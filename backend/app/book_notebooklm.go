@@ -130,11 +130,13 @@ func exportNotebookLMBridge(pkg *BookKnowledgePackage, outputDir string) ([]stri
 		filepath.Join(outputDir, "book.md"),
 		filepath.Join(outputDir, "claims.md"),
 		filepath.Join(outputDir, "notebooklm-prompt.md"),
+		filepath.Join(outputDir, "upload-guide.md"),
 	}
 	contents := []string{
 		buildNotebookLMBookMarkdown(pkg),
 		buildNotebookLMClaimsMarkdown(pkg),
 		buildNotebookLMPromptMarkdown(pkg),
+		buildNotebookLMUploadGuideMarkdown(pkg),
 	}
 	for i, path := range files {
 		if err := writeTextFile(path, contents[i]); err != nil {
@@ -221,6 +223,26 @@ func buildNotebookLMPromptMarkdown(pkg *BookKnowledgePackage) string {
 	builder.WriteString("- 提取最值得落地的 10 条行动建议，标注来源 claim 或 chunk。\n")
 	builder.WriteString("- 找出书中可能冲突、证据不足或需要二次验证的观点。\n")
 	builder.WriteString("- 把本书转换成可执行规则卡或项目知识库条目。\n")
+	return builder.String()
+}
+
+func buildNotebookLMUploadGuideMarkdown(pkg *BookKnowledgePackage) string {
+	var builder strings.Builder
+	writeMarkdownTitle(&builder, 1, "上传到 NotebookLM")
+	builder.WriteString("\n")
+	builder.WriteString("Book: ")
+	builder.WriteString(pkg.Book.Title)
+	builder.WriteString("\n\n")
+	builder.WriteString("## 上传文件\n\n")
+	builder.WriteString("1. 打开 https://notebooklm.google.com/ 并创建新 notebook。\n")
+	builder.WriteString("2. 上传 `book.md` 作为主资料源。\n")
+	builder.WriteString("3. 上传 `claims.md` 作为观点与证据索引。\n")
+	builder.WriteString("4. 打开 `notebooklm-prompt.md`，复制其中的问题到 NotebookLM 对话框。\n")
+	builder.WriteString("5. 回到 dedao-gui 的 NotebookLM tab，保存这个 notebook 的链接。\n")
+	builder.WriteString("\n## 推荐上传顺序\n\n")
+	builder.WriteString("- `book.md`\n")
+	builder.WriteString("- `claims.md`\n")
+	builder.WriteString("- `notebooklm-prompt.md` 仅作为提示词参考，不必上传。\n")
 	return builder.String()
 }
 

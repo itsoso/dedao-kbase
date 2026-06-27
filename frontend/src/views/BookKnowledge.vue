@@ -272,6 +272,9 @@
                                         <el-button icon="Link" @click="openNotebookLM">
                                             打开 NotebookLM
                                         </el-button>
+                                        <el-button icon="DocumentCopy" @click="copyNotebookLMUploadGuide">
+                                            复制上传指南
+                                        </el-button>
                                     </div>
                                 </section>
 
@@ -676,6 +679,24 @@ const copyNotebookLMExportDir = () => {
     }
     ClipboardSetText(dir)
     ElMessage({message: '已复制导出目录', type: 'success'})
+}
+
+const copyNotebookLMUploadGuide = () => {
+    const bookTitle = selectedBook.value?.title || '当前书籍'
+    const dir = notebookLMBridge.value?.last_export_dir || '请先点击「导出资料包」生成目录'
+    const files = notebookLMBridge.value?.last_export_files?.map(fileName) || ['book.md', 'claims.md', 'notebooklm-prompt.md', 'upload-guide.md']
+    const guide = [
+        `NotebookLM 上传指南：${bookTitle}`,
+        '',
+        `1. 打开 ${notebookLMBridge.value?.notebook_url || notebookLMHomeURL}`,
+        '2. 新建或打开对应 notebook。',
+        `3. 从目录上传资料：${dir}`,
+        `4. 优先上传：${files.filter((file) => file === 'book.md' || file === 'claims.md').join('、') || 'book.md、claims.md'}`,
+        '5. 打开 notebooklm-prompt.md，复制推荐问题到 NotebookLM 对话框。',
+        '6. 回到 dedao-gui 保存 NotebookLM 链接，方便下次继续。',
+    ].join('\n')
+    ClipboardSetText(guide)
+    ElMessage({message: '已复制上传指南', type: 'success'})
 }
 
 const fileName = (path: string) => {

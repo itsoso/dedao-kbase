@@ -26,6 +26,8 @@ assert.ok(source.includes('BookKnowledgeNotebookLMBridge'), 'BookKnowledge.vue s
 assert.ok(source.includes('BookKnowledgeNotebookLMExport'), 'BookKnowledge.vue should export NotebookLM bridge packages')
 assert.ok(source.includes('BookKnowledgeNotebookLMSaveLink'), 'BookKnowledge.vue should save NotebookLM links')
 assert.ok(source.includes('BrowserOpenURL'), 'BookKnowledge.vue should open NotebookLM in the browser')
+assert.ok(source.includes('copyNotebookLMUploadGuide'), 'BookKnowledge.vue should copy NotebookLM upload guide')
+assert.ok(source.includes('复制上传指南'), 'BookKnowledge.vue should expose an upload-guide copy action')
 assert.ok(source.includes("const chatModel = ref('qwen3.7-max')"), 'BookKnowledge.vue should default to Qwen3.7 Max')
 assert.ok(source.includes('chatLoadingByBookID'), 'BookKnowledge.vue should track chat loading by book id')
 assert.ok(source.includes('currentBookChatLoading'), 'BookKnowledge.vue should expose current book loading state')

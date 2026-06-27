@@ -23,8 +23,8 @@ func TestExportNotebookLMBridgePackageWritesMarkdownAndMetadata(t *testing.T) {
 	if bridge.LastExportDir == "" {
 		t.Fatalf("LastExportDir is empty")
 	}
-	if len(bridge.LastExportFiles) != 3 {
-		t.Fatalf("LastExportFiles = %#v, want 3 markdown files", bridge.LastExportFiles)
+	if len(bridge.LastExportFiles) != 4 {
+		t.Fatalf("LastExportFiles = %#v, want 4 markdown files", bridge.LastExportFiles)
 	}
 
 	bookMarkdown := filepath.Join(bridge.LastExportDir, "book.md")
@@ -32,6 +32,8 @@ func TestExportNotebookLMBridgePackageWritesMarkdownAndMetadata(t *testing.T) {
 	assertFileContains(t, bookMarkdown, "MACD 背离需要趋势过滤。")
 	assertFileContains(t, filepath.Join(bridge.LastExportDir, "claims.md"), "MACD 规则需要趋势过滤")
 	assertFileContains(t, filepath.Join(bridge.LastExportDir, "notebooklm-prompt.md"), "NotebookLM")
+	assertFileContains(t, filepath.Join(bridge.LastExportDir, "upload-guide.md"), "上传到 NotebookLM")
+	assertFileContains(t, filepath.Join(bridge.LastExportDir, "upload-guide.md"), "book.md")
 
 	loaded, err := store.LoadNotebookLMBridge("42")
 	if err != nil {
