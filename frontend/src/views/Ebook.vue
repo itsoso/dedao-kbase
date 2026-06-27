@@ -29,7 +29,7 @@
         </el-table-column>
         <el-table-column prop="progress" label="已读%" width="100" align="center">
         </el-table-column>
-        <el-table-column fixed="right" label="操作" width="180">
+        <el-table-column fixed="right" label="操作" width="220">
             <template #default="scope">
               <el-tooltip content="书评">
                 <el-button icon="ChatDotRound" size="small" type="primary" link @click="gotoCommentList(scope.row)">
@@ -41,6 +41,10 @@
               </el-tooltip>
               <el-tooltip content="下载">
                 <el-button icon="download" size="small" type="primary" link @click="openDownloadDialog(scope.row)">
+                </el-button>
+              </el-tooltip>
+              <el-tooltip content="下载并入 Wiki">
+                <el-button icon="Collection" size="small" type="primary" link @click="openWikiSyncDialog(scope.row)">
                 </el-button>
               </el-tooltip>
               <el-tooltip content="移出书架">
@@ -60,6 +64,7 @@
             :prod-type="2"
             :download-id="downloadId"
             :en-id="downloadEnId"
+            :wiki-sync="downloadWikiSync"
             @close="closeDownloadDialog">
     </download-dialog>
 </template>
@@ -98,6 +103,7 @@ const dialogDownloadVisible = ref(false)
 const downloadType = ref(1)
 const downloadId = ref(0)
 const downloadEnId = ref('')
+const downloadWikiSync = ref(false)
 const downloadTypeOptions = [
     {value: 1, label: "HTML"}, {value: 2, label: "PDF"}, {value: 3, label: "EPUB"}
 ]
@@ -196,6 +202,7 @@ const ebookShelfRemove = async (enid: string) => {
 const openDownloadDialog = (row: any) => {
     downloadId.value = row.id
     downloadEnId.value = row.enid
+    downloadWikiSync.value = false
     dialogDownloadVisible.value = true
     if (setStore.getDownloadDir == "") {
         ElMessage({
@@ -215,9 +222,16 @@ const openDownloadDialog = (row: any) => {
         })
     }
 }
+const openWikiSyncDialog = (row: any) => {
+    downloadId.value = row.id
+    downloadEnId.value = row.enid
+    downloadWikiSync.value = true
+    dialogDownloadVisible.value = true
+}
 const closeDownloadDialog = () => {
     //   initForm()
     downloadType.value = 1
+    downloadWikiSync.value = false
     dialogDownloadVisible.value = false
 }
 

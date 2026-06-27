@@ -1,5 +1,7 @@
 package services
 
+import "encoding/json"
+
 type QrCodeResp struct {
 	ErrCode int    `json:"errCode"`
 	ErrMsg  string `json:"errMsg"`
@@ -17,13 +19,40 @@ type CheckLoginResp struct {
 	} `json:"data"`
 }
 
+type loginAccessTokenError struct {
+	Message string `json:"message"`
+}
+
 // LoginAccessToken get login access token
 func (s *Service) LoginAccessToken() (token string, err error) {
+	if CsrfToken == "" {
+		if _, err = s.GetHomeInitialState(); err != nil {
+			return
+		}
+	}
 	token, err = s.reqGetLoginAccessToken(CsrfToken)
 	if err != nil {
 		return
 	}
+	if loginAccessTokenNeedsCSRFRefresh(token) {
+		CsrfToken = ""
+		if _, err = s.GetHomeInitialState(); err != nil {
+			return
+		}
+		token, err = s.reqGetLoginAccessToken(CsrfToken)
+		if err != nil {
+			return
+		}
+	}
 	return
+}
+
+func loginAccessTokenNeedsCSRFRefresh(token string) bool {
+	var tokenErr loginAccessTokenError
+	if err := json.Unmarshal([]byte(token), &tokenErr); err != nil {
+		return false
+	}
+	return tokenErr.Message == "missing csrf token" || tokenErr.Message == "invalid csrf token"
 }
 
 func (s *Service) GetQrcode(token string) (resp *QrCodeResp, err error) {

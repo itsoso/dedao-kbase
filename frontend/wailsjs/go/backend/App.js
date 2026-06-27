@@ -22,6 +22,54 @@ export function AudioDetail(arg1) {
   return window['go']['backend']['App']['AudioDetail'](arg1);
 }
 
+export function BookKnowledgeChat(arg1, arg2, arg3, arg4) {
+  return window['go']['backend']['App']['BookKnowledgeChat'](arg1, arg2, arg3, arg4);
+}
+
+export function BookKnowledgeChatHistory(arg1, arg2) {
+  return window['go']['backend']['App']['BookKnowledgeChatHistory'](arg1, arg2);
+}
+
+export function BookKnowledgeExport(arg1, arg2) {
+  return window['go']['backend']['App']['BookKnowledgeExport'](arg1, arg2);
+}
+
+export function BookKnowledgeGetBook(arg1) {
+  return window['go']['backend']['App']['BookKnowledgeGetBook'](arg1);
+}
+
+export function BookKnowledgeListBooks() {
+  return window['go']['backend']['App']['BookKnowledgeListBooks']();
+}
+
+export function BookKnowledgeMCPCall(arg1, arg2) {
+  return window['go']['backend']['App']['BookKnowledgeMCPCall'](arg1, arg2);
+}
+
+export function BookKnowledgeMCPTools() {
+  return window['go']['backend']['App']['BookKnowledgeMCPTools']();
+}
+
+export function BookKnowledgeNotebookLMBridge(arg1) {
+  return window['go']['backend']['App']['BookKnowledgeNotebookLMBridge'](arg1);
+}
+
+export function BookKnowledgeNotebookLMExport(arg1) {
+  return window['go']['backend']['App']['BookKnowledgeNotebookLMExport'](arg1);
+}
+
+export function BookKnowledgeNotebookLMSaveLink(arg1, arg2) {
+  return window['go']['backend']['App']['BookKnowledgeNotebookLMSaveLink'](arg1, arg2);
+}
+
+export function BookKnowledgeRoot() {
+  return window['go']['backend']['App']['BookKnowledgeRoot']();
+}
+
+export function BookKnowledgeSearch(arg1, arg2, arg3) {
+  return window['go']['backend']['App']['BookKnowledgeSearch'](arg1, arg2, arg3);
+}
+
 export function CheckLogin(arg1, arg2) {
   return window['go']['backend']['App']['CheckLogin'](arg1, arg2);
 }
@@ -48,6 +96,10 @@ export function EbookCommentList(arg1, arg2, arg3) {
 
 export function EbookDownload(arg1, arg2, arg3) {
   return window['go']['backend']['App']['EbookDownload'](arg1, arg2, arg3);
+}
+
+export function EbookDownloadAndSyncWiki(arg1, arg2) {
+  return window['go']['backend']['App']['EbookDownloadAndSyncWiki'](arg1, arg2);
 }
 
 export function EbookInfo(arg1) {

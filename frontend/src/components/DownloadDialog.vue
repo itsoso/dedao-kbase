@@ -1,7 +1,7 @@
 <template>
-    <el-dialog v-model="dialogVisible" title="请选择下载格式" align-center center width="30%" :before-close="closeDialog">
+    <el-dialog v-model="dialogVisible" :title="props.wikiSync ? '下载并入 Wiki' : '请选择下载格式'" align-center center width="30%" :before-close="closeDialog">
         <el-form >
-            <el-form-item label="下载格式" label-width="80px">
+            <el-form-item v-if="!props.wikiSync" label="下载格式" label-width="80px">
                 <el-select v-model="downloadType" placeholder="请选择下载格式">
                     <el-option v-for="item in props.downloadTypeOptions" :key="item.value" :label="item.label" :value="item.value" />
                 </el-select>
@@ -28,7 +28,7 @@
 
 <script lang="ts" setup>
 import {onMounted, ref} from "vue";
-import {EbookDownload, CourseDownload} from "../../wailsjs/go/backend/App";
+import {EbookDownload, EbookDownloadAndSyncWiki, CourseDownload} from "../../wailsjs/go/backend/App";
 import {ElMessage} from "element-plus";
 import { EventsOn, EventsOff} from "../../wailsjs/runtime/runtime";
 
@@ -63,6 +63,10 @@ const props = defineProps({
         default:0,
     },
     dialogVisible: {
+        type: Boolean,
+        default: false,
+    },
+    wikiSync: {
         type: Boolean,
         default: false,
     },
@@ -102,11 +106,19 @@ const download = async () => {
                 if (data) {
                     console.log(data)
                     percentage.value = data.pct
-                    content.value = data.value + '下载中...'
+                    content.value = props.wikiSync ? data.value : data.value + '下载中...'
                 }
             })
-            await EbookDownload(props.downloadId, downloadType.value, props.enId).then((info) => {
-                // console.log(info)
+            await (props.wikiSync
+                ? EbookDownloadAndSyncWiki(props.downloadId, props.enId)
+                : EbookDownload(props.downloadId, downloadType.value, props.enId)
+            ).then((info) => {
+                if (props.wikiSync) {
+                    ElMessage({
+                        message: 'Wiki 同步完成',
+                        type: 'success'
+                    })
+                }
             }).catch((error) => {
                 ElMessage({
                     message: error,

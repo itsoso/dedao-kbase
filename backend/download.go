@@ -60,3 +60,8 @@ func (a *App) EbookDownload(id, dType int, enid string) (err error) {
 	err = d.Download()
 	return
 }
+
+func (a *App) EbookDownloadAndSyncWiki(id int, enid string) (err error) {
+	_, err = app.SyncEbookToWiki(a.Ctx, id, enid)
+	return
+}

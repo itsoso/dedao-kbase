@@ -37,6 +37,13 @@ type EBookDownload struct {
 	DownloadType int // 1:html, 2:PDF文档, 3:epub
 	ID           int
 	EnID         string
+	OutputDir    string
+}
+
+type EBookDownloadResult struct {
+	BookID   int
+	Title    string
+	HTMLPath string
 }
 
 type Progress struct {
@@ -212,9 +219,14 @@ func (d *OdobDownload) Download() error {
 }
 
 func (d *EBookDownload) Download() error {
+	_, err := d.DownloadWithResult()
+	return err
+}
+
+func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	detail, err := EbookDetail(d.EnID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	title := strconv.Itoa(d.ID) + "_"
@@ -227,9 +239,18 @@ func (d *EBookDownload) Download() error {
 	title += "_" + detail.BookAuthor
 	info, svgContent, err := EbookPage(d.Ctx, detail.Enid)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sort.Sort(svgContent)
+
+	outputDir := OutputDir
+	if d.OutputDir != "" {
+		outputDir = d.OutputDir
+	}
+	result := &EBookDownloadResult{
+		BookID: d.ID,
+		Title:  title,
+	}
 
 	dType := map[int]string{
 		1: "HTML",
@@ -242,13 +263,17 @@ func (d *EBookDownload) Download() error {
 	runtime.EventsEmit(d.Ctx, "ebookDownload", progress)
 	switch d.DownloadType {
 	case 1:
-		if err = utils.Svg2Html(OutputDir, title, svgContent, info.BookInfo.Toc); err != nil {
-			return err
+		result.HTMLPath, err = ebookHTMLPath(outputDir, title)
+		if err != nil {
+			return nil, err
+		}
+		if err = utils.Svg2Html(outputDir, title, svgContent, info.BookInfo.Toc); err != nil {
+			return nil, err
 		}
 
 	case 2:
-		if err = utils.Svg2Pdf(OutputDir, title, svgContent, info.BookInfo.Toc); err != nil {
-			return err
+		if err = utils.Svg2Pdf(outputDir, title, svgContent, info.BookInfo.Toc); err != nil {
+			return nil, err
 		}
 
 	case 3:
@@ -258,14 +283,14 @@ func (d *EBookDownload) Download() error {
 		opts.Description = detail.BookIntro
 		opts.Toc = info.BookInfo.Toc
 
-		if err = utils.Svg2Epub(OutputDir, title, svgContent, opts); err != nil {
-			return err
+		if err = utils.Svg2Epub(outputDir, title, svgContent, opts); err != nil {
+			return nil, err
 		}
 
-		return err
+		return result, err
 	}
 
-	return nil
+	return result, nil
 }
 
 // 生成下载数据
