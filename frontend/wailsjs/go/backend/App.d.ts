@@ -34,6 +34,8 @@ export function BookKnowledgeNotebookLMExport(arg1:string):Promise<app.BookKnowl
 
 export function BookKnowledgeNotebookLMSaveLink(arg1:string,arg2:string):Promise<app.BookKnowledgeNotebookLMBridge>;
 
+export function BookKnowledgePrompts(arg1:string):Promise<Array<app.BookKnowledgePrompt>>;
+
 export function BookKnowledgeRoot():Promise<string>;
 
 export function BookKnowledgeSearch(arg1:string,arg2:string,arg3:number):Promise<Array<app.BookKnowledgeSearchResult>>;

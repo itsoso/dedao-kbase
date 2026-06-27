@@ -27,6 +27,10 @@ func (a *App) BookKnowledgeSearch(query, bookID string, limit int) ([]app.BookKn
 	})
 }
 
+func (a *App) BookKnowledgePrompts(bookID string) ([]app.BookKnowledgePrompt, error) {
+	return app.GenerateBookKnowledgePrompts(app.DefaultBookKnowledgeStore(), bookID)
+}
+
 func (a *App) BookKnowledgeExport(bookID, target string) (*app.BookKnowledgeExportResult, error) {
 	return app.ExportBookKnowledgePackage(app.DefaultBookKnowledgeStore(), bookID, target)
 }

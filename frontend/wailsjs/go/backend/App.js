@@ -62,6 +62,10 @@ export function BookKnowledgeNotebookLMSaveLink(arg1, arg2) {
   return window['go']['backend']['App']['BookKnowledgeNotebookLMSaveLink'](arg1, arg2);
 }
 
+export function BookKnowledgePrompts(arg1) {
+  return window['go']['backend']['App']['BookKnowledgePrompts'](arg1);
+}
+
 export function BookKnowledgeRoot() {
   return window['go']['backend']['App']['BookKnowledgeRoot']();
 }

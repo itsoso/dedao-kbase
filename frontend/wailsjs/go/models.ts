@@ -347,6 +347,30 @@ export namespace app {
 		    return a;
 		}
 	}
+	export class BookKnowledgePrompt {
+	    prompt_id: string;
+	    category: string;
+	    title: string;
+	    description?: string;
+	    prompt: string;
+	    output_format?: string;
+	    dynamic?: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new BookKnowledgePrompt(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.prompt_id = source["prompt_id"];
+	        this.category = source["category"];
+	        this.title = source["title"];
+	        this.description = source["description"];
+	        this.prompt = source["prompt"];
+	        this.output_format = source["output_format"];
+	        this.dynamic = source["dynamic"];
+	    }
+	}
 	export class BookKnowledgeSearchResult {
 	    kind: string;
 	    book_id: string;

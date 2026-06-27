@@ -243,6 +243,70 @@
                             </div>
                         </el-tab-pane>
 
+                        <el-tab-pane label="Prompt模板" name="prompts">
+                            <div class="prompt-studio">
+                                <div class="prompt-toolbar">
+                                    <div>
+                                        <div class="panel-kicker">Prompt Studio</div>
+                                        <div class="prompt-title">书籍分析模板</div>
+                                    </div>
+                                    <el-radio-group v-model="promptCategory" size="small">
+                                        <el-radio-button label="全部">全部</el-radio-button>
+                                        <el-radio-button
+                                            v-for="category in promptCategories"
+                                            :key="category"
+                                            :label="category"
+                                        >
+                                            {{ category }}
+                                        </el-radio-button>
+                                    </el-radio-group>
+                                </div>
+                                <el-empty
+                                    v-if="!filteredPrompts.length"
+                                    description="暂无 Prompt 模板"
+                                    :image-size="72"
+                                />
+                                <div v-else class="prompt-grid">
+                                    <article
+                                        v-for="prompt in filteredPrompts"
+                                        :key="prompt.prompt_id"
+                                        class="prompt-card"
+                                    >
+                                        <div class="prompt-card-head">
+                                            <div>
+                                                <div class="prompt-card-title">{{ prompt.title }}</div>
+                                                <div class="prompt-card-desc">{{ prompt.description }}</div>
+                                            </div>
+                                            <el-tag
+                                                size="small"
+                                                effect="plain"
+                                                :type="prompt.dynamic ? 'success' : 'info'"
+                                            >
+                                                {{ prompt.dynamic ? '动态' : prompt.category }}
+                                            </el-tag>
+                                        </div>
+                                        <div class="prompt-preview">{{ prompt.prompt }}</div>
+                                        <div class="prompt-card-foot">
+                                            <el-tag size="small" effect="plain">{{ prompt.output_format || 'markdown' }}</el-tag>
+                                            <div class="prompt-actions">
+                                                <el-button size="small" icon="DocumentCopy" @click="copyPrompt(prompt)">复制</el-button>
+                                                <el-button size="small" icon="EditPen" @click="insertPrompt(prompt)">填入</el-button>
+                                                <el-button
+                                                    size="small"
+                                                    type="primary"
+                                                    icon="Promotion"
+                                                    :disabled="currentBookChatLoading"
+                                                    @click="runPrompt(prompt)"
+                                                >
+                                                    运行
+                                                </el-button>
+                                            </div>
+                                        </div>
+                                    </article>
+                                </div>
+                            </div>
+                        </el-tab-pane>
+
                         <el-tab-pane label="MCP" name="mcp">
                             <el-table :data="mcpTools" height="100%" table-layout="auto">
                                 <el-table-column prop="name" label="Tool" width="180" />
@@ -360,6 +424,7 @@ import {
     BookKnowledgeNotebookLMBridge,
     BookKnowledgeNotebookLMExport,
     BookKnowledgeNotebookLMSaveLink,
+    BookKnowledgePrompts,
     BookKnowledgeRoot,
     BookKnowledgeSearch
 } from '../../wailsjs/go/backend/App'
@@ -460,6 +525,16 @@ interface BookKnowledgeChatHistoryItem {
     created_at: string
 }
 
+interface BookKnowledgePrompt {
+    prompt_id: string
+    category: string
+    title: string
+    description?: string
+    prompt: string
+    output_format?: string
+    dynamic?: boolean
+}
+
 interface BookKnowledgeNotebookLMBridge {
     book_id: string
     notebook_url?: string
@@ -479,6 +554,8 @@ const activeTab = ref('chapters')
 const searchText = ref('')
 const searchResults = ref<BookKnowledgeSearchResult[]>([])
 const mcpTools = ref<BookKnowledgeMCPTool[]>([])
+const bookPrompts = ref<BookKnowledgePrompt[]>([])
+const promptCategory = ref('全部')
 const chatModel = ref('qwen3.7-max')
 const chatQuestion = ref('')
 const chatLoadingByBookID = reactive<Record<string, boolean>>({})
@@ -517,6 +594,23 @@ const currentBookChatLoading = computed(() => {
     return Boolean(bookID && chatLoadingByBookID[bookID])
 })
 
+const promptCategories = computed(() => {
+    const categories = new Set<string>()
+    for (const prompt of bookPrompts.value) {
+        if (prompt.category) {
+            categories.add(prompt.category)
+        }
+    }
+    return Array.from(categories)
+})
+
+const filteredPrompts = computed(() => {
+    if (promptCategory.value === '全部') {
+        return bookPrompts.value
+    }
+    return bookPrompts.value.filter((prompt) => prompt.category === promptCategory.value)
+})
+
 onMounted(() => {
     loadRoot()
     loadMCPTools()
@@ -546,6 +640,8 @@ const loadBooks = async () => {
             selectedHistoryID.value = ''
             notebookLMBridge.value = null
             notebookLMLinkInput.value = ''
+            bookPrompts.value = []
+            promptCategory.value = '全部'
         }
     } catch (error: any) {
         ElMessage({message: String(error), type: 'warning'})
@@ -565,12 +661,15 @@ const selectBook = async (row: BookKnowledgeBook | null) => {
     selectedHistoryID.value = ''
     notebookLMBridge.value = null
     notebookLMLinkInput.value = ''
+    bookPrompts.value = []
+    promptCategory.value = '全部'
     try {
         const pkg = await BookKnowledgeGetBook(row.book_id)
         bookPackage.value = pkg as BookKnowledgePackage
         selectedChapter.value = bookPackage.value.chapters?.[0] || null
         await loadChatHistory(row.book_id)
         await loadNotebookLMBridge(row.book_id)
+        await loadBookPrompts(row.book_id)
     } catch (error: any) {
         ElMessage({message: String(error), type: 'warning'})
     }
@@ -611,6 +710,37 @@ const exportKnowledge = async (target: string) => {
     } catch (error: any) {
         ElMessage({message: String(error), type: 'warning'})
     }
+}
+
+const loadBookPrompts = async (bookID?: string) => {
+    const targetBookID = bookID || selectedBook.value?.book_id || ''
+    if (!targetBookID) {
+        return
+    }
+    try {
+        const list = await BookKnowledgePrompts(targetBookID)
+        if (selectedBook.value?.book_id === targetBookID) {
+            bookPrompts.value = Array.isArray(list) ? (list as BookKnowledgePrompt[]) : []
+            promptCategory.value = '全部'
+        }
+    } catch (error: any) {
+        ElMessage({message: String(error), type: 'warning'})
+    }
+}
+
+const copyPrompt = (prompt: BookKnowledgePrompt) => {
+    ClipboardSetText(prompt.prompt)
+    ElMessage({message: 'Prompt 已复制', type: 'success'})
+}
+
+const insertPrompt = (prompt: BookKnowledgePrompt) => {
+    chatQuestion.value = prompt.prompt
+    activeTab.value = 'chat'
+}
+
+const runPrompt = async (prompt: BookKnowledgePrompt) => {
+    chatQuestion.value = prompt.prompt
+    await callBookChat('chat', prompt.prompt)
 }
 
 const loadNotebookLMBridge = async (bookID?: string) => {
@@ -1427,6 +1557,99 @@ const callBookChat = async (mode: string, question: string) => {
     border-top: 1px solid #e5ebf3;
 }
 
+.prompt-studio {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: 100%;
+    min-height: 0;
+    overflow: auto;
+}
+
+.prompt-toolbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    border: 1px solid #dfe5ef;
+    border-radius: 8px;
+    padding: 12px;
+    background: #f8fafc;
+}
+
+.prompt-title {
+    color: #111827;
+    font-size: 16px;
+    font-weight: 750;
+    line-height: 24px;
+}
+
+.prompt-toolbar .el-radio-group {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 4px;
+}
+
+.prompt-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+    min-height: 0;
+}
+
+.prompt-card {
+    display: flex;
+    flex-direction: column;
+    min-height: 228px;
+    border: 1px solid #dfe5ef;
+    border-radius: 8px;
+    padding: 12px;
+    background: #ffffff;
+    box-shadow: 0 8px 18px rgb(15 23 42 / 4%);
+}
+
+.prompt-card-head,
+.prompt-card-foot {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.prompt-card-title {
+    color: #111827;
+    font-size: 14px;
+    font-weight: 750;
+    line-height: 20px;
+}
+
+.prompt-card-desc {
+    margin-top: 2px;
+    color: #64748b;
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.prompt-preview {
+    display: -webkit-box;
+    overflow: hidden;
+    flex: 1;
+    margin: 12px 0;
+    color: #334155;
+    font-size: 12px;
+    line-height: 1.65;
+    -webkit-line-clamp: 6;
+    -webkit-box-orient: vertical;
+}
+
+.prompt-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+}
+
 .notebooklm-panel {
     display: flex;
     flex-direction: column;
@@ -1539,6 +1762,8 @@ const callBookChat = async (mode: string, question: string) => {
     .workspace,
     .chapter-grid,
     .chat-pane,
+    .prompt-toolbar,
+    .prompt-card-foot,
     .bridge-card-main,
     .bridge-grid,
     .bridge-link-row {
