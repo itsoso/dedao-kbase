@@ -2,26 +2,28 @@
   <main class="kbase-web-shell">
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
-    <nav class="app-navigation" aria-label="KBase navigation">
-      <div class="app-navigation-items">
-        <button
-          v-for="item in navigationItems"
-          :key="item.key"
-          type="button"
-          :class="{ active: activeNavigationKey === item.key }"
-          @click="navigateTo(item)"
-        >
-          <span>{{ item.label }}</span>
-          <small>{{ item.meta }}</small>
-        </button>
-      </div>
+    <header class="kbase-workbench-header">
+      <nav class="app-navigation app-subnavigation" aria-label="KBase navigation">
+        <div class="app-navigation-items">
+          <button
+            v-for="item in navigationItems"
+            :key="item.key"
+            type="button"
+            :class="{ active: activeNavigationKey === item.key }"
+            @click="navigateTo(item)"
+          >
+            <span>{{ item.label }}</span>
+            <small>{{ item.meta }}</small>
+          </button>
+        </div>
+      </nav>
       <div class="app-navigation-actions">
         <button class="primary-action compact" type="button" :disabled="loading" @click="connectAndRefresh">
           {{ loading ? '刷新中' : '连接' }}
         </button>
         <span class="status-pill compact" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</span>
       </div>
-    </nav>
+    </header>
 
     <div ref="workbenchRef" class="workbench-grid learning-layout" :style="workbenchStyle">
       <aside ref="libraryPanelRef" class="book-rail library-search-panel">

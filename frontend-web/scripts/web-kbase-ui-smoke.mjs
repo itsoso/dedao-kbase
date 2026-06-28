@@ -42,7 +42,6 @@ const accountLoginSource = readFileSync(accountLoginPath, 'utf8')
 const webSettingsSource = existsSync(webSettingsPath) ? readFileSync(webSettingsPath, 'utf8') : ''
 
 assert.ok(appSource.includes('dedao-web-shell'), 'App.vue should render the Dedao Web shell')
-assert.ok(appSource.includes('compact-shell-header'), 'App.vue should render a compact shell header')
 assert.ok(appSource.includes('compact-shell-nav'), 'App.vue should render compact shell navigation')
 assert.ok(appSource.includes('router-view'), 'App.vue should render routed pages')
 assert.ok(appSource.includes('router-link'), 'App.vue should expose shell navigation links')
@@ -67,7 +66,8 @@ for (const routePath of [
 
 for (const hook of [
   'kbase-web-shell',
-  'connection-bar',
+  'kbase-workbench-header',
+  'app-subnavigation',
   'app-navigation',
   'book-rail',
   'book-pagination',

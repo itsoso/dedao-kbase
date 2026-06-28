@@ -7,8 +7,10 @@
   --dedao-subtle: #f7f7f7;
   --dedao-line: #eeeeee;
   --dedao-border: #dddddd;
+  --dedao-panel: #ffffff;
+  --dedao-bg: #ffffff;
   color: var(--dedao-text);
-  background: #ffffff;
+  background: var(--dedao-bg);
   font-family: "Avenir Next", "Helvetica Neue", Helvetica, sans-serif;
   font-synthesis: none;
   line-height: 1.45;
@@ -23,7 +25,7 @@ body {
   margin: 0;
   min-width: 1120px;
   min-height: 100vh;
-  background: #ffffff;
+  background: var(--dedao-bg);
 }
 
 button,
@@ -79,10 +81,10 @@ textarea {
 
 .dedao-web-shell {
   min-height: 100vh;
-  max-width: 1200px;
+  max-width: 1240px;
   margin: 0 auto;
   padding: 0 0 24px;
-  background: #ffffff;
+  background: var(--dedao-panel);
 }
 
 .shell-nav,
@@ -95,13 +97,13 @@ textarea {
 
 .shell-nav {
   display: flex;
-  gap: 22px;
+  gap: 28px;
   overflow-x: auto;
   border: 0;
   border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
   padding: 0;
-  background: #ffffff;
+  background: var(--dedao-panel);
   box-shadow: none;
 }
 
@@ -113,9 +115,9 @@ textarea {
   border: 0;
   border-bottom: 2px solid transparent;
   border-radius: 0;
-  min-height: 44px;
+  min-height: 46px;
   padding: 0 2px;
-  background: #ffffff;
+  background: var(--dedao-panel);
   color: var(--dedao-text);
   text-decoration: none;
   white-space: nowrap;
@@ -124,7 +126,7 @@ textarea {
 .shell-nav a:hover,
 .shell-nav a.active {
   border-color: var(--dedao-orange);
-  background: #ffffff;
+  background: var(--dedao-panel);
   color: var(--dedao-orange);
 }
 
@@ -220,12 +222,12 @@ textarea {
 .kbase-web-shell {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  min-height: calc(100vh - 64px);
-  padding: 8px 0 0;
+  gap: 8px;
+  min-height: calc(100vh - 58px);
+  padding: 6px 0 0;
 }
 
-.app-navigation,
+.kbase-workbench-header,
 .book-rail,
 .search-panel,
 .library-search-panel,
@@ -234,51 +236,61 @@ textarea {
 .error-strip {
   border: 1px solid var(--dedao-line);
   border-radius: 10px;
-  background: #ffffff;
+  background: var(--dedao-panel);
   box-shadow: none;
+}
+
+.kbase-workbench-header {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 0;
 }
 
 .app-navigation {
   display: flex;
   align-items: stretch;
-  justify-content: space-between;
-  gap: 12px;
+  min-width: 0;
+  gap: 0;
   border: 0;
-  border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
   padding: 0;
-  background: #ffffff;
+  background: transparent;
 }
 
 .app-navigation-items {
   display: flex;
   min-width: 0;
-  gap: 22px;
+  gap: 24px;
   overflow-x: auto;
 }
 
 .app-navigation button {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
+  align-items: center;
   border: 0;
   border-bottom: 2px solid transparent;
   border-radius: 0;
-  padding: 9px 10px 8px;
-  background: #ffffff;
+  padding: 0;
+  background: transparent;
   text-align: left;
 }
 
 .app-navigation-items button {
   flex: 0 0 auto;
-  padding: 8px 0 7px;
+  min-height: 42px;
+  padding: 0;
 }
 
 .app-navigation button.active {
   border-color: var(--dedao-orange);
-  background: #ffffff;
+  background: transparent;
   color: var(--dedao-orange);
 }
 
@@ -287,14 +299,13 @@ textarea {
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
-  padding-bottom: 6px;
 }
 
 .app-navigation-actions .primary-action.compact {
   min-height: 30px;
   border: 1px solid var(--dedao-orange);
   border-radius: 6px;
-  padding: 0 14px;
+  padding: 0 16px;
   background: var(--dedao-orange);
   color: #ffffff;
   font-weight: 700;
@@ -321,12 +332,7 @@ textarea {
 }
 
 .app-navigation small {
-  overflow: hidden;
-  max-width: 100%;
-  color: #999999;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
+  display: none;
 }
 
 .brand-block h1,
