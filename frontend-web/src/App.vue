@@ -21,8 +21,21 @@
 
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
+    <nav class="app-navigation" aria-label="KBase navigation">
+      <button
+        v-for="item in navigationItems"
+        :key="item.key"
+        type="button"
+        :class="{ active: activeNavigationKey === item.key }"
+        @click="navigateTo(item)"
+      >
+        <span>{{ item.label }}</span>
+        <small>{{ item.meta }}</small>
+      </button>
+    </nav>
+
     <div ref="workbenchRef" class="workbench-grid learning-layout" :style="workbenchStyle">
-      <aside class="book-rail library-search-panel">
+      <aside ref="libraryPanelRef" class="book-rail library-search-panel">
         <div class="panel-head">
           <div>
             <span class="eyebrow">Library Search</span>
@@ -98,7 +111,7 @@
 
       <div class="column-resizer left-resizer" role="separator" aria-label="Resize library column" @pointerdown="beginColumnResize('left', $event)"></div>
 
-      <section class="chat-panel study-panel">
+      <section ref="studyPanelRef" class="chat-panel study-panel">
         <div class="panel-head study-head">
           <div>
             <span class="eyebrow">TokenPlan Study</span>
@@ -179,7 +192,7 @@
 
       <div class="column-resizer right-resizer" role="separator" aria-label="Resize detail column" @pointerdown="beginColumnResize('right', $event)"></div>
 
-      <section class="detail-panel compact-reference-panel">
+      <section ref="detailPanelRef" class="detail-panel compact-reference-panel">
         <div class="panel-head detail-head">
           <div>
             <span class="eyebrow">Details</span>
@@ -265,12 +278,42 @@
           </div>
         </div>
 
-        <div v-else class="system-kb-panel">
+        <div v-else-if="activeTab === 'System KB'" class="system-kb-panel">
           <div class="system-actions">
             <button type="button" @click="loadSystemKBManifest">Manifest</button>
             <button type="button" @click="loadSystemKBExport">Export</button>
           </div>
           <pre>{{ formattedSystemKB }}</pre>
+        </div>
+
+        <div v-else-if="activeTab === 'Skills/API'" class="interop-panel">
+          <div class="endpoint-group">
+            <span class="eyebrow">Public Discovery</span>
+            <a v-for="route in publicDiscoveryRoutes" :key="route" :href="routeUrl(route)" target="_blank" rel="noreferrer">
+              {{ route }}
+            </a>
+          </div>
+          <div class="endpoint-group">
+            <span class="eyebrow">Bearer API</span>
+            <code v-for="route in protectedApiRoutes" :key="route">{{ route }}</code>
+          </div>
+        </div>
+
+        <div v-else class="ops-panel">
+          <dl class="ops-grid">
+            <div><dt>Service</dt><dd>{{ connected ? 'online' : 'offline' }}</dd></div>
+            <div><dt>Token</dt><dd>{{ token ? 'present' : 'missing' }}</dd></div>
+            <div><dt>Books</dt><dd>{{ bookTotal }}</dd></div>
+            <div><dt>Jobs</dt><dd>{{ jobs.length }}</dd></div>
+          </dl>
+          <div class="endpoint-group">
+            <span class="eyebrow">Health</span>
+            <a :href="routeUrl('/health')" target="_blank" rel="noreferrer">/health</a>
+          </div>
+          <div class="endpoint-group">
+            <span class="eyebrow">Current Base</span>
+            <code>{{ serviceBaseUrl }}</code>
+          </div>
         </div>
       </section>
     </div>
@@ -278,7 +321,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   getBrowserSession,
   KBaseClient,
@@ -295,7 +338,7 @@ import { renderMarkdown } from './utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
 const layoutStorageKey = 'dedao-kbase-web-layout'
-const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'Jobs', 'System KB']
+const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'Jobs', 'System KB', 'Skills/API', 'Ops']
 const chatModes = [
   { value: 'chat', label: '问答' },
   { value: 'summary', label: '总结' },
@@ -311,11 +354,38 @@ const chatModelOptions = [
 ]
 
 type JobActionValue = 'notebooklm_export' | 'health_system_kb_v2' | 'quant_rule_cards'
+type NavigationPanel = 'library' | 'study' | 'details'
+type NavigationItem = { key: string; label: string; meta: string; panel: NavigationPanel; tab?: string }
 
 const jobActions: Array<{ value: JobActionValue; label: string; description: string }> = [
   { value: 'notebooklm_export', label: 'NotebookLM', description: '导出当前书籍的 NotebookLM 学习资料包' },
   { value: 'health_system_kb_v2', label: 'Health KB', description: '生成 health_system_kb_v2 draft 供下游审核' },
   { value: 'quant_rule_cards', label: 'Quant Rules', description: '生成 paper-only 量化规则卡 draft' },
+]
+
+const navigationItems: NavigationItem[] = [
+  { key: 'library', label: '书库', meta: 'Search', panel: 'library' },
+  { key: 'study', label: '学习', meta: 'Chat', panel: 'study', tab: 'Overview' },
+  { key: 'jobs', label: '任务', meta: 'Exports', panel: 'details', tab: 'Jobs' },
+  { key: 'system-kb', label: 'System KB', meta: 'Manifest', panel: 'details', tab: 'System KB' },
+  { key: 'skills', label: 'Skills/API', meta: 'Interop', panel: 'details', tab: 'Skills/API' },
+  { key: 'ops', label: '运维', meta: 'Status', panel: 'details', tab: 'Ops' },
+]
+
+const publicDiscoveryRoutes = [
+  '/.well-known/dedao-kbase-skills.json',
+  '/api/skills',
+  '/api/skills/dedao.book.search/manifest.json',
+  '/api/skills/dedao.book.search/openapi.json',
+  '/api/skills/dedao.book.search/SKILL.md',
+]
+
+const protectedApiRoutes = [
+  '/api/books',
+  '/api/search',
+  '/api/jobs',
+  '/api/system-kb/manifest',
+  '/api/system-kb/export',
 ]
 
 const baseUrl = ref(window.location.origin)
@@ -335,6 +405,7 @@ const selectedPackage = ref<BookKnowledgePackage | null>(null)
 const searchScope = ref<'selected' | 'all'>('selected')
 const searchResults = ref<BookKnowledgeSearchResult[]>([])
 const activeTab = ref('Overview')
+const activeNavigationHint = ref('study')
 const systemKBPayload = ref<Record<string, unknown> | null>(null)
 const promptTemplates = ref<BookKnowledgePrompt[]>([])
 const selectedPromptID = ref('')
@@ -349,6 +420,9 @@ const jobs = ref<BookKnowledgeJob[]>([])
 const jobsLoading = ref(false)
 const jobError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
+const libraryPanelRef = ref<HTMLElement | null>(null)
+const studyPanelRef = ref<HTMLElement | null>(null)
+const detailPanelRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 340, right: 320 })
 const activeResizeTarget = ref<'left' | 'right' | null>(null)
 
@@ -358,6 +432,29 @@ const workbenchStyle = computed(() => ({
   '--left-column': `${layoutColumns.value.left}px`,
   '--right-column': `${layoutColumns.value.right}px`,
 }))
+
+const serviceBaseUrl = computed(() => {
+  return (baseUrl.value || window.location.origin).replace(/\/+$/, '')
+})
+
+const activeNavigationKey = computed(() => {
+  if (activeTab.value === 'Jobs') {
+    return 'jobs'
+  }
+  if (activeTab.value === 'System KB') {
+    return 'system-kb'
+  }
+  if (activeTab.value === 'Skills/API') {
+    return 'skills'
+  }
+  if (activeTab.value === 'Ops') {
+    return 'ops'
+  }
+  if (activeNavigationHint.value === 'library') {
+    return 'library'
+  }
+  return 'study'
+})
 
 const formattedSystemKB = computed(() => {
   return systemKBPayload.value ? JSON.stringify(systemKBPayload.value, null, 2) : 'No System KB payload loaded'
@@ -440,6 +537,28 @@ const connectAndRefresh = async () => {
   saveConnection()
   await loadBooks()
   await loadJobs()
+}
+
+const navigateTo = async (item: NavigationItem) => {
+  activeNavigationHint.value = item.key
+  if (item.tab) {
+    activeTab.value = item.tab
+  }
+  if (item.key === 'jobs') {
+    await loadJobs()
+  }
+  await nextTick()
+  scrollNavigationPanel(item.panel)
+}
+
+const scrollNavigationPanel = (panel: NavigationPanel) => {
+  const target = (
+    panel === 'library' ? libraryPanelRef.value : panel === 'study' ? studyPanelRef.value : detailPanelRef.value
+  ) as HTMLElement | null
+  if (!target || !window.matchMedia('(max-width: 1180px)').matches) {
+    return
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 const withRequest = async (operation: () => Promise<void>) => {
@@ -626,6 +745,10 @@ const formatJobTime = (value?: string) => {
   }
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+const routeUrl = (path: string) => {
+  return `${serviceBaseUrl.value}${path}`
 }
 
 const setChatMode = (mode: string) => {

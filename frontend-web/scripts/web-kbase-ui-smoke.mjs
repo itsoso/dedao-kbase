@@ -13,12 +13,15 @@ const apiSource = readFileSync(apiPath, 'utf8')
 for (const hook of [
   'kbase-web-shell',
   'connection-bar',
+  'app-navigation',
   'book-rail',
   'book-pagination',
   'library-search-panel',
   'chat-panel',
   'detail-panel',
+  'interop-panel',
   'jobs-panel',
+  'ops-panel',
   'system-kb-panel',
   'model-select',
   'column-resizer',
@@ -34,6 +37,8 @@ for (const surface of [
   'listBooksPage',
   'getBook',
   'getBrowserSession',
+  'navigationItems',
+  'navigateTo',
   'combinedSearchQuery',
   'runLibrarySearch',
   'renderedChatAnswer',
@@ -58,6 +63,9 @@ assert.ok(appSource.includes('Claims'), 'App.vue should expose claim details')
 assert.ok(appSource.includes('Chunks'), 'App.vue should expose chunk details')
 assert.ok(appSource.includes('System KB'), 'App.vue should expose system KB details')
 assert.ok(appSource.includes('Jobs'), 'App.vue should expose jobs details')
+assert.ok(appSource.includes('Skills/API'), 'App.vue should expose skills/API navigation')
+assert.ok(appSource.includes('Ops'), 'App.vue should expose ops navigation')
+assert.ok(appSource.includes('/.well-known/dedao-kbase-skills.json'), 'App.vue should expose skill discovery route')
 assert.ok(appSource.includes('chatHistory'), 'App.vue should expose chat history')
 assert.ok(appSource.includes('promptTemplates'), 'App.vue should expose prompt templates')
 assert.ok(appSource.includes('layoutColumns'), 'App.vue should persist draggable column widths')

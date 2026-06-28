@@ -69,6 +69,7 @@ textarea {
 }
 
 .connection-bar,
+.app-navigation,
 .book-rail,
 .search-panel,
 .library-search-panel,
@@ -87,6 +88,47 @@ textarea {
   gap: 12px;
   align-items: end;
   padding: 12px;
+}
+
+.app-navigation {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  padding: 8px;
+}
+
+.app-navigation button {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.app-navigation button.active {
+  border-color: #397367;
+  background: #f1faf6;
+}
+
+.app-navigation span {
+  overflow: hidden;
+  max-width: 100%;
+  color: #121926;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.app-navigation small {
+  overflow: hidden;
+  max-width: 100%;
+  color: #6c7b8f;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
 }
 
 .brand-block h1,
@@ -350,7 +392,9 @@ label span {
 }
 
 .detail-body,
+.interop-panel,
 .jobs-panel,
+.ops-panel,
 .system-kb-panel {
   max-height: calc(100vh - 174px);
   overflow: auto;
@@ -702,6 +746,60 @@ label span {
   font-size: 12px;
 }
 
+.endpoint-group {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+
+.endpoint-group a,
+.endpoint-group code {
+  display: block;
+  border: 1px solid #dbe2ec;
+  border-radius: 6px;
+  padding: 8px 9px;
+  overflow-wrap: anywhere;
+  background: #fbfcfe;
+  color: #263244;
+  font-size: 12px;
+  line-height: 18px;
+  text-decoration: none;
+}
+
+.endpoint-group a:hover {
+  border-color: #397367;
+  color: #153f37;
+}
+
+.ops-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.ops-grid div {
+  border: 1px solid #dbe2ec;
+  border-radius: 6px;
+  padding: 8px;
+  background: #fbfcfe;
+}
+
+.ops-grid dt {
+  color: #6c7b8f;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.ops-grid dd {
+  margin: 2px 0 0;
+  color: #121926;
+  font-size: 16px;
+  font-weight: 700;
+}
+
 pre {
   min-height: 420px;
   margin: 0;
@@ -728,6 +826,7 @@ pre {
   }
 
   .connection-bar,
+  .app-navigation,
   .workbench-grid {
     grid-template-columns: 1fr;
   }
@@ -754,7 +853,9 @@ pre {
   .result-list,
   .table-list,
   .detail-body,
+  .interop-panel,
   .jobs-panel,
+  .ops-panel,
   .system-kb-panel {
     max-height: none;
   }
