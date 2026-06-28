@@ -1,6 +1,9 @@
 package app
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExtractBookKnowledgeFromHTML(t *testing.T) {
 	html := `<!doctype html>
@@ -90,5 +93,28 @@ func TestExtractBookKnowledgeFromGeneratedHeaderHTML(t *testing.T) {
 	}
 	if pkg.Chapters[0].Title != "第一章" {
 		t.Fatalf("chapter title = %q, want 第一章", pkg.Chapters[0].Title)
+	}
+}
+
+func TestExtractBookKnowledgeFromMarkdown(t *testing.T) {
+	pkg, err := ExtractBookKnowledgeFromMarkdown(BookKnowledgeBook{
+		BookID:    "odob-301",
+		Title:     "每天听本书",
+		Extractor: "dedao-gui-odob-transcript",
+	}, "# 学习闭环\n\n- 输入\n- 输出\n- 复盘\n\n## 行动建议\n\n每天记录一个问题。")
+	if err != nil {
+		t.Fatalf("ExtractBookKnowledgeFromMarkdown returned error: %v", err)
+	}
+	if pkg.Book.BookID != "odob-301" || pkg.Book.Extractor != "dedao-gui-odob-transcript" {
+		t.Fatalf("book = %#v", pkg.Book)
+	}
+	if len(pkg.Chapters) != 2 || pkg.Chapters[0].Title != "学习闭环" || pkg.Chapters[1].Title != "行动建议" {
+		t.Fatalf("chapters = %#v", pkg.Chapters)
+	}
+	if len(pkg.Chunks) != 2 || !strings.Contains(pkg.Chunks[0].Text, "输入") {
+		t.Fatalf("chunks = %#v", pkg.Chunks)
+	}
+	if len(pkg.Claims) != 2 || pkg.Claims[0].ReviewStatus != "draft" {
+		t.Fatalf("claims = %#v", pkg.Claims)
 	}
 }

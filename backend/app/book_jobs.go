@@ -33,6 +33,7 @@ const (
 	BookKnowledgeJobTypeDedaoEbookDownload  = "dedao_ebook_download"
 	BookKnowledgeJobTypeDedaoEbookSyncKBase = "dedao_ebook_sync_kbase"
 	BookKnowledgeJobTypeDedaoOdobDownload   = "dedao_odob_download"
+	BookKnowledgeJobTypeDedaoOdobSyncKBase  = "dedao_odob_sync_kbase"
 )
 
 type BookKnowledgeJob struct {
@@ -82,6 +83,7 @@ var (
 	runDedaoEbookDownloadJob  = executeDedaoEbookDownloadJob
 	runDedaoEbookSyncKBaseJob = executeDedaoEbookSyncKBaseJob
 	runDedaoOdobDownloadJob   = executeDedaoOdobDownloadJob
+	runDedaoOdobSyncKBaseJob  = executeDedaoOdobSyncKBaseJob
 )
 
 func (s *BookKnowledgeStore) JobsPath() string {
@@ -281,6 +283,8 @@ func (s *BookKnowledgeStore) executeBookKnowledgeJob(job BookKnowledgeJob) (map[
 		return runDedaoEbookSyncKBaseJob(context.Background(), s, job)
 	case BookKnowledgeJobTypeDedaoOdobDownload:
 		return runDedaoOdobDownloadJob(context.Background(), job)
+	case BookKnowledgeJobTypeDedaoOdobSyncKBase:
+		return runDedaoOdobSyncKBaseJob(context.Background(), s, job)
 	default:
 		return nil, fmt.Errorf("unknown job type: %s", job.Type)
 	}
@@ -365,6 +369,9 @@ func normalizeBookKnowledgeJobRequest(request BookKnowledgeJobRequest) (BookKnow
 	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
 		return normalizeDedaoEbookJobRequest(request, false)
 	case BookKnowledgeJobTypeDedaoOdobDownload:
+		return normalizeDedaoOdobJobRequest(request)
+	case BookKnowledgeJobTypeDedaoOdobSyncKBase:
+		request.DownloadType = 3
 		return normalizeDedaoOdobJobRequest(request)
 	default:
 		return request, fmt.Errorf("unsupported job type: %s", request.Type)
@@ -469,6 +476,26 @@ func executeDedaoOdobDownloadJob(ctx context.Context, job BookKnowledgeJob) (map
 		"download_type": job.DownloadType,
 		"output_dir":    cfg.RepoDir,
 		"title":         title,
+	}, nil
+}
+
+func executeDedaoOdobSyncKBaseJob(ctx context.Context, store *BookKnowledgeStore, job BookKnowledgeJob) (map[string]any, error) {
+	result, err := SyncOdobToWikiStore(ctx, store, job)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"book_id":             result.KnowledgeBookID,
+		"odob_id":             job.OdobID,
+		"odob_enid":           job.OdobEnID,
+		"odob_alias_id":       job.OdobAliasID,
+		"download_type":       3,
+		"knowledge_book_id":   result.KnowledgeBookID,
+		"title":               result.Title,
+		"chapters":            result.Chapters,
+		"chunks":              result.Chunks,
+		"claims":              result.Claims,
+		"book_knowledge_root": result.BookKnowledgeRoot,
 	}, nil
 }
 

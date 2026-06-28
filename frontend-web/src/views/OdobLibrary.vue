@@ -73,11 +73,19 @@
               </button>
               <button
                 type="button"
+                class="secondary-action"
+                :disabled="isOdobActionLoading('sync', odob)"
+                @click.stop="createOdobSyncJob(odob)"
+              >
+                {{ isOdobActionLoading('sync', odob) ? '入库中' : '加入知识库' }}
+              </button>
+              <button
+                type="button"
                 class="primary-action compact"
-                :disabled="isOdobActionLoading(odob)"
+                :disabled="isOdobActionLoading('download', odob)"
                 @click.stop="createOdobDownloadJob(odob)"
               >
-                {{ isOdobActionLoading(odob) ? '下载中' : '下载' }}
+                {{ isOdobActionLoading('download', odob) ? '下载中' : '下载' }}
               </button>
             </div>
           </article>
@@ -117,7 +125,20 @@
           <button type="button" class="secondary-action" :disabled="transcriptLoading" @click="loadTranscript(selectedOdob)">
             {{ transcriptLoading ? '加载文稿' : '阅读文稿' }}
           </button>
-          <button type="button" class="primary-action compact" :disabled="isOdobActionLoading(selectedOdob)" @click="createOdobDownloadJob(selectedOdob)">
+          <button
+            type="button"
+            class="secondary-action"
+            :disabled="isOdobActionLoading('sync', selectedOdob)"
+            @click="createOdobSyncJob(selectedOdob)"
+          >
+            加入知识库
+          </button>
+          <button
+            type="button"
+            class="primary-action compact"
+            :disabled="isOdobActionLoading('download', selectedOdob)"
+            @click="createOdobDownloadJob(selectedOdob)"
+          >
             下载
           </button>
         </div>
@@ -216,6 +237,7 @@ import { renderMarkdown } from '../utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
 const odobDownloadJobType = 'dedao_odob_download'
+const odobSyncJobType = 'dedao_odob_sync_kbase'
 const downloadTypeOptions = [
   { value: 1, label: 'MP3' },
   { value: 2, label: 'PDF文稿' },
@@ -468,6 +490,14 @@ const loadJobs = async () => {
 }
 
 const createOdobDownloadJob = async (odob: DedaoOdob | null) => {
+  await createOdobJob(odob, 'download')
+}
+
+const createOdobSyncJob = async (odob: DedaoOdob | null) => {
+  await createOdobJob(odob, 'sync')
+}
+
+const createOdobJob = async (odob: DedaoOdob | null, action: 'download' | 'sync') => {
   if (!odob) {
     return
   }
@@ -482,18 +512,18 @@ const createOdobDownloadJob = async (odob: DedaoOdob | null) => {
     return
   }
   selectOdob(odob)
-  actionLoadingKey.value = key
+  actionLoadingKey.value = odobActionKey(action, odob)
   errorMessage.value = ''
   try {
     saveConnection()
     const job = await client.value.createJob({
-      type: odobDownloadJobType,
+      type: action === 'download' ? odobDownloadJobType : odobSyncJobType,
       odob_id: odob.id,
       odob_enid: key,
       odob_title: odob.title,
       odob_alias_id: odob.audio_alias_id,
       odob_can_play: odob.has_play_auth,
-      download_type: downloadTypeFor(odob),
+      download_type: action === 'download' ? downloadTypeFor(odob) : 3,
     })
     jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
   } catch (error) {
@@ -516,7 +546,9 @@ const setDownloadType = (odob: DedaoOdob | null, event: Event) => {
     [odobKey(odob)]: value,
   }
 }
-const isOdobActionLoading = (odob: DedaoOdob | null) => Boolean(odob && actionLoadingKey.value === odobKey(odob))
+const odobActionKey = (action: 'download' | 'sync', odob: DedaoOdob) => `${action}:${odobKey(odob)}`
+const isOdobActionLoading = (action: 'download' | 'sync', odob: DedaoOdob | null) =>
+  Boolean(odob && actionLoadingKey.value === odobActionKey(action, odob))
 const jobMatchesOdob = (job: BookKnowledgeJob, odob: DedaoOdob) => {
   const key = odobKey(odob)
   const resultOdobID = Number(job.result?.odob_id || 0)
@@ -534,6 +566,9 @@ const jobMatchesOdob = (job: BookKnowledgeJob, odob: DedaoOdob) => {
 const jobTypeLabel = (job: BookKnowledgeJob) => {
   if (job.type === odobDownloadJobType) {
     return `下载 ${downloadTypeLabel(job.download_type || Number(job.result?.download_type || 1))}`
+  }
+  if (job.type === odobSyncJobType) {
+    return '加入书籍知识库'
   }
   return job.type
 }

@@ -90,6 +90,55 @@ func ExtractBookKnowledgeFromHTML(book BookKnowledgeBook, htmlContent string) (*
 	return builder.build(), nil
 }
 
+func BuildBookKnowledgeFromMarkdown(book BookKnowledgeBook, markdown string, store *BookKnowledgeStore) (*BookKnowledgePackage, error) {
+	pkg, err := ExtractBookKnowledgeFromMarkdown(book, markdown)
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	if err := store.SavePackage(*pkg); err != nil {
+		return nil, err
+	}
+	return pkg, nil
+}
+
+func ExtractBookKnowledgeFromMarkdown(book BookKnowledgeBook, markdown string) (*BookKnowledgePackage, error) {
+	if strings.TrimSpace(book.BookID) == "" {
+		return nil, fmt.Errorf("book_id is required")
+	}
+	blocks := extractMarkdownBookBlocks(markdown)
+	if len(blocks) == 0 {
+		return nil, fmt.Errorf("markdown contains no readable text: book_id=%s", book.BookID)
+	}
+
+	now := time.Now().Format(time.RFC3339)
+	if strings.TrimSpace(book.Status) == "" {
+		book.Status = "draft"
+	}
+	if strings.TrimSpace(book.Extractor) == "" {
+		book.Extractor = defaultBookKnowledgeExtractor
+	}
+	if strings.TrimSpace(book.CreatedAt) == "" {
+		book.CreatedAt = now
+	}
+	book.UpdatedAt = now
+
+	builder := bookKnowledgePackageBuilder{book: book}
+	for _, block := range blocks {
+		if block.Text == "" {
+			continue
+		}
+		if block.Kind == "heading" {
+			builder.startChapter(block.Text)
+			continue
+		}
+		builder.addParagraph(block.Text)
+	}
+	return builder.build(), nil
+}
+
 func extractBookBlocks(doc *goquery.Document) []extractedBookBlock {
 	selector := "h1,h2,h3,h4,h5,h6,div[class^='header'],p"
 	var blocks []extractedBookBlock
@@ -108,6 +157,40 @@ func extractBookBlocks(doc *goquery.Document) []extractedBookBlock {
 		}
 		blocks = append(blocks, extractedBookBlock{Kind: kind, Text: text})
 	})
+	return blocks
+}
+
+func extractMarkdownBookBlocks(markdown string) []extractedBookBlock {
+	var blocks []extractedBookBlock
+	var paragraph []string
+	flushParagraph := func() {
+		text := normalizeBookText(strings.Join(paragraph, " "))
+		if text != "" {
+			blocks = append(blocks, extractedBookBlock{Kind: "paragraph", Text: text})
+		}
+		paragraph = nil
+	}
+
+	for _, line := range strings.Split(markdown, "\n") {
+		text := strings.TrimSpace(line)
+		if text == "" {
+			flushParagraph()
+			continue
+		}
+		if strings.HasPrefix(text, "#") {
+			flushParagraph()
+			title := strings.TrimSpace(strings.TrimLeft(text, "#"))
+			if title != "" {
+				blocks = append(blocks, extractedBookBlock{Kind: "heading", Text: normalizeBookText(title)})
+			}
+			continue
+		}
+		text = strings.TrimSpace(strings.TrimLeft(text, "-*0123456789.、)） "))
+		if text != "" {
+			paragraph = append(paragraph, text)
+		}
+	}
+	flushParagraph()
 	return blocks
 }
 

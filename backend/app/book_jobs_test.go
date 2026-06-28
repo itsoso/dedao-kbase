@@ -83,6 +83,26 @@ func TestBookKnowledgeJobAcceptsDedaoOdobDownload(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobAcceptsDedaoOdobSyncKBase(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:        BookKnowledgeJobTypeDedaoOdobSyncKBase,
+		OdobID:      301,
+		OdobEnID:    "odob-enid",
+		OdobTitle:   "每天听本书",
+		OdobAliasID: "audio-alias",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob returned error: %v", err)
+	}
+
+	if job.Type != BookKnowledgeJobTypeDedaoOdobSyncKBase || job.OdobID != 301 ||
+		job.OdobEnID != "odob-enid" || job.OdobAliasID != "audio-alias" || job.DownloadType != 3 {
+		t.Fatalf("job = %#v", job)
+	}
+}
+
 func TestBookKnowledgeJobRejectsInvalidDedaoEbookJobs(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	tests := []struct {
@@ -235,6 +255,40 @@ func TestBookKnowledgeJobExecutesDedaoOdobDownload(t *testing.T) {
 		t.Fatalf("gotJob = %#v", gotJob)
 	}
 	if result["download_type"] != 2 || result["odob_alias_id"] != "audio-alias" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestBookKnowledgeJobExecutesDedaoOdobSyncKBase(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldRunner := runDedaoOdobSyncKBaseJob
+	defer func() { runDedaoOdobSyncKBaseJob = oldRunner }()
+
+	var gotStore *BookKnowledgeStore
+	var gotJob BookKnowledgeJob
+	runDedaoOdobSyncKBaseJob = func(_ context.Context, store *BookKnowledgeStore, job BookKnowledgeJob) (map[string]any, error) {
+		gotStore = store
+		gotJob = job
+		return map[string]any{"knowledge_book_id": "odob-301"}, nil
+	}
+
+	result, err := store.executeBookKnowledgeJob(BookKnowledgeJob{
+		Type:        BookKnowledgeJobTypeDedaoOdobSyncKBase,
+		OdobID:      301,
+		OdobEnID:    "odob-enid",
+		OdobTitle:   "每天听本书",
+		OdobAliasID: "audio-alias",
+	})
+	if err != nil {
+		t.Fatalf("executeBookKnowledgeJob returned error: %v", err)
+	}
+	if gotStore != store {
+		t.Fatalf("gotStore = %#v, want test store", gotStore)
+	}
+	if gotJob.OdobID != 301 || gotJob.OdobEnID != "odob-enid" || gotJob.OdobAliasID != "audio-alias" {
+		t.Fatalf("gotJob = %#v", gotJob)
+	}
+	if result["knowledge_book_id"] != "odob-301" {
 		t.Fatalf("result = %#v", result)
 	}
 }
