@@ -91,6 +91,10 @@ func SyncEbookToWiki(ctx context.Context, id int, enid string) (*EbookWikiSyncRe
 	return syncEbookToWikiWithConfig(ctx, id, enid, DefaultEbookWikiSyncConfig(), osEbookWikiCommandRunner{})
 }
 
+func SyncEbookToWikiStore(ctx context.Context, id int, enid string, store *BookKnowledgeStore) (*EbookWikiSyncResult, error) {
+	return syncEbookToWikiWithConfigAndStore(ctx, id, enid, DefaultEbookWikiSyncConfig(), osEbookWikiCommandRunner{}, store)
+}
+
 func syncEbookToWikiWithConfig(
 	ctx context.Context,
 	id int,
@@ -98,7 +102,21 @@ func syncEbookToWikiWithConfig(
 	cfg EbookWikiSyncConfig,
 	runner ebookWikiCommandRunner,
 ) (*EbookWikiSyncResult, error) {
+	return syncEbookToWikiWithConfigAndStore(ctx, id, enid, cfg, runner, DefaultBookKnowledgeStore())
+}
+
+func syncEbookToWikiWithConfigAndStore(
+	ctx context.Context,
+	id int,
+	enid string,
+	cfg EbookWikiSyncConfig,
+	runner ebookWikiCommandRunner,
+	knowledgeStore *BookKnowledgeStore,
+) (*EbookWikiSyncResult, error) {
 	cfg = cfg.withDefaults()
+	if knowledgeStore == nil {
+		knowledgeStore = DefaultBookKnowledgeStore()
+	}
 	emitEbookWikiProgress(ctx, "正在下载电子书")
 	download := EBookDownload{
 		Ctx:          ctx,
@@ -124,7 +142,6 @@ func syncEbookToWikiWithConfig(
 		HTMLPath: result.HTMLPath,
 	}
 	emitEbookWikiProgress(ctx, "正在生成本地知识包")
-	knowledgeStore := DefaultBookKnowledgeStore()
 	knowledgePackage, err := BuildBookKnowledgeFromHTMLFile(BookKnowledgeBook{
 		BookID:  strconv.Itoa(id),
 		DedaoID: id,

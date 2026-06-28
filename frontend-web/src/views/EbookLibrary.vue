@@ -70,13 +70,16 @@
         </div>
 
         <div class="ebook-list">
-          <button
+          <article
             v-for="ebook in ebooks"
             :key="ebook.enid || ebook.id"
-            type="button"
             class="ebook-row"
             :class="{ active: selectedKey === ebookKey(ebook) }"
+            role="button"
+            tabindex="0"
             @click="openEbook(ebook)"
+            @keydown.enter.prevent="openEbook(ebook)"
+            @keydown.space.prevent="openEbook(ebook)"
           >
             <div class="cover-frame">
               <img v-if="ebook.icon" :src="ebook.icon" alt="" />
@@ -96,7 +99,30 @@
               <span>{{ safeProgress(ebook.progress) }}%</span>
               <small>{{ ebook.publish_num || 0 }} 篇</small>
             </div>
-          </button>
+            <div class="ebook-action-bar" @click.stop @keydown.stop>
+              <select :value="downloadTypeFor(ebook)" @change.stop="setDownloadType(ebook, $event)">
+                <option v-for="option in downloadTypeOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+              <button
+                type="button"
+                class="secondary-action"
+                :disabled="isEbookActionLoading('sync', ebook)"
+                @click.stop="createEbookSyncJob(ebook)"
+              >
+                {{ isEbookActionLoading('sync', ebook) ? '入库中' : '加入书籍知识库' }}
+              </button>
+              <button
+                type="button"
+                class="primary-action compact"
+                :disabled="isEbookActionLoading('download', ebook)"
+                @click.stop="createEbookDownloadJob(ebook)"
+              >
+                {{ isEbookActionLoading('download', ebook) ? '下载中' : '下载' }}
+              </button>
+            </div>
+          </article>
 
           <div v-if="!loading && !ebooks.length" class="empty-state">
             {{ token ? '当前页没有电子书，尝试刷新、换页或重新扫码登录。' : '缺少 KBASE_AUTH_TOKEN，登录浏览器页后会自动填充。' }}
@@ -113,7 +139,16 @@
       <aside class="ebook-detail-panel">
         <span class="eyebrow">Study Context</span>
         <h2>{{ selectedEbook?.title || '选择一本电子书' }}</h2>
-        <p>{{ selectedEbook?.intro || '这里显示当前书的学习摘要。详情、书评和下载会在后续切片迁移。' }}</p>
+        <p>{{ selectedEbook?.intro || '这里显示当前书的学习摘要，可从书架直接下载或加入书籍知识库。' }}</p>
+        <div v-if="selectedEbook" class="detail-action-row">
+          <select :value="downloadTypeFor(selectedEbook)" @change="setDownloadType(selectedEbook, $event)">
+            <option v-for="option in downloadTypeOptions" :key="option.value" :value="option.value">
+              {{ option.label }}
+            </option>
+          </select>
+          <button type="button" class="secondary-action" @click="createEbookSyncJob(selectedEbook)">加入知识库</button>
+          <button type="button" class="primary-action compact" @click="createEbookDownloadJob(selectedEbook)">下载</button>
+        </div>
         <dl class="ebook-detail-list">
           <div>
             <dt>ID</dt>
@@ -132,6 +167,28 @@
             <dd>{{ selectedEbook?.last_read || '-' }}</dd>
           </div>
         </dl>
+        <section class="ebook-job-status">
+          <div class="job-status-head">
+            <div>
+              <span class="eyebrow">Jobs</span>
+              <strong>当前书任务</strong>
+            </div>
+            <button type="button" class="secondary-action tiny" :disabled="jobLoading" @click="loadJobs">
+              {{ jobLoading ? '刷新中' : '刷新' }}
+            </button>
+          </div>
+          <div v-if="selectedEbookJobs.length" class="job-status-list">
+            <article v-for="job in selectedEbookJobs" :key="job.id" class="job-status-item">
+              <div>
+                <strong>{{ jobTypeLabel(job) }}</strong>
+                <span :class="['job-pill', job.status]">{{ job.status }}</span>
+              </div>
+              <p v-if="job.error">{{ job.error }}</p>
+              <small>{{ formatJobTime(job.updated_at) }}</small>
+            </article>
+          </div>
+          <p v-else class="job-empty">暂无当前书任务。</p>
+        </section>
       </aside>
     </section>
   </main>
@@ -140,15 +197,23 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { getBrowserSession, KBaseClient, type DedaoEbook } from '../api'
+import { getBrowserSession, KBaseClient, type BookKnowledgeJob, type DedaoEbook } from '../api'
 
 const storageKey = 'dedao-kbase-web-settings'
+const ebookDownloadJobType = 'dedao_ebook_download'
+const ebookSyncJobType = 'dedao_ebook_sync_kbase'
+const downloadTypeOptions = [
+  { value: 1, label: 'HTML' },
+  { value: 2, label: 'PDF' },
+  { value: 3, label: 'EPUB' },
+]
 const router = useRouter()
 
 const baseUrl = ref(window.location.origin)
 const token = ref('')
 const connected = ref(false)
 const loading = ref(false)
+const jobLoading = ref(false)
 const errorMessage = ref('')
 const query = ref('')
 const page = ref(1)
@@ -158,9 +223,19 @@ const totalPages = ref(0)
 const isMore = ref(0)
 const ebooks = ref<DedaoEbook[]>([])
 const selectedKey = ref('')
+const jobs = ref<BookKnowledgeJob[]>([])
+const actionLoadingKey = ref('')
+const downloadTypes = ref<Record<string, number>>({})
 
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 const selectedEbook = computed(() => ebooks.value.find((ebook) => ebookKey(ebook) === selectedKey.value) || null)
+const selectedEbookJobs = computed(() => {
+  const ebook = selectedEbook.value
+  if (!ebook) {
+    return []
+  }
+  return jobs.value.filter((job) => jobMatchesEbook(job, ebook)).slice(0, 6)
+})
 const canGoNext = computed(() => {
   if (totalPages.value > 0) {
     return page.value < totalPages.value
@@ -174,6 +249,7 @@ onMounted(async () => {
     await hydrateBrowserSession()
     if (token.value) {
       await loadEbooks()
+      await loadJobs()
     }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
@@ -225,6 +301,12 @@ const loadEbooks = async () => {
     total.value = result.total || 0
     totalPages.value = result.total_pages || 0
     isMore.value = result.is_more || 0
+    for (const ebook of ebooks.value) {
+      const key = ebookKey(ebook)
+      if (key && !downloadTypes.value[key]) {
+        downloadTypes.value[key] = 1
+      }
+    }
     connected.value = true
     if (!ebooks.value.some((ebook) => ebookKey(ebook) === selectedKey.value)) {
       selectedKey.value = ebooks.value[0] ? ebookKey(ebooks.value[0]) : ''
@@ -240,6 +322,7 @@ const loadEbooks = async () => {
 const reloadFromFirstPage = async () => {
   page.value = 1
   await loadEbooks()
+  await loadJobs()
 }
 
 const changePage = async (nextPage: number) => {
@@ -256,8 +339,100 @@ const openEbook = (ebook: DedaoEbook) => {
   router.push(`/ebook/${encodeURIComponent(ebookKey(ebook))}`)
 }
 
+const loadJobs = async () => {
+  if (!token.value) {
+    return
+  }
+  jobLoading.value = true
+  try {
+    jobs.value = await client.value.listJobs(50)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    jobLoading.value = false
+  }
+}
+
+const createEbookDownloadJob = async (ebook: DedaoEbook | null) => {
+  await createEbookJob(ebook, 'download')
+}
+
+const createEbookSyncJob = async (ebook: DedaoEbook | null) => {
+  await createEbookJob(ebook, 'sync')
+}
+
+const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sync') => {
+  if (!ebook) {
+    return
+  }
+  await hydrateBrowserSession()
+  if (!token.value) {
+    errorMessage.value = '缺少 KBASE_AUTH_TOKEN，登录浏览器页后会自动填充。'
+    return
+  }
+  const key = ebookKey(ebook)
+  if (!ebook.id || !key) {
+    errorMessage.value = '当前电子书缺少 id 或 enid，无法创建任务。'
+    return
+  }
+  selectEbook(ebook)
+  actionLoadingKey.value = ebookActionKey(action, ebook)
+  errorMessage.value = ''
+  try {
+    saveConnection()
+    const job = await client.value.createJob({
+      type: action === 'download' ? ebookDownloadJobType : ebookSyncJobType,
+      ebook_id: ebook.id,
+      ebook_enid: key,
+      download_type: action === 'download' ? downloadTypeFor(ebook) : 1,
+    })
+    jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    actionLoadingKey.value = ''
+  }
+}
+
 const ebookKey = (ebook: DedaoEbook) => ebook.enid || String(ebook.id)
 const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
+const downloadTypeFor = (ebook: DedaoEbook | null) => (ebook ? downloadTypes.value[ebookKey(ebook)] || 1 : 1)
+const setDownloadType = (ebook: DedaoEbook | null, event: Event) => {
+  if (!ebook) {
+    return
+  }
+  const value = Number((event.target as HTMLSelectElement).value)
+  downloadTypes.value = {
+    ...downloadTypes.value,
+    [ebookKey(ebook)]: value,
+  }
+}
+const ebookActionKey = (action: 'download' | 'sync', ebook: DedaoEbook) => `${action}:${ebookKey(ebook)}`
+const isEbookActionLoading = (action: 'download' | 'sync', ebook: DedaoEbook) =>
+  actionLoadingKey.value === ebookActionKey(action, ebook)
+const jobMatchesEbook = (job: BookKnowledgeJob, ebook: DedaoEbook) => {
+  const key = ebookKey(ebook)
+  const resultEbookID = Number(job.result?.ebook_id || 0)
+  const resultEbookEnID = typeof job.result?.ebook_enid === 'string' ? job.result.ebook_enid : ''
+  return job.ebook_id === ebook.id || resultEbookID === ebook.id || job.ebook_enid === key || resultEbookEnID === key
+}
+const jobTypeLabel = (job: BookKnowledgeJob) => {
+  if (job.type === ebookDownloadJobType) {
+    return `下载 ${downloadTypeLabel(job.download_type || Number(job.result?.download_type || 1))}`
+  }
+  if (job.type === ebookSyncJobType) {
+    return '加入书籍知识库'
+  }
+  return job.type
+}
+const downloadTypeLabel = (value: number) => downloadTypeOptions.find((option) => option.value === value)?.label || 'HTML'
+const formatJobTime = (value?: string) => {
+  if (!value) {
+    return '-'
+  }
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
 </script>
 
 <style scoped>
@@ -361,7 +536,11 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   align-items: center;
   width: 100%;
   min-height: 76px;
+  border: 1px solid #dbe2ec;
+  border-radius: 8px;
   padding: 9px;
+  background: #ffffff;
+  cursor: pointer;
   text-align: left;
 }
 
@@ -456,6 +635,58 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   font-weight: 700;
 }
 
+.ebook-action-bar {
+  display: flex;
+  grid-column: 2 / 4;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.ebook-action-bar select,
+.detail-action-row select {
+  height: 32px;
+  border: 1px solid #c8d2df;
+  border-radius: 7px;
+  padding: 0 8px;
+  background: #ffffff;
+  color: #263244;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.secondary-action {
+  min-height: 32px;
+  border: 1px solid #c8d2df;
+  border-radius: 7px;
+  padding: 0 10px;
+  background: #fbfcfe;
+  color: #263244;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.secondary-action:hover {
+  border-color: #397367;
+  color: #244b43;
+}
+
+.secondary-action:disabled,
+.primary-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.primary-action.compact {
+  min-height: 32px;
+  padding: 0 12px;
+}
+
+.secondary-action.tiny {
+  min-height: 28px;
+  padding: 0 8px;
+}
+
 .ebook-detail-panel h2 {
   margin: 0;
   color: #121926;
@@ -467,6 +698,96 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   margin: 8px 0 0;
   color: #536274;
   font-size: 13px;
+}
+
+.detail-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.ebook-job-status {
+  margin-top: 14px;
+  border-top: 1px solid #dbe2ec;
+  padding-top: 12px;
+}
+
+.job-status-head,
+.job-status-item div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.job-status-head strong {
+  display: block;
+  margin-top: 2px;
+  color: #121926;
+  font-size: 14px;
+}
+
+.job-status-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.job-status-item {
+  border: 1px solid #dbe2ec;
+  border-radius: 7px;
+  padding: 9px;
+  background: #fbfcfe;
+}
+
+.job-status-item strong {
+  color: #121926;
+  font-size: 12px;
+}
+
+.job-status-item p,
+.job-empty {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+  color: #8a3d33;
+  font-size: 12px;
+}
+
+.job-status-item small {
+  display: block;
+  margin-top: 6px;
+  color: #6c7b8f;
+  font-size: 11px;
+}
+
+.job-pill {
+  border: 1px solid #c8d2df;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #536274;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.job-pill.running,
+.job-pill.queued {
+  border-color: #b8c9e4;
+  background: #eef5ff;
+  color: #2f5f92;
+}
+
+.job-pill.succeeded {
+  border-color: #a7d1bd;
+  background: #effaf4;
+  color: #397367;
+}
+
+.job-pill.failed {
+  border-color: #e5b8ac;
+  background: #fff4f1;
+  color: #9b3f2e;
 }
 
 .empty-state {

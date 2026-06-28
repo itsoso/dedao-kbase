@@ -1,0 +1,152 @@
+package app
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestBookKnowledgeJobAcceptsDedaoEbookDownload(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:         BookKnowledgeJobTypeDedaoEbookDownload,
+		EbookID:      67929,
+		EbookEnID:    "ebook-enid",
+		DownloadType: 2,
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob returned error: %v", err)
+	}
+
+	if job.Type != BookKnowledgeJobTypeDedaoEbookDownload || job.EbookID != 67929 ||
+		job.EbookEnID != "ebook-enid" || job.DownloadType != 2 {
+		t.Fatalf("job = %#v", job)
+	}
+
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil {
+		t.Fatalf("LoadBookKnowledgeJob returned error: %v", err)
+	}
+	if loaded.EbookID != 67929 || loaded.EbookEnID != "ebook-enid" || loaded.DownloadType != 2 {
+		t.Fatalf("loaded job = %#v", loaded)
+	}
+}
+
+func TestBookKnowledgeJobAcceptsDedaoEbookSyncKBase(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:      BookKnowledgeJobTypeDedaoEbookSyncKBase,
+		EbookID:   67929,
+		EbookEnID: "ebook-enid",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob returned error: %v", err)
+	}
+
+	if job.Type != BookKnowledgeJobTypeDedaoEbookSyncKBase || job.EbookID != 67929 ||
+		job.EbookEnID != "ebook-enid" || job.DownloadType != 1 {
+		t.Fatalf("job = %#v", job)
+	}
+}
+
+func TestBookKnowledgeJobRejectsInvalidDedaoEbookJobs(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	tests := []struct {
+		name    string
+		request BookKnowledgeJobRequest
+		want    string
+	}{
+		{
+			name:    "download missing ebook id",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookEnID: "ebook-enid", DownloadType: 1},
+			want:    "ebook_id is required",
+		},
+		{
+			name:    "sync missing enid",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 67929},
+			want:    "ebook_enid is required",
+		},
+		{
+			name:    "download unsupported format",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 67929, EbookEnID: "ebook-enid", DownloadType: 9},
+			want:    "download_type must be 1, 2, or 3",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := store.CreateBookKnowledgeJob(tt.request)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %q, want %q", err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+func TestBookKnowledgeJobExecutesDedaoEbookDownload(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldRunner := runDedaoEbookDownloadJob
+	defer func() { runDedaoEbookDownloadJob = oldRunner }()
+
+	var gotJob BookKnowledgeJob
+	runDedaoEbookDownloadJob = func(_ context.Context, job BookKnowledgeJob) (map[string]any, error) {
+		gotJob = job
+		return map[string]any{
+			"ebook_id":      job.EbookID,
+			"download_type": job.DownloadType,
+		}, nil
+	}
+
+	result, err := store.executeBookKnowledgeJob(BookKnowledgeJob{
+		Type:         BookKnowledgeJobTypeDedaoEbookDownload,
+		EbookID:      67929,
+		EbookEnID:    "ebook-enid",
+		DownloadType: 3,
+	})
+	if err != nil {
+		t.Fatalf("executeBookKnowledgeJob returned error: %v", err)
+	}
+	if gotJob.EbookID != 67929 || gotJob.EbookEnID != "ebook-enid" || gotJob.DownloadType != 3 {
+		t.Fatalf("gotJob = %#v", gotJob)
+	}
+	if result["download_type"] != 3 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestBookKnowledgeJobExecutesDedaoEbookSyncKBase(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldRunner := runDedaoEbookSyncKBaseJob
+	defer func() { runDedaoEbookSyncKBaseJob = oldRunner }()
+
+	var gotStore *BookKnowledgeStore
+	var gotJob BookKnowledgeJob
+	runDedaoEbookSyncKBaseJob = func(_ context.Context, store *BookKnowledgeStore, job BookKnowledgeJob) (map[string]any, error) {
+		gotStore = store
+		gotJob = job
+		return map[string]any{"knowledge_book_id": "67929"}, nil
+	}
+
+	result, err := store.executeBookKnowledgeJob(BookKnowledgeJob{
+		Type:      BookKnowledgeJobTypeDedaoEbookSyncKBase,
+		EbookID:   67929,
+		EbookEnID: "ebook-enid",
+	})
+	if err != nil {
+		t.Fatalf("executeBookKnowledgeJob returned error: %v", err)
+	}
+	if gotStore != store {
+		t.Fatalf("gotStore = %#v, want test store", gotStore)
+	}
+	if gotJob.EbookID != 67929 || gotJob.EbookEnID != "ebook-enid" {
+		t.Fatalf("gotJob = %#v", gotJob)
+	}
+	if result["knowledge_book_id"] != "67929" {
+		t.Fatalf("result = %#v", result)
+	}
+}

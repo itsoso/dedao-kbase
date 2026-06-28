@@ -86,7 +86,7 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `GET /api/dedao/ebooks/{enid}`：读取电子书详情和目录，只返回阅读页需要的安全字段。
 - `GET /api/dedao/ebooks/{enid}/chapters/{chapter_id}/pages?index=0&count=8&offset=0`：读取单章节受限页数的解密 SVG 页面；服务端使用阅读 token，但不会把 token 下发给浏览器。
 - `GET /api/jobs?limit=30`：读取线上任务列表。
-- `POST /api/jobs`：为当前书籍创建导出任务，例如 `{"type":"notebooklm_export","book_id":"..."}` 或 `{"type":"book_export","book_id":"...","target":"health_system_kb_v2"}`。
+- `POST /api/jobs`：为当前书籍或电子书创建后台任务，例如 `{"type":"notebooklm_export","book_id":"..."}`、`{"type":"book_export","book_id":"...","target":"health_system_kb_v2"}`、`{"type":"dedao_ebook_download","ebook_id":67929,"ebook_enid":"...","download_type":1}` 或 `{"type":"dedao_ebook_sync_kbase","ebook_id":67929,"ebook_enid":"..."}`。
 - `GET /api/jobs/{job_id}`：读取任务状态、错误和导出结果。
 - `GET /api/search?q=关键词&limit=5`：检索书籍 chunks/claims。
 - `GET /api/system-kb/manifest`：返回 System KB export 摘要。
@@ -109,7 +109,7 @@ KBASE_WEB_DIR="$PWD/frontend-web/dist" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
-打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。页面提供全局导航，可切到书库、学习、课程、电子书架、登录、个人中心、任务、System KB、Skills/API 和运维状态。`/user/login` 支持得到扫码登录，轮询成功后由服务端保存 Cookie；`/user/profile` 只展示安全登录摘要；`/course` 提供只读课程列表、关键词筛选和分页，点击课程进入 `/course/{enid}` 后可查看课程详情、文章目录并阅读 Markdown 文章；`/ebook` 提供只读电子书架、关键词筛选和分页，点击电子书进入 `/ebook/{enid}` 后可查看书籍详情、目录并阅读受限批次 SVG 页面。左侧支持分页和书名筛选，中栏提供检索与 TokenPlan 对话，右侧保留章节、claims、chunks、Jobs、System KB、Skills/API 和 Ops 详情。Jobs 面板可为当前书籍创建 NotebookLM、`health_system_kb_v2`、`quant_rule_cards` 导出任务并查看状态。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。TokenPlan API Key、Dedao Cookie 和电子书阅读 token 只读取服务端环境/配置，不会下发到浏览器。
+打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。页面提供全局导航，可切到书库、学习、课程、电子书架、登录、个人中心、任务、System KB、Skills/API 和运维状态。`/user/login` 支持得到扫码登录，轮询成功后由服务端保存 Cookie；`/user/profile` 只展示安全登录摘要；`/course` 提供只读课程列表、关键词筛选和分页，点击课程进入 `/course/{enid}` 后可查看课程详情、文章目录并阅读 Markdown 文章；`/ebook` 提供电子书架、关键词筛选和分页，点击电子书进入 `/ebook/{enid}` 后可查看书籍详情、目录并阅读受限批次 SVG 页面；书架行内可选择 HTML/PDF/EPUB 并创建下载任务，也可创建“加入书籍知识库”任务。左侧支持分页和书名筛选，中栏提供检索与 TokenPlan 对话，右侧保留章节、claims、chunks、Jobs、System KB、Skills/API 和 Ops 详情。Jobs 面板可为当前书籍创建 NotebookLM、`health_system_kb_v2`、`quant_rule_cards` 导出任务并查看状态。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。TokenPlan API Key、Dedao Cookie 和电子书阅读 token 只读取服务端环境/配置，不会下发到浏览器。
 
 #### kbase Agent Skills
 

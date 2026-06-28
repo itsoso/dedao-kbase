@@ -125,6 +125,9 @@ export interface BookKnowledgeJob {
   status: 'queued' | 'running' | 'succeeded' | 'failed'
   book_id?: string
   target?: string
+  ebook_id?: number
+  ebook_enid?: string
+  download_type?: number
   result?: Record<string, unknown>
   error?: string
   logs?: string[]
@@ -138,6 +141,9 @@ export interface BookKnowledgeJobRequest {
   type: string
   book_id?: string
   target?: string
+  ebook_id?: number
+  ebook_enid?: string
+  download_type?: number
 }
 
 export interface BrowserSession {

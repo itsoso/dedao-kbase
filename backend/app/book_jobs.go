@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -25,29 +26,37 @@ const (
 )
 
 const (
-	BookKnowledgeJobTypeNotebookLMExport = "notebooklm_export"
-	BookKnowledgeJobTypeBookExport       = "book_export"
+	BookKnowledgeJobTypeNotebookLMExport    = "notebooklm_export"
+	BookKnowledgeJobTypeBookExport          = "book_export"
+	BookKnowledgeJobTypeDedaoEbookDownload  = "dedao_ebook_download"
+	BookKnowledgeJobTypeDedaoEbookSyncKBase = "dedao_ebook_sync_kbase"
 )
 
 type BookKnowledgeJob struct {
-	ID         string                 `json:"id"`
-	Type       string                 `json:"type"`
-	Status     BookKnowledgeJobStatus `json:"status"`
-	BookID     string                 `json:"book_id,omitempty"`
-	Target     string                 `json:"target,omitempty"`
-	Result     map[string]any         `json:"result,omitempty"`
-	Error      string                 `json:"error,omitempty"`
-	Logs       []string               `json:"logs,omitempty"`
-	CreatedAt  string                 `json:"created_at"`
-	UpdatedAt  string                 `json:"updated_at"`
-	StartedAt  string                 `json:"started_at,omitempty"`
-	FinishedAt string                 `json:"finished_at,omitempty"`
+	ID           string                 `json:"id"`
+	Type         string                 `json:"type"`
+	Status       BookKnowledgeJobStatus `json:"status"`
+	BookID       string                 `json:"book_id,omitempty"`
+	Target       string                 `json:"target,omitempty"`
+	EbookID      int                    `json:"ebook_id,omitempty"`
+	EbookEnID    string                 `json:"ebook_enid,omitempty"`
+	DownloadType int                    `json:"download_type,omitempty"`
+	Result       map[string]any         `json:"result,omitempty"`
+	Error        string                 `json:"error,omitempty"`
+	Logs         []string               `json:"logs,omitempty"`
+	CreatedAt    string                 `json:"created_at"`
+	UpdatedAt    string                 `json:"updated_at"`
+	StartedAt    string                 `json:"started_at,omitempty"`
+	FinishedAt   string                 `json:"finished_at,omitempty"`
 }
 
 type BookKnowledgeJobRequest struct {
-	Type   string `json:"type"`
-	BookID string `json:"book_id,omitempty"`
-	Target string `json:"target,omitempty"`
+	Type         string `json:"type"`
+	BookID       string `json:"book_id,omitempty"`
+	Target       string `json:"target,omitempty"`
+	EbookID      int    `json:"ebook_id,omitempty"`
+	EbookEnID    string `json:"ebook_enid,omitempty"`
+	DownloadType int    `json:"download_type,omitempty"`
 }
 
 type bookKnowledgeJobsFile struct {
@@ -55,6 +64,11 @@ type bookKnowledgeJobsFile struct {
 }
 
 var bookKnowledgeJobsMu sync.Mutex
+
+var (
+	runDedaoEbookDownloadJob  = executeDedaoEbookDownloadJob
+	runDedaoEbookSyncKBaseJob = executeDedaoEbookSyncKBaseJob
+)
 
 func (s *BookKnowledgeStore) JobsPath() string {
 	return filepath.Join(s.root, bookKnowledgeJobsFileName)
@@ -70,14 +84,17 @@ func (s *BookKnowledgeStore) CreateBookKnowledgeJob(request BookKnowledgeJobRequ
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	job := BookKnowledgeJob{
-		ID:        newBookKnowledgeJobID(),
-		Type:      normalized.Type,
-		Status:    BookKnowledgeJobStatusQueued,
-		BookID:    normalized.BookID,
-		Target:    normalized.Target,
-		Logs:      []string{"queued"},
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:           newBookKnowledgeJobID(),
+		Type:         normalized.Type,
+		Status:       BookKnowledgeJobStatusQueued,
+		BookID:       normalized.BookID,
+		Target:       normalized.Target,
+		EbookID:      normalized.EbookID,
+		EbookEnID:    normalized.EbookEnID,
+		DownloadType: normalized.DownloadType,
+		Logs:         []string{"queued"},
+		CreatedAt:    now,
+		UpdatedAt:    now,
 	}
 
 	bookKnowledgeJobsMu.Lock()
@@ -200,6 +217,10 @@ func (s *BookKnowledgeStore) executeBookKnowledgeJob(job BookKnowledgeJob) (map[
 			"output_dir": result.OutputDir,
 			"files":      result.Files,
 		}, nil
+	case BookKnowledgeJobTypeDedaoEbookDownload:
+		return runDedaoEbookDownloadJob(context.Background(), job)
+	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
+		return runDedaoEbookSyncKBaseJob(context.Background(), s, job)
 	default:
 		return nil, fmt.Errorf("unknown job type: %s", job.Type)
 	}
@@ -261,6 +282,7 @@ func normalizeBookKnowledgeJobRequest(request BookKnowledgeJobRequest) (BookKnow
 	request.Type = strings.TrimSpace(request.Type)
 	request.BookID = strings.TrimSpace(request.BookID)
 	request.Target = strings.TrimSpace(request.Target)
+	request.EbookEnID = strings.TrimSpace(request.EbookEnID)
 	switch request.Type {
 	case BookKnowledgeJobTypeNotebookLMExport:
 		if request.BookID == "" {
@@ -275,10 +297,78 @@ func normalizeBookKnowledgeJobRequest(request BookKnowledgeJobRequest) (BookKnow
 		default:
 			return request, fmt.Errorf("unsupported book export target: %s", request.Target)
 		}
+	case BookKnowledgeJobTypeDedaoEbookDownload:
+		return normalizeDedaoEbookJobRequest(request, true)
+	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
+		return normalizeDedaoEbookJobRequest(request, false)
 	default:
 		return request, fmt.Errorf("unsupported job type: %s", request.Type)
 	}
 	return request, nil
+}
+
+func normalizeDedaoEbookJobRequest(request BookKnowledgeJobRequest, allowDownloadType bool) (BookKnowledgeJobRequest, error) {
+	if request.EbookID <= 0 {
+		return request, fmt.Errorf("ebook_id is required")
+	}
+	if request.EbookEnID == "" {
+		return request, fmt.Errorf("ebook_enid is required")
+	}
+	if !allowDownloadType {
+		request.DownloadType = 1
+		return request, nil
+	}
+	if request.DownloadType == 0 {
+		request.DownloadType = 1
+	}
+	switch request.DownloadType {
+	case 1, 2, 3:
+		return request, nil
+	default:
+		return request, fmt.Errorf("download_type must be 1, 2, or 3")
+	}
+}
+
+func executeDedaoEbookDownloadJob(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
+	cfg := DefaultEbookWikiSyncConfig().withDefaults()
+	download := EBookDownload{
+		Ctx:          ctx,
+		DownloadType: job.DownloadType,
+		ID:           job.EbookID,
+		EnID:         job.EbookEnID,
+		OutputDir:    cfg.RepoDir,
+	}
+	result, err := download.DownloadWithResult()
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"book_id":       fmt.Sprintf("%d", job.EbookID),
+		"ebook_id":      job.EbookID,
+		"ebook_enid":    job.EbookEnID,
+		"download_type": job.DownloadType,
+		"output_dir":    cfg.RepoDir,
+		"title":         result.Title,
+		"html_path":     result.HTMLPath,
+	}, nil
+}
+
+func executeDedaoEbookSyncKBaseJob(ctx context.Context, store *BookKnowledgeStore, job BookKnowledgeJob) (map[string]any, error) {
+	result, err := SyncEbookToWikiStore(ctx, job.EbookID, job.EbookEnID, store)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"book_id":             fmt.Sprintf("%d", job.EbookID),
+		"ebook_id":            job.EbookID,
+		"ebook_enid":          job.EbookEnID,
+		"download_type":       1,
+		"knowledge_book_id":   result.KnowledgeBookID,
+		"title":               result.Title,
+		"html_path":           result.HTMLPath,
+		"repo_dir":            result.RepoDir,
+		"book_knowledge_root": result.BookKnowledgeRoot,
+	}, nil
 }
 
 func newBookKnowledgeJobID() string {
