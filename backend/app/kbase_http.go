@@ -48,6 +48,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.URL.Path == "/.well-known/dedao-kbase-skills.json" {
+		h.handleSkillsDiscovery(w, r)
+		return
+	}
+	if r.URL.Path == "/api/skills" || strings.HasPrefix(r.URL.Path, "/api/skills/") {
+		h.handleSkillRoute(w, r)
+		return
+	}
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
 		h.serveStatic(w, r)
 		return
@@ -178,15 +186,22 @@ func (h *kbaseHTTPHandler) handleSystemKBExport(w http.ResponseWriter) {
 }
 
 func (h *kbaseHTTPHandler) handleSystemKBManifest(w http.ResponseWriter) {
+	manifest, status, err := h.systemKBManifest()
+	if err != nil {
+		writeHTTPError(w, status, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, manifest)
+}
+
+func (h *kbaseHTTPHandler) systemKBManifest() (map[string]any, int, error) {
 	payload, err := h.readSystemKBExport()
 	if err != nil {
-		writeHTTPError(w, http.StatusNotFound, err.Error())
-		return
+		return nil, http.StatusNotFound, err
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(payload, &decoded); err != nil {
-		writeHTTPError(w, http.StatusInternalServerError, fmt.Sprintf("invalid system kb export: %v", err))
-		return
+		return nil, http.StatusInternalServerError, fmt.Errorf("invalid system kb export: %v", err)
 	}
 	manifest := map[string]any{}
 	for _, key := range []string{
@@ -197,7 +212,7 @@ func (h *kbaseHTTPHandler) handleSystemKBManifest(w http.ResponseWriter) {
 			manifest[key] = value
 		}
 	}
-	writeHTTPJSON(w, http.StatusOK, manifest)
+	return manifest, http.StatusOK, nil
 }
 
 func (h *kbaseHTTPHandler) readSystemKBExport() ([]byte, error) {

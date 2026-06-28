@@ -26,3 +26,7 @@ The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/b
 ## Web KBase Expansion Point
 
 The web UI should not reuse the Wails runtime. It should be an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore` and System KB export files.
+
+## Agent Skills Expansion Point
+
+Agent-facing discovery is exposed by `cmd/kbase-server` as public descriptors under `/.well-known/dedao-kbase-skills.json` and `/api/skills/*`. Descriptor routes are safe to publish; `invoke` routes stay Bearer-protected and read from the same book knowledge and System KB sources. Downstream systems such as health, Reva, and proofroom should treat returned book claims as draft source material unless their own review gates promote them.

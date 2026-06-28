@@ -95,6 +95,40 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。
 
+#### kbase Agent Skills
+
+`cmd/kbase-server` 也提供给 OpenClaw、Hermes、Reva、health、proofroom 等系统发现和安装用的 skills 描述。Discovery 文档可公开读取,真正调用仍需同一个 Bearer token:
+
+- `GET /.well-known/dedao-kbase-skills.json`
+- `GET /api/skills`
+- `GET /api/skills/dedao.book.search/manifest.json`
+- `GET /api/skills/dedao.book.search/openapi.json`
+- `GET /api/skills/dedao.book.search/SKILL.md`
+- `POST /api/skills/dedao.book.search/invoke`
+
+示例:
+
+```bash
+export DEDAO_KBASE_BASE_URL="https://kbase.executor.life"
+export DEDAO_KBASE_TOKEN="replace-with-long-secret"
+
+curl "$DEDAO_KBASE_BASE_URL/.well-known/dedao-kbase-skills.json"
+
+curl -H "Authorization: Bearer $DEDAO_KBASE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"arguments":{"query":"强化学习","limit":5}}' \
+  "$DEDAO_KBASE_BASE_URL/api/skills/dedao.book.search/invoke"
+```
+
+首批只读 skills:
+
+- `dedao.book.search`:检索书籍 chunks/claims。
+- `dedao.book.get_context`:按 `book_id` 读取书籍上下文。
+- `dedao.system_kb.manifest`:读取 System KB export 摘要。
+- `dedao.system_kb.export`:读取完整 System KB export。
+
+health/Reva 不应直接把 dedao 返回的 draft claim 当运行时权威;应先导入自身知识库并通过 review gate。proofroom 可直接把结果作为证据线索和溯源材料。
+
 ### NotebookLM Bridge 使用方式
 
 1. 在「电子书架」中下载并入 Wiki，或先下载电子书 HTML 后进入「书籍知识库」。
