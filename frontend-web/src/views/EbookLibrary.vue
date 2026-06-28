@@ -1,9 +1,9 @@
 <template>
   <main class="ebook-library">
     <section class="ebook-toolbar">
-      <div class="brand-block">
-        <span class="eyebrow">Dedao Ebooks</span>
-        <h2>电子书架</h2>
+      <div class="toolbar-summary">
+        <strong>电子书架</strong>
+        <span>{{ total }} 本 · 第 {{ page }} / {{ totalPages || 1 }} 页</span>
       </div>
 
       <button class="primary-action" type="button" :disabled="loading" @click="reloadFromFirstPage">
@@ -16,13 +16,6 @@
 
     <section class="ebook-workspace">
       <aside class="ebook-filter-panel">
-        <div class="panel-head">
-          <div>
-            <span class="eyebrow">Search</span>
-            <h2>筛选书架</h2>
-          </div>
-        </div>
-
         <div class="ebook-filter-stack">
           <input v-model="query" placeholder="输入书名、作者或简介关键词" @keydown.enter="reloadFromFirstPage" />
           <select v-model.number="pageSize" @change="reloadFromFirstPage">
@@ -31,32 +24,16 @@
             <option :value="30">30/page</option>
             <option :value="50">50/page</option>
           </select>
-          <button type="button" class="primary-action" :disabled="loading" @click="reloadFromFirstPage">Search</button>
+          <button type="button" class="primary-action" :disabled="loading" @click="reloadFromFirstPage">搜索</button>
         </div>
-
-        <dl class="ebook-metrics">
-          <div>
-            <dt>Total</dt>
-            <dd>{{ total }}</dd>
-          </div>
-          <div>
-            <dt>Page</dt>
-            <dd>{{ page }} / {{ totalPages || 1 }}</dd>
-          </div>
-          <div>
-            <dt>Loaded</dt>
-            <dd>{{ ebooks.length }}</dd>
-          </div>
-        </dl>
+        <p class="ebook-filter-summary">已载入 {{ ebooks.length }} / {{ total || ebooks.length }}</p>
       </aside>
 
       <section class="ebook-list-panel">
         <div class="panel-head">
           <div>
-            <span class="eyebrow">Bookshelf</span>
             <h2>已购电子书</h2>
           </div>
-          <span class="ebook-source">CourseList("ebook", "study")</span>
         </div>
 
         <div class="ebook-list">
@@ -127,7 +104,6 @@
       </section>
 
       <aside class="ebook-detail-panel">
-        <span class="eyebrow">Study Context</span>
         <h2>{{ selectedEbook?.title || '选择一本电子书' }}</h2>
         <p>{{ selectedEbook?.intro || '这里显示当前书的学习摘要，可从书架直接下载或加入书籍知识库。' }}</p>
         <div v-if="selectedEbook" class="detail-action-row">
@@ -429,9 +405,9 @@ const formatJobTime = (value?: string) => {
 .ebook-library {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  min-height: calc(100vh - 156px);
-  margin-top: 12px;
+  gap: 10px;
+  min-height: calc(100vh - 80px);
+  margin-top: 8px;
 }
 
 .ebook-toolbar,
@@ -446,47 +422,62 @@ const formatJobTime = (value?: string) => {
 
 .ebook-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 120px 96px;
-  gap: 12px;
+  grid-template-columns: minmax(180px, 1fr) 112px 82px;
+  gap: 10px;
   align-items: center;
-  padding: 12px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 6px 0 10px;
+}
+
+.toolbar-summary {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.toolbar-summary strong {
+  color: #111111;
+  font-size: 18px;
+  line-height: 24px;
+}
+
+.toolbar-summary span {
+  overflow: hidden;
+  color: var(--dedao-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .ebook-workspace {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 300px;
-  gap: 12px;
+  grid-template-columns: 240px minmax(0, 1fr) 260px;
+  gap: 10px;
 }
 
 .ebook-filter-panel,
 .ebook-list-panel,
 .ebook-detail-panel {
   min-width: 0;
-  padding: 12px;
+  padding: 10px;
 }
 
 .ebook-filter-stack {
   display: grid;
   gap: 8px;
-  margin-top: 12px;
+  margin-top: 0;
 }
 
-.ebook-metrics,
 .ebook-detail-list {
   display: grid;
-  gap: 8px;
-  margin: 14px 0 0;
+  gap: 0;
+  margin: 10px 0 0;
+  border-top: 1px solid var(--dedao-line);
 }
 
-.ebook-metrics div,
-.ebook-detail-list div {
-  border: 1px solid var(--dedao-line);
-  border-radius: 8px;
-  padding: 9px;
-  background: var(--dedao-subtle);
-}
-
-.ebook-metrics dt,
 .ebook-detail-list dt {
   color: var(--dedao-muted);
   font-size: 10px;
@@ -494,7 +485,6 @@ const formatJobTime = (value?: string) => {
   text-transform: uppercase;
 }
 
-.ebook-metrics dd,
 .ebook-detail-list dd {
   margin: 3px 0 0;
   overflow-wrap: anywhere;
@@ -503,12 +493,13 @@ const formatJobTime = (value?: string) => {
   font-weight: 700;
 }
 
-.ebook-source {
-  align-self: center;
-  border: 1px solid var(--dedao-line);
-  border-radius: 999px;
-  padding: 6px 9px;
-  background: var(--dedao-subtle);
+.ebook-detail-list div {
+  border-bottom: 1px solid var(--dedao-line);
+  padding: 8px 0;
+}
+
+.ebook-filter-summary {
+  margin: 8px 0 0;
   color: var(--dedao-muted);
   font-size: 12px;
 }
@@ -516,7 +507,7 @@ const formatJobTime = (value?: string) => {
 .ebook-list {
   display: grid;
   gap: 0;
-  margin-top: 12px;
+  margin-top: 4px;
 }
 
 .ebook-row {
@@ -525,11 +516,11 @@ const formatJobTime = (value?: string) => {
   gap: 10px;
   align-items: center;
   width: 100%;
-  min-height: 76px;
+  min-height: 74px;
   border: 0;
   border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
-  padding: 12px 0;
+  padding: 10px 0;
   background: #ffffff;
   cursor: pointer;
   text-align: left;
@@ -681,8 +672,8 @@ const formatJobTime = (value?: string) => {
 .ebook-detail-panel h2 {
   margin: 0;
   color: #111111;
-  font-size: 19px;
-  line-height: 26px;
+  font-size: 18px;
+  line-height: 24px;
 }
 
 .ebook-detail-panel p {

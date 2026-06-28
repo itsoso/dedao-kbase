@@ -1,9 +1,9 @@
 <template>
   <main class="course-library">
     <section class="course-toolbar">
-      <div class="brand-block">
-        <span class="eyebrow">Dedao Courses</span>
-        <h2>课程</h2>
+      <div class="toolbar-summary">
+        <strong>课程</strong>
+        <span>{{ total }} 门 · 第 {{ page }} / {{ totalPages || 1 }} 页</span>
       </div>
 
       <button class="primary-action" type="button" :disabled="loading" @click="reloadFromFirstPage">
@@ -16,13 +16,6 @@
 
     <section class="course-workspace">
       <aside class="course-filter-panel">
-        <div class="panel-head">
-          <div>
-            <span class="eyebrow">Search</span>
-            <h2>筛选课程</h2>
-          </div>
-        </div>
-
         <div class="course-filter-stack">
           <input v-model="query" placeholder="输入课程名、讲师或简介关键词" @keydown.enter="reloadFromFirstPage" />
           <select v-model.number="pageSize" @change="reloadFromFirstPage">
@@ -31,32 +24,16 @@
             <option :value="30">30/page</option>
             <option :value="50">50/page</option>
           </select>
-          <button type="button" class="primary-action" :disabled="loading" @click="reloadFromFirstPage">Search</button>
+          <button type="button" class="primary-action" :disabled="loading" @click="reloadFromFirstPage">搜索</button>
         </div>
-
-        <dl class="course-metrics">
-          <div>
-            <dt>Total</dt>
-            <dd>{{ total }}</dd>
-          </div>
-          <div>
-            <dt>Page</dt>
-            <dd>{{ page }} / {{ totalPages || 1 }}</dd>
-          </div>
-          <div>
-            <dt>Loaded</dt>
-            <dd>{{ courses.length }}</dd>
-          </div>
-        </dl>
+        <p class="course-filter-summary">已载入 {{ courses.length }} / {{ total || courses.length }}</p>
       </aside>
 
       <section class="course-list-panel">
         <div class="panel-head">
           <div>
-            <span class="eyebrow">Purchased Courses</span>
             <h2>已购课程</h2>
           </div>
-          <span class="course-source">CourseList("bauhinia", "study")</span>
         </div>
 
         <div class="course-list">
@@ -104,7 +81,6 @@
       </section>
 
       <aside class="course-detail-panel">
-        <span class="eyebrow">Study Context</span>
         <h2>{{ selectedCourse?.title || '选择一门课程' }}</h2>
         <p>{{ selectedCourse?.intro || '这里显示当前课程的学习摘要。课程详情、章节列表和下载会在后续切片迁移。' }}</p>
         <dl class="course-detail-list">
@@ -257,9 +233,9 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 .course-library {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  min-height: calc(100vh - 156px);
-  margin-top: 12px;
+  gap: 10px;
+  min-height: calc(100vh - 80px);
+  margin-top: 8px;
 }
 
 .course-toolbar,
@@ -274,47 +250,62 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 
 .course-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) 120px 96px;
-  gap: 12px;
+  grid-template-columns: minmax(180px, 1fr) 112px 82px;
+  gap: 10px;
   align-items: center;
-  padding: 12px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 6px 0 10px;
+}
+
+.toolbar-summary {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.toolbar-summary strong {
+  color: #111111;
+  font-size: 18px;
+  line-height: 24px;
+}
+
+.toolbar-summary span {
+  overflow: hidden;
+  color: var(--dedao-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .course-workspace {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr) 300px;
-  gap: 12px;
+  grid-template-columns: 240px minmax(0, 1fr) 260px;
+  gap: 10px;
 }
 
 .course-filter-panel,
 .course-list-panel,
 .course-detail-panel {
   min-width: 0;
-  padding: 12px;
+  padding: 10px;
 }
 
 .course-filter-stack {
   display: grid;
   gap: 8px;
-  margin-top: 12px;
+  margin-top: 0;
 }
 
-.course-metrics,
 .course-detail-list {
   display: grid;
-  gap: 8px;
-  margin: 14px 0 0;
+  gap: 0;
+  margin: 10px 0 0;
+  border-top: 1px solid var(--dedao-line);
 }
 
-.course-metrics div,
-.course-detail-list div {
-  border: 1px solid var(--dedao-line);
-  border-radius: 8px;
-  padding: 9px;
-  background: var(--dedao-subtle);
-}
-
-.course-metrics dt,
 .course-detail-list dt {
   color: var(--dedao-muted);
   font-size: 10px;
@@ -322,7 +313,6 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   text-transform: uppercase;
 }
 
-.course-metrics dd,
 .course-detail-list dd {
   margin: 3px 0 0;
   overflow-wrap: anywhere;
@@ -331,12 +321,13 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   font-weight: 700;
 }
 
-.course-source {
-  align-self: center;
-  border: 1px solid var(--dedao-line);
-  border-radius: 999px;
-  padding: 6px 9px;
-  background: var(--dedao-subtle);
+.course-detail-list div {
+  border-bottom: 1px solid var(--dedao-line);
+  padding: 8px 0;
+}
+
+.course-filter-summary {
+  margin: 8px 0 0;
   color: var(--dedao-muted);
   font-size: 12px;
 }
@@ -344,7 +335,7 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 .course-list {
   display: grid;
   gap: 0;
-  margin-top: 12px;
+  margin-top: 4px;
 }
 
 .course-row {
@@ -353,11 +344,11 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   gap: 10px;
   align-items: center;
   width: 100%;
-  min-height: 78px;
+  min-height: 74px;
   border: 0;
   border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
-  padding: 12px 0;
+  padding: 10px 0;
   background: #ffffff;
   text-align: left;
 }
@@ -466,8 +457,8 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 .course-detail-panel h2 {
   margin: 0;
   color: #111111;
-  font-size: 19px;
-  line-height: 26px;
+  font-size: 18px;
+  line-height: 24px;
 }
 
 .course-detail-panel p {

@@ -81,11 +81,10 @@ textarea {
   min-height: 100vh;
   max-width: 1200px;
   margin: 0 auto;
-  padding: 0 0 28px;
+  padding: 0 0 24px;
   background: #ffffff;
 }
 
-.shell-header,
 .shell-nav,
 .module-landing {
   border: 1px solid var(--dedao-line);
@@ -94,61 +93,10 @@ textarea {
   box-shadow: none;
 }
 
-.shell-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 64px;
-  border-width: 0 0 1px;
-  border-radius: 0;
-  padding: 0;
-  background: rgba(255, 255, 255, 0.94);
-}
-
-.shell-brand {
-  display: flex;
-  min-width: 0;
-  align-items: baseline;
-  gap: 12px;
-}
-
-.shell-brand .eyebrow {
-  flex: 0 0 auto;
-}
-
-.shell-brand h1 {
-  margin: 0;
-  color: #111111;
-  overflow: visible;
-  font-size: 24px;
-  line-height: 32px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.shell-status {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.shell-status span {
-  border: 1px solid var(--dedao-border);
-  border-radius: 999px;
-  padding: 4px 8px;
-  background: #ffffff;
-  color: var(--dedao-orange);
-  font-size: 12px;
-  font-weight: 700;
-}
-
 .shell-nav {
-  display: grid;
-  grid-template-columns: repeat(9, minmax(0, 1fr));
-  gap: 0;
-  margin-top: 10px;
+  display: flex;
+  gap: 22px;
+  overflow-x: auto;
   border: 0;
   border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
@@ -161,16 +109,16 @@ textarea {
   display: flex;
   min-width: 0;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  justify-content: center;
   border: 0;
   border-bottom: 2px solid transparent;
   border-radius: 0;
-  min-height: 42px;
-  padding: 8px 10px;
+  min-height: 44px;
+  padding: 0 2px;
   background: #ffffff;
   color: var(--dedao-text);
   text-decoration: none;
+  white-space: nowrap;
 }
 
 .shell-nav a:hover,
@@ -180,8 +128,7 @@ textarea {
   color: var(--dedao-orange);
 }
 
-.shell-nav span,
-.shell-nav small {
+.shell-nav span {
   overflow: hidden;
   max-width: 100%;
   text-overflow: ellipsis;
@@ -192,11 +139,6 @@ textarea {
   color: currentColor;
   font-size: 13px;
   font-weight: 700;
-}
-
-.shell-nav small {
-  color: #999999;
-  font-size: 10px;
 }
 
 .module-landing {
@@ -1281,7 +1223,6 @@ pre {
   .connection-bar,
   .account-toolbar,
   .login-toolbar,
-  .shell-header,
   .app-navigation,
   .shell-nav,
   .account-grid,
@@ -1295,11 +1236,6 @@ pre {
 
   .dedao-web-shell {
     padding: 8px;
-  }
-
-  .shell-header {
-    align-items: flex-start;
-    flex-direction: column;
   }
 
   .workbench-grid.learning-layout {
