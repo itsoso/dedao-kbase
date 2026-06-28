@@ -1,21 +1,23 @@
 <template>
-  <section class="module-landing">
-    <div class="module-hero">
-      <span class="eyebrow">Desktop GUI Parity</span>
-      <h2>{{ title }}</h2>
-      <p>{{ scope }}</p>
-    </div>
+  <section class="module-landing module-landing-compact">
+    <div class="module-summary-row">
+      <div class="module-hero">
+        <span class="eyebrow">Desktop GUI Parity</span>
+        <h2>{{ title }}</h2>
+        <p>{{ scope }}</p>
+      </div>
 
-    <dl class="module-status-grid">
-      <div>
-        <dt>Status</dt>
-        <dd>{{ status }}</dd>
-      </div>
-      <div>
-        <dt>Desktop Source</dt>
-        <dd>{{ source }}</dd>
-      </div>
-    </dl>
+      <dl class="module-status-grid">
+        <div>
+          <dt>Status</dt>
+          <dd>{{ status }}</dd>
+        </div>
+        <div>
+          <dt>Desktop Source</dt>
+          <dd>{{ source }}</dd>
+        </div>
+      </dl>
+    </div>
 
     <section class="module-methods">
       <span class="eyebrow">Wails Methods To Migrate</span>

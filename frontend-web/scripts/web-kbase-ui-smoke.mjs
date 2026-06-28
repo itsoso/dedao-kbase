@@ -30,6 +30,7 @@ const appSource = readFileSync(appPath, 'utf8')
 const apiSource = readFileSync(apiPath, 'utf8')
 const routerSource = readFileSync(routerPath, 'utf8')
 const workbenchSource = readFileSync(workbenchPath, 'utf8')
+const moduleLandingSource = readFileSync(moduleLandingPath, 'utf8')
 const courseLibrarySource = existsSync(courseLibraryPath) ? readFileSync(courseLibraryPath, 'utf8') : ''
 const ebookLibrarySource = existsSync(ebookLibraryPath) ? readFileSync(ebookLibraryPath, 'utf8') : ''
 const courseDetailReaderSource = existsSync(courseDetailReaderPath) ? readFileSync(courseDetailReaderPath, 'utf8') : ''
@@ -38,8 +39,12 @@ const accountProfileSource = readFileSync(accountProfilePath, 'utf8')
 const accountLoginSource = readFileSync(accountLoginPath, 'utf8')
 
 assert.ok(appSource.includes('dedao-web-shell'), 'App.vue should render the Dedao Web shell')
+assert.ok(appSource.includes('compact-shell-header'), 'App.vue should render a compact shell header')
+assert.ok(appSource.includes('compact-shell-nav'), 'App.vue should render compact shell navigation')
 assert.ok(appSource.includes('router-view'), 'App.vue should render routed pages')
 assert.ok(appSource.includes('router-link'), 'App.vue should expose shell navigation links')
+assert.ok(moduleLandingSource.includes('module-landing-compact'), 'ModuleLanding.vue should use the compact module layout')
+assert.ok(moduleLandingSource.includes('module-summary-row'), 'ModuleLanding.vue should render a compact summary row')
 
 for (const routePath of [
   '/home',
