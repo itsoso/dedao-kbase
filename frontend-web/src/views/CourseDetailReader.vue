@@ -7,16 +7,6 @@
         <h2>{{ detail?.course.title || '课程阅读' }}</h2>
       </div>
 
-      <label>
-        <span>Base URL</span>
-        <input v-model="baseUrl" name="courseDetailBaseUrl" placeholder="http://127.0.0.1:8719" />
-      </label>
-
-      <label>
-        <span>Token</span>
-        <input v-model="token" name="courseDetailToken" type="password" placeholder="KBASE_AUTH_TOKEN" />
-      </label>
-
       <button class="primary-action" type="button" :disabled="loading" @click="loadDetail">
         {{ loading ? '加载中' : '刷新' }}
       </button>
@@ -268,9 +258,9 @@ const formatPublishTime = (value?: number) => {
 
 .reader-toolbar {
   display: grid;
-  grid-template-columns: 76px minmax(240px, 1fr) minmax(220px, 320px) minmax(220px, 320px) 88px;
+  grid-template-columns: 76px minmax(240px, 1fr) 88px;
   gap: 12px;
-  align-items: end;
+  align-items: center;
   padding: 12px;
 }
 

@@ -7,6 +7,7 @@ import EbookDetailReader from './views/EbookDetailReader.vue'
 import EbookLibrary from './views/EbookLibrary.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
+import WebSettings from './views/WebSettings.vue'
 
 export interface NavigationItem {
   path: string
@@ -156,11 +157,22 @@ const routes: RouteRecordRaw[] = [
       desktopMethods: ['CourseList', 'EbookInfo', 'EbookCommentList', 'EbookDownload', 'EbookDownloadAndSyncWiki'],
     },
   },
+  {
+    path: '/setting',
+    component: WebSettings,
+    meta: {
+      title: '设置',
+      scope: 'server_settings',
+      status: 'online',
+      source: 'frontend/src/views/Setting.vue',
+      desktopMethods: ['OpenDirectoryDialog', 'SetDir'],
+    },
+  },
   ...moduleRoutes.map((route) => ({
     path: route.path,
     component: ModuleLanding,
     meta: route,
-  })),
+  })).filter((route) => route.path !== '/setting'),
   { path: '/:pathMatch(.*)*', redirect: '/book-knowledge' },
 ]
 

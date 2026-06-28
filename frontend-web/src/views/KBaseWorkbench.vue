@@ -5,14 +5,6 @@
         <span class="eyebrow">Dedao KBase</span>
         <h1>书籍知识库</h1>
       </div>
-      <label>
-        <span>Base URL</span>
-        <input v-model="baseUrl" name="baseUrl" placeholder="http://127.0.0.1:8719" />
-      </label>
-      <label>
-        <span>Token</span>
-        <input v-model="token" name="token" type="password" placeholder="KBASE_AUTH_TOKEN" />
-      </label>
       <button class="primary-action" type="button" :disabled="loading" @click="connectAndRefresh">
         {{ loading ? '刷新中' : '连接' }}
       </button>

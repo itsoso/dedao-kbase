@@ -6,16 +6,6 @@
         <h2>扫码登录</h2>
       </div>
 
-      <label>
-        <span>Base URL</span>
-        <input v-model="baseUrl" name="loginBaseUrl" placeholder="http://127.0.0.1:8719" />
-      </label>
-
-      <label>
-        <span>Token</span>
-        <input v-model="token" name="loginToken" type="password" placeholder="KBASE_AUTH_TOKEN" />
-      </label>
-
       <button class="primary-action" type="button" :disabled="loading" @click="generateQRCode">
         {{ loading ? '生成中' : '生成二维码' }}
       </button>

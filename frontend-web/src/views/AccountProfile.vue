@@ -6,16 +6,6 @@
         <h2>得到账户状态</h2>
       </div>
 
-      <label>
-        <span>Base URL</span>
-        <input v-model="baseUrl" name="accountBaseUrl" placeholder="http://127.0.0.1:8719" />
-      </label>
-
-      <label>
-        <span>Token</span>
-        <input v-model="token" name="accountToken" type="password" placeholder="KBASE_AUTH_TOKEN" />
-      </label>
-
       <button class="primary-action" type="button" :disabled="loading" @click="refreshSession">
         {{ loading ? '刷新中' : '刷新' }}
       </button>

@@ -6,16 +6,6 @@
         <h2>课程</h2>
       </div>
 
-      <label>
-        <span>Base URL</span>
-        <input v-model="baseUrl" name="courseBaseUrl" placeholder="http://127.0.0.1:8719" />
-      </label>
-
-      <label>
-        <span>Token</span>
-        <input v-model="token" name="courseToken" type="password" placeholder="KBASE_AUTH_TOKEN" />
-      </label>
-
       <button class="primary-action" type="button" :disabled="loading" @click="reloadFromFirstPage">
         {{ loading ? '加载中' : '刷新课程' }}
       </button>
@@ -284,9 +274,9 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 
 .course-toolbar {
   display: grid;
-  grid-template-columns: 220px minmax(260px, 1fr) minmax(260px, 1fr) 120px 96px;
+  grid-template-columns: minmax(220px, 1fr) 120px 96px;
   gap: 12px;
-  align-items: end;
+  align-items: center;
   padding: 12px;
 }
 

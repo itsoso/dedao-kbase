@@ -271,9 +271,9 @@ textarea {
 
 .connection-bar {
   display: grid;
-  grid-template-columns: 220px minmax(260px, 1fr) minmax(260px, 1fr) 110px 96px;
+  grid-template-columns: minmax(220px, 1fr) 110px 96px;
   gap: 12px;
-  align-items: end;
+  align-items: center;
   padding: 12px;
 }
 
@@ -390,9 +390,9 @@ label span {
 .account-toolbar,
 .login-toolbar {
   display: grid;
-  grid-template-columns: 220px minmax(220px, 1fr) minmax(220px, 1fr) 96px;
+  grid-template-columns: minmax(220px, 1fr) 120px;
   gap: 12px;
-  align-items: end;
+  align-items: center;
   padding: 12px;
 }
 
