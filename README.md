@@ -51,7 +51,7 @@
 * 新增 NotebookLM Bridge：可导出 `book.md`、`claims.md`、`notebooklm-prompt.md` 资料包，一键打开 NotebookLM，并保存每本书对应的 NotebookLM 链接。
 * 新增 MCP 能力：提供 `cmd/book-mcp` stdio server，可向其他大模型暴露书籍列表、检索、章节读取、导出等工具。
 * 新增在线 kbase HTTP 服务：提供 `cmd/kbase-server`，可部署到 `kbase.executor.life`，用 Bearer token 向 health/proofroom 暴露书籍检索和 System KB export。
-* 新增 kbase Web UI：提供独立浏览器页面，可用同一个 Bearer token 浏览书籍、检索 chunks/claims，并查看 System KB 导出。
+* 新增 kbase Web UI：提供独立浏览器页面，可用同一个 Bearer token 浏览书籍、分页选书、检索 chunks/claims、调用 TokenPlan 进行单书对话，并查看 System KB 导出。
 * 新增项目导出：支持导出为 `health_system_kb_v2` 健康知识库格式，以及 `quant_rule_cards` 量化规则卡草案。
 * 优化登录二维码流程：在缺失或失效 CSRF token 时自动刷新首页状态并重试，降低扫码二维码加载失败概率。
 * 优化书籍知识库 UI：新增专业化工作台布局、搜索、章节/claims/chunks/MCP/NotebookLM tabs 和历史记录侧栏。
@@ -71,7 +71,10 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：
 
 - `GET /health`：无需 token，用于服务探活。
-- `GET /api/books`：列出书籍知识包。
+- `GET /api/books?page=1&page_size=30&q=关键词&sort=updated_at_desc`：分页列出书籍知识包。
+- `GET /api/books/{book_id}/prompts`：读取书籍 Prompt 模板。
+- `POST /api/books/{book_id}/chat`：服务端调用 TokenPlan 进行单书对话，返回 answer、sources 和 context stats。
+- `GET /api/books/{book_id}/chat-history?limit=20`：读取本地 SQLite 对话历史。
 - `GET /api/search?q=关键词&limit=5`：检索书籍 chunks/claims。
 - `GET /api/system-kb/manifest`：返回 System KB export 摘要。
 - `GET /api/system-kb/export`：返回 health/proofroom 导入用的 `system_kb_export.json`。
@@ -93,7 +96,7 @@ KBASE_WEB_DIR="$PWD/frontend-web/dist" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
-打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。
+打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。页面左侧支持分页和书名筛选，中栏提供检索与 TokenPlan 对话，右侧保留章节、claims、chunks 和 System KB 详情。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。TokenPlan API Key 只读取服务端环境变量，不会下发到浏览器。
 
 #### kbase Agent Skills
 
@@ -128,6 +131,8 @@ curl -H "Authorization: Bearer $DEDAO_KBASE_TOKEN" \
 - `dedao.system_kb.export`:读取完整 System KB export。
 
 health/Reva 不应直接把 dedao 返回的 draft claim 当运行时权威;应先导入自身知识库并通过 review gate。proofroom 可直接把结果作为证据线索和溯源材料。
+
+Web 对话历史默认写入 SQLite；当 `kbase-server` 以 `CGO_ENABLED=0` 构建、`go-sqlite3` 不可用时，会显式写入同目录 `book_chat_history.jsonl`，保证 cross-compiled 线上部署仍可保存和读取 history。
 
 ### NotebookLM Bridge 使用方式
 

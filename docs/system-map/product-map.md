@@ -17,15 +17,15 @@ last-reviewed: 2026-06-28
 Downloaded ebook HTML
   -> backend/app extraction
   -> local book_knowledge package
-  -> Wails desktop workbench / MCP server / private kbase HTTP server
+  -> Wails desktop workbench / MCP server / private kbase HTTP server / browser workbench
   -> exports for health KB, quant rule cards, and NotebookLM bridge packages
 ```
 
-The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/backend/App.*` bindings. The private kbase server is HTTP-native and exposes read-only book and System KB endpoints under `/api/*`.
+The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/backend/App.*` bindings. The private kbase server is HTTP-native and exposes Bearer-protected book, search, System KB, prompt, chat, and chat-history endpoints under `/api/*`.
 
 ## Web KBase Expansion Point
 
-The web UI should not reuse the Wails runtime. It should be an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore` and System KB export files.
+The web UI does not reuse the Wails runtime. It is an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore`, prompt generator, TokenPlan chat layer, chat history store, and System KB export files. TokenPlan secrets remain server-side in environment configuration. Chat history uses SQLite when cgo is available and a JSONL file fallback for cross-compiled `CGO_ENABLED=0` server builds.
 
 ## Agent Skills Expansion Point
 

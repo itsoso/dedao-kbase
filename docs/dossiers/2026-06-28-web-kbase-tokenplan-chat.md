@@ -1,7 +1,7 @@
 ---
 slug: 2026-06-28-web-kbase-tokenplan-chat
-status: planning
-current_stage: S3
+status: online
+current_stage: S8
 last-reviewed: 2026-06-28
 ---
 
@@ -38,21 +38,24 @@ Browser Workbench
 |---|---|---|
 | G1 准入 | PASS | 用户明确要 Web 版 TokenPlan 对话、书籍分页和 GUI 能力;2026-06-28 |
 | G2 可行性 | PASS | 桌面端已有 `backend/app/book_chat.go`、Prompt、history;Web 只需加 HTTP facade 和 UI;2026-06-28 |
-| G3 测试 | 待跑 | |
-| G4 评审 | 待跑 | 涉及 Bearer 鉴权、TokenPlan 外部请求和 secret 边界 |
-| G5 部署健康 | 待跑 | |
-| G6 验证 | 待线上验证 | |
+| G3 测试 | PASS | `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1`; `CGO_ENABLED=0 go test ./backend/app -run 'TestKBaseHTTPHandlerServesBookPromptsChatAndHistory' -count=1`; `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `cd frontend-web && npm run build`; `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/dedao-kbase-web/kbase-server-linux-amd64 ./cmd/kbase-server`; `git diff --check`;2026-06-28 |
+| G4 评审 | PASS | HTTP chat route remains Bearer-protected;browser only receives KBase Bearer token;TokenPlan API Key stays server-side;2026-06-28 |
+| G5 部署健康 | PASS | 已同步 `frontend-web/dist` 和 `kbase-server`;`nginx -t` 通过;`dedao-kbase.service` active;`https://kbase.executor.life/health` 200;2026-06-28 |
+| G6 验证 | PASS | 线上 `/api/books?page=1&page_size=1`、`/prompts`、`/chat`、`/chat-history` 均通过;chat 返回 `answer_chars=478 sources=5 model=MiniMax-M2.5`;根路径保持 Basic Auth 401;2026-06-28 |
 
 ## Discovery 现状图(带 file:line)
 - `backend/app/book_chat.go` 已实现 TokenPlan config、prompt/context 构造、chat completions 调用和响应解析。
 - `backend/app/book_chat_history.go` 已实现本地 SQLite chat history。
 - `backend/app/book_prompts.go` 已实现静态和动态书籍 Prompt 模板。
 - `frontend/src/views/BookKnowledge.vue` 桌面端已有对话 tab、prompt 模板、历史记录、Markdown 渲染和来源列表。
-- `frontend-web/src/App.vue` 目前只有书籍列表、搜索、详情和 System KB,还没有 chat panel 或分页。
-- `backend/app/kbase_http.go` 当前 `/api/books` 一次性返回全部书籍,并缺少 prompts/chat/history 路由。
+- `frontend-web/src/App.vue` 已新增分页书籍栏、Prompt 模板、TokenPlan chat panel、sources 和 history 恢复。
+- `backend/app/kbase_http.go` 已新增 `/api/books` 分页以及 prompts/chat/history 路由。
+- `backend/app/book_chat_history.go` 已新增 `CGO_ENABLED=0` 时的 JSONL history fallback;线上 cross-compiled binary 已验证可保存 history。
 
 ## 待拍板决策(STOP 问人)
 - 已拍板:先做非流式、单书、只读 Web TokenPlan 对话和分页书籍栏。
 
 ## 沉淀(S8)
-- 待上线后记录验证命令、线上 URL 和 TokenPlan secret 边界。
+- 线上入口: `https://kbase.executor.life/`。浏览器页面由 Nginx Basic Auth 保护,登录后通过 `/browser/session-token` 自动填充 `KBASE_AUTH_TOKEN`。
+- TokenPlan secret 已写入 `/etc/dedao-kbase/kbase.env` 的 `DEDAO_TOKENPLAN_*`;验证只输出 present 状态,不记录密钥。
+- `CGO_ENABLED=0` 部署需要 JSONL history fallback,否则 `go-sqlite3` stub 会导致 chat 500。
