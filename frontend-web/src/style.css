@@ -60,6 +60,166 @@ textarea {
   min-height: 112px;
 }
 
+.dedao-web-shell {
+  min-height: 100vh;
+  padding: 12px;
+  background: #eef2f6;
+}
+
+.shell-header,
+.shell-nav,
+.module-landing {
+  border: 1px solid #d3dce8;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+}
+
+.shell-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+}
+
+.shell-brand h1 {
+  margin: 0;
+  color: #121926;
+  font-size: 22px;
+  line-height: 28px;
+}
+
+.shell-status {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.shell-status span {
+  border: 1px solid #b6d3c8;
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #f1faf6;
+  color: #276052;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.shell-nav {
+  display: grid;
+  grid-template-columns: repeat(9, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+  padding: 8px;
+}
+
+.shell-nav a {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid #c8d2df;
+  border-radius: 6px;
+  padding: 8px 9px;
+  background: #ffffff;
+  color: #263244;
+  text-decoration: none;
+}
+
+.shell-nav a:hover,
+.shell-nav a.active {
+  border-color: #397367;
+  background: #f1faf6;
+  color: #153f37;
+}
+
+.shell-nav span,
+.shell-nav small {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shell-nav span {
+  color: #121926;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.shell-nav small {
+  color: #6c7b8f;
+  font-size: 11px;
+}
+
+.module-landing {
+  margin-top: 12px;
+  padding: 16px;
+}
+
+.module-hero h2 {
+  margin: 0;
+  color: #121926;
+  font-size: 24px;
+  line-height: 32px;
+}
+
+.module-hero p {
+  margin: 6px 0 0;
+  color: #536274;
+  font-size: 13px;
+}
+
+.module-status-grid {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.module-status-grid div {
+  border: 1px solid #dbe2ec;
+  border-radius: 7px;
+  padding: 10px;
+  background: #fbfcfe;
+}
+
+.module-status-grid dt {
+  color: #6c7b8f;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.module-status-grid dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  color: #121926;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.module-methods {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.module-methods .eyebrow {
+  flex: 0 0 100%;
+}
+
+.module-methods code {
+  border: 1px solid #dbe2ec;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #fbfcfe;
+  color: #263244;
+  font-size: 12px;
+}
+
 .kbase-web-shell {
   display: flex;
   flex-direction: column;
@@ -826,9 +986,21 @@ pre {
   }
 
   .connection-bar,
+  .shell-header,
   .app-navigation,
+  .shell-nav,
+  .module-status-grid,
   .workbench-grid {
     grid-template-columns: 1fr;
+  }
+
+  .dedao-web-shell {
+    padding: 8px;
+  }
+
+  .shell-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .workbench-grid.learning-layout {
