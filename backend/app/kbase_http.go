@@ -70,6 +70,13 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
+	case r.URL.Path == "/api/jobs":
+		h.handleJobs(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/jobs/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleGetJob(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -300,6 +307,58 @@ func (h *kbaseHTTPHandler) handleSearch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func (h *kbaseHTTPHandler) handleJobs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 0 {
+				writeHTTPError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+				return
+			}
+			if parsed > 0 {
+				limit = parsed
+			}
+		}
+		jobs, err := h.store.ListBookKnowledgeJobs(limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	case http.MethodPost:
+		var request BookKnowledgeJobRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		job, err := h.store.CreateBookKnowledgeJob(request)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		go h.store.RunBookKnowledgeJob(job.ID)
+		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	default:
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleGetJob(w http.ResponseWriter, r *http.Request) {
+	jobID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/jobs/"))
+	if err != nil || strings.TrimSpace(jobID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+	job, err := h.store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
 func parseKBasePagination(r *http.Request) (int, int) {

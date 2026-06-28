@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
@@ -204,6 +205,78 @@ func TestKBaseHTTPHandlerServesBookPromptsChatAndHistory(t *testing.T) {
 	if !strings.Contains(historyResp.Body.String(), `"history"`) ||
 		!strings.Contains(historyResp.Body.String(), `"Web 对话回答"`) {
 		t.Fatalf("history response missing saved chat: %s", historyResp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerServesJobs(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	listResp := requestKBase(handler, http.MethodGet, "/api/jobs", "secret-token")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("jobs list status = %d, body=%s", listResp.Code, listResp.Body.String())
+	}
+	if !strings.Contains(listResp.Body.String(), `"jobs"`) {
+		t.Fatalf("jobs list response missing jobs: %s", listResp.Body.String())
+	}
+
+	createResp := requestKBaseJSON(handler, http.MethodPost, "/api/jobs", "secret-token", `{"type":"notebooklm_export","book_id":"42"}`)
+	if createResp.Code != http.StatusAccepted {
+		t.Fatalf("job create status = %d, body=%s", createResp.Code, createResp.Body.String())
+	}
+	var created struct {
+		Job BookKnowledgeJob `json:"job"`
+	}
+	if err := json.Unmarshal(createResp.Body.Bytes(), &created); err != nil {
+		t.Fatalf("Unmarshal create response returned error: %v", err)
+	}
+	if created.Job.ID == "" || created.Job.Type != "notebooklm_export" || created.Job.BookID != "42" {
+		t.Fatalf("created job = %#v", created.Job)
+	}
+
+	var loaded BookKnowledgeJob
+	for i := 0; i < 50; i++ {
+		getResp := requestKBase(handler, http.MethodGet, "/api/jobs/"+created.Job.ID, "secret-token")
+		if getResp.Code != http.StatusOK {
+			t.Fatalf("job get status = %d, body=%s", getResp.Code, getResp.Body.String())
+		}
+		var payload struct {
+			Job BookKnowledgeJob `json:"job"`
+		}
+		if err := json.Unmarshal(getResp.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("Unmarshal get response returned error: %v", err)
+		}
+		loaded = payload.Job
+		if loaded.Status == BookKnowledgeJobStatusSucceeded || loaded.Status == BookKnowledgeJobStatusFailed {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("job status = %s, error=%s, logs=%v", loaded.Status, loaded.Error, loaded.Logs)
+	}
+	if !strings.Contains(fmt.Sprint(loaded.Result), "notebooklm-prompt.md") {
+		t.Fatalf("job result missing NotebookLM files: %#v", loaded.Result)
+	}
+
+	listResp = requestKBase(handler, http.MethodGet, "/api/jobs?limit=10", "secret-token")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("jobs list status after create = %d, body=%s", listResp.Code, listResp.Body.String())
+	}
+	if !strings.Contains(listResp.Body.String(), created.Job.ID) ||
+		!strings.Contains(listResp.Body.String(), `"status":"succeeded"`) {
+		t.Fatalf("jobs list response missing completed job: %s", listResp.Body.String())
+	}
+
+	unauthorizedResp := requestKBaseJSON(handler, http.MethodPost, "/api/jobs", "", `{"type":"notebooklm_export","book_id":"42"}`)
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("job create without bearer = %d, want 401", unauthorizedResp.Code)
 	}
 }
 
