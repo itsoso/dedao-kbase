@@ -2,11 +2,11 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Rework the browser KBase workbench into a learning-first layout with merged search/book navigation, central model chat, compact details, and draggable columns.
+**Goal:** Rework the browser KBase workbench into a learning-first layout with merged search/book navigation, central model chat, Markdown-rendered answers, compact details, and draggable columns.
 
 **Architecture:** Keep the existing Vue 3 single-page `frontend-web` app and `KBaseClient` API surface. This is a frontend-only layout and interaction change over the already shipped Bearer-protected APIs.
 
-**Tech Stack:** Vue 3 Composition API, TypeScript, Vite, plain CSS, Node smoke script, browser `localStorage`.
+**Tech Stack:** Vue 3 Composition API, TypeScript, Vite, `marked`, plain CSS, Node smoke script, browser `localStorage`.
 
 ---
 
@@ -16,7 +16,7 @@
 - Modify: `frontend-web/scripts/web-kbase-ui-smoke.mjs`
 
 **Steps:**
-1. Add assertions for `library-search-panel`, `combinedSearchQuery`, `runLibrarySearch`, `model-select`, `qwen3.7-max`, `column-resizer`, `layoutColumns`, `compact-detail-summary`.
+1. Add assertions for `library-search-panel`, `combinedSearchQuery`, `runLibrarySearch`, `model-select`, `qwen3.7-max`, `column-resizer`, `layoutColumns`, `compact-detail-summary`, `renderMarkdown`, and `answer-markdown`.
 2. Run `node frontend-web/scripts/web-kbase-ui-smoke.mjs`.
 3. Expected: FAIL because these hooks do not exist yet.
 
@@ -50,11 +50,16 @@
 **Files:**
 - Modify: `frontend-web/src/App.vue`
 - Modify: `frontend-web/src/style.css`
+- Create: `frontend-web/src/utils/markdownRender.ts`
+- Modify: `frontend-web/package.json`
+- Modify: `frontend-web/package-lock.json`
 
 **Steps:**
 1. Replace large overview metric cards with `compact-detail-summary`.
 2. Make the right rail narrower by default.
-3. Keep tabs and System KB actions available.
+3. Add the same escaped `marked` Markdown renderer used by the desktop GUI.
+4. Render `chatResponse.answer` through `answer-markdown`.
+5. Keep tabs and System KB actions available.
 
 ### Task 5: Verify And Deploy
 

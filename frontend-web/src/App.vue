@@ -21,22 +21,36 @@
 
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
-    <div class="workbench-grid">
-      <aside class="book-rail">
+    <div ref="workbenchRef" class="workbench-grid learning-layout" :style="workbenchStyle">
+      <aside class="book-rail library-search-panel">
         <div class="panel-head">
           <div>
-            <span class="eyebrow">Library</span>
-            <h2>Books</h2>
+            <span class="eyebrow">Library Search</span>
+            <h2>找书与检索</h2>
           </div>
           <button type="button" @click="loadBooks">Refresh</button>
         </div>
-        <div class="rail-controls">
-          <input v-model="bookQuery" class="rail-filter" placeholder="Filter books" @keydown.enter="resetBookPageAndLoad" />
-          <select v-model="bookSort" @change="resetBookPageAndLoad">
-            <option value="updated_at_desc">Updated</option>
-            <option value="title_asc">Title A-Z</option>
-          </select>
+
+        <div class="rail-controls stacked">
+          <input
+            v-model="combinedSearchQuery"
+            class="rail-filter"
+            placeholder="搜索书名、作者、claims 或 chunks"
+            @keydown.enter="runLibrarySearch"
+          />
+          <div class="rail-control-row">
+            <select v-model="searchScope">
+              <option value="selected">Current Book</option>
+              <option value="all">All Books</option>
+            </select>
+            <select v-model="bookSort" @change="resetBookPageAndLoad">
+              <option value="updated_at_desc">Updated</option>
+              <option value="title_asc">Title A-Z</option>
+            </select>
+          </div>
+          <button class="primary-action" type="button" :disabled="loading" @click="runLibrarySearch">Search</button>
         </div>
+
         <div class="book-list">
           <button
             v-for="book in books"
@@ -50,6 +64,7 @@
             <span>{{ book.status || 'draft' }} · {{ book.extractor || 'unknown' }}</span>
           </button>
         </div>
+
         <div class="book-pagination">
           <button type="button" :disabled="bookPage <= 1 || loading" @click="changeBookPage(bookPage - 1)">Prev</button>
           <span>Page {{ bookPage }} / {{ bookTotalPages || 1 }} · {{ bookTotal }} books</span>
@@ -61,25 +76,13 @@
             <option :value="100">100/page</option>
           </select>
         </div>
-      </aside>
 
-      <div class="middle-stack">
-        <section class="search-panel">
-          <div class="panel-head">
-            <div>
-              <span class="eyebrow">Search</span>
-              <h2>检索</h2>
-            </div>
-            <select v-model="searchScope">
-              <option value="selected">Current Book</option>
-              <option value="all">All Books</option>
-            </select>
+        <div class="search-results-block">
+          <div class="history-head">
+            <strong>Search Results</strong>
+            <span>{{ searchResults.length }}</span>
           </div>
-          <div class="search-row">
-            <input v-model="query" placeholder="输入关键词" @keydown.enter="runSearch" />
-            <button class="primary-action" type="button" @click="runSearch">Search</button>
-          </div>
-          <div class="result-list">
+          <div class="result-list rail-results">
             <article v-for="result in searchResults" :key="resultKey(result)" class="result-row">
               <div class="result-meta">
                 <span>{{ result.kind }}</span>
@@ -88,88 +91,96 @@
               <h3>{{ result.title || result.book_title || result.book_id }}</h3>
               <p>{{ result.snippet }}</p>
             </article>
-            <div v-if="!searchResults.length" class="empty-state">No results</div>
+            <div v-if="!searchResults.length" class="empty-state compact">No results</div>
           </div>
-        </section>
+        </div>
+      </aside>
 
-        <section class="chat-panel">
-          <div class="panel-head">
-            <div>
-              <span class="eyebrow">TokenPlan</span>
-              <h2>大模型对话</h2>
-            </div>
-            <input v-model="chatModel" class="model-input" placeholder="MiniMax-M2.5" />
+      <div class="column-resizer left-resizer" role="separator" aria-label="Resize library column" @pointerdown="beginColumnResize('left', $event)"></div>
+
+      <section class="chat-panel study-panel">
+        <div class="panel-head study-head">
+          <div>
+            <span class="eyebrow">TokenPlan Study</span>
+            <h2>{{ selectedPackage?.book.title || '选择一本书开始学习' }}</h2>
           </div>
-
-          <div class="mode-strip">
-            <button
-              v-for="mode in chatModes"
-              :key="mode.value"
-              type="button"
-              :class="{ active: chatMode === mode.value }"
-              @click="setChatMode(mode.value)"
-            >
-              {{ mode.label }}
-            </button>
-          </div>
-
-          <select v-model="selectedPromptID" class="prompt-select" @change="applySelectedPrompt">
-            <option value="">Prompt templates</option>
-            <option v-for="prompt in promptTemplates" :key="prompt.prompt_id" :value="prompt.prompt_id">
-              {{ prompt.category }} · {{ prompt.title }}
+          <select v-model="selectedChatModel" class="model-select">
+            <option v-for="model in chatModelOptions" :key="model.value" :value="model.value">
+              {{ model.label }}
             </option>
           </select>
+        </div>
 
-          <textarea
-            v-model="chatQuestion"
-            rows="5"
-            placeholder="输入问题，或选择上方模板"
-            :disabled="!selectedBookID || chatLoading"
-            @keydown.meta.enter.prevent="sendChat"
-          ></textarea>
+        <div class="mode-strip">
+          <button
+            v-for="mode in chatModes"
+            :key="mode.value"
+            type="button"
+            :class="{ active: chatMode === mode.value }"
+            @click="setChatMode(mode.value)"
+          >
+            {{ mode.label }}
+          </button>
+        </div>
 
-          <div class="chat-actions">
-            <button type="button" :disabled="!selectedBookID || chatLoading" @click="clearChatDraft">Clear</button>
-            <button class="primary-action" type="button" :disabled="!selectedBookID || chatLoading" @click="sendChat">
-              {{ chatLoading ? '生成中' : 'Send' }}
-            </button>
+        <select v-model="selectedPromptID" class="prompt-select" @change="applySelectedPrompt">
+          <option value="">Prompt templates</option>
+          <option v-for="prompt in promptTemplates" :key="prompt.prompt_id" :value="prompt.prompt_id">
+            {{ prompt.category }} · {{ prompt.title }}
+          </option>
+        </select>
+
+        <textarea
+          v-model="chatQuestion"
+          rows="7"
+          placeholder="围绕当前书籍提问，或选择上方模板"
+          :disabled="!selectedBookID || chatLoading"
+          @keydown.meta.enter.prevent="sendChat"
+        ></textarea>
+
+        <div class="chat-actions">
+          <button type="button" :disabled="!selectedBookID || chatLoading" @click="clearChatDraft">Clear</button>
+          <button class="primary-action" type="button" :disabled="!selectedBookID || chatLoading" @click="sendChat">
+            {{ chatLoading ? '生成中' : 'Send' }}
+          </button>
+        </div>
+
+        <article v-if="chatResponse" class="chat-answer">
+          <div class="result-meta">
+            <span>{{ chatResponse.mode }} · {{ chatResponse.model }}</span>
+            <span>{{ chatResponse.context_stats.chars }} chars</span>
           </div>
-
-          <article v-if="chatResponse" class="chat-answer">
-            <div class="result-meta">
-              <span>{{ chatResponse.mode }} · {{ chatResponse.model }}</span>
-              <span>{{ chatResponse.context_stats.chars }} chars</span>
-            </div>
-            <p>{{ chatResponse.answer }}</p>
-            <div class="source-chips">
-              <span v-for="source in chatResponse.sources" :key="`${source.kind}:${source.id}`">
-                {{ source.kind }}: {{ source.title || source.id }}
-              </span>
-            </div>
-          </article>
-
-          <div class="chat-history">
-            <div class="history-head">
-              <strong>History</strong>
-              <button type="button" :disabled="!selectedBookID || chatLoading" @click="loadChatHistory">Reload</button>
-            </div>
-            <button
-              v-for="item in chatHistory"
-              :key="item.id"
-              type="button"
-              class="history-row"
-              @click="restoreChatHistory(item)"
-            >
-              <span>{{ item.mode }} · {{ item.created_at }}</span>
-              <strong>{{ item.question || item.mode }}</strong>
-            </button>
-            <div v-if="!chatHistory.length" class="empty-state compact">No history</div>
+          <div class="answer-markdown" v-html="renderedChatAnswer"></div>
+          <div class="source-chips">
+            <span v-for="source in chatResponse.sources" :key="`${source.kind}:${source.id}`">
+              {{ source.kind }}: {{ source.title || source.id }}
+            </span>
           </div>
-        </section>
-      </div>
+        </article>
 
-      <section class="detail-panel">
-        <div class="panel-head">
+        <div class="chat-history">
+          <div class="history-head">
+            <strong>History</strong>
+            <button type="button" :disabled="!selectedBookID || chatLoading" @click="loadChatHistory">Reload</button>
+          </div>
+          <button
+            v-for="item in chatHistory"
+            :key="item.id"
+            type="button"
+            class="history-row"
+            @click="restoreChatHistory(item)"
+          >
+            <span>{{ item.mode }} · {{ item.created_at }}</span>
+            <strong>{{ item.question || item.mode }}</strong>
+          </button>
+          <div v-if="!chatHistory.length" class="empty-state compact">No history</div>
+        </div>
+      </section>
+
+      <div class="column-resizer right-resizer" role="separator" aria-label="Resize detail column" @pointerdown="beginColumnResize('right', $event)"></div>
+
+      <section class="detail-panel compact-reference-panel">
+        <div class="panel-head detail-head">
           <div>
             <span class="eyebrow">Details</span>
             <h2>{{ selectedPackage?.book.title || 'Book Details' }}</h2>
@@ -188,7 +199,7 @@
         </div>
 
         <div v-if="activeTab === 'Overview'" class="detail-body">
-          <dl class="metric-grid">
+          <dl class="compact-detail-summary">
             <div><dt>Chapters</dt><dd>{{ selectedPackage?.chapters.length || 0 }}</dd></div>
             <div><dt>Claims</dt><dd>{{ selectedPackage?.claims.length || 0 }}</dd></div>
             <div><dt>Chunks</dt><dd>{{ selectedPackage?.chunks.length || 0 }}</dd></div>
@@ -237,7 +248,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   getBrowserSession,
   KBaseClient,
@@ -248,8 +259,10 @@ import {
   type BookKnowledgePrompt,
   type BookKnowledgeSearchResult,
 } from './api'
+import { renderMarkdown } from './utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
+const layoutStorageKey = 'dedao-kbase-web-layout'
 const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'System KB']
 const chatModes = [
   { value: 'chat', label: '问答' },
@@ -258,6 +271,12 @@ const chatModes = [
   { value: 'actions', label: '行动' },
   { value: 'rules', label: '规则' },
 ]
+const chatModelOptions = [
+  { value: 'qwen3.7-max', label: 'Qwen-3.7-Max' },
+  { value: 'MiniMax-M2.5', label: 'MiniMax-M2.5' },
+  { value: 'qwen-max', label: 'Qwen-Max' },
+  { value: 'deepseek-v3', label: 'DeepSeek-V3' },
+]
 
 const baseUrl = ref(window.location.origin)
 const token = ref('')
@@ -265,7 +284,7 @@ const connected = ref(false)
 const loading = ref(false)
 const errorMessage = ref('')
 const books = ref<BookKnowledgeBook[]>([])
-const bookQuery = ref('')
+const combinedSearchQuery = ref('')
 const bookPage = ref(1)
 const bookPageSize = ref(30)
 const bookTotal = ref(0)
@@ -273,7 +292,6 @@ const bookTotalPages = ref(0)
 const bookSort = ref('updated_at_desc')
 const selectedBookID = ref('')
 const selectedPackage = ref<BookKnowledgePackage | null>(null)
-const query = ref('')
 const searchScope = ref<'selected' | 'all'>('selected')
 const searchResults = ref<BookKnowledgeSearchResult[]>([])
 const activeTab = ref('Overview')
@@ -282,23 +300,40 @@ const promptTemplates = ref<BookKnowledgePrompt[]>([])
 const selectedPromptID = ref('')
 const chatMode = ref('chat')
 const chatQuestion = ref('')
-const chatModel = ref('MiniMax-M2.5')
+const selectedChatModel = ref('qwen3.7-max')
 const chatLoading = ref(false)
 const chatResponse = ref<BookKnowledgeChatResponse | null>(null)
 const chatHistory = ref<BookKnowledgeChatHistoryItem[]>([])
+const workbenchRef = ref<HTMLElement | null>(null)
+const layoutColumns = ref({ left: 340, right: 320 })
+const activeResizeTarget = ref<'left' | 'right' | null>(null)
 
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
+
+const workbenchStyle = computed(() => ({
+  '--left-column': `${layoutColumns.value.left}px`,
+  '--right-column': `${layoutColumns.value.right}px`,
+}))
 
 const formattedSystemKB = computed(() => {
   return systemKBPayload.value ? JSON.stringify(systemKBPayload.value, null, 2) : 'No System KB payload loaded'
 })
 
+const renderedChatAnswer = computed(() => {
+  return renderMarkdown(chatResponse.value?.answer || '')
+})
+
 onMounted(async () => {
   restoreConnection()
+  restoreLayoutColumns()
   await hydrateBrowserSession()
   if (token.value) {
     loadBooks()
   }
+})
+
+onBeforeUnmount(() => {
+  stopColumnResize()
 })
 
 const restoreConnection = () => {
@@ -317,6 +352,26 @@ const restoreConnection = () => {
 
 const saveConnection = () => {
   localStorage.setItem(storageKey, JSON.stringify({ baseUrl: baseUrl.value, token: token.value }))
+}
+
+const restoreLayoutColumns = () => {
+  const raw = localStorage.getItem(layoutStorageKey)
+  if (!raw) {
+    return
+  }
+  try {
+    const parsed = JSON.parse(raw) as { left?: number; right?: number }
+    layoutColumns.value = {
+      left: clampNumber(parsed.left || layoutColumns.value.left, 280, 460),
+      right: clampNumber(parsed.right || layoutColumns.value.right, 240, 520),
+    }
+  } catch {
+    localStorage.removeItem(layoutStorageKey)
+  }
+}
+
+const saveLayoutColumns = () => {
+  localStorage.setItem(layoutStorageKey, JSON.stringify(layoutColumns.value))
 }
 
 const hydrateBrowserSession = async () => {
@@ -353,7 +408,7 @@ const withRequest = async (operation: () => Promise<void>) => {
 
 const loadBooks = async () => {
   await withRequest(async () => {
-    const page = await client.value.listBooksPage(bookPage.value, bookPageSize.value, bookQuery.value, bookSort.value)
+    const page = await client.value.listBooksPage(bookPage.value, bookPageSize.value, combinedSearchQuery.value, bookSort.value)
     books.value = page.books || []
     bookPage.value = page.page || 1
     bookPageSize.value = page.page_size || bookPageSize.value
@@ -388,8 +443,10 @@ const selectBook = async (bookID: string) => {
   })
 }
 
-const runSearch = async () => {
-  const text = query.value.trim()
+const runLibrarySearch = async () => {
+  const text = combinedSearchQuery.value.trim()
+  bookPage.value = 1
+  await loadBooks()
   if (!text) {
     searchResults.value = []
     return
@@ -459,7 +516,7 @@ const sendChat = async () => {
     chatResponse.value = await client.value.chatWithBook(selectedBookID.value, {
       mode: chatMode.value,
       question: chatQuestion.value,
-      model: chatModel.value,
+      model: selectedChatModel.value,
     })
     await loadChatHistory()
     connected.value = true
@@ -474,7 +531,7 @@ const sendChat = async () => {
 const restoreChatHistory = (item: BookKnowledgeChatHistoryItem) => {
   chatMode.value = item.mode
   chatQuestion.value = item.question
-  chatModel.value = item.model || chatModel.value
+  selectedChatModel.value = item.model || selectedChatModel.value
   chatResponse.value = {
     history_id: item.id,
     answer: item.answer,
@@ -484,6 +541,45 @@ const restoreChatHistory = (item: BookKnowledgeChatHistoryItem) => {
     context_stats: item.context_stats,
     created_at: item.created_at,
   }
+}
+
+const beginColumnResize = (target: 'left' | 'right', event: PointerEvent) => {
+  activeResizeTarget.value = target
+  event.preventDefault()
+  window.addEventListener('pointermove', resizeColumn)
+  window.addEventListener('pointerup', stopColumnResize)
+}
+
+const resizeColumn = (event: PointerEvent) => {
+  const target = activeResizeTarget.value
+  const rect = workbenchRef.value?.getBoundingClientRect()
+  if (!target || !rect) {
+    return
+  }
+  if (target === 'left') {
+    layoutColumns.value = {
+      ...layoutColumns.value,
+      left: clampNumber(event.clientX - rect.left, 280, 460),
+    }
+  } else {
+    layoutColumns.value = {
+      ...layoutColumns.value,
+      right: clampNumber(rect.right - event.clientX, 240, 520),
+    }
+  }
+}
+
+const stopColumnResize = () => {
+  if (activeResizeTarget.value) {
+    saveLayoutColumns()
+  }
+  activeResizeTarget.value = null
+  window.removeEventListener('pointermove', resizeColumn)
+  window.removeEventListener('pointerup', stopColumnResize)
+}
+
+const clampNumber = (value: number, min: number, max: number) => {
+  return Math.min(Math.max(value, min), max)
 }
 
 const resultKey = (result: BookKnowledgeSearchResult) => {

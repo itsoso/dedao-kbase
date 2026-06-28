@@ -15,10 +15,14 @@ for (const hook of [
   'connection-bar',
   'book-rail',
   'book-pagination',
-  'search-panel',
+  'library-search-panel',
   'chat-panel',
   'detail-panel',
   'system-kb-panel',
+  'model-select',
+  'column-resizer',
+  'compact-detail-summary',
+  'answer-markdown',
 ]) {
   assert.ok(appSource.includes(hook), `App.vue should include ${hook}`)
 }
@@ -29,6 +33,9 @@ for (const surface of [
   'listBooksPage',
   'getBook',
   'getBrowserSession',
+  'combinedSearchQuery',
+  'runLibrarySearch',
+  'renderedChatAnswer',
   'searchKnowledge',
   'getBookPrompts',
   'chatWithBook',
@@ -47,10 +54,13 @@ assert.ok(appSource.includes('Chunks'), 'App.vue should expose chunk details')
 assert.ok(appSource.includes('System KB'), 'App.vue should expose system KB details')
 assert.ok(appSource.includes('chatHistory'), 'App.vue should expose chat history')
 assert.ok(appSource.includes('promptTemplates'), 'App.vue should expose prompt templates')
-assert.ok(appSource.includes('MiniMax-M2.5'), 'App.vue should default to TokenPlan model')
+assert.ok(appSource.includes('layoutColumns'), 'App.vue should persist draggable column widths')
+assert.ok(appSource.includes('qwen3.7-max'), 'App.vue should default to Qwen 3.7 Max')
+assert.ok(appSource.includes('renderMarkdown'), 'App.vue should render Markdown answers')
+assert.ok(apiSource.includes('class KBaseClient'), 'api.ts should define KBaseClient')
+assert.ok(readFileSync(join(here, '../src/utils/markdownRender.ts'), 'utf8').includes('marked'), 'markdownRender should use marked')
 assert.ok(appSource.includes('bookTotalPages'), 'App.vue should track paginated book totals')
 
-assert.ok(apiSource.includes('class KBaseClient'), 'api.ts should define KBaseClient')
 assert.ok(apiSource.includes('/browser/session-token'), 'api.ts should request the browser session token endpoint')
 assert.ok(apiSource.includes('BookKnowledgeBooksPage'), 'api.ts should type paginated book results')
 assert.ok(apiSource.includes('BookKnowledgePrompt'), 'api.ts should type prompt templates')

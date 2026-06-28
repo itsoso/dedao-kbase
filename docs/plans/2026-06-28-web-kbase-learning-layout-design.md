@@ -9,6 +9,7 @@ Make the browser workbench feel like a book-learning tool: find a book or passag
 - Merge book filtering and knowledge search into the left rail.
 - Make TokenPlan chat the central primary workspace.
 - Replace the free-form model text input with a model selector that defaults to `Qwen-3.7-Max`.
+- Render Markdown answers with the same escaped `marked` pipeline used by the desktop GUI.
 - Shrink the right details rail by default.
 - Add draggable column splitters and persist column widths in `localStorage`.
 
@@ -31,11 +32,12 @@ The left rail owns all retrieval controls. One keyword field drives both `/api/b
 
 - Default model: `qwen3.7-max` with label `Qwen-3.7-Max`.
 - Model selector options: `Qwen-3.7-Max`, `MiniMax-M2.5`, and custom-compatible values already accepted by the backend.
+- Chat answers render Markdown as headings, lists, tables, blockquotes, and code blocks; raw HTML is escaped before rendering.
 - Drag handles sit between columns. Widths are clamped so the left rail remains usable, the chat panel stays dominant, and the right rail can become compact but not disappear.
 - Right Overview uses compact summary chips instead of large metric cards.
 
 ## Verification
 
-- Extend `frontend-web/scripts/web-kbase-ui-smoke.mjs` with layout hooks: merged search rail, model select, default Qwen model, drag handles, persisted column widths, compact details.
+- Extend `frontend-web/scripts/web-kbase-ui-smoke.mjs` with layout hooks: merged search rail, model select, default Qwen model, drag handles, persisted column widths, compact details, and Markdown rendering.
 - Run `node frontend-web/scripts/web-kbase-ui-smoke.mjs`.
 - Run `cd frontend-web && npm run build`.
