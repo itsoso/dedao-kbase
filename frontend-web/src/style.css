@@ -220,12 +220,11 @@ textarea {
 .kbase-web-shell {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  min-height: calc(100vh - 112px);
-  padding: 12px 0 0;
+  gap: 10px;
+  min-height: calc(100vh - 64px);
+  padding: 8px 0 0;
 }
 
-.connection-bar,
 .app-navigation,
 .book-rail,
 .search-panel,
@@ -239,23 +238,23 @@ textarea {
   box-shadow: none;
 }
 
-.connection-bar {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) 110px 96px;
-  gap: 12px;
-  align-items: center;
-  padding: 12px;
-}
-
 .app-navigation {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 0;
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 12px;
   border: 0;
   border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
   padding: 0;
   background: #ffffff;
+}
+
+.app-navigation-items {
+  display: flex;
+  min-width: 0;
+  gap: 22px;
+  overflow-x: auto;
 }
 
 .app-navigation button {
@@ -272,10 +271,43 @@ textarea {
   text-align: left;
 }
 
+.app-navigation-items button {
+  flex: 0 0 auto;
+  padding: 8px 0 7px;
+}
+
 .app-navigation button.active {
   border-color: var(--dedao-orange);
   background: #ffffff;
   color: var(--dedao-orange);
+}
+
+.app-navigation-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 6px;
+}
+
+.app-navigation-actions .primary-action.compact {
+  min-height: 30px;
+  border: 1px solid var(--dedao-orange);
+  border-radius: 6px;
+  padding: 0 14px;
+  background: var(--dedao-orange);
+  color: #ffffff;
+  font-weight: 700;
+}
+
+.status-pill.compact {
+  min-height: 30px;
+  padding: 0 12px;
+}
+
+.app-navigation-actions .status-pill.compact {
+  overflow: visible;
+  font-size: 12px;
 }
 
 .app-navigation span {
@@ -1220,7 +1252,6 @@ pre {
     min-width: 0;
   }
 
-  .connection-bar,
   .account-toolbar,
   .login-toolbar,
   .app-navigation,
@@ -1232,6 +1263,21 @@ pre {
   .module-status-grid,
   .workbench-grid {
     grid-template-columns: 1fr;
+  }
+
+  .app-navigation {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .app-navigation-items {
+    width: 100%;
+  }
+
+  .app-navigation-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .dedao-web-shell {

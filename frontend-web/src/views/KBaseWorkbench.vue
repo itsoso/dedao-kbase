@@ -1,29 +1,26 @@
 <template>
   <main class="kbase-web-shell">
-    <section class="connection-bar">
-      <div class="brand-block">
-        <span class="eyebrow">Dedao KBase</span>
-        <h1>书籍知识库</h1>
-      </div>
-      <button class="primary-action" type="button" :disabled="loading" @click="connectAndRefresh">
-        {{ loading ? '刷新中' : '连接' }}
-      </button>
-      <div class="status-pill" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</div>
-    </section>
-
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
     <nav class="app-navigation" aria-label="KBase navigation">
-      <button
-        v-for="item in navigationItems"
-        :key="item.key"
-        type="button"
-        :class="{ active: activeNavigationKey === item.key }"
-        @click="navigateTo(item)"
-      >
-        <span>{{ item.label }}</span>
-        <small>{{ item.meta }}</small>
-      </button>
+      <div class="app-navigation-items">
+        <button
+          v-for="item in navigationItems"
+          :key="item.key"
+          type="button"
+          :class="{ active: activeNavigationKey === item.key }"
+          @click="navigateTo(item)"
+        >
+          <span>{{ item.label }}</span>
+          <small>{{ item.meta }}</small>
+        </button>
+      </div>
+      <div class="app-navigation-actions">
+        <button class="primary-action compact" type="button" :disabled="loading" @click="connectAndRefresh">
+          {{ loading ? '刷新中' : '连接' }}
+        </button>
+        <span class="status-pill compact" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</span>
+      </div>
     </nav>
 
     <div ref="workbenchRef" class="workbench-grid learning-layout" :style="workbenchStyle">
