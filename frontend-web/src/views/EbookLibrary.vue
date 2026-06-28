@@ -438,10 +438,10 @@ const formatJobTime = (value?: string) => {
 .ebook-filter-panel,
 .ebook-list-panel,
 .ebook-detail-panel {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .ebook-toolbar {
@@ -480,15 +480,15 @@ const formatJobTime = (value?: string) => {
 
 .ebook-metrics div,
 .ebook-detail-list div {
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 9px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .ebook-metrics dt,
 .ebook-detail-list dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -498,24 +498,24 @@ const formatJobTime = (value?: string) => {
 .ebook-detail-list dd {
   margin: 3px 0 0;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 14px;
   font-weight: 700;
 }
 
 .ebook-source {
   align-self: center;
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 999px;
   padding: 6px 9px;
-  background: #fbfcfe;
-  color: #536274;
+  background: var(--dedao-subtle);
+  color: var(--dedao-muted);
   font-size: 12px;
 }
 
 .ebook-list {
   display: grid;
-  gap: 8px;
+  gap: 0;
   margin-top: 12px;
 }
 
@@ -526,17 +526,18 @@ const formatJobTime = (value?: string) => {
   align-items: center;
   width: 100%;
   min-height: 76px;
-  border: 1px solid #dbe2ec;
-  border-radius: 8px;
-  padding: 9px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 12px 0;
   background: #ffffff;
   cursor: pointer;
   text-align: left;
 }
 
 .ebook-row.active {
-  border-color: #397367;
-  background: #f1faf6;
+  color: var(--dedao-orange);
+  background: #fffaf6;
 }
 
 .cover-frame {
@@ -545,10 +546,10 @@ const formatJobTime = (value?: string) => {
   width: 52px;
   height: 68px;
   place-items: center;
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 6px;
-  background: #f6f8fb;
-  color: #607086;
+  background: var(--dedao-subtle);
+  color: var(--dedao-muted);
   font-weight: 800;
 }
 
@@ -579,20 +580,20 @@ const formatJobTime = (value?: string) => {
 }
 
 .ebook-title-line strong {
-  color: #121926;
-  font-size: 14px;
+  color: #222222;
+  font-size: 15px;
 }
 
 .ebook-title-line span {
   flex: 0 0 auto;
-  color: #397367;
+  color: var(--dedao-orange);
   font-size: 12px;
   font-weight: 700;
 }
 
 .ebook-main p {
   margin: 5px 0 8px;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 12px;
 }
 
@@ -601,26 +602,26 @@ const formatJobTime = (value?: string) => {
   width: 100%;
   height: 6px;
   border-radius: 999px;
-  background: #e7edf4;
+  background: #eeeeee;
 }
 
 .progress-track span {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: #397367;
+  background: var(--dedao-orange);
 }
 
 .ebook-side {
   display: grid;
   justify-items: end;
   gap: 4px;
-  color: #121926;
+  color: #222222;
   font-weight: 800;
 }
 
 .ebook-side small {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 11px;
   font-weight: 700;
 }
@@ -636,29 +637,29 @@ const formatJobTime = (value?: string) => {
 .ebook-action-bar select,
 .detail-action-row select {
   height: 32px;
-  border: 1px solid #c8d2df;
+  border: 1px solid var(--dedao-border);
   border-radius: 7px;
   padding: 0 8px;
   background: #ffffff;
-  color: #263244;
+  color: var(--dedao-text);
   font-size: 12px;
   font-weight: 700;
 }
 
 .secondary-action {
   min-height: 32px;
-  border: 1px solid #c8d2df;
+  border: 1px solid var(--dedao-border);
   border-radius: 7px;
   padding: 0 10px;
-  background: #fbfcfe;
-  color: #263244;
+  background: var(--dedao-subtle);
+  color: var(--dedao-text);
   font-size: 12px;
   font-weight: 700;
 }
 
 .secondary-action:hover {
-  border-color: #397367;
-  color: #244b43;
+  border-color: var(--dedao-orange);
+  color: var(--dedao-orange);
 }
 
 .secondary-action:disabled,
@@ -679,14 +680,14 @@ const formatJobTime = (value?: string) => {
 
 .ebook-detail-panel h2 {
   margin: 0;
-  color: #121926;
+  color: #111111;
   font-size: 19px;
   line-height: 26px;
 }
 
 .ebook-detail-panel p {
   margin: 8px 0 0;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 13px;
 }
 
@@ -699,7 +700,7 @@ const formatJobTime = (value?: string) => {
 
 .ebook-job-status {
   margin-top: 14px;
-  border-top: 1px solid #dbe2ec;
+  border-top: 1px solid var(--dedao-line);
   padding-top: 12px;
 }
 
@@ -714,7 +715,7 @@ const formatJobTime = (value?: string) => {
 .job-status-head strong {
   display: block;
   margin-top: 2px;
-  color: #121926;
+  color: #111111;
   font-size: 14px;
 }
 
@@ -725,14 +726,14 @@ const formatJobTime = (value?: string) => {
 }
 
 .job-status-item {
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 9px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .job-status-item strong {
-  color: #121926;
+  color: #222222;
   font-size: 12px;
 }
 
@@ -747,15 +748,15 @@ const formatJobTime = (value?: string) => {
 .job-status-item small {
   display: block;
   margin-top: 6px;
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 11px;
 }
 
 .job-pill {
-  border: 1px solid #c8d2df;
+  border: 1px solid var(--dedao-border);
   border-radius: 999px;
   padding: 3px 7px;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 800;
   text-transform: uppercase;
@@ -771,7 +772,7 @@ const formatJobTime = (value?: string) => {
 .job-pill.succeeded {
   border-color: #a7d1bd;
   background: #effaf4;
-  color: #397367;
+  color: #257347;
 }
 
 .job-pill.failed {
@@ -781,10 +782,10 @@ const formatJobTime = (value?: string) => {
 }
 
 .empty-state {
-  border: 1px dashed #c8d2df;
-  border-radius: 8px;
+  border: 1px dashed var(--dedao-border);
+  border-radius: 10px;
   padding: 24px;
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   text-align: center;
 }
 </style>

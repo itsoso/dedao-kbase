@@ -367,10 +367,10 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 .catalog-rail,
 .ebook-reader,
 .ebook-context {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .reader-toolbar {
@@ -407,7 +407,7 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 
 .catalog-list {
   display: grid;
-  gap: 8px;
+  gap: 0;
   max-height: calc(100vh - 340px);
   overflow: auto;
 }
@@ -419,21 +419,22 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
   align-items: start;
   width: 100%;
   min-height: 44px;
-  border: 1px solid #d9e2ee;
-  border-radius: 8px;
-  background: #f8fafc;
-  color: #172033;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  background: #ffffff;
+  color: var(--dedao-text);
   text-align: left;
   cursor: pointer;
 }
 
 .catalog-row.active {
-  border-color: #3c7f73;
-  background: #eaf5f1;
+  color: var(--dedao-orange);
+  background: #fffaf6;
 }
 
 .catalog-row:disabled {
-  color: #8491a6;
+  color: #aaaaaa;
   cursor: not-allowed;
 }
 
@@ -449,7 +450,7 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 
 .ebook-reader h1 {
   margin: 2px 0 0;
-  color: #172033;
+  color: #111111;
   font-size: 24px;
   line-height: 1.25;
 }
@@ -462,19 +463,19 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 .ebook-page-frame {
   width: 100%;
   min-height: 720px;
-  border: 1px solid #d9e2ee;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
 }
 
 .page-actions {
   align-items: center;
   margin: 12px 0 0;
-  color: #61708a;
+  color: var(--dedao-muted);
 }
 
 .ebook-context p {
-  color: #52627a;
+  color: #666666;
   line-height: 1.6;
 }
 
@@ -484,7 +485,7 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 }
 
 .ebook-context dt {
-  color: #66758a;
+  color: var(--dedao-muted);
   font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
@@ -493,16 +494,16 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 .ebook-context dd {
   margin: 2px 0 0;
   overflow-wrap: anywhere;
-  color: #172033;
+  color: #222222;
 }
 
 .back-link,
 .primary-action,
 .secondary-action {
   min-height: 38px;
-  border: 1px solid #3c7f73;
-  border-radius: 8px;
-  background: #3c7f73;
+  border: 1px solid var(--dedao-orange);
+  border-radius: 6px;
+  background: var(--dedao-orange);
   color: #ffffff;
   font-weight: 700;
   text-decoration: none;
@@ -517,13 +518,13 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
   min-width: 72px;
   padding: 0 12px;
   background: #ffffff;
-  color: #275f56;
+  color: var(--dedao-orange);
 }
 
 label {
   display: grid;
   gap: 4px;
-  color: #52627a;
+  color: var(--dedao-muted);
   font-size: 12px;
   font-weight: 700;
 }
@@ -531,14 +532,14 @@ label {
 input {
   min-width: 0;
   height: 38px;
-  border: 1px solid #cdd8e6;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-border);
+  border-radius: 6px;
   padding: 0 10px;
-  color: #172033;
+  color: var(--dedao-text);
 }
 
 .eyebrow {
-  color: #607089;
+  color: var(--dedao-muted);
   font-size: 12px;
   font-weight: 800;
   letter-spacing: 0;
@@ -548,7 +549,7 @@ input {
 .brand-block h2,
 .panel-head h2 {
   margin: 2px 0 0;
-  color: #172033;
+  color: #111111;
   font-size: 22px;
   line-height: 1.15;
 }
@@ -559,25 +560,25 @@ input {
   justify-content: center;
   min-height: 28px;
   padding: 0 10px;
-  border: 1px solid #d3dce8;
+  border: 1px solid var(--dedao-border);
   border-radius: 999px;
-  color: #66758a;
+  color: var(--dedao-muted);
   font-size: 12px;
   font-weight: 700;
 }
 
 .status-pill.ok {
-  border-color: #3c7f73;
-  color: #275f56;
+  border-color: #ffd0ad;
+  color: var(--dedao-orange);
 }
 
 .error-strip,
 .empty-state {
-  border: 1px dashed #c9d5e5;
-  border-radius: 8px;
+  border: 1px dashed var(--dedao-border);
+  border-radius: 10px;
   padding: 14px;
-  color: #61708a;
-  background: #fbfcfe;
+  color: var(--dedao-muted);
+  background: var(--dedao-subtle);
 }
 
 .error-strip {

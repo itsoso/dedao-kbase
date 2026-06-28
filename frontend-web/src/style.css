@@ -1,6 +1,14 @@
 :root {
-  color: #172033;
-  background: #eef2f6;
+  --dedao-orange: #ff6b00;
+  --dedao-orange-dark: #e85f00;
+  --dedao-orange-soft: #fff2e8;
+  --dedao-text: #333333;
+  --dedao-muted: #8a8a8a;
+  --dedao-subtle: #f7f7f7;
+  --dedao-line: #eeeeee;
+  --dedao-border: #dddddd;
+  color: var(--dedao-text);
+  background: #ffffff;
   font-family: "Avenir Next", "Helvetica Neue", Helvetica, sans-serif;
   font-synthesis: none;
   line-height: 1.45;
@@ -15,6 +23,7 @@ body {
   margin: 0;
   min-width: 1120px;
   min-height: 100vh;
+  background: #ffffff;
 }
 
 button,
@@ -25,18 +34,18 @@ textarea {
 }
 
 button {
-  border: 1px solid #c8d2df;
+  border: 1px solid var(--dedao-border);
   border-radius: 6px;
   padding: 8px 12px;
   background: #ffffff;
-  color: #263244;
+  color: var(--dedao-text);
   cursor: pointer;
 }
 
 button:hover,
 button.active {
-  border-color: #397367;
-  color: #153f37;
+  border-color: var(--dedao-orange);
+  color: var(--dedao-orange);
 }
 
 button:disabled {
@@ -48,11 +57,19 @@ input,
 select,
 textarea {
   width: 100%;
-  border: 1px solid #c8d2df;
+  border: 1px solid var(--dedao-border);
   border-radius: 6px;
   padding: 9px 10px;
+  background: #f9f9f9;
+  color: var(--dedao-text);
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 0;
+  border-color: var(--dedao-orange);
   background: #ffffff;
-  color: #172033;
 }
 
 textarea {
@@ -62,17 +79,19 @@ textarea {
 
 .dedao-web-shell {
   min-height: 100vh;
-  padding: 8px 10px;
-  background: #eef2f6;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 0 28px;
+  background: #ffffff;
 }
 
 .shell-header,
 .shell-nav,
 .module-landing {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .shell-header {
@@ -80,15 +99,18 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  min-height: 46px;
-  padding: 7px 12px;
+  min-height: 64px;
+  border-width: 0 0 1px;
+  border-radius: 0;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.94);
 }
 
 .shell-brand {
   display: flex;
   min-width: 0;
   align-items: baseline;
-  gap: 10px;
+  gap: 12px;
 }
 
 .shell-brand .eyebrow {
@@ -97,10 +119,10 @@ textarea {
 
 .shell-brand h1 {
   margin: 0;
-  color: #121926;
-  overflow: hidden;
-  font-size: 20px;
-  line-height: 24px;
+  color: #111111;
+  overflow: visible;
+  font-size: 24px;
+  line-height: 32px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -113,11 +135,11 @@ textarea {
 }
 
 .shell-status span {
-  border: 1px solid #b6d3c8;
+  border: 1px solid var(--dedao-border);
   border-radius: 999px;
   padding: 4px 8px;
-  background: #f1faf6;
-  color: #276052;
+  background: #ffffff;
+  color: var(--dedao-orange);
   font-size: 12px;
   font-weight: 700;
 }
@@ -125,9 +147,14 @@ textarea {
 .shell-nav {
   display: grid;
   grid-template-columns: repeat(9, minmax(0, 1fr));
-  gap: 6px;
-  margin-top: 8px;
-  padding: 6px;
+  gap: 0;
+  margin-top: 10px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 0;
+  background: #ffffff;
+  box-shadow: none;
 }
 
 .shell-nav a {
@@ -136,20 +163,21 @@ textarea {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  border: 1px solid #c8d2df;
-  border-radius: 6px;
-  min-height: 38px;
-  padding: 6px 8px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  min-height: 42px;
+  padding: 8px 10px;
   background: #ffffff;
-  color: #263244;
+  color: var(--dedao-text);
   text-decoration: none;
 }
 
 .shell-nav a:hover,
 .shell-nav a.active {
-  border-color: #397367;
-  background: #f1faf6;
-  color: #153f37;
+  border-color: var(--dedao-orange);
+  background: #ffffff;
+  color: var(--dedao-orange);
 }
 
 .shell-nav span,
@@ -161,13 +189,13 @@ textarea {
 }
 
 .shell-nav span {
-  color: #121926;
+  color: currentColor;
   font-size: 13px;
   font-weight: 700;
 }
 
 .shell-nav small {
-  color: #6c7b8f;
+  color: #999999;
   font-size: 10px;
 }
 
@@ -185,14 +213,14 @@ textarea {
 
 .module-hero h2 {
   margin: 0;
-  color: #121926;
+  color: #111111;
   font-size: 22px;
   line-height: 28px;
 }
 
 .module-hero p {
   margin: 4px 0 0;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 13px;
 }
 
@@ -204,14 +232,14 @@ textarea {
 }
 
 .module-status-grid div {
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 8px 10px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .module-status-grid dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -220,7 +248,7 @@ textarea {
 .module-status-grid dd {
   margin: 2px 0 0;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 14px;
   font-weight: 700;
 }
@@ -239,11 +267,11 @@ textarea {
 }
 
 .module-methods code {
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 6px;
   padding: 5px 7px;
-  background: #fbfcfe;
-  color: #263244;
+  background: var(--dedao-subtle);
+  color: var(--dedao-text);
   font-size: 12px;
 }
 
@@ -252,7 +280,7 @@ textarea {
   flex-direction: column;
   gap: 12px;
   min-height: calc(100vh - 112px);
-  padding: 10px 2px 2px;
+  padding: 12px 0 0;
 }
 
 .connection-bar,
@@ -263,10 +291,10 @@ textarea {
 .chat-panel,
 .detail-panel,
 .error-strip {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .connection-bar {
@@ -280,8 +308,12 @@ textarea {
 .app-navigation {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
-  padding: 8px;
+  gap: 0;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 0;
+  background: #ffffff;
 }
 
 .app-navigation button {
@@ -290,19 +322,24 @@ textarea {
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
-  padding: 9px 10px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 9px 10px 8px;
+  background: #ffffff;
   text-align: left;
 }
 
 .app-navigation button.active {
-  border-color: #397367;
-  background: #f1faf6;
+  border-color: var(--dedao-orange);
+  background: #ffffff;
+  color: var(--dedao-orange);
 }
 
 .app-navigation span {
   overflow: hidden;
   max-width: 100%;
-  color: #121926;
+  color: currentColor;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 13px;
@@ -312,7 +349,7 @@ textarea {
 .app-navigation small {
   overflow: hidden;
   max-width: 100%;
-  color: #6c7b8f;
+  color: #999999;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11px;
@@ -322,7 +359,7 @@ textarea {
 .brand-block h2,
 .panel-head h2 {
   margin: 0;
-  color: #121926;
+  color: #111111;
   font-size: 20px;
   line-height: 26px;
 }
@@ -331,7 +368,7 @@ textarea {
 label span {
   display: block;
   margin-bottom: 4px;
-  color: #607086;
+  color: var(--dedao-muted);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0;
@@ -339,27 +376,33 @@ label span {
 }
 
 .primary-action {
-  border-color: #397367;
-  background: #397367;
+  border-color: var(--dedao-orange);
+  background: var(--dedao-orange);
+  color: #ffffff;
+}
+
+.primary-action:hover {
+  border-color: var(--dedao-orange-dark);
+  background: var(--dedao-orange-dark);
   color: #ffffff;
 }
 
 .status-pill {
   align-self: center;
-  border: 1px solid #d6b7a2;
+  border: 1px solid #ffd0ad;
   border-radius: 999px;
   padding: 7px 10px;
-  background: #fff8f1;
-  color: #86502d;
+  background: var(--dedao-orange-soft);
+  color: var(--dedao-orange-dark);
   text-align: center;
   font-size: 12px;
   font-weight: 700;
 }
 
 .status-pill.ok {
-  border-color: #b6d3c8;
-  background: #f1faf6;
-  color: #276052;
+  border-color: #d7eadf;
+  background: #f5fbf7;
+  color: #257347;
 }
 
 .error-strip {
@@ -381,10 +424,10 @@ label span {
 .account-card,
 .login-toolbar,
 .login-card {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .account-toolbar,
@@ -419,7 +462,7 @@ label span {
 .account-identity h2 {
   margin: 10px 0 4px;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 22px;
   line-height: 28px;
 }
@@ -428,7 +471,7 @@ label span {
 .account-note p {
   margin: 0;
   overflow-wrap: anywhere;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 13px;
   line-height: 20px;
 }
@@ -439,18 +482,18 @@ label span {
   height: 72px;
   place-items: center;
   overflow: hidden;
-  border: 1px solid #b6d3c8;
+  border: 1px solid #ffd0ad;
   border-radius: 8px;
-  background: #f1faf6;
-  color: #276052;
+  background: var(--dedao-orange-soft);
+  color: var(--dedao-orange-dark);
   font-size: 28px;
   font-weight: 800;
 }
 
 .account-avatar.empty {
-  border-color: #c8d2df;
-  background: #f5f7fa;
-  color: #607086;
+  border-color: var(--dedao-border);
+  background: var(--dedao-subtle);
+  color: var(--dedao-muted);
 }
 
 .account-avatar img {
@@ -468,14 +511,14 @@ label span {
 
 .account-metrics div {
   min-width: 0;
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 10px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .account-metrics dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -484,7 +527,7 @@ label span {
 .account-metrics dd {
   margin: 4px 0 0;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 15px;
   font-weight: 800;
 }
@@ -501,10 +544,10 @@ label span {
   width: 184px;
   height: 184px;
   place-items: center;
-  border: 1px solid #c8d2df;
-  border-radius: 8px;
-  background: #fbfcfe;
-  color: #607086;
+  border: 1px solid var(--dedao-border);
+  border-radius: 10px;
+  background: var(--dedao-subtle);
+  color: var(--dedao-muted);
   font-size: 22px;
   font-weight: 800;
 }
@@ -531,14 +574,14 @@ label span {
 
 .login-metrics div {
   min-width: 0;
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 10px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .login-metrics dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -547,7 +590,7 @@ label span {
 .login-metrics dd {
   margin: 4px 0 0;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 15px;
   font-weight: 800;
 }
@@ -555,7 +598,7 @@ label span {
 .login-result h2 {
   margin: 8px 0 6px;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 22px;
   line-height: 28px;
 }
@@ -563,17 +606,17 @@ label span {
 .login-result p {
   margin: 0 0 12px;
   overflow-wrap: anywhere;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 13px;
   line-height: 20px;
 }
 
 .login-result a {
   display: inline-flex;
-  border: 1px solid #397367;
+  border: 1px solid var(--dedao-orange);
   border-radius: 6px;
   padding: 8px 12px;
-  background: #397367;
+  background: var(--dedao-orange);
   color: #ffffff;
   text-decoration: none;
   font-size: 13px;
@@ -658,7 +701,7 @@ label span {
 .table-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
   max-height: calc(100vh - 196px);
   overflow: auto;
 }
@@ -682,16 +725,17 @@ label span {
 .table-row {
   display: block;
   width: 100%;
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
-  padding: 10px;
-  background: #fbfcfe;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 12px 2px;
+  background: #ffffff;
   text-align: left;
 }
 
 .book-row.active {
-  border-color: #397367;
-  background: #f1faf6;
+  color: var(--dedao-orange);
+  background: #fffaf6;
 }
 
 .book-row strong,
@@ -699,9 +743,13 @@ label span {
 .table-row strong {
   display: block;
   margin: 0 0 4px;
-  color: #121926;
-  font-size: 14px;
+  color: #222222;
+  font-size: 15px;
   line-height: 20px;
+}
+
+.book-row.active strong {
+  color: var(--dedao-orange);
 }
 
 .book-row span,
@@ -709,7 +757,7 @@ label span {
 .table-row p,
 .source-path {
   margin: 0;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 12px;
   line-height: 18px;
 }
@@ -730,7 +778,7 @@ label span {
   gap: 8px;
   align-items: center;
   margin-top: 10px;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 12px;
 }
 
@@ -747,17 +795,17 @@ label span {
   justify-content: space-between;
   gap: 8px;
   margin-bottom: 5px;
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
 }
 
 .empty-state {
-  border: 1px dashed #c8d2df;
-  border-radius: 7px;
+  border: 1px dashed var(--dedao-border);
+  border-radius: 10px;
   padding: 24px;
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   text-align: center;
 }
 
@@ -834,10 +882,10 @@ label span {
 
 .chat-answer {
   margin-top: 10px;
-  border: 1px solid #b6d3c8;
-  border-radius: 7px;
+  border: 1px solid #ffe0c7;
+  border-radius: 10px;
   padding: 10px;
-  background: #f7fbf9;
+  background: #fffaf6;
 }
 
 .source-chips {
@@ -848,11 +896,11 @@ label span {
 }
 
 .source-chips span {
-  border: 1px solid #c8d2df;
+  border: 1px solid var(--dedao-line);
   border-radius: 999px;
   padding: 4px 8px;
   background: #ffffff;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 11px;
 }
 
@@ -865,7 +913,7 @@ label span {
   justify-content: space-between;
   align-items: center;
   margin-bottom: 8px;
-  color: #253244;
+  color: #333333;
   font-size: 13px;
 }
 
@@ -878,20 +926,24 @@ label span {
   display: block;
   width: 100%;
   margin-bottom: 6px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  background: #ffffff;
   text-align: left;
 }
 
 .history-row span {
   display: block;
   margin-bottom: 3px;
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 11px;
 }
 
 .history-row strong {
   display: block;
   overflow: hidden;
-  color: #121926;
+  color: #222222;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
@@ -905,14 +957,14 @@ label span {
 }
 
 .compact-detail-summary div {
-  border: 1px solid #dbe2ec;
-  border-radius: 6px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 8px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .compact-detail-summary dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -920,7 +972,7 @@ label span {
 
 .compact-detail-summary dd {
   margin: 2px 0 0;
-  color: #121926;
+  color: #111111;
   font-size: 18px;
   font-weight: 700;
 }
@@ -939,12 +991,12 @@ label span {
   height: 100%;
   margin: 0 auto;
   border-radius: 999px;
-  background: #d3dce8;
+  background: var(--dedao-line);
   content: "";
 }
 
 .column-resizer:hover::before {
-  background: #397367;
+  background: var(--dedao-orange);
 }
 
 .answer-markdown {
@@ -981,14 +1033,14 @@ label span {
 }
 
 .answer-markdown h3 {
-  border-left: 4px solid #397367;
+  border-left: 4px solid var(--dedao-orange);
   padding-left: 10px;
   font-size: 16px;
 }
 
 .answer-markdown p {
   margin: 10px 0 12px;
-  color: #263244;
+  color: var(--dedao-text);
   line-height: 1.86;
 }
 
@@ -1036,9 +1088,9 @@ label span {
 .answer-markdown blockquote {
   margin: 12px 0;
   padding: 8px 12px;
-  border-left: 3px solid #0f766e;
+  border-left: 3px solid var(--dedao-orange);
   border-radius: 0 6px 6px 0;
-  background: #f0fdfa;
+  background: #fff8f1;
   color: #334155;
 }
 
@@ -1056,7 +1108,7 @@ label span {
   border-collapse: collapse;
   border: 1px solid #dfe7f2;
   border-radius: 8px;
-  color: #263244;
+  color: var(--dedao-text);
   font-size: 13px;
   line-height: 1.62;
 }
@@ -1092,7 +1144,7 @@ label span {
 
 .job-helper {
   margin: 8px 0 10px;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 12px;
   line-height: 18px;
 }
@@ -1100,14 +1152,15 @@ label span {
 .job-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
 }
 
 .job-row {
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
-  padding: 10px;
-  background: #fbfcfe;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 10px 0;
+  background: #ffffff;
 }
 
 .job-row.running,
@@ -1118,7 +1171,7 @@ label span {
 
 .job-row.succeeded {
   border-color: #b6d3c8;
-  background: #f1faf6;
+  background: #f5fbf7;
 }
 
 .job-row.failed {
@@ -1129,14 +1182,14 @@ label span {
 .job-row strong {
   display: block;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #222222;
   font-size: 13px;
   line-height: 19px;
 }
 
 .job-row p {
   margin: 4px 0 0;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 12px;
   line-height: 18px;
 }
@@ -1156,20 +1209,20 @@ label span {
 .endpoint-group a,
 .endpoint-group code {
   display: block;
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 6px;
   padding: 8px 9px;
   overflow-wrap: anywhere;
-  background: #fbfcfe;
-  color: #263244;
+  background: var(--dedao-subtle);
+  color: var(--dedao-text);
   font-size: 12px;
   line-height: 18px;
   text-decoration: none;
 }
 
 .endpoint-group a:hover {
-  border-color: #397367;
-  color: #153f37;
+  border-color: var(--dedao-orange);
+  color: var(--dedao-orange);
 }
 
 .ops-grid {
@@ -1180,14 +1233,14 @@ label span {
 }
 
 .ops-grid div {
-  border: 1px solid #dbe2ec;
-  border-radius: 6px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 8px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .ops-grid dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -1195,7 +1248,7 @@ label span {
 
 .ops-grid dd {
   margin: 2px 0 0;
-  color: #121926;
+  color: #111111;
   font-size: 16px;
   font-weight: 700;
 }
@@ -1203,7 +1256,7 @@ label span {
 pre {
   min-height: 420px;
   margin: 0;
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 7px;
   padding: 12px;
   overflow: auto;

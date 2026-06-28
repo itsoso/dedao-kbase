@@ -140,10 +140,10 @@ const hydrateFromBrowserSession = async () => {
 
 .settings-header,
 .settings-card {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .settings-header {
@@ -173,7 +173,7 @@ const hydrateFromBrowserSession = async () => {
 
 .settings-card label span,
 .settings-card dt {
-  color: #607086;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 800;
   text-transform: uppercase;
@@ -181,10 +181,10 @@ const hydrateFromBrowserSession = async () => {
 
 .settings-card input {
   min-height: 38px;
-  border: 1px solid #c8d2df;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-border);
+  border-radius: 6px;
   padding: 0 10px;
-  color: #172033;
+  color: var(--dedao-text);
   font-size: 14px;
 }
 
@@ -197,7 +197,7 @@ const hydrateFromBrowserSession = async () => {
 
 .settings-card p {
   margin: 8px 0 0;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 13px;
 }
 
@@ -208,25 +208,25 @@ const hydrateFromBrowserSession = async () => {
 }
 
 .settings-card dl div {
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 9px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .settings-card dd {
   margin: 3px 0 0;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-weight: 700;
 }
 
 .settings-message {
-  border: 1px solid #b8d7ca;
-  border-radius: 8px;
+  border: 1px solid #ffd0ad;
+  border-radius: 10px;
   padding: 10px 12px;
-  background: #effaf4;
-  color: #397367;
+  background: var(--dedao-orange-soft);
+  color: var(--dedao-orange-dark);
 }
 
 .settings-message.error {
@@ -237,11 +237,11 @@ const hydrateFromBrowserSession = async () => {
 
 .secondary-action {
   min-height: 36px;
-  border: 1px solid #c8d2df;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-border);
+  border-radius: 6px;
   padding: 0 12px;
-  background: #fbfcfe;
-  color: #263244;
+  background: var(--dedao-subtle);
+  color: var(--dedao-text);
   font-weight: 700;
 }
 

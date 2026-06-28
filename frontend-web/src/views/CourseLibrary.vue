@@ -266,10 +266,10 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 .course-filter-panel,
 .course-list-panel,
 .course-detail-panel {
-  border: 1px solid #d3dce8;
-  border-radius: 8px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
   background: #ffffff;
-  box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
+  box-shadow: none;
 }
 
 .course-toolbar {
@@ -308,15 +308,15 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 
 .course-metrics div,
 .course-detail-list div {
-  border: 1px solid #dbe2ec;
-  border-radius: 7px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
   padding: 9px;
-  background: #fbfcfe;
+  background: var(--dedao-subtle);
 }
 
 .course-metrics dt,
 .course-detail-list dt {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
@@ -326,24 +326,24 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 .course-detail-list dd {
   margin: 3px 0 0;
   overflow-wrap: anywhere;
-  color: #121926;
+  color: #111111;
   font-size: 14px;
   font-weight: 700;
 }
 
 .course-source {
   align-self: center;
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 999px;
   padding: 6px 9px;
-  background: #fbfcfe;
-  color: #536274;
+  background: var(--dedao-subtle);
+  color: var(--dedao-muted);
   font-size: 12px;
 }
 
 .course-list {
   display: grid;
-  gap: 8px;
+  gap: 0;
   margin-top: 12px;
 }
 
@@ -354,13 +354,17 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   align-items: center;
   width: 100%;
   min-height: 78px;
-  padding: 9px;
+  border: 0;
+  border-bottom: 1px solid var(--dedao-line);
+  border-radius: 0;
+  padding: 12px 0;
+  background: #ffffff;
   text-align: left;
 }
 
 .course-row.active {
-  border-color: #397367;
-  background: #f1faf6;
+  color: var(--dedao-orange);
+  background: #fffaf6;
 }
 
 .course-cover {
@@ -369,10 +373,10 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   width: 62px;
   height: 62px;
   place-items: center;
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 6px;
-  background: #f6f8fb;
-  color: #607086;
+  background: var(--dedao-subtle);
+  color: var(--dedao-muted);
   font-weight: 800;
 }
 
@@ -404,20 +408,20 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
 }
 
 .course-title-line strong {
-  color: #121926;
-  font-size: 14px;
+  color: #222222;
+  font-size: 15px;
 }
 
 .course-title-line span {
   flex: 0 0 auto;
-  color: #397367;
+  color: var(--dedao-orange);
   font-size: 12px;
   font-weight: 700;
 }
 
 .course-main p {
   margin: 5px 0 8px;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 12px;
 }
 
@@ -433,19 +437,19 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   width: 100%;
   height: 6px;
   border-radius: 999px;
-  background: #e7edf4;
+  background: #eeeeee;
 }
 
 .progress-track span {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: #397367;
+  background: var(--dedao-orange);
 }
 
 .course-progress-line small,
 .course-side small {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 11px;
   font-weight: 700;
 }
@@ -455,28 +459,28 @@ const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinit
   min-width: 0;
   justify-items: end;
   gap: 4px;
-  color: #121926;
+  color: #222222;
   font-weight: 800;
 }
 
 .course-detail-panel h2 {
   margin: 0;
-  color: #121926;
+  color: #111111;
   font-size: 19px;
   line-height: 26px;
 }
 
 .course-detail-panel p {
   margin: 8px 0 0;
-  color: #536274;
+  color: var(--dedao-muted);
   font-size: 13px;
 }
 
 .empty-state {
-  border: 1px dashed #c8d2df;
+  border: 1px dashed var(--dedao-border);
   border-radius: 8px;
   padding: 24px;
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   text-align: center;
 }
 </style>

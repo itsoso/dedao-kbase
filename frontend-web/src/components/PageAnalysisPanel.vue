@@ -155,7 +155,7 @@ const submitAnalysis = async () => {
   display: grid;
   gap: 10px;
   margin-top: 14px;
-  border-top: 1px solid #dbe2ec;
+  border-top: 1px solid var(--dedao-line);
   padding-top: 12px;
 }
 
@@ -170,7 +170,7 @@ const submitAnalysis = async () => {
 
 .analysis-head h3 {
   margin: 0;
-  color: #121926;
+  color: #111111;
   font-size: 15px;
   line-height: 20px;
 }
@@ -194,7 +194,7 @@ const submitAnalysis = async () => {
 
 .analysis-actions span,
 .answer-meta {
-  color: #6c7b8f;
+  color: var(--dedao-muted);
   font-size: 11px;
   font-weight: 700;
 }
@@ -202,15 +202,15 @@ const submitAnalysis = async () => {
 .analysis-answer {
   display: grid;
   gap: 8px;
-  border: 1px solid #dbe2ec;
-  border-radius: 8px;
+  border: 1px solid #ffe0c7;
+  border-radius: 10px;
   padding: 10px;
-  background: #fbfcfe;
+  background: #fffaf6;
 }
 
 .answer-markdown {
   overflow-wrap: anywhere;
-  color: #263244;
+  color: #333333;
   font-size: 13px;
 }
 
@@ -224,16 +224,16 @@ const submitAnalysis = async () => {
 .answer-markdown :deep(h2),
 .answer-markdown :deep(h3) {
   margin: 10px 0 6px;
-  color: #121926;
+  color: #111111;
   font-size: 15px;
   line-height: 20px;
 }
 
 .answer-markdown :deep(code) {
-  border: 1px solid #dbe2ec;
+  border: 1px solid var(--dedao-line);
   border-radius: 4px;
   padding: 1px 4px;
-  background: #eef2f6;
+  background: #f7f7f7;
 }
 
 .error-strip.compact {

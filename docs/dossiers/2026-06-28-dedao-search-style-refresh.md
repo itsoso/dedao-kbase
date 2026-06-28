@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress.
+Implemented locally; pending production deploy verification.
 
 ## Requirement
 
@@ -20,7 +20,7 @@ Reference `https://www.dedao.cn/search/ebook/result?...q=金融` and refactor th
 
 - G1 Scope: accepted as frontend style refresh only.
 - G2 Feasibility: no backend/API changes required.
-- G3 Tests: pending.
-- G4 Review: pending.
+- G3 Tests: passed with `npm --prefix frontend-web run build`, Playwright screenshots for `/ebook`, `/course`, `/book-knowledge`, `/course/demo-course`, `/ebook/demo-ebook`, and `git diff --check`.
+- G4 Review: old blue/green primary colors were removed from `frontend-web/src` style sources; shell width and body background were checked in browser automation.
 - G5 Deploy Health: pending.
 - G6 Online Verification: pending.
