@@ -48,3 +48,11 @@ Continue Phase 2 auth work by replacing the Web `/user/login` placeholder with a
 ## Result
 
 Phase 2 login slice shipped. `/user/login` now renders a Web QR login surface backed by Bearer-protected auth endpoints, while raw Dedao cookies remain server-side.
+
+## Follow-up: Service Cache Fix
+
+The login chain generated QR codes and returned pending scan status correctly, but active user changes did not refresh `ConfigsData.service`. After a successful QR login, later Dedao API calls could still reuse the old unauthenticated service instance. Added a regression test for this cache boundary and fixed `setActiveUser` to rebuild the service whenever the active user changes.
+
+## Follow-up: Logged-In QR Fix
+
+Online debugging showed `/api/dedao/auth/qrcode` returned `502` with `empty qrcode response` when the server already had an active Dedao session. The root cause was QR generation reusing the active user service, so the upstream login QR request was sent with logged-in cookies. Login QR/check now use a dedicated anonymous login service, while successful check still persists the returned Cookie through the existing config path. Verification after deployment: `logged_in=True user_count=1`, Bearer QR returned 200 with QR image/string/token, `has_cookie=False`, `no_store=True`; immediate unscanned check returned 200 with `status=0` and session metadata.

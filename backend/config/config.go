@@ -288,8 +288,15 @@ func (c *ConfigsData) ActiveUser() *Dedao {
 }
 
 func (c *ConfigsData) setActiveUser(u *Dedao) {
+	if u == nil {
+		c.AcitveUID = ""
+		c.activeUser = nil
+		c.service = nil
+		return
+	}
 	c.AcitveUID = u.UIDHazy
 	c.activeUser = u
+	c.service = u.New()
 }
 
 // LoginUserCount 登录用户数量

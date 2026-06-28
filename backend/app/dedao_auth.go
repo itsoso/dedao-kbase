@@ -29,17 +29,36 @@ type DedaoAuthProvider interface {
 	CheckLogin(token string, qrCodeString string) (DedaoLoginCheck, error)
 }
 
-type liveDedaoAuthProvider struct{}
+type dedaoLoginService interface {
+	LoginAccessToken() (string, error)
+	GetQrcode(token string) (*services.QrCodeResp, error)
+	CheckLogin(token string, qrcode string) (*services.CheckLoginResp, string, error)
+}
+
+type liveDedaoAuthProvider struct {
+	newLoginService func() dedaoLoginService
+}
 
 func defaultDedaoAuthProvider(provider DedaoAuthProvider) DedaoAuthProvider {
 	if provider != nil {
 		return provider
 	}
-	return liveDedaoAuthProvider{}
+	return liveDedaoAuthProvider{
+		newLoginService: func() dedaoLoginService {
+			return services.NewService(&services.CookieOptions{})
+		},
+	}
 }
 
-func (liveDedaoAuthProvider) NewQRCode() (DedaoLoginQRCode, error) {
-	service := getService()
+func (p liveDedaoAuthProvider) loginService() dedaoLoginService {
+	if p.newLoginService != nil {
+		return p.newLoginService()
+	}
+	return services.NewService(&services.CookieOptions{})
+}
+
+func (p liveDedaoAuthProvider) NewQRCode() (DedaoLoginQRCode, error) {
+	service := p.loginService()
 	token, err := service.LoginAccessToken()
 	if err != nil {
 		return DedaoLoginQRCode{}, err
@@ -58,8 +77,8 @@ func (liveDedaoAuthProvider) NewQRCode() (DedaoLoginQRCode, error) {
 	}, nil
 }
 
-func (liveDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (DedaoLoginCheck, error) {
-	check, cookie, err := getService().CheckLogin(token, qrCodeString)
+func (p liveDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (DedaoLoginCheck, error) {
+	check, cookie, err := p.loginService().CheckLogin(token, qrCodeString)
 	if err != nil {
 		return DedaoLoginCheck{}, err
 	}
