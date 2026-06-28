@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented locally; pending production deploy verification.
+Deployed and verified on production.
 
 ## Requirement
 
@@ -22,5 +22,5 @@ Reference `https://www.dedao.cn/search/ebook/result?...q=金融` and refactor th
 - G2 Feasibility: no backend/API changes required.
 - G3 Tests: passed with `npm --prefix frontend-web run build`, Playwright screenshots for `/ebook`, `/course`, `/book-knowledge`, `/course/demo-course`, `/ebook/demo-ebook`, and `git diff --check`.
 - G4 Review: old blue/green primary colors were removed from `frontend-web/src` style sources; shell width and body background were checked in browser automation.
-- G5 Deploy Health: pending.
-- G6 Online Verification: pending.
+- G5 Deploy Health: static frontend bundle deployed to `/var/www/kbase.executor.life`; `/health` returned HTTP 200.
+- G6 Online Verification: `/ebook` remains Basic Auth protected as expected, and deployed CSS contains `--dedao-orange` with old blue/green primary colors absent.
