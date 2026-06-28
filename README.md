@@ -50,9 +50,30 @@
 * 新增多书并行分析：按 `book_id` 管理分析 loading 状态，切换到其他书时可以继续发送新请求。
 * 新增 NotebookLM Bridge：可导出 `book.md`、`claims.md`、`notebooklm-prompt.md` 资料包，一键打开 NotebookLM，并保存每本书对应的 NotebookLM 链接。
 * 新增 MCP 能力：提供 `cmd/book-mcp` stdio server，可向其他大模型暴露书籍列表、检索、章节读取、导出等工具。
+* 新增在线 kbase HTTP 服务：提供 `cmd/kbase-server`，可部署到 `kbase.executor.life`，用 Bearer token 向 health/proofroom 暴露书籍检索和 System KB export。
 * 新增项目导出：支持导出为 `health_system_kb_v2` 健康知识库格式，以及 `quant_rule_cards` 量化规则卡草案。
 * 优化登录二维码流程：在缺失或失效 CSRF token 时自动刷新首页状态并重试，降低扫码二维码加载失败概率。
 * 优化书籍知识库 UI：新增专业化工作台布局、搜索、章节/claims/chunks/MCP/NotebookLM tabs 和历史记录侧栏。
+
+### kbase HTTP 服务
+
+本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。
+
+```bash
+cd /opt/dedao-gui
+KBASE_AUTH_TOKEN="replace-with-long-secret" \
+KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
+KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
+go run ./cmd/kbase-server --addr 127.0.0.1:8719
+```
+
+对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：
+
+- `GET /health`：无需 token，用于服务探活。
+- `GET /api/books`：列出书籍知识包。
+- `GET /api/search?q=关键词&limit=5`：检索书籍 chunks/claims。
+- `GET /api/system-kb/manifest`：返回 System KB export 摘要。
+- `GET /api/system-kb/export`：返回 health/proofroom 导入用的 `system_kb_export.json`。
 
 ### NotebookLM Bridge 使用方式
 
