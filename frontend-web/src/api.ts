@@ -327,6 +327,36 @@ export interface DedaoArticleMarkdown {
   markdown: string
 }
 
+export interface PageAnalysisSection {
+  title: string
+  content: string
+}
+
+export interface PageAnalysisContextStats {
+  sections: number
+  chars: number
+}
+
+export interface PageAnalysisRequest {
+  source: string
+  title: string
+  url?: string
+  mode?: string
+  question: string
+  model?: string
+  max_context_chars?: number
+  context_sections: PageAnalysisSection[]
+}
+
+export interface PageAnalysisResponse {
+  answer: string
+  model: string
+  mode: string
+  source: string
+  context_stats: PageAnalysisContextStats
+  created_at: string
+}
+
 export const getBrowserSession = async (): Promise<BrowserSession | null> => {
   const response = await fetch('/browser/session-token', {
     credentials: 'same-origin',
@@ -502,6 +532,13 @@ export class KBaseClient {
 
   async getDedaoArticleMarkdown(enid: string): Promise<DedaoArticleMarkdown> {
     return this.request<DedaoArticleMarkdown>(`/api/dedao/articles/${encodeURIComponent(enid)}?type=course`)
+  }
+
+  async analyzePage(body: PageAnalysisRequest): Promise<PageAnalysisResponse> {
+    return this.request<PageAnalysisResponse>('/api/analyze-page', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {

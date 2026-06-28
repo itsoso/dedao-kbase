@@ -99,6 +99,16 @@
             <dd>{{ enid }}</dd>
           </div>
         </dl>
+        <PageAnalysisPanel
+          :base-url="baseUrl"
+          :token="token"
+          source="ebook"
+          :page-title="detail?.title || '电子书页面'"
+          :page-url="ebookPageURL"
+          :context-sections="ebookAnalysisSections"
+          :quick-prompts="ebookQuickPrompts"
+          default-question="分析当前电子书页面的重点、难点和建议学习路径。"
+        />
       </aside>
     </section>
   </main>
@@ -113,7 +123,9 @@ import {
   type DedaoEbookCatalogItem,
   type DedaoEbookChapterPages,
   type DedaoEbookDetail,
+  type PageAnalysisSection,
 } from '../api'
+import PageAnalysisPanel from '../components/PageAnalysisPanel.vue'
 
 const storageKey = 'dedao-kbase-web-settings'
 const route = useRoute()
@@ -132,12 +144,59 @@ const pageResponse = ref<DedaoEbookChapterPages | null>(null)
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
+const ebookPageURL = computed(() => `/ebook/${encodeURIComponent(enid.value)}`)
 const svgFrames = computed(() =>
   (pageResponse.value?.pages || []).map((page) => ({
     key: `${page.page_num}-${page.begin_offset}-${page.end_offset}`,
     srcdoc: svgToSrcdoc(page.svg),
   })),
 )
+const ebookQuickPrompts = [
+  { label: '学习', mode: 'study', question: '分析当前电子书页面的重点、难点和建议学习路径。' },
+  { label: '总结', mode: 'summary', question: '总结当前电子书和当前章节的核心内容。' },
+  { label: '问题', mode: 'questions', question: '基于当前章节生成 5 个复习问题，并给出参考答案。' },
+]
+const ebookAnalysisSections = computed<PageAnalysisSection[]>(() => {
+  const sections: PageAnalysisSection[] = []
+  if (detail.value) {
+    sections.push({
+      title: '电子书信息',
+      content: compactLines([
+        `标题: ${detail.value.title || '-'}`,
+        `作者: ${detail.value.book_author || detail.value.author_list?.join(' / ') || '-'}`,
+        `出版社: ${detail.value.press_name || '-'}`,
+        `分类: ${detail.value.classify_name || '-'}`,
+        `简介: ${detail.value.book_intro || detail.value.author_info || '-'}`,
+        `评分: ${detail.value.product_score || detail.value.douban_score || '-'}`,
+      ]),
+    })
+    sections.push({
+      title: '目录',
+      content: detail.value.catalog
+        .slice(0, 80)
+        .map((item) => `${item.play_order || '-'} ${'  '.repeat(Math.max(0, item.level - 1))}${item.text || item.chapter_id || '-'}`)
+        .join('\n'),
+    })
+  }
+  if (selectedChapterID.value || selectedChapterTitle.value) {
+    sections.push({
+      title: '当前章节',
+      content: compactLines([
+        `标题: ${selectedChapterTitle.value || '-'}`,
+        `chapter_id: ${selectedChapterID.value || '-'}`,
+        pageResponse.value ? `页索引: ${pageResponse.value.index}, 已加载: ${pageResponse.value.pages.length}, 是否结束: ${pageResponse.value.is_end}` : '',
+      ]),
+    })
+  }
+  const pageText = currentPageText()
+  if (pageText) {
+    sections.push({
+      title: '当前加载页文本',
+      content: pageText,
+    })
+  }
+  return sections
+})
 
 onMounted(async () => {
   restoreConnection()
@@ -234,6 +293,41 @@ const loadChapterPages = async (chapterID: string, index: number) => {
 
 const catalogKey = (item: DedaoEbookCatalogItem) => `${item.chapter_id || item.href || item.text}-${item.play_order || 0}`
 
+const currentPageText = () => {
+  const pages = pageResponse.value?.pages || []
+  const text = pages
+    .map((page) => {
+      const extracted = extractSVGText(page.svg)
+      if (extracted) {
+        return `Page ${page.page_num}\n${extracted}`
+      }
+      return `Page ${page.page_num}: begin_offset=${page.begin_offset}, end_offset=${page.end_offset}`
+    })
+    .join('\n\n')
+  return text.trim()
+}
+
+const extractSVGText = (svg: string) => {
+  if (!svg.trim()) {
+    return ''
+  }
+  try {
+    const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
+    return Array.from(doc.querySelectorAll('text,tspan'))
+      .map((node) => node.textContent?.trim() || '')
+      .filter(Boolean)
+      .join('\n')
+  } catch {
+    return svg.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+  }
+}
+
+const compactLines = (lines: Array<string | number | undefined | null>) =>
+  lines
+    .map((line) => String(line ?? '').trim())
+    .filter(Boolean)
+    .join('\n')
+
 const svgToSrcdoc = (svg: string) => `<!doctype html>
 <html>
   <head>
@@ -289,7 +383,7 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 
 .reader-workspace {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 260px;
+  grid-template-columns: 300px minmax(0, 1fr) 320px;
   gap: 12px;
   min-height: calc(100vh - 260px);
 }

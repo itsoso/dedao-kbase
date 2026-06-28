@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -205,6 +206,75 @@ func TestKBaseHTTPHandlerServesBookPromptsChatAndHistory(t *testing.T) {
 	if !strings.Contains(historyResp.Body.String(), `"history"`) ||
 		!strings.Contains(historyResp.Body.String(), `"Web 对话回答"`) {
 		t.Fatalf("history response missing saved chat: %s", historyResp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerServesPageAnalysis(t *testing.T) {
+	var gotTokenPlanAuth string
+	var gotTokenPlanBody string
+	tokenPlanServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTokenPlanAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/compatible-mode/v1/chat/completions" {
+			t.Fatalf("TokenPlan path = %q", r.URL.Path)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("ReadAll returned error: %v", err)
+		}
+		gotTokenPlanBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"当前页面重点是主动回忆。"}}]}`))
+	}))
+	defer tokenPlanServer.Close()
+
+	envFile := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envFile, []byte(strings.Join([]string{
+		"TOKENPLAN_API_KEY=sk-page-web-test",
+		"TOKENPLAN_BASE_URL=" + tokenPlanServer.URL + "/compatible-mode/v1",
+		"TOKENPLAN_MODEL=MiniMax-M2.5",
+	}, "\n")), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "")
+	t.Setenv("DEDAO_TOKENPLAN_MODEL", "")
+	t.Setenv("TOKENPLAN_API_KEY", "")
+	t.Setenv("TOKENPLAN_BASE_URL", "")
+	t.Setenv("TOKENPLAN_MODEL", "")
+	t.Setenv("DEDAO_TOKENPLAN_ENV_FILE", envFile)
+
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(t.TempDir()),
+		AuthToken: "secret-token",
+	})
+
+	resp := requestKBaseJSON(handler, http.MethodPost, "/api/analyze-page", "secret-token", `{
+		"source":"course",
+		"title":"有效学习",
+		"url":"/course/course-enid",
+		"mode":"study",
+		"question":"分析当前页面",
+		"model":"qwen3.7-max",
+		"context_sections":[
+			{"title":"课程信息","content":"讲师: 王老师"},
+			{"title":"当前文章","content":"主动回忆比重复阅读更有效。"}
+		]
+	}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("page analysis status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"answer":"当前页面重点是主动回忆。"`) ||
+		!strings.Contains(resp.Body.String(), `"model":"qwen3.7-max"`) ||
+		!strings.Contains(resp.Body.String(), `"source":"course"`) ||
+		!strings.Contains(resp.Body.String(), `"context_stats"`) {
+		t.Fatalf("page analysis response missing metadata: %s", resp.Body.String())
+	}
+	if gotTokenPlanAuth != "Bearer sk-page-web-test" {
+		t.Fatalf("TokenPlan auth = %q, want fake bearer", gotTokenPlanAuth)
+	}
+	if !strings.Contains(gotTokenPlanBody, "有效学习") ||
+		!strings.Contains(gotTokenPlanBody, "主动回忆比重复阅读更有效") {
+		t.Fatalf("TokenPlan request missing page context: %s", gotTokenPlanBody)
 	}
 }
 

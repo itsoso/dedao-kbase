@@ -85,6 +85,16 @@
             <dd>{{ enid }}</dd>
           </div>
         </dl>
+        <PageAnalysisPanel
+          :base-url="baseUrl"
+          :token="token"
+          source="course"
+          :page-title="detail?.course.title || '课程页面'"
+          :page-url="coursePageURL"
+          :context-sections="courseAnalysisSections"
+          :quick-prompts="courseQuickPrompts"
+          default-question="分析当前课程页面的重点、难点和建议学习路径。"
+        />
       </aside>
     </section>
   </main>
@@ -98,7 +108,9 @@ import {
   KBaseClient,
   type DedaoArticle,
   type DedaoCourseDetail,
+  type PageAnalysisSection,
 } from '../api'
+import PageAnalysisPanel from '../components/PageAnalysisPanel.vue'
 import { renderMarkdown } from '../utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
@@ -123,6 +135,50 @@ const hasMoreArticles = ref(false)
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 const renderedArticle = computed(() => renderMarkdown(markdown.value))
+const coursePageURL = computed(() => `/course/${encodeURIComponent(enid.value)}`)
+const courseQuickPrompts = [
+  { label: '学习', mode: 'study', question: '分析当前课程页面的重点、难点和建议学习路径。' },
+  { label: '总结', mode: 'summary', question: '总结当前课程和当前文章的核心内容。' },
+  { label: '复习题', mode: 'questions', question: '基于当前文章生成 5 个复习问题，并给出参考答案。' },
+]
+const courseAnalysisSections = computed<PageAnalysisSection[]>(() => {
+  const sections: PageAnalysisSection[] = []
+  const course = detail.value?.course
+  if (course) {
+    sections.push({
+      title: '课程信息',
+      content: compactLines([
+        `标题: ${course.title || '-'}`,
+        `讲师: ${course.lecturer_name || '-'}`,
+        `讲师头衔: ${course.lecturer_title || '-'}`,
+        `简介: ${course.intro || '-'}`,
+        `亮点: ${course.highlight || '-'}`,
+        `文章数: ${course.article_count || articles.value.length || 0}`,
+        `学习人数: ${course.learn_user_count || '-'}`,
+      ]),
+    })
+  }
+  if (articles.value.length) {
+    sections.push({
+      title: '课程目录',
+      content: articles.value
+        .slice(0, 60)
+        .map((article) => `${article.order_num || article.id}. ${article.title || `Article ${article.id}`} - ${article.summary || ''}`)
+        .join('\n'),
+    })
+  }
+  if (selectedArticleTitle.value || markdown.value) {
+    sections.push({
+      title: '当前文章',
+      content: compactLines([
+        `标题: ${selectedArticleTitle.value || '-'}`,
+        `ENID: ${selectedArticleEnid.value || '-'}`,
+        markdown.value,
+      ]),
+    })
+  }
+  return sections
+})
 
 onMounted(async () => {
   restoreConnection()
@@ -235,6 +291,12 @@ const formatPublishTime = (value?: number) => {
   }
   return new Date(value * 1000).toLocaleDateString()
 }
+
+const compactLines = (lines: Array<string | number | undefined | null>) =>
+  lines
+    .map((line) => String(line ?? '').trim())
+    .filter(Boolean)
+    .join('\n')
 </script>
 
 <style scoped>
@@ -266,7 +328,7 @@ const formatPublishTime = (value?: number) => {
 
 .reader-workspace {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 260px;
+  grid-template-columns: 300px minmax(0, 1fr) 320px;
   gap: 12px;
   min-height: calc(100vh - 260px);
 }

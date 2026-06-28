@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress.
+Implemented locally; pending production deploy verification.
 
 ## Requirement
 
@@ -12,8 +12,8 @@ Add large-model entry points to the Web course and ebook pages. The entry point 
 
 - G1 Scope: accepted as a one-shot analysis panel for course and ebook detail pages.
 - G2 Feasibility: reuse existing TokenPlan config and OpenAI-compatible client; add a generic protected page-analysis endpoint.
-- G3 Tests: pending.
-- G4 Review: pending.
+- G3 Tests: passed with `go test ./backend/app -count=1`, `go test ./... -count=1`, `npm --prefix frontend-web run build`, and `git diff --check`.
+- G4 Review: implementation kept to generic page-analysis API plus shared Web panel; book knowledge chat history remains unchanged.
 - G5 Deploy Health: pending.
 - G6 Online Verification: pending.
 

@@ -123,6 +123,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoEbookSubroute(w, r)
+	case r.URL.Path == "/api/analyze-page":
+		if !requireHTTPMethod(w, r, http.MethodPost) {
+			return
+		}
+		h.handlePageAnalysis(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -329,6 +334,24 @@ func (h *kbaseHTTPHandler) handleBookChatHistory(w http.ResponseWriter, r *http.
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"history": history})
+}
+
+func (h *kbaseHTTPHandler) handlePageAnalysis(w http.ResponseWriter, r *http.Request) {
+	var request PageAnalysisRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	response, err := AnalyzePage(r.Context(), request)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "required") {
+			status = http.StatusBadRequest
+		}
+		writeHTTPError(w, status, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, response)
 }
 
 func (h *kbaseHTTPHandler) handleSearch(w http.ResponseWriter, r *http.Request) {
