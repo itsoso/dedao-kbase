@@ -76,7 +76,7 @@
             type="button"
             class="course-row"
             :class="{ active: selectedKey === courseKey(course) }"
-            @click="selectCourse(course)"
+            @click="openCourse(course)"
           >
             <div class="course-cover">
               <img v-if="course.icon" :src="course.icon" alt="" />
@@ -142,9 +142,11 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { getBrowserSession, KBaseClient, type DedaoCourse } from '../api'
 
 const storageKey = 'dedao-kbase-web-settings'
+const router = useRouter()
 
 const baseUrl = ref(window.location.origin)
 const token = ref('')
@@ -250,6 +252,11 @@ const changePage = async (nextPage: number) => {
 
 const selectCourse = (course: DedaoCourse) => {
   selectedKey.value = courseKey(course)
+}
+
+const openCourse = (course: DedaoCourse) => {
+  selectCourse(course)
+  router.push(`/course/${encodeURIComponent(courseKey(course))}`)
 }
 
 const courseKey = (course: DedaoCourse) => course.enid || String(course.class_id || course.id)

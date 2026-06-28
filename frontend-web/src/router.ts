@@ -1,7 +1,9 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import AccountLogin from './views/AccountLogin.vue'
 import AccountProfile from './views/AccountProfile.vue'
+import CourseDetailReader from './views/CourseDetailReader.vue'
 import CourseLibrary from './views/CourseLibrary.vue'
+import EbookDetailReader from './views/EbookDetailReader.vue'
 import EbookLibrary from './views/EbookLibrary.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
@@ -111,6 +113,17 @@ const routes: RouteRecordRaw[] = [
     },
   },
   {
+    path: '/course/:enid',
+    component: CourseDetailReader,
+    meta: {
+      title: '课程阅读',
+      scope: 'course_detail_reader',
+      status: 'online',
+      source: 'frontend/src/views/Course.vue',
+      desktopMethods: ['CourseInfo', 'ArticleList', 'ArticleDetail'],
+    },
+  },
+  {
     path: '/course',
     component: CourseLibrary,
     meta: {
@@ -119,6 +132,17 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/Course.vue',
       desktopMethods: ['CourseCategory', 'CourseList', 'CourseInfo', 'ArticleList', 'ArticleDetail', 'CourseDownload'],
+    },
+  },
+  {
+    path: '/ebook/:enid',
+    component: EbookDetailReader,
+    meta: {
+      title: '电子书阅读',
+      scope: 'ebook_detail_reader',
+      status: 'online',
+      source: 'frontend/src/views/Ebook.vue',
+      desktopMethods: ['EbookDetail', 'EbookInfo', 'EbookPage'],
     },
   },
   {

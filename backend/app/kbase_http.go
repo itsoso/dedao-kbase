@@ -103,11 +103,26 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoCourses(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/dedao/courses/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoCourseSubroute(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/dedao/articles/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoArticleMarkdown(w, r)
 	case r.URL.Path == "/api/dedao/ebooks":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
 		}
 		h.handleDedaoEbooks(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/dedao/ebooks/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoEbookSubroute(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -447,6 +462,114 @@ func (h *kbaseHTTPHandler) handleDedaoCourses(w http.ResponseWriter, r *http.Req
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 
+func (h *kbaseHTTPHandler) handleDedaoCourseSubroute(w http.ResponseWriter, r *http.Request) {
+	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/courses/")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(segments) == 1 {
+		result, err := h.dedaoContent.GetCourseDetail(segments[0])
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
+	if len(segments) == 2 && segments[1] == "articles" {
+		count, err := parseBoundedIntQuery(r, "count", 30, 1, 50)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		maxID, err := parseBoundedIntQuery(r, "max_id", 0, 0, 0)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result, err := h.dedaoContent.ListCourseArticles(segments[0], count, maxID)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "not found")
+}
+
+func (h *kbaseHTTPHandler) handleDedaoArticleMarkdown(w http.ResponseWriter, r *http.Request) {
+	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/articles/")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(segments) != 1 {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	articleType := strings.TrimSpace(r.URL.Query().Get("type"))
+	if articleType == "" {
+		articleType = "course"
+	}
+	if articleType != "course" {
+		writeHTTPError(w, http.StatusBadRequest, "only course article markdown is supported")
+		return
+	}
+	result, err := h.dedaoContent.GetCourseArticleMarkdown(segments[0])
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if result.Type == "" {
+		result.Type = "course"
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbookSubroute(w http.ResponseWriter, r *http.Request) {
+	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/ebooks/")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(segments) == 1 {
+		result, err := h.dedaoContent.GetEbookDetail(segments[0])
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
+	if len(segments) == 4 && segments[1] == "chapters" && segments[3] == "pages" {
+		index, err := parseBoundedIntQuery(r, "index", 0, 0, 0)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		count, err := parseBoundedIntQuery(r, "count", 8, 1, 8)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		offset, err := parseBoundedIntQuery(r, "offset", 0, 0, 0)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result, err := h.dedaoContent.GetEbookChapterPages(segments[0], segments[2], index, count, offset)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "not found")
+}
+
 func setHTTPNoStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
@@ -469,6 +592,45 @@ func parseKBasePagination(r *http.Request) (int, int) {
 		pageSize = 100
 	}
 	return page, pageSize
+}
+
+func parseBoundedIntQuery(r *http.Request, key string, defaultValue, minValue, maxValue int) (int, error) {
+	value := defaultValue
+	if raw := strings.TrimSpace(r.URL.Query().Get(key)); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil {
+			return 0, fmt.Errorf("%s must be an integer", key)
+		}
+		value = parsed
+	}
+	if value < minValue {
+		return 0, fmt.Errorf("%s must be >= %d", key, minValue)
+	}
+	if maxValue > 0 && value > maxValue {
+		value = maxValue
+	}
+	return value, nil
+}
+
+func splitHTTPPathSegments(urlPath string, prefix string) ([]string, error) {
+	trimmed := strings.Trim(strings.TrimPrefix(urlPath, prefix), "/")
+	if strings.TrimSpace(trimmed) == "" {
+		return nil, fmt.Errorf("path parameter is required")
+	}
+	rawSegments := strings.Split(trimmed, "/")
+	segments := make([]string, 0, len(rawSegments))
+	for _, rawSegment := range rawSegments {
+		segment, err := url.PathUnescape(rawSegment)
+		if err != nil {
+			return nil, err
+		}
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			return nil, fmt.Errorf("path parameter is required")
+		}
+		segments = append(segments, segment)
+	}
+	return segments, nil
 }
 
 func filterKBaseBooks(books []BookKnowledgeBook, query string) []BookKnowledgeBook {

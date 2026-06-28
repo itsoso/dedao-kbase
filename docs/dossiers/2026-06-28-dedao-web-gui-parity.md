@@ -58,6 +58,8 @@ The desktop GUI baseline is `frontend/src/router/index.ts`:
 - Phase 3 ebook dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase3-ebooks.md`
 - Phase 3 course plan: `docs/plans/2026-06-28-dedao-web-gui-phase3-courses.md`
 - Phase 3 course dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase3-courses.md`
+- Phase 3 detail reading plan: `docs/plans/2026-06-28-dedao-web-gui-phase3-detail-reading.md`
+- Phase 3 detail reading dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase3-detail-reading.md`
 
 ## Current Decision
 
@@ -70,3 +72,5 @@ Phase 2 login slice shipped: `/user/login` now renders a Web QR login surface ba
 Phase 3 first read-only content slice shipped: `/ebook` renders a Web ebook bookshelf backed by Bearer-protected `GET /api/dedao/ebooks`, reusing the desktop `CourseList("ebook","study")` data path and returning only safe browser fields.
 
 Phase 3 second read-only content slice shipped: `/course` renders a Web course browser backed by Bearer-protected `GET /api/dedao/courses`, reusing the desktop `CourseList("bauhinia","study")` data path and returning only safe browser fields.
+
+Phase 3 detail reading slice in progress: `/course/{enid}` reads course detail, article lists, and Markdown articles; `/ebook/{enid}` reads ebook detail, catalog, and bounded chapter SVG page batches. Browser payloads remain read-only and do not expose Dedao cookies, DRM tokens, or ebook read tokens.

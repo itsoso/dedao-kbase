@@ -191,6 +191,58 @@ export interface DedaoEbookPage {
   is_more: number
 }
 
+export interface DedaoEbookCatalogItem {
+  level: number
+  text: string
+  href?: string
+  chapter_id?: string
+  play_order?: number
+}
+
+export interface DedaoEbookDetail {
+  enid: string
+  id: number
+  title: string
+  operating_title?: string
+  cover?: string
+  count?: number
+  price?: string
+  author_info?: string
+  book_author?: string
+  publish_time?: string
+  book_intro?: string
+  author_list?: string[]
+  press_name?: string
+  press_brief?: string
+  classify_name?: string
+  product_score?: string
+  douban_score?: string
+  read_time?: number
+  is_buy: boolean
+  is_on_bookshelf: boolean
+  can_trial_read: boolean
+  catalog: DedaoEbookCatalogItem[]
+}
+
+export interface DedaoEbookPageSVG {
+  page_num: number
+  begin_offset: number
+  end_offset: number
+  is_first: boolean
+  is_last: boolean
+  svg: string
+}
+
+export interface DedaoEbookChapterPages {
+  enid: string
+  chapter_id: string
+  index: number
+  count: number
+  offset: number
+  is_end: boolean
+  pages: DedaoEbookPageSVG[]
+}
+
 export interface DedaoCourse {
   enid: string
   id: number
@@ -213,6 +265,60 @@ export interface DedaoCoursePage {
   total: number
   total_pages: number
   is_more: number
+}
+
+export interface DedaoCourseDetailMeta {
+  enid: string
+  id: number
+  id_str?: string
+  title: string
+  intro?: string
+  highlight?: string
+  lecturer_name?: string
+  lecturer_title?: string
+  lecturer_intro?: string
+  lecturer_avatar?: string
+  logo?: string
+  index_img?: string
+  article_count?: number
+  learn_user_count?: number
+  price_desc?: string
+  is_subscribe: boolean
+}
+
+export interface DedaoArticle {
+  enid: string
+  id: number
+  id_str?: string
+  title: string
+  summary?: string
+  logo?: string
+  publish_time?: number
+  is_read: boolean
+  is_free_try: boolean
+  order_num?: number
+  has_audio: boolean
+  has_video: boolean
+}
+
+export interface DedaoArticlePage {
+  articles: DedaoArticle[]
+  count: number
+  max_id: number
+  is_more: boolean
+}
+
+export interface DedaoCourseDetail {
+  course: DedaoCourseDetailMeta
+  articles: DedaoArticle[]
+  has_more: boolean
+}
+
+export interface DedaoArticleMarkdown {
+  enid: string
+  type: string
+  title?: string
+  markdown: string
 }
 
 export const getBrowserSession = async (): Promise<BrowserSession | null> => {
@@ -344,6 +450,27 @@ export class KBaseClient {
     return this.request<DedaoEbookPage>(`/api/dedao/ebooks?${params.join('&')}`)
   }
 
+  async getDedaoEbookDetail(enid: string): Promise<DedaoEbookDetail> {
+    return this.request<DedaoEbookDetail>(`/api/dedao/ebooks/${encodeURIComponent(enid)}`)
+  }
+
+  async getDedaoEbookChapterPages(
+    enid: string,
+    chapterID: string,
+    index = 0,
+    count = 8,
+    offset = 0,
+  ): Promise<DedaoEbookChapterPages> {
+    const params = [
+      `index=${encodeURIComponent(String(index))}`,
+      `count=${encodeURIComponent(String(count))}`,
+      `offset=${encodeURIComponent(String(offset))}`,
+    ]
+    return this.request<DedaoEbookChapterPages>(
+      `/api/dedao/ebooks/${encodeURIComponent(enid)}/chapters/${encodeURIComponent(chapterID)}/pages?${params.join('&')}`,
+    )
+  }
+
   async listDedaoCourses(page = 1, pageSize = 15, query = ''): Promise<DedaoCoursePage> {
     const params = [
       `page=${encodeURIComponent(String(page))}`,
@@ -353,6 +480,22 @@ export class KBaseClient {
       params.push(`q=${encodeURIComponent(query.trim())}`)
     }
     return this.request<DedaoCoursePage>(`/api/dedao/courses?${params.join('&')}`)
+  }
+
+  async getDedaoCourseDetail(enid: string): Promise<DedaoCourseDetail> {
+    return this.request<DedaoCourseDetail>(`/api/dedao/courses/${encodeURIComponent(enid)}`)
+  }
+
+  async listDedaoCourseArticles(enid: string, count = 30, maxID = 0): Promise<DedaoArticlePage> {
+    const params = [
+      `count=${encodeURIComponent(String(count))}`,
+      `max_id=${encodeURIComponent(String(maxID))}`,
+    ]
+    return this.request<DedaoArticlePage>(`/api/dedao/courses/${encodeURIComponent(enid)}/articles?${params.join('&')}`)
+  }
+
+  async getDedaoArticleMarkdown(enid: string): Promise<DedaoArticleMarkdown> {
+    return this.request<DedaoArticleMarkdown>(`/api/dedao/articles/${encodeURIComponent(enid)}?type=course`)
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {

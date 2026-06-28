@@ -76,7 +76,7 @@
             type="button"
             class="ebook-row"
             :class="{ active: selectedKey === ebookKey(ebook) }"
-            @click="selectEbook(ebook)"
+            @click="openEbook(ebook)"
           >
             <div class="cover-frame">
               <img v-if="ebook.icon" :src="ebook.icon" alt="" />
@@ -139,9 +139,11 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { getBrowserSession, KBaseClient, type DedaoEbook } from '../api'
 
 const storageKey = 'dedao-kbase-web-settings'
+const router = useRouter()
 
 const baseUrl = ref(window.location.origin)
 const token = ref('')
@@ -247,6 +249,11 @@ const changePage = async (nextPage: number) => {
 
 const selectEbook = (ebook: DedaoEbook) => {
   selectedKey.value = ebookKey(ebook)
+}
+
+const openEbook = (ebook: DedaoEbook) => {
+  selectEbook(ebook)
+  router.push(`/ebook/${encodeURIComponent(ebookKey(ebook))}`)
 }
 
 const ebookKey = (ebook: DedaoEbook) => ebook.enid || String(ebook.id)

@@ -503,6 +503,236 @@ func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoCourseDetail(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		courseDetail: DedaoCourseDetail{
+			Course: DedaoCourseDetailMeta{
+				Enid:          "course-enid",
+				ID:            101,
+				Title:         "商业分析课",
+				Intro:         "从案例学习商业分析。",
+				Highlight:     "建立结构化分析框架。",
+				LecturerName:  "张三",
+				LecturerTitle: "商业顾问",
+				Logo:          "https://example.test/course.jpg",
+				ArticleCount:  36,
+			},
+			Articles: []DedaoArticle{
+				{
+					Enid:        "article-enid",
+					ID:          501,
+					Title:       "第一讲：问题定义",
+					Summary:     "先定义问题，再选择工具。",
+					PublishTime: 1710000000,
+					IsRead:      true,
+					OrderNum:    1,
+				},
+			},
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/courses/course-enid", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("course detail without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/courses/course-enid", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("course detail status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotCourseDetailEnid != "course-enid" {
+		t.Fatalf("course detail enid = %q", content.gotCourseDetailEnid)
+	}
+	var payload DedaoCourseDetail
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Course.Title != "商业分析课" || len(payload.Articles) != 1 || payload.Articles[0].Title != "第一讲：问题定义" {
+		t.Fatalf("course detail payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
+func TestKBaseHTTPHandlerServesDedaoCourseArticles(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		articles: DedaoArticlePage{
+			Articles: []DedaoArticle{
+				{
+					Enid:        "article-enid",
+					ID:          501,
+					Title:       "第一讲：问题定义",
+					Summary:     "先定义问题，再选择工具。",
+					PublishTime: 1710000000,
+					OrderNum:    1,
+				},
+			},
+			Count: 2,
+			MaxID: 10,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/courses/course-enid/articles?count=2&max_id=10", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("course articles status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotArticlesEnid != "course-enid" || content.gotArticlesCount != 2 || content.gotArticlesMaxID != 10 {
+		t.Fatalf("course articles args = enid %q count %d maxID %d", content.gotArticlesEnid, content.gotArticlesCount, content.gotArticlesMaxID)
+	}
+	var payload DedaoArticlePage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Count != 2 || payload.MaxID != 10 || len(payload.Articles) != 1 || payload.Articles[0].Enid != "article-enid" {
+		t.Fatalf("course articles payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
+func TestKBaseHTTPHandlerServesDedaoArticleMarkdown(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		articleMarkdown: DedaoArticleMarkdown{
+			Enid:     "article-enid",
+			Type:     "course",
+			Title:    "第一讲：问题定义",
+			Markdown: "## 问题定义\n\n先定义问题，再选择工具。",
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/articles/article-enid?type=course", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("article markdown status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotArticleMarkdownEnid != "article-enid" {
+		t.Fatalf("article markdown enid = %q", content.gotArticleMarkdownEnid)
+	}
+	var payload DedaoArticleMarkdown
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Markdown == "" || !strings.Contains(payload.Markdown, "问题定义") {
+		t.Fatalf("article markdown payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+
+	badTypeResp := requestKBase(handler, http.MethodGet, "/api/dedao/articles/article-enid?type=odob", "secret-token")
+	if badTypeResp.Code != http.StatusBadRequest {
+		t.Fatalf("article unsupported type status = %d, want 400", badTypeResp.Code)
+	}
+}
+
+func TestKBaseHTTPHandlerServesDedaoEbookDetail(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		ebookDetail: DedaoEbookDetail{
+			Enid:           "ebook-enid",
+			ID:             67929,
+			Title:          "强化学习教程",
+			OperatingTitle: "强化学习教程",
+			Cover:          "https://example.test/cover.jpg",
+			BookAuthor:     "王琦",
+			AuthorInfo:     "长期研究强化学习。",
+			BookIntro:      "一本系统学习强化学习的教材。",
+			PressName:      "测试出版社",
+			ClassifyName:   "计算机",
+			ReadTime:       12,
+			Catalog: []DedaoEbookCatalogItem{
+				{
+					Level:     1,
+					Text:      "第一章 导论",
+					Href:      "chapter-1#0",
+					ChapterID: "chapter-1",
+					PlayOrder: 1,
+				},
+			},
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/ebooks/ebook-enid", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("ebook detail status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotEbookDetailEnid != "ebook-enid" {
+		t.Fatalf("ebook detail enid = %q", content.gotEbookDetailEnid)
+	}
+	var payload DedaoEbookDetail
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Title != "强化学习教程" || len(payload.Catalog) != 1 || payload.Catalog[0].ChapterID != "chapter-1" {
+		t.Fatalf("ebook detail payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
+func TestKBaseHTTPHandlerServesDedaoEbookChapterPages(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		ebookPages: DedaoEbookChapterPages{
+			Enid:      "ebook-enid",
+			ChapterID: "chapter-1",
+			Index:     4,
+			Count:     8,
+			Offset:    2,
+			IsEnd:     true,
+			Pages: []DedaoEbookPageSVG{
+				{
+					PageNum:     5,
+					BeginOffset: 2,
+					EndOffset:   88,
+					SVG:         `<svg xmlns="http://www.w3.org/2000/svg"><text>第一章</text></svg>`,
+				},
+			},
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/ebooks/ebook-enid/chapters/chapter-1/pages?index=4&count=99&offset=2", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("ebook pages status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotEbookPagesEnid != "ebook-enid" || content.gotEbookPagesChapterID != "chapter-1" ||
+		content.gotEbookPagesIndex != 4 || content.gotEbookPagesCount != 8 || content.gotEbookPagesOffset != 2 {
+		t.Fatalf(
+			"ebook pages args = enid %q chapter %q index %d count %d offset %d",
+			content.gotEbookPagesEnid,
+			content.gotEbookPagesChapterID,
+			content.gotEbookPagesIndex,
+			content.gotEbookPagesCount,
+			content.gotEbookPagesOffset,
+		)
+	}
+	var payload DedaoEbookChapterPages
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Count != 8 || len(payload.Pages) != 1 || !strings.Contains(payload.Pages[0].SVG, "<svg") {
+		t.Fatalf("ebook pages payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
 func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	root := t.TempDir()
 	webDir := filepath.Join(root, "web")
@@ -698,14 +928,30 @@ func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (D
 }
 
 type fakeDedaoContentProvider struct {
-	ebooks            DedaoEbookPage
-	courses           DedaoCoursePage
-	gotQuery          string
-	gotPage           int
-	gotPageSize       int
-	gotCourseQuery    string
-	gotCoursePage     int
-	gotCoursePageSize int
+	ebooks                 DedaoEbookPage
+	courses                DedaoCoursePage
+	courseDetail           DedaoCourseDetail
+	articles               DedaoArticlePage
+	articleMarkdown        DedaoArticleMarkdown
+	ebookDetail            DedaoEbookDetail
+	ebookPages             DedaoEbookChapterPages
+	gotQuery               string
+	gotPage                int
+	gotPageSize            int
+	gotCourseQuery         string
+	gotCoursePage          int
+	gotCoursePageSize      int
+	gotCourseDetailEnid    string
+	gotArticlesEnid        string
+	gotArticlesCount       int
+	gotArticlesMaxID       int
+	gotArticleMarkdownEnid string
+	gotEbookDetailEnid     string
+	gotEbookPagesEnid      string
+	gotEbookPagesChapterID string
+	gotEbookPagesIndex     int
+	gotEbookPagesCount     int
+	gotEbookPagesOffset    int
 }
 
 func (f *fakeDedaoContentProvider) ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error) {
@@ -720,6 +966,47 @@ func (f *fakeDedaoContentProvider) ListCourses(query string, page, pageSize int)
 	f.gotCoursePage = page
 	f.gotCoursePageSize = pageSize
 	return f.courses, nil
+}
+
+func (f *fakeDedaoContentProvider) GetCourseDetail(enid string) (DedaoCourseDetail, error) {
+	f.gotCourseDetailEnid = enid
+	return f.courseDetail, nil
+}
+
+func (f *fakeDedaoContentProvider) ListCourseArticles(enid string, count, maxID int) (DedaoArticlePage, error) {
+	f.gotArticlesEnid = enid
+	f.gotArticlesCount = count
+	f.gotArticlesMaxID = maxID
+	return f.articles, nil
+}
+
+func (f *fakeDedaoContentProvider) GetCourseArticleMarkdown(enid string) (DedaoArticleMarkdown, error) {
+	f.gotArticleMarkdownEnid = enid
+	return f.articleMarkdown, nil
+}
+
+func (f *fakeDedaoContentProvider) GetEbookDetail(enid string) (DedaoEbookDetail, error) {
+	f.gotEbookDetailEnid = enid
+	return f.ebookDetail, nil
+}
+
+func (f *fakeDedaoContentProvider) GetEbookChapterPages(enid string, chapterID string, index, count, offset int) (DedaoEbookChapterPages, error) {
+	f.gotEbookPagesEnid = enid
+	f.gotEbookPagesChapterID = chapterID
+	f.gotEbookPagesIndex = index
+	f.gotEbookPagesCount = count
+	f.gotEbookPagesOffset = offset
+	return f.ebookPages, nil
+}
+
+func assertDedaoResponseOmitsSecrets(t *testing.T, body string) {
+	t.Helper()
+	lowerBody := strings.ToLower(body)
+	for _, forbidden := range []string{"cookie", "token", "drm_token", "dd_url", "dd_article_token"} {
+		if strings.Contains(lowerBody, forbidden) {
+			t.Fatalf("dedao response must not expose %s: %s", forbidden, body)
+		}
+	}
 }
 
 func newTestKBaseHandlerWithSystemKB(t *testing.T, root string) http.Handler {
