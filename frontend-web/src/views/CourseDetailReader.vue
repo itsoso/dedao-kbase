@@ -14,7 +14,7 @@
 
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
-    <section class="reader-workspace">
+    <section ref="readerWorkspaceRef" class="reader-workspace draggable-layout" :style="readerWorkspaceStyle">
       <aside class="article-rail">
         <div class="panel-head">
           <div>
@@ -48,6 +48,13 @@
         <div v-if="!loading && !articles.length" class="empty-state">暂无课程文章。</div>
       </aside>
 
+      <div
+        class="column-resizer left-resizer"
+        role="separator"
+        aria-label="调整课程目录宽度"
+        @pointerdown="beginColumnResize('left', $event)"
+      ></div>
+
       <article class="article-reader">
         <div class="article-reader-head">
           <div>
@@ -63,10 +70,25 @@
         <div v-else class="empty-state">从左侧选择文章开始阅读。</div>
       </article>
 
+      <div
+        class="column-resizer right-resizer"
+        role="separator"
+        aria-label="调整课程详情宽度"
+        @pointerdown="beginColumnResize('right', $event)"
+      ></div>
+
       <aside class="course-context">
-        <span class="eyebrow">Course</span>
-        <h2>{{ detail?.course.title || '课程详情' }}</h2>
-        <p>{{ detail?.course.highlight || detail?.course.intro || '暂无简介' }}</p>
+        <div class="context-head">
+          <div>
+            <span class="eyebrow">Course</span>
+            <h2>{{ detail?.course.title || '课程详情' }}</h2>
+          </div>
+          <button v-if="hasCourseIntro" class="text-action" type="button" @click="courseIntroCollapsed = !courseIntroCollapsed">
+            {{ courseIntroCollapsed ? '展开' : '收起' }}
+          </button>
+        </div>
+        <p v-if="hasCourseIntro" class="course-intro" :class="{ collapsed: courseIntroCollapsed }">{{ courseIntro }}</p>
+        <p v-else class="course-intro muted">暂无简介</p>
         <dl>
           <div>
             <dt>Lecturer</dt>
@@ -101,7 +123,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
@@ -114,6 +136,7 @@ import PageAnalysisPanel from '../components/PageAnalysisPanel.vue'
 import { renderMarkdown } from '../utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
+const layoutStorageKey = 'dedao-course-reader-layout'
 const route = useRoute()
 
 const baseUrl = ref(window.location.origin)
@@ -131,11 +154,24 @@ const selectedArticleTitle = ref('')
 const markdown = ref('')
 const articlesMaxID = ref(0)
 const hasMoreArticles = ref(false)
+const courseIntroCollapsed = ref(true)
+const readerWorkspaceRef = ref<HTMLElement | null>(null)
+const layoutColumns = ref({ left: 240, right: 260 })
+const activeResizeTarget = ref<'left' | 'right' | null>(null)
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 const renderedArticle = computed(() => renderMarkdown(markdown.value))
 const coursePageURL = computed(() => `/course/${encodeURIComponent(enid.value)}`)
+const readerWorkspaceStyle = computed(() => ({
+  '--course-left-column': `${layoutColumns.value.left}px`,
+  '--course-right-column': `${layoutColumns.value.right}px`,
+}))
+const courseIntro = computed(() => {
+  const course = detail.value?.course
+  return String(course?.highlight || course?.intro || '').trim()
+})
+const hasCourseIntro = computed(() => Boolean(courseIntro.value))
 const courseQuickPrompts = [
   { label: '学习', mode: 'study', question: '分析当前课程页面的重点、难点和建议学习路径。' },
   { label: '总结', mode: 'summary', question: '总结当前课程和当前文章的核心内容。' },
@@ -182,12 +218,17 @@ const courseAnalysisSections = computed<PageAnalysisSection[]>(() => {
 
 onMounted(async () => {
   restoreConnection()
+  restoreLayoutColumns()
   try {
     await hydrateBrowserSession()
     await loadDetail()
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
+})
+
+onBeforeUnmount(() => {
+  stopColumnResize()
 })
 
 const restoreConnection = () => {
@@ -206,6 +247,26 @@ const restoreConnection = () => {
 
 const saveConnection = () => {
   localStorage.setItem(storageKey, JSON.stringify({ baseUrl: baseUrl.value, token: token.value }))
+}
+
+const restoreLayoutColumns = () => {
+  const raw = localStorage.getItem(layoutStorageKey)
+  if (!raw) {
+    return
+  }
+  try {
+    const parsed = JSON.parse(raw) as { left?: number; right?: number }
+    layoutColumns.value = {
+      left: clampNumber(parsed.left || layoutColumns.value.left, 180, 360),
+      right: clampNumber(parsed.right || layoutColumns.value.right, 220, 420),
+    }
+  } catch {
+    localStorage.removeItem(layoutStorageKey)
+  }
+}
+
+const saveLayoutColumns = () => {
+  localStorage.setItem(layoutStorageKey, JSON.stringify(layoutColumns.value))
 }
 
 const hydrateBrowserSession = async () => {
@@ -297,15 +358,54 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
     .map((line) => String(line ?? '').trim())
     .filter(Boolean)
     .join('\n')
+
+const beginColumnResize = (target: 'left' | 'right', event: PointerEvent) => {
+  activeResizeTarget.value = target
+  event.preventDefault()
+  window.addEventListener('pointermove', resizeColumn)
+  window.addEventListener('pointerup', stopColumnResize)
+}
+
+const resizeColumn = (event: PointerEvent) => {
+  const target = activeResizeTarget.value
+  const rect = readerWorkspaceRef.value?.getBoundingClientRect()
+  if (!target || !rect) {
+    return
+  }
+  if (target === 'left') {
+    layoutColumns.value = {
+      ...layoutColumns.value,
+      left: clampNumber(event.clientX - rect.left, 180, 360),
+    }
+  } else {
+    layoutColumns.value = {
+      ...layoutColumns.value,
+      right: clampNumber(rect.right - event.clientX, 220, 420),
+    }
+  }
+}
+
+const stopColumnResize = () => {
+  if (activeResizeTarget.value) {
+    saveLayoutColumns()
+  }
+  activeResizeTarget.value = null
+  window.removeEventListener('pointermove', resizeColumn)
+  window.removeEventListener('pointerup', stopColumnResize)
+}
+
+const clampNumber = (value: number, min: number, max: number) => {
+  return Math.min(Math.max(value, min), max)
+}
 </script>
 
 <style scoped>
 .course-detail-reader {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  min-height: calc(100vh - 156px);
-  margin-top: 12px;
+  gap: 10px;
+  min-height: calc(100vh - 92px);
+  margin-top: 8px;
 }
 
 .reader-toolbar,
@@ -328,9 +428,9 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
 
 .reader-workspace {
   display: grid;
-  grid-template-columns: 300px minmax(0, 1fr) 320px;
-  gap: 12px;
-  min-height: calc(100vh - 260px);
+  grid-template-columns: var(--course-left-column, 240px) 8px minmax(420px, 1fr) 8px var(--course-right-column, 260px);
+  gap: 0;
+  min-height: calc(100vh - 196px);
 }
 
 .article-rail,
@@ -343,17 +443,17 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
 .article-list {
   display: grid;
   gap: 0;
-  max-height: calc(100vh - 360px);
+  max-height: calc(100vh - 292px);
   overflow: auto;
 }
 
 .article-row {
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 8px;
   align-items: start;
   width: 100%;
-  padding: 11px 0;
+  padding: 10px 0;
   border: 0;
   border-bottom: 1px solid var(--dedao-line);
   border-radius: 0;
@@ -374,13 +474,20 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
   overflow-wrap: anywhere;
 }
 
+.article-row strong {
+  font-size: 13px;
+  line-height: 18px;
+}
+
 .article-row small {
   display: block;
-  margin-top: 4px;
+  margin-top: 3px;
   color: var(--dedao-muted);
+  font-size: 11px;
 }
 
 .article-reader {
+  margin: 0 10px;
   overflow: auto;
 }
 
@@ -417,18 +524,39 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
 }
 
 .course-context p {
+  margin: 10px 0 0;
   color: #666666;
   line-height: 1.6;
 }
 
+.context-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.course-intro.collapsed {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 4;
+}
+
+.course-intro.muted {
+  color: var(--dedao-muted);
+}
+
 .course-context dl {
   display: grid;
-  gap: 10px;
+  gap: 0;
+  margin: 12px 0 0;
+  border-top: 1px solid var(--dedao-line);
 }
 
 .course-context dt {
   color: var(--dedao-muted);
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -437,6 +565,11 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
   margin: 2px 0 0;
   overflow-wrap: anywhere;
   color: #222222;
+}
+
+.course-context dl div {
+  border-bottom: 1px solid var(--dedao-line);
+  padding: 8px 0;
 }
 
 .back-link,
@@ -464,6 +597,17 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
 .secondary-action {
   width: 100%;
   margin-top: 10px;
+}
+
+.text-action {
+  min-height: 28px;
+  border: 1px solid #ffd0ad;
+  border-radius: 999px;
+  padding: 0 10px;
+  background: #ffffff;
+  color: var(--dedao-orange);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 label {
@@ -495,7 +639,7 @@ input {
 .panel-head h2 {
   margin: 2px 0 0;
   color: #111111;
-  font-size: 22px;
+  font-size: 20px;
   line-height: 1.15;
 }
 
@@ -541,6 +685,14 @@ button:disabled {
   .reader-toolbar,
   .reader-workspace {
     grid-template-columns: 1fr;
+  }
+
+  .column-resizer {
+    display: none;
+  }
+
+  .article-reader {
+    margin: 0;
   }
 
   .article-list {
