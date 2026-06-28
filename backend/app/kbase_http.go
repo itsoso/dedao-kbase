@@ -113,6 +113,16 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoArticleMarkdown(w, r)
+	case r.URL.Path == "/api/dedao/odobs":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoOdobs(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/dedao/odobs/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoOdobSubroute(w, r)
 	case r.URL.Path == "/api/dedao/ebooks":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -485,6 +495,34 @@ func (h *kbaseHTTPHandler) handleDedaoCourses(w http.ResponseWriter, r *http.Req
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 
+func (h *kbaseHTTPHandler) handleDedaoOdobs(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parseKBasePagination(r)
+	result, err := h.dedaoContent.ListOdobs(r.URL.Query().Get("q"), page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoOdobSubroute(w http.ResponseWriter, r *http.Request) {
+	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/odobs/")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(segments) == 1 {
+		result, err := h.dedaoContent.GetOdobDetail(segments[0])
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "not found")
+}
+
 func (h *kbaseHTTPHandler) handleDedaoCourseSubroute(w http.ResponseWriter, r *http.Request) {
 	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/courses/")
 	if err != nil {
@@ -536,18 +574,22 @@ func (h *kbaseHTTPHandler) handleDedaoArticleMarkdown(w http.ResponseWriter, r *
 	if articleType == "" {
 		articleType = "course"
 	}
-	if articleType != "course" {
-		writeHTTPError(w, http.StatusBadRequest, "only course article markdown is supported")
+	var result DedaoArticleMarkdown
+	var runErr error
+	switch articleType {
+	case "course":
+		result, runErr = h.dedaoContent.GetCourseArticleMarkdown(segments[0])
+	case "odob":
+		result, runErr = h.dedaoContent.GetOdobArticleMarkdown(segments[0])
+	default:
+		writeHTTPError(w, http.StatusBadRequest, "article type must be course or odob")
 		return
 	}
-	result, err := h.dedaoContent.GetCourseArticleMarkdown(segments[0])
-	if err != nil {
-		writeHTTPError(w, http.StatusBadGateway, err.Error())
+	if runErr != nil {
+		writeHTTPError(w, http.StatusBadGateway, runErr.Error())
 		return
 	}
-	if result.Type == "" {
-		result.Type = "course"
-	}
+	result.Type = articleType
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 

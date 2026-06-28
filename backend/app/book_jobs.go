@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 const bookKnowledgeJobsFileName = "jobs.json"
@@ -30,6 +32,7 @@ const (
 	BookKnowledgeJobTypeBookExport          = "book_export"
 	BookKnowledgeJobTypeDedaoEbookDownload  = "dedao_ebook_download"
 	BookKnowledgeJobTypeDedaoEbookSyncKBase = "dedao_ebook_sync_kbase"
+	BookKnowledgeJobTypeDedaoOdobDownload   = "dedao_odob_download"
 )
 
 type BookKnowledgeJob struct {
@@ -40,6 +43,11 @@ type BookKnowledgeJob struct {
 	Target       string                 `json:"target,omitempty"`
 	EbookID      int                    `json:"ebook_id,omitempty"`
 	EbookEnID    string                 `json:"ebook_enid,omitempty"`
+	OdobID       int                    `json:"odob_id,omitempty"`
+	OdobEnID     string                 `json:"odob_enid,omitempty"`
+	OdobTitle    string                 `json:"odob_title,omitempty"`
+	OdobAliasID  string                 `json:"odob_alias_id,omitempty"`
+	OdobCanPlay  bool                   `json:"odob_can_play,omitempty"`
 	DownloadType int                    `json:"download_type,omitempty"`
 	Result       map[string]any         `json:"result,omitempty"`
 	Error        string                 `json:"error,omitempty"`
@@ -56,6 +64,11 @@ type BookKnowledgeJobRequest struct {
 	Target       string `json:"target,omitempty"`
 	EbookID      int    `json:"ebook_id,omitempty"`
 	EbookEnID    string `json:"ebook_enid,omitempty"`
+	OdobID       int    `json:"odob_id,omitempty"`
+	OdobEnID     string `json:"odob_enid,omitempty"`
+	OdobTitle    string `json:"odob_title,omitempty"`
+	OdobAliasID  string `json:"odob_alias_id,omitempty"`
+	OdobCanPlay  bool   `json:"odob_can_play,omitempty"`
 	DownloadType int    `json:"download_type,omitempty"`
 }
 
@@ -68,6 +81,7 @@ var bookKnowledgeJobsMu sync.Mutex
 var (
 	runDedaoEbookDownloadJob  = executeDedaoEbookDownloadJob
 	runDedaoEbookSyncKBaseJob = executeDedaoEbookSyncKBaseJob
+	runDedaoOdobDownloadJob   = executeDedaoOdobDownloadJob
 )
 
 func (s *BookKnowledgeStore) JobsPath() string {
@@ -91,6 +105,11 @@ func (s *BookKnowledgeStore) CreateBookKnowledgeJob(request BookKnowledgeJobRequ
 		Target:       normalized.Target,
 		EbookID:      normalized.EbookID,
 		EbookEnID:    normalized.EbookEnID,
+		OdobID:       normalized.OdobID,
+		OdobEnID:     normalized.OdobEnID,
+		OdobTitle:    normalized.OdobTitle,
+		OdobAliasID:  normalized.OdobAliasID,
+		OdobCanPlay:  normalized.OdobCanPlay,
 		DownloadType: normalized.DownloadType,
 		Logs:         []string{"queued"},
 		CreatedAt:    now,
@@ -260,6 +279,8 @@ func (s *BookKnowledgeStore) executeBookKnowledgeJob(job BookKnowledgeJob) (map[
 		return runDedaoEbookDownloadJob(context.Background(), job)
 	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
 		return runDedaoEbookSyncKBaseJob(context.Background(), s, job)
+	case BookKnowledgeJobTypeDedaoOdobDownload:
+		return runDedaoOdobDownloadJob(context.Background(), job)
 	default:
 		return nil, fmt.Errorf("unknown job type: %s", job.Type)
 	}
@@ -322,6 +343,9 @@ func normalizeBookKnowledgeJobRequest(request BookKnowledgeJobRequest) (BookKnow
 	request.BookID = strings.TrimSpace(request.BookID)
 	request.Target = strings.TrimSpace(request.Target)
 	request.EbookEnID = strings.TrimSpace(request.EbookEnID)
+	request.OdobEnID = strings.TrimSpace(request.OdobEnID)
+	request.OdobTitle = strings.TrimSpace(request.OdobTitle)
+	request.OdobAliasID = strings.TrimSpace(request.OdobAliasID)
 	switch request.Type {
 	case BookKnowledgeJobTypeNotebookLMExport:
 		if request.BookID == "" {
@@ -340,6 +364,8 @@ func normalizeBookKnowledgeJobRequest(request BookKnowledgeJobRequest) (BookKnow
 		return normalizeDedaoEbookJobRequest(request, true)
 	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
 		return normalizeDedaoEbookJobRequest(request, false)
+	case BookKnowledgeJobTypeDedaoOdobDownload:
+		return normalizeDedaoOdobJobRequest(request)
 	default:
 		return request, fmt.Errorf("unsupported job type: %s", request.Type)
 	}
@@ -356,6 +382,27 @@ func normalizeDedaoEbookJobRequest(request BookKnowledgeJobRequest, allowDownloa
 	if !allowDownloadType {
 		request.DownloadType = 1
 		return request, nil
+	}
+	if request.DownloadType == 0 {
+		request.DownloadType = 1
+	}
+	switch request.DownloadType {
+	case 1, 2, 3:
+		return request, nil
+	default:
+		return request, fmt.Errorf("download_type must be 1, 2, or 3")
+	}
+}
+
+func normalizeDedaoOdobJobRequest(request BookKnowledgeJobRequest) (BookKnowledgeJobRequest, error) {
+	if request.OdobID <= 0 {
+		return request, fmt.Errorf("odob_id is required")
+	}
+	if request.OdobEnID == "" {
+		return request, fmt.Errorf("odob_enid is required")
+	}
+	if request.OdobAliasID == "" {
+		return request, fmt.Errorf("odob_alias_id is required")
 	}
 	if request.DownloadType == 0 {
 		request.DownloadType = 1
@@ -389,6 +436,39 @@ func executeDedaoEbookDownloadJob(ctx context.Context, job BookKnowledgeJob) (ma
 		"output_dir":    cfg.RepoDir,
 		"title":         result.Title,
 		"html_path":     result.HTMLPath,
+	}, nil
+}
+
+func executeDedaoOdobDownloadJob(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
+	cfg := DefaultEbookWikiSyncConfig().withDefaults()
+	title := firstNonEmpty(job.OdobTitle, fmt.Sprintf("%d", job.OdobID))
+	download := OdobDownload{
+		Ctx:          ctx,
+		DownloadType: job.DownloadType,
+		ID:           job.OdobID,
+		OutputDir:    cfg.RepoDir,
+		Data: &services.Course{
+			Enid:        job.OdobEnID,
+			ID:          job.OdobID,
+			ClassID:     job.OdobID,
+			Title:       title,
+			HasPlayAuth: job.OdobCanPlay,
+			AudioDetail: services.Audio{
+				AliasID: job.OdobAliasID,
+				Title:   title,
+			},
+		},
+	}
+	if err := download.Download(); err != nil {
+		return nil, err
+	}
+	return map[string]any{
+		"odob_id":       job.OdobID,
+		"odob_enid":     job.OdobEnID,
+		"odob_alias_id": job.OdobAliasID,
+		"download_type": job.DownloadType,
+		"output_dir":    cfg.RepoDir,
+		"title":         title,
 	}, nil
 }
 

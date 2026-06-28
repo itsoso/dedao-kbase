@@ -127,6 +127,11 @@ export interface BookKnowledgeJob {
   target?: string
   ebook_id?: number
   ebook_enid?: string
+  odob_id?: number
+  odob_enid?: string
+  odob_title?: string
+  odob_alias_id?: string
+  odob_can_play?: boolean
   download_type?: number
   result?: Record<string, unknown>
   error?: string
@@ -143,6 +148,11 @@ export interface BookKnowledgeJobRequest {
   target?: string
   ebook_id?: number
   ebook_enid?: string
+  odob_id?: number
+  odob_enid?: string
+  odob_title?: string
+  odob_alias_id?: string
+  odob_can_play?: boolean
   download_type?: number
 }
 
@@ -271,6 +281,69 @@ export interface DedaoCoursePage {
   total: number
   total_pages: number
   is_more: number
+}
+
+export interface DedaoOdob {
+  enid: string
+  id: number
+  class_id?: number
+  title: string
+  intro?: string
+  author?: string
+  icon?: string
+  price?: string
+  progress: number
+  duration?: number
+  publish_num?: number
+  last_read?: string
+  audio_alias_id?: string
+  audio_title?: string
+  audio_icon?: string
+  audio_duration?: number
+  audio_play_url?: string
+  has_play_auth: boolean
+}
+
+export interface DedaoOdobPage {
+  odobs: DedaoOdob[]
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+  is_more: number
+}
+
+export interface DedaoOdobAgency {
+  name?: string
+  intro?: string
+  member_name?: string
+  member_avatar?: string
+  book_count?: number
+  user_visit_count?: number
+}
+
+export interface DedaoOdobTopicSummary {
+  title: string
+  sub_title?: string
+}
+
+export interface DedaoOdobDetail {
+  enid: string
+  id: number
+  title: string
+  icon?: string
+  duration?: number
+  audio_price?: string
+  audio_summary?: string
+  publish_time?: number
+  is_vip: boolean
+  is_buy: boolean
+  in_bookrack: boolean
+  progress?: number
+  tags?: string[]
+  learn_count_desc?: string
+  agency?: DedaoOdobAgency
+  topic_summary?: DedaoOdobTopicSummary[]
 }
 
 export interface DedaoCourseDetailMeta {
@@ -518,6 +591,21 @@ export class KBaseClient {
     return this.request<DedaoCoursePage>(`/api/dedao/courses?${params.join('&')}`)
   }
 
+  async listDedaoOdobs(page = 1, pageSize = 15, query = ''): Promise<DedaoOdobPage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+    ]
+    if (query.trim()) {
+      params.push(`q=${encodeURIComponent(query.trim())}`)
+    }
+    return this.request<DedaoOdobPage>(`/api/dedao/odobs?${params.join('&')}`)
+  }
+
+  async getDedaoOdobDetail(enid: string): Promise<DedaoOdobDetail> {
+    return this.request<DedaoOdobDetail>(`/api/dedao/odobs/${encodeURIComponent(enid)}`)
+  }
+
   async getDedaoCourseDetail(enid: string): Promise<DedaoCourseDetail> {
     return this.request<DedaoCourseDetail>(`/api/dedao/courses/${encodeURIComponent(enid)}`)
   }
@@ -532,6 +620,10 @@ export class KBaseClient {
 
   async getDedaoArticleMarkdown(enid: string): Promise<DedaoArticleMarkdown> {
     return this.request<DedaoArticleMarkdown>(`/api/dedao/articles/${encodeURIComponent(enid)}?type=course`)
+  }
+
+  async getDedaoOdobArticleMarkdown(enid: string): Promise<DedaoArticleMarkdown> {
+    return this.request<DedaoArticleMarkdown>(`/api/dedao/articles/${encodeURIComponent(enid)}?type=odob`)
   }
 
   async analyzePage(body: PageAnalysisRequest): Promise<PageAnalysisResponse> {

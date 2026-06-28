@@ -573,6 +573,113 @@ func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoOdobs(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		odobs: DedaoOdobPage{
+			Odobs: []DedaoOdob{
+				{
+					ID:            301,
+					ClassID:       301,
+					Enid:          "odob-enid",
+					Title:         "每天听本书",
+					Intro:         "一本书的精华解读。",
+					Author:        "得到听书",
+					Icon:          "https://example.test/odob.jpg",
+					Price:         "29.90",
+					Progress:      55,
+					Duration:      1800,
+					AudioAliasID:  "audio-alias",
+					AudioTitle:    "听书音频",
+					AudioPlayURL:  "https://example.test/audio.mp3",
+					HasPlayAuth:   true,
+					AudioDuration: 1800,
+				},
+			},
+			Page:       2,
+			PageSize:   1,
+			Total:      4,
+			TotalPages: 4,
+			IsMore:     1,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/odobs", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("odobs without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/odobs?page=2&page_size=1&q=听书", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("odobs status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotOdobPage != 2 || content.gotOdobPageSize != 1 || content.gotOdobQuery != "听书" {
+		t.Fatalf("odobs request args = page %d pageSize %d query %q", content.gotOdobPage, content.gotOdobPageSize, content.gotOdobQuery)
+	}
+	var payload DedaoOdobPage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Page != 2 || payload.PageSize != 1 || payload.Total != 4 || payload.TotalPages != 4 || payload.IsMore != 1 {
+		t.Fatalf("odobs pagination = %#v", payload)
+	}
+	if len(payload.Odobs) != 1 || payload.Odobs[0].Title != "每天听本书" || payload.Odobs[0].AudioAliasID != "audio-alias" {
+		t.Fatalf("odobs payload = %#v", payload.Odobs)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
+func TestKBaseHTTPHandlerServesDedaoOdobDetail(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		odobDetail: DedaoOdobDetail{
+			Enid:           "odob-enid",
+			ID:             301,
+			Title:          "每天听本书",
+			Icon:           "https://example.test/odob.jpg",
+			Duration:       1800,
+			AudioPrice:     "29.90",
+			AudioSummary:   "一本书的精华解读。",
+			IsBuy:          true,
+			InBookrack:     true,
+			Progress:       55,
+			Tags:           []string{"商业", "认知"},
+			LearnCountDesc: "1.2 万人学习",
+			Agency: DedaoOdobAgency{
+				Name:       "得到听书",
+				MemberName: "讲书人",
+			},
+			TopicSummary: []DedaoOdobTopicSummary{
+				{Title: "核心观点", SubTitle: "三条主线"},
+			},
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/odobs/odob-enid", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("odob detail status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotOdobDetailEnid != "odob-enid" {
+		t.Fatalf("odob detail enid = %q", content.gotOdobDetailEnid)
+	}
+	var payload DedaoOdobDetail
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Title != "每天听本书" || payload.Agency.Name != "得到听书" || len(payload.TopicSummary) != 1 {
+		t.Fatalf("odob detail payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
 func TestKBaseHTTPHandlerServesDedaoCourseDetail(t *testing.T) {
 	content := &fakeDedaoContentProvider{
 		courseDetail: DedaoCourseDetail{
@@ -676,6 +783,12 @@ func TestKBaseHTTPHandlerServesDedaoArticleMarkdown(t *testing.T) {
 			Title:    "第一讲：问题定义",
 			Markdown: "## 问题定义\n\n先定义问题，再选择工具。",
 		},
+		odobMarkdown: DedaoArticleMarkdown{
+			Enid:     "audio-alias",
+			Type:     "odob",
+			Title:    "每天听本书",
+			Markdown: "## 听书文稿\n\n一本书的精华解读。",
+		},
 	}
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:        NewBookKnowledgeStore(t.TempDir()),
@@ -699,7 +812,23 @@ func TestKBaseHTTPHandlerServesDedaoArticleMarkdown(t *testing.T) {
 	}
 	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
 
-	badTypeResp := requestKBase(handler, http.MethodGet, "/api/dedao/articles/article-enid?type=odob", "secret-token")
+	odobResp := requestKBase(handler, http.MethodGet, "/api/dedao/articles/audio-alias?type=odob", "secret-token")
+	if odobResp.Code != http.StatusOK {
+		t.Fatalf("odob markdown status = %d, body=%s", odobResp.Code, odobResp.Body.String())
+	}
+	if content.gotOdobMarkdownEnid != "audio-alias" {
+		t.Fatalf("odob markdown enid = %q", content.gotOdobMarkdownEnid)
+	}
+	var odobPayload DedaoArticleMarkdown
+	if err := json.Unmarshal(odobResp.Body.Bytes(), &odobPayload); err != nil {
+		t.Fatalf("Unmarshal odob returned error: %v", err)
+	}
+	if odobPayload.Type != "odob" || !strings.Contains(odobPayload.Markdown, "听书文稿") {
+		t.Fatalf("odob markdown payload = %#v", odobPayload)
+	}
+	assertDedaoResponseOmitsSecrets(t, odobResp.Body.String())
+
+	badTypeResp := requestKBase(handler, http.MethodGet, "/api/dedao/articles/article-enid?type=video", "secret-token")
 	if badTypeResp.Code != http.StatusBadRequest {
 		t.Fatalf("article unsupported type status = %d, want 400", badTypeResp.Code)
 	}
@@ -1000,9 +1129,12 @@ func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (D
 type fakeDedaoContentProvider struct {
 	ebooks                 DedaoEbookPage
 	courses                DedaoCoursePage
+	odobs                  DedaoOdobPage
+	odobDetail             DedaoOdobDetail
 	courseDetail           DedaoCourseDetail
 	articles               DedaoArticlePage
 	articleMarkdown        DedaoArticleMarkdown
+	odobMarkdown           DedaoArticleMarkdown
 	ebookDetail            DedaoEbookDetail
 	ebookPages             DedaoEbookChapterPages
 	gotQuery               string
@@ -1011,11 +1143,16 @@ type fakeDedaoContentProvider struct {
 	gotCourseQuery         string
 	gotCoursePage          int
 	gotCoursePageSize      int
+	gotOdobQuery           string
+	gotOdobPage            int
+	gotOdobPageSize        int
+	gotOdobDetailEnid      string
 	gotCourseDetailEnid    string
 	gotArticlesEnid        string
 	gotArticlesCount       int
 	gotArticlesMaxID       int
 	gotArticleMarkdownEnid string
+	gotOdobMarkdownEnid    string
 	gotEbookDetailEnid     string
 	gotEbookPagesEnid      string
 	gotEbookPagesChapterID string
@@ -1038,6 +1175,18 @@ func (f *fakeDedaoContentProvider) ListCourses(query string, page, pageSize int)
 	return f.courses, nil
 }
 
+func (f *fakeDedaoContentProvider) ListOdobs(query string, page, pageSize int) (DedaoOdobPage, error) {
+	f.gotOdobQuery = query
+	f.gotOdobPage = page
+	f.gotOdobPageSize = pageSize
+	return f.odobs, nil
+}
+
+func (f *fakeDedaoContentProvider) GetOdobDetail(enid string) (DedaoOdobDetail, error) {
+	f.gotOdobDetailEnid = enid
+	return f.odobDetail, nil
+}
+
 func (f *fakeDedaoContentProvider) GetCourseDetail(enid string) (DedaoCourseDetail, error) {
 	f.gotCourseDetailEnid = enid
 	return f.courseDetail, nil
@@ -1053,6 +1202,11 @@ func (f *fakeDedaoContentProvider) ListCourseArticles(enid string, count, maxID 
 func (f *fakeDedaoContentProvider) GetCourseArticleMarkdown(enid string) (DedaoArticleMarkdown, error) {
 	f.gotArticleMarkdownEnid = enid
 	return f.articleMarkdown, nil
+}
+
+func (f *fakeDedaoContentProvider) GetOdobArticleMarkdown(enid string) (DedaoArticleMarkdown, error) {
+	f.gotOdobMarkdownEnid = enid
+	return f.odobMarkdown, nil
 }
 
 func (f *fakeDedaoContentProvider) GetEbookDetail(enid string) (DedaoEbookDetail, error) {

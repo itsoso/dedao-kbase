@@ -51,6 +51,38 @@ func TestBookKnowledgeJobAcceptsDedaoEbookSyncKBase(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobAcceptsDedaoOdobDownload(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:         BookKnowledgeJobTypeDedaoOdobDownload,
+		OdobID:       301,
+		OdobEnID:     "odob-enid",
+		OdobTitle:    "每天听本书",
+		OdobAliasID:  "audio-alias",
+		OdobCanPlay:  true,
+		DownloadType: 3,
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob returned error: %v", err)
+	}
+
+	if job.Type != BookKnowledgeJobTypeDedaoOdobDownload || job.OdobID != 301 ||
+		job.OdobEnID != "odob-enid" || job.OdobAliasID != "audio-alias" ||
+		job.OdobTitle != "每天听本书" || !job.OdobCanPlay || job.DownloadType != 3 {
+		t.Fatalf("job = %#v", job)
+	}
+
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil {
+		t.Fatalf("LoadBookKnowledgeJob returned error: %v", err)
+	}
+	if loaded.OdobID != 301 || loaded.OdobEnID != "odob-enid" || loaded.OdobAliasID != "audio-alias" ||
+		loaded.DownloadType != 3 {
+		t.Fatalf("loaded job = %#v", loaded)
+	}
+}
+
 func TestBookKnowledgeJobRejectsInvalidDedaoEbookJobs(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	tests := []struct {
@@ -71,6 +103,26 @@ func TestBookKnowledgeJobRejectsInvalidDedaoEbookJobs(t *testing.T) {
 		{
 			name:    "download unsupported format",
 			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 67929, EbookEnID: "ebook-enid", DownloadType: 9},
+			want:    "download_type must be 1, 2, or 3",
+		},
+		{
+			name:    "odob missing id",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoOdobDownload, OdobEnID: "odob-enid", OdobAliasID: "audio-alias"},
+			want:    "odob_id is required",
+		},
+		{
+			name:    "odob missing enid",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoOdobDownload, OdobID: 301, OdobAliasID: "audio-alias"},
+			want:    "odob_enid is required",
+		},
+		{
+			name:    "odob missing alias id",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoOdobDownload, OdobID: 301, OdobEnID: "odob-enid"},
+			want:    "odob_alias_id is required",
+		},
+		{
+			name:    "odob unsupported format",
+			request: BookKnowledgeJobRequest{Type: BookKnowledgeJobTypeDedaoOdobDownload, OdobID: 301, OdobEnID: "odob-enid", OdobAliasID: "audio-alias", DownloadType: 9},
 			want:    "download_type must be 1, 2, or 3",
 		},
 	}
@@ -147,6 +199,42 @@ func TestBookKnowledgeJobExecutesDedaoEbookSyncKBase(t *testing.T) {
 		t.Fatalf("gotJob = %#v", gotJob)
 	}
 	if result["knowledge_book_id"] != "67929" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestBookKnowledgeJobExecutesDedaoOdobDownload(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldRunner := runDedaoOdobDownloadJob
+	defer func() { runDedaoOdobDownloadJob = oldRunner }()
+
+	var gotJob BookKnowledgeJob
+	runDedaoOdobDownloadJob = func(_ context.Context, job BookKnowledgeJob) (map[string]any, error) {
+		gotJob = job
+		return map[string]any{
+			"odob_id":       job.OdobID,
+			"odob_alias_id": job.OdobAliasID,
+			"download_type": job.DownloadType,
+		}, nil
+	}
+
+	result, err := store.executeBookKnowledgeJob(BookKnowledgeJob{
+		Type:         BookKnowledgeJobTypeDedaoOdobDownload,
+		OdobID:       301,
+		OdobEnID:     "odob-enid",
+		OdobTitle:    "每天听本书",
+		OdobAliasID:  "audio-alias",
+		OdobCanPlay:  true,
+		DownloadType: 2,
+	})
+	if err != nil {
+		t.Fatalf("executeBookKnowledgeJob returned error: %v", err)
+	}
+	if gotJob.OdobID != 301 || gotJob.OdobEnID != "odob-enid" || gotJob.OdobAliasID != "audio-alias" ||
+		!gotJob.OdobCanPlay || gotJob.DownloadType != 2 {
+		t.Fatalf("gotJob = %#v", gotJob)
+	}
+	if result["download_type"] != 2 || result["odob_alias_id"] != "audio-alias" {
 		t.Fatalf("result = %#v", result)
 	}
 }

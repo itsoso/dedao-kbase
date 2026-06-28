@@ -7,6 +7,7 @@ import EbookDetailReader from './views/EbookDetailReader.vue'
 import EbookLibrary from './views/EbookLibrary.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
+import OdobLibrary from './views/OdobLibrary.vue'
 import WebSettings from './views/WebSettings.vue'
 
 export interface NavigationItem {
@@ -35,14 +36,6 @@ const moduleRoutes = [
     status: 'planned',
     source: 'frontend/src/views/Home.vue',
     desktopMethods: ['GetHomeInitialState', 'SunflowerLabelList', 'SunflowerLabelContent', 'SunflowerResourceList'],
-  },
-  {
-    path: '/odob',
-    title: '听书书架',
-    scope: 'odob_browser',
-    status: 'planned',
-    source: 'frontend/src/views/Odob.vue',
-    desktopMethods: ['CourseList', 'OdobDownload', 'OdobUserInfo'],
   },
   {
     path: '/knowledge',
@@ -155,6 +148,17 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/Ebook.vue',
       desktopMethods: ['CourseList', 'EbookInfo', 'EbookCommentList', 'EbookDownload', 'EbookDownloadAndSyncWiki'],
+    },
+  },
+  {
+    path: '/odob',
+    component: OdobLibrary,
+    meta: {
+      title: '听书书架',
+      scope: 'odob_browser',
+      status: 'online',
+      source: 'frontend/src/views/Odob.vue',
+      desktopMethods: ['CourseList', 'OdobDownload', 'OdobUserInfo'],
     },
   },
   {

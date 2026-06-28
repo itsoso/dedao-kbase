@@ -53,6 +53,69 @@ type DedaoCoursePage struct {
 	IsMore     int           `json:"is_more"`
 }
 
+type DedaoOdob struct {
+	Enid          string `json:"enid"`
+	ID            int    `json:"id"`
+	ClassID       int    `json:"class_id,omitempty"`
+	Title         string `json:"title"`
+	Intro         string `json:"intro,omitempty"`
+	Author        string `json:"author,omitempty"`
+	Icon          string `json:"icon,omitempty"`
+	Price         string `json:"price,omitempty"`
+	Progress      int    `json:"progress"`
+	Duration      int    `json:"duration,omitempty"`
+	PublishNum    int    `json:"publish_num,omitempty"`
+	LastRead      string `json:"last_read,omitempty"`
+	AudioAliasID  string `json:"audio_alias_id,omitempty"`
+	AudioTitle    string `json:"audio_title,omitempty"`
+	AudioIcon     string `json:"audio_icon,omitempty"`
+	AudioDuration int    `json:"audio_duration,omitempty"`
+	AudioPlayURL  string `json:"audio_play_url,omitempty"`
+	HasPlayAuth   bool   `json:"has_play_auth"`
+}
+
+type DedaoOdobPage struct {
+	Odobs      []DedaoOdob `json:"odobs"`
+	Page       int         `json:"page"`
+	PageSize   int         `json:"page_size"`
+	Total      int         `json:"total"`
+	TotalPages int         `json:"total_pages"`
+	IsMore     int         `json:"is_more"`
+}
+
+type DedaoOdobAgency struct {
+	Name           string `json:"name,omitempty"`
+	Intro          string `json:"intro,omitempty"`
+	MemberName     string `json:"member_name,omitempty"`
+	MemberAvatar   string `json:"member_avatar,omitempty"`
+	BookCount      int    `json:"book_count,omitempty"`
+	UserVisitCount int    `json:"user_visit_count,omitempty"`
+}
+
+type DedaoOdobTopicSummary struct {
+	Title    string `json:"title"`
+	SubTitle string `json:"sub_title,omitempty"`
+}
+
+type DedaoOdobDetail struct {
+	Enid           string                  `json:"enid"`
+	ID             int                     `json:"id"`
+	Title          string                  `json:"title"`
+	Icon           string                  `json:"icon,omitempty"`
+	Duration       int                     `json:"duration,omitempty"`
+	AudioPrice     string                  `json:"audio_price,omitempty"`
+	AudioSummary   string                  `json:"audio_summary,omitempty"`
+	PublishTime    int                     `json:"publish_time,omitempty"`
+	IsVIP          bool                    `json:"is_vip"`
+	IsBuy          bool                    `json:"is_buy"`
+	InBookrack     bool                    `json:"in_bookrack"`
+	Progress       int                     `json:"progress,omitempty"`
+	Tags           []string                `json:"tags,omitempty"`
+	LearnCountDesc string                  `json:"learn_count_desc,omitempty"`
+	Agency         DedaoOdobAgency         `json:"agency,omitempty"`
+	TopicSummary   []DedaoOdobTopicSummary `json:"topic_summary,omitempty"`
+}
+
 type DedaoCourseDetailMeta struct {
 	Enid           string `json:"enid"`
 	ID             int    `json:"id"`
@@ -162,9 +225,12 @@ type DedaoEbookChapterPages struct {
 type DedaoContentProvider interface {
 	ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
 	ListCourses(query string, page, pageSize int) (DedaoCoursePage, error)
+	ListOdobs(query string, page, pageSize int) (DedaoOdobPage, error)
+	GetOdobDetail(enid string) (DedaoOdobDetail, error)
 	GetCourseDetail(enid string) (DedaoCourseDetail, error)
 	ListCourseArticles(enid string, count, maxID int) (DedaoArticlePage, error)
 	GetCourseArticleMarkdown(enid string) (DedaoArticleMarkdown, error)
+	GetOdobArticleMarkdown(enid string) (DedaoArticleMarkdown, error)
 	GetEbookDetail(enid string) (DedaoEbookDetail, error)
 	GetEbookChapterPages(enid string, chapterID string, index, count, offset int) (DedaoEbookChapterPages, error)
 }
@@ -240,6 +306,45 @@ func (p liveDedaoContentProvider) ListCourses(query string, page, pageSize int) 
 	return dedaoCoursePageFromPagedCourses(courses, page, pageSize, total, isMore), nil
 }
 
+func (p liveDedaoContentProvider) ListOdobs(query string, page, pageSize int) (DedaoOdobPage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 30
+	}
+	query = strings.TrimSpace(query)
+	if query != "" {
+		list, err := getService().CourseListAll(CateAudioBook, "study")
+		if err != nil {
+			return DedaoOdobPage{}, err
+		}
+		courses := filterDedaoCourses(list.List, query)
+		return dedaoOdobPageFromAllCourses(courses, page, pageSize), nil
+	}
+
+	list, err := CourseList(CateAudioBook, "study", page, pageSize)
+	if err != nil {
+		return DedaoOdobPage{}, err
+	}
+	total := dedaoCourseCategoryCount(CateAudioBook)
+	courses := []services.Course{}
+	isMore := 0
+	if list != nil {
+		courses = list.List
+		isMore = list.ISMore
+	}
+	return dedaoOdobPageFromPagedCourses(courses, page, pageSize, total, isMore), nil
+}
+
+func (p liveDedaoContentProvider) GetOdobDetail(enid string) (DedaoOdobDetail, error) {
+	detail, err := AudioDetail(enid)
+	if err != nil {
+		return DedaoOdobDetail{}, err
+	}
+	return dedaoOdobDetailFromService(enid, detail), nil
+}
+
 func (p liveDedaoContentProvider) GetCourseDetail(enid string) (DedaoCourseDetail, error) {
 	info, err := CourseInfoByEnid(enid)
 	if err != nil {
@@ -298,6 +403,23 @@ func (p liveDedaoContentProvider) GetCourseArticleMarkdown(enid string) (DedaoAr
 		Enid:     enid,
 		Type:     "course",
 		Title:    title,
+		Markdown: ContentsToMarkdown(content),
+	}, nil
+}
+
+func (p liveDedaoContentProvider) GetOdobArticleMarkdown(enid string) (DedaoArticleMarkdown, error) {
+	detail, err := OdobArticleDetail(enid)
+	if err != nil {
+		return DedaoArticleMarkdown{}, err
+	}
+	var content []services.Content
+	if err := jsoniter.UnmarshalFromString(detail.Content, &content); err != nil {
+		return DedaoArticleMarkdown{}, err
+	}
+	return DedaoArticleMarkdown{
+		Enid:     enid,
+		Type:     "odob",
+		Title:    "",
 		Markdown: ContentsToMarkdown(content),
 	}, nil
 }
@@ -441,6 +563,37 @@ func dedaoCoursePageFromPagedCourses(courses []services.Course, page, pageSize, 
 	}
 }
 
+func dedaoOdobPageFromAllCourses(courses []services.Course, page, pageSize int) DedaoOdobPage {
+	total := len(courses)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return dedaoOdobPageFromPagedCourses(courses[start:end], page, pageSize, total, 0)
+}
+
+func dedaoOdobPageFromPagedCourses(courses []services.Course, page, pageSize, total, isMore int) DedaoOdobPage {
+	if total < len(courses) {
+		total = len(courses)
+	}
+	totalPages := 0
+	if total > 0 && pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	return DedaoOdobPage{
+		Odobs:      dedaoOdobsFromCourses(courses),
+		Page:       page,
+		PageSize:   pageSize,
+		Total:      total,
+		TotalPages: totalPages,
+		IsMore:     isMore,
+	}
+}
+
 func dedaoEbooksFromCourses(courses []services.Course) []DedaoEbook {
 	ebooks := make([]DedaoEbook, 0, len(courses))
 	for _, course := range courses {
@@ -458,6 +611,34 @@ func dedaoEbooksFromCourses(courses []services.Course) []DedaoEbook {
 		})
 	}
 	return ebooks
+}
+
+func dedaoOdobsFromCourses(courses []services.Course) []DedaoOdob {
+	result := make([]DedaoOdob, 0, len(courses))
+	for _, course := range courses {
+		audio := course.AudioDetail
+		result = append(result, DedaoOdob{
+			Enid:          course.Enid,
+			ID:            course.ID,
+			ClassID:       course.ClassID,
+			Title:         course.Title,
+			Intro:         course.Intro,
+			Author:        course.Author,
+			Icon:          firstNonEmpty(course.Icon, audio.Icon, audio.AudioListIcon),
+			Price:         course.Price,
+			Progress:      course.Progress,
+			Duration:      firstNonZero(course.Duration, audio.Duration),
+			PublishNum:    course.PublishNum,
+			LastRead:      course.LastRead,
+			AudioAliasID:  audio.AliasID,
+			AudioTitle:    firstNonEmpty(audio.Title, audio.ShareTitle),
+			AudioIcon:     firstNonEmpty(audio.Icon, audio.AudioListIcon),
+			AudioDuration: audio.Duration,
+			AudioPlayURL:  audio.Mp3PlayURL,
+			HasPlayAuth:   course.HasPlayAuth,
+		})
+	}
+	return result
 }
 
 func dedaoCoursesFromCourses(courses []services.Course) []DedaoCourse {
@@ -479,6 +660,45 @@ func dedaoCoursesFromCourses(courses []services.Course) []DedaoCourse {
 		})
 	}
 	return result
+}
+
+func dedaoOdobDetailFromService(enid string, detail *services.AudioInfoResp) DedaoOdobDetail {
+	if detail == nil {
+		return DedaoOdobDetail{Enid: enid}
+	}
+	audio := detail.AudioInfo
+	topics := make([]DedaoOdobTopicSummary, 0, len(audio.TopicSummary))
+	for _, topic := range audio.TopicSummary {
+		topics = append(topics, DedaoOdobTopicSummary{
+			Title:    topic.Title,
+			SubTitle: topic.SubTitle,
+		})
+	}
+	return DedaoOdobDetail{
+		Enid:           enid,
+		ID:             audio.ID,
+		Title:          audio.Title,
+		Icon:           audio.Icon,
+		Duration:       audio.Duration,
+		AudioPrice:     audio.AudioPrice,
+		AudioSummary:   audio.AudioSummary,
+		PublishTime:    audio.PublishTime,
+		IsVIP:          audio.IsVip,
+		IsBuy:          audio.IsBuy,
+		InBookrack:     audio.InBookrack,
+		Progress:       audio.Progress,
+		Tags:           audio.Tag,
+		LearnCountDesc: audio.LearnCountDesc,
+		Agency: DedaoOdobAgency{
+			Name:           audio.AgencyDetail.Name,
+			Intro:          audio.AgencyDetail.Intro,
+			MemberName:     audio.AgencyDetail.QcgMemberName,
+			MemberAvatar:   audio.AgencyDetail.QcgMemberAvatar,
+			BookCount:      audio.AgencyDetail.BookCount,
+			UserVisitCount: audio.AgencyDetail.Uv,
+		},
+		TopicSummary: topics,
+	}
 }
 
 func dedaoCourseDetailMetaFromInfo(info *services.CourseInfo) DedaoCourseDetailMeta {
@@ -596,4 +816,13 @@ func ebookChapterIDFromHref(href string) string {
 		chapterID = beforeHash
 	}
 	return strings.TrimSpace(chapterID)
+}
+
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }

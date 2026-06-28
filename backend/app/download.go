@@ -29,6 +29,7 @@ type OdobDownload struct {
 	DownloadType int // 1:mp3, 2:PDF文档, 3:markdown文档
 	ID           int
 	Data         *services.Course
+	OutputDir    string
 }
 
 type EBookDownload struct {
@@ -139,6 +140,10 @@ func (d *CourseDownload) Download() error {
 
 func (d *OdobDownload) Download() error {
 	fileName := "每天听本书"
+	outputDir := OutputDir
+	if d.OutputDir != "" {
+		outputDir = d.OutputDir
+	}
 	switch d.DownloadType {
 	case 1:
 		downloadData := downloader.Data{
@@ -147,7 +152,7 @@ func (d *OdobDownload) Download() error {
 		downloadData.Type = "audio"
 		downloadData.Data = extOdobDownloadData(d.Data)
 		errors := make([]error, 0)
-		path, err := utils.Mkdir(OutputDir, utils.FileName(fileName, ""), "MP3")
+		path, err := utils.Mkdir(outputDir, utils.FileName(fileName, ""), "MP3")
 		if err != nil {
 			return err
 		}
@@ -173,7 +178,7 @@ func (d *OdobDownload) Download() error {
 			return errors[0]
 		}
 	case 2:
-		path, err := utils.Mkdir(OutputDir, utils.FileName(fileName, ""), "PDF")
+		path, err := utils.Mkdir(outputDir, utils.FileName(fileName, ""), "PDF")
 		if err != nil {
 			return err
 		}
@@ -199,7 +204,7 @@ func (d *OdobDownload) Download() error {
 		return utils.Md2Pdf(path, d.Data.Title, []byte(res))
 	case 3:
 		// 下载 Markdown
-		path, err := utils.Mkdir(OutputDir, utils.FileName(fileName, ""), "MD")
+		path, err := utils.Mkdir(outputDir, utils.FileName(fileName, ""), "MD")
 		if err != nil {
 			return err
 		}
