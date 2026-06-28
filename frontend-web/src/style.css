@@ -19,7 +19,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -44,13 +45,19 @@ button:disabled {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   border: 1px solid #c8d2df;
   border-radius: 6px;
   padding: 9px 10px;
   background: #ffffff;
   color: #172033;
+}
+
+textarea {
+  resize: vertical;
+  min-height: 112px;
 }
 
 .kbase-web-shell {
@@ -64,6 +71,7 @@ select {
 .connection-bar,
 .book-rail,
 .search-panel,
+.chat-panel,
 .detail-panel,
 .error-strip {
   border: 1px solid #d3dce8;
@@ -131,16 +139,24 @@ label span {
 
 .workbench-grid {
   display: grid;
-  grid-template-columns: 280px 360px minmax(520px, 1fr);
+  grid-template-columns: 300px 420px minmax(520px, 1fr);
   gap: 12px;
   min-height: calc(100vh - 106px);
 }
 
 .book-rail,
 .search-panel,
+.chat-panel,
 .detail-panel {
   min-height: 0;
   padding: 12px;
+}
+
+.middle-stack {
+  display: grid;
+  grid-template-rows: minmax(220px, 0.72fr) minmax(420px, 1fr);
+  gap: 12px;
+  min-height: 0;
 }
 
 .panel-head {
@@ -151,9 +167,15 @@ label span {
   margin-bottom: 12px;
 }
 
-.rail-filter,
+.rail-controls,
 .search-row {
   margin-bottom: 10px;
+}
+
+.rail-controls {
+  display: grid;
+  grid-template-columns: 1fr 112px;
+  gap: 8px;
 }
 
 .book-list,
@@ -164,6 +186,14 @@ label span {
   gap: 8px;
   max-height: calc(100vh - 196px);
   overflow: auto;
+}
+
+.book-list {
+  max-height: calc(100vh - 258px);
+}
+
+.result-list {
+  max-height: calc((100vh - 244px) * 0.34);
 }
 
 .book-row,
@@ -209,6 +239,24 @@ label span {
   gap: 8px;
 }
 
+.book-pagination {
+  display: grid;
+  grid-template-columns: 64px 1fr 64px;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+  color: #536274;
+  font-size: 12px;
+}
+
+.book-pagination span {
+  text-align: center;
+}
+
+.book-pagination select {
+  grid-column: 1 / -1;
+}
+
 .result-meta {
   display: flex;
   justify-content: space-between;
@@ -228,6 +276,10 @@ label span {
   text-align: center;
 }
 
+.empty-state.compact {
+  padding: 14px;
+}
+
 .tab-strip {
   display: flex;
   flex-wrap: wrap;
@@ -244,6 +296,106 @@ label span {
 .system-kb-panel {
   max-height: calc(100vh - 174px);
   overflow: auto;
+}
+
+.model-input {
+  max-width: 160px;
+}
+
+.mode-strip {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.mode-strip button {
+  padding: 7px 6px;
+  font-size: 12px;
+}
+
+.prompt-select {
+  margin-bottom: 8px;
+}
+
+.chat-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.chat-answer {
+  margin-top: 10px;
+  border: 1px solid #b6d3c8;
+  border-radius: 7px;
+  padding: 10px;
+  background: #f7fbf9;
+}
+
+.chat-answer p {
+  margin: 0;
+  color: #253244;
+  font-size: 13px;
+  line-height: 20px;
+  white-space: pre-wrap;
+}
+
+.source-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.source-chips span {
+  border: 1px solid #c8d2df;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: #ffffff;
+  color: #536274;
+  font-size: 11px;
+}
+
+.chat-history {
+  margin-top: 12px;
+}
+
+.history-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  color: #253244;
+  font-size: 13px;
+}
+
+.history-head button {
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.history-row {
+  display: block;
+  width: 100%;
+  margin-bottom: 6px;
+  text-align: left;
+}
+
+.history-row span {
+  display: block;
+  margin-bottom: 3px;
+  color: #6c7b8f;
+  font-size: 11px;
+}
+
+.history-row strong {
+  display: block;
+  overflow: hidden;
+  color: #121926;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .metric-grid {
@@ -291,4 +443,27 @@ pre {
   color: #dce8e4;
   font-size: 12px;
   line-height: 18px;
+}
+
+@media (max-width: 1180px) {
+  body {
+    min-width: 0;
+  }
+
+  .connection-bar,
+  .workbench-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .middle-stack {
+    grid-template-rows: auto;
+  }
+
+  .book-list,
+  .result-list,
+  .table-list,
+  .detail-body,
+  .system-kb-panel {
+    max-height: none;
+  }
 }

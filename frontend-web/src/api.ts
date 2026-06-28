@@ -45,6 +45,14 @@ export interface BookKnowledgePackage {
   citations?: unknown[]
 }
 
+export interface BookKnowledgeBooksPage {
+  books: BookKnowledgeBook[]
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+}
+
 export interface BookKnowledgeSearchResult {
   kind: string
   book_id: string
@@ -55,6 +63,60 @@ export interface BookKnowledgeSearchResult {
   title?: string
   snippet: string
   score: number
+}
+
+export interface BookKnowledgePrompt {
+  prompt_id: string
+  category: string
+  title: string
+  description?: string
+  prompt: string
+  output_format?: string
+  dynamic?: boolean
+}
+
+export interface BookKnowledgeChatSource {
+  kind: string
+  id: string
+  title?: string
+  chapter_id?: string
+}
+
+export interface BookKnowledgeChatContextStats {
+  chapters: number
+  claims: number
+  chunks: number
+  chars: number
+}
+
+export interface BookKnowledgeChatResponse {
+  history_id?: string
+  answer: string
+  model: string
+  mode: string
+  sources: BookKnowledgeChatSource[]
+  context_stats: BookKnowledgeChatContextStats
+  created_at?: string
+}
+
+export interface BookKnowledgeChatHistoryItem {
+  id: string
+  book_id: string
+  book_title: string
+  mode: string
+  question: string
+  model: string
+  answer: string
+  sources: BookKnowledgeChatSource[]
+  context_stats: BookKnowledgeChatContextStats
+  created_at: string
+}
+
+export interface BookKnowledgeChatRequest {
+  mode: string
+  question: string
+  model?: string
+  max_context_chars?: number
 }
 
 export interface BrowserSession {
@@ -88,8 +150,20 @@ export class KBaseClient {
     this.token = token.trim()
   }
 
+  async listBooksPage(page = 1, pageSize = 30, query = '', sort = 'updated_at_desc'): Promise<BookKnowledgeBooksPage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+      `sort=${encodeURIComponent(sort)}`,
+    ]
+    if (query.trim()) {
+      params.push(`q=${encodeURIComponent(query.trim())}`)
+    }
+    return this.request<BookKnowledgeBooksPage>(`/api/books?${params.join('&')}`)
+  }
+
   async listBooks(): Promise<BookKnowledgeBook[]> {
-    const response = await this.request<{ books: BookKnowledgeBook[] }>('/api/books')
+    const response = await this.listBooksPage()
     return response.books || []
   }
 
@@ -106,6 +180,27 @@ export class KBaseClient {
     return response.results || []
   }
 
+  async getBookPrompts(bookID: string): Promise<BookKnowledgePrompt[]> {
+    const response = await this.request<{ prompts: BookKnowledgePrompt[] }>(
+      `/api/books/${encodeURIComponent(bookID)}/prompts`,
+    )
+    return response.prompts || []
+  }
+
+  async chatWithBook(bookID: string, body: BookKnowledgeChatRequest): Promise<BookKnowledgeChatResponse> {
+    return this.request<BookKnowledgeChatResponse>(`/api/books/${encodeURIComponent(bookID)}/chat`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  }
+
+  async getBookChatHistory(bookID: string, limit = 50): Promise<BookKnowledgeChatHistoryItem[]> {
+    const response = await this.request<{ history: BookKnowledgeChatHistoryItem[] }>(
+      `/api/books/${encodeURIComponent(bookID)}/chat-history?limit=${encodeURIComponent(String(limit))}`,
+    )
+    return response.history || []
+  }
+
   async getSystemKBManifest(): Promise<Record<string, unknown>> {
     return this.request<Record<string, unknown>>('/api/system-kb/manifest')
   }
@@ -114,12 +209,19 @@ export class KBaseClient {
     return this.request<Record<string, unknown>>('/api/system-kb/export')
   }
 
-  private async request<T>(path: string): Promise<T> {
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const url = `${this.baseUrl || window.location.origin}${path}`
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      Accept: 'application/json',
+    }
+    if (init.body) {
+      headers['Content-Type'] = 'application/json'
+    }
     const response = await fetch(url, {
+      ...init,
       headers: {
-        Authorization: `Bearer ${this.token}`,
-        Accept: 'application/json',
+        ...headers,
       },
     })
     if (!response.ok) {
