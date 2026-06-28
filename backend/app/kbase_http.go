@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -15,12 +17,14 @@ type KBaseHTTPConfig struct {
 	Store              *BookKnowledgeStore
 	AuthToken          string
 	SystemKBExportPath string
+	StaticDir          string
 }
 
 type kbaseHTTPHandler struct {
 	store              *BookKnowledgeStore
 	authToken          string
 	systemKBExportPath string
+	staticDir          string
 }
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
@@ -32,6 +36,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		store:              store,
 		authToken:          strings.TrimSpace(cfg.AuthToken),
 		systemKBExportPath: strings.TrimSpace(cfg.SystemKBExportPath),
+		staticDir:          strings.TrimSpace(cfg.StaticDir),
 	}
 }
 
@@ -44,7 +49,7 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
-		writeHTTPError(w, http.StatusNotFound, "not found")
+		h.serveStatic(w, r)
 		return
 	}
 	if !h.authorize(w, r) {
@@ -69,6 +74,35 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (h *kbaseHTTPHandler) serveStatic(w http.ResponseWriter, r *http.Request) {
+	if h.staticDir == "" {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	cleanURLPath := path.Clean("/" + strings.TrimPrefix(r.URL.Path, "/"))
+	relativePath := strings.TrimPrefix(cleanURLPath, "/")
+	if relativePath == "" {
+		relativePath = "index.html"
+	}
+	candidate := filepath.Join(h.staticDir, filepath.FromSlash(relativePath))
+	if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+		http.ServeFile(w, r, candidate)
+		return
+	}
+
+	indexPath := filepath.Join(h.staticDir, "index.html")
+	if info, err := os.Stat(indexPath); err != nil || info.IsDir() {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	http.ServeFile(w, r, indexPath)
 }
 
 func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) bool {

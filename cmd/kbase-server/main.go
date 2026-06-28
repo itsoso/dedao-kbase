@@ -16,17 +16,22 @@ func main() {
 	root := flag.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")
 	exportPath := flag.String("system-kb-export", defaultSystemKBExportPath(), "system_kb_export.json path")
 	authToken := flag.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
+	webDir := flag.String("web-dir", defaultKBaseWebDir(), "web UI static asset directory")
 	flag.Parse()
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:              app.NewBookKnowledgeStore(*root),
 		AuthToken:          *authToken,
 		SystemKBExportPath: *exportPath,
+		StaticDir:          *webDir,
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
 	log.Printf("book knowledge root: %s", *root)
 	log.Printf("system kb export: %s", *exportPath)
+	if strings.TrimSpace(*webDir) != "" {
+		log.Printf("web UI dir: %s", *webDir)
+	}
 	if strings.TrimSpace(*authToken) == "" {
 		log.Printf("warning: KBASE_AUTH_TOKEN is empty; /api/* routes will reject requests")
 	}
@@ -54,4 +59,15 @@ func defaultSystemKBExportPath() string {
 		return filepath.Join(root, "artifacts", "system_kb_export.json")
 	}
 	return "/Users/liqiuhua/work/personal/down-dedao/artifacts/system_kb_export.json"
+}
+
+func defaultKBaseWebDir() string {
+	if value := strings.TrimSpace(os.Getenv("KBASE_WEB_DIR")); value != "" {
+		return value
+	}
+	candidate := filepath.Join("frontend-web", "dist")
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	return ""
 }

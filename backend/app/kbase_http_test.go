@@ -100,6 +100,60 @@ func TestKBaseHTTPHandlerServesSearchAndSystemKBExport(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
+	root := t.TempDir()
+	webDir := filepath.Join(root, "web")
+	assetDir := filepath.Join(webDir, "assets")
+	if err := os.MkdirAll(assetDir, os.ModePerm); err != nil {
+		t.Fatalf("MkdirAll returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "index.html"), []byte("<main id=\"app\">kbase web</main>"), 0o644); err != nil {
+		t.Fatalf("WriteFile index returned error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(assetDir, "app.js"), []byte("console.log('kbase')"), 0o644); err != nil {
+		t.Fatalf("WriteFile asset returned error: %v", err)
+	}
+
+	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		StaticDir: webDir,
+	})
+
+	indexResp := requestKBase(handler, http.MethodGet, "/", "")
+	if indexResp.Code != http.StatusOK {
+		t.Fatalf("index status = %d, body=%s", indexResp.Code, indexResp.Body.String())
+	}
+	if !strings.Contains(indexResp.Body.String(), "kbase web") {
+		t.Fatalf("index response missing app shell: %s", indexResp.Body.String())
+	}
+
+	assetResp := requestKBase(handler, http.MethodGet, "/assets/app.js", "")
+	if assetResp.Code != http.StatusOK {
+		t.Fatalf("asset status = %d, body=%s", assetResp.Code, assetResp.Body.String())
+	}
+	if !strings.Contains(assetResp.Body.String(), "console.log") {
+		t.Fatalf("asset response missing js: %s", assetResp.Body.String())
+	}
+
+	fallbackResp := requestKBase(handler, http.MethodGet, "/books/42", "")
+	if fallbackResp.Code != http.StatusOK {
+		t.Fatalf("fallback status = %d, body=%s", fallbackResp.Code, fallbackResp.Body.String())
+	}
+	if !strings.Contains(fallbackResp.Body.String(), "kbase web") {
+		t.Fatalf("fallback response missing index: %s", fallbackResp.Body.String())
+	}
+
+	apiResp := requestKBase(handler, http.MethodGet, "/api/books", "")
+	if apiResp.Code != http.StatusUnauthorized {
+		t.Fatalf("api status without token = %d, want 401", apiResp.Code)
+	}
+}
+
 func requestKBase(handler http.Handler, method, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, nil)
 	if token != "" {
