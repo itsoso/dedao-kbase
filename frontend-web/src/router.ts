@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import AccountProfile from './views/AccountProfile.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
 
@@ -86,14 +87,6 @@ const moduleRoutes = [
     desktopMethods: ['GetQrcode', 'CheckLogin'],
   },
   {
-    path: '/user/profile',
-    title: '个人中心',
-    scope: 'account_profile',
-    status: 'planned',
-    source: 'frontend/src/views/UserCenter.vue',
-    desktopMethods: ['UserInfo', 'EbookUserInfo', 'OdobUserInfo'],
-  },
-  {
     path: '/user/switch',
     title: '切换账号',
     scope: 'account_switch',
@@ -114,6 +107,17 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/BookKnowledge.vue',
       desktopMethods: ['BookKnowledgeListBooks', 'BookKnowledgeGetBook', 'BookKnowledgeSearch', 'BookKnowledgeChat'],
+    },
+  },
+  {
+    path: '/user/profile',
+    component: AccountProfile,
+    meta: {
+      title: '个人中心',
+      scope: 'account_profile',
+      status: 'online',
+      source: 'frontend/src/views/UserCenter.vue',
+      desktopMethods: ['UserInfo', 'EbookUserInfo', 'OdobUserInfo'],
     },
   },
   ...moduleRoutes.map((route) => ({

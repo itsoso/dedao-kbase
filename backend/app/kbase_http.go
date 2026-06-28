@@ -77,6 +77,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleGetJob(w, r)
+	case r.URL.Path == "/api/dedao/session":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoSession(w)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -359,6 +364,10 @@ func (h *kbaseHTTPHandler) handleGetJob(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+func (h *kbaseHTTPHandler) handleDedaoSession(w http.ResponseWriter) {
+	writeHTTPJSON(w, http.StatusOK, CurrentDedaoSession())
 }
 
 func parseKBasePagination(r *http.Request) (int, int) {

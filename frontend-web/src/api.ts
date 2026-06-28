@@ -144,6 +144,18 @@ export interface BrowserSession {
   token?: string
 }
 
+export interface DedaoSessionUser {
+  uid_hazy?: string
+  name?: string
+  avatar?: string
+}
+
+export interface DedaoSession {
+  logged_in: boolean
+  active_user?: DedaoSessionUser
+  user_count: number
+}
+
 export const getBrowserSession = async (): Promise<BrowserSession | null> => {
   const response = await fetch('/browser/session-token', {
     credentials: 'same-origin',
@@ -240,6 +252,10 @@ export class KBaseClient {
   async getJob(jobID: string): Promise<BookKnowledgeJob> {
     const response = await this.request<{ job: BookKnowledgeJob }>(`/api/jobs/${encodeURIComponent(jobID)}`)
     return response.job
+  }
+
+  async getDedaoSession(): Promise<DedaoSession> {
+    return this.request<DedaoSession>('/api/dedao/session')
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {

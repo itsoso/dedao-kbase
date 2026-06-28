@@ -280,6 +280,30 @@ func TestKBaseHTTPHandlerServesJobs(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoSession(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(t.TempDir()),
+		AuthToken: "secret-token",
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/session", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("session without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/session", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("session status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	if !strings.Contains(body, `"logged_in"`) || !strings.Contains(body, `"user_count"`) {
+		t.Fatalf("session response missing safe status fields: %s", body)
+	}
+	if strings.Contains(strings.ToLower(body), "cookie") {
+		t.Fatalf("session response must not expose cookies: %s", body)
+	}
+}
+
 func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	root := t.TempDir()
 	webDir := filepath.Join(root, "web")
