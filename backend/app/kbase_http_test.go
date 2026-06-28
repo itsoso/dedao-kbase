@@ -382,6 +382,66 @@ func TestKBaseHTTPHandlerServesDedaoAuth(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoEbooks(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		ebooks: DedaoEbookPage{
+			Ebooks: []DedaoEbook{
+				{
+					ID:         67929,
+					Enid:       "ebook-enid",
+					Title:      "强化学习教程",
+					Author:     "王琦",
+					Intro:      "适合系统学习强化学习的电子书。",
+					Icon:       "https://example.test/cover.jpg",
+					Price:      "99.00",
+					Progress:   42,
+					PublishNum: 18,
+					LastRead:   "第 3 章",
+				},
+			},
+			Page:       2,
+			PageSize:   1,
+			Total:      3,
+			TotalPages: 3,
+			IsMore:     1,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/ebooks", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("ebooks without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/ebooks?page=2&page_size=1&q=强化学习", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("ebooks status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotPage != 2 || content.gotPageSize != 1 || content.gotQuery != "强化学习" {
+		t.Fatalf("ebooks request args = page %d pageSize %d query %q", content.gotPage, content.gotPageSize, content.gotQuery)
+	}
+	var payload DedaoEbookPage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Page != 2 || payload.PageSize != 1 || payload.Total != 3 || payload.TotalPages != 3 || payload.IsMore != 1 {
+		t.Fatalf("ebooks pagination = %#v", payload)
+	}
+	if len(payload.Ebooks) != 1 || payload.Ebooks[0].Title != "强化学习教程" || payload.Ebooks[0].Enid != "ebook-enid" {
+		t.Fatalf("ebooks payload = %#v", payload.Ebooks)
+	}
+	body := strings.ToLower(resp.Body.String())
+	for _, forbidden := range []string{"cookie", "drm_token"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("ebooks response must not expose %s: %s", forbidden, resp.Body.String())
+		}
+	}
+}
+
 func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	root := t.TempDir()
 	webDir := filepath.Join(root, "web")
@@ -574,6 +634,20 @@ func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (D
 	f.gotToken = token
 	f.gotQRCodeString = qrCodeString
 	return f.check, nil
+}
+
+type fakeDedaoContentProvider struct {
+	ebooks      DedaoEbookPage
+	gotQuery    string
+	gotPage     int
+	gotPageSize int
+}
+
+func (f *fakeDedaoContentProvider) ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error) {
+	f.gotQuery = query
+	f.gotPage = page
+	f.gotPageSize = pageSize
+	return f.ebooks, nil
 }
 
 func newTestKBaseHandlerWithSystemKB(t *testing.T, root string) http.Handler {

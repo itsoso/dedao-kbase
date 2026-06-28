@@ -169,6 +169,28 @@ export interface DedaoLoginCheck {
   session: DedaoSession
 }
 
+export interface DedaoEbook {
+  enid: string
+  id: number
+  title: string
+  author?: string
+  intro?: string
+  icon?: string
+  price?: string
+  progress: number
+  publish_num?: number
+  last_read?: string
+}
+
+export interface DedaoEbookPage {
+  ebooks: DedaoEbook[]
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+  is_more: number
+}
+
 export const getBrowserSession = async (): Promise<BrowserSession | null> => {
   const response = await fetch('/browser/session-token', {
     credentials: 'same-origin',
@@ -285,6 +307,17 @@ export class KBaseClient {
         qr_code_string: qrCodeString,
       }),
     })
+  }
+
+  async listDedaoEbooks(page = 1, pageSize = 15, query = ''): Promise<DedaoEbookPage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+    ]
+    if (query.trim()) {
+      params.push(`q=${encodeURIComponent(query.trim())}`)
+    }
+    return this.request<DedaoEbookPage>(`/api/dedao/ebooks?${params.join('&')}`)
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {

@@ -20,6 +20,7 @@ type KBaseHTTPConfig struct {
 	SystemKBExportPath string
 	StaticDir          string
 	DedaoAuth          DedaoAuthProvider
+	DedaoContent       DedaoContentProvider
 }
 
 type kbaseHTTPHandler struct {
@@ -28,6 +29,7 @@ type kbaseHTTPHandler struct {
 	systemKBExportPath string
 	staticDir          string
 	dedaoAuth          DedaoAuthProvider
+	dedaoContent       DedaoContentProvider
 }
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
@@ -41,6 +43,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		systemKBExportPath: strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:          strings.TrimSpace(cfg.StaticDir),
 		dedaoAuth:          defaultDedaoAuthProvider(cfg.DedaoAuth),
+		dedaoContent:       defaultDedaoContentProvider(cfg.DedaoContent),
 	}
 }
 
@@ -95,6 +98,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoAuthCheck(w, r)
+	case r.URL.Path == "/api/dedao/ebooks":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoEbooks(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -411,6 +419,16 @@ func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.R
 		return
 	}
 	setHTTPNoStore(w)
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbooks(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parseKBasePagination(r)
+	result, err := h.dedaoContent.ListEbooks(r.URL.Query().Get("q"), page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 

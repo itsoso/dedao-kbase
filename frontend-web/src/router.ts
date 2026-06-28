@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import AccountLogin from './views/AccountLogin.vue'
 import AccountProfile from './views/AccountProfile.vue'
+import EbookLibrary from './views/EbookLibrary.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
 
@@ -46,14 +47,6 @@ const moduleRoutes = [
     status: 'planned',
     source: 'frontend/src/views/Odob.vue',
     desktopMethods: ['CourseList', 'OdobDownload', 'OdobUserInfo'],
-  },
-  {
-    path: '/ebook',
-    title: '电子书架',
-    scope: 'ebook_browser',
-    status: 'planned',
-    source: 'frontend/src/views/Ebook.vue',
-    desktopMethods: ['CourseList', 'EbookInfo', 'EbookCommentList', 'EbookDownload', 'EbookDownloadAndSyncWiki'],
   },
   {
     path: '/knowledge',
@@ -122,6 +115,17 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/UserCenter.vue',
       desktopMethods: ['UserInfo', 'EbookUserInfo', 'OdobUserInfo'],
+    },
+  },
+  {
+    path: '/ebook',
+    component: EbookLibrary,
+    meta: {
+      title: '电子书架',
+      scope: 'ebook_browser',
+      status: 'online',
+      source: 'frontend/src/views/Ebook.vue',
+      desktopMethods: ['CourseList', 'EbookInfo', 'EbookCommentList', 'EbookDownload', 'EbookDownloadAndSyncWiki'],
     },
   },
   ...moduleRoutes.map((route) => ({
