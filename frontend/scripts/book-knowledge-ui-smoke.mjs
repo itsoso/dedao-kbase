@@ -15,8 +15,8 @@ for (const hook of [
   'history-panel',
   'history-list',
   'answer-report',
-  'prompt-studio',
-  'prompt-card',
+  'prompt-picker',
+  'prompt-select',
   'notebooklm-panel',
   'notebooklm-actions',
 ]) {
@@ -31,9 +31,13 @@ assert.ok(source.includes('BookKnowledgeNotebookLMSaveLink'), 'BookKnowledge.vue
 assert.ok(source.includes('BrowserOpenURL'), 'BookKnowledge.vue should open NotebookLM in the browser')
 assert.ok(source.includes('copyNotebookLMUploadGuide'), 'BookKnowledge.vue should copy NotebookLM upload guide')
 assert.ok(source.includes('复制上传指南'), 'BookKnowledge.vue should expose an upload-guide copy action')
-assert.ok(source.includes('insertPrompt'), 'BookKnowledge.vue should insert prompts into the chat composer')
-assert.ok(source.includes('runPrompt'), 'BookKnowledge.vue should run selected prompts immediately')
-assert.ok(source.includes('promptCategory'), 'BookKnowledge.vue should filter prompts by category')
+assert.ok(source.includes("const activeTab = ref('chat')"), 'BookKnowledge.vue should open the chat tab by default')
+assert.ok(source.includes('selectedPromptID'), 'BookKnowledge.vue should track the selected prompt template')
+assert.ok(source.includes('promptGroups'), 'BookKnowledge.vue should group prompt templates in a dropdown')
+assert.ok(source.includes('applySelectedPrompt'), 'BookKnowledge.vue should insert selected prompt templates into the composer')
+assert.ok(source.includes('runSelectedPrompt'), 'BookKnowledge.vue should run selected prompt templates immediately')
+assert.ok(!source.includes('<el-tab-pane label="Prompt模板"'), 'BookKnowledge.vue should not expose prompt templates as a separate tab')
+assert.ok(!source.includes('prompt-card'), 'BookKnowledge.vue should not render prompt templates as cards')
 assert.ok(source.includes("const chatModel = ref('qwen3.7-max')"), 'BookKnowledge.vue should default to Qwen3.7 Max')
 assert.ok(source.includes('chatLoadingByBookID'), 'BookKnowledge.vue should track chat loading by book id')
 assert.ok(source.includes('currentBookChatLoading'), 'BookKnowledge.vue should expose current book loading state')
