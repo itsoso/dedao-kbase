@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 )
 
 const bookChatHistoryDBName = "book_chat_history.sqlite3"
+const bookChatHistoryJSONLName = "book_chat_history.jsonl"
 
 type BookKnowledgeChatHistoryItem struct {
 	ID           string                        `json:"id"`
@@ -31,6 +34,10 @@ type BookKnowledgeChatHistoryItem struct {
 
 func (s *BookKnowledgeStore) ChatHistoryDBPath() string {
 	return filepath.Join(s.root, bookChatHistoryDBName)
+}
+
+func (s *BookKnowledgeStore) ChatHistoryJSONLPath() string {
+	return filepath.Join(s.root, bookChatHistoryJSONLName)
 }
 
 func (s *BookKnowledgeStore) SaveChatHistory(item BookKnowledgeChatHistoryItem) (BookKnowledgeChatHistoryItem, error) {
@@ -67,6 +74,9 @@ func (s *BookKnowledgeStore) SaveChatHistory(item BookKnowledgeChatHistoryItem) 
 
 	db, err := s.openChatHistoryDB()
 	if err != nil {
+		if isSQLiteCGOStubError(err) {
+			return s.saveChatHistoryJSONL(item)
+		}
 		return item, err
 	}
 	defer db.Close()
@@ -77,6 +87,9 @@ func (s *BookKnowledgeStore) SaveChatHistory(item BookKnowledgeChatHistoryItem) 
 			sources_json, context_stats_json, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, item.ID, item.BookID, item.BookTitle, item.Mode, item.Question, item.Model, item.Answer, string(sourcesJSON), string(statsJSON), item.CreatedAt)
+	if isSQLiteCGOStubError(err) {
+		return s.saveChatHistoryJSONL(item)
+	}
 	return item, err
 }
 
@@ -93,6 +106,9 @@ func (s *BookKnowledgeStore) ListChatHistory(bookID string, limit int) ([]BookKn
 	}
 	db, err := s.openChatHistoryDB()
 	if err != nil {
+		if isSQLiteCGOStubError(err) {
+			return s.listChatHistoryJSONL(bookID, limit)
+		}
 		return nil, err
 	}
 	defer db.Close()
@@ -120,6 +136,62 @@ func (s *BookKnowledgeStore) ListChatHistory(bookID string, limit int) ([]BookKn
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	return items, nil
+}
+
+func (s *BookKnowledgeStore) saveChatHistoryJSONL(item BookKnowledgeChatHistoryItem) (BookKnowledgeChatHistoryItem, error) {
+	if err := os.MkdirAll(s.root, os.ModePerm); err != nil {
+		return item, err
+	}
+	file, err := os.OpenFile(s.ChatHistoryJSONLPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return item, err
+	}
+	defer file.Close()
+	if err := json.NewEncoder(file).Encode(item); err != nil {
+		return item, err
+	}
+	return item, nil
+}
+
+func (s *BookKnowledgeStore) listChatHistoryJSONL(bookID string, limit int) ([]BookKnowledgeChatHistoryItem, error) {
+	file, err := os.Open(s.ChatHistoryJSONLPath())
+	if os.IsNotExist(err) {
+		return []BookKnowledgeChatHistoryItem{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	items := make([]BookKnowledgeChatHistoryItem, 0)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var item BookKnowledgeChatHistoryItem
+		if err := json.Unmarshal([]byte(line), &item); err != nil {
+			return nil, err
+		}
+		if item.BookID == bookID {
+			items = append(items, item)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].CreatedAt != items[j].CreatedAt {
+			return items[i].CreatedAt > items[j].CreatedAt
+		}
+		return items[i].ID > items[j].ID
+	})
+	if len(items) > limit {
+		items = items[:limit]
 	}
 	return items, nil
 }
@@ -198,6 +270,10 @@ func migrateBookChatHistoryDB(db *sql.DB) error {
 			ON book_chat_history(book_id, created_at DESC);
 	`)
 	return err
+}
+
+func isSQLiteCGOStubError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "go-sqlite3 requires cgo")
 }
 
 func newBookChatHistoryID() string {
