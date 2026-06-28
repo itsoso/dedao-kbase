@@ -93,7 +93,7 @@ KBASE_WEB_DIR="$PWD/frontend-web/dist" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
-打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。
+打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。
 
 #### kbase Agent Skills
 

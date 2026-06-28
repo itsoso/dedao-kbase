@@ -145,6 +145,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import {
+  getBrowserSession,
   KBaseClient,
   type BookKnowledgeBook,
   type BookKnowledgePackage,
@@ -183,8 +184,9 @@ const formattedSystemKB = computed(() => {
   return systemKBPayload.value ? JSON.stringify(systemKBPayload.value, null, 2) : 'No System KB payload loaded'
 })
 
-onMounted(() => {
+onMounted(async () => {
   restoreConnection()
+  await hydrateBrowserSession()
   if (token.value) {
     loadBooks()
   }
@@ -206,6 +208,19 @@ const restoreConnection = () => {
 
 const saveConnection = () => {
   localStorage.setItem(storageKey, JSON.stringify({ baseUrl: baseUrl.value, token: token.value }))
+}
+
+const hydrateBrowserSession = async () => {
+  try {
+    const session = await getBrowserSession()
+    if (session?.token) {
+      token.value = session.token
+      baseUrl.value = window.location.origin
+      saveConnection()
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  }
 }
 
 const connectAndRefresh = async () => {

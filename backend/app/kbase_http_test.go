@@ -155,6 +155,38 @@ func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesBrowserSessionTokenOnlyFromTrustedProxy(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(t.TempDir()),
+		AuthToken: "secret-token",
+	})
+
+	directResp := requestKBase(handler, http.MethodGet, "/browser/session-token", "")
+	if directResp.Code != http.StatusNotFound {
+		t.Fatalf("direct browser token status = %d, want 404", directResp.Code)
+	}
+
+	proxyResp := requestKBaseWithHeaders(handler, http.MethodGet, "/browser/session-token", "", "", map[string]string{
+		"X-KBase-Browser-Session": "1",
+	})
+	if proxyResp.Code != http.StatusOK {
+		t.Fatalf("proxy browser token status = %d, body=%s", proxyResp.Code, proxyResp.Body.String())
+	}
+	if !strings.Contains(proxyResp.Body.String(), `"token":"secret-token"`) {
+		t.Fatalf("browser token response missing token: %s", proxyResp.Body.String())
+	}
+	if cacheControl := proxyResp.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "no-store") {
+		t.Fatalf("Cache-Control = %q, want no-store", cacheControl)
+	}
+
+	postResp := requestKBaseWithHeaders(handler, http.MethodPost, "/browser/session-token", "", "", map[string]string{
+		"X-KBase-Browser-Session": "1",
+	})
+	if postResp.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("browser token POST status = %d, want 405", postResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesSkillDiscoveryWithoutBearer(t *testing.T) {
 	root := t.TempDir()
 	handler := newTestKBaseHandlerWithSystemKB(t, root)
@@ -287,12 +319,19 @@ func requestKBase(handler http.Handler, method, path, token string) *httptest.Re
 }
 
 func requestKBaseJSON(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+	return requestKBaseWithHeaders(handler, method, path, token, body, nil)
+}
+
+func requestKBaseWithHeaders(handler http.Handler, method, path, token, body string, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)

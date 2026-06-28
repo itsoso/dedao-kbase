@@ -26,6 +26,7 @@ for (const surface of [
   'token',
   'listBooks',
   'getBook',
+  'getBrowserSession',
   'searchKnowledge',
   'getSystemKBManifest',
   'getSystemKBExport',
@@ -41,6 +42,8 @@ assert.ok(appSource.includes('Chunks'), 'App.vue should expose chunk details')
 assert.ok(appSource.includes('System KB'), 'App.vue should expose system KB details')
 
 assert.ok(apiSource.includes('class KBaseClient'), 'api.ts should define KBaseClient')
+assert.ok(apiSource.includes('/browser/session-token'), 'api.ts should request the browser session token endpoint')
+assert.ok(apiSource.includes("credentials: 'same-origin'"), 'api.ts should include browser credentials for the session token endpoint')
 assert.ok(/Authorization['"]?\s*:\s*`Bearer \$\{this\.token\}`/.test(apiSource), 'api.ts should attach Bearer token')
 assert.ok(apiSource.includes('HTTP ${response.status}'), 'api.ts should include status in failed request errors')
 assert.ok(apiSource.includes('await response.text()'), 'api.ts should include response body in failed request errors')

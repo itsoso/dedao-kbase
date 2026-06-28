@@ -57,6 +57,28 @@ export interface BookKnowledgeSearchResult {
   score: number
 }
 
+export interface BrowserSession {
+  token?: string
+}
+
+export const getBrowserSession = async (): Promise<BrowserSession | null> => {
+  const response = await fetch('/browser/session-token', {
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: {
+      Accept: 'application/json',
+    },
+  })
+  if (response.status === 401 || response.status === 404) {
+    return null
+  }
+  if (!response.ok) {
+    const body = await response.text()
+    throw new Error(`HTTP ${response.status}: ${body || response.statusText}`)
+  }
+  return response.json() as Promise<BrowserSession>
+}
+
 export class KBaseClient {
   private baseUrl: string
   private token: string

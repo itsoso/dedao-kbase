@@ -48,6 +48,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.URL.Path == "/browser/session-token" {
+		h.handleBrowserSessionToken(w, r)
+		return
+	}
 	if r.URL.Path == "/.well-known/dedao-kbase-skills.json" {
 		h.handleSkillsDiscovery(w, r)
 		return
@@ -111,6 +115,22 @@ func (h *kbaseHTTPHandler) serveStatic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, indexPath)
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session")) != "1" || h.authToken == "" {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"token": h.authToken,
+	})
 }
 
 func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) bool {
