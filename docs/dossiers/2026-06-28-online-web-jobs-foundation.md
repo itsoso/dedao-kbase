@@ -1,7 +1,7 @@
 ---
 slug: 2026-06-28-online-web-jobs-foundation
-status: in_progress
-current_stage: S5
+status: shipped
+current_stage: S6
 last-reviewed: 2026-06-28
 ---
 
@@ -38,8 +38,8 @@ last-reviewed: 2026-06-28
 | G2 可行性 | PASS | 复用现有 `BookKnowledgeStore`、NotebookLM export 和 book export;不触碰 Dedao cookie 和下载长任务 |
 | G3 测试 | PASS | `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1`; `CGO_ENABLED=0 go test ./backend/app -run 'TestKBaseHTTPHandlerServesJobs' -count=1`; `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `cd frontend-web && npm run build`; `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/dedao-kbase-web/kbase-server-linux-amd64 ./cmd/kbase-server`; `git diff --check` |
 | G4 评审 | PASS | Job mutation remains under Bearer-protected `/api/*`; browser receives only existing session token via Basic Auth-gated `/browser/session-token`; TokenPlan and service secrets stay server-side |
-| G5 部署健康 | 待跑 | deploy 后 `/health` 和 job smoke |
-| G6 上线验证 | 待跑 | production create/list/get job |
+| G5 部署健康 | PASS | Deployed `/tmp/dedao-kbase-web/kbase-server-linux-amd64` to `/opt/dedao-kbase/bin/kbase-server`; synced `frontend-web/dist`; `nginx -t`; `systemctl restart dedao-kbase.service`; service active; `https://kbase.executor.life/health` returned 200 |
+| G6 上线验证 | PASS | Browser root without Basic Auth returned 401; unauthenticated `/api/jobs?limit=1` returned 401; Bearer production job check created `notebooklm_export` for book `67929` and returned `status:succeeded`, list status `succeeded` |
 
 ## Data Flow
 
