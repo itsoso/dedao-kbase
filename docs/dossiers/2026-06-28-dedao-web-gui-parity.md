@@ -1,7 +1,7 @@
 ---
 slug: 2026-06-28-dedao-web-gui-parity
-status: definition
-current_stage: S3
+status: shipped
+current_stage: S8
 last-reviewed: 2026-06-28
 ---
 
@@ -41,10 +41,10 @@ The desktop GUI baseline is `frontend/src/router/index.ts`:
 |---|---|---|
 | G1 准入 | PASS | User explicitly requested Web planning based on desktop GUI parity and then implementation |
 | G2 可行性 | PASS | Desktop GUI route map and Wails bindings inspected; current `cmd/kbase-server` already serves static Web and Bearer API; Phase 1 scoped to shell/router/navigation only |
-| G3 测试 | pending | Phase 1 must pass Web smoke, frontend build, browser nav check, and `git diff --check` |
-| G4 评审 | pending | Phase 1 must preserve Basic Auth/Bearer boundaries and avoid new unauthenticated data APIs |
-| G5 部署健康 | pending | Deploy static `frontend-web/dist`, verify `/health` and service active |
-| G6 上线验证 | pending | Verify online page includes desktop-parity nav and root remains Basic Auth protected |
+| G3 测试 | PASS | Red: `node frontend-web/scripts/web-kbase-ui-smoke.mjs` failed on missing `router.ts`; Green: `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `cd frontend-web && npm run build`; Chrome/Playwright verified `/book-knowledge`, `/course`, 9 shell nav items, and no mobile horizontal overflow; `git diff --check` |
+| G4 评审 | PASS | Phase 1 changed only Web static shell/router and npm dependency; no new backend routes; `/api/*` and Basic Auth boundaries unchanged |
+| G5 部署健康 | PASS | Synced `frontend-web/dist` to `/var/www/kbase.executor.life`; normalized static file permissions; `https://kbase.executor.life/health` returned 200; `dedao-kbase.service` active |
+| G6 上线验证 | PASS | Unauthenticated `/` and `/course` both returned 401; deployed assets contain `dedao-web-shell` CSS and `book-knowledge` route JS |
 
 ## Documents
 
@@ -53,4 +53,4 @@ The desktop GUI baseline is `frontend/src/router/index.ts`:
 
 ## Current Decision
 
-Start with Phase 1: upgrade `frontend-web` into a Web shell with Vue Router and desktop-equivalent top-level navigation, keeping the current KBase workbench as `/book-knowledge`.
+Phase 1 shipped: `frontend-web` now has Vue Router, desktop-equivalent Web shell navigation, module landing routes, and the current KBase workbench mounted at `/book-knowledge`.
