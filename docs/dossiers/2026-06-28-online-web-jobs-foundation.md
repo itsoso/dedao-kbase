@@ -36,8 +36,8 @@ last-reviewed: 2026-06-28
 |---|---|---|
 | G1 准入 | PASS | 用户要求执行在线 Web 产品规划;第一批切片选择在线化基础 Job 系统 |
 | G2 可行性 | PASS | 复用现有 `BookKnowledgeStore`、NotebookLM export 和 book export;不触碰 Dedao cookie 和下载长任务 |
-| G3 测试 | 待跑 | 后端 HTTP tests、Web smoke、frontend build、linux build |
-| G4 评审 | 待跑 | 新增 Bearer-protected job mutation;需确认不泄露 secret/cookie |
+| G3 测试 | PASS | `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1`; `CGO_ENABLED=0 go test ./backend/app -run 'TestKBaseHTTPHandlerServesJobs' -count=1`; `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `cd frontend-web && npm run build`; `GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/dedao-kbase-web/kbase-server-linux-amd64 ./cmd/kbase-server`; `git diff --check` |
+| G4 评审 | PASS | Job mutation remains under Bearer-protected `/api/*`; browser receives only existing session token via Basic Auth-gated `/browser/session-token`; TokenPlan and service secrets stay server-side |
 | G5 部署健康 | 待跑 | deploy 后 `/health` 和 job smoke |
 | G6 上线验证 | 待跑 | production create/list/get job |
 

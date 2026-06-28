@@ -18,6 +18,7 @@ for (const hook of [
   'library-search-panel',
   'chat-panel',
   'detail-panel',
+  'jobs-panel',
   'system-kb-panel',
   'model-select',
   'column-resizer',
@@ -40,6 +41,10 @@ for (const surface of [
   'getBookPrompts',
   'chatWithBook',
   'getBookChatHistory',
+  'listJobs',
+  'createJob',
+  'getJob',
+  'jobType',
   'getSystemKBManifest',
   'getSystemKBExport',
 ]) {
@@ -52,6 +57,7 @@ assert.ok(appSource.includes('Chapters'), 'App.vue should expose chapter details
 assert.ok(appSource.includes('Claims'), 'App.vue should expose claim details')
 assert.ok(appSource.includes('Chunks'), 'App.vue should expose chunk details')
 assert.ok(appSource.includes('System KB'), 'App.vue should expose system KB details')
+assert.ok(appSource.includes('Jobs'), 'App.vue should expose jobs details')
 assert.ok(appSource.includes('chatHistory'), 'App.vue should expose chat history')
 assert.ok(appSource.includes('promptTemplates'), 'App.vue should expose prompt templates')
 assert.ok(appSource.includes('layoutColumns'), 'App.vue should persist draggable column widths')
@@ -66,6 +72,8 @@ assert.ok(apiSource.includes('BookKnowledgeBooksPage'), 'api.ts should type pagi
 assert.ok(apiSource.includes('BookKnowledgePrompt'), 'api.ts should type prompt templates')
 assert.ok(apiSource.includes('BookKnowledgeChatResponse'), 'api.ts should type chat responses')
 assert.ok(apiSource.includes('BookKnowledgeChatHistoryItem'), 'api.ts should type chat history')
+assert.ok(apiSource.includes('BookKnowledgeJob'), 'api.ts should type online jobs')
+assert.ok(apiSource.includes('/api/jobs'), 'api.ts should call jobs endpoints')
 assert.ok(apiSource.includes("credentials: 'same-origin'"), 'api.ts should include browser credentials for the session token endpoint')
 assert.ok(/Authorization['"]?\s*:\s*`Bearer \$\{this\.token\}`/.test(apiSource), 'api.ts should attach Bearer token')
 assert.ok(apiSource.includes('HTTP ${response.status}'), 'api.ts should include status in failed request errors')

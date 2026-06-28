@@ -235,6 +235,36 @@
           </article>
         </div>
 
+        <div v-else-if="activeTab === 'Jobs'" class="jobs-panel">
+          <div class="job-create-row">
+            <select v-model="jobType" :disabled="jobsLoading">
+              <option v-for="action in jobActions" :key="action.value" :value="action.value">
+                {{ action.label }}
+              </option>
+            </select>
+            <button type="button" class="primary-action" :disabled="!selectedBookID || jobsLoading" @click="createSelectedBookJob">
+              {{ jobsLoading ? 'Running' : 'Create Job' }}
+            </button>
+          </div>
+          <p class="job-helper">
+            {{ selectedJobAction?.description || '为当前书籍创建线上处理任务' }}
+          </p>
+          <p v-if="jobError" class="job-error">{{ jobError }}</p>
+          <div class="job-list">
+            <article v-for="job in jobs" :key="job.id" class="job-row" :class="job.status">
+              <div class="result-meta">
+                <span>{{ job.type }}</span>
+                <span>{{ jobStatusLabel(job.status) }}</span>
+              </div>
+              <strong>{{ job.book_id || 'system' }}{{ job.target ? ` · ${job.target}` : '' }}</strong>
+              <p>{{ formatJobTime(job.updated_at || job.created_at) }}</p>
+              <p v-if="job.error" class="job-error">{{ job.error }}</p>
+              <pre v-if="job.result" class="job-result">{{ jobResultSummary(job) }}</pre>
+            </article>
+            <div v-if="!jobs.length" class="empty-state compact">No jobs</div>
+          </div>
+        </div>
+
         <div v-else class="system-kb-panel">
           <div class="system-actions">
             <button type="button" @click="loadSystemKBManifest">Manifest</button>
@@ -255,6 +285,8 @@ import {
   type BookKnowledgeBook,
   type BookKnowledgeChatHistoryItem,
   type BookKnowledgeChatResponse,
+  type BookKnowledgeJob,
+  type BookKnowledgeJobRequest,
   type BookKnowledgePackage,
   type BookKnowledgePrompt,
   type BookKnowledgeSearchResult,
@@ -263,7 +295,7 @@ import { renderMarkdown } from './utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
 const layoutStorageKey = 'dedao-kbase-web-layout'
-const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'System KB']
+const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'Jobs', 'System KB']
 const chatModes = [
   { value: 'chat', label: '问答' },
   { value: 'summary', label: '总结' },
@@ -276,6 +308,14 @@ const chatModelOptions = [
   { value: 'MiniMax-M2.5', label: 'MiniMax-M2.5' },
   { value: 'qwen-max', label: 'Qwen-Max' },
   { value: 'deepseek-v3', label: 'DeepSeek-V3' },
+]
+
+type JobActionValue = 'notebooklm_export' | 'health_system_kb_v2' | 'quant_rule_cards'
+
+const jobActions: Array<{ value: JobActionValue; label: string; description: string }> = [
+  { value: 'notebooklm_export', label: 'NotebookLM', description: '导出当前书籍的 NotebookLM 学习资料包' },
+  { value: 'health_system_kb_v2', label: 'Health KB', description: '生成 health_system_kb_v2 draft 供下游审核' },
+  { value: 'quant_rule_cards', label: 'Quant Rules', description: '生成 paper-only 量化规则卡 draft' },
 ]
 
 const baseUrl = ref(window.location.origin)
@@ -304,6 +344,10 @@ const selectedChatModel = ref('qwen3.7-max')
 const chatLoading = ref(false)
 const chatResponse = ref<BookKnowledgeChatResponse | null>(null)
 const chatHistory = ref<BookKnowledgeChatHistoryItem[]>([])
+const jobType = ref<JobActionValue>('notebooklm_export')
+const jobs = ref<BookKnowledgeJob[]>([])
+const jobsLoading = ref(false)
+const jobError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 340, right: 320 })
 const activeResizeTarget = ref<'left' | 'right' | null>(null)
@@ -323,12 +367,17 @@ const renderedChatAnswer = computed(() => {
   return renderMarkdown(chatResponse.value?.answer || '')
 })
 
+const selectedJobAction = computed(() => {
+  return jobActions.find((action) => action.value === jobType.value)
+})
+
 onMounted(async () => {
   restoreConnection()
   restoreLayoutColumns()
   await hydrateBrowserSession()
   if (token.value) {
-    loadBooks()
+    await loadBooks()
+    await loadJobs()
   }
 })
 
@@ -390,6 +439,7 @@ const hydrateBrowserSession = async () => {
 const connectAndRefresh = async () => {
   saveConnection()
   await loadBooks()
+  await loadJobs()
 }
 
 const withRequest = async (operation: () => Promise<void>) => {
@@ -485,6 +535,97 @@ const loadChatHistory = async () => {
     return
   }
   chatHistory.value = await client.value.getBookChatHistory(selectedBookID.value, 20)
+}
+
+const loadJobs = async () => {
+  if (!token.value) {
+    jobs.value = []
+    return
+  }
+  jobsLoading.value = true
+  jobError.value = ''
+  try {
+    jobs.value = await client.value.listJobs(30)
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    jobError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    jobsLoading.value = false
+  }
+}
+
+const createSelectedBookJob = async () => {
+  if (!selectedBookID.value || jobsLoading.value) {
+    return
+  }
+  jobsLoading.value = true
+  jobError.value = ''
+  errorMessage.value = ''
+  try {
+    const job = await client.value.createJob(buildJobRequest())
+    upsertJob(job)
+    activeTab.value = 'Jobs'
+    const finalJob = await waitForJob(job.id)
+    if (finalJob?.status === 'failed') {
+      jobError.value = finalJob.error || 'Job failed'
+    }
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    jobError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    jobsLoading.value = false
+  }
+}
+
+const buildJobRequest = (): BookKnowledgeJobRequest => {
+  if (jobType.value === 'notebooklm_export') {
+    return { type: 'notebooklm_export', book_id: selectedBookID.value }
+  }
+  return { type: 'book_export', book_id: selectedBookID.value, target: jobType.value }
+}
+
+const waitForJob = async (jobID: string): Promise<BookKnowledgeJob | null> => {
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    await sleep(650)
+    const job = await client.value.getJob(jobID)
+    upsertJob(job)
+    if (job.status === 'succeeded' || job.status === 'failed') {
+      return job
+    }
+  }
+  return null
+}
+
+const upsertJob = (job: BookKnowledgeJob) => {
+  jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
+}
+
+const sleep = (ms: number) => {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+const jobStatusLabel = (status: string) => {
+  const labels: Record<string, string> = {
+    queued: 'Queued',
+    running: 'Running',
+    succeeded: 'Succeeded',
+    failed: 'Failed',
+  }
+  return labels[status] || status
+}
+
+const jobResultSummary = (job: BookKnowledgeJob) => {
+  return job.result ? JSON.stringify(job.result, null, 2) : ''
+}
+
+const formatJobTime = (value?: string) => {
+  if (!value) {
+    return ''
+  }
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
 const setChatMode = (mode: string) => {

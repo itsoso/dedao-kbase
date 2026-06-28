@@ -21,11 +21,11 @@ Downloaded ebook HTML
   -> exports for health KB, quant rule cards, and NotebookLM bridge packages
 ```
 
-The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/backend/App.*` bindings. The private kbase server is HTTP-native and exposes Bearer-protected book, search, System KB, prompt, chat, and chat-history endpoints under `/api/*`.
+The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/backend/App.*` bindings. The private kbase server is HTTP-native and exposes Bearer-protected book, search, System KB, prompt, chat, chat-history, and job endpoints under `/api/*`.
 
 ## Web KBase Expansion Point
 
-The web UI does not reuse the Wails runtime. It is an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore`, prompt generator, TokenPlan chat layer, chat history store, and System KB export files. TokenPlan secrets remain server-side in environment configuration. Chat history uses SQLite when cgo is available and a JSONL file fallback for cross-compiled `CGO_ENABLED=0` server builds.
+The web UI does not reuse the Wails runtime. It is an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore`, prompt generator, TokenPlan chat layer, chat history store, job store, and System KB export files. TokenPlan secrets remain server-side in environment configuration. Chat history uses SQLite when cgo is available and a JSONL file fallback for cross-compiled `CGO_ENABLED=0` server builds. Online export jobs are recorded in `jobs.json` so Linux cross-compiled deployments can create NotebookLM, health KB, and quant rule-card exports without SQLite.
 
 ## Agent Skills Expansion Point
 

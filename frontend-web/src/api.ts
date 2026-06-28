@@ -119,6 +119,27 @@ export interface BookKnowledgeChatRequest {
   max_context_chars?: number
 }
 
+export interface BookKnowledgeJob {
+  id: string
+  type: string
+  status: 'queued' | 'running' | 'succeeded' | 'failed'
+  book_id?: string
+  target?: string
+  result?: Record<string, unknown>
+  error?: string
+  logs?: string[]
+  created_at: string
+  updated_at: string
+  started_at?: string
+  finished_at?: string
+}
+
+export interface BookKnowledgeJobRequest {
+  type: string
+  book_id?: string
+  target?: string
+}
+
 export interface BrowserSession {
   token?: string
 }
@@ -199,6 +220,26 @@ export class KBaseClient {
       `/api/books/${encodeURIComponent(bookID)}/chat-history?limit=${encodeURIComponent(String(limit))}`,
     )
     return response.history || []
+  }
+
+  async listJobs(limit = 50): Promise<BookKnowledgeJob[]> {
+    const response = await this.request<{ jobs: BookKnowledgeJob[] }>(
+      `/api/jobs?limit=${encodeURIComponent(String(limit))}`,
+    )
+    return response.jobs || []
+  }
+
+  async createJob(body: BookKnowledgeJobRequest): Promise<BookKnowledgeJob> {
+    const response = await this.request<{ job: BookKnowledgeJob }>('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    return response.job
+  }
+
+  async getJob(jobID: string): Promise<BookKnowledgeJob> {
+    const response = await this.request<{ job: BookKnowledgeJob }>(`/api/jobs/${encodeURIComponent(jobID)}`)
+    return response.job
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {
