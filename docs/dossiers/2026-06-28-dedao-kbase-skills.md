@@ -1,7 +1,7 @@
 ---
 slug: 2026-06-28-dedao-kbase-skills
-status: building
-current_stage: S5
+status: shipped
+current_stage: S8
 last-reviewed: 2026-06-28
 ---
 
@@ -33,16 +33,18 @@ Agent / downstream system
 | S1 Discovery | 现状图 | 本文件 Discovery 节 |
 | S3 规划 | 实施计划 | `docs/plans/2026-06-28-dedao-kbase-skills.md` |
 | S5 实现 | 分支 | `codex/web-kbase-ui-kbase` |
+| S6 构建 | Linux kbase-server + Web dist | `GOOS=linux GOARCH=amd64 go build`; `frontend-web npm run build` |
+| S7 验证 | 线上验证 | `https://kbase.executor.life/.well-known/dedao-kbase-skills.json` |
 
 ## Gate 裁决记录
 | Gate | 裁决 | 依据 / 日期 |
 |---|---|---|
 | G1 准入 | PASS | 用户明确要求将 skills 规划进入开发并上线;2026-06-28 |
 | G2 可行性 | PASS | 复用现有 HTTP server、BookKnowledgeStore、Bearer token,不引入新认证系统;2026-06-28 |
-| G3 测试 | IN PROGRESS | 新增 TDD 覆盖 public discovery、protected invoke、authenticated invocation |
-| G4 评审 | IN PROGRESS | 需要确认 public descriptor 不泄漏 token,invoke 无 token 401 |
-| G5 部署健康 | 待跑 | |
-| G6 验证 | 待线上验证 | |
+| G3 测试 | PASS | `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1` PASS; `frontend-web npm run build` PASS; Linux amd64 build PASS;2026-06-28 |
+| G4 评审 | PASS | public descriptor 不含 token; `POST /api/skills/.../invoke` 无 token 401; token invoke 成功;2026-06-28 |
+| G5 部署健康 | PASS | `dedao-kbase.service` active; Nginx `nginx -t` successful; `/health` 200;2026-06-28 |
+| G6 验证 | PASS | discovery、manifest、SKILL.md 公开可读; authenticated search/manifest invoke 返回结果;2026-06-28 |
 
 ## Discovery 现状图(带 file:line)
 - `backend/app/kbase_http.go` 已有 `/health`、`/api/books`、`/api/search`、`/api/system-kb/*`,且 `/api/*` 统一 Bearer 鉴权。
@@ -54,4 +56,6 @@ Agent / downstream system
 - 已拍板:先开放 read-only skill discovery + protected invoke。
 
 ## 沉淀(S8)
-- 待完成后记录线上 discovery URL、验证命令和部署状态。
+- 线上 discovery URL:`https://kbase.executor.life/.well-known/dedao-kbase-skills.json`。
+- Web Workbench 已发布到 `/var/www/kbase.executor.life`;浏览器页面继续走 Basic Auth,`/api/*` 和 skills invoke 走 Bearer。
+- 线上验证命令覆盖:health 200、root/assets no Basic 401、well-known 200、manifest/SKILL.md 200、invoke no token 401、invoke with token 200。

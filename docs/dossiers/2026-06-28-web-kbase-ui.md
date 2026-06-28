@@ -1,7 +1,7 @@
 ---
 slug: 2026-06-28-web-kbase-ui
-status: ready-for-user-verification
-current_stage: S7
+status: online
+current_stage: S8
 last-reviewed: 2026-06-28
 ---
 
@@ -45,7 +45,7 @@ last-reviewed: 2026-06-28
 | G3 测试 | PARTIAL PASS | `node frontend-web/scripts/web-kbase-ui-smoke.mjs` PASS; `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1` PASS;全量 `go test ./...` 仍红在无关 `backend/utils.TestPrintToPdf` Chrome/chromedp 60s 超时;2026-06-28 |
 | G4 评审 | PASS | `TestKBaseHTTPHandlerServesWebAssets` 覆盖静态资源、SPA fallback、`/api/books` 无 token 仍 401;2026-06-28 |
 | G5 构建健康 | PASS | `cd frontend-web && npm run build` PASS; `git diff --check` PASS;2026-06-28 |
-| G6 验证 | 待用户确认 | 需要在本地启动 `cmd/kbase-server` 后用浏览器输入 token 做端到端验收 |
+| G6 验证 | PASS | 已发布到 `https://kbase.executor.life/`;浏览器入口受 Basic Auth 保护,页面资源已替换为 `frontend-web/dist`;2026-06-28 |
 
 ## 待拍板决策(STOP 问人)
 - 已拍板:选择独立 Web 版书籍知识库页面,首版只读,使用现有 kbase HTTP API。
@@ -62,3 +62,4 @@ last-reviewed: 2026-06-28
 - README 已更新 Web UI 构建、启动和 token 使用说明。
 - 代码结构新增 `frontend-web/` 和 kbase static serving;已新增最小 system-map 入口,后续如要加入计数需走生成文件。
 - 完成分支流程当前不能进入 merge/PR 选项:全量 `go test ./...` 被既有 `backend/utils.TestPrintToPdf` chromedp 环境问题阻塞。
+- 线上 Nginx 已切换为:浏览器页面和 assets 走 Basic Auth 静态托管,`/health`、`/.well-known/dedao-kbase-skills.json`、`/api/*` 反代到 kbase-server。
