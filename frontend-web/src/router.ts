@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
+import AccountLogin from './views/AccountLogin.vue'
 import AccountProfile from './views/AccountProfile.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
@@ -79,14 +80,6 @@ const moduleRoutes = [
     desktopMethods: ['OpenDirectoryDialog', 'SetDir'],
   },
   {
-    path: '/user/login',
-    title: '登录',
-    scope: 'dedao_auth',
-    status: 'planned',
-    source: 'frontend/src/views/Login.vue',
-    desktopMethods: ['GetQrcode', 'CheckLogin'],
-  },
-  {
     path: '/user/switch',
     title: '切换账号',
     scope: 'account_switch',
@@ -107,6 +100,17 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/BookKnowledge.vue',
       desktopMethods: ['BookKnowledgeListBooks', 'BookKnowledgeGetBook', 'BookKnowledgeSearch', 'BookKnowledgeChat'],
+    },
+  },
+  {
+    path: '/user/login',
+    component: AccountLogin,
+    meta: {
+      title: '登录',
+      scope: 'dedao_auth',
+      status: 'online',
+      source: 'frontend/src/views/Login.vue',
+      desktopMethods: ['GetQrcode', 'CheckLogin'],
     },
   },
   {

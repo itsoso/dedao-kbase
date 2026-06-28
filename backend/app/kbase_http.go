@@ -19,6 +19,7 @@ type KBaseHTTPConfig struct {
 	AuthToken          string
 	SystemKBExportPath string
 	StaticDir          string
+	DedaoAuth          DedaoAuthProvider
 }
 
 type kbaseHTTPHandler struct {
@@ -26,6 +27,7 @@ type kbaseHTTPHandler struct {
 	authToken          string
 	systemKBExportPath string
 	staticDir          string
+	dedaoAuth          DedaoAuthProvider
 }
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
@@ -38,6 +40,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		authToken:          strings.TrimSpace(cfg.AuthToken),
 		systemKBExportPath: strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:          strings.TrimSpace(cfg.StaticDir),
+		dedaoAuth:          defaultDedaoAuthProvider(cfg.DedaoAuth),
 	}
 }
 
@@ -82,6 +85,16 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoSession(w)
+	case r.URL.Path == "/api/dedao/auth/qrcode":
+		if !requireHTTPMethod(w, r, http.MethodPost) {
+			return
+		}
+		h.handleDedaoAuthQRCode(w)
+	case r.URL.Path == "/api/dedao/auth/check":
+		if !requireHTTPMethod(w, r, http.MethodPost) {
+			return
+		}
+		h.handleDedaoAuthCheck(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -368,6 +381,42 @@ func (h *kbaseHTTPHandler) handleGetJob(w http.ResponseWriter, r *http.Request) 
 
 func (h *kbaseHTTPHandler) handleDedaoSession(w http.ResponseWriter) {
 	writeHTTPJSON(w, http.StatusOK, CurrentDedaoSession())
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAuthQRCode(w http.ResponseWriter) {
+	qr, err := h.dedaoAuth.NewQRCode()
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	setHTTPNoStore(w)
+	writeHTTPJSON(w, http.StatusOK, qr)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.Request) {
+	var request DedaoLoginCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	request.Token = strings.TrimSpace(request.Token)
+	request.QRCodeString = strings.TrimSpace(request.QRCodeString)
+	if request.Token == "" || request.QRCodeString == "" {
+		writeHTTPError(w, http.StatusBadRequest, "token and qr_code_string are required")
+		return
+	}
+	result, err := h.dedaoAuth.CheckLogin(request.Token, request.QRCodeString)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	setHTTPNoStore(w)
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func setHTTPNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 }
 
 func parseKBasePagination(r *http.Request) (int, int) {

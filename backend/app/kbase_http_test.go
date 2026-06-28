@@ -304,6 +304,84 @@ func TestKBaseHTTPHandlerServesDedaoSession(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoAuth(t *testing.T) {
+	auth := &fakeDedaoAuthProvider{
+		qr: DedaoLoginQRCode{
+			Token:        "login-token",
+			QRCode:       "data:image/png;base64,abc",
+			QRCodeString: "qr-string",
+		},
+		check: DedaoLoginCheck{
+			Status: 1,
+			User: &DedaoSessionUser{
+				UIDHazy: "uid-1",
+				Name:    "学习者",
+				Avatar:  "https://example.test/avatar.png",
+			},
+			Session: DedaoSession{
+				LoggedIn: true,
+				ActiveUser: &DedaoSessionUser{
+					UIDHazy: "uid-1",
+					Name:    "学习者",
+				},
+				UserCount: 1,
+			},
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(t.TempDir()),
+		AuthToken: "secret-token",
+		DedaoAuth: auth,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodPost, "/api/dedao/auth/qrcode", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("auth qrcode without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	qrResp := requestKBase(handler, http.MethodPost, "/api/dedao/auth/qrcode", "secret-token")
+	if qrResp.Code != http.StatusOK {
+		t.Fatalf("auth qrcode status = %d, body=%s", qrResp.Code, qrResp.Body.String())
+	}
+	if cacheControl := qrResp.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "no-store") {
+		t.Fatalf("auth qrcode Cache-Control = %q, want no-store", cacheControl)
+	}
+	qrBody := qrResp.Body.String()
+	if !strings.Contains(qrBody, `"token":"login-token"`) ||
+		!strings.Contains(qrBody, `"qr_code":"data:image/png;base64,abc"`) ||
+		!strings.Contains(qrBody, `"qr_code_string":"qr-string"`) {
+		t.Fatalf("qrcode response missing safe QR payload: %s", qrBody)
+	}
+	if strings.Contains(strings.ToLower(qrBody), "cookie") {
+		t.Fatalf("qrcode response must not expose cookies: %s", qrBody)
+	}
+
+	checkResp := requestKBaseJSON(handler, http.MethodPost, "/api/dedao/auth/check", "secret-token", `{"token":"login-token","qr_code_string":"qr-string"}`)
+	if checkResp.Code != http.StatusOK {
+		t.Fatalf("auth check status = %d, body=%s", checkResp.Code, checkResp.Body.String())
+	}
+	if cacheControl := checkResp.Header().Get("Cache-Control"); !strings.Contains(cacheControl, "no-store") {
+		t.Fatalf("auth check Cache-Control = %q, want no-store", cacheControl)
+	}
+	checkBody := checkResp.Body.String()
+	if auth.gotToken != "login-token" || auth.gotQRCodeString != "qr-string" {
+		t.Fatalf("auth check arguments = token %q qr %q", auth.gotToken, auth.gotQRCodeString)
+	}
+	if !strings.Contains(checkBody, `"status":1`) ||
+		!strings.Contains(checkBody, `"uid_hazy":"uid-1"`) ||
+		!strings.Contains(checkBody, `"session"`) {
+		t.Fatalf("auth check response missing safe status/user/session: %s", checkBody)
+	}
+	if strings.Contains(strings.ToLower(checkBody), "cookie") {
+		t.Fatalf("auth check response must not expose cookies: %s", checkBody)
+	}
+
+	badResp := requestKBaseJSON(handler, http.MethodPost, "/api/dedao/auth/check", "secret-token", `{"token":"","qr_code_string":""}`)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("auth check missing token status = %d, want 400", badResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	root := t.TempDir()
 	webDir := filepath.Join(root, "web")
@@ -479,6 +557,23 @@ func TestKBaseHTTPHandlerInvokesSkillsWithBearer(t *testing.T) {
 	if unknownResp.Code != http.StatusNotFound {
 		t.Fatalf("unknown skill status = %d, want 404", unknownResp.Code)
 	}
+}
+
+type fakeDedaoAuthProvider struct {
+	qr              DedaoLoginQRCode
+	check           DedaoLoginCheck
+	gotToken        string
+	gotQRCodeString string
+}
+
+func (f *fakeDedaoAuthProvider) NewQRCode() (DedaoLoginQRCode, error) {
+	return f.qr, nil
+}
+
+func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (DedaoLoginCheck, error) {
+	f.gotToken = token
+	f.gotQRCodeString = qrCodeString
+	return f.check, nil
 }
 
 func newTestKBaseHandlerWithSystemKB(t *testing.T, root string) http.Handler {

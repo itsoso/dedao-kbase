@@ -75,6 +75,9 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `GET /api/books/{book_id}/prompts`：读取书籍 Prompt 模板。
 - `POST /api/books/{book_id}/chat`：服务端调用 TokenPlan 进行单书对话，返回 answer、sources 和 context stats。
 - `GET /api/books/{book_id}/chat-history?limit=20`：读取本地 SQLite 对话历史。
+- `GET /api/dedao/session`：读取安全登录摘要，只返回登录状态、当前用户安全字段和账号数量。
+- `POST /api/dedao/auth/qrcode`：生成得到扫码登录二维码和轮询 token，不返回 Cookie。
+- `POST /api/dedao/auth/check`：轮询扫码登录状态，成功后服务端保存登录配置，只返回状态、安全用户字段和 session 摘要。
 - `GET /api/jobs?limit=30`：读取线上任务列表。
 - `POST /api/jobs`：为当前书籍创建导出任务，例如 `{"type":"notebooklm_export","book_id":"..."}` 或 `{"type":"book_export","book_id":"...","target":"health_system_kb_v2"}`。
 - `GET /api/jobs/{job_id}`：读取任务状态、错误和导出结果。
@@ -99,7 +102,7 @@ KBASE_WEB_DIR="$PWD/frontend-web/dist" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
-打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。页面提供全局导航，可切到书库、学习、任务、System KB、Skills/API 和运维状态。左侧支持分页和书名筛选，中栏提供检索与 TokenPlan 对话，右侧保留章节、claims、chunks、Jobs、System KB、Skills/API 和 Ops 详情。Jobs 面板可为当前书籍创建 NotebookLM、`health_system_kb_v2`、`quant_rule_cards` 导出任务并查看状态。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。TokenPlan API Key 只读取服务端环境变量，不会下发到浏览器。
+打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。页面提供全局导航，可切到书库、学习、登录、个人中心、任务、System KB、Skills/API 和运维状态。`/user/login` 支持得到扫码登录，轮询成功后由服务端保存 Cookie；`/user/profile` 只展示安全登录摘要。左侧支持分页和书名筛选，中栏提供检索与 TokenPlan 对话，右侧保留章节、claims、chunks、Jobs、System KB、Skills/API 和 Ops 详情。Jobs 面板可为当前书籍创建 NotebookLM、`health_system_kb_v2`、`quant_rule_cards` 导出任务并查看状态。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。TokenPlan API Key 和 Dedao Cookie 只读取服务端环境/配置，不会下发到浏览器。
 
 #### kbase Agent Skills
 

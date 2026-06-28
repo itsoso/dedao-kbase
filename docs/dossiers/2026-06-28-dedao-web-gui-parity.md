@@ -52,9 +52,13 @@ The desktop GUI baseline is `frontend/src/router/index.ts`:
 - Phase 1 implementation plan: `docs/plans/2026-06-28-dedao-web-gui-phase1.md`
 - Phase 2 session plan: `docs/plans/2026-06-28-dedao-web-gui-phase2-session.md`
 - Phase 2 session dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase2-session.md`
+- Phase 2 login plan: `docs/plans/2026-06-28-dedao-web-gui-phase2-login.md`
+- Phase 2 login dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase2-login.md`
 
 ## Current Decision
 
 Phase 1 shipped: `frontend-web` now has Vue Router, desktop-equivalent Web shell navigation, module landing routes, and the current KBase workbench mounted at `/book-knowledge`.
 
 Phase 2 first slice shipped: `/user/profile` now renders a Web personal center backed by Bearer-protected `GET /api/dedao/session`, exposing only safe session metadata.
+
+Phase 2 login slice shipped: `/user/login` now renders a Web QR login surface backed by Bearer-protected `POST /api/dedao/auth/qrcode` and `POST /api/dedao/auth/check`, with Dedao cookies kept server-side.

@@ -156,6 +156,19 @@ export interface DedaoSession {
   user_count: number
 }
 
+export interface DedaoLoginQRCode {
+  token: string
+  qr_code: string
+  qr_code_string: string
+}
+
+export interface DedaoLoginCheck {
+  status: number
+  expired?: boolean
+  user?: DedaoSessionUser
+  session: DedaoSession
+}
+
 export const getBrowserSession = async (): Promise<BrowserSession | null> => {
   const response = await fetch('/browser/session-token', {
     credentials: 'same-origin',
@@ -256,6 +269,22 @@ export class KBaseClient {
 
   async getDedaoSession(): Promise<DedaoSession> {
     return this.request<DedaoSession>('/api/dedao/session')
+  }
+
+  async createDedaoLoginQRCode(): Promise<DedaoLoginQRCode> {
+    return this.request<DedaoLoginQRCode>('/api/dedao/auth/qrcode', {
+      method: 'POST',
+    })
+  }
+
+  async checkDedaoLogin(token: string, qrCodeString: string): Promise<DedaoLoginCheck> {
+    return this.request<DedaoLoginCheck>('/api/dedao/auth/check', {
+      method: 'POST',
+      body: JSON.stringify({
+        token,
+        qr_code_string: qrCodeString,
+      }),
+    })
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {

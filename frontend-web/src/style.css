@@ -341,7 +341,8 @@ label span {
   background: #fff5f4;
 }
 
-.account-profile {
+.account-profile,
+.account-login {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -350,14 +351,17 @@ label span {
 }
 
 .account-toolbar,
-.account-card {
+.account-card,
+.login-toolbar,
+.login-card {
   border: 1px solid #d3dce8;
   border-radius: 8px;
   background: #ffffff;
   box-shadow: 0 10px 24px rgb(37 51 74 / 8%);
 }
 
-.account-toolbar {
+.account-toolbar,
+.login-toolbar {
   display: grid;
   grid-template-columns: 220px minmax(220px, 1fr) minmax(220px, 1fr) 96px;
   gap: 12px;
@@ -365,13 +369,15 @@ label span {
   padding: 12px;
 }
 
-.account-grid {
+.account-grid,
+.login-grid {
   display: grid;
   grid-template-columns: minmax(320px, 1.15fr) minmax(260px, 0.85fr) minmax(280px, 1fr);
   gap: 12px;
 }
 
-.account-card {
+.account-card,
+.login-card {
   min-width: 0;
   padding: 14px;
 }
@@ -454,6 +460,97 @@ label span {
   color: #121926;
   font-size: 15px;
   font-weight: 800;
+}
+
+.qr-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.qr-frame {
+  display: grid;
+  width: 184px;
+  height: 184px;
+  place-items: center;
+  border: 1px solid #c8d2df;
+  border-radius: 8px;
+  background: #fbfcfe;
+  color: #607086;
+  font-size: 22px;
+  font-weight: 800;
+}
+
+.qr-frame img {
+  width: 154px;
+  height: 154px;
+  object-fit: contain;
+}
+
+.login-actions {
+  display: grid;
+  width: 100%;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.login-metrics {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.login-metrics div {
+  min-width: 0;
+  border: 1px solid #dbe2ec;
+  border-radius: 7px;
+  padding: 10px;
+  background: #fbfcfe;
+}
+
+.login-metrics dt {
+  color: #6c7b8f;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.login-metrics dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  color: #121926;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.login-result h2 {
+  margin: 8px 0 6px;
+  overflow-wrap: anywhere;
+  color: #121926;
+  font-size: 22px;
+  line-height: 28px;
+}
+
+.login-result p {
+  margin: 0 0 12px;
+  overflow-wrap: anywhere;
+  color: #536274;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.login-result a {
+  display: inline-flex;
+  border: 1px solid #397367;
+  border-radius: 6px;
+  padding: 8px 12px;
+  background: #397367;
+  color: #ffffff;
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .workbench-grid {
@@ -1103,11 +1200,14 @@ pre {
 
   .connection-bar,
   .account-toolbar,
+  .login-toolbar,
   .shell-header,
   .app-navigation,
   .shell-nav,
   .account-grid,
   .account-metrics,
+  .login-grid,
+  .login-actions,
   .module-status-grid,
   .workbench-grid {
     grid-template-columns: 1fr;
