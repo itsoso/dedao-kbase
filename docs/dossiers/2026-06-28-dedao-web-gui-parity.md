@@ -73,4 +73,4 @@ Phase 3 first read-only content slice shipped: `/ebook` renders a Web ebook book
 
 Phase 3 second read-only content slice shipped: `/course` renders a Web course browser backed by Bearer-protected `GET /api/dedao/courses`, reusing the desktop `CourseList("bauhinia","study")` data path and returning only safe browser fields.
 
-Phase 3 detail reading slice in progress: `/course/{enid}` reads course detail, article lists, and Markdown articles; `/ebook/{enid}` reads ebook detail, catalog, and bounded chapter SVG page batches. Browser payloads remain read-only and do not expose Dedao cookies, DRM tokens, or ebook read tokens.
+Phase 3 detail reading slice shipped: `/course/{enid}` reads course detail, article lists, and Markdown articles; `/ebook/{enid}` reads ebook detail, catalog, and bounded chapter SVG page batches. Browser payloads remain read-only and do not expose Dedao cookies, DRM tokens, or ebook read tokens.
