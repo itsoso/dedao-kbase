@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -67,21 +68,47 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.authorize(w, r) {
 		return
 	}
-	if r.Method != http.MethodGet {
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 
 	switch {
 	case r.URL.Path == "/api/books":
-		h.handleListBooks(w)
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleListBooks(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/books/") && strings.HasSuffix(r.URL.Path, "/prompts"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleBookPrompts(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/books/") && strings.HasSuffix(r.URL.Path, "/chat-history"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleBookChatHistory(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/books/") && strings.HasSuffix(r.URL.Path, "/chat"):
+		if !requireHTTPMethod(w, r, http.MethodPost) {
+			return
+		}
+		h.handleBookChat(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/books/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		h.handleGetBook(w, r)
 	case r.URL.Path == "/api/search":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		h.handleSearch(w, r)
 	case r.URL.Path == "/api/system-kb/export":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		h.handleSystemKBExport(w)
 	case r.URL.Path == "/api/system-kb/manifest":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		h.handleSystemKBManifest(w)
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
@@ -147,13 +174,35 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 	return true
 }
 
-func (h *kbaseHTTPHandler) handleListBooks(w http.ResponseWriter) {
+func (h *kbaseHTTPHandler) handleListBooks(w http.ResponseWriter, r *http.Request) {
 	books, err := h.store.ListBooks()
 	if err != nil {
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, map[string]any{"books": books})
+	books = filterKBaseBooks(books, r.URL.Query().Get("q"))
+	sortKBaseBooks(books, r.URL.Query().Get("sort"))
+	page, pageSize := parseKBasePagination(r)
+	total := len(books)
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"books":       books[start:end],
+		"page":        page,
+		"page_size":   pageSize,
+		"total":       total,
+		"total_pages": totalPages,
+	})
 }
 
 func (h *kbaseHTTPHandler) handleGetBook(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +217,65 @@ func (h *kbaseHTTPHandler) handleGetBook(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, pkg)
+}
+
+func (h *kbaseHTTPHandler) handleBookPrompts(w http.ResponseWriter, r *http.Request) {
+	bookID, err := bookIDFromAPIBookSubroute(r.URL.Path, "/prompts")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	prompts, err := GenerateBookKnowledgePrompts(h.store, bookID)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"prompts": prompts})
+}
+
+func (h *kbaseHTTPHandler) handleBookChat(w http.ResponseWriter, r *http.Request) {
+	bookID, err := bookIDFromAPIBookSubroute(r.URL.Path, "/chat")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var request BookKnowledgeChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	request.BookID = bookID
+	response, err := BookKnowledgeChat(r.Context(), h.store, request)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, response)
+}
+
+func (h *kbaseHTTPHandler) handleBookChatHistory(w http.ResponseWriter, r *http.Request) {
+	bookID, err := bookIDFromAPIBookSubroute(r.URL.Path, "/chat-history")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeHTTPError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return
+		}
+		if parsed > 0 {
+			limit = parsed
+		}
+	}
+	history, err := h.store.ListChatHistory(bookID, limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"history": history})
 }
 
 func (h *kbaseHTTPHandler) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -192,6 +300,85 @@ func (h *kbaseHTTPHandler) handleSearch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func parseKBasePagination(r *http.Request) (int, int) {
+	page := 1
+	pageSize := 30
+	if raw := strings.TrimSpace(r.URL.Query().Get("page")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("page_size")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			pageSize = parsed
+		}
+	}
+	if pageSize > 100 {
+		pageSize = 100
+	}
+	return page, pageSize
+}
+
+func filterKBaseBooks(books []BookKnowledgeBook, query string) []BookKnowledgeBook {
+	term := strings.ToLower(strings.TrimSpace(query))
+	if term == "" {
+		return books
+	}
+	filtered := make([]BookKnowledgeBook, 0, len(books))
+	for _, book := range books {
+		haystack := strings.ToLower(strings.Join([]string{
+			book.BookID,
+			book.Title,
+			book.Author,
+			book.Status,
+			book.Extractor,
+		}, " "))
+		if strings.Contains(haystack, term) {
+			filtered = append(filtered, book)
+		}
+	}
+	return filtered
+}
+
+func sortKBaseBooks(books []BookKnowledgeBook, sortMode string) {
+	switch strings.TrimSpace(sortMode) {
+	case "title_asc":
+		sort.SliceStable(books, func(i, j int) bool {
+			if books[i].Title != books[j].Title {
+				return books[i].Title < books[j].Title
+			}
+			return books[i].BookID < books[j].BookID
+		})
+	default:
+		sort.SliceStable(books, func(i, j int) bool {
+			if books[i].UpdatedAt != books[j].UpdatedAt {
+				return books[i].UpdatedAt > books[j].UpdatedAt
+			}
+			return books[i].BookID < books[j].BookID
+		})
+	}
+}
+
+func bookIDFromAPIBookSubroute(urlPath string, suffix string) (string, error) {
+	trimmed := strings.TrimPrefix(urlPath, "/api/books/")
+	if !strings.HasSuffix(trimmed, suffix) {
+		return "", fmt.Errorf("invalid book route")
+	}
+	bookID, err := url.PathUnescape(strings.TrimSuffix(trimmed, suffix))
+	if err != nil || strings.TrimSpace(bookID) == "" {
+		return "", fmt.Errorf("book_id is required")
+	}
+	return bookID, nil
+}
+
+func requireHTTPMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method == method {
+		return true
+	}
+	writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+	return false
 }
 
 func (h *kbaseHTTPHandler) handleSystemKBExport(w http.ResponseWriter) {

@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -98,6 +99,111 @@ func TestKBaseHTTPHandlerServesSearchAndSystemKBExport(t *testing.T) {
 	}
 	if !strings.Contains(exportResp.Body.String(), `"type":"system_kb_v2_export"`) {
 		t.Fatalf("export response missing payload: %s", exportResp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerListsBooksWithPagination(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	for i, title := range []string{"Book Alpha", "Book Beta", "Book Gamma"} {
+		pkg := sampleBookKnowledgePackageWithID(fmt.Sprintf("book-%d", i+1), title)
+		if err := store.SavePackage(pkg); err != nil {
+			t.Fatalf("SavePackage returned error: %v", err)
+		}
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/books?page=2&page_size=1&q=Book&sort=title_asc", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("books status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Books      []BookKnowledgeBook `json:"books"`
+		Page       int                 `json:"page"`
+		PageSize   int                 `json:"page_size"`
+		Total      int                 `json:"total"`
+		TotalPages int                 `json:"total_pages"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Page != 2 || payload.PageSize != 1 || payload.Total != 3 || payload.TotalPages != 3 {
+		t.Fatalf("pagination payload = %#v", payload)
+	}
+	if len(payload.Books) != 1 || payload.Books[0].BookID != "book-2" {
+		t.Fatalf("books page = %#v, want second title-sorted book", payload.Books)
+	}
+}
+
+func TestKBaseHTTPHandlerServesBookPromptsChatAndHistory(t *testing.T) {
+	var gotTokenPlanAuth string
+	tokenPlanServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTokenPlanAuth = r.Header.Get("Authorization")
+		if r.URL.Path != "/compatible-mode/v1/chat/completions" {
+			t.Fatalf("TokenPlan path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"Web 对话回答"}}]}`))
+	}))
+	defer tokenPlanServer.Close()
+
+	envFile := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envFile, []byte(strings.Join([]string{
+		"TOKENPLAN_API_KEY=sk-web-test",
+		"TOKENPLAN_BASE_URL=" + tokenPlanServer.URL + "/compatible-mode/v1",
+		"TOKENPLAN_MODEL=MiniMax-M2.5",
+	}, "\n")), 0o600); err != nil {
+		t.Fatalf("WriteFile returned error: %v", err)
+	}
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "")
+	t.Setenv("DEDAO_TOKENPLAN_MODEL", "")
+	t.Setenv("TOKENPLAN_API_KEY", "")
+	t.Setenv("TOKENPLAN_BASE_URL", "")
+	t.Setenv("TOKENPLAN_MODEL", "")
+	t.Setenv("DEDAO_TOKENPLAN_ENV_FILE", envFile)
+
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	promptsResp := requestKBase(handler, http.MethodGet, "/api/books/42/prompts", "secret-token")
+	if promptsResp.Code != http.StatusOK {
+		t.Fatalf("prompts status = %d, body=%s", promptsResp.Code, promptsResp.Body.String())
+	}
+	if !strings.Contains(promptsResp.Body.String(), `"prompts"`) ||
+		!strings.Contains(promptsResp.Body.String(), `"understand-core"`) {
+		t.Fatalf("prompts response missing templates: %s", promptsResp.Body.String())
+	}
+
+	chatResp := requestKBaseJSON(handler, http.MethodPost, "/api/books/42/chat", "secret-token", `{"mode":"chat","question":"如何理解 MACD？","model":"qwen3.7-max"}`)
+	if chatResp.Code != http.StatusOK {
+		t.Fatalf("chat status = %d, body=%s", chatResp.Code, chatResp.Body.String())
+	}
+	if !strings.Contains(chatResp.Body.String(), `"answer":"Web 对话回答"`) ||
+		!strings.Contains(chatResp.Body.String(), `"model":"qwen3.7-max"`) ||
+		!strings.Contains(chatResp.Body.String(), `"sources"`) ||
+		!strings.Contains(chatResp.Body.String(), `"context_stats"`) {
+		t.Fatalf("chat response missing answer metadata: %s", chatResp.Body.String())
+	}
+	if gotTokenPlanAuth != "Bearer sk-web-test" {
+		t.Fatalf("TokenPlan auth = %q, want fake bearer", gotTokenPlanAuth)
+	}
+
+	historyResp := requestKBase(handler, http.MethodGet, "/api/books/42/chat-history?limit=10", "secret-token")
+	if historyResp.Code != http.StatusOK {
+		t.Fatalf("history status = %d, body=%s", historyResp.Code, historyResp.Body.String())
+	}
+	if !strings.Contains(historyResp.Body.String(), `"history"`) ||
+		!strings.Contains(historyResp.Body.String(), `"Web 对话回答"`) {
+		t.Fatalf("history response missing saved chat: %s", historyResp.Body.String())
 	}
 }
 
@@ -312,6 +418,34 @@ func newTestKBaseHandlerWithSystemKB(t *testing.T, root string) http.Handler {
 		AuthToken:          "secret-token",
 		SystemKBExportPath: exportPath,
 	})
+}
+
+func sampleBookKnowledgePackageWithID(bookID, title string) BookKnowledgePackage {
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = bookID
+	pkg.Book.Title = title
+	pkg.Book.UpdatedAt = fmt.Sprintf("2026-06-28T00:00:0%sZ", strings.TrimPrefix(bookID, "book-"))
+	for i := range pkg.Chapters {
+		pkg.Chapters[i].BookID = bookID
+		pkg.Chapters[i].ChapterID = bookID + "-chapter-1"
+	}
+	for i := range pkg.Chunks {
+		pkg.Chunks[i].BookID = bookID
+		pkg.Chunks[i].ChapterID = bookID + "-chapter-1"
+		pkg.Chunks[i].ChunkID = bookID + "-chunk-1"
+	}
+	for i := range pkg.Claims {
+		pkg.Claims[i].BookID = bookID
+		pkg.Claims[i].ChapterID = bookID + "-chapter-1"
+		pkg.Claims[i].ClaimID = bookID + "-claim-1"
+	}
+	for i := range pkg.Citations {
+		pkg.Citations[i].BookID = bookID
+		pkg.Citations[i].ChapterID = bookID + "-chapter-1"
+		pkg.Citations[i].ChunkID = bookID + "-chunk-1"
+		pkg.Citations[i].CitationID = bookID + "-citation-1"
+	}
+	return pkg
 }
 
 func requestKBase(handler http.Handler, method, path, token string) *httptest.ResponseRecorder {
