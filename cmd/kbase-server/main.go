@@ -19,8 +19,15 @@ func main() {
 	webDir := flag.String("web-dir", defaultKBaseWebDir(), "web UI static asset directory")
 	flag.Parse()
 
+	store := app.NewBookKnowledgeStore(*root)
+	if count, err := store.FailRunningBookKnowledgeJobs("interrupted by kbase-server restart"); err != nil {
+		log.Printf("failed to recover interrupted jobs: %v", err)
+	} else if count > 0 {
+		log.Printf("marked %d interrupted running jobs as failed", count)
+	}
+
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
-		Store:              app.NewBookKnowledgeStore(*root),
+		Store:              store,
 		AuthToken:          *authToken,
 		SystemKBExportPath: *exportPath,
 		StaticDir:          *webDir,

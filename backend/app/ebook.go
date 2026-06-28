@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"github.com/yann0917/dedao-gui/backend/services"
 	"github.com/yann0917/dedao-gui/backend/utils"
 )
@@ -82,7 +81,7 @@ func EbookPage(ctx context.Context, enID string) (info *services.EbookInfo, svgC
 			progress.Value = value.(utils.EbookToc).Text
 			chapterMap.Delete(order.ChapterID)
 		}
-		runtime.EventsEmit(ctx, "ebookDownload", progress)
+		emitProgress(ctx, "ebookDownload", progress)
 		wgp.Add()
 		go func(i int, order services.EbookOrders) {
 			defer func() {

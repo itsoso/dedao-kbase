@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"github.com/yann0917/dedao-gui/backend/utils"
 )
 
@@ -249,10 +248,7 @@ func formatEbookWikiCommand(cmd ebookWikiCommand) string {
 }
 
 func emitEbookWikiProgress(ctx context.Context, value string) {
-	if ctx == nil || ctx.Value("events") == nil {
-		return
-	}
-	runtime.EventsEmit(ctx, "ebookDownload", Progress{
+	emitProgress(ctx, "ebookDownload", Progress{
 		Total:   100,
 		Current: 100,
 		Pct:     100,

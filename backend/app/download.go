@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	jsoniter "github.com/json-iterator/go"
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"github.com/yann0917/dedao-gui/backend/downloader"
 	"github.com/yann0917/dedao-gui/backend/services"
 	"github.com/yann0917/dedao-gui/backend/utils"
@@ -87,7 +86,7 @@ func (d *CourseDownload) Download() error {
 			progress.Current = curr
 			progress.Pct = curr * 100 / progress.Total
 			progress.Value = datum.Title
-			runtime.EventsEmit(d.Ctx, "courseDownload", progress)
+			emitProgress(d.Ctx, "courseDownload", progress)
 			if !datum.IsCanDL {
 				continue
 			}
@@ -118,7 +117,7 @@ func (d *CourseDownload) Download() error {
 			progress.Current = curr
 			progress.Pct = curr * 100 / progress.Total
 			progress.Value = datum.Title
-			runtime.EventsEmit(d.Ctx, "courseDownload", progress)
+			emitProgress(d.Ctx, "courseDownload", progress)
 			if err := downloader.PrintToPDF(datum, cookies, path); err != nil {
 				errs = append(errs, err)
 			}
@@ -161,7 +160,7 @@ func (d *OdobDownload) Download() error {
 			progress.Current = curr
 			progress.Pct = curr * 100 / progress.Total
 			progress.Value = datum.Title + ".mp3"
-			runtime.EventsEmit(d.Ctx, "odobDownload", progress)
+			emitProgress(d.Ctx, "odobDownload", progress)
 			if !datum.IsCanDL {
 				continue
 			}
@@ -196,7 +195,7 @@ func (d *OdobDownload) Download() error {
 		progress.Current = 100
 		progress.Pct = 100 * 100 / progress.Total
 		progress.Value = d.Data.Title + ".pdf"
-		runtime.EventsEmit(d.Ctx, "odobDownload", progress)
+		emitProgress(d.Ctx, "odobDownload", progress)
 		return utils.Md2Pdf(path, d.Data.Title, []byte(res))
 	case 3:
 		// 下载 Markdown
@@ -210,7 +209,7 @@ func (d *OdobDownload) Download() error {
 		progress.Current = 100
 		progress.Pct = 100 * 100 / progress.Total
 		progress.Value = d.Data.Title + ".md"
-		runtime.EventsEmit(d.Ctx, "odobDownload", progress)
+		emitProgress(d.Ctx, "odobDownload", progress)
 		if err := DownloadOdobMarkdown(d.Data, path); err != nil {
 			return err
 		}
@@ -260,7 +259,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	var progress Progress
 	progress.Pct = 100
 	progress.Value = "正在生成" + dType[d.DownloadType] + "文件"
-	runtime.EventsEmit(d.Ctx, "ebookDownload", progress)
+	emitProgress(d.Ctx, "ebookDownload", progress)
 	switch d.DownloadType {
 	case 1:
 		result.HTMLPath, err = ebookHTMLPath(outputDir, title)
@@ -582,7 +581,7 @@ func DownloadMarkdown(list *services.ArticleList, aid int, path string, ctx cont
 		progress.Current = curr
 		progress.Pct = curr * 100 / progress.Total
 		progress.Value = v.Title
-		runtime.EventsEmit(ctx, "courseDownload", progress)
+		emitProgress(ctx, "courseDownload", progress)
 
 		if aid > 0 && v.ID != aid {
 			continue

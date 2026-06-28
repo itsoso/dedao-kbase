@@ -161,6 +161,45 @@ func (s *BookKnowledgeStore) LoadBookKnowledgeJob(jobID string) (BookKnowledgeJo
 	return BookKnowledgeJob{}, fmt.Errorf("job not found: %s", jobID)
 }
 
+func (s *BookKnowledgeStore) FailRunningBookKnowledgeJobs(reason string) (int, error) {
+	if s == nil {
+		s = DefaultBookKnowledgeStore()
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "interrupted"
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+
+	bookKnowledgeJobsMu.Lock()
+	defer bookKnowledgeJobsMu.Unlock()
+
+	file, err := s.readBookKnowledgeJobsFileLocked()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for i, job := range file.Jobs {
+		if job.Status != BookKnowledgeJobStatusRunning {
+			continue
+		}
+		job.Status = BookKnowledgeJobStatusFailed
+		job.Error = reason
+		job.UpdatedAt = now
+		job.FinishedAt = now
+		job.Logs = append(job.Logs, "failed: "+reason)
+		file.Jobs[i] = job
+		count++
+	}
+	if count == 0 {
+		return 0, nil
+	}
+	if err := s.writeBookKnowledgeJobsFileLocked(file); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) {
 	job, err := s.updateBookKnowledgeJob(jobID, func(job BookKnowledgeJob) BookKnowledgeJob {
 		now := time.Now().UTC().Format(time.RFC3339Nano)

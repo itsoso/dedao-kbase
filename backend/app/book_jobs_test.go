@@ -150,3 +150,61 @@ func TestBookKnowledgeJobExecutesDedaoEbookSyncKBase(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 }
+
+func TestBookKnowledgeStoreFailsInterruptedRunningJobs(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	running, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:   BookKnowledgeJobTypeNotebookLMExport,
+		BookID: "67929",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob running returned error: %v", err)
+	}
+	queued, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:   BookKnowledgeJobTypeNotebookLMExport,
+		BookID: "123",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob queued returned error: %v", err)
+	}
+	_, err = store.updateBookKnowledgeJob(running.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.Status = BookKnowledgeJobStatusRunning
+		job.StartedAt = "2026-06-28T13:53:54Z"
+		job.UpdatedAt = "2026-06-28T13:53:54Z"
+		job.Logs = append(job.Logs, "running")
+		return job
+	})
+	if err != nil {
+		t.Fatalf("updateBookKnowledgeJob returned error: %v", err)
+	}
+
+	count, err := store.FailRunningBookKnowledgeJobs("interrupted by server restart")
+	if err != nil {
+		t.Fatalf("FailRunningBookKnowledgeJobs returned error: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("count = %d, want 1", count)
+	}
+
+	loadedRunning, err := store.LoadBookKnowledgeJob(running.ID)
+	if err != nil {
+		t.Fatalf("LoadBookKnowledgeJob running returned error: %v", err)
+	}
+	if loadedRunning.Status != BookKnowledgeJobStatusFailed {
+		t.Fatalf("running status = %s, want failed", loadedRunning.Status)
+	}
+	if !strings.Contains(loadedRunning.Error, "interrupted by server restart") {
+		t.Fatalf("running error = %q", loadedRunning.Error)
+	}
+	if loadedRunning.FinishedAt == "" {
+		t.Fatal("running FinishedAt is empty")
+	}
+
+	loadedQueued, err := store.LoadBookKnowledgeJob(queued.ID)
+	if err != nil {
+		t.Fatalf("LoadBookKnowledgeJob queued returned error: %v", err)
+	}
+	if loadedQueued.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("queued status = %s, want queued", loadedQueued.Status)
+	}
+}
