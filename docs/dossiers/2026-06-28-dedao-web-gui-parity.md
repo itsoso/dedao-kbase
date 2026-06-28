@@ -56,6 +56,8 @@ The desktop GUI baseline is `frontend/src/router/index.ts`:
 - Phase 2 login dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase2-login.md`
 - Phase 3 ebook plan: `docs/plans/2026-06-28-dedao-web-gui-phase3-ebooks.md`
 - Phase 3 ebook dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase3-ebooks.md`
+- Phase 3 course plan: `docs/plans/2026-06-28-dedao-web-gui-phase3-courses.md`
+- Phase 3 course dossier: `docs/dossiers/2026-06-28-dedao-web-gui-phase3-courses.md`
 
 ## Current Decision
 
@@ -66,3 +68,5 @@ Phase 2 first slice shipped: `/user/profile` now renders a Web personal center b
 Phase 2 login slice shipped: `/user/login` now renders a Web QR login surface backed by Bearer-protected `POST /api/dedao/auth/qrcode` and `POST /api/dedao/auth/check`, with Dedao cookies kept server-side.
 
 Phase 3 first read-only content slice shipped: `/ebook` renders a Web ebook bookshelf backed by Bearer-protected `GET /api/dedao/ebooks`, reusing the desktop `CourseList("ebook","study")` data path and returning only safe browser fields.
+
+Phase 3 second read-only content slice shipped: `/course` renders a Web course browser backed by Bearer-protected `GET /api/dedao/courses`, reusing the desktop `CourseList("bauhinia","study")` data path and returning only safe browser fields.

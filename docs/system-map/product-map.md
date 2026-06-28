@@ -21,11 +21,11 @@ Downloaded ebook HTML
   -> exports for health KB, quant rule cards, and NotebookLM bridge packages
 ```
 
-The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/backend/App.*` bindings. The private kbase server is HTTP-native and exposes Bearer-protected book, search, System KB, prompt, chat, chat-history, Dedao session/login, read-only ebook bookshelf, and job endpoints under `/api/*`.
+The desktop workbench is Wails-native and calls generated `frontend/wailsjs/go/backend/App.*` bindings. The private kbase server is HTTP-native and exposes Bearer-protected book, search, System KB, prompt, chat, chat-history, Dedao session/login, read-only course browser, read-only ebook bookshelf, and job endpoints under `/api/*`.
 
 ## Web KBase Expansion Point
 
-The web UI does not reuse the Wails runtime. It is an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore`, prompt generator, TokenPlan chat layer, chat history store, job store, System KB export files, and server-side Dedao login config. TokenPlan secrets and Dedao cookies remain server-side in environment/configuration. Chat history uses SQLite when cgo is available and a JSONL file fallback for cross-compiled `CGO_ENABLED=0` server builds. Online export jobs are recorded in `jobs.json` so Linux cross-compiled deployments can create NotebookLM, health KB, and quant rule-card exports without SQLite. Browser navigation exposes the current online surfaces: library search, book study, QR login, personal center status, read-only ebook bookshelf, jobs, System KB, Skills/API discovery, and basic ops status.
+The web UI does not reuse the Wails runtime. It is an independent browser app served by `cmd/kbase-server`, using the existing Bearer-protected HTTP API. This keeps desktop and browser runtimes separate while sharing the same `BookKnowledgeStore`, prompt generator, TokenPlan chat layer, chat history store, job store, System KB export files, and server-side Dedao login config. TokenPlan secrets and Dedao cookies remain server-side in environment/configuration. Chat history uses SQLite when cgo is available and a JSONL file fallback for cross-compiled `CGO_ENABLED=0` server builds. Online export jobs are recorded in `jobs.json` so Linux cross-compiled deployments can create NotebookLM, health KB, and quant rule-card exports without SQLite. Browser navigation exposes the current online surfaces: library search, book study, QR login, personal center status, read-only course browser, read-only ebook bookshelf, jobs, System KB, Skills/API discovery, and basic ops status.
 
 ## Agent Skills Expansion Point
 

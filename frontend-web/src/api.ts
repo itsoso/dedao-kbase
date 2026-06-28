@@ -191,6 +191,30 @@ export interface DedaoEbookPage {
   is_more: number
 }
 
+export interface DedaoCourse {
+  enid: string
+  id: number
+  class_id: number
+  title: string
+  intro?: string
+  author?: string
+  icon?: string
+  price?: string
+  progress: number
+  publish_num?: number
+  course_num?: number
+  last_read?: string
+}
+
+export interface DedaoCoursePage {
+  courses: DedaoCourse[]
+  page: number
+  page_size: number
+  total: number
+  total_pages: number
+  is_more: number
+}
+
 export const getBrowserSession = async (): Promise<BrowserSession | null> => {
   const response = await fetch('/browser/session-token', {
     credentials: 'same-origin',
@@ -318,6 +342,17 @@ export class KBaseClient {
       params.push(`q=${encodeURIComponent(query.trim())}`)
     }
     return this.request<DedaoEbookPage>(`/api/dedao/ebooks?${params.join('&')}`)
+  }
+
+  async listDedaoCourses(page = 1, pageSize = 15, query = ''): Promise<DedaoCoursePage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+    ]
+    if (query.trim()) {
+      params.push(`q=${encodeURIComponent(query.trim())}`)
+    }
+    return this.request<DedaoCoursePage>(`/api/dedao/courses?${params.join('&')}`)
   }
 
   async getSystemKBManifest(): Promise<Record<string, unknown>> {

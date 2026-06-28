@@ -442,6 +442,67 @@ func TestKBaseHTTPHandlerServesDedaoEbooks(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		courses: DedaoCoursePage{
+			Courses: []DedaoCourse{
+				{
+					ID:         101,
+					ClassID:    202,
+					Enid:       "course-enid",
+					Title:      "商业分析课",
+					Intro:      "从案例学习商业分析。",
+					Icon:       "https://example.test/course.jpg",
+					Price:      "199.00",
+					Progress:   67,
+					PublishNum: 36,
+					CourseNum:  48,
+					LastRead:   "第 12 讲",
+				},
+			},
+			Page:       3,
+			PageSize:   1,
+			Total:      9,
+			TotalPages: 9,
+			IsMore:     1,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/courses", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("courses without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/courses?page=3&page_size=1&q=商业", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("courses status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotCoursePage != 3 || content.gotCoursePageSize != 1 || content.gotCourseQuery != "商业" {
+		t.Fatalf("courses request args = page %d pageSize %d query %q", content.gotCoursePage, content.gotCoursePageSize, content.gotCourseQuery)
+	}
+	var payload DedaoCoursePage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Page != 3 || payload.PageSize != 1 || payload.Total != 9 || payload.TotalPages != 9 || payload.IsMore != 1 {
+		t.Fatalf("courses pagination = %#v", payload)
+	}
+	if len(payload.Courses) != 1 || payload.Courses[0].Title != "商业分析课" || payload.Courses[0].ClassID != 202 {
+		t.Fatalf("courses payload = %#v", payload.Courses)
+	}
+	body := strings.ToLower(resp.Body.String())
+	for _, forbidden := range []string{"cookie", "drm_token", "dd_url"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("courses response must not expose %s: %s", forbidden, resp.Body.String())
+		}
+	}
+}
+
 func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	root := t.TempDir()
 	webDir := filepath.Join(root, "web")
@@ -637,10 +698,14 @@ func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (D
 }
 
 type fakeDedaoContentProvider struct {
-	ebooks      DedaoEbookPage
-	gotQuery    string
-	gotPage     int
-	gotPageSize int
+	ebooks            DedaoEbookPage
+	courses           DedaoCoursePage
+	gotQuery          string
+	gotPage           int
+	gotPageSize       int
+	gotCourseQuery    string
+	gotCoursePage     int
+	gotCoursePageSize int
 }
 
 func (f *fakeDedaoContentProvider) ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error) {
@@ -648,6 +713,13 @@ func (f *fakeDedaoContentProvider) ListEbooks(query string, page, pageSize int) 
 	f.gotPage = page
 	f.gotPageSize = pageSize
 	return f.ebooks, nil
+}
+
+func (f *fakeDedaoContentProvider) ListCourses(query string, page, pageSize int) (DedaoCoursePage, error) {
+	f.gotCourseQuery = query
+	f.gotCoursePage = page
+	f.gotCoursePageSize = pageSize
+	return f.courses, nil
 }
 
 func newTestKBaseHandlerWithSystemKB(t *testing.T, root string) http.Handler {

@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import AccountLogin from './views/AccountLogin.vue'
 import AccountProfile from './views/AccountProfile.vue'
+import CourseLibrary from './views/CourseLibrary.vue'
 import EbookLibrary from './views/EbookLibrary.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
@@ -31,14 +32,6 @@ const moduleRoutes = [
     status: 'planned',
     source: 'frontend/src/views/Home.vue',
     desktopMethods: ['GetHomeInitialState', 'SunflowerLabelList', 'SunflowerLabelContent', 'SunflowerResourceList'],
-  },
-  {
-    path: '/course',
-    title: '课程',
-    scope: 'course_browser',
-    status: 'planned',
-    source: 'frontend/src/views/Course.vue',
-    desktopMethods: ['CourseCategory', 'CourseList', 'CourseInfo', 'ArticleList', 'ArticleDetail', 'CourseDownload'],
   },
   {
     path: '/odob',
@@ -115,6 +108,17 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/UserCenter.vue',
       desktopMethods: ['UserInfo', 'EbookUserInfo', 'OdobUserInfo'],
+    },
+  },
+  {
+    path: '/course',
+    component: CourseLibrary,
+    meta: {
+      title: '课程',
+      scope: 'course_browser',
+      status: 'online',
+      source: 'frontend/src/views/Course.vue',
+      desktopMethods: ['CourseCategory', 'CourseList', 'CourseInfo', 'ArticleList', 'ArticleDetail', 'CourseDownload'],
     },
   },
   {

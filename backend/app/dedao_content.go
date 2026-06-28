@@ -28,8 +28,33 @@ type DedaoEbookPage struct {
 	IsMore     int          `json:"is_more"`
 }
 
+type DedaoCourse struct {
+	Enid       string `json:"enid"`
+	ID         int    `json:"id"`
+	ClassID    int    `json:"class_id"`
+	Title      string `json:"title"`
+	Intro      string `json:"intro,omitempty"`
+	Author     string `json:"author,omitempty"`
+	Icon       string `json:"icon,omitempty"`
+	Price      string `json:"price,omitempty"`
+	Progress   int    `json:"progress"`
+	PublishNum int    `json:"publish_num,omitempty"`
+	CourseNum  int    `json:"course_num,omitempty"`
+	LastRead   string `json:"last_read,omitempty"`
+}
+
+type DedaoCoursePage struct {
+	Courses    []DedaoCourse `json:"courses"`
+	Page       int           `json:"page"`
+	PageSize   int           `json:"page_size"`
+	Total      int           `json:"total"`
+	TotalPages int           `json:"total_pages"`
+	IsMore     int           `json:"is_more"`
+}
+
 type DedaoContentProvider interface {
 	ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
+	ListCourses(query string, page, pageSize int) (DedaoCoursePage, error)
 }
 
 type liveDedaoContentProvider struct{}
@@ -70,6 +95,37 @@ func (p liveDedaoContentProvider) ListEbooks(query string, page, pageSize int) (
 		isMore = list.ISMore
 	}
 	return dedaoEbookPageFromPagedCourses(ebooks, page, pageSize, total, isMore), nil
+}
+
+func (p liveDedaoContentProvider) ListCourses(query string, page, pageSize int) (DedaoCoursePage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 30
+	}
+	query = strings.TrimSpace(query)
+	if query != "" {
+		list, err := getService().CourseListAll(CateCourse, "study")
+		if err != nil {
+			return DedaoCoursePage{}, err
+		}
+		courses := filterDedaoCourses(list.List, query)
+		return dedaoCoursePageFromAllCourses(courses, page, pageSize), nil
+	}
+
+	list, err := CourseList(CateCourse, "study", page, pageSize)
+	if err != nil {
+		return DedaoCoursePage{}, err
+	}
+	total := dedaoCourseCategoryCount(CateCourse)
+	courses := []services.Course{}
+	isMore := 0
+	if list != nil {
+		courses = list.List
+		isMore = list.ISMore
+	}
+	return dedaoCoursePageFromPagedCourses(courses, page, pageSize, total, isMore), nil
 }
 
 func dedaoCourseCategoryCount(category string) int {
@@ -138,6 +194,37 @@ func dedaoEbookPageFromPagedCourses(courses []services.Course, page, pageSize, t
 	}
 }
 
+func dedaoCoursePageFromAllCourses(courses []services.Course, page, pageSize int) DedaoCoursePage {
+	total := len(courses)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	return dedaoCoursePageFromPagedCourses(courses[start:end], page, pageSize, total, 0)
+}
+
+func dedaoCoursePageFromPagedCourses(courses []services.Course, page, pageSize, total, isMore int) DedaoCoursePage {
+	if total < len(courses) {
+		total = len(courses)
+	}
+	totalPages := 0
+	if total > 0 && pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	return DedaoCoursePage{
+		Courses:    dedaoCoursesFromCourses(courses),
+		Page:       page,
+		PageSize:   pageSize,
+		Total:      total,
+		TotalPages: totalPages,
+		IsMore:     isMore,
+	}
+}
+
 func dedaoEbooksFromCourses(courses []services.Course) []DedaoEbook {
 	ebooks := make([]DedaoEbook, 0, len(courses))
 	for _, course := range courses {
@@ -155,4 +242,25 @@ func dedaoEbooksFromCourses(courses []services.Course) []DedaoEbook {
 		})
 	}
 	return ebooks
+}
+
+func dedaoCoursesFromCourses(courses []services.Course) []DedaoCourse {
+	result := make([]DedaoCourse, 0, len(courses))
+	for _, course := range courses {
+		result = append(result, DedaoCourse{
+			Enid:       course.Enid,
+			ID:         course.ID,
+			ClassID:    course.ClassID,
+			Title:      course.Title,
+			Intro:      course.Intro,
+			Author:     course.Author,
+			Icon:       course.Icon,
+			Price:      course.Price,
+			Progress:   course.Progress,
+			PublishNum: course.PublishNum,
+			CourseNum:  course.CourseNum,
+			LastRead:   course.LastRead,
+		})
+	}
+	return result
 }

@@ -98,6 +98,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoAuthCheck(w, r)
+	case r.URL.Path == "/api/dedao/courses":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoCourses(w, r)
 	case r.URL.Path == "/api/dedao/ebooks":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -425,6 +430,16 @@ func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.R
 func (h *kbaseHTTPHandler) handleDedaoEbooks(w http.ResponseWriter, r *http.Request) {
 	page, pageSize := parseKBasePagination(r)
 	result, err := h.dedaoContent.ListEbooks(r.URL.Query().Get("q"), page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoCourses(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parseKBasePagination(r)
+	result, err := h.dedaoContent.ListCourses(r.URL.Query().Get("q"), page, pageSize)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
 		return
