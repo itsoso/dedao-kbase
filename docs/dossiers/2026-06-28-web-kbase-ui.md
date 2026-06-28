@@ -1,7 +1,7 @@
 ---
 slug: 2026-06-28-web-kbase-ui
-status: building
-current_stage: S5
+status: ready-for-user-verification
+current_stage: S7
 last-reviewed: 2026-06-28
 ---
 
@@ -34,17 +34,18 @@ last-reviewed: 2026-06-28
 | S2 PRD | 轻量 PRD | `docs/plans/2026-06-28-web-kbase-ui-design.md` |
 | S3 规划 | 实现计划 | `docs/plans/2026-06-28-web-kbase-ui.md` |
 | S5 实现 | 分支 | `codex/web-kbase-ui-kbase` |
-| S6 构建 | 待完成 | |
+| S6 构建 | 前端构建与后端 kbase 窄测 | `npm run build`; `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1` |
+| S7 验证 | 待浏览器实测 | 用户输入 token 后访问 `http://127.0.0.1:8719/` |
 
 ## Gate 裁决记录
 | Gate | 裁决 | 依据 / 日期 |
 |---|---|---|
 | G1 准入 | PASS | 映射到私有 kbase 浏览器 UI;最小端到端切片为连接 token -> 列书 -> 搜索 -> 看详情;2026-06-28 |
 | G2 可行性 | PASS | 用户确认采用独立 Web 版 MVP;复用现有 HTTP API,首版只读;2026-06-28 |
-| G3 测试 | IN PROGRESS | kbase 窄测绿;全量 `go test ./...` 基线红在无关 `backend/utils.TestPrintToPdf` Chrome/chromedp 环境超时 |
-| G4 评审 | IN PROGRESS | 需复查 `/api/*` Bearer token 不被静态托管绕过 |
-| G5 构建健康 | 待跑 | |
-| G6 验证 | 待用户确认 | |
+| G3 测试 | PARTIAL PASS | `node frontend-web/scripts/web-kbase-ui-smoke.mjs` PASS; `go test ./backend/app -run 'TestKBaseHTTPHandler' -count=1` PASS;全量 `go test ./...` 仍红在无关 `backend/utils.TestPrintToPdf` Chrome/chromedp 60s 超时;2026-06-28 |
+| G4 评审 | PASS | `TestKBaseHTTPHandlerServesWebAssets` 覆盖静态资源、SPA fallback、`/api/books` 无 token 仍 401;2026-06-28 |
+| G5 构建健康 | PASS | `cd frontend-web && npm run build` PASS; `git diff --check` PASS;2026-06-28 |
+| G6 验证 | 待用户确认 | 需要在本地启动 `cmd/kbase-server` 后用浏览器输入 token 做端到端验收 |
 
 ## 待拍板决策(STOP 问人)
 - 已拍板:选择独立 Web 版书籍知识库页面,首版只读,使用现有 kbase HTTP API。
@@ -58,5 +59,6 @@ last-reviewed: 2026-06-28
 - `frontend/src/views/BookKnowledge.vue` 是 Wails 桌面工作台,依赖 Wails bindings,不适合直接作为浏览器 web UI。
 
 ## 沉淀(S8)
-- 待完成后更新 README web 使用说明。
-- 代码结构会新增 `frontend-web/` 和 kbase static serving;已新增最小 system-map 入口,后续如要加入计数需走生成文件。
+- README 已更新 Web UI 构建、启动和 token 使用说明。
+- 代码结构新增 `frontend-web/` 和 kbase static serving;已新增最小 system-map 入口,后续如要加入计数需走生成文件。
+- 完成分支流程当前不能进入 merge/PR 选项:全量 `go test ./...` 被既有 `backend/utils.TestPrintToPdf` chromedp 环境问题阻塞。
