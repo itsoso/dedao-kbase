@@ -186,6 +186,7 @@ import PageAnalysisPanel from '../components/PageAnalysisPanel.vue'
 const storageKey = 'dedao-kbase-web-settings'
 const route = useRoute()
 type ColumnMode = 1 | 2 | 3
+type SVGContentBox = { minX: number; minY: number; maxX: number; maxY: number }
 
 const columnModes: Array<{ value: ColumnMode; label: string }> = [
   { value: 1, label: '单栏' },
@@ -242,7 +243,7 @@ const svgFrames = computed(() =>
   (pageResponse.value?.pages || []).map((page) => ({
     key: `${page.page_num}-${page.begin_offset}-${page.end_offset}`,
     pageNum: page.page_num,
-    srcdoc: svgToSrcdoc(normalizeEbookSvg(page.svg)),
+    srcdoc: svgToSrcdoc(page.svg),
   })),
 )
 const visibleFrames = computed(() => svgFrames.value)
@@ -531,13 +532,42 @@ const extractSVGText = (svg: string) => {
   }
   try {
     const doc = new DOMParser().parseFromString(svg, 'image/svg+xml')
-    return Array.from(doc.querySelectorAll('text,tspan'))
-      .map((node) => node.textContent?.trim() || '')
-      .filter(Boolean)
-      .join('\n')
+    return extractSVGTextFromDocument(doc)
   } catch {
     return svg.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
   }
+}
+
+const extractSVGTextFromDocument = (doc: Document) => {
+  const textNodes = Array.from(doc.querySelectorAll('text,tspan')).filter((node) => {
+    if (node.nodeName.toLowerCase() !== 'text') {
+      return true
+    }
+    return !node.querySelector('tspan')
+  })
+  const rows = new Map<number, Array<{ index: number; x: number; text: string }>>()
+  textNodes.forEach((node, index) => {
+    const text = node.textContent?.replace(/\s+/g, ' ').trim() || ''
+    if (!text) {
+      return
+    }
+    const x = readSVGCoordinate(node, 'x')
+    const y = readSVGCoordinate(node, 'y')
+    const rowKey = Math.round(y / 8) * 8 || index
+    const row = rows.get(rowKey) || []
+    row.push({ index, x, text })
+    rows.set(rowKey, row)
+  })
+  return Array.from(rows.entries())
+    .sort(([a], [b]) => a - b)
+    .map(([, row]) =>
+      row
+        .sort((a, b) => a.x - b.x || a.index - b.index)
+        .map((item) => item.text)
+        .join(''),
+    )
+    .filter(Boolean)
+    .join('\n')
 }
 
 const estimateEbookTotalPageCount = () => {
@@ -576,6 +606,76 @@ const normalizeEbookSvg = (svg: string) => {
   }
 }
 
+const ebookSvgTextFallback = (svg: string) => {
+  const source = svg.trim()
+  if (!source) {
+    return ''
+  }
+  try {
+    const doc = new DOMParser().parseFromString(source, 'image/svg+xml')
+    const svgElement = doc.documentElement
+    if (svgElement.nodeName.toLowerCase() !== 'svg') {
+      return ''
+    }
+    const text = extractSVGTextFromDocument(doc)
+    if (text.length < 12) {
+      return ''
+    }
+    const contentBox = computeEbookSvgContentBox(svgElement)
+    const rootHeight = parseSVGLength(svgElement.getAttribute('height'))
+    const textNodeCount = svgElement.querySelectorAll('text,tspan').length
+    const complexVisualCount = svgElement.querySelectorAll('image,path,polygon,polyline,circle,ellipse').length
+    if (!contentBox || !rootHeight || textNodeCount < 6 || complexVisualCount > 0) {
+      return ''
+    }
+    const contentHeight = contentBox.maxY - contentBox.minY
+    const compressedTextCanvas = contentHeight > 0 && rootHeight > 3000 && contentHeight / rootHeight < 0.08
+    return compressedTextCanvas ? text : ''
+  } catch {
+    return ''
+  }
+}
+
+const computeEbookSvgContentBox = (svgElement: Element): SVGContentBox | null => {
+  const boxes: SVGContentBox[] = []
+  svgElement.querySelectorAll('text,tspan').forEach((node) => {
+    const text = node.textContent?.trim() || ''
+    if (!text) {
+      return
+    }
+    const x = readSVGCoordinate(node, 'x')
+    const y = readSVGCoordinate(node, 'y')
+    const fontSize = readSVGFontSize(node)
+    boxes.push({
+      minX: x,
+      minY: Math.max(0, y - fontSize),
+      maxX: x + Math.max(fontSize, text.length * fontSize * 0.6),
+      maxY: y + fontSize * 0.35,
+    })
+  })
+  svgElement.querySelectorAll('image,rect').forEach((node) => {
+    const x = readSVGCoordinate(node, 'x')
+    const y = readSVGCoordinate(node, 'y')
+    const width = parseSVGLength(node.getAttribute('width'))
+    const height = parseSVGLength(node.getAttribute('height'))
+    if (width && height) {
+      boxes.push({ minX: x, minY: y, maxX: x + width, maxY: y + height })
+    }
+  })
+  if (!boxes.length) {
+    return null
+  }
+  return boxes.reduce<SVGContentBox>(
+    (bounds, box) => ({
+      minX: Math.min(bounds.minX, box.minX),
+      minY: Math.min(bounds.minY, box.minY),
+      maxX: Math.max(bounds.maxX, box.maxX),
+      maxY: Math.max(bounds.maxY, box.maxY),
+    }),
+    boxes[0],
+  )
+}
+
 const parseSVGLength = (value: string | null) => {
   if (!value) {
     return 0
@@ -584,13 +684,74 @@ const parseSVGLength = (value: string | null) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
 }
 
+const parseSVGNumber = (value: string | null) => {
+  if (!value) {
+    return 0
+  }
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+const readSVGCoordinate = (node: Element, attr: 'x' | 'y') => {
+  let current: Element | null = node
+  while (current) {
+    const value = current.getAttribute(attr)
+    if (value) {
+      return parseSVGNumber(value)
+    }
+    current = current.parentElement
+  }
+  return 0
+}
+
+const readSVGFontSize = (node: Element) => {
+  let current: Element | null = node
+  while (current) {
+    const attrSize = parseSVGLength(current.getAttribute('font-size'))
+    if (attrSize) {
+      return attrSize
+    }
+    const styleSize = /font-size\s*:\s*([0-9.]+)/i.exec(current.getAttribute('style') || '')?.[1]
+    const parsedStyleSize = parseSVGLength(styleSize || null)
+    if (parsedStyleSize) {
+      return parsedStyleSize
+    }
+    current = current.parentElement
+  }
+  return 24
+}
+
 const compactLines = (lines: Array<string | number | undefined | null>) =>
   lines
     .map((line) => String(line ?? '').trim())
     .filter(Boolean)
     .join('\n')
 
-const svgToSrcdoc = (svg: string) => `<!doctype html>
+const escapeHTML = (value: string) =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+
+const textToParagraphs = (text: string) =>
+  text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `<p>${escapeHTML(line)}</p>`)
+    .join('')
+
+const svgToSrcdoc = (svg: string) => {
+  const textFallback = ebookSvgTextFallback(svg)
+  if (textFallback) {
+    return textPageSrcdoc(textFallback)
+  }
+  return svgPageSrcdoc(normalizeEbookSvg(svg))
+}
+
+const svgPageSrcdoc = (svg: string) => `<!doctype html>
 <html>
   <head>
     <meta charset="utf-8" />
@@ -616,6 +777,44 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
     </style>
   </head>
   <body>${svg || ''}</body>
+</html>`
+
+const textPageSrcdoc = (text: string) => `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+      }
+      body {
+        color: #3f3f3f;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      }
+      .ebook-text-page {
+        box-sizing: border-box;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        padding: 4vh 5.5vw;
+        overflow: hidden;
+        font-size: clamp(18px, 1.22vw, 27px);
+        font-weight: 500;
+        line-height: 1.9;
+        letter-spacing: 0;
+      }
+      .ebook-text-page p {
+        margin: 0 0 1.05em;
+      }
+    </style>
+  </head>
+  <body><main class="ebook-text-page">${textToParagraphs(text)}</main></body>
 </html>`
 </script>
 
