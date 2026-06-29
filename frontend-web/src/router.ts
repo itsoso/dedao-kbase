@@ -135,6 +135,7 @@ const routes: RouteRecordRaw[] = [
       title: '电子书阅读',
       scope: 'ebook_detail_reader',
       status: 'online',
+      immersive: true,
       source: 'frontend/src/views/Ebook.vue',
       desktopMethods: ['EbookDetail', 'EbookInfo', 'EbookPage'],
     },

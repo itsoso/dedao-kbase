@@ -1,6 +1,6 @@
 <template>
-  <main class="dedao-web-shell">
-    <nav class="shell-nav compact-shell-nav" aria-label="Dedao desktop navigation">
+  <main class="dedao-web-shell" :class="{ 'immersive-shell': route.meta.immersive }">
+    <nav v-if="!route.meta.immersive" class="shell-nav compact-shell-nav" aria-label="Dedao desktop navigation">
       <router-link
         v-for="item in navigationItems"
         :key="item.path"
