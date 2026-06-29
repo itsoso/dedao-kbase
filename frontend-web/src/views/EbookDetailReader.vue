@@ -57,16 +57,12 @@
     <section v-if="settingsOpen" class="reader-settings-strip">
       <label>
         <span>字号</span>
-        <input v-model.number="readerScale" type="range" min="0.86" max="1.18" step="0.04" />
+        <input v-model.number="readerScale" type="range" min="0.86" max="1.18" step="0.04" @change="saveCurrentReadingProgress" />
       </label>
       <label>
         <span>每次加载</span>
         <select v-model.number="pageLoadCount" @change="reloadCurrentChapter">
-          <option :value="1">1 页</option>
-          <option :value="2">2 页</option>
-          <option :value="4">4 页</option>
-          <option :value="6">6 页</option>
-          <option :value="8">8 页</option>
+          <option v-for="count in pageLoadCountOptions" :key="count" :value="count">{{ count }} 页</option>
         </select>
       </label>
       <span class="reader-state" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</span>
@@ -189,15 +185,29 @@ import {
 import PageAnalysisPanel from '../components/PageAnalysisPanel.vue'
 
 const storageKey = 'dedao-kbase-web-settings'
+const ebookReaderProgressStorageKey = 'dedao-kbase-web-ebook-progress'
 const route = useRoute()
 type ColumnMode = 1 | 2 | 3
 type SVGContentBox = { minX: number; minY: number; maxX: number; maxY: number }
+type EbookReaderProgress = {
+  chapterID: string
+  chapterTitle?: string
+  pageIndex: number
+  columnMode?: ColumnMode
+  pageLoadCount?: number
+  readerScale?: number
+  updatedAt: string
+}
+type EbookReaderProgressMap = Record<string, EbookReaderProgress>
 
 const columnModes: Array<{ value: ColumnMode; label: string }> = [
   { value: 1, label: '单栏' },
   { value: 2, label: '双栏' },
   { value: 3, label: '三栏' },
 ]
+const defaultColumnMode: ColumnMode = 1
+const defaultPageLoadCount = 8
+const pageLoadCountOptions = [1, 2, 4, 6, 8]
 
 const baseUrl = ref(window.location.origin)
 const token = ref('')
@@ -215,9 +225,9 @@ const settingsOpen = ref(false)
 const searchOpen = ref(false)
 const analysisOpen = ref(false)
 const readerSearchQuery = ref('')
-const columnMode = ref<ColumnMode>(2)
+const columnMode = ref<ColumnMode>(defaultColumnMode)
 const readerScale = ref(1)
-const pageLoadCount = ref(2)
+const pageLoadCount = ref(defaultPageLoadCount)
 const readerRootRef = ref<HTMLElement | null>(null)
 const readerFullscreen = ref(false)
 const autoAdvanceRunning = ref(false)
@@ -315,6 +325,7 @@ onMounted(async () => {
   document.addEventListener('fullscreenchange', syncReaderFullscreenState)
   window.addEventListener('keydown', handleReaderKeydown)
   window.addEventListener('message', handleReaderFrameMessage)
+  window.addEventListener('beforeunload', handleReaderBeforeUnload)
   restoreConnection()
   try {
     await hydrateBrowserSession()
@@ -325,9 +336,11 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  saveCurrentReadingProgress()
   document.removeEventListener('fullscreenchange', syncReaderFullscreenState)
   window.removeEventListener('keydown', handleReaderKeydown)
   window.removeEventListener('message', handleReaderFrameMessage)
+  window.removeEventListener('beforeunload', handleReaderBeforeUnload)
 })
 
 const restoreConnection = () => {
@@ -357,6 +370,93 @@ const hydrateBrowserSession = async () => {
   }
 }
 
+const readReadingProgressMap = (): EbookReaderProgressMap => {
+  const raw = localStorage.getItem(ebookReaderProgressStorageKey)
+  if (!raw) {
+    return {}
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' ? (parsed as EbookReaderProgressMap) : {}
+  } catch (error) {
+    console.warn('Failed to parse ebook reader progress', error)
+    localStorage.removeItem(ebookReaderProgressStorageKey)
+    return {}
+  }
+}
+
+const restoreReadingProgress = () => {
+  const progress = readReadingProgressMap()[enid.value]
+  if (!progress) {
+    return null
+  }
+  columnMode.value = normalizeColumnMode(progress.columnMode)
+  pageLoadCount.value = normalizePageLoadCount(progress.pageLoadCount)
+  readerScale.value = normalizeReaderScale(progress.readerScale)
+  const item = readableCatalogItems.value.find((catalogItem) => catalogItem.chapter_id === progress.chapterID)
+  if (!item) {
+    return null
+  }
+  return {
+    item,
+    pageIndex: normalizePageIndex(progress.pageIndex),
+  }
+}
+
+const saveCurrentReadingProgress = () => {
+  if (!selectedChapterID.value) {
+    return
+  }
+  saveReadingProgress(selectedChapterID.value, pageResponse.value?.index || 0)
+}
+
+const saveReadingProgress = (chapterID: string, pageIndex: number) => {
+  if (!enid.value || !chapterID) {
+    return
+  }
+  const progressMap = readReadingProgressMap()
+  progressMap[enid.value] = {
+    chapterID,
+    chapterTitle: selectedChapterTitle.value,
+    pageIndex: normalizePageIndex(pageIndex),
+    columnMode: columnMode.value,
+    pageLoadCount: pageLoadCount.value,
+    readerScale: readerScale.value,
+    updatedAt: new Date().toISOString(),
+  }
+  try {
+    localStorage.setItem(ebookReaderProgressStorageKey, JSON.stringify(progressMap))
+  } catch (error) {
+    console.warn('Failed to save ebook reader progress', error)
+  }
+}
+
+const normalizeColumnMode = (value: unknown): ColumnMode => {
+  const mode = Number(value)
+  return mode === 1 || mode === 2 || mode === 3 ? mode : defaultColumnMode
+}
+
+const normalizePageLoadCount = (value: unknown) => {
+  const count = Number(value)
+  return pageLoadCountOptions.includes(count) ? count : defaultPageLoadCount
+}
+
+const normalizeReaderScale = (value: unknown) => {
+  const scale = Number(value)
+  if (!Number.isFinite(scale)) {
+    return 1
+  }
+  return Math.min(1.18, Math.max(0.86, scale))
+}
+
+const normalizePageIndex = (value: unknown) => {
+  const pageIndex = Number(value)
+  if (!Number.isFinite(pageIndex) || pageIndex < 0) {
+    return 0
+  }
+  return Math.floor(pageIndex)
+}
+
 const loadDetail = async () => {
   if (!token.value) {
     connected.value = false
@@ -371,6 +471,11 @@ const loadDetail = async () => {
     saveConnection()
     detail.value = await client.value.getDedaoEbookDetail(enid.value)
     connected.value = true
+    const restoredProgress = restoreReadingProgress()
+    if (restoredProgress) {
+      await openChapter(restoredProgress.item, restoredProgress.pageIndex)
+      return
+    }
     const firstReadable = readableCatalogItems.value[0]
     if (firstReadable) {
       await openChapter(firstReadable)
@@ -383,21 +488,20 @@ const loadDetail = async () => {
   }
 }
 
-const openChapter = async (item: DedaoEbookCatalogItem) => {
+const openChapter = async (item: DedaoEbookCatalogItem, pageIndex = 0) => {
   if (!item.chapter_id) {
     return
   }
   selectedChapterID.value = item.chapter_id
   selectedChapterTitle.value = item.text
   catalogOpen.value = false
-  await loadChapterPages(item.chapter_id, 0)
+  await loadChapterPages(item.chapter_id, pageIndex)
   scrollReaderToTop()
 }
 
-const setColumnMode = async (mode: ColumnMode) => {
+const setColumnMode = (mode: ColumnMode) => {
   columnMode.value = mode
-  pageLoadCount.value = mode
-  await reloadCurrentChapter()
+  saveCurrentReadingProgress()
 }
 
 const reloadCurrentChapter = async () => {
@@ -436,12 +540,17 @@ const loadChapterPages = async (chapterID: string, index: number) => {
   pageError.value = ''
   try {
     pageResponse.value = await client.value.getDedaoEbookChapterPages(enid.value, chapterID, index, pageLoadCount.value, 0)
+    saveReadingProgress(chapterID, pageResponse.value.index)
   } catch (error) {
     pageResponse.value = null
     pageError.value = error instanceof Error ? error.message : String(error)
   } finally {
     pageLoading.value = false
   }
+}
+
+const handleReaderBeforeUnload = () => {
+  saveCurrentReadingProgress()
 }
 
 const toggleFullscreen = async () => {
