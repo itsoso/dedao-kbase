@@ -767,18 +767,6 @@ label span {
   flex: 0 0 auto;
 }
 
-.mode-strip {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 6px;
-  margin-bottom: 8px;
-}
-
-.mode-strip button {
-  padding: 7px 6px;
-  font-size: 12px;
-}
-
 .prompt-chip-grid {
   display: flex;
   flex-wrap: wrap;

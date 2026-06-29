@@ -73,18 +73,6 @@
           </div>
         </div>
 
-        <div class="mode-strip">
-          <button
-            v-for="mode in chatModes"
-            :key="mode.value"
-            type="button"
-            :class="{ active: chatMode === mode.value }"
-            @click="setChatMode(mode.value)"
-          >
-            {{ mode.label }}
-          </button>
-        </div>
-
         <div class="prompt-chip-grid">
           <button
             v-for="prompt in promptTemplates"
@@ -302,13 +290,6 @@ import { renderMarkdown } from '../utils/markdownRender'
 const storageKey = 'dedao-kbase-web-settings'
 const layoutStorageKey = 'dedao-kbase-web-layout'
 const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'Jobs', 'System KB', 'Skills/API', 'Ops']
-const chatModes = [
-  { value: 'chat', label: '问答' },
-  { value: 'summary', label: '总结' },
-  { value: 'analysis', label: '分析' },
-  { value: 'actions', label: '行动' },
-  { value: 'rules', label: '规则' },
-]
 const chatModelOptions = [
   { value: 'qwen3.7-max', label: 'Qwen-3.7-Max' },
   { value: 'MiniMax-M2.5', label: 'MiniMax-M2.5' },
@@ -358,7 +339,7 @@ const activeContextPanel = ref('')
 const systemKBPayload = ref<Record<string, unknown> | null>(null)
 const promptTemplates = ref<BookKnowledgePrompt[]>([])
 const selectedPromptID = ref('')
-const chatMode = ref('chat')
+const selectedPromptCategory = ref('chat')
 const chatQuestion = ref('')
 const selectedChatModel = ref('qwen3.7-max')
 const pendingChatRequests = ref(0)
@@ -664,13 +645,9 @@ const routeUrl = (path: string) => {
   return `${serviceBaseUrl.value}${path}`
 }
 
-const setChatMode = (mode: string) => {
-  chatMode.value = mode
-}
-
 const applyPrompt = (prompt: BookKnowledgePrompt) => {
   selectedPromptID.value = prompt.prompt_id
-  chatMode.value = 'chat'
+  selectedPromptCategory.value = prompt.category || 'chat'
   chatQuestion.value = prompt.prompt
 }
 
@@ -682,6 +659,7 @@ const clearChatDraft = () => {
 
 const resetBookStudyState = () => {
   selectedPromptID.value = ''
+  selectedPromptCategory.value = 'chat'
   chatQuestion.value = ''
   chatResponse.value = null
   chatHistory.value = []
@@ -694,7 +672,7 @@ const resetBookStudyState = () => {
 const sendChat = async () => {
   const requestBookID = selectedBookID.value
   const requestQuestion = chatQuestion.value.trim()
-  const requestMode = chatMode.value
+  const requestMode = selectedPromptCategory.value || 'chat'
   const requestModel = selectedChatModel.value
   if (!requestBookID || !requestQuestion) {
     return
@@ -723,7 +701,7 @@ const sendChat = async () => {
 }
 
 const restoreChatHistory = (item: BookKnowledgeChatHistoryItem) => {
-  chatMode.value = item.mode
+  selectedPromptCategory.value = item.mode || 'chat'
   chatQuestion.value = item.question
   selectedChatModel.value = item.model || selectedChatModel.value
   chatResponse.value = {
