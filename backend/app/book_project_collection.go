@@ -1,11 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -15,6 +18,7 @@ const (
 	bookKnowledgeProjectAuditStatusPending      = "pending_async_audit"
 	bookKnowledgeProjectCollectionFileName      = "collection.json"
 	bookKnowledgeProjectCollectionSchemaVersion = "1"
+	bookKnowledgeProjectCollectionExportV1      = "dedao_project_collection_jsonl_v1"
 )
 
 type BookKnowledgeProjectCollection struct {
@@ -46,7 +50,9 @@ type BookKnowledgeProjectCollectionItem struct {
 	Decision          string   `json:"decision"`
 	AllowedUses       []string `json:"allowed_uses,omitempty"`
 	BlockedUses       []string `json:"blocked_uses,omitempty"`
+	RiskFlags         []string `json:"risk_flags,omitempty"`
 	SourceHash        string   `json:"source_hash"`
+	Citations         []string `json:"citations,omitempty"`
 }
 
 type BookKnowledgeProjectAuditItem struct {
@@ -64,6 +70,9 @@ type BookKnowledgeProjectAuditItem struct {
 	SourceHash   string   `json:"source_hash"`
 	AllowedUses  []string `json:"allowed_uses,omitempty"`
 	BlockedUses  []string `json:"blocked_uses,omitempty"`
+	RiskFlags    []string `json:"risk_flags,omitempty"`
+	Citations    []string `json:"citations,omitempty"`
+	Failures     []string `json:"failure_reasons,omitempty"`
 	CreatedAt    string   `json:"created_at"`
 }
 
@@ -73,6 +82,35 @@ type BookKnowledgeProjectAuditQueue struct {
 	AuditItems   []BookKnowledgeProjectAuditItem `json:"audit_items"`
 	Total        int                             `json:"total"`
 	Limit        int                             `json:"limit"`
+}
+
+type BookKnowledgeProjectCollectionExportRecord struct {
+	ConsumerContract string   `json:"consumer_contract"`
+	SchemaVersion    string   `json:"schema_version"`
+	CollectionID     string   `json:"collection_id"`
+	GeneratedAt      string   `json:"generated_at"`
+	ProjectID        string   `json:"project_id"`
+	TargetSystem     string   `json:"target_system"`
+	ExportType       string   `json:"export_type"`
+	SourcePolicy     string   `json:"source_policy"`
+	HumanLoop        string   `json:"human_loop"`
+	BookID           string   `json:"book_id"`
+	BookTitle        string   `json:"book_title"`
+	ChapterID        string   `json:"chapter_id,omitempty"`
+	ChapterTitle     string   `json:"chapter_title,omitempty"`
+	ClaimID          string   `json:"claim_id"`
+	Title            string   `json:"title"`
+	Summary          string   `json:"summary"`
+	Verification     float64  `json:"verification_score"`
+	RiskTier         string   `json:"risk_tier"`
+	Decision         string   `json:"decision"`
+	AllowedUses      []string `json:"allowed_uses,omitempty"`
+	BlockedUses      []string `json:"blocked_uses,omitempty"`
+	RiskFlags        []string `json:"risk_flags,omitempty"`
+	Citations        []string `json:"citations,omitempty"`
+	SourceHash       string   `json:"source_hash"`
+	AuditStatus      string   `json:"audit_status"`
+	AuditReason      string   `json:"audit_reason,omitempty"`
 }
 
 func (s *BookKnowledgeStore) ProjectDir(projectID string) string {
@@ -148,6 +186,23 @@ func (s *BookKnowledgeStore) LoadProjectAuditQueue(projectID string, limit int) 
 	}, nil
 }
 
+func (s *BookKnowledgeStore) ExportProjectCollectionJSONL(projectID string) ([]byte, error) {
+	collection, err := s.LoadProjectCollection(projectID)
+	if err != nil {
+		return nil, err
+	}
+	records := projectCollectionExportRecords(collection)
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	for _, record := range records {
+		if err := encoder.Encode(record); err != nil {
+			return nil, err
+		}
+	}
+	return out.Bytes(), nil
+}
+
 func buildProjectCollectionFromReport(report *BookKnowledgeProjectVerificationReport) *BookKnowledgeProjectCollection {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	items := make([]BookKnowledgeProjectCollectionItem, 0, len(report.Items))
@@ -191,7 +246,9 @@ func projectCollectionItemFromVerified(verified BookKnowledgeVerifiedItem) BookK
 		Decision:          verified.Decision,
 		AllowedUses:       append([]string(nil), verified.AllowedUses...),
 		BlockedUses:       append([]string(nil), verified.BlockedUses...),
+		RiskFlags:         append([]string(nil), verified.RiskFlags...),
 		SourceHash:        verified.Provenance.SourceHash,
+		Citations:         append([]string(nil), verified.Provenance.Citations...),
 	}
 }
 
@@ -211,7 +268,93 @@ func projectAuditItemFromVerified(verified BookKnowledgeVerifiedItem, reason, no
 		SourceHash:   verified.Provenance.SourceHash,
 		AllowedUses:  append([]string(nil), verified.AllowedUses...),
 		BlockedUses:  append([]string(nil), verified.BlockedUses...),
+		RiskFlags:    append([]string(nil), verified.RiskFlags...),
+		Citations:    append([]string(nil), verified.Provenance.Citations...),
+		Failures:     append([]string(nil), verified.FailureReasons...),
 		CreatedAt:    now,
+	}
+}
+
+func projectCollectionExportRecords(collection *BookKnowledgeProjectCollection) []BookKnowledgeProjectCollectionExportRecord {
+	auditByClaim := map[string]BookKnowledgeProjectAuditItem{}
+	for _, item := range collection.AuditQueue {
+		auditByClaim[projectAuditLookupKey(item.ClaimID, item.SourceHash)] = item
+	}
+	records := make([]BookKnowledgeProjectCollectionExportRecord, 0, len(collection.Items))
+	for _, item := range collection.Items {
+		auditStatus := "not_required"
+		auditReason := ""
+		if audit, ok := auditByClaim[projectAuditLookupKey(item.ClaimID, item.SourceHash)]; ok {
+			auditStatus = firstNonEmpty(audit.ReviewStatus, bookKnowledgeProjectAuditStatusPending)
+			auditReason = audit.SampleReason
+		}
+		records = append(records, BookKnowledgeProjectCollectionExportRecord{
+			ConsumerContract: bookKnowledgeProjectCollectionExportV1,
+			SchemaVersion:    collection.Version,
+			CollectionID:     collection.CollectionID,
+			GeneratedAt:      collection.GeneratedAt,
+			ProjectID:        collection.ProjectID,
+			TargetSystem:     collection.Project.TargetSystem,
+			ExportType:       collection.Project.ExportType,
+			SourcePolicy:     collection.Project.SourcePolicy,
+			HumanLoop:        collection.HumanLoop,
+			BookID:           item.BookID,
+			BookTitle:        item.BookTitle,
+			ChapterID:        item.ChapterID,
+			ChapterTitle:     item.ChapterTitle,
+			ClaimID:          item.ClaimID,
+			Title:            item.Title,
+			Summary:          item.Summary,
+			Verification:     item.VerificationScore,
+			RiskTier:         item.RiskTier,
+			Decision:         item.Decision,
+			AllowedUses:      append([]string(nil), item.AllowedUses...),
+			BlockedUses:      append([]string(nil), item.BlockedUses...),
+			RiskFlags:        append([]string(nil), item.RiskFlags...),
+			Citations:        append([]string(nil), item.Citations...),
+			SourceHash:       item.SourceHash,
+			AuditStatus:      auditStatus,
+			AuditReason:      auditReason,
+		})
+	}
+	sort.SliceStable(records, func(i, j int) bool {
+		if records[i].AuditStatus != records[j].AuditStatus {
+			return auditStatusRank(records[i].AuditStatus) < auditStatusRank(records[j].AuditStatus)
+		}
+		if records[i].RiskTier != records[j].RiskTier {
+			return riskTierExportRank(records[i].RiskTier) < riskTierExportRank(records[j].RiskTier)
+		}
+		if records[i].BookID != records[j].BookID {
+			return records[i].BookID < records[j].BookID
+		}
+		return records[i].ClaimID < records[j].ClaimID
+	})
+	return records
+}
+
+func projectAuditLookupKey(claimID, sourceHash string) string {
+	return claimID + "|" + sourceHash
+}
+
+func auditStatusRank(status string) int {
+	if status == "not_required" {
+		return 0
+	}
+	return 1
+}
+
+func riskTierExportRank(riskTier string) int {
+	switch riskTier {
+	case bookKnowledgeRiskAutoUsable:
+		return 0
+	case bookKnowledgeRiskAssistive:
+		return 1
+	case bookKnowledgeRiskNeedsHuman:
+		return 2
+	case bookKnowledgeRiskBlocked:
+		return 3
+	default:
+		return 4
 	}
 }
 

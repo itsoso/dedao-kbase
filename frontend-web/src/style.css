@@ -922,6 +922,10 @@ label span {
   padding: 8px 12px;
 }
 
+.project-policy-head button {
+  flex: 0 0 auto;
+}
+
 .project-policy strong {
   display: block;
   margin-bottom: 6px;
@@ -949,6 +953,21 @@ label span {
 
 .project-collection-summary strong {
   font-size: 13px;
+}
+
+.project-export-route {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  color: var(--dedao-muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.project-export-preview {
+  max-height: 220px;
+  margin-bottom: 10px;
+  overflow: auto;
 }
 
 .chat-history {

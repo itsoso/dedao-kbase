@@ -141,6 +141,7 @@ for (const surface of [
   'refreshProjectCollection',
   'getProjectCollection',
   'getProjectAuditQueue',
+  'getProjectCollectionExport',
   'getSystemKBManifest',
   'getSystemKBExport',
 ]) {
@@ -162,6 +163,7 @@ assert.ok(workbenchSource.includes('verificationReport'), 'KBaseWorkbench.vue sh
 assert.ok(workbenchSource.includes('projectCollection'), 'KBaseWorkbench.vue should render persisted project collections')
 assert.ok(workbenchSource.includes('projectAuditQueue'), 'KBaseWorkbench.vue should render project async audit queue items')
 assert.ok(workbenchSource.includes('refreshProjectCollection'), 'KBaseWorkbench.vue should allow refreshing project collections')
+assert.ok(workbenchSource.includes('projectCollectionExportPath'), 'KBaseWorkbench.vue should show the project collection export path')
 assert.ok(workbenchSource.includes('pending_async_audit'), 'KBaseWorkbench.vue should expose async audit status')
 assert.ok(workbenchSource.includes('verification_score'), 'KBaseWorkbench.vue should expose verification scores')
 assert.ok(workbenchSource.includes('risk_tier'), 'KBaseWorkbench.vue should expose risk tiers')
@@ -202,6 +204,8 @@ assert.ok(apiSource.includes('BookKnowledgeProjectCollection'), 'api.ts should t
 assert.ok(apiSource.includes('BookKnowledgeProjectAuditQueue'), 'api.ts should type project audit queues')
 assert.ok(apiSource.includes('collection/refresh'), 'api.ts should call project collection refresh endpoints')
 assert.ok(apiSource.includes('audit-queue'), 'api.ts should call project audit queue endpoints')
+assert.ok(apiSource.includes('collection/export?format=jsonl'), 'api.ts should call project collection JSONL export endpoints')
+assert.ok(apiSource.includes('requestText'), 'api.ts should support text responses for JSONL exports')
 assert.ok(apiSource.includes('/api/dedao/session'), 'api.ts should call the Dedao session endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/qrcode'), 'api.ts should call the Dedao QR login endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/check'), 'api.ts should call the Dedao login polling endpoint')

@@ -113,3 +113,30 @@ git diff --check
 ```
 
 Then sync `frontend-web/dist/` and restart/verify the online KBase service.
+
+### Task 4: Downstream Consumer JSONL Export
+
+**Files:**
+- `backend/app/book_project_collection.go`
+- `backend/app/kbase_http.go`
+- `backend/app/kbase_http_test.go`
+- `frontend-web/src/api.ts`
+- `frontend-web/src/views/KBaseWorkbench.vue`
+- `frontend-web/src/style.css`
+- `frontend-web/scripts/web-kbase-ui-smoke.mjs`
+
+**Step 1: Add the failing HTTP test**
+
+Require `GET /api/projects/{project}/collection/export?format=jsonl` to return newline-delimited JSON records after a collection is generated. Each record must include `consumer_contract`, `collection_id`, `project_id`, `target_system`, `claim_id`, `source_hash`, `risk_tier`, `decision`, allowed/blocked uses, `human_loop`, and audit status.
+
+**Step 2: Implement JSONL export**
+
+Export from the persisted collection only. Do not write into downstream systems. Sort auto-consumable records before async-audit records so downstream consumers can process the low-risk path first.
+
+**Step 3: Surface the consumer route in Web**
+
+Expose a typed text client method, show the JSONL route in the project panel, and provide a bounded preview action for the current collection.
+
+**Step 4: Verify and deploy**
+
+Run the focused HTTP test, Web smoke, frontend build, full Go tests, and whitespace check. Deploy the rebuilt server and static Web bundle, then verify `/health`, the JSONL export endpoint, and unauthorized 401 behavior online.

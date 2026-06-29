@@ -760,6 +760,10 @@ export class KBaseClient {
     )
   }
 
+  async getProjectCollectionExport(projectID: string): Promise<string> {
+    return this.requestText(`/api/projects/${encodeURIComponent(projectID)}/collection/export?format=jsonl`)
+  }
+
   async listJobs(limit = 50): Promise<BookKnowledgeJob[]> {
     const response = await this.request<{ jobs: BookKnowledgeJob[] }>(
       `/api/jobs?limit=${encodeURIComponent(String(limit))}`,
@@ -945,5 +949,27 @@ export class KBaseClient {
       throw new Error(`HTTP ${response.status}: ${body || response.statusText}`)
     }
     return response.json() as Promise<T>
+  }
+
+  private async requestText(path: string, init: RequestInit = {}): Promise<string> {
+    const url = `${this.baseUrl || window.location.origin}${path}`
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.token}`,
+      Accept: 'application/x-ndjson, text/plain, */*',
+    }
+    if (init.body) {
+      headers['Content-Type'] = 'application/json'
+    }
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        ...headers,
+      },
+    })
+    if (!response.ok) {
+      const body = await response.text()
+      throw new Error(`HTTP ${response.status}: ${body || response.statusText}`)
+    }
+    return response.text()
   }
 }

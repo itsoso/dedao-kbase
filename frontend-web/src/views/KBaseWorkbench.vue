@@ -294,6 +294,13 @@
               >
                 {{ projectCollectionLoading ? '生成中' : '生成集合' }}
               </button>
+              <button
+                type="button"
+                :disabled="!projectCollection || projectCollectionExportLoading"
+                @click="previewProjectCollectionExport"
+              >
+                {{ projectCollectionExportLoading ? 'Loading' : 'JSONL' }}
+              </button>
             </div>
             <div class="source-chips">
               <span>{{ selectedProject.target_system }}</span>
@@ -302,6 +309,7 @@
               <span v-if="projectHub.verification">{{ projectHub.verification.human_loop }}</span>
               <span v-if="projectCollection">{{ projectCollection.source }}</span>
             </div>
+            <code v-if="projectCollection" class="project-export-route">{{ projectCollectionExportPath }}</code>
           </section>
 
           <section v-if="projectCollection" class="project-summary project-collection-summary">
@@ -367,6 +375,8 @@
               No pending_async_audit items
             </div>
           </div>
+
+          <pre v-if="projectCollectionExportText" class="job-result project-export-preview">{{ projectCollectionExportText }}</pre>
 
           <div class="table-list project-review-list">
             <article v-for="item in reviewQueue?.items || []" :key="`${item.project_id}:${item.claim_id}`" class="table-row">
@@ -486,6 +496,7 @@ const protectedApiRoutes = [
   '/api/projects/health/verification-report',
   '/api/projects/health/collection/refresh',
   '/api/projects/health/audit-queue',
+  '/api/projects/health/collection/export?format=jsonl',
   '/api/system-kb/manifest',
   '/api/system-kb/export',
 ]
@@ -525,8 +536,10 @@ const projectExportPreview = ref<BookKnowledgeProjectExportPreview | null>(null)
 const verificationReport = ref<BookKnowledgeProjectVerificationReport | null>(null)
 const projectCollection = ref<BookKnowledgeProjectCollection | null>(null)
 const projectAuditQueue = ref<BookKnowledgeProjectAuditQueue | null>(null)
+const projectCollectionExportText = ref('')
 const projectLoading = ref(false)
 const projectCollectionLoading = ref(false)
+const projectCollectionExportLoading = ref(false)
 const projectError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 320 })
@@ -540,6 +553,11 @@ const workbenchStyle = computed(() => ({
 
 const serviceBaseUrl = computed(() => {
   return (baseUrl.value || window.location.origin).replace(/\/+$/, '')
+})
+
+const projectCollectionExportPath = computed(() => {
+  const projectID = encodeURIComponent(selectedProjectID.value || 'health')
+  return `/api/projects/${projectID}/collection/export?format=jsonl`
 })
 
 const formattedSystemKB = computed(() => {
@@ -803,6 +821,7 @@ const selectProject = async (projectID: string) => {
   verificationReport.value = null
   projectCollection.value = null
   projectAuditQueue.value = null
+  projectCollectionExportText.value = ''
   await loadProjectHub()
 }
 
@@ -836,6 +855,7 @@ const refreshProjectCollection = async () => {
       projectCollection.value = collection
       projectAuditQueue.value = auditQueue
       verificationReport.value = await client.value.getProjectVerificationReport(projectID, 25)
+      projectCollectionExportText.value = ''
     }
     connected.value = true
   } catch (error) {
@@ -843,6 +863,31 @@ const refreshProjectCollection = async () => {
     projectError.value = error instanceof Error ? error.message : String(error)
   } finally {
     projectCollectionLoading.value = false
+  }
+}
+
+const previewProjectCollectionExport = async () => {
+  if (!token.value || projectCollectionExportLoading.value) {
+    return
+  }
+  const projectID = selectedProjectID.value || 'health'
+  projectCollectionExportLoading.value = true
+  projectError.value = ''
+  try {
+    const text = await client.value.getProjectCollectionExport(projectID)
+    if (selectedProjectID.value === projectID) {
+      projectCollectionExportText.value = text
+        .trim()
+        .split('\n')
+        .slice(0, 8)
+        .join('\n')
+    }
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    projectCollectionExportLoading.value = false
   }
 }
 

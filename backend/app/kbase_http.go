@@ -440,6 +440,25 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 			writeHTTPJSON(w, http.StatusOK, collection)
 			return
 		}
+		if len(parts) == 3 && parts[2] == "export" {
+			if !requireHTTPMethod(w, r, http.MethodGet) {
+				return
+			}
+			format := strings.TrimSpace(r.URL.Query().Get("format"))
+			if format != "" && format != "jsonl" {
+				writeHTTPError(w, http.StatusBadRequest, "format must be jsonl")
+				return
+			}
+			payload, err := h.store.ExportProjectCollectionJSONL(projectID)
+			if err != nil {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
 		if len(parts) != 2 {
 			writeHTTPError(w, http.StatusNotFound, "not found")
 			return

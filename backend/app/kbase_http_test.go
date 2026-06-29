@@ -429,6 +429,80 @@ func TestKBaseHTTPHandlerPersistsProjectCollectionAndAuditQueue(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerExportsProjectCollectionJSONL(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	missingResp := requestKBase(handler, http.MethodGet, "/api/projects/health/collection/export?format=jsonl", "secret-token")
+	if missingResp.Code != http.StatusNotFound {
+		t.Fatalf("missing collection export status = %d, want 404", missingResp.Code)
+	}
+
+	refreshResp := requestKBase(handler, http.MethodPost, "/api/projects/health/collection/refresh?limit=10", "secret-token")
+	if refreshResp.Code != http.StatusOK {
+		t.Fatalf("collection refresh status = %d, body=%s", refreshResp.Code, refreshResp.Body.String())
+	}
+
+	exportResp := requestKBase(handler, http.MethodGet, "/api/projects/health/collection/export?format=jsonl", "secret-token")
+	if exportResp.Code != http.StatusOK {
+		t.Fatalf("collection export status = %d, body=%s", exportResp.Code, exportResp.Body.String())
+	}
+	if contentType := exportResp.Header().Get("Content-Type"); !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("collection export content-type = %q, want ndjson", contentType)
+	}
+	lines := strings.Split(strings.TrimSpace(exportResp.Body.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("export line count = %d, want 3; body=%s", len(lines), exportResp.Body.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first export line is not JSON: %v; line=%s", err, lines[0])
+	}
+	for _, key := range []string{
+		"consumer_contract",
+		"collection_id",
+		"project_id",
+		"target_system",
+		"claim_id",
+		"source_hash",
+		"risk_tier",
+		"decision",
+		"allowed_uses",
+		"blocked_uses",
+		"human_loop",
+		"audit_status",
+	} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("first export line missing %q: %#v", key, first)
+		}
+	}
+	if first["consumer_contract"] != "dedao_project_collection_jsonl_v1" ||
+		first["project_id"] != "health" ||
+		first["target_system"] != "health-llm-driven" ||
+		first["claim_id"] != "verify-claim-study" {
+		t.Fatalf("first export line has wrong identity fields: %#v", first)
+	}
+	if first["audit_status"] != "not_required" {
+		t.Fatalf("first export line audit_status = %#v, want not_required", first["audit_status"])
+	}
+	if !strings.Contains(exportResp.Body.String(), `"audit_status":"pending_async_audit"`) ||
+		!strings.Contains(exportResp.Body.String(), `"audit_reason":"health_sensitive_claim"`) ||
+		!strings.Contains(exportResp.Body.String(), `"audit_reason":"missing_citation"`) {
+		t.Fatalf("export missing async audit fields: %s", exportResp.Body.String())
+	}
+
+	badFormatResp := requestKBase(handler, http.MethodGet, "/api/projects/health/collection/export?format=json", "secret-token")
+	if badFormatResp.Code != http.StatusBadRequest {
+		t.Fatalf("bad format status = %d, want 400", badFormatResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesPageAnalysis(t *testing.T) {
 	var gotTokenPlanAuth string
 	var gotTokenPlanBody string
