@@ -225,6 +225,66 @@ export interface BookKnowledgeProjectVerificationReport {
   policy: BookKnowledgeVerificationPolicy
 }
 
+export interface BookKnowledgeProjectCollectionItem {
+  project_id: string
+  book_id: string
+  book_title: string
+  chapter_id?: string
+  chapter_title?: string
+  claim_id: string
+  title: string
+  summary: string
+  verification_score: number
+  risk_tier: string
+  decision: string
+  allowed_uses?: string[]
+  blocked_uses?: string[]
+  risk_flags?: string[]
+  source_hash: string
+  citations?: string[]
+}
+
+export interface BookKnowledgeProjectAuditItem {
+  audit_id: string
+  project_id: string
+  book_id: string
+  book_title: string
+  claim_id: string
+  title: string
+  summary: string
+  review_status: string
+  sample_reason: string
+  created_at: string
+  source_hash: string
+  failure_reasons?: string[]
+  risk_flags?: string[]
+  citations?: string[]
+}
+
+export interface BookKnowledgeProjectCollection {
+  collection_id: string
+  project_id: string
+  project: BookKnowledgeProject
+  source: string
+  generated_at: string
+  total: number
+  limit: number
+  item_count: number
+  audit_count: number
+  human_loop: string
+  review_sampling: string
+  items: BookKnowledgeProjectCollectionItem[]
+  audit_queue: BookKnowledgeProjectAuditItem[]
+}
+
+export interface BookKnowledgeProjectAuditQueue {
+  project_id: string
+  collection_id: string
+  audit_items: BookKnowledgeProjectAuditItem[]
+  total: number
+  limit: number
+}
+
 export interface BookKnowledgeJob {
   id: string
   type: string
@@ -680,6 +740,23 @@ export class KBaseClient {
   async getProjectVerificationReport(projectID: string, limit = 20): Promise<BookKnowledgeProjectVerificationReport> {
     return this.request<BookKnowledgeProjectVerificationReport>(
       `/api/projects/${encodeURIComponent(projectID)}/verification-report?limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async refreshProjectCollection(projectID: string, limit = 20): Promise<BookKnowledgeProjectCollection> {
+    return this.request<BookKnowledgeProjectCollection>(
+      `/api/projects/${encodeURIComponent(projectID)}/collection/refresh?limit=${encodeURIComponent(String(limit))}`,
+      { method: 'POST' },
+    )
+  }
+
+  async getProjectCollection(projectID: string): Promise<BookKnowledgeProjectCollection> {
+    return this.request<BookKnowledgeProjectCollection>(`/api/projects/${encodeURIComponent(projectID)}/collection`)
+  }
+
+  async getProjectAuditQueue(projectID: string, limit = 20): Promise<BookKnowledgeProjectAuditQueue> {
+    return this.request<BookKnowledgeProjectAuditQueue>(
+      `/api/projects/${encodeURIComponent(projectID)}/audit-queue?limit=${encodeURIComponent(String(limit))}`,
     )
   }
 

@@ -908,6 +908,20 @@ label span {
   margin-bottom: 10px;
 }
 
+.project-policy-head {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.project-policy-head .primary-action {
+  flex: 0 0 auto;
+  min-width: 86px;
+  padding: 8px 12px;
+}
+
 .project-policy strong {
   display: block;
   margin-bottom: 6px;
@@ -923,12 +937,18 @@ label span {
 }
 
 .project-verification-list,
+.project-audit-list,
 .project-review-list {
   max-height: none;
 }
 
-.project-verification-list {
+.project-verification-list,
+.project-audit-list {
   margin-bottom: 10px;
+}
+
+.project-collection-summary strong {
+  font-size: 13px;
 }
 
 .chat-history {

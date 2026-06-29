@@ -138,6 +138,9 @@ for (const surface of [
   'getProjectReviewQueue',
   'getProjectExportPreview',
   'getProjectVerificationReport',
+  'refreshProjectCollection',
+  'getProjectCollection',
+  'getProjectAuditQueue',
   'getSystemKBManifest',
   'getSystemKBExport',
 ]) {
@@ -156,6 +159,10 @@ assert.ok(workbenchSource.includes('projectHub'), 'KBaseWorkbench.vue should ren
 assert.ok(workbenchSource.includes('health') && workbenchSource.includes('proofroom'), 'KBaseWorkbench.vue should expose health and proofroom project tabs')
 assert.ok(workbenchSource.includes('reviewQueue'), 'KBaseWorkbench.vue should render project review queue items')
 assert.ok(workbenchSource.includes('verificationReport'), 'KBaseWorkbench.vue should render project verification reports')
+assert.ok(workbenchSource.includes('projectCollection'), 'KBaseWorkbench.vue should render persisted project collections')
+assert.ok(workbenchSource.includes('projectAuditQueue'), 'KBaseWorkbench.vue should render project async audit queue items')
+assert.ok(workbenchSource.includes('refreshProjectCollection'), 'KBaseWorkbench.vue should allow refreshing project collections')
+assert.ok(workbenchSource.includes('pending_async_audit'), 'KBaseWorkbench.vue should expose async audit status')
 assert.ok(workbenchSource.includes('verification_score'), 'KBaseWorkbench.vue should expose verification scores')
 assert.ok(workbenchSource.includes('risk_tier'), 'KBaseWorkbench.vue should expose risk tiers')
 assert.ok(workbenchSource.includes('Skills/API'), 'KBaseWorkbench.vue should expose skills/API navigation')
@@ -191,6 +198,10 @@ assert.ok(apiSource.includes('DedaoLoginCheck'), 'api.ts should type Dedao login
 assert.ok(apiSource.includes('/api/jobs'), 'api.ts should call jobs endpoints')
 assert.ok(apiSource.includes('/api/projects'), 'api.ts should call project hub endpoints')
 assert.ok(apiSource.includes('verification-report'), 'api.ts should call project verification endpoints')
+assert.ok(apiSource.includes('BookKnowledgeProjectCollection'), 'api.ts should type persisted project collections')
+assert.ok(apiSource.includes('BookKnowledgeProjectAuditQueue'), 'api.ts should type project audit queues')
+assert.ok(apiSource.includes('collection/refresh'), 'api.ts should call project collection refresh endpoints')
+assert.ok(apiSource.includes('audit-queue'), 'api.ts should call project audit queue endpoints')
 assert.ok(apiSource.includes('/api/dedao/session'), 'api.ts should call the Dedao session endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/qrcode'), 'api.ts should call the Dedao QR login endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/check'), 'api.ts should call the Dedao login polling endpoint')

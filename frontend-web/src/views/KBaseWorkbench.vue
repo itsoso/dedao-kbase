@@ -281,15 +281,46 @@
           </section>
 
           <section v-if="selectedProject" class="project-policy">
-            <strong>{{ selectedProject.name }}</strong>
-            <p>{{ selectedProject.description }}</p>
+            <div class="project-policy-head">
+              <div>
+                <strong>{{ selectedProject.name }}</strong>
+                <p>{{ selectedProject.description }}</p>
+              </div>
+              <button
+                type="button"
+                class="primary-action"
+                :disabled="projectLoading || projectCollectionLoading"
+                @click="refreshProjectCollection"
+              >
+                {{ projectCollectionLoading ? '生成中' : '生成集合' }}
+              </button>
+            </div>
             <div class="source-chips">
               <span>{{ selectedProject.target_system }}</span>
               <span>{{ selectedProject.source_policy }}</span>
               <span>{{ selectedProject.requires_review ? 'requires review' : 'read only' }}</span>
               <span v-if="projectHub.verification">{{ projectHub.verification.human_loop }}</span>
+              <span v-if="projectCollection">{{ projectCollection.source }}</span>
             </div>
           </section>
+
+          <section v-if="projectCollection" class="project-summary project-collection-summary">
+            <div>
+              <span>Collection</span>
+              <strong>{{ projectCollection.collection_id }}</strong>
+            </div>
+            <div>
+              <span>Items</span>
+              <strong>{{ projectCollection.item_count }}</strong>
+            </div>
+            <div>
+              <span>Async Audit</span>
+              <strong>{{ projectCollection.audit_count }}</strong>
+            </div>
+          </section>
+          <div v-else-if="!projectLoading" class="empty-state compact">
+            No persisted collection. Generate collection to materialize the latest verified project snapshot.
+          </div>
 
           <div v-if="verificationReport" class="table-list project-verification-list">
             <article
@@ -312,6 +343,29 @@
                 {{ (item.failure_reasons || []).join(', ') }}
               </p>
             </article>
+          </div>
+
+          <div v-if="projectAuditQueue" class="table-list project-audit-list">
+            <article
+              v-for="item in projectAuditQueue.audit_items || []"
+              :key="item.audit_id"
+              class="table-row"
+            >
+              <div class="result-meta">
+                <span>{{ item.review_status || 'pending_async_audit' }}</span>
+                <span>{{ item.sample_reason || 'async_audit' }}</span>
+              </div>
+              <strong>{{ item.title || item.book_title }}</strong>
+              <p>{{ item.summary }}</p>
+              <div class="source-chips">
+                <span>{{ item.book_id }} · {{ item.claim_id }}</span>
+                <span>source_hash: {{ item.source_hash }}</span>
+                <span v-for="reason in item.failure_reasons || []" :key="reason">{{ reason }}</span>
+              </div>
+            </article>
+            <div v-if="!projectLoading && !(projectAuditQueue.audit_items || []).length" class="empty-state compact">
+              No pending_async_audit items
+            </div>
           </div>
 
           <div class="table-list project-review-list">
@@ -387,6 +441,8 @@ import {
   type BookKnowledgePackage,
   type BookKnowledgePrompt,
   type BookKnowledgeProject,
+  type BookKnowledgeProjectAuditQueue,
+  type BookKnowledgeProjectCollection,
   type BookKnowledgeProjectExportPreview,
   type BookKnowledgeProjectReviewQueue,
   type BookKnowledgeProjectVerificationReport,
@@ -428,6 +484,8 @@ const protectedApiRoutes = [
   '/api/projects/health/review-queue',
   '/api/projects/proofroom/export-preview',
   '/api/projects/health/verification-report',
+  '/api/projects/health/collection/refresh',
+  '/api/projects/health/audit-queue',
   '/api/system-kb/manifest',
   '/api/system-kb/export',
 ]
@@ -465,7 +523,10 @@ const selectedProjectID = ref('health')
 const reviewQueue = ref<BookKnowledgeProjectReviewQueue | null>(null)
 const projectExportPreview = ref<BookKnowledgeProjectExportPreview | null>(null)
 const verificationReport = ref<BookKnowledgeProjectVerificationReport | null>(null)
+const projectCollection = ref<BookKnowledgeProjectCollection | null>(null)
+const projectAuditQueue = ref<BookKnowledgeProjectAuditQueue | null>(null)
 const projectLoading = ref(false)
+const projectCollectionLoading = ref(false)
 const projectError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 320 })
@@ -506,6 +567,8 @@ const projectHub = computed(() => ({
   queue: reviewQueue.value,
   preview: projectExportPreview.value,
   verification: verificationReport.value,
+  collection: projectCollection.value,
+  auditQueue: projectAuditQueue.value,
 }))
 
 onMounted(async () => {
@@ -711,15 +774,18 @@ const loadProjectHub = async () => {
     if (!selectedProjectID.value && projects.value.length) {
       selectedProjectID.value = projects.value[0].project_id
     }
-    const [queue, preview, verification] = await Promise.all([
+    const [queue, preview, verification, collectionState] = await Promise.all([
       client.value.getProjectReviewQueue(projectID, 20),
       client.value.getProjectExportPreview(projectID, 20),
       client.value.getProjectVerificationReport(projectID, 20),
+      loadProjectCollectionState(projectID),
     ])
     if (selectedProjectID.value === projectID) {
       reviewQueue.value = queue
       projectExportPreview.value = preview
       verificationReport.value = verification
+      projectCollection.value = collectionState.collection
+      projectAuditQueue.value = collectionState.auditQueue
     }
     connected.value = true
   } catch (error) {
@@ -735,7 +801,49 @@ const selectProject = async (projectID: string) => {
   reviewQueue.value = null
   projectExportPreview.value = null
   verificationReport.value = null
+  projectCollection.value = null
+  projectAuditQueue.value = null
   await loadProjectHub()
+}
+
+const loadProjectCollectionState = async (projectID: string) => {
+  try {
+    const [collection, auditQueue] = await Promise.all([
+      client.value.getProjectCollection(projectID),
+      client.value.getProjectAuditQueue(projectID, 20),
+    ])
+    return { collection, auditQueue }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('HTTP 404')) {
+      return { collection: null, auditQueue: null }
+    }
+    throw error
+  }
+}
+
+const refreshProjectCollection = async () => {
+  if (!token.value || projectCollectionLoading.value) {
+    return
+  }
+  const projectID = selectedProjectID.value || 'health'
+  projectCollectionLoading.value = true
+  projectError.value = ''
+  try {
+    const collection = await client.value.refreshProjectCollection(projectID, 25)
+    const auditQueue = await client.value.getProjectAuditQueue(projectID, 25)
+    if (selectedProjectID.value === projectID) {
+      projectCollection.value = collection
+      projectAuditQueue.value = auditQueue
+      verificationReport.value = await client.value.getProjectVerificationReport(projectID, 25)
+    }
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    projectCollectionLoading.value = false
+  }
 }
 
 const createSelectedBookJob = async () => {
