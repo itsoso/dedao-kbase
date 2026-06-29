@@ -113,7 +113,12 @@
         <div v-if="pageLoading" class="empty-state reader-loading">加载页面中...</div>
         <div v-else-if="svgFrames.length" class="ebook-pages">
           <section v-for="frame in visibleFrames" :key="frame.key" class="ebook-page-shell">
-            <iframe class="ebook-page-frame" title="ebook page" :sandbox="frame.sandbox" :srcdoc="frame.srcdoc"></iframe>
+            <iframe
+              :class="['ebook-page-frame', { 'ebook-page-frame-passive': frame.passive }]"
+              title="ebook page"
+              :sandbox="frame.sandbox"
+              :srcdoc="frame.srcdoc"
+            ></iframe>
             <footer>{{ frame.pageNum }} / {{ totalPageCount || '?' }}</footer>
           </section>
         </div>
@@ -791,11 +796,13 @@ const svgToFrame = (svg: string) => {
     return {
       srcdoc: textPageSrcdoc(textFallback),
       sandbox: 'allow-scripts',
+      passive: false,
     }
   }
   return {
     srcdoc: svgPageSrcdoc(normalizeEbookSvg(svg)),
     sandbox: '',
+    passive: true,
   }
 }
 
@@ -1171,6 +1178,10 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
   background: transparent;
   transform: scale(var(--reader-scale));
   transform-origin: top center;
+}
+
+.ebook-page-frame-passive {
+  pointer-events: none;
 }
 
 .ebook-page-shell footer {

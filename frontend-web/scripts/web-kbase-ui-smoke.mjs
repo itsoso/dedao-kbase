@@ -292,6 +292,8 @@ assert.ok(ebookDetailReaderSource.includes('handleReaderWheel'), 'EbookDetailRea
 assert.ok(ebookDetailReaderSource.includes('handleReaderFrameMessage'), 'EbookDetailReader.vue should receive iframe scroll-boundary paging messages')
 assert.ok(ebookDetailReaderSource.includes('ebook-text-boundary'), 'EbookDetailReader.vue text fallback should post scroll-boundary messages from inside the frame')
 assert.ok(ebookDetailReaderSource.includes('allow-scripts'), 'EbookDetailReader.vue should allow scripts only for generated text fallback frames')
+assert.ok(ebookDetailReaderSource.includes('ebook-page-frame-passive'), 'EbookDetailReader.vue should let SVG frames pass wheel input to the parent reader')
+assert.ok(ebookDetailReaderSource.includes('pointer-events: none'), 'EbookDetailReader.vue passive SVG frames should not swallow parent wheel paging')
 assert.ok(ebookDetailReaderSource.includes('adjacentReadableCatalogItem'), 'EbookDetailReader.vue should skip duplicate catalog entries that point to the same chapter file')
 assert.ok(ebookDetailReaderSource.includes('item.chapter_id !== selectedChapterID.value'), 'EbookDetailReader.vue should advance to a different chapter_id at chapter boundaries')
 assert.ok(ebookDetailReaderSource.includes('--reader-page-height'), 'EbookDetailReader.vue should define an explicit viewport-based reader page height')
