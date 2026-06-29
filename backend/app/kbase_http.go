@@ -154,9 +154,6 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleListProjects(w)
 	case strings.HasPrefix(r.URL.Path, "/api/projects/"):
-		if !requireHTTPMethod(w, r, http.MethodGet) {
-			return
-		}
 		h.handleProjectSubroute(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
@@ -373,7 +370,7 @@ func (h *kbaseHTTPHandler) handleListProjects(w http.ResponseWriter) {
 func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/api/projects/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+	if (len(parts) != 2 && len(parts) != 3) || strings.TrimSpace(parts[0]) == "" {
 		writeHTTPError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -389,6 +386,13 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 	}
 	switch parts[1] {
 	case "review-queue":
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		queue, err := h.store.BuildProjectReviewQueue(projectID, limit)
 		if err != nil {
 			writeHTTPError(w, http.StatusNotFound, err.Error())
@@ -396,6 +400,13 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 		}
 		writeHTTPJSON(w, http.StatusOK, queue)
 	case "export-preview":
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		preview, err := h.store.BuildProjectExportPreview(projectID, limit)
 		if err != nil {
 			writeHTTPError(w, http.StatusNotFound, err.Error())
@@ -403,12 +414,59 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 		}
 		writeHTTPJSON(w, http.StatusOK, preview)
 	case "verification-report":
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
 		report, err := h.store.BuildProjectVerificationReport(projectID, limit)
 		if err != nil {
 			writeHTTPError(w, http.StatusNotFound, err.Error())
 			return
 		}
 		writeHTTPJSON(w, http.StatusOK, report)
+	case "collection":
+		if len(parts) == 3 && parts[2] == "refresh" {
+			if !requireHTTPMethod(w, r, http.MethodPost) {
+				return
+			}
+			collection, err := h.store.RefreshProjectCollection(projectID, limit)
+			if err != nil {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeHTTPJSON(w, http.StatusOK, collection)
+			return
+		}
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		collection, err := h.store.LoadProjectCollection(projectID)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, collection)
+	case "audit-queue":
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		queue, err := h.store.LoadProjectAuditQueue(projectID, limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, queue)
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}

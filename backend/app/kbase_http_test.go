@@ -372,6 +372,63 @@ func sampleBookKnowledgePackageForVerification() BookKnowledgePackage {
 	}
 }
 
+func TestKBaseHTTPHandlerPersistsProjectCollectionAndAuditQueue(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	refreshResp := requestKBase(handler, http.MethodPost, "/api/projects/health/collection/refresh?limit=10", "secret-token")
+	if refreshResp.Code != http.StatusOK {
+		t.Fatalf("collection refresh status = %d, body=%s", refreshResp.Code, refreshResp.Body.String())
+	}
+	refreshBody := refreshResp.Body.String()
+	for _, want := range []string{
+		`"project_id":"health"`,
+		`"source":"verification_report"`,
+		`"human_loop":"async_audit_only"`,
+		`"collection_id"`,
+		`"items"`,
+		`"audit_queue"`,
+		`"review_status":"pending_async_audit"`,
+		`"sample_reason":"health_sensitive_claim"`,
+		`"sample_reason":"missing_citation"`,
+		`"source_hash"`,
+	} {
+		if !strings.Contains(refreshBody, want) {
+			t.Fatalf("collection refresh response missing %q: %s", want, refreshBody)
+		}
+	}
+
+	collectionResp := requestKBase(handler, http.MethodGet, "/api/projects/health/collection", "secret-token")
+	if collectionResp.Code != http.StatusOK {
+		t.Fatalf("collection status = %d, body=%s", collectionResp.Code, collectionResp.Body.String())
+	}
+	if !strings.Contains(collectionResp.Body.String(), `"project_id":"health"`) ||
+		!strings.Contains(collectionResp.Body.String(), `"item_count":3`) {
+		t.Fatalf("collection response missing persisted summary: %s", collectionResp.Body.String())
+	}
+
+	auditResp := requestKBase(handler, http.MethodGet, "/api/projects/health/audit-queue?limit=10", "secret-token")
+	if auditResp.Code != http.StatusOK {
+		t.Fatalf("audit queue status = %d, body=%s", auditResp.Code, auditResp.Body.String())
+	}
+	if !strings.Contains(auditResp.Body.String(), `"project_id":"health"`) ||
+		!strings.Contains(auditResp.Body.String(), `"audit_items"`) ||
+		!strings.Contains(auditResp.Body.String(), `"pending_async_audit"`) {
+		t.Fatalf("audit queue response missing async audit contract: %s", auditResp.Body.String())
+	}
+
+	unknownResp := requestKBase(handler, http.MethodPost, "/api/projects/unknown/collection/refresh", "secret-token")
+	if unknownResp.Code != http.StatusNotFound {
+		t.Fatalf("unknown project collection status = %d, want 404", unknownResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesPageAnalysis(t *testing.T) {
 	var gotTokenPlanAuth string
 	var gotTokenPlanBody string
