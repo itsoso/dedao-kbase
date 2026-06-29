@@ -1,5 +1,5 @@
 <template>
-  <main class="ebook-detail-reader">
+  <main ref="readerRootRef" class="ebook-detail-reader" :class="{ 'reader-fullscreen': readerFullscreen }">
     <header class="dedao-reader-toolbar">
       <div class="reader-tool-cluster left-tools">
         <RouterLink class="reader-tool" to="/ebook">
@@ -47,9 +47,9 @@
           <span class="tool-icon">⊞</span>
           <small>{{ detail?.is_on_bookshelf ? '已在书架' : '加入书架' }}</small>
         </button>
-        <button class="reader-tool" type="button" @click="toggleFullscreen">
+        <button class="reader-tool" type="button" :class="{ active: readerFullscreen }" @click="toggleFullscreen">
           <span class="tool-icon">✣</span>
-          <small>全屏</small>
+          <small>{{ readerFullscreen ? '退出全屏' : '全屏' }}</small>
         </button>
       </div>
     </header>
@@ -171,7 +171,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
@@ -212,6 +212,8 @@ const readerSearchQuery = ref('')
 const columnMode = ref<ColumnMode>(2)
 const readerScale = ref(1)
 const pageLoadCount = ref(2)
+const readerRootRef = ref<HTMLElement | null>(null)
+const readerFullscreen = ref(false)
 const autoAdvanceRunning = ref(false)
 const autoAdvanceCooldownUntil = ref(0)
 const wheelPagingThreshold = 180
@@ -301,6 +303,8 @@ const ebookAnalysisSections = computed<PageAnalysisSection[]>(() => {
 })
 
 onMounted(async () => {
+  document.addEventListener('fullscreenchange', syncReaderFullscreenState)
+  window.addEventListener('keydown', handleReaderKeydown)
   restoreConnection()
   try {
     await hydrateBrowserSession()
@@ -308,6 +312,11 @@ onMounted(async () => {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('fullscreenchange', syncReaderFullscreenState)
+  window.removeEventListener('keydown', handleReaderKeydown)
 })
 
 const restoreConnection = () => {
@@ -426,11 +435,48 @@ const loadChapterPages = async (chapterID: string, index: number) => {
 }
 
 const toggleFullscreen = async () => {
-  if (document.fullscreenElement) {
-    await document.exitFullscreen()
+  if (readerFullscreen.value) {
+    await exitReaderFullscreen()
     return
   }
-  await document.documentElement.requestFullscreen()
+  await requestReaderFullscreen()
+}
+
+const requestReaderFullscreen = async () => {
+  readerFullscreen.value = true
+  try {
+    const target = readerRootRef.value || document.documentElement
+    if (target.requestFullscreen && !document.fullscreenElement) {
+      await target.requestFullscreen()
+    }
+  } catch {
+    readerFullscreen.value = true
+  }
+}
+
+const exitReaderFullscreen = async () => {
+  readerFullscreen.value = false
+  if (document.fullscreenElement) {
+    try {
+      await document.exitFullscreen()
+    } catch {
+      readerFullscreen.value = false
+    }
+  }
+}
+
+const syncReaderFullscreenState = () => {
+  if (!document.fullscreenElement) {
+    readerFullscreen.value = false
+    return
+  }
+  readerFullscreen.value = document.fullscreenElement === readerRootRef.value || document.fullscreenElement === document.documentElement
+}
+
+const handleReaderKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape' && readerFullscreen.value && !document.fullscreenElement) {
+    readerFullscreen.value = false
+  }
 }
 
 const handleReaderWheel = (event: WheelEvent) => {
@@ -539,6 +585,33 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
   overflow: hidden;
   background: #f5f5f5;
   color: #3f3f3f;
+}
+
+.ebook-detail-reader.reader-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  width: 100vw;
+  height: 100vh;
+  background: #f5f5f5;
+}
+
+.ebook-detail-reader.reader-fullscreen .dedao-reader-toolbar {
+  min-height: 72px;
+  padding: 8px 36px;
+}
+
+.ebook-detail-reader.reader-fullscreen .dedao-reader-stage {
+  padding: 18px 48px 56px;
+}
+
+.ebook-detail-reader.reader-fullscreen .reader-bottom-bar {
+  z-index: 10020;
+}
+
+.ebook-detail-reader.reader-fullscreen .reader-floating-actions,
+.ebook-detail-reader.reader-fullscreen .reader-help {
+  z-index: 10030;
 }
 
 .dedao-reader-toolbar {
