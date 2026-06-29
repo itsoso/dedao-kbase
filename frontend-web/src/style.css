@@ -227,7 +227,6 @@ textarea {
   padding: 6px 0 0;
 }
 
-.kbase-workbench-header,
 .book-rail,
 .search-panel,
 .library-search-panel,
@@ -238,101 +237,6 @@ textarea {
   border-radius: 10px;
   background: var(--dedao-panel);
   box-shadow: none;
-}
-
-.kbase-workbench-header {
-  display: flex;
-  min-height: 42px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  border: 0;
-  border-bottom: 1px solid var(--dedao-line);
-  border-radius: 0;
-  padding: 0;
-}
-
-.app-navigation {
-  display: flex;
-  align-items: stretch;
-  min-width: 0;
-  gap: 0;
-  border: 0;
-  border-radius: 0;
-  padding: 0;
-  background: transparent;
-}
-
-.app-navigation-items {
-  display: flex;
-  min-width: 0;
-  gap: 24px;
-  overflow-x: auto;
-}
-
-.app-navigation button {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  border-radius: 0;
-  padding: 0;
-  background: transparent;
-  text-align: left;
-}
-
-.app-navigation-items button {
-  flex: 0 0 auto;
-  min-height: 42px;
-  padding: 0;
-}
-
-.app-navigation button.active {
-  border-color: var(--dedao-orange);
-  background: transparent;
-  color: var(--dedao-orange);
-}
-
-.app-navigation-actions {
-  display: flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 8px;
-}
-
-.app-navigation-actions .primary-action.compact {
-  min-height: 30px;
-  border: 1px solid var(--dedao-orange);
-  border-radius: 6px;
-  padding: 0 16px;
-  background: var(--dedao-orange);
-  color: #ffffff;
-  font-weight: 700;
-}
-
-.status-pill.compact {
-  min-height: 30px;
-  padding: 0 12px;
-}
-
-.app-navigation-actions .status-pill.compact {
-  overflow: visible;
-  font-size: 12px;
-}
-
-.app-navigation span {
-  overflow: hidden;
-  max-width: 100%;
-  color: currentColor;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.app-navigation small {
-  display: none;
 }
 
 .brand-block h1,
@@ -1260,7 +1164,6 @@ pre {
 
   .account-toolbar,
   .login-toolbar,
-  .app-navigation,
   .shell-nav,
   .account-grid,
   .account-metrics,
@@ -1269,21 +1172,6 @@ pre {
   .module-status-grid,
   .workbench-grid {
     grid-template-columns: 1fr;
-  }
-
-  .app-navigation {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 8px;
-  }
-
-  .app-navigation-items {
-    width: 100%;
-  }
-
-  .app-navigation-actions {
-    width: 100%;
-    justify-content: flex-start;
   }
 
   .dedao-web-shell {

@@ -66,9 +66,6 @@ for (const routePath of [
 
 for (const hook of [
   'kbase-web-shell',
-  'kbase-workbench-header',
-  'app-subnavigation',
-  'app-navigation',
   'book-rail',
   'book-pagination',
   'library-search-panel',
@@ -86,14 +83,16 @@ for (const hook of [
   assert.ok(workbenchSource.includes(hook), `KBaseWorkbench.vue should include ${hook}`)
 }
 
+assert.ok(!workbenchSource.includes('kbase-workbench-header'), 'KBaseWorkbench.vue should not render a duplicate secondary navigation row')
+assert.ok(!workbenchSource.includes('app-subnavigation'), 'KBaseWorkbench.vue should not render duplicate section tabs above the workbench')
+assert.ok(!workbenchSource.includes('navigationItems'), 'KBaseWorkbench.vue should rely on the workbench panels instead of a duplicate navigation list')
+
 for (const surface of [
   'baseUrl',
   'token',
   'listBooksPage',
   'getBook',
   'getBrowserSession',
-  'navigationItems',
-  'navigateTo',
   'combinedSearchQuery',
   'runLibrarySearch',
   'renderedChatAnswer',

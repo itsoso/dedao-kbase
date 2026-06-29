@@ -2,31 +2,8 @@
   <main class="kbase-web-shell">
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
-    <header class="kbase-workbench-header">
-      <nav class="app-navigation app-subnavigation" aria-label="KBase navigation">
-        <div class="app-navigation-items">
-          <button
-            v-for="item in navigationItems"
-            :key="item.key"
-            type="button"
-            :class="{ active: activeNavigationKey === item.key }"
-            @click="navigateTo(item)"
-          >
-            <span>{{ item.label }}</span>
-            <small>{{ item.meta }}</small>
-          </button>
-        </div>
-      </nav>
-      <div class="app-navigation-actions">
-        <button class="primary-action compact" type="button" :disabled="loading" @click="connectAndRefresh">
-          {{ loading ? '刷新中' : '连接' }}
-        </button>
-        <span class="status-pill compact" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</span>
-      </div>
-    </header>
-
     <div ref="workbenchRef" class="workbench-grid learning-layout" :style="workbenchStyle">
-      <aside ref="libraryPanelRef" class="book-rail library-search-panel">
+      <aside class="book-rail library-search-panel">
         <div class="panel-head">
           <div>
             <span class="eyebrow">Library Search</span>
@@ -102,7 +79,7 @@
 
       <div class="column-resizer left-resizer" role="separator" aria-label="Resize library column" @pointerdown="beginColumnResize('left', $event)"></div>
 
-      <section ref="studyPanelRef" class="chat-panel study-panel">
+      <section class="chat-panel study-panel">
         <div class="panel-head study-head">
           <div>
             <span class="eyebrow">TokenPlan Study</span>
@@ -183,7 +160,7 @@
 
       <div class="column-resizer right-resizer" role="separator" aria-label="Resize detail column" @pointerdown="beginColumnResize('right', $event)"></div>
 
-      <section ref="detailPanelRef" class="detail-panel compact-reference-panel">
+      <section class="detail-panel compact-reference-panel">
         <div class="panel-head detail-head">
           <div>
             <span class="eyebrow">Details</span>
@@ -312,7 +289,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   getBrowserSession,
   KBaseClient,
@@ -345,22 +322,11 @@ const chatModelOptions = [
 ]
 
 type JobActionValue = 'notebooklm_export' | 'health_system_kb_v2' | 'quant_rule_cards'
-type NavigationPanel = 'library' | 'study' | 'details'
-type NavigationItem = { key: string; label: string; meta: string; panel: NavigationPanel; tab?: string }
 
 const jobActions: Array<{ value: JobActionValue; label: string; description: string }> = [
   { value: 'notebooklm_export', label: 'NotebookLM', description: '导出当前书籍的 NotebookLM 学习资料包' },
   { value: 'health_system_kb_v2', label: 'Health KB', description: '生成 health_system_kb_v2 draft 供下游审核' },
   { value: 'quant_rule_cards', label: 'Quant Rules', description: '生成 paper-only 量化规则卡 draft' },
-]
-
-const navigationItems: NavigationItem[] = [
-  { key: 'library', label: '书库', meta: 'Search', panel: 'library' },
-  { key: 'study', label: '学习', meta: 'Chat', panel: 'study', tab: 'Overview' },
-  { key: 'jobs', label: '任务', meta: 'Exports', panel: 'details', tab: 'Jobs' },
-  { key: 'system-kb', label: 'System KB', meta: 'Manifest', panel: 'details', tab: 'System KB' },
-  { key: 'skills', label: 'Skills/API', meta: 'Interop', panel: 'details', tab: 'Skills/API' },
-  { key: 'ops', label: '运维', meta: 'Status', panel: 'details', tab: 'Ops' },
 ]
 
 const publicDiscoveryRoutes = [
@@ -396,7 +362,6 @@ const selectedPackage = ref<BookKnowledgePackage | null>(null)
 const searchScope = ref<'selected' | 'all'>('selected')
 const searchResults = ref<BookKnowledgeSearchResult[]>([])
 const activeTab = ref('Overview')
-const activeNavigationHint = ref('study')
 const systemKBPayload = ref<Record<string, unknown> | null>(null)
 const promptTemplates = ref<BookKnowledgePrompt[]>([])
 const selectedPromptID = ref('')
@@ -411,9 +376,6 @@ const jobs = ref<BookKnowledgeJob[]>([])
 const jobsLoading = ref(false)
 const jobError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
-const libraryPanelRef = ref<HTMLElement | null>(null)
-const studyPanelRef = ref<HTMLElement | null>(null)
-const detailPanelRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 340, right: 320 })
 const activeResizeTarget = ref<'left' | 'right' | null>(null)
 
@@ -426,25 +388,6 @@ const workbenchStyle = computed(() => ({
 
 const serviceBaseUrl = computed(() => {
   return (baseUrl.value || window.location.origin).replace(/\/+$/, '')
-})
-
-const activeNavigationKey = computed(() => {
-  if (activeTab.value === 'Jobs') {
-    return 'jobs'
-  }
-  if (activeTab.value === 'System KB') {
-    return 'system-kb'
-  }
-  if (activeTab.value === 'Skills/API') {
-    return 'skills'
-  }
-  if (activeTab.value === 'Ops') {
-    return 'ops'
-  }
-  if (activeNavigationHint.value === 'library') {
-    return 'library'
-  }
-  return 'study'
 })
 
 const formattedSystemKB = computed(() => {
@@ -522,34 +465,6 @@ const hydrateBrowserSession = async () => {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
-}
-
-const connectAndRefresh = async () => {
-  saveConnection()
-  await loadBooks()
-  await loadJobs()
-}
-
-const navigateTo = async (item: NavigationItem) => {
-  activeNavigationHint.value = item.key
-  if (item.tab) {
-    activeTab.value = item.tab
-  }
-  if (item.key === 'jobs') {
-    await loadJobs()
-  }
-  await nextTick()
-  scrollNavigationPanel(item.panel)
-}
-
-const scrollNavigationPanel = (panel: NavigationPanel) => {
-  const target = (
-    panel === 'library' ? libraryPanelRef.value : panel === 'study' ? studyPanelRef.value : detailPanelRef.value
-  ) as HTMLElement | null
-  if (!target || !window.matchMedia('(max-width: 1180px)').matches) {
-    return
-  }
-  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 const withRequest = async (operation: () => Promise<void>) => {
