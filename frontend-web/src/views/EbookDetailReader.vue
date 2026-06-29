@@ -43,9 +43,14 @@
           <span class="tool-icon">↻</span>
           <small>同步</small>
         </button>
-        <button class="reader-tool" type="button" disabled>
+        <button
+          class="reader-tool"
+          type="button"
+          :disabled="loading || shelfAdding || !enid || detail?.is_on_bookshelf"
+          @click="addCurrentEbookToBookshelf"
+        >
           <span class="tool-icon">⊞</span>
-          <small>{{ detail?.is_on_bookshelf ? '已在书架' : '加入书架' }}</small>
+          <small>{{ shelfAdding ? '加入中' : detail?.is_on_bookshelf ? '已在书架' : '加入书架' }}</small>
         </button>
         <button class="reader-tool" type="button" :class="{ active: readerFullscreen }" @click="toggleFullscreen">
           <span class="tool-icon">✣</span>
@@ -177,6 +182,7 @@ import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
   KBaseClient,
+  type DedaoEbook,
   type DedaoEbookCatalogItem,
   type DedaoEbookChapterPages,
   type DedaoEbookDetail,
@@ -214,6 +220,7 @@ const token = ref('')
 const connected = ref(false)
 const loading = ref(false)
 const pageLoading = ref(false)
+const shelfAdding = ref(false)
 const errorMessage = ref('')
 const pageError = ref('')
 const detail = ref<DedaoEbookDetail | null>(null)
@@ -485,6 +492,45 @@ const loadDetail = async () => {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     loading.value = false
+  }
+}
+
+const addCurrentEbookToBookshelf = async () => {
+  if (!enid.value) {
+    return
+  }
+  await hydrateBrowserSession()
+  if (!token.value) {
+    errorMessage.value = '缺少 KBASE_AUTH_TOKEN，登录浏览器页后会自动填充。'
+    return
+  }
+  shelfAdding.value = true
+  errorMessage.value = ''
+  try {
+    saveConnection()
+    const ebook = await client.value.addDedaoEbookToBookshelf(enid.value)
+    markDetailOnBookshelf(ebook)
+    connected.value = true
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    shelfAdding.value = false
+  }
+}
+
+const markDetailOnBookshelf = (ebook: DedaoEbook) => {
+  if (!detail.value) {
+    return
+  }
+  detail.value = {
+    ...detail.value,
+    id: ebook.id || detail.value.id,
+    title: ebook.title || detail.value.title,
+    cover: ebook.icon || detail.value.cover,
+    price: ebook.price || detail.value.price,
+    is_buy: true,
+    is_on_bookshelf: true,
+    can_trial_read: ebook.can_trial_read ?? detail.value.can_trial_read,
   }
 }
 

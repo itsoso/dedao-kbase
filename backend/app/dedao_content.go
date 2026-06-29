@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"strings"
 
 	jsoniter "github.com/json-iterator/go"
@@ -284,6 +285,7 @@ type DedaoContentProvider interface {
 	GetCourseArticleMarkdown(enid string) (DedaoArticleMarkdown, error)
 	GetOdobArticleMarkdown(enid string) (DedaoArticleMarkdown, error)
 	GetEbookDetail(enid string) (DedaoEbookDetail, error)
+	AddEbookToBookshelf(enid string) (DedaoEbook, error)
 	GetEbookChapterPages(enid string, chapterID string, index, count, offset int) (DedaoEbookChapterPages, error)
 }
 
@@ -554,6 +556,26 @@ func (p liveDedaoContentProvider) GetEbookDetail(enid string) (DedaoEbookDetail,
 	return dedaoEbookDetailFromService(detail), nil
 }
 
+func (p liveDedaoContentProvider) AddEbookToBookshelf(enid string) (DedaoEbook, error) {
+	enid = strings.TrimSpace(enid)
+	if enid == "" {
+		return DedaoEbook{}, errors.New("ebook enid is required")
+	}
+	if _, err := EbookShelfAdd([]string{enid}); err != nil {
+		return DedaoEbook{}, err
+	}
+	detail, err := EbookDetail(enid)
+	if err != nil {
+		return DedaoEbook{}, err
+	}
+	ebook := dedaoEbookFromServiceDetail(detail)
+	if ebook.Enid == "" {
+		ebook.Enid = enid
+	}
+	ebook.IsBuy = true
+	return ebook, nil
+}
+
 func (p liveDedaoContentProvider) GetEbookChapterPages(enid string, chapterID string, index, count, offset int) (DedaoEbookChapterPages, error) {
 	token, err := getService().EbookReadToken(enid)
 	if err != nil {
@@ -702,6 +724,25 @@ func dedaoEbookPageFromSiteSearch(result *services.EbookSearchResult, page, page
 		Total:      total,
 		TotalPages: totalPages,
 		IsMore:     result.IsMore,
+	}
+}
+
+func dedaoEbookFromServiceDetail(detail *services.EbookDetail) DedaoEbook {
+	if detail == nil {
+		return DedaoEbook{}
+	}
+	return DedaoEbook{
+		Enid:       detail.Enid,
+		ID:         detail.ID,
+		Title:      detail.Title,
+		Author:     firstNonEmptySearchField(detail.BookAuthor, strings.Join(detail.AuthorList, " / ")),
+		Intro:      firstNonEmptySearchField(detail.BookIntro, detail.AuthorInfo, detail.OperatingTitle),
+		Icon:       detail.Cover,
+		Price:      firstNonEmptySearchField(detail.CurrentPrice, detail.Price, detail.OriginalPrice),
+		Progress:   0,
+		PublishNum: detail.Count,
+		IsBuy:      detail.IsBuy,
+		CanTrial:   detail.CanTrialRead,
 	}
 }
 

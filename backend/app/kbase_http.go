@@ -143,6 +143,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoEbooks(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/dedao/ebooks/") && strings.HasSuffix(r.URL.Path, "/bookshelf"):
+		if !requireHTTPMethod(w, r, http.MethodPost) {
+			return
+		}
+		h.handleDedaoEbookBookshelf(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/dedao/ebooks/"):
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -835,6 +840,24 @@ func (h *kbaseHTTPHandler) handleDedaoEbookSubroute(w http.ResponseWriter, r *ht
 		return
 	}
 	writeHTTPError(w, http.StatusNotFound, "not found")
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbookBookshelf(w http.ResponseWriter, r *http.Request) {
+	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/ebooks/")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(segments) != 2 || segments[1] != "bookshelf" {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	result, err := h.dedaoContent.AddEbookToBookshelf(segments[0])
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func setHTTPNoStore(w http.ResponseWriter) {

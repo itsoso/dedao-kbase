@@ -91,6 +91,15 @@
                 </option>
               </select>
               <button
+                v-if="searchScope === 'site'"
+                type="button"
+                class="secondary-action"
+                :disabled="!canAddEbookToBookshelf(ebook) || isEbookShelfLoading(ebook)"
+                @click.stop="addEbookToBookshelf(ebook)"
+              >
+                {{ shelfActionLabel(ebook) }}
+              </button>
+              <button
                 type="button"
                 class="secondary-action"
                 :disabled="!canCreateEbookJob(ebook) || isEbookActionLoading('sync', ebook)"
@@ -130,11 +139,20 @@
               {{ option.label }}
             </option>
           </select>
+          <button
+            v-if="searchScope === 'site'"
+            type="button"
+            class="secondary-action"
+            :disabled="!canAddEbookToBookshelf(selectedEbook) || isEbookShelfLoading(selectedEbook)"
+            @click="addEbookToBookshelf(selectedEbook)"
+          >
+            {{ shelfActionLabel(selectedEbook) }}
+          </button>
           <button type="button" class="secondary-action" :disabled="!canCreateEbookJob(selectedEbook)" @click="createEbookSyncJob(selectedEbook)">
-            {{ canCreateEbookJob(selectedEbook) ? '加入知识库' : '未购买' }}
+            {{ canCreateEbookJob(selectedEbook) ? '加入知识库' : '无法执行' }}
           </button>
           <button type="button" class="primary-action compact" :disabled="!canCreateEbookJob(selectedEbook)" @click="createEbookDownloadJob(selectedEbook)">
-            {{ canCreateEbookJob(selectedEbook) ? '下载' : '未购买' }}
+            {{ canCreateEbookJob(selectedEbook) ? '下载' : '无法执行' }}
           </button>
         </div>
         <dl class="ebook-detail-list">
@@ -214,6 +232,7 @@ const ebooks = ref<DedaoEbook[]>([])
 const selectedKey = ref('')
 const jobs = ref<BookKnowledgeJob[]>([])
 const actionLoadingKey = ref('')
+const shelfLoadingKey = ref('')
 const downloadTypes = ref<Record<string, number>>({})
 
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
@@ -376,6 +395,43 @@ const createEbookSyncJob = async (ebook: DedaoEbook | null) => {
   await createEbookJob(ebook, 'sync')
 }
 
+const addEbookToBookshelf = async (ebook: DedaoEbook | null) => {
+  if (!ebook) {
+    return null
+  }
+  await hydrateBrowserSession()
+  if (!token.value) {
+    errorMessage.value = '缺少 KBASE_AUTH_TOKEN，登录浏览器页后会自动填充。'
+    return null
+  }
+  const key = ebookKey(ebook)
+  if (!key) {
+    errorMessage.value = '当前电子书缺少 enid，无法加入书架。'
+    return null
+  }
+  shelfLoadingKey.value = key
+  errorMessage.value = ''
+  try {
+    saveConnection()
+    const hydrated = await client.value.addDedaoEbookToBookshelf(key)
+    const merged = mergeHydratedEbook(ebook, hydrated)
+    upsertEbook(ebook, merged)
+    return merged
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : String(error)
+    return null
+  } finally {
+    shelfLoadingKey.value = ''
+  }
+}
+
+const ensureEbookOnShelf = async (ebook: DedaoEbook) => {
+  if (searchScope.value !== 'site' || (ebook.is_buy && ebook.id)) {
+    return ebook
+  }
+  return addEbookToBookshelf(ebook)
+}
+
 const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sync') => {
   if (!ebook) {
     return
@@ -386,12 +442,12 @@ const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sy
     return
   }
   const key = ebookKey(ebook)
-  if (!ebook.id || !key) {
-    errorMessage.value = '当前电子书缺少 id 或 enid，无法创建任务。'
+  if (!key) {
+    errorMessage.value = '当前电子书缺少 enid，无法创建任务。'
     return
   }
   if (!canCreateEbookJob(ebook)) {
-    errorMessage.value = '全站搜索结果未确认已购，无法下载或加入书籍知识库。'
+    errorMessage.value = '当前电子书缺少 enid，无法下载或加入书籍知识库。'
     return
   }
   selectEbook(ebook)
@@ -399,11 +455,20 @@ const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sy
   errorMessage.value = ''
   try {
     saveConnection()
+    const readyEbook = await ensureEbookOnShelf(ebook)
+    if (!readyEbook) {
+      return
+    }
+    const readyKey = ebookKey(readyEbook)
+    if (!readyEbook.id || !readyKey) {
+      errorMessage.value = '当前电子书缺少 id 或 enid，无法创建任务。'
+      return
+    }
     const job = await client.value.createJob({
       type: action === 'download' ? ebookDownloadJobType : ebookSyncJobType,
-      ebook_id: ebook.id,
-      ebook_enid: key,
-      download_type: action === 'download' ? downloadTypeFor(ebook) : 1,
+      ebook_id: readyEbook.id,
+      ebook_enid: readyKey,
+      download_type: action === 'download' ? downloadTypeFor(readyEbook) : 1,
     })
     jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
   } catch (error) {
@@ -415,7 +480,8 @@ const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sy
 
 const ebookKey = (ebook: DedaoEbook) => ebook.enid || String(ebook.id)
 const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
-const canCreateEbookJob = (ebook: DedaoEbook | null) => Boolean(ebook && (searchScope.value === 'shelf' || ebook.is_buy))
+const canCreateEbookJob = (ebook: DedaoEbook | null) => Boolean(ebook && ebookKey(ebook))
+const canAddEbookToBookshelf = (ebook: DedaoEbook | null) => Boolean(ebook && ebookKey(ebook) && !ebook.is_buy)
 const downloadTypeFor = (ebook: DedaoEbook | null) => (ebook ? downloadTypes.value[ebookKey(ebook)] || 1 : 1)
 const setDownloadType = (ebook: DedaoEbook | null, event: Event) => {
   if (!ebook) {
@@ -430,14 +496,54 @@ const setDownloadType = (ebook: DedaoEbook | null, event: Event) => {
 const ebookActionKey = (action: 'download' | 'sync', ebook: DedaoEbook) => `${action}:${ebookKey(ebook)}`
 const isEbookActionLoading = (action: 'download' | 'sync', ebook: DedaoEbook) =>
   actionLoadingKey.value === ebookActionKey(action, ebook)
+const isEbookShelfLoading = (ebook: DedaoEbook) => shelfLoadingKey.value === ebookKey(ebook)
 const ebookActionLabel = (action: 'download' | 'sync', ebook: DedaoEbook) => {
   if (!canCreateEbookJob(ebook)) {
-    return '未购买'
+    return '无法执行'
   }
   if (isEbookActionLoading(action, ebook)) {
     return action === 'download' ? '下载中' : '入库中'
   }
   return action === 'download' ? '下载' : '加入书籍知识库'
+}
+const shelfActionLabel = (ebook: DedaoEbook | null) => {
+  if (!ebook) {
+    return '加入书架'
+  }
+  if (isEbookShelfLoading(ebook)) {
+    return '加入中'
+  }
+  return ebook.is_buy ? '已在书架' : '加入书架'
+}
+const mergeHydratedEbook = (source: DedaoEbook, hydrated: DedaoEbook): DedaoEbook => ({
+  ...source,
+  ...hydrated,
+  enid: hydrated.enid || source.enid,
+  id: hydrated.id || source.id,
+  title: hydrated.title || source.title,
+  author: hydrated.author || source.author,
+  intro: hydrated.intro || source.intro,
+  icon: hydrated.icon || source.icon,
+  price: hydrated.price || source.price,
+  progress: Number.isFinite(hydrated.progress) ? hydrated.progress : source.progress,
+  publish_num: hydrated.publish_num || source.publish_num,
+  last_read: hydrated.last_read || source.last_read,
+  is_buy: hydrated.is_buy ?? true,
+  can_trial_read: hydrated.can_trial_read ?? source.can_trial_read,
+})
+const upsertEbook = (source: DedaoEbook, next: DedaoEbook) => {
+  const sourceKey = ebookKey(source)
+  const nextKey = ebookKey(next)
+  ebooks.value = ebooks.value.map((item) => (ebookKey(item) === sourceKey ? next : item))
+  if (selectedKey.value === sourceKey) {
+    selectedKey.value = nextKey
+  }
+  if (nextKey && !downloadTypes.value[nextKey]) {
+    downloadTypes.value = {
+      ...downloadTypes.value,
+      [nextKey]: downloadTypes.value[sourceKey] || 1,
+    }
+  }
 }
 const jobMatchesEbook = (job: BookKnowledgeJob, ebook: DedaoEbook) => {
   const key = ebookKey(ebook)

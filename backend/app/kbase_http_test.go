@@ -864,6 +864,47 @@ func TestKBaseHTTPHandlerServesDedaoSiteEbookSearch(t *testing.T) {
 	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
 }
 
+func TestKBaseHTTPHandlerAddsDedaoEbookToBookshelf(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		addEbook: DedaoEbook{
+			ID:       32355,
+			Enid:     "site-ebook-enid",
+			Title:    "陆蓉行为金融学讲义",
+			Author:   "陆蓉",
+			Icon:     "https://example.test/site-cover.jpg",
+			Price:    "41.30",
+			Progress: 0,
+			IsBuy:    true,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodPost, "/api/dedao/ebooks/site-ebook-enid/bookshelf", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("add ebook shelf without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodPost, "/api/dedao/ebooks/site-ebook-enid/bookshelf", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("add ebook shelf status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotAddEbookEnid != "site-ebook-enid" {
+		t.Fatalf("add ebook shelf enid = %q, want site-ebook-enid", content.gotAddEbookEnid)
+	}
+	var payload DedaoEbook
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Enid != "site-ebook-enid" || payload.ID != 32355 || !payload.IsBuy {
+		t.Fatalf("add ebook shelf payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
 func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
 	content := &fakeDedaoContentProvider{
 		courses: DedaoCoursePage{
@@ -1628,6 +1669,7 @@ type fakeDedaoContentProvider struct {
 	articleMarkdown        DedaoArticleMarkdown
 	odobMarkdown           DedaoArticleMarkdown
 	ebookDetail            DedaoEbookDetail
+	addEbook               DedaoEbook
 	ebookPages             DedaoEbookChapterPages
 	gotQuery               string
 	gotPage                int
@@ -1656,6 +1698,7 @@ type fakeDedaoContentProvider struct {
 	gotArticleMarkdownEnid string
 	gotOdobMarkdownEnid    string
 	gotEbookDetailEnid     string
+	gotAddEbookEnid        string
 	gotEbookPagesEnid      string
 	gotEbookPagesChapterID string
 	gotEbookPagesIndex     int
@@ -1740,6 +1783,11 @@ func (f *fakeDedaoContentProvider) GetOdobArticleMarkdown(enid string) (DedaoArt
 func (f *fakeDedaoContentProvider) GetEbookDetail(enid string) (DedaoEbookDetail, error) {
 	f.gotEbookDetailEnid = enid
 	return f.ebookDetail, nil
+}
+
+func (f *fakeDedaoContentProvider) AddEbookToBookshelf(enid string) (DedaoEbook, error) {
+	f.gotAddEbookEnid = enid
+	return f.addEbook, nil
 }
 
 func (f *fakeDedaoContentProvider) GetEbookChapterPages(enid string, chapterID string, index, count, offset int) (DedaoEbookChapterPages, error) {

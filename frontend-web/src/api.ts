@@ -832,6 +832,12 @@ export class KBaseClient {
     return this.request<DedaoEbookDetail>(`/api/dedao/ebooks/${encodeURIComponent(enid)}`)
   }
 
+  async addDedaoEbookToBookshelf(enid: string): Promise<DedaoEbook> {
+    return this.request<DedaoEbook>(`/api/dedao/ebooks/${encodeURIComponent(enid)}/bookshelf`, {
+      method: 'POST',
+    })
+  }
+
   async getDedaoEbookChapterPages(
     enid: string,
     chapterID: string,
