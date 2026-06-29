@@ -113,7 +113,7 @@
         <div v-if="pageLoading" class="empty-state reader-loading">加载页面中...</div>
         <div v-else-if="svgFrames.length" class="ebook-pages">
           <section v-for="frame in visibleFrames" :key="frame.key" class="ebook-page-shell">
-            <iframe class="ebook-page-frame" title="ebook page" sandbox="" :srcdoc="frame.srcdoc"></iframe>
+            <iframe class="ebook-page-frame" title="ebook page" :sandbox="frame.sandbox" :srcdoc="frame.srcdoc"></iframe>
             <footer>{{ frame.pageNum }} / {{ totalPageCount || '?' }}</footer>
           </section>
         </div>
@@ -231,20 +231,23 @@ const canGoPrevious = computed(() => {
   if (!pageResponse.value) {
     return false
   }
-  return pageResponse.value.index > 0 || currentReadableIndex.value > 0
+  return pageResponse.value.index > 0 || Boolean(adjacentReadableCatalogItem(-1))
 })
 const canGoNext = computed(() => {
   if (!pageResponse.value) {
     return false
   }
-  return !pageResponse.value.is_end || currentReadableIndex.value < readableCatalogItems.value.length - 1
+  return !pageResponse.value.is_end || Boolean(adjacentReadableCatalogItem(1))
 })
 const svgFrames = computed(() =>
-  (pageResponse.value?.pages || []).map((page) => ({
-    key: `${page.page_num}-${page.begin_offset}-${page.end_offset}`,
-    pageNum: page.page_num,
-    srcdoc: svgToSrcdoc(page.svg),
-  })),
+  (pageResponse.value?.pages || []).map((page) => {
+    const frame = svgToFrame(page.svg)
+    return {
+      key: `${page.page_num}-${page.begin_offset}-${page.end_offset}`,
+      pageNum: page.page_num,
+      ...frame,
+    }
+  }),
 )
 const visibleFrames = computed(() => svgFrames.value)
 const totalPageCount = computed(() => estimateEbookTotalPageCount())
@@ -306,6 +309,7 @@ const ebookAnalysisSections = computed<PageAnalysisSection[]>(() => {
 onMounted(async () => {
   document.addEventListener('fullscreenchange', syncReaderFullscreenState)
   window.addEventListener('keydown', handleReaderKeydown)
+  window.addEventListener('message', handleReaderFrameMessage)
   restoreConnection()
   try {
     await hydrateBrowserSession()
@@ -318,6 +322,7 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   document.removeEventListener('fullscreenchange', syncReaderFullscreenState)
   window.removeEventListener('keydown', handleReaderKeydown)
+  window.removeEventListener('message', handleReaderFrameMessage)
 })
 
 const restoreConnection = () => {
@@ -401,16 +406,15 @@ const loadRelativePage = async (direction: -1 | 1) => {
   if (!selectedChapterID.value || !pageResponse.value) {
     return
   }
-  const currentIndex = currentReadableIndex.value
   if (direction > 0 && pageResponse.value.is_end) {
-    const nextChapter = readableCatalogItems.value[currentIndex + 1]
+    const nextChapter = adjacentReadableCatalogItem(1)
     if (nextChapter) {
       await openChapter(nextChapter)
     }
     return
   }
   if (direction < 0 && pageResponse.value.index <= 0) {
-    const previousChapter = readableCatalogItems.value[currentIndex - 1]
+    const previousChapter = adjacentReadableCatalogItem(-1)
     if (previousChapter) {
       await openChapter(previousChapter)
     }
@@ -480,23 +484,46 @@ const handleReaderKeydown = (event: KeyboardEvent) => {
   }
 }
 
+const handleReaderFrameMessage = (event: MessageEvent) => {
+  const data = event.data as { source?: string; direction?: number } | null
+  if (!data || data.source !== 'ebook-text-boundary') {
+    return
+  }
+  const direction = data.direction && data.direction < 0 ? -1 : 1
+  triggerReaderAutoAdvance(direction)
+}
+
 const handleReaderWheel = (event: WheelEvent) => {
   if (Math.abs(event.deltaY) < 1) {
     return
   }
   event.preventDefault()
+  queueReaderWheelDelta(event.deltaY)
+}
+
+const queueReaderWheelDelta = (deltaY: number) => {
   if (autoAdvanceRunning.value || pageLoading.value || loading.value) {
     return
   }
   if (Date.now() < autoAdvanceCooldownUntil.value) {
     return
   }
-  wheelPagingDelta.value += event.deltaY
+  wheelPagingDelta.value += deltaY
   if (Math.abs(wheelPagingDelta.value) < wheelPagingThreshold) {
     return
   }
   const direction = wheelPagingDelta.value > 0 ? 1 : -1
   wheelPagingDelta.value = 0
+  triggerReaderAutoAdvance(direction)
+}
+
+const triggerReaderAutoAdvance = (direction: -1 | 1) => {
+  if (autoAdvanceRunning.value || pageLoading.value || loading.value) {
+    return
+  }
+  if (Date.now() < autoAdvanceCooldownUntil.value) {
+    return
+  }
   if ((direction > 0 && !canGoNext.value) || (direction < 0 && !canGoPrevious.value)) {
     return
   }
@@ -511,6 +538,20 @@ const scrollReaderToTop = () => {
 }
 
 const catalogKey = (item: DedaoEbookCatalogItem) => `${item.chapter_id || item.href || item.text}-${item.play_order || 0}`
+
+const adjacentReadableCatalogItem = (direction: -1 | 1) => {
+  const currentIndex = currentReadableIndex.value
+  if (currentIndex < 0) {
+    return null
+  }
+  for (let index = currentIndex + direction; index >= 0 && index < readableCatalogItems.value.length; index += direction) {
+    const item = readableCatalogItems.value[index]
+    if (item.chapter_id && item.chapter_id !== selectedChapterID.value) {
+      return item
+    }
+  }
+  return null
+}
 
 const currentPageText = () => {
   const pages = pageResponse.value?.pages || []
@@ -744,12 +785,18 @@ const textToParagraphs = (text: string) =>
     .map((line) => `<p>${escapeHTML(line)}</p>`)
     .join('')
 
-const svgToSrcdoc = (svg: string) => {
+const svgToFrame = (svg: string) => {
   const textFallback = ebookSvgTextFallback(svg)
   if (textFallback) {
-    return textPageSrcdoc(textFallback)
+    return {
+      srcdoc: textPageSrcdoc(textFallback),
+      sandbox: 'allow-scripts',
+    }
   }
-  return svgPageSrcdoc(normalizeEbookSvg(svg))
+  return {
+    srcdoc: svgPageSrcdoc(normalizeEbookSvg(svg)),
+    sandbox: '',
+  }
 }
 
 const svgPageSrcdoc = (svg: string) => `<!doctype html>
@@ -820,6 +867,38 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
     </style>
   </head>
   <body><main class="ebook-text-page">${textToParagraphs(text)}</main></body>
+  <script>
+    (() => {
+      const page = document.querySelector('.ebook-text-page');
+      let accumulatedDelta = 0;
+      let lastSentAt = 0;
+      const threshold = 120;
+      const edgeSlack = 4;
+      const sendBoundary = (direction) => {
+        const now = Date.now();
+        if (now - lastSentAt < 650) {
+          return;
+        }
+        lastSentAt = now;
+        parent.postMessage({ source: 'ebook-text-boundary', direction }, '*');
+      };
+      page?.addEventListener('wheel', (event) => {
+        const atTop = page.scrollTop <= edgeSlack;
+        const atBottom = page.scrollTop + page.clientHeight >= page.scrollHeight - edgeSlack;
+        const direction = event.deltaY > 0 ? 1 : -1;
+        if ((direction > 0 && atBottom) || (direction < 0 && atTop)) {
+          event.preventDefault();
+          accumulatedDelta += event.deltaY;
+          if (Math.abs(accumulatedDelta) >= threshold) {
+            accumulatedDelta = 0;
+            sendBoundary(direction);
+          }
+        } else {
+          accumulatedDelta = 0;
+        }
+      }, { passive: false });
+    })();
+  <\/script>
 </html>`
 </script>
 
