@@ -101,6 +101,20 @@ func SyncEbookToWikiStore(ctx context.Context, id int, enid string, store *BookK
 	return syncEbookToWikiWithConfigAndStore(ctx, id, enid, DefaultEbookWikiSyncConfig(), osEbookWikiCommandRunner{}, store)
 }
 
+func SyncEbookToBookKnowledgeStore(
+	ctx context.Context,
+	id int,
+	enid string,
+	store *BookKnowledgeStore,
+	downloadRoot string,
+) (*EbookWikiSyncResult, error) {
+	if strings.TrimSpace(downloadRoot) == "" {
+		downloadRoot = DefaultDedaoDownloadRoot()
+	}
+	result, _, err := downloadEbookIntoBookKnowledgeStore(ctx, id, enid, downloadRoot, store)
+	return result, err
+}
+
 func syncEbookToWikiWithConfig(
 	ctx context.Context,
 	id int,
@@ -123,23 +137,54 @@ func syncEbookToWikiWithConfigAndStore(
 	if knowledgeStore == nil {
 		knowledgeStore = DefaultBookKnowledgeStore()
 	}
+	result, input, err := downloadEbookIntoBookKnowledgeStore(ctx, id, enid, cfg.RepoDir, knowledgeStore)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = runEbookWikiPipeline(ctx, cfg, runner, input); err != nil {
+		if !isEbookWikiCommandMissing(err) {
+			return nil, err
+		}
+		emitEbookWikiProgress(ctx, "llms-wikis 不可用，已使用本地提取器")
+	}
+	return &EbookWikiSyncResult{
+		BookID:            result.BookID,
+		KnowledgeBookID:   result.KnowledgeBookID,
+		Title:             result.Title,
+		HTMLPath:          result.HTMLPath,
+		RepoDir:           cfg.RepoDir,
+		BookKnowledgeRoot: result.BookKnowledgeRoot,
+	}, nil
+}
+
+func downloadEbookIntoBookKnowledgeStore(
+	ctx context.Context,
+	id int,
+	enid string,
+	outputDir string,
+	knowledgeStore *BookKnowledgeStore,
+) (*EbookWikiSyncResult, EbookWikiInput, error) {
+	if knowledgeStore == nil {
+		knowledgeStore = DefaultBookKnowledgeStore()
+	}
 	emitEbookWikiProgress(ctx, "正在下载电子书")
 	download := EBookDownload{
 		Ctx:          ctx,
 		DownloadType: 1,
 		ID:           id,
 		EnID:         enid,
-		OutputDir:    cfg.RepoDir,
+		OutputDir:    outputDir,
 	}
 	result, err := download.DownloadWithResult()
 	if err != nil {
-		return nil, err
+		return nil, EbookWikiInput{}, err
 	}
 	if strings.TrimSpace(result.HTMLPath) == "" {
-		return nil, fmt.Errorf("电子书 HTML 路径为空: book_id=%d", id)
+		return nil, EbookWikiInput{}, fmt.Errorf("电子书 HTML 路径为空: book_id=%d", id)
 	}
 	if _, err = os.Stat(result.HTMLPath); err != nil {
-		return nil, fmt.Errorf("电子书 HTML 文件不存在: %s: %w", result.HTMLPath, err)
+		return nil, EbookWikiInput{}, fmt.Errorf("电子书 HTML 文件不存在: %s: %w", result.HTMLPath, err)
 	}
 
 	input := EbookWikiInput{
@@ -155,23 +200,16 @@ func syncEbookToWikiWithConfigAndStore(
 		Title:   result.Title,
 	}, result.HTMLPath, knowledgeStore)
 	if err != nil {
-		return nil, err
-	}
-
-	if err = runEbookWikiPipeline(ctx, cfg, runner, input); err != nil {
-		if !isEbookWikiCommandMissing(err) {
-			return nil, err
-		}
-		emitEbookWikiProgress(ctx, "llms-wikis 不可用，已使用本地提取器")
+		return nil, EbookWikiInput{}, err
 	}
 	return &EbookWikiSyncResult{
 		BookID:            id,
 		KnowledgeBookID:   knowledgePackage.Book.BookID,
 		Title:             result.Title,
 		HTMLPath:          result.HTMLPath,
-		RepoDir:           cfg.RepoDir,
+		RepoDir:           outputDir,
 		BookKnowledgeRoot: knowledgeStore.Root(),
-	}, nil
+	}, input, nil
 }
 
 func ebookHTMLPath(outputDir, title string) (string, error) {

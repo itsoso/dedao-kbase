@@ -64,6 +64,7 @@
 cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
+DEDAO_DOWNLOAD_ROOT="/opt/dedao-kbase/downloads" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
@@ -104,12 +105,15 @@ npm run build
 cd ..
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
+DEDAO_DOWNLOAD_ROOT="/opt/dedao-kbase/downloads" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
 KBASE_WEB_DIR="$PWD/frontend-web/dist" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
 打开 `http://127.0.0.1:8719/`，在页面顶部填写服务地址和同一个 token 后即可连接。页面提供全局导航，可切到书库、学习、课程、电子书架、登录、个人中心、任务、System KB、Skills/API 和运维状态。`/user/login` 支持得到扫码登录，轮询成功后由服务端保存 Cookie；`/user/profile` 只展示安全登录摘要；`/course` 提供只读课程列表、关键词筛选和分页，点击课程进入 `/course/{enid}` 后可查看课程详情、文章目录并阅读 Markdown 文章；`/ebook` 提供电子书架、关键词筛选和分页，点击电子书进入 `/ebook/{enid}` 后可查看书籍详情、目录并阅读受限批次 SVG 页面；书架行内可选择 HTML/PDF/EPUB 并创建下载任务，也可创建“加入书籍知识库”任务。左侧支持分页和书名筛选，中栏提供检索与 TokenPlan 对话，右侧保留章节、claims、chunks、Jobs、System KB、Skills/API 和 Ops 详情。Jobs 面板可为当前书籍创建 NotebookLM、`health_system_kb_v2`、`quant_rule_cards` 导出任务并查看状态。线上部署可通过 Nginx Basic Auth 保护浏览器页面,并把 `/browser/session-token` 精确路由到 kbase-server;Basic Auth 通过后页面会自动填充 Bearer token。TokenPlan API Key、Dedao Cookie 和电子书阅读 token 只读取服务端环境/配置，不会下发到浏览器。
+
+下载任务默认写入 `DEDAO_DOWNLOAD_ROOT`；未配置时依次使用 `DEDAO_KBASE_DOWNLOAD_ROOT`、`DEDAO_KBASE_ROOT/downloads`、`KBASE_BOOK_KNOWLEDGE_ROOT` 的同级 `downloads`。不要把生产下载目录配置为本机个人路径。
 
 #### kbase Agent Skills
 

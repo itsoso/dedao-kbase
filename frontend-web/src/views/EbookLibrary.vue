@@ -148,11 +148,21 @@
           >
             {{ shelfActionLabel(selectedEbook) }}
           </button>
-          <button type="button" class="secondary-action" :disabled="!canCreateEbookJob(selectedEbook)" @click="createEbookSyncJob(selectedEbook)">
-            {{ canCreateEbookJob(selectedEbook) ? '加入知识库' : '无法执行' }}
+          <button
+            type="button"
+            class="secondary-action"
+            :disabled="!canCreateEbookJob(selectedEbook) || isEbookActionLoading('sync', selectedEbook)"
+            @click="createEbookSyncJob(selectedEbook)"
+          >
+            {{ selectedEbook ? ebookActionLabel('sync', selectedEbook) : '无法执行' }}
           </button>
-          <button type="button" class="primary-action compact" :disabled="!canCreateEbookJob(selectedEbook)" @click="createEbookDownloadJob(selectedEbook)">
-            {{ canCreateEbookJob(selectedEbook) ? '下载' : '无法执行' }}
+          <button
+            type="button"
+            class="primary-action compact"
+            :disabled="!canCreateEbookJob(selectedEbook) || isEbookActionLoading('download', selectedEbook)"
+            @click="createEbookDownloadJob(selectedEbook)"
+          >
+            {{ selectedEbook ? ebookActionLabel('download', selectedEbook) : '无法执行' }}
           </button>
         </div>
         <dl class="ebook-detail-list">
@@ -213,6 +223,7 @@ const downloadTypeOptions = [
   { value: 2, label: 'PDF' },
   { value: 3, label: 'EPUB' },
 ]
+const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms))
 const router = useRouter()
 
 const baseUrl = ref(window.location.origin)
@@ -470,12 +481,32 @@ const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sy
       ebook_enid: readyKey,
       download_type: action === 'download' ? downloadTypeFor(readyEbook) : 1,
     })
-    jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
+    upsertJob(job)
+    void pollJob(job.id)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     actionLoadingKey.value = ''
   }
+}
+
+const pollJob = async (jobID: string) => {
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    await sleep(1000)
+    try {
+      const job = await client.value.getJob(jobID)
+      upsertJob(job)
+      if (job.status === 'succeeded' || job.status === 'failed') {
+        return
+      }
+    } catch {
+      return
+    }
+  }
+}
+
+const upsertJob = (job: BookKnowledgeJob) => {
+  jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
 }
 
 const ebookKey = (ebook: DedaoEbook) => ebook.enid || String(ebook.id)
@@ -494,8 +525,8 @@ const setDownloadType = (ebook: DedaoEbook | null, event: Event) => {
   }
 }
 const ebookActionKey = (action: 'download' | 'sync', ebook: DedaoEbook) => `${action}:${ebookKey(ebook)}`
-const isEbookActionLoading = (action: 'download' | 'sync', ebook: DedaoEbook) =>
-  actionLoadingKey.value === ebookActionKey(action, ebook)
+const isEbookActionLoading = (action: 'download' | 'sync', ebook: DedaoEbook | null) =>
+  Boolean(ebook && actionLoadingKey.value === ebookActionKey(action, ebook))
 const isEbookShelfLoading = (ebook: DedaoEbook) => shelfLoadingKey.value === ebookKey(ebook)
 const ebookActionLabel = (action: 'download' | 'sync', ebook: DedaoEbook) => {
   if (!canCreateEbookJob(ebook)) {

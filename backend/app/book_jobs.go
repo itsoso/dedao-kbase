@@ -16,7 +16,10 @@ import (
 	"github.com/yann0917/dedao-gui/backend/services"
 )
 
-const bookKnowledgeJobsFileName = "jobs.json"
+const (
+	bookKnowledgeJobsFileName = "jobs.json"
+	defaultDedaoDownloadDir   = "downloads"
+)
 
 type BookKnowledgeJobStatus string
 
@@ -183,6 +186,18 @@ func (s *BookKnowledgeStore) LoadBookKnowledgeJob(jobID string) (BookKnowledgeJo
 }
 
 func (s *BookKnowledgeStore) FailRunningBookKnowledgeJobs(reason string) (int, error) {
+	return s.failBookKnowledgeJobs(reason, func(job BookKnowledgeJob) bool {
+		return job.Status == BookKnowledgeJobStatusRunning
+	})
+}
+
+func (s *BookKnowledgeStore) FailInterruptedBookKnowledgeJobs(reason string) (int, error) {
+	return s.failBookKnowledgeJobs(reason, func(job BookKnowledgeJob) bool {
+		return job.Status == BookKnowledgeJobStatusQueued || job.Status == BookKnowledgeJobStatusRunning
+	})
+}
+
+func (s *BookKnowledgeStore) failBookKnowledgeJobs(reason string, shouldFail func(BookKnowledgeJob) bool) (int, error) {
 	if s == nil {
 		s = DefaultBookKnowledgeStore()
 	}
@@ -201,7 +216,7 @@ func (s *BookKnowledgeStore) FailRunningBookKnowledgeJobs(reason string) (int, e
 	}
 	count := 0
 	for i, job := range file.Jobs {
-		if job.Status != BookKnowledgeJobStatusRunning {
+		if !shouldFail(job) {
 			continue
 		}
 		job.Status = BookKnowledgeJobStatusFailed
@@ -423,13 +438,13 @@ func normalizeDedaoOdobJobRequest(request BookKnowledgeJobRequest) (BookKnowledg
 }
 
 func executeDedaoEbookDownloadJob(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
-	cfg := DefaultEbookWikiSyncConfig().withDefaults()
+	downloadRoot := DefaultDedaoDownloadRoot()
 	download := EBookDownload{
 		Ctx:          ctx,
 		DownloadType: job.DownloadType,
 		ID:           job.EbookID,
 		EnID:         job.EbookEnID,
-		OutputDir:    cfg.RepoDir,
+		OutputDir:    downloadRoot,
 	}
 	result, err := download.DownloadWithResult()
 	if err != nil {
@@ -440,20 +455,20 @@ func executeDedaoEbookDownloadJob(ctx context.Context, job BookKnowledgeJob) (ma
 		"ebook_id":      job.EbookID,
 		"ebook_enid":    job.EbookEnID,
 		"download_type": job.DownloadType,
-		"output_dir":    cfg.RepoDir,
+		"output_dir":    downloadRoot,
 		"title":         result.Title,
 		"html_path":     result.HTMLPath,
 	}, nil
 }
 
 func executeDedaoOdobDownloadJob(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
-	cfg := DefaultEbookWikiSyncConfig().withDefaults()
+	downloadRoot := DefaultDedaoDownloadRoot()
 	title := firstNonEmpty(job.OdobTitle, fmt.Sprintf("%d", job.OdobID))
 	download := OdobDownload{
 		Ctx:          ctx,
 		DownloadType: job.DownloadType,
 		ID:           job.OdobID,
-		OutputDir:    cfg.RepoDir,
+		OutputDir:    downloadRoot,
 		Data: &services.Course{
 			Enid:        job.OdobEnID,
 			ID:          job.OdobID,
@@ -474,7 +489,7 @@ func executeDedaoOdobDownloadJob(ctx context.Context, job BookKnowledgeJob) (map
 		"odob_enid":     job.OdobEnID,
 		"odob_alias_id": job.OdobAliasID,
 		"download_type": job.DownloadType,
-		"output_dir":    cfg.RepoDir,
+		"output_dir":    downloadRoot,
 		"title":         title,
 	}, nil
 }
@@ -500,7 +515,7 @@ func executeDedaoOdobSyncKBaseJob(ctx context.Context, store *BookKnowledgeStore
 }
 
 func executeDedaoEbookSyncKBaseJob(ctx context.Context, store *BookKnowledgeStore, job BookKnowledgeJob) (map[string]any, error) {
-	result, err := SyncEbookToWikiStore(ctx, job.EbookID, job.EbookEnID, store)
+	result, err := SyncEbookToBookKnowledgeStore(ctx, job.EbookID, job.EbookEnID, store, DefaultDedaoDownloadRoot())
 	if err != nil {
 		return nil, err
 	}
@@ -515,6 +530,28 @@ func executeDedaoEbookSyncKBaseJob(ctx context.Context, store *BookKnowledgeStor
 		"repo_dir":            result.RepoDir,
 		"book_knowledge_root": result.BookKnowledgeRoot,
 	}, nil
+}
+
+func DefaultDedaoDownloadRoot() string {
+	if value := strings.TrimSpace(os.Getenv("DEDAO_DOWNLOAD_ROOT")); value != "" {
+		return value
+	}
+	if value := strings.TrimSpace(os.Getenv("DEDAO_KBASE_DOWNLOAD_ROOT")); value != "" {
+		return value
+	}
+	if root := strings.TrimSpace(os.Getenv("DEDAO_KBASE_ROOT")); root != "" {
+		return filepath.Join(root, defaultDedaoDownloadDir)
+	}
+	if root := strings.TrimSpace(os.Getenv("DEDAO_BOOK_KNOWLEDGE_ROOT")); root != "" {
+		return filepath.Join(filepath.Dir(root), defaultDedaoDownloadDir)
+	}
+	if root := strings.TrimSpace(os.Getenv("KBASE_BOOK_KNOWLEDGE_ROOT")); root != "" {
+		return filepath.Join(filepath.Dir(root), defaultDedaoDownloadDir)
+	}
+	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+		return filepath.Join(cwd, "dedao-"+defaultDedaoDownloadDir)
+	}
+	return filepath.Join(os.TempDir(), "dedao-kbase", defaultDedaoDownloadDir)
 }
 
 func newBookKnowledgeJobID() string {

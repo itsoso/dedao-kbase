@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -293,6 +294,32 @@ func TestBookKnowledgeJobExecutesDedaoOdobSyncKBase(t *testing.T) {
 	}
 }
 
+func TestDefaultDedaoDownloadRootUsesKBaseRootBeforeWikiRepo(t *testing.T) {
+	t.Setenv("DEDAO_DOWNLOAD_ROOT", "")
+	t.Setenv("DEDAO_KBASE_DOWNLOAD_ROOT", "")
+	t.Setenv("DEDAO_KBASE_ROOT", "/srv/dedao-kbase")
+	t.Setenv("DEDAO_BOOK_KNOWLEDGE_ROOT", "")
+	t.Setenv("KBASE_BOOK_KNOWLEDGE_ROOT", "")
+	t.Setenv("DEDAO_WIKI_REPO", "/legacy/wiki-repo")
+
+	got := DefaultDedaoDownloadRoot()
+	want := filepath.Join("/srv/dedao-kbase", "downloads")
+	if got != want {
+		t.Fatalf("DefaultDedaoDownloadRoot() = %q, want %q", got, want)
+	}
+}
+
+func TestDefaultDedaoDownloadRootUsesExplicitOverride(t *testing.T) {
+	t.Setenv("DEDAO_DOWNLOAD_ROOT", "/srv/dedao-downloads")
+	t.Setenv("DEDAO_KBASE_DOWNLOAD_ROOT", "/srv/ignored-downloads")
+	t.Setenv("DEDAO_KBASE_ROOT", "/srv/dedao-kbase")
+
+	got := DefaultDedaoDownloadRoot()
+	if got != "/srv/dedao-downloads" {
+		t.Fatalf("DefaultDedaoDownloadRoot() = %q, want explicit override", got)
+	}
+}
+
 func TestBookKnowledgeStoreFailsInterruptedRunningJobs(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	running, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
@@ -348,5 +375,82 @@ func TestBookKnowledgeStoreFailsInterruptedRunningJobs(t *testing.T) {
 	}
 	if loadedQueued.Status != BookKnowledgeJobStatusQueued {
 		t.Fatalf("queued status = %s, want queued", loadedQueued.Status)
+	}
+}
+
+func TestBookKnowledgeStoreFailsInterruptedQueuedAndRunningJobs(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	running, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:   BookKnowledgeJobTypeNotebookLMExport,
+		BookID: "67929",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob running returned error: %v", err)
+	}
+	queued, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:   BookKnowledgeJobTypeNotebookLMExport,
+		BookID: "123",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob queued returned error: %v", err)
+	}
+	succeeded, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type:   BookKnowledgeJobTypeNotebookLMExport,
+		BookID: "456",
+	})
+	if err != nil {
+		t.Fatalf("CreateBookKnowledgeJob succeeded returned error: %v", err)
+	}
+	_, err = store.updateBookKnowledgeJob(running.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.Status = BookKnowledgeJobStatusRunning
+		job.StartedAt = "2026-06-28T13:53:54Z"
+		job.UpdatedAt = "2026-06-28T13:53:54Z"
+		job.Logs = append(job.Logs, "running")
+		return job
+	})
+	if err != nil {
+		t.Fatalf("update running returned error: %v", err)
+	}
+	_, err = store.updateBookKnowledgeJob(succeeded.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.Status = BookKnowledgeJobStatusSucceeded
+		job.UpdatedAt = "2026-06-28T13:53:55Z"
+		job.FinishedAt = "2026-06-28T13:53:55Z"
+		job.Logs = append(job.Logs, "succeeded")
+		return job
+	})
+	if err != nil {
+		t.Fatalf("update succeeded returned error: %v", err)
+	}
+
+	count, err := store.FailInterruptedBookKnowledgeJobs("interrupted by server restart")
+	if err != nil {
+		t.Fatalf("FailInterruptedBookKnowledgeJobs returned error: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+
+	for _, jobID := range []string{running.ID, queued.ID} {
+		loaded, err := store.LoadBookKnowledgeJob(jobID)
+		if err != nil {
+			t.Fatalf("LoadBookKnowledgeJob(%s) returned error: %v", jobID, err)
+		}
+		if loaded.Status != BookKnowledgeJobStatusFailed {
+			t.Fatalf("status = %s, want failed", loaded.Status)
+		}
+		if !strings.Contains(loaded.Error, "interrupted by server restart") {
+			t.Fatalf("error = %q", loaded.Error)
+		}
+		if loaded.FinishedAt == "" {
+			t.Fatalf("FinishedAt is empty for %s", jobID)
+		}
+	}
+
+	loadedSucceeded, err := store.LoadBookKnowledgeJob(succeeded.ID)
+	if err != nil {
+		t.Fatalf("LoadBookKnowledgeJob succeeded returned error: %v", err)
+	}
+	if loadedSucceeded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("succeeded status = %s, want succeeded", loadedSucceeded.Status)
 	}
 }

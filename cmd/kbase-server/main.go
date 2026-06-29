@@ -20,10 +20,10 @@ func main() {
 	flag.Parse()
 
 	store := app.NewBookKnowledgeStore(*root)
-	if count, err := store.FailRunningBookKnowledgeJobs("interrupted by kbase-server restart"); err != nil {
+	if count, err := store.FailInterruptedBookKnowledgeJobs("interrupted by kbase-server restart"); err != nil {
 		log.Printf("failed to recover interrupted jobs: %v", err)
 	} else if count > 0 {
-		log.Printf("marked %d interrupted running jobs as failed", count)
+		log.Printf("marked %d interrupted jobs as failed", count)
 	}
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
