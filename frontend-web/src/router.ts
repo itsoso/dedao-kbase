@@ -94,6 +94,7 @@ const routes: RouteRecordRaw[] = [
       title: '书籍知识库',
       scope: 'book_knowledge',
       status: 'online',
+      wide: true,
       source: 'frontend/src/views/BookKnowledge.vue',
       desktopMethods: ['BookKnowledgeListBooks', 'BookKnowledgeGetBook', 'BookKnowledgeSearch', 'BookKnowledgeChat'],
     },

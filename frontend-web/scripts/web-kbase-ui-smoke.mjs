@@ -52,6 +52,7 @@ const webSettingsSource = existsSync(webSettingsPath) ? readFileSync(webSettings
 
 assert.ok(appSource.includes('dedao-web-shell'), 'App.vue should render the Dedao Web shell')
 assert.ok(appSource.includes('immersive-shell'), 'App.vue should support immersive reader routes')
+assert.ok(appSource.includes('wide-shell'), 'App.vue should support wide workbench routes')
 assert.ok(appSource.includes('!route.meta.immersive'), 'App.vue should hide shell navigation for immersive routes')
 assert.ok(appSource.includes('compact-shell-nav'), 'App.vue should render compact shell navigation')
 assert.ok(appSource.includes('router-view'), 'App.vue should render routed pages')
@@ -77,23 +78,34 @@ for (const routePath of [
 
 for (const hook of [
   'kbase-web-shell',
+  'two-pane-layout',
   'book-rail',
   'book-pagination',
   'library-search-panel',
   'chat-panel',
-  'detail-panel',
+  'context-drawer',
   'interop-panel',
   'jobs-panel',
   'ops-panel',
   'system-kb-panel',
   'model-select',
+  'prompt-chip-grid',
   'column-resizer',
-  'compact-detail-summary',
   'answer-markdown',
 ]) {
   assert.ok(workbenchSource.includes(hook), `KBaseWorkbench.vue should include ${hook}`)
 }
 
+assert.ok(!workbenchSource.includes('right-resizer'), 'KBaseWorkbench.vue should not keep a third details column')
+assert.ok(!workbenchSource.includes('compact-reference-panel'), 'KBaseWorkbench.vue should not render a permanent right details panel')
+assert.ok(!workbenchSource.includes('prompt-select'), 'KBaseWorkbench.vue should render prompt templates as chips, not a dropdown')
+assert.ok(!workbenchSource.includes('Library Search'), 'KBaseWorkbench.vue should not show the library search label')
+assert.ok(!workbenchSource.includes('找书与检索'), 'KBaseWorkbench.vue should not show the redundant library search title')
+assert.ok(!workbenchSource.includes('Refresh'), 'KBaseWorkbench.vue should not show a Refresh button in the search panel')
+assert.ok(!workbenchSource.includes('Current Book'), 'KBaseWorkbench.vue should not show a Current Book search scope dropdown')
+assert.ok(!workbenchSource.includes('Updated'), 'KBaseWorkbench.vue should not show a sort dropdown in the search panel')
+assert.ok(workbenchSource.includes('resetBookStudyState'), 'KBaseWorkbench.vue should clear stale chat and details when switching books')
+assert.ok(workbenchSource.includes("selectedChatModel.value = 'qwen3.7-max'"), 'KBaseWorkbench.vue should reset the default model to Qwen-3.7-Max')
 assert.ok(!workbenchSource.includes('kbase-workbench-header'), 'KBaseWorkbench.vue should not render a duplicate secondary navigation row')
 assert.ok(!workbenchSource.includes('app-subnavigation'), 'KBaseWorkbench.vue should not render duplicate section tabs above the workbench')
 assert.ok(!workbenchSource.includes('navigationItems'), 'KBaseWorkbench.vue should rely on the workbench panels instead of a duplicate navigation list')
@@ -191,6 +203,7 @@ assert.ok(routerSource.includes('EbookDetailReader'), 'router.ts should route eb
 assert.ok(/path:\s*['"]\/ebook\/:enid['"][\s\S]{0,140}component:\s*EbookDetailReader/.test(routerSource), 'router.ts should render EbookDetailReader for /ebook/:enid')
 assert.ok(/path:\s*['"]\/ebook\/:enid['"][\s\S]{0,220}immersive:\s*true/.test(routerSource), 'router.ts should make ebook reading immersive')
 assert.ok(routerSource.includes('WebSettings'), 'router.ts should route settings to WebSettings')
+assert.ok(/path:\s*['"]\/book-knowledge['"][\s\S]{0,220}wide:\s*true/.test(routerSource), 'router.ts should make /book-knowledge a wide workbench route')
 assert.ok(/path:\s*['"]\/setting['"][\s\S]{0,140}component:\s*WebSettings/.test(routerSource), 'router.ts should render WebSettings for /setting')
 assert.ok(courseLibrarySource.includes('course-library'), 'CourseLibrary.vue should expose the course library surface')
 assert.ok(courseLibrarySource.includes('listDedaoCourses'), 'CourseLibrary.vue should load courses through the API client')
@@ -257,7 +270,9 @@ assert.ok(ebookDetailReaderSource.includes('reader-floating-actions'), 'EbookDet
 assert.ok(ebookDetailReaderSource.includes('reader-bottom-bar'), 'EbookDetailReader.vue should expose fixed page navigation')
 assert.ok(ebookDetailReaderSource.includes('readableCatalogItems'), 'EbookDetailReader.vue should advance across readable chapters')
 assert.ok(ebookDetailReaderSource.includes('canGoNext'), 'EbookDetailReader.vue should not disable next at chapter end when another chapter exists')
-assert.ok(ebookDetailReaderSource.includes('handleReaderScroll'), 'EbookDetailReader.vue should auto-advance when the reader scroll reaches the bottom')
+assert.ok(ebookDetailReaderSource.includes('handleReaderWheel'), 'EbookDetailReader.vue should page through loaded frames with wheel input')
+assert.ok(ebookDetailReaderSource.includes('height: 100vh'), 'EbookDetailReader.vue should use a fixed full-viewport reader canvas')
+assert.ok(ebookDetailReaderSource.includes('overflow: hidden'), 'EbookDetailReader.vue should avoid body-level reader scrollbars')
 assert.ok(!ebookDetailReaderSource.includes('ebookDetailBaseUrl'), 'EbookDetailReader.vue should not render inline Base URL settings')
 assert.ok(!ebookDetailReaderSource.includes('ebookDetailToken'), 'EbookDetailReader.vue should not render inline Token settings')
 assert.ok(accountProfileSource.includes('account-profile'), 'AccountProfile.vue should expose the account profile surface')

@@ -1,10 +1,28 @@
 package app
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 )
+
+func TestDefaultBookKnowledgeRootUsesServerWritableRepo(t *testing.T) {
+	t.Setenv("DEDAO_BOOK_KNOWLEDGE_ROOT", "")
+	t.Setenv("DEDAO_WIKI_REPO", "")
+	cwd := t.TempDir()
+	chdirForTest(t, cwd)
+	actualCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+
+	got := DefaultBookKnowledgeRoot()
+	want := filepath.Join(actualCwd, "down-dedao", "book_knowledge")
+	if got != want {
+		t.Fatalf("DefaultBookKnowledgeRoot() = %q, want %q", got, want)
+	}
+}
 
 func TestBookKnowledgeStorePaths(t *testing.T) {
 	root := t.TempDir()

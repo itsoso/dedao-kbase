@@ -65,7 +65,10 @@ func defaultSystemKBExportPath() string {
 	if root := strings.TrimSpace(os.Getenv("DEDAO_WIKI_REPO")); root != "" {
 		return filepath.Join(root, "artifacts", "system_kb_export.json")
 	}
-	return "/Users/liqiuhua/work/personal/down-dedao/artifacts/system_kb_export.json"
+	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+		return filepath.Join(cwd, "artifacts", "system_kb_export.json")
+	}
+	return filepath.Join(os.TempDir(), "dedao-kbase", "artifacts", "system_kb_export.json")
 }
 
 func defaultKBaseWebDir() string {

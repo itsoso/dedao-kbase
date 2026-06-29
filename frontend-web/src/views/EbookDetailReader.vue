@@ -79,7 +79,12 @@
 
     <section v-if="errorMessage" class="error-strip reader-error">{{ errorMessage }}</section>
 
-    <section class="dedao-reader-stage" :class="`columns-${columnMode}`" :style="{ '--reader-scale': String(readerScale) }">
+    <section
+      class="dedao-reader-stage"
+      :class="`columns-${columnMode}`"
+      :style="{ '--reader-scale': String(readerScale) }"
+      @wheel="handleReaderWheel"
+    >
       <aside v-if="catalogOpen" class="reader-drawer catalog-drawer">
         <div class="drawer-head">
           <strong>目录</strong>
@@ -166,7 +171,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
@@ -209,6 +214,8 @@ const readerScale = ref(1)
 const pageLoadCount = ref(2)
 const autoAdvanceRunning = ref(false)
 const autoAdvanceCooldownUntil = ref(0)
+const wheelPagingThreshold = 180
+const wheelPagingDelta = ref(0)
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
@@ -294,7 +301,6 @@ const ebookAnalysisSections = computed<PageAnalysisSection[]>(() => {
 })
 
 onMounted(async () => {
-  window.addEventListener('scroll', handleReaderScroll, { passive: true })
   restoreConnection()
   try {
     await hydrateBrowserSession()
@@ -302,10 +308,6 @@ onMounted(async () => {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
-})
-
-onBeforeUnmount(() => {
-  window.removeEventListener('scroll', handleReaderScroll)
 })
 
 const restoreConnection = () => {
@@ -404,7 +406,8 @@ const loadRelativePage = async (direction: -1 | 1) => {
     }
     return
   }
-  const nextIndex = Math.max(0, pageResponse.value.index + direction * pageResponse.value.count)
+  const loadedCount = Math.max(1, pageResponse.value.pages.length || pageResponse.value.count || pageLoadCount.value)
+  const nextIndex = Math.max(0, pageResponse.value.index + direction * loadedCount)
   await loadChapterPages(selectedChapterID.value, nextIndex)
   scrollReaderToTop()
 }
@@ -430,29 +433,34 @@ const toggleFullscreen = async () => {
   await document.documentElement.requestFullscreen()
 }
 
-const handleReaderScroll = () => {
-  if (autoAdvanceRunning.value || pageLoading.value || loading.value || !canGoNext.value) {
+const handleReaderWheel = (event: WheelEvent) => {
+  if (Math.abs(event.deltaY) < 1) {
+    return
+  }
+  event.preventDefault()
+  if (autoAdvanceRunning.value || pageLoading.value || loading.value) {
     return
   }
   if (Date.now() < autoAdvanceCooldownUntil.value) {
     return
   }
-  const doc = document.documentElement
-  const remaining = doc.scrollHeight - window.scrollY - window.innerHeight
-  if (remaining > 140) {
+  wheelPagingDelta.value += event.deltaY
+  if (Math.abs(wheelPagingDelta.value) < wheelPagingThreshold) {
+    return
+  }
+  const direction = wheelPagingDelta.value > 0 ? 1 : -1
+  wheelPagingDelta.value = 0
+  if ((direction > 0 && !canGoNext.value) || (direction < 0 && !canGoPrevious.value)) {
     return
   }
   autoAdvanceRunning.value = true
-  void loadRelativePage(1).finally(() => {
+  void loadRelativePage(direction).finally(() => {
     autoAdvanceRunning.value = false
   })
 }
 
 const scrollReaderToTop = () => {
   autoAdvanceCooldownUntil.value = Date.now() + 700
-  window.requestAnimationFrame(() => {
-    window.scrollTo({ top: 0, behavior: 'smooth' })
-  })
 }
 
 const catalogKey = (item: DedaoEbookCatalogItem) => `${item.chapter_id || item.href || item.text}-${item.play_order || 0}`
@@ -499,17 +507,21 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
     <style>
       html, body {
         margin: 0;
-        min-height: 100%;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
         background: transparent;
       }
       body {
         display: grid;
-        place-items: start center;
+        place-items: center;
         padding: 0;
         box-sizing: border-box;
       }
       svg {
         max-width: 100%;
+        max-height: 100%;
+        width: auto;
         height: auto;
       }
     </style>
@@ -521,15 +533,16 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 <style scoped>
 .ebook-detail-reader {
   display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
-  min-height: 100vh;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
+  height: 100vh;
   margin: 0;
+  overflow: hidden;
   background: #f5f5f5;
   color: #3f3f3f;
 }
 
 .dedao-reader-toolbar {
-  position: sticky;
+  position: relative;
   top: 0;
   z-index: 30;
   display: grid;
@@ -638,8 +651,8 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 
 .reader-settings-strip,
 .reader-search-strip {
-  position: sticky;
-  top: 104px;
+  position: relative;
+  top: 0;
   z-index: 25;
   display: flex;
   gap: 16px;
@@ -697,20 +710,26 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 .dedao-reader-stage {
   display: flex;
   flex: 1;
-  align-items: flex-start;
+  align-items: stretch;
   gap: 28px;
-  min-height: calc(100vh - 148px);
-  padding: 32px 48px 76px;
+  min-height: 0;
+  overflow: hidden;
+  padding: 28px 48px 72px;
 }
 
 .dedao-page-spread {
+  display: flex;
   flex: 1 1 auto;
+  align-items: stretch;
   min-width: 0;
+  min-height: 0;
 }
 
 .ebook-pages {
   display: grid;
-  align-items: start;
+  align-items: stretch;
+  width: 100%;
+  height: 100%;
   margin: 0 auto;
 }
 
@@ -734,14 +753,16 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
 
 .ebook-page-shell {
   display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
-  min-height: calc(100vh - 210px);
-  align-content: start;
+  min-height: 0;
+  align-content: stretch;
 }
 
 .ebook-page-frame {
   width: 100%;
-  min-height: calc(100vh - 228px);
+  height: 100%;
+  min-height: 0;
   border: 0;
   background: transparent;
   transform: scale(var(--reader-scale));

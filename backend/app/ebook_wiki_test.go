@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -18,6 +20,38 @@ func TestEbookHTMLPath(t *testing.T) {
 	if got != want {
 		t.Fatalf("ebookHTMLPath() = %q, want %q", got, want)
 	}
+}
+
+func TestDefaultEbookWikiSyncConfigUsesServerWritableRepo(t *testing.T) {
+	t.Setenv("DEDAO_WIKI_REPO", "")
+	cwd := t.TempDir()
+	chdirForTest(t, cwd)
+	actualCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+
+	cfg := DefaultEbookWikiSyncConfig()
+	want := filepath.Join(actualCwd, "down-dedao")
+	if cfg.RepoDir != want {
+		t.Fatalf("RepoDir = %q, want %q", cfg.RepoDir, want)
+	}
+}
+
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	previous, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd returned error: %v", err)
+	}
+	if err = os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%q) returned error: %v", dir, err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(previous); err != nil {
+			t.Fatalf("restore Chdir(%q) returned error: %v", previous, err)
+		}
+	})
 }
 
 func TestEbookWikiCommand(t *testing.T) {

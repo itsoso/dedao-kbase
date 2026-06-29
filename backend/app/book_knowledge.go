@@ -111,7 +111,7 @@ func DefaultBookKnowledgeRoot() string {
 	if value := strings.TrimSpace(os.Getenv("DEDAO_BOOK_KNOWLEDGE_ROOT")); value != "" {
 		return value
 	}
-	return filepath.Join(defaultEbookWikiRepoDir, "book_knowledge")
+	return filepath.Join(defaultEbookWikiRepoDir(), "book_knowledge")
 }
 
 func DefaultBookKnowledgeStore() *BookKnowledgeStore {

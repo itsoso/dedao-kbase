@@ -2,33 +2,15 @@
   <main class="kbase-web-shell">
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
-    <div ref="workbenchRef" class="workbench-grid learning-layout" :style="workbenchStyle">
+    <div ref="workbenchRef" class="workbench-grid learning-layout two-pane-layout" :style="workbenchStyle">
       <aside class="book-rail library-search-panel">
-        <div class="panel-head">
-          <div>
-            <span class="eyebrow">Library Search</span>
-            <h2>找书与检索</h2>
-          </div>
-          <button type="button" @click="loadBooks">Refresh</button>
-        </div>
-
-        <div class="rail-controls stacked">
+        <div class="rail-controls search-only">
           <input
             v-model="combinedSearchQuery"
             class="rail-filter"
             placeholder="搜索书名、作者、claims 或 chunks"
             @keydown.enter="runLibrarySearch"
           />
-          <div class="rail-control-row">
-            <select v-model="searchScope">
-              <option value="selected">Current Book</option>
-              <option value="all">All Books</option>
-            </select>
-            <select v-model="bookSort" @change="resetBookPageAndLoad">
-              <option value="updated_at_desc">Updated</option>
-              <option value="title_asc">Title A-Z</option>
-            </select>
-          </div>
           <button class="primary-action" type="button" :disabled="loading" @click="runLibrarySearch">Search</button>
         </div>
 
@@ -59,10 +41,6 @@
         </div>
 
         <div class="search-results-block">
-          <div class="history-head">
-            <strong>Search Results</strong>
-            <span>{{ searchResults.length }}</span>
-          </div>
           <div class="result-list rail-results">
             <article v-for="result in searchResults" :key="resultKey(result)" class="result-row">
               <div class="result-meta">
@@ -82,14 +60,17 @@
       <section class="chat-panel study-panel">
         <div class="panel-head study-head">
           <div>
-            <span class="eyebrow">TokenPlan Study</span>
             <h2>{{ selectedPackage?.book.title || '选择一本书开始学习' }}</h2>
           </div>
-          <select v-model="selectedChatModel" class="model-select">
-            <option v-for="model in chatModelOptions" :key="model.value" :value="model.value">
-              {{ model.label }}
-            </option>
-          </select>
+          <div class="study-actions">
+            <select v-model="selectedChatModel" class="model-select">
+              <option v-for="model in chatModelOptions" :key="model.value" :value="model.value">
+                {{ model.label }}
+              </option>
+            </select>
+            <button type="button" :disabled="!selectedPackage" @click="openContextPanel('Overview')">详情</button>
+            <button type="button" @click="openContextPanel('Jobs')">任务</button>
+          </div>
         </div>
 
         <div class="mode-strip">
@@ -104,12 +85,17 @@
           </button>
         </div>
 
-        <select v-model="selectedPromptID" class="prompt-select" @change="applySelectedPrompt">
-          <option value="">Prompt templates</option>
-          <option v-for="prompt in promptTemplates" :key="prompt.prompt_id" :value="prompt.prompt_id">
-            {{ prompt.category }} · {{ prompt.title }}
-          </option>
-        </select>
+        <div class="prompt-chip-grid">
+          <button
+            v-for="prompt in promptTemplates"
+            :key="prompt.prompt_id"
+            type="button"
+            :class="{ active: selectedPromptID === prompt.prompt_id }"
+            @click="applyPrompt(prompt)"
+          >
+            {{ prompt.title }}
+          </button>
+        </div>
 
         <textarea
           v-model="chatQuestion"
@@ -124,6 +110,15 @@
           <button class="primary-action" type="button" :disabled="!selectedBookID || chatLoading" @click="sendChat">
             {{ chatLoading ? '生成中' : 'Send' }}
           </button>
+        </div>
+
+        <div class="utility-actions">
+          <button type="button" @click="openContextPanel('Chapters')">章节</button>
+          <button type="button" @click="openContextPanel('Claims')">Claims</button>
+          <button type="button" @click="openContextPanel('Chunks')">Chunks</button>
+          <button type="button" @click="openContextPanel('System KB')">System KB</button>
+          <button type="button" @click="openContextPanel('Skills/API')">Skills/API</button>
+          <button type="button" @click="openContextPanel('Ops')">Ops</button>
         </div>
 
         <article v-if="chatResponse" class="chat-answer">
@@ -158,28 +153,28 @@
         </div>
       </section>
 
-      <div class="column-resizer right-resizer" role="separator" aria-label="Resize detail column" @pointerdown="beginColumnResize('right', $event)"></div>
-
-      <section class="detail-panel compact-reference-panel">
+      <section v-if="activeContextPanel" class="context-drawer detail-panel">
         <div class="panel-head detail-head">
           <div>
-            <span class="eyebrow">Details</span>
             <h2>{{ selectedPackage?.book.title || 'Book Details' }}</h2>
+          </div>
+          <div class="drawer-actions">
+            <button type="button" @click="activeContextPanel = ''">关闭</button>
           </div>
           <div class="tab-strip">
             <button
               v-for="tab in tabs"
               :key="tab"
               type="button"
-              :class="{ active: activeTab === tab }"
-              @click="activeTab = tab"
+              :class="{ active: activeContextPanel === tab }"
+              @click="activeContextPanel = tab"
             >
               {{ tab }}
             </button>
           </div>
         </div>
 
-        <div v-if="activeTab === 'Overview'" class="detail-body">
+        <div v-if="activeContextPanel === 'Overview'" class="detail-body">
           <dl class="compact-detail-summary">
             <div><dt>Chapters</dt><dd>{{ selectedPackage?.chapters.length || 0 }}</dd></div>
             <div><dt>Claims</dt><dd>{{ selectedPackage?.claims.length || 0 }}</dd></div>
@@ -188,14 +183,14 @@
           <p class="source-path">{{ selectedPackage?.book.source_html || 'No source HTML path' }}</p>
         </div>
 
-        <div v-else-if="activeTab === 'Chapters'" class="table-list">
+        <div v-else-if="activeContextPanel === 'Chapters'" class="table-list">
           <article v-for="chapter in selectedPackage?.chapters || []" :key="chapter.chapter_id" class="table-row">
             <strong>{{ chapter.order }}. {{ chapter.title }}</strong>
             <p>{{ chapter.summary }}</p>
           </article>
         </div>
 
-        <div v-else-if="activeTab === 'Claims'" class="table-list">
+        <div v-else-if="activeContextPanel === 'Claims'" class="table-list">
           <article v-for="claim in selectedPackage?.claims || []" :key="claim.claim_id" class="table-row">
             <div class="result-meta">
               <span>{{ claim.review_status || 'draft' }}</span>
@@ -206,7 +201,7 @@
           </article>
         </div>
 
-        <div v-else-if="activeTab === 'Chunks'" class="table-list">
+        <div v-else-if="activeContextPanel === 'Chunks'" class="table-list">
           <article v-for="chunk in selectedPackage?.chunks || []" :key="chunk.chunk_id" class="table-row">
             <div class="result-meta">
               <span>{{ chunk.chunk_id }}</span>
@@ -216,7 +211,7 @@
           </article>
         </div>
 
-        <div v-else-if="activeTab === 'Jobs'" class="jobs-panel">
+        <div v-else-if="activeContextPanel === 'Jobs'" class="jobs-panel">
           <div class="job-create-row">
             <select v-model="jobType" :disabled="jobsLoading">
               <option v-for="action in jobActions" :key="action.value" :value="action.value">
@@ -246,7 +241,7 @@
           </div>
         </div>
 
-        <div v-else-if="activeTab === 'System KB'" class="system-kb-panel">
+        <div v-else-if="activeContextPanel === 'System KB'" class="system-kb-panel">
           <div class="system-actions">
             <button type="button" @click="loadSystemKBManifest">Manifest</button>
             <button type="button" @click="loadSystemKBExport">Export</button>
@@ -254,7 +249,7 @@
           <pre>{{ formattedSystemKB }}</pre>
         </div>
 
-        <div v-else-if="activeTab === 'Skills/API'" class="interop-panel">
+        <div v-else-if="activeContextPanel === 'Skills/API'" class="interop-panel">
           <div class="endpoint-group">
             <span class="eyebrow">Public Discovery</span>
             <a v-for="route in publicDiscoveryRoutes" :key="route" :href="routeUrl(route)" target="_blank" rel="noreferrer">
@@ -356,12 +351,10 @@ const bookPage = ref(1)
 const bookPageSize = ref(30)
 const bookTotal = ref(0)
 const bookTotalPages = ref(0)
-const bookSort = ref('updated_at_desc')
 const selectedBookID = ref('')
 const selectedPackage = ref<BookKnowledgePackage | null>(null)
-const searchScope = ref<'selected' | 'all'>('selected')
 const searchResults = ref<BookKnowledgeSearchResult[]>([])
-const activeTab = ref('Overview')
+const activeContextPanel = ref('')
 const systemKBPayload = ref<Record<string, unknown> | null>(null)
 const promptTemplates = ref<BookKnowledgePrompt[]>([])
 const selectedPromptID = ref('')
@@ -376,14 +369,13 @@ const jobs = ref<BookKnowledgeJob[]>([])
 const jobsLoading = ref(false)
 const jobError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
-const layoutColumns = ref({ left: 340, right: 320 })
-const activeResizeTarget = ref<'left' | 'right' | null>(null)
+const layoutColumns = ref({ left: 320 })
+const activeResizeTarget = ref<'left' | null>(null)
 
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 
 const workbenchStyle = computed(() => ({
   '--left-column': `${layoutColumns.value.left}px`,
-  '--right-column': `${layoutColumns.value.right}px`,
 }))
 
 const serviceBaseUrl = computed(() => {
@@ -440,10 +432,9 @@ const restoreLayoutColumns = () => {
     return
   }
   try {
-    const parsed = JSON.parse(raw) as { left?: number; right?: number }
+    const parsed = JSON.parse(raw) as { left?: number }
     layoutColumns.value = {
-      left: clampNumber(parsed.left || layoutColumns.value.left, 280, 460),
-      right: clampNumber(parsed.right || layoutColumns.value.right, 240, 520),
+      left: clampNumber(parsed.left || layoutColumns.value.left, 260, 420),
     }
   } catch {
     localStorage.removeItem(layoutStorageKey)
@@ -483,7 +474,7 @@ const withRequest = async (operation: () => Promise<void>) => {
 
 const loadBooks = async () => {
   await withRequest(async () => {
-    const page = await client.value.listBooksPage(bookPage.value, bookPageSize.value, combinedSearchQuery.value, bookSort.value)
+    const page = await client.value.listBooksPage(bookPage.value, bookPageSize.value, combinedSearchQuery.value, 'updated_at_desc')
     books.value = page.books || []
     bookPage.value = page.page || 1
     bookPageSize.value = page.page_size || bookPageSize.value
@@ -509,10 +500,13 @@ const changeBookPage = async (page: number) => {
 }
 
 const selectBook = async (bookID: string) => {
+  const switchingBook = selectedBookID.value !== bookID
   selectedBookID.value = bookID
+  if (switchingBook) {
+    resetBookStudyState()
+  }
   await withRequest(async () => {
     selectedPackage.value = await client.value.getBook(bookID)
-    activeTab.value = 'Overview'
     await loadBookPrompts()
     await loadChatHistory()
   })
@@ -527,22 +521,21 @@ const runLibrarySearch = async () => {
     return
   }
   await withRequest(async () => {
-    const bookID = searchScope.value === 'selected' ? selectedBookID.value : ''
-    searchResults.value = await client.value.searchKnowledge(text, bookID, 20)
+    searchResults.value = await client.value.searchKnowledge(text, '', 20)
   })
 }
 
 const loadSystemKBManifest = async () => {
   await withRequest(async () => {
     systemKBPayload.value = await client.value.getSystemKBManifest()
-    activeTab.value = 'System KB'
+    activeContextPanel.value = 'System KB'
   })
 }
 
 const loadSystemKBExport = async () => {
   await withRequest(async () => {
     systemKBPayload.value = await client.value.getSystemKBExport()
-    activeTab.value = 'System KB'
+    activeContextPanel.value = 'System KB'
   })
 }
 
@@ -590,7 +583,7 @@ const createSelectedBookJob = async () => {
   try {
     const job = await client.value.createJob(buildJobRequest())
     upsertJob(job)
-    activeTab.value = 'Jobs'
+    activeContextPanel.value = 'Jobs'
     const finalJob = await waitForJob(job.id)
     if (finalJob?.status === 'failed') {
       jobError.value = finalJob.error || 'Job failed'
@@ -661,11 +654,8 @@ const setChatMode = (mode: string) => {
   chatMode.value = mode
 }
 
-const applySelectedPrompt = () => {
-  const prompt = promptTemplates.value.find((item) => item.prompt_id === selectedPromptID.value)
-  if (!prompt) {
-    return
-  }
+const applyPrompt = (prompt: BookKnowledgePrompt) => {
+  selectedPromptID.value = prompt.prompt_id
   chatMode.value = 'chat'
   chatQuestion.value = prompt.prompt
 }
@@ -674,6 +664,17 @@ const clearChatDraft = () => {
   selectedPromptID.value = ''
   chatQuestion.value = ''
   chatResponse.value = null
+}
+
+const resetBookStudyState = () => {
+  selectedPromptID.value = ''
+  chatQuestion.value = ''
+  chatResponse.value = null
+  chatHistory.value = []
+  systemKBPayload.value = null
+  jobError.value = ''
+  activeContextPanel.value = ''
+  selectedChatModel.value = 'qwen3.7-max'
 }
 
 const sendChat = async () => {
@@ -713,7 +714,11 @@ const restoreChatHistory = (item: BookKnowledgeChatHistoryItem) => {
   }
 }
 
-const beginColumnResize = (target: 'left' | 'right', event: PointerEvent) => {
+const openContextPanel = (panel: string) => {
+  activeContextPanel.value = activeContextPanel.value === panel ? '' : panel
+}
+
+const beginColumnResize = (target: 'left', event: PointerEvent) => {
   activeResizeTarget.value = target
   event.preventDefault()
   window.addEventListener('pointermove', resizeColumn)
@@ -726,15 +731,10 @@ const resizeColumn = (event: PointerEvent) => {
   if (!target || !rect) {
     return
   }
-  if (target === 'left') {
+  if (target) {
     layoutColumns.value = {
       ...layoutColumns.value,
-      left: clampNumber(event.clientX - rect.left, 280, 460),
-    }
-  } else {
-    layoutColumns.value = {
-      ...layoutColumns.value,
-      right: clampNumber(rect.right - event.clientX, 240, 520),
+      left: clampNumber(event.clientX - rect.left, 260, 420),
     }
   }
 }

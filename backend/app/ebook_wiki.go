@@ -13,7 +13,7 @@ import (
 	"github.com/yann0917/dedao-gui/backend/utils"
 )
 
-const defaultEbookWikiRepoDir = "/Users/liqiuhua/work/personal/down-dedao"
+const defaultEbookWikiRepoDirName = "down-dedao"
 
 type EbookWikiSyncConfig struct {
 	RepoDir      string
@@ -50,12 +50,9 @@ type osEbookWikiCommandRunner struct{}
 
 func DefaultEbookWikiSyncConfig() EbookWikiSyncConfig {
 	cfg := EbookWikiSyncConfig{
-		RepoDir:      defaultEbookWikiRepoDir,
+		RepoDir:      defaultEbookWikiRepoDir(),
 		WikisCommand: "llms-wikis",
 		Python:       "python3",
-	}
-	if value := strings.TrimSpace(os.Getenv("DEDAO_WIKI_REPO")); value != "" {
-		cfg.RepoDir = value
 	}
 	if value := strings.TrimSpace(os.Getenv("DEDAO_WIKI_COMMAND")); value != "" {
 		cfg.WikisCommand = value
@@ -64,6 +61,16 @@ func DefaultEbookWikiSyncConfig() EbookWikiSyncConfig {
 		cfg.Python = value
 	}
 	return cfg
+}
+
+func defaultEbookWikiRepoDir() string {
+	if value := strings.TrimSpace(os.Getenv("DEDAO_WIKI_REPO")); value != "" {
+		return value
+	}
+	if cwd, err := os.Getwd(); err == nil && strings.TrimSpace(cwd) != "" {
+		return filepath.Join(cwd, defaultEbookWikiRepoDirName)
+	}
+	return filepath.Join(os.TempDir(), defaultEbookWikiRepoDirName)
 }
 
 func (cfg EbookWikiSyncConfig) withDefaults() EbookWikiSyncConfig {
