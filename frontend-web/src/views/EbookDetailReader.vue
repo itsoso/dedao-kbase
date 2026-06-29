@@ -1048,6 +1048,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
 .ebook-pages {
   display: grid;
   align-items: stretch;
+  grid-auto-rows: minmax(0, 1fr);
   width: 100%;
   height: 100%;
   margin: 0 auto;
@@ -1076,6 +1077,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   align-content: stretch;
 }
 

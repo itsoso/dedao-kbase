@@ -289,6 +289,8 @@ assert.ok(ebookDetailReaderSource.includes('reader-bottom-bar'), 'EbookDetailRea
 assert.ok(ebookDetailReaderSource.includes('readableCatalogItems'), 'EbookDetailReader.vue should advance across readable chapters')
 assert.ok(ebookDetailReaderSource.includes('canGoNext'), 'EbookDetailReader.vue should not disable next at chapter end when another chapter exists')
 assert.ok(ebookDetailReaderSource.includes('handleReaderWheel'), 'EbookDetailReader.vue should page through loaded frames with wheel input')
+assert.ok(ebookDetailReaderSource.includes('grid-auto-rows: minmax(0, 1fr)'), 'EbookDetailReader.vue should stretch reader page rows to the available viewport height')
+assert.ok(ebookDetailReaderSource.includes('height: 100%;') && ebookDetailReaderSource.includes('.ebook-page-shell'), 'EbookDetailReader.vue should stretch each page shell to the reader grid height')
 assert.ok(ebookDetailReaderSource.includes('readerFullscreen'), 'EbookDetailReader.vue should keep an in-page fullscreen state')
 assert.ok(ebookDetailReaderSource.includes('reader-fullscreen'), 'EbookDetailReader.vue should apply an in-page fullscreen class')
 assert.ok(ebookDetailReaderSource.includes('fullscreenchange'), 'EbookDetailReader.vue should sync browser fullscreen changes')
