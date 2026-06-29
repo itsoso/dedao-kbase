@@ -137,6 +137,7 @@ for (const surface of [
   'listProjects',
   'getProjectReviewQueue',
   'getProjectExportPreview',
+  'getProjectVerificationReport',
   'getSystemKBManifest',
   'getSystemKBExport',
 ]) {
@@ -154,6 +155,9 @@ assert.ok(workbenchSource.includes('Projects'), 'KBaseWorkbench.vue should expos
 assert.ok(workbenchSource.includes('projectHub'), 'KBaseWorkbench.vue should render the project knowledge hub')
 assert.ok(workbenchSource.includes('health') && workbenchSource.includes('proofroom'), 'KBaseWorkbench.vue should expose health and proofroom project tabs')
 assert.ok(workbenchSource.includes('reviewQueue'), 'KBaseWorkbench.vue should render project review queue items')
+assert.ok(workbenchSource.includes('verificationReport'), 'KBaseWorkbench.vue should render project verification reports')
+assert.ok(workbenchSource.includes('verification_score'), 'KBaseWorkbench.vue should expose verification scores')
+assert.ok(workbenchSource.includes('risk_tier'), 'KBaseWorkbench.vue should expose risk tiers')
 assert.ok(workbenchSource.includes('Skills/API'), 'KBaseWorkbench.vue should expose skills/API navigation')
 assert.ok(workbenchSource.includes('Ops'), 'KBaseWorkbench.vue should expose ops navigation')
 assert.ok(workbenchSource.includes('/.well-known/dedao-kbase-skills.json'), 'KBaseWorkbench.vue should expose skill discovery route')
@@ -186,6 +190,7 @@ assert.ok(apiSource.includes('DedaoLoginQRCode'), 'api.ts should type Dedao logi
 assert.ok(apiSource.includes('DedaoLoginCheck'), 'api.ts should type Dedao login polling payload')
 assert.ok(apiSource.includes('/api/jobs'), 'api.ts should call jobs endpoints')
 assert.ok(apiSource.includes('/api/projects'), 'api.ts should call project hub endpoints')
+assert.ok(apiSource.includes('verification-report'), 'api.ts should call project verification endpoints')
 assert.ok(apiSource.includes('/api/dedao/session'), 'api.ts should call the Dedao session endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/qrcode'), 'api.ts should call the Dedao QR login endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/check'), 'api.ts should call the Dedao login polling endpoint')

@@ -261,6 +261,25 @@
             </div>
           </section>
 
+          <section v-if="projectHub.verification" class="verification-summary">
+            <div>
+              <span>Auto</span>
+              <strong>{{ verificationTierCount('auto_usable') }}</strong>
+            </div>
+            <div>
+              <span>Assist</span>
+              <strong>{{ verificationTierCount('assistive_only') }}</strong>
+            </div>
+            <div>
+              <span>Review</span>
+              <strong>{{ verificationTierCount('needs_human') }}</strong>
+            </div>
+            <div>
+              <span>Blocked</span>
+              <strong>{{ verificationTierCount('blocked') }}</strong>
+            </div>
+          </section>
+
           <section v-if="selectedProject" class="project-policy">
             <strong>{{ selectedProject.name }}</strong>
             <p>{{ selectedProject.description }}</p>
@@ -268,8 +287,32 @@
               <span>{{ selectedProject.target_system }}</span>
               <span>{{ selectedProject.source_policy }}</span>
               <span>{{ selectedProject.requires_review ? 'requires review' : 'read only' }}</span>
+              <span v-if="projectHub.verification">{{ projectHub.verification.human_loop }}</span>
             </div>
           </section>
+
+          <div v-if="verificationReport" class="table-list project-verification-list">
+            <article
+              v-for="item in verificationReport.items || []"
+              :key="`${item.project_id}:verify:${item.claim_id}`"
+              class="table-row"
+            >
+              <div class="result-meta">
+                <span>{{ riskTierLabel(item.risk_tier) }}</span>
+                <span>{{ item.decision }} · {{ formatScore(item.verification_score) }}</span>
+              </div>
+              <strong>{{ item.title || item.book_title }}</strong>
+              <p>{{ item.summary }}</p>
+              <div class="source-chips">
+                <span>verification_score: {{ formatScore(item.verification_score) }}</span>
+                <span>risk_tier: {{ item.risk_tier }}</span>
+                <span v-for="use in item.allowed_uses || []" :key="use">{{ use }}</span>
+              </div>
+              <p v-if="(item.failure_reasons || []).length" class="job-error">
+                {{ (item.failure_reasons || []).join(', ') }}
+              </p>
+            </article>
+          </div>
 
           <div class="table-list project-review-list">
             <article v-for="item in reviewQueue?.items || []" :key="`${item.project_id}:${item.claim_id}`" class="table-row">
@@ -346,6 +389,7 @@ import {
   type BookKnowledgeProject,
   type BookKnowledgeProjectExportPreview,
   type BookKnowledgeProjectReviewQueue,
+  type BookKnowledgeProjectVerificationReport,
   type BookKnowledgeSearchResult,
 } from '../api'
 import { renderMarkdown } from '../utils/markdownRender'
@@ -383,6 +427,7 @@ const protectedApiRoutes = [
   '/api/projects',
   '/api/projects/health/review-queue',
   '/api/projects/proofroom/export-preview',
+  '/api/projects/health/verification-report',
   '/api/system-kb/manifest',
   '/api/system-kb/export',
 ]
@@ -419,6 +464,7 @@ const projects = ref<BookKnowledgeProject[]>([])
 const selectedProjectID = ref('health')
 const reviewQueue = ref<BookKnowledgeProjectReviewQueue | null>(null)
 const projectExportPreview = ref<BookKnowledgeProjectExportPreview | null>(null)
+const verificationReport = ref<BookKnowledgeProjectVerificationReport | null>(null)
 const projectLoading = ref(false)
 const projectError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
@@ -459,6 +505,7 @@ const projectHub = computed(() => ({
   project: selectedProject.value,
   queue: reviewQueue.value,
   preview: projectExportPreview.value,
+  verification: verificationReport.value,
 }))
 
 onMounted(async () => {
@@ -664,13 +711,15 @@ const loadProjectHub = async () => {
     if (!selectedProjectID.value && projects.value.length) {
       selectedProjectID.value = projects.value[0].project_id
     }
-    const [queue, preview] = await Promise.all([
+    const [queue, preview, verification] = await Promise.all([
       client.value.getProjectReviewQueue(projectID, 20),
       client.value.getProjectExportPreview(projectID, 20),
+      client.value.getProjectVerificationReport(projectID, 20),
     ])
     if (selectedProjectID.value === projectID) {
       reviewQueue.value = queue
       projectExportPreview.value = preview
+      verificationReport.value = verification
     }
     connected.value = true
   } catch (error) {
@@ -685,6 +734,7 @@ const selectProject = async (projectID: string) => {
   selectedProjectID.value = projectID
   reviewQueue.value = null
   projectExportPreview.value = null
+  verificationReport.value = null
   await loadProjectHub()
 }
 
@@ -733,6 +783,27 @@ const waitForJob = async (jobID: string): Promise<BookKnowledgeJob | null> => {
 
 const upsertJob = (job: BookKnowledgeJob) => {
   jobs.value = [job, ...jobs.value.filter((item) => item.id !== job.id)]
+}
+
+const verificationTierCount = (riskTier: string) => {
+  return verificationReport.value?.tier_counts?.[riskTier] || 0
+}
+
+const formatScore = (score?: number) => {
+  if (typeof score !== 'number' || Number.isNaN(score)) {
+    return '0%'
+  }
+  return `${Math.round(score * 100)}%`
+}
+
+const riskTierLabel = (riskTier: string) => {
+  const labels: Record<string, string> = {
+    auto_usable: 'Auto usable',
+    assistive_only: 'Assistive',
+    needs_human: 'Needs review',
+    blocked: 'Blocked',
+  }
+  return labels[riskTier] || riskTier
 }
 
 const sleep = (ms: number) => {

@@ -861,14 +861,23 @@ label span {
   background: #fffaf6;
 }
 
-.project-summary {
+.project-summary,
+.verification-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }
 
+.project-summary {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.verification-summary {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .project-summary div,
+.verification-summary div,
 .project-policy {
   border: 1px solid var(--dedao-line);
   border-radius: 8px;
@@ -876,7 +885,8 @@ label span {
   background: var(--dedao-subtle);
 }
 
-.project-summary span {
+.project-summary span,
+.verification-summary span {
   display: block;
   color: var(--dedao-muted);
   font-size: 10px;
@@ -884,7 +894,8 @@ label span {
   text-transform: uppercase;
 }
 
-.project-summary strong {
+.project-summary strong,
+.verification-summary strong {
   display: block;
   margin-top: 4px;
   overflow-wrap: anywhere;
@@ -911,8 +922,13 @@ label span {
   line-height: 18px;
 }
 
+.project-verification-list,
 .project-review-list {
   max-height: none;
+}
+
+.project-verification-list {
+  margin-bottom: 10px;
 }
 
 .chat-history {

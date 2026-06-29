@@ -257,6 +257,121 @@ func TestKBaseHTTPHandlerServesProjectKnowledgeHub(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesProjectVerificationReport(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	healthResp := requestKBase(handler, http.MethodGet, "/api/projects/health/verification-report?limit=10", "secret-token")
+	if healthResp.Code != http.StatusOK {
+		t.Fatalf("health verification status = %d, body=%s", healthResp.Code, healthResp.Body.String())
+	}
+	healthBody := healthResp.Body.String()
+	for _, want := range []string{
+		`"project_id":"health"`,
+		`"autonomy_mode":"machine_verified_async_audit"`,
+		`"human_loop":"async_audit_only"`,
+		`"verification_score"`,
+		`"source_hash"`,
+		`"risk_tier":"assistive_only"`,
+		`"risk_tier":"needs_human"`,
+		`"decision":"assist"`,
+		`"decision":"queue"`,
+		`"not_medical_advice"`,
+	} {
+		if !strings.Contains(healthBody, want) {
+			t.Fatalf("health verification response missing %q: %s", want, healthBody)
+		}
+	}
+	if strings.Contains(healthBody, `"claim_id":"verify-claim-medication","risk_tier":"auto_usable"`) {
+		t.Fatalf("health-sensitive claim must not be auto usable: %s", healthBody)
+	}
+
+	proofroomResp := requestKBase(handler, http.MethodGet, "/api/projects/proofroom/verification-report?limit=10", "secret-token")
+	if proofroomResp.Code != http.StatusOK {
+		t.Fatalf("proofroom verification status = %d, body=%s", proofroomResp.Code, proofroomResp.Body.String())
+	}
+	proofroomBody := proofroomResp.Body.String()
+	for _, want := range []string{
+		`"project_id":"proofroom"`,
+		`"risk_tier":"auto_usable"`,
+		`"decision":"allow"`,
+		`"argument_draft"`,
+		`"citation_presence"`,
+		`"review_sampling":"async_sample"`,
+	} {
+		if !strings.Contains(proofroomBody, want) {
+			t.Fatalf("proofroom verification response missing %q: %s", want, proofroomBody)
+		}
+	}
+
+	unknownResp := requestKBase(handler, http.MethodGet, "/api/projects/unknown/verification-report", "secret-token")
+	if unknownResp.Code != http.StatusNotFound {
+		t.Fatalf("unknown project verification status = %d, want 404", unknownResp.Code)
+	}
+}
+
+func sampleBookKnowledgePackageForVerification() BookKnowledgePackage {
+	return BookKnowledgePackage{
+		Book: BookKnowledgeBook{
+			BookID:     "verify-book",
+			Title:      "验证能力测试书",
+			SourceHTML: "/tmp/verify-book.html",
+			Status:     "draft",
+		},
+		Chapters: []BookKnowledgeChapter{
+			{ChapterID: "verify-chapter-1", BookID: "verify-book", Order: 1, Title: "验证章节", Summary: "验证章节摘要"},
+		},
+		Chunks: []BookKnowledgeChunk{
+			{ChunkID: "verify-chunk-1", BookID: "verify-book", ChapterID: "verify-chapter-1", Order: 1, Text: "稳定复盘可以帮助学习者识别错误模式。"},
+			{ChunkID: "verify-chunk-2", BookID: "verify-book", ChapterID: "verify-chapter-1", Order: 2, Text: "具体用药剂量必须由医生结合个体情况判断。"},
+		},
+		Claims: []BookKnowledgeClaim{
+			{
+				ClaimID:       "verify-claim-study",
+				BookID:        "verify-book",
+				ChapterID:     "verify-chapter-1",
+				Title:         "复盘提高学习质量",
+				Summary:       "稳定复盘可以帮助学习者识别错误模式。",
+				EvidenceLevel: "B",
+				Confidence:    0.92,
+				ReviewStatus:  "draft",
+				Citations:     []string{"verify-citation-1"},
+			},
+			{
+				ClaimID:       "verify-claim-medication",
+				BookID:        "verify-book",
+				ChapterID:     "verify-chapter-1",
+				Title:         "用药剂量需要个体判断",
+				Summary:       "具体用药剂量必须由医生结合个体情况判断。",
+				EvidenceLevel: "B",
+				Confidence:    0.88,
+				ReviewStatus:  "draft",
+				Citations:     []string{"verify-citation-2"},
+			},
+			{
+				ClaimID:       "verify-claim-unsupported",
+				BookID:        "verify-book",
+				ChapterID:     "verify-chapter-1",
+				Title:         "缺少引用的观点",
+				Summary:       "这条观点没有引用来源。",
+				EvidenceLevel: "D",
+				Confidence:    0.35,
+				ReviewStatus:  "draft",
+			},
+		},
+		Citations: []BookKnowledgeCitation{
+			{CitationID: "verify-citation-1", BookID: "verify-book", ChapterID: "verify-chapter-1", ChunkID: "verify-chunk-1", SourceHTML: "/tmp/verify-book.html"},
+			{CitationID: "verify-citation-2", BookID: "verify-book", ChapterID: "verify-chapter-1", ChunkID: "verify-chunk-2", SourceHTML: "/tmp/verify-book.html"},
+		},
+	}
+}
+
 func TestKBaseHTTPHandlerServesPageAnalysis(t *testing.T) {
 	var gotTokenPlanAuth string
 	var gotTokenPlanBody string

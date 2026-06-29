@@ -402,6 +402,13 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 			return
 		}
 		writeHTTPJSON(w, http.StatusOK, preview)
+	case "verification-report":
+		report, err := h.store.BuildProjectVerificationReport(projectID, limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, report)
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}

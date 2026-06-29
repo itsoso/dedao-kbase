@@ -169,6 +169,62 @@ export interface BookKnowledgeProjectExportPreview {
   items?: BookKnowledgeReviewQueueItem[]
 }
 
+export interface BookKnowledgeVerificationPolicy {
+  default_risk_tier: string
+  auto_use_tiers?: string[]
+  assistive_tiers?: string[]
+  blocked_uses?: string[]
+}
+
+export interface BookKnowledgeVerificationCheck {
+  check_id: string
+  status: string
+  score: number
+  message: string
+}
+
+export interface BookKnowledgeVerificationProvenance {
+  book_id: string
+  chapter_id?: string
+  claim_id: string
+  citations?: string[]
+  source_hash: string
+}
+
+export interface BookKnowledgeVerifiedItem {
+  project_id: string
+  book_id: string
+  book_title: string
+  chapter_id?: string
+  chapter_title?: string
+  claim_id: string
+  title: string
+  summary: string
+  verification_score: number
+  risk_tier: string
+  decision: string
+  checks: BookKnowledgeVerificationCheck[]
+  failure_reasons?: string[]
+  allowed_uses?: string[]
+  blocked_uses?: string[]
+  risk_flags?: string[]
+  provenance: BookKnowledgeVerificationProvenance
+}
+
+export interface BookKnowledgeProjectVerificationReport {
+  project_id: string
+  project: BookKnowledgeProject
+  autonomy_mode: string
+  human_loop: string
+  review_sampling: string
+  items: BookKnowledgeVerifiedItem[]
+  total: number
+  limit: number
+  tier_counts: Record<string, number>
+  decision_counts: Record<string, number>
+  policy: BookKnowledgeVerificationPolicy
+}
+
 export interface BookKnowledgeJob {
   id: string
   type: string
@@ -618,6 +674,12 @@ export class KBaseClient {
   async getProjectExportPreview(projectID: string, limit = 20): Promise<BookKnowledgeProjectExportPreview> {
     return this.request<BookKnowledgeProjectExportPreview>(
       `/api/projects/${encodeURIComponent(projectID)}/export-preview?limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async getProjectVerificationReport(projectID: string, limit = 20): Promise<BookKnowledgeProjectVerificationReport> {
+    return this.request<BookKnowledgeProjectVerificationReport>(
+      `/api/projects/${encodeURIComponent(projectID)}/verification-report?limit=${encodeURIComponent(String(limit))}`,
     )
   }
 
