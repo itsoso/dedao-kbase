@@ -622,15 +622,16 @@ const ebookSvgTextFallback = (svg: string) => {
       return ''
     }
     const contentBox = computeEbookSvgContentBox(svgElement)
+    const rootWidth = parseSVGLength(svgElement.getAttribute('width'))
     const rootHeight = parseSVGLength(svgElement.getAttribute('height'))
     const textNodeCount = svgElement.querySelectorAll('text,tspan').length
-    const complexVisualCount = svgElement.querySelectorAll('image,path,polygon,polyline,circle,ellipse').length
-    if (!contentBox || !rootHeight || textNodeCount < 6 || complexVisualCount > 0) {
+    if (!contentBox || !rootHeight || textNodeCount < 6) {
       return ''
     }
     const contentHeight = contentBox.maxY - contentBox.minY
     const compressedTextCanvas = contentHeight > 0 && rootHeight > 3000 && contentHeight / rootHeight < 0.08
-    return compressedTextCanvas ? text : ''
+    const textDenseHugeCanvas = rootWidth > 20000 && rootHeight > 20000 && text.length > 120 && textNodeCount > 40
+    return compressedTextCanvas || textDenseHugeCanvas ? text : ''
   } catch {
     return ''
   }
@@ -797,17 +798,21 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
       }
       .ebook-text-page {
         box-sizing: border-box;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
         width: 100%;
         height: 100%;
-        padding: 4vh 5.5vw;
-        overflow: hidden;
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 7vh min(8vw, 92px) 9vh;
+        overflow: auto;
+        scrollbar-width: none;
         font-size: clamp(18px, 1.22vw, 27px);
         font-weight: 500;
         line-height: 1.9;
         letter-spacing: 0;
+      }
+      .ebook-text-page::-webkit-scrollbar {
+        width: 0;
+        height: 0;
       }
       .ebook-text-page p {
         margin: 0 0 1.05em;
