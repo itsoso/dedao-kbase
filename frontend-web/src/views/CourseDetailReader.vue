@@ -14,7 +14,7 @@
 
     <section v-if="errorMessage" class="error-strip">{{ errorMessage }}</section>
 
-    <section ref="readerWorkspaceRef" class="reader-workspace draggable-layout" :style="readerWorkspaceStyle">
+    <section ref="readerWorkspaceRef" class="reader-workspace draggable-layout course-two-pane-layout" :style="readerWorkspaceStyle">
       <aside class="article-rail">
         <div class="panel-head">
           <div>
@@ -61,7 +61,11 @@
             <span class="eyebrow">Markdown Reader</span>
             <h1>{{ selectedArticleTitle || '选择一篇文章' }}</h1>
           </div>
-          <span class="status-pill" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</span>
+          <div class="course-reader-actions">
+            <span class="status-pill" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</span>
+            <button type="button" :disabled="!detail" @click="openContextPanel('Course')">课程信息</button>
+            <button type="button" :disabled="!detail" @click="openContextPanel('Analysis')">AI 分析</button>
+          </div>
         </div>
 
         <div v-if="articleError" class="error-strip">{{ articleError }}</div>
@@ -70,44 +74,44 @@
         <div v-else class="empty-state">从左侧选择文章开始阅读。</div>
       </article>
 
-      <div
-        class="column-resizer right-resizer"
-        role="separator"
-        aria-label="调整课程详情宽度"
-        @pointerdown="beginColumnResize('right', $event)"
-      ></div>
-
-      <aside class="course-context">
+      <aside v-if="activeContextPanel" class="course-context course-context-drawer">
         <div class="context-head">
           <div>
             <span class="eyebrow">Course</span>
             <h2>{{ detail?.course.title || '课程详情' }}</h2>
           </div>
-          <button v-if="hasCourseIntro" class="text-action" type="button" @click="courseIntroCollapsed = !courseIntroCollapsed">
-            {{ courseIntroCollapsed ? '展开' : '收起' }}
-          </button>
+          <button class="text-action" type="button" @click="activeContextPanel = ''">关闭</button>
         </div>
-        <p v-if="hasCourseIntro" class="course-intro" :class="{ collapsed: courseIntroCollapsed }">{{ courseIntro }}</p>
-        <p v-else class="course-intro muted">暂无简介</p>
-        <dl>
-          <div>
-            <dt>Lecturer</dt>
-            <dd>{{ detail?.course.lecturer_name || '-' }}</dd>
-          </div>
-          <div>
-            <dt>Articles</dt>
-            <dd>{{ detail?.course.article_count || articles.length || '-' }}</dd>
-          </div>
-          <div>
-            <dt>Students</dt>
-            <dd>{{ detail?.course.learn_user_count || '-' }}</dd>
-          </div>
-          <div>
-            <dt>ENID</dt>
-            <dd>{{ enid }}</dd>
-          </div>
-        </dl>
+        <div class="context-tabs">
+          <button type="button" :class="{ active: activeContextPanel === 'Course' }" @click="activeContextPanel = 'Course'">课程</button>
+          <button type="button" :class="{ active: activeContextPanel === 'Analysis' }" @click="activeContextPanel = 'Analysis'">AI 分析</button>
+        </div>
+
+        <template v-if="activeContextPanel === 'Course'">
+          <p v-if="hasCourseIntro" class="course-intro">{{ courseIntro }}</p>
+          <p v-else class="course-intro muted">暂无简介</p>
+          <dl>
+            <div>
+              <dt>Lecturer</dt>
+              <dd>{{ detail?.course.lecturer_name || '-' }}</dd>
+            </div>
+            <div>
+              <dt>Articles</dt>
+              <dd>{{ detail?.course.article_count || articles.length || '-' }}</dd>
+            </div>
+            <div>
+              <dt>Students</dt>
+              <dd>{{ detail?.course.learn_user_count || '-' }}</dd>
+            </div>
+            <div>
+              <dt>ENID</dt>
+              <dd>{{ enid }}</dd>
+            </div>
+          </dl>
+        </template>
+
         <PageAnalysisPanel
+          v-else
           :base-url="baseUrl"
           :token="token"
           source="course"
@@ -154,10 +158,10 @@ const selectedArticleTitle = ref('')
 const markdown = ref('')
 const articlesMaxID = ref(0)
 const hasMoreArticles = ref(false)
-const courseIntroCollapsed = ref(true)
+const activeContextPanel = ref<'Course' | 'Analysis' | ''>('')
 const readerWorkspaceRef = ref<HTMLElement | null>(null)
-const layoutColumns = ref({ left: 240, right: 260 })
-const activeResizeTarget = ref<'left' | 'right' | null>(null)
+const layoutColumns = ref({ left: 248 })
+const activeResizeTarget = ref<'left' | null>(null)
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
@@ -165,7 +169,6 @@ const renderedArticle = computed(() => renderMarkdown(markdown.value))
 const coursePageURL = computed(() => `/course/${encodeURIComponent(enid.value)}`)
 const readerWorkspaceStyle = computed(() => ({
   '--course-left-column': `${layoutColumns.value.left}px`,
-  '--course-right-column': `${layoutColumns.value.right}px`,
 }))
 const courseIntro = computed(() => {
   const course = detail.value?.course
@@ -255,10 +258,9 @@ const restoreLayoutColumns = () => {
     return
   }
   try {
-    const parsed = JSON.parse(raw) as { left?: number; right?: number }
+    const parsed = JSON.parse(raw) as { left?: number }
     layoutColumns.value = {
-      left: clampNumber(parsed.left || layoutColumns.value.left, 180, 360),
-      right: clampNumber(parsed.right || layoutColumns.value.right, 220, 420),
+      left: clampNumber(parsed.left || layoutColumns.value.left, 196, 360),
     }
   } catch {
     localStorage.removeItem(layoutStorageKey)
@@ -359,7 +361,11 @@ const compactLines = (lines: Array<string | number | undefined | null>) =>
     .filter(Boolean)
     .join('\n')
 
-const beginColumnResize = (target: 'left' | 'right', event: PointerEvent) => {
+const openContextPanel = (panel: 'Course' | 'Analysis') => {
+  activeContextPanel.value = activeContextPanel.value === panel ? '' : panel
+}
+
+const beginColumnResize = (target: 'left', event: PointerEvent) => {
   activeResizeTarget.value = target
   event.preventDefault()
   window.addEventListener('pointermove', resizeColumn)
@@ -375,12 +381,7 @@ const resizeColumn = (event: PointerEvent) => {
   if (target === 'left') {
     layoutColumns.value = {
       ...layoutColumns.value,
-      left: clampNumber(event.clientX - rect.left, 180, 360),
-    }
-  } else {
-    layoutColumns.value = {
-      ...layoutColumns.value,
-      right: clampNumber(rect.right - event.clientX, 220, 420),
+      left: clampNumber(event.clientX - rect.left, 196, 360),
     }
   }
 }
@@ -427,8 +428,9 @@ const clampNumber = (value: number, min: number, max: number) => {
 }
 
 .reader-workspace {
+  position: relative;
   display: grid;
-  grid-template-columns: var(--course-left-column, 240px) 8px minmax(420px, 1fr) 8px var(--course-right-column, 260px);
+  grid-template-columns: var(--course-left-column, 248px) 8px minmax(760px, 1fr);
   gap: 0;
   min-height: calc(100vh - 196px);
 }
@@ -487,7 +489,7 @@ const clampNumber = (value: number, min: number, max: number) => {
 }
 
 .article-reader {
-  margin: 0 10px;
+  margin-left: 10px;
   overflow: auto;
 }
 
@@ -498,6 +500,31 @@ const clampNumber = (value: number, min: number, max: number) => {
   gap: 12px;
   align-items: start;
   margin-bottom: 12px;
+}
+
+.course-reader-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 240px;
+}
+
+.course-reader-actions button {
+  min-height: 30px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #ffffff;
+  color: var(--dedao-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.course-reader-actions button:hover,
+.course-reader-actions button.active {
+  border-color: var(--dedao-orange);
+  color: var(--dedao-orange);
 }
 
 .article-reader h1 {
@@ -529,6 +556,17 @@ const clampNumber = (value: number, min: number, max: number) => {
   line-height: 1.6;
 }
 
+.course-context-drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 20;
+  width: min(400px, calc(100vw - var(--course-left-column, 248px) - 48px));
+  max-height: calc(100vh - 112px);
+  overflow: auto;
+  box-shadow: 0 18px 48px rgb(0 0 0 / 12%);
+}
+
 .context-head {
   display: flex;
   align-items: flex-start;
@@ -536,15 +574,30 @@ const clampNumber = (value: number, min: number, max: number) => {
   gap: 10px;
 }
 
-.course-intro.collapsed {
-  display: -webkit-box;
-  overflow: hidden;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 4;
-}
-
 .course-intro.muted {
   color: var(--dedao-muted);
+}
+
+.context-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.context-tabs button {
+  min-height: 34px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--dedao-text);
+  font-weight: 700;
+}
+
+.context-tabs button.active,
+.context-tabs button:hover {
+  border-color: var(--dedao-orange);
+  color: var(--dedao-orange);
 }
 
 .course-context dl {
@@ -693,6 +746,12 @@ button:disabled {
 
   .article-reader {
     margin: 0;
+  }
+
+  .course-context-drawer {
+    position: static;
+    width: auto;
+    max-height: none;
   }
 
   .article-list {

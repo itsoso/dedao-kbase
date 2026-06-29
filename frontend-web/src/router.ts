@@ -150,6 +150,7 @@ const routes: RouteRecordRaw[] = [
       title: '课程阅读',
       scope: 'course_detail_reader',
       status: 'online',
+      wide: true,
       source: 'frontend/src/views/Course.vue',
       desktopMethods: ['CourseInfo', 'ArticleList', 'ArticleDetail'],
     },
