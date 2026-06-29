@@ -119,6 +119,56 @@ export interface BookKnowledgeChatRequest {
   max_context_chars?: number
 }
 
+export interface BookKnowledgeProject {
+  project_id: string
+  name: string
+  description: string
+  target_system: string
+  export_type: string
+  source_policy: string
+  requires_review: boolean
+  default_statuses?: string[]
+  default_tags?: string[]
+}
+
+export interface BookKnowledgeReviewQueueItem {
+  project_id: string
+  book_id: string
+  book_title: string
+  chapter_id?: string
+  chapter_title?: string
+  claim_id: string
+  title: string
+  summary: string
+  review_status: string
+  source_review_status?: string
+  evidence_level?: string
+  confidence?: number
+  citations?: string[]
+  tags?: string[]
+  risk_flags?: string[]
+}
+
+export interface BookKnowledgeProjectReviewQueue {
+  project_id: string
+  project: BookKnowledgeProject
+  items: BookKnowledgeReviewQueueItem[]
+  total: number
+  limit: number
+}
+
+export interface BookKnowledgeProjectExportPreview {
+  project_id: string
+  project: BookKnowledgeProject
+  export_type: string
+  source_policy: string
+  requires_review: boolean
+  book_count: number
+  claim_count: number
+  review_status_counts: Record<string, number>
+  items?: BookKnowledgeReviewQueueItem[]
+}
+
 export interface BookKnowledgeJob {
   id: string
   type: string
@@ -552,6 +602,23 @@ export class KBaseClient {
       `/api/books/${encodeURIComponent(bookID)}/chat-history?limit=${encodeURIComponent(String(limit))}`,
     )
     return response.history || []
+  }
+
+  async listProjects(): Promise<BookKnowledgeProject[]> {
+    const response = await this.request<{ projects: BookKnowledgeProject[] }>('/api/projects')
+    return response.projects || []
+  }
+
+  async getProjectReviewQueue(projectID: string, limit = 20): Promise<BookKnowledgeProjectReviewQueue> {
+    return this.request<BookKnowledgeProjectReviewQueue>(
+      `/api/projects/${encodeURIComponent(projectID)}/review-queue?limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async getProjectExportPreview(projectID: string, limit = 20): Promise<BookKnowledgeProjectExportPreview> {
+    return this.request<BookKnowledgeProjectExportPreview>(
+      `/api/projects/${encodeURIComponent(projectID)}/export-preview?limit=${encodeURIComponent(String(limit))}`,
+    )
   }
 
   async listJobs(limit = 50): Promise<BookKnowledgeJob[]> {

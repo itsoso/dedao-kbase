@@ -134,6 +134,9 @@ for (const surface of [
   'createJob',
   'getJob',
   'jobType',
+  'listProjects',
+  'getProjectReviewQueue',
+  'getProjectExportPreview',
   'getSystemKBManifest',
   'getSystemKBExport',
 ]) {
@@ -147,6 +150,10 @@ assert.ok(workbenchSource.includes('Claims'), 'KBaseWorkbench.vue should expose 
 assert.ok(workbenchSource.includes('Chunks'), 'KBaseWorkbench.vue should expose chunk details')
 assert.ok(workbenchSource.includes('System KB'), 'KBaseWorkbench.vue should expose system KB details')
 assert.ok(workbenchSource.includes('Jobs'), 'KBaseWorkbench.vue should expose jobs details')
+assert.ok(workbenchSource.includes('Projects'), 'KBaseWorkbench.vue should expose project knowledge details')
+assert.ok(workbenchSource.includes('projectHub'), 'KBaseWorkbench.vue should render the project knowledge hub')
+assert.ok(workbenchSource.includes('health') && workbenchSource.includes('proofroom'), 'KBaseWorkbench.vue should expose health and proofroom project tabs')
+assert.ok(workbenchSource.includes('reviewQueue'), 'KBaseWorkbench.vue should render project review queue items')
 assert.ok(workbenchSource.includes('Skills/API'), 'KBaseWorkbench.vue should expose skills/API navigation')
 assert.ok(workbenchSource.includes('Ops'), 'KBaseWorkbench.vue should expose ops navigation')
 assert.ok(workbenchSource.includes('/.well-known/dedao-kbase-skills.json'), 'KBaseWorkbench.vue should expose skill discovery route')
@@ -178,6 +185,7 @@ assert.ok(apiSource.includes('DedaoSession'), 'api.ts should type Dedao account 
 assert.ok(apiSource.includes('DedaoLoginQRCode'), 'api.ts should type Dedao login QR payload')
 assert.ok(apiSource.includes('DedaoLoginCheck'), 'api.ts should type Dedao login polling payload')
 assert.ok(apiSource.includes('/api/jobs'), 'api.ts should call jobs endpoints')
+assert.ok(apiSource.includes('/api/projects'), 'api.ts should call project hub endpoints')
 assert.ok(apiSource.includes('/api/dedao/session'), 'api.ts should call the Dedao session endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/qrcode'), 'api.ts should call the Dedao QR login endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/check'), 'api.ts should call the Dedao login polling endpoint')

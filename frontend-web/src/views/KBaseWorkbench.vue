@@ -104,6 +104,7 @@
           <button type="button" @click="openContextPanel('Chapters')">章节</button>
           <button type="button" @click="openContextPanel('Claims')">Claims</button>
           <button type="button" @click="openContextPanel('Chunks')">Chunks</button>
+          <button type="button" @click="openContextPanel('Projects')">项目知识</button>
           <button type="button" @click="openContextPanel('System KB')">System KB</button>
           <button type="button" @click="openContextPanel('Skills/API')">Skills/API</button>
           <button type="button" @click="openContextPanel('Ops')">Ops</button>
@@ -155,7 +156,7 @@
               :key="tab"
               type="button"
               :class="{ active: activeContextPanel === tab }"
-              @click="activeContextPanel = tab"
+              @click="setContextPanel(tab)"
             >
               {{ tab }}
             </button>
@@ -229,6 +230,65 @@
           </div>
         </div>
 
+        <div v-else-if="activeContextPanel === 'Projects'" class="project-hub">
+          <div class="project-tabs">
+            <button
+              v-for="project in projects"
+              :key="project.project_id"
+              type="button"
+              :class="{ active: selectedProjectID === project.project_id }"
+              @click="selectProject(project.project_id)"
+            >
+              {{ project.project_id === 'health' ? '阿衡' : project.name }}
+            </button>
+          </div>
+
+          <p v-if="projectError" class="job-error">{{ projectError }}</p>
+          <div v-if="projectLoading" class="empty-state compact">Loading project knowledge...</div>
+
+          <section v-if="projectHub.preview" class="project-summary">
+            <div>
+              <span>Export</span>
+              <strong>{{ projectHub.preview.export_type }}</strong>
+            </div>
+            <div>
+              <span>Books</span>
+              <strong>{{ projectHub.preview.book_count }}</strong>
+            </div>
+            <div>
+              <span>Claims</span>
+              <strong>{{ projectHub.preview.claim_count }}</strong>
+            </div>
+          </section>
+
+          <section v-if="selectedProject" class="project-policy">
+            <strong>{{ selectedProject.name }}</strong>
+            <p>{{ selectedProject.description }}</p>
+            <div class="source-chips">
+              <span>{{ selectedProject.target_system }}</span>
+              <span>{{ selectedProject.source_policy }}</span>
+              <span>{{ selectedProject.requires_review ? 'requires review' : 'read only' }}</span>
+            </div>
+          </section>
+
+          <div class="table-list project-review-list">
+            <article v-for="item in reviewQueue?.items || []" :key="`${item.project_id}:${item.claim_id}`" class="table-row">
+              <div class="result-meta">
+                <span>{{ item.review_status }}</span>
+                <span>{{ item.book_id }} · {{ item.claim_id }}</span>
+              </div>
+              <strong>{{ item.title || item.book_title }}</strong>
+              <p>{{ item.summary }}</p>
+              <div class="source-chips">
+                <span v-for="flag in item.risk_flags || []" :key="flag">{{ flag }}</span>
+              </div>
+            </article>
+            <div v-if="!projectLoading && !(reviewQueue?.items || []).length" class="empty-state compact">
+              No review queue items
+            </div>
+          </div>
+        </div>
+
         <div v-else-if="activeContextPanel === 'System KB'" class="system-kb-panel">
           <div class="system-actions">
             <button type="button" @click="loadSystemKBManifest">Manifest</button>
@@ -283,13 +343,16 @@ import {
   type BookKnowledgeJobRequest,
   type BookKnowledgePackage,
   type BookKnowledgePrompt,
+  type BookKnowledgeProject,
+  type BookKnowledgeProjectExportPreview,
+  type BookKnowledgeProjectReviewQueue,
   type BookKnowledgeSearchResult,
 } from '../api'
 import { renderMarkdown } from '../utils/markdownRender'
 
 const storageKey = 'dedao-kbase-web-settings'
 const layoutStorageKey = 'dedao-kbase-web-layout'
-const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'Jobs', 'System KB', 'Skills/API', 'Ops']
+const tabs = ['Overview', 'Chapters', 'Claims', 'Chunks', 'Jobs', 'Projects', 'System KB', 'Skills/API', 'Ops']
 const chatModelOptions = [
   { value: 'qwen3.7-max', label: 'Qwen-3.7-Max' },
   { value: 'MiniMax-M2.5', label: 'MiniMax-M2.5' },
@@ -317,6 +380,9 @@ const protectedApiRoutes = [
   '/api/books',
   '/api/search',
   '/api/jobs',
+  '/api/projects',
+  '/api/projects/health/review-queue',
+  '/api/projects/proofroom/export-preview',
   '/api/system-kb/manifest',
   '/api/system-kb/export',
 ]
@@ -349,6 +415,12 @@ const jobType = ref<JobActionValue>('notebooklm_export')
 const jobs = ref<BookKnowledgeJob[]>([])
 const jobsLoading = ref(false)
 const jobError = ref('')
+const projects = ref<BookKnowledgeProject[]>([])
+const selectedProjectID = ref('health')
+const reviewQueue = ref<BookKnowledgeProjectReviewQueue | null>(null)
+const projectExportPreview = ref<BookKnowledgeProjectExportPreview | null>(null)
+const projectLoading = ref(false)
+const projectError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 320 })
 const activeResizeTarget = ref<'left' | null>(null)
@@ -378,6 +450,16 @@ const canSendChat = computed(() => Boolean(selectedBookID.value && chatQuestion.
 const selectedJobAction = computed(() => {
   return jobActions.find((action) => action.value === jobType.value)
 })
+
+const selectedProject = computed(() => {
+  return projects.value.find((project) => project.project_id === selectedProjectID.value) || reviewQueue.value?.project || null
+})
+
+const projectHub = computed(() => ({
+  project: selectedProject.value,
+  queue: reviewQueue.value,
+  preview: projectExportPreview.value,
+}))
 
 onMounted(async () => {
   restoreConnection()
@@ -568,6 +650,44 @@ const loadJobs = async () => {
   }
 }
 
+const loadProjectHub = async () => {
+  if (!token.value || projectLoading.value) {
+    return
+  }
+  const projectID = selectedProjectID.value || 'health'
+  projectLoading.value = true
+  projectError.value = ''
+  try {
+    if (!projects.value.length) {
+      projects.value = await client.value.listProjects()
+    }
+    if (!selectedProjectID.value && projects.value.length) {
+      selectedProjectID.value = projects.value[0].project_id
+    }
+    const [queue, preview] = await Promise.all([
+      client.value.getProjectReviewQueue(projectID, 20),
+      client.value.getProjectExportPreview(projectID, 20),
+    ])
+    if (selectedProjectID.value === projectID) {
+      reviewQueue.value = queue
+      projectExportPreview.value = preview
+    }
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    projectLoading.value = false
+  }
+}
+
+const selectProject = async (projectID: string) => {
+  selectedProjectID.value = projectID
+  reviewQueue.value = null
+  projectExportPreview.value = null
+  await loadProjectHub()
+}
+
 const createSelectedBookJob = async () => {
   if (!selectedBookID.value || jobsLoading.value) {
     return
@@ -715,8 +835,19 @@ const restoreChatHistory = (item: BookKnowledgeChatHistoryItem) => {
   }
 }
 
+const setContextPanel = (panel: string) => {
+  activeContextPanel.value = panel
+  if (panel === 'Projects') {
+    void loadProjectHub()
+  }
+}
+
 const openContextPanel = (panel: string) => {
-  activeContextPanel.value = activeContextPanel.value === panel ? '' : panel
+  if (activeContextPanel.value === panel) {
+    activeContextPanel.value = ''
+    return
+  }
+  setContextPanel(panel)
 }
 
 const beginColumnResize = (target: 'left', event: PointerEvent) => {

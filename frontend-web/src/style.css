@@ -753,6 +753,7 @@ label span {
 .interop-panel,
 .jobs-panel,
 .ops-panel,
+.project-hub,
 .system-kb-panel {
   max-height: calc(100vh - 174px);
   overflow: auto;
@@ -835,6 +836,83 @@ label span {
   background: #ffffff;
   color: var(--dedao-muted);
   font-size: 11px;
+}
+
+.project-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.project-tabs button {
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #ffffff;
+  color: var(--dedao-text);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.project-tabs button.active {
+  border-color: var(--dedao-orange);
+  color: var(--dedao-orange);
+  background: #fffaf6;
+}
+
+.project-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.project-summary div,
+.project-policy {
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--dedao-subtle);
+}
+
+.project-summary span {
+  display: block;
+  color: var(--dedao-muted);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.project-summary strong {
+  display: block;
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: #111111;
+  font-size: 15px;
+  line-height: 20px;
+}
+
+.project-policy {
+  margin-bottom: 10px;
+}
+
+.project-policy strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #111111;
+  font-size: 15px;
+}
+
+.project-policy p {
+  margin: 0 0 8px;
+  color: var(--dedao-muted);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.project-review-list {
+  max-height: none;
 }
 
 .chat-history {
@@ -1277,6 +1355,7 @@ pre {
   .interop-panel,
   .jobs-panel,
   .ops-panel,
+  .project-hub,
   .system-kb-panel {
     max-height: none;
   }

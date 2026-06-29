@@ -148,6 +148,16 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handlePageAnalysis(w, r)
+	case r.URL.Path == "/api/projects":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleListProjects(w)
+	case strings.HasPrefix(r.URL.Path, "/api/projects/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleProjectSubroute(w, r)
 	case r.URL.Path == "/api/books":
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -354,6 +364,47 @@ func (h *kbaseHTTPHandler) handleBookChatHistory(w http.ResponseWriter, r *http.
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"history": history})
+}
+
+func (h *kbaseHTTPHandler) handleListProjects(w http.ResponseWriter) {
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"projects": SupportedBookKnowledgeProjects()})
+}
+
+func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/projects/")
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	projectID, err := url.PathUnescape(parts[0])
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid project id")
+		return
+	}
+	limit, err := parseBoundedIntQuery(r, "limit", 50, 0, 200)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	switch parts[1] {
+	case "review-queue":
+		queue, err := h.store.BuildProjectReviewQueue(projectID, limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, queue)
+	case "export-preview":
+		preview, err := h.store.BuildProjectExportPreview(projectID, limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, preview)
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
 }
 
 func (h *kbaseHTTPHandler) handlePageAnalysis(w http.ResponseWriter, r *http.Request) {

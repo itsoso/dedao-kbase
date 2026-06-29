@@ -209,6 +209,54 @@ func TestKBaseHTTPHandlerServesBookPromptsChatAndHistory(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesProjectKnowledgeHub(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	projectsResp := requestKBase(handler, http.MethodGet, "/api/projects", "secret-token")
+	if projectsResp.Code != http.StatusOK {
+		t.Fatalf("projects status = %d, body=%s", projectsResp.Code, projectsResp.Body.String())
+	}
+	if !strings.Contains(projectsResp.Body.String(), `"project_id":"health"`) ||
+		!strings.Contains(projectsResp.Body.String(), `"project_id":"proofroom"`) ||
+		!strings.Contains(projectsResp.Body.String(), `"requires_review":true`) {
+		t.Fatalf("projects response missing governed project descriptors: %s", projectsResp.Body.String())
+	}
+
+	queueResp := requestKBase(handler, http.MethodGet, "/api/projects/health/review-queue?limit=5", "secret-token")
+	if queueResp.Code != http.StatusOK {
+		t.Fatalf("review queue status = %d, body=%s", queueResp.Code, queueResp.Body.String())
+	}
+	if !strings.Contains(queueResp.Body.String(), `"project_id":"health"`) ||
+		!strings.Contains(queueResp.Body.String(), `"review_status":"needs_review"`) ||
+		!strings.Contains(queueResp.Body.String(), `"book_id":"42"`) ||
+		!strings.Contains(queueResp.Body.String(), `"claim_id":"42-claim-1"`) {
+		t.Fatalf("review queue response missing source IDs and review status: %s", queueResp.Body.String())
+	}
+
+	previewResp := requestKBase(handler, http.MethodGet, "/api/projects/proofroom/export-preview?limit=5", "secret-token")
+	if previewResp.Code != http.StatusOK {
+		t.Fatalf("export preview status = %d, body=%s", previewResp.Code, previewResp.Body.String())
+	}
+	if !strings.Contains(previewResp.Body.String(), `"project_id":"proofroom"`) ||
+		!strings.Contains(previewResp.Body.String(), `"export_type":"proofroom_source_pack"`) ||
+		!strings.Contains(previewResp.Body.String(), `"source_policy":"draft_source_material"`) ||
+		!strings.Contains(previewResp.Body.String(), `"claim_count":1`) {
+		t.Fatalf("export preview response missing proofroom source-pack semantics: %s", previewResp.Body.String())
+	}
+
+	unknownResp := requestKBase(handler, http.MethodGet, "/api/projects/unknown/review-queue", "secret-token")
+	if unknownResp.Code != http.StatusNotFound {
+		t.Fatalf("unknown project status = %d, want 404", unknownResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesPageAnalysis(t *testing.T) {
 	var gotTokenPlanAuth string
 	var gotTokenPlanBody string
