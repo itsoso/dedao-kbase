@@ -9,6 +9,13 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
+const (
+	ebookDownloadPageWidth  = 60000
+	ebookDownloadPageHeight = 200000
+	ebookReaderPageWidth    = 60000
+	ebookReaderPageHeight   = 86000
+)
+
 // reqGetLoginAccessToken 扫码请求token
 func (s *Service) reqGetLoginAccessToken(csrfToken string) (string, error) {
 	resp, err := s.client.R().
@@ -250,6 +257,14 @@ func (s *Service) reqEbookInfo(token string) (io.ReadCloser, error) {
 
 // reqEbookPages 获取页面详情
 func (s *Service) reqEbookPages(chapterID, token string, index, count, offset int) (io.ReadCloser, error) {
+	return s.reqEbookPagesWithCanvas(chapterID, token, index, count, offset, ebookDownloadPageWidth, ebookDownloadPageHeight)
+}
+
+func (s *Service) reqEbookReaderPages(chapterID, token string, index, count, offset int) (io.ReadCloser, error) {
+	return s.reqEbookPagesWithCanvas(chapterID, token, index, count, offset, ebookReaderPageWidth, ebookReaderPageHeight)
+}
+
+func (s *Service) reqEbookPagesWithCanvas(chapterID, token string, index, count, offset int, width, height int) (io.ReadCloser, error) {
 	resp, err := s.client.R().
 		SetBody(map[string]interface{}{
 			"chapter_id":  chapterID,
@@ -263,7 +278,7 @@ func (s *Service) reqEbookPages(chapterID, token string, index, count, offset in
 				"font_name":       "pingfang",
 				"font_scale":      1,
 				"font_size":       16,
-				"height":          200000,
+				"height":          height,
 				"line_height":     "2em",
 				"margin_bottom":   20,
 				"margin_left":     20,
@@ -271,7 +286,7 @@ func (s *Service) reqEbookPages(chapterID, token string, index, count, offset in
 				"margin_top":      0,
 				"paragraph_space": "1em",
 				"platform":        1,
-				"width":           60000,
+				"width":           width,
 			},
 			"token": token,
 		}).

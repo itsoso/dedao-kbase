@@ -534,7 +534,7 @@ func (p liveDedaoContentProvider) GetEbookChapterPages(enid string, chapterID st
 	if err != nil {
 		return DedaoEbookChapterPages{}, err
 	}
-	pageList, err := getService().EbookPages(chapterID, token.Token, index, count, offset)
+	pageList, err := getService().EbookReaderPages(chapterID, token.Token, index, count, offset)
 	if err != nil {
 		return DedaoEbookChapterPages{}, err
 	}

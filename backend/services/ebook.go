@@ -234,6 +234,18 @@ func (s *Service) EbookPages(chapterID, token string, index, count, offset int) 
 	return
 }
 
+func (s *Service) EbookReaderPages(chapterID, token string, index, count, offset int) (pages *EbookPage, err error) {
+	body, err := s.reqEbookReaderPages(chapterID, token, index, count, offset)
+	if err != nil {
+		return
+	}
+	defer body.Close()
+	if err = handleJSONParse(body, &pages); err != nil {
+		return
+	}
+	return
+}
+
 // EbookCommentList get ebook comment list
 // sort like_count
 func (s *Service) EbookCommentList(id, sort string, page, limit int) (list *EbookCommentList, err error) {

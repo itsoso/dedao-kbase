@@ -242,11 +242,11 @@ const svgFrames = computed(() =>
   (pageResponse.value?.pages || []).map((page) => ({
     key: `${page.page_num}-${page.begin_offset}-${page.end_offset}`,
     pageNum: page.page_num,
-    srcdoc: svgToSrcdoc(page.svg),
+    srcdoc: svgToSrcdoc(normalizeEbookSvg(page.svg)),
   })),
 )
 const visibleFrames = computed(() => svgFrames.value)
-const totalPageCount = computed(() => detail.value?.count || 0)
+const totalPageCount = computed(() => estimateEbookTotalPageCount())
 const searchMatchCount = computed(() => {
   const query = readerSearchQuery.value.trim().toLowerCase()
   if (!query) {
@@ -540,6 +540,50 @@ const extractSVGText = (svg: string) => {
   }
 }
 
+const estimateEbookTotalPageCount = () => {
+  const pages = pageResponse.value?.pages || []
+  if (!pages.length) {
+    return 0
+  }
+  if (!pageResponse.value?.is_end) {
+    return 0
+  }
+  return Math.max(...pages.map((page) => page.page_num), pageResponse.value.index + pages.length)
+}
+
+const normalizeEbookSvg = (svg: string) => {
+  const source = svg.trim()
+  if (!source) {
+    return ''
+  }
+  try {
+    const doc = new DOMParser().parseFromString(source, 'image/svg+xml')
+    const svgElement = doc.documentElement
+    if (svgElement.nodeName.toLowerCase() !== 'svg') {
+      return source
+    }
+    const width = parseSVGLength(svgElement.getAttribute('width'))
+    const height = parseSVGLength(svgElement.getAttribute('height'))
+    if (!svgElement.getAttribute('viewBox') && width && height) {
+      svgElement.setAttribute('viewBox', `0 0 ${width} ${height}`)
+    }
+    svgElement.setAttribute('width', '100%')
+    svgElement.setAttribute('height', '100%')
+    svgElement.setAttribute('preserveAspectRatio', 'xMidYMid meet')
+    return new XMLSerializer().serializeToString(svgElement)
+  } catch {
+    return source.replace(/<svg\b/i, '<svg preserveAspectRatio="xMidYMid meet" width="100%" height="100%"')
+  }
+}
+
+const parseSVGLength = (value: string | null) => {
+  if (!value) {
+    return 0
+  }
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+}
+
 const compactLines = (lines: Array<string | number | undefined | null>) =>
   lines
     .map((line) => String(line ?? '').trim())
@@ -565,10 +609,9 @@ const svgToSrcdoc = (svg: string) => `<!doctype html>
         box-sizing: border-box;
       }
       svg {
-        max-width: 100%;
-        max-height: 100%;
-        width: auto;
-        height: auto;
+        display: block;
+        width: 100%;
+        height: 100%;
       }
     </style>
   </head>
