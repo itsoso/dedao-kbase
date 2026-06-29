@@ -5,6 +5,7 @@ import CourseDetailReader from './views/CourseDetailReader.vue'
 import CourseLibrary from './views/CourseLibrary.vue'
 import EbookDetailReader from './views/EbookDetailReader.vue'
 import EbookLibrary from './views/EbookLibrary.vue'
+import HomeDiscovery from './views/HomeDiscovery.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
 import OdobLibrary from './views/OdobLibrary.vue'
@@ -73,6 +74,17 @@ const moduleRoutes = [
 
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/book-knowledge' },
+  {
+    path: '/home',
+    component: HomeDiscovery,
+    meta: {
+      title: '首页',
+      scope: 'home_discovery',
+      status: 'online',
+      source: 'frontend/src/views/Home.vue',
+      desktopMethods: ['GetHomeInitialState', 'SunflowerLabelList', 'SunflowerLabelContent', 'SunflowerResourceList'],
+    },
+  },
   {
     path: '/book-knowledge',
     component: KBaseWorkbench,
@@ -177,7 +189,7 @@ const routes: RouteRecordRaw[] = [
     path: route.path,
     component: ModuleLanding,
     meta: route,
-  })).filter((route) => route.path !== '/setting'),
+  })).filter((route) => route.path !== '/setting' && route.path !== '/home'),
   { path: '/:pathMatch(.*)*', redirect: '/book-knowledge' },
 ]
 
