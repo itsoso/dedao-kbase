@@ -825,6 +825,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
 
 <style scoped>
 .ebook-detail-reader {
+  --reader-page-height: calc(100vh - 228px);
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr);
   height: 100vh;
@@ -835,6 +836,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
 }
 
 .ebook-detail-reader.reader-fullscreen {
+  --reader-page-height: calc(100vh - 170px);
   position: fixed;
   inset: 0;
   z-index: 9999;
@@ -1043,6 +1045,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
   align-items: stretch;
   min-width: 0;
   min-height: 0;
+  height: var(--reader-page-height);
 }
 
 .ebook-pages {
@@ -1050,7 +1053,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
   align-items: stretch;
   grid-auto-rows: minmax(0, 1fr);
   width: 100%;
-  height: 100%;
+  height: var(--reader-page-height);
   margin: 0 auto;
 }
 
@@ -1077,7 +1080,7 @@ const textPageSrcdoc = (text: string) => `<!doctype html>
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
-  height: 100%;
+  height: var(--reader-page-height);
   align-content: stretch;
 }
 
@@ -1322,6 +1325,10 @@ button:disabled {
   .dedao-reader-stage {
     flex-direction: column;
     padding: 22px 16px 82px;
+  }
+
+  .ebook-detail-reader {
+    --reader-page-height: calc(100vh - 252px);
   }
 
   .reader-drawer {
