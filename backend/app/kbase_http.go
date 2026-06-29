@@ -103,6 +103,16 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleDedaoCourses(w, r)
+	case r.URL.Path == "/api/dedao/topics":
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoTopics(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/dedao/topics/"):
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		h.handleDedaoTopicSubroute(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/dedao/courses/"):
 		if !requireHTTPMethod(w, r, http.MethodGet) {
 			return
@@ -487,12 +497,54 @@ func (h *kbaseHTTPHandler) handleDedaoEbooks(w http.ResponseWriter, r *http.Requ
 
 func (h *kbaseHTTPHandler) handleDedaoCourses(w http.ResponseWriter, r *http.Request) {
 	page, pageSize := parseKBasePagination(r)
-	result, err := h.dedaoContent.ListCourses(r.URL.Query().Get("q"), page, pageSize)
+	category := strings.TrimSpace(r.URL.Query().Get("category"))
+	if category == "" {
+		category = CateCourse
+	}
+	result, err := h.dedaoContent.ListCoursesByCategory(category, r.URL.Query().Get("q"), page, pageSize)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoTopics(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parseKBasePagination(r)
+	result, err := h.dedaoContent.ListTopics(page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoTopicSubroute(w http.ResponseWriter, r *http.Request) {
+	segments, err := splitHTTPPathSegments(r.URL.Path, "/api/dedao/topics/")
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(segments) == 2 && segments[1] == "notes" {
+		page, pageSize := parseKBasePagination(r)
+		isElected := true
+		if raw := strings.TrimSpace(r.URL.Query().Get("elected")); raw != "" {
+			parsed, err := strconv.ParseBool(raw)
+			if err != nil {
+				writeHTTPError(w, http.StatusBadRequest, "elected must be true or false")
+				return
+			}
+			isElected = parsed
+		}
+		result, err := h.dedaoContent.ListTopicNotes(segments[0], isElected, page, pageSize)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "not found")
 }
 
 func (h *kbaseHTTPHandler) handleDedaoOdobs(w http.ResponseWriter, r *http.Request) {

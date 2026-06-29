@@ -552,8 +552,8 @@ func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("courses status = %d, body=%s", resp.Code, resp.Body.String())
 	}
-	if content.gotCoursePage != 3 || content.gotCoursePageSize != 1 || content.gotCourseQuery != "商业" {
-		t.Fatalf("courses request args = page %d pageSize %d query %q", content.gotCoursePage, content.gotCoursePageSize, content.gotCourseQuery)
+	if content.gotCourseCategory != CateCourse || content.gotCoursePage != 3 || content.gotCoursePageSize != 1 || content.gotCourseQuery != "商业" {
+		t.Fatalf("courses request args = category %q page %d pageSize %d query %q", content.gotCourseCategory, content.gotCoursePage, content.gotCoursePageSize, content.gotCourseQuery)
 	}
 	var payload DedaoCoursePage
 	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
@@ -571,6 +571,143 @@ func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
 			t.Fatalf("courses response must not expose %s: %s", forbidden, resp.Body.String())
 		}
 	}
+}
+
+func TestKBaseHTTPHandlerServesDedaoCompassCourses(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		courses: DedaoCoursePage{
+			Courses: []DedaoCourse{
+				{
+					ID:       801,
+					ClassID:  901,
+					Enid:     "compass-enid",
+					Title:    "沟通锦囊",
+					Intro:    "可直接使用的问题解决方案。",
+					Icon:     "https://example.test/compass.jpg",
+					Progress: 12,
+				},
+			},
+			Page:       1,
+			PageSize:   12,
+			Total:      22,
+			TotalPages: 2,
+			IsMore:     1,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/courses?category=compass&page=1&page_size=12&q=沟通", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("compass courses status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotCourseCategory != CateAce || content.gotCoursePage != 1 || content.gotCoursePageSize != 12 || content.gotCourseQuery != "沟通" {
+		t.Fatalf("compass request args = category %q page %d pageSize %d query %q", content.gotCourseCategory, content.gotCoursePage, content.gotCoursePageSize, content.gotCourseQuery)
+	}
+	var payload DedaoCoursePage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if len(payload.Courses) != 1 || payload.Courses[0].Title != "沟通锦囊" || payload.Total != 22 {
+		t.Fatalf("compass payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
+func TestKBaseHTTPHandlerServesDedaoTopics(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		topics: DedaoTopicPage{
+			Topics: []DedaoTopic{
+				{
+					TopicIDHazy: "topic-1",
+					Name:        "AI学习",
+					Intro:       "围绕 AI 工具和学习方法的讨论。",
+					Img:         "https://example.test/topic.jpg",
+					Tag:         2,
+					ViewCount:   1200,
+					NotesCount:  89,
+					HasNewNotes: true,
+				},
+			},
+			Page:     1,
+			PageSize: 20,
+			HasMore:  true,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/topics", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("topics without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/topics?page=1&page_size=20", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("topics status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotTopicPage != 1 || content.gotTopicPageSize != 20 {
+		t.Fatalf("topics request args = page %d pageSize %d", content.gotTopicPage, content.gotTopicPageSize)
+	}
+	var payload DedaoTopicPage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if len(payload.Topics) != 1 || payload.Topics[0].Name != "AI学习" || !payload.HasMore {
+		t.Fatalf("topics payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
+func TestKBaseHTTPHandlerServesDedaoTopicNotes(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		topicNotes: DedaoTopicNotePage{
+			TopicIDHazy: "topic-1",
+			Notes: []DedaoTopicNote{
+				{
+					NoteIDHazy:   "note-1",
+					AuthorName:   "学习者",
+					Avatar:       "https://example.test/avatar.jpg",
+					TimeDesc:     "今天",
+					Note:         "这条讨论很适合沉淀成学习卡片。",
+					TopicName:    "AI学习",
+					LikeCount:    23,
+					CommentCount: 4,
+				},
+			},
+			Page:      2,
+			PageSize:  10,
+			HasMore:   false,
+			IsElected: false,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/topics/topic-1/notes?page=2&page_size=10&elected=false", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("topic notes status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotTopicNotesID != "topic-1" || content.gotTopicNotesPage != 2 || content.gotTopicNotesPageSize != 10 || content.gotTopicNotesElected {
+		t.Fatalf("topic notes args = id %q elected %v page %d pageSize %d", content.gotTopicNotesID, content.gotTopicNotesElected, content.gotTopicNotesPage, content.gotTopicNotesPageSize)
+	}
+	var payload DedaoTopicNotePage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.TopicIDHazy != "topic-1" || len(payload.Notes) != 1 || payload.Notes[0].AuthorName != "学习者" {
+		t.Fatalf("topic notes payload = %#v", payload)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
 }
 
 func TestKBaseHTTPHandlerServesDedaoOdobs(t *testing.T) {
@@ -1129,6 +1266,8 @@ func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (D
 type fakeDedaoContentProvider struct {
 	ebooks                 DedaoEbookPage
 	courses                DedaoCoursePage
+	topics                 DedaoTopicPage
+	topicNotes             DedaoTopicNotePage
 	odobs                  DedaoOdobPage
 	odobDetail             DedaoOdobDetail
 	courseDetail           DedaoCourseDetail
@@ -1141,8 +1280,15 @@ type fakeDedaoContentProvider struct {
 	gotPage                int
 	gotPageSize            int
 	gotCourseQuery         string
+	gotCourseCategory      string
 	gotCoursePage          int
 	gotCoursePageSize      int
+	gotTopicPage           int
+	gotTopicPageSize       int
+	gotTopicNotesID        string
+	gotTopicNotesElected   bool
+	gotTopicNotesPage      int
+	gotTopicNotesPageSize  int
 	gotOdobQuery           string
 	gotOdobPage            int
 	gotOdobPageSize        int
@@ -1169,10 +1315,29 @@ func (f *fakeDedaoContentProvider) ListEbooks(query string, page, pageSize int) 
 }
 
 func (f *fakeDedaoContentProvider) ListCourses(query string, page, pageSize int) (DedaoCoursePage, error) {
+	return f.ListCoursesByCategory(CateCourse, query, page, pageSize)
+}
+
+func (f *fakeDedaoContentProvider) ListCoursesByCategory(category string, query string, page, pageSize int) (DedaoCoursePage, error) {
+	f.gotCourseCategory = category
 	f.gotCourseQuery = query
 	f.gotCoursePage = page
 	f.gotCoursePageSize = pageSize
 	return f.courses, nil
+}
+
+func (f *fakeDedaoContentProvider) ListTopics(page, pageSize int) (DedaoTopicPage, error) {
+	f.gotTopicPage = page
+	f.gotTopicPageSize = pageSize
+	return f.topics, nil
+}
+
+func (f *fakeDedaoContentProvider) ListTopicNotes(topicID string, isElected bool, page, pageSize int) (DedaoTopicNotePage, error) {
+	f.gotTopicNotesID = topicID
+	f.gotTopicNotesElected = isElected
+	f.gotTopicNotesPage = page
+	f.gotTopicNotesPageSize = pageSize
+	return f.topicNotes, nil
 }
 
 func (f *fakeDedaoContentProvider) ListOdobs(query string, page, pageSize int) (DedaoOdobPage, error) {

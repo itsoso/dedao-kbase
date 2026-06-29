@@ -1,12 +1,14 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import AccountLogin from './views/AccountLogin.vue'
 import AccountProfile from './views/AccountProfile.vue'
+import CompassLibrary from './views/CompassLibrary.vue'
 import CourseDetailReader from './views/CourseDetailReader.vue'
 import CourseLibrary from './views/CourseLibrary.vue'
 import EbookDetailReader from './views/EbookDetailReader.vue'
 import EbookLibrary from './views/EbookLibrary.vue'
 import HomeDiscovery from './views/HomeDiscovery.vue'
 import KBaseWorkbench from './views/KBaseWorkbench.vue'
+import KnowledgeCity from './views/KnowledgeCity.vue'
 import ModuleLanding from './views/ModuleLanding.vue'
 import OdobLibrary from './views/OdobLibrary.vue'
 import WebSettings from './views/WebSettings.vue'
@@ -94,6 +96,28 @@ const routes: RouteRecordRaw[] = [
       status: 'online',
       source: 'frontend/src/views/BookKnowledge.vue',
       desktopMethods: ['BookKnowledgeListBooks', 'BookKnowledgeGetBook', 'BookKnowledgeSearch', 'BookKnowledgeChat'],
+    },
+  },
+  {
+    path: '/knowledge',
+    component: KnowledgeCity,
+    meta: {
+      title: '知识城邦',
+      scope: 'knowledge_city',
+      status: 'online',
+      source: 'frontend/src/views/Knowledge.vue',
+      desktopMethods: ['TopicAll', 'TopicNoteDetail', 'TopicNotesList'],
+    },
+  },
+  {
+    path: '/compass',
+    component: CompassLibrary,
+    meta: {
+      title: '锦囊',
+      scope: 'compass_browser',
+      status: 'online',
+      source: 'frontend/src/views/Compass.vue',
+      desktopMethods: ['CourseCategory', 'CourseList', 'CourseDownload'],
     },
   },
   {
@@ -189,7 +213,7 @@ const routes: RouteRecordRaw[] = [
     path: route.path,
     component: ModuleLanding,
     meta: route,
-  })).filter((route) => route.path !== '/setting' && route.path !== '/home'),
+  })).filter((route) => !['/setting', '/home', '/knowledge', '/compass'].includes(route.path)),
   { path: '/:pathMatch(.*)*', redirect: '/book-knowledge' },
 ]
 

@@ -283,6 +283,52 @@ export interface DedaoCoursePage {
   is_more: number
 }
 
+export interface DedaoTopic {
+  topic_id_hazy: string
+  name: string
+  intro?: string
+  img?: string
+  tag?: number
+  view_count?: number
+  notes_count?: number
+  has_new_notes: boolean
+}
+
+export interface DedaoTopicPage {
+  topics: DedaoTopic[]
+  page: number
+  page_size: number
+  has_more: boolean
+}
+
+export interface DedaoTopicNote {
+  note_id_hazy: string
+  author_name?: string
+  avatar?: string
+  time_desc?: string
+  note_title?: string
+  note: string
+  slogan?: string
+  v_info?: string
+  topic_name?: string
+  base_title?: string
+  base_sub_title?: string
+  base_img?: string
+  images?: string[]
+  repost_count?: number
+  comment_count?: number
+  like_count?: number
+}
+
+export interface DedaoTopicNotePage {
+  topic_id_hazy: string
+  notes: DedaoTopicNote[]
+  page: number
+  page_size: number
+  has_more: boolean
+  is_elected: boolean
+}
+
 export interface DedaoOdob {
   enid: string
   id: number
@@ -580,7 +626,12 @@ export class KBaseClient {
     )
   }
 
-  async listDedaoCourses(page = 1, pageSize = 15, query = ''): Promise<DedaoCoursePage> {
+  async listDedaoCourses(
+    page = 1,
+    pageSize = 15,
+    query = '',
+    options: { category?: string } = {},
+  ): Promise<DedaoCoursePage> {
     const params = [
       `page=${encodeURIComponent(String(page))}`,
       `page_size=${encodeURIComponent(String(pageSize))}`,
@@ -588,7 +639,34 @@ export class KBaseClient {
     if (query.trim()) {
       params.push(`q=${encodeURIComponent(query.trim())}`)
     }
+    if (options.category?.trim()) {
+      params.push(`category=${encodeURIComponent(options.category.trim())}`)
+    }
     return this.request<DedaoCoursePage>(`/api/dedao/courses?${params.join('&')}`)
+  }
+
+  async listDedaoTopics(page = 1, pageSize = 20): Promise<DedaoTopicPage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+    ]
+    return this.request<DedaoTopicPage>(`/api/dedao/topics?${params.join('&')}`)
+  }
+
+  async listDedaoTopicNotes(
+    topicID: string,
+    elected = true,
+    page = 1,
+    pageSize = 20,
+  ): Promise<DedaoTopicNotePage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+      `elected=${encodeURIComponent(String(elected))}`,
+    ]
+    return this.request<DedaoTopicNotePage>(
+      `/api/dedao/topics/${encodeURIComponent(topicID)}/notes?${params.join('&')}`,
+    )
   }
 
   async listDedaoOdobs(page = 1, pageSize = 15, query = ''): Promise<DedaoOdobPage> {

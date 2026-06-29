@@ -53,6 +53,52 @@ type DedaoCoursePage struct {
 	IsMore     int           `json:"is_more"`
 }
 
+type DedaoTopic struct {
+	TopicIDHazy string `json:"topic_id_hazy"`
+	Name        string `json:"name"`
+	Intro       string `json:"intro,omitempty"`
+	Img         string `json:"img,omitempty"`
+	Tag         int    `json:"tag,omitempty"`
+	ViewCount   int    `json:"view_count,omitempty"`
+	NotesCount  int    `json:"notes_count,omitempty"`
+	HasNewNotes bool   `json:"has_new_notes"`
+}
+
+type DedaoTopicPage struct {
+	Topics   []DedaoTopic `json:"topics"`
+	Page     int          `json:"page"`
+	PageSize int          `json:"page_size"`
+	HasMore  bool         `json:"has_more"`
+}
+
+type DedaoTopicNote struct {
+	NoteIDHazy   string   `json:"note_id_hazy"`
+	AuthorName   string   `json:"author_name,omitempty"`
+	Avatar       string   `json:"avatar,omitempty"`
+	TimeDesc     string   `json:"time_desc,omitempty"`
+	NoteTitle    string   `json:"note_title,omitempty"`
+	Note         string   `json:"note"`
+	Slogan       string   `json:"slogan,omitempty"`
+	VInfo        string   `json:"v_info,omitempty"`
+	TopicName    string   `json:"topic_name,omitempty"`
+	BaseTitle    string   `json:"base_title,omitempty"`
+	BaseSubTitle string   `json:"base_sub_title,omitempty"`
+	BaseImg      string   `json:"base_img,omitempty"`
+	Images       []string `json:"images,omitempty"`
+	RepostCount  int      `json:"repost_count,omitempty"`
+	CommentCount int      `json:"comment_count,omitempty"`
+	LikeCount    int      `json:"like_count,omitempty"`
+}
+
+type DedaoTopicNotePage struct {
+	TopicIDHazy string           `json:"topic_id_hazy"`
+	Notes       []DedaoTopicNote `json:"notes"`
+	Page        int              `json:"page"`
+	PageSize    int              `json:"page_size"`
+	HasMore     bool             `json:"has_more"`
+	IsElected   bool             `json:"is_elected"`
+}
+
 type DedaoOdob struct {
 	Enid          string `json:"enid"`
 	ID            int    `json:"id"`
@@ -225,6 +271,9 @@ type DedaoEbookChapterPages struct {
 type DedaoContentProvider interface {
 	ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
 	ListCourses(query string, page, pageSize int) (DedaoCoursePage, error)
+	ListCoursesByCategory(category string, query string, page, pageSize int) (DedaoCoursePage, error)
+	ListTopics(page, pageSize int) (DedaoTopicPage, error)
+	ListTopicNotes(topicID string, isElected bool, page, pageSize int) (DedaoTopicNotePage, error)
 	ListOdobs(query string, page, pageSize int) (DedaoOdobPage, error)
 	GetOdobDetail(enid string) (DedaoOdobDetail, error)
 	GetCourseDetail(enid string) (DedaoCourseDetail, error)
@@ -276,15 +325,23 @@ func (p liveDedaoContentProvider) ListEbooks(query string, page, pageSize int) (
 }
 
 func (p liveDedaoContentProvider) ListCourses(query string, page, pageSize int) (DedaoCoursePage, error) {
+	return p.ListCoursesByCategory(CateCourse, query, page, pageSize)
+}
+
+func (p liveDedaoContentProvider) ListCoursesByCategory(category string, query string, page, pageSize int) (DedaoCoursePage, error) {
 	if page < 1 {
 		page = 1
 	}
 	if pageSize < 1 {
 		pageSize = 30
 	}
+	category = strings.TrimSpace(category)
+	if category == "" {
+		category = CateCourse
+	}
 	query = strings.TrimSpace(query)
 	if query != "" {
-		list, err := getService().CourseListAll(CateCourse, "study")
+		list, err := getService().CourseListAll(category, "study")
 		if err != nil {
 			return DedaoCoursePage{}, err
 		}
@@ -292,11 +349,11 @@ func (p liveDedaoContentProvider) ListCourses(query string, page, pageSize int) 
 		return dedaoCoursePageFromAllCourses(courses, page, pageSize), nil
 	}
 
-	list, err := CourseList(CateCourse, "study", page, pageSize)
+	list, err := CourseList(category, "study", page, pageSize)
 	if err != nil {
 		return DedaoCoursePage{}, err
 	}
-	total := dedaoCourseCategoryCount(CateCourse)
+	total := dedaoCourseCategoryCount(category)
 	courses := []services.Course{}
 	isMore := 0
 	if list != nil {
@@ -304,6 +361,46 @@ func (p liveDedaoContentProvider) ListCourses(query string, page, pageSize int) 
 		isMore = list.ISMore
 	}
 	return dedaoCoursePageFromPagedCourses(courses, page, pageSize, total, isMore), nil
+}
+
+func (p liveDedaoContentProvider) ListTopics(page, pageSize int) (DedaoTopicPage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	apiPage := page - 1
+	if apiPage < 0 {
+		apiPage = 0
+	}
+	list, err := TopicAll(apiPage, pageSize)
+	if err != nil {
+		return DedaoTopicPage{}, err
+	}
+	return dedaoTopicPageFromService(list, page, pageSize), nil
+}
+
+func (p liveDedaoContentProvider) ListTopicNotes(topicID string, isElected bool, page, pageSize int) (DedaoTopicNotePage, error) {
+	topicID = strings.TrimSpace(topicID)
+	if topicID == "" {
+		return DedaoTopicNotePage{}, nil
+	}
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	apiPage := page - 1
+	if apiPage < 0 {
+		apiPage = 0
+	}
+	list, err := TopicNotesList(topicID, isElected, apiPage, pageSize)
+	if err != nil {
+		return DedaoTopicNotePage{}, err
+	}
+	return dedaoTopicNotePageFromService(topicID, list, page, pageSize, isElected), nil
 }
 
 func (p liveDedaoContentProvider) ListOdobs(query string, page, pageSize int) (DedaoOdobPage, error) {
@@ -592,6 +689,86 @@ func dedaoOdobPageFromPagedCourses(courses []services.Course, page, pageSize, to
 		TotalPages: totalPages,
 		IsMore:     isMore,
 	}
+}
+
+func dedaoTopicPageFromService(list *services.TopicAll, page, pageSize int) DedaoTopicPage {
+	result := DedaoTopicPage{
+		Page:     page,
+		PageSize: pageSize,
+	}
+	if list == nil {
+		return result
+	}
+	result.HasMore = list.HasMore
+	result.Topics = make([]DedaoTopic, 0, len(list.List))
+	for _, topic := range list.List {
+		result.Topics = append(result.Topics, DedaoTopic{
+			TopicIDHazy: topic.TopicIDHazy,
+			Name:        topic.Name,
+			Intro:       topic.Intro,
+			Img:         topic.Img,
+			Tag:         topic.Tag,
+			ViewCount:   topic.ViewCount,
+			NotesCount:  topic.NotesCount,
+			HasNewNotes: topic.HasNewNotes,
+		})
+	}
+	return result
+}
+
+func dedaoTopicNotePageFromService(topicID string, list *services.NotesList, page, pageSize int, isElected bool) DedaoTopicNotePage {
+	result := DedaoTopicNotePage{
+		TopicIDHazy: topicID,
+		Page:        page,
+		PageSize:    pageSize,
+		IsElected:   isElected,
+	}
+	if list == nil {
+		return result
+	}
+	result.HasMore = list.HasMore
+	result.Notes = make([]DedaoTopicNote, 0, len(list.NoteDetailList))
+	for _, note := range list.NoteDetailList {
+		first := note.FPart
+		result.Notes = append(result.Notes, DedaoTopicNote{
+			NoteIDHazy:   first.NoteIDHazy,
+			AuthorName:   first.NickName,
+			Avatar:       first.Avatar,
+			TimeDesc:     first.TimeDesc,
+			NoteTitle:    first.NoteTitle,
+			Note:         first.Note,
+			Slogan:       first.Slogan,
+			VInfo:        first.VInfo,
+			TopicName:    note.Topic.TopicName,
+			BaseTitle:    first.BaseSource.Title,
+			BaseSubTitle: first.BaseSource.SubTitle,
+			BaseImg:      first.BaseSource.Img,
+			Images:       dedaoTopicNoteImages(first.Images),
+			RepostCount:  note.NoteCount.RepostCount,
+			CommentCount: note.NoteCount.CommentCount,
+			LikeCount:    note.NoteCount.LikeCount,
+		})
+	}
+	return result
+}
+
+func dedaoTopicNoteImages(images []string) []string {
+	result := make([]string, 0, len(images))
+	for _, image := range images {
+		image = strings.TrimSpace(image)
+		if image == "" {
+			continue
+		}
+		var payload struct {
+			URL string `json:"url"`
+		}
+		if err := jsoniter.UnmarshalFromString(image, &payload); err == nil && strings.TrimSpace(payload.URL) != "" {
+			result = append(result, strings.TrimSpace(payload.URL))
+			continue
+		}
+		result = append(result, image)
+	}
+	return result
 }
 
 func dedaoEbooksFromCourses(courses []services.Course) []DedaoEbook {
