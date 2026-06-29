@@ -152,8 +152,8 @@
     </section>
 
     <footer v-if="pageResponse" class="reader-bottom-bar">
-      <button type="button" :disabled="pageLoading || pageResponse.index <= 0" @click="loadRelativePage(-1)">上一页</button>
-      <button type="button" :disabled="pageLoading || pageResponse.is_end" @click="loadRelativePage(1)">下一页</button>
+      <button type="button" :disabled="pageLoading || !canGoPrevious" @click="loadRelativePage(-1)">上一页</button>
+      <button type="button" :disabled="pageLoading || !canGoNext" @click="loadRelativePage(1)">下一页</button>
     </footer>
 
     <div class="reader-floating-actions">
@@ -166,7 +166,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
@@ -207,10 +207,28 @@ const readerSearchQuery = ref('')
 const columnMode = ref<ColumnMode>(2)
 const readerScale = ref(1)
 const pageLoadCount = ref(2)
+const autoAdvanceRunning = ref(false)
+const autoAdvanceCooldownUntil = ref(0)
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 const ebookPageURL = computed(() => `/ebook/${encodeURIComponent(enid.value)}`)
+const readableCatalogItems = computed(() => (detail.value?.catalog || []).filter((item) => Boolean(item.chapter_id)))
+const currentReadableIndex = computed(() =>
+  readableCatalogItems.value.findIndex((item) => item.chapter_id === selectedChapterID.value),
+)
+const canGoPrevious = computed(() => {
+  if (!pageResponse.value) {
+    return false
+  }
+  return pageResponse.value.index > 0 || currentReadableIndex.value > 0
+})
+const canGoNext = computed(() => {
+  if (!pageResponse.value) {
+    return false
+  }
+  return !pageResponse.value.is_end || currentReadableIndex.value < readableCatalogItems.value.length - 1
+})
 const svgFrames = computed(() =>
   (pageResponse.value?.pages || []).map((page) => ({
     key: `${page.page_num}-${page.begin_offset}-${page.end_offset}`,
@@ -276,6 +294,7 @@ const ebookAnalysisSections = computed<PageAnalysisSection[]>(() => {
 })
 
 onMounted(async () => {
+  window.addEventListener('scroll', handleReaderScroll, { passive: true })
   restoreConnection()
   try {
     await hydrateBrowserSession()
@@ -283,6 +302,10 @@ onMounted(async () => {
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   }
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('scroll', handleReaderScroll)
 })
 
 const restoreConnection = () => {
@@ -326,7 +349,7 @@ const loadDetail = async () => {
     saveConnection()
     detail.value = await client.value.getDedaoEbookDetail(enid.value)
     connected.value = true
-    const firstReadable = detail.value.catalog.find((item) => item.chapter_id)
+    const firstReadable = readableCatalogItems.value[0]
     if (firstReadable) {
       await openChapter(firstReadable)
     }
@@ -346,6 +369,7 @@ const openChapter = async (item: DedaoEbookCatalogItem) => {
   selectedChapterTitle.value = item.text
   catalogOpen.value = false
   await loadChapterPages(item.chapter_id, 0)
+  scrollReaderToTop()
 }
 
 const setColumnMode = async (mode: ColumnMode) => {
@@ -365,8 +389,24 @@ const loadRelativePage = async (direction: -1 | 1) => {
   if (!selectedChapterID.value || !pageResponse.value) {
     return
   }
+  const currentIndex = currentReadableIndex.value
+  if (direction > 0 && pageResponse.value.is_end) {
+    const nextChapter = readableCatalogItems.value[currentIndex + 1]
+    if (nextChapter) {
+      await openChapter(nextChapter)
+    }
+    return
+  }
+  if (direction < 0 && pageResponse.value.index <= 0) {
+    const previousChapter = readableCatalogItems.value[currentIndex - 1]
+    if (previousChapter) {
+      await openChapter(previousChapter)
+    }
+    return
+  }
   const nextIndex = Math.max(0, pageResponse.value.index + direction * pageResponse.value.count)
   await loadChapterPages(selectedChapterID.value, nextIndex)
+  scrollReaderToTop()
 }
 
 const loadChapterPages = async (chapterID: string, index: number) => {
@@ -388,6 +428,31 @@ const toggleFullscreen = async () => {
     return
   }
   await document.documentElement.requestFullscreen()
+}
+
+const handleReaderScroll = () => {
+  if (autoAdvanceRunning.value || pageLoading.value || loading.value || !canGoNext.value) {
+    return
+  }
+  if (Date.now() < autoAdvanceCooldownUntil.value) {
+    return
+  }
+  const doc = document.documentElement
+  const remaining = doc.scrollHeight - window.scrollY - window.innerHeight
+  if (remaining > 140) {
+    return
+  }
+  autoAdvanceRunning.value = true
+  void loadRelativePage(1).finally(() => {
+    autoAdvanceRunning.value = false
+  })
+}
+
+const scrollReaderToTop = () => {
+  autoAdvanceCooldownUntil.value = Date.now() + 700
+  window.requestAnimationFrame(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  })
 }
 
 const catalogKey = (item: DedaoEbookCatalogItem) => `${item.chapter_id || item.href || item.text}-${item.play_order || 0}`
