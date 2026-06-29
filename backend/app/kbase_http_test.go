@@ -806,6 +806,64 @@ func TestKBaseHTTPHandlerServesDedaoEbooks(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesDedaoSiteEbookSearch(t *testing.T) {
+	content := &fakeDedaoContentProvider{
+		searchEbooks: DedaoEbookPage{
+			Ebooks: []DedaoEbook{
+				{
+					ID:       32355,
+					Enid:     "site-ebook-enid",
+					Title:    "陆蓉行为金融学讲义",
+					Author:   "陆蓉",
+					Intro:    "聪明的投资者都该懂的实战智慧。",
+					Icon:     "https://example.test/site-cover.jpg",
+					Price:    "41.30",
+					Progress: 0,
+				},
+			},
+			Page:       3,
+			PageSize:   7,
+			Total:      54455,
+			TotalPages: 7780,
+			IsMore:     1,
+		},
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoContent: content,
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/dedao/search/ebooks?q=金融", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("site ebook search without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/search/ebooks?page=3&page_size=7&q=金融", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("site ebook search status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if content.gotSearchEbookPage != 3 || content.gotSearchEbookPageSize != 7 || content.gotSearchEbookQuery != "金融" {
+		t.Fatalf(
+			"site ebook search request args = page %d pageSize %d query %q",
+			content.gotSearchEbookPage,
+			content.gotSearchEbookPageSize,
+			content.gotSearchEbookQuery,
+		)
+	}
+	var payload DedaoEbookPage
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("Unmarshal returned error: %v", err)
+	}
+	if payload.Page != 3 || payload.PageSize != 7 || payload.Total != 54455 || payload.TotalPages != 7780 || payload.IsMore != 1 {
+		t.Fatalf("site ebook search pagination = %#v", payload)
+	}
+	if len(payload.Ebooks) != 1 || payload.Ebooks[0].Title != "陆蓉行为金融学讲义" || payload.Ebooks[0].Enid != "site-ebook-enid" {
+		t.Fatalf("site ebook search payload = %#v", payload.Ebooks)
+	}
+	assertDedaoResponseOmitsSecrets(t, resp.Body.String())
+}
+
 func TestKBaseHTTPHandlerServesDedaoCourses(t *testing.T) {
 	content := &fakeDedaoContentProvider{
 		courses: DedaoCoursePage{
@@ -1559,6 +1617,7 @@ func (f *fakeDedaoAuthProvider) CheckLogin(token string, qrCodeString string) (D
 
 type fakeDedaoContentProvider struct {
 	ebooks                 DedaoEbookPage
+	searchEbooks           DedaoEbookPage
 	courses                DedaoCoursePage
 	topics                 DedaoTopicPage
 	topicNotes             DedaoTopicNotePage
@@ -1573,6 +1632,9 @@ type fakeDedaoContentProvider struct {
 	gotQuery               string
 	gotPage                int
 	gotPageSize            int
+	gotSearchEbookQuery    string
+	gotSearchEbookPage     int
+	gotSearchEbookPageSize int
 	gotCourseQuery         string
 	gotCourseCategory      string
 	gotCoursePage          int
@@ -1606,6 +1668,13 @@ func (f *fakeDedaoContentProvider) ListEbooks(query string, page, pageSize int) 
 	f.gotPage = page
 	f.gotPageSize = pageSize
 	return f.ebooks, nil
+}
+
+func (f *fakeDedaoContentProvider) SearchEbooks(query string, page, pageSize int) (DedaoEbookPage, error) {
+	f.gotSearchEbookQuery = query
+	f.gotSearchEbookPage = page
+	f.gotSearchEbookPageSize = pageSize
+	return f.searchEbooks, nil
 }
 
 func (f *fakeDedaoContentProvider) ListCourses(query string, page, pageSize int) (DedaoCoursePage, error) {

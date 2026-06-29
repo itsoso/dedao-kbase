@@ -18,6 +18,8 @@ type DedaoEbook struct {
 	Progress   int    `json:"progress"`
 	PublishNum int    `json:"publish_num,omitempty"`
 	LastRead   string `json:"last_read,omitempty"`
+	IsBuy      bool   `json:"is_buy"`
+	CanTrial   bool   `json:"can_trial_read,omitempty"`
 }
 
 type DedaoEbookPage struct {
@@ -270,6 +272,7 @@ type DedaoEbookChapterPages struct {
 
 type DedaoContentProvider interface {
 	ListEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
+	SearchEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
 	ListCourses(query string, page, pageSize int) (DedaoCoursePage, error)
 	ListCoursesByCategory(category string, query string, page, pageSize int) (DedaoCoursePage, error)
 	ListTopics(page, pageSize int) (DedaoTopicPage, error)
@@ -322,6 +325,28 @@ func (p liveDedaoContentProvider) ListEbooks(query string, page, pageSize int) (
 		isMore = list.ISMore
 	}
 	return dedaoEbookPageFromPagedCourses(ebooks, page, pageSize, total, isMore), nil
+}
+
+func (p liveDedaoContentProvider) SearchEbooks(query string, page, pageSize int) (DedaoEbookPage, error) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 30
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return DedaoEbookPage{
+			Ebooks:   []DedaoEbook{},
+			Page:     page,
+			PageSize: pageSize,
+		}, nil
+	}
+	result, err := getService().SearchEbooks(query, page, pageSize)
+	if err != nil {
+		return DedaoEbookPage{}, err
+	}
+	return dedaoEbookPageFromSiteSearch(result, page, pageSize), nil
 }
 
 func (p liveDedaoContentProvider) ListCourses(query string, page, pageSize int) (DedaoCoursePage, error) {
@@ -629,6 +654,57 @@ func dedaoEbookPageFromPagedCourses(courses []services.Course, page, pageSize, t
 	}
 }
 
+func dedaoEbookPageFromSiteSearch(result *services.EbookSearchResult, page, pageSize int) DedaoEbookPage {
+	if result == nil {
+		return DedaoEbookPage{
+			Ebooks:   []DedaoEbook{},
+			Page:     page,
+			PageSize: pageSize,
+		}
+	}
+	if result.Page > 0 {
+		page = result.Page
+	}
+	if result.Size > 0 {
+		pageSize = result.Size
+	}
+	total := result.Total
+	totalPages := 0
+	if total > 0 && pageSize > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	ebooks := make([]DedaoEbook, 0, len(result.List))
+	for _, item := range result.List {
+		detail := item.Detail
+		title := firstNonEmptySearchField(detail.BookName, item.Title)
+		author := firstNonEmptySearchField(detail.BookAuthor, detail.Author, item.Author)
+		if author == "" && len(detail.AuthorList) > 0 {
+			author = detail.AuthorList[0]
+		}
+		ebooks = append(ebooks, DedaoEbook{
+			Enid:     detail.Enid,
+			ID:       detail.ID,
+			Title:    stripDedaoSearchHighlights(title),
+			Author:   stripDedaoSearchHighlights(author),
+			Intro:    stripDedaoSearchHighlights(firstNonEmptySearchField(detail.BookIntro, item.Content)),
+			Icon:     firstNonEmptySearchField(detail.Cover, item.Image, item.Extra.Image),
+			Price:    firstNonEmptySearchField(detail.CurrentPrice, detail.Price, detail.OriginalPrice),
+			Progress: detail.ReadProgress,
+			LastRead: stripDedaoSearchHighlights(detail.ReadingTitle),
+			IsBuy:    detail.IsBuy,
+			CanTrial: detail.CanTrialRead,
+		})
+	}
+	return DedaoEbookPage{
+		Ebooks:     ebooks,
+		Page:       page,
+		PageSize:   pageSize,
+		Total:      total,
+		TotalPages: totalPages,
+		IsMore:     result.IsMore,
+	}
+}
+
 func dedaoCoursePageFromAllCourses(courses []services.Course, page, pageSize int) DedaoCoursePage {
 	total := len(courses)
 	start := (page - 1) * pageSize
@@ -788,6 +864,21 @@ func dedaoEbooksFromCourses(courses []services.Course) []DedaoEbook {
 		})
 	}
 	return ebooks
+}
+
+func firstNonEmptySearchField(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func stripDedaoSearchHighlights(value string) string {
+	value = strings.ReplaceAll(value, "<hl>", "")
+	value = strings.ReplaceAll(value, "</hl>", "")
+	return strings.TrimSpace(value)
 }
 
 func dedaoOdobsFromCourses(courses []services.Course) []DedaoOdob {

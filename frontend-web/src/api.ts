@@ -362,6 +362,8 @@ export interface DedaoEbook {
   progress: number
   publish_num?: number
   last_read?: string
+  is_buy?: boolean
+  can_trial_read?: boolean
 }
 
 export interface DedaoEbookPage {
@@ -813,6 +815,17 @@ export class KBaseClient {
       params.push(`q=${encodeURIComponent(query.trim())}`)
     }
     return this.request<DedaoEbookPage>(`/api/dedao/ebooks?${params.join('&')}`)
+  }
+
+  async searchDedaoEbooks(page = 1, pageSize = 15, query = ''): Promise<DedaoEbookPage> {
+    const params = [
+      `page=${encodeURIComponent(String(page))}`,
+      `page_size=${encodeURIComponent(String(pageSize))}`,
+    ]
+    if (query.trim()) {
+      params.push(`q=${encodeURIComponent(query.trim())}`)
+    }
+    return this.request<DedaoEbookPage>(`/api/dedao/search/ebooks?${params.join('&')}`)
   }
 
   async getDedaoEbookDetail(enid: string): Promise<DedaoEbookDetail> {

@@ -2,12 +2,12 @@
   <main class="ebook-library">
     <section class="ebook-toolbar">
       <div class="toolbar-summary">
-        <strong>电子书架</strong>
+        <strong>{{ pageTitle }}</strong>
         <span>{{ total }} 本 · 第 {{ page }} / {{ totalPages || 1 }} 页</span>
       </div>
 
       <button class="primary-action" type="button" :disabled="loading" @click="reloadFromFirstPage">
-        {{ loading ? '加载中' : '刷新书架' }}
+        {{ loading ? '加载中' : refreshLabel }}
       </button>
       <div class="status-pill" :class="{ ok: connected }">{{ connected ? '已连接' : '未连接' }}</div>
     </section>
@@ -17,6 +17,24 @@
     <section class="ebook-workspace">
       <aside class="ebook-filter-panel">
         <div class="ebook-filter-stack">
+          <div class="ebook-source-switch" role="group" aria-label="电子书搜索范围">
+            <button
+              type="button"
+              :class="{ active: searchScope === 'shelf' }"
+              :disabled="loading"
+              @click="setSearchScope('shelf')"
+            >
+              我的书架
+            </button>
+            <button
+              type="button"
+              :class="{ active: searchScope === 'site' }"
+              :disabled="loading"
+              @click="setSearchScope('site')"
+            >
+              全站搜索
+            </button>
+          </div>
           <input v-model="query" placeholder="输入书名、作者或简介关键词" @keydown.enter="reloadFromFirstPage" />
           <select v-model.number="pageSize" @change="reloadFromFirstPage">
             <option :value="10">10/page</option>
@@ -32,7 +50,7 @@
       <section class="ebook-list-panel">
         <div class="panel-head">
           <div>
-            <h2>已购电子书</h2>
+            <h2>{{ resultTitle }}</h2>
           </div>
         </div>
 
@@ -75,24 +93,24 @@
               <button
                 type="button"
                 class="secondary-action"
-                :disabled="isEbookActionLoading('sync', ebook)"
+                :disabled="!canCreateEbookJob(ebook) || isEbookActionLoading('sync', ebook)"
                 @click.stop="createEbookSyncJob(ebook)"
               >
-                {{ isEbookActionLoading('sync', ebook) ? '入库中' : '加入书籍知识库' }}
+                {{ ebookActionLabel('sync', ebook) }}
               </button>
               <button
                 type="button"
                 class="primary-action compact"
-                :disabled="isEbookActionLoading('download', ebook)"
+                :disabled="!canCreateEbookJob(ebook) || isEbookActionLoading('download', ebook)"
                 @click.stop="createEbookDownloadJob(ebook)"
               >
-                {{ isEbookActionLoading('download', ebook) ? '下载中' : '下载' }}
+                {{ ebookActionLabel('download', ebook) }}
               </button>
             </div>
           </article>
 
           <div v-if="!loading && !ebooks.length" class="empty-state">
-            {{ token ? '当前页没有电子书，尝试刷新、换页或重新扫码登录。' : '缺少 KBASE_AUTH_TOKEN，登录浏览器页后会自动填充。' }}
+            {{ emptyStateText }}
           </div>
         </div>
 
@@ -112,8 +130,12 @@
               {{ option.label }}
             </option>
           </select>
-          <button type="button" class="secondary-action" @click="createEbookSyncJob(selectedEbook)">加入知识库</button>
-          <button type="button" class="primary-action compact" @click="createEbookDownloadJob(selectedEbook)">下载</button>
+          <button type="button" class="secondary-action" :disabled="!canCreateEbookJob(selectedEbook)" @click="createEbookSyncJob(selectedEbook)">
+            {{ canCreateEbookJob(selectedEbook) ? '加入知识库' : '未购买' }}
+          </button>
+          <button type="button" class="primary-action compact" :disabled="!canCreateEbookJob(selectedEbook)" @click="createEbookDownloadJob(selectedEbook)">
+            {{ canCreateEbookJob(selectedEbook) ? '下载' : '未购买' }}
+          </button>
         </div>
         <dl class="ebook-detail-list">
           <div>
@@ -182,6 +204,7 @@ const loading = ref(false)
 const jobLoading = ref(false)
 const errorMessage = ref('')
 const query = ref('')
+const searchScope = ref<'shelf' | 'site'>('shelf')
 const page = ref(1)
 const pageSize = ref(15)
 const total = ref(0)
@@ -195,6 +218,20 @@ const downloadTypes = ref<Record<string, number>>({})
 
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 const selectedEbook = computed(() => ebooks.value.find((ebook) => ebookKey(ebook) === selectedKey.value) || null)
+const pageTitle = computed(() => (searchScope.value === 'site' ? '全站电子书搜索' : '电子书架'))
+const resultTitle = computed(() => (searchScope.value === 'site' ? '全站电子书' : '已购电子书'))
+const refreshLabel = computed(() => (searchScope.value === 'site' ? '搜索全站' : '刷新书架'))
+const emptyStateText = computed(() => {
+  if (!token.value) {
+    return '缺少 KBASE_AUTH_TOKEN，登录浏览器页后会自动填充。'
+  }
+  if (searchScope.value === 'site' && !query.value.trim()) {
+    return '输入关键词后搜索 dedao.cn 全站电子书。'
+  }
+  return searchScope.value === 'site'
+    ? '全站搜索没有结果，尝试更换关键词。'
+    : '当前页没有电子书，尝试刷新、换页或重新扫码登录。'
+})
 const selectedEbookJobs = computed(() => {
   const ebook = selectedEbook.value
   if (!ebook) {
@@ -260,7 +297,10 @@ const loadEbooks = async () => {
   try {
     await hydrateBrowserSession()
     saveConnection()
-    const result = await client.value.listDedaoEbooks(page.value, pageSize.value, query.value)
+    const result =
+      searchScope.value === 'site'
+        ? await client.value.searchDedaoEbooks(page.value, pageSize.value, query.value)
+        : await client.value.listDedaoEbooks(page.value, pageSize.value, query.value)
     ebooks.value = result.ebooks || []
     page.value = result.page || page.value
     pageSize.value = result.page_size || pageSize.value
@@ -289,6 +329,15 @@ const reloadFromFirstPage = async () => {
   page.value = 1
   await loadEbooks()
   await loadJobs()
+}
+
+const setSearchScope = async (nextScope: 'shelf' | 'site') => {
+  if (searchScope.value === nextScope) {
+    return
+  }
+  searchScope.value = nextScope
+  selectedKey.value = ''
+  await reloadFromFirstPage()
 }
 
 const changePage = async (nextPage: number) => {
@@ -341,6 +390,10 @@ const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sy
     errorMessage.value = '当前电子书缺少 id 或 enid，无法创建任务。'
     return
   }
+  if (!canCreateEbookJob(ebook)) {
+    errorMessage.value = '全站搜索结果未确认已购，无法下载或加入书籍知识库。'
+    return
+  }
   selectEbook(ebook)
   actionLoadingKey.value = ebookActionKey(action, ebook)
   errorMessage.value = ''
@@ -362,6 +415,7 @@ const createEbookJob = async (ebook: DedaoEbook | null, action: 'download' | 'sy
 
 const ebookKey = (ebook: DedaoEbook) => ebook.enid || String(ebook.id)
 const safeProgress = (value: number) => Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0))
+const canCreateEbookJob = (ebook: DedaoEbook | null) => Boolean(ebook && (searchScope.value === 'shelf' || ebook.is_buy))
 const downloadTypeFor = (ebook: DedaoEbook | null) => (ebook ? downloadTypes.value[ebookKey(ebook)] || 1 : 1)
 const setDownloadType = (ebook: DedaoEbook | null, event: Event) => {
   if (!ebook) {
@@ -376,6 +430,15 @@ const setDownloadType = (ebook: DedaoEbook | null, event: Event) => {
 const ebookActionKey = (action: 'download' | 'sync', ebook: DedaoEbook) => `${action}:${ebookKey(ebook)}`
 const isEbookActionLoading = (action: 'download' | 'sync', ebook: DedaoEbook) =>
   actionLoadingKey.value === ebookActionKey(action, ebook)
+const ebookActionLabel = (action: 'download' | 'sync', ebook: DedaoEbook) => {
+  if (!canCreateEbookJob(ebook)) {
+    return '未购买'
+  }
+  if (isEbookActionLoading(action, ebook)) {
+    return action === 'download' ? '下载中' : '入库中'
+  }
+  return action === 'download' ? '下载' : '加入书籍知识库'
+}
 const jobMatchesEbook = (job: BookKnowledgeJob, ebook: DedaoEbook) => {
   const key = ebookKey(ebook)
   const resultEbookID = Number(job.result?.ebook_id || 0)
@@ -469,6 +532,40 @@ const formatJobTime = (value?: string) => {
   display: grid;
   gap: 8px;
   margin-top: 0;
+}
+
+.ebook-source-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  overflow: hidden;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
+  background: #f7f7f7;
+}
+
+.ebook-source-switch button {
+  min-height: 34px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #666666;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.ebook-source-switch button + button {
+  border-left: 1px solid var(--dedao-line);
+}
+
+.ebook-source-switch button.active {
+  background: #ffffff;
+  color: var(--dedao-orange);
+}
+
+.ebook-source-switch button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
 }
 
 .ebook-detail-list {
