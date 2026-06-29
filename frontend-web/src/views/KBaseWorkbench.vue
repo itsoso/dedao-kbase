@@ -101,14 +101,14 @@
           v-model="chatQuestion"
           rows="7"
           placeholder="围绕当前书籍提问，或选择上方模板"
-          :disabled="!selectedBookID || chatLoading"
+          :disabled="!selectedBookID"
           @keydown.meta.enter.prevent="sendChat"
         ></textarea>
 
         <div class="chat-actions">
-          <button type="button" :disabled="!selectedBookID || chatLoading" @click="clearChatDraft">Clear</button>
-          <button class="primary-action" type="button" :disabled="!selectedBookID || chatLoading" @click="sendChat">
-            {{ chatLoading ? '生成中' : 'Send' }}
+          <button type="button" :disabled="!selectedBookID" @click="clearChatDraft">Clear</button>
+          <button class="primary-action" type="button" :disabled="!canSendChat" @click="sendChat">
+            {{ chatLoading ? `生成中 · ${pendingChatRequests}` : 'Send' }}
           </button>
         </div>
 
@@ -137,7 +137,7 @@
         <div class="chat-history">
           <div class="history-head">
             <strong>History</strong>
-            <button type="button" :disabled="!selectedBookID || chatLoading" @click="loadChatHistory">Reload</button>
+            <button type="button" :disabled="!selectedBookID" @click="loadChatHistory()">Reload</button>
           </div>
           <button
             v-for="item in chatHistory"
@@ -361,7 +361,7 @@ const selectedPromptID = ref('')
 const chatMode = ref('chat')
 const chatQuestion = ref('')
 const selectedChatModel = ref('qwen3.7-max')
-const chatLoading = ref(false)
+const pendingChatRequests = ref(0)
 const chatResponse = ref<BookKnowledgeChatResponse | null>(null)
 const chatHistory = ref<BookKnowledgeChatHistoryItem[]>([])
 const jobType = ref<JobActionValue>('notebooklm_export')
@@ -389,6 +389,10 @@ const formattedSystemKB = computed(() => {
 const renderedChatAnswer = computed(() => {
   return renderMarkdown(chatResponse.value?.answer || '')
 })
+
+const chatLoading = computed(() => pendingChatRequests.value > 0)
+
+const canSendChat = computed(() => Boolean(selectedBookID.value && chatQuestion.value.trim()))
 
 const selectedJobAction = computed(() => {
   return jobActions.find((action) => action.value === jobType.value)
@@ -506,9 +510,13 @@ const selectBook = async (bookID: string) => {
     resetBookStudyState()
   }
   await withRequest(async () => {
-    selectedPackage.value = await client.value.getBook(bookID)
-    await loadBookPrompts()
-    await loadChatHistory()
+    const pkg = await client.value.getBook(bookID)
+    if (selectedBookID.value !== bookID) {
+      return
+    }
+    selectedPackage.value = pkg
+    await loadBookPrompts(bookID)
+    await loadChatHistory(bookID)
   })
 }
 
@@ -539,20 +547,26 @@ const loadSystemKBExport = async () => {
   })
 }
 
-const loadBookPrompts = async () => {
-  if (!selectedBookID.value) {
+const loadBookPrompts = async (bookID = selectedBookID.value) => {
+  if (!bookID) {
     promptTemplates.value = []
     return
   }
-  promptTemplates.value = await client.value.getBookPrompts(selectedBookID.value)
+  const prompts = await client.value.getBookPrompts(bookID)
+  if (selectedBookID.value === bookID) {
+    promptTemplates.value = prompts
+  }
 }
 
-const loadChatHistory = async () => {
-  if (!selectedBookID.value) {
+const loadChatHistory = async (bookID = selectedBookID.value) => {
+  if (!bookID) {
     chatHistory.value = []
     return
   }
-  chatHistory.value = await client.value.getBookChatHistory(selectedBookID.value, 20)
+  const history = await client.value.getBookChatHistory(bookID, 20)
+  if (selectedBookID.value === bookID) {
+    chatHistory.value = history
+  }
 }
 
 const loadJobs = async () => {
@@ -678,24 +692,33 @@ const resetBookStudyState = () => {
 }
 
 const sendChat = async () => {
-  if (!selectedBookID.value || chatLoading.value) {
+  const requestBookID = selectedBookID.value
+  const requestQuestion = chatQuestion.value.trim()
+  const requestMode = chatMode.value
+  const requestModel = selectedChatModel.value
+  if (!requestBookID || !requestQuestion) {
     return
   }
-  chatLoading.value = true
+  pendingChatRequests.value += 1
   errorMessage.value = ''
   try {
-    chatResponse.value = await client.value.chatWithBook(selectedBookID.value, {
-      mode: chatMode.value,
-      question: chatQuestion.value,
-      model: selectedChatModel.value,
+    const response = await client.value.chatWithBook(requestBookID, {
+      mode: requestMode,
+      question: requestQuestion,
+      model: requestModel,
     })
-    await loadChatHistory()
+    if (selectedBookID.value === requestBookID) {
+      chatResponse.value = response
+      await loadChatHistory(requestBookID)
+    }
     connected.value = true
   } catch (error) {
-    connected.value = false
-    errorMessage.value = error instanceof Error ? error.message : String(error)
+    if (selectedBookID.value === requestBookID) {
+      connected.value = false
+      errorMessage.value = error instanceof Error ? error.message : String(error)
+    }
   } finally {
-    chatLoading.value = false
+    pendingChatRequests.value = Math.max(0, pendingChatRequests.value - 1)
   }
 }
 
