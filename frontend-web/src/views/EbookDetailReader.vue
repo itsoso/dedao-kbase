@@ -246,6 +246,17 @@ const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
 const ebookPageURL = computed(() => `/ebook/${encodeURIComponent(enid.value)}`)
 const readableCatalogItems = computed(() => (detail.value?.catalog || []).filter((item) => Boolean(item.chapter_id)))
+const dedaoCopyrightResourceName = 'Copyright.xhtml'
+const nonContentCatalogIDKeywords = [
+  dedaoCopyrightResourceName.toLowerCase(),
+  'copyright',
+  'cover',
+  'toc',
+  'contents',
+  'titlepage',
+  'nav',
+]
+const nonContentCatalogTextPatterns = [/^版权信息$/, /^版权$/, /^版权页$/, /^封面$/, /^目录$/, /^目\s*录$/]
 const currentReadableIndex = computed(() =>
   readableCatalogItems.value.findIndex((item) => item.chapter_id === selectedChapterID.value),
 )
@@ -401,7 +412,7 @@ const restoreReadingProgress = () => {
   pageLoadCount.value = normalizePageLoadCount(progress.pageLoadCount)
   readerScale.value = normalizeReaderScale(progress.readerScale)
   const item = readableCatalogItems.value.find((catalogItem) => catalogItem.chapter_id === progress.chapterID)
-  if (!item) {
+  if (!item || isNonContentCatalogItem(item)) {
     return null
   }
   return {
@@ -483,9 +494,9 @@ const loadDetail = async () => {
       await openChapter(restoredProgress.item, restoredProgress.pageIndex)
       return
     }
-    const firstReadable = readableCatalogItems.value[0]
-    if (firstReadable) {
-      await openChapter(firstReadable)
+    const initialCatalogItem = preferredInitialCatalogItem()
+    if (initialCatalogItem) {
+      await openChapter(initialCatalogItem)
     }
   } catch (error) {
     connected.value = false
@@ -698,6 +709,23 @@ const scrollReaderToTop = () => {
 }
 
 const catalogKey = (item: DedaoEbookCatalogItem) => `${item.chapter_id || item.href || item.text}-${item.play_order || 0}`
+
+const preferredInitialCatalogItem = () =>
+  readableCatalogItems.value.find((item) => !isNonContentCatalogItem(item)) || readableCatalogItems.value[0] || null
+
+const isNonContentCatalogItem = (item: DedaoEbookCatalogItem) => {
+  const resourceName = catalogResourceName(item).toLowerCase()
+  const text = (item.text || '').trim()
+  return (
+    nonContentCatalogIDKeywords.some((keyword) => resourceName === keyword || resourceName.startsWith(`${keyword}.`)) ||
+    nonContentCatalogTextPatterns.some((pattern) => pattern.test(text))
+  )
+}
+
+const catalogResourceName = (item: DedaoEbookCatalogItem) => {
+  const resourcePath = (item.chapter_id || item.href || '').split('#')[0].trim()
+  return resourcePath.split('/').filter(Boolean).pop() || resourcePath
+}
 
 const adjacentReadableCatalogItem = (direction: -1 | 1) => {
   const currentIndex = currentReadableIndex.value
