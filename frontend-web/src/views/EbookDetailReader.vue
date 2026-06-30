@@ -711,7 +711,18 @@ const scrollReaderToTop = () => {
 const catalogKey = (item: DedaoEbookCatalogItem) => `${item.chapter_id || item.href || item.text}-${item.play_order || 0}`
 
 const preferredInitialCatalogItem = () =>
-  readableCatalogItems.value.find((item) => !isNonContentCatalogItem(item)) || readableCatalogItems.value[0] || null
+  preferredLearningCatalogItem() ||
+  readableCatalogItems.value.find((item) => !isNonContentCatalogItem(item)) ||
+  readableCatalogItems.value[0] ||
+  null
+
+const preferredLearningCatalogItem = () =>
+  readableCatalogItems.value.find((item) => !isNonContentCatalogItem(item) && isLearningCatalogItem(item)) || null
+
+const isLearningCatalogItem = (item: DedaoEbookCatalogItem) => {
+  const text = (item.text || '').trim()
+  return /^第\s*\d+\s*章/i.test(text) || /^chapter\s+\d+/i.test(text) || /^\d+\s*[.、]\s*\S+/.test(text)
+}
 
 const isNonContentCatalogItem = (item: DedaoEbookCatalogItem) => {
   const resourceName = catalogResourceName(item).toLowerCase()
