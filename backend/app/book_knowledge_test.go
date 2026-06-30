@@ -102,8 +102,15 @@ func TestBookKnowledgePackageRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPackage returned error: %v", err)
 	}
-	if !reflect.DeepEqual(got.Book, pkg.Book) {
-		t.Fatalf("book = %#v, want %#v", got.Book, pkg.Book)
+	wantBook := pkg.Book
+	wantBook.QualityStatus = got.Book.QualityStatus
+	wantBook.QualityScore = got.Book.QualityScore
+	wantBook.QualityUpdatedAt = got.Book.QualityUpdatedAt
+	if !reflect.DeepEqual(got.Book, wantBook) {
+		t.Fatalf("book = %#v, want %#v", got.Book, wantBook)
+	}
+	if got.Book.QualityStatus == "" || got.Book.QualityScore == 0 || got.Book.QualityUpdatedAt == "" {
+		t.Fatalf("book quality summary was not populated: %#v", got.Book)
 	}
 	if !reflect.DeepEqual(got.Chapters, pkg.Chapters) {
 		t.Fatalf("chapters = %#v, want %#v", got.Chapters, pkg.Chapters)

@@ -18,16 +18,19 @@ const (
 )
 
 type BookKnowledgeBook struct {
-	BookID     string `json:"book_id"`
-	DedaoID    int    `json:"dedao_id,omitempty"`
-	EnID       string `json:"enid,omitempty"`
-	Title      string `json:"title"`
-	Author     string `json:"author,omitempty"`
-	SourceHTML string `json:"source_html,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	UpdatedAt  string `json:"updated_at,omitempty"`
-	Status     string `json:"status,omitempty"`
-	Extractor  string `json:"extractor,omitempty"`
+	BookID           string  `json:"book_id"`
+	DedaoID          int     `json:"dedao_id,omitempty"`
+	EnID             string  `json:"enid,omitempty"`
+	Title            string  `json:"title"`
+	Author           string  `json:"author,omitempty"`
+	SourceHTML       string  `json:"source_html,omitempty"`
+	CreatedAt        string  `json:"created_at,omitempty"`
+	UpdatedAt        string  `json:"updated_at,omitempty"`
+	Status           string  `json:"status,omitempty"`
+	Extractor        string  `json:"extractor,omitempty"`
+	QualityStatus    string  `json:"quality_status,omitempty"`
+	QualityScore     float64 `json:"quality_score,omitempty"`
+	QualityUpdatedAt string  `json:"quality_updated_at,omitempty"`
 }
 
 type BookKnowledgeChapter struct {
@@ -72,11 +75,12 @@ type BookKnowledgeCitation struct {
 }
 
 type BookKnowledgePackage struct {
-	Book      BookKnowledgeBook       `json:"book"`
-	Chapters  []BookKnowledgeChapter  `json:"chapters"`
-	Chunks    []BookKnowledgeChunk    `json:"chunks"`
-	Claims    []BookKnowledgeClaim    `json:"claims"`
-	Citations []BookKnowledgeCitation `json:"citations"`
+	Book          BookKnowledgeBook           `json:"book"`
+	Chapters      []BookKnowledgeChapter      `json:"chapters"`
+	Chunks        []BookKnowledgeChunk        `json:"chunks"`
+	Claims        []BookKnowledgeClaim        `json:"claims"`
+	Citations     []BookKnowledgeCitation     `json:"citations"`
+	QualityReport *BookKnowledgeQualityReport `json:"quality_report,omitempty"`
 }
 
 type BookKnowledgeManifest struct {
@@ -158,6 +162,10 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 	if strings.TrimSpace(pkg.Book.Extractor) == "" {
 		pkg.Book.Extractor = defaultBookKnowledgeExtractor
 	}
+	qualityReport := BuildBookKnowledgeQualityReport(pkg)
+	pkg.Book.QualityStatus = qualityReport.Status
+	pkg.Book.QualityScore = qualityReport.Score
+	pkg.Book.QualityUpdatedAt = qualityReport.GeneratedAt
 
 	bookDir := s.BookDir(pkg.Book.BookID)
 	if err := os.MkdirAll(bookDir, os.ModePerm); err != nil {
@@ -176,6 +184,9 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 		return err
 	}
 	if err := writeJSONLFile(s.BookJSONLPath(pkg.Book.BookID, "citations"), pkg.Citations); err != nil {
+		return err
+	}
+	if err := s.saveBookQualityReport(qualityReport); err != nil {
 		return err
 	}
 	return s.upsertManifestBook(pkg.Book)
@@ -207,13 +218,26 @@ func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, 
 	if err != nil {
 		return nil, err
 	}
-	return &BookKnowledgePackage{
+	pkg := &BookKnowledgePackage{
 		Book:      book,
 		Chapters:  chapters,
 		Chunks:    chunks,
 		Claims:    claims,
 		Citations: citations,
-	}, nil
+	}
+	qualityReport, err := s.LoadBookQualityReport(bookID)
+	if err != nil {
+		if !isMissingQualityReport(err) {
+			return nil, err
+		}
+		generated := BuildBookKnowledgeQualityReport(*pkg)
+		qualityReport = &generated
+	}
+	pkg.QualityReport = qualityReport
+	pkg.Book.QualityStatus = qualityReport.Status
+	pkg.Book.QualityScore = qualityReport.Score
+	pkg.Book.QualityUpdatedAt = qualityReport.GeneratedAt
+	return pkg, nil
 }
 
 func (s *BookKnowledgeStore) ListBooks() ([]BookKnowledgeBook, error) {

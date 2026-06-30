@@ -115,6 +115,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 下载任务默认写入 `DEDAO_DOWNLOAD_ROOT`；未配置时依次使用 `DEDAO_KBASE_DOWNLOAD_ROOT`、`DEDAO_KBASE_ROOT/downloads`、`KBASE_BOOK_KNOWLEDGE_ROOT` 的同级 `downloads`。不要把生产下载目录配置为本机个人路径。
 
+每本书籍入库时会生成 `quality_report.json`，并在书籍 manifest 中写入 `quality_status`、`quality_score` 和更新时间。`usable` 可进入项目验证，`needs_review` 只能作为辅助材料，`rejected` 会被 health/proofroom 项目集合过滤。
+
 #### kbase Agent Skills
 
 `cmd/kbase-server` 也提供给 OpenClaw、Hermes、Reva、health、proofroom 等系统发现和安装用的 skills 描述。Discovery 文档可公开读取,真正调用仍需同一个 Bearer token:

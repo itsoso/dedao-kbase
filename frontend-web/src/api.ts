@@ -6,6 +6,38 @@ export interface BookKnowledgeBook {
   extractor?: string
   source_html?: string
   updated_at?: string
+  quality_status?: string
+  quality_score?: number
+  quality_updated_at?: string
+}
+
+export interface BookKnowledgeQualityMetrics {
+  chapters: number
+  chunks: number
+  claims: number
+  citations: number
+  empty_chunk_ratio: number
+  duplicate_claim_ratio: number
+  average_chunk_chars: number
+  source_present: boolean
+}
+
+export interface BookKnowledgeQualityIssue {
+  code: string
+  severity: string
+  message: string
+}
+
+export interface BookKnowledgeQualityReport {
+  version: string
+  book_id: string
+  generated_at: string
+  status: string
+  score: number
+  metrics: BookKnowledgeQualityMetrics
+  issues?: BookKnowledgeQualityIssue[]
+  allowed_uses?: string[]
+  blocked_uses?: string[]
 }
 
 export interface BookKnowledgeChapter {
@@ -43,6 +75,7 @@ export interface BookKnowledgePackage {
   chunks: BookKnowledgeChunk[]
   claims: BookKnowledgeClaim[]
   citations?: unknown[]
+  quality_report?: BookKnowledgeQualityReport
 }
 
 export interface BookKnowledgeBooksPage {

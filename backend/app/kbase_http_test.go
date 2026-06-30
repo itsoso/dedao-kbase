@@ -139,6 +139,47 @@ func TestKBaseHTTPHandlerListsBooksWithPagination(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesBookQuality(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleQualityBookKnowledgePackage("quality-api")); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	listResp := requestKBase(handler, http.MethodGet, "/api/books?page=1&page_size=1", "secret-token")
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("books status = %d, body=%s", listResp.Code, listResp.Body.String())
+	}
+	var listPayload struct {
+		Books []BookKnowledgeBook `json:"books"`
+	}
+	if err := json.Unmarshal(listResp.Body.Bytes(), &listPayload); err != nil {
+		t.Fatalf("Unmarshal list returned error: %v", err)
+	}
+	if len(listPayload.Books) != 1 {
+		t.Fatalf("books = %#v, want one", listPayload.Books)
+	}
+	if listPayload.Books[0].QualityStatus != BookKnowledgeQualityStatusUsable ||
+		listPayload.Books[0].QualityScore < 0.75 {
+		t.Fatalf("quality summary = %#v", listPayload.Books[0])
+	}
+
+	detailResp := requestKBase(handler, http.MethodGet, "/api/books/quality-api", "secret-token")
+	if detailResp.Code != http.StatusOK {
+		t.Fatalf("detail status = %d, body=%s", detailResp.Code, detailResp.Body.String())
+	}
+	var pkg BookKnowledgePackage
+	if err := json.Unmarshal(detailResp.Body.Bytes(), &pkg); err != nil {
+		t.Fatalf("Unmarshal detail returned error: %v", err)
+	}
+	if pkg.QualityReport == nil || pkg.QualityReport.Status != BookKnowledgeQualityStatusUsable {
+		t.Fatalf("quality report = %#v", pkg.QualityReport)
+	}
+}
+
 func TestKBaseHTTPHandlerServesBookPromptsChatAndHistory(t *testing.T) {
 	var gotTokenPlanAuth string
 	tokenPlanServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

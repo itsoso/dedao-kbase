@@ -150,6 +150,9 @@ for (const surface of [
 
 assert.ok(workbenchSource.includes('localStorage'), 'KBaseWorkbench.vue should persist connection settings')
 assert.ok(workbenchSource.includes('Overview'), 'KBaseWorkbench.vue should expose overview details')
+assert.ok(workbenchSource.includes('quality-status-pill'), 'KBaseWorkbench.vue should render book quality status')
+assert.ok(workbenchSource.includes('quality-report-panel'), 'KBaseWorkbench.vue should render the book quality report')
+assert.ok(workbenchSource.includes('quality_report'), 'KBaseWorkbench.vue should read quality reports from book details')
 assert.ok(workbenchSource.includes('Chapters'), 'KBaseWorkbench.vue should expose chapter details')
 assert.ok(workbenchSource.includes('Claims'), 'KBaseWorkbench.vue should expose claim details')
 assert.ok(workbenchSource.includes('Chunks'), 'KBaseWorkbench.vue should expose chunk details')
@@ -187,6 +190,9 @@ assert.ok(!workbenchSource.includes('name="token"'), 'KBaseWorkbench.vue should 
 
 assert.ok(apiSource.includes('/browser/session-token'), 'api.ts should request the browser session token endpoint')
 assert.ok(apiSource.includes('BookKnowledgeBooksPage'), 'api.ts should type paginated book results')
+assert.ok(apiSource.includes('BookKnowledgeQualityReport'), 'api.ts should type book quality reports')
+assert.ok(apiSource.includes('quality_status'), 'api.ts should type book quality status')
+assert.ok(apiSource.includes('quality_report'), 'api.ts should type package quality reports')
 assert.ok(apiSource.includes('BookKnowledgePrompt'), 'api.ts should type prompt templates')
 assert.ok(apiSource.includes('BookKnowledgeChatResponse'), 'api.ts should type chat responses')
 assert.ok(apiSource.includes('BookKnowledgeChatHistoryItem'), 'api.ts should type chat history')

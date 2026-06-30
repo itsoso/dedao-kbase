@@ -672,6 +672,39 @@ label span {
   line-height: 18px;
 }
 
+.quality-status-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 999px;
+  padding: 1px 7px;
+  background: #ffffff;
+  color: #777777;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 800;
+  line-height: 16px;
+}
+
+.quality-status-pill.usable {
+  border-color: #bfe6d5;
+  color: #147a4b;
+  background: #f2fbf6;
+}
+
+.quality-status-pill.review {
+  border-color: #ffd8b8;
+  color: var(--dedao-orange);
+  background: #fff8f2;
+}
+
+.quality-status-pill.rejected {
+  border-color: #f1b9b0;
+  color: #ad2f20;
+  background: #fff4f2;
+}
+
 .search-results-block {
   margin-top: 12px;
 }
@@ -836,6 +869,56 @@ label span {
   background: #ffffff;
   color: var(--dedao-muted);
   font-size: 11px;
+}
+
+.quality-report-panel {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 12px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 10px;
+  padding: 10px;
+  background: #fffdfb;
+}
+
+.quality-report-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+}
+
+.quality-report-head span {
+  display: block;
+  color: var(--dedao-muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.quality-report-head strong {
+  color: #111111;
+  font-size: 18px;
+}
+
+.quality-metrics {
+  margin-bottom: 0;
+}
+
+.quality-chips {
+  margin-top: 0;
+}
+
+.quality-issues {
+  display: grid;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--dedao-line);
+  border-radius: 8px;
+}
+
+.quality-issues .table-row {
+  padding: 8px;
 }
 
 .project-tabs {

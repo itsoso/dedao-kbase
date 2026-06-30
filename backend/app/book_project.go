@@ -175,6 +175,9 @@ func (s *BookKnowledgeStore) projectReviewItems(project BookKnowledgeProject, li
 		if err != nil {
 			return nil, 0, err
 		}
+		if pkg.Book.QualityStatus == BookKnowledgeQualityStatusRejected {
+			continue
+		}
 		chapterTitles := make(map[string]string, len(pkg.Chapters))
 		for _, chapter := range pkg.Chapters {
 			chapterTitles[chapter.ChapterID] = chapter.Title

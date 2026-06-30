@@ -24,7 +24,12 @@
             @click="selectBook(book.book_id)"
           >
             <strong>{{ book.title || book.book_id }}</strong>
-            <span>{{ book.status || 'draft' }} · {{ book.extractor || 'unknown' }}</span>
+            <span>
+              <em class="quality-status-pill" :class="qualityStatusClass(book.quality_status)">
+                {{ qualityStatusLabel(book.quality_status) }}
+              </em>
+              {{ book.extractor || 'unknown' }}
+            </span>
           </button>
         </div>
 
@@ -169,6 +174,41 @@
             <div><dt>Claims</dt><dd>{{ selectedPackage?.claims.length || 0 }}</dd></div>
             <div><dt>Chunks</dt><dd>{{ selectedPackage?.chunks.length || 0 }}</dd></div>
           </dl>
+          <section v-if="selectedPackage?.quality_report" class="quality-report-panel">
+            <div class="quality-report-head">
+              <div>
+                <span>Quality</span>
+                <strong>{{ qualityStatusLabel(selectedPackage.quality_report.status) }}</strong>
+              </div>
+              <strong>{{ qualityScoreLabel(selectedPackage.quality_report.score) }}</strong>
+            </div>
+            <dl class="compact-detail-summary quality-metrics">
+              <div><dt>Empty Chunks</dt><dd>{{ percentLabel(selectedPackage.quality_report.metrics.empty_chunk_ratio) }}</dd></div>
+              <div><dt>Duplicates</dt><dd>{{ percentLabel(selectedPackage.quality_report.metrics.duplicate_claim_ratio) }}</dd></div>
+              <div><dt>Avg Chunk</dt><dd>{{ selectedPackage.quality_report.metrics.average_chunk_chars }}</dd></div>
+            </dl>
+            <div class="source-chips quality-chips">
+              <span v-for="use in selectedPackage.quality_report.allowed_uses || []" :key="`allow:${use}`">
+                {{ use }}
+              </span>
+              <span v-for="use in selectedPackage.quality_report.blocked_uses || []" :key="`block:${use}`">
+                blocked: {{ use }}
+              </span>
+            </div>
+            <div v-if="(selectedPackage.quality_report.issues || []).length" class="table-list quality-issues">
+              <article
+                v-for="issue in selectedPackage.quality_report.issues || []"
+                :key="qualityIssueKey(issue)"
+                class="table-row"
+              >
+                <div class="result-meta">
+                  <span>{{ issue.severity }}</span>
+                  <span>{{ issue.code }}</span>
+                </div>
+                <p>{{ issue.message }}</p>
+              </article>
+            </div>
+          </section>
           <p class="source-path">{{ selectedPackage?.book.source_html || 'No source HTML path' }}</p>
         </div>
 
@@ -456,6 +496,7 @@ import {
   type BookKnowledgeProjectExportPreview,
   type BookKnowledgeProjectReviewQueue,
   type BookKnowledgeProjectVerificationReport,
+  type BookKnowledgeQualityIssue,
   type BookKnowledgeSearchResult,
 } from '../api'
 import { renderMarkdown } from '../utils/markdownRender'
@@ -941,6 +982,41 @@ const upsertJob = (job: BookKnowledgeJob) => {
 const verificationTierCount = (riskTier: string) => {
   return verificationReport.value?.tier_counts?.[riskTier] || 0
 }
+
+const qualityStatusLabel = (status?: string) => {
+  switch (status) {
+    case 'usable':
+      return 'usable'
+    case 'needs_review':
+      return 'needs review'
+    case 'rejected':
+      return 'rejected'
+    default:
+      return 'unknown'
+  }
+}
+
+const qualityStatusClass = (status?: string) => ({
+  usable: status === 'usable',
+  review: status === 'needs_review',
+  rejected: status === 'rejected',
+})
+
+const qualityScoreLabel = (score?: number) => {
+  if (typeof score !== 'number' || Number.isNaN(score)) {
+    return '0%'
+  }
+  return `${Math.round(score * 100)}%`
+}
+
+const percentLabel = (value?: number) => {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return '0%'
+  }
+  return `${Math.round(value * 100)}%`
+}
+
+const qualityIssueKey = (issue: BookKnowledgeQualityIssue) => `${issue.severity}:${issue.code}:${issue.message}`
 
 const formatScore = (score?: number) => {
   if (typeof score !== 'number' || Number.isNaN(score)) {
