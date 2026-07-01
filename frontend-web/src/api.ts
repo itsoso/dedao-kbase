@@ -332,11 +332,23 @@ export interface HealthAuthorityPackRecord {
   risk_tier: string
   decision: string
   candidate_type: string
+  review_status: string
+  risk_reason: string
+  entity_candidates?: string[]
   allowed_uses?: string[]
   blocked_uses?: string[]
   risk_flags?: string[]
   citations?: string[]
   source_hash: string
+  source_refs: {
+    book_id: string
+    book_title: string
+    chapter_id?: string
+    chapter_title?: string
+    claim_id: string
+    citations?: string[]
+    source_hash: string
+  }
 }
 
 export interface HealthAuthorityPack {
@@ -345,6 +357,9 @@ export interface HealthAuthorityPack {
   target_system: string
   generated_at: string
   item_count: number
+  reviewable_count: number
+  blocked_count: number
+  risk_reason_counts: Record<string, number>
   items: HealthAuthorityPackRecord[]
 }
 

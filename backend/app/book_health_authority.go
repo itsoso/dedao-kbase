@@ -16,6 +16,9 @@ type HealthAuthorityPack struct {
 	TargetSystem     string                      `json:"target_system"`
 	GeneratedAt      string                      `json:"generated_at"`
 	ItemCount        int                         `json:"item_count"`
+	ReviewableCount  int                         `json:"reviewable_count"`
+	BlockedCount     int                         `json:"blocked_count"`
+	RiskReasonCounts map[string]int              `json:"risk_reason_counts"`
 	Items            []HealthAuthorityPackRecord `json:"items"`
 }
 
@@ -66,8 +69,15 @@ func (s *BookKnowledgeStore) BuildHealthAuthorityPack(limit int) (*HealthAuthori
 		return nil, err
 	}
 	items := make([]HealthAuthorityPackRecord, 0, len(collection.Items))
+	riskReasonCounts := map[string]int{}
+	blockedCount := 0
 	for _, item := range collection.Items {
-		items = append(items, healthAuthorityPackRecordFromCollection(collection, item))
+		record := healthAuthorityPackRecordFromCollection(collection, item)
+		items = append(items, record)
+		riskReasonCounts[record.RiskReason]++
+		if record.ReviewStatus == "blocked" {
+			blockedCount++
+		}
 	}
 	return &HealthAuthorityPack{
 		ConsumerContract: HealthAuthorityPackContractV1,
@@ -75,6 +85,9 @@ func (s *BookKnowledgeStore) BuildHealthAuthorityPack(limit int) (*HealthAuthori
 		TargetSystem:     collection.Project.TargetSystem,
 		GeneratedAt:      collection.GeneratedAt,
 		ItemCount:        len(items),
+		ReviewableCount:  len(items) - blockedCount,
+		BlockedCount:     blockedCount,
+		RiskReasonCounts: riskReasonCounts,
 		Items:            items,
 	}, nil
 }

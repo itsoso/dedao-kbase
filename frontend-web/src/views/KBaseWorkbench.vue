@@ -384,6 +384,14 @@
                 <strong>{{ healthAuthorityPack.item_count }}</strong>
               </div>
               <div>
+                <span>Reviewable</span>
+                <strong>{{ healthAuthorityPack.reviewable_count }}</strong>
+              </div>
+              <div>
+                <span>Blocked</span>
+                <strong>{{ healthAuthorityPack.blocked_count }}</strong>
+              </div>
+              <div>
                 <span>Generated</span>
                 <strong>{{ formatJobTime(healthAuthorityPack.generated_at) || '-' }}</strong>
               </div>
@@ -392,6 +400,13 @@
               <span>{{ healthAuthorityPack.target_system }}</span>
               <span>education/context only</span>
               <span>blocks diagnosis/treatment/dosage</span>
+              <span v-if="healthAuthorityPack.items?.[0]?.source_refs">source_refs: stable</span>
+              <span
+                v-for="(count, reason) in healthAuthorityPack.risk_reason_counts || {}"
+                :key="reason"
+              >
+                {{ reason }}: {{ count }}
+              </span>
             </div>
             <code class="project-export-route">{{ healthAuthorityPackExportPath }}</code>
             <pre v-if="healthAuthorityPackExportText" class="job-result project-export-preview">{{ healthAuthorityPackExportText }}</pre>
