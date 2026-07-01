@@ -570,7 +570,11 @@ func TestKBaseHTTPHandlerServesHealthAuthorityPack(t *testing.T) {
 		`"target_system":"health-llm-driven"`,
 		`"claim_id":"dedao:verify-book:verify-claim-medication"`,
 		`"candidate_type":"education_context_candidate"`,
+		`"review_status":"blocked"`,
+		`"risk_reason":"medical_action_boundary"`,
+		`"entity_candidates":["用药安全"]`,
 		`"blocked_uses":["diagnosis","treatment","dosage","medication_change","emergency_guidance"]`,
+		`"source_refs"`,
 		`"source_hash"`,
 	} {
 		if !strings.Contains(refreshBody, want) {
@@ -629,6 +633,10 @@ func TestKBaseHTTPHandlerExportsHealthAuthorityPackJSONL(t *testing.T) {
 		"source_hash",
 		"citations",
 		"candidate_type",
+		"review_status",
+		"risk_reason",
+		"entity_candidates",
+		"source_refs",
 		"allowed_uses",
 		"blocked_uses",
 	} {

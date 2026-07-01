@@ -64,6 +64,47 @@ func TestBuildHealthAuthorityPackKeepsStableSourceRefs(t *testing.T) {
 	}
 }
 
+func TestBuildHealthAuthorityPackAddsReviewMetadata(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthAuthorityPackFixture(t, store)
+
+	pack, err := store.BuildHealthAuthorityPack(0)
+	if err != nil {
+		t.Fatalf("BuildHealthAuthorityPack returned error: %v", err)
+	}
+
+	study := findHealthAuthorityPackRecord(t, pack, "dedao:verify-book:verify-claim-study")
+	if study.SourceRefs.SourceHash != study.SourceHash {
+		t.Fatalf("SourceRefs.SourceHash = %q, want flat SourceHash %q", study.SourceRefs.SourceHash, study.SourceHash)
+	}
+	if study.SourceRefs.BookID != study.BookID || study.SourceRefs.ChapterID != study.ChapterID || study.SourceRefs.ClaimID != study.ClaimID {
+		t.Fatalf("SourceRefs do not mirror stable identity fields: %#v", study.SourceRefs)
+	}
+	if !reflect.DeepEqual(study.SourceRefs.Citations, study.Citations) {
+		t.Fatalf("SourceRefs.Citations = %#v, want %#v", study.SourceRefs.Citations, study.Citations)
+	}
+	if study.ReviewStatus != "needs_review" {
+		t.Fatalf("ReviewStatus = %q, want needs_review", study.ReviewStatus)
+	}
+	if study.RiskReason != "dedao_educational_source" {
+		t.Fatalf("RiskReason = %q, want dedao_educational_source", study.RiskReason)
+	}
+	if !stringSliceContains(study.EntityCandidates, "学习复盘") {
+		t.Fatalf("EntityCandidates = %#v, want 学习复盘", study.EntityCandidates)
+	}
+
+	medication := findHealthAuthorityPackRecord(t, pack, "dedao:verify-book:verify-claim-medication")
+	if medication.ReviewStatus != "blocked" {
+		t.Fatalf("ReviewStatus = %q, want blocked", medication.ReviewStatus)
+	}
+	if medication.RiskReason != "medical_action_boundary" {
+		t.Fatalf("RiskReason = %q, want medical_action_boundary", medication.RiskReason)
+	}
+	if !stringSliceContains(medication.EntityCandidates, "用药安全") {
+		t.Fatalf("EntityCandidates = %#v, want 用药安全", medication.EntityCandidates)
+	}
+}
+
 func TestBuildHealthAuthorityPackBlocksMedicationActionClaims(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthAuthorityPackFixture(t, store)
