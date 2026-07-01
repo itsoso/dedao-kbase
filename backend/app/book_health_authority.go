@@ -1,6 +1,10 @@
 package app
 
-import "strings"
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+)
 
 const HealthAuthorityPackContractV1 = "health_authority_pack_v1"
 
@@ -36,6 +40,12 @@ type HealthAuthorityPackRecord struct {
 	SourceHash        string   `json:"source_hash"`
 }
 
+type HealthAuthorityPackExportRecord struct {
+	ConsumerContract string `json:"consumer_contract"`
+	GeneratedAt      string `json:"generated_at"`
+	HealthAuthorityPackRecord
+}
+
 func (s *BookKnowledgeStore) BuildHealthAuthorityPack(limit int) (*HealthAuthorityPack, error) {
 	collection, err := s.RefreshProjectCollection(BookKnowledgeProjectHealth, limit)
 	if err != nil {
@@ -53,6 +63,27 @@ func (s *BookKnowledgeStore) BuildHealthAuthorityPack(limit int) (*HealthAuthori
 		ItemCount:        len(items),
 		Items:            items,
 	}, nil
+}
+
+func (s *BookKnowledgeStore) ExportHealthAuthorityPackJSONL(limit int) ([]byte, error) {
+	pack, err := s.BuildHealthAuthorityPack(limit)
+	if err != nil {
+		return nil, err
+	}
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	for _, item := range pack.Items {
+		record := HealthAuthorityPackExportRecord{
+			ConsumerContract:          pack.ConsumerContract,
+			GeneratedAt:               pack.GeneratedAt,
+			HealthAuthorityPackRecord: item,
+		}
+		if err := encoder.Encode(record); err != nil {
+			return nil, err
+		}
+	}
+	return out.Bytes(), nil
 }
 
 func healthAuthorityPackRecordFromCollection(collection *BookKnowledgeProjectCollection, item BookKnowledgeProjectCollectionItem) HealthAuthorityPackRecord {

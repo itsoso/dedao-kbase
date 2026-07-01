@@ -544,6 +544,114 @@ func TestKBaseHTTPHandlerExportsProjectCollectionJSONL(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesHealthAuthorityPack(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/projects/health/authority-pack", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("authority pack without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	refreshResp := requestKBase(handler, http.MethodPost, "/api/projects/health/authority-pack/refresh?limit=10", "secret-token")
+	if refreshResp.Code != http.StatusOK {
+		t.Fatalf("authority pack refresh status = %d, body=%s", refreshResp.Code, refreshResp.Body.String())
+	}
+	refreshBody := refreshResp.Body.String()
+	for _, want := range []string{
+		`"consumer_contract":"health_authority_pack_v1"`,
+		`"project_id":"health"`,
+		`"target_system":"health-llm-driven"`,
+		`"claim_id":"dedao:verify-book:verify-claim-medication"`,
+		`"candidate_type":"education_context_candidate"`,
+		`"blocked_uses":["diagnosis","treatment","dosage","medication_change","emergency_guidance"]`,
+		`"source_hash"`,
+	} {
+		if !strings.Contains(refreshBody, want) {
+			t.Fatalf("authority pack refresh response missing %q: %s", want, refreshBody)
+		}
+	}
+	if strings.Contains(refreshBody, "action_support_candidate") {
+		t.Fatalf("authority pack must not expose action support candidates: %s", refreshBody)
+	}
+
+	getResp := requestKBase(handler, http.MethodGet, "/api/projects/health/authority-pack?limit=10", "secret-token")
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("authority pack get status = %d, body=%s", getResp.Code, getResp.Body.String())
+	}
+	if !strings.Contains(getResp.Body.String(), `"item_count":3`) {
+		t.Fatalf("authority pack get response missing item_count: %s", getResp.Body.String())
+	}
+
+	proofroomResp := requestKBase(handler, http.MethodPost, "/api/projects/proofroom/authority-pack/refresh", "secret-token")
+	if proofroomResp.Code != http.StatusNotFound {
+		t.Fatalf("proofroom authority pack status = %d, want 404", proofroomResp.Code)
+	}
+}
+
+func TestKBaseHTTPHandlerExportsHealthAuthorityPackJSONL(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	exportResp := requestKBase(handler, http.MethodGet, "/api/projects/health/authority-pack/export?format=jsonl&limit=10", "secret-token")
+	if exportResp.Code != http.StatusOK {
+		t.Fatalf("authority pack export status = %d, body=%s", exportResp.Code, exportResp.Body.String())
+	}
+	if contentType := exportResp.Header().Get("Content-Type"); !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("authority pack export content-type = %q, want ndjson", contentType)
+	}
+	lines := strings.Split(strings.TrimSpace(exportResp.Body.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("authority pack export line count = %d, want 3; body=%s", len(lines), exportResp.Body.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first authority pack line is not JSON: %v; line=%s", err, lines[0])
+	}
+	for _, key := range []string{
+		"consumer_contract",
+		"generated_at",
+		"project_id",
+		"target_system",
+		"claim_id",
+		"source_hash",
+		"citations",
+		"candidate_type",
+		"allowed_uses",
+		"blocked_uses",
+	} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("first authority pack line missing %q: %#v", key, first)
+		}
+	}
+	if first["consumer_contract"] != "health_authority_pack_v1" ||
+		first["project_id"] != "health" ||
+		first["target_system"] != "health-llm-driven" ||
+		first["candidate_type"] != healthAuthorityPackCandidateEducationContext {
+		t.Fatalf("first authority pack line has wrong identity fields: %#v", first)
+	}
+	if strings.Contains(exportResp.Body.String(), "action_support_candidate") {
+		t.Fatalf("authority pack export must not expose action support candidates: %s", exportResp.Body.String())
+	}
+
+	badFormatResp := requestKBase(handler, http.MethodGet, "/api/projects/health/authority-pack/export?format=json", "secret-token")
+	if badFormatResp.Code != http.StatusBadRequest {
+		t.Fatalf("bad authority pack format status = %d, want 400", badFormatResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesPageAnalysis(t *testing.T) {
 	var gotTokenPlanAuth string
 	var gotTokenPlanBody string
