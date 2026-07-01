@@ -53,6 +53,7 @@
 * 新增在线 kbase HTTP 服务：提供 `cmd/kbase-server`，可部署到 `kbase.executor.life`，用 Bearer token 向 health/proofroom 暴露书籍检索和 System KB export。
 * 新增 kbase Web UI：提供独立浏览器页面，可用同一个 Bearer token 浏览书籍、分页选书、检索 chunks/claims、调用 TokenPlan 进行单书对话，并查看 System KB 导出与线上任务。
 * 新增项目导出：支持导出为 `health_system_kb_v2` 健康知识库格式，以及 `quant_rule_cards` 量化规则卡草案。
+* 新增 Health Authority Pack：为 health-llm-driven 导出 `health_authority_pack_v1` 审核包，保留书籍、章节、claim、citation 和 source hash，并阻断诊断、治疗、剂量、用药调整和急救指导用途。
 * 优化登录二维码流程：在缺失或失效 CSRF token 时自动刷新首页状态并重试，降低扫码二维码加载失败概率。
 * 优化书籍知识库 UI：新增专业化工作台布局、搜索、章节/claims/chunks/MCP/NotebookLM tabs 和历史记录侧栏。
 
@@ -90,6 +91,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `POST /api/jobs`：为当前书籍或电子书创建后台任务，例如 `{"type":"notebooklm_export","book_id":"..."}`、`{"type":"book_export","book_id":"...","target":"health_system_kb_v2"}`、`{"type":"dedao_ebook_download","ebook_id":67929,"ebook_enid":"...","download_type":1}` 或 `{"type":"dedao_ebook_sync_kbase","ebook_id":67929,"ebook_enid":"..."}`。
 - `GET /api/jobs/{job_id}`：读取任务状态、错误和导出结果。
 - `GET /api/search?q=关键词&limit=5`：检索书籍 chunks/claims。
+- `POST /api/projects/health/authority-pack/refresh?limit=25`：生成 `health_authority_pack_v1` 审核包，只面向 health 项目。
+- `GET /api/projects/health/authority-pack/export?format=jsonl`：导出 Health Authority Pack JSONL，供 health-llm-driven dry-run import。
 - `GET /api/system-kb/manifest`：返回 System KB export 摘要。
 - `GET /api/system-kb/export`：返回 health/proofroom 导入用的 `system_kb_export.json`。
 
@@ -116,6 +119,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 下载任务默认写入 `DEDAO_DOWNLOAD_ROOT`；未配置时依次使用 `DEDAO_KBASE_DOWNLOAD_ROOT`、`DEDAO_KBASE_ROOT/downloads`、`KBASE_BOOK_KNOWLEDGE_ROOT` 的同级 `downloads`。不要把生产下载目录配置为本机个人路径。
 
 每本书籍入库时会生成 `quality_report.json`，并在书籍 manifest 中写入 `quality_status`、`quality_score` 和更新时间。`usable` 可进入项目验证，`needs_review` 只能作为辅助材料，`rejected` 会被 health/proofroom 项目集合过滤。
+
+Health Authority Pack 是给 health-llm-driven 的审核输入，不是直接运行时知识。Dedao-only claim 只能作为健康教育、问题准备和上下文检索候选；涉及诊断、治疗、剂量、用药调整或急救指导的记录必须由 health 侧 review gate 继续阻断或人工审核。
 
 #### kbase Agent Skills
 
