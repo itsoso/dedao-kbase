@@ -318,6 +318,36 @@ export interface BookKnowledgeProjectAuditQueue {
   limit: number
 }
 
+export interface HealthAuthorityPackRecord {
+  project_id: string
+  target_system: string
+  book_id: string
+  book_title: string
+  chapter_id?: string
+  chapter_title?: string
+  claim_id: string
+  title: string
+  summary: string
+  verification_score: number
+  risk_tier: string
+  decision: string
+  candidate_type: string
+  allowed_uses?: string[]
+  blocked_uses?: string[]
+  risk_flags?: string[]
+  citations?: string[]
+  source_hash: string
+}
+
+export interface HealthAuthorityPack {
+  consumer_contract: string
+  project_id: string
+  target_system: string
+  generated_at: string
+  item_count: number
+  items: HealthAuthorityPackRecord[]
+}
+
 export interface BookKnowledgeJob {
   id: string
   type: string
@@ -797,6 +827,25 @@ export class KBaseClient {
 
   async getProjectCollectionExport(projectID: string): Promise<string> {
     return this.requestText(`/api/projects/${encodeURIComponent(projectID)}/collection/export?format=jsonl`)
+  }
+
+  async getHealthAuthorityPack(limit = 25): Promise<HealthAuthorityPack> {
+    return this.request<HealthAuthorityPack>(
+      `/api/projects/health/authority-pack?limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async refreshHealthAuthorityPack(limit = 25): Promise<HealthAuthorityPack> {
+    return this.request<HealthAuthorityPack>(
+      `/api/projects/health/authority-pack/refresh?limit=${encodeURIComponent(String(limit))}`,
+      { method: 'POST' },
+    )
+  }
+
+  async getHealthAuthorityPackExport(limit = 25): Promise<string> {
+    return this.requestText(
+      `/api/projects/health/authority-pack/export?format=jsonl&limit=${encodeURIComponent(String(limit))}`,
+    )
   }
 
   async listJobs(limit = 50): Promise<BookKnowledgeJob[]> {

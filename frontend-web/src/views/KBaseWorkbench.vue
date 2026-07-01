@@ -352,6 +352,51 @@
             <code v-if="projectCollection" class="project-export-route">{{ projectCollectionExportPath }}</code>
           </section>
 
+          <section v-if="selectedProjectID === 'health'" class="project-policy health-authority-pack">
+            <div class="project-policy-head">
+              <div>
+                <strong>Health Authority Pack</strong>
+                <p>health_authority_pack_v1 review pack for health-llm-driven. Not medical advice.</p>
+              </div>
+              <button
+                type="button"
+                class="primary-action"
+                :disabled="projectLoading || healthAuthorityPackLoading"
+                @click="refreshHealthAuthorityPack"
+              >
+                {{ healthAuthorityPackLoading ? '生成中' : '刷新 Pack' }}
+              </button>
+              <button
+                type="button"
+                :disabled="!healthAuthorityPack || healthAuthorityPackExportLoading"
+                @click="previewHealthAuthorityPackExport"
+              >
+                {{ healthAuthorityPackExportLoading ? 'Loading' : 'JSONL' }}
+              </button>
+            </div>
+            <section v-if="healthAuthorityPack" class="project-summary project-authority-summary">
+              <div>
+                <span>Contract</span>
+                <strong>{{ healthAuthorityPack.consumer_contract }}</strong>
+              </div>
+              <div>
+                <span>Items</span>
+                <strong>{{ healthAuthorityPack.item_count }}</strong>
+              </div>
+              <div>
+                <span>Generated</span>
+                <strong>{{ formatJobTime(healthAuthorityPack.generated_at) || '-' }}</strong>
+              </div>
+            </section>
+            <div v-if="healthAuthorityPack" class="source-chips">
+              <span>{{ healthAuthorityPack.target_system }}</span>
+              <span>education/context only</span>
+              <span>blocks diagnosis/treatment/dosage</span>
+            </div>
+            <code class="project-export-route">{{ healthAuthorityPackExportPath }}</code>
+            <pre v-if="healthAuthorityPackExportText" class="job-result project-export-preview">{{ healthAuthorityPackExportText }}</pre>
+          </section>
+
           <section v-if="projectCollection" class="project-summary project-collection-summary">
             <div>
               <span>Collection</span>
@@ -498,6 +543,7 @@ import {
   type BookKnowledgeProjectVerificationReport,
   type BookKnowledgeQualityIssue,
   type BookKnowledgeSearchResult,
+  type HealthAuthorityPack,
 } from '../api'
 import { renderMarkdown } from '../utils/markdownRender'
 
@@ -538,6 +584,8 @@ const protectedApiRoutes = [
   '/api/projects/health/collection/refresh',
   '/api/projects/health/audit-queue',
   '/api/projects/health/collection/export?format=jsonl',
+  '/api/projects/health/authority-pack/refresh',
+  '/api/projects/health/authority-pack/export?format=jsonl',
   '/api/system-kb/manifest',
   '/api/system-kb/export',
 ]
@@ -577,10 +625,14 @@ const projectExportPreview = ref<BookKnowledgeProjectExportPreview | null>(null)
 const verificationReport = ref<BookKnowledgeProjectVerificationReport | null>(null)
 const projectCollection = ref<BookKnowledgeProjectCollection | null>(null)
 const projectAuditQueue = ref<BookKnowledgeProjectAuditQueue | null>(null)
+const healthAuthorityPack = ref<HealthAuthorityPack | null>(null)
 const projectCollectionExportText = ref('')
+const healthAuthorityPackExportText = ref('')
 const projectLoading = ref(false)
 const projectCollectionLoading = ref(false)
 const projectCollectionExportLoading = ref(false)
+const healthAuthorityPackLoading = ref(false)
+const healthAuthorityPackExportLoading = ref(false)
 const projectError = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 320 })
@@ -600,6 +652,8 @@ const projectCollectionExportPath = computed(() => {
   const projectID = encodeURIComponent(selectedProjectID.value || 'health')
   return `/api/projects/${projectID}/collection/export?format=jsonl`
 })
+
+const healthAuthorityPackExportPath = computed(() => '/api/projects/health/authority-pack/export?format=jsonl')
 
 const formattedSystemKB = computed(() => {
   return systemKBPayload.value ? JSON.stringify(systemKBPayload.value, null, 2) : 'No System KB payload loaded'
@@ -628,6 +682,7 @@ const projectHub = computed(() => ({
   verification: verificationReport.value,
   collection: projectCollection.value,
   auditQueue: projectAuditQueue.value,
+  authorityPack: healthAuthorityPack.value,
 }))
 
 onMounted(async () => {
@@ -833,11 +888,12 @@ const loadProjectHub = async () => {
     if (!selectedProjectID.value && projects.value.length) {
       selectedProjectID.value = projects.value[0].project_id
     }
-    const [queue, preview, verification, collectionState] = await Promise.all([
+    const [queue, preview, verification, collectionState, authorityPackState] = await Promise.all([
       client.value.getProjectReviewQueue(projectID, 20),
       client.value.getProjectExportPreview(projectID, 20),
       client.value.getProjectVerificationReport(projectID, 20),
       loadProjectCollectionState(projectID),
+      loadHealthAuthorityPackState(projectID),
     ])
     if (selectedProjectID.value === projectID) {
       reviewQueue.value = queue
@@ -845,6 +901,7 @@ const loadProjectHub = async () => {
       verificationReport.value = verification
       projectCollection.value = collectionState.collection
       projectAuditQueue.value = collectionState.auditQueue
+      healthAuthorityPack.value = authorityPackState
     }
     connected.value = true
   } catch (error) {
@@ -862,7 +919,9 @@ const selectProject = async (projectID: string) => {
   verificationReport.value = null
   projectCollection.value = null
   projectAuditQueue.value = null
+  healthAuthorityPack.value = null
   projectCollectionExportText.value = ''
+  healthAuthorityPackExportText.value = ''
   await loadProjectHub()
 }
 
@@ -882,6 +941,21 @@ const loadProjectCollectionState = async (projectID: string) => {
   }
 }
 
+const loadHealthAuthorityPackState = async (projectID: string) => {
+  if (projectID !== 'health') {
+    return null
+  }
+  try {
+    return await client.value.getHealthAuthorityPack(25)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('HTTP 404')) {
+      return null
+    }
+    throw error
+  }
+}
+
 const refreshProjectCollection = async () => {
   if (!token.value || projectCollectionLoading.value) {
     return
@@ -896,7 +970,9 @@ const refreshProjectCollection = async () => {
       projectCollection.value = collection
       projectAuditQueue.value = auditQueue
       verificationReport.value = await client.value.getProjectVerificationReport(projectID, 25)
+      healthAuthorityPack.value = await loadHealthAuthorityPackState(projectID)
       projectCollectionExportText.value = ''
+      healthAuthorityPackExportText.value = ''
     }
     connected.value = true
   } catch (error) {
@@ -904,6 +980,24 @@ const refreshProjectCollection = async () => {
     projectError.value = error instanceof Error ? error.message : String(error)
   } finally {
     projectCollectionLoading.value = false
+  }
+}
+
+const refreshHealthAuthorityPack = async () => {
+  if (!token.value || healthAuthorityPackLoading.value || selectedProjectID.value !== 'health') {
+    return
+  }
+  healthAuthorityPackLoading.value = true
+  projectError.value = ''
+  try {
+    healthAuthorityPack.value = await client.value.refreshHealthAuthorityPack(25)
+    healthAuthorityPackExportText.value = ''
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    healthAuthorityPackLoading.value = false
   }
 }
 
@@ -929,6 +1023,30 @@ const previewProjectCollectionExport = async () => {
     projectError.value = error instanceof Error ? error.message : String(error)
   } finally {
     projectCollectionExportLoading.value = false
+  }
+}
+
+const previewHealthAuthorityPackExport = async () => {
+  if (!token.value || healthAuthorityPackExportLoading.value || selectedProjectID.value !== 'health') {
+    return
+  }
+  healthAuthorityPackExportLoading.value = true
+  projectError.value = ''
+  try {
+    const text = await client.value.getHealthAuthorityPackExport(25)
+    if (selectedProjectID.value === 'health') {
+      healthAuthorityPackExportText.value = text
+        .trim()
+        .split('\n')
+        .slice(0, 8)
+        .join('\n')
+    }
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    healthAuthorityPackExportLoading.value = false
   }
 }
 
