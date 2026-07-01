@@ -42,5 +42,5 @@ Additive contract hardening kept `health_authority_pack_v1` stable while adding 
 | G2 Feasibility | PASS | Additive fields only; existing flat fields remain for compatibility. |
 | G3 Tests | PASS | `go test ./backend/app -run 'TestBuildHealthAuthorityPack\|TestKBaseHTTPHandler' -count=1`; `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `npm --prefix frontend-web run build`; `go test ./...`; health importer pytest and doc drift. |
 | G4 Review | PASS | Dedao-only records still cannot expose `action_support_candidate`; blocked review status is rejected by health dry-run importer. |
-| G5 Deploy Health | PENDING | Deploy after commit and push. |
-| G6 Online Verify | PENDING | Verify `/health`, unauthorized `401`, Bearer refresh, JSONL export, and deployed JS markers after deploy. |
+| G5 Deploy Health | PASS | Built Linux `kbase-server`, rebuilt `frontend-web/dist`, rsynced binary/static assets to `executor.life`, `nginx -t` successful, `dedao-kbase.service` active. |
+| G6 Online Verify | PASS | `https://kbase.executor.life/health` 200; unauth authority-pack 401; remote Bearer refresh 200 with `source_refs`, `review_status`, `risk_reason`, and `blocked_count`; JSONL export returned `application/x-ndjson` with `source_refs` and `entity_candidates`; deployed JS contains `risk_reason_counts` and `source_refs`. |
