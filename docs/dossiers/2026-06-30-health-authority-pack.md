@@ -25,8 +25,8 @@ Serve `health-llm-driven` with a governed Dedao book-knowledge review pack that 
 | G2 Feasibility | PASS | Reused existing health project verification collection and Web Project hub. |
 | G3 Tests | PASS | `go test ./backend/app -run 'TestBuildHealthAuthorityPack|TestKBaseHTTPHandler' -count=1`; `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `npm --prefix frontend-web run build`; health dry-run pytest. |
 | G4 Review | PASS | Dedao-only claims never return `action_support_candidate`; health importer blocks medical action claims. |
-| G5 Deploy Health | PENDING | Deploy after merge/push from clean deploy branch. |
-| G6 Online Verify | PENDING | Verify `/health`, authority-pack refresh/export, and Web Project panel after deploy. |
+| G5 Deploy Health | PASS | Built Linux `kbase-server`, synced `frontend-web/dist`, `nginx -t` passed, `dedao-kbase.service` active. |
+| G6 Online Verify | PASS | `https://kbase.executor.life/health` 200; unauth authority-pack 401; local Bearer refresh 200 with `health_authority_pack_v1`; JSONL export returned `application/x-ndjson`; deployed JS contains `health-authority-pack`. |
 
 ## Boundaries
 
