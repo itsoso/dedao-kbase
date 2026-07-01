@@ -31,3 +31,16 @@ Serve `health-llm-driven` with a governed Dedao book-knowledge review pack that 
 ## Boundaries
 
 Health Authority Pack is not runtime medical authority. It preserves source references and supports review workflows only. health-llm-driven remains responsible for final System KB admission and clinical safety gates.
+
+## 2026-07-01 v1.1 Hardening
+
+Additive contract hardening kept `health_authority_pack_v1` stable while adding normalized `source_refs`, `review_status`, `risk_reason`, `entity_candidates`, `reviewable_count`, `blocked_count`, and `risk_reason_counts`. The paired health importer now accepts nested source refs, preserves review metadata, and blocks upstream `review_status = blocked` records in dry-run mode.
+
+| Gate | Status | Evidence |
+|---|---|---|
+| G1 Intake | PASS | User approved Authority Pack v1.1 quality hardening. |
+| G2 Feasibility | PASS | Additive fields only; existing flat fields remain for compatibility. |
+| G3 Tests | PASS | `go test ./backend/app -run 'TestBuildHealthAuthorityPack\|TestKBaseHTTPHandler' -count=1`; `node frontend-web/scripts/web-kbase-ui-smoke.mjs`; `npm --prefix frontend-web run build`; `go test ./...`; health importer pytest and doc drift. |
+| G4 Review | PASS | Dedao-only records still cannot expose `action_support_candidate`; blocked review status is rejected by health dry-run importer. |
+| G5 Deploy Health | PENDING | Deploy after commit and push. |
+| G6 Online Verify | PENDING | Verify `/health`, unauthorized `401`, Bearer refresh, JSONL export, and deployed JS markers after deploy. |
