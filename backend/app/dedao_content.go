@@ -206,10 +206,13 @@ type DedaoArticle struct {
 }
 
 type DedaoArticlePage struct {
-	Articles []DedaoArticle `json:"articles"`
-	Count    int            `json:"count"`
-	MaxID    int            `json:"max_id"`
-	IsMore   bool           `json:"is_more"`
+	Articles     []DedaoArticle `json:"articles"`
+	Count        int            `json:"count"`
+	MaxID        int            `json:"max_id"`
+	LoadedCount  int            `json:"loaded_count"`
+	ArticleCount int            `json:"article_count,omitempty"`
+	NextCursor   int            `json:"next_cursor,omitempty"`
+	IsMore       bool           `json:"is_more"`
 }
 
 type DedaoArticleMarkdown struct {
@@ -495,15 +498,33 @@ func (p liveDedaoContentProvider) ListCourseArticles(enid string, count, maxID i
 	if err != nil {
 		return DedaoArticlePage{}, err
 	}
+	articleCount := p.courseArticleCount(enid)
 	if list == nil {
-		return DedaoArticlePage{Count: count, MaxID: maxID}, nil
+		return DedaoArticlePage{
+			Count:        count,
+			MaxID:        maxID,
+			NextCursor:   maxID,
+			ArticleCount: articleCount,
+		}, nil
 	}
+	articles := dedaoArticlesFromIntros(list.List)
 	return DedaoArticlePage{
-		Articles: dedaoArticlesFromIntros(list.List),
-		Count:    count,
-		MaxID:    list.MaxID,
-		IsMore:   count > 0 && len(list.List) >= count && list.MaxID != 0,
+		Articles:     articles,
+		Count:        count,
+		MaxID:        list.MaxID,
+		LoadedCount:  len(articles),
+		ArticleCount: articleCount,
+		NextCursor:   list.MaxID,
+		IsMore:       count > 0 && len(articles) >= count && list.MaxID != 0,
 	}, nil
+}
+
+func (p liveDedaoContentProvider) courseArticleCount(enid string) int {
+	info, err := CourseInfoByEnid(enid)
+	if err != nil || info == nil {
+		return 0
+	}
+	return info.ClassInfo.CurrentArticleCount
 }
 
 func (p liveDedaoContentProvider) GetCourseArticleMarkdown(enid string) (DedaoArticleMarkdown, error) {

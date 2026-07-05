@@ -676,6 +676,9 @@ export interface DedaoArticlePage {
   articles: DedaoArticle[]
   count: number
   max_id: number
+  loaded_count: number
+  article_count?: number
+  next_cursor?: number
   is_more: boolean
 }
 

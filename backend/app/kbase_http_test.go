@@ -1435,8 +1435,12 @@ func TestKBaseHTTPHandlerServesDedaoCourseArticles(t *testing.T) {
 					OrderNum:    1,
 				},
 			},
-			Count: 2,
-			MaxID: 10,
+			Count:        2,
+			MaxID:        10,
+			LoadedCount:  1,
+			ArticleCount: 36,
+			NextCursor:   10,
+			IsMore:       true,
 		},
 	}
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
@@ -1457,6 +1461,9 @@ func TestKBaseHTTPHandlerServesDedaoCourseArticles(t *testing.T) {
 		t.Fatalf("Unmarshal returned error: %v", err)
 	}
 	if payload.Count != 2 || payload.MaxID != 10 || len(payload.Articles) != 1 || payload.Articles[0].Enid != "article-enid" {
+		t.Fatalf("course articles payload = %#v", payload)
+	}
+	if payload.LoadedCount != 1 || payload.ArticleCount != 36 || payload.NextCursor != 10 || !payload.IsMore {
 		t.Fatalf("course articles payload = %#v", payload)
 	}
 	assertDedaoResponseOmitsSecrets(t, resp.Body.String())

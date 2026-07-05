@@ -144,7 +144,7 @@
             </div>
             <div>
               <dt>Articles</dt>
-              <dd>{{ detail?.course.article_count || articles.length || '-' }}</dd>
+              <dd>{{ knownArticleCount || articles.length || '-' }}</dd>
             </div>
             <div>
               <dt>Students</dt>
@@ -180,6 +180,7 @@ import {
   getBrowserSession,
   KBaseClient,
   type DedaoArticle,
+  type DedaoArticleMarkdown,
   type DedaoCourseDetail,
   type PageAnalysisSection,
 } from '../api'
@@ -194,6 +195,14 @@ interface CourseReadingEntry {
   markdown: string
   loading: boolean
   error: string
+}
+
+interface CourseReadingPosition {
+  article_enid: string
+  scroll_top: number
+  articles_max_id: number
+  loaded_count: number
+  updated_at: string
 }
 
 const storageKey = 'dedao-kbase-web-settings'
@@ -216,6 +225,7 @@ const markdown = ref('')
 const readingEntries = ref<CourseReadingEntry[]>([])
 const articlesMaxID = ref(0)
 const hasMoreArticles = ref(false)
+const lastArticlePageTotal = ref(0)
 const continuousArticleLoading = ref(false)
 const articleSearchQuery = ref('')
 const articleSearchStatus = ref('')
@@ -228,9 +238,12 @@ const articleReaderRef = ref<HTMLElement | null>(null)
 const articleListRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 248 })
 const activeResizeTarget = ref<'left' | null>(null)
+const articleMarkdownCache = ref<Record<string, DedaoArticleMarkdown>>({})
+const prefetchingArticleEnids = new Set<string>()
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
+const courseReadingPositionStorageKey = computed(() => `dedao-course-reading-position:${enid.value}`)
 const renderedReadingEntries = computed(() =>
   readingEntries.value.map((entry) => ({
     ...entry,
@@ -242,6 +255,7 @@ const readerWorkspaceStyle = computed(() => ({
   '--course-left-column': `${layoutColumns.value.left}px`,
 }))
 const normalizedArticleSearch = computed(() => articleSearchQuery.value.trim().toLowerCase())
+const knownArticleCount = computed(() => Math.max(detail.value?.course.article_count || 0, lastArticlePageTotal.value))
 const filteredArticles = computed(() => {
   const query = normalizedArticleSearch.value
   if (!query) {
@@ -257,7 +271,7 @@ const filteredArticles = computed(() => {
 })
 const loadedArticlePages = computed(() => Math.max(1, Math.ceil(filteredArticles.value.length / articlePageSize.value)))
 const knownTotalArticlePages = computed(() => {
-  const total = detail.value?.course.article_count || 0
+  const total = knownArticleCount.value
   if (normalizedArticleSearch.value || total <= 0) {
     return loadedArticlePages.value
   }
@@ -283,7 +297,7 @@ const nextReadingArticle = computed(() => {
 })
 const hasNextReadingArticle = computed(() => Boolean(nextReadingArticle.value || hasMoreArticles.value))
 const articleCountLabel = computed(() => {
-  const total = detail.value?.course.article_count || 0
+  const total = knownArticleCount.value
   return total > articles.value.length ? `${articles.value.length}/${total}` : String(articles.value.length)
 })
 const filteredArticleCountLabel = computed(() => {
@@ -314,7 +328,7 @@ const courseAnalysisSections = computed<PageAnalysisSection[]>(() => {
         `讲师头衔: ${course.lecturer_title || '-'}`,
         `简介: ${course.intro || '-'}`,
         `亮点: ${course.highlight || '-'}`,
-        `文章数: ${course.article_count || articles.value.length || 0}`,
+        `文章数: ${knownArticleCount.value || articles.value.length || 0}`,
         `学习人数: ${course.learn_user_count || '-'}`,
       ]),
     })
@@ -428,6 +442,9 @@ const loadDetail = async () => {
     const result = await client.value.getDedaoCourseDetail(enid.value)
     detail.value = result
     articles.value = result.articles || []
+    lastArticlePageTotal.value = result.course.article_count || 0
+    articleMarkdownCache.value = {}
+    prefetchingArticleEnids.clear()
     setArticleCursorFromArticles(articles.value)
     refreshHasMoreArticles(Boolean(result.has_more))
     articlePage.value = 1
@@ -435,9 +452,10 @@ const loadDetail = async () => {
     articleSearchStatus.value = ''
     readingEntries.value = []
     connected.value = true
-    const firstArticle = articles.value[0]
+    const savedPosition = restoreReadingPosition()
+    const firstArticle = await findRestoredArticle(savedPosition)
     if (firstArticle) {
-      await openArticle(firstArticle)
+      await openArticle(firstArticle, firstArticle.enid === savedPosition?.article_enid ? savedPosition.scroll_top : 0)
     } else {
       selectedArticleEnid.value = ''
       selectedArticleTitle.value = ''
@@ -461,9 +479,11 @@ const loadMoreArticles = async () => {
   try {
     const result = await client.value.listDedaoCourseArticles(enid.value, articlePageSize.value, articlesMaxID.value)
     const nextArticles = result.articles || []
+    const loadedCount = typeof result.loaded_count === 'number' ? result.loaded_count : nextArticles.length
+    lastArticlePageTotal.value = Math.max(lastArticlePageTotal.value, result.article_count || 0)
     articles.value = mergeArticles(articles.value, nextArticles)
-    setArticleCursorFromArticles(articles.value, result.max_id)
-    refreshHasMoreArticles(Boolean(result.is_more), nextArticles.length)
+    setArticleCursorFromArticles(articles.value, result.next_cursor ?? result.max_id)
+    refreshHasMoreArticles(Boolean(result.is_more), loadedCount)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -478,6 +498,7 @@ const handleArticleListScroll = () => {
 }
 
 const handleArticleReaderScroll = () => {
+  saveReadingPosition()
   if (isNearScrollBottom(articleReaderRef.value, 260)) {
     void appendNextReadingArticle()
   }
@@ -510,13 +531,35 @@ const loadAllArticlePages = async () => {
   }
 }
 
+const findRestoredArticle = async (savedPosition: CourseReadingPosition | null) => {
+  if (!savedPosition?.article_enid) {
+    return articles.value[0]
+  }
+  let restoredArticle = articles.value.find((article) => article.enid === savedPosition.article_enid)
+  let guard = 0
+  while (!restoredArticle && hasMoreArticles.value && guard < 20) {
+    guard += 1
+    const beforeCount = articles.value.length
+    await loadMoreArticles()
+    restoredArticle = articles.value.find((article) => article.enid === savedPosition.article_enid)
+    if (articles.value.length === beforeCount) {
+      break
+    }
+  }
+  return restoredArticle || articles.value[0]
+}
+
 const shouldKeepLoadingArticles = () => {
-  const total = detail.value?.course.article_count || 0
+  const total = knownArticleCount.value
   return total > 0 && articles.value.length > 0 && articles.value.length < total
 }
 
-const refreshHasMoreArticles = (serverHasMore: boolean, lastLoadedCount = articles.value.length) => {
-  hasMoreArticles.value = Boolean(serverHasMore || (lastLoadedCount > 0 && shouldKeepLoadingArticles()))
+const refreshHasMoreArticles = (
+  serverHasMore: boolean,
+  lastLoadedCount = articles.value.length,
+  nextCursor = articlesMaxID.value,
+) => {
+  hasMoreArticles.value = Boolean(serverHasMore || (nextCursor > 0 && lastLoadedCount > 0 && shouldKeepLoadingArticles()))
 }
 
 const goToPreviousArticlePage = () => {
@@ -563,8 +606,8 @@ const appendNextReadingArticle = async () => {
   }
 }
 
-const setArticleCursorFromArticles = (nextArticles: DedaoArticle[] = articles.value, explicitMaxID = 0) => {
-  if (explicitMaxID > 0) {
+const setArticleCursorFromArticles = (nextArticles: DedaoArticle[] = articles.value, explicitMaxID?: number) => {
+  if (typeof explicitMaxID === 'number') {
     articlesMaxID.value = explicitMaxID
     return
   }
@@ -586,14 +629,56 @@ const mergeArticles = (currentArticles: DedaoArticle[], nextArticles: DedaoArtic
   return merged
 }
 
-const openArticle = async (article: DedaoArticle) => {
+const restoreReadingPosition = (): CourseReadingPosition | null => {
+  const raw = localStorage.getItem(courseReadingPositionStorageKey.value)
+  if (!raw) {
+    return null
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<CourseReadingPosition>
+    if (!parsed.article_enid) {
+      return null
+    }
+    return {
+      article_enid: parsed.article_enid,
+      scroll_top: Math.max(0, Number(parsed.scroll_top || 0)),
+      articles_max_id: Number(parsed.articles_max_id || 0),
+      loaded_count: Number(parsed.loaded_count || 0),
+      updated_at: parsed.updated_at || '',
+    }
+  } catch (error) {
+    console.warn('failed to restore course reading position', error)
+    localStorage.removeItem(courseReadingPositionStorageKey.value)
+    return null
+  }
+}
+
+const saveReadingPosition = () => {
+  if (!enid.value || !selectedArticleEnid.value) {
+    return
+  }
+  const position: CourseReadingPosition = {
+    article_enid: selectedArticleEnid.value,
+    scroll_top: Math.max(0, Math.round(articleReaderRef.value?.scrollTop || 0)),
+    articles_max_id: articlesMaxID.value,
+    loaded_count: articles.value.length,
+    updated_at: new Date().toISOString(),
+  }
+  try {
+    localStorage.setItem(courseReadingPositionStorageKey.value, JSON.stringify(position))
+  } catch (error) {
+    console.warn('failed to save course reading position', error)
+  }
+}
+
+const openArticle = async (article: DedaoArticle, restoredScrollTop = 0) => {
   if (!article.enid) {
     return
   }
-  await startReadingFromArticle(article)
+  await startReadingFromArticle(article, restoredScrollTop)
 }
 
-const startReadingFromArticle = async (article: DedaoArticle) => {
+const startReadingFromArticle = async (article: DedaoArticle, restoredScrollTop = 0) => {
   selectedArticleEnid.value = article.enid
   selectedArticleTitle.value = article.title
   markdown.value = ''
@@ -602,6 +687,46 @@ const startReadingFromArticle = async (article: DedaoArticle) => {
   articleReaderRef.value?.scrollTo({ top: 0 })
   await appendArticleToReadingStream(article, true)
   await fillReaderIfNeeded()
+  if (restoredScrollTop > 0) {
+    await nextTick()
+    articleReaderRef.value?.scrollTo({ top: restoredScrollTop })
+  }
+  saveReadingPosition()
+  void prefetchNextArticle()
+}
+
+const getArticleMarkdownCached = async (article: DedaoArticle) => {
+  const articleEnid = article.enid
+  const cached = articleMarkdownCache.value[articleEnid]
+  if (cached) {
+    return cached
+  }
+  const result = await client.value.getDedaoArticleMarkdown(articleEnid)
+  articleMarkdownCache.value = {
+    ...articleMarkdownCache.value,
+    [articleEnid]: result,
+  }
+  return result
+}
+
+const prefetchNextArticle = async () => {
+  const nextArticle = nextReadingArticle.value
+  const nextArticleEnid = nextArticle?.enid || ''
+  if (!nextArticleEnid || articleMarkdownCache.value[nextArticleEnid] || prefetchingArticleEnids.has(nextArticleEnid)) {
+    return
+  }
+  prefetchingArticleEnids.add(nextArticleEnid)
+  try {
+    const result = await client.value.getDedaoArticleMarkdown(nextArticleEnid)
+    articleMarkdownCache.value = {
+      ...articleMarkdownCache.value,
+      [nextArticleEnid]: result,
+    }
+  } catch (error) {
+    console.warn('failed to prefetch next course article', error)
+  } finally {
+    prefetchingArticleEnids.delete(nextArticleEnid)
+  }
 }
 
 const appendArticleToReadingStream = async (article: DedaoArticle, replace = false) => {
@@ -619,7 +744,7 @@ const appendArticleToReadingStream = async (article: DedaoArticle, replace = fal
   articleLoading.value = true
   articleError.value = ''
   try {
-    const result = await client.value.getDedaoArticleMarkdown(article.enid)
+    const result = await getArticleMarkdownCached(article)
     const resolvedTitle = result.title || article.title
     markdown.value = result.markdown || ''
     selectedArticleTitle.value = resolvedTitle
@@ -639,6 +764,8 @@ const appendArticleToReadingStream = async (article: DedaoArticle, replace = fal
     })
   } finally {
     articleLoading.value = false
+    saveReadingPosition()
+    void prefetchNextArticle()
   }
 }
 
