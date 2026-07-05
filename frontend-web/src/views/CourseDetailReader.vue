@@ -21,12 +21,29 @@
             <span class="eyebrow">Articles</span>
             <h2>课程目录</h2>
           </div>
-          <span>{{ articles.length }}</span>
+          <span>{{ articleCountLabel }}</span>
+        </div>
+
+        <div class="article-search">
+          <input
+            v-model="articleSearchQuery"
+            type="search"
+            placeholder="搜索本课程标题、摘要"
+            @keyup.enter="searchCourseArticles"
+          />
+          <button type="button" :disabled="articleSearchLoading || articleListLoading" @click="searchCourseArticles">
+            {{ articleSearchLoading ? '搜索中' : '搜索' }}
+          </button>
+        </div>
+
+        <div class="article-list-meta">
+          <span>{{ filteredArticleCountLabel }}</span>
+          <span v-if="articleSearchStatus">{{ articleSearchStatus }}</span>
         </div>
 
         <div class="article-list">
           <button
-            v-for="article in articles"
+            v-for="article in visibleArticles"
             :key="article.enid || article.id"
             type="button"
             class="article-row"
@@ -41,10 +58,23 @@
           </button>
         </div>
 
+        <div v-if="filteredArticles.length || hasMoreArticles" class="article-pagination">
+          <button type="button" :disabled="articlePage <= 1" @click="goToPreviousArticlePage">上一页</button>
+          <span>{{ articlePage }} / {{ articleTotalPages }}</span>
+          <button
+            type="button"
+            :disabled="articleListLoading || (!canGoNextArticlePage && !hasMoreArticles)"
+            @click="goToNextArticlePage"
+          >
+            下一页
+          </button>
+        </div>
+
         <button v-if="hasMoreArticles" class="secondary-action" type="button" :disabled="articleListLoading" @click="loadMoreArticles">
           {{ articleListLoading ? '加载中' : '加载更多' }}
         </button>
 
+        <div v-if="!loading && articles.length && !filteredArticles.length" class="empty-state">没有匹配的课程文章。</div>
         <div v-if="!loading && !articles.length" class="empty-state">暂无课程文章。</div>
       </aside>
 
@@ -127,7 +157,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
@@ -158,6 +188,11 @@ const selectedArticleTitle = ref('')
 const markdown = ref('')
 const articlesMaxID = ref(0)
 const hasMoreArticles = ref(false)
+const articleSearchQuery = ref('')
+const articleSearchStatus = ref('')
+const articleSearchLoading = ref(false)
+const articlePage = ref(1)
+const articlePageSize = ref(30)
 const activeContextPanel = ref<'Course' | 'Analysis' | ''>('')
 const readerWorkspaceRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 248 })
@@ -170,6 +205,36 @@ const coursePageURL = computed(() => `/course/${encodeURIComponent(enid.value)}`
 const readerWorkspaceStyle = computed(() => ({
   '--course-left-column': `${layoutColumns.value.left}px`,
 }))
+const normalizedArticleSearch = computed(() => articleSearchQuery.value.trim().toLowerCase())
+const filteredArticles = computed(() => {
+  const query = normalizedArticleSearch.value
+  if (!query) {
+    return articles.value
+  }
+  const terms = query.split(/\s+/).filter(Boolean)
+  return articles.value.filter((article) => {
+    const haystack = [article.title, article.summary, article.id, article.order_num]
+      .map((value) => String(value ?? '').toLowerCase())
+      .join('\n')
+    return terms.every((term) => haystack.includes(term))
+  })
+})
+const articleTotalPages = computed(() => Math.max(1, Math.ceil(filteredArticles.value.length / articlePageSize.value)))
+const visibleArticles = computed(() => {
+  const start = (articlePage.value - 1) * articlePageSize.value
+  return filteredArticles.value.slice(start, start + articlePageSize.value)
+})
+const canGoNextArticlePage = computed(() => articlePage.value < articleTotalPages.value)
+const articleCountLabel = computed(() => {
+  const total = detail.value?.course.article_count || 0
+  return total > articles.value.length ? `${articles.value.length}/${total}` : String(articles.value.length)
+})
+const filteredArticleCountLabel = computed(() => {
+  if (normalizedArticleSearch.value) {
+    return `命中 ${filteredArticles.value.length} 条 · 已载入 ${articles.value.length} 条`
+  }
+  return `已载入 ${articles.value.length} 条`
+})
 const courseIntro = computed(() => {
   const course = detail.value?.course
   return String(course?.highlight || course?.intro || '').trim()
@@ -234,6 +299,17 @@ onBeforeUnmount(() => {
   stopColumnResize()
 })
 
+watch(articleSearchQuery, () => {
+  articlePage.value = 1
+  articleSearchStatus.value = ''
+})
+
+watch(enid, async (next, previous) => {
+  if (next && next !== previous) {
+    await loadDetail()
+  }
+})
+
 const restoreConnection = () => {
   const raw = localStorage.getItem(storageKey)
   if (!raw) {
@@ -295,7 +371,11 @@ const loadDetail = async () => {
     const result = await client.value.getDedaoCourseDetail(enid.value)
     detail.value = result
     articles.value = result.articles || []
+    setArticleCursorFromArticles(articles.value)
     hasMoreArticles.value = Boolean(result.has_more)
+    articlePage.value = 1
+    articleSearchQuery.value = ''
+    articleSearchStatus.value = ''
     connected.value = true
     const firstArticle = articles.value[0]
     if (firstArticle) {
@@ -314,18 +394,91 @@ const loadDetail = async () => {
 }
 
 const loadMoreArticles = async () => {
+  if (articleListLoading.value || !hasMoreArticles.value) {
+    return
+  }
   articleListLoading.value = true
   errorMessage.value = ''
   try {
-    const result = await client.value.listDedaoCourseArticles(enid.value, 30, articlesMaxID.value)
-    articles.value = [...articles.value, ...(result.articles || [])]
-    articlesMaxID.value = result.max_id || articlesMaxID.value
-    hasMoreArticles.value = Boolean(result.is_more)
+    const result = await client.value.listDedaoCourseArticles(enid.value, articlePageSize.value, articlesMaxID.value)
+    const nextArticles = result.articles || []
+    articles.value = mergeArticles(articles.value, nextArticles)
+    setArticleCursorFromArticles(articles.value, result.max_id)
+    hasMoreArticles.value = Boolean(result.is_more) && nextArticles.length > 0
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     articleListLoading.value = false
   }
+}
+
+const searchCourseArticles = async () => {
+  articlePage.value = 1
+  articleSearchStatus.value = ''
+  if (!normalizedArticleSearch.value) {
+    return
+  }
+  articleSearchLoading.value = true
+  try {
+    await loadAllArticlePages()
+    articleSearchStatus.value = hasMoreArticles.value ? '已搜索已载入目录' : '已搜索全部目录'
+  } finally {
+    articleSearchLoading.value = false
+  }
+}
+
+const loadAllArticlePages = async () => {
+  let guard = 0
+  while (hasMoreArticles.value && guard < 80) {
+    guard += 1
+    const beforeCount = articles.value.length
+    await loadMoreArticles()
+    if (articles.value.length === beforeCount) {
+      break
+    }
+  }
+}
+
+const goToPreviousArticlePage = () => {
+  articlePage.value = Math.max(1, articlePage.value - 1)
+}
+
+const goToNextArticlePage = async () => {
+  if (canGoNextArticlePage.value) {
+    articlePage.value += 1
+    return
+  }
+  if (!hasMoreArticles.value) {
+    return
+  }
+  const previousTotalPages = articleTotalPages.value
+  await loadMoreArticles()
+  if (articleTotalPages.value > previousTotalPages || canGoNextArticlePage.value) {
+    articlePage.value += 1
+  }
+}
+
+const setArticleCursorFromArticles = (nextArticles: DedaoArticle[] = articles.value, explicitMaxID = 0) => {
+  if (explicitMaxID > 0) {
+    articlesMaxID.value = explicitMaxID
+    return
+  }
+  const lastArticle = [...nextArticles].reverse().find((article) => article.id > 0)
+  articlesMaxID.value = lastArticle?.id || 0
+}
+
+const mergeArticles = (currentArticles: DedaoArticle[], nextArticles: DedaoArticle[]) => {
+  const seen = new Set<string>()
+  const merged: DedaoArticle[] = []
+  for (const article of [...currentArticles, ...nextArticles]) {
+    const key = article.enid || String(article.id)
+    if (!key || seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    merged.push(article)
+  }
+  return merged
 }
 
 const openArticle = async (article: DedaoArticle) => {
@@ -445,8 +598,53 @@ const clampNumber = (value: number, min: number, max: number) => {
 .article-list {
   display: grid;
   gap: 0;
-  max-height: calc(100vh - 292px);
+  max-height: calc(100vh - 390px);
   overflow: auto;
+}
+
+.article-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 62px;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.article-search button,
+.article-pagination button {
+  min-height: 36px;
+  border: 1px solid var(--dedao-line);
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--dedao-text);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.article-search button {
+  border-color: var(--dedao-orange);
+  background: var(--dedao-orange);
+  color: #ffffff;
+}
+
+.article-list-meta,
+.article-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: var(--dedao-muted);
+  font-size: 12px;
+}
+
+.article-pagination {
+  margin: 10px 0 0;
+}
+
+.article-pagination span {
+  color: var(--dedao-text);
+  font-weight: 700;
 }
 
 .article-row {
