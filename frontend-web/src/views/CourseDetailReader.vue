@@ -63,7 +63,7 @@
           <span>{{ articlePage }} / {{ articleTotalPages }}</span>
           <button
             type="button"
-            :disabled="articleListLoading || (!canGoNextArticlePage && !hasMoreArticles)"
+            :disabled="articleListLoading || !canGoNextArticlePage"
             @click="goToNextArticlePage"
           >
             下一页
@@ -255,12 +255,21 @@ const filteredArticles = computed(() => {
     return terms.every((term) => haystack.includes(term))
   })
 })
-const articleTotalPages = computed(() => Math.max(1, Math.ceil(filteredArticles.value.length / articlePageSize.value)))
+const loadedArticlePages = computed(() => Math.max(1, Math.ceil(filteredArticles.value.length / articlePageSize.value)))
+const knownTotalArticlePages = computed(() => {
+  const total = detail.value?.course.article_count || 0
+  if (normalizedArticleSearch.value || total <= 0) {
+    return loadedArticlePages.value
+  }
+  return Math.max(loadedArticlePages.value, Math.ceil(total / articlePageSize.value))
+})
+const articleTotalPages = computed(() => Math.max(loadedArticlePages.value, knownTotalArticlePages.value))
 const visibleArticles = computed(() => {
   const start = (articlePage.value - 1) * articlePageSize.value
   return filteredArticles.value.slice(start, start + articlePageSize.value)
 })
-const canGoNextArticlePage = computed(() => articlePage.value < articleTotalPages.value)
+const canGoNextLoadedArticlePage = computed(() => articlePage.value < loadedArticlePages.value)
+const canGoNextArticlePage = computed(() => canGoNextLoadedArticlePage.value || hasMoreArticles.value)
 const nextReadingArticle = computed(() => {
   const lastEntry = readingEntries.value[readingEntries.value.length - 1]
   if (!lastEntry) {
@@ -420,7 +429,7 @@ const loadDetail = async () => {
     detail.value = result
     articles.value = result.articles || []
     setArticleCursorFromArticles(articles.value)
-    hasMoreArticles.value = Boolean(result.has_more)
+    refreshHasMoreArticles(Boolean(result.has_more))
     articlePage.value = 1
     articleSearchQuery.value = ''
     articleSearchStatus.value = ''
@@ -454,7 +463,7 @@ const loadMoreArticles = async () => {
     const nextArticles = result.articles || []
     articles.value = mergeArticles(articles.value, nextArticles)
     setArticleCursorFromArticles(articles.value, result.max_id)
-    hasMoreArticles.value = Boolean(result.is_more) && nextArticles.length > 0
+    refreshHasMoreArticles(Boolean(result.is_more), nextArticles.length)
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -501,21 +510,30 @@ const loadAllArticlePages = async () => {
   }
 }
 
+const shouldKeepLoadingArticles = () => {
+  const total = detail.value?.course.article_count || 0
+  return total > 0 && articles.value.length > 0 && articles.value.length < total
+}
+
+const refreshHasMoreArticles = (serverHasMore: boolean, lastLoadedCount = articles.value.length) => {
+  hasMoreArticles.value = Boolean(serverHasMore || (lastLoadedCount > 0 && shouldKeepLoadingArticles()))
+}
+
 const goToPreviousArticlePage = () => {
   articlePage.value = Math.max(1, articlePage.value - 1)
 }
 
 const goToNextArticlePage = async () => {
-  if (canGoNextArticlePage.value) {
+  if (canGoNextLoadedArticlePage.value) {
     articlePage.value += 1
     return
   }
   if (!hasMoreArticles.value) {
     return
   }
-  const previousTotalPages = articleTotalPages.value
+  const previousLoadedPages = loadedArticlePages.value
   await loadMoreArticles()
-  if (articleTotalPages.value > previousTotalPages || canGoNextArticlePage.value) {
+  if (loadedArticlePages.value > previousLoadedPages || canGoNextLoadedArticlePage.value) {
     articlePage.value += 1
   }
 }
