@@ -41,7 +41,7 @@
           <span v-if="articleSearchStatus">{{ articleSearchStatus }}</span>
         </div>
 
-        <div class="article-list">
+        <div ref="articleListRef" class="article-list" @scroll="handleArticleListScroll">
           <button
             v-for="article in visibleArticles"
             :key="article.enid || article.id"
@@ -85,7 +85,7 @@
         @pointerdown="beginColumnResize('left', $event)"
       ></div>
 
-      <article class="article-reader">
+      <article ref="articleReaderRef" class="article-reader" @scroll="handleArticleReaderScroll">
         <div class="article-reader-head">
           <div>
             <span class="eyebrow">Markdown Reader</span>
@@ -98,9 +98,26 @@
           </div>
         </div>
 
-        <div v-if="articleError" class="error-strip">{{ articleError }}</div>
-        <div v-if="articleLoading" class="empty-state">加载文章中...</div>
-        <div v-else-if="renderedArticle" class="answer-markdown" v-html="renderedArticle"></div>
+        <div v-if="articleError && !readingEntries.length" class="error-strip">{{ articleError }}</div>
+        <div v-if="articleLoading && !readingEntries.length" class="empty-state">加载文章中...</div>
+        <div v-else-if="readingEntries.length" class="continuous-article-stream">
+          <section
+            v-for="entry in renderedReadingEntries"
+            :key="entry.enid"
+            class="reading-entry"
+            :class="{ active: selectedArticleEnid === entry.enid }"
+          >
+            <div class="reading-entry-head">
+              <span>{{ entry.orderNum || entry.id || 'Article' }}</span>
+              <h2>{{ entry.title || '课程文章' }}</h2>
+            </div>
+            <div v-if="entry.error" class="error-strip">{{ entry.error }}</div>
+            <div v-else-if="entry.loading" class="empty-state">加载文章中...</div>
+            <div v-else class="answer-markdown" v-html="entry.html"></div>
+          </section>
+          <div v-if="continuousArticleLoading" class="empty-state">正在加载下一篇...</div>
+          <div v-else-if="!hasNextReadingArticle" class="reader-end-state">已读完已载入课程内容</div>
+        </div>
         <div v-else class="empty-state">从左侧选择文章开始阅读。</div>
       </article>
 
@@ -157,7 +174,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import {
   getBrowserSession,
@@ -168,6 +185,16 @@ import {
 } from '../api'
 import PageAnalysisPanel from '../components/PageAnalysisPanel.vue'
 import { renderMarkdown } from '../utils/markdownRender'
+
+interface CourseReadingEntry {
+  enid: string
+  id?: number
+  orderNum?: number
+  title: string
+  markdown: string
+  loading: boolean
+  error: string
+}
 
 const storageKey = 'dedao-kbase-web-settings'
 const layoutStorageKey = 'dedao-course-reader-layout'
@@ -186,8 +213,10 @@ const articles = ref<DedaoArticle[]>([])
 const selectedArticleEnid = ref('')
 const selectedArticleTitle = ref('')
 const markdown = ref('')
+const readingEntries = ref<CourseReadingEntry[]>([])
 const articlesMaxID = ref(0)
 const hasMoreArticles = ref(false)
+const continuousArticleLoading = ref(false)
 const articleSearchQuery = ref('')
 const articleSearchStatus = ref('')
 const articleSearchLoading = ref(false)
@@ -195,12 +224,19 @@ const articlePage = ref(1)
 const articlePageSize = ref(30)
 const activeContextPanel = ref<'Course' | 'Analysis' | ''>('')
 const readerWorkspaceRef = ref<HTMLElement | null>(null)
+const articleReaderRef = ref<HTMLElement | null>(null)
+const articleListRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 248 })
 const activeResizeTarget = ref<'left' | null>(null)
 
 const enid = computed(() => String(route.params.enid || ''))
 const client = computed(() => new KBaseClient(baseUrl.value, token.value))
-const renderedArticle = computed(() => renderMarkdown(markdown.value))
+const renderedReadingEntries = computed(() =>
+  readingEntries.value.map((entry) => ({
+    ...entry,
+    html: renderMarkdown(entry.markdown),
+  })),
+)
 const coursePageURL = computed(() => `/course/${encodeURIComponent(enid.value)}`)
 const readerWorkspaceStyle = computed(() => ({
   '--course-left-column': `${layoutColumns.value.left}px`,
@@ -225,6 +261,18 @@ const visibleArticles = computed(() => {
   return filteredArticles.value.slice(start, start + articlePageSize.value)
 })
 const canGoNextArticlePage = computed(() => articlePage.value < articleTotalPages.value)
+const nextReadingArticle = computed(() => {
+  const lastEntry = readingEntries.value[readingEntries.value.length - 1]
+  if (!lastEntry) {
+    return articles.value[0]
+  }
+  const currentIndex = findArticleIndex(lastEntry.enid)
+  if (currentIndex >= 0 && currentIndex + 1 < articles.value.length) {
+    return articles.value[currentIndex + 1]
+  }
+  return undefined
+})
+const hasNextReadingArticle = computed(() => Boolean(nextReadingArticle.value || hasMoreArticles.value))
 const articleCountLabel = computed(() => {
   const total = detail.value?.course.article_count || 0
   return total > articles.value.length ? `${articles.value.length}/${total}` : String(articles.value.length)
@@ -376,6 +424,7 @@ const loadDetail = async () => {
     articlePage.value = 1
     articleSearchQuery.value = ''
     articleSearchStatus.value = ''
+    readingEntries.value = []
     connected.value = true
     const firstArticle = articles.value[0]
     if (firstArticle) {
@@ -384,6 +433,7 @@ const loadDetail = async () => {
       selectedArticleEnid.value = ''
       selectedArticleTitle.value = ''
       markdown.value = ''
+      readingEntries.value = []
     }
   } catch (error) {
     connected.value = false
@@ -409,6 +459,18 @@ const loadMoreArticles = async () => {
     errorMessage.value = error instanceof Error ? error.message : String(error)
   } finally {
     articleListLoading.value = false
+  }
+}
+
+const handleArticleListScroll = () => {
+  if (isNearScrollBottom(articleListRef.value, 120)) {
+    void loadMoreArticles()
+  }
+}
+
+const handleArticleReaderScroll = () => {
+  if (isNearScrollBottom(articleReaderRef.value, 260)) {
+    void appendNextReadingArticle()
   }
 }
 
@@ -458,6 +520,31 @@ const goToNextArticlePage = async () => {
   }
 }
 
+const appendNextReadingArticle = async () => {
+  if (articleLoading.value || continuousArticleLoading.value) {
+    return
+  }
+  let nextArticle = nextReadingArticle.value
+  if (!nextArticle && hasMoreArticles.value) {
+    const beforeCount = articles.value.length
+    await loadMoreArticles()
+    if (articles.value.length > beforeCount) {
+      nextArticle = nextReadingArticle.value
+    }
+  }
+  const nextArticleEnid = nextArticle?.enid || ''
+  if (!nextArticle || !nextArticleEnid || readingEntries.value.some((entry) => entry.enid === nextArticleEnid)) {
+    return
+  }
+  continuousArticleLoading.value = true
+  try {
+    await appendArticleToReadingStream(nextArticle)
+  } finally {
+    continuousArticleLoading.value = false
+    await fillReaderIfNeeded()
+  }
+}
+
 const setArticleCursorFromArticles = (nextArticles: DedaoArticle[] = articles.value, explicitMaxID = 0) => {
   if (explicitMaxID > 0) {
     articlesMaxID.value = explicitMaxID
@@ -485,20 +572,91 @@ const openArticle = async (article: DedaoArticle) => {
   if (!article.enid) {
     return
   }
+  await startReadingFromArticle(article)
+}
+
+const startReadingFromArticle = async (article: DedaoArticle) => {
+  selectedArticleEnid.value = article.enid
+  selectedArticleTitle.value = article.title
+  markdown.value = ''
+  readingEntries.value = []
+  await nextTick()
+  articleReaderRef.value?.scrollTo({ top: 0 })
+  await appendArticleToReadingStream(article, true)
+  await fillReaderIfNeeded()
+}
+
+const appendArticleToReadingStream = async (article: DedaoArticle, replace = false) => {
+  if (!article.enid) {
+    return
+  }
+  const loadingEntry = createReadingEntry(article, true)
+  if (replace) {
+    readingEntries.value = [loadingEntry]
+  } else {
+    readingEntries.value = [...readingEntries.value, loadingEntry]
+  }
   selectedArticleEnid.value = article.enid
   selectedArticleTitle.value = article.title
   articleLoading.value = true
   articleError.value = ''
   try {
     const result = await client.value.getDedaoArticleMarkdown(article.enid)
+    const resolvedTitle = result.title || article.title
     markdown.value = result.markdown || ''
-    selectedArticleTitle.value = result.title || article.title
+    selectedArticleTitle.value = resolvedTitle
+    updateReadingEntry(article.enid, {
+      title: resolvedTitle,
+      markdown: result.markdown || '',
+      loading: false,
+      error: '',
+    })
   } catch (error) {
     markdown.value = ''
-    articleError.value = error instanceof Error ? error.message : String(error)
+    const message = error instanceof Error ? error.message : String(error)
+    articleError.value = message
+    updateReadingEntry(article.enid, {
+      loading: false,
+      error: message,
+    })
   } finally {
     articleLoading.value = false
   }
+}
+
+const fillReaderIfNeeded = async () => {
+  await nextTick()
+  if (isNearScrollBottom(articleReaderRef.value, 260)) {
+    void appendNextReadingArticle()
+  }
+}
+
+const createReadingEntry = (article: DedaoArticle, loading = false): CourseReadingEntry => ({
+  enid: article.enid,
+  id: article.id,
+  orderNum: article.order_num,
+  title: article.title || `Article ${article.id}`,
+  markdown: '',
+  loading,
+  error: '',
+})
+
+const updateReadingEntry = (entryEnid: string, patch: Partial<CourseReadingEntry>) => {
+  readingEntries.value = readingEntries.value.map((entry) => (
+    entry.enid === entryEnid ? { ...entry, ...patch } : entry
+  ))
+}
+
+const findArticleIndex = (articleEnid: string) => articles.value.findIndex((article) => article.enid === articleEnid)
+
+const isNearScrollBottom = (
+  element: { scrollTop: number; clientHeight: number; scrollHeight: number } | null,
+  threshold: number,
+) => {
+  if (!element) {
+    return false
+  }
+  return element.scrollTop + element.clientHeight >= element.scrollHeight - threshold
 }
 
 const formatPublishTime = (value?: number) => {
@@ -688,6 +846,7 @@ const clampNumber = (value: number, min: number, max: number) => {
 
 .article-reader {
   margin-left: 10px;
+  max-height: calc(100vh - 196px);
   overflow: auto;
 }
 
@@ -729,6 +888,54 @@ const clampNumber = (value: number, min: number, max: number) => {
   margin: 2px 0 0;
   font-size: 24px;
   line-height: 1.25;
+}
+
+.continuous-article-stream {
+  display: grid;
+  gap: 22px;
+}
+
+.reading-entry {
+  border-bottom: 1px solid var(--dedao-line);
+  padding-bottom: 18px;
+}
+
+.reading-entry:last-child {
+  border-bottom: 0;
+}
+
+.reading-entry-head {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  margin: 0 0 12px;
+}
+
+.reading-entry-head span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  border: 1px solid #ffd0ad;
+  border-radius: 999px;
+  color: var(--dedao-orange);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.reading-entry-head h2 {
+  margin: 0;
+  color: #111111;
+  font-size: 24px;
+  line-height: 1.28;
+}
+
+.reader-end-state {
+  border-top: 1px solid var(--dedao-line);
+  padding: 18px 0 8px;
+  color: var(--dedao-muted);
+  text-align: center;
 }
 
 .answer-markdown {
