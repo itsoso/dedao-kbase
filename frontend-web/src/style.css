@@ -1038,6 +1038,22 @@ label span {
   font-size: 13px;
 }
 
+.evidence-pack-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.evidence-pack-controls input {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.evidence-pack-controls button {
+  min-width: 68px;
+}
+
 .project-export-route {
   display: block;
   margin-top: 8px;

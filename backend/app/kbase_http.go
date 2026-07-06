@@ -482,6 +482,93 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 			return
 		}
 		writeHTTPJSON(w, http.StatusOK, collection)
+	case "evidence-pack":
+		if len(parts) == 3 && parts[2] == "diff" {
+			if !requireHTTPMethod(w, r, http.MethodGet) {
+				return
+			}
+			previousPackID := strings.TrimSpace(r.URL.Query().Get("previous_pack_id"))
+			if previousPackID == "" {
+				writeHTTPError(w, http.StatusBadRequest, "previous_pack_id is required")
+				return
+			}
+			diff, err := h.store.BuildVerifiedEvidencePackDiff(projectID, previousPackID, limit)
+			if err != nil {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeHTTPJSON(w, http.StatusOK, diff)
+			return
+		}
+		if len(parts) == 3 && parts[2] == "export" {
+			if !requireHTTPMethod(w, r, http.MethodGet) {
+				return
+			}
+			format := strings.TrimSpace(r.URL.Query().Get("format"))
+			if format != "" && format != "jsonl" {
+				writeHTTPError(w, http.StatusBadRequest, "format must be jsonl")
+				return
+			}
+			payload, err := h.store.ExportVerifiedEvidencePackJSONL(projectID, limit)
+			if err != nil {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		pack, err := h.store.BuildVerifiedEvidencePack(projectID, limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, pack)
+	case "proofroom-pack":
+		if projectID != BookKnowledgeProjectProofroom {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if len(parts) == 3 && parts[2] == "export" {
+			if !requireHTTPMethod(w, r, http.MethodGet) {
+				return
+			}
+			format := strings.TrimSpace(r.URL.Query().Get("format"))
+			if format != "" && format != "jsonl" {
+				writeHTTPError(w, http.StatusBadRequest, "format must be jsonl")
+				return
+			}
+			payload, err := h.store.ExportProofroomArgumentPackJSONL(limit)
+			if err != nil {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload)
+			return
+		}
+		if len(parts) != 2 {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		if !requireHTTPMethod(w, r, http.MethodGet) {
+			return
+		}
+		pack, err := h.store.BuildProofroomArgumentPack(limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, pack)
 	case "authority-pack":
 		if projectID != BookKnowledgeProjectHealth {
 			writeHTTPError(w, http.StatusNotFound, "not found")

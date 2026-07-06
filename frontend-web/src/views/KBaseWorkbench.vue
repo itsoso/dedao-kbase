@@ -352,6 +352,105 @@
             <code v-if="projectCollection" class="project-export-route">{{ projectCollectionExportPath }}</code>
           </section>
 
+          <section v-if="selectedProject" class="project-policy evidence-pack-panel">
+            <div class="project-policy-head">
+              <div>
+                <strong>Verified Evidence Pack</strong>
+                <p>verified_evidence_pack_v1 · {{ selectedProject.target_system }}</p>
+              </div>
+              <button
+                type="button"
+                class="primary-action"
+                :disabled="projectLoading || evidencePackLoading"
+                @click="refreshEvidencePack"
+              >
+                {{ evidencePackLoading ? '生成中' : '刷新 Pack' }}
+              </button>
+              <button
+                type="button"
+                :disabled="!evidencePack || evidencePackExportLoading"
+                @click="previewEvidencePackExport"
+              >
+                {{ evidencePackExportLoading ? 'Loading' : 'JSONL' }}
+              </button>
+            </div>
+            <section v-if="evidencePack" class="project-summary evidence-pack-summary">
+              <div>
+                <span>Pack</span>
+                <strong>{{ evidencePack.pack_id }}</strong>
+              </div>
+              <div>
+                <span>Records</span>
+                <strong>{{ evidencePack.quality_summary.total }}</strong>
+              </div>
+              <div>
+                <span>Accepted</span>
+                <strong>{{ evidencePack.quality_summary.accepted }}</strong>
+              </div>
+              <div>
+                <span>Assistive</span>
+                <strong>{{ evidencePack.quality_summary.assistive }}</strong>
+              </div>
+              <div>
+                <span>Blocked</span>
+                <strong>{{ evidencePack.quality_summary.blocked }}</strong>
+              </div>
+              <div>
+                <span>Missing Refs</span>
+                <strong>{{ evidencePack.quality_summary.missing_source_refs }}</strong>
+              </div>
+            </section>
+            <div v-if="evidencePack" class="source-chips">
+              <span>{{ evidencePack.consumer_contract }}</span>
+              <span>{{ evidencePack.source_unchanged ? 'source unchanged' : 'source changed' }}</span>
+              <span>fingerprint: {{ evidencePack.source_fingerprint.slice(0, 12) }}</span>
+              <span v-for="item in evidencePackTopRiskReasons" :key="`risk:${item.reason}`">
+                {{ item.reason }}: {{ item.count }}
+              </span>
+              <span v-for="item in evidencePackRecommendedActions" :key="`action:${item.action}`">
+                {{ item.action }}: {{ item.count }}
+              </span>
+            </div>
+            <div class="evidence-pack-controls">
+              <input v-model="previousEvidencePackID" placeholder="previous_pack_id" />
+              <button
+                type="button"
+                :disabled="!evidencePack || evidencePackDiffLoading || !previousEvidencePackID.trim()"
+                @click="loadEvidencePackDiff"
+              >
+                {{ evidencePackDiffLoading ? 'Loading' : 'Diff' }}
+              </button>
+            </div>
+            <section v-if="evidencePackDiff" class="project-summary evidence-pack-diff-summary">
+              <div>
+                <span>Added</span>
+                <strong>{{ evidencePackDiff.counts.added }}</strong>
+              </div>
+              <div>
+                <span>Removed</span>
+                <strong>{{ evidencePackDiff.counts.removed }}</strong>
+              </div>
+              <div>
+                <span>Changed</span>
+                <strong>{{ evidencePackDiff.counts.changed }}</strong>
+              </div>
+              <div>
+                <span>Unchanged</span>
+                <strong>{{ evidencePackDiff.counts.unchanged }}</strong>
+              </div>
+              <div>
+                <span>Blocked</span>
+                <strong>{{ evidencePackDiff.counts.blocked }}</strong>
+              </div>
+              <div>
+                <span>Source</span>
+                <strong>{{ evidencePackDiff.source_unchanged ? 'unchanged' : 'changed' }}</strong>
+              </div>
+            </section>
+            <code class="project-export-route">{{ evidencePackExportPath }}</code>
+            <pre v-if="evidencePackExportText" class="job-result project-export-preview">{{ evidencePackExportText }}</pre>
+          </section>
+
           <section v-if="selectedProjectID === 'health'" class="project-policy health-authority-pack">
             <div class="project-policy-head">
               <div>
@@ -559,6 +658,8 @@ import {
   type BookKnowledgeQualityIssue,
   type BookKnowledgeSearchResult,
   type HealthAuthorityPack,
+  type VerifiedEvidencePack,
+  type VerifiedEvidencePackDiff,
 } from '../api'
 import { renderMarkdown } from '../utils/markdownRender'
 
@@ -599,8 +700,13 @@ const protectedApiRoutes = [
   '/api/projects/health/collection/refresh',
   '/api/projects/health/audit-queue',
   '/api/projects/health/collection/export?format=jsonl',
+  '/api/projects/health/evidence-pack',
+  '/api/projects/health/evidence-pack/export?format=jsonl',
+  '/api/projects/health/evidence-pack/diff?previous_pack_id=...',
   '/api/projects/health/authority-pack/refresh',
   '/api/projects/health/authority-pack/export?format=jsonl',
+  '/api/projects/proofroom/proofroom-pack',
+  '/api/projects/proofroom/proofroom-pack/export?format=jsonl',
   '/api/system-kb/manifest',
   '/api/system-kb/export',
 ]
@@ -640,15 +746,22 @@ const projectExportPreview = ref<BookKnowledgeProjectExportPreview | null>(null)
 const verificationReport = ref<BookKnowledgeProjectVerificationReport | null>(null)
 const projectCollection = ref<BookKnowledgeProjectCollection | null>(null)
 const projectAuditQueue = ref<BookKnowledgeProjectAuditQueue | null>(null)
+const evidencePack = ref<VerifiedEvidencePack | null>(null)
+const evidencePackDiff = ref<VerifiedEvidencePackDiff | null>(null)
 const healthAuthorityPack = ref<HealthAuthorityPack | null>(null)
 const projectCollectionExportText = ref('')
+const evidencePackExportText = ref('')
 const healthAuthorityPackExportText = ref('')
 const projectLoading = ref(false)
 const projectCollectionLoading = ref(false)
 const projectCollectionExportLoading = ref(false)
+const evidencePackLoading = ref(false)
+const evidencePackExportLoading = ref(false)
+const evidencePackDiffLoading = ref(false)
 const healthAuthorityPackLoading = ref(false)
 const healthAuthorityPackExportLoading = ref(false)
 const projectError = ref('')
+const previousEvidencePackID = ref('')
 const workbenchRef = ref<HTMLElement | null>(null)
 const layoutColumns = ref({ left: 320 })
 const activeResizeTarget = ref<'left' | null>(null)
@@ -666,6 +779,11 @@ const serviceBaseUrl = computed(() => {
 const projectCollectionExportPath = computed(() => {
   const projectID = encodeURIComponent(selectedProjectID.value || 'health')
   return `/api/projects/${projectID}/collection/export?format=jsonl`
+})
+
+const evidencePackExportPath = computed(() => {
+  const projectID = encodeURIComponent(selectedProjectID.value || 'health')
+  return `/api/projects/${projectID}/evidence-pack/export?format=jsonl`
 })
 
 const healthAuthorityPackExportPath = computed(() => '/api/projects/health/authority-pack/export?format=jsonl')
@@ -697,8 +815,35 @@ const projectHub = computed(() => ({
   verification: verificationReport.value,
   collection: projectCollection.value,
   auditQueue: projectAuditQueue.value,
+  evidencePack: evidencePack.value,
+  evidencePackDiff: evidencePackDiff.value,
   authorityPack: healthAuthorityPack.value,
 }))
+
+const evidencePackTopRiskReasons = computed(() => {
+  const counts = new Map<string, number>()
+  for (const record of evidencePack.value?.records || []) {
+    const reason = record.risk_reason || record.risk_tier || 'unknown'
+    counts.set(reason, (counts.get(reason) || 0) + 1)
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 5)
+    .map(([reason, count]) => ({ reason, count }))
+})
+
+const evidencePackRecommendedActions = computed(() => {
+  const actions = new Map<string, number>()
+  for (const record of evidencePack.value?.records || []) {
+    for (const action of record.audit?.recommended_actions || []) {
+      actions.set(action, (actions.get(action) || 0) + 1)
+    }
+  }
+  return Array.from(actions.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 5)
+    .map(([action, count]) => ({ action, count }))
+})
 
 onMounted(async () => {
   restoreConnection()
@@ -903,11 +1048,12 @@ const loadProjectHub = async () => {
     if (!selectedProjectID.value && projects.value.length) {
       selectedProjectID.value = projects.value[0].project_id
     }
-    const [queue, preview, verification, collectionState, authorityPackState] = await Promise.all([
+    const [queue, preview, verification, collectionState, evidencePackState, authorityPackState] = await Promise.all([
       client.value.getProjectReviewQueue(projectID, 20),
       client.value.getProjectExportPreview(projectID, 20),
       client.value.getProjectVerificationReport(projectID, 20),
       loadProjectCollectionState(projectID),
+      loadEvidencePackState(projectID),
       loadHealthAuthorityPackState(projectID),
     ])
     if (selectedProjectID.value === projectID) {
@@ -916,6 +1062,8 @@ const loadProjectHub = async () => {
       verificationReport.value = verification
       projectCollection.value = collectionState.collection
       projectAuditQueue.value = collectionState.auditQueue
+      evidencePack.value = evidencePackState
+      previousEvidencePackID.value = previousEvidencePackID.value || evidencePackState?.pack_id || ''
       healthAuthorityPack.value = authorityPackState
     }
     connected.value = true
@@ -934,8 +1082,12 @@ const selectProject = async (projectID: string) => {
   verificationReport.value = null
   projectCollection.value = null
   projectAuditQueue.value = null
+  evidencePack.value = null
+  evidencePackDiff.value = null
   healthAuthorityPack.value = null
+  previousEvidencePackID.value = ''
   projectCollectionExportText.value = ''
+  evidencePackExportText.value = ''
   healthAuthorityPackExportText.value = ''
   await loadProjectHub()
 }
@@ -951,6 +1103,18 @@ const loadProjectCollectionState = async (projectID: string) => {
     const message = error instanceof Error ? error.message : String(error)
     if (message.includes('HTTP 404')) {
       return { collection: null, auditQueue: null }
+    }
+    throw error
+  }
+}
+
+const loadEvidencePackState = async (projectID: string) => {
+  try {
+    return await client.value.getProjectEvidencePack(projectID, 25)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('HTTP 404')) {
+      return null
     }
     throw error
   }
@@ -985,8 +1149,13 @@ const refreshProjectCollection = async () => {
       projectCollection.value = collection
       projectAuditQueue.value = auditQueue
       verificationReport.value = await client.value.getProjectVerificationReport(projectID, 25)
+      const previousPackID = evidencePack.value?.pack_id || ''
+      evidencePack.value = await loadEvidencePackState(projectID)
+      previousEvidencePackID.value = previousPackID || evidencePack.value?.pack_id || ''
+      evidencePackDiff.value = null
       healthAuthorityPack.value = await loadHealthAuthorityPackState(projectID)
       projectCollectionExportText.value = ''
+      evidencePackExportText.value = ''
       healthAuthorityPackExportText.value = ''
     }
     connected.value = true
@@ -995,6 +1164,28 @@ const refreshProjectCollection = async () => {
     projectError.value = error instanceof Error ? error.message : String(error)
   } finally {
     projectCollectionLoading.value = false
+  }
+}
+
+const refreshEvidencePack = async () => {
+  if (!token.value || evidencePackLoading.value) {
+    return
+  }
+  const projectID = selectedProjectID.value || 'health'
+  evidencePackLoading.value = true
+  projectError.value = ''
+  try {
+    const previousPackID = evidencePack.value?.pack_id || previousEvidencePackID.value
+    evidencePack.value = await client.value.getProjectEvidencePack(projectID, 25)
+    previousEvidencePackID.value = previousPackID || evidencePack.value?.pack_id || ''
+    evidencePackDiff.value = null
+    evidencePackExportText.value = ''
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    evidencePackLoading.value = false
   }
 }
 
@@ -1038,6 +1229,54 @@ const previewProjectCollectionExport = async () => {
     projectError.value = error instanceof Error ? error.message : String(error)
   } finally {
     projectCollectionExportLoading.value = false
+  }
+}
+
+const previewEvidencePackExport = async () => {
+  if (!token.value || evidencePackExportLoading.value) {
+    return
+  }
+  const projectID = selectedProjectID.value || 'health'
+  evidencePackExportLoading.value = true
+  projectError.value = ''
+  try {
+    const text = await client.value.getProjectEvidencePackExport(projectID, 25)
+    if (selectedProjectID.value === projectID) {
+      evidencePackExportText.value = text
+        .trim()
+        .split('\n')
+        .slice(0, 8)
+        .join('\n')
+    }
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    evidencePackExportLoading.value = false
+  }
+}
+
+const loadEvidencePackDiff = async () => {
+  if (!token.value || evidencePackDiffLoading.value) {
+    return
+  }
+  const projectID = selectedProjectID.value || 'health'
+  const previousPackID = previousEvidencePackID.value.trim()
+  if (!previousPackID) {
+    projectError.value = 'previous_pack_id is required'
+    return
+  }
+  evidencePackDiffLoading.value = true
+  projectError.value = ''
+  try {
+    evidencePackDiff.value = await client.value.getProjectEvidencePackDiff(projectID, previousPackID, 25)
+    connected.value = true
+  } catch (error) {
+    connected.value = false
+    projectError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    evidencePackDiffLoading.value = false
   }
 }
 

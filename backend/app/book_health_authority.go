@@ -11,18 +11,21 @@ const HealthAuthorityPackContractV1 = "health_authority_pack_v1"
 const healthAuthorityPackCandidateEducationContext = "education_context_candidate"
 
 type HealthAuthorityPack struct {
-	ConsumerContract string                      `json:"consumer_contract"`
-	ProjectID        string                      `json:"project_id"`
-	TargetSystem     string                      `json:"target_system"`
-	GeneratedAt      string                      `json:"generated_at"`
-	ItemCount        int                         `json:"item_count"`
-	ReviewableCount  int                         `json:"reviewable_count"`
-	BlockedCount     int                         `json:"blocked_count"`
-	RiskReasonCounts map[string]int              `json:"risk_reason_counts"`
-	Items            []HealthAuthorityPackRecord `json:"items"`
+	ConsumerContract  string                      `json:"consumer_contract"`
+	ProjectID         string                      `json:"project_id"`
+	TargetSystem      string                      `json:"target_system"`
+	BasePackID        string                      `json:"base_pack_id,omitempty"`
+	SourceFingerprint string                      `json:"source_fingerprint,omitempty"`
+	GeneratedAt       string                      `json:"generated_at"`
+	ItemCount         int                         `json:"item_count"`
+	ReviewableCount   int                         `json:"reviewable_count"`
+	BlockedCount      int                         `json:"blocked_count"`
+	RiskReasonCounts  map[string]int              `json:"risk_reason_counts"`
+	Items             []HealthAuthorityPackRecord `json:"items"`
 }
 
 type HealthAuthorityPackRecord struct {
+	EvidenceID        string                    `json:"evidence_id,omitempty"`
 	ProjectID         string                    `json:"project_id"`
 	TargetSystem      string                    `json:"target_system"`
 	BookID            string                    `json:"book_id"`
@@ -48,6 +51,8 @@ type HealthAuthorityPackRecord struct {
 }
 
 type HealthAuthoritySourceRefs struct {
+	SourceType   string   `json:"source_type,omitempty"`
+	SourceID     string   `json:"source_id,omitempty"`
 	BookID       string   `json:"book_id"`
 	BookTitle    string   `json:"book_title"`
 	ChapterID    string   `json:"chapter_id,omitempty"`
@@ -58,21 +63,23 @@ type HealthAuthoritySourceRefs struct {
 }
 
 type HealthAuthorityPackExportRecord struct {
-	ConsumerContract string `json:"consumer_contract"`
-	GeneratedAt      string `json:"generated_at"`
+	ConsumerContract  string `json:"consumer_contract"`
+	BasePackID        string `json:"base_pack_id,omitempty"`
+	SourceFingerprint string `json:"source_fingerprint,omitempty"`
+	GeneratedAt       string `json:"generated_at"`
 	HealthAuthorityPackRecord
 }
 
 func (s *BookKnowledgeStore) BuildHealthAuthorityPack(limit int) (*HealthAuthorityPack, error) {
-	collection, err := s.RefreshProjectCollection(BookKnowledgeProjectHealth, limit)
+	basePack, err := s.BuildVerifiedEvidencePack(BookKnowledgeProjectHealth, limit)
 	if err != nil {
 		return nil, err
 	}
-	items := make([]HealthAuthorityPackRecord, 0, len(collection.Items))
+	items := make([]HealthAuthorityPackRecord, 0, len(basePack.Records))
 	riskReasonCounts := map[string]int{}
 	blockedCount := 0
-	for _, item := range collection.Items {
-		record := healthAuthorityPackRecordFromCollection(collection, item)
+	for _, item := range basePack.Records {
+		record := healthAuthorityPackRecordFromEvidence(basePack, item)
 		items = append(items, record)
 		riskReasonCounts[record.RiskReason]++
 		if record.ReviewStatus == "blocked" {
@@ -80,15 +87,17 @@ func (s *BookKnowledgeStore) BuildHealthAuthorityPack(limit int) (*HealthAuthori
 		}
 	}
 	return &HealthAuthorityPack{
-		ConsumerContract: HealthAuthorityPackContractV1,
-		ProjectID:        collection.ProjectID,
-		TargetSystem:     collection.Project.TargetSystem,
-		GeneratedAt:      collection.GeneratedAt,
-		ItemCount:        len(items),
-		ReviewableCount:  len(items) - blockedCount,
-		BlockedCount:     blockedCount,
-		RiskReasonCounts: riskReasonCounts,
-		Items:            items,
+		ConsumerContract:  HealthAuthorityPackContractV1,
+		ProjectID:         basePack.ProjectID,
+		TargetSystem:      basePack.TargetSystem,
+		BasePackID:        basePack.PackID,
+		SourceFingerprint: basePack.SourceFingerprint,
+		GeneratedAt:       basePack.GeneratedAt,
+		ItemCount:         len(items),
+		ReviewableCount:   len(items) - blockedCount,
+		BlockedCount:      blockedCount,
+		RiskReasonCounts:  riskReasonCounts,
+		Items:             items,
 	}, nil
 }
 
@@ -103,6 +112,8 @@ func (s *BookKnowledgeStore) ExportHealthAuthorityPackJSONL(limit int) ([]byte, 
 	for _, item := range pack.Items {
 		record := HealthAuthorityPackExportRecord{
 			ConsumerContract:          pack.ConsumerContract,
+			BasePackID:                pack.BasePackID,
+			SourceFingerprint:         pack.SourceFingerprint,
 			GeneratedAt:               pack.GeneratedAt,
 			HealthAuthorityPackRecord: item,
 		}
@@ -113,22 +124,24 @@ func (s *BookKnowledgeStore) ExportHealthAuthorityPackJSONL(limit int) ([]byte, 
 	return out.Bytes(), nil
 }
 
-func healthAuthorityPackRecordFromCollection(collection *BookKnowledgeProjectCollection, item BookKnowledgeProjectCollectionItem) HealthAuthorityPackRecord {
+func healthAuthorityPackRecordFromEvidence(pack *VerifiedEvidencePack, item VerifiedEvidencePackRecord) HealthAuthorityPackRecord {
+	text := item.Title + " " + item.Summary
 	riskTier := item.RiskTier
 	decision := item.Decision
-	if containsHealthSensitiveTerm(item.Title+" "+item.Summary) && riskTier == bookKnowledgeRiskAutoUsable {
+	if containsHealthSensitiveTerm(text) && riskTier == bookKnowledgeRiskAutoUsable {
 		riskTier = bookKnowledgeRiskAssistive
 		decision = bookKnowledgeDecisionAssist
 	}
-	claimID := healthAuthorityPackClaimID(item)
-	reviewStatus, riskReason := healthAuthorityReviewMetadata(item)
+	claimID := item.EvidenceID
+	reviewStatus, riskReason := healthAuthorityReviewMetadata(text)
 	return HealthAuthorityPackRecord{
-		ProjectID:         item.ProjectID,
-		TargetSystem:      collection.Project.TargetSystem,
-		BookID:            item.BookID,
-		BookTitle:         item.BookTitle,
-		ChapterID:         item.ChapterID,
-		ChapterTitle:      item.ChapterTitle,
+		EvidenceID:        item.EvidenceID,
+		ProjectID:         pack.ProjectID,
+		TargetSystem:      pack.TargetSystem,
+		BookID:            item.SourceRefs.SourceID,
+		BookTitle:         item.SourceRefs.SourceTitle,
+		ChapterID:         item.SourceRefs.SectionID,
+		ChapterTitle:      item.SourceRefs.SectionTitle,
 		ClaimID:           claimID,
 		Title:             item.Title,
 		Summary:           item.Summary,
@@ -138,34 +151,29 @@ func healthAuthorityPackRecordFromCollection(collection *BookKnowledgeProjectCol
 		CandidateType:     healthAuthorityPackCandidateEducationContext,
 		ReviewStatus:      reviewStatus,
 		RiskReason:        riskReason,
-		EntityCandidates:  healthAuthorityEntityCandidates(item),
-		AllowedUses:       healthAuthorityAllowedUses(item),
+		EntityCandidates:  firstNonEmptySlice(item.Entities, healthAuthorityEntityCandidatesForText(text)),
+		AllowedUses:       healthAuthorityAllowedUsesForText(text),
 		BlockedUses:       healthAuthorityBlockedUses(),
 		RiskFlags:         append([]string(nil), item.RiskFlags...),
-		Citations:         append([]string(nil), item.Citations...),
-		SourceHash:        item.SourceHash,
+		Citations:         append([]string(nil), item.SourceRefs.Citations...),
+		SourceHash:        item.SourceRefs.SourceHash,
 		SourceRefs: HealthAuthoritySourceRefs{
-			BookID:       item.BookID,
-			BookTitle:    item.BookTitle,
-			ChapterID:    item.ChapterID,
-			ChapterTitle: item.ChapterTitle,
+			SourceType:   item.SourceRefs.SourceType,
+			SourceID:     item.SourceRefs.SourceID,
+			BookID:       item.SourceRefs.SourceID,
+			BookTitle:    item.SourceRefs.SourceTitle,
+			ChapterID:    item.SourceRefs.SectionID,
+			ChapterTitle: item.SourceRefs.SectionTitle,
 			ClaimID:      claimID,
-			Citations:    append([]string(nil), item.Citations...),
-			SourceHash:   item.SourceHash,
+			Citations:    append([]string(nil), item.SourceRefs.Citations...),
+			SourceHash:   item.SourceRefs.SourceHash,
 		},
 	}
 }
 
-func healthAuthorityPackClaimID(item BookKnowledgeProjectCollectionItem) string {
-	if strings.HasPrefix(item.ClaimID, "dedao:") {
-		return item.ClaimID
-	}
-	return "dedao:" + item.BookID + ":" + item.ClaimID
-}
-
-func healthAuthorityAllowedUses(item BookKnowledgeProjectCollectionItem) []string {
+func healthAuthorityAllowedUsesForText(text string) []string {
 	allowedUses := []string{"health_education", "context_retrieval"}
-	if !containsHealthSensitiveTerm(item.Title + " " + item.Summary) {
+	if !containsHealthSensitiveTerm(text) {
 		allowedUses = append(allowedUses, "question_preparation")
 	}
 	return allowedUses
@@ -175,8 +183,7 @@ func healthAuthorityBlockedUses() []string {
 	return []string{"diagnosis", "treatment", "dosage", "medication_change", "emergency_guidance"}
 }
 
-func healthAuthorityReviewMetadata(item BookKnowledgeProjectCollectionItem) (string, string) {
-	text := item.Title + " " + item.Summary
+func healthAuthorityReviewMetadata(text string) (string, string) {
 	if containsHealthActionBoundaryTerm(text) {
 		return "blocked", "medical_action_boundary"
 	}
@@ -187,7 +194,10 @@ func healthAuthorityReviewMetadata(item BookKnowledgeProjectCollectionItem) (str
 }
 
 func healthAuthorityEntityCandidates(item BookKnowledgeProjectCollectionItem) []string {
-	text := item.Title + " " + item.Summary
+	return healthAuthorityEntityCandidatesForText(item.Title + " " + item.Summary)
+}
+
+func healthAuthorityEntityCandidatesForText(text string) []string {
 	candidates := []string{}
 	add := func(value string) {
 		for _, existing := range candidates {
@@ -213,6 +223,13 @@ func healthAuthorityEntityCandidates(item BookKnowledgeProjectCollectionItem) []
 		add("健康教育")
 	}
 	return candidates
+}
+
+func firstNonEmptySlice(primary, fallback []string) []string {
+	if len(primary) > 0 {
+		return append([]string(nil), primary...)
+	}
+	return append([]string(nil), fallback...)
 }
 
 func containsHealthActionBoundaryTerm(text string) bool {

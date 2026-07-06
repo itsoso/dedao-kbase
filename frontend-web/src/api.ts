@@ -319,6 +319,7 @@ export interface BookKnowledgeProjectAuditQueue {
 }
 
 export interface HealthAuthorityPackRecord {
+  evidence_id?: string
   project_id: string
   target_system: string
   book_id: string
@@ -341,6 +342,8 @@ export interface HealthAuthorityPackRecord {
   citations?: string[]
   source_hash: string
   source_refs: {
+    source_type?: string
+    source_id?: string
     book_id: string
     book_title: string
     chapter_id?: string
@@ -355,12 +358,117 @@ export interface HealthAuthorityPack {
   consumer_contract: string
   project_id: string
   target_system: string
+  base_pack_id?: string
+  source_fingerprint?: string
   generated_at: string
   item_count: number
   reviewable_count: number
   blocked_count: number
   risk_reason_counts: Record<string, number>
   items: HealthAuthorityPackRecord[]
+}
+
+export interface VerifiedEvidenceSourceRefs {
+  source_type: string
+  source_id: string
+  source_title: string
+  section_id?: string
+  section_title?: string
+  claim_id: string
+  citations?: string[]
+  source_hash: string
+}
+
+export interface VerifiedEvidenceAudit {
+  review_status: string
+  audit_status: string
+  sample_reason?: string
+  recommended_actions?: string[]
+}
+
+export interface VerifiedEvidencePackRecord {
+  evidence_id: string
+  source_refs: VerifiedEvidenceSourceRefs
+  title: string
+  summary: string
+  normalized_claim: string
+  verification_score: number
+  quality_status: string
+  risk_tier: string
+  decision: string
+  allowed_uses?: string[]
+  blocked_uses?: string[]
+  risk_flags?: string[]
+  risk_reason?: string
+  failure_reasons?: string[]
+  entities?: string[]
+  audit: VerifiedEvidenceAudit
+}
+
+export interface VerifiedEvidencePackQualitySummary {
+  total: number
+  accepted: number
+  assistive: number
+  blocked: number
+  invalid: number
+  missing_source_refs: number
+}
+
+export interface VerifiedEvidencePack {
+  consumer_contract: string
+  schema_version: string
+  pack_id: string
+  project_id: string
+  target_system: string
+  export_type: string
+  generated_at: string
+  source_fingerprint: string
+  source_unchanged: boolean
+  quality_summary: VerifiedEvidencePackQualitySummary
+  policy: {
+    default_allowed_uses?: string[]
+    default_blocked_uses?: string[]
+    human_loop: string
+  }
+  records: VerifiedEvidencePackRecord[]
+}
+
+export interface VerifiedEvidencePackDiffRecord {
+  evidence_id: string
+  change_type: string
+  changed_fields?: string[]
+  source_refs: VerifiedEvidenceSourceRefs
+  current_risk_tier?: string
+  previous_risk_tier?: string
+  current_decision?: string
+  previous_decision?: string
+  current_source_hash?: string
+  previous_source_hash?: string
+  current_normalized_claim?: string
+  previous_normalized_claim?: string
+}
+
+export interface VerifiedEvidencePackDiff {
+  consumer_contract: string
+  schema_version: string
+  project_id: string
+  target_system: string
+  current_pack_id: string
+  previous_pack_id: string
+  current_source_fingerprint: string
+  previous_source_fingerprint: string
+  source_unchanged: boolean
+  counts: {
+    added: number
+    removed: number
+    changed: number
+    unchanged: number
+    blocked: number
+  }
+  added: VerifiedEvidencePackDiffRecord[]
+  removed: VerifiedEvidencePackDiffRecord[]
+  changed: VerifiedEvidencePackDiffRecord[]
+  unchanged: VerifiedEvidencePackDiffRecord[]
 }
 
 export interface BookKnowledgeJob {
@@ -845,6 +953,24 @@ export class KBaseClient {
 
   async getProjectCollectionExport(projectID: string): Promise<string> {
     return this.requestText(`/api/projects/${encodeURIComponent(projectID)}/collection/export?format=jsonl`)
+  }
+
+  async getProjectEvidencePack(projectID: string, limit = 25): Promise<VerifiedEvidencePack> {
+    return this.request<VerifiedEvidencePack>(
+      `/api/projects/${encodeURIComponent(projectID)}/evidence-pack?limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async getProjectEvidencePackExport(projectID: string, limit = 25): Promise<string> {
+    return this.requestText(
+      `/api/projects/${encodeURIComponent(projectID)}/evidence-pack/export?format=jsonl&limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async getProjectEvidencePackDiff(projectID: string, previousPackID: string, limit = 25): Promise<VerifiedEvidencePackDiff> {
+    return this.request<VerifiedEvidencePackDiff>(
+      `/api/projects/${encodeURIComponent(projectID)}/evidence-pack/diff?previous_pack_id=${encodeURIComponent(previousPackID)}&limit=${encodeURIComponent(String(limit))}`,
+    )
   }
 
   async getHealthAuthorityPack(limit = 25): Promise<HealthAuthorityPack> {

@@ -544,11 +544,136 @@ func TestKBaseHTTPHandlerExportsProjectCollectionJSONL(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesVerifiedEvidencePack(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	healthTargetSystem := testProjectTargetSystem(t, BookKnowledgeProjectHealth)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("evidence pack without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	packResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack?limit=10", "secret-token")
+	if packResp.Code != http.StatusOK {
+		t.Fatalf("evidence pack status = %d, body=%s", packResp.Code, packResp.Body.String())
+	}
+	packBody := packResp.Body.String()
+	for _, want := range []string{
+		`"consumer_contract":"verified_evidence_pack_v1"`,
+		`"project_id":"health"`,
+		fmt.Sprintf(`"target_system":"%s"`, healthTargetSystem),
+		`"pack_id"`,
+		`"source_fingerprint"`,
+		`"source_unchanged":false`,
+		`"quality_summary"`,
+		`"evidence_id":"dedao:verify-book:verify-claim-study"`,
+		`"source_type":"dedao_book_claim"`,
+		`"source_refs"`,
+		`"recommended_actions"`,
+	} {
+		if !strings.Contains(packBody, want) {
+			t.Fatalf("evidence pack response missing %q: %s", want, packBody)
+		}
+	}
+	for _, forbidden := range []string{"/tmp/", "secret-token", "verify-book.html"} {
+		if strings.Contains(packBody, forbidden) {
+			t.Fatalf("evidence pack response leaked %q: %s", forbidden, packBody)
+		}
+	}
+	var servedPack VerifiedEvidencePack
+	if err := json.Unmarshal(packResp.Body.Bytes(), &servedPack); err != nil {
+		t.Fatalf("evidence pack response is not JSON: %v", err)
+	}
+	missingDiffResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack/diff?previous_pack_id=missing-pack", "secret-token")
+	if missingDiffResp.Code != http.StatusNotFound ||
+		!strings.Contains(missingDiffResp.Body.String(), "previous_pack_not_found") {
+		t.Fatalf("missing previous diff status/body = %d %s, want 404 previous_pack_not_found", missingDiffResp.Code, missingDiffResp.Body.String())
+	}
+	if err := store.SavePackage(mutatedBookKnowledgePackageForEvidenceDiff()); err != nil {
+		t.Fatalf("SavePackage mutated returned error: %v", err)
+	}
+	diffResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack/diff?previous_pack_id="+servedPack.PackID+"&limit=10", "secret-token")
+	if diffResp.Code != http.StatusOK {
+		t.Fatalf("evidence pack diff status = %d, body=%s", diffResp.Code, diffResp.Body.String())
+	}
+	diffBody := diffResp.Body.String()
+	for _, want := range []string{
+		`"previous_pack_id":"` + servedPack.PackID + `"`,
+		`"added":1`,
+		`"removed":1`,
+		`"changed":1`,
+		`"unchanged":1`,
+		`"changed_fields":["normalized_claim","source_hash"]`,
+		`"evidence_id":"dedao:verify-book:verify-claim-new"`,
+		`"evidence_id":"dedao:verify-book:verify-claim-unsupported"`,
+	} {
+		if !strings.Contains(diffBody, want) {
+			t.Fatalf("evidence pack diff missing %q: %s", want, diffBody)
+		}
+	}
+
+	exportResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack/export?format=jsonl&limit=10", "secret-token")
+	if exportResp.Code != http.StatusOK {
+		t.Fatalf("evidence pack export status = %d, body=%s", exportResp.Code, exportResp.Body.String())
+	}
+	if contentType := exportResp.Header().Get("Content-Type"); !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("evidence pack export content-type = %q, want ndjson", contentType)
+	}
+	lines := strings.Split(strings.TrimSpace(exportResp.Body.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("evidence pack export line count = %d, want 3; body=%s", len(lines), exportResp.Body.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first evidence pack line is not JSON: %v; line=%s", err, lines[0])
+	}
+	for _, key := range []string{
+		"consumer_contract",
+		"pack_id",
+		"project_id",
+		"target_system",
+		"evidence_id",
+		"source_refs",
+		"source_fingerprint",
+		"risk_tier",
+		"decision",
+		"allowed_uses",
+		"blocked_uses",
+		"audit",
+	} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("first evidence pack line missing %q: %#v", key, first)
+		}
+	}
+	if first["consumer_contract"] != VerifiedEvidencePackContractV1 ||
+		first["project_id"] != "health" ||
+		first["target_system"] != healthTargetSystem {
+		t.Fatalf("first evidence pack line has wrong identity fields: %#v", first)
+	}
+
+	badFormatResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack/export?format=json", "secret-token")
+	if badFormatResp.Code != http.StatusBadRequest {
+		t.Fatalf("bad evidence pack format status = %d, want 400", badFormatResp.Code)
+	}
+	unknownResp := requestKBase(handler, http.MethodGet, "/api/projects/unknown/evidence-pack", "secret-token")
+	if unknownResp.Code != http.StatusNotFound {
+		t.Fatalf("unknown evidence pack status = %d, want 404", unknownResp.Code)
+	}
+}
+
 func TestKBaseHTTPHandlerServesHealthAuthorityPack(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
 		t.Fatalf("SavePackage returned error: %v", err)
 	}
+	healthTargetSystem := testProjectTargetSystem(t, BookKnowledgeProjectHealth)
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:     store,
 		AuthToken: "secret-token",
@@ -567,7 +692,10 @@ func TestKBaseHTTPHandlerServesHealthAuthorityPack(t *testing.T) {
 	for _, want := range []string{
 		`"consumer_contract":"health_authority_pack_v1"`,
 		`"project_id":"health"`,
-		`"target_system":"health-llm-driven"`,
+		fmt.Sprintf(`"target_system":"%s"`, healthTargetSystem),
+		`"base_pack_id"`,
+		`"source_fingerprint"`,
+		`"evidence_id":"dedao:verify-book:verify-claim-medication"`,
 		`"claim_id":"dedao:verify-book:verify-claim-medication"`,
 		`"candidate_type":"education_context_candidate"`,
 		`"review_status":"blocked"`,
@@ -575,6 +703,7 @@ func TestKBaseHTTPHandlerServesHealthAuthorityPack(t *testing.T) {
 		`"entity_candidates":["用药安全"]`,
 		`"blocked_uses":["diagnosis","treatment","dosage","medication_change","emergency_guidance"]`,
 		`"source_refs"`,
+		`"source_type":"dedao_book_claim"`,
 		`"source_hash"`,
 	} {
 		if !strings.Contains(refreshBody, want) {
@@ -604,6 +733,7 @@ func TestKBaseHTTPHandlerExportsHealthAuthorityPackJSONL(t *testing.T) {
 	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
 		t.Fatalf("SavePackage returned error: %v", err)
 	}
+	healthTargetSystem := testProjectTargetSystem(t, BookKnowledgeProjectHealth)
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:     store,
 		AuthToken: "secret-token",
@@ -629,8 +759,10 @@ func TestKBaseHTTPHandlerExportsHealthAuthorityPackJSONL(t *testing.T) {
 		"generated_at",
 		"project_id",
 		"target_system",
+		"evidence_id",
 		"claim_id",
 		"source_hash",
+		"source_fingerprint",
 		"citations",
 		"candidate_type",
 		"review_status",
@@ -646,7 +778,7 @@ func TestKBaseHTTPHandlerExportsHealthAuthorityPackJSONL(t *testing.T) {
 	}
 	if first["consumer_contract"] != "health_authority_pack_v1" ||
 		first["project_id"] != "health" ||
-		first["target_system"] != "health-llm-driven" ||
+		first["target_system"] != healthTargetSystem ||
 		first["candidate_type"] != healthAuthorityPackCandidateEducationContext {
 		t.Fatalf("first authority pack line has wrong identity fields: %#v", first)
 	}
@@ -657,6 +789,80 @@ func TestKBaseHTTPHandlerExportsHealthAuthorityPackJSONL(t *testing.T) {
 	badFormatResp := requestKBase(handler, http.MethodGet, "/api/projects/health/authority-pack/export?format=json", "secret-token")
 	if badFormatResp.Code != http.StatusBadRequest {
 		t.Fatalf("bad authority pack format status = %d, want 400", badFormatResp.Code)
+	}
+}
+
+func TestKBaseHTTPHandlerServesProofroomArgumentPack(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	unauthorizedResp := requestKBase(handler, http.MethodGet, "/api/projects/proofroom/proofroom-pack", "")
+	if unauthorizedResp.Code != http.StatusUnauthorized {
+		t.Fatalf("proofroom pack without bearer = %d, want 401", unauthorizedResp.Code)
+	}
+
+	packResp := requestKBase(handler, http.MethodGet, "/api/projects/proofroom/proofroom-pack?limit=10", "secret-token")
+	if packResp.Code != http.StatusOK {
+		t.Fatalf("proofroom pack status = %d, body=%s", packResp.Code, packResp.Body.String())
+	}
+	packBody := packResp.Body.String()
+	for _, want := range []string{
+		`"consumer_contract":"proofroom_argument_pack_v1"`,
+		`"project_id":"proofroom"`,
+		`"target_system":"proofroom"`,
+		`"base_pack_id"`,
+		`"source_fingerprint"`,
+		`"evidence_id":"dedao:verify-book:verify-claim-study"`,
+		`"argument_roles":["claim","support","counterpoint","question"]`,
+		`"contradiction_candidate":true`,
+		`"review_status":"needs_source_review"`,
+		`"source_type":"dedao_book_claim"`,
+	} {
+		if !strings.Contains(packBody, want) {
+			t.Fatalf("proofroom pack response missing %q: %s", want, packBody)
+		}
+	}
+
+	exportResp := requestKBase(handler, http.MethodGet, "/api/projects/proofroom/proofroom-pack/export?format=jsonl&limit=10", "secret-token")
+	if exportResp.Code != http.StatusOK {
+		t.Fatalf("proofroom pack export status = %d, body=%s", exportResp.Code, exportResp.Body.String())
+	}
+	if contentType := exportResp.Header().Get("Content-Type"); !strings.Contains(contentType, "application/x-ndjson") {
+		t.Fatalf("proofroom pack export content-type = %q, want ndjson", contentType)
+	}
+	lines := strings.Split(strings.TrimSpace(exportResp.Body.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("proofroom pack export line count = %d, want 3; body=%s", len(lines), exportResp.Body.String())
+	}
+	var first map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatalf("first proofroom pack line is not JSON: %v; line=%s", err, lines[0])
+	}
+	for _, key := range []string{
+		"consumer_contract",
+		"base_pack_id",
+		"source_fingerprint",
+		"project_id",
+		"target_system",
+		"evidence_id",
+		"source_refs",
+		"argument_roles",
+		"review_status",
+	} {
+		if _, ok := first[key]; !ok {
+			t.Fatalf("first proofroom pack line missing %q: %#v", key, first)
+		}
+	}
+
+	healthResp := requestKBase(handler, http.MethodGet, "/api/projects/health/proofroom-pack", "secret-token")
+	if healthResp.Code != http.StatusNotFound {
+		t.Fatalf("health proofroom pack status = %d, want 404", healthResp.Code)
 	}
 }
 
@@ -2035,6 +2241,15 @@ func sampleBookKnowledgePackageWithID(bookID, title string) BookKnowledgePackage
 		pkg.Citations[i].CitationID = bookID + "-citation-1"
 	}
 	return pkg
+}
+
+func testProjectTargetSystem(t *testing.T, projectID string) string {
+	t.Helper()
+	project, ok := BookKnowledgeProjectByID(projectID)
+	if !ok {
+		t.Fatalf("project %q not found", projectID)
+	}
+	return project.TargetSystem
 }
 
 func requestKBase(handler http.Handler, method, path, token string) *httptest.ResponseRecorder {

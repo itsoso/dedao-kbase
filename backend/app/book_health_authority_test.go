@@ -16,6 +16,9 @@ func TestBuildHealthAuthorityPackDowngradesHighRiskClaims(t *testing.T) {
 	if pack.ConsumerContract != HealthAuthorityPackContractV1 {
 		t.Fatalf("ConsumerContract = %q, want %q", pack.ConsumerContract, HealthAuthorityPackContractV1)
 	}
+	if pack.BasePackID == "" || pack.SourceFingerprint == "" {
+		t.Fatalf("base evidence metadata is incomplete: %#v", pack)
+	}
 
 	record := findHealthAuthorityPackRecord(t, pack, "dedao:verify-book:verify-claim-medication")
 	if record.RiskTier == bookKnowledgeRiskAutoUsable {
@@ -44,8 +47,14 @@ func TestBuildHealthAuthorityPackKeepsStableSourceRefs(t *testing.T) {
 
 	firstRecord := findHealthAuthorityPackRecord(t, first, "dedao:verify-book:verify-claim-medication")
 	secondRecord := findHealthAuthorityPackRecord(t, second, "dedao:verify-book:verify-claim-medication")
+	if first.SourceFingerprint == "" || first.SourceFingerprint != second.SourceFingerprint {
+		t.Fatalf("SourceFingerprint changed between builds: %q != %q", first.SourceFingerprint, second.SourceFingerprint)
+	}
 	if firstRecord.BookID != "verify-book" {
 		t.Fatalf("BookID = %q, want verify-book", firstRecord.BookID)
+	}
+	if firstRecord.EvidenceID != "dedao:verify-book:verify-claim-medication" {
+		t.Fatalf("EvidenceID = %q, want stable base evidence id", firstRecord.EvidenceID)
 	}
 	if firstRecord.ChapterID != "verify-chapter-1" {
 		t.Fatalf("ChapterID = %q, want verify-chapter-1", firstRecord.ChapterID)
@@ -79,6 +88,9 @@ func TestBuildHealthAuthorityPackAddsReviewMetadata(t *testing.T) {
 	}
 	if study.SourceRefs.BookID != study.BookID || study.SourceRefs.ChapterID != study.ChapterID || study.SourceRefs.ClaimID != study.ClaimID {
 		t.Fatalf("SourceRefs do not mirror stable identity fields: %#v", study.SourceRefs)
+	}
+	if study.SourceRefs.SourceType != verifiedEvidenceSourceTypeDedaoBook || study.SourceRefs.SourceID != study.BookID {
+		t.Fatalf("SourceRefs do not preserve base source identity: %#v", study.SourceRefs)
 	}
 	if !reflect.DeepEqual(study.SourceRefs.Citations, study.Citations) {
 		t.Fatalf("SourceRefs.Citations = %#v, want %#v", study.SourceRefs.Citations, study.Citations)
