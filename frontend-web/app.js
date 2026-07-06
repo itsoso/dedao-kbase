@@ -37,8 +37,13 @@ const wcplusState = {
   articleNum: 20,
   importLimit: 10,
   exportRecentNum: 100,
+  taskCrawlerType: "gzh_article_link",
+  taskArticleListType: "all",
+  taskArticleListAmount: 20,
   batchNicknames: "",
   batchExactMatch: true,
+  batchArticleListType: "all",
+  batchArticleListAmount: 0,
   loading: "",
   message: "",
 };
@@ -163,7 +168,8 @@ function renderShell(content, current = "") {
       <nav class="web-nav" aria-label="主导航">
         <a class="${current === "home" ? "active" : ""}" href="/">首页</a>
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信来源</a>
-        <a href="/book-knowledge">书籍知识库</a>
+        <a class="${current === "wcplus" ? "active" : ""}" href="/wcplus-source">WC Plus</a>
+        <a class="${current === "knowledge" ? "active" : ""}" href="/book-knowledge">书籍知识库</a>
       </nav>
     </header>
     ${content}
@@ -179,6 +185,7 @@ function renderHome() {
         <p>从公众号文章开始，下载、预览并导入到书籍知识库，再交给 Health 和 Proofroom 使用。</p>
         <div class="web-home__actions">
           <a class="button button-primary" href="/wechat-source">导入微信公众号文章</a>
+          <a class="button button-ghost" href="/wcplus-source">打开 WC Plus 工作台</a>
           <a class="button button-ghost" href="/book-knowledge">查看书籍知识库</a>
         </div>
       </section>
@@ -425,6 +432,33 @@ function renderWeChatSource() {
   bindWCPlusEvents();
 }
 
+function renderWCPlusPage() {
+  const status = wcplusState.loading
+    ? `<div class="web-status">处理中：${escapeHTML(wcplusState.loading)}</div>`
+    : (wcplusState.message ? `<div class="web-status">${escapeHTML(wcplusState.message)}</div>` : "");
+  renderShell(`
+    <main class="wechat-source wcplus-page">
+      <section class="wechat-source__header">
+        <div>
+          <p class="web-kicker">WC Plus Source</p>
+          <h1>WC Plus 公众号工作台</h1>
+        </div>
+        ${status}
+      </section>
+      ${renderWCPlusSource(false)}
+    </main>
+  `, "wcplus");
+  bindWCPlusEvents();
+}
+
+function refreshWCPlusView() {
+  if (window.location.pathname.startsWith("/wcplus-source")) {
+    renderWCPlusPage();
+    return;
+  }
+  renderWeChatSource();
+}
+
 function firstValue(value, keys) {
   for (const key of keys) {
     const found = value?.[key];
@@ -480,7 +514,7 @@ function wcplusArticlePublishTime(article) {
   return String(firstValue(article, ["publish_time", "PublishTime", "p_date_text", "PDateText"]) || "");
 }
 
-function renderWCPlusSource() {
+function renderWCPlusSource(showOwnStatus = true) {
   const accountRows = wcplusState.accounts.map((account, index) => {
     const active = wcplusAccountBiz(account) === wcplusAccountBiz(wcplusState.selectedAccount) ? " active" : "";
     const nickname = wcplusAccountNickname(account) || "未命名公众号";
@@ -559,7 +593,7 @@ function renderWCPlusSource() {
           <button id="wcplus-run-queue" class="button button-ghost" type="button">启动队列</button>
         </div>
       </div>
-      ${status}
+      ${showOwnStatus ? status : ""}
       <div class="wcplus-source__grid">
         <aside class="wcplus-source__panel">
           <form id="wcplus-search-form" class="source-form source-form--flat">
@@ -579,6 +613,16 @@ function renderWCPlusSource() {
             </label>
             <button class="button button-primary" type="submit">搜索</button>
           </form>
+          <form id="wcplus-account-options-form" class="wcplus-source__mini-form">
+            <label>
+              <span>每页</span>
+              <input name="accountNum" type="number" min="1" max="100" value="${escapeAttribute(wcplusState.accountNum)}">
+            </label>
+            <div class="wcplus-source__pager">
+              <button class="button button-ghost" type="button" data-wcplus-account-page="-1" ${wcplusState.accountOffset <= 0 ? "disabled" : ""}>上一页</button>
+              <button class="button button-ghost" type="button" data-wcplus-account-page="1">下一页</button>
+            </div>
+          </form>
           <div class="wcplus-source__accounts">
             ${accountRows || "<p class=\"web-muted\">启动 WC Plus 本地服务后，可加载已同步公众号。</p>"}
           </div>
@@ -596,6 +640,43 @@ function renderWCPlusSource() {
               <button id="wcplus-export-csv" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>导出 CSV</button>
               <button id="wcplus-import-account" class="button button-primary" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>批量导入</button>
             </div>
+          </div>
+          <form id="wcplus-work-options-form" class="wcplus-source__options">
+            <label>
+              <span>任务类型</span>
+              <select name="taskCrawlerType">
+                <option value="gzh_article_link" ${wcplusState.taskCrawlerType === "gzh_article_link" ? "selected" : ""}>公众号链接</option>
+                <option value="article" ${wcplusState.taskCrawlerType === "article" ? "selected" : ""}>文章内容</option>
+                <option value="gzh" ${wcplusState.taskCrawlerType === "gzh" ? "selected" : ""}>公众号信息</option>
+              </select>
+            </label>
+            <label>
+              <span>抓取范围</span>
+              <select name="taskArticleListType">
+                <option value="all" ${wcplusState.taskArticleListType === "all" ? "selected" : ""}>全部</option>
+                <option value="amount" ${wcplusState.taskArticleListType === "amount" ? "selected" : ""}>指定篇数</option>
+              </select>
+            </label>
+            <label>
+              <span>抓取篇数</span>
+              <input name="articleListAmount" type="number" min="0" max="1000" value="${escapeAttribute(wcplusState.taskArticleListAmount)}">
+            </label>
+            <label>
+              <span>导入篇数</span>
+              <input name="importLimit" type="number" min="1" max="100" value="${escapeAttribute(wcplusState.importLimit)}">
+            </label>
+            <label>
+              <span>最近导出</span>
+              <input name="exportRecentNum" type="number" min="1" max="5000" value="${escapeAttribute(wcplusState.exportRecentNum)}">
+            </label>
+            <label>
+              <span>文章每页</span>
+              <input name="articleNum" type="number" min="1" max="100" value="${escapeAttribute(wcplusState.articleNum)}">
+            </label>
+          </form>
+          <div class="wcplus-source__pager is-article">
+            <button class="button button-ghost" type="button" data-wcplus-article-page="-1" ${wcplusState.articleOffset <= 0 ? "disabled" : ""}>上一页</button>
+            <button class="button button-ghost" type="button" data-wcplus-article-page="1" ${wcplusState.selectedAccount ? "" : "disabled"}>下一页</button>
           </div>
           <div class="wcplus-source__search-results">
             ${searchRows || ""}
@@ -623,6 +704,17 @@ function renderWCPlusSource() {
           <label>
             <span>批量导入公众号昵称</span>
             <textarea name="nicknames" placeholder="每行一个公众号昵称，严格精确匹配">${escapeHTML(wcplusState.batchNicknames)}</textarea>
+          </label>
+          <label>
+            <span>抓取范围</span>
+            <select name="batchArticleListType">
+              <option value="all" ${wcplusState.batchArticleListType === "all" ? "selected" : ""}>全部</option>
+              <option value="amount" ${wcplusState.batchArticleListType === "amount" ? "selected" : ""}>指定篇数</option>
+            </select>
+          </label>
+          <label>
+            <span>抓取篇数</span>
+            <input name="batchArticleListAmount" type="number" min="0" max="1000" value="${escapeAttribute(wcplusState.batchArticleListAmount)}">
           </label>
           <label class="wcplus-source__inline-check">
             <input name="exactMatch" type="checkbox" ${wcplusState.batchExactMatch ? "checked" : ""}>
@@ -754,6 +846,12 @@ function bindWeChatSourceEvents() {
 }
 
 function bindWCPlusEvents() {
+  document.querySelector("#wcplus-account-options-form")?.addEventListener("change", () => {
+    readWCPlusOptionsFromDOM();
+  });
+  document.querySelector("#wcplus-work-options-form")?.addEventListener("change", () => {
+    readWCPlusOptionsFromDOM();
+  });
   document.querySelector("#wcplus-check-status")?.addEventListener("click", () => {
     checkWCPlusStatus();
   });
@@ -802,8 +900,22 @@ function bindWCPlusEvents() {
     const data = new FormData(event.currentTarget);
     wcplusState.batchNicknames = String(data.get("nicknames") || "");
     wcplusState.batchExactMatch = data.get("exactMatch") === "on";
+    wcplusState.batchArticleListType = String(data.get("batchArticleListType") || "all");
+    wcplusState.batchArticleListAmount = boundedNumber(data.get("batchArticleListAmount"), 0, 1000, 0);
     await batchImportWCPlusNicknames();
   });
+  for (const button of document.querySelectorAll("[data-wcplus-account-page]")) {
+    button.addEventListener("click", async () => {
+      const delta = Number(button.getAttribute("data-wcplus-account-page") || "0");
+      await pageWCPlusAccounts(delta);
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-article-page]")) {
+    button.addEventListener("click", async () => {
+      const delta = Number(button.getAttribute("data-wcplus-article-page") || "0");
+      await pageWCPlusArticles(delta);
+    });
+  }
   for (const button of document.querySelectorAll("[data-wcplus-account-index]")) {
     button.addEventListener("click", async () => {
       const index = Number(button.getAttribute("data-wcplus-account-index") || "0");
@@ -874,6 +986,44 @@ function bindWCPlusEvents() {
       }
     });
   }
+}
+
+function boundedNumber(value, min, max, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function readWCPlusOptionsFromDOM() {
+  const accountOptions = document.querySelector("#wcplus-account-options-form");
+  if (accountOptions) {
+    const data = new FormData(accountOptions);
+    wcplusState.accountNum = boundedNumber(data.get("accountNum"), 1, 100, wcplusState.accountNum);
+  }
+  const workOptions = document.querySelector("#wcplus-work-options-form");
+  if (workOptions) {
+    const data = new FormData(workOptions);
+    wcplusState.taskCrawlerType = String(data.get("taskCrawlerType") || "gzh_article_link");
+    wcplusState.taskArticleListType = String(data.get("taskArticleListType") || "all");
+    wcplusState.taskArticleListAmount = boundedNumber(data.get("articleListAmount"), 0, 1000, wcplusState.taskArticleListAmount);
+    wcplusState.importLimit = boundedNumber(data.get("importLimit"), 1, 100, wcplusState.importLimit);
+    wcplusState.exportRecentNum = boundedNumber(data.get("exportRecentNum"), 1, 5000, wcplusState.exportRecentNum);
+    wcplusState.articleNum = boundedNumber(data.get("articleNum"), 1, 100, wcplusState.articleNum);
+  }
+}
+
+async function pageWCPlusAccounts(delta) {
+  readWCPlusOptionsFromDOM();
+  wcplusState.accountOffset = Math.max(0, wcplusState.accountOffset + (delta * wcplusState.accountNum));
+  await loadWCPlusAccounts();
+}
+
+async function pageWCPlusArticles(delta) {
+  readWCPlusOptionsFromDOM();
+  wcplusState.articleOffset = Math.max(0, wcplusState.articleOffset + (delta * wcplusState.articleNum));
+  await loadWCPlusArticles();
 }
 
 async function previewWeChatArticle(rawURL) {
@@ -987,9 +1137,10 @@ async function loadWeChatAccountArticles(renderBefore = true) {
 }
 
 async function loadWCPlusAccounts() {
+  readWCPlusOptionsFromDOM();
   wcplusState.loading = "加载 WC Plus 公众号";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const query = new URLSearchParams({
       offset: String(wcplusState.accountOffset),
@@ -1007,11 +1158,12 @@ async function loadWCPlusAccounts() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function loadWCPlusArticles(renderBefore = true) {
+  readWCPlusOptionsFromDOM();
   const account = wcplusState.selectedAccount;
   const biz = wcplusAccountBiz(account);
   if (!biz) {
@@ -1020,7 +1172,7 @@ async function loadWCPlusArticles(renderBefore = true) {
   wcplusState.loading = "加载 WC Plus 文章";
   wcplusState.message = "";
   if (renderBefore) {
-    renderWeChatSource();
+    refreshWCPlusView();
   }
   try {
     const query = new URLSearchParams({
@@ -1036,7 +1188,7 @@ async function loadWCPlusArticles(renderBefore = true) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
@@ -1045,12 +1197,12 @@ async function previewWCPlusArticle(article) {
   const id = wcplusArticleID(article);
   if (!nickname || !id) {
     wcplusState.message = "文章缺少 nickname 或 id。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "预览 WC Plus 文章";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const query = new URLSearchParams({ nickname, id });
     wcplusState.preview = await apiFetch(`/api/wcplus/article/content?${query.toString()}`);
@@ -1059,7 +1211,7 @@ async function previewWCPlusArticle(article) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
@@ -1068,12 +1220,12 @@ async function importWCPlusArticle(article) {
   const id = wcplusArticleID(article);
   if (!nickname || !id) {
     wcplusState.message = "文章缺少 nickname 或 id。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "导入 WC Plus 文章";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const payload = await apiFetch("/api/wcplus/import/article", {
       method: "POST",
@@ -1084,21 +1236,22 @@ async function importWCPlusArticle(article) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function importWCPlusAccount() {
+  readWCPlusOptionsFromDOM();
   const account = wcplusState.selectedAccount;
   const biz = wcplusAccountBiz(account);
   if (!biz) {
     wcplusState.message = "请先选择公众号。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "批量导入 WC Plus 文章";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const payload = await apiFetch("/api/wcplus/import/account", {
       method: "POST",
@@ -1113,14 +1266,14 @@ async function importWCPlusAccount() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function checkWCPlusStatus() {
   wcplusState.loading = "检查 WC Plus 状态";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     wcplusState.serviceStatus = await apiFetch("/api/wcplus/status");
     wcplusState.message = wcplusState.serviceStatus?.ok ? "WC Plus 本地服务已连接。" : "WC Plus 本地服务未连接。";
@@ -1129,14 +1282,14 @@ async function checkWCPlusStatus() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function checkWCPlusEnvironment() {
   wcplusState.loading = "检查 WC Plus 环境";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const result = await apiFetch("/api/wcplus/env/check");
     wcplusState.serviceStatus = { ok: Boolean(result.ok) };
@@ -1149,19 +1302,19 @@ async function checkWCPlusEnvironment() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function searchWCPlus() {
   if (!wcplusState.searchQuery && wcplusState.searchMode !== "all") {
     wcplusState.message = "请输入搜索关键词。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "搜索 WC Plus";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const query = new URLSearchParams({
       q: wcplusState.searchQuery,
@@ -1188,7 +1341,7 @@ async function searchWCPlus() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
@@ -1199,18 +1352,20 @@ async function batchImportWCPlusNicknames() {
     .filter(Boolean);
   if (!nicknames.length) {
     wcplusState.message = "请先输入公众号昵称。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "批量导入公众号昵称";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
+    const articleListAmount = wcplusState.batchArticleListType === "amount" ? wcplusState.batchArticleListAmount : 0;
     const result = await apiFetch("/api/wcplus/batch-import/gzh", {
       method: "POST",
       body: JSON.stringify({
         nicknames,
-        articleListType: "all",
+        articleListType: wcplusState.batchArticleListType,
+        articleListAmount,
         start_queue: true,
         exact_match: wcplusState.batchExactMatch,
       }),
@@ -1223,14 +1378,14 @@ async function batchImportWCPlusNicknames() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function loadWCPlusTasks() {
   wcplusState.loading = "加载 WC Plus 下载任务";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const payload = await apiFetch("/api/wcplus/task/all");
     wcplusState.tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
@@ -1239,25 +1394,32 @@ async function loadWCPlusTasks() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function createWCPlusTask() {
+  readWCPlusOptionsFromDOM();
   const account = wcplusState.selectedAccount;
   const biz = wcplusAccountBiz(account);
   if (!biz) {
     wcplusState.message = "请先选择公众号。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "创建 WC Plus 同步任务";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const task = await apiFetch("/api/wcplus/task/new", {
       method: "POST",
-      body: JSON.stringify({ biz, nickname: wcplusAccountNickname(account) }),
+      body: JSON.stringify({
+        biz,
+        nickname: wcplusAccountNickname(account),
+        crawlerType: wcplusState.taskCrawlerType,
+        articleListType: wcplusState.taskArticleListType,
+        articleListAmount: wcplusState.taskArticleListAmount,
+      }),
     });
     wcplusState.message = `已创建同步任务：${task.task_id || wcplusAccountNickname(account) || biz}`;
     await loadWCPlusTasks(false);
@@ -1265,25 +1427,32 @@ async function createWCPlusTask() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function createWCPlusBatchTask() {
+  readWCPlusOptionsFromDOM();
   const account = wcplusState.selectedAccount;
   const biz = wcplusAccountBiz(account);
   if (!biz) {
     wcplusState.message = "请先选择公众号。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "创建 WC Plus 批量任务";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const result = await apiFetch("/api/wcplus/batch-task/create", {
       method: "POST",
-      body: JSON.stringify({ biz, nickname: wcplusAccountNickname(account) }),
+      body: JSON.stringify({
+        biz,
+        nickname: wcplusAccountNickname(account),
+        crawlerType: wcplusState.taskCrawlerType,
+        articleListType: wcplusState.taskArticleListType,
+        articleListAmount: wcplusState.taskArticleListAmount,
+      }),
     });
     wcplusState.message = `批量任务已创建：${firstValue(result, ["task_id", "TaskID", "status", "Status"]) || "已提交"}`;
     await loadWCPlusTasks(false);
@@ -1291,19 +1460,19 @@ async function createWCPlusBatchTask() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function controlWCPlusTask(task, action) {
   if (!task?.task_id) {
     wcplusState.message = "任务缺少 task_id。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "更新 WC Plus 任务";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const updated = await apiFetch("/api/wcplus/task/control", {
       method: "POST",
@@ -1315,14 +1484,14 @@ async function controlWCPlusTask(task, action) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function runWCPlusQueue() {
   wcplusState.loading = "启动 WC Plus 队列";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const result = await apiFetch("/api/wcplus/task/control", {
       method: "POST",
@@ -1334,14 +1503,14 @@ async function runWCPlusQueue() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function cleanWCPlusBatchTasks() {
   wcplusState.loading = "清理 WC Plus 批量任务";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const result = await apiFetch("/api/wcplus/batch-task/delete", {
       method: "POST",
@@ -1353,7 +1522,7 @@ async function cleanWCPlusBatchTasks() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
@@ -1362,12 +1531,12 @@ async function exportWCPlusText() {
   const biz = wcplusAccountBiz(account);
   if (!biz) {
     wcplusState.message = "请先选择公众号。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "导出 WC Plus TXT";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const query = new URLSearchParams({
       biz,
@@ -1382,7 +1551,7 @@ async function exportWCPlusText() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
@@ -1391,12 +1560,12 @@ async function exportWCPlusCSV() {
   const biz = wcplusAccountBiz(account);
   if (!biz) {
     wcplusState.message = "请先选择公众号。";
-    renderWeChatSource();
+    refreshWCPlusView();
     return;
   }
   wcplusState.loading = "导出 WC Plus CSV";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const query = new URLSearchParams({
       biz,
@@ -1409,14 +1578,15 @@ async function exportWCPlusCSV() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
 async function exportWCPlusAllArticlesXLSX() {
+  readWCPlusOptionsFromDOM();
   wcplusState.loading = "导出 WC Plus 全库 XLSX";
   wcplusState.message = "";
-  renderWeChatSource();
+  refreshWCPlusView();
   try {
     const size = await apiDownload("/api/wcplus/export/all-articles-xlsx", {
       method: "POST",
@@ -1446,7 +1616,7 @@ async function exportWCPlusAllArticlesXLSX() {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
     wcplusState.loading = "";
-    renderWeChatSource();
+    refreshWCPlusView();
   }
 }
 
@@ -1557,6 +1727,10 @@ function formatArticleTime(value) {
 async function boot() {
   if (window.location.pathname.startsWith("/wechat-source") || window.location.pathname.startsWith("/sources/wechat")) {
     renderWeChatSource();
+    return;
+  }
+  if (window.location.pathname.startsWith("/wcplus-source")) {
+    renderWCPlusPage();
     return;
   }
   if (window.location.pathname.startsWith("/book-knowledge")) {

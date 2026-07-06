@@ -9,8 +9,11 @@ const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 
 for (const marker of [
   "wcplusState",
+  "renderWCPlusPage",
   "loadWCPlusAccounts",
   "loadWCPlusArticles",
+  "pageWCPlusAccounts",
+  "pageWCPlusArticles",
   "checkWCPlusStatus",
   "checkWCPlusEnvironment",
   "searchWCPlus",
@@ -65,8 +68,27 @@ for (const label of [
   "启动队列",
   "导出全库 XLSX",
   "下载任务",
+  "任务类型",
+  "每页",
+  "导入篇数",
+  "最近导出",
+  "抓取篇数",
 ]) {
   assert.ok(js.includes(label), `WC Plus UI should render ${label}`);
+}
+
+for (const selector of [
+  "data-wcplus-account-page",
+  "data-wcplus-article-page",
+  "name=\"taskCrawlerType\"",
+  "name=\"taskArticleListType\"",
+  "name=\"articleListAmount\"",
+  "name=\"importLimit\"",
+  "name=\"exportRecentNum\"",
+  "name=\"batchArticleListType\"",
+  "name=\"batchArticleListAmount\"",
+]) {
+  assert.ok(js.includes(selector), `WC Plus UI should include ${selector}`);
 }
 
 for (const className of [

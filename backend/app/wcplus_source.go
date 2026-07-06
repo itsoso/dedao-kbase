@@ -109,8 +109,11 @@ type WCPlusTask struct {
 }
 
 type WCPlusTaskRequest struct {
-	Biz      string `json:"biz"`
-	Nickname string `json:"nickname,omitempty"`
+	Biz               string `json:"biz"`
+	Nickname          string `json:"nickname,omitempty"`
+	CrawlerType       string `json:"crawlerType,omitempty"`
+	ArticleListType   string `json:"articleListType,omitempty"`
+	ArticleListAmount int    `json:"articleListAmount,omitempty"`
 }
 
 type WCPlusTaskControlRequest struct {
@@ -330,6 +333,9 @@ func (s *WCPlusSourceService) ListTasks(ctx context.Context) ([]WCPlusTask, erro
 func (s *WCPlusSourceService) CreateTask(ctx context.Context, req WCPlusTaskRequest) (*WCPlusTask, error) {
 	if strings.TrimSpace(req.Biz) == "" {
 		return nil, fmt.Errorf("biz is required")
+	}
+	if strings.TrimSpace(req.CrawlerType) == "" {
+		req.CrawlerType = "gzh_article_link"
 	}
 	var task WCPlusTask
 	if err := s.post(ctx, "/api/task/new", req, &task); err != nil {

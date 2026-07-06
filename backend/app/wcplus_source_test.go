@@ -119,6 +119,9 @@ func TestWCPlusSourceCreatesAndControlsTasks(t *testing.T) {
 			if payload["biz"] != "biz-1" {
 				t.Fatalf("create body = %#v", payload)
 			}
+			if payload["crawlerType"] != "gzh_article_link" {
+				t.Fatalf("crawlerType = %#v, want default gzh_article_link", payload["crawlerType"])
+			}
 			fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-2","status":"created"}}`)
 		case "/api/task/control":
 			sawControl = true
@@ -157,6 +160,41 @@ func TestWCPlusSourceCreatesAndControlsTasks(t *testing.T) {
 	}
 	if !sawControl || controlled.Status != "running" {
 		t.Fatalf("unexpected control result: %#v", controlled)
+	}
+}
+
+func TestWCPlusSourceCreatesTypedTasks(t *testing.T) {
+	var payload map[string]any
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/task/new":
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode create body: %v", err)
+			}
+			fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-typed","status":"created"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	task, err := service.CreateTask(context.Background(), WCPlusTaskRequest{
+		Biz:               "biz-1",
+		Nickname:          "医学参考",
+		CrawlerType:       "article",
+		ArticleListType:   "amount",
+		ArticleListAmount: 30,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask returned error: %v", err)
+	}
+	if task.TaskID != "task-typed" {
+		t.Fatalf("unexpected task: %#v", task)
+	}
+	if payload["crawlerType"] != "article" || payload["articleListType"] != "amount" || payload["articleListAmount"] != float64(30) {
+		t.Fatalf("typed task payload = %#v", payload)
 	}
 }
 

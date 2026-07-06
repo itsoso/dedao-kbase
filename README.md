@@ -99,6 +99,28 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `GET /api/system-kb/manifest`：返回 System KB export 摘要。
 - `GET /api/system-kb/export`：返回 health/proofroom 导入用的 `system_kb_export.json`。
 
+### 微信/WC Plus 来源工作台
+
+在线 Web UI 新增 `/wechat-source` 和 `/wcplus-source`。所有浏览器请求都走 kbase 的 Bearer 代理；浏览器不会直接访问本机 WC Plus 端口。
+
+```bash
+KBASE_AUTH_TOKEN="replace-with-long-secret" \
+KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
+WCPLUS_BASE_URL="http://127.0.0.1:5001" \
+go run ./cmd/kbase-server --addr 127.0.0.1:8719
+```
+
+`WCPLUS_BASE_URL` 必须指向 kbase 服务端可访问的 WC Plus API。若 kbase 部署在线上服务器，而 WC Plus 只运行在个人 Mac 上，线上服务器无法访问个人 Mac 的 `127.0.0.1:5001`；此时需要把 WC Plus API 放到服务器可达的地址，或在同一台机器上运行 kbase 与 WC Plus。
+
+常用代理接口：
+
+- `GET /api/wcplus/env/check`：检查 WC Plus 服务和公众号列表 API。
+- `GET /api/wcplus/gzh/list`、`GET /api/wcplus/gzh/articles`、`GET /api/wcplus/article/content`：加载公众号、文章和正文。
+- `POST /api/wcplus/import/article`、`POST /api/wcplus/import/account`：导入单篇或一批文章到书籍知识库。
+- `POST /api/wcplus/task/new`、`POST /api/wcplus/task/control`、`GET /api/wcplus/task/all`：创建、启动和查看下载任务。
+- `GET /api/wcplus/search`、`GET /api/wcplus/article/search-title`、`GET /api/wcplus/search-gzh`：全文、标题和公众号候选检索。
+- `GET /api/wcplus/export/text`、`GET /api/wcplus/export/gzh-csv`、`POST /api/wcplus/export/all-articles-xlsx`：触发 TXT/CSV/XLSX 导出。
+
 ### NotebookLM Bridge 使用方式
 
 1. 在「电子书架」中下载并入 Wiki，或先下载电子书 HTML 后进入「书籍知识库」。

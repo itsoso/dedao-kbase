@@ -493,6 +493,66 @@ a.button {
   gap: 8px;
 }
 
+.wcplus-source__mini-form,
+.wcplus-source__options,
+.wcplus-source__pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+}
+
+.wcplus-source__mini-form {
+  margin: 0 0 12px;
+  border-bottom: 1px solid rgba(141, 132, 117, 0.12);
+  padding: 0 0 12px;
+}
+
+.wcplus-source__options {
+  margin-bottom: 12px;
+  border: 1px solid rgba(141, 132, 117, 0.14);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(245, 239, 228, 0.42);
+}
+
+.wcplus-source__mini-form label,
+.wcplus-source__options label {
+  display: grid;
+  flex: 1 1 110px;
+  gap: 5px;
+}
+
+.wcplus-source__mini-form span,
+.wcplus-source__options span {
+  color: #6f6658;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.wcplus-source__mini-form input,
+.wcplus-source__options input,
+.wcplus-source__options select,
+.wcplus-source__batch-form input,
+.wcplus-source__batch-form select {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid rgba(141, 132, 117, 0.24);
+  border-radius: 8px;
+  padding: 0 10px;
+  background: #fffdf8;
+  color: #24231f;
+  outline: none;
+}
+
+.wcplus-source__pager {
+  justify-content: flex-end;
+}
+
+.wcplus-source__pager.is-article {
+  margin-bottom: 10px;
+}
+
 .wcplus-source__badge {
   display: inline-flex;
   min-height: 30px;
@@ -651,7 +711,7 @@ a.button {
 
 .wcplus-source__batch-form {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) auto auto;
+  grid-template-columns: minmax(260px, 1fr) minmax(120px, 150px) minmax(110px, 140px) auto auto;
   align-items: end;
   gap: 10px;
   border: 1px solid rgba(141, 132, 117, 0.14);
