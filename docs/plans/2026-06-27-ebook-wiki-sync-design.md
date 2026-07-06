@@ -13,9 +13,9 @@ Add a `dedao-gui` workflow that downloads one selected Dedao ebook into the loca
 ## Recommended Flow
 
 1. The user clicks `下载并入 Wiki` on one ebook row.
-2. `dedao-gui` downloads the ebook as HTML to `/Users/liqiuhua/work/personal/down-dedao/Ebook`.
+2. `dedao-gui` downloads the ebook as HTML to `$DEDAO_WIKI_REPO_DIR/Ebook`.
 3. The backend receives the generated HTML file path.
-4. The backend runs `llms-wikis ingest-ebook --repo /Users/liqiuhua/work/personal/down-dedao --input <html> --book-id <id> --title <title>`.
+4. The backend runs `llms-wikis ingest-ebook --repo $DEDAO_WIKI_REPO_DIR --input <html> --book-id <id> --title <title>`.
 5. If extraction succeeds, the backend runs `python3 pipeline/compiler.py --changed-only` inside `down-dedao`.
 6. Progress and failure messages are emitted through Wails events and displayed in the existing download dialog.
 
@@ -32,7 +32,7 @@ Add a small backend service around the existing ebook downloader:
 
 ## Defaults
 
-- Vault repo: `/Users/liqiuhua/work/personal/down-dedao`
+- Vault repo: `$DEDAO_WIKI_REPO_DIR`
 - Ebook output root: vault repo itself, because existing `Svg2Html` writes under `<output>/Ebook`
 - Wiki command: `llms-wikis`
 - Compiler command: `python3 pipeline/compiler.py --changed-only`
@@ -41,7 +41,7 @@ These should be backend defaults for the local workflow. Later they can move int
 
 The backend also supports local overrides:
 
-- `DEDAO_WIKI_REPO`
+- `DEDAO_WIKI_REPO_DIR`
 - `DEDAO_WIKI_COMMAND`
 - `DEDAO_WIKI_PYTHON`
 

@@ -2,7 +2,7 @@
 import Menu from './components/Menu.vue'
 import { ElConfigProvider } from 'element-plus'
 import 'element-plus/es/components/message/style/css'
-import zhCn from 'element-plus/lib/locale/lang/zh-cn'
+import zhCn from 'element-plus/es/locale/lang/zh-cn'
 </script>
 
 <template>

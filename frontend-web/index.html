@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KBase 读书</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <div id="app" class="reader-shell">
+    <main class="reader-loading" data-reader-loading aria-live="polite">
+      <section class="reader-loading__stage">
+        <aside class="reader-loading__rail" aria-hidden="true">
+          <div class="reader-loading__rail-top"></div>
+          <div class="reader-loading__rail-item is-active"></div>
+          <div class="reader-loading__rail-item"></div>
+          <div class="reader-loading__rail-item is-short"></div>
+        </aside>
+        <article class="reader-loading__book" role="status" aria-label="正在加载读书页面">
+          <div class="reader-loading__meta">
+            <span class="reader-loading__mark" aria-hidden="true"></span>
+            <span>正在载入书页</span>
+          </div>
+          <div class="reader-loading__sheet">
+            <div class="reader-loading__title skeleton"></div>
+            <div class="reader-loading__subtitle skeleton"></div>
+            <div class="reader-loading__rule"></div>
+            <div class="reader-loading__line skeleton"></div>
+            <div class="reader-loading__line skeleton"></div>
+            <div class="reader-loading__line skeleton is-medium"></div>
+            <div class="reader-loading__gap"></div>
+            <div class="reader-loading__line skeleton"></div>
+            <div class="reader-loading__line skeleton is-long"></div>
+            <div class="reader-loading__line skeleton is-short"></div>
+            <div class="reader-loading__footer">
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

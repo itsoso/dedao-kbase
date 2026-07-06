@@ -14,8 +14,6 @@ import (
 	"github.com/yann0917/dedao-gui/backend/utils"
 )
 
-const defaultEbookWikiRepoDir = "/Users/liqiuhua/work/personal/down-dedao"
-
 type EbookWikiSyncConfig struct {
 	RepoDir      string
 	WikisCommand string
@@ -51,12 +49,9 @@ type osEbookWikiCommandRunner struct{}
 
 func DefaultEbookWikiSyncConfig() EbookWikiSyncConfig {
 	cfg := EbookWikiSyncConfig{
-		RepoDir:      defaultEbookWikiRepoDir,
+		RepoDir:      defaultWikiRepoDirFromEnv(),
 		WikisCommand: "llms-wikis",
 		Python:       "python3",
-	}
-	if value := strings.TrimSpace(os.Getenv("DEDAO_WIKI_REPO")); value != "" {
-		cfg.RepoDir = value
 	}
 	if value := strings.TrimSpace(os.Getenv("DEDAO_WIKI_COMMAND")); value != "" {
 		cfg.WikisCommand = value
@@ -65,6 +60,13 @@ func DefaultEbookWikiSyncConfig() EbookWikiSyncConfig {
 		cfg.Python = value
 	}
 	return cfg
+}
+
+func defaultWikiRepoDirFromEnv() string {
+	if value := strings.TrimSpace(os.Getenv("DEDAO_WIKI_REPO_DIR")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(os.Getenv("DEDAO_WIKI_REPO"))
 }
 
 func (cfg EbookWikiSyncConfig) withDefaults() EbookWikiSyncConfig {
@@ -99,6 +101,9 @@ func syncEbookToWikiWithConfig(
 	runner ebookWikiCommandRunner,
 ) (*EbookWikiSyncResult, error) {
 	cfg = cfg.withDefaults()
+	if strings.TrimSpace(cfg.RepoDir) == "" {
+		return nil, fmt.Errorf("DEDAO_WIKI_REPO_DIR 未配置")
+	}
 	emitEbookWikiProgress(ctx, "正在下载电子书")
 	download := EBookDownload{
 		Ctx:          ctx,

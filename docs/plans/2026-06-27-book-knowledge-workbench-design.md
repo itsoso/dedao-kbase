@@ -16,8 +16,8 @@ First release:
 Later releases:
 
 - Open/read the downloaded source book in `dedao-gui`.
-- Export a reviewed health package into `health-llm-driven` System KB V2.
-- Export quant rule cards and paper-only experiment queues for `macd-analysis-claude`.
+- Export a reviewed health package into `reviewed health knowledge system` System KB V2.
+- Export quant rule cards and paper-only experiment queues for `paper-only quant research project`.
 
 ## Key Decision
 
@@ -119,14 +119,14 @@ Health export should produce System KB V2-compatible JSONL files:
 - `pages.jsonl`
 - `relations.jsonl`
 
-Default `review_status` must be `draft` or `needs_review`. A later explicit review/import action can call `health-llm-driven` importer or admin endpoints.
+Default `review_status` must be `draft` or `needs_review`. A later explicit review/import action can call `reviewed health knowledge system` importer or admin endpoints.
 
 Health-specific constraints:
 
 - do not sync personal/private material;
 - do not expose long paid-course/book text;
 - attach claim boundaries for diagnosis, prescriptions, treatment, and emergency care;
-- keep review/reindex in `health-llm-driven`, not hidden inside `dedao-gui`.
+- keep review/reindex in `reviewed health knowledge system`, not hidden inside `dedao-gui`.
 
 ## Quant Export
 
@@ -137,7 +137,7 @@ Quant export should produce paper-only artifacts:
 - `paper_queue.json`
 - `risk_notes.md`
 
-Default status is `draft`. Generated rules must not be wired to live trading. They enter `macd-analysis-claude` through a paper-only queue and must pass that repo's readiness gates.
+Default status is `draft`. Generated rules must not be wired to live trading. They enter `paper-only quant research project` through a paper-only queue and must pass that repo's readiness gates.
 
 ## Reader
 

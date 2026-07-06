@@ -4,7 +4,7 @@
 
 **Goal:** Add a NotebookLM-like TokenPlan chat and analysis entry to the `dedao-gui` book knowledge workbench.
 
-**Architecture:** Backend Go code loads TokenPlan configuration from local environment or the existing `health-llm-driven` env files, builds a bounded book-grounded prompt, and calls the OpenAI-compatible TokenPlan `/chat/completions` API. The Vue workbench adds a `对话` tab with quick prompts and custom questions.
+**Architecture:** Backend Go code loads TokenPlan configuration from local environment or the existing `reviewed health knowledge system` env files, builds a bounded book-grounded prompt, and calls the OpenAI-compatible TokenPlan `/chat/completions` API. The Vue workbench adds a `对话` tab with quick prompts and custom questions.
 
 **Tech Stack:** Go, Wails v2, Vue 3, Element Plus, Aliyun TokenPlan OpenAI-compatible chat completions API.
 

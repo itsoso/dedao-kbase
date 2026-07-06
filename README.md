@@ -55,6 +55,30 @@
 * 优化登录二维码流程：在缺失或失效 CSRF token 时自动刷新首页状态并重试，降低扫码二维码加载失败概率。
 * 优化书籍知识库 UI：新增专业化工作台布局、搜索、章节/claims/chunks/MCP/NotebookLM tabs 和历史记录侧栏。
 
+### 架构概览
+
+本 fork 在原有 Wails 桌面端上新增了一条本地书籍知识库链路。`frontend/src/views/BookKnowledge.vue` 是工作台入口，只负责书籍选择、搜索、对话、历史恢复、NotebookLM 操作和导出按钮；所有数据读写都通过 Wails 生成的 `frontend/wailsjs/go/backend/App.*` 调用后端。
+
+后端边界集中在 `backend/book_knowledge.go`，它把前端可调用方法转发到 `backend/app` 中的领域模块：
+
+```mermaid
+flowchart LR
+  UI[BookKnowledge.vue] --> Wails[Wails App bindings]
+  Wails --> Facade[backend/book_knowledge.go]
+  Facade --> Store[BookKnowledgeStore]
+  Facade --> Chat[TokenPlan chat]
+  Facade --> Export[Export / NotebookLM / MCP]
+  Store --> Files[book_knowledge JSON + JSONL]
+  Chat --> Store
+  Chat --> History[SQLite chat history]
+  Chat --> TokenPlan[OpenAI-compatible API]
+  Export --> KBase[health_system_kb_v2]
+  Export --> Quant[quant_rule_cards]
+  Export --> NotebookLM[NotebookLM package]
+```
+
+核心数据模型定义在 `backend/app/book_knowledge.go`：一本书由 `BookKnowledgeBook`、`Chapter`、`Chunk`、`Claim`、`Citation` 组成，并保存到本地 `book_knowledge` 根目录。默认根目录可通过 `DEDAO_BOOK_KNOWLEDGE_ROOT` 覆盖；每本书有独立目录，结构包括 `manifest.json`、`chapters.jsonl`、`chunks.jsonl`、`claims.jsonl`、`citations.jsonl`。对话层位于 `backend/app/book_chat.go`，从本地知识包构造上下文，调用 TokenPlan OpenAI-compatible API，并把成功回答写入 `book_chat_history.sqlite3`。外部集成包括 `cmd/book-mcp` 的 stdio MCP 工具、`cmd/kbase-server` 的 Bearer token 私有 HTTP 检索服务，以及 NotebookLM Bridge 导出的 markdown 资料包和 notebook 链接。
+
 ### kbase HTTP 服务
 
 本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。

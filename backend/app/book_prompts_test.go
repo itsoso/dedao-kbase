@@ -50,6 +50,38 @@ func TestGenerateBookKnowledgePromptsIncludesTemplatesAndDynamicPrompts(t *testi
 	}
 }
 
+func TestGenerateBookKnowledgePromptsDoesNotExposePrivateProjectNames(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+
+	prompts, err := GenerateBookKnowledgePrompts(store, "42")
+	if err != nil {
+		t.Fatalf("GenerateBookKnowledgePrompts returned error: %v", err)
+	}
+
+	for _, prompt := range prompts {
+		combined := strings.Join([]string{
+			prompt.PromptID,
+			prompt.Category,
+			prompt.Title,
+			prompt.Description,
+			prompt.Prompt,
+		}, "\n")
+		for _, forbidden := range []string{
+			"health" + "-llm-driven",
+			"macd" + "-analysis-claude",
+			"/" + "Users" + "/",
+			"li" + "qiuhua",
+		} {
+			if strings.Contains(combined, forbidden) {
+				t.Fatalf("prompt %s exposes private token %q:\n%s", prompt.PromptID, forbidden, combined)
+			}
+		}
+	}
+}
+
 func TestGenerateBookKnowledgePromptsUsesBookShape(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {

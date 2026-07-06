@@ -68,6 +68,30 @@ func TestEbookCompilerCommand(t *testing.T) {
 	}
 }
 
+func TestDefaultEbookWikiSyncConfigUsesRepoDirEnv(t *testing.T) {
+	t.Setenv("DEDAO_WIKI_REPO", "")
+	t.Setenv("DEDAO_WIKI_REPO_DIR", "/tmp/wiki-root")
+
+	got := DefaultEbookWikiSyncConfig()
+
+	if got.RepoDir != "/tmp/wiki-root" {
+		t.Fatalf("RepoDir = %q, want DEDAO_WIKI_REPO_DIR", got.RepoDir)
+	}
+}
+
+func TestDefaultEbookWikiSyncConfigHasNoPrivateRepoFallback(t *testing.T) {
+	t.Setenv("DEDAO_WIKI_REPO", "")
+	t.Setenv("DEDAO_WIKI_REPO_DIR", "")
+
+	got := DefaultEbookWikiSyncConfig()
+
+	privatePathToken := "/" + "Users" + "/"
+	privateUserToken := "li" + "qiuhua"
+	if strings.Contains(got.RepoDir, privatePathToken) || strings.Contains(got.RepoDir, privateUserToken) {
+		t.Fatalf("RepoDir leaks a private fallback path: %q", got.RepoDir)
+	}
+}
+
 func TestSyncEbookToWikiRunsIngestThenCompiler(t *testing.T) {
 	runner := &fakeEbookWikiRunner{}
 	cfg := EbookWikiSyncConfig{

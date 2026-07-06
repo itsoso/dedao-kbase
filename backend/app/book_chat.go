@@ -19,10 +19,7 @@ const (
 	defaultTokenPlanModel   = "MiniMax-M2.5"
 )
 
-var defaultTokenPlanEnvFiles = []string{
-	"/Users/liqiuhua/work/personal/health-llm-driven/backend/.env",
-	"/Users/liqiuhua/work/personal/health-llm-driven/.env",
-}
+var defaultTokenPlanEnvFiles []string
 
 type BookTokenPlanConfig struct {
 	APIKey  string `json:"-"`

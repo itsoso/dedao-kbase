@@ -1,0 +1,1581 @@
+const app = document.querySelector("#app");
+
+const tokenKeys = [
+  "kbase.token",
+  "kbaseToken",
+  "KBASE_AUTH_TOKEN",
+];
+
+const wechatState = {
+  articleURL: "",
+  bookID: "",
+  accountQuery: "",
+  accounts: [],
+  selectedAccount: null,
+  accountArticles: [],
+  articleBegin: 0,
+  articleCount: 10,
+  preview: null,
+  imported: null,
+  loading: "",
+  message: "",
+};
+
+const wcplusState = {
+  accounts: [],
+  selectedAccount: null,
+  articles: [],
+  searchQuery: "",
+  searchMode: "fulltext",
+  searchResults: [],
+  tasks: [],
+  preview: null,
+  serviceStatus: null,
+  accountOffset: 0,
+  accountNum: 20,
+  articleOffset: 0,
+  articleNum: 20,
+  importLimit: 10,
+  exportRecentNum: 100,
+  batchNicknames: "",
+  batchExactMatch: true,
+  loading: "",
+  message: "",
+};
+
+const knowledgeState = {
+  books: [],
+  selectedBook: null,
+  package: null,
+  query: "",
+  results: [],
+  loading: "",
+  message: "",
+};
+
+function getToken() {
+  for (const key of tokenKeys) {
+    const value = window.localStorage.getItem(key);
+    if (value && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
+}
+
+function escapeHTML(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function escapeAttribute(value) {
+  return escapeHTML(value).replaceAll("\n", " ");
+}
+
+async function apiFetch(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set("Accept", "application/json");
+  if (options.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const token = getToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
+  const response = await fetch(path, {
+    ...options,
+    headers,
+  });
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = text;
+    }
+  }
+  if (!response.ok) {
+    const message = typeof payload === "object" && payload
+      ? (payload.error || payload.message || JSON.stringify(payload))
+      : (payload || `HTTP ${response.status}`);
+    throw new Error(message);
+  }
+  return payload;
+}
+
+async function apiDownload(path, options = {}, filename = "download.bin") {
+  const headers = new Headers(options.headers || {});
+  const token = getToken();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  if (options.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const response = await fetch(path, {
+    ...options,
+    headers,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(text || `HTTP ${response.status}`);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  return blob.size;
+}
+
+function getBookID() {
+  const prefix = "/ebook/";
+  if (!window.location.pathname.startsWith(prefix)) {
+    return "";
+  }
+  const raw = window.location.pathname.slice(prefix.length).split("/")[0];
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+async function fetchBook(bookID) {
+  return apiFetch(`/api/books/${encodeURIComponent(bookID)}`);
+}
+
+function renderShell(content, current = "") {
+  app.className = "web-shell";
+  app.innerHTML = `
+    <header class="web-topbar">
+      <a class="web-brand" href="/">dedao kbase</a>
+      <nav class="web-nav" aria-label="主导航">
+        <a class="${current === "home" ? "active" : ""}" href="/">首页</a>
+        <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信来源</a>
+        <a href="/book-knowledge">书籍知识库</a>
+      </nav>
+    </header>
+    ${content}
+  `;
+}
+
+function renderHome() {
+  renderShell(`
+    <main class="web-home">
+      <section class="web-home__hero">
+        <p class="web-kicker">Source Workbench</p>
+        <h1>把外部内容整理成可验证知识库</h1>
+        <p>从公众号文章开始，下载、预览并导入到书籍知识库，再交给 Health 和 Proofroom 使用。</p>
+        <div class="web-home__actions">
+          <a class="button button-primary" href="/wechat-source">导入微信公众号文章</a>
+          <a class="button button-ghost" href="/book-knowledge">查看书籍知识库</a>
+        </div>
+      </section>
+    </main>
+  `, "home");
+}
+
+function renderBookKnowledge() {
+  const bookRows = knowledgeState.books.map((book, index) => {
+    const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
+    return `
+      <button class="knowledge-web__book${active}" type="button" data-book-index="${index}">
+        <strong>${escapeHTML(book.title || book.book_id)}</strong>
+        <span>${escapeHTML([book.status || "draft", book.extractor || ""].filter(Boolean).join(" · "))}</span>
+      </button>
+    `;
+  }).join("");
+  const pkg = knowledgeState.package || {};
+  const currentBook = pkg.book || knowledgeState.selectedBook || {};
+  const resultRows = knowledgeState.results.map((result) => `
+    <article class="knowledge-web__result">
+      <div class="web-kicker">${escapeHTML(result.kind || "result")}</div>
+      <h3>${escapeHTML(result.title || result.id || "片段")}</h3>
+      <p>${escapeHTML(result.snippet || "")}</p>
+    </article>
+  `).join("");
+  const chapterRows = (pkg.chapters || []).slice(0, 16).map((chapter) => `
+    <li>
+      <span>${escapeHTML(chapter.title || chapter.chapter_id)}</span>
+      <small>${escapeHTML(chapter.summary || "")}</small>
+    </li>
+  `).join("");
+  const status = knowledgeState.loading
+    ? `<div class="web-status">处理中：${escapeHTML(knowledgeState.loading)}</div>`
+    : (knowledgeState.message ? `<div class="web-status">${escapeHTML(knowledgeState.message)}</div>` : "");
+
+  renderShell(`
+    <main class="knowledge-web">
+      <section class="knowledge-web__header">
+        <div>
+          <p class="web-kicker">Book Knowledge</p>
+          <h1>书籍知识库</h1>
+        </div>
+        <button id="knowledge-refresh" class="button button-ghost" type="button">刷新</button>
+      </section>
+      ${status}
+
+      <div class="knowledge-web__layout">
+        <aside class="knowledge-web__sidebar">
+          <form id="knowledge-search-form" class="source-form">
+            <label>
+              <span>搜索</span>
+              <input name="query" value="${escapeAttribute(knowledgeState.query)}" placeholder="搜索标题、claims 或 chunks">
+            </label>
+            <button class="button button-primary" type="submit">Search</button>
+          </form>
+          <div class="knowledge-web__books">
+            ${bookRows || "<p class=\"web-muted\">暂无知识库条目，可先从微信来源导入。</p>"}
+          </div>
+        </aside>
+
+        <section class="knowledge-web__main">
+          ${currentBook.book_id ? `
+            <div class="knowledge-web__title-row">
+              <div>
+                <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
+                <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
+              </div>
+              <a class="button button-primary" href="/ebook/${encodeURIComponent(currentBook.book_id)}">阅读</a>
+            </div>
+            <div class="knowledge-web__stats">
+              <span>${(pkg.chapters || []).length} 章</span>
+              <span>${(pkg.claims || []).length} claims</span>
+              <span>${(pkg.chunks || []).length} chunks</span>
+            </div>
+            <div class="knowledge-web__content">
+              <section>
+                <p class="web-kicker">Chapters</p>
+                <ul>${chapterRows || "<li><span>暂无章节</span></li>"}</ul>
+              </section>
+              <section>
+                <p class="web-kicker">Search Results</p>
+                ${resultRows || "<p class=\"web-muted\">输入关键词后查看检索结果。</p>"}
+              </section>
+            </div>
+          ` : "<p class=\"web-muted\">请选择书籍或导入新来源。</p>"}
+        </section>
+      </div>
+    </main>
+  `, "knowledge");
+  bindBookKnowledgeEvents();
+}
+
+function renderReader(payload) {
+  const book = payload.book || {};
+  const chapters = Array.isArray(payload.chapters) ? payload.chapters : [];
+  const claims = Array.isArray(payload.claims) ? payload.claims : [];
+  const chunks = Array.isArray(payload.chunks) ? payload.chunks : [];
+  const title = book.title || book.book_id || "未命名书籍";
+  const meta = [
+    book.author,
+    book.extractor,
+    book.updated_at,
+  ].filter(Boolean).join(" / ");
+  const chapterItems = chapters.slice(0, 12).map((chapter) => (
+    `<li>${escapeHTML(chapter.title || chapter.chapter_id || "章节")}</li>`
+  )).join("");
+  const claimItems = claims.slice(0, 8).map((claim) => (
+    `<li>${escapeHTML(claim.text || claim.claim || claim.summary || "")}</li>`
+  )).join("");
+  const chunkItems = chunks.slice(0, 4).map((chunk) => (
+    `<p>${escapeHTML(chunk.text || chunk.content || "")}</p>`
+  )).join("");
+
+  app.className = "reader-shell";
+  app.innerHTML = `
+    <main class="reader-page">
+      <article class="reader-page__article">
+        <p class="reader-page__eyebrow">KBase Reader</p>
+        <h1>${escapeHTML(title)}</h1>
+        <div class="reader-page__meta">${escapeHTML(meta || book.book_id || "")}</div>
+        <section class="reader-page__section">
+          <h2>目录</h2>
+          ${chapterItems ? `<ul>${chapterItems}</ul>` : "<p>暂无目录数据。</p>"}
+        </section>
+        <section class="reader-page__section">
+          <h2>重点</h2>
+          ${claimItems ? `<ul>${claimItems}</ul>` : "<p>暂无重点摘录。</p>"}
+        </section>
+        <section class="reader-page__section">
+          <h2>正文摘录</h2>
+          ${chunkItems || "<p>暂无正文摘录。</p>"}
+        </section>
+      </article>
+    </main>
+  `;
+}
+
+function renderError(message) {
+  app.className = "reader-shell";
+  app.innerHTML = `
+    <main class="reader-error">
+      <section class="reader-error__card" role="alert">
+        <h1>页面暂时无法打开</h1>
+        <p>${escapeHTML(message)}</p>
+      </section>
+    </main>
+  `;
+}
+
+function renderWeChatSource() {
+  const accountRows = wechatState.accounts.map((account, index) => {
+    const active = account.fakeid === wechatState.selectedAccount?.fakeid ? " active" : "";
+    return `
+      <button class="wechat-source__account${active}" type="button" data-account-index="${index}">
+        <span>${escapeHTML(account.nickname || "未命名公众号")}</span>
+        <small>${escapeHTML(account.alias || account.fakeid)}</small>
+      </button>
+    `;
+  }).join("");
+  const articleRows = wechatState.accountArticles.map((article, index) => `
+    <article class="wechat-source__article">
+      ${article.cover ? `<img src="${escapeAttribute(article.cover)}" alt="">` : "<div class=\"wechat-source__cover\"></div>"}
+      <div>
+        <h3>${escapeHTML(article.title || "未命名文章")}</h3>
+        <p>${escapeHTML(article.digest || formatArticleTime(article.update_time) || "暂无摘要")}</p>
+        <div class="wechat-source__row-actions">
+          <button type="button" class="button button-ghost" data-preview-article="${index}">预览</button>
+          <button type="button" class="button button-primary" data-import-article="${index}">导入知识库</button>
+          ${article.link ? `<a class="button button-link" href="${escapeAttribute(article.link)}" target="_blank" rel="noreferrer">原文</a>` : ""}
+        </div>
+      </div>
+    </article>
+  `).join("");
+  const status = wechatState.loading
+    ? `<div class="web-status">处理中：${escapeHTML(wechatState.loading)}</div>`
+    : (wechatState.message ? `<div class="web-status">${escapeHTML(wechatState.message)}</div>` : "");
+
+  renderShell(`
+    <main class="wechat-source">
+      <section class="wechat-source__header">
+        <div>
+          <p class="web-kicker">WeChat Source</p>
+          <h1>微信公众号来源</h1>
+        </div>
+        ${status}
+      </section>
+
+      <div class="wechat-source__layout">
+        <section class="wechat-source__panel">
+          <form id="wechat-preview-form" class="source-form">
+            <label>
+              <span>文章链接</span>
+              <input name="articleURL" value="${escapeAttribute(wechatState.articleURL)}" placeholder="https://mp.weixin.qq.com/s/..." autocomplete="off">
+            </label>
+            <label>
+              <span>知识库 ID（可选）</span>
+              <input name="bookID" value="${escapeAttribute(wechatState.bookID)}" placeholder="留空自动生成 wechat-...">
+            </label>
+            <div class="source-form__actions">
+              <button class="button button-ghost" type="submit">预览文章</button>
+              <button id="wechat-import" class="button button-primary" type="button">导入知识库</button>
+            </div>
+          </form>
+
+          <form id="wechat-account-form" class="source-form source-form--compact">
+            <label>
+              <span>搜索公众号</span>
+              <input name="accountQuery" value="${escapeAttribute(wechatState.accountQuery)}" placeholder="输入公众号名称">
+            </label>
+            <button class="button button-primary" type="submit">搜索公众号</button>
+          </form>
+
+          <div class="wechat-source__accounts">
+            ${accountRows || "<p class=\"web-muted\">搜索后可选择公众号并加载最近文章。</p>"}
+          </div>
+        </section>
+
+        <section class="wechat-source__panel wechat-source__main">
+          <div class="wechat-source__section-head">
+            <div>
+              <p class="web-kicker">Recent Articles</p>
+              <h2>最近文章</h2>
+            </div>
+            <div class="wechat-source__pager">
+              <button class="button button-ghost" type="button" id="wechat-prev" ${wechatState.articleBegin <= 0 ? "disabled" : ""}>上一页</button>
+              <button class="button button-ghost" type="button" id="wechat-next" ${wechatState.selectedAccount ? "" : "disabled"}>下一页</button>
+            </div>
+          </div>
+          <div class="wechat-source__articles">
+            ${articleRows || "<p class=\"web-muted\">选择公众号后显示文章；也可以直接粘贴文章链接导入。</p>"}
+          </div>
+        </section>
+
+        <aside class="wechat-source__panel wechat-source__preview">
+          ${renderWeChatPreview()}
+        </aside>
+      </div>
+
+      ${renderWCPlusSource()}
+    </main>
+  `, "wechat");
+  bindWeChatSourceEvents();
+  bindWCPlusEvents();
+}
+
+function firstValue(value, keys) {
+  for (const key of keys) {
+    const found = value?.[key];
+    if (found !== undefined && found !== null && String(found).trim() !== "") {
+      return found;
+    }
+  }
+  return "";
+}
+
+function firstArray(value, keys) {
+  for (const key of keys) {
+    if (Array.isArray(value?.[key])) {
+      return value[key];
+    }
+  }
+  return [];
+}
+
+function wcplusAccountBiz(account) {
+  return String(firstValue(account, ["biz", "Biz", "fakeid", "FakeID"]) || "");
+}
+
+function wcplusAccountNickname(account) {
+  return String(firstValue(account, ["nickname", "Nickname", "name", "Name"]) || "");
+}
+
+function wcplusAccountArticleCount(account) {
+  return firstValue(account, ["article_count", "ArticleCount", "Articles", "articles"]);
+}
+
+function wcplusArticleID(article) {
+  return String(firstValue(article, ["id", "ID", "article_id", "ArticleID"]) || "");
+}
+
+function wcplusArticleTitle(article) {
+  return String(firstValue(article, ["title", "Title"]) || "");
+}
+
+function wcplusArticleNickname(article) {
+  return String(firstValue(article, ["nickname", "Nickname", "gzh_nickname", "GzhNickname"]) || "");
+}
+
+function wcplusArticleDigest(article) {
+  return String(firstValue(article, ["digest", "Digest", "summary", "Summary"]) || "");
+}
+
+function wcplusArticleURL(article) {
+  return String(firstValue(article, ["url", "URL", "content_url", "ContentURL", "source_url", "SourceURL"]) || "");
+}
+
+function wcplusArticlePublishTime(article) {
+  return String(firstValue(article, ["publish_time", "PublishTime", "p_date_text", "PDateText"]) || "");
+}
+
+function renderWCPlusSource() {
+  const accountRows = wcplusState.accounts.map((account, index) => {
+    const active = wcplusAccountBiz(account) === wcplusAccountBiz(wcplusState.selectedAccount) ? " active" : "";
+    const nickname = wcplusAccountNickname(account) || "未命名公众号";
+    const articleCount = wcplusAccountArticleCount(account);
+    return `
+      <button class="wcplus-source__account${active}" type="button" data-wcplus-account-index="${index}">
+        <span>${escapeHTML(nickname)}</span>
+        <small>${escapeHTML([wcplusAccountBiz(account), articleCount ? `${articleCount} 篇` : ""].filter(Boolean).join(" · "))}</small>
+      </button>
+    `;
+  }).join("");
+  const articleRows = wcplusState.articles.map((article, index) => {
+    const id = wcplusArticleID(article);
+    return `
+    <article class="wcplus-source__article">
+      <div>
+        <h3>${escapeHTML(wcplusArticleTitle(article) || id || "未命名文章")}</h3>
+        <p>${escapeHTML([wcplusArticleDigest(article), wcplusArticlePublishTime(article)].filter(Boolean).join(" · ") || wcplusArticleURL(article) || "暂无摘要")}</p>
+      </div>
+      <div class="wcplus-source__row-actions">
+        <button type="button" class="button button-ghost" data-wcplus-preview="${index}" ${id ? "" : "disabled"}>预览</button>
+        <button type="button" class="button button-primary" data-wcplus-import="${index}" ${id ? "" : "disabled"}>导入知识库</button>
+      </div>
+    </article>
+  `}).join("");
+  const searchRows = wcplusState.searchResults.map((item, index) => {
+    const articleID = wcplusArticleID(item);
+    const accountBiz = wcplusAccountBiz(item);
+    const title = wcplusArticleTitle(item) || wcplusAccountNickname(item) || articleID || accountBiz || "结果";
+    const subline = [wcplusArticleDigest(item), wcplusArticlePublishTime(item), wcplusArticleURL(item), accountBiz].filter(Boolean).join(" · ");
+    return `
+      <article class="wcplus-source__search-result">
+        <div>
+          <h4>${escapeHTML(title)}</h4>
+          <p>${escapeHTML(subline || "命中结果")}</p>
+        </div>
+        <div class="wcplus-source__row-actions">
+          ${accountBiz ? `<button type="button" class="button button-ghost" data-wcplus-select-result-account="${index}">选择</button>` : ""}
+          ${articleID ? `<button type="button" class="button button-ghost" data-wcplus-preview-result="${index}">预览</button>` : ""}
+          ${articleID ? `<button type="button" class="button button-primary" data-wcplus-import-result="${index}">导入</button>` : ""}
+        </div>
+      </article>
+    `;
+  }).join("");
+  const taskRows = wcplusState.tasks.map((task, index) => `
+    <div class="wcplus-source__task">
+      <div>
+        <strong>${escapeHTML(task.nickname || task.biz || task.task_id)}</strong>
+        <span>${escapeHTML(task.status || "unknown")}</span>
+      </div>
+      <div class="wcplus-source__row-actions">
+        <button type="button" class="button button-ghost" data-wcplus-task-start="${index}">开始</button>
+        <button type="button" class="button button-ghost" data-wcplus-task-stop="${index}">停止</button>
+      </div>
+    </div>
+  `).join("");
+  const status = wcplusState.loading
+    ? `<div class="web-status">处理中：${escapeHTML(wcplusState.loading)}</div>`
+    : (wcplusState.message ? `<div class="web-status">${escapeHTML(wcplusState.message)}</div>` : "");
+  const serviceStatus = wcplusState.serviceStatus
+    ? `<span class="wcplus-source__badge ${wcplusState.serviceStatus.ok ? "is-ok" : "is-bad"}">${wcplusState.serviceStatus.ok ? "已连接" : "未连接"}</span>`
+    : "";
+  return `
+    <section class="wcplus-source">
+      <div class="wcplus-source__toolbar">
+        <div>
+          <p class="web-kicker">WC Plus Local API</p>
+          <h2>WC Plus 本地服务</h2>
+        </div>
+        <div class="wcplus-source__actions">
+          ${serviceStatus}
+          <button id="wcplus-check-status" class="button button-ghost" type="button">检查状态</button>
+          <button id="wcplus-check-env" class="button button-ghost" type="button">环境检查</button>
+          <button id="wcplus-load-accounts" class="button button-primary" type="button">加载公众号</button>
+          <button id="wcplus-load-tasks" class="button button-ghost" type="button">下载任务</button>
+          <button id="wcplus-run-queue" class="button button-ghost" type="button">启动队列</button>
+        </div>
+      </div>
+      ${status}
+      <div class="wcplus-source__grid">
+        <aside class="wcplus-source__panel">
+          <form id="wcplus-search-form" class="source-form source-form--flat">
+            <label>
+              <span>搜索 WC Plus</span>
+              <input name="query" value="${escapeAttribute(wcplusState.searchQuery)}" placeholder="标题、全文或公众号">
+            </label>
+            <label>
+              <span>范围</span>
+              <select name="mode">
+                <option value="fulltext" ${wcplusState.searchMode === "fulltext" ? "selected" : ""}>全文</option>
+                <option value="title" ${wcplusState.searchMode === "title" ? "selected" : ""}>标题</option>
+                <option value="account" ${wcplusState.searchMode === "account" ? "selected" : ""}>已入库公众号</option>
+                <option value="candidate" ${wcplusState.searchMode === "candidate" ? "selected" : ""}>可导入公众号</option>
+                <option value="all" ${wcplusState.searchMode === "all" ? "selected" : ""}>全库文章</option>
+              </select>
+            </label>
+            <button class="button button-primary" type="submit">搜索</button>
+          </form>
+          <div class="wcplus-source__accounts">
+            ${accountRows || "<p class=\"web-muted\">启动 WC Plus 本地服务后，可加载已同步公众号。</p>"}
+          </div>
+        </aside>
+        <section class="wcplus-source__panel wcplus-source__articles">
+          <div class="wcplus-source__toolbar is-tight">
+            <div>
+              <p class="web-kicker">Articles</p>
+              <h3>${escapeHTML(wcplusAccountNickname(wcplusState.selectedAccount) || "公众号文章")}</h3>
+            </div>
+            <div class="wcplus-source__actions">
+              <button id="wcplus-create-task" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>同步公众号</button>
+              <button id="wcplus-create-batch-task" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>批量任务</button>
+              <button id="wcplus-export-text" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>导出 TXT</button>
+              <button id="wcplus-export-csv" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>导出 CSV</button>
+              <button id="wcplus-import-account" class="button button-primary" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>批量导入</button>
+            </div>
+          </div>
+          <div class="wcplus-source__search-results">
+            ${searchRows || ""}
+          </div>
+          <div class="wcplus-source__article-list">
+            ${articleRows || "<p class=\"web-muted\">选择公众号后显示已下载文章。</p>"}
+          </div>
+        </section>
+        <aside class="wcplus-source__panel wcplus-source__preview">
+          ${renderWCPlusPreview()}
+        </aside>
+      </div>
+      <section class="wcplus-source__tasks">
+        <div class="wcplus-source__toolbar is-tight">
+          <div>
+            <p class="web-kicker">Tasks</p>
+            <h3>下载任务</h3>
+          </div>
+          <div class="wcplus-source__actions">
+            <button id="wcplus-clean-batch-tasks" class="button button-ghost" type="button">清理 ready/error</button>
+            <button id="wcplus-export-xlsx" class="button button-primary" type="button">导出全库 XLSX</button>
+          </div>
+        </div>
+        <form id="wcplus-batch-nickname-form" class="wcplus-source__batch-form">
+          <label>
+            <span>批量导入公众号昵称</span>
+            <textarea name="nicknames" placeholder="每行一个公众号昵称，严格精确匹配">${escapeHTML(wcplusState.batchNicknames)}</textarea>
+          </label>
+          <label class="wcplus-source__inline-check">
+            <input name="exactMatch" type="checkbox" ${wcplusState.batchExactMatch ? "checked" : ""}>
+            <span>昵称精确匹配</span>
+          </label>
+          <button class="button button-primary" type="submit">创建链接任务并启动队列</button>
+        </form>
+        ${taskRows || "<p class=\"web-muted\">点击“下载任务”查看 WC Plus 同步任务。</p>"}
+      </section>
+    </section>
+  `;
+}
+
+function renderWCPlusPreview() {
+  const article = wcplusState.preview;
+  if (!article) {
+    return `
+      <p class="web-kicker">WC Plus Preview</p>
+      <h3>等待文章预览</h3>
+      <p class="web-muted">从 WC Plus 已下载文章中选择预览，确认内容后可导入书籍知识库。</p>
+    `;
+  }
+  return `
+    <p class="web-kicker">WC Plus Preview</p>
+    <h3>${escapeHTML(wcplusArticleTitle(article) || wcplusArticleID(article) || "未命名文章")}</h3>
+    <div class="wechat-source__meta">
+      <span>${escapeHTML(wcplusArticleNickname(article) || "未知公众号")}</span>
+      <span>${escapeHTML(wcplusArticlePublishTime(article) || "")}</span>
+    </div>
+    <pre>${escapeHTML(String(firstValue(article, ["content", "Content"]) || "").slice(0, 2200))}</pre>
+  `;
+}
+
+function renderWeChatPreview() {
+  const article = wechatState.preview;
+  if (!article) {
+    return `
+      <p class="web-kicker">Preview</p>
+      <h2>等待预览</h2>
+      <p class="web-muted">文章预览会展示标题、公众号、摘要和正文片段。导入后会生成单篇文章知识包。</p>
+      ${wechatState.imported ? renderImportedPackage() : ""}
+    `;
+  }
+  return `
+    <p class="web-kicker">Preview</p>
+    <h2>${escapeHTML(article.title || "未命名文章")}</h2>
+    <div class="wechat-source__meta">
+      <span>${escapeHTML(article.account_name || "未知公众号")}</span>
+      <span>${escapeHTML(article.published_at || "")}</span>
+    </div>
+    ${article.digest ? `<p class="wechat-source__digest">${escapeHTML(article.digest)}</p>` : ""}
+    <pre>${escapeHTML((article.markdown || article.text || "").slice(0, 2600))}</pre>
+    ${wechatState.imported ? renderImportedPackage() : ""}
+  `;
+}
+
+function renderImportedPackage() {
+  const book = wechatState.imported?.book || {};
+  const id = book.book_id || "";
+  return `
+    <div class="wechat-source__imported">
+      <p class="web-kicker">Imported</p>
+      <strong>${escapeHTML(book.title || id || "已导入")}</strong>
+      ${id ? `<a href="/ebook/${encodeURIComponent(id)}">打开阅读页</a>` : ""}
+    </div>
+  `;
+}
+
+function bindWeChatSourceEvents() {
+  document.querySelector("#wechat-preview-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    wechatState.articleURL = String(data.get("articleURL") || "").trim();
+    wechatState.bookID = String(data.get("bookID") || "").trim();
+    await previewWeChatArticle(wechatState.articleURL);
+  });
+
+  document.querySelector("#wechat-import")?.addEventListener("click", async () => {
+    await importWeChatArticle(wechatState.articleURL);
+  });
+
+  document.querySelector("#wechat-account-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    wechatState.accountQuery = String(data.get("accountQuery") || "").trim();
+    await searchWeChatAccounts();
+  });
+
+  for (const button of document.querySelectorAll("[data-account-index]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-account-index") || "0");
+      wechatState.selectedAccount = wechatState.accounts[index] || null;
+      wechatState.articleBegin = 0;
+      await loadWeChatAccountArticles();
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-preview-article]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-preview-article") || "0");
+      const article = wechatState.accountArticles[index];
+      if (article?.link) {
+        wechatState.articleURL = article.link;
+        await previewWeChatArticle(article.link);
+      }
+    });
+  }
+
+  for (const button of document.querySelectorAll("[data-import-article]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-import-article") || "0");
+      const article = wechatState.accountArticles[index];
+      if (article?.link) {
+        wechatState.articleURL = article.link;
+        await importWeChatArticle(article.link);
+      }
+    });
+  }
+
+  document.querySelector("#wechat-prev")?.addEventListener("click", async () => {
+    wechatState.articleBegin = Math.max(0, wechatState.articleBegin - wechatState.articleCount);
+    await loadWeChatAccountArticles();
+  });
+
+  document.querySelector("#wechat-next")?.addEventListener("click", async () => {
+    wechatState.articleBegin += wechatState.articleCount;
+    await loadWeChatAccountArticles();
+  });
+}
+
+function bindWCPlusEvents() {
+  document.querySelector("#wcplus-check-status")?.addEventListener("click", () => {
+    checkWCPlusStatus();
+  });
+  document.querySelector("#wcplus-check-env")?.addEventListener("click", () => {
+    checkWCPlusEnvironment();
+  });
+  document.querySelector("#wcplus-load-accounts")?.addEventListener("click", () => {
+    loadWCPlusAccounts();
+  });
+  document.querySelector("#wcplus-load-tasks")?.addEventListener("click", () => {
+    loadWCPlusTasks();
+  });
+  document.querySelector("#wcplus-run-queue")?.addEventListener("click", () => {
+    runWCPlusQueue();
+  });
+  document.querySelector("#wcplus-search-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    wcplusState.searchQuery = String(data.get("query") || "").trim();
+    wcplusState.searchMode = String(data.get("mode") || "fulltext");
+    await searchWCPlus();
+  });
+  document.querySelector("#wcplus-create-task")?.addEventListener("click", () => {
+    createWCPlusTask();
+  });
+  document.querySelector("#wcplus-create-batch-task")?.addEventListener("click", () => {
+    createWCPlusBatchTask();
+  });
+  document.querySelector("#wcplus-import-account")?.addEventListener("click", () => {
+    importWCPlusAccount();
+  });
+  document.querySelector("#wcplus-export-text")?.addEventListener("click", () => {
+    exportWCPlusText();
+  });
+  document.querySelector("#wcplus-export-csv")?.addEventListener("click", () => {
+    exportWCPlusCSV();
+  });
+  document.querySelector("#wcplus-clean-batch-tasks")?.addEventListener("click", () => {
+    cleanWCPlusBatchTasks();
+  });
+  document.querySelector("#wcplus-export-xlsx")?.addEventListener("click", () => {
+    exportWCPlusAllArticlesXLSX();
+  });
+  document.querySelector("#wcplus-batch-nickname-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    wcplusState.batchNicknames = String(data.get("nicknames") || "");
+    wcplusState.batchExactMatch = data.get("exactMatch") === "on";
+    await batchImportWCPlusNicknames();
+  });
+  for (const button of document.querySelectorAll("[data-wcplus-account-index]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-account-index") || "0");
+      wcplusState.selectedAccount = wcplusState.accounts[index] || null;
+      wcplusState.articleOffset = 0;
+      await loadWCPlusArticles();
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-preview]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-preview") || "0");
+      const article = wcplusState.articles[index];
+      if (article) {
+        await previewWCPlusArticle(article);
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-select-result-account]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-select-result-account") || "0");
+      wcplusState.selectedAccount = wcplusState.searchResults[index] || null;
+      wcplusState.articleOffset = 0;
+      await loadWCPlusArticles();
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-preview-result]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-preview-result") || "0");
+      const article = wcplusState.searchResults[index];
+      if (article) {
+        await previewWCPlusArticle(article);
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-import-result]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-import-result") || "0");
+      const article = wcplusState.searchResults[index];
+      if (article) {
+        await importWCPlusArticle(article);
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-import]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-import") || "0");
+      const article = wcplusState.articles[index];
+      if (article) {
+        await importWCPlusArticle(article);
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-task-start]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-task-start") || "0");
+      const task = wcplusState.tasks[index];
+      if (task) {
+        await controlWCPlusTask(task, "start");
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-task-stop]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-task-stop") || "0");
+      const task = wcplusState.tasks[index];
+      if (task) {
+        await controlWCPlusTask(task, "stop");
+      }
+    });
+  }
+}
+
+async function previewWeChatArticle(rawURL) {
+  if (!rawURL) {
+    wechatState.message = "请先输入文章链接。";
+    renderWeChatSource();
+    return;
+  }
+  wechatState.loading = "预览文章";
+  wechatState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({ url: rawURL });
+    const payload = await apiFetch(`/api/wechat/article?${query.toString()}`);
+    wechatState.preview = payload.article || null;
+    wechatState.message = "文章预览已更新。";
+  } catch (error) {
+    wechatState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wechatState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function importWeChatArticle(rawURL) {
+  if (!rawURL) {
+    wechatState.message = "请先输入文章链接。";
+    renderWeChatSource();
+    return;
+  }
+  wechatState.loading = "导入知识库";
+  wechatState.message = "";
+  renderWeChatSource();
+  try {
+    wechatState.imported = await apiFetch("/api/wechat/import", {
+      method: "POST",
+      body: JSON.stringify({
+        url: rawURL,
+        book_id: wechatState.bookID,
+      }),
+    });
+    wechatState.preview = wechatState.preview || {
+      title: wechatState.imported?.book?.title || "",
+      source_url: rawURL,
+      markdown: "",
+      text: "",
+    };
+    wechatState.message = "已导入书籍知识库。";
+  } catch (error) {
+    wechatState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wechatState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function searchWeChatAccounts() {
+  if (!wechatState.accountQuery) {
+    wechatState.message = "请输入公众号名称。";
+    renderWeChatSource();
+    return;
+  }
+  wechatState.loading = "搜索公众号";
+  wechatState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({ q: wechatState.accountQuery });
+    const payload = await apiFetch(`/api/wechat/search?${query.toString()}`);
+    wechatState.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+    wechatState.selectedAccount = wechatState.accounts[0] || null;
+    wechatState.articleBegin = 0;
+    if (wechatState.selectedAccount) {
+      await loadWeChatAccountArticles(false);
+    } else {
+      wechatState.accountArticles = [];
+    }
+    wechatState.message = wechatState.accounts.length ? "请选择公众号或直接导入文章。" : "未找到公众号。";
+  } catch (error) {
+    wechatState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wechatState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function loadWeChatAccountArticles(renderBefore = true) {
+  const fakeid = wechatState.selectedAccount?.fakeid || "";
+  if (!fakeid) {
+    return;
+  }
+  wechatState.loading = "加载最近文章";
+  wechatState.message = "";
+  if (renderBefore) {
+    renderWeChatSource();
+  }
+  try {
+    const query = new URLSearchParams({
+      fakeid,
+      begin: String(wechatState.articleBegin),
+      count: String(wechatState.articleCount),
+    });
+    const payload = await apiFetch(`/api/wechat/articles?${query.toString()}`);
+    wechatState.accountArticles = Array.isArray(payload.articles) ? payload.articles : [];
+    wechatState.message = `已加载 ${wechatState.accountArticles.length} 篇文章。`;
+  } catch (error) {
+    wechatState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wechatState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function loadWCPlusAccounts() {
+  wcplusState.loading = "加载 WC Plus 公众号";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({
+      offset: String(wcplusState.accountOffset),
+      num: String(wcplusState.accountNum),
+    });
+    const payload = await apiFetch(`/api/wcplus/gzh/list?${query.toString()}`);
+    wcplusState.accounts = Array.isArray(payload.accounts) ? payload.accounts : [];
+    wcplusState.selectedAccount = wcplusState.accounts[0] || null;
+    wcplusState.articles = [];
+    if (wcplusState.selectedAccount) {
+      await loadWCPlusArticles(false);
+    }
+    wcplusState.message = `已加载 ${wcplusState.accounts.length} 个公众号。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function loadWCPlusArticles(renderBefore = true) {
+  const account = wcplusState.selectedAccount;
+  const biz = wcplusAccountBiz(account);
+  if (!biz) {
+    return;
+  }
+  wcplusState.loading = "加载 WC Plus 文章";
+  wcplusState.message = "";
+  if (renderBefore) {
+    renderWeChatSource();
+  }
+  try {
+    const query = new URLSearchParams({
+      biz,
+      nickname: wcplusAccountNickname(account),
+      offset: String(wcplusState.articleOffset),
+      num: String(wcplusState.articleNum),
+    });
+    const payload = await apiFetch(`/api/wcplus/gzh/articles?${query.toString()}`);
+    wcplusState.articles = Array.isArray(payload.articles) ? payload.articles : [];
+    wcplusState.message = `已加载 ${wcplusState.articles.length} 篇 WC Plus 文章。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function previewWCPlusArticle(article) {
+  const nickname = wcplusArticleNickname(article) || wcplusAccountNickname(wcplusState.selectedAccount);
+  const id = wcplusArticleID(article);
+  if (!nickname || !id) {
+    wcplusState.message = "文章缺少 nickname 或 id。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "预览 WC Plus 文章";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({ nickname, id });
+    wcplusState.preview = await apiFetch(`/api/wcplus/article/content?${query.toString()}`);
+    wcplusState.message = "WC Plus 文章预览已更新。";
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function importWCPlusArticle(article) {
+  const nickname = wcplusArticleNickname(article) || wcplusAccountNickname(wcplusState.selectedAccount);
+  const id = wcplusArticleID(article);
+  if (!nickname || !id) {
+    wcplusState.message = "文章缺少 nickname 或 id。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "导入 WC Plus 文章";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const payload = await apiFetch("/api/wcplus/import/article", {
+      method: "POST",
+      body: JSON.stringify({ nickname, id }),
+    });
+    wcplusState.message = `已导入：${payload.book?.title || wcplusArticleTitle(article) || id}`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function importWCPlusAccount() {
+  const account = wcplusState.selectedAccount;
+  const biz = wcplusAccountBiz(account);
+  if (!biz) {
+    wcplusState.message = "请先选择公众号。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "批量导入 WC Plus 文章";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const payload = await apiFetch("/api/wcplus/import/account", {
+      method: "POST",
+      body: JSON.stringify({
+        biz,
+        nickname: wcplusAccountNickname(account),
+        limit: wcplusState.importLimit,
+      }),
+    });
+    wcplusState.message = `批量导入完成：${payload.imported_count || 0} 篇。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function checkWCPlusStatus() {
+  wcplusState.loading = "检查 WC Plus 状态";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    wcplusState.serviceStatus = await apiFetch("/api/wcplus/status");
+    wcplusState.message = wcplusState.serviceStatus?.ok ? "WC Plus 本地服务已连接。" : "WC Plus 本地服务未连接。";
+  } catch (error) {
+    wcplusState.serviceStatus = { ok: false };
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function checkWCPlusEnvironment() {
+  wcplusState.loading = "检查 WC Plus 环境";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const result = await apiFetch("/api/wcplus/env/check");
+    wcplusState.serviceStatus = { ok: Boolean(result.ok) };
+    const failed = Array.isArray(result.checks)
+      ? result.checks.filter((item) => !item.ok).map((item) => item.name).join(", ")
+      : "";
+    wcplusState.message = result.ok ? "环境检查通过。" : `环境检查未通过：${failed || "请检查服务状态"}`;
+  } catch (error) {
+    wcplusState.serviceStatus = { ok: false };
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function searchWCPlus() {
+  if (!wcplusState.searchQuery && wcplusState.searchMode !== "all") {
+    wcplusState.message = "请输入搜索关键词。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "搜索 WC Plus";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({
+      q: wcplusState.searchQuery,
+      offset: "0",
+      num: "30",
+      sort: "p_date",
+      direction: "desc",
+    });
+    const endpointByMode = {
+      fulltext: "/api/wcplus/search",
+      title: "/api/wcplus/article/search-title",
+      account: "/api/wcplus/gzh/search",
+      candidate: "/api/wcplus/search-gzh",
+      all: "/api/wcplus/article/all",
+    };
+    const payload = await apiFetch(`${endpointByMode[wcplusState.searchMode] || endpointByMode.fulltext}?${query.toString()}`);
+    if (wcplusState.searchMode === "account" || wcplusState.searchMode === "candidate") {
+      wcplusState.searchResults = firstArray(payload, ["accounts", "Accounts", "gzhs", "Gzhs", "candidates", "Candidates"]);
+    } else {
+      wcplusState.searchResults = firstArray(payload, ["results", "Results", "articles", "Articles", "items", "Items"]);
+    }
+    wcplusState.message = `搜索完成：${wcplusState.searchResults.length} 条结果。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function batchImportWCPlusNicknames() {
+  const nicknames = wcplusState.batchNicknames
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (!nicknames.length) {
+    wcplusState.message = "请先输入公众号昵称。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "批量导入公众号昵称";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const result = await apiFetch("/api/wcplus/batch-import/gzh", {
+      method: "POST",
+      body: JSON.stringify({
+        nicknames,
+        articleListType: "all",
+        start_queue: true,
+        exact_match: wcplusState.batchExactMatch,
+      }),
+    });
+    const successCount = Array.isArray(result.success) ? result.success.length : 0;
+    const failedCount = Array.isArray(result.failed) ? result.failed.length : 0;
+    wcplusState.message = `批量任务完成：成功 ${successCount}，失败 ${failedCount}${result.started ? "，队列已启动" : ""}。`;
+    await loadWCPlusTasks(false);
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function loadWCPlusTasks() {
+  wcplusState.loading = "加载 WC Plus 下载任务";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const payload = await apiFetch("/api/wcplus/task/all");
+    wcplusState.tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+    wcplusState.message = `已加载 ${wcplusState.tasks.length} 个任务。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function createWCPlusTask() {
+  const account = wcplusState.selectedAccount;
+  const biz = wcplusAccountBiz(account);
+  if (!biz) {
+    wcplusState.message = "请先选择公众号。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "创建 WC Plus 同步任务";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const task = await apiFetch("/api/wcplus/task/new", {
+      method: "POST",
+      body: JSON.stringify({ biz, nickname: wcplusAccountNickname(account) }),
+    });
+    wcplusState.message = `已创建同步任务：${task.task_id || wcplusAccountNickname(account) || biz}`;
+    await loadWCPlusTasks(false);
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function createWCPlusBatchTask() {
+  const account = wcplusState.selectedAccount;
+  const biz = wcplusAccountBiz(account);
+  if (!biz) {
+    wcplusState.message = "请先选择公众号。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "创建 WC Plus 批量任务";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const result = await apiFetch("/api/wcplus/batch-task/create", {
+      method: "POST",
+      body: JSON.stringify({ biz, nickname: wcplusAccountNickname(account) }),
+    });
+    wcplusState.message = `批量任务已创建：${firstValue(result, ["task_id", "TaskID", "status", "Status"]) || "已提交"}`;
+    await loadWCPlusTasks(false);
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function controlWCPlusTask(task, action) {
+  if (!task?.task_id) {
+    wcplusState.message = "任务缺少 task_id。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "更新 WC Plus 任务";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const updated = await apiFetch("/api/wcplus/task/control", {
+      method: "POST",
+      body: JSON.stringify({ task_id: task.task_id, action }),
+    });
+    wcplusState.message = `任务状态：${updated.status || action}`;
+    await loadWCPlusTasks(false);
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function runWCPlusQueue() {
+  wcplusState.loading = "启动 WC Plus 队列";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const result = await apiFetch("/api/wcplus/task/control", {
+      method: "POST",
+      body: JSON.stringify({ command: "run" }),
+    });
+    wcplusState.message = `队列已启动：${firstValue(result, ["status", "Status", "message", "Message"]) || "running"}`;
+    await loadWCPlusTasks(false);
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function cleanWCPlusBatchTasks() {
+  wcplusState.loading = "清理 WC Plus 批量任务";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const result = await apiFetch("/api/wcplus/batch-task/delete", {
+      method: "POST",
+      body: JSON.stringify({ status: ["ready", "error"] }),
+    });
+    wcplusState.message = `批量任务已清理：${firstValue(result, ["deleted", "Deleted", "count", "Count"]) || "完成"}`;
+    await loadWCPlusTasks(false);
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function exportWCPlusText() {
+  const account = wcplusState.selectedAccount;
+  const biz = wcplusAccountBiz(account);
+  if (!biz) {
+    wcplusState.message = "请先选择公众号。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "导出 WC Plus TXT";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({
+      biz,
+      nickname: wcplusAccountNickname(account),
+      only_main: "true",
+      need_img: "false",
+      open_dir: "false",
+    });
+    const result = await apiFetch(`/api/wcplus/export/text?${query.toString()}`);
+    wcplusState.message = `TXT 导出已触发：${JSON.stringify(result)}`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function exportWCPlusCSV() {
+  const account = wcplusState.selectedAccount;
+  const biz = wcplusAccountBiz(account);
+  if (!biz) {
+    wcplusState.message = "请先选择公众号。";
+    renderWeChatSource();
+    return;
+  }
+  wcplusState.loading = "导出 WC Plus CSV";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const query = new URLSearchParams({
+      biz,
+      nickname: wcplusAccountNickname(account),
+      open_dir: "false",
+    });
+    const result = await apiFetch(`/api/wcplus/export/gzh-csv?${query.toString()}`);
+    wcplusState.message = `CSV 导出已触发：${JSON.stringify(result)}`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+async function exportWCPlusAllArticlesXLSX() {
+  wcplusState.loading = "导出 WC Plus 全库 XLSX";
+  wcplusState.message = "";
+  renderWeChatSource();
+  try {
+    const size = await apiDownload("/api/wcplus/export/all-articles-xlsx", {
+      method: "POST",
+      body: JSON.stringify({
+        sort: "p_date",
+        direction: "desc",
+        only_headline: false,
+        range_mode: "recent",
+        recent_num: wcplusState.exportRecentNum,
+        fields: [
+          "gzh_nickname",
+          "title",
+          "author",
+          "p_date_text",
+          "read_num",
+          "like_num",
+          "comment_num",
+          "digest",
+          "content_url",
+          "source_url",
+          "content",
+        ],
+      }),
+    }, "wcplus-all-articles.xlsx");
+    wcplusState.message = `XLSX 已下载：${size} bytes。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    renderWeChatSource();
+  }
+}
+
+function bindBookKnowledgeEvents() {
+  document.querySelector("#knowledge-refresh")?.addEventListener("click", () => {
+    loadBookKnowledge();
+  });
+  document.querySelector("#knowledge-search-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    knowledgeState.query = String(data.get("query") || "").trim();
+    await searchBookKnowledge();
+  });
+  for (const button of document.querySelectorAll("[data-book-index]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-book-index") || "0");
+      const book = knowledgeState.books[index] || null;
+      if (book) {
+        await selectKnowledgeBook(book);
+      }
+    });
+  }
+}
+
+async function loadBookKnowledge() {
+  knowledgeState.loading = "加载书籍";
+  knowledgeState.message = "";
+  renderBookKnowledge();
+  try {
+    const payload = await apiFetch("/api/books");
+    knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
+    if (knowledgeState.books.length) {
+      const preferred = knowledgeState.selectedBook?.book_id
+        ? knowledgeState.books.find((book) => book.book_id === knowledgeState.selectedBook.book_id)
+        : null;
+      await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
+    } else {
+      knowledgeState.selectedBook = null;
+      knowledgeState.package = null;
+      knowledgeState.results = [];
+    }
+    knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
+  } catch (error) {
+    knowledgeState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.loading = "";
+    renderBookKnowledge();
+  }
+}
+
+async function selectKnowledgeBook(book, renderBefore = true) {
+  knowledgeState.selectedBook = book;
+  knowledgeState.package = null;
+  knowledgeState.results = [];
+  knowledgeState.loading = "加载详情";
+  if (renderBefore) {
+    renderBookKnowledge();
+  }
+  try {
+    knowledgeState.package = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+  } catch (error) {
+    knowledgeState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.loading = "";
+    if (renderBefore) {
+      renderBookKnowledge();
+    }
+  }
+}
+
+async function searchBookKnowledge() {
+  if (!knowledgeState.query) {
+    knowledgeState.results = [];
+    renderBookKnowledge();
+    return;
+  }
+  knowledgeState.loading = "检索";
+  knowledgeState.message = "";
+  renderBookKnowledge();
+  try {
+    const query = new URLSearchParams({
+      q: knowledgeState.query,
+      book_id: knowledgeState.selectedBook?.book_id || "",
+      limit: "20",
+    });
+    const payload = await apiFetch(`/api/search?${query.toString()}`);
+    knowledgeState.results = Array.isArray(payload.results) ? payload.results : [];
+    knowledgeState.message = `找到 ${knowledgeState.results.length} 条结果。`;
+  } catch (error) {
+    knowledgeState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.loading = "";
+    renderBookKnowledge();
+  }
+}
+
+function formatArticleTime(value) {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(Number(value) * 1000);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return date.toLocaleDateString("zh-CN");
+}
+
+async function boot() {
+  if (window.location.pathname.startsWith("/wechat-source") || window.location.pathname.startsWith("/sources/wechat")) {
+    renderWeChatSource();
+    return;
+  }
+  if (window.location.pathname.startsWith("/book-knowledge")) {
+    renderBookKnowledge();
+    await loadBookKnowledge();
+    return;
+  }
+
+  const bookID = getBookID();
+  if (!bookID) {
+    renderHome();
+    return;
+  }
+  try {
+    const payload = await fetchBook(bookID);
+    renderReader(payload);
+  } catch (error) {
+    renderError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+boot();

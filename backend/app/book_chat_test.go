@@ -46,6 +46,17 @@ func TestLoadBookTokenPlanConfigFromEnvFile(t *testing.T) {
 	}
 }
 
+func TestDefaultTokenPlanEnvFilesDoNotContainPrivatePaths(t *testing.T) {
+	privatePathToken := "/" + "Users" + "/"
+	privateUserToken := "li" + "qiuhua"
+	privateProjectToken := "health" + "-llm-driven"
+	for _, path := range defaultTokenPlanEnvFiles {
+		if strings.Contains(path, privatePathToken) || strings.Contains(path, privateUserToken) || strings.Contains(path, privateProjectToken) {
+			t.Fatalf("default token plan env file leaks a private path: %q", path)
+		}
+	}
+}
+
 func TestBookKnowledgeChatBuildsGroundedPrompt(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")

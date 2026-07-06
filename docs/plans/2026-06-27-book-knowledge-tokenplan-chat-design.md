@@ -12,7 +12,7 @@ First release:
 - Use the selected book knowledge package as the only grounding source.
 - Support quick prompts: summarize, analyze, extract actions, extract executable rules.
 - Call Aliyun TokenPlan through the OpenAI-compatible chat completions API.
-- Reuse `health-llm-driven` TokenPlan configuration:
+- Reuse `reviewed health knowledge system` TokenPlan configuration:
   - `TOKENPLAN_API_KEY`
   - `TOKENPLAN_BASE_URL`
   - `TOKENPLAN_MODEL`
@@ -27,15 +27,15 @@ Not in this release:
 
 ## Architecture
 
-The GUI remains a read-only frontend over the local `book_knowledge` package. A new backend chat layer builds a compact prompt from book metadata, chapter summaries, claims, and a bounded set of matching chunks. It then calls TokenPlan using the same OpenAI-compatible endpoint shape used by `health-llm-driven`.
+The GUI remains a read-only frontend over the local `book_knowledge` package. A new backend chat layer builds a compact prompt from book metadata, chapter summaries, claims, and a bounded set of matching chunks. It then calls TokenPlan using the same OpenAI-compatible endpoint shape used by `reviewed health knowledge system`.
 
 Configuration resolves in this order:
 
 1. `DEDAO_TOKENPLAN_*`
 2. `TOKENPLAN_*`
 3. `DEDAO_TOKENPLAN_ENV_FILE`
-4. `/Users/liqiuhua/work/personal/health-llm-driven/backend/.env`
-5. `/Users/liqiuhua/work/personal/health-llm-driven/.env`
+4. `$DEDAO_TOKENPLAN_ENV_FILE`
+5. `$DEDAO_TOKENPLAN_ENV_FILE`
 
 The fallback is a runtime read, not a committed copy of secrets.
 

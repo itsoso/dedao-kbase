@@ -153,7 +153,7 @@ Expected: PASS.
 
 If `llms-wikis` is installed and the user is logged in, trigger one ebook from the UI. Confirm:
 
-- file is created under `/Users/liqiuhua/work/personal/down-dedao/Ebook`;
+- file is created under `$DEDAO_WIKI_REPO_DIR/Ebook`;
 - wiki ingest runs;
 - `pipeline/compiler.py --changed-only` runs;
 - errors are visible when a command is missing or fails.

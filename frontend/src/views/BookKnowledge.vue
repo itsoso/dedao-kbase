@@ -88,6 +88,155 @@
                     </div>
 
                     <el-tabs v-model="activeTab" class="detail-tabs">
+                        <el-tab-pane label="对话" name="chat">
+                            <div class="chat-pane">
+                                <div class="chat-main">
+                                    <div class="chat-composer">
+                                        <div class="chat-controls">
+                                            <el-select v-model="chatModel" class="model-select" size="small">
+                                                <el-option
+                                                    v-for="model in tokenPlanModels"
+                                                    :key="model.value"
+                                                    :label="model.label"
+                                                    :value="model.value"
+                                                />
+                                            </el-select>
+                                            <div class="prompt-picker">
+                                                <el-select
+                                                    v-model="selectedPromptID"
+                                                    class="prompt-select"
+                                                    size="small"
+                                                    filterable
+                                                    clearable
+                                                    placeholder="选择 Prompt 模板"
+                                                    popper-class="book-prompt-popper"
+                                                    :disabled="!bookPrompts.length"
+                                                    @change="applySelectedPrompt"
+                                                >
+                                                    <el-option-group
+                                                        v-for="group in promptGroups"
+                                                        :key="group.category"
+                                                        :label="group.category"
+                                                    >
+                                                        <el-option
+                                                            v-for="prompt in group.prompts"
+                                                            :key="prompt.prompt_id"
+                                                            :label="prompt.title"
+                                                            :value="prompt.prompt_id"
+                                                        >
+                                                            <div class="prompt-option">
+                                                                <span>{{ prompt.title }}</span>
+                                                                <small>{{ prompt.description }}</small>
+                                                            </div>
+                                                        </el-option>
+                                                    </el-option-group>
+                                                </el-select>
+                                                <el-button
+                                                    size="small"
+                                                    icon="Promotion"
+                                                    :disabled="!selectedPrompt || currentBookChatLoading"
+                                                    @click="runSelectedPrompt"
+                                                >
+                                                    运行模板
+                                                </el-button>
+                                            </div>
+                                            <el-button-group class="quick-actions">
+                                                <el-button size="small" icon="Document" :disabled="currentBookChatLoading" @click="runQuickChat('summary')">总结本书</el-button>
+                                                <el-button size="small" icon="TrendCharts" :disabled="currentBookChatLoading" @click="runQuickChat('analysis')">分析本书</el-button>
+                                                <el-button size="small" icon="List" :disabled="currentBookChatLoading" @click="runQuickChat('actions')">行动清单</el-button>
+                                                <el-button size="small" icon="Operation" :disabled="currentBookChatLoading" @click="runQuickChat('rules')">规则卡</el-button>
+                                            </el-button-group>
+                                        </div>
+                                        <el-input
+                                            v-model="chatQuestion"
+                                            class="question-input"
+                                            type="textarea"
+                                            :rows="4"
+                                            resize="none"
+                                            placeholder="基于当前书籍提问，例如：这本书最值得落地的 3 条方法是什么？"
+                                        />
+                                        <div class="chat-submit">
+                                            <el-button type="primary" icon="Promotion" :disabled="currentBookChatLoading" @click="sendChat">
+                                                {{ currentBookChatLoading ? '生成中' : '发送' }}
+                                            </el-button>
+                                            <span v-if="chatResponse" class="chat-stats">
+                                                {{ chatResponse.model }} · chapters {{ chatResponse.context_stats.chapters }} · claims {{ chatResponse.context_stats.claims }} · chunks {{ chatResponse.context_stats.chunks }}
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <div class="answer-panel answer-report">
+                                        <div v-if="currentBookChatLoading" class="answer-running">
+                                            <span class="running-dot"></span>
+                                            <span>{{ chatResponse ? '正在生成新的结论，当前结论保持可读' : '正在生成结论...' }}</span>
+                                        </div>
+                                        <el-empty v-if="!chatResponse && !currentBookChatLoading" description="选择快捷按钮或输入问题" />
+                                        <el-empty v-else-if="!chatResponse && currentBookChatLoading" description="正在生成结论" :image-size="72" />
+                                        <template v-if="chatResponse">
+                                            <div class="answer-head">
+                                                <div class="answer-head-title">分析结果</div>
+                                                <el-radio-group v-model="answerView" class="answer-view-switch" size="small">
+                                                    <el-radio-button label="rendered">渲染</el-radio-button>
+                                                    <el-radio-button label="raw">Markdown</el-radio-button>
+                                                </el-radio-group>
+                                            </div>
+                                            <div class="answer-body">
+                                                <div
+                                                    v-if="answerView === 'rendered'"
+                                                    class="answer-markdown"
+                                                    v-html="renderedChatAnswer"
+                                                ></div>
+                                                <div v-else class="answer-text">{{ chatResponse.answer }}</div>
+                                                <div v-if="chatResponse.sources.length" class="source-list">
+                                                    <el-tag
+                                                        v-for="source in chatResponse.sources"
+                                                        :key="`${source.kind}:${source.id}`"
+                                                        size="small"
+                                                        effect="plain"
+                                                    >
+                                                        {{ source.kind }}:{{ source.id }}
+                                                    </el-tag>
+                                                </div>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+                                <aside class="history-panel" v-loading="historyLoading">
+                                    <div class="history-head">
+                                        <div>
+                                            <div class="panel-kicker">History</div>
+                                            <div class="history-title">历史记录</div>
+                                        </div>
+                                        <el-button icon="Refresh" circle size="small" @click="loadChatHistory()" />
+                                    </div>
+                                    <el-empty
+                                        v-if="!chatHistory.length && !historyLoading"
+                                        description="暂无历史"
+                                        :image-size="64"
+                                    />
+                                    <div v-else class="history-list">
+                                        <button
+                                            v-for="history in chatHistory"
+                                            :key="history.id"
+                                            type="button"
+                                            class="history-item"
+                                            :class="{ active: history.id === selectedHistoryID }"
+                                            @click="restoreChatHistory(history)"
+                                        >
+                                            <div class="history-top">
+                                                <el-tag size="small" effect="plain">{{ modeLabel(history.mode) }}</el-tag>
+                                                <span class="history-time">{{ formatChatTime(history.created_at) }}</span>
+                                            </div>
+                                            <div class="history-question">{{ history.question || modeLabel(history.mode) }}</div>
+                                            <div class="history-answer">{{ history.answer }}</div>
+                                            <div class="history-meta">
+                                                {{ history.model }} · {{ history.context_stats.claims }} claims · {{ history.context_stats.chunks }} chunks
+                                            </div>
+                                        </button>
+                                    </div>
+                                </aside>
+                            </div>
+                        </el-tab-pane>
+
                         <el-tab-pane label="章节" name="chapters">
                             <div class="chapter-grid">
                                 <el-table
@@ -139,146 +288,6 @@
                                 <el-table-column prop="text" label="内容" min-width="520" />
                                 <el-table-column prop="tokens" label="Tokens" width="90" />
                             </el-table>
-                        </el-tab-pane>
-
-                        <el-tab-pane label="对话" name="chat">
-                            <div class="chat-pane">
-                                <div class="chat-main">
-                                    <div class="chat-composer">
-                                        <div class="chat-controls">
-                                            <el-select v-model="chatModel" class="model-select" size="small">
-                                                <el-option
-                                                    v-for="model in tokenPlanModels"
-                                                    :key="model.value"
-                                                    :label="model.label"
-                                                    :value="model.value"
-                                                />
-                                            </el-select>
-                                            <div class="prompt-picker">
-                                                <el-select
-                                                    v-model="selectedPromptID"
-                                                    class="prompt-select"
-                                                    size="small"
-                                                    filterable
-                                                    clearable
-                                                    placeholder="选择 Prompt 模板"
-                                                    :disabled="!bookPrompts.length"
-                                                    @change="applySelectedPrompt"
-                                                >
-                                                    <el-option-group
-                                                        v-for="group in promptGroups"
-                                                        :key="group.category"
-                                                        :label="group.category"
-                                                    >
-                                                        <el-option
-                                                            v-for="prompt in group.prompts"
-                                                            :key="prompt.prompt_id"
-                                                            :label="prompt.title"
-                                                            :value="prompt.prompt_id"
-                                                        >
-                                                            <div class="prompt-option">
-                                                                <span>{{ prompt.title }}</span>
-                                                                <small>{{ prompt.description }}</small>
-                                                            </div>
-                                                        </el-option>
-                                                    </el-option-group>
-                                                </el-select>
-                                                <el-button
-                                                    size="small"
-                                                    icon="Promotion"
-                                                    :disabled="!selectedPrompt || currentBookChatLoading"
-                                                    @click="runSelectedPrompt"
-                                                >
-                                                    运行模板
-                                                </el-button>
-                                            </div>
-                                            <el-button-group class="quick-actions">
-                                                <el-button size="small" icon="Document" :disabled="currentBookChatLoading" @click="runQuickChat('summary')">总结本书</el-button>
-                                                <el-button size="small" icon="TrendCharts" :disabled="currentBookChatLoading" @click="runQuickChat('analysis')">分析本书</el-button>
-                                                <el-button size="small" icon="List" :disabled="currentBookChatLoading" @click="runQuickChat('actions')">行动清单</el-button>
-                                                <el-button size="small" icon="Operation" :disabled="currentBookChatLoading" @click="runQuickChat('rules')">规则卡</el-button>
-                                            </el-button-group>
-                                        </div>
-                                        <el-input
-                                            v-model="chatQuestion"
-                                            class="question-input"
-                                            type="textarea"
-                                            :rows="4"
-                                            resize="none"
-                                            placeholder="基于当前书籍提问，例如：这本书最值得落地的 3 条方法是什么？"
-                                        />
-                                        <div class="chat-submit">
-                                            <el-button type="primary" icon="Promotion" :loading="currentBookChatLoading" @click="sendChat">
-                                                发送
-                                            </el-button>
-                                            <span v-if="chatResponse" class="chat-stats">
-                                                {{ chatResponse.model }} · chapters {{ chatResponse.context_stats.chapters }} · claims {{ chatResponse.context_stats.claims }} · chunks {{ chatResponse.context_stats.chunks }}
-                                            </span>
-                                        </div>
-                                    </div>
-                                    <div class="answer-panel answer-report" v-loading="currentBookChatLoading">
-                                        <el-empty v-if="!chatResponse && !currentBookChatLoading" description="选择快捷按钮或输入问题" />
-                                        <template v-if="chatResponse">
-                                            <div class="answer-head">
-                                                <el-radio-group v-model="answerView" size="small">
-                                                    <el-radio-button label="rendered">渲染</el-radio-button>
-                                                    <el-radio-button label="raw">Markdown</el-radio-button>
-                                                </el-radio-group>
-                                            </div>
-                                            <div
-                                                v-if="answerView === 'rendered'"
-                                                class="answer-markdown"
-                                                v-html="renderedChatAnswer"
-                                            ></div>
-                                            <div v-else class="answer-text">{{ chatResponse.answer }}</div>
-                                            <div v-if="chatResponse.sources.length" class="source-list">
-                                                <el-tag
-                                                    v-for="source in chatResponse.sources"
-                                                    :key="`${source.kind}:${source.id}`"
-                                                    size="small"
-                                                    effect="plain"
-                                                >
-                                                    {{ source.kind }}:{{ source.id }}
-                                                </el-tag>
-                                            </div>
-                                        </template>
-                                    </div>
-                                </div>
-                                <aside class="history-panel" v-loading="historyLoading">
-                                    <div class="history-head">
-                                        <div>
-                                            <div class="panel-kicker">History</div>
-                                            <div class="history-title">历史记录</div>
-                                        </div>
-                                        <el-button icon="Refresh" circle size="small" @click="loadChatHistory()" />
-                                    </div>
-                                    <el-empty
-                                        v-if="!chatHistory.length && !historyLoading"
-                                        description="暂无历史"
-                                        :image-size="64"
-                                    />
-                                    <div v-else class="history-list">
-                                        <button
-                                            v-for="history in chatHistory"
-                                            :key="history.id"
-                                            type="button"
-                                            class="history-item"
-                                            :class="{ active: history.id === selectedHistoryID }"
-                                            @click="restoreChatHistory(history)"
-                                        >
-                                            <div class="history-top">
-                                                <el-tag size="small" effect="plain">{{ modeLabel(history.mode) }}</el-tag>
-                                                <span class="history-time">{{ formatChatTime(history.created_at) }}</span>
-                                            </div>
-                                            <div class="history-question">{{ history.question || modeLabel(history.mode) }}</div>
-                                            <div class="history-answer">{{ history.answer }}</div>
-                                            <div class="history-meta">
-                                                {{ history.model }} · {{ history.context_stats.claims }} claims · {{ history.context_stats.chunks }} chunks
-                                            </div>
-                                        </button>
-                                    </div>
-                                </aside>
-                            </div>
                         </el-tab-pane>
 
                         <el-tab-pane label="MCP" name="mcp">
@@ -901,7 +910,6 @@ const callBookChat = async (mode: string, question: string) => {
         return
     }
     setBookChatLoading(bookID, true)
-    chatResponse.value = null
     answerView.value = 'rendered'
     activeTab.value = 'chat'
     try {
@@ -1349,29 +1357,81 @@ const callBookChat = async (mode: string, question: string) => {
 }
 
 .answer-panel {
+    display: flex;
+    flex-direction: column;
     min-height: 0;
     flex: 1;
-    overflow: auto;
+    overflow: hidden;
 }
 
 .answer-report {
     border: 1px solid #dfe5ef;
     border-radius: 8px;
-    padding: 18px 22px;
     background: #ffffff;
     text-align: left;
 }
 
 .answer-head {
     display: flex;
+    flex: 0 0 auto;
+    align-items: center;
     justify-content: flex-end;
-    position: sticky;
+    gap: 12px;
     z-index: 1;
-    top: 0;
-    margin: -4px 0 12px;
-    padding-bottom: 8px;
-    background: #ffffff;
+    min-height: 44px;
+    padding: 8px 12px 8px 16px;
+    background: #f8fafc;
     border-bottom: 1px solid #eef2f7;
+}
+
+.answer-head-title {
+    flex: 1;
+    min-width: 0;
+    color: #475569;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 18px;
+}
+
+.answer-view-switch {
+    flex: 0 0 auto;
+}
+
+.answer-view-switch :deep(.el-radio-button__inner) {
+    padding: 5px 11px;
+    color: #4b5563;
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.answer-body {
+    min-height: 0;
+    flex: 1;
+    overflow: auto;
+    padding: 18px 22px;
+}
+
+.answer-running {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 12px 0;
+    border: 1px solid #d8e6f7;
+    border-radius: 7px;
+    padding: 7px 10px;
+    background: #f5f9ff;
+    color: #475569;
+    font-size: 12px;
+    line-height: 18px;
+}
+
+.running-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #409eff;
+    box-shadow: 0 0 0 4px rgb(64 158 255 / 12%);
 }
 
 .answer-text {
@@ -1544,6 +1604,12 @@ const callBookChat = async (mode: string, question: string) => {
     width: 240px;
 }
 
+.prompt-select :deep(.el-input__inner) {
+    color: #1f2937;
+    font-weight: 600;
+    text-align: left;
+}
+
 .prompt-option {
     display: flex;
     flex-direction: column;
@@ -1567,6 +1633,90 @@ const callBookChat = async (mode: string, question: string) => {
     font-size: 11px;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+:global(.book-prompt-popper) {
+    overflow: hidden;
+    border: 1px solid #dbe4f0;
+    border-radius: 8px;
+    background: #ffffff;
+    text-align: left;
+    box-shadow: 0 14px 36px rgb(15 23 42 / 14%);
+}
+
+:global(.book-prompt-popper .el-popper__arrow::before) {
+    border-color: #dbe4f0;
+    background: #ffffff;
+}
+
+:global(.book-prompt-popper .el-select-dropdown__wrap) {
+    max-height: 360px;
+}
+
+:global(.book-prompt-popper .el-select-dropdown__list) {
+    padding: 6px;
+}
+
+:global(.book-prompt-popper .el-select-group__title) {
+    height: auto;
+    padding: 8px 10px 5px;
+    color: #7a8699;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 16px;
+    text-align: left;
+}
+
+:global(.book-prompt-popper .el-select-dropdown__item) {
+    height: auto;
+    min-height: 46px;
+    margin: 2px 0;
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 0;
+    color: #111827;
+    line-height: normal;
+    text-align: left;
+}
+
+:global(.book-prompt-popper .el-select-dropdown__item.hover),
+:global(.book-prompt-popper .el-select-dropdown__item:hover) {
+    border-color: #dbe7f7;
+    background: #f6f9fd;
+}
+
+:global(.book-prompt-popper .el-select-dropdown__item.selected) {
+    border-color: #bcd7ff;
+    background: #eef6ff;
+    color: #0f172a;
+    font-weight: 600;
+}
+
+:global(.book-prompt-popper .prompt-option) {
+    align-items: flex-start;
+    width: 100%;
+    padding: 7px 10px;
+    text-align: left;
+}
+
+:global(.book-prompt-popper .prompt-option span),
+:global(.book-prompt-popper .prompt-option small) {
+    display: block;
+    max-width: 100%;
+    text-align: left;
+}
+
+:global(.book-prompt-popper .prompt-option span) {
+    color: #172033;
+    font-size: 13px;
+    line-height: 18px;
+}
+
+:global(.book-prompt-popper .prompt-option small) {
+    margin-top: 2px;
+    color: #6b778c;
+    font-size: 11px;
+    line-height: 15px;
 }
 
 .notebooklm-panel {
