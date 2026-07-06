@@ -415,6 +415,8 @@ func (h *kbaseHTTPHandler) handleWCPlusPost(w http.ResponseWriter, r *http.Reque
 	switch r.URL.Path {
 	case "/api/wcplus/import/article":
 		h.handleWCPlusImportArticle(w, r)
+	case "/api/wcplus/import/raw":
+		h.handleWCPlusImportRawArticle(w, r)
 	case "/api/wcplus/import/account":
 		h.handleWCPlusImportAccount(w, r)
 	case "/api/wcplus/task/new":
@@ -513,6 +515,21 @@ func (h *kbaseHTTPHandler) handleWCPlusImportArticle(w http.ResponseWriter, r *h
 	pkg, err := h.wcplusService().ImportArticle(r.Context(), h.store, payload)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"book": pkg.Book})
+}
+
+func (h *kbaseHTTPHandler) handleWCPlusImportRawArticle(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var payload WCPlusRawImportRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&payload); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	pkg, err := h.wcplusService().ImportRawArticle(r.Context(), h.store, payload)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"book": pkg.Book})

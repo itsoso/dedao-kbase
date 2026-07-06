@@ -18,6 +18,7 @@ for (const marker of [
   "checkWCPlusEnvironment",
   "searchWCPlus",
   "batchImportWCPlusNicknames",
+  "importRawWCPlusArticle",
   "importWCPlusArticle",
   "importWCPlusAccount",
   "loadWCPlusTasks",
@@ -35,6 +36,7 @@ for (const endpoint of [
   "/api/wcplus/gzh/articles",
   "/api/wcplus/article/content",
   "/api/wcplus/import/article",
+  "/api/wcplus/import/raw",
   "/api/wcplus/import/account",
   "/api/wcplus/status",
   "/api/wcplus/env/check",
@@ -62,6 +64,8 @@ for (const label of [
   "环境检查",
   "搜索 WC Plus",
   "批量导入公众号昵称",
+  "手动导入知识库",
+  "正文 Markdown / 纯文本",
   "同步公众号",
   "批量任务",
   "批量导入",
@@ -87,6 +91,8 @@ for (const selector of [
   "name=\"exportRecentNum\"",
   "name=\"batchArticleListType\"",
   "name=\"batchArticleListAmount\"",
+  "id=\"wcplus-raw-import-form\"",
+  "name=\"rawContent\"",
 ]) {
   assert.ok(js.includes(selector), `WC Plus UI should include ${selector}`);
 }
@@ -99,6 +105,7 @@ for (const className of [
   ".wcplus-source__search-results",
   ".wcplus-source__badge",
   ".wcplus-source__batch-form",
+  ".wcplus-source__manual-form",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }

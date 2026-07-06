@@ -87,6 +87,16 @@ type WCPlusImportArticleRequest struct {
 	BookID   string `json:"book_id,omitempty"`
 }
 
+type WCPlusRawImportRequest struct {
+	ID          string `json:"id,omitempty"`
+	Title       string `json:"title"`
+	Nickname    string `json:"nickname,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Content     string `json:"content"`
+	PublishTime string `json:"publish_time,omitempty"`
+	BookID      string `json:"book_id,omitempty"`
+}
+
 type WCPlusImportAccountRequest struct {
 	Biz          string `json:"biz"`
 	Nickname     string `json:"nickname"`
@@ -263,6 +273,37 @@ func (s *WCPlusSourceService) ImportArticle(ctx context.Context, store *BookKnow
 		return nil, err
 	}
 	pkg := WCPlusArticleToPackage(*content, req.BookID)
+	if err := store.SavePackage(pkg); err != nil {
+		return nil, err
+	}
+	return &pkg, nil
+}
+
+func (s *WCPlusSourceService) ImportRawArticle(ctx context.Context, store *BookKnowledgeStore, req WCPlusRawImportRequest) (*BookKnowledgePackage, error) {
+	if store == nil {
+		return nil, fmt.Errorf("book knowledge store is required")
+	}
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		return nil, fmt.Errorf("title is required")
+	}
+	content := strings.TrimSpace(req.Content)
+	if content == "" {
+		return nil, fmt.Errorf("content is required")
+	}
+	articleID := strings.TrimSpace(req.ID)
+	if articleID == "" {
+		articleID = manualWCPlusArticleID(title, req.Nickname, content)
+	}
+	article := WCPlusArticleContent{
+		ID:          articleID,
+		Title:       title,
+		Nickname:    strings.TrimSpace(req.Nickname),
+		URL:         strings.TrimSpace(req.URL),
+		Content:     content,
+		PublishTime: strings.TrimSpace(req.PublishTime),
+	}
+	pkg := WCPlusArticleToPackage(article, req.BookID)
 	if err := store.SavePackage(pkg); err != nil {
 		return nil, err
 	}
@@ -600,6 +641,15 @@ func wcplusBatchImportText(items []WCPlusBatchImportItem) string {
 		lines = append(lines, strings.TrimSpace(item.Nickname+"\t"+item.Biz+"\t"+item.TaskID))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func manualWCPlusArticleID(title string, nickname string, content string) string {
+	sum := sha1.Sum([]byte(strings.Join([]string{
+		strings.TrimSpace(title),
+		strings.TrimSpace(nickname),
+		strings.TrimSpace(content),
+	}, "|")))
+	return "manual-" + hex.EncodeToString(sum[:])[:12]
 }
 
 func WCPlusArticleToPackage(article WCPlusArticleContent, bookID string) BookKnowledgePackage {

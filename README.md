@@ -110,13 +110,14 @@ WCPLUS_BASE_URL="http://127.0.0.1:5001" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
-`WCPLUS_BASE_URL` 必须指向 kbase 服务端可访问的 WC Plus API。若 kbase 部署在线上服务器，而 WC Plus 只运行在个人 Mac 上，线上服务器无法访问个人 Mac 的 `127.0.0.1:5001`；此时需要把 WC Plus API 放到服务器可达的地址，或在同一台机器上运行 kbase 与 WC Plus。
+`WCPLUS_BASE_URL` 必须指向 kbase 服务端可访问的 WC Plus API。若 kbase 部署在线上服务器，而 WC Plus 只运行在个人 Mac 上，线上服务器无法访问个人 Mac 的 `127.0.0.1:5001`；此时需要把 WC Plus API 放到服务器可达的地址、在同一台机器上运行 kbase 与 WC Plus，或在 `/wcplus-source` 使用“手动导入知识库”粘贴 WC Plus 导出的正文。
 
 常用代理接口：
 
 - `GET /api/wcplus/env/check`：检查 WC Plus 服务和公众号列表 API。
 - `GET /api/wcplus/gzh/list`、`GET /api/wcplus/gzh/articles`、`GET /api/wcplus/article/content`：加载公众号、文章和正文。
 - `POST /api/wcplus/import/article`、`POST /api/wcplus/import/account`：导入单篇或一批文章到书籍知识库。
+- `POST /api/wcplus/import/raw`：将粘贴的标题、公众号、原文链接和 Markdown/纯文本正文直接导入书籍知识库，不依赖 WC Plus API 联通性。
 - `POST /api/wcplus/task/new`、`POST /api/wcplus/task/control`、`GET /api/wcplus/task/all`：创建、启动和查看下载任务。
 - `GET /api/wcplus/search`、`GET /api/wcplus/article/search-title`、`GET /api/wcplus/search-gzh`：全文、标题和公众号候选检索。
 - `GET /api/wcplus/export/text`、`GET /api/wcplus/export/gzh-csv`、`POST /api/wcplus/export/all-articles-xlsx`：触发 TXT/CSV/XLSX 导出。

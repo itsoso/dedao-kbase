@@ -102,6 +102,47 @@ func TestWCPlusSourceImportsArticleIntoBookKnowledge(t *testing.T) {
 	}
 }
 
+func TestWCPlusSourceImportsRawArticleIntoBookKnowledge(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	service := NewWCPlusSourceService(WCPlusSourceConfig{})
+
+	pkg, err := service.ImportRawArticle(context.Background(), store, WCPlusRawImportRequest{
+		Title:       "人工导入文章",
+		Nickname:    "医学参考",
+		URL:         "https://mp.weixin.qq.com/s/manual",
+		Content:     "# 人工导入文章\n\n用指标和来源交叉验证结论。",
+		PublishTime: "2026-07-06",
+		BookID:      "wcplus-manual-health",
+	})
+	if err != nil {
+		t.Fatalf("ImportRawArticle returned error: %v", err)
+	}
+	if pkg.Book.BookID != "wcplus-manual-health" || pkg.Book.Title != "人工导入文章" {
+		t.Fatalf("unexpected book metadata: %#v", pkg.Book)
+	}
+	if pkg.Book.Author != "医学参考" || pkg.Book.SourceHTML != "https://mp.weixin.qq.com/s/manual" {
+		t.Fatalf("unexpected book source: %#v", pkg.Book)
+	}
+	if len(pkg.Chunks) != 1 || !strings.Contains(pkg.Chunks[0].Text, "交叉验证结论") {
+		t.Fatalf("unexpected chunks: %#v", pkg.Chunks)
+	}
+
+	saved, err := store.LoadPackage("wcplus-manual-health")
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if saved.Book.Title != "人工导入文章" {
+		t.Fatalf("saved title = %q", saved.Book.Title)
+	}
+
+	if _, err := service.ImportRawArticle(context.Background(), store, WCPlusRawImportRequest{
+		Title:   "缺正文",
+		Content: "   ",
+	}); err == nil || !strings.Contains(err.Error(), "content is required") {
+		t.Fatalf("missing content error = %v", err)
+	}
+}
+
 func TestWCPlusSourceCreatesAndControlsTasks(t *testing.T) {
 	var sawCreate bool
 	var sawControl bool

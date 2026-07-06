@@ -289,6 +289,42 @@ func TestKBaseHTTPHandlerProxiesAndImportsWCPlusArticles(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerImportsRawWCPlusArticle(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		WCPlus:    NewWCPlusSourceService(WCPlusSourceConfig{}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/wcplus/import/raw", bytes.NewBufferString(`{
+		"title":"人工导入文章",
+		"nickname":"医学参考",
+		"url":"https://mp.weixin.qq.com/s/manual",
+		"content":"# 人工导入文章\n\n用指标和来源交叉验证结论。",
+		"book_id":"wcplus-manual-health"
+	}`))
+	req.Header.Set("Authorization", "Bearer secret-token")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusOK {
+		t.Fatalf("raw import status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"book_id":"wcplus-manual-health"`) {
+		t.Fatalf("raw import response missing book id: %s", resp.Body.String())
+	}
+
+	pkg, err := store.LoadPackage("wcplus-manual-health")
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if pkg.Book.Extractor != "wcplus-source-adapter" || !strings.Contains(pkg.Chunks[0].Text, "交叉验证结论") {
+		t.Fatalf("unexpected imported package: %#v", pkg)
+	}
+}
+
 func TestKBaseHTTPHandlerProxiesAdvancedWCPlusAPIs(t *testing.T) {
 	var sawQueueRun bool
 	var sawBatchCreate bool

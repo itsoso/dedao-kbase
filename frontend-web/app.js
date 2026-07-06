@@ -44,6 +44,12 @@ const wcplusState = {
   batchExactMatch: true,
   batchArticleListType: "all",
   batchArticleListAmount: 0,
+  rawTitle: "",
+  rawNickname: "",
+  rawURL: "",
+  rawBookID: "",
+  rawContent: "",
+  rawImported: null,
   loading: "",
   message: "",
 };
@@ -571,6 +577,13 @@ function renderWCPlusSource(showOwnStatus = true) {
       </div>
     </div>
   `).join("");
+  const rawImportedBook = wcplusState.rawImported?.book;
+  const rawImportedHTML = rawImportedBook
+    ? `<div class="wcplus-source__imported">
+        <strong>已导入：${escapeHTML(rawImportedBook.title || rawImportedBook.book_id || "WC Plus 文章")}</strong>
+        <a href="/book-knowledge" data-link>打开书籍知识库</a>
+      </div>`
+    : "";
   const status = wcplusState.loading
     ? `<div class="web-status">处理中：${escapeHTML(wcplusState.loading)}</div>`
     : (wcplusState.message ? `<div class="web-status">${escapeHTML(wcplusState.message)}</div>` : "");
@@ -722,6 +735,32 @@ function renderWCPlusSource(showOwnStatus = true) {
           </label>
           <button class="button button-primary" type="submit">创建链接任务并启动队列</button>
         </form>
+        <form id="wcplus-raw-import-form" class="wcplus-source__manual-form">
+          <label>
+            <span>原文标题</span>
+            <input name="rawTitle" value="${escapeAttribute(wcplusState.rawTitle)}" placeholder="文章标题">
+          </label>
+          <label>
+            <span>公众号/作者</span>
+            <input name="rawNickname" value="${escapeAttribute(wcplusState.rawNickname)}" placeholder="公众号或作者">
+          </label>
+          <label>
+            <span>原文链接</span>
+            <input name="rawURL" value="${escapeAttribute(wcplusState.rawURL)}" placeholder="https://mp.weixin.qq.com/s/...">
+          </label>
+          <label>
+            <span>知识库 ID（可选）</span>
+            <input name="rawBookID" value="${escapeAttribute(wcplusState.rawBookID)}" placeholder="留空自动生成">
+          </label>
+          <label class="is-wide">
+            <span>正文 Markdown / 纯文本</span>
+            <textarea name="rawContent" placeholder="粘贴 WC Plus 导出的正文、Markdown 或清洗后的纯文本">${escapeHTML(wcplusState.rawContent)}</textarea>
+          </label>
+          <div class="wcplus-source__manual-actions">
+            <button class="button button-primary" type="submit">手动导入知识库</button>
+          </div>
+        </form>
+        ${rawImportedHTML}
         ${taskRows || "<p class=\"web-muted\">点击“下载任务”查看 WC Plus 同步任务。</p>"}
       </section>
     </section>
@@ -903,6 +942,16 @@ function bindWCPlusEvents() {
     wcplusState.batchArticleListType = String(data.get("batchArticleListType") || "all");
     wcplusState.batchArticleListAmount = boundedNumber(data.get("batchArticleListAmount"), 0, 1000, 0);
     await batchImportWCPlusNicknames();
+  });
+  document.querySelector("#wcplus-raw-import-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    wcplusState.rawTitle = String(data.get("rawTitle") || "").trim();
+    wcplusState.rawNickname = String(data.get("rawNickname") || "").trim();
+    wcplusState.rawURL = String(data.get("rawURL") || "").trim();
+    wcplusState.rawBookID = String(data.get("rawBookID") || "").trim();
+    wcplusState.rawContent = String(data.get("rawContent") || "");
+    await importRawWCPlusArticle();
   });
   for (const button of document.querySelectorAll("[data-wcplus-account-page]")) {
     button.addEventListener("click", async () => {
@@ -1232,6 +1281,40 @@ async function importWCPlusArticle(article) {
       body: JSON.stringify({ nickname, id }),
     });
     wcplusState.message = `已导入：${payload.book?.title || wcplusArticleTitle(article) || id}`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    refreshWCPlusView();
+  }
+}
+
+async function importRawWCPlusArticle() {
+  if (!wcplusState.rawTitle) {
+    wcplusState.message = "请先输入原文标题。";
+    refreshWCPlusView();
+    return;
+  }
+  if (!wcplusState.rawContent.trim()) {
+    wcplusState.message = "请先粘贴正文内容。";
+    refreshWCPlusView();
+    return;
+  }
+  wcplusState.loading = "手动导入 WC Plus 文章";
+  wcplusState.message = "";
+  refreshWCPlusView();
+  try {
+    wcplusState.rawImported = await apiFetch("/api/wcplus/import/raw", {
+      method: "POST",
+      body: JSON.stringify({
+        title: wcplusState.rawTitle,
+        nickname: wcplusState.rawNickname,
+        url: wcplusState.rawURL,
+        book_id: wcplusState.rawBookID,
+        content: wcplusState.rawContent,
+      }),
+    });
+    wcplusState.message = `已手动导入：${wcplusState.rawImported?.book?.title || wcplusState.rawTitle}`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {

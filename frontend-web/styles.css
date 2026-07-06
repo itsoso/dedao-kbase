@@ -534,7 +534,8 @@ a.button {
 .wcplus-source__options input,
 .wcplus-source__options select,
 .wcplus-source__batch-form input,
-.wcplus-source__batch-form select {
+.wcplus-source__batch-form select,
+.wcplus-source__manual-form input {
   width: 100%;
   min-height: 38px;
   border: 1px solid rgba(141, 132, 117, 0.24);
@@ -720,19 +721,41 @@ a.button {
   background: rgba(255, 253, 248, 0.78);
 }
 
+.wcplus-source__manual-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+  align-items: end;
+  gap: 10px;
+  border: 1px solid rgba(44, 122, 107, 0.16);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(44, 122, 107, 0.05);
+}
+
 .wcplus-source__batch-form label {
   display: grid;
   gap: 6px;
 }
 
+.wcplus-source__manual-form label {
+  display: grid;
+  gap: 6px;
+}
+
+.wcplus-source__manual-form label.is-wide {
+  grid-column: 1 / -1;
+}
+
 .wcplus-source__batch-form label > span,
+.wcplus-source__manual-form label > span,
 .wcplus-source__inline-check span {
   color: #6f6658;
   font-size: 12px;
   font-weight: 800;
 }
 
-.wcplus-source__batch-form textarea {
+.wcplus-source__batch-form textarea,
+.wcplus-source__manual-form textarea {
   width: 100%;
   min-height: 82px;
   border: 1px solid rgba(141, 132, 117, 0.24);
@@ -744,9 +767,42 @@ a.button {
   resize: vertical;
 }
 
-.wcplus-source__batch-form textarea:focus {
+.wcplus-source__manual-form textarea {
+  min-height: 150px;
+}
+
+.wcplus-source__batch-form textarea:focus,
+.wcplus-source__manual-form input:focus,
+.wcplus-source__manual-form textarea:focus {
   border-color: #ff6b00;
   box-shadow: 0 0 0 3px rgba(255, 107, 0, 0.12);
+}
+
+.wcplus-source__manual-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.wcplus-source__imported {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(44, 122, 107, 0.16);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(44, 122, 107, 0.08);
+}
+
+.wcplus-source__imported strong {
+  color: #234c45;
+}
+
+.wcplus-source__imported a {
+  color: #ff6b00;
+  font-weight: 800;
+  text-decoration: none;
 }
 
 .wcplus-source__inline-check {
@@ -1257,6 +1313,7 @@ a.button {
 
   .wcplus-source__toolbar,
   .wcplus-source__batch-form,
+  .wcplus-source__manual-form,
   .wcplus-source__task,
   .wcplus-source__article {
     align-items: flex-start;
