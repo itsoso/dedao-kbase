@@ -591,6 +591,33 @@ func TestKBaseHTTPHandlerServesVerifiedEvidencePack(t *testing.T) {
 	if err := json.Unmarshal(packResp.Body.Bytes(), &servedPack); err != nil {
 		t.Fatalf("evidence pack response is not JSON: %v", err)
 	}
+	manifestResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack/manifest?limit=10", "secret-token")
+	if manifestResp.Code != http.StatusOK {
+		t.Fatalf("evidence pack manifest status = %d, body=%s", manifestResp.Code, manifestResp.Body.String())
+	}
+	manifestBody := manifestResp.Body.String()
+	for _, want := range []string{
+		`"consumer_contract":"verified_evidence_pull_manifest_v1"`,
+		`"project_id":"health"`,
+		`"current_pack"`,
+		`"pack_id":"` + servedPack.PackID + `"`,
+		`"record_count":3`,
+		`"evidence_pack_url":"/api/projects/health/evidence-pack?limit=10"`,
+		`"evidence_pack_jsonl_url":"/api/projects/health/evidence-pack/export?format=jsonl&limit=10"`,
+		`"diff_url_template":"/api/projects/health/evidence-pack/diff?previous_pack_id={pack_id}&limit=10"`,
+		`"domain_pack_url":"/api/projects/health/authority-pack?limit=10"`,
+		`"must_check_source_fingerprint":true`,
+		`"must_reject_blocked":true`,
+	} {
+		if !strings.Contains(manifestBody, want) {
+			t.Fatalf("evidence pack manifest missing %q: %s", want, manifestBody)
+		}
+	}
+	for _, forbidden := range []string{"/tmp/", "secret-token", "verify-book.html"} {
+		if strings.Contains(manifestBody, forbidden) {
+			t.Fatalf("evidence pack manifest leaked %q: %s", forbidden, manifestBody)
+		}
+	}
 	missingDiffResp := requestKBase(handler, http.MethodGet, "/api/projects/health/evidence-pack/diff?previous_pack_id=missing-pack", "secret-token")
 	if missingDiffResp.Code != http.StatusNotFound ||
 		!strings.Contains(missingDiffResp.Body.String(), "previous_pack_not_found") {

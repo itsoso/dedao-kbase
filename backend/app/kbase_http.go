@@ -483,6 +483,18 @@ func (h *kbaseHTTPHandler) handleProjectSubroute(w http.ResponseWriter, r *http.
 		}
 		writeHTTPJSON(w, http.StatusOK, collection)
 	case "evidence-pack":
+		if len(parts) == 3 && parts[2] == "manifest" {
+			if !requireHTTPMethod(w, r, http.MethodGet) {
+				return
+			}
+			manifest, err := h.store.BuildVerifiedEvidencePullManifest(projectID, limit)
+			if err != nil {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeHTTPJSON(w, http.StatusOK, manifest)
+			return
+		}
 		if len(parts) == 3 && parts[2] == "diff" {
 			if !requireHTTPMethod(w, r, http.MethodGet) {
 				return

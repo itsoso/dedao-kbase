@@ -411,6 +411,34 @@
                 {{ item.action }}: {{ item.count }}
               </span>
             </div>
+            <section v-if="evidencePullManifest" class="project-summary evidence-pack-manifest-summary">
+              <div>
+                <span>Pull Contract</span>
+                <strong>{{ evidencePullManifest.consumer_contract }}</strong>
+              </div>
+              <div>
+                <span>Gate</span>
+                <strong>{{ evidencePullManifest.consumer_gate.mode }}</strong>
+              </div>
+              <div>
+                <span>Pack Records</span>
+                <strong>{{ evidencePullManifest.current_pack.record_count }}</strong>
+              </div>
+              <div>
+                <span>Human Loop</span>
+                <strong>{{ evidencePullManifest.consumer_gate.human_loop }}</strong>
+              </div>
+            </section>
+            <div v-if="evidencePullManifest" class="source-chips">
+              <span>{{ evidencePullManifest.consumer_gate.must_check_source_fingerprint ? 'check fingerprint' : 'fingerprint optional' }}</span>
+              <span>{{ evidencePullManifest.consumer_gate.must_reject_blocked ? 'reject blocked' : 'blocked optional' }}</span>
+              <span v-for="action in evidencePullManifest.next_actions" :key="`pull-action:${action}`">{{ action }}</span>
+            </div>
+            <div v-if="evidencePullManifest" class="project-endpoint-list">
+              <code>{{ evidencePullManifest.endpoints.evidence_pack_jsonl_url }}</code>
+              <code>{{ evidencePullManifest.endpoints.diff_url_template }}</code>
+              <code v-if="evidencePullManifest.endpoints.domain_pack_jsonl_url">{{ evidencePullManifest.endpoints.domain_pack_jsonl_url }}</code>
+            </div>
             <div class="evidence-pack-controls">
               <input v-model="previousEvidencePackID" placeholder="previous_pack_id" />
               <button
@@ -447,6 +475,7 @@
                 <strong>{{ evidencePackDiff.source_unchanged ? 'unchanged' : 'changed' }}</strong>
               </div>
             </section>
+            <code class="project-export-route">{{ evidencePackManifestPath }}</code>
             <code class="project-export-route">{{ evidencePackExportPath }}</code>
             <pre v-if="evidencePackExportText" class="job-result project-export-preview">{{ evidencePackExportText }}</pre>
           </section>
@@ -660,6 +689,7 @@ import {
   type HealthAuthorityPack,
   type VerifiedEvidencePack,
   type VerifiedEvidencePackDiff,
+  type VerifiedEvidencePullManifest,
 } from '../api'
 import { renderMarkdown } from '../utils/markdownRender'
 
@@ -748,6 +778,7 @@ const projectCollection = ref<BookKnowledgeProjectCollection | null>(null)
 const projectAuditQueue = ref<BookKnowledgeProjectAuditQueue | null>(null)
 const evidencePack = ref<VerifiedEvidencePack | null>(null)
 const evidencePackDiff = ref<VerifiedEvidencePackDiff | null>(null)
+const evidencePullManifest = ref<VerifiedEvidencePullManifest | null>(null)
 const healthAuthorityPack = ref<HealthAuthorityPack | null>(null)
 const projectCollectionExportText = ref('')
 const evidencePackExportText = ref('')
@@ -784,6 +815,11 @@ const projectCollectionExportPath = computed(() => {
 const evidencePackExportPath = computed(() => {
   const projectID = encodeURIComponent(selectedProjectID.value || 'health')
   return `/api/projects/${projectID}/evidence-pack/export?format=jsonl`
+})
+
+const evidencePackManifestPath = computed(() => {
+  const projectID = encodeURIComponent(selectedProjectID.value || 'health')
+  return `/api/projects/${projectID}/evidence-pack/manifest`
 })
 
 const healthAuthorityPackExportPath = computed(() => '/api/projects/health/authority-pack/export?format=jsonl')
@@ -1048,12 +1084,13 @@ const loadProjectHub = async () => {
     if (!selectedProjectID.value && projects.value.length) {
       selectedProjectID.value = projects.value[0].project_id
     }
-    const [queue, preview, verification, collectionState, evidencePackState, authorityPackState] = await Promise.all([
+    const [queue, preview, verification, collectionState, evidencePackState, manifestState, authorityPackState] = await Promise.all([
       client.value.getProjectReviewQueue(projectID, 20),
       client.value.getProjectExportPreview(projectID, 20),
       client.value.getProjectVerificationReport(projectID, 20),
       loadProjectCollectionState(projectID),
       loadEvidencePackState(projectID),
+      loadEvidencePullManifestState(projectID),
       loadHealthAuthorityPackState(projectID),
     ])
     if (selectedProjectID.value === projectID) {
@@ -1063,6 +1100,7 @@ const loadProjectHub = async () => {
       projectCollection.value = collectionState.collection
       projectAuditQueue.value = collectionState.auditQueue
       evidencePack.value = evidencePackState
+      evidencePullManifest.value = manifestState
       previousEvidencePackID.value = previousEvidencePackID.value || evidencePackState?.pack_id || ''
       healthAuthorityPack.value = authorityPackState
     }
@@ -1084,6 +1122,7 @@ const selectProject = async (projectID: string) => {
   projectAuditQueue.value = null
   evidencePack.value = null
   evidencePackDiff.value = null
+  evidencePullManifest.value = null
   healthAuthorityPack.value = null
   previousEvidencePackID.value = ''
   projectCollectionExportText.value = ''
@@ -1111,6 +1150,18 @@ const loadProjectCollectionState = async (projectID: string) => {
 const loadEvidencePackState = async (projectID: string) => {
   try {
     return await client.value.getProjectEvidencePack(projectID, 25)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (message.includes('HTTP 404')) {
+      return null
+    }
+    throw error
+  }
+}
+
+const loadEvidencePullManifestState = async (projectID: string) => {
+  try {
+    return await client.value.getProjectEvidencePullManifest(projectID, 25)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (message.includes('HTTP 404')) {
@@ -1151,6 +1202,7 @@ const refreshProjectCollection = async () => {
       verificationReport.value = await client.value.getProjectVerificationReport(projectID, 25)
       const previousPackID = evidencePack.value?.pack_id || ''
       evidencePack.value = await loadEvidencePackState(projectID)
+      evidencePullManifest.value = await loadEvidencePullManifestState(projectID)
       previousEvidencePackID.value = previousPackID || evidencePack.value?.pack_id || ''
       evidencePackDiff.value = null
       healthAuthorityPack.value = await loadHealthAuthorityPackState(projectID)
@@ -1177,6 +1229,7 @@ const refreshEvidencePack = async () => {
   try {
     const previousPackID = evidencePack.value?.pack_id || previousEvidencePackID.value
     evidencePack.value = await client.value.getProjectEvidencePack(projectID, 25)
+    evidencePullManifest.value = await client.value.getProjectEvidencePullManifest(projectID, 25)
     previousEvidencePackID.value = previousPackID || evidencePack.value?.pack_id || ''
     evidencePackDiff.value = null
     evidencePackExportText.value = ''

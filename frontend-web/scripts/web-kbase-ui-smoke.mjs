@@ -146,6 +146,7 @@ for (const surface of [
   'getProjectEvidencePack',
   'getProjectEvidencePackExport',
   'getProjectEvidencePackDiff',
+  'getProjectEvidencePullManifest',
   'getSystemKBManifest',
   'getSystemKBExport',
 ]) {
@@ -171,13 +172,16 @@ assert.ok(workbenchSource.includes('projectCollection'), 'KBaseWorkbench.vue sho
 assert.ok(workbenchSource.includes('projectAuditQueue'), 'KBaseWorkbench.vue should render project async audit queue items')
 assert.ok(workbenchSource.includes('evidencePack'), 'KBaseWorkbench.vue should render the base verified evidence pack panel')
 assert.ok(workbenchSource.includes('evidencePackDiff'), 'KBaseWorkbench.vue should render evidence pack diff results')
+assert.ok(workbenchSource.includes('evidencePullManifest'), 'KBaseWorkbench.vue should render the evidence pull manifest')
 assert.ok(workbenchSource.includes('previousEvidencePackID'), 'KBaseWorkbench.vue should let users enter a previous pack id')
 assert.ok(workbenchSource.includes('verified_evidence_pack_v1'), 'KBaseWorkbench.vue should show the verified evidence pack contract')
+assert.ok(workbenchSource.includes('verified_evidence_pull_manifest_v1') || workbenchSource.includes('consumer_gate'), 'KBaseWorkbench.vue should show the pull manifest contract or gate')
 assert.ok(workbenchSource.includes('source_unchanged'), 'KBaseWorkbench.vue should show evidence pack source unchanged status')
 assert.ok(workbenchSource.includes('quality_summary'), 'KBaseWorkbench.vue should show evidence pack quality summary counts')
 assert.ok(workbenchSource.includes('evidencePackTopRiskReasons'), 'KBaseWorkbench.vue should show top evidence pack risk reasons')
 assert.ok(workbenchSource.includes('evidencePackRecommendedActions'), 'KBaseWorkbench.vue should show evidence pack recommended actions')
 assert.ok(workbenchSource.includes('evidence-pack/export?format=jsonl'), 'KBaseWorkbench.vue should expose evidence pack JSONL export')
+assert.ok(workbenchSource.includes('evidence-pack/manifest'), 'KBaseWorkbench.vue should expose evidence pack pull manifest')
 assert.ok(workbenchSource.includes('evidence-pack/diff'), 'KBaseWorkbench.vue should expose evidence pack diff action')
 assert.ok(workbenchSource.includes('healthAuthorityPack'), 'KBaseWorkbench.vue should render the Health Authority Pack panel')
 assert.ok(workbenchSource.includes('health-authority-pack'), 'KBaseWorkbench.vue should expose the health authority pack endpoint')
@@ -232,9 +236,11 @@ assert.ok(apiSource.includes('BookKnowledgeProjectAuditQueue'), 'api.ts should t
 assert.ok(apiSource.includes('HealthAuthorityPack'), 'api.ts should type Health Authority Pack responses')
 assert.ok(apiSource.includes('VerifiedEvidencePack'), 'api.ts should type Verified Evidence Pack responses')
 assert.ok(apiSource.includes('VerifiedEvidencePackDiff'), 'api.ts should type Verified Evidence Pack diff responses')
+assert.ok(apiSource.includes('VerifiedEvidencePullManifest'), 'api.ts should type Verified Evidence Pull Manifest responses')
 assert.ok(apiSource.includes('getProjectEvidencePack'), 'api.ts should expose project evidence pack fetch')
 assert.ok(apiSource.includes('getProjectEvidencePackExport'), 'api.ts should expose project evidence pack JSONL export')
 assert.ok(apiSource.includes('getProjectEvidencePackDiff'), 'api.ts should expose project evidence pack diff')
+assert.ok(apiSource.includes('getProjectEvidencePullManifest'), 'api.ts should expose project evidence pull manifest fetch')
 assert.ok(apiSource.includes('refreshHealthAuthorityPack'), 'api.ts should expose Health Authority Pack refresh')
 assert.ok(apiSource.includes('getHealthAuthorityPackExport'), 'api.ts should expose Health Authority Pack JSONL export')
 assert.ok(apiSource.includes('blocked_count'), 'api.ts should type Health Authority Pack blocked counts')
@@ -248,6 +254,7 @@ assert.ok(apiSource.includes('authority-pack/refresh'), 'api.ts should call Heal
 assert.ok(apiSource.includes('authority-pack/export?format=jsonl'), 'api.ts should call Health Authority Pack JSONL export endpoints')
 assert.ok(apiSource.includes('evidence-pack/export?format=jsonl'), 'api.ts should call Verified Evidence Pack JSONL export endpoints')
 assert.ok(apiSource.includes('evidence-pack/diff?previous_pack_id='), 'api.ts should call Verified Evidence Pack diff endpoints')
+assert.ok(apiSource.includes('evidence-pack/manifest'), 'api.ts should call Verified Evidence Pull Manifest endpoints')
 assert.ok(apiSource.includes('requestText'), 'api.ts should support text responses for JSONL exports')
 assert.ok(apiSource.includes('/api/dedao/session'), 'api.ts should call the Dedao session endpoint')
 assert.ok(apiSource.includes('/api/dedao/auth/qrcode'), 'api.ts should call the Dedao QR login endpoint')

@@ -1054,6 +1054,24 @@ label span {
   min-width: 68px;
 }
 
+.project-endpoint-list {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.project-endpoint-list code {
+  display: block;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--dedao-border);
+  border-radius: 6px;
+  background: #fafafa;
+  color: #555555;
+  font-size: 11px;
+  line-height: 16px;
+}
+
 .project-export-route {
   display: block;
   margin-top: 8px;

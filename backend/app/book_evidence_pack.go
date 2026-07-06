@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,10 +16,11 @@ import (
 )
 
 const (
-	VerifiedEvidencePackContractV1      = "verified_evidence_pack_v1"
-	verifiedEvidencePackSchemaVersion   = "1"
-	verifiedEvidenceSourceTypeDedaoBook = "dedao_book_claim"
-	verifiedEvidencePackDirName         = "evidence_packs"
+	VerifiedEvidencePackContractV1         = "verified_evidence_pack_v1"
+	VerifiedEvidencePullManifestContractV1 = "verified_evidence_pull_manifest_v1"
+	verifiedEvidencePackSchemaVersion      = "1"
+	verifiedEvidenceSourceTypeDedaoBook    = "dedao_book_claim"
+	verifiedEvidencePackDirName            = "evidence_packs"
 )
 
 type VerifiedEvidencePack struct {
@@ -140,6 +142,46 @@ type VerifiedEvidencePackDiffRecord struct {
 	PreviousNormalizedClaim string                     `json:"previous_normalized_claim,omitempty"`
 }
 
+type VerifiedEvidencePullManifest struct {
+	ConsumerContract string                               `json:"consumer_contract"`
+	SchemaVersion    string                               `json:"schema_version"`
+	GeneratedAt      string                               `json:"generated_at"`
+	ProjectID        string                               `json:"project_id"`
+	TargetSystem     string                               `json:"target_system"`
+	ExportType       string                               `json:"export_type"`
+	CurrentPack      VerifiedEvidencePullManifestPack     `json:"current_pack"`
+	Endpoints        VerifiedEvidencePullManifestEndpoint `json:"endpoints"`
+	ConsumerGate     VerifiedEvidencePullManifestGate     `json:"consumer_gate"`
+	NextActions      []string                             `json:"next_actions"`
+}
+
+type VerifiedEvidencePullManifestPack struct {
+	ConsumerContract  string                             `json:"consumer_contract"`
+	PackID            string                             `json:"pack_id"`
+	GeneratedAt       string                             `json:"generated_at"`
+	SourceFingerprint string                             `json:"source_fingerprint"`
+	SourceUnchanged   bool                               `json:"source_unchanged"`
+	RecordCount       int                                `json:"record_count"`
+	QualitySummary    VerifiedEvidencePackQualitySummary `json:"quality_summary"`
+}
+
+type VerifiedEvidencePullManifestEndpoint struct {
+	EvidencePackURL      string `json:"evidence_pack_url"`
+	EvidencePackJSONLURL string `json:"evidence_pack_jsonl_url"`
+	DiffURLTemplate      string `json:"diff_url_template"`
+	DomainPackURL        string `json:"domain_pack_url,omitempty"`
+	DomainPackJSONLURL   string `json:"domain_pack_jsonl_url,omitempty"`
+}
+
+type VerifiedEvidencePullManifestGate struct {
+	Mode                       string   `json:"mode"`
+	MustCheckSourceFingerprint bool     `json:"must_check_source_fingerprint"`
+	MustRejectBlocked          bool     `json:"must_reject_blocked"`
+	AllowedUses                []string `json:"allowed_uses,omitempty"`
+	BlockedUses                []string `json:"blocked_uses,omitempty"`
+	HumanLoop                  string   `json:"human_loop"`
+}
+
 func (s *BookKnowledgeStore) BuildVerifiedEvidencePack(projectID string, limit int) (*VerifiedEvidencePack, error) {
 	collection, err := s.RefreshProjectCollection(projectID, limit)
 	if err != nil {
@@ -193,6 +235,41 @@ func (s *BookKnowledgeStore) BuildVerifiedEvidencePackDiff(projectID, previousPa
 		return nil, err
 	}
 	return buildVerifiedEvidencePackDiff(current, previous), nil
+}
+
+func (s *BookKnowledgeStore) BuildVerifiedEvidencePullManifest(projectID string, limit int) (*VerifiedEvidencePullManifest, error) {
+	pack, err := s.BuildVerifiedEvidencePack(projectID, limit)
+	if err != nil {
+		return nil, err
+	}
+	endpoints := verifiedEvidencePullManifestEndpoints(projectID, limit)
+	return &VerifiedEvidencePullManifest{
+		ConsumerContract: VerifiedEvidencePullManifestContractV1,
+		SchemaVersion:    verifiedEvidencePackSchemaVersion,
+		GeneratedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		ProjectID:        pack.ProjectID,
+		TargetSystem:     pack.TargetSystem,
+		ExportType:       pack.ExportType,
+		CurrentPack: VerifiedEvidencePullManifestPack{
+			ConsumerContract:  pack.ConsumerContract,
+			PackID:            pack.PackID,
+			GeneratedAt:       pack.GeneratedAt,
+			SourceFingerprint: pack.SourceFingerprint,
+			SourceUnchanged:   pack.SourceUnchanged,
+			RecordCount:       len(pack.Records),
+			QualitySummary:    pack.QualitySummary,
+		},
+		Endpoints: endpoints,
+		ConsumerGate: VerifiedEvidencePullManifestGate{
+			Mode:                       "pull_and_verify",
+			MustCheckSourceFingerprint: true,
+			MustRejectBlocked:          true,
+			AllowedUses:                append([]string(nil), pack.Policy.DefaultAllowedUses...),
+			BlockedUses:                append([]string(nil), pack.Policy.DefaultBlockedUses...),
+			HumanLoop:                  pack.Policy.HumanLoop,
+		},
+		NextActions: verifiedEvidencePullManifestNextActions(projectID),
+	}, nil
 }
 
 func (s *BookKnowledgeStore) ProjectEvidencePackDir(projectID string) string {
@@ -332,6 +409,49 @@ func buildVerifiedEvidencePackDiff(current, previous *VerifiedEvidencePack) *Ver
 		Blocked:   verifiedEvidenceBlockedCount(current.Records),
 	}
 	return diff
+}
+
+func verifiedEvidencePullManifestEndpoints(projectID string, limit int) VerifiedEvidencePullManifestEndpoint {
+	projectPath := url.PathEscape(projectID)
+	limitSuffix := ""
+	if limit > 0 {
+		limitSuffix = "&limit=" + url.QueryEscape(fmt.Sprintf("%d", limit))
+	}
+	packQuery := "?limit=" + url.QueryEscape(fmt.Sprintf("%d", limit))
+	if limit <= 0 {
+		packQuery = ""
+	}
+	endpoints := VerifiedEvidencePullManifestEndpoint{
+		EvidencePackURL:      "/api/projects/" + projectPath + "/evidence-pack" + packQuery,
+		EvidencePackJSONLURL: "/api/projects/" + projectPath + "/evidence-pack/export?format=jsonl" + limitSuffix,
+		DiffURLTemplate:      "/api/projects/" + projectPath + "/evidence-pack/diff?previous_pack_id={pack_id}" + limitSuffix,
+	}
+	switch projectID {
+	case BookKnowledgeProjectHealth:
+		endpoints.DomainPackURL = "/api/projects/health/authority-pack" + packQuery
+		endpoints.DomainPackJSONLURL = "/api/projects/health/authority-pack/export?format=jsonl" + limitSuffix
+	case BookKnowledgeProjectProofroom:
+		endpoints.DomainPackURL = "/api/projects/proofroom/proofroom-pack" + packQuery
+		endpoints.DomainPackJSONLURL = "/api/projects/proofroom/proofroom-pack/export?format=jsonl" + limitSuffix
+	}
+	return endpoints
+}
+
+func verifiedEvidencePullManifestNextActions(projectID string) []string {
+	actions := []string{
+		"pull:evidence_pack_jsonl",
+		"compare:source_fingerprint",
+		"reject:blocklisted_or_blocked_records",
+	}
+	switch projectID {
+	case BookKnowledgeProjectHealth:
+		actions = append(actions, "run:health_import_dry_run", "gate:clinical_safety_review")
+	case BookKnowledgeProjectProofroom:
+		actions = append(actions, "run:argument_pack_ingest", "gate:source_citation_review")
+	default:
+		actions = append(actions, "gate:consumer_policy_review")
+	}
+	return actions
 }
 
 func evidencePackRecordMap(records []VerifiedEvidencePackRecord) map[string]VerifiedEvidencePackRecord {

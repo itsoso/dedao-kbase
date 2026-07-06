@@ -471,6 +471,40 @@ export interface VerifiedEvidencePackDiff {
   unchanged: VerifiedEvidencePackDiffRecord[]
 }
 
+export interface VerifiedEvidencePullManifest {
+  consumer_contract: string
+  schema_version: string
+  generated_at: string
+  project_id: string
+  target_system: string
+  export_type: string
+  current_pack: {
+    consumer_contract: string
+    pack_id: string
+    generated_at: string
+    source_fingerprint: string
+    source_unchanged: boolean
+    record_count: number
+    quality_summary: VerifiedEvidencePackQualitySummary
+  }
+  endpoints: {
+    evidence_pack_url: string
+    evidence_pack_jsonl_url: string
+    diff_url_template: string
+    domain_pack_url?: string
+    domain_pack_jsonl_url?: string
+  }
+  consumer_gate: {
+    mode: string
+    must_check_source_fingerprint: boolean
+    must_reject_blocked: boolean
+    allowed_uses?: string[]
+    blocked_uses?: string[]
+    human_loop: string
+  }
+  next_actions: string[]
+}
+
 export interface BookKnowledgeJob {
   id: string
   type: string
@@ -970,6 +1004,12 @@ export class KBaseClient {
   async getProjectEvidencePackDiff(projectID: string, previousPackID: string, limit = 25): Promise<VerifiedEvidencePackDiff> {
     return this.request<VerifiedEvidencePackDiff>(
       `/api/projects/${encodeURIComponent(projectID)}/evidence-pack/diff?previous_pack_id=${encodeURIComponent(previousPackID)}&limit=${encodeURIComponent(String(limit))}`,
+    )
+  }
+
+  async getProjectEvidencePullManifest(projectID: string, limit = 25): Promise<VerifiedEvidencePullManifest> {
+    return this.request<VerifiedEvidencePullManifest>(
+      `/api/projects/${encodeURIComponent(projectID)}/evidence-pack/manifest?limit=${encodeURIComponent(String(limit))}`,
     )
   }
 

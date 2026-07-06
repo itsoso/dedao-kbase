@@ -128,6 +128,52 @@ func TestBuildVerifiedEvidencePackDiff(t *testing.T) {
 	}
 }
 
+func TestBuildVerifiedEvidencePullManifest(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForVerification()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+
+	manifest, err := store.BuildVerifiedEvidencePullManifest(BookKnowledgeProjectHealth, 10)
+	if err != nil {
+		t.Fatalf("BuildVerifiedEvidencePullManifest returned error: %v", err)
+	}
+
+	if manifest.ConsumerContract != VerifiedEvidencePullManifestContractV1 {
+		t.Fatalf("ConsumerContract = %q, want %q", manifest.ConsumerContract, VerifiedEvidencePullManifestContractV1)
+	}
+	if manifest.ProjectID != BookKnowledgeProjectHealth || manifest.TargetSystem == "" {
+		t.Fatalf("manifest identity = %#v", manifest)
+	}
+	if manifest.CurrentPack.PackID == "" || manifest.CurrentPack.SourceFingerprint == "" {
+		t.Fatalf("manifest missing current pack identity: %#v", manifest.CurrentPack)
+	}
+	if manifest.CurrentPack.RecordCount != 3 || manifest.CurrentPack.QualitySummary.Total != 3 {
+		t.Fatalf("manifest pack summary = %#v, want 3 records", manifest.CurrentPack)
+	}
+	if manifest.Endpoints.EvidencePackURL != "/api/projects/health/evidence-pack?limit=10" ||
+		manifest.Endpoints.EvidencePackJSONLURL != "/api/projects/health/evidence-pack/export?format=jsonl&limit=10" ||
+		manifest.Endpoints.DiffURLTemplate != "/api/projects/health/evidence-pack/diff?previous_pack_id={pack_id}&limit=10" ||
+		manifest.Endpoints.DomainPackURL != "/api/projects/health/authority-pack?limit=10" {
+		t.Fatalf("manifest endpoints = %#v", manifest.Endpoints)
+	}
+	if !manifest.ConsumerGate.MustCheckSourceFingerprint || !manifest.ConsumerGate.MustRejectBlocked {
+		t.Fatalf("manifest consumer gate missing required checks: %#v", manifest.ConsumerGate)
+	}
+	if len(manifest.ConsumerGate.BlockedUses) == 0 || len(manifest.NextActions) == 0 {
+		t.Fatalf("manifest missing safety metadata: gate=%#v actions=%#v", manifest.ConsumerGate, manifest.NextActions)
+	}
+	payload, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest returned error: %v", err)
+	}
+	for _, forbidden := range []string{"/tmp/", "secret-token", "verify-book.html"} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("manifest leaked %q: %s", forbidden, string(payload))
+		}
+	}
+}
+
 func findEvidencePackDiffRecord(t *testing.T, records []VerifiedEvidencePackDiffRecord, evidenceID string) VerifiedEvidencePackDiffRecord {
 	t.Helper()
 	for _, record := range records {
