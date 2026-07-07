@@ -31,6 +31,8 @@ const wcplusState = {
   tasks: [],
   preview: null,
   serviceStatus: null,
+  envCheck: null,
+  batchResult: null,
   accountOffset: 0,
   accountNum: 20,
   articleOffset: 0,
@@ -617,6 +619,54 @@ function renderWCPlusSource(showOwnStatus = true) {
   const serviceStatus = wcplusState.serviceStatus
     ? `<span class="wcplus-source__badge ${wcplusState.serviceStatus.ok ? "is-ok" : "is-bad"}">${wcplusState.serviceStatus.ok ? "已连接" : "未连接"}</span>`
     : "";
+  const envCheckHTML = wcplusState.envCheck ? `
+    <section class="wcplus-source__env">
+      <div class="wcplus-source__toolbar is-tight">
+        <div>
+          <p class="web-kicker">Environment</p>
+          <h3>环境诊断</h3>
+        </div>
+        <span class="wcplus-source__badge ${wcplusState.envCheck.ok ? "is-ok" : "is-bad"}">${wcplusState.envCheck.ok ? "通过" : "需处理"}</span>
+      </div>
+      <div class="wcplus-source__env-list">
+        ${(Array.isArray(wcplusState.envCheck.checks) ? wcplusState.envCheck.checks : []).map((item) => `
+          <div class="wcplus-source__env-row">
+            <strong>${escapeHTML(item.name || "check")}</strong>
+            <span class="${item.ok ? "is-ok" : "is-bad"}">${item.ok ? "OK" : "FAIL"}</span>
+            <small>${escapeHTML(item.message || "-")}</small>
+          </div>
+        `).join("")}
+      </div>
+      ${Array.isArray(wcplusState.envCheck.advice) && wcplusState.envCheck.advice.length ? `
+        <ul class="wcplus-source__env-advice">
+          ${wcplusState.envCheck.advice.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}
+        </ul>
+      ` : ""}
+    </section>
+  ` : "";
+  const batchResultHTML = wcplusState.batchResult ? `
+    <section class="wcplus-source__batch-result">
+      <div class="wcplus-source__toolbar is-tight">
+        <div>
+          <p class="web-kicker">Batch Result</p>
+          <h3>批量结果</h3>
+        </div>
+        <span class="wcplus-source__badge">成功 ${Array.isArray(wcplusState.batchResult.success) ? wcplusState.batchResult.success.length : 0} / 失败 ${Array.isArray(wcplusState.batchResult.failed) ? wcplusState.batchResult.failed.length : 0}</span>
+      </div>
+      <label>
+        <span>成功清单</span>
+        <textarea readonly>${escapeHTML(wcplusState.batchResult.success_text || "无成功项")}</textarea>
+      </label>
+      <label>
+        <span>失败清单</span>
+        <textarea readonly>${escapeHTML(wcplusState.batchResult.failed_text || "无失败项")}</textarea>
+      </label>
+      <div class="wcplus-source__row-actions">
+        <button class="button button-ghost" type="button" data-wcplus-copy-batch="success">复制成功</button>
+        <button class="button button-ghost" type="button" data-wcplus-copy-batch="failed">复制失败</button>
+      </div>
+    </section>
+  ` : "";
   return `
     <section class="wcplus-source">
       <div class="wcplus-source__toolbar">
@@ -634,6 +684,7 @@ function renderWCPlusSource(showOwnStatus = true) {
         </div>
       </div>
       ${showOwnStatus ? status : ""}
+      ${envCheckHTML}
       <div class="wcplus-source__grid">
         <aside class="wcplus-source__panel">
           <form id="wcplus-search-form" class="source-form source-form--flat">
@@ -762,6 +813,7 @@ function renderWCPlusSource(showOwnStatus = true) {
           </label>
           <button class="button button-primary" type="submit">创建链接任务并启动队列</button>
         </form>
+        ${batchResultHTML}
         <form id="wcplus-raw-import-form" class="wcplus-source__manual-form">
           <label>
             <span>原文标题</span>
@@ -970,6 +1022,11 @@ function bindWCPlusEvents() {
     wcplusState.batchArticleListAmount = boundedNumber(data.get("batchArticleListAmount"), 0, 1000, 0);
     await batchImportWCPlusNicknames();
   });
+  for (const button of document.querySelectorAll("[data-wcplus-copy-batch]")) {
+    button.addEventListener("click", async () => {
+      await copyWCPlusBatchText(String(button.getAttribute("data-wcplus-copy-batch") || ""));
+    });
+  }
   document.querySelector("#wcplus-raw-import-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -1402,6 +1459,7 @@ async function checkWCPlusEnvironment() {
   refreshWCPlusView();
   try {
     const result = await apiFetch("/api/wcplus/env/check");
+    wcplusState.envCheck = result;
     wcplusState.serviceStatus = { ok: Boolean(result.ok) };
     const failed = Array.isArray(result.checks)
       ? result.checks.filter((item) => !item.ok).map((item) => item.name).join(", ")
@@ -1480,6 +1538,7 @@ async function batchImportWCPlusNicknames() {
         exact_match: wcplusState.batchExactMatch,
       }),
     });
+    wcplusState.batchResult = result;
     const successCount = Array.isArray(result.success) ? result.success.length : 0;
     const failedCount = Array.isArray(result.failed) ? result.failed.length : 0;
     wcplusState.message = `批量任务完成：成功 ${successCount}，失败 ${failedCount}${result.started ? "，队列已启动" : ""}。`;
@@ -1490,6 +1549,23 @@ async function batchImportWCPlusNicknames() {
     wcplusState.loading = "";
     refreshWCPlusView();
   }
+}
+
+async function copyWCPlusBatchText(kind) {
+  const result = wcplusState.batchResult || {};
+  const text = kind === "success" ? result.success_text : result.failed_text;
+  if (!text) {
+    wcplusState.message = kind === "success" ? "暂无成功清单。" : "暂无失败清单。";
+    refreshWCPlusView();
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    wcplusState.message = "已复制到剪贴板。";
+  } catch {
+    wcplusState.message = "浏览器不允许写入剪贴板，请手动复制文本框内容。";
+  }
+  refreshWCPlusView();
 }
 
 async function loadWCPlusTasks() {

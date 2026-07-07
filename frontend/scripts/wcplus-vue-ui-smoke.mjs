@@ -18,6 +18,8 @@ for (const hook of [
   'wcplus-task-panel',
   'wcplus-raw-import',
   'wcplus-batch-import',
+  'wcplus-env-check',
+  'wcplus-batch-result',
   'wcplus-action-bar',
 ]) {
   assert.ok(viewSource.includes(hook), `WCPlusSource.vue should include ${hook}`)
@@ -52,6 +54,9 @@ for (const endpoint of [
 assert.ok(viewSource.includes('Authorization'), 'WCPlusSource.vue should set Authorization header')
 assert.ok(viewSource.includes('Bearer'), 'WCPlusSource.vue should use Bearer token auth')
 assert.ok(viewSource.includes('KBASE_AUTH_TOKEN'), 'WCPlusSource.vue should reuse the existing kbase token key')
+assert.ok(viewSource.includes('success_text'), 'WCPlusSource.vue should expose WC Plus batch import success text')
+assert.ok(viewSource.includes('failed_text'), 'WCPlusSource.vue should expose WC Plus batch import failed text')
+assert.ok(viewSource.includes('envCheck'), 'WCPlusSource.vue should render WC Plus environment check details')
 assert.ok(!viewSource.includes('WCPLUS_BASE_URL'), 'browser code must not embed local WC Plus base URL config')
 assert.ok(!viewSource.includes('localhost:5324'), 'browser code must not call local WC Plus directly')
 

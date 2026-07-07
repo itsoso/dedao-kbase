@@ -535,6 +535,7 @@ a.button {
 .wcplus-source__options select,
 .wcplus-source__batch-form input,
 .wcplus-source__batch-form select,
+.wcplus-source__batch-result textarea,
 .wcplus-source__manual-form input {
   width: 100%;
   min-height: 38px;
@@ -710,6 +711,57 @@ a.button {
   padding: 12px;
 }
 
+.wcplus-source__env {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+  border: 1px solid rgba(44, 122, 107, 0.16);
+  border-radius: 9px;
+  padding: 12px;
+  background: rgba(44, 122, 107, 0.05);
+}
+
+.wcplus-source__env-list {
+  display: grid;
+  gap: 6px;
+}
+
+.wcplus-source__env-row {
+  display: grid;
+  grid-template-columns: minmax(100px, 1fr) auto;
+  gap: 4px 10px;
+  border-bottom: 1px solid rgba(44, 122, 107, 0.12);
+  padding-bottom: 6px;
+}
+
+.wcplus-source__env-row strong {
+  color: #24231f;
+}
+
+.wcplus-source__env-row span.is-ok {
+  color: #2c7a6b;
+  font-weight: 900;
+}
+
+.wcplus-source__env-row span.is-bad {
+  color: #9d3f2e;
+  font-weight: 900;
+}
+
+.wcplus-source__env-row small {
+  grid-column: 1 / -1;
+  color: #756c60;
+  line-height: 1.5;
+}
+
+.wcplus-source__env-advice {
+  margin: 0;
+  padding-left: 20px;
+  color: #756c60;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
 .wcplus-source__batch-form {
   display: grid;
   grid-template-columns: minmax(260px, 1fr) minmax(120px, 150px) minmax(110px, 140px) auto auto;
@@ -719,6 +771,15 @@ a.button {
   border-radius: 8px;
   padding: 10px;
   background: rgba(255, 253, 248, 0.78);
+}
+
+.wcplus-source__batch-result {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(255, 107, 0, 0.16);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(255, 107, 0, 0.05);
 }
 
 .wcplus-source__manual-form {
@@ -737,6 +798,11 @@ a.button {
   gap: 6px;
 }
 
+.wcplus-source__batch-result label {
+  display: grid;
+  gap: 6px;
+}
+
 .wcplus-source__manual-form label {
   display: grid;
   gap: 6px;
@@ -747,6 +813,7 @@ a.button {
 }
 
 .wcplus-source__batch-form label > span,
+.wcplus-source__batch-result label > span,
 .wcplus-source__manual-form label > span,
 .wcplus-source__inline-check span {
   color: #6f6658;
@@ -755,6 +822,7 @@ a.button {
 }
 
 .wcplus-source__batch-form textarea,
+.wcplus-source__batch-result textarea,
 .wcplus-source__manual-form textarea {
   width: 100%;
   min-height: 82px;
@@ -1313,6 +1381,7 @@ a.button {
 
   .wcplus-source__toolbar,
   .wcplus-source__batch-form,
+  .wcplus-source__batch-result,
   .wcplus-source__manual-form,
   .wcplus-source__task,
   .wcplus-source__article {

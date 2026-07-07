@@ -190,6 +190,25 @@
                     </div>
                 </section>
 
+                <section v-if="envCheck" class="panel wcplus-env-check">
+                    <div class="section-head">
+                        <span>环境诊断</span>
+                        <el-tag size="small" :type="envCheck.ok ? 'success' : 'danger'" effect="plain">
+                            {{ envCheck.ok ? '通过' : '需处理' }}
+                        </el-tag>
+                    </div>
+                    <div class="env-check-list">
+                        <div v-for="item in envCheck.checks || []" :key="item.name" class="env-check-row">
+                            <strong>{{ item.name }}</strong>
+                            <span :class="{ ok: item.ok, bad: !item.ok }">{{ item.ok ? 'OK' : 'FAIL' }}</span>
+                            <small>{{ item.message || '-' }}</small>
+                        </div>
+                    </div>
+                    <ul v-if="envCheck.advice?.length" class="env-advice">
+                        <li v-for="item in envCheck.advice" :key="item">{{ item }}</li>
+                    </ul>
+                </section>
+
                 <section class="panel wcplus-batch-import">
                     <div class="section-head">
                         <span>批量公众号</span>
@@ -209,6 +228,30 @@
                         <el-input-number v-model="batchArticleListAmount" :min="0" :max="1000" size="small" />
                     </div>
                     <el-button type="primary" class="full-button" @click="batchImportNicknames">创建任务并启动</el-button>
+                    <div v-if="batchResult" class="wcplus-batch-result">
+                        <div class="section-head">
+                            <span>批量结果</span>
+                            <el-tag size="small" effect="plain">
+                                成功 {{ batchResult.success?.length || 0 }} / 失败 {{ batchResult.failed?.length || 0 }}
+                            </el-tag>
+                        </div>
+                        <el-input
+                            :model-value="batchResult.success_text || '无成功项'"
+                            type="textarea"
+                            :rows="3"
+                            readonly
+                        />
+                        <el-input
+                            :model-value="batchResult.failed_text || '无失败项'"
+                            type="textarea"
+                            :rows="3"
+                            readonly
+                        />
+                        <div class="mini-actions">
+                            <el-button size="small" @click="copyBatchText('success')">复制成功</el-button>
+                            <el-button size="small" @click="copyBatchText('failed')">复制失败</el-button>
+                        </div>
+                    </div>
                 </section>
 
                 <section class="panel wcplus-raw-import">
@@ -245,6 +288,7 @@ const searchResults = ref<any[]>([])
 const tasks = ref<any[]>([])
 const preview = ref<any>(null)
 const mainTab = ref('articles')
+const batchResult = ref<any>(null)
 
 const searchQuery = ref('')
 const searchMode = ref('fulltext')
@@ -683,11 +727,28 @@ const batchImportNicknames = async () => {
                 exact_match: batchExactMatch.value,
             }),
         })
+        batchResult.value = result
         const successCount = Array.isArray(result?.success) ? result.success.length : 0
         const failedCount = Array.isArray(result?.failed) ? result.failed.length : 0
         notify(`批量任务完成：成功 ${successCount}，失败 ${failedCount}${result?.started ? '，队列已启动' : ''}。`, failedCount ? 'warning' : 'success')
         await loadTasks(false)
     })
+}
+
+const copyBatchText = async (kind: 'success' | 'failed') => {
+    const text = kind === 'success'
+        ? batchResult.value?.success_text
+        : batchResult.value?.failed_text
+    if (!text) {
+        notify(kind === 'success' ? '暂无成功清单。' : '暂无失败清单。', 'info')
+        return
+    }
+    try {
+        await navigator.clipboard.writeText(text)
+        notify('已复制到剪贴板。', 'success')
+    } catch {
+        notify('浏览器不允许写入剪贴板，请手动复制文本框内容。', 'warning')
+    }
 }
 
 const importRawArticle = async () => {
@@ -879,7 +940,7 @@ const exportAllArticlesXLSX = async () => {
 
 .wcplus-preview {
     display: grid;
-    grid-template-rows: minmax(180px, 1fr) minmax(150px, 0.72fr) auto auto;
+    grid-template-rows: minmax(180px, 1fr) minmax(150px, 0.72fr) auto auto auto;
     gap: 12px;
     overflow: hidden;
 }
@@ -1044,13 +1105,15 @@ const exportAllArticlesXLSX = async () => {
 
 .preview-panel,
 .wcplus-task-panel,
+.wcplus-env-check,
 .wcplus-batch-import,
 .wcplus-raw-import {
     overflow: hidden;
 }
 
 .preview-panel,
-.wcplus-task-panel {
+.wcplus-task-panel,
+.wcplus-env-check {
     display: flex;
     flex-direction: column;
 }
@@ -1085,9 +1148,48 @@ const exportAllArticlesXLSX = async () => {
 }
 
 .wcplus-batch-import,
-.wcplus-raw-import {
+.wcplus-raw-import,
+.wcplus-batch-result {
     display: grid;
     gap: 8px;
+}
+
+.env-check-list {
+    display: grid;
+    gap: 6px;
+    overflow: auto;
+}
+
+.env-check-row {
+    display: grid;
+    grid-template-columns: minmax(70px, 1fr) auto;
+    gap: 4px 8px;
+    border-bottom: 1px solid #edf0f5;
+    padding-bottom: 6px;
+}
+
+.env-check-row small {
+    grid-column: 1 / -1;
+    color: #64748b;
+    line-height: 18px;
+}
+
+.env-check-row .ok {
+    color: #047857;
+    font-weight: 800;
+}
+
+.env-check-row .bad {
+    color: #b91c1c;
+    font-weight: 800;
+}
+
+.env-advice {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    color: #64748b;
+    font-size: 12px;
+    line-height: 18px;
 }
 
 .batch-options {

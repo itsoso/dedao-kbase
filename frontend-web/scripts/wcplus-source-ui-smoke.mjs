@@ -18,6 +18,7 @@ for (const marker of [
   "checkWCPlusEnvironment",
   "searchWCPlus",
   "batchImportWCPlusNicknames",
+  "copyWCPlusBatchText",
   "importRawWCPlusArticle",
   "importWCPlusArticle",
   "importWCPlusAccount",
@@ -71,6 +72,8 @@ for (const label of [
   "批量导入",
   "启动队列",
   "导出全库 XLSX",
+  "环境诊断",
+  "批量结果",
   "下载任务",
   "任务类型",
   "每页",
@@ -93,6 +96,8 @@ for (const selector of [
   "name=\"batchArticleListAmount\"",
   "id=\"wcplus-raw-import-form\"",
   "name=\"rawContent\"",
+  "data-wcplus-copy-batch=\"success\"",
+  "data-wcplus-copy-batch=\"failed\"",
 ]) {
   assert.ok(js.includes(selector), `WC Plus UI should include ${selector}`);
 }
@@ -104,12 +109,17 @@ for (const className of [
   ".wcplus-source__tasks",
   ".wcplus-source__search-results",
   ".wcplus-source__badge",
+  ".wcplus-source__env",
   ".wcplus-source__batch-form",
+  ".wcplus-source__batch-result",
   ".wcplus-source__manual-form",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
 
+assert.ok(js.includes("success_text"), "WC Plus UI should render batch import success_text");
+assert.ok(js.includes("failed_text"), "WC Plus UI should render batch import failed_text");
+assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
 assert.doesNotMatch(js, /WCPLUS_BASE_URL\s*=/, "web UI must not embed WC Plus base URL configuration");
 assert.doesNotMatch(js, /127\.0\.0\.1:5001/, "web UI should not hardcode the local WC Plus URL");
 
