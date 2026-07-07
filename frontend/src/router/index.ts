@@ -155,6 +155,21 @@ const router = createRouter({
         },
         {
             path: "/",
+            meta: { name: "WC Plus", icon:"Connection", menuType: 2 },
+            redirect: "/wcplus-source",
+            children: [
+                {
+                    path: 'wcplus-source',
+                    name: "wcplusSource",
+                    component: () => import("../views/WCPlusSource.vue"),
+                    meta: {
+                        name: "WC Plus", requiresAuth:false
+                    },
+                }
+            ],
+        },
+        {
+            path: "/",
             // name: "compass",
             meta: { name: "锦囊", icon:"Compass", menuType: 2 },
             redirect: "/compass",
