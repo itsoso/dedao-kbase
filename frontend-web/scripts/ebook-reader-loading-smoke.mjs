@@ -18,6 +18,8 @@ assert.match(css, /@keyframes reader-shimmer/, "loading skeleton should use a sh
 assert.match(css, /prefers-reduced-motion: reduce/, "loading animation should respect reduced motion");
 assert.doesNotMatch(css, /border:\s*1px\s+dashed/, "loading page should not use the old dashed placeholder");
 
+assert.match(js, /function normalizeReaderBookID/, "reader should normalize legacy route suffixes before fetching");
+assert.match(js, /readerRouteSuffixes/, "reader should keep allowed UI suffixes explicit");
 assert.match(js, /apiFetch\(`\/api\/books\/\$\{encodeURIComponent\(bookID\)\}`/, "reader should load the selected book through the API client");
 assert.match(js, /renderError/, "reader should surface load failures");
 

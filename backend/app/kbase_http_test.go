@@ -103,6 +103,51 @@ func TestKBaseHTTPHandlerServesSearchAndSystemKBExport(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerReadsBookWithLegacyReaderSuffix(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "83477"
+	pkg.Book.Title = "83477_测试书"
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/books/83477-prompts", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("legacy suffix status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"book_id":"83477"`) {
+		t.Fatalf("legacy suffix response did not resolve base book id: %s", resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerMissingBookDoesNotExposeFilesystemPath(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/books/missing-prompts", "secret-token")
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("missing book status = %d, want 404, body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	for _, leak := range []string{root, "manifest.json", "book_knowledge"} {
+		if strings.Contains(body, leak) {
+			t.Fatalf("missing book response leaked %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "book not found") {
+		t.Fatalf("missing book response should be actionable: %s", body)
+	}
+}
+
 func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))

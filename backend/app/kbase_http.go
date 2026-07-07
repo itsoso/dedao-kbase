@@ -213,12 +213,66 @@ func (h *kbaseHTTPHandler) handleGetBook(w http.ResponseWriter, r *http.Request)
 		writeHTTPError(w, http.StatusBadRequest, "book_id is required")
 		return
 	}
-	pkg, err := h.store.LoadPackage(bookID)
+	pkg, err := h.loadHTTPBookPackage(bookID)
 	if err != nil {
 		writeHTTPError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, pkg)
+}
+
+func (h *kbaseHTTPHandler) loadHTTPBookPackage(bookID string) (*BookKnowledgePackage, error) {
+	bookID = sanitizeBookKnowledgeID(bookID)
+	if strings.TrimSpace(bookID) == "" {
+		return nil, fmt.Errorf("book_id is required")
+	}
+	if pkg, err := h.store.LoadPackage(bookID); err == nil {
+		return pkg, nil
+	}
+	if fallback := stripReaderRouteSuffix(bookID); fallback != bookID {
+		if pkg, err := h.store.LoadPackage(fallback); err == nil {
+			return pkg, nil
+		}
+	}
+	return nil, fmt.Errorf("book not found: %s", bookID)
+}
+
+var readerRouteSuffixes = []string{
+	"overview",
+	"chat",
+	"prompts",
+	"chapters",
+	"claims",
+	"chunks",
+	"jobs",
+	"system-kb",
+	"skills",
+	"ops",
+}
+
+func stripReaderRouteSuffix(bookID string) string {
+	for _, suffix := range readerRouteSuffixes {
+		marker := "-" + suffix
+		if strings.HasSuffix(bookID, marker) {
+			base := strings.TrimSuffix(bookID, marker)
+			if isNumericBookID(base) {
+				return base
+			}
+		}
+	}
+	return bookID
+}
+
+func isNumericBookID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *kbaseHTTPHandler) handleSearch(w http.ResponseWriter, r *http.Request) {

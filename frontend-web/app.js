@@ -149,6 +149,33 @@ async function apiDownload(path, options = {}, filename = "download.bin") {
   return blob.size;
 }
 
+const readerRouteSuffixes = [
+  "overview",
+  "chat",
+  "prompts",
+  "chapters",
+  "claims",
+  "chunks",
+  "jobs",
+  "system-kb",
+  "skills",
+  "ops",
+];
+
+function normalizeReaderBookID(bookID) {
+  const value = String(bookID || "").trim();
+  for (const suffix of readerRouteSuffixes) {
+    const marker = `-${suffix}`;
+    if (value.endsWith(marker)) {
+      const base = value.slice(0, -marker.length);
+      if (/^\d+$/.test(base)) {
+        return base;
+      }
+    }
+  }
+  return value;
+}
+
 function getBookID() {
   const prefix = "/ebook/";
   if (!window.location.pathname.startsWith(prefix)) {
@@ -156,9 +183,9 @@ function getBookID() {
   }
   const raw = window.location.pathname.slice(prefix.length).split("/")[0];
   try {
-    return decodeURIComponent(raw);
+    return normalizeReaderBookID(decodeURIComponent(raw));
   } catch {
-    return raw;
+    return normalizeReaderBookID(raw);
   }
 }
 
