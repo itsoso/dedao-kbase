@@ -42,6 +42,37 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(t.TempDir()),
+		AuthToken: "secret-token",
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status without trusted header = %d, want 401", resp.Code)
+	}
+	if strings.Contains(resp.Body.String(), "secret-token") {
+		t.Fatalf("untrusted response leaked token: %s", resp.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
+	req.Header.Set("X-KBase-Browser-Session", "1")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status with trusted header = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"token":"secret-token"`) {
+		t.Fatalf("trusted response missing token: %s", resp.Body.String())
+	}
+	if got := resp.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
 func TestKBaseHTTPHandlerServesSearchAndSystemKBExport(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))

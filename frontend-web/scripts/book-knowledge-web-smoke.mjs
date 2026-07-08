@@ -10,6 +10,8 @@ const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 for (const marker of [
   "renderBookKnowledge",
   "knowledgeState",
+  "ensureBrowserSessionToken",
+  "refreshBrowserSessionToken",
   "loadBookKnowledge",
   "searchBookKnowledge",
   'window.location.pathname.startsWith("/book-knowledge")',
@@ -18,10 +20,19 @@ for (const marker of [
 }
 
 for (const endpoint of [
+  "/browser/session-token",
   "/api/books",
   "/api/search?",
 ]) {
   assert.ok(js.includes(endpoint), `book knowledge web UI should call ${endpoint}`);
+}
+
+for (const authMarker of [
+  "localStorage.setItem",
+  'credentials: "same-origin"',
+  "response.status === 401",
+]) {
+  assert.ok(js.includes(authMarker), `book knowledge web UI should include auth marker ${authMarker}`);
 }
 
 for (const unwrap of [

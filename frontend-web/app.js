@@ -76,6 +76,56 @@ function getToken() {
   return "";
 }
 
+function storeToken(token) {
+  const clean = String(token || "").trim();
+  if (!clean) {
+    return "";
+  }
+  for (const key of tokenKeys) {
+    window.localStorage.setItem(key, clean);
+  }
+  return clean;
+}
+
+async function refreshBrowserSessionToken() {
+  const response = await fetch("/browser/session-token", {
+    headers: {
+      Accept: "application/json",
+    },
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = null;
+    }
+  }
+  if (!response.ok) {
+    const message = payload && typeof payload === "object"
+      ? (payload.error || payload.message || JSON.stringify(payload))
+      : (text || `HTTP ${response.status}`);
+    throw new Error(message);
+  }
+  return storeToken(payload?.token || "");
+}
+
+async function ensureBrowserSessionToken() {
+  const existing = getToken();
+  if (existing) {
+    return existing;
+  }
+  try {
+    return await refreshBrowserSessionToken();
+  } catch (error) {
+    console.warn("Unable to load kbase browser session token", error);
+    return "";
+  }
+}
+
 function escapeHTML(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -89,13 +139,13 @@ function escapeAttribute(value) {
   return escapeHTML(value).replaceAll("\n", " ");
 }
 
-async function apiFetch(path, options = {}) {
+async function apiFetch(path, options = {}, didRefreshAuth = false) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json");
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const token = getToken();
+  const token = getToken() || await ensureBrowserSessionToken();
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
@@ -114,6 +164,16 @@ async function apiFetch(path, options = {}) {
     }
   }
   if (!response.ok) {
+    if (response.status === 401 && !didRefreshAuth) {
+      try {
+        const refreshed = await refreshBrowserSessionToken();
+        if (refreshed) {
+          return apiFetch(path, options, true);
+        }
+      } catch (error) {
+        console.warn("Unable to refresh kbase browser session token", error);
+      }
+    }
     const message = typeof payload === "object" && payload
       ? (payload.error || payload.message || JSON.stringify(payload))
       : (payload || `HTTP ${response.status}`);
@@ -122,9 +182,9 @@ async function apiFetch(path, options = {}) {
   return payload;
 }
 
-async function apiDownload(path, options = {}, filename = "download.bin") {
+async function apiDownload(path, options = {}, filename = "download.bin", didRefreshAuth = false) {
   const headers = new Headers(options.headers || {});
-  const token = getToken();
+  const token = getToken() || await ensureBrowserSessionToken();
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
@@ -136,6 +196,16 @@ async function apiDownload(path, options = {}, filename = "download.bin") {
     headers,
   });
   if (!response.ok) {
+    if (response.status === 401 && !didRefreshAuth) {
+      try {
+        const refreshed = await refreshBrowserSessionToken();
+        if (refreshed) {
+          return apiDownload(path, options, filename, true);
+        }
+      } catch (error) {
+        console.warn("Unable to refresh kbase browser session token", error);
+      }
+    }
     const text = await response.text();
     throw new Error(text || `HTTP ${response.status}`);
   }

@@ -54,6 +54,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if r.URL.Path == "/browser/session-token" {
+		h.handleBrowserSessionToken(w, r)
+		return
+	}
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
 		h.serveStatic(w, r)
 		return
@@ -196,6 +200,26 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 		return false
 	}
 	return true
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	if h.authToken == "" {
+		writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
+		return
+	}
+	if strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session")) != "1" {
+		writeHTTPError(w, http.StatusUnauthorized, "browser session is not authorized")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"token": h.authToken,
+	})
 }
 
 func (h *kbaseHTTPHandler) handleListBooks(w http.ResponseWriter) {
