@@ -734,6 +734,19 @@ a.button {
   padding-bottom: 6px;
 }
 
+.wcplus-source__diagnostic-line {
+  grid-template-columns: minmax(100px, 1fr) minmax(0, 2fr);
+}
+
+.wcplus-source__diagnostic-line code {
+  overflow-wrap: anywhere;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: #f5efe5;
+  color: #3f3327;
+  font-size: 12px;
+}
+
 .wcplus-source__env-row strong {
   color: #24231f;
 }
@@ -844,6 +857,12 @@ a.button {
 .wcplus-source__manual-form textarea:focus {
   border-color: #ff6b00;
   box-shadow: 0 0 0 3px rgba(255, 107, 0, 0.12);
+}
+
+.wcplus-source__manual-form input[type="file"] {
+  min-height: 40px;
+  padding: 9px 10px;
+  background: #fffaf2;
 }
 
 .wcplus-source__manual-actions {

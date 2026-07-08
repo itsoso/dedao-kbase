@@ -629,6 +629,11 @@ function renderWCPlusSource(showOwnStatus = true) {
         <span class="wcplus-source__badge ${wcplusState.envCheck.ok ? "is-ok" : "is-bad"}">${wcplusState.envCheck.ok ? "通过" : "需处理"}</span>
       </div>
       <div class="wcplus-source__env-list">
+        <div class="wcplus-source__env-row wcplus-source__diagnostic-line">
+          <strong>服务地址</strong>
+          <code>${escapeHTML(wcplusState.envCheck.base_url || "-")}</code>
+          <small>这是 kbase 服务端实际访问的 WC Plus API 地址。</small>
+        </div>
         ${(Array.isArray(wcplusState.envCheck.checks) ? wcplusState.envCheck.checks : []).map((item) => `
           <div class="wcplus-source__env-row">
             <strong>${escapeHTML(item.name || "check")}</strong>
@@ -642,6 +647,9 @@ function renderWCPlusSource(showOwnStatus = true) {
           ${wcplusState.envCheck.advice.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}
         </ul>
       ` : ""}
+      <div class="wcplus-source__row-actions">
+        <button class="button button-ghost" type="button" data-wcplus-copy-diagnostics>复制诊断</button>
+      </div>
     </section>
   ` : "";
   const batchResultHTML = wcplusState.batchResult ? `
@@ -830,6 +838,10 @@ function renderWCPlusSource(showOwnStatus = true) {
           <label>
             <span>知识库 ID（可选）</span>
             <input name="rawBookID" value="${escapeAttribute(wcplusState.rawBookID)}" placeholder="留空自动生成">
+          </label>
+          <label class="is-wide">
+            <span>导入 TXT / Markdown 文件</span>
+            <input name="rawFile" type="file" accept=".txt,.md,.markdown,text/plain,text/markdown">
           </label>
           <label class="is-wide">
             <span>正文 Markdown / 纯文本</span>
@@ -1027,14 +1039,23 @@ function bindWCPlusEvents() {
       await copyWCPlusBatchText(String(button.getAttribute("data-wcplus-copy-batch") || ""));
     });
   }
+  document.querySelector("[data-wcplus-copy-diagnostics]")?.addEventListener("click", async () => {
+    await copyWCPlusDiagnostics();
+  });
+  document.querySelector("#wcplus-raw-import-form input[name=\"rawFile\"]")?.addEventListener("change", async (event) => {
+    const [file] = Array.from(event.currentTarget.files || []);
+    if (file) {
+      try {
+        await loadWCPlusRawFile(file);
+      } catch (error) {
+        wcplusState.message = error instanceof Error ? error.message : String(error);
+        refreshWCPlusView();
+      }
+    }
+  });
   document.querySelector("#wcplus-raw-import-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    wcplusState.rawTitle = String(data.get("rawTitle") || "").trim();
-    wcplusState.rawNickname = String(data.get("rawNickname") || "").trim();
-    wcplusState.rawURL = String(data.get("rawURL") || "").trim();
-    wcplusState.rawBookID = String(data.get("rawBookID") || "").trim();
-    wcplusState.rawContent = String(data.get("rawContent") || "");
+    readWCPlusRawFormFromDOM();
     await importRawWCPlusArticle();
   });
   for (const button of document.querySelectorAll("[data-wcplus-account-page]")) {
@@ -1145,6 +1166,19 @@ function readWCPlusOptionsFromDOM() {
     wcplusState.exportRecentNum = boundedNumber(data.get("exportRecentNum"), 1, 5000, wcplusState.exportRecentNum);
     wcplusState.articleNum = boundedNumber(data.get("articleNum"), 1, 100, wcplusState.articleNum);
   }
+}
+
+function readWCPlusRawFormFromDOM() {
+  const rawForm = document.querySelector("#wcplus-raw-import-form");
+  if (!rawForm) {
+    return;
+  }
+  const data = new FormData(rawForm);
+  wcplusState.rawTitle = String(data.get("rawTitle") || "").trim();
+  wcplusState.rawNickname = String(data.get("rawNickname") || "").trim();
+  wcplusState.rawURL = String(data.get("rawURL") || "").trim();
+  wcplusState.rawBookID = String(data.get("rawBookID") || "").trim();
+  wcplusState.rawContent = String(data.get("rawContent") || "");
 }
 
 async function pageWCPlusAccounts(delta) {
@@ -1565,6 +1599,69 @@ async function copyWCPlusBatchText(kind) {
   } catch {
     wcplusState.message = "浏览器不允许写入剪贴板，请手动复制文本框内容。";
   }
+  refreshWCPlusView();
+}
+
+function wcplusDiagnosticText() {
+  const check = wcplusState.envCheck || {};
+  const lines = [
+    `WC Plus environment: ${check.ok ? "OK" : "NEEDS_ACTION"}`,
+    `base_url: ${check.base_url || "-"}`,
+  ];
+  if (Array.isArray(check.checks) && check.checks.length) {
+    lines.push("", "checks:");
+    for (const item of check.checks) {
+      lines.push(`- ${item.name || "check"}: ${item.ok ? "OK" : "FAIL"} ${item.message || ""}`.trim());
+    }
+  }
+  if (Array.isArray(check.advice) && check.advice.length) {
+    lines.push("", "advice:");
+    for (const item of check.advice) {
+      lines.push(`- ${item}`);
+    }
+  }
+  const batch = wcplusState.batchResult;
+  if (batch) {
+    lines.push(
+      "",
+      `batch_success: ${Array.isArray(batch.success) ? batch.success.length : 0}`,
+      `batch_failed: ${Array.isArray(batch.failed) ? batch.failed.length : 0}`,
+    );
+    if (batch.failed_text) {
+      lines.push("", "failed_text:", batch.failed_text);
+    }
+  }
+  return lines.join("\n");
+}
+
+async function copyWCPlusDiagnostics() {
+  if (!wcplusState.envCheck) {
+    wcplusState.message = "请先执行环境检查。";
+    refreshWCPlusView();
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(wcplusDiagnosticText());
+    wcplusState.message = "诊断信息已复制。";
+  } catch {
+    wcplusState.message = "浏览器不允许写入剪贴板，请手动复制环境诊断内容。";
+  }
+  refreshWCPlusView();
+}
+
+async function loadWCPlusRawFile(file) {
+  readWCPlusRawFormFromDOM();
+  const text = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("读取文件失败"));
+    reader.readAsText(file);
+  });
+  wcplusState.rawContent = String(text);
+  if (!wcplusState.rawTitle) {
+    wcplusState.rawTitle = file.name.replace(/\.(txt|md|markdown)$/i, "");
+  }
+  wcplusState.message = `已读取文件：${file.name}`;
   refreshWCPlusView();
 }
 

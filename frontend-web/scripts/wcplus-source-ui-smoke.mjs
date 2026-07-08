@@ -19,6 +19,8 @@ for (const marker of [
   "searchWCPlus",
   "batchImportWCPlusNicknames",
   "copyWCPlusBatchText",
+  "copyWCPlusDiagnostics",
+  "loadWCPlusRawFile",
   "importRawWCPlusArticle",
   "importWCPlusArticle",
   "importWCPlusAccount",
@@ -73,6 +75,8 @@ for (const label of [
   "启动队列",
   "导出全库 XLSX",
   "环境诊断",
+  "服务地址",
+  "复制诊断",
   "批量结果",
   "下载任务",
   "任务类型",
@@ -96,6 +100,8 @@ for (const selector of [
   "name=\"batchArticleListAmount\"",
   "id=\"wcplus-raw-import-form\"",
   "name=\"rawContent\"",
+  "name=\"rawFile\"",
+  "data-wcplus-copy-diagnostics",
   "data-wcplus-copy-batch=\"success\"",
   "data-wcplus-copy-batch=\"failed\"",
 ]) {
@@ -120,6 +126,8 @@ for (const className of [
 assert.ok(js.includes("success_text"), "WC Plus UI should render batch import success_text");
 assert.ok(js.includes("failed_text"), "WC Plus UI should render batch import failed_text");
 assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
+assert.ok(js.includes("base_url"), "WC Plus UI should show server-side WC Plus base_url diagnostics");
+assert.ok(js.includes("FileReader"), "WC Plus UI should support raw TXT/Markdown file import fallback");
 assert.doesNotMatch(js, /WCPLUS_BASE_URL\s*=/, "web UI must not embed WC Plus base URL configuration");
 assert.doesNotMatch(js, /127\.0\.0\.1:5001/, "web UI should not hardcode the local WC Plus URL");
 

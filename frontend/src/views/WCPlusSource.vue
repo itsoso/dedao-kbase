@@ -193,9 +193,17 @@
                 <section v-if="envCheck" class="panel wcplus-env-check">
                     <div class="section-head">
                         <span>环境诊断</span>
-                        <el-tag size="small" :type="envCheck.ok ? 'success' : 'danger'" effect="plain">
-                            {{ envCheck.ok ? '通过' : '需处理' }}
-                        </el-tag>
+                        <div class="mini-actions">
+                            <el-button size="small" @click="copyDiagnostics">复制诊断</el-button>
+                            <el-tag size="small" :type="envCheck.ok ? 'success' : 'danger'" effect="plain">
+                                {{ envCheck.ok ? '通过' : '需处理' }}
+                            </el-tag>
+                        </div>
+                    </div>
+                    <div class="wcplus-diagnostics">
+                        <strong>服务地址</strong>
+                        <code>{{ envCheck.base_url || '-' }}</code>
+                        <small>kbase 服务端实际访问的 WC Plus API 地址。</small>
                     </div>
                     <div class="env-check-list">
                         <div v-for="item in envCheck.checks || []" :key="item.name" class="env-check-row">
@@ -262,6 +270,12 @@
                     <el-input v-model="rawNickname" placeholder="公众号/作者" />
                     <el-input v-model="rawURL" placeholder="原文链接" />
                     <el-input v-model="rawBookID" placeholder="book_id 可选" />
+                    <input
+                        class="wcplus-raw-file"
+                        type="file"
+                        accept=".txt,.md,.markdown,text/plain,text/markdown"
+                        @change="loadRawFile"
+                    />
                     <el-input v-model="rawContent" type="textarea" :rows="5" placeholder="粘贴正文或 Markdown" />
                     <el-button type="primary" class="full-button" @click="importRawArticle">导入知识库</el-button>
                 </section>
@@ -751,6 +765,71 @@ const copyBatchText = async (kind: 'success' | 'failed') => {
     }
 }
 
+const diagnosticText = () => {
+    const check = envCheck.value || {}
+    const lines = [
+        `WC Plus environment: ${check.ok ? 'OK' : 'NEEDS_ACTION'}`,
+        `base_url: ${check.base_url || '-'}`,
+    ]
+    if (Array.isArray(check.checks) && check.checks.length) {
+        lines.push('', 'checks:')
+        for (const item of check.checks) {
+            lines.push(`- ${item.name || 'check'}: ${item.ok ? 'OK' : 'FAIL'} ${item.message || ''}`.trim())
+        }
+    }
+    if (Array.isArray(check.advice) && check.advice.length) {
+        lines.push('', 'advice:')
+        for (const item of check.advice) {
+            lines.push(`- ${item}`)
+        }
+    }
+    const batch = batchResult.value
+    if (batch) {
+        lines.push(
+            '',
+            `batch_success: ${Array.isArray(batch.success) ? batch.success.length : 0}`,
+            `batch_failed: ${Array.isArray(batch.failed) ? batch.failed.length : 0}`,
+        )
+        if (batch.failed_text) {
+            lines.push('', 'failed_text:', batch.failed_text)
+        }
+    }
+    return lines.join('\n')
+}
+
+const copyDiagnostics = async () => {
+    if (!envCheck.value) {
+        notify('请先执行环境检查。', 'info')
+        return
+    }
+    try {
+        await navigator.clipboard.writeText(diagnosticText())
+        notify('诊断信息已复制。', 'success')
+    } catch {
+        notify('浏览器不允许写入剪贴板，请手动复制环境诊断内容。', 'warning')
+    }
+}
+
+const loadRawFile = (event: Event) => {
+    const input = event.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) {
+        return
+    }
+    const reader = new FileReader()
+    reader.onload = () => {
+        rawContent.value = String(reader.result || '')
+        if (!rawTitle.value.trim()) {
+            rawTitle.value = file.name.replace(/\.(txt|md|markdown)$/i, '')
+        }
+        notify(`已读取文件：${file.name}`, 'success')
+    }
+    reader.onerror = () => {
+        notify(reader.error?.message || '读取文件失败。', 'warning')
+    }
+    reader.readAsText(file)
+}
+
 const importRawArticle = async () => {
     if (!rawTitle.value.trim() || !rawContent.value.trim()) {
         notify('请填写标题和正文。', 'warning')
@@ -1160,6 +1239,29 @@ const exportAllArticlesXLSX = async () => {
     overflow: auto;
 }
 
+.wcplus-diagnostics {
+    display: grid;
+    grid-template-columns: minmax(80px, 120px) minmax(0, 1fr);
+    gap: 4px 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #edf0f5;
+}
+
+.wcplus-diagnostics code {
+    overflow-wrap: anywhere;
+    border-radius: 5px;
+    background: #f8fafc;
+    padding: 2px 6px;
+    color: #334155;
+    font-size: 12px;
+}
+
+.wcplus-diagnostics small {
+    grid-column: 1 / -1;
+    color: #64748b;
+    line-height: 18px;
+}
+
 .env-check-row {
     display: grid;
     grid-template-columns: minmax(70px, 1fr) auto;
@@ -1198,6 +1300,15 @@ const exportAllArticlesXLSX = async () => {
 
 .full-button {
     width: 100%;
+}
+
+.wcplus-raw-file {
+    width: 100%;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 8px 10px;
+    background: #f8fafc;
+    color: #334155;
 }
 
 @media (max-width: 1280px) {
