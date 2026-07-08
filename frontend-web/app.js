@@ -32,6 +32,7 @@ const wcplusState = {
   preview: null,
   serviceStatus: null,
   envCheck: null,
+  utilityResult: null,
   batchResult: null,
   accountOffset: 0,
   accountNum: 20,
@@ -800,6 +801,14 @@ function renderWCPlusSource(showOwnStatus = true) {
           <button id="wcplus-run-queue" class="button button-ghost" type="button">启动队列</button>
         </div>
       </div>
+      <div class="wcplus-source__utility">
+        <span>辅助查询</span>
+        <button class="button button-ghost" type="button" data-wcplus-utility="reading" ${wcplusState.selectedAccount ? "" : "disabled"}>阅读数据</button>
+        <button class="button button-ghost" type="button" data-wcplus-utility="statistics" ${wcplusState.selectedAccount ? "" : "disabled"}>统计数据</button>
+        <button class="button button-ghost" type="button" data-wcplus-utility="owner" ${wcplusState.preview || wcplusState.articles.length ? "" : "disabled"}>公众号详情</button>
+        <button class="button button-ghost" type="button" data-wcplus-utility="likes">收藏文章</button>
+        <button class="button button-ghost" type="button" data-wcplus-utility="request" ${wcplusState.selectedAccount ? "" : "disabled"}>请求公众号</button>
+      </div>
       ${showOwnStatus ? status : ""}
       ${envCheckHTML}
       <div class="wcplus-source__grid">
@@ -1025,11 +1034,20 @@ async function bootstrapWCPlusSource() {
 
 function renderWCPlusPreview() {
   const article = wcplusState.preview;
+  const utility = wcplusState.utilityResult;
+  const utilityHTML = utility ? `
+    <div class="wcplus-source__utility-result">
+      <p class="web-kicker">Auxiliary Result</p>
+      <h4>${escapeHTML(utility.title || "辅助查询结果")}</h4>
+      <pre>${escapeHTML(JSON.stringify(utility.payload || {}, null, 2).slice(0, 3200))}</pre>
+    </div>
+  ` : "";
   if (!article) {
     return `
       <p class="web-kicker">WC Plus Preview</p>
       <h3>等待文章预览</h3>
       <p class="web-muted">从 WC Plus 已下载文章中选择预览，确认内容后可导入书籍知识库。</p>
+      ${utilityHTML}
     `;
   }
   return `
@@ -1040,6 +1058,7 @@ function renderWCPlusPreview() {
       <span>${escapeHTML(wcplusArticlePublishTime(article) || "")}</span>
     </div>
     <pre>${escapeHTML(String(firstValue(article, ["content", "Content"]) || "").slice(0, 2200))}</pre>
+    ${utilityHTML}
   `;
 }
 
@@ -1202,6 +1221,11 @@ function bindWCPlusEvents() {
   for (const button of document.querySelectorAll("[data-wcplus-copy-batch]")) {
     button.addEventListener("click", async () => {
       await copyWCPlusBatchText(String(button.getAttribute("data-wcplus-copy-batch") || ""));
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-utility]")) {
+    button.addEventListener("click", async () => {
+      await runWCPlusUtility(String(button.getAttribute("data-wcplus-utility") || ""));
     });
   }
   document.querySelector("[data-wcplus-copy-diagnostics]")?.addEventListener("click", async () => {
@@ -1706,6 +1730,82 @@ async function searchWCPlus() {
       wcplusState.searchResults = firstArray(payload, ["results", "Results", "articles", "Articles", "items", "Items"]);
     }
     wcplusState.message = `搜索完成：${wcplusState.searchResults.length} 条结果。`;
+  } catch (error) {
+    wcplusState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    wcplusState.loading = "";
+    refreshWCPlusView();
+  }
+}
+
+async function runWCPlusUtility(kind) {
+  const biz = wcplusAccountBiz(wcplusState.selectedAccount);
+  const articleID = wcplusArticleID(wcplusState.preview || wcplusState.articles[0] || {});
+  const query = new URLSearchParams();
+  const utilityByKind = {
+    reading: {
+      title: "阅读数据",
+      endpoint: "/api/wcplus/report/reading-data",
+      needsBiz: true,
+    },
+    statistics: {
+      title: "统计数据",
+      endpoint: "/api/wcplus/report/statistic-data",
+      needsBiz: true,
+    },
+    owner: {
+      title: "公众号详情",
+      endpoint: "/api/wcplus/article/gzh",
+      needsArticleID: true,
+    },
+    likes: {
+      title: "收藏文章",
+      endpoint: "/api/wcplus/like-articles",
+      defaults: { offset: "0", num: String(wcplusState.articleNum || 20) },
+    },
+    request: {
+      title: "请求公众号",
+      endpoint: "/api/wcplus/request/gzh",
+      needsBiz: true,
+    },
+  };
+  const utility = utilityByKind[kind];
+  if (!utility) {
+    wcplusState.message = "未知辅助查询。";
+    refreshWCPlusView();
+    return;
+  }
+  if (utility.needsBiz && !biz) {
+    wcplusState.message = "请先选择公众号。";
+    refreshWCPlusView();
+    return;
+  }
+  if (utility.needsArticleID && !articleID) {
+    wcplusState.message = "请先预览或加载一篇带 id 的文章。";
+    refreshWCPlusView();
+    return;
+  }
+  if (utility.needsBiz) {
+    query.set("biz", biz);
+  }
+  if (utility.needsArticleID) {
+    query.set("id", articleID);
+  }
+  for (const [key, value] of Object.entries(utility.defaults || {})) {
+    query.set(key, value);
+  }
+
+  wcplusState.loading = utility.title;
+  wcplusState.message = "";
+  refreshWCPlusView();
+  try {
+    const suffix = query.toString() ? `?${query.toString()}` : "";
+    const payload = await apiFetch(`${utility.endpoint}${suffix}`);
+    wcplusState.utilityResult = {
+      title: utility.title,
+      payload,
+    };
+    wcplusState.message = `${utility.title}已更新。`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {

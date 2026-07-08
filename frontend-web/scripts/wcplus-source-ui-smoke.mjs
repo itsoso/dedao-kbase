@@ -51,6 +51,11 @@ for (const endpoint of [
   "/api/wcplus/article/all",
   "/api/wcplus/article/search-title",
   "/api/wcplus/search",
+  "/api/wcplus/report/reading-data",
+  "/api/wcplus/report/statistic-data",
+  "/api/wcplus/article/gzh",
+  "/api/wcplus/like-articles",
+  "/api/wcplus/request/gzh",
   "/api/wcplus/export/text",
   "/api/wcplus/export/gzh-csv",
   "/api/wcplus/export/all-articles-xlsx",
@@ -89,6 +94,12 @@ for (const label of [
   "导入篇数",
   "最近导出",
   "抓取篇数",
+  "辅助查询",
+  "阅读数据",
+  "统计数据",
+  "公众号详情",
+  "收藏文章",
+  "请求公众号",
 ]) {
   assert.ok(js.includes(label), `WC Plus UI should render ${label}`);
 }
@@ -109,6 +120,11 @@ for (const selector of [
   "data-wcplus-copy-diagnostics",
   "data-wcplus-copy-batch=\"success\"",
   "data-wcplus-copy-batch=\"failed\"",
+  "data-wcplus-utility=\"reading\"",
+  "data-wcplus-utility=\"statistics\"",
+  "data-wcplus-utility=\"owner\"",
+  "data-wcplus-utility=\"likes\"",
+  "data-wcplus-utility=\"request\"",
 ]) {
   assert.ok(js.includes(selector), `WC Plus UI should include ${selector}`);
 }
@@ -121,6 +137,8 @@ for (const className of [
   ".wcplus-source__search-results",
   ".wcplus-source__badge",
   ".wcplus-source__env",
+  ".wcplus-source__utility",
+  ".wcplus-source__utility-result",
   ".wcplus-source__batch-form",
   ".wcplus-source__batch-result",
   ".wcplus-source__manual-form",
@@ -131,6 +149,8 @@ for (const className of [
 assert.ok(js.includes("success_text"), "WC Plus UI should render batch import success_text");
 assert.ok(js.includes("failed_text"), "WC Plus UI should render batch import failed_text");
 assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
+assert.ok(js.includes("utilityResult"), "WC Plus UI should render auxiliary API results");
+assert.ok(js.includes("runWCPlusUtility"), "WC Plus UI should call auxiliary WC Plus APIs");
 assert.ok(js.includes("base_url"), "WC Plus UI should show server-side WC Plus base_url diagnostics");
 assert.ok(js.includes("FileReader"), "WC Plus UI should support raw TXT/Markdown file import fallback");
 assert.ok(js.includes("new URLSearchParams({ url: articleURL })"), "WC Plus UI should preview URL-only article results");

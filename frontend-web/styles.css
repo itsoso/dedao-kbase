@@ -493,6 +493,23 @@ a.button {
   gap: 8px;
 }
 
+.wcplus-source__utility {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: -2px 0 12px;
+  border-bottom: 1px solid rgba(141, 132, 117, 0.12);
+  padding-bottom: 12px;
+}
+
+.wcplus-source__utility > span {
+  color: #756c60;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
 .wcplus-source__mini-form,
 .wcplus-source__options,
 .wcplus-source__pager {
@@ -702,6 +719,18 @@ a.button {
   font-size: 13px;
   line-height: 1.75;
   white-space: pre-wrap;
+}
+
+.wcplus-source__utility-result {
+  margin-top: 14px;
+  border-top: 1px solid rgba(141, 132, 117, 0.16);
+  padding-top: 12px;
+}
+
+.wcplus-source__utility-result h4 {
+  margin: 3px 0 8px;
+  color: #24231f;
+  font-size: 16px;
 }
 
 .wcplus-source__tasks {
@@ -1399,6 +1428,7 @@ a.button {
   }
 
   .wcplus-source__toolbar,
+  .wcplus-source__utility,
   .wcplus-source__batch-form,
   .wcplus-source__batch-result,
   .wcplus-source__manual-form,
