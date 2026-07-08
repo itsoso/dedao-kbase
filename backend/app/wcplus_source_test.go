@@ -124,6 +124,47 @@ func TestWCPlusSourceAcceptsFlexibleListShapes(t *testing.T) {
 	}
 }
 
+func TestWCPlusSourceNormalizesArticleAliasFields(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"success":true,"data":{"articles":[{"ArticleId":"alias-1","Title":"别名文章","GzhNickname":"别名公众号","link":"https://mp.weixin.qq.com/s/alias","p_date_text":"2026-07-08"}],"total":1}}`)
+		case "/api/search/search":
+			fmt.Fprint(w, `{"success":true,"data":{"results":[{"appmsgid":"alias-2","title":"搜索别名","source_url":"https://mp.weixin.qq.com/s/search-alias"}]}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	list, err := service.ListAccountArticles(context.Background(), WCPlusArticleListOptions{Biz: "biz-alias"})
+	if err != nil {
+		t.Fatalf("ListAccountArticles returned error: %v", err)
+	}
+	if len(list.Articles) != 1 {
+		t.Fatalf("articles length = %d", len(list.Articles))
+	}
+	article := list.Articles[0]
+	if article.ID != "alias-1" || article.Nickname != "别名公众号" || article.URL != "https://mp.weixin.qq.com/s/alias" {
+		t.Fatalf("unexpected aliased article: %#v", article)
+	}
+
+	payload, err := service.GetJSON(context.Background(), "/api/search/search", mapToValues(map[string]string{"q": "别名"}))
+	if err != nil {
+		t.Fatalf("GetJSON returned error: %v", err)
+	}
+	items := wcplusArrayValue(payload, "results", "Results", "articles", "Articles", "items", "Items")
+	if len(items) != 1 {
+		t.Fatalf("search items length = %d", len(items))
+	}
+	searchArticle := wcplusArticleFromAny(items[0])
+	if searchArticle.ID != "alias-2" || searchArticle.URL != "https://mp.weixin.qq.com/s/search-alias" {
+		t.Fatalf("unexpected search alias article: %#v", searchArticle)
+	}
+}
+
 func TestWCPlusSourceImportsArticleIntoBookKnowledge(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -154,6 +195,48 @@ func TestWCPlusSourceImportsArticleIntoBookKnowledge(t *testing.T) {
 	}
 	if len(pkg.Citations) != 1 || pkg.Citations[0].SourceHTML != "https://mp.weixin.qq.com/s/wx1" {
 		t.Fatalf("unexpected citations: %#v", pkg.Citations)
+	}
+}
+
+func TestWCPlusSourceGetsAndImportsArticleContentByURL(t *testing.T) {
+	var sawURLContent bool
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/article/content":
+			if got := r.URL.Query().Get("url"); got != "https://mp.weixin.qq.com/s/url-only" {
+				t.Fatalf("url = %q", got)
+			}
+			if got := r.URL.Query().Get("nickname"); got != "" {
+				t.Fatalf("nickname should be empty for URL lookup, got %q", got)
+			}
+			sawURLContent = true
+			fmt.Fprint(w, `{"success":true,"data":{"id":"url-only","title":"URL 文章","nickname":"URL 公众号","url":"https://mp.weixin.qq.com/s/url-only","content":"# URL 文章\n\n只通过链接也能导入。","publish_time":"2026-07-08"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	store := NewBookKnowledgeStore(t.TempDir())
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	content, err := service.GetArticleContentByURL(context.Background(), "https://mp.weixin.qq.com/s/url-only")
+	if err != nil {
+		t.Fatalf("GetArticleContentByURL returned error: %v", err)
+	}
+	if !sawURLContent || content.ID != "url-only" || !strings.Contains(content.Content, "只通过链接") {
+		t.Fatalf("unexpected URL content: %#v", content)
+	}
+
+	pkg, err := service.ImportArticle(context.Background(), store, WCPlusImportArticleRequest{
+		URL:    "https://mp.weixin.qq.com/s/url-only",
+		BookID: "wcplus-url-only",
+	})
+	if err != nil {
+		t.Fatalf("ImportArticle URL returned error: %v", err)
+	}
+	if pkg.Book.BookID != "wcplus-url-only" || !strings.Contains(pkg.Chunks[0].Text, "只通过链接") {
+		t.Fatalf("unexpected imported URL package: %#v", pkg)
 	}
 }
 

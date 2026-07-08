@@ -472,7 +472,13 @@ func (h *kbaseHTTPHandler) handleWCPlusArticleList(w http.ResponseWriter, r *htt
 }
 
 func (h *kbaseHTTPHandler) handleWCPlusArticleContent(w http.ResponseWriter, r *http.Request) {
-	content, err := h.wcplusService().GetArticleContent(r.Context(), r.URL.Query().Get("nickname"), r.URL.Query().Get("id"))
+	var content *WCPlusArticleContent
+	var err error
+	if rawURL := strings.TrimSpace(r.URL.Query().Get("url")); rawURL != "" && strings.TrimSpace(r.URL.Query().Get("id")) == "" {
+		content, err = h.wcplusService().GetArticleContentByURL(r.Context(), rawURL)
+	} else {
+		content, err = h.wcplusService().GetArticleContent(r.Context(), r.URL.Query().Get("nickname"), r.URL.Query().Get("id"))
+	}
 	if err != nil {
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
 		return

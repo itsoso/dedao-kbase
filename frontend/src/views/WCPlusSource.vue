@@ -143,8 +143,8 @@
                                 </div>
                                 <div class="row-actions">
                                     <el-button v-if="accountBiz(item)" @click="selectAccount(item)">选择</el-button>
-                                    <el-button v-if="articleID(item)" @click="previewArticle(item)">预览</el-button>
-                                    <el-button v-if="articleID(item)" type="primary" @click="importArticle(item)">导入</el-button>
+                                    <el-button v-if="articleID(item) || articleURL(item)" @click="previewArticle(item)">预览</el-button>
+                                    <el-button v-if="articleID(item) || articleURL(item)" type="primary" @click="importArticle(item)">导入</el-button>
                                 </div>
                             </article>
                             <el-empty v-if="!searchResults.length" description="提交搜索后显示结果" :image-size="80" />
@@ -479,12 +479,12 @@ const numberValue = (value: any, keys: string[]) => {
 const accountBiz = (account: any) => firstValue(account, ['biz', 'Biz', 'fakeid', 'FakeID'])
 const accountNickname = (account: any) => firstValue(account, ['nickname', 'Nickname', 'name', 'Name', 'gzh_nickname'])
 const accountArticleCount = (account: any) => numberValue(account, ['article_count', 'ArticleCount', 'articleCount', 'total'])
-const articleID = (article: any) => firstValue(article, ['id', 'ID', 'article_id', 'ArticleID', 'appmsgid', 'msgid'])
+const articleID = (article: any) => firstValue(article, ['id', 'ID', 'article_id', 'ArticleID', 'ArticleId', 'articleId', 'appmsgid', 'AppMsgID', 'app_msg_id', 'msgid', 'MsgID', 'aid', 'Aid'])
 const articleTitle = (article: any) => firstValue(article, ['title', 'Title'])
 const articleNickname = (article: any) => firstValue(article, ['nickname', 'Nickname', 'gzh_nickname'])
-const articleURL = (article: any) => firstValue(article, ['url', 'URL', 'content_url', 'ContentURL', 'source_url', 'SourceURL'])
+const articleURL = (article: any) => firstValue(article, ['url', 'URL', 'link', 'Link', 'content_url', 'ContentURL', 'source_url', 'SourceURL'])
 const articleDigest = (article: any) => firstValue(article, ['digest', 'Digest', 'summary', 'Summary'])
-const articlePublishTime = (article: any) => firstValue(article, ['publish_time', 'PublishTime', 'p_date_text', 'pDateText'])
+const articlePublishTime = (article: any) => firstValue(article, ['publish_time', 'PublishTime', 'p_date_text', 'PDateText', 'pDateText', 'date', 'Date'])
 const articleContent = (article: any) => firstValue(article, ['content', 'Content', 'markdown', 'Markdown', 'text', 'Text']) || '暂无正文内容'
 const articleSubline = (article: any) => [articleDigest(article), articlePublishTime(article), articleURL(article)].filter(Boolean).join(' · ') || '暂无摘要'
 const resultSubline = (item: any) => [articleDigest(item), articlePublishTime(item), articleURL(item), accountBiz(item)].filter(Boolean).join(' · ') || '暂无摘要'
@@ -637,12 +637,13 @@ const searchWCPlus = async () => {
 const previewArticle = async (article: any) => {
     const nickname = articleNickname(article) || accountNickname(selectedAccount.value)
     const id = articleID(article)
-    if (!nickname || !id) {
-        notify('文章缺少 nickname 或 id。', 'warning')
+    const url = articleURL(article)
+    if ((!nickname || !id) && !url) {
+        notify('文章缺少 nickname/id 或 URL。', 'warning')
         return
     }
     await withLoading('preview', async () => {
-        preview.value = await apiJSON(apiURL('/api/wcplus/article/content', {nickname, id}))
+        preview.value = await apiJSON(apiURL('/api/wcplus/article/content', id ? {nickname, id} : {url}))
         notify('文章预览已更新。', 'success')
     })
 }
@@ -650,16 +651,17 @@ const previewArticle = async (article: any) => {
 const importArticle = async (article: any) => {
     const nickname = articleNickname(article) || accountNickname(selectedAccount.value)
     const id = articleID(article)
-    if (!nickname || !id) {
-        notify('文章缺少 nickname 或 id。', 'warning')
+    const url = articleURL(article)
+    if ((!nickname || !id) && !url) {
+        notify('文章缺少 nickname/id 或 URL。', 'warning')
         return
     }
     await withLoading('importArticle', async () => {
         const payload: any = await apiJSON('/api/wcplus/import/article', {
             method: 'POST',
-            body: JSON.stringify({nickname, id}),
+            body: JSON.stringify(id ? {nickname, id} : {url}),
         })
-        notify(`已导入：${payload?.book?.title || articleTitle(article) || id}`, 'success')
+        notify(`已导入：${payload?.book?.title || articleTitle(article) || id || url}`, 'success')
     })
 }
 

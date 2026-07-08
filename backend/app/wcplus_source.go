@@ -84,6 +84,7 @@ type WCPlusArticleContent struct {
 type WCPlusImportArticleRequest struct {
 	Nickname string `json:"nickname"`
 	ID       string `json:"id"`
+	URL      string `json:"url,omitempty"`
 	BookID   string `json:"book_id,omitempty"`
 }
 
@@ -277,15 +278,37 @@ func (s *WCPlusSourceService) GetArticleContent(ctx context.Context, nickname st
 	values := url.Values{}
 	values.Set("nickname", nickname)
 	values.Set("id", id)
+	return s.getArticleContent(ctx, values, func(content *WCPlusArticleContent) {
+		if content.Nickname == "" {
+			content.Nickname = nickname
+		}
+		if content.ID == "" {
+			content.ID = id
+		}
+	})
+}
+
+func (s *WCPlusSourceService) GetArticleContentByURL(ctx context.Context, rawURL string) (*WCPlusArticleContent, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, fmt.Errorf("url is required")
+	}
+	values := url.Values{}
+	values.Set("url", rawURL)
+	return s.getArticleContent(ctx, values, func(content *WCPlusArticleContent) {
+		if content.URL == "" {
+			content.URL = rawURL
+		}
+	})
+}
+
+func (s *WCPlusSourceService) getArticleContent(ctx context.Context, values url.Values, normalize func(*WCPlusArticleContent)) (*WCPlusArticleContent, error) {
 	var content WCPlusArticleContent
 	if err := s.get(ctx, "/api/article/content", values, &content); err != nil {
 		return nil, err
 	}
-	if content.Nickname == "" {
-		content.Nickname = nickname
-	}
-	if content.ID == "" {
-		content.ID = id
+	if normalize != nil {
+		normalize(&content)
 	}
 	return &content, nil
 }
@@ -294,7 +317,13 @@ func (s *WCPlusSourceService) ImportArticle(ctx context.Context, store *BookKnow
 	if store == nil {
 		return nil, fmt.Errorf("book knowledge store is required")
 	}
-	content, err := s.GetArticleContent(ctx, req.Nickname, req.ID)
+	var content *WCPlusArticleContent
+	var err error
+	if strings.TrimSpace(req.URL) != "" && strings.TrimSpace(req.ID) == "" {
+		content, err = s.GetArticleContentByURL(ctx, req.URL)
+	} else {
+		content, err = s.GetArticleContent(ctx, req.Nickname, req.ID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -622,12 +651,12 @@ func wcplusAccountFromAny(value any) WCPlusAccount {
 
 func wcplusArticleFromAny(value any) WCPlusArticle {
 	return WCPlusArticle{
-		ID:          wcplusStringValue(value, "id", "ID", "article_id", "ArticleID"),
+		ID:          wcplusStringValue(value, "id", "ID", "article_id", "ArticleID", "ArticleId", "articleId", "appmsgid", "AppMsgID", "app_msg_id", "msgid", "MsgID", "aid", "Aid"),
 		Title:       wcplusStringValue(value, "title", "Title"),
 		Nickname:    wcplusStringValue(value, "nickname", "Nickname", "gzh_nickname", "GzhNickname"),
-		URL:         wcplusStringValue(value, "url", "URL", "content_url", "ContentURL", "source_url", "SourceURL"),
+		URL:         wcplusStringValue(value, "url", "URL", "link", "Link", "content_url", "ContentURL", "source_url", "SourceURL"),
 		Digest:      wcplusStringValue(value, "digest", "Digest", "summary", "Summary"),
-		PublishTime: wcplusStringValue(value, "publish_time", "PublishTime", "p_date_text", "PDateText"),
+		PublishTime: wcplusStringValue(value, "publish_time", "PublishTime", "p_date_text", "PDateText", "pDateText", "date", "Date"),
 		UpdateTime:  int64(wcplusIntValue(value, "update_time", "UpdateTime", "p_date", "PDate")),
 	}
 }

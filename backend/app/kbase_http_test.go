@@ -365,6 +365,53 @@ func TestKBaseHTTPHandlerProxiesAndImportsWCPlusArticles(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerPreviewsAndImportsWCPlusArticleByURL(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/article/content":
+			if got := r.URL.Query().Get("url"); got != "https://mp.weixin.qq.com/s/url-only" {
+				t.Fatalf("url = %q", got)
+			}
+			fmt.Fprint(w, `{"success":true,"data":{"id":"url-only","title":"URL 文章","nickname":"URL 公众号","url":"https://mp.weixin.qq.com/s/url-only","content":"# URL 文章\n\n只通过链接也能预览和导入。","publish_time":"2026-07-08"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		WCPlus:    NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL}),
+	})
+
+	contentResp := requestKBase(handler, http.MethodGet, "/api/wcplus/article/content?url="+url.QueryEscape("https://mp.weixin.qq.com/s/url-only"), "secret-token")
+	if contentResp.Code != http.StatusOK {
+		t.Fatalf("content by URL status = %d, body=%s", contentResp.Code, contentResp.Body.String())
+	}
+	if !strings.Contains(contentResp.Body.String(), "只通过链接") {
+		t.Fatalf("content by URL response missing body: %s", contentResp.Body.String())
+	}
+
+	importReq := httptest.NewRequest(http.MethodPost, "/api/wcplus/import/article", bytes.NewBufferString(`{"url":"https://mp.weixin.qq.com/s/url-only","book_id":"wcplus-url-only"}`))
+	importReq.Header.Set("Authorization", "Bearer secret-token")
+	importResp := httptest.NewRecorder()
+	handler.ServeHTTP(importResp, importReq)
+	if importResp.Code != http.StatusOK {
+		t.Fatalf("import by URL status = %d, body=%s", importResp.Code, importResp.Body.String())
+	}
+	pkg, err := store.LoadPackage("wcplus-url-only")
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if !strings.Contains(pkg.Chunks[0].Text, "只通过链接") {
+		t.Fatalf("unexpected imported URL package: %#v", pkg)
+	}
+}
+
 func TestKBaseHTTPHandlerImportsRawWCPlusArticle(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))

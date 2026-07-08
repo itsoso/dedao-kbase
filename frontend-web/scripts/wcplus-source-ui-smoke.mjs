@@ -23,6 +23,7 @@ for (const marker of [
   "copyWCPlusDiagnostics",
   "isWCPlusBootstrapped",
   "loadWCPlusRawFile",
+  "wcplusArticleURL",
   "importRawWCPlusArticle",
   "importWCPlusArticle",
   "importWCPlusAccount",
@@ -76,6 +77,7 @@ for (const label of [
   "批量导入",
   "启动队列",
   "启动时自动检查环境",
+  "文章缺少 nickname/id 或 URL",
   "导出全库 XLSX",
   "环境诊断",
   "服务地址",
@@ -131,6 +133,10 @@ assert.ok(js.includes("failed_text"), "WC Plus UI should render batch import fai
 assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
 assert.ok(js.includes("base_url"), "WC Plus UI should show server-side WC Plus base_url diagnostics");
 assert.ok(js.includes("FileReader"), "WC Plus UI should support raw TXT/Markdown file import fallback");
+assert.ok(js.includes("new URLSearchParams({ url: articleURL })"), "WC Plus UI should preview URL-only article results");
+assert.ok(js.includes("JSON.stringify(id ? { nickname, id } : { url: articleURL })"), "WC Plus UI should import URL-only article results");
+assert.ok(js.includes("appmsgid"), "WC Plus UI should normalize alternate article id fields");
+assert.ok(js.includes("\"link\""), "WC Plus UI should normalize alternate article URL fields");
 assert.doesNotMatch(js, /WCPLUS_BASE_URL\s*=/, "web UI must not embed WC Plus base URL configuration");
 assert.doesNotMatch(js, /127\.0\.0\.1:5001/, "web UI should not hardcode the local WC Plus URL");
 

@@ -632,7 +632,7 @@ function wcplusAccountArticleCount(account) {
 }
 
 function wcplusArticleID(article) {
-  return String(firstValue(article, ["id", "ID", "article_id", "ArticleID"]) || "");
+  return String(firstValue(article, ["id", "ID", "article_id", "ArticleID", "ArticleId", "articleId", "appmsgid", "AppMsgID", "app_msg_id", "msgid", "MsgID", "aid", "Aid"]) || "");
 }
 
 function wcplusArticleTitle(article) {
@@ -648,11 +648,11 @@ function wcplusArticleDigest(article) {
 }
 
 function wcplusArticleURL(article) {
-  return String(firstValue(article, ["url", "URL", "content_url", "ContentURL", "source_url", "SourceURL"]) || "");
+  return String(firstValue(article, ["url", "URL", "link", "Link", "content_url", "ContentURL", "source_url", "SourceURL"]) || "");
 }
 
 function wcplusArticlePublishTime(article) {
-  return String(firstValue(article, ["publish_time", "PublishTime", "p_date_text", "PDateText"]) || "");
+  return String(firstValue(article, ["publish_time", "PublishTime", "p_date_text", "PDateText", "pDateText", "date", "Date"]) || "");
 }
 
 function renderWCPlusSource(showOwnStatus = true) {
@@ -683,6 +683,7 @@ function renderWCPlusSource(showOwnStatus = true) {
   `}).join("");
   const searchRows = wcplusState.searchResults.map((item, index) => {
     const articleID = wcplusArticleID(item);
+    const articleURL = wcplusArticleURL(item);
     const accountBiz = wcplusAccountBiz(item);
     const title = wcplusArticleTitle(item) || wcplusAccountNickname(item) || articleID || accountBiz || "结果";
     const subline = [wcplusArticleDigest(item), wcplusArticlePublishTime(item), wcplusArticleURL(item), accountBiz].filter(Boolean).join(" · ");
@@ -694,8 +695,8 @@ function renderWCPlusSource(showOwnStatus = true) {
         </div>
         <div class="wcplus-source__row-actions">
           ${accountBiz ? `<button type="button" class="button button-ghost" data-wcplus-select-result-account="${index}">选择</button>` : ""}
-          ${articleID ? `<button type="button" class="button button-ghost" data-wcplus-preview-result="${index}">预览</button>` : ""}
-          ${articleID ? `<button type="button" class="button button-primary" data-wcplus-import-result="${index}">导入</button>` : ""}
+          ${articleID || articleURL ? `<button type="button" class="button button-ghost" data-wcplus-preview-result="${index}">预览</button>` : ""}
+          ${articleID || articleURL ? `<button type="button" class="button button-primary" data-wcplus-import-result="${index}">导入</button>` : ""}
         </div>
       </article>
     `;
@@ -1525,8 +1526,9 @@ async function loadWCPlusArticles(renderBefore = true) {
 async function previewWCPlusArticle(article) {
   const nickname = wcplusArticleNickname(article) || wcplusAccountNickname(wcplusState.selectedAccount);
   const id = wcplusArticleID(article);
-  if (!nickname || !id) {
-    wcplusState.message = "文章缺少 nickname 或 id。";
+  const articleURL = wcplusArticleURL(article);
+  if ((!nickname || !id) && !articleURL) {
+    wcplusState.message = "文章缺少 nickname/id 或 URL。";
     refreshWCPlusView();
     return;
   }
@@ -1534,7 +1536,7 @@ async function previewWCPlusArticle(article) {
   wcplusState.message = "";
   refreshWCPlusView();
   try {
-    const query = new URLSearchParams({ nickname, id });
+    const query = id ? new URLSearchParams({ nickname, id }) : new URLSearchParams({ url: articleURL });
     wcplusState.preview = await apiFetch(`/api/wcplus/article/content?${query.toString()}`);
     wcplusState.message = "WC Plus 文章预览已更新。";
   } catch (error) {
@@ -1548,8 +1550,9 @@ async function previewWCPlusArticle(article) {
 async function importWCPlusArticle(article) {
   const nickname = wcplusArticleNickname(article) || wcplusAccountNickname(wcplusState.selectedAccount);
   const id = wcplusArticleID(article);
-  if (!nickname || !id) {
-    wcplusState.message = "文章缺少 nickname 或 id。";
+  const articleURL = wcplusArticleURL(article);
+  if ((!nickname || !id) && !articleURL) {
+    wcplusState.message = "文章缺少 nickname/id 或 URL。";
     refreshWCPlusView();
     return;
   }
@@ -1559,9 +1562,9 @@ async function importWCPlusArticle(article) {
   try {
     const payload = await apiFetch("/api/wcplus/import/article", {
       method: "POST",
-      body: JSON.stringify({ nickname, id }),
+      body: JSON.stringify(id ? { nickname, id } : { url: articleURL }),
     });
-    wcplusState.message = `已导入：${payload.book?.title || wcplusArticleTitle(article) || id}`;
+    wcplusState.message = `已导入：${payload.book?.title || wcplusArticleTitle(article) || id || articleURL}`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {

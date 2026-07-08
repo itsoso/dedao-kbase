@@ -66,6 +66,11 @@ assert.ok(viewSource.includes('base_url'), 'WCPlusSource.vue should show server-
 assert.ok(viewSource.includes('copyDiagnostics'), 'WCPlusSource.vue should support copying WC Plus diagnostics')
 assert.ok(viewSource.includes('loadRawFile'), 'WCPlusSource.vue should support raw TXT/Markdown file import fallback')
 assert.ok(viewSource.includes('FileReader'), 'WCPlusSource.vue should read local raw article files')
+assert.ok(viewSource.includes("articleURL(item)"), 'WCPlusSource.vue should allow URL-only article results')
+assert.ok(viewSource.includes("id ? {nickname, id} : {url}"), 'WCPlusSource.vue should preview URL-only articles')
+assert.ok(viewSource.includes("id ? {nickname, id} : {url}"), 'WCPlusSource.vue should import URL-only articles')
+assert.ok(viewSource.includes('appmsgid'), 'WCPlusSource.vue should normalize alternate article id fields')
+assert.ok(viewSource.includes("'link'"), 'WCPlusSource.vue should normalize alternate article URL fields')
 assert.ok(!viewSource.includes('WCPLUS_BASE_URL'), 'browser code must not embed local WC Plus base URL config')
 assert.ok(!viewSource.includes('localhost:5324'), 'browser code must not call local WC Plus directly')
 
