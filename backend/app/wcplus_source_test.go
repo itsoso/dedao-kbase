@@ -69,6 +69,61 @@ func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 	}
 }
 
+func TestWCPlusSourceAcceptsFlexibleListShapes(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/gzh/list":
+			switch r.URL.Query().Get("q") {
+			case "items":
+				fmt.Fprint(w, `{"success":true,"data":{"items":[{"biz":"biz-items","nickname":"Items 公众号"}],"total":1}}`)
+			default:
+				fmt.Fprint(w, `{"success":true,"data":[{"biz":"biz-array","nickname":"Array 公众号"}]}`)
+			}
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"success":true,"data":{"list":[{"id":"wx-list","title":"List 文章"}],"total":1}}`)
+		case "/api/task/all":
+			fmt.Fprint(w, `{"success":true,"data":{"items":[{"task_id":"task-items","status":"ready"}]}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	accounts, err := service.ListAccounts(context.Background(), WCPlusListOptions{Query: "array"})
+	if err != nil {
+		t.Fatalf("ListAccounts array returned error: %v", err)
+	}
+	if len(accounts.Accounts) != 1 || accounts.Accounts[0].Biz != "biz-array" {
+		t.Fatalf("unexpected array accounts: %#v", accounts)
+	}
+
+	accounts, err = service.ListAccounts(context.Background(), WCPlusListOptions{Query: "items"})
+	if err != nil {
+		t.Fatalf("ListAccounts items returned error: %v", err)
+	}
+	if len(accounts.Accounts) != 1 || accounts.Accounts[0].Biz != "biz-items" {
+		t.Fatalf("unexpected items accounts: %#v", accounts)
+	}
+
+	articles, err := service.ListAccountArticles(context.Background(), WCPlusArticleListOptions{Biz: "biz-list"})
+	if err != nil {
+		t.Fatalf("ListAccountArticles list returned error: %v", err)
+	}
+	if len(articles.Articles) != 1 || articles.Articles[0].ID != "wx-list" {
+		t.Fatalf("unexpected list articles: %#v", articles)
+	}
+
+	tasks, err := service.ListTasks(context.Background())
+	if err != nil {
+		t.Fatalf("ListTasks items returned error: %v", err)
+	}
+	if len(tasks) != 1 || tasks[0].TaskID != "task-items" {
+		t.Fatalf("unexpected tasks: %#v", tasks)
+	}
+}
+
 func TestWCPlusSourceImportsArticleIntoBookKnowledge(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")

@@ -204,14 +204,24 @@ func (s *WCPlusSourceService) ListAccounts(ctx context.Context, opts WCPlusListO
 	setOptionalQuery(values, "sort", opts.Sort)
 	setOptionalQuery(values, "direction", opts.Direction)
 	setOptionalQuery(values, "q", opts.Query)
-	var payload struct {
-		Accounts []WCPlusAccount `json:"gzhs"`
-		Total    int             `json:"total"`
-	}
+	var payload any
 	if err := s.get(ctx, "/api/gzh/list", values, &payload); err != nil {
 		return nil, err
 	}
-	return &WCPlusAccountList{Accounts: payload.Accounts, Total: payload.Total}, nil
+	items := wcplusArrayValue(payload, "gzhs", "Gzhs", "accounts", "Accounts", "items", "Items", "list", "List")
+	accounts := make([]WCPlusAccount, 0, len(items))
+	for _, item := range items {
+		account := wcplusAccountFromAny(item)
+		if account.Biz == "" && account.Nickname == "" {
+			continue
+		}
+		accounts = append(accounts, account)
+	}
+	total := wcplusIntValue(payload, "total", "Total", "count", "Count")
+	if total == 0 {
+		total = len(accounts)
+	}
+	return &WCPlusAccountList{Accounts: accounts, Total: total}, nil
 }
 
 func (s *WCPlusSourceService) ListAccountArticles(ctx context.Context, opts WCPlusArticleListOptions) (*WCPlusArticleList, error) {
@@ -225,18 +235,34 @@ func (s *WCPlusSourceService) ListAccountArticles(ctx context.Context, opts WCPl
 	setOptionalQuery(values, "nickname", opts.Nickname)
 	setOptionalQuery(values, "sort", opts.Sort)
 	setOptionalQuery(values, "direction", opts.Direction)
-	var payload struct {
-		Account  WCPlusAccount   `json:"gzh"`
-		Articles []WCPlusArticle `json:"articles"`
-		Total    int             `json:"total"`
-	}
+	var payload any
 	if err := s.get(ctx, "/api/report/gzh_articles", values, &payload); err != nil {
 		return nil, err
 	}
-	if payload.Account.Nickname == "" {
-		payload.Account.Nickname = opts.Nickname
+	account := wcplusAccountFromAny(wcplusObjectValue(payload, "gzh", "Gzh", "account", "Account"))
+	if account.Nickname == "" {
+		account.Nickname = opts.Nickname
 	}
-	return &WCPlusArticleList{Account: payload.Account, Articles: payload.Articles, Total: payload.Total}, nil
+	if account.Biz == "" {
+		account.Biz = strings.TrimSpace(opts.Biz)
+	}
+	items := wcplusArrayValue(payload, "articles", "Articles", "items", "Items", "list", "List", "results", "Results")
+	articles := make([]WCPlusArticle, 0, len(items))
+	for _, item := range items {
+		article := wcplusArticleFromAny(item)
+		if article.ID == "" && article.Title == "" {
+			continue
+		}
+		if article.Nickname == "" {
+			article.Nickname = account.Nickname
+		}
+		articles = append(articles, article)
+	}
+	total := wcplusIntValue(payload, "total", "Total", "count", "Count")
+	if total == 0 {
+		total = len(articles)
+	}
+	return &WCPlusArticleList{Account: account, Articles: articles, Total: total}, nil
 }
 
 func (s *WCPlusSourceService) GetArticleContent(ctx context.Context, nickname string, id string) (*WCPlusArticleContent, error) {
@@ -362,13 +388,20 @@ func (s *WCPlusSourceService) ImportAccountArticles(ctx context.Context, store *
 }
 
 func (s *WCPlusSourceService) ListTasks(ctx context.Context) ([]WCPlusTask, error) {
-	var payload struct {
-		Tasks []WCPlusTask `json:"tasks"`
-	}
+	var payload any
 	if err := s.get(ctx, "/api/task/all", nil, &payload); err != nil {
 		return nil, err
 	}
-	return payload.Tasks, nil
+	items := wcplusArrayValue(payload, "tasks", "Tasks", "items", "Items", "list", "List")
+	tasks := make([]WCPlusTask, 0, len(items))
+	for _, item := range items {
+		task := wcplusTaskFromAny(item)
+		if task.TaskID == "" && task.Status == "" {
+			continue
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, nil
 }
 
 func (s *WCPlusSourceService) CreateTask(ctx context.Context, req WCPlusTaskRequest) (*WCPlusTask, error) {
@@ -579,10 +612,33 @@ func (s *WCPlusSourceService) findCandidateAccount(ctx context.Context, nickname
 
 func wcplusAccountFromAny(value any) WCPlusAccount {
 	return WCPlusAccount{
-		Biz:      wcplusStringValue(value, "biz", "Biz", "fakeid", "FakeID"),
+		Biz:          wcplusStringValue(value, "biz", "Biz", "fakeid", "FakeID"),
+		Nickname:     wcplusStringValue(value, "nickname", "Nickname", "name", "Name"),
+		Alias:        wcplusStringValue(value, "alias", "Alias"),
+		Desc:         wcplusStringValue(value, "desc", "Desc"),
+		ArticleCount: wcplusIntValue(value, "article_count", "ArticleCount", "articleCount", "total", "Total"),
+	}
+}
+
+func wcplusArticleFromAny(value any) WCPlusArticle {
+	return WCPlusArticle{
+		ID:          wcplusStringValue(value, "id", "ID", "article_id", "ArticleID"),
+		Title:       wcplusStringValue(value, "title", "Title"),
+		Nickname:    wcplusStringValue(value, "nickname", "Nickname", "gzh_nickname", "GzhNickname"),
+		URL:         wcplusStringValue(value, "url", "URL", "content_url", "ContentURL", "source_url", "SourceURL"),
+		Digest:      wcplusStringValue(value, "digest", "Digest", "summary", "Summary"),
+		PublishTime: wcplusStringValue(value, "publish_time", "PublishTime", "p_date_text", "PDateText"),
+		UpdateTime:  int64(wcplusIntValue(value, "update_time", "UpdateTime", "p_date", "PDate")),
+	}
+}
+
+func wcplusTaskFromAny(value any) WCPlusTask {
+	return WCPlusTask{
+		TaskID:   wcplusStringValue(value, "task_id", "TaskID", "id", "ID"),
+		Biz:      wcplusStringValue(value, "biz", "Biz"),
 		Nickname: wcplusStringValue(value, "nickname", "Nickname", "name", "Name"),
-		Alias:    wcplusStringValue(value, "alias", "Alias"),
-		Desc:     wcplusStringValue(value, "desc", "Desc"),
+		Status:   wcplusStringValue(value, "status", "Status"),
+		Message:  wcplusStringValue(value, "message", "Message", "error", "Error"),
 	}
 }
 
@@ -609,6 +665,63 @@ func wcplusStringValue(value any, keys ...string) string {
 	return ""
 }
 
+func wcplusIntValue(value any, keys ...string) int {
+	current := value
+	if raw, ok := current.(json.RawMessage); ok {
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err == nil {
+			current = decoded
+		}
+	}
+	object, ok := current.(map[string]any)
+	if !ok {
+		return 0
+	}
+	for _, key := range keys {
+		found, ok := object[key]
+		if !ok || found == nil {
+			continue
+		}
+		switch typed := found.(type) {
+		case int:
+			return typed
+		case int64:
+			return int(typed)
+		case float64:
+			return int(typed)
+		case json.Number:
+			parsed, _ := typed.Int64()
+			return int(parsed)
+		default:
+			parsed, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(found)))
+			if err == nil {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
+func wcplusObjectValue(value any, keys ...string) any {
+	current := value
+	if raw, ok := current.(json.RawMessage); ok {
+		var decoded any
+		if err := json.Unmarshal(raw, &decoded); err == nil {
+			current = decoded
+		}
+	}
+	object, ok := current.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, key := range keys {
+		if found, ok := object[key]; ok {
+			return found
+		}
+	}
+	return nil
+}
+
 func wcplusArrayValue(value any, keys ...string) []any {
 	current := value
 	if raw, ok := current.(json.RawMessage); ok {
@@ -616,6 +729,9 @@ func wcplusArrayValue(value any, keys ...string) []any {
 		if err := json.Unmarshal(raw, &decoded); err == nil {
 			current = decoded
 		}
+	}
+	if array, ok := current.([]any); ok {
+		return array
 	}
 	object, ok := current.(map[string]any)
 	if !ok {
