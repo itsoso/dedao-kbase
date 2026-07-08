@@ -135,6 +135,9 @@ assert.ok(js.includes("base_url"), "WC Plus UI should show server-side WC Plus b
 assert.ok(js.includes("FileReader"), "WC Plus UI should support raw TXT/Markdown file import fallback");
 assert.ok(js.includes("new URLSearchParams({ url: articleURL })"), "WC Plus UI should preview URL-only article results");
 assert.ok(js.includes("JSON.stringify(id ? { nickname, id } : { url: articleURL })"), "WC Plus UI should import URL-only article results");
+assert.ok(js.includes("const articleURL = wcplusArticleURL(article);"), "WC Plus article list should read article URL aliases");
+assert.ok(js.includes('data-wcplus-preview="${index}" ${id || articleURL ? "" : "disabled"}'), "WC Plus article list should preview URL-only articles");
+assert.ok(js.includes('data-wcplus-import="${index}" ${id || articleURL ? "" : "disabled"}'), "WC Plus article list should import URL-only articles");
 assert.ok(js.includes("appmsgid"), "WC Plus UI should normalize alternate article id fields");
 assert.ok(js.includes("\"link\""), "WC Plus UI should normalize alternate article URL fields");
 assert.doesNotMatch(js, /WCPLUS_BASE_URL\s*=/, "web UI must not embed WC Plus base URL configuration");

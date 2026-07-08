@@ -669,15 +669,16 @@ function renderWCPlusSource(showOwnStatus = true) {
   }).join("");
   const articleRows = wcplusState.articles.map((article, index) => {
     const id = wcplusArticleID(article);
+    const articleURL = wcplusArticleURL(article);
     return `
     <article class="wcplus-source__article">
       <div>
         <h3>${escapeHTML(wcplusArticleTitle(article) || id || "未命名文章")}</h3>
-        <p>${escapeHTML([wcplusArticleDigest(article), wcplusArticlePublishTime(article)].filter(Boolean).join(" · ") || wcplusArticleURL(article) || "暂无摘要")}</p>
+        <p>${escapeHTML([wcplusArticleDigest(article), wcplusArticlePublishTime(article)].filter(Boolean).join(" · ") || articleURL || "暂无摘要")}</p>
       </div>
       <div class="wcplus-source__row-actions">
-        <button type="button" class="button button-ghost" data-wcplus-preview="${index}" ${id ? "" : "disabled"}>预览</button>
-        <button type="button" class="button button-primary" data-wcplus-import="${index}" ${id ? "" : "disabled"}>导入知识库</button>
+        <button type="button" class="button button-ghost" data-wcplus-preview="${index}" ${id || articleURL ? "" : "disabled"}>预览</button>
+        <button type="button" class="button button-primary" data-wcplus-import="${index}" ${id || articleURL ? "" : "disabled"}>导入知识库</button>
       </div>
     </article>
   `}).join("");
