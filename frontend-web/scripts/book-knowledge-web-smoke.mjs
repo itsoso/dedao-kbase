@@ -31,6 +31,10 @@ for (const authMarker of [
   "localStorage.setItem",
   'credentials: "same-origin"',
   "response.status === 401",
+  "isSafeBearerToken",
+  "clearStoredToken",
+  "setAuthorizationHeader",
+  "skip invalid kbase token",
 ]) {
   assert.ok(js.includes(authMarker), `book knowledge web UI should include auth marker ${authMarker}`);
 }

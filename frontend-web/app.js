@@ -69,22 +69,56 @@ const knowledgeState = {
 function getToken() {
   for (const key of tokenKeys) {
     const value = window.localStorage.getItem(key);
-    if (value && value.trim()) {
-      return value.trim();
+    const clean = String(value || "").trim();
+    if (!clean) {
+      continue;
     }
+    if (isSafeBearerToken(clean)) {
+      return clean;
+    }
+    console.warn("skip invalid kbase token", key);
+    window.localStorage.removeItem(key);
   }
   return "";
 }
 
+function isSafeBearerToken(token) {
+  const clean = String(token || "").trim();
+  if (!clean || /\s/.test(clean)) {
+    return false;
+  }
+  return /^[\x21-\x7e]+$/.test(clean);
+}
+
+function clearStoredToken() {
+  for (const key of tokenKeys) {
+    window.localStorage.removeItem(key);
+  }
+}
+
 function storeToken(token) {
   const clean = String(token || "").trim();
-  if (!clean) {
+  if (!isSafeBearerToken(clean)) {
+    clearStoredToken();
     return "";
   }
   for (const key of tokenKeys) {
     window.localStorage.setItem(key, clean);
   }
   return clean;
+}
+
+function setAuthorizationHeader(headers, token) {
+  const clean = String(token || "").trim();
+  if (!isSafeBearerToken(clean)) {
+    if (clean) {
+      clearStoredToken();
+      console.warn("skip invalid kbase token", "authorization");
+    }
+    return false;
+  }
+  headers.set("Authorization", `Bearer ${clean}`);
+  return true;
 }
 
 async function refreshBrowserSessionToken() {
@@ -147,7 +181,7 @@ async function apiFetch(path, options = {}, didRefreshAuth = false) {
   }
   const token = getToken() || await ensureBrowserSessionToken();
   if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+    setAuthorizationHeader(headers, token);
   }
 
   const response = await fetch(path, {
@@ -186,7 +220,7 @@ async function apiDownload(path, options = {}, filename = "download.bin", didRef
   const headers = new Headers(options.headers || {});
   const token = getToken() || await ensureBrowserSessionToken();
   if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+    setAuthorizationHeader(headers, token);
   }
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
