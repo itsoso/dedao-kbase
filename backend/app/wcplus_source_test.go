@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
@@ -653,6 +654,73 @@ func TestWCPlusSourceBatchImportsNicknamesWithExactMatch(t *testing.T) {
 	}
 	if !strings.Contains(result.SuccessText, "医学参考") || !strings.Contains(result.FailedText, "相似账号") {
 		t.Fatalf("missing text exports: %#v", result)
+	}
+}
+
+func TestWCPlusSourceBatchImportsNicknamesToKnowledgeAfterSync(t *testing.T) {
+	var taskPolls int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/search_gzh/search":
+			fmt.Fprint(w, `{"Candidates":[{"Biz":"biz-med","Nickname":"医学参考"}],"Total":1}`)
+		case "/api/batch_task/create_task":
+			fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-1","status":"ready"}}`)
+		case "/api/task/control":
+			fmt.Fprint(w, `{"success":true,"data":{"status":"running"}}`)
+		case "/api/task/all":
+			taskPolls++
+			if taskPolls == 1 {
+				fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-1","biz":"biz-med","nickname":"医学参考","status":"running"}]}}`)
+				return
+			}
+			fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-1","biz":"biz-med","nickname":"医学参考","status":"succeeded"}]}}`)
+		case "/api/report/gzh_articles":
+			if got := r.URL.Query().Get("biz"); got != "biz-med" {
+				t.Fatalf("biz = %q", got)
+			}
+			fmt.Fprint(w, `{"success":true,"data":{"gzh":{"biz":"biz-med","nickname":"医学参考"},"articles":[{"title":"同步后文章","link":"https://mp.weixin.qq.com/s/synced"}],"total":1}}`)
+		case "/api/article/content":
+			if got := r.URL.Query().Get("url"); got != "https://mp.weixin.qq.com/s/synced" {
+				t.Fatalf("url = %q", got)
+			}
+			fmt.Fprint(w, `{"success":true,"data":{"title":"同步后文章","nickname":"医学参考","url":"https://mp.weixin.qq.com/s/synced","content":"# 同步后文章\n\n自动进入书籍知识库。","publish_time":"2026-07-08"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	store := NewBookKnowledgeStore(t.TempDir())
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	result, err := service.BatchImportNicknamesToKnowledge(context.Background(), store, WCPlusBatchImportRequest{
+		Nicknames:          []string{"医学参考"},
+		ArticleListType:    "amount",
+		ArticleListAmount:  1,
+		StartQueue:         true,
+		ExactMatch:         true,
+		ImportToKBase:      true,
+		ImportLimit:        1,
+		WaitForCompletion:  true,
+		PollAttempts:       2,
+		PollIntervalMillis: int((time.Millisecond).Milliseconds()),
+		BookIDPrefix:       "wcplus-batch",
+	})
+	if err != nil {
+		t.Fatalf("BatchImportNicknamesToKnowledge returned error: %v", err)
+	}
+	if taskPolls != 2 {
+		t.Fatalf("taskPolls = %d, want 2", taskPolls)
+	}
+	if result.ImportedCount != 1 || len(result.ImportedBooks) != 1 || len(result.ImportErrors) != 0 {
+		t.Fatalf("unexpected import result: %#v", result)
+	}
+	saved, err := store.LoadPackage(result.ImportedBooks[0].BookID)
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if !strings.Contains(saved.Chunks[0].Text, "自动进入书籍知识库") {
+		t.Fatalf("unexpected saved chunk: %#v", saved.Chunks)
 	}
 }
 

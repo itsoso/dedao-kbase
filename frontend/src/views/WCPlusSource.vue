@@ -253,12 +253,20 @@
                         </el-select>
                         <el-input-number v-model="batchArticleListAmount" :min="0" :max="1000" size="small" />
                     </div>
+                    <div class="batch-options wcplus-batch-import-to-kbase">
+                        <el-checkbox v-model="batchImportToKBase">同步后导入书籍知识库</el-checkbox>
+                        <el-checkbox v-model="batchWaitForCompletion" :disabled="!batchImportToKBase">等待任务完成后入库</el-checkbox>
+                        <label>
+                            入库篇数
+                            <el-input-number v-model="batchImportLimit" :min="1" :max="100" size="small" />
+                        </label>
+                    </div>
                     <el-button type="primary" class="full-button" @click="batchImportNicknames">创建任务并启动</el-button>
                     <div v-if="batchResult" class="wcplus-batch-result">
                         <div class="section-head">
                             <span>批量结果</span>
                             <el-tag size="small" effect="plain">
-                                成功 {{ batchResult.success?.length || 0 }} / 失败 {{ batchResult.failed?.length || 0 }}
+                                成功 {{ batchResult.success?.length || 0 }} / 失败 {{ batchResult.failed?.length || 0 }} / 入库 {{ batchResult.imported_count || 0 }}
                             </el-tag>
                         </div>
                         <el-input
@@ -269,6 +277,13 @@
                         />
                         <el-input
                             :model-value="batchResult.failed_text || '无失败项'"
+                            type="textarea"
+                            :rows="3"
+                            readonly
+                        />
+                        <el-input
+                            v-if="batchResult.import_errors?.length"
+                            :model-value="batchResult.import_errors.join('\n')"
                             type="textarea"
                             :rows="3"
                             readonly
@@ -338,6 +353,9 @@ const batchNicknames = ref('')
 const batchExactMatch = ref(true)
 const batchArticleListType = ref('all')
 const batchArticleListAmount = ref(0)
+const batchImportToKBase = ref(false)
+const batchWaitForCompletion = ref(false)
+const batchImportLimit = ref(10)
 const rawTitle = ref('')
 const rawNickname = ref('')
 const rawURL = ref('')
@@ -882,12 +900,18 @@ const batchImportNicknames = async () => {
                 articleListAmount: batchArticleListType.value === 'amount' ? batchArticleListAmount.value : 0,
                 start_queue: true,
                 exact_match: batchExactMatch.value,
+                import_to_kbase: batchImportToKBase.value,
+                wait_for_completion: batchWaitForCompletion.value,
+                import_limit: batchImportLimit.value,
+                poll_attempts: batchWaitForCompletion.value ? 30 : 0,
+                poll_interval_millis: batchWaitForCompletion.value ? 2000 : 0,
             }),
         })
         batchResult.value = result
         const successCount = Array.isArray(result?.success) ? result.success.length : 0
         const failedCount = Array.isArray(result?.failed) ? result.failed.length : 0
-        notify(`批量任务完成：成功 ${successCount}，失败 ${failedCount}${result?.started ? '，队列已启动' : ''}。`, failedCount ? 'warning' : 'success')
+        const importedCount = result?.imported_count || 0
+        notify(`批量任务完成：成功 ${successCount}，失败 ${failedCount}${result?.started ? '，队列已启动' : ''}${batchImportToKBase.value ? `，入库 ${importedCount} 篇` : ''}。`, failedCount ? 'warning' : 'success')
         await loadTasks(false)
     })
 }

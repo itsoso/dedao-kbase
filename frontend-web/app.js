@@ -47,6 +47,9 @@ const wcplusState = {
   batchExactMatch: true,
   batchArticleListType: "all",
   batchArticleListAmount: 0,
+  batchImportToKBase: false,
+  batchWaitForCompletion: false,
+  batchImportLimit: 10,
   rawTitle: "",
   rawNickname: "",
   rawURL: "",
@@ -768,7 +771,7 @@ function renderWCPlusSource(showOwnStatus = true) {
           <p class="web-kicker">Batch Result</p>
           <h3>批量结果</h3>
         </div>
-        <span class="wcplus-source__badge">成功 ${Array.isArray(wcplusState.batchResult.success) ? wcplusState.batchResult.success.length : 0} / 失败 ${Array.isArray(wcplusState.batchResult.failed) ? wcplusState.batchResult.failed.length : 0}</span>
+        <span class="wcplus-source__badge">成功 ${Array.isArray(wcplusState.batchResult.success) ? wcplusState.batchResult.success.length : 0} / 失败 ${Array.isArray(wcplusState.batchResult.failed) ? wcplusState.batchResult.failed.length : 0} / 入库 ${wcplusState.batchResult.imported_count || 0}</span>
       </div>
       <label>
         <span>成功清单</span>
@@ -778,6 +781,12 @@ function renderWCPlusSource(showOwnStatus = true) {
         <span>失败清单</span>
         <textarea readonly>${escapeHTML(wcplusState.batchResult.failed_text || "无失败项")}</textarea>
       </label>
+      ${Array.isArray(wcplusState.batchResult.import_errors) && wcplusState.batchResult.import_errors.length ? `
+        <label>
+          <span>入库错误</span>
+          <textarea readonly>${escapeHTML(wcplusState.batchResult.import_errors.join("\n"))}</textarea>
+        </label>
+      ` : ""}
       <div class="wcplus-source__row-actions">
         <button class="button button-ghost" type="button" data-wcplus-copy-batch="success">复制成功</button>
         <button class="button button-ghost" type="button" data-wcplus-copy-batch="failed">复制失败</button>
@@ -936,6 +945,18 @@ function renderWCPlusSource(showOwnStatus = true) {
           <label class="wcplus-source__inline-check">
             <input name="exactMatch" type="checkbox" ${wcplusState.batchExactMatch ? "checked" : ""}>
             <span>昵称精确匹配</span>
+          </label>
+          <label class="wcplus-source__inline-check">
+            <input name="importToKBase" type="checkbox" ${wcplusState.batchImportToKBase ? "checked" : ""}>
+            <span>同步后导入书籍知识库</span>
+          </label>
+          <label class="wcplus-source__inline-check">
+            <input name="waitForCompletion" type="checkbox" ${wcplusState.batchWaitForCompletion ? "checked" : ""}>
+            <span>等待任务完成后入库</span>
+          </label>
+          <label>
+            <span>入库篇数</span>
+            <input name="batchImportLimit" type="number" min="1" max="100" value="${escapeAttribute(wcplusState.batchImportLimit)}">
           </label>
           <button class="button button-primary" type="submit">创建链接任务并启动队列</button>
         </form>
@@ -1216,6 +1237,9 @@ function bindWCPlusEvents() {
     wcplusState.batchExactMatch = data.get("exactMatch") === "on";
     wcplusState.batchArticleListType = String(data.get("batchArticleListType") || "all");
     wcplusState.batchArticleListAmount = boundedNumber(data.get("batchArticleListAmount"), 0, 1000, 0);
+    wcplusState.batchImportToKBase = data.get("importToKBase") === "on";
+    wcplusState.batchWaitForCompletion = data.get("waitForCompletion") === "on";
+    wcplusState.batchImportLimit = boundedNumber(data.get("batchImportLimit"), 1, 100, 10);
     await batchImportWCPlusNicknames();
   });
   for (const button of document.querySelectorAll("[data-wcplus-copy-batch]")) {
@@ -1837,12 +1861,18 @@ async function batchImportWCPlusNicknames() {
         articleListAmount,
         start_queue: true,
         exact_match: wcplusState.batchExactMatch,
+        import_to_kbase: wcplusState.batchImportToKBase,
+        wait_for_completion: wcplusState.batchWaitForCompletion,
+        import_limit: wcplusState.batchImportLimit,
+        poll_attempts: wcplusState.batchWaitForCompletion ? 30 : 0,
+        poll_interval_millis: wcplusState.batchWaitForCompletion ? 2000 : 0,
       }),
     });
     wcplusState.batchResult = result;
     const successCount = Array.isArray(result.success) ? result.success.length : 0;
     const failedCount = Array.isArray(result.failed) ? result.failed.length : 0;
-    wcplusState.message = `批量任务完成：成功 ${successCount}，失败 ${failedCount}${result.started ? "，队列已启动" : ""}。`;
+    const importedCount = result.imported_count || 0;
+    wcplusState.message = `批量任务完成：成功 ${successCount}，失败 ${failedCount}${result.started ? "，队列已启动" : ""}${wcplusState.batchImportToKBase ? `，入库 ${importedCount} 篇` : ""}。`;
     await loadWCPlusTasks(false);
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);

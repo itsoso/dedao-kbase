@@ -18,6 +18,7 @@ for (const hook of [
   'wcplus-task-panel',
   'wcplus-raw-import',
   'wcplus-batch-import',
+  'wcplus-batch-import-to-kbase',
   'wcplus-env-check',
   'wcplus-diagnostics',
   'wcplus-utility-panel',
@@ -71,6 +72,15 @@ assert.ok(viewSource.includes('Promise.allSettled'), 'WCPlusSource.vue should lo
 assert.ok(viewSource.includes('启动时自动检查环境'), 'WCPlusSource.vue should explain startup diagnostics')
 assert.ok(viewSource.includes('success_text'), 'WCPlusSource.vue should expose WC Plus batch import success text')
 assert.ok(viewSource.includes('failed_text'), 'WCPlusSource.vue should expose WC Plus batch import failed text')
+assert.ok(viewSource.includes('batchImportToKBase'), 'WCPlusSource.vue should support batch import to knowledge base')
+assert.ok(viewSource.includes('batchWaitForCompletion'), 'WCPlusSource.vue should support waiting for WC Plus tasks before import')
+assert.ok(viewSource.includes('batchImportLimit'), 'WCPlusSource.vue should send batch import limits')
+assert.ok(viewSource.includes('import_to_kbase'), 'WCPlusSource.vue should send import_to_kbase')
+assert.ok(viewSource.includes('wait_for_completion'), 'WCPlusSource.vue should send wait_for_completion')
+assert.ok(viewSource.includes('poll_attempts'), 'WCPlusSource.vue should send bounded poll attempts')
+assert.ok(viewSource.includes('imported_count'), 'WCPlusSource.vue should render imported knowledge count')
+assert.ok(viewSource.includes('同步后导入书籍知识库'), 'WCPlusSource.vue should label knowledge import option')
+assert.ok(viewSource.includes('等待任务完成后入库'), 'WCPlusSource.vue should label task wait option')
 assert.ok(viewSource.includes('envCheck'), 'WCPlusSource.vue should render WC Plus environment check details')
 assert.ok(viewSource.includes('utilityResult'), 'WCPlusSource.vue should render auxiliary WC Plus API results')
 assert.ok(viewSource.includes('runUtility'), 'WCPlusSource.vue should call auxiliary WC Plus APIs')

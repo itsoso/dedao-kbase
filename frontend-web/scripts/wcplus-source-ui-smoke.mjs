@@ -22,6 +22,9 @@ for (const marker of [
   "copyWCPlusBatchText",
   "copyWCPlusDiagnostics",
   "isWCPlusBootstrapped",
+  "batchImportToKBase",
+  "batchWaitForCompletion",
+  "batchImportLimit",
   "loadWCPlusRawFile",
   "wcplusArticleURL",
   "importRawWCPlusArticle",
@@ -75,6 +78,9 @@ for (const label of [
   "环境检查",
   "搜索 WC Plus",
   "批量导入公众号昵称",
+  "同步后导入书籍知识库",
+  "等待任务完成后入库",
+  "入库篇数",
   "手动导入知识库",
   "正文 Markdown / 纯文本",
   "同步公众号",
@@ -114,6 +120,9 @@ for (const selector of [
   "name=\"exportRecentNum\"",
   "name=\"batchArticleListType\"",
   "name=\"batchArticleListAmount\"",
+  "name=\"importToKBase\"",
+  "name=\"waitForCompletion\"",
+  "name=\"batchImportLimit\"",
   "id=\"wcplus-raw-import-form\"",
   "name=\"rawContent\"",
   "name=\"rawFile\"",
@@ -148,6 +157,11 @@ for (const className of [
 
 assert.ok(js.includes("success_text"), "WC Plus UI should render batch import success_text");
 assert.ok(js.includes("failed_text"), "WC Plus UI should render batch import failed_text");
+assert.ok(js.includes("import_to_kbase"), "WC Plus batch import should support direct knowledge import");
+assert.ok(js.includes("wait_for_completion"), "WC Plus batch import should support waiting for synced tasks");
+assert.ok(js.includes("import_limit"), "WC Plus batch import should send knowledge import limits");
+assert.ok(js.includes("poll_attempts"), "WC Plus batch import should send bounded task polling");
+assert.ok(js.includes("imported_count"), "WC Plus UI should render imported knowledge count");
 assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
 assert.ok(js.includes("utilityResult"), "WC Plus UI should render auxiliary API results");
 assert.ok(js.includes("runWCPlusUtility"), "WC Plus UI should call auxiliary WC Plus APIs");

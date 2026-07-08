@@ -549,7 +549,7 @@ func (h *kbaseHTTPHandler) handleWCPlusBatchImportGZH(w http.ResponseWriter, r *
 		writeHTTPError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	result, err := h.wcplusService().BatchImportNicknames(r.Context(), payload)
+	result, err := h.wcplusService().BatchImportNicknamesToKnowledge(r.Context(), h.store, payload)
 	if err != nil {
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
 		return

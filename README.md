@@ -126,6 +126,7 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `GET /api/wcplus/search`、`GET /api/wcplus/article/search-title`、`GET /api/wcplus/search-gzh`：全文、标题和公众号候选检索。
 - `GET /api/wcplus/report/reading-data`、`GET /api/wcplus/report/statistic-data`、`GET /api/wcplus/article/gzh`、`GET /api/wcplus/like-articles`、`GET /api/wcplus/request/gzh`：阅读/统计/公众号详情等辅助查询代理。
 - `GET /api/wcplus/export/text`、`GET /api/wcplus/export/gzh-csv`、`POST /api/wcplus/export/all-articles-xlsx`：触发 TXT/CSV/XLSX 导出。
+- `POST /api/wcplus/batch-import/gzh`：按公众号昵称批量创建 WC Plus 同步任务；可传 `import_to_kbase=true`、`wait_for_completion=true`、`import_limit`，在任务完成后直接导入书籍知识库。
 
 ### NotebookLM Bridge 使用方式
 

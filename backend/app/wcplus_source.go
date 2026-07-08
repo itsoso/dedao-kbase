@@ -152,11 +152,17 @@ type WCPlusEnvCheckResult struct {
 }
 
 type WCPlusBatchImportRequest struct {
-	Nicknames         []string `json:"nicknames"`
-	ArticleListType   string   `json:"articleListType,omitempty"`
-	ArticleListAmount int      `json:"articleListAmount,omitempty"`
-	StartQueue        bool     `json:"start_queue,omitempty"`
-	ExactMatch        bool     `json:"exact_match,omitempty"`
+	Nicknames          []string `json:"nicknames"`
+	ArticleListType    string   `json:"articleListType,omitempty"`
+	ArticleListAmount  int      `json:"articleListAmount,omitempty"`
+	StartQueue         bool     `json:"start_queue,omitempty"`
+	ExactMatch         bool     `json:"exact_match,omitempty"`
+	ImportToKBase      bool     `json:"import_to_kbase,omitempty"`
+	ImportLimit        int      `json:"import_limit,omitempty"`
+	WaitForCompletion  bool     `json:"wait_for_completion,omitempty"`
+	PollAttempts       int      `json:"poll_attempts,omitempty"`
+	PollIntervalMillis int      `json:"poll_interval_millis,omitempty"`
+	BookIDPrefix       string   `json:"book_id_prefix,omitempty"`
 }
 
 type WCPlusBatchImportItem struct {
@@ -168,12 +174,15 @@ type WCPlusBatchImportItem struct {
 }
 
 type WCPlusBatchImportResult struct {
-	Success     []WCPlusBatchImportItem `json:"success"`
-	Failed      []WCPlusBatchImportItem `json:"failed"`
-	Started     bool                    `json:"started"`
-	StartResult any                     `json:"start_result,omitempty"`
-	SuccessText string                  `json:"success_text"`
-	FailedText  string                  `json:"failed_text"`
+	Success       []WCPlusBatchImportItem `json:"success"`
+	Failed        []WCPlusBatchImportItem `json:"failed"`
+	Started       bool                    `json:"started"`
+	StartResult   any                     `json:"start_result,omitempty"`
+	SuccessText   string                  `json:"success_text"`
+	FailedText    string                  `json:"failed_text"`
+	ImportedCount int                     `json:"imported_count,omitempty"`
+	ImportedBooks []BookKnowledgeBook     `json:"imported_books,omitempty"`
+	ImportErrors  []string                `json:"import_errors,omitempty"`
 }
 
 func WCPlusSourceConfigFromEnv() WCPlusSourceConfig {
@@ -662,6 +671,131 @@ func (s *WCPlusSourceService) BatchImportNicknames(ctx context.Context, req WCPl
 	result.SuccessText = wcplusBatchImportText(result.Success)
 	result.FailedText = wcplusBatchImportText(result.Failed)
 	return result, nil
+}
+
+func (s *WCPlusSourceService) BatchImportNicknamesToKnowledge(ctx context.Context, store *BookKnowledgeStore, req WCPlusBatchImportRequest) (*WCPlusBatchImportResult, error) {
+	result, err := s.BatchImportNicknames(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if !req.ImportToKBase {
+		return result, nil
+	}
+	if store == nil {
+		return nil, fmt.Errorf("book knowledge store is required")
+	}
+
+	completedTasks := map[string]bool{}
+	if req.WaitForCompletion {
+		var waitErrors []string
+		completedTasks, waitErrors = s.waitForBatchTasks(ctx, result.Success, req)
+		result.ImportErrors = append(result.ImportErrors, waitErrors...)
+	}
+
+	importLimit := req.ImportLimit
+	if importLimit <= 0 {
+		importLimit = req.ArticleListAmount
+	}
+	importLimit = positiveOr(importLimit, 20)
+	for _, item := range result.Success {
+		if req.WaitForCompletion && strings.TrimSpace(item.TaskID) != "" && !completedTasks[item.TaskID] {
+			continue
+		}
+		imported, err := s.ImportAccountArticles(ctx, store, WCPlusImportAccountRequest{
+			Biz:          item.Biz,
+			Nickname:     item.Nickname,
+			Limit:        importLimit,
+			BookIDPrefix: req.BookIDPrefix,
+		})
+		if err != nil {
+			result.ImportErrors = append(result.ImportErrors, fmt.Sprintf("%s: %v", item.Nickname, err))
+			continue
+		}
+		result.ImportedCount += imported.ImportedCount
+		result.ImportedBooks = append(result.ImportedBooks, imported.Books...)
+		for _, importErr := range imported.Errors {
+			result.ImportErrors = append(result.ImportErrors, fmt.Sprintf("%s: %s", item.Nickname, importErr))
+		}
+	}
+	return result, nil
+}
+
+func (s *WCPlusSourceService) waitForBatchTasks(ctx context.Context, items []WCPlusBatchImportItem, req WCPlusBatchImportRequest) (map[string]bool, []string) {
+	pending := map[string]WCPlusBatchImportItem{}
+	completed := map[string]bool{}
+	for _, item := range items {
+		taskID := strings.TrimSpace(item.TaskID)
+		if taskID != "" {
+			pending[taskID] = item
+		}
+	}
+	if len(pending) == 0 {
+		return completed, nil
+	}
+	attempts := req.PollAttempts
+	if attempts <= 0 {
+		attempts = 30
+	}
+	interval := time.Duration(req.PollIntervalMillis) * time.Millisecond
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	waitErrors := []string{}
+	for attempt := 0; attempt < attempts && len(pending) > 0; attempt++ {
+		tasks, err := s.ListTasks(ctx)
+		if err != nil {
+			return completed, []string{fmt.Sprintf("poll tasks: %v", err)}
+		}
+		for _, task := range tasks {
+			taskID := strings.TrimSpace(task.TaskID)
+			if _, ok := pending[taskID]; !ok {
+				continue
+			}
+			status := strings.ToLower(strings.TrimSpace(task.Status))
+			if wcplusTaskStatusComplete(status) {
+				completed[taskID] = true
+				delete(pending, taskID)
+				continue
+			}
+			if wcplusTaskStatusFailed(status) {
+				waitErrors = append(waitErrors, fmt.Sprintf("%s: task %s %s", pending[taskID].Nickname, taskID, status))
+				delete(pending, taskID)
+			}
+		}
+		if len(pending) == 0 || attempt == attempts-1 {
+			break
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			waitErrors = append(waitErrors, ctx.Err().Error())
+			return completed, waitErrors
+		case <-timer.C:
+		}
+	}
+	for taskID, item := range pending {
+		waitErrors = append(waitErrors, fmt.Sprintf("%s: task %s did not complete", item.Nickname, taskID))
+	}
+	return completed, waitErrors
+}
+
+func wcplusTaskStatusComplete(status string) bool {
+	switch status {
+	case "done", "success", "succeeded", "finished", "completed", "complete":
+		return true
+	default:
+		return false
+	}
+}
+
+func wcplusTaskStatusFailed(status string) bool {
+	switch status {
+	case "failed", "failure", "error", "stopped", "cancelled", "canceled":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *WCPlusSourceService) findCandidateAccount(ctx context.Context, nickname string, exactMatch bool) (WCPlusAccount, error) {
