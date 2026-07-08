@@ -81,6 +81,8 @@ assert.ok(viewSource.includes('pageSearch'), 'WCPlusSource.vue should expose WC 
 assert.ok(viewSource.includes('搜索每页'), 'WCPlusSource.vue should render WC Plus search page-size control')
 assert.ok(viewSource.includes('offset: searchOffset.value'), 'WCPlusSource.vue should send search offset')
 assert.ok(viewSource.includes('num: searchNum.value'), 'WCPlusSource.vue should send search page size')
+assert.ok(viewSource.includes('createTaskForAccount'), 'WCPlusSource.vue should create sync tasks directly from account search results')
+assert.ok(viewSource.includes('@click="createTaskForAccount(item)"'), 'WCPlusSource.vue should expose direct sync action on account search results')
 assert.ok(viewSource.includes('success_text'), 'WCPlusSource.vue should expose WC Plus batch import success text')
 assert.ok(viewSource.includes('failed_text'), 'WCPlusSource.vue should expose WC Plus batch import failed text')
 assert.ok(viewSource.includes('batchImportToKBase'), 'WCPlusSource.vue should support batch import to knowledge base')

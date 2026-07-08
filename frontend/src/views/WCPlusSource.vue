@@ -160,6 +160,7 @@
                                 </div>
                                 <div class="row-actions">
                                     <el-button v-if="accountBiz(item)" @click="selectAccount(item)">选择</el-button>
+                                    <el-button v-if="accountBiz(item)" @click="createTaskForAccount(item)">同步</el-button>
                                     <el-button v-if="articleID(item) || articleURL(item)" @click="previewArticle(item)">预览</el-button>
                                     <el-button v-if="articleID(item) || articleURL(item)" type="primary" @click="importArticle(item)">导入</el-button>
                                 </div>
@@ -866,18 +867,23 @@ const importAccount = async () => {
 }
 
 const createTask = async () => {
-    const biz = accountBiz(selectedAccount.value)
+    await createTaskForAccount(selectedAccount.value)
+}
+
+const createTaskForAccount = async (account: any) => {
+    const biz = accountBiz(account)
     if (!biz) {
         notify('请先选择公众号。', 'warning')
         return
     }
+    selectedAccount.value = account
     await withLoading('taskCreate', async () => {
         const task: any = await apiJSON('/api/wcplus/task/new', {
             method: 'POST',
-            body: JSON.stringify(taskPayload()),
+            body: JSON.stringify(taskPayload(account)),
         })
-        notify(`已创建同步任务：${task?.task_id || accountNickname(selectedAccount.value) || biz}`, 'success')
         await loadTasks(false)
+        notify(`已创建同步任务：${task?.task_id || accountNickname(account) || biz}`, 'success')
     })
 }
 
@@ -897,9 +903,9 @@ const createBatchTask = async () => {
     })
 }
 
-const taskPayload = () => ({
-    biz: accountBiz(selectedAccount.value),
-    nickname: accountNickname(selectedAccount.value),
+const taskPayload = (account = selectedAccount.value) => ({
+    biz: accountBiz(account),
+    nickname: accountNickname(account),
     crawlerType: taskCrawlerType.value,
     articleListType: taskArticleListType.value,
     articleListAmount: taskArticleListAmount.value,

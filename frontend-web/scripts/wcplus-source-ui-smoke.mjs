@@ -35,6 +35,7 @@ for (const marker of [
   "importWCPlusAccount",
   "loadWCPlusTasks",
   "createWCPlusTask",
+  "createWCPlusTaskForAccount",
   "createWCPlusBatchTask",
   "controlWCPlusTask",
   "runWCPlusQueue",
@@ -139,6 +140,7 @@ for (const selector of [
   "data-wcplus-utility=\"owner\"",
   "data-wcplus-utility=\"likes\"",
   "data-wcplus-utility=\"request\"",
+  "data-wcplus-sync-result-account",
 ]) {
   assert.ok(js.includes(selector), `WC Plus UI should include ${selector}`);
 }

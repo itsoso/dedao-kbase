@@ -702,6 +702,7 @@ function renderWCPlusSource(showOwnStatus = true) {
         </div>
         <div class="wcplus-source__row-actions">
           ${accountBiz ? `<button type="button" class="button button-ghost" data-wcplus-select-result-account="${index}">选择</button>` : ""}
+          ${accountBiz ? `<button type="button" class="button button-ghost" data-wcplus-sync-result-account="${index}">同步</button>` : ""}
           ${articleID || articleURL ? `<button type="button" class="button button-ghost" data-wcplus-preview-result="${index}">预览</button>` : ""}
           ${articleID || articleURL ? `<button type="button" class="button button-primary" data-wcplus-import-result="${index}">导入</button>` : ""}
         </div>
@@ -1325,6 +1326,15 @@ function bindWCPlusEvents() {
       wcplusState.selectedAccount = wcplusState.searchResults[index] || null;
       wcplusState.articleOffset = 0;
       await loadWCPlusArticles();
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-sync-result-account]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-wcplus-sync-result-account") || "0");
+      const account = wcplusState.searchResults[index];
+      if (account) {
+        await createWCPlusTaskForAccount(account);
+      }
     });
   }
   for (const button of document.querySelectorAll("[data-wcplus-preview-result]")) {
@@ -2003,14 +2013,18 @@ async function loadWCPlusTasks() {
 }
 
 async function createWCPlusTask() {
+  await createWCPlusTaskForAccount(wcplusState.selectedAccount);
+}
+
+async function createWCPlusTaskForAccount(account) {
   readWCPlusOptionsFromDOM();
-  const account = wcplusState.selectedAccount;
   const biz = wcplusAccountBiz(account);
   if (!biz) {
     wcplusState.message = "请先选择公众号。";
     refreshWCPlusView();
     return;
   }
+  wcplusState.selectedAccount = account;
   wcplusState.loading = "创建 WC Plus 同步任务";
   wcplusState.message = "";
   refreshWCPlusView();
@@ -2025,8 +2039,8 @@ async function createWCPlusTask() {
         articleListAmount: wcplusState.taskArticleListAmount,
       }),
     });
-    wcplusState.message = `已创建同步任务：${task.task_id || wcplusAccountNickname(account) || biz}`;
     await loadWCPlusTasks(false);
+    wcplusState.message = `已创建同步任务：${task.task_id || wcplusAccountNickname(account) || biz}`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
   } finally {
