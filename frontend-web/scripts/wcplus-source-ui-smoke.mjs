@@ -18,6 +18,7 @@ for (const marker of [
   "checkWCPlusStatus",
   "checkWCPlusEnvironment",
   "searchWCPlus",
+  "pageWCPlusSearch",
   "batchImportWCPlusNicknames",
   "copyWCPlusBatchText",
   "copyWCPlusDiagnostics",
@@ -25,6 +26,8 @@ for (const marker of [
   "batchImportToKBase",
   "batchWaitForCompletion",
   "batchImportLimit",
+  "searchOffset",
+  "searchNum",
   "loadWCPlusRawFile",
   "wcplusArticleURL",
   "importRawWCPlusArticle",
@@ -113,6 +116,8 @@ for (const label of [
 for (const selector of [
   "data-wcplus-account-page",
   "data-wcplus-article-page",
+  "data-wcplus-search-page",
+  "name=\"searchNum\"",
   "name=\"taskCrawlerType\"",
   "name=\"taskArticleListType\"",
   "name=\"articleListAmount\"",
@@ -161,6 +166,8 @@ assert.ok(js.includes("import_to_kbase"), "WC Plus batch import should support d
 assert.ok(js.includes("wait_for_completion"), "WC Plus batch import should support waiting for synced tasks");
 assert.ok(js.includes("import_limit"), "WC Plus batch import should send knowledge import limits");
 assert.ok(js.includes("poll_attempts"), "WC Plus batch import should send bounded task polling");
+assert.ok(js.includes("offset: String(wcplusState.searchOffset)"), "WC Plus search should send a pageable offset");
+assert.ok(js.includes("num: String(wcplusState.searchNum)"), "WC Plus search should send a configurable page size");
 assert.ok(js.includes("imported_count"), "WC Plus UI should render imported knowledge count");
 assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
 assert.ok(js.includes("utilityResult"), "WC Plus UI should render auxiliary API results");

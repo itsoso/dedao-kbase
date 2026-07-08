@@ -45,6 +45,10 @@
                             <el-option label="可导入公众号" value="candidate" />
                             <el-option label="全库文章" value="all" />
                         </el-select>
+                        <label class="search-size-control">
+                            <span>搜索每页</span>
+                            <el-input-number v-model="searchNum" :min="1" :max="100" size="small" />
+                        </label>
                         <el-button type="primary" native-type="submit" :loading="loading === 'search'">搜索</el-button>
                     </div>
                 </form>
@@ -143,6 +147,11 @@
                     </el-tab-pane>
 
                     <el-tab-pane label="搜索结果" name="search">
+                        <div class="list-pager">
+                            <span>{{ searchResults.length ? `${searchOffset + 1} - ${searchOffset + searchResults.length}` : '0' }}</span>
+                            <el-button :disabled="searchOffset <= 0" @click="pageSearch(-1)">上一页</el-button>
+                            <el-button :disabled="!searchResults.length" @click="pageSearch(1)">下一页</el-button>
+                        </div>
                         <div class="article-list search-results">
                             <article v-for="(item, index) in searchResults" :key="`${articleID(item)}-${index}`" class="article-row">
                                 <div>
@@ -369,6 +378,8 @@ const utilityResult = ref<any>(null)
 
 const searchQuery = ref('')
 const searchMode = ref('fulltext')
+const searchOffset = ref(0)
+const searchNum = ref(30)
 const accountOffset = ref(0)
 const accountNum = ref(20)
 const articleOffset = ref(0)
@@ -707,10 +718,13 @@ const pageArticles = async (delta: number) => {
     await loadArticles()
 }
 
-const searchWCPlus = async () => {
+const searchWCPlus = async (resetOffset: boolean | Event = true) => {
     if (!searchQuery.value.trim() && searchMode.value !== 'all') {
         notify('请输入搜索关键词。', 'warning')
         return
+    }
+    if (resetOffset !== false) {
+        searchOffset.value = 0
     }
     await withLoading('search', async () => {
         const endpointByMode: Record<string, string> = {
@@ -723,8 +737,8 @@ const searchWCPlus = async () => {
         const payload: any = await apiJSON(apiURL(endpointByMode[searchMode.value] || endpointByMode.fulltext, {
             q: searchQuery.value.trim(),
             keyword: searchQuery.value.trim(),
-            offset: 0,
-            num: searchMode.value === 'all' ? articleNum.value : 30,
+            offset: searchOffset.value,
+            num: searchNum.value,
             sort: 'p_date',
             direction: 'desc',
         }))
@@ -734,6 +748,11 @@ const searchWCPlus = async () => {
         mainTab.value = 'search'
         notify(`搜索完成：${searchResults.value.length} 条结果。`, 'success')
     })
+}
+
+const pageSearch = async (delta: number) => {
+    searchOffset.value = Math.max(0, searchOffset.value + delta * searchNum.value)
+    await searchWCPlus(false)
 }
 
 const runUtility = async (kind: string) => {
@@ -1378,7 +1397,15 @@ const exportAllArticlesXLSX = async () => {
 }
 
 .search-results {
-    height: 100%;
+    height: calc(100% - 42px);
+}
+
+.search-size-control {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #64748b;
+    font-size: 12px;
 }
 
 .article-row,

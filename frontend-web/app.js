@@ -28,6 +28,8 @@ const wcplusState = {
   searchQuery: "",
   searchMode: "fulltext",
   searchResults: [],
+  searchOffset: 0,
+  searchNum: 30,
   tasks: [],
   preview: null,
   serviceStatus: null,
@@ -837,6 +839,10 @@ function renderWCPlusSource(showOwnStatus = true) {
                 <option value="all" ${wcplusState.searchMode === "all" ? "selected" : ""}>全库文章</option>
               </select>
             </label>
+            <label>
+              <span>搜索每页</span>
+              <input name="searchNum" type="number" min="1" max="100" value="${escapeAttribute(wcplusState.searchNum)}">
+            </label>
             <button class="button button-primary" type="submit">搜索</button>
           </form>
           <form id="wcplus-account-options-form" class="wcplus-source__mini-form">
@@ -903,6 +909,11 @@ function renderWCPlusSource(showOwnStatus = true) {
           <div class="wcplus-source__pager is-article">
             <button class="button button-ghost" type="button" data-wcplus-article-page="-1" ${wcplusState.articleOffset <= 0 ? "disabled" : ""}>上一页</button>
             <button class="button button-ghost" type="button" data-wcplus-article-page="1" ${wcplusState.selectedAccount ? "" : "disabled"}>下一页</button>
+          </div>
+          <div class="wcplus-source__pager is-search">
+            <span>搜索结果 ${wcplusState.searchResults.length ? `${wcplusState.searchOffset + 1} - ${wcplusState.searchOffset + wcplusState.searchResults.length}` : "0"}</span>
+            <button class="button button-ghost" type="button" data-wcplus-search-page="-1" ${wcplusState.searchOffset <= 0 ? "disabled" : ""}>上一页</button>
+            <button class="button button-ghost" type="button" data-wcplus-search-page="1" ${wcplusState.searchResults.length ? "" : "disabled"}>下一页</button>
           </div>
           <div class="wcplus-source__search-results">
             ${searchRows || ""}
@@ -1207,6 +1218,8 @@ function bindWCPlusEvents() {
     const data = new FormData(event.currentTarget);
     wcplusState.searchQuery = String(data.get("query") || "").trim();
     wcplusState.searchMode = String(data.get("mode") || "fulltext");
+    wcplusState.searchNum = boundedNumber(data.get("searchNum"), 1, 100, wcplusState.searchNum);
+    wcplusState.searchOffset = 0;
     await searchWCPlus();
   });
   document.querySelector("#wcplus-create-task")?.addEventListener("click", () => {
@@ -1281,6 +1294,12 @@ function bindWCPlusEvents() {
     button.addEventListener("click", async () => {
       const delta = Number(button.getAttribute("data-wcplus-article-page") || "0");
       await pageWCPlusArticles(delta);
+    });
+  }
+  for (const button of document.querySelectorAll("[data-wcplus-search-page]")) {
+    button.addEventListener("click", async () => {
+      const delta = Number(button.getAttribute("data-wcplus-search-page") || "0");
+      await pageWCPlusSearch(delta);
     });
   }
   for (const button of document.querySelectorAll("[data-wcplus-account-index]")) {
@@ -1404,6 +1423,11 @@ async function pageWCPlusArticles(delta) {
   readWCPlusOptionsFromDOM();
   wcplusState.articleOffset = Math.max(0, wcplusState.articleOffset + (delta * wcplusState.articleNum));
   await loadWCPlusArticles();
+}
+
+async function pageWCPlusSearch(delta) {
+  wcplusState.searchOffset = Math.max(0, wcplusState.searchOffset + (delta * wcplusState.searchNum));
+  await searchWCPlus();
 }
 
 async function previewWeChatArticle(rawURL) {
@@ -1735,8 +1759,8 @@ async function searchWCPlus() {
   try {
     const query = new URLSearchParams({
       q: wcplusState.searchQuery,
-      offset: "0",
-      num: "30",
+      offset: String(wcplusState.searchOffset),
+      num: String(wcplusState.searchNum),
       sort: "p_date",
       direction: "desc",
     });
