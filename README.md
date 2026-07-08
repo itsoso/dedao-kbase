@@ -112,6 +112,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 `WCPLUS_BASE_URL` 必须指向 kbase 服务端可访问的 WC Plus API。若 kbase 部署在线上服务器，而 WC Plus 只运行在个人 Mac 上，线上服务器无法访问个人 Mac 的 `127.0.0.1:5001`；此时需要把 WC Plus API 放到服务器可达的地址、在同一台机器上运行 kbase 与 WC Plus，或在 `/wcplus-source` 使用“手动导入知识库”粘贴 WC Plus 导出的正文。
 
+`/wcplus-source` 的“环境检查”会显示 kbase 服务端实际访问的 WC Plus 地址，并可一键复制诊断信息。WC Plus API 暂时不可达时，可在“手动导入知识库”粘贴正文，或选择 `.txt` / `.md` 文件填入正文后再导入。
+
 常用代理接口：
 
 - `GET /api/wcplus/env/check`：检查 WC Plus 服务和公众号列表 API。
