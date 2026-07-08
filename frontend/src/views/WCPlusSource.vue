@@ -190,6 +190,24 @@
                     </div>
                 </section>
 
+                <section class="panel wcplus-utility-panel">
+                    <div class="section-head">
+                        <span>辅助查询</span>
+                        <el-tag size="small" effect="plain">{{ utilityResult ? '已更新' : '待查询' }}</el-tag>
+                    </div>
+                    <div class="utility-actions">
+                        <el-button size="small" :disabled="!selectedAccount" @click="runUtility('reading')">阅读数据</el-button>
+                        <el-button size="small" :disabled="!selectedAccount" @click="runUtility('statistics')">统计数据</el-button>
+                        <el-button size="small" :disabled="!preview && !articles.length" @click="runUtility('owner')">公众号详情</el-button>
+                        <el-button size="small" @click="runUtility('likes')">收藏文章</el-button>
+                        <el-button size="small" :disabled="!selectedAccount" @click="runUtility('request')">请求公众号</el-button>
+                    </div>
+                    <div v-if="utilityResult" class="wcplus-utility-result">
+                        <strong>{{ utilityResult.title }}</strong>
+                        <pre>{{ JSON.stringify(utilityResult.payload || {}, null, 2) }}</pre>
+                    </div>
+                </section>
+
                 <section v-if="envCheck" class="panel wcplus-env-check">
                     <div class="section-head">
                         <span>环境诊断</span>
@@ -303,6 +321,7 @@ const tasks = ref<any[]>([])
 const preview = ref<any>(null)
 const mainTab = ref('articles')
 const batchResult = ref<any>(null)
+const utilityResult = ref<any>(null)
 
 const searchQuery = ref('')
 const searchMode = ref('fulltext')
@@ -346,11 +365,27 @@ onMounted(() => {
 const readToken = () => {
     for (const key of tokenKeys) {
         const value = window.localStorage.getItem(key)
-        if (value?.trim()) {
-            return value.trim()
+        const clean = String(value || '').trim()
+        if (!clean) {
+            continue
         }
+        if (isSafeBearerToken(clean)) {
+            return clean
+        }
+        clearStoredToken()
     }
     return ''
+}
+
+const isSafeBearerToken = (token: string) => {
+    const clean = String(token || '').trim()
+    return Boolean(clean) && !/\s/.test(clean) && /^[\x21-\x7e]+$/.test(clean)
+}
+
+const clearStoredToken = () => {
+    for (const key of tokenKeys) {
+        window.localStorage.removeItem(key)
+    }
 }
 
 const apiURL = (path: string, params?: Record<string, string | number | boolean | undefined>) => {
@@ -631,6 +666,66 @@ const searchWCPlus = async () => {
             : firstArray(payload, ['results', 'Results', 'articles', 'Articles', 'items', 'Items'])
         mainTab.value = 'search'
         notify(`搜索完成：${searchResults.value.length} 条结果。`, 'success')
+    })
+}
+
+const runUtility = async (kind: string) => {
+    const biz = accountBiz(selectedAccount.value)
+    const currentArticleID = articleID(preview.value || articles.value[0] || {})
+    const utilityByKind: Record<string, any> = {
+        reading: {
+            title: '阅读数据',
+            endpoint: '/api/wcplus/report/reading-data',
+            needsBiz: true,
+        },
+        statistics: {
+            title: '统计数据',
+            endpoint: '/api/wcplus/report/statistic-data',
+            needsBiz: true,
+        },
+        owner: {
+            title: '公众号详情',
+            endpoint: '/api/wcplus/article/gzh',
+            needsArticleID: true,
+        },
+        likes: {
+            title: '收藏文章',
+            endpoint: '/api/wcplus/like-articles',
+            params: {offset: 0, num: articleNum.value},
+        },
+        request: {
+            title: '请求公众号',
+            endpoint: '/api/wcplus/request/gzh',
+            needsBiz: true,
+        },
+    }
+    const utility = utilityByKind[kind]
+    if (!utility) {
+        notify('未知辅助查询。', 'warning')
+        return
+    }
+    if (utility.needsBiz && !biz) {
+        notify('请先选择公众号。', 'warning')
+        return
+    }
+    if (utility.needsArticleID && !currentArticleID) {
+        notify('请先预览或加载一篇带 id 的文章。', 'warning')
+        return
+    }
+    const params: Record<string, string | number | boolean | undefined> = {...(utility.params || {})}
+    if (utility.needsBiz) {
+        params.biz = biz
+    }
+    if (utility.needsArticleID) {
+        params.id = currentArticleID
+    }
+    await withLoading(`utility:${kind}`, async () => {
+        const payload = await apiJSON(apiURL(utility.endpoint, params))
+        utilityResult.value = {
+            title: utility.title,
+            payload,
+        }
+        notify(`${utility.title}已更新。`, 'success')
     })
 }
 
@@ -1067,7 +1162,7 @@ const exportAllArticlesXLSX = async () => {
 
 .wcplus-preview {
     display: grid;
-    grid-template-rows: minmax(180px, 1fr) minmax(150px, 0.72fr) auto auto auto;
+    grid-template-rows: minmax(180px, 1fr) minmax(150px, 0.72fr) auto auto auto auto;
     gap: 12px;
     overflow: hidden;
 }
@@ -1232,6 +1327,7 @@ const exportAllArticlesXLSX = async () => {
 
 .preview-panel,
 .wcplus-task-panel,
+.wcplus-utility-panel,
 .wcplus-env-check,
 .wcplus-batch-import,
 .wcplus-raw-import {
@@ -1240,6 +1336,7 @@ const exportAllArticlesXLSX = async () => {
 
 .preview-panel,
 .wcplus-task-panel,
+.wcplus-utility-panel,
 .wcplus-env-check {
     display: flex;
     flex-direction: column;
@@ -1265,6 +1362,32 @@ const exportAllArticlesXLSX = async () => {
     gap: 8px;
 }
 
+.utility-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.wcplus-utility-result {
+    display: grid;
+    gap: 6px;
+    margin-top: 10px;
+    min-height: 0;
+}
+
+.wcplus-utility-result pre {
+    overflow: auto;
+    max-height: 180px;
+    margin: 0;
+    border-radius: 6px;
+    background: #f8fafc;
+    padding: 8px;
+    color: #334155;
+    font-size: 12px;
+    line-height: 18px;
+    white-space: pre-wrap;
+}
+
 .task-row {
     align-items: center;
 }
@@ -1276,6 +1399,7 @@ const exportAllArticlesXLSX = async () => {
 
 .wcplus-batch-import,
 .wcplus-raw-import,
+.wcplus-utility-result,
 .wcplus-batch-result {
     display: grid;
     gap: 8px;

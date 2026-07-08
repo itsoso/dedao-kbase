@@ -20,6 +20,8 @@ for (const hook of [
   'wcplus-batch-import',
   'wcplus-env-check',
   'wcplus-diagnostics',
+  'wcplus-utility-panel',
+  'wcplus-utility-result',
   'wcplus-raw-file',
   'wcplus-batch-result',
   'wcplus-action-bar',
@@ -40,6 +42,11 @@ for (const endpoint of [
   '/api/wcplus/article/search-title',
   '/api/wcplus/search-gzh',
   '/api/wcplus/article/all',
+  '/api/wcplus/report/reading-data',
+  '/api/wcplus/report/statistic-data',
+  '/api/wcplus/article/gzh',
+  '/api/wcplus/like-articles',
+  '/api/wcplus/request/gzh',
   '/api/wcplus/task/all',
   '/api/wcplus/task/new',
   '/api/wcplus/task/control',
@@ -56,12 +63,23 @@ for (const endpoint of [
 assert.ok(viewSource.includes('Authorization'), 'WCPlusSource.vue should set Authorization header')
 assert.ok(viewSource.includes('Bearer'), 'WCPlusSource.vue should use Bearer token auth')
 assert.ok(viewSource.includes('KBASE_AUTH_TOKEN'), 'WCPlusSource.vue should reuse the existing kbase token key')
+assert.ok(viewSource.includes('isSafeBearerToken'), 'WCPlusSource.vue should validate token before setting Authorization')
+assert.ok(viewSource.includes('clearStoredToken'), 'WCPlusSource.vue should clear invalid local token values')
+assert.ok(viewSource.includes('/^[\\x21-\\x7e]+$/'), 'WCPlusSource.vue should reject non-ASCII bearer tokens')
 assert.ok(viewSource.includes('bootstrapWCPlusSource'), 'WCPlusSource.vue should bootstrap WC Plus diagnostics on mount')
 assert.ok(viewSource.includes('Promise.allSettled'), 'WCPlusSource.vue should load startup diagnostics without blocking the page')
 assert.ok(viewSource.includes('启动时自动检查环境'), 'WCPlusSource.vue should explain startup diagnostics')
 assert.ok(viewSource.includes('success_text'), 'WCPlusSource.vue should expose WC Plus batch import success text')
 assert.ok(viewSource.includes('failed_text'), 'WCPlusSource.vue should expose WC Plus batch import failed text')
 assert.ok(viewSource.includes('envCheck'), 'WCPlusSource.vue should render WC Plus environment check details')
+assert.ok(viewSource.includes('utilityResult'), 'WCPlusSource.vue should render auxiliary WC Plus API results')
+assert.ok(viewSource.includes('runUtility'), 'WCPlusSource.vue should call auxiliary WC Plus APIs')
+assert.ok(viewSource.includes('辅助查询'), 'WCPlusSource.vue should expose auxiliary query controls')
+assert.ok(viewSource.includes('阅读数据'), 'WCPlusSource.vue should expose reading report query')
+assert.ok(viewSource.includes('统计数据'), 'WCPlusSource.vue should expose statistic report query')
+assert.ok(viewSource.includes('公众号详情'), 'WCPlusSource.vue should expose article owner query')
+assert.ok(viewSource.includes('收藏文章'), 'WCPlusSource.vue should expose liked articles query')
+assert.ok(viewSource.includes('请求公众号'), 'WCPlusSource.vue should expose request gzh query')
 assert.ok(viewSource.includes('base_url'), 'WCPlusSource.vue should show server-side WC Plus base_url diagnostics')
 assert.ok(viewSource.includes('copyDiagnostics'), 'WCPlusSource.vue should support copying WC Plus diagnostics')
 assert.ok(viewSource.includes('loadRawFile'), 'WCPlusSource.vue should support raw TXT/Markdown file import fallback')
