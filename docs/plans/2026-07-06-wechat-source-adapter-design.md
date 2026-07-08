@@ -87,3 +87,4 @@ WC Plus integration stores only imported book-knowledge packages. It does not pe
 - `/wechat-source` can also operate WC Plus local accounts, article lists, single article import, latest-N account import, task listing, task creation, and task control through authenticated `/api/wcplus/*` routes.
 - `/wechat-source` exposes WC Plus status, account/title/full-text search, TXT/CSV export triggers, all-library XLSX download, queue start, and batch-task cleanup without embedding the local WC Plus URL in frontend code.
 - `/wechat-source` exposes WC Plus environment checks and batch nickname import for the documented skill flow, including exact-match failures and copyable success/failure text.
+- `/wcplus-source` automatically runs environment, task, and account bootstrap checks on entry, while still allowing manual raw article import when the local service is unavailable.

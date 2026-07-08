@@ -4,7 +4,7 @@
             <div class="workbench-title">
                 <div class="kicker">WC Plus Source</div>
                 <h1>公众号知识来源</h1>
-                <p>从本地 WC Plus 同步文章、创建任务，并导入书籍知识库。</p>
+                <p>从本地 WC Plus 同步文章、创建任务，并导入书籍知识库；启动时自动检查环境。</p>
             </div>
             <div class="bar-actions">
                 <el-tag :type="serviceTagType" effect="plain">{{ serviceLabel }}</el-tag>
@@ -340,7 +340,7 @@ const serviceLabel = computed(() => {
 })
 
 onMounted(() => {
-    checkStatus()
+    bootstrapWCPlusSource()
 })
 
 const readToken = () => {
@@ -508,6 +508,52 @@ const checkEnvironment = async () => {
             : ''
         notify(envCheck.value?.ok ? '环境检查通过。' : `环境检查未通过：${failed || '请检查服务状态'}`, envCheck.value?.ok ? 'success' : 'warning')
     })
+}
+
+const bootstrapWCPlusSource = async () => {
+    loading.value = 'bootstrap'
+    message.value = '启动时自动检查环境，加载诊断、任务和公众号列表。'
+    messageType.value = 'info'
+    const [envResult, taskResult, accountResult] = await Promise.allSettled([
+        apiJSON('/api/wcplus/env/check'),
+        apiJSON('/api/wcplus/task/all'),
+        apiJSON(apiURL('/api/wcplus/gzh/list', {offset: accountOffset.value, num: accountNum.value})),
+    ])
+
+    const failures: string[] = []
+    if (envResult.status === 'fulfilled') {
+        envCheck.value = envResult.value
+        serviceStatus.value = {ok: Boolean(envResult.value?.ok)}
+        if (!envResult.value?.ok) {
+            failures.push('环境检查')
+        }
+    } else {
+        serviceStatus.value = {ok: false}
+        failures.push('环境检查')
+    }
+
+    if (taskResult.status === 'fulfilled') {
+        tasks.value = firstArray(taskResult.value, ['tasks', 'items', 'list'])
+    } else {
+        failures.push('任务列表')
+    }
+
+    if (accountResult.status === 'fulfilled') {
+        accounts.value = firstArray(accountResult.value, ['accounts', 'gzhs', 'items', 'list'])
+        selectedAccount.value = accounts.value[0] || null
+        if (selectedAccount.value) {
+            await loadArticles(false)
+        }
+    } else {
+        failures.push('公众号列表')
+    }
+
+    loading.value = ''
+    if (failures.length) {
+        notify(`启动检查完成，但 ${failures.join('、')} 需要处理；可继续使用手动导入知识库。`, 'warning')
+    } else {
+        notify(`启动检查完成：${accounts.value.length} 个公众号，${tasks.value.length} 个任务。`, 'success')
+    }
 }
 
 const loadAccounts = async () => {

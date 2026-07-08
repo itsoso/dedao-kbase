@@ -66,6 +66,8 @@ const knowledgeState = {
   message: "",
 };
 
+let isWCPlusBootstrapped = false;
+
 function getToken() {
   for (const key of tokenKeys) {
     const value = window.localStorage.getItem(key);
@@ -785,6 +787,7 @@ function renderWCPlusSource(showOwnStatus = true) {
         <div>
           <p class="web-kicker">WC Plus Local API</p>
           <h2>WC Plus 本地服务</h2>
+          <p class="web-muted">启动时自动检查环境；服务不可达时仍可用下方手动导入知识库。</p>
         </div>
         <div class="wcplus-source__actions">
           ${serviceStatus}
@@ -960,6 +963,62 @@ function renderWCPlusSource(showOwnStatus = true) {
       </section>
     </section>
   `;
+}
+
+async function bootstrapWCPlusSource() {
+  if (isWCPlusBootstrapped) {
+    return;
+  }
+  isWCPlusBootstrapped = true;
+  wcplusState.loading = "启动时自动检查环境";
+  wcplusState.message = "启动时自动检查环境，加载诊断、任务和公众号列表。";
+  refreshWCPlusView();
+
+  const accountQuery = new URLSearchParams({
+    offset: String(wcplusState.accountOffset),
+    num: String(wcplusState.accountNum),
+  });
+  const [envResult, taskResult, accountResult] = await Promise.allSettled([
+    apiFetch("/api/wcplus/env/check"),
+    apiFetch("/api/wcplus/task/all"),
+    apiFetch(`/api/wcplus/gzh/list?${accountQuery.toString()}`),
+  ]);
+
+  const failures = [];
+  if (envResult.status === "fulfilled") {
+    wcplusState.envCheck = envResult.value;
+    wcplusState.serviceStatus = { ok: Boolean(envResult.value?.ok) };
+    if (!envResult.value?.ok) {
+      failures.push("环境检查");
+    }
+  } else {
+    wcplusState.serviceStatus = { ok: false };
+    failures.push("环境检查");
+  }
+
+  if (taskResult.status === "fulfilled") {
+    wcplusState.tasks = Array.isArray(taskResult.value.tasks) ? taskResult.value.tasks : [];
+  } else {
+    failures.push("任务列表");
+  }
+
+  if (accountResult.status === "fulfilled") {
+    wcplusState.accounts = Array.isArray(accountResult.value.accounts) ? accountResult.value.accounts : [];
+    wcplusState.selectedAccount = wcplusState.accounts[0] || null;
+    if (wcplusState.selectedAccount) {
+      await loadWCPlusArticles(false);
+    }
+  } else {
+    failures.push("公众号列表");
+  }
+
+  wcplusState.loading = "";
+  if (failures.length) {
+    wcplusState.message = `启动检查完成，但 ${failures.join("、")} 需要处理；可继续使用手动导入知识库。`;
+  } else {
+    wcplusState.message = `启动检查完成：${wcplusState.accounts.length} 个公众号，${wcplusState.tasks.length} 个任务。`;
+  }
+  refreshWCPlusView();
 }
 
 function renderWCPlusPreview() {
@@ -2118,6 +2177,7 @@ async function boot() {
   }
   if (window.location.pathname.startsWith("/wcplus-source")) {
     renderWCPlusPage();
+    await bootstrapWCPlusSource();
     return;
   }
   if (window.location.pathname.startsWith("/book-knowledge")) {

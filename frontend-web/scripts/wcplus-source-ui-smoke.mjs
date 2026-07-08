@@ -10,6 +10,7 @@ const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 for (const marker of [
   "wcplusState",
   "renderWCPlusPage",
+  "bootstrapWCPlusSource",
   "loadWCPlusAccounts",
   "loadWCPlusArticles",
   "pageWCPlusAccounts",
@@ -20,6 +21,7 @@ for (const marker of [
   "batchImportWCPlusNicknames",
   "copyWCPlusBatchText",
   "copyWCPlusDiagnostics",
+  "isWCPlusBootstrapped",
   "loadWCPlusRawFile",
   "importRawWCPlusArticle",
   "importWCPlusArticle",
@@ -73,6 +75,7 @@ for (const label of [
   "批量任务",
   "批量导入",
   "启动队列",
+  "启动时自动检查环境",
   "导出全库 XLSX",
   "环境诊断",
   "服务地址",
