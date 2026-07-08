@@ -240,6 +240,54 @@ func TestWCPlusSourceGetsAndImportsArticleContentByURL(t *testing.T) {
 	}
 }
 
+func TestWCPlusSourceImportAccountArticlesFallsBackToURLContent(t *testing.T) {
+	var sawURLContent bool
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"success":true,"data":{"gzh":{"biz":"biz-url","nickname":"URL 公众号"},"articles":[{"title":"URL 列表文章","link":"https://mp.weixin.qq.com/s/account-url-only"}],"total":1}}`)
+		case "/api/article/content":
+			if got := r.URL.Query().Get("url"); got != "https://mp.weixin.qq.com/s/account-url-only" {
+				t.Fatalf("url = %q", got)
+			}
+			if got := r.URL.Query().Get("id"); got != "" {
+				t.Fatalf("id should be empty for URL fallback, got %q", got)
+			}
+			sawURLContent = true
+			fmt.Fprint(w, `{"success":true,"data":{"title":"URL 列表文章","nickname":"URL 公众号","url":"https://mp.weixin.qq.com/s/account-url-only","content":"# URL 列表文章\n\n账号批量导入也支持 URL-only。","publish_time":"2026-07-08"}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	store := NewBookKnowledgeStore(t.TempDir())
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	result, err := service.ImportAccountArticles(context.Background(), store, WCPlusImportAccountRequest{
+		Biz:          "biz-url",
+		Nickname:     "URL 公众号",
+		Limit:        1,
+		BookIDPrefix: "wcplus-url-account",
+	})
+	if err != nil {
+		t.Fatalf("ImportAccountArticles returned error: %v", err)
+	}
+	if !sawURLContent {
+		t.Fatalf("URL content fallback was not called")
+	}
+	if result.ImportedCount != 1 || len(result.Errors) != 0 || len(result.Books) != 1 {
+		t.Fatalf("unexpected import result: %#v", result)
+	}
+	saved, err := store.LoadPackage(result.Books[0].BookID)
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if !strings.Contains(saved.Chunks[0].Text, "账号批量导入也支持 URL-only") {
+		t.Fatalf("unexpected saved chunk: %#v", saved.Chunks)
+	}
+}
+
 func TestWCPlusSourceImportsRawArticleIntoBookKnowledge(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	service := NewWCPlusSourceService(WCPlusSourceConfig{})

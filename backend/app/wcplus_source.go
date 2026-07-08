@@ -387,13 +387,19 @@ func (s *WCPlusSourceService) ImportAccountArticles(ctx context.Context, store *
 		nickname = list.Account.Nickname
 	}
 	for _, article := range list.Articles {
-		content, err := s.GetArticleContent(ctx, nickname, article.ID)
+		content, err := s.getListedArticleContent(ctx, nickname, article)
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", article.ID, err))
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", wcplusArticleErrorLabel(article), err))
 			continue
+		}
+		if content.ID == "" {
+			content.ID = article.ID
 		}
 		if content.Title == "" {
 			content.Title = article.Title
+		}
+		if content.Nickname == "" {
+			content.Nickname = nickname
 		}
 		if content.URL == "" {
 			content.URL = article.URL
@@ -403,17 +409,64 @@ func (s *WCPlusSourceService) ImportAccountArticles(ctx context.Context, store *
 		}
 		bookID := ""
 		if strings.TrimSpace(req.BookIDPrefix) != "" {
-			bookID = strings.TrimSpace(req.BookIDPrefix) + "-" + article.ID
+			bookID = strings.TrimSpace(req.BookIDPrefix) + "-" + wcplusArticleStableID(article, content)
 		}
 		pkg := WCPlusArticleToPackage(*content, bookID)
 		if err := store.SavePackage(pkg); err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", article.ID, err))
+			result.Errors = append(result.Errors, fmt.Sprintf("%s: %v", wcplusArticleErrorLabel(article), err))
 			continue
 		}
 		result.ImportedCount++
 		result.Books = append(result.Books, pkg.Book)
 	}
 	return result, nil
+}
+
+func (s *WCPlusSourceService) getListedArticleContent(ctx context.Context, nickname string, article WCPlusArticle) (*WCPlusArticleContent, error) {
+	if strings.TrimSpace(article.ID) != "" {
+		return s.GetArticleContent(ctx, nickname, article.ID)
+	}
+	if strings.TrimSpace(article.URL) != "" {
+		return s.GetArticleContentByURL(ctx, article.URL)
+	}
+	return nil, fmt.Errorf("article id or url is required")
+}
+
+func wcplusArticleStableID(article WCPlusArticle, content *WCPlusArticleContent) string {
+	if strings.TrimSpace(article.ID) != "" {
+		return strings.TrimSpace(article.ID)
+	}
+	if content != nil && strings.TrimSpace(content.ID) != "" {
+		return strings.TrimSpace(content.ID)
+	}
+	title := article.Title
+	nickname := article.Nickname
+	url := article.URL
+	if content != nil {
+		if strings.TrimSpace(title) == "" {
+			title = content.Title
+		}
+		if strings.TrimSpace(nickname) == "" {
+			nickname = content.Nickname
+		}
+		if strings.TrimSpace(url) == "" {
+			url = content.URL
+		}
+	}
+	return manualWCPlusArticleID(title, nickname, url)
+}
+
+func wcplusArticleErrorLabel(article WCPlusArticle) string {
+	if strings.TrimSpace(article.ID) != "" {
+		return strings.TrimSpace(article.ID)
+	}
+	if strings.TrimSpace(article.URL) != "" {
+		return strings.TrimSpace(article.URL)
+	}
+	if strings.TrimSpace(article.Title) != "" {
+		return strings.TrimSpace(article.Title)
+	}
+	return "article"
 }
 
 func (s *WCPlusSourceService) ListTasks(ctx context.Context) ([]WCPlusTask, error) {
