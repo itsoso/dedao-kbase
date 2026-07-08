@@ -47,6 +47,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") && h.applyCORS(w, r) && r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	if r.URL.Path == "/health" {
 		writeHTTPJSON(w, http.StatusOK, map[string]any{
 			"ok":      true,
@@ -137,6 +141,35 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleWCPlusGetJSON(w, r, "/api/gzh/export_csv")
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (h *kbaseHTTPHandler) applyCORS(w http.ResponseWriter, r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" || !isAllowedKBaseCORSOrigin(origin) {
+		return false
+	}
+	w.Header().Add("Vary", "Origin")
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+	w.Header().Set("Access-Control-Max-Age", "600")
+	return true
+}
+
+func isAllowedKBaseCORSOrigin(origin string) bool {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	switch parsed.Scheme {
+	case "wails":
+		return host == "wails.localhost"
+	case "http", "https":
+		return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "wails.localhost"
+	default:
+		return false
 	}
 }
 

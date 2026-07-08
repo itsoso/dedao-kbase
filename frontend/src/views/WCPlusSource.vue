@@ -7,6 +7,14 @@
                 <p>从本地 WC Plus 同步文章、创建任务，并导入书籍知识库；启动时自动检查环境。</p>
             </div>
             <div class="bar-actions">
+                <label class="api-base-control">
+                    <span>KBase API Base URL</span>
+                    <el-input
+                        v-model="apiBaseURL"
+                        placeholder="默认同源；桌面端可填 http://127.0.0.1:8719"
+                        clearable
+                    />
+                </label>
                 <el-tag :type="serviceTagType" effect="plain">{{ serviceLabel }}</el-tag>
                 <el-button :loading="loading === 'status'" @click="checkStatus">检查状态</el-button>
                 <el-button :loading="loading === 'env'" @click="checkEnvironment">环境检查</el-button>
@@ -318,10 +326,31 @@
 </template>
 
 <script lang="ts" setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 
 const tokenKeys = ['kbase.token', 'kbaseToken', 'KBASE_AUTH_TOKEN']
+const apiBaseKey = 'kbase.apiBaseURL'
+
+const cleanAPIBaseURL = (value: string) => {
+    const raw = String(value || '').trim().replace(/\/+$/, '')
+    if (!raw) {
+        return ''
+    }
+    try {
+        const parsed = new URL(raw)
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            return ''
+        }
+        return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`
+    } catch {
+        return raw
+    }
+}
+
+const readAPIBaseURL = () => cleanAPIBaseURL(window.localStorage.getItem(apiBaseKey) || '')
+
+const apiBaseURL = ref(readAPIBaseURL())
 
 const loading = ref('')
 const message = ref('')
@@ -361,6 +390,15 @@ const rawNickname = ref('')
 const rawURL = ref('')
 const rawBookID = ref('')
 const rawContent = ref('')
+
+watch(apiBaseURL, (value) => {
+    const clean = cleanAPIBaseURL(value)
+    if (clean) {
+        window.localStorage.setItem(apiBaseKey, clean)
+    } else {
+        window.localStorage.removeItem(apiBaseKey)
+    }
+})
 
 const serviceTagType = computed(() => {
     if (!serviceStatus.value) {
@@ -418,6 +456,17 @@ const apiURL = (path: string, params?: Record<string, string | number | boolean 
     return suffix ? `${path}?${suffix}` : path
 }
 
+const resolveAPIURL = (path: string) => {
+    if (/^https?:\/\//i.test(path)) {
+        return path
+    }
+    const base = cleanAPIBaseURL(apiBaseURL.value)
+    if (!base) {
+        return path
+    }
+    return `${base}${path.startsWith('/') ? path : `/${path}`}`
+}
+
 const apiJSON = async <T = any>(path: string, options: RequestInit = {}): Promise<T> => {
     const headers = new Headers(options.headers || {})
     headers.set('Accept', 'application/json')
@@ -428,7 +477,7 @@ const apiJSON = async <T = any>(path: string, options: RequestInit = {}): Promis
     if (token) {
         headers.set('Authorization', `Bearer ${token}`)
     }
-    const response = await fetch(path, {...options, headers})
+    const response = await fetch(resolveAPIURL(path), {...options, headers})
     const text = await response.text()
     let payload: any = null
     if (text) {
@@ -457,7 +506,7 @@ const apiDownload = async (path: string, options: RequestInit, filename: string)
     if (token) {
         headers.set('Authorization', `Bearer ${token}`)
     }
-    const response = await fetch(path, {...options, headers})
+    const response = await fetch(resolveAPIURL(path), {...options, headers})
     if (!response.ok) {
         throw new Error(await response.text() || `HTTP ${response.status}`)
     }
@@ -1152,6 +1201,19 @@ const exportAllArticlesXLSX = async () => {
 .main-actions {
     flex-wrap: wrap;
     justify-content: flex-end;
+}
+
+.api-base-control {
+    display: grid;
+    gap: 4px;
+    min-width: 280px;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.api-base-control :deep(.el-input__wrapper) {
+    min-height: 32px;
 }
 
 .workbench-message {

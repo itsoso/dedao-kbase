@@ -73,6 +73,42 @@ func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) 
 	}
 }
 
+func TestKBaseHTTPHandlerAllowsDesktopCORSPreflight(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(t.TempDir()),
+		AuthToken: "secret-token",
+	})
+
+	req := httptest.NewRequest(http.MethodOptions, "/api/wcplus/status", nil)
+	req.Header.Set("Origin", "wails://wails.localhost")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "Authorization, Content-Type")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Origin"); got != "wails://wails.localhost" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", got)
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Headers"); !strings.Contains(got, "Authorization") || !strings.Contains(got, "Content-Type") {
+		t.Fatalf("Access-Control-Allow-Headers = %q", got)
+	}
+	if got := resp.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, http.MethodGet) || !strings.Contains(got, http.MethodPost) {
+		t.Fatalf("Access-Control-Allow-Methods = %q", got)
+	}
+
+	untrustedReq := httptest.NewRequest(http.MethodOptions, "/api/wcplus/status", nil)
+	untrustedReq.Header.Set("Origin", "https://example.invalid")
+	untrustedReq.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	untrustedResp := httptest.NewRecorder()
+	handler.ServeHTTP(untrustedResp, untrustedReq)
+	if untrustedResp.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("untrusted origin received CORS header: %q", untrustedResp.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
 func TestKBaseHTTPHandlerServesSearchAndSystemKBExport(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(filepath.Join(root, "book_knowledge"))

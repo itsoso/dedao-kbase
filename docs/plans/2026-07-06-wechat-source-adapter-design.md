@@ -88,3 +88,4 @@ WC Plus integration stores only imported book-knowledge packages. It does not pe
 - `/wechat-source` exposes WC Plus status, account/title/full-text search, TXT/CSV export triggers, all-library XLSX download, queue start, and batch-task cleanup without embedding the local WC Plus URL in frontend code.
 - `/wechat-source` exposes WC Plus environment checks and batch nickname import for the documented skill flow, including exact-match failures and copyable success/failure text.
 - `/wcplus-source` automatically runs environment, task, and account bootstrap checks on entry, while still allowing manual raw article import when the local service is unavailable.
+- The desktop `/wcplus-source` route can call a separate kbase HTTP service through a user-configured `KBase API Base URL`; kbase allows only Wails and local development origins to use CORS for Bearer-protected `/api/*` routes.

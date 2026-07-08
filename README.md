@@ -103,6 +103,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 在线 Web UI 新增 `/wechat-source` 和 `/wcplus-source`。所有浏览器请求都走 kbase 的 Bearer 代理；浏览器不会直接访问本机 WC Plus 端口。
 
+桌面版 `/wcplus-source` 默认也使用同源 `/api/*`。如果 Wails 桌面壳没有和 kbase HTTP 服务同源运行，在页面顶部的 `KBase API Base URL` 填入 kbase 地址，例如 `http://127.0.0.1:8719`，并确保本机已写入 `KBASE_AUTH_TOKEN` 对应的 Bearer token。kbase 只允许 Wails/localhost/127.0.0.1 这类桌面来源跨域调用 `/api/*`，不会对任意网页开放 CORS。
+
 ```bash
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
