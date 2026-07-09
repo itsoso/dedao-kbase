@@ -58,6 +58,7 @@ const wcplusState = {
   rawBookID: "",
   rawContent: "",
   rawImported: null,
+  importedPackages: [],
   loading: "",
   message: "",
 };
@@ -728,6 +729,7 @@ function renderWCPlusSource(showOwnStatus = true) {
         <a href="/book-knowledge" data-link>打开书籍知识库</a>
       </div>`
     : "";
+  const importedBooksHTML = renderWCPlusImportedBooks();
   const status = wcplusState.loading
     ? `<div class="web-status">处理中：${escapeHTML(wcplusState.loading)}</div>`
     : (wcplusState.message ? `<div class="web-status">${escapeHTML(wcplusState.message)}</div>` : "");
@@ -1003,8 +1005,72 @@ function renderWCPlusSource(showOwnStatus = true) {
           </div>
         </form>
         ${rawImportedHTML}
+        ${importedBooksHTML}
         ${taskRows || "<p class=\"web-muted\">点击“下载任务”查看 WC Plus 同步任务。</p>"}
       </section>
+    </section>
+  `;
+}
+
+function wcplusBooksFromPayload(payload) {
+  const books = [];
+  if (payload?.book) {
+    books.push(payload.book);
+  }
+  if (Array.isArray(payload?.books)) {
+    books.push(...payload.books);
+  }
+  if (Array.isArray(payload?.imported_books)) {
+    books.push(...payload.imported_books);
+  }
+  return books.filter((book) => book && (book.book_id || book.title));
+}
+
+function rememberWCPlusImportedBooks(payload) {
+  const incoming = wcplusBooksFromPayload(payload);
+  if (!incoming.length) {
+    return [];
+  }
+  const merged = [...incoming, ...wcplusState.importedPackages];
+  const seen = new Set();
+  wcplusState.importedPackages = merged.filter((book) => {
+    const key = book.book_id || book.title;
+    if (!key || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  }).slice(0, 8);
+  return incoming;
+}
+
+function renderWCPlusImportedBooks() {
+  if (!wcplusState.importedPackages.length) {
+    return "";
+  }
+  const rows = wcplusState.importedPackages.map((book) => {
+    const id = book.book_id || "";
+    const title = book.title || id || "WC Plus 文章";
+    return `
+      <li>
+        <strong>${escapeHTML(title)}</strong>
+        <span>${escapeHTML(id)}</span>
+        <div class="wcplus-source__row-actions">
+          ${id ? `<a class="button button-ghost" href="/book-knowledge?book_id=${encodeURIComponent(id)}" data-link>知识库</a>` : ""}
+          ${id ? `<a class="button button-ghost" href="/ebook/${encodeURIComponent(id)}" data-link>阅读</a>` : ""}
+        </div>
+      </li>
+    `;
+  }).join("");
+  return `
+    <section class="wcplus-source__imported-books">
+      <div class="wcplus-source__toolbar is-tight">
+        <div>
+          <p class="web-kicker">Imported</p>
+          <h3>最近入库</h3>
+        </div>
+      </div>
+      <ul>${rows}</ul>
     </section>
   `;
 }
@@ -1647,6 +1713,7 @@ async function importWCPlusArticle(article) {
       method: "POST",
       body: JSON.stringify(id ? { nickname, id } : { url: articleURL }),
     });
+    rememberWCPlusImportedBooks(payload);
     wcplusState.message = `已导入：${payload.book?.title || wcplusArticleTitle(article) || id || articleURL}`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
@@ -1681,6 +1748,7 @@ async function importRawWCPlusArticle() {
         content: wcplusState.rawContent,
       }),
     });
+    rememberWCPlusImportedBooks(wcplusState.rawImported);
     wcplusState.message = `已手动导入：${wcplusState.rawImported?.book?.title || wcplusState.rawTitle}`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
@@ -1711,6 +1779,7 @@ async function importWCPlusAccount() {
         limit: wcplusState.importLimit,
       }),
     });
+    rememberWCPlusImportedBooks(payload);
     wcplusState.message = `批量导入完成：${payload.imported_count || 0} 篇。`;
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);
@@ -1903,6 +1972,7 @@ async function batchImportWCPlusNicknames() {
       }),
     });
     wcplusState.batchResult = result;
+    rememberWCPlusImportedBooks(result);
     const successCount = Array.isArray(result.success) ? result.success.length : 0;
     const failedCount = Array.isArray(result.failed) ? result.failed.length : 0;
     const importedCount = result.imported_count || 0;
@@ -2267,8 +2337,10 @@ async function loadBookKnowledge() {
     const payload = await apiFetch("/api/books");
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length) {
-      const preferred = knowledgeState.selectedBook?.book_id
-        ? knowledgeState.books.find((book) => book.book_id === knowledgeState.selectedBook.book_id)
+      const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
+      const preferredID = queryBookID || knowledgeState.selectedBook?.book_id || "";
+      const preferred = preferredID
+        ? knowledgeState.books.find((book) => book.book_id === preferredID)
         : null;
       await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
     } else {

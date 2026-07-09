@@ -25,6 +25,7 @@ for (const hook of [
   'wcplus-utility-result',
   'wcplus-raw-file',
   'wcplus-batch-result',
+  'wcplus-imported-books',
   'wcplus-action-bar',
 ]) {
   assert.ok(viewSource.includes(hook), `WCPlusSource.vue should include ${hook}`)
@@ -83,6 +84,10 @@ assert.ok(viewSource.includes('offset: searchOffset.value'), 'WCPlusSource.vue s
 assert.ok(viewSource.includes('num: searchNum.value'), 'WCPlusSource.vue should send search page size')
 assert.ok(viewSource.includes('createTaskForAccount'), 'WCPlusSource.vue should create sync tasks directly from account search results')
 assert.ok(viewSource.includes('@click="createTaskForAccount(item)"'), 'WCPlusSource.vue should expose direct sync action on account search results')
+assert.ok(viewSource.includes('importedBooks'), 'WCPlusSource.vue should keep recently imported WC Plus books')
+assert.ok(viewSource.includes('rememberImportedBooks'), 'WCPlusSource.vue should remember imported books from import responses')
+assert.ok(viewSource.includes('最近入库'), 'WCPlusSource.vue should render recently imported books')
+assert.ok(viewSource.includes('book_id='), 'WCPlusSource.vue should link imported books to book knowledge')
 assert.ok(viewSource.includes('success_text'), 'WCPlusSource.vue should expose WC Plus batch import success text')
 assert.ok(viewSource.includes('failed_text'), 'WCPlusSource.vue should expose WC Plus batch import failed text')
 assert.ok(viewSource.includes('batchImportToKBase'), 'WCPlusSource.vue should support batch import to knowledge base')

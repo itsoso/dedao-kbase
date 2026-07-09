@@ -26,6 +26,7 @@ for (const marker of [
   "batchImportToKBase",
   "batchWaitForCompletion",
   "batchImportLimit",
+  "importedPackages",
   "searchOffset",
   "searchNum",
   "loadWCPlusRawFile",
@@ -33,6 +34,8 @@ for (const marker of [
   "importRawWCPlusArticle",
   "importWCPlusArticle",
   "importWCPlusAccount",
+  "rememberWCPlusImportedBooks",
+  "renderWCPlusImportedBooks",
   "loadWCPlusTasks",
   "createWCPlusTask",
   "createWCPlusTaskForAccount",
@@ -98,6 +101,7 @@ for (const label of [
   "服务地址",
   "复制诊断",
   "批量结果",
+  "最近入库",
   "下载任务",
   "任务类型",
   "每页",
@@ -141,6 +145,7 @@ for (const selector of [
   "data-wcplus-utility=\"likes\"",
   "data-wcplus-utility=\"request\"",
   "data-wcplus-sync-result-account",
+  "book_id=",
 ]) {
   assert.ok(js.includes(selector), `WC Plus UI should include ${selector}`);
 }
@@ -158,6 +163,7 @@ for (const className of [
   ".wcplus-source__batch-form",
   ".wcplus-source__batch-result",
   ".wcplus-source__manual-form",
+  ".wcplus-source__imported-books",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
@@ -171,6 +177,8 @@ assert.ok(js.includes("poll_attempts"), "WC Plus batch import should send bounde
 assert.ok(js.includes("offset: String(wcplusState.searchOffset)"), "WC Plus search should send a pageable offset");
 assert.ok(js.includes("num: String(wcplusState.searchNum)"), "WC Plus search should send a configurable page size");
 assert.ok(js.includes("imported_count"), "WC Plus UI should render imported knowledge count");
+assert.ok(js.includes("imported_books"), "WC Plus UI should render batch imported books");
+assert.ok(js.includes("books"), "WC Plus UI should remember account imported books");
 assert.ok(js.includes("envCheck"), "WC Plus UI should keep environment check details");
 assert.ok(js.includes("utilityResult"), "WC Plus UI should render auxiliary API results");
 assert.ok(js.includes("runWCPlusUtility"), "WC Plus UI should call auxiliary WC Plus APIs");

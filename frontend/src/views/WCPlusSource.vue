@@ -185,6 +185,25 @@
                     <el-empty v-else description="点击文章预览" :image-size="64" />
                 </section>
 
+                <section v-if="importedBooks.length" class="panel wcplus-imported-books">
+                    <div class="section-head">
+                        <span>最近入库</span>
+                        <el-tag size="small" effect="plain">{{ importedBooks.length }}</el-tag>
+                    </div>
+                    <div class="imported-book-list">
+                        <div v-for="book in importedBooks" :key="book.book_id || book.title" class="imported-book-row">
+                            <div>
+                                <strong>{{ book.title || book.book_id || 'WC Plus 文章' }}</strong>
+                                <span>{{ book.book_id || '-' }}</span>
+                            </div>
+                            <div class="mini-actions">
+                                <a v-if="book.book_id" :href="`#/book-knowledge?book_id=${encodeURIComponent(book.book_id)}`">知识库</a>
+                                <a v-if="book.book_id" :href="`#/ebook/${encodeURIComponent(book.book_id)}`">阅读</a>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
                 <section class="panel wcplus-task-panel">
                     <div class="section-head">
                         <span>任务</span>
@@ -376,6 +395,7 @@ const preview = ref<any>(null)
 const mainTab = ref('articles')
 const batchResult = ref<any>(null)
 const utilityResult = ref<any>(null)
+const importedBooks = ref<any[]>([])
 
 const searchQuery = ref('')
 const searchMode = ref('fulltext')
@@ -605,6 +625,37 @@ const resultSubline = (item: any) => [articleDigest(item), articlePublishTime(it
 const taskID = (task: any) => firstValue(task, ['task_id', 'TaskID', 'id', 'ID'])
 const taskStatus = (task: any) => firstValue(task, ['status', 'Status', 'message', 'Message']) || 'unknown'
 const taskTitle = (task: any) => firstValue(task, ['nickname', 'Nickname', 'title', 'Title']) || taskID(task) || '任务'
+
+const importedBooksFromPayload = (payload: any) => {
+    const books: any[] = []
+    if (payload?.book) {
+        books.push(payload.book)
+    }
+    if (Array.isArray(payload?.books)) {
+        books.push(...payload.books)
+    }
+    if (Array.isArray(payload?.imported_books)) {
+        books.push(...payload.imported_books)
+    }
+    return books.filter((book) => book && (book.book_id || book.title))
+}
+
+const rememberImportedBooks = (payload: any) => {
+    const incoming = importedBooksFromPayload(payload)
+    if (!incoming.length) {
+        return []
+    }
+    const seen = new Set<string>()
+    importedBooks.value = [...incoming, ...importedBooks.value].filter((book) => {
+        const key = book.book_id || book.title
+        if (!key || seen.has(key)) {
+            return false
+        }
+        seen.add(key)
+        return true
+    }).slice(0, 8)
+    return incoming
+}
 
 const checkStatus = async () => {
     await withLoading('status', async () => {
@@ -843,6 +894,7 @@ const importArticle = async (article: any) => {
             method: 'POST',
             body: JSON.stringify(id ? {nickname, id} : {url}),
         })
+        rememberImportedBooks(payload)
         notify(`已导入：${payload?.book?.title || articleTitle(article) || id || url}`, 'success')
     })
 }
@@ -862,6 +914,7 @@ const importAccount = async () => {
                 limit: importLimit.value,
             }),
         })
+        rememberImportedBooks(payload)
         notify(`批量导入完成：${payload?.imported_count || 0} 篇。`, 'success')
     })
 }
@@ -982,6 +1035,7 @@ const batchImportNicknames = async () => {
             }),
         })
         batchResult.value = result
+        rememberImportedBooks(result)
         const successCount = Array.isArray(result?.success) ? result.success.length : 0
         const failedCount = Array.isArray(result?.failed) ? result.failed.length : 0
         const importedCount = result?.imported_count || 0
@@ -1087,6 +1141,7 @@ const importRawArticle = async () => {
                 content: rawContent.value,
             }),
         })
+        rememberImportedBooks(payload)
         notify(`已导入：${payload?.book?.title || rawTitle.value}`, 'success')
     })
 }
@@ -1518,10 +1573,52 @@ const exportAllArticlesXLSX = async () => {
 
 .wcplus-batch-import,
 .wcplus-raw-import,
+.wcplus-imported-books,
 .wcplus-utility-result,
 .wcplus-batch-result {
     display: grid;
     gap: 8px;
+}
+
+.imported-book-list {
+    display: grid;
+    gap: 8px;
+}
+
+.imported-book-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    border: 1px solid #edf0f5;
+    border-radius: 8px;
+    padding: 8px;
+    background: #f8fafc;
+}
+
+.imported-book-row > div:first-child {
+    display: grid;
+    gap: 3px;
+    min-width: 0;
+}
+
+.imported-book-row strong,
+.imported-book-row span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.imported-book-row span {
+    color: #64748b;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+
+.imported-book-row a {
+    color: #ff6b00;
+    font-size: 12px;
+    font-weight: 700;
+    text-decoration: none;
 }
 
 .env-check-list {

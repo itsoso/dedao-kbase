@@ -921,6 +921,48 @@ a.button {
   text-decoration: none;
 }
 
+.wcplus-source__imported-books {
+  border: 1px solid rgba(44, 122, 107, 0.16);
+  border-radius: 8px;
+  padding: 10px;
+  background: rgba(44, 122, 107, 0.05);
+}
+
+.wcplus-source__imported-books ul {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.wcplus-source__imported-books li {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(120px, 220px) auto;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid rgba(44, 122, 107, 0.12);
+  padding-top: 8px;
+}
+
+.wcplus-source__imported-books li:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.wcplus-source__imported-books strong {
+  color: #234c45;
+}
+
+.wcplus-source__imported-books span {
+  overflow: hidden;
+  color: #756c60;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .wcplus-source__inline-check {
   display: inline-flex !important;
   grid-template-columns: auto 1fr;
