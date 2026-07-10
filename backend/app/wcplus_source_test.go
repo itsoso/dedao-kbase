@@ -337,7 +337,7 @@ func TestWCPlusSourceCreatesAndControlsTasks(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		switch r.URL.Path {
 		case "/api/task/all":
-			fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-1","biz":"biz-1","nickname":"医学参考","status":"running"}]}}`)
+			fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-1","biz":"biz-1","nickname":"医学参考","crawlerType":"article","status":"running","status_error":"waiting for parameter","status_article_total_amount":30,"status_article_finished_amount":12,"status_reading_data_total_amount":20,"status_reading_data_finished_amount":5,"created_at":100,"updated_at":200}]}}`)
 		case "/api/task/new":
 			sawCreate = true
 			var payload map[string]any
@@ -374,6 +374,15 @@ func TestWCPlusSourceCreatesAndControlsTasks(t *testing.T) {
 	}
 	if len(tasks) != 1 || tasks[0].TaskID != "task-1" {
 		t.Fatalf("unexpected tasks: %#v", tasks)
+	}
+	if tasks[0].CrawlerType != "article" || tasks[0].StatusError != "waiting for parameter" {
+		t.Fatalf("task details were not normalized: %#v", tasks[0])
+	}
+	if tasks[0].ArticleTotal != 30 || tasks[0].ArticleFinished != 12 || tasks[0].ReadingTotal != 20 || tasks[0].ReadingFinished != 5 {
+		t.Fatalf("task progress was not normalized: %#v", tasks[0])
+	}
+	if tasks[0].CreatedAt != 100 || tasks[0].UpdatedAt != 200 {
+		t.Fatalf("task timestamps were not normalized: %#v", tasks[0])
 	}
 	created, err := service.CreateTask(context.Background(), WCPlusTaskRequest{Biz: "biz-1", Nickname: "医学参考"})
 	if err != nil {
@@ -423,6 +432,74 @@ func TestWCPlusSourceCreatesTypedTasks(t *testing.T) {
 	}
 	if payload["crawlerType"] != "article" || payload["articleListType"] != "amount" || payload["articleListAmount"] != float64(30) {
 		t.Fatalf("typed task payload = %#v", payload)
+	}
+}
+
+func TestWCPlusSourceCreatesCompleteArticleTask(t *testing.T) {
+	var payload map[string]any
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if r.URL.Path != "/api/task/new" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode create body: %v", err)
+		}
+		fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-article","status":"created"}}`)
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	_, err := service.CreateTask(context.Background(), WCPlusTaskRequest{
+		Biz:                  "biz-article",
+		Nickname:             "医学参考",
+		ImageURL:             "https://example.test/avatar.png",
+		CrawlerType:          "article",
+		ArticleRefresh:       true,
+		ArticleImageDownload: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask returned error: %v", err)
+	}
+	if payload["img"] != "https://example.test/avatar.png" || payload["articleRefresh"] != true || payload["articleImgDownload"] != true {
+		t.Fatalf("article task payload = %#v", payload)
+	}
+}
+
+func TestWCPlusSourceCreatesCompleteReadingDataTask(t *testing.T) {
+	var payload map[string]any
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if r.URL.Path != "/api/task/new" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode create body: %v", err)
+		}
+		fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-reading","status":"created"}}`)
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	_, err := service.CreateTask(context.Background(), WCPlusTaskRequest{
+		Biz:                  "biz-reading",
+		Nickname:             "医学参考",
+		CrawlerType:          "reading_data",
+		ReadingDataType:      "date",
+		ReadingDataStartDate: 1000,
+		ReadingDataEndDate:   2000,
+		ReadingDataAmount:    50,
+		ReadingDataOnlyMain:  true,
+		ReadingDataRefresh:   true,
+	})
+	if err != nil {
+		t.Fatalf("CreateTask returned error: %v", err)
+	}
+	if payload["readingDataType"] != "date" || payload["readingDataStartDate"] != float64(1000) || payload["readingDataEndDate"] != float64(2000) {
+		t.Fatalf("reading task date payload = %#v", payload)
+	}
+	if payload["readingDataAmount"] != float64(50) || payload["readingDataOnlyMain"] != true || payload["readingDataRefresh"] != true {
+		t.Fatalf("reading task options payload = %#v", payload)
 	}
 }
 
@@ -603,7 +680,7 @@ func TestWCPlusSourceBatchImportsNicknamesWithExactMatch(t *testing.T) {
 			default:
 				fmt.Fprint(w, `{"Candidates":[],"Total":0}`)
 			}
-		case "/api/batch_task/create_task":
+		case "/api/task/new":
 			var payload map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Fatalf("decode create task body: %v", err)
@@ -664,7 +741,7 @@ func TestWCPlusSourceBatchImportsNicknamesToKnowledgeAfterSync(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/search_gzh/search":
 			fmt.Fprint(w, `{"Candidates":[{"Biz":"biz-med","Nickname":"医学参考"}],"Total":1}`)
-		case "/api/batch_task/create_task":
+		case "/api/task/new":
 			fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-1","status":"ready"}}`)
 		case "/api/task/control":
 			fmt.Fprint(w, `{"success":true,"data":{"status":"running"}}`)
@@ -674,7 +751,7 @@ func TestWCPlusSourceBatchImportsNicknamesToKnowledgeAfterSync(t *testing.T) {
 				fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-1","biz":"biz-med","nickname":"医学参考","status":"running"}]}}`)
 				return
 			}
-			fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-1","biz":"biz-med","nickname":"医学参考","status":"succeeded"}]}}`)
+			fmt.Fprint(w, `{"success":true,"data":{"tasks":[]}}`)
 		case "/api/report/gzh_articles":
 			if got := r.URL.Query().Get("biz"); got != "biz-med" {
 				t.Fatalf("biz = %q", got)
@@ -721,6 +798,54 @@ func TestWCPlusSourceBatchImportsNicknamesToKnowledgeAfterSync(t *testing.T) {
 	}
 	if !strings.Contains(saved.Chunks[0].Text, "自动进入书籍知识库") {
 		t.Fatalf("unexpected saved chunk: %#v", saved.Chunks)
+	}
+}
+
+func TestWCPlusSourceDoesNotCompleteDisappearedTaskWithoutArticleVerification(t *testing.T) {
+	var taskPolls int
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		switch r.URL.Path {
+		case "/api/search_gzh/search":
+			fmt.Fprint(w, `{"Candidates":[{"Biz":"biz-empty","Nickname":"空公众号"}],"Total":1}`)
+		case "/api/task/new":
+			fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-empty","status":"ready"}}`)
+		case "/api/task/control":
+			fmt.Fprint(w, `{"success":true,"data":{"status":"running"}}`)
+		case "/api/task/all":
+			taskPolls++
+			if taskPolls == 1 {
+				fmt.Fprint(w, `{"success":true,"data":{"tasks":[{"task_id":"task-empty","status":"running"}]}}`)
+				return
+			}
+			fmt.Fprint(w, `{"success":true,"data":{"tasks":[]}}`)
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"success":true,"data":{"gzh":{"biz":"biz-empty","nickname":"空公众号"},"articles":[],"total":0}}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	store := NewBookKnowledgeStore(t.TempDir())
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	result, err := service.BatchImportNicknamesToKnowledge(context.Background(), store, WCPlusBatchImportRequest{
+		Nicknames:          []string{"空公众号"},
+		StartQueue:         true,
+		ExactMatch:         true,
+		ImportToKBase:      true,
+		WaitForCompletion:  true,
+		PollAttempts:       2,
+		PollIntervalMillis: 1,
+	})
+	if err != nil {
+		t.Fatalf("BatchImportNicknamesToKnowledge returned error: %v", err)
+	}
+	if result.ImportedCount != 0 {
+		t.Fatalf("ImportedCount = %d, want 0", result.ImportedCount)
+	}
+	if len(result.ImportErrors) != 1 || !strings.Contains(result.ImportErrors[0], "outcome could not be verified") {
+		t.Fatalf("ImportErrors = %#v", result.ImportErrors)
 	}
 }
 

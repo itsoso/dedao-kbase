@@ -44,7 +44,17 @@ const wcplusState = {
   exportRecentNum: 100,
   taskCrawlerType: "gzh_article_link",
   taskArticleListType: "all",
+  taskArticleListDate: 0,
   taskArticleListAmount: 20,
+  taskArticleListOffset: 0,
+  taskArticleRefresh: false,
+  taskArticleImageDownload: false,
+  taskReadingDataType: "all",
+  taskReadingDataStartDate: 0,
+  taskReadingDataEndDate: 0,
+  taskReadingDataAmount: 1000,
+  taskReadingDataOnlyMain: true,
+  taskReadingDataRefresh: false,
   batchNicknames: "",
   batchExactMatch: true,
   batchArticleListType: "all",
@@ -710,18 +720,24 @@ function renderWCPlusSource(showOwnStatus = true) {
       </article>
     `;
   }).join("");
-  const taskRows = wcplusState.tasks.map((task, index) => `
-    <div class="wcplus-source__task">
-      <div>
-        <strong>${escapeHTML(task.nickname || task.biz || task.task_id)}</strong>
-        <span>${escapeHTML(task.status || "unknown")}</span>
+  const taskRows = wcplusState.tasks.map((task) => {
+    const progress = [];
+    if (task.article_total) {
+      progress.push(`正文 ${task.article_finished || 0}/${task.article_total}`);
+    }
+    if (task.reading_total) {
+      progress.push(`阅读数据 ${task.reading_finished || 0}/${task.reading_total}`);
+    }
+    return `
+      <div class="wcplus-source__task">
+        <div>
+          <strong>${escapeHTML(task.nickname || task.biz || task.task_id)}</strong>
+          <span>${escapeHTML([task.crawler_type, task.status || "unknown", progress.join(" · ")].filter(Boolean).join(" · "))}</span>
+          ${task.status_error ? `<small class="is-bad">${escapeHTML(task.status_error)}</small>` : ""}
+        </div>
       </div>
-      <div class="wcplus-source__row-actions">
-        <button type="button" class="button button-ghost" data-wcplus-task-start="${index}">开始</button>
-        <button type="button" class="button button-ghost" data-wcplus-task-stop="${index}">停止</button>
-      </div>
-    </div>
-  `).join("");
+    `;
+  }).join("");
   const rawImportedBook = wcplusState.rawImported?.book;
   const rawImportedHTML = rawImportedBook
     ? `<div class="wcplus-source__imported">
@@ -870,7 +886,7 @@ function renderWCPlusSource(showOwnStatus = true) {
             </div>
             <div class="wcplus-source__actions">
               <button id="wcplus-create-task" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>同步公众号</button>
-              <button id="wcplus-create-batch-task" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>批量任务</button>
+              <button id="wcplus-create-batch-task" class="button button-ghost" type="button">批量任务</button>
               <button id="wcplus-export-text" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>导出 TXT</button>
               <button id="wcplus-export-csv" class="button button-ghost" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>导出 CSV</button>
               <button id="wcplus-import-account" class="button button-primary" type="button" ${wcplusState.selectedAccount ? "" : "disabled"}>批量导入</button>
@@ -882,7 +898,7 @@ function renderWCPlusSource(showOwnStatus = true) {
               <select name="taskCrawlerType">
                 <option value="gzh_article_link" ${wcplusState.taskCrawlerType === "gzh_article_link" ? "selected" : ""}>公众号链接</option>
                 <option value="article" ${wcplusState.taskCrawlerType === "article" ? "selected" : ""}>文章内容</option>
-                <option value="gzh" ${wcplusState.taskCrawlerType === "gzh" ? "selected" : ""}>公众号信息</option>
+                <option value="reading_data" ${wcplusState.taskCrawlerType === "reading_data" ? "selected" : ""}>阅读数据任务</option>
               </select>
             </label>
             <label>
@@ -895,6 +911,50 @@ function renderWCPlusSource(showOwnStatus = true) {
             <label>
               <span>抓取篇数</span>
               <input name="articleListAmount" type="number" min="0" max="1000" value="${escapeAttribute(wcplusState.taskArticleListAmount)}">
+            </label>
+            <label>
+              <span>开始时间（Unix 秒）</span>
+              <input name="articleListDate" type="number" min="0" value="${escapeAttribute(wcplusState.taskArticleListDate)}">
+            </label>
+            <label>
+              <span>抓取偏移</span>
+              <input name="articleListOffset" type="number" min="0" value="${escapeAttribute(wcplusState.taskArticleListOffset)}">
+            </label>
+            <label class="wcplus-source__inline-check">
+              <input name="articleRefresh" type="checkbox" ${wcplusState.taskArticleRefresh ? "checked" : ""}>
+              <span>文章刷新</span>
+            </label>
+            <label class="wcplus-source__inline-check">
+              <input name="articleImageDownload" type="checkbox" ${wcplusState.taskArticleImageDownload ? "checked" : ""}>
+              <span>下载正文图片</span>
+            </label>
+            <label>
+              <span>阅读范围</span>
+              <select name="readingDataType">
+                <option value="all" ${wcplusState.taskReadingDataType === "all" ? "selected" : ""}>全部</option>
+                <option value="date" ${wcplusState.taskReadingDataType === "date" ? "selected" : ""}>时间区间</option>
+                <option value="amount" ${wcplusState.taskReadingDataType === "amount" ? "selected" : ""}>指定篇数</option>
+              </select>
+            </label>
+            <label>
+              <span>阅读开始（Unix 秒）</span>
+              <input name="readingDataStartDate" type="number" min="0" value="${escapeAttribute(wcplusState.taskReadingDataStartDate)}">
+            </label>
+            <label>
+              <span>阅读结束（Unix 秒）</span>
+              <input name="readingDataEndDate" type="number" min="0" value="${escapeAttribute(wcplusState.taskReadingDataEndDate)}">
+            </label>
+            <label>
+              <span>阅读数据篇数</span>
+              <input name="readingDataAmount" type="number" min="0" max="1000" value="${escapeAttribute(wcplusState.taskReadingDataAmount)}">
+            </label>
+            <label class="wcplus-source__inline-check">
+              <input name="readingDataOnlyMain" type="checkbox" ${wcplusState.taskReadingDataOnlyMain ? "checked" : ""}>
+              <span>仅头条</span>
+            </label>
+            <label class="wcplus-source__inline-check">
+              <input name="readingDataRefresh" type="checkbox" ${wcplusState.taskReadingDataRefresh ? "checked" : ""}>
+              <span>刷新阅读数据</span>
             </label>
             <label>
               <span>导入篇数</span>
@@ -1430,24 +1490,6 @@ function bindWCPlusEvents() {
       }
     });
   }
-  for (const button of document.querySelectorAll("[data-wcplus-task-start]")) {
-    button.addEventListener("click", async () => {
-      const index = Number(button.getAttribute("data-wcplus-task-start") || "0");
-      const task = wcplusState.tasks[index];
-      if (task) {
-        await controlWCPlusTask(task, "start");
-      }
-    });
-  }
-  for (const button of document.querySelectorAll("[data-wcplus-task-stop]")) {
-    button.addEventListener("click", async () => {
-      const index = Number(button.getAttribute("data-wcplus-task-stop") || "0");
-      const task = wcplusState.tasks[index];
-      if (task) {
-        await controlWCPlusTask(task, "stop");
-      }
-    });
-  }
 }
 
 function boundedNumber(value, min, max, fallback) {
@@ -1469,7 +1511,17 @@ function readWCPlusOptionsFromDOM() {
     const data = new FormData(workOptions);
     wcplusState.taskCrawlerType = String(data.get("taskCrawlerType") || "gzh_article_link");
     wcplusState.taskArticleListType = String(data.get("taskArticleListType") || "all");
+    wcplusState.taskArticleListDate = boundedNumber(data.get("articleListDate"), 0, Number.MAX_SAFE_INTEGER, wcplusState.taskArticleListDate);
     wcplusState.taskArticleListAmount = boundedNumber(data.get("articleListAmount"), 0, 1000, wcplusState.taskArticleListAmount);
+    wcplusState.taskArticleListOffset = boundedNumber(data.get("articleListOffset"), 0, Number.MAX_SAFE_INTEGER, wcplusState.taskArticleListOffset);
+    wcplusState.taskArticleRefresh = data.has("articleRefresh");
+    wcplusState.taskArticleImageDownload = data.has("articleImageDownload");
+    wcplusState.taskReadingDataType = String(data.get("readingDataType") || "all");
+    wcplusState.taskReadingDataStartDate = boundedNumber(data.get("readingDataStartDate"), 0, Number.MAX_SAFE_INTEGER, wcplusState.taskReadingDataStartDate);
+    wcplusState.taskReadingDataEndDate = boundedNumber(data.get("readingDataEndDate"), 0, Number.MAX_SAFE_INTEGER, wcplusState.taskReadingDataEndDate);
+    wcplusState.taskReadingDataAmount = boundedNumber(data.get("readingDataAmount"), 0, 1000, wcplusState.taskReadingDataAmount);
+    wcplusState.taskReadingDataOnlyMain = data.has("readingDataOnlyMain");
+    wcplusState.taskReadingDataRefresh = data.has("readingDataRefresh");
     wcplusState.importLimit = boundedNumber(data.get("importLimit"), 1, 100, wcplusState.importLimit);
     wcplusState.exportRecentNum = boundedNumber(data.get("exportRecentNum"), 1, 5000, wcplusState.exportRecentNum);
     wcplusState.articleNum = boundedNumber(data.get("articleNum"), 1, 100, wcplusState.articleNum);
@@ -2106,7 +2158,17 @@ async function createWCPlusTaskForAccount(account) {
         nickname: wcplusAccountNickname(account),
         crawlerType: wcplusState.taskCrawlerType,
         articleListType: wcplusState.taskArticleListType,
+        articleListDate: wcplusState.taskArticleListDate,
         articleListAmount: wcplusState.taskArticleListAmount,
+        articleListOffset: wcplusState.taskArticleListOffset,
+        articleRefresh: wcplusState.taskArticleRefresh,
+        articleImgDownload: wcplusState.taskArticleImageDownload,
+        readingDataType: wcplusState.taskReadingDataType,
+        readingDataStartDate: wcplusState.taskReadingDataStartDate,
+        readingDataEndDate: wcplusState.taskReadingDataEndDate,
+        readingDataAmount: wcplusState.taskReadingDataAmount,
+        readingDataOnlyMain: wcplusState.taskReadingDataOnlyMain,
+        readingDataRefresh: wcplusState.taskReadingDataRefresh,
       }),
     });
     await loadWCPlusTasks(false);
@@ -2121,13 +2183,6 @@ async function createWCPlusTaskForAccount(account) {
 
 async function createWCPlusBatchTask() {
   readWCPlusOptionsFromDOM();
-  const account = wcplusState.selectedAccount;
-  const biz = wcplusAccountBiz(account);
-  if (!biz) {
-    wcplusState.message = "请先选择公众号。";
-    refreshWCPlusView();
-    return;
-  }
   wcplusState.loading = "创建 WC Plus 批量任务";
   wcplusState.message = "";
   refreshWCPlusView();
@@ -2135,38 +2190,15 @@ async function createWCPlusBatchTask() {
     const result = await apiFetch("/api/wcplus/batch-task/create", {
       method: "POST",
       body: JSON.stringify({
-        biz,
-        nickname: wcplusAccountNickname(account),
-        crawlerType: wcplusState.taskCrawlerType,
         articleListType: wcplusState.taskArticleListType,
+        articleListDate: wcplusState.taskArticleListDate,
         articleListAmount: wcplusState.taskArticleListAmount,
+        articleListOffset: wcplusState.taskArticleListOffset,
+        articleRefresh: wcplusState.taskArticleRefresh,
+        articleImgDownload: wcplusState.taskArticleImageDownload,
       }),
     });
     wcplusState.message = `批量任务已创建：${firstValue(result, ["task_id", "TaskID", "status", "Status"]) || "已提交"}`;
-    await loadWCPlusTasks(false);
-  } catch (error) {
-    wcplusState.message = error instanceof Error ? error.message : String(error);
-  } finally {
-    wcplusState.loading = "";
-    refreshWCPlusView();
-  }
-}
-
-async function controlWCPlusTask(task, action) {
-  if (!task?.task_id) {
-    wcplusState.message = "任务缺少 task_id。";
-    refreshWCPlusView();
-    return;
-  }
-  wcplusState.loading = "更新 WC Plus 任务";
-  wcplusState.message = "";
-  refreshWCPlusView();
-  try {
-    const updated = await apiFetch("/api/wcplus/task/control", {
-      method: "POST",
-      body: JSON.stringify({ task_id: task.task_id, action }),
-    });
-    wcplusState.message = `任务状态：${updated.status || action}`;
     await loadWCPlusTasks(false);
   } catch (error) {
     wcplusState.message = error instanceof Error ? error.message : String(error);

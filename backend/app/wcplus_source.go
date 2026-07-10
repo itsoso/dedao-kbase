@@ -112,19 +112,38 @@ type WCPlusImportAccountResult struct {
 }
 
 type WCPlusTask struct {
-	TaskID   string `json:"task_id"`
-	Biz      string `json:"biz,omitempty"`
-	Nickname string `json:"nickname,omitempty"`
-	Status   string `json:"status,omitempty"`
-	Message  string `json:"message,omitempty"`
+	TaskID          string `json:"task_id"`
+	Biz             string `json:"biz,omitempty"`
+	Nickname        string `json:"nickname,omitempty"`
+	CrawlerType     string `json:"crawler_type,omitempty"`
+	Status          string `json:"status,omitempty"`
+	StatusError     string `json:"status_error,omitempty"`
+	Message         string `json:"message,omitempty"`
+	ArticleTotal    int    `json:"article_total,omitempty"`
+	ArticleFinished int    `json:"article_finished,omitempty"`
+	ReadingTotal    int    `json:"reading_total,omitempty"`
+	ReadingFinished int    `json:"reading_finished,omitempty"`
+	CreatedAt       int64  `json:"created_at,omitempty"`
+	UpdatedAt       int64  `json:"updated_at,omitempty"`
 }
 
 type WCPlusTaskRequest struct {
-	Biz               string `json:"biz"`
-	Nickname          string `json:"nickname,omitempty"`
-	CrawlerType       string `json:"crawlerType,omitempty"`
-	ArticleListType   string `json:"articleListType,omitempty"`
-	ArticleListAmount int    `json:"articleListAmount,omitempty"`
+	Biz                  string `json:"biz"`
+	Nickname             string `json:"nickname,omitempty"`
+	ImageURL             string `json:"img,omitempty"`
+	CrawlerType          string `json:"crawlerType,omitempty"`
+	ArticleListType      string `json:"articleListType,omitempty"`
+	ArticleListDate      int64  `json:"articleListDate,omitempty"`
+	ArticleListAmount    int    `json:"articleListAmount,omitempty"`
+	ArticleListOffset    int    `json:"articleListOffset,omitempty"`
+	ArticleRefresh       bool   `json:"articleRefresh,omitempty"`
+	ArticleImageDownload bool   `json:"articleImgDownload,omitempty"`
+	ReadingDataType      string `json:"readingDataType,omitempty"`
+	ReadingDataStartDate int64  `json:"readingDataStartDate,omitempty"`
+	ReadingDataEndDate   int64  `json:"readingDataEndDate,omitempty"`
+	ReadingDataAmount    int    `json:"readingDataAmount,omitempty"`
+	ReadingDataOnlyMain  bool   `json:"readingDataOnlyMain,omitempty"`
+	ReadingDataRefresh   bool   `json:"readingDataRefresh,omitempty"`
 }
 
 type WCPlusTaskControlRequest struct {
@@ -637,16 +656,13 @@ func (s *WCPlusSourceService) BatchImportNicknames(ctx context.Context, req WCPl
 			result.Failed = append(result.Failed, WCPlusBatchImportItem{Nickname: nickname, Error: err.Error()})
 			continue
 		}
-		payload := map[string]any{
-			"crawlerType":     "gzh_article_link",
-			"biz":             account.Biz,
-			"nickname":        account.Nickname,
-			"articleListType": articleListType,
-		}
-		if req.ArticleListAmount > 0 {
-			payload["articleListAmount"] = req.ArticleListAmount
-		}
-		created, err := s.PostJSON(ctx, "/api/batch_task/create_task", payload)
+		created, err := s.CreateTask(ctx, WCPlusTaskRequest{
+			CrawlerType:       "gzh_article_link",
+			Biz:               account.Biz,
+			Nickname:          account.Nickname,
+			ArticleListType:   articleListType,
+			ArticleListAmount: req.ArticleListAmount,
+		})
 		if err != nil {
 			result.Failed = append(result.Failed, WCPlusBatchImportItem{Nickname: nickname, Biz: account.Biz, Error: err.Error()})
 			continue
@@ -654,8 +670,8 @@ func (s *WCPlusSourceService) BatchImportNicknames(ctx context.Context, req WCPl
 		item := WCPlusBatchImportItem{
 			Nickname: account.Nickname,
 			Biz:      account.Biz,
-			TaskID:   wcplusStringValue(created, "task_id", "TaskID", "id", "ID"),
-			Status:   wcplusStringValue(created, "status", "Status"),
+			TaskID:   created.TaskID,
+			Status:   created.Status,
 		}
 		result.Success = append(result.Success, item)
 	}
@@ -723,6 +739,7 @@ func (s *WCPlusSourceService) BatchImportNicknamesToKnowledge(ctx context.Contex
 func (s *WCPlusSourceService) waitForBatchTasks(ctx context.Context, items []WCPlusBatchImportItem, req WCPlusBatchImportRequest) (map[string]bool, []string) {
 	pending := map[string]WCPlusBatchImportItem{}
 	completed := map[string]bool{}
+	observed := map[string]bool{}
 	for _, item := range items {
 		taskID := strings.TrimSpace(item.TaskID)
 		if taskID != "" {
@@ -746,11 +763,14 @@ func (s *WCPlusSourceService) waitForBatchTasks(ctx context.Context, items []WCP
 		if err != nil {
 			return completed, []string{fmt.Sprintf("poll tasks: %v", err)}
 		}
+		visible := map[string]bool{}
 		for _, task := range tasks {
 			taskID := strings.TrimSpace(task.TaskID)
 			if _, ok := pending[taskID]; !ok {
 				continue
 			}
+			visible[taskID] = true
+			observed[taskID] = true
 			status := strings.ToLower(strings.TrimSpace(task.Status))
 			if wcplusTaskStatusComplete(status) {
 				completed[taskID] = true
@@ -759,6 +779,25 @@ func (s *WCPlusSourceService) waitForBatchTasks(ctx context.Context, items []WCP
 			}
 			if wcplusTaskStatusFailed(status) {
 				waitErrors = append(waitErrors, fmt.Sprintf("%s: task %s %s", pending[taskID].Nickname, taskID, status))
+				delete(pending, taskID)
+			}
+		}
+		for taskID, item := range pending {
+			if visible[taskID] || !observed[taskID] {
+				continue
+			}
+			verified, verifyErr := s.verifyWCPlusTaskArticleState(ctx, item)
+			if verified {
+				completed[taskID] = true
+				delete(pending, taskID)
+				continue
+			}
+			if attempt == attempts-1 {
+				message := fmt.Sprintf("%s: task %s outcome could not be verified", item.Nickname, taskID)
+				if verifyErr != nil {
+					message += ": " + verifyErr.Error()
+				}
+				waitErrors = append(waitErrors, message)
 				delete(pending, taskID)
 			}
 		}
@@ -778,6 +817,18 @@ func (s *WCPlusSourceService) waitForBatchTasks(ctx context.Context, items []WCP
 		waitErrors = append(waitErrors, fmt.Sprintf("%s: task %s did not complete", item.Nickname, taskID))
 	}
 	return completed, waitErrors
+}
+
+func (s *WCPlusSourceService) verifyWCPlusTaskArticleState(ctx context.Context, item WCPlusBatchImportItem) (bool, error) {
+	list, err := s.ListAccountArticles(ctx, WCPlusArticleListOptions{
+		Biz:      item.Biz,
+		Nickname: item.Nickname,
+		Num:      1,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(list.Articles) > 0, nil
 }
 
 func wcplusTaskStatusComplete(status string) bool {
@@ -850,11 +901,19 @@ func wcplusArticleFromAny(value any) WCPlusArticle {
 
 func wcplusTaskFromAny(value any) WCPlusTask {
 	return WCPlusTask{
-		TaskID:   wcplusStringValue(value, "task_id", "TaskID", "id", "ID"),
-		Biz:      wcplusStringValue(value, "biz", "Biz"),
-		Nickname: wcplusStringValue(value, "nickname", "Nickname", "name", "Name"),
-		Status:   wcplusStringValue(value, "status", "Status"),
-		Message:  wcplusStringValue(value, "message", "Message", "error", "Error"),
+		TaskID:          wcplusStringValue(value, "task_id", "TaskID", "id", "ID"),
+		Biz:             wcplusStringValue(value, "biz", "Biz"),
+		Nickname:        wcplusStringValue(value, "nickname", "Nickname", "name", "Name"),
+		CrawlerType:     wcplusStringValue(value, "crawler_type", "CrawlerType", "crawlerType"),
+		Status:          wcplusStringValue(value, "status", "Status"),
+		StatusError:     wcplusStringValue(value, "status_error", "StatusError", "statusError"),
+		Message:         wcplusStringValue(value, "message", "Message", "msg", "Msg", "error", "Error"),
+		ArticleTotal:    wcplusIntValue(value, "status_article_total_amount", "StatusArticleTotalAmount"),
+		ArticleFinished: wcplusIntValue(value, "status_article_finished_amount", "StatusArticleFinishedAmount"),
+		ReadingTotal:    wcplusIntValue(value, "status_reading_data_total_amount", "StatusReadingDataTotalAmount"),
+		ReadingFinished: wcplusIntValue(value, "status_reading_data_finished_amount", "StatusReadingDataFinishedAmount"),
+		CreatedAt:       int64(wcplusIntValue(value, "created_at", "CreatedAt")),
+		UpdatedAt:       int64(wcplusIntValue(value, "updated_at", "UpdatedAt")),
 	}
 }
 

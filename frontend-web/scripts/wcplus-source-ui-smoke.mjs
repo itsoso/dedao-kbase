@@ -40,7 +40,16 @@ for (const marker of [
   "createWCPlusTask",
   "createWCPlusTaskForAccount",
   "createWCPlusBatchTask",
-  "controlWCPlusTask",
+  "taskArticleListDate",
+  "taskArticleListOffset",
+  "taskArticleRefresh",
+  "taskArticleImageDownload",
+  "taskReadingDataType",
+  "taskReadingDataStartDate",
+  "taskReadingDataEndDate",
+  "taskReadingDataAmount",
+  "taskReadingDataOnlyMain",
+  "taskReadingDataRefresh",
   "runWCPlusQueue",
   "exportWCPlusAllArticlesXLSX",
 ]) {
@@ -104,6 +113,10 @@ for (const label of [
   "最近入库",
   "下载任务",
   "任务类型",
+  "阅读数据任务",
+  "文章刷新",
+  "下载正文图片",
+  "仅头条",
   "每页",
   "导入篇数",
   "最近导出",
@@ -126,6 +139,16 @@ for (const selector of [
   "name=\"taskCrawlerType\"",
   "name=\"taskArticleListType\"",
   "name=\"articleListAmount\"",
+  "name=\"articleListDate\"",
+  "name=\"articleListOffset\"",
+  "name=\"articleRefresh\"",
+  "name=\"articleImageDownload\"",
+  "name=\"readingDataType\"",
+  "name=\"readingDataStartDate\"",
+  "name=\"readingDataEndDate\"",
+  "name=\"readingDataAmount\"",
+  "name=\"readingDataOnlyMain\"",
+  "name=\"readingDataRefresh\"",
   "name=\"importLimit\"",
   "name=\"exportRecentNum\"",
   "name=\"batchArticleListType\"",
@@ -191,6 +214,10 @@ assert.ok(js.includes('data-wcplus-preview="${index}" ${id || articleURL ? "" : 
 assert.ok(js.includes('data-wcplus-import="${index}" ${id || articleURL ? "" : "disabled"}'), "WC Plus article list should import URL-only articles");
 assert.ok(js.includes("appmsgid"), "WC Plus UI should normalize alternate article id fields");
 assert.ok(js.includes("\"link\""), "WC Plus UI should normalize alternate article URL fields");
+assert.ok(js.includes('value="reading_data"'), "WC Plus task form should support reading-data tasks");
+assert.doesNotMatch(js, /data-wcplus-task-start/, "WC Plus UI must not expose unsupported per-task start actions");
+assert.doesNotMatch(js, /data-wcplus-task-stop/, "WC Plus UI must not expose unsupported per-task stop actions");
+assert.doesNotMatch(js, /async function controlWCPlusTask/, "WC Plus UI must not send unsupported task_id/action controls");
 assert.doesNotMatch(js, /WCPLUS_BASE_URL\s*=/, "web UI must not embed WC Plus base URL configuration");
 assert.doesNotMatch(js, /127\.0\.0\.1:5001/, "web UI should not hardcode the local WC Plus URL");
 

@@ -659,13 +659,13 @@ func TestKBaseHTTPHandlerChecksEnvAndBatchImportsWCPlusNicknames(t *testing.T) {
 			default:
 				fmt.Fprint(w, `{"Candidates":[],"Total":0}`)
 			}
-		case "/api/batch_task/create_task":
+		case "/api/task/new":
 			var payload map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Fatalf("decode create task body: %v", err)
 			}
 			created = append(created, payload)
-			fmt.Fprint(w, `{"success":true,"data":{"task_id":"batch-1","status":"ready"}}`)
+			fmt.Fprint(w, `{"success":true,"data":{"task_id":"task-1","status":"ready"}}`)
 		case "/api/task/control":
 			queueStarted = true
 			fmt.Fprint(w, `{"success":true,"data":{"status":"running"}}`)
