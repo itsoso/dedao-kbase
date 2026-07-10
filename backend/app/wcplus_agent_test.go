@@ -24,12 +24,13 @@ func TestWCPlusAgentExecutesLeasedRunEndToEnd(t *testing.T) {
 		calls = append(calls, call)
 	}
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/":
 			record("local-status")
-			fmt.Fprint(w, `{"ok":true}`)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, `<html><head><title>wcplusPro 9.483</title></head></html>`)
 		case "/api/report/gzh_articles":
+			w.Header().Set("Content-Type", "application/json")
 			record("local-list")
 			if r.URL.Query().Get("biz") != "biz-med" {
 				t.Fatalf("list biz = %q", r.URL.Query().Get("biz"))
@@ -40,6 +41,7 @@ func TestWCPlusAgentExecutesLeasedRunEndToEnd(t *testing.T) {
 				"total":1
 			}`)
 		case "/api/article/content":
+			w.Header().Set("Content-Type", "application/json")
 			record("local-content")
 			fmt.Fprint(w, `{
 				"ID":"article-1",
@@ -78,6 +80,10 @@ func TestWCPlusAgentExecutesLeasedRunEndToEnd(t *testing.T) {
 	wantCursor := `{"published_at":"2026-07-10","source_item_key":"article-1"}`
 	if subscription.Cursor != wantCursor {
 		t.Fatalf("subscription cursor = %q, want %q", subscription.Cursor, wantCursor)
+	}
+	agents, err := harness.Sync.ListAgents()
+	if err != nil || len(agents) != 1 || agents[0].WCPlusVersion != "9.483" {
+		t.Fatalf("source agents = %#v, err=%v", agents, err)
 	}
 	books, err := harness.Books.ListBooks()
 	if err != nil || len(books) != 1 || books[0].SourceKey != "article-1" {

@@ -117,6 +117,7 @@ func (a *WCPlusAgent) RunOnce(ctx context.Context) (WCPlusAgentCycleResult, erro
 		Version:       a.version,
 		Capabilities:  a.capabilities,
 		WCPlusHealthy: result.WCPlusHealthy,
+		WCPlusVersion: status.Version,
 		LastError:     lastError,
 	}); err != nil {
 		return result, fmt.Errorf("send source-agent heartbeat: %w", err)

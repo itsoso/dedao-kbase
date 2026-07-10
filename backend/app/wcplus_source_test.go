@@ -28,6 +28,12 @@ func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 			if got := r.URL.Query().Get("biz"); got != "biz-1" {
 				t.Fatalf("biz = %q", got)
 			}
+			if got := r.URL.Query().Get("sort"); got != "p_date" {
+				t.Fatalf("default sort = %q", got)
+			}
+			if got := r.URL.Query().Get("direction"); got != "desc" {
+				t.Fatalf("default direction = %q", got)
+			}
 			fmt.Fprint(w, `{"success":true,"data":{"gzh":{"biz":"biz-1","nickname":"医学参考"},"articles":[{"id":"wx-1","title":"验证文章","nickname":"医学参考","url":"https://mp.weixin.qq.com/s/wx1","digest":"摘要","publish_time":"2026-07-06"}],"total":1}}`)
 		case "/api/article/content":
 			if got := r.URL.Query().Get("nickname"); got != "医学参考" {
@@ -547,7 +553,7 @@ func TestWCPlusSourceProxiesSearchReportsExportsAndBatchTasks(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/":
-			fmt.Fprint(w, `<html>wcplus</html>`)
+			fmt.Fprint(w, `<html><head><title>wcplusPro 9.483</title></head></html>`)
 		case "/api/gzh/search":
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			if got := r.URL.Query().Get("q"); got != "医学" {
@@ -624,7 +630,7 @@ func TestWCPlusSourceProxiesSearchReportsExportsAndBatchTasks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Status returned error: %v", err)
 	}
-	if !status.OK || status.StatusCode != http.StatusOK {
+	if !status.OK || status.StatusCode != http.StatusOK || status.Version != "9.483" {
 		t.Fatalf("unexpected status: %#v", status)
 	}
 

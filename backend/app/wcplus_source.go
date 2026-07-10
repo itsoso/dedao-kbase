@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -154,8 +155,11 @@ type WCPlusTaskControlRequest struct {
 type WCPlusStatus struct {
 	OK         bool   `json:"ok"`
 	StatusCode int    `json:"status_code,omitempty"`
+	Version    string `json:"version,omitempty"`
 	Message    string `json:"message,omitempty"`
 }
+
+var wcplusVersionTitlePattern = regexp.MustCompile(`(?i)<title>\s*wcplusPro\s+([^<\s]+)\s*</title>`)
 
 type WCPlusEnvCheck struct {
 	Name    string `json:"name"`
@@ -262,8 +266,16 @@ func (s *WCPlusSourceService) ListAccountArticles(ctx context.Context, opts WCPl
 	values.Set("offset", strconv.Itoa(nonNegative(opts.Offset)))
 	values.Set("num", strconv.Itoa(positiveOr(opts.Num, 20)))
 	setOptionalQuery(values, "nickname", opts.Nickname)
-	setOptionalQuery(values, "sort", opts.Sort)
-	setOptionalQuery(values, "direction", opts.Direction)
+	sortField := strings.TrimSpace(opts.Sort)
+	if sortField == "" {
+		sortField = "p_date"
+	}
+	direction := strings.TrimSpace(opts.Direction)
+	if direction == "" {
+		direction = "desc"
+	}
+	values.Set("sort", sortField)
+	values.Set("direction", direction)
 	var payload any
 	if err := s.get(ctx, "/api/report/gzh_articles", values, &payload); err != nil {
 		return nil, err
@@ -553,10 +565,15 @@ func (s *WCPlusSourceService) Status(ctx context.Context) (*WCPlusStatus, error)
 		return &WCPlusStatus{OK: false, Message: err.Error()}, nil
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	version := ""
+	if matches := wcplusVersionTitlePattern.FindSubmatch(body); len(matches) == 2 {
+		version = strings.TrimSpace(string(matches[1]))
+	}
 	return &WCPlusStatus{
 		OK:         resp.StatusCode >= 200 && resp.StatusCode < 400,
 		StatusCode: resp.StatusCode,
+		Version:    version,
 		Message:    resp.Status,
 	}, nil
 }

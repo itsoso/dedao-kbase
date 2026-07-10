@@ -106,7 +106,7 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 桌面版 `/wcplus-source` 默认也使用同源 `/api/*`。如果 Wails 桌面壳没有和 kbase HTTP 服务同源运行，在页面顶部的 `KBase API Base URL` 填入 kbase 地址，例如 `http://127.0.0.1:8719`，并确保本机已写入 `KBASE_AUTH_TOKEN` 对应的 Bearer token。kbase 只允许 Wails/localhost/127.0.0.1 这类桌面来源跨域调用 `/api/*`，不会对任意网页开放 CORS。
 
-推荐使用“本地 Agent + 在线 KBase 控制面”：`wcplus-agent` 只访问本机 loopback WC Plus API，并通过出站 HTTPS 租用同步任务、上传文章和回报计数。不要把 WC Plus 的 `127.0.0.1:5001` 通过公网隧道暴露，也不要把微信 cookie 或 WC Plus 请求参数上传到 KBase。
+推荐使用“本地 Agent + 在线 KBase 控制面”：`wcplus-agent` 只访问本机 loopback WC Plus API，并通过出站 HTTPS 租用同步任务、上传文章和回报计数。不要把 WC Plus 的 loopback API 通过公网隧道暴露，也不要把微信 cookie 或 WC Plus 请求参数上传到 KBase。
 
 在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`。该 token 必须与浏览器/API 使用的 `KBASE_AUTH_TOKEN` 分离，并使用不含空格的可打印 ASCII 字符。
 
@@ -116,7 +116,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 export KBASE_REMOTE_URL="https://kbase.example.invalid"
 export KBASE_SOURCE_AGENT_ID="wcplus-agent-1"
 export KBASE_SOURCE_AGENT_TOKEN="replace-with-source-agent-secret"
-export WCPLUSPRO_BASE_URL="http://127.0.0.1:5001"
+# 以 WC Plus 当前界面或启动日志显示的 API 端口为准；9.483 实测为 5002。
+export WCPLUSPRO_BASE_URL="http://127.0.0.1:5002"
 export WCPLUS_AGENT_STATE_DIR="./state/wcplus-agent"
 ```
 
@@ -141,7 +142,7 @@ bash scripts/uninstall-wcplus-agent-macos.sh --delete-state --delete-logs
 
 使用删除参数时，状态和日志目录必须通过对应环境变量提供绝对路径；这是防止从错误工作目录删除相对路径的保护措施。
 
-Agent 优先读取 `WCPLUSPRO_BASE_URL`，也兼容 `WCPLUS_BASE_URL`，两者都未设置时使用 `http://127.0.0.1:5001`。出于安全边界，Agent 会拒绝非 loopback WC Plus 地址。
+Agent 优先读取 `WCPLUSPRO_BASE_URL`，也兼容 `WCPLUS_BASE_URL`。WC Plus 9.483 实测使用 `http://127.0.0.1:5002`，旧版和旧文档可能使用 `5001`；请以 WC Plus 当前界面或启动日志显示的端口为准。两者都未设置时，Agent 为兼容旧版仍回退到 `http://127.0.0.1:5001`。出于安全边界，Agent 会拒绝非 loopback WC Plus 地址。
 
 旧的同机直连模式仍可用于诊断。WC Plus API 暂时不可达时，可在“本地 API 诊断”中使用手动导入，或选择 `.txt` / `.md` 文件填入正文后再导入。
 
