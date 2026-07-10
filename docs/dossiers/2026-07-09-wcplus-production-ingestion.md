@@ -3,7 +3,7 @@
 ## Status
 
 - **Current stage:** S7 - verification and rollout
-- **Delivery status:** Tasks 1-9 complete; Checkpoints A-D pass; Task 10 in progress
+- **Delivery status:** Server and heartbeat stage deployed; G6 article validation blocked by locked local Mac
 - **Architecture decision:** approved
 - **Last updated:** 2026-07-10
 
@@ -204,7 +204,7 @@ returned `ok`.
   SHA-256 published in the official Go release metadata. The initial module
   download through `proxy.golang.org` timed out; the successful retry used an
   HTTPS Go module mirror without disabling `go.sum` verification.
-- Pre-deploy backup identifier: pending G5.
+- Pre-deploy backup identifier: `20260710162043`.
 
 ## G4 Independent Review
 
@@ -216,6 +216,41 @@ redaction and truncation, crash-safe outbox replay, atomic knowledge manifests,
 and rollback behavior. Findings were fixed in `7f40949`; the race detector then
 passed for the ingestion server and Agent packages.
 
+## G5 Deployment Evidence
+
+**Decision:** PASS
+
+The server and static control plane were deployed from the checked release
+artifacts. The service returned to `active` with the expected Linux binary hash.
+Before enabling source authentication, both loopback and public source-agent
+routes returned `503` as designed. Existing health, books, search, reader, WC
+Plus diagnostics, public Bearer API access, and control-plane static assets all
+passed production probes.
+
+The dedicated source-agent token was then configured separately from the admin
+token. Unauthenticated source requests returned `401`; an authenticated empty
+lease preflight returned `200` and no run. The native Agent was installed with
+a `0600` LaunchAgent plist and the recorded binary hash. Production now reports
+one Agent at version `0.1.0`, `wcplus_healthy=false`, zero subscriptions, and
+zero runs. This is the correct non-leasing state while the local acquisition
+service is unavailable.
+
+## G6 Production Validation
+
+**Decision:** BLOCKED
+
+The local Mac was locked during the staged real-path run. The vendor-supported
+Terminal launch path could not run while locked, and the local WC Plus port was
+therefore unavailable. The installed Agent reported that state accurately and
+did not lease work. No production article, subscription, or synthetic content
+was created.
+
+Resume after the Mac is unlocked and WC Plus 9.483 is listening on its displayed
+loopback port. Then execute, in order: `doctor`, one selected article, unchanged
+replay, one bounded account sync, restart recovery, outbox replay, and one
+scheduled subscription. Record only run IDs, book IDs, counters, and failure
+reasons.
+
 ## Gate Ledger
 
 | Gate | Status | Evidence | Next action |
@@ -224,25 +259,26 @@ passed for the ingestion server and Agent packages.
 | G2 Feasibility/risk | PASS WITH CONSTRAINTS | Design documents auth, loopback, privacy, idempotency, and rollback | Start Task 1 |
 | G3 Tests | PASS | Fresh Go tests/vet/race, Vue build, Web smokes, packaging, privacy, and diff checks passed | Preserve tested commit and artifact hashes |
 | G4 Review | PASS | Auth, leases, transactions, idempotency, limits, redaction, outbox, atomic writes, and rollback reviewed; findings fixed in `7f40949` | Preserve release diff |
-| G5 Deploy health | PENDING | No new runtime deployed | Deploy from clean main after G4 |
-| G6 Production validation | PENDING | No production local-to-online run yet | Execute staged validation with user |
+| G5 Deploy health | PASS | Backup `20260710162043`; expected server hash; existing endpoints, disabled-by-default state, dedicated auth, and heartbeat verified | Preserve backup through G6 |
+| G6 Production validation | BLOCKED | Mac locked; WC Plus unavailable; Agent healthy as a process but correctly reports source unhealthy; no production data created | Unlock Mac, start WC Plus, then run staged sequence |
 
 ## Pending Decisions
 
-No design decision blocks Task 10. Production source-agent authentication and
-the first bounded subscription remain disabled until the capability-only
-deployment passes existing-path checks.
+No design decision blocks Task 10. The remaining dependency is an unlocked Mac
+with WC Plus running. Source-agent authentication is enabled, but the first
+bounded subscription remains intentionally absent until G6 resumes.
 
 ## Rollback
 
 - Disable source-agent token configuration and scheduler leasing.
 - Unload the local Agent while preserving its outbox.
+- Restore server/static/env state from backup `20260710162043` if G5 regresses.
 - Keep existing imported knowledge and source-sync audit records.
 - Continue using direct local proxy or manual import.
 
 ## Completion Record
 
-Not shipped. Tasks 1-9 and Checkpoints A-D are complete on the feature branch.
-Release artifact hashes, the pre-deploy backup identifier, production run IDs,
-outcome counters, and user confirmation are recorded only after G5/G6 produce
-direct evidence.
+Not shipped. Tasks 1-9, Checkpoints A-D, release artifacts, G5 deployment, and
+the heartbeat-only stage are complete. G6 production article runs, outcome
+counters, REST knowledge links, and user-visible confirmation remain blocked
+until the local Mac is unlocked and WC Plus is running.
