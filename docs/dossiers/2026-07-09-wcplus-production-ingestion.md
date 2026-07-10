@@ -2,8 +2,8 @@
 
 ## Status
 
-- **Current stage:** S4 - requirement decomposition
-- **Delivery status:** ready for implementation
+- **Current stage:** S5 - implementation
+- **Delivery status:** Checkpoint B implementation verified; live WC Plus contract validation blocked
 - **Architecture decision:** approved
 - **Last updated:** 2026-07-09
 
@@ -121,13 +121,52 @@ The task-level file changes, failing tests, verification commands, and commit
 boundaries are defined in the implementation plan. Implementation must stop at
 checkpoints A-E when evidence is missing or a gate is red.
 
+## S5 Implementation Progress
+
+Completed commits:
+
+- `c3ebac5` corrects per-account task creation, task normalization, completion
+  verification, and the Web diagnostics contract.
+- `be49404` adds the SQLite source agents, subscriptions, runs, items,
+  documents, receipts, leases, retries, and terminal-state model.
+- `93d64c3` separates source-agent authentication from browser/admin
+  authentication and adds the source control APIs and request limits.
+- `4a7ac3d` adds server-computed content hashes, idempotency receipts,
+  new/updated/skipped outcomes, bounded chunks, and per-chunk provenance.
+
+Checkpoint evidence:
+
+- **Checkpoint A: BLOCKED for live confirmation.** Contract and regression
+  tests pass, but the local WC Plus endpoint at loopback port 5001 timed out on
+  2026-07-09. No real response fixture was captured.
+- **Checkpoint B: PASS for the server slice.** Source state, token isolation,
+  request limits, restart persistence, idempotent replay, update preservation,
+  failed-write behavior, search discovery, and chunk citations are covered by
+  passing tests.
+
+Verification executed after Task 4:
+
+```text
+go test ./... -count=1
+go vet ./...
+node frontend-web/scripts/wcplus-source-ui-smoke.mjs
+node frontend-web/scripts/book-knowledge-web-smoke.mjs
+node frontend-web/scripts/kbase-token-header-smoke.mjs
+node --check frontend-web/app.js
+bash scripts/privacy-smoke.sh
+git diff --check
+```
+
+All commands passed. Building the local Agent remains gated on a sanitized
+live WC Plus contract check, as required by Checkpoint A.
+
 ## Gate Ledger
 
 | Gate | Status | Evidence | Next action |
 | --- | --- | --- | --- |
 | G1 Admission | PASS | User confirmed local Agent plus online control plane | Preserve approved scope |
 | G2 Feasibility/risk | PASS WITH CONSTRAINTS | Design documents auth, loopback, privacy, idempotency, and rollback | Start Task 1 |
-| G3 Tests | PENDING | Full matrix not yet run for implementation | Complete Tasks 1-9 |
+| G3 Tests | IN PROGRESS | Tasks 1-4 and Checkpoint B local matrix pass; Tasks 5-9 remain | Validate live WC Plus contract, then build Agent |
 | G4 Review | PENDING | Security/data path requires independent review | Review after G3 |
 | G5 Deploy health | PENDING | No new runtime deployed | Deploy from clean main after G4 |
 | G6 Production validation | PENDING | No real local-to-online run yet | Execute staged validation with user |
@@ -146,6 +185,6 @@ initial subscription interval and maximum articles per run.
 
 ## Completion Record
 
-Not shipped. Fill in commit IDs, artifact hashes, backup identifier, production
-run IDs, outcome counters, and user confirmation only after the corresponding
-gates pass.
+Not shipped. Tasks 1-4 are committed on the feature branch. Fill in artifact
+hashes, backup identifier, production run IDs, outcome counters, and user
+confirmation only after the corresponding gates pass.
