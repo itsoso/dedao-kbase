@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,10 +28,9 @@ var wcplusAgentCapabilities = []string{
 type environmentLookup func(string) (string, bool)
 
 type wcplusAgentRuntime struct {
-	config *app.SourceAgentConfig
 	client *app.SourceAgentClient
 	wcplus *app.WCPlusSourceService
-	outbox *app.SourceAgentOutbox
+	agent  *app.WCPlusAgent
 }
 
 func main() {
@@ -115,7 +113,6 @@ func newWCPlusAgentRuntime(config app.SourceAgentConfig, withOutbox bool) (*wcpl
 		return nil, err
 	}
 	runtime := &wcplusAgentRuntime{
-		config: &config,
 		client: client,
 		wcplus: app.NewWCPlusSourceService(app.WCPlusSourceConfig{
 			BaseURL:    config.WCPlusBaseURL,
@@ -123,8 +120,22 @@ func newWCPlusAgentRuntime(config app.SourceAgentConfig, withOutbox bool) (*wcpl
 		}),
 	}
 	if withOutbox {
-		runtime.outbox, err = app.NewSourceAgentOutbox(config.StateDir)
+		outbox, outboxErr := app.NewSourceAgentOutbox(config.StateDir)
+		if outboxErr != nil {
+			return nil, outboxErr
+		}
+		runtime.agent, err = app.NewWCPlusAgent(app.WCPlusAgentConfig{
+			Client:           client,
+			WCPlus:           runtime.wcplus,
+			Outbox:           outbox,
+			Version:          wcplusAgentVersion,
+			Capabilities:     wcplusAgentCapabilities,
+			LeaseDuration:    2 * time.Minute,
+			TaskPollAttempts: 30,
+			TaskPollInterval: 2 * time.Second,
+		})
 		if err != nil {
+			_ = outbox.Close()
 			return nil, err
 		}
 	}
@@ -132,8 +143,8 @@ func newWCPlusAgentRuntime(config app.SourceAgentConfig, withOutbox bool) (*wcpl
 }
 
 func (r *wcplusAgentRuntime) close() {
-	if r != nil && r.outbox != nil {
-		_ = r.outbox.Close()
+	if r != nil && r.agent != nil {
+		_ = r.agent.Close()
 	}
 }
 
@@ -160,83 +171,11 @@ func (r *wcplusAgentRuntime) doctor(ctx context.Context, output io.Writer) error
 	})
 }
 
-func (r *wcplusAgentRuntime) once(ctx context.Context) (map[string]any, error) {
-	status, err := r.wcplus.Status(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("check local WC Plus: %w", err)
+func (r *wcplusAgentRuntime) once(ctx context.Context) (app.WCPlusAgentCycleResult, error) {
+	if r.agent == nil {
+		return app.WCPlusAgentCycleResult{}, fmt.Errorf("WC Plus agent executor is not configured")
 	}
-	healthy := status != nil && status.OK
-	lastError := ""
-	if !healthy && status != nil {
-		lastError = status.Message
-	}
-	if _, err := r.client.Heartbeat(ctx, app.SourceAgentHeartbeat{
-		Version:       wcplusAgentVersion,
-		Capabilities:  wcplusAgentCapabilities,
-		WCPlusHealthy: healthy,
-		LastError:     lastError,
-	}); err != nil {
-		return nil, fmt.Errorf("send source-agent heartbeat: %w", err)
-	}
-	flushed, err := r.flushOutbox(ctx)
-	if err != nil {
-		return nil, err
-	}
-	leased := false
-	if healthy {
-		run, err := r.client.Lease(ctx, wcplusAgentCapabilities, 2*time.Minute)
-		if err != nil {
-			return nil, fmt.Errorf("lease source sync run: %w", err)
-		}
-		if run != nil {
-			leased = true
-			message := "leased run execution is not available until the WC Plus executor is installed"
-			_, failErr := r.client.FailRun(ctx, run.ID, message)
-			if failErr != nil {
-				return nil, fmt.Errorf("%s; report failure: %w", message, failErr)
-			}
-			return nil, errors.New(message)
-		}
-	}
-	return map[string]any{
-		"ok":             true,
-		"wcplus_healthy": healthy,
-		"outbox_flushed": flushed,
-		"leased":         leased,
-	}, nil
-}
-
-func (r *wcplusAgentRuntime) flushOutbox(ctx context.Context) (int, error) {
-	if r.outbox == nil {
-		return 0, nil
-	}
-	items, err := r.outbox.PeekReady(50)
-	if err != nil {
-		return 0, fmt.Errorf("read source-agent outbox: %w", err)
-	}
-	flushed := 0
-	for _, item := range items {
-		if _, err := r.client.UploadArticle(ctx, item.RunID, item.Envelope); err != nil {
-			statusCode := 0
-			var httpErr *app.SourceAgentHTTPError
-			if errors.As(err, &httpErr) {
-				statusCode = httpErr.StatusCode
-			}
-			updated, recordErr := r.outbox.RecordFailure(item.ID, statusCode, err)
-			if recordErr != nil {
-				return flushed, fmt.Errorf("record outbox delivery failure: %w", recordErr)
-			}
-			if updated.State == app.SourceOutboxDead {
-				return flushed, fmt.Errorf("source outbox item %s moved to dead letter: %w", item.ID, err)
-			}
-			continue
-		}
-		if err := r.outbox.Acknowledge(item.ID); err != nil {
-			return flushed, fmt.Errorf("acknowledge source outbox item: %w", err)
-		}
-		flushed++
-	}
-	return flushed, nil
+	return r.agent.RunOnce(ctx)
 }
 
 func lookupValue(lookup environmentLookup, key string) string {

@@ -189,19 +189,46 @@ func (c *SourceAgentClient) UploadArticle(ctx context.Context, runID string, env
 	return response.Receipt, nil
 }
 
-func (c *SourceAgentClient) CompleteRun(ctx context.Context, runID string) (SourceSyncRun, error) {
-	return c.finishRun(ctx, runID, "complete", "")
+func (c *SourceAgentClient) ReportItemFailure(ctx context.Context, runID, sourceItemKey, idempotencyKey, message string) (SourceSyncItem, error) {
+	payload := struct {
+		AgentID        string `json:"agent_id"`
+		SourceItemKey  string `json:"source_item_key"`
+		IdempotencyKey string `json:"idempotency_key"`
+		Error          string `json:"error"`
+	}{
+		AgentID:        c.agentID,
+		SourceItemKey:  strings.TrimSpace(sourceItemKey),
+		IdempotencyKey: strings.TrimSpace(idempotencyKey),
+		Error:          strings.TrimSpace(message),
+	}
+	var response struct {
+		Item SourceSyncItem `json:"item"`
+	}
+	requestPath := "/api/source-agent/runs/" + url.PathEscape(strings.TrimSpace(runID)) + "/items"
+	if err := c.doJSON(ctx, http.MethodPost, requestPath, payload, &response); err != nil {
+		return SourceSyncItem{}, err
+	}
+	return response.Item, nil
+}
+
+func (c *SourceAgentClient) CompleteRun(ctx context.Context, runID string, cursor ...string) (SourceSyncRun, error) {
+	cursorValue := ""
+	if len(cursor) > 0 {
+		cursorValue = strings.TrimSpace(cursor[0])
+	}
+	return c.finishRun(ctx, runID, "complete", "", cursorValue)
 }
 
 func (c *SourceAgentClient) FailRun(ctx context.Context, runID, message string) (SourceSyncRun, error) {
-	return c.finishRun(ctx, runID, "fail", strings.TrimSpace(message))
+	return c.finishRun(ctx, runID, "fail", strings.TrimSpace(message), "")
 }
 
-func (c *SourceAgentClient) finishRun(ctx context.Context, runID, action, message string) (SourceSyncRun, error) {
+func (c *SourceAgentClient) finishRun(ctx context.Context, runID, action, message, cursor string) (SourceSyncRun, error) {
 	payload := struct {
 		AgentID string `json:"agent_id"`
 		Error   string `json:"error,omitempty"`
-	}{AgentID: c.agentID, Error: message}
+		Cursor  string `json:"cursor,omitempty"`
+	}{AgentID: c.agentID, Error: message, Cursor: cursor}
 	var response struct {
 		Run SourceSyncRun `json:"run"`
 	}

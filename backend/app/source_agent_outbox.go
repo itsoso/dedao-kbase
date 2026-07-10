@@ -167,14 +167,30 @@ func (o *SourceAgentOutbox) Enqueue(runID string, envelope SourceArticleEnvelope
 }
 
 func (o *SourceAgentOutbox) PeekReady(limit int) ([]SourceAgentOutboxItem, error) {
+	return o.peekReady("", limit)
+}
+
+func (o *SourceAgentOutbox) PeekReadyForRun(runID string, limit int) ([]SourceAgentOutboxItem, error) {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return nil, fmt.Errorf("run_id is required")
+	}
+	return o.peekReady(runID, limit)
+}
+
+func (o *SourceAgentOutbox) peekReady(runID string, limit int) ([]SourceAgentOutboxItem, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 50
 	}
-	rows, err := o.db.Query(sourceAgentOutboxSelect+`
-		WHERE state = ? AND next_attempt_at_ns <= ?
-		ORDER BY created_at_ns, id
-		LIMIT ?
-	`, SourceOutboxPending, o.now().UTC().UnixNano(), limit)
+	query := sourceAgentOutboxSelect + ` WHERE state = ? AND next_attempt_at_ns <= ?`
+	args := []any{SourceOutboxPending, o.now().UTC().UnixNano()}
+	if runID != "" {
+		query += ` AND run_id = ?`
+		args = append(args, runID)
+	}
+	query += ` ORDER BY created_at_ns, id LIMIT ?`
+	args = append(args, limit)
+	rows, err := o.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -188,6 +204,13 @@ func (o *SourceAgentOutbox) PeekReady(limit int) ([]SourceAgentOutboxItem, error
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func (o *SourceAgentOutbox) CountPendingForRun(runID string) (int, error) {
+	var count int
+	err := o.db.QueryRow(`SELECT COUNT(*) FROM source_agent_outbox WHERE run_id = ? AND state = ?`,
+		strings.TrimSpace(runID), SourceOutboxPending).Scan(&count)
+	return count, err
 }
 
 func (o *SourceAgentOutbox) Acknowledge(id string) error {

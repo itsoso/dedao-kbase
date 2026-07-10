@@ -96,24 +96,25 @@ type SourceSubscription struct {
 }
 
 type SourceSyncRun struct {
-	ID                 string `json:"id"`
-	SubscriptionID     string `json:"subscription_id"`
-	AgentID            string `json:"agent_id,omitempty"`
-	RequestedOperation string `json:"requested_operation"`
-	Status             string `json:"status"`
-	Attempt            int    `json:"attempt"`
-	RetryOf            string `json:"retry_of,omitempty"`
-	LeaseOwner         string `json:"lease_owner,omitempty"`
-	LeaseExpiresAt     string `json:"lease_expires_at,omitempty"`
-	NewCount           int    `json:"new_count"`
-	UpdatedCount       int    `json:"updated_count"`
-	SkippedCount       int    `json:"skipped_count"`
-	FailedCount        int    `json:"failed_count"`
-	Error              string `json:"error,omitempty"`
-	CreatedAt          string `json:"created_at"`
-	UpdatedAt          string `json:"updated_at"`
-	StartedAt          string `json:"started_at,omitempty"`
-	FinishedAt         string `json:"finished_at,omitempty"`
+	ID                 string              `json:"id"`
+	SubscriptionID     string              `json:"subscription_id"`
+	AgentID            string              `json:"agent_id,omitempty"`
+	RequestedOperation string              `json:"requested_operation"`
+	Status             string              `json:"status"`
+	Attempt            int                 `json:"attempt"`
+	RetryOf            string              `json:"retry_of,omitempty"`
+	LeaseOwner         string              `json:"lease_owner,omitempty"`
+	LeaseExpiresAt     string              `json:"lease_expires_at,omitempty"`
+	NewCount           int                 `json:"new_count"`
+	UpdatedCount       int                 `json:"updated_count"`
+	SkippedCount       int                 `json:"skipped_count"`
+	FailedCount        int                 `json:"failed_count"`
+	Error              string              `json:"error,omitempty"`
+	CreatedAt          string              `json:"created_at"`
+	UpdatedAt          string              `json:"updated_at"`
+	StartedAt          string              `json:"started_at,omitempty"`
+	FinishedAt         string              `json:"finished_at,omitempty"`
+	Subscription       *SourceSubscription `json:"subscription,omitempty"`
 }
 
 type SourceSyncItemInput struct {
@@ -692,7 +693,7 @@ func (s *SourceSyncStore) RecordRunItem(runID, agentID string, input SourceSyncI
 	return s.getRunItem(run.ID, input.SourceItemKey)
 }
 
-func (s *SourceSyncStore) CompleteRun(runID, agentID string) (SourceSyncRun, error) {
+func (s *SourceSyncStore) CompleteRun(runID, agentID string, cursor ...string) (SourceSyncRun, error) {
 	tx, run, err := s.beginOwnedRunTransition(runID, agentID, SourceRunRunning)
 	if err != nil {
 		return SourceSyncRun{}, err
@@ -733,7 +734,16 @@ func (s *SourceSyncStore) CompleteRun(runID, agentID string) (SourceSyncRun, err
 		return SourceSyncRun{}, ErrSourceRunInvalidState
 	}
 	if status == SourceRunSucceeded || status == SourceRunPartial {
-		if _, err := tx.Exec(`UPDATE source_subscriptions SET last_success_at = ?, updated_at = ? WHERE id = ?`, now, now, run.SubscriptionID); err != nil {
+		cursorValue := ""
+		if len(cursor) > 0 {
+			cursorValue = strings.TrimSpace(cursor[0])
+		}
+		if _, err := tx.Exec(`
+			UPDATE source_subscriptions SET
+				cursor_value = CASE WHEN ? = '' THEN cursor_value ELSE ? END,
+				last_success_at = ?, updated_at = ?
+			WHERE id = ?
+		`, cursorValue, cursorValue, now, now, run.SubscriptionID); err != nil {
 			return SourceSyncRun{}, err
 		}
 	}
@@ -801,7 +811,8 @@ func (s *SourceSyncStore) RequeueExpiredRuns() (int64, error) {
 	result, err := s.db.Exec(`
 		UPDATE source_sync_runs SET
 			status = ?, lease_owner = '', lease_expires_at = '', started_at = '', updated_at = ?
-		WHERE status IN (?, ?) AND lease_expires_at != '' AND lease_expires_at <= ?
+		WHERE status IN (?, ?) AND lease_expires_at != ''
+			AND julianday(lease_expires_at) <= julianday(?)
 	`, SourceRunQueued, now, SourceRunLeased, SourceRunRunning, now)
 	if err != nil {
 		return 0, err

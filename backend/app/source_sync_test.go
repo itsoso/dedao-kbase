@@ -257,6 +257,37 @@ func TestSourceSyncStoreRecoversExpiredLeaseAndRetries(t *testing.T) {
 	}
 }
 
+func TestSourceSyncStoreRequeuesLeaseExpiredDuringFractionalSecond(t *testing.T) {
+	clock := newSourceSyncTestClock(time.Date(2026, 7, 9, 18, 0, 0, 0, time.UTC))
+	store, err := newSourceSyncStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	defer store.Close()
+	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wcplus_wechat_article",
+		SourceAccountKey: "biz-fractional",
+		SourceAccount:    "Fractional Clock",
+		Operation:        "existing_articles",
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	if _, err := store.CreateRun(subscription.ID, ""); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := store.LeaseNextRun("agent-a", []string{"existing_articles"}, time.Minute); err != nil {
+		t.Fatalf("lease run: %v", err)
+	}
+
+	clock.Advance(time.Minute + 500*time.Millisecond)
+	requeued, err := store.RequeueExpiredRuns()
+	if err != nil || requeued != 1 {
+		t.Fatalf("requeue fractional-second expiry = %d, err=%v", requeued, err)
+	}
+}
+
 func TestSourceSyncStoreLeasesRunOnce(t *testing.T) {
 	store, err := NewSourceSyncStore(t.TempDir())
 	if err != nil {

@@ -787,6 +787,12 @@ func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Requ
 				h.writeSourceSyncError(w, err)
 				return
 			}
+			subscription, err := h.sourceSync.GetSubscription(started.SubscriptionID)
+			if err != nil {
+				h.writeSourceSyncError(w, err)
+				return
+			}
+			started.Subscription = &subscription
 			run = &started
 		}
 		writeHTTPJSON(w, http.StatusOK, map[string]any{"run": run})
@@ -805,9 +811,24 @@ func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.R
 	case "items":
 		var payload struct {
 			AgentID string `json:"agent_id"`
+			Error   string `json:"error,omitempty"`
 			SourceArticleEnvelope
 		}
 		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		if strings.TrimSpace(payload.Error) != "" && strings.TrimSpace(payload.Content) == "" {
+			item, err := h.sourceSync.RecordRunItem(runID, payload.AgentID, SourceSyncItemInput{
+				SourceItemKey:  payload.SourceItemID,
+				IdempotencyKey: payload.IdempotencyKey,
+				Outcome:        SourceItemFailed,
+				Error:          trimRunes(payload.Error, 1000),
+			})
+			if err != nil {
+				h.writeSourceSyncError(w, err)
+				return
+			}
+			writeHTTPJSON(w, http.StatusCreated, map[string]any{"item": item})
 			return
 		}
 		if h.sourceIngest == nil {
@@ -823,11 +844,12 @@ func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.R
 	case "complete":
 		var payload struct {
 			AgentID string `json:"agent_id"`
+			Cursor  string `json:"cursor,omitempty"`
 		}
 		if !h.decodeSourceAgentJSON(w, r, &payload) {
 			return
 		}
-		run, err := h.sourceSync.CompleteRun(runID, payload.AgentID)
+		run, err := h.sourceSync.CompleteRun(runID, payload.AgentID, trimRunes(payload.Cursor, 1000))
 		if err != nil {
 			h.writeSourceSyncError(w, err)
 			return
