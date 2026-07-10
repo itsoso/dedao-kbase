@@ -2,10 +2,10 @@
 
 ## Status
 
-- **Current stage:** S5 - implementation
-- **Delivery status:** Checkpoint B implementation verified; live WC Plus contract validation blocked
+- **Current stage:** S7 - verification and rollout
+- **Delivery status:** Tasks 1-9 complete; Checkpoints A-D pass; Task 10 in progress
 - **Architecture decision:** approved
-- **Last updated:** 2026-07-09
+- **Last updated:** 2026-07-10
 
 ## S0 Intake
 
@@ -133,32 +133,88 @@ Completed commits:
   authentication and adds the source control APIs and request limits.
 - `4a7ac3d` adds server-computed content hashes, idempotency receipts,
   new/updated/skipped outcomes, bounded chunks, and per-chunk provenance.
+- `fa37893` accepts the current WC Plus account-list response shape.
+- `4684138` adds the outbound-only local Agent client and durable SQLite
+  outbox.
+- `5a7b02c` executes leased article and reading-data runs end to end.
+- `ad41258` adds conservative subscription scheduling and lease recovery.
+- `c627941` adds the wide Web source control plane with agent,
+  subscription, run, retry, and REST knowledge-document workflows.
+- `fd2f7f5` packages the native macOS Agent as a bounded user LaunchAgent.
+- `7f40949` adds atomic knowledge writes, concurrent-ingestion protection,
+  diagnostic limits, and source/admin token separation checks.
+- `cf1efa4` aligns article-list defaults with WC Plus 9.483 and reports the
+  observed WC Plus version through Agent heartbeats.
 
 Checkpoint evidence:
 
-- **Checkpoint A: BLOCKED for live confirmation.** Contract and regression
-  tests pass, but the local WC Plus endpoint at loopback port 5001 timed out on
-  2026-07-09. No real response fixture was captured.
+- **Checkpoint A: PASS.** A local WC Plus 9.483 instance was observed on its
+  displayed loopback port (`5002`). Account, article-list, and article-content
+  calls succeeded. The live article-list contract requires `sort=p_date` and
+  `direction=desc`; both are now defaulted and covered by regression tests.
+  Only response field shapes were inspected; no account name, article title,
+  body, cookie, or request-parameter record was retained.
 - **Checkpoint B: PASS for the server slice.** Source state, token isolation,
   request limits, restart persistence, idempotent replay, update preservation,
   failed-write behavior, search discovery, and chunk citations are covered by
   passing tests.
+- **Checkpoint C: PASS for the isolated end-to-end path.** One real local
+  existing article was processed through `wcplus-agent once` into an isolated
+  KBase control plane. The run finished `succeeded` with `uploaded=1`,
+  `failed=0`, `outbox_remaining=0`, and server counters `new=1`, `updated=0`,
+  `skipped=0`, `failed=0`. The resulting private knowledge document contained
+  one chapter, one bounded chunk, one citation, and complete provenance. All
+  temporary article and knowledge data was deleted after validation.
+- **Checkpoint D: PASS.** Desktop and mobile browser checks covered agent
+  health/version, subscriptions, runs, item failures, retry/cancel actions,
+  detail drawers, and REST-style knowledge links. Legacy direct-proxy tools
+  remain collapsed under diagnostics.
 
-Verification executed after Task 4:
+Verification executed through Task 9 and the live-contract correction:
 
 ```text
 go test ./... -count=1
 go vet ./...
+go test -race ./backend/app ./cmd/kbase-server ./cmd/wcplus-agent -count=1
+node frontend-web/scripts/wcplus-control-plane-smoke.mjs
 node frontend-web/scripts/wcplus-source-ui-smoke.mjs
 node frontend-web/scripts/book-knowledge-web-smoke.mjs
 node frontend-web/scripts/kbase-token-header-smoke.mjs
 node --check frontend-web/app.js
+bash scripts/wcplus-agent-packaging-smoke.sh
 bash scripts/privacy-smoke.sh
 git diff --check
 ```
 
-All commands passed. Building the local Agent remains gated on a sanitized
-live WC Plus contract check, as required by Checkpoint A.
+The fresh final Task 10 matrix passed before release artifact creation. The
+Vue build emitted its existing eval and large-chunk warnings but returned zero;
+the race run emitted macOS linker warnings but all three tested packages
+returned `ok`.
+
+## Release Artifacts
+
+- Source commit: `cf1efa4d2dd58f7ff09d12112d5e0b4582d907f1`
+- Clean source archive SHA-256:
+  `f94f0844091919682113fc9f620cff7b5bb4fc4f5d5ae430dbc340887d3052d0`
+- Native macOS `arm64` Agent SHA-256:
+  `f17dd26ddb174734ee5c1b747253107a0a6c6d9c705c39da8dadbb08d00ae1cd`
+- Linux `x86-64` server SHA-256:
+  `c9064e9faebe0460699fe88d8cfc96f0ff3c0eaba627b067f456b90d5a6fcde7`
+- Linux build used Go 1.23.0 after checking the toolchain archive against
+  SHA-256 published in the official Go release metadata. The initial module
+  download through `proxy.golang.org` timed out; the successful retry used an
+  HTTPS Go module mirror without disabling `go.sum` verification.
+- Pre-deploy backup identifier: pending G5.
+
+## G4 Independent Review
+
+**Decision:** PASS
+
+The review covered dedicated-token route isolation, lease ownership and expiry,
+SQLite transactions, idempotency receipts, upload/request limits, diagnostic
+redaction and truncation, crash-safe outbox replay, atomic knowledge manifests,
+and rollback behavior. Findings were fixed in `7f40949`; the race detector then
+passed for the ingestion server and Agent packages.
 
 ## Gate Ledger
 
@@ -166,15 +222,16 @@ live WC Plus contract check, as required by Checkpoint A.
 | --- | --- | --- | --- |
 | G1 Admission | PASS | User confirmed local Agent plus online control plane | Preserve approved scope |
 | G2 Feasibility/risk | PASS WITH CONSTRAINTS | Design documents auth, loopback, privacy, idempotency, and rollback | Start Task 1 |
-| G3 Tests | IN PROGRESS | Tasks 1-4 and Checkpoint B local matrix pass; Tasks 5-9 remain | Validate live WC Plus contract, then build Agent |
-| G4 Review | PENDING | Security/data path requires independent review | Review after G3 |
+| G3 Tests | PASS | Fresh Go tests/vet/race, Vue build, Web smokes, packaging, privacy, and diff checks passed | Preserve tested commit and artifact hashes |
+| G4 Review | PASS | Auth, leases, transactions, idempotency, limits, redaction, outbox, atomic writes, and rollback reviewed; findings fixed in `7f40949` | Preserve release diff |
 | G5 Deploy health | PENDING | No new runtime deployed | Deploy from clean main after G4 |
-| G6 Production validation | PENDING | No real local-to-online run yet | Execute staged validation with user |
+| G6 Production validation | PENDING | No production local-to-online run yet | Execute staged validation with user |
 
 ## Pending Decisions
 
-None block Task 1. Before scheduled synchronization is enabled, confirm the
-initial subscription interval and maximum articles per run.
+No design decision blocks Task 10. Production source-agent authentication and
+the first bounded subscription remain disabled until the capability-only
+deployment passes existing-path checks.
 
 ## Rollback
 
@@ -185,6 +242,7 @@ initial subscription interval and maximum articles per run.
 
 ## Completion Record
 
-Not shipped. Tasks 1-4 are committed on the feature branch. Fill in artifact
-hashes, backup identifier, production run IDs, outcome counters, and user
-confirmation only after the corresponding gates pass.
+Not shipped. Tasks 1-9 and Checkpoints A-D are complete on the feature branch.
+Release artifact hashes, the pre-deploy backup identifier, production run IDs,
+outcome counters, and user confirmation are recorded only after G5/G6 produce
+direct evidence.
