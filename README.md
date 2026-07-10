@@ -86,6 +86,7 @@ flowchart LR
 ```bash
 cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
+KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
@@ -101,22 +102,48 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 ### 微信/WC Plus 来源工作台
 
-在线 Web UI 新增 `/wechat-source` 和 `/wcplus-source`。所有浏览器请求都走 kbase 的 Bearer 代理；浏览器不会直接访问本机 WC Plus 端口。
+在线 Web UI 新增 `/wechat-source` 和 `/wcplus-source`。`/wcplus-source` 是来源控制面，可查看本地 Agent 心跳、WC Plus 健康状态、订阅和同步运行；旧的直连代理工具收在“本地 API 诊断”中。浏览器不会直接访问本机 WC Plus 端口。
 
 桌面版 `/wcplus-source` 默认也使用同源 `/api/*`。如果 Wails 桌面壳没有和 kbase HTTP 服务同源运行，在页面顶部的 `KBase API Base URL` 填入 kbase 地址，例如 `http://127.0.0.1:8719`，并确保本机已写入 `KBASE_AUTH_TOKEN` 对应的 Bearer token。kbase 只允许 Wails/localhost/127.0.0.1 这类桌面来源跨域调用 `/api/*`，不会对任意网页开放 CORS。
 
+推荐使用“本地 Agent + 在线 KBase 控制面”：`wcplus-agent` 只访问本机 loopback WC Plus API，并通过出站 HTTPS 租用同步任务、上传文章和回报计数。不要把 WC Plus 的 `127.0.0.1:5001` 通过公网隧道暴露，也不要把微信 cookie 或 WC Plus 请求参数上传到 KBase。
+
+在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`。该 token 必须与浏览器/API 使用的 `KBASE_AUTH_TOKEN` 分离，并使用不含空格的可打印 ASCII 字符。
+
+本机 Agent 配置契约：
+
 ```bash
-KBASE_AUTH_TOKEN="replace-with-long-secret" \
-KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
-WCPLUS_BASE_URL="http://127.0.0.1:5001" \
-go run ./cmd/kbase-server --addr 127.0.0.1:8719
+export KBASE_REMOTE_URL="https://kbase.example.invalid"
+export KBASE_SOURCE_AGENT_ID="wcplus-agent-1"
+export KBASE_SOURCE_AGENT_TOKEN="replace-with-source-agent-secret"
+export WCPLUSPRO_BASE_URL="http://127.0.0.1:5001"
+export WCPLUS_AGENT_STATE_DIR="./state/wcplus-agent"
 ```
 
-`WCPLUS_BASE_URL` 必须指向 kbase 服务端可访问的 WC Plus API。若 kbase 部署在线上服务器，而 WC Plus 只运行在个人 Mac 上，线上服务器无法访问个人 Mac 的 `127.0.0.1:5001`；此时需要把 WC Plus API 放到服务器可达的地址、在同一台机器上运行 kbase 与 WC Plus，或在 `/wcplus-source` 使用“手动导入知识库”粘贴 WC Plus 导出的正文。
+构建、检查和安装用户级 LaunchAgent：
 
-兼容 wcplusPro 的环境变量名：未设置 `WCPLUS_BASE_URL` 时，服务端会读取 `WCPLUSPRO_BASE_URL` 作为 fallback；如果两者都设置，`WCPLUS_BASE_URL` 优先。
+```bash
+bash scripts/build-wcplus-agent-macos.sh --check
+bash scripts/build-wcplus-agent-macos.sh
+bash scripts/install-wcplus-agent-macos.sh --check
+build/bin/wcplus-agent doctor
+bash scripts/install-wcplus-agent-macos.sh
+```
 
-`/wcplus-source` 的“环境检查”会显示 kbase 服务端实际访问的 WC Plus 地址，并可一键复制诊断信息。WC Plus API 暂时不可达时，可在“手动导入知识库”粘贴正文，或选择 `.txt` / `.md` 文件填入正文后再导入。
+安装器会将相对状态路径解析为安装时的绝对路径，生成权限为 `600` 的 LaunchAgent plist，并只在进程异常退出时按受限间隔重启。可用 `WCPLUS_AGENT_LOG_DIR`、`WCPLUS_AGENT_INSTALL_DIR`、`WCPLUS_AGENT_PLIST_PATH`、`WCPLUS_AGENT_POLL_SECONDS` 和 `WCPLUS_AGENT_RESTART_SECONDS` 覆盖默认值。
+
+卸载默认保留 SQLite outbox 和日志，避免未上传数据丢失：
+
+```bash
+bash scripts/uninstall-wcplus-agent-macos.sh
+bash scripts/uninstall-wcplus-agent-macos.sh --delete-state --delete-logs
+```
+
+使用删除参数时，状态和日志目录必须通过对应环境变量提供绝对路径；这是防止从错误工作目录删除相对路径的保护措施。
+
+Agent 优先读取 `WCPLUSPRO_BASE_URL`，也兼容 `WCPLUS_BASE_URL`，两者都未设置时使用 `http://127.0.0.1:5001`。出于安全边界，Agent 会拒绝非 loopback WC Plus 地址。
+
+旧的同机直连模式仍可用于诊断。WC Plus API 暂时不可达时，可在“本地 API 诊断”中使用手动导入，或选择 `.txt` / `.md` 文件填入正文后再导入。
 
 常用代理接口：
 
