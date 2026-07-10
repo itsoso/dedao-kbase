@@ -73,6 +73,27 @@ const wcplusState = {
   message: "",
 };
 
+const sourceControlState = {
+  agents: [],
+  subscriptions: [],
+  runs: [],
+  selectedSubscriptionID: "",
+  selectedRunID: "",
+  runDetail: null,
+  runFilter: "all",
+  legacyDiagnosticsOpen: false,
+  loading: "",
+  message: "",
+  draft: {
+    sourceAccountKey: "",
+    sourceAccount: "",
+    sourceAgentID: "",
+    sourceOperation: "sync_content",
+    sourceScheduleMode: "manual",
+    sourceIntervalSeconds: 3600,
+  },
+};
+
 const knowledgeState = {
   books: [],
   selectedBook: null,
@@ -84,6 +105,8 @@ const knowledgeState = {
 };
 
 let isWCPlusBootstrapped = false;
+let sourceControlPollTimer = null;
+let sourceControlLoadSequence = 0;
 
 function getToken() {
   for (const key of tokenKeys) {
@@ -311,6 +334,19 @@ function getBookID() {
     return normalizeReaderBookID(decodeURIComponent(raw));
   } catch {
     return normalizeReaderBookID(raw);
+  }
+}
+
+function getKnowledgeBookID() {
+  const prefix = "/book-knowledge/";
+  if (!window.location.pathname.startsWith(prefix)) {
+    return "";
+  }
+  const raw = window.location.pathname.slice(prefix.length).split("/")[0];
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
   }
 }
 
@@ -591,22 +627,357 @@ function renderWeChatSource() {
 }
 
 function renderWCPlusPage() {
-  const status = wcplusState.loading
-    ? `<div class="web-status">处理中：${escapeHTML(wcplusState.loading)}</div>`
-    : (wcplusState.message ? `<div class="web-status">${escapeHTML(wcplusState.message)}</div>` : "");
   renderShell(`
-    <main class="wechat-source wcplus-page">
-      <section class="wechat-source__header">
-        <div>
-          <p class="web-kicker">WC Plus Source</p>
-          <h1>WC Plus 公众号工作台</h1>
-        </div>
-        ${status}
-      </section>
-      ${renderWCPlusSource(false)}
+    <main class="source-control">
+      ${renderSourceControlPlane()}
+      <details id="wcplus-legacy-diagnostics" class="source-control__legacy" ${sourceControlState.legacyDiagnosticsOpen ? "open" : ""}>
+        <summary>本地 API 诊断</summary>
+        ${renderWCPlusSource(false)}
+      </details>
+      ${renderSourceRunDrawer()}
     </main>
   `, "wcplus");
+  bindSourceControlEvents();
   bindWCPlusEvents();
+}
+
+function renderSourceControlPlane() {
+  const status = sourceControlState.loading
+    ? `<div class="web-status">处理中：${escapeHTML(sourceControlState.loading)}</div>`
+    : (sourceControlState.message ? `<div class="web-status">${escapeHTML(sourceControlState.message)}</div>` : "");
+  return `
+    <section class="source-control__header">
+      <div>
+        <p class="web-kicker">Source Control</p>
+        <h1>来源控制台</h1>
+      </div>
+      <div class="source-control__header-actions">
+        ${status}
+        <button id="source-control-refresh" class="button button-ghost" type="button">刷新</button>
+      </div>
+    </section>
+    <div class="source-control__layout">
+      <aside class="source-control__sidebar">
+        ${renderSourceAgentList()}
+        ${renderSourceSubscriptionList()}
+      </aside>
+      <section class="source-control__workspace">
+        ${renderSourceRunHistory()}
+      </section>
+    </div>
+  `;
+}
+
+function renderSourceAgentList() {
+  const rows = sourceControlState.agents.map((agent) => {
+    const online = sourceAgentIsOnline(agent);
+    const capabilities = Array.isArray(agent.capabilities) ? agent.capabilities : [];
+    return `
+      <article class="source-control__agent ${online ? "is-online" : "is-offline"}">
+        <div class="source-control__item-head">
+          <strong>${escapeHTML(agent.agent_id || "未命名 Agent")}</strong>
+          <span class="source-control__status ${online ? "is-ok" : "is-muted"}">${online ? "在线" : "离线"}</span>
+        </div>
+        <dl class="source-control__facts">
+          <div><dt>心跳</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_heartbeat_at))}</dd></div>
+          <div><dt>Agent</dt><dd>${escapeHTML(agent.version || "-")}</dd></div>
+          <div><dt>WC Plus</dt><dd class="${agent.wcplus_healthy ? "is-ok" : "is-bad"}">${agent.wcplus_healthy ? "可用" : "不可用"}${agent.wcplus_version ? ` · ${escapeHTML(agent.wcplus_version)}` : ""}</dd></div>
+        </dl>
+        <div class="source-control__capabilities">
+          ${capabilities.map((capability) => `<span>${escapeHTML(capability)}</span>`).join("") || "<span>无能力上报</span>"}
+        </div>
+        ${agent.last_error ? `<p class="source-control__error">${escapeHTML(agent.last_error)}</p>` : ""}
+      </article>
+    `;
+  }).join("");
+  return `
+    <section class="source-control__section">
+      <div class="source-control__section-head">
+        <h2>本地 Agent</h2>
+        <span>${sourceControlState.agents.length}</span>
+      </div>
+      <div class="source-control__agent-list">
+        ${rows || '<p class="web-muted">尚未收到 Agent 心跳。</p>'}
+      </div>
+    </section>
+  `;
+}
+
+function renderSourceSubscriptionList() {
+  const draft = sourceControlState.draft;
+  const agentOptions = sourceControlState.agents.map((agent) => `
+    <option value="${escapeAttribute(agent.agent_id)}" ${draft.sourceAgentID === agent.agent_id ? "selected" : ""}>${escapeHTML(agent.agent_id)}</option>
+  `).join("");
+  const rows = sourceControlState.subscriptions.map((subscription, index) => {
+    const active = subscription.id === sourceControlState.selectedSubscriptionID ? " active" : "";
+    return `
+      <article class="source-control__subscription${active}">
+        <button class="source-control__subscription-select" type="button" data-source-subscription-index="${index}">
+          <strong>${escapeHTML(subscription.source_account || subscription.source_account_key)}</strong>
+          <span>${escapeHTML(subscription.operation || "existing_articles")} · ${escapeHTML(formatSourceSchedule(subscription.schedule))}</span>
+        </button>
+        <div class="source-control__subscription-actions">
+          <label class="source-control__toggle">
+            <input type="checkbox" data-source-subscription-enabled="${index}" ${subscription.enabled ? "checked" : ""}>
+            <span>启用</span>
+          </label>
+          <button class="button button-ghost" type="button" data-source-subscription-sync="${index}">立即同步</button>
+        </div>
+      </article>
+    `;
+  }).join("");
+  return `
+    <section class="source-control__section source-control__subscriptions">
+      <div class="source-control__section-head">
+        <h2>订阅</h2>
+        <span>${sourceControlState.subscriptions.length}</span>
+      </div>
+      <form id="source-subscription-form" class="source-control__form">
+        <h3>新建订阅</h3>
+        <label>
+          <span>公众号标识</span>
+          <input name="sourceAccountKey" value="${escapeAttribute(draft.sourceAccountKey)}" placeholder="biz 或稳定来源键" required>
+        </label>
+        <label>
+          <span>公众号名称</span>
+          <input name="sourceAccount" value="${escapeAttribute(draft.sourceAccount)}" placeholder="显示名称">
+        </label>
+        <label>
+          <span>执行 Agent</span>
+          <select name="sourceAgentID">
+            <option value="">自动分配</option>
+            ${agentOptions}
+          </select>
+        </label>
+        <label>
+          <span>同步范围</span>
+          <select name="sourceOperation">
+            <option value="existing_articles" ${draft.sourceOperation === "existing_articles" ? "selected" : ""}>已有文章</option>
+            <option value="sync_links" ${draft.sourceOperation === "sync_links" ? "selected" : ""}>刷新链接</option>
+            <option value="sync_content" ${draft.sourceOperation === "sync_content" ? "selected" : ""}>链接与正文</option>
+            <option value="sync_reading_data" ${draft.sourceOperation === "sync_reading_data" ? "selected" : ""}>阅读数据</option>
+          </select>
+        </label>
+        <div class="source-control__schedule-fields">
+          <label>
+            <span>计划</span>
+            <select name="sourceScheduleMode">
+              <option value="manual" ${draft.sourceScheduleMode === "manual" ? "selected" : ""}>手动</option>
+              <option value="interval" ${draft.sourceScheduleMode === "interval" ? "selected" : ""}>固定间隔</option>
+            </select>
+          </label>
+          <label>
+            <span>间隔秒数</span>
+            <input name="sourceIntervalSeconds" type="number" min="60" max="31536000" value="${escapeAttribute(draft.sourceIntervalSeconds)}" ${draft.sourceScheduleMode === "interval" ? "" : "disabled"}>
+          </label>
+        </div>
+        <button class="button button-primary" type="submit">创建订阅</button>
+      </form>
+      <div class="source-control__subscription-list">
+        ${rows || '<p class="web-muted">暂无订阅。</p>'}
+      </div>
+    </section>
+  `;
+}
+
+function renderSourceRunHistory() {
+  const subscription = selectedSourceSubscription();
+  if (!subscription) {
+    return `
+      <div class="source-control__empty">
+        <h2>运行历史</h2>
+        <p>选择或新建订阅后显示同步运行。</p>
+      </div>
+    `;
+  }
+  const filters = [
+    ["all", "全部"],
+    ["queued", "等待中"],
+    ["running", "运行中"],
+    ["partial", "部分完成"],
+    ["failed", "失败"],
+    ["succeeded", "已完成"],
+  ];
+  const subscriptionRuns = sourceControlState.runs.filter((run) => run.subscription_id === subscription.id);
+  const visibleRuns = subscriptionRuns.filter((run) => sourceRunMatchesFilter(run, sourceControlState.runFilter));
+  const rows = visibleRuns.map((run) => {
+    const active = sourceRunIsActive(run);
+    const canRetry = run.status === "failed" || run.status === "partial";
+    return `
+      <article class="source-control__run ${sourceRunStatusClass(run.status)}">
+        <div class="source-control__run-main">
+          <div class="source-control__item-head">
+            <span class="source-control__status">${escapeHTML(sourceRunStatusLabel(run.status))}</span>
+            <time>${escapeHTML(formatSourceControlTime(run.created_at))}</time>
+          </div>
+          <strong>${escapeHTML(run.requested_operation || subscription.operation)}</strong>
+          <span class="source-control__run-id">${escapeHTML(run.id)}</span>
+          <div class="source-control__counters">
+            <span>新增 <b>${run.new_count || 0}</b></span>
+            <span>更新 <b>${run.updated_count || 0}</b></span>
+            <span>跳过 <b>${run.skipped_count || 0}</b></span>
+            <span>失败 <b>${run.failed_count || 0}</b></span>
+          </div>
+          ${run.error ? `<p class="source-control__error">${escapeHTML(run.error)}</p>` : ""}
+        </div>
+        <div class="source-control__run-actions">
+          <button class="button button-ghost" type="button" data-source-run-detail="${escapeAttribute(run.id)}">详情</button>
+          ${canRetry ? `<button class="button button-ghost" type="button" data-source-run-retry="${escapeAttribute(run.id)}">重试</button>` : ""}
+          ${active ? `<button class="button button-ghost" type="button" data-source-run-cancel="${escapeAttribute(run.id)}">取消</button>` : ""}
+        </div>
+      </article>
+    `;
+  }).join("");
+  return `
+    <div class="source-control__workspace-head">
+      <div>
+        <p class="web-kicker">${escapeHTML(subscription.source_account_key)}</p>
+        <h2>${escapeHTML(subscription.source_account || subscription.source_account_key)}</h2>
+        <p>${escapeHTML(subscription.operation)} · ${escapeHTML(formatSourceSchedule(subscription.schedule))}</p>
+      </div>
+      <button class="button button-primary" type="button" data-source-subscription-sync="${sourceControlState.subscriptions.indexOf(subscription)}">立即同步</button>
+    </div>
+    <div class="source-control__history-head">
+      <h3>运行历史</h3>
+      <span>${subscriptionRuns.length}</span>
+    </div>
+    <div class="source-control__filters" role="tablist" aria-label="运行状态">
+      ${filters.map(([value, label]) => `
+        <button class="${sourceControlState.runFilter === value ? "active" : ""}" type="button" role="tab" data-source-run-filter="${value}" aria-selected="${sourceControlState.runFilter === value}">${label}</button>
+      `).join("")}
+    </div>
+    <div class="source-control__run-list">
+      ${rows || '<p class="web-muted">当前筛选下没有运行记录。</p>'}
+    </div>
+  `;
+}
+
+function renderSourceRunDrawer() {
+  const detail = sourceControlState.runDetail;
+  if (!detail?.run) {
+    return "";
+  }
+  const run = detail.run;
+  const items = Array.isArray(detail.items) ? detail.items : [];
+  const active = sourceRunIsActive(run);
+  const canRetry = run.status === "failed" || run.status === "partial";
+  const itemRows = items.map((item) => `
+    <article class="source-control__drawer-item ${item.outcome === "failed" ? "is-failed" : ""}">
+      <div class="source-control__item-head">
+        <strong>${escapeHTML(item.source_item_key || item.id)}</strong>
+        <span class="source-control__status">${escapeHTML(item.outcome || "unknown")}</span>
+      </div>
+      ${item.error ? `<p class="source-control__error">${escapeHTML(item.error)}</p>` : ""}
+      ${item.target_book_id ? `<a class="button button-link" href="${sourceKnowledgeURL(item.target_book_id)}">导入知识</a>` : ""}
+    </article>
+  `).join("");
+  return `
+    <aside class="source-control__drawer" role="dialog" aria-label="运行详情">
+      <div class="source-control__drawer-head">
+        <div>
+          <p class="web-kicker">${escapeHTML(sourceRunStatusLabel(run.status))}</p>
+          <h2>运行详情</h2>
+        </div>
+        <div class="source-control__drawer-actions">
+          ${canRetry ? `<button class="button button-ghost" type="button" data-source-run-retry="${escapeAttribute(run.id)}">重试</button>` : ""}
+          ${active ? `<button class="button button-ghost" type="button" data-source-run-cancel="${escapeAttribute(run.id)}">取消</button>` : ""}
+          <button class="button button-ghost" type="button" data-source-drawer-close>关闭</button>
+        </div>
+      </div>
+      <dl class="source-control__facts source-control__drawer-facts">
+        <div><dt>运行 ID</dt><dd>${escapeHTML(run.id)}</dd></div>
+        <div><dt>操作</dt><dd>${escapeHTML(run.requested_operation || "-")}</dd></div>
+        <div><dt>开始</dt><dd>${escapeHTML(formatSourceControlTime(run.started_at || run.created_at))}</dd></div>
+        <div><dt>结束</dt><dd>${escapeHTML(formatSourceControlTime(run.finished_at))}</dd></div>
+      </dl>
+      <div class="source-control__counters is-drawer">
+        <span>新增 <b>${run.new_count || 0}</b></span>
+        <span>更新 <b>${run.updated_count || 0}</b></span>
+        <span>跳过 <b>${run.skipped_count || 0}</b></span>
+        <span>失败 <b>${run.failed_count || 0}</b></span>
+      </div>
+      ${run.error ? `<p class="source-control__error">${escapeHTML(run.error)}</p>` : ""}
+      <section class="source-control__drawer-items">
+        <div class="source-control__history-head"><h3>条目</h3><span>${items.length}</span></div>
+        ${itemRows || '<p class="web-muted">暂无条目。</p>'}
+      </section>
+    </aside>
+  `;
+}
+
+function selectedSourceSubscription() {
+  return sourceControlState.subscriptions.find((subscription) => subscription.id === sourceControlState.selectedSubscriptionID) || null;
+}
+
+function sourceAgentIsOnline(agent, now = Date.now()) {
+  const heartbeat = Date.parse(String(agent?.last_heartbeat_at || ""));
+  return Number.isFinite(heartbeat) && heartbeat <= now + 5000 && now - heartbeat <= 90000;
+}
+
+function sourceRunIsActive(run) {
+  return ["queued", "leased", "running"].includes(String(run?.status || ""));
+}
+
+function sourceRunMatchesFilter(run, filter) {
+  if (filter === "all") {
+    return true;
+  }
+  if (filter === "queued") {
+    return run.status === "queued" || run.status === "leased";
+  }
+  return run.status === filter;
+}
+
+function sourceRunStatusLabel(status) {
+  return ({
+    queued: "等待中",
+    leased: "已分配",
+    running: "运行中",
+    partial: "部分完成",
+    failed: "失败",
+    succeeded: "已完成",
+    canceled: "已取消",
+  })[status] || status || "未知";
+}
+
+function sourceRunStatusClass(status) {
+  return `is-${String(status || "unknown").replace(/[^a-z0-9_-]/gi, "")}`;
+}
+
+function sourceKnowledgeURL(bookID) {
+  return `/book-knowledge/${encodeURIComponent(String(bookID || "").trim())}`;
+}
+
+function formatSourceControlTime(value) {
+  if (!value) {
+    return "-";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return String(value);
+  }
+  return parsed.toLocaleString("zh-CN", { hour12: false });
+}
+
+function formatSourceSchedule(schedule) {
+  const value = String(schedule || "manual").trim();
+  if (value === "manual") {
+    return "手动";
+  }
+  const seconds = Number.parseInt(value.replace(/^interval:/, ""), 10);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return value;
+  }
+  if (seconds % 86400 === 0) {
+    return `每 ${seconds / 86400} 天`;
+  }
+  if (seconds % 3600 === 0) {
+    return `每 ${seconds / 3600} 小时`;
+  }
+  if (seconds % 60 === 0) {
+    return `每 ${seconds / 60} 分钟`;
+  }
+  return `每 ${seconds} 秒`;
 }
 
 function refreshWCPlusView() {
@@ -615,6 +986,354 @@ function refreshWCPlusView() {
     return;
   }
   renderWeChatSource();
+}
+
+async function bootstrapSourceControlPlane() {
+  sourceControlState.message = "";
+  await loadSourceControlPlane();
+}
+
+async function loadSourceControlPlane({ silent = false, renderResult = true } = {}) {
+  const sequence = ++sourceControlLoadSequence;
+  const previousSignature = sourceControlDataSignature();
+  let shouldRender = !silent;
+  if (!silent) {
+    sourceControlState.loading = "加载来源状态";
+    sourceControlState.message = "";
+    renderWCPlusPage();
+  }
+  try {
+    const [agentPayload, subscriptionPayload, runPayload] = await Promise.all([
+      apiFetch("/api/source-agents"),
+      apiFetch("/api/source-subscriptions"),
+      apiFetch("/api/source-sync/runs?limit=200"),
+    ]);
+    if (sequence !== sourceControlLoadSequence) {
+      return;
+    }
+    sourceControlState.agents = Array.isArray(agentPayload.agents) ? agentPayload.agents : [];
+    sourceControlState.subscriptions = Array.isArray(subscriptionPayload.subscriptions) ? subscriptionPayload.subscriptions : [];
+    sourceControlState.runs = Array.isArray(runPayload.runs) ? runPayload.runs : [];
+    if (!sourceControlState.draft.sourceAgentID && sourceControlState.agents.length === 1) {
+      sourceControlState.draft.sourceAgentID = sourceControlState.agents[0].agent_id || "";
+    }
+    const selectedStillExists = sourceControlState.subscriptions.some((subscription) => subscription.id === sourceControlState.selectedSubscriptionID);
+    if (!selectedStillExists) {
+      sourceControlState.selectedSubscriptionID = sourceControlState.subscriptions[0]?.id || "";
+      sourceControlState.selectedRunID = "";
+      sourceControlState.runDetail = null;
+    }
+    if (sourceControlState.selectedRunID) {
+      try {
+        const detail = await apiFetch(`/api/source-sync/runs/${encodeURIComponent(sourceControlState.selectedRunID)}`);
+        if (sequence === sourceControlLoadSequence) {
+          sourceControlState.runDetail = detail;
+        }
+      } catch {
+        sourceControlState.selectedRunID = "";
+        sourceControlState.runDetail = null;
+      }
+    }
+    shouldRender = shouldRender || previousSignature !== sourceControlDataSignature();
+    sourceControlState.message = `${sourceControlState.agents.length} 个 Agent · ${sourceControlState.subscriptions.length} 个订阅 · ${sourceControlState.runs.length} 次运行`;
+  } catch (error) {
+    if (sequence === sourceControlLoadSequence) {
+      sourceControlState.message = error instanceof Error ? error.message : String(error);
+      shouldRender = true;
+    }
+  } finally {
+    if (sequence === sourceControlLoadSequence) {
+      sourceControlState.loading = "";
+      if (renderResult && shouldRender) {
+        renderWCPlusPage();
+      }
+      scheduleSourceControlPoll();
+    }
+  }
+}
+
+function sourceControlDataSignature() {
+  return JSON.stringify({
+    agents: sourceControlState.agents,
+    subscriptions: sourceControlState.subscriptions,
+    runs: sourceControlState.runs,
+    runDetail: sourceControlState.runDetail,
+  });
+}
+
+function scheduleSourceControlPoll() {
+  if (sourceControlPollTimer) {
+    clearTimeout(sourceControlPollTimer);
+    sourceControlPollTimer = null;
+  }
+  if (!window.location.pathname.startsWith("/wcplus-source")) {
+    return;
+  }
+  if (!sourceControlState.runs.some(sourceRunIsActive)) {
+    return;
+  }
+  sourceControlPollTimer = setTimeout(() => {
+    sourceControlPollTimer = null;
+    loadSourceControlPlane({ silent: true });
+  }, 5000);
+}
+
+function bindSourceControlEvents() {
+  document.querySelector("#source-control-refresh")?.addEventListener("click", () => {
+    loadSourceControlPlane();
+  });
+  const form = document.querySelector("#source-subscription-form");
+  form?.addEventListener("input", () => {
+    readSourceSubscriptionDraft();
+  });
+  form?.addEventListener("change", (event) => {
+    readSourceSubscriptionDraft();
+    if (event.target?.name === "sourceScheduleMode") {
+      const intervalInput = form.querySelector('[name="sourceIntervalSeconds"]');
+      if (intervalInput) {
+        intervalInput.disabled = sourceControlState.draft.sourceScheduleMode !== "interval";
+      }
+    }
+  });
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    readSourceSubscriptionDraft();
+    await createSourceSubscription();
+  });
+  for (const button of document.querySelectorAll("[data-source-subscription-index]")) {
+    button.addEventListener("click", () => {
+      const index = Number(button.getAttribute("data-source-subscription-index") || "0");
+      const subscription = sourceControlState.subscriptions[index];
+      if (!subscription) {
+        return;
+      }
+      sourceControlState.selectedSubscriptionID = subscription.id;
+      sourceControlState.selectedRunID = "";
+      sourceControlState.runDetail = null;
+      sourceControlState.runFilter = "all";
+      renderWCPlusPage();
+      scheduleSourceControlPoll();
+    });
+  }
+  for (const input of document.querySelectorAll("[data-source-subscription-enabled]")) {
+    input.addEventListener("change", () => {
+      const index = Number(input.getAttribute("data-source-subscription-enabled") || "0");
+      const subscription = sourceControlState.subscriptions[index];
+      if (subscription) {
+        const enabled = Boolean(input.checked);
+        input.setAttribute("aria-busy", "true");
+        setSourceSubscriptionEnabled(subscription, enabled, input);
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-source-subscription-sync]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-source-subscription-sync") || "0");
+      const subscription = sourceControlState.subscriptions[index];
+      if (subscription) {
+        await syncSourceSubscriptionNow(subscription.id);
+      }
+    });
+  }
+  for (const button of document.querySelectorAll("[data-source-run-filter]")) {
+    button.addEventListener("click", () => {
+      sourceControlState.runFilter = String(button.getAttribute("data-source-run-filter") || "all");
+      renderWCPlusPage();
+      scheduleSourceControlPoll();
+    });
+  }
+  for (const button of document.querySelectorAll("[data-source-run-detail]")) {
+    button.addEventListener("click", async () => {
+      await loadSourceRunDetail(String(button.getAttribute("data-source-run-detail") || ""));
+    });
+  }
+  for (const button of document.querySelectorAll("[data-source-run-retry]")) {
+    button.addEventListener("click", async () => {
+      await retrySourceRun(String(button.getAttribute("data-source-run-retry") || ""));
+    });
+  }
+  for (const button of document.querySelectorAll("[data-source-run-cancel]")) {
+    button.addEventListener("click", async () => {
+      await cancelSourceRun(String(button.getAttribute("data-source-run-cancel") || ""));
+    });
+  }
+  document.querySelector("[data-source-drawer-close]")?.addEventListener("click", () => {
+    sourceControlState.selectedRunID = "";
+    sourceControlState.runDetail = null;
+    renderWCPlusPage();
+    scheduleSourceControlPoll();
+  });
+  document.querySelector("#wcplus-legacy-diagnostics")?.addEventListener("toggle", async (event) => {
+    sourceControlState.legacyDiagnosticsOpen = Boolean(event.currentTarget.open);
+    if (event.currentTarget.open && !isWCPlusBootstrapped) {
+      await bootstrapWCPlusSource();
+    }
+  });
+}
+
+function readSourceSubscriptionDraft() {
+  const form = document.querySelector("#source-subscription-form");
+  if (!form) {
+    return;
+  }
+  const data = new FormData(form);
+  sourceControlState.draft.sourceAccountKey = String(data.get("sourceAccountKey") || "").trim();
+  sourceControlState.draft.sourceAccount = String(data.get("sourceAccount") || "").trim();
+  sourceControlState.draft.sourceAgentID = String(data.get("sourceAgentID") || "").trim();
+  sourceControlState.draft.sourceOperation = String(data.get("sourceOperation") || "sync_content");
+  sourceControlState.draft.sourceScheduleMode = String(data.get("sourceScheduleMode") || "manual");
+  sourceControlState.draft.sourceIntervalSeconds = boundedNumber(data.get("sourceIntervalSeconds"), 60, 31536000, sourceControlState.draft.sourceIntervalSeconds);
+}
+
+async function createSourceSubscription() {
+  const draft = sourceControlState.draft;
+  if (!draft.sourceAccountKey) {
+    sourceControlState.message = "请填写公众号标识。";
+    renderWCPlusPage();
+    return;
+  }
+  sourceControlState.loading = "创建订阅";
+  renderWCPlusPage();
+  try {
+    const schedule = draft.sourceScheduleMode === "interval"
+      ? `interval:${draft.sourceIntervalSeconds}`
+      : "manual";
+    const payload = await apiFetch("/api/source-subscriptions", {
+      method: "POST",
+      body: JSON.stringify({
+        source_type: "wcplus_wechat_article",
+        source_account_key: draft.sourceAccountKey,
+        source_account: draft.sourceAccount || draft.sourceAccountKey,
+        agent_id: draft.sourceAgentID,
+        schedule,
+        operation: draft.sourceOperation,
+        options: { limit: 20 },
+        enabled: true,
+      }),
+    });
+    sourceControlState.selectedSubscriptionID = payload.subscription?.id || "";
+    sourceControlState.draft.sourceAccountKey = "";
+    sourceControlState.draft.sourceAccount = "";
+    await loadSourceControlPlane({ silent: true });
+    sourceControlState.message = "订阅已创建。";
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceControlState.loading = "";
+    renderWCPlusPage();
+    scheduleSourceControlPoll();
+  }
+}
+
+async function setSourceSubscriptionEnabled(subscription, enabled, control = null) {
+  sourceControlState.loading = enabled ? "启用订阅" : "停用订阅";
+  try {
+    await apiFetch(`/api/source-subscriptions/${encodeURIComponent(subscription.id)}/enabled`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    await loadSourceControlPlane({ silent: true, renderResult: false });
+    sourceControlState.message = enabled ? "订阅已启用。" : "订阅已停用。";
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceControlState.loading = "";
+    const authoritative = sourceControlState.subscriptions.find((item) => item.id === subscription.id);
+    if (control?.isConnected) {
+      control.checked = authoritative ? Boolean(authoritative.enabled) : Boolean(subscription.enabled);
+      control.removeAttribute("aria-busy");
+    }
+    const status = document.querySelector(".source-control__header-actions .web-status");
+    if (status) {
+      status.textContent = sourceControlState.message;
+    }
+    scheduleSourceControlPoll();
+  }
+}
+
+async function syncSourceSubscriptionNow(subscriptionID) {
+  sourceControlState.loading = "创建同步运行";
+  renderWCPlusPage();
+  try {
+    const payload = await apiFetch(`/api/source-subscriptions/${encodeURIComponent(subscriptionID)}/sync`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    sourceControlState.selectedSubscriptionID = subscriptionID;
+    sourceControlState.selectedRunID = payload.run?.id || "";
+    await loadSourceControlPlane({ silent: true });
+    sourceControlState.message = "同步运行已进入队列。";
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceControlState.loading = "";
+    renderWCPlusPage();
+    scheduleSourceControlPoll();
+  }
+}
+
+async function loadSourceRunDetail(runID) {
+  if (!runID) {
+    return;
+  }
+  sourceControlState.loading = "加载运行详情";
+  renderWCPlusPage();
+  try {
+    sourceControlState.runDetail = await apiFetch(`/api/source-sync/runs/${encodeURIComponent(runID)}`);
+    sourceControlState.selectedRunID = runID;
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceControlState.loading = "";
+    renderWCPlusPage();
+    scheduleSourceControlPoll();
+  }
+}
+
+async function retrySourceRun(runID) {
+  if (!runID) {
+    return;
+  }
+  sourceControlState.loading = "重试运行";
+  renderWCPlusPage();
+  try {
+    const payload = await apiFetch(`/api/source-sync/runs/${encodeURIComponent(runID)}/retry`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    sourceControlState.selectedRunID = payload.run?.id || "";
+    await loadSourceControlPlane({ silent: true });
+    sourceControlState.message = "重试运行已进入队列。";
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceControlState.loading = "";
+    renderWCPlusPage();
+    scheduleSourceControlPoll();
+  }
+}
+
+async function cancelSourceRun(runID) {
+  if (!runID) {
+    return;
+  }
+  sourceControlState.loading = "取消运行";
+  renderWCPlusPage();
+  try {
+    await apiFetch(`/api/source-sync/runs/${encodeURIComponent(runID)}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    sourceControlState.selectedRunID = runID;
+    await loadSourceControlPlane({ silent: true });
+    sourceControlState.message = "运行已取消。";
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceControlState.loading = "";
+    renderWCPlusPage();
+    scheduleSourceControlPoll();
+  }
 }
 
 function firstValue(value, keys) {
@@ -2355,6 +3074,7 @@ function bindBookKnowledgeEvents() {
       const index = Number(button.getAttribute("data-book-index") || "0");
       const book = knowledgeState.books[index] || null;
       if (book) {
+        window.history?.pushState?.({}, "", sourceKnowledgeURL(book.book_id));
         await selectKnowledgeBook(book);
       }
     });
@@ -2370,7 +3090,7 @@ async function loadBookKnowledge() {
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length) {
       const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
-      const preferredID = queryBookID || knowledgeState.selectedBook?.book_id || "";
+      const preferredID = getKnowledgeBookID() || queryBookID || knowledgeState.selectedBook?.book_id || "";
       const preferred = preferredID
         ? knowledgeState.books.find((book) => book.book_id === preferredID)
         : null;
@@ -2453,7 +3173,7 @@ async function boot() {
   }
   if (window.location.pathname.startsWith("/wcplus-source")) {
     renderWCPlusPage();
-    await bootstrapWCPlusSource();
+    await bootstrapSourceControlPlane();
     return;
   }
   if (window.location.pathname.startsWith("/book-knowledge")) {

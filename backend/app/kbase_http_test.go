@@ -224,6 +224,53 @@ func TestKBaseHTTPHandlerSourceSyncHTTP(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerSetsSubscriptionEnabledWithoutReplacingCursor(t *testing.T) {
+	root := t.TempDir()
+	sourceSync, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:      NewBookKnowledgeStore(root),
+		AuthToken:  "admin-secret",
+		SourceSync: sourceSync,
+	})
+	subscription, err := sourceSync.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wcplus_wechat_article",
+		SourceAccountKey: "biz-med",
+		SourceAccount:    "医学参考",
+		AgentID:          "agent-a",
+		Schedule:         "interval:3600",
+		Cursor:           "2026-07-10T11:55:00Z|article-42",
+		Operation:        "sync_content",
+		Options:          map[string]any{"limit": float64(50)},
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	path := "/api/source-subscriptions/" + url.PathEscape(subscription.ID) + "/enabled"
+	resp := requestJSONKBase(handler, http.MethodPost, path, "admin-secret", `{"enabled":false}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("disable subscription status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Subscription SourceSubscription `json:"subscription"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode subscription: %v", err)
+	}
+	if payload.Subscription.Enabled || payload.Subscription.Cursor != subscription.Cursor || payload.Subscription.Schedule != subscription.Schedule || payload.Subscription.Operation != subscription.Operation {
+		t.Fatalf("enabled endpoint replaced subscription state: before=%#v after=%#v", subscription, payload.Subscription)
+	}
+
+	missingEnabled := requestJSONKBase(handler, http.MethodPost, path, "admin-secret", `{}`)
+	if missingEnabled.Code != http.StatusBadRequest {
+		t.Fatalf("missing enabled status = %d, body=%s", missingEnabled.Code, missingEnabled.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:     NewBookKnowledgeStore(t.TempDir()),

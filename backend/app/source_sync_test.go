@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +43,46 @@ func TestSourceSyncStoreMigratesEmptyRoot(t *testing.T) {
 	}
 	if store.DBPath() != filepath.Join(root, sourceSyncDBName) {
 		t.Fatalf("db path = %q", store.DBPath())
+	}
+}
+
+func TestSourceSyncStoreSetSubscriptionEnabledPreservesAgentCursor(t *testing.T) {
+	clock := newSourceSyncTestClock(time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC))
+	store, err := newSourceSyncStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wcplus_wechat_article",
+		SourceAccountKey: "biz-med",
+		SourceAccount:    "医学参考",
+		AgentID:          "agent-a",
+		Schedule:         "interval:3600",
+		Cursor:           "2026-07-10T11:55:00Z|article-42",
+		Operation:        "sync_content",
+		Options:          map[string]any{"limit": float64(50), "include_html": true},
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+
+	clock.Advance(time.Minute)
+	updated, err := store.SetSubscriptionEnabled(subscription.ID, false)
+	if err != nil {
+		t.Fatalf("disable subscription: %v", err)
+	}
+	if updated.Enabled {
+		t.Fatalf("subscription remained enabled: %#v", updated)
+	}
+	if updated.Cursor != subscription.Cursor || updated.Schedule != subscription.Schedule || updated.Operation != subscription.Operation || updated.AgentID != subscription.AgentID {
+		t.Fatalf("enabled update overwrote agent-owned fields: before=%#v after=%#v", subscription, updated)
+	}
+	if !reflect.DeepEqual(updated.Options, subscription.Options) {
+		t.Fatalf("enabled update overwrote options: before=%#v after=%#v", subscription.Options, updated.Options)
+	}
+	if updated.CreatedAt != subscription.CreatedAt || updated.UpdatedAt != clock.Now().Format(time.RFC3339Nano) {
+		t.Fatalf("unexpected timestamps: before=%#v after=%#v", subscription, updated)
 	}
 }
 

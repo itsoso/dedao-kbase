@@ -955,22 +955,45 @@ func (h *kbaseHTTPHandler) handleSourceSubscriptionAction(w http.ResponseWriter,
 		return
 	}
 	subscriptionID, action, ok := parseSourceSyncRunAction(r.URL.Path, "/api/source-subscriptions/")
-	if !ok || action != "sync" {
+	if !ok {
 		writeHTTPError(w, http.StatusNotFound, "not found")
 		return
 	}
-	var payload struct {
-		Operation string `json:"operation,omitempty"`
-	}
-	if !decodeLimitedHTTPJSON(w, r, 1<<20, &payload) {
+	switch action {
+	case "sync":
+		var payload struct {
+			Operation string `json:"operation,omitempty"`
+		}
+		if !decodeLimitedHTTPJSON(w, r, 1<<20, &payload) {
+			return
+		}
+		run, err := h.sourceSync.CreateRun(subscriptionID, payload.Operation)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{"run": run})
+	case "enabled":
+		var payload struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if !decodeLimitedHTTPJSON(w, r, 1<<20, &payload) {
+			return
+		}
+		if payload.Enabled == nil {
+			writeHTTPError(w, http.StatusBadRequest, "enabled is required")
+			return
+		}
+		subscription, err := h.sourceSync.SetSubscriptionEnabled(subscriptionID, *payload.Enabled)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"subscription": subscription})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
 		return
 	}
-	run, err := h.sourceSync.CreateRun(subscriptionID, payload.Operation)
-	if err != nil {
-		h.writeSourceSyncError(w, err)
-		return
-	}
-	writeHTTPJSON(w, http.StatusCreated, map[string]any{"run": run})
 }
 
 func (h *kbaseHTTPHandler) handleSourceSyncRunAdmin(w http.ResponseWriter, r *http.Request) {

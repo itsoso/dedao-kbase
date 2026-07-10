@@ -435,6 +435,29 @@ func (s *SourceSyncStore) UpdateSubscription(id string, input SourceSubscription
 	return s.GetSubscription(id)
 }
 
+func (s *SourceSyncStore) SetSubscriptionEnabled(id string, enabled bool) (SourceSubscription, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return SourceSubscription{}, fmt.Errorf("subscription id is required")
+	}
+	enabledValue := 0
+	if enabled {
+		enabledValue = 1
+	}
+	result, err := s.db.Exec(`
+		UPDATE source_subscriptions
+		SET enabled = ?, updated_at = ?
+		WHERE id = ?
+	`, enabledValue, s.timestamp(), id)
+	if err != nil {
+		return SourceSubscription{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return SourceSubscription{}, ErrSourceSubscriptionAbsent
+	}
+	return s.GetSubscription(id)
+}
+
 func (s *SourceSyncStore) GetSubscription(id string) (SourceSubscription, error) {
 	subscription, err := scanSourceSubscription(s.db.QueryRow(`
 		SELECT id, source_type, source_account_key, source_account, agent_id, schedule,
