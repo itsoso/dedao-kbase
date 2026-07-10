@@ -25,6 +25,9 @@ func main() {
 	authToken := flag.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
 	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
 	flag.Parse()
+	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken); err != nil {
+		log.Fatal(err)
+	}
 	sourceSync, err := app.NewSourceSyncStore(*root)
 	if err != nil {
 		log.Fatalf("initialize source sync store: %v", err)
@@ -88,6 +91,15 @@ func main() {
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
 		log.Fatal(listenErr)
 	}
+}
+
+func validateKBaseTokenSeparation(adminToken, sourceAgentToken string) error {
+	adminToken = strings.TrimSpace(adminToken)
+	sourceAgentToken = strings.TrimSpace(sourceAgentToken)
+	if adminToken != "" && sourceAgentToken != "" && adminToken == sourceAgentToken {
+		return errors.New("KBASE_SOURCE_AGENT_TOKEN must differ from KBASE_AUTH_TOKEN")
+	}
+	return nil
 }
 
 type sourceSchedulerRunner interface {

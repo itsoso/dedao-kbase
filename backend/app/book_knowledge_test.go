@@ -1,8 +1,13 @@
 package app
 
 import (
+	"bytes"
+	"fmt"
+	"math"
+	"os"
 	"path/filepath"
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -115,6 +120,82 @@ func TestBookKnowledgePackageRoundTrip(t *testing.T) {
 	}
 	if len(books) != 1 || books[0].BookID != "42" {
 		t.Fatalf("books = %#v, want one saved book", books)
+	}
+}
+
+func TestBookKnowledgeWritesPreserveExistingFilesOnEncodeFailure(t *testing.T) {
+	root := t.TempDir()
+	jsonPath := filepath.Join(root, "manifest.json")
+	if err := writeJSONFile(jsonPath, map[string]any{"version": "stable"}); err != nil {
+		t.Fatalf("write initial JSON: %v", err)
+	}
+	jsonBefore, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read initial JSON: %v", err)
+	}
+	if err := writeJSONFile(jsonPath, map[string]any{"invalid": math.Inf(1)}); err == nil {
+		t.Fatal("invalid JSON write unexpectedly succeeded")
+	}
+	jsonAfter, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read JSON after failure: %v", err)
+	}
+	if !bytes.Equal(jsonAfter, jsonBefore) {
+		t.Fatalf("failed JSON write replaced existing data: before=%q after=%q", jsonBefore, jsonAfter)
+	}
+
+	jsonlPath := filepath.Join(root, "claims.jsonl")
+	if err := writeJSONLFile(jsonlPath, []any{"stable"}); err != nil {
+		t.Fatalf("write initial JSONL: %v", err)
+	}
+	jsonlBefore, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatalf("read initial JSONL: %v", err)
+	}
+	if err := writeJSONLFile(jsonlPath, []any{"new", math.Inf(1)}); err == nil {
+		t.Fatal("invalid JSONL write unexpectedly succeeded")
+	}
+	jsonlAfter, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatalf("read JSONL after failure: %v", err)
+	}
+	if !bytes.Equal(jsonlAfter, jsonlBefore) {
+		t.Fatalf("failed JSONL write replaced existing data: before=%q after=%q", jsonlBefore, jsonlAfter)
+	}
+}
+
+func TestBookKnowledgeStoreSerializesConcurrentManifestUpdates(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	const count = 40
+	start := make(chan struct{})
+	errorsByBook := make(chan error, count)
+	var wait sync.WaitGroup
+	for index := 0; index < count; index++ {
+		index := index
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			bookID := fmt.Sprintf("concurrent-%02d", index)
+			errorsByBook <- store.SavePackage(BookKnowledgePackage{
+				Book: BookKnowledgeBook{BookID: bookID, Title: bookID, Status: "ready"},
+			})
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(errorsByBook)
+	for err := range errorsByBook {
+		if err != nil {
+			t.Fatalf("concurrent SavePackage: %v", err)
+		}
+	}
+	books, err := store.ListBooks()
+	if err != nil {
+		t.Fatalf("ListBooks after concurrent saves: %v", err)
+	}
+	if len(books) != count {
+		t.Fatalf("manifest contains %d books, want %d", len(books), count)
 	}
 }
 

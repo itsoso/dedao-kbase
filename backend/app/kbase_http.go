@@ -55,16 +55,21 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if sourceIngest == nil && cfg.SourceSync != nil {
 		sourceIngest = NewSourceIngestService(store, cfg.SourceSync)
 	}
+	authToken := strings.TrimSpace(cfg.AuthToken)
+	sourceAgentToken := strings.TrimSpace(cfg.SourceAgentToken)
+	if authToken != "" && sourceAgentToken == authToken {
+		sourceAgentToken = ""
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
-		authToken:               strings.TrimSpace(cfg.AuthToken),
+		authToken:               authToken,
 		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:               strings.TrimSpace(cfg.StaticDir),
 		wechat:                  cfg.WeChat,
 		wcplus:                  cfg.WCPlus,
 		sourceSync:              cfg.SourceSync,
 		sourceIngest:            sourceIngest,
-		sourceAgentToken:        strings.TrimSpace(cfg.SourceAgentToken),
+		sourceAgentToken:        sourceAgentToken,
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 	}
 }

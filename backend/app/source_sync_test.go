@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -295,6 +296,52 @@ func TestSourceSyncStoreRecoversExpiredLeaseAndRetries(t *testing.T) {
 	}
 	if _, err := store.RetryRun(retry.ID); !errors.Is(err, ErrSourceRunNotRetryable) {
 		t.Fatalf("canceled retry error = %v", err)
+	}
+}
+
+func TestSourceSyncStoreBoundsRunFailureText(t *testing.T) {
+	store, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID:       "agent-a",
+		WCPlusHealthy: false,
+		LastError:     strings.Repeat("错", 10000),
+	})
+	if err != nil {
+		t.Fatalf("heartbeat agent: %v", err)
+	}
+	if got := len([]rune(agent.LastError)); got != 4000 {
+		t.Fatalf("stored heartbeat error length = %d, want 4000", got)
+	}
+	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wcplus_wechat_article",
+		SourceAccountKey: "biz-errors",
+		SourceAccount:    "错误边界",
+		Operation:        "sync_content",
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	run, err := store.CreateRun(subscription.ID, "")
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	leased, err := store.LeaseNextRun("agent-a", []string{"sync_content"}, time.Minute)
+	if err != nil || leased == nil || leased.ID != run.ID {
+		t.Fatalf("lease run = %#v, err=%v", leased, err)
+	}
+	if _, err := store.StartRun(run.ID, "agent-a"); err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	failed, err := store.FailRun(run.ID, "agent-a", strings.Repeat("错", 10000))
+	if err != nil {
+		t.Fatalf("fail run: %v", err)
+	}
+	if got := len([]rune(failed.Error)); got != 4000 {
+		t.Fatalf("stored failure length = %d, want 4000", got)
 	}
 }
 

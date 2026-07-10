@@ -17,6 +17,7 @@ import (
 )
 
 const sourceSyncDBName = "source_sync.sqlite3"
+const sourceDiagnosticMaxRunes = 4000
 
 const (
 	SourceRunQueued    = "queued"
@@ -325,7 +326,7 @@ func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (Source
 			last_heartbeat_at = excluded.last_heartbeat_at,
 			updated_at = excluded.updated_at
 	`, heartbeat.AgentID, strings.TrimSpace(heartbeat.Version), string(capabilitiesJSON), healthy,
-		strings.TrimSpace(heartbeat.WCPlusVersion), strings.TrimSpace(heartbeat.LastError), now, now, now)
+		strings.TrimSpace(heartbeat.WCPlusVersion), trimSourceDiagnostic(heartbeat.LastError), now, now, now)
 	if err != nil {
 		return SourceAgent{}, err
 	}
@@ -709,7 +710,7 @@ func (s *SourceSyncStore) RecordRunItem(runID, agentID string, input SourceSyncI
 			error_text = excluded.error_text,
 			updated_at = excluded.updated_at
 	`, id, run.ID, input.SourceItemKey, input.IdempotencyKey, strings.TrimSpace(input.ContentHash),
-		input.Outcome, strings.TrimSpace(input.TargetBookID), strings.TrimSpace(input.Error), now, now)
+		input.Outcome, strings.TrimSpace(input.TargetBookID), trimSourceDiagnostic(input.Error), now, now)
 	if err != nil {
 		return SourceSyncItem{}, err
 	}
@@ -798,7 +799,7 @@ func (s *SourceSyncStore) FailRun(runID, agentID, message string) (SourceSyncRun
 		UPDATE source_sync_runs SET status = ?, error_text = ?, lease_owner = '', lease_expires_at = '',
 			finished_at = ?, updated_at = ?
 		WHERE id = ? AND status = ? AND lease_owner = ?
-	`, SourceRunFailed, strings.TrimSpace(message), now, now, run.ID, run.Status, strings.TrimSpace(agentID))
+	`, SourceRunFailed, trimSourceDiagnostic(message), now, now, run.ID, run.Status, strings.TrimSpace(agentID))
 	if err != nil {
 		return SourceSyncRun{}, err
 	}
@@ -977,6 +978,14 @@ func normalizeSourceCapabilities(capabilities []string) []string {
 	}
 	sort.Strings(normalized)
 	return normalized
+}
+
+func trimSourceDiagnostic(value string) string {
+	runes := []rune(strings.TrimSpace(value))
+	if len(runes) <= sourceDiagnosticMaxRunes {
+		return string(runes)
+	}
+	return string(runes[:sourceDiagnosticMaxRunes-3]) + "..."
 }
 
 func isSourceItemOutcome(outcome string) bool {

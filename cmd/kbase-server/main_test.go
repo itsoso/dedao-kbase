@@ -92,6 +92,27 @@ func TestDefaultSourceAgentTokenUsesTrimmedEnv(t *testing.T) {
 	}
 }
 
+func TestValidateKBaseTokenSeparation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		adminToken string
+		agentToken string
+		wantError  bool
+	}{
+		{name: "distinct", adminToken: "admin-secret", agentToken: "agent-secret"},
+		{name: "agent disabled", adminToken: "admin-secret"},
+		{name: "admin disabled", agentToken: "agent-secret"},
+		{name: "shared", adminToken: "shared-secret", agentToken: "shared-secret", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateKBaseTokenSeparation(test.adminToken, test.agentToken)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateKBaseTokenSeparation() error = %v, wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}
+
 func TestStartSourceSchedulerRequiresSourceAgentTokenAndStopsWithContext(t *testing.T) {
 	runnerStarted := make(chan struct{}, 1)
 	runner := sourceSchedulerRunFunc(func(ctx context.Context, interval time.Duration, onTick func(app.SourceSchedulerTickResult, error)) {

@@ -2,12 +2,15 @@ package app
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -114,6 +117,7 @@ type BookKnowledgeSearchResult struct {
 
 type BookKnowledgeStore struct {
 	root string
+	mu   sync.RWMutex
 }
 
 func DefaultBookKnowledgeRoot() string {
@@ -158,6 +162,9 @@ func (s *BookKnowledgeStore) BookJSONLPath(bookID, name string) string {
 }
 
 func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if strings.TrimSpace(pkg.Book.BookID) == "" {
 		return fmt.Errorf("book knowledge package missing book_id")
 	}
@@ -170,30 +177,53 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 	if strings.TrimSpace(pkg.Book.Extractor) == "" {
 		pkg.Book.Extractor = defaultBookKnowledgeExtractor
 	}
+	bookJSON, err := encodeJSONFile(pkg.Book)
+	if err != nil {
+		return err
+	}
+	chaptersJSONL, err := encodeJSONLFile(pkg.Chapters)
+	if err != nil {
+		return err
+	}
+	chunksJSONL, err := encodeJSONLFile(pkg.Chunks)
+	if err != nil {
+		return err
+	}
+	claimsJSONL, err := encodeJSONLFile(pkg.Claims)
+	if err != nil {
+		return err
+	}
+	citationsJSONL, err := encodeJSONLFile(pkg.Citations)
+	if err != nil {
+		return err
+	}
 
 	bookDir := s.BookDir(pkg.Book.BookID)
 	if err := os.MkdirAll(bookDir, os.ModePerm); err != nil {
 		return err
 	}
-	if err := writeJSONFile(s.BookManifestPath(pkg.Book.BookID), pkg.Book); err != nil {
+	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "chapters"), chaptersJSONL); err != nil {
 		return err
 	}
-	if err := writeJSONLFile(s.BookJSONLPath(pkg.Book.BookID, "chapters"), pkg.Chapters); err != nil {
+	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "chunks"), chunksJSONL); err != nil {
 		return err
 	}
-	if err := writeJSONLFile(s.BookJSONLPath(pkg.Book.BookID, "chunks"), pkg.Chunks); err != nil {
+	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "claims"), claimsJSONL); err != nil {
 		return err
 	}
-	if err := writeJSONLFile(s.BookJSONLPath(pkg.Book.BookID, "claims"), pkg.Claims); err != nil {
+	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "citations"), citationsJSONL); err != nil {
 		return err
 	}
-	if err := writeJSONLFile(s.BookJSONLPath(pkg.Book.BookID, "citations"), pkg.Citations); err != nil {
+	if err := writeFileAtomically(s.BookManifestPath(pkg.Book.BookID), bookJSON); err != nil {
 		return err
 	}
 	return s.upsertManifestBook(pkg.Book)
 }
 
 func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	bookID = sanitizeBookKnowledgeID(bookID)
 	if strings.TrimSpace(bookID) == "" {
 		return nil, fmt.Errorf("book_id is required")
@@ -229,6 +259,9 @@ func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, 
 }
 
 func (s *BookKnowledgeStore) ListBooks() ([]BookKnowledgeBook, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	manifest, err := s.loadManifest()
 	if err != nil {
 		return nil, err
@@ -371,16 +404,22 @@ func (s *BookKnowledgeStore) loadManifest() (BookKnowledgeManifest, error) {
 }
 
 func writeJSONFile(path string, value any) error {
-	file, err := os.Create(path)
+	data, err := encodeJSONFile(value)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	return writeFileAtomically(path, data)
+}
 
-	encoder := json.NewEncoder(file)
+func encodeJSONFile(value any) ([]byte, error) {
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
 	encoder.SetEscapeHTML(false)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(value)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return data.Bytes(), nil
 }
 
 func readJSONFile(path string, target any) error {
@@ -393,20 +432,61 @@ func readJSONFile(path string, target any) error {
 }
 
 func writeJSONLFile[T any](path string, values []T) error {
-	file, err := os.Create(path)
+	data, err := encodeJSONLFile(values)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	return writeFileAtomically(path, data)
+}
 
-	encoder := json.NewEncoder(file)
+func encodeJSONLFile[T any](values []T) ([]byte, error) {
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
 	encoder.SetEscapeHTML(false)
 	for _, value := range values {
 		if err := encoder.Encode(value); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return data.Bytes(), nil
+}
+
+func writeFileAtomically(path string, data []byte) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	mode := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	}
+	if err := temporary.Chmod(mode); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err == nil {
+		return nil
+	} else if runtime.GOOS != "windows" {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return os.Rename(temporaryPath, path)
 }
 
 func readJSONLFile[T any](path string) ([]T, error) {

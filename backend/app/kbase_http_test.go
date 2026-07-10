@@ -98,6 +98,21 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	if resp.Code != http.StatusServiceUnavailable {
 		t.Fatalf("unconfigured agent auth status = %d, body=%s", resp.Code, resp.Body.String())
 	}
+
+	sharedToken := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:        "shared-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "shared-secret",
+	})
+	resp = requestJSONKBase(sharedToken, http.MethodPost, "/api/source-agent/heartbeat", "shared-secret", heartbeat)
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("shared admin/agent token status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = requestKBase(sharedToken, http.MethodGet, "/api/books", "shared-secret")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("shared-token defense disabled admin API: status=%d body=%s", resp.Code, resp.Body.String())
+	}
 }
 
 func TestKBaseHTTPHandlerSourceAgentPayloadLimit(t *testing.T) {
