@@ -80,3 +80,10 @@ func TestWCPlusBaseURLConfiguredFromEnvSupportsWCPlusPro(t *testing.T) {
 		t.Fatalf("wcplusBaseURLConfiguredFromEnv() = true, want false without WC Plus env")
 	}
 }
+
+func TestDefaultSourceAgentTokenUsesTrimmedEnv(t *testing.T) {
+	t.Setenv("KBASE_SOURCE_AGENT_TOKEN", "  source-agent-secret  ")
+	if got := defaultSourceAgentToken(); got != "source-agent-secret" {
+		t.Fatalf("defaultSourceAgentToken() = %q", got)
+	}
+}

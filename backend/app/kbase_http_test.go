@@ -42,6 +42,182 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
+	root := t.TempDir()
+	sourceSync, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(root),
+		AuthToken:        "admin-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "agent-secret",
+	})
+	heartbeat := `{"agent_id":"agent-a","version":"1.0.0","capabilities":["sync_content"],"wcplus_healthy":true}`
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/heartbeat", "admin-secret", heartbeat)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("admin token on agent route status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = requestJSONKBase(handler, http.MethodPost, "/api/source-agent/heartbeat", "invalid-agent-token", heartbeat)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid agent token status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "invalid-agent-token") {
+		t.Fatalf("agent auth response leaked token: %s", resp.Body.String())
+	}
+	resp = requestJSONKBase(handler, http.MethodPost, "/api/source-agent/heartbeat", "agent-secret", heartbeat)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"agent_id":"agent-a"`) {
+		t.Fatalf("agent heartbeat status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = requestKBase(handler, http.MethodGet, "/api/books", "agent-secret")
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("agent token on admin route status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = requestKBase(handler, http.MethodGet, "/api/books", "admin-secret")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("admin token on admin route status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	browserReq := httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
+	browserReq.Header.Set("Authorization", "Bearer agent-secret")
+	browserReq.Header.Set("X-KBase-Browser-Session", "1")
+	browserResp := httptest.NewRecorder()
+	handler.ServeHTTP(browserResp, browserReq)
+	if browserResp.Code != http.StatusUnauthorized || strings.Contains(browserResp.Body.String(), "admin-secret") {
+		t.Fatalf("agent token exchanged for browser token: status=%d body=%s", browserResp.Code, browserResp.Body.String())
+	}
+
+	unconfigured := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:      NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:  "admin-secret",
+		SourceSync: sourceSync,
+	})
+	resp = requestJSONKBase(unconfigured, http.MethodPost, "/api/source-agent/heartbeat", "agent-secret", heartbeat)
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unconfigured agent auth status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentPayloadLimit(t *testing.T) {
+	sourceSync, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:                   NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:               "admin-secret",
+		SourceSync:              sourceSync,
+		SourceAgentToken:        "agent-secret",
+		SourceAgentMaxBodyBytes: 128,
+	})
+	payload := `{"agent_id":"agent-a","source_item_key":"` + strings.Repeat("x", 512) + `","idempotency_key":"idem","outcome":"new"}`
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/runs/run-1/items", "agent-secret", payload)
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized agent payload status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerSourceSyncHTTP(t *testing.T) {
+	root := t.TempDir()
+	sourceSync, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatalf("new source sync store: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(root),
+		AuthToken:        "admin-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "agent-secret",
+	})
+
+	createResp := requestJSONKBase(handler, http.MethodPost, "/api/source-subscriptions", "admin-secret", `{
+		"source_type":"wcplus_wechat_article",
+		"source_account_key":"biz-med",
+		"source_account":"医学参考",
+		"agent_id":"agent-a",
+		"schedule":"manual",
+		"operation":"sync_content",
+		"enabled":true
+	}`)
+	if createResp.Code != http.StatusCreated {
+		t.Fatalf("create subscription status = %d, body=%s", createResp.Code, createResp.Body.String())
+	}
+	var createPayload struct {
+		Subscription SourceSubscription `json:"subscription"`
+	}
+	if err := json.Unmarshal(createResp.Body.Bytes(), &createPayload); err != nil {
+		t.Fatalf("decode subscription: %v", err)
+	}
+	if createPayload.Subscription.ID == "" {
+		t.Fatalf("created subscription missing id: %s", createResp.Body.String())
+	}
+
+	syncPath := "/api/source-subscriptions/" + url.PathEscape(createPayload.Subscription.ID) + "/sync"
+	syncResp := requestJSONKBase(handler, http.MethodPost, syncPath, "admin-secret", `{}`)
+	if syncResp.Code != http.StatusCreated {
+		t.Fatalf("create sync run status = %d, body=%s", syncResp.Code, syncResp.Body.String())
+	}
+
+	heartbeatResp := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/heartbeat", "agent-secret", `{
+		"agent_id":"agent-a",
+		"version":"1.0.0",
+		"capabilities":["sync_content"],
+		"wcplus_healthy":true
+	}`)
+	if heartbeatResp.Code != http.StatusOK {
+		t.Fatalf("heartbeat status = %d, body=%s", heartbeatResp.Code, heartbeatResp.Body.String())
+	}
+	leaseResp := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/lease", "agent-secret", `{
+		"agent_id":"agent-a",
+		"capabilities":["sync_content"],
+		"lease_seconds":120
+	}`)
+	if leaseResp.Code != http.StatusOK {
+		t.Fatalf("lease status = %d, body=%s", leaseResp.Code, leaseResp.Body.String())
+	}
+	var leasePayload struct {
+		Run *SourceSyncRun `json:"run"`
+	}
+	if err := json.Unmarshal(leaseResp.Body.Bytes(), &leasePayload); err != nil {
+		t.Fatalf("decode lease: %v", err)
+	}
+	if leasePayload.Run == nil || leasePayload.Run.Status != SourceRunRunning {
+		t.Fatalf("leased run = %#v, body=%s", leasePayload.Run, leaseResp.Body.String())
+	}
+
+	runPath := "/api/source-agent/runs/" + url.PathEscape(leasePayload.Run.ID)
+	itemResp := requestJSONKBase(handler, http.MethodPost, runPath+"/items", "agent-secret", `{
+		"agent_id":"agent-a",
+		"source_item_key":"article-1",
+		"idempotency_key":"idem-1",
+		"content_hash":"hash-1",
+		"outcome":"new",
+		"target_book_id":"wcplus-article-1"
+	}`)
+	if itemResp.Code != http.StatusCreated {
+		t.Fatalf("record item status = %d, body=%s", itemResp.Code, itemResp.Body.String())
+	}
+	completeResp := requestJSONKBase(handler, http.MethodPost, runPath+"/complete", "agent-secret", `{"agent_id":"agent-a"}`)
+	if completeResp.Code != http.StatusOK || !strings.Contains(completeResp.Body.String(), `"status":"succeeded"`) {
+		t.Fatalf("complete run status = %d, body=%s", completeResp.Code, completeResp.Body.String())
+	}
+
+	detailResp := requestKBase(handler, http.MethodGet, "/api/source-sync/runs/"+url.PathEscape(leasePayload.Run.ID), "admin-secret")
+	if detailResp.Code != http.StatusOK || !strings.Contains(detailResp.Body.String(), `"new_count":1`) || !strings.Contains(detailResp.Body.String(), `"source_item_key":"article-1"`) {
+		t.Fatalf("run detail status = %d, body=%s", detailResp.Code, detailResp.Body.String())
+	}
+	agentsResp := requestKBase(handler, http.MethodGet, "/api/source-agents", "admin-secret")
+	if agentsResp.Code != http.StatusOK || !strings.Contains(agentsResp.Body.String(), `"agent_id":"agent-a"`) {
+		t.Fatalf("agents status = %d, body=%s", agentsResp.Code, agentsResp.Body.String())
+	}
+	runsResp := requestKBase(handler, http.MethodGet, "/api/source-sync/runs", "admin-secret")
+	if runsResp.Code != http.StatusOK || !strings.Contains(runsResp.Body.String(), leasePayload.Run.ID) {
+		t.Fatalf("runs status = %d, body=%s", runsResp.Code, runsResp.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:     NewBookKnowledgeStore(t.TempDir()),
@@ -710,6 +886,17 @@ func TestKBaseHTTPHandlerChecksEnvAndBatchImportsWCPlusNicknames(t *testing.T) {
 
 func requestKBase(handler http.Handler, method, path, token string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func requestJSONKBase(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

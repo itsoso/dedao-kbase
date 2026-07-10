@@ -17,7 +17,13 @@ func main() {
 	exportPath := flag.String("system-kb-export", defaultSystemKBExportPath(), "system_kb_export.json path")
 	webDir := flag.String("web-dir", defaultWebDir(), "static web UI directory")
 	authToken := flag.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
+	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
 	flag.Parse()
+	sourceSync, err := app.NewSourceSyncStore(*root)
+	if err != nil {
+		log.Fatalf("initialize source sync store: %v", err)
+	}
+	defer sourceSync.Close()
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:              app.NewBookKnowledgeStore(*root),
@@ -26,6 +32,8 @@ func main() {
 		StaticDir:          *webDir,
 		WeChat:             app.NewWeChatSourceService(app.WeChatSourceConfigFromEnv()),
 		WCPlus:             app.NewWCPlusSourceService(app.WCPlusSourceConfigFromEnv()),
+		SourceSync:         sourceSync,
+		SourceAgentToken:   *sourceAgentToken,
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
@@ -36,6 +44,11 @@ func main() {
 	}
 	if strings.TrimSpace(*authToken) == "" {
 		log.Printf("warning: KBASE_AUTH_TOKEN is empty; /api/* routes will reject requests")
+	}
+	if strings.TrimSpace(*sourceAgentToken) == "" {
+		log.Printf("source agent API disabled until KBASE_SOURCE_AGENT_TOKEN is configured")
+	} else {
+		log.Printf("source agent API enabled")
 	}
 	if strings.TrimSpace(os.Getenv("WECHAT_MP_TOKEN")) == "" || strings.TrimSpace(os.Getenv("WECHAT_MP_COOKIE")) == "" {
 		log.Printf("wechat source: official account search/list disabled until WECHAT_MP_TOKEN and WECHAT_MP_COOKIE are configured")
@@ -89,4 +102,8 @@ func defaultWebDir() string {
 
 func wcplusBaseURLConfiguredFromEnv() bool {
 	return strings.TrimSpace(os.Getenv("WCPLUS_BASE_URL")) != "" || strings.TrimSpace(os.Getenv("WCPLUSPRO_BASE_URL")) != ""
+}
+
+func defaultSourceAgentToken() string {
+	return strings.TrimSpace(os.Getenv("KBASE_SOURCE_AGENT_TOKEN"))
 }

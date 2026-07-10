@@ -11,38 +11,54 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type KBaseHTTPConfig struct {
-	Store              *BookKnowledgeStore
-	AuthToken          string
-	SystemKBExportPath string
-	StaticDir          string
-	WeChat             *WeChatSourceService
-	WCPlus             *WCPlusSourceService
+	Store                   *BookKnowledgeStore
+	AuthToken               string
+	SystemKBExportPath      string
+	StaticDir               string
+	WeChat                  *WeChatSourceService
+	WCPlus                  *WCPlusSourceService
+	SourceSync              *SourceSyncStore
+	SourceAgentToken        string
+	SourceAgentMaxBodyBytes int64
 }
 
 type kbaseHTTPHandler struct {
-	store              *BookKnowledgeStore
-	authToken          string
-	systemKBExportPath string
-	staticDir          string
-	wechat             *WeChatSourceService
-	wcplus             *WCPlusSourceService
+	store                   *BookKnowledgeStore
+	authToken               string
+	systemKBExportPath      string
+	staticDir               string
+	wechat                  *WeChatSourceService
+	wcplus                  *WCPlusSourceService
+	sourceSync              *SourceSyncStore
+	sourceAgentToken        string
+	sourceAgentMaxBodyBytes int64
 }
+
+const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	store := cfg.Store
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
+	maxBodyBytes := cfg.SourceAgentMaxBodyBytes
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = defaultSourceAgentMaxBodyBytes
+	}
 	return &kbaseHTTPHandler{
-		store:              store,
-		authToken:          strings.TrimSpace(cfg.AuthToken),
-		systemKBExportPath: strings.TrimSpace(cfg.SystemKBExportPath),
-		staticDir:          strings.TrimSpace(cfg.StaticDir),
-		wechat:             cfg.WeChat,
-		wcplus:             cfg.WCPlus,
+		store:                   store,
+		authToken:               strings.TrimSpace(cfg.AuthToken),
+		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
+		staticDir:               strings.TrimSpace(cfg.StaticDir),
+		wechat:                  cfg.WeChat,
+		wcplus:                  cfg.WCPlus,
+		sourceSync:              cfg.SourceSync,
+		sourceAgentToken:        strings.TrimSpace(cfg.SourceAgentToken),
+		sourceAgentMaxBodyBytes: maxBodyBytes,
 	}
 }
 
@@ -66,7 +82,22 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStatic(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/source-agent/") {
+		if h.sourceSync == nil || h.sourceAgentToken == "" {
+			writeHTTPError(w, http.StatusServiceUnavailable, "source agent API is not configured")
+			return
+		}
+		if !authorizeBearerToken(w, r, h.sourceAgentToken) {
+			return
+		}
+		h.handleSourceAgent(w, r)
+		return
+	}
 	if !h.authorize(w, r) {
+		return
+	}
+	if isSourceSyncAdminPath(r.URL.Path) {
+		h.handleSourceSyncAdmin(w, r)
 		return
 	}
 	if r.URL.Path == "/api/wechat/import" {
@@ -226,9 +257,13 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 		writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
 		return false
 	}
+	return authorizeBearerToken(w, r, h.authToken)
+}
+
+func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected string) bool {
 	value := strings.TrimSpace(r.Header.Get("Authorization"))
 	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
-	if token == value || subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) != 1 {
+	if token == value || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}
@@ -242,6 +277,10 @@ func (h *kbaseHTTPHandler) handleBrowserSessionToken(w http.ResponseWriter, r *h
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
+	if strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+		writeHTTPError(w, http.StatusUnauthorized, "browser session does not accept bearer authorization")
+		return
+	}
 	if h.authToken == "" {
 		writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
 		return
@@ -693,6 +732,313 @@ func (h *kbaseHTTPHandler) handleWCPlusTaskControl(w http.ResponseWriter, r *htt
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func isSourceSyncAdminPath(path string) bool {
+	return path == "/api/source-agents" ||
+		path == "/api/source-subscriptions" ||
+		strings.HasPrefix(path, "/api/source-subscriptions/") ||
+		path == "/api/source-sync/runs" ||
+		strings.HasPrefix(path, "/api/source-sync/runs/")
+}
+
+func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	switch r.URL.Path {
+	case "/api/source-agent/heartbeat":
+		var payload SourceAgentHeartbeat
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		agent, err := h.sourceSync.HeartbeatAgent(payload)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"agent": agent})
+	case "/api/source-agent/lease":
+		var payload struct {
+			AgentID      string   `json:"agent_id"`
+			Capabilities []string `json:"capabilities"`
+			LeaseSeconds int      `json:"lease_seconds"`
+		}
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		leaseDuration := time.Duration(payload.LeaseSeconds) * time.Second
+		run, err := h.sourceSync.LeaseNextRun(payload.AgentID, payload.Capabilities, leaseDuration)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		if run != nil {
+			started, err := h.sourceSync.StartRun(run.ID, payload.AgentID)
+			if err != nil {
+				h.writeSourceSyncError(w, err)
+				return
+			}
+			run = &started
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"run": run})
+	default:
+		h.handleSourceAgentRun(w, r)
+	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.Request) {
+	runID, action, ok := parseSourceSyncRunAction(r.URL.Path, "/api/source-agent/runs/")
+	if !ok {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	switch action {
+	case "items":
+		var payload struct {
+			AgentID string `json:"agent_id"`
+			SourceSyncItemInput
+		}
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		item, err := h.sourceSync.RecordRunItem(runID, payload.AgentID, payload.SourceSyncItemInput)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{"item": item})
+	case "complete":
+		var payload struct {
+			AgentID string `json:"agent_id"`
+		}
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		run, err := h.sourceSync.CompleteRun(runID, payload.AgentID)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"run": run})
+	case "fail":
+		var payload struct {
+			AgentID string `json:"agent_id"`
+			Error   string `json:"error"`
+		}
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		run, err := h.sourceSync.FailRun(runID, payload.AgentID, payload.Error)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"run": run})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceSyncAdmin(w http.ResponseWriter, r *http.Request) {
+	if h.sourceSync == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "source sync store is not configured")
+		return
+	}
+	switch {
+	case r.URL.Path == "/api/source-agents":
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		agents, err := h.sourceSync.ListAgents()
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"agents": agents})
+	case r.URL.Path == "/api/source-subscriptions":
+		h.handleSourceSubscriptions(w, r)
+	case strings.HasPrefix(r.URL.Path, "/api/source-subscriptions/"):
+		h.handleSourceSubscriptionAction(w, r)
+	case r.URL.Path == "/api/source-sync/runs":
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		runs, err := h.sourceSync.ListRuns(parseNonNegativeQueryInt(r, "limit", 100))
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"runs": runs})
+	case strings.HasPrefix(r.URL.Path, "/api/source-sync/runs/"):
+		h.handleSourceSyncRunAdmin(w, r)
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceSubscriptions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		subscriptions, err := h.sourceSync.ListSubscriptions()
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"subscriptions": subscriptions})
+	case http.MethodPost:
+		var payload struct {
+			ID string `json:"id,omitempty"`
+			SourceSubscriptionInput
+		}
+		if !decodeLimitedHTTPJSON(w, r, 1<<20, &payload) {
+			return
+		}
+		var subscription SourceSubscription
+		var err error
+		status := http.StatusCreated
+		if strings.TrimSpace(payload.ID) == "" {
+			subscription, err = h.sourceSync.CreateSubscription(payload.SourceSubscriptionInput)
+		} else {
+			status = http.StatusOK
+			subscription, err = h.sourceSync.UpdateSubscription(payload.ID, payload.SourceSubscriptionInput)
+		}
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, status, map[string]any{"subscription": subscription})
+	default:
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceSubscriptionAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	subscriptionID, action, ok := parseSourceSyncRunAction(r.URL.Path, "/api/source-subscriptions/")
+	if !ok || action != "sync" {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	var payload struct {
+		Operation string `json:"operation,omitempty"`
+	}
+	if !decodeLimitedHTTPJSON(w, r, 1<<20, &payload) {
+		return
+	}
+	run, err := h.sourceSync.CreateRun(subscriptionID, payload.Operation)
+	if err != nil {
+		h.writeSourceSyncError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusCreated, map[string]any{"run": run})
+}
+
+func (h *kbaseHTTPHandler) handleSourceSyncRunAdmin(w http.ResponseWriter, r *http.Request) {
+	remainder := strings.TrimPrefix(r.URL.Path, "/api/source-sync/runs/")
+	parts := strings.Split(strings.Trim(remainder, "/"), "/")
+	if len(parts) == 0 || len(parts) > 2 || strings.TrimSpace(parts[0]) == "" {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	runID, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(runID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "run_id is required")
+		return
+	}
+	if len(parts) == 1 {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		run, err := h.sourceSync.GetRun(runID)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		items, err := h.sourceSync.ListRunItems(runID)
+		if err != nil {
+			h.writeSourceSyncError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"run": run, "items": items})
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var run SourceSyncRun
+	switch parts[1] {
+	case "retry":
+		run, err = h.sourceSync.RetryRun(runID)
+	case "cancel":
+		run, err = h.sourceSync.CancelRun(runID)
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if err != nil {
+		h.writeSourceSyncError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"run": run})
+}
+
+func parseSourceSyncRunAction(path, prefix string) (string, string, bool) {
+	remainder := strings.TrimPrefix(path, prefix)
+	parts := strings.Split(strings.Trim(remainder, "/"), "/")
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+		return "", "", false
+	}
+	id, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(id) == "" {
+		return "", "", false
+	}
+	return id, parts[1], true
+}
+
+func (h *kbaseHTTPHandler) decodeSourceAgentJSON(w http.ResponseWriter, r *http.Request, value any) bool {
+	return decodeLimitedHTTPJSON(w, r, h.sourceAgentMaxBodyBytes, value)
+}
+
+func decodeLimitedHTTPJSON(w http.ResponseWriter, r *http.Request, limit int64, value any) bool {
+	defer r.Body.Close()
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit)).Decode(value)
+	if err == nil {
+		return true
+	}
+	var maxBytesError *http.MaxBytesError
+	if errors.As(err, &maxBytesError) {
+		writeHTTPError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return false
+	}
+	writeHTTPError(w, http.StatusBadRequest, err.Error())
+	return false
+}
+
+func (h *kbaseHTTPHandler) writeSourceSyncError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrSourceRunNotFound), errors.Is(err, ErrSourceSubscriptionAbsent):
+		writeHTTPError(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrSourceRunLeaseOwner), errors.Is(err, ErrSourceRunLeaseExpired),
+		errors.Is(err, ErrSourceRunTerminal), errors.Is(err, ErrSourceRunInvalidState),
+		errors.Is(err, ErrSourceRunNotRetryable), errors.Is(err, ErrSourceRunActive):
+		writeHTTPError(w, http.StatusConflict, err.Error())
+	case strings.Contains(strings.ToLower(err.Error()), "required") ||
+		strings.Contains(strings.ToLower(err.Error()), "unsupported"):
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+	case strings.Contains(strings.ToLower(err.Error()), "unique constraint"):
+		writeHTTPError(w, http.StatusConflict, "source subscription already exists")
+	default:
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 func decodeHTTPJSONBody(w http.ResponseWriter, r *http.Request) (any, bool) {
