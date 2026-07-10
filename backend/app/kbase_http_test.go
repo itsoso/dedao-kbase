@@ -190,11 +190,17 @@ func TestKBaseHTTPHandlerSourceSyncHTTP(t *testing.T) {
 	runPath := "/api/source-agent/runs/" + url.PathEscape(leasePayload.Run.ID)
 	itemResp := requestJSONKBase(handler, http.MethodPost, runPath+"/items", "agent-secret", `{
 		"agent_id":"agent-a",
+		"source_type":"wcplus_wechat_article",
+		"source_account_key":"biz-med",
+		"source_account":"医学参考",
 		"source_item_key":"article-1",
 		"idempotency_key":"idem-1",
-		"content_hash":"hash-1",
-		"outcome":"new",
-		"target_book_id":"wcplus-article-1"
+		"title":"可验证知识",
+		"author":"编辑部",
+		"source_url":"https://mp.weixin.qq.com/s/article-1",
+		"published_at":"2026-07-09T19:30:00Z",
+		"content":"# 可验证知识\\n\\n每一个知识结论都需要保留可复核的来源、上下文和更新时间，供下游系统进行交叉验证。",
+		"content_format":"markdown"
 	}`)
 	if itemResp.Code != http.StatusCreated {
 		t.Fatalf("record item status = %d, body=%s", itemResp.Code, itemResp.Body.String())

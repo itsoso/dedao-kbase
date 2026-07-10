@@ -22,6 +22,7 @@ type KBaseHTTPConfig struct {
 	WeChat                  *WeChatSourceService
 	WCPlus                  *WCPlusSourceService
 	SourceSync              *SourceSyncStore
+	SourceIngest            *SourceIngestService
 	SourceAgentToken        string
 	SourceAgentMaxBodyBytes int64
 }
@@ -34,6 +35,7 @@ type kbaseHTTPHandler struct {
 	wechat                  *WeChatSourceService
 	wcplus                  *WCPlusSourceService
 	sourceSync              *SourceSyncStore
+	sourceIngest            *SourceIngestService
 	sourceAgentToken        string
 	sourceAgentMaxBodyBytes int64
 }
@@ -49,6 +51,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = defaultSourceAgentMaxBodyBytes
 	}
+	sourceIngest := cfg.SourceIngest
+	if sourceIngest == nil && cfg.SourceSync != nil {
+		sourceIngest = NewSourceIngestService(store, cfg.SourceSync)
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               strings.TrimSpace(cfg.AuthToken),
@@ -57,6 +63,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		wechat:                  cfg.WeChat,
 		wcplus:                  cfg.WCPlus,
 		sourceSync:              cfg.SourceSync,
+		sourceIngest:            sourceIngest,
 		sourceAgentToken:        strings.TrimSpace(cfg.SourceAgentToken),
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 	}
@@ -798,17 +805,21 @@ func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.R
 	case "items":
 		var payload struct {
 			AgentID string `json:"agent_id"`
-			SourceSyncItemInput
+			SourceArticleEnvelope
 		}
 		if !h.decodeSourceAgentJSON(w, r, &payload) {
 			return
 		}
-		item, err := h.sourceSync.RecordRunItem(runID, payload.AgentID, payload.SourceSyncItemInput)
+		if h.sourceIngest == nil {
+			writeHTTPError(w, http.StatusServiceUnavailable, "source ingestion service is not configured")
+			return
+		}
+		receipt, err := h.sourceIngest.IngestArticle(runID, payload.AgentID, payload.SourceArticleEnvelope)
 		if err != nil {
 			h.writeSourceSyncError(w, err)
 			return
 		}
-		writeHTTPJSON(w, http.StatusCreated, map[string]any{"item": item})
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{"receipt": receipt})
 	case "complete":
 		var payload struct {
 			AgentID string `json:"agent_id"`
@@ -1031,6 +1042,8 @@ func (h *kbaseHTTPHandler) writeSourceSyncError(w http.ResponseWriter, err error
 		errors.Is(err, ErrSourceRunTerminal), errors.Is(err, ErrSourceRunInvalidState),
 		errors.Is(err, ErrSourceRunNotRetryable), errors.Is(err, ErrSourceRunActive):
 		writeHTTPError(w, http.StatusConflict, err.Error())
+	case errors.Is(err, ErrSourceArticleContentTooShort), errors.Is(err, ErrSourceArticleInvalidURL):
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
 	case strings.Contains(strings.ToLower(err.Error()), "required") ||
 		strings.Contains(strings.ToLower(err.Error()), "unsupported"):
 		writeHTTPError(w, http.StatusBadRequest, err.Error())

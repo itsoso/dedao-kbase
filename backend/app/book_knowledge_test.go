@@ -20,14 +20,19 @@ func TestBookKnowledgePackageRoundTrip(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	pkg := BookKnowledgePackage{
 		Book: BookKnowledgeBook{
-			BookID:     "42",
-			DedaoID:    42,
-			EnID:       "enid-42",
-			Title:      "42_测试书_作者",
-			Author:     "作者",
-			SourceHTML: "/tmp/book.html",
-			Status:     "draft",
-			Extractor:  "dedao-gui-fallback",
+			BookID:        "42",
+			DedaoID:       42,
+			EnID:          "enid-42",
+			Title:         "42_测试书_作者",
+			Author:        "作者",
+			SourceHTML:    "/tmp/book.html",
+			Status:        "draft",
+			Extractor:     "dedao-gui-fallback",
+			SourceType:    "wcplus_wechat_article",
+			SourceKey:     "article-42",
+			SourceAccount: "测试账号",
+			PublishedAt:   "2026-07-09T12:00:00Z",
+			ContentHash:   "hash-42",
 		},
 		Chapters: []BookKnowledgeChapter{
 			{
@@ -65,13 +70,17 @@ func TestBookKnowledgePackageRoundTrip(t *testing.T) {
 		},
 		Citations: []BookKnowledgeCitation{
 			{
-				CitationID: "42-citation-1",
-				BookID:     "42",
-				ChapterID:  "42-chapter-1",
-				ChunkID:    "42-chunk-1",
-				SourceHTML: "/tmp/book.html",
-				Anchor:     "第一章",
-				Note:       "自动提取",
+				CitationID:    "42-citation-1",
+				BookID:        "42",
+				ChapterID:     "42-chapter-1",
+				ChunkID:       "42-chunk-1",
+				SourceHTML:    "/tmp/book.html",
+				Anchor:        "第一章",
+				Note:          "自动提取",
+				SourceType:    "wcplus_wechat_article",
+				SourceAccount: "测试账号",
+				SourceItemKey: "article-42",
+				PublishedAt:   "2026-07-09T12:00:00Z",
 			},
 		},
 	}

@@ -18,16 +18,21 @@ const (
 )
 
 type BookKnowledgeBook struct {
-	BookID     string `json:"book_id"`
-	DedaoID    int    `json:"dedao_id,omitempty"`
-	EnID       string `json:"enid,omitempty"`
-	Title      string `json:"title"`
-	Author     string `json:"author,omitempty"`
-	SourceHTML string `json:"source_html,omitempty"`
-	CreatedAt  string `json:"created_at,omitempty"`
-	UpdatedAt  string `json:"updated_at,omitempty"`
-	Status     string `json:"status,omitempty"`
-	Extractor  string `json:"extractor,omitempty"`
+	BookID        string `json:"book_id"`
+	DedaoID       int    `json:"dedao_id,omitempty"`
+	EnID          string `json:"enid,omitempty"`
+	Title         string `json:"title"`
+	Author        string `json:"author,omitempty"`
+	SourceHTML    string `json:"source_html,omitempty"`
+	SourceType    string `json:"source_type,omitempty"`
+	SourceKey     string `json:"source_key,omitempty"`
+	SourceAccount string `json:"source_account,omitempty"`
+	PublishedAt   string `json:"published_at,omitempty"`
+	ContentHash   string `json:"content_hash,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	UpdatedAt     string `json:"updated_at,omitempty"`
+	Status        string `json:"status,omitempty"`
+	Extractor     string `json:"extractor,omitempty"`
 }
 
 type BookKnowledgeChapter struct {
@@ -62,13 +67,17 @@ type BookKnowledgeClaim struct {
 }
 
 type BookKnowledgeCitation struct {
-	CitationID string `json:"citation_id"`
-	BookID     string `json:"book_id"`
-	ChapterID  string `json:"chapter_id,omitempty"`
-	ChunkID    string `json:"chunk_id,omitempty"`
-	SourceHTML string `json:"source_html,omitempty"`
-	Anchor     string `json:"anchor,omitempty"`
-	Note       string `json:"note,omitempty"`
+	CitationID    string `json:"citation_id"`
+	BookID        string `json:"book_id"`
+	ChapterID     string `json:"chapter_id,omitempty"`
+	ChunkID       string `json:"chunk_id,omitempty"`
+	SourceHTML    string `json:"source_html,omitempty"`
+	Anchor        string `json:"anchor,omitempty"`
+	Note          string `json:"note,omitempty"`
+	SourceType    string `json:"source_type,omitempty"`
+	SourceAccount string `json:"source_account,omitempty"`
+	SourceItemKey string `json:"source_item_key,omitempty"`
+	PublishedAt   string `json:"published_at,omitempty"`
 }
 
 type BookKnowledgePackage struct {
