@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/yann0917/dedao-gui/backend/app"
 )
 
 func TestDefaultSystemKBExportPathUsesRepoDirEnv(t *testing.T) {
@@ -85,5 +89,53 @@ func TestDefaultSourceAgentTokenUsesTrimmedEnv(t *testing.T) {
 	t.Setenv("KBASE_SOURCE_AGENT_TOKEN", "  source-agent-secret  ")
 	if got := defaultSourceAgentToken(); got != "source-agent-secret" {
 		t.Fatalf("defaultSourceAgentToken() = %q", got)
+	}
+}
+
+func TestStartSourceSchedulerRequiresSourceAgentTokenAndStopsWithContext(t *testing.T) {
+	runnerStarted := make(chan struct{}, 1)
+	runner := sourceSchedulerRunFunc(func(ctx context.Context, interval time.Duration, onTick func(app.SourceSchedulerTickResult, error)) {
+		runnerStarted <- struct{}{}
+		<-ctx.Done()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	started, done := startSourceScheduler(ctx, "", time.Second, runner, func(string, ...any) {})
+	if started {
+		t.Fatal("scheduler started without source-agent token")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("disabled scheduler completion signal is not closed")
+	}
+	started, done = startSourceScheduler(ctx, "source-agent-secret", time.Second, runner, func(string, ...any) {})
+	if !started {
+		t.Fatal("scheduler did not start with source-agent token")
+	}
+	select {
+	case <-runnerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler runner did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler runner did not stop with context")
+	}
+}
+
+func TestSourceSchedulerTickIntervalUsesBoundedEnvironmentValue(t *testing.T) {
+	t.Setenv("KBASE_SOURCE_SCHEDULER_TICK_SECONDS", "45")
+	if got := sourceSchedulerTickInterval(); got != 45*time.Second {
+		t.Fatalf("sourceSchedulerTickInterval() = %s", got)
+	}
+	t.Setenv("KBASE_SOURCE_SCHEDULER_TICK_SECONDS", "0")
+	if got := sourceSchedulerTickInterval(); got != 30*time.Second {
+		t.Fatalf("zero sourceSchedulerTickInterval() = %s", got)
+	}
+	t.Setenv("KBASE_SOURCE_SCHEDULER_TICK_SECONDS", "9999")
+	if got := sourceSchedulerTickInterval(); got != 5*time.Minute {
+		t.Fatalf("bounded sourceSchedulerTickInterval() = %s", got)
 	}
 }

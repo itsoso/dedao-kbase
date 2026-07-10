@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
 )
@@ -56,9 +62,87 @@ func main() {
 	if !wcplusBaseURLConfiguredFromEnv() {
 		log.Printf("wcplus source: using default local API base http://127.0.0.1:5001")
 	}
-	if err := http.ListenAndServe(*addr, handler); err != nil {
-		log.Fatal(err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	var schedulerDone <-chan struct{}
+	if scheduler, schedulerErr := app.NewSourceScheduler(sourceSync, time.Now); schedulerErr != nil {
+		log.Fatalf("initialize source scheduler: %v", schedulerErr)
+	} else {
+		_, schedulerDone = startSourceScheduler(ctx, *sourceAgentToken, sourceSchedulerTickInterval(), scheduler, log.Printf)
 	}
+
+	server := &http.Server{Addr: *addr, Handler: handler}
+	go func() {
+		<-ctx.Done()
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownContext); err != nil {
+			log.Printf("kbase server shutdown failed: %v", err)
+		}
+	}()
+	listenErr := server.ListenAndServe()
+	stop()
+	if schedulerDone != nil {
+		<-schedulerDone
+	}
+	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
+		log.Fatal(listenErr)
+	}
+}
+
+type sourceSchedulerRunner interface {
+	Run(context.Context, time.Duration, func(app.SourceSchedulerTickResult, error))
+}
+
+type sourceSchedulerRunFunc func(context.Context, time.Duration, func(app.SourceSchedulerTickResult, error))
+
+func (f sourceSchedulerRunFunc) Run(ctx context.Context, interval time.Duration, onTick func(app.SourceSchedulerTickResult, error)) {
+	f(ctx, interval, onTick)
+}
+
+func startSourceScheduler(
+	ctx context.Context,
+	sourceAgentToken string,
+	interval time.Duration,
+	runner sourceSchedulerRunner,
+	logf func(string, ...any),
+) (bool, <-chan struct{}) {
+	done := make(chan struct{})
+	if strings.TrimSpace(sourceAgentToken) == "" || runner == nil {
+		close(done)
+		return false, done
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	go func() {
+		defer close(done)
+		runner.Run(ctx, interval, func(result app.SourceSchedulerTickResult, err error) {
+			if err != nil {
+				logf("source scheduler tick failed: %v", err)
+				return
+			}
+			logf("source scheduler tick: evaluated=%d queued=%d retried=%d disabled=%d manual=%d future=%d active=%d blocked=%d invalid=%d",
+				result.Evaluated, result.Queued, result.Retried, result.SkippedDisabled,
+				result.SkippedManual, result.SkippedFuture, result.SkippedActive,
+				result.SkippedBlocked, result.InvalidSchedule)
+		})
+	}()
+	return true, done
+}
+
+func sourceSchedulerTickInterval() time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(os.Getenv("KBASE_SOURCE_SCHEDULER_TICK_SECONDS")))
+	if err != nil || seconds <= 0 {
+		seconds = 30
+	}
+	if seconds > 300 {
+		seconds = 300
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func envDefault(key string, fallback string) string {
