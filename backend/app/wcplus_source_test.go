@@ -400,6 +400,43 @@ func TestWCPlusSourceCreatesAndControlsTasks(t *testing.T) {
 	}
 }
 
+func TestWCPlusSourceParsesRealAccountListShape(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/gzh/list" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("num") != "1" || r.URL.Query().Get("offset") != "0" {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		fmt.Fprint(w, `{
+			"gzh":[{
+				"Biz":"biz-live-shape",
+				"Nickname":"脱敏账号",
+				"LocalArticleNum":12,
+				"TotalArticleNum":34
+			}],
+			"articles":12,
+			"num":1,
+			"offset":0,
+			"total":2
+		}`)
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	list, err := service.ListAccounts(context.Background(), WCPlusListOptions{Num: 1})
+	if err != nil {
+		t.Fatalf("ListAccounts returned error: %v", err)
+	}
+	if list.Total != 2 || len(list.Accounts) != 1 {
+		t.Fatalf("unexpected account list: %#v", list)
+	}
+	if list.Accounts[0].Biz != "biz-live-shape" || list.Accounts[0].Nickname != "脱敏账号" {
+		t.Fatalf("unexpected account: %#v", list.Accounts[0])
+	}
+}
+
 func TestWCPlusSourceCreatesTypedTasks(t *testing.T) {
 	var payload map[string]any
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

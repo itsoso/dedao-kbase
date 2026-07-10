@@ -237,7 +237,7 @@ func (s *WCPlusSourceService) ListAccounts(ctx context.Context, opts WCPlusListO
 	if err := s.get(ctx, "/api/gzh/list", values, &payload); err != nil {
 		return nil, err
 	}
-	items := wcplusArrayValue(payload, "gzhs", "Gzhs", "accounts", "Accounts", "items", "Items", "list", "List")
+	items := wcplusArrayValue(payload, "gzh", "Gzh", "gzhs", "Gzhs", "accounts", "Accounts", "items", "Items", "list", "List")
 	accounts := make([]WCPlusAccount, 0, len(items))
 	for _, item := range items {
 		account := wcplusAccountFromAny(item)
