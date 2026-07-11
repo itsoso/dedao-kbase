@@ -97,6 +97,11 @@ func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult
 	if err != nil {
 		return result, err
 	}
+	for _, failure := range adapterResult.Failures {
+		if _, err := r.client.ReportItemFailure(ctx, run.ID, failure.SourceItemKey, failure.IdempotencyKey, failure.Error); err != nil {
+			return result, fmt.Errorf("report source item failure: %w", err)
+		}
+	}
 	pending, err := r.outbox.CountPendingForRun(run.ID)
 	if err != nil {
 		return result, err

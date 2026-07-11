@@ -60,7 +60,7 @@ func NewWeChatDiscovery(cfg WeChatDiscoveryConfig) (*WeChatDiscovery, error) {
 	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 20 * time.Second}
 	}
 	return &WeChatDiscovery{baseURL: base, client: client, sessions: cfg.SessionProvider}, nil
 }

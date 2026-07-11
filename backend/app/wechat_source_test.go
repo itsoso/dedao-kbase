@@ -252,3 +252,18 @@ func TestWeChatSourcePreservesTextAndImageDOMOrder(t *testing.T) {
 		t.Fatalf("markdown order=%s", markdown)
 	}
 }
+
+func TestWeChatClientsUseBoundedDefaultTimeouts(t *testing.T) {
+	source := NewWeChatSourceService(WeChatSourceConfig{})
+	media := NewWeChatMediaDownloader(WeChatMediaConfig{})
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{
+		BaseURL:         "https://mp.weixin.qq.com",
+		SessionProvider: staticWeChatSessionProvider{session: WeChatMPSession{Token: "test"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.client.Timeout <= 0 || media.client.Timeout <= 0 || discovery.client.Timeout <= 0 {
+		t.Fatalf("timeouts source=%s media=%s discovery=%s", source.client.Timeout, media.client.Timeout, discovery.client.Timeout)
+	}
+}

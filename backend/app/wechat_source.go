@@ -87,7 +87,7 @@ func WeChatSourceConfigFromEnv() WeChatSourceConfig {
 func NewWeChatSourceService(cfg WeChatSourceConfig) *WeChatSourceService {
 	client := cfg.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	mpBaseURL := strings.TrimRight(strings.TrimSpace(cfg.MPBaseURL), "/")
 	if mpBaseURL == "" {

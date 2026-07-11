@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 type WeChatMediaItem struct {
@@ -42,7 +43,7 @@ type WeChatMediaDownloader struct {
 func NewWeChatMediaDownloader(cfg WeChatMediaConfig) *WeChatMediaDownloader {
 	client := cfg.HTTPClient
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: 30 * time.Second}
 	}
 	hosts := map[string]bool{"mmbiz.qpic.cn": true, "mmbiz.qlogo.cn": true}
 	if len(cfg.Hosts) > 0 {

@@ -109,6 +109,64 @@ func TestSourceAgentCapabilityHealthMapsLegacyWCPlusFields(t *testing.T) {
 	}
 }
 
+func TestSourceSyncNormalizesWeChatSubscriptionOptions(t *testing.T) {
+	input, _, err := normalizeSourceSubscriptionInput(SourceSubscriptionInput{
+		SourceType:       "wechat_mp_article",
+		SourceAccountKey: "account-key",
+		Operation:        "sync_articles",
+		Schedule:         "interval:60",
+		Options: map[string]any{
+			"page_size":     float64(999),
+			"max_items":     float64(999),
+			"include_media": true,
+			"title_query":   strings.Repeat("筛", 150),
+			"ignored":       "value",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceAgentOptionInt(input.Options, "page_size", 0, 1000) != 20 || sourceAgentOptionInt(input.Options, "max_items", 0, 1000) != 100 {
+		t.Fatalf("options=%#v", input.Options)
+	}
+	if !sourceAgentOptionBool(input.Options, "include_media", false) || len([]rune(sourceAgentOptionString(input.Options, "title_query", ""))) != 100 {
+		t.Fatalf("options=%#v", input.Options)
+	}
+	if _, ok := input.Options["ignored"]; ok {
+		t.Fatalf("unexpected option survived: %#v", input.Options)
+	}
+}
+
+func TestSourceSyncClampsWeChatSubscriptionBatchSizesToOne(t *testing.T) {
+	input, _, err := normalizeSourceSubscriptionInput(SourceSubscriptionInput{
+		SourceType:       "wechat_mp_article",
+		SourceAccountKey: "account-key",
+		Operation:        "sync_articles",
+		Schedule:         "manual",
+		Options: map[string]any{
+			"page_size": float64(0),
+			"max_items": float64(0),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sourceAgentOptionInt(input.Options, "page_size", 0, 1000) != 1 || sourceAgentOptionInt(input.Options, "max_items", 0, 1000) != 1 {
+		t.Fatalf("options=%#v", input.Options)
+	}
+}
+
+func TestSourceSyncRejectsUnsafeWeChatSubscriptionContract(t *testing.T) {
+	for _, input := range []SourceSubscriptionInput{
+		{SourceType: "wechat_mp_article", SourceAccountKey: "account", Operation: "unknown", Schedule: "manual"},
+		{SourceType: "wechat_mp_article", SourceAccountKey: "account", Operation: "sync_articles", Schedule: "interval:1"},
+	} {
+		if _, _, err := normalizeSourceSubscriptionInput(input); err == nil {
+			t.Fatalf("accepted input=%#v", input)
+		}
+	}
+}
+
 func TestSourceSyncStoreSetSubscriptionEnabledPreservesAgentCursor(t *testing.T) {
 	clock := newSourceSyncTestClock(time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC))
 	store, err := newSourceSyncStore(t.TempDir(), clock.Now)

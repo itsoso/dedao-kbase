@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -16,19 +17,27 @@ import (
 type recordingSourceEnvelopeSink struct {
 	envelopes []SourceArticleEnvelope
 	failItem  string
+	failErr   error
 }
 
 type recordingWeChatAssetUploader struct {
 	assets []SourceAssetEnvelope
+	fail   bool
 }
 
 func (u *recordingWeChatAssetUploader) UploadAsset(_ context.Context, _ string, asset SourceAssetEnvelope) (SourceAssetReference, error) {
+	if u.fail {
+		return SourceAssetReference{}, fmt.Errorf("asset upload failed")
+	}
 	u.assets = append(u.assets, asset)
 	return SourceAssetReference{SHA256: asset.SHA256, ContentType: asset.ContentType, Size: int64(len(asset.Data))}, nil
 }
 
 func (s *recordingSourceEnvelopeSink) Enqueue(_ string, envelope SourceArticleEnvelope) (SourceAgentOutboxItem, error) {
 	if envelope.SourceItemID == s.failItem {
+		if s.failErr != nil {
+			return SourceAgentOutboxItem{}, s.failErr
+		}
 		return SourceAgentOutboxItem{}, fmt.Errorf("enqueue %s failed", envelope.SourceItemID)
 	}
 	s.envelopes = append(s.envelopes, envelope)
@@ -271,6 +280,36 @@ func TestWeChatAgentDoesNotAdvancePastFailure(t *testing.T) {
 	}
 }
 
+func TestWeChatAgentRecordsPermanentArticleRejectionAndContinues(t *testing.T) {
+	adapter := newFailureTestWeChatAgentAdapter(t, "")
+	sink := &recordingSourceEnvelopeSink{failItem: "article-2", failErr: ErrSourceArticleContentTooShort}
+	result, err := adapter.Execute(context.Background(), SourceSyncRun{
+		ID:                 "run-rejection",
+		RequestedOperation: "sync_articles",
+		Subscription: &SourceSubscription{
+			SourceAccountKey: "account-key",
+			SourceAccount:    "Account",
+			Options:          map[string]any{"max_items": float64(3)},
+		},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Failures) != 1 || result.Failures[0].SourceItemKey != "article-2" {
+		t.Fatalf("failures=%#v", result.Failures)
+	}
+	if len(sink.envelopes) != 2 || sink.envelopes[0].SourceItemID != "article-1" || sink.envelopes[1].SourceItemID != "article-3" {
+		t.Fatalf("envelopes=%#v", sink.envelopes)
+	}
+	cursor, err := decodeWeChatAgentCursor(result.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.UpstreamBegin != 1 || cursor.PublicationItemIndex != 0 {
+		t.Fatalf("cursor=%#v", cursor)
+	}
+}
+
 func TestWeChatAgentSyncMediaUploadsAssetsAndRewritesArticle(t *testing.T) {
 	mediaData := []byte("\x89PNG\r\n\x1a\nsanitized-media")
 	mediaServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -340,6 +379,24 @@ func TestWeChatAgentSyncMediaUploadsAssetsAndRewritesArticle(t *testing.T) {
 	if cursor.UpstreamBegin != 1 || cursor.PublicationItemIndex != 0 {
 		t.Fatalf("cursor=%#v", cursor)
 	}
+
+	uploader.fail = true
+	partialSink := &recordingSourceEnvelopeSink{}
+	partial, err := adapter.Execute(context.Background(), SourceSyncRun{
+		ID:                 "run-media-partial",
+		RequestedOperation: "sync_media",
+		Subscription: &SourceSubscription{
+			SourceAccountKey: "account-key",
+			SourceAccount:    "Account",
+			Options:          map[string]any{"max_items": float64(1)},
+		},
+	}, partialSink)
+	if err != nil {
+		t.Fatalf("partial Execute() error=%v", err)
+	}
+	if len(partialSink.envelopes) != 1 || len(partial.Failures) != 1 || partial.Failures[0].SourceItemKey != "article-media" {
+		t.Fatalf("partial=%#v envelopes=%#v", partial, partialSink.envelopes)
+	}
 }
 
 func TestWeChatAgentIdempotencyKeyIsScopedToSourceItem(t *testing.T) {
@@ -347,6 +404,127 @@ func TestWeChatAgentIdempotencyKeyIsScopedToSourceItem(t *testing.T) {
 	second := weChatArticleIdempotencyKey("account", "article-2", "same content")
 	if first == second || first != weChatArticleIdempotencyKey("account", "article-1", "same content") {
 		t.Fatalf("first=%q second=%q", first, second)
+	}
+}
+
+func TestWeChatAgentCommitsFrontierAndOnlyProcessesNewArticles(t *testing.T) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<html><body><h1 id="activity-name">Article %s</h1><a id="js_name">Account</a><div id="js_content"><p>Article %s contains enough content for deterministic frontier testing.</p></div></body></html>`, r.URL.Path, r.URL.Path)
+	}))
+	defer articleServer.Close()
+	articles := []WeChatOfficialArticle{
+		{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 102},
+		{Title: "Article 2", Link: articleServer.URL + "/2", AID: "article-2", UpdateTime: 101},
+	}
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		begin, _ := strconv.Atoi(r.URL.Query().Get("begin"))
+		publishList := []map[string]any{}
+		if begin == 0 {
+			publishInfo, _ := json.Marshal(map[string]any{"appmsgex": articles})
+			publishList = append(publishList, map[string]any{"publish_info": string(publishInfo)})
+		}
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": publishList})
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 0}, "publish_page": string(publishPage)})
+	}))
+	defer discoveryServer.Close()
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery, Source: newTestWeChatSourceService(t, articleServer)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := SourceSyncRun{ID: "run-frontier", RequestedOperation: "sync_articles", Subscription: &SourceSubscription{SourceAccountKey: "account-key", SourceAccount: "Account", Options: map[string]any{"max_items": float64(10)}}}
+
+	firstSink := &recordingSourceEnvelopeSink{}
+	first, err := adapter.Execute(context.Background(), run, firstSink)
+	if err != nil || len(firstSink.envelopes) != 2 {
+		t.Fatalf("first result=%#v envelopes=%d err=%v", first, len(firstSink.envelopes), err)
+	}
+	run.Subscription.Cursor = first.Cursor
+	secondSink := &recordingSourceEnvelopeSink{}
+	second, err := adapter.Execute(context.Background(), run, secondSink)
+	if err != nil || len(secondSink.envelopes) != 0 {
+		t.Fatalf("second result=%#v envelopes=%d err=%v", second, len(secondSink.envelopes), err)
+	}
+	secondCursor, err := decodeWeChatAgentCursor(second.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondCursor.UpstreamBegin != 0 || secondCursor.FrontierArticleKey != "article-1" {
+		t.Fatalf("committed cursor=%#v", secondCursor)
+	}
+
+	run.Subscription.Cursor = second.Cursor
+	unchangedSink := &recordingSourceEnvelopeSink{}
+	unchanged, err := adapter.Execute(context.Background(), run, unchangedSink)
+	if err != nil || len(unchangedSink.envelopes) != 0 {
+		t.Fatalf("unchanged result=%#v envelopes=%d err=%v", unchanged, len(unchangedSink.envelopes), err)
+	}
+	articles = append([]WeChatOfficialArticle{{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 103}}, articles...)
+	run.Subscription.Cursor = unchanged.Cursor
+	newSink := &recordingSourceEnvelopeSink{}
+	newResult, err := adapter.Execute(context.Background(), run, newSink)
+	if err != nil || len(newSink.envelopes) != 1 || newSink.envelopes[0].SourceItemID != "article-3" {
+		t.Fatalf("new result=%#v envelopes=%#v err=%v", newResult, newSink.envelopes, err)
+	}
+	newCursor, err := decodeWeChatAgentCursor(newResult.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newCursor.UpstreamBegin != 0 || newCursor.FrontierArticleKey != "article-3" {
+		t.Fatalf("new cursor=%#v", newCursor)
+	}
+}
+
+func TestWeChatAgentSetsInitialFrontierToNewestFilteredMatch(t *testing.T) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `<html><body><h1 id="activity-name">%s</h1><a id="js_name">Account</a><div id="js_content"><p>This filtered article contains enough content for frontier testing.</p></div></body></html>`, r.URL.Path)
+	}))
+	defer articleServer.Close()
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		begin, _ := strconv.Atoi(r.URL.Query().Get("begin"))
+		publishList := []map[string]any{}
+		if begin < 3 {
+			title := "Ignored article"
+			aid := "ignored"
+			if begin > 0 {
+				title = "Selected article"
+				aid = fmt.Sprintf("selected-%d", begin)
+			}
+			publishInfo, _ := json.Marshal(map[string]any{"appmsgex": []WeChatOfficialArticle{{Title: title, Link: articleServer.URL + "/" + aid, AID: aid, UpdateTime: int64(103 - begin)}}})
+			publishList = append(publishList, map[string]any{"publish_info": string(publishInfo)})
+		}
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": publishList})
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 0}, "publish_page": string(publishPage)})
+	}))
+	defer discoveryServer.Close()
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery, Source: newTestWeChatSourceService(t, articleServer)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := SourceSyncRun{ID: "run-filtered-frontier", RequestedOperation: "sync_articles", Subscription: &SourceSubscription{SourceAccountKey: "account-key", SourceAccount: "Account", Options: map[string]any{"max_items": float64(10), "title_query": "Selected"}}}
+	for cycle := 0; cycle < 4; cycle++ {
+		result, executeErr := adapter.Execute(context.Background(), run, &recordingSourceEnvelopeSink{})
+		if executeErr != nil {
+			t.Fatal(executeErr)
+		}
+		run.Subscription.Cursor = result.Cursor
+	}
+	cursor, err := decodeWeChatAgentCursor(run.Subscription.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.FrontierArticleKey != "selected-1" || cursor.UpstreamBegin != 0 {
+		t.Fatalf("cursor=%#v", cursor)
 	}
 }
 

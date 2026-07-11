@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -30,13 +31,17 @@ type WeChatSourceAdapter struct {
 	assets    WeChatAssetUploader
 }
 
-const weChatAgentCursorVersion = 1
+const weChatAgentCursorVersion = 2
 
 type weChatAgentCursor struct {
 	UpstreamBegin        int    `json:"upstream_begin"`
 	PublicationItemIndex int    `json:"publication_item_index"`
 	LastArticleKey       string `json:"last_article_key,omitempty"`
 	LastTimestamp        int64  `json:"last_timestamp,omitempty"`
+	FrontierArticleKey   string `json:"frontier_article_key,omitempty"`
+	FrontierTimestamp    int64  `json:"frontier_timestamp,omitempty"`
+	PendingFrontierKey   string `json:"pending_frontier_key,omitempty"`
+	PendingFrontierTime  int64  `json:"pending_frontier_timestamp,omitempty"`
 }
 
 func NewWeChatSourceAdapter(cfg WeChatSourceAdapterConfig) (*WeChatSourceAdapter, error) {
@@ -80,13 +85,23 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	}
 	items := page.Articles
 	next := cursor
+	failures := make([]SourceAdapterItemFailure, 0)
+	if next.PublicationItemIndex == 0 && next.PendingFrontierKey == "" && len(items) > 0 {
+		next.PendingFrontierKey = items[0].ArticleKey
+		next.PendingFrontierTime = items[0].UpdateTime
+	}
+	processableEnd, reachedFrontier := weChatAgentPageBoundary(cursor.FrontierArticleKey, items)
 	if run.RequestedOperation == "discover_articles" {
-		next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
-		next.PublicationItemIndex = 0
-		if len(items) > 0 {
-			next.LastArticleKey = items[len(items)-1].ArticleKey
-			next.LastTimestamp = items[len(items)-1].UpdateTime
+		if next.PublicationItemIndex > processableEnd {
+			return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
 		}
+		if processableEnd > next.PublicationItemIndex {
+			last := items[processableEnd-1]
+			next.LastArticleKey = last.ArticleKey
+			next.LastTimestamp = last.UpdateTime
+		}
+		next.PublicationItemIndex = processableEnd
+		advanceWeChatAgentPage(&next, page, processableEnd, reachedFrontier)
 		encoded, err := encodeWeChatAgentCursor(next)
 		if err != nil {
 			return SourceAdapterResult{}, err
@@ -103,10 +118,10 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	if includeMedia && (a.media == nil || a.assets == nil) {
 		return SourceAdapterResult{}, fmt.Errorf("wechat media downloader and asset uploader are required")
 	}
-	if next.PublicationItemIndex > len(items) {
+	if next.PublicationItemIndex > processableEnd {
 		return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
 	}
-	items = items[next.PublicationItemIndex:]
+	items = items[next.PublicationItemIndex:processableEnd]
 	if len(items) > maxItems {
 		items = items[:maxItems]
 	}
@@ -121,25 +136,66 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 			content, mediaErr = a.archiveArticleMedia(ctx, run.ID, item.ArticleKey, article)
 		}
 		envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: weChatArticleIdempotencyKey(run.Subscription.SourceAccountKey, item.ArticleKey, content), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: article.PublishedAt, Content: content, ContentFormat: "markdown"}
+		itemErr := mediaErr
 		if _, err := sink.Enqueue(run.ID, envelope); err != nil {
-			return weChatAdapterFailure(next, err)
+			if errors.Is(err, ErrSourceArticleContentTooShort) || errors.Is(err, ErrSourceArticleInvalidURL) {
+				itemErr = err
+			} else {
+				return weChatAdapterFailure(next, err)
+			}
 		}
-		if mediaErr != nil {
-			return weChatAdapterFailure(next, mediaErr)
+		if itemErr != nil {
+			failures = append(failures, SourceAdapterItemFailure{
+				SourceItemKey:  item.ArticleKey,
+				IdempotencyKey: envelope.IdempotencyKey,
+				Error:          itemErr.Error(),
+			})
 		}
 		next.PublicationItemIndex++
 		next.LastArticleKey = item.ArticleKey
 		next.LastTimestamp = item.UpdateTime
 	}
-	if len(page.Articles) == 0 || next.PublicationItemIndex >= len(page.Articles) {
-		next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
-		next.PublicationItemIndex = 0
-	}
+	advanceWeChatAgentPage(&next, page, processableEnd, reachedFrontier)
 	encoded, err := encodeWeChatAgentCursor(next)
 	if err != nil {
 		return SourceAdapterResult{}, err
 	}
-	return SourceAdapterResult{Cursor: encoded}, nil
+	return SourceAdapterResult{Cursor: encoded, Failures: failures}, nil
+}
+
+func weChatAgentPageBoundary(frontier string, items []WeChatDiscoveredArticle) (int, bool) {
+	frontier = strings.TrimSpace(frontier)
+	if frontier == "" {
+		return len(items), false
+	}
+	for index, item := range items {
+		if item.ArticleKey == frontier {
+			return index, true
+		}
+	}
+	return len(items), false
+}
+
+func advanceWeChatAgentPage(cursor *weChatAgentCursor, page WeChatDiscoveryPage, processableEnd int, reachedFrontier bool) {
+	if cursor.PublicationItemIndex < processableEnd {
+		return
+	}
+	if reachedFrontier || page.PublicationCount == 0 {
+		if cursor.PendingFrontierKey != "" {
+			cursor.FrontierArticleKey = cursor.PendingFrontierKey
+			cursor.FrontierTimestamp = cursor.PendingFrontierTime
+		} else if cursor.FrontierArticleKey == "" && cursor.LastArticleKey != "" {
+			cursor.FrontierArticleKey = cursor.LastArticleKey
+			cursor.FrontierTimestamp = cursor.LastTimestamp
+		}
+		cursor.PendingFrontierKey = ""
+		cursor.PendingFrontierTime = 0
+		cursor.UpstreamBegin = 0
+		cursor.PublicationItemIndex = 0
+		return
+	}
+	cursor.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
+	cursor.PublicationItemIndex = 0
 }
 
 func (a *WeChatSourceAdapter) archiveArticleMedia(ctx context.Context, runID, articleKey string, article *WeChatArticle) (string, error) {
@@ -213,7 +269,7 @@ func decodeWeChatAgentCursor(raw string) (weChatAgentCursor, error) {
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return weChatAgentCursor{}, fmt.Errorf("invalid cursor")
 	}
-	if payload.Version != 0 && payload.Version != weChatAgentCursorVersion {
+	if payload.Version != 0 && payload.Version != 1 && payload.Version != weChatAgentCursorVersion {
 		return weChatAgentCursor{}, fmt.Errorf("unsupported cursor version")
 	}
 	if err := validateWeChatAgentCursor(payload.weChatAgentCursor); err != nil {

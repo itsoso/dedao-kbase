@@ -574,6 +574,9 @@ func normalizeSourceSubscriptionInput(input SourceSubscriptionInput) (SourceSubs
 	if input.SourceType == "" {
 		return input, "", fmt.Errorf("source_type is required")
 	}
+	if len([]rune(input.SourceType)) > 64 || len([]rune(input.SourceAccountKey)) > 512 || len([]rune(input.SourceAccount)) > 512 || len([]rune(input.AgentID)) > 128 || len([]rune(input.Cursor)) > 1000 || len([]rune(input.Operation)) > 64 {
+		return input, "", fmt.Errorf("source subscription field exceeds length limit")
+	}
 	if input.SourceAccountKey == "" {
 		return input, "", fmt.Errorf("source_account_key is required")
 	}
@@ -584,12 +587,49 @@ func normalizeSourceSubscriptionInput(input SourceSubscriptionInput) (SourceSubs
 		input.Schedule = "manual"
 	}
 	if input.Operation == "" {
-		input.Operation = "existing_articles"
+		if input.SourceType == "wechat_mp_article" {
+			input.Operation = "sync_articles"
+		} else {
+			input.Operation = "existing_articles"
+		}
 	}
 	if input.Options == nil {
 		input.Options = map[string]any{}
 	}
+	if input.SourceType == "wechat_mp_article" {
+		if interval, scheduled, scheduleErr := sourceSubscriptionInterval(input.Schedule); scheduleErr != nil {
+			return input, "", scheduleErr
+		} else if scheduled && interval < time.Minute {
+			return input, "", fmt.Errorf("source schedule interval must be at least 60 seconds")
+		}
+		switch input.Operation {
+		case "discover_articles", "sync_articles", "sync_media":
+		default:
+			return input, "", fmt.Errorf("unsupported wechat source operation %q", input.Operation)
+		}
+		titleQuery := []rune(strings.TrimSpace(sourceAgentOptionString(input.Options, "title_query", "")))
+		if len(titleQuery) > 100 {
+			titleQuery = titleQuery[:100]
+		}
+		pageSize := sourceAgentOptionInt(input.Options, "page_size", 10, 20)
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		maxItems := sourceAgentOptionInt(input.Options, "max_items", 100, 100)
+		if maxItems < 1 {
+			maxItems = 1
+		}
+		input.Options = map[string]any{
+			"page_size":     pageSize,
+			"max_items":     maxItems,
+			"include_media": sourceAgentOptionBool(input.Options, "include_media", true),
+			"title_query":   string(titleQuery),
+		}
+	}
 	optionsJSON, err := json.Marshal(input.Options)
+	if err == nil && len(optionsJSON) > 16<<10 {
+		return input, "", fmt.Errorf("source subscription options exceed byte limit")
+	}
 	return input, string(optionsJSON), err
 }
 

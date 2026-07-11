@@ -127,3 +127,64 @@ func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 		t.Fatalf("calls=%v, want upload before fail", calls)
 	}
 }
+
+func TestSourceAgentRunnerReportsAdapterItemFailuresBeforeCompletion(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a"}}`)
+		case "/api/source-agent/lease":
+			fmt.Fprint(w, `{"run":{"id":"run-partial","status":"running","requested_operation":"sync_fake","subscription":{"id":"sub-1","source_account_key":"account-key","source_account":"Account"}}}`)
+		case "/api/source-agent/runs/run-partial/items":
+			var payload struct {
+				SourceItemKey string `json:"source_item_key"`
+				Error         string `json:"error"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode item failure: %v", err)
+			}
+			if payload.SourceItemKey != "article-media" || payload.Error != "media archival failed" {
+				t.Errorf("failure payload=%#v", payload)
+			}
+			calls = append(calls, "failure")
+			fmt.Fprint(w, `{"item":{"source_item_key":"article-media","outcome":"failed"}}`)
+		case "/api/source-agent/runs/run-partial/complete":
+			calls = append(calls, "complete")
+			fmt.Fprint(w, `{"run":{"id":"run-partial","status":"partial"}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(), HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	adapter := &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}, result: SourceAdapterResult{
+		Cursor: "cursor-partial",
+		Failures: []SourceAdapterItemFailure{{
+			SourceItemKey:  "article-media",
+			IdempotencyKey: "failure-idem",
+			Error:          "media archival failed",
+		}},
+	}}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != SourceRunPartial || strings.Join(calls, ",") != "failure,complete" {
+		t.Fatalf("result=%#v calls=%v", result, calls)
+	}
+}

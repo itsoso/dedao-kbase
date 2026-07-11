@@ -10,7 +10,14 @@ type SourceEnvelopeSink interface {
 }
 
 type SourceAdapterResult struct {
-	Cursor string
+	Cursor   string
+	Failures []SourceAdapterItemFailure
+}
+
+type SourceAdapterItemFailure struct {
+	SourceItemKey  string
+	IdempotencyKey string
+	Error          string
 }
 
 type SourceAdapterExecutionError struct {
