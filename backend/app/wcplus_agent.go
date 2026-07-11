@@ -207,7 +207,7 @@ func (a *WCPlusAgent) executeArticleRun(ctx context.Context, run SourceSyncRun) 
 	needsLinkTask := run.RequestedOperation == "sync_links" ||
 		(run.RequestedOperation == "sync_content" && len(list.Articles) == 0)
 	if needsLinkTask {
-		if err := a.runAccountTask(ctx, run.ID, *subscription, "gzh_article_link", limit, func(ctx context.Context) (bool, error) {
+		if err := a.runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "gzh_article_link", limit, func(ctx context.Context) (bool, error) {
 			verified, err := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
 				Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: 1,
 			})
@@ -242,7 +242,7 @@ func (a *WCPlusAgent) executeArticleRun(ctx context.Context, run SourceSyncRun) 
 	}
 	if run.RequestedOperation == "sync_content" && len(failedIndexes) > 0 {
 		sample := results[failedIndexes[0]].article
-		if err := a.runAccountTask(ctx, run.ID, *subscription, "article", limit, func(ctx context.Context) (bool, error) {
+		if err := a.runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "article", limit, func(ctx context.Context) (bool, error) {
 			content, verifyErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, sample)
 			return verifyErr == nil && content != nil && strings.TrimSpace(content.Content) != "", verifyErr
 		}); err != nil {
@@ -274,9 +274,20 @@ func (a *WCPlusAgent) executeArticleRun(ctx context.Context, run SourceSyncRun) 
 
 func (a *WCPlusAgent) executeReadingDataRun(ctx context.Context, run SourceSyncRun) error {
 	subscription := *run.Subscription
+	imageURL := sourceAgentOptionString(subscription.Options, "image_url", "")
+	if imageURL == "" {
+		list, err := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
+			Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: 1,
+		})
+		if err != nil {
+			return err
+		}
+		imageURL = list.Account.ImageURL
+	}
 	request := WCPlusTaskRequest{
 		Biz:                  subscription.SourceAccountKey,
 		Nickname:             subscription.SourceAccount,
+		ImageURL:             imageURL,
 		CrawlerType:          "reading_data",
 		ReadingDataType:      sourceAgentOptionString(subscription.Options, "reading_data_type", "all"),
 		ReadingDataStartDate: int64(sourceAgentOptionInt(subscription.Options, "reading_data_start", 0, int(^uint(0)>>1))),
@@ -297,6 +308,7 @@ func (a *WCPlusAgent) runAccountTask(
 	ctx context.Context,
 	runID string,
 	subscription SourceSubscription,
+	imageURL string,
 	crawlerType string,
 	limit int,
 	verify func(context.Context) (bool, error),
@@ -304,6 +316,7 @@ func (a *WCPlusAgent) runAccountTask(
 	request := WCPlusTaskRequest{
 		Biz:                  subscription.SourceAccountKey,
 		Nickname:             subscription.SourceAccount,
+		ImageURL:             sourceAgentOptionString(subscription.Options, "image_url", imageURL),
 		CrawlerType:          crawlerType,
 		ArticleListType:      sourceAgentOptionString(subscription.Options, "article_list_type", "amount"),
 		ArticleListDate:      int64(sourceAgentOptionInt(subscription.Options, "article_list_date", 0, int(^uint(0)>>1))),

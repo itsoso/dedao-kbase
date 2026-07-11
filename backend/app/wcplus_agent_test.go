@@ -111,16 +111,16 @@ func TestWCPlusAgentCreatesLinkTaskAndVerifiesDisappearance(t *testing.T) {
 		case "/api/report/gzh_articles":
 			listCalls++
 			if !taskFinished {
-				fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考"},"articles":[],"total":0}`)
+				fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[],"total":0}`)
 				return
 			}
-			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考"},"articles":[{"ID":"article-1","Title":"任务后文章","URL":"https://mp.weixin.qq.com/s/article-1"}],"total":1}`)
+			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[{"ID":"article-1","Title":"任务后文章","URL":"https://mp.weixin.qq.com/s/article-1"}],"total":1}`)
 		case "/api/task/new":
 			var payload WCPlusTaskRequest
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				t.Fatalf("decode task: %v", err)
 			}
-			if payload.CrawlerType != "gzh_article_link" || payload.Biz != "biz-med" {
+			if payload.CrawlerType != "gzh_article_link" || payload.Biz != "biz-med" || payload.ImageURL != "https://example.test/account.png" {
 				t.Fatalf("task payload = %#v", payload)
 			}
 			fmt.Fprint(w, `{"task_id":"task-link-1","status":"ready"}`)
@@ -164,6 +164,48 @@ func TestWCPlusAgentCreatesLinkTaskAndVerifiesDisappearance(t *testing.T) {
 	}
 	if len(progress) != 1 || progress[0].ArticleFinished != 1 {
 		t.Fatalf("progress = %#v", progress)
+	}
+}
+
+func TestWCPlusAgentIncludesAccountImageInReadingDataTask(t *testing.T) {
+	taskCreated := false
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			fmt.Fprint(w, `{"ok":true}`)
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[],"total":0}`)
+		case "/api/task/new":
+			var payload WCPlusTaskRequest
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode task: %v", err)
+			}
+			if payload.CrawlerType != "reading_data" || payload.ImageURL != "https://example.test/account.png" {
+				t.Fatalf("task payload = %#v", payload)
+			}
+			taskCreated = true
+			fmt.Fprint(w, `{"task_id":"task-reading-1","status":"ready"}`)
+		case "/api/task/control":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/api/task/all":
+			fmt.Fprint(w, `{"tasks":[{"ID":"task-reading-1","Status":"succeeded"}]}`)
+		default:
+			t.Fatalf("unexpected local path: %s", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+
+	harness := newWCPlusAgentServerHarness(t, "sync_reading_data", nil, nil)
+	defer harness.Close()
+	agent := newTestWCPlusAgent(t, harness.RemoteURL, local.URL, t.TempDir(), nil)
+	defer agent.Close()
+	result, err := agent.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce returned error: %v", err)
+	}
+	if result.Status != SourceRunSucceeded || !taskCreated {
+		t.Fatalf("result=%#v taskCreated=%v", result, taskCreated)
 	}
 }
 

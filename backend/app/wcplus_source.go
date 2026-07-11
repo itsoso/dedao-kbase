@@ -47,6 +47,7 @@ type WCPlusArticleListOptions struct {
 type WCPlusAccount struct {
 	Biz          string `json:"biz"`
 	Nickname     string `json:"nickname"`
+	ImageURL     string `json:"image_url,omitempty"`
 	Alias        string `json:"alias,omitempty"`
 	Desc         string `json:"desc,omitempty"`
 	ArticleCount int    `json:"article_count,omitempty"`
@@ -898,6 +899,7 @@ func wcplusAccountFromAny(value any) WCPlusAccount {
 	return WCPlusAccount{
 		Biz:          wcplusStringValue(value, "biz", "Biz", "fakeid", "FakeID"),
 		Nickname:     wcplusStringValue(value, "nickname", "Nickname", "name", "Name"),
+		ImageURL:     wcplusStringValue(value, "img", "Img", "head_img", "HeadImg", "avatar", "Avatar", "image_url", "ImageURL"),
 		Alias:        wcplusStringValue(value, "alias", "Alias"),
 		Desc:         wcplusStringValue(value, "desc", "Desc"),
 		ArticleCount: wcplusIntValue(value, "article_count", "ArticleCount", "articleCount", "total", "Total"),

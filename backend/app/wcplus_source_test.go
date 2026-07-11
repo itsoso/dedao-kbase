@@ -23,7 +23,7 @@ func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 			if got := r.URL.Query().Get("num"); got != "10" {
 				t.Fatalf("num = %q", got)
 			}
-			fmt.Fprint(w, `{"success":true,"data":{"gzhs":[{"biz":"biz-1","nickname":"医学参考","alias":"med-ref","desc":"医学知识","article_count":2}],"total":1}}`)
+			fmt.Fprint(w, `{"success":true,"data":{"gzhs":[{"biz":"biz-1","nickname":"医学参考","img":"https://example.test/account.png","alias":"med-ref","desc":"医学知识","article_count":2}],"total":1}}`)
 		case "/api/report/gzh_articles":
 			if got := r.URL.Query().Get("biz"); got != "biz-1" {
 				t.Fatalf("biz = %q", got)
@@ -34,7 +34,7 @@ func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 			if got := r.URL.Query().Get("direction"); got != "desc" {
 				t.Fatalf("default direction = %q", got)
 			}
-			fmt.Fprint(w, `{"success":true,"data":{"gzh":{"biz":"biz-1","nickname":"医学参考"},"articles":[{"id":"wx-1","title":"验证文章","nickname":"医学参考","url":"https://mp.weixin.qq.com/s/wx1","digest":"摘要","publish_time":"2026-07-06"}],"total":1}}`)
+			fmt.Fprint(w, `{"success":true,"data":{"gzh":{"biz":"biz-1","nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[{"id":"wx-1","title":"验证文章","nickname":"医学参考","url":"https://mp.weixin.qq.com/s/wx1","digest":"摘要","publish_time":"2026-07-06"}],"total":1}}`)
 		case "/api/article/content":
 			if got := r.URL.Query().Get("nickname"); got != "医学参考" {
 				t.Fatalf("nickname = %q", got)
@@ -55,7 +55,7 @@ func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAccounts returned error: %v", err)
 	}
-	if len(accounts.Accounts) != 1 || accounts.Accounts[0].Biz != "biz-1" || accounts.Total != 1 {
+	if len(accounts.Accounts) != 1 || accounts.Accounts[0].Biz != "biz-1" || accounts.Accounts[0].ImageURL != "https://example.test/account.png" || accounts.Total != 1 {
 		t.Fatalf("unexpected accounts: %#v", accounts)
 	}
 
@@ -63,7 +63,7 @@ func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListAccountArticles returned error: %v", err)
 	}
-	if len(articles.Articles) != 1 || articles.Articles[0].Title != "验证文章" || articles.Account.Nickname != "医学参考" {
+	if len(articles.Articles) != 1 || articles.Articles[0].Title != "验证文章" || articles.Account.Nickname != "医学参考" || articles.Account.ImageURL != "https://example.test/account.png" {
 		t.Fatalf("unexpected articles: %#v", articles)
 	}
 
