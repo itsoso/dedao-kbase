@@ -3,14 +3,16 @@ package app
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
 
 func TestWeChatSourceDownloadsArticleAsMarkdown(t *testing.T) {
-	articleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, `<!doctype html>
 <html>
@@ -29,7 +31,7 @@ func TestWeChatSourceDownloadsArticleAsMarkdown(t *testing.T) {
 	}))
 	defer articleServer.Close()
 
-	service := NewWeChatSourceService(WeChatSourceConfig{})
+	service := newTestWeChatSourceService(t, articleServer)
 	article, err := service.DownloadArticle(context.Background(), articleServer.URL+"/s/test")
 	if err != nil {
 		t.Fatalf("DownloadArticle returned error: %v", err)
@@ -56,6 +58,104 @@ func TestWeChatSourceDownloadsArticleAsMarkdown(t *testing.T) {
 	if !strings.Contains(article.Text, "第二段包含可检索内容。") {
 		t.Fatalf("Text missing normalized body: %q", article.Text)
 	}
+}
+
+func TestWeChatSourceRejectsNonWeChatArticleURLs(t *testing.T) {
+	service := NewWeChatSourceService(WeChatSourceConfig{
+		ResolveHost: publicTestResolver,
+	})
+
+	for _, rawURL := range []string{
+		"http://mp.weixin.qq.com/s/demo",
+		"https://example.com/s/demo",
+		"https://user:pass@mp.weixin.qq.com/s/demo",
+		"https://mp.weixin.qq.com:8443/s/demo",
+	} {
+		t.Run(rawURL, func(t *testing.T) {
+			if _, err := service.DownloadArticle(context.Background(), rawURL); err == nil {
+				t.Fatalf("DownloadArticle(%q) succeeded, want policy rejection", rawURL)
+			}
+		})
+	}
+}
+
+func TestWeChatSourceRevalidatesEveryRedirect(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><h1 id="activity-name">unexpected</h1></html>`)
+	}))
+	defer target.Close()
+
+	redirect := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetURL, err := url.Parse(target.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		targetURL.Host = "localhost:" + targetURL.Port()
+		http.Redirect(w, r, targetURL.String()+"/s/escaped", http.StatusFound)
+	}))
+	defer redirect.Close()
+
+	redirectURL, _ := url.Parse(redirect.URL)
+	targetURL, _ := url.Parse(target.URL)
+	service := NewWeChatSourceService(WeChatSourceConfig{
+		HTTPClient:   redirect.Client(),
+		ArticleHosts: []string{redirectURL.Hostname()},
+		ResolveHost:  publicTestResolver,
+	})
+
+	if _, err := service.DownloadArticle(context.Background(), redirect.URL+"/s/start"); err == nil {
+		t.Fatalf("DownloadArticle followed redirect to disallowed host %q", targetURL.Hostname())
+	}
+}
+
+func TestWeChatSourceRejectsPrivateResolvedAddresses(t *testing.T) {
+	service := NewWeChatSourceService(WeChatSourceConfig{
+		ResolveHost: func(context.Context, string) ([]net.IP, error) {
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		},
+	})
+
+	if _, err := service.DownloadArticle(context.Background(), "https://mp.weixin.qq.com/s/demo"); err == nil {
+		t.Fatalf("DownloadArticle accepted a private resolved address")
+	}
+}
+
+func TestWeChatSourceBoundsArticleResponseBytes(t *testing.T) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, strings.Repeat("x", 65))
+	}))
+	defer articleServer.Close()
+
+	parsed, err := url.Parse(articleServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewWeChatSourceService(WeChatSourceConfig{
+		HTTPClient:      articleServer.Client(),
+		ArticleHosts:    []string{parsed.Hostname()},
+		ResolveHost:     publicTestResolver,
+		MaxArticleBytes: 64,
+	})
+	if _, err := service.DownloadArticle(context.Background(), articleServer.URL+"/s/large"); err == nil {
+		t.Fatalf("DownloadArticle accepted a response larger than MaxArticleBytes")
+	}
+}
+
+func newTestWeChatSourceService(t *testing.T, server *httptest.Server) *WeChatSourceService {
+	t.Helper()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewWeChatSourceService(WeChatSourceConfig{
+		HTTPClient:   server.Client(),
+		ArticleHosts: []string{parsed.Hostname()},
+		ResolveHost:  publicTestResolver,
+	})
+}
+
+func publicTestResolver(context.Context, string) ([]net.IP, error) {
+	return []net.IP{net.ParseIP("203.0.113.10")}, nil
 }
 
 func TestWeChatSourceSearchAndListArticlesUseOfficialAPIs(t *testing.T) {

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,19 +22,26 @@ import (
 var ErrWeChatCredentialsNotConfigured = errors.New("wechat mp token/cookie are not configured")
 
 type WeChatSourceConfig struct {
-	HTTPClient *http.Client
-	MPBaseURL  string
-	Token      string
-	Cookie     string
-	UserAgent  string
+	HTTPClient      *http.Client
+	MPBaseURL       string
+	Token           string
+	Cookie          string
+	UserAgent       string
+	ArticleHosts    []string
+	ResolveHost     func(context.Context, string) ([]net.IP, error)
+	MaxArticleBytes int64
 }
 
 type WeChatSourceService struct {
-	client    *http.Client
-	mpBaseURL string
-	token     string
-	cookie    string
-	userAgent string
+	client                       *http.Client
+	mpBaseURL                    string
+	token                        string
+	cookie                       string
+	userAgent                    string
+	articleHosts                 map[string]struct{}
+	resolveHost                  func(context.Context, string) ([]net.IP, error)
+	maxArticleBytes              int64
+	allowNonstandardArticlePorts bool
 }
 
 type WeChatArticle struct {
@@ -84,12 +93,37 @@ func NewWeChatSourceService(cfg WeChatSourceConfig) *WeChatSourceService {
 	if userAgent == "" {
 		userAgent = "Mozilla/5.0 (compatible; dedao-kbase-wechat-source/1.0)"
 	}
+	articleHosts := make(map[string]struct{})
+	configuredArticleHosts := len(cfg.ArticleHosts) > 0
+	if !configuredArticleHosts {
+		cfg.ArticleHosts = []string{"mp.weixin.qq.com"}
+	}
+	for _, host := range cfg.ArticleHosts {
+		if normalized := strings.ToLower(strings.TrimSpace(host)); normalized != "" {
+			articleHosts[normalized] = struct{}{}
+		}
+	}
+	resolveHost := cfg.ResolveHost
+	if resolveHost == nil {
+		resolver := net.DefaultResolver
+		resolveHost = func(ctx context.Context, host string) ([]net.IP, error) {
+			return resolver.LookupIP(ctx, "ip", host)
+		}
+	}
+	maxArticleBytes := cfg.MaxArticleBytes
+	if maxArticleBytes <= 0 {
+		maxArticleBytes = 4 << 20
+	}
 	return &WeChatSourceService{
-		client:    client,
-		mpBaseURL: mpBaseURL,
-		token:     strings.TrimSpace(cfg.Token),
-		cookie:    strings.TrimSpace(cfg.Cookie),
-		userAgent: userAgent,
+		client:                       client,
+		mpBaseURL:                    mpBaseURL,
+		token:                        strings.TrimSpace(cfg.Token),
+		cookie:                       strings.TrimSpace(cfg.Cookie),
+		userAgent:                    userAgent,
+		articleHosts:                 articleHosts,
+		resolveHost:                  resolveHost,
+		maxArticleBytes:              maxArticleBytes,
+		allowNonstandardArticlePorts: configuredArticleHosts,
 	}
 }
 
@@ -98,12 +132,30 @@ func (s *WeChatSourceService) DownloadArticle(ctx context.Context, rawURL string
 	if rawURL == "" {
 		return nil, fmt.Errorf("wechat article url is required")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	articleURL, err := s.validateWeChatArticleURL(ctx, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, articleURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
 	s.applyHeaders(req, false)
-	resp, err := s.client.Do(req)
+	client := *s.client
+	previousCheckRedirect := client.CheckRedirect
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("wechat article redirect limit exceeded")
+		}
+		if _, err := s.validateWeChatArticleURL(req.Context(), req.URL.String()); err != nil {
+			return err
+		}
+		if previousCheckRedirect != nil {
+			return previousCheckRedirect(req, via)
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -112,11 +164,48 @@ func (s *WeChatSourceService) DownloadArticle(ctx context.Context, rawURL string
 		return nil, fmt.Errorf("wechat article request failed: %s", resp.Status)
 	}
 
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, s.maxArticleBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > s.maxArticleBytes {
+		return nil, fmt.Errorf("wechat article response exceeds %d bytes", s.maxArticleBytes)
+	}
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
 	return parseWeChatArticleDocument(doc, rawURL), nil
+}
+
+func (s *WeChatSourceService) validateWeChatArticleURL(ctx context.Context, rawURL string) (*url.URL, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil, fmt.Errorf("invalid wechat article url: %w", err)
+	}
+	if parsed.Scheme != "https" || parsed.User != nil || parsed.Hostname() == "" {
+		return nil, fmt.Errorf("wechat article url must be credential-free HTTPS")
+	}
+	host := strings.ToLower(parsed.Hostname())
+	if _, ok := s.articleHosts[host]; !ok {
+		return nil, fmt.Errorf("wechat article host is not allowed")
+	}
+	if parsed.Port() != "" && parsed.Port() != "443" && !s.allowNonstandardArticlePorts {
+		return nil, fmt.Errorf("wechat article port is not allowed")
+	}
+	addresses, err := s.resolveHost(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve wechat article host: %w", err)
+	}
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("wechat article host resolved to no addresses")
+	}
+	for _, address := range addresses {
+		if address == nil || address.IsLoopback() || address.IsPrivate() || address.IsUnspecified() || address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() {
+			return nil, fmt.Errorf("wechat article host resolved to a non-public address")
+		}
+	}
+	return parsed, nil
 }
 
 func (s *WeChatSourceService) SearchOfficialAccounts(ctx context.Context, query string) ([]WeChatOfficialAccount, error) {
