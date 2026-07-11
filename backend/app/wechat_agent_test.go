@@ -2,8 +2,21 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
+
+type recordingSourceEnvelopeSink struct {
+	envelopes []SourceArticleEnvelope
+}
+
+func (s *recordingSourceEnvelopeSink) Enqueue(_ string, envelope SourceArticleEnvelope) (SourceAgentOutboxItem, error) {
+	s.envelopes = append(s.envelopes, envelope)
+	return SourceAgentOutboxItem{IdempotencyKey: envelope.IdempotencyKey, Envelope: envelope}, nil
+}
 
 type fakeSessionHealthProvider struct {
 	session WeChatMPSession
@@ -74,5 +87,107 @@ func TestWeChatAgentCursorRejectsInvalidValue(t *testing.T) {
 				t.Fatalf("accepted invalid cursor %q", raw)
 			}
 		})
+	}
+}
+
+func TestWeChatAgentResumesMidPublication(t *testing.T) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<html><body><h1 id="activity-name">Article %s</h1><a id="js_name">Account</a><div id="js_content"><p>Article %s contains enough content for a deterministic source adapter test.</p></div></body></html>`, r.URL.Path, r.URL.Path)
+	}))
+	defer articleServer.Close()
+
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		articles := []WeChatOfficialArticle{
+			{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 101},
+			{Title: "Article 2", Link: articleServer.URL + "/2", AID: "article-2", UpdateTime: 102},
+			{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 103},
+		}
+		publishInfo, _ := json.Marshal(map[string]any{"appmsgex": articles})
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": []map[string]any{{"publish_info": string(publishInfo)}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"base_resp":    map[string]any{"ret": 0},
+			"publish_page": string(publishPage),
+		})
+	}))
+	defer discoveryServer.Close()
+
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{
+		BaseURL:         discoveryServer.URL,
+		HTTPClient:      discoveryServer.Client(),
+		SessionProvider: sessions,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{
+		Sessions:  sessions,
+		Discovery: discovery,
+		Source:    newTestWeChatSourceService(t, articleServer),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := SourceSyncRun{
+		ID:                 "run-1",
+		RequestedOperation: "sync_articles",
+		Subscription: &SourceSubscription{
+			SourceAccountKey: "account-key",
+			SourceAccount:    "Account",
+			Options:          map[string]any{"max_items": float64(1)},
+		},
+	}
+	firstSink := &recordingSourceEnvelopeSink{}
+	first, err := adapter.Execute(context.Background(), run, firstSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(firstSink.envelopes) != 1 || firstSink.envelopes[0].SourceItemID != "article-1" {
+		t.Fatalf("first envelopes=%#v", firstSink.envelopes)
+	}
+	firstCursor, err := decodeWeChatAgentCursor(first.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCursor.UpstreamBegin != 0 || firstCursor.PublicationItemIndex != 1 || firstCursor.LastArticleKey != "article-1" {
+		t.Fatalf("first cursor=%#v", firstCursor)
+	}
+
+	run.ID = "run-2"
+	run.Subscription.Cursor = first.Cursor
+	secondSink := &recordingSourceEnvelopeSink{}
+	second, err := adapter.Execute(context.Background(), run, secondSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(secondSink.envelopes) != 1 || secondSink.envelopes[0].SourceItemID != "article-2" {
+		t.Fatalf("second envelopes=%#v", secondSink.envelopes)
+	}
+	secondCursor, err := decodeWeChatAgentCursor(second.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondCursor.UpstreamBegin != 0 || secondCursor.PublicationItemIndex != 2 || secondCursor.LastArticleKey != "article-2" {
+		t.Fatalf("second cursor=%#v", secondCursor)
+	}
+
+	run.ID = "run-3"
+	run.Subscription.Cursor = second.Cursor
+	thirdSink := &recordingSourceEnvelopeSink{}
+	third, err := adapter.Execute(context.Background(), run, thirdSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(thirdSink.envelopes) != 1 || thirdSink.envelopes[0].SourceItemID != "article-3" {
+		t.Fatalf("third envelopes=%#v", thirdSink.envelopes)
+	}
+	thirdCursor, err := decodeWeChatAgentCursor(third.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thirdCursor.UpstreamBegin != 1 || thirdCursor.PublicationItemIndex != 0 || thirdCursor.LastArticleKey != "article-3" {
+		t.Fatalf("third cursor=%#v", thirdCursor)
 	}
 }

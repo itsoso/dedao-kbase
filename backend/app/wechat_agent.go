@@ -72,23 +72,26 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	}
 	items := page.Articles
 	next := cursor
-	next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
-	next.PublicationItemIndex = 0
-	if len(items) > 0 {
-		next.LastArticleKey = items[len(items)-1].ArticleKey
-		next.LastTimestamp = items[len(items)-1].UpdateTime
-	}
-	if len(items) > maxItems {
-		items = items[:maxItems]
-	}
-	encoded, err := encodeWeChatAgentCursor(next)
-	if err != nil {
-		return SourceAdapterResult{}, err
-	}
 	if run.RequestedOperation == "discover_articles" {
+		next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
+		next.PublicationItemIndex = 0
+		if len(items) > 0 {
+			next.LastArticleKey = items[len(items)-1].ArticleKey
+			next.LastTimestamp = items[len(items)-1].UpdateTime
+		}
+		encoded, err := encodeWeChatAgentCursor(next)
+		if err != nil {
+			return SourceAdapterResult{}, err
+		}
 		return SourceAdapterResult{Cursor: encoded}, nil
 	}
 	if run.RequestedOperation == "sync_media" {
+		next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
+		next.PublicationItemIndex = 0
+		encoded, err := encodeWeChatAgentCursor(next)
+		if err != nil {
+			return SourceAdapterResult{}, err
+		}
 		return SourceAdapterResult{Cursor: encoded}, nil
 	}
 	if run.RequestedOperation != "sync_articles" {
@@ -96,6 +99,13 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	}
 	if a.source == nil {
 		return SourceAdapterResult{}, fmt.Errorf("wechat article source is not configured")
+	}
+	if next.PublicationItemIndex > len(items) {
+		return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
+	}
+	items = items[next.PublicationItemIndex:]
+	if len(items) > maxItems {
+		items = items[:maxItems]
 	}
 	for _, item := range items {
 		article, err := a.source.DownloadArticle(ctx, item.Link)
@@ -107,6 +117,17 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		if _, err := sink.Enqueue(run.ID, envelope); err != nil {
 			return SourceAdapterResult{}, err
 		}
+		next.PublicationItemIndex++
+		next.LastArticleKey = item.ArticleKey
+		next.LastTimestamp = item.UpdateTime
+	}
+	if len(page.Articles) == 0 || next.PublicationItemIndex >= len(page.Articles) {
+		next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
+		next.PublicationItemIndex = 0
+	}
+	encoded, err := encodeWeChatAgentCursor(next)
+	if err != nil {
+		return SourceAdapterResult{}, err
 	}
 	return SourceAdapterResult{Cursor: encoded}, nil
 }
