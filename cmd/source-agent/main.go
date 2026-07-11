@@ -43,10 +43,6 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	}
 	store := newKeychainSecretStore(cfg.AgentID, nil)
 	sessions := storedSessionProvider{store: store}
-	if args[0] == "doctor" {
-		_, err := sessions.Session(ctx)
-		return err
-	}
 	if args[0] == "enroll" {
 		return runEnrollmentServer(ctx, lookup, store)
 	}
@@ -59,7 +55,15 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 		return err
 	}
 	defer outbox.Close()
-	mpBase := strings.TrimSpace(os.Getenv("WECHAT_MP_BASE_URL"))
+	if args[0] == "doctor" {
+		report, doctorErr := inspectSourceAgent(ctx, client, sessions)
+		if doctorErr != nil {
+			return doctorErr
+		}
+		return json.NewEncoder(os.Stdout).Encode(report)
+	}
+	mpBase, _ := lookup("WECHAT_MP_BASE_URL")
+	mpBase = strings.TrimSpace(mpBase)
 	if mpBase == "" {
 		mpBase = "https://mp.weixin.qq.com"
 	}
@@ -89,15 +93,86 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	if args[0] != "run" {
 		return fmt.Errorf("unknown source-agent command")
 	}
+	return runSourceAgentRuntime(ctx, runner, 15*time.Second, func(runtimeCtx context.Context) error {
+		return runEnrollmentServer(runtimeCtx, lookup, store)
+	}, func(cycleErr error) {
+		fmt.Fprintf(os.Stderr, "source-agent cycle failed: %v\n", cycleErr)
+	})
+}
+
+type sourceAgentCycleRunner interface {
+	RunOnce(context.Context) (app.SourceAgentCycleResult, error)
+}
+
+type sourceAgentAuthChecker interface {
+	CheckAuth(context.Context) error
+}
+
+type sourceAgentDoctorReport struct {
+	RemoteAuth    bool   `json:"remote_auth"`
+	StateReady    bool   `json:"state_ready"`
+	WeChatSession string `json:"wechat_session"`
+}
+
+func inspectSourceAgent(ctx context.Context, auth sourceAgentAuthChecker, sessions app.WeChatMPSessionProvider) (sourceAgentDoctorReport, error) {
+	report := sourceAgentDoctorReport{StateReady: true, WeChatSession: "login_required"}
+	if auth == nil || sessions == nil {
+		return report, fmt.Errorf("source-agent doctor dependencies are required")
+	}
+	if err := auth.CheckAuth(ctx); err != nil {
+		return report, fmt.Errorf("source-agent remote authentication failed: %w", err)
+	}
+	report.RemoteAuth = true
+	session, err := sessions.Session(ctx)
+	if err == nil && session.Validate(time.Now()) == nil {
+		report.WeChatSession = "ready"
+	}
+	return report, nil
+}
+
+func runSourceAgentLoop(ctx context.Context, runner sourceAgentCycleRunner, interval time.Duration, report func(error)) error {
+	if runner == nil {
+		return fmt.Errorf("source-agent cycle runner is required")
+	}
+	if interval <= 0 {
+		interval = 15 * time.Second
+	}
 	for {
-		if _, err = runner.RunOnce(ctx); err != nil {
-			return err
+		if _, cycleErr := runner.RunOnce(ctx); cycleErr != nil && report != nil {
+			report(cycleErr)
 		}
+		timer := time.NewTimer(interval)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return nil
-		case <-time.After(15 * time.Second):
+		case <-timer.C:
 		}
+	}
+}
+
+func runSourceAgentRuntime(ctx context.Context, runner sourceAgentCycleRunner, interval time.Duration, enrollment func(context.Context) error, report func(error)) error {
+	if enrollment == nil {
+		return fmt.Errorf("source-agent enrollment runtime is required")
+	}
+	runtimeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errors := make(chan error, 2)
+	go func() { errors <- enrollment(runtimeCtx) }()
+	go func() { errors <- runSourceAgentLoop(runtimeCtx, runner, interval, report) }()
+	select {
+	case <-ctx.Done():
+		return nil
+	case runtimeErr := <-errors:
+		if runtimeErr == nil {
+			return fmt.Errorf("source-agent runtime component stopped unexpectedly")
+		}
+		return runtimeErr
 	}
 }
 
@@ -155,8 +230,13 @@ func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, st
 		return err
 	}
 	server := &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("start enrollment listener: %w", err)
+	}
+	fmt.Printf("source-agent enrollment: http://%s\n", listener.Addr().String())
 	done := make(chan error, 1)
-	go func() { done <- server.ListenAndServe() }()
+	go func() { done <- server.Serve(listener) }()
 	select {
 	case <-ctx.Done():
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)

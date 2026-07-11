@@ -26,7 +26,19 @@ func TestKeychainSecretUsesStdinAndRedactsErrors(t *testing.T) {
 		return nil, errors.New("command failed: never-log-this")
 	})
 	err := store.Save(context.Background(), "wechat-session", secret)
-	if !bytes.Equal(stdin, secret) || err == nil || strings.Contains(err.Error(), string(secret)) {
+	wantStdin := append(append(append([]byte(nil), secret...), '\n'), secret...)
+	wantStdin = append(wantStdin, '\n')
+	if !bytes.Equal(stdin, wantStdin) || err == nil || strings.Contains(err.Error(), string(secret)) {
 		t.Fatalf("stdin=%q err=%v", stdin, err)
+	}
+}
+
+func TestKeychainSecretRejectsLineBreaks(t *testing.T) {
+	store := newKeychainSecretStore("agent-a", func(context.Context, string, []string, []byte) ([]byte, error) {
+		t.Fatal("security command should not run")
+		return nil, nil
+	})
+	if err := store.Save(context.Background(), "wechat-session", []byte("line-1\nline-2")); err == nil {
+		t.Fatal("Save accepted multiline secret")
 	}
 }

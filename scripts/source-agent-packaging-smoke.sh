@@ -10,6 +10,14 @@ grep -q 'chmod 600' "$root/scripts/install-source-agent-macos.sh"
 grep -q 'chmod 700' "$root/scripts/install-source-agent-macos.sh"
 grep -q '127.0.0.1' "$root/scripts/install-source-agent-macos.sh"
 grep -q 'KBASE_SOURCE_AGENT_TOKEN' "$root/scripts/install-source-agent-macos.sh"
+grep -q '/usr/bin/plutil' "$root/scripts/install-source-agent-macos.sh"
+grep -q 'source-agent" doctor' "$root/scripts/install-source-agent-macos.sh"
+grep -q 'launchctl bootstrap' "$root/scripts/install-source-agent-macos.sh"
+grep -q 'launchctl kickstart' "$root/scripts/install-source-agent-macos.sh"
+grep -q 'StandardOutPath' "$root/scripts/install-source-agent-macos.sh"
+if grep -q 'cat >"\$plist"' "$root/scripts/install-source-agent-macos.sh"; then
+  echo "LaunchAgent plist must be generated with plutil" >&2; exit 1
+fi
 if grep -Eq 'WECHAT_MP_(TOKEN|COOKIE)' "$root/scripts/install-source-agent-macos.sh"; then
   echo "MP secrets must not be written to the plist" >&2; exit 1
 fi

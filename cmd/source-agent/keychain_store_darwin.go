@@ -48,7 +48,15 @@ func (s *keychainSecretStore) Save(ctx context.Context, key string, value []byte
 	if err != nil {
 		return err
 	}
-	_, err = s.run(ctx, "/usr/bin/security", []string{"add-generic-password", "-U", "-s", sourceAgentKeychainService, "-a", account, "-w"}, value)
+	if len(value) == 0 || bytes.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("source secret must be non-empty single-line data")
+	}
+	promptInput := make([]byte, 0, len(value)*2+2)
+	promptInput = append(promptInput, value...)
+	promptInput = append(promptInput, '\n')
+	promptInput = append(promptInput, value...)
+	promptInput = append(promptInput, '\n')
+	_, err = s.run(ctx, "/usr/bin/security", []string{"add-generic-password", "-U", "-s", sourceAgentKeychainService, "-a", account, "-w"}, promptInput)
 	if err != nil {
 		return fmt.Errorf("save source secret in keychain failed")
 	}
