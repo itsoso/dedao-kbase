@@ -246,6 +246,42 @@ func TestWCPlusAgentSyncLinksRefreshesExistingList(t *testing.T) {
 	}
 }
 
+func TestWCPlusAgentRejectsDisappearedLinkTaskWhenArticleListIsUnchanged(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			fmt.Fprint(w, `{"ok":true}`)
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[{"ID":"article-1","Title":"已有链接","URL":"https://mp.weixin.qq.com/s/article-1","PDateText":"2026-07-10"}],"total":1}`)
+		case "/api/task/new":
+			fmt.Fprint(w, `{"task_id":"task-disappeared-1","status":"ready"}`)
+		case "/api/task/control":
+			fmt.Fprint(w, `{"status":"ok"}`)
+		case "/api/task/all":
+			fmt.Fprint(w, `{"tasks":[]}`)
+		case "/api/article/content":
+			fmt.Fprint(w, `{"ID":"article-1","Title":"已有链接","Nickname":"医学参考","URL":"https://mp.weixin.qq.com/s/article-1","Content":"已有文章不能作为新同步任务成功的证据；列表没有变化时必须报告结果无法验证。"}`)
+		default:
+			t.Fatalf("unexpected local path: %s", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+
+	harness := newWCPlusAgentServerHarness(t, "sync_links", map[string]any{"limit": float64(10)}, nil)
+	defer harness.Close()
+	agent := newTestWCPlusAgent(t, harness.RemoteURL, local.URL, t.TempDir(), nil)
+	defer agent.Close()
+	_, err := agent.RunOnce(context.Background())
+	if !errors.Is(err, ErrWCPlusTaskOutcomeUnverified) {
+		t.Fatalf("RunOnce error = %v, want ErrWCPlusTaskOutcomeUnverified", err)
+	}
+	persisted, getErr := harness.Sync.GetRun(harness.Run.ID)
+	if getErr != nil || persisted.Status != SourceRunFailed || !strings.Contains(persisted.Error, ErrWCPlusTaskOutcomeUnverified.Error()) {
+		t.Fatalf("persisted run = %#v, err=%v", persisted, getErr)
+	}
+}
+
 func TestWCPlusAgentDoesNotRegressSubscriptionCursor(t *testing.T) {
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

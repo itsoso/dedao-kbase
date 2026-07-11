@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -207,11 +208,12 @@ func (a *WCPlusAgent) executeArticleRun(ctx context.Context, run SourceSyncRun) 
 	needsLinkTask := run.RequestedOperation == "sync_links" ||
 		(run.RequestedOperation == "sync_content" && len(list.Articles) == 0)
 	if needsLinkTask {
+		beforeFingerprint := wcplusArticleListFingerprint(list)
 		if err := a.runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "gzh_article_link", limit, func(ctx context.Context) (bool, error) {
 			verified, err := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
 				Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: 1,
 			})
-			return err == nil && len(verified.Articles) > 0, err
+			return err == nil && len(verified.Articles) > 0 && wcplusArticleListFingerprint(verified) != beforeFingerprint, err
 		}); err != nil {
 			return 0, "", err
 		}
@@ -459,6 +461,26 @@ func wcplusTaskBlockedReason(task WCPlusTask) string {
 		}
 	}
 	return ""
+}
+
+func wcplusArticleListFingerprint(list *WCPlusArticleList) string {
+	if list == nil {
+		return ""
+	}
+	articles := make([]string, 0, len(list.Articles))
+	for _, article := range list.Articles {
+		articles = append(articles, strings.Join([]string{
+			strings.TrimSpace(article.ID),
+			strings.TrimSpace(article.URL),
+			strings.TrimSpace(article.Title),
+			strings.TrimSpace(article.PublishTime),
+			strconv.FormatInt(article.UpdateTime, 10),
+		}, "\x00"))
+	}
+	sort.Strings(articles)
+	payload := strconv.Itoa(list.Total) + "\x01" + strings.Join(articles, "\x02")
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
 }
 
 type wcplusAgentCursor struct {
