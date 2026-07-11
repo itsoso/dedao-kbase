@@ -113,6 +113,7 @@ assert.ok(js.includes("<details") && js.includes("wcplus-legacy-diagnostics"), "
 assert.ok(js.includes("sourceControlState.legacyDiagnosticsOpen"), "legacy diagnostic open state should survive control-plane refreshes");
 assert.ok(js.includes("sourceControlState.runFilter"), "run status filter should be authoritative state");
 assert.ok(js.includes("sourceControlState.runDetail"), "run detail drawer should reload from the API");
+assert.ok(js.includes("capability_health"), "agent rendering should prefer typed capability health");
 assert.ok(js.includes("renderResult && shouldRender"), "silent polling should render only when authoritative data changes");
 assert.ok(js.includes("<span>启用</span>"), "subscription toggles should keep a stable accessible label");
 const drawerSource = js.slice(js.indexOf("function renderSourceRunDrawer"), js.indexOf("function selectedSourceSubscription"));

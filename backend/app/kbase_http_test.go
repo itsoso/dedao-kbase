@@ -115,6 +115,23 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerSerializesCapabilityHealth(t *testing.T) {
+	root := t.TempDir()
+	sourceSync, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", SourceSync: sourceSync, SourceAgentToken: "agent-secret"})
+	heartbeat := `{"agent_id":"agent-a","capability_health":{"wechat_mp":{"healthy":false,"requires_action":"login"},"wcplus":{"healthy":false}}}`
+	if resp := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/heartbeat", "agent-secret", heartbeat); resp.Code != http.StatusOK {
+		t.Fatalf("heartbeat status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	resp := requestKBase(handler, http.MethodGet, "/api/source-agents", "admin-secret")
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"capability_health":{"wcplus":{"healthy":false},"wechat_mp":{"healthy":false,"requires_action":"login"}}`) {
+		t.Fatalf("agents capability response status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentPayloadLimit(t *testing.T) {
 	sourceSync, err := NewSourceSyncStore(t.TempDir())
 	if err != nil {
@@ -518,7 +535,7 @@ func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 }
 
 func TestKBaseHTTPHandlerImportsWeChatArticleIntoBookKnowledge(t *testing.T) {
-	articleServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		fmt.Fprint(w, `<!doctype html>
 <html>
@@ -537,7 +554,7 @@ func TestKBaseHTTPHandlerImportsWeChatArticleIntoBookKnowledge(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:     store,
 		AuthToken: "secret-token",
-		WeChat:    NewWeChatSourceService(WeChatSourceConfig{}),
+		WeChat:    newTestWeChatSourceService(t, articleServer),
 	})
 
 	body := bytes.NewBufferString(`{"url":"` + articleServer.URL + `/s/test","book_id":"wechat-health"}`)

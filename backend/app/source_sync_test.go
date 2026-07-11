@@ -47,6 +47,68 @@ func TestSourceSyncStoreMigratesEmptyRoot(t *testing.T) {
 	}
 }
 
+func TestSourceAgentCapabilityHealthMigratesLegacyDatabase(t *testing.T) {
+	root := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(root, sourceSyncDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE source_agents (
+		agent_id TEXT PRIMARY KEY, version TEXT NOT NULL DEFAULT '', capabilities_json TEXT NOT NULL DEFAULT '[]',
+		wcplus_healthy INTEGER NOT NULL DEFAULT 0, wcplus_version TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+		last_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	store, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatalf("migrate legacy store: %v", err)
+	}
+	defer store.Close()
+	var count int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('source_agents') WHERE name = 'capability_health_json'`).Scan(&count); err != nil || count != 1 {
+		t.Fatalf("capability_health_json count=%d err=%v", count, err)
+	}
+}
+
+func TestSourceAgentCapabilityHealthRoundTripAndBoundsDiagnostics(t *testing.T) {
+	store, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-capability",
+		CapabilityHealth: map[string]SourceCapabilityHealth{
+			" wechat_mp ": {Healthy: false, RequiresAction: "login", LastError: strings.Repeat("故", sourceDiagnosticMaxRunes+20)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	health, ok := agent.CapabilityHealth["wechat_mp"]
+	if !ok || health.RequiresAction != "login" || len([]rune(health.LastError)) != sourceDiagnosticMaxRunes {
+		t.Fatalf("unexpected capability health: %#v", agent.CapabilityHealth)
+	}
+}
+
+func TestSourceAgentCapabilityHealthMapsLegacyWCPlusFields(t *testing.T) {
+	store, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{AgentID: "legacy", WCPlusHealthy: true, WCPlusVersion: "4.2.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if health := agent.CapabilityHealth["wcplus"]; !health.Healthy || health.Version != "4.2.0" {
+		t.Fatalf("legacy fields not mapped: %#v", agent)
+	}
+}
+
 func TestSourceSyncStoreSetSubscriptionEnabledPreservesAgentCursor(t *testing.T) {
 	clock := newSourceSyncTestClock(time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC))
 	store, err := newSourceSyncStore(t.TempDir(), clock.Now)

@@ -672,6 +672,12 @@ function renderSourceAgentList() {
   const rows = sourceControlState.agents.map((agent) => {
     const online = sourceAgentIsOnline(agent);
     const capabilities = Array.isArray(agent.capabilities) ? agent.capabilities : [];
+    const capabilityHealth = agent.capability_health && typeof agent.capability_health === "object"
+      ? agent.capability_health
+      : { wcplus: { healthy: Boolean(agent.wcplus_healthy), version: agent.wcplus_version || "", last_error: agent.last_error || "" } };
+    const healthRows = Object.entries(capabilityHealth).map(([name, health]) => `
+      <div><dt>${escapeHTML(name)}</dt><dd class="${health?.healthy ? "is-ok" : "is-bad"}">${health?.healthy ? "可用" : "不可用"}${health?.version ? ` · ${escapeHTML(health.version)}` : ""}${health?.requires_action ? ` · ${escapeHTML(health.requires_action)}` : ""}</dd></div>
+    `).join("");
     return `
       <article class="source-control__agent ${online ? "is-online" : "is-offline"}">
         <div class="source-control__item-head">
@@ -681,7 +687,7 @@ function renderSourceAgentList() {
         <dl class="source-control__facts">
           <div><dt>心跳</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_heartbeat_at))}</dd></div>
           <div><dt>Agent</dt><dd>${escapeHTML(agent.version || "-")}</dd></div>
-          <div><dt>WC Plus</dt><dd class="${agent.wcplus_healthy ? "is-ok" : "is-bad"}">${agent.wcplus_healthy ? "可用" : "不可用"}${agent.wcplus_version ? ` · ${escapeHTML(agent.wcplus_version)}` : ""}</dd></div>
+          ${healthRows}
         </dl>
         <div class="source-control__capabilities">
           ${capabilities.map((capability) => `<span>${escapeHTML(capability)}</span>`).join("") || "<span>无能力上报</span>"}

@@ -48,24 +48,33 @@ var (
 )
 
 type SourceAgentHeartbeat struct {
-	AgentID       string   `json:"agent_id"`
-	Version       string   `json:"version,omitempty"`
-	Capabilities  []string `json:"capabilities,omitempty"`
-	WCPlusHealthy bool     `json:"wcplus_healthy"`
-	WCPlusVersion string   `json:"wcplus_version,omitempty"`
-	LastError     string   `json:"last_error,omitempty"`
+	AgentID          string                            `json:"agent_id"`
+	Version          string                            `json:"version,omitempty"`
+	Capabilities     []string                          `json:"capabilities,omitempty"`
+	WCPlusHealthy    bool                              `json:"wcplus_healthy"`
+	WCPlusVersion    string                            `json:"wcplus_version,omitempty"`
+	LastError        string                            `json:"last_error,omitempty"`
+	CapabilityHealth map[string]SourceCapabilityHealth `json:"capability_health,omitempty"`
+}
+
+type SourceCapabilityHealth struct {
+	Healthy        bool   `json:"healthy"`
+	Version        string `json:"version,omitempty"`
+	LastError      string `json:"last_error,omitempty"`
+	RequiresAction string `json:"requires_action,omitempty"`
 }
 
 type SourceAgent struct {
-	AgentID         string   `json:"agent_id"`
-	Version         string   `json:"version,omitempty"`
-	Capabilities    []string `json:"capabilities,omitempty"`
-	WCPlusHealthy   bool     `json:"wcplus_healthy"`
-	WCPlusVersion   string   `json:"wcplus_version,omitempty"`
-	LastError       string   `json:"last_error,omitempty"`
-	LastHeartbeatAt string   `json:"last_heartbeat_at"`
-	CreatedAt       string   `json:"created_at"`
-	UpdatedAt       string   `json:"updated_at"`
+	AgentID          string                            `json:"agent_id"`
+	Version          string                            `json:"version,omitempty"`
+	Capabilities     []string                          `json:"capabilities,omitempty"`
+	WCPlusHealthy    bool                              `json:"wcplus_healthy"`
+	WCPlusVersion    string                            `json:"wcplus_version,omitempty"`
+	LastError        string                            `json:"last_error,omitempty"`
+	LastHeartbeatAt  string                            `json:"last_heartbeat_at"`
+	CreatedAt        string                            `json:"created_at"`
+	UpdatedAt        string                            `json:"updated_at"`
+	CapabilityHealth map[string]SourceCapabilityHealth `json:"capability_health"`
 }
 
 type SourceSubscriptionInput struct {
@@ -294,6 +303,34 @@ func migrateSourceSyncDB(db *sql.DB) error {
 			accepted_at TEXT NOT NULL
 		);
 	`)
+	if err != nil {
+		return err
+	}
+	return ensureSourceSyncColumn(db, "source_agents", "capability_health_json", "TEXT NOT NULL DEFAULT '{}'")
+}
+
+func ensureSourceSyncColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
 	return err
 }
 
@@ -303,7 +340,17 @@ func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (Source
 		return SourceAgent{}, fmt.Errorf("agent_id is required")
 	}
 	heartbeat.Capabilities = normalizeSourceCapabilities(heartbeat.Capabilities)
+	heartbeat.CapabilityHealth = normalizeSourceCapabilityHealth(heartbeat.CapabilityHealth)
+	if len(heartbeat.CapabilityHealth) == 0 {
+		heartbeat.CapabilityHealth = map[string]SourceCapabilityHealth{"wcplus": {
+			Healthy: heartbeat.WCPlusHealthy, Version: strings.TrimSpace(heartbeat.WCPlusVersion), LastError: trimSourceDiagnostic(heartbeat.LastError),
+		}}
+	}
 	capabilitiesJSON, err := json.Marshal(heartbeat.Capabilities)
+	if err != nil {
+		return SourceAgent{}, err
+	}
+	capabilityHealthJSON, err := json.Marshal(heartbeat.CapabilityHealth)
 	if err != nil {
 		return SourceAgent{}, err
 	}
@@ -315,8 +362,8 @@ func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (Source
 	_, err = s.db.Exec(`
 		INSERT INTO source_agents (
 			agent_id, version, capabilities_json, wcplus_healthy, wcplus_version,
-			last_error, last_heartbeat_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			last_error, last_heartbeat_at, created_at, updated_at, capability_health_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(agent_id) DO UPDATE SET
 			version = excluded.version,
 			capabilities_json = excluded.capabilities_json,
@@ -325,8 +372,9 @@ func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (Source
 			last_error = excluded.last_error,
 			last_heartbeat_at = excluded.last_heartbeat_at,
 			updated_at = excluded.updated_at
+			, capability_health_json = excluded.capability_health_json
 	`, heartbeat.AgentID, strings.TrimSpace(heartbeat.Version), string(capabilitiesJSON), healthy,
-		strings.TrimSpace(heartbeat.WCPlusVersion), trimSourceDiagnostic(heartbeat.LastError), now, now, now)
+		strings.TrimSpace(heartbeat.WCPlusVersion), trimSourceDiagnostic(heartbeat.LastError), now, now, now, string(capabilityHealthJSON))
 	if err != nil {
 		return SourceAgent{}, err
 	}
@@ -336,7 +384,7 @@ func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (Source
 func (s *SourceSyncStore) ListAgents() ([]SourceAgent, error) {
 	rows, err := s.db.Query(`
 		SELECT agent_id, version, capabilities_json, wcplus_healthy, wcplus_version,
-			last_error, last_heartbeat_at, created_at, updated_at
+			last_error, last_heartbeat_at, created_at, updated_at, capability_health_json
 		FROM source_agents
 		ORDER BY last_heartbeat_at DESC, agent_id
 	`)
@@ -358,7 +406,7 @@ func (s *SourceSyncStore) ListAgents() ([]SourceAgent, error) {
 func (s *SourceSyncStore) getAgent(agentID string) (SourceAgent, error) {
 	return scanSourceAgent(s.db.QueryRow(`
 		SELECT agent_id, version, capabilities_json, wcplus_healthy, wcplus_version,
-			last_error, last_heartbeat_at, created_at, updated_at
+			last_error, last_heartbeat_at, created_at, updated_at, capability_health_json
 		FROM source_agents WHERE agent_id = ?
 	`, agentID))
 }
@@ -370,9 +418,10 @@ type sourceSyncScanner interface {
 func scanSourceAgent(row sourceSyncScanner) (SourceAgent, error) {
 	var agent SourceAgent
 	var capabilitiesJSON string
+	var capabilityHealthJSON string
 	var healthy int
 	err := row.Scan(&agent.AgentID, &agent.Version, &capabilitiesJSON, &healthy, &agent.WCPlusVersion,
-		&agent.LastError, &agent.LastHeartbeatAt, &agent.CreatedAt, &agent.UpdatedAt)
+		&agent.LastError, &agent.LastHeartbeatAt, &agent.CreatedAt, &agent.UpdatedAt, &capabilityHealthJSON)
 	if err != nil {
 		return SourceAgent{}, err
 	}
@@ -380,7 +429,28 @@ func scanSourceAgent(row sourceSyncScanner) (SourceAgent, error) {
 	if err := json.Unmarshal([]byte(capabilitiesJSON), &agent.Capabilities); err != nil {
 		return SourceAgent{}, err
 	}
+	if err := json.Unmarshal([]byte(capabilityHealthJSON), &agent.CapabilityHealth); err != nil {
+		return SourceAgent{}, err
+	}
 	return agent, nil
+}
+
+func normalizeSourceCapabilityHealth(input map[string]SourceCapabilityHealth) map[string]SourceCapabilityHealth {
+	result := make(map[string]SourceCapabilityHealth)
+	for rawKey, health := range input {
+		if len(result) >= 32 {
+			break
+		}
+		key := strings.ToLower(strings.TrimSpace(rawKey))
+		if key == "" || len(key) > 64 {
+			continue
+		}
+		health.Version = trimSourceDiagnostic(health.Version)
+		health.LastError = trimSourceDiagnostic(health.LastError)
+		health.RequiresAction = trimSourceDiagnostic(health.RequiresAction)
+		result[key] = health
+	}
+	return result
 }
 
 func (s *SourceSyncStore) CreateSubscription(input SourceSubscriptionInput) (SourceSubscription, error) {
