@@ -30,6 +30,7 @@ type WeChatSourceConfig struct {
 	ArticleHosts    []string
 	ResolveHost     func(context.Context, string) ([]net.IP, error)
 	MaxArticleBytes int64
+	SessionProvider WeChatMPSessionProvider
 }
 
 type WeChatSourceService struct {
@@ -42,6 +43,7 @@ type WeChatSourceService struct {
 	resolveHost                  func(context.Context, string) ([]net.IP, error)
 	maxArticleBytes              int64
 	allowNonstandardArticlePorts bool
+	sessionProvider              WeChatMPSessionProvider
 }
 
 type WeChatArticle struct {
@@ -124,6 +126,7 @@ func NewWeChatSourceService(cfg WeChatSourceConfig) *WeChatSourceService {
 		resolveHost:                  resolveHost,
 		maxArticleBytes:              maxArticleBytes,
 		allowNonstandardArticlePorts: configuredArticleHosts,
+		sessionProvider:              cfg.SessionProvider,
 	}
 }
 
@@ -209,7 +212,8 @@ func (s *WeChatSourceService) validateWeChatArticleURL(ctx context.Context, rawU
 }
 
 func (s *WeChatSourceService) SearchOfficialAccounts(ctx context.Context, query string) ([]WeChatOfficialAccount, error) {
-	if err := s.requireCredentials(); err != nil {
+	token, cookie, err := s.credentials(ctx)
+	if err != nil {
 		return nil, err
 	}
 	values := url.Values{
@@ -218,7 +222,7 @@ func (s *WeChatSourceService) SearchOfficialAccounts(ctx context.Context, query 
 		"begin":  {"0"},
 		"count":  {"10"},
 		"query":  {query},
-		"token":  {s.token},
+		"token":  {token},
 		"lang":   {"zh_CN"},
 		"f":      {"json"},
 		"ajax":   {"1"},
@@ -228,7 +232,7 @@ func (s *WeChatSourceService) SearchOfficialAccounts(ctx context.Context, query 
 	if err != nil {
 		return nil, err
 	}
-	s.applyHeaders(req, true)
+	s.applyHeadersWithCookie(req, cookie)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -264,7 +268,8 @@ func (s *WeChatSourceService) SearchOfficialAccounts(ctx context.Context, query 
 }
 
 func (s *WeChatSourceService) ListOfficialAccountArticles(ctx context.Context, fakeID string, begin int, count int) ([]WeChatOfficialArticle, error) {
-	if err := s.requireCredentials(); err != nil {
+	token, cookie, err := s.credentials(ctx)
+	if err != nil {
 		return nil, err
 	}
 	fakeID = strings.TrimSpace(fakeID)
@@ -284,7 +289,7 @@ func (s *WeChatSourceService) ListOfficialAccountArticles(ctx context.Context, f
 		"fakeid": {fakeID},
 		"type":   {"9"},
 		"query":  {""},
-		"token":  {s.token},
+		"token":  {token},
 		"lang":   {"zh_CN"},
 		"f":      {"json"},
 		"ajax":   {"1"},
@@ -294,7 +299,7 @@ func (s *WeChatSourceService) ListOfficialAccountArticles(ctx context.Context, f
 	if err != nil {
 		return nil, err
 	}
-	s.applyHeaders(req, true)
+	s.applyHeadersWithCookie(req, cookie)
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil, err
@@ -418,10 +423,37 @@ func (s *WeChatSourceService) requireCredentials() error {
 	return nil
 }
 
+func (s *WeChatSourceService) credentials(ctx context.Context) (string, string, error) {
+	if s.sessionProvider == nil {
+		if err := s.requireCredentials(); err != nil {
+			return "", "", err
+		}
+		return s.token, s.cookie, nil
+	}
+	session, err := s.sessionProvider.Session(ctx)
+	if err != nil || strings.TrimSpace(session.Token) == "" {
+		return "", "", ErrWeChatCredentialsNotConfigured
+	}
+	cookies := make([]string, 0, len(session.Cookies))
+	for _, cookie := range session.Cookies {
+		if cookie.Name != "" {
+			cookies = append(cookies, cookie.Name+"="+cookie.Value)
+		}
+	}
+	return session.Token, strings.Join(cookies, "; "), nil
+}
+
 func (s *WeChatSourceService) applyHeaders(req *http.Request, includeCookie bool) {
 	req.Header.Set("User-Agent", s.userAgent)
 	if includeCookie && s.cookie != "" {
 		req.Header.Set("Cookie", s.cookie)
+	}
+}
+
+func (s *WeChatSourceService) applyHeadersWithCookie(req *http.Request, cookie string) {
+	req.Header.Set("User-Agent", s.userAgent)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
 	}
 }
 
