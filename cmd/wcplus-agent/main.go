@@ -94,8 +94,11 @@ func loadWCPlusAgentConfig(lookup environmentLookup) (app.SourceAgentConfig, err
 		RemoteURL:     lookupValue(lookup, "KBASE_REMOTE_URL"),
 		AgentToken:    lookupValue(lookup, "KBASE_SOURCE_AGENT_TOKEN"),
 		AgentID:       lookupValue(lookup, "KBASE_SOURCE_AGENT_ID"),
-		StateDir:      lookupValue(lookup, "WCPLUS_AGENT_STATE_DIR"),
+		StateDir:      lookupValue(lookup, "SOURCE_AGENT_STATE_DIR"),
 		WCPlusBaseURL: lookupValue(lookup, "WCPLUSPRO_BASE_URL"),
+	}
+	if config.StateDir == "" {
+		config.StateDir = lookupValue(lookup, "WCPLUS_AGENT_STATE_DIR")
 	}
 	if config.WCPlusBaseURL == "" {
 		config.WCPlusBaseURL = lookupValue(lookup, "WCPLUS_BASE_URL")

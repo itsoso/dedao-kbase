@@ -27,7 +27,7 @@ func TestSourceAgentConfigValidation(t *testing.T) {
 		{name: "remote URL", mutate: func(cfg *SourceAgentConfig) { cfg.RemoteURL = "" }, want: "KBASE_REMOTE_URL"},
 		{name: "agent token", mutate: func(cfg *SourceAgentConfig) { cfg.AgentToken = "" }, want: "KBASE_SOURCE_AGENT_TOKEN"},
 		{name: "agent ID", mutate: func(cfg *SourceAgentConfig) { cfg.AgentID = "" }, want: "KBASE_SOURCE_AGENT_ID"},
-		{name: "state directory", mutate: func(cfg *SourceAgentConfig) { cfg.StateDir = "" }, want: "WCPLUS_AGENT_STATE_DIR"},
+		{name: "state directory", mutate: func(cfg *SourceAgentConfig) { cfg.StateDir = "" }, want: "SOURCE_AGENT_STATE_DIR"},
 		{name: "insecure remote", mutate: func(cfg *SourceAgentConfig) { cfg.RemoteURL = "http://kbase.example.invalid" }, want: "HTTPS"},
 		{name: "remote credentials", mutate: func(cfg *SourceAgentConfig) { cfg.RemoteURL = "https://user:pass@kbase.example.invalid" }, want: "credentials"},
 		{name: "unicode token", mutate: func(cfg *SourceAgentConfig) { cfg.AgentToken = "agent-密钥" }, want: "ASCII"},

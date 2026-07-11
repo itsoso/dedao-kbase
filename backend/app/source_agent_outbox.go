@@ -54,7 +54,7 @@ func newSourceAgentOutbox(
 ) (*SourceAgentOutbox, error) {
 	stateDir = strings.TrimSpace(stateDir)
 	if stateDir == "" {
-		return nil, fmt.Errorf("WCPLUS_AGENT_STATE_DIR is required")
+		return nil, fmt.Errorf("SOURCE_AGENT_STATE_DIR is required")
 	}
 	if now == nil {
 		now = time.Now

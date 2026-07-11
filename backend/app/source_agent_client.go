@@ -49,7 +49,7 @@ func (c SourceAgentConfig) Normalized() (SourceAgentConfig, error) {
 		return c, fmt.Errorf("KBASE_SOURCE_AGENT_ID is required")
 	}
 	if c.StateDir == "" {
-		return c, fmt.Errorf("WCPLUS_AGENT_STATE_DIR is required")
+		return c, fmt.Errorf("SOURCE_AGENT_STATE_DIR is required")
 	}
 	remote, err := url.Parse(c.RemoteURL)
 	if err != nil || remote.Hostname() == "" || (remote.Scheme != "http" && remote.Scheme != "https") {
