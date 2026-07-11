@@ -132,6 +132,19 @@ func TestKBaseHTTPHandlerSerializesCapabilityHealth(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerCreatesWeChatCollectorSubscription(t *testing.T) {
+	root := t.TempDir()
+	syncStore, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", SourceSync: syncStore})
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/source-subscriptions", "admin-secret", `{"source_type":"wechat_mp_article","source_account_key":"account-key","source_account":"Sanitized account","operation":"sync_articles","schedule":"manual","enabled":true}`)
+	if resp.Code != http.StatusCreated || !strings.Contains(resp.Body.String(), `"source_type":"wechat_mp_article"`) || !strings.Contains(resp.Body.String(), `"operation":"sync_articles"`) {
+		t.Fatalf("status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentPayloadLimit(t *testing.T) {
 	sourceSync, err := NewSourceSyncStore(t.TempDir())
 	if err != nil {

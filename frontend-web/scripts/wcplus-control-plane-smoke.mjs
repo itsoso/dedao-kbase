@@ -68,7 +68,7 @@ for (const selector of [
 }
 
 for (const label of [
-  "来源控制台",
+  "微信公众号采集器",
   "本地 Agent",
   "订阅",
   "新建订阅",

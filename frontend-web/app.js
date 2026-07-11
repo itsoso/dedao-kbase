@@ -88,7 +88,7 @@ const sourceControlState = {
     sourceAccountKey: "",
     sourceAccount: "",
     sourceAgentID: "",
-    sourceOperation: "sync_content",
+    sourceOperation: "sync_articles",
     sourceScheduleMode: "manual",
     sourceIntervalSeconds: 3600,
   },
@@ -648,8 +648,9 @@ function renderSourceControlPlane() {
   return `
     <section class="source-control__header">
       <div>
-        <p class="web-kicker">Source Control</p>
-        <h1>来源控制台</h1>
+        <p class="web-kicker">WeChat Collector</p>
+        <h1>微信公众号采集器</h1>
+        <p class="web-muted">登录状态与公众号搜索由本地 Agent 处理，凭据不会发送到 KBase。</p>
       </div>
       <div class="source-control__header-actions">
         ${status}
@@ -758,10 +759,9 @@ function renderSourceSubscriptionList() {
         <label>
           <span>同步范围</span>
           <select name="sourceOperation">
-            <option value="existing_articles" ${draft.sourceOperation === "existing_articles" ? "selected" : ""}>已有文章</option>
-            <option value="sync_links" ${draft.sourceOperation === "sync_links" ? "selected" : ""}>刷新链接</option>
-            <option value="sync_content" ${draft.sourceOperation === "sync_content" ? "selected" : ""}>链接与正文</option>
-            <option value="sync_reading_data" ${draft.sourceOperation === "sync_reading_data" ? "selected" : ""}>阅读数据</option>
+            <option value="discover_articles" ${draft.sourceOperation === "discover_articles" ? "selected" : ""}>发现文章</option>
+            <option value="sync_articles" ${draft.sourceOperation === "sync_articles" ? "selected" : ""}>同步文章</option>
+            <option value="sync_media" ${draft.sourceOperation === "sync_media" ? "selected" : ""}>同步媒体</option>
           </select>
         </label>
         <div class="source-control__schedule-fields">
@@ -1186,7 +1186,7 @@ function readSourceSubscriptionDraft() {
   sourceControlState.draft.sourceAccountKey = String(data.get("sourceAccountKey") || "").trim();
   sourceControlState.draft.sourceAccount = String(data.get("sourceAccount") || "").trim();
   sourceControlState.draft.sourceAgentID = String(data.get("sourceAgentID") || "").trim();
-  sourceControlState.draft.sourceOperation = String(data.get("sourceOperation") || "sync_content");
+  sourceControlState.draft.sourceOperation = String(data.get("sourceOperation") || "sync_articles");
   sourceControlState.draft.sourceScheduleMode = String(data.get("sourceScheduleMode") || "manual");
   sourceControlState.draft.sourceIntervalSeconds = boundedNumber(data.get("sourceIntervalSeconds"), 60, 31536000, sourceControlState.draft.sourceIntervalSeconds);
 }
@@ -1207,13 +1207,13 @@ async function createSourceSubscription() {
     const payload = await apiFetch("/api/source-subscriptions", {
       method: "POST",
       body: JSON.stringify({
-        source_type: "wcplus_wechat_article",
+        source_type: "wechat_mp_article",
         source_account_key: draft.sourceAccountKey,
         source_account: draft.sourceAccount || draft.sourceAccountKey,
         agent_id: draft.sourceAgentID,
         schedule,
         operation: draft.sourceOperation,
-        options: { limit: 20 },
+        options: { page_size: 10, max_items: 100, include_media: true, title_query: "" },
         enabled: true,
       }),
     });
