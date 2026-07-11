@@ -20,6 +20,7 @@ const (
 	WeChatMPLoginExpired   = "expired"
 	WeChatMPLoginConfirmed = "confirmed"
 	WeChatMPLoginVerify    = "verification_required"
+	weChatMPUserAgent      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36 KBaseSourceAgent/1.0"
 )
 
 var (
@@ -118,8 +119,11 @@ func (c *WeChatMPSessionClient) StartLogin(ctx context.Context) error {
 	var payload struct {
 		BaseResp weChatBaseResp `json:"base_resp"`
 	}
-	if json.Unmarshal(body, &payload) != nil || payload.BaseResp.Ret != 0 {
-		return fmt.Errorf("wechat MP login start was rejected")
+	if json.Unmarshal(body, &payload) != nil {
+		return fmt.Errorf("wechat MP login start response is malformed")
+	}
+	if payload.BaseResp.Ret != 0 {
+		return fmt.Errorf("wechat MP login start was rejected (%d)", payload.BaseResp.Ret)
 	}
 	return nil
 }
@@ -276,6 +280,11 @@ func (c *WeChatMPSessionClient) request(ctx context.Context, method, path string
 	if form != nil {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	}
+	origin := c.base.Scheme + "://" + c.base.Host
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("User-Agent", weChatMPUserAgent)
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("wechat MP request failed")

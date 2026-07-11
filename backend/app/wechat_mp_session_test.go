@@ -20,6 +20,9 @@ func TestWeChatMPLoginCompletesAndSavesSession(t *testing.T) {
 			if r.Method != http.MethodPost {
 				t.Fatalf("bizlogin method=%s", r.Method)
 			}
+			if r.Header.Get("Referer") == "" || r.Header.Get("Origin") == "" || r.Header.Get("User-Agent") == "" || r.Header.Get("Accept-Encoding") != "identity" {
+				t.Fatalf("bizlogin headers=%v", r.Header)
+			}
 			if err := r.ParseForm(); err != nil {
 				t.Fatal(err)
 			}
