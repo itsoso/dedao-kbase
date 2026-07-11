@@ -24,6 +24,11 @@ type WeChatDiscoveredArticle struct {
 	WeChatOfficialArticle
 	ArticleKey string `json:"article_key"`
 }
+type WeChatDiscoveryPage struct {
+	Articles         []WeChatDiscoveredArticle `json:"articles"`
+	UpstreamBegin    int                       `json:"upstream_begin"`
+	PublicationCount int                       `json:"publication_count"`
+}
 type WeChatDiscoveryConfig struct {
 	BaseURL         string
 	HTTPClient      *http.Client
@@ -58,10 +63,11 @@ func NewWeChatDiscovery(cfg WeChatDiscoveryConfig) (*WeChatDiscovery, error) {
 	}
 	return &WeChatDiscovery{baseURL: base, client: client, sessions: cfg.SessionProvider}, nil
 }
-func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor WeChatDiscoveryCursor, pageSize int, titleQuery string) ([]WeChatDiscoveredArticle, WeChatDiscoveryCursor, error) {
+func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor WeChatDiscoveryCursor, pageSize int, titleQuery string) (WeChatDiscoveryPage, error) {
+	result := WeChatDiscoveryPage{UpstreamBegin: cursor.Begin}
 	session, err := d.sessions.Session(ctx)
 	if err != nil || session.Token == "" {
-		return nil, cursor, &WeChatDiscoveryError{Code: "login_required"}
+		return result, &WeChatDiscoveryError{Code: "login_required"}
 	}
 	if pageSize <= 0 {
 		pageSize = 5
@@ -76,7 +82,7 @@ func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor W
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, cursor, fmt.Errorf("wechat discovery request failed")
+		return result, fmt.Errorf("wechat discovery request failed")
 	}
 	defer resp.Body.Close()
 	var outer struct {
@@ -84,10 +90,10 @@ func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor W
 		PublishPage string         `json:"publish_page"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&outer) != nil {
-		return nil, cursor, &WeChatDiscoveryError{Code: "malformed_contract"}
+		return result, &WeChatDiscoveryError{Code: "malformed_contract"}
 	}
 	if outer.BaseResp.Ret != 0 {
-		return nil, cursor, &WeChatDiscoveryError{Code: discoveryRetCode(outer.BaseResp.Ret)}
+		return result, &WeChatDiscoveryError{Code: discoveryRetCode(outer.BaseResp.Ret)}
 	}
 	var page struct {
 		PublishList []struct {
@@ -95,15 +101,16 @@ func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor W
 		} `json:"publish_list"`
 	}
 	if json.Unmarshal([]byte(outer.PublishPage), &page) != nil {
-		return nil, cursor, &WeChatDiscoveryError{Code: "malformed_contract"}
+		return result, &WeChatDiscoveryError{Code: "malformed_contract"}
 	}
 	items := []WeChatDiscoveredArticle{}
+	result.PublicationCount = len(page.PublishList)
 	for _, published := range page.PublishList {
 		var info struct {
 			AppMsgEx []WeChatOfficialArticle `json:"appmsgex"`
 		}
 		if json.Unmarshal([]byte(published.PublishInfo), &info) != nil {
-			return nil, cursor, &WeChatDiscoveryError{Code: "malformed_contract"}
+			return result, &WeChatDiscoveryError{Code: "malformed_contract"}
 		}
 		for _, article := range info.AppMsgEx {
 			if titleQuery != "" && !strings.Contains(strings.ToLower(article.Title), strings.ToLower(titleQuery)) {
@@ -113,13 +120,8 @@ func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor W
 			items = append(items, WeChatDiscoveredArticle{WeChatOfficialArticle: article, ArticleKey: key})
 		}
 	}
-	next := cursor
-	next.Begin += len(items)
-	if len(items) > 0 {
-		next.LastArticleKey = items[len(items)-1].ArticleKey
-		next.LastTimestamp = items[len(items)-1].UpdateTime
-	}
-	return items, next, nil
+	result.Articles = items
+	return result, nil
 }
 func stableWeChatArticleKey(a WeChatOfficialArticle) string {
 	if strings.TrimSpace(a.AID) != "" {

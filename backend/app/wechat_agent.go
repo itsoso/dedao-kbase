@@ -52,9 +52,16 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	}
 	pageSize := sourceAgentOptionInt(run.Subscription.Options, "page_size", 10, 20)
 	maxItems := sourceAgentOptionInt(run.Subscription.Options, "max_items", 100, 100)
-	items, next, err := a.discovery.Discover(ctx, run.Subscription.SourceAccountKey, cursor, pageSize, sourceAgentOptionString(run.Subscription.Options, "title_query", ""))
+	page, err := a.discovery.Discover(ctx, run.Subscription.SourceAccountKey, cursor, pageSize, sourceAgentOptionString(run.Subscription.Options, "title_query", ""))
 	if err != nil {
 		return SourceAdapterResult{}, err
+	}
+	items := page.Articles
+	next := cursor
+	next.Begin = page.UpstreamBegin + page.PublicationCount
+	if len(items) > 0 {
+		next.LastArticleKey = items[len(items)-1].ArticleKey
+		next.LastTimestamp = items[len(items)-1].UpdateTime
 	}
 	if len(items) > maxItems {
 		items = items[:maxItems]
