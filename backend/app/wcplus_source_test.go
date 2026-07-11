@@ -478,6 +478,29 @@ func TestWCPlusSourceCreatesTypedTasks(t *testing.T) {
 	}
 }
 
+func TestWCPlusSourceNormalizesNumericCreatedTaskID(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if r.URL.Path != "/api/task/new" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		fmt.Fprint(w, `{"success":true,"data":{"task_id":42,"status":"created"}}`)
+	}))
+	defer apiServer.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: apiServer.URL})
+	task, err := service.CreateTask(context.Background(), WCPlusTaskRequest{
+		Biz:         "biz-1",
+		CrawlerType: "gzh_article_link",
+	})
+	if err != nil {
+		t.Fatalf("CreateTask returned error: %v", err)
+	}
+	if task.TaskID != "42" || task.Status != "created" {
+		t.Fatalf("unexpected task: %#v", task)
+	}
+}
+
 func TestWCPlusSourceCreatesCompleteArticleTask(t *testing.T) {
 	var payload map[string]any
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

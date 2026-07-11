@@ -534,10 +534,11 @@ func (s *WCPlusSourceService) CreateTask(ctx context.Context, req WCPlusTaskRequ
 	if strings.TrimSpace(req.CrawlerType) == "" {
 		req.CrawlerType = "gzh_article_link"
 	}
-	var task WCPlusTask
-	if err := s.post(ctx, "/api/task/new", req, &task); err != nil {
+	var payload any
+	if err := s.post(ctx, "/api/task/new", req, &payload); err != nil {
 		return nil, err
 	}
+	task := wcplusTaskFromAny(payload)
 	return &task, nil
 }
 
