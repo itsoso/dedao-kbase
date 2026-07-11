@@ -189,6 +189,36 @@ func (c *SourceAgentClient) UploadArticle(ctx context.Context, runID string, env
 	return response.Receipt, nil
 }
 
+func (c *SourceAgentClient) UploadAsset(ctx context.Context, runID string, envelope SourceAssetEnvelope) (SourceAssetReference, error) {
+	endpoint := *c.baseURL
+	endpoint.Path = path.Join(strings.TrimSuffix(c.baseURL.Path, "/"), "/api/source-agent/runs/"+url.PathEscape(strings.TrimSpace(runID))+"/assets")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(envelope.Data))
+	if err != nil {
+		return SourceAssetReference{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", envelope.ContentType)
+	req.Header.Set("X-Source-Agent-ID", c.agentID)
+	req.Header.Set("X-Source-Item-Key", envelope.SourceItemKey)
+	req.Header.Set("X-Source-URL", envelope.SourceURL)
+	req.Header.Set("X-Content-SHA256", envelope.SHA256)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return SourceAssetReference{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return SourceAssetReference{}, &SourceAgentHTTPError{Method: http.MethodPost, Path: req.URL.Path, StatusCode: resp.StatusCode}
+	}
+	var payload struct {
+		Asset SourceAssetReference `json:"asset"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&payload) != nil {
+		return SourceAssetReference{}, fmt.Errorf("decode source asset response failed")
+	}
+	return payload.Asset, nil
+}
+
 func (c *SourceAgentClient) ReportItemFailure(ctx context.Context, runID, sourceItemKey, idempotencyKey, message string) (SourceSyncItem, error) {
 	payload := struct {
 		AgentID        string `json:"agent_id"`

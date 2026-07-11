@@ -25,6 +25,7 @@ type KBaseHTTPConfig struct {
 	SourceIngest            *SourceIngestService
 	SourceAgentToken        string
 	SourceAgentMaxBodyBytes int64
+	SourceAssets            *SourceAssetStore
 }
 
 type kbaseHTTPHandler struct {
@@ -38,6 +39,7 @@ type kbaseHTTPHandler struct {
 	sourceIngest            *SourceIngestService
 	sourceAgentToken        string
 	sourceAgentMaxBodyBytes int64
+	sourceAssets            *SourceAssetStore
 }
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
@@ -60,6 +62,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if authToken != "" && sourceAgentToken == authToken {
 		sourceAgentToken = ""
 	}
+	assets := cfg.SourceAssets
+	if assets == nil {
+		assets, _ = NewSourceAssetStore(store.Root())
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
@@ -71,6 +77,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceIngest:            sourceIngest,
 		sourceAgentToken:        sourceAgentToken,
 		sourceAgentMaxBodyBytes: maxBodyBytes,
+		sourceAssets:            assets,
 	}
 }
 
@@ -110,6 +117,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if isSourceSyncAdminPath(r.URL.Path) {
 		h.handleSourceSyncAdmin(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/source-assets/") {
+		h.handleSourceAssetRead(w, r)
 		return
 	}
 	if r.URL.Path == "/api/wechat/import" {
@@ -846,6 +857,24 @@ func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.R
 			return
 		}
 		writeHTTPJSON(w, http.StatusCreated, map[string]any{"receipt": receipt})
+	case "assets":
+		run, err := h.sourceSync.GetRun(runID)
+		agentID := strings.TrimSpace(r.Header.Get("X-Source-Agent-ID"))
+		if err != nil || run.LeaseOwner != agentID || run.Status != SourceRunRunning {
+			h.writeSourceSyncError(w, ErrSourceRunLeaseOwner)
+			return
+		}
+		data, err := readBoundedAsset(r.Body)
+		if err != nil {
+			writeHTTPError(w, http.StatusRequestEntityTooLarge, err.Error())
+			return
+		}
+		ref, err := h.sourceAssets.Save(r.Context(), SourceAssetEnvelope{SourceItemKey: r.Header.Get("X-Source-Item-Key"), SourceURL: r.Header.Get("X-Source-URL"), SHA256: r.Header.Get("X-Content-SHA256"), ContentType: r.Header.Get("Content-Type"), Data: data})
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{"asset": ref})
 	case "complete":
 		var payload struct {
 			AgentID string `json:"agent_id"`
@@ -877,6 +906,26 @@ func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.R
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceAssetRead(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	hash := strings.TrimPrefix(r.URL.Path, "/api/source-assets/")
+	file, err := h.sourceAssets.Open(hash)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	defer file.Close()
+	head := make([]byte, 512)
+	n, _ := file.Read(head)
+	_, _ = file.Seek(0, 0)
+	w.Header().Set("Content-Type", http.DetectContentType(head[:n]))
+	w.Header().Set("Cache-Control", "private, immutable")
+	http.ServeContent(w, r, hash, time.Time{}, file)
 }
 
 func (h *kbaseHTTPHandler) handleSourceSyncAdmin(w http.ResponseWriter, r *http.Request) {
