@@ -222,3 +222,9 @@ wails 构建需要安装以下依赖：
 [MIT](./LICENSE) © yann0917
 
 ---
+# First-party WeChat source agent
+
+Build the native macOS agent with `scripts/build-source-agent-macos.sh`. Install
+it with explicit `KBASE_REMOTE_URL`, `KBASE_SOURCE_AGENT_ID`, and a dedicated
+`KBASE_SOURCE_AGENT_TOKEN` using `scripts/install-source-agent-macos.sh`. MP
+sessions remain in macOS Keychain and enrollment listens on loopback only.

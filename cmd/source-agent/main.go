@@ -20,6 +20,11 @@ func main() {
 func loadSourceAgentConfig(lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
 	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
 	cfg := app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: value("KBASE_SOURCE_AGENT_TOKEN"), AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}
+	if cfg.AgentToken == "" && cfg.AgentID != "" {
+		if raw, err := newKeychainSecretStore(cfg.AgentID, nil).Load(context.Background(), "transport-token"); err == nil {
+			cfg.AgentToken = string(raw)
+		}
+	}
 	return cfg.Normalized()
 }
 func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) error {
