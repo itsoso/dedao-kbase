@@ -1,6 +1,6 @@
 # WeChat Discovery Cursor Correctness Design
 
-**Status:** Approved
+**Status:** Implemented and verified on 2026-07-11
 
 ## Problem
 
@@ -17,7 +17,7 @@ Use a two-level cursor that separates upstream page position from local item
 progress:
 
 ```go
-type WeChatDiscoveryCursor struct {
+type weChatAgentCursor struct {
     UpstreamBegin        int    `json:"upstream_begin"`
     PublicationItemIndex int    `json:"publication_item_index,omitempty"`
     LastArticleKey       string `json:"last_article_key,omitempty"`
@@ -43,7 +43,9 @@ failure rather than an implicit restart from the beginning.
 
 - A page with zero title matches still advances past the upstream publications.
 - A download or outbox failure preserves the cursor immediately before the
-  failed item.
+  failed item. The runner uploads already accepted outbox items before
+  reporting failure, and the failure endpoint atomically stores the safe
+  cursor without updating `last_success_at`.
 - A `max_items` boundary preserves the page position and resumes at the next
   unprocessed item.
 - An empty upstream page leaves a stable terminal cursor.
@@ -52,7 +54,16 @@ failure rather than an implicit restart from the beginning.
 
 ## Verification
 
-Add deterministic tests for filtered-empty pages, multi-item publications,
-mid-page `max_items` continuation, failure-before-advance, legacy cursor decode,
-and invalid cursor rejection. Run focused discovery/adapter tests, the complete
-backend package, privacy smoke, and `git diff --check` before commit.
+Deterministic coverage now includes filtered-empty pages, multi-item
+publications, three-run `max_items` continuation, download and enqueue failures,
+runner upload-before-fail ordering, failure cursor persistence, legacy cursor
+decode, and invalid cursor rejection.
+
+Verified on 2026-07-11 with:
+
+```bash
+go test ./backend/app -run 'Test(WeChatDiscovery|WeChatAgent|SourceAgentRunner)' -count=1
+go test ./backend/app -count=1
+bash scripts/privacy-smoke.sh
+git diff --check
+```
