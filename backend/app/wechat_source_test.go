@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
 func TestWeChatSourceDownloadsArticleAsMarkdown(t *testing.T) {
@@ -231,5 +233,19 @@ func TestWeChatSourceRequiresExplicitCredentialsForOfficialAPIs(t *testing.T) {
 	}
 	if _, err := service.ListOfficialAccountArticles(context.Background(), "fake-123", 0, 5); err != ErrWeChatCredentialsNotConfigured {
 		t.Fatalf("ListOfficialAccountArticles error = %v, want ErrWeChatCredentialsNotConfigured", err)
+	}
+}
+
+func TestWeChatSourcePreservesTextAndImageDOMOrder(t *testing.T) {
+	doc, err := goquery.NewDocumentFromReader(strings.NewReader(`<div id="js_content"><p>before</p><img data-src="https://mmbiz.qpic.cn/a.png" alt="middle"><blockquote>after</blockquote></div>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	markdown := buildWeChatMarkdown("title", doc.Find("#js_content"))
+	before := strings.Index(markdown, "before")
+	image := strings.Index(markdown, "![middle]")
+	after := strings.Index(markdown, "after")
+	if before < 0 || image < before || after < image {
+		t.Fatalf("markdown order=%s", markdown)
 	}
 }

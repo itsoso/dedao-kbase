@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/net/html"
 )
 
 var ErrWeChatCredentialsNotConfigured = errors.New("wechat mp token/cookie are not configured")
@@ -501,33 +502,48 @@ func buildWeChatMarkdown(title string, content *goquery.Selection) string {
 		return strings.TrimSpace(strings.Join(parts, "\n\n"))
 	}
 
-	content.Find("h2,h3,p,li,blockquote").Each(func(_ int, sel *goquery.Selection) {
-		text := normalizeWhitespace(sel.Text())
-		if text == "" {
-			return
+	imageIndex := 0
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			selection := goquery.NewDocumentFromNode(node).Selection
+			switch node.Data {
+			case "img":
+				imageIndex++
+				src := firstAttr(selection, "data-src", "data-original", "data-lazy-src", "src")
+				if src != "" && !strings.HasPrefix(src, "data:") {
+					alt := normalizeWhitespace(firstAttr(selection, "alt", "title"))
+					if alt == "" {
+						alt = fmt.Sprintf("image-%d", imageIndex)
+					}
+					parts = append(parts, fmt.Sprintf("![%s](%s)", alt, src))
+				}
+				return
+			case "h2", "h3", "p", "li", "blockquote":
+				text := normalizeWhitespace(selection.Text())
+				if text != "" {
+					prefix := ""
+					if node.Data == "h2" {
+						prefix = "## "
+					} else if node.Data == "h3" {
+						prefix = "### "
+					} else if node.Data == "li" {
+						prefix = "- "
+					} else if node.Data == "blockquote" {
+						prefix = "> "
+					}
+					parts = append(parts, prefix+text)
+				}
+				return
+			}
 		}
-		switch goquery.NodeName(sel) {
-		case "h2":
-			parts = append(parts, "## "+text)
-		case "h3":
-			parts = append(parts, "### "+text)
-		case "li":
-			parts = append(parts, "- "+text)
-		default:
-			parts = append(parts, text)
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
 		}
-	})
-	content.Find("img").Each(func(i int, sel *goquery.Selection) {
-		src := firstAttr(sel, "data-src", "src")
-		if src == "" || strings.HasPrefix(src, "data:") {
-			return
-		}
-		alt := normalizeWhitespace(firstAttr(sel, "alt", "title"))
-		if alt == "" {
-			alt = fmt.Sprintf("image-%d", i+1)
-		}
-		parts = append(parts, fmt.Sprintf("![%s](%s)", alt, src))
-	})
+	}
+	for _, node := range content.Nodes {
+		walk(node)
+	}
 	return strings.TrimSpace(strings.Join(parts, "\n\n"))
 }
 
