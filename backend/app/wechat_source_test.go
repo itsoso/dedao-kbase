@@ -57,6 +57,9 @@ func TestWeChatSourceDownloadsArticleAsMarkdown(t *testing.T) {
 	if !strings.Contains(article.Markdown, "![配图](https://mmbiz.qpic.cn/example.jpg)") {
 		t.Fatalf("Markdown missing image: %s", article.Markdown)
 	}
+	if len(article.Media) != 1 || article.Media[0].SourceURL != "https://mmbiz.qpic.cn/example.jpg" || article.Media[0].Alt != "配图" {
+		t.Fatalf("Media = %#v", article.Media)
+	}
 	if !strings.Contains(article.Text, "第二段包含可检索内容。") {
 		t.Fatalf("Text missing normalized body: %q", article.Text)
 	}

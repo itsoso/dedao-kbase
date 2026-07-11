@@ -14,12 +14,19 @@ type WeChatSourceAdapterConfig struct {
 	Discovery *WeChatDiscovery
 	Source    *WeChatSourceService
 	Media     *WeChatMediaDownloader
+	Assets    WeChatAssetUploader
 }
+
+type WeChatAssetUploader interface {
+	UploadAsset(context.Context, string, SourceAssetEnvelope) (SourceAssetReference, error)
+}
+
 type WeChatSourceAdapter struct {
 	sessions  WeChatMPSessionProvider
 	discovery *WeChatDiscovery
 	source    *WeChatSourceService
 	media     *WeChatMediaDownloader
+	assets    WeChatAssetUploader
 }
 
 const weChatAgentCursorVersion = 1
@@ -35,7 +42,7 @@ func NewWeChatSourceAdapter(cfg WeChatSourceAdapterConfig) (*WeChatSourceAdapter
 	if cfg.Sessions == nil {
 		return nil, fmt.Errorf("wechat MP session provider is required")
 	}
-	return &WeChatSourceAdapter{sessions: cfg.Sessions, discovery: cfg.Discovery, source: cfg.Source, media: cfg.Media}, nil
+	return &WeChatSourceAdapter{sessions: cfg.Sessions, discovery: cfg.Discovery, source: cfg.Source, media: cfg.Media, assets: cfg.Assets}, nil
 }
 func (a *WeChatSourceAdapter) Name() string { return "wechat_mp" }
 func (a *WeChatSourceAdapter) Operations() []string {
@@ -85,20 +92,15 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		}
 		return SourceAdapterResult{Cursor: encoded}, nil
 	}
-	if run.RequestedOperation == "sync_media" {
-		next.UpstreamBegin = page.UpstreamBegin + page.PublicationCount
-		next.PublicationItemIndex = 0
-		encoded, err := encodeWeChatAgentCursor(next)
-		if err != nil {
-			return SourceAdapterResult{}, err
-		}
-		return SourceAdapterResult{Cursor: encoded}, nil
-	}
-	if run.RequestedOperation != "sync_articles" {
+	if run.RequestedOperation != "sync_articles" && run.RequestedOperation != "sync_media" {
 		return SourceAdapterResult{}, fmt.Errorf("unsupported source sync operation %q", run.RequestedOperation)
 	}
 	if a.source == nil {
 		return SourceAdapterResult{}, fmt.Errorf("wechat article source is not configured")
+	}
+	includeMedia := run.RequestedOperation == "sync_media" || sourceAgentOptionBool(run.Subscription.Options, "include_media", false)
+	if includeMedia && (a.media == nil || a.assets == nil) {
+		return SourceAdapterResult{}, fmt.Errorf("wechat media downloader and asset uploader are required")
 	}
 	if next.PublicationItemIndex > len(items) {
 		return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
@@ -112,10 +114,17 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		if err != nil {
 			return weChatAdapterFailure(next, err)
 		}
-		sum := sha256.Sum256([]byte(article.Markdown))
-		envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: hex.EncodeToString(sum[:]), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: article.PublishedAt, Content: article.Markdown, ContentFormat: "markdown"}
+		content := article.Markdown
+		var mediaErr error
+		if includeMedia {
+			content, mediaErr = a.archiveArticleMedia(ctx, run.ID, item.ArticleKey, article)
+		}
+		envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: weChatArticleIdempotencyKey(run.Subscription.SourceAccountKey, item.ArticleKey, content), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: article.PublishedAt, Content: content, ContentFormat: "markdown"}
 		if _, err := sink.Enqueue(run.ID, envelope); err != nil {
 			return weChatAdapterFailure(next, err)
+		}
+		if mediaErr != nil {
+			return weChatAdapterFailure(next, mediaErr)
 		}
 		next.PublicationItemIndex++
 		next.LastArticleKey = item.ArticleKey
@@ -130,6 +139,35 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		return SourceAdapterResult{}, err
 	}
 	return SourceAdapterResult{Cursor: encoded}, nil
+}
+
+func (a *WeChatSourceAdapter) archiveArticleMedia(ctx context.Context, runID, articleKey string, article *WeChatArticle) (string, error) {
+	content := article.Markdown
+	assets, failures := a.media.Download(ctx, article.Media)
+	failureCount := len(failures)
+	for _, asset := range assets {
+		ref, err := a.assets.UploadAsset(ctx, runID, SourceAssetEnvelope{
+			SourceItemKey: articleKey,
+			SourceURL:     asset.SourceURL,
+			SHA256:        asset.SHA256,
+			ContentType:   asset.ContentType,
+			Data:          asset.Data,
+		})
+		if err != nil || ref.SHA256 == "" {
+			failureCount++
+			continue
+		}
+		content = strings.ReplaceAll(content, asset.SourceURL, "/api/source-assets/"+ref.SHA256)
+	}
+	if failureCount > 0 {
+		return content, fmt.Errorf("wechat media archival failed for %d assets", failureCount)
+	}
+	return content, nil
+}
+
+func weChatArticleIdempotencyKey(accountKey, articleKey, content string) string {
+	sum := sha256.Sum256([]byte("wechat_mp_article\x00" + strings.TrimSpace(accountKey) + "\x00" + strings.TrimSpace(articleKey) + "\x00" + content))
+	return hex.EncodeToString(sum[:])
 }
 
 func weChatAdapterFailure(cursor weChatAgentCursor, cause error) (SourceAdapterResult, error) {

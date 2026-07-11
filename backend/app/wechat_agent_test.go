@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -14,6 +15,15 @@ import (
 type recordingSourceEnvelopeSink struct {
 	envelopes []SourceArticleEnvelope
 	failItem  string
+}
+
+type recordingWeChatAssetUploader struct {
+	assets []SourceAssetEnvelope
+}
+
+func (u *recordingWeChatAssetUploader) UploadAsset(_ context.Context, _ string, asset SourceAssetEnvelope) (SourceAssetReference, error) {
+	u.assets = append(u.assets, asset)
+	return SourceAssetReference{SHA256: asset.SHA256, ContentType: asset.ContentType, Size: int64(len(asset.Data))}, nil
 }
 
 func (s *recordingSourceEnvelopeSink) Enqueue(_ string, envelope SourceArticleEnvelope) (SourceAgentOutboxItem, error) {
@@ -243,6 +253,85 @@ func TestWeChatAgentDoesNotAdvancePastFailure(t *testing.T) {
 				t.Fatalf("accepted envelopes=%#v", sink.envelopes)
 			}
 		})
+	}
+}
+
+func TestWeChatAgentSyncMediaUploadsAssetsAndRewritesArticle(t *testing.T) {
+	mediaData := []byte("\x89PNG\r\n\x1a\nsanitized-media")
+	mediaServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(mediaData)
+	}))
+	defer mediaServer.Close()
+	mediaURL, err := url.Parse(mediaServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<html><body><h1 id="activity-name">Article with media</h1><a id="js_name">Account</a><div id="js_content"><p>Article content is long enough for deterministic ingestion.</p><img data-src="%s" alt="chart"></div></body></html>`, mediaServer.URL+"/chart.png")
+	}))
+	defer articleServer.Close()
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		publishInfo, _ := json.Marshal(map[string]any{"appmsgex": []WeChatOfficialArticle{{Title: "Article with media", Link: articleServer.URL + "/article", AID: "article-media", UpdateTime: 101}}})
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": []map[string]any{{"publish_info": string(publishInfo)}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 0}, "publish_page": string(publishPage)})
+	}))
+	defer discoveryServer.Close()
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploader := &recordingWeChatAssetUploader{}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{
+		Sessions:  sessions,
+		Discovery: discovery,
+		Source:    newTestWeChatSourceService(t, articleServer),
+		Media: NewWeChatMediaDownloader(WeChatMediaConfig{
+			HTTPClient:  mediaServer.Client(),
+			Hosts:       []string{mediaURL.Hostname()},
+			ResolveHost: publicTestResolver,
+		}),
+		Assets: uploader,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSourceEnvelopeSink{}
+	result, err := adapter.Execute(context.Background(), SourceSyncRun{
+		ID:                 "run-media",
+		RequestedOperation: "sync_media",
+		Subscription: &SourceSubscription{
+			SourceAccountKey: "account-key",
+			SourceAccount:    "Account",
+			Options:          map[string]any{"max_items": float64(1)},
+		},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uploader.assets) != 1 || len(sink.envelopes) != 1 {
+		t.Fatalf("assets=%d envelopes=%d", len(uploader.assets), len(sink.envelopes))
+	}
+	privateURL := "/api/source-assets/" + uploader.assets[0].SHA256
+	if !strings.Contains(sink.envelopes[0].Content, privateURL) || strings.Contains(sink.envelopes[0].Content, mediaServer.URL) {
+		t.Fatalf("rewritten content=%s", sink.envelopes[0].Content)
+	}
+	cursor, err := decodeWeChatAgentCursor(result.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.UpstreamBegin != 1 || cursor.PublicationItemIndex != 0 {
+		t.Fatalf("cursor=%#v", cursor)
+	}
+}
+
+func TestWeChatAgentIdempotencyKeyIsScopedToSourceItem(t *testing.T) {
+	first := weChatArticleIdempotencyKey("account", "article-1", "same content")
+	second := weChatArticleIdempotencyKey("account", "article-2", "same content")
+	if first == second || first != weChatArticleIdempotencyKey("account", "article-1", "same content") {
+		t.Fatalf("first=%q second=%q", first, second)
 	}
 }
 

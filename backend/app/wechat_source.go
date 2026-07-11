@@ -48,13 +48,14 @@ type WeChatSourceService struct {
 }
 
 type WeChatArticle struct {
-	Title       string `json:"title"`
-	AccountName string `json:"account_name,omitempty"`
-	PublishedAt string `json:"published_at,omitempty"`
-	SourceURL   string `json:"source_url"`
-	Digest      string `json:"digest,omitempty"`
-	Markdown    string `json:"markdown"`
-	Text        string `json:"text"`
+	Title       string            `json:"title"`
+	AccountName string            `json:"account_name,omitempty"`
+	PublishedAt string            `json:"published_at,omitempty"`
+	SourceURL   string            `json:"source_url"`
+	Digest      string            `json:"digest,omitempty"`
+	Markdown    string            `json:"markdown"`
+	Text        string            `json:"text"`
+	Media       []WeChatMediaItem `json:"media,omitempty"`
 }
 
 type WeChatOfficialAccount struct {
@@ -477,7 +478,7 @@ func parseWeChatArticleDocument(doc *goquery.Document, sourceURL string) *WeChat
 	digest := firstSelectionAttr(doc, "meta[name='description']", "content")
 
 	content := firstSelection(doc, "#js_content", ".rich_media_content", "#js_article_content", "article")
-	markdown := buildWeChatMarkdown(title, content)
+	markdown, media := buildWeChatMarkdownWithMedia(title, content)
 	text := normalizeWhitespace(content.Text())
 	if text == "" {
 		text = normalizeWhitespace(doc.Find("body").Text())
@@ -490,16 +491,23 @@ func parseWeChatArticleDocument(doc *goquery.Document, sourceURL string) *WeChat
 		Digest:      digest,
 		Markdown:    markdown,
 		Text:        text,
+		Media:       media,
 	}
 }
 
 func buildWeChatMarkdown(title string, content *goquery.Selection) string {
+	markdown, _ := buildWeChatMarkdownWithMedia(title, content)
+	return markdown
+}
+
+func buildWeChatMarkdownWithMedia(title string, content *goquery.Selection) (string, []WeChatMediaItem) {
 	var parts []string
+	var media []WeChatMediaItem
 	if title != "" {
 		parts = append(parts, "# "+title)
 	}
 	if content == nil || content.Length() == 0 {
-		return strings.TrimSpace(strings.Join(parts, "\n\n"))
+		return strings.TrimSpace(strings.Join(parts, "\n\n")), media
 	}
 
 	imageIndex := 0
@@ -516,6 +524,7 @@ func buildWeChatMarkdown(title string, content *goquery.Selection) string {
 					if alt == "" {
 						alt = fmt.Sprintf("image-%d", imageIndex)
 					}
+					media = append(media, WeChatMediaItem{SourceURL: src, Alt: alt})
 					parts = append(parts, fmt.Sprintf("![%s](%s)", alt, src))
 				}
 				return
@@ -544,7 +553,7 @@ func buildWeChatMarkdown(title string, content *goquery.Selection) string {
 	for _, node := range content.Nodes {
 		walk(node)
 	}
-	return strings.TrimSpace(strings.Join(parts, "\n\n"))
+	return strings.TrimSpace(strings.Join(parts, "\n\n")), media
 }
 
 func firstSelection(doc *goquery.Document, selectors ...string) *goquery.Selection {
