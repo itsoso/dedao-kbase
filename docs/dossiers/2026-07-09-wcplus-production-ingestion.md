@@ -3,7 +3,7 @@
 ## Status
 
 - **Current stage:** S7 - verification and rollout
-- **Delivery status:** Control plane and Agent deployed; G6 new-content acquisition blocked by WC Plus authorization
+- **Delivery status:** Control plane and Agent deployed; G6 new-content acquisition blocked by WC Plus authorization and host security
 - **Architecture decision:** approved
 - **Last updated:** 2026-07-10
 
@@ -282,10 +282,21 @@ failure. KBase cannot activate or bypass a paid WC Plus license. G6 remains
 blocked until WC Plus accepts a nonzero task, after which the same bounded probe
 must be rerun.
 
-A sanitized license-status check reports `is_active=false`, `expire_time=0`,
-and no configured license key. The vendor UI exposes purchased-license and
-limited trial activation. Neither was triggered automatically because trial
-activation starts a time-limited entitlement and requires an operator decision.
+After explicit operator approval, the official one-hour trial endpoint returned
+a license for the current machine. The key shape, machine binding, issue time,
+expiry, and minimum-client-version claim were validated without recording the
+key. The host clock matched the vendor server, but saving the license and
+restarting WC Plus still left `is_active=false` and `expire_time=0`.
+
+The current official Apple Silicon package was then downloaded over HTTPS and
+its ZIP integrity was verified. Both the current and historical vendor
+executables triggered macOS XProtect during extraction: the unified log showed
+`XProtectBridgeService` receiving the event and `Forwarding detection
+succeeded!`, after which macOS removed the executable. KBase did not remove
+quarantine metadata, disable XProtect, or execute the rejected binary. The
+existing vendor process was unloaded, while the KBase Agent and all local data
+were preserved in a private backup. The Agent now heartbeats as online with
+`wcplus_healthy=false`; no source run is leased.
 
 ## Gate Ledger
 
@@ -296,20 +307,22 @@ activation starts a time-limited entitlement and requires an operator decision.
 | G3 Tests | PASS | Fresh Go tests/vet/race, Vue build, Web smokes, packaging, privacy, and diff checks passed | Preserve tested commit and artifact hashes |
 | G4 Review | PASS | Auth, leases, transactions, idempotency, limits, redaction, outbox, atomic writes, and rollback reviewed; findings fixed in `7f40949` | Preserve release diff |
 | G5 Deploy health | PASS | Backup `20260711095218`; expected server and Agent hashes; public health, admin access, dedicated auth, and healthy heartbeat verified | Retain rollback backup |
-| G6 Production validation | BLOCKED | Existing imports, replay, recovery, outbox, scheduling, and REST access pass; WC Plus rejects new task creation with ID `0` and an authorization error | Activate WC Plus, then rerun one bounded `sync_links` probe |
+| G6 Production validation | BLOCKED | Existing imports, replay, recovery, outbox, scheduling, and REST access pass; WC Plus rejects task creation and the current macOS package is removed by XProtect | Obtain a vendor build accepted by host security, then activate it and rerun one bounded `sync_links` probe |
 
 ## Pending Decisions
 
-No KBase design decision remains open. The external decision is to activate a
-valid WC Plus license or approve a separate non-WC Plus acquisition adapter.
-Until then, existing locally collected articles can be imported, but new
-WC Plus task families remain intentionally blocked rather than reported as
-successful.
+No KBase design decision remains open. The upstream requirement is now a WC
+Plus build that is both authorized and accepted by macOS security controls.
+KBase will not bypass XProtect or quarantine. If the vendor cannot supply that
+build, the product decision is to use the first-party WeChat source adapter
+instead. Existing locally collected articles remain importable, but new WC Plus
+task families stay blocked rather than being reported as successful.
 
 ## Rollback
 
 - Disable source-agent token configuration and scheduler leasing.
 - Unload the local Agent while preserving its outbox.
+- Keep the WC Plus vendor process unloaded until a host-approved build exists.
 - Restore server/static/env state from backup `20260711095218` if G5 regresses.
 - Keep existing imported knowledge and source-sync audit records.
 - Continue using direct local proxy or manual import.
@@ -319,5 +332,6 @@ successful.
 The production control plane and local Agent are shipped. Existing article
 ingestion, idempotent replay, bounded processing, lease recovery, outbox replay,
 scheduling, and REST knowledge access are complete. Full WC Plus acquisition is
-not complete because the paid upstream currently rejects task creation; G6 must
-be rerun after activation.
+not complete because the upstream rejects task creation and its current macOS
+binary is rejected by host security. G6 must be rerun only after both conditions
+are resolved.

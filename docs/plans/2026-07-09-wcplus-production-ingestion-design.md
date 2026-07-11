@@ -35,6 +35,8 @@ that unfinished-task list.
 
 - Reimplement WC Plus licensing, payment, CA certificate, proxy, activation, or
   account-parameter management.
+- Disable, bypass, or weaken host operating-system security controls to run a
+  WC Plus binary.
 - Expose the unauthenticated WC Plus local API through a public tunnel.
 - Copy WC Plus prompt, AI-task, category, favorite, or administrative screens.
 - Store WeChat cookies, WC Plus request parameters, or downloaded raw databases
@@ -241,6 +243,9 @@ local troubleshooting. Browser refresh must not lose run history.
 
 - Local WC Plus unavailable: heartbeat stays online but reports the WC Plus
   capability unhealthy; no run is leased.
+- Host security rejects the vendor executable: keep the vendor process stopped,
+  preserve local data, report the capability unhealthy, and require an updated
+  vendor build. Never remove quarantine metadata or suppress the detection.
 - Online KBase unavailable: envelopes remain in the local outbox and retry with
   backoff.
 - Agent exits mid-run: lease expires and the run becomes queueable again.
@@ -263,6 +268,8 @@ local troubleshooting. Browser refresh must not lose run history.
 - Store only normalized article content and non-sensitive provenance online.
 - Keep agent state and downloaded content outside the repository through an
   explicit state-directory setting.
+- Treat the vendor executable as an external supply-chain boundary. A release
+  must pass the host's security checks before it is installed or executed.
 
 ## Testing Strategy
 
@@ -296,6 +303,8 @@ knowledge or source-sync history.
 
 - The online server never connects directly to a personal localhost WC Plus
   service.
+- The local Agent fails closed when the vendor process is unavailable or its
+  executable is rejected by host security.
 - A local agent can heartbeat, lease a run, upload an article, and complete the
   run over outbound HTTPS.
 - Restarting either process does not lose accepted items or leave a run falsely
