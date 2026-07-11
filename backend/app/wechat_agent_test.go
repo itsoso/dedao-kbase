@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 type recordingSourceEnvelopeSink struct {
@@ -53,6 +54,20 @@ func TestWeChatAgentReportsLoginRequiredWithoutSession(t *testing.T) {
 	}
 	if adapter.Name() != "wechat_mp" {
 		t.Fatalf("name=%s", adapter.Name())
+	}
+}
+
+func TestWeChatAgentReportsLoginRequiredForExpiredSession(t *testing.T) {
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: fakeSessionHealthProvider{session: WeChatMPSession{
+		Token:          "expired-token",
+		ObservedExpiry: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := adapter.Status(context.Background())
+	if health.Healthy || health.RequiresAction != "login" {
+		t.Fatalf("health=%#v", health)
 	}
 }
 func TestWeChatAgentDeclaresFirstPartyOperations(t *testing.T) {

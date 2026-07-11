@@ -1,7 +1,13 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/yann0917/dedao-gui/backend/app"
 )
 
 func TestSourceAgentCLIConfigPrefersGenericStateDirectory(t *testing.T) {
@@ -23,5 +29,20 @@ func TestSourceAgentEnrollmentAddressIsLoopbackOnly(t *testing.T) {
 	}
 	if _, err := normalizeEnrollmentAddress("0.0.0.0:8765"); err == nil {
 		t.Fatal("accepted wildcard enrollment address")
+	}
+}
+
+func TestStoredSessionProviderRejectsExpiredSession(t *testing.T) {
+	store := app.NewMemorySourceSecretStore()
+	raw, err := json.Marshal(app.WeChatMPSession{Token: "expired", ObservedExpiry: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(context.Background(), "wechat-mp-session", raw); err != nil {
+		t.Fatal(err)
+	}
+	_, err = (storedSessionProvider{store: store}).Session(context.Background())
+	if !errors.Is(err, app.ErrWeChatMPSessionExpired) {
+		t.Fatalf("Session() error=%v", err)
 	}
 }

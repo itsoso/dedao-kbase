@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 type staticWeChatSessionProvider struct {
@@ -87,5 +88,26 @@ func TestWeChatDiscoveryRejectsInsecureRemoteBaseURL(t *testing.T) {
 	_, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: "http://example.invalid", SessionProvider: staticWeChatSessionProvider{}})
 	if err == nil {
 		t.Fatal("accepted insecure remote discovery base URL")
+	}
+}
+
+func TestWeChatDiscoveryRejectsExpiredSessionBeforeRequest(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	defer server.Close()
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+		SessionProvider: staticWeChatSessionProvider{session: WeChatMPSession{
+			Token:          "expired",
+			ObservedExpiry: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = discovery.Discover(context.Background(), "account", WeChatDiscoveryCursor{}, 5, "")
+	if WeChatDiscoveryErrorCode(err) != "login_required" || requests != 0 {
+		t.Fatalf("error=%v requests=%d", err, requests)
 	}
 }

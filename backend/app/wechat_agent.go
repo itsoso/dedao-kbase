@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type WeChatSourceAdapterConfig struct {
@@ -50,7 +51,7 @@ func (a *WeChatSourceAdapter) Operations() []string {
 }
 func (a *WeChatSourceAdapter) Status(ctx context.Context) SourceCapabilityHealth {
 	session, err := a.sessions.Session(ctx)
-	if err != nil || session.Token == "" {
+	if err != nil || session.Validate(time.Now()) != nil {
 		return SourceCapabilityHealth{Healthy: false, RequiresAction: "login", LastError: "wechat MP login is required"}
 	}
 	return SourceCapabilityHealth{Healthy: true, Version: "1"}

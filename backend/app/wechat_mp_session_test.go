@@ -2,11 +2,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestWeChatMPLoginCompletesAndSavesSession(t *testing.T) {
@@ -83,5 +86,23 @@ func TestWeChatMPLoginRejectsInsecureRemoteBaseURL(t *testing.T) {
 	_, err := NewWeChatMPSessionClient(WeChatMPSessionConfig{BaseURL: "http://example.invalid", SecretStore: NewMemorySourceSecretStore()})
 	if err == nil {
 		t.Fatal("accepted insecure remote MP base URL")
+	}
+}
+
+func TestWeChatMPSessionLoadRejectsExpiredSession(t *testing.T) {
+	store := NewMemorySourceSecretStore()
+	raw, err := json.Marshal(WeChatMPSession{Token: "expired", ObservedExpiry: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(context.Background(), "wechat-session", raw); err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewWeChatMPSessionClient(WeChatMPSessionConfig{BaseURL: "https://mp.weixin.qq.com", SecretStore: store, SecretKey: "wechat-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.LoadSession(context.Background()); !errors.Is(err, ErrWeChatMPSessionExpired) {
+		t.Fatalf("LoadSession() error=%v", err)
 	}
 }

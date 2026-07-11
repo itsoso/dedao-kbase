@@ -59,7 +59,6 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 		return err
 	}
 	defer outbox.Close()
-	adapter, _ := app.NewWeChatSourceAdapter(app.WeChatSourceAdapterConfig{Sessions: sessions})
 	mpBase := strings.TrimSpace(os.Getenv("WECHAT_MP_BASE_URL"))
 	if mpBase == "" {
 		mpBase = "https://mp.weixin.qq.com"
@@ -69,7 +68,16 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 		return err
 	}
 	source := app.NewWeChatSourceService(app.WeChatSourceConfig{SessionProvider: sessions})
-	adapter, _ = app.NewWeChatSourceAdapter(app.WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery, Source: source})
+	adapter, err := app.NewWeChatSourceAdapter(app.WeChatSourceAdapterConfig{
+		Sessions:  sessions,
+		Discovery: discovery,
+		Source:    source,
+		Media:     app.NewWeChatMediaDownloader(app.WeChatMediaConfig{}),
+		Assets:    client,
+	})
+	if err != nil {
+		return err
+	}
 	runner, err := app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter, Version: "0.1.0"})
 	if err != nil {
 		return err
@@ -136,7 +144,13 @@ func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, st
 	if _, err = rand.Read(secret); err != nil {
 		return fmt.Errorf("generate enrollment CSRF secret failed")
 	}
-	handler, err := newEnrollmentHandler(enrollmentClientAdapter{client: client}, hex.EncodeToString(secret))
+	sessions := storedSessionProvider{store: store}
+	discovery := app.NewWeChatSourceService(app.WeChatSourceConfig{MPBaseURL: base, SessionProvider: sessions})
+	handler, err := newEnrollmentHandler(enrollmentClientAdapter{client: client}, discovery, enrollmentHandlerConfig{
+		CSRFToken: hex.EncodeToString(secret),
+		RemoteURL: value("KBASE_REMOTE_URL"),
+		AgentID:   value("KBASE_SOURCE_AGENT_ID"),
+	})
 	if err != nil {
 		return err
 	}
@@ -164,8 +178,11 @@ func (p storedSessionProvider) Session(ctx context.Context) (app.WeChatMPSession
 		return app.WeChatMPSession{}, err
 	}
 	var session app.WeChatMPSession
-	if json.Unmarshal(raw, &session) != nil || session.Token == "" {
+	if json.Unmarshal(raw, &session) != nil {
 		return app.WeChatMPSession{}, fmt.Errorf("stored wechat MP session is invalid")
+	}
+	if err := session.Validate(time.Now()); err != nil {
+		return app.WeChatMPSession{}, err
 	}
 	return session, nil
 }

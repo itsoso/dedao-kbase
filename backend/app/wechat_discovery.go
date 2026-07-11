@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type WeChatMPSessionProvider interface {
@@ -66,7 +67,7 @@ func NewWeChatDiscovery(cfg WeChatDiscoveryConfig) (*WeChatDiscovery, error) {
 func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor WeChatDiscoveryCursor, pageSize int, titleQuery string) (WeChatDiscoveryPage, error) {
 	result := WeChatDiscoveryPage{UpstreamBegin: cursor.Begin}
 	session, err := d.sessions.Session(ctx)
-	if err != nil || session.Token == "" {
+	if err != nil || session.Validate(time.Now()) != nil {
 		return result, &WeChatDiscoveryError{Code: "login_required"}
 	}
 	if pageSize <= 0 {

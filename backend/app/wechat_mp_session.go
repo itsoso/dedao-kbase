@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,6 +20,11 @@ const (
 	WeChatMPLoginConfirmed = "confirmed"
 )
 
+var (
+	ErrWeChatMPSessionExpired = errors.New("wechat MP session expired")
+	ErrWeChatMPSessionInvalid = errors.New("wechat MP session is invalid")
+)
+
 type WeChatMPCookie struct {
 	Name   string `json:"name"`
 	Value  string `json:"value"`
@@ -31,6 +37,25 @@ type WeChatMPSession struct {
 	AccountName    string           `json:"account_name,omitempty"`
 	ObservedExpiry string           `json:"observed_expiry,omitempty"`
 }
+
+func (s WeChatMPSession) Validate(now time.Time) error {
+	if strings.TrimSpace(s.Token) == "" {
+		return ErrWeChatMPSessionInvalid
+	}
+	value := strings.TrimSpace(s.ObservedExpiry)
+	if value == "" {
+		return nil
+	}
+	expiry, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return ErrWeChatMPSessionInvalid
+	}
+	if !expiry.After(now.UTC()) {
+		return ErrWeChatMPSessionExpired
+	}
+	return nil
+}
+
 type WeChatMPLoginStatus struct {
 	State          string `json:"state"`
 	RequiresAction string `json:"requires_action,omitempty"`
@@ -142,8 +167,11 @@ func (c *WeChatMPSessionClient) LoadSession(ctx context.Context) (WeChatMPSessio
 		return WeChatMPSession{}, err
 	}
 	var session WeChatMPSession
-	if json.Unmarshal(raw, &session) != nil || session.Token == "" {
+	if json.Unmarshal(raw, &session) != nil {
 		return WeChatMPSession{}, fmt.Errorf("stored wechat MP session is invalid")
+	}
+	if err := session.Validate(time.Now()); err != nil {
+		return WeChatMPSession{}, err
 	}
 	return session, nil
 }
