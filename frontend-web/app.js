@@ -361,8 +361,8 @@ function renderShell(content, current = "") {
       <a class="web-brand" href="/">dedao kbase</a>
       <nav class="web-nav" aria-label="主导航">
         <a class="${current === "home" ? "active" : ""}" href="/">首页</a>
-        <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信来源</a>
-        <a class="${current === "wcplus" ? "active" : ""}" href="/wcplus-source">WC Plus</a>
+        <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
+        <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="/book-knowledge">书籍知识库</a>
       </nav>
     </header>
@@ -378,8 +378,8 @@ function renderHome() {
         <h1>把外部内容整理成可验证知识库</h1>
         <p>从公众号文章开始，下载、预览并导入到书籍知识库，再交给 Health 和 Proofroom 使用。</p>
         <div class="web-home__actions">
-          <a class="button button-primary" href="/wechat-source">导入微信公众号文章</a>
-          <a class="button button-ghost" href="/wcplus-source">打开 WC Plus 工作台</a>
+          <a class="button button-primary" href="/wechat-source">打开微信采集器</a>
+          <a class="button button-ghost" href="/wechat-import">导入单篇文章</a>
           <a class="button button-ghost" href="/book-knowledge">查看书籍知识库</a>
         </div>
       </section>
@@ -621,7 +621,7 @@ function renderWeChatSource() {
 
       ${renderWCPlusSource()}
     </main>
-  `, "wechat");
+  `, "import");
   bindWeChatSourceEvents();
   bindWCPlusEvents();
 }
@@ -636,7 +636,7 @@ function renderWCPlusPage() {
       </details>
       ${renderSourceRunDrawer()}
     </main>
-  `, "wcplus");
+  `, "wechat");
   bindSourceControlEvents();
   bindWCPlusEvents();
 }
@@ -654,6 +654,7 @@ function renderSourceControlPlane() {
       </div>
       <div class="source-control__header-actions">
         ${status}
+        <a id="source-agent-enrollment-link" class="button button-primary" href="http://127.0.0.1:8765" target="_blank" rel="noreferrer">本地登录与公众号搜索</a>
         <button id="source-control-refresh" class="button button-ghost" type="button">刷新</button>
       </div>
     </section>
@@ -987,11 +988,27 @@ function formatSourceSchedule(schedule) {
 }
 
 function refreshWCPlusView() {
-  if (window.location.pathname.startsWith("/wcplus-source")) {
+  if (isSourceControlPath()) {
     renderWCPlusPage();
     return;
   }
   renderWeChatSource();
+}
+
+function isSourceControlPath() {
+  return window.location.pathname.startsWith("/wechat-source") || window.location.pathname.startsWith("/wcplus-source");
+}
+
+function sourceControlPrefillFromLocation() {
+  const params = new URLSearchParams(window.location.search);
+  const sourceAccountKey = String(params.get("source_account_key") || "").trim();
+  if (!sourceAccountKey) {
+    return;
+  }
+  sourceControlState.draft.sourceAccountKey = sourceAccountKey;
+  sourceControlState.draft.sourceAccount = String(params.get("source_account") || sourceAccountKey).trim();
+  sourceControlState.draft.sourceAgentID = String(params.get("agent_id") || sourceControlState.draft.sourceAgentID || "").trim();
+  sourceControlState.draft.sourceOperation = "sync_articles";
 }
 
 async function bootstrapSourceControlPlane() {
@@ -1072,7 +1089,7 @@ function scheduleSourceControlPoll() {
     clearTimeout(sourceControlPollTimer);
     sourceControlPollTimer = null;
   }
-  if (!window.location.pathname.startsWith("/wcplus-source")) {
+  if (!isSourceControlPath()) {
     return;
   }
   if (!sourceControlState.runs.some(sourceRunIsActive)) {
@@ -3173,11 +3190,12 @@ function formatArticleTime(value) {
 }
 
 async function boot() {
-  if (window.location.pathname.startsWith("/wechat-source") || window.location.pathname.startsWith("/sources/wechat")) {
+  if (window.location.pathname.startsWith("/wechat-import") || window.location.pathname.startsWith("/sources/wechat")) {
     renderWeChatSource();
     return;
   }
-  if (window.location.pathname.startsWith("/wcplus-source")) {
+  if (isSourceControlPath()) {
+    sourceControlPrefillFromLocation();
     renderWCPlusPage();
     await bootstrapSourceControlPlane();
     return;

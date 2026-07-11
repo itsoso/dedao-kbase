@@ -10,6 +10,7 @@ const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 for (const marker of [
   "renderWeChatSource",
   "wechat-source",
+  "/wechat-import",
   "wechatState",
   "apiFetch",
 ]) {
