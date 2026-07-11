@@ -893,11 +893,12 @@ func (h *kbaseHTTPHandler) handleSourceAgentRun(w http.ResponseWriter, r *http.R
 		var payload struct {
 			AgentID string `json:"agent_id"`
 			Error   string `json:"error"`
+			Cursor  string `json:"cursor,omitempty"`
 		}
 		if !h.decodeSourceAgentJSON(w, r, &payload) {
 			return
 		}
-		run, err := h.sourceSync.FailRun(runID, payload.AgentID, payload.Error)
+		run, err := h.sourceSync.FailRun(runID, payload.AgentID, payload.Error, trimRunes(payload.Cursor, 1000))
 		if err != nil {
 			h.writeSourceSyncError(w, err)
 			return

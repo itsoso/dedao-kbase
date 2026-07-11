@@ -361,6 +361,49 @@ func TestSourceSyncStoreRecoversExpiredLeaseAndRetries(t *testing.T) {
 	}
 }
 
+func TestSourceSyncStoreFailRunPersistsCheckpointCursor(t *testing.T) {
+	store, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wechat_mp_article",
+		SourceAccountKey: "account-key",
+		SourceAccount:    "Account",
+		Operation:        "sync_articles",
+		Cursor:           "old-cursor",
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(subscription.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LeaseNextRun("agent-a", []string{"sync_articles"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartRun(run.ID, "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := store.FailRun(run.ID, "agent-a", "download failed", "safe-cursor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != SourceRunFailed {
+		t.Fatalf("failed run=%#v", failed)
+	}
+	updated, err := store.GetSubscription(subscription.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Cursor != "safe-cursor" || updated.LastSuccessAt != "" {
+		t.Fatalf("updated subscription=%#v", updated)
+	}
+}
+
 func TestSourceSyncStoreBoundsRunFailureText(t *testing.T) {
 	store, err := NewSourceSyncStore(t.TempDir())
 	if err != nil {

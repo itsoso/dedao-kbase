@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
@@ -266,6 +267,57 @@ func TestKBaseHTTPHandlerSourceSyncHTTP(t *testing.T) {
 	runsResp := requestKBase(handler, http.MethodGet, "/api/source-sync/runs", "admin-secret")
 	if runsResp.Code != http.StatusOK || !strings.Contains(runsResp.Body.String(), leasePayload.Run.ID) {
 		t.Fatalf("runs status = %d, body=%s", runsResp.Code, runsResp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerPersistsFailureCheckpointCursor(t *testing.T) {
+	root := t.TempDir()
+	sourceSync, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceSync.Close()
+	subscription, err := sourceSync.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wechat_mp_article",
+		SourceAccountKey: "account-key",
+		SourceAccount:    "Account",
+		Operation:        "sync_articles",
+		Cursor:           "old-cursor",
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := sourceSync.CreateRun(subscription.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceSync.LeaseNextRun("agent-a", []string{"sync_articles"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceSync.StartRun(run.ID, "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(root),
+		AuthToken:        "admin-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "agent-secret",
+	})
+	response := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/runs/"+url.PathEscape(run.ID)+"/fail", "agent-secret", `{
+		"agent_id":"agent-a",
+		"error":"download failed",
+		"cursor":"safe-cursor"
+	}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("fail status=%d body=%s", response.Code, response.Body.String())
+	}
+	updated, err := sourceSync.GetSubscription(subscription.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Cursor != "safe-cursor" || updated.LastSuccessAt != "" {
+		t.Fatalf("updated subscription=%#v", updated)
 	}
 }
 

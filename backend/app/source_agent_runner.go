@@ -70,6 +70,23 @@ func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult
 	}
 	adapterResult, err := r.adapter.Execute(ctx, *run, r.outbox)
 	if err != nil {
+		var executionErr *SourceAdapterExecutionError
+		if errors.As(err, &executionErr) && strings.TrimSpace(executionErr.Cursor) != "" {
+			uploaded, flushErr := r.flush(ctx, run.ID)
+			result.Uploaded += uploaded
+			if flushErr != nil {
+				return result, flushErr
+			}
+			pending, countErr := r.outbox.CountPendingForRun(run.ID)
+			if countErr != nil {
+				return result, countErr
+			}
+			result.OutboxRemaining = pending
+			if pending != 0 {
+				return result, fmt.Errorf("%w; run %s still has %d pending outbox items", err, run.ID, pending)
+			}
+			return result, r.failRun(ctx, run.ID, err, executionErr.Cursor)
+		}
 		if sourceAgentRequestRetryable(err) {
 			return result, err
 		}
@@ -127,8 +144,8 @@ func (r *SourceAgentRunner) flush(ctx context.Context, runID string) (int, error
 	return uploaded, nil
 }
 
-func (r *SourceAgentRunner) failRun(ctx context.Context, runID string, cause error) error {
-	if _, err := r.client.FailRun(ctx, runID, cause.Error()); err != nil {
+func (r *SourceAgentRunner) failRun(ctx context.Context, runID string, cause error, cursor ...string) error {
+	if _, err := r.client.FailRun(ctx, runID, cause.Error(), cursor...); err != nil {
 		return fmt.Errorf("%w; report run failure: %v", cause, err)
 	}
 	return cause

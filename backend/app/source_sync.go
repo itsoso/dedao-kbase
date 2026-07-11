@@ -847,7 +847,7 @@ func (s *SourceSyncStore) CompleteRun(runID, agentID string, cursor ...string) (
 	return s.GetRun(run.ID)
 }
 
-func (s *SourceSyncStore) FailRun(runID, agentID, message string) (SourceSyncRun, error) {
+func (s *SourceSyncStore) FailRun(runID, agentID, message string, cursor ...string) (SourceSyncRun, error) {
 	run, err := s.GetRun(runID)
 	if err != nil {
 		return SourceSyncRun{}, err
@@ -864,8 +864,13 @@ func (s *SourceSyncStore) FailRun(runID, agentID, message string) (SourceSyncRun
 	if run.Status != SourceRunLeased && run.Status != SourceRunRunning {
 		return SourceSyncRun{}, ErrSourceRunInvalidState
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return SourceSyncRun{}, err
+	}
+	defer tx.Rollback()
 	now := s.timestamp()
-	result, err := s.db.Exec(`
+	result, err := tx.Exec(`
 		UPDATE source_sync_runs SET status = ?, error_text = ?, lease_owner = '', lease_expires_at = '',
 			finished_at = ?, updated_at = ?
 		WHERE id = ? AND status = ? AND lease_owner = ?
@@ -875,6 +880,20 @@ func (s *SourceSyncStore) FailRun(runID, agentID, message string) (SourceSyncRun
 	}
 	if rows, _ := result.RowsAffected(); rows != 1 {
 		return SourceSyncRun{}, ErrSourceRunInvalidState
+	}
+	cursorValue := ""
+	if len(cursor) > 0 {
+		cursorValue = strings.TrimSpace(cursor[0])
+	}
+	if cursorValue != "" {
+		if _, err := tx.Exec(`
+			UPDATE source_subscriptions SET cursor_value = ?, updated_at = ? WHERE id = ?
+		`, cursorValue, now, run.SubscriptionID); err != nil {
+			return SourceSyncRun{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return SourceSyncRun{}, err
 	}
 	return s.GetRun(run.ID)
 }

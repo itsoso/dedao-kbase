@@ -3,17 +3,23 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
 type recordingSourceEnvelopeSink struct {
 	envelopes []SourceArticleEnvelope
+	failItem  string
 }
 
 func (s *recordingSourceEnvelopeSink) Enqueue(_ string, envelope SourceArticleEnvelope) (SourceAgentOutboxItem, error) {
+	if envelope.SourceItemID == s.failItem {
+		return SourceAgentOutboxItem{}, fmt.Errorf("enqueue %s failed", envelope.SourceItemID)
+	}
 	s.envelopes = append(s.envelopes, envelope)
 	return SourceAgentOutboxItem{IdempotencyKey: envelope.IdempotencyKey, Envelope: envelope}, nil
 }
@@ -190,4 +196,86 @@ func TestWeChatAgentResumesMidPublication(t *testing.T) {
 	if thirdCursor.UpstreamBegin != 1 || thirdCursor.PublicationItemIndex != 0 || thirdCursor.LastArticleKey != "article-3" {
 		t.Fatalf("third cursor=%#v", thirdCursor)
 	}
+}
+
+func TestWeChatAgentDoesNotAdvancePastFailure(t *testing.T) {
+	tests := []struct {
+		name           string
+		failedPath     string
+		failedSinkItem string
+		wantError      string
+	}{
+		{name: "article download", failedPath: "/2", wantError: "wechat article request failed"},
+		{name: "outbox enqueue", failedSinkItem: "article-2", wantError: "enqueue article-2 failed"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			adapter := newFailureTestWeChatAgentAdapter(t, test.failedPath)
+			run := SourceSyncRun{
+				ID:                 "run-failure",
+				RequestedOperation: "sync_articles",
+				Subscription: &SourceSubscription{
+					SourceAccountKey: "account-key",
+					SourceAccount:    "Account",
+					Options:          map[string]any{"max_items": float64(3)},
+				},
+			}
+			sink := &recordingSourceEnvelopeSink{failItem: test.failedSinkItem}
+			result, err := adapter.Execute(context.Background(), run, sink)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("Execute() error=%v, want %q", err, test.wantError)
+			}
+			var executionErr *SourceAdapterExecutionError
+			if !errors.As(err, &executionErr) {
+				t.Fatalf("Execute() error=%T, want SourceAdapterExecutionError", err)
+			}
+			if result.Cursor == "" || result.Cursor != executionErr.Cursor {
+				t.Fatalf("result cursor=%q execution cursor=%q", result.Cursor, executionErr.Cursor)
+			}
+			cursor, decodeErr := decodeWeChatAgentCursor(executionErr.Cursor)
+			if decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if cursor.UpstreamBegin != 0 || cursor.PublicationItemIndex != 1 || cursor.LastArticleKey != "article-1" {
+				t.Fatalf("safe cursor=%#v", cursor)
+			}
+			if len(sink.envelopes) != 1 || sink.envelopes[0].SourceItemID != "article-1" {
+				t.Fatalf("accepted envelopes=%#v", sink.envelopes)
+			}
+		})
+	}
+}
+
+func newFailureTestWeChatAgentAdapter(t *testing.T, failedPath string) *WeChatSourceAdapter {
+	t.Helper()
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == failedPath {
+			http.Error(w, "failed", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<html><body><h1 id="activity-name">Article %s</h1><a id="js_name">Account</a><div id="js_content"><p>Article %s contains enough content for a deterministic source adapter test.</p></div></body></html>`, r.URL.Path, r.URL.Path)
+	}))
+	t.Cleanup(articleServer.Close)
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		articles := []WeChatOfficialArticle{
+			{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 101},
+			{Title: "Article 2", Link: articleServer.URL + "/2", AID: "article-2", UpdateTime: 102},
+			{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 103},
+		}
+		publishInfo, _ := json.Marshal(map[string]any{"appmsgex": articles})
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": []map[string]any{{"publish_info": string(publishInfo)}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 0}, "publish_page": string(publishPage)})
+	}))
+	t.Cleanup(discoveryServer.Close)
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery, Source: newTestWeChatSourceService(t, articleServer)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return adapter
 }

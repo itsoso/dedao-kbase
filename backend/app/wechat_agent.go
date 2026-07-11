@@ -110,12 +110,12 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	for _, item := range items {
 		article, err := a.source.DownloadArticle(ctx, item.Link)
 		if err != nil {
-			return SourceAdapterResult{}, err
+			return weChatAdapterFailure(next, err)
 		}
 		sum := sha256.Sum256([]byte(article.Markdown))
 		envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: hex.EncodeToString(sum[:]), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: article.PublishedAt, Content: article.Markdown, ContentFormat: "markdown"}
 		if _, err := sink.Enqueue(run.ID, envelope); err != nil {
-			return SourceAdapterResult{}, err
+			return weChatAdapterFailure(next, err)
 		}
 		next.PublicationItemIndex++
 		next.LastArticleKey = item.ArticleKey
@@ -130,6 +130,14 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		return SourceAdapterResult{}, err
 	}
 	return SourceAdapterResult{Cursor: encoded}, nil
+}
+
+func weChatAdapterFailure(cursor weChatAgentCursor, cause error) (SourceAdapterResult, error) {
+	encoded, err := encodeWeChatAgentCursor(cursor)
+	if err != nil {
+		return SourceAdapterResult{}, fmt.Errorf("%w; encode safe cursor: %v", cause, err)
+	}
+	return SourceAdapterResult{Cursor: encoded}, newSourceAdapterExecutionError(encoded, cause)
 }
 
 func decodeWeChatAgentCursor(raw string) (weChatAgentCursor, error) {

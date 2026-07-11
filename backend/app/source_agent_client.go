@@ -249,8 +249,12 @@ func (c *SourceAgentClient) CompleteRun(ctx context.Context, runID string, curso
 	return c.finishRun(ctx, runID, "complete", "", cursorValue)
 }
 
-func (c *SourceAgentClient) FailRun(ctx context.Context, runID, message string) (SourceSyncRun, error) {
-	return c.finishRun(ctx, runID, "fail", strings.TrimSpace(message), "")
+func (c *SourceAgentClient) FailRun(ctx context.Context, runID, message string, cursor ...string) (SourceSyncRun, error) {
+	cursorValue := ""
+	if len(cursor) > 0 {
+		cursorValue = strings.TrimSpace(cursor[0])
+	}
+	return c.finishRun(ctx, runID, "fail", strings.TrimSpace(message), cursorValue)
 }
 
 func (c *SourceAgentClient) finishRun(ctx context.Context, runID, action, message, cursor string) (SourceSyncRun, error) {
