@@ -17,18 +17,43 @@ func TestWeChatMPLoginCompletesAndSavesSession(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/cgi-bin/bizlogin":
-			w.Header().Add("Set-Cookie", "uuid=fake-uuid; Path=/; HttpOnly")
-			fmt.Fprint(w, `{"base_resp":{"ret":0},"redirect_url":"/cgi-bin/home?t=home/index&token=fake-token"}`)
-		case "/cgi-bin/scanloginqrcode":
-			pollCount++
-			if pollCount == 1 {
-				fmt.Fprint(w, `{"status":"scanned"}`)
-				return
+			if r.Method != http.MethodPost {
+				t.Fatalf("bizlogin method=%s", r.Method)
 			}
-			fmt.Fprint(w, `{"status":"confirmed","redirect_url":"/cgi-bin/home?t=home/index&token=fake-token"}`)
-		case "/cgi-bin/loginqrcode":
-			w.Header().Set("Content-Type", "image/png")
-			w.Write([]byte("sanitized-qr-image"))
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			switch r.URL.Query().Get("action") {
+			case "startlogin":
+				if r.Form.Get("login_type") != "3" || r.Form.Get("sessionid") == "" {
+					t.Fatalf("start form=%v", r.Form)
+				}
+				w.Header().Add("Set-Cookie", "uuid=fake-uuid; Path=/; HttpOnly")
+				fmt.Fprint(w, `{"base_resp":{"ret":0}}`)
+			case "login":
+				if r.Form.Get("login_type") != "3" {
+					t.Fatalf("login form=%v", r.Form)
+				}
+				w.Header().Add("Set-Cookie", "session=fake-session; Path=/; HttpOnly")
+				fmt.Fprint(w, `{"base_resp":{"ret":0},"redirect_url":"/cgi-bin/home?t=home/index&token=fake-token"}`)
+			default:
+				t.Fatalf("unexpected bizlogin action=%s", r.URL.Query().Get("action"))
+			}
+		case "/cgi-bin/scanloginqrcode":
+			switch r.URL.Query().Get("action") {
+			case "getqrcode":
+				w.Header().Set("Content-Type", "image/png")
+				_, _ = w.Write([]byte("sanitized-qr-image"))
+			case "ask":
+				pollCount++
+				if pollCount == 1 {
+					fmt.Fprint(w, `{"base_resp":{"ret":0},"status":4,"acct_size":1}`)
+					return
+				}
+				fmt.Fprint(w, `{"base_resp":{"ret":0},"status":1}`)
+			default:
+				t.Fatalf("unexpected scan action=%s", r.URL.Query().Get("action"))
+			}
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -65,7 +90,11 @@ func TestWeChatMPLoginCompletesAndSavesSession(t *testing.T) {
 
 func TestWeChatMPLoginRejectsMalformedRedirectWithoutSaving(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"status":"confirmed","redirect_url":"https://example.invalid/escaped?token=secret"}`)
+		if r.URL.Path == "/cgi-bin/scanloginqrcode" {
+			fmt.Fprint(w, `{"base_resp":{"ret":0},"status":1}`)
+			return
+		}
+		fmt.Fprint(w, `{"base_resp":{"ret":0},"redirect_url":"https://example.invalid/escaped?token=secret"}`)
 	}))
 	defer server.Close()
 	store := NewMemorySourceSecretStore()
@@ -79,6 +108,21 @@ func TestWeChatMPLoginRejectsMalformedRedirectWithoutSaving(t *testing.T) {
 	}
 	if _, loadErr := store.Load(context.Background(), "wechat-session"); loadErr != ErrSourceSecretNotFound {
 		t.Fatalf("saved malformed session: %v", loadErr)
+	}
+}
+
+func TestWeChatMPLoginMapsExpiredQRStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"base_resp":{"ret":0},"status":2}`)
+	}))
+	defer server.Close()
+	client, err := NewWeChatMPSessionClient(WeChatMPSessionConfig{BaseURL: server.URL, HTTPClient: server.Client(), SecretStore: NewMemorySourceSecretStore()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := client.PollLogin(context.Background())
+	if err != nil || status.State != WeChatMPLoginExpired || status.RequiresAction != "login" {
+		t.Fatalf("status=%#v err=%v", status, err)
 	}
 }
 
