@@ -3,7 +3,7 @@
 ## Status
 
 - **Current stage:** S7 - verification and rollout
-- **Delivery status:** Server and heartbeat stage deployed; G6 article validation blocked by locked local Mac
+- **Delivery status:** Control plane and Agent deployed; G6 new-content acquisition blocked by WC Plus authorization
 - **Architecture decision:** approved
 - **Last updated:** 2026-07-10
 
@@ -145,6 +145,14 @@ Completed commits:
   diagnostic limits, and source/admin token separation checks.
 - `cf1efa4` aligns article-list defaults with WC Plus 9.483 and reports the
   observed WC Plus version through Agent heartbeats.
+- `de25e3d` parses the live account image field and supplies WC Plus's required
+  `Img` value for article-link, content, and reading-data tasks.
+- `5124c66` normalizes numeric task IDs returned by WC Plus 9.483 before the
+  Agent begins task polling.
+- `8283f91` rejects vanished tasks when the article list did not change,
+  preventing existing content from becoming false success evidence.
+- `b2d1173` treats WC Plus's numeric task ID `0` as an authorization or
+  activation block and reports it immediately to the control plane.
 
 Checkpoint evidence:
 
@@ -186,25 +194,25 @@ bash scripts/privacy-smoke.sh
 git diff --check
 ```
 
-The fresh final Task 10 matrix passed before release artifact creation. The
+The final matrix was rerun after all production-discovered contract fixes. The
 Vue build emitted its existing eval and large-chunk warnings but returned zero;
 the race run emitted macOS linker warnings but all three tested packages
 returned `ok`.
 
 ## Release Artifacts
 
-- Source commit: `cf1efa4d2dd58f7ff09d12112d5e0b4582d907f1`
+- Source commit: `b2d1173ae71a4379b34de0b1edac0cbbced015e4`
 - Clean source archive SHA-256:
-  `f94f0844091919682113fc9f620cff7b5bb4fc4f5d5ae430dbc340887d3052d0`
+  `3fa39180f79094f5dc14b37958ecc2aa0826c55a5441b5c3374bb5d5bc94bd6e`
 - Native macOS `arm64` Agent SHA-256:
-  `f17dd26ddb174734ee5c1b747253107a0a6c6d9c705c39da8dadbb08d00ae1cd`
+  `67602da40381d73fc95c8bcb4ee2817bffa8d908abbab7558c418e66b207dec7`
 - Linux `x86-64` server SHA-256:
-  `c9064e9faebe0460699fe88d8cfc96f0ff3c0eaba627b067f456b90d5a6fcde7`
+  `634250e5a06b2400793e510ce83f3bf7bac24d6bfbd5014fec97dec810bb3f15`
 - Linux build used Go 1.23.0 after checking the toolchain archive against
   SHA-256 published in the official Go release metadata. The initial module
   download through `proxy.golang.org` timed out; the successful retry used an
   HTTPS Go module mirror without disabling `go.sum` verification.
-- Pre-deploy backup identifier: `20260710162043`.
+- Final pre-deploy backup identifier: `20260711095218`.
 
 ## G4 Independent Review
 
@@ -227,29 +235,52 @@ routes returned `503` as designed. Existing health, books, search, reader, WC
 Plus diagnostics, public Bearer API access, and control-plane static assets all
 passed production probes.
 
-The dedicated source-agent token was then configured separately from the admin
-token. Unauthenticated source requests returned `401`; an authenticated empty
-lease preflight returned `200` and no run. The native Agent was installed with
-a `0600` LaunchAgent plist and the recorded binary hash. Production now reports
-one Agent at version `0.1.0`, `wcplus_healthy=false`, zero subscriptions, and
-zero runs. This is the correct non-leasing state while the local acquisition
-service is unavailable.
+The dedicated source-agent token is separate from the admin token.
+Unauthenticated source requests return `401`; an authenticated empty lease
+preflight returns `200`. The token was rotated during rollout and the previous
+value was verified invalid. The native Agent is installed with a `0600`
+LaunchAgent plist and the recorded binary hash. Production reports one Agent
+at version `0.1.0`, WC Plus `9.483`, and `wcplus_healthy=true`. The final server
+is `active`, public health returns `200`, and admin book access returns `200`.
 
 ## G6 Production Validation
 
 **Decision:** BLOCKED
 
-The local Mac was locked during the staged real-path run. The vendor-supported
-Terminal launch path could not run while locked, and the local WC Plus port was
-therefore unavailable. The installed Agent reported that state accurately and
-did not lease work. No production article, subscription, or synthetic content
-was created.
+The staged production sequence completed without retaining account names,
+article titles, bodies, cookies, or WC Plus request parameters in release
+evidence:
 
-Resume after the Mac is unlocked and WC Plus 9.483 is listening on its displayed
-loopback port. Then execute, in order: `doctor`, one selected article, unchanged
-replay, one bounded account sync, restart recovery, outbox replay, and one
-scheduled subscription. Record only run IDs, book IDs, counters, and failure
-reasons.
+- `doctor` confirmed local WC Plus, remote authentication, and Agent version.
+- `run_bf1533af450cae52` imported one selected existing article with `new=1`
+  and no failures.
+- `run_3a1bfe07932d0c07` replayed the same article with `skipped=1`, proving
+  unchanged idempotency.
+- `run_899428a145a9e124` bounded an account sync to three items and returned
+  `new=2`, `skipped=1`, and no failures.
+- Live task creation exposed required `Img`, numeric `task_id`, and vanished
+  task contract differences. All were fixed with regression tests and
+  redeployed. An earlier apparent `sync_links` success was invalidated after
+  WC Plus logged an authorization failure while returning task ID `0`.
+- `run_166892b1e16aee3e` recovered an expired five-second lease after an Agent
+  restart and completed successfully.
+- `run_a115ead40717f75e` retained one upload after a simulated HTTP `503` in
+  the local SQLite outbox, then replayed it after recovery; pending returned
+  from one to zero and the run completed successfully.
+- A temporary five-second schedule automatically created
+  `run_96d34172c2145d0f`, which completed successfully. The subscription was
+  then verified restored to its original `manual` and `sync_links` settings.
+
+The three newly created knowledge documents all returned `200` from their REST
+detail routes. Existing knowledge was preserved; validation replays produced
+skips rather than duplicate documents.
+
+The final new-content acquisition probe, `run_2887bca1d59aab6b`, failed
+immediately with `task creation returned invalid task_id 0; check WC Plus
+authorization or activation`. This matches the vendor console's authorization
+failure. KBase cannot activate or bypass a paid WC Plus license. G6 remains
+blocked until WC Plus accepts a nonzero task, after which the same bounded probe
+must be rerun.
 
 ## Gate Ledger
 
@@ -259,26 +290,29 @@ reasons.
 | G2 Feasibility/risk | PASS WITH CONSTRAINTS | Design documents auth, loopback, privacy, idempotency, and rollback | Start Task 1 |
 | G3 Tests | PASS | Fresh Go tests/vet/race, Vue build, Web smokes, packaging, privacy, and diff checks passed | Preserve tested commit and artifact hashes |
 | G4 Review | PASS | Auth, leases, transactions, idempotency, limits, redaction, outbox, atomic writes, and rollback reviewed; findings fixed in `7f40949` | Preserve release diff |
-| G5 Deploy health | PASS | Backup `20260710162043`; expected server hash; existing endpoints, disabled-by-default state, dedicated auth, and heartbeat verified | Preserve backup through G6 |
-| G6 Production validation | BLOCKED | Mac locked; WC Plus unavailable; Agent healthy as a process but correctly reports source unhealthy; no production data created | Unlock Mac, start WC Plus, then run staged sequence |
+| G5 Deploy health | PASS | Backup `20260711095218`; expected server and Agent hashes; public health, admin access, dedicated auth, and healthy heartbeat verified | Retain rollback backup |
+| G6 Production validation | BLOCKED | Existing imports, replay, recovery, outbox, scheduling, and REST access pass; WC Plus rejects new task creation with ID `0` and an authorization error | Activate WC Plus, then rerun one bounded `sync_links` probe |
 
 ## Pending Decisions
 
-No design decision blocks Task 10. The remaining dependency is an unlocked Mac
-with WC Plus running. Source-agent authentication is enabled, but the first
-bounded subscription remains intentionally absent until G6 resumes.
+No KBase design decision remains open. The external decision is to activate a
+valid WC Plus license or approve a separate non-WC Plus acquisition adapter.
+Until then, existing locally collected articles can be imported, but new
+WC Plus task families remain intentionally blocked rather than reported as
+successful.
 
 ## Rollback
 
 - Disable source-agent token configuration and scheduler leasing.
 - Unload the local Agent while preserving its outbox.
-- Restore server/static/env state from backup `20260710162043` if G5 regresses.
+- Restore server/static/env state from backup `20260711095218` if G5 regresses.
 - Keep existing imported knowledge and source-sync audit records.
 - Continue using direct local proxy or manual import.
 
 ## Completion Record
 
-Not shipped. Tasks 1-9, Checkpoints A-D, release artifacts, G5 deployment, and
-the heartbeat-only stage are complete. G6 production article runs, outcome
-counters, REST knowledge links, and user-visible confirmation remain blocked
-until the local Mac is unlocked and WC Plus is running.
+The production control plane and local Agent are shipped. Existing article
+ingestion, idempotent replay, bounded processing, lease recovery, outbox replay,
+scheduling, and REST knowledge access are complete. Full WC Plus acquisition is
+not complete because the paid upstream currently rejects task creation; G6 must
+be rerun after activation.
