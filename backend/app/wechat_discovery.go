@@ -76,7 +76,21 @@ func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor W
 	if pageSize > 20 {
 		pageSize = 20
 	}
-	values := url.Values{"sub": {"list"}, "begin": {strconv.Itoa(cursor.Begin)}, "count": {strconv.Itoa(pageSize)}, "fakeid": {strings.TrimSpace(account)}, "token": {session.Token}, "lang": {"zh_CN"}, "f": {"json"}, "ajax": {"1"}}
+	values := url.Values{
+		"sub":               {"list"},
+		"search_field":      {"null"},
+		"begin":             {strconv.Itoa(cursor.Begin)},
+		"count":             {strconv.Itoa(pageSize)},
+		"query":             {""},
+		"fakeid":            {strings.TrimSpace(account)},
+		"type":              {"101_1"},
+		"free_publish_type": {"1"},
+		"sub_action":        {"list_ex"},
+		"token":             {session.Token},
+		"lang":              {"zh_CN"},
+		"f":                 {"json"},
+		"ajax":              {"1"},
+	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, d.baseURL+"/cgi-bin/appmsgpublish?"+values.Encode(), nil)
 	for _, cookie := range session.Cookies {
 		req.AddCookie(&http.Cookie{Name: cookie.Name, Value: cookie.Value})

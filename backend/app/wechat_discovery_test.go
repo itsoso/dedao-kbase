@@ -23,6 +23,11 @@ func TestWeChatDiscoveryReportsPublicationProgress(t *testing.T) {
 		if r.URL.Query().Get("begin") != "0" || r.URL.Query().Get("count") != "10" {
 			t.Fatalf("query=%s", r.URL.RawQuery)
 		}
+		for key, want := range map[string]string{"sub": "list", "search_field": "null", "type": "101_1", "free_publish_type": "1", "sub_action": "list_ex"} {
+			if got := r.URL.Query().Get(key); got != want {
+				t.Fatalf("query %s=%q want=%q raw=%s", key, got, want, r.URL.RawQuery)
+			}
+		}
 		fmt.Fprint(w, `{"base_resp":{"ret":0},"publish_page":"{\"publish_list\":[{\"publish_info\":\"{\\\"appmsgex\\\":[{\\\"title\\\":\\\"First\\\",\\\"link\\\":\\\"https://mp.weixin.qq.com/s/a\\\",\\\"aid\\\":\\\"aid-a\\\",\\\"appmsgid\\\":11,\\\"itemidx\\\":1,\\\"update_time\\\":100},{\\\"title\\\":\\\"Second\\\",\\\"link\\\":\\\"https://mp.weixin.qq.com/s/b\\\",\\\"appmsgid\\\":11,\\\"itemidx\\\":2,\\\"update_time\\\":99}]}\"}]}"}`)
 	}))
 	defer server.Close()

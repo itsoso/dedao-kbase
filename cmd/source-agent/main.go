@@ -190,6 +190,27 @@ func (a enrollmentClientAdapter) LoginStatus(ctx context.Context) (any, error) {
 }
 func (a enrollmentClientAdapter) Logout(ctx context.Context) error { return a.client.Logout(ctx) }
 
+type enrollmentDiscoveryAdapter struct {
+	search  *app.WeChatSourceService
+	history *app.WeChatDiscovery
+}
+
+func (a enrollmentDiscoveryAdapter) SearchOfficialAccounts(ctx context.Context, query string) ([]app.WeChatOfficialAccount, error) {
+	return a.search.SearchOfficialAccounts(ctx, query)
+}
+
+func (a enrollmentDiscoveryAdapter) ListOfficialAccountArticles(ctx context.Context, fakeID string, begin, count int) ([]app.WeChatOfficialArticle, error) {
+	page, err := a.history.Discover(ctx, fakeID, app.WeChatDiscoveryCursor{Begin: begin}, count, "")
+	if err != nil {
+		return nil, err
+	}
+	articles := make([]app.WeChatOfficialArticle, 0, len(page.Articles))
+	for _, item := range page.Articles {
+		articles = append(articles, item.WeChatOfficialArticle)
+	}
+	return articles, nil
+}
+
 func normalizeEnrollmentAddress(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -220,7 +241,12 @@ func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, st
 		return fmt.Errorf("generate enrollment CSRF secret failed")
 	}
 	sessions := storedSessionProvider{store: store}
-	discovery := app.NewWeChatSourceService(app.WeChatSourceConfig{MPBaseURL: base, SessionProvider: sessions})
+	search := app.NewWeChatSourceService(app.WeChatSourceConfig{MPBaseURL: base, SessionProvider: sessions})
+	history, err := app.NewWeChatDiscovery(app.WeChatDiscoveryConfig{BaseURL: base, SessionProvider: sessions})
+	if err != nil {
+		return err
+	}
+	discovery := enrollmentDiscoveryAdapter{search: search, history: history}
 	handler, err := newEnrollmentHandler(enrollmentClientAdapter{client: client}, discovery, enrollmentHandlerConfig{
 		CSRFToken: hex.EncodeToString(secret),
 		RemoteURL: value("KBASE_REMOTE_URL"),
