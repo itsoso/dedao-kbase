@@ -343,6 +343,9 @@ func (a *WCPlusAgent) createAndWaitForTask(
 	if task == nil || strings.TrimSpace(task.TaskID) == "" {
 		return fmt.Errorf("wcplus task creation returned no task_id")
 	}
+	if strings.TrimSpace(task.TaskID) == "0" {
+		return &WCPlusAgentBlockedError{Reason: "task creation returned invalid task_id 0; check WC Plus authorization or activation"}
+	}
 	if reason := wcplusTaskBlockedReason(*task); reason != "" {
 		return &WCPlusAgentBlockedError{Reason: reason}
 	}

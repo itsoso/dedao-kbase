@@ -282,6 +282,41 @@ func TestWCPlusAgentRejectsDisappearedLinkTaskWhenArticleListIsUnchanged(t *test
 	}
 }
 
+func TestWCPlusAgentRejectsZeroTaskIDAsUpstreamAuthorizationBlock(t *testing.T) {
+	controlCalled := false
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			fmt.Fprint(w, `{"ok":true}`)
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[{"ID":"article-1","Title":"已有链接","URL":"https://mp.weixin.qq.com/s/article-1"}],"total":1}`)
+		case "/api/task/new":
+			fmt.Fprint(w, `{"task_id":0,"status":"ready"}`)
+		case "/api/task/control":
+			controlCalled = true
+			fmt.Fprint(w, `{"status":"ok"}`)
+		default:
+			t.Fatalf("unexpected local path: %s", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+
+	harness := newWCPlusAgentServerHarness(t, "sync_links", map[string]any{"limit": float64(10)}, nil)
+	defer harness.Close()
+	agent := newTestWCPlusAgent(t, harness.RemoteURL, local.URL, t.TempDir(), nil)
+	defer agent.Close()
+	_, err := agent.RunOnce(context.Background())
+	var blocked *WCPlusAgentBlockedError
+	if !errors.As(err, &blocked) || !strings.Contains(blocked.Reason, "task_id 0") || controlCalled {
+		t.Fatalf("RunOnce error=%v controlCalled=%v", err, controlCalled)
+	}
+	persisted, getErr := harness.Sync.GetRun(harness.Run.ID)
+	if getErr != nil || persisted.Status != SourceRunFailed || !strings.Contains(persisted.Error, "task_id 0") {
+		t.Fatalf("persisted run = %#v, err=%v", persisted, getErr)
+	}
+}
+
 func TestWCPlusAgentDoesNotRegressSubscriptionCursor(t *testing.T) {
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
