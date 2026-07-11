@@ -1,7 +1,7 @@
 # KBase WeChat Collector Design
 
-**Status:** Implemented; G1-G4 passed, G5 deployment and bounded G6 pending
-operator enrollment
+**Status:** Implemented and deployed; G1-G5 passed, bounded G6 pending operator
+enrollment
 
 **Decision:** Build a first-party, local-first WeChat public-account collector
 on the existing source-agent and KBase control-plane architecture. WC Plus
