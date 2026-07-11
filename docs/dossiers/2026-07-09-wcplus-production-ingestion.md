@@ -282,6 +282,11 @@ failure. KBase cannot activate or bypass a paid WC Plus license. G6 remains
 blocked until WC Plus accepts a nonzero task, after which the same bounded probe
 must be rerun.
 
+A sanitized license-status check reports `is_active=false`, `expire_time=0`,
+and no configured license key. The vendor UI exposes purchased-license and
+limited trial activation. Neither was triggered automatically because trial
+activation starts a time-limited entitlement and requires an operator decision.
+
 ## Gate Ledger
 
 | Gate | Status | Evidence | Next action |
