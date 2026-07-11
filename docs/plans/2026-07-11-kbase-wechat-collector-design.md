@@ -1,6 +1,6 @@
 # KBase WeChat Collector Design
 
-**Status:** Approved
+**Status:** Implemented; G1-G5 passed, bounded G6 pending operator enrollment
 
 **Decision:** Build a first-party, local-first WeChat public-account collector
 on the existing source-agent and KBase control-plane architecture. WC Plus
@@ -239,4 +239,3 @@ cancel actions. WC Plus diagnostics move behind a legacy section.
   request shapes, and sanitized fixtures.
 - `wechat_articles_spider` (Apache-2.0): historical compatibility reference
   only; interception and anti-rate-limit techniques are explicitly excluded.
-

@@ -228,3 +228,5 @@ Build the native macOS agent with `scripts/build-source-agent-macos.sh`. Install
 it with explicit `KBASE_REMOTE_URL`, `KBASE_SOURCE_AGENT_ID`, and a dedicated
 `KBASE_SOURCE_AGENT_TOKEN` using `scripts/install-source-agent-macos.sh`. MP
 sessions remain in macOS Keychain and enrollment listens on loopback only.
+Production scheduling must remain disabled until the bounded G6 probe in the
+collector delivery dossier passes.
