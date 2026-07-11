@@ -51,7 +51,7 @@ type WeChatMPSessionClient struct {
 
 func NewWeChatMPSessionClient(cfg WeChatMPSessionConfig) (*WeChatMPSessionClient, error) {
 	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/"))
-	if err != nil || base.Hostname() == "" {
+	if err != nil || base.Hostname() == "" || (base.Scheme != "https" && !isLoopbackSourceAgentHost(base.Hostname())) {
 		return nil, fmt.Errorf("wechat MP base URL is invalid")
 	}
 	if cfg.SecretStore == nil {

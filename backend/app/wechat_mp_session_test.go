@@ -78,3 +78,10 @@ func TestWeChatMPLoginRejectsMalformedRedirectWithoutSaving(t *testing.T) {
 		t.Fatalf("saved malformed session: %v", loadErr)
 	}
 }
+
+func TestWeChatMPLoginRejectsInsecureRemoteBaseURL(t *testing.T) {
+	_, err := NewWeChatMPSessionClient(WeChatMPSessionConfig{BaseURL: "http://example.invalid", SecretStore: NewMemorySourceSecretStore()})
+	if err == nil {
+		t.Fatal("accepted insecure remote MP base URL")
+	}
+}

@@ -14,3 +14,14 @@ func TestSourceAgentCLIConfigPrefersGenericStateDirectory(t *testing.T) {
 		t.Fatalf("state=%q", cfg.StateDir)
 	}
 }
+
+func TestSourceAgentEnrollmentAddressIsLoopbackOnly(t *testing.T) {
+	for _, value := range []string{"127.0.0.1:8765", "localhost:9000"} {
+		if _, err := normalizeEnrollmentAddress(value); err != nil {
+			t.Fatalf("%s: %v", value, err)
+		}
+	}
+	if _, err := normalizeEnrollmentAddress("0.0.0.0:8765"); err == nil {
+		t.Fatal("accepted wildcard enrollment address")
+	}
+}

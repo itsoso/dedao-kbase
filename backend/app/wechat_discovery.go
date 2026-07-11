@@ -45,7 +45,8 @@ func WeChatDiscoveryErrorCode(err error) string {
 }
 func NewWeChatDiscovery(cfg WeChatDiscoveryConfig) (*WeChatDiscovery, error) {
 	base := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-	if _, err := url.ParseRequestURI(base); err != nil {
+	parsed, err := url.Parse(base)
+	if err != nil || parsed.Hostname() == "" || (parsed.Scheme != "https" && !isLoopbackSourceAgentHost(parsed.Hostname())) {
 		return nil, fmt.Errorf("wechat discovery base URL is invalid")
 	}
 	if cfg.SessionProvider == nil {

@@ -2,11 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/yann0917/dedao-gui/backend/app"
+	"net"
+	"net/http"
 	"os"
 	"strings"
+	"time"
+
+	"github.com/yann0917/dedao-gui/backend/app"
 )
 
 type sourceEnvironmentLookup func(string) (string, bool)
@@ -42,7 +48,7 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 		return err
 	}
 	if args[0] == "enroll" {
-		return fmt.Errorf("enrollment requires the local loopback server")
+		return runEnrollmentServer(ctx, lookup, store)
 	}
 	client, err := app.NewSourceAgentClient(cfg)
 	if err != nil {
@@ -82,9 +88,71 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 		select {
 		case <-ctx.Done():
 			return nil
-		default:
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
+
+type enrollmentClientAdapter struct{ client *app.WeChatMPSessionClient }
+
+func (a enrollmentClientAdapter) StartLogin(ctx context.Context) error {
+	return a.client.StartLogin(ctx)
+}
+func (a enrollmentClientAdapter) QRImage(ctx context.Context) ([]byte, string, error) {
+	data, err := a.client.QRImage(ctx)
+	return data, "image/png", err
+}
+func (a enrollmentClientAdapter) LoginStatus(ctx context.Context) (any, error) {
+	return a.client.PollLogin(ctx)
+}
+func (a enrollmentClientAdapter) Logout(ctx context.Context) error { return a.client.Logout(ctx) }
+
+func normalizeEnrollmentAddress(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		value = "127.0.0.1:8765"
+	}
+	host, _, err := net.SplitHostPort(value)
+	if err != nil || !isLoopbackHost(host) {
+		return "", fmt.Errorf("SOURCE_AGENT_ENROLL_ADDR must bind loopback")
+	}
+	return value, nil
+}
+func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, store app.SourceSecretStore) error {
+	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
+	address, err := normalizeEnrollmentAddress(value("SOURCE_AGENT_ENROLL_ADDR"))
+	if err != nil {
+		return err
+	}
+	base := value("WECHAT_MP_BASE_URL")
+	if base == "" {
+		base = "https://mp.weixin.qq.com"
+	}
+	client, err := app.NewWeChatMPSessionClient(app.WeChatMPSessionConfig{BaseURL: base, SecretStore: store, SecretKey: "wechat-mp-session"})
+	if err != nil {
+		return err
+	}
+	secret := make([]byte, 32)
+	if _, err = rand.Read(secret); err != nil {
+		return fmt.Errorf("generate enrollment CSRF secret failed")
+	}
+	handler, err := newEnrollmentHandler(enrollmentClientAdapter{client: client}, hex.EncodeToString(secret))
+	if err != nil {
+		return err
+	}
+	server := &http.Server{Addr: address, Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	select {
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return server.Shutdown(shutdown)
+	case err := <-done:
+		if err == http.ErrServerClosed {
 			return nil
 		}
+		return err
 	}
 }
 

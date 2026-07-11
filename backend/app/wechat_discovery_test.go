@@ -51,3 +51,10 @@ func TestWeChatDiscoveryClassifiesUpstreamFailures(t *testing.T) {
 		})
 	}
 }
+
+func TestWeChatDiscoveryRejectsInsecureRemoteBaseURL(t *testing.T) {
+	_, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: "http://example.invalid", SessionProvider: staticWeChatSessionProvider{}})
+	if err == nil {
+		t.Fatal("accepted insecure remote discovery base URL")
+	}
+}
