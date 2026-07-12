@@ -216,7 +216,7 @@ func (s *BookKnowledgeStore) ListKnowledgeReleases(after string, limit int) ([]K
 	if end > len(manifest.Releases) {
 		end = len(manifest.Releases)
 	}
-	return append([]KnowledgeReleaseRecord(nil), manifest.Releases[start:end]...), nil
+	return append([]KnowledgeReleaseRecord{}, manifest.Releases[start:end]...), nil
 }
 
 func (s *BookKnowledgeStore) loadKnowledgeReleaseManifest() (*KnowledgeReleaseManifest, error) {

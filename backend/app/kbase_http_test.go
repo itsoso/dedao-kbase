@@ -102,6 +102,61 @@ func TestKBaseHTTPHandlerBookAnalysisPost(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeQualityAndRelease(t *testing.T) {
+	store := qualityTestStore(t)
+	if _, err := EvaluateBookAnalysisQuality(store, "42"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	quality := requestKBase(handler, http.MethodGet, "/api/books/42/quality", "secret-token")
+	if quality.Code != http.StatusOK || !strings.Contains(quality.Body.String(), `"decision":"pass"`) {
+		t.Fatalf("quality status=%d body=%s", quality.Code, quality.Body.String())
+	}
+	published := requestJSONKBase(handler, http.MethodPost, "/api/books/42/publish", "secret-token", `{}`)
+	if published.Code != http.StatusOK || !strings.Contains(published.Body.String(), `"release_id":"release-`) {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+	var release KnowledgeRelease
+	if err := json.Unmarshal(published.Body.Bytes(), &release); err != nil {
+		t.Fatalf("decode release: %v", err)
+	}
+
+	list := requestKBase(handler, http.MethodGet, "/api/knowledge/releases?limit=10", "secret-token")
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), release.ReleaseID) || !strings.Contains(list.Body.String(), `"next_cursor":"`+release.ReleaseID+`"`) {
+		t.Fatalf("release list status=%d body=%s", list.Code, list.Body.String())
+	}
+	after := requestKBase(handler, http.MethodGet, "/api/knowledge/releases?after="+url.QueryEscape(release.ReleaseID), "secret-token")
+	if after.Code != http.StatusOK || !strings.Contains(after.Body.String(), `"releases":[]`) {
+		t.Fatalf("release cursor status=%d body=%s", after.Code, after.Body.String())
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/knowledge/releases/"+url.PathEscape(release.ReleaseID), "secret-token")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"usage_policy":"standard"`) {
+		t.Fatalf("release detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodDelete, "/api/books/42/quality", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("quality DELETE status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerKnowledgeReleaseRejectsQuarantinedAnalysis(t *testing.T) {
+	store := qualityTestStore(t)
+	manifest, _ := store.LoadAnalysisManifest("42")
+	manifest.Payload.Claims[0].CitationIDs = nil
+	if err := store.SaveAnalysisManifest(*manifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EvaluateBookAnalysisQuality(store, "42"); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/books/42/publish", "secret-token", `{}`)
+	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "quality decision") {
+		t.Fatalf("publish quarantined status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)

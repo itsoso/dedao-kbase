@@ -149,6 +149,18 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleBookAnalysis(w, r, bookID)
 		return
 	}
+	if bookID, ok := bookNestedPathID(r.URL.Path, "quality"); ok {
+		h.handleBookQuality(w, r, bookID)
+		return
+	}
+	if bookID, ok := bookNestedPathID(r.URL.Path, "publish"); ok {
+		h.handleBookPublish(w, r, bookID)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
+		h.handleKnowledgeReleases(w, r)
+		return
+	}
 	if r.URL.Path == "/api/book-chat" {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -221,9 +233,13 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func bookAnalysisPathID(path string) (string, bool) {
+	return bookNestedPathID(path, "analysis")
+}
+
+func bookNestedPathID(path, resource string) (string, bool) {
 	const prefix = "/api/books/"
-	const suffix = "/analysis"
-	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+	suffix := "/" + strings.Trim(resource, "/")
+	if suffix == "/" || !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
 		return "", false
 	}
 	bookID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
@@ -235,6 +251,94 @@ func bookAnalysisPathID(path string) (string, bool) {
 		return "", false
 	}
 	return decoded, true
+}
+
+func (h *kbaseHTTPHandler) handleBookQuality(w http.ResponseWriter, r *http.Request, bookID string) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	report, err := h.store.LoadBookQualityReport(bookID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "quality report not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, report)
+}
+
+func (h *kbaseHTTPHandler) handleBookPublish(w http.ResponseWriter, r *http.Request, bookID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	release, err := PublishKnowledgeRelease(h.store, bookID)
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "book not found") {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "quality decision") || strings.Contains(err.Error(), "requires ready") || strings.Contains(err.Error(), "stale") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, release)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	const prefix = "/api/knowledge/releases/"
+	if strings.HasPrefix(r.URL.Path, prefix) {
+		rawID := strings.TrimPrefix(r.URL.Path, prefix)
+		if rawID == "" || strings.Contains(rawID, "/") {
+			writeHTTPError(w, http.StatusNotFound, "release not found")
+			return
+		}
+		releaseID, err := url.PathUnescape(rawID)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid release_id")
+			return
+		}
+		release, err := h.store.LoadKnowledgeRelease(releaseID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeHTTPError(w, http.StatusNotFound, "release not found")
+				return
+			}
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, release)
+		return
+	}
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 200 {
+			writeHTTPError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
+		limit = parsed
+	}
+	releases, err := h.store.ListKnowledgeReleases(r.URL.Query().Get("after"), limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	nextCursor := ""
+	if len(releases) > 0 {
+		nextCursor = releases[len(releases)-1].ReleaseID
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"releases": releases, "next_cursor": nextCursor})
 }
 
 func (h *kbaseHTTPHandler) handleBookAnalysis(w http.ResponseWriter, r *http.Request, bookID string) {
