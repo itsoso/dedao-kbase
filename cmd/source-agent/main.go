@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -251,6 +252,9 @@ func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, st
 		CSRFToken: hex.EncodeToString(secret),
 		RemoteURL: value("KBASE_REMOTE_URL"),
 		AgentID:   value("KBASE_SOURCE_AGENT_ID"),
+		ReportError: func(stage string, reportErr error) {
+			log.Printf("source-agent enrollment %s failed: %v", stage, reportErr)
+		},
 	})
 	if err != nil {
 		return err

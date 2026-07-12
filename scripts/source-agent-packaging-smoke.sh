@@ -21,5 +21,7 @@ fi
 if grep -Eq 'WECHAT_MP_(TOKEN|COOKIE)' "$root/scripts/install-source-agent-macos.sh"; then
   echo "MP secrets must not be written to the plist" >&2; exit 1
 fi
+grep -q 'keychainEnvelopePrefix' "$root/cmd/source-agent/keychain_store_darwin.go"
+grep -q 'sealKeychainEnvelope' "$root/cmd/source-agent/keychain_store_darwin.go"
 grep -q -- '--purge-state' "$root/scripts/uninstall-source-agent-macos.sh"
 echo "source-agent packaging smoke passed"

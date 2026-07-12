@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"net"
@@ -27,9 +28,10 @@ type enrollmentDiscovery interface {
 }
 
 type enrollmentHandlerConfig struct {
-	CSRFToken string
-	RemoteURL string
-	AgentID   string
+	CSRFToken   string
+	RemoteURL   string
+	AgentID     string
+	ReportError func(string, error)
 }
 
 func newEnrollmentHandler(login enrollmentLogin, discovery enrollmentDiscovery, config enrollmentHandlerConfig) (http.Handler, error) {
@@ -96,6 +98,9 @@ func newEnrollmentHandler(login enrollmentLogin, discovery enrollmentDiscovery, 
 	mux.HandleFunc("/api/local/wechat/login/status", guard(false, requireMethod(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		status, err := login.LoginStatus(r.Context())
 		if err != nil {
+			if config.ReportError != nil {
+				config.ReportError("login_status", err)
+			}
 			http.Error(w, "status unavailable", 502)
 			return
 		}
@@ -120,6 +125,13 @@ func newEnrollmentHandler(login enrollmentLogin, discovery enrollmentDiscovery, 
 		}
 		accounts, err := discovery.SearchOfficialAccounts(r.Context(), query)
 		if err != nil {
+			if config.ReportError != nil {
+				config.ReportError("account_search", err)
+			}
+			if isEnrollmentLoginRequiredError(err) {
+				http.Error(w, "login required", http.StatusUnauthorized)
+				return
+			}
 			http.Error(w, "account search failed", http.StatusBadGateway)
 			return
 		}
@@ -139,6 +151,13 @@ func newEnrollmentHandler(login enrollmentLogin, discovery enrollmentDiscovery, 
 		}
 		articles, err := discovery.ListOfficialAccountArticles(r.Context(), fakeID, begin, count)
 		if err != nil {
+			if config.ReportError != nil {
+				config.ReportError("article_list", err)
+			}
+			if isEnrollmentLoginRequiredError(err) {
+				http.Error(w, "login required", http.StatusUnauthorized)
+				return
+			}
 			http.Error(w, "article discovery failed", http.StatusBadGateway)
 			return
 		}
@@ -146,6 +165,11 @@ func newEnrollmentHandler(login enrollmentLogin, discovery enrollmentDiscovery, 
 	})))
 	return mux, nil
 }
+
+func isEnrollmentLoginRequiredError(err error) bool {
+	return errors.Is(err, app.ErrWeChatCredentialsNotConfigured) || app.WeChatDiscoveryErrorCode(err) == "login_required"
+}
+
 func requireMethod(want string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != want {
@@ -190,7 +214,7 @@ const setStatus=value=>{status.textContent=value};const poll=async()=>{try{const
 document.querySelector('#login-start').onclick=async()=>{try{await request('/api/local/wechat/login/start',{method:'POST'});qr.src='/api/local/wechat/login/qr?t='+Date.now();setStatus('请使用微信扫码');clearInterval(timer);timer=setInterval(poll,1500)}catch(error){setStatus(error.message)}};
 document.querySelector('#login-logout').onclick=async()=>{try{await request('/api/local/wechat/logout',{method:'POST'});qr.removeAttribute('src');setStatus('已退出')}catch(error){setStatus(error.message)}};
 document.querySelector('#account-search').onsubmit=async event=>{event.preventDefault();const q=new FormData(event.currentTarget).get('q');accounts.textContent='搜索中';try{const data=await request('/api/local/wechat/accounts?q='+encodeURIComponent(q));accounts.replaceChildren();for(const account of data.accounts||[]){const row=document.createElement('div');row.className='row';const text=document.createElement('div');const title=document.createElement('strong');title.textContent=account.nickname||account.fakeid;const key=document.createElement('small');key.textContent=account.fakeid;text.append(title,key);const button=document.createElement('button');button.className='button';button.textContent='选择';button.onclick=()=>loadArticles(account);row.append(text,button);accounts.append(row)}if(!accounts.children.length)accounts.textContent='未找到公众号'}catch(error){accounts.textContent=error.message}};
-const loadArticles=async account=>{articles.textContent='加载中';try{const data=await request('/api/local/wechat/articles?fakeid='+encodeURIComponent(account.fakeid)+'&begin=0&count=10');articles.replaceChildren();for(const article of data.articles||[]){const row=document.createElement('div');row.className='row';const text=document.createElement('div');const title=document.createElement('strong');title.textContent=article.title||article.aid;const link=document.createElement('small');link.textContent=article.link||'';text.append(title,link);row.append(text);articles.append(row)}if(!articles.children.length)articles.textContent='暂无文章';if(root.dataset.remoteUrl){const target=new URL('/wechat-source',root.dataset.remoteUrl);target.searchParams.set('source_account_key',account.fakeid);target.searchParams.set('source_account',account.nickname||account.fakeid);if(root.dataset.agentId)target.searchParams.set('agent_id',root.dataset.agentId);online.href=target.toString();online.style.display='inline-block'}}catch(error){articles.textContent=error.message}};poll();})();
+const loadArticles=async account=>{articles.textContent='加载中';try{const data=await request('/api/local/wechat/articles?fakeid='+encodeURIComponent(account.fakeid)+'&begin=0&count=10');articles.replaceChildren();for(const article of data.articles||[]){const row=document.createElement('div');row.className='row';const text=document.createElement('div');const title=document.createElement('strong');title.textContent=article.title||article.aid;const link=document.createElement('small');link.textContent=article.link||'';text.append(title,link);row.append(text);articles.append(row)}if(!articles.children.length)articles.textContent='暂无文章';if(root.dataset.remoteUrl){const target=new URL('/wechat-source',root.dataset.remoteUrl);target.searchParams.set('source_account_key',account.fakeid);target.searchParams.set('source_account',account.nickname||account.fakeid);if(root.dataset.agentId)target.searchParams.set('agent_id',root.dataset.agentId);online.href=target.toString();online.style.display='inline-block'}}catch(error){articles.textContent=error.message}};poll();window.setInterval(poll,5000);})();
 </script>
 </body>
 </html>`

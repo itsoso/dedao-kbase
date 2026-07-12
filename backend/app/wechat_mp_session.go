@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -70,11 +72,14 @@ type WeChatMPSessionConfig struct {
 	SecretKey   string
 }
 type WeChatMPSessionClient struct {
-	base   *url.URL
-	client *http.Client
-	jar    http.CookieJar
-	store  SourceSecretStore
-	key    string
+	base           *url.URL
+	client         *http.Client
+	jar            http.CookieJar
+	store          SourceSecretStore
+	key            string
+	loginMu        sync.Mutex
+	loginActive    bool
+	loginConfirmed bool
 }
 
 func NewWeChatMPSessionClient(cfg WeChatMPSessionConfig) (*WeChatMPSessionClient, error) {
@@ -103,6 +108,8 @@ func (c *WeChatMPSessionClient) endpoint(path string) *url.URL {
 	return &u
 }
 func (c *WeChatMPSessionClient) StartLogin(ctx context.Context) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
 	body, err := c.request(ctx, http.MethodPost, "/cgi-bin/bizlogin", url.Values{"action": {"startlogin"}}, url.Values{
 		"userlang":     {"zh_CN"},
 		"redirect_url": {""},
@@ -125,6 +132,8 @@ func (c *WeChatMPSessionClient) StartLogin(ctx context.Context) error {
 	if payload.BaseResp.Ret != 0 {
 		return fmt.Errorf("wechat MP login start was rejected (%d)", payload.BaseResp.Ret)
 	}
+	c.loginActive = true
+	c.loginConfirmed = false
 	return nil
 }
 func (c *WeChatMPSessionClient) QRImage(ctx context.Context) ([]byte, error) {
@@ -134,6 +143,18 @@ func (c *WeChatMPSessionClient) QRImage(ctx context.Context) ([]byte, error) {
 	}, nil)
 }
 func (c *WeChatMPSessionClient) PollLogin(ctx context.Context) (WeChatMPLoginStatus, error) {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	if c.loginConfirmed {
+		return WeChatMPLoginStatus{State: WeChatMPLoginConfirmed}, nil
+	}
+	if !c.loginActive {
+		if _, err := c.LoadSession(ctx); err == nil {
+			c.loginConfirmed = true
+			return WeChatMPLoginStatus{State: WeChatMPLoginConfirmed}, nil
+		}
+		return WeChatMPLoginStatus{State: WeChatMPLoginPending, RequiresAction: "login"}, nil
+	}
 	body, err := c.request(ctx, http.MethodGet, "/cgi-bin/scanloginqrcode", url.Values{
 		"action": {"ask"},
 		"token":  {""},
@@ -153,7 +174,7 @@ func (c *WeChatMPSessionClient) PollLogin(ctx context.Context) (WeChatMPLoginSta
 		return WeChatMPLoginStatus{}, fmt.Errorf("wechat MP login response is malformed")
 	}
 	if payload.BaseResp.Ret != 0 {
-		return WeChatMPLoginStatus{}, fmt.Errorf("wechat MP login was rejected")
+		return WeChatMPLoginStatus{}, fmt.Errorf("wechat MP login was rejected (%d)", payload.BaseResp.Ret)
 	}
 	code, err := decodeWeChatMPScanStatus(payload.Status)
 	if err != nil {
@@ -166,6 +187,8 @@ func (c *WeChatMPSessionClient) PollLogin(ctx context.Context) (WeChatMPLoginSta
 		if err := c.completeLogin(ctx); err != nil {
 			return WeChatMPLoginStatus{}, err
 		}
+		c.loginActive = false
+		c.loginConfirmed = true
 		return WeChatMPLoginStatus{State: WeChatMPLoginConfirmed}, nil
 	case 2, 3:
 		return WeChatMPLoginStatus{State: WeChatMPLoginExpired, RequiresAction: "login"}, nil
@@ -201,8 +224,11 @@ func (c *WeChatMPSessionClient) completeLogin(ctx context.Context) error {
 		RedirectURL string         `json:"redirect_url"`
 		BaseResp    weChatBaseResp `json:"base_resp"`
 	}
-	if json.Unmarshal(body, &payload) != nil || payload.BaseResp.Ret != 0 {
-		return fmt.Errorf("wechat MP login completion was rejected")
+	if json.Unmarshal(body, &payload) != nil {
+		return fmt.Errorf("wechat MP login completion response is malformed")
+	}
+	if payload.BaseResp.Ret != 0 {
+		return fmt.Errorf("wechat MP login completion was rejected (%d)", payload.BaseResp.Ret)
 	}
 	token, err := c.validateRedirect(payload.RedirectURL)
 	if err != nil {
@@ -212,6 +238,9 @@ func (c *WeChatMPSessionClient) completeLogin(ctx context.Context) error {
 	for _, cookie := range c.jar.Cookies(c.base) {
 		session.Cookies = append(session.Cookies, WeChatMPCookie{Name: cookie.Name, Value: cookie.Value, Domain: cookie.Domain, Path: cookie.Path})
 	}
+	if len(session.Cookies) == 0 {
+		return fmt.Errorf("wechat MP login session is incomplete")
+	}
 	encoded, err := json.Marshal(session)
 	if err != nil {
 		return fmt.Errorf("encode wechat MP session failed")
@@ -219,7 +248,23 @@ func (c *WeChatMPSessionClient) completeLogin(ctx context.Context) error {
 	if err = c.store.Save(ctx, c.key, encoded); err != nil {
 		return fmt.Errorf("save wechat MP session failed")
 	}
+	stored, err := c.LoadSession(ctx)
+	if err != nil || !sameWeChatMPSession(stored, session) {
+		return fmt.Errorf("verify saved wechat MP session failed")
+	}
 	return nil
+}
+
+func sameWeChatMPSession(left, right WeChatMPSession) bool {
+	if left.Token != right.Token || left.ObservedExpiry != right.ObservedExpiry || len(left.Cookies) != len(right.Cookies) {
+		return false
+	}
+	for index := range left.Cookies {
+		if left.Cookies[index] != right.Cookies[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func decodeWeChatMPScanStatus(raw json.RawMessage) (int, error) {
@@ -242,7 +287,13 @@ func decodeWeChatMPScanStatus(raw json.RawMessage) (int, error) {
 }
 func (c *WeChatMPSessionClient) validateRedirect(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.IsAbs() || !strings.HasPrefix(u.Path, "/cgi-bin/") {
+	if err != nil || !strings.HasPrefix(u.Path, "/cgi-bin/") {
+		return "", fmt.Errorf("wechat MP login redirect is invalid")
+	}
+	if u.Host != "" && !strings.EqualFold(u.Host, c.base.Host) {
+		return "", fmt.Errorf("wechat MP login redirect is invalid")
+	}
+	if u.IsAbs() && !strings.EqualFold(u.Scheme, c.base.Scheme) {
 		return "", fmt.Errorf("wechat MP login redirect is invalid")
 	}
 	token := strings.TrimSpace(u.Query().Get("token"))
@@ -265,7 +316,13 @@ func (c *WeChatMPSessionClient) LoadSession(ctx context.Context) (WeChatMPSessio
 	}
 	return session, nil
 }
-func (c *WeChatMPSessionClient) Logout(ctx context.Context) error { return c.store.Delete(ctx, c.key) }
+func (c *WeChatMPSessionClient) Logout(ctx context.Context) error {
+	c.loginMu.Lock()
+	defer c.loginMu.Unlock()
+	c.loginActive = false
+	c.loginConfirmed = false
+	return c.store.Delete(ctx, c.key)
+}
 func (c *WeChatMPSessionClient) request(ctx context.Context, method, path string, query, form url.Values) ([]byte, error) {
 	endpoint := c.endpoint(path)
 	endpoint.RawQuery = query.Encode()
@@ -287,7 +344,7 @@ func (c *WeChatMPSessionClient) request(ctx context.Context, method, path string
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("wechat MP request failed")
+		return nil, fmt.Errorf("wechat MP request failed (%s)", classifyWeChatMPRequestError(err))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -298,4 +355,20 @@ func (c *WeChatMPSessionClient) request(ctx context.Context, method, path string
 		return nil, fmt.Errorf("read wechat MP response failed")
 	}
 	return body, nil
+}
+
+func classifyWeChatMPRequestError(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "eof"
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && networkError.Timeout() {
+		return "timeout"
+	}
+	return "network"
 }
