@@ -23,6 +23,7 @@ for (const endpoint of [
   "/browser/session-token",
   "/api/books",
   "/api/search?",
+  "/api/book-chat",
 ]) {
   assert.ok(js.includes(endpoint), `book knowledge web UI should call ${endpoint}`);
 }
@@ -57,5 +58,8 @@ for (const className of [
 
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(js.includes('href="/ebook/${encodeURIComponent(currentBook.book_id)}"'), "book details should link to the reader");
+assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
+assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");
+assert.ok(js.includes("Qwen-3.7-Max"), "book knowledge analysis should default to Qwen-3.7-Max");
 
 console.log("book knowledge web smoke passed");

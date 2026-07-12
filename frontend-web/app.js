@@ -100,9 +100,21 @@ const knowledgeState = {
   package: null,
   query: "",
   results: [],
+  analysisModel: "Qwen-3.7-Max",
+  analysisPrompt: "",
+  analysisResponse: null,
+  analysisLoading: "",
+  analysisError: "",
   loading: "",
   message: "",
 };
+
+const knowledgeAnalysisPrompts = [
+  ["article", "分析当前文章", "请分析当前文章的核心论点、关键证据、适用边界和可执行启发。回答要引用 claim_id 或 chunk_id。"],
+  ["summary", "结构化总结", "请用结构化方式总结当前内容：一句话结论、3-5 个关键点、证据来源、我下一步该怎么读。"],
+  ["claims", "证据审计", "请审计当前内容的 claims：哪些证据强，哪些证据弱，哪些需要外部数据验证。每项引用 claim_id 或 chunk_id。"],
+  ["actions", "行动建议", "请把当前内容转成可执行清单，区分立即行动、需要验证、长期跟踪，并说明依据。"],
+];
 
 let isWCPlusBootstrapped = false;
 let sourceControlPollTimer = null;
@@ -418,6 +430,11 @@ function renderBookKnowledge() {
   const status = knowledgeState.loading
     ? `<div class="web-status">处理中：${escapeHTML(knowledgeState.loading)}</div>`
     : (knowledgeState.message ? `<div class="web-status">${escapeHTML(knowledgeState.message)}</div>` : "");
+  const analysisPrompt = knowledgeState.analysisPrompt || knowledgeAnalysisPrompts[0][2];
+  const analysisResponse = knowledgeState.analysisResponse || {};
+  const analysisStats = analysisResponse.context_stats
+    ? `${analysisResponse.context_stats.chapters || 0} 章 · ${analysisResponse.context_stats.claims || 0} claims · ${analysisResponse.context_stats.chunks || 0} chunks`
+    : "";
 
   renderShell(`
     <main class="knowledge-web">
@@ -468,12 +485,72 @@ function renderBookKnowledge() {
                 ${resultRows || "<p class=\"web-muted\">输入关键词后查看检索结果。</p>"}
               </section>
             </div>
+            <section class="knowledge-web__analysis" aria-label="大模型分析">
+              <div class="knowledge-web__analysis-head">
+                <div>
+                  <p class="web-kicker">TokenPlan Study</p>
+                  <h3>大模型分析</h3>
+                </div>
+                <select id="knowledge-analysis-model" aria-label="模型">
+                  ${["Qwen-3.7-Max", "MiniMax-M2.5", "DeepSeek-V3.1"].map((model) => `
+                    <option value="${escapeAttribute(model)}" ${knowledgeState.analysisModel === model ? "selected" : ""}>${escapeHTML(model)}</option>
+                  `).join("")}
+                </select>
+              </div>
+              <div class="knowledge-web__prompt-grid">
+                ${knowledgeAnalysisPrompts.map(([key, label]) => `
+                  <button class="button button-ghost" type="button" data-knowledge-prompt="${escapeAttribute(key)}">${escapeHTML(label)}</button>
+                `).join("")}
+              </div>
+              <form id="knowledge-analysis-form" class="knowledge-web__analysis-form">
+                <textarea name="question" rows="5" placeholder="围绕当前文章提问，或点击上方模板">${escapeHTML(analysisPrompt)}</textarea>
+                <div class="knowledge-web__analysis-actions">
+                  <span>${escapeHTML(analysisStats || knowledgeState.analysisError || knowledgeState.analysisLoading || "会基于当前文章知识包回答。")}</span>
+                  <button class="button button-primary" type="submit">${knowledgeState.analysisLoading ? "分析中" : "分析当前文章"}</button>
+                </div>
+              </form>
+              ${analysisResponse.answer ? `
+                <article class="knowledge-web__answer">
+                  <div class="web-kicker">${escapeHTML(analysisResponse.model || knowledgeState.analysisModel)}</div>
+                  ${renderSimpleMarkdown(analysisResponse.answer)}
+                </article>
+              ` : ""}
+            </section>
           ` : "<p class=\"web-muted\">请选择书籍或导入新来源。</p>"}
         </section>
       </div>
     </main>
   `, "knowledge");
   bindBookKnowledgeEvents();
+}
+
+function renderSimpleMarkdown(markdown) {
+  const blocks = String(markdown || "").split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  if (!blocks.length) {
+    return "";
+  }
+  return blocks.map((block) => {
+    if (/^#{1,4}\s+/.test(block)) {
+      const level = Math.min(4, block.match(/^#+/)?.[0]?.length || 3);
+      return `<h${level}>${escapeHTML(block.replace(/^#{1,4}\s+/, ""))}</h${level}>`;
+    }
+    if (/^[-*]\s+/m.test(block)) {
+      const items = block.split(/\n/).filter(Boolean).map((line) => line.replace(/^[-*]\s+/, ""));
+      return `<ul>${items.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}</ul>`;
+    }
+    if (/^\d+\.\s+/m.test(block)) {
+      const items = block.split(/\n/).filter(Boolean).map((line) => line.replace(/^\d+\.\s+/, ""));
+      return `<ol>${items.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}</ol>`;
+    }
+    return `<p>${escapeHTML(block).replace(/\n/g, "<br>")}</p>`;
+  }).join("");
+}
+
+function resetKnowledgeAnalysis(prompt = "") {
+  knowledgeState.analysisPrompt = prompt;
+  knowledgeState.analysisResponse = null;
+  knowledgeState.analysisLoading = "";
+  knowledgeState.analysisError = "";
 }
 
 function renderReader(payload) {
@@ -3120,6 +3197,27 @@ function bindBookKnowledgeEvents() {
     knowledgeState.query = String(data.get("query") || "").trim();
     await searchBookKnowledge();
   });
+  document.querySelector("#knowledge-analysis-model")?.addEventListener("change", (event) => {
+    knowledgeState.analysisModel = event.currentTarget.value || "Qwen-3.7-Max";
+  });
+  for (const button of document.querySelectorAll("[data-knowledge-prompt]")) {
+    button.addEventListener("click", () => {
+      const key = button.getAttribute("data-knowledge-prompt") || "";
+      const prompt = knowledgeAnalysisPrompts.find(([value]) => value === key)?.[2] || "";
+      knowledgeState.analysisPrompt = prompt;
+      const textarea = document.querySelector("#knowledge-analysis-form textarea[name='question']");
+      if (textarea) {
+        textarea.value = prompt;
+        textarea.focus();
+      }
+    });
+  }
+  document.querySelector("#knowledge-analysis-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    knowledgeState.analysisPrompt = String(data.get("question") || "").trim();
+    await runKnowledgeAnalysis();
+  });
   for (const button of document.querySelectorAll("[data-book-index]")) {
     button.addEventListener("click", async () => {
       const index = Number(button.getAttribute("data-book-index") || "0");
@@ -3161,9 +3259,13 @@ async function loadBookKnowledge() {
 }
 
 async function selectKnowledgeBook(book, renderBefore = true) {
+  const previousID = knowledgeState.selectedBook?.book_id || "";
   knowledgeState.selectedBook = book;
   knowledgeState.package = null;
   knowledgeState.results = [];
+  if (book?.book_id !== previousID) {
+    resetKnowledgeAnalysis();
+  }
   knowledgeState.loading = "加载详情";
   if (renderBefore) {
     renderBookKnowledge();
@@ -3177,6 +3279,41 @@ async function selectKnowledgeBook(book, renderBefore = true) {
     if (renderBefore) {
       renderBookKnowledge();
     }
+  }
+}
+
+async function runKnowledgeAnalysis() {
+  const bookID = knowledgeState.selectedBook?.book_id || knowledgeState.package?.book?.book_id || "";
+  const question = String(knowledgeState.analysisPrompt || "").trim();
+  if (!bookID) {
+    knowledgeState.analysisError = "请先选择文章。";
+    renderBookKnowledge();
+    return;
+  }
+  if (!question) {
+    knowledgeState.analysisError = "请输入问题或选择模板。";
+    renderBookKnowledge();
+    return;
+  }
+  knowledgeState.analysisLoading = "TokenPlan 分析中";
+  knowledgeState.analysisError = "";
+  renderBookKnowledge();
+  try {
+    knowledgeState.analysisResponse = await apiFetch("/api/book-chat", {
+      method: "POST",
+      body: JSON.stringify({
+        book_id: bookID,
+        mode: "analysis",
+        question,
+        model: knowledgeState.analysisModel || "Qwen-3.7-Max",
+        max_context_chars: 12000,
+      }),
+    });
+  } catch (error) {
+    knowledgeState.analysisError = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.analysisLoading = "";
+    renderBookKnowledge();
   }
 }
 

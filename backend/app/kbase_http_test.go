@@ -43,6 +43,22 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+	})
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/book-chat", "secret-token", `{}`)
+	if resp.Code == http.StatusMethodNotAllowed {
+		t.Fatalf("book chat POST returned 405; HTTP API should expose TokenPlan analysis: %s", resp.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)

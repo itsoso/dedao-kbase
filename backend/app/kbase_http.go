@@ -135,6 +135,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleWCPlusPost(w, r)
 		return
 	}
+	if r.URL.Path == "/api/book-chat" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleBookChat(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -416,6 +424,28 @@ func (h *kbaseHTTPHandler) handleSearch(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"results": results})
+}
+
+func (h *kbaseHTTPHandler) handleBookChat(w http.ResponseWriter, r *http.Request) {
+	var request BookKnowledgeChatRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	response, err := BookKnowledgeChat(r.Context(), h.store, request)
+	if err != nil {
+		if strings.Contains(err.Error(), "book_id is required") || strings.Contains(err.Error(), "question is required") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "book not found") {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, response)
 }
 
 func (h *kbaseHTTPHandler) handleSystemKBExport(w http.ResponseWriter) {
