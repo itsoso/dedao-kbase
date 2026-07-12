@@ -55,7 +55,7 @@ func TestGenerateBookAnalysisManifestPersistsGroundedResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateBookAnalysisManifestWithClient returned error: %v", err)
 	}
-	if manifest.Status != BookAnalysisReady || manifest.Answer != client.answer || manifest.Model != "Qwen-3.7-Max" {
+	if manifest.Status != BookAnalysisReady || manifest.Answer != client.answer || manifest.Model != "qwen3.7-max" {
 		t.Fatalf("manifest = %#v", manifest)
 	}
 	if manifest.ContentHash != pkg.Book.ContentHash || manifest.CompletedAt == "" {

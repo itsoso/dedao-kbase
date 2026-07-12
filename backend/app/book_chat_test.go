@@ -99,6 +99,26 @@ func TestBookKnowledgeChatBuildsGroundedPrompt(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeChatCanonicalizesQwenDisplayLabel(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	client := &fakeBookKnowledgeLLMClient{answer: "answer"}
+
+	response, err := BookKnowledgeChatWithClient(context.Background(), store, BookKnowledgeChatRequest{
+		BookID: "42", Question: "总结", Model: "Qwen-3.7-Max",
+	}, client)
+	if err != nil {
+		t.Fatalf("BookKnowledgeChatWithClient returned error: %v", err)
+	}
+	if client.cfg.Model != "qwen3.7-max" || response.Model != "qwen3.7-max" {
+		t.Fatalf("models = client %q response %q, want qwen3.7-max", client.cfg.Model, response.Model)
+	}
+}
+
 func TestBookKnowledgeChatPersistsHistory(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")

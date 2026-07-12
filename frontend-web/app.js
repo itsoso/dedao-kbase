@@ -100,7 +100,7 @@ const knowledgeState = {
   package: null,
   query: "",
   results: [],
-  analysisModel: "Qwen-3.7-Max",
+  analysisModel: "qwen3.7-max",
   analysisPrompt: "",
   analysisResponse: null,
   analysisLoading: "",
@@ -118,6 +118,16 @@ const knowledgeAnalysisPrompts = [
   ["claims", "证据审计", "请审计当前内容的 claims：哪些证据强，哪些证据弱，哪些需要外部数据验证。每项引用 claim_id 或 chunk_id。"],
   ["actions", "行动建议", "请把当前内容转成可执行清单，区分立即行动、需要验证、长期跟踪，并说明依据。"],
 ];
+
+const knowledgeAnalysisModels = [
+  { id: "qwen3.7-max", label: "Qwen-3.7-Max" },
+  { id: "qwen3.7-plus", label: "Qwen-3.7-Plus" },
+  { id: "MiniMax-M2.5", label: "MiniMax-M2.5" },
+];
+
+function knowledgeModelLabel(modelID) {
+  return knowledgeAnalysisModels.find((model) => model.id === modelID)?.label || modelID;
+}
 
 let isWCPlusBootstrapped = false;
 let sourceControlPollTimer = null;
@@ -506,7 +516,7 @@ function renderBookKnowledge() {
                 <span class="knowledge-web__manifest-status is-${escapeAttribute(manifestStatus)}">${escapeHTML(manifestStatusLabels[manifestStatus] || manifestStatus)}</span>
               </div>
               <div class="knowledge-web__manifest-meta">
-                <span>${escapeHTML(analysisManifest.model || knowledgeState.analysisModel)}</span>
+                <span>${escapeHTML(knowledgeModelLabel(analysisManifest.model || knowledgeState.analysisModel))}</span>
                 ${analysisManifest.updated_at ? `<span>更新于 ${escapeHTML(analysisManifest.updated_at)}</span>` : ""}
                 ${analysisManifest.content_hash ? `<span>内容版本 ${escapeHTML(String(analysisManifest.content_hash).slice(0, 12))}</span>` : ""}
               </div>
@@ -524,8 +534,8 @@ function renderBookKnowledge() {
                   <h3>大模型分析</h3>
                 </div>
                 <select id="knowledge-analysis-model" aria-label="模型">
-                  ${["Qwen-3.7-Max", "MiniMax-M2.5", "DeepSeek-V3.1"].map((model) => `
-                    <option value="${escapeAttribute(model)}" ${knowledgeState.analysisModel === model ? "selected" : ""}>${escapeHTML(model)}</option>
+                  ${knowledgeAnalysisModels.map((model) => `
+                    <option value="${escapeAttribute(model.id)}" ${knowledgeState.analysisModel === model.id ? "selected" : ""}>${escapeHTML(model.label)}</option>
                   `).join("")}
                 </select>
               </div>
@@ -3233,7 +3243,7 @@ function bindBookKnowledgeEvents() {
     await searchBookKnowledge();
   });
   document.querySelector("#knowledge-analysis-model")?.addEventListener("change", (event) => {
-    knowledgeState.analysisModel = event.currentTarget.value || "Qwen-3.7-Max";
+    knowledgeState.analysisModel = event.currentTarget.value || "qwen3.7-max";
   });
   for (const button of document.querySelectorAll("[data-knowledge-prompt]")) {
     button.addEventListener("click", () => {
@@ -3349,7 +3359,7 @@ async function generateKnowledgeAnalysisManifest() {
     knowledgeState.analysisManifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`, {
       method: "POST",
       body: JSON.stringify({
-        model: knowledgeState.analysisModel || "Qwen-3.7-Max",
+        model: knowledgeState.analysisModel || "qwen3.7-max",
         max_context_chars: 16000,
       }),
     });
@@ -3388,7 +3398,7 @@ async function runKnowledgeAnalysis() {
         book_id: bookID,
         mode: "analysis",
         question,
-        model: knowledgeState.analysisModel || "Qwen-3.7-Max",
+        model: knowledgeState.analysisModel || "qwen3.7-max",
         max_context_chars: 12000,
       }),
     });

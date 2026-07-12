@@ -144,8 +144,9 @@ func BookKnowledgeChatWithClient(
 		return nil, err
 	}
 	if model := strings.TrimSpace(request.Model); model != "" {
-		cfg.Model = model
+		cfg.Model = normalizeBookTokenPlanModel(model)
 	}
+	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
 
 	pkg, err := store.LoadPackage(request.BookID)
 	if err != nil {
@@ -211,6 +212,7 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 	if strings.TrimSpace(cfg.Model) == "" {
 		cfg.Model = defaultTokenPlanModel
 	}
+	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
 	payload := map[string]any{
 		"model":       cfg.Model,
 		"messages":    messages,
@@ -255,6 +257,19 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 		return "", fmt.Errorf("TokenPlan 响应为空")
 	}
 	return parsed.Choices[0].Message.Content, nil
+}
+
+func normalizeBookTokenPlanModel(model string) string {
+	clean := strings.TrimSpace(model)
+	compact := strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "").Replace(clean))
+	switch compact {
+	case "qwen3.7max":
+		return "qwen3.7-max"
+	case "qwen3.7plus":
+		return "qwen3.7-plus"
+	default:
+		return clean
+	}
 }
 
 func buildBookChatContext(

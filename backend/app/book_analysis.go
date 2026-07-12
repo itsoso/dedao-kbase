@@ -115,8 +115,9 @@ func GenerateBookAnalysisManifestWithClient(
 		return nil, err
 	}
 	if model := strings.TrimSpace(request.Model); model != "" {
-		cfg.Model = model
+		cfg.Model = normalizeBookTokenPlanModel(model)
 	}
+	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
 
 	prompt := "请对当前文章做结构化分析，输出以下部分：核心摘要、可验证结论、风险与局限、行动建议。每个事实性结论必须引用提供的来源 ID，并明确区分原文事实与模型推理。"
 	contextText, stats, sources, err := buildBookChatContext(store, pkg, prompt, request.MaxContextChars)
