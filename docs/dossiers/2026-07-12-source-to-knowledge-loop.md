@@ -30,15 +30,20 @@ health decision logic remains outside KBase.
   analysis/report binding, release manifest repair, feedback privacy and
   idempotency, risk normalization, and embedded release evidence. Follow-up
   review found no remaining Critical, High, or Medium findings.
-- G5 deployment health: pending.
-- G6 production validation: pending.
+- G5 deployment health: PASS. Commit `b51aed9` deployed with binary SHA-256
+  `7fa231b7721fba8a9be456ee2626aacdc4b44612c0b9c1e0b7dabcb24be3ee30`.
+  The immediate post-restart probe raced service startup; systemd logs and a
+  condition-based retry confirmed `/health` returned HTTP 200.
+- G6 production validation: PASS. A real source article generated structured
+  analysis with five claims, passed all quality rules, published immutable
+  release `release-43a7dbb5062e51e383597c1452dfe5b187a2ce8b78690915f18cb1bc8819bcbb`,
+  appeared in the release cursor API, and accepted idempotent `used` feedback.
 
 ## Current State
 
-Stage: S6 deployment preparation.
+Stage: S8 shipped and documented.
 
-Status: producer contract implemented and reviewed; deployment and production
-validation pending.
+Status: shipped.
 
 ## Implementation Commits
 
