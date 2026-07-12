@@ -24,14 +24,27 @@ health decision logic remains outside KBase.
   into a reusable knowledge product.
 - G2 feasibility and risk: PASS with boundary. High-risk health material is
   evidence-only; KBase does not generate personal medical advice.
-- G3 tests: pending.
-- G4 review: pending; required because published evidence feeds a health system.
+- G3 tests: PASS. `go test ./...`, focused knowledge-loop tests, frontend
+  control-plane smoke tests, privacy smoke, and diff checks passed.
+- G4 review: PASS after remediation. Independent review initially blocked on
+  analysis/report binding, release manifest repair, feedback privacy and
+  idempotency, risk normalization, and embedded release evidence. Follow-up
+  review found no remaining Critical, High, or Medium findings.
 - G5 deployment health: pending.
 - G6 production validation: pending.
 
 ## Current State
 
-Stage: S4 task breakdown.
+Stage: S6 deployment preparation.
 
-Status: implementation approved; producer contract implementation starting.
+Status: producer contract implemented and reviewed; deployment and production
+validation pending.
 
+## Implementation Commits
+
+- `dd09fa9`: structured source analysis payloads.
+- `d015dd7`: deterministic source analysis quality reports.
+- `e4e90e6`: immutable content-addressed releases.
+- `6507984`: quality and release REST API.
+- `9802043`: consumer feedback loop.
+- `42f21e2`, `22ff879`, `398fd65`: independent-review remediation.
