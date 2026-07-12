@@ -157,6 +157,25 @@ func TestKBaseHTTPHandlerKnowledgeReleaseRejectsQuarantinedAnalysis(t *testing.T
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	path := "/api/knowledge/releases/" + url.PathEscape(release.ReleaseID) + "/feedback"
+	payload := `{"event_id":"event-1","consumer":"health-assistant","outcome":"used","claim_ids":["claim-1"],"reason":"cited"}`
+	resp := requestJSONKBase(handler, http.MethodPost, path, "secret-token", payload)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"feedback_id":"feedback-`) || !strings.Contains(resp.Body.String(), `"used":1`) {
+		t.Fatalf("feedback status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	sensitive := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-2","consumer":"health-assistant","outcome":"used","user_id":"private-user"}`)
+	if sensitive.Code != http.StatusBadRequest || !strings.Contains(sensitive.Body.String(), "invalid JSON body") {
+		t.Fatalf("sensitive feedback status=%d body=%s", sensitive.Code, sensitive.Body.String())
+	}
+	invalidClaim := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-3","consumer":"health-assistant","outcome":"conflict","claim_ids":["missing"]}`)
+	if invalidClaim.Code != http.StatusBadRequest || !strings.Contains(invalidClaim.Body.String(), "claim_id") {
+		t.Fatalf("invalid claim status=%d body=%s", invalidClaim.Code, invalidClaim.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)

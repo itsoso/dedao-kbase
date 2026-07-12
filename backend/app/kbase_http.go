@@ -157,6 +157,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleBookPublish(w, r, bookID)
 		return
 	}
+	if releaseID, ok := knowledgeReleaseFeedbackPathID(r.URL.Path); ok {
+		h.handleKnowledgeFeedback(w, r, releaseID)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
 		h.handleKnowledgeReleases(w, r)
 		return
@@ -230,6 +234,48 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func knowledgeReleaseFeedbackPathID(path string) (string, bool) {
+	const prefix = "/api/knowledge/releases/"
+	const suffix = "/feedback"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		return "", false
+	}
+	releaseID, err := url.PathUnescape(rawID)
+	return releaseID, err == nil && strings.TrimSpace(releaseID) != ""
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeFeedback(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var input KnowledgeFeedbackInput
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	feedback, counts, err := h.store.SaveKnowledgeFeedback(releaseID, input)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "release not found")
+			return
+		}
+		if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "invalid feedback") || strings.Contains(err.Error(), "claim_id") || strings.Contains(err.Error(), "too long") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"feedback": feedback, "status_counts": counts})
 }
 
 func bookAnalysisPathID(path string) (string, bool) {
