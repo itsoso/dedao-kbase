@@ -223,6 +223,9 @@ func GenerateBookAnalysisManifestWithClient(
 	if err := store.SaveAnalysisManifest(manifest); err != nil {
 		return nil, err
 	}
+	if _, err := EvaluateBookAnalysisQuality(store, manifest.BookID); err != nil {
+		return nil, fmt.Errorf("evaluate structured analysis quality: %w", err)
+	}
 	return &manifest, nil
 }
 

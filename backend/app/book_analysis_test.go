@@ -103,6 +103,10 @@ func TestGenerateBookAnalysisManifestParsesStructuredPayload(t *testing.T) {
 	if len(manifest.Payload.Risks) != 1 || len(manifest.Payload.Actions) != 1 {
 		t.Fatalf("payload = %#v", manifest.Payload)
 	}
+	report, err := store.LoadBookQualityReport("42")
+	if err != nil || report.Decision != BookQualityPass {
+		t.Fatalf("generated quality report = %#v, err=%v", report, err)
+	}
 }
 
 func TestGenerateBookAnalysisManifestRejectsMalformedPayload(t *testing.T) {
