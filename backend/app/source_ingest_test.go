@@ -71,6 +71,13 @@ func TestIngestSourceArticleIsIdempotentAndUpdatesKnowledge(t *testing.T) {
 	if len(pkg.Chunks) < 3 || len(pkg.Citations) != len(pkg.Chunks) {
 		t.Fatalf("chunks/citations = %d/%d, want bounded per-chunk citations", len(pkg.Chunks), len(pkg.Citations))
 	}
+	analysis, err := bookStore.LoadAnalysisManifest(receipt.TargetBookID)
+	if err != nil {
+		t.Fatalf("load pending analysis manifest: %v", err)
+	}
+	if analysis.Status != BookAnalysisPending || analysis.BookID != receipt.TargetBookID || analysis.ContentHash != receipt.ContentHash {
+		t.Fatalf("pending analysis manifest = %#v", analysis)
+	}
 	for index, chunk := range pkg.Chunks {
 		if len([]rune(chunk.Text)) > sourceArticleMaxChunkRunes {
 			t.Fatalf("chunk %d has %d runes", index, len([]rune(chunk.Text)))
@@ -110,6 +117,10 @@ func TestIngestSourceArticleIsIdempotentAndUpdatesKnowledge(t *testing.T) {
 	if unchangedPackage.Book.UpdatedAt != updatedAt {
 		t.Fatalf("skipped import changed updated_at: %q -> %q", updatedAt, unchangedPackage.Book.UpdatedAt)
 	}
+	unchangedAnalysis, err := bookStore.LoadAnalysisManifest(receipt.TargetBookID)
+	if err != nil || unchangedAnalysis.UpdatedAt != analysis.UpdatedAt {
+		t.Fatalf("skipped import changed analysis manifest: %#v, err=%v", unchangedAnalysis, err)
+	}
 	if _, err := syncStore.CompleteRun(unchangedRun.ID, "agent-a"); err != nil {
 		t.Fatalf("complete unchanged run: %v", err)
 	}
@@ -132,6 +143,13 @@ func TestIngestSourceArticleIsIdempotentAndUpdatesKnowledge(t *testing.T) {
 	}
 	if updatedPackage.Book.CreatedAt != createdAt || updatedPackage.Book.UpdatedAt == updatedAt {
 		t.Fatalf("update timestamps = created %q/%q updated %q/%q", createdAt, updatedPackage.Book.CreatedAt, updatedAt, updatedPackage.Book.UpdatedAt)
+	}
+	updatedAnalysis, err := bookStore.LoadAnalysisManifest(receipt.TargetBookID)
+	if err != nil {
+		t.Fatalf("load updated analysis manifest: %v", err)
+	}
+	if updatedAnalysis.Status != BookAnalysisPending || updatedAnalysis.ContentHash != updatedReceipt.ContentHash || updatedAnalysis.UpdatedAt == analysis.UpdatedAt {
+		t.Fatalf("updated analysis manifest = %#v", updatedAnalysis)
 	}
 }
 

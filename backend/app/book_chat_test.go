@@ -199,6 +199,7 @@ func TestTokenPlanChatClientUsesOpenAICompatibleRequest(t *testing.T) {
 
 type fakeBookKnowledgeLLMClient struct {
 	answer   string
+	err      error
 	cfg      BookTokenPlanConfig
 	messages []BookKnowledgeMessage
 }
@@ -206,5 +207,5 @@ type fakeBookKnowledgeLLMClient struct {
 func (c *fakeBookKnowledgeLLMClient) Chat(_ context.Context, cfg BookTokenPlanConfig, messages []BookKnowledgeMessage) (string, error) {
 	c.cfg = cfg
 	c.messages = messages
-	return c.answer, nil
+	return c.answer, c.err
 }

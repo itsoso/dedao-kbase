@@ -105,6 +105,9 @@ const knowledgeState = {
   analysisResponse: null,
   analysisLoading: "",
   analysisError: "",
+  analysisManifest: null,
+  analysisManifestLoading: "",
+  analysisManifestError: "",
   loading: "",
   message: "",
 };
@@ -435,6 +438,15 @@ function renderBookKnowledge() {
   const analysisStats = analysisResponse.context_stats
     ? `${analysisResponse.context_stats.chapters || 0} 章 · ${analysisResponse.context_stats.claims || 0} claims · ${analysisResponse.context_stats.chunks || 0} chunks`
     : "";
+  const analysisManifest = knowledgeState.analysisManifest || {};
+  const manifestStatus = analysisManifest.status || "pending";
+  const manifestStatusLabels = {
+    pending: "待分析",
+    running: "分析中",
+    ready: "已完成",
+    failed: "需重试",
+  };
+  const manifestActionLabel = analysisManifest.answer ? "重新生成" : "生成基线分析";
 
   renderShell(`
     <main class="knowledge-web">
@@ -485,6 +497,26 @@ function renderBookKnowledge() {
                 ${resultRows || "<p class=\"web-muted\">输入关键词后查看检索结果。</p>"}
               </section>
             </div>
+            <section class="knowledge-web__manifest" aria-label="知识基线分析">
+              <div class="knowledge-web__manifest-head">
+                <div>
+                  <p class="web-kicker">Analysis Manifest</p>
+                  <h3>知识基线分析</h3>
+                </div>
+                <span class="knowledge-web__manifest-status is-${escapeAttribute(manifestStatus)}">${escapeHTML(manifestStatusLabels[manifestStatus] || manifestStatus)}</span>
+              </div>
+              <div class="knowledge-web__manifest-meta">
+                <span>${escapeHTML(analysisManifest.model || knowledgeState.analysisModel)}</span>
+                ${analysisManifest.updated_at ? `<span>更新于 ${escapeHTML(analysisManifest.updated_at)}</span>` : ""}
+                ${analysisManifest.content_hash ? `<span>内容版本 ${escapeHTML(String(analysisManifest.content_hash).slice(0, 12))}</span>` : ""}
+              </div>
+              ${analysisManifest.error || knowledgeState.analysisManifestError ? `<p class="knowledge-web__manifest-error">${escapeHTML(analysisManifest.error || knowledgeState.analysisManifestError)}</p>` : ""}
+              ${analysisManifest.answer ? `<article class="knowledge-web__answer">${renderSimpleMarkdown(analysisManifest.answer)}</article>` : `<p class="web-muted">生成后会形成可追溯、可供其他系统读取的文章基线分析。</p>`}
+              <div class="knowledge-web__manifest-actions">
+                <span>${escapeHTML(knowledgeState.analysisManifestLoading || "摘要、结论、风险与行动建议")}</span>
+                <button id="knowledge-analysis-generate" class="button button-primary" type="button" ${knowledgeState.analysisManifestLoading ? "disabled" : ""}>${knowledgeState.analysisManifestLoading ? "生成中" : manifestActionLabel}</button>
+              </div>
+            </section>
             <section class="knowledge-web__analysis" aria-label="大模型分析">
               <div class="knowledge-web__analysis-head">
                 <div>
@@ -551,6 +583,9 @@ function resetKnowledgeAnalysis(prompt = "") {
   knowledgeState.analysisResponse = null;
   knowledgeState.analysisLoading = "";
   knowledgeState.analysisError = "";
+  knowledgeState.analysisManifest = null;
+  knowledgeState.analysisManifestLoading = "";
+  knowledgeState.analysisManifestError = "";
 }
 
 function renderReader(payload) {
@@ -3218,6 +3253,9 @@ function bindBookKnowledgeEvents() {
     knowledgeState.analysisPrompt = String(data.get("question") || "").trim();
     await runKnowledgeAnalysis();
   });
+  document.querySelector("#knowledge-analysis-generate")?.addEventListener("click", async () => {
+    await generateKnowledgeAnalysisManifest();
+  });
   for (const button of document.querySelectorAll("[data-book-index]")) {
     button.addEventListener("click", async () => {
       const index = Number(button.getAttribute("data-book-index") || "0");
@@ -3272,6 +3310,7 @@ async function selectKnowledgeBook(book, renderBefore = true) {
   }
   try {
     knowledgeState.package = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    await loadKnowledgeAnalysisManifest(book.book_id);
   } catch (error) {
     knowledgeState.message = error instanceof Error ? error.message : String(error);
   } finally {
@@ -3279,6 +3318,50 @@ async function selectKnowledgeBook(book, renderBefore = true) {
     if (renderBefore) {
       renderBookKnowledge();
     }
+  }
+}
+
+async function loadKnowledgeAnalysisManifest(bookID) {
+  knowledgeState.analysisManifestError = "";
+  try {
+    knowledgeState.analysisManifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("HTTP 404")) {
+      knowledgeState.analysisManifest = null;
+      return;
+    }
+    knowledgeState.analysisManifestError = message;
+  }
+}
+
+async function generateKnowledgeAnalysisManifest() {
+  const bookID = knowledgeState.selectedBook?.book_id || knowledgeState.package?.book?.book_id || "";
+  if (!bookID) {
+    knowledgeState.analysisManifestError = "请先选择文章。";
+    renderBookKnowledge();
+    return;
+  }
+  knowledgeState.analysisManifestLoading = "正在生成可追溯分析";
+  knowledgeState.analysisManifestError = "";
+  renderBookKnowledge();
+  try {
+    knowledgeState.analysisManifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: knowledgeState.analysisModel || "Qwen-3.7-Max",
+        max_context_chars: 16000,
+      }),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await loadKnowledgeAnalysisManifest(bookID);
+    if (!knowledgeState.analysisManifest?.error) {
+      knowledgeState.analysisManifestError = message;
+    }
+  } finally {
+    knowledgeState.analysisManifestLoading = "";
+    renderBookKnowledge();
   }
 }
 

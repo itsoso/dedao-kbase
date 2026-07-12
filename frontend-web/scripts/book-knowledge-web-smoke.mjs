@@ -24,6 +24,7 @@ for (const endpoint of [
   "/api/books",
   "/api/search?",
   "/api/book-chat",
+  "/analysis",
 ]) {
   assert.ok(js.includes(endpoint), `book knowledge web UI should call ${endpoint}`);
 }
@@ -61,5 +62,19 @@ assert.ok(js.includes('href="/ebook/${encodeURIComponent(currentBook.book_id)}"'
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");
 assert.ok(js.includes("Qwen-3.7-Max"), "book knowledge analysis should default to Qwen-3.7-Max");
+for (const marker of [
+  "analysisManifest",
+  "loadKnowledgeAnalysisManifest",
+  "generateKnowledgeAnalysisManifest",
+  "知识基线分析",
+  "生成基线分析",
+  "重新生成",
+  "pending",
+  "ready",
+  "failed",
+]) {
+  assert.ok(js.includes(marker), `book knowledge web UI should include durable analysis marker ${marker}`);
+}
+assert.ok(css.includes(".knowledge-web__manifest"), "styles.css should style the durable analysis manifest");
 
 console.log("book knowledge web smoke passed");

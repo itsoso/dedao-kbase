@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -26,7 +27,10 @@ type KBaseHTTPConfig struct {
 	SourceAgentToken        string
 	SourceAgentMaxBodyBytes int64
 	SourceAssets            *SourceAssetStore
+	AnalysisGenerator       BookAnalysisGenerator
 }
+
+type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
 
 type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
@@ -40,6 +44,7 @@ type kbaseHTTPHandler struct {
 	sourceAgentToken        string
 	sourceAgentMaxBodyBytes int64
 	sourceAssets            *SourceAssetStore
+	analysisGenerator       BookAnalysisGenerator
 }
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
@@ -66,6 +71,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if assets == nil {
 		assets, _ = NewSourceAssetStore(store.Root())
 	}
+	analysisGenerator := cfg.AnalysisGenerator
+	if analysisGenerator == nil {
+		analysisGenerator = GenerateBookAnalysisManifest
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
@@ -78,6 +87,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceAgentToken:        sourceAgentToken,
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 		sourceAssets:            assets,
+		analysisGenerator:       analysisGenerator,
 	}
 }
 
@@ -133,6 +143,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/wcplus/") && r.Method == http.MethodPost {
 		h.handleWCPlusPost(w, r)
+		return
+	}
+	if bookID, ok := bookAnalysisPathID(r.URL.Path); ok {
+		h.handleBookAnalysis(w, r, bookID)
 		return
 	}
 	if r.URL.Path == "/api/book-chat" {
@@ -203,6 +217,58 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleWCPlusGetJSON(w, r, "/api/gzh/export_csv")
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func bookAnalysisPathID(path string) (string, bool) {
+	const prefix = "/api/books/"
+	const suffix = "/analysis"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	bookID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if bookID == "" || strings.Contains(bookID, "/") {
+		return "", false
+	}
+	decoded, err := url.PathUnescape(bookID)
+	if err != nil || strings.TrimSpace(decoded) == "" {
+		return "", false
+	}
+	return decoded, true
+}
+
+func (h *kbaseHTTPHandler) handleBookAnalysis(w http.ResponseWriter, r *http.Request, bookID string) {
+	switch r.Method {
+	case http.MethodGet:
+		manifest, err := h.store.LoadAnalysisManifest(bookID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeHTTPError(w, http.StatusNotFound, "analysis manifest not found")
+				return
+			}
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, manifest)
+	case http.MethodPost:
+		var request BookAnalysisGenerateRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&request); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		request.BookID = bookID
+		manifest, err := h.analysisGenerator(r.Context(), h.store, request)
+		if err != nil {
+			if os.IsNotExist(err) || strings.Contains(err.Error(), "book not found") {
+				writeHTTPError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, manifest)
+	default:
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 

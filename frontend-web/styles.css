@@ -1691,6 +1691,65 @@ a.button {
   padding-top: 18px;
 }
 
+.knowledge-web__manifest {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+  border: 1px solid rgba(141, 132, 117, 0.18);
+  border-radius: 10px;
+  padding: 16px;
+  background: rgba(255, 253, 248, 0.8);
+}
+
+.knowledge-web__manifest-head,
+.knowledge-web__manifest-actions,
+.knowledge-web__manifest-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.knowledge-web__manifest-head,
+.knowledge-web__manifest-actions {
+  justify-content: space-between;
+}
+
+.knowledge-web__manifest-head h3 {
+  margin: 0;
+  color: #24231f;
+  font-size: 20px;
+}
+
+.knowledge-web__manifest-status {
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: rgba(141, 132, 117, 0.12);
+  color: #71675b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.knowledge-web__manifest-status.is-ready {
+  background: rgba(30, 126, 92, 0.1);
+  color: #1e7e5c;
+}
+
+.knowledge-web__manifest-status.is-failed,
+.knowledge-web__manifest-error {
+  color: #9d3f2e;
+}
+
+.knowledge-web__manifest-meta {
+  flex-wrap: wrap;
+  color: #8d8475;
+  font-size: 12px;
+}
+
+.knowledge-web__manifest-actions span {
+  color: #8d8475;
+  font-size: 13px;
+}
+
 .knowledge-web__analysis-head,
 .knowledge-web__analysis-actions {
   display: flex;

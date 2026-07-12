@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -56,6 +57,48 @@ func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
 	resp := requestJSONKBase(handler, http.MethodPost, "/api/book-chat", "secret-token", `{}`)
 	if resp.Code == http.StatusMethodNotAllowed {
 		t.Fatalf("book chat POST returned 405; HTTP API should expose TokenPlan analysis: %s", resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerBookAnalysisGet(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SaveAnalysisManifest(BookAnalysisManifest{
+		Version: "1", BookID: "source-article-1", ContentHash: "hash-1",
+		Status: BookAnalysisPending, UpdatedAt: "2026-07-12T12:00:00Z",
+	}); err != nil {
+		t.Fatalf("SaveAnalysisManifest returned error: %v", err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/books/source-article-1/analysis", "secret-token")
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"status":"pending"`) {
+		t.Fatalf("analysis GET status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	missing := requestKBase(handler, http.MethodGet, "/api/books/missing/analysis", "secret-token")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing analysis status=%d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerBookAnalysisPost(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	var got BookAnalysisGenerateRequest
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		AnalysisGenerator: func(_ context.Context, _ *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+			got = request
+			return &BookAnalysisManifest{Version: "1", BookID: request.BookID, Status: BookAnalysisReady, Model: request.Model, Answer: "analysis"}, nil
+		},
+	})
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/books/source-article-1/analysis", "secret-token", `{"model":"Qwen-3.7-Max","max_context_chars":8000}`)
+	if resp.Code != http.StatusOK || got.BookID != "source-article-1" || got.Model != "Qwen-3.7-Max" || got.MaxContextChars != 8000 {
+		t.Fatalf("analysis POST status=%d request=%#v body=%s", resp.Code, got, resp.Body.String())
+	}
+	invalid := requestJSONKBase(handler, http.MethodPost, "/api/books/source-article-1/analysis", "secret-token", `{`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid analysis POST status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
 }
 

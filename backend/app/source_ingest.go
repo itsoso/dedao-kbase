@@ -132,6 +132,17 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 			return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
 				fmt.Errorf("save source article package: %w", err))
 		}
+		if err := s.books.SaveAnalysisManifest(BookAnalysisManifest{
+			Version:     bookAnalysisVersion,
+			BookID:      targetBookID,
+			ContentHash: contentHash,
+			Status:      BookAnalysisPending,
+			CreatedAt:   acceptedAt,
+			UpdatedAt:   acceptedAt,
+		}); err != nil {
+			return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
+				fmt.Errorf("save source analysis manifest: %w", err))
+		}
 	}
 
 	receipt, err := s.sync.commitSourceIngest(runID, agentID, normalized, contentHash, targetBookID, outcome, acceptedAt)
