@@ -23,6 +23,7 @@ for (const marker of [
   "createSourceSubscription",
   "setSourceSubscriptionEnabled",
   "syncSourceSubscriptionNow",
+  "handleSourceSyncConflict",
   "retrySourceRun",
   "cancelSourceRun",
   "bindSourceControlEvents",
@@ -114,6 +115,8 @@ assert.ok(js.includes("sourceControlState.legacyDiagnosticsOpen"), "legacy diagn
 assert.ok(js.includes("sourceControlState.runFilter"), "run status filter should be authoritative state");
 assert.ok(js.includes("sourceControlState.runDetail"), "run detail drawer should reload from the API");
 assert.ok(js.includes("capability_health"), "agent rendering should prefer typed capability health");
+assert.ok(js.includes("error.status = response.status"), "apiFetch errors should preserve HTTP status for conflict-aware UI");
+assert.ok(js.includes("已有同步任务在进行中"), "sync conflicts should show a readable active-run message");
 assert.ok(js.includes("renderResult && shouldRender"), "silent polling should render only when authoritative data changes");
 assert.ok(js.includes("<span>启用</span>"), "subscription toggles should keep a stable accessible label");
 const drawerSource = js.slice(js.indexOf("function renderSourceRunDrawer"), js.indexOf("function selectedSourceSubscription"));

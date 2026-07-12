@@ -253,7 +253,10 @@ async function apiFetch(path, options = {}, didRefreshAuth = false) {
     const message = typeof payload === "object" && payload
       ? (payload.error || payload.message || JSON.stringify(payload))
       : (payload || `HTTP ${response.status}`);
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
   }
   return payload;
 }
@@ -925,6 +928,10 @@ function sourceRunIsActive(run) {
   return ["queued", "leased", "running"].includes(String(run?.status || ""));
 }
 
+function activeRunForSubscription(subscriptionID) {
+  return sourceControlState.runs.find((run) => run.subscription_id === subscriptionID && sourceRunIsActive(run)) || null;
+}
+
 function sourceRunMatchesFilter(run, filter) {
   if (filter === "all") {
     return true;
@@ -1287,12 +1294,33 @@ async function syncSourceSubscriptionNow(subscriptionID) {
     await loadSourceControlPlane({ silent: true });
     sourceControlState.message = "同步运行已进入队列。";
   } catch (error) {
+    if (error?.status === 409 && await handleSourceSyncConflict(subscriptionID)) {
+      return;
+    }
     sourceControlState.message = error instanceof Error ? error.message : String(error);
   } finally {
     sourceControlState.loading = "";
     renderWCPlusPage();
     scheduleSourceControlPoll();
   }
+}
+
+async function handleSourceSyncConflict(subscriptionID) {
+  await loadSourceControlPlane({ silent: true, renderResult: false });
+  const activeRun = activeRunForSubscription(subscriptionID);
+  if (!activeRun) {
+    sourceControlState.message = "已有同步任务在进行中，请稍后刷新运行历史。";
+    return true;
+  }
+  sourceControlState.selectedSubscriptionID = subscriptionID;
+  sourceControlState.selectedRunID = activeRun.id;
+  try {
+    await loadSourceRunDetail(activeRun.id);
+  } catch {
+    sourceControlState.runDetail = { run: activeRun, items: [] };
+  }
+  sourceControlState.message = `已有同步任务在进行中：${sourceRunStatusLabel(activeRun.status)}。`;
+  return true;
 }
 
 async function loadSourceRunDetail(runID) {
