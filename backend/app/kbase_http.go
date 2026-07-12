@@ -268,6 +268,10 @@ func (h *kbaseHTTPHandler) handleKnowledgeFeedback(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusNotFound, "release not found")
 			return
 		}
+		if strings.Contains(err.Error(), "idempotency payload conflict") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
 		if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "invalid feedback") || strings.Contains(err.Error(), "claim_id") || strings.Contains(err.Error(), "too long") {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return

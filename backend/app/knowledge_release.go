@@ -81,11 +81,21 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if quality.ContentHash != pkg.Book.ContentHash || analysis.ContentHash != pkg.Book.ContentHash {
 		return nil, fmt.Errorf("knowledge release content hash is stale")
 	}
+	analysisHash, err := bookAnalysisHash(*analysis)
+	if err != nil {
+		return nil, err
+	}
+	if quality.AnalysisHash == "" || quality.AnalysisHash != analysisHash {
+		return nil, fmt.Errorf("knowledge release analysis hash is stale")
+	}
 	releaseID, err := knowledgeReleaseID(pkg.Book, *analysis.Payload, *quality, pkg.Citations)
 	if err != nil {
 		return nil, err
 	}
 	if existing, loadErr := store.LoadKnowledgeRelease(releaseID); loadErr == nil {
+		if err := store.saveKnowledgeRelease(*existing); err != nil {
+			return nil, err
+		}
 		return existing, nil
 	} else if !errors.Is(loadErr, os.ErrNotExist) {
 		return nil, loadErr

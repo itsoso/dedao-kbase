@@ -1,6 +1,9 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,13 +30,14 @@ type BookQualityRule struct {
 }
 
 type BookQualityReport struct {
-	Version     string            `json:"version"`
-	BookID      string            `json:"book_id"`
-	ContentHash string            `json:"content_hash"`
-	Decision    string            `json:"decision"`
-	UsagePolicy string            `json:"usage_policy"`
-	Rules       []BookQualityRule `json:"rules"`
-	EvaluatedAt string            `json:"evaluated_at"`
+	Version      string            `json:"version"`
+	BookID       string            `json:"book_id"`
+	ContentHash  string            `json:"content_hash"`
+	AnalysisHash string            `json:"analysis_hash"`
+	Decision     string            `json:"decision"`
+	UsagePolicy  string            `json:"usage_policy"`
+	Rules        []BookQualityRule `json:"rules"`
+	EvaluatedAt  string            `json:"evaluated_at"`
 }
 
 func (s *BookKnowledgeStore) BookQualityReportPath(bookID string) string {
@@ -86,13 +90,18 @@ func EvaluateBookAnalysisQuality(store *BookKnowledgeStore, bookID string) (*Boo
 	if err != nil {
 		return nil, err
 	}
+	analysisHash, err := bookAnalysisHash(*manifest)
+	if err != nil {
+		return nil, err
+	}
 	report := BookQualityReport{
-		Version:     bookQualityVersion,
-		BookID:      pkg.Book.BookID,
-		ContentHash: pkg.Book.ContentHash,
-		Decision:    BookQualityPass,
-		UsagePolicy: BookUsageStandard,
-		EvaluatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Version:      bookQualityVersion,
+		BookID:       pkg.Book.BookID,
+		ContentHash:  pkg.Book.ContentHash,
+		AnalysisHash: analysisHash,
+		Decision:     BookQualityPass,
+		UsagePolicy:  BookUsageStandard,
+		EvaluatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	addRule := func(id string, passed, hard bool, message string) {
 		report.Rules = append(report.Rules, BookQualityRule{ID: id, Passed: passed, Hard: hard, Message: message})
@@ -156,6 +165,21 @@ func EvaluateBookAnalysisQuality(store *BookKnowledgeStore, bookID string) (*Boo
 		return nil, err
 	}
 	return &report, nil
+}
+
+func bookAnalysisHash(manifest BookAnalysisManifest) (string, error) {
+	seed := struct {
+		ContentHash   string               `json:"content_hash"`
+		Model         string               `json:"model"`
+		PromptVersion string               `json:"prompt_version"`
+		Payload       *BookAnalysisPayload `json:"payload"`
+	}{manifest.ContentHash, manifest.Model, manifest.PromptVersion, manifest.Payload}
+	payload, err := json.Marshal(seed)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func validBookRiskLevel(level string) bool {

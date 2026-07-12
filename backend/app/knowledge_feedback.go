@@ -16,14 +16,21 @@ const (
 	KnowledgeFeedbackStale    = "stale"
 	KnowledgeFeedbackConflict = "conflict"
 	KnowledgeFeedbackZeroHit  = "zero_hit"
+
+	KnowledgeFeedbackReasonUsedForAnswer       = "used_for_answer"
+	KnowledgeFeedbackReasonOutOfScope          = "out_of_scope"
+	KnowledgeFeedbackReasonStaleSource         = "stale_source"
+	KnowledgeFeedbackReasonConflictingEvidence = "conflicting_evidence"
+	KnowledgeFeedbackReasonNoRelevantClaim     = "no_relevant_claim"
+	KnowledgeFeedbackReasonPolicyBlocked       = "policy_blocked"
 )
 
 type KnowledgeFeedbackInput struct {
-	EventID  string   `json:"event_id"`
-	Consumer string   `json:"consumer"`
-	Outcome  string   `json:"outcome"`
-	ClaimIDs []string `json:"claim_ids,omitempty"`
-	Reason   string   `json:"reason,omitempty"`
+	EventID    string   `json:"event_id"`
+	Consumer   string   `json:"consumer"`
+	Outcome    string   `json:"outcome"`
+	ClaimIDs   []string `json:"claim_ids,omitempty"`
+	ReasonCode string   `json:"reason_code,omitempty"`
 }
 
 type KnowledgeFeedback struct {
@@ -33,7 +40,7 @@ type KnowledgeFeedback struct {
 	Consumer   string   `json:"consumer"`
 	Outcome    string   `json:"outcome"`
 	ClaimIDs   []string `json:"claim_ids,omitempty"`
-	Reason     string   `json:"reason,omitempty"`
+	ReasonCode string   `json:"reason_code,omitempty"`
 	CreatedAt  string   `json:"created_at"`
 }
 
@@ -49,7 +56,7 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 	input.EventID = strings.TrimSpace(input.EventID)
 	input.Consumer = strings.TrimSpace(input.Consumer)
 	input.Outcome = strings.ToLower(strings.TrimSpace(input.Outcome))
-	input.Reason = strings.TrimSpace(input.Reason)
+	input.ReasonCode = strings.ToLower(strings.TrimSpace(input.ReasonCode))
 	if input.EventID == "" || input.Consumer == "" {
 		return nil, nil, fmt.Errorf("event_id and consumer are required")
 	}
@@ -59,8 +66,8 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 	if !validKnowledgeFeedbackOutcome(input.Outcome) {
 		return nil, nil, fmt.Errorf("invalid feedback outcome %q", input.Outcome)
 	}
-	if len([]rune(input.Reason)) > 1000 {
-		return nil, nil, fmt.Errorf("feedback reason is too long")
+	if input.ReasonCode != "" && !validKnowledgeFeedbackReason(input.ReasonCode) {
+		return nil, nil, fmt.Errorf("invalid feedback reason_code %q", input.ReasonCode)
 	}
 	validClaims := make(map[string]struct{})
 	for _, claim := range release.Analysis.Claims {
@@ -81,6 +88,9 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 	feedbackID := knowledgeFeedbackID(release.ReleaseID, input.Consumer, input.EventID)
 	for index := range items {
 		if items[index].FeedbackID == feedbackID {
+			if items[index].Outcome != input.Outcome || items[index].ReasonCode != input.ReasonCode || !equalFeedbackClaimIDs(items[index].ClaimIDs, input.ClaimIDs) {
+				return nil, nil, fmt.Errorf("feedback idempotency payload conflict")
+			}
 			counts := knowledgeFeedbackCounts(items)
 			return &items[index], counts, nil
 		}
@@ -92,7 +102,7 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 		Consumer:   input.Consumer,
 		Outcome:    input.Outcome,
 		ClaimIDs:   append([]string(nil), input.ClaimIDs...),
-		Reason:     input.Reason,
+		ReasonCode: input.ReasonCode,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	items = append(items, feedback)
@@ -107,6 +117,28 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 		return nil, nil, err
 	}
 	return &feedback, knowledgeFeedbackCounts(items), nil
+}
+
+func validKnowledgeFeedbackReason(reason string) bool {
+	switch reason {
+	case KnowledgeFeedbackReasonUsedForAnswer, KnowledgeFeedbackReasonOutOfScope, KnowledgeFeedbackReasonStaleSource,
+		KnowledgeFeedbackReasonConflictingEvidence, KnowledgeFeedbackReasonNoRelevantClaim, KnowledgeFeedbackReasonPolicyBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+func equalFeedbackClaimIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *BookKnowledgeStore) ListKnowledgeFeedback(releaseID string) ([]KnowledgeFeedback, error) {

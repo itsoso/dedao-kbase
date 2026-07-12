@@ -9,7 +9,7 @@ func TestKnowledgeFeedbackIsValidatedAndIdempotent(t *testing.T) {
 	store, release := feedbackTestStore(t)
 	input := KnowledgeFeedbackInput{
 		EventID: "event-1", Consumer: "health-assistant", Outcome: KnowledgeFeedbackUsed,
-		ClaimIDs: []string{"claim-1"}, Reason: "evidence cited in a bounded answer",
+		ClaimIDs: []string{"claim-1"}, ReasonCode: KnowledgeFeedbackReasonUsedForAnswer,
 	}
 	first, counts, err := store.SaveKnowledgeFeedback(release.ReleaseID, input)
 	if err != nil {
@@ -28,6 +28,29 @@ func TestKnowledgeFeedbackIsValidatedAndIdempotent(t *testing.T) {
 	items, err := store.ListKnowledgeFeedback(release.ReleaseID)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("feedback items = %#v, err=%v", items, err)
+	}
+}
+
+func TestKnowledgeFeedbackRejectsIdempotencyPayloadMismatch(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	input := KnowledgeFeedbackInput{EventID: "event-1", Consumer: "health-assistant", Outcome: KnowledgeFeedbackUsed, ClaimIDs: []string{"claim-1"}}
+	if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, input); err != nil {
+		t.Fatal(err)
+	}
+	input.Outcome = KnowledgeFeedbackRejected
+	_, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, input)
+	if err == nil || !strings.Contains(err.Error(), "idempotency") {
+		t.Fatalf("mismatched replay error = %v", err)
+	}
+}
+
+func TestKnowledgeFeedbackRejectsUnknownReasonCode(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	_, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+		EventID: "event-reason", Consumer: "consumer", Outcome: KnowledgeFeedbackRejected, ReasonCode: "free-form private detail",
+	})
+	if err == nil || !strings.Contains(err.Error(), "reason_code") {
+		t.Fatalf("reason code error = %v", err)
 	}
 }
 

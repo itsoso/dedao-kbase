@@ -161,7 +161,7 @@ func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
 	store, release := feedbackTestStore(t)
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
 	path := "/api/knowledge/releases/" + url.PathEscape(release.ReleaseID) + "/feedback"
-	payload := `{"event_id":"event-1","consumer":"health-assistant","outcome":"used","claim_ids":["claim-1"],"reason":"cited"}`
+	payload := `{"event_id":"event-1","consumer":"health-assistant","outcome":"used","claim_ids":["claim-1"],"reason_code":"used_for_answer"}`
 	resp := requestJSONKBase(handler, http.MethodPost, path, "secret-token", payload)
 	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"feedback_id":"feedback-`) || !strings.Contains(resp.Body.String(), `"used":1`) {
 		t.Fatalf("feedback status=%d body=%s", resp.Code, resp.Body.String())
@@ -169,6 +169,14 @@ func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
 	sensitive := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-2","consumer":"health-assistant","outcome":"used","user_id":"private-user"}`)
 	if sensitive.Code != http.StatusBadRequest || !strings.Contains(sensitive.Body.String(), "invalid JSON body") {
 		t.Fatalf("sensitive feedback status=%d body=%s", sensitive.Code, sensitive.Body.String())
+	}
+	freeText := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-2b","consumer":"health-assistant","outcome":"used","reason":"private free text"}`)
+	if freeText.Code != http.StatusBadRequest || !strings.Contains(freeText.Body.String(), "invalid JSON body") {
+		t.Fatalf("free-text feedback status=%d body=%s", freeText.Code, freeText.Body.String())
+	}
+	mismatch := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-1","consumer":"health-assistant","outcome":"rejected","claim_ids":["claim-1"]}`)
+	if mismatch.Code != http.StatusConflict || !strings.Contains(mismatch.Body.String(), "idempotency") {
+		t.Fatalf("mismatched feedback status=%d body=%s", mismatch.Code, mismatch.Body.String())
 	}
 	invalidClaim := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-3","consumer":"health-assistant","outcome":"conflict","claim_ids":["missing"]}`)
 	if invalidClaim.Code != http.StatusBadRequest || !strings.Contains(invalidClaim.Body.String(), "claim_id") {
