@@ -64,6 +64,41 @@ func TestKnowledgeReleaseRejectsAnalysisChangedAfterQualityPass(t *testing.T) {
 	}
 }
 
+func TestKnowledgeReleaseRejectsSourcesChangedAfterQualityPass(t *testing.T) {
+	store := qualityTestStore(t)
+	manifest, _ := store.LoadAnalysisManifest("42")
+	manifest.Payload.Claims[0].CitationIDs = []string{"synthetic-source"}
+	manifest.Sources = append(manifest.Sources, BookKnowledgeChatSource{Kind: "chunk", ID: "synthetic-source"})
+	if err := store.SaveAnalysisManifest(*manifest); err != nil {
+		t.Fatal(err)
+	}
+	if report, err := EvaluateBookAnalysisQuality(store, "42"); err != nil || report.Decision != BookQualityPass {
+		t.Fatalf("quality report = %#v, err=%v", report, err)
+	}
+	manifest, _ = store.LoadAnalysisManifest("42")
+	manifest.Sources = manifest.Sources[:len(manifest.Sources)-1]
+	if err := store.SaveAnalysisManifest(*manifest); err != nil {
+		t.Fatal(err)
+	}
+	_, err := PublishKnowledgeRelease(store, "42")
+	if err == nil || !strings.Contains(err.Error(), "analysis hash") {
+		t.Fatalf("publish changed sources error = %v", err)
+	}
+}
+
+func TestKnowledgeReleaseUppercaseHighRiskIsEvidenceOnly(t *testing.T) {
+	store := qualityTestStore(t)
+	manifest, _ := store.LoadAnalysisManifest("42")
+	manifest.Payload.Claims[0].RiskLevel = "HIGH"
+	if err := store.SaveAnalysisManifest(*manifest); err != nil {
+		t.Fatal(err)
+	}
+	report, err := EvaluateBookAnalysisQuality(store, "42")
+	if err != nil || report.Decision != BookQualityPass || report.UsagePolicy != BookUsageEvidenceOnly {
+		t.Fatalf("quality report = %#v, err=%v", report, err)
+	}
+}
+
 func TestKnowledgeReleaseRepairsMissingManifestEntry(t *testing.T) {
 	store := qualityTestStore(t)
 	if _, err := EvaluateBookAnalysisQuality(store, "42"); err != nil {

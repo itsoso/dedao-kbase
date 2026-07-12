@@ -152,7 +152,7 @@ func EvaluateBookAnalysisQuality(store *BookKnowledgeStore, bookID string) (*Boo
 			if strings.TrimSpace(claim.ID) == "" || strings.TrimSpace(claim.Statement) == "" || claim.Confidence < 0 || claim.Confidence > 1 || !validBookRiskLevel(claim.RiskLevel) {
 				claimMetadataValid = false
 			}
-			if claim.RiskLevel == "high" {
+			if strings.EqualFold(strings.TrimSpace(claim.RiskLevel), "high") {
 				report.UsagePolicy = BookUsageEvidenceOnly
 			}
 		}
@@ -169,11 +169,12 @@ func EvaluateBookAnalysisQuality(store *BookKnowledgeStore, bookID string) (*Boo
 
 func bookAnalysisHash(manifest BookAnalysisManifest) (string, error) {
 	seed := struct {
-		ContentHash   string               `json:"content_hash"`
-		Model         string               `json:"model"`
-		PromptVersion string               `json:"prompt_version"`
-		Payload       *BookAnalysisPayload `json:"payload"`
-	}{manifest.ContentHash, manifest.Model, manifest.PromptVersion, manifest.Payload}
+		ContentHash   string                    `json:"content_hash"`
+		Model         string                    `json:"model"`
+		PromptVersion string                    `json:"prompt_version"`
+		Payload       *BookAnalysisPayload      `json:"payload"`
+		Sources       []BookKnowledgeChatSource `json:"sources"`
+	}{manifest.ContentHash, manifest.Model, manifest.PromptVersion, manifest.Payload, manifest.Sources}
 	payload, err := json.Marshal(seed)
 	if err != nil {
 		return "", err

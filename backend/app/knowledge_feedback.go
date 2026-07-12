@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+var knowledgeFeedbackOpaqueIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
 
 const (
 	KnowledgeFeedbackUsed     = "used"
@@ -62,6 +65,9 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 	}
 	if len(input.EventID) > 200 || len(input.Consumer) > 100 {
 		return nil, nil, fmt.Errorf("event_id or consumer is too long")
+	}
+	if !knowledgeFeedbackOpaqueIDPattern.MatchString(input.EventID) || !knowledgeFeedbackOpaqueIDPattern.MatchString(input.Consumer) {
+		return nil, nil, fmt.Errorf("event_id and consumer must be opaque identifiers")
 	}
 	if !validKnowledgeFeedbackOutcome(input.Outcome) {
 		return nil, nil, fmt.Errorf("invalid feedback outcome %q", input.Outcome)

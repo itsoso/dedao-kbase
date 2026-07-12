@@ -54,6 +54,19 @@ func TestKnowledgeFeedbackRejectsUnknownReasonCode(t *testing.T) {
 	}
 }
 
+func TestKnowledgeFeedbackRejectsNonOpaqueIdentifiers(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	for _, input := range []KnowledgeFeedbackInput{
+		{EventID: "user@example.com", Consumer: "health-assistant", Outcome: KnowledgeFeedbackUsed},
+		{EventID: "event-1", Consumer: "patient name", Outcome: KnowledgeFeedbackUsed},
+		{EventID: "Bearer secret-token", Consumer: "health-assistant", Outcome: KnowledgeFeedbackUsed},
+	} {
+		if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, input); err == nil || !strings.Contains(err.Error(), "opaque identifier") {
+			t.Fatalf("identifier input %#v error = %v", input, err)
+		}
+	}
+}
+
 func TestKnowledgeFeedbackRejectsInvalidOutcomeAndClaim(t *testing.T) {
 	store, release := feedbackTestStore(t)
 	_, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
