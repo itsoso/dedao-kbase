@@ -16,17 +16,18 @@ import (
 const knowledgeReleaseVersion = "1"
 
 type KnowledgeRelease struct {
-	Version     string                  `json:"version"`
-	ReleaseID   string                  `json:"release_id"`
-	BookID      string                  `json:"book_id"`
-	ContentHash string                  `json:"content_hash"`
-	Supersedes  string                  `json:"supersedes,omitempty"`
-	UsagePolicy string                  `json:"usage_policy"`
-	Book        BookKnowledgeBook       `json:"book"`
-	Analysis    *BookAnalysisPayload    `json:"analysis"`
-	Quality     BookQualityReport       `json:"quality"`
-	Citations   []BookKnowledgeCitation `json:"citations"`
-	CreatedAt   string                  `json:"created_at"`
+	Version     string                    `json:"version"`
+	ReleaseID   string                    `json:"release_id"`
+	BookID      string                    `json:"book_id"`
+	ContentHash string                    `json:"content_hash"`
+	Supersedes  string                    `json:"supersedes,omitempty"`
+	UsagePolicy string                    `json:"usage_policy"`
+	Book        BookKnowledgeBook         `json:"book"`
+	Analysis    *BookAnalysisPayload      `json:"analysis"`
+	Quality     BookQualityReport         `json:"quality"`
+	Sources     []BookKnowledgeChatSource `json:"sources"`
+	Citations   []BookKnowledgeCitation   `json:"citations"`
+	CreatedAt   string                    `json:"created_at"`
 }
 
 type KnowledgeReleaseRecord struct {
@@ -88,7 +89,7 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if quality.AnalysisHash == "" || quality.AnalysisHash != analysisHash {
 		return nil, fmt.Errorf("knowledge release analysis hash is stale")
 	}
-	releaseID, err := knowledgeReleaseID(pkg.Book, *analysis.Payload, *quality, pkg.Citations)
+	releaseID, err := knowledgeReleaseID(pkg.Book, *analysis.Payload, *quality, analysis.Sources, pkg.Citations)
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +110,7 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 		Book:        pkg.Book,
 		Analysis:    analysis.Payload,
 		Quality:     *quality,
+		Sources:     append([]BookKnowledgeChatSource(nil), analysis.Sources...),
 		Citations:   append([]BookKnowledgeCitation(nil), pkg.Citations...),
 		CreatedAt:   time.Now().UTC().Format(time.RFC3339Nano),
 	}
@@ -129,16 +131,18 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	return &release, nil
 }
 
-func knowledgeReleaseID(book BookKnowledgeBook, analysis BookAnalysisPayload, quality BookQualityReport, citations []BookKnowledgeCitation) (string, error) {
+func knowledgeReleaseID(book BookKnowledgeBook, analysis BookAnalysisPayload, quality BookQualityReport, sources []BookKnowledgeChatSource, citations []BookKnowledgeCitation) (string, error) {
 	seed := struct {
-		Version     string                  `json:"version"`
-		BookID      string                  `json:"book_id"`
-		ContentHash string                  `json:"content_hash"`
-		Analysis    BookAnalysisPayload     `json:"analysis"`
-		Decision    string                  `json:"decision"`
-		UsagePolicy string                  `json:"usage_policy"`
-		Citations   []BookKnowledgeCitation `json:"citations"`
-	}{knowledgeReleaseVersion, book.BookID, book.ContentHash, analysis, quality.Decision, quality.UsagePolicy, citations}
+		Version      string                    `json:"version"`
+		BookID       string                    `json:"book_id"`
+		ContentHash  string                    `json:"content_hash"`
+		Analysis     BookAnalysisPayload       `json:"analysis"`
+		Decision     string                    `json:"decision"`
+		UsagePolicy  string                    `json:"usage_policy"`
+		AnalysisHash string                    `json:"analysis_hash"`
+		Sources      []BookKnowledgeChatSource `json:"sources"`
+		Citations    []BookKnowledgeCitation   `json:"citations"`
+	}{knowledgeReleaseVersion, book.BookID, book.ContentHash, analysis, quality.Decision, quality.UsagePolicy, quality.AnalysisHash, sources, citations}
 	payload, err := json.Marshal(seed)
 	if err != nil {
 		return "", err
