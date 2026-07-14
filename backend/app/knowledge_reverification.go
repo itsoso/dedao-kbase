@@ -469,6 +469,52 @@ func (s *BookKnowledgeStore) RequeueKnowledgeReverification(taskID string, now t
 	return task, nil
 }
 
+func (s *BookKnowledgeStore) RetryKnowledgeReverification(releaseID string, now time.Time) (*KnowledgeReverificationTask, error) {
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseQueueLock()
+
+	assessment, err := s.AssessKnowledgeFeedback(releaseID)
+	if err != nil {
+		return nil, err
+	}
+	if !assessment.ReverifyRequired || strings.TrimSpace(assessment.ReverificationFingerprint) == "" {
+		return nil, fmt.Errorf("reverification retry requires invalidating feedback")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tasks, err := s.listKnowledgeReverificationsUnlocked(releaseID)
+	if err != nil {
+		return nil, err
+	}
+	var task *KnowledgeReverificationTask
+	for index := len(tasks) - 1; index >= 0; index-- {
+		if tasks[index].AssessmentFingerprint == assessment.ReverificationFingerprint {
+			copy := tasks[index]
+			task = &copy
+			break
+		}
+	}
+	if task == nil {
+		if len(tasks) > 0 {
+			return nil, fmt.Errorf("reverification retry task was superseded by newer feedback")
+		}
+		return nil, fmt.Errorf("reverification retry task not found")
+	}
+	if task.Status != KnowledgeReverificationFailed {
+		return nil, fmt.Errorf("reverification retry requires failed task, got %q", task.Status)
+	}
+	task.Attempts = 0
+	requeueKnowledgeReverificationTask(task, now.UTC(), 0)
+	if err := s.saveKnowledgeReverificationUnlocked(*task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
 func (s *BookKnowledgeStore) ValidateKnowledgeReverificationPublication(bookID, analysisHash string) (*KnowledgeReverificationTask, error) {
 	manifest, err := s.loadKnowledgeReleaseManifest()
 	if err != nil {

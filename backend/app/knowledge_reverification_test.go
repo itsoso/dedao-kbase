@@ -439,6 +439,89 @@ func TestKnowledgeReverificationRequeueUsesBackoffAndAttemptCeiling(t *testing.T
 	}
 }
 
+func TestKnowledgeReverificationRetryResetsCurrentFailedTask(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	task, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextKnowledgeReverification(now, 15*time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claimed = %#v, ok=%v, err=%v", claimed, ok, err)
+	}
+	failed, err := store.FailKnowledgeReverification(task.TaskID, claimed.AssessmentAt, claimed.AssessmentFingerprint, KnowledgeReverificationErrorAnalysisFailed, now.Add(time.Minute))
+	if err != nil || failed.Status != KnowledgeReverificationFailed {
+		t.Fatalf("failed task = %#v, err=%v", failed, err)
+	}
+
+	retried, err := store.RetryKnowledgeReverification(release.ReleaseID, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != KnowledgeReverificationQueued || retried.Attempts != 0 || retried.AvailableAt != now.Add(2*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatalf("retried task = %#v", retried)
+	}
+	if retried.ErrorCode != "" || retried.StartedAt != "" || retried.CompletedAt != "" {
+		t.Fatalf("retry retained terminal state = %#v", retried)
+	}
+}
+
+func TestKnowledgeReverificationRetryRejectsNonFailedTask(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RetryKnowledgeReverification(release.ReleaseID, now.Add(time.Minute)); err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("queued retry error = %v", err)
+	}
+	tasks, err := store.ListKnowledgeReverifications(release.ReleaseID)
+	if err != nil || len(tasks) != 1 || tasks[0].Status != KnowledgeReverificationQueued || tasks[0].Attempts != 0 {
+		t.Fatalf("queued task changed = %#v, err=%v", tasks, err)
+	}
+	claimed, ok, err := store.ClaimNextKnowledgeReverification(now, 15*time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claimed = %#v, ok=%v, err=%v", claimed, ok, err)
+	}
+	ready, err := store.CompleteKnowledgeReverification(claimed.TaskID, claimed.AssessmentAt, claimed.AssessmentFingerprint, KnowledgeReverificationCandidate{
+		AnalysisHash: "analysis-ready", QualityDecision: BookQualityPass,
+	}, now.Add(time.Minute))
+	if err != nil || ready.Status != KnowledgeReverificationCandidateReady {
+		t.Fatalf("ready task = %#v, err=%v", ready, err)
+	}
+	if _, err := store.RetryKnowledgeReverification(release.ReleaseID, now.Add(2*time.Minute)); err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("candidate-ready retry error = %v", err)
+	}
+}
+
+func TestKnowledgeReverificationRetryRejectsSupersededFeedback(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	task, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextKnowledgeReverification(now, 15*time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claimed = %#v, ok=%v, err=%v", claimed, ok, err)
+	}
+	if _, err := store.FailKnowledgeReverification(task.TaskID, claimed.AssessmentAt, claimed.AssessmentFingerprint, KnowledgeReverificationErrorAnalysisFailed, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+		EventID: "event-conflict", Consumer: "consumer-a", Outcome: KnowledgeFeedbackConflict,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RetryKnowledgeReverification(release.ReleaseID, now.Add(2*time.Minute)); err == nil || !strings.Contains(err.Error(), "superseded") {
+		t.Fatalf("superseded retry error = %v", err)
+	}
+}
+
 func TestKnowledgeFeedbackAndPublicationUseSameCrossProcessLock(t *testing.T) {
 	store, release := feedbackTestStore(t)
 	unlock, err := store.acquireKnowledgeReverificationFileLock()
