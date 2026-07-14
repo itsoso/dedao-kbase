@@ -182,6 +182,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgeReverification(w, r, releaseID)
 		return
 	}
+	if releaseID, ok := knowledgeReleaseReverificationRetryPathID(r.URL.Path); ok {
+		h.handleKnowledgeReverificationRetry(w, r, releaseID)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
 		h.handleKnowledgeReleases(w, r)
 		return
@@ -263,6 +267,10 @@ func knowledgeReleaseFeedbackPathID(path string) (string, bool) {
 
 func knowledgeReleaseReverificationPathID(path string) (string, bool) {
 	return knowledgeReleaseNestedPathID(path, "reverification")
+}
+
+func knowledgeReleaseReverificationRetryPathID(path string) (string, bool) {
+	return knowledgeReleaseNestedPathID(path, "reverification/retry")
 }
 
 func knowledgeReleaseNestedPathID(path, resource string) (string, bool) {
@@ -362,6 +370,27 @@ func (h *kbaseHTTPHandler) handleKnowledgeReverification(w http.ResponseWriter, 
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"release_id": releaseID, "tasks": tasks})
 }
 
+func (h *kbaseHTTPHandler) handleKnowledgeReverificationRetry(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	task, err := h.store.RetryKnowledgeReverification(releaseID, h.reverificationNow())
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "release not found")
+			return
+		}
+		if strings.Contains(err.Error(), "requires") || strings.Contains(err.Error(), "superseded") || strings.Contains(err.Error(), "task not found") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, task)
+}
+
 func bookAnalysisPathID(path string) (string, bool) {
 	return bookNestedPathID(path, "analysis")
 }
@@ -459,7 +488,7 @@ func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *htt
 		}
 		limit = parsed
 	}
-	releases, err := h.store.ListKnowledgeReleases(r.URL.Query().Get("after"), limit)
+	releases, err := h.store.ListKnowledgeReleasesForBook(r.URL.Query().Get("after"), limit, r.URL.Query().Get("book_id"))
 	if err != nil {
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return

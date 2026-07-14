@@ -225,6 +225,64 @@ func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeReverificationRetry(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	task, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextKnowledgeReverification(now, 15*time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("claimed = %#v, ok=%v, err=%v", claimed, ok, err)
+	}
+	if _, err := store.FailKnowledgeReverification(task.TaskID, claimed.AssessmentAt, claimed.AssessmentFingerprint, KnowledgeReverificationErrorAnalysisFailed, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "secret-token", ReverificationNow: func() time.Time { return now.Add(2 * time.Minute) },
+	})
+	path := "/api/knowledge/releases/" + url.PathEscape(release.ReleaseID) + "/reverification/retry"
+	unauthorized := requestJSONKBase(handler, http.MethodPost, path, "", `{}`)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized retry status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodGet, path, "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("retry GET status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+	retried := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{}`)
+	if retried.Code != http.StatusOK || !strings.Contains(retried.Body.String(), `"status":"queued"`) || !strings.Contains(retried.Body.String(), `"attempts":0`) {
+		t.Fatalf("retry status=%d body=%s", retried.Code, retried.Body.String())
+	}
+	conflict := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{}`)
+	if conflict.Code != http.StatusConflict || !strings.Contains(conflict.Body.String(), "failed") {
+		t.Fatalf("retry conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+	missing := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/releases/missing/reverification/retry", "secret-token", `{}`)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing retry status=%d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerKnowledgeReleasesFiltersBookBeforeLimit(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	for _, release := range []KnowledgeRelease{
+		{Version: knowledgeReleaseVersion, ReleaseID: "release-other", BookID: "other", CreatedAt: "2026-07-14T12:00:00Z"},
+		{Version: knowledgeReleaseVersion, ReleaseID: "release-target", BookID: "target", CreatedAt: "2026-07-14T12:01:00Z"},
+	} {
+		if err := store.saveKnowledgeRelease(release); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	response := requestKBase(handler, http.MethodGet, "/api/knowledge/releases?book_id=target&limit=1", "secret-token")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"release_id":"release-target"`) || strings.Contains(response.Body.String(), `"release-other"`) {
+		t.Fatalf("book-filtered releases status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)

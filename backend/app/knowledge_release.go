@@ -228,6 +228,10 @@ func (s *BookKnowledgeStore) LoadKnowledgeRelease(releaseID string) (*KnowledgeR
 }
 
 func (s *BookKnowledgeStore) ListKnowledgeReleases(after string, limit int) ([]KnowledgeReleaseRecord, error) {
+	return s.ListKnowledgeReleasesForBook(after, limit, "")
+}
+
+func (s *BookKnowledgeStore) ListKnowledgeReleasesForBook(after string, limit int, bookID string) ([]KnowledgeReleaseRecord, error) {
 	manifest, err := s.loadKnowledgeReleaseManifest()
 	if err != nil {
 		return nil, err
@@ -235,10 +239,20 @@ func (s *BookKnowledgeStore) ListKnowledgeReleases(after string, limit int) ([]K
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	releases := manifest.Releases
+	if bookID = strings.TrimSpace(bookID); bookID != "" {
+		filtered := make([]KnowledgeReleaseRecord, 0)
+		for _, record := range releases {
+			if record.BookID == bookID {
+				filtered = append(filtered, record)
+			}
+		}
+		releases = filtered
+	}
 	start := 0
 	if after = strings.TrimSpace(after); after != "" {
-		start = len(manifest.Releases)
-		for index, record := range manifest.Releases {
+		start = len(releases)
+		for index, record := range releases {
 			if record.ReleaseID == after {
 				start = index + 1
 				break
@@ -246,10 +260,10 @@ func (s *BookKnowledgeStore) ListKnowledgeReleases(after string, limit int) ([]K
 		}
 	}
 	end := start + limit
-	if end > len(manifest.Releases) {
-		end = len(manifest.Releases)
+	if end > len(releases) {
+		end = len(releases)
 	}
-	return append([]KnowledgeReleaseRecord{}, manifest.Releases[start:end]...), nil
+	return append([]KnowledgeReleaseRecord{}, releases[start:end]...), nil
 }
 
 func (s *BookKnowledgeStore) loadKnowledgeReleaseManifest() (*KnowledgeReleaseManifest, error) {
