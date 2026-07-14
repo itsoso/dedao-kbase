@@ -57,6 +57,7 @@ type KnowledgeFeedbackAssessment struct {
 	TriggerOutcomes  []string       `json:"trigger_outcomes"`
 	StatusCounts     map[string]int `json:"status_counts"`
 	LatestFeedbackAt string         `json:"latest_feedback_at,omitempty"`
+	ReverificationAt string         `json:"reverification_at,omitempty"`
 }
 
 func (s *BookKnowledgeStore) KnowledgeFeedbackPath(releaseID string) string {
@@ -195,9 +196,13 @@ func (s *BookKnowledgeStore) AssessKnowledgeFeedback(releaseID string) (*Knowled
 		disposition = KnowledgeFeedbackReverifyRequired
 	}
 	latestFeedbackAt := ""
+	reverificationAt := ""
 	for _, item := range items {
 		if item.CreatedAt > latestFeedbackAt {
 			latestFeedbackAt = item.CreatedAt
+		}
+		if invalidatesKnowledgeRelease(item.Outcome) && item.CreatedAt > reverificationAt {
+			reverificationAt = item.CreatedAt
 		}
 	}
 	return &KnowledgeFeedbackAssessment{
@@ -207,6 +212,7 @@ func (s *BookKnowledgeStore) AssessKnowledgeFeedback(releaseID string) (*Knowled
 		TriggerOutcomes:  triggers,
 		StatusCounts:     counts,
 		LatestFeedbackAt: latestFeedbackAt,
+		ReverificationAt: reverificationAt,
 	}, nil
 }
 
@@ -218,6 +224,15 @@ func knowledgeFeedbackID(releaseID, consumer, eventID string) string {
 func validKnowledgeFeedbackOutcome(outcome string) bool {
 	switch outcome {
 	case KnowledgeFeedbackUsed, KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict, KnowledgeFeedbackZeroHit:
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidatesKnowledgeRelease(outcome string) bool {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict:
 		return true
 	default:
 		return false

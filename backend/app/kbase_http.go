@@ -362,15 +362,6 @@ func (h *kbaseHTTPHandler) handleKnowledgeReverification(w http.ResponseWriter, 
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"release_id": releaseID, "tasks": tasks})
 }
 
-func invalidatesKnowledgeRelease(outcome string) bool {
-	switch strings.ToLower(strings.TrimSpace(outcome)) {
-	case KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict:
-		return true
-	default:
-		return false
-	}
-}
-
 func bookAnalysisPathID(path string) (string, bool) {
 	return bookNestedPathID(path, "analysis")
 }

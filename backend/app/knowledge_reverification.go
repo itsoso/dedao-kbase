@@ -233,7 +233,8 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 	now time.Time,
 	cooldown time.Duration,
 ) (*KnowledgeReverificationTask, error) {
-	if !assessment.ReverifyRequired || strings.TrimSpace(assessment.LatestFeedbackAt) == "" {
+	assessmentAt := strings.TrimSpace(assessment.ReverificationAt)
+	if !assessment.ReverifyRequired || assessmentAt == "" {
 		return nil, fmt.Errorf("reverification requires an invalidating feedback assessment")
 	}
 	release, err := s.LoadKnowledgeRelease(releaseID)
@@ -258,7 +259,7 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 			continue
 		}
 		task := tasks[index]
-		task.AssessmentAt = assessment.LatestFeedbackAt
+		task.AssessmentAt = assessmentAt
 		task.TriggerOutcomes = append([]string(nil), assessment.TriggerOutcomes...)
 		task.UpdatedAt = now.Format(time.RFC3339Nano)
 		if err := s.saveKnowledgeReverificationUnlocked(task); err != nil {
@@ -267,7 +268,7 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 		return &task, nil
 	}
 
-	taskID := knowledgeReverificationTaskID(release.ReleaseID, assessment.LatestFeedbackAt)
+	taskID := knowledgeReverificationTaskID(release.ReleaseID, assessmentAt)
 	if existing, err := s.loadKnowledgeReverificationUnlocked(taskID); err == nil {
 		return existing, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -292,7 +293,7 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 		Version: knowledgeReverificationVersion, TaskID: taskID,
 		ReleaseID: release.ReleaseID, BookID: release.BookID,
 		TriggerOutcomes: append([]string(nil), assessment.TriggerOutcomes...),
-		AssessmentAt:    assessment.LatestFeedbackAt, Status: KnowledgeReverificationQueued,
+		AssessmentAt:    assessmentAt, Status: KnowledgeReverificationQueued,
 		AvailableAt:        availableAt.Format(time.RFC3339Nano),
 		ReleaseContentHash: release.ContentHash,
 		CreatedAt:          timestamp, UpdatedAt: timestamp,
@@ -469,8 +470,8 @@ func (s *BookKnowledgeStore) ValidateKnowledgeReverificationPublication(bookID, 
 		if err != nil {
 			return nil, err
 		}
-		if assessment.ReverifyRequired && assessment.LatestFeedbackAt > latestAssessmentAt {
-			latestAssessmentAt = assessment.LatestFeedbackAt
+		if assessment.ReverifyRequired && assessment.ReverificationAt > latestAssessmentAt {
+			latestAssessmentAt = assessment.ReverificationAt
 			latestReleaseID = record.ReleaseID
 		}
 	}

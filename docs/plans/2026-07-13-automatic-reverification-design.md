@@ -36,9 +36,11 @@ The state machine is:
 to `failed` after the attempt ceiling.
 
 New invalidating feedback while a task is queued or running is coalesced into
-that task. New feedback after a terminal task creates a new task. A configurable
-cooldown can defer the new task without dropping it. The runner recovers stale
-`running` tasks after process restart.
+that task. The task fingerprint uses the latest invalidating feedback timestamp,
+so later `used` or `zero_hit` observations do not supersede a valid candidate.
+New invalidating feedback after a terminal task creates a new task. A
+configurable cooldown can defer the new task without dropping it. The runner
+recovers stale `running` tasks after process restart.
 
 ## Processing
 

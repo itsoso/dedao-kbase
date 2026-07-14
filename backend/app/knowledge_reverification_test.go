@@ -350,6 +350,11 @@ func TestKnowledgeReleaseAllowsMatchingReadyCandidate(t *testing.T) {
 	if _, err := runner.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+		EventID: "event-used-after-candidate", Consumer: "consumer-a", Outcome: KnowledgeFeedbackUsed,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	published, err := PublishKnowledgeRelease(store, release.BookID)
 	if err != nil {
 		t.Fatalf("publish matching candidate returned error: %v", err)
