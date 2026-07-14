@@ -159,7 +159,16 @@ func TestKBaseHTTPHandlerKnowledgeReleaseRejectsQuarantinedAnalysis(t *testing.T
 
 func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
 	store, release := feedbackTestStore(t)
-	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	analysisCalls := 0
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "secret-token",
+		ReverificationNow:      func() time.Time { return time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC) },
+		ReverificationCooldown: 5 * time.Minute,
+		AnalysisGenerator: func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+			analysisCalls++
+			return nil, fmt.Errorf("must not run synchronously")
+		},
+	})
 	path := "/api/knowledge/releases/" + url.PathEscape(release.ReleaseID) + "/feedback"
 	empty := requestKBase(handler, http.MethodGet, path, "secret-token")
 	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"disposition":"healthy"`) || strings.Contains(empty.Body.String(), "consumer") {
@@ -171,8 +180,28 @@ func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
 		t.Fatalf("feedback status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	reverify := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-1b","consumer":"health-assistant","outcome":"stale","reason_code":"stale_source"}`)
-	if reverify.Code != http.StatusOK || !strings.Contains(reverify.Body.String(), `"disposition":"reverify_required"`) || !strings.Contains(reverify.Body.String(), `"trigger_outcomes":["stale"]`) {
+	if reverify.Code != http.StatusOK || !strings.Contains(reverify.Body.String(), `"disposition":"reverify_required"`) || !strings.Contains(reverify.Body.String(), `"trigger_outcomes":["stale"]`) || !strings.Contains(reverify.Body.String(), `"reverification":{"version":"1"`) || !strings.Contains(reverify.Body.String(), `"status":"queued"`) {
 		t.Fatalf("reverify feedback status=%d body=%s", reverify.Code, reverify.Body.String())
+	}
+	if analysisCalls != 0 {
+		t.Fatalf("feedback invoked analysis generator %d times", analysisCalls)
+	}
+	replayed := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-1b","consumer":"health-assistant","outcome":"stale","reason_code":"stale_source"}`)
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("replayed feedback status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	tasks, err := store.ListKnowledgeReverifications(release.ReleaseID)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("replayed feedback tasks=%#v err=%v", tasks, err)
+	}
+	statusPath := "/api/knowledge/releases/" + url.PathEscape(release.ReleaseID) + "/reverification"
+	status := requestKBase(handler, http.MethodGet, statusPath, "secret-token")
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"tasks":[`) || !strings.Contains(status.Body.String(), `"status":"queued"`) || strings.Contains(status.Body.String(), "health-assistant") || strings.Contains(status.Body.String(), "event-1b") {
+		t.Fatalf("reverification status=%d body=%s", status.Code, status.Body.String())
+	}
+	method := requestJSONKBase(handler, http.MethodPost, statusPath, "secret-token", `{}`)
+	if method.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("reverification POST status=%d body=%s", method.Code, method.Body.String())
 	}
 	read := requestKBase(handler, http.MethodGet, path, "secret-token")
 	if read.Code != http.StatusOK || !strings.Contains(read.Body.String(), `"reverify_required":true`) || strings.Contains(read.Body.String(), "event-1") || strings.Contains(read.Body.String(), "health-assistant") {
