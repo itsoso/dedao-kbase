@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -93,6 +95,130 @@ func TestKnowledgeReverificationRecoversStaleRunningTask(t *testing.T) {
 	if err != nil || !ok || recovered.TaskID != task.TaskID || recovered.Attempts != 2 {
 		t.Fatalf("recovered = %#v, ok=%v, err=%v", recovered, ok, err)
 	}
+}
+
+func TestKnowledgeReverificationRunnerProducesCandidateWithoutPublishing(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	runner := NewKnowledgeReverificationRunner(store, func(_ context.Context, current *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		calls++
+		return saveReadyReverificationAnalysis(t, current, request.BookID), nil
+	}, func() time.Time { return now }, 15*time.Minute)
+
+	result, err := runner.Tick(context.Background())
+	if err != nil {
+		t.Fatalf("Tick returned error: %v", err)
+	}
+	if !result.Processed || result.Status != KnowledgeReverificationCandidateReady || calls != 1 {
+		t.Fatalf("result = %#v, calls=%d", result, calls)
+	}
+	tasks, err := store.ListKnowledgeReverifications(release.ReleaseID)
+	if err != nil || len(tasks) != 1 {
+		t.Fatalf("tasks = %#v, err=%v", tasks, err)
+	}
+	task := tasks[0]
+	if task.QualityDecision != BookQualityPass || task.CandidateAnalysisHash == "" || task.ContentChanged {
+		t.Fatalf("candidate task = %#v", task)
+	}
+	releases, err := store.ListKnowledgeReleases("", 10)
+	if err != nil || len(releases) != 1 {
+		t.Fatalf("releases changed = %#v, err=%v", releases, err)
+	}
+}
+
+func TestKnowledgeReverificationRunnerRecordsChangedContent(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := store.LoadPackage(release.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Book.ContentHash = "content-hash-new"
+	if err := store.SavePackage(*pkg); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewKnowledgeReverificationRunner(store, func(_ context.Context, current *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		return saveReadyReverificationAnalysis(t, current, request.BookID), nil
+	}, func() time.Time { return now }, 15*time.Minute)
+	if _, err := runner.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	tasks, _ := store.ListKnowledgeReverifications(release.ReleaseID)
+	if len(tasks) != 1 || !tasks[0].ContentChanged || tasks[0].ReleaseContentHash != release.ContentHash || tasks[0].CurrentContentHash != "content-hash-new" {
+		t.Fatalf("changed-content task = %#v", tasks)
+	}
+}
+
+func TestKnowledgeReverificationRunnerRecordsAnalysisFailure(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewKnowledgeReverificationRunner(store, func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		return nil, errors.New("model unavailable")
+	}, func() time.Time { return now }, 15*time.Minute)
+	result, err := runner.Tick(context.Background())
+	if err != nil || result.Status != KnowledgeReverificationFailed {
+		t.Fatalf("result = %#v, err=%v", result, err)
+	}
+	tasks, _ := store.ListKnowledgeReverifications(release.ReleaseID)
+	if len(tasks) != 1 || tasks[0].Status != KnowledgeReverificationFailed || tasks[0].Error != "model unavailable" {
+		t.Fatalf("failed task = %#v", tasks)
+	}
+}
+
+func TestKnowledgeReverificationRunnerRequeuesWhenFeedbackAdvances(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewKnowledgeReverificationRunner(store, func(_ context.Context, current *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		advanced := saveReverificationFeedback(t, current, release.ReleaseID, "event-conflict", KnowledgeFeedbackConflict)
+		if _, err := current.EnqueueKnowledgeReverification(release.ReleaseID, *advanced, now.Add(time.Second), 0); err != nil {
+			t.Fatal(err)
+		}
+		return saveReadyReverificationAnalysis(t, current, request.BookID), nil
+	}, func() time.Time { return now }, 15*time.Minute)
+	result, err := runner.Tick(context.Background())
+	if err != nil || result.Status != KnowledgeReverificationQueued {
+		t.Fatalf("result = %#v, err=%v", result, err)
+	}
+	tasks, _ := store.ListKnowledgeReverifications(release.ReleaseID)
+	if len(tasks) != 1 || tasks[0].Status != KnowledgeReverificationQueued || len(tasks[0].TriggerOutcomes) != 2 {
+		t.Fatalf("requeued task = %#v", tasks)
+	}
+}
+
+func saveReadyReverificationAnalysis(t *testing.T, store *BookKnowledgeStore, bookID string) *BookAnalysisManifest {
+	t.Helper()
+	pkg, err := store.LoadPackage(bookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.LoadAnalysisManifest(bookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.ContentHash = pkg.Book.ContentHash
+	manifest.Status = BookAnalysisReady
+	manifest.Error = ""
+	if err := store.SaveAnalysisManifest(*manifest); err != nil {
+		t.Fatal(err)
+	}
+	return manifest
 }
 
 func saveReverificationFeedback(t *testing.T, store *BookKnowledgeStore, releaseID, eventID, outcome string) *KnowledgeFeedbackAssessment {
