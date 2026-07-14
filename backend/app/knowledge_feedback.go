@@ -26,6 +26,9 @@ const (
 	KnowledgeFeedbackReasonConflictingEvidence = "conflicting_evidence"
 	KnowledgeFeedbackReasonNoRelevantClaim     = "no_relevant_claim"
 	KnowledgeFeedbackReasonPolicyBlocked       = "policy_blocked"
+
+	KnowledgeFeedbackHealthy          = "healthy"
+	KnowledgeFeedbackReverifyRequired = "reverify_required"
 )
 
 type KnowledgeFeedbackInput struct {
@@ -45,6 +48,15 @@ type KnowledgeFeedback struct {
 	ClaimIDs   []string `json:"claim_ids,omitempty"`
 	ReasonCode string   `json:"reason_code,omitempty"`
 	CreatedAt  string   `json:"created_at"`
+}
+
+type KnowledgeFeedbackAssessment struct {
+	ReleaseID        string         `json:"release_id"`
+	Disposition      string         `json:"disposition"`
+	ReverifyRequired bool           `json:"reverify_required"`
+	TriggerOutcomes  []string       `json:"trigger_outcomes"`
+	StatusCounts     map[string]int `json:"status_counts"`
+	LatestFeedbackAt string         `json:"latest_feedback_at,omitempty"`
 }
 
 func (s *BookKnowledgeStore) KnowledgeFeedbackPath(releaseID string) string {
@@ -155,6 +167,42 @@ func (s *BookKnowledgeStore) ListKnowledgeFeedback(releaseID string) ([]Knowledg
 		return []KnowledgeFeedback{}, nil
 	}
 	return items, err
+}
+
+func (s *BookKnowledgeStore) AssessKnowledgeFeedback(releaseID string) (*KnowledgeFeedbackAssessment, error) {
+	release, err := s.LoadKnowledgeRelease(releaseID)
+	if err != nil {
+		return nil, err
+	}
+	items, err := s.ListKnowledgeFeedback(release.ReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	counts := knowledgeFeedbackCounts(items)
+	triggers := make([]string, 0, 3)
+	for _, outcome := range []string{KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict} {
+		if counts[outcome] > 0 {
+			triggers = append(triggers, outcome)
+		}
+	}
+	disposition := KnowledgeFeedbackHealthy
+	if len(triggers) > 0 {
+		disposition = KnowledgeFeedbackReverifyRequired
+	}
+	latestFeedbackAt := ""
+	for _, item := range items {
+		if item.CreatedAt > latestFeedbackAt {
+			latestFeedbackAt = item.CreatedAt
+		}
+	}
+	return &KnowledgeFeedbackAssessment{
+		ReleaseID:        release.ReleaseID,
+		Disposition:      disposition,
+		ReverifyRequired: len(triggers) > 0,
+		TriggerOutcomes:  triggers,
+		StatusCounts:     counts,
+		LatestFeedbackAt: latestFeedbackAt,
+	}, nil
 }
 
 func knowledgeFeedbackID(releaseID, consumer, eventID string) string {

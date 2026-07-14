@@ -161,10 +161,22 @@ func TestKBaseHTTPHandlerKnowledgeFeedback(t *testing.T) {
 	store, release := feedbackTestStore(t)
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
 	path := "/api/knowledge/releases/" + url.PathEscape(release.ReleaseID) + "/feedback"
+	empty := requestKBase(handler, http.MethodGet, path, "secret-token")
+	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"disposition":"healthy"`) || strings.Contains(empty.Body.String(), "consumer") {
+		t.Fatalf("empty feedback assessment status=%d body=%s", empty.Code, empty.Body.String())
+	}
 	payload := `{"event_id":"event-1","consumer":"health-assistant","outcome":"used","claim_ids":["claim-1"],"reason_code":"used_for_answer"}`
 	resp := requestJSONKBase(handler, http.MethodPost, path, "secret-token", payload)
-	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"feedback_id":"feedback-`) || !strings.Contains(resp.Body.String(), `"used":1`) {
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"feedback_id":"feedback-`) || !strings.Contains(resp.Body.String(), `"used":1`) || !strings.Contains(resp.Body.String(), `"assessment":{"release_id":`) {
 		t.Fatalf("feedback status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	reverify := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-1b","consumer":"health-assistant","outcome":"stale","reason_code":"stale_source"}`)
+	if reverify.Code != http.StatusOK || !strings.Contains(reverify.Body.String(), `"disposition":"reverify_required"`) || !strings.Contains(reverify.Body.String(), `"trigger_outcomes":["stale"]`) {
+		t.Fatalf("reverify feedback status=%d body=%s", reverify.Code, reverify.Body.String())
+	}
+	read := requestKBase(handler, http.MethodGet, path, "secret-token")
+	if read.Code != http.StatusOK || !strings.Contains(read.Body.String(), `"reverify_required":true`) || strings.Contains(read.Body.String(), "event-1") || strings.Contains(read.Body.String(), "health-assistant") {
+		t.Fatalf("feedback assessment status=%d body=%s", read.Code, read.Body.String())
 	}
 	sensitive := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"event_id":"event-2","consumer":"health-assistant","outcome":"used","user_id":"private-user"}`)
 	if sensitive.Code != http.StatusBadRequest || !strings.Contains(sensitive.Body.String(), "invalid JSON body") {

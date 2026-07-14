@@ -251,6 +251,19 @@ func knowledgeReleaseFeedbackPathID(path string) (string, bool) {
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeFeedback(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method == http.MethodGet {
+		assessment, err := h.store.AssessKnowledgeFeedback(releaseID)
+		if err != nil {
+			if os.IsNotExist(err) {
+				writeHTTPError(w, http.StatusNotFound, "release not found")
+				return
+			}
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, assessment)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -279,7 +292,12 @@ func (h *kbaseHTTPHandler) handleKnowledgeFeedback(w http.ResponseWriter, r *htt
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, map[string]any{"feedback": feedback, "status_counts": counts})
+	assessment, err := h.store.AssessKnowledgeFeedback(releaseID)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"feedback": feedback, "status_counts": counts, "assessment": assessment})
 }
 
 func bookAnalysisPathID(path string) (string, bool) {
