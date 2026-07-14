@@ -42,6 +42,7 @@ type KnowledgeReverificationTask struct {
 	BookID                string   `json:"book_id"`
 	TriggerOutcomes       []string `json:"trigger_outcomes"`
 	AssessmentAt          string   `json:"assessment_at"`
+	AssessmentFingerprint string   `json:"assessment_fingerprint"`
 	Status                string   `json:"status"`
 	Attempts              int      `json:"attempts"`
 	AvailableAt           string   `json:"available_at"`
@@ -124,8 +125,11 @@ func (r *KnowledgeReverificationRunner) Tick(ctx context.Context) (KnowledgeReve
 	}
 	manifest, err := r.analysisGenerator(ctx, r.store, BookAnalysisGenerateRequest{BookID: task.BookID})
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return r.requeueTask(task, 0)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return r.requeueTask(task, knowledgeReverificationRetryDelay(task.Attempts))
 		}
 		return r.failTask(task, KnowledgeReverificationErrorAnalysisFailed)
 	}
@@ -150,7 +154,7 @@ func (r *KnowledgeReverificationRunner) Tick(ctx context.Context) (KnowledgeReve
 	if pkgBefore.Book.ContentHash != pkgAfter.Book.ContentHash || quality.ContentHash != pkgAfter.Book.ContentHash {
 		return r.requeueTask(task, knowledgeReverificationRetryDelay(task.Attempts))
 	}
-	completed, err := r.store.CompleteKnowledgeReverification(task.TaskID, task.AssessmentAt, KnowledgeReverificationCandidate{
+	completed, err := r.store.CompleteKnowledgeReverification(task.TaskID, task.AssessmentAt, task.AssessmentFingerprint, KnowledgeReverificationCandidate{
 		ReleaseContentHash:   release.ContentHash,
 		CandidateContentHash: pkgAfter.Book.ContentHash,
 		ContentChanged:       release.ContentHash != pkgAfter.Book.ContentHash,
@@ -200,7 +204,7 @@ func (r *KnowledgeReverificationRunner) failTask(task *KnowledgeReverificationTa
 	result := KnowledgeReverificationTickResult{
 		Processed: true, TaskID: task.TaskID, ReleaseID: task.ReleaseID,
 	}
-	failed, err := r.store.FailKnowledgeReverification(task.TaskID, task.AssessmentAt, errorCode, r.now())
+	failed, err := r.store.FailKnowledgeReverification(task.TaskID, task.AssessmentAt, task.AssessmentFingerprint, errorCode, r.now())
 	if err != nil {
 		return result, err
 	}
@@ -234,7 +238,8 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 	cooldown time.Duration,
 ) (*KnowledgeReverificationTask, error) {
 	assessmentAt := strings.TrimSpace(assessment.ReverificationAt)
-	if !assessment.ReverifyRequired || assessmentAt == "" {
+	assessmentFingerprint := strings.TrimSpace(assessment.ReverificationFingerprint)
+	if !assessment.ReverifyRequired || assessmentAt == "" || assessmentFingerprint == "" {
 		return nil, fmt.Errorf("reverification requires an invalidating feedback assessment")
 	}
 	release, err := s.LoadKnowledgeRelease(releaseID)
@@ -255,11 +260,17 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 		return nil, err
 	}
 	for index := len(tasks) - 1; index >= 0; index-- {
+		if tasks[index].AssessmentFingerprint == assessmentFingerprint {
+			return &tasks[index], nil
+		}
+	}
+	for index := len(tasks) - 1; index >= 0; index-- {
 		if !isActiveKnowledgeReverificationStatus(tasks[index].Status) {
 			continue
 		}
 		task := tasks[index]
 		task.AssessmentAt = assessmentAt
+		task.AssessmentFingerprint = assessmentFingerprint
 		task.TriggerOutcomes = append([]string(nil), assessment.TriggerOutcomes...)
 		task.UpdatedAt = now.Format(time.RFC3339Nano)
 		if err := s.saveKnowledgeReverificationUnlocked(task); err != nil {
@@ -268,7 +279,7 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 		return &task, nil
 	}
 
-	taskID := knowledgeReverificationTaskID(release.ReleaseID, assessmentAt)
+	taskID := knowledgeReverificationTaskID(release.ReleaseID, assessmentFingerprint)
 	if existing, err := s.loadKnowledgeReverificationUnlocked(taskID); err == nil {
 		return existing, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -293,7 +304,8 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 		Version: knowledgeReverificationVersion, TaskID: taskID,
 		ReleaseID: release.ReleaseID, BookID: release.BookID,
 		TriggerOutcomes: append([]string(nil), assessment.TriggerOutcomes...),
-		AssessmentAt:    assessmentAt, Status: KnowledgeReverificationQueued,
+		AssessmentAt:    assessmentAt, AssessmentFingerprint: assessmentFingerprint,
+		Status:             KnowledgeReverificationQueued,
 		AvailableAt:        availableAt.Format(time.RFC3339Nano),
 		ReleaseContentHash: release.ContentHash,
 		CreatedAt:          timestamp, UpdatedAt: timestamp,
@@ -364,6 +376,7 @@ func (s *BookKnowledgeStore) ClaimNextKnowledgeReverification(now time.Time, sta
 func (s *BookKnowledgeStore) CompleteKnowledgeReverification(
 	taskID string,
 	processedAssessmentAt string,
+	processedAssessmentFingerprint string,
 	candidate KnowledgeReverificationCandidate,
 	now time.Time,
 ) (*KnowledgeReverificationTask, error) {
@@ -379,7 +392,7 @@ func (s *BookKnowledgeStore) CompleteKnowledgeReverification(
 	if err != nil {
 		return nil, err
 	}
-	if task.AssessmentAt != processedAssessmentAt {
+	if task.AssessmentAt != processedAssessmentAt || task.AssessmentFingerprint != processedAssessmentFingerprint {
 		requeueKnowledgeReverificationTask(task, now, knowledgeReverificationRetryDelay(task.Attempts))
 	} else {
 		timestamp := now.Format(time.RFC3339Nano)
@@ -402,6 +415,7 @@ func (s *BookKnowledgeStore) CompleteKnowledgeReverification(
 func (s *BookKnowledgeStore) FailKnowledgeReverification(
 	taskID string,
 	processedAssessmentAt string,
+	processedAssessmentFingerprint string,
 	errorCode string,
 	now time.Time,
 ) (*KnowledgeReverificationTask, error) {
@@ -417,7 +431,7 @@ func (s *BookKnowledgeStore) FailKnowledgeReverification(
 	if err != nil {
 		return nil, err
 	}
-	if task.AssessmentAt != processedAssessmentAt {
+	if task.AssessmentAt != processedAssessmentAt || task.AssessmentFingerprint != processedAssessmentFingerprint {
 		requeueKnowledgeReverificationTask(task, now, knowledgeReverificationRetryDelay(task.Attempts))
 	} else {
 		timestamp := now.Format(time.RFC3339Nano)
@@ -461,6 +475,7 @@ func (s *BookKnowledgeStore) ValidateKnowledgeReverificationPublication(bookID, 
 		return nil, err
 	}
 	latestAssessmentAt := ""
+	latestAssessmentFingerprint := ""
 	latestReleaseID := ""
 	for _, record := range manifest.Releases {
 		if record.BookID != bookID {
@@ -470,8 +485,10 @@ func (s *BookKnowledgeStore) ValidateKnowledgeReverificationPublication(bookID, 
 		if err != nil {
 			return nil, err
 		}
-		if assessment.ReverifyRequired && assessment.ReverificationAt > latestAssessmentAt {
+		if assessment.ReverifyRequired && (knowledgeFeedbackTimestampAfter(assessment.ReverificationAt, latestAssessmentAt) ||
+			(assessment.ReverificationAt == latestAssessmentAt && record.ReleaseID > latestReleaseID)) {
 			latestAssessmentAt = assessment.ReverificationAt
+			latestAssessmentFingerprint = assessment.ReverificationFingerprint
 			latestReleaseID = record.ReleaseID
 		}
 	}
@@ -484,7 +501,8 @@ func (s *BookKnowledgeStore) ValidateKnowledgeReverificationPublication(bookID, 
 	}
 	var latest *KnowledgeReverificationTask
 	for index := range tasks {
-		if tasks[index].BookID == bookID && tasks[index].ReleaseID == latestReleaseID && tasks[index].AssessmentAt == latestAssessmentAt {
+		if tasks[index].BookID == bookID && tasks[index].ReleaseID == latestReleaseID &&
+			tasks[index].AssessmentAt == latestAssessmentAt && tasks[index].AssessmentFingerprint == latestAssessmentFingerprint {
 			copy := tasks[index]
 			latest = &copy
 		}
@@ -620,8 +638,8 @@ func (s *BookKnowledgeStore) saveKnowledgeReverificationUnlocked(task KnowledgeR
 	return writeFileAtomically(s.KnowledgeReverificationPath(task.TaskID), payload)
 }
 
-func knowledgeReverificationTaskID(releaseID, assessmentAt string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(releaseID) + "\x00" + strings.TrimSpace(assessmentAt)))
+func knowledgeReverificationTaskID(releaseID, assessmentFingerprint string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(releaseID) + "\x00" + strings.TrimSpace(assessmentFingerprint)))
 	return "reverify-" + hex.EncodeToString(sum[:])
 }
 

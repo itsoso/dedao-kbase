@@ -31,11 +31,16 @@ func TestKnowledgeReverificationEnqueueCoalescesActiveTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("coalesced enqueue returned error: %v", err)
 	}
-	if coalesced.TaskID != first.TaskID || coalesced.AssessmentAt != newAssessment.LatestFeedbackAt {
+	if coalesced.TaskID != first.TaskID || coalesced.AssessmentAt != newAssessment.ReverificationAt ||
+		coalesced.AssessmentFingerprint != newAssessment.ReverificationFingerprint {
 		t.Fatalf("coalesced task = %#v", coalesced)
 	}
 	if len(coalesced.TriggerOutcomes) != 2 {
 		t.Fatalf("trigger outcomes = %#v", coalesced.TriggerOutcomes)
+	}
+	replayedCoalesced, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *newAssessment, now.Add(3*time.Second), 5*time.Minute)
+	if err != nil || replayedCoalesced.TaskID != first.TaskID {
+		t.Fatalf("replayed coalesced task = %#v, err=%v", replayedCoalesced, err)
 	}
 	tasks, err := store.ListKnowledgeReverifications(release.ReleaseID)
 	if err != nil || len(tasks) != 1 {
@@ -55,7 +60,7 @@ func TestKnowledgeReverificationCreatesCooledTaskAfterTerminalTask(t *testing.T)
 	if err != nil || !ok || claimed.TaskID != task.TaskID {
 		t.Fatalf("claimed = %#v, ok=%v, err=%v", claimed, ok, err)
 	}
-	if _, err := store.CompleteKnowledgeReverification(task.TaskID, claimed.AssessmentAt, KnowledgeReverificationCandidate{
+	if _, err := store.CompleteKnowledgeReverification(task.TaskID, claimed.AssessmentAt, claimed.AssessmentFingerprint, KnowledgeReverificationCandidate{
 		AnalysisHash: "analysis-1", QualityDecision: BookQualityPass,
 	}, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
@@ -236,16 +241,38 @@ func TestKnowledgeReverificationRunnerRequeuesCancellation(t *testing.T) {
 	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	runner := NewKnowledgeReverificationRunner(store, func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		cancel()
 		return nil, context.Canceled
 	}, func() time.Time { return now }, 15*time.Minute)
-	result, err := runner.Tick(context.Background())
+	result, err := runner.Tick(ctx)
 	if err != nil || result.Status != KnowledgeReverificationQueued {
 		t.Fatalf("result = %#v, err=%v", result, err)
 	}
 	tasks, _ := store.ListKnowledgeReverifications(release.ReleaseID)
 	if len(tasks) != 1 || tasks[0].Status != KnowledgeReverificationQueued || tasks[0].CompletedAt != "" {
 		t.Fatalf("cancelled task = %#v", tasks)
+	}
+}
+
+func TestKnowledgeReverificationRunnerBacksOffDownstreamTimeout(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	runner := NewKnowledgeReverificationRunner(store, func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		return nil, context.DeadlineExceeded
+	}, func() time.Time { return now }, 15*time.Minute)
+	result, err := runner.Tick(context.Background())
+	if err != nil || result.Status != KnowledgeReverificationQueued {
+		t.Fatalf("result = %#v, err=%v", result, err)
+	}
+	tasks, _ := store.ListKnowledgeReverifications(release.ReleaseID)
+	if len(tasks) != 1 || tasks[0].Attempts != 1 || tasks[0].AvailableAt == now.Format(time.RFC3339Nano) {
+		t.Fatalf("timeout task = %#v", tasks)
 	}
 }
 
