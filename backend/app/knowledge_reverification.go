@@ -137,6 +137,33 @@ func (r *KnowledgeReverificationRunner) Tick(ctx context.Context) (KnowledgeReve
 	return result, nil
 }
 
+func (r *KnowledgeReverificationRunner) Run(
+	ctx context.Context,
+	interval time.Duration,
+	onTick func(KnowledgeReverificationTickResult, error),
+) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	runTick := func() {
+		result, err := r.Tick(ctx)
+		if onTick != nil {
+			onTick(result, err)
+		}
+	}
+	runTick()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runTick()
+		}
+	}
+}
+
 func (r *KnowledgeReverificationRunner) failTask(task *KnowledgeReverificationTask, cause error) (KnowledgeReverificationTickResult, error) {
 	result := KnowledgeReverificationTickResult{
 		Processed: true, TaskID: task.TaskID, ReleaseID: task.ReleaseID,
