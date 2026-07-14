@@ -1,6 +1,6 @@
 # Knowledge Reverification Console Dossier
 
-**Status:** Ready for deployment
+**Status:** Complete
 
 ## Requirement
 
@@ -42,9 +42,23 @@ release mutation, and a separate administration application.
   identity, polls only active tasks, and requires both candidate and current
   quality decisions to pass before offering the already backend-gated publish
   action. No automatic publication path was added.
-- **G5 Deployment health:** PENDING.
-- **G6 Online verification:** PENDING.
+- **G5 Deployment health:** PASS. PR #5 merged as `248cc6f`; the server-built
+  binary SHA-256 is
+  `1e92f09b037ef72955666404ebf39366caf745b93ba54364d6161961cc97ff54`.
+  Binary and Web assets were replaced atomically, with backups at
+  `/opt/dedao-kbase/bin/kbase-server.before-20260714185235` and
+  `/opt/dedao-kbase/frontend-web.before-20260714185235`. The systemd unit is
+  active and post-deployment logs contain no panic, fatal, or reverification
+  error event.
+- **G6 Online verification:** PASS. Public `/health` returned 200. Authenticated
+  checks confirmed the deployed static bundle contains the review retry client,
+  safe inline Markdown renderer, and Markdown answer styles; the target
+  `source-2c403c4d3b68a4c4` package and book-scoped release listing are readable.
+  A GET against the retry action returned 405 without mutating data. The
+  behavior smoke verifies headings, bold text, inline code, separators, lists,
+  safe links, and raw-script escaping. Browser screenshot automation could not
+  reuse an authenticated session, so no credential bypass was attempted.
 
 ## Current Stage
 
-S5 implementation and local verification complete; awaiting deployment.
+S6 deployed and verified online.
