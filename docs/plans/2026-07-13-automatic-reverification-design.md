@@ -22,7 +22,9 @@ deletes, or mutates an existing release.
 Tasks are stored below the configured book-knowledge root, not in source files
 or downloaded content. Each task contains opaque identifiers, trigger outcomes,
 assessment timestamp, status, attempt count, due time, content hashes, quality
-decision, bounded error text, and timestamps.
+decision, an enumerated error code, and timestamps. Queue mutations use a
+short-lived owner-checked filesystem lock so overlapping server processes cannot
+claim the same task.
 
 The state machine is:
 
@@ -44,7 +46,14 @@ For each due task, the runner:
 5. Re-checks the feedback assessment; feedback received during processing
    requeues the task instead of falsely marking it current.
 
-The existing explicit publish endpoint remains the only publication path.
+The package content hash is checked both before and after analysis. A changed
+snapshot or graceful cancellation requeues the task. Raw filesystem or model
+errors are never persisted in the public task record.
+
+The existing explicit publish endpoint remains the only publication path. It
+also requires the newest task for that book to be `candidate_ready` with an
+analysis hash matching the current quality report; queued, running, failed, or
+superseded candidates are rejected.
 
 ## API And Operations
 

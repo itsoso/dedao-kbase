@@ -14,12 +14,19 @@ import (
 )
 
 const (
-	knowledgeReverificationVersion = "1"
+	knowledgeReverificationVersion        = "1"
+	knowledgeReverificationLockWait       = 2 * time.Second
+	knowledgeReverificationLockStaleAfter = 30 * time.Second
 
 	KnowledgeReverificationQueued         = "queued"
 	KnowledgeReverificationRunning        = "running"
 	KnowledgeReverificationCandidateReady = "candidate_ready"
 	KnowledgeReverificationFailed         = "failed"
+
+	KnowledgeReverificationErrorReleaseUnavailable = "release_unavailable"
+	KnowledgeReverificationErrorPackageUnavailable = "package_unavailable"
+	KnowledgeReverificationErrorAnalysisFailed     = "analysis_failed"
+	KnowledgeReverificationErrorQualityFailed      = "quality_evaluation_failed"
 )
 
 type KnowledgeReverificationTask struct {
@@ -37,7 +44,7 @@ type KnowledgeReverificationTask struct {
 	ContentChanged        bool     `json:"content_changed,omitempty"`
 	CandidateAnalysisHash string   `json:"candidate_analysis_hash,omitempty"`
 	QualityDecision       string   `json:"quality_decision,omitempty"`
-	Error                 string   `json:"error,omitempty"`
+	ErrorCode             string   `json:"error_code,omitempty"`
 	CreatedAt             string   `json:"created_at"`
 	UpdatedAt             string   `json:"updated_at"`
 	StartedAt             string   `json:"started_at,omitempty"`
@@ -57,7 +64,7 @@ type KnowledgeReverificationTickResult struct {
 	TaskID    string `json:"task_id,omitempty"`
 	ReleaseID string `json:"release_id,omitempty"`
 	Status    string `json:"status,omitempty"`
-	Error     string `json:"error,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
 }
 
 type KnowledgeReverificationRunner struct {
@@ -102,31 +109,44 @@ func (r *KnowledgeReverificationRunner) Tick(ctx context.Context) (KnowledgeReve
 
 	release, err := r.store.LoadKnowledgeRelease(task.ReleaseID)
 	if err != nil {
-		return r.failTask(task, err)
+		return r.failTask(task, KnowledgeReverificationErrorReleaseUnavailable)
 	}
-	pkg, err := r.store.LoadPackage(task.BookID)
+	pkgBefore, err := r.store.LoadPackage(task.BookID)
 	if err != nil {
-		return r.failTask(task, err)
+		return r.failTask(task, KnowledgeReverificationErrorPackageUnavailable)
 	}
 	manifest, err := r.analysisGenerator(ctx, r.store, BookAnalysisGenerateRequest{BookID: task.BookID})
 	if err != nil {
-		return r.failTask(task, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			return r.requeueTask(task)
+		}
+		return r.failTask(task, KnowledgeReverificationErrorAnalysisFailed)
+	}
+	if ctx.Err() != nil {
+		return r.requeueTask(task)
 	}
 	quality, err := EvaluateBookAnalysisQuality(r.store, task.BookID)
 	if err != nil {
-		return r.failTask(task, err)
+		return r.failTask(task, KnowledgeReverificationErrorQualityFailed)
 	}
 	analysisHash := quality.AnalysisHash
 	if strings.TrimSpace(analysisHash) == "" && manifest != nil {
 		analysisHash, err = bookAnalysisHash(*manifest)
 		if err != nil {
-			return r.failTask(task, err)
+			return r.failTask(task, KnowledgeReverificationErrorQualityFailed)
 		}
+	}
+	pkgAfter, err := r.store.LoadPackage(task.BookID)
+	if err != nil {
+		return r.failTask(task, KnowledgeReverificationErrorPackageUnavailable)
+	}
+	if pkgBefore.Book.ContentHash != pkgAfter.Book.ContentHash || quality.ContentHash != pkgAfter.Book.ContentHash {
+		return r.requeueTask(task)
 	}
 	completed, err := r.store.CompleteKnowledgeReverification(task.TaskID, task.AssessmentAt, KnowledgeReverificationCandidate{
 		ReleaseContentHash: release.ContentHash,
-		CurrentContentHash: pkg.Book.ContentHash,
-		ContentChanged:     release.ContentHash != pkg.Book.ContentHash,
+		CurrentContentHash: pkgAfter.Book.ContentHash,
+		ContentChanged:     release.ContentHash != pkgAfter.Book.ContentHash,
 		AnalysisHash:       analysisHash,
 		QualityDecision:    quality.Decision,
 	}, r.now())
@@ -146,6 +166,11 @@ func (r *KnowledgeReverificationRunner) Run(
 		interval = 30 * time.Second
 	}
 	runTick := func() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
 		result, err := r.Tick(ctx)
 		if onTick != nil {
 			onTick(result, err)
@@ -164,16 +189,26 @@ func (r *KnowledgeReverificationRunner) Run(
 	}
 }
 
-func (r *KnowledgeReverificationRunner) failTask(task *KnowledgeReverificationTask, cause error) (KnowledgeReverificationTickResult, error) {
+func (r *KnowledgeReverificationRunner) failTask(task *KnowledgeReverificationTask, errorCode string) (KnowledgeReverificationTickResult, error) {
 	result := KnowledgeReverificationTickResult{
 		Processed: true, TaskID: task.TaskID, ReleaseID: task.ReleaseID,
 	}
-	failed, err := r.store.FailKnowledgeReverification(task.TaskID, task.AssessmentAt, cause, r.now())
+	failed, err := r.store.FailKnowledgeReverification(task.TaskID, task.AssessmentAt, errorCode, r.now())
 	if err != nil {
 		return result, err
 	}
 	result.Status = failed.Status
-	result.Error = failed.Error
+	result.ErrorCode = failed.ErrorCode
+	return result, nil
+}
+
+func (r *KnowledgeReverificationRunner) requeueTask(task *KnowledgeReverificationTask) (KnowledgeReverificationTickResult, error) {
+	result := KnowledgeReverificationTickResult{Processed: true, TaskID: task.TaskID, ReleaseID: task.ReleaseID}
+	requeued, err := r.store.RequeueKnowledgeReverification(task.TaskID, r.now())
+	if err != nil {
+		return result, err
+	}
+	result.Status = requeued.Status
 	return result, nil
 }
 
@@ -202,6 +237,11 @@ func (s *BookKnowledgeStore) EnqueueKnowledgeReverification(
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseQueueLock()
 	tasks, err := s.listKnowledgeReverificationsUnlocked(release.ReleaseID)
 	if err != nil {
 		return nil, err
@@ -266,6 +306,11 @@ func (s *BookKnowledgeStore) ClaimNextKnowledgeReverification(now time.Time, sta
 	now = now.UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, false, err
+	}
+	defer releaseQueueLock()
 	tasks, err := s.listKnowledgeReverificationsUnlocked("")
 	if err != nil {
 		return nil, false, err
@@ -320,6 +365,11 @@ func (s *BookKnowledgeStore) CompleteKnowledgeReverification(
 	now = now.UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseQueueLock()
 	task, err := s.loadKnowledgeReverificationUnlocked(taskID)
 	if err != nil {
 		return nil, err
@@ -337,7 +387,7 @@ func (s *BookKnowledgeStore) CompleteKnowledgeReverification(
 		task.ContentChanged = candidate.ContentChanged
 		task.CandidateAnalysisHash = candidate.AnalysisHash
 		task.QualityDecision = candidate.QualityDecision
-		task.Error = ""
+		task.ErrorCode = ""
 		task.UpdatedAt = timestamp
 		task.CompletedAt = timestamp
 	}
@@ -350,12 +400,17 @@ func (s *BookKnowledgeStore) CompleteKnowledgeReverification(
 func (s *BookKnowledgeStore) FailKnowledgeReverification(
 	taskID string,
 	processedAssessmentAt string,
-	cause error,
+	errorCode string,
 	now time.Time,
 ) (*KnowledgeReverificationTask, error) {
 	now = now.UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseQueueLock()
 	task, err := s.loadKnowledgeReverificationUnlocked(taskID)
 	if err != nil {
 		return nil, err
@@ -365,13 +420,11 @@ func (s *BookKnowledgeStore) FailKnowledgeReverification(
 		task.Status = KnowledgeReverificationQueued
 		task.AvailableAt = timestamp
 		task.StartedAt = ""
-		task.Error = ""
+		task.ErrorCode = ""
 		task.UpdatedAt = timestamp
 	} else {
 		task.Status = KnowledgeReverificationFailed
-		if cause != nil {
-			task.Error = trimRunes(cause.Error(), 2000)
-		}
+		task.ErrorCode = strings.TrimSpace(errorCode)
 		task.UpdatedAt = timestamp
 		task.CompletedAt = timestamp
 	}
@@ -379,6 +432,92 @@ func (s *BookKnowledgeStore) FailKnowledgeReverification(
 		return nil, err
 	}
 	return task, nil
+}
+
+func (s *BookKnowledgeStore) RequeueKnowledgeReverification(taskID string, now time.Time) (*KnowledgeReverificationTask, error) {
+	now = now.UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseQueueLock()
+	task, err := s.loadKnowledgeReverificationUnlocked(taskID)
+	if err != nil {
+		return nil, err
+	}
+	timestamp := now.Format(time.RFC3339Nano)
+	task.Status = KnowledgeReverificationQueued
+	task.AvailableAt = timestamp
+	task.StartedAt = ""
+	task.CompletedAt = ""
+	task.CandidateAnalysisHash = ""
+	task.QualityDecision = ""
+	task.ErrorCode = ""
+	task.UpdatedAt = timestamp
+	if err := s.saveKnowledgeReverificationUnlocked(*task); err != nil {
+		return nil, err
+	}
+	return task, nil
+}
+
+func (s *BookKnowledgeStore) ValidateKnowledgeReverificationPublication(bookID, analysisHash string) error {
+	tasks, err := s.ListKnowledgeReverifications("")
+	if err != nil {
+		return err
+	}
+	var latest *KnowledgeReverificationTask
+	for index := range tasks {
+		if tasks[index].BookID == bookID {
+			copy := tasks[index]
+			latest = &copy
+		}
+	}
+	if latest == nil {
+		return nil
+	}
+	if latest.Status != KnowledgeReverificationCandidateReady {
+		return fmt.Errorf("knowledge release blocked by reverification status %q", latest.Status)
+	}
+	if strings.TrimSpace(latest.CandidateAnalysisHash) == "" || latest.CandidateAnalysisHash != analysisHash {
+		return fmt.Errorf("knowledge release candidate is stale against reverification")
+	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) acquireKnowledgeReverificationFileLock() (func(), error) {
+	if err := os.MkdirAll(s.KnowledgeReverificationDir(), os.ModePerm); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(s.KnowledgeReverificationDir(), ".queue.lock")
+	ownerPath := filepath.Join(lockPath, "owner")
+	owner := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	deadline := time.Now().Add(knowledgeReverificationLockWait)
+	for {
+		if err := os.Mkdir(lockPath, 0o700); err == nil {
+			if err := os.WriteFile(ownerPath, []byte(owner), 0o600); err != nil {
+				_ = os.RemoveAll(lockPath)
+				return nil, err
+			}
+			return func() {
+				current, err := os.ReadFile(ownerPath)
+				if err == nil && string(current) == owner {
+					_ = os.RemoveAll(lockPath)
+				}
+			}, nil
+		} else if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if info, err := os.Stat(lockPath); err == nil && time.Since(info.ModTime()) > knowledgeReverificationLockStaleAfter {
+			_ = os.RemoveAll(lockPath)
+			continue
+		}
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("timed out acquiring reverification queue lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (s *BookKnowledgeStore) listKnowledgeReverificationsUnlocked(releaseID string) ([]KnowledgeReverificationTask, error) {

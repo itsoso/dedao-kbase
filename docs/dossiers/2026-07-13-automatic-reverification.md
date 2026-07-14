@@ -38,8 +38,12 @@ text storage, and synchronous model work in the feedback request.
   no synchronous model invocation, no automatic publication, and no raw consumer
   data in task responses.
 - **G3 Test:** PENDING.
-- **G4 Review:** PENDING. Authentication, model-cost amplification, task races,
-  privacy, and publication boundaries require independent review.
+- **G4 Review:** BLOCKED ON FIRST REVIEW. Independent review found two High
+  issues (superseded candidate publication and cross-process duplicate claims)
+  plus three Medium issues (cancellation handling, inconsistent content
+  snapshot, and raw internal error exposure). Fixes add an owner-checked
+  filesystem lock, publication gate, cancellation/content requeue, and public
+  error codes. Re-review is pending.
 - **G5 Deployment health:** PENDING.
 - **G6 Online verification:** PENDING.
 

@@ -420,7 +420,7 @@ func (h *kbaseHTTPHandler) handleBookPublish(w http.ResponseWriter, r *http.Requ
 			writeHTTPError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "quality decision") || strings.Contains(err.Error(), "requires ready") || strings.Contains(err.Error(), "stale") {
+		if strings.Contains(err.Error(), "quality decision") || strings.Contains(err.Error(), "requires ready") || strings.Contains(err.Error(), "stale") || strings.Contains(err.Error(), "reverification") {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}

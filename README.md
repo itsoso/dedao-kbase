@@ -89,6 +89,9 @@ KBASE_AUTH_TOKEN="replace-with-long-secret" \
 KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
+KBASE_REVERIFICATION_TICK_SECONDS="30" \
+KBASE_REVERIFICATION_COOLDOWN_SECONDS="300" \
+KBASE_REVERIFICATION_STALE_SECONDS="900" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
@@ -99,6 +102,10 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `GET /api/search?q=关键词&limit=5`：检索书籍 chunks/claims。
 - `GET /api/system-kb/manifest`：返回 System KB export 摘要。
 - `GET /api/system-kb/export`：返回 health/proofroom 导入用的 `system_kb_export.json`。
+- `POST /api/knowledge/releases/{release_id}/feedback`：接收消费者的结构化反馈；`stale`、`conflict`、`rejected` 会幂等创建异步复核任务。
+- `GET /api/knowledge/releases/{release_id}/reverification`：查看该 release 的复核任务状态、候选分析哈希、质量裁决和枚举错误码。
+
+复核任务由 `kbase-server` 后台处理，不依赖本地来源 Agent。任务会通过跨进程文件锁合并同一 release 的并发异常反馈，并以冷却时间限制模型调用频率；服务重启后会恢复超时的 `running` 任务，服务取消或分析期间内容变化则重新排队。复核只生成当前知识包的候选分析与质量报告，已有 release 保持不可变；显式发布时还会校验最新复核状态及候选哈希，未解决或已过期的候选不能发布。
 
 ### 微信/WC Plus 来源工作台
 

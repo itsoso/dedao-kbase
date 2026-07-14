@@ -197,8 +197,8 @@ func startKnowledgeReverificationRunner(
 				return
 			}
 			if result.Processed {
-				logf("knowledge reverification tick: task=%s release=%s status=%s error=%s",
-					result.TaskID, result.ReleaseID, result.Status, result.Error)
+				logf("knowledge reverification tick: task=%s release=%s status=%s error_code=%s",
+					result.TaskID, result.ReleaseID, result.Status, result.ErrorCode)
 			}
 		})
 	}()

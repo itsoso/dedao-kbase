@@ -89,6 +89,9 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if quality.AnalysisHash == "" || quality.AnalysisHash != analysisHash {
 		return nil, fmt.Errorf("knowledge release analysis hash is stale")
 	}
+	if err := store.ValidateKnowledgeReverificationPublication(bookID, analysisHash); err != nil {
+		return nil, err
+	}
 	releaseID, err := knowledgeReleaseID(pkg.Book, *analysis.Payload, *quality, analysis.Sources, pkg.Citations)
 	if err != nil {
 		return nil, err
