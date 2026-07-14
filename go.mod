@@ -1,6 +1,6 @@
 module github.com/yann0917/dedao-gui
 
-go 1.21
+go 1.21.0
 
 require (
 	github.com/JoshVarga/svgparser v0.0.0-20200804023048-5eaba627a7d1
@@ -11,6 +11,7 @@ require (
 	github.com/chromedp/chromedp v0.10.0
 	github.com/gabriel-vasile/mimetype v1.4.5
 	github.com/go-resty/resty/v2 v2.14.0
+	github.com/gofrs/flock v0.12.1
 	github.com/gomarkdown/markdown v0.0.0-20240730141124-034f12af3bf6
 	github.com/json-iterator/go v1.1.12
 	github.com/mattn/go-colorable v0.1.13
@@ -18,6 +19,7 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/wailsapp/wails/v2 v2.9.1
+	golang.org/x/net v0.27.0
 	golang.org/x/sync v0.8.0
 )
 
@@ -56,7 +58,6 @@ require (
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	golang.org/x/crypto v0.25.0 // indirect
 	golang.org/x/exp v0.0.0-20240525044651-4c93da0ed11d // indirect
-	golang.org/x/net v0.27.0 // indirect
 	golang.org/x/sys v0.22.0 // indirect
 	golang.org/x/text v0.16.0 // indirect
 )

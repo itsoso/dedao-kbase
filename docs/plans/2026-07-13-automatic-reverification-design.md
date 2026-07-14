@@ -22,13 +22,18 @@ deletes, or mutates an existing release.
 Tasks are stored below the configured book-knowledge root, not in source files
 or downloaded content. Each task contains opaque identifiers, trigger outcomes,
 assessment timestamp, status, attempt count, due time, content hashes, quality
-decision, an enumerated error code, and timestamps. Queue mutations use a
-short-lived owner-checked filesystem lock so overlapping server processes cannot
-claim the same task.
+decision, an enumerated error code, and timestamps. Feedback writes, queue
+mutations, and publication use the same short-lived OS advisory lock so
+overlapping server processes cannot claim the same task or publish across an
+invalidating feedback write. The operating system releases the lock on process
+exit.
 
 The state machine is:
 
-`queued -> running -> candidate_ready | failed`
+`queued -> running -> candidate_ready -> published`
+
+`running` may also transition to `queued` with bounded exponential backoff, or
+to `failed` after the attempt ceiling.
 
 New invalidating feedback while a task is queued or running is coalesced into
 that task. New feedback after a terminal task creates a new task. A configurable
@@ -46,14 +51,18 @@ For each due task, the runner:
 5. Re-checks the feedback assessment; feedback received during processing
    requeues the task instead of falsely marking it current.
 
-The package content hash is checked both before and after analysis. A changed
-snapshot or graceful cancellation requeues the task. Raw filesystem or model
-errors are never persisted in the public task record.
+The package content hash is checked both before and after analysis. The task
+records the candidate snapshot hash rather than claiming it remains the current
+package forever. A changed snapshot or graceful cancellation requeues the task.
+Automatic requeues use exponential backoff and a five-attempt ceiling. Raw
+filesystem or model errors are never persisted in the public task record.
 
 The existing explicit publish endpoint remains the only publication path. It
-also requires the newest task for that book to be `candidate_ready` with an
-analysis hash matching the current quality report; queued, running, failed, or
-superseded candidates are rejected.
+also requires the task matching the latest invalidating assessment to be
+`candidate_ready` with an analysis hash matching the current quality report;
+queued, running, failed, or superseded candidates are rejected. Successful
+publication marks that assessment task `published`, so later source updates and
+manual analyses are not permanently blocked.
 
 ## API And Operations
 

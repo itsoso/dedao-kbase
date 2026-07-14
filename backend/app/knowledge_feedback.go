@@ -97,6 +97,11 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 		}
 	}
 
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releaseQueueLock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items, err := readJSONLFile[KnowledgeFeedback](s.KnowledgeFeedbackPath(release.ReleaseID))

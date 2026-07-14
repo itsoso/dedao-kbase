@@ -93,9 +93,20 @@ func TestKnowledgeReverificationRecoversStaleRunningTask(t *testing.T) {
 	if _, ok, err := store.ClaimNextKnowledgeReverification(now.Add(14*time.Minute), 15*time.Minute); err != nil || ok {
 		t.Fatalf("premature recovery ok=%v err=%v", ok, err)
 	}
-	recovered, ok, err := store.ClaimNextKnowledgeReverification(now.Add(16*time.Minute), 15*time.Minute)
+	if recovered, ok, err := store.ClaimNextKnowledgeReverification(now.Add(16*time.Minute), 15*time.Minute); err != nil || ok {
+		t.Fatalf("recovered before backoff = %#v, ok=%v, err=%v", recovered, ok, err)
+	}
+	tasks, err := store.ListKnowledgeReverifications(release.ReleaseID)
+	if err != nil || len(tasks) != 1 || tasks[0].Status != KnowledgeReverificationQueued {
+		t.Fatalf("stale task = %#v, err=%v", tasks, err)
+	}
+	availableAt, err := time.Parse(time.RFC3339Nano, tasks[0].AvailableAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, ok, err := store.ClaimNextKnowledgeReverification(availableAt, 15*time.Minute)
 	if err != nil || !ok || recovered.TaskID != task.TaskID || recovered.Attempts != 2 {
-		t.Fatalf("recovered = %#v, ok=%v, err=%v", recovered, ok, err)
+		t.Fatalf("recovered after backoff = %#v, ok=%v, err=%v", recovered, ok, err)
 	}
 }
 
@@ -189,7 +200,7 @@ func TestKnowledgeReverificationRunnerRecordsChangedContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	tasks, _ := store.ListKnowledgeReverifications(release.ReleaseID)
-	if len(tasks) != 1 || !tasks[0].ContentChanged || tasks[0].ReleaseContentHash != release.ContentHash || tasks[0].CurrentContentHash != "content-hash-new" {
+	if len(tasks) != 1 || !tasks[0].ContentChanged || tasks[0].ReleaseContentHash != release.ContentHash || tasks[0].CandidateContentHash != "content-hash-new" {
 		t.Fatalf("changed-content task = %#v", tasks)
 	}
 }
@@ -339,8 +350,87 @@ func TestKnowledgeReleaseAllowsMatchingReadyCandidate(t *testing.T) {
 	if _, err := runner.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := PublishKnowledgeRelease(store, release.BookID); err != nil {
+	published, err := PublishKnowledgeRelease(store, release.BookID)
+	if err != nil {
 		t.Fatalf("publish matching candidate returned error: %v", err)
+	}
+	tasks, err := store.ListKnowledgeReverifications(release.ReleaseID)
+	if err != nil || len(tasks) != 1 || tasks[0].Status != KnowledgeReverificationPublished || tasks[0].PublishedReleaseID != published.ReleaseID {
+		t.Fatalf("published task = %#v, release=%#v, err=%v", tasks, published, err)
+	}
+
+	pkg, err := store.LoadPackage(release.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Book.ContentHash = "later-manual-content"
+	if err := store.SavePackage(*pkg); err != nil {
+		t.Fatal(err)
+	}
+	saveReadyReverificationAnalysis(t, store, release.BookID)
+	if _, err := EvaluateBookAnalysisQuality(store, release.BookID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishKnowledgeRelease(store, release.BookID); err != nil {
+		t.Fatalf("later manual publication remained blocked: %v", err)
+	}
+}
+
+func TestKnowledgeReverificationRequeueUsesBackoffAndAttemptCeiling(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	now := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, now, 0); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 1; attempt <= knowledgeReverificationMaxAttempts; attempt++ {
+		claimed, ok, err := store.ClaimNextKnowledgeReverification(now, 15*time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim attempt %d = %#v ok=%v err=%v", attempt, claimed, ok, err)
+		}
+		task, err := store.RequeueKnowledgeReverification(claimed.TaskID, now, knowledgeReverificationRetryDelay(claimed.Attempts))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if attempt < knowledgeReverificationMaxAttempts {
+			if task.Status != KnowledgeReverificationQueued || task.AvailableAt == now.Format(time.RFC3339Nano) {
+				t.Fatalf("backoff task at attempt %d = %#v", attempt, task)
+			}
+			availableAt, err := time.Parse(time.RFC3339Nano, task.AvailableAt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now = availableAt
+		} else if task.Status != KnowledgeReverificationFailed || task.ErrorCode != KnowledgeReverificationErrorRetryExhausted {
+			t.Fatalf("exhausted task = %#v", task)
+		}
+	}
+}
+
+func TestKnowledgeFeedbackAndPublicationUseSameCrossProcessLock(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	unlock, err := store.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	feedbackDone := make(chan error, 1)
+	go func() {
+		_, _, err := NewBookKnowledgeStore(store.Root()).SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+			EventID: "event-stale", Consumer: "consumer-a", Outcome: KnowledgeFeedbackStale,
+		})
+		feedbackDone <- err
+	}()
+	select {
+	case err := <-feedbackDone:
+		t.Fatalf("feedback bypassed cross-process lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlock()
+	if err := <-feedbackDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishKnowledgeRelease(store, release.BookID); err == nil || !strings.Contains(err.Error(), "reverification") {
+		t.Fatalf("publication ignored feedback committed before gate: %v", err)
 	}
 }
 

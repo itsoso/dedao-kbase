@@ -43,7 +43,12 @@ text storage, and synchronous model work in the feedback request.
   plus three Medium issues (cancellation handling, inconsistent content
   snapshot, and raw internal error exposure). Fixes add an owner-checked
   filesystem lock, publication gate, cancellation/content requeue, and public
-  error codes. Re-review is pending.
+  error codes. First re-review found three remaining High race/lifecycle issues
+  and two Medium snapshot/retry issues. The second fix replaces custom stale
+  lock removal with an OS advisory lock, serializes feedback and publication,
+  records successful resolution as `published`, defines candidate snapshot
+  semantics, and adds exponential backoff plus a five-attempt ceiling. Final
+  re-review is pending.
 - **G5 Deployment health:** PENDING.
 - **G6 Online verification:** PENDING.
 
