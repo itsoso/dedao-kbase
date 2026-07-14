@@ -25,6 +25,12 @@ for (const endpoint of [
   "/api/search?",
   "/api/book-chat",
   "/analysis",
+  "/api/knowledge/releases?",
+  "/feedback",
+  "/reverification",
+  "/reverification/retry",
+  "/quality",
+  "/publish",
 ]) {
   assert.ok(js.includes(endpoint), `book knowledge web UI should call ${endpoint}`);
 }
@@ -78,5 +84,33 @@ for (const marker of [
   assert.ok(js.includes(marker), `book knowledge web UI should include durable analysis marker ${marker}`);
 }
 assert.ok(css.includes(".knowledge-web__manifest"), "styles.css should style the durable analysis manifest");
+
+for (const marker of [
+  "resetKnowledgeReview",
+  "loadKnowledgeReview",
+  "scheduleKnowledgeReviewPoll",
+  "retryKnowledgeReverification",
+  "publishKnowledgeCandidate",
+  "knowledgeReviewLatestTask",
+  "candidate_ready",
+  "window.confirm",
+  'params.set("review", "1")',
+  "复核与发布",
+  "候选差异",
+  "质量规则",
+  "重新入队",
+  "确认发布",
+]) {
+  assert.ok(js.includes(marker), `book knowledge review console should include ${marker}`);
+}
+
+for (const className of [
+  ".knowledge-review",
+  ".knowledge-review__summary",
+  ".knowledge-review__evidence",
+  ".knowledge-review__rules",
+]) {
+  assert.ok(css.includes(className), `styles.css should include ${className}`);
+}
 
 console.log("book knowledge web smoke passed");

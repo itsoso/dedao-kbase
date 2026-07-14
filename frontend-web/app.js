@@ -108,6 +108,16 @@ const knowledgeState = {
   analysisManifest: null,
   analysisManifestLoading: "",
   analysisManifestError: "",
+  releases: [],
+  selectedRelease: null,
+  releaseDetail: null,
+  feedbackAssessment: null,
+  reverificationTasks: [],
+  qualityReport: null,
+  reviewOpen: false,
+  reviewLoading: "",
+  reviewError: "",
+  reviewOperation: "",
   loading: "",
   message: "",
 };
@@ -132,6 +142,8 @@ function knowledgeModelLabel(modelID) {
 let isWCPlusBootstrapped = false;
 let sourceControlPollTimer = null;
 let sourceControlLoadSequence = 0;
+let knowledgeReviewPollTimer = null;
+let knowledgeReviewLoadSequence = 0;
 
 function getToken() {
   for (const key of tokenKeys) {
@@ -415,6 +427,119 @@ function renderHome() {
   `, "home");
 }
 
+function knowledgeReviewLatestTask() {
+  const tasks = Array.isArray(knowledgeState.reverificationTasks) ? knowledgeState.reverificationTasks : [];
+  return tasks[tasks.length - 1] || null;
+}
+
+function knowledgeReviewStatus() {
+  const task = knowledgeReviewLatestTask();
+  if (task?.status) {
+    return task.status;
+  }
+  if (knowledgeState.selectedRelease) {
+    return "healthy";
+  }
+  return "unpublished";
+}
+
+function knowledgeReviewStatusLabel(status) {
+  return ({
+    queued: "等待复核",
+    running: "复核中",
+    candidate_ready: "候选待发布",
+    failed: "复核失败",
+    published: "已发布",
+    healthy: "已发布 · 无待复核",
+    unpublished: "尚未发布",
+  })[status] || status || "未知";
+}
+
+function knowledgeHash(value) {
+  const clean = String(value || "").trim();
+  return clean ? clean.slice(0, 12) : "-";
+}
+
+function renderKnowledgeReview() {
+  const task = knowledgeReviewLatestTask();
+  const status = knowledgeReviewStatus();
+  const release = knowledgeState.releaseDetail || knowledgeState.selectedRelease || {};
+  const assessment = knowledgeState.feedbackAssessment || {};
+  const quality = knowledgeState.qualityReport || {};
+  const rules = Array.isArray(quality.rules) ? quality.rules : [];
+  const triggers = Array.isArray(task?.trigger_outcomes) ? task.trigger_outcomes : [];
+  const canRetry = task?.status === "failed";
+  const canPublish = task?.status === "candidate_ready"
+    && task.quality_decision === "pass"
+    && quality.decision === "pass";
+  const busy = Boolean(knowledgeState.reviewOperation);
+  const summary = knowledgeState.reviewLoading
+    || knowledgeState.reviewError
+    || (task ? `${triggers.join(" / ") || "反馈触发"} · 尝试 ${task.attempts || 0}` : (release.release_id ? `版本 ${knowledgeHash(release.release_id)}` : "完成基线分析与质量校验后可发布"));
+  const ruleRows = rules.map((rule) => `
+    <li class="${rule.passed ? "is-pass" : "is-fail"}">
+      <span>${rule.passed ? "通过" : "未通过"}</span>
+      <strong>${escapeHTML(rule.id || "quality_rule")}</strong>
+      <small>${escapeHTML(rule.message || "-")}</small>
+    </li>
+  `).join("");
+
+  return `
+    <section class="knowledge-review is-${escapeAttribute(status)}" aria-label="复核与发布">
+      <div class="knowledge-review__summary">
+        <div>
+          <p class="web-kicker">Reverification</p>
+          <h3>复核与发布</h3>
+          <p>${escapeHTML(summary)}</p>
+        </div>
+        <div class="knowledge-review__summary-actions">
+          <span class="knowledge-review__status is-${escapeAttribute(status)}">${escapeHTML(knowledgeReviewStatusLabel(status))}</span>
+          <button id="knowledge-review-toggle" class="button button-ghost" type="button" aria-expanded="${knowledgeState.reviewOpen}">${knowledgeState.reviewOpen ? "收起" : "详情"}</button>
+        </div>
+      </div>
+      ${knowledgeState.reviewOpen ? `
+        <div class="knowledge-review__body">
+          ${knowledgeState.reviewError ? `<p class="knowledge-review__error">${escapeHTML(knowledgeState.reviewError)}</p>` : ""}
+          <section class="knowledge-review__evidence" aria-label="候选差异">
+            <div>
+              <p class="web-kicker">Published</p>
+              <h4>已发布版本</h4>
+              <dl>
+                <div><dt>Release</dt><dd>${escapeHTML(knowledgeHash(release.release_id))}</dd></div>
+                <div><dt>内容</dt><dd>${escapeHTML(knowledgeHash(release.content_hash))}</dd></div>
+                <div><dt>分析</dt><dd>${escapeHTML(knowledgeHash(release.quality?.analysis_hash))}</dd></div>
+                <div><dt>时间</dt><dd>${escapeHTML(formatSourceControlTime(release.created_at))}</dd></div>
+              </dl>
+            </div>
+            <div>
+              <p class="web-kicker">Candidate</p>
+              <h4>候选差异</h4>
+              <dl>
+                <div><dt>内容</dt><dd>${escapeHTML(knowledgeHash(task?.candidate_content_hash || quality.content_hash))}</dd></div>
+                <div><dt>分析</dt><dd>${escapeHTML(knowledgeHash(task?.candidate_analysis_hash || quality.analysis_hash))}</dd></div>
+                <div><dt>内容变化</dt><dd>${task?.content_changed ? "有变化" : "无变化"}</dd></div>
+                <div><dt>策略</dt><dd>${escapeHTML(quality.usage_policy || release.usage_policy || "-")}</dd></div>
+              </dl>
+            </div>
+          </section>
+          <section class="knowledge-review__rules" aria-label="质量规则">
+            <div class="knowledge-review__section-head">
+              <div><p class="web-kicker">Quality Gate</p><h4>质量规则</h4></div>
+              <span>${escapeHTML(quality.decision || "未评估")}</span>
+            </div>
+            <ul>${ruleRows || "<li><small>暂无质量报告。</small></li>"}</ul>
+          </section>
+          <div class="knowledge-review__actions">
+            <span>${escapeHTML(knowledgeState.reviewOperation || task?.error_code || (assessment.reverify_required ? "等待人工处理" : "当前发布状态稳定"))}</span>
+            ${canRetry ? `<button id="knowledge-review-retry" class="button button-ghost" type="button" ${busy ? "disabled" : ""}>重新入队</button>` : ""}
+            ${canPublish ? `<button id="knowledge-review-publish" class="button button-primary" type="button" ${busy ? "disabled" : ""}>确认发布</button>` : ""}
+          </div>
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
 function renderBookKnowledge() {
   const bookRows = knowledgeState.books.map((book, index) => {
     const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
@@ -497,6 +622,7 @@ function renderBookKnowledge() {
               <span>${(pkg.claims || []).length} claims</span>
               <span>${(pkg.chunks || []).length} chunks</span>
             </div>
+            ${renderKnowledgeReview()}
             <div class="knowledge-web__content">
               <section>
                 <p class="web-kicker">Chapters</p>
@@ -596,6 +722,201 @@ function resetKnowledgeAnalysis(prompt = "") {
   knowledgeState.analysisManifest = null;
   knowledgeState.analysisManifestLoading = "";
   knowledgeState.analysisManifestError = "";
+}
+
+function resetKnowledgeReview() {
+  knowledgeReviewLoadSequence++;
+  if (knowledgeReviewPollTimer) {
+    clearTimeout(knowledgeReviewPollTimer);
+    knowledgeReviewPollTimer = null;
+  }
+  knowledgeState.releases = [];
+  knowledgeState.selectedRelease = null;
+  knowledgeState.releaseDetail = null;
+  knowledgeState.feedbackAssessment = null;
+  knowledgeState.reverificationTasks = [];
+  knowledgeState.qualityReport = null;
+  knowledgeState.reviewOpen = new URLSearchParams(window.location.search).get("review") === "1";
+  knowledgeState.reviewLoading = "";
+  knowledgeState.reviewError = "";
+  knowledgeState.reviewOperation = "";
+}
+
+async function loadKnowledgeReleaseRecords(bookID) {
+  const releases = [];
+  let after = "";
+  for (let page = 0; page < 20; page++) {
+    const params = new URLSearchParams({ book_id: bookID, limit: "200" });
+    if (after) {
+      params.set("after", after);
+    }
+    const payload = await apiFetch(`/api/knowledge/releases?${params.toString()}`);
+    const pageReleases = Array.isArray(payload.releases) ? payload.releases : [];
+    releases.push(...pageReleases);
+    if (pageReleases.length < 200 || !payload.next_cursor || payload.next_cursor === after) {
+      break;
+    }
+    after = payload.next_cursor;
+  }
+  return releases;
+}
+
+async function loadOptionalKnowledgeResource(path) {
+  try {
+    return await apiFetch(path);
+  } catch (error) {
+    if (error?.status === 404) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function loadKnowledgeReview(bookID, { silent = false, renderResult = true } = {}) {
+  const sequence = ++knowledgeReviewLoadSequence;
+  if (!silent) {
+    knowledgeState.reviewLoading = "加载复核状态";
+    knowledgeState.reviewError = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
+  }
+  try {
+    const releases = await loadKnowledgeReleaseRecords(bookID);
+    const selectedRelease = releases[releases.length - 1] || null;
+    if (sequence !== knowledgeReviewLoadSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.releases = releases;
+    knowledgeState.selectedRelease = selectedRelease;
+    if (!selectedRelease) {
+      const qualityReport = await loadOptionalKnowledgeResource(`/api/books/${encodeURIComponent(bookID)}/quality`);
+      if (sequence !== knowledgeReviewLoadSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+        return;
+      }
+      knowledgeState.releaseDetail = null;
+      knowledgeState.feedbackAssessment = null;
+      knowledgeState.reverificationTasks = [];
+      knowledgeState.qualityReport = qualityReport;
+      return;
+    }
+    const releaseID = encodeURIComponent(selectedRelease.release_id);
+    const [releaseDetail, feedbackAssessment, taskPayload, qualityReport] = await Promise.all([
+      apiFetch(`/api/knowledge/releases/${releaseID}`),
+      apiFetch(`/api/knowledge/releases/${releaseID}/feedback`),
+      apiFetch(`/api/knowledge/releases/${releaseID}/reverification`),
+      loadOptionalKnowledgeResource(`/api/books/${encodeURIComponent(bookID)}/quality`),
+    ]);
+    if (sequence !== knowledgeReviewLoadSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.releaseDetail = releaseDetail;
+    knowledgeState.feedbackAssessment = feedbackAssessment;
+    knowledgeState.reverificationTasks = Array.isArray(taskPayload.tasks) ? taskPayload.tasks : [];
+    knowledgeState.qualityReport = qualityReport;
+  } catch (error) {
+    if (sequence === knowledgeReviewLoadSequence) {
+      knowledgeState.reviewError = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (sequence === knowledgeReviewLoadSequence) {
+      knowledgeState.reviewLoading = "";
+      scheduleKnowledgeReviewPoll();
+      if (renderResult) {
+        renderBookKnowledge();
+      }
+    }
+  }
+}
+
+function scheduleKnowledgeReviewPoll() {
+  if (knowledgeReviewPollTimer) {
+    clearTimeout(knowledgeReviewPollTimer);
+    knowledgeReviewPollTimer = null;
+  }
+  const task = knowledgeReviewLatestTask();
+  if (!window.location.pathname.startsWith("/book-knowledge") || !["queued", "running"].includes(task?.status)) {
+    return;
+  }
+  knowledgeReviewPollTimer = setTimeout(() => {
+    knowledgeReviewPollTimer = null;
+    if (!window.location.pathname.startsWith("/book-knowledge")) {
+      return;
+    }
+    const bookID = knowledgeState.selectedBook?.book_id || "";
+    if (bookID) {
+      loadKnowledgeReview(bookID, { silent: true });
+    }
+  }, 5000);
+}
+
+function setKnowledgeReviewOpen(open) {
+  knowledgeState.reviewOpen = Boolean(open);
+  const params = new URLSearchParams(window.location.search);
+  if (knowledgeState.reviewOpen) {
+    params.set("review", "1");
+  } else {
+    params.delete("review");
+  }
+  const query = params.toString();
+  window.history?.replaceState?.({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+  renderBookKnowledge();
+}
+
+async function retryKnowledgeReverification() {
+  const releaseID = knowledgeState.selectedRelease?.release_id || "";
+  const bookID = knowledgeState.selectedBook?.book_id || "";
+  if (!releaseID || !bookID || knowledgeState.reviewOperation) {
+    return;
+  }
+  knowledgeState.reviewOperation = "正在重新入队";
+  knowledgeState.reviewError = "";
+  renderBookKnowledge();
+  try {
+    await apiFetch(`/api/knowledge/releases/${encodeURIComponent(releaseID)}/reverification/retry`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadKnowledgeReview(bookID, { silent: true, renderResult: false });
+  } catch (error) {
+    if (knowledgeState.selectedBook?.book_id === bookID) {
+      knowledgeState.reviewError = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (knowledgeState.selectedBook?.book_id === bookID) {
+      knowledgeState.reviewOperation = "";
+      renderBookKnowledge();
+    }
+  }
+}
+
+async function publishKnowledgeCandidate() {
+  const bookID = knowledgeState.selectedBook?.book_id || "";
+  if (!bookID || knowledgeState.reviewOperation) {
+    return;
+  }
+  if (!window.confirm("确认发布当前通过质量校验的复核候选？发布后将生成新的不可变 release。")) {
+    return;
+  }
+  knowledgeState.reviewOperation = "正在发布候选";
+  knowledgeState.reviewError = "";
+  renderBookKnowledge();
+  try {
+    await apiFetch(`/api/books/${encodeURIComponent(bookID)}/publish`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadKnowledgeReview(bookID, { silent: true, renderResult: false });
+  } catch (error) {
+    if (knowledgeState.selectedBook?.book_id === bookID) {
+      knowledgeState.reviewError = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (knowledgeState.selectedBook?.book_id === bookID) {
+      knowledgeState.reviewOperation = "";
+      renderBookKnowledge();
+    }
+  }
 }
 
 function renderReader(payload) {
@@ -3266,6 +3587,15 @@ function bindBookKnowledgeEvents() {
   document.querySelector("#knowledge-analysis-generate")?.addEventListener("click", async () => {
     await generateKnowledgeAnalysisManifest();
   });
+  document.querySelector("#knowledge-review-toggle")?.addEventListener("click", () => {
+    setKnowledgeReviewOpen(!knowledgeState.reviewOpen);
+  });
+  document.querySelector("#knowledge-review-retry")?.addEventListener("click", async () => {
+    await retryKnowledgeReverification();
+  });
+  document.querySelector("#knowledge-review-publish")?.addEventListener("click", async () => {
+    await publishKnowledgeCandidate();
+  });
   for (const button of document.querySelectorAll("[data-book-index]")) {
     button.addEventListener("click", async () => {
       const index = Number(button.getAttribute("data-book-index") || "0");
@@ -3296,6 +3626,7 @@ async function loadBookKnowledge() {
       knowledgeState.selectedBook = null;
       knowledgeState.package = null;
       knowledgeState.results = [];
+      resetKnowledgeReview();
     }
     knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
   } catch (error) {
@@ -3313,6 +3644,7 @@ async function selectKnowledgeBook(book, renderBefore = true) {
   knowledgeState.results = [];
   if (book?.book_id !== previousID) {
     resetKnowledgeAnalysis();
+    resetKnowledgeReview();
   }
   knowledgeState.loading = "加载详情";
   if (renderBefore) {
@@ -3320,7 +3652,10 @@ async function selectKnowledgeBook(book, renderBefore = true) {
   }
   try {
     knowledgeState.package = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
-    await loadKnowledgeAnalysisManifest(book.book_id);
+    await Promise.all([
+      loadKnowledgeAnalysisManifest(book.book_id),
+      loadKnowledgeReview(book.book_id, { silent: true, renderResult: false }),
+    ]);
   } catch (error) {
     knowledgeState.message = error instanceof Error ? error.message : String(error);
   } finally {

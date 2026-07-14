@@ -1627,6 +1627,171 @@ a.button {
   font-weight: 750;
 }
 
+.knowledge-review {
+  margin: 0 0 18px;
+  border-top: 1px solid rgba(141, 132, 117, 0.2);
+  border-bottom: 1px solid rgba(141, 132, 117, 0.2);
+  background: rgba(245, 239, 228, 0.26);
+}
+
+.knowledge-review__summary,
+.knowledge-review__summary-actions,
+.knowledge-review__section-head,
+.knowledge-review__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.knowledge-review__summary {
+  min-height: 78px;
+  padding: 12px 2px;
+}
+
+.knowledge-review__summary h3,
+.knowledge-review__section-head h4,
+.knowledge-review__evidence h4 {
+  margin: 0;
+  color: #24231f;
+}
+
+.knowledge-review__summary h3 {
+  font-size: 18px;
+}
+
+.knowledge-review__summary p:not(.web-kicker) {
+  margin: 4px 0 0;
+  color: #756c60;
+  font-size: 12px;
+}
+
+.knowledge-review__status {
+  border: 1px solid rgba(141, 132, 117, 0.2);
+  border-radius: 999px;
+  padding: 6px 9px;
+  color: #71675b;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.knowledge-review__status.is-candidate_ready,
+.knowledge-review__status.is-queued,
+.knowledge-review__status.is-running {
+  border-color: rgba(197, 138, 34, 0.3);
+  color: #8a5c12;
+}
+
+.knowledge-review__status.is-healthy,
+.knowledge-review__status.is-published {
+  border-color: rgba(44, 122, 107, 0.28);
+  color: #2c7a6b;
+}
+
+.knowledge-review__status.is-failed,
+.knowledge-review__error {
+  color: #9d3f2e;
+}
+
+.knowledge-review__body {
+  display: grid;
+  gap: 18px;
+  border-top: 1px solid rgba(141, 132, 117, 0.16);
+  padding: 18px 2px;
+}
+
+.knowledge-review__error {
+  margin: 0;
+  font-size: 13px;
+}
+
+.knowledge-review__evidence {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.knowledge-review__evidence > div + div {
+  border-left: 1px solid rgba(141, 132, 117, 0.18);
+  padding-left: 20px;
+}
+
+.knowledge-review__evidence dl {
+  display: grid;
+  gap: 0;
+  margin: 10px 0 0;
+}
+
+.knowledge-review__evidence dl div {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 10px;
+  border-top: 1px solid rgba(141, 132, 117, 0.12);
+  padding: 8px 0;
+}
+
+.knowledge-review__evidence dt,
+.knowledge-review__evidence dd {
+  margin: 0;
+  font-size: 12px;
+}
+
+.knowledge-review__evidence dt {
+  color: #8d8475;
+  font-weight: 800;
+}
+
+.knowledge-review__evidence dd {
+  overflow-wrap: anywhere;
+  color: #292721;
+}
+
+.knowledge-review__rules ul {
+  display: grid;
+  gap: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.knowledge-review__rules li {
+  display: grid;
+  grid-template-columns: 54px minmax(120px, 0.55fr) minmax(0, 1fr);
+  gap: 10px;
+  border-top: 1px solid rgba(141, 132, 117, 0.14);
+  padding: 9px 0;
+}
+
+.knowledge-review__rules li span,
+.knowledge-review__rules li strong,
+.knowledge-review__rules li small {
+  font-size: 12px;
+}
+
+.knowledge-review__rules li span {
+  color: #2c7a6b;
+  font-weight: 850;
+}
+
+.knowledge-review__rules li.is-fail span {
+  color: #9d3f2e;
+}
+
+.knowledge-review__rules li small,
+.knowledge-review__actions span {
+  color: #756c60;
+}
+
+.knowledge-review__actions {
+  justify-content: flex-end;
+  min-height: 42px;
+}
+
+.knowledge-review__actions span {
+  margin-right: auto;
+  font-size: 12px;
+}
+
 .knowledge-web__content {
   display: grid;
   grid-template-columns: minmax(280px, 42%) minmax(0, 1fr);
@@ -2214,8 +2379,31 @@ a.button {
   }
 
   .knowledge-web__layout,
-  .knowledge-web__content {
+  .knowledge-web__content,
+  .knowledge-review__evidence {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .knowledge-review__summary,
+  .knowledge-review__summary-actions,
+  .knowledge-review__actions {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .knowledge-review__evidence > div + div {
+    border-top: 1px solid rgba(141, 132, 117, 0.18);
+    border-left: 0;
+    padding-top: 16px;
+    padding-left: 0;
+  }
+
+  .knowledge-review__rules li {
+    grid-template-columns: 54px minmax(0, 1fr);
+  }
+
+  .knowledge-review__rules li small {
+    grid-column: 1 / -1;
   }
 
   .knowledge-web__books {
