@@ -131,6 +131,43 @@ func TestKnowledgeFeedbackAssessmentRequiresReverificationForInvalidatingSignals
 	}
 }
 
+func TestKnowledgeFeedbackAssessmentFingerprintAdvancesForEqualTimestamps(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	first, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+		EventID: "event-stale", Consumer: "health-assistant", Outcome: KnowledgeFeedbackStale,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := store.AssessKnowledgeFeedback(release.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+		EventID: "event-conflict", Consumer: "health-assistant", Outcome: KnowledgeFeedbackConflict,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := store.ListKnowledgeFeedback(release.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items[1].CreatedAt = first.CreatedAt
+	if err := writeJSONLFile(store.KnowledgeFeedbackPath(release.ReleaseID), items); err != nil {
+		t.Fatal(err)
+	}
+	advanced, err := store.AssessKnowledgeFeedback(release.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if advanced.ReverificationAt != initial.ReverificationAt {
+		t.Fatalf("timestamps differ: initial=%q advanced=%q", initial.ReverificationAt, advanced.ReverificationAt)
+	}
+	if advanced.ReverificationFingerprint == "" || advanced.ReverificationFingerprint == initial.ReverificationFingerprint {
+		t.Fatalf("fingerprint did not advance: initial=%q advanced=%q", initial.ReverificationFingerprint, advanced.ReverificationFingerprint)
+	}
+}
+
 func feedbackTestStore(t *testing.T) (*BookKnowledgeStore, *KnowledgeRelease) {
 	t.Helper()
 	store := qualityTestStore(t)

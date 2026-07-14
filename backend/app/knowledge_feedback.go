@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -51,12 +52,14 @@ type KnowledgeFeedback struct {
 }
 
 type KnowledgeFeedbackAssessment struct {
-	ReleaseID        string         `json:"release_id"`
-	Disposition      string         `json:"disposition"`
-	ReverifyRequired bool           `json:"reverify_required"`
-	TriggerOutcomes  []string       `json:"trigger_outcomes"`
-	StatusCounts     map[string]int `json:"status_counts"`
-	LatestFeedbackAt string         `json:"latest_feedback_at,omitempty"`
+	ReleaseID                 string         `json:"release_id"`
+	Disposition               string         `json:"disposition"`
+	ReverifyRequired          bool           `json:"reverify_required"`
+	TriggerOutcomes           []string       `json:"trigger_outcomes"`
+	StatusCounts              map[string]int `json:"status_counts"`
+	LatestFeedbackAt          string         `json:"latest_feedback_at,omitempty"`
+	ReverificationAt          string         `json:"reverification_at,omitempty"`
+	ReverificationFingerprint string         `json:"reverification_fingerprint,omitempty"`
 }
 
 func (s *BookKnowledgeStore) KnowledgeFeedbackPath(releaseID string) string {
@@ -97,6 +100,11 @@ func (s *BookKnowledgeStore) SaveKnowledgeFeedback(releaseID string, input Knowl
 		}
 	}
 
+	releaseQueueLock, err := s.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer releaseQueueLock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items, err := readJSONLFile[KnowledgeFeedback](s.KnowledgeFeedbackPath(release.ReleaseID))
@@ -190,19 +198,57 @@ func (s *BookKnowledgeStore) AssessKnowledgeFeedback(releaseID string) (*Knowled
 		disposition = KnowledgeFeedbackReverifyRequired
 	}
 	latestFeedbackAt := ""
+	reverificationAt := ""
+	invalidatingFeedbackIDs := make([]string, 0)
 	for _, item := range items {
-		if item.CreatedAt > latestFeedbackAt {
+		if knowledgeFeedbackTimestampAfter(item.CreatedAt, latestFeedbackAt) {
 			latestFeedbackAt = item.CreatedAt
 		}
+		if invalidatesKnowledgeRelease(item.Outcome) && knowledgeFeedbackTimestampAfter(item.CreatedAt, reverificationAt) {
+			reverificationAt = item.CreatedAt
+		}
+		if invalidatesKnowledgeRelease(item.Outcome) {
+			invalidatingFeedbackIDs = append(invalidatingFeedbackIDs, item.FeedbackID)
+		}
 	}
+	sort.Strings(invalidatingFeedbackIDs)
+	reverificationFingerprint := knowledgeFeedbackSetFingerprint(invalidatingFeedbackIDs)
 	return &KnowledgeFeedbackAssessment{
-		ReleaseID:        release.ReleaseID,
-		Disposition:      disposition,
-		ReverifyRequired: len(triggers) > 0,
-		TriggerOutcomes:  triggers,
-		StatusCounts:     counts,
-		LatestFeedbackAt: latestFeedbackAt,
+		ReleaseID:                 release.ReleaseID,
+		Disposition:               disposition,
+		ReverifyRequired:          len(triggers) > 0,
+		TriggerOutcomes:           triggers,
+		StatusCounts:              counts,
+		LatestFeedbackAt:          latestFeedbackAt,
+		ReverificationAt:          reverificationAt,
+		ReverificationFingerprint: reverificationFingerprint,
 	}, nil
+}
+
+func knowledgeFeedbackTimestampAfter(candidate, current string) bool {
+	if current == "" {
+		return candidate != ""
+	}
+	candidateTime, candidateErr := time.Parse(time.RFC3339Nano, candidate)
+	currentTime, currentErr := time.Parse(time.RFC3339Nano, current)
+	if candidateErr == nil && currentErr == nil {
+		return candidateTime.After(currentTime)
+	}
+	if candidateErr == nil {
+		return true
+	}
+	if currentErr == nil {
+		return false
+	}
+	return candidate > current
+}
+
+func knowledgeFeedbackSetFingerprint(feedbackIDs []string) string {
+	if len(feedbackIDs) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.Join(feedbackIDs, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 func knowledgeFeedbackID(releaseID, consumer, eventID string) string {
@@ -213,6 +259,15 @@ func knowledgeFeedbackID(releaseID, consumer, eventID string) string {
 func validKnowledgeFeedbackOutcome(outcome string) bool {
 	switch outcome {
 	case KnowledgeFeedbackUsed, KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict, KnowledgeFeedbackZeroHit:
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidatesKnowledgeRelease(outcome string) bool {
+	switch strings.ToLower(strings.TrimSpace(outcome)) {
+	case KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict:
 		return true
 	default:
 		return false

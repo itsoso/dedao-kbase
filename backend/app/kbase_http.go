@@ -28,6 +28,8 @@ type KBaseHTTPConfig struct {
 	SourceAgentMaxBodyBytes int64
 	SourceAssets            *SourceAssetStore
 	AnalysisGenerator       BookAnalysisGenerator
+	ReverificationNow       func() time.Time
+	ReverificationCooldown  time.Duration
 }
 
 type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
@@ -45,6 +47,8 @@ type kbaseHTTPHandler struct {
 	sourceAgentMaxBodyBytes int64
 	sourceAssets            *SourceAssetStore
 	analysisGenerator       BookAnalysisGenerator
+	reverificationNow       func() time.Time
+	reverificationCooldown  time.Duration
 }
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
@@ -75,6 +79,17 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if analysisGenerator == nil {
 		analysisGenerator = GenerateBookAnalysisManifest
 	}
+	reverificationNow := cfg.ReverificationNow
+	if reverificationNow == nil {
+		reverificationNow = time.Now
+	}
+	reverificationCooldown := cfg.ReverificationCooldown
+	if reverificationCooldown < 0 {
+		reverificationCooldown = 0
+	}
+	if reverificationCooldown == 0 {
+		reverificationCooldown = 5 * time.Minute
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
@@ -88,6 +103,8 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 		sourceAssets:            assets,
 		analysisGenerator:       analysisGenerator,
+		reverificationNow:       reverificationNow,
+		reverificationCooldown:  reverificationCooldown,
 	}
 }
 
@@ -159,6 +176,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if releaseID, ok := knowledgeReleaseFeedbackPathID(r.URL.Path); ok {
 		h.handleKnowledgeFeedback(w, r, releaseID)
+		return
+	}
+	if releaseID, ok := knowledgeReleaseReverificationPathID(r.URL.Path); ok {
+		h.handleKnowledgeReverification(w, r, releaseID)
 		return
 	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
@@ -237,8 +258,19 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func knowledgeReleaseFeedbackPathID(path string) (string, bool) {
+	return knowledgeReleaseNestedPathID(path, "feedback")
+}
+
+func knowledgeReleaseReverificationPathID(path string) (string, bool) {
+	return knowledgeReleaseNestedPathID(path, "reverification")
+}
+
+func knowledgeReleaseNestedPathID(path, resource string) (string, bool) {
 	const prefix = "/api/knowledge/releases/"
-	const suffix = "/feedback"
+	suffix := "/" + strings.Trim(resource, "/")
+	if suffix == "/" {
+		return "", false
+	}
 	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
 		return "", false
 	}
@@ -297,7 +329,37 @@ func (h *kbaseHTTPHandler) handleKnowledgeFeedback(w http.ResponseWriter, r *htt
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, map[string]any{"feedback": feedback, "status_counts": counts, "assessment": assessment})
+	response := map[string]any{"feedback": feedback, "status_counts": counts, "assessment": assessment}
+	if invalidatesKnowledgeRelease(input.Outcome) {
+		task, enqueueErr := h.store.EnqueueKnowledgeReverification(releaseID, *assessment, h.reverificationNow(), h.reverificationCooldown)
+		if enqueueErr != nil {
+			writeHTTPError(w, http.StatusInternalServerError, enqueueErr.Error())
+			return
+		}
+		response["reverification"] = task
+	}
+	writeHTTPJSON(w, http.StatusOK, response)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeReverification(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if _, err := h.store.LoadKnowledgeRelease(releaseID); err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "release not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tasks, err := h.store.ListKnowledgeReverifications(releaseID)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"release_id": releaseID, "tasks": tasks})
 }
 
 func bookAnalysisPathID(path string) (string, bool) {
@@ -349,7 +411,7 @@ func (h *kbaseHTTPHandler) handleBookPublish(w http.ResponseWriter, r *http.Requ
 			writeHTTPError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if strings.Contains(err.Error(), "quality decision") || strings.Contains(err.Error(), "requires ready") || strings.Contains(err.Error(), "stale") {
+		if strings.Contains(err.Error(), "quality decision") || strings.Contains(err.Error(), "requires ready") || strings.Contains(err.Error(), "stale") || strings.Contains(err.Error(), "reverification") {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}

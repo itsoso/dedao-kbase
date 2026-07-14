@@ -160,3 +160,64 @@ func TestSourceSchedulerTickIntervalUsesBoundedEnvironmentValue(t *testing.T) {
 		t.Fatalf("bounded sourceSchedulerTickInterval() = %s", got)
 	}
 }
+
+func TestStartKnowledgeReverificationRunnerStopsWithContext(t *testing.T) {
+	runnerStarted := make(chan struct{}, 1)
+	runner := knowledgeReverificationRunFunc(func(ctx context.Context, interval time.Duration, onTick func(app.KnowledgeReverificationTickResult, error)) {
+		runnerStarted <- struct{}{}
+		<-ctx.Done()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	started, done := startKnowledgeReverificationRunner(ctx, time.Second, runner, func(string, ...any) {})
+	if !started {
+		t.Fatal("reverification runner did not start")
+	}
+	select {
+	case <-runnerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reverification runner did not run")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reverification runner did not stop with context")
+	}
+	started, done = startKnowledgeReverificationRunner(context.Background(), time.Second, nil, nil)
+	if started {
+		t.Fatal("nil reverification runner started")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("nil runner completion signal is not closed")
+	}
+}
+
+func TestKnowledgeReverificationDurationsUseBoundedEnvironmentValues(t *testing.T) {
+	t.Setenv("KBASE_REVERIFICATION_TICK_SECONDS", "45")
+	t.Setenv("KBASE_REVERIFICATION_COOLDOWN_SECONDS", "600")
+	t.Setenv("KBASE_REVERIFICATION_STALE_SECONDS", "1200")
+	if got := knowledgeReverificationTickInterval(); got != 45*time.Second {
+		t.Fatalf("tick interval = %s", got)
+	}
+	if got := knowledgeReverificationCooldown(); got != 10*time.Minute {
+		t.Fatalf("cooldown = %s", got)
+	}
+	if got := knowledgeReverificationStaleAfter(); got != 20*time.Minute {
+		t.Fatalf("stale after = %s", got)
+	}
+
+	t.Setenv("KBASE_REVERIFICATION_TICK_SECONDS", "0")
+	t.Setenv("KBASE_REVERIFICATION_COOLDOWN_SECONDS", "-1")
+	t.Setenv("KBASE_REVERIFICATION_STALE_SECONDS", "999999")
+	if got := knowledgeReverificationTickInterval(); got != 30*time.Second {
+		t.Fatalf("default tick interval = %s", got)
+	}
+	if got := knowledgeReverificationCooldown(); got != 5*time.Minute {
+		t.Fatalf("default cooldown = %s", got)
+	}
+	if got := knowledgeReverificationStaleAfter(); got != 24*time.Hour {
+		t.Fatalf("bounded stale after = %s", got)
+	}
+}

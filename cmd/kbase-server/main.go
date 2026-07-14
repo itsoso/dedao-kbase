@@ -33,16 +33,18 @@ func main() {
 		log.Fatalf("initialize source sync store: %v", err)
 	}
 	defer sourceSync.Close()
+	bookStore := app.NewBookKnowledgeStore(*root)
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
-		Store:              app.NewBookKnowledgeStore(*root),
-		AuthToken:          *authToken,
-		SystemKBExportPath: *exportPath,
-		StaticDir:          *webDir,
-		WeChat:             app.NewWeChatSourceService(app.WeChatSourceConfigFromEnv()),
-		WCPlus:             app.NewWCPlusSourceService(app.WCPlusSourceConfigFromEnv()),
-		SourceSync:         sourceSync,
-		SourceAgentToken:   *sourceAgentToken,
+		Store:                  bookStore,
+		AuthToken:              *authToken,
+		SystemKBExportPath:     *exportPath,
+		StaticDir:              *webDir,
+		WeChat:                 app.NewWeChatSourceService(app.WeChatSourceConfigFromEnv()),
+		WCPlus:                 app.NewWCPlusSourceService(app.WCPlusSourceConfigFromEnv()),
+		SourceSync:             sourceSync,
+		SourceAgentToken:       *sourceAgentToken,
+		ReverificationCooldown: knowledgeReverificationCooldown(),
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
@@ -73,6 +75,8 @@ func main() {
 	} else {
 		_, schedulerDone = startSourceScheduler(ctx, *sourceAgentToken, sourceSchedulerTickInterval(), scheduler, log.Printf)
 	}
+	reverificationRunner := app.NewKnowledgeReverificationRunner(bookStore, nil, time.Now, knowledgeReverificationStaleAfter())
+	_, reverificationDone := startKnowledgeReverificationRunner(ctx, knowledgeReverificationTickInterval(), reverificationRunner, log.Printf)
 
 	server := &http.Server{Addr: *addr, Handler: handler}
 	go func() {
@@ -88,6 +92,7 @@ func main() {
 	if schedulerDone != nil {
 		<-schedulerDone
 	}
+	<-reverificationDone
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
 		log.Fatal(listenErr)
 	}
@@ -153,6 +158,72 @@ func sourceSchedulerTickInterval() time.Duration {
 	}
 	if seconds > 300 {
 		seconds = 300
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+type knowledgeReverificationRunner interface {
+	Run(context.Context, time.Duration, func(app.KnowledgeReverificationTickResult, error))
+}
+
+type knowledgeReverificationRunFunc func(context.Context, time.Duration, func(app.KnowledgeReverificationTickResult, error))
+
+func (f knowledgeReverificationRunFunc) Run(ctx context.Context, interval time.Duration, onTick func(app.KnowledgeReverificationTickResult, error)) {
+	f(ctx, interval, onTick)
+}
+
+func startKnowledgeReverificationRunner(
+	ctx context.Context,
+	interval time.Duration,
+	runner knowledgeReverificationRunner,
+	logf func(string, ...any),
+) (bool, <-chan struct{}) {
+	done := make(chan struct{})
+	if runner == nil {
+		close(done)
+		return false, done
+	}
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	go func() {
+		defer close(done)
+		runner.Run(ctx, interval, func(result app.KnowledgeReverificationTickResult, err error) {
+			if err != nil {
+				logf("knowledge reverification tick failed: %v", err)
+				return
+			}
+			if result.Processed {
+				logf("knowledge reverification tick: task=%s release=%s status=%s error_code=%s",
+					result.TaskID, result.ReleaseID, result.Status, result.ErrorCode)
+			}
+		})
+	}()
+	return true, done
+}
+
+func knowledgeReverificationTickInterval() time.Duration {
+	return boundedSecondsEnvironment("KBASE_REVERIFICATION_TICK_SECONDS", 30, 300)
+}
+
+func knowledgeReverificationCooldown() time.Duration {
+	return boundedSecondsEnvironment("KBASE_REVERIFICATION_COOLDOWN_SECONDS", 300, 86400)
+}
+
+func knowledgeReverificationStaleAfter() time.Duration {
+	return boundedSecondsEnvironment("KBASE_REVERIFICATION_STALE_SECONDS", 900, 86400)
+}
+
+func boundedSecondsEnvironment(key string, fallback, maximum int) time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil || seconds <= 0 {
+		seconds = fallback
+	}
+	if seconds > maximum {
+		seconds = maximum
 	}
 	return time.Duration(seconds) * time.Second
 }

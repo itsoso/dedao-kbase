@@ -61,6 +61,11 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
+	releaseQueueLock, err := store.acquireKnowledgeReverificationFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseQueueLock()
 	pkg, err := store.LoadPackage(bookID)
 	if err != nil {
 		return nil, err
@@ -89,6 +94,10 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if quality.AnalysisHash == "" || quality.AnalysisHash != analysisHash {
 		return nil, fmt.Errorf("knowledge release analysis hash is stale")
 	}
+	reverificationTask, err := store.ValidateKnowledgeReverificationPublication(bookID, analysisHash)
+	if err != nil {
+		return nil, err
+	}
 	releaseID, err := knowledgeReleaseID(pkg.Book, *analysis.Payload, *quality, analysis.Sources, pkg.Citations)
 	if err != nil {
 		return nil, err
@@ -96,6 +105,11 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if existing, loadErr := store.LoadKnowledgeRelease(releaseID); loadErr == nil {
 		if err := store.saveKnowledgeRelease(*existing); err != nil {
 			return nil, err
+		}
+		if reverificationTask != nil {
+			if err := store.markKnowledgeReverificationPublished(reverificationTask.TaskID, existing.ReleaseID, time.Now()); err != nil {
+				return nil, err
+			}
 		}
 		return existing, nil
 	} else if !errors.Is(loadErr, os.ErrNotExist) {
@@ -127,6 +141,11 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	}
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		return nil, err
+	}
+	if reverificationTask != nil {
+		if err := store.markKnowledgeReverificationPublished(reverificationTask.TaskID, release.ReleaseID, time.Now()); err != nil {
+			return nil, err
+		}
 	}
 	return &release, nil
 }
