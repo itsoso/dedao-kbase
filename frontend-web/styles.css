@@ -1982,6 +1982,33 @@ a.button {
   padding: 0;
 }
 
+.knowledge-web__answer hr {
+  margin: 18px 0;
+  border: 0;
+  border-top: 1px solid rgba(141, 132, 117, 0.2);
+}
+
+.knowledge-web__answer blockquote {
+  margin: 12px 0;
+  border-left: 3px solid rgba(255, 107, 0, 0.48);
+  padding: 2px 0 2px 14px;
+  color: #625b51;
+}
+
+.knowledge-web__answer code {
+  border-radius: 4px;
+  padding: 2px 5px;
+  background: rgba(141, 132, 117, 0.12);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.knowledge-web__answer a {
+  color: #c75400;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .reader-shell {
   min-height: 100vh;
 }

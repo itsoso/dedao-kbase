@@ -692,25 +692,54 @@ function renderBookKnowledge() {
   bindBookKnowledgeEvents();
 }
 
+function renderInlineMarkdown(value) {
+  const tokens = [];
+  const stash = (html) => {
+    const token = `\u0000markdown-token-${tokens.length}\u0000`;
+    tokens.push(html);
+    return token;
+  };
+  let source = String(value || "");
+  source = source.replace(/`([^`\n]+)`/g, (_, code) => stash(`<code>${escapeHTML(code)}</code>`));
+  source = source.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/gi, (_, label, href) => (
+    stash(`<a href="${escapeAttribute(href)}" target="_blank" rel="noopener noreferrer">${escapeHTML(label)}</a>`)
+  ));
+  let rendered = escapeHTML(source)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/__([^_\n]+)__/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(（])\*([^*\n]+)\*(?=$|[\s),.!?;:，。！？；：）])/g, "$1<em>$2</em>");
+  tokens.forEach((html, index) => {
+    rendered = rendered.replaceAll(`\u0000markdown-token-${index}\u0000`, html);
+  });
+  return rendered;
+}
+
 function renderSimpleMarkdown(markdown) {
   const blocks = String(markdown || "").split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
   if (!blocks.length) {
     return "";
   }
   return blocks.map((block) => {
+    if (/^(?:-{3,}|\*{3,}|_{3,})$/.test(block)) {
+      return "<hr>";
+    }
     if (/^#{1,4}\s+/.test(block)) {
       const level = Math.min(4, block.match(/^#+/)?.[0]?.length || 3);
-      return `<h${level}>${escapeHTML(block.replace(/^#{1,4}\s+/, ""))}</h${level}>`;
+      return `<h${level}>${renderInlineMarkdown(block.replace(/^#{1,4}\s+/, ""))}</h${level}>`;
     }
-    if (/^[-*]\s+/m.test(block)) {
-      const items = block.split(/\n/).filter(Boolean).map((line) => line.replace(/^[-*]\s+/, ""));
-      return `<ul>${items.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}</ul>`;
+    const lines = block.split(/\n/).filter(Boolean);
+    if (lines.length && lines.every((line) => /^[-*]\s+/.test(line))) {
+      const items = lines.map((line) => line.replace(/^[-*]\s+/, ""));
+      return `<ul>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`;
     }
-    if (/^\d+\.\s+/m.test(block)) {
-      const items = block.split(/\n/).filter(Boolean).map((line) => line.replace(/^\d+\.\s+/, ""));
-      return `<ol>${items.map((item) => `<li>${escapeHTML(item)}</li>`).join("")}</ol>`;
+    if (lines.length && lines.every((line) => /^\d+\.\s+/.test(line))) {
+      const items = lines.map((line) => line.replace(/^\d+\.\s+/, ""));
+      return `<ol>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ol>`;
     }
-    return `<p>${escapeHTML(block).replace(/\n/g, "<br>")}</p>`;
+    if (lines.length && lines.every((line) => /^>\s?/.test(line))) {
+      return `<blockquote>${lines.map((line) => renderInlineMarkdown(line.replace(/^>\s?/, ""))).join("<br>")}</blockquote>`;
+    }
+    return `<p>${lines.map((line) => renderInlineMarkdown(line)).join("<br>")}</p>`;
   }).join("");
 }
 
