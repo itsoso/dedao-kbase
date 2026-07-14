@@ -1,6 +1,6 @@
 # Automatic Knowledge Reverification Dossier
 
-**Status:** Review
+**Status:** Shipped
 
 ## Requirement
 
@@ -59,10 +59,21 @@ text storage, and synchronous model work in the feedback request.
   digest of invalidating feedback IDs for enqueue, completion, and publication
   gates. Independent re-review reported no remaining Critical, High, or Medium
   findings.
-- **G5 Deployment health:** PENDING.
-- **G6 Online verification:** PENDING.
+- **G5 Deployment health:** PASS. PR #3 merged as `2d85190`. Linux CGO tests
+  and an isolated service-user preflight passed before replacement. The first
+  module download through `proxy.golang.org` timed out; the successful retry
+  used an HTTPS Go module mirror while retaining `go.sum` verification. The
+  deployed and running binary SHA-256 is
+  `83507b5b6b496decc4dbeeef9794b6121b15a73444e8fdf949f148b223b97f24`.
+  Backup: `/opt/dedao-kbase/bin/kbase-server.before-20260714155715`.
+- **G6 Online verification:** PASS. Public `/health` returned 200 before and
+  after deployment. The unauthenticated reverification endpoint returned 401;
+  an authenticated request for a real release returned 200 with the expected
+  release ID and an empty task list. After a complete worker scheduling window,
+  systemd remained active and logs contained no reverification failure, panic,
+  or fatal event. No synthetic invalidating feedback was written to production
+  knowledge solely for verification.
 
 ## Current Stage
 
-S5 implementation, G3 verification, and G4 review are complete. Ready for merge
-and deployment gates.
+S8 shipped and verified in production.
