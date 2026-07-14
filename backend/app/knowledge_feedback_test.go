@@ -84,6 +84,53 @@ func TestKnowledgeFeedbackRejectsInvalidOutcomeAndClaim(t *testing.T) {
 	}
 }
 
+func TestKnowledgeFeedbackAssessmentHealthyWithoutInvalidatingSignals(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	for _, input := range []KnowledgeFeedbackInput{
+		{EventID: "event-used", Consumer: "health-assistant", Outcome: KnowledgeFeedbackUsed, ClaimIDs: []string{"claim-1"}},
+		{EventID: "event-zero-hit", Consumer: "health-assistant", Outcome: KnowledgeFeedbackZeroHit},
+	} {
+		if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assessment, err := store.AssessKnowledgeFeedback(release.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assessment.Disposition != KnowledgeFeedbackHealthy || assessment.ReverifyRequired {
+		t.Fatalf("assessment = %#v", assessment)
+	}
+	if len(assessment.TriggerOutcomes) != 0 || assessment.StatusCounts[KnowledgeFeedbackUsed] != 1 || assessment.StatusCounts[KnowledgeFeedbackZeroHit] != 1 {
+		t.Fatalf("assessment = %#v", assessment)
+	}
+	if assessment.LatestFeedbackAt == "" {
+		t.Fatalf("latest feedback timestamp missing: %#v", assessment)
+	}
+}
+
+func TestKnowledgeFeedbackAssessmentRequiresReverificationForInvalidatingSignals(t *testing.T) {
+	store, release := feedbackTestStore(t)
+	for index, outcome := range []string{KnowledgeFeedbackConflict, KnowledgeFeedbackRejected, KnowledgeFeedbackStale} {
+		if _, _, err := store.SaveKnowledgeFeedback(release.ReleaseID, KnowledgeFeedbackInput{
+			EventID: "event-reverify-" + string(rune('a'+index)), Consumer: "health-assistant", Outcome: outcome,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assessment, err := store.AssessKnowledgeFeedback(release.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{KnowledgeFeedbackRejected, KnowledgeFeedbackStale, KnowledgeFeedbackConflict}
+	if assessment.Disposition != KnowledgeFeedbackReverifyRequired || !assessment.ReverifyRequired {
+		t.Fatalf("assessment = %#v", assessment)
+	}
+	if !equalFeedbackClaimIDs(assessment.TriggerOutcomes, want) {
+		t.Fatalf("trigger outcomes = %#v, want %#v", assessment.TriggerOutcomes, want)
+	}
+}
+
 func feedbackTestStore(t *testing.T) (*BookKnowledgeStore, *KnowledgeRelease) {
 	t.Helper()
 	store := qualityTestStore(t)
