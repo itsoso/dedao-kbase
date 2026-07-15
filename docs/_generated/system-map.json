@@ -834,6 +834,16 @@
       "line": 23
     },
     {
+      "name": "KnowledgeFeedItem",
+      "file": "backend/app/knowledge_release.go",
+      "line": 47
+    },
+    {
+      "name": "KnowledgeFeedPage",
+      "file": "backend/app/knowledge_release.go",
+      "line": 40
+    },
+    {
       "name": "KnowledgeFeedback",
       "file": "backend/app/knowledge_feedback.go",
       "line": 43
@@ -851,17 +861,17 @@
     {
       "name": "KnowledgeRelease",
       "file": "backend/app/knowledge_release.go",
-      "line": 18
+      "line": 24
     },
     {
       "name": "KnowledgeReleaseManifest",
       "file": "backend/app/knowledge_release.go",
-      "line": 42
+      "line": 77
     },
     {
       "name": "KnowledgeReleaseRecord",
       "file": "backend/app/knowledge_release.go",
-      "line": 33
+      "line": 68
     },
     {
       "name": "KnowledgeReverificationCandidate",

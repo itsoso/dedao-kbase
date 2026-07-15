@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/knowledge-feed-v1.schema.json",
+  "title": "Knowledge Feed v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "items", "has_more"],
+  "properties": {
+    "schema_version": { "const": "knowledge_feed.v1" },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["release_id", "book_id", "content_hash", "usage_policy", "created_at", "url"],
+        "properties": {
+          "release_id": { "type": "string", "minLength": 1 },
+          "book_id": { "type": "string", "minLength": 1 },
+          "content_hash": { "type": "string", "minLength": 1 },
+          "supersedes": { "type": "string" },
+          "usage_policy": { "enum": ["standard", "evidence_only"] },
+          "created_at": { "type": "string", "minLength": 1 },
+          "url": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "next_cursor": { "type": "string" },
+    "has_more": { "type": "boolean" }
+  }
+}

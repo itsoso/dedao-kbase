@@ -15,19 +15,54 @@ import (
 
 const knowledgeReleaseVersion = "1"
 
+const (
+	KnowledgeReleaseSchemaVersion = "knowledge_release.v1"
+	KnowledgeFeedSchemaVersion    = "knowledge_feed.v1"
+	DeliveryReceiptSchemaVersion  = "delivery_receipt.v1"
+)
+
 type KnowledgeRelease struct {
-	Version     string                    `json:"version"`
-	ReleaseID   string                    `json:"release_id"`
-	BookID      string                    `json:"book_id"`
-	ContentHash string                    `json:"content_hash"`
-	Supersedes  string                    `json:"supersedes,omitempty"`
-	UsagePolicy string                    `json:"usage_policy"`
-	Book        BookKnowledgeBook         `json:"book"`
-	Analysis    *BookAnalysisPayload      `json:"analysis"`
-	Quality     BookQualityReport         `json:"quality"`
-	Sources     []BookKnowledgeChatSource `json:"sources"`
-	Citations   []BookKnowledgeCitation   `json:"citations"`
-	CreatedAt   string                    `json:"created_at"`
+	SchemaVersion string                    `json:"schema_version,omitempty"`
+	Version       string                    `json:"version"`
+	ReleaseID     string                    `json:"release_id"`
+	BookID        string                    `json:"book_id"`
+	ContentHash   string                    `json:"content_hash"`
+	Supersedes    string                    `json:"supersedes,omitempty"`
+	UsagePolicy   string                    `json:"usage_policy"`
+	Book          BookKnowledgeBook         `json:"book"`
+	Analysis      *BookAnalysisPayload      `json:"analysis"`
+	Quality       BookQualityReport         `json:"quality"`
+	Sources       []BookKnowledgeChatSource `json:"sources"`
+	Citations     []BookKnowledgeCitation   `json:"citations"`
+	CreatedAt     string                    `json:"created_at"`
+}
+
+type KnowledgeFeedPage struct {
+	SchemaVersion string              `json:"schema_version"`
+	Items         []KnowledgeFeedItem `json:"items"`
+	NextCursor    string              `json:"next_cursor,omitempty"`
+	HasMore       bool                `json:"has_more"`
+}
+
+type KnowledgeFeedItem struct {
+	ReleaseID   string `json:"release_id"`
+	BookID      string `json:"book_id"`
+	ContentHash string `json:"content_hash"`
+	Supersedes  string `json:"supersedes,omitempty"`
+	UsagePolicy string `json:"usage_policy"`
+	CreatedAt   string `json:"created_at"`
+	URL         string `json:"url"`
+}
+
+type DeliveryReceipt struct {
+	SchemaVersion       string `json:"schema_version"`
+	ReceiptID           string `json:"receipt_id,omitempty"`
+	Consumer            string `json:"consumer"`
+	ReleaseID           string `json:"release_id"`
+	IdempotencyKey      string `json:"idempotency_key"`
+	Disposition         string `json:"disposition"`
+	ImportedFingerprint string `json:"imported_fingerprint,omitempty"`
+	ReceivedAt          string `json:"received_at,omitempty"`
 }
 
 type KnowledgeReleaseRecord struct {
@@ -116,17 +151,18 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 		return nil, loadErr
 	}
 	release := KnowledgeRelease{
-		Version:     knowledgeReleaseVersion,
-		ReleaseID:   releaseID,
-		BookID:      pkg.Book.BookID,
-		ContentHash: pkg.Book.ContentHash,
-		UsagePolicy: quality.UsagePolicy,
-		Book:        pkg.Book,
-		Analysis:    analysis.Payload,
-		Quality:     *quality,
-		Sources:     append([]BookKnowledgeChatSource(nil), analysis.Sources...),
-		Citations:   append([]BookKnowledgeCitation(nil), pkg.Citations...),
-		CreatedAt:   time.Now().UTC().Format(time.RFC3339Nano),
+		SchemaVersion: KnowledgeReleaseSchemaVersion,
+		Version:       knowledgeReleaseVersion,
+		ReleaseID:     releaseID,
+		BookID:        pkg.Book.BookID,
+		ContentHash:   pkg.Book.ContentHash,
+		UsagePolicy:   quality.UsagePolicy,
+		Book:          pkg.Book,
+		Analysis:      analysis.Payload,
+		Quality:       *quality,
+		Sources:       append([]BookKnowledgeChatSource(nil), analysis.Sources...),
+		Citations:     append([]BookKnowledgeCitation(nil), pkg.Citations...),
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	manifest, err := store.loadKnowledgeReleaseManifest()
 	if err != nil {
@@ -148,6 +184,94 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 		}
 	}
 	return &release, nil
+}
+
+func ValidateKnowledgeReleaseContract(raw []byte) error {
+	var release KnowledgeRelease
+	if err := json.Unmarshal(raw, &release); err != nil {
+		return err
+	}
+	required := map[string]string{
+		"schema_version": release.SchemaVersion,
+		"version":        release.Version,
+		"release_id":     release.ReleaseID,
+		"book_id":        release.BookID,
+		"content_hash":   release.ContentHash,
+		"usage_policy":   release.UsagePolicy,
+		"created_at":     release.CreatedAt,
+	}
+	if err := requireContractFields(required); err != nil {
+		return err
+	}
+	if release.SchemaVersion != KnowledgeReleaseSchemaVersion {
+		return fmt.Errorf("schema_version must be %q", KnowledgeReleaseSchemaVersion)
+	}
+	if strings.TrimSpace(release.Book.BookID) == "" {
+		return fmt.Errorf("book.book_id is required")
+	}
+	if release.Analysis == nil {
+		return fmt.Errorf("analysis is required")
+	}
+	if strings.TrimSpace(release.Quality.Decision) == "" {
+		return fmt.Errorf("quality.decision is required")
+	}
+	if len(release.Citations) == 0 {
+		return fmt.Errorf("citations are required")
+	}
+	return nil
+}
+
+func ValidateKnowledgeFeedContract(raw []byte) error {
+	var feed KnowledgeFeedPage
+	if err := json.Unmarshal(raw, &feed); err != nil {
+		return err
+	}
+	if feed.SchemaVersion != KnowledgeFeedSchemaVersion {
+		return fmt.Errorf("schema_version must be %q", KnowledgeFeedSchemaVersion)
+	}
+	for index, item := range feed.Items {
+		if err := requireContractFields(map[string]string{
+			"items.release_id":   item.ReleaseID,
+			"items.book_id":      item.BookID,
+			"items.content_hash": item.ContentHash,
+			"items.usage_policy": item.UsagePolicy,
+			"items.created_at":   item.CreatedAt,
+			"items.url":          item.URL,
+		}); err != nil {
+			return fmt.Errorf("items[%d]: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func ValidateDeliveryReceiptContract(raw []byte) error {
+	var receipt DeliveryReceipt
+	if err := json.Unmarshal(raw, &receipt); err != nil {
+		return err
+	}
+	if receipt.SchemaVersion != DeliveryReceiptSchemaVersion {
+		return fmt.Errorf("schema_version must be %q", DeliveryReceiptSchemaVersion)
+	}
+	return requireContractFields(map[string]string{
+		"consumer":        receipt.Consumer,
+		"release_id":      receipt.ReleaseID,
+		"idempotency_key": receipt.IdempotencyKey,
+		"disposition":     receipt.Disposition,
+	})
+}
+
+func requireContractFields(fields map[string]string) error {
+	names := make([]string, 0, len(fields))
+	for name := range fields {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if strings.TrimSpace(fields[name]) == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+	}
+	return nil
 }
 
 func knowledgeReleaseID(book BookKnowledgeBook, analysis BookAnalysisPayload, quality BookQualityReport, sources []BookKnowledgeChatSource, citations []BookKnowledgeCitation) (string, error) {
