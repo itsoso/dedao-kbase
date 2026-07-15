@@ -879,6 +879,11 @@
       "line": 35
     },
     {
+      "name": "KnowledgePipelineProjection",
+      "file": "backend/app/knowledge_pipeline.go",
+      "line": 21
+    },
+    {
       "name": "KnowledgeRelease",
       "file": "backend/app/knowledge_release.go",
       "line": 24

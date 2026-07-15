@@ -112,6 +112,18 @@ func (s *KnowledgeCatalogStore) migrate() error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_pipeline_projections (
+			book_id TEXT PRIMARY KEY,
+			content_hash TEXT NOT NULL,
+			stage TEXT NOT NULL,
+			input_fingerprint TEXT NOT NULL,
+			output_ref TEXT NOT NULL DEFAULT '',
+			attempts INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			public_error_code TEXT NOT NULL DEFAULT '',
+			last_published_release_id TEXT NOT NULL DEFAULT '',
+			last_published_at TEXT NOT NULL DEFAULT ''
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
