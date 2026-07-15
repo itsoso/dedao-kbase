@@ -124,6 +124,17 @@ func (s *KnowledgeCatalogStore) migrate() error {
 			last_published_release_id TEXT NOT NULL DEFAULT '',
 			last_published_at TEXT NOT NULL DEFAULT ''
 		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_delivery_receipts (
+			receipt_id TEXT PRIMARY KEY,
+			schema_version TEXT NOT NULL,
+			consumer TEXT NOT NULL,
+			release_id TEXT NOT NULL,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			disposition TEXT NOT NULL,
+			imported_fingerprint TEXT NOT NULL DEFAULT '',
+			received_at TEXT NOT NULL,
+			payload_hash TEXT NOT NULL
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {
