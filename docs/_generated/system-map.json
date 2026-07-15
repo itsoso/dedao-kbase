@@ -1,0 +1,1287 @@
+{
+  "schema_version": "1",
+  "commands": [
+    {
+      "name": "book-mcp",
+      "path": "cmd/book-mcp/main.go"
+    },
+    {
+      "name": "kbase-server",
+      "path": "cmd/kbase-server/main.go"
+    },
+    {
+      "name": "source-agent",
+      "path": "cmd/source-agent/main.go"
+    },
+    {
+      "name": "system-map",
+      "path": "cmd/system-map/main.go"
+    },
+    {
+      "name": "wcplus-agent",
+      "path": "cmd/wcplus-agent/main.go"
+    }
+  ],
+  "http_routes": [
+    {
+      "path": "/api/",
+      "file": "backend/app/kbase_http.go",
+      "line": 112,
+      "authenticated": true
+    },
+    {
+      "path": "/api/",
+      "file": "cmd/system-map/main.go",
+      "line": 203,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/all_articles",
+      "file": "backend/app/kbase_http.go",
+      "line": 240,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/all_articles/export_xlsx",
+      "file": "backend/app/kbase_http.go",
+      "line": 1032,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/content",
+      "file": "backend/app/wcplus_source.go",
+      "line": 348,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/export_text",
+      "file": "backend/app/kbase_http.go",
+      "line": 256,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 250,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/search_title",
+      "file": "backend/app/kbase_http.go",
+      "line": 242,
+      "authenticated": true
+    },
+    {
+      "path": "/api/batch_task/create_task",
+      "file": "backend/app/kbase_http.go",
+      "line": 965,
+      "authenticated": true
+    },
+    {
+      "path": "/api/batch_task/delete_task",
+      "file": "backend/app/kbase_http.go",
+      "line": 967,
+      "authenticated": true
+    },
+    {
+      "path": "/api/book-chat",
+      "file": "backend/app/kbase_http.go",
+      "line": 193,
+      "authenticated": true
+    },
+    {
+      "path": "/api/books",
+      "file": "backend/app/kbase_http.go",
+      "line": 207,
+      "authenticated": true
+    },
+    {
+      "path": "/api/books/",
+      "file": "backend/app/kbase_http.go",
+      "line": 209,
+      "authenticated": true
+    },
+    {
+      "path": "/api/gzh/export_csv",
+      "file": "backend/app/kbase_http.go",
+      "line": 258,
+      "authenticated": true
+    },
+    {
+      "path": "/api/gzh/list",
+      "file": "backend/app/wcplus_source.go",
+      "line": 242,
+      "authenticated": true
+    },
+    {
+      "path": "/api/gzh/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 236,
+      "authenticated": true
+    },
+    {
+      "path": "/api/hades/v1/index/detail",
+      "file": "backend/services/requester.go",
+      "line": 80,
+      "authenticated": true
+    },
+    {
+      "path": "/api/hades/v1/product/list",
+      "file": "backend/services/requester.go",
+      "line": 92,
+      "authenticated": true
+    },
+    {
+      "path": "/api/knowledge/releases",
+      "file": "backend/app/kbase_http.go",
+      "line": 189,
+      "authenticated": true
+    },
+    {
+      "path": "/api/knowledge/releases/",
+      "file": "backend/app/kbase_http.go",
+      "line": 189,
+      "authenticated": true
+    },
+    {
+      "path": "/api/like_article/get_all",
+      "file": "backend/app/kbase_http.go",
+      "line": 252,
+      "authenticated": true
+    },
+    {
+      "path": "/api/local/wechat/accounts",
+      "file": "cmd/source-agent/enrollment.go",
+      "line": 116,
+      "authenticated": true
+    },
+    {
+      "path": "/api/local/wechat/articles",
+      "file": "cmd/source-agent/enrollment.go",
+      "line": 140,
+      "authenticated": true
+    },
+    {
+      "path": "/api/local/wechat/login/qr",
+      "file": "cmd/source-agent/enrollment.go",
+      "line": 89,
+      "authenticated": true
+    },
+    {
+      "path": "/api/local/wechat/login/start",
+      "file": "cmd/source-agent/enrollment.go",
+      "line": 82,
+      "authenticated": true
+    },
+    {
+      "path": "/api/local/wechat/login/status",
+      "file": "cmd/source-agent/enrollment.go",
+      "line": 98,
+      "authenticated": true
+    },
+    {
+      "path": "/api/local/wechat/logout",
+      "file": "cmd/source-agent/enrollment.go",
+      "line": 109,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/bauhinia/pc/class/purchase/article_list",
+      "file": "backend/services/requester.go",
+      "line": 123,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/ddlive/v2/pc/home/live/list",
+      "file": "backend/services/requester.go",
+      "line": 396,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/ddlive/v2/pc/home/live/tablist",
+      "file": "backend/services/requester.go",
+      "line": 386,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/ddlive/v2/pc/live/check",
+      "file": "backend/services/requester.go",
+      "line": 405,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/ebook2/v1/bookshelf/add",
+      "file": "backend/services/requester.go",
+      "line": 310,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/ebook2/v1/pc/read/token",
+      "file": "backend/services/requester.go",
+      "line": 239,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/ebook2/v1/vip/info",
+      "file": "backend/services/requester.go",
+      "line": 285,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/hades/v1/product/remove",
+      "file": "backend/services/requester.go",
+      "line": 322,
+      "authenticated": true
+    },
+    {
+      "path": "/api/pc/user/info",
+      "file": "backend/services/requester.go",
+      "line": 73,
+      "authenticated": true
+    },
+    {
+      "path": "/api/report/gzh_articles",
+      "file": "backend/app/wcplus_source.go",
+      "line": 281,
+      "authenticated": true
+    },
+    {
+      "path": "/api/report/reading_data",
+      "file": "backend/app/kbase_http.go",
+      "line": 246,
+      "authenticated": true
+    },
+    {
+      "path": "/api/report/reading_data",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 302,
+      "authenticated": true
+    },
+    {
+      "path": "/api/report/statistic_data",
+      "file": "backend/app/kbase_http.go",
+      "line": 248,
+      "authenticated": true
+    },
+    {
+      "path": "/api/req_data/get_gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 254,
+      "authenticated": true
+    },
+    {
+      "path": "/api/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 211,
+      "authenticated": true
+    },
+    {
+      "path": "/api/search/pc/hot",
+      "file": "backend/services/requester.go",
+      "line": 469,
+      "authenticated": true
+    },
+    {
+      "path": "/api/search/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 244,
+      "authenticated": true
+    },
+    {
+      "path": "/api/search_gzh/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 238,
+      "authenticated": true
+    },
+    {
+      "path": "/api/search_gzh/search",
+      "file": "backend/app/wcplus_source.go",
+      "line": 878,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/",
+      "file": "backend/app/kbase_http.go",
+      "line": 131,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/heartbeat",
+      "file": "backend/app/kbase_http.go",
+      "line": 1133,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/heartbeat",
+      "file": "backend/app/source_agent_client.go",
+      "line": 146,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/lease",
+      "file": "backend/app/kbase_http.go",
+      "line": 1144,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/lease",
+      "file": "backend/app/source_agent_client.go",
+      "line": 166,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/runs/",
+      "file": "backend/app/kbase_http.go",
+      "line": 1180,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/runs/",
+      "file": "backend/app/source_agent_client.go",
+      "line": 185,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agents",
+      "file": "backend/app/kbase_http.go",
+      "line": 1120,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-assets/",
+      "file": "backend/app/kbase_http.go",
+      "line": 149,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-assets/",
+      "file": "backend/app/wechat_agent.go",
+      "line": 217,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-subscriptions",
+      "file": "backend/app/kbase_http.go",
+      "line": 1121,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-subscriptions/",
+      "file": "backend/app/kbase_http.go",
+      "line": 1122,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-sync/runs",
+      "file": "backend/app/kbase_http.go",
+      "line": 1123,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-sync/runs/",
+      "file": "backend/app/kbase_http.go",
+      "line": 1124,
+      "authenticated": true
+    },
+    {
+      "path": "/api/system-kb/export",
+      "file": "backend/app/kbase_http.go",
+      "line": 213,
+      "authenticated": true
+    },
+    {
+      "path": "/api/system-kb/manifest",
+      "file": "backend/app/kbase_http.go",
+      "line": 215,
+      "authenticated": true
+    },
+    {
+      "path": "/api/task/all",
+      "file": "backend/app/wcplus_source.go",
+      "line": 515,
+      "authenticated": true
+    },
+    {
+      "path": "/api/task/control",
+      "file": "backend/app/kbase_http.go",
+      "line": 1111,
+      "authenticated": true
+    },
+    {
+      "path": "/api/task/control",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 352,
+      "authenticated": true
+    },
+    {
+      "path": "/api/task/control",
+      "file": "backend/app/wcplus_source.go",
+      "line": 553,
+      "authenticated": true
+    },
+    {
+      "path": "/api/task/new",
+      "file": "backend/app/wcplus_source.go",
+      "line": 538,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/",
+      "file": "backend/app/kbase_http.go",
+      "line": 161,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/article/all",
+      "file": "backend/app/kbase_http.go",
+      "line": 239,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/article/content",
+      "file": "backend/app/kbase_http.go",
+      "line": 227,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/article/gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 249,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/article/search-title",
+      "file": "backend/app/kbase_http.go",
+      "line": 241,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/batch-import/gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 970,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/batch-task/create",
+      "file": "backend/app/kbase_http.go",
+      "line": 964,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/batch-task/delete",
+      "file": "backend/app/kbase_http.go",
+      "line": 966,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/env/check",
+      "file": "backend/app/kbase_http.go",
+      "line": 233,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/export/all-articles-xlsx",
+      "file": "backend/app/kbase_http.go",
+      "line": 968,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/export/gzh-csv",
+      "file": "backend/app/kbase_http.go",
+      "line": 257,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/export/text",
+      "file": "backend/app/kbase_http.go",
+      "line": 255,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/gzh/articles",
+      "file": "backend/app/kbase_http.go",
+      "line": 225,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/gzh/list",
+      "file": "backend/app/kbase_http.go",
+      "line": 223,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/gzh/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 235,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/import/account",
+      "file": "backend/app/kbase_http.go",
+      "line": 958,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/import/article",
+      "file": "backend/app/kbase_http.go",
+      "line": 954,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/import/raw",
+      "file": "backend/app/kbase_http.go",
+      "line": 956,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/like-articles",
+      "file": "backend/app/kbase_http.go",
+      "line": 251,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/report/reading-data",
+      "file": "backend/app/kbase_http.go",
+      "line": 245,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/report/statistic-data",
+      "file": "backend/app/kbase_http.go",
+      "line": 247,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/request/gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 253,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 243,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/search-gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 237,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/status",
+      "file": "backend/app/kbase_http.go",
+      "line": 231,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/task/all",
+      "file": "backend/app/kbase_http.go",
+      "line": 229,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/task/control",
+      "file": "backend/app/kbase_http.go",
+      "line": 962,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wcplus/task/new",
+      "file": "backend/app/kbase_http.go",
+      "line": 960,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wechat/article",
+      "file": "backend/app/kbase_http.go",
+      "line": 217,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wechat/articles",
+      "file": "backend/app/kbase_http.go",
+      "line": 221,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wechat/import",
+      "file": "backend/app/kbase_http.go",
+      "line": 153,
+      "authenticated": true
+    },
+    {
+      "path": "/api/wechat/search",
+      "file": "backend/app/kbase_http.go",
+      "line": 219,
+      "authenticated": true
+    },
+    {
+      "path": "/health",
+      "file": "backend/app/kbase_http.go",
+      "line": 116,
+      "authenticated": false
+    },
+    {
+      "path": "/health",
+      "file": "cmd/system-map/main.go",
+      "line": 203,
+      "authenticated": false
+    }
+  ],
+  "source_operations": [
+    {
+      "name": "discover_articles",
+      "file": "backend/app/source_sync.go",
+      "line": 606
+    },
+    {
+      "name": "discover_articles",
+      "file": "backend/app/wechat_agent.go",
+      "line": 55
+    },
+    {
+      "name": "discover_articles",
+      "file": "cmd/system-map/main.go",
+      "line": 212
+    },
+    {
+      "name": "existing_articles",
+      "file": "backend/app/source_sync.go",
+      "line": 593
+    },
+    {
+      "name": "existing_articles",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 188
+    },
+    {
+      "name": "existing_articles",
+      "file": "cmd/system-map/main.go",
+      "line": 212
+    },
+    {
+      "name": "existing_articles",
+      "file": "cmd/wcplus-agent/main.go",
+      "line": 22
+    },
+    {
+      "name": "sync_articles",
+      "file": "backend/app/source_sync.go",
+      "line": 591
+    },
+    {
+      "name": "sync_articles",
+      "file": "backend/app/wechat_agent.go",
+      "line": 55
+    },
+    {
+      "name": "sync_articles",
+      "file": "cmd/system-map/main.go",
+      "line": 212
+    },
+    {
+      "name": "sync_content",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 188
+    },
+    {
+      "name": "sync_content",
+      "file": "cmd/system-map/main.go",
+      "line": 212
+    },
+    {
+      "name": "sync_content",
+      "file": "cmd/wcplus-agent/main.go",
+      "line": 23
+    },
+    {
+      "name": "sync_media",
+      "file": "backend/app/source_sync.go",
+      "line": 606
+    },
+    {
+      "name": "sync_media",
+      "file": "backend/app/wechat_agent.go",
+      "line": 55
+    },
+    {
+      "name": "sync_media",
+      "file": "cmd/system-map/main.go",
+      "line": 212
+    }
+  ],
+  "durable_objects": [
+    {
+      "name": "BookAnalysisManifest",
+      "file": "backend/app/book_analysis.go",
+      "line": 53
+    },
+    {
+      "name": "BookKnowledgeBook",
+      "file": "backend/app/book_knowledge.go",
+      "line": 23
+    },
+    {
+      "name": "BookKnowledgeChapter",
+      "file": "backend/app/book_knowledge.go",
+      "line": 41
+    },
+    {
+      "name": "BookKnowledgeChatContextStats",
+      "file": "backend/app/book_chat.go",
+      "line": 61
+    },
+    {
+      "name": "BookKnowledgeChatHistoryItem",
+      "file": "backend/app/book_chat_history.go",
+      "line": 19
+    },
+    {
+      "name": "BookKnowledgeChatRequest",
+      "file": "backend/app/book_chat.go",
+      "line": 36
+    },
+    {
+      "name": "BookKnowledgeChatResponse",
+      "file": "backend/app/book_chat.go",
+      "line": 44
+    },
+    {
+      "name": "BookKnowledgeChatSource",
+      "file": "backend/app/book_chat.go",
+      "line": 54
+    },
+    {
+      "name": "BookKnowledgeChunk",
+      "file": "backend/app/book_knowledge.go",
+      "line": 50
+    },
+    {
+      "name": "BookKnowledgeCitation",
+      "file": "backend/app/book_knowledge.go",
+      "line": 72
+    },
+    {
+      "name": "BookKnowledgeClaim",
+      "file": "backend/app/book_knowledge.go",
+      "line": 59
+    },
+    {
+      "name": "BookKnowledgeExportResult",
+      "file": "backend/app/book_export.go",
+      "line": 17
+    },
+    {
+      "name": "BookKnowledgeMCPServer",
+      "file": "backend/app/book_mcp.go",
+      "line": 14
+    },
+    {
+      "name": "BookKnowledgeMCPTool",
+      "file": "backend/app/book_mcp.go",
+      "line": 8
+    },
+    {
+      "name": "BookKnowledgeManifest",
+      "file": "backend/app/book_knowledge.go",
+      "line": 94
+    },
+    {
+      "name": "BookKnowledgeMessage",
+      "file": "backend/app/book_chat.go",
+      "line": 31
+    },
+    {
+      "name": "BookKnowledgeNotebookLMBridge",
+      "file": "backend/app/book_notebooklm.go",
+      "line": 16
+    },
+    {
+      "name": "BookKnowledgePackage",
+      "file": "backend/app/book_knowledge.go",
+      "line": 86
+    },
+    {
+      "name": "BookKnowledgePrompt",
+      "file": "backend/app/book_prompts.go",
+      "line": 9
+    },
+    {
+      "name": "BookKnowledgeSearchQuery",
+      "file": "backend/app/book_knowledge.go",
+      "line": 100
+    },
+    {
+      "name": "BookKnowledgeSearchResult",
+      "file": "backend/app/book_knowledge.go",
+      "line": 106
+    },
+    {
+      "name": "BookKnowledgeStore",
+      "file": "backend/app/book_knowledge.go",
+      "line": 118
+    },
+    {
+      "name": "BookQualityReport",
+      "file": "backend/app/book_quality.go",
+      "line": 32
+    },
+    {
+      "name": "DownloadTask",
+      "file": "backend/request/download.go",
+      "line": 23
+    },
+    {
+      "name": "KnowledgeFeedback",
+      "file": "backend/app/knowledge_feedback.go",
+      "line": 43
+    },
+    {
+      "name": "KnowledgeFeedbackAssessment",
+      "file": "backend/app/knowledge_feedback.go",
+      "line": 54
+    },
+    {
+      "name": "KnowledgeFeedbackInput",
+      "file": "backend/app/knowledge_feedback.go",
+      "line": 35
+    },
+    {
+      "name": "KnowledgeRelease",
+      "file": "backend/app/knowledge_release.go",
+      "line": 18
+    },
+    {
+      "name": "KnowledgeReleaseManifest",
+      "file": "backend/app/knowledge_release.go",
+      "line": 42
+    },
+    {
+      "name": "KnowledgeReleaseRecord",
+      "file": "backend/app/knowledge_release.go",
+      "line": 33
+    },
+    {
+      "name": "KnowledgeReverificationCandidate",
+      "file": "backend/app/knowledge_reverification.go",
+      "line": 62
+    },
+    {
+      "name": "KnowledgeReverificationRunner",
+      "file": "backend/app/knowledge_reverification.go",
+      "line": 78
+    },
+    {
+      "name": "KnowledgeReverificationTask",
+      "file": "backend/app/knowledge_reverification.go",
+      "line": 38
+    },
+    {
+      "name": "KnowledgeReverificationTickResult",
+      "file": "backend/app/knowledge_reverification.go",
+      "line": 70
+    },
+    {
+      "name": "SourceAdapterExecutionError",
+      "file": "backend/app/source_adapter.go",
+      "line": 23
+    },
+    {
+      "name": "SourceAdapterItemFailure",
+      "file": "backend/app/source_adapter.go",
+      "line": 17
+    },
+    {
+      "name": "SourceAdapterResult",
+      "file": "backend/app/source_adapter.go",
+      "line": 12
+    },
+    {
+      "name": "SourceAgent",
+      "file": "backend/app/source_sync.go",
+      "line": 67
+    },
+    {
+      "name": "SourceAgentClient",
+      "file": "backend/app/source_agent_client.go",
+      "line": 112
+    },
+    {
+      "name": "SourceAgentConfig",
+      "file": "backend/app/source_agent_client.go",
+      "line": 19
+    },
+    {
+      "name": "SourceAgentCycleResult",
+      "file": "backend/app/source_agent_runner.go",
+      "line": 28
+    },
+    {
+      "name": "SourceAgentHTTPError",
+      "file": "backend/app/source_agent_client.go",
+      "line": 98
+    },
+    {
+      "name": "SourceAgentHeartbeat",
+      "file": "backend/app/source_sync.go",
+      "line": 50
+    },
+    {
+      "name": "SourceAgentOutbox",
+      "file": "backend/app/source_agent_outbox.go",
+      "line": 37
+    },
+    {
+      "name": "SourceAgentOutboxItem",
+      "file": "backend/app/source_agent_outbox.go",
+      "line": 24
+    },
+    {
+      "name": "SourceAgentRunner",
+      "file": "backend/app/source_agent_runner.go",
+      "line": 20
+    },
+    {
+      "name": "SourceAgentRunnerConfig",
+      "file": "backend/app/source_agent_runner.go",
+      "line": 12
+    },
+    {
+      "name": "SourceArticleEnvelope",
+      "file": "backend/app/source_ingest.go",
+      "line": 25
+    },
+    {
+      "name": "SourceAssetEnvelope",
+      "file": "backend/app/source_asset.go",
+      "line": 20
+    },
+    {
+      "name": "SourceAssetReference",
+      "file": "backend/app/source_asset.go",
+      "line": 27
+    },
+    {
+      "name": "SourceAssetStore",
+      "file": "backend/app/source_asset.go",
+      "line": 33
+    },
+    {
+      "name": "SourceCapabilityHealth",
+      "file": "backend/app/source_sync.go",
+      "line": 60
+    },
+    {
+      "name": "SourceDocument",
+      "file": "backend/app/source_ingest.go",
+      "line": 51
+    },
+    {
+      "name": "SourceIngestReceipt",
+      "file": "backend/app/source_ingest.go",
+      "line": 40
+    },
+    {
+      "name": "SourceIngestService",
+      "file": "backend/app/source_ingest.go",
+      "line": 62
+    },
+    {
+      "name": "SourceOperation",
+      "file": "cmd/system-map/main.go",
+      "line": 39
+    },
+    {
+      "name": "SourceScheduler",
+      "file": "backend/app/source_scheduler.go",
+      "line": 27
+    },
+    {
+      "name": "SourceSchedulerTickResult",
+      "file": "backend/app/source_scheduler.go",
+      "line": 15
+    },
+    {
+      "name": "SourceSubscription",
+      "file": "backend/app/source_sync.go",
+      "line": 92
+    },
+    {
+      "name": "SourceSubscriptionInput",
+      "file": "backend/app/source_sync.go",
+      "line": 80
+    },
+    {
+      "name": "SourceSyncItem",
+      "file": "backend/app/source_sync.go",
+      "line": 139
+    },
+    {
+      "name": "SourceSyncItemInput",
+      "file": "backend/app/source_sync.go",
+      "line": 130
+    },
+    {
+      "name": "SourceSyncRun",
+      "file": "backend/app/source_sync.go",
+      "line": 108
+    },
+    {
+      "name": "SourceSyncStore",
+      "file": "backend/app/source_sync.go",
+      "line": 152
+    },
+    {
+      "name": "WCPlusAccount",
+      "file": "backend/app/wcplus_source.go",
+      "line": 47
+    },
+    {
+      "name": "WCPlusAccountList",
+      "file": "backend/app/wcplus_source.go",
+      "line": 56
+    },
+    {
+      "name": "WCPlusAgent",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 52
+    },
+    {
+      "name": "WCPlusAgentBlockedError",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 22
+    },
+    {
+      "name": "WCPlusAgentConfig",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 30
+    },
+    {
+      "name": "WCPlusAgentCycleResult",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 42
+    },
+    {
+      "name": "WCPlusArticle",
+      "file": "backend/app/wcplus_source.go",
+      "line": 61
+    },
+    {
+      "name": "WCPlusArticleContent",
+      "file": "backend/app/wcplus_source.go",
+      "line": 77
+    },
+    {
+      "name": "WCPlusArticleList",
+      "file": "backend/app/wcplus_source.go",
+      "line": 71
+    },
+    {
+      "name": "WCPlusArticleListOptions",
+      "file": "backend/app/wcplus_source.go",
+      "line": 38
+    },
+    {
+      "name": "WCPlusBatchImportItem",
+      "file": "backend/app/wcplus_source.go",
+      "line": 192
+    },
+    {
+      "name": "WCPlusBatchImportRequest",
+      "file": "backend/app/wcplus_source.go",
+      "line": 178
+    },
+    {
+      "name": "WCPlusBatchImportResult",
+      "file": "backend/app/wcplus_source.go",
+      "line": 200
+    },
+    {
+      "name": "WCPlusEnvCheck",
+      "file": "backend/app/wcplus_source.go",
+      "line": 165
+    },
+    {
+      "name": "WCPlusEnvCheckResult",
+      "file": "backend/app/wcplus_source.go",
+      "line": 171
+    },
+    {
+      "name": "WCPlusImportAccountRequest",
+      "file": "backend/app/wcplus_source.go",
+      "line": 103
+    },
+    {
+      "name": "WCPlusImportAccountResult",
+      "file": "backend/app/wcplus_source.go",
+      "line": 110
+    },
+    {
+      "name": "WCPlusImportArticleRequest",
+      "file": "backend/app/wcplus_source.go",
+      "line": 86
+    },
+    {
+      "name": "WCPlusListOptions",
+      "file": "backend/app/wcplus_source.go",
+      "line": 30
+    },
+    {
+      "name": "WCPlusRawImportRequest",
+      "file": "backend/app/wcplus_source.go",
+      "line": 93
+    },
+    {
+      "name": "WCPlusSourceConfig",
+      "file": "backend/app/wcplus_source.go",
+      "line": 20
+    },
+    {
+      "name": "WCPlusSourceService",
+      "file": "backend/app/wcplus_source.go",
+      "line": 25
+    },
+    {
+      "name": "WCPlusStatus",
+      "file": "backend/app/wcplus_source.go",
+      "line": 156
+    },
+    {
+      "name": "WCPlusTask",
+      "file": "backend/app/wcplus_source.go",
+      "line": 116
+    },
+    {
+      "name": "WCPlusTaskControlRequest",
+      "file": "backend/app/wcplus_source.go",
+      "line": 151
+    },
+    {
+      "name": "WCPlusTaskRequest",
+      "file": "backend/app/wcplus_source.go",
+      "line": 132
+    },
+    {
+      "name": "WeChatArticle",
+      "file": "backend/app/wechat_source.go",
+      "line": 50
+    },
+    {
+      "name": "WeChatDiscoveredArticle",
+      "file": "backend/app/wechat_discovery.go",
+      "line": 24
+    },
+    {
+      "name": "WeChatDiscovery",
+      "file": "backend/app/wechat_discovery.go",
+      "line": 38
+    },
+    {
+      "name": "WeChatDiscoveryConfig",
+      "file": "backend/app/wechat_discovery.go",
+      "line": 33
+    },
+    {
+      "name": "WeChatDiscoveryCursor",
+      "file": "backend/app/wechat_discovery.go",
+      "line": 19
+    },
+    {
+      "name": "WeChatDiscoveryError",
+      "file": "backend/app/wechat_discovery.go",
+      "line": 43
+    },
+    {
+      "name": "WeChatDiscoveryPage",
+      "file": "backend/app/wechat_discovery.go",
+      "line": 28
+    },
+    {
+      "name": "WeChatMPCookie",
+      "file": "backend/app/wechat_mp_session.go",
+      "line": 33
+    },
+    {
+      "name": "WeChatMPLoginStatus",
+      "file": "backend/app/wechat_mp_session.go",
+      "line": 64
+    },
+    {
+      "name": "WeChatMPSession",
+      "file": "backend/app/wechat_mp_session.go",
+      "line": 39
+    },
+    {
+      "name": "WeChatMPSessionClient",
+      "file": "backend/app/wechat_mp_session.go",
+      "line": 74
+    },
+    {
+      "name": "WeChatMPSessionConfig",
+      "file": "backend/app/wechat_mp_session.go",
+      "line": 68
+    },
+    {
+      "name": "WeChatMediaAsset",
+      "file": "backend/app/wechat_media.go",
+      "line": 20
+    },
+    {
+      "name": "WeChatMediaConfig",
+      "file": "backend/app/wechat_media.go",
+      "line": 30
+    },
+    {
+      "name": "WeChatMediaDownloader",
+      "file": "backend/app/wechat_media.go",
+      "line": 36
+    },
+    {
+      "name": "WeChatMediaFailure",
+      "file": "backend/app/wechat_media.go",
+      "line": 26
+    },
+    {
+      "name": "WeChatMediaItem",
+      "file": "backend/app/wechat_media.go",
+      "line": 16
+    },
+    {
+      "name": "WeChatOfficialAccount",
+      "file": "backend/app/wechat_source.go",
+      "line": 61
+    },
+    {
+      "name": "WeChatOfficialArticle",
+      "file": "backend/app/wechat_source.go",
+      "line": 67
+    },
+    {
+      "name": "WeChatSourceAdapter",
+      "file": "backend/app/wechat_agent.go",
+      "line": 26
+    },
+    {
+      "name": "WeChatSourceAdapterConfig",
+      "file": "backend/app/wechat_agent.go",
+      "line": 14
+    },
+    {
+      "name": "WeChatSourceConfig",
+      "file": "backend/app/wechat_source.go",
+      "line": 25
+    },
+    {
+      "name": "WeChatSourceService",
+      "file": "backend/app/wechat_source.go",
+      "line": 37
+    },
+    {
+      "name": "sourceAgentDoctorReport",
+      "file": "cmd/source-agent/main.go",
+      "line": 112
+    }
+  ]
+}

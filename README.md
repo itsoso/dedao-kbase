@@ -59,6 +59,8 @@
 
 本 fork 在原有 Wails 桌面端上新增了一条本地书籍知识库链路。`frontend/src/views/BookKnowledge.vue` 是工作台入口，只负责书籍选择、搜索、对话、历史恢复、NotebookLM 操作和导出按钮；所有数据读写都通过 Wails 生成的 `frontend/wailsjs/go/backend/App.*` 调用后端。
 
+当前命令、HTTP 路由、来源操作和持久对象的结构清单由代码生成，见 `docs/system-map/INDEX.md` 和 `docs/_generated/system-map.json`。修改架构结构后运行 `bash scripts/system-map-smoke.sh` 检查漂移。
+
 后端边界集中在 `backend/book_knowledge.go`，它把前端可调用方法转发到 `backend/app` 中的领域模块：
 
 ```mermaid
