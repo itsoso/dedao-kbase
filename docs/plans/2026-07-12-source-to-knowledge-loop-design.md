@@ -106,10 +106,12 @@ quality reports remain administrative surfaces.
 
 ## Automation Policy
 
-Analysis may run automatically after ingestion. Publication is automatic only
-when every hard quality rule passes. Health-related high-risk releases carry
-`usage_policy=evidence_only`; consumer systems must enforce their own safety
-and user-context gates before producing advice.
+Analysis and deterministic quality evaluation may run automatically after
+ingestion. Passing quality creates a candidate; publication remains an explicit
+operator action and is never triggered by model output alone. Health-related
+high-risk releases carry `usage_policy=evidence_only`; consumer systems must
+enforce their own review, safety, and user-context gates before producing
+advice. This boundary is refined by the later knowledge-supply platform design.
 
 Failed jobs use bounded retries with visible terminal errors. Repeated model
 failures do not delete the previous successful release. Content updates make
@@ -130,4 +132,3 @@ share of published claims that are retrieved, cited, and accepted by consumers.
 4. Add consumer feedback persistence.
 5. Connect the health assistant through the release contract in a later repo
    change after the KBase producer contract is stable.
-
