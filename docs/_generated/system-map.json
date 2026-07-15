@@ -834,6 +834,26 @@
       "line": 23
     },
     {
+      "name": "KnowledgeCatalogRecord",
+      "file": "backend/app/knowledge_catalog.go",
+      "line": 48
+    },
+    {
+      "name": "KnowledgeCatalogSource",
+      "file": "backend/app/knowledge_catalog.go",
+      "line": 24
+    },
+    {
+      "name": "KnowledgeCatalogStore",
+      "file": "backend/app/knowledge_catalog.go",
+      "line": 18
+    },
+    {
+      "name": "KnowledgeContentVersion",
+      "file": "backend/app/knowledge_catalog.go",
+      "line": 36
+    },
+    {
       "name": "KnowledgeFeedItem",
       "file": "backend/app/knowledge_release.go",
       "line": 47
@@ -961,7 +981,7 @@
     {
       "name": "SourceArticleEnvelope",
       "file": "backend/app/source_ingest.go",
-      "line": 25
+      "line": 26
     },
     {
       "name": "SourceAssetEnvelope",
@@ -986,17 +1006,17 @@
     {
       "name": "SourceDocument",
       "file": "backend/app/source_ingest.go",
-      "line": 51
+      "line": 52
     },
     {
       "name": "SourceIngestReceipt",
       "file": "backend/app/source_ingest.go",
-      "line": 40
+      "line": 41
     },
     {
       "name": "SourceIngestService",
       "file": "backend/app/source_ingest.go",
-      "line": 62
+      "line": 63
     },
     {
       "name": "SourceOperation",

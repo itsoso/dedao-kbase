@@ -74,7 +74,7 @@ func TestKnowledgeContractFeedAndReceiptRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(receiptRaw, &receipt); err != nil {
 		t.Fatal(err)
 	}
-	if receipt.SchemaVersion != DeliveryReceiptSchemaVersion || receipt.IdempotencyKey == "" || receipt.Consumer != "health-llm-driven" {
+	if receipt.SchemaVersion != DeliveryReceiptSchemaVersion || receipt.IdempotencyKey == "" || receipt.Consumer != "health-consumer" {
 		t.Fatalf("receipt did not round-trip: %#v", receipt)
 	}
 }
