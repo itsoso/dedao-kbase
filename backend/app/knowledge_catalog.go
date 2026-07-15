@@ -135,6 +135,15 @@ func (s *KnowledgeCatalogStore) migrate() error {
 			received_at TEXT NOT NULL,
 			payload_hash TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS knowledge_gap_aggregates (
+			fingerprint TEXT NOT NULL,
+			consumer TEXT NOT NULL DEFAULT '',
+			domain TEXT NOT NULL DEFAULT '',
+			kind TEXT NOT NULL,
+			count INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (fingerprint, consumer, domain, kind)
+		)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.Exec(statement); err != nil {

@@ -198,6 +198,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgeLineage(w, r)
 		return
 	}
+	if r.URL.Path == "/api/knowledge/impact" {
+		h.handleKnowledgeImpact(w, r)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/gaps" {
+		h.handleKnowledgeGaps(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
 		h.handleKnowledgeReleases(w, r)
 		return
@@ -361,6 +369,45 @@ func (h *kbaseHTTPHandler) handleKnowledgeLineage(w http.ResponseWriter, r *http
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, lineage)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeImpact(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	catalog, err := NewKnowledgeCatalogStore(h.store.Root(), time.Now)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer catalog.Close()
+	report, err := BuildKnowledgeImpactReport(h.store, catalog)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, report)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeGaps(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	catalog, err := NewKnowledgeCatalogStore(h.store.Root(), time.Now)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer catalog.Close()
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	report, err := ListKnowledgeGaps(catalog, limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, report)
 }
 
 func knowledgeReleaseFeedbackPathID(path string) (string, bool) {
