@@ -190,6 +190,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDeliveryReceipt(w, r, releaseID)
 		return
 	}
+	if r.URL.Path == "/api/consumers/health/releases" {
+		h.handleHealthKnowledgeFeed(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/feed" {
 		h.handleKnowledgeFeed(w, r)
 		return
@@ -291,6 +295,23 @@ func (h *kbaseHTTPHandler) handleKnowledgeFeed(w http.ResponseWriter, r *http.Re
 		return
 	}
 	page, err := BuildKnowledgeFeedPage(h.store, parseKnowledgeFeedQuery(r.URL.Query()))
+	if err != nil {
+		if strings.Contains(err.Error(), "invalid cursor") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, page)
+}
+
+func (h *kbaseHTTPHandler) handleHealthKnowledgeFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	page, err := BuildHealthKnowledgeFeedPage(h.store, r.URL.Query())
 	if err != nil {
 		if strings.Contains(err.Error(), "invalid cursor") {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
