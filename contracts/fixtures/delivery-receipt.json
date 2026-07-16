@@ -1,0 +1,13 @@
+{
+  "schema_version": "delivery_receipt.v1",
+  "receipt_id": "receipt-fixture-1",
+  "consumer": "health-consumer",
+  "release_id": "release-fixture-1",
+  "idempotency_key": "health-consumer:release-fixture-1:import-1",
+  "disposition": "imported",
+  "imported_fingerprint": "sha256:imported-fixture",
+  "received_at": "2026-07-14T00:00:00Z",
+  "future_optional": {
+    "ignored": true
+  }
+}

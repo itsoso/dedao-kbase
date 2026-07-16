@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/delivery-receipt-v1.schema.json",
+  "title": "Delivery Receipt v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "consumer", "release_id", "idempotency_key", "disposition"],
+  "properties": {
+    "schema_version": { "const": "delivery_receipt.v1" },
+    "receipt_id": { "type": "string" },
+    "consumer": { "type": "string", "minLength": 1 },
+    "release_id": { "type": "string", "minLength": 1 },
+    "idempotency_key": { "type": "string", "minLength": 1 },
+    "disposition": { "enum": ["imported", "held", "rejected", "failed"] },
+    "imported_fingerprint": { "type": "string" },
+    "received_at": { "type": "string" }
+  }
+}

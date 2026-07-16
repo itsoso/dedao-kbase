@@ -186,6 +186,26 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgeReverificationRetry(w, r, releaseID)
 		return
 	}
+	if releaseID, ok := knowledgeReleaseReceiptPathID(r.URL.Path); ok {
+		h.handleDeliveryReceipt(w, r, releaseID)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/feed" {
+		h.handleKnowledgeFeed(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/knowledge/lineage/") {
+		h.handleKnowledgeLineage(w, r)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/impact" {
+		h.handleKnowledgeImpact(w, r)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/gaps" {
+		h.handleKnowledgeGaps(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
 		h.handleKnowledgeReleases(w, r)
 		return
@@ -261,8 +281,141 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *kbaseHTTPHandler) handleKnowledgeFeed(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	page, err := BuildKnowledgeFeedPage(h.store, parseKnowledgeFeedQuery(r.URL.Query()))
+	if err != nil {
+		if strings.Contains(err.Error(), "invalid cursor") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, page)
+}
+
+func (h *kbaseHTTPHandler) handleDeliveryReceipt(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if _, err := h.store.LoadKnowledgeRelease(releaseID); err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "release not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var input DeliveryReceipt
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if input.ReleaseID != releaseID {
+		writeHTTPError(w, http.StatusBadRequest, "release_id must match path")
+		return
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := ValidateDeliveryReceiptContract(raw); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	catalog, err := NewKnowledgeCatalogStore(h.store.Root(), time.Now)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer catalog.Close()
+	receipt, err := catalog.SaveDeliveryReceipt(input, time.Now)
+	if err != nil {
+		if strings.Contains(err.Error(), "idempotency payload conflict") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, receipt)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeLineage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	objectID, err := url.PathUnescape(strings.TrimPrefix(r.URL.Path, "/api/knowledge/lineage/"))
+	if err != nil || strings.TrimSpace(objectID) == "" || strings.Contains(objectID, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "object_id is required")
+		return
+	}
+	lineage, err := BuildKnowledgeLineage(h.store, objectID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "object not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, lineage)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeImpact(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	catalog, err := NewKnowledgeCatalogStore(h.store.Root(), time.Now)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer catalog.Close()
+	report, err := BuildKnowledgeImpactReport(h.store, catalog)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, report)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeGaps(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	catalog, err := NewKnowledgeCatalogStore(h.store.Root(), time.Now)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer catalog.Close()
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	report, err := ListKnowledgeGaps(catalog, limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, report)
+}
+
 func knowledgeReleaseFeedbackPathID(path string) (string, bool) {
 	return knowledgeReleaseNestedPathID(path, "feedback")
+}
+
+func knowledgeReleaseReceiptPathID(path string) (string, bool) {
+	return knowledgeReleaseNestedPathID(path, "receipts")
 }
 
 func knowledgeReleaseReverificationPathID(path string) (string, bool) {

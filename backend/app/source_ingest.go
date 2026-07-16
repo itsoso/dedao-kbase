@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -60,9 +61,10 @@ type SourceDocument struct {
 }
 
 type SourceIngestService struct {
-	books *BookKnowledgeStore
-	sync  *SourceSyncStore
-	now   func() time.Time
+	books   *BookKnowledgeStore
+	sync    *SourceSyncStore
+	catalog *KnowledgeCatalogStore
+	now     func() time.Time
 }
 
 func NewSourceIngestService(books *BookKnowledgeStore, syncStore *SourceSyncStore) *SourceIngestService {
@@ -152,7 +154,27 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 		}
 		return SourceIngestReceipt{}, err
 	}
+	if err := s.recordKnowledgeCatalog(normalized, receipt); err != nil {
+		return SourceIngestReceipt{}, err
+	}
 	return receipt, nil
+}
+
+func (s *SourceIngestService) recordKnowledgeCatalog(envelope SourceArticleEnvelope, receipt SourceIngestReceipt) error {
+	if s.catalog == nil {
+		catalog, err := NewKnowledgeCatalogStore(s.books.Root(), s.now)
+		if err != nil {
+			return err
+		}
+		s.catalog = catalog
+	}
+	_, err := s.catalog.RecordContentVersion(
+		envelope,
+		receipt.ContentHash,
+		receipt.TargetBookID,
+		filepath.ToSlash(filepath.Join("books", sanitizeBookKnowledgeID(receipt.TargetBookID), "manifest.json")),
+	)
+	return err
 }
 
 func (s *SourceIngestService) recordFailure(runID, agentID string, envelope SourceArticleEnvelope, cause error) error {

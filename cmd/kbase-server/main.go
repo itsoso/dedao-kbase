@@ -34,6 +34,11 @@ func main() {
 	}
 	defer sourceSync.Close()
 	bookStore := app.NewBookKnowledgeStore(*root)
+	knowledgeCatalog, err := app.NewKnowledgeCatalogStore(*root, time.Now)
+	if err != nil {
+		log.Fatalf("initialize knowledge catalog: %v", err)
+	}
+	defer knowledgeCatalog.Close()
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:                  bookStore,
