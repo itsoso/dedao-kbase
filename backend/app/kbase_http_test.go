@@ -283,6 +283,76 @@ func TestKBaseHTTPHandlerKnowledgeReleasesFiltersBookBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeReviewCockpit(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	savePipelinePackage(t, store, "review-book", "hash-review")
+	savePipelineAnalysis(t, store, "review-book", "hash-review")
+	savePipelineQuality(t, store, "review-book", "hash-review", BookQualityPass)
+	release := KnowledgeRelease{
+		SchemaVersion: KnowledgeReleaseSchemaVersion,
+		Version:       knowledgeReleaseVersion,
+		ReleaseID:     "release-review",
+		BookID:        "review-book",
+		ContentHash:   "hash-review",
+		UsagePolicy:   BookUsageStandard,
+		Book:          BookKnowledgeBook{BookID: "review-book", Title: "Review Book", ContentHash: "hash-review"},
+		Analysis:      &BookAnalysisPayload{Summary: "summary", Claims: []BookAnalysisClaim{{ID: "claim-1", Statement: "claim", CitationIDs: []string{"citation-1"}, Confidence: 0.8, RiskLevel: "low"}}},
+		Quality:       BookQualityReport{Decision: BookQualityPass, UsagePolicy: BookUsageStandard},
+		Citations:     []BookKnowledgeCitation{{CitationID: "citation-1", BookID: "review-book"}},
+		CreatedAt:     "2026-07-14T12:00:00Z",
+	}
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatalf("save release: %v", err)
+	}
+	assessment := saveReverificationFeedback(t, store, release.ReleaseID, "event-stale", KnowledgeFeedbackStale)
+	if _, err := store.EnqueueKnowledgeReverification(release.ReleaseID, *assessment, time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC), 0); err != nil {
+		t.Fatalf("enqueue reverification: %v", err)
+	}
+	catalog, err := NewKnowledgeCatalogStore(root, nil)
+	if err != nil {
+		t.Fatalf("new catalog: %v", err)
+	}
+	if _, err := catalog.SaveDeliveryReceipt(DeliveryReceipt{
+		SchemaVersion:  DeliveryReceiptSchemaVersion,
+		Consumer:       "health-consumer",
+		ReleaseID:      release.ReleaseID,
+		IdempotencyKey: "health:release-review:1",
+		Disposition:    "imported",
+	}, nil); err != nil {
+		t.Fatalf("save receipt: %v", err)
+	}
+	if err := catalog.RecordKnowledgeGap(KnowledgeGapInput{Consumer: "health-consumer", Domain: "health", Fingerprint: "gap-hash", Kind: "zero_hit"}); err != nil {
+		t.Fatalf("record gap: %v", err)
+	}
+	if err := catalog.Close(); err != nil {
+		t.Fatalf("close catalog: %v", err)
+	}
+
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/knowledge/review", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	resp := requestKBase(handler, http.MethodGet, "/api/knowledge/review?limit=20", "secret-token")
+	body := resp.Body.String()
+	if resp.Code != http.StatusOK ||
+		!strings.Contains(body, `"schema_version":"knowledge_review.v1"`) ||
+		!strings.Contains(body, `"release_id":"release-review"`) ||
+		!strings.Contains(body, `"latest_reverification_status":"queued"`) ||
+		!strings.Contains(body, `"attention_reasons":["reverification_queued"]`) ||
+		!strings.Contains(body, `"receipt_counts":{"imported":1}`) ||
+		!strings.Contains(body, `"pipeline_stage":"published"`) ||
+		!strings.Contains(body, `"published_releases":1`) ||
+		!strings.Contains(body, `"fingerprint":"gap-hash"`) {
+		t.Fatalf("review status=%d body=%s", resp.Code, body)
+	}
+	invalid := requestKBase(handler, http.MethodGet, "/api/knowledge/review?limit=201", "secret-token")
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)

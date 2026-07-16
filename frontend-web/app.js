@@ -114,6 +114,10 @@ const knowledgeState = {
   feedbackAssessment: null,
   reverificationTasks: [],
   qualityReport: null,
+  reviewCockpit: null,
+  reviewCockpitOpen: true,
+  reviewCockpitLoading: "",
+  reviewCockpitError: "",
   reviewOpen: false,
   reviewLoading: "",
   reviewError: "",
@@ -137,6 +141,17 @@ const knowledgeAnalysisModels = [
 
 function knowledgeModelLabel(modelID) {
   return knowledgeAnalysisModels.find((model) => model.id === modelID)?.label || modelID;
+}
+
+function knowledgeReviewReasonLabel(reason) {
+  const labels = {
+    reverification_queued: "等待复核",
+    reverification_running: "复核中",
+    reverification_failed: "复核失败",
+    candidate_ready: "候选待发布",
+    no_delivery_receipt: "未被下游接收",
+  };
+  return labels[reason] || reason;
 }
 
 let isWCPlusBootstrapped = false;
@@ -540,6 +555,57 @@ function renderKnowledgeReview() {
   `;
 }
 
+function renderKnowledgeReviewCockpit() {
+  const cockpit = knowledgeState.reviewCockpit || {};
+  const impact = cockpit.impact || {};
+  const items = Array.isArray(cockpit.items) ? cockpit.items : [];
+  const attentionItems = items.filter((item) => Array.isArray(item.attention_reasons) && item.attention_reasons.length);
+  const stageEntries = Object.entries(impact.pipeline_stages || {});
+  const receiptEntries = Object.entries(impact.receipts || {});
+  const gapItems = Array.isArray(cockpit.gaps) ? cockpit.gaps : [];
+  const receiptTotal = receiptEntries.reduce((sum, [, count]) => sum + Number(count || 0), 0);
+  const status = knowledgeState.reviewCockpitLoading || knowledgeState.reviewCockpitError || `${attentionItems.length} 条需要处理`;
+  const visibleItems = attentionItems.length ? attentionItems : items.slice(0, 5);
+  return `
+    <section class="knowledge-cockpit ${knowledgeState.reviewCockpitOpen ? "is-open" : ""}" aria-label="全局复核">
+      <div class="knowledge-cockpit__head">
+        <div>
+          <p class="web-kicker">Review Cockpit</p>
+          <h2>全局复核</h2>
+        </div>
+        <div class="knowledge-cockpit__actions">
+          <span>${escapeHTML(status)}</span>
+          <button id="knowledge-cockpit-refresh" class="button button-ghost" type="button">更新</button>
+          <button id="knowledge-cockpit-toggle" class="button button-ghost" type="button" aria-expanded="${knowledgeState.reviewCockpitOpen}">${knowledgeState.reviewCockpitOpen ? "收起" : "展开"}</button>
+        </div>
+      </div>
+      ${knowledgeState.reviewCockpitOpen ? `
+        <div class="knowledge-cockpit__body">
+          <div class="knowledge-cockpit__metrics">
+            <div><span>Published</span><strong>${Number(impact.published_releases || 0)}</strong></div>
+            <div><span>Receipts</span><strong>${receiptTotal}</strong></div>
+            <div><span>Gaps</span><strong>${gapItems.length}</strong></div>
+          </div>
+          <div class="knowledge-cockpit__chips">
+            ${stageEntries.map(([stage, count]) => `<span>${escapeHTML(stage)} ${Number(count || 0)}</span>`).join("") || "<span>pipeline 暂无数据</span>"}
+            ${receiptEntries.map(([disposition, count]) => `<span>${escapeHTML(disposition)} ${Number(count || 0)}</span>`).join("")}
+          </div>
+          ${knowledgeState.reviewCockpitError ? `<p class="knowledge-cockpit__error">${escapeHTML(knowledgeState.reviewCockpitError)}</p>` : ""}
+          <div class="knowledge-cockpit__items">
+            ${visibleItems.map((item) => `
+              <button class="knowledge-cockpit__item" type="button" data-cockpit-book-id="${escapeAttribute(item.book_id || "")}">
+                <strong>${escapeHTML(item.title || item.book_id || item.release_id || "未命名知识")}</strong>
+                <span>${escapeHTML(item.pipeline_stage || "unknown")} · ${escapeHTML(item.latest_reverification_status || item.quality_decision || "stable")}</span>
+                <small>${(item.attention_reasons || []).map((reason) => escapeHTML(knowledgeReviewReasonLabel(reason))).join(" / ") || "暂无处理项"}</small>
+              </button>
+            `).join("") || "<p class=\"web-muted\">暂无发布知识，先完成分析、质量校验和发布。</p>"}
+          </div>
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
 function renderBookKnowledge() {
   const bookRows = knowledgeState.books.map((book, index) => {
     const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
@@ -582,6 +648,7 @@ function renderBookKnowledge() {
     failed: "需重试",
   };
   const manifestActionLabel = analysisManifest.answer ? "重新生成" : "生成基线分析";
+  const cockpitHTML = renderKnowledgeReviewCockpit();
 
   renderShell(`
     <main class="knowledge-web">
@@ -593,6 +660,7 @@ function renderBookKnowledge() {
         <button id="knowledge-refresh" class="button button-ghost" type="button">刷新</button>
       </section>
       ${status}
+      ${cockpitHTML}
 
       <div class="knowledge-web__layout">
         <aside class="knowledge-web__sidebar">
@@ -3586,6 +3654,25 @@ function bindBookKnowledgeEvents() {
   document.querySelector("#knowledge-refresh")?.addEventListener("click", () => {
     loadBookKnowledge();
   });
+  document.querySelector("#knowledge-cockpit-refresh")?.addEventListener("click", () => {
+    loadKnowledgeReviewCockpit();
+  });
+  document.querySelector("#knowledge-cockpit-toggle")?.addEventListener("click", () => {
+    knowledgeState.reviewCockpitOpen = !knowledgeState.reviewCockpitOpen;
+    renderBookKnowledge();
+  });
+  for (const button of document.querySelectorAll("[data-cockpit-book-id]")) {
+    button.addEventListener("click", async () => {
+      const bookID = button.getAttribute("data-cockpit-book-id") || "";
+      const book = knowledgeState.books.find((item) => item.book_id === bookID);
+      if (!book) {
+        return;
+      }
+      window.history?.pushState?.({}, "", `${sourceKnowledgeURL(book.book_id)}?review=1`);
+      await selectKnowledgeBook(book);
+      setKnowledgeReviewOpen(true);
+    });
+  }
   document.querySelector("#knowledge-search-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -3642,6 +3729,7 @@ async function loadBookKnowledge() {
   knowledgeState.message = "";
   renderBookKnowledge();
   try {
+    await loadKnowledgeReviewCockpit({ silent: true, renderResult: false });
     const payload = await apiFetch("/api/books");
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length) {
@@ -3663,6 +3751,26 @@ async function loadBookKnowledge() {
   } finally {
     knowledgeState.loading = "";
     renderBookKnowledge();
+  }
+}
+
+async function loadKnowledgeReviewCockpit({ silent = false, renderResult = true } = {}) {
+  if (!silent) {
+    knowledgeState.reviewCockpitLoading = "加载全局复核";
+    knowledgeState.reviewCockpitError = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
+  }
+  try {
+    knowledgeState.reviewCockpit = await apiFetch("/api/knowledge/review?limit=50");
+  } catch (error) {
+    knowledgeState.reviewCockpitError = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.reviewCockpitLoading = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
   }
 }
 
