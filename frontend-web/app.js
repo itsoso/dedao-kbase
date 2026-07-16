@@ -566,6 +566,7 @@ function renderKnowledgeReviewCockpit() {
   const receiptTotal = receiptEntries.reduce((sum, [, count]) => sum + Number(count || 0), 0);
   const status = knowledgeState.reviewCockpitLoading || knowledgeState.reviewCockpitError || `${attentionItems.length} 条需要处理`;
   const visibleItems = attentionItems.length ? attentionItems : items.slice(0, 5);
+  const supplyStatus = renderKnowledgeSupplyStatus(cockpit);
   return `
     <section class="knowledge-cockpit ${knowledgeState.reviewCockpitOpen ? "is-open" : ""}" aria-label="全局复核">
       <div class="knowledge-cockpit__head">
@@ -586,6 +587,7 @@ function renderKnowledgeReviewCockpit() {
             <div><span>Receipts</span><strong>${receiptTotal}</strong></div>
             <div><span>Gaps</span><strong>${gapItems.length}</strong></div>
           </div>
+          ${supplyStatus}
           <div class="knowledge-cockpit__chips">
             ${stageEntries.map(([stage, count]) => `<span>${escapeHTML(stage)} ${Number(count || 0)}</span>`).join("") || "<span>pipeline 暂无数据</span>"}
             ${receiptEntries.map(([disposition, count]) => `<span>${escapeHTML(disposition)} ${Number(count || 0)}</span>`).join("")}
@@ -602,6 +604,39 @@ function renderKnowledgeReviewCockpit() {
           </div>
         </div>
       ` : ""}
+    </section>
+  `;
+}
+
+function renderKnowledgeSupplyStatus(cockpit) {
+  const impact = cockpit?.impact || {};
+  const rebuildActions = impact.rebuild_actions || {};
+  const rebuildPlan = cockpit?.rebuild_plan || {};
+  const rebuildItems = Array.isArray(rebuildPlan.items) ? rebuildPlan.items : [];
+  const needsRebuild = Number(rebuildActions.rebuild || 0) + Number(rebuildActions.reevaluate || 0) + Number(rebuildActions.republish || 0);
+  const published = Number(impact.published_releases || 0);
+  const cards = [
+    ["Source Connector", "ready", "healthy", "统一来源契约已启用"],
+    ["Search Index", "ready", published > 0 ? "healthy" : "quiet", published > 0 ? "可从知识包重建" : "等待发布知识"],
+    ["Health Feed", published, published > 0 ? "healthy" : "quiet", "evidence_only release"],
+    ["Evaluation", "smoke", "healthy", "检索与引用质量检查"],
+    ["Rebuild Plan", needsRebuild || "clear", needsRebuild ? "attention" : "healthy", rebuildItems.length ? `${rebuildItems.length} 个 release 已评估` : "暂无发布版本"],
+  ];
+  return `
+    <section class="knowledge-supply" aria-label="供应链状态">
+      <div class="knowledge-supply__head">
+        <p class="web-kicker">Knowledge Supply</p>
+        <h3>供应链状态</h3>
+      </div>
+      <div class="knowledge-supply__grid">
+        ${cards.map(([label, value, status, detail]) => `
+          <div class="knowledge-supply__card">
+            <span class="knowledge-supply__status is-${escapeAttribute(status)}">${escapeHTML(label)}</span>
+            <strong>${escapeHTML(String(value))}</strong>
+            <small>${escapeHTML(detail)}</small>
+          </div>
+        `).join("")}
+      </div>
     </section>
   `;
 }

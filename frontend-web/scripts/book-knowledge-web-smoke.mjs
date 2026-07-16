@@ -106,6 +106,15 @@ for (const marker of [
   "质量规则",
   "重新入队",
   "确认发布",
+  "renderKnowledgeSupplyStatus",
+  "供应链状态",
+  "Source Connector",
+  "Search Index",
+  "Health Feed",
+  "Evaluation",
+  "Rebuild Plan",
+  "rebuild_actions",
+  "rebuild_plan",
 ]) {
   assert.ok(js.includes(marker), `book knowledge review console should include ${marker}`);
 }
@@ -118,6 +127,9 @@ for (const className of [
   ".knowledge-cockpit",
   ".knowledge-cockpit__metrics",
   ".knowledge-cockpit__items",
+  ".knowledge-supply",
+  ".knowledge-supply__card",
+  ".knowledge-supply__status",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
