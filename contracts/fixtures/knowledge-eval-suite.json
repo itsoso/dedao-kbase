@@ -1,0 +1,14 @@
+{
+  "schema_version": "knowledge_eval_suite.v1",
+  "cases": [
+    {
+      "id": "fixture-hit",
+      "query": "evidence boundary",
+      "expected_chunk_ids": ["fixture-chunk-1"],
+      "answer": "The answer must cite the source chunk. [fixture-chunk-1]",
+      "citation_ids": ["fixture-chunk-1"],
+      "consumer": "health",
+      "domain": "health"
+    }
+  ]
+}
