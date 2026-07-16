@@ -26,6 +26,7 @@ for (const endpoint of [
   "/api/book-chat",
   "/analysis",
   "/api/knowledge/releases?",
+  "/api/knowledge/review?limit=50",
   "/feedback",
   "/reverification",
   "/reverification/retry",
@@ -91,6 +92,11 @@ for (const marker of [
   "scheduleKnowledgeReviewPoll",
   "retryKnowledgeReverification",
   "publishKnowledgeCandidate",
+  "loadKnowledgeReviewCockpit",
+  "renderKnowledgeReviewCockpit",
+  "Review Cockpit",
+  "全局复核",
+  "data-cockpit-book-id",
   "knowledgeReviewLatestTask",
   "candidate_ready",
   "window.confirm",
@@ -109,6 +115,9 @@ for (const className of [
   ".knowledge-review__summary",
   ".knowledge-review__evidence",
   ".knowledge-review__rules",
+  ".knowledge-cockpit",
+  ".knowledge-cockpit__metrics",
+  ".knowledge-cockpit__items",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
