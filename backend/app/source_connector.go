@@ -147,6 +147,32 @@ func NormalizeSourceDocumentEnvelope(input SourceDocumentEnvelope) (SourceDocume
 	return input, hex.EncodeToString(sum[:]), nil
 }
 
+func SourceArticleEnvelopeFromDocument(document SourceDocumentEnvelope) (SourceArticleEnvelope, string, error) {
+	normalized, contentHash, err := NormalizeSourceDocumentEnvelope(document)
+	if err != nil {
+		return SourceArticleEnvelope{}, "", err
+	}
+	metadata := make(map[string]string, len(normalized.Metadata)+1)
+	for key, value := range normalized.Metadata {
+		metadata[key] = value
+	}
+	metadata["license_scope"] = normalized.LicenseScope
+	return SourceArticleEnvelope{
+		IdempotencyKey:  normalized.IdempotencyKey,
+		SourceType:      normalized.SourceType,
+		SourceAccountID: normalized.SourceAccountKey,
+		SourceAccount:   normalized.SourceAccount,
+		SourceItemID:    normalized.SourceItemKey,
+		Title:           normalized.Title,
+		Author:          normalized.Author,
+		SourceURL:       normalized.SourceURL,
+		PublishedAt:     normalized.PublishedAt,
+		Content:         normalized.Content,
+		ContentFormat:   normalized.ContentFormat,
+		Metadata:        metadata,
+	}, contentHash, nil
+}
+
 func normalizeSourceLicenseScope(scope string) string {
 	return strings.ToLower(strings.TrimSpace(scope))
 }

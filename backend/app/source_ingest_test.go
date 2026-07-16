@@ -226,6 +226,50 @@ func TestIngestSourceArticleDoesNotAdvanceDocumentWhenPackageWriteFails(t *testi
 	}
 }
 
+func TestSourceDocumentEnvelopeConvertsToSourceArticleEnvelope(t *testing.T) {
+	document := SourceDocumentEnvelope{
+		IdempotencyKey:   " doc-idem ",
+		SourceType:       " wechat_mp_article ",
+		SourceAccountKey: " biz-evidence ",
+		SourceAccount:    " 证据参考 ",
+		SourceItemKey:    " article-99 ",
+		Title:            " 证据加工流程 ",
+		Author:           " 作者 ",
+		SourceURL:        "https://mp.weixin.qq.com/s/article-99#rd",
+		PublishedAt:      "2026-07-16T10:00:00Z",
+		Content:          "# 标题\n\n" + strings.Repeat("知识加工需要保留来源、授权、版本与证据链。", 6),
+		ContentFormat:    "markdown",
+		LicenseScope:     SourceLicenseScopePersonalUse,
+		Metadata:         map[string]string{" topic ": " evidence "},
+	}
+
+	envelope, contentHash, err := SourceArticleEnvelopeFromDocument(document)
+	if err != nil {
+		t.Fatalf("convert document: %v", err)
+	}
+	if envelope.IdempotencyKey != "doc-idem" ||
+		envelope.SourceType != "wechat_mp_article" ||
+		envelope.SourceAccountID != "biz-evidence" ||
+		envelope.SourceAccount != "证据参考" ||
+		envelope.SourceItemID != "article-99" ||
+		envelope.Title != "证据加工流程" ||
+		envelope.Author != "作者" ||
+		envelope.SourceURL != "https://mp.weixin.qq.com/s/article-99" ||
+		envelope.ContentFormat != "markdown" {
+		t.Fatalf("unexpected article envelope: %#v", envelope)
+	}
+	if envelope.Metadata["topic"] != "evidence" || envelope.Metadata["license_scope"] != SourceLicenseScopePersonalUse {
+		t.Fatalf("metadata not preserved: %#v", envelope.Metadata)
+	}
+	_, normalizedHash, err := normalizeSourceArticleEnvelope(envelope)
+	if err != nil {
+		t.Fatalf("article envelope should remain ingestable: %v", err)
+	}
+	if contentHash == "" || contentHash != normalizedHash {
+		t.Fatalf("content hash mismatch: document=%q article=%q", contentHash, normalizedHash)
+	}
+}
+
 func createSourceIngestSubscription(t *testing.T, store *SourceSyncStore) SourceSubscription {
 	t.Helper()
 	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
