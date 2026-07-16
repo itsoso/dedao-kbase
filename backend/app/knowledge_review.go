@@ -13,6 +13,7 @@ type KnowledgeReviewCockpit struct {
 	SchemaVersion string                  `json:"schema_version"`
 	Items         []KnowledgeReviewItem   `json:"items"`
 	Impact        KnowledgeImpactReport   `json:"impact"`
+	RebuildPlan   KnowledgeRebuildPlan    `json:"rebuild_plan"`
 	Gaps          []KnowledgeGapAggregate `json:"gaps"`
 	GeneratedAt   string                  `json:"generated_at"`
 }
@@ -74,6 +75,10 @@ func BuildKnowledgeReviewCockpit(store *BookKnowledgeStore, catalog *KnowledgeCa
 	if err != nil {
 		return KnowledgeReviewCockpit{}, err
 	}
+	rebuildPlan, err := BuildKnowledgeRebuildPlan(store, catalog, KnowledgeRebuildPlanQuery{})
+	if err != nil {
+		return KnowledgeReviewCockpit{}, err
+	}
 	gapReport, err := ListKnowledgeGaps(catalog, 20)
 	if err != nil {
 		return KnowledgeReviewCockpit{}, err
@@ -115,6 +120,7 @@ func BuildKnowledgeReviewCockpit(store *BookKnowledgeStore, catalog *KnowledgeCa
 		SchemaVersion: KnowledgeReviewSchemaVersion,
 		Items:         items,
 		Impact:        impact,
+		RebuildPlan:   rebuildPlan,
 		Gaps:          gapReport.Gaps,
 		GeneratedAt:   now().UTC().Format(time.RFC3339Nano),
 	}, nil

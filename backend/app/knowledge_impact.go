@@ -10,6 +10,7 @@ type KnowledgeImpactReport struct {
 	PublishedReleases int            `json:"published_releases"`
 	Receipts          map[string]int `json:"receipts"`
 	PipelineStages    map[string]int `json:"pipeline_stages"`
+	RebuildActions    map[string]int `json:"rebuild_actions,omitempty"`
 }
 
 type KnowledgeGapInput struct {
@@ -52,6 +53,7 @@ func BuildKnowledgeImpactReport(store *BookKnowledgeStore, catalog *KnowledgeCat
 		PublishedReleases: len(manifest.Releases),
 		Receipts:          map[string]int{},
 		PipelineStages:    map[string]int{},
+		RebuildActions:    map[string]int{},
 	}
 	rows, err := catalog.db.Query(`SELECT disposition, COUNT(*) FROM knowledge_delivery_receipts GROUP BY disposition`)
 	if err != nil {
@@ -82,7 +84,19 @@ func BuildKnowledgeImpactReport(store *BookKnowledgeStore, catalog *KnowledgeCat
 		}
 		report.PipelineStages[stage] = count
 	}
-	return report, stageRows.Err()
+	if err := stageRows.Err(); err != nil {
+		return KnowledgeImpactReport{}, err
+	}
+	plan, err := BuildKnowledgeRebuildPlan(store, catalog, KnowledgeRebuildPlanQuery{})
+	if err != nil {
+		return KnowledgeImpactReport{}, err
+	}
+	for _, item := range plan.Items {
+		for _, action := range item.Actions {
+			report.RebuildActions[action]++
+		}
+	}
+	return report, nil
 }
 
 func (s *KnowledgeCatalogStore) RecordKnowledgeGap(input KnowledgeGapInput) error {

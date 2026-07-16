@@ -344,6 +344,8 @@ func TestKBaseHTTPHandlerKnowledgeReviewCockpit(t *testing.T) {
 		!strings.Contains(body, `"receipt_counts":{"imported":1}`) ||
 		!strings.Contains(body, `"pipeline_stage":"published"`) ||
 		!strings.Contains(body, `"published_releases":1`) ||
+		!strings.Contains(body, `"rebuild_actions":{"noop":1}`) ||
+		!strings.Contains(body, `"rebuild_plan":{"schema_version":"knowledge_rebuild_plan.v1"`) ||
 		!strings.Contains(body, `"fingerprint":"gap-hash"`) {
 		t.Fatalf("review status=%d body=%s", resp.Code, body)
 	}
