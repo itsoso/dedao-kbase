@@ -136,17 +136,20 @@ type HealthEvidenceAnalysisBatchRequest struct {
 }
 
 type HealthEvidenceAnalysisBatchResult struct {
-	SchemaVersion   string                            `json:"schema_version"`
-	DryRun          bool                              `json:"dry_run"`
-	SummaryOnly     bool                              `json:"summary_only,omitempty"`
-	Eligible        int                               `json:"eligible"`
-	Skipped         int                               `json:"skipped"`
-	SkippedByStatus map[string]int                    `json:"skipped_by_status,omitempty"`
-	LimitReached    bool                              `json:"limit_reached"`
-	Processed       int                               `json:"processed"`
-	Succeeded       int                               `json:"succeeded"`
-	Failed          int                               `json:"failed"`
-	Items           []HealthEvidenceAnalysisBatchItem `json:"items"`
+	SchemaVersion    string                            `json:"schema_version"`
+	DryRun           bool                              `json:"dry_run"`
+	SummaryOnly      bool                              `json:"summary_only,omitempty"`
+	Eligible         int                               `json:"eligible"`
+	Skipped          int                               `json:"skipped"`
+	SkippedByStatus  map[string]int                    `json:"skipped_by_status,omitempty"`
+	RequestedLimit   int                               `json:"requested_limit"`
+	NextBatchSize    int                               `json:"next_batch_size"`
+	EstimatedBatches int                               `json:"estimated_batches"`
+	LimitReached     bool                              `json:"limit_reached"`
+	Processed        int                               `json:"processed"`
+	Succeeded        int                               `json:"succeeded"`
+	Failed           int                               `json:"failed"`
+	Items            []HealthEvidenceAnalysisBatchItem `json:"items"`
 }
 
 type HealthEvidenceAnalysisBatchItem struct {
@@ -321,6 +324,7 @@ func RunHealthEvidenceAnalysisBatch(
 		SchemaVersion:   HealthEvidenceAnalysisBatchSchemaVersion,
 		DryRun:          request.DryRun || request.SummaryOnly,
 		SummaryOnly:     request.SummaryOnly,
+		RequestedLimit:  request.Limit,
 		SkippedByStatus: map[string]int{},
 		Items:           []HealthEvidenceAnalysisBatchItem{},
 	}
@@ -334,6 +338,13 @@ func RunHealthEvidenceAnalysisBatch(
 	}
 	if len(result.SkippedByStatus) == 0 {
 		result.SkippedByStatus = nil
+	}
+	result.NextBatchSize = result.Eligible
+	if result.NextBatchSize > request.Limit {
+		result.NextBatchSize = request.Limit
+	}
+	if result.Eligible > 0 {
+		result.EstimatedBatches = (result.Eligible + request.Limit - 1) / request.Limit
 	}
 	result.LimitReached = result.Eligible > request.Limit
 	if request.SummaryOnly {
