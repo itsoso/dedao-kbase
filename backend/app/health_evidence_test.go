@@ -204,6 +204,9 @@ func TestRunHealthEvidenceAnalysisBatchProcessesNeedsAnalysisAndEvaluatesQuality
 	if result.RequestedLimit != 1 || result.NextBatchSize != 1 || result.EstimatedBatches != 2 {
 		t.Fatalf("batch estimates = %#v", result)
 	}
+	if result.Scanned != 3 || !result.HasWork || result.QueueState != "ready" || result.RecommendedAction != "run_analysis" {
+		t.Fatalf("batch queue state = %#v", result)
+	}
 	if result.SkippedByStatus[HealthEvidenceReadinessReadyToPublish] != 1 {
 		t.Fatalf("skipped statuses = %#v", result.SkippedByStatus)
 	}
@@ -256,6 +259,9 @@ func TestRunHealthEvidenceAnalysisBatchDryRunDoesNotMutateOrCallModel(t *testing
 	if result.RequestedLimit != 2 || result.NextBatchSize != 2 || result.EstimatedBatches != 1 {
 		t.Fatalf("dry-run estimates = %#v", result)
 	}
+	if result.Scanned != 2 || !result.HasWork || result.QueueState != "ready" || result.RecommendedAction != "run_analysis" {
+		t.Fatalf("dry-run queue state = %#v", result)
+	}
 	if len(result.SkippedByStatus) != 0 {
 		t.Fatalf("dry-run skipped statuses = %#v", result.SkippedByStatus)
 	}
@@ -305,6 +311,9 @@ func TestRunHealthEvidenceAnalysisBatchSummaryOnlyReturnsCountsWithoutItems(t *t
 	}
 	if result.RequestedLimit != 1 || result.NextBatchSize != 1 || result.EstimatedBatches != 2 {
 		t.Fatalf("summary-only estimates = %#v", result)
+	}
+	if result.Scanned != 3 || !result.HasWork || result.QueueState != "ready" || result.RecommendedAction != "run_analysis" {
+		t.Fatalf("summary-only queue state = %#v", result)
 	}
 	if result.Processed != 0 || result.Succeeded != 0 || result.Failed != 0 || len(result.Items) != 0 {
 		t.Fatalf("summary-only should not process items: %#v", result)
@@ -359,7 +368,7 @@ func TestHealthEvidenceAnalysisBatchHTTPDryRunDoesNotCallGenerator(t *testing.T)
 	})
 
 	resp := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "secret-token", `{"limit":1,"dry_run":true}`)
-	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"dry_run":true`) || !strings.Contains(resp.Body.String(), `"eligible":1`) || !strings.Contains(resp.Body.String(), `"requested_limit":1`) || !strings.Contains(resp.Body.String(), `"next_batch_size":1`) || !strings.Contains(resp.Body.String(), `"estimated_batches":1`) || !strings.Contains(resp.Body.String(), `"status":"preview"`) {
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"dry_run":true`) || !strings.Contains(resp.Body.String(), `"eligible":1`) || !strings.Contains(resp.Body.String(), `"has_work":true`) || !strings.Contains(resp.Body.String(), `"queue_state":"ready"`) || !strings.Contains(resp.Body.String(), `"recommended_action":"run_analysis"`) || !strings.Contains(resp.Body.String(), `"requested_limit":1`) || !strings.Contains(resp.Body.String(), `"next_batch_size":1`) || !strings.Contains(resp.Body.String(), `"estimated_batches":1`) || !strings.Contains(resp.Body.String(), `"status":"preview"`) {
 		t.Fatalf("dry-run batch status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	if called {
@@ -381,7 +390,7 @@ func TestHealthEvidenceAnalysisBatchHTTPSummaryOnlyDoesNotCallGenerator(t *testi
 	})
 
 	resp := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "secret-token", `{"limit":1,"summary_only":true}`)
-	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"dry_run":true`) || !strings.Contains(resp.Body.String(), `"summary_only":true`) || !strings.Contains(resp.Body.String(), `"eligible":1`) || !strings.Contains(resp.Body.String(), `"requested_limit":1`) || !strings.Contains(resp.Body.String(), `"next_batch_size":1`) || !strings.Contains(resp.Body.String(), `"estimated_batches":1`) || !strings.Contains(resp.Body.String(), `"items":[]`) {
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"dry_run":true`) || !strings.Contains(resp.Body.String(), `"summary_only":true`) || !strings.Contains(resp.Body.String(), `"eligible":1`) || !strings.Contains(resp.Body.String(), `"has_work":true`) || !strings.Contains(resp.Body.String(), `"queue_state":"ready"`) || !strings.Contains(resp.Body.String(), `"recommended_action":"run_analysis"`) || !strings.Contains(resp.Body.String(), `"requested_limit":1`) || !strings.Contains(resp.Body.String(), `"next_batch_size":1`) || !strings.Contains(resp.Body.String(), `"estimated_batches":1`) || !strings.Contains(resp.Body.String(), `"items":[]`) {
 		t.Fatalf("summary-only batch status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	if called {
