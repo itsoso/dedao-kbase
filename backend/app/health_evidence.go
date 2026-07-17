@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 const HealthEvidenceSchemaVersion = "health_evidence.v1"
 const HealthEvidenceSearchSchemaVersion = "health_evidence_search.v1"
 const HealthEvidenceReadinessSchemaVersion = "health_evidence_readiness.v1"
+const HealthEvidenceAnalysisBatchSchemaVersion = "health_evidence_analysis_batch.v1"
 
 const (
 	HealthEvidenceReadinessPublished      = "published"
@@ -123,6 +125,32 @@ type HealthEvidenceReadinessItem struct {
 	NextAction        string   `json:"next_action,omitempty"`
 	Reasons           []string `json:"reasons,omitempty"`
 	UpdatedAt         string   `json:"updated_at,omitempty"`
+}
+
+type HealthEvidenceAnalysisBatchRequest struct {
+	Limit           int    `json:"limit,omitempty"`
+	Model           string `json:"model,omitempty"`
+	MaxContextChars int    `json:"max_context_chars,omitempty"`
+}
+
+type HealthEvidenceAnalysisBatchResult struct {
+	SchemaVersion string                            `json:"schema_version"`
+	Processed     int                               `json:"processed"`
+	Succeeded     int                               `json:"succeeded"`
+	Failed        int                               `json:"failed"`
+	Items         []HealthEvidenceAnalysisBatchItem `json:"items"`
+}
+
+type HealthEvidenceAnalysisBatchItem struct {
+	BookID      string `json:"book_id"`
+	Title       string `json:"title"`
+	Status      string `json:"status"`
+	NextStatus  string `json:"next_status,omitempty"`
+	NextAction  string `json:"next_action,omitempty"`
+	Error       string `json:"error,omitempty"`
+	AnalysisID  string `json:"analysis_id,omitempty"`
+	Quality     string `json:"quality,omitempty"`
+	UsagePolicy string `json:"usage_policy,omitempty"`
 }
 
 func BuildHealthEvidencePackage(store *BookKnowledgeStore, releaseID string) (HealthEvidencePackage, error) {
@@ -257,6 +285,95 @@ func BuildHealthEvidenceReadiness(store *BookKnowledgeStore, limit int) (HealthE
 		}
 	}
 	return report, nil
+}
+
+func RunHealthEvidenceAnalysisBatch(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	generator BookAnalysisGenerator,
+	request HealthEvidenceAnalysisBatchRequest,
+) (HealthEvidenceAnalysisBatchResult, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	if generator == nil {
+		generator = GenerateBookAnalysisManifest
+	}
+	if request.Limit <= 0 || request.Limit > 20 {
+		request.Limit = 5
+	}
+	if request.MaxContextChars < 0 {
+		request.MaxContextChars = 0
+	}
+	readiness, err := BuildHealthEvidenceReadiness(store, 500)
+	if err != nil {
+		return HealthEvidenceAnalysisBatchResult{}, err
+	}
+	result := HealthEvidenceAnalysisBatchResult{
+		SchemaVersion: HealthEvidenceAnalysisBatchSchemaVersion,
+		Items:         []HealthEvidenceAnalysisBatchItem{},
+	}
+	for _, item := range readiness.Items {
+		if result.Processed >= request.Limit {
+			break
+		}
+		if item.Status != HealthEvidenceReadinessNeedsAnalysis {
+			continue
+		}
+		result.Processed++
+		batchItem := HealthEvidenceAnalysisBatchItem{
+			BookID:     item.BookID,
+			Title:      item.Title,
+			Status:     "processing",
+			NextAction: item.NextAction,
+		}
+		manifest, analysisErr := generator(ctx, store, BookAnalysisGenerateRequest{
+			BookID:          item.BookID,
+			Model:           request.Model,
+			MaxContextChars: request.MaxContextChars,
+		})
+		if analysisErr == nil && manifest != nil {
+			if saveErr := store.SaveAnalysisManifest(*manifest); saveErr != nil {
+				analysisErr = saveErr
+			}
+		}
+		if analysisErr != nil {
+			batchItem.Status = "failed"
+			batchItem.Error = trimRunes(analysisErr.Error(), 500)
+			result.Failed++
+			result.Items = append(result.Items, batchItem)
+			continue
+		}
+		quality, qualityErr := EvaluateBookAnalysisQuality(store, item.BookID)
+		if qualityErr != nil {
+			batchItem.Status = "failed"
+			batchItem.Error = trimRunes(qualityErr.Error(), 500)
+			result.Failed++
+			result.Items = append(result.Items, batchItem)
+			continue
+		}
+		nextReadiness, nextErr := BuildHealthEvidenceReadiness(store, 500)
+		nextStatus := ""
+		nextAction := ""
+		if nextErr == nil {
+			for _, next := range nextReadiness.Items {
+				if next.BookID == item.BookID {
+					nextStatus = next.Status
+					nextAction = next.NextAction
+					break
+				}
+			}
+		}
+		batchItem.Status = "succeeded"
+		batchItem.NextStatus = nextStatus
+		batchItem.NextAction = nextAction
+		batchItem.AnalysisID = item.BookID + ":" + item.ContentHash
+		batchItem.Quality = quality.Decision
+		batchItem.UsagePolicy = quality.UsagePolicy
+		result.Succeeded++
+		result.Items = append(result.Items, batchItem)
+	}
+	return result, nil
 }
 
 func ParseHealthEvidenceSearchQuery(values url.Values) HealthEvidenceSearchQuery {

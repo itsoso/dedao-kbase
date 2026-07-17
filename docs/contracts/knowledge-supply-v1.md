@@ -66,6 +66,7 @@ importing generic releases directly:
 ```text
 GET /api/consumers/health/releases?after={cursor}&limit={n}
 GET /api/consumers/health/readiness?limit={n}
+POST /api/consumers/health/readiness/analyze
 GET /api/consumers/health/evidence/{release_id}
 GET /api/consumers/health/search?q={query}&tag={tag}&limit={n}
 ```
@@ -81,6 +82,12 @@ package state as `published`, `ready_to_publish`, `needs_analysis`,
 `needs_quality`, `policy_blocked`, or `quality_blocked`, with a bounded
 `next_action` such as `analyze`, `evaluate_quality`, `review_policy`, or
 `publish`.
+
+Use `POST /api/consumers/health/readiness/analyze` as an explicit operator
+action for bounded backfill. The request accepts `limit`, `model`, and
+`max_context_chars`; the server analyzes only `needs_analysis` packages, writes
+the analysis manifest, evaluates quality immediately, and returns per-book
+status. It does not publish releases automatically.
 
 ## Local Contract Smoke
 

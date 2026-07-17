@@ -198,6 +198,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleHealthEvidenceReadiness(w, r)
 		return
 	}
+	if r.URL.Path == "/api/consumers/health/readiness/analyze" {
+		h.handleHealthEvidenceReadinessAnalyze(w, r)
+		return
+	}
 	if r.URL.Path == "/api/consumers/health/search" {
 		h.handleHealthEvidenceSearch(w, r)
 		return
@@ -376,6 +380,26 @@ func (h *kbaseHTTPHandler) handleHealthEvidenceReadiness(w http.ResponseWriter, 
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, report)
+}
+
+func (h *kbaseHTTPHandler) handleHealthEvidenceReadinessAnalyze(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var input HealthEvidenceAnalysisBatchRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	result, err := RunHealthEvidenceAnalysisBatch(r.Context(), h.store, h.analysisGenerator, input)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func (h *kbaseHTTPHandler) handleDeliveryReceipt(w http.ResponseWriter, r *http.Request, releaseID string) {

@@ -1,7 +1,9 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -172,6 +174,84 @@ func TestHealthEvidenceReadinessHTTP(t *testing.T) {
 	}
 }
 
+func TestRunHealthEvidenceAnalysisBatchProcessesNeedsAnalysisAndEvaluatesQuality(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	saveHealthReadinessBook(t, store, "also-needs-analysis", "hash-second")
+	saveHealthReadinessBook(t, store, "already-ready", "hash-ready")
+	saveHealthAnalysis(t, store, "already-ready", "hash-ready")
+	saveHealthQuality(t, store, "already-ready", "hash-ready", BookQualityPass, BookUsageEvidenceOnly)
+	called := []string{}
+	generator := func(_ context.Context, current *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		called = append(called, request.BookID)
+		if request.BookID == "needs-analysis" {
+			manifest := healthBatchAnalysisManifest(request.BookID, "hash-analysis")
+			return &manifest, nil
+		}
+		return nil, fmt.Errorf("unexpected book %s", request.BookID)
+	}
+
+	result, err := RunHealthEvidenceAnalysisBatch(context.Background(), store, generator, HealthEvidenceAnalysisBatchRequest{Limit: 1, Model: "Qwen-3.7-Max"})
+	if err != nil {
+		t.Fatalf("RunHealthEvidenceAnalysisBatch returned error: %v", err)
+	}
+	if result.SchemaVersion != HealthEvidenceAnalysisBatchSchemaVersion || result.Processed != 1 || result.Succeeded != 1 || result.Failed != 0 {
+		t.Fatalf("batch result = %#v", result)
+	}
+	if len(called) != 1 || called[0] != "needs-analysis" {
+		t.Fatalf("generator calls = %#v", called)
+	}
+	quality, err := store.LoadBookQualityReport("needs-analysis")
+	if err != nil {
+		t.Fatalf("quality report was not created: %v", err)
+	}
+	if quality.Decision != BookQualityPass || quality.UsagePolicy != BookUsageEvidenceOnly {
+		t.Fatalf("quality = %#v", quality)
+	}
+	readiness, err := BuildHealthEvidenceReadiness(store, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := healthReadinessByBook(readiness.Items)
+	if items["needs-analysis"].Status != HealthEvidenceReadinessReadyToPublish {
+		t.Fatalf("processed readiness = %#v", items["needs-analysis"])
+	}
+	if items["also-needs-analysis"].Status != HealthEvidenceReadinessNeedsAnalysis {
+		t.Fatalf("limit should leave second item untouched: %#v", items["also-needs-analysis"])
+	}
+}
+
+func TestHealthEvidenceAnalysisBatchHTTP(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	var got BookAnalysisGenerateRequest
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		AnalysisGenerator: func(_ context.Context, _ *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+			got = request
+			manifest := healthBatchAnalysisManifest(request.BookID, "hash-analysis")
+			return &manifest, nil
+		},
+	})
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "", `{"limit":1}`)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "secret-token", `{"limit":1,"model":"Qwen-3.7-Max"}`)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"succeeded":1`) {
+		t.Fatalf("batch status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if got.BookID != "needs-analysis" || got.Model != "Qwen-3.7-Max" {
+		t.Fatalf("analysis request = %#v", got)
+	}
+	wrongMethod := requestKBase(handler, http.MethodGet, "/api/consumers/health/readiness/analyze", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
 func sampleHealthEvidenceRelease() KnowledgeRelease {
 	return KnowledgeRelease{
 		SchemaVersion: KnowledgeReleaseSchemaVersion,
@@ -238,14 +318,41 @@ func sampleHealthEvidenceRelease() KnowledgeRelease {
 	}
 }
 
+func healthBatchAnalysisManifest(bookID, contentHash string) BookAnalysisManifest {
+	return BookAnalysisManifest{
+		Version:       bookAnalysisVersion,
+		BookID:        bookID,
+		ContentHash:   contentHash,
+		Status:        BookAnalysisReady,
+		Model:         "Qwen-3.7-Max",
+		PromptVersion: bookAnalysisPromptVersion,
+		Payload: &BookAnalysisPayload{
+			Summary: "summary",
+			Claims: []BookAnalysisClaim{{
+				ID:          "claim-1",
+				Statement:   "高血压运动证据",
+				CitationIDs: []string{bookID + "-citation-1"},
+				Confidence:  0.8,
+				RiskLevel:   "high",
+			}},
+		},
+		UpdatedAt:   "2026-07-16T10:00:00Z",
+		CompletedAt: "2026-07-16T10:00:00Z",
+	}
+}
+
 func saveHealthReadinessBook(t *testing.T, store *BookKnowledgeStore, bookID, contentHash string) {
 	t.Helper()
+	updatedAt := "2026-07-16T10:00:00Z"
+	if bookID == "needs-analysis" {
+		updatedAt = "2026-07-16T11:00:00Z"
+	}
 	if err := store.SavePackage(BookKnowledgePackage{
 		Book: BookKnowledgeBook{
 			BookID:      bookID,
 			Title:       bookID,
 			ContentHash: contentHash,
-			UpdatedAt:   "2026-07-16T10:00:00Z",
+			UpdatedAt:   updatedAt,
 			SourceType:  "wechat_mp_article",
 		},
 		Chapters: []BookKnowledgeChapter{{ChapterID: bookID + "-chapter-1", BookID: bookID, Order: 1, Title: "chapter"}},
