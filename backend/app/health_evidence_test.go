@@ -201,6 +201,9 @@ func TestRunHealthEvidenceAnalysisBatchProcessesNeedsAnalysisAndEvaluatesQuality
 	if result.DryRun || result.Eligible != 2 || result.Skipped != 1 || !result.LimitReached {
 		t.Fatalf("batch summary = %#v", result)
 	}
+	if result.ReadyToPublish != 1 || result.Published != 0 || result.Blocked != 0 {
+		t.Fatalf("batch status counts = %#v", result)
+	}
 	if result.RequestedLimit != 1 || result.NextBatchSize != 1 || result.EstimatedBatches != 2 {
 		t.Fatalf("batch estimates = %#v", result)
 	}
@@ -309,6 +312,9 @@ func TestRunHealthEvidenceAnalysisBatchSummaryOnlyReturnsCountsWithoutItems(t *t
 	if !result.DryRun || !result.SummaryOnly || result.Eligible != 2 || result.Skipped != 1 || !result.LimitReached {
 		t.Fatalf("summary-only summary = %#v", result)
 	}
+	if result.ReadyToPublish != 1 || result.Published != 0 || result.Blocked != 0 {
+		t.Fatalf("summary-only status counts = %#v", result)
+	}
 	if result.RequestedLimit != 1 || result.NextBatchSize != 1 || result.EstimatedBatches != 2 {
 		t.Fatalf("summary-only estimates = %#v", result)
 	}
@@ -346,6 +352,9 @@ func TestRunHealthEvidenceAnalysisBatchCompleteQueueDoesNotLookBlocked(t *testin
 	if result.Eligible != 0 || result.Skipped != 2 || result.HasWork {
 		t.Fatalf("complete queue summary = %#v", result)
 	}
+	if result.ReadyToPublish != 1 || result.Published != 1 || result.Blocked != 0 {
+		t.Fatalf("complete queue status counts = %#v", result)
+	}
 	if result.QueueState != "complete" || result.RecommendedAction != "idle" {
 		t.Fatalf("complete queue state = %#v", result)
 	}
@@ -363,6 +372,9 @@ func TestRunHealthEvidenceAnalysisBatchBlockedQueueRequiresReview(t *testing.T) 
 	}
 	if result.Eligible != 0 || result.Skipped != 1 || result.HasWork {
 		t.Fatalf("blocked queue summary = %#v", result)
+	}
+	if result.ReadyToPublish != 0 || result.Published != 0 || result.Blocked != 1 {
+		t.Fatalf("blocked queue status counts = %#v", result)
 	}
 	if result.QueueState != "blocked" || result.RecommendedAction != "review_blocked" {
 		t.Fatalf("blocked queue state = %#v", result)

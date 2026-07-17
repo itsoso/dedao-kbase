@@ -146,6 +146,9 @@ type HealthEvidenceAnalysisBatchResult struct {
 	HasWork           bool                              `json:"has_work"`
 	QueueState        string                            `json:"queue_state"`
 	RecommendedAction string                            `json:"recommended_action"`
+	ReadyToPublish    int                               `json:"ready_to_publish"`
+	Published         int                               `json:"published"`
+	Blocked           int                               `json:"blocked"`
 	RequestedLimit    int                               `json:"requested_limit"`
 	NextBatchSize     int                               `json:"next_batch_size"`
 	EstimatedBatches  int                               `json:"estimated_batches"`
@@ -340,6 +343,14 @@ func RunHealthEvidenceAnalysisBatch(
 		}
 		result.Skipped++
 		result.SkippedByStatus[item.Status]++
+		switch item.Status {
+		case HealthEvidenceReadinessReadyToPublish:
+			result.ReadyToPublish++
+		case HealthEvidenceReadinessPublished:
+			result.Published++
+		case HealthEvidenceReadinessPolicyBlocked, HealthEvidenceReadinessQualityBlocked:
+			result.Blocked++
+		}
 	}
 	if len(result.SkippedByStatus) == 0 {
 		result.SkippedByStatus = nil

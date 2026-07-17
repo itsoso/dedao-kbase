@@ -94,6 +94,7 @@ quality state. When `summary_only` is `true`, the response returns queue
 statistics only, forces dry-run behavior, and omits candidate items. The
 batch response includes `dry_run`, `eligible`, `skipped`, `skipped_by_status`,
 `scanned`, `has_work`, `queue_state`, `recommended_action`,
+`ready_to_publish`, `published`, `blocked`,
 `requested_limit`, `next_batch_size`, `estimated_batches`, and `limit_reached`
 so operators can distinguish an empty queue from a limited preview, estimate
 how many batches remain, or identify a queue blocked in another readiness state.
