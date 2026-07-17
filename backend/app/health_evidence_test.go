@@ -221,6 +221,47 @@ func TestRunHealthEvidenceAnalysisBatchProcessesNeedsAnalysisAndEvaluatesQuality
 	}
 }
 
+func TestRunHealthEvidenceAnalysisBatchDryRunDoesNotMutateOrCallModel(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	saveHealthReadinessBook(t, store, "also-needs-analysis", "hash-second")
+	called := false
+	generator := func(_ context.Context, _ *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		called = true
+		return nil, fmt.Errorf("generator should not run for dry run: %s", request.BookID)
+	}
+
+	result, err := RunHealthEvidenceAnalysisBatch(context.Background(), store, generator, HealthEvidenceAnalysisBatchRequest{Limit: 2, DryRun: true})
+	if err != nil {
+		t.Fatalf("RunHealthEvidenceAnalysisBatch returned error: %v", err)
+	}
+	if called {
+		t.Fatal("dry run called model generator")
+	}
+	if result.Processed != 2 || result.Succeeded != 0 || result.Failed != 0 || len(result.Items) != 2 {
+		t.Fatalf("dry-run result = %#v", result)
+	}
+	for _, item := range result.Items {
+		if item.Status != "preview" || item.NextAction != "analyze" || item.NextStatus != HealthEvidenceReadinessNeedsAnalysis {
+			t.Fatalf("dry-run item = %#v", item)
+		}
+	}
+	if _, err := store.LoadAnalysisManifest("needs-analysis"); err == nil {
+		t.Fatal("dry run wrote analysis manifest")
+	}
+	if _, err := store.LoadBookQualityReport("needs-analysis"); err == nil {
+		t.Fatal("dry run wrote quality report")
+	}
+	readiness, err := BuildHealthEvidenceReadiness(store, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := healthReadinessByBook(readiness.Items)
+	if items["needs-analysis"].Status != HealthEvidenceReadinessNeedsAnalysis || items["also-needs-analysis"].Status != HealthEvidenceReadinessNeedsAnalysis {
+		t.Fatalf("dry run changed readiness: %#v", items)
+	}
+}
+
 func TestHealthEvidenceAnalysisBatchHTTP(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
@@ -249,6 +290,28 @@ func TestHealthEvidenceAnalysisBatchHTTP(t *testing.T) {
 	wrongMethod := requestKBase(handler, http.MethodGet, "/api/consumers/health/readiness/analyze", "secret-token")
 	if wrongMethod.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestHealthEvidenceAnalysisBatchHTTPDryRunDoesNotCallGenerator(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	called := false
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		AnalysisGenerator: func(_ context.Context, _ *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+			called = true
+			return nil, fmt.Errorf("generator should not run for dry run: %s", request.BookID)
+		},
+	})
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "secret-token", `{"limit":1,"dry_run":true}`)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"status":"preview"`) {
+		t.Fatalf("dry-run batch status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Fatal("dry-run HTTP request called model generator")
 	}
 }
 

@@ -131,6 +131,7 @@ type HealthEvidenceAnalysisBatchRequest struct {
 	Limit           int    `json:"limit,omitempty"`
 	Model           string `json:"model,omitempty"`
 	MaxContextChars int    `json:"max_context_chars,omitempty"`
+	DryRun          bool   `json:"dry_run,omitempty"`
 }
 
 type HealthEvidenceAnalysisBatchResult struct {
@@ -326,6 +327,12 @@ func RunHealthEvidenceAnalysisBatch(
 			Title:      item.Title,
 			Status:     "processing",
 			NextAction: item.NextAction,
+		}
+		if request.DryRun {
+			batchItem.Status = "preview"
+			batchItem.NextStatus = item.Status
+			result.Items = append(result.Items, batchItem)
+			continue
 		}
 		manifest, analysisErr := generator(ctx, store, BookAnalysisGenerateRequest{
 			BookID:          item.BookID,

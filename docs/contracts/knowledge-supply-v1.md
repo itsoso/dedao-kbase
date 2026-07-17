@@ -84,10 +84,12 @@ package state as `published`, `ready_to_publish`, `needs_analysis`,
 `publish`.
 
 Use `POST /api/consumers/health/readiness/analyze` as an explicit operator
-action for bounded backfill. The request accepts `limit`, `model`, and
-`max_context_chars`; the server analyzes only `needs_analysis` packages, writes
-the analysis manifest, evaluates quality immediately, and returns per-book
-status. It does not publish releases automatically.
+action for bounded backfill. The request accepts `limit`, `model`,
+`max_context_chars`, and `dry_run`; the server analyzes only `needs_analysis`
+packages, writes the analysis manifest, evaluates quality immediately, and
+returns per-book status. It does not publish releases automatically. When
+`dry_run` is `true`, the response previews the same candidate set without
+calling the model, writing analysis manifests, or changing quality state.
 
 ## Local Contract Smoke
 
