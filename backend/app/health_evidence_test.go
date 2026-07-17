@@ -109,6 +109,69 @@ func TestHealthEvidenceHTTPDetailAndSearch(t *testing.T) {
 	}
 }
 
+func TestBuildHealthEvidenceReadinessExplainsPublicationState(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	saveHealthReadinessBook(t, store, "ready", "hash-ready")
+	saveHealthAnalysis(t, store, "ready", "hash-ready")
+	saveHealthQuality(t, store, "ready", "hash-ready", BookQualityPass, BookUsageEvidenceOnly)
+	saveHealthReadinessBook(t, store, "published", "hash-published")
+	saveHealthAnalysis(t, store, "published", "hash-published")
+	saveHealthQuality(t, store, "published", "hash-published", BookQualityPass, BookUsageEvidenceOnly)
+	release := sampleHealthEvidenceRelease()
+	release.ReleaseID = "release-published"
+	release.BookID = "published"
+	release.ContentHash = "hash-published"
+	release.Book.BookID = "published"
+	release.Book.Title = "published"
+	saveFeedRelease(t, store, release)
+	saveHealthReadinessBook(t, store, "policy-blocked", "hash-policy")
+	saveHealthAnalysis(t, store, "policy-blocked", "hash-policy")
+	saveHealthQuality(t, store, "policy-blocked", "hash-policy", BookQualityPass, BookUsageStandard)
+
+	report, err := BuildHealthEvidenceReadiness(store, 20)
+	if err != nil {
+		t.Fatalf("BuildHealthEvidenceReadiness returned error: %v", err)
+	}
+	if report.SchemaVersion != HealthEvidenceReadinessSchemaVersion || report.Totals.Total != 4 || report.Totals.ReadyToPublish != 1 || report.Totals.Published != 1 {
+		t.Fatalf("report totals = %#v", report)
+	}
+	items := healthReadinessByBook(report.Items)
+	if items["needs-analysis"].Status != HealthEvidenceReadinessNeedsAnalysis || items["needs-analysis"].NextAction != "analyze" {
+		t.Fatalf("needs-analysis item = %#v", items["needs-analysis"])
+	}
+	if items["ready"].Status != HealthEvidenceReadinessReadyToPublish || items["ready"].NextAction != "publish" {
+		t.Fatalf("ready item = %#v", items["ready"])
+	}
+	if items["published"].Status != HealthEvidenceReadinessPublished || items["published"].EvidenceReleaseID != "release-published" {
+		t.Fatalf("published item = %#v", items["published"])
+	}
+	if items["policy-blocked"].Status != HealthEvidenceReadinessPolicyBlocked || items["policy-blocked"].NextAction != "review_policy" {
+		t.Fatalf("policy-blocked item = %#v", items["policy-blocked"])
+	}
+}
+
+func TestHealthEvidenceReadinessHTTP(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "ready", "hash-ready")
+	saveHealthAnalysis(t, store, "ready", "hash-ready")
+	saveHealthQuality(t, store, "ready", "hash-ready", BookQualityPass, BookUsageEvidenceOnly)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/consumers/health/readiness", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	resp := requestKBase(handler, http.MethodGet, "/api/consumers/health/readiness?limit=10", "secret-token")
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"status":"ready_to_publish"`) {
+		t.Fatalf("readiness status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodPost, "/api/consumers/health/readiness", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
 func sampleHealthEvidenceRelease() KnowledgeRelease {
 	return KnowledgeRelease{
 		SchemaVersion: KnowledgeReleaseSchemaVersion,
@@ -173,4 +236,73 @@ func sampleHealthEvidenceRelease() KnowledgeRelease {
 			UsagePolicy: BookUsageEvidenceOnly,
 		},
 	}
+}
+
+func saveHealthReadinessBook(t *testing.T, store *BookKnowledgeStore, bookID, contentHash string) {
+	t.Helper()
+	if err := store.SavePackage(BookKnowledgePackage{
+		Book: BookKnowledgeBook{
+			BookID:      bookID,
+			Title:       bookID,
+			ContentHash: contentHash,
+			UpdatedAt:   "2026-07-16T10:00:00Z",
+			SourceType:  "wechat_mp_article",
+		},
+		Chapters: []BookKnowledgeChapter{{ChapterID: bookID + "-chapter-1", BookID: bookID, Order: 1, Title: "chapter"}},
+		Chunks:   []BookKnowledgeChunk{{ChunkID: bookID + "-chunk-1", BookID: bookID, ChapterID: bookID + "-chapter-1", Order: 1, Text: "健康证据"}},
+		Claims:   []BookKnowledgeClaim{{ClaimID: bookID + "-claim-1", BookID: bookID, Title: "claim", Summary: "健康证据"}},
+		Citations: []BookKnowledgeCitation{{
+			CitationID: bookID + "-citation-1",
+			BookID:     bookID,
+			ChunkID:    bookID + "-chunk-1",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func saveHealthAnalysis(t *testing.T, store *BookKnowledgeStore, bookID, contentHash string) {
+	t.Helper()
+	if err := store.SaveAnalysisManifest(BookAnalysisManifest{
+		Version:     bookAnalysisVersion,
+		BookID:      bookID,
+		ContentHash: contentHash,
+		Status:      BookAnalysisReady,
+		Payload: &BookAnalysisPayload{
+			Summary: "summary",
+			Claims: []BookAnalysisClaim{{
+				ID:          "claim-1",
+				Statement:   "高血压运动证据",
+				CitationIDs: []string{bookID + "-citation-1"},
+				Confidence:  0.8,
+				RiskLevel:   "high",
+			}},
+		},
+		UpdatedAt:   "2026-07-16T10:00:00Z",
+		CompletedAt: "2026-07-16T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func saveHealthQuality(t *testing.T, store *BookKnowledgeStore, bookID, contentHash, decision, usagePolicy string) {
+	t.Helper()
+	if err := store.SaveBookQualityReport(BookQualityReport{
+		Version:     bookQualityVersion,
+		BookID:      bookID,
+		ContentHash: contentHash,
+		Decision:    decision,
+		UsagePolicy: usagePolicy,
+		EvaluatedAt: "2026-07-16T10:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func healthReadinessByBook(items []HealthEvidenceReadinessItem) map[string]HealthEvidenceReadinessItem {
+	result := make(map[string]HealthEvidenceReadinessItem)
+	for _, item := range items {
+		result[item.BookID] = item
+	}
+	return result
 }

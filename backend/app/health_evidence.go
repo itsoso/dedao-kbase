@@ -12,6 +12,16 @@ import (
 
 const HealthEvidenceSchemaVersion = "health_evidence.v1"
 const HealthEvidenceSearchSchemaVersion = "health_evidence_search.v1"
+const HealthEvidenceReadinessSchemaVersion = "health_evidence_readiness.v1"
+
+const (
+	HealthEvidenceReadinessPublished      = "published"
+	HealthEvidenceReadinessReadyToPublish = "ready_to_publish"
+	HealthEvidenceReadinessNeedsAnalysis  = "needs_analysis"
+	HealthEvidenceReadinessNeedsQuality   = "needs_quality"
+	HealthEvidenceReadinessPolicyBlocked  = "policy_blocked"
+	HealthEvidenceReadinessQualityBlocked = "quality_blocked"
+)
 
 type HealthEvidencePackage struct {
 	SchemaVersion string                  `json:"schema_version"`
@@ -85,6 +95,34 @@ type HealthEvidenceSearchQuery struct {
 type HealthEvidenceSearchPage struct {
 	SchemaVersion string                `json:"schema_version"`
 	Items         []HealthEvidenceClaim `json:"items"`
+}
+
+type HealthEvidenceReadinessReport struct {
+	SchemaVersion string                        `json:"schema_version"`
+	Totals        HealthEvidenceReadinessTotals `json:"totals"`
+	Items         []HealthEvidenceReadinessItem `json:"items"`
+}
+
+type HealthEvidenceReadinessTotals struct {
+	Total          int `json:"total"`
+	Published      int `json:"published"`
+	ReadyToPublish int `json:"ready_to_publish"`
+	NeedsAnalysis  int `json:"needs_analysis"`
+	NeedsQuality   int `json:"needs_quality"`
+	Blocked        int `json:"blocked"`
+}
+
+type HealthEvidenceReadinessItem struct {
+	BookID            string   `json:"book_id"`
+	Title             string   `json:"title"`
+	ContentHash       string   `json:"content_hash,omitempty"`
+	Status            string   `json:"status"`
+	UsagePolicy       string   `json:"usage_policy,omitempty"`
+	LatestReleaseID   string   `json:"latest_release_id,omitempty"`
+	EvidenceReleaseID string   `json:"evidence_release_id,omitempty"`
+	NextAction        string   `json:"next_action,omitempty"`
+	Reasons           []string `json:"reasons,omitempty"`
+	UpdatedAt         string   `json:"updated_at,omitempty"`
 }
 
 func BuildHealthEvidencePackage(store *BookKnowledgeStore, releaseID string) (HealthEvidencePackage, error) {
@@ -171,6 +209,56 @@ func SearchHealthEvidence(store *BookKnowledgeStore, query HealthEvidenceSearchQ
 	return page, nil
 }
 
+func BuildHealthEvidenceReadiness(store *BookKnowledgeStore, limit int) (HealthEvidenceReadinessReport, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	books, err := store.ListBooks()
+	if err != nil {
+		return HealthEvidenceReadinessReport{}, err
+	}
+	releaseManifest, err := store.loadKnowledgeReleaseManifest()
+	if err != nil {
+		return HealthEvidenceReadinessReport{}, err
+	}
+	latestByBook := make(map[string]KnowledgeReleaseRecord)
+	evidenceByBook := make(map[string]KnowledgeReleaseRecord)
+	for _, record := range releaseManifest.Releases {
+		latestByBook[record.BookID] = record
+		if record.UsagePolicy == BookUsageEvidenceOnly {
+			evidenceByBook[record.BookID] = record
+		}
+	}
+	report := HealthEvidenceReadinessReport{
+		SchemaVersion: HealthEvidenceReadinessSchemaVersion,
+		Items:         []HealthEvidenceReadinessItem{},
+	}
+	for _, book := range books {
+		if len(report.Items) >= limit {
+			break
+		}
+		item := buildHealthEvidenceReadinessItem(store, book, latestByBook[book.BookID], evidenceByBook[book.BookID])
+		report.Items = append(report.Items, item)
+		report.Totals.Total++
+		switch item.Status {
+		case HealthEvidenceReadinessPublished:
+			report.Totals.Published++
+		case HealthEvidenceReadinessReadyToPublish:
+			report.Totals.ReadyToPublish++
+		case HealthEvidenceReadinessNeedsAnalysis:
+			report.Totals.NeedsAnalysis++
+		case HealthEvidenceReadinessNeedsQuality:
+			report.Totals.NeedsQuality++
+		case HealthEvidenceReadinessPolicyBlocked, HealthEvidenceReadinessQualityBlocked:
+			report.Totals.Blocked++
+		}
+	}
+	return report, nil
+}
+
 func ParseHealthEvidenceSearchQuery(values url.Values) HealthEvidenceSearchQuery {
 	limit, _ := strconv.Atoi(values.Get("limit"))
 	return HealthEvidenceSearchQuery{
@@ -178,6 +266,11 @@ func ParseHealthEvidenceSearchQuery(values url.Values) HealthEvidenceSearchQuery
 		Tag:   strings.TrimSpace(values.Get("tag")),
 		Limit: limit,
 	}
+}
+
+func ParseHealthEvidenceReadinessLimit(values url.Values) int {
+	limit, _ := strconv.Atoi(values.Get("limit"))
+	return limit
 }
 
 func ValidateHealthEvidenceContract(raw []byte) error {
@@ -253,6 +346,56 @@ func healthEvidenceClaimFromAnalysis(release *KnowledgeRelease, claim BookAnalys
 		SafetyFlags:   flags,
 		URL:           "/api/consumers/health/evidence/" + url.PathEscape(release.ReleaseID),
 	}
+}
+
+func buildHealthEvidenceReadinessItem(store *BookKnowledgeStore, book BookKnowledgeBook, latestRelease, evidenceRelease KnowledgeReleaseRecord) HealthEvidenceReadinessItem {
+	item := HealthEvidenceReadinessItem{
+		BookID:      book.BookID,
+		Title:       firstNonEmpty(book.Title, book.BookID),
+		ContentHash: book.ContentHash,
+		UpdatedAt:   book.UpdatedAt,
+	}
+	if latestRelease.ReleaseID != "" {
+		item.LatestReleaseID = latestRelease.ReleaseID
+	}
+	if evidenceRelease.ReleaseID != "" {
+		item.EvidenceReleaseID = evidenceRelease.ReleaseID
+	}
+	if evidenceRelease.ReleaseID != "" && evidenceRelease.ContentHash == book.ContentHash {
+		item.Status = HealthEvidenceReadinessPublished
+		item.UsagePolicy = BookUsageEvidenceOnly
+		return item
+	}
+	analysis, err := store.LoadAnalysisManifest(book.BookID)
+	if err != nil || analysis.Status != BookAnalysisReady || analysis.Payload == nil || analysis.ContentHash != book.ContentHash {
+		item.Status = HealthEvidenceReadinessNeedsAnalysis
+		item.NextAction = "analyze"
+		item.Reasons = []string{"analysis_missing_or_stale"}
+		return item
+	}
+	quality, err := store.LoadBookQualityReport(book.BookID)
+	if err != nil || quality.ContentHash != book.ContentHash {
+		item.Status = HealthEvidenceReadinessNeedsQuality
+		item.NextAction = "evaluate_quality"
+		item.Reasons = []string{"quality_missing_or_stale"}
+		return item
+	}
+	item.UsagePolicy = quality.UsagePolicy
+	if quality.Decision != BookQualityPass {
+		item.Status = HealthEvidenceReadinessQualityBlocked
+		item.NextAction = "fix_quality"
+		item.Reasons = []string{"quality_not_passed"}
+		return item
+	}
+	if quality.UsagePolicy != BookUsageEvidenceOnly {
+		item.Status = HealthEvidenceReadinessPolicyBlocked
+		item.NextAction = "review_policy"
+		item.Reasons = []string{"usage_policy_not_evidence_only"}
+		return item
+	}
+	item.Status = HealthEvidenceReadinessReadyToPublish
+	item.NextAction = "publish"
+	return item
 }
 
 func inferHealthEvidenceTags(claim BookAnalysisClaim) HealthEvidenceTags {

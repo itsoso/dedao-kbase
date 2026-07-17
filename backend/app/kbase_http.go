@@ -194,6 +194,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleHealthKnowledgeFeed(w, r)
 		return
 	}
+	if r.URL.Path == "/api/consumers/health/readiness" {
+		h.handleHealthEvidenceReadiness(w, r)
+		return
+	}
 	if r.URL.Path == "/api/consumers/health/search" {
 		h.handleHealthEvidenceSearch(w, r)
 		return
@@ -359,6 +363,19 @@ func (h *kbaseHTTPHandler) handleHealthEvidenceSearch(w http.ResponseWriter, r *
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, page)
+}
+
+func (h *kbaseHTTPHandler) handleHealthEvidenceReadiness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	report, err := BuildHealthEvidenceReadiness(h.store, ParseHealthEvidenceReadinessLimit(r.URL.Query()))
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, report)
 }
 
 func (h *kbaseHTTPHandler) handleDeliveryReceipt(w http.ResponseWriter, r *http.Request, releaseID string) {

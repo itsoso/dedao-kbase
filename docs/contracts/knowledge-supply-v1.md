@@ -65,6 +65,7 @@ importing generic releases directly:
 
 ```text
 GET /api/consumers/health/releases?after={cursor}&limit={n}
+GET /api/consumers/health/readiness?limit={n}
 GET /api/consumers/health/evidence/{release_id}
 GET /api/consumers/health/search?q={query}&tag={tag}&limit={n}
 ```
@@ -74,6 +75,12 @@ include release identity, source provenance, freshness, claim-level tags,
 citations, and safety flags. They are inputs for domain review only; diagnosis,
 personalization, and user-facing medical actions remain owned by the health
 consumer.
+
+Use readiness when the Health feed is empty or stale. It returns each knowledge
+package state as `published`, `ready_to_publish`, `needs_analysis`,
+`needs_quality`, `policy_blocked`, or `quality_blocked`, with a bounded
+`next_action` such as `analyze`, `evaluate_quality`, `review_policy`, or
+`publish`.
 
 ## Local Contract Smoke
 
