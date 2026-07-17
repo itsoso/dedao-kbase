@@ -194,6 +194,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleHealthKnowledgeFeed(w, r)
 		return
 	}
+	if r.URL.Path == "/api/consumers/health/search" {
+		h.handleHealthEvidenceSearch(w, r)
+		return
+	}
+	if releaseID, ok := healthEvidencePathID(r.URL.Path); ok {
+		h.handleHealthEvidence(w, r, releaseID)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/feed" {
 		h.handleKnowledgeFeed(w, r)
 		return
@@ -317,6 +325,36 @@ func (h *kbaseHTTPHandler) handleHealthKnowledgeFeed(w http.ResponseWriter, r *h
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, page)
+}
+
+func (h *kbaseHTTPHandler) handleHealthEvidence(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pkg, err := BuildHealthEvidencePackage(h.store, releaseID)
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "not available for health") {
+			writeHTTPError(w, http.StatusNotFound, "health evidence not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, pkg)
+}
+
+func (h *kbaseHTTPHandler) handleHealthEvidenceSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	page, err := SearchHealthEvidence(h.store, ParseHealthEvidenceSearchQuery(r.URL.Query()))
+	if err != nil {
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -489,6 +527,19 @@ func knowledgeReleaseNestedPathID(path, resource string) (string, bool) {
 		return "", false
 	}
 	rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		return "", false
+	}
+	releaseID, err := url.PathUnescape(rawID)
+	return releaseID, err == nil && strings.TrimSpace(releaseID) != ""
+}
+
+func healthEvidencePathID(path string) (string, bool) {
+	const prefix = "/api/consumers/health/evidence/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", false
+	}
+	rawID := strings.TrimPrefix(path, prefix)
 	if rawID == "" || strings.Contains(rawID, "/") {
 		return "", false
 	}

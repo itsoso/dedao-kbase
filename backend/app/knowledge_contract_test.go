@@ -79,11 +79,29 @@ func TestKnowledgeContractFeedAndReceiptRoundTrip(t *testing.T) {
 	}
 }
 
+func TestKnowledgeContractHealthEvidenceRoundTrip(t *testing.T) {
+	raw := readContractFixture(t, "health-evidence-package.json")
+	if err := ValidateHealthEvidenceContract(raw); err != nil {
+		t.Fatalf("ValidateHealthEvidenceContract() error = %v", err)
+	}
+	var pkg HealthEvidencePackage
+	if err := json.Unmarshal(raw, &pkg); err != nil {
+		t.Fatal(err)
+	}
+	if pkg.SchemaVersion != HealthEvidenceSchemaVersion || pkg.ReleaseID == "" || pkg.UsagePolicy != BookUsageEvidenceOnly {
+		t.Fatalf("health evidence did not round-trip identity fields: %#v", pkg)
+	}
+	if len(pkg.Evidence) != 1 || pkg.Evidence[0].ClaimID == "" || len(pkg.Evidence[0].Citations) != 1 {
+		t.Fatalf("health evidence did not preserve claim citations: %#v", pkg.Evidence)
+	}
+}
+
 func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 	for _, name := range []string{
 		"knowledge-release-v1.schema.json",
 		"knowledge-feed-v1.schema.json",
 		"delivery-receipt-v1.schema.json",
+		"health-evidence-v1.schema.json",
 	} {
 		raw, err := os.ReadFile(filepath.Join("..", "..", "contracts", name))
 		if err != nil {

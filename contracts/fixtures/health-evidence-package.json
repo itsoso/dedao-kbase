@@ -1,0 +1,54 @@
+{
+  "schema_version": "health_evidence.v1",
+  "release_id": "release-health-fixture",
+  "book_id": "book-health-fixture",
+  "content_hash": "sha256:fixture-health-content",
+  "usage_policy": "evidence_only",
+  "title": "高血压运动证据",
+  "summary": "用于 Health 消费端的证据包样例。",
+  "source": {
+    "uri": "https://mp.weixin.qq.com/s/fixture-health",
+    "type": "wechat_mp_article",
+    "account": "医学参考",
+    "author": "医学参考",
+    "published_at": "2026-07-10T00:00:00Z"
+  },
+  "freshness": {
+    "published_at": "2026-07-10T00:00:00Z",
+    "age_days": 6,
+    "stale": false
+  },
+  "evidence": [
+    {
+      "evidence_id": "release-health-fixture:claim-1",
+      "release_id": "release-health-fixture",
+      "claim_id": "claim-1",
+      "statement": "规律运动可能帮助高血压人群改善血压管理。",
+      "confidence": 0.74,
+      "risk_level": "medium",
+      "evidence_level": "source_claim",
+      "scope": ["成人", "慢病管理"],
+      "tags": {
+        "conditions": ["血压", "高血压"],
+        "interventions": ["运动"],
+        "metrics": ["血压"],
+        "populations": ["成人", "慢病"],
+        "evidence_levels": ["source_claim"]
+      },
+      "citation_ids": ["citation-1"],
+      "citations": [
+        {
+          "citation_id": "citation-1",
+          "chunk_id": "chunk-1",
+          "source_uri": "https://mp.weixin.qq.com/s/fixture-health",
+          "source_type": "wechat_mp_article",
+          "source_account": "医学参考",
+          "published_at": "2026-07-10T00:00:00Z"
+        }
+      ],
+      "safety_flags": ["medical_evidence"],
+      "url": "/api/consumers/health/evidence/release-health-fixture"
+    }
+  ],
+  "created_at": "2026-07-16T10:01:00Z"
+}

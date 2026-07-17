@@ -58,6 +58,23 @@ Impact aggregates release count, receipt dispositions, and pipeline stages.
 Gaps are fingerprinted aggregates only. Consumers should submit or sync gap
 fingerprints rather than raw user queries.
 
+## Health Evidence Consumer
+
+Health systems should use the evidence-only consumer surface instead of
+importing generic releases directly:
+
+```text
+GET /api/consumers/health/releases?after={cursor}&limit={n}
+GET /api/consumers/health/evidence/{release_id}
+GET /api/consumers/health/search?q={query}&tag={tag}&limit={n}
+```
+
+Evidence packages follow `contracts/health-evidence-v1.schema.json`. They
+include release identity, source provenance, freshness, claim-level tags,
+citations, and safety flags. They are inputs for domain review only; diagnosis,
+personalization, and user-facing medical actions remain owned by the health
+consumer.
+
 ## Local Contract Smoke
 
 Run:
@@ -66,5 +83,6 @@ Run:
 bash scripts/knowledge-contract-smoke.sh
 ```
 
-This executes the contract, feed, receipt, lineage, impact, system-map, privacy,
-and whitespace checks without contacting production services.
+This executes the contract, feed, Health evidence, receipt, lineage, impact,
+system-map, privacy, and whitespace checks without contacting production
+services.
