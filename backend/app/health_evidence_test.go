@@ -274,6 +274,37 @@ func TestRunHealthEvidenceAnalysisBatchDryRunDoesNotMutateOrCallModel(t *testing
 	}
 }
 
+func TestRunHealthEvidenceAnalysisBatchSummaryOnlyReturnsCountsWithoutItems(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	saveHealthReadinessBook(t, store, "also-needs-analysis", "hash-second")
+	saveHealthReadinessBook(t, store, "already-ready", "hash-ready")
+	saveHealthAnalysis(t, store, "already-ready", "hash-ready")
+	saveHealthQuality(t, store, "already-ready", "hash-ready", BookQualityPass, BookUsageEvidenceOnly)
+	called := false
+	generator := func(_ context.Context, _ *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+		called = true
+		return nil, fmt.Errorf("generator should not run for summary only: %s", request.BookID)
+	}
+
+	result, err := RunHealthEvidenceAnalysisBatch(context.Background(), store, generator, HealthEvidenceAnalysisBatchRequest{Limit: 1, SummaryOnly: true})
+	if err != nil {
+		t.Fatalf("RunHealthEvidenceAnalysisBatch returned error: %v", err)
+	}
+	if called {
+		t.Fatal("summary-only request called model generator")
+	}
+	if !result.DryRun || !result.SummaryOnly || result.Eligible != 2 || result.Skipped != 1 || !result.LimitReached {
+		t.Fatalf("summary-only summary = %#v", result)
+	}
+	if result.Processed != 0 || result.Succeeded != 0 || result.Failed != 0 || len(result.Items) != 0 {
+		t.Fatalf("summary-only should not process items: %#v", result)
+	}
+	if result.SkippedByStatus[HealthEvidenceReadinessReadyToPublish] != 1 {
+		t.Fatalf("summary-only skipped statuses = %#v", result.SkippedByStatus)
+	}
+}
+
 func TestHealthEvidenceAnalysisBatchHTTP(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
@@ -324,6 +355,28 @@ func TestHealthEvidenceAnalysisBatchHTTPDryRunDoesNotCallGenerator(t *testing.T)
 	}
 	if called {
 		t.Fatal("dry-run HTTP request called model generator")
+	}
+}
+
+func TestHealthEvidenceAnalysisBatchHTTPSummaryOnlyDoesNotCallGenerator(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	called := false
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		AnalysisGenerator: func(_ context.Context, _ *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+			called = true
+			return nil, fmt.Errorf("generator should not run for summary only: %s", request.BookID)
+		},
+	})
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "secret-token", `{"limit":1,"summary_only":true}`)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"dry_run":true`) || !strings.Contains(resp.Body.String(), `"summary_only":true`) || !strings.Contains(resp.Body.String(), `"eligible":1`) || !strings.Contains(resp.Body.String(), `"items":[]`) {
+		t.Fatalf("summary-only batch status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if called {
+		t.Fatal("summary-only HTTP request called model generator")
 	}
 }
 

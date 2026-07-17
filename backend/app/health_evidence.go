@@ -132,11 +132,13 @@ type HealthEvidenceAnalysisBatchRequest struct {
 	Model           string `json:"model,omitempty"`
 	MaxContextChars int    `json:"max_context_chars,omitempty"`
 	DryRun          bool   `json:"dry_run,omitempty"`
+	SummaryOnly     bool   `json:"summary_only,omitempty"`
 }
 
 type HealthEvidenceAnalysisBatchResult struct {
 	SchemaVersion   string                            `json:"schema_version"`
 	DryRun          bool                              `json:"dry_run"`
+	SummaryOnly     bool                              `json:"summary_only,omitempty"`
 	Eligible        int                               `json:"eligible"`
 	Skipped         int                               `json:"skipped"`
 	SkippedByStatus map[string]int                    `json:"skipped_by_status,omitempty"`
@@ -317,7 +319,8 @@ func RunHealthEvidenceAnalysisBatch(
 	}
 	result := HealthEvidenceAnalysisBatchResult{
 		SchemaVersion:   HealthEvidenceAnalysisBatchSchemaVersion,
-		DryRun:          request.DryRun,
+		DryRun:          request.DryRun || request.SummaryOnly,
+		SummaryOnly:     request.SummaryOnly,
 		SkippedByStatus: map[string]int{},
 		Items:           []HealthEvidenceAnalysisBatchItem{},
 	}
@@ -333,6 +336,9 @@ func RunHealthEvidenceAnalysisBatch(
 		result.SkippedByStatus = nil
 	}
 	result.LimitReached = result.Eligible > request.Limit
+	if request.SummaryOnly {
+		return result, nil
+	}
 	for _, item := range readiness.Items {
 		if result.Processed >= request.Limit {
 			break
@@ -347,7 +353,7 @@ func RunHealthEvidenceAnalysisBatch(
 			Status:     "processing",
 			NextAction: item.NextAction,
 		}
-		if request.DryRun {
+		if result.DryRun {
 			batchItem.Status = "preview"
 			batchItem.NextStatus = item.Status
 			result.Items = append(result.Items, batchItem)
