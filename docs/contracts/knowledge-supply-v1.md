@@ -97,8 +97,9 @@ batch response includes `dry_run`, `eligible`, `skipped`, `skipped_by_status`,
 `requested_limit`, `next_batch_size`, `estimated_batches`, and `limit_reached`
 so operators can distinguish an empty queue from a limited preview, estimate
 how many batches remain, or identify a queue blocked in another readiness state.
-`queue_state` is `ready`, `blocked`, or `empty`; `recommended_action` is
-`run_analysis`, `review_blocked`, or `idle`.
+`queue_state` is `ready`, `complete`, `blocked`, or `empty`; `complete`
+means all scanned items are already published or ready to publish.
+`recommended_action` is `run_analysis`, `review_blocked`, or `idle`.
 
 ## Local Contract Smoke
 

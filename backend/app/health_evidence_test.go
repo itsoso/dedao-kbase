@@ -323,6 +323,52 @@ func TestRunHealthEvidenceAnalysisBatchSummaryOnlyReturnsCountsWithoutItems(t *t
 	}
 }
 
+func TestRunHealthEvidenceAnalysisBatchCompleteQueueDoesNotLookBlocked(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "already-ready", "hash-ready")
+	saveHealthAnalysis(t, store, "already-ready", "hash-ready")
+	saveHealthQuality(t, store, "already-ready", "hash-ready", BookQualityPass, BookUsageEvidenceOnly)
+	release := sampleHealthEvidenceRelease()
+	release.ReleaseID = "release-published"
+	release.BookID = "already-published"
+	release.ContentHash = "hash-published"
+	release.Book.BookID = "already-published"
+	release.Book.Title = "already-published"
+	saveHealthReadinessBook(t, store, "already-published", "hash-published")
+	saveHealthAnalysis(t, store, "already-published", "hash-published")
+	saveHealthQuality(t, store, "already-published", "hash-published", BookQualityPass, BookUsageEvidenceOnly)
+	saveFeedRelease(t, store, release)
+
+	result, err := RunHealthEvidenceAnalysisBatch(context.Background(), store, nil, HealthEvidenceAnalysisBatchRequest{Limit: 5, SummaryOnly: true})
+	if err != nil {
+		t.Fatalf("RunHealthEvidenceAnalysisBatch returned error: %v", err)
+	}
+	if result.Eligible != 0 || result.Skipped != 2 || result.HasWork {
+		t.Fatalf("complete queue summary = %#v", result)
+	}
+	if result.QueueState != "complete" || result.RecommendedAction != "idle" {
+		t.Fatalf("complete queue state = %#v", result)
+	}
+}
+
+func TestRunHealthEvidenceAnalysisBatchBlockedQueueRequiresReview(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "policy-blocked", "hash-policy")
+	saveHealthAnalysis(t, store, "policy-blocked", "hash-policy")
+	saveHealthQuality(t, store, "policy-blocked", "hash-policy", BookQualityPass, BookUsageStandard)
+
+	result, err := RunHealthEvidenceAnalysisBatch(context.Background(), store, nil, HealthEvidenceAnalysisBatchRequest{Limit: 5, SummaryOnly: true})
+	if err != nil {
+		t.Fatalf("RunHealthEvidenceAnalysisBatch returned error: %v", err)
+	}
+	if result.Eligible != 0 || result.Skipped != 1 || result.HasWork {
+		t.Fatalf("blocked queue summary = %#v", result)
+	}
+	if result.QueueState != "blocked" || result.RecommendedAction != "review_blocked" {
+		t.Fatalf("blocked queue state = %#v", result)
+	}
+}
+
 func TestHealthEvidenceAnalysisBatchHTTP(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")

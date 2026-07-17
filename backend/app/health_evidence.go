@@ -352,17 +352,7 @@ func RunHealthEvidenceAnalysisBatch(
 		result.EstimatedBatches = (result.Eligible + request.Limit - 1) / request.Limit
 	}
 	result.HasWork = result.Eligible > 0
-	switch {
-	case result.HasWork:
-		result.QueueState = "ready"
-		result.RecommendedAction = "run_analysis"
-	case result.Skipped > 0:
-		result.QueueState = "blocked"
-		result.RecommendedAction = "review_blocked"
-	default:
-		result.QueueState = "empty"
-		result.RecommendedAction = "idle"
-	}
+	result.QueueState, result.RecommendedAction = healthEvidenceAnalysisQueueDecision(result)
 	result.LimitReached = result.Eligible > request.Limit
 	if request.SummaryOnly {
 		return result, nil
@@ -434,6 +424,21 @@ func RunHealthEvidenceAnalysisBatch(
 		result.Items = append(result.Items, batchItem)
 	}
 	return result, nil
+}
+
+func healthEvidenceAnalysisQueueDecision(result HealthEvidenceAnalysisBatchResult) (string, string) {
+	if result.Eligible > 0 {
+		return "ready", "run_analysis"
+	}
+	if result.Scanned == 0 {
+		return "empty", "idle"
+	}
+	for status := range result.SkippedByStatus {
+		if status != HealthEvidenceReadinessPublished && status != HealthEvidenceReadinessReadyToPublish {
+			return "blocked", "review_blocked"
+		}
+	}
+	return "complete", "idle"
 }
 
 func ParseHealthEvidenceSearchQuery(values url.Values) HealthEvidenceSearchQuery {
