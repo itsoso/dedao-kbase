@@ -70,6 +70,13 @@ func TestSearchHealthEvidenceFiltersByTextAndTag(t *testing.T) {
 	if results.Items[0].URL != "/api/consumers/health/evidence/release-health" {
 		t.Fatalf("search URL = %#v", results.Items[0])
 	}
+	empty, err := SearchHealthEvidence(store, HealthEvidenceSearchQuery{Query: "不存在的健康问题", Limit: 10})
+	if err != nil {
+		t.Fatalf("empty SearchHealthEvidence returned error: %v", err)
+	}
+	if empty.Items == nil || len(empty.Items) != 0 {
+		t.Fatalf("empty search should return stable empty array, got %#v", empty.Items)
+	}
 }
 
 func TestHealthEvidenceHTTPDetailAndSearch(t *testing.T) {

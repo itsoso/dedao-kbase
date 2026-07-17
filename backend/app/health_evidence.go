@@ -146,7 +146,10 @@ func SearchHealthEvidence(store *BookKnowledgeStore, query HealthEvidenceSearchQ
 	if err != nil {
 		return HealthEvidenceSearchPage{}, err
 	}
-	page := HealthEvidenceSearchPage{SchemaVersion: HealthEvidenceSearchSchemaVersion}
+	page := HealthEvidenceSearchPage{
+		SchemaVersion: HealthEvidenceSearchSchemaVersion,
+		Items:         []HealthEvidenceClaim{},
+	}
 	for _, record := range manifest.Releases {
 		if record.UsagePolicy != BookUsageEvidenceOnly {
 			continue
