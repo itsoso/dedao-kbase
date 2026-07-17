@@ -89,7 +89,10 @@ action for bounded backfill. The request accepts `limit`, `model`,
 packages, writes the analysis manifest, evaluates quality immediately, and
 returns per-book status. It does not publish releases automatically. When
 `dry_run` is `true`, the response previews the same candidate set without
-calling the model, writing analysis manifests, or changing quality state.
+calling the model, writing analysis manifests, or changing quality state. The
+batch response includes `dry_run`, `eligible`, `skipped`, `skipped_by_status`,
+and `limit_reached` so operators can distinguish an empty queue from a limited
+preview or a queue blocked in another readiness state.
 
 ## Local Contract Smoke
 

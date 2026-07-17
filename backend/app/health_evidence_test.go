@@ -198,6 +198,12 @@ func TestRunHealthEvidenceAnalysisBatchProcessesNeedsAnalysisAndEvaluatesQuality
 	if result.SchemaVersion != HealthEvidenceAnalysisBatchSchemaVersion || result.Processed != 1 || result.Succeeded != 1 || result.Failed != 0 {
 		t.Fatalf("batch result = %#v", result)
 	}
+	if result.DryRun || result.Eligible != 2 || result.Skipped != 1 || !result.LimitReached {
+		t.Fatalf("batch summary = %#v", result)
+	}
+	if result.SkippedByStatus[HealthEvidenceReadinessReadyToPublish] != 1 {
+		t.Fatalf("skipped statuses = %#v", result.SkippedByStatus)
+	}
 	if len(called) != 1 || called[0] != "needs-analysis" {
 		t.Fatalf("generator calls = %#v", called)
 	}
@@ -240,6 +246,12 @@ func TestRunHealthEvidenceAnalysisBatchDryRunDoesNotMutateOrCallModel(t *testing
 	}
 	if result.Processed != 2 || result.Succeeded != 0 || result.Failed != 0 || len(result.Items) != 2 {
 		t.Fatalf("dry-run result = %#v", result)
+	}
+	if !result.DryRun || result.Eligible != 2 || result.Skipped != 0 || result.LimitReached {
+		t.Fatalf("dry-run summary = %#v", result)
+	}
+	if len(result.SkippedByStatus) != 0 {
+		t.Fatalf("dry-run skipped statuses = %#v", result.SkippedByStatus)
 	}
 	for _, item := range result.Items {
 		if item.Status != "preview" || item.NextAction != "analyze" || item.NextStatus != HealthEvidenceReadinessNeedsAnalysis {
@@ -307,7 +319,7 @@ func TestHealthEvidenceAnalysisBatchHTTPDryRunDoesNotCallGenerator(t *testing.T)
 	})
 
 	resp := requestJSONKBase(handler, http.MethodPost, "/api/consumers/health/readiness/analyze", "secret-token", `{"limit":1,"dry_run":true}`)
-	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"status":"preview"`) {
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"dry_run":true`) || !strings.Contains(resp.Body.String(), `"eligible":1`) || !strings.Contains(resp.Body.String(), `"status":"preview"`) {
 		t.Fatalf("dry-run batch status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	if called {

@@ -135,11 +135,16 @@ type HealthEvidenceAnalysisBatchRequest struct {
 }
 
 type HealthEvidenceAnalysisBatchResult struct {
-	SchemaVersion string                            `json:"schema_version"`
-	Processed     int                               `json:"processed"`
-	Succeeded     int                               `json:"succeeded"`
-	Failed        int                               `json:"failed"`
-	Items         []HealthEvidenceAnalysisBatchItem `json:"items"`
+	SchemaVersion   string                            `json:"schema_version"`
+	DryRun          bool                              `json:"dry_run"`
+	Eligible        int                               `json:"eligible"`
+	Skipped         int                               `json:"skipped"`
+	SkippedByStatus map[string]int                    `json:"skipped_by_status,omitempty"`
+	LimitReached    bool                              `json:"limit_reached"`
+	Processed       int                               `json:"processed"`
+	Succeeded       int                               `json:"succeeded"`
+	Failed          int                               `json:"failed"`
+	Items           []HealthEvidenceAnalysisBatchItem `json:"items"`
 }
 
 type HealthEvidenceAnalysisBatchItem struct {
@@ -311,9 +316,23 @@ func RunHealthEvidenceAnalysisBatch(
 		return HealthEvidenceAnalysisBatchResult{}, err
 	}
 	result := HealthEvidenceAnalysisBatchResult{
-		SchemaVersion: HealthEvidenceAnalysisBatchSchemaVersion,
-		Items:         []HealthEvidenceAnalysisBatchItem{},
+		SchemaVersion:   HealthEvidenceAnalysisBatchSchemaVersion,
+		DryRun:          request.DryRun,
+		SkippedByStatus: map[string]int{},
+		Items:           []HealthEvidenceAnalysisBatchItem{},
 	}
+	for _, item := range readiness.Items {
+		if item.Status == HealthEvidenceReadinessNeedsAnalysis {
+			result.Eligible++
+			continue
+		}
+		result.Skipped++
+		result.SkippedByStatus[item.Status]++
+	}
+	if len(result.SkippedByStatus) == 0 {
+		result.SkippedByStatus = nil
+	}
+	result.LimitReached = result.Eligible > request.Limit
 	for _, item := range readiness.Items {
 		if result.Processed >= request.Limit {
 			break
