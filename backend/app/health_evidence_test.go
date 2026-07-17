@@ -207,6 +207,9 @@ func TestRunHealthEvidenceAnalysisBatchProcessesNeedsAnalysisAndEvaluatesQuality
 	if result.RequestedLimit != 1 || result.NextBatchSize != 1 || result.EstimatedBatches != 2 {
 		t.Fatalf("batch estimates = %#v", result)
 	}
+	if result.RemainingAfterNextBatch != 1 {
+		t.Fatalf("batch remaining after next batch = %#v", result)
+	}
 	if result.Scanned != 3 || !result.HasWork || result.QueueState != "ready" || result.RecommendedAction != "run_analysis" {
 		t.Fatalf("batch queue state = %#v", result)
 	}
@@ -261,6 +264,9 @@ func TestRunHealthEvidenceAnalysisBatchDryRunDoesNotMutateOrCallModel(t *testing
 	}
 	if result.RequestedLimit != 2 || result.NextBatchSize != 2 || result.EstimatedBatches != 1 {
 		t.Fatalf("dry-run estimates = %#v", result)
+	}
+	if result.RemainingAfterNextBatch != 0 {
+		t.Fatalf("dry-run remaining after next batch = %#v", result)
 	}
 	if result.Scanned != 2 || !result.HasWork || result.QueueState != "ready" || result.RecommendedAction != "run_analysis" {
 		t.Fatalf("dry-run queue state = %#v", result)
@@ -318,6 +324,9 @@ func TestRunHealthEvidenceAnalysisBatchSummaryOnlyReturnsCountsWithoutItems(t *t
 	if result.RequestedLimit != 1 || result.NextBatchSize != 1 || result.EstimatedBatches != 2 {
 		t.Fatalf("summary-only estimates = %#v", result)
 	}
+	if result.RemainingAfterNextBatch != 1 {
+		t.Fatalf("summary-only remaining after next batch = %#v", result)
+	}
 	if result.Scanned != 3 || !result.HasWork || result.QueueState != "ready" || result.RecommendedAction != "run_analysis" {
 		t.Fatalf("summary-only queue state = %#v", result)
 	}
@@ -351,6 +360,9 @@ func TestRunHealthEvidenceAnalysisBatchCompleteQueueDoesNotLookBlocked(t *testin
 	}
 	if result.Eligible != 0 || result.Skipped != 2 || result.HasWork {
 		t.Fatalf("complete queue summary = %#v", result)
+	}
+	if result.RemainingAfterNextBatch != 0 {
+		t.Fatalf("complete queue remaining after next batch = %#v", result)
 	}
 	if result.ReadyToPublish != 1 || result.Published != 1 || result.Blocked != 0 {
 		t.Fatalf("complete queue status counts = %#v", result)

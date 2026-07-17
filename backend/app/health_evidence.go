@@ -136,27 +136,28 @@ type HealthEvidenceAnalysisBatchRequest struct {
 }
 
 type HealthEvidenceAnalysisBatchResult struct {
-	SchemaVersion     string                            `json:"schema_version"`
-	DryRun            bool                              `json:"dry_run"`
-	SummaryOnly       bool                              `json:"summary_only,omitempty"`
-	Eligible          int                               `json:"eligible"`
-	Skipped           int                               `json:"skipped"`
-	SkippedByStatus   map[string]int                    `json:"skipped_by_status,omitempty"`
-	Scanned           int                               `json:"scanned"`
-	HasWork           bool                              `json:"has_work"`
-	QueueState        string                            `json:"queue_state"`
-	RecommendedAction string                            `json:"recommended_action"`
-	ReadyToPublish    int                               `json:"ready_to_publish"`
-	Published         int                               `json:"published"`
-	Blocked           int                               `json:"blocked"`
-	RequestedLimit    int                               `json:"requested_limit"`
-	NextBatchSize     int                               `json:"next_batch_size"`
-	EstimatedBatches  int                               `json:"estimated_batches"`
-	LimitReached      bool                              `json:"limit_reached"`
-	Processed         int                               `json:"processed"`
-	Succeeded         int                               `json:"succeeded"`
-	Failed            int                               `json:"failed"`
-	Items             []HealthEvidenceAnalysisBatchItem `json:"items"`
+	SchemaVersion           string                            `json:"schema_version"`
+	DryRun                  bool                              `json:"dry_run"`
+	SummaryOnly             bool                              `json:"summary_only,omitempty"`
+	Eligible                int                               `json:"eligible"`
+	Skipped                 int                               `json:"skipped"`
+	SkippedByStatus         map[string]int                    `json:"skipped_by_status,omitempty"`
+	Scanned                 int                               `json:"scanned"`
+	HasWork                 bool                              `json:"has_work"`
+	QueueState              string                            `json:"queue_state"`
+	RecommendedAction       string                            `json:"recommended_action"`
+	ReadyToPublish          int                               `json:"ready_to_publish"`
+	Published               int                               `json:"published"`
+	Blocked                 int                               `json:"blocked"`
+	RequestedLimit          int                               `json:"requested_limit"`
+	NextBatchSize           int                               `json:"next_batch_size"`
+	RemainingAfterNextBatch int                               `json:"remaining_after_next_batch"`
+	EstimatedBatches        int                               `json:"estimated_batches"`
+	LimitReached            bool                              `json:"limit_reached"`
+	Processed               int                               `json:"processed"`
+	Succeeded               int                               `json:"succeeded"`
+	Failed                  int                               `json:"failed"`
+	Items                   []HealthEvidenceAnalysisBatchItem `json:"items"`
 }
 
 type HealthEvidenceAnalysisBatchItem struct {
@@ -359,6 +360,7 @@ func RunHealthEvidenceAnalysisBatch(
 	if result.NextBatchSize > request.Limit {
 		result.NextBatchSize = request.Limit
 	}
+	result.RemainingAfterNextBatch = result.Eligible - result.NextBatchSize
 	if result.Eligible > 0 {
 		result.EstimatedBatches = (result.Eligible + request.Limit - 1) / request.Limit
 	}
