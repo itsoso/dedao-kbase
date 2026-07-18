@@ -152,6 +152,7 @@ type HealthEvidenceAnalysisBatchResult struct {
 	RequestedLimit          int                               `json:"requested_limit"`
 	NextBatchSize           int                               `json:"next_batch_size"`
 	RemainingAfterNextBatch int                               `json:"remaining_after_next_batch"`
+	HasMoreAfterNextBatch   bool                              `json:"has_more_after_next_batch"`
 	EstimatedBatches        int                               `json:"estimated_batches"`
 	LimitReached            bool                              `json:"limit_reached"`
 	Processed               int                               `json:"processed"`
@@ -361,6 +362,7 @@ func RunHealthEvidenceAnalysisBatch(
 		result.NextBatchSize = request.Limit
 	}
 	result.RemainingAfterNextBatch = result.Eligible - result.NextBatchSize
+	result.HasMoreAfterNextBatch = result.RemainingAfterNextBatch > 0
 	if result.Eligible > 0 {
 		result.EstimatedBatches = (result.Eligible + request.Limit - 1) / request.Limit
 	}
