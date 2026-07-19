@@ -11,6 +11,7 @@ import (
 
 type AgentToolAudit struct {
 	PackageID         string   `json:"package_id,omitempty"`
+	PackageVersion    string   `json:"package_version,omitempty"`
 	ReleaseID         string   `json:"release_id,omitempty"`
 	ToolID            string   `json:"tool_id"`
 	Decision          string   `json:"decision"`
@@ -32,20 +33,20 @@ type agentReadOnlyToolDefinition struct {
 
 var agentReadOnlyTools = map[string]agentReadOnlyToolDefinition{
 	"agent.package_metadata": {
-		Allowed:  stringBoolSet("package_id", "release_id"),
-		Required: stringBoolSet("package_id", "release_id"),
+		Allowed:  stringBoolSet("package_id", "package_version", "release_id"),
+		Required: stringBoolSet("package_id", "package_version", "release_id"),
 	},
 	"agent.search": {
-		Allowed:  stringBoolSet("package_id", "release_id", "query", "limit"),
-		Required: stringBoolSet("package_id", "release_id", "query"),
+		Allowed:  stringBoolSet("package_id", "package_version", "release_id", "query", "limit"),
+		Required: stringBoolSet("package_id", "package_version", "release_id", "query"),
 	},
 	"agent.resolve_citation": {
-		Allowed:  stringBoolSet("package_id", "release_id", "citation_id"),
-		Required: stringBoolSet("package_id", "release_id", "citation_id"),
+		Allowed:  stringBoolSet("package_id", "package_version", "release_id", "citation_id"),
+		Required: stringBoolSet("package_id", "package_version", "release_id", "citation_id"),
 	},
 	"agent.get_claim": {
-		Allowed:  stringBoolSet("package_id", "release_id", "claim_id"),
-		Required: stringBoolSet("package_id", "release_id", "claim_id"),
+		Allowed:  stringBoolSet("package_id", "package_version", "release_id", "claim_id"),
+		Required: stringBoolSet("package_id", "package_version", "release_id", "claim_id"),
 	},
 }
 
@@ -61,11 +62,12 @@ func AgentReadOnlyToolIDs() []string {
 func EvaluateAgentToolCall(pkg AgentPackage, mcpServer, toolName string, arguments map[string]any) AgentToolPolicyDecision {
 	toolID := strings.TrimSpace(mcpServer) + "/" + strings.TrimSpace(toolName)
 	audit := AgentToolAudit{
-		PackageID:     stringArgument(arguments, "package_id"),
-		ReleaseID:     stringArgument(arguments, "release_id"),
-		ToolID:        toolID,
-		ArgumentNames: sortedArgumentNames(arguments),
-		ArgumentHash:  agentToolArgumentHash(arguments),
+		PackageID:      stringArgument(arguments, "package_id"),
+		PackageVersion: stringArgument(arguments, "package_version"),
+		ReleaseID:      stringArgument(arguments, "release_id"),
+		ToolID:         toolID,
+		ArgumentNames:  sortedArgumentNames(arguments),
+		ArgumentHash:   agentToolArgumentHash(arguments),
 	}
 	block := func(reason string) AgentToolPolicyDecision {
 		audit.Decision = AgentToolBlock
@@ -78,11 +80,17 @@ func EvaluateAgentToolCall(pkg AgentPackage, mcpServer, toolName string, argumen
 	if audit.PackageID == "" {
 		return block("package_id scope is required")
 	}
+	if audit.PackageVersion == "" {
+		return block("package_version scope is required")
+	}
 	if audit.ReleaseID == "" {
 		return block("release_id scope is required")
 	}
 	if audit.PackageID != pkg.PackageID {
 		return block(fmt.Sprintf("package scope %q does not match package %q", audit.PackageID, pkg.PackageID))
+	}
+	if audit.PackageVersion != pkg.Version {
+		return block(fmt.Sprintf("package version scope %q does not match package version %q", audit.PackageVersion, pkg.Version))
 	}
 	pinned := false
 	for _, release := range pkg.Releases {

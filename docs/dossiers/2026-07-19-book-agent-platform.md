@@ -429,6 +429,48 @@ TDD and exact results:
   configuration and evaluation store changed structural inventory.
 - `bash scripts/privacy-smoke.sh` and `git diff --check` — PASS.
 
+## G4 remediation checkpoint 2: versioned read boundary and bounded traces
+
+**Decision: PASS for the second remediation batch; G4 remains NO-GO.** MCP
+versioning, retrieval limits, citation redaction, and trace hash boundaries are
+closed. The package-scoped runtime and the two consumer feedback/review paths
+remain release blockers. No push or deployment was attempted.
+
+Delivered:
+
+- every read-only MCP resource and tool now requires `package_version` and
+  loads that immutable version rather than mutable latest state;
+- tool policy audit records include the version, reject missing/mismatched
+  versions, and keep the version inside the deterministic argument fingerprint;
+- MCP search rejects limits above `retrieval_policy.max_context_chunks` and
+  bounds its default to that package limit;
+- citation resolution returns an allowlisted citation view that excludes source
+  HTML, source-account identity, and local-path-bearing fields;
+- completed traces require retrieved evidence and final citations;
+- trace/package/release/fingerprint and replay-result hashes use exact lowercase
+  SHA-256 formats, trace IDs are bounded URL-safe identifiers, and trace loads
+  verify the requested identity matches the stored object;
+- evaluation tool-argument cases now cover the immutable package version.
+
+TDD and exact results:
+
+- `go test ./backend/app -run 'BookKnowledgeMCP|AgentToolPolicy|AgentTraceRejects' -count=1`
+  — RED first: `package_version` was rejected as unknown while versionless calls
+  still passed; raw fingerprints and ungrounded completed traces also passed.
+- `go test ./backend/app -run TestAgentPackageEvaluationRequiresVersionedToolArguments -count=1`
+  — RED first because a mismatched package version still scored the tool
+  arguments metric as passing.
+- `go test ./backend/app -run TestReplayAgentTraceIsDeterministicOverStoredEvidenceAndMockResults -count=1`
+  — RED for an unbounded raw tool-result hash, then GREEN after replay validation
+  required a SHA-256 value for executed results.
+- `go test ./backend/app -run 'BookKnowledgeMCP|AgentToolPolicy|AgentTrace|AgentPackageEvaluation' -count=1`
+  — PASS.
+- `go test ./...` — PASS.
+- `jq empty contracts/agent-trace-v1.schema.json` — PASS.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` and
+  `bash scripts/system-map-smoke.sh` — PASS; regenerated because the scoped MCP
+  citation and audit types changed structural inventory.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.

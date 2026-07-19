@@ -17,14 +17,14 @@
   ],
   "properties": {
     "schema_version": { "const": "agent-trace.v1" },
-    "trace_id": { "type": "string", "minLength": 1 },
+    "trace_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
     "package": {
       "type": "object",
       "required": ["package_id", "version", "content_hash"],
       "properties": {
         "package_id": { "type": "string", "minLength": 1 },
         "version": { "type": "string", "minLength": 1 },
-        "content_hash": { "type": "string", "minLength": 1 }
+        "content_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
       },
       "additionalProperties": false
     },
@@ -37,7 +37,7 @@
         "properties": {
           "release_id": { "type": "string", "minLength": 1 },
           "version": { "type": "string", "minLength": 1 },
-          "content_hash": { "type": "string", "minLength": 1 }
+          "content_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
         },
         "additionalProperties": false
       }
@@ -82,7 +82,7 @@
           "call_id": { "type": "string", "minLength": 1 },
           "mcp_server": { "type": "string", "minLength": 1 },
           "tool_name": { "type": "string", "minLength": 1 },
-          "argument_fingerprint": { "type": "string", "minLength": 1 },
+          "argument_fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
           "policy_decision": {
             "enum": ["allow", "require_confirmation", "block"]
           },
@@ -95,7 +95,7 @@
               "confirmation_required"
             ]
           },
-          "result_fingerprint": { "type": "string" }
+          "result_fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
         },
         "additionalProperties": false
       }
@@ -105,7 +105,7 @@
       "required": ["outcome", "response_fingerprint", "citations"],
       "properties": {
         "outcome": { "enum": ["completed", "abstained", "failed"] },
-        "response_fingerprint": { "type": "string", "minLength": 1 },
+        "response_fingerprint": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
         "citations": {
           "type": "array",
           "items": {

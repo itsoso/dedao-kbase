@@ -143,6 +143,15 @@ func ValidateAgentTrace(trace AgentTrace) error {
 	}); err != nil {
 		return err
 	}
+	if len(trace.TraceID) > 128 || !agentPackageIDPattern.MatchString(trace.TraceID) {
+		return fmt.Errorf("trace_id must be a URL-safe identifier of at most 128 characters")
+	}
+	if err := validateAgentSHA256("package.content_hash", trace.Package.ContentHash); err != nil {
+		return err
+	}
+	if err := validateAgentSHA256("final.response_fingerprint", trace.Final.ResponseFingerprint); err != nil {
+		return err
+	}
 	startedAt, err := time.Parse(time.RFC3339Nano, trace.StartedAt)
 	if err != nil {
 		return fmt.Errorf("started_at must be RFC3339: %w", err)
@@ -164,6 +173,9 @@ func ValidateAgentTrace(trace AgentTrace) error {
 		}
 		if strings.TrimSpace(release.Version) == "" {
 			return fmt.Errorf("release version is required for %q", release.ReleaseID)
+		}
+		if err := validateAgentSHA256(fmt.Sprintf("releases[%d].content_hash", index), release.ContentHash); err != nil {
+			return err
 		}
 		if _, exists := releases[release.ReleaseID]; exists {
 			return fmt.Errorf("duplicate release %q", release.ReleaseID)
@@ -208,10 +220,16 @@ func ValidateAgentTrace(trace AgentTrace) error {
 	default:
 		return fmt.Errorf("unsupported final outcome %q", trace.Final.Outcome)
 	}
+	if trace.Final.Outcome == AgentTraceOutcomeCompleted && (len(trace.Retrievals) == 0 || len(trace.Final.Citations) == 0) {
+		return fmt.Errorf("completed trace requires grounded evidence and citations")
+	}
 	return validateAgentTraceCitations(trace.Final.Citations, releases, evidence)
 }
 
 func validateAgentTraceToolCall(call AgentTraceToolCall) error {
+	if err := validateAgentSHA256("argument_fingerprint", call.ArgumentFingerprint); err != nil {
+		return fmt.Errorf("tool %q: %w", call.CallID, err)
+	}
 	switch call.PolicyDecision {
 	case AgentToolAllow:
 		if call.Outcome != AgentToolOutcomeSucceeded && call.Outcome != AgentToolOutcomeFailed {
@@ -232,6 +250,19 @@ func validateAgentTraceToolCall(call AgentTraceToolCall) error {
 	if (call.Outcome == AgentToolOutcomeSucceeded || call.Outcome == AgentToolOutcomeFailed) &&
 		strings.TrimSpace(call.ResultFingerprint) == "" {
 		return fmt.Errorf("executed tool %q requires result_fingerprint", call.CallID)
+	}
+	if strings.TrimSpace(call.ResultFingerprint) != "" {
+		if err := validateAgentSHA256("result_fingerprint", call.ResultFingerprint); err != nil {
+			return fmt.Errorf("tool %q: %w", call.CallID, err)
+		}
+	}
+	return nil
+}
+
+func validateAgentSHA256(field, value string) error {
+	digest := strings.TrimPrefix(strings.TrimSpace(value), "sha256:")
+	if !strings.HasPrefix(strings.TrimSpace(value), "sha256:") || len(digest) != 64 || !isLowerHex(digest) {
+		return fmt.Errorf("%s must be a lowercase sha256 fingerprint", field)
 	}
 	return nil
 }
@@ -297,7 +328,8 @@ func (s *BookKnowledgeStore) SaveAgentTrace(trace AgentTrace) error {
 }
 
 func (s *BookKnowledgeStore) LoadAgentTrace(traceID string) (*AgentTrace, error) {
-	if strings.TrimSpace(traceID) == "" {
+	traceID = strings.TrimSpace(traceID)
+	if traceID == "" {
 		return nil, fmt.Errorf("trace_id is required")
 	}
 	s.mu.RLock()
@@ -305,6 +337,9 @@ func (s *BookKnowledgeStore) LoadAgentTrace(traceID string) (*AgentTrace, error)
 	var trace AgentTrace
 	if err := readJSONFile(s.AgentTracePath(traceID), &trace); err != nil {
 		return nil, err
+	}
+	if trace.TraceID != traceID {
+		return nil, fmt.Errorf("stored trace identity does not match requested trace_id")
 	}
 	if err := ValidateAgentTrace(trace); err != nil {
 		return nil, err
@@ -328,8 +363,8 @@ func ReplayAgentTrace(trace AgentTrace, fixture AgentReplayFixture) (AgentReplay
 	evidenceIDs := make([]string, 0, len(evidence))
 	seenEvidence := make(map[string]struct{}, len(evidence))
 	for _, item := range evidence {
-		if strings.TrimSpace(item.ContentHash) == "" {
-			return AgentReplayResult{}, fmt.Errorf("stored evidence %q requires content_hash", item.EvidenceID)
+		if err := validateAgentSHA256(fmt.Sprintf("stored evidence %q content_hash", item.EvidenceID), item.ContentHash); err != nil {
+			return AgentReplayResult{}, err
 		}
 		if _, ok := retrievals[item.EvidenceID]; !ok {
 			return AgentReplayResult{}, fmt.Errorf("stored evidence %q was not retrieved", item.EvidenceID)
@@ -340,8 +375,8 @@ func ReplayAgentTrace(trace AgentTrace, fixture AgentReplayFixture) (AgentReplay
 		seenEvidence[item.EvidenceID] = struct{}{}
 		evidenceIDs = append(evidenceIDs, item.EvidenceID)
 	}
-	if strings.TrimSpace(fixture.Model.OutputHash) == "" {
-		return AgentReplayResult{}, fmt.Errorf("mock model output_hash is required")
+	if err := validateAgentSHA256("mock model output_hash", fixture.Model.OutputHash); err != nil {
+		return AgentReplayResult{}, err
 	}
 	releases := make(map[string]AgentTraceReleaseRef, len(trace.Releases))
 	for _, release := range trace.Releases {
@@ -370,6 +405,11 @@ func ReplayAgentTrace(trace AgentTrace, fixture AgentReplayFixture) (AgentReplay
 			return AgentReplayResult{}, fmt.Errorf("duplicate mock tool result %q", result.CallID)
 		}
 		seenTools[result.CallID] = struct{}{}
+		if result.Outcome == AgentToolOutcomeSucceeded || result.Outcome == AgentToolOutcomeFailed || strings.TrimSpace(result.ResultHash) != "" {
+			if err := validateAgentSHA256(fmt.Sprintf("mock tool result %q result_hash", result.CallID), result.ResultHash); err != nil {
+				return AgentReplayResult{}, err
+			}
+		}
 		if call.PolicyDecision == AgentToolBlock && result.Outcome != AgentToolOutcomeBlocked && result.Outcome != AgentToolOutcomeNotExecuted {
 			return AgentReplayResult{}, fmt.Errorf("blocked tool %q cannot execute during replay", result.CallID)
 		}

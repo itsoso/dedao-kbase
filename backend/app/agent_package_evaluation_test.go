@@ -140,6 +140,25 @@ func TestAgentPackageEvaluationIgnoresCallerSuppliedObservations(t *testing.T) {
 	}
 }
 
+func TestAgentPackageEvaluationRequiresVersionedToolArguments(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	suite := loadAgentEvaluationFixture(t)
+	for index := range suite.Cases {
+		if suite.Cases[index].Metric == "tool_arguments" {
+			suite.Cases[index].ExpectedArguments["package_version"] = "2.0.0"
+		}
+	}
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Metrics["tool_arguments"] != 0 || report.Passed {
+		t.Fatalf("version-mismatched tool arguments passed: %#v", report)
+	}
+}
+
 func TestAgentPackageEvaluationRejectsTamperingAndOverwrite(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
@@ -224,6 +243,13 @@ func loadAgentEvaluationFixture(t *testing.T) AgentEvaluationSuite {
 func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeStore, pkg AgentPackage) {
 	t.Helper()
 	suite := loadAgentEvaluationFixture(t)
+	for index := range suite.Cases {
+		if suite.Cases[index].Metric == "tool_arguments" {
+			suite.Cases[index].ExpectedArguments["package_id"] = pkg.PackageID
+			suite.Cases[index].ExpectedArguments["package_version"] = pkg.Version
+			suite.Cases[index].ExpectedArguments["release_id"] = pkg.Releases[0].ReleaseID
+		}
+	}
 	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)

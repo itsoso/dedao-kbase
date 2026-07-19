@@ -9,10 +9,11 @@ import (
 func TestAgentToolPolicyAllowsScopedReadOnlyCallWithBoundedAudit(t *testing.T) {
 	pkg := agentToolPolicyTestPackage()
 	decision := EvaluateAgentToolCall(pkg, "book-mcp", "agent.search", map[string]any{
-		"package_id": "agent-package-example",
-		"release_id": "release-1",
-		"query":      "private query must not enter audit",
-		"limit":      float64(5),
+		"package_id":      "agent-package-example",
+		"package_version": "1.0.0",
+		"release_id":      "release-1",
+		"query":           "private query must not enter audit",
+		"limit":           float64(5),
 	})
 	if decision.Decision != AgentToolAllow || decision.Audit.PackageID != pkg.PackageID ||
 		decision.Audit.ReleaseID != "release-1" || !strings.HasPrefix(decision.Audit.ArgumentHash, "sha256:") {
@@ -35,12 +36,14 @@ func TestAgentToolPolicyRequiresScopeAndRejectsArguments(t *testing.T) {
 		args map[string]any
 		want string
 	}{
-		{name: "missing package", tool: "agent.search", args: map[string]any{"release_id": "release-1", "query": "q"}, want: "package_id"},
-		{name: "missing release", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "query": "q"}, want: "release_id"},
-		{name: "wrong package", tool: "agent.search", args: map[string]any{"package_id": "other", "release_id": "release-1", "query": "q"}, want: "package scope"},
-		{name: "unpinned release", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "release_id": "release-other", "query": "q"}, want: "release scope"},
-		{name: "unknown argument", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "release_id": "release-1", "query": "q", "write": true}, want: "unsupported argument"},
-		{name: "write tool", tool: "agent.publish", args: map[string]any{"package_id": pkg.PackageID, "release_id": "release-1"}, want: "read-only"},
+		{name: "missing package", tool: "agent.search", args: map[string]any{"package_version": pkg.Version, "release_id": "release-1", "query": "q"}, want: "package_id"},
+		{name: "missing package version", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "release_id": "release-1", "query": "q"}, want: "package_version"},
+		{name: "wrong package version", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "package_version": "2.0.0", "release_id": "release-1", "query": "q"}, want: "package version"},
+		{name: "missing release", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "package_version": pkg.Version, "query": "q"}, want: "release_id"},
+		{name: "wrong package", tool: "agent.search", args: map[string]any{"package_id": "other", "package_version": pkg.Version, "release_id": "release-1", "query": "q"}, want: "package scope"},
+		{name: "unpinned release", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "package_version": pkg.Version, "release_id": "release-other", "query": "q"}, want: "release scope"},
+		{name: "unknown argument", tool: "agent.search", args: map[string]any{"package_id": pkg.PackageID, "package_version": pkg.Version, "release_id": "release-1", "query": "q", "write": true}, want: "unsupported argument"},
+		{name: "write tool", tool: "agent.publish", args: map[string]any{"package_id": pkg.PackageID, "package_version": pkg.Version, "release_id": "release-1"}, want: "read-only"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -56,9 +59,10 @@ func TestAgentToolPolicyPreservesRequireConfirmation(t *testing.T) {
 	pkg := agentToolPolicyTestPackage()
 	pkg.ToolPolicy.Tools[0].Decision = AgentToolRequireConfirmation
 	decision := EvaluateAgentToolCall(pkg, "book-mcp", "agent.search", map[string]any{
-		"package_id": pkg.PackageID,
-		"release_id": "release-1",
-		"query":      "q",
+		"package_id":      pkg.PackageID,
+		"package_version": pkg.Version,
+		"release_id":      "release-1",
+		"query":           "q",
 	})
 	if decision.Decision != AgentToolRequireConfirmation || !strings.Contains(decision.Reason, "confirmation") {
 		t.Fatalf("decision = %#v", decision)

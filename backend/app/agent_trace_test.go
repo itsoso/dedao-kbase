@@ -50,7 +50,7 @@ func TestAgentTracePersistsVersionedRuntimeEvidenceWithoutPrivateInputs(t *testi
 		t.Fatalf("idempotent SaveAgentTrace returned error: %v", err)
 	}
 	changed := trace
-	changed.Final.ResponseFingerprint = "sha256:different-response"
+	changed.Final.ResponseFingerprint = "sha256:" + strings.Repeat("9", 64)
 	if err := store.SaveAgentTrace(changed); err == nil || !strings.Contains(err.Error(), "trace_id already exists") {
 		t.Fatalf("changed trace SaveAgentTrace error = %v", err)
 	}
@@ -91,6 +91,21 @@ func TestAgentTraceRejectsIncompleteOrUnsafeRuntimeRecords(t *testing.T) {
 			},
 			message: "citation evidence",
 		},
+		{
+			name: "raw fingerprint value",
+			mutate: func(trace *AgentTrace) {
+				trace.ToolCalls[0].ArgumentFingerprint = "private prompt copied here"
+			},
+			message: "sha256",
+		},
+		{
+			name: "completed without grounding",
+			mutate: func(trace *AgentTrace) {
+				trace.Retrievals = nil
+				trace.Final.Citations = nil
+			},
+			message: "completed trace requires grounded evidence",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -106,15 +121,15 @@ func TestAgentTraceRejectsIncompleteOrUnsafeRuntimeRecords(t *testing.T) {
 func TestReplayAgentTraceIsDeterministicOverStoredEvidenceAndMockResults(t *testing.T) {
 	trace := agentTraceTestTrace()
 	fixture := AgentReplayFixture{
-		Evidence: []AgentReplayEvidence{{EvidenceID: "chunk-1", ContentHash: "sha256:evidence-1"}},
+		Evidence: []AgentReplayEvidence{{EvidenceID: "chunk-1", ContentHash: "sha256:" + strings.Repeat("5", 64)}},
 		Model: AgentReplayModelResult{
-			OutputHash: "sha256:response-1",
+			OutputHash: "sha256:" + strings.Repeat("8", 64),
 			Citations:  trace.Final.Citations,
 		},
 		Tools: []AgentReplayToolResult{{
 			CallID:     "tool-call-1",
 			Outcome:    AgentToolOutcomeSucceeded,
-			ResultHash: "sha256:tool-result-1",
+			ResultHash: "sha256:" + strings.Repeat("4", 64),
 		}},
 	}
 
@@ -136,6 +151,14 @@ func TestReplayAgentTraceIsDeterministicOverStoredEvidenceAndMockResults(t *test
 	fixture.Evidence = nil
 	if _, err := ReplayAgentTrace(trace, fixture); err == nil || !strings.Contains(err.Error(), "stored evidence") {
 		t.Fatalf("missing evidence replay error = %v", err)
+	}
+	fixture = AgentReplayFixture{
+		Evidence: []AgentReplayEvidence{{EvidenceID: "chunk-1", ContentHash: "sha256:" + strings.Repeat("5", 64)}},
+		Model:    AgentReplayModelResult{OutputHash: trace.Final.ResponseFingerprint, Citations: trace.Final.Citations},
+		Tools:    []AgentReplayToolResult{{CallID: "tool-call-1", Outcome: AgentToolOutcomeSucceeded, ResultHash: "raw tool output"}},
+	}
+	if _, err := ReplayAgentTrace(trace, fixture); err == nil || !strings.Contains(err.Error(), "sha256") {
+		t.Fatalf("raw tool result hash replay error = %v", err)
 	}
 }
 
@@ -204,12 +227,12 @@ func agentTraceTestTrace() AgentTrace {
 		Package: AgentTracePackageRef{
 			PackageID:   "agent-package-example",
 			Version:     "1.0.0",
-			ContentHash: "sha256:package-1",
+			ContentHash: "sha256:" + strings.Repeat("1", 64),
 		},
 		Releases: []AgentTraceReleaseRef{{
 			ReleaseID:   "release-1",
 			Version:     "1",
-			ContentHash: "sha256:release-1",
+			ContentHash: "sha256:" + strings.Repeat("2", 64),
 		}},
 		Retrievals: []AgentTraceRetrieval{{
 			EvidenceID: "chunk-1",
@@ -226,14 +249,14 @@ func agentTraceTestTrace() AgentTrace {
 			CallID:              "tool-call-1",
 			MCPServer:           "book-kbase",
 			ToolName:            "search_package",
-			ArgumentFingerprint: "sha256:tool-arguments-1",
+			ArgumentFingerprint: "sha256:" + strings.Repeat("3", 64),
 			PolicyDecision:      AgentToolAllow,
 			Outcome:             AgentToolOutcomeSucceeded,
-			ResultFingerprint:   "sha256:tool-result-1",
+			ResultFingerprint:   "sha256:" + strings.Repeat("4", 64),
 		}},
 		Final: AgentTraceFinal{
 			Outcome:             AgentTraceOutcomeCompleted,
-			ResponseFingerprint: "sha256:response-1",
+			ResponseFingerprint: "sha256:" + strings.Repeat("8", 64),
 			Citations: []AgentTraceCitation{{
 				CitationID: "citation-1",
 				ReleaseID:  "release-1",

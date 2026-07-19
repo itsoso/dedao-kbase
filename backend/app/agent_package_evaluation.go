@@ -177,6 +177,7 @@ func deterministicAgentEvaluationCasePasses(pkg AgentPackage, facts agentEvaluat
 		return facts.tools[strings.TrimSpace(evalCase.ExpectedValue)]
 	case "tool_arguments":
 		if len(evalCase.ExpectedArguments) == 0 || evalCase.ExpectedArguments["package_id"] != pkg.PackageID ||
+			evalCase.ExpectedArguments["package_version"] != pkg.Version ||
 			!facts.releaseIDs[evalCase.ExpectedArguments["release_id"]] {
 			return false
 		}

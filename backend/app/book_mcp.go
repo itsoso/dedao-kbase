@@ -26,6 +26,17 @@ type AgentScopedSearchResult struct {
 	Score       float64  `json:"score"`
 }
 
+type AgentScopedCitation struct {
+	CitationID  string `json:"citation_id"`
+	BookID      string `json:"book_id"`
+	ChapterID   string `json:"chapter_id,omitempty"`
+	ChunkID     string `json:"chunk_id,omitempty"`
+	Anchor      string `json:"anchor,omitempty"`
+	Note        string `json:"note,omitempty"`
+	SourceType  string `json:"source_type,omitempty"`
+	PublishedAt string `json:"published_at,omitempty"`
+}
+
 type BookKnowledgeMCPServer struct {
 	store *BookKnowledgeStore
 }
@@ -39,14 +50,15 @@ func NewBookKnowledgeMCPServer(store *BookKnowledgeStore) *BookKnowledgeMCPServe
 
 func (s *BookKnowledgeMCPServer) Tools() []BookKnowledgeMCPTool {
 	scope := map[string]any{
-		"package_id": map[string]any{"type": "string", "minLength": 1},
-		"release_id": map[string]any{"type": "string", "minLength": 1},
+		"package_id":      map[string]any{"type": "string", "minLength": 1},
+		"package_version": map[string]any{"type": "string", "minLength": 1},
+		"release_id":      map[string]any{"type": "string", "minLength": 1},
 	}
 	return []BookKnowledgeMCPTool{
 		{
 			Name:        "agent.package_metadata",
 			Description: "Read bounded metadata for one published Agent Package and pinned release.",
-			InputSchema: strictObjectSchema(scope, []string{"package_id", "release_id"}),
+			InputSchema: strictObjectSchema(scope, []string{"package_id", "package_version", "release_id"}),
 		},
 		{
 			Name:        "agent.search",
@@ -54,27 +66,27 @@ func (s *BookKnowledgeMCPServer) Tools() []BookKnowledgeMCPTool {
 			InputSchema: strictObjectSchema(mergeSchemaProperties(scope, map[string]any{
 				"query": map[string]any{"type": "string", "minLength": 1},
 				"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50},
-			}), []string{"package_id", "release_id", "query"}),
+			}), []string{"package_id", "package_version", "release_id", "query"}),
 		},
 		{
 			Name:        "agent.resolve_citation",
 			Description: "Resolve one citation ID inside one explicitly pinned Agent Package release.",
 			InputSchema: strictObjectSchema(mergeSchemaProperties(scope, map[string]any{
 				"citation_id": map[string]any{"type": "string", "minLength": 1},
-			}), []string{"package_id", "release_id", "citation_id"}),
+			}), []string{"package_id", "package_version", "release_id", "citation_id"}),
 		},
 		{
 			Name:        "agent.get_claim",
 			Description: "Read one claim inside one explicitly pinned Agent Package release.",
 			InputSchema: strictObjectSchema(mergeSchemaProperties(scope, map[string]any{
 				"claim_id": map[string]any{"type": "string", "minLength": 1},
-			}), []string{"package_id", "release_id", "claim_id"}),
+			}), []string{"package_id", "package_version", "release_id", "claim_id"}),
 		},
 	}
 }
 
 func (s *BookKnowledgeMCPServer) Resources() []BookKnowledgeMCPResource {
-	const base = "agent-package://{package_id}/releases/{release_id}"
+	const base = "agent-package://{package_id}/versions/{package_version}/releases/{release_id}"
 	return []BookKnowledgeMCPResource{
 		{Name: "agent.package_metadata", Description: "Published package metadata.", URITemplate: base + "/metadata"},
 		{Name: "agent.search", Description: "Package-scoped claim search.", URITemplate: base + "/search{?query,limit}"},
@@ -91,9 +103,10 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 		return nil, fmt.Errorf("invalid Agent tool arguments: %w", err)
 	}
 	packageID := stringArgument(input, "package_id")
-	var pkg AgentPackage
-	if packageID != "" {
-		loaded, err := s.store.LoadAgentPackage(packageID, "")
+	packageVersion := stringArgument(input, "package_version")
+	pkg := AgentPackage{PackageID: packageID}
+	if packageID != "" && packageVersion != "" {
+		loaded, err := s.store.LoadAgentPackage(packageID, packageVersion)
 		if err != nil {
 			return nil, fmt.Errorf("load Agent Package: %w", err)
 		}
@@ -128,7 +141,7 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 			"ui_manifest":       pkg.UIManifest,
 		})
 	case "agent.search":
-		limit, err := agentToolLimit(input["limit"])
+		limit, err := agentToolLimit(input["limit"], pkg.RetrievalPolicy.MaxContextChunks)
 		if err != nil {
 			return nil, err
 		}
@@ -137,7 +150,12 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 		citationID := stringArgument(input, "citation_id")
 		for _, citation := range release.Citations {
 			if citation.CitationID == citationID {
-				return marshalMCPResult(citation)
+				return marshalMCPResult(AgentScopedCitation{
+					CitationID: citation.CitationID, BookID: citation.BookID,
+					ChapterID: citation.ChapterID, ChunkID: citation.ChunkID,
+					Anchor: citation.Anchor, Note: citation.Note,
+					SourceType: citation.SourceType, PublishedAt: citation.PublishedAt,
+				})
 			}
 		}
 		return nil, fmt.Errorf("citation not found in pinned release: %s", citationID)
@@ -192,13 +210,22 @@ func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int)
 	return results
 }
 
-func agentToolLimit(value any) (int, error) {
+func agentToolLimit(value any, packageLimit int) (int, error) {
+	if packageLimit <= 0 {
+		return 0, fmt.Errorf("retrieval_policy.max_context_chunks must be positive")
+	}
 	if value == nil {
+		if packageLimit < 10 {
+			return packageLimit, nil
+		}
 		return 10, nil
 	}
 	number, ok := value.(float64)
 	if !ok || number < 1 || number > 50 || number != float64(int(number)) {
 		return 0, fmt.Errorf("limit must be an integer between 1 and 50")
+	}
+	if int(number) > packageLimit {
+		return 0, fmt.Errorf("limit exceeds retrieval_policy.max_context_chunks (%d)", packageLimit)
 	}
 	return int(number), nil
 }
