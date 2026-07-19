@@ -968,6 +968,14 @@ function normalizeJobTask(task, source = "wcplus") {
   };
 }
 
+function jobCenterErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/connect: connection refused|dial tcp|127\.0\.0\.1|localhost/i.test(message)) {
+    return "WC Plus 服务暂不可用。请到来源控制页检查本地 Agent 或服务连接状态。";
+  }
+  return message;
+}
+
 function renderJobCenter() {
   const tasks = Array.isArray(jobCenterState.tasks) ? jobCenterState.tasks : [];
   const rows = tasks.map((task) => `
@@ -1020,7 +1028,7 @@ async function loadJobCenter() {
     jobCenterState.lastUpdated = new Date().toLocaleString("zh-CN");
     jobCenterState.message = wcplusTasks.length ? `已加载 ${wcplusTasks.length} 个任务。` : "暂无 WC Plus 任务。";
   } catch (error) {
-    jobCenterState.message = error instanceof Error ? error.message : String(error);
+    jobCenterState.message = jobCenterErrorMessage(error);
   } finally {
     jobCenterState.loading = "";
     renderJobCenter();
