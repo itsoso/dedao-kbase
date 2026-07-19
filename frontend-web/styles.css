@@ -3631,6 +3631,29 @@ a.button {
   color: #fffdf5;
 }
 
+.book-agent__answer-citations {
+  display: grid;
+  gap: 1px;
+  margin-top: 18px;
+  background: rgb(255 253 245 / 28%);
+}
+
+.book-agent__answer-citations article {
+  padding: 12px;
+  background: var(--agent-ink);
+}
+
+.book-agent__answer-citations strong,
+.book-agent__answer-citations span {
+  display: block;
+}
+
+.book-agent__answer-citations span {
+  margin-top: 4px;
+  color: var(--agent-lime);
+  font-size: 0.8rem;
+}
+
 .book-agent__release + .book-agent__release {
   margin-top: 34px;
 }

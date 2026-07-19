@@ -1960,6 +1960,24 @@ function renderBookAgentEvidence() {
   `;
 }
 
+function renderBookAgentAnswerCitations(answer) {
+  const citations = Array.isArray(answer?.citations) ? answer.citations : [];
+  if (!citations.length) {
+    return "";
+  }
+  return `
+    <div class="book-agent__answer-citations" aria-label="Answer citations">
+      ${citations.map((citation) => `
+        <article>
+          <strong>${escapeHTML(citation.citation_id || "citation")}</strong>
+          <span>${escapeHTML(citation.book_id || "book")} · ${escapeHTML(citation.chunk_id || citation.chapter_id || "anchored evidence")}</span>
+          ${citation.note ? `<p>${escapeHTML(citation.note)}</p>` : ""}
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
   if (!route.packageID || !bookAgentState.package) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
@@ -1977,9 +1995,9 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
   const [viewLabel, viewDescription] = viewLabels[route.view] || viewLabels.app;
   const searchRows = bookAgentState.results.map((result) => `
     <article>
-      <span>${escapeHTML(result.kind || "evidence")}</span>
-      <strong>${escapeHTML(result.title || result.id || "Result")}</strong>
-      <p>${escapeHTML(result.snippet || "")}</p>
+      <span>${escapeHTML(result.release_id || "release")} · ${escapeHTML(result.claim_id || "claim")}</span>
+      <strong>${escapeHTML((result.citation_ids || []).join(" · ") || "No citation IDs")}</strong>
+      <p>${escapeHTML(result.statement || "")}</p>
     </article>
   `).join("");
   const evaluationMetrics = Object.entries(evaluation.metrics || {}).map(([metric, score]) => `
@@ -2035,14 +2053,15 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="Search this package"><button class="button button-primary" type="submit">Search</button></form>
             <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
           </section>
-        `, Boolean(bookID))}
+        `, Boolean(pkg.package_id && pkg.version))}
         ${renderBookAgentCapability("grounded_chat", `
           <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
             <div class="book-agent__section-head"><div><span>03</span><h2>Grounded conversation</h2></div><p>回答必须经过 package 的 citation 与 abstention 边界。</p></div>
             <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="Ask a question grounded in this package">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">Ask with evidence</button></form>
-            ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}</article>` : ""}
+            ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
+            ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>Abstained</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "insufficient_evidence")}</p></article>` : ""}
           </section>
-        `, Boolean(bookID))}
+        `, Boolean(pkg.package_id && pkg.version))}
         ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
         ${renderBookAgentCapability("quiz", "", false)}
         ${renderBookAgentCapability("action_plan", "", false)}
@@ -2094,9 +2113,8 @@ async function loadBookAgentPlatform(route) {
 }
 
 async function searchBookAgentPackage(route) {
-  const release = bookAgentState.releases[0] || {};
-  const bookID = release.book_id || release.book?.book_id || "";
-  if (!bookAgentState.query || !bookID) {
+  const pkg = bookAgentState.package || {};
+  if (!bookAgentState.query || !pkg.package_id || !pkg.version) {
     bookAgentState.results = [];
     renderBookAgentPlatform(route);
     return;
@@ -2104,8 +2122,9 @@ async function searchBookAgentPackage(route) {
   bookAgentState.loading = "Searching pinned evidence";
   renderBookAgentPlatform(route);
   try {
-    const query = new URLSearchParams({ q: bookAgentState.query, book_id: bookID, limit: "20" });
-    const payload = await apiFetch(`/api/search?${query.toString()}`);
+    const maxContextChunks = Math.max(1, Number(pkg.retrieval_policy?.max_context_chunks || 20));
+    const query = new URLSearchParams({ version: pkg.version, q: bookAgentState.query, limit: String(Math.min(20, maxContextChunks)) });
+    const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/search?${query.toString()}`);
     bookAgentState.results = Array.isArray(payload.results) ? payload.results : [];
     bookAgentState.message = `${bookAgentState.results.length} evidence results`;
   } catch (error) {
@@ -2117,22 +2136,17 @@ async function searchBookAgentPackage(route) {
 }
 
 async function chatWithBookAgentPackage(route) {
-  const release = bookAgentState.releases[0] || {};
-  const bookID = release.book_id || release.book?.book_id || "";
-  if (!bookAgentState.question || !bookID) {
+  const pkg = bookAgentState.package || {};
+  if (!bookAgentState.question || !pkg.package_id || !pkg.version) {
     return;
   }
   bookAgentState.loading = "Reasoning over pinned evidence";
   renderBookAgentPlatform(route);
   try {
-    bookAgentState.answer = await apiFetch("/api/book-chat", {
+    bookAgentState.answer = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/chat?version=${encodeURIComponent(pkg.version)}`, {
       method: "POST",
       body: JSON.stringify({
-        book_id: bookID,
-        mode: "analysis",
         question: bookAgentState.question,
-        model: knowledgeState.analysisModel || "qwen3.7-max",
-        max_context_chars: 12000,
       }),
     });
     bookAgentState.message = "Grounded response complete";

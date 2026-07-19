@@ -471,6 +471,60 @@ TDD and exact results:
   `bash scripts/system-map-smoke.sh` — PASS; regenerated because the scoped MCP
   citation and audit types changed structural inventory.
 
+## G4 remediation checkpoint 3: package runtime and shared Book App
+
+**Decision: PASS for the third remediation batch; G4 remains NO-GO.** The
+package-scoped runtime and shared Book App findings are closed. Proofroom
+lifecycle/feedback and Health review/feedback integration remain release
+blockers. No push or deployment was attempted.
+
+Delivered:
+
+- package search and chat require an exact package version and pass the package
+  evaluation Gate before execution;
+- search covers every pinned release, preserves release/claim/citation identity,
+  sorts deterministically, and rejects limits above
+  `retrieval_policy.max_context_chunks`;
+- grounded chat selects the package fallback model, applies its capability and
+  timeout, uses the package prompt/output and safety/abstention policies, and
+  returns allowlisted citations without source bodies or local source paths;
+- completed, abstained, and failed model executions persist bounded SHA-256
+  traces with package/release versions, retrieval ranks, model route, outcome,
+  and final citation identity;
+- consumer-authenticated HTTP routes expose only versioned package runtime
+  search and chat;
+- the shared Book App now calls those package routes, supports multi-release
+  results, renders citation identities and explicit abstention, and no longer
+  falls back to the generic single-book search/chat endpoints.
+
+TDD and exact results:
+
+- `go test ./backend/app -run AgentPackageRuntime -count=1` — RED first because
+  the package runtime types and functions did not exist. The first GREEN attempt
+  exposed a duplicate-version test-fixture conflict; isolating the fixture made
+  all package search/chat behavior tests pass.
+- `go test ./backend/app -run 'KBaseHTTPHandlerRunsVersionedAgentPackage' -count=1`
+  — RED with `404 agent package not found`, then GREEN after the versioned
+  package search/chat routes were added.
+- `node frontend-web/scripts/book-knowledge-web-smoke.mjs` — RED because Book
+  App search still called the generic endpoint, then GREEN after package runtime
+  migration and citation rendering.
+- `go test ./backend/app -run 'AgentPackageRuntimeChat|AgentPackageRuntimeAbstains' -count=1`
+  — RED because responses had no trace identity, then GREEN after completed and
+  abstained traces were persisted.
+- `go test ./backend/app -run TestAgentPackageRuntimePersistsFailedModelCall -count=1`
+  — RED because a failed model call left no trace directory, then GREEN after
+  fail-closed trace persistence was added.
+- `go test ./backend/app -run 'AgentPackageRuntime|KBaseHTTPHandlerRunsVersionedAgentPackage' -count=1`
+  — PASS.
+- `go test ./...` — PASS.
+- `node --check frontend-web/app.js` — PASS.
+- `for smoke in frontend-web/scripts/*.mjs; do node "$smoke"; done` — PASS for
+  all nine Web client smoke suites.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` and
+  `bash scripts/system-map-smoke.sh` — PASS; regenerated because the HTTP
+  runtime handler changed structural source inventory.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.

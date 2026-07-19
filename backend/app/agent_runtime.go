@@ -1,0 +1,387 @@
+package app
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
+
+type AgentPackageSearchRequest struct {
+	PackageID      string `json:"package_id"`
+	PackageVersion string `json:"package_version"`
+	Query          string `json:"query"`
+	Limit          int    `json:"limit,omitempty"`
+}
+
+type AgentPackageEvidence struct {
+	ReleaseID   string   `json:"release_id"`
+	ClaimID     string   `json:"claim_id"`
+	Statement   string   `json:"statement"`
+	CitationIDs []string `json:"citation_ids"`
+	Score       float64  `json:"score"`
+}
+
+type AgentPackageSearchResponse struct {
+	PackageID         string                 `json:"package_id"`
+	PackageVersion    string                 `json:"package_version"`
+	PackageHash       string                 `json:"package_hash"`
+	RetrievalStrategy string                 `json:"retrieval_strategy"`
+	Results           []AgentPackageEvidence `json:"results"`
+}
+
+type AgentPackageChatRequest struct {
+	PackageID      string `json:"package_id"`
+	PackageVersion string `json:"package_version"`
+	Question       string `json:"question"`
+}
+
+type AgentPackageChatResponse struct {
+	TraceID          string                 `json:"trace_id"`
+	PackageID        string                 `json:"package_id"`
+	PackageVersion   string                 `json:"package_version"`
+	PackageHash      string                 `json:"package_hash"`
+	Outcome          string                 `json:"outcome"`
+	AbstentionReason string                 `json:"abstention_reason,omitempty"`
+	Answer           string                 `json:"answer,omitempty"`
+	Model            string                 `json:"model,omitempty"`
+	ModelCapability  string                 `json:"model_capability,omitempty"`
+	PromptProfile    string                 `json:"prompt_profile,omitempty"`
+	Evidence         []AgentPackageEvidence `json:"evidence"`
+	Citations        []AgentScopedCitation  `json:"citations"`
+}
+
+func SearchAgentPackage(store *BookKnowledgeStore, request AgentPackageSearchRequest) (*AgentPackageSearchResponse, error) {
+	pkg, err := loadRunnableAgentPackage(store, request.PackageID, request.PackageVersion, "search")
+	if err != nil {
+		return nil, err
+	}
+	query := strings.TrimSpace(request.Query)
+	if query == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+	limit := request.Limit
+	if limit <= 0 {
+		limit = pkg.RetrievalPolicy.MaxContextChunks
+	}
+	if limit > pkg.RetrievalPolicy.MaxContextChunks {
+		return nil, fmt.Errorf("limit exceeds retrieval_policy.max_context_chunks (%d)", pkg.RetrievalPolicy.MaxContextChunks)
+	}
+	results := make([]AgentPackageEvidence, 0)
+	for _, ref := range pkg.Releases {
+		release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
+		if loadErr != nil {
+			return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
+		}
+		for _, result := range searchAgentReleaseClaims(*release, query, pkg.RetrievalPolicy.MaxContextChunks) {
+			results = append(results, AgentPackageEvidence{
+				ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
+				Statement: result.Statement, CitationIDs: append([]string(nil), result.CitationIDs...),
+				Score: result.Score,
+			})
+		}
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		if results[i].ReleaseID != results[j].ReleaseID {
+			return results[i].ReleaseID < results[j].ReleaseID
+		}
+		return results[i].ClaimID < results[j].ClaimID
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return &AgentPackageSearchResponse{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, PackageHash: pkg.ContentHash,
+		RetrievalStrategy: pkg.RetrievalPolicy.Strategy, Results: results,
+	}, nil
+}
+
+func ChatAgentPackageWithClient(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	request AgentPackageChatRequest,
+	client BookKnowledgeLLMClient,
+) (*AgentPackageChatResponse, error) {
+	startedAt := time.Now().UTC()
+	pkg, err := loadRunnableAgentPackage(store, request.PackageID, request.PackageVersion, "grounded_chat")
+	if err != nil {
+		return nil, err
+	}
+	question := strings.TrimSpace(request.Question)
+	if question == "" {
+		return nil, fmt.Errorf("question is required")
+	}
+	search, err := SearchAgentPackage(store, AgentPackageSearchRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Query: question, Limit: pkg.RetrievalPolicy.MaxContextChunks,
+	})
+	if err != nil {
+		return nil, err
+	}
+	response := &AgentPackageChatResponse{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, PackageHash: pkg.ContentHash,
+		Outcome: AgentTraceOutcomeAbstained, Evidence: search.Results, Citations: []AgentScopedCitation{},
+	}
+	model := firstAgentPackageModel(pkg.ModelPolicy)
+	if model == "" {
+		return nil, fmt.Errorf("model_policy has no executable fallback model")
+	}
+	normalizedModel := normalizeBookTokenPlanModel(model)
+	if len(search.Results) == 0 {
+		response.AbstentionReason = preferredAgentAbstention(pkg.SafetyPolicy.AbstentionReasons)
+		traceID, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, normalizedModel,
+			AgentTraceOutcomeAbstained, response.AbstentionReason, nil, startedAt, time.Now().UTC())
+		if traceErr != nil {
+			return nil, traceErr
+		}
+		response.TraceID = traceID
+		response.Model = normalizedModel
+		response.ModelCapability = pkg.ModelPolicy.PreferredCapability
+		return response, nil
+	}
+	citations, err := resolveAgentRuntimeCitations(store, search.Results)
+	if err != nil {
+		return nil, err
+	}
+	if pkg.RetrievalPolicy.RequireCitations && len(citations) == 0 {
+		response.AbstentionReason = "citation_required"
+		return response, nil
+	}
+	if client == nil {
+		client = NewTokenPlanChatClient(nil)
+	}
+	cfg, err := LoadBookTokenPlanConfig()
+	if err != nil {
+		return nil, err
+	}
+	cfg.Model = normalizedModel
+	promptProfile := pkg.PromptProfiles[0]
+	messages := []BookKnowledgeMessage{
+		{
+			Role: "system",
+			Content: fmt.Sprintf("You are executing immutable Agent Package %s version %s. Use only the pinned evidence below. Capability: %s. Usage policy: %s. Output schema: %s. Cite every factual claim as [citation:<id>]. If evidence is insufficient, abstain.",
+				pkg.PackageID, pkg.Version, pkg.ModelPolicy.PreferredCapability, pkg.SafetyPolicy.UsagePolicy, promptProfile.OutputSchema),
+		},
+		{Role: "user", Content: buildAgentPackagePrompt(question, search.Results)},
+	}
+	callCtx := ctx
+	if pkg.ModelPolicy.TimeoutMS > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, time.Duration(pkg.ModelPolicy.TimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
+	answer, err := client.Chat(callCtx, cfg, messages)
+	if err != nil {
+		if _, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
+			AgentTraceOutcomeFailed, err.Error(), nil, startedAt, time.Now().UTC()); traceErr != nil {
+			return nil, fmt.Errorf("model call failed: %v; persist failed trace: %w", err, traceErr)
+		}
+		return nil, err
+	}
+	response.Outcome = AgentTraceOutcomeCompleted
+	response.Answer = answer
+	response.Model = cfg.Model
+	response.ModelCapability = pkg.ModelPolicy.PreferredCapability
+	response.PromptProfile = promptProfile.ProfileID
+	response.Citations = citations
+	traceID, err := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
+		AgentTraceOutcomeCompleted, answer, citations, startedAt, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	response.TraceID = traceID
+	return response, nil
+}
+
+func saveAgentRuntimeTrace(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	evidence []AgentPackageEvidence,
+	model, outcome, responseText string,
+	citations []AgentScopedCitation,
+	startedAt, completedAt time.Time,
+) (string, error) {
+	traceID, err := newAgentRuntimeTraceID()
+	if err != nil {
+		return "", err
+	}
+	releases := make([]AgentTraceReleaseRef, 0, len(pkg.Releases))
+	for _, ref := range pkg.Releases {
+		release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
+		if loadErr != nil {
+			return "", loadErr
+		}
+		releases = append(releases, AgentTraceReleaseRef{
+			ReleaseID: ref.ReleaseID, Version: release.Version, ContentHash: ref.ContentHash,
+		})
+	}
+	retrievals := make([]AgentTraceRetrieval, 0, len(evidence))
+	for index, item := range evidence {
+		retrievals = append(retrievals, AgentTraceRetrieval{
+			EvidenceID: agentRuntimeEvidenceID(item), ReleaseID: item.ReleaseID,
+			Score: item.Score, Rank: index + 1,
+		})
+	}
+	traceCitations := agentRuntimeTraceCitations(evidence, citations)
+	trace := AgentTrace{
+		SchemaVersion: AgentTraceSchemaVersion,
+		TraceID:       traceID,
+		Package: AgentTracePackageRef{
+			PackageID: pkg.PackageID, Version: pkg.Version, ContentHash: pkg.ContentHash,
+		},
+		Releases: releases, Retrievals: retrievals,
+		ModelRoute: AgentTraceModelRoute{
+			Provider: "tokenplan", Model: model, Capability: pkg.ModelPolicy.PreferredCapability,
+		},
+		ToolCalls: []AgentTraceToolCall{},
+		Final: AgentTraceFinal{
+			Outcome: outcome, ResponseFingerprint: sha256Fingerprint([]byte(responseText)),
+			Citations: traceCitations,
+		},
+		StartedAt: startedAt.Format(time.RFC3339Nano), CompletedAt: completedAt.Format(time.RFC3339Nano),
+	}
+	if err := store.SaveAgentTrace(trace); err != nil {
+		return "", err
+	}
+	return traceID, nil
+}
+
+func newAgentRuntimeTraceID() (string, error) {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return "", fmt.Errorf("create agent trace id: %w", err)
+	}
+	return "agent-run-" + hex.EncodeToString(random), nil
+}
+
+func agentRuntimeEvidenceID(item AgentPackageEvidence) string {
+	return item.ReleaseID + ":" + item.ClaimID
+}
+
+func agentRuntimeTraceCitations(evidence []AgentPackageEvidence, citations []AgentScopedCitation) []AgentTraceCitation {
+	allowed := make(map[string]bool, len(citations))
+	for _, citation := range citations {
+		allowed[citation.CitationID] = true
+	}
+	seen := make(map[string]bool)
+	result := make([]AgentTraceCitation, 0, len(citations))
+	for _, item := range evidence {
+		for _, citationID := range item.CitationIDs {
+			key := item.ReleaseID + "\x00" + item.ClaimID + "\x00" + citationID
+			if !allowed[citationID] || seen[key] {
+				continue
+			}
+			seen[key] = true
+			result = append(result, AgentTraceCitation{
+				CitationID: citationID, ReleaseID: item.ReleaseID, EvidenceID: agentRuntimeEvidenceID(item),
+			})
+		}
+	}
+	return result
+}
+
+func loadRunnableAgentPackage(store *BookKnowledgeStore, packageID, version, capability string) (*AgentPackage, error) {
+	if store == nil {
+		return nil, fmt.Errorf("agent package store is required")
+	}
+	packageID = strings.TrimSpace(packageID)
+	version = strings.TrimSpace(version)
+	if packageID == "" || version == "" {
+		return nil, fmt.Errorf("package_id and package_version are required")
+	}
+	pkg, err := store.LoadAgentPackage(packageID, version)
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateAgentPackageEvaluationGate(store, *pkg); err != nil {
+		return nil, err
+	}
+	if !agentPackageHasCapability(*pkg, capability) {
+		return nil, fmt.Errorf("capability %q is not declared by the package manifest", capability)
+	}
+	return pkg, nil
+}
+
+func agentPackageHasCapability(pkg AgentPackage, capability string) bool {
+	for _, declared := range pkg.UIManifest.Capabilities {
+		if strings.TrimSpace(declared) == capability {
+			return true
+		}
+	}
+	return false
+}
+
+func firstAgentPackageModel(policy AgentPackageModelPolicy) string {
+	for _, model := range policy.Fallbacks {
+		if strings.TrimSpace(model) != "" {
+			return strings.TrimSpace(model)
+		}
+	}
+	return ""
+}
+
+func preferredAgentAbstention(reasons []string) string {
+	for _, reason := range reasons {
+		if strings.TrimSpace(reason) == "insufficient_evidence" {
+			return "insufficient_evidence"
+		}
+	}
+	if len(reasons) > 0 {
+		return strings.TrimSpace(reasons[0])
+	}
+	return "insufficient_evidence"
+}
+
+func buildAgentPackagePrompt(question string, evidence []AgentPackageEvidence) string {
+	var builder strings.Builder
+	builder.WriteString("Question: ")
+	builder.WriteString(question)
+	builder.WriteString("\n\nPinned package evidence:\n")
+	for _, item := range evidence {
+		fmt.Fprintf(&builder, "- release=%s claim=%s citations=%s\n  %s\n",
+			item.ReleaseID, item.ClaimID, strings.Join(item.CitationIDs, ","), item.Statement)
+	}
+	return builder.String()
+}
+
+func resolveAgentRuntimeCitations(store *BookKnowledgeStore, evidence []AgentPackageEvidence) ([]AgentScopedCitation, error) {
+	wanted := make(map[string]map[string]bool)
+	for _, item := range evidence {
+		if wanted[item.ReleaseID] == nil {
+			wanted[item.ReleaseID] = make(map[string]bool)
+		}
+		for _, citationID := range item.CitationIDs {
+			wanted[item.ReleaseID][citationID] = true
+		}
+	}
+	result := make([]AgentScopedCitation, 0)
+	for releaseID, citationIDs := range wanted {
+		release, err := store.LoadKnowledgeRelease(releaseID)
+		if err != nil {
+			return nil, err
+		}
+		for _, citation := range release.Citations {
+			if citationIDs[citation.CitationID] {
+				result = append(result, AgentScopedCitation{
+					CitationID: citation.CitationID, BookID: citation.BookID,
+					ChapterID: citation.ChapterID, ChunkID: citation.ChunkID,
+					Anchor: citation.Anchor, Note: citation.Note,
+					SourceType: citation.SourceType, PublishedAt: citation.PublishedAt,
+				})
+			}
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].BookID != result[j].BookID {
+			return result[i].BookID < result[j].BookID
+		}
+		return result[i].CitationID < result[j].CitationID
+	})
+	return result, nil
+}

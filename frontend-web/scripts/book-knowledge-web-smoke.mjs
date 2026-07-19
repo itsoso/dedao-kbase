@@ -206,6 +206,17 @@ assert.ok(js.includes("功能已声明，但运行时尚未接通"), "declared u
 assert.ok(js.includes("Evaluation passed"), "Book App should expose evaluation status");
 assert.ok(css.includes("@media (max-width: 760px)"), "Book App should include a narrow mobile layout");
 
+const packageSearchSource = js.match(/async function searchBookAgentPackage\(route\) \{([\s\S]*?)\n\}/)?.[1] || "";
+const packageChatSource = js.match(/async function chatWithBookAgentPackage\(route\) \{([\s\S]*?)\n\}/)?.[1] || "";
+assert.ok(packageSearchSource.includes("/api/agent-packages/"), "Book App search should use the versioned package runtime");
+assert.ok(packageSearchSource.includes('version: pkg.version'), "Book App search should pin the package version");
+assert.ok(!packageSearchSource.includes("/api/search?"), "Book App search must not fall back to the generic single-book endpoint");
+assert.ok(packageChatSource.includes("/api/agent-packages/"), "Book App chat should use the versioned package runtime");
+assert.ok(packageChatSource.includes("version=${encodeURIComponent(pkg.version)}"), "Book App chat should pin the package version");
+assert.ok(!packageChatSource.includes("/api/book-chat"), "Book App chat must not fall back to the generic single-book endpoint");
+assert.ok(js.includes("renderBookAgentAnswerCitations"), "Book App should render citation identities returned by package chat");
+assert.ok(js.includes("result.release_id"), "Book App search should render release identity across multi-release packages");
+
 for (const marker of [
   "resetKnowledgeReview",
   "loadKnowledgeReview",

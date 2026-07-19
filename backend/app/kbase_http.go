@@ -1130,6 +1130,10 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		writeHTTPJSON(w, status, map[string]any{"created": created, "package": published})
 		return
 	}
+	if packageID, action, ok := agentPackageRuntimePath(r.URL.Path); ok {
+		h.handleAgentPackageRuntime(w, r, packageID, action)
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -1196,6 +1200,100 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		AgentPackage: pkg,
 		Evaluation:   evaluation,
 	})
+}
+
+func agentPackageRuntimePath(path string) (string, string, bool) {
+	const prefix = "/api/agent-packages/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	for _, action := range []string{"search", "chat"} {
+		suffix := "/" + action
+		if !strings.HasSuffix(path, suffix) {
+			continue
+		}
+		rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+		if rawID == "" || strings.Contains(rawID, "/") {
+			return "", "", false
+		}
+		packageID, err := url.PathUnescape(rawID)
+		if err != nil || strings.TrimSpace(packageID) == "" {
+			return "", "", false
+		}
+		return packageID, action, true
+	}
+	return "", "", false
+}
+
+func (h *kbaseHTTPHandler) handleAgentPackageRuntime(w http.ResponseWriter, r *http.Request, packageID, action string) {
+	version := strings.TrimSpace(r.URL.Query().Get("version"))
+	if version == "" {
+		writeHTTPError(w, http.StatusBadRequest, "version is required")
+		return
+	}
+	switch action {
+	case "search":
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		limit := 0
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 {
+				writeHTTPError(w, http.StatusBadRequest, "limit must be positive")
+				return
+			}
+			limit = parsed
+		}
+		response, err := SearchAgentPackage(h.store, AgentPackageSearchRequest{
+			PackageID: packageID, PackageVersion: version,
+			Query: r.URL.Query().Get("q"), Limit: limit,
+		})
+		if err != nil {
+			h.writeAgentPackageRuntimeError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, response)
+	case "chat":
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input struct {
+			Question string `json:"question"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		response, err := ChatAgentPackageWithClient(r.Context(), h.store, AgentPackageChatRequest{
+			PackageID: packageID, PackageVersion: version, Question: input.Question,
+		}, h.chatClient)
+		if err != nil {
+			h.writeAgentPackageRuntimeError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, response)
+	}
+}
+
+func (h *kbaseHTTPHandler) writeAgentPackageRuntimeError(w http.ResponseWriter, err error) {
+	if errors.Is(err, os.ErrNotExist) {
+		writeHTTPError(w, http.StatusNotFound, "agent package not found")
+		return
+	}
+	message := err.Error()
+	for _, inputError := range []string{
+		"is required", "must be positive", "max_context_chunks", "is not declared",
+	} {
+		if strings.Contains(message, inputError) {
+			writeHTTPError(w, http.StatusBadRequest, message)
+			return
+		}
+	}
+	writeHTTPError(w, http.StatusInternalServerError, message)
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgePipeline(w http.ResponseWriter, r *http.Request) {
