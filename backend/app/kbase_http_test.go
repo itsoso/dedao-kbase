@@ -116,6 +116,30 @@ func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerContextChatAllowsCourseArticleAnalysis(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")
+	client := &fakeBookKnowledgeLLMClient{answer: "临时文章分析"}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:      NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:  "secret-token",
+		ChatClient: client,
+	})
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/context-chat", "secret-token", `{"title":"课程文章","source_type":"dedao_course_article","question":"总结","content":"正文内容","model":"Qwen-3.7-Max"}`)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"answer":"临时文章分析"`) || !strings.Contains(resp.Body.String(), `"model":"qwen3.7-max"`) {
+		t.Fatalf("context chat status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(client.messages) != 2 || !strings.Contains(client.messages[1].Content, "课程文章") || !strings.Contains(client.messages[1].Content, "正文内容") {
+		t.Fatalf("context chat messages = %#v", client.messages)
+	}
+
+	invalid := requestJSONKBase(handler, http.MethodPost, "/api/context-chat", "secret-token", `{"question":"总结"}`)
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid context chat status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerBookAnalysisGet(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	if err := store.SaveAnalysisManifest(BookAnalysisManifest{

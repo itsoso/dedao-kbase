@@ -41,6 +41,16 @@ type BookKnowledgeChatRequest struct {
 	MaxContextChars int    `json:"max_context_chars,omitempty"`
 }
 
+type ContextKnowledgeChatRequest struct {
+	Title           string `json:"title"`
+	SourceType      string `json:"source_type"`
+	SourceID        string `json:"source_id,omitempty"`
+	Question        string `json:"question"`
+	Content         string `json:"content"`
+	Model           string `json:"model,omitempty"`
+	MaxContextChars int    `json:"max_context_chars,omitempty"`
+}
+
 type BookKnowledgeChatResponse struct {
 	HistoryID    string                        `json:"history_id,omitempty"`
 	Answer       string                        `json:"answer"`
@@ -193,6 +203,98 @@ func BookKnowledgeChatWithClient(
 	response.HistoryID = history.ID
 	response.CreatedAt = history.CreatedAt
 	return response, nil
+}
+
+func ContextKnowledgeChat(ctx context.Context, request ContextKnowledgeChatRequest) (*BookKnowledgeChatResponse, error) {
+	return ContextKnowledgeChatWithClient(ctx, request, NewTokenPlanChatClient(nil))
+}
+
+func ContextKnowledgeChatWithClient(
+	ctx context.Context,
+	request ContextKnowledgeChatRequest,
+	client BookKnowledgeLLMClient,
+) (*BookKnowledgeChatResponse, error) {
+	if client == nil {
+		client = NewTokenPlanChatClient(nil)
+	}
+	title := strings.TrimSpace(request.Title)
+	if title == "" {
+		title = "临时文章"
+	}
+	question := strings.TrimSpace(request.Question)
+	if question == "" {
+		return nil, fmt.Errorf("question is required")
+	}
+	content := strings.TrimSpace(request.Content)
+	if content == "" {
+		return nil, fmt.Errorf("content is required")
+	}
+	if request.MaxContextChars <= 0 {
+		request.MaxContextChars = 12000
+	}
+	contentRunes := []rune(content)
+	if len(contentRunes) > request.MaxContextChars {
+		content = string(contentRunes[:request.MaxContextChars])
+	}
+	sourceType := strings.TrimSpace(request.SourceType)
+	if sourceType == "" {
+		sourceType = "article"
+	}
+
+	cfg, err := LoadBookTokenPlanConfig()
+	if err != nil {
+		return nil, err
+	}
+	if model := strings.TrimSpace(request.Model); model != "" {
+		cfg.Model = normalizeBookTokenPlanModel(model)
+	}
+	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
+	sourceID := strings.TrimSpace(request.SourceID)
+	if sourceID == "" {
+		sourceID = "article"
+	}
+	messages := []BookKnowledgeMessage{
+		{
+			Role:    "system",
+			Content: "你是 dedao-gui 的文章学习助手。只基于用户提供的当前文章上下文回答；不要声称读过未提供的材料；需要区分原文观点、你的推理和可执行建议；引用来源 ID。",
+		},
+		{
+			Role: "user",
+			Content: fmt.Sprintf(`请基于下面的当前文章上下文回答。
+
+标题: %s
+来源类型: %s
+问题: %s
+
+要求:
+- 先给结论，再给依据。
+- 必须引用来源 ID，例如 [context:%s]。
+- 如果当前文章不足以回答，明确说明缺口。
+- 不要输出大段原文复刻；只做总结、分析和结构化推理。
+
+当前文章上下文 [context:%s]:
+%s`, title, sourceType, question, sourceID, sourceID, content),
+		},
+	}
+	answer, err := client.Chat(ctx, cfg, messages)
+	if err != nil {
+		return nil, err
+	}
+	return &BookKnowledgeChatResponse{
+		Answer: answer,
+		Model:  cfg.Model,
+		Mode:   "context",
+		Sources: []BookKnowledgeChatSource{{
+			Kind:  "context",
+			ID:    sourceID,
+			Title: title,
+		}},
+		ContextStats: BookKnowledgeChatContextStats{
+			Chunks: 1,
+			Chars:  len([]rune(content)),
+		},
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}, nil
 }
 
 func NewTokenPlanChatClient(httpClient *http.Client) *TokenPlanChatClient {

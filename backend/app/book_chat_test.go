@@ -119,6 +119,36 @@ func TestBookKnowledgeChatCanonicalizesQwenDisplayLabel(t *testing.T) {
 	}
 }
 
+func TestContextKnowledgeChatBuildsGroundedPrompt(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")
+	client := &fakeBookKnowledgeLLMClient{answer: "文章强调供给侧心态可以改善合作。"}
+
+	response, err := ContextKnowledgeChatWithClient(context.Background(), ContextKnowledgeChatRequest{
+		Title:           "供给侧心态",
+		SourceType:      "dedao_course_article",
+		Question:        "提炼这篇文章的方法论",
+		Content:         strings.Repeat("合作需要先提供价值。", 80),
+		Model:           "Qwen-3.7-Max",
+		MaxContextChars: 40,
+	}, client)
+	if err != nil {
+		t.Fatalf("ContextKnowledgeChatWithClient returned error: %v", err)
+	}
+	if response.Answer != client.answer || response.Model != "qwen3.7-max" {
+		t.Fatalf("response = %#v", response)
+	}
+	if response.ContextStats.Chars > 40 || response.ContextStats.Chunks != 1 {
+		t.Fatalf("ContextStats = %#v, want trimmed single context", response.ContextStats)
+	}
+	combined := client.messages[0].Content + "\n" + client.messages[1].Content
+	for _, want := range []string{"dedao_course_article", "供给侧心态", "提炼这篇文章的方法论", "context:article"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, combined)
+		}
+	}
+}
+
 func TestBookKnowledgeChatPersistsHistory(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")

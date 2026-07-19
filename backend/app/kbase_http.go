@@ -30,6 +30,7 @@ type KBaseHTTPConfig struct {
 	SourceAgentMaxBodyBytes int64
 	SourceAssets            *SourceAssetStore
 	AnalysisGenerator       BookAnalysisGenerator
+	ChatClient              BookKnowledgeLLMClient
 	DedaoLibrary            DedaoLibraryService
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
@@ -57,6 +58,7 @@ type kbaseHTTPHandler struct {
 	sourceAgentMaxBodyBytes int64
 	sourceAssets            *SourceAssetStore
 	analysisGenerator       BookAnalysisGenerator
+	chatClient              BookKnowledgeLLMClient
 	dedaoLibrary            DedaoLibraryService
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
@@ -118,6 +120,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 		sourceAssets:            assets,
 		analysisGenerator:       analysisGenerator,
+		chatClient:              cfg.ChatClient,
 		dedaoLibrary:            dedaoLibrary,
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
@@ -274,6 +277,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleBookChat(w, r)
+		return
+	}
+	if r.URL.Path == "/api/context-chat" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleContextChat(w, r)
 		return
 	}
 	if r.URL.Path == "/api/dedao/library" {
@@ -1308,6 +1319,24 @@ func (h *kbaseHTTPHandler) handleBookChat(w http.ResponseWriter, r *http.Request
 		}
 		if strings.Contains(err.Error(), "book not found") {
 			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, response)
+}
+
+func (h *kbaseHTTPHandler) handleContextChat(w http.ResponseWriter, r *http.Request) {
+	var request ContextKnowledgeChatRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	response, err := ContextKnowledgeChatWithClient(r.Context(), request, h.chatClient)
+	if err != nil {
+		if strings.Contains(err.Error(), "question is required") || strings.Contains(err.Error(), "content is required") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())

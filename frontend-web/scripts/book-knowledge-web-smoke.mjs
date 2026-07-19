@@ -48,6 +48,7 @@ for (const endpoint of [
   "/api/books",
   "/api/search?",
   "/api/book-chat",
+  "/api/context-chat",
   "/analysis",
   "/api/knowledge/releases?",
   "/api/knowledge/review?limit=50",
@@ -131,6 +132,8 @@ assert.ok(js.includes('`${ROUTES.dedaoCourses}/detail/${encodeURIComponent(enid)
 assert.ok(js.includes("加载更多"), "course detail should load more than the first page of articles");
 assert.ok(js.includes("课程正文"), "course article reader should render article body");
 assert.ok(js.includes("dedao-course-article__image"), "course article reader should render markdown images as images");
+assert.ok(js.includes("dedao-course-article__analysis"), "course article reader should expose TokenPlan analysis");
+assert.ok(js.includes("course-article-analysis-form"), "course article reader should include an article analysis form");
 assert.ok(js.includes('buildDedaoEbookURL(currentBook.book_id)'), "book details should link to the canonical reader");
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");

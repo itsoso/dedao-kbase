@@ -114,6 +114,12 @@ const dedaoLibraryState = {
   courseArticle: null,
   courseArticleLoading: "",
   courseArticleMessage: "",
+  courseArticleAnalysisModel: "qwen3.7-max",
+  courseArticleAnalysisPrompt: "",
+  courseArticleAnalysisResponse: null,
+  courseArticleAnalysisLoading: "",
+  courseArticleAnalysisError: "",
+  courseArticleAnalysisKey: "",
 };
 
 const sourceControlState = {
@@ -1031,6 +1037,11 @@ function renderDedaoCourseArticle(route = getDedaoCourseArticleRoute()) {
   const payload = dedaoLibraryState.courseArticle || {};
   const markdown = payload.markdown || "";
   const title = route?.title || payload.detail?.article?.Title || "课程正文";
+  const analysisPrompt = dedaoLibraryState.courseArticleAnalysisPrompt || "请分析当前课程文章的核心论点、关键证据、适用边界和可执行启发。";
+  const analysisResponse = dedaoLibraryState.courseArticleAnalysisResponse || {};
+  const analysisStats = analysisResponse.context_stats
+    ? `${analysisResponse.context_stats.chunks || 0} 段 · ${analysisResponse.context_stats.chars || 0} 字上下文`
+    : "";
   renderShell(`
     <main class="dedao-course-article">
       <section class="dedao-course-detail__header">
@@ -1046,11 +1057,47 @@ function renderDedaoCourseArticle(route = getDedaoCourseArticleRoute()) {
       <article class="knowledge-web__answer dedao-course-article__body">
         ${markdown ? renderCourseMarkdown(markdown) : "<p>暂无正文。</p>"}
       </article>
+      <section class="knowledge-web__analysis dedao-course-article__analysis" aria-label="TokenPlan 文章分析">
+        <div class="knowledge-web__analysis-head">
+          <div>
+            <p class="web-kicker">TokenPlan</p>
+            <h3>分析当前文章</h3>
+          </div>
+          <select id="course-article-analysis-model" aria-label="模型">
+            ${knowledgeAnalysisModels.map((model) => `
+              <option value="${escapeAttribute(model.id)}" ${dedaoLibraryState.courseArticleAnalysisModel === model.id ? "selected" : ""}>${escapeHTML(model.label)}</option>
+            `).join("")}
+          </select>
+        </div>
+        <div class="knowledge-web__prompt-grid">
+          ${knowledgeAnalysisPrompts.map(([key, label, prompt]) => `
+            <button class="button button-ghost" type="button" data-course-article-prompt="${escapeAttribute(key)}" data-prompt="${escapeAttribute(prompt)}">${escapeHTML(label)}</button>
+          `).join("")}
+        </div>
+        <form id="course-article-analysis-form" class="knowledge-web__analysis-form">
+          <textarea name="question" rows="5" placeholder="围绕当前课程文章提问，或点击上方模板">${escapeHTML(analysisPrompt)}</textarea>
+          <div class="knowledge-web__analysis-actions">
+            <span>${escapeHTML(analysisStats || dedaoLibraryState.courseArticleAnalysisError || dedaoLibraryState.courseArticleAnalysisLoading || "会基于当前课程文章正文回答。")}</span>
+            <button class="button button-primary" type="submit">${dedaoLibraryState.courseArticleAnalysisLoading ? "分析中" : "发送给 TokenPlan"}</button>
+          </div>
+        </form>
+        ${analysisResponse.answer ? `
+          <article class="knowledge-web__answer">
+            <div class="web-kicker">${escapeHTML(knowledgeModelLabel(analysisResponse.model || dedaoLibraryState.courseArticleAnalysisModel))}</div>
+            ${renderSimpleMarkdown(analysisResponse.answer)}
+          </article>
+        ` : ""}
+      </section>
     </main>
   `, "course");
+  bindDedaoCourseArticleAnalysis(route);
 }
 
 async function loadDedaoCourseArticle(route) {
+  const routeKey = route?.articleEnID || "";
+  if (routeKey && routeKey !== dedaoLibraryState.courseArticleAnalysisKey) {
+    resetDedaoCourseArticleAnalysis(routeKey);
+  }
   dedaoLibraryState.courseArticleLoading = "loading";
   dedaoLibraryState.courseArticleMessage = "";
   dedaoLibraryState.courseArticle = null;
@@ -1066,6 +1113,14 @@ async function loadDedaoCourseArticle(route) {
     dedaoLibraryState.courseArticleLoading = "";
     renderDedaoCourseArticle(route);
   }
+}
+
+function resetDedaoCourseArticleAnalysis(key = "") {
+  dedaoLibraryState.courseArticleAnalysisPrompt = "";
+  dedaoLibraryState.courseArticleAnalysisResponse = null;
+  dedaoLibraryState.courseArticleAnalysisLoading = "";
+  dedaoLibraryState.courseArticleAnalysisError = "";
+  dedaoLibraryState.courseArticleAnalysisKey = key;
 }
 
 function jobStatusLabel(status) {
@@ -4537,6 +4592,29 @@ function bindBookKnowledgeEvents() {
   }
 }
 
+function bindDedaoCourseArticleAnalysis(route) {
+  document.querySelector("#course-article-analysis-model")?.addEventListener("change", (event) => {
+    dedaoLibraryState.courseArticleAnalysisModel = event.currentTarget.value || "qwen3.7-max";
+  });
+  for (const button of document.querySelectorAll("[data-course-article-prompt]")) {
+    button.addEventListener("click", () => {
+      const prompt = button.getAttribute("data-prompt") || "";
+      dedaoLibraryState.courseArticleAnalysisPrompt = prompt;
+      const textarea = document.querySelector("#course-article-analysis-form textarea[name='question']");
+      if (textarea) {
+        textarea.value = prompt;
+        textarea.focus();
+      }
+    });
+  }
+  document.querySelector("#course-article-analysis-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    dedaoLibraryState.courseArticleAnalysisPrompt = String(data.get("question") || "").trim();
+    await runDedaoCourseArticleAnalysis(route);
+  });
+}
+
 async function loadBookKnowledge() {
   knowledgeState.loading = "加载书籍";
   knowledgeState.message = "";
@@ -4692,6 +4770,45 @@ async function runKnowledgeAnalysis() {
   } finally {
     knowledgeState.analysisLoading = "";
     renderBookKnowledge();
+  }
+}
+
+async function runDedaoCourseArticleAnalysis(route) {
+  const payload = dedaoLibraryState.courseArticle || {};
+  const markdown = String(payload.markdown || "").trim();
+  const question = String(dedaoLibraryState.courseArticleAnalysisPrompt || "").trim();
+  const title = route?.title || payload.detail?.article?.Title || "课程正文";
+  if (!markdown) {
+    dedaoLibraryState.courseArticleAnalysisError = "当前文章正文还未加载完成。";
+    renderDedaoCourseArticle(route);
+    return;
+  }
+  if (!question) {
+    dedaoLibraryState.courseArticleAnalysisError = "请输入问题或选择模板。";
+    renderDedaoCourseArticle(route);
+    return;
+  }
+  dedaoLibraryState.courseArticleAnalysisLoading = "TokenPlan 分析中";
+  dedaoLibraryState.courseArticleAnalysisError = "";
+  renderDedaoCourseArticle(route);
+  try {
+    dedaoLibraryState.courseArticleAnalysisResponse = await apiFetch("/api/context-chat", {
+      method: "POST",
+      body: JSON.stringify({
+        title,
+        source_type: "dedao_course_article",
+        source_id: route?.articleEnID || "",
+        question,
+        content: markdown,
+        model: dedaoLibraryState.courseArticleAnalysisModel || "qwen3.7-max",
+        max_context_chars: 16000,
+      }),
+    });
+  } catch (error) {
+    dedaoLibraryState.courseArticleAnalysisError = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoLibraryState.courseArticleAnalysisLoading = "";
+    renderDedaoCourseArticle(route);
   }
 }
 

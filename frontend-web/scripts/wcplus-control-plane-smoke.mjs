@@ -109,7 +109,7 @@ for (const filter of ['["queued", "等待中"]', '["running", "运行中"]', '["
 }
 assert.ok(js.includes("clearTimeout(sourceControlPollTimer)"), "control plane should clear the previous poll before scheduling another");
 assert.ok(js.includes('href="${sourceKnowledgeURL(item.target_book_id)}"'), "run items should expose direct REST knowledge links");
-assert.ok(js.includes('return `/book-knowledge/${encodeURIComponent'), "knowledge links should use REST-style book paths");
+assert.ok(js.includes("return buildKnowledgePackageURL"), "knowledge links should use REST-style book paths");
 assert.ok(js.includes("<details") && js.includes("wcplus-legacy-diagnostics"), "legacy WC Plus diagnostics should be collapsible");
 assert.ok(js.includes("sourceControlState.legacyDiagnosticsOpen"), "legacy diagnostic open state should survive control-plane refreshes");
 assert.ok(js.includes("sourceControlState.runFilter"), "run status filter should be authoritative state");
