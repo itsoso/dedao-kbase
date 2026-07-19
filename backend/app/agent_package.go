@@ -167,11 +167,7 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 
 func validateAgentPackageState(pkg AgentPackage) error {
 	switch pkg.LifecycleState {
-	case AgentPackageDraft, AgentPackagePublished:
-	case AgentPackageSuperseded:
-		if strings.TrimSpace(pkg.Supersedes) == "" {
-			return fmt.Errorf("supersedes is required for superseded lifecycle state")
-		}
+	case AgentPackageDraft, AgentPackagePublished, AgentPackageSuperseded:
 	default:
 		return fmt.Errorf("unsupported lifecycle_state %q", pkg.LifecycleState)
 	}

@@ -46,6 +46,67 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(AgentPackagePublishRequest{
+		IdempotencyKey: "operator:http:1",
+		Package:        pkg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:      store,
+		AuthToken:  "secret-token",
+		AgentTools: []string{"book-mcp/search", "book-mcp/resolve_citation"},
+	})
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "", string(payload))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized publish status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(payload))
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"created":true`) ||
+		!strings.Contains(published.Body.String(), `"lifecycle_state":"published"`) {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+	replayed := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(payload))
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) {
+		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+
+	list := requestKBase(handler, http.MethodGet, "/api/agent-packages", "secret-token")
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"package_id":"agent-package-example"`) ||
+		!strings.Contains(list.Body.String(), `"url":"/api/agent-packages/agent-package-example?version=1.0.0"`) {
+		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example", "secret-token")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"content_hash":"`) {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	versioned := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example?version=1.0.0", "secret-token")
+	if versioned.Code != http.StatusOK || !strings.Contains(versioned.Body.String(), `"version":"1.0.0"`) {
+		t.Fatalf("versioned detail status=%d body=%s", versioned.Code, versioned.Body.String())
+	}
+
+	changed := validAgentPackage()
+	changed.Version = "2.0.0"
+	changed, err = FinalizeAgentPackage(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictPayload, _ := json.Marshal(AgentPackagePublishRequest{IdempotencyKey: "operator:http:1", Package: changed})
+	conflict := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(conflictPayload))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("idempotency conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:        NewBookKnowledgeStore(t.TempDir()),

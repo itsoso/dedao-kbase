@@ -34,6 +34,7 @@ type KBaseHTTPConfig struct {
 	DedaoLibrary            DedaoLibraryService
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
+	AgentTools              []string
 }
 
 type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
@@ -62,6 +63,7 @@ type kbaseHTTPHandler struct {
 	dedaoLibrary            DedaoLibraryService
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
+	agentTools              []string
 }
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
@@ -124,6 +126,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		dedaoLibrary:            dedaoLibrary,
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
+		agentTools:              append([]string(nil), cfg.AgentTools...),
 	}
 }
 
@@ -273,6 +276,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/knowledge/pipeline/run" {
 		h.handleKnowledgePipelineRun(w, r)
+		return
+	}
+	if r.URL.Path == "/api/agent-packages" || strings.HasPrefix(r.URL.Path, "/api/agent-packages/") {
+		h.handleAgentPackages(w, r)
 		return
 	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
@@ -1050,6 +1057,105 @@ func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *htt
 		nextCursor = releases[len(releases)-1].ReleaseID
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"releases": releases, "next_cursor": nextCursor})
+}
+
+type AgentPackagePublishRequest struct {
+	IdempotencyKey string       `json:"idempotency_key"`
+	Package        AgentPackage `json:"package"`
+}
+
+func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
+	const (
+		collectionPath = "/api/agent-packages"
+		publishPath    = "/api/agent-packages/publish"
+		detailPrefix   = "/api/agent-packages/"
+	)
+	if r.URL.Path == publishPath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input AgentPackagePublishRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if strings.TrimSpace(input.IdempotencyKey) == "" {
+			writeHTTPError(w, http.StatusBadRequest, "idempotency_key is required")
+			return
+		}
+		if err := ValidateAgentPackage(input.Package, h.store, h.agentTools); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		published, created, err := PublishAgentPackage(h.store, input.Package, input.IdempotencyKey, h.agentTools, time.Now())
+		if err != nil {
+			if errors.Is(err, ErrAgentPackageIdempotencyConflict) || errors.Is(err, ErrAgentPackageVersionConflict) {
+				writeHTTPError(w, http.StatusConflict, err.Error())
+				return
+			}
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "package": published})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if r.URL.Path == collectionPath {
+		limit := 50
+		if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed <= 0 || parsed > 200 {
+				writeHTTPError(w, http.StatusBadRequest, "limit must be between 1 and 200")
+				return
+			}
+			limit = parsed
+		}
+		packages, err := h.store.ListAgentPackages(r.URL.Query().Get("after"), limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		nextCursor := ""
+		if len(packages) > 0 {
+			last := packages[len(packages)-1]
+			nextCursor = agentPackageReference(last.PackageID, last.Version)
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"packages": packages, "next_cursor": nextCursor})
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, detailPrefix) {
+		writeHTTPError(w, http.StatusNotFound, "agent package not found")
+		return
+	}
+	rawID := strings.TrimPrefix(r.URL.Path, detailPrefix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		writeHTTPError(w, http.StatusNotFound, "agent package not found")
+		return
+	}
+	packageID, err := url.PathUnescape(rawID)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid package_id")
+		return
+	}
+	pkg, err := h.store.LoadAgentPackage(packageID, r.URL.Query().Get("version"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeHTTPError(w, http.StatusNotFound, "agent package not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, pkg)
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgePipeline(w http.ResponseWriter, r *http.Request) {
