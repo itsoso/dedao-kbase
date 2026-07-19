@@ -8,12 +8,16 @@ const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 
 for (const marker of [
+  "renderDedaoHome",
+  "renderDedaoCourses",
   "renderBookKnowledge",
   "knowledgeState",
   "ensureBrowserSessionToken",
   "refreshBrowserSessionToken",
   "loadBookKnowledge",
   "searchBookKnowledge",
+  'window.location.pathname === "/home"',
+  'window.location.pathname.startsWith("/course")',
   'window.location.pathname.startsWith("/book-knowledge")',
 ]) {
   assert.ok(js.includes(marker), `app.js should include ${marker}`);
@@ -56,6 +60,9 @@ for (const unwrap of [
 }
 
 for (const className of [
+  ".dedao-home",
+  ".dedao-courses",
+  ".dedao-card",
   ".knowledge-web",
   ".knowledge-web__layout",
   ".knowledge-web__sidebar",
@@ -65,6 +72,11 @@ for (const className of [
 }
 
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
+assert.ok(js.includes('href="/home"'), "navigation should include the Dedao home page");
+assert.ok(js.includes('href="/course"'), "navigation should include the Dedao course page");
+assert.ok(js.includes("得到首页"), "Dedao home should be restored");
+assert.ok(js.includes("得到课程"), "Dedao course page should be restored");
+assert.ok(js.includes("继续学习"), "Dedao course page should expose study actions");
 assert.ok(js.includes('href="/ebook/${encodeURIComponent(currentBook.book_id)}"'), "book details should link to the reader");
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");

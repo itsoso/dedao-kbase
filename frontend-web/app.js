@@ -73,6 +73,12 @@ const wcplusState = {
   message: "",
 };
 
+const dedaoCourseState = {
+  books: [],
+  loading: "",
+  message: "",
+};
+
 const sourceControlState = {
   agents: [],
   subscriptions: [],
@@ -413,9 +419,10 @@ function renderShell(content, current = "") {
   app.className = "web-shell";
   app.innerHTML = `
     <header class="web-topbar">
-      <a class="web-brand" href="/">dedao kbase</a>
+      <a class="web-brand" href="/home">得到 KBase</a>
       <nav class="web-nav" aria-label="主导航">
-        <a class="${current === "home" ? "active" : ""}" href="/">首页</a>
+        <a class="${current === "home" ? "active" : ""}" href="/home">首页</a>
+        <a class="${current === "course" ? "active" : ""}" href="/course">课程</a>
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="/book-knowledge">书籍知识库</a>
@@ -425,21 +432,140 @@ function renderShell(content, current = "") {
   `;
 }
 
-function renderHome() {
+function renderDedaoHome() {
   renderShell(`
-    <main class="web-home">
-      <section class="web-home__hero">
-        <p class="web-kicker">Source Workbench</p>
-        <h1>把外部内容整理成可验证知识库</h1>
-        <p>从公众号文章开始，下载、预览并导入到书籍知识库，再交给 Health 和 Proofroom 使用。</p>
-        <div class="web-home__actions">
-          <a class="button button-primary" href="/wechat-source">打开微信采集器</a>
-          <a class="button button-ghost" href="/wechat-import">导入单篇文章</a>
-          <a class="button button-ghost" href="/book-knowledge">查看书籍知识库</a>
+    <main class="dedao-home">
+      <section class="dedao-home__hero">
+        <div>
+          <p class="web-kicker">得到首页</p>
+          <h1>把得到内容变成可学习、可验证、可供给的知识库</h1>
+          <p>从课程、电子书、听书和公众号来源开始，完成搜索、下载、加工、分析和外部系统供给。</p>
+          <div class="web-home__actions">
+            <a class="button button-primary" href="/course">进入得到课程</a>
+            <a class="button button-ghost" href="/book-knowledge">打开书籍知识库</a>
+            <a class="button button-ghost" href="/wechat-source">微信采集</a>
+          </div>
         </div>
+        <div class="dedao-home__panel">
+          <strong>今日工作台</strong>
+          <span>搜索内容，导入知识库，再用 Token Plan 模型完成结构化分析。</span>
+        </div>
+      </section>
+      <section class="dedao-home__shortcuts" aria-label="得到功能">
+        <a class="dedao-card" href="/course">
+          <span>得到课程</span>
+          <strong>继续学习</strong>
+          <small>查看已导入课程和学习入口</small>
+        </a>
+        <a class="dedao-card" href="/book-knowledge">
+          <span>书籍知识库</span>
+          <strong>知识加工</strong>
+          <small>检索、分析、发布给外部系统</small>
+        </a>
+        <a class="dedao-card" href="/wcplus-source">
+          <span>公众号</span>
+          <strong>采集来源</strong>
+          <small>同步文章并导入知识库</small>
+        </a>
       </section>
     </main>
   `, "home");
+}
+
+function renderHome() {
+  renderDedaoHome();
+}
+
+function isDedaoCourseBook(book) {
+  const value = [
+    book?.source,
+    book?.source_type,
+    book?.type,
+    book?.category,
+    book?.metadata?.source,
+    book?.metadata?.source_type,
+    book?.metadata?.type,
+    book?.path,
+    book?.title,
+  ].join(" ").toLowerCase();
+  return value.includes("course") || value.includes("课程");
+}
+
+function renderDedaoCourses() {
+  const courseBooks = dedaoCourseState.books.filter(isDedaoCourseBook);
+  const visibleBooks = courseBooks.length ? courseBooks : dedaoCourseState.books.slice(0, 12);
+  const cards = visibleBooks.map((book) => {
+    const bookID = String(book.book_id || book.id || "").trim();
+    const title = book.title || book.name || bookID || "未命名课程";
+    const author = book.author || book.lecturer || book.metadata?.author || book.metadata?.lecturer || "得到课程";
+    const chapters = book.chapters || book.chapter_count || book.metadata?.chapters || 0;
+    const claims = book.claims || book.claim_count || book.metadata?.claims || 0;
+    return `
+      <article class="dedao-course-card">
+        <div>
+          <p class="web-kicker">得到课程</p>
+          <h2>${escapeHTML(title)}</h2>
+          <p>${escapeHTML(author)}</p>
+        </div>
+        <dl>
+          <div><dt>章节</dt><dd>${escapeHTML(chapters || "-")}</dd></div>
+          <div><dt>Claims</dt><dd>${escapeHTML(claims || "-")}</dd></div>
+        </dl>
+        <div class="dedao-course-card__actions">
+          ${bookID ? `<a class="button button-primary" href="${knowledgeBookPath(bookID)}">继续学习</a>` : ""}
+          ${bookID ? `<a class="button button-ghost" href="/ebook/${encodeURIComponent(bookID)}">阅读</a>` : ""}
+        </div>
+      </article>
+    `;
+  }).join("");
+
+  renderShell(`
+    <main class="dedao-courses">
+      <section class="dedao-courses__header">
+        <div>
+          <p class="web-kicker">得到课程</p>
+          <h1>课程</h1>
+          <p>从已导入的得到课程进入学习、阅读和知识库分析。</p>
+        </div>
+        <button class="button button-primary" type="button" data-action="reload-courses" ${dedaoCourseState.loading ? "disabled" : ""}>
+          ${dedaoCourseState.loading ? "加载中" : "刷新课程"}
+        </button>
+      </section>
+      ${dedaoCourseState.message ? `<p class="web-status">${escapeHTML(dedaoCourseState.message)}</p>` : ""}
+      <section class="dedao-courses__grid">
+        ${cards || `
+          <div class="dedao-courses__empty">
+            <h2>暂无课程内容</h2>
+            <p>可以先从书籍知识库查看已导入内容，或从微信/WC Plus 来源导入新资料。</p>
+            <div class="web-home__actions">
+              <a class="button button-primary" href="/book-knowledge">打开书籍知识库</a>
+              <a class="button button-ghost" href="/wcplus-source">导入来源</a>
+            </div>
+          </div>
+        `}
+      </section>
+    </main>
+  `, "course");
+
+  app.querySelector("[data-action='reload-courses']")?.addEventListener("click", loadDedaoCourses);
+}
+
+async function loadDedaoCourses() {
+  dedaoCourseState.loading = "loading";
+  dedaoCourseState.message = "";
+  renderDedaoCourses();
+  try {
+    const payload = await apiFetch("/api/books");
+    dedaoCourseState.books = Array.isArray(payload?.books) ? payload.books : [];
+    if (!dedaoCourseState.books.length) {
+      dedaoCourseState.message = "暂无已导入内容。";
+    }
+  } catch (error) {
+    dedaoCourseState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoCourseState.loading = "";
+    renderDedaoCourses();
+  }
 }
 
 function knowledgeReviewLatestTask() {
@@ -3955,6 +4081,15 @@ function formatArticleTime(value) {
 }
 
 async function boot() {
+  if (window.location.pathname === "/" || window.location.pathname === "/home") {
+    renderDedaoHome();
+    return;
+  }
+  if (window.location.pathname.startsWith("/course")) {
+    renderDedaoCourses();
+    await loadDedaoCourses();
+    return;
+  }
   if (window.location.pathname.startsWith("/wechat-import") || window.location.pathname.startsWith("/sources/wechat")) {
     renderWeChatSource();
     return;
@@ -3973,7 +4108,7 @@ async function boot() {
 
   const bookID = getBookID();
   if (!bookID) {
-    renderHome();
+    renderDedaoHome();
     return;
   }
   try {

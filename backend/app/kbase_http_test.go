@@ -900,6 +900,22 @@ func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 		t.Fatalf("reader route did not fall back to index: %s", readerRouteResp.Body.String())
 	}
 
+	homeRouteResp := requestKBase(handler, http.MethodGet, "/home", "")
+	if homeRouteResp.Code != http.StatusOK {
+		t.Fatalf("home route status = %d, body=%s", homeRouteResp.Code, homeRouteResp.Body.String())
+	}
+	if !strings.Contains(homeRouteResp.Body.String(), `reader-loading`) {
+		t.Fatalf("home route did not fall back to index: %s", homeRouteResp.Body.String())
+	}
+
+	courseRouteResp := requestKBase(handler, http.MethodGet, "/course", "")
+	if courseRouteResp.Code != http.StatusOK {
+		t.Fatalf("course route status = %d, body=%s", courseRouteResp.Code, courseRouteResp.Body.String())
+	}
+	if !strings.Contains(courseRouteResp.Body.String(), `reader-loading`) {
+		t.Fatalf("course route did not fall back to index: %s", courseRouteResp.Body.String())
+	}
+
 	missingAssetResp := requestKBase(handler, http.MethodGet, "/assets/missing.js", "")
 	if missingAssetResp.Code != http.StatusNotFound {
 		t.Fatalf("missing asset status = %d, want 404", missingAssetResp.Code)
