@@ -39,6 +39,7 @@ type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalys
 
 type DedaoLibraryService interface {
 	CourseList(category, order string, page, limit int) (*services.CourseList, error)
+	CourseInfo(enid string) (*services.CourseInfo, error)
 }
 
 type kbaseHTTPHandler struct {
@@ -125,6 +126,10 @@ type defaultDedaoLibrary struct{}
 
 func (defaultDedaoLibrary) CourseList(category, order string, page, limit int) (*services.CourseList, error) {
 	return CourseList(category, order, page, limit)
+}
+
+func (defaultDedaoLibrary) CourseInfo(enid string) (*services.CourseInfo, error) {
+	return CourseInfoByEnid(enid)
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -267,6 +272,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/dedao/home" {
 		h.handleDedaoHome(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/course" {
+		h.handleDedaoCourse(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -499,6 +508,28 @@ func (h *kbaseHTTPHandler) handleDedaoHome(w http.ResponseWriter, r *http.Reques
 		}
 	}
 	writeHTTPJSON(w, http.StatusOK, payload)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoCourse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	enid := strings.TrimSpace(r.URL.Query().Get("enid"))
+	if enid == "" {
+		writeHTTPError(w, http.StatusBadRequest, "missing enid")
+		return
+	}
+	info, err := h.dedaoLibrary.CourseInfo(enid)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if info == nil {
+		writeHTTPError(w, http.StatusNotFound, "course not found")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, info)
 }
 
 func isDedaoLibraryCategory(category string) bool {

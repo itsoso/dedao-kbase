@@ -13,6 +13,8 @@ for (const marker of [
   "renderDedaoCourses",
   "renderDedaoEbooks",
   "renderDedaoLibrary",
+  "renderDedaoCourseDetail",
+  "loadDedaoCourseDetail",
   "loadDedaoLibrary",
   "renderBookKnowledge",
   "knowledgeState",
@@ -22,6 +24,7 @@ for (const marker of [
   "searchBookKnowledge",
   'window.location.pathname === "/home"',
   'window.location.pathname.startsWith("/course")',
+  'getDedaoCourseEnID()',
   'window.location.pathname === "/ebook"',
   'window.location.pathname.startsWith("/book-knowledge")',
 ]) {
@@ -32,6 +35,7 @@ for (const endpoint of [
   "/browser/session-token",
   "/api/dedao/home",
   "/api/dedao/library?",
+  "/api/dedao/course?",
   "/api/books",
   "/api/search?",
   "/api/book-chat",
@@ -88,6 +92,7 @@ assert.ok(js.includes("得到首页"), "Dedao home should be restored");
 assert.ok(js.includes("得到课程"), "Dedao course page should be restored");
 assert.ok(js.includes("得到电子书"), "Dedao ebook page should be restored");
 assert.ok(js.includes("继续学习"), "Dedao course page should expose study actions");
+assert.ok(js.includes('`/course/${encodeURIComponent(enid)}`'), "subscribed course cards should link to actual course detail pages");
 assert.ok(js.includes('href="/ebook/${encodeURIComponent(currentBook.book_id)}"'), "book details should link to the reader");
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");

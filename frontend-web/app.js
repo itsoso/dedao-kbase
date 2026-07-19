@@ -82,6 +82,9 @@ const dedaoLibraryState = {
     ebook: { items: [], page: 1, pageSize: 15, isMore: 0, loading: "", message: "" },
     odob: { items: [], page: 1, pageSize: 15, isMore: 0, loading: "", message: "" },
   },
+  courseDetail: null,
+  courseDetailLoading: "",
+  courseDetailMessage: "",
 };
 
 const sourceControlState = {
@@ -416,6 +419,19 @@ function getKnowledgeBookID() {
   }
 }
 
+function getDedaoCourseEnID() {
+  const prefix = "/course/";
+  if (!window.location.pathname.startsWith(prefix)) {
+    return "";
+  }
+  const raw = window.location.pathname.slice(prefix.length).split("/")[0];
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 async function fetchBook(bookID) {
   return apiFetch(`/api/books/${encodeURIComponent(bookID)}`);
 }
@@ -580,7 +596,12 @@ function renderDedaoLibrary(category) {
     const progress = Number.isFinite(Number(item.progress)) ? Number(item.progress) : 0;
     const total = item.course_num || item.publish_num || item.duration || "-";
     const updated = item.publish_num ? `${item.publish_num}/${item.course_num || "?"}` : (item.last_read || "-");
-    const readerHref = category === "ebook" && enid ? `/ebook/${encodeURIComponent(enid)}` : "";
+    const primaryHref = category === "ebook" && enid
+      ? `/ebook/${encodeURIComponent(enid)}`
+      : (category === "bauhinia" && enid ? `/course/${encodeURIComponent(enid)}` : "");
+    const detailHref = category === "bauhinia" && enid
+      ? `/course/${encodeURIComponent(enid)}`
+      : (enid ? `${cfg.path}/${encodeURIComponent(enid)}` : "");
     return `
       <article class="dedao-course-card">
         <div class="dedao-course-card__top">
@@ -599,8 +620,8 @@ function renderDedaoLibrary(category) {
           <div><dt>更新</dt><dd>${escapeHTML(updated || total)}</dd></div>
         </dl>
         <div class="dedao-course-card__actions">
-          ${readerHref ? `<a class="button button-primary" href="${escapeAttribute(readerHref)}">${escapeHTML(cfg.primaryAction)}</a>` : ""}
-          ${enid ? `<a class="button button-ghost" href="${escapeAttribute(`${cfg.path}/${encodeURIComponent(enid)}`)}">详情</a>` : ""}
+          ${primaryHref ? `<a class="button button-primary" href="${escapeAttribute(primaryHref)}">${escapeHTML(cfg.primaryAction)}</a>` : ""}
+          ${detailHref ? `<a class="button button-ghost" href="${escapeAttribute(detailHref)}">详情</a>` : ""}
           ${id || enid ? `<a class="button button-ghost" href="/book-knowledge?query=${encodeURIComponent(item.title || id || enid)}">查知识库</a>` : ""}
         </div>
       </article>
@@ -681,6 +702,69 @@ async function loadDedaoLibrary(category) {
   } finally {
     state.loading = "";
     renderDedaoLibrary(category);
+  }
+}
+
+function renderDedaoCourseDetail() {
+  const detail = dedaoLibraryState.courseDetail;
+  const info = detail?.class_info || {};
+  const articles = Array.isArray(detail?.flat_article_list) ? detail.flat_article_list : [];
+  const articleRows = articles.map((article, index) => `
+    <article class="dedao-article-row">
+      <span>${index + 1}</span>
+      <div>
+        <strong>${escapeHTML(article.title || article.share_title || "未命名文章")}</strong>
+        <small>${escapeHTML(formatArticleTime(article.publish_time || article.update_time || article.create_time))}</small>
+      </div>
+      ${article.enid ? `<a class="button button-ghost" href="/course/${encodeURIComponent(info.enid || getDedaoCourseEnID())}/article/${encodeURIComponent(article.enid)}">打开</a>` : ""}
+    </article>
+  `).join("");
+
+  renderShell(`
+    <main class="dedao-course-detail">
+      <section class="dedao-course-detail__header">
+        <a class="button button-ghost" href="/course">返回课程</a>
+        <div>
+          <p class="web-kicker">得到课程详情</p>
+          <h1>${escapeHTML(info.name || "课程详情")}</h1>
+          <p>${escapeHTML(info.intro || dedaoLibraryState.courseDetailMessage || "正在读取课程详情。")}</p>
+        </div>
+      </section>
+      ${dedaoLibraryState.courseDetailLoading ? `<p class="web-status">正在加载课程详情...</p>` : ""}
+      ${dedaoLibraryState.courseDetailMessage ? `<p class="web-status">${escapeHTML(dedaoLibraryState.courseDetailMessage)}</p>` : ""}
+      <section class="dedao-course-detail__layout">
+        <aside class="dedao-course-detail__aside">
+          <dl>
+            <div><dt>讲师</dt><dd>${escapeHTML(info.lecturer_name || "-")}</dd></div>
+            <div><dt>更新</dt><dd>${escapeHTML(info.current_article_count || articles.length || "-")}/${escapeHTML(info.phase_num || "-")}</dd></div>
+            <div><dt>学习人数</dt><dd>${escapeHTML(info.learn_user_count || "-")}</dd></div>
+          </dl>
+          <a class="button button-primary" href="/book-knowledge?query=${encodeURIComponent(info.name || "")}">在知识库中检索</a>
+        </aside>
+        <section class="dedao-course-detail__articles">
+          <div class="dedao-home__section-head">
+            <h2>课程目录</h2>
+            <span>${articles.length} 篇</span>
+          </div>
+          ${articleRows || "<p class=\"web-muted\">暂无课程文章。</p>"}
+        </section>
+      </section>
+    </main>
+  `, "course");
+}
+
+async function loadDedaoCourseDetail(enid) {
+  dedaoLibraryState.courseDetailLoading = "loading";
+  dedaoLibraryState.courseDetailMessage = "";
+  dedaoLibraryState.courseDetail = null;
+  renderDedaoCourseDetail();
+  try {
+    dedaoLibraryState.courseDetail = await apiFetch(`/api/dedao/course?enid=${encodeURIComponent(enid)}`);
+  } catch (error) {
+    dedaoLibraryState.courseDetailMessage = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoLibraryState.courseDetailLoading = "";
+    renderDedaoCourseDetail();
   }
 }
 
@@ -4200,6 +4284,12 @@ async function boot() {
   if (window.location.pathname === "/" || window.location.pathname === "/home") {
     renderDedaoHome();
     await loadDedaoHome();
+    return;
+  }
+  const dedaoCourseEnID = getDedaoCourseEnID();
+  if (dedaoCourseEnID) {
+    renderDedaoCourseDetail();
+    await loadDedaoCourseDetail(dedaoCourseEnID);
     return;
   }
   if (window.location.pathname.startsWith("/course")) {

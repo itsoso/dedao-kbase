@@ -139,14 +139,16 @@ a.button {
 }
 
 .dedao-home,
-.dedao-courses {
+.dedao-courses,
+.dedao-course-detail {
   width: min(100% - 48px, 1320px);
   margin: 0 auto;
   padding: 34px 0 56px;
 }
 
 .dedao-home__hero,
-.dedao-courses__header {
+.dedao-courses__header,
+.dedao-course-detail__header {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;
   gap: 24px;
@@ -359,6 +361,79 @@ a.button {
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+}
+
+.dedao-course-detail__header {
+  grid-template-columns: 120px minmax(0, 1fr);
+  align-items: start;
+}
+
+.dedao-course-detail__header h1 {
+  margin: 0;
+  font-size: clamp(32px, 4vw, 52px);
+  line-height: 1.14;
+}
+
+.dedao-course-detail__header p {
+  color: #6d6356;
+  line-height: 1.75;
+}
+
+.dedao-course-detail__layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.dedao-course-detail__aside,
+.dedao-course-detail__articles {
+  padding: 20px;
+  border: 1px solid rgba(141, 132, 117, 0.18);
+  border-radius: 12px;
+  background: #fffdf8;
+}
+
+.dedao-course-detail__aside dl {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 16px;
+}
+
+.dedao-course-detail__aside dt {
+  color: #8d8475;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.dedao-course-detail__aside dd {
+  margin: 2px 0 0;
+  font-size: 20px;
+  font-weight: 850;
+}
+
+.dedao-article-row {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 0;
+  border-top: 1px solid rgba(141, 132, 117, 0.16);
+}
+
+.dedao-article-row > span {
+  color: #ff6b00;
+  font-weight: 850;
+}
+
+.dedao-article-row strong {
+  display: block;
+  color: #25231f;
+  line-height: 1.45;
+}
+
+.dedao-article-row small {
+  color: #8d8475;
 }
 
 .dedao-courses__empty {
@@ -2744,21 +2819,25 @@ a.button {
   }
 
   .dedao-home,
-  .dedao-courses {
+  .dedao-courses,
+  .dedao-course-detail {
     width: min(100% - 20px, 100%);
     padding-top: 14px;
   }
 
   .dedao-home__hero,
   .dedao-courses__header,
+  .dedao-course-detail__header,
   .dedao-home__shortcuts,
   .dedao-home__library,
+  .dedao-course-detail__layout,
   .dedao-courses__grid {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .dedao-home__hero,
-  .dedao-courses__header {
+  .dedao-courses__header,
+  .dedao-course-detail__header {
     padding: 24px;
   }
 

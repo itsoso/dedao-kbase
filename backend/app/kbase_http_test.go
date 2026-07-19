@@ -78,6 +78,16 @@ func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	if invalid.Code != http.StatusBadRequest {
 		t.Fatalf("invalid category status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
+
+	detail := requestKBase(handler, http.MethodGet, "/api/dedao/course?enid=course-enid", "secret-token")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"name":"得到订阅课程详情"`) || !strings.Contains(detail.Body.String(), `"title":"第一讲"`) {
+		t.Fatalf("course detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	missingDetail := requestKBase(handler, http.MethodGet, "/api/dedao/course", "secret-token")
+	if missingDetail.Code != http.StatusBadRequest {
+		t.Fatalf("missing course detail enid status=%d body=%s", missingDetail.Code, missingDetail.Body.String())
+	}
 }
 
 func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
@@ -1451,5 +1461,23 @@ func (fakeDedaoLibrary) CourseList(category, order string, page, limit int) (*se
 		}},
 		ISMore: 1,
 		Page:   page,
+	}, nil
+}
+
+func (fakeDedaoLibrary) CourseInfo(enid string) (*services.CourseInfo, error) {
+	return &services.CourseInfo{
+		ClassInfo: services.ClassInfo{
+			Enid:                enid,
+			Name:                "得到订阅课程详情",
+			Intro:               "课程简介",
+			LecturerName:        "得到讲师",
+			CurrentArticleCount: 1,
+			PhaseNum:            20,
+		},
+		FlatArticleList: []services.ArticleBase{{
+			ID:    1,
+			Enid:  "article-enid",
+			Title: "第一讲",
+		}},
 	}, nil
 }
