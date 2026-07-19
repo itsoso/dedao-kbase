@@ -37,6 +37,19 @@ for (const marker of [
   'getDedaoEbookRoute()',
   "routePathname === ROUTES.dedaoEbooks",
   "routePathname === ROUTES.knowledgePackages",
+  "renderBookAgentPlatform",
+  "loadBookAgentPlatform",
+  "bindBookAgentPlatformEvents",
+  "getBookAgentRoute",
+  "buildAgentPackageURL",
+  "buildAgentURL",
+  "buildBookAppURL",
+  "hasBookAgentCapability",
+  "renderBookAgentCapability",
+  "bookAgentState",
+  "routePathname === ROUTES.agentPackages",
+  "routePathname.startsWith(`${ROUTES.agents}/`)",
+  "routePathname.startsWith(`${ROUTES.bookApps}/`)",
 ]) {
   assert.ok(js.includes(marker), `app.js should include ${marker}`);
 }
@@ -61,6 +74,8 @@ for (const endpoint of [
   "/api/context-chat",
   "/analysis",
   "/api/knowledge/releases?",
+  "/api/agent-packages",
+  "/api/knowledge/releases/",
   "/api/knowledge/review?limit=50",
   "/api/knowledge/pipeline",
   "/api/knowledge/pipeline/run",
@@ -92,6 +107,9 @@ for (const marker of [
   "/knowledge/packages",
   "/delivery/health/releases",
   "/jobs",
+  "/agent-packages",
+  "/agents",
+  "/book-apps",
 ]) {
   assert.ok(js.includes(marker), `route contract should include ${marker}`);
 }
@@ -126,6 +144,12 @@ for (const className of [
   ".job-center",
   ".job-card",
   ".job-card__status",
+  ".book-agent",
+  ".book-agent__hero",
+  ".book-agent__capabilities",
+  ".book-agent__evidence",
+  ".book-agent__evaluation",
+  ".book-agent__unavailable",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
@@ -170,6 +194,17 @@ for (const marker of [
   assert.ok(js.includes(marker), `book knowledge web UI should include durable analysis marker ${marker}`);
 }
 assert.ok(css.includes(".knowledge-web__manifest"), "styles.css should style the durable analysis manifest");
+
+for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]) {
+  assert.ok(
+    js.includes(`renderBookAgentCapability("${capability}"`),
+    `shared Book App should render ${capability} through the manifest gate`,
+  );
+}
+assert.ok(js.includes("ui_manifest?.capabilities"), "Book App capabilities should come from ui_manifest");
+assert.ok(js.includes("功能已声明，但运行时尚未接通"), "declared unavailable capabilities should explain runtime status");
+assert.ok(js.includes("Evaluation passed"), "Book App should expose evaluation status");
+assert.ok(css.includes("@media (max-width: 760px)"), "Book App should include a narrow mobile layout");
 
 for (const marker of [
   "resetKnowledgeReview",

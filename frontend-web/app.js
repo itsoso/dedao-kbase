@@ -13,6 +13,9 @@ const ROUTES = Object.freeze({
   dedaoAudio: "/sources/dedao/audio",
   bookReader: "/read/books",
   knowledgePackages: "/knowledge/packages",
+  agentPackages: "/agent-packages",
+  agents: "/agents",
+  bookApps: "/book-apps",
   healthReleases: "/delivery/health/releases",
   jobs: "/jobs",
 });
@@ -182,6 +185,19 @@ const knowledgeState = {
   pipelineAutomation: null,
   pipelineAutomationLoading: "",
   pipelineAutomationError: "",
+  loading: "",
+  message: "",
+};
+
+const bookAgentState = {
+  packages: [],
+  package: null,
+  releases: [],
+  route: null,
+  query: "",
+  results: [],
+  question: "",
+  answer: null,
   loading: "",
   message: "",
 };
@@ -597,6 +613,48 @@ function buildKnowledgePackageURL(packageID) {
   return packageID ? `${ROUTES.knowledgePackages}/${encodeURIComponent(packageID)}` : ROUTES.knowledgePackages;
 }
 
+function buildAgentPackageURL(packageID, version = "") {
+  if (!packageID) {
+    return ROUTES.agentPackages;
+  }
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
+  return `${ROUTES.agentPackages}/${encodeURIComponent(packageID)}${query}`;
+}
+
+function buildAgentURL(packageID, version = "") {
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
+  return packageID ? `${ROUTES.agents}/${encodeURIComponent(packageID)}${query}` : ROUTES.agents;
+}
+
+function buildBookAppURL(packageID, version = "") {
+  const query = version ? `?version=${encodeURIComponent(version)}` : "";
+  return packageID ? `${ROUTES.bookApps}/${encodeURIComponent(packageID)}${query}` : ROUTES.bookApps;
+}
+
+function getBookAgentRoute() {
+  const pathname = getRoutePathname();
+  const routes = [
+    [ROUTES.agentPackages, "package"],
+    [ROUTES.agents, "agent"],
+    [ROUTES.bookApps, "app"],
+  ];
+  for (const [base, view] of routes) {
+    if (pathname === base) {
+      return { view, packageID: "", version: "" };
+    }
+    if (pathname.startsWith(`${base}/`)) {
+      const raw = pathname.slice(base.length + 1).split("/")[0];
+      const params = new URLSearchParams(window.location.search);
+      try {
+        return { view, packageID: decodeURIComponent(raw), version: params.get("version") || "" };
+      } catch {
+        return { view, packageID: raw, version: params.get("version") || "" };
+      }
+    }
+  }
+  return null;
+}
+
 async function fetchBook(bookID) {
   return apiFetch(`/api/books/${encodeURIComponent(bookID)}`);
 }
@@ -614,6 +672,7 @@ function renderShell(content, current = "") {
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
+        <a class="${current === "agents" ? "active" : ""}" href="${escapeAttribute(ROUTES.agentPackages)}">Book Agents</a>
         <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
       </nav>
     </header>
@@ -1804,6 +1863,285 @@ function renderBookKnowledge() {
     </main>
   `, "knowledge");
   bindBookKnowledgeEvents();
+}
+
+function hasBookAgentCapability(capability) {
+  const capabilities = bookAgentState.package?.ui_manifest?.capabilities;
+  return Array.isArray(capabilities) && capabilities.includes(capability);
+}
+
+function renderBookAgentCapability(capability, content, runtimeAvailable = true) {
+  if (!hasBookAgentCapability(capability)) {
+    return "";
+  }
+  if (!runtimeAvailable) {
+    return `
+      <section class="book-agent__capability book-agent__unavailable" data-capability="${escapeAttribute(capability)}">
+        <span class="book-agent__capability-index">${escapeHTML(capability.replaceAll("_", " "))}</span>
+        <div>
+          <strong>功能已声明，但运行时尚未接通</strong>
+          <p>当前包保留了这个入口；接入对应的受控运行时后才会开放，不会跳转到空页面。</p>
+        </div>
+      </section>
+    `;
+  }
+  return content;
+}
+
+function renderBookAgentPackageIndex(route) {
+  const rows = bookAgentState.packages.map((pkg, index) => {
+    const version = pkg.version || "";
+    return `
+      <article class="book-agent__package-card" style="--card-index:${index}">
+        <div class="book-agent__package-number">${String(index + 1).padStart(2, "0")}</div>
+        <div>
+          <p class="web-kicker">${escapeHTML(pkg.lifecycle_state || "published")}</p>
+          <h2>${escapeHTML(pkg.package_id || "Untitled package")}</h2>
+          <p>${escapeHTML(version ? `Version ${version}` : "Version unavailable")}</p>
+        </div>
+        <nav aria-label="Package destinations">
+          <a href="${escapeAttribute(buildAgentPackageURL(pkg.package_id, version))}">Package</a>
+          <a href="${escapeAttribute(buildAgentURL(pkg.package_id, version))}">Agent</a>
+          <a href="${escapeAttribute(buildBookAppURL(pkg.package_id, version))}">Book App</a>
+        </nav>
+      </article>
+    `;
+  }).join("");
+  const viewLabel = route.view === "app" ? "Book Apps" : (route.view === "agent" ? "Agents" : "Agent Packages");
+  return `
+    <main class="book-agent book-agent--index">
+      <header class="book-agent__index-head">
+        <p class="web-kicker">Shared Book Runtime</p>
+        <h1>${escapeHTML(viewLabel)}</h1>
+        <p>一个版本化知识包，三条稳定路径。Package 展示契约，Agent 展示运行边界，Book App 只呈现清单声明的能力。</p>
+      </header>
+      ${bookAgentState.message ? `<p class="web-status">${escapeHTML(bookAgentState.message)}</p>` : ""}
+      <section class="book-agent__package-grid" aria-label="Published Agent Packages">
+        ${rows || `<div class="book-agent__empty"><strong>尚无已发布 Agent Package</strong><p>先完成知识发布与评测；这里不会用示例内容伪造可运行产品。</p></div>`}
+      </section>
+    </main>
+  `;
+}
+
+function renderBookAgentEvidence() {
+  const releaseRows = bookAgentState.releases.map((release) => {
+    const claims = Array.isArray(release.analysis?.claims) ? release.analysis.claims : [];
+    const citations = Array.isArray(release.citations) ? release.citations : [];
+    return `
+      <article class="book-agent__release">
+        <header>
+          <div>
+            <span>Release ${escapeHTML(release.version || "—")}</span>
+            <strong>${escapeHTML(release.book?.title || release.book_id || release.release_id)}</strong>
+          </div>
+          <code>${escapeHTML(String(release.content_hash || "").slice(0, 18))}</code>
+        </header>
+        <div class="book-agent__evidence-grid">
+          ${claims.slice(0, 6).map((claim) => `
+            <div>
+              <span>${escapeHTML(claim.id || "claim")}</span>
+              <p>${escapeHTML(claim.statement || "")}</p>
+              <small>${(claim.citation_ids || []).map((id) => escapeHTML(id)).join(" · ") || "No citation IDs"}</small>
+            </div>
+          `).join("") || `<p class="web-muted">此 release 暂无结构化 claims。</p>`}
+        </div>
+        <footer>${claims.length} claims · ${citations.length} citations · ${escapeHTML(release.usage_policy || "policy unknown")}</footer>
+      </article>
+    `;
+  }).join("");
+  return `
+    <section class="book-agent__capability book-agent__evidence" data-capability="evidence">
+      <div class="book-agent__section-head">
+        <div><span>04</span><h2>Evidence ledger</h2></div>
+        <p>固定 release、claim 与 citation 身份；不展示下载源正文。</p>
+      </div>
+      ${releaseRows || `<p class="web-muted">正在等待 release 证据。</p>`}
+    </section>
+  `;
+}
+
+function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
+  if (!route.packageID || !bookAgentState.package) {
+    renderShell(renderBookAgentPackageIndex(route), "agents");
+    return;
+  }
+  const pkg = bookAgentState.package;
+  const evaluation = pkg.evaluation || {};
+  const release = bookAgentState.releases[0] || {};
+  const bookID = release.book_id || release.book?.book_id || "";
+  const viewLabels = {
+    package: ["Package contract", "版本、边界与评测证据"],
+    agent: ["Agent console", "受策略约束的检索、模型与工具入口"],
+    app: ["Shared Book App", "由 ui_manifest 生成的阅读与证据空间"],
+  };
+  const [viewLabel, viewDescription] = viewLabels[route.view] || viewLabels.app;
+  const searchRows = bookAgentState.results.map((result) => `
+    <article>
+      <span>${escapeHTML(result.kind || "evidence")}</span>
+      <strong>${escapeHTML(result.title || result.id || "Result")}</strong>
+      <p>${escapeHTML(result.snippet || "")}</p>
+    </article>
+  `).join("");
+  const evaluationMetrics = Object.entries(evaluation.metrics || {}).map(([metric, score]) => `
+    <div><span>${escapeHTML(metric)}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
+  `).join("");
+  const runtimeStatus = bookAgentState.loading || bookAgentState.message;
+
+  renderShell(`
+    <main class="book-agent book-agent--detail">
+      <header class="book-agent__hero">
+        <div class="book-agent__hero-copy">
+          <p class="web-kicker">${escapeHTML(viewLabel)}</p>
+          <h1>${escapeHTML(pkg.package_id)}</h1>
+          <p>${escapeHTML(viewDescription)}</p>
+          <div class="book-agent__route-switch" aria-label="Package routes">
+            <a class="${route.view === "package" ? "active" : ""}" href="${escapeAttribute(buildAgentPackageURL(pkg.package_id, pkg.version))}">Package</a>
+            <a class="${route.view === "agent" ? "active" : ""}" href="${escapeAttribute(buildAgentURL(pkg.package_id, pkg.version))}">Agent</a>
+            <a class="${route.view === "app" ? "active" : ""}" href="${escapeAttribute(buildBookAppURL(pkg.package_id, pkg.version))}">Book App</a>
+          </div>
+        </div>
+        <aside class="book-agent__hero-ledger">
+          <div><span>VERSION</span><strong>${escapeHTML(pkg.version)}</strong></div>
+          <div><span>RELEASES</span><strong>${pkg.releases?.length || 0}</strong></div>
+          <div><span>POLICY</span><strong>${escapeHTML(pkg.safety_policy?.usage_policy || "unknown")}</strong></div>
+          <div class="book-agent__evaluation ${evaluation.passed ? "is-pass" : "is-hold"}">
+            <span>EVALUATION</span>
+            <strong>${evaluation.passed ? "Evaluation passed" : "Evaluation hold"}</strong>
+            <small>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "suite unavailable")}</small>
+          </div>
+        </aside>
+      </header>
+
+      ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
+
+      <section class="book-agent__manifest">
+        <div><span>Package hash</span><code>${escapeHTML(pkg.content_hash)}</code></div>
+        <div><span>Model route</span><strong>${escapeHTML(pkg.model_policy?.preferred_capability || "—")}</strong></div>
+        <div><span>Retrieval</span><strong>${escapeHTML(pkg.retrieval_policy?.strategy || "—")}</strong></div>
+        <div><span>Escalation</span><strong>${escapeHTML(pkg.safety_policy?.escalation_target || "—")}</strong></div>
+        ${evaluationMetrics ? `<div class="book-agent__metric-strip">${evaluationMetrics}</div>` : ""}
+      </section>
+
+      <section class="book-agent__capabilities" aria-label="Manifest capabilities">
+        ${renderBookAgentCapability("reader", `
+          <section class="book-agent__capability book-agent__reader" data-capability="reader">
+            <div class="book-agent__section-head"><div><span>01</span><h2>Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
+            ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>Open the book</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
+          </section>
+        `)}
+        ${renderBookAgentCapability("search", `
+          <section class="book-agent__capability book-agent__search" data-capability="search">
+            <div class="book-agent__section-head"><div><span>02</span><h2>Grounded search</h2></div><p>结果保持 claim、chunk 与 release 身份。</p></div>
+            <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="Search this package"><button class="button button-primary" type="submit">Search</button></form>
+            <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
+          </section>
+        `, Boolean(bookID))}
+        ${renderBookAgentCapability("grounded_chat", `
+          <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
+            <div class="book-agent__section-head"><div><span>03</span><h2>Grounded conversation</h2></div><p>回答必须经过 package 的 citation 与 abstention 边界。</p></div>
+            <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="Ask a question grounded in this package">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">Ask with evidence</button></form>
+            ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}</article>` : ""}
+          </section>
+        `, Boolean(bookID))}
+        ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+        ${renderBookAgentCapability("quiz", "", false)}
+        ${renderBookAgentCapability("action_plan", "", false)}
+      </section>
+    </main>
+  `, "agents");
+  bindBookAgentPlatformEvents(route);
+}
+
+function bindBookAgentPlatformEvents(route) {
+  document.querySelector("#book-agent-search-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    bookAgentState.query = String(data.get("query") || "").trim();
+    await searchBookAgentPackage(route);
+  });
+  document.querySelector("#book-agent-chat-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    bookAgentState.question = String(data.get("question") || "").trim();
+    await chatWithBookAgentPackage(route);
+  });
+}
+
+async function loadBookAgentPlatform(route) {
+  bookAgentState.route = route;
+  bookAgentState.loading = "Loading Agent Packages";
+  bookAgentState.message = "";
+  renderBookAgentPlatform(route);
+  try {
+    if (!route.packageID) {
+      const payload = await apiFetch("/api/agent-packages?limit=100");
+      bookAgentState.packages = Array.isArray(payload.packages) ? payload.packages : [];
+      bookAgentState.message = `${bookAgentState.packages.length} published packages`;
+      return;
+    }
+    const query = route.version ? `?version=${encodeURIComponent(route.version)}` : "";
+    bookAgentState.package = await apiFetch(`/api/agent-packages/${encodeURIComponent(route.packageID)}${query}`);
+    bookAgentState.releases = await Promise.all((bookAgentState.package.releases || []).map((reference) => (
+      apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
+    )));
+    bookAgentState.message = "Package, releases, and evaluation loaded";
+  } catch (error) {
+    bookAgentState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    bookAgentState.loading = "";
+    renderBookAgentPlatform(route);
+  }
+}
+
+async function searchBookAgentPackage(route) {
+  const release = bookAgentState.releases[0] || {};
+  const bookID = release.book_id || release.book?.book_id || "";
+  if (!bookAgentState.query || !bookID) {
+    bookAgentState.results = [];
+    renderBookAgentPlatform(route);
+    return;
+  }
+  bookAgentState.loading = "Searching pinned evidence";
+  renderBookAgentPlatform(route);
+  try {
+    const query = new URLSearchParams({ q: bookAgentState.query, book_id: bookID, limit: "20" });
+    const payload = await apiFetch(`/api/search?${query.toString()}`);
+    bookAgentState.results = Array.isArray(payload.results) ? payload.results : [];
+    bookAgentState.message = `${bookAgentState.results.length} evidence results`;
+  } catch (error) {
+    bookAgentState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    bookAgentState.loading = "";
+    renderBookAgentPlatform(route);
+  }
+}
+
+async function chatWithBookAgentPackage(route) {
+  const release = bookAgentState.releases[0] || {};
+  const bookID = release.book_id || release.book?.book_id || "";
+  if (!bookAgentState.question || !bookID) {
+    return;
+  }
+  bookAgentState.loading = "Reasoning over pinned evidence";
+  renderBookAgentPlatform(route);
+  try {
+    bookAgentState.answer = await apiFetch("/api/book-chat", {
+      method: "POST",
+      body: JSON.stringify({
+        book_id: bookID,
+        mode: "analysis",
+        question: bookAgentState.question,
+        model: knowledgeState.analysisModel || "qwen3.7-max",
+        max_context_chars: 12000,
+      }),
+    });
+    bookAgentState.message = "Grounded response complete";
+  } catch (error) {
+    bookAgentState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    bookAgentState.loading = "";
+    renderBookAgentPlatform(route);
+  }
 }
 
 function renderInlineMarkdown(value) {
@@ -5186,6 +5524,16 @@ async function boot() {
   if (routePathname === ROUTES.dedaoAudio || routePathname.startsWith(`${ROUTES.dedaoAudio}/`)) {
     renderDedaoOdob();
     await loadDedaoLibrary("odob");
+    return;
+  }
+  if (
+    routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
+    routePathname === ROUTES.agents || routePathname.startsWith(`${ROUTES.agents}/`) ||
+    routePathname === ROUTES.bookApps || routePathname.startsWith(`${ROUTES.bookApps}/`)
+  ) {
+    const bookAgentRoute = getBookAgentRoute();
+    renderBookAgentPlatform(bookAgentRoute);
+    await loadBookAgentPlatform(bookAgentRoute);
     return;
   }
   if (window.location.pathname.startsWith("/wechat-import") || window.location.pathname.startsWith("/sources/wechat")) {
