@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** BLOCKED at G4 review; Tasks 1-9 implemented and G3 passed
+**Status:** BLOCKED at G4 review; Health configured-root lock identity remains NO-GO
 
 ## Objective
 
@@ -30,9 +30,10 @@ prescription or dosage decisions, and personal-data write tools.
 - **G3 Test: PASS.** The full KBase, Proofroom, and Health release matrix passed
   on the integrated feature heads recorded below.
 - **G4 Review: NO-GO.** Independent architecture and cross-consumer safety
-  review found release-blocking policy, evaluation, authorization, runtime,
-  lifecycle, feedback, and citation-disclosure gaps. The implementation has
-  returned upstream; no push or deployment is permitted.
+  review findings have been remediated through the package runtime, Proofroom,
+  and most Health review paths, but the mandatory Health re-review still found
+  one release-blocking configured-root symlink/lock-identity gap. The
+  implementation has returned upstream; no push or deployment is permitted.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -564,6 +565,59 @@ TDD and exact results:
 - Proofroom has no `scripts/privacy-smoke.sh`; an added-line scan for
   machine-specific paths, private paths, and bearer literals found no matches,
   and `git diff --check` passed before commit.
+
+## G4 remediation checkpoint 5: Health review workspace
+
+**Decision: NO-GO.** The normal configured-directory path now satisfies the
+Health review and safety boundaries, but the independent safety reviewer found
+that a configured release root which is itself a symbolic link still produces
+different lock identities between synchronization and review/publish paths.
+G4 remains failed. No branch was pushed and no deployment was attempted.
+
+Delivered in Health revisions `1ea87f2d8` and `9a8f5f44f`:
+
+- the admin review, adjudication, verification, finalize, preview, and publish
+  APIs select either the configured release workspace or its fixed
+  `agent-packages` child;
+- public service functions no longer accept arbitrary artifact-directory
+  overrides, and an `agent-packages` symlink escape is rejected;
+- for a normal real configured root, release and Agent Package workspaces share
+  one lock, and a parent release rebuild preserves the child workspace and its
+  fingerprint;
+- Agent Packages remain draft-only until Health-owned adjudication,
+  finalization, and explicit publication; preview does not mutate serving data
+  or personal health state.
+
+TDD and exact verification results from the Health worktree with its project
+virtual environment active:
+
+- the four-test focused regression command covering parent rebuild, shared
+  locking, service signatures, and child-symlink escape was RED with three
+  failures before the implementation;
+- `python -m pytest -o addopts='' -q` over the five focused lifecycle and API
+  regressions — PASS, `5 passed, 6 warnings in 1.92s`;
+- `python -m pytest -o addopts='' -q backend/tests/test_dedao_kbase_release_consumer.py backend/tests/test_dedao_kbase_export_importer.py backend/tests/test_system_knowledge_lifecycle.py backend/tests/test_system_knowledge_ingest.py backend/tests/test_kb_reconciliation.py backend/tests/test_kb_reconciliation_e2e.py backend/tests/test_kb_reconciliation_evalcase.py backend/tests/test_kb_reconciliation_judge.py backend/tests/test_kb_reconciliation_merge.py backend/tests/test_safety_failloud_consumers.py backend/tests/test_system_knowledge_phase0.py`
+  — PASS, `224 passed, 6 warnings in 33.43s`;
+- `python -m py_compile` over the five changed service/task/test files — PASS;
+- `ruff check` over the changed workspace, lifecycle, and test files — PASS;
+- `ruff check --ignore E402 backend/app/services/system_knowledge_service.py`
+  — PASS; the project virtual environment did not contain a `ruff` executable,
+  so the repository's installed formatter was used for both successful runs;
+- `python scripts/check_doc_drift.py` — PASS. The change did not alter route or
+  source inventory, so the Health system map was not regenerated;
+- the Health repository has no `scripts/privacy-smoke.sh`; the added-line scan
+  found no machine path, credential, key, or token literal, and
+  `git diff --check` passed before commit;
+- all commit hooks passed for `9a8f5f44f`.
+
+Mandatory independent safety re-review of `9a8f5f44f`: **NO-GO**. Review and
+publish resolve the configured root, while release and Agent Package sync still
+use the expanded but unresolved configured path. With a symlinked configured
+root, those paths lock different files and parent replacement can replace the
+symlink entry rather than the resolved workspace. Required upstream correction:
+normalize sync and service paths to one resolved root, or reject a symlinked
+configured root, then add a root-symlink lock/replacement regression and repeat
+the safety review.
 
 ## Decisions
 
