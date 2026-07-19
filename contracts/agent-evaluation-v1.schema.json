@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/agent-evaluation-v1.schema.json",
+  "title": "KBase Agent Evaluation Suite v1",
+  "type": "object",
+  "required": ["schema_version", "suite_version", "cases"],
+  "properties": {
+    "schema_version": { "const": "agent-evaluation.v1" },
+    "suite_version": { "type": "string", "minLength": 1 },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["case_id", "metric"],
+        "properties": {
+          "case_id": { "type": "string", "minLength": 1 },
+          "metric": {
+            "enum": ["retrieval", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments"]
+          },
+          "expected_ids": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "observed_ids": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "expected_value": { "type": "string" },
+          "observed_value": { "type": "string" },
+          "expected_arguments": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
+          "observed_arguments": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -171,8 +171,15 @@ func validAgentPackage() AgentPackage {
 			EscalationTarget:  "human_review",
 		},
 		EvaluationPolicy: AgentPackageEvaluationPolicy{
-			SuiteVersion:  "book-agent-v1",
-			MinimumScores: map[string]float64{"citation_resolution": 1, "faithfulness": 0.9},
+			SuiteVersion: "book-agent-v1",
+			MinimumScores: map[string]float64{
+				"retrieval":      0.8,
+				"citations":      1,
+				"faithfulness":   0.9,
+				"abstention":     1,
+				"tool_choice":    1,
+				"tool_arguments": 1,
+			},
 		},
 		UIManifest: AgentPackageUIManifest{Capabilities: []string{"reader", "search", "grounded_chat", "evidence"}},
 	}
@@ -188,10 +195,15 @@ func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 		ContentHash:   "sha256:release-content",
 		UsagePolicy:   BookUsageStandard,
 		Book:          BookKnowledgeBook{BookID: "book-1", Title: "Synthetic Book", SourceType: "dedao_ebook"},
-		Analysis:      &BookAnalysisPayload{Summary: "Synthetic summary"},
-		Quality:       BookQualityReport{Decision: BookQualityPass},
-		Citations:     []BookKnowledgeCitation{{CitationID: "citation-1", BookID: "book-1", ChunkID: "chunk-1"}},
-		CreatedAt:     "2026-07-19T00:00:00Z",
+		Analysis: &BookAnalysisPayload{
+			Summary: "Synthetic summary",
+			Claims: []BookAnalysisClaim{{
+				ID: "claim-1", Statement: "Synthetic grounded statement", CitationIDs: []string{"citation-1"}, Confidence: 1, RiskLevel: "low",
+			}},
+		},
+		Quality:   BookQualityReport{Decision: BookQualityPass},
+		Citations: []BookKnowledgeCitation{{CitationID: "citation-1", BookID: "book-1", ChunkID: "chunk-1"}},
+		CreatedAt: "2026-07-19T00:00:00Z",
 	}
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		t.Fatal(err)

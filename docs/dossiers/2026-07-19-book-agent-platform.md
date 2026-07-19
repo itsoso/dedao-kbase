@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** Delivery in progress; Tasks 1-2 checkpoint passed
+**Status:** Delivery in progress; Tasks 1-4 checkpoints passed
 
 ## Objective
 
@@ -67,6 +67,42 @@ Exact commands and results:
 - `git diff --check` — PASS.
 
 Task 1 commit: `6e09f2f feat(kbase): define agent package contract`.
+
+## Checkpoint: Tasks 3-4
+
+**Decision: PASS for the Task 3-4 batch.** G3 remains pending until the proof
+and health consumer contract suites, traces, and shared Book App also pass. No
+deployment was attempted.
+
+Delivered:
+
+- versioned synthetic evaluation suites for retrieval, citations,
+  faithfulness, abstention, tool choice, and tool arguments;
+- deterministic evaluation input hashing and persisted evaluator provenance;
+- publication blocking for missing, mismatched, or below-threshold reports;
+- package/release-scoped metadata, search, citation, and claim MCP resources;
+- deterministic `allow`, `require_confirmation`, and `block` policy;
+- read-only tool catalog, strict argument schemas, and audit fingerprints that
+  omit argument values.
+
+Exact commands and results:
+
+- `go test ./backend/app -run AgentPackageEvaluation -count=1` — RED first:
+  evaluator and persistence symbols were undefined; GREEN after implementation.
+- `go test ./backend/app -run 'AgentToolPolicy|BookKnowledgeMCP' -count=1` —
+  RED first: policy evaluation and scoped resources were undefined; GREEN after
+  implementation.
+- `go test ./backend/app -run KBaseHTTPHandlerPublishesAndReadsAgentPackages -count=1`
+  — RED first: the default HTTP publisher rejected the built-in scoped tool;
+  GREEN after wiring the read-only catalog.
+- `go test ./backend/app -run 'AgentPackageEvaluation|AgentToolPolicy|BookKnowledgeMCP|KBaseHTTPHandlerPublishesAndReadsAgentPackages' -count=1`
+  — PASS.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` —
+  PASS; regenerated for new durable evaluation/audit objects and MCP operations.
+- `bash scripts/system-map-smoke.sh` — PASS.
+- `go test ./...` — PASS.
+- `bash scripts/privacy-smoke.sh` — PASS.
+- `git diff --check` — PASS.
 
 ## Decisions
 

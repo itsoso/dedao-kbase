@@ -49,10 +49,8 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
-	pkg, err := FinalizeAgentPackage(validAgentPackage())
-	if err != nil {
-		t.Fatal(err)
-	}
+	pkg := agentToolPolicyTestPackage()
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
 	payload, err := json.Marshal(AgentPackagePublishRequest{
 		IdempotencyKey: "operator:http:1",
 		Package:        pkg,
@@ -61,9 +59,8 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store:      store,
-		AuthToken:  "secret-token",
-		AgentTools: []string{"book-mcp/search", "book-mcp/resolve_citation"},
+		Store:     store,
+		AuthToken: "secret-token",
 	})
 
 	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "", string(payload))
@@ -94,12 +91,13 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 		t.Fatalf("versioned detail status=%d body=%s", versioned.Code, versioned.Body.String())
 	}
 
-	changed := validAgentPackage()
+	changed := agentToolPolicyTestPackage()
 	changed.Version = "2.0.0"
 	changed, err = FinalizeAgentPackage(changed)
 	if err != nil {
 		t.Fatal(err)
 	}
+	savePassingAgentPackageTestEvaluation(t, store, changed)
 	conflictPayload, _ := json.Marshal(AgentPackagePublishRequest{IdempotencyKey: "operator:http:1", Package: changed})
 	conflict := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(conflictPayload))
 	if conflict.Code != http.StatusConflict {

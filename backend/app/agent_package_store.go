@@ -66,6 +66,9 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 	if err := ValidateAgentPackage(pkg, store, knownTools); err != nil {
 		return nil, false, err
 	}
+	if err := ValidateAgentPackageEvaluationGate(store, pkg); err != nil {
+		return nil, false, err
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}

@@ -109,6 +109,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if reverificationCooldown == 0 {
 		reverificationCooldown = 5 * time.Minute
 	}
+	agentTools := uniqueTrimmedStrings(cfg.AgentTools)
+	if len(agentTools) == 0 {
+		agentTools = AgentReadOnlyToolIDs()
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
@@ -126,7 +130,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		dedaoLibrary:            dedaoLibrary,
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
-		agentTools:              append([]string(nil), cfg.AgentTools...),
+		agentTools:              agentTools,
 	}
 }
 

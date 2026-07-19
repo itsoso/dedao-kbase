@@ -2,58 +2,133 @@ package app
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 )
 
-func TestBookKnowledgeMCPListAndSearch(t *testing.T) {
-	store := NewBookKnowledgeStore(t.TempDir())
-	if err := store.SavePackage(BookKnowledgePackage{
-		Book: BookKnowledgeBook{BookID: "42", Title: "42_量化分析_作者", Status: "draft"},
-		Chapters: []BookKnowledgeChapter{
-			{ChapterID: "42-chapter-1", BookID: "42", Order: 1, Title: "趋势过滤"},
-		},
-		Chunks: []BookKnowledgeChunk{
-			{ChunkID: "42-chunk-1", BookID: "42", ChapterID: "42-chapter-1", Text: "MACD 背离需要趋势过滤。"},
-		},
-	}); err != nil {
-		t.Fatalf("SavePackage returned error: %v", err)
-	}
-
-	server := NewBookKnowledgeMCPServer(store)
+func TestBookKnowledgeMCPAdvertisesOnlyScopedReadOnlyAgentTools(t *testing.T) {
+	server := NewBookKnowledgeMCPServer(NewBookKnowledgeStore(t.TempDir()))
 	tools := server.Tools()
-	if len(tools) == 0 {
-		t.Fatal("expected MCP tools")
+	if len(tools) != 4 {
+		t.Fatalf("tools = %#v", tools)
 	}
-
-	listResp, err := server.Call("book.list_books", nil)
-	if err != nil {
-		t.Fatalf("book.list_books returned error: %v", err)
+	for _, tool := range tools {
+		if !strings.HasPrefix(tool.Name, "agent.") {
+			t.Fatalf("unscoped tool is still advertised: %#v", tool)
+		}
+		required, ok := tool.InputSchema["required"].([]string)
+		if !ok || !containsMCPString(required, "package_id") || !containsMCPString(required, "release_id") {
+			t.Fatalf("tool %q does not require package and release scope: %#v", tool.Name, tool.InputSchema)
+		}
+		if tool.InputSchema["additionalProperties"] != false {
+			t.Fatalf("tool %q accepts unknown arguments: %#v", tool.Name, tool.InputSchema)
+		}
 	}
-	var books []BookKnowledgeBook
-	if err := json.Unmarshal(listResp, &books); err != nil {
-		t.Fatalf("list response is not books JSON: %v", err)
+	resources := server.Resources()
+	if len(resources) != 4 {
+		t.Fatalf("resources = %#v", resources)
 	}
-	if len(books) != 1 || books[0].BookID != "42" {
-		t.Fatalf("books = %#v, want saved book", books)
-	}
-
-	searchResp, err := server.Call("book.search", json.RawMessage(`{"query":"MACD","limit":5}`))
-	if err != nil {
-		t.Fatalf("book.search returned error: %v", err)
-	}
-	var results []BookKnowledgeSearchResult
-	if err := json.Unmarshal(searchResp, &results); err != nil {
-		t.Fatalf("search response is not results JSON: %v", err)
-	}
-	if len(results) != 1 || results[0].ChunkID != "42-chunk-1" {
-		t.Fatalf("results = %#v, want matching chunk", results)
+	for _, resource := range resources {
+		if !strings.Contains(resource.URITemplate, "{package_id}") || !strings.Contains(resource.URITemplate, "{release_id}") {
+			t.Fatalf("resource lacks package/release scope: %#v", resource)
+		}
 	}
 }
 
-func TestBookKnowledgeMCPRejectsUnknownTool(t *testing.T) {
-	server := NewBookKnowledgeMCPServer(NewBookKnowledgeStore(t.TempDir()))
-
-	if _, err := server.Call("unknown.tool", nil); err == nil {
-		t.Fatal("expected unknown tool error")
+func TestBookKnowledgeMCPReadsOnlyPinnedPackageRelease(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := agentToolPolicyTestPackage()
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	knownTools := []string{
+		"book-mcp/agent.search",
+		"book-mcp/agent.resolve_citation",
+		"book-mcp/agent.get_claim",
+		"book-mcp/agent.package_metadata",
 	}
+	if _, _, err := PublishAgentPackage(store, pkg, "mcp-package", knownTools, testAgentPackageTime()); err != nil {
+		t.Fatal(err)
+	}
+	server := NewBookKnowledgeMCPServer(store)
+
+	metadataRaw, err := server.Call("agent.package_metadata", json.RawMessage(`{"package_id":"agent-package-example","release_id":"release-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metadataRaw), `"package_id":"agent-package-example"`) ||
+		!strings.Contains(string(metadataRaw), `"release_id":"release-1"`) {
+		t.Fatalf("metadata = %s", metadataRaw)
+	}
+
+	searchRaw, err := server.Call("agent.search", json.RawMessage(`{"package_id":"agent-package-example","release_id":"release-1","query":"grounded","limit":5}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(searchRaw), `"claim_id":"claim-1"`) || !strings.Contains(string(searchRaw), `"citation_ids":["citation-1"]`) {
+		t.Fatalf("search = %s", searchRaw)
+	}
+
+	citationRaw, err := server.Call("agent.resolve_citation", json.RawMessage(`{"package_id":"agent-package-example","release_id":"release-1","citation_id":"citation-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(citationRaw), `"chunk_id":"chunk-1"`) {
+		t.Fatalf("citation = %s", citationRaw)
+	}
+
+	claimRaw, err := server.Call("agent.get_claim", json.RawMessage(`{"package_id":"agent-package-example","release_id":"release-1","claim_id":"claim-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(claimRaw), `"statement":"Synthetic grounded statement"`) {
+		t.Fatalf("claim = %s", claimRaw)
+	}
+}
+
+func TestBookKnowledgeMCPRejectsMissingScopeUnknownArgumentsAndWrites(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := agentToolPolicyTestPackage()
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	knownTools := []string{
+		"book-mcp/agent.search",
+		"book-mcp/agent.resolve_citation",
+		"book-mcp/agent.get_claim",
+		"book-mcp/agent.package_metadata",
+	}
+	if _, _, err := PublishAgentPackage(store, pkg, "mcp-package", knownTools, testAgentPackageTime()); err != nil {
+		t.Fatal(err)
+	}
+	server := NewBookKnowledgeMCPServer(store)
+
+	for _, tc := range []struct {
+		name string
+		tool string
+		args string
+		want string
+	}{
+		{name: "missing release scope", tool: "agent.search", args: `{"package_id":"agent-package-example","query":"q"}`, want: "release_id"},
+		{name: "unknown argument", tool: "agent.search", args: `{"package_id":"agent-package-example","release_id":"release-1","query":"q","write":true}`, want: "unsupported argument"},
+		{name: "write tool", tool: "agent.publish", args: `{"package_id":"agent-package-example","release_id":"release-1"}`, want: "read-only"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := server.Call(tc.tool, json.RawMessage(tc.args)); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func containsMCPString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func testAgentPackageTime() time.Time {
+	return time.Date(2026, 7, 19, 15, 0, 0, 0, time.UTC)
 }

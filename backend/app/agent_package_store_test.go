@@ -15,6 +15,7 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 
 	published, created, err := PublishAgentPackage(store, pkg, "operator:package:1", []string{"book-mcp/search", "book-mcp/resolve_citation"}, now)
@@ -52,6 +53,7 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	savePassingAgentPackageTestEvaluation(t, store, changed)
 	if _, _, err := PublishAgentPackage(store, changed, "operator:package:1", []string{"book-mcp/search", "book-mcp/resolve_citation"}, now); !errors.Is(err, ErrAgentPackageIdempotencyConflict) {
 		t.Fatalf("reused idempotency key error = %v", err)
 	}
@@ -67,6 +69,7 @@ func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	savePassingAgentPackageTestEvaluation(t, store, first)
 	firstPublished, _, err := PublishAgentPackage(store, first, "publish-v1", knownTools, now)
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +87,7 @@ func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
+	savePassingAgentPackageTestEvaluation(t, store, second)
 	secondPublished, created, err := PublishAgentPackage(store, second, "publish-v2", knownTools, now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -130,6 +134,7 @@ func TestAgentPackageStoreRejectsMutableVersionReuse(t *testing.T) {
 	knownTools := []string{"book-mcp/search", "book-mcp/resolve_citation"}
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	first, _ := FinalizeAgentPackage(validAgentPackage())
+	savePassingAgentPackageTestEvaluation(t, store, first)
 	if _, _, err := PublishAgentPackage(store, first, "publish-a", knownTools, now); err != nil {
 		t.Fatal(err)
 	}
@@ -137,6 +142,7 @@ func TestAgentPackageStoreRejectsMutableVersionReuse(t *testing.T) {
 	changed := validAgentPackage()
 	changed.UIManifest.Capabilities = append(changed.UIManifest.Capabilities, "quiz")
 	changed, _ = FinalizeAgentPackage(changed)
+	savePassingAgentPackageTestEvaluation(t, store, changed)
 	if _, _, err := PublishAgentPackage(store, changed, "publish-b", knownTools, now.Add(time.Hour)); !errors.Is(err, ErrAgentPackageVersionConflict) {
 		t.Fatalf("version reuse error = %v", err)
 	}

@@ -3,12 +3,27 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 type BookKnowledgeMCPTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema,omitempty"`
+}
+
+type BookKnowledgeMCPResource struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	URITemplate string `json:"uriTemplate"`
+}
+
+type AgentScopedSearchResult struct {
+	ClaimID     string   `json:"claim_id"`
+	Statement   string   `json:"statement"`
+	CitationIDs []string `json:"citation_ids"`
+	Score       float64  `json:"score"`
 }
 
 type BookKnowledgeMCPServer struct {
@@ -23,122 +38,169 @@ func NewBookKnowledgeMCPServer(store *BookKnowledgeStore) *BookKnowledgeMCPServe
 }
 
 func (s *BookKnowledgeMCPServer) Tools() []BookKnowledgeMCPTool {
+	scope := map[string]any{
+		"package_id": map[string]any{"type": "string", "minLength": 1},
+		"release_id": map[string]any{"type": "string", "minLength": 1},
+	}
 	return []BookKnowledgeMCPTool{
 		{
-			Name:        "book.list_books",
-			Description: "列出 dedao-gui 已提取的本地书籍知识包。",
-			InputSchema: objectSchema(map[string]any{}),
+			Name:        "agent.package_metadata",
+			Description: "Read bounded metadata for one published Agent Package and pinned release.",
+			InputSchema: strictObjectSchema(scope, []string{"package_id", "release_id"}),
 		},
 		{
-			Name:        "book.search",
-			Description: "在本地书籍知识包的 chunks 和 claims 中检索。",
-			InputSchema: objectSchema(map[string]any{
-				"query":   map[string]any{"type": "string"},
-				"book_id": map[string]any{"type": "string"},
-				"limit":   map[string]any{"type": "integer"},
-			}),
+			Name:        "agent.search",
+			Description: "Search claims inside one explicitly pinned Agent Package release.",
+			InputSchema: strictObjectSchema(mergeSchemaProperties(scope, map[string]any{
+				"query": map[string]any{"type": "string", "minLength": 1},
+				"limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 50},
+			}), []string{"package_id", "release_id", "query"}),
 		},
 		{
-			Name:        "book.get_chapter",
-			Description: "按 book_id 和 chapter_id 读取章节、chunks、claims。",
-			InputSchema: objectSchema(map[string]any{
-				"book_id":    map[string]any{"type": "string"},
-				"chapter_id": map[string]any{"type": "string"},
-			}),
+			Name:        "agent.resolve_citation",
+			Description: "Resolve one citation ID inside one explicitly pinned Agent Package release.",
+			InputSchema: strictObjectSchema(mergeSchemaProperties(scope, map[string]any{
+				"citation_id": map[string]any{"type": "string", "minLength": 1},
+			}), []string{"package_id", "release_id", "citation_id"}),
 		},
 		{
-			Name:        "book.get_context",
-			Description: "按 book_id 读取整本书的知识包上下文。",
-			InputSchema: objectSchema(map[string]any{
-				"book_id": map[string]any{"type": "string"},
-			}),
+			Name:        "agent.get_claim",
+			Description: "Read one claim inside one explicitly pinned Agent Package release.",
+			InputSchema: strictObjectSchema(mergeSchemaProperties(scope, map[string]any{
+				"claim_id": map[string]any{"type": "string", "minLength": 1},
+			}), []string{"package_id", "release_id", "claim_id"}),
 		},
+	}
+}
+
+func (s *BookKnowledgeMCPServer) Resources() []BookKnowledgeMCPResource {
+	const base = "agent-package://{package_id}/releases/{release_id}"
+	return []BookKnowledgeMCPResource{
+		{Name: "agent.package_metadata", Description: "Published package metadata.", URITemplate: base + "/metadata"},
+		{Name: "agent.search", Description: "Package-scoped claim search.", URITemplate: base + "/search{?query,limit}"},
+		{Name: "agent.resolve_citation", Description: "Package-scoped citation resolution.", URITemplate: base + "/citations/{citation_id}"},
+		{Name: "agent.get_claim", Description: "Package-scoped claim lookup.", URITemplate: base + "/claims/{claim_id}"},
 	}
 }
 
 func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (json.RawMessage, error) {
+	var input map[string]any
+	if len(arguments) == 0 {
+		input = map[string]any{}
+	} else if err := json.Unmarshal(arguments, &input); err != nil {
+		return nil, fmt.Errorf("invalid Agent tool arguments: %w", err)
+	}
+	packageID := stringArgument(input, "package_id")
+	var pkg AgentPackage
+	if packageID != "" {
+		loaded, err := s.store.LoadAgentPackage(packageID, "")
+		if err != nil {
+			return nil, fmt.Errorf("load Agent Package: %w", err)
+		}
+		pkg = *loaded
+	}
+	decision := EvaluateAgentToolCall(pkg, "book-mcp", name, input)
+	if decision.Decision != AgentToolAllow {
+		return nil, fmt.Errorf("agent tool policy %s: %s (argument_hash=%s)", decision.Decision, decision.Reason, decision.Audit.ArgumentHash)
+	}
+	releaseID := stringArgument(input, "release_id")
+	release, err := s.store.LoadKnowledgeRelease(releaseID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned release: %w", err)
+	}
+
 	switch name {
-	case "book.list_books":
-		books, err := s.store.ListBooks()
+	case "agent.package_metadata":
+		evaluation, err := s.store.LoadAgentPackageEvaluation(pkg.ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("load package evaluation: %w", err)
+		}
+		return marshalMCPResult(map[string]any{
+			"package_id":        pkg.PackageID,
+			"package_version":   pkg.Version,
+			"package_hash":      pkg.ContentHash,
+			"lifecycle_state":   pkg.LifecycleState,
+			"release_id":        release.ReleaseID,
+			"release_hash":      release.ContentHash,
+			"retrieval_policy":  pkg.RetrievalPolicy,
+			"safety_policy":     pkg.SafetyPolicy,
+			"evaluation_status": map[string]any{"passed": evaluation.Passed, "suite_version": evaluation.SuiteVersion, "metrics": evaluation.Metrics},
+			"ui_manifest":       pkg.UIManifest,
+		})
+	case "agent.search":
+		limit, err := agentToolLimit(input["limit"])
 		if err != nil {
 			return nil, err
 		}
-		return marshalMCPResult(books)
-	case "book.search":
-		var query BookKnowledgeSearchQuery
-		if len(arguments) > 0 {
-			if err := json.Unmarshal(arguments, &query); err != nil {
-				return nil, err
+		return marshalMCPResult(searchAgentReleaseClaims(*release, stringArgument(input, "query"), limit))
+	case "agent.resolve_citation":
+		citationID := stringArgument(input, "citation_id")
+		for _, citation := range release.Citations {
+			if citation.CitationID == citationID {
+				return marshalMCPResult(citation)
 			}
 		}
-		results, err := s.store.Search(query)
-		if err != nil {
-			return nil, err
+		return nil, fmt.Errorf("citation not found in pinned release: %s", citationID)
+	case "agent.get_claim":
+		if release.Analysis == nil {
+			return nil, fmt.Errorf("pinned release has no claims")
 		}
-		return marshalMCPResult(results)
-	case "book.get_chapter":
-		var input struct {
-			BookID    string `json:"book_id"`
-			ChapterID string `json:"chapter_id"`
+		claimID := stringArgument(input, "claim_id")
+		for _, claim := range release.Analysis.Claims {
+			if claim.ID == claimID {
+				return marshalMCPResult(claim)
+			}
 		}
-		if err := json.Unmarshal(arguments, &input); err != nil {
-			return nil, err
-		}
-		result, err := s.getChapter(input.BookID, input.ChapterID)
-		if err != nil {
-			return nil, err
-		}
-		return marshalMCPResult(result)
-	case "book.get_context":
-		var input struct {
-			BookID string `json:"book_id"`
-		}
-		if err := json.Unmarshal(arguments, &input); err != nil {
-			return nil, err
-		}
-		pkg, err := s.store.LoadPackage(input.BookID)
-		if err != nil {
-			return nil, err
-		}
-		return marshalMCPResult(pkg)
+		return nil, fmt.Errorf("claim not found in pinned release: %s", claimID)
 	default:
-		return nil, fmt.Errorf("unknown book knowledge MCP tool: %s", name)
+		return nil, fmt.Errorf("tool is outside the read-only Agent tool catalog: %s", name)
 	}
 }
 
-func (s *BookKnowledgeMCPServer) getChapter(bookID, chapterID string) (map[string]any, error) {
-	pkg, err := s.store.LoadPackage(bookID)
-	if err != nil {
-		return nil, err
+func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int) []AgentScopedSearchResult {
+	if release.Analysis == nil {
+		return []AgentScopedSearchResult{}
 	}
-	var chapter *BookKnowledgeChapter
-	for i := range pkg.Chapters {
-		if pkg.Chapters[i].ChapterID == chapterID {
-			chapter = &pkg.Chapters[i]
-			break
+	terms := splitSearchTerms(query)
+	results := make([]AgentScopedSearchResult, 0)
+	for _, claim := range release.Analysis.Claims {
+		haystack := strings.ToLower(strings.Join(append([]string{claim.Statement}, claim.Scope...), " "))
+		matched := 0
+		for _, term := range terms {
+			if strings.Contains(haystack, term) {
+				matched++
+			}
 		}
-	}
-	if chapter == nil {
-		return nil, fmt.Errorf("chapter not found: %s", chapterID)
-	}
-	var chunks []BookKnowledgeChunk
-	for _, chunk := range pkg.Chunks {
-		if chunk.ChapterID == chapterID {
-			chunks = append(chunks, chunk)
+		if matched == 0 {
+			continue
 		}
+		results = append(results, AgentScopedSearchResult{
+			ClaimID: claim.ID, Statement: claim.Statement,
+			CitationIDs: append([]string(nil), claim.CitationIDs...),
+			Score:       float64(matched) / float64(len(terms)),
+		})
 	}
-	var claims []BookKnowledgeClaim
-	for _, claim := range pkg.Claims {
-		if claim.ChapterID == chapterID {
-			claims = append(claims, claim)
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
 		}
+		return results[i].ClaimID < results[j].ClaimID
+	})
+	if len(results) > limit {
+		results = results[:limit]
 	}
-	return map[string]any{
-		"book":    pkg.Book,
-		"chapter": chapter,
-		"chunks":  chunks,
-		"claims":  claims,
-	}, nil
+	return results
+}
+
+func agentToolLimit(value any) (int, error) {
+	if value == nil {
+		return 10, nil
+	}
+	number, ok := value.(float64)
+	if !ok || number < 1 || number > 50 || number != float64(int(number)) {
+		return 0, fmt.Errorf("limit must be an integer between 1 and 50")
+	}
+	return int(number), nil
 }
 
 func marshalMCPResult(value any) (json.RawMessage, error) {
@@ -149,10 +211,21 @@ func marshalMCPResult(value any) (json.RawMessage, error) {
 	return json.RawMessage(data), nil
 }
 
-func objectSchema(properties map[string]any) map[string]any {
+func strictObjectSchema(properties map[string]any, required []string) map[string]any {
 	return map[string]any{
 		"type":                 "object",
 		"properties":           properties,
-		"additionalProperties": true,
+		"required":             required,
+		"additionalProperties": false,
 	}
+}
+
+func mergeSchemaProperties(groups ...map[string]any) map[string]any {
+	result := make(map[string]any)
+	for _, group := range groups {
+		for name, schema := range group {
+			result[name] = schema
+		}
+	}
+	return result
 }
