@@ -6,6 +6,23 @@ const tokenKeys = [
   "KBASE_AUTH_TOKEN",
 ];
 
+const ROUTES = Object.freeze({
+  dedaoHome: "/sources/dedao/home",
+  dedaoCourses: "/sources/dedao/courses",
+  dedaoEbooks: "/sources/dedao/ebooks",
+  dedaoAudio: "/sources/dedao/audio",
+  knowledgePackages: "/knowledge/packages",
+  healthReleases: "/delivery/health/releases",
+});
+
+const legacyRouteAliases = Object.freeze({
+  "/home": ROUTES.dedaoHome,
+  "/course": ROUTES.dedaoCourses,
+  "/ebook": ROUTES.dedaoEbooks,
+  "/odob": ROUTES.dedaoAudio,
+  "/book-knowledge": ROUTES.knowledgePackages,
+});
+
 const wechatState = {
   articleURL: "",
   bookID: "",
@@ -393,12 +410,31 @@ function normalizeReaderBookID(bookID) {
   return value;
 }
 
-function getBookID() {
-  const prefix = "/ebook/";
-  if (!window.location.pathname.startsWith(prefix)) {
+function resolveCanonicalRoute(pathname = window.location.pathname) {
+  for (const [legacy, canonical] of Object.entries(legacyRouteAliases)) {
+    if (pathname === legacy || pathname.startsWith(`${legacy}/`)) {
+      return canonical + pathname.slice(legacy.length);
+    }
+  }
+  return pathname;
+}
+
+function getRoutePathname() {
+  return resolveCanonicalRoute(window.location.pathname);
+}
+
+function getPathSegmentAfter(prefix, pathname = getRoutePathname()) {
+  if (!pathname.startsWith(prefix)) {
     return "";
   }
-  const raw = window.location.pathname.slice(prefix.length).split("/")[0];
+  return pathname.slice(prefix.length).split("/")[0];
+}
+
+function getBookID() {
+  const raw = getPathSegmentAfter(`${ROUTES.dedaoEbooks}/`) || getPathSegmentAfter("/ebook/");
+  if (!raw) {
+    return "";
+  }
   try {
     return normalizeReaderBookID(decodeURIComponent(raw));
   } catch {
@@ -407,11 +443,10 @@ function getBookID() {
 }
 
 function getKnowledgeBookID() {
-  const prefix = "/book-knowledge/";
-  if (!window.location.pathname.startsWith(prefix)) {
+  const raw = getPathSegmentAfter(`${ROUTES.knowledgePackages}/`) || getPathSegmentAfter("/book-knowledge/");
+  if (!raw) {
     return "";
   }
-  const raw = window.location.pathname.slice(prefix.length).split("/")[0];
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -420,11 +455,10 @@ function getKnowledgeBookID() {
 }
 
 function getDedaoCourseDetailEnID() {
-  const prefix = "/course/detail/";
-  if (!window.location.pathname.startsWith(prefix)) {
+  const raw = getPathSegmentAfter(`${ROUTES.dedaoCourses}/detail/`) || getPathSegmentAfter("/course/detail/");
+  if (!raw) {
     return "";
   }
-  const raw = window.location.pathname.slice(prefix.length).split("/")[0];
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -433,11 +467,12 @@ function getDedaoCourseDetailEnID() {
 }
 
 function getDedaoCourseRoute() {
-  const prefix = "/course/";
-  if (!window.location.pathname.startsWith(prefix) || window.location.pathname.startsWith("/course/detail/")) {
+  const pathname = getRoutePathname();
+  const prefix = `${ROUTES.dedaoCourses}/`;
+  if (!pathname.startsWith(prefix) || pathname.startsWith(`${ROUTES.dedaoCourses}/detail/`)) {
     return null;
   }
-  const rawID = window.location.pathname.slice(prefix.length).split("/")[0];
+  const rawID = pathname.slice(prefix.length).split("/")[0];
   if (!rawID || !/^\d+$/.test(rawID)) {
     return null;
   }
@@ -451,6 +486,28 @@ function getDedaoCourseRoute() {
   };
 }
 
+function buildDedaoCourseURL(item) {
+  const courseID = item?.id || item?.class_id || item?.product_id || "";
+  const enid = dedaoProductEnID(item || {});
+  const params = new URLSearchParams();
+  if (enid) params.set("enid", enid);
+  if (item?.publish_num) params.set("total", String(item.publish_num));
+  if (item?.title || item?.name) params.set("title", item.title || item.name);
+  return courseID ? `${ROUTES.dedaoCourses}/${encodeURIComponent(courseID)}${params.toString() ? `?${params.toString()}` : ""}` : "";
+}
+
+function buildDedaoCourseDetailURL(enid) {
+  return enid ? `${ROUTES.dedaoCourses}/detail/${encodeURIComponent(enid)}` : "";
+}
+
+function buildDedaoEbookURL(bookID) {
+  return bookID ? `${ROUTES.dedaoEbooks}/${encodeURIComponent(bookID)}` : "";
+}
+
+function buildKnowledgePackageURL(packageID) {
+  return packageID ? `${ROUTES.knowledgePackages}/${encodeURIComponent(packageID)}` : ROUTES.knowledgePackages;
+}
+
 async function fetchBook(bookID) {
   return apiFetch(`/api/books/${encodeURIComponent(bookID)}`);
 }
@@ -459,15 +516,15 @@ function renderShell(content, current = "") {
   app.className = "web-shell";
   app.innerHTML = `
     <header class="web-topbar">
-      <a class="web-brand" href="/home">得到 KBase</a>
+      <a class="web-brand" href="${escapeAttribute(ROUTES.dedaoHome)}">得到 KBase</a>
       <nav class="web-nav" aria-label="主导航">
-        <a class="${current === "home" ? "active" : ""}" href="/home">首页</a>
-        <a class="${current === "course" ? "active" : ""}" href="/course">课程</a>
-        <a class="${current === "ebook" ? "active" : ""}" href="/ebook">电子书</a>
-        <a class="${current === "odob" ? "active" : ""}" href="/odob">听书</a>
+        <a class="${current === "home" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoHome)}">首页</a>
+        <a class="${current === "course" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoCourses)}">课程</a>
+        <a class="${current === "ebook" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoEbooks)}">电子书</a>
+        <a class="${current === "odob" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoAudio)}">听书</a>
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
-        <a class="${current === "knowledge" ? "active" : ""}" href="/book-knowledge">书籍知识库</a>
+        <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
       </nav>
     </header>
     ${content}
@@ -477,9 +534,9 @@ function renderShell(content, current = "") {
 function renderDedaoHome() {
   const sections = dedaoLibraryState.home ? `
     <section class="dedao-home__library" aria-label="得到订阅内容">
-      ${renderDedaoHomeSection("订阅课程", dedaoLibraryState.home.courses?.list, "/course")}
-      ${renderDedaoHomeSection("得到电子书", dedaoLibraryState.home.ebooks?.list, "/ebook")}
-      ${renderDedaoHomeSection("听书书架", dedaoLibraryState.home.odob?.list, "/odob")}
+      ${renderDedaoHomeSection("订阅课程", dedaoLibraryState.home.courses?.list, ROUTES.dedaoCourses)}
+      ${renderDedaoHomeSection("得到电子书", dedaoLibraryState.home.ebooks?.list, ROUTES.dedaoEbooks)}
+      ${renderDedaoHomeSection("听书书架", dedaoLibraryState.home.odob?.list, ROUTES.dedaoAudio)}
     </section>
   ` : "";
   renderShell(`
@@ -490,9 +547,9 @@ function renderDedaoHome() {
           <h1>把得到内容变成可学习、可验证、可供给的知识库</h1>
           <p>从课程、电子书、听书和公众号来源开始，完成搜索、下载、加工、分析和外部系统供给。</p>
           <div class="web-home__actions">
-            <a class="button button-primary" href="/course">进入得到课程</a>
-            <a class="button button-ghost" href="/ebook">查看得到电子书</a>
-            <a class="button button-ghost" href="/book-knowledge">打开书籍知识库</a>
+            <a class="button button-primary" href="${escapeAttribute(ROUTES.dedaoCourses)}">进入得到课程</a>
+            <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoEbooks)}">查看得到电子书</a>
+            <a class="button button-ghost" href="${escapeAttribute(ROUTES.knowledgePackages)}">打开书籍知识库</a>
             <a class="button button-ghost" href="/wechat-source">微信采集</a>
           </div>
         </div>
@@ -502,17 +559,17 @@ function renderDedaoHome() {
         </div>
       </section>
       <section class="dedao-home__shortcuts" aria-label="得到功能">
-        <a class="dedao-card" href="/course">
+        <a class="dedao-card" href="${escapeAttribute(ROUTES.dedaoCourses)}">
           <span>得到课程</span>
           <strong>继续学习</strong>
           <small>查看已订阅课程和学习入口</small>
         </a>
-        <a class="dedao-card" href="/ebook">
+        <a class="dedao-card" href="${escapeAttribute(ROUTES.dedaoEbooks)}">
           <span>得到电子书</span>
           <strong>书架阅读</strong>
           <small>查看已订阅电子书</small>
         </a>
-        <a class="dedao-card" href="/book-knowledge">
+        <a class="dedao-card" href="${escapeAttribute(ROUTES.knowledgePackages)}">
           <span>书籍知识库</span>
           <strong>知识加工</strong>
           <small>检索、分析、发布给外部系统</small>
@@ -546,7 +603,7 @@ const dedaoLibraryConfig = {
   },
   ebook: {
     nav: "ebook",
-    path: "/ebook",
+    path: ROUTES.dedaoEbooks,
     kicker: "得到电子书",
     title: "电子书",
     description: "从得到账号读取已订阅电子书，进入阅读、下载或同步到书籍知识库。",
@@ -555,7 +612,7 @@ const dedaoLibraryConfig = {
   },
   odob: {
     nav: "odob",
-    path: "/odob",
+    path: ROUTES.dedaoAudio,
     kicker: "听书书架",
     title: "听书",
     description: "从得到账号读取已订阅听书内容，查看文稿并沉淀成知识资料。",
@@ -615,16 +672,11 @@ function renderDedaoLibrary(category) {
     const progress = Number.isFinite(Number(item.progress)) ? Number(item.progress) : 0;
     const total = item.course_num || item.publish_num || item.duration || "-";
     const updated = item.publish_num ? `${item.publish_num}/${item.course_num || "?"}` : (item.last_read || "-");
-    const courseID = item.id || item.class_id || item.product_id || "";
-    const courseQuery = new URLSearchParams();
-    if (enid) courseQuery.set("enid", enid);
-    if (item.publish_num) courseQuery.set("total", String(item.publish_num));
-    if (item.title || item.name) courseQuery.set("title", item.title || item.name);
     const primaryHref = category === "ebook" && enid
-      ? `/ebook/${encodeURIComponent(enid)}`
-      : (category === "bauhinia" && courseID ? `/course/${encodeURIComponent(courseID)}${courseQuery.toString() ? `?${courseQuery.toString()}` : ""}` : "");
+      ? buildDedaoEbookURL(enid)
+      : (category === "bauhinia" ? buildDedaoCourseURL(item) : "");
     const detailHref = category === "bauhinia" && enid
-      ? `/course/detail/${encodeURIComponent(enid)}`
+      ? buildDedaoCourseDetailURL(enid)
       : (enid ? `${cfg.path}/${encodeURIComponent(enid)}` : "");
     return `
       <article class="dedao-course-card">
@@ -646,7 +698,7 @@ function renderDedaoLibrary(category) {
         <div class="dedao-course-card__actions">
           ${primaryHref ? `<a class="button button-primary" href="${escapeAttribute(primaryHref)}">${escapeHTML(cfg.primaryAction)}</a>` : ""}
           ${detailHref ? `<a class="button button-ghost" href="${escapeAttribute(detailHref)}">详情</a>` : ""}
-          ${id || enid ? `<a class="button button-ghost" href="/book-knowledge?query=${encodeURIComponent(item.title || id || enid)}">查知识库</a>` : ""}
+          ${id || enid ? `<a class="button button-ghost" href="${escapeAttribute(`${ROUTES.knowledgePackages}?query=${encodeURIComponent(item.title || id || enid)}`)}">查知识库</a>` : ""}
         </div>
       </article>
     `;
@@ -664,7 +716,7 @@ function renderDedaoLibrary(category) {
           <button class="button button-primary" type="button" data-action="reload-dedao-library" ${state.loading ? "disabled" : ""}>
             ${state.loading ? "加载中" : "刷新"}
           </button>
-          <a class="button button-ghost" href="/book-knowledge">书籍知识库</a>
+          <a class="button button-ghost" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
         </div>
       </section>
       ${state.message ? `<p class="web-status">${escapeHTML(state.message)}</p>` : ""}
@@ -674,8 +726,8 @@ function renderDedaoLibrary(category) {
             <h2>${escapeHTML(cfg.empty)}</h2>
             <p>确认得到扫码登录成功后，刷新本页；已下载加工过的内容仍可在书籍知识库查看。</p>
             <div class="web-home__actions">
-              <a class="button button-primary" href="/book-knowledge">打开书籍知识库</a>
-              <a class="button button-ghost" href="/home">返回首页</a>
+              <a class="button button-primary" href="${escapeAttribute(ROUTES.knowledgePackages)}">打开书籍知识库</a>
+              <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoHome)}">返回首页</a>
             </div>
           </div>
         `}
@@ -748,7 +800,7 @@ function renderDedaoCourseDetail() {
   renderShell(`
     <main class="dedao-course-detail">
       <section class="dedao-course-detail__header">
-        <a class="button button-ghost" href="/course">返回课程</a>
+        <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoCourses)}">返回课程</a>
         <div>
           <p class="web-kicker">得到课程详情</p>
           <h1>${escapeHTML(info.name || "课程详情")}</h1>
@@ -764,7 +816,7 @@ function renderDedaoCourseDetail() {
             <div><dt>更新</dt><dd>${escapeHTML(info.current_article_count || articles.length || "-")}/${escapeHTML(info.phase_num || "-")}</dd></div>
             <div><dt>学习人数</dt><dd>${escapeHTML(info.learn_user_count || "-")}</dd></div>
           </dl>
-          <a class="button button-primary" href="/book-knowledge?query=${encodeURIComponent(info.name || "")}">在知识库中检索</a>
+          <a class="button button-primary" href="${escapeAttribute(`${ROUTES.knowledgePackages}?query=${encodeURIComponent(info.name || "")}`)}">在知识库中检索</a>
         </aside>
         <section class="dedao-course-detail__articles">
           <div class="dedao-home__section-head">
@@ -799,7 +851,7 @@ function renderDedaoCourseArticles(route = getDedaoCourseRoute()) {
   renderShell(`
     <main class="dedao-course-detail">
       <section class="dedao-course-detail__header">
-        <a class="button button-ghost" href="/course">返回课程</a>
+        <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoCourses)}">返回课程</a>
         <div>
           <p class="web-kicker">得到课程目录</p>
           <h1>${escapeHTML(title)}</h1>
@@ -815,7 +867,7 @@ function renderDedaoCourseArticles(route = getDedaoCourseRoute()) {
             <div><dt>EnID</dt><dd>${escapeHTML(route?.enid || info.enid || "-")}</dd></div>
             <div><dt>目录</dt><dd>${escapeHTML(articles.length || route?.total || "-")} 篇</dd></div>
           </dl>
-          ${route?.enid || info.enid ? `<a class="button button-ghost" href="/course/detail/${encodeURIComponent(route?.enid || info.enid)}">课程详情</a>` : ""}
+          ${route?.enid || info.enid ? `<a class="button button-ghost" href="${escapeAttribute(buildDedaoCourseDetailURL(route?.enid || info.enid))}">课程详情</a>` : ""}
         </aside>
         <section class="dedao-course-detail__articles">
           <div class="dedao-home__section-head">
@@ -1140,7 +1192,7 @@ function renderBookKnowledge() {
                 <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
                 <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
               </div>
-              <a class="button button-primary" href="/ebook/${encodeURIComponent(currentBook.book_id)}">阅读</a>
+              <a class="button button-primary" href="${escapeAttribute(buildDedaoEbookURL(currentBook.book_id))}">阅读</a>
             </div>
             <div class="knowledge-web__stats">
               <span>${(pkg.chapters || []).length} 章</span>
@@ -1956,7 +2008,7 @@ function sourceRunStatusClass(status) {
 }
 
 function sourceKnowledgeURL(bookID) {
-  return `/book-knowledge/${encodeURIComponent(String(bookID || "").trim())}`;
+  return buildKnowledgePackageURL(String(bookID || "").trim());
 }
 
 function formatSourceControlTime(value) {
@@ -4377,7 +4429,8 @@ function formatArticleTime(value) {
 }
 
 async function boot() {
-  if (window.location.pathname === "/" || window.location.pathname === "/home") {
+  const routePathname = getRoutePathname();
+  if (window.location.pathname === "/" || routePathname === ROUTES.dedaoHome) {
     renderDedaoHome();
     await loadDedaoHome();
     return;
@@ -4394,17 +4447,17 @@ async function boot() {
     await loadDedaoCourseArticles(dedaoCourseRoute);
     return;
   }
-  if (window.location.pathname.startsWith("/course")) {
+  if (routePathname === ROUTES.dedaoCourses) {
     renderDedaoCourses();
     await loadDedaoCourses();
     return;
   }
-  if (window.location.pathname === "/ebook") {
+  if (routePathname === ROUTES.dedaoEbooks) {
     renderDedaoEbooks();
     await loadDedaoLibrary("ebook");
     return;
   }
-  if (window.location.pathname.startsWith("/odob")) {
+  if (routePathname === ROUTES.dedaoAudio || routePathname.startsWith(`${ROUTES.dedaoAudio}/`)) {
     renderDedaoOdob();
     await loadDedaoLibrary("odob");
     return;
@@ -4419,7 +4472,7 @@ async function boot() {
     await bootstrapSourceControlPlane();
     return;
   }
-  if (window.location.pathname.startsWith("/book-knowledge")) {
+  if (routePathname === ROUTES.knowledgePackages || routePathname.startsWith(`${ROUTES.knowledgePackages}/`)) {
     renderBookKnowledge();
     await loadBookKnowledge();
     return;

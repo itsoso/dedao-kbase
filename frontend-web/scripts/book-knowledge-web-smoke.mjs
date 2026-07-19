@@ -24,12 +24,12 @@ for (const marker of [
   "refreshBrowserSessionToken",
   "loadBookKnowledge",
   "searchBookKnowledge",
-  'window.location.pathname === "/home"',
-  'window.location.pathname.startsWith("/course")',
+  "routePathname === ROUTES.dedaoHome",
+  "routePathname === ROUTES.dedaoCourses",
   'getDedaoCourseDetailEnID()',
   'getDedaoCourseRoute()',
-  'window.location.pathname === "/ebook"',
-  'window.location.pathname.startsWith("/book-knowledge")',
+  "routePathname === ROUTES.dedaoEbooks",
+  "routePathname === ROUTES.knowledgePackages",
 ]) {
   assert.ok(js.includes(marker), `app.js should include ${marker}`);
 }
@@ -52,6 +52,22 @@ for (const endpoint of [
   "/publish",
 ]) {
   assert.ok(js.includes(endpoint), `book knowledge web UI should call ${endpoint}`);
+}
+
+for (const marker of [
+  "ROUTES",
+  "legacyRouteAliases",
+  "buildDedaoCourseURL",
+  "buildDedaoCourseDetailURL",
+  "buildDedaoEbookURL",
+  "buildKnowledgePackageURL",
+  "resolveCanonicalRoute",
+  "/sources/dedao/courses",
+  "/sources/dedao/ebooks",
+  "/knowledge/packages",
+  "/delivery/health/releases",
+]) {
+  assert.ok(js.includes(marker), `route contract should include ${marker}`);
 }
 
 for (const authMarker of [
@@ -88,16 +104,16 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
-assert.ok(js.includes('href="/home"'), "navigation should include the Dedao home page");
-assert.ok(js.includes('href="/course"'), "navigation should include the Dedao course page");
-assert.ok(js.includes('href="/ebook"'), "navigation should include the subscribed ebook page");
+assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
+assert.ok(js.includes('"/course": ROUTES.dedaoCourses'), "legacy course alias should be preserved");
+assert.ok(js.includes('"/ebook": ROUTES.dedaoEbooks'), "legacy ebook alias should be preserved");
 assert.ok(js.includes("得到首页"), "Dedao home should be restored");
 assert.ok(js.includes("得到课程"), "Dedao course page should be restored");
 assert.ok(js.includes("得到电子书"), "Dedao ebook page should be restored");
 assert.ok(js.includes("继续学习"), "Dedao course page should expose study actions");
-assert.ok(js.includes('`/course/${encodeURIComponent(courseID)}'), "subscribed course cards should link to desktop-style numeric course pages");
-assert.ok(js.includes('`/course/detail/${encodeURIComponent(enid)}`'), "subscribed course details should use the explicit detail route");
-assert.ok(js.includes('href="/ebook/${encodeURIComponent(currentBook.book_id)}"'), "book details should link to the reader");
+assert.ok(js.includes('`${ROUTES.dedaoCourses}/${encodeURIComponent(courseID)}'), "subscribed course cards should link to canonical numeric course pages");
+assert.ok(js.includes('`${ROUTES.dedaoCourses}/detail/${encodeURIComponent(enid)}`'), "subscribed course details should use the explicit canonical detail route");
+assert.ok(js.includes('buildDedaoEbookURL(currentBook.book_id)'), "book details should link to the canonical reader");
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");
 assert.ok(js.includes("Qwen-3.7-Max"), "book knowledge analysis should default to Qwen-3.7-Max");
