@@ -888,6 +888,11 @@
       "line": 88
     },
     {
+      "name": "AgentTraceOTLPEnvelope",
+      "file": "backend/app/agent_trace.go",
+      "line": 402
+    },
+    {
       "name": "BookAnalysisManifest",
       "file": "backend/app/book_analysis.go",
       "line": 53
