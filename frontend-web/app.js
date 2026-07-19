@@ -13,6 +13,7 @@ const ROUTES = Object.freeze({
   dedaoAudio: "/sources/dedao/audio",
   knowledgePackages: "/knowledge/packages",
   healthReleases: "/delivery/health/releases",
+  jobs: "/jobs",
 });
 
 const legacyRouteAliases = Object.freeze({
@@ -88,6 +89,13 @@ const wcplusState = {
   importedPackages: [],
   loading: "",
   message: "",
+};
+
+const jobCenterState = {
+  tasks: [],
+  loading: "",
+  message: "",
+  lastUpdated: "",
 };
 
 const dedaoLibraryState = {
@@ -525,6 +533,7 @@ function renderShell(content, current = "") {
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
+        <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
       </nav>
     </header>
     ${content}
@@ -915,6 +924,108 @@ async function loadDedaoCourseArticles(route) {
   }
 }
 
+function jobStatusLabel(status) {
+  return ({
+    queued: "排队中",
+    pending: "等待中",
+    running: "运行中",
+    processing: "处理中",
+    ready: "已就绪",
+    succeeded: "已完成",
+    success: "已完成",
+    completed: "已完成",
+    failed: "失败",
+    error: "失败",
+    canceled: "已取消",
+  })[String(status || "").toLowerCase()] || status || "未知";
+}
+
+function jobStatusClass(status) {
+  const value = String(status || "unknown").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  return `is-${value || "unknown"}`;
+}
+
+function normalizeJobTask(task, source = "wcplus") {
+  const taskID = String(task?.task_id || task?.id || task?.biz || task?.nickname || "").trim();
+  const progress = [];
+  if (task?.article_total) {
+    progress.push(`正文 ${task.article_finished || 0}/${task.article_total}`);
+  }
+  if (task?.reading_total) {
+    progress.push(`阅读 ${task.reading_finished || 0}/${task.reading_total}`);
+  }
+  return {
+    id: taskID || `${source}-${Math.random().toString(36).slice(2)}`,
+    source,
+    title: task?.nickname || task?.biz || taskID || "未命名任务",
+    operation: task?.crawler_type || task?.operation || source,
+    status: task?.status || "unknown",
+    progress: progress.join(" · "),
+    error: task?.status_error || task?.error || task?.message || "",
+    updatedAt: task?.updated_at || task?.update_time || task?.created_at || "",
+    sourceURL: "/wcplus-source",
+    raw: task || {},
+  };
+}
+
+function renderJobCenter() {
+  const tasks = Array.isArray(jobCenterState.tasks) ? jobCenterState.tasks : [];
+  const rows = tasks.map((task) => `
+    <article class="job-card ${escapeAttribute(jobStatusClass(task.status))}">
+      <div class="job-card__main">
+        <span class="job-card__source">${escapeHTML(task.source)}</span>
+        <h2>${escapeHTML(task.title)}</h2>
+        <p>${escapeHTML([task.operation, task.progress].filter(Boolean).join(" · ") || "暂无进度")}</p>
+        ${task.error ? `<small class="job-card__error">${escapeHTML(task.error)}</small>` : ""}
+      </div>
+      <div class="job-card__meta">
+        <span class="job-card__status ${escapeAttribute(jobStatusClass(task.status))}">${escapeHTML(jobStatusLabel(task.status))}</span>
+        ${task.updatedAt ? `<small>${escapeHTML(task.updatedAt)}</small>` : ""}
+        <a class="button button-ghost" href="${escapeAttribute(task.sourceURL)}">打开来源</a>
+      </div>
+    </article>
+  `).join("");
+
+  renderShell(`
+    <main class="job-center">
+      <section class="job-center__toolbar">
+        <div>
+          <p class="web-kicker">Jobs</p>
+          <h1>任务中心</h1>
+          <p>统一查看采集、下载、入库、分析和供给任务。当前已接入 WC Plus 下载任务。</p>
+        </div>
+        <button class="button button-primary" type="button" data-action="reload-job-center" ${jobCenterState.loading ? "disabled" : ""}>
+          ${jobCenterState.loading ? "加载中" : "刷新任务"}
+        </button>
+      </section>
+      ${jobCenterState.message ? `<p class="web-status">${escapeHTML(jobCenterState.message)}</p>` : ""}
+      ${jobCenterState.lastUpdated ? `<p class="web-muted">最后更新：${escapeHTML(jobCenterState.lastUpdated)}</p>` : ""}
+      <section class="job-center__grid">
+        ${rows || "<p class=\"web-muted\">暂无任务。先从来源控制或得到内容页创建下载、同步或入库任务。</p>"}
+      </section>
+    </main>
+  `, "jobs");
+
+  app.querySelector("[data-action='reload-job-center']")?.addEventListener("click", () => loadJobCenter());
+}
+
+async function loadJobCenter() {
+  jobCenterState.loading = "loading";
+  jobCenterState.message = "";
+  renderJobCenter();
+  try {
+    const payload = await apiFetch("/api/wcplus/task/all");
+    const wcplusTasks = Array.isArray(payload.tasks) ? payload.tasks.map((task) => normalizeJobTask(task, "wcplus")) : [];
+    jobCenterState.tasks = wcplusTasks;
+    jobCenterState.lastUpdated = new Date().toLocaleString("zh-CN");
+    jobCenterState.message = wcplusTasks.length ? `已加载 ${wcplusTasks.length} 个任务。` : "暂无 WC Plus 任务。";
+  } catch (error) {
+    jobCenterState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    jobCenterState.loading = "";
+    renderJobCenter();
+  }
+}
 
 function knowledgeReviewLatestTask() {
   const tasks = Array.isArray(knowledgeState.reverificationTasks) ? knowledgeState.reverificationTasks : [];
@@ -4433,6 +4544,11 @@ async function boot() {
   if (window.location.pathname === "/" || routePathname === ROUTES.dedaoHome) {
     renderDedaoHome();
     await loadDedaoHome();
+    return;
+  }
+  if (routePathname === ROUTES.jobs || routePathname.startsWith(`${ROUTES.jobs}/`)) {
+    renderJobCenter();
+    await loadJobCenter();
     return;
   }
   const dedaoCourseEnID = getDedaoCourseDetailEnID();

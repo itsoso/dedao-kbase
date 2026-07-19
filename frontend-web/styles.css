@@ -501,6 +501,115 @@ a.button {
   font-weight: 700;
 }
 
+.job-center {
+  width: min(1480px, calc(100% - 40px));
+  margin: 0 auto;
+  padding: 24px 0 42px;
+}
+
+.job-center__toolbar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+  padding: 18px;
+  border: 1px solid rgba(141, 132, 117, 0.2);
+  border-radius: 12px;
+  background: rgba(255, 253, 248, 0.74);
+}
+
+.job-center__toolbar h1 {
+  margin: 0;
+  font-size: clamp(28px, 3vw, 42px);
+}
+
+.job-center__toolbar p:not(.web-kicker) {
+  margin: 8px 0 0;
+  color: #81796b;
+  line-height: 1.7;
+}
+
+.job-center__grid {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.job-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid rgba(141, 132, 117, 0.22);
+  border-radius: 12px;
+  background: #fffdf8;
+}
+
+.job-card__main h2 {
+  margin: 4px 0 6px;
+  font-size: 18px;
+}
+
+.job-card__main p,
+.job-card__meta small {
+  margin: 0;
+  color: #8d8475;
+  font-size: 13px;
+}
+
+.job-card__source,
+.job-card__status {
+  display: inline-flex;
+  width: fit-content;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgba(141, 132, 117, 0.12);
+  color: #6f6659;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.job-card__status.is-running,
+.job-card__status.is-queued,
+.job-card__status.is-pending,
+.job-card__status.is-processing {
+  background: rgba(255, 107, 0, 0.12);
+  color: #b65300;
+}
+
+.job-card__status.is-failed,
+.job-card__status.is-error {
+  background: rgba(191, 72, 54, 0.12);
+  color: #9a3324;
+}
+
+.job-card__status.is-succeeded,
+.job-card__status.is-success,
+.job-card__status.is-completed,
+.job-card__status.is-ready {
+  background: rgba(44, 122, 107, 0.12);
+  color: #2c6b5f;
+}
+
+.job-card__error {
+  display: block;
+  margin-top: 8px;
+  color: #9a3324;
+  line-height: 1.55;
+}
+
+.job-card__meta {
+  display: flex;
+  min-width: 132px;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
 .wechat-source {
   width: min(1680px, calc(100% - 40px));
   margin: 0 auto;

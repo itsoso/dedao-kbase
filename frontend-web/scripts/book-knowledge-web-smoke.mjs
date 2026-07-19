@@ -62,10 +62,15 @@ for (const marker of [
   "buildDedaoEbookURL",
   "buildKnowledgePackageURL",
   "resolveCanonicalRoute",
+  "renderJobCenter",
+  "loadJobCenter",
+  "normalizeJobTask",
+  "jobCenterState",
   "/sources/dedao/courses",
   "/sources/dedao/ebooks",
   "/knowledge/packages",
   "/delivery/health/releases",
+  "/jobs",
 ]) {
   assert.ok(js.includes(marker), `route contract should include ${marker}`);
 }
@@ -97,6 +102,9 @@ for (const className of [
   ".knowledge-web__layout",
   ".knowledge-web__sidebar",
   ".knowledge-web__main",
+  ".job-center",
+  ".job-card",
+  ".job-card__status",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
