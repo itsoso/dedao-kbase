@@ -1044,7 +1044,7 @@ function renderDedaoCourseArticle(route = getDedaoCourseArticleRoute()) {
       ${dedaoLibraryState.courseArticleLoading ? `<p class="web-status">正在加载课程正文...</p>` : ""}
       ${dedaoLibraryState.courseArticleMessage ? `<p class="web-status">${escapeHTML(dedaoLibraryState.courseArticleMessage)}</p>` : ""}
       <article class="knowledge-web__answer dedao-course-article__body">
-        ${markdown ? renderSimpleMarkdown(markdown) : "<p>暂无正文。</p>"}
+        ${markdown ? renderCourseMarkdown(markdown) : "<p>暂无正文。</p>"}
       </article>
     </main>
   `, "course");
@@ -1566,6 +1566,47 @@ function renderSimpleMarkdown(markdown) {
     if (/^#{1,4}\s+/.test(block)) {
       const level = Math.min(4, block.match(/^#+/)?.[0]?.length || 3);
       return `<h${level}>${renderInlineMarkdown(block.replace(/^#{1,4}\s+/, ""))}</h${level}>`;
+    }
+    const lines = block.split(/\n/).filter(Boolean);
+    if (lines.length && lines.every((line) => /^[-*]\s+/.test(line))) {
+      const items = lines.map((line) => line.replace(/^[-*]\s+/, ""));
+      return `<ul>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`;
+    }
+    if (lines.length && lines.every((line) => /^\d+\.\s+/.test(line))) {
+      const items = lines.map((line) => line.replace(/^\d+\.\s+/, ""));
+      return `<ol>${items.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ol>`;
+    }
+    if (lines.length && lines.every((line) => /^>\s?/.test(line))) {
+      return `<blockquote>${lines.map((line) => renderInlineMarkdown(line.replace(/^>\s?/, ""))).join("<br>")}</blockquote>`;
+    }
+    return `<p>${lines.map((line) => renderInlineMarkdown(line)).join("<br>")}</p>`;
+  }).join("");
+}
+
+function renderCourseMarkdown(markdown) {
+  const source = String(markdown || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const blocks = source.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+  if (!blocks.length) {
+    return "";
+  }
+  return blocks.map((block) => {
+    if (/^(?:-{3,}|\*{3,}|_{3,}|✵)$/.test(block)) {
+      return `<hr class="dedao-course-article__divider">`;
+    }
+    const imageMatch = block.match(/^!\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)$/i);
+    if (imageMatch) {
+      const alt = imageMatch[1] || "";
+      const src = imageMatch[2] || "";
+      return `
+        <figure class="dedao-course-article__image">
+          <img src="${escapeAttribute(src)}" alt="${escapeAttribute(alt)}" loading="lazy">
+          ${alt && alt !== src ? `<figcaption>${escapeHTML(alt)}</figcaption>` : ""}
+        </figure>
+      `;
+    }
+    if (/^#{1,6}\s+/.test(block)) {
+      const level = Math.min(4, block.match(/^#+/)?.[0]?.length || 2);
+      return `<h${level}>${renderInlineMarkdown(block.replace(/^#{1,6}\s+/, ""))}</h${level}>`;
     }
     const lines = block.split(/\n/).filter(Boolean);
     if (lines.length && lines.every((line) => /^[-*]\s+/.test(line))) {

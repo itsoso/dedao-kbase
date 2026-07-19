@@ -16,6 +16,7 @@ for (const marker of [
   "renderDedaoCourseDetail",
   "renderDedaoCourseArticles",
   "renderDedaoCourseArticle",
+  "renderCourseMarkdown",
   "loadDedaoCourseDetail",
   "loadDedaoCourseArticles",
   "loadMoreDedaoCourseArticles",
@@ -129,6 +130,7 @@ assert.ok(js.includes('`${ROUTES.dedaoCourses}/${encodeURIComponent(courseID)}/a
 assert.ok(js.includes('`${ROUTES.dedaoCourses}/detail/${encodeURIComponent(enid)}`'), "subscribed course details should use the explicit canonical detail route");
 assert.ok(js.includes("加载更多"), "course detail should load more than the first page of articles");
 assert.ok(js.includes("课程正文"), "course article reader should render article body");
+assert.ok(js.includes("dedao-course-article__image"), "course article reader should render markdown images as images");
 assert.ok(js.includes('buildDedaoEbookURL(currentBook.book_id)'), "book details should link to the canonical reader");
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");
