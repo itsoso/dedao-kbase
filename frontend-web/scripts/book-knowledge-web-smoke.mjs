@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 for (const marker of [
   "renderDedaoHome",
@@ -72,6 +73,8 @@ for (const className of [
 }
 
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
+assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
+assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
 assert.ok(js.includes('href="/home"'), "navigation should include the Dedao home page");
 assert.ok(js.includes('href="/course"'), "navigation should include the Dedao course page");
 assert.ok(js.includes("得到首页"), "Dedao home should be restored");

@@ -894,6 +894,11 @@ func (h *kbaseHTTPHandler) serveStatic(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if fileInfo, err := os.Stat(filePath); err == nil && !fileInfo.IsDir() {
+		if strings.EqualFold(filepath.Base(filePath), "index.html") {
+			w.Header().Set("Cache-Control", "no-store")
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+		}
 		http.ServeFile(w, r, filePath)
 		return
 	}
@@ -907,6 +912,7 @@ func (h *kbaseHTTPHandler) serveStatic(w http.ResponseWriter, r *http.Request) {
 		writeHTTPError(w, http.StatusNotFound, "not found")
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	http.ServeFile(w, r, indexPath)
 }
 

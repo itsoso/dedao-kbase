@@ -883,6 +883,9 @@ func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	if !strings.Contains(indexResp.Body.String(), `reader-loading`) {
 		t.Fatalf("index response missing reader shell: %s", indexResp.Body.String())
 	}
+	if got := indexResp.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("index Cache-Control = %q, want no-store", got)
+	}
 
 	assetResp := requestKBase(handler, http.MethodGet, "/assets/app.js", "")
 	if assetResp.Code != http.StatusOK {
@@ -890,6 +893,9 @@ func TestKBaseHTTPHandlerServesWebAssets(t *testing.T) {
 	}
 	if !strings.Contains(assetResp.Body.String(), `console.log`) {
 		t.Fatalf("asset response missing script: %s", assetResp.Body.String())
+	}
+	if got := assetResp.Header().Get("Cache-Control"); !strings.Contains(got, "no-cache") {
+		t.Fatalf("asset Cache-Control = %q, want no-cache", got)
 	}
 
 	readerRouteResp := requestKBase(handler, http.MethodGet, "/ebook/42", "")
