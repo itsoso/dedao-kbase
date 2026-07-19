@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** G3 revalidation pending after Health safety GO; no push or deployment
+**Status:** G3 PASS on current heads; fresh G4 review pending; no push or deployment
 
 ## Objective
 
@@ -27,14 +27,12 @@ prescription or dosage decisions, and personal-data write tools.
   package/runtime/tool/evaluation separation. Paid-source usage policy,
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
-- **G3 Test: REVALIDATION PENDING.** The earlier full matrix passed, and the
-  final Health remediation passed its complete consumer matrix. The full
-  three-repository matrix must now be rerun on the exact current heads.
-- **G4 Review: NO-GO.** Independent architecture and cross-consumer safety
-  review findings have been remediated through the package runtime, Proofroom,
-  and Health review paths, and the mandatory Health-specific safety review now
-  returns GO. Fresh architecture and cross-consumer G4 reviews remain required
-  after G3 passes. No push or deployment is permitted yet.
+- **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed on
+  current heads `30c5b30`, `c6618c3d`, and `bff01c3b2` respectively.
+- **G4 Review: RE-REVIEW PENDING.** All findings from the prior NO-GO have been
+  returned upstream and remediated, and the mandatory Health-specific safety
+  review now returns GO. Fresh architecture and cross-consumer reviews must
+  independently pass before any push or deployment.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -656,6 +654,52 @@ review, finalize, and publish; preservation of the fixed child during parent
 replacement; rejection of arbitrary and escaping workspace paths; and no
 serving, personal-health, diagnosis, prescription, dosage, or tool-execution
 mutation before Health-owned review and explicit publication.
+
+## Task 10 checkpoint: G3 revalidation
+
+**Decision: PASS on the exact current three-repository heads.** G4 remains a
+separate pending Gate. No branch was pushed and no deployment was attempted.
+
+Verified revisions:
+
+- KBase: `30c5b30`;
+- Proofroom: `c6618c3d`;
+- Health: `bff01c3b2`.
+
+Exact commands and results:
+
+- `go test ./...` in KBase — PASS;
+- `npm run build` in `frontend/` — PASS. Vite reported existing bundle-size
+  and dependency `eval` warnings but returned success after transforming and
+  rendering the production bundle;
+- `node --check frontend-web/app.js` and every
+  `frontend-web/scripts/*.mjs` smoke — PASS;
+- `bash scripts/knowledge-contract-smoke.sh`,
+  `bash scripts/knowledge-eval-smoke.sh`,
+  `bash scripts/proof-consumer-contract-smoke.sh`,
+  `bash scripts/health-evidence-smoke.sh`,
+  `bash scripts/source-agent-packaging-smoke.sh`, and
+  `bash scripts/wcplus-agent-packaging-smoke.sh` — PASS;
+- `jq empty contracts/agent-package-v1.schema.json contracts/agent-evaluation-v1.schema.json contracts/agent-trace-v1.schema.json`
+  — PASS;
+- Proofroom's six-suite command covering package consumption, decision engine,
+  claim-verifier routing and quota/cache, knowledge runtime, and legacy KBase
+  sync — PASS, `128 passed in 8.53s`;
+- Proofroom `python -m py_compile` over its four changed Python files — PASS;
+- the eleven-file Health release matrix — PASS,
+  `225 passed, 6 warnings in 33.41s`;
+- Health `python -m py_compile` over the seven changed Python files, `ruff
+  check` over the normal changed files, and `ruff check --ignore E402` over the
+  large service module — PASS;
+- `python scripts/check_doc_drift.py` in Health and
+  `bash scripts/system-map-smoke.sh` in KBase — PASS. No structural source
+  inventory changed after the last generated artifacts, so neither system map
+  was regenerated;
+- `bash scripts/privacy-smoke.sh` in KBase — PASS. Proofroom and Health have no
+  privacy-smoke script; their branch added-line scans found no machine path,
+  credential, key, or token literal;
+- `git diff --check` — PASS in all three repositories, and all three worktrees
+  were clean after verification.
 
 ## Decisions
 
