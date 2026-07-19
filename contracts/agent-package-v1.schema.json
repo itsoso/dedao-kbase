@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/agent-package-v1.schema.json",
+  "title": "KBase Agent Package v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "package_id",
+    "version",
+    "content_hash",
+    "lifecycle_state",
+    "releases",
+    "retrieval_policy",
+    "model_policy",
+    "prompt_profiles",
+    "tool_policy",
+    "safety_policy",
+    "evaluation_policy",
+    "ui_manifest"
+  ],
+  "properties": {
+    "schema_version": { "const": "agent-package.v1" },
+    "package_id": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$" },
+    "version": { "type": "string", "minLength": 1 },
+    "content_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "lifecycle_state": { "enum": ["draft", "published", "superseded"] },
+    "supersedes": { "type": "string", "minLength": 1 },
+    "releases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["release_id", "content_hash", "citation_ids"],
+        "properties": {
+          "release_id": { "type": "string", "minLength": 1 },
+          "content_hash": { "type": "string", "minLength": 1 },
+          "citation_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "retrieval_policy": {
+      "type": "object",
+      "required": ["strategy", "allowed_source_types", "require_citations", "max_context_chunks"],
+      "properties": {
+        "strategy": { "enum": ["lexical", "vector", "hybrid", "graph"] },
+        "allowed_source_types": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "require_citations": { "const": true },
+        "max_context_chunks": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "model_policy": {
+      "type": "object",
+      "required": ["preferred_capability", "max_cost_usd", "timeout_ms"],
+      "properties": {
+        "preferred_capability": { "type": "string", "minLength": 1 },
+        "fallbacks": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "max_cost_usd": { "type": "number", "minimum": 0 },
+        "timeout_ms": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "prompt_profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["profile_id", "output_schema"],
+        "properties": {
+          "profile_id": { "type": "string", "minLength": 1 },
+          "output_schema": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "tool_policy": {
+      "type": "object",
+      "required": ["tools"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["mcp_server", "tool_name", "decision"],
+            "properties": {
+              "mcp_server": { "type": "string", "minLength": 1 },
+              "tool_name": { "type": "string", "minLength": 1 },
+              "decision": { "enum": ["allow", "require_confirmation", "block"] }
+            }
+          }
+        }
+      }
+    },
+    "safety_policy": {
+      "type": "object",
+      "required": ["usage_policy", "abstention_reasons", "escalation_target"],
+      "properties": {
+        "usage_policy": { "enum": ["standard", "evidence_only"] },
+        "abstention_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "escalation_target": { "type": "string", "minLength": 1 }
+      }
+    },
+    "evaluation_policy": {
+      "type": "object",
+      "required": ["suite_version", "minimum_scores"],
+      "properties": {
+        "suite_version": { "type": "string", "minLength": 1 },
+        "minimum_scores": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+        }
+      }
+    },
+    "ui_manifest": {
+      "type": "object",
+      "required": ["capabilities"],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]
+          }
+        }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "published_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": true
+}

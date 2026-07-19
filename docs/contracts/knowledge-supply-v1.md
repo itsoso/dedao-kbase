@@ -4,6 +4,25 @@ KBase is the authoring and release plane. Consumers import only published
 knowledge releases, run their own domain review, and serve from their own
 reviewed indexes.
 
+## Agent Packages
+
+An Agent Package binds immutable published knowledge releases to retrieval,
+model, prompt-profile, tool, safety, evaluation, and shared-UI policies. The
+manifest follows `contracts/agent-package-v1.schema.json` and uses
+`schema_version: agent-package.v1`.
+
+Every release reference must include the published `release_id`, its pinned
+`content_hash`, and resolvable `citation_ids`. Package validation rejects
+unpublished or changed releases, missing citations, unknown MCP tools, missing
+abstention rules, invalid evaluation thresholds, and undeclared UI
+capabilities. Package content hashes include identity, release pins, and policy
+content, but exclude mutable lifecycle timestamps so the same artifact can be
+replayed after publication.
+
+Package manifests contain prompt profile and output-schema identifiers, not
+private prompt bodies. They do not transfer downloaded source bodies,
+credentials, consumer user data, or consumer-owned review decisions.
+
 ## Pull Feed
 
 Use:

@@ -834,6 +834,16 @@
   ],
   "durable_objects": [
     {
+      "name": "AgentPackage",
+      "file": "backend/app/agent_package.go",
+      "line": 23
+    },
+    {
+      "name": "AgentPackageUIManifest",
+      "file": "backend/app/agent_package.go",
+      "line": 88
+    },
+    {
       "name": "BookAnalysisManifest",
       "file": "backend/app/book_analysis.go",
       "line": 53
