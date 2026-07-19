@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** Delivery in progress; Tasks 1-6 checkpoints passed
+**Status:** Delivery in progress; Tasks 1-7 checkpoints passed
 
 ## Objective
 
@@ -147,6 +147,85 @@ Exact commands and results:
 - `git diff --check` — PASS in both feature worktrees.
 
 Proofroom commit: `7adc63fb feat(kbase): consume agent packages for proof`.
+
+## Checkpoint: Task 7
+
+**Decision: PASS after an initial independent NO-GO and two corrective
+reviews.** Health imports only evidence-only packages into an isolated draft
+workspace; its serving, domain review, and safety ownership remain outside
+KBase. G3 remains pending until traces, replay, the shared Book App, and the
+full release suites pass. No deployment was attempted.
+
+Delivered:
+
+- KBase package detail responses now include the persisted evaluation report
+  and fail closed if the matching publication-gate evidence is unavailable;
+- Health verifies evaluation identity, suite, input hash, evaluator version,
+  timestamp, passing status, and required threshold metrics rather than
+  inferring a pass from publication state;
+- stale, conflicting, unevaluated, and non-evidence-only packages remain held;
+- package imports write only draft review artifacts and audit receipts, never
+  the serving index or personal health state;
+- fingerprinted cursor handling selects cumulative incremental sync or a full
+  immutable replay when the workspace is missing, stale, or based on a changed
+  canonical seed;
+- the explicit, unscheduled Agent Package task uses a separate
+  `agent-packages` review workspace;
+- package lineage is preserved across overlapping packages in the same batch
+  and across later incremental batches, including artifact rows and both
+  manifests.
+
+TDD and review trail:
+
+- the first interface suite was RED with seven missing Agent Package consumer
+  behaviors, then GREEN with `43 passed`;
+- the first independent safety review returned NO-GO because missing
+  evaluation evidence was treated as passed, a later batch could replace
+  unreviewed drafts while advancing the cursor, and overlapping packages lost
+  lineage;
+- producer and consumer regressions were added before the fixes; focused KBase
+  tests and the Health suite returned GREEN;
+- the second review returned NO-GO for one remaining case: two overlapping
+  packages arriving in separate `limit=1` calls;
+- that exact regression failed with only the first package in the final claim
+  lineage, then passed after existing and generated rows were merged by release;
+- the final independent safety review returned GO and confirmed no serving
+  import, diagnosis, prescription, dosage, tool execution, or personal-data
+  write.
+
+Exact final commands and results:
+
+- `go test ./backend/app -run 'AgentPackage|KBaseHTTPHandlerPublishesAndReadsAgentPackages' -count=1`
+  — PASS.
+- `go test ./...` — PASS.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` —
+  PASS; regenerated because the HTTP source locations tracked by the generated
+  inventory changed.
+- `bash scripts/system-map-smoke.sh` — PASS.
+- `python -m pytest backend/tests/test_dedao_kbase_release_consumer.py -q`
+  (from the isolated Health worktree and its project virtual environment) —
+  PASS, `48 passed, 6 warnings in 30.47s`.
+- `python -m pytest -o addopts='' -q backend/tests/test_dedao_kbase_release_consumer.py backend/tests/test_dedao_kbase_export_importer.py backend/tests/test_system_knowledge_lifecycle.py backend/tests/test_system_knowledge_ingest.py backend/tests/test_kb_reconciliation.py backend/tests/test_kb_reconciliation_e2e.py backend/tests/test_kb_reconciliation_evalcase.py backend/tests/test_kb_reconciliation_judge.py backend/tests/test_kb_reconciliation_merge.py backend/tests/test_safety_failloud_consumers.py`
+  — PASS, `176 passed, 6 warnings in 25.96s`.
+- `ruff check backend/app/integrations/dedao_kbase_release_consumer.py backend/app/tasks/system_knowledge_lifecycle.py backend/tests/test_dedao_kbase_release_consumer.py`
+  — PASS.
+- `python -m py_compile backend/app/integrations/dedao_kbase_release_consumer.py backend/app/tasks/system_knowledge_lifecycle.py backend/tests/test_dedao_kbase_release_consumer.py`
+  — PASS.
+- `python scripts/check_doc_drift.py` — PASS; structural counts remained
+  consistent, so the Health system map was not regenerated after the
+  corrective edits.
+- `bash scripts/privacy-smoke.sh` — PASS before every KBase and cross-repository
+  feature commit; the Health diffs also passed a targeted path, credential, and
+  key scan.
+- `git diff --check` — PASS in both feature worktrees before each commit.
+
+KBase corrective commit: `fc6abc4 fix(kbase): expose package evaluation evidence`.
+
+Health commits:
+
+- `9ed97637a feat(kbase): hold health agent packages for review`;
+- `07cfa8eda fix(kbase): fail closed on health package review`;
+- `8463c3b61 fix(kbase): retain incremental package lineage`.
 
 ## Decisions
 
