@@ -2305,6 +2305,136 @@ a.button {
   color: #756c60;
 }
 
+.knowledge-pipeline {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+  border: 1px solid rgba(141, 132, 117, 0.16);
+  border-radius: 12px;
+  padding: 18px;
+  background: rgba(255, 253, 248, 0.86);
+}
+
+.knowledge-pipeline__head,
+.knowledge-pipeline__actions,
+.knowledge-pipeline__metrics,
+.knowledge-pipeline__item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.knowledge-pipeline__head {
+  justify-content: space-between;
+}
+
+.knowledge-pipeline__head h2 {
+  margin: 0;
+  color: #24231f;
+  font-size: 22px;
+}
+
+.knowledge-pipeline__actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.knowledge-pipeline__actions span {
+  color: #8d8475;
+  font-size: 13px;
+}
+
+.knowledge-pipeline__metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.knowledge-pipeline__metrics div {
+  border-radius: 10px;
+  padding: 12px;
+  background: rgba(255, 107, 0, 0.06);
+}
+
+.knowledge-pipeline__metrics span,
+.knowledge-pipeline__item span,
+.knowledge-pipeline__run small {
+  color: #8d8475;
+  font-size: 12px;
+}
+
+.knowledge-pipeline__metrics strong {
+  display: block;
+  margin-top: 4px;
+  color: #24231f;
+  font-size: 24px;
+}
+
+.knowledge-pipeline__items {
+  display: grid;
+  gap: 8px;
+}
+
+.knowledge-pipeline__item {
+  justify-content: space-between;
+  width: 100%;
+  border: 1px solid rgba(141, 132, 117, 0.14);
+  border-radius: 10px;
+  padding: 12px;
+  background: #fff;
+  text-align: left;
+}
+
+.knowledge-pipeline__item strong {
+  display: block;
+  color: #24231f;
+  font-size: 15px;
+}
+
+.knowledge-pipeline__stage {
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: rgba(141, 132, 117, 0.12);
+  color: #71675b;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.knowledge-pipeline__stage.is-needs_analysis,
+.knowledge-pipeline__stage.is-needs_quality {
+  background: rgba(255, 107, 0, 0.12);
+  color: #c75400;
+}
+
+.knowledge-pipeline__stage.is-ready_to_publish {
+  background: rgba(44, 122, 107, 0.12);
+  color: #2c6b5f;
+}
+
+.knowledge-pipeline__stage.is-blocked {
+  background: rgba(191, 72, 54, 0.12);
+  color: #9a3324;
+}
+
+.knowledge-pipeline__run {
+  border-radius: 10px;
+  padding: 12px;
+  background: rgba(44, 122, 107, 0.06);
+}
+
+.knowledge-pipeline__run ul {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.knowledge-pipeline__run li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+}
+
 .knowledge-review {
   margin: 0 0 18px;
   border-top: 1px solid rgba(141, 132, 117, 0.2);

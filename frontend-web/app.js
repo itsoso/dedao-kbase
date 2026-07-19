@@ -171,6 +171,12 @@ const knowledgeState = {
   reviewLoading: "",
   reviewError: "",
   reviewOperation: "",
+  pipelineDashboard: null,
+  pipelineLoading: "",
+  pipelineError: "",
+  pipelineAutomation: null,
+  pipelineAutomationLoading: "",
+  pipelineAutomationError: "",
   loading: "",
   message: "",
 };
@@ -1433,6 +1439,76 @@ function renderKnowledgeSupplyStatus(cockpit) {
   `;
 }
 
+function renderKnowledgePipelineDashboard() {
+  const dashboard = knowledgeState.pipelineDashboard || {};
+  const summary = dashboard.summary || {};
+  const items = Array.isArray(dashboard.items) ? dashboard.items : [];
+  const automation = knowledgeState.pipelineAutomation || {};
+  const status = knowledgeState.pipelineLoading || knowledgeState.pipelineError || `${Number(summary.total || 0)} 条内容`;
+  const rows = items.slice(0, 12).map((item) => `
+    <button class="knowledge-pipeline__item" type="button" data-pipeline-book-id="${escapeAttribute(item.book_id || "")}">
+      <div>
+        <strong>${escapeHTML(item.title || item.book_id || "未命名内容")}</strong>
+        <span>${escapeHTML([item.source_type || "source", item.source_account || ""].filter(Boolean).join(" · "))}</span>
+      </div>
+      <small class="knowledge-pipeline__stage is-${escapeAttribute(item.next_action || item.stage || "unknown")}">${escapeHTML(knowledgePipelineActionLabel(item.next_action || item.stage))}</small>
+    </button>
+  `).join("");
+  const runRows = Array.isArray(automation.items) ? automation.items.slice(0, 5).map((item) => `
+    <li>
+      <span>${escapeHTML(item.title || item.book_id)}</span>
+      <small>${escapeHTML(knowledgePipelineActionLabel(item.action))} · ${escapeHTML(item.status || "planned")}${item.next_action ? ` → ${escapeHTML(knowledgePipelineActionLabel(item.next_action))}` : ""}</small>
+    </li>
+  `).join("") : "";
+  return `
+    <section class="knowledge-pipeline" aria-label="知识流水线">
+      <div class="knowledge-pipeline__head">
+        <div>
+          <p class="web-kicker">Knowledge Pipeline</p>
+          <h2>知识流水线</h2>
+        </div>
+        <div class="knowledge-pipeline__actions">
+          <span>${escapeHTML(status)}</span>
+          <button id="knowledge-pipeline-refresh" class="button button-ghost" type="button">刷新</button>
+          <button id="knowledge-pipeline-preview" class="button button-ghost" type="button" ${knowledgeState.pipelineAutomationLoading ? "disabled" : ""}>预览推进</button>
+          <button id="knowledge-pipeline-run" class="button button-primary" type="button" ${knowledgeState.pipelineAutomationLoading ? "disabled" : ""}>${knowledgeState.pipelineAutomationLoading || "自动推进一次"}</button>
+        </div>
+      </div>
+      <div class="knowledge-pipeline__metrics">
+        <div><span>待分析</span><strong>${Number(summary.needs_analysis || 0)}</strong></div>
+        <div><span>待质检</span><strong>${Number(summary.needs_quality || 0)}</strong></div>
+        <div><span>可发布</span><strong>${Number(summary.ready_to_publish || 0)}</strong></div>
+        <div><span>已发布</span><strong>${Number(summary.published || 0)}</strong></div>
+        <div><span>阻塞</span><strong>${Number(summary.blocked || 0)}</strong></div>
+      </div>
+      ${knowledgeState.pipelineError ? `<p class="knowledge-cockpit__error">${escapeHTML(knowledgeState.pipelineError)}</p>` : ""}
+      <div class="knowledge-pipeline__items">
+        ${rows || "<p class=\"web-muted\">暂无流水线条目。</p>"}
+      </div>
+      ${knowledgeState.pipelineAutomationError ? `<p class="knowledge-cockpit__error">${escapeHTML(knowledgeState.pipelineAutomationError)}</p>` : ""}
+      ${automation.items ? `
+        <div class="knowledge-pipeline__run">
+          <strong>${automation.dry_run ? "预览结果" : "推进结果"}：eligible ${Number(automation.eligible || 0)} · processed ${Number(automation.processed || 0)} · failed ${Number(automation.failed || 0)}</strong>
+          <ul>${runRows || "<li><span>暂无可推进内容</span></li>"}</ul>
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
+function knowledgePipelineActionLabel(action) {
+  return ({
+    needs_analysis: "待分析",
+    needs_quality: "待质检",
+    ready_to_publish: "可发布",
+    published: "已发布",
+    blocked: "阻塞",
+    normalized: "已清洗",
+    analyzed: "已分析",
+    candidate: "候选",
+  })[String(action || "")] || action || "未知";
+}
+
 function renderBookKnowledge() {
   const bookRows = knowledgeState.books.map((book, index) => {
     const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
@@ -1476,6 +1552,7 @@ function renderBookKnowledge() {
   };
   const manifestActionLabel = analysisManifest.answer ? "重新生成" : "生成基线分析";
   const cockpitHTML = renderKnowledgeReviewCockpit();
+  const pipelineHTML = renderKnowledgePipelineDashboard();
 
   renderShell(`
     <main class="knowledge-web">
@@ -1488,6 +1565,7 @@ function renderBookKnowledge() {
       </section>
       ${status}
       ${cockpitHTML}
+      ${pipelineHTML}
 
       <div class="knowledge-web__layout">
         <aside class="knowledge-web__sidebar">
@@ -4529,6 +4607,26 @@ function bindBookKnowledgeEvents() {
     knowledgeState.reviewCockpitOpen = !knowledgeState.reviewCockpitOpen;
     renderBookKnowledge();
   });
+  document.querySelector("#knowledge-pipeline-refresh")?.addEventListener("click", () => {
+    loadKnowledgePipelineDashboard();
+  });
+  document.querySelector("#knowledge-pipeline-preview")?.addEventListener("click", async () => {
+    await runKnowledgePipelineAutomation({ dryRun: true });
+  });
+  document.querySelector("#knowledge-pipeline-run")?.addEventListener("click", async () => {
+    await runKnowledgePipelineAutomation({ dryRun: false });
+  });
+  for (const button of document.querySelectorAll("[data-pipeline-book-id]")) {
+    button.addEventListener("click", async () => {
+      const bookID = button.getAttribute("data-pipeline-book-id") || "";
+      const book = knowledgeState.books.find((item) => item.book_id === bookID);
+      if (!book) {
+        return;
+      }
+      window.history?.pushState?.({}, "", sourceKnowledgeURL(book.book_id));
+      await selectKnowledgeBook(book);
+    });
+  }
   for (const button of document.querySelectorAll("[data-cockpit-book-id]")) {
     button.addEventListener("click", async () => {
       const bookID = button.getAttribute("data-cockpit-book-id") || "";
@@ -4620,7 +4718,10 @@ async function loadBookKnowledge() {
   knowledgeState.message = "";
   renderBookKnowledge();
   try {
-    await loadKnowledgeReviewCockpit({ silent: true, renderResult: false });
+    await Promise.all([
+      loadKnowledgeReviewCockpit({ silent: true, renderResult: false }),
+      loadKnowledgePipelineDashboard({ silent: true, renderResult: false }),
+    ]);
     const payload = await apiFetch("/api/books");
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length) {
@@ -4641,6 +4742,52 @@ async function loadBookKnowledge() {
     knowledgeState.message = error instanceof Error ? error.message : String(error);
   } finally {
     knowledgeState.loading = "";
+    renderBookKnowledge();
+  }
+}
+
+async function loadKnowledgePipelineDashboard({ silent = false, renderResult = true } = {}) {
+  if (!silent) {
+    knowledgeState.pipelineLoading = "加载流水线";
+    knowledgeState.pipelineError = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
+  }
+  try {
+    knowledgeState.pipelineDashboard = await apiFetch("/api/knowledge/pipeline?limit=100");
+  } catch (error) {
+    knowledgeState.pipelineError = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.pipelineLoading = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
+  }
+}
+
+async function runKnowledgePipelineAutomation({ dryRun = false } = {}) {
+  knowledgeState.pipelineAutomationLoading = dryRun ? "预览中" : "推进中";
+  knowledgeState.pipelineAutomationError = "";
+  renderBookKnowledge();
+  try {
+    knowledgeState.pipelineAutomation = await apiFetch("/api/knowledge/pipeline/run", {
+      method: "POST",
+      body: JSON.stringify({
+        dry_run: dryRun,
+        limit: 5,
+        model: knowledgeState.analysisModel || "qwen3.7-max",
+        max_context_chars: 16000,
+      }),
+    });
+    await Promise.all([
+      loadKnowledgePipelineDashboard({ silent: true, renderResult: false }),
+      loadKnowledgeReviewCockpit({ silent: true, renderResult: false }),
+    ]);
+  } catch (error) {
+    knowledgeState.pipelineAutomationError = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.pipelineAutomationLoading = "";
     renderBookKnowledge();
   }
 }

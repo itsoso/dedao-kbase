@@ -267,6 +267,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgeReview(w, r)
 		return
 	}
+	if r.URL.Path == "/api/knowledge/pipeline" {
+		h.handleKnowledgePipeline(w, r)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/pipeline/run" {
+		h.handleKnowledgePipelineRun(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/releases" || strings.HasPrefix(r.URL.Path, "/api/knowledge/releases/") {
 		h.handleKnowledgeReleases(w, r)
 		return
@@ -1042,6 +1050,46 @@ func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *htt
 		nextCursor = releases[len(releases)-1].ReleaseID
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"releases": releases, "next_cursor": nextCursor})
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgePipeline(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 500 {
+			writeHTTPError(w, http.StatusBadRequest, "limit must be between 1 and 500")
+			return
+		}
+		limit = parsed
+	}
+	dashboard, err := BuildKnowledgePipelineDashboard(h.store, limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, dashboard)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgePipelineRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var request KnowledgePipelineAutomationRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	result, err := RunKnowledgePipelineAutomation(r.Context(), h.store, h.analysisGenerator, request)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func (h *kbaseHTTPHandler) handleBookAnalysis(w http.ResponseWriter, r *http.Request, bookID string) {

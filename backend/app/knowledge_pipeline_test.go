@@ -103,7 +103,18 @@ func TestKnowledgePipelineKeepsLastPublishedReleaseWhenCurrentArtifactIsStale(t 
 
 func savePipelinePackage(t *testing.T, store *BookKnowledgeStore, bookID, hash string) {
 	t.Helper()
-	if err := store.SavePackage(BookKnowledgePackage{Book: BookKnowledgeBook{BookID: bookID, Title: bookID, SourceType: "synthetic", SourceKey: bookID, ContentHash: hash}}); err != nil {
+	if err := store.SavePackage(BookKnowledgePackage{
+		Book: BookKnowledgeBook{BookID: bookID, Title: bookID, SourceType: "synthetic", SourceKey: bookID, ContentHash: hash},
+		Chapters: []BookKnowledgeChapter{
+			{ChapterID: "chapter-1", BookID: bookID, Order: 1, Title: "chapter"},
+		},
+		Chunks: []BookKnowledgeChunk{
+			{ChunkID: "chunk-1", BookID: bookID, ChapterID: "chapter-1", Order: 1, Text: "source text"},
+		},
+		Citations: []BookKnowledgeCitation{
+			{CitationID: "citation-1", BookID: bookID, ChapterID: "chapter-1", ChunkID: "chunk-1"},
+		},
+	}); err != nil {
 		t.Fatalf("save package %s: %v", bookID, err)
 	}
 }

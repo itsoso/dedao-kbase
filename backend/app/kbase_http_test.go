@@ -182,6 +182,44 @@ func TestKBaseHTTPHandlerBookAnalysisPost(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgePipeline(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	savePipelinePackage(t, store, "needs-analysis", "hash-analysis")
+	savePipelinePackage(t, store, "needs-quality", "hash-quality")
+	savePipelineAnalysis(t, store, "needs-quality", "hash-quality")
+	generatorCalls := 0
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "secret-token",
+		AnalysisGenerator: func(_ context.Context, current *BookKnowledgeStore, request BookAnalysisGenerateRequest) (*BookAnalysisManifest, error) {
+			generatorCalls++
+			savePipelineAnalysis(t, current, request.BookID, "hash-analysis")
+			return current.LoadAnalysisManifest(request.BookID)
+		},
+	})
+
+	dashboard := requestKBase(handler, http.MethodGet, "/api/knowledge/pipeline?limit=10", "secret-token")
+	if dashboard.Code != http.StatusOK || !strings.Contains(dashboard.Body.String(), `"needs_analysis":1`) || !strings.Contains(dashboard.Body.String(), `"next_action":"needs_quality"`) {
+		t.Fatalf("pipeline status=%d body=%s", dashboard.Code, dashboard.Body.String())
+	}
+
+	dryRun := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/pipeline/run", "secret-token", `{"dry_run":true,"limit":5}`)
+	if dryRun.Code != http.StatusOK || !strings.Contains(dryRun.Body.String(), `"dry_run":true`) || !strings.Contains(dryRun.Body.String(), `"eligible":2`) {
+		t.Fatalf("pipeline dry run status=%d body=%s", dryRun.Code, dryRun.Body.String())
+	}
+	if generatorCalls != 0 {
+		t.Fatalf("dry run called generator %d times", generatorCalls)
+	}
+
+	run := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/pipeline/run", "secret-token", `{"limit":5}`)
+	if run.Code != http.StatusOK || !strings.Contains(run.Body.String(), `"analyzed":1`) || !strings.Contains(run.Body.String(), `"qualified":2`) {
+		t.Fatalf("pipeline run status=%d body=%s", run.Code, run.Body.String())
+	}
+	if generatorCalls != 1 {
+		t.Fatalf("run called generator %d times, want 1", generatorCalls)
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeQualityAndRelease(t *testing.T) {
 	store := qualityTestStore(t)
 	if _, err := EvaluateBookAnalysisQuality(store, "42"); err != nil {
