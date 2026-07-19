@@ -82,6 +82,7 @@ type CourseInfo struct {
 	ArticleIntro           ArticleIntro  `json:"intro_article"`
 	ChapterList            []Chapter     `json:"chapter_list"`
 	FlatArticleList        []ArticleBase `json:"flat_article_list"`
+	ArticleListError       string        `json:"article_list_error,omitempty"`
 	UserType               string        `json:"user_type"`
 	HasMoreFlatArticleList bool          `json:"has_more_flat_article_list"`
 	IsShowGrading          bool          `json:"is_show_grading"`

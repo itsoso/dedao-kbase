@@ -537,7 +537,8 @@ func (h *kbaseHTTPHandler) handleDedaoCourse(w http.ResponseWriter, r *http.Requ
 	if len(info.FlatArticleList) == 0 {
 		articles, err := h.dedaoLibrary.ArticleList(enid, "", 200, 0)
 		if err != nil {
-			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			info.ArticleListError = err.Error()
+			writeHTTPJSON(w, http.StatusOK, info)
 			return
 		}
 		for _, article := range articles.List {

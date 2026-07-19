@@ -709,6 +709,7 @@ function renderDedaoCourseDetail() {
   const detail = dedaoLibraryState.courseDetail;
   const info = detail?.class_info || {};
   const articles = Array.isArray(detail?.flat_article_list) ? detail.flat_article_list : [];
+  const articleListError = detail?.article_list_error || "";
   const articleRows = articles.map((article, index) => `
     <article class="dedao-article-row">
       <span>${index + 1}</span>
@@ -746,6 +747,7 @@ function renderDedaoCourseDetail() {
             <h2>课程目录</h2>
             <span>${articles.length} 篇</span>
           </div>
+          ${articleListError ? `<p class="web-status">课程目录暂时不可用：${escapeHTML(articleListError)}</p>` : ""}
           ${articleRows || "<p class=\"web-muted\">暂无课程文章。</p>"}
         </section>
       </section>
