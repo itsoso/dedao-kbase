@@ -73,10 +73,15 @@ const wcplusState = {
   message: "",
 };
 
-const dedaoCourseState = {
-  books: [],
-  loading: "",
-  message: "",
+const dedaoLibraryState = {
+  home: null,
+  homeLoading: "",
+  homeMessage: "",
+  pages: {
+    bauhinia: { items: [], page: 1, pageSize: 15, isMore: 0, loading: "", message: "" },
+    ebook: { items: [], page: 1, pageSize: 15, isMore: 0, loading: "", message: "" },
+    odob: { items: [], page: 1, pageSize: 15, isMore: 0, loading: "", message: "" },
+  },
 };
 
 const sourceControlState = {
@@ -423,6 +428,8 @@ function renderShell(content, current = "") {
       <nav class="web-nav" aria-label="主导航">
         <a class="${current === "home" ? "active" : ""}" href="/home">首页</a>
         <a class="${current === "course" ? "active" : ""}" href="/course">课程</a>
+        <a class="${current === "ebook" ? "active" : ""}" href="/ebook">电子书</a>
+        <a class="${current === "odob" ? "active" : ""}" href="/odob">听书</a>
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="/book-knowledge">书籍知识库</a>
@@ -433,6 +440,13 @@ function renderShell(content, current = "") {
 }
 
 function renderDedaoHome() {
+  const sections = dedaoLibraryState.home ? `
+    <section class="dedao-home__library" aria-label="得到订阅内容">
+      ${renderDedaoHomeSection("订阅课程", dedaoLibraryState.home.courses?.list, "/course")}
+      ${renderDedaoHomeSection("得到电子书", dedaoLibraryState.home.ebooks?.list, "/ebook")}
+      ${renderDedaoHomeSection("听书书架", dedaoLibraryState.home.odob?.list, "/odob")}
+    </section>
+  ` : "";
   renderShell(`
     <main class="dedao-home">
       <section class="dedao-home__hero">
@@ -442,6 +456,7 @@ function renderDedaoHome() {
           <p>从课程、电子书、听书和公众号来源开始，完成搜索、下载、加工、分析和外部系统供给。</p>
           <div class="web-home__actions">
             <a class="button button-primary" href="/course">进入得到课程</a>
+            <a class="button button-ghost" href="/ebook">查看得到电子书</a>
             <a class="button button-ghost" href="/book-knowledge">打开书籍知识库</a>
             <a class="button button-ghost" href="/wechat-source">微信采集</a>
           </div>
@@ -455,7 +470,12 @@ function renderDedaoHome() {
         <a class="dedao-card" href="/course">
           <span>得到课程</span>
           <strong>继续学习</strong>
-          <small>查看已导入课程和学习入口</small>
+          <small>查看已订阅课程和学习入口</small>
+        </a>
+        <a class="dedao-card" href="/ebook">
+          <span>得到电子书</span>
+          <strong>书架阅读</strong>
+          <small>查看已订阅电子书</small>
         </a>
         <a class="dedao-card" href="/book-knowledge">
           <span>书籍知识库</span>
@@ -468,6 +488,9 @@ function renderDedaoHome() {
           <small>同步文章并导入知识库</small>
         </a>
       </section>
+      ${dedaoLibraryState.homeLoading ? `<p class="web-status">正在加载得到订阅内容...</p>` : ""}
+      ${dedaoLibraryState.homeMessage ? `<p class="web-status">${escapeHTML(dedaoLibraryState.homeMessage)}</p>` : ""}
+      ${sections}
     </main>
   `, "home");
 }
@@ -476,44 +499,109 @@ function renderHome() {
   renderDedaoHome();
 }
 
-function isDedaoCourseBook(book) {
-  const value = [
-    book?.source,
-    book?.source_type,
-    book?.type,
-    book?.category,
-    book?.metadata?.source,
-    book?.metadata?.source_type,
-    book?.metadata?.type,
-    book?.path,
-    book?.title,
-  ].join(" ").toLowerCase();
-  return value.includes("course") || value.includes("课程");
+const dedaoLibraryConfig = {
+  bauhinia: {
+    nav: "course",
+    path: "/course",
+    kicker: "得到课程",
+    title: "课程",
+    description: "从得到账号读取已订阅课程，继续学习、下载或沉淀到书籍知识库。",
+    empty: "暂无已订阅课程，或得到登录 cookie 已失效。",
+    primaryAction: "继续学习",
+  },
+  ebook: {
+    nav: "ebook",
+    path: "/ebook",
+    kicker: "得到电子书",
+    title: "电子书",
+    description: "从得到账号读取已订阅电子书，进入阅读、下载或同步到书籍知识库。",
+    empty: "暂无已订阅电子书，或得到登录 cookie 已失效。",
+    primaryAction: "阅读",
+  },
+  odob: {
+    nav: "odob",
+    path: "/odob",
+    kicker: "听书书架",
+    title: "听书",
+    description: "从得到账号读取已订阅听书内容，查看文稿并沉淀成知识资料。",
+    empty: "暂无已订阅听书内容，或得到登录 cookie 已失效。",
+    primaryAction: "查看",
+  },
+};
+
+function dedaoProductID(item, category) {
+  if (category === "bauhinia") {
+    return String(item.class_id || item.id || "").trim();
+  }
+  return String(item.id || item.class_id || "").trim();
+}
+
+function dedaoProductEnID(item) {
+  return String(item.enid || item.en_id || "").trim();
+}
+
+function renderDedaoHomeSection(title, items, href) {
+  const rows = (Array.isArray(items) ? items : []).slice(0, 4).map((item) => `
+    <a class="dedao-mini-card" href="${escapeAttribute(href)}">
+      ${item.icon ? `<img src="${escapeAttribute(item.icon)}" alt="">` : "<span></span>"}
+      <strong>${escapeHTML(item.title || "未命名")}</strong>
+      <small>${escapeHTML(item.author || item.intro || "得到订阅内容")}</small>
+    </a>
+  `).join("");
+  return `
+    <section>
+      <div class="dedao-home__section-head">
+        <h2>${escapeHTML(title)}</h2>
+        <a href="${escapeAttribute(href)}">查看全部</a>
+      </div>
+      <div class="dedao-home__mini-grid">${rows || "<p class=\"web-muted\">暂无内容</p>"}</div>
+    </section>
+  `;
 }
 
 function renderDedaoCourses() {
-  const courseBooks = dedaoCourseState.books.filter(isDedaoCourseBook);
-  const visibleBooks = courseBooks.length ? courseBooks : dedaoCourseState.books.slice(0, 12);
-  const cards = visibleBooks.map((book) => {
-    const bookID = String(book.book_id || book.id || "").trim();
-    const title = book.title || book.name || bookID || "未命名课程";
-    const author = book.author || book.lecturer || book.metadata?.author || book.metadata?.lecturer || "得到课程";
-    const chapters = book.chapters || book.chapter_count || book.metadata?.chapters || 0;
-    const claims = book.claims || book.claim_count || book.metadata?.claims || 0;
+  renderDedaoLibrary("bauhinia");
+}
+
+function renderDedaoEbooks() {
+  renderDedaoLibrary("ebook");
+}
+
+function renderDedaoOdob() {
+  renderDedaoLibrary("odob");
+}
+
+function renderDedaoLibrary(category) {
+  const cfg = dedaoLibraryConfig[category] || dedaoLibraryConfig.bauhinia;
+  const state = dedaoLibraryState.pages[category] || dedaoLibraryState.pages.bauhinia;
+  const cards = state.items.map((item) => {
+    const id = dedaoProductID(item, category);
+    const enid = dedaoProductEnID(item);
+    const progress = Number.isFinite(Number(item.progress)) ? Number(item.progress) : 0;
+    const total = item.course_num || item.publish_num || item.duration || "-";
+    const updated = item.publish_num ? `${item.publish_num}/${item.course_num || "?"}` : (item.last_read || "-");
+    const readerHref = category === "ebook" && enid ? `/ebook/${encodeURIComponent(enid)}` : "";
     return `
       <article class="dedao-course-card">
-        <div>
-          <p class="web-kicker">得到课程</p>
-          <h2>${escapeHTML(title)}</h2>
-          <p>${escapeHTML(author)}</p>
+        <div class="dedao-course-card__top">
+          ${item.icon ? `<img src="${escapeAttribute(item.icon)}" alt="">` : "<div></div>"}
+          <div>
+            <p class="web-kicker">${escapeHTML(cfg.kicker)}</p>
+            <h2>${escapeHTML(item.title || id || "未命名")}</h2>
+            <p>${escapeHTML(item.author || item.intro || "得到订阅内容")}</p>
+          </div>
+        </div>
+        <div class="dedao-progress" aria-label="进度">
+          <span style="width:${Math.max(0, Math.min(100, progress))}%"></span>
         </div>
         <dl>
-          <div><dt>章节</dt><dd>${escapeHTML(chapters || "-")}</dd></div>
-          <div><dt>Claims</dt><dd>${escapeHTML(claims || "-")}</dd></div>
+          <div><dt>进度</dt><dd>${escapeHTML(progress ? `${progress}%` : "-")}</dd></div>
+          <div><dt>更新</dt><dd>${escapeHTML(updated || total)}</dd></div>
         </dl>
         <div class="dedao-course-card__actions">
-          ${bookID ? `<a class="button button-primary" href="${knowledgeBookPath(bookID)}">继续学习</a>` : ""}
-          ${bookID ? `<a class="button button-ghost" href="/ebook/${encodeURIComponent(bookID)}">阅读</a>` : ""}
+          ${readerHref ? `<a class="button button-primary" href="${escapeAttribute(readerHref)}">${escapeHTML(cfg.primaryAction)}</a>` : ""}
+          ${enid ? `<a class="button button-ghost" href="${escapeAttribute(`${cfg.path}/${encodeURIComponent(enid)}`)}">详情</a>` : ""}
+          ${id || enid ? `<a class="button button-ghost" href="/book-knowledge?query=${encodeURIComponent(item.title || id || enid)}">查知识库</a>` : ""}
         </div>
       </article>
     `;
@@ -523,48 +611,76 @@ function renderDedaoCourses() {
     <main class="dedao-courses">
       <section class="dedao-courses__header">
         <div>
-          <p class="web-kicker">得到课程</p>
-          <h1>课程</h1>
-          <p>从已导入的得到课程进入学习、阅读和知识库分析。</p>
+          <p class="web-kicker">${escapeHTML(cfg.kicker)}</p>
+          <h1>${escapeHTML(cfg.title)}</h1>
+          <p>${escapeHTML(cfg.description)}</p>
         </div>
-        <button class="button button-primary" type="button" data-action="reload-courses" ${dedaoCourseState.loading ? "disabled" : ""}>
-          ${dedaoCourseState.loading ? "加载中" : "刷新课程"}
-        </button>
+        <div class="dedao-courses__actions">
+          <button class="button button-primary" type="button" data-action="reload-dedao-library" ${state.loading ? "disabled" : ""}>
+            ${state.loading ? "加载中" : "刷新"}
+          </button>
+          <a class="button button-ghost" href="/book-knowledge">书籍知识库</a>
+        </div>
       </section>
-      ${dedaoCourseState.message ? `<p class="web-status">${escapeHTML(dedaoCourseState.message)}</p>` : ""}
+      ${state.message ? `<p class="web-status">${escapeHTML(state.message)}</p>` : ""}
       <section class="dedao-courses__grid">
         ${cards || `
           <div class="dedao-courses__empty">
-            <h2>暂无课程内容</h2>
-            <p>可以先从书籍知识库查看已导入内容，或从微信/WC Plus 来源导入新资料。</p>
+            <h2>${escapeHTML(cfg.empty)}</h2>
+            <p>确认得到扫码登录成功后，刷新本页；已下载加工过的内容仍可在书籍知识库查看。</p>
             <div class="web-home__actions">
               <a class="button button-primary" href="/book-knowledge">打开书籍知识库</a>
-              <a class="button button-ghost" href="/wcplus-source">导入来源</a>
+              <a class="button button-ghost" href="/home">返回首页</a>
             </div>
           </div>
         `}
       </section>
     </main>
-  `, "course");
+  `, cfg.nav);
 
-  app.querySelector("[data-action='reload-courses']")?.addEventListener("click", loadDedaoCourses);
+  app.querySelector("[data-action='reload-dedao-library']")?.addEventListener("click", () => loadDedaoLibrary(category));
+}
+
+async function loadDedaoHome() {
+  dedaoLibraryState.homeLoading = "loading";
+  dedaoLibraryState.homeMessage = "";
+  renderDedaoHome();
+  try {
+    dedaoLibraryState.home = await apiFetch("/api/dedao/home?page_size=4");
+  } catch (error) {
+    dedaoLibraryState.homeMessage = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoLibraryState.homeLoading = "";
+    renderDedaoHome();
+  }
 }
 
 async function loadDedaoCourses() {
-  dedaoCourseState.loading = "loading";
-  dedaoCourseState.message = "";
-  renderDedaoCourses();
+  return loadDedaoLibrary("bauhinia");
+}
+
+async function loadDedaoLibrary(category) {
+  const cfg = dedaoLibraryConfig[category] || dedaoLibraryConfig.bauhinia;
+  const state = dedaoLibraryState.pages[category] || dedaoLibraryState.pages.bauhinia;
+  state.loading = "loading";
+  state.message = "";
+  renderDedaoLibrary(category);
   try {
-    const payload = await apiFetch("/api/books");
-    dedaoCourseState.books = Array.isArray(payload?.books) ? payload.books : [];
-    if (!dedaoCourseState.books.length) {
-      dedaoCourseState.message = "暂无已导入内容。";
-    }
+    const query = new URLSearchParams({
+      category,
+      order: "study",
+      page: String(state.page || 1),
+      page_size: String(state.pageSize || 15),
+    });
+    const payload = await apiFetch(`/api/dedao/library?${query.toString()}`);
+    state.items = Array.isArray(payload?.list) ? payload.list : [];
+    state.isMore = Number(payload?.is_more || 0);
+    state.message = state.items.length ? `已加载 ${state.items.length} 条${cfg.title}` : cfg.empty;
   } catch (error) {
-    dedaoCourseState.message = error instanceof Error ? error.message : String(error);
+    state.message = error instanceof Error ? error.message : String(error);
   } finally {
-    dedaoCourseState.loading = "";
-    renderDedaoCourses();
+    state.loading = "";
+    renderDedaoLibrary(category);
   }
 }
 
@@ -4083,11 +4199,22 @@ function formatArticleTime(value) {
 async function boot() {
   if (window.location.pathname === "/" || window.location.pathname === "/home") {
     renderDedaoHome();
+    await loadDedaoHome();
     return;
   }
   if (window.location.pathname.startsWith("/course")) {
     renderDedaoCourses();
     await loadDedaoCourses();
+    return;
+  }
+  if (window.location.pathname === "/ebook") {
+    renderDedaoEbooks();
+    await loadDedaoLibrary("ebook");
+    return;
+  }
+  if (window.location.pathname.startsWith("/odob")) {
+    renderDedaoOdob();
+    await loadDedaoLibrary("odob");
     return;
   }
   if (window.location.pathname.startsWith("/wechat-import") || window.location.pathname.startsWith("/sources/wechat")) {

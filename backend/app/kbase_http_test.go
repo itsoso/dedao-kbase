@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
@@ -41,6 +43,40 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 	if !strings.Contains(resp.Body.String(), `"book_id":"42"`) {
 		t.Fatalf("books response missing sample book: %s", resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:        NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:    "secret-token",
+		DedaoLibrary: fakeDedaoLibrary{},
+	})
+
+	resp := requestKBase(handler, http.MethodGet, "/api/dedao/library?category=bauhinia&page=2&page_size=3", "secret-token")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("library status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"category":"bauhinia"`) || !strings.Contains(resp.Body.String(), `"title":"得到订阅课程"`) {
+		t.Fatalf("library response missing subscribed course: %s", resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), `"page":2`) || !strings.Contains(resp.Body.String(), `"page_size":3`) {
+		t.Fatalf("library response missing pagination: %s", resp.Body.String())
+	}
+
+	ebooks := requestKBase(handler, http.MethodGet, "/api/dedao/library?category=ebook", "secret-token")
+	if ebooks.Code != http.StatusOK || !strings.Contains(ebooks.Body.String(), `"title":"得到订阅电子书"`) {
+		t.Fatalf("ebook library status=%d body=%s", ebooks.Code, ebooks.Body.String())
+	}
+
+	home := requestKBase(handler, http.MethodGet, "/api/dedao/home", "secret-token")
+	if home.Code != http.StatusOK || !strings.Contains(home.Body.String(), `"courses"`) || !strings.Contains(home.Body.String(), `"ebooks"`) || !strings.Contains(home.Body.String(), `"odob"`) {
+		t.Fatalf("home status=%d body=%s", home.Code, home.Body.String())
+	}
+
+	invalid := requestKBase(handler, http.MethodGet, "/api/dedao/library?category=bad", "secret-token")
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid category status=%d body=%s", invalid.Code, invalid.Body.String())
 	}
 }
 
@@ -1387,4 +1423,33 @@ func requestJSONKBase(handler http.Handler, method, path, token, body string) *h
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+type fakeDedaoLibrary struct{}
+
+func (fakeDedaoLibrary) CourseList(category, order string, page, limit int) (*services.CourseList, error) {
+	title := map[string]string{
+		CateCourse:    "得到订阅课程",
+		CateEbook:     "得到订阅电子书",
+		CateAudioBook: "得到订阅读书",
+	}[category]
+	if title == "" {
+		title = "得到订阅内容"
+	}
+	return &services.CourseList{
+		List: []services.Course{{
+			Enid:      category + "-enid",
+			ID:        101,
+			ClassID:   202,
+			Title:     title,
+			Intro:     "从得到账号读取的订阅内容",
+			Author:    "得到",
+			Icon:      "https://example.test/icon.png",
+			Progress:  12,
+			CourseNum: 30,
+			PublishNum: 8,
+		}},
+		ISMore: 1,
+		Page:   page,
+	}, nil
 }

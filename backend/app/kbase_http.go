@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 type KBaseHTTPConfig struct {
@@ -28,11 +30,16 @@ type KBaseHTTPConfig struct {
 	SourceAgentMaxBodyBytes int64
 	SourceAssets            *SourceAssetStore
 	AnalysisGenerator       BookAnalysisGenerator
+	DedaoLibrary            DedaoLibraryService
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
 }
 
 type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
+
+type DedaoLibraryService interface {
+	CourseList(category, order string, page, limit int) (*services.CourseList, error)
+}
 
 type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
@@ -47,6 +54,7 @@ type kbaseHTTPHandler struct {
 	sourceAgentMaxBodyBytes int64
 	sourceAssets            *SourceAssetStore
 	analysisGenerator       BookAnalysisGenerator
+	dedaoLibrary            DedaoLibraryService
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
 }
@@ -79,6 +87,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if analysisGenerator == nil {
 		analysisGenerator = GenerateBookAnalysisManifest
 	}
+	dedaoLibrary := cfg.DedaoLibrary
+	if dedaoLibrary == nil {
+		dedaoLibrary = defaultDedaoLibrary{}
+	}
 	reverificationNow := cfg.ReverificationNow
 	if reverificationNow == nil {
 		reverificationNow = time.Now
@@ -103,9 +115,16 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 		sourceAssets:            assets,
 		analysisGenerator:       analysisGenerator,
+		dedaoLibrary:            dedaoLibrary,
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
 	}
+}
+
+type defaultDedaoLibrary struct{}
+
+func (defaultDedaoLibrary) CourseList(category, order string, page, limit int) (*services.CourseList, error) {
+	return CourseList(category, order, page, limit)
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +259,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleBookChat(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/library" {
+		h.handleDedaoLibrary(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/home" {
+		h.handleDedaoHome(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -400,6 +427,101 @@ func (h *kbaseHTTPHandler) handleHealthEvidenceReadinessAnalyze(w http.ResponseW
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoLibrary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	query := r.URL.Query()
+	category := strings.TrimSpace(query.Get("category"))
+	if category == "" {
+		category = CateCourse
+	}
+	if !isDedaoLibraryCategory(category) {
+		writeHTTPError(w, http.StatusBadRequest, "invalid dedao category")
+		return
+	}
+	order := strings.TrimSpace(query.Get("order"))
+	if order == "" {
+		order = "study"
+	}
+	page := parseBoundedInt(query.Get("page"), 1, 1, 10000)
+	pageSize := parseBoundedInt(firstNonEmpty(query.Get("page_size"), query.Get("limit")), 15, 1, 100)
+	list, err := h.dedaoLibrary.CourseList(category, order, page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if list == nil {
+		list = &services.CourseList{}
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"category":  category,
+		"order":     order,
+		"page":      page,
+		"page_size": pageSize,
+		"list":      list.List,
+		"is_more":   list.ISMore,
+	})
+}
+
+func (h *kbaseHTTPHandler) handleDedaoHome(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pageSize := parseBoundedInt(firstNonEmpty(r.URL.Query().Get("page_size"), r.URL.Query().Get("limit")), 6, 1, 30)
+	payload := map[string]any{}
+	for key, category := range map[string]string{
+		"courses": CateCourse,
+		"ebooks":  CateEbook,
+		"odob":    CateAudioBook,
+	} {
+		list, err := h.dedaoLibrary.CourseList(category, "study", 1, pageSize)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		items := []services.Course{}
+		isMore := 0
+		if list != nil {
+			items = list.List
+			isMore = list.ISMore
+		}
+		payload[key] = map[string]any{
+			"category":  category,
+			"page":      1,
+			"page_size": pageSize,
+			"list":      items,
+			"is_more":   isMore,
+		}
+	}
+	writeHTTPJSON(w, http.StatusOK, payload)
+}
+
+func isDedaoLibraryCategory(category string) bool {
+	switch category {
+	case CateCourse, CateEbook, CateAudioBook, CateAce:
+		return true
+	default:
+		return false
+	}
+}
+
+func parseBoundedInt(value string, fallback, min, max int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
+	}
+	if parsed < min {
+		return min
+	}
+	if parsed > max {
+		return max
+	}
+	return parsed
 }
 
 func (h *kbaseHTTPHandler) handleDeliveryReceipt(w http.ResponseWriter, r *http.Request, releaseID string) {

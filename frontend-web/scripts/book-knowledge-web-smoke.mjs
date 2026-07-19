@@ -11,6 +11,9 @@ const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 for (const marker of [
   "renderDedaoHome",
   "renderDedaoCourses",
+  "renderDedaoEbooks",
+  "renderDedaoLibrary",
+  "loadDedaoLibrary",
   "renderBookKnowledge",
   "knowledgeState",
   "ensureBrowserSessionToken",
@@ -19,6 +22,7 @@ for (const marker of [
   "searchBookKnowledge",
   'window.location.pathname === "/home"',
   'window.location.pathname.startsWith("/course")',
+  'window.location.pathname === "/ebook"',
   'window.location.pathname.startsWith("/book-knowledge")',
 ]) {
   assert.ok(js.includes(marker), `app.js should include ${marker}`);
@@ -26,6 +30,8 @@ for (const marker of [
 
 for (const endpoint of [
   "/browser/session-token",
+  "/api/dedao/home",
+  "/api/dedao/library?",
   "/api/books",
   "/api/search?",
   "/api/book-chat",
@@ -77,8 +83,10 @@ assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoi
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
 assert.ok(js.includes('href="/home"'), "navigation should include the Dedao home page");
 assert.ok(js.includes('href="/course"'), "navigation should include the Dedao course page");
+assert.ok(js.includes('href="/ebook"'), "navigation should include the subscribed ebook page");
 assert.ok(js.includes("得到首页"), "Dedao home should be restored");
 assert.ok(js.includes("得到课程"), "Dedao course page should be restored");
+assert.ok(js.includes("得到电子书"), "Dedao ebook page should be restored");
 assert.ok(js.includes("继续学习"), "Dedao course page should expose study actions");
 assert.ok(js.includes('href="/ebook/${encodeURIComponent(currentBook.book_id)}"'), "book details should link to the reader");
 assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge pages should expose an LLM analysis workspace");
