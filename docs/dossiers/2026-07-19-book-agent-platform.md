@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** G3 PASS on current heads; fresh G4 review pending; no push or deployment
+**Status:** BLOCKED at G4; behavioral evaluation, grounding, lifecycle, and feedback gaps remain
 
 ## Objective
 
@@ -29,10 +29,10 @@ prescription or dosage decisions, and personal-data write tools.
   high-risk review are mandatory.
 - **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed on
   current heads `30c5b30`, `c6618c3d`, and `bff01c3b2` respectively.
-- **G4 Review: RE-REVIEW PENDING.** All findings from the prior NO-GO have been
-  returned upstream and remediated, and the mandatory Health-specific safety
-  review now returns GO. Fresh architecture and cross-consumer reviews must
-  independently pass before any push or deployment.
+- **G4 Review: NO-GO.** Fresh architecture and cross-consumer reviews on the
+  exact G3 heads found release-blocking behavioral evaluation, grounded-answer
+  citation, supersession propagation/execution, and production feedback gaps.
+  The implementation has returned upstream. No push or deployment is allowed.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -700,6 +700,69 @@ Exact commands and results:
   credential, key, or token literal;
 - `git diff --check` — PASS in all three repositories, and all three worktrees
   were clean after verification.
+
+## Task 10 checkpoint: fresh G4 re-review
+
+**Decision: NO-GO on exact heads `99b7414`, `c6618c3d`, and `bff01c3b2`.** Both
+independent reviewers rejected release. G3 remains passed but does not override
+G4. No files were changed by reviewers, and no branch was pushed or deployed.
+
+Release blockers returned upstream:
+
+1. **Critical — the evaluation Gate is immutable but not behavioral.** The
+   trusted evaluator enumerates pinned IDs and declared policies but does not
+   execute retrieval queries, grounded chat, abstention, tool selection, tool
+   arguments, latency, or cost cases. A broken runtime can still score a
+   perfect report and publish. Evaluation fixtures also contain expected IDs
+   rather than executable inputs and expected observations.
+2. **Critical — completed chat is not tied to citations actually present in the
+   generated answer.** The runtime accepts model text without parsing citation
+   markers, then attaches every retrieved citation to the response and trace.
+   Missing or invented answer citations can therefore appear grounded. The
+   citation-required no-evidence path also needs consistent trace persistence.
+3. **High — supersession is not safely propagated or enforced.** KBase mutates
+   the old list record, while cursor consumers positioned after that record see
+   only the new version. Proofroom and Health can retain stale local lifecycle
+   state. Exact-version HTTP runtime and MCP reads also fail to reject a
+   superseded package, and MCP does not re-run the trusted evaluation Gate.
+4. **High — Proofroom production feedback does not close every required
+   outcome.** The production verifier emits `used`, `rejected`, and `conflict`,
+   while `stale` and `zero_hit` are only reachable through the low-level helper
+   or direct tests. Zero-hit cannot be emitted from the current post-candidate
+   call site.
+5. **Important — declared retrieval and cost policies are not faithfully
+   executed.** Accepted lexical, vector, hybrid, and graph strategies currently
+   share one lexical implementation while the response reports the declared
+   strategy; `max_cost_usd` is validated but not enforced at runtime.
+6. **Minor — MCP required-argument validation accepts some non-string values
+   before later string conversion empties them.** Server-side schema rejection
+   is weaker than the published strict tool contract.
+
+Confirmed closed by both reviewers:
+
+- authorized-source usage enforcement and bounded citation serialization;
+- immutable evaluator provenance and publisher/consumer token separation;
+- exact package-version routing, shared Book App package routes, and bounded
+  trace hashes/replay;
+- Proofroom verdict ownership and the feedback outcomes already wired;
+- Health's resolved workspace, shared parent/child lock, atomic replacement,
+  evidence-only draft review ownership, and absence of pre-review serving or
+  personal-health mutation;
+- privacy fixtures contain no downloaded source bodies, secrets, or local
+  source paths.
+
+Independent verification results:
+
+- architecture reviewer: focused KBase package/evaluation/MCP/trace/runtime/HTTP
+  tests — PASS; Proofroom six-suite matrix — PASS,
+  `128 passed in 7.38s`; Health focused consumer/lifecycle matrix — PASS,
+  `55 passed, 6 warnings in 19.37s`;
+- cross-consumer safety reviewer: focused KBase suites and Book App smoke —
+  PASS; Proofroom project-environment matrix — PASS,
+  `128 passed in 7.11s`; Health eleven-file matrix — PASS,
+  `225 passed, 6 warnings in 32.56s`;
+- KBase privacy smoke and `git diff --check` — PASS; all three worktrees stayed
+  clean throughout review.
 
 ## Decisions
 
