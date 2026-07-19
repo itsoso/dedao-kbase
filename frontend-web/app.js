@@ -419,8 +419,8 @@ function getKnowledgeBookID() {
   }
 }
 
-function getDedaoCourseEnID() {
-  const prefix = "/course/";
+function getDedaoCourseDetailEnID() {
+  const prefix = "/course/detail/";
   if (!window.location.pathname.startsWith(prefix)) {
     return "";
   }
@@ -430,6 +430,25 @@ function getDedaoCourseEnID() {
   } catch {
     return raw;
   }
+}
+
+function getDedaoCourseRoute() {
+  const prefix = "/course/";
+  if (!window.location.pathname.startsWith(prefix) || window.location.pathname.startsWith("/course/detail/")) {
+    return null;
+  }
+  const rawID = window.location.pathname.slice(prefix.length).split("/")[0];
+  if (!rawID || !/^\d+$/.test(rawID)) {
+    return null;
+  }
+  const params = new URLSearchParams(window.location.search);
+  const enid = params.get("enid") || "";
+  return {
+    id: rawID,
+    enid,
+    title: params.get("title") || "",
+    total: params.get("total") || "",
+  };
 }
 
 async function fetchBook(bookID) {
@@ -596,11 +615,16 @@ function renderDedaoLibrary(category) {
     const progress = Number.isFinite(Number(item.progress)) ? Number(item.progress) : 0;
     const total = item.course_num || item.publish_num || item.duration || "-";
     const updated = item.publish_num ? `${item.publish_num}/${item.course_num || "?"}` : (item.last_read || "-");
+    const courseID = item.id || item.class_id || item.product_id || "";
+    const courseQuery = new URLSearchParams();
+    if (enid) courseQuery.set("enid", enid);
+    if (item.publish_num) courseQuery.set("total", String(item.publish_num));
+    if (item.title || item.name) courseQuery.set("title", item.title || item.name);
     const primaryHref = category === "ebook" && enid
       ? `/ebook/${encodeURIComponent(enid)}`
-      : (category === "bauhinia" && enid ? `/course/${encodeURIComponent(enid)}` : "");
+      : (category === "bauhinia" && courseID ? `/course/${encodeURIComponent(courseID)}${courseQuery.toString() ? `?${courseQuery.toString()}` : ""}` : "");
     const detailHref = category === "bauhinia" && enid
-      ? `/course/${encodeURIComponent(enid)}`
+      ? `/course/detail/${encodeURIComponent(enid)}`
       : (enid ? `${cfg.path}/${encodeURIComponent(enid)}` : "");
     return `
       <article class="dedao-course-card">
@@ -717,7 +741,7 @@ function renderDedaoCourseDetail() {
         <strong>${escapeHTML(article.title || article.share_title || "未命名文章")}</strong>
         <small>${escapeHTML(formatArticleTime(article.publish_time || article.update_time || article.create_time))}</small>
       </div>
-      ${article.enid ? `<a class="button button-ghost" href="/course/${encodeURIComponent(info.enid || getDedaoCourseEnID())}/article/${encodeURIComponent(article.enid)}">打开</a>` : ""}
+      ${article.enid ? `<a class="button button-ghost" href="/article/${encodeURIComponent(article.enid)}?from=course&class_enid=${encodeURIComponent(info.enid || getDedaoCourseDetailEnID())}&title=${encodeURIComponent(article.title || article.share_title || "")}">打开</a>` : ""}
     </article>
   `).join("");
 
@@ -755,6 +779,57 @@ function renderDedaoCourseDetail() {
   `, "course");
 }
 
+function renderDedaoCourseArticles(route = getDedaoCourseRoute()) {
+  const detail = dedaoLibraryState.courseDetail;
+  const info = detail?.class_info || {};
+  const articles = Array.isArray(detail?.flat_article_list) ? detail.flat_article_list : [];
+  const articleListError = detail?.article_list_error || "";
+  const title = info.name || route?.title || "课程目录";
+  const articleRows = articles.map((article, index) => `
+    <article class="dedao-article-row">
+      <span>${index + 1}</span>
+      <div>
+        <strong>${escapeHTML(article.title || article.share_title || "未命名文章")}</strong>
+        <small>${escapeHTML(formatArticleTime(article.publish_time || article.update_time || article.create_time))}</small>
+      </div>
+      ${article.enid ? `<a class="button button-ghost" href="/article/${encodeURIComponent(article.enid)}?from=course&class_id=${encodeURIComponent(route?.id || "")}&class_enid=${encodeURIComponent(route?.enid || info.enid || "")}&title=${encodeURIComponent(article.title || article.share_title || "")}">打开</a>` : ""}
+    </article>
+  `).join("");
+
+  renderShell(`
+    <main class="dedao-course-detail">
+      <section class="dedao-course-detail__header">
+        <a class="button button-ghost" href="/course">返回课程</a>
+        <div>
+          <p class="web-kicker">得到课程目录</p>
+          <h1>${escapeHTML(title)}</h1>
+          <p>${escapeHTML(info.intro || "按桌面版课程入口打开课程目录。")}</p>
+        </div>
+      </section>
+      ${dedaoLibraryState.courseDetailLoading ? `<p class="web-status">正在加载课程目录...</p>` : ""}
+      ${dedaoLibraryState.courseDetailMessage ? `<p class="web-status">${escapeHTML(dedaoLibraryState.courseDetailMessage)}</p>` : ""}
+      <section class="dedao-course-detail__layout">
+        <aside class="dedao-course-detail__aside">
+          <dl>
+            <div><dt>课程 ID</dt><dd>${escapeHTML(route?.id || info.id || "-")}</dd></div>
+            <div><dt>EnID</dt><dd>${escapeHTML(route?.enid || info.enid || "-")}</dd></div>
+            <div><dt>目录</dt><dd>${escapeHTML(articles.length || route?.total || "-")} 篇</dd></div>
+          </dl>
+          ${route?.enid || info.enid ? `<a class="button button-ghost" href="/course/detail/${encodeURIComponent(route?.enid || info.enid)}">课程详情</a>` : ""}
+        </aside>
+        <section class="dedao-course-detail__articles">
+          <div class="dedao-home__section-head">
+            <h2>课程目录</h2>
+            <span>${articles.length || route?.total || 0} 篇</span>
+          </div>
+          ${articleListError ? `<p class="web-status">课程目录暂时不可用：${escapeHTML(articleListError)}</p>` : ""}
+          ${articleRows || "<p class=\"web-muted\">暂无课程文章。</p>"}
+        </section>
+      </section>
+    </main>
+  `, "course");
+}
+
 async function loadDedaoCourseDetail(enid) {
   dedaoLibraryState.courseDetailLoading = "loading";
   dedaoLibraryState.courseDetailMessage = "";
@@ -769,6 +844,25 @@ async function loadDedaoCourseDetail(enid) {
     renderDedaoCourseDetail();
   }
 }
+
+async function loadDedaoCourseArticles(route) {
+  dedaoLibraryState.courseDetailLoading = "loading";
+  dedaoLibraryState.courseDetailMessage = "";
+  dedaoLibraryState.courseDetail = null;
+  renderDedaoCourseArticles(route);
+  try {
+    if (!route?.enid) {
+      throw new Error("课程链接缺少 enid，无法加载目录。请从课程列表重新进入。");
+    }
+    dedaoLibraryState.courseDetail = await apiFetch(`/api/dedao/course?enid=${encodeURIComponent(route.enid)}`);
+  } catch (error) {
+    dedaoLibraryState.courseDetailMessage = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoLibraryState.courseDetailLoading = "";
+    renderDedaoCourseArticles(route);
+  }
+}
+
 
 function knowledgeReviewLatestTask() {
   const tasks = Array.isArray(knowledgeState.reverificationTasks) ? knowledgeState.reverificationTasks : [];
@@ -4288,10 +4382,16 @@ async function boot() {
     await loadDedaoHome();
     return;
   }
-  const dedaoCourseEnID = getDedaoCourseEnID();
+  const dedaoCourseEnID = getDedaoCourseDetailEnID();
   if (dedaoCourseEnID) {
     renderDedaoCourseDetail();
     await loadDedaoCourseDetail(dedaoCourseEnID);
+    return;
+  }
+  const dedaoCourseRoute = getDedaoCourseRoute();
+  if (dedaoCourseRoute) {
+    renderDedaoCourseArticles(dedaoCourseRoute);
+    await loadDedaoCourseArticles(dedaoCourseRoute);
     return;
   }
   if (window.location.pathname.startsWith("/course")) {
