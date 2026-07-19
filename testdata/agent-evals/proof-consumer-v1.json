@@ -1,0 +1,74 @@
+{
+  "schema_version": "proof-consumer-eval.v1",
+  "suite_version": "proof-consumer-v1",
+  "automatic_publication": false,
+  "sources": [
+    {
+      "release_id": "release-book-synthetic",
+      "content_hash": "sha256:book-release-synthetic",
+      "source_type": "dedao_ebook",
+      "usage_policy": "standard",
+      "citation_ids": ["citation-book-1", "citation-book-2"]
+    },
+    {
+      "release_id": "release-article-synthetic",
+      "content_hash": "sha256:article-release-synthetic",
+      "source_type": "wechat_mp_article",
+      "usage_policy": "standard",
+      "citation_ids": ["citation-article-1"]
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "supported",
+      "claim_id": "claim-supported",
+      "classification": "supported",
+      "citation_ids": ["citation-book-1"],
+      "feedback": {
+        "outcome": "used",
+        "creates": "none"
+      }
+    },
+    {
+      "case_id": "contradicted",
+      "claim_id": "claim-contradicted",
+      "classification": "contradicted",
+      "citation_ids": ["citation-book-2", "citation-article-1"],
+      "feedback": {
+        "outcome": "conflict",
+        "creates": "reverification"
+      }
+    },
+    {
+      "case_id": "insufficient",
+      "claim_id": "claim-insufficient",
+      "classification": "unknown",
+      "citation_ids": [],
+      "feedback": {
+        "outcome": "zero_hit",
+        "creates": "gap"
+      }
+    },
+    {
+      "case_id": "stale",
+      "claim_id": "claim-stale",
+      "classification": "unknown",
+      "citation_ids": ["citation-article-1"],
+      "feedback": {
+        "outcome": "stale",
+        "creates": "reverification"
+      }
+    },
+    {
+      "case_id": "citation_missing",
+      "claim_id": "claim-citation-missing",
+      "classification": "unknown",
+      "citation_ids": [],
+      "missing_citation_ids": ["citation-missing"],
+      "feedback": {
+        "outcome": "rejected",
+        "creates": "reverification"
+      }
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** Delivery in progress; Tasks 1-4 checkpoints passed
+**Status:** Delivery in progress; Tasks 1-6 checkpoints passed
 
 ## Objective
 
@@ -103,6 +103,50 @@ Exact commands and results:
 - `go test ./...` — PASS.
 - `bash scripts/privacy-smoke.sh` — PASS.
 - `git diff --check` — PASS.
+
+## Checkpoint: Tasks 5-6
+
+**Decision: PASS for the Task 5-6 batch.** The proof consumer imports Agent
+Packages without assuming that retrieval proves a claim, and the proof contract
+fixture closes bounded feedback into gap or reverification candidates without
+automatic publication. G3 remains pending until the health consumer, traces,
+shared Book App, and full cross-repository suites pass. No deployment was
+attempted.
+
+Delivered:
+
+- cursor-based Proofroom package import with stable idempotent release receipts;
+- preserved package, release, claim, chunk, and citation identities and links;
+- user-scoped package evidence retrieval that remains `unknown` until
+  Proofroom's judge assigns support or contradiction;
+- bounded `used`, `rejected`, `stale`, `conflict`, and `zero_hit` feedback with
+  opaque event IDs and no prompt or user-data fields;
+- a synthetic proof fixture covering supported, contradicted, insufficient,
+  stale, and citation-missing outcomes;
+- contract smoke coverage proving feedback creates a gap or reverification
+  candidate while `automatic_publication` remains false.
+
+Exact commands and results:
+
+- `python -m pytest -q tests/test_kbase_release_consumer.py` (from the isolated
+  Proofroom feature worktree and its project virtual environment)
+  — RED case-by-case before implementation; final result `7 passed in 1.72s`.
+- `python -m pytest -q tests/test_kbase_release_consumer.py tests/test_decision_engine.py tests/test_claim_verifier_routing.py tests/test_claim_verifier_quota_query_cache.py tests/test_knowledge_runtime.py tests/test_dedao_kbase_sync.py`
+  (from the isolated Proofroom feature worktree and its project virtual
+  environment)
+  — PASS, `126 passed in 10.75s`.
+- `python -m py_compile rpa_llm/kbase_release_consumer.py rpa_llm/claim_verifier.py rpa_llm/decision_engine.py tests/test_kbase_release_consumer.py`
+  — PASS.
+- `bash scripts/proof-consumer-contract-smoke.sh` — RED first because the proof
+  fixture was absent; GREEN after adding the synthetic fixture.
+- `bash scripts/knowledge-contract-smoke.sh` — PASS with the proof pilot included.
+- `bash scripts/privacy-smoke.sh` — PASS before the Proofroom commit, run from
+  the KBase feature worktree because the Proofroom repository has no privacy
+  smoke script; the Proofroom feature diff also passed a targeted path, key,
+  and token scan.
+- `git diff --check` — PASS in both feature worktrees.
+
+Proofroom commit: `7adc63fb feat(kbase): consume agent packages for proof`.
 
 ## Decisions
 
