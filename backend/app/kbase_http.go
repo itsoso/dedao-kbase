@@ -1159,7 +1159,22 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, pkg)
+	if err := ValidateAgentPackageEvaluationGate(h.store, *pkg); err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	evaluation, err := h.store.LoadAgentPackageEvaluation(pkg.ContentHash)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, struct {
+		*AgentPackage
+		Evaluation *AgentEvaluationReport `json:"evaluation"`
+	}{
+		AgentPackage: pkg,
+		Evaluation:   evaluation,
+	})
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgePipeline(w http.ResponseWriter, r *http.Request) {

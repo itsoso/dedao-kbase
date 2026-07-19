@@ -68,7 +68,7 @@
     {
       "path": "/api/article/all_articles/export_xlsx",
       "file": "backend/app/kbase_http.go",
-      "line": 1758,
+      "line": 1773,
       "authenticated": true
     },
     {
@@ -98,13 +98,13 @@
     {
       "path": "/api/batch_task/create_task",
       "file": "backend/app/kbase_http.go",
-      "line": 1691,
+      "line": 1706,
       "authenticated": true
     },
     {
       "path": "/api/batch_task/delete_task",
       "file": "backend/app/kbase_http.go",
-      "line": 1693,
+      "line": 1708,
       "authenticated": true
     },
     {
@@ -452,7 +452,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/kbase_http.go",
-      "line": 1859,
+      "line": 1874,
       "authenticated": true
     },
     {
@@ -464,7 +464,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/kbase_http.go",
-      "line": 1870,
+      "line": 1885,
       "authenticated": true
     },
     {
@@ -476,7 +476,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 1906,
+      "line": 1921,
       "authenticated": true
     },
     {
@@ -488,7 +488,7 @@
     {
       "path": "/api/source-agents",
       "file": "backend/app/kbase_http.go",
-      "line": 1846,
+      "line": 1861,
       "authenticated": true
     },
     {
@@ -506,25 +506,25 @@
     {
       "path": "/api/source-subscriptions",
       "file": "backend/app/kbase_http.go",
-      "line": 1847,
+      "line": 1862,
       "authenticated": true
     },
     {
       "path": "/api/source-subscriptions/",
       "file": "backend/app/kbase_http.go",
-      "line": 1848,
+      "line": 1863,
       "authenticated": true
     },
     {
       "path": "/api/source-sync/runs",
       "file": "backend/app/kbase_http.go",
-      "line": 1849,
+      "line": 1864,
       "authenticated": true
     },
     {
       "path": "/api/source-sync/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 1850,
+      "line": 1865,
       "authenticated": true
     },
     {
@@ -548,7 +548,7 @@
     {
       "path": "/api/task/control",
       "file": "backend/app/kbase_http.go",
-      "line": 1837,
+      "line": 1852,
       "authenticated": true
     },
     {
@@ -602,19 +602,19 @@
     {
       "path": "/api/wcplus/batch-import/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 1696,
+      "line": 1711,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-task/create",
       "file": "backend/app/kbase_http.go",
-      "line": 1690,
+      "line": 1705,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-task/delete",
       "file": "backend/app/kbase_http.go",
-      "line": 1692,
+      "line": 1707,
       "authenticated": true
     },
     {
@@ -626,7 +626,7 @@
     {
       "path": "/api/wcplus/export/all-articles-xlsx",
       "file": "backend/app/kbase_http.go",
-      "line": 1694,
+      "line": 1709,
       "authenticated": true
     },
     {
@@ -662,19 +662,19 @@
     {
       "path": "/api/wcplus/import/account",
       "file": "backend/app/kbase_http.go",
-      "line": 1684,
+      "line": 1699,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/article",
       "file": "backend/app/kbase_http.go",
-      "line": 1680,
+      "line": 1695,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/raw",
       "file": "backend/app/kbase_http.go",
-      "line": 1682,
+      "line": 1697,
       "authenticated": true
     },
     {
@@ -728,13 +728,13 @@
     {
       "path": "/api/wcplus/task/control",
       "file": "backend/app/kbase_http.go",
-      "line": 1688,
+      "line": 1703,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/new",
       "file": "backend/app/kbase_http.go",
-      "line": 1686,
+      "line": 1701,
       "authenticated": true
     },
     {

@@ -86,6 +86,18 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"content_hash":"`) {
 		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
 	}
+	var detailPayload struct {
+		Evaluation AgentEvaluationReport `json:"evaluation"`
+	}
+	if err := json.Unmarshal(detail.Body.Bytes(), &detailPayload); err != nil {
+		t.Fatalf("decode detail response: %v", err)
+	}
+	if !detailPayload.Evaluation.Passed || detailPayload.Evaluation.PackageContentHash != pkg.ContentHash ||
+		detailPayload.Evaluation.SuiteVersion != pkg.EvaluationPolicy.SuiteVersion ||
+		detailPayload.Evaluation.InputHash == "" || detailPayload.Evaluation.EvaluatorVersion == "" ||
+		detailPayload.Evaluation.EvaluatedAt == "" {
+		t.Fatalf("detail evaluation provenance = %#v", detailPayload.Evaluation)
+	}
 	versioned := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example?version=1.0.0", "secret-token")
 	if versioned.Code != http.StatusOK || !strings.Contains(versioned.Body.String(), `"version":"1.0.0"`) {
 		t.Fatalf("versioned detail status=%d body=%s", versioned.Code, versioned.Body.String())
@@ -102,6 +114,14 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	conflict := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(conflictPayload))
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("idempotency conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+
+	if err := os.Remove(store.AgentPackageEvaluationPath(pkg.ContentHash)); err != nil {
+		t.Fatalf("remove evaluation fixture: %v", err)
+	}
+	missingEvaluation := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example", "secret-token")
+	if missingEvaluation.Code != http.StatusInternalServerError {
+		t.Fatalf("detail without persisted evaluation status=%d body=%s", missingEvaluation.Code, missingEvaluation.Body.String())
 	}
 }
 
