@@ -20,7 +20,7 @@ func TestAgentPackageValidatesPinnedReleasePoliciesAndCapabilities(t *testing.T)
 	if !strings.HasPrefix(finalized.ContentHash, "sha256:") {
 		t.Fatalf("content hash = %q", finalized.ContentHash)
 	}
-	if err := ValidateAgentPackage(finalized, store, []string{"book-mcp/search", "book-mcp/resolve_citation"}); err != nil {
+	if err := ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs()); err != nil {
 		t.Fatalf("ValidateAgentPackage() error = %v", err)
 	}
 
@@ -30,8 +30,8 @@ func TestAgentPackageValidatesPinnedReleasePoliciesAndCapabilities(t *testing.T)
 	reordered.SafetyPolicy.AbstentionReasons = []string{"outside_scope", "insufficient_evidence"}
 	reordered.UIManifest.Capabilities = []string{"evidence", "reader", "grounded_chat", "search"}
 	reordered.ToolPolicy.Tools = []AgentPackageToolRule{
-		{MCPServer: "book-mcp", ToolName: "resolve_citation", Decision: AgentToolAllow},
-		{MCPServer: "book-mcp", ToolName: "search", Decision: AgentToolAllow},
+		{MCPServer: "book-mcp", ToolName: "agent.resolve_citation", Decision: AgentToolAllow},
+		{MCPServer: "book-mcp", ToolName: "agent.search", Decision: AgentToolAllow},
 	}
 	reorderedFinalized, err := FinalizeAgentPackage(reordered)
 	if err != nil {
@@ -45,7 +45,7 @@ func TestAgentPackageValidatesPinnedReleasePoliciesAndCapabilities(t *testing.T)
 func TestAgentPackageRejectsInvalidOrMutableReferences(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
-	knownTools := []string{"book-mcp/search", "book-mcp/resolve_citation"}
+	knownTools := AgentReadOnlyToolIDs()
 
 	tests := []struct {
 		name string
@@ -85,6 +85,52 @@ func TestAgentPackageRejectsInvalidOrMutableReferences(t *testing.T) {
 				t.Fatalf("ValidateAgentPackage() error = %v, want %q", err, tt.want)
 			}
 		})
+	}
+}
+
+func TestAgentPackageRejectsUsagePolicyDowngrade(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.UsagePolicy = BookUsageEvidenceOnly
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs()); err == nil || !strings.Contains(err.Error(), "usage policy") {
+		t.Fatalf("usage policy downgrade error = %v", err)
+	}
+}
+
+func TestAgentPackageRejectsMissingSourceIdentity(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Book.SourceType = ""
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs()); err == nil || !strings.Contains(err.Error(), "source type is required") {
+		t.Fatalf("missing source identity error = %v", err)
+	}
+}
+
+func TestAgentPackageRejectsNonURLSafePackageID(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := validAgentPackage()
+	pkg.PackageID = "agent/package"
+	pkg, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs()); err == nil || !strings.Contains(err.Error(), "package_id") {
+		t.Fatalf("unsafe package_id error = %v", err)
 	}
 }
 
@@ -162,8 +208,8 @@ func validAgentPackage() AgentPackage {
 			OutputSchema: "grounded-answer.v1",
 		}},
 		ToolPolicy: AgentPackageToolPolicy{Tools: []AgentPackageToolRule{
-			{MCPServer: "book-mcp", ToolName: "search", Decision: AgentToolAllow},
-			{MCPServer: "book-mcp", ToolName: "resolve_citation", Decision: AgentToolAllow},
+			{MCPServer: "book-mcp", ToolName: "agent.search", Decision: AgentToolAllow},
+			{MCPServer: "book-mcp", ToolName: "agent.resolve_citation", Decision: AgentToolAllow},
 		}},
 		SafetyPolicy: AgentPackageSafetyPolicy{
 			UsagePolicy:       BookUsageStandard,
@@ -187,7 +233,13 @@ func validAgentPackage() AgentPackage {
 
 func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 	t.Helper()
-	release := KnowledgeRelease{
+	if err := store.saveKnowledgeRelease(agentPackageTestRelease()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func agentPackageTestRelease() KnowledgeRelease {
+	return KnowledgeRelease{
 		SchemaVersion: KnowledgeReleaseSchemaVersion,
 		Version:       "1",
 		ReleaseID:     "release-1",
@@ -204,9 +256,6 @@ func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 		Quality:   BookQualityReport{Decision: BookQualityPass},
 		Citations: []BookKnowledgeCitation{{CitationID: "citation-1", BookID: "book-1", ChunkID: "chunk-1"}},
 		CreatedAt: "2026-07-19T00:00:00Z",
-	}
-	if err := store.saveKnowledgeRelease(release); err != nil {
-		t.Fatal(err)
 	}
 }
 

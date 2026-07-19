@@ -22,17 +22,8 @@
             "type": "array",
             "items": { "type": "string", "minLength": 1 }
           },
-          "observed_ids": {
-            "type": "array",
-            "items": { "type": "string", "minLength": 1 }
-          },
           "expected_value": { "type": "string" },
-          "observed_value": { "type": "string" },
           "expected_arguments": {
-            "type": "object",
-            "additionalProperties": { "type": "string" }
-          },
-          "observed_arguments": {
             "type": "object",
             "additionalProperties": { "type": "string" }
           }

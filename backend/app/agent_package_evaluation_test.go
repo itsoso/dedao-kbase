@@ -4,19 +4,22 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
 	suite := loadAgentEvaluationFixture(t)
 	pkg, err := FinalizeAgentPackage(validAgentPackage())
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC)
-	report, err := EvaluateAgentPackageDeterministically(pkg, suite, now)
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, now)
 	if err != nil {
 		t.Fatalf("EvaluateAgentPackageDeterministically() error = %v", err)
 	}
@@ -30,7 +33,7 @@ func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *test
 			t.Fatalf("metric %q = %v, report=%#v", metric, report.Metrics[metric], report)
 		}
 	}
-	replayed, err := EvaluateAgentPackageDeterministically(pkg, suite, now.Add(time.Hour))
+	replayed, err := EvaluateAgentPackageDeterministically(store, pkg, suite, now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +49,7 @@ func TestAgentPackageEvaluationFailedAndMissingMetricsBlockPublication(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	knownTools := []string{"book-mcp/search", "book-mcp/resolve_citation"}
+	knownTools := AgentReadOnlyToolIDs()
 	now := time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC)
 
 	if _, _, err := PublishAgentPackage(store, pkg, "missing-evaluation", knownTools, now); err == nil || !strings.Contains(err.Error(), "evaluation") {
@@ -54,41 +57,46 @@ func TestAgentPackageEvaluationFailedAndMissingMetricsBlockPublication(t *testin
 	}
 
 	suite := loadAgentEvaluationFixture(t)
-	suite.Cases[0].ObservedIDs = []string{"chunk-other"}
-	failed, err := EvaluateAgentPackageDeterministically(pkg, suite, now)
+	suite.Cases[0].ExpectedIDs = []string{"chunk-other"}
+	failed, err := EvaluateAgentPackageDeterministically(store, pkg, suite, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if failed.Passed || failed.Metrics["retrieval"] != 0 {
 		t.Fatalf("failed report = %#v", failed)
 	}
-	if err := store.SaveAgentPackageEvaluation(failed); err != nil {
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, failed); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := PublishAgentPackage(store, pkg, "failed-evaluation", knownTools, now); err == nil || !strings.Contains(err.Error(), "retrieval") {
 		t.Fatalf("failed evaluation publication error = %v", err)
 	}
 
-	passing, err := EvaluateAgentPackageDeterministically(pkg, loadAgentEvaluationFixture(t), now)
+	passingStore := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, passingStore)
+	passingSuite := loadAgentEvaluationFixture(t)
+	passing, err := EvaluateAgentPackageDeterministically(passingStore, pkg, passingSuite, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SaveAgentPackageEvaluation(passing); err != nil {
+	if err := passingStore.SaveAgentPackageEvaluation(pkg, passingSuite, passing); err != nil {
 		t.Fatal(err)
 	}
-	if _, created, err := PublishAgentPackage(store, pkg, "passing-evaluation", knownTools, now); err != nil || !created {
+	if _, created, err := PublishAgentPackage(passingStore, pkg, "passing-evaluation", knownTools, now); err != nil || !created {
 		t.Fatalf("passing evaluation publication created=%v err=%v", created, err)
 	}
 }
 
 func TestAgentPackageEvaluationPersistsInputAndEvaluatorIdentity(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
 	pkg, _ := FinalizeAgentPackage(validAgentPackage())
-	report, err := EvaluateAgentPackageDeterministically(pkg, loadAgentEvaluationFixture(t), time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC))
+	suite := loadAgentEvaluationFixture(t)
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SaveAgentPackageEvaluation(report); err != nil {
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, report); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := store.LoadAgentPackageEvaluation(pkg.ContentHash)
@@ -98,6 +106,83 @@ func TestAgentPackageEvaluationPersistsInputAndEvaluatorIdentity(t *testing.T) {
 	if loaded.PackageContentHash != pkg.ContentHash || loaded.InputHash != report.InputHash ||
 		loaded.EvaluatorVersion != report.EvaluatorVersion || loaded.EvaluatedAt != report.EvaluatedAt {
 		t.Fatalf("loaded report = %#v, want %#v", loaded, report)
+	}
+	storedSuite, err := store.LoadAgentPackageEvaluationSuite(pkg.ContentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluatedAt, _ := time.Parse(time.RFC3339Nano, loaded.EvaluatedAt)
+	recomputed, err := EvaluateAgentPackageDeterministically(store, pkg, *storedSuite, evaluatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(*loaded, recomputed) {
+		t.Fatalf("persisted evaluation changed trusted output:\nloaded=%#v\nrecomputed=%#v", *loaded, recomputed)
+	}
+	if err := ValidateAgentPackageEvaluationGate(store, pkg); err != nil {
+		t.Fatalf("trusted persisted evaluation failed gate: %v", err)
+	}
+}
+
+func TestAgentPackageEvaluationIgnoresCallerSuppliedObservations(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	suite := loadAgentEvaluationFixture(t)
+	suite.Cases[0].ObservedIDs = []string{"caller-forged-result"}
+	suite.Cases[1].ObservedIDs = []string{"caller-forged-citation"}
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Passed {
+		t.Fatalf("trusted evaluator used caller observations: %#v", report)
+	}
+}
+
+func TestAgentPackageEvaluationRejectsTamperingAndOverwrite(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	suite := loadAgentEvaluationFixture(t)
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := report
+	forged.InputHash = "sha256:" + strings.Repeat("0", 64)
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, forged); err == nil || !strings.Contains(err.Error(), "input hash") {
+		t.Fatalf("forged input hash error = %v", err)
+	}
+	forged = report
+	forged.EvaluatorVersion = "unapproved-evaluator"
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, forged); err == nil || !strings.Contains(err.Error(), "evaluator") {
+		t.Fatalf("forged evaluator error = %v", err)
+	}
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, report); err != nil {
+		t.Fatal(err)
+	}
+	overwrite := report
+	overwrite.Metrics = map[string]float64{"retrieval": 0}
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, overwrite); err == nil || !strings.Contains(err.Error(), "immutable") {
+		t.Fatalf("evaluation overwrite error = %v", err)
+	}
+	storedPath := store.AgentPackageEvaluationPath(pkg.ContentHash)
+	raw, err := os.ReadFile(storedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tampered AgentEvaluationReport
+	if err := json.Unmarshal(raw, &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered.InputHash = "sha256:" + strings.Repeat("f", 64)
+	payload, _ := json.Marshal(tampered)
+	if err := os.WriteFile(storedPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackageEvaluationGate(store, pkg); err == nil || !strings.Contains(err.Error(), "input hash") {
+		t.Fatalf("tampered persisted evaluation gate error = %v", err)
 	}
 }
 
@@ -138,14 +223,15 @@ func loadAgentEvaluationFixture(t *testing.T) AgentEvaluationSuite {
 
 func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeStore, pkg AgentPackage) {
 	t.Helper()
-	report, err := EvaluateAgentPackageDeterministically(pkg, loadAgentEvaluationFixture(t), time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC))
+	suite := loadAgentEvaluationFixture(t)
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !report.Passed {
 		t.Fatalf("test evaluation did not pass: %#v", report)
 	}
-	if err := store.SaveAgentPackageEvaluation(report); err != nil {
+	if err := store.SaveAgentPackageEvaluation(pkg, suite, report); err != nil {
 		t.Fatal(err)
 	}
 }

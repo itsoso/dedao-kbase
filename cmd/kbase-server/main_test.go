@@ -92,20 +92,30 @@ func TestDefaultSourceAgentTokenUsesTrimmedEnv(t *testing.T) {
 	}
 }
 
+func TestDefaultAgentPublisherTokenUsesTrimmedEnv(t *testing.T) {
+	t.Setenv("KBASE_AGENT_PUBLISHER_TOKEN", "  publisher-secret  ")
+	if got := defaultAgentPublisherToken(); got != "publisher-secret" {
+		t.Fatalf("defaultAgentPublisherToken() = %q", got)
+	}
+}
+
 func TestValidateKBaseTokenSeparation(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		adminToken string
-		agentToken string
-		wantError  bool
+		name           string
+		adminToken     string
+		agentToken     string
+		publisherToken string
+		wantError      bool
 	}{
-		{name: "distinct", adminToken: "admin-secret", agentToken: "agent-secret"},
+		{name: "distinct", adminToken: "admin-secret", agentToken: "agent-secret", publisherToken: "publisher-secret"},
 		{name: "agent disabled", adminToken: "admin-secret"},
 		{name: "admin disabled", agentToken: "agent-secret"},
 		{name: "shared", adminToken: "shared-secret", agentToken: "shared-secret", wantError: true},
+		{name: "publisher shares consumer", adminToken: "shared-secret", publisherToken: "shared-secret", wantError: true},
+		{name: "publisher shares source agent", agentToken: "shared-secret", publisherToken: "shared-secret", wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateKBaseTokenSeparation(test.adminToken, test.agentToken)
+			err := validateKBaseTokenSeparation(test.adminToken, test.agentToken, test.publisherToken)
 			if (err != nil) != test.wantError {
 				t.Fatalf("validateKBaseTokenSeparation() error = %v, wantError=%v", err, test.wantError)
 			}

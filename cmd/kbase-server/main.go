@@ -23,9 +23,10 @@ func main() {
 	exportPath := flag.String("system-kb-export", defaultSystemKBExportPath(), "system_kb_export.json path")
 	webDir := flag.String("web-dir", defaultWebDir(), "static web UI directory")
 	authToken := flag.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
+	agentPublisherToken := flag.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
 	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
 	flag.Parse()
-	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken); err != nil {
+	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken, *agentPublisherToken); err != nil {
 		log.Fatal(err)
 	}
 	sourceSync, err := app.NewSourceSyncStore(*root)
@@ -43,6 +44,7 @@ func main() {
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:                  bookStore,
 		AuthToken:              *authToken,
+		AgentPublisherToken:    *agentPublisherToken,
 		SystemKBExportPath:     *exportPath,
 		StaticDir:              *webDir,
 		WeChat:                 app.NewWeChatSourceService(app.WeChatSourceConfigFromEnv()),
@@ -65,6 +67,11 @@ func main() {
 		log.Printf("source agent API disabled until KBASE_SOURCE_AGENT_TOKEN is configured")
 	} else {
 		log.Printf("source agent API enabled")
+	}
+	if strings.TrimSpace(*agentPublisherToken) == "" {
+		log.Printf("agent package publisher API disabled until KBASE_AGENT_PUBLISHER_TOKEN is configured")
+	} else {
+		log.Printf("agent package publisher API enabled with a dedicated token")
 	}
 	if strings.TrimSpace(os.Getenv("WECHAT_MP_TOKEN")) == "" || strings.TrimSpace(os.Getenv("WECHAT_MP_COOKIE")) == "" {
 		log.Printf("wechat source: official account search/list disabled until WECHAT_MP_TOKEN and WECHAT_MP_COOKIE are configured")
@@ -103,13 +110,24 @@ func main() {
 	}
 }
 
-func validateKBaseTokenSeparation(adminToken, sourceAgentToken string) error {
+func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherToken string) error {
 	adminToken = strings.TrimSpace(adminToken)
 	sourceAgentToken = strings.TrimSpace(sourceAgentToken)
+	agentPublisherToken = strings.TrimSpace(agentPublisherToken)
 	if adminToken != "" && sourceAgentToken != "" && adminToken == sourceAgentToken {
 		return errors.New("KBASE_SOURCE_AGENT_TOKEN must differ from KBASE_AUTH_TOKEN")
 	}
+	if agentPublisherToken != "" && adminToken != "" && agentPublisherToken == adminToken {
+		return errors.New("KBASE_AGENT_PUBLISHER_TOKEN must differ from KBASE_AUTH_TOKEN")
+	}
+	if agentPublisherToken != "" && sourceAgentToken != "" && agentPublisherToken == sourceAgentToken {
+		return errors.New("KBASE_AGENT_PUBLISHER_TOKEN must differ from KBASE_SOURCE_AGENT_TOKEN")
+	}
 	return nil
+}
+
+func defaultAgentPublisherToken() string {
+	return strings.TrimSpace(os.Getenv("KBASE_AGENT_PUBLISHER_TOKEN"))
 }
 
 type sourceSchedulerRunner interface {

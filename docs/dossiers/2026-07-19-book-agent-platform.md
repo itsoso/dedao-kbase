@@ -383,6 +383,52 @@ Required return upstream before a new G4 attempt:
 5. redact citation source paths, constrain fingerprint/hash formats and IDs,
    then rerun G3 and independent G4 review.
 
+## G4 remediation checkpoint 1: publication trust boundary
+
+**Decision: PASS for the first remediation batch; G4 remains NO-GO.** This batch
+closes the source-policy, evaluation-provenance, package-ID, and publisher-token
+findings. MCP versioning, the package-scoped runtime, consumer lifecycle and
+feedback, citation redaction, trace constraints, and Health review progression
+remain release blockers. No push or deployment was attempted.
+
+Delivered:
+
+- Package IDs now follow the JSON Schema's URL-safe identity rule.
+- Every pinned release must have a non-empty authorized source type, and an
+  `evidence_only` release cannot be downgraded into a `standard` package.
+- Synthetic evaluation observations are derived from the package's pinned
+  release claims, citations, chunks, allowed tools, abstention reasons, and
+  bounded arguments rather than accepted from the suite fixture.
+- Evaluation reports persist their trusted suite sidecar, recompute the input
+  hash and approved evaluator output at save and publication time, and are
+  immutable for a package content hash.
+- `KBASE_AGENT_PUBLISHER_TOKEN` is separate from consumer and source-agent
+  credentials; ordinary consumer tokens cannot call Package publication.
+
+TDD and exact results:
+
+- `go test ./backend/app -run 'TestAgentPackageRejectsUsagePolicyDowngrade|TestAgentPackageRejectsMissingSourceIdentity|TestAgentPackageRejectsNonURLSafePackageID|TestAgentPackageEvaluation|TestKBaseHTTPHandlerPublishesAndReadsAgentPackages' -count=1`
+  — RED first because the trusted evaluator/store signatures and dedicated
+  publisher configuration did not exist.
+- The first GREEN attempt exposed immutable release-fixture reuse and a
+  persisted `nil` versus in-memory empty failure slice; targeted regressions
+  reproduced both. Test fixtures now create the intended immutable release,
+  and trusted reports normalize the empty failure set before persistence.
+- A second focused attempt exposed pointer-versus-value comparison inside the
+  publication Gate; the persisted/recomputed identity regression failed before
+  dereferencing and passed afterward.
+- `go test ./backend/app ./cmd/kbase-server -run 'TestAgentPackageRejectsUsagePolicyDowngrade|TestAgentPackageRejectsMissingSourceIdentity|TestAgentPackageRejectsNonURLSafePackageID|TestAgentPackageEvaluation|TestKBaseHTTPHandlerPublishesAndReadsAgentPackages|TestDefaultAgentPublisherToken|TestValidateKBaseTokenSeparation' -count=1`
+  — PASS.
+- `jq empty contracts/agent-evaluation-v1.schema.json testdata/agent-evals/book-agent-v1.json`
+  — PASS.
+- `go test ./backend/app ./cmd/kbase-server -run 'AgentPackage|AgentEvaluation|KBaseHTTPHandlerPublishesAndReadsAgentPackages|KBaseTokenSeparation' -count=1`
+  — PASS.
+- `go test ./...` — PASS.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` and
+  `bash scripts/system-map-smoke.sh` — PASS; regenerated because the HTTP
+  configuration and evaluation store changed structural inventory.
+- `bash scripts/privacy-smoke.sh` and `git diff --check` — PASS.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.

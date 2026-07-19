@@ -18,7 +18,7 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 	savePassingAgentPackageTestEvaluation(t, store, pkg)
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 
-	published, created, err := PublishAgentPackage(store, pkg, "operator:package:1", []string{"book-mcp/search", "book-mcp/resolve_citation"}, now)
+	published, created, err := PublishAgentPackage(store, pkg, "operator:package:1", AgentReadOnlyToolIDs(), now)
 	if err != nil {
 		t.Fatalf("PublishAgentPackage() error = %v", err)
 	}
@@ -39,7 +39,7 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 		t.Fatalf("atomic publication left temporary files: %v", temporary)
 	}
 
-	replayed, created, err := PublishAgentPackage(store, pkg, "operator:package:1", []string{"book-mcp/search", "book-mcp/resolve_citation"}, now.Add(time.Hour))
+	replayed, created, err := PublishAgentPackage(store, pkg, "operator:package:1", AgentReadOnlyToolIDs(), now.Add(time.Hour))
 	if err != nil {
 		t.Fatalf("idempotent replay error = %v", err)
 	}
@@ -54,7 +54,7 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 		t.Fatal(err)
 	}
 	savePassingAgentPackageTestEvaluation(t, store, changed)
-	if _, _, err := PublishAgentPackage(store, changed, "operator:package:1", []string{"book-mcp/search", "book-mcp/resolve_citation"}, now); !errors.Is(err, ErrAgentPackageIdempotencyConflict) {
+	if _, _, err := PublishAgentPackage(store, changed, "operator:package:1", AgentReadOnlyToolIDs(), now); !errors.Is(err, ErrAgentPackageIdempotencyConflict) {
 		t.Fatalf("reused idempotency key error = %v", err)
 	}
 }
@@ -62,7 +62,7 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
-	knownTools := []string{"book-mcp/search", "book-mcp/resolve_citation"}
+	knownTools := AgentReadOnlyToolIDs()
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 
 	first, err := FinalizeAgentPackage(validAgentPackage())
@@ -131,7 +131,7 @@ func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.
 func TestAgentPackageStoreRejectsMutableVersionReuse(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
-	knownTools := []string{"book-mcp/search", "book-mcp/resolve_citation"}
+	knownTools := AgentReadOnlyToolIDs()
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	first, _ := FinalizeAgentPackage(validAgentPackage())
 	savePassingAgentPackageTestEvaluation(t, store, first)

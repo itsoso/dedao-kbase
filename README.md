@@ -88,6 +88,7 @@ flowchart LR
 ```bash
 cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
+KBASE_AGENT_PUBLISHER_TOKEN="replace-with-separate-publisher-secret" \
 KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
@@ -111,6 +112,7 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `POST /api/knowledge/releases/{release_id}/receipts`：下游导入后的幂等 delivery receipt。
 - `GET /api/knowledge/lineage/{object_id}`：查询 release 或 book 的来源、hash、artifact refs 和 citation IDs。
 - `GET /api/knowledge/impact`、`GET /api/knowledge/gaps`：查看导入回执、pipeline 阶段和隐私安全 gap 聚合。
+- `POST /api/agent-packages/publish`：仅接受独立的 `KBASE_AGENT_PUBLISHER_TOKEN`；普通 API/consumer token 不能发布 Agent Package。
 
 机器可读契约和 consumer 接入说明见 `contracts/*.schema.json` 与 `docs/contracts/knowledge-supply-v1.md`。
 
@@ -124,7 +126,7 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 
 推荐使用“本地 Agent + 在线 KBase 控制面”：`wcplus-agent` 只访问本机 loopback WC Plus API，并通过出站 HTTPS 租用同步任务、上传文章和回报计数。不要把 WC Plus 的 loopback API 通过公网隧道暴露，也不要把微信 cookie 或 WC Plus 请求参数上传到 KBase。
 
-在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`。该 token 必须与浏览器/API 使用的 `KBASE_AUTH_TOKEN` 分离，并使用不含空格的可打印 ASCII 字符。
+在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`，并使用另一个独立的 `KBASE_AGENT_PUBLISHER_TOKEN` 保护 Agent Package 发布。三个 token 必须彼此不同，并使用不含空格的可打印 ASCII 字符。Proofroom、Health 等只读消费者只能获得 `KBASE_AUTH_TOKEN`，不能获得发布 token。
 
 本机 Agent 配置契约：
 

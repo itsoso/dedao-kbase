@@ -5,9 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
+
+var agentPackageIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 const (
 	AgentPackageSchemaVersion = "agent-package.v1"
@@ -127,6 +130,9 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 		"evaluation_policy.suite_version":   pkg.EvaluationPolicy.SuiteVersion,
 	}); err != nil {
 		return err
+	}
+	if !agentPackageIDPattern.MatchString(pkg.PackageID) {
+		return fmt.Errorf("package_id must contain only URL-safe letters, digits, dot, underscore, or hyphen")
 	}
 	if err := validateAgentPackageState(pkg); err != nil {
 		return err
@@ -334,8 +340,21 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 		if err != nil {
 			return fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
 		}
-		if sourceType := strings.TrimSpace(release.Book.SourceType); sourceType != "" && !allowedSources[sourceType] {
+		sourceType := strings.TrimSpace(release.Book.SourceType)
+		if sourceType == "" {
+			return fmt.Errorf("release %q source type is required", ref.ReleaseID)
+		}
+		if !allowedSources[sourceType] {
 			return fmt.Errorf("release %q source type %q is outside retrieval policy", ref.ReleaseID, sourceType)
+		}
+		switch release.UsagePolicy {
+		case BookUsageStandard:
+		case BookUsageEvidenceOnly:
+			if pkg.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly {
+				return fmt.Errorf("release %q usage policy %q cannot be downgraded to package policy %q", ref.ReleaseID, release.UsagePolicy, pkg.SafetyPolicy.UsagePolicy)
+			}
+		default:
+			return fmt.Errorf("release %q usage policy %q is unsupported", ref.ReleaseID, release.UsagePolicy)
 		}
 		if pkg.RetrievalPolicy.RequireCitations && len(ref.CitationIDs) == 0 {
 			return fmt.Errorf("release %q citation_ids is required", ref.ReleaseID)

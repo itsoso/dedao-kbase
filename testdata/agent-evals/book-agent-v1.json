@@ -5,32 +5,27 @@
     {
       "case_id": "retrieval-synthetic-1",
       "metric": "retrieval",
-      "expected_ids": ["chunk-synthetic-1"],
-      "observed_ids": ["chunk-synthetic-1"]
+      "expected_ids": ["chunk-1"]
     },
     {
       "case_id": "citation-synthetic-1",
       "metric": "citations",
-      "expected_ids": ["citation-1"],
-      "observed_ids": ["citation-1"]
+      "expected_ids": ["citation-1"]
     },
     {
       "case_id": "faithfulness-synthetic-1",
       "metric": "faithfulness",
-      "expected_ids": ["claim-synthetic-1"],
-      "observed_ids": ["claim-synthetic-1"]
+      "expected_ids": ["claim-1"]
     },
     {
       "case_id": "abstention-synthetic-1",
       "metric": "abstention",
-      "expected_value": "insufficient_evidence",
-      "observed_value": "insufficient_evidence"
+      "expected_value": "insufficient_evidence"
     },
     {
       "case_id": "tool-choice-synthetic-1",
       "metric": "tool_choice",
-      "expected_value": "book-mcp/search",
-      "observed_value": "book-mcp/search"
+      "expected_value": "book-mcp/agent.search"
     },
     {
       "case_id": "tool-arguments-synthetic-1",
@@ -38,12 +33,7 @@
       "expected_arguments": {
         "package_id": "agent-package-example",
         "release_id": "release-1",
-        "query_fingerprint": "sha256:synthetic-query"
-      },
-      "observed_arguments": {
-        "package_id": "agent-package-example",
-        "release_id": "release-1",
-        "query_fingerprint": "sha256:synthetic-query"
+        "query_fingerprint": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
       }
     }
   ]

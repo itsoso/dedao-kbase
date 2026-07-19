@@ -20,6 +20,7 @@ import (
 type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
 	AuthToken               string
+	AgentPublisherToken     string
 	SystemKBExportPath      string
 	StaticDir               string
 	WeChat                  *WeChatSourceService
@@ -49,6 +50,7 @@ type DedaoLibraryService interface {
 type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
 	authToken               string
+	agentPublisherToken     string
 	systemKBExportPath      string
 	staticDir               string
 	wechat                  *WeChatSourceService
@@ -82,7 +84,14 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceIngest = NewSourceIngestService(store, cfg.SourceSync)
 	}
 	authToken := strings.TrimSpace(cfg.AuthToken)
+	agentPublisherToken := strings.TrimSpace(cfg.AgentPublisherToken)
 	sourceAgentToken := strings.TrimSpace(cfg.SourceAgentToken)
+	if agentPublisherToken != "" && agentPublisherToken == authToken {
+		agentPublisherToken = ""
+	}
+	if agentPublisherToken != "" && agentPublisherToken == sourceAgentToken {
+		agentPublisherToken = ""
+	}
 	if authToken != "" && sourceAgentToken == authToken {
 		sourceAgentToken = ""
 	}
@@ -116,6 +125,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
+		agentPublisherToken:     agentPublisherToken,
 		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:               strings.TrimSpace(cfg.StaticDir),
 		wechat:                  cfg.WeChat,
@@ -181,6 +191,17 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleSourceAgent(w, r)
+		return
+	}
+	if r.URL.Path == "/api/agent-packages/publish" {
+		if h.agentPublisherToken == "" {
+			writeHTTPError(w, http.StatusServiceUnavailable, "agent package publisher API is not configured")
+			return
+		}
+		if !authorizeBearerToken(w, r, h.agentPublisherToken) {
+			return
+		}
+		h.handleAgentPackages(w, r)
 		return
 	}
 	if !h.authorize(w, r) {

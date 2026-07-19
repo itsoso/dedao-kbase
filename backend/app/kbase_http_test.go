@@ -59,30 +59,35 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store:     store,
-		AuthToken: "secret-token",
+		Store:               store,
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
 	})
 
 	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "", string(payload))
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized publish status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
 	}
-	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(payload))
+	consumerPublish := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "consumer-token", string(payload))
+	if consumerPublish.Code != http.StatusUnauthorized {
+		t.Fatalf("consumer publish status=%d body=%s", consumerPublish.Code, consumerPublish.Body.String())
+	}
+	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(payload))
 	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"created":true`) ||
 		!strings.Contains(published.Body.String(), `"lifecycle_state":"published"`) {
 		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
 	}
-	replayed := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(payload))
+	replayed := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(payload))
 	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) {
 		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
 	}
 
-	list := requestKBase(handler, http.MethodGet, "/api/agent-packages", "secret-token")
+	list := requestKBase(handler, http.MethodGet, "/api/agent-packages", "consumer-token")
 	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"package_id":"agent-package-example"`) ||
 		!strings.Contains(list.Body.String(), `"url":"/api/agent-packages/agent-package-example?version=1.0.0"`) {
 		t.Fatalf("list status=%d body=%s", list.Code, list.Body.String())
 	}
-	detail := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example", "secret-token")
+	detail := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example", "consumer-token")
 	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"content_hash":"`) {
 		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
 	}
@@ -98,7 +103,7 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 		detailPayload.Evaluation.EvaluatedAt == "" {
 		t.Fatalf("detail evaluation provenance = %#v", detailPayload.Evaluation)
 	}
-	versioned := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example?version=1.0.0", "secret-token")
+	versioned := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example?version=1.0.0", "consumer-token")
 	if versioned.Code != http.StatusOK || !strings.Contains(versioned.Body.String(), `"version":"1.0.0"`) {
 		t.Fatalf("versioned detail status=%d body=%s", versioned.Code, versioned.Body.String())
 	}
@@ -111,7 +116,7 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	}
 	savePassingAgentPackageTestEvaluation(t, store, changed)
 	conflictPayload, _ := json.Marshal(AgentPackagePublishRequest{IdempotencyKey: "operator:http:1", Package: changed})
-	conflict := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "secret-token", string(conflictPayload))
+	conflict := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(conflictPayload))
 	if conflict.Code != http.StatusConflict {
 		t.Fatalf("idempotency conflict status=%d body=%s", conflict.Code, conflict.Body.String())
 	}
@@ -119,7 +124,7 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	if err := os.Remove(store.AgentPackageEvaluationPath(pkg.ContentHash)); err != nil {
 		t.Fatalf("remove evaluation fixture: %v", err)
 	}
-	missingEvaluation := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example", "secret-token")
+	missingEvaluation := requestKBase(handler, http.MethodGet, "/api/agent-packages/agent-package-example", "consumer-token")
 	if missingEvaluation.Code != http.StatusInternalServerError {
 		t.Fatalf("detail without persisted evaluation status=%d body=%s", missingEvaluation.Code, missingEvaluation.Body.String())
 	}
