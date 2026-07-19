@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** Delivery in progress; Tasks 1-7 checkpoints passed
+**Status:** BLOCKED at G4 review; Tasks 1-9 implemented and G3 passed
 
 ## Objective
 
@@ -27,10 +27,12 @@ prescription or dosage decisions, and personal-data write tools.
   package/runtime/tool/evaluation separation. Paid-source usage policy,
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
-- **G3 Test: PENDING.** Requires package schema, store, policy, evaluation, and
-  cross-consumer contract tests.
-- **G4 Review: PENDING.** Requires architecture and safety review after the proof
-  pilot passes.
+- **G3 Test: PASS.** The full KBase, Proofroom, and Health release matrix passed
+  on the integrated feature heads recorded below.
+- **G4 Review: NO-GO.** Independent architecture and cross-consumer safety
+  review found release-blocking policy, evaluation, authorization, runtime,
+  lifecycle, feedback, and citation-disclosure gaps. The implementation has
+  returned upstream; no push or deployment is permitted.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -226,6 +228,160 @@ Health commits:
 - `9ed97637a feat(kbase): hold health agent packages for review`;
 - `07cfa8eda fix(kbase): fail closed on health package review`;
 - `8463c3b61 fix(kbase): retain incremental package lineage`.
+
+## Task 8: Bounded traces and replay
+
+Delivered:
+
+- a versioned trace contract for package/release identities, evidence ranks,
+  model routing, policy decisions, tool outcomes, citations, and fingerprints;
+- persisted payload redaction for credentials, source bodies, private prompts,
+  and consumer user identifiers;
+- immutable, idempotent trace persistence with conflicting identity rejection;
+- deterministic replay over stored evidence hashes and mocked model/tool
+  outcomes;
+- an allowlisted OTLP/OpenInference-style span projection for optional tracing
+  backends.
+
+Exact commands and results:
+
+- `go test ./backend/app -run AgentTrace -count=1` — RED first because trace
+  symbols were undefined; GREEN after implementation.
+- The immutable trace regression was RED before conflict detection and GREEN
+  after the store rejected a second payload for the same trace ID.
+- `jq empty contracts/agent-trace-v1.schema.json` — PASS.
+- `go test ./backend/app -run 'AgentTrace|AgentToolPolicy|AgentPackageEvaluation' -count=1`
+  — PASS.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` —
+  PASS; regenerated because trace types changed structural inventory.
+- `bash scripts/system-map-smoke.sh`, `bash scripts/privacy-smoke.sh`, and
+  `git diff --check` — PASS.
+
+Task 8 commit: `acf913d feat(kbase): trace and replay agent runs`.
+
+## Task 9: Shared Book App
+
+Delivered:
+
+- stable `/agent-packages`, `/agents`, and `/book-apps` routes backed by one
+  shared renderer;
+- package/release/evaluation loading and manifest-gated reader, search,
+  grounded-chat, evidence, quiz, and action-plan surfaces;
+- explicit unavailable states for declared capabilities without a connected
+  runtime, rather than empty links;
+- responsive desktop/mobile layouts with no horizontal overflow in the bounded
+  browser check.
+
+Exact commands and results:
+
+- `node frontend-web/scripts/book-knowledge-web-smoke.mjs` — RED first because
+  the shared renderer and stable route contract were absent; GREEN after
+  implementation.
+- `node --check frontend-web/app.js` — PASS.
+- `for smoke in frontend-web/scripts/*.mjs; do node "$smoke"; done` — PASS for
+  Book Knowledge, ebook loading, token header, markdown, WC Plus control-plane
+  and source, and WeChat collector and source smokes.
+- An ephemeral Playwright harness ran the static Web client through the
+  webapp-testing server helper — PASS at widths 1440 and 390; six declared
+  capabilities rendered, two unavailable capabilities were explicit, search
+  and chat interactions completed, and horizontal overflow was `0` at both
+  widths.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json` and
+  `bash scripts/system-map-smoke.sh` — PASS; the generator produced no diff.
+- `bash scripts/privacy-smoke.sh` and `git diff --check` — PASS.
+
+Task 9 commit: `f70068a feat(web): add shared book agent shell`.
+
+## Checkpoint: Task 10 release gates
+
+**Decision: G3 PASS; G4 NO-GO.** Release progression stopped at the failed
+review Gate. No feature branch was pushed and no deployment or online mutation
+was attempted. G5 and G6 remain pending.
+
+Integrated revisions:
+
+- KBase `f70068a`; canonical `dedao-kbase/main` at `dd6bc9c` is its direct
+  ancestor, so no main integration commit was required.
+- Proofroom `815fe7c5`, merging current `origin/main` into the consumer feature.
+- Health `2852250a9`, merging current `origin/main` into the consumer feature;
+  the generated system map was regenerated from the merged source tree and its
+  drift hook passed under the project environment.
+
+G3 exact commands and results:
+
+- `go test ./...` — PASS.
+- `go test -race ./backend/app ./cmd/kbase-server -count=1` — PASS; the macOS
+  linker emitted non-fatal `LC_DYSYMTAB` warnings.
+- `cd frontend && npm run build` — PASS with existing large-chunk and `eval`
+  warnings.
+- `node frontend/scripts/markdown-render-smoke.mjs` and
+  `node frontend/scripts/book-knowledge-ui-smoke.mjs` — PASS.
+- `for smoke in frontend-web/scripts/*.mjs; do node "$smoke"; done` — PASS.
+- `bash scripts/proof-consumer-contract-smoke.sh` and
+  `bash scripts/knowledge-contract-smoke.sh` — PASS.
+- `jq empty contracts/agent-package-v1.schema.json contracts/agent-trace-v1.schema.json`
+  — PASS.
+- `go test ./backend/app -run 'AgentPackage|AgentToolPolicy|BookKnowledgeMCP|AgentTrace|KBaseHTTPHandlerPublishesAndReadsAgentPackages' -count=1`
+  — PASS.
+- `python -m pytest -q tests/test_kbase_release_consumer.py tests/test_decision_engine.py tests/test_claim_verifier_routing.py tests/test_claim_verifier_quota_query_cache.py tests/test_knowledge_runtime.py tests/test_dedao_kbase_sync.py`
+  in the Proofroom project environment — PASS after current-main integration,
+  `126 passed in 9.32s`.
+- `python -m py_compile rpa_llm/kbase_release_consumer.py rpa_llm/claim_verifier.py rpa_llm/decision_engine.py tests/test_kbase_release_consumer.py`
+  — PASS.
+- `python -m pytest -o addopts='' -q backend/tests/test_dedao_kbase_release_consumer.py backend/tests/test_dedao_kbase_export_importer.py backend/tests/test_system_knowledge_lifecycle.py backend/tests/test_system_knowledge_ingest.py backend/tests/test_kb_reconciliation.py backend/tests/test_kb_reconciliation_e2e.py backend/tests/test_kb_reconciliation_evalcase.py backend/tests/test_kb_reconciliation_judge.py backend/tests/test_kb_reconciliation_merge.py backend/tests/test_safety_failloud_consumers.py`
+  in the Health project environment — PASS after current-main integration,
+  `176 passed, 6 warnings in 31.53s`.
+- `ruff check backend/app/integrations/dedao_kbase_release_consumer.py backend/app/tasks/system_knowledge_lifecycle.py backend/tests/test_dedao_kbase_release_consumer.py`
+  and the matching `python -m py_compile` command — PASS.
+- `python scripts/dump_system_map.py` and `python scripts/check_doc_drift.py` in
+  Health — PASS; the generated inventory matches the merged source tree.
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json`,
+  `bash scripts/system-map-smoke.sh`, `bash scripts/privacy-smoke.sh`, and
+  `git diff --check` in KBase — PASS. Both consumer worktrees also passed
+  `git diff --check` and targeted newly-added-line privacy scans.
+
+G4 independent review findings:
+
+- **Critical:** package publication does not prevent a release usage-policy
+  downgrade or require non-empty authorized source types.
+- **Critical:** evaluation reports can be overwritten and publication does not
+  recompute the input hash or pin the approved evaluator; the synthetic adapter
+  also scores caller-supplied observations rather than package behavior.
+- **Critical:** one bearer credential authorizes both read consumers and package
+  publication, so operator-only publication is not enforced.
+- **Important:** MCP calls omit package version and load mutable latest state;
+  search also does not enforce the package context limit.
+- **Important:** the shared Book App calls generic single-book search/chat,
+  ignores additional pinned releases and package retrieval/model/safety/tool
+  policy, and omits answer citation evidence.
+- **Important:** Proofroom imports superseded package records without lifecycle
+  or freshness filtering.
+- **Important:** package feedback helpers are not wired into Proofroom or Health
+  usage paths, so the planned feedback closure is not operational.
+- **Important:** the isolated Health package workspace has no selector in the
+  ordinary admin review API, leaving no normal human-review progression path.
+- **Important:** citation resolution can return `SourceHTML`, including local
+  ebook paths; trace fingerprint fields are not constrained to actual bounded
+  hashes; Go package-ID validation is weaker than the JSON Schema.
+
+The cross-consumer reviewer confirmed that Health remains draft-only,
+human-review-blocked, and free of serving-index, personal-data, diagnosis,
+prescription, dosage, or tool-execution writes. Proof neutrality remains intact
+for non-stale candidates. These preserved boundaries do not override the failed
+platform Gate.
+
+Required return upstream before a new G4 attempt:
+
+1. add RED regressions and enforce source-policy monotonicity, source identity,
+   immutable evaluator evidence, recomputed inputs, and separated publisher
+   authorization;
+2. version every MCP call and enforce package retrieval/tool limits;
+3. provide a package-scoped multi-release runtime with citation-bearing output,
+   or mark search/chat unavailable until that runtime exists;
+4. filter consumer imports to valid current lifecycle state and wire bounded
+   package feedback into both consumers;
+5. redact citation source paths, constrain fingerprint/hash formats and IDs,
+   then rerun G3 and independent G4 review.
 
 ## Decisions
 
