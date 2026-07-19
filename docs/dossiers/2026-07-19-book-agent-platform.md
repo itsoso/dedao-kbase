@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** BLOCKED at G4 review; Health configured-root lock identity remains NO-GO
+**Status:** G3 revalidation pending after Health safety GO; no push or deployment
 
 ## Objective
 
@@ -27,13 +27,14 @@ prescription or dosage decisions, and personal-data write tools.
   package/runtime/tool/evaluation separation. Paid-source usage policy,
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
-- **G3 Test: PASS.** The full KBase, Proofroom, and Health release matrix passed
-  on the integrated feature heads recorded below.
+- **G3 Test: REVALIDATION PENDING.** The earlier full matrix passed, and the
+  final Health remediation passed its complete consumer matrix. The full
+  three-repository matrix must now be rerun on the exact current heads.
 - **G4 Review: NO-GO.** Independent architecture and cross-consumer safety
   review findings have been remediated through the package runtime, Proofroom,
-  and most Health review paths, but the mandatory Health re-review still found
-  one release-blocking configured-root symlink/lock-identity gap. The
-  implementation has returned upstream; no push or deployment is permitted.
+  and Health review paths, and the mandatory Health-specific safety review now
+  returns GO. Fresh architecture and cross-consumer G4 reviews remain required
+  after G3 passes. No push or deployment is permitted yet.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -568,11 +569,11 @@ TDD and exact results:
 
 ## G4 remediation checkpoint 5: Health review workspace
 
-**Decision: NO-GO.** The normal configured-directory path now satisfies the
-Health review and safety boundaries, but the independent safety reviewer found
-that a configured release root which is itself a symbolic link still produces
-different lock identities between synchronization and review/publish paths.
-G4 remains failed. No branch was pushed and no deployment was attempted.
+**Decision: PASS after correction and independent re-review.** The normal and
+symbolic-link configured-directory paths now use one physical workspace and
+one lock identity. Health retains review and safety ownership. Fresh
+cross-repository G3 and G4 remain pending. No branch was pushed and no
+deployment was attempted.
 
 Delivered in Health revisions `1ea87f2d8` and `9a8f5f44f`:
 
@@ -610,7 +611,7 @@ virtual environment active:
   `git diff --check` passed before commit;
 - all commit hooks passed for `9a8f5f44f`.
 
-Mandatory independent safety re-review of `9a8f5f44f`: **NO-GO**. Review and
+The first mandatory independent safety re-review of `9a8f5f44f`: **NO-GO**. Review and
 publish resolve the configured root, while release and Agent Package sync still
 use the expanded but unresolved configured path. With a symlinked configured
 root, those paths lock different files and parent replacement can replace the
@@ -618,6 +619,43 @@ symlink entry rather than the resolved workspace. Required upstream correction:
 normalize sync and service paths to one resolved root, or reject a symlinked
 configured root, then add a root-symlink lock/replacement regression and repeat
 the safety review.
+
+Final correction in Health revision `bff01c3b2`:
+
+- `_dedao_kbase_review_artifact_dir()` now resolves the configured path before
+  either release or Agent Package synchronization derives a target or lock;
+- the root-symlink regression proves sync and review resolve to the same
+  physical path, their locks serialize, a full release rebuild replaces the
+  physical workspace, the configured link remains a link, and the rebuilt
+  workspace is visible to review.
+
+Exact final correction commands and results from the Health worktree with its
+project virtual environment active:
+
+- `python -m pytest -o addopts='' -q backend/tests/test_dedao_kbase_release_consumer.py::test_configured_release_root_symlink_uses_one_workspace_for_sync_and_review`
+  — RED first, `1 failed, 6 warnings in 0.55s`, because sync returned the link
+  path while review returned the physical path; GREEN after the one-line path
+  normalization, `1 passed, 6 warnings in 1.18s`;
+- the six-test focused command covering parent rebuild, parent/child locking,
+  configured-root locking/replacement, workspace selection, service signatures,
+  and child-link escape — PASS, `6 passed, 6 warnings in 2.61s`;
+- the same eleven-file Health release matrix recorded above — PASS,
+  `225 passed, 6 warnings in 33.50s`;
+- `python -m py_compile backend/app/tasks/system_knowledge_lifecycle.py backend/tests/test_dedao_kbase_release_consumer.py`
+  — PASS;
+- `ruff check backend/app/tasks/system_knowledge_lifecycle.py backend/tests/test_dedao_kbase_release_consumer.py`
+  — PASS;
+- `python scripts/check_doc_drift.py` — PASS. No structural inventory changed,
+  so the Health system map was not regenerated;
+- the added-line privacy scan found no machine path, credential, key, or token
+  literal, `git diff --check` passed, and every commit hook passed.
+
+Mandatory independent safety re-review of `bff01c3b2`: **GO**. The reviewer
+confirmed one resolved physical workspace and coordination lock across sync,
+review, finalize, and publish; preservation of the fixed child during parent
+replacement; rejection of arbitrary and escaping workspace paths; and no
+serving, personal-health, diagnosis, prescription, dosage, or tool-execution
+mutation before Health-owned review and explicit publication.
 
 ## Decisions
 
