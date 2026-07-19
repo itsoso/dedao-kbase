@@ -41,6 +41,7 @@ type DedaoLibraryService interface {
 	CourseList(category, order string, page, limit int) (*services.CourseList, error)
 	CourseInfo(enid string) (*services.CourseInfo, error)
 	ArticleList(enid, chapterID string, count, maxID int) (*services.ArticleList, error)
+	ArticleDetail(enid string) (*services.ArticleDetail, error)
 }
 
 type kbaseHTTPHandler struct {
@@ -135,6 +136,10 @@ func (defaultDedaoLibrary) CourseInfo(enid string) (*services.CourseInfo, error)
 
 func (defaultDedaoLibrary) ArticleList(enid, chapterID string, count, maxID int) (*services.ArticleList, error) {
 	return ArticleList(enid, chapterID, count, maxID)
+}
+
+func (defaultDedaoLibrary) ArticleDetail(enid string) (*services.ArticleDetail, error) {
+	return ArticleDetail(enid)
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +286,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/dedao/course" {
 		h.handleDedaoCourse(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/course/articles" {
+		h.handleDedaoCourseArticles(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/article" {
+		h.handleDedaoArticle(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -546,6 +559,59 @@ func (h *kbaseHTTPHandler) handleDedaoCourse(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	writeHTTPJSON(w, http.StatusOK, info)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoCourseArticles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	enid := strings.TrimSpace(r.URL.Query().Get("enid"))
+	if enid == "" {
+		writeHTTPError(w, http.StatusBadRequest, "missing enid")
+		return
+	}
+	count := parseBoundedInt(r.URL.Query().Get("count"), 30, 1, 100)
+	maxID := parseBoundedInt(r.URL.Query().Get("max_id"), 0, 0, int(^uint(0)>>1))
+	articles, err := h.dedaoLibrary.ArticleList(enid, "", count, maxID)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if articles == nil {
+		articles = &services.ArticleList{}
+	}
+	writeHTTPJSON(w, http.StatusOK, articles)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoArticle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	enid := strings.TrimSpace(r.URL.Query().Get("enid"))
+	if enid == "" {
+		writeHTTPError(w, http.StatusBadRequest, "missing enid")
+		return
+	}
+	detail, err := h.dedaoLibrary.ArticleDetail(enid)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if detail == nil {
+		writeHTTPError(w, http.StatusNotFound, "article not found")
+		return
+	}
+	var contents []services.Content
+	if err := json.Unmarshal([]byte(detail.Content), &contents); err != nil {
+		writeHTTPError(w, http.StatusBadGateway, fmt.Sprintf("parse article content: %v", err))
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"detail":   detail,
+		"markdown": ContentsToMarkdown(contents),
+	})
 }
 
 func isDedaoLibraryCategory(category string) bool {

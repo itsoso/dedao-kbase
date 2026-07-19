@@ -84,6 +84,16 @@ func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 		t.Fatalf("course detail status=%d body=%s", detail.Code, detail.Body.String())
 	}
 
+	articles := requestKBase(handler, http.MethodGet, "/api/dedao/course/articles?enid=course-enid&count=30&max_id=1", "secret-token")
+	if articles.Code != http.StatusOK || !strings.Contains(articles.Body.String(), `"title":"第一讲文章列表"`) {
+		t.Fatalf("course articles status=%d body=%s", articles.Code, articles.Body.String())
+	}
+
+	article := requestKBase(handler, http.MethodGet, "/api/dedao/article?enid=article-enid", "secret-token")
+	if article.Code != http.StatusOK || !strings.Contains(article.Body.String(), `"markdown":"# 正文标题`) {
+		t.Fatalf("course article status=%d body=%s", article.Code, article.Body.String())
+	}
+
 	missingDetail := requestKBase(handler, http.MethodGet, "/api/dedao/course", "secret-token")
 	if missingDetail.Code != http.StatusBadRequest {
 		t.Fatalf("missing course detail enid status=%d body=%s", missingDetail.Code, missingDetail.Body.String())
@@ -1487,5 +1497,11 @@ func (fakeDedaoLibrary) ArticleList(enid, chapterID string, count, maxID int) (*
 				Title:     "第一讲文章列表",
 			},
 		}},
+	}, nil
+}
+
+func (fakeDedaoLibrary) ArticleDetail(enid string) (*services.ArticleDetail, error) {
+	return &services.ArticleDetail{
+		Content: `[{"type":"header","level":1,"text":"正文标题"}]`,
 	}, nil
 }

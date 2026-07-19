@@ -610,6 +610,25 @@ a.button {
   gap: 8px;
 }
 
+.dedao-course-article {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 18px;
+}
+
+.dedao-course-article__body {
+  margin-top: 16px;
+  padding: 26px;
+  font-size: 17px;
+  line-height: 1.9;
+}
+
+.dedao-course-article__body h1,
+.dedao-course-article__body h2,
+.dedao-course-article__body h3 {
+  margin-top: 22px;
+}
+
 .wechat-source {
   width: min(1680px, calc(100% - 40px));
   margin: 0 auto;
