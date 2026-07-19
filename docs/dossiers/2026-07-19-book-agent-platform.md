@@ -525,6 +525,46 @@ TDD and exact results:
   `bash scripts/system-map-smoke.sh` — PASS; regenerated because the HTTP
   runtime handler changed structural source inventory.
 
+## G4 remediation checkpoint 4: Proofroom lifecycle and feedback
+
+**Decision: PASS for the Proofroom remediation; G4 remains NO-GO.** Proofroom
+continues to own retrieval adjudication and claim verdicts. The Health
+review/feedback integration remains the final consumer blocker. No branch was
+pushed and no deployment was attempted.
+
+Delivered in Proofroom revision `c6618c3d`:
+
+- package sync mirrors list-record lifecycle onto existing local projections,
+  skips every non-`published` package before fetching its detail, and
+  rechecks detail lifecycle before projection;
+- projected package, release, claim, chunk, and citation records carry
+  lifecycle state, while retrieval fails closed for records not currently
+  marked `published`;
+- the existing Proofroom claim judge remains the only component that assigns
+  support or contradiction;
+- after that judge runs, the production verification path asynchronously sends
+  grouped, bounded KBase feedback containing only release/claim identifiers and
+  outcome codes; missing configuration or feedback failure never changes the
+  local proof verdict.
+
+TDD and exact results:
+
+- `python -m pytest -q tests/test_kbase_release_consumer.py -k 'superseded or non_published_local_versions or retrieved_package_claim'`
+  — RED with a superseded detail request and both old/new versions returned,
+  then GREEN with `3 passed, 6 deselected`.
+- `python -m pytest -q tests/test_kbase_release_consumer.py -k 'adjudicates_package_candidates_without_counting'`
+  — RED because no feedback call occurred, then GREEN after wiring the bounded
+  sender into the post-judge path.
+- `python -m pytest -q tests/test_kbase_release_consumer.py`
+  — PASS, `9 passed in 3.34s`.
+- the six-suite Proofroom contract command covering the KBase adapter,
+  decision engine, claim-verifier routing/quota/cache, knowledge runtime, and
+  legacy KBase sync — PASS, `128 passed in 8.74s`.
+- the matching four-file `python -m py_compile` command — PASS.
+- Proofroom has no `scripts/privacy-smoke.sh`; an added-line scan for
+  machine-specific paths, private paths, and bearer literals found no matches,
+  and `git diff --check` passed before commit.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
