@@ -40,6 +40,7 @@ type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalys
 type DedaoLibraryService interface {
 	CourseList(category, order string, page, limit int) (*services.CourseList, error)
 	CourseInfo(enid string) (*services.CourseInfo, error)
+	ArticleList(enid, chapterID string, count, maxID int) (*services.ArticleList, error)
 }
 
 type kbaseHTTPHandler struct {
@@ -130,6 +131,10 @@ func (defaultDedaoLibrary) CourseList(category, order string, page, limit int) (
 
 func (defaultDedaoLibrary) CourseInfo(enid string) (*services.CourseInfo, error) {
 	return CourseInfoByEnid(enid)
+}
+
+func (defaultDedaoLibrary) ArticleList(enid, chapterID string, count, maxID int) (*services.ArticleList, error) {
+	return ArticleList(enid, chapterID, count, maxID)
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -528,6 +533,16 @@ func (h *kbaseHTTPHandler) handleDedaoCourse(w http.ResponseWriter, r *http.Requ
 	if info == nil {
 		writeHTTPError(w, http.StatusNotFound, "course not found")
 		return
+	}
+	if len(info.FlatArticleList) == 0 {
+		articles, err := h.dedaoLibrary.ArticleList(enid, "", 200, 0)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		for _, article := range articles.List {
+			info.FlatArticleList = append(info.FlatArticleList, article.ArticleBase)
+		}
 	}
 	writeHTTPJSON(w, http.StatusOK, info)
 }

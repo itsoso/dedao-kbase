@@ -80,7 +80,7 @@ func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	}
 
 	detail := requestKBase(handler, http.MethodGet, "/api/dedao/course?enid=course-enid", "secret-token")
-	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"name":"得到订阅课程详情"`) || !strings.Contains(detail.Body.String(), `"title":"第一讲"`) {
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"name":"得到订阅课程详情"`) || !strings.Contains(detail.Body.String(), `"title":"第一讲文章列表"`) {
 		t.Fatalf("course detail status=%d body=%s", detail.Code, detail.Body.String())
 	}
 
@@ -1448,15 +1448,15 @@ func (fakeDedaoLibrary) CourseList(category, order string, page, limit int) (*se
 	}
 	return &services.CourseList{
 		List: []services.Course{{
-			Enid:      category + "-enid",
-			ID:        101,
-			ClassID:   202,
-			Title:     title,
-			Intro:     "从得到账号读取的订阅内容",
-			Author:    "得到",
-			Icon:      "https://example.test/icon.png",
-			Progress:  12,
-			CourseNum: 30,
+			Enid:       category + "-enid",
+			ID:         101,
+			ClassID:    202,
+			Title:      title,
+			Intro:      "从得到账号读取的订阅内容",
+			Author:     "得到",
+			Icon:       "https://example.test/icon.png",
+			Progress:   12,
+			CourseNum:  30,
 			PublishNum: 8,
 		}},
 		ISMore: 1,
@@ -1474,10 +1474,18 @@ func (fakeDedaoLibrary) CourseInfo(enid string) (*services.CourseInfo, error) {
 			CurrentArticleCount: 1,
 			PhaseNum:            20,
 		},
-		FlatArticleList: []services.ArticleBase{{
-			ID:    1,
-			Enid:  "article-enid",
-			Title: "第一讲",
+	}, nil
+}
+
+func (fakeDedaoLibrary) ArticleList(enid, chapterID string, count, maxID int) (*services.ArticleList, error) {
+	return &services.ArticleList{
+		List: []services.ArticleIntro{{
+			ArticleBase: services.ArticleBase{
+				ID:        1,
+				Enid:      "article-enid",
+				ClassEnid: enid,
+				Title:     "第一讲文章列表",
+			},
 		}},
 	}, nil
 }
