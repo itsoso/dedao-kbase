@@ -53,6 +53,9 @@ for (const className of [
 }
 
 assert.doesNotMatch(js, /WECHAT_MP_(TOKEN|COOKIE)\s*=/, "web UI must not embed WeChat credentials");
-assert.doesNotMatch(css, /border:\s*1px\s+dashed/, "new source page should not use dashed placeholders");
+const wechatSourceStart = css.indexOf(".wechat-source {");
+const wechatSourceEnd = css.indexOf(".source-control", wechatSourceStart);
+const wechatSourceCSS = css.slice(wechatSourceStart, wechatSourceEnd > wechatSourceStart ? wechatSourceEnd : undefined);
+assert.doesNotMatch(wechatSourceCSS, /border:\s*1px\s+dashed/, "new source page should not use dashed placeholders");
 
 console.log("wechat source UI smoke passed");

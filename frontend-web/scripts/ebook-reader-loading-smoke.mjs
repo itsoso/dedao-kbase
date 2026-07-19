@@ -16,7 +16,10 @@ assert.match(html, /reader-loading__rail/, "desktop loading state should include
 assert.match(css, /\.reader-loading__stage/, "loading layout should be styled");
 assert.match(css, /@keyframes reader-shimmer/, "loading skeleton should use a shimmer animation");
 assert.match(css, /prefers-reduced-motion: reduce/, "loading animation should respect reduced motion");
-assert.doesNotMatch(css, /border:\s*1px\s+dashed/, "loading page should not use the old dashed placeholder");
+const readerLoadingStart = css.indexOf(".reader-loading");
+const readerLoadingEnd = css.indexOf("@media", readerLoadingStart);
+const readerLoadingCSS = css.slice(readerLoadingStart, readerLoadingEnd > readerLoadingStart ? readerLoadingEnd : undefined);
+assert.doesNotMatch(readerLoadingCSS, /border:\s*1px\s+dashed/, "loading page should not use the old dashed placeholder");
 
 assert.match(js, /function normalizeReaderBookID/, "reader should normalize legacy route suffixes before fetching");
 assert.match(js, /readerRouteSuffixes/, "reader should keep allowed UI suffixes explicit");

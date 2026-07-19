@@ -11,6 +11,7 @@ const ROUTES = Object.freeze({
   dedaoCourses: "/sources/dedao/courses",
   dedaoEbooks: "/sources/dedao/ebooks",
   dedaoAudio: "/sources/dedao/audio",
+  bookReader: "/read/books",
   knowledgePackages: "/knowledge/packages",
   healthReleases: "/delivery/health/releases",
   jobs: "/jobs",
@@ -120,6 +121,10 @@ const dedaoLibraryState = {
   courseArticleAnalysisLoading: "",
   courseArticleAnalysisError: "",
   courseArticleAnalysisKey: "",
+  ebookDetail: null,
+  ebookPackage: null,
+  ebookDetailLoading: "",
+  ebookDetailMessage: "",
 };
 
 const sourceControlState = {
@@ -436,6 +441,9 @@ function normalizeReaderBookID(bookID) {
 
 function resolveCanonicalRoute(pathname = window.location.pathname) {
   for (const [legacy, canonical] of Object.entries(legacyRouteAliases)) {
+    if (legacy === "/ebook" && pathname.startsWith(`${legacy}/`)) {
+      return ROUTES.bookReader + pathname.slice(legacy.length);
+    }
     if (pathname === legacy || pathname.startsWith(`${legacy}/`)) {
       return canonical + pathname.slice(legacy.length);
     }
@@ -455,7 +463,7 @@ function getPathSegmentAfter(prefix, pathname = getRoutePathname()) {
 }
 
 function getBookID() {
-  const raw = getPathSegmentAfter(`${ROUTES.dedaoEbooks}/`) || getPathSegmentAfter("/ebook/");
+  const raw = getPathSegmentAfter(`${ROUTES.bookReader}/`);
   if (!raw) {
     return "";
   }
@@ -463,6 +471,18 @@ function getBookID() {
     return normalizeReaderBookID(decodeURIComponent(raw));
   } catch {
     return normalizeReaderBookID(raw);
+  }
+}
+
+function getDedaoEbookRoute() {
+  const raw = getPathSegmentAfter(`${ROUTES.dedaoEbooks}/`);
+  if (!raw) {
+    return null;
+  }
+  try {
+    return { enid: decodeURIComponent(raw) };
+  } catch {
+    return { enid: raw };
   }
 }
 
@@ -567,6 +587,10 @@ function buildDedaoCourseDetailURL(enid) {
 
 function buildDedaoEbookURL(bookID) {
   return bookID ? `${ROUTES.dedaoEbooks}/${encodeURIComponent(bookID)}` : "";
+}
+
+function buildBookReaderURL(packageID) {
+  return packageID ? `${ROUTES.bookReader}/${encodeURIComponent(packageID)}` : "";
 }
 
 function buildKnowledgePackageURL(packageID) {
@@ -844,6 +868,123 @@ async function loadDedaoLibrary(category) {
   } finally {
     state.loading = "";
     renderDedaoLibrary(category);
+  }
+}
+
+function findKnowledgePackageForEbook(item, books) {
+  const sourceID = dedaoProductID(item || {}, "ebook");
+  const sourceEnID = dedaoProductEnID(item || {});
+  const title = String(item?.title || "").trim();
+  return (Array.isArray(books) ? books : []).find((book) => {
+    const dedaoID = String(book?.dedao_id || "").trim();
+    const bookEnID = String(book?.enid || "").trim();
+    const sourceKey = String(book?.source_key || "").trim();
+    const bookTitle = String(book?.title || "").trim();
+    return Boolean(
+      (sourceID && dedaoID === sourceID)
+      || (sourceEnID && (bookEnID === sourceEnID || sourceKey === sourceEnID))
+      || (title && bookTitle === title),
+    );
+  }) || null;
+}
+
+function renderDedaoEbookDetail(route) {
+  const item = dedaoLibraryState.ebookDetail;
+  const pkg = dedaoLibraryState.ebookPackage;
+  const sourceID = dedaoProductID(item || {}, "ebook");
+  const sourceEnID = dedaoProductEnID(item || {}) || route?.enid || "";
+  const title = item?.title || "得到电子书";
+  const progress = Number.isFinite(Number(item?.progress)) ? Number(item.progress) : 0;
+  const packageID = String(pkg?.book_id || "").trim();
+  const packageURL = packageID ? buildKnowledgePackageURL(packageID) : `${ROUTES.knowledgePackages}?query=${encodeURIComponent(title || sourceID || sourceEnID)}`;
+  const readerURL = packageID ? buildBookReaderURL(packageID) : "";
+
+  renderShell(`
+    <main class="dedao-ebook-detail">
+      <section class="dedao-ebook-detail__hero">
+        <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoEbooks)}">返回电子书</a>
+        <div class="dedao-ebook-detail__cover">
+          ${item?.icon ? `<img src="${escapeAttribute(item.icon)}" alt="${escapeAttribute(title)}封面">` : "<span>书</span>"}
+        </div>
+        <div class="dedao-ebook-detail__summary">
+          <p class="web-kicker">得到电子书来源</p>
+          <h1>${escapeHTML(title)}</h1>
+          <p class="dedao-ebook-detail__author">${escapeHTML(item?.author || "作者信息暂缺")}</p>
+          <p>${escapeHTML(item?.intro || dedaoLibraryState.ebookDetailMessage || "正在读取电子书信息。")}</p>
+          <div class="dedao-progress" aria-label="阅读进度"><span style="width:${Math.max(0, Math.min(100, progress))}%"></span></div>
+          <div class="dedao-ebook-detail__actions">
+            ${readerURL ? `<a class="button button-primary" href="${escapeAttribute(readerURL)}">阅读知识包</a>` : ""}
+            <a class="button ${packageID ? "button-ghost" : "button-primary"}" href="${escapeAttribute(packageURL)}">${packageID ? "打开知识包" : "检查并创建知识包"}</a>
+          </div>
+        </div>
+      </section>
+
+      ${dedaoLibraryState.ebookDetailLoading ? `<p class="web-status">正在加载电子书详情...</p>` : ""}
+      ${dedaoLibraryState.ebookDetailMessage ? `<p class="web-status">${escapeHTML(dedaoLibraryState.ebookDetailMessage)}</p>` : ""}
+
+      <section class="dedao-ebook-detail__body">
+        <div class="dedao-ebook-detail__facts">
+          <p class="web-kicker">来源信息</p>
+          <dl>
+            <div><dt>得到 ID</dt><dd>${escapeHTML(sourceID || "-")}</dd></div>
+            <div><dt>来源 EnID</dt><dd>${escapeHTML(sourceEnID || "-")}</dd></div>
+            <div><dt>阅读进度</dt><dd>${escapeHTML(progress ? `${progress}%` : "未开始")}</dd></div>
+            <div><dt>知识包 ID</dt><dd>${escapeHTML(packageID || "尚未生成")}</dd></div>
+          </dl>
+        </div>
+        <div class="dedao-ebook-detail__lifecycle">
+          <div class="dedao-home__section-head">
+            <div>
+              <p class="web-kicker">Book Lifecycle</p>
+              <h2>从一本书到一个 Agent</h2>
+            </div>
+          </div>
+          <ol>
+            <li class="is-ready"><span>1</span><div><strong>来源书</strong><small>元数据已连接，可稳定传播</small></div><b>已就绪</b></li>
+            <li class="${packageID ? "is-ready" : "is-pending"}"><span>2</span><div><strong>知识包</strong><small>章节、chunks、claims 与引用</small></div><b>${packageID ? "已生成" : "待生成"}</b></li>
+            <li class="is-pending"><span>3</span><div><strong>书籍 Agent</strong><small>绑定知识包、模型策略和评测</small></div><b>待接入</b></li>
+            <li class="is-pending"><span>4</span><div><strong>独立应用</strong><small>基于同一 Agent 的专属学习软件</small></div><b>待发布</b></li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  `, "ebook");
+}
+
+async function loadDedaoEbookDetail(route) {
+  dedaoLibraryState.ebookDetail = null;
+  dedaoLibraryState.ebookPackage = null;
+  dedaoLibraryState.ebookDetailLoading = "loading";
+  dedaoLibraryState.ebookDetailMessage = "";
+  renderDedaoEbookDetail(route);
+  try {
+    let matched = null;
+    for (let page = 1; page <= 10 && !matched; page += 1) {
+      const query = new URLSearchParams({
+        category: "ebook",
+        order: "study",
+        page: String(page),
+        page_size: "100",
+      });
+      const payload = await apiFetch(`/api/dedao/library?${query.toString()}`);
+      const items = Array.isArray(payload?.list) ? payload.list : [];
+      matched = items.find((item) => dedaoProductEnID(item) === route.enid || dedaoProductID(item, "ebook") === route.enid) || null;
+      if (!Number(payload?.is_more)) {
+        break;
+      }
+    }
+    if (!matched) {
+      throw new Error("未在当前得到书架中找到这本电子书，请刷新书架或重新登录得到账号。");
+    }
+    dedaoLibraryState.ebookDetail = matched;
+    const booksPayload = await apiFetch("/api/books");
+    const books = Array.isArray(booksPayload?.books) ? booksPayload.books : (Array.isArray(booksPayload) ? booksPayload : []);
+    dedaoLibraryState.ebookPackage = findKnowledgePackageForEbook(matched, books);
+  } catch (error) {
+    dedaoLibraryState.ebookDetailMessage = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoLibraryState.ebookDetailLoading = "";
+    renderDedaoEbookDetail(route);
   }
 }
 
@@ -1588,7 +1729,7 @@ function renderBookKnowledge() {
                 <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
                 <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
               </div>
-              <a class="button button-primary" href="${escapeAttribute(buildDedaoEbookURL(currentBook.book_id))}">阅读</a>
+              <a class="button button-primary" href="${escapeAttribute(buildBookReaderURL(currentBook.book_id))}">阅读</a>
             </div>
             <div class="knowledge-web__stats">
               <span>${(pkg.chapters || []).length} 章</span>
@@ -3373,7 +3514,7 @@ function renderWCPlusImportedBooks() {
         <span>${escapeHTML(id)}</span>
         <div class="wcplus-source__row-actions">
           ${id ? `<a class="button button-ghost" href="/book-knowledge?book_id=${encodeURIComponent(id)}" data-link>知识库</a>` : ""}
-          ${id ? `<a class="button button-ghost" href="/ebook/${encodeURIComponent(id)}" data-link>阅读</a>` : ""}
+          ${id ? `<a class="button button-ghost" href="${escapeAttribute(buildBookReaderURL(id))}" data-link>阅读</a>` : ""}
         </div>
       </li>
     `;
@@ -5029,6 +5170,12 @@ async function boot() {
   if (routePathname === ROUTES.dedaoCourses) {
     renderDedaoCourses();
     await loadDedaoCourses();
+    return;
+  }
+  const dedaoEbookRoute = getDedaoEbookRoute();
+  if (dedaoEbookRoute) {
+    renderDedaoEbookDetail(dedaoEbookRoute);
+    await loadDedaoEbookDetail(dedaoEbookRoute);
     return;
   }
   if (routePathname === ROUTES.dedaoEbooks) {
