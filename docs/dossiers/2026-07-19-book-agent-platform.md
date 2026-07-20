@@ -1211,6 +1211,31 @@ The system map was regenerated because the trace contract added a structural
 retrieval-route type. Proofroom and Health code did not change in this
 checkpoint; both must still be included in the next full G3 run.
 
+## Task 10 checkpoint: final G3 after remediation 10
+
+**Decision: G3 PASS on clean local heads KBase `8a12351`, Proofroom
+`0942fb7c`, and Health `e33beedfa`.** G4 remains pending; no push or deployment
+was attempted.
+
+Exact evidence:
+
+- KBase `go test ./...` — PASS; all six contract/consumer packaging smokes,
+  every Web and desktop frontend smoke, schema JSON validation, system-map drift,
+  privacy smoke, and `git diff --check` — PASS;
+- KBase frontend production build — PASS with only the existing dependency
+  `eval` and bundle-size warnings;
+- Proofroom six-suite release matrix — PASS, `137 passed in 12.22s`; four-file
+  `py_compile`, branch added-line privacy scan, `git diff --check`, and clean
+  status — PASS;
+- Health eleven-file release matrix — PASS,
+  `234 passed, 6 warnings in 40.70s`; four-file `py_compile`, document drift,
+  both required `ruff` commands, branch added-line privacy scan,
+  `git diff --check`, and clean status — PASS;
+- all three exact worktrees were clean after verification.
+
+Fresh independent architecture and consumer-safety G4 review is now required on
+these remediated heads before any release action.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
