@@ -1007,6 +1007,77 @@ cross-release citation collision, and Proof list/detail reconciliation, then
 resolve the evaluation/retrieval design gaps without weakening the approved
 Gate thresholds.
 
+## G4 remediation checkpoint 9: executable evaluation and semantic retrieval
+
+**Decision: implementation PASS; G3/G4 revalidation pending.** The six findings
+from the previous fresh G4 review are now addressed in local revisions KBase
+`f7ee6d9` and Proofroom `0942fb7c`. Neither branch was pushed and no deployment
+was attempted.
+
+Delivered in KBase:
+
+- publisher-authenticated `POST /api/agent-packages/evaluate` creates and
+  immutably stores the first trusted suite/report sidecar, supports exact replay,
+  and leaves publication gated on recomputation;
+- package hashing preserves runtime-significant fallback-model and prompt-profile
+  order;
+- package validation rejects a citation ID pinned from multiple releases;
+- deterministic golden evaluation now runs the shared grounded-chat execution
+  path using suite model outputs, evaluates model-proposed tools and arguments,
+  measures retrieval recall and exact precision separately, and adds task
+  completion plus observed request/response cost and runtime latency;
+- `vector` and `hybrid` retrieval now require an explicitly authorized
+  OpenAI-compatible semantic embedder, persist a content-addressed numeric vector
+  index, and use a distinct reranking stage. Missing embedding configuration
+  fails closed instead of substituting lexical term frequency;
+- the evaluation/package schemas, synthetic fixture, operator documentation,
+  and generated system map were updated. No downloaded source body or secret was
+  added.
+
+Delivered in Proofroom:
+
+- published list records are reconciled against detail on package ID, version,
+  content hash, lifecycle, and supersession before any local mutation;
+- supersession is applied only after the replacement projection succeeds;
+- a six-case mixed-page regression proves mismatched replacements cannot retire
+  the live version and do not prevent an unrelated valid package from importing.
+
+TDD and exact verification results:
+
+- KBase cross-release citation regression — RED with
+  `cross-release citation collision error = <nil>`, then GREEN together with the
+  production evaluation and hash-order regressions;
+- KBase behavioral evaluation regressions — RED at compile time because
+  `ModelOutput` and `ProposedTool` did not exist, then GREEN after shared-runtime
+  execution and the new precision/task metrics;
+- KBase semantic retrieval regressions — RED because no semantic embedder/index
+  API existed, then GREEN with `ok .../backend/app 1.385s`; missing configuration
+  also fails closed;
+- `go test ./backend/app -count=1` — PASS in `15.048s`;
+- `go test ./...` — PASS, including `backend/app` in `14.823s` and
+  `cmd/kbase-server` in `1.766s`;
+- `frontend/npm run build` — PASS with the pre-existing dependency `eval` and
+  bundle-size warnings only;
+- all six KBase contract/consumer packaging smokes — PASS; all Web client and
+  desktop markdown/Book Knowledge smokes — PASS; schema JSON validation and
+  `bash scripts/system-map-smoke.sh` — PASS;
+- `bash scripts/privacy-smoke.sh` and `git diff --check` — PASS before the KBase
+  commit; only the 17 listed feature files were staged;
+- Proofroom mixed-page reconciliation regression — RED in all six parameterized
+  cases, then GREEN with `8 passed, 10 deselected` including existing lifecycle
+  cases;
+- Proofroom six-suite release matrix in the project environment — PASS,
+  `137 passed in 23.98s`; four-file `py_compile`, current-diff added-line privacy
+  scan, and `git diff --check` — PASS before commit;
+- a diagnostic Proofroom run with system Python returned `22 failed, 115 passed`
+  because `pytest-asyncio` was not installed. It was not treated as Gate evidence
+  and was rerun with the repository `.venv`, producing the passing result above.
+
+The generated system map was regenerated because the semantic retrieval source
+file and publisher evaluation route changed structural inventory. Full Health
+revalidation and fresh independent G4 review remain required before push or
+deployment.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
