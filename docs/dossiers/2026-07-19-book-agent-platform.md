@@ -28,12 +28,13 @@ prescription or dosage decisions, and personal-data write tools.
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
 - **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed after
-  persisted-package integrity remediation on implementation heads `a508a32`,
-  `0942fb7c`, and merged Health head `a762fa99b` respectively.
+  citation-scope remediation on deployable heads `c50c3af`, `c3324fec`, and
+  `b7b1a610d` respectively.
 - **G4 Review: PENDING after prior NO-GO.** The prior consumer-safety High was
-  remediated and G3 repeated. Fresh independent architecture and
-  consumer-safety GO decisions are still mandatory. No push or deployment is
-  allowed before both pass.
+  remediated, but a later cross-consumer review found and returned a Medium
+  citation-scope gap upstream. That gap is now remediated and G3 repeated.
+  Fresh independent architecture and consumer-safety GO decisions are still
+  mandatory. No push or deployment is allowed before both pass.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -1366,6 +1367,82 @@ Health integration evidence:
 
 Fresh independent architecture and cross-consumer G4 review is required on
 these exact deployable heads.
+
+## Task 10 checkpoint: final G4 after persisted-package remediation
+
+**Decision: G4 NO-GO on exact clean heads KBase `c50c3af`, Proofroom
+`0942fb7c`, and Health `a762fa99b`.** Architecture review returned GO with no
+Critical, High, or Medium blockers. Cross-consumer review found one Medium
+citation-scope blocker, so release progression stopped. No branch was pushed
+and no deployment was attempted.
+
+Architecture evidence:
+
+- KBase focused package/runtime suite, focused race suite, and server suite —
+  PASS in `4.694s`, `3.304s`, and `0.919s`;
+- KBase system map, privacy smoke, `git diff --check`, and clean status — PASS;
+- Proofroom matrix — PASS, `137 passed in 9.88s`;
+- Health focused consumer/lifecycle matrix — PASS,
+  `64 passed, 6 warnings in 17.84s`; document drift and clean status — PASS;
+- persisted artifact integrity, post-unlock full validation, citation
+  allowlists inside KBase, semantic retrieval identity, deterministic
+  evaluation, read-only MCP, traces, and consumer-owned review were accepted;
+- a Low non-blocking recommendation remains: canonicalize package-list detail
+  URLs instead of trusting stored list metadata.
+
+Cross-consumer NO-GO evidence:
+
+- KBase runtime filtered claims and citations against each hashed release
+  reference's `citation_ids`, but Proofroom and Health validated the references
+  and then projected each complete release;
+- a package allowing citation A from a release containing A and B could
+  therefore place B in both consumer projections. Proofroom adjudication and
+  Health human review reduced serving risk but did not preserve deterministic
+  package scope;
+- KBase focused checks and Proofroom's `18` focused tests passed. The reviewer's
+  Health shell lacked project dependencies, so its Health pytest and drift
+  attempts were not counted; the primary G3 environment had already passed
+  both and the Medium code finding was independently reproduced.
+
+## G4 remediation checkpoint 12: consumer citation scope
+
+**Decision: implementation and consumer matrices PASS; fresh G4 pending.**
+Proofroom now intersects release citations and claim citation IDs with the
+hashed package reference, projects only chunks reached by allowed citations,
+and drops claims with no allowed citation. Health now deep-copies and scopes
+each release before compilation, removes unlisted citations, chunks, claims,
+and release-wide summary content, and still emits draft-only artifacts for
+Health-owned review. No source inventory was added; Health document drift
+passed without regenerating its system map. No branch was pushed and no
+deployment was attempted.
+
+TDD and verification evidence:
+
+- Proofroom focused import regression — RED: the package authorizing one
+  citation projected `2` claims, `2` citations, and `2` chunks; GREEN after the
+  fix, `1 passed in 0.79s`, with the existing test's exact `1/1/1` assertions;
+- Health focused package compiler regression — RED: projected claim IDs were
+  `claim-1` and `claim-unlisted`; GREEN after the fix,
+  `1 passed, 6 warnings in 0.06s`, followed by the strengthened full-projection
+  assertion passing in `0.31s`;
+- Proofroom six-suite matrix — PASS, `137 passed in 8.26s`; four-file
+  `py_compile`, `git diff --check`, and clean status — PASS; commit
+  `c3324fec`;
+- Health eleven-file matrix — PASS,
+  `235 passed, 6 warnings in 38.31s`; seven-file `py_compile`, both required
+  `ruff` commands, document drift, and `git diff --check` — PASS; feature
+  commit `110947e2d`;
+- Health `origin/main` then advanced by one documentation commit. The clean
+  merge tree passed the same eleven-file matrix and document drift,
+  `235 passed, 6 warnings in 40.47s`; final merged head `b7b1a610d`;
+- KBase privacy smoke, both consumer added-line privacy scans, every
+  pre-commit hook, and `git diff --check` — PASS before the commits;
+- final G3 deployable heads are KBase `c50c3af`, Proofroom `c3324fec`, and
+  Health `b7b1a610d`. KBase source was unchanged from its passing full G3;
+  Proofroom and Health passed their complete feature release matrices above.
+
+Fresh independent architecture and cross-consumer G4 review is required on
+these exact clean heads before any push or deployment.
 
 ## Decisions
 
