@@ -115,6 +115,13 @@ func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.
 		records[1].URL != "/api/agent-packages/agent-package-example?version=1.1.0" {
 		t.Fatalf("stable URLs = %#v", records)
 	}
+	incremental, err := store.ListAgentPackages("agent-package-example@1.0.0", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(incremental) != 1 || incremental[0].Supersedes != "agent-package-example@1.0.0" {
+		t.Fatalf("incremental supersession edge = %#v", incremental)
+	}
 	latest, err := store.LoadAgentPackage("agent-package-example", "")
 	if err != nil || latest.Version != "1.1.0" {
 		t.Fatalf("latest package = %#v, err=%v", latest, err)
