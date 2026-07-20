@@ -836,6 +836,62 @@ draft-only review boundary, explicit Health publication ownership, lack of
 personal-health writes, and privacy boundary remain intact. Remediation and a
 fresh independent safety review are required before G3/G4 can resume.
 
+## G4 remediation checkpoint 7: Health retirement safety re-review
+
+**Decision: NO-GO after partial correction.** Health revision `171d42f55`
+closed both checkpoint-6 findings, but its fresh independent safety review found
+one remaining record/detail identity-consistency blocker. G3/G4 remain stopped;
+no branch was pushed and no deployment was attempted.
+
+Corrections delivered in `171d42f55`:
+
+- retirement authority is now derived only after the fetched replacement
+  passes Health's evidence-only eligibility assessment;
+- malformed, cross-package, self-version, and explicit list/detail
+  supersession conflicts are held rather than applied;
+- removing the final Agent Package lineage restores a matching canonical
+  document by `doc_id` or canonical relation by
+  `(src_doc_id, relation, dst_doc_id)`; rows shared by another package retain
+  the remaining lineage;
+- all changes remain inside the locked candidate workspace and preserve
+  draft-only Health review, finalization, and explicit publication ownership.
+
+Exact TDD and verification results:
+
+- the mixed held/eligible cursor-page regression — RED because `release-one`
+  disappeared when the held v2 shared a page with an unrelated eligible package;
+- the canonical-collision regression — RED with a missing canonical page after
+  final-lineage retirement;
+- the four focused retirement/preservation regressions after correction — PASS,
+  `4 passed, 6 warnings in 5.17s`;
+- Health release matrix group one — PASS,
+  `104 passed, 6 warnings in 19.25s`; group two — PASS,
+  `124 passed, 6 warnings in 18.73s`;
+- `ruff check`, project-environment `python -m py_compile`, project-environment
+  `python scripts/check_doc_drift.py`, the added-line privacy scan, and
+  `git diff --check` — PASS; all commit hooks passed. No structural source
+  inventory changed, so the Health system map was not regenerated.
+- KBase's six contract/consumer packaging smokes — PASS individually with
+  trustworthy exit code `0`; all Web client smokes, schema JSON validation,
+  system-map smoke, privacy smoke, and `git diff --check` — PASS. The combined
+  diagnostic command's output session did not expose a trustworthy final exit
+  code, so every release smoke was rerun individually before being counted.
+
+Mandatory independent safety re-review of `171d42f55`: **NO-GO**.
+
+The cursor record and fetched detail must agree exactly on package ID, version,
+content hash, lifecycle state, and supersession field before the replacement can
+authorize retirement. The current implementation does not compare content hash
+or lifecycle, and permits an empty record supersession when detail supplies one.
+A mismatched pair can therefore retire the prior draft. Required correction:
+add mixed-page regressions for every mismatched identity/lifecycle/supersession
+class and hold the replacement on any disagreement, then repeat the independent
+safety review.
+
+The reviewer reconfirmed canonical restoration, shared-lineage preservation,
+workspace locking/atomicity, draft-only review ownership, and absence of serving,
+personal-health, diagnosis, prescription, dosage, or tool-execution mutation.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
