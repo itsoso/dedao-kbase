@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** BLOCKED at G4; persisted Agent Package integrity remediation awaits G3/G4 revalidation
+**Status:** G3 PASS after persisted Agent Package integrity remediation; fresh G4 pending
 
 ## Objective
 
@@ -27,13 +27,13 @@ prescription or dosage decisions, and personal-data write tools.
   package/runtime/tool/evaluation separation. Paid-source usage policy,
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
-- **G3 Test: PASS on the last reviewed revision; revalidation pending.** The
-  full KBase, Proofroom, and Health matrix passed on heads `a6c870d`,
-  `0942fb7c`, and `e33beedfa`; the new persisted-package integrity remediation
-  must repeat G3 before release.
-- **G4 Review: NO-GO.** Architecture review returned GO, but consumer-safety
-  review found a High persisted-package integrity gap on the same heads. The
-  implementation returned upstream. No push or deployment is allowed.
+- **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed after
+  persisted-package integrity remediation on implementation heads `a508a32`,
+  `0942fb7c`, and `e33beedfa` respectively.
+- **G4 Review: PENDING after prior NO-GO.** The prior consumer-safety High was
+  remediated and G3 repeated. Fresh independent architecture and
+  consumer-safety GO decisions are still mandatory. No push or deployment is
+  allowed before both pass.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -1281,9 +1281,10 @@ Consumer-safety review evidence:
 package reads now verify artifact identity, recompute and compare the
 deterministic content hash, verify immutable publication metadata, release the
 store lock, and then rerun the complete Agent Package contract. Runtime, MCP,
-HTTP, and consumer reads therefore share the same fail-closed boundary. No
-structural inventory changed, so system-map regeneration was not required. No
-branch was pushed and no deployment was attempted.
+HTTP, and consumer reads therefore share the same fail-closed boundary. The
+route set did not change, but the generated route source locator moved when the
+read boundary grew, so the system map was regenerated after its drift Gate
+failed. No branch was pushed and no deployment was attempted.
 
 TDD and focused evidence:
 
@@ -1294,7 +1295,45 @@ TDD and focused evidence:
 - `go test ./backend/app -run 'AgentPackage|AgentRuntime|BookKnowledgeMCP|AgentTrace' -count=1`
   — PASS, `ok .../backend/app 3.608s`;
 - `go test ./cmd/kbase-server -count=1` — PASS,
-  `ok .../cmd/kbase-server 1.025s`.
+  `ok .../cmd/kbase-server 1.025s`;
+- the first full KBase G3 attempt completed Go, race, frontend, and smoke
+  checks, but `bash scripts/system-map-smoke.sh` reported the generated route
+  locator changing from line `282` to `304`; G3 was marked failed rather than
+  allowing later commands to mask it;
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json`,
+  `bash scripts/system-map-smoke.sh`, and `git diff --check` — PASS after
+  regeneration. A fresh full KBase G3 run remains required.
+
+## Task 10 checkpoint: final G3 after remediation 11
+
+**Decision: G3 PASS on KBase implementation revision `a508a32`, Proofroom
+`0942fb7c`, and Health `e33beedfa`.** Fresh independent G4 remains pending, so
+no branch was pushed and no deployment was attempted.
+
+Exact final evidence:
+
+- KBase `go test ./...` — PASS;
+- KBase `go test -race ./backend/app ./cmd/kbase-server -count=1` — PASS,
+  backend `17.660s` and server `1.911s`; the macOS linker emitted the existing
+  non-fatal `LC_DYSYMTAB` warnings;
+- KBase frontend production build — PASS with the existing dependency `eval`
+  and bundle-size warnings;
+- every `frontend/scripts/*.mjs` and `frontend-web/scripts/*.mjs` smoke plus
+  `node --check frontend-web/app.js` — PASS;
+- all six contract/consumer packaging smokes, all three Agent JSON Schemas,
+  system-map drift, privacy smoke, and `git diff --check` — PASS;
+- Proofroom six-suite matrix — PASS, `137 passed in 9.16s`; four-file
+  `py_compile`, branch added-line privacy scan, `git diff --check`, and clean
+  status — PASS;
+- Health eleven-file release matrix — PASS,
+  `234 passed, 6 warnings in 41.88s`; seven-file `py_compile`, normal changed
+  file `ruff`, service-module `ruff --ignore E402`, document drift, branch
+  added-line privacy scan, `git diff --check`, and clean status — PASS.
+
+The successful KBase rerun used `set -euo pipefail`, so any failing command
+would stop the Gate instead of being hidden by a later successful check. The
+only KBase working-tree changes after verification are this dossier checkpoint
+and the regenerated source-locator metadata in the system map.
 
 ## Decisions
 

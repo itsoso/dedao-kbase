@@ -44,7 +44,7 @@
     {
       "path": "/api/agent-packages/",
       "file": "backend/app/agent_package_store.go",
-      "line": 282,
+      "line": 304,
       "authenticated": true
     },
     {
