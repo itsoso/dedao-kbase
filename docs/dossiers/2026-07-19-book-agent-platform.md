@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** BLOCKED at G4; behavioral evaluation, grounding, lifecycle, and feedback gaps remain
+**Status:** BLOCKED at G4; persisted Agent Package integrity remediation awaits G3/G4 revalidation
 
 ## Objective
 
@@ -27,12 +27,13 @@ prescription or dosage decisions, and personal-data write tools.
   package/runtime/tool/evaluation separation. Paid-source usage policy,
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
-- **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed on
-  current heads `30c5b30`, `c6618c3d`, and `bff01c3b2` respectively.
-- **G4 Review: NO-GO.** Fresh architecture and cross-consumer reviews on the
-  exact G3 heads found release-blocking behavioral evaluation, grounded-answer
-  citation, supersession propagation/execution, and production feedback gaps.
-  The implementation has returned upstream. No push or deployment is allowed.
+- **G3 Test: PASS on the last reviewed revision; revalidation pending.** The
+  full KBase, Proofroom, and Health matrix passed on heads `a6c870d`,
+  `0942fb7c`, and `e33beedfa`; the new persisted-package integrity remediation
+  must repeat G3 before release.
+- **G4 Review: NO-GO.** Architecture review returned GO, but consumer-safety
+  review found a High persisted-package integrity gap on the same heads. The
+  implementation returned upstream. No push or deployment is allowed.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -1235,6 +1236,65 @@ Exact evidence:
 
 Fresh independent architecture and consumer-safety G4 review is now required on
 these remediated heads before any release action.
+
+## Task 10 checkpoint: fresh G4 after remediation 10
+
+**Decision: G4 NO-GO on exact clean heads KBase `a6c870d`, Proofroom
+`0942fb7c`, and Health `e33beedfa`.** The independent architecture reviewer
+returned GO with no Critical, High, or Medium blockers. The independent
+consumer-safety reviewer found a High persisted-package integrity gap, so the
+Gate failed and release progression stopped. No branch was pushed and no
+deployment was attempted.
+
+Architecture review evidence:
+
+- focused KBase backend and server suites — PASS in `8.240s` and `0.962s`;
+- KBase `go test ./...`, schema validation, system-map drift, privacy smoke,
+  `git diff --check`, and clean status — PASS;
+- Proofroom release matrix — PASS, `137 passed in 13.12s`;
+- Health focused consumer/lifecycle matrix — PASS,
+  `64 passed, 6 warnings in 17.57s`;
+- all earlier citation allowlist, retrieval identity, deterministic latency,
+  consumer-owned review, and evidence-only Health boundaries were accepted;
+- one Low advisory remains non-blocking: replay canonical input and OTLP
+  attributes do not yet include the already persisted `RetrievalRoute`.
+
+Consumer-safety review evidence:
+
+- exact heads and clean status — confirmed;
+- KBase citation/MCP/evaluation/trace suite — PASS in `2.791s`;
+- Proofroom focused reconciliation — PASS, `8 passed, 10 deselected`; full
+  six-suite matrix — PASS, `137 passed`;
+- Health consumer suite — PASS, `59 passed`;
+- High blocker: `loadAgentPackageRecordUnlocked` read the content-addressed
+  artifact without recomputing its hash or validating the package. Runtime and
+  MCP then ran only the evaluation Gate. An altered persisted retrieval policy
+  could therefore retain the manifest hash and reach execution without a
+  complete package-contract check. The reviewer process was interrupted by an
+  automated platform classifier after reporting the finding and expected
+  NO-GO; the finding was independently reproduced locally and is treated as a
+  failed Gate.
+
+## G4 remediation checkpoint 11: persisted package integrity
+
+**Decision: focused remediation PASS; full G3 and fresh G4 pending.** Public
+package reads now verify artifact identity, recompute and compare the
+deterministic content hash, verify immutable publication metadata, release the
+store lock, and then rerun the complete Agent Package contract. Runtime, MCP,
+HTTP, and consumer reads therefore share the same fail-closed boundary. No
+structural inventory changed, so system-map regeneration was not required. No
+branch was pushed and no deployment was attempted.
+
+TDD and focused evidence:
+
+- `go test ./backend/app -run TestAgentPackageStoreRejectsTamperedArtifactOnLoad -count=1`
+  — RED: the altered persisted retrieval policy loaded with `<nil>` error;
+- the same regression plus atomic publication, supersession, and mutable
+  version tests — GREEN, `ok .../backend/app 1.388s`;
+- `go test ./backend/app -run 'AgentPackage|AgentRuntime|BookKnowledgeMCP|AgentTrace' -count=1`
+  — PASS, `ok .../backend/app 3.608s`;
+- `go test ./cmd/kbase-server -count=1` — PASS,
+  `ok .../cmd/kbase-server 1.025s`.
 
 ## Decisions
 

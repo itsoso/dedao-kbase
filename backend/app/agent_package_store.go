@@ -171,12 +171,20 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 
 func (s *BookKnowledgeStore) LoadAgentPackage(packageID, version string) (*AgentPackage, error) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	manifest, err := s.loadAgentPackageManifestUnlocked()
+	if err != nil {
+		s.mu.RUnlock()
+		return nil, err
+	}
+	pkg, err := s.loadAgentPackageByIdentityUnlocked(manifest, strings.TrimSpace(packageID), strings.TrimSpace(version))
+	s.mu.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	return s.loadAgentPackageByIdentityUnlocked(manifest, strings.TrimSpace(packageID), strings.TrimSpace(version))
+	if err := ValidateAgentPackage(*pkg, s, AgentReadOnlyToolIDs()); err != nil {
+		return nil, fmt.Errorf("validate persisted agent package: %w", err)
+	}
+	return pkg, nil
 }
 
 func (s *BookKnowledgeStore) ListAgentPackages(after string, limit int) ([]AgentPackageRecord, error) {
@@ -238,6 +246,20 @@ func (s *BookKnowledgeStore) loadAgentPackageRecordUnlocked(record AgentPackageR
 	var pkg AgentPackage
 	if err := readJSONFile(s.AgentPackagePath(record.ContentHash), &pkg); err != nil {
 		return nil, err
+	}
+	if pkg.PackageID != record.PackageID || pkg.Version != record.Version {
+		return nil, fmt.Errorf("agent package artifact identity does not match manifest record")
+	}
+	wantHash, err := AgentPackageContentHash(pkg)
+	if err != nil {
+		return nil, fmt.Errorf("hash persisted agent package: %w", err)
+	}
+	if pkg.ContentHash != record.ContentHash || wantHash != record.ContentHash {
+		return nil, fmt.Errorf("agent package artifact content hash does not match manifest record")
+	}
+	if pkg.LifecycleState != AgentPackagePublished || pkg.Supersedes != record.Supersedes ||
+		pkg.CreatedAt != record.PublishedAt || pkg.PublishedAt != record.PublishedAt {
+		return nil, fmt.Errorf("agent package artifact publication metadata does not match manifest record")
 	}
 	pkg.LifecycleState = record.LifecycleState
 	pkg.Supersedes = record.Supersedes

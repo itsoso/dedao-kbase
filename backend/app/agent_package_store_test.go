@@ -1,9 +1,11 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -152,5 +154,42 @@ func TestAgentPackageStoreRejectsMutableVersionReuse(t *testing.T) {
 	savePassingAgentPackageTestEvaluation(t, store, changed)
 	if _, _, err := PublishAgentPackage(store, changed, "publish-b", knownTools, now.Add(time.Hour)); !errors.Is(err, ErrAgentPackageVersionConflict) {
 		t.Fatalf("version reuse error = %v", err)
+	}
+}
+
+func TestAgentPackageStoreRejectsTamperedArtifactOnLoad(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	published, _, err := PublishAgentPackage(store, pkg, "publish-tamper-test", AgentReadOnlyToolIDs(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	artifactPath := store.AgentPackagePath(published.ContentHash)
+	raw, err := os.ReadFile(artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tampered AgentPackage
+	if err := json.Unmarshal(raw, &tampered); err != nil {
+		t.Fatal(err)
+	}
+	tampered.RetrievalPolicy.RequireCitations = false
+	payload, err := json.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(artifactPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.LoadAgentPackage(published.PackageID, published.Version); err == nil ||
+		!strings.Contains(err.Error(), "content hash") {
+		t.Fatalf("tampered artifact load error = %v", err)
 	}
 }
