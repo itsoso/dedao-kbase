@@ -937,6 +937,76 @@ that environment limitation accurately and relied on code inspection plus
 successful compile/diff checks. The executor's project-environment release
 matrix above provides the runtime test evidence.
 
+## Task 10 checkpoint: fresh G4 after Health safety GO
+
+**Decision: NO-GO on exact clean heads `a636820a1a7d343dad8da07e8df34ad1335b6ca6`,
+`018d8d997d47620d35ab2a8bc7bbbfd550125f98`, and
+`e33beedfa952f8d4e5d672a5f113e9b21c5c5e20`.** Both independent G4 reviewers
+rejected release. No branch was pushed and no deployment was attempted.
+
+Fresh G3 evidence on those revisions remained green:
+
+- KBase `go test ./...` — PASS; `frontend/npm run build` — PASS with the
+  pre-existing dependency `eval` and bundle-size warnings;
+- all six KBase contract/consumer packaging smokes, Web client smokes, schema
+  JSON validation, system-map smoke, privacy smoke, and `git diff --check` —
+  PASS;
+- Proofroom six-suite matrix — PASS, `131 passed in 11.32s`; compile and diff
+  checks — PASS;
+- Health release matrix — PASS, `234 passed`; lint, compile, document drift,
+  privacy scan, and diff checks — PASS;
+- reviewers independently reran focused KBase, Proofroom, and Health matrices
+  successfully and confirmed all three worktrees were clean.
+
+Release blockers returned upstream:
+
+1. **Critical — no supported production surface creates the trusted evaluation
+   sidecar required for publication.** Publication requires a persisted trusted
+   report, but only tests call deterministic evaluation/save helpers. The HTTP
+   publish test pre-seeds it with a test-only helper. A clean production pilot
+   therefore cannot publish its first package through API, CLI, or task.
+2. **Critical — content hashing sorts runtime-significant order.** Model
+   fallbacks and prompt profiles are sorted during hash normalization while the
+   runtime executes index zero. Two packages can therefore share one immutable
+   content hash but execute different model or prompt behavior.
+3. **High — the evaluation Gate is still only partially behavioral.** Retrieval
+   executes, but faithfulness synthesizes an answer from expected evidence;
+   tool choice selects a declared tool for any non-empty input; retrieval lacks
+   precision measurement; latency/cost are local/static; task completion is not
+   evaluated. The design's package-specific answer/tool/task/model observations
+   are not yet established.
+4. **High — declared vector/hybrid retrieval does not match the approved
+   semantic-vector plus reranker design.** Current vector is token-frequency
+   cosine, hybrid averages that with lexical overlap, no reranker exists, and
+   graph fails closed. The declared strategy is materially stronger than the
+   implementation.
+5. **High — multi-release citation identity is ambiguous.** Package validation
+   allows duplicate citation IDs across pinned releases. Runtime initially
+   resolves `(release_id, citation_id)` but drops release identity, answer
+   markers use only citation ID, selection maps overwrite collisions, and trace
+   authorization can attribute one marker to multiple evidence items. Required
+   correction: release-qualified citation identity end to end or reject
+   cross-release citation-ID collisions with regressions.
+6. **High — Proofroom applies list-record supersession before validating
+   detail.** It retires the old projection, then fetches detail and checks only
+   detail lifecycle; it never reconciles list/detail ID, version, content hash,
+   lifecycle, or supersession. An adversarial reproduction retired live v1 and
+   projected an unrelated package. Proofroom must adopt the same reconcile-
+   before-retire discipline and mixed-page mismatch tests now used by Health.
+
+Both reviewers confirmed closed: answer-bound citation markers and abstention;
+trace persistence; published/evaluation enforcement in runtime and MCP; strict
+MCP argument types; cursor-only supersession transport; all five Proof feedback
+outcomes; Health exact eligible-only retirement/canonical restoration/review
+ownership; authorized-source usage, separated publisher authentication, and
+privacy boundaries.
+
+G4 remediation is required before any push or deployment. The next execution
+must begin with TDD for the production evaluation surface, hash-order invariant,
+cross-release citation collision, and Proof list/detail reconciliation, then
+resolve the evaluation/retrieval design gaps without weakening the approved
+Gate thresholds.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
