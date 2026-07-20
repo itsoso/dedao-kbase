@@ -1110,6 +1110,52 @@ Exact final evidence:
 All three feature worktrees were clean at the checkpoint. Fresh independent G4
 architecture and consumer-safety review is the next required Gate.
 
+## Task 10 checkpoint: fresh G4 after remediation 9
+
+**Decision: G4 NO-GO on exact clean heads KBase
+`ed17c9185d4f295a1edbde1b323f5a4b996ae018`, Proofroom
+`0942fb7c9d625e55f905bb070ee7a0e1d379d10b`, and Health
+`e33beedfa952f8d4e5d672a5f113e9b21c5c5e20`.** Both independent reviewers
+rejected release. G3 remains passed but cannot override G4. No branch was pushed
+and no deployment was attempted.
+
+Release blockers returned upstream:
+
+1. **High — collision rejection does not cover every runtime-reachable
+   citation.** Validation checks only citation IDs explicitly listed on each
+   package release reference. Runtime search can return a matched claim's full
+   citation list even when an ID is outside that reference list. Two releases
+   can therefore pin different valid decoy IDs while their searchable claims
+   expose the same unlisted ID, reaching the bare-ID answer selector and trace
+   attribution. Required correction: reject collisions across all reachable
+   release/claim citations and enforce the reference allowlist at retrieval, or
+   carry release-qualified citation identity end to end. Add the adversarial
+   unique-ref/duplicate-claim regression.
+2. **High — semantic retrieval identity is not bound to the immutable package.**
+   The embedder endpoint/provider/model and reranker version are selected outside
+   the hashed policy. The same evaluated package hash can retrieve differently
+   across deployments, and providers sharing a model label can reuse an
+   incompatible index. Pin authorized embedder provider/model/version and
+   reranker version in hashed package policy, and preserve that identity in
+   evaluation, trace, and vector-index provenance.
+3. **Medium — deterministic evaluation mixes in wall-clock latency.** Evaluation
+   uses elapsed host time while persisted reports are later recomputed and
+   compared exactly. A near-threshold case can pass creation but fail publication
+   because of host load. Separate observed performance evidence from
+   deterministic recomputation or inject a stable timing observation.
+
+The reviewers independently reran focused KBase, Proofroom, and Health suites.
+KBase full/focused Go checks, system-map/privacy/diff checks, Proofroom's
+six-suite matrix (`137 passed`), and Health focused consumer/lifecycle checks all
+passed; every worktree remained clean. They confirmed Proofroom reconciliation,
+Health evidence-only ownership, publisher-token separation, read-only MCP
+policy, hash-order preservation, production evaluation API, semantic vector
+index/reranker presence, and privacy boundaries are otherwise closed.
+
+Execution stops at this failed Gate. The next continuation must begin with TDD
+for the three findings above and repeat full G3 plus fresh independent G4 before
+any push or deployment.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
