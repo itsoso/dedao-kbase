@@ -892,6 +892,51 @@ The reviewer reconfirmed canonical restoration, shared-lineage preservation,
 workspace locking/atomicity, draft-only review ownership, and absence of serving,
 personal-health, diagnosis, prescription, dosage, or tool-execution mutation.
 
+## G4 remediation checkpoint 8: Health identity safety GO
+
+**Decision: PASS for the mandatory Health safety Gate on revision
+`e33beedfa`.** Full cross-repository G4 review remains pending. No branch was
+pushed and no deployment was attempted.
+
+Corrections and TDD evidence:
+
+- cursor record and fetched detail are normalized and must agree on package ID,
+  version, content hash, lifecycle state, and supersession before retirement
+  authority is considered;
+- missing list-record supersession now conflicts with a non-empty detail
+  supersession instead of trusting the detail unilaterally;
+- a mixed-page parameterized regression covers package-ID, version,
+  content-hash, lifecycle, explicit-supersession, and missing-supersession
+  disagreement while an unrelated eligible package proceeds;
+- before correction the parameterized test was RED in the three missing classes:
+  content hash, lifecycle, and missing list supersession (`3 failed, 3 passed`);
+  after correction all retirement and preservation cases were GREEN,
+  `9 passed, 6 warnings in 7.21s`.
+
+Exact Health verification on `e33beedfa`:
+
+- Agent Package consumer file — PASS, `59 passed, 6 warnings in 17.04s`;
+- export/lifecycle/ingest/reconciliation group — PASS,
+  `51 passed, 6 warnings in 6.20s`;
+- reconciliation/safety/phase-0 group — PASS,
+  `124 passed, 6 warnings in 18.72s`;
+- total Health release matrix — `234 passed`;
+- `ruff check`, project-environment `python -m py_compile`, project-environment
+  `python scripts/check_doc_drift.py`, added-line privacy scan, and
+  `git diff --check` — PASS; all commit hooks passed. No structural inventory
+  changed, so the system map was not regenerated.
+
+Mandatory independent safety re-review: **GO**. The reviewer confirmed exact
+record/detail agreement, eligible-only retirement authority, malformed/cross/self
+supersession holds, canonical document/relation restoration, shared-lineage
+preservation, locked atomic candidate replacement, draft-only artifacts, Health-
+owned adjudication/finalization/publication, and no serving, personal-health,
+diagnosis, prescription, dosage, or tool mutation. The reviewer's own focused
+pytest attempt could not collect because its shell lacked SQLAlchemy; it reported
+that environment limitation accurately and relied on code inspection plus
+successful compile/diff checks. The executor's project-environment release
+matrix above provides the runtime test evidence.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
