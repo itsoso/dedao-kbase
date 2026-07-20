@@ -1078,6 +1078,38 @@ file and publisher evaluation route changed structural inventory. Full Health
 revalidation and fresh independent G4 review remain required before push or
 deployment.
 
+## Task 10 checkpoint: final G3 after remediation 9
+
+**Decision: G3 PASS on clean local heads KBase `4400baa`, Proofroom
+`0942fb7c`, and Health `e33beedfa`.** G4 remains pending, so no push or
+deployment was attempted.
+
+Exact final evidence:
+
+- KBase `go test ./...` — PASS; all six contract/consumer packaging smokes,
+  every Web client smoke, both desktop frontend smokes, schema JSON validation,
+  system-map smoke, privacy smoke, and `git diff --check` — PASS;
+- the KBase production frontend build on the same implementation revision —
+  PASS with only the existing dependency `eval` and bundle-size warnings;
+- Proofroom six-suite release matrix in the repository environment — PASS,
+  `137 passed in 9.09s`; four-file `py_compile`, branch added-line privacy scan,
+  `git diff --check`, and clean-worktree check — PASS;
+- Health eleven-file release matrix in the project backend environment — PASS,
+  `234 passed, 6 warnings in 39.68s`; four-file `py_compile`, document drift,
+  normal changed-file `ruff check`, service-module `ruff check --ignore E402`,
+  branch added-line privacy scan, `git diff --check`, and clean-worktree check —
+  PASS;
+- the first Health command selected a nonexistent worktree-local environment
+  and failed collection with `ModuleNotFoundError: No module named 'sqlalchemy'`.
+  It was diagnostic only, was not counted as Gate evidence, and the identical
+  matrix passed with the repository backend environment above;
+- the first Health lint path pointed at an environment without a `ruff` binary
+  and returned exit `127`; it was not counted, and the repository's lint
+  environment then passed both required commands.
+
+All three feature worktrees were clean at the checkpoint. Fresh independent G4
+architecture and consumer-safety review is the next required Gate.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
