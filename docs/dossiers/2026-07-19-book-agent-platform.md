@@ -1156,6 +1156,61 @@ Execution stops at this failed Gate. The next continuation must begin with TDD
 for the three findings above and repeat full G3 plus fresh independent G4 before
 any push or deployment.
 
+## G4 remediation checkpoint 10: citation scope and retrieval provenance
+
+**Decision: implementation PASS in KBase revision `74dce4e`; full cross-repo G3
+and fresh G4 pending.** No branch was pushed and no deployment was attempted.
+
+Corrections:
+
+- chat/runtime retrieval filters every claim citation through the package
+  release reference allowlist and drops claims with no authorized citation;
+- MCP search applies the same filter, citation resolution rejects IDs outside
+  the allowlist, and claim lookup returns only authorized citations or fails;
+- package validation continues rejecting cross-release collisions among allowed
+  IDs and now also rejects duplicate citation IDs inside one pinned release;
+- semantic provider, model, model version, exact endpoint URL fingerprint, and
+  reranker version are required fields in the hashed retrieval policy;
+- runtime configuration must match that immutable identity; vector indexes,
+  evaluation reports, and runtime traces record the same embedder/reranker
+  provenance;
+- golden latency uses an immutable recorded observation while still executing
+  the shared runtime path. Publication recomputation no longer compares a
+  wall-clock measurement affected by host load.
+
+TDD and exact results:
+
+- unique reference IDs plus duplicate unlisted claim citations — RED with two
+  ambiguous runtime results, then GREEN after allowlist enforcement;
+- MCP unlisted claim citation regression — RED with the forbidden claim in the
+  result, then GREEN together with the existing pinned-release MCP test;
+- semantic retrieval identity hash regression — RED at compile time because the
+  five identity fields did not exist, then GREEN after adding them to policy;
+- trace provenance regression — RED at compile time because
+  `RetrievalRoute`/`AgentTraceRetrievalRoute` did not exist, then GREEN after
+  trace contract and runtime persistence changes;
+- stable latency regression — RED at compile time because
+  `RecordedLatencyMS` did not exist, then GREEN with deterministic repeated
+  reports;
+- duplicate citation within one release — RED with validation error `<nil>`,
+  then GREEN together with cross-release and runtime-scope regressions;
+- combined seven-regression command — PASS, `backend/app 1.500s`;
+- `go test ./backend/app -count=1` — PASS in `15.196s` before the final duplicate
+  citation addition; the subsequent focused duplicate/collision/scope command
+  also passed;
+- `go test ./...` — PASS, including `backend/app` in `13.170s` and
+  `cmd/kbase-server` in `1.340s`;
+- frontend production build — PASS with the existing dependency `eval` and
+  bundle-size warnings only;
+- all six contract/consumer packaging smokes, all Web and desktop frontend
+  smokes, schema JSON validation, regenerated system map and drift check,
+  privacy smoke, and `git diff --check` — PASS;
+- only the 18 feature files listed by the staged diff were committed.
+
+The system map was regenerated because the trace contract added a structural
+retrieval-route type. Proofroom and Health code did not change in this
+checkpoint; both must still be included in the next full G3 run.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
