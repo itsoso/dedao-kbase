@@ -65,6 +65,33 @@ func TestAgentPackageHashPreservesRuntimeSignificantOrder(t *testing.T) {
 	}
 }
 
+func TestAgentPackageHashBindsSemanticRetrievalIdentity(t *testing.T) {
+	base, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutations := []func(*AgentPackage){
+		func(pkg *AgentPackage) { pkg.RetrievalPolicy.EmbeddingProvider = "other-provider" },
+		func(pkg *AgentPackage) { pkg.RetrievalPolicy.EmbeddingModel = "other-model" },
+		func(pkg *AgentPackage) { pkg.RetrievalPolicy.EmbeddingVersion = "v2" },
+		func(pkg *AgentPackage) {
+			pkg.RetrievalPolicy.EmbeddingEndpointHash = "sha256:" + strings.Repeat("9", 64)
+		},
+		func(pkg *AgentPackage) { pkg.RetrievalPolicy.RerankerVersion = "semantic-reranker.v2" },
+	}
+	for index, mutate := range mutations {
+		changed := validAgentPackage()
+		mutate(&changed)
+		changed, err = FinalizeAgentPackage(changed)
+		if err != nil {
+			t.Fatalf("mutation %d: %v", index, err)
+		}
+		if changed.ContentHash == base.ContentHash {
+			t.Fatalf("semantic retrieval identity mutation %d did not change package hash", index)
+		}
+	}
+}
+
 func TestAgentPackageRejectsCrossReleaseCitationIDCollisions(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	first := agentPackageTestRelease()
@@ -94,6 +121,23 @@ func TestAgentPackageRejectsCrossReleaseCitationIDCollisions(t *testing.T) {
 	if err := ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs()); err == nil ||
 		!strings.Contains(err.Error(), "citation") || !strings.Contains(err.Error(), "multiple releases") {
 		t.Fatalf("cross-release citation collision error = %v", err)
+	}
+}
+
+func TestAgentPackageRejectsDuplicateCitationIDsInsidePinnedRelease(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Citations = append(release.Citations, release.Citations[0])
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs())
+	if err == nil || !strings.Contains(err.Error(), "duplicate citation") {
+		t.Fatalf("duplicate release citation error = %v", err)
 	}
 }
 
@@ -249,10 +293,15 @@ func validAgentPackage() AgentPackage {
 			CitationIDs: []string{"citation-1"},
 		}},
 		RetrievalPolicy: AgentPackageRetrievalPolicy{
-			Strategy:           "hybrid",
-			AllowedSourceTypes: []string{"dedao_ebook", "wechat_mp_article"},
-			RequireCitations:   true,
-			MaxContextChunks:   8,
+			Strategy:              "hybrid",
+			AllowedSourceTypes:    []string{"dedao_ebook", "wechat_mp_article"},
+			RequireCitations:      true,
+			MaxContextChunks:      8,
+			EmbeddingProvider:     "fixture",
+			EmbeddingModel:        "semantic",
+			EmbeddingVersion:      "v1",
+			EmbeddingEndpointHash: sha256Fingerprint([]byte("https://embedding.test.invalid/v1")),
+			RerankerVersion:       AgentSemanticRerankerVersion,
 		},
 		ModelPolicy: AgentPackageModelPolicy{
 			PreferredCapability: "reasoning",

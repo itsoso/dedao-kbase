@@ -28,6 +28,10 @@ func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *test
 		report.EvaluatedAt != now.Format(time.RFC3339Nano) {
 		t.Fatalf("report identity = %#v", report)
 	}
+	if report.RetrievalIdentity.EmbeddingIdentity != agentPackageSemanticEmbedderIdentity(pkg.RetrievalPolicy) ||
+		report.RetrievalIdentity.RerankerVersion != AgentSemanticRerankerVersion {
+		t.Fatalf("evaluation retrieval identity = %#v", report.RetrievalIdentity)
+	}
 	for _, metric := range []string{"retrieval", "retrieval_precision", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "task_completion", "latency", "cost"} {
 		if report.Metrics[metric] != 1 {
 			t.Fatalf("metric %q = %v, report=%#v", metric, report.Metrics[metric], report)
@@ -77,7 +81,9 @@ func TestAgentPackageEvaluationMeasuresRetrievalPrecisionAndTaskCompletion(t *te
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		t.Fatal(err)
 	}
-	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	pkg := validAgentPackage()
+	pkg.Releases[0].CitationIDs = append(pkg.Releases[0].CitationIDs, "citation-extra")
+	pkg, _ = FinalizeAgentPackage(pkg)
 	report, err := EvaluateAgentPackageDeterministically(store, pkg, loadAgentEvaluationFixture(t), testAgentPackageTime())
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +93,29 @@ func TestAgentPackageEvaluationMeasuresRetrievalPrecisionAndTaskCompletion(t *te
 	}
 	if report.Metrics["task_completion"] != 1 {
 		t.Fatalf("task completion did not execute package chat: %#v", report)
+	}
+}
+
+func TestAgentPackageEvaluationLatencyUsesStableRecordedObservation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	suite := loadAgentEvaluationFixture(t)
+	for index := range suite.Cases {
+		if suite.Cases[index].Metric == "latency" {
+			suite.Cases[index].RecordedLatencyMS = suite.Cases[index].MaxLatencyMS + 1
+		}
+	}
+	first, err := EvaluateAgentPackageDeterministically(store, pkg, suite, testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := EvaluateAgentPackageDeterministically(store, pkg, suite, testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Metrics["latency"] != 0 || !reflect.DeepEqual(first, second) {
+		t.Fatalf("recorded latency was not stable: first=%#v second=%#v", first, second)
 	}
 }
 

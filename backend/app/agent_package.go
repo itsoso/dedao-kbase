@@ -49,10 +49,15 @@ type AgentPackageReleaseRef struct {
 }
 
 type AgentPackageRetrievalPolicy struct {
-	Strategy           string   `json:"strategy"`
-	AllowedSourceTypes []string `json:"allowed_source_types"`
-	RequireCitations   bool     `json:"require_citations"`
-	MaxContextChunks   int      `json:"max_context_chunks"`
+	Strategy              string   `json:"strategy"`
+	AllowedSourceTypes    []string `json:"allowed_source_types"`
+	RequireCitations      bool     `json:"require_citations"`
+	MaxContextChunks      int      `json:"max_context_chunks"`
+	EmbeddingProvider     string   `json:"embedding_provider,omitempty"`
+	EmbeddingModel        string   `json:"embedding_model,omitempty"`
+	EmbeddingVersion      string   `json:"embedding_version,omitempty"`
+	EmbeddingEndpointHash string   `json:"embedding_endpoint_hash,omitempty"`
+	RerankerVersion       string   `json:"reranker_version,omitempty"`
 }
 
 type AgentPackageModelPolicy struct {
@@ -194,6 +199,23 @@ func validateAgentPackageRetrieval(policy AgentPackageRetrievalPolicy) error {
 	}
 	if policy.MaxContextChunks <= 0 {
 		return fmt.Errorf("retrieval_policy.max_context_chunks must be positive")
+	}
+	if policy.Strategy == "vector" || policy.Strategy == "hybrid" {
+		if err := requireContractFields(map[string]string{
+			"retrieval_policy.embedding_provider":      policy.EmbeddingProvider,
+			"retrieval_policy.embedding_model":         policy.EmbeddingModel,
+			"retrieval_policy.embedding_version":       policy.EmbeddingVersion,
+			"retrieval_policy.embedding_endpoint_hash": policy.EmbeddingEndpointHash,
+			"retrieval_policy.reranker_version":        policy.RerankerVersion,
+		}); err != nil {
+			return err
+		}
+		if policy.RerankerVersion != AgentSemanticRerankerVersion {
+			return fmt.Errorf("retrieval_policy.reranker_version %q is not supported", policy.RerankerVersion)
+		}
+		if err := validateAgentSHA256("retrieval_policy.embedding_endpoint_hash", policy.EmbeddingEndpointHash); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -373,6 +395,9 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 		}
 		availableCitations := make(map[string]struct{}, len(release.Citations))
 		for _, citation := range release.Citations {
+			if _, exists := availableCitations[citation.CitationID]; exists {
+				return fmt.Errorf("release %q contains duplicate citation %q", ref.ReleaseID, citation.CitationID)
+			}
 			availableCitations[citation.CitationID] = struct{}{}
 		}
 		for _, citationID := range uniqueTrimmedStrings(ref.CitationIDs) {

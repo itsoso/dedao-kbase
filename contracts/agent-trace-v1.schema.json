@@ -8,6 +8,7 @@
     "trace_id",
     "package",
     "releases",
+    "retrieval_route",
     "retrievals",
     "model_route",
     "tool_calls",
@@ -55,6 +56,16 @@
         },
         "additionalProperties": false
       }
+    },
+    "retrieval_route": {
+      "type": "object",
+      "required": ["strategy"],
+      "properties": {
+        "strategy": { "enum": ["lexical", "vector", "hybrid", "graph"] },
+        "embedding_identity": { "type": "string", "minLength": 1 },
+        "reranker_version": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
     },
     "model_route": {
       "type": "object",

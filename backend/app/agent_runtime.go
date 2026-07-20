@@ -91,15 +91,25 @@ func searchAgentPackageEvidence(
 			return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
 		}
 		releaseResults, searchErr := searchAgentReleaseClaimsWithStrategy(
-			store, *release, query, pkg.RetrievalPolicy.MaxContextChunks, pkg.RetrievalPolicy.Strategy,
+			store, *release, query, pkg.RetrievalPolicy.MaxContextChunks, pkg.RetrievalPolicy,
 		)
 		if searchErr != nil {
 			return nil, searchErr
 		}
+		allowedCitations := stringBoolSet(ref.CitationIDs...)
 		for _, result := range releaseResults {
+			filteredCitations := make([]string, 0, len(result.CitationIDs))
+			for _, citationID := range result.CitationIDs {
+				if allowedCitations[citationID] {
+					filteredCitations = append(filteredCitations, citationID)
+				}
+			}
+			if pkg.RetrievalPolicy.RequireCitations && len(filteredCitations) == 0 {
+				continue
+			}
 			results = append(results, AgentPackageEvidence{
 				ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
-				Statement: result.Statement, CitationIDs: append([]string(nil), result.CitationIDs...),
+				Statement: result.Statement, CitationIDs: filteredCitations,
 				Score: result.Score,
 			})
 		}
@@ -294,6 +304,11 @@ func saveAgentRuntimeTrace(
 		})
 	}
 	traceCitations := agentRuntimeTraceCitations(evidence, citations)
+	retrievalRoute := AgentTraceRetrievalRoute{Strategy: pkg.RetrievalPolicy.Strategy}
+	if pkg.RetrievalPolicy.Strategy == "vector" || pkg.RetrievalPolicy.Strategy == "hybrid" {
+		retrievalRoute.EmbeddingIdentity = agentPackageSemanticEmbedderIdentity(pkg.RetrievalPolicy)
+		retrievalRoute.RerankerVersion = pkg.RetrievalPolicy.RerankerVersion
+	}
 	trace := AgentTrace{
 		SchemaVersion: AgentTraceSchemaVersion,
 		TraceID:       traceID,
@@ -301,6 +316,7 @@ func saveAgentRuntimeTrace(
 			PackageID: pkg.PackageID, Version: pkg.Version, ContentHash: pkg.ContentHash,
 		},
 		Releases: releases, Retrievals: retrievals,
+		RetrievalRoute: retrievalRoute,
 		ModelRoute: AgentTraceModelRoute{
 			Provider: "tokenplan", Model: model, Capability: pkg.ModelPolicy.PreferredCapability,
 		},

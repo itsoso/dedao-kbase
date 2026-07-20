@@ -29,21 +29,28 @@ const (
 )
 
 type AgentTrace struct {
-	SchemaVersion string                 `json:"schema_version"`
-	TraceID       string                 `json:"trace_id"`
-	Package       AgentTracePackageRef   `json:"package"`
-	Releases      []AgentTraceReleaseRef `json:"releases"`
-	Retrievals    []AgentTraceRetrieval  `json:"retrievals"`
-	ModelRoute    AgentTraceModelRoute   `json:"model_route"`
-	ToolCalls     []AgentTraceToolCall   `json:"tool_calls"`
-	Final         AgentTraceFinal        `json:"final"`
-	StartedAt     string                 `json:"started_at"`
-	CompletedAt   string                 `json:"completed_at"`
+	SchemaVersion  string                   `json:"schema_version"`
+	TraceID        string                   `json:"trace_id"`
+	Package        AgentTracePackageRef     `json:"package"`
+	Releases       []AgentTraceReleaseRef   `json:"releases"`
+	RetrievalRoute AgentTraceRetrievalRoute `json:"retrieval_route"`
+	Retrievals     []AgentTraceRetrieval    `json:"retrievals"`
+	ModelRoute     AgentTraceModelRoute     `json:"model_route"`
+	ToolCalls      []AgentTraceToolCall     `json:"tool_calls"`
+	Final          AgentTraceFinal          `json:"final"`
+	StartedAt      string                   `json:"started_at"`
+	CompletedAt    string                   `json:"completed_at"`
 
 	Credentials    string   `json:"-"`
 	SourceBodies   []string `json:"-"`
 	PrivatePrompt  string   `json:"-"`
 	ConsumerUserID string   `json:"-"`
+}
+
+type AgentTraceRetrievalRoute struct {
+	Strategy          string `json:"strategy"`
+	EmbeddingIdentity string `json:"embedding_identity,omitempty"`
+	RerankerVersion   string `json:"reranker_version,omitempty"`
 }
 
 type AgentTracePackageRef struct {
@@ -133,6 +140,7 @@ func ValidateAgentTrace(trace AgentTrace) error {
 		"package.package_id":         trace.Package.PackageID,
 		"package.version":            trace.Package.Version,
 		"package.content_hash":       trace.Package.ContentHash,
+		"retrieval_route.strategy":   trace.RetrievalRoute.Strategy,
 		"model_route.provider":       trace.ModelRoute.Provider,
 		"model_route.model":          trace.ModelRoute.Model,
 		"model_route.capability":     trace.ModelRoute.Capability,
@@ -151,6 +159,16 @@ func ValidateAgentTrace(trace AgentTrace) error {
 	}
 	if err := validateAgentSHA256("final.response_fingerprint", trace.Final.ResponseFingerprint); err != nil {
 		return err
+	}
+	switch trace.RetrievalRoute.Strategy {
+	case "lexical", "graph":
+	case "vector", "hybrid":
+		if strings.TrimSpace(trace.RetrievalRoute.EmbeddingIdentity) == "" ||
+			strings.TrimSpace(trace.RetrievalRoute.RerankerVersion) == "" {
+			return fmt.Errorf("semantic retrieval trace requires embedding identity and reranker version")
+		}
+	default:
+		return fmt.Errorf("unsupported retrieval route strategy %q", trace.RetrievalRoute.Strategy)
 	}
 	startedAt, err := time.Parse(time.RFC3339Nano, trace.StartedAt)
 	if err != nil {

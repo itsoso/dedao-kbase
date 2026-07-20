@@ -35,6 +35,7 @@
             "additionalProperties": { "type": "string" }
           },
           "max_latency_ms": { "type": "integer", "minimum": 1 },
+          "recorded_latency_ms": { "type": "integer", "minimum": 1 },
           "max_cost_usd": { "type": "number", "exclusiveMinimum": 0 }
         },
         "additionalProperties": true

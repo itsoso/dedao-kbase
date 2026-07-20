@@ -866,7 +866,7 @@
     {
       "name": "AgentEvaluationReport",
       "file": "backend/app/agent_package_evaluation.go",
-      "line": 46
+      "line": 47
     },
     {
       "name": "AgentPackage",
@@ -891,12 +891,12 @@
     {
       "name": "AgentPackageUIManifest",
       "file": "backend/app/agent_package.go",
-      "line": 91
+      "line": 96
     },
     {
       "name": "AgentTraceOTLPEnvelope",
       "file": "backend/app/agent_trace.go",
-      "line": 442
+      "line": 460
     },
     {
       "name": "BookAnalysisManifest",
@@ -1661,7 +1661,7 @@
     {
       "name": "agentSemanticVectorRecord",
       "file": "backend/app/agent_semantic_retrieval.go",
-      "line": 25
+      "line": 37
     },
     {
       "name": "knowledgeSearchIndexRecord",

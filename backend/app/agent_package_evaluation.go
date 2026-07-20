@@ -40,20 +40,28 @@ type AgentEvaluationCase struct {
 	ExpectedArguments map[string]string `json:"expected_arguments,omitempty"`
 	ObservedArguments map[string]string `json:"-"`
 	MaxLatencyMS      int               `json:"max_latency_ms,omitempty"`
+	RecordedLatencyMS int               `json:"recorded_latency_ms,omitempty"`
 	MaxCostUSD        float64           `json:"max_cost_usd,omitempty"`
 }
 
 type AgentEvaluationReport struct {
-	SchemaVersion      string             `json:"schema_version"`
-	PackageID          string             `json:"package_id"`
-	PackageContentHash string             `json:"package_content_hash"`
-	SuiteVersion       string             `json:"suite_version"`
-	InputHash          string             `json:"input_hash"`
-	EvaluatorVersion   string             `json:"evaluator_version"`
-	Metrics            map[string]float64 `json:"metrics"`
-	Passed             bool               `json:"passed"`
-	Failures           []string           `json:"failures,omitempty"`
-	EvaluatedAt        string             `json:"evaluated_at"`
+	SchemaVersion      string                           `json:"schema_version"`
+	PackageID          string                           `json:"package_id"`
+	PackageContentHash string                           `json:"package_content_hash"`
+	SuiteVersion       string                           `json:"suite_version"`
+	InputHash          string                           `json:"input_hash"`
+	EvaluatorVersion   string                           `json:"evaluator_version"`
+	RetrievalIdentity  AgentEvaluationRetrievalIdentity `json:"retrieval_identity"`
+	Metrics            map[string]float64               `json:"metrics"`
+	Passed             bool                             `json:"passed"`
+	Failures           []string                         `json:"failures,omitempty"`
+	EvaluatedAt        string                           `json:"evaluated_at"`
+}
+
+type AgentEvaluationRetrievalIdentity struct {
+	Strategy          string `json:"strategy"`
+	EmbeddingIdentity string `json:"embedding_identity,omitempty"`
+	RerankerVersion   string `json:"reranker_version,omitempty"`
 }
 
 func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentPackage, suite AgentEvaluationSuite, now time.Time) (AgentEvaluationReport, error) {
@@ -99,6 +107,11 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 	if now.IsZero() {
 		now = time.Now()
 	}
+	retrievalIdentity := AgentEvaluationRetrievalIdentity{Strategy: pkg.RetrievalPolicy.Strategy}
+	if pkg.RetrievalPolicy.Strategy == "vector" || pkg.RetrievalPolicy.Strategy == "hybrid" {
+		retrievalIdentity.EmbeddingIdentity = agentPackageSemanticEmbedderIdentity(pkg.RetrievalPolicy)
+		retrievalIdentity.RerankerVersion = pkg.RetrievalPolicy.RerankerVersion
+	}
 	return AgentEvaluationReport{
 		SchemaVersion:      AgentEvaluationReportSchemaVersion,
 		PackageID:          pkg.PackageID,
@@ -106,6 +119,7 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 		SuiteVersion:       suite.SuiteVersion,
 		InputHash:          inputHash,
 		EvaluatorVersion:   AgentDeterministicEvaluatorVersion,
+		RetrievalIdentity:  retrievalIdentity,
 		Metrics:            metrics,
 		Passed:             len(failures) == 0,
 		Failures:           failures,
@@ -118,7 +132,6 @@ func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, eva
 	if input == "" {
 		return false, fmt.Errorf("input is required for behavioral metric %q", evalCase.Metric)
 	}
-	startedAt := time.Now()
 	search, err := searchAgentPackageEvidence(store, pkg, input, pkg.RetrievalPolicy.MaxContextChunks)
 	if err != nil {
 		return false, err
@@ -221,8 +234,11 @@ func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, eva
 		if evalCase.MaxLatencyMS <= 0 {
 			return false, fmt.Errorf("max_latency_ms must be positive")
 		}
+		if evalCase.RecordedLatencyMS <= 0 {
+			return false, fmt.Errorf("recorded_latency_ms must be positive")
+		}
 		_, _, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
-		return chatErr == nil && time.Since(startedAt) <= time.Duration(evalCase.MaxLatencyMS)*time.Millisecond, chatErr
+		return chatErr == nil && evalCase.RecordedLatencyMS <= evalCase.MaxLatencyMS, chatErr
 	case "cost":
 		if evalCase.MaxCostUSD <= 0 {
 			return false, fmt.Errorf("max_cost_usd must be positive")

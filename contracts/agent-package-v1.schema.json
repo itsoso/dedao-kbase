@@ -53,8 +53,19 @@
           "items": { "type": "string", "minLength": 1 }
         },
         "require_citations": { "const": true },
-        "max_context_chunks": { "type": "integer", "minimum": 1 }
-      }
+        "max_context_chunks": { "type": "integer", "minimum": 1 },
+        "embedding_provider": { "type": "string", "minLength": 1 },
+        "embedding_model": { "type": "string", "minLength": 1 },
+        "embedding_version": { "type": "string", "minLength": 1 },
+        "embedding_endpoint_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+        "reranker_version": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [{
+        "if": { "properties": { "strategy": { "enum": ["vector", "hybrid"] } } },
+        "then": {
+          "required": ["embedding_provider", "embedding_model", "embedding_version", "embedding_endpoint_hash", "reranker_version"]
+        }
+      }]
     },
     "model_policy": {
       "type": "object",

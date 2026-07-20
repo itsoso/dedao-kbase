@@ -96,6 +96,39 @@ func TestBookKnowledgeMCPReadsOnlyPinnedPackageRelease(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeMCPSearchDoesNotExposeClaimCitationsOutsidePackageAllowlist(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Citations = append(release.Citations, BookKnowledgeCitation{
+		CitationID: "shared-citation", BookID: release.BookID, ChunkID: "shared-chunk",
+	})
+	release.Analysis.Claims = append(release.Analysis.Claims, BookAnalysisClaim{
+		ID: "claim-forbidden", Statement: "forbidden-only evidence", CitationIDs: []string{"shared-citation"},
+	})
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg := validAgentPackage()
+	pkg.RetrievalPolicy.Strategy = "lexical"
+	pkg, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	if _, _, err := PublishAgentPackage(store, pkg, "mcp-allowlist", AgentReadOnlyToolIDs(), testAgentPackageTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	server := NewBookKnowledgeMCPServer(store)
+	result, err := server.Call("agent.search", json.RawMessage(`{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1","query":"forbidden-only"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(result) != "[]" {
+		t.Fatalf("MCP exposed claim citations outside package allowlist: %s", result)
+	}
+}
+
 func TestBookKnowledgeMCPRejectsMissingScopeUnknownArgumentsAndWrites(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

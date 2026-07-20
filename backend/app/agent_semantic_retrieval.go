@@ -15,7 +15,19 @@ import (
 	"time"
 )
 
-const agentSemanticVectorIndexVersion = "agent-semantic-vector-index.v1"
+const (
+	agentSemanticVectorIndexVersion = "agent-semantic-vector-index.v1"
+	AgentSemanticRerankerVersion    = "kbase-semantic-reranker.v1"
+)
+
+func agentPackageSemanticEmbedderIdentity(policy AgentPackageRetrievalPolicy) string {
+	return strings.Join([]string{
+		strings.TrimSpace(policy.EmbeddingProvider),
+		strings.TrimSpace(policy.EmbeddingModel),
+		strings.TrimSpace(policy.EmbeddingVersion),
+		strings.TrimSpace(policy.EmbeddingEndpointHash),
+	}, ":")
+}
 
 type AgentSemanticEmbedder interface {
 	Identity() string
@@ -39,11 +51,12 @@ type openAICompatibleAgentEmbedder struct {
 	baseURL    string
 	apiKey     string
 	model      string
+	identity   string
 	httpClient *http.Client
 }
 
 func (e *openAICompatibleAgentEmbedder) Identity() string {
-	return "openai-compatible:" + strings.TrimSpace(e.model)
+	return e.identity
 }
 
 func (e *openAICompatibleAgentEmbedder) Embed(ctx context.Context, inputs []string) ([][]float64, error) {
@@ -89,21 +102,33 @@ func (e *openAICompatibleAgentEmbedder) Embed(ctx context.Context, inputs []stri
 	return vectors, nil
 }
 
-func (s *BookKnowledgeStore) configuredAgentSemanticEmbedder() (AgentSemanticEmbedder, error) {
+func (s *BookKnowledgeStore) configuredAgentSemanticEmbedder(policy AgentPackageRetrievalPolicy) (AgentSemanticEmbedder, error) {
+	expectedIdentity := agentPackageSemanticEmbedderIdentity(policy)
 	s.mu.RLock()
 	embedder := s.agentSemanticEmbedder
 	s.mu.RUnlock()
 	if embedder != nil {
+		if embedder.Identity() != expectedIdentity {
+			return nil, fmt.Errorf("semantic embedder identity %q does not match package policy %q", embedder.Identity(), expectedIdentity)
+		}
 		return embedder, nil
 	}
 	baseURL := strings.TrimSpace(os.Getenv("KBASE_EMBEDDING_BASE_URL"))
+	provider := strings.TrimSpace(os.Getenv("KBASE_EMBEDDING_PROVIDER"))
 	model := strings.TrimSpace(os.Getenv("KBASE_EMBEDDING_MODEL"))
+	version := strings.TrimSpace(os.Getenv("KBASE_EMBEDDING_VERSION"))
 	apiKey := strings.TrimSpace(os.Getenv("KBASE_EMBEDDING_API_KEY"))
-	if baseURL == "" || model == "" || apiKey == "" {
-		return nil, fmt.Errorf("semantic embedder is not configured; KBASE_EMBEDDING_BASE_URL, KBASE_EMBEDDING_MODEL, and KBASE_EMBEDDING_API_KEY are required")
+	if baseURL == "" || provider == "" || model == "" || version == "" || apiKey == "" {
+		return nil, fmt.Errorf("semantic embedder is not configured; base URL, provider, model, version, and API key are required")
+	}
+	endpointHash := sha256Fingerprint([]byte(strings.TrimRight(baseURL, "/")))
+	configuredIdentity := strings.Join([]string{provider, model, version, endpointHash}, ":")
+	if configuredIdentity != expectedIdentity {
+		return nil, fmt.Errorf("configured semantic embedder identity %q does not match package policy %q", configuredIdentity, expectedIdentity)
 	}
 	return &openAICompatibleAgentEmbedder{
-		baseURL: baseURL, apiKey: apiKey, model: model, httpClient: &http.Client{Timeout: 30 * time.Second},
+		baseURL: baseURL, apiKey: apiKey, model: model, identity: configuredIdentity,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 

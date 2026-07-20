@@ -43,6 +43,10 @@ func TestAgentTracePersistsVersionedRuntimeEvidenceWithoutPrivateInputs(t *testi
 	if loaded.Retrievals[0].EvidenceID != "chunk-1" || loaded.ModelRoute.Model != "grounded-model" {
 		t.Fatalf("loaded runtime trace = %#v", loaded)
 	}
+	if loaded.RetrievalRoute.EmbeddingIdentity != agentPackageSemanticEmbedderIdentity(validAgentPackage().RetrievalPolicy) ||
+		loaded.RetrievalRoute.RerankerVersion != AgentSemanticRerankerVersion {
+		t.Fatalf("loaded retrieval provenance = %#v", loaded.RetrievalRoute)
+	}
 	if loaded.ToolCalls[0].PolicyDecision != AgentToolAllow || loaded.Final.Citations[0].CitationID != "citation-1" {
 		t.Fatalf("loaded policy/final trace = %#v", loaded)
 	}
@@ -204,6 +208,7 @@ func TestAgentTraceJSONSchemaDeclaresBoundedObservableContract(t *testing.T) {
 		`"agent-trace.v1"`,
 		`"package"`,
 		`"releases"`,
+		`"retrieval_route"`,
 		`"retrievals"`,
 		`"model_route"`,
 		`"tool_calls"`,
@@ -240,6 +245,10 @@ func agentTraceTestTrace() AgentTrace {
 			Score:      0.91,
 			Rank:       1,
 		}},
+		RetrievalRoute: AgentTraceRetrievalRoute{
+			Strategy: "hybrid", EmbeddingIdentity: agentPackageSemanticEmbedderIdentity(validAgentPackage().RetrievalPolicy),
+			RerankerVersion: AgentSemanticRerankerVersion,
+		},
 		ModelRoute: AgentTraceModelRoute{
 			Provider:   "tokenplan-compatible",
 			Model:      "grounded-model",

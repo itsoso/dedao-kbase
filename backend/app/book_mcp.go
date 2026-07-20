@@ -128,6 +128,7 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 	if err != nil {
 		return nil, fmt.Errorf("load pinned release: %w", err)
 	}
+	allowedCitations := agentPackageReleaseCitationAllowlist(pkg, releaseID)
 
 	switch name {
 	case "agent.package_metadata":
@@ -153,14 +154,17 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 			return nil, err
 		}
 		results, searchErr := searchAgentReleaseClaimsWithStrategy(
-			s.store, *release, stringArgument(input, "query"), limit, pkg.RetrievalPolicy.Strategy,
+			s.store, *release, stringArgument(input, "query"), limit, pkg.RetrievalPolicy,
 		)
 		if searchErr != nil {
 			return nil, searchErr
 		}
-		return marshalMCPResult(results)
+		return marshalMCPResult(filterAgentScopedSearchResults(results, allowedCitations, pkg.RetrievalPolicy.RequireCitations))
 	case "agent.resolve_citation":
 		citationID := stringArgument(input, "citation_id")
+		if !allowedCitations[citationID] {
+			return nil, fmt.Errorf("citation is outside the pinned package release allowlist: %s", citationID)
+		}
 		for _, citation := range release.Citations {
 			if citation.CitationID == citationID {
 				return marshalMCPResult(AgentScopedCitation{
@@ -179,6 +183,16 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 		claimID := stringArgument(input, "claim_id")
 		for _, claim := range release.Analysis.Claims {
 			if claim.ID == claimID {
+				filtered := make([]string, 0, len(claim.CitationIDs))
+				for _, citationID := range claim.CitationIDs {
+					if allowedCitations[citationID] {
+						filtered = append(filtered, citationID)
+					}
+				}
+				if pkg.RetrievalPolicy.RequireCitations && len(filtered) == 0 {
+					return nil, fmt.Errorf("claim citations are outside the pinned package release allowlist: %s", claimID)
+				}
+				claim.CitationIDs = filtered
 				return marshalMCPResult(claim)
 			}
 		}
@@ -188,8 +202,35 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 	}
 }
 
+func agentPackageReleaseCitationAllowlist(pkg AgentPackage, releaseID string) map[string]bool {
+	for _, ref := range pkg.Releases {
+		if ref.ReleaseID == releaseID {
+			return stringBoolSet(ref.CitationIDs...)
+		}
+	}
+	return map[string]bool{}
+}
+
+func filterAgentScopedSearchResults(results []AgentScopedSearchResult, allowed map[string]bool, requireCitations bool) []AgentScopedSearchResult {
+	filteredResults := make([]AgentScopedSearchResult, 0, len(results))
+	for _, result := range results {
+		filteredCitations := make([]string, 0, len(result.CitationIDs))
+		for _, citationID := range result.CitationIDs {
+			if allowed[citationID] {
+				filteredCitations = append(filteredCitations, citationID)
+			}
+		}
+		if requireCitations && len(filteredCitations) == 0 {
+			continue
+		}
+		result.CitationIDs = filteredCitations
+		filteredResults = append(filteredResults, result)
+	}
+	return filteredResults
+}
+
 func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int) []AgentScopedSearchResult {
-	results, _ := searchAgentReleaseClaimsWithStrategy(nil, release, query, limit, "lexical")
+	results, _ := searchAgentReleaseClaimsWithStrategy(nil, release, query, limit, AgentPackageRetrievalPolicy{Strategy: "lexical"})
 	return results
 }
 
@@ -198,12 +239,12 @@ func searchAgentReleaseClaimsWithStrategy(
 	release KnowledgeRelease,
 	query string,
 	limit int,
-	strategy string,
+	policy AgentPackageRetrievalPolicy,
 ) ([]AgentScopedSearchResult, error) {
 	if release.Analysis == nil {
 		return []AgentScopedSearchResult{}, nil
 	}
-	strategy = strings.TrimSpace(strategy)
+	strategy := strings.TrimSpace(policy.Strategy)
 	if strategy == "graph" {
 		return nil, fmt.Errorf("graph retrieval is not connected for Agent Package execution")
 	}
@@ -216,7 +257,7 @@ func searchAgentReleaseClaimsWithStrategy(
 		if store == nil {
 			return nil, fmt.Errorf("semantic embedder store is required for %s retrieval", strategy)
 		}
-		embedder, err := store.configuredAgentSemanticEmbedder()
+		embedder, err := store.configuredAgentSemanticEmbedder(policy)
 		if err != nil {
 			return nil, err
 		}
@@ -259,7 +300,7 @@ func searchAgentReleaseClaimsWithStrategy(
 			continue
 		}
 		if strategy == "vector" || strategy == "hybrid" {
-			score = agentSemanticRerankScore(query, haystack, score)
+			score = agentSemanticRerankScore(policy.RerankerVersion, query, haystack, score)
 		}
 		results = append(results, AgentScopedSearchResult{
 			ClaimID: claim.ID, Statement: claim.Statement,
@@ -279,7 +320,10 @@ func searchAgentReleaseClaimsWithStrategy(
 	return results, nil
 }
 
-func agentSemanticRerankScore(query, document string, baseScore float64) float64 {
+func agentSemanticRerankScore(version, query, document string, baseScore float64) float64 {
+	if version != AgentSemanticRerankerVersion {
+		return 0
+	}
 	queryTerms := splitSearchTerms(query)
 	if len(queryTerms) == 0 {
 		return baseScore

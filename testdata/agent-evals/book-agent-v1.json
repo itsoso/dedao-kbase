@@ -78,6 +78,7 @@
       "metric": "latency",
       "input": "grounded",
       "model_output": "Synthetic grounded statement [citation:citation-1]",
+      "recorded_latency_ms": 25,
       "max_latency_ms": 1000
     },
     {

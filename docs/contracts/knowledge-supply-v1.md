@@ -38,13 +38,21 @@ abstention, task completion, observed latency, and bounded observed cost. The
 trusted report and suite are immutable sidecars keyed by package content hash;
 publication recomputes them and fails when any declared threshold is missed.
 
-`vector` and `hybrid` strategies require an explicitly configured semantic
-embedding service (`KBASE_EMBEDDING_BASE_URL`, `KBASE_EMBEDDING_MODEL`, and
-`KBASE_EMBEDDING_API_KEY`). KBase stores only content-addressed numeric vectors
-in its local index and reranks candidates before resolving citations. Missing
-embedding configuration fails closed; it never silently substitutes lexical
-term frequency. Operators must use an embedding service authorized to process
-the source material.
+`vector` and `hybrid` strategies pin embedding provider, model, version,
+endpoint URL fingerprint, and reranker version inside the hashed package policy.
+The
+runtime configuration (`KBASE_EMBEDDING_BASE_URL`, `KBASE_EMBEDDING_PROVIDER`,
+`KBASE_EMBEDDING_MODEL`, `KBASE_EMBEDDING_VERSION`, and
+`KBASE_EMBEDDING_API_KEY`) must match that identity. KBase stores only
+content-addressed numeric vectors in its local index,
+records retrieval identity in evaluations and traces, and reranks candidates
+before resolving citations. Missing or mismatched configuration fails closed;
+it never silently substitutes lexical term frequency. Operators must use an
+embedding service authorized to process the source material.
+
+Golden latency cases use an immutable recorded observation and threshold. The
+evaluator still executes the shared runtime path, but wall-clock host load is
+not included in the report that publication later recomputes byte-for-byte.
 
 ## Pull Feed
 

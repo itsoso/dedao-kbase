@@ -32,6 +32,45 @@ func TestAgentPackageRuntimeSearchesEveryPinnedRelease(t *testing.T) {
 	}
 }
 
+func TestAgentPackageRuntimeRejectsClaimCitationsOutsideReleaseReferenceAllowlist(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := validAgentPackage()
+	pkg.RetrievalPolicy.Strategy = "lexical"
+	pkg.Releases = nil
+	for index, releaseID := range []string{"release-1", "release-2"} {
+		release := agentPackageTestRelease()
+		release.ReleaseID = releaseID
+		release.ContentHash = "sha256:" + strings.Repeat(string(rune('1'+index)), 64)
+		uniqueCitationID := "unique-citation-" + releaseID
+		release.Citations = []BookKnowledgeCitation{
+			{CitationID: uniqueCitationID, BookID: release.BookID, ChunkID: "unique-chunk-" + releaseID},
+			{CitationID: "shared-citation", BookID: release.BookID, ChunkID: "shared-chunk-" + releaseID},
+		}
+		release.Analysis.Claims[0].CitationIDs = []string{"shared-citation"}
+		if err := store.saveKnowledgeRelease(release); err != nil {
+			t.Fatal(err)
+		}
+		pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
+			ReleaseID: releaseID, ContentHash: release.ContentHash, CitationIDs: []string{uniqueCitationID},
+		})
+	}
+	pkg, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs()); err != nil {
+		t.Fatalf("unique release refs should validate: %v", err)
+	}
+
+	response, err := searchAgentPackageEvidence(store, pkg, "grounded", 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 0 {
+		t.Fatalf("runtime exposed citations outside release ref allowlists: %#v", response.Results)
+	}
+}
+
 func TestAgentPackageRuntimeEnforcesPackageSearchLimit(t *testing.T) {
 	store, pkg := agentRuntimeTestStoreWithLimit(t, 1)
 	_, err := SearchAgentPackage(store, AgentPackageSearchRequest{
@@ -75,7 +114,9 @@ func TestAgentPackageVectorRetrievalUsesSemanticEmbeddingIndexAndReranker(t *tes
 		{ID: "claim-finance", Statement: "Portfolio allocation affects investment risk.", CitationIDs: []string{"citation-2"}},
 	}
 
-	results, err := searchAgentReleaseClaimsWithStrategy(store, release, "cardiac wellness", 2, "vector")
+	vectorPolicy := validAgentPackage().RetrievalPolicy
+	vectorPolicy.Strategy = "vector"
+	results, err := searchAgentReleaseClaimsWithStrategy(store, release, "cardiac wellness", 2, vectorPolicy)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +130,7 @@ func TestAgentPackageVectorRetrievalUsesSemanticEmbeddingIndexAndReranker(t *tes
 	reloaded := NewBookKnowledgeStore(root)
 	reloadedEmbedder := &fakeAgentSemanticEmbedder{}
 	reloaded.SetAgentSemanticEmbedder(reloadedEmbedder)
-	if _, err := searchAgentReleaseClaimsWithStrategy(reloaded, release, "cardiac wellness", 2, "hybrid"); err != nil {
+	if _, err := searchAgentReleaseClaimsWithStrategy(reloaded, release, "cardiac wellness", 2, validAgentPackage().RetrievalPolicy); err != nil {
 		t.Fatal(err)
 	}
 	if reloadedEmbedder.documentInputs != 0 || reloadedEmbedder.queryInputs != 1 {
@@ -101,18 +142,58 @@ func TestAgentPackageSemanticRetrievalFailsClosedWithoutConfiguredEmbedder(t *te
 	t.Setenv("KBASE_EMBEDDING_BASE_URL", "")
 	t.Setenv("KBASE_EMBEDDING_MODEL", "")
 	store := NewBookKnowledgeStore(t.TempDir())
-	_, err := searchAgentReleaseClaimsWithStrategy(store, agentPackageTestRelease(), "grounded", 2, "hybrid")
+	_, err := searchAgentReleaseClaimsWithStrategy(store, agentPackageTestRelease(), "grounded", 2, validAgentPackage().RetrievalPolicy)
 	if err == nil || !strings.Contains(err.Error(), "semantic embedder") {
 		t.Fatalf("missing semantic embedder error = %v", err)
+	}
+}
+
+func TestAgentPackageSemanticRetrievalRejectsEmbedderIdentityMismatch(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{identity: "other:model:v9:endpoint"})
+	_, err := searchAgentReleaseClaimsWithStrategy(
+		store, agentPackageTestRelease(), "grounded", 2, validAgentPackage().RetrievalPolicy,
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match package policy") {
+		t.Fatalf("embedder identity mismatch error = %v", err)
+	}
+}
+
+func TestConfiguredSemanticEmbedderBindsEndpointFingerprintToPackagePolicy(t *testing.T) {
+	baseURL := "https://embedding.test.invalid/v1"
+	t.Setenv("KBASE_EMBEDDING_BASE_URL", baseURL)
+	t.Setenv("KBASE_EMBEDDING_PROVIDER", "fixture")
+	t.Setenv("KBASE_EMBEDDING_MODEL", "semantic")
+	t.Setenv("KBASE_EMBEDDING_VERSION", "v1")
+	t.Setenv("KBASE_EMBEDDING_API_KEY", "synthetic-test-key")
+	store := NewBookKnowledgeStore(t.TempDir())
+	policy := validAgentPackage().RetrievalPolicy
+	embedder, err := store.configuredAgentSemanticEmbedder(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if embedder.Identity() != agentPackageSemanticEmbedderIdentity(policy) {
+		t.Fatalf("configured embedder identity = %q", embedder.Identity())
+	}
+
+	t.Setenv("KBASE_EMBEDDING_BASE_URL", "https://different.test.invalid/v1")
+	if _, err := store.configuredAgentSemanticEmbedder(policy); err == nil || !strings.Contains(err.Error(), "does not match package policy") {
+		t.Fatalf("changed endpoint identity error = %v", err)
 	}
 }
 
 type fakeAgentSemanticEmbedder struct {
 	documentInputs int
 	queryInputs    int
+	identity       string
 }
 
-func (e *fakeAgentSemanticEmbedder) Identity() string { return "fixture-semantic-v1" }
+func (e *fakeAgentSemanticEmbedder) Identity() string {
+	if e.identity != "" {
+		return e.identity
+	}
+	return agentPackageSemanticEmbedderIdentity(validAgentPackage().RetrievalPolicy)
+}
 
 func (e *fakeAgentSemanticEmbedder) Embed(_ context.Context, inputs []string) ([][]float64, error) {
 	vectors := make([][]float64, 0, len(inputs))
