@@ -764,6 +764,78 @@ Independent verification results:
 - KBase privacy smoke and `git diff --check` — PASS; all three worktrees stayed
   clean throughout review.
 
+## G4 remediation checkpoint 6: behavioral Gates and cursor consumers
+
+**Decision: NO-GO.** KBase and Proofroom remediations passed their focused and
+release-level checks, but the mandatory independent Health safety review found
+two blocking retirement defects in Health revision `544adb16a`. G3
+revalidation was stopped at that failed Gate. No branch was pushed and no
+deployment was attempted.
+
+Exact current revisions:
+
+- KBase: `2e0ee67` (`0cc307b` behavioral runtime/evaluation hardening plus
+  `2e0ee67` incremental supersession contract regression);
+- Proofroom: `018d8d99`;
+- Health: `544adb16a`.
+
+Delivered and verified before the failed safety Gate:
+
+- KBase now executes deterministic retrieval, citation, faithfulness,
+  abstention, tool-selection, tool-argument, latency, and cost evaluation cases;
+  runtime and MCP require a currently published package and a passing trusted
+  evaluation; generated answer citation markers are validated before completed
+  traces; retrieval strategy and model-cost declarations are enforced; strict
+  MCP required arguments reject non-string values.
+- `go test ./...` in KBase — PASS, including `backend/app` in `15.432s`;
+  `npm run build` in `frontend/` — PASS with the existing Vite `eval` and large
+  chunk warnings only.
+- `go test ./backend/app -run
+  'TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts' -count=1`
+  — PASS; the regression confirms a consumer positioned after v1 sees only v2
+  and receives `supersedes: package@v1`.
+- KBase `bash scripts/privacy-smoke.sh` and `git diff --check` — PASS before
+  both remediation commits.
+- Proofroom cursor-only supersession, stale-match, and zero-hit tests were RED
+  before production wiring and GREEN afterward; the focused adapter file —
+  PASS, `12 passed in 3.90s`.
+- Proofroom's six-suite release matrix in the repository virtual environment —
+  PASS, `131 passed in 9.07s`; `python3 -m py_compile`, the added-line privacy
+  scan, and `git diff --check` — PASS before commit. An earlier diagnostic run
+  with system Python failed `22` async tests because `pytest-asyncio` was absent;
+  it was not counted as a Gate pass and was rerun successfully in the project
+  environment.
+- Health's cursor-only supersession regression was RED because both old and new
+  release artifacts remained, then GREEN with the two related lifecycle tests,
+  `3 passed, 6 warnings in 2.57s`.
+- The Health eleven-file release matrix was split only to preserve a trustworthy
+  process exit code: group one — PASS, `102 passed, 6 warnings in 17.23s`;
+  group two — PASS, `124 passed, 6 warnings in 17.56s`. `ruff check`, project-
+  environment `python scripts/check_doc_drift.py`, `python -m py_compile`, the
+  added-line privacy scan, and `git diff --check` — PASS. No structural source
+  inventory changed, so the Health system map was not regenerated. The first
+  commit attempt was correctly blocked when its hook used dependency-missing
+  system Python; retrying with the repository virtual environment first in
+  `PATH` passed every hook without bypass.
+
+Mandatory independent Health safety review of `544adb16a`: **NO-GO**.
+
+1. A mixed cursor page can contain a held replacement plus an unrelated
+   eligible package. Supersession references are currently collected before
+   Health eligibility assessment, so the held replacement can retire the prior
+   draft even though Health rejected the replacement. Retirement must be
+   derived only from an eligible, identity-validated replacement detail.
+2. Removing the final Agent Package lineage currently drops the artifact row.
+   If package ingestion replaced a canonical row with the same `doc_id`, this
+   deletes shared canonical evidence instead of restoring its baseline form.
+   The correction must restore canonical rows and add canonical-collision plus
+   mixed held/eligible regressions.
+
+The reviewer confirmed that the candidate-workspace lock/atomic replacement,
+draft-only review boundary, explicit Health publication ownership, lack of
+personal-health writes, and privacy boundary remain intact. Remediation and a
+fresh independent safety review are required before G3/G4 can resume.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
