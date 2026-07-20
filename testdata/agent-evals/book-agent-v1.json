@@ -9,17 +9,25 @@
       "expected_ids": ["chunk-1"]
     },
     {
+      "case_id": "retrieval-precision-synthetic-1",
+      "metric": "retrieval_precision",
+      "input": "grounded",
+      "expected_ids": ["chunk-1"]
+    },
+    {
       "case_id": "citation-synthetic-1",
       "metric": "citations",
       "input": "grounded",
-      "expected_ids": ["citation-1"]
+      "expected_ids": ["citation-1"],
+      "model_output": "Synthetic grounded statement [citation:citation-1]"
     },
     {
       "case_id": "faithfulness-synthetic-1",
       "metric": "faithfulness",
       "input": "grounded",
       "expected_ids": ["claim-1"],
-      "expected_value": "Synthetic grounded statement"
+      "expected_value": "Synthetic grounded statement",
+      "model_output": "Synthetic grounded statement [citation:citation-1]"
     },
     {
       "case_id": "abstention-synthetic-1",
@@ -31,29 +39,52 @@
       "case_id": "tool-choice-synthetic-1",
       "metric": "tool_choice",
       "input": "grounded",
-      "expected_value": "book-mcp/agent.search"
+      "expected_value": "book-mcp/agent.search",
+      "proposed_tool": "book-mcp/agent.search",
+      "proposed_arguments": {
+        "package_id": "agent-package-example",
+        "package_version": "1.0.0",
+        "release_id": "release-1",
+        "query": "grounded"
+      }
     },
     {
       "case_id": "tool-arguments-synthetic-1",
       "metric": "tool_arguments",
       "input": "grounded",
+      "proposed_tool": "book-mcp/agent.search",
+      "proposed_arguments": {
+        "package_id": "agent-package-example",
+        "package_version": "1.0.0",
+        "release_id": "release-1",
+        "query": "grounded"
+      },
       "expected_arguments": {
         "package_id": "agent-package-example",
         "package_version": "1.0.0",
         "release_id": "release-1",
-        "query_fingerprint": "sha256:d2aaf9e89e052bb304af234efa3b813a7442017b61c243e90edd108b1701d896"
+        "query": "grounded"
       }
+    },
+    {
+      "case_id": "task-completion-synthetic-1",
+      "metric": "task_completion",
+      "input": "grounded",
+      "expected_value": "Synthetic grounded statement",
+      "model_output": "Synthetic grounded statement [citation:citation-1]"
     },
     {
       "case_id": "latency-synthetic-1",
       "metric": "latency",
       "input": "grounded",
+      "model_output": "Synthetic grounded statement [citation:citation-1]",
       "max_latency_ms": 1000
     },
     {
       "case_id": "cost-synthetic-1",
       "metric": "cost",
       "input": "grounded",
+      "model_output": "Synthetic grounded statement [citation:citation-1]",
       "max_cost_usd": 0.25
     }
   ]

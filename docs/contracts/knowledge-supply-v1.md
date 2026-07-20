@@ -23,6 +23,29 @@ Package manifests contain prompt profile and output-schema identifiers, not
 private prompt bodies. They do not transfer downloaded source bodies,
 credentials, consumer user data, or consumer-owned review decisions.
 
+Before publication, a publisher submits the finalized package and its synthetic
+golden suite to:
+
+```text
+POST /api/agent-packages/evaluate
+POST /api/agent-packages/publish
+```
+
+Both routes require the dedicated Agent Package publisher token. Evaluation
+executes the package retrieval and grounded-chat path, the proposed read-only
+tool policy, retrieval recall and precision, citations, faithfulness,
+abstention, task completion, observed latency, and bounded observed cost. The
+trusted report and suite are immutable sidecars keyed by package content hash;
+publication recomputes them and fails when any declared threshold is missed.
+
+`vector` and `hybrid` strategies require an explicitly configured semantic
+embedding service (`KBASE_EMBEDDING_BASE_URL`, `KBASE_EMBEDDING_MODEL`, and
+`KBASE_EMBEDDING_API_KEY`). KBase stores only content-addressed numeric vectors
+in its local index and reranks candidates before resolving citations. Missing
+embedding configuration fails closed; it never silently substitutes lexical
+term frequency. Operators must use an embedding service authorized to process
+the source material.
+
 ## Pull Feed
 
 Use:

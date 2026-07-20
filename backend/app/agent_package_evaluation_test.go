@@ -28,7 +28,7 @@ func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *test
 		report.EvaluatedAt != now.Format(time.RFC3339Nano) {
 		t.Fatalf("report identity = %#v", report)
 	}
-	for _, metric := range []string{"retrieval", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "latency", "cost"} {
+	for _, metric := range []string{"retrieval", "retrieval_precision", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "task_completion", "latency", "cost"} {
 		if report.Metrics[metric] != 1 {
 			t.Fatalf("metric %q = %v, report=%#v", metric, report.Metrics[metric], report)
 		}
@@ -42,8 +42,57 @@ func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *test
 	}
 }
 
+func TestAgentPackageEvaluationUsesGoldenModelAndToolObservations(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	suite := loadAgentEvaluationFixture(t)
+	for index := range suite.Cases {
+		switch suite.Cases[index].Metric {
+		case "faithfulness":
+			suite.Cases[index].ModelOutput = "Unsupported synthetic answer [citation:citation-1]"
+		case "tool_choice":
+			suite.Cases[index].ProposedTool = "book-mcp/agent.delete"
+		}
+	}
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Metrics["faithfulness"] != 0 || report.Metrics["tool_choice"] != 0 || report.Passed {
+		t.Fatalf("forged evaluator observations passed: %#v", report)
+	}
+}
+
+func TestAgentPackageEvaluationMeasuresRetrievalPrecisionAndTaskCompletion(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
+	release := agentPackageTestRelease()
+	release.Analysis.Claims = append(release.Analysis.Claims, BookAnalysisClaim{
+		ID: "claim-extra", Statement: "Another grounded synthetic statement", CitationIDs: []string{"citation-extra"},
+	})
+	release.Citations = append(release.Citations, BookKnowledgeCitation{
+		CitationID: "citation-extra", BookID: "book-1", ChunkID: "chunk-extra",
+	})
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, loadAgentEvaluationFixture(t), testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Metrics["retrieval"] != 1 || report.Metrics["retrieval_precision"] != 0 {
+		t.Fatalf("retrieval recall/precision = %#v", report.Metrics)
+	}
+	if report.Metrics["task_completion"] != 1 {
+		t.Fatalf("task completion did not execute package chat: %#v", report)
+	}
+}
+
 func TestAgentPackageEvaluationExecutesGoldenRetrievalQuery(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
+	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	release := agentPackageTestRelease()
 	release.Analysis.Claims[0].Statement = "Synthetic unrelated statement"
 	if err := store.saveKnowledgeRelease(release); err != nil {
@@ -66,6 +115,7 @@ func TestAgentPackageEvaluationExecutesGoldenRetrievalQuery(t *testing.T) {
 
 func TestAgentPackageEvaluationJudgesDeterministicGroundedAnswer(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
+	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	release := agentPackageTestRelease()
 	release.Analysis.Claims[0].Statement = "Grounded but incorrect statement"
 	if err := store.saveKnowledgeRelease(release); err != nil {
@@ -283,12 +333,35 @@ func loadAgentEvaluationFixture(t *testing.T) AgentEvaluationSuite {
 
 func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeStore, pkg AgentPackage) {
 	t.Helper()
+	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	suite := loadAgentEvaluationFixture(t)
 	for index := range suite.Cases {
-		if suite.Cases[index].Metric == "tool_arguments" {
-			suite.Cases[index].ExpectedArguments["package_id"] = pkg.PackageID
-			suite.Cases[index].ExpectedArguments["package_version"] = pkg.Version
-			suite.Cases[index].ExpectedArguments["release_id"] = pkg.Releases[0].ReleaseID
+		if len(suite.Cases[index].ProposedArguments) > 0 {
+			for _, arguments := range []map[string]string{
+				suite.Cases[index].ExpectedArguments,
+				suite.Cases[index].ProposedArguments,
+			} {
+				if arguments == nil {
+					continue
+				}
+				arguments["package_id"] = pkg.PackageID
+				arguments["package_version"] = pkg.Version
+				arguments["release_id"] = pkg.Releases[0].ReleaseID
+			}
+		}
+		if suite.Cases[index].Metric == "retrieval_precision" {
+			search, err := searchAgentPackageEvidence(store, pkg, suite.Cases[index].Input, pkg.RetrievalPolicy.MaxContextChunks)
+			if err != nil {
+				t.Fatal(err)
+			}
+			citations, err := resolveAgentRuntimeCitations(store, search.Results)
+			if err != nil {
+				t.Fatal(err)
+			}
+			suite.Cases[index].ExpectedIDs = suite.Cases[index].ExpectedIDs[:0]
+			for _, citation := range citations {
+				suite.Cases[index].ExpectedIDs = append(suite.Cases[index].ExpectedIDs, citation.ChunkID)
+			}
 		}
 	}
 	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC))

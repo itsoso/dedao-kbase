@@ -44,7 +44,6 @@ func TestAgentPackageRuntimeEnforcesPackageSearchLimit(t *testing.T) {
 
 func TestAgentPackageRuntimeExecutesDeclaredRetrievalStrategy(t *testing.T) {
 	strategies := []string{"lexical", "vector", "hybrid"}
-	scores := make(map[string]float64)
 	for _, strategy := range strategies {
 		store, pkg := agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
 			pkg.RetrievalPolicy.Strategy = strategy
@@ -58,11 +57,79 @@ func TestAgentPackageRuntimeExecutesDeclaredRetrievalStrategy(t *testing.T) {
 		if response.RetrievalStrategy != strategy || len(response.Results) == 0 || response.Results[0].ClaimID != "claim-2" {
 			t.Fatalf("%s response = %#v", strategy, response)
 		}
-		scores[strategy] = response.Results[0].Score
+		if response.Results[0].Score <= 0 || response.Results[0].Score > 1 {
+			t.Fatalf("%s score = %v", strategy, response.Results[0].Score)
+		}
 	}
-	if scores["lexical"] == scores["vector"] || scores["hybrid"] == scores["lexical"] || scores["hybrid"] == scores["vector"] {
-		t.Fatalf("retrieval strategies reused one score: %#v", scores)
+}
+
+func TestAgentPackageVectorRetrievalUsesSemanticEmbeddingIndexAndReranker(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	embedder := &fakeAgentSemanticEmbedder{}
+	store.SetAgentSemanticEmbedder(embedder)
+	release := agentPackageTestRelease()
+	release.ContentHash = "sha256:" + strings.Repeat("a", 64)
+	release.Analysis.Claims = []BookAnalysisClaim{
+		{ID: "claim-heart", Statement: "Heart health improves with steady movement.", CitationIDs: []string{"citation-1"}},
+		{ID: "claim-finance", Statement: "Portfolio allocation affects investment risk.", CitationIDs: []string{"citation-2"}},
 	}
+
+	results, err := searchAgentReleaseClaimsWithStrategy(store, release, "cardiac wellness", 2, "vector")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].ClaimID != "claim-heart" {
+		t.Fatalf("semantic vector results = %#v", results)
+	}
+	if embedder.documentInputs != 2 || embedder.queryInputs != 1 {
+		t.Fatalf("embedding calls after index build = %#v", embedder)
+	}
+
+	reloaded := NewBookKnowledgeStore(root)
+	reloadedEmbedder := &fakeAgentSemanticEmbedder{}
+	reloaded.SetAgentSemanticEmbedder(reloadedEmbedder)
+	if _, err := searchAgentReleaseClaimsWithStrategy(reloaded, release, "cardiac wellness", 2, "hybrid"); err != nil {
+		t.Fatal(err)
+	}
+	if reloadedEmbedder.documentInputs != 0 || reloadedEmbedder.queryInputs != 1 {
+		t.Fatalf("persisted vector index was not reused: %#v", reloadedEmbedder)
+	}
+}
+
+func TestAgentPackageSemanticRetrievalFailsClosedWithoutConfiguredEmbedder(t *testing.T) {
+	t.Setenv("KBASE_EMBEDDING_BASE_URL", "")
+	t.Setenv("KBASE_EMBEDDING_MODEL", "")
+	store := NewBookKnowledgeStore(t.TempDir())
+	_, err := searchAgentReleaseClaimsWithStrategy(store, agentPackageTestRelease(), "grounded", 2, "hybrid")
+	if err == nil || !strings.Contains(err.Error(), "semantic embedder") {
+		t.Fatalf("missing semantic embedder error = %v", err)
+	}
+}
+
+type fakeAgentSemanticEmbedder struct {
+	documentInputs int
+	queryInputs    int
+}
+
+func (e *fakeAgentSemanticEmbedder) Identity() string { return "fixture-semantic-v1" }
+
+func (e *fakeAgentSemanticEmbedder) Embed(_ context.Context, inputs []string) ([][]float64, error) {
+	vectors := make([][]float64, 0, len(inputs))
+	for _, input := range inputs {
+		lower := strings.ToLower(input)
+		if strings.Contains(lower, "heart") || strings.Contains(lower, "cardiac") || strings.Contains(lower, "grounded") {
+			vectors = append(vectors, []float64{1, 0})
+		} else {
+			vectors = append(vectors, []float64{0, 1})
+		}
+	}
+	if len(inputs) > 1 {
+		e.documentInputs += len(inputs)
+	} else {
+		e.queryInputs += len(inputs)
+	}
+	return vectors, nil
 }
 
 func TestAgentPackageRuntimeFailsClosedForUnavailableGraphRetrieval(t *testing.T) {

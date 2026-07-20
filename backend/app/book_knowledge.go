@@ -116,8 +116,15 @@ type BookKnowledgeSearchResult struct {
 }
 
 type BookKnowledgeStore struct {
-	root string
-	mu   sync.RWMutex
+	root                  string
+	mu                    sync.RWMutex
+	agentSemanticEmbedder AgentSemanticEmbedder
+}
+
+func (s *BookKnowledgeStore) SetAgentSemanticEmbedder(embedder AgentSemanticEmbedder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.agentSemanticEmbedder = embedder
 }
 
 func DefaultBookKnowledgeRoot() string {

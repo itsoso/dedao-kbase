@@ -16,7 +16,7 @@
         "properties": {
           "case_id": { "type": "string", "minLength": 1 },
           "metric": {
-            "enum": ["retrieval", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "latency", "cost"]
+            "enum": ["retrieval", "retrieval_precision", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "task_completion", "latency", "cost"]
           },
           "input": { "type": "string", "minLength": 1 },
           "expected_ids": {
@@ -24,6 +24,12 @@
             "items": { "type": "string", "minLength": 1 }
           },
           "expected_value": { "type": "string" },
+          "model_output": { "type": "string" },
+          "proposed_tool": { "type": "string" },
+          "proposed_arguments": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          },
           "expected_arguments": {
             "type": "object",
             "additionalProperties": { "type": "string" }

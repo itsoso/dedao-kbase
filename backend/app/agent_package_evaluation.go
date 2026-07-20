@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,9 @@ type AgentEvaluationCase struct {
 	ExpectedIDs       []string          `json:"expected_ids,omitempty"`
 	ObservedIDs       []string          `json:"-"`
 	ExpectedValue     string            `json:"expected_value,omitempty"`
+	ModelOutput       string            `json:"model_output,omitempty"`
+	ProposedTool      string            `json:"proposed_tool,omitempty"`
+	ProposedArguments map[string]string `json:"proposed_arguments,omitempty"`
 	ObservedValue     string            `json:"-"`
 	ExpectedArguments map[string]string `json:"expected_arguments,omitempty"`
 	ObservedArguments map[string]string `json:"-"`
@@ -133,9 +137,21 @@ func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, eva
 			}
 		}
 		return agentEvaluationContainsExpected(observed, evalCase.ExpectedIDs), nil
-	case "citations":
+	case "retrieval_precision":
 		observed := make([]string, 0, len(citations))
 		for _, citation := range citations {
+			if strings.TrimSpace(citation.ChunkID) != "" {
+				observed = append(observed, citation.ChunkID)
+			}
+		}
+		return agentEvaluationExactIDs(observed, evalCase.ExpectedIDs), nil
+	case "citations":
+		response, _, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
+		if chatErr != nil {
+			return false, chatErr
+		}
+		observed := make([]string, 0, len(response.Citations))
+		for _, citation := range response.Citations {
 			observed = append(observed, citation.CitationID)
 		}
 		return agentEvaluationContainsExpected(observed, evalCase.ExpectedIDs), nil
@@ -149,56 +165,119 @@ func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, eva
 		if !agentEvaluationContainsExpected(observed, evalCase.ExpectedIDs) {
 			return false, nil
 		}
-		var answer strings.Builder
 		for _, claimID := range uniqueTrimmedStrings(evalCase.ExpectedIDs) {
 			evidence := byClaim[claimID]
-			if strings.TrimSpace(evidence.Statement) == "" || len(evidence.CitationIDs) == 0 {
+			if strings.TrimSpace(evidence.Statement) == "" || len(evidence.CitationIDs) == 0 ||
+				!strings.Contains(evidence.Statement, strings.TrimSpace(evalCase.ExpectedValue)) {
 				return false, nil
 			}
-			fmt.Fprintf(&answer, "%s [citation:%s]\n", evidence.Statement, evidence.CitationIDs[0])
 		}
-		if expected := strings.TrimSpace(evalCase.ExpectedValue); expected == "" || !strings.Contains(answer.String(), expected) {
+		response, _, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
+		if chatErr != nil {
+			return false, chatErr
+		}
+		if expected := strings.TrimSpace(evalCase.ExpectedValue); expected == "" ||
+			response.Outcome != AgentTraceOutcomeCompleted || !strings.Contains(response.Answer, expected) {
 			return false, nil
 		}
-		usedCitations, citationErr := selectAgentRuntimeCitations(answer.String(), citations)
-		return citationErr == nil && len(usedCitations) > 0, nil
+		return len(response.Citations) > 0, nil
 	case "abstention":
-		return len(search.Results) == 0 &&
-			preferredAgentAbstention(pkg.SafetyPolicy.AbstentionReasons) == strings.TrimSpace(evalCase.ExpectedValue), nil
+		response, _, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
+		return chatErr == nil && len(search.Results) == 0 && response.Outcome == AgentTraceOutcomeAbstained &&
+			response.AbstentionReason == strings.TrimSpace(evalCase.ExpectedValue), chatErr
 	case "tool_choice":
-		actualTool := agentEvaluationToolChoice(pkg, input)
-		return actualTool != "" && actualTool == strings.TrimSpace(evalCase.ExpectedValue), nil
+		actualTool := strings.TrimSpace(evalCase.ProposedTool)
+		server, tool, ok := strings.Cut(actualTool, "/")
+		if !ok || actualTool != strings.TrimSpace(evalCase.ExpectedValue) {
+			return false, nil
+		}
+		arguments := make(map[string]any, len(evalCase.ProposedArguments))
+		for key, value := range evalCase.ProposedArguments {
+			arguments[key] = value
+		}
+		decision := EvaluateAgentToolCall(pkg, server, tool, arguments)
+		return decision.Decision == AgentToolAllow, nil
 	case "tool_arguments":
-		actual := agentEvaluationToolArguments(pkg, input)
+		actual := evalCase.ProposedArguments
 		if !reflect.DeepEqual(actual, evalCase.ExpectedArguments) {
 			return false, nil
 		}
-		decision := EvaluateAgentToolCall(pkg, "book-mcp", "agent.search", map[string]any{
-			"package_id": actual["package_id"], "package_version": actual["package_version"],
-			"release_id": actual["release_id"], "query": input,
-		})
+		server, tool, ok := strings.Cut(strings.TrimSpace(evalCase.ProposedTool), "/")
+		if !ok || actual["package_id"] != pkg.PackageID || actual["package_version"] != pkg.Version ||
+			actual["query"] != input || !agentPackagePinsRelease(pkg, actual["release_id"]) {
+			return false, nil
+		}
+		arguments := make(map[string]any, len(actual))
+		for key, value := range actual {
+			arguments[key] = value
+		}
+		decision := EvaluateAgentToolCall(pkg, server, tool, arguments)
 		return decision.Decision == AgentToolAllow, nil
+	case "task_completion":
+		response, _, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
+		return chatErr == nil && response.Outcome == AgentTraceOutcomeCompleted &&
+			strings.Contains(response.Answer, strings.TrimSpace(evalCase.ExpectedValue)), chatErr
 	case "latency":
 		if evalCase.MaxLatencyMS <= 0 {
 			return false, fmt.Errorf("max_latency_ms must be positive")
 		}
-		return time.Since(startedAt) <= time.Duration(evalCase.MaxLatencyMS)*time.Millisecond, nil
+		_, _, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
+		return chatErr == nil && time.Since(startedAt) <= time.Duration(evalCase.MaxLatencyMS)*time.Millisecond, chatErr
 	case "cost":
 		if evalCase.MaxCostUSD <= 0 {
 			return false, fmt.Errorf("max_cost_usd must be positive")
 		}
-		if len(pkg.PromptProfiles) == 0 {
-			return false, fmt.Errorf("prompt profile is required")
+		_, client, chatErr := executeAgentEvaluationChat(store, pkg, input, evalCase.ModelOutput)
+		if chatErr != nil {
+			return false, chatErr
 		}
-		messages := buildAgentPackageMessages(pkg, pkg.PromptProfiles[0], input, search.Results)
-		cfg := BookTokenPlanConfig{Model: firstAgentPackageModel(pkg.ModelPolicy)}
-		if err := applyAgentRuntimeCostBudget(&cfg, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
-			return false, nil
-		}
-		return agentRuntimeEstimatedMaxCostUSD(messages, cfg.MaxTokens) <= evalCase.MaxCostUSD, nil
+		return agentEvaluationObservedCostUSD(client.messages, client.output) <= evalCase.MaxCostUSD, nil
 	default:
 		return false, fmt.Errorf("unsupported behavioral metric %q", evalCase.Metric)
 	}
+}
+
+type agentEvaluationModelClient struct {
+	output   string
+	messages []BookKnowledgeMessage
+}
+
+func (c *agentEvaluationModelClient) Chat(_ context.Context, _ BookTokenPlanConfig, messages []BookKnowledgeMessage) (string, error) {
+	c.messages = append([]BookKnowledgeMessage(nil), messages...)
+	return c.output, nil
+}
+
+func executeAgentEvaluationChat(store *BookKnowledgeStore, pkg AgentPackage, input, modelOutput string) (*AgentPackageChatResponse, *agentEvaluationModelClient, error) {
+	if strings.TrimSpace(modelOutput) == "" {
+		modelOutput = "evaluation model returned no grounded answer"
+	}
+	client := &agentEvaluationModelClient{output: modelOutput}
+	cfg := BookTokenPlanConfig{Model: firstAgentPackageModel(pkg.ModelPolicy)}
+	response, err := chatFinalizedAgentPackageWithClient(context.Background(), store, pkg, input, client, &cfg, time.Now().UTC(), false)
+	return response, client, err
+}
+
+func agentEvaluationExactIDs(observed, expected []string) bool {
+	left := sortedUniqueStrings(observed)
+	right := sortedUniqueStrings(expected)
+	return len(right) > 0 && reflect.DeepEqual(left, right)
+}
+
+func agentPackagePinsRelease(pkg AgentPackage, releaseID string) bool {
+	for _, ref := range pkg.Releases {
+		if ref.ReleaseID == releaseID {
+			return true
+		}
+	}
+	return false
+}
+
+func agentEvaluationObservedCostUSD(messages []BookKnowledgeMessage, output string) float64 {
+	characters := len([]rune(output))
+	for _, message := range messages {
+		characters += len([]rune(message.Content))
+	}
+	return float64(characters) * agentRuntimeUSDPerTokenCeiling
 }
 
 func agentEvaluationContainsExpected(observed, expected []string) bool {
@@ -213,29 +292,6 @@ func agentEvaluationContainsExpected(observed, expected []string) bool {
 		}
 	}
 	return true
-}
-
-func agentEvaluationToolChoice(pkg AgentPackage, input string) string {
-	if strings.TrimSpace(input) == "" {
-		return ""
-	}
-	for _, rule := range pkg.ToolPolicy.Tools {
-		if rule.MCPServer == "book-mcp" && rule.ToolName == "agent.search" && rule.Decision == AgentToolAllow {
-			return "book-mcp/agent.search"
-		}
-	}
-	return ""
-}
-
-func agentEvaluationToolArguments(pkg AgentPackage, input string) map[string]string {
-	releaseID := ""
-	if len(pkg.Releases) > 0 {
-		releaseID = pkg.Releases[0].ReleaseID
-	}
-	return map[string]string{
-		"package_id": pkg.PackageID, "package_version": pkg.Version, "release_id": releaseID,
-		"query_fingerprint": sha256Fingerprint([]byte(strings.TrimSpace(input))),
-	}
 }
 
 func isLowerHex(value string) bool {

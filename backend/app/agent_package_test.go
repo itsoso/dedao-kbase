@@ -26,7 +26,6 @@ func TestAgentPackageValidatesPinnedReleasePoliciesAndCapabilities(t *testing.T)
 
 	reordered := pkg
 	reordered.RetrievalPolicy.AllowedSourceTypes = []string{"wechat_mp_article", "dedao_ebook"}
-	reordered.ModelPolicy.Fallbacks = []string{"qwen-max", "qwen-plus"}
 	reordered.SafetyPolicy.AbstentionReasons = []string{"outside_scope", "insufficient_evidence"}
 	reordered.UIManifest.Capabilities = []string{"evidence", "reader", "grounded_chat", "search"}
 	reordered.ToolPolicy.Tools = []AgentPackageToolRule{
@@ -39,6 +38,62 @@ func TestAgentPackageValidatesPinnedReleasePoliciesAndCapabilities(t *testing.T)
 	}
 	if reorderedFinalized.ContentHash != finalized.ContentHash {
 		t.Fatalf("hash changed after reordering set-like policies: %q != %q", reorderedFinalized.ContentHash, finalized.ContentHash)
+	}
+}
+
+func TestAgentPackageHashPreservesRuntimeSignificantOrder(t *testing.T) {
+	pkg := validAgentPackage()
+	pkg.ModelPolicy.Fallbacks = []string{"qwen-plus", "qwen-max"}
+	pkg.PromptProfiles = []AgentPackagePromptProfile{
+		{ProfileID: "primary", OutputSchema: "answer.v1"},
+		{ProfileID: "fallback", OutputSchema: "answer.v1"},
+	}
+	ordered, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reorderedInput := pkg
+	reorderedInput.ModelPolicy.Fallbacks = []string{"qwen-max", "qwen-plus"}
+	reorderedInput.PromptProfiles = []AgentPackagePromptProfile{pkg.PromptProfiles[1], pkg.PromptProfiles[0]}
+	reordered, err := FinalizeAgentPackage(reorderedInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reordered.ContentHash == ordered.ContentHash {
+		t.Fatalf("runtime-significant order produced identical hash %q", ordered.ContentHash)
+	}
+}
+
+func TestAgentPackageRejectsCrossReleaseCitationIDCollisions(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	first := agentPackageTestRelease()
+	if err := store.saveKnowledgeRelease(first); err != nil {
+		t.Fatal(err)
+	}
+	second := agentPackageTestRelease()
+	second.ReleaseID = "release-2"
+	second.BookID = "book-2"
+	second.ContentHash = "sha256:release-content-2"
+	second.Book = BookKnowledgeBook{BookID: "book-2", Title: "Second Book", SourceType: "dedao_ebook"}
+	second.Citations[0].BookID = "book-2"
+	second.Citations[0].ChunkID = "chunk-2"
+	if err := store.saveKnowledgeRelease(second); err != nil {
+		t.Fatal(err)
+	}
+	pkg := validAgentPackage()
+	pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
+		ReleaseID:   second.ReleaseID,
+		ContentHash: second.ContentHash,
+		CitationIDs: []string{"citation-1"},
+	})
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs()); err == nil ||
+		!strings.Contains(err.Error(), "citation") || !strings.Contains(err.Error(), "multiple releases") {
+		t.Fatalf("cross-release citation collision error = %v", err)
 	}
 }
 
@@ -221,14 +276,16 @@ func validAgentPackage() AgentPackage {
 		EvaluationPolicy: AgentPackageEvaluationPolicy{
 			SuiteVersion: "book-agent-v1",
 			MinimumScores: map[string]float64{
-				"retrieval":      0.8,
-				"citations":      1,
-				"faithfulness":   0.9,
-				"abstention":     1,
-				"tool_choice":    1,
-				"tool_arguments": 1,
-				"latency":        1,
-				"cost":           1,
+				"retrieval":           0.8,
+				"retrieval_precision": 0.8,
+				"citations":           1,
+				"faithfulness":        0.9,
+				"abstention":          1,
+				"tool_choice":         1,
+				"tool_arguments":      1,
+				"task_completion":     1,
+				"latency":             1,
+				"cost":                1,
 			},
 		},
 		UIManifest: AgentPackageUIManifest{Capabilities: []string{"reader", "search", "grounded_chat", "evidence"}},
@@ -237,6 +294,7 @@ func validAgentPackage() AgentPackage {
 
 func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 	t.Helper()
+	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	if err := store.saveKnowledgeRelease(agentPackageTestRelease()); err != nil {
 		t.Fatal(err)
 	}

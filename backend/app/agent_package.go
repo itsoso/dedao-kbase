@@ -278,8 +278,8 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 		return fmt.Errorf("evaluation_policy.minimum_scores is required")
 	}
 	for _, metric := range []string{
-		"retrieval", "citations", "faithfulness", "abstention",
-		"tool_choice", "tool_arguments", "latency", "cost",
+		"retrieval", "retrieval_precision", "citations", "faithfulness", "abstention",
+		"tool_choice", "tool_arguments", "task_completion", "latency", "cost",
 	} {
 		if _, ok := policy.MinimumScores[metric]; !ok {
 			return fmt.Errorf("required evaluation metric %q is missing", metric)
@@ -329,6 +329,7 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 	}
 	allowedSources := stringSet(pkg.RetrievalPolicy.AllowedSourceTypes)
 	seen := make(map[string]struct{}, len(pkg.Releases))
+	citationReleases := make(map[string]string)
 	for index, ref := range pkg.Releases {
 		if strings.TrimSpace(ref.ReleaseID) == "" {
 			return fmt.Errorf("releases[%d].release_id is required", index)
@@ -378,6 +379,10 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 			if _, ok := availableCitations[citationID]; !ok {
 				return fmt.Errorf("release %q citation %q cannot be resolved", ref.ReleaseID, citationID)
 			}
+			if previousReleaseID, ok := citationReleases[citationID]; ok && previousReleaseID != ref.ReleaseID {
+				return fmt.Errorf("citation %q is ambiguous across multiple releases %q and %q", citationID, previousReleaseID, ref.ReleaseID)
+			}
+			citationReleases[citationID] = ref.ReleaseID
 		}
 	}
 	return nil
@@ -407,10 +412,7 @@ func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {
 		return normalized.Releases[i].ReleaseID < normalized.Releases[j].ReleaseID
 	})
 	normalized.RetrievalPolicy.AllowedSourceTypes = sortedUniqueStrings(normalized.RetrievalPolicy.AllowedSourceTypes)
-	normalized.ModelPolicy.Fallbacks = sortedUniqueStrings(normalized.ModelPolicy.Fallbacks)
-	sort.Slice(normalized.PromptProfiles, func(i, j int) bool {
-		return normalized.PromptProfiles[i].ProfileID < normalized.PromptProfiles[j].ProfileID
-	})
+	normalized.ModelPolicy.Fallbacks = uniqueTrimmedStrings(normalized.ModelPolicy.Fallbacks)
 	sort.Slice(normalized.ToolPolicy.Tools, func(i, j int) bool {
 		left := normalized.ToolPolicy.Tools[i].MCPServer + "/" + normalized.ToolPolicy.Tools[i].ToolName
 		right := normalized.ToolPolicy.Tools[j].MCPServer + "/" + normalized.ToolPolicy.Tools[j].ToolName

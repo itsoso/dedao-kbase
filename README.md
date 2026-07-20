@@ -90,6 +90,9 @@ cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
 KBASE_AGENT_PUBLISHER_TOKEN="replace-with-separate-publisher-secret" \
 KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
+KBASE_EMBEDDING_BASE_URL="https://embedding-provider.example.invalid/v1" \
+KBASE_EMBEDDING_MODEL="replace-with-approved-embedding-model" \
+KBASE_EMBEDDING_API_KEY="replace-with-embedding-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
 KBASE_REVERIFICATION_TICK_SECONDS="30" \
@@ -112,6 +115,7 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `POST /api/knowledge/releases/{release_id}/receipts`：下游导入后的幂等 delivery receipt。
 - `GET /api/knowledge/lineage/{object_id}`：查询 release 或 book 的来源、hash、artifact refs 和 citation IDs。
 - `GET /api/knowledge/impact`、`GET /api/knowledge/gaps`：查看导入回执、pipeline 阶段和隐私安全 gap 聚合。
+- `POST /api/agent-packages/evaluate`：使用独立 publisher token 执行并保存不可变的黄金集评估；`vector`/`hybrid` 包要求显式配置获授权的语义嵌入服务。
 - `POST /api/agent-packages/publish`：仅接受独立的 `KBASE_AGENT_PUBLISHER_TOKEN`；普通 API/consumer token 不能发布 Agent Package。
 
 机器可读契约和 consumer 接入说明见 `contracts/*.schema.json` 与 `docs/contracts/knowledge-supply-v1.md`。

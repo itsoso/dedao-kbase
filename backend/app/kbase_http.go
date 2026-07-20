@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -193,7 +194,7 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSourceAgent(w, r)
 		return
 	}
-	if r.URL.Path == "/api/agent-packages/publish" {
+	if r.URL.Path == "/api/agent-packages/publish" || r.URL.Path == "/api/agent-packages/evaluate" {
 		if h.agentPublisherToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "agent package publisher API is not configured")
 			return
@@ -1089,12 +1090,61 @@ type AgentPackagePublishRequest struct {
 	Package        AgentPackage `json:"package"`
 }
 
+type AgentPackageEvaluationRequest struct {
+	Package AgentPackage         `json:"package"`
+	Suite   AgentEvaluationSuite `json:"suite"`
+}
+
 func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
 	const (
 		collectionPath = "/api/agent-packages"
+		evaluatePath   = "/api/agent-packages/evaluate"
 		publishPath    = "/api/agent-packages/publish"
 		detailPrefix   = "/api/agent-packages/"
 	)
+	if r.URL.Path == evaluatePath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input AgentPackageEvaluationRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := ValidateAgentPackage(input.Package, h.store, h.agentTools); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if existing, err := h.store.LoadAgentPackageEvaluation(input.Package.ContentHash); err == nil {
+			storedSuite, suiteErr := h.store.LoadAgentPackageEvaluationSuite(input.Package.ContentHash)
+			if suiteErr != nil {
+				writeHTTPError(w, http.StatusInternalServerError, suiteErr.Error())
+				return
+			}
+			if !reflect.DeepEqual(*storedSuite, input.Suite) {
+				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
+				return
+			}
+			writeHTTPJSON(w, http.StatusOK, map[string]any{"created": false, "evaluation": existing})
+			return
+		} else if !os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		report, err := EvaluateAgentPackageDeterministically(h.store, input.Package, input.Suite, time.Now())
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.store.SaveAgentPackageEvaluation(input.Package, input.Suite, report); err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{"created": true, "evaluation": report})
+		return
+	}
 	if r.URL.Path == publishPath {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")

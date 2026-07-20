@@ -91,7 +91,7 @@ func searchAgentPackageEvidence(
 			return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
 		}
 		releaseResults, searchErr := searchAgentReleaseClaimsWithStrategy(
-			*release, query, pkg.RetrievalPolicy.MaxContextChunks, pkg.RetrievalPolicy.Strategy,
+			store, *release, query, pkg.RetrievalPolicy.MaxContextChunks, pkg.RetrievalPolicy.Strategy,
 		)
 		if searchErr != nil {
 			return nil, searchErr
@@ -133,14 +133,24 @@ func ChatAgentPackageWithClient(
 	if err != nil {
 		return nil, err
 	}
-	question := strings.TrimSpace(request.Question)
+	return chatFinalizedAgentPackageWithClient(ctx, store, *pkg, request.Question, client, nil, startedAt, true)
+}
+
+func chatFinalizedAgentPackageWithClient(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	rawQuestion string,
+	client BookKnowledgeLLMClient,
+	configOverride *BookTokenPlanConfig,
+	startedAt time.Time,
+	persistTrace bool,
+) (*AgentPackageChatResponse, error) {
+	question := strings.TrimSpace(rawQuestion)
 	if question == "" {
 		return nil, fmt.Errorf("question is required")
 	}
-	search, err := SearchAgentPackage(store, AgentPackageSearchRequest{
-		PackageID: pkg.PackageID, PackageVersion: pkg.Version,
-		Query: question, Limit: pkg.RetrievalPolicy.MaxContextChunks,
-	})
+	search, err := searchAgentPackageEvidence(store, pkg, question, pkg.RetrievalPolicy.MaxContextChunks)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +165,7 @@ func ChatAgentPackageWithClient(
 	normalizedModel := normalizeBookTokenPlanModel(model)
 	if len(search.Results) == 0 {
 		response.AbstentionReason = preferredAgentAbstention(pkg.SafetyPolicy.AbstentionReasons)
-		traceID, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, normalizedModel,
+		traceID, traceErr := maybeSaveAgentRuntimeTrace(persistTrace, store, pkg, search.Results, normalizedModel,
 			AgentTraceOutcomeAbstained, response.AbstentionReason, nil, startedAt, time.Now().UTC())
 		if traceErr != nil {
 			return nil, traceErr
@@ -171,7 +181,7 @@ func ChatAgentPackageWithClient(
 	}
 	if pkg.RetrievalPolicy.RequireCitations && len(citations) == 0 {
 		response.AbstentionReason = "citation_required"
-		traceID, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, normalizedModel,
+		traceID, traceErr := maybeSaveAgentRuntimeTrace(persistTrace, store, pkg, search.Results, normalizedModel,
 			AgentTraceOutcomeAbstained, response.AbstentionReason, nil, startedAt, time.Now().UTC())
 		if traceErr != nil {
 			return nil, traceErr
@@ -184,13 +194,18 @@ func ChatAgentPackageWithClient(
 	if client == nil {
 		client = NewTokenPlanChatClient(nil)
 	}
-	cfg, err := LoadBookTokenPlanConfig()
-	if err != nil {
-		return nil, err
+	var cfg BookTokenPlanConfig
+	if configOverride != nil {
+		cfg = *configOverride
+	} else {
+		cfg, err = LoadBookTokenPlanConfig()
+		if err != nil {
+			return nil, err
+		}
 	}
 	cfg.Model = normalizedModel
 	promptProfile := pkg.PromptProfiles[0]
-	messages := buildAgentPackageMessages(*pkg, promptProfile, question, search.Results)
+	messages := buildAgentPackageMessages(pkg, promptProfile, question, search.Results)
 	if err := applyAgentRuntimeCostBudget(&cfg, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
 		return nil, err
 	}
@@ -202,7 +217,7 @@ func ChatAgentPackageWithClient(
 	}
 	answer, err := client.Chat(callCtx, cfg, messages)
 	if err != nil {
-		if _, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
+		if _, traceErr := maybeSaveAgentRuntimeTrace(persistTrace, store, pkg, search.Results, cfg.Model,
 			AgentTraceOutcomeFailed, err.Error(), nil, startedAt, time.Now().UTC()); traceErr != nil {
 			return nil, fmt.Errorf("model call failed: %v; persist failed trace: %w", err, traceErr)
 		}
@@ -214,7 +229,7 @@ func ChatAgentPackageWithClient(
 	usedCitations, citationErr := selectAgentRuntimeCitations(answer, citations)
 	if citationErr != nil {
 		response.AbstentionReason = "citation_required"
-		traceID, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
+		traceID, traceErr := maybeSaveAgentRuntimeTrace(persistTrace, store, pkg, search.Results, cfg.Model,
 			AgentTraceOutcomeAbstained, answer, nil, startedAt, time.Now().UTC())
 		if traceErr != nil {
 			return nil, traceErr
@@ -225,13 +240,28 @@ func ChatAgentPackageWithClient(
 	response.Outcome = AgentTraceOutcomeCompleted
 	response.Answer = answer
 	response.Citations = usedCitations
-	traceID, err := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
+	traceID, err := maybeSaveAgentRuntimeTrace(persistTrace, store, pkg, search.Results, cfg.Model,
 		AgentTraceOutcomeCompleted, answer, usedCitations, startedAt, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
 	response.TraceID = traceID
 	return response, nil
+}
+
+func maybeSaveAgentRuntimeTrace(
+	persist bool,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	evidence []AgentPackageEvidence,
+	model, outcome, responseText string,
+	citations []AgentScopedCitation,
+	startedAt, completedAt time.Time,
+) (string, error) {
+	if !persist {
+		return "", nil
+	}
+	return saveAgentRuntimeTrace(store, pkg, evidence, model, outcome, responseText, citations, startedAt, completedAt)
 }
 
 func saveAgentRuntimeTrace(

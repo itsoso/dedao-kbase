@@ -1,9 +1,9 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 )
@@ -153,7 +153,7 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 			return nil, err
 		}
 		results, searchErr := searchAgentReleaseClaimsWithStrategy(
-			*release, stringArgument(input, "query"), limit, pkg.RetrievalPolicy.Strategy,
+			s.store, *release, stringArgument(input, "query"), limit, pkg.RetrievalPolicy.Strategy,
 		)
 		if searchErr != nil {
 			return nil, searchErr
@@ -189,11 +189,12 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 }
 
 func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int) []AgentScopedSearchResult {
-	results, _ := searchAgentReleaseClaimsWithStrategy(release, query, limit, "lexical")
+	results, _ := searchAgentReleaseClaimsWithStrategy(nil, release, query, limit, "lexical")
 	return results
 }
 
 func searchAgentReleaseClaimsWithStrategy(
+	store *BookKnowledgeStore,
 	release KnowledgeRelease,
 	query string,
 	limit int,
@@ -210,6 +211,33 @@ func searchAgentReleaseClaimsWithStrategy(
 		return nil, fmt.Errorf("unsupported Agent Package retrieval strategy %q", strategy)
 	}
 	terms := splitSearchTerms(query)
+	semanticScores := make(map[string]float64)
+	if strategy == "vector" || strategy == "hybrid" {
+		if store == nil {
+			return nil, fmt.Errorf("semantic embedder store is required for %s retrieval", strategy)
+		}
+		embedder, err := store.configuredAgentSemanticEmbedder()
+		if err != nil {
+			return nil, err
+		}
+		index, err := store.loadOrBuildAgentSemanticVectorIndex(context.Background(), release, embedder)
+		if err != nil {
+			return nil, fmt.Errorf("build semantic vector index: %w", err)
+		}
+		queryVectors, err := embedder.Embed(context.Background(), []string{query})
+		if err != nil {
+			return nil, fmt.Errorf("embed semantic query: %w", err)
+		}
+		if len(queryVectors) != 1 {
+			return nil, fmt.Errorf("semantic embedder returned %d query vectors", len(queryVectors))
+		}
+		if err := validateAgentSemanticVector(queryVectors[0]); err != nil {
+			return nil, err
+		}
+		for _, record := range index.Vectors {
+			semanticScores[record.ClaimID] = agentDenseVectorScore(queryVectors[0], record.Vector)
+		}
+	}
 	results := make([]AgentScopedSearchResult, 0)
 	for _, claim := range release.Analysis.Claims {
 		haystack := strings.ToLower(strings.Join(append([]string{claim.Statement}, claim.Scope...), " "))
@@ -220,15 +248,18 @@ func searchAgentReleaseClaimsWithStrategy(
 			}
 		}
 		lexicalScore := float64(matched) / float64(len(terms))
-		vectorScore := agentSparseVectorScore(terms, splitSearchTerms(haystack))
+		vectorScore := semanticScores[claim.ID]
 		score := lexicalScore
 		if strategy == "vector" {
 			score = vectorScore
 		} else if strategy == "hybrid" {
-			score = (lexicalScore + vectorScore) / 2
+			score = lexicalScore*0.4 + vectorScore*0.6
 		}
 		if score <= 0 {
 			continue
+		}
+		if strategy == "vector" || strategy == "hybrid" {
+			score = agentSemanticRerankScore(query, haystack, score)
 		}
 		results = append(results, AgentScopedSearchResult{
 			ClaimID: claim.ID, Statement: claim.Statement,
@@ -248,30 +279,23 @@ func searchAgentReleaseClaimsWithStrategy(
 	return results, nil
 }
 
-func agentSparseVectorScore(queryTerms, documentTerms []string) float64 {
-	if len(queryTerms) == 0 || len(documentTerms) == 0 {
-		return 0
+func agentSemanticRerankScore(query, document string, baseScore float64) float64 {
+	queryTerms := splitSearchTerms(query)
+	if len(queryTerms) == 0 {
+		return baseScore
 	}
-	queryCounts := make(map[string]float64)
-	documentCounts := make(map[string]float64)
+	matched := 0
 	for _, term := range queryTerms {
-		queryCounts[term]++
+		if strings.Contains(document, term) {
+			matched++
+		}
 	}
-	for _, term := range documentTerms {
-		documentCounts[term]++
+	coverage := float64(matched) / float64(len(queryTerms))
+	phraseBonus := 0.0
+	if strings.Contains(document, strings.ToLower(strings.TrimSpace(query))) {
+		phraseBonus = 0.05
 	}
-	dot, queryNorm, documentNorm := 0.0, 0.0, 0.0
-	for term, count := range queryCounts {
-		dot += count * documentCounts[term]
-		queryNorm += count * count
-	}
-	for _, count := range documentCounts {
-		documentNorm += count * count
-	}
-	if dot == 0 || queryNorm == 0 || documentNorm == 0 {
-		return 0
-	}
-	return dot / (math.Sqrt(queryNorm) * math.Sqrt(documentNorm))
+	return baseScore*0.8 + coverage*0.15 + phraseBonus
 }
 
 func agentToolLimit(value any, packageLimit int) (int, error) {

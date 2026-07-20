@@ -130,6 +130,51 @@ func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := agentToolPolicyTestPackage()
+	payload, err := json.Marshal(map[string]any{
+		"package": pkg,
+		"suite":   loadAgentEvaluationFixture(t),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+
+	for name, token := range map[string]string{"missing": "", "consumer": "consumer-token"} {
+		response := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", token, string(payload))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("%s evaluation status=%d body=%s", name, response.Code, response.Body.String())
+		}
+	}
+	evaluated := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(payload))
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"created":true`) ||
+		!strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("evaluation status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	if _, err := store.LoadAgentPackageEvaluation(pkg.ContentHash); err != nil {
+		t.Fatalf("production evaluation sidecar was not persisted: %v", err)
+	}
+	replayed := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(payload))
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) {
+		t.Fatalf("evaluation replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	publishPayload, _ := json.Marshal(AgentPackagePublishRequest{
+		IdempotencyKey: "operator:evaluated-http:1",
+		Package:        pkg,
+	})
+	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishPayload))
+	if published.Code != http.StatusCreated {
+		t.Fatalf("publish evaluated package status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:        NewBookKnowledgeStore(t.TempDir()),
