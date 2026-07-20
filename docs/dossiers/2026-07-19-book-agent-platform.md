@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** G3 PASS after persisted Agent Package integrity remediation; fresh G4 pending
+**Status:** G3 and G4 PASS; ready for controlled main integration and deployment
 
 ## Objective
 
@@ -30,11 +30,9 @@ prescription or dosage decisions, and personal-data write tools.
 - **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed after
   citation-scope remediation on deployable heads `c50c3af`, `c3324fec`, and
   `b7b1a610d` respectively.
-- **G4 Review: PENDING after prior NO-GO.** The prior consumer-safety High was
-  remediated, but a later cross-consumer review found and returned a Medium
-  citation-scope gap upstream. That gap is now remediated and G3 repeated.
-  Fresh independent architecture and consumer-safety GO decisions are still
-  mandatory. No push or deployment is allowed before both pass.
+- **G4 Review: PASS.** Fresh independent architecture and cross-consumer
+  reviews returned GO on exact clean heads `eabd98e`, `c3324fec`, and
+  `b7b1a610d`. No Critical, High, or Medium blockers remain.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
 - **G6 Online verification: PENDING.** Requires exact-revision verification in
   KBase and both consumer environments.
@@ -1443,6 +1441,47 @@ TDD and verification evidence:
 
 Fresh independent architecture and cross-consumer G4 review is required on
 these exact clean heads before any push or deployment.
+
+## Task 10 checkpoint: final G4 after consumer citation remediation
+
+**Decision: G4 PASS on exact clean heads KBase `eabd98e`, Proofroom
+`c3324fec`, and Health `b7b1a610d`.** Both independent reviewers returned GO
+with no Critical, High, or Medium blockers. Push, clean-main integration, and
+deployment may now proceed under the remaining privacy, G5, and G6 Gates.
+
+Architecture review evidence:
+
+- Proofroom intersects package/release citations, projects only reachable
+  chunks and claims with allowed citations, and retrieval serves only projected
+  claim rows;
+- Health scopes a deep-copied release before compilation, removes unlisted
+  citations, sources, claims, and release-summary content, and retains
+  draft/review-required/not-serving metadata;
+- persisted package integrity, post-lock validation, read-only MCP,
+  deterministic evaluation, citation-bounded runtime, traces, lifecycle, and
+  consumer-owned review remain intact;
+- KBase focused backend/server tests, system-map drift, privacy smoke,
+  `git diff --check`, canonical-main ancestry, and all three clean-worktree
+  checks — PASS.
+
+Cross-consumer review evidence:
+
+- the A+B fixtures prove only citation A, its reachable chunk, its claim, and
+  its scoped summary survive when the package authorizes only A;
+- KBase focused package/runtime checks — PASS in `3.768s`; privacy and
+  system-map checks — PASS;
+- Proofroom focused consumer suite — PASS, `18 passed in 2.88s`; compile,
+  commit diff, and clean status — PASS;
+- Health focused Agent Package suite — PASS,
+  `23 passed, 37 deselected, 6 warnings in 30.68s`; document drift, compile,
+  feature-range diff, and clean status — PASS;
+- record/detail reconciliation, explicit Proofroom adjudication, Health's six
+  mismatch holds, evidence-only human approval, authorized-source boundaries,
+  and fixture privacy remain intact.
+
+One Low non-blocking defense-in-depth note remains: canonicalize package-list
+detail URLs at delivery and construct same-origin detail URLs in consumers
+rather than relying on stored list metadata. It does not alter the G4 GO.
 
 ## Decisions
 
