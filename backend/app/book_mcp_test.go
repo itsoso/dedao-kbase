@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,8 @@ func TestBookKnowledgeMCPRejectsMissingScopeUnknownArgumentsAndWrites(t *testing
 		{name: "missing release scope", tool: "agent.search", args: `{"package_id":"agent-package-example","package_version":"1.0.0","query":"q"}`, want: "release_id"},
 		{name: "missing package version", tool: "agent.search", args: `{"package_id":"agent-package-example","release_id":"release-1","query":"q"}`, want: "package_version"},
 		{name: "unknown argument", tool: "agent.search", args: `{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1","query":"q","write":true}`, want: "unsupported argument"},
+		{name: "non-string package", tool: "agent.search", args: `{"package_id":7,"package_version":"1.0.0","release_id":"release-1","query":"q"}`, want: "package_id"},
+		{name: "non-string query", tool: "agent.search", args: `{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1","query":7}`, want: "query"},
 		{name: "write tool", tool: "agent.publish", args: `{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1"}`, want: "read-only"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,15 +152,33 @@ func TestBookKnowledgeMCPPinsPackageVersionAndContextLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := NewBookKnowledgeMCPServer(store)
-	metadata, err := server.Call("agent.package_metadata", json.RawMessage(`{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1"}`))
-	if err != nil {
+	if _, err := server.Call("agent.package_metadata", json.RawMessage(`{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1"}`)); err == nil || !strings.Contains(err.Error(), "not published") {
+		t.Fatalf("superseded package metadata error = %v", err)
+	}
+	metadata, err := server.Call("agent.package_metadata", json.RawMessage(`{"package_id":"agent-package-example","package_version":"2.0.0","release_id":"release-1"}`))
+	if err != nil || !strings.Contains(string(metadata), `"package_version":"2.0.0"`) {
+		t.Fatalf("current version metadata = %s err=%v", metadata, err)
+	}
+	if _, err := server.Call("agent.search", json.RawMessage(`{"package_id":"agent-package-example","package_version":"2.0.0","release_id":"release-1","query":"grounded","limit":2}`)); err == nil || !strings.Contains(err.Error(), "max_context_chunks") {
+		t.Fatalf("context limit error = %v", err)
+	}
+}
+
+func TestBookKnowledgeMCPRevalidatesEvaluationBeforeEveryCall(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := agentToolPolicyTestPackage()
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	if _, _, err := PublishAgentPackage(store, pkg, "mcp-evaluation", AgentReadOnlyToolIDs(), testAgentPackageTime()); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(metadata), `"package_version":"1.0.0"`) || strings.Contains(string(metadata), "different-capability") {
-		t.Fatalf("version-pinned metadata = %s", metadata)
+	if err := os.WriteFile(store.AgentPackageEvaluationPath(pkg.ContentHash), []byte(`{"passed":true}`), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := server.Call("agent.search", json.RawMessage(`{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1","query":"grounded","limit":2}`)); err == nil || !strings.Contains(err.Error(), "max_context_chunks") {
-		t.Fatalf("context limit error = %v", err)
+	server := NewBookKnowledgeMCPServer(store)
+	_, err := server.Call("agent.package_metadata", json.RawMessage(`{"package_id":"agent-package-example","package_version":"1.0.0","release_id":"release-1"}`))
+	if err == nil || !strings.Contains(err.Error(), "evaluation") {
+		t.Fatalf("tampered MCP evaluation error = %v", err)
 	}
 }
 

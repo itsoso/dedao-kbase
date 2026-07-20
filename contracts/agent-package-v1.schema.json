@@ -120,7 +120,8 @@
         "minimum_scores": {
           "type": "object",
           "minProperties": 1,
-          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+          "required": ["retrieval", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "latency", "cost"],
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 }
         }
       }
     },

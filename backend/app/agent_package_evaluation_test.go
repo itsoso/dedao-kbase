@@ -28,7 +28,7 @@ func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *test
 		report.EvaluatedAt != now.Format(time.RFC3339Nano) {
 		t.Fatalf("report identity = %#v", report)
 	}
-	for _, metric := range []string{"retrieval", "citations", "abstention", "tool_choice", "tool_arguments"} {
+	for _, metric := range []string{"retrieval", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "latency", "cost"} {
 		if report.Metrics[metric] != 1 {
 			t.Fatalf("metric %q = %v, report=%#v", metric, report.Metrics[metric], report)
 		}
@@ -39,6 +39,47 @@ func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *test
 	}
 	if replayed.InputHash != report.InputHash {
 		t.Fatalf("deterministic input hash changed: %q != %q", replayed.InputHash, report.InputHash)
+	}
+}
+
+func TestAgentPackageEvaluationExecutesGoldenRetrievalQuery(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Analysis.Claims[0].Statement = "Synthetic unrelated statement"
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := EvaluateAgentPackageDeterministically(
+		store, pkg, loadAgentEvaluationFixture(t), time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Metrics["retrieval"] != 0 || report.Metrics["citations"] != 0 || report.Metrics["faithfulness"] != 0 {
+		t.Fatalf("non-matching golden query passed behavioral metrics: %#v", report)
+	}
+}
+
+func TestAgentPackageEvaluationJudgesDeterministicGroundedAnswer(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Analysis.Claims[0].Statement = "Grounded but incorrect statement"
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg, _ := FinalizeAgentPackage(validAgentPackage())
+	report, err := EvaluateAgentPackageDeterministically(
+		store, pkg, loadAgentEvaluationFixture(t), time.Date(2026, 7, 19, 14, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Metrics["retrieval"] != 1 || report.Metrics["citations"] != 1 || report.Metrics["faithfulness"] != 0 {
+		t.Fatalf("incorrect grounded answer passed faithfulness: %#v", report)
 	}
 }
 

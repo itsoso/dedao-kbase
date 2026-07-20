@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+const (
+	agentRuntimeDefaultMaxOutputTokens = 2200
+	agentRuntimeUSDPerTokenCeiling     = 0.0001
+)
+
 type AgentPackageSearchRequest struct {
 	PackageID      string `json:"package_id"`
 	PackageVersion string `json:"package_version"`
@@ -59,11 +64,20 @@ func SearchAgentPackage(store *BookKnowledgeStore, request AgentPackageSearchReq
 	if err != nil {
 		return nil, err
 	}
-	query := strings.TrimSpace(request.Query)
+	return searchAgentPackageEvidence(store, *pkg, request.Query, request.Limit)
+}
+
+func searchAgentPackageEvidence(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	rawQuery string,
+	requestedLimit int,
+) (*AgentPackageSearchResponse, error) {
+	query := strings.TrimSpace(rawQuery)
 	if query == "" {
 		return nil, fmt.Errorf("query is required")
 	}
-	limit := request.Limit
+	limit := requestedLimit
 	if limit <= 0 {
 		limit = pkg.RetrievalPolicy.MaxContextChunks
 	}
@@ -76,7 +90,13 @@ func SearchAgentPackage(store *BookKnowledgeStore, request AgentPackageSearchReq
 		if loadErr != nil {
 			return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
 		}
-		for _, result := range searchAgentReleaseClaims(*release, query, pkg.RetrievalPolicy.MaxContextChunks) {
+		releaseResults, searchErr := searchAgentReleaseClaimsWithStrategy(
+			*release, query, pkg.RetrievalPolicy.MaxContextChunks, pkg.RetrievalPolicy.Strategy,
+		)
+		if searchErr != nil {
+			return nil, searchErr
+		}
+		for _, result := range releaseResults {
 			results = append(results, AgentPackageEvidence{
 				ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
 				Statement: result.Statement, CitationIDs: append([]string(nil), result.CitationIDs...),
@@ -151,6 +171,14 @@ func ChatAgentPackageWithClient(
 	}
 	if pkg.RetrievalPolicy.RequireCitations && len(citations) == 0 {
 		response.AbstentionReason = "citation_required"
+		traceID, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, normalizedModel,
+			AgentTraceOutcomeAbstained, response.AbstentionReason, nil, startedAt, time.Now().UTC())
+		if traceErr != nil {
+			return nil, traceErr
+		}
+		response.TraceID = traceID
+		response.Model = normalizedModel
+		response.ModelCapability = pkg.ModelPolicy.PreferredCapability
 		return response, nil
 	}
 	if client == nil {
@@ -162,13 +190,9 @@ func ChatAgentPackageWithClient(
 	}
 	cfg.Model = normalizedModel
 	promptProfile := pkg.PromptProfiles[0]
-	messages := []BookKnowledgeMessage{
-		{
-			Role: "system",
-			Content: fmt.Sprintf("You are executing immutable Agent Package %s version %s. Use only the pinned evidence below. Capability: %s. Usage policy: %s. Output schema: %s. Cite every factual claim as [citation:<id>]. If evidence is insufficient, abstain.",
-				pkg.PackageID, pkg.Version, pkg.ModelPolicy.PreferredCapability, pkg.SafetyPolicy.UsagePolicy, promptProfile.OutputSchema),
-		},
-		{Role: "user", Content: buildAgentPackagePrompt(question, search.Results)},
+	messages := buildAgentPackageMessages(*pkg, promptProfile, question, search.Results)
+	if err := applyAgentRuntimeCostBudget(&cfg, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
+		return nil, err
 	}
 	callCtx := ctx
 	if pkg.ModelPolicy.TimeoutMS > 0 {
@@ -184,14 +208,25 @@ func ChatAgentPackageWithClient(
 		}
 		return nil, err
 	}
-	response.Outcome = AgentTraceOutcomeCompleted
-	response.Answer = answer
 	response.Model = cfg.Model
 	response.ModelCapability = pkg.ModelPolicy.PreferredCapability
 	response.PromptProfile = promptProfile.ProfileID
-	response.Citations = citations
+	usedCitations, citationErr := selectAgentRuntimeCitations(answer, citations)
+	if citationErr != nil {
+		response.AbstentionReason = "citation_required"
+		traceID, traceErr := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
+			AgentTraceOutcomeAbstained, answer, nil, startedAt, time.Now().UTC())
+		if traceErr != nil {
+			return nil, traceErr
+		}
+		response.TraceID = traceID
+		return response, nil
+	}
+	response.Outcome = AgentTraceOutcomeCompleted
+	response.Answer = answer
+	response.Citations = usedCitations
 	traceID, err := saveAgentRuntimeTrace(store, *pkg, search.Results, cfg.Model,
-		AgentTraceOutcomeCompleted, answer, citations, startedAt, time.Now().UTC())
+		AgentTraceOutcomeCompleted, answer, usedCitations, startedAt, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -299,6 +334,9 @@ func loadRunnableAgentPackage(store *BookKnowledgeStore, packageID, version, cap
 	if err != nil {
 		return nil, err
 	}
+	if pkg.LifecycleState != AgentPackagePublished {
+		return nil, fmt.Errorf("agent package %s is not published", agentPackageReference(pkg.PackageID, pkg.Version))
+	}
 	if err := ValidateAgentPackageEvaluationGate(store, *pkg); err != nil {
 		return nil, err
 	}
@@ -326,6 +364,34 @@ func firstAgentPackageModel(policy AgentPackageModelPolicy) string {
 	return ""
 }
 
+func applyAgentRuntimeCostBudget(cfg *BookTokenPlanConfig, messages []BookKnowledgeMessage, maxCostUSD float64) error {
+	if cfg == nil {
+		return fmt.Errorf("model configuration is required")
+	}
+	inputTokens := 0
+	for _, message := range messages {
+		inputTokens += len([]rune(message.Content))
+	}
+	remainingUSD := maxCostUSD - float64(inputTokens)*agentRuntimeUSDPerTokenCeiling
+	maxOutputTokens := int(remainingUSD / agentRuntimeUSDPerTokenCeiling)
+	if maxOutputTokens < 1 {
+		return fmt.Errorf("model_policy.max_cost_usd cost budget is exhausted before the model call")
+	}
+	if maxOutputTokens > agentRuntimeDefaultMaxOutputTokens {
+		maxOutputTokens = agentRuntimeDefaultMaxOutputTokens
+	}
+	cfg.MaxTokens = maxOutputTokens
+	return nil
+}
+
+func agentRuntimeEstimatedMaxCostUSD(messages []BookKnowledgeMessage, maxOutputTokens int) float64 {
+	inputTokens := 0
+	for _, message := range messages {
+		inputTokens += len([]rune(message.Content))
+	}
+	return float64(inputTokens+maxOutputTokens) * agentRuntimeUSDPerTokenCeiling
+}
+
 func preferredAgentAbstention(reasons []string) string {
 	for _, reason := range reasons {
 		if strings.TrimSpace(reason) == "insufficient_evidence" {
@@ -348,6 +414,22 @@ func buildAgentPackagePrompt(question string, evidence []AgentPackageEvidence) s
 			item.ReleaseID, item.ClaimID, strings.Join(item.CitationIDs, ","), item.Statement)
 	}
 	return builder.String()
+}
+
+func buildAgentPackageMessages(
+	pkg AgentPackage,
+	promptProfile AgentPackagePromptProfile,
+	question string,
+	evidence []AgentPackageEvidence,
+) []BookKnowledgeMessage {
+	return []BookKnowledgeMessage{
+		{
+			Role: "system",
+			Content: fmt.Sprintf("You are executing immutable Agent Package %s version %s. Use only the pinned evidence below. Capability: %s. Usage policy: %s. Output schema: %s. Cite every factual claim as [citation:<id>]. If evidence is insufficient, abstain.",
+				pkg.PackageID, pkg.Version, pkg.ModelPolicy.PreferredCapability, pkg.SafetyPolicy.UsagePolicy, promptProfile.OutputSchema),
+		},
+		{Role: "user", Content: buildAgentPackagePrompt(question, evidence)},
+	}
 }
 
 func resolveAgentRuntimeCitations(store *BookKnowledgeStore, evidence []AgentPackageEvidence) ([]AgentScopedCitation, error) {
@@ -384,4 +466,39 @@ func resolveAgentRuntimeCitations(store *BookKnowledgeStore, evidence []AgentPac
 		return result[i].CitationID < result[j].CitationID
 	})
 	return result, nil
+}
+
+func selectAgentRuntimeCitations(answer string, available []AgentScopedCitation) ([]AgentScopedCitation, error) {
+	byID := make(map[string]AgentScopedCitation, len(available))
+	for _, citation := range available {
+		byID[citation.CitationID] = citation
+	}
+	seen := make(map[string]bool)
+	selected := make([]AgentScopedCitation, 0)
+	remaining := answer
+	for {
+		start := strings.Index(remaining, "[citation:")
+		if start < 0 {
+			break
+		}
+		remaining = remaining[start+len("[citation:"):]
+		end := strings.Index(remaining, "]")
+		if end < 0 {
+			break
+		}
+		citationID := strings.TrimSpace(remaining[:end])
+		remaining = remaining[end+1:]
+		citation, ok := byID[citationID]
+		if !ok {
+			return nil, fmt.Errorf("answer citation %q is outside retrieved evidence", citationID)
+		}
+		if !seen[citationID] {
+			seen[citationID] = true
+			selected = append(selected, citation)
+		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("answer requires at least one retrieved citation")
+	}
+	return selected, nil
 }

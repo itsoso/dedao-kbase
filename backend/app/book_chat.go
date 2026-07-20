@@ -22,10 +22,11 @@ const (
 var defaultTokenPlanEnvFiles []string
 
 type BookTokenPlanConfig struct {
-	APIKey  string `json:"-"`
-	BaseURL string `json:"base_url"`
-	Model   string `json:"model"`
-	Source  string `json:"source,omitempty"`
+	APIKey    string `json:"-"`
+	BaseURL   string `json:"base_url"`
+	Model     string `json:"model"`
+	Source    string `json:"source,omitempty"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
 }
 
 type BookKnowledgeMessage struct {
@@ -315,11 +316,15 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 		cfg.Model = defaultTokenPlanModel
 	}
 	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
+	maxTokens := cfg.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = agentRuntimeDefaultMaxOutputTokens
+	}
 	payload := map[string]any{
 		"model":       cfg.Model,
 		"messages":    messages,
 		"temperature": 0.2,
-		"max_tokens":  2200,
+		"max_tokens":  maxTokens,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

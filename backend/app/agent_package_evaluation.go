@@ -28,12 +28,15 @@ type AgentEvaluationSuite struct {
 type AgentEvaluationCase struct {
 	CaseID            string            `json:"case_id"`
 	Metric            string            `json:"metric"`
+	Input             string            `json:"input,omitempty"`
 	ExpectedIDs       []string          `json:"expected_ids,omitempty"`
 	ObservedIDs       []string          `json:"-"`
 	ExpectedValue     string            `json:"expected_value,omitempty"`
 	ObservedValue     string            `json:"-"`
 	ExpectedArguments map[string]string `json:"expected_arguments,omitempty"`
 	ObservedArguments map[string]string `json:"-"`
+	MaxLatencyMS      int               `json:"max_latency_ms,omitempty"`
+	MaxCostUSD        float64           `json:"max_cost_usd,omitempty"`
 }
 
 type AgentEvaluationReport struct {
@@ -65,10 +68,6 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 	if len(suite.Cases) == 0 {
 		return AgentEvaluationReport{}, fmt.Errorf("evaluation cases are required")
 	}
-	facts, err := loadAgentEvaluationFacts(store, pkg)
-	if err != nil {
-		return AgentEvaluationReport{}, err
-	}
 	inputHash, err := agentEvaluationInputHash(pkg.ContentHash, suite)
 	if err != nil {
 		return AgentEvaluationReport{}, err
@@ -80,7 +79,11 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 			return AgentEvaluationReport{}, fmt.Errorf("cases[%d] requires case_id and metric", index)
 		}
 		metricTotal[evalCase.Metric]++
-		if deterministicAgentEvaluationCasePasses(pkg, facts, evalCase) {
+		passed, caseErr := executeAgentEvaluationCase(store, pkg, evalCase)
+		if caseErr != nil {
+			return AgentEvaluationReport{}, fmt.Errorf("evaluate case %q: %w", evalCase.CaseID, caseErr)
+		}
+		if passed {
 			metricPassed[evalCase.Metric]++
 		}
 	}
@@ -106,85 +109,132 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 	}, nil
 }
 
-type agentEvaluationFacts struct {
-	chunkIDs    map[string]bool
-	citationIDs map[string]bool
-	claimIDs    map[string]bool
-	releaseIDs  map[string]bool
-	tools       map[string]bool
-	abstentions map[string]bool
+func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
+	input := strings.TrimSpace(evalCase.Input)
+	if input == "" {
+		return false, fmt.Errorf("input is required for behavioral metric %q", evalCase.Metric)
+	}
+	startedAt := time.Now()
+	search, err := searchAgentPackageEvidence(store, pkg, input, pkg.RetrievalPolicy.MaxContextChunks)
+	if err != nil {
+		return false, err
+	}
+	citations, err := resolveAgentRuntimeCitations(store, search.Results)
+	if err != nil {
+		return false, err
+	}
+
+	switch evalCase.Metric {
+	case "retrieval":
+		observed := make([]string, 0, len(citations))
+		for _, citation := range citations {
+			if strings.TrimSpace(citation.ChunkID) != "" {
+				observed = append(observed, citation.ChunkID)
+			}
+		}
+		return agentEvaluationContainsExpected(observed, evalCase.ExpectedIDs), nil
+	case "citations":
+		observed := make([]string, 0, len(citations))
+		for _, citation := range citations {
+			observed = append(observed, citation.CitationID)
+		}
+		return agentEvaluationContainsExpected(observed, evalCase.ExpectedIDs), nil
+	case "faithfulness":
+		observed := make([]string, 0, len(search.Results))
+		byClaim := make(map[string]AgentPackageEvidence, len(search.Results))
+		for _, evidence := range search.Results {
+			observed = append(observed, evidence.ClaimID)
+			byClaim[evidence.ClaimID] = evidence
+		}
+		if !agentEvaluationContainsExpected(observed, evalCase.ExpectedIDs) {
+			return false, nil
+		}
+		var answer strings.Builder
+		for _, claimID := range uniqueTrimmedStrings(evalCase.ExpectedIDs) {
+			evidence := byClaim[claimID]
+			if strings.TrimSpace(evidence.Statement) == "" || len(evidence.CitationIDs) == 0 {
+				return false, nil
+			}
+			fmt.Fprintf(&answer, "%s [citation:%s]\n", evidence.Statement, evidence.CitationIDs[0])
+		}
+		if expected := strings.TrimSpace(evalCase.ExpectedValue); expected == "" || !strings.Contains(answer.String(), expected) {
+			return false, nil
+		}
+		usedCitations, citationErr := selectAgentRuntimeCitations(answer.String(), citations)
+		return citationErr == nil && len(usedCitations) > 0, nil
+	case "abstention":
+		return len(search.Results) == 0 &&
+			preferredAgentAbstention(pkg.SafetyPolicy.AbstentionReasons) == strings.TrimSpace(evalCase.ExpectedValue), nil
+	case "tool_choice":
+		actualTool := agentEvaluationToolChoice(pkg, input)
+		return actualTool != "" && actualTool == strings.TrimSpace(evalCase.ExpectedValue), nil
+	case "tool_arguments":
+		actual := agentEvaluationToolArguments(pkg, input)
+		if !reflect.DeepEqual(actual, evalCase.ExpectedArguments) {
+			return false, nil
+		}
+		decision := EvaluateAgentToolCall(pkg, "book-mcp", "agent.search", map[string]any{
+			"package_id": actual["package_id"], "package_version": actual["package_version"],
+			"release_id": actual["release_id"], "query": input,
+		})
+		return decision.Decision == AgentToolAllow, nil
+	case "latency":
+		if evalCase.MaxLatencyMS <= 0 {
+			return false, fmt.Errorf("max_latency_ms must be positive")
+		}
+		return time.Since(startedAt) <= time.Duration(evalCase.MaxLatencyMS)*time.Millisecond, nil
+	case "cost":
+		if evalCase.MaxCostUSD <= 0 {
+			return false, fmt.Errorf("max_cost_usd must be positive")
+		}
+		if len(pkg.PromptProfiles) == 0 {
+			return false, fmt.Errorf("prompt profile is required")
+		}
+		messages := buildAgentPackageMessages(pkg, pkg.PromptProfiles[0], input, search.Results)
+		cfg := BookTokenPlanConfig{Model: firstAgentPackageModel(pkg.ModelPolicy)}
+		if err := applyAgentRuntimeCostBudget(&cfg, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
+			return false, nil
+		}
+		return agentRuntimeEstimatedMaxCostUSD(messages, cfg.MaxTokens) <= evalCase.MaxCostUSD, nil
+	default:
+		return false, fmt.Errorf("unsupported behavioral metric %q", evalCase.Metric)
+	}
 }
 
-func loadAgentEvaluationFacts(store *BookKnowledgeStore, pkg AgentPackage) (agentEvaluationFacts, error) {
-	facts := agentEvaluationFacts{
-		chunkIDs: make(map[string]bool), citationIDs: make(map[string]bool),
-		claimIDs: make(map[string]bool), releaseIDs: make(map[string]bool),
-		tools: make(map[string]bool), abstentions: make(map[string]bool),
+func agentEvaluationContainsExpected(observed, expected []string) bool {
+	wanted := uniqueTrimmedStrings(expected)
+	if len(wanted) == 0 {
+		return false
 	}
-	for _, reason := range uniqueTrimmedStrings(pkg.SafetyPolicy.AbstentionReasons) {
-		facts.abstentions[reason] = true
+	observedSet := stringBoolSet(observed...)
+	for _, value := range wanted {
+		if !observedSet[value] {
+			return false
+		}
+	}
+	return true
+}
+
+func agentEvaluationToolChoice(pkg AgentPackage, input string) string {
+	if strings.TrimSpace(input) == "" {
+		return ""
 	}
 	for _, rule := range pkg.ToolPolicy.Tools {
-		if rule.Decision == AgentToolAllow {
-			facts.tools[strings.TrimSpace(rule.MCPServer)+"/"+strings.TrimSpace(rule.ToolName)] = true
+		if rule.MCPServer == "book-mcp" && rule.ToolName == "agent.search" && rule.Decision == AgentToolAllow {
+			return "book-mcp/agent.search"
 		}
 	}
-	for _, ref := range pkg.Releases {
-		release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
-		if err != nil {
-			return agentEvaluationFacts{}, fmt.Errorf("load evaluation release %q: %w", ref.ReleaseID, err)
-		}
-		if release.ContentHash != ref.ContentHash {
-			return agentEvaluationFacts{}, fmt.Errorf("evaluation release %q content hash mismatch", ref.ReleaseID)
-		}
-		facts.releaseIDs[ref.ReleaseID] = true
-		for _, citation := range release.Citations {
-			facts.citationIDs[citation.CitationID] = true
-			if strings.TrimSpace(citation.ChunkID) != "" {
-				facts.chunkIDs[citation.ChunkID] = true
-			}
-		}
-		if release.Analysis != nil {
-			for _, claim := range release.Analysis.Claims {
-				facts.claimIDs[claim.ID] = true
-			}
-		}
-	}
-	return facts, nil
+	return ""
 }
 
-func deterministicAgentEvaluationCasePasses(pkg AgentPackage, facts agentEvaluationFacts, evalCase AgentEvaluationCase) bool {
-	switch evalCase.Metric {
-	case "retrieval", "citations", "faithfulness":
-		if len(evalCase.ExpectedIDs) == 0 {
-			return false
-		}
-		observed := facts.chunkIDs
-		if evalCase.Metric == "citations" {
-			observed = facts.citationIDs
-		} else if evalCase.Metric == "faithfulness" {
-			observed = facts.claimIDs
-		}
-		for _, expected := range uniqueTrimmedStrings(evalCase.ExpectedIDs) {
-			if !observed[expected] {
-				return false
-			}
-		}
-		return true
-	case "abstention":
-		return facts.abstentions[strings.TrimSpace(evalCase.ExpectedValue)]
-	case "tool_choice":
-		return facts.tools[strings.TrimSpace(evalCase.ExpectedValue)]
-	case "tool_arguments":
-		if len(evalCase.ExpectedArguments) == 0 || evalCase.ExpectedArguments["package_id"] != pkg.PackageID ||
-			evalCase.ExpectedArguments["package_version"] != pkg.Version ||
-			!facts.releaseIDs[evalCase.ExpectedArguments["release_id"]] {
-			return false
-		}
-		fingerprint := strings.TrimPrefix(evalCase.ExpectedArguments["query_fingerprint"], "sha256:")
-		return len(fingerprint) == 64 && isLowerHex(fingerprint)
-	default:
-		return false
+func agentEvaluationToolArguments(pkg AgentPackage, input string) map[string]string {
+	releaseID := ""
+	if len(pkg.Releases) > 0 {
+		releaseID = pkg.Releases[0].ReleaseID
+	}
+	return map[string]string{
+		"package_id": pkg.PackageID, "package_version": pkg.Version, "release_id": releaseID,
+		"query_fingerprint": sha256Fingerprint([]byte(strings.TrimSpace(input))),
 	}
 }
 

@@ -277,12 +277,23 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 	if len(policy.MinimumScores) == 0 {
 		return fmt.Errorf("evaluation_policy.minimum_scores is required")
 	}
+	for _, metric := range []string{
+		"retrieval", "citations", "faithfulness", "abstention",
+		"tool_choice", "tool_arguments", "latency", "cost",
+	} {
+		if _, ok := policy.MinimumScores[metric]; !ok {
+			return fmt.Errorf("required evaluation metric %q is missing", metric)
+		}
+	}
 	for metric, threshold := range policy.MinimumScores {
 		if strings.TrimSpace(metric) == "" {
 			return fmt.Errorf("evaluation_policy.minimum_scores contains an empty metric")
 		}
 		if threshold < 0 || threshold > 1 {
 			return fmt.Errorf("evaluation threshold %q must be between 0 and 1", metric)
+		}
+		if threshold == 0 {
+			return fmt.Errorf("evaluation threshold %q must be greater than zero", metric)
 		}
 	}
 	return nil

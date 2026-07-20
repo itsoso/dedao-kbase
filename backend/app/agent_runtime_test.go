@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAgentPackageRuntimeSearchesEveryPinnedRelease(t *testing.T) {
@@ -38,6 +39,71 @@ func TestAgentPackageRuntimeEnforcesPackageSearchLimit(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "max_context_chunks") {
 		t.Fatalf("search limit error = %v", err)
+	}
+}
+
+func TestAgentPackageRuntimeExecutesDeclaredRetrievalStrategy(t *testing.T) {
+	strategies := []string{"lexical", "vector", "hybrid"}
+	scores := make(map[string]float64)
+	for _, strategy := range strategies {
+		store, pkg := agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
+			pkg.RetrievalPolicy.Strategy = strategy
+		})
+		response, err := SearchAgentPackage(store, AgentPackageSearchRequest{
+			PackageID: pkg.PackageID, PackageVersion: pkg.Version, Query: "second grounded", Limit: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.RetrievalStrategy != strategy || len(response.Results) == 0 || response.Results[0].ClaimID != "claim-2" {
+			t.Fatalf("%s response = %#v", strategy, response)
+		}
+		scores[strategy] = response.Results[0].Score
+	}
+	if scores["lexical"] == scores["vector"] || scores["hybrid"] == scores["lexical"] || scores["hybrid"] == scores["vector"] {
+		t.Fatalf("retrieval strategies reused one score: %#v", scores)
+	}
+}
+
+func TestAgentPackageRuntimeFailsClosedForUnavailableGraphRetrieval(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := validAgentPackage()
+	pkg.RetrievalPolicy.Strategy = "graph"
+	pkg, _ = FinalizeAgentPackage(pkg)
+	_, err := EvaluateAgentPackageDeterministically(store, pkg, loadAgentEvaluationFixture(t), testAgentPackageTime())
+	if err == nil || !strings.Contains(err.Error(), "graph") {
+		t.Fatalf("graph evaluation error = %v", err)
+	}
+}
+
+func TestAgentPackageRuntimeEnforcesCostBudgetBeforeModelCall(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store, pkg := agentRuntimeTestStore(t)
+	client := &fakeBookKnowledgeLLMClient{answer: "must not be called [citation:citation-1]"}
+	_, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, Question: strings.Repeat("grounded ", 4000),
+	}, client)
+	if err == nil || !strings.Contains(err.Error(), "cost budget") || len(client.messages) != 0 {
+		t.Fatalf("cost budget error=%v messages=%#v", err, client.messages)
+	}
+}
+
+func TestAgentPackageRuntimeRejectsSupersededVersion(t *testing.T) {
+	store, v1 := agentRuntimeTestStore(t)
+	v2 := v1
+	v2.Version = "2.0.0"
+	v2, _ = FinalizeAgentPackage(v2)
+	savePassingAgentPackageTestEvaluation(t, store, v2)
+	if _, _, err := PublishAgentPackage(store, v2, "runtime-package-v2", AgentReadOnlyToolIDs(), testAgentPackageTime().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := SearchAgentPackage(store, AgentPackageSearchRequest{
+		PackageID: v1.PackageID, PackageVersion: v1.Version, Query: "grounded",
+	})
+	if err == nil || !strings.Contains(err.Error(), "not published") {
+		t.Fatalf("superseded package search error = %v", err)
 	}
 }
 
@@ -73,6 +139,53 @@ func TestAgentPackageRuntimeChatUsesPinnedEvidencePolicyAndCitations(t *testing.
 	}
 	if strings.Contains(prompt, "private-source-marker") {
 		t.Fatalf("package prompt leaked source body/path marker: %s", prompt)
+	}
+}
+
+func TestAgentPackageRuntimeAbstainsForMissingOrUnknownAnswerCitations(t *testing.T) {
+	for _, answer := range []string{
+		"Ungrounded answer without a citation marker",
+		"Invented evidence [citation:not-pinned]",
+	} {
+		t.Run(answer, func(t *testing.T) {
+			t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+			store, pkg := agentRuntimeTestStore(t)
+			client := &fakeBookKnowledgeLLMClient{answer: answer}
+			response, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+				PackageID: pkg.PackageID, PackageVersion: pkg.Version, Question: "What is grounded?",
+			}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.Outcome != AgentTraceOutcomeAbstained || response.AbstentionReason != "citation_required" ||
+				response.Answer != "" || len(response.Citations) != 0 || response.TraceID == "" {
+				t.Fatalf("ungrounded response = %#v", response)
+			}
+			trace, loadErr := store.LoadAgentTrace(response.TraceID)
+			if loadErr != nil || trace.Final.Outcome != AgentTraceOutcomeAbstained || len(trace.Final.Citations) != 0 {
+				t.Fatalf("ungrounded trace = %#v err=%v", trace, loadErr)
+			}
+		})
+	}
+}
+
+func TestAgentPackageRuntimeReturnsOnlyCitationsUsedInAnswer(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store, pkg := agentRuntimeTestStore(t)
+	client := &fakeBookKnowledgeLLMClient{answer: "Grounded answer [citation:citation-2]"}
+	response, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, Question: "What is grounded?",
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != AgentTraceOutcomeCompleted || len(response.Citations) != 1 ||
+		response.Citations[0].CitationID != "citation-2" {
+		t.Fatalf("answer citations = %#v", response)
+	}
+	trace, loadErr := store.LoadAgentTrace(response.TraceID)
+	if loadErr != nil || len(trace.Final.Citations) != 1 || trace.Final.Citations[0].CitationID != "citation-2" {
+		t.Fatalf("answer trace = %#v err=%v", trace, loadErr)
 	}
 }
 
@@ -153,6 +266,12 @@ func agentRuntimeTestStore(t *testing.T) (*BookKnowledgeStore, AgentPackage) {
 }
 
 func agentRuntimeTestStoreWithLimit(t *testing.T, maxContextChunks int) (*BookKnowledgeStore, AgentPackage) {
+	return agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
+		pkg.RetrievalPolicy.MaxContextChunks = maxContextChunks
+	})
+}
+
+func agentRuntimeTestStoreWithPackageEdit(t *testing.T, edit func(*AgentPackage)) (*BookKnowledgeStore, AgentPackage) {
 	t.Helper()
 	store := NewBookKnowledgeStore(t.TempDir())
 	first := agentPackageTestRelease()
@@ -179,10 +298,12 @@ func agentRuntimeTestStoreWithLimit(t *testing.T, maxContextChunks int) (*BookKn
 	}
 	pkg := agentToolPolicyTestPackage()
 	pkg.Releases[0].ContentHash = first.ContentHash
-	pkg.RetrievalPolicy.MaxContextChunks = maxContextChunks
 	pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
 		ReleaseID: "release-2", ContentHash: second.ContentHash, CitationIDs: []string{"citation-2"},
 	})
+	if edit != nil {
+		edit(&pkg)
+	}
 	pkg, _ = FinalizeAgentPackage(pkg)
 	savePassingAgentPackageTestEvaluation(t, store, pkg)
 	if _, _, err := PublishAgentPackage(store, pkg, "runtime-package", AgentReadOnlyToolIDs(), testAgentPackageTime()); err != nil {

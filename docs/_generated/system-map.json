@@ -860,7 +860,7 @@
     {
       "name": "AgentEvaluationReport",
       "file": "backend/app/agent_package_evaluation.go",
-      "line": 39
+      "line": 42
     },
     {
       "name": "AgentPackage",
@@ -910,7 +910,7 @@
     {
       "name": "BookKnowledgeChatContextStats",
       "file": "backend/app/book_chat.go",
-      "line": 71
+      "line": 72
     },
     {
       "name": "BookKnowledgeChatHistoryItem",
@@ -920,17 +920,17 @@
     {
       "name": "BookKnowledgeChatRequest",
       "file": "backend/app/book_chat.go",
-      "line": 36
+      "line": 37
     },
     {
       "name": "BookKnowledgeChatResponse",
       "file": "backend/app/book_chat.go",
-      "line": 54
+      "line": 55
     },
     {
       "name": "BookKnowledgeChatSource",
       "file": "backend/app/book_chat.go",
-      "line": 64
+      "line": 65
     },
     {
       "name": "BookKnowledgeChunk",
@@ -955,17 +955,17 @@
     {
       "name": "BookKnowledgeMCPResource",
       "file": "backend/app/book_mcp.go",
-      "line": 16
+      "line": 17
     },
     {
       "name": "BookKnowledgeMCPServer",
       "file": "backend/app/book_mcp.go",
-      "line": 40
+      "line": 41
     },
     {
       "name": "BookKnowledgeMCPTool",
       "file": "backend/app/book_mcp.go",
-      "line": 10
+      "line": 11
     },
     {
       "name": "BookKnowledgeManifest",
@@ -975,7 +975,7 @@
     {
       "name": "BookKnowledgeMessage",
       "file": "backend/app/book_chat.go",
-      "line": 31
+      "line": 32
     },
     {
       "name": "BookKnowledgeNotebookLMBridge",

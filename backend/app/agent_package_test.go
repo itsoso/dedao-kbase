@@ -63,7 +63,9 @@ func TestAgentPackageRejectsInvalidOrMutableReferences(t *testing.T) {
 		{name: "unknown tool", edit: func(pkg *AgentPackage) { pkg.ToolPolicy.Tools[0].ToolName = "delete_source" }, want: "unknown tool"},
 		{name: "missing safety policy", edit: func(pkg *AgentPackage) { pkg.SafetyPolicy.AbstentionReasons = nil }, want: "abstention"},
 		{name: "missing evaluation threshold", edit: func(pkg *AgentPackage) { pkg.EvaluationPolicy.MinimumScores = nil }, want: "minimum_scores"},
+		{name: "missing behavioral evaluation threshold", edit: func(pkg *AgentPackage) { delete(pkg.EvaluationPolicy.MinimumScores, "cost") }, want: "required evaluation metric"},
 		{name: "invalid evaluation threshold", edit: func(pkg *AgentPackage) { pkg.EvaluationPolicy.MinimumScores["faithfulness"] = 1.1 }, want: "between 0 and 1"},
+		{name: "zero required evaluation threshold", edit: func(pkg *AgentPackage) { pkg.EvaluationPolicy.MinimumScores["citations"] = 0 }, want: "greater than zero"},
 		{name: "unknown ui capability", edit: func(pkg *AgentPackage) {
 			pkg.UIManifest.Capabilities = append(pkg.UIManifest.Capabilities, "private_fork")
 		}, want: "ui capability"},
@@ -225,6 +227,8 @@ func validAgentPackage() AgentPackage {
 				"abstention":     1,
 				"tool_choice":    1,
 				"tool_arguments": 1,
+				"latency":        1,
+				"cost":           1,
 			},
 		},
 		UIManifest: AgentPackageUIManifest{Capabilities: []string{"reader", "search", "grounded_chat", "evidence"}},

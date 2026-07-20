@@ -162,14 +162,8 @@ func stringArgument(arguments map[string]any, name string) string {
 }
 
 func nonEmptyAgentArgument(value any) bool {
-	switch typed := value.(type) {
-	case string:
-		return strings.TrimSpace(typed) != ""
-	case nil:
-		return false
-	default:
-		return true
-	}
+	typed, ok := value.(string)
+	return ok && strings.TrimSpace(typed) != ""
 }
 
 func stringBoolSet(values ...string) map[string]bool {

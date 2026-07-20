@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -111,6 +112,12 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 			return nil, fmt.Errorf("load Agent Package: %w", err)
 		}
 		pkg = *loaded
+		if pkg.LifecycleState != AgentPackagePublished {
+			return nil, fmt.Errorf("agent package %s is not published", agentPackageReference(pkg.PackageID, pkg.Version))
+		}
+		if err := ValidateAgentPackageEvaluationGate(s.store, pkg); err != nil {
+			return nil, fmt.Errorf("agent package evaluation gate: %w", err)
+		}
 	}
 	decision := EvaluateAgentToolCall(pkg, "book-mcp", name, input)
 	if decision.Decision != AgentToolAllow {
@@ -145,7 +152,13 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 		if err != nil {
 			return nil, err
 		}
-		return marshalMCPResult(searchAgentReleaseClaims(*release, stringArgument(input, "query"), limit))
+		results, searchErr := searchAgentReleaseClaimsWithStrategy(
+			*release, stringArgument(input, "query"), limit, pkg.RetrievalPolicy.Strategy,
+		)
+		if searchErr != nil {
+			return nil, searchErr
+		}
+		return marshalMCPResult(results)
 	case "agent.resolve_citation":
 		citationID := stringArgument(input, "citation_id")
 		for _, citation := range release.Citations {
@@ -176,8 +189,25 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 }
 
 func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int) []AgentScopedSearchResult {
+	results, _ := searchAgentReleaseClaimsWithStrategy(release, query, limit, "lexical")
+	return results
+}
+
+func searchAgentReleaseClaimsWithStrategy(
+	release KnowledgeRelease,
+	query string,
+	limit int,
+	strategy string,
+) ([]AgentScopedSearchResult, error) {
 	if release.Analysis == nil {
-		return []AgentScopedSearchResult{}
+		return []AgentScopedSearchResult{}, nil
+	}
+	strategy = strings.TrimSpace(strategy)
+	if strategy == "graph" {
+		return nil, fmt.Errorf("graph retrieval is not connected for Agent Package execution")
+	}
+	if strategy != "lexical" && strategy != "vector" && strategy != "hybrid" {
+		return nil, fmt.Errorf("unsupported Agent Package retrieval strategy %q", strategy)
 	}
 	terms := splitSearchTerms(query)
 	results := make([]AgentScopedSearchResult, 0)
@@ -189,13 +219,21 @@ func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int)
 				matched++
 			}
 		}
-		if matched == 0 {
+		lexicalScore := float64(matched) / float64(len(terms))
+		vectorScore := agentSparseVectorScore(terms, splitSearchTerms(haystack))
+		score := lexicalScore
+		if strategy == "vector" {
+			score = vectorScore
+		} else if strategy == "hybrid" {
+			score = (lexicalScore + vectorScore) / 2
+		}
+		if score <= 0 {
 			continue
 		}
 		results = append(results, AgentScopedSearchResult{
 			ClaimID: claim.ID, Statement: claim.Statement,
 			CitationIDs: append([]string(nil), claim.CitationIDs...),
-			Score:       float64(matched) / float64(len(terms)),
+			Score:       score,
 		})
 	}
 	sort.SliceStable(results, func(i, j int) bool {
@@ -207,7 +245,33 @@ func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int)
 	if len(results) > limit {
 		results = results[:limit]
 	}
-	return results
+	return results, nil
+}
+
+func agentSparseVectorScore(queryTerms, documentTerms []string) float64 {
+	if len(queryTerms) == 0 || len(documentTerms) == 0 {
+		return 0
+	}
+	queryCounts := make(map[string]float64)
+	documentCounts := make(map[string]float64)
+	for _, term := range queryTerms {
+		queryCounts[term]++
+	}
+	for _, term := range documentTerms {
+		documentCounts[term]++
+	}
+	dot, queryNorm, documentNorm := 0.0, 0.0, 0.0
+	for term, count := range queryCounts {
+		dot += count * documentCounts[term]
+		queryNorm += count * count
+	}
+	for _, count := range documentCounts {
+		documentNorm += count * count
+	}
+	if dot == 0 || queryNorm == 0 || documentNorm == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(queryNorm) * math.Sqrt(documentNorm))
 }
 
 func agentToolLimit(value any, packageLimit int) (int, error) {
