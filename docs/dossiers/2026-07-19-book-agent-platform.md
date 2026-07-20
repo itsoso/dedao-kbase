@@ -29,7 +29,7 @@ prescription or dosage decisions, and personal-data write tools.
   high-risk review are mandatory.
 - **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed after
   persisted-package integrity remediation on implementation heads `a508a32`,
-  `0942fb7c`, and `e33beedfa` respectively.
+  `0942fb7c`, and merged Health head `a762fa99b` respectively.
 - **G4 Review: PENDING after prior NO-GO.** The prior consumer-safety High was
   remediated and G3 repeated. Fresh independent architecture and
   consumer-safety GO decisions are still mandatory. No push or deployment is
@@ -1334,6 +1334,38 @@ The successful KBase rerun used `set -euo pipefail`, so any failing command
 would stop the Gate instead of being hidden by a later successful check. The
 only KBase working-tree changes after verification are this dossier checkpoint
 and the regenerated source-locator metadata in the system map.
+
+## Task 10 checkpoint: refresh consumers onto current main
+
+**Decision: G3 remains PASS on deployable local heads KBase `7d285a9`,
+Proofroom `0942fb7c`, and Health `a762fa99b`.** Read-only remote refresh showed
+KBase canonical `dedao-kbase/main` at `dd6bc9c` and Proofroom `origin/main` at
+`9b155400`; both are direct ancestors of their feature heads and merge-tree
+checks were clean. Health `origin/main` had advanced to `e135100d`, so the
+feature branch was refreshed before final G4. No branch was pushed and no
+deployment was attempted.
+
+Health integration evidence:
+
+- `git merge-tree --write-tree origin/main HEAD` — correctly reported one
+  conflict limited to `docs/_generated/system-map.json`;
+- `git merge --no-ff --no-commit origin/main` — reproduced only that generated
+  conflict; `python scripts/dump_system_map.py` regenerated the merged source
+  inventory and the subsequent document-drift check passed;
+- the eleven-file Health matrix on the merged source — PASS,
+  `234 passed, 6 warnings in 39.79s`; seven-file `py_compile`, both required
+  `ruff` commands, document drift, and `git diff --check` — PASS;
+- the first merge-commit attempt was rejected by the doc-drift hook because
+  system Python lacked `sqlalchemy` and `pydantic`; it was not bypassed. The
+  same commit was rerun with the repository backend environment on `PATH`, and
+  every pre-commit hook passed;
+- KBase privacy smoke, Health staged added-line privacy scan, and
+  `git diff --check` — PASS immediately before merge commit `a762fa99b`;
+- the Health worktree was clean and `11` commits ahead of current
+  `origin/main` after the merge.
+
+Fresh independent architecture and cross-consumer G4 review is required on
+these exact deployable heads.
 
 ## Decisions
 
