@@ -1483,6 +1483,35 @@ One Low non-blocking defense-in-depth note remains: canonicalize package-list
 detail URLs at delivery and construct same-origin detail URLs in consumers
 rather than relying on stored list metadata. It does not alter the G4 GO.
 
+## Release checkpoint: publish reviewed branches
+
+**Decision: reviewed revisions are present on their canonical GitHub remotes;
+clean-main integration remains pending for KBase and Proofroom.** No deployment
+was attempted.
+
+Exact results:
+
+- KBase privacy smoke, `git diff --check`, and clean status — PASS; explicit
+  push created `dedao-kbase/codex/book-agent-platform` at `cd95d87`;
+- Proofroom privacy and diff checks — PASS. Its `origin` has two push URLs. The
+  GitHub push created `refs/heads/codex/book-agent-consumer` at exact reviewed
+  commit `c3324fec`, while the subsequent company-network mirror connection
+  failed and made the combined command exit `128`. An explicit GitHub
+  `ls-remote` confirmed the reviewed commit, and the failed mirror is not used
+  by the production deployment;
+- Health privacy and diff checks — PASS. Repository configuration
+  `remote.origin.push=HEAD:refs/heads/main` mapped the requested feature push
+  directly to `main`, advancing GitHub main from `bb68c0ae5` to exact reviewed
+  head `b7b1a610d`. GitHub reported that expected status checks were bypassed by
+  repository permissions. The pushed revision had already passed G3 and both
+  G4 reviews, but all remaining pushes will use explicit refspecs to avoid
+  implicit mappings;
+- `git ls-remote` confirmed Health `refs/heads/main` at `b7b1a610d`; its local
+  feature worktree is clean and tracks that exact remote main.
+
+G5 and G6 remain pending. KBase and Proofroom must next be integrated and
+reverified from clean `main` clones before explicit main pushes.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
