@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** G3 and G4 PASS; ready for controlled main integration and deployment
+**Status:** BLOCKED before G5; production publisher and semantic retrieval secrets are missing
 
 ## Objective
 
@@ -34,8 +34,10 @@ prescription or dosage decisions, and personal-data write tools.
   reviews returned GO on exact clean heads `eabd98e`, `c3324fec`, and
   `b7b1a610d`. No Critical, High, or Medium blockers remain.
 - **G5 Deployment health: PENDING.** No implementation has been deployed.
-- **G6 Online verification: PENDING.** Requires exact-revision verification in
-  KBase and both consumer environments.
+- **G6 Online verification: BLOCKED.** Production KBase lacks the independent
+  publisher token and semantic retrieval configuration required to evaluate,
+  publish, and verify the pilot package. No secret was generated or written by
+  this execution.
 
 ## Checkpoint: Tasks 1-2
 
@@ -1511,6 +1513,69 @@ Exact results:
 
 G5 and G6 remain pending. KBase and Proofroom must next be integrated and
 reverified from clean `main` clones before explicit main pushes.
+
+## Release checkpoint: clean main integration and production preflight
+
+**Decision: all three reviewed revisions are on canonical GitHub `main`, but
+deployment is BLOCKED before G5 by missing production secrets.** No service was
+restarted and no production artifact, environment file, knowledge package, or
+consumer state was mutated.
+
+Canonical main revisions:
+
+- KBase `bfb82fd` on `dedao-kbase/main`;
+- Proofroom `c3324fec` on `origin/main`;
+- Health `b7b1a610d` on `origin/main`.
+
+Clean-main integration and verification:
+
+- fresh temporary clones checked out actual `main`; KBase and Proofroom were
+  fast-forwarded with `--ff-only` from their reviewed remote feature branches;
+  Health cloned directly at the reviewed main revision;
+- KBase's first clean-clone attempt ran Go before generating the ignored
+  `frontend/dist` embed input and failed with `pattern all:frontend/dist: no
+  matching files found`. It was not counted. The rerun used the required order:
+  `npm ci`, production frontend build, `go test ./...`, race tests, every Web
+  and desktop smoke, all six contract/packaging smokes, Schema validation,
+  system-map drift, privacy smoke, and `git diff --check` — PASS. Race tests
+  passed in `18.807s` and `2.662s`; only the existing macOS linker warnings,
+  frontend `eval`/bundle warnings, and dependency audit findings were reported;
+- Proofroom clean-main six-suite matrix — PASS,
+  `137 passed, 2 warnings in 8.56s`; compile, diff, and clean status — PASS;
+- Health clean-main eleven-file matrix — PASS,
+  `235 passed, 6 warnings in 40.66s`; document drift, diff, and clean status —
+  PASS;
+- immediately before each main push, the remote main was fetched, ancestry and
+  clean status were checked, KBase privacy smoke was rerun, and explicit
+  `HEAD:refs/heads/main` refspecs were used. `ls-remote` confirmed all three
+  canonical revisions above.
+
+KBase production preflight:
+
+- public `https://kbase.executor.life/health` — HTTP 200 with the expected
+  service payload;
+- authoritative DNS resolved the host to the production server; SSH confirmed
+  systemd unit `dedao-kbase` is active and runs
+  `/opt/dedao-kbase/bin/kbase-server` as the dedicated service user;
+- `/opt/dedao-kbase` is an artifact/data installation rather than a Git
+  checkout, and the server has no Go toolchain. A clean-main local cross-build
+  produced a static Linux amd64 server binary with SHA-256
+  `74cb1871949701a0e4f311e361253b17d3573e8e4e634516e9afb4bc1c975e8f`;
+- environment presence checks (values were never printed) found
+  `KBASE_AUTH_TOKEN` present but `KBASE_AGENT_PUBLISHER_TOKEN`,
+  `KBASE_EMBEDDING_BASE_URL`, `KBASE_EMBEDDING_PROVIDER`,
+  `KBASE_EMBEDDING_MODEL`, `KBASE_EMBEDDING_VERSION`, and
+  `KBASE_EMBEDDING_API_KEY` missing;
+- these values are required to keep publication authority separate and to
+  reproduce the hash-bound semantic evaluation/retrieval identity. Creating or
+  selecting production credentials requires explicit human secret ownership,
+  so deployment and G6 verification stopped before any mutation.
+
+Unblock requirement: configure an independently governed publisher token and
+an approved, pinned embedding endpoint/provider/model/version/API key in the
+production KBase secret store, then resume G5 deployment from the clean main
+revision and run the full package publication, Proofroom import, Health
+hold/import, citation, receipt, and feedback-closure online checks.
 
 ## Decisions
 
