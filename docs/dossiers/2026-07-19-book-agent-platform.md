@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** KBase and Proofroom G5 PASS; empty-list contract hotfix verified locally, Health deployment pending
+**Status:** COMPLETE — G1-G6 PASS; production pilot verified on KBase, Proofroom, and Health
 
 ## Objective
 
@@ -27,17 +27,19 @@ prescription or dosage decisions, and personal-data write tools.
   package/runtime/tool/evaluation separation. Paid-source usage policy,
   deterministic tool authorization, citation resolution, and consumer-owned
   high-risk review are mandatory.
-- **G3 Test: PASS.** The full KBase, Proofroom, and Health matrix passed after
-  citation-scope remediation on deployable heads `c50c3af`, `c3324fec`, and
-  `b7b1a610d` respectively.
-- **G4 Review: PASS.** Fresh independent architecture and cross-consumer
-  reviews returned GO on exact clean heads `eabd98e`, `c3324fec`, and
-  `b7b1a610d`. No Critical, High, or Medium blockers remain.
-- **G5 Deployment health: IN PROGRESS.** KBase and Proofroom are deployed and
-  healthy; Health deployment remains pending.
-- **G6 Online verification: BLOCKED.** A production empty-list probe found
-  `packages:null` instead of the required array. The hotfix passes locally but
-  has not yet been reviewed, published, and deployed.
+- **G3 Test: PASS.** Final clean-main matrices passed on KBase `6643420`,
+  Proofroom `7ed622fa`, and Health `f58925b8` after all production-discovered
+  citation and trace remediations.
+- **G4 Review: PASS.** Independent architecture and cross-consumer reviews
+  returned GO. The final Proofroom legacy citation resolver also received an
+  independent GO with no Critical, High, Medium, or Low finding.
+- **G5 Deployment health: PASS.** All three exact main revisions are deployed;
+  public health, service status, restart counts, and product-specific health
+  checks pass.
+- **G6 Online verification: PASS.** The evaluated v1.1.0 pilot is published,
+  searchable, executable, cited, and traced; Proofroom imports it idempotently
+  and closes bounded feedback; Health holds it outside serving because its
+  authorized usage policy is not `evidence_only`.
 
 ## Checkpoint: Tasks 1-2
 
@@ -1981,6 +1983,217 @@ Trace remediation TDD:
 
 The trace remediation is not yet committed, pushed, or deployed. G6 remains
 blocked.
+
+## G6 trace rollout, successful runtime, and Proofroom projection remediation
+
+**Decision: the KBase runtime portion of G6 is PASS; G6 remains BLOCKED at the
+Proofroom import Gate pending the reviewed consumer fix.** The failed v1.0.0
+pilot remains immutable and auditable. A new v1.1.0 package supersedes it and
+passes evaluation, publication, retrieval, real model execution, citation, and
+trace checks. The first Proofroom import then exposed a consumer-side legacy
+identifier mismatch and was returned upstream before Health import or feedback
+closure.
+
+Trace rollout evidence:
+
+- the reviewed trace remediation was committed as `6643420`, pushed to both
+  the feature ref and canonical `main`, and deployed from an exact clean-main
+  source archive with SHA-256
+  `d2b6d4c105104f0458c6660646aae80d78c0f5516e8015715b92c26e2f59abde`;
+- server-side Linux CGO `go test ./...` passed: backend app `9.901s`, services
+  `3.338s`, utils `0.618s`, KBase server `0.070s`, source agent `0.112s`, system
+  map `0.098s`, and WC Plus agent `0.145s`;
+- the production binary SHA-256 is
+  `5a3b2f123f01ce8f5935285586b58e19f42f87baf7ae206162c6902ba6c33eaf`;
+  the retained atomic backup is
+  `/opt/dedao-kbase/bin/kbase-server.backup-6643420-20260721105916`;
+- systemd reported `active/running`, `ExecMainStatus=0`, and `NRestarts=0`;
+  public health and authenticated empty-list checks passed;
+- replaying v1.0.0 still returned the expected configured-model
+  `model_not_found`, but the failed trace now persisted successfully as
+  `agent-run-72ea...`, outcome `failed`, with a normalized release fingerprint
+  and no `persist failed trace` secondary error.
+
+Successful v1.1.0 pilot evidence:
+
+- the private transient evaluator input remained server-only with mode `0600`;
+  it contained no downloaded source body in Git and declared the actually
+  configured `MiniMax-M2.5` model;
+- deterministic preflight passed all ten required metrics; publisher-only
+  `/evaluate` returned HTTP 201 for suite `pilot-book-agent-v2`, `passed=true`;
+- publisher-only `/publish` returned HTTP 201 for
+  `book-agent-clinical-trials-truth@1.1.0`, content hash
+  `sha256:2ff1f0b5540d0aef4fcf6e46e60778e8bedd6c50c84697b755d2e67fe1c8fbd8`;
+  v1.0.0 became `superseded` and v1.1.0 is `published`;
+- authenticated online search returned HTTP 200 with one result and one
+  citation; real chat returned HTTP 200, outcome `completed`, model
+  `MiniMax-M2.5`, and one citation;
+- trace `agent-run-06f5cdc259e4b72570164840cc83a876` loaded successfully with
+  outcome `completed`, one citation, a normalized legacy release fingerprint,
+  and none of the forbidden credential, source-body, private-prompt, or
+  consumer-user-data fields.
+
+Proofroom import Gate evidence:
+
+- the production history database was backed up before the pilot and retained
+  with mode `0600`;
+- the first `sync_kbase_agent_packages` run for the configured consumer user
+  projected one package, one release, four chunks, and four citations, but zero
+  claims. The package projection points to v1.1.0 and the Proofroom service
+  remained healthy at its exact deployed revision;
+- identifier-only inspection found the same historical shape already fixed in
+  KBase: Knowledge Release claims reference chunk IDs while the package
+  allowlist contains citation IDs. Proofroom compared only direct citation IDs,
+  so otherwise authorized claims were dropped. No claim was adjudicated and no
+  feedback closure was attempted.
+
+Proofroom TDD remediation:
+
+- RED: `python3 -m pytest -q
+  tests/test_kbase_release_consumer.py::test_agent_package_import_uses_cursor_and_preserves_evidence_identity`
+  failed with expected claims `1`, actual `0`, `1 failed in 0.87s`;
+- the consumer now resolves claim references by exact citation ID first, then
+  by release citation `chunk_id`, preserving release order and de-duplicating;
+  unknown references continue into the unchanged package allowlist filter and
+  therefore remain fail-closed;
+- GREEN: the focused import passed in `0.76s`; the original consumer suite
+  passed `18` tests in `3.03s`;
+- a defense-in-depth regression locks direct-ID precedence, one-to-many release
+  ordering/de-duplication, and unknown-reference preservation. The expanded
+  consumer suite passed `19 passed in 2.49s`;
+- the project-environment six-suite release matrix passed
+  `138 passed in 9.76s`; the four-file `python -m py_compile`, Proofroom
+  added-line privacy scan, KBase privacy smoke, and `git diff --check` passed;
+- independent G4 review returned GO with no Critical, High, Medium, or Low
+  finding. The reviewer independently passed the two focused regressions
+  (`2 passed, 17 deselected in 0.78s`), the six-suite matrix
+  (`138 passed in 8.47s`), two-file compilation, added-line privacy scan, and
+  `git diff --check`; it confirmed the allowlist remains fail-closed,
+  projection remains idempotent, and Proofroom retains verdict ownership;
+- no structural source inventory changed, so system-map artifacts were not
+  regenerated.
+
+The Proofroom fix is not yet committed, pushed, or deployed. Clean-main
+rollout, idempotent import replay, delivery receipt, bounded feedback, Health
+draft/hold isolation, and final G6 verification remain pending.
+
+## Task 10 final checkpoint: G6 production pilot
+
+**Decision: G6 PASS on exact deployed revisions KBase `6643420`, Proofroom
+`7ed622fa`, and Health `f58925b8`.** All planned Tasks 1-10 and checkpoints are
+complete. The pilot preserves authorized-source policy: no downloaded source
+body or credential was added to Git, fixtures remain synthetic or
+identifier-only, KBase tools remain read-only, Proofroom owns proof verdicts,
+and Health owns domain review and serving approval.
+
+Proofroom clean-main rollout:
+
+- pre-commit privacy checks, `git diff --check`, the six-suite release matrix,
+  and independent G4 GO passed before commit
+  `7ed622fa fix(kbase): resolve chunk-backed claim citations`;
+- privacy and diff checks passed again before explicit feature push. A clean
+  `main` clone fast-forwarded from `c3324fec` to `7ed622fa`; its exact command
+  `python -m pytest -q tests/test_kbase_release_consumer.py
+  tests/test_decision_engine.py tests/test_claim_verifier_routing.py
+  tests/test_claim_verifier_quota_query_cache.py tests/test_knowledge_runtime.py
+  tests/test_dedao_kbase_sync.py` passed `138 passed in 9.38s`, followed by the
+  four-file `python -m py_compile`, range diff, and clean-status checks;
+- a fresh remote-main ancestry check passed and the explicit main push advanced
+  `c3324fec..7ed622fa`; no force push or second push URL was used;
+- production preflight found only the deployment script's expected prior
+  frontend build residue plus untracked runtime data. The script's scope was
+  inspected before `bash deploy/server-deploy.sh main` ran; it preserved
+  runtime data, built and verified `111` manifest resources, atomically switched
+  `static/react-app` to `react-app-7ed622fa`, verified nine public assets, and
+  passed the anonymous-auth `401` check;
+- public `/api/deploy-health` reports `ok=true`, database and scheduler healthy,
+  and frontend/backend Git SHA `7ed622fa`; systemd reports `active`,
+  `ExecMainStatus=0`, and `NRestarts=0`.
+
+Proofroom pilot import and feedback closure:
+
+- the first post-fix `sync_kbase_agent_packages` run returned one package, one
+  release, five claims, four chunks, four citations, one skipped superseded
+  package, and cursor `book-agent-clinical-trials-truth@1.1.0`;
+- an immediate identical replay returned the same logical counts. The database
+  remains exactly one package, one release, five claims, four chunks, four
+  citations, and `19` stable links; KBase contains one imported receipt and one
+  distinct receipt idempotency key for this consumer and release;
+- `send_kbase_release_feedback` sent only outcome `used`, opaque `claim-1`, and
+  a deterministic event fingerprint. Replaying it returned the same feedback
+  ID. Assessment is `healthy`, `reverify_required=false`, with no trigger
+  outcomes. The release's aggregate `used=2` includes one unrelated historical
+  Health smoke from July 12 plus this Proofroom event, not a duplicate write;
+- no query text, user data, source body, credential, or local path entered the
+  receipt or feedback payload.
+
+Health hold/isolation verification:
+
+- the explicit unscheduled Celery task was invoked synchronously with
+  `sync_dedao_kbase_agent_packages_draft.apply().get()` using the production
+  process environment. It returned `status=held`, `mode=rebuild`,
+  `package_count=0`, `serving_allowed=false`, and blocking reason
+  `human_domain_review_required`;
+- v1.0.0 was held for `stale` and `non_evidence_only`; published v1.1.0 was held
+  for `non_evidence_only`. The canonical serving artifact fingerprint was
+  identical before and after, and the Health-owned audit count advanced from
+  zero to one with audit status `held`;
+- no serving-index, diagnosis, prescription, dosage, tool-execution, or
+  personal-data write occurred. Health review and safety ownership remained
+  outside KBase;
+- public `/api/v1/health` reports API, database, Redis, and Celery healthy;
+  backend, Celery worker, and Celery beat are active with `ExecMainStatus=0` and
+  `NRestarts=0`; `backend/scripts/system_health_score.py --skip-tests --url
+  http://localhost:8000 --json` returned `60/60`, `pass=true`, and the public
+  skills manifest contains the expected `22` skills.
+
+Fresh final G3 verification:
+
+- KBase clean `main@6643420`: `npm --prefix frontend ci --no-audit --no-fund`
+  and `npm --prefix frontend run build` passed with only existing warnings;
+  `go test ./...` passed, including backend app `15.372s`, services `6.416s`,
+  utils `5.168s`, server `2.754s`, source agent `2.896s`, system map `3.377s`,
+  and WC Plus agent `4.457s`; `go test -race ./backend/app
+  ./cmd/kbase-server -count=1` passed in `19.910s` and `3.041s` with only the
+  existing macOS linker warnings;
+- every desktop and Web smoke, `node --check frontend-web/app.js`, all six
+  knowledge/evaluation/consumer/packaging smokes, three Agent Schema parses,
+  system-map drift, privacy smoke, `git diff --check`, and clean status passed;
+- Proofroom clean `main@7ed622fa`: the six-suite matrix passed
+  `138 passed in 9.38s`; compilation, diff, and clean status passed;
+- the first Health matrix attempt was not counted because the clean deployment
+  clone had no test database override and collection exited `4` against a
+  nonexistent local PostgreSQL role. A diagnostic SQLite rerun inherited the
+  clone's production review-directory setting and reported
+  `3 failed, 232 passed`; all three failures selected that production path
+  instead of the monkeypatched temporary workspace;
+- the exact CI-safe Health Gate explicitly used
+  `DATABASE_URL=sqlite:///:memory:`, `TZ=Asia/Shanghai`,
+  `DEDAO_KBASE_REVIEW_ARTIFACT_DIR=''`, and `PYTHONPATH=backend`. The eleven-file
+  release matrix then passed `235 passed, 7 warnings in 49.71s`; three-file
+  compilation, both required `ruff` commands, document drift,
+  `git diff --check`, and clean status passed on exact `main@f58925b8`.
+
+Final online verification:
+
+- KBase public health is OK and systemd is active with zero restarts. v1.0.0
+  remains `superseded`; v1.1.0 remains `published` with evaluation
+  `passed=true` and all ten metrics;
+- a fresh authenticated search returned one result with one citation. A fresh
+  real chat returned `completed` on `MiniMax-M2.5` with one citation; trace
+  `agent-run-3cf7633a335759fb87fb1cc40b04af20` contains one retrieval, normalized
+  release fingerprints, a completed final outcome, and none of
+  `source_body`, `private_prompt`, `consumer_user_id`, or `credentials`;
+- Proofroom public deploy health reports exact SHA `7ed622fa`; the final local
+  projection is `1/1/5/4/4` for package/release/claim/chunk/citation;
+- KBase feedback assessment remains healthy and its Proofroom imported receipt
+  remains one row with one idempotency key; Health remains healthy after the
+  explicit hold task with its serving fingerprint unchanged.
+
+No structural source inventory changed in the final Proofroom remediation or
+checkpoint documentation, so no system-map artifact was regenerated. Privacy
+smoke and `git diff --check` remain mandatory for the final dossier commit and
+push.
 
 ## Decisions
 
