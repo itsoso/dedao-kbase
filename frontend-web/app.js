@@ -1,4 +1,5 @@
 const app = document.querySelector("#app");
+let readerAssetObjectURLs = [];
 
 const tokenKeys = [
   "kbase.token",
@@ -2229,14 +2230,20 @@ function renderCourseMarkdown(markdown) {
     if (/^(?:-{3,}|\*{3,}|_{3,}|✵)$/.test(block)) {
       return `<hr class="dedao-course-article__divider">`;
     }
-    const imageMatch = block.match(/^!\[([^\]\n]*)\]\((https?:\/\/[^\s)]+)\)$/i);
+    const imageMatch = block.match(/^!\[([^\]\n]*)\]\(([^\s)]+)\)$/i);
     if (imageMatch) {
       const alt = imageMatch[1] || "";
       const src = imageMatch[2] || "";
+      const privateSourceAsset = /^\/api\/source-assets\/[a-f0-9]{64}$/.test(src);
+      const publicImage = /^https?:\/\/[^\s]+$/i.test(src);
+      if (!privateSourceAsset && !publicImage) {
+        return `<p>${renderInlineMarkdown(block)}</p>`;
+      }
       return `
-        <figure class="dedao-course-article__image">
-          <img src="${escapeAttribute(src)}" alt="${escapeAttribute(alt)}" loading="lazy">
+        <figure class="dedao-course-article__image${privateSourceAsset ? " is-loading" : ""}">
+          <img ${privateSourceAsset ? `data-private-src="${escapeAttribute(src)}"` : `src="${escapeAttribute(src)}"`} alt="${escapeAttribute(alt)}" loading="lazy">
           ${alt && alt !== src ? `<figcaption>${escapeHTML(alt)}</figcaption>` : ""}
+          ${privateSourceAsset ? '<span class="reader-page__image-status">图片加载中</span>' : ""}
         </figure>
       `;
     }
@@ -2258,6 +2265,54 @@ function renderCourseMarkdown(markdown) {
     }
     return `<p>${lines.map((line) => renderInlineMarkdown(line)).join("<br>")}</p>`;
   }).join("");
+}
+
+function releaseReaderAssetObjectURLs() {
+  readerAssetObjectURLs.forEach((url) => URL.revokeObjectURL(url));
+  readerAssetObjectURLs = [];
+}
+
+async function loadPrivateSourceAssets(container = app) {
+  const images = Array.from(container.querySelectorAll("img[data-private-src]"));
+  if (!images.length) {
+    return;
+  }
+  const token = getToken() || await ensureBrowserSessionToken();
+  await Promise.allSettled(images.map(async (image) => {
+    const source = image.dataset.privateSrc || "";
+    const figure = image.closest("figure");
+    const status = figure?.querySelector(".reader-page__image-status");
+    try {
+      const headers = new Headers();
+      headers.set("Accept", "image/*");
+      if (token) {
+        setAuthorizationHeader(headers, token);
+      }
+      const response = await fetch(source, {
+        headers,
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      if (!String(blob.type || "").startsWith("image/")) {
+        throw new Error("invalid image response");
+      }
+      const objectURL = URL.createObjectURL(blob);
+      readerAssetObjectURLs.push(objectURL);
+      image.src = objectURL;
+      image.removeAttribute("data-private-src");
+      figure?.classList.remove("is-loading");
+      status?.remove();
+    } catch (error) {
+      figure?.classList.remove("is-loading");
+      figure?.classList.add("is-error");
+      if (status) {
+        status.textContent = `图片加载失败：${error instanceof Error ? error.message : String(error)}`;
+      }
+    }
+  }));
 }
 
 function resetKnowledgeAnalysis(prompt = "") {
@@ -2466,6 +2521,7 @@ async function publishKnowledgeCandidate() {
 }
 
 function renderReader(payload) {
+  releaseReaderAssetObjectURLs();
   const book = payload.book || {};
   const chapters = Array.isArray(payload.chapters) ? payload.chapters : [];
   const claims = Array.isArray(payload.claims) ? payload.claims : [];
@@ -2482,8 +2538,8 @@ function renderReader(payload) {
   const claimItems = claims.slice(0, 8).map((claim) => (
     `<li>${escapeHTML(claim.text || claim.claim || claim.summary || "")}</li>`
   )).join("");
-  const chunkItems = chunks.slice(0, 4).map((chunk) => (
-    `<p>${escapeHTML(chunk.text || chunk.content || "")}</p>`
+  const chunkItems = chunks.map((chunk) => (
+    `<section class="reader-page__chunk">${renderCourseMarkdown(chunk.text || chunk.content || "")}</section>`
   )).join("");
 
   app.className = "reader-shell";
@@ -2508,6 +2564,7 @@ function renderReader(payload) {
       </article>
     </main>
   `;
+  void loadPrivateSourceAssets(app);
 }
 
 function renderError(message) {

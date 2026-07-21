@@ -53,4 +53,15 @@ assert.match(rendered, /<a href="https:\/\/example\.com\/report"[^>]*>来源<\/a
 assert.ok(!rendered.includes("<script>"), "Markdown renderer must not emit raw scripts");
 assert.match(rendered, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
 
+const assetHash = "cd4512109f46255931291b68e04218e3a6cb82c204cad609a90c5be9419bf3e6";
+const privateImage = context.renderCourseMarkdown(`![章节配图](/api/source-assets/${assetHash})`);
+assert.match(privateImage, new RegExp(`data-private-src="/api/source-assets/${assetHash}"`));
+assert.doesNotMatch(privateImage, /<img\s+src=/, "private images must not issue unauthenticated native requests");
+
+const unsafeImage = context.renderCourseMarkdown("![危险图片](javascript:alert(1))");
+assert.ok(!unsafeImage.includes("<img"), "Markdown renderer must reject unsafe image URLs");
+assert.ok(js.includes("loadPrivateSourceAssets"), "reader should hydrate private source images with authenticated fetches");
+assert.ok(js.includes('headers.set("Accept", "image/*")'), "private image fetches should request image content");
+assert.ok(js.includes("setAuthorizationHeader(headers, token)"), "private image fetches should include bearer auth");
+
 console.log("markdown render smoke passed");

@@ -3309,6 +3309,57 @@ a.button {
   padding-left: 22px;
 }
 
+.reader-page__chunk + .reader-page__chunk {
+  margin-top: 26px;
+}
+
+.reader-page__chunk h2,
+.reader-page__chunk h3,
+.reader-page__chunk h4 {
+  margin: 28px 0 12px;
+  color: #25231f;
+  line-height: 1.35;
+}
+
+.reader-page__chunk img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+
+.reader-page__chunk figure {
+  margin: 24px 0;
+  text-align: center;
+}
+
+.reader-page__chunk figcaption,
+.reader-page__image-status {
+  display: block;
+  margin-top: 8px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.reader-page__chunk figure.is-loading {
+  min-height: 120px;
+  border: 1px solid rgba(141, 132, 117, 0.18);
+  border-radius: 8px;
+  padding: 44px 16px;
+}
+
+.reader-page__chunk figure.is-error {
+  border: 1px solid rgba(161, 58, 37, 0.18);
+  border-radius: 8px;
+  padding: 18px;
+  background: rgba(161, 58, 37, 0.05);
+}
+
+.reader-page__chunk figure.is-error .reader-page__image-status {
+  color: #a13a25;
+}
+
 .reader-error {
   display: grid;
   place-items: center;
