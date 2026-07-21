@@ -3,10 +3,48 @@ package app
 import (
 	"encoding/json"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestResolveAgentClaimCitationIDsIsDeterministicAndPrefersDirectIDs(t *testing.T) {
+	citations := []BookKnowledgeCitation{
+		{CitationID: "citation-b", ChunkID: "multi-chunk"},
+		{CitationID: "shared-chunk", ChunkID: "other-chunk"},
+		{CitationID: "citation-a", ChunkID: "multi-chunk"},
+		{CitationID: "citation-other", ChunkID: "shared-chunk"},
+	}
+	for _, testCase := range []struct {
+		name       string
+		references []string
+		want       []string
+	}{
+		{
+			name:       "direct citation ID wins over a same-named chunk",
+			references: []string{"shared-chunk"},
+			want:       []string{"shared-chunk"},
+		},
+		{
+			name:       "chunk expansion preserves release order and de-duplicates",
+			references: []string{"multi-chunk", "multi-chunk", "citation-b"},
+			want:       []string{"citation-b", "citation-a"},
+		},
+		{
+			name:       "unknown references remain available for fail-closed filtering",
+			references: []string{"unknown-reference"},
+			want:       []string{"unknown-reference"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := resolveAgentClaimCitationIDs(citations, testCase.references)
+			if !reflect.DeepEqual(got, testCase.want) {
+				t.Fatalf("resolved = %#v, want %#v", got, testCase.want)
+			}
+		})
+	}
+}
 
 func TestBookKnowledgeMCPAdvertisesOnlyScopedReadOnlyAgentTools(t *testing.T) {
 	server := NewBookKnowledgeMCPServer(NewBookKnowledgeStore(t.TempDir()))
@@ -40,6 +78,9 @@ func TestBookKnowledgeMCPAdvertisesOnlyScopedReadOnlyAgentTools(t *testing.T) {
 func TestBookKnowledgeMCPReadsOnlyPinnedPackageRelease(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	release := agentPackageTestRelease()
+	// Analysis generated from real source packages cites chunk IDs. Agent Package
+	// consumers must resolve those references to the pinned citation IDs.
+	release.Analysis.Claims[0].CitationIDs = []string{"chunk-1"}
 	release.Citations[0].SourceHTML = "private-source-marker"
 	release.Citations[0].SourceAccount = "private-account-marker"
 	if err := store.saveKnowledgeRelease(release); err != nil {
@@ -91,7 +132,8 @@ func TestBookKnowledgeMCPReadsOnlyPinnedPackageRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(claimRaw), `"statement":"Synthetic grounded statement"`) {
+	if !strings.Contains(string(claimRaw), `"statement":"Synthetic grounded statement"`) ||
+		!strings.Contains(string(claimRaw), `"citation_ids":["citation-1"]`) {
 		t.Fatalf("claim = %s", claimRaw)
 	}
 }

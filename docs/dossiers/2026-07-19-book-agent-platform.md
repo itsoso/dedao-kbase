@@ -1838,6 +1838,70 @@ Online verification:
 G6 remains pending because no pilot Agent Package has yet been evaluated,
 published, imported into Proofroom, or held/imported as a Health review draft.
 
+## G6 pilot publication preflight and citation-resolution remediation
+
+**Decision: G6 remains BLOCKED at the evaluation input Gate; no Agent Package
+was evaluated or published.** The only production Knowledge Release is
+authorized for `standard` use, so the intended pilot disposition is Proofroom
+import plus a Health `non_evidence_only` hold. It will not be relabeled as
+medical evidence.
+
+Read-only production inspection found one release,
+`release-43a7dbb5062e51e383597c1452dfe5b187a2ce8b78690915f18cb1bc8819bcbb`,
+with four release citations and five claims. No source body was printed or
+copied into the repository. A transient private-server generator attempted to
+build and locally pre-evaluate a lexical, read-only pilot package containing
+all ten required evaluation metrics. It failed before writing its output:
+
+```text
+release has no claim with a resolvable citation
+FAIL github.com/yann0917/dedao-gui/backend/app
+```
+
+Identifier-only inspection showed the historical analysis claims correctly
+reference `source-4f7d471215fe4cbc-chunk-1`, while the immutable release
+citations use IDs such as `source-4f7d471215fe4cbc-citation-1` and point back
+to that chunk. Quality validation permits both chunk and citation references,
+but the new Agent runtime filtered only direct citation IDs. The failed Gate
+was therefore returned upstream; no evaluation report, package, receipt,
+consumer import, or feedback event was created.
+
+TDD remediation status:
+
+- RED: `go test -v ./backend/app -run
+  '^TestBookKnowledgeMCPReadsOnlyPinnedPackageRelease$' -count=1` failed with
+  retrieval, retrieval-precision, citations, faithfulness, and task-completion
+  all scoring zero after the fixture claim was changed to the production-form
+  chunk reference;
+- implementation resolves a claim reference through immutable release
+  citations by exact citation ID first, then by chunk ID, preserving release
+  order and de-duplicating IDs. Unknown references remain fail-closed at the
+  existing package allowlist filter. Both `agent.search` and `agent.get_claim`
+  use the same resolver;
+- GREEN: the focused MCP test passed in `1.729s`; the broader Agent
+  Package/MCP selection passed in `4.974s`;
+- `go test ./...` passed, including backend app `18.781s`, services `7.602s`,
+  utils `4.256s`, KBase server `2.948s`, source agent `2.746s`, system map
+  `3.058s`, and WC Plus agent `2.682s`;
+- `go test -race ./backend/app ./cmd/kbase-server` passed in `22.130s` and
+  `3.111s`, with only the existing macOS linker warnings;
+- knowledge contract/evaluation, Proof consumer, Health evidence,
+  source-agent packaging, WC Plus packaging, and system-map smokes passed;
+  privacy smoke and `git diff --check` passed;
+- independent G4 review returned GO with no Critical, High, or Medium finding.
+  The reviewer independently passed focused MCP tests in `2.905s`, MCP plus
+  Agent Runtime tests in `1.697s`, MCP race tests in `3.239s`, `gofmt -d`,
+  privacy smoke, and `git diff --check`; the only Low suggestion was to lock
+  one-to-many ordering/de-duplication and direct-ID precedence in tests;
+- those suggested table-driven regressions were added. Focused normal tests
+  passed in `1.760s` and focused race tests passed in `2.987s`, again with only
+  the existing macOS linker warning;
+- no structural source inventory changed, so system-map artifacts were not
+  regenerated.
+
+The remediation has not yet been committed, pushed, or deployed. G6 remains
+blocked until clean-main rollout and the complete pilot sequence pass.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.

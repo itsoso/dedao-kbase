@@ -183,8 +183,9 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 		claimID := stringArgument(input, "claim_id")
 		for _, claim := range release.Analysis.Claims {
 			if claim.ID == claimID {
-				filtered := make([]string, 0, len(claim.CitationIDs))
-				for _, citationID := range claim.CitationIDs {
+				resolved := resolveAgentClaimCitationIDs(release.Citations, claim.CitationIDs)
+				filtered := make([]string, 0, len(resolved))
+				for _, citationID := range resolved {
 					if allowedCitations[citationID] {
 						filtered = append(filtered, citationID)
 					}
@@ -227,6 +228,44 @@ func filterAgentScopedSearchResults(results []AgentScopedSearchResult, allowed m
 		filteredResults = append(filteredResults, result)
 	}
 	return filteredResults
+}
+
+func resolveAgentClaimCitationIDs(citations []BookKnowledgeCitation, references []string) []string {
+	byCitationID := make(map[string]string, len(citations))
+	byChunkID := make(map[string][]string, len(citations))
+	for _, citation := range citations {
+		citationID := strings.TrimSpace(citation.CitationID)
+		if citationID == "" {
+			continue
+		}
+		byCitationID[citationID] = citationID
+		if chunkID := strings.TrimSpace(citation.ChunkID); chunkID != "" {
+			byChunkID[chunkID] = append(byChunkID[chunkID], citationID)
+		}
+	}
+	resolved := make([]string, 0, len(references))
+	seen := make(map[string]bool, len(references))
+	appendID := func(citationID string) {
+		if citationID != "" && !seen[citationID] {
+			seen[citationID] = true
+			resolved = append(resolved, citationID)
+		}
+	}
+	for _, reference := range references {
+		reference = strings.TrimSpace(reference)
+		if citationID := byCitationID[reference]; citationID != "" {
+			appendID(citationID)
+			continue
+		}
+		if citationIDs := byChunkID[reference]; len(citationIDs) > 0 {
+			for _, citationID := range citationIDs {
+				appendID(citationID)
+			}
+			continue
+		}
+		appendID(reference)
+	}
+	return resolved
 }
 
 func searchAgentReleaseClaims(release KnowledgeRelease, query string, limit int) []AgentScopedSearchResult {
@@ -304,7 +343,7 @@ func searchAgentReleaseClaimsWithStrategy(
 		}
 		results = append(results, AgentScopedSearchResult{
 			ClaimID: claim.ID, Statement: claim.Statement,
-			CitationIDs: append([]string(nil), claim.CitationIDs...),
+			CitationIDs: resolveAgentClaimCitationIDs(release.Citations, claim.CitationIDs),
 			Score:       score,
 		})
 	}
