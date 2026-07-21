@@ -223,3 +223,22 @@ Decision: PASS.
   `panic|fatal|error|failed` lines.
 
 Decision: PASS.
+
+## Post-deployment usability hardening
+
+- Follow-up public route check showed `https://kbase.executor.life/`,
+  `/operations`, `/app.js`, and `/styles.css` return HTTP `401` without browser
+  Basic Auth, while `/health` remains public. Server-local checks against
+  `127.0.0.1:8719` returned `200` for the same static routes. Nginx config
+  confirms `location /` intentionally uses `auth_basic "dedao-kbase"` and
+  `/api/` remains bearer-protected. Decision: no anonymous static access change.
+- Found a real browser-cache risk: `frontend-web/index.html` still referenced
+  `/app.js?v=20260721-pipeline-timeout` and
+  `/styles.css?v=20260721-pipeline-timeout`. TDD:
+  changed `frontend-web/scripts/book-knowledge-web-smoke.mjs` to require
+  `20260721-operations-console`; RED confirmed the old index failed; then
+  updated `frontend-web/index.html` to the new cache version.
+- Verification after cache-bust fix:
+  `node frontend-web/scripts/book-knowledge-web-smoke.mjs &&
+  node frontend-web/scripts/knowledge-operations-console-smoke.mjs &&
+  node --check frontend-web/app.js` — PASS.
