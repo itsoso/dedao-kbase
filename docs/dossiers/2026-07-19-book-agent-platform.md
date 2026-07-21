@@ -2190,6 +2190,19 @@ Final online verification:
   remains one row with one idempotency key; Health remains healthy after the
   explicit hold task with its serving fingerprint unchanged.
 
+Post-close concurrency audit:
+
+- after the exact `f58925b8` Health deployment and G6 checks completed, Health
+  `origin/main` advanced to `0fa40389` through unrelated agenda, Agent Runtime
+  write-reconciliation, deployment-script, CI, mobile, and generated-map work;
+- `f58925b8` is an ancestor of `0fa40389`, and the Book Agent Health consumer,
+  lifecycle task, and focused consumer test are byte-for-byte unchanged across
+  that range;
+- those concurrent changes were not automatically deployed under this
+  feature's authority. The G6 evidence remains tied to the exact clean-main
+  revision actually tested and deployed, `f58925b8`, rather than claiming the
+  production host equals a later unreviewed main.
+
 No structural source inventory changed in the final Proofroom remediation or
 checkpoint documentation, so no system-map artifact was regenerated. Privacy
 smoke and `git diff --check` remain mandatory for the final dossier commit and
