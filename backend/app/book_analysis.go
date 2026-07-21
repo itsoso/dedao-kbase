@@ -13,6 +13,7 @@ import (
 const (
 	bookAnalysisVersion       = "1"
 	bookAnalysisPromptVersion = "structured-v1"
+	bookAnalysisMaxTokens     = 4096
 
 	BookAnalysisPending = "pending"
 	BookAnalysisRunning = "running"
@@ -153,6 +154,9 @@ func GenerateBookAnalysisManifestWithClient(
 	}
 	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
 	applyStructuredQwenThinkingPolicy(&cfg)
+	if cfg.MaxTokens < bookAnalysisMaxTokens {
+		cfg.MaxTokens = bookAnalysisMaxTokens
+	}
 
 	prompt := `请对当前文章做结构化分析。只输出一个 JSON 对象，不要输出解释文字或 Markdown 围栏。结构必须为：
 {"summary":"核心摘要","claims":[{"id":"claim-1","statement":"可验证结论","citation_ids":["来源 ID"],"confidence":0.0,"scope":["适用范围"],"risk_level":"low|medium|high"}],"risks":[{"id":"risk-1","description":"风险与局限","citation_ids":["来源 ID"],"severity":"low|medium|high"}],"actions":[{"id":"action-1","description":"阅读或验证行动","citation_ids":["来源 ID"],"kind":"read|verify|monitor"}]}

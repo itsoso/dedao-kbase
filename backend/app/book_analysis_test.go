@@ -80,7 +80,7 @@ func TestGenerateBookAnalysisManifestPersistsGroundedResult(t *testing.T) {
 	}
 }
 
-func TestGenerateBookAnalysisManifestDisablesThinkingForQwenStructuredOutput(t *testing.T) {
+func TestGenerateBookAnalysisManifestAppliesQwenStructuredRequestPolicy(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	store := NewBookKnowledgeStore(t.TempDir())
 	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
@@ -97,6 +97,9 @@ func TestGenerateBookAnalysisManifestDisablesThinkingForQwenStructuredOutput(t *
 	field := reflect.ValueOf(client.cfg).FieldByName("EnableThinking")
 	if !field.IsValid() || field.IsNil() || field.Elem().Bool() {
 		t.Fatalf("structured Qwen analysis thinking config = %#v, want explicit false", client.cfg)
+	}
+	if client.cfg.MaxTokens < bookAnalysisMaxTokens {
+		t.Fatalf("structured Qwen analysis max tokens = %d, want at least %d", client.cfg.MaxTokens, bookAnalysisMaxTokens)
 	}
 }
 

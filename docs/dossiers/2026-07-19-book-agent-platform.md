@@ -2216,7 +2216,7 @@ push.
 
 ## Post-release incident: package article returns no result
 
-**Status:** LOCAL G3 AND G4 PASS; COMMIT/DEPLOY PENDING. Production diagnosis reproduced a browser-visible
+**Status:** SECOND LOCAL G3 AND G4 PASS; SECOND COMMIT/DEPLOY PENDING. Production diagnosis reproduced a browser-visible
 package page whose structured analysis manifest was `failed` with
 `context_canceled`; the matching Nginx log showed `POST
 /api/knowledge/pipeline/run` returning `504` after the configured upstream read
@@ -2265,6 +2265,49 @@ Exact commands and results so far:
   `node --check frontend-web/app.js`,
   `node frontend-web/scripts/book-knowledge-web-smoke.mjs`,
   `bash scripts/privacy-smoke.sh`, and `git diff --check`.
+- First commit and deploy attempt: commit `de7db54 fix(kbase): prevent qwen
+  pipeline timeouts` was pushed to `dedao-kbase/codex/book-agent-platform` and
+  fast-forwarded to `dedao-kbase/main`. Clean-main `go test ./... -timeout=180s`
+  passed; `node --check frontend-web/app.js && node
+  frontend-web/scripts/book-knowledge-web-smoke.mjs && bash
+  scripts/privacy-smoke.sh && git diff --check` passed.
+- Server-side deployment preflight for `de7db54`: source archive SHA-256
+  `f7c1183da7f491edecc10af8942959cc8ce8065b65bb86b071c832350421c5c6`;
+  `npm --prefix frontend ci --no-audit --no-fund` passed; `npm --prefix
+  frontend run build` passed with existing Vite large-chunk warnings; Linux CGO
+  `go test ./... -timeout=180s` passed; production binary SHA-256
+  `c9c2b0d7528e8cfef4fffa938cc469db66c68ef03ddeb23208a2fc9162ab6ee3`; isolated
+  health smoke passed.
+- First rollout for `de7db54`: local and public `/health` passed, systemd was
+  `active`, `ExecMainStatus=0`, `NRestarts=0`, binary hash matched, backups were
+  `/opt/dedao-kbase/bin/kbase-server.backup-de7db54-20260721121740` and
+  `/opt/dedao-kbase/frontend-web.backup-de7db54-20260721121740`.
+- First G6 target analysis retry for the reported package returned
+  `http_status=500 elapsed_seconds=29` with `structured analysis response is not
+  valid JSON: unexpected EOF`. This closed the original timeout symptom but did
+  not pass G6; the Gate was not bypassed.
+- Additional TDD remediation: `go test ./backend/app -run
+  TestGenerateBookAnalysisManifestAppliesQwenStructuredRequestPolicy
+  -count=1 -timeout=60s` — RED first because structured analysis `MaxTokens`
+  was `0`; GREEN after setting the analysis generator to request at least
+  `4096` output tokens.
+- Second local verification: `go test ./backend/app -count=1 -timeout=120s` —
+  PASS; `go test ./... -timeout=180s` — PASS; `node --check
+  frontend-web/app.js && node frontend-web/scripts/book-knowledge-web-smoke.mjs`
+  — PASS; `for script in frontend-web/scripts/*smoke*.mjs; do node "$script";
+  done` — PASS; `go test -race ./backend/app ./cmd/kbase-server -count=1
+  -timeout=180s` — PASS with existing macOS linker warnings; the six
+  knowledge/evaluation/consumer/packaging/system-map smoke scripts — PASS;
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Second G4 independent review `g4_incident_review_3` — PASS / Ready to merge:
+  Yes; no Critical or Important findings. Two Minor readability findings were
+  addressed by renaming the request-policy test and using
+  `bookAnalysisMaxTokens` in the assertion. Follow-up verification
+  `go test ./backend/app -run
+  'TestGenerateBookAnalysisManifestAppliesQwenStructuredRequestPolicy|TestTokenPlanChatClientUsesOpenAICompatibleRequest'
+  -count=1 -timeout=60s`, `go test ./backend/app -count=1 -timeout=120s`,
+  `bash scripts/system-map-smoke.sh`, `bash scripts/privacy-smoke.sh`, and `git
+  diff --check` all passed.
 
 No structural route, operation, command, or durable-object inventory changed.
 `docs/_generated/system-map.json` was regenerated because adding
