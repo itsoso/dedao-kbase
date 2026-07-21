@@ -130,6 +130,9 @@ const dedaoLibraryState = {
   ebookPackage: null,
   ebookDetailLoading: "",
   ebookDetailMessage: "",
+  audioDetail: null,
+  audioDetailLoading: "",
+  audioDetailMessage: "",
 };
 
 const sourceControlState = {
@@ -512,6 +515,19 @@ function getDedaoEbookRoute() {
   }
 }
 
+function getDedaoAudioRoute() {
+  const raw = getPathSegmentAfter(`${ROUTES.dedaoAudio}/`);
+  if (!raw) {
+    return null;
+  }
+  const params = new URLSearchParams(window.location.search);
+  try {
+    return { enid: decodeURIComponent(raw), aliasID: params.get("alias_id") || "" };
+  } catch {
+    return { enid: raw, aliasID: params.get("alias_id") || "" };
+  }
+}
+
 function getKnowledgeBookID() {
   const raw = getPathSegmentAfter(`${ROUTES.knowledgePackages}/`) || getPathSegmentAfter("/book-knowledge/");
   if (!raw) {
@@ -613,6 +629,14 @@ function buildDedaoCourseDetailURL(enid) {
 
 function buildDedaoEbookURL(bookID) {
   return bookID ? `${ROUTES.dedaoEbooks}/${encodeURIComponent(bookID)}` : "";
+}
+
+function buildDedaoAudioURL(enid, aliasID = "") {
+  if (!enid) {
+    return "";
+  }
+  const query = aliasID ? `?alias_id=${encodeURIComponent(aliasID)}` : "";
+  return `${ROUTES.dedaoAudio}/${encodeURIComponent(enid)}${query}`;
 }
 
 function buildBookReaderURL(packageID) {
@@ -823,6 +847,54 @@ function renderDedaoOdob() {
   renderDedaoLibrary("odob");
 }
 
+function renderDedaoAudioDetail(route = getDedaoAudioRoute()) {
+  const payload = dedaoLibraryState.audioDetail || {};
+  const detail = payload.detail || {};
+  const topics = Array.isArray(detail.topic_summary) ? detail.topic_summary : [];
+  const markdown = String(payload.markdown || "").trim();
+  const durationMinutes = Number(detail.duration || 0) > 0 ? `${Math.ceil(Number(detail.duration) / 60)} 分钟` : "-";
+  const topicRows = topics.map((topic) => `
+    <section class="dedao-audio-detail__topic">
+      <h3>${escapeHTML(topic.title || "主题内容")}</h3>
+      <div>${renderSimpleMarkdown(topic.sub_title || "")}</div>
+    </section>
+  `).join("");
+  renderShell(`
+    <main class="dedao-audio-detail">
+      <section class="dedao-audio-detail__header">
+        <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoAudio)}">返回听书书架</a>
+        <div class="dedao-audio-detail__identity">
+          ${detail.icon ? `<img src="${escapeAttribute(detail.icon)}" alt="${escapeAttribute(detail.title || "听书封面")}">` : ""}
+          <div>
+            <p class="web-kicker">听书详情</p>
+            <h1>${escapeHTML(detail.title || route?.enid || "得到听书")}</h1>
+            <p>${escapeHTML(detail.audio_summary || "查看听书介绍与文稿。")}</p>
+          </div>
+        </div>
+        <dl>
+          <div><dt>时长</dt><dd>${escapeHTML(durationMinutes)}</dd></div>
+          <div><dt>学习</dt><dd>${escapeHTML(detail.learn_count_desc || "-")}</dd></div>
+          <div><dt>解读者</dt><dd>${escapeHTML(detail.agency_detail?.qcg_member_name || detail.agency_detail?.name || "-")}</dd></div>
+        </dl>
+      </section>
+      ${dedaoLibraryState.audioDetailLoading ? '<p class="web-status">正在加载听书内容...</p>' : ""}
+      ${dedaoLibraryState.audioDetailMessage ? `<p class="web-status">${escapeHTML(dedaoLibraryState.audioDetailMessage)}</p>` : ""}
+      ${detail.title ? `
+        <section class="dedao-audio-detail__content">
+          <aside>
+            <h2>内容提要</h2>
+            ${topicRows || renderSimpleMarkdown(detail.audio_summary || "暂无主题摘要。")}
+          </aside>
+          <article class="knowledge-web__answer dedao-course-article__body">
+            <p class="web-kicker">听书文稿</p>
+            ${markdown ? renderCourseMarkdown(markdown) : `<p>${escapeHTML(payload.transcript_error || "该听书暂未提供可读取文稿，仍可查看内容提要。")}</p>`}
+          </article>
+        </section>
+      ` : ""}
+    </main>
+  `, "odob");
+}
+
 function renderDedaoLibrary(category) {
   const cfg = dedaoLibraryConfig[category] || dedaoLibraryConfig.bauhinia;
   const state = dedaoLibraryState.pages[category] || dedaoLibraryState.pages.bauhinia;
@@ -837,7 +909,9 @@ function renderDedaoLibrary(category) {
       : (category === "bauhinia" ? buildDedaoCourseURL(item) : "");
     const detailHref = category === "bauhinia" && enid
       ? buildDedaoCourseDetailURL(enid)
-      : (enid ? `${cfg.path}/${encodeURIComponent(enid)}` : "");
+      : (category === "odob" && enid
+        ? buildDedaoAudioURL(enid, item.audio_detail?.alias_id || "")
+        : (enid ? `${cfg.path}/${encodeURIComponent(enid)}` : ""));
     return `
       <article class="dedao-course-card">
         <div class="dedao-course-card__top">
@@ -938,6 +1012,30 @@ async function loadDedaoLibrary(category) {
   } finally {
     state.loading = "";
     renderDedaoLibrary(category);
+  }
+}
+
+async function loadDedaoAudioDetail(route = getDedaoAudioRoute()) {
+  if (!route?.enid) {
+    dedaoLibraryState.audioDetailMessage = "听书链接缺少 enid。";
+    renderDedaoAudioDetail(route);
+    return;
+  }
+  dedaoLibraryState.audioDetail = null;
+  dedaoLibraryState.audioDetailLoading = "loading";
+  dedaoLibraryState.audioDetailMessage = "";
+  renderDedaoAudioDetail(route);
+  try {
+    const query = new URLSearchParams({ enid: route.enid });
+    if (route.aliasID) {
+      query.set("alias_id", route.aliasID);
+    }
+    dedaoLibraryState.audioDetail = await apiFetch(`/api/dedao/audio?${query.toString()}`);
+  } catch (error) {
+    dedaoLibraryState.audioDetailMessage = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoLibraryState.audioDetailLoading = "";
+    renderDedaoAudioDetail(route);
   }
 }
 
@@ -5759,7 +5857,13 @@ async function boot() {
     await loadDedaoLibrary("ebook");
     return;
   }
-  if (routePathname === ROUTES.dedaoAudio || routePathname.startsWith(`${ROUTES.dedaoAudio}/`)) {
+  if (routePathname.startsWith(`${ROUTES.dedaoAudio}/`)) {
+    const audioRoute = getDedaoAudioRoute();
+    renderDedaoAudioDetail(audioRoute);
+    await loadDedaoAudioDetail(audioRoute);
+    return;
+  }
+  if (routePathname === ROUTES.dedaoAudio) {
     renderDedaoOdob();
     await loadDedaoLibrary("odob");
     return;

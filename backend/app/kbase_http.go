@@ -46,6 +46,8 @@ type DedaoLibraryService interface {
 	CourseInfo(enid string) (*services.CourseInfo, error)
 	ArticleList(enid, chapterID string, count, maxID int) (*services.ArticleList, error)
 	ArticleDetail(enid string) (*services.ArticleDetail, error)
+	AudioDetail(enid string) (*services.AudioInfoResp, error)
+	OdobArticleDetail(aliasID string) (*services.ArticleDetail, error)
 }
 
 type kbaseHTTPHandler struct {
@@ -161,6 +163,14 @@ func (defaultDedaoLibrary) ArticleList(enid, chapterID string, count, maxID int)
 
 func (defaultDedaoLibrary) ArticleDetail(enid string) (*services.ArticleDetail, error) {
 	return ArticleDetail(enid)
+}
+
+func (defaultDedaoLibrary) AudioDetail(enid string) (*services.AudioInfoResp, error) {
+	return AudioDetail(enid)
+}
+
+func (defaultDedaoLibrary) OdobArticleDetail(aliasID string) (*services.ArticleDetail, error) {
+	return OdobArticleDetail(aliasID)
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -354,6 +364,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/dedao/article" {
 		h.handleDedaoArticle(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/audio" {
+		h.handleDedaoAudio(w, r)
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -671,6 +685,53 @@ func (h *kbaseHTTPHandler) handleDedaoArticle(w http.ResponseWriter, r *http.Req
 	writeHTTPJSON(w, http.StatusOK, map[string]any{
 		"detail":   detail,
 		"markdown": ContentsToMarkdown(contents),
+	})
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAudio(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	enid := strings.TrimSpace(r.URL.Query().Get("enid"))
+	if enid == "" {
+		writeHTTPError(w, http.StatusBadRequest, "missing enid")
+		return
+	}
+	detail, err := h.dedaoLibrary.AudioDetail(enid)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if detail == nil {
+		writeHTTPError(w, http.StatusNotFound, "audio not found")
+		return
+	}
+	aliasID := strings.TrimSpace(r.URL.Query().Get("alias_id"))
+	if aliasID == "" {
+		aliasID = strings.TrimSpace(detail.AudioInfo.AudioID)
+	}
+	markdown := ""
+	transcriptError := ""
+	if aliasID != "" {
+		transcript, transcriptErr := h.dedaoLibrary.OdobArticleDetail(aliasID)
+		if transcriptErr != nil {
+			transcriptError = transcriptErr.Error()
+		} else if transcript != nil {
+			var contents []services.Content
+			if parseErr := json.Unmarshal([]byte(transcript.Content), &contents); parseErr != nil {
+				transcriptError = fmt.Sprintf("parse audio transcript: %v", parseErr)
+			} else {
+				markdown = ContentsToMarkdown(contents)
+			}
+		}
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"detail":           detail.AudioInfo,
+		"quality":          detail.Quality,
+		"alias_id":         aliasID,
+		"markdown":         markdown,
+		"transcript_error": transcriptError,
 	})
 }
 

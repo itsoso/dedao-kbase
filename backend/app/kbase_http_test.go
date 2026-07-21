@@ -248,6 +248,11 @@ func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 		t.Fatalf("course article status=%d body=%s", article.Code, article.Body.String())
 	}
 
+	audio := requestKBase(handler, http.MethodGet, "/api/dedao/audio?enid=audio-enid&alias_id=audio-alias", "secret-token")
+	if audio.Code != http.StatusOK || !strings.Contains(audio.Body.String(), `"title":"得到听书详情"`) || !strings.Contains(audio.Body.String(), `"markdown":"# 听书文稿`) {
+		t.Fatalf("audio detail status=%d body=%s", audio.Code, audio.Body.String())
+	}
+
 	missingDetail := requestKBase(handler, http.MethodGet, "/api/dedao/course", "secret-token")
 	if missingDetail.Code != http.StatusBadRequest {
 		t.Fatalf("missing course detail enid status=%d body=%s", missingDetail.Code, missingDetail.Body.String())
@@ -1769,4 +1774,17 @@ func (fakeDedaoLibrary) ArticleDetail(enid string) (*services.ArticleDetail, err
 	return &services.ArticleDetail{
 		Content: `[{"type":"header","level":1,"text":"正文标题"}]`,
 	}, nil
+}
+
+func (fakeDedaoLibrary) AudioDetail(enid string) (*services.AudioInfoResp, error) {
+	return &services.AudioInfoResp{AudioInfo: services.AudioInfo{
+		AudioID:      "audio-alias",
+		Title:        "得到听书详情",
+		AudioSummary: "听书摘要",
+		TopicSummary: []services.TopicSummary{{Title: "核心内容", SubTitle: "主题摘要"}},
+	}}, nil
+}
+
+func (fakeDedaoLibrary) OdobArticleDetail(aliasID string) (*services.ArticleDetail, error) {
+	return &services.ArticleDetail{Content: `[{"type":"header","level":1,"text":"听书文稿"}]`}, nil
 }

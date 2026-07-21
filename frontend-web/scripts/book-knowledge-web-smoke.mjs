@@ -12,6 +12,7 @@ for (const marker of [
   "renderDedaoHome",
   "renderDedaoCourses",
   "renderDedaoEbooks",
+  "renderDedaoAudioDetail",
   "renderDedaoLibrary",
   "renderDedaoCourseDetail",
   "renderDedaoCourseArticles",
@@ -23,6 +24,7 @@ for (const marker of [
   "loadMoreDedaoCourseArticles",
   "loadDedaoCourseArticle",
   "loadDedaoEbookDetail",
+  "loadDedaoAudioDetail",
   "loadDedaoLibrary",
   "renderBookKnowledge",
   "knowledgeState",
@@ -35,6 +37,7 @@ for (const marker of [
   'getDedaoCourseDetailEnID()',
   'getDedaoCourseRoute()',
   'getDedaoEbookRoute()',
+  'getDedaoAudioRoute()',
   "routePathname === ROUTES.dedaoEbooks",
   "routePathname === ROUTES.knowledgePackages",
   "renderBookAgentPlatform",
@@ -68,6 +71,7 @@ for (const endpoint of [
   "/api/dedao/course?",
   "/api/dedao/course/articles?",
   "/api/dedao/article?",
+  "/api/dedao/audio?",
   "/api/books",
   "/api/search?",
   "/api/book-chat",
@@ -157,7 +161,7 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
-assert.ok(html.includes("20260721-reader-images"), "reader image fix should use a fresh browser cache version");
+assert.ok(html.includes("20260721-audio-detail"), "audio detail release should use a fresh browser cache version");
 assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
 assert.ok(js.includes('"/course": ROUTES.dedaoCourses'), "legacy course alias should be preserved");
 assert.ok(js.includes('"/ebook": ROUTES.dedaoEbooks'), "legacy ebook alias should be preserved");
@@ -171,6 +175,8 @@ assert.ok(js.includes('`${ROUTES.dedaoCourses}/${encodeURIComponent(courseID)}/a
 assert.ok(js.includes('`${ROUTES.dedaoCourses}/detail/${encodeURIComponent(enid)}`'), "subscribed course details should use the explicit canonical detail route");
 assert.ok(js.includes("加载更多"), "course detail should load more than the first page of articles");
 assert.ok(js.includes("课程正文"), "course article reader should render article body");
+assert.ok(js.includes("听书详情"), "audio detail route should render product details");
+assert.ok(js.includes("听书文稿"), "audio detail route should render the available transcript");
 assert.ok(js.includes("dedao-course-article__image"), "course article reader should render markdown images as images");
 assert.ok(js.includes("dedao-course-article__analysis"), "course article reader should expose TokenPlan analysis");
 assert.ok(js.includes("course-article-analysis-form"), "course article reader should include an article analysis form");
