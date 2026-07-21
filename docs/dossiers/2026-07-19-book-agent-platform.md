@@ -2216,7 +2216,7 @@ push.
 
 ## Post-release incident: package article returns no result
 
-**Status:** FINAL LOCAL G3 AND G4 PASS; FINAL COMMIT/DEPLOY PENDING. Production diagnosis reproduced a browser-visible
+**Status:** INCIDENT FIX COMPLETE — G3-G6 PASS on deployed KBase `aa4aa72`. Production diagnosis reproduced a browser-visible
 package page whose structured analysis manifest was `failed` with
 `context_canceled`; the matching Nginx log showed `POST
 /api/knowledge/pipeline/run` returning `504` after the configured upstream read
@@ -2378,6 +2378,29 @@ Exact commands and results so far:
   array element to be non-null and non-empty. Reviewer reran targeted
   scope/unknown-field tests, `bash scripts/privacy-smoke.sh`, `git diff
   --check`, and `bash scripts/system-map-smoke.sh`.
+- Final commit and deployment: commit `aa4aa72 fix(kbase): tolerate string
+  analysis scope` was pushed to `dedao-kbase/codex/book-agent-platform` and
+  fast-forwarded to `dedao-kbase/main`. Clean-main `go test ./... -timeout=180s`
+  passed; `node --check frontend-web/app.js && node
+  frontend-web/scripts/book-knowledge-web-smoke.mjs && bash
+  scripts/privacy-smoke.sh && git diff --check` passed. Server-side source
+  archive SHA-256 was
+  `6fa5d217f774dde72d05089e26b1ceffdbce03f033eed4b1351c06731999bebb`;
+  server-side frontend build and Linux CGO `go test ./... -timeout=180s`
+  passed; production binary SHA-256 was
+  `32d63221f7ee11f07340f3d8cebe899de72b84a25a99572434860a68a8f407bb`; isolated
+  health smoke passed; rollout retained
+  `/opt/dedao-kbase/bin/kbase-server.backup-aa4aa72-20260721124406` and
+  `/opt/dedao-kbase/frontend-web.backup-aa4aa72-20260721124406`.
+- Final G5/G6 online verification: local and public `/health` returned OK;
+  systemd reported `active`, `ExecMainStatus=0`, and `NRestarts=0`; deployed
+  `index.html` referenced `20260721-pipeline-timeout`; post-restart logs since
+  deployment had no panic/fatal/error/failed lines. Re-running the reported
+  package analysis returned `http_status=200 elapsed_seconds=29`, manifest
+  `status=ready`, model `qwen3.7-max`, payload present with `10` claims, `4`
+  risks, and `4` actions. The quality report returned `decision=pass` with six
+  checks, and the pipeline item advanced to `ready_to_publish` with no public
+  error code. No source body, prompt, token, or secret was written to Git.
 
 No structural route, operation, command, or durable-object inventory changed.
 `docs/_generated/system-map.json` was regenerated because adding
