@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** BLOCKED before G5; production publisher and semantic retrieval secrets are missing
+**Status:** KBase production G5 PASS; consumer deployment and G6 online verification pending
 
 ## Objective
 
@@ -33,11 +33,10 @@ prescription or dosage decisions, and personal-data write tools.
 - **G4 Review: PASS.** Fresh independent architecture and cross-consumer
   reviews returned GO on exact clean heads `eabd98e`, `c3324fec`, and
   `b7b1a610d`. No Critical, High, or Medium blockers remain.
-- **G5 Deployment health: PENDING.** No implementation has been deployed.
-- **G6 Online verification: BLOCKED.** Production KBase lacks the independent
-  publisher token and semantic retrieval configuration required to evaluate,
-  publish, and verify the pilot package. No secret was generated or written by
-  this execution.
+- **G5 Deployment health: IN PROGRESS.** KBase is deployed and healthy; consumer
+  deployment checks remain pending.
+- **G6 Online verification: PENDING.** Production publication and both consumer
+  flows still require exact online verification.
 
 ## Checkpoint: Tasks 1-2
 
@@ -1593,6 +1592,77 @@ repeated on 2026-07-20. Exact results:
 
 The blocker is unchanged. No secret values were read or printed, and no
 production mutation or deployment was attempted.
+
+## KBase production deployment checkpoint
+
+**Decision: KBase G5 PASS after one failed attempt was automatically rolled
+back and corrected upstream.** The user explicitly authorized server-local
+secret generation and production configuration. Secret values were never
+printed, copied into the repository, or written to this dossier.
+
+Embedding service and secret configuration:
+
+- production capacity check found x86-64, approximately 30 GiB RAM, 368 GiB
+  free disk, and active Docker; port `11434` and container name
+  `kbase-embedding` were unused;
+- official Ollama `0.32.0` was pulled and pinned to image digest
+  `sha256:57f573b47f1f71ebb445789f279fe3e596a8beab182f7cf486db9205bad87c5a`;
+- the container uses `restart=unless-stopped`, a persistent named model volume,
+  and publishes only `127.0.0.1:11434`;
+- `embeddinggemma:300m-bf16` was pulled and pinned to model digest
+  `85462619ee721b466c5927d109d4cb765861907d5417b9109caebc4e614679f1`
+  with reported size `621875917` bytes;
+- OpenAI-compatible Chinese batch probe — PASS: two results, 768 dimensions,
+  all finite and non-zero;
+- the server generated a random dedicated publisher token and embedding client
+  key locally. The environment atomically received the loopback endpoint,
+  provider `ollama-local`, pinned model/version, and both generated secrets;
+  presence checks passed, the publisher token differed from admin and source
+  tokens, and `/etc/dedao-kbase/kbase.env` remained `0600 root:root`.
+
+First deployment attempt and rollback:
+
+- a macOS cross-build made with `CGO_ENABLED=0` had SHA-256
+  `5e80ceb80faa3e5bb28002ed24742d8e9a39a18845c05f58131cda73b92a7a58`;
+- production startup failed closed with `go-sqlite3 requires cgo to work`;
+- the rollout transaction restored both the previous environment file and
+  previous binary, restarted the old service, and confirmed `/health` healthy;
+  no Gate was bypassed and this attempt was not counted as G5 PASS.
+
+Upstream correction and Linux verification:
+
+- the exact clean-main source archive for `a0a77ed` had SHA-256
+  `65346e0916c035f156c20cb25d895ded3871fa089589be3276cf84ca167f6768`;
+- official Go `1.23.12` Linux amd64 toolchain archive matched published SHA-256
+  `d3847fef834e9db11bf64e3fb34db9c04db14e068eeb064f49af747010454f90`;
+- the first Linux test process was stopped after diagnosis showed production
+  network SYN attempts to `proxy.golang.org` could not complete. Re-running
+  through reachable `https://goproxy.cn,direct` kept normal `go.sum` checksum
+  validation and passed `go test ./...`: backend app `11.346s`, services
+  `3.173s`, utils `0.455s`, KBase server `0.078s`, source agent `0.109s`,
+  system map `0.095s`, and WC Plus agent `0.163s`;
+- the Linux CGO production binary had SHA-256
+  `1165fd82ba978c455047a1265bb048195d99a2ce4489f42395246ba1c470298b`,
+  was dynamically linked only to the production glibc surface, and passed an
+  isolated service-user SQLite/health smoke before rollout.
+
+Successful rollout and G5 evidence:
+
+- the second atomic rollout succeeded with the Linux CGO binary; local and
+  public `/health` returned `{"ok":true,"service":"dedao-kbase"}`;
+- systemd reported `active`, `NRestarts=0`, and logs confirmed the Agent Package
+  publisher API was enabled with a dedicated token;
+- authorization probes returned anonymous package list `401`, consumer package
+  list `200`, consumer evaluation attempt `401`, and publisher-authenticated
+  invalid evaluation payload `400`, proving the dedicated privilege boundary
+  without creating an evaluation artifact;
+- the live local embedding probe returned one finite 768-dimensional vector;
+  Docker reported the pinned image running with the expected restart policy and
+  `ss` confirmed the endpoint listened only on loopback.
+
+KBase is healthy at G5. Proofroom and Health deployment verification plus the
+pilot publication/import/feedback sequence remain pending; G6 has not been
+claimed.
 
 ## Decisions
 
