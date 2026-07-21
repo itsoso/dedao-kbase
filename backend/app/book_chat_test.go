@@ -202,17 +202,20 @@ func TestBookKnowledgeChatPersistsHistory(t *testing.T) {
 
 func TestTokenPlanChatClientUsesOpenAICompatibleRequest(t *testing.T) {
 	var gotPath, gotAuth, gotModel string
+	var gotEnableThinking *bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
 		var payload struct {
-			Model    string                 `json:"model"`
-			Messages []BookKnowledgeMessage `json:"messages"`
+			Model          string                 `json:"model"`
+			Messages       []BookKnowledgeMessage `json:"messages"`
+			EnableThinking *bool                  `json:"enable_thinking"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatalf("Decode request returned error: %v", err)
 		}
 		gotModel = payload.Model
+		gotEnableThinking = payload.EnableThinking
 		if len(payload.Messages) != 2 {
 			t.Fatalf("messages = %#v, want 2", payload.Messages)
 		}
@@ -222,10 +225,12 @@ func TestTokenPlanChatClientUsesOpenAICompatibleRequest(t *testing.T) {
 	defer server.Close()
 
 	client := NewTokenPlanChatClient(server.Client())
+	enableThinking := false
 	answer, err := client.Chat(context.Background(), BookTokenPlanConfig{
-		APIKey:  "sk-test-token",
-		BaseURL: server.URL + "/compatible-mode/v1",
-		Model:   "qwen3.7-max",
+		APIKey:         "sk-test-token",
+		BaseURL:        server.URL + "/compatible-mode/v1",
+		Model:          "qwen3.7-max",
+		EnableThinking: &enableThinking,
 	}, []BookKnowledgeMessage{
 		{Role: "system", Content: "system"},
 		{Role: "user", Content: "user"},
@@ -244,6 +249,9 @@ func TestTokenPlanChatClientUsesOpenAICompatibleRequest(t *testing.T) {
 	}
 	if gotModel != "qwen3.7-max" {
 		t.Fatalf("model = %q", gotModel)
+	}
+	if gotEnableThinking == nil || *gotEnableThinking {
+		t.Fatalf("enable_thinking = %v, want explicit false", gotEnableThinking)
 	}
 }
 

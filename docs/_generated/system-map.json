@@ -916,7 +916,7 @@
     {
       "name": "BookKnowledgeChatContextStats",
       "file": "backend/app/book_chat.go",
-      "line": 72
+      "line": 73
     },
     {
       "name": "BookKnowledgeChatHistoryItem",
@@ -926,17 +926,17 @@
     {
       "name": "BookKnowledgeChatRequest",
       "file": "backend/app/book_chat.go",
-      "line": 37
+      "line": 38
     },
     {
       "name": "BookKnowledgeChatResponse",
       "file": "backend/app/book_chat.go",
-      "line": 55
+      "line": 56
     },
     {
       "name": "BookKnowledgeChatSource",
       "file": "backend/app/book_chat.go",
-      "line": 65
+      "line": 66
     },
     {
       "name": "BookKnowledgeChunk",
@@ -981,7 +981,7 @@
     {
       "name": "BookKnowledgeMessage",
       "file": "backend/app/book_chat.go",
-      "line": 32
+      "line": 33
     },
     {
       "name": "BookKnowledgeNotebookLMBridge",

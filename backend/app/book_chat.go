@@ -22,11 +22,12 @@ const (
 var defaultTokenPlanEnvFiles []string
 
 type BookTokenPlanConfig struct {
-	APIKey    string `json:"-"`
-	BaseURL   string `json:"base_url"`
-	Model     string `json:"model"`
-	Source    string `json:"source,omitempty"`
-	MaxTokens int    `json:"max_tokens,omitempty"`
+	APIKey         string `json:"-"`
+	BaseURL        string `json:"base_url"`
+	Model          string `json:"model"`
+	Source         string `json:"source,omitempty"`
+	MaxTokens      int    `json:"max_tokens,omitempty"`
+	EnableThinking *bool  `json:"enable_thinking,omitempty"`
 }
 
 type BookKnowledgeMessage struct {
@@ -158,6 +159,7 @@ func BookKnowledgeChatWithClient(
 		cfg.Model = normalizeBookTokenPlanModel(model)
 	}
 	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
+	applyStructuredQwenThinkingPolicy(&cfg)
 
 	pkg, err := store.LoadPackage(request.BookID)
 	if err != nil {
@@ -250,6 +252,7 @@ func ContextKnowledgeChatWithClient(
 		cfg.Model = normalizeBookTokenPlanModel(model)
 	}
 	cfg.Model = normalizeBookTokenPlanModel(cfg.Model)
+	applyStructuredQwenThinkingPolicy(&cfg)
 	sourceID := strings.TrimSpace(request.SourceID)
 	if sourceID == "" {
 		sourceID = "article"
@@ -326,6 +329,9 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 		"temperature": 0.2,
 		"max_tokens":  maxTokens,
 	}
+	if cfg.EnableThinking != nil {
+		payload["enable_thinking"] = *cfg.EnableThinking
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -377,6 +383,19 @@ func normalizeBookTokenPlanModel(model string) string {
 	default:
 		return clean
 	}
+}
+
+func applyStructuredQwenThinkingPolicy(cfg *BookTokenPlanConfig) {
+	if cfg == nil || !isQwenHybridThinkingModel(cfg.Model) {
+		return
+	}
+	disabled := false
+	cfg.EnableThinking = &disabled
+}
+
+func isQwenHybridThinkingModel(model string) bool {
+	compact := strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "", ".", "").Replace(strings.TrimSpace(model)))
+	return strings.HasPrefix(compact, "qwen37")
 }
 
 func buildBookChatContext(

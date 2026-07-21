@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -76,6 +77,26 @@ func TestGenerateBookAnalysisManifestPersistsGroundedResult(t *testing.T) {
 	stored, err := store.LoadAnalysisManifest("42")
 	if err != nil || stored.Payload == nil || stored.Status != BookAnalysisReady {
 		t.Fatalf("stored manifest = %#v, err=%v", stored, err)
+	}
+}
+
+func TestGenerateBookAnalysisManifestDisablesThinkingForQwenStructuredOutput(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	client := &fakeBookKnowledgeLLMClient{answer: sampleStructuredBookAnalysisJSON()}
+
+	if _, err := GenerateBookAnalysisManifestWithClient(context.Background(), store, BookAnalysisGenerateRequest{
+		BookID: "42",
+		Model:  "qwen3.7-max",
+	}, client); err != nil {
+		t.Fatalf("GenerateBookAnalysisManifestWithClient returned error: %v", err)
+	}
+	field := reflect.ValueOf(client.cfg).FieldByName("EnableThinking")
+	if !field.IsValid() || field.IsNil() || field.Elem().Bool() {
+		t.Fatalf("structured Qwen analysis thinking config = %#v, want explicit false", client.cfg)
 	}
 }
 

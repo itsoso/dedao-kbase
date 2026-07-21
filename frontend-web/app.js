@@ -5268,7 +5268,7 @@ async function runKnowledgePipelineAutomation({ dryRun = false } = {}) {
       method: "POST",
       body: JSON.stringify({
         dry_run: dryRun,
-        limit: 5,
+        limit: 1,
         model: knowledgeState.analysisModel || "qwen3.7-max",
         max_context_chars: 16000,
       }),

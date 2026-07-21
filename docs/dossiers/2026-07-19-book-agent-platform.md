@@ -2214,6 +2214,62 @@ checkpoint documentation, so no system-map artifact was regenerated. Privacy
 smoke and `git diff --check` remain mandatory for the final dossier commit and
 push.
 
+## Post-release incident: package article returns no result
+
+**Status:** LOCAL G3 AND G4 PASS; COMMIT/DEPLOY PENDING. Production diagnosis reproduced a browser-visible
+package page whose structured analysis manifest was `failed` with
+`context_canceled`; the matching Nginx log showed `POST
+/api/knowledge/pipeline/run` returning `504` after the configured upstream read
+timeout. The service-local API could still load the package and source content,
+so the failure was isolated to long synchronous TokenPlan analysis triggered by
+the browser automation path, not missing package data.
+
+Fix under test:
+
+- Qwen3.7 TokenPlan requests from KBase now carry explicit
+  `enable_thinking:false`, which matches the provider requirement for
+  OpenAI-compatible structured JSON output;
+- the browser "自动推进一次" action now advances one package per request instead
+  of five sequential analyses, avoiding a single browser request owning several
+  long model calls;
+- the Web static asset version changed to force browsers to load the fixed
+  JavaScript.
+
+Exact commands and results so far:
+
+- `go test ./backend/app -run TestGenerateBookAnalysisManifestDisablesThinkingForQwenStructuredOutput -count=1 -timeout=60s`
+  — RED first: `EnableThinking` was missing from `BookTokenPlanConfig`; later
+  GREEN after adding the request policy.
+- `node frontend-web/scripts/book-knowledge-web-smoke.mjs` — RED first:
+  pipeline automation did not include `limit: 1`; later GREEN after changing
+  the browser request.
+- `go test ./backend/app -run 'TestGenerateBookAnalysisManifestDisablesThinkingForQwenStructuredOutput|TestTokenPlanChatClientUsesOpenAICompatibleRequest' -count=1 -timeout=60s`
+  — PASS.
+- `go test ./backend/app -count=1 -timeout=120s` — PASS.
+- `go test ./... -timeout=180s` — PASS.
+- `node --check frontend-web/app.js && node frontend-web/scripts/book-knowledge-web-smoke.mjs`
+  — PASS. A follow-up command that also named nonexistent optional scripts
+  failed with `MODULE_NOT_FOUND`; it was not counted as a product verification.
+- `for script in frontend-web/scripts/*smoke*.mjs; do node "$script"; done` —
+  PASS for all existing Web smoke scripts.
+- `npm --prefix frontend run build` — PASS with the existing Vite large-chunk
+  warnings.
+- `go test -race ./backend/app ./cmd/kbase-server -count=1 -timeout=180s` —
+  PASS with existing macOS linker warnings.
+- `bash scripts/knowledge-contract-smoke.sh && bash scripts/knowledge-eval-smoke.sh && bash scripts/proof-consumer-contract-smoke.sh && bash scripts/health-evidence-smoke.sh && bash scripts/source-agent-packaging-smoke.sh && bash scripts/wcplus-agent-packaging-smoke.sh && bash scripts/system-map-smoke.sh`
+  — PASS after regenerating the system map.
+- `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- G4 independent review `g4_incident_review_2` — PASS / Ready to merge: Yes;
+  no Critical, Important, or Minor findings. Reviewer reran
+  `go test ./backend/app -run 'TestGenerateBookAnalysisManifestDisablesThinkingForQwenStructuredOutput|TestTokenPlanChatClientUsesOpenAICompatibleRequest' -count=1 -timeout=60s`,
+  `node --check frontend-web/app.js`,
+  `node frontend-web/scripts/book-knowledge-web-smoke.mjs`,
+  `bash scripts/privacy-smoke.sh`, and `git diff --check`.
+
+No structural route, operation, command, or durable-object inventory changed.
+`docs/_generated/system-map.json` was regenerated because adding
+`BookTokenPlanConfig.EnableThinking` shifted generated Go type line numbers.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
