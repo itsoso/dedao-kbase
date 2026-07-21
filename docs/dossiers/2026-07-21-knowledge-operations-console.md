@@ -1,6 +1,6 @@
 # Knowledge Operations Console Dossier
 
-**Status:** IN PROGRESS — G1/G2 PASS, G3/G4 pending
+**Status:** COMPLETE — G1-G6 PASS; production KBase deployed and verified
 
 ## S0 · User request
 
@@ -151,5 +151,75 @@ Decision: PASS.
 
 ## G5/G6
 
-Pending. Deployment requires clean main after this feature is committed and
-pushed.
+## Push and main integration
+
+- Feature implementation commit: `4360938 feat(kbase): add knowledge operations console`.
+- `bash scripts/privacy-smoke.sh && git diff --check` before push — PASS.
+- Pushed `dedao-kbase/codex/book-agent-platform` from `8190f33` to `4360938`.
+- `bash scripts/privacy-smoke.sh && git diff --check` before main update —
+  PASS.
+- Fast-forwarded `dedao-kbase/main` from `8190f33` to `4360938`.
+
+## G5 · Deployment Health Gate
+
+- Clean main release clone at `43609385e64143def47cbf2f6f80badd815afcc4`.
+- Initial clean clone `go test ./... -timeout=180s` failed before deployment
+  because Wails `frontend/dist` was missing from the clean source tree:
+  `main.go:18:12: pattern all:frontend/dist: no matching files found`.
+  No deployment mutation had occurred. The release clone then ran
+  `cd frontend && npm install && npm run build` to regenerate `frontend/dist`.
+- Clean-main verification after generating `frontend/dist`:
+  `go test ./... -timeout=180s` — PASS;
+  `node --check frontend-web/app.js` — PASS;
+  `for script in frontend-web/scripts/*smoke*.mjs; do node "$script"; done` —
+  PASS;
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Clean release archive with generated `frontend/dist` and without `.git` or
+  `node_modules`: SHA-256
+  `f31956cffcb9e074a7350be5b0dc71d2080ade23209f84f12beed260fcdbaf78`.
+- Server-side preflight in `/tmp/kbase-release-4360938`:
+  `node --check frontend-web/app.js` and all `frontend-web/scripts/*smoke*.mjs`
+  — PASS; `/opt/go-toolchains/go1.23.0/bin/go test ./... -timeout=180s` —
+  PASS.
+- Server-side Linux build:
+  `CGO_ENABLED=1 /opt/go-toolchains/go1.23.0/bin/go build -trimpath -o /tmp/kbase-server-4360938 ./cmd/kbase-server`
+  — PASS; binary SHA-256
+  `9a160285dcd1aad4a5e7dfe0cda5c44b4f6d35696c5bd2bcb7fb1aa9c205fcc8`.
+- Deployment replaced only `/opt/dedao-kbase/bin/kbase-server` and
+  `/opt/dedao-kbase/frontend-web`; KBase data/artifact directories were not
+  touched.
+- Backups:
+  `/opt/dedao-kbase/bin/kbase-server.backup-4360938-20260721083423` and
+  `/opt/dedao-kbase/frontend-web.backup-4360938-20260721083423`.
+- Post-restart service checks:
+  `systemctl is-active dedao-kbase` — `active`;
+  `ExecMainStatus=0`;
+  `NRestarts=0`;
+  local `/health` returned `{"ok":true,"service":"dedao-kbase"}`.
+
+Decision: PASS.
+
+## G6 · Online Verification Gate
+
+- Public `https://kbase.executor.life/health` returned
+  `{"ok":true,"service":"dedao-kbase"}`.
+- Public `https://health.executor.life/api/v1/health` returned healthy with
+  API, database, Redis, and Celery connected.
+- Deployed `/app.js` contains the new `Knowledge Operations Console`,
+  `Release Status Center`, `Health Evidence Review Workspace`, and
+  `/api/knowledge/operations` markers.
+- Authenticated production `GET /api/knowledge/operations?limit=5` returned
+  schema `knowledge_operations.v1`, `total=5`, `items=5`,
+  `health_published=1`.
+- Authenticated dangerous replay probe:
+  `POST /api/knowledge/operations/replay` with action `publish` returned HTTP
+  `409` and `replay action "publish" is not allowed`.
+- Authenticated safe replay planning probe:
+  `POST /api/knowledge/operations/replay` with action `evaluate_quality` and no
+  confirmation returned `status=planned`, `mutated=false`.
+- `systemctl is-active dedao-kbase` remained `active`; `ExecMainStatus=0`;
+  `NRestarts=0`.
+- `journalctl -u dedao-kbase --since "5 minutes ago"` contained no
+  `panic|fatal|error|failed` lines.
+
+Decision: PASS.
