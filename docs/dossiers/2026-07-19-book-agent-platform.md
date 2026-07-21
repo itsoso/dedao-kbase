@@ -2401,6 +2401,17 @@ Exact commands and results so far:
   risks, and `4` actions. The quality report returned `decision=pass` with six
   checks, and the pipeline item advanced to `ready_to_publish` with no public
   error code. No source body, prompt, token, or secret was written to Git.
+- Operator-authorized publication: after the user said "继续" following the
+  explicit ready-to-publish prompt, `POST /api/books/{reported-package}/publish`
+  returned `http_status=200` and created
+  `release-67a509a13bbea28c40c6f7d0ed730ad25f1e3e97c582be4255bd3b8f5639fe59`.
+  The release has schema `knowledge_release.v1`, usage policy `evidence_only`,
+  `10` claims, and `3` citations. Follow-up checks confirmed the release is
+  listed, release detail returns quality `pass`, the pipeline item is
+  `published`, public `/health` is OK, systemd remains `active` with
+  `ExecMainStatus=0` and `NRestarts=0`, and recent service logs contain no
+  panic/fatal/error/failed lines. No source body, prompt, token, or secret was
+  written to Git.
 
 No structural route, operation, command, or durable-object inventory changed.
 `docs/_generated/system-map.json` was regenerated because adding
