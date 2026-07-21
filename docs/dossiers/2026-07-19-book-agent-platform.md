@@ -2216,7 +2216,7 @@ push.
 
 ## Post-release incident: package article returns no result
 
-**Status:** SECOND LOCAL G3 AND G4 PASS; SECOND COMMIT/DEPLOY PENDING. Production diagnosis reproduced a browser-visible
+**Status:** FINAL LOCAL G3 AND G4 PASS; FINAL COMMIT/DEPLOY PENDING. Production diagnosis reproduced a browser-visible
 package page whose structured analysis manifest was `failed` with
 `context_canceled`; the matching Nginx log showed `POST
 /api/knowledge/pipeline/run` returning `504` after the configured upstream read
@@ -2308,6 +2308,76 @@ Exact commands and results so far:
   -count=1 -timeout=60s`, `go test ./backend/app -count=1 -timeout=120s`,
   `bash scripts/system-map-smoke.sh`, `bash scripts/privacy-smoke.sh`, and `git
   diff --check` all passed.
+- Second commit and deploy attempt: commit `ccf8192 fix(kbase): raise analysis
+  output budget` was pushed to `dedao-kbase/codex/book-agent-platform` and
+  fast-forwarded to `dedao-kbase/main`. Clean-main `go test ./... -timeout=180s`
+  passed; `node --check frontend-web/app.js && node
+  frontend-web/scripts/book-knowledge-web-smoke.mjs && bash
+  scripts/privacy-smoke.sh && git diff --check` passed. Server-side source
+  archive SHA-256 was
+  `c6ec583bf630a3a0fee0f94e6b394e24feb98f30e10201e79caef2557e5b0c64`;
+  server-side frontend build and Linux CGO `go test ./... -timeout=180s`
+  passed; production binary SHA-256 was
+  `3ad49cf3d8f82712d087b67142274cb14bd3afcfeb48dfe9da7da7f307ceb66e`; isolated
+  health smoke and rollout health passed with backup
+  `/opt/dedao-kbase/bin/kbase-server.backup-ccf8192-20260721122717`.
+- Second G6 target analysis retry returned `http_status=500 elapsed_seconds=28`
+  with `json: cannot unmarshal string into Go struct field
+  BookAnalysisClaim.claims.scope of type []string`. This showed the model now
+  returned complete JSON, but one schema field used a string instead of a
+  string array. The Gate was not bypassed.
+- Third TDD remediation: `go test ./backend/app -run
+  TestParseBookAnalysisPayloadCoercesStringScope -count=1 -timeout=60s` — RED
+  first with the same `scope` unmarshal error; GREEN after adding narrow parser
+  coercion from `scope:"text"` to `scope:["text"]`.
+- Third local verification: `go test ./backend/app -count=1 -timeout=120s` —
+  PASS; `go test ./... -timeout=180s` — PASS; `node --check
+  frontend-web/app.js && node frontend-web/scripts/book-knowledge-web-smoke.mjs`
+  — PASS; `for script in frontend-web/scripts/*smoke*.mjs; do node "$script";
+  done` — PASS; `go test -race ./backend/app ./cmd/kbase-server -count=1
+  -timeout=180s` — PASS with existing macOS linker warnings; the six
+  knowledge/evaluation/consumer/packaging/system-map smoke scripts — PASS;
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Third G4 review `g4_incident_review_4` returned WITH FIXES: custom claim
+  unmarshalling bypassed nested `DisallowUnknownFields`, and invalid non-string
+  `scope` types needed explicit negative coverage. Follow-up TDD added
+  `TestParseBookAnalysisPayloadRejectsInvalidScopeType` and
+  `TestParseBookAnalysisPayloadRejectsUnknownClaimFields`; the first run was
+  RED because unknown claim fields were accepted. The parser now uses strict
+  claim decoding plus only the narrow `scope` string-to-array coercion.
+- Final local verification after G4 remediation: `go test ./backend/app -run
+  'TestParseBookAnalysisPayloadCoercesStringScope|TestParseBookAnalysisPayloadRejectsInvalidScopeType|TestParseBookAnalysisPayloadRejectsUnknownClaimFields|TestGenerateBookAnalysisManifestAppliesQwenStructuredRequestPolicy'
+  -count=1 -timeout=60s` — PASS; `go test ./backend/app -count=1
+  -timeout=120s` — PASS; `go test ./... -timeout=180s` — PASS; `node --check
+  frontend-web/app.js && node frontend-web/scripts/book-knowledge-web-smoke.mjs`
+  — PASS; `for script in frontend-web/scripts/*smoke*.mjs; do node "$script";
+  done` — PASS; `go test -race ./backend/app ./cmd/kbase-server -count=1
+  -timeout=180s` — PASS with existing macOS linker warnings; the six
+  knowledge/evaluation/consumer/packaging/system-map smoke scripts — PASS;
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Final G4 review `g4_incident_review_5` returned WITH FIXES because explicit
+  `scope:null` was still accepted, and null/number/boolean cases needed
+  coverage. Follow-up TDD expanded
+  `TestParseBookAnalysisPayloadRejectsInvalidScopeType` to cover object, null,
+  number, and boolean scopes; the first run was RED on `scope:null`. The parser
+  now rejects explicit null and still allows only absent scope, string arrays,
+  and string-to-single-item-array coercion.
+- Final local verification after the null-scope fix: `go test ./backend/app
+  -run 'TestParseBookAnalysisPayloadCoercesStringScope|TestParseBookAnalysisPayloadRejectsInvalidScopeType|TestParseBookAnalysisPayloadRejectsUnknownClaimFields'
+  -count=1 -timeout=60s` — PASS; `go test ./backend/app -count=1
+  -timeout=120s` — PASS; `go test ./... -timeout=180s` — PASS; `node --check
+  frontend-web/app.js && node frontend-web/scripts/book-knowledge-web-smoke.mjs`
+  — PASS; `for script in frontend-web/scripts/*smoke*.mjs; do node "$script";
+  done` — PASS; `go test -race ./backend/app ./cmd/kbase-server -count=1
+  -timeout=180s` — PASS with existing macOS linker warnings; the six
+  knowledge/evaluation/consumer/packaging/system-map smoke scripts — PASS;
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Final G4 review `g4_incident_review_6` — PASS / Ready to merge: Yes; no
+  Critical or Important findings. The review noted one non-blocking Minor:
+  `scope:[null]` remains worth tightening later if the contract needs every
+  array element to be non-null and non-empty. Reviewer reran targeted
+  scope/unknown-field tests, `bash scripts/privacy-smoke.sh`, `git diff
+  --check`, and `bash scripts/system-map-smoke.sh`.
 
 No structural route, operation, command, or durable-object inventory changed.
 `docs/_generated/system-map.json` was regenerated because adding

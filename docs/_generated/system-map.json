@@ -901,7 +901,7 @@
     {
       "name": "BookAnalysisManifest",
       "file": "backend/app/book_analysis.go",
-      "line": 54
+      "line": 99
     },
     {
       "name": "BookKnowledgeBook",

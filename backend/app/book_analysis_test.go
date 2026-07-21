@@ -133,6 +133,69 @@ func TestGenerateBookAnalysisManifestParsesStructuredPayload(t *testing.T) {
 	}
 }
 
+func TestParseBookAnalysisPayloadCoercesStringScope(t *testing.T) {
+	payload, err := parseBookAnalysisPayload(`{
+		"summary":"summary",
+		"claims":[{
+			"id":"claim-1",
+			"statement":"statement",
+			"citation_ids":["42-chunk-1"],
+			"confidence":0.8,
+			"scope":"single scope",
+			"risk_level":"medium"
+		}],
+		"risks":[],
+		"actions":[]
+	}`)
+	if err != nil {
+		t.Fatalf("parseBookAnalysisPayload returned error: %v", err)
+	}
+	if got := payload.Claims[0].Scope; len(got) != 1 || got[0] != "single scope" {
+		t.Fatalf("scope = %#v, want coerced single-item scope", got)
+	}
+}
+
+func TestParseBookAnalysisPayloadRejectsInvalidScopeType(t *testing.T) {
+	for _, scope := range []string{`{"text":"invalid"}`, `null`, `123`, `true`} {
+		_, err := parseBookAnalysisPayload(`{
+			"summary":"summary",
+			"claims":[{
+				"id":"claim-1",
+				"statement":"statement",
+				"citation_ids":["42-chunk-1"],
+				"confidence":0.8,
+				"scope":` + scope + `,
+				"risk_level":"medium"
+			}],
+			"risks":[],
+			"actions":[]
+		}`)
+		if err == nil || !strings.Contains(err.Error(), "structured analysis") {
+			t.Fatalf("scope %s parse error = %v, want structured analysis error", scope, err)
+		}
+	}
+}
+
+func TestParseBookAnalysisPayloadRejectsUnknownClaimFields(t *testing.T) {
+	_, err := parseBookAnalysisPayload(`{
+		"summary":"summary",
+		"claims":[{
+			"id":"claim-1",
+			"statement":"statement",
+			"citation_ids":["42-chunk-1"],
+			"confidence":0.8,
+			"scope":"single scope",
+			"risk_level":"medium",
+			"unexpected":"not allowed"
+		}],
+		"risks":[],
+		"actions":[]
+	}`)
+	if err == nil || !strings.Contains(err.Error(), "structured analysis") {
+		t.Fatalf("parseBookAnalysisPayload error = %v, want structured analysis error", err)
+	}
+}
+
 func TestGenerateBookAnalysisManifestRejectsMalformedPayload(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	store := NewBookKnowledgeStore(t.TempDir())

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -35,6 +36,50 @@ type BookAnalysisClaim struct {
 	Confidence  float64  `json:"confidence"`
 	Scope       []string `json:"scope,omitempty"`
 	RiskLevel   string   `json:"risk_level"`
+}
+
+func (c *BookAnalysisClaim) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		ID          string          `json:"id"`
+		Statement   string          `json:"statement"`
+		CitationIDs []string        `json:"citation_ids"`
+		Confidence  float64         `json:"confidence"`
+		Scope       json.RawMessage `json:"scope"`
+		RiskLevel   string          `json:"risk_level"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	scope := []string(nil)
+	if len(raw.Scope) > 0 {
+		if string(raw.Scope) == "null" {
+			return fmt.Errorf("scope must be a string or string array")
+		}
+		var scopeList []string
+		if err := json.Unmarshal(raw.Scope, &scopeList); err == nil {
+			scope = scopeList
+		} else {
+			var scopeText string
+			if err := json.Unmarshal(raw.Scope, &scopeText); err != nil {
+				return err
+			}
+			scopeText = strings.TrimSpace(scopeText)
+			if scopeText != "" {
+				scope = []string{scopeText}
+			}
+		}
+	}
+	*c = BookAnalysisClaim{
+		ID:          raw.ID,
+		Statement:   raw.Statement,
+		CitationIDs: raw.CitationIDs,
+		Confidence:  raw.Confidence,
+		Scope:       scope,
+		RiskLevel:   raw.RiskLevel,
+	}
+	return nil
 }
 
 type BookAnalysisRisk struct {
