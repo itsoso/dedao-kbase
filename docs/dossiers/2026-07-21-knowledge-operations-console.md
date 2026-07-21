@@ -242,3 +242,22 @@ Decision: PASS.
   `node frontend-web/scripts/book-knowledge-web-smoke.mjs &&
   node frontend-web/scripts/knowledge-operations-console-smoke.mjs &&
   node --check frontend-web/app.js` — PASS.
+- Commit: `1fb6731 fix(kbase): refresh operations console assets`; pushed to
+  `dedao-kbase/codex/book-agent-platform` and fast-forwarded to
+  `dedao-kbase/main`.
+- Clean-main static preflight at
+  `1fb67311d6d8d232d970eb59e1355d84533083c0`:
+  `node frontend-web/scripts/book-knowledge-web-smoke.mjs`,
+  `node frontend-web/scripts/knowledge-operations-console-smoke.mjs`,
+  `node --check frontend-web/app.js`, `bash scripts/privacy-smoke.sh`, and
+  `git diff --check` — PASS.
+- Static frontend archive SHA-256:
+  `2e6b42ee44accd598f9b9c60b6263f6a1984c946dc642704cbd69f0b74edd076`.
+- Production static update replaced only `/opt/dedao-kbase/frontend-web`; the
+  service binary and data directories were not changed. Backup:
+  `/opt/dedao-kbase/frontend-web.backup-1fb6731-20260721084629`.
+- Online local verification:
+  `http://127.0.0.1:8719/operations` references
+  `20260721-operations-console`; deployed `/app.js` contains
+  `Knowledge Operations Console` and `/api/knowledge/operations` markers;
+  `systemctl is-active dedao-kbase` remained `active`.
