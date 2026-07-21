@@ -1902,6 +1902,86 @@ TDD remediation status:
 The remediation has not yet been committed, pushed, or deployed. G6 remains
 blocked until clean-main rollout and the complete pilot sequence pass.
 
+## G6 pilot evaluation, publication, and runtime trace checkpoint
+
+**Decision: G6 remains BLOCKED after publication because the real online chat
+Gate failed.** No Proofroom or Health import was attempted, and no feedback
+closure was claimed.
+
+Citation-resolution rollout:
+
+- privacy smoke, `git diff --check`, clean status, remote-main ancestry, and
+  explicit feature/main pushes passed; both remote refs reached
+  `0c15973a807a5248b8fded0035f7a25a98aca85f`;
+- exact clean-main source archive SHA-256 was
+  `e0c4736a1e34a9f71d9bfc05b52c2f68b24b633a82d6719b8a911d3bb1ed1efe`;
+- server-side Linux CGO `go test ./...` passed: backend app `9.847s`, services
+  `3.264s`, utils `0.462s`, KBase server `0.085s`, source agent `0.128s`,
+  system map `0.118s`, and WC Plus agent `0.175s`;
+- the production Linux CGO binary SHA-256 is
+  `d364e4fbfe4652332a72f28c0b73d75be7278193a99adc6aba520f9b757cfe4d`;
+  isolated service-user SQLite/health/empty-list smoke passed;
+- atomic rollout retained
+  `/opt/dedao-kbase/bin/kbase-server.backup-0c15973-20260721104359` and passed;
+  production is `active/running`, `ExecMainStatus=0`, `NRestarts=0`, and public
+  health is OK.
+
+Pilot Gate sequence:
+
+- the first regenerated evaluation input failed before file creation because
+  the package declared a preferred capability without an executable fallback:
+  `model_policy has no executable fallback model`;
+- adding the approved configured fallback to the private transient package
+  input, without changing thresholds, passed local deterministic preflight:
+  one package, one release, all ten metrics, private file mode `0600`;
+- publisher-only `/evaluate` returned HTTP 201 with
+  `deterministic-agent-evaluator.v1`, `passed=true`, ten metrics, and no
+  failures;
+- publisher-only `/publish` returned HTTP 201 for
+  `book-agent-clinical-trials-truth@1.0.0`, state `published`, content hash
+  `sha256:eaec5a77b520cc7feeb1a5926a3391c2de3bc39d2e7b1b1eb96cf0c71cfa95a0`;
+- authenticated online search returned HTTP 200, lexical strategy, one result,
+  `claim-1`, and one resolved citation;
+- real online chat returned HTTP 500. The configured TokenPlan service rejected
+  the package fallback `qwen-plus` as `model_not_found`; while persisting the
+  required failed trace, a second contract mismatch surfaced: the immutable
+  legacy Knowledge Release stores its digest as 64 lowercase hex, whereas
+  Agent Trace requires a `sha256:` fingerprint. The combined error was
+  `model call failed ...; persist failed trace: releases[0].content_hash must be
+  a lowercase sha256 fingerprint`.
+
+The published v1.0.0 package is retained as an auditable failed pilot and will
+be superseded, not overwritten, after the trace fix. The server's configured
+model is `MiniMax-M2.5`; no credential value was printed.
+
+Trace remediation TDD:
+
+- RED: `TestAgentPackageRuntimeTraceNormalizesLegacyReleaseContentHash` failed
+  with `releases[0].content_hash must be a lowercase sha256 fingerprint`;
+- the trace projection now prefixes only an exact 64-character lowercase hex
+  digest. Already-prefixed values are unchanged and malformed/uppercase values
+  still fail trace validation. Package and Knowledge Release content hashes are
+  not mutated;
+- focused legacy-hash, failed-model, and completed-chat tests passed in
+  `1.852s`; broader Agent Runtime/Trace tests passed in `2.550s`;
+- `go test ./...` passed, including backend app `16.277s`, KBase server
+  `1.115s`, source agent `3.142s`, and WC Plus agent `1.745s` (other packages
+  cached); race tests passed in `19.569s` and `3.027s` with only the existing
+  macOS linker warnings;
+- all knowledge, evaluation, Proof consumer, Health evidence, packaging,
+  system-map, privacy, and diff smokes passed; no structural inventory changed.
+- independent G4 review returned GO with no Critical, High, or Medium finding.
+  Focused Runtime/Trace passed in `3.243s`, full backend app in `16.217s`,
+  KBase server in `0.945s`, focused race in `5.629s`, and formatting/privacy/diff
+  checks passed;
+- the review's only Low suggestion was converted into table-driven tests for
+  already-prefixed, uppercase, non-hex, wrong-length, and legacy raw hashes,
+  plus failed/completed/abstained outcomes. Focused normal and race tests passed
+  in `1.639s` and `2.768s` respectively.
+
+The trace remediation is not yet committed, pushed, or deployed. G6 remains
+blocked.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.

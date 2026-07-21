@@ -377,6 +377,72 @@ func TestAgentPackageRuntimePersistsFailedModelCall(t *testing.T) {
 	}
 }
 
+func TestAgentPackageRuntimeTraceNormalizesLegacyReleaseContentHash(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.ContentHash = strings.Repeat("a", 64)
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg := validAgentPackage()
+	pkg.RetrievalPolicy.Strategy = "lexical"
+	pkg.Releases[0].ContentHash = release.ContentHash
+	pkg, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	evidence := []AgentPackageEvidence{{
+		ReleaseID: release.ReleaseID, ClaimID: "claim-1",
+		CitationIDs: []string{"citation-1"}, Score: 1,
+	}}
+	for _, outcome := range []string{
+		AgentTraceOutcomeFailed,
+		AgentTraceOutcomeAbstained,
+		AgentTraceOutcomeCompleted,
+	} {
+		var citations []AgentScopedCitation
+		if outcome == AgentTraceOutcomeCompleted {
+			citations = []AgentScopedCitation{{CitationID: "citation-1"}}
+		}
+		traceID, saveErr := saveAgentRuntimeTrace(
+			store, pkg, evidence, "qwen-plus", outcome, "synthetic response", citations,
+			testAgentPackageTime(), testAgentPackageTime().Add(time.Second),
+		)
+		if saveErr != nil {
+			t.Fatalf("%s trace: %v", outcome, saveErr)
+		}
+		trace, loadErr := store.LoadAgentTrace(traceID)
+		if loadErr != nil {
+			t.Fatalf("%s trace: %v", outcome, loadErr)
+		}
+		if got, want := trace.Releases[0].ContentHash, "sha256:"+release.ContentHash; got != want {
+			t.Fatalf("%s trace release content hash = %q, want %q", outcome, got, want)
+		}
+	}
+}
+
+func TestAgentTraceReleaseContentHashNormalizationIsNarrow(t *testing.T) {
+	raw := strings.Repeat("a", 64)
+	for _, testCase := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "legacy lowercase digest", input: raw, want: "sha256:" + raw},
+		{name: "already prefixed", input: "sha256:" + raw, want: "sha256:" + raw},
+		{name: "uppercase is not normalized", input: strings.Repeat("A", 64), want: strings.Repeat("A", 64)},
+		{name: "non hex is not normalized", input: strings.Repeat("z", 64), want: strings.Repeat("z", 64)},
+		{name: "wrong length is not normalized", input: strings.Repeat("a", 63), want: strings.Repeat("a", 63)},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if got := agentTraceReleaseContentHash(testCase.input); got != testCase.want {
+				t.Fatalf("normalized = %q, want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestKBaseHTTPHandlerRunsVersionedAgentPackage(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
 	store, pkg := agentRuntimeTestStore(t)

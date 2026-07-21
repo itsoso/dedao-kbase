@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"sort"
@@ -293,7 +294,8 @@ func saveAgentRuntimeTrace(
 			return "", loadErr
 		}
 		releases = append(releases, AgentTraceReleaseRef{
-			ReleaseID: ref.ReleaseID, Version: release.Version, ContentHash: ref.ContentHash,
+			ReleaseID: ref.ReleaseID, Version: release.Version,
+			ContentHash: agentTraceReleaseContentHash(ref.ContentHash),
 		})
 	}
 	retrievals := make([]AgentTraceRetrieval, 0, len(evidence))
@@ -343,6 +345,14 @@ func newAgentRuntimeTraceID() (string, error) {
 
 func agentRuntimeEvidenceID(item AgentPackageEvidence) string {
 	return item.ReleaseID + ":" + item.ClaimID
+}
+
+func agentTraceReleaseContentHash(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) == sha256.Size*2 && isLowerHex(value) {
+		return "sha256:" + value
+	}
+	return value
 }
 
 func agentRuntimeTraceCitations(evidence []AgentPackageEvidence, citations []AgentScopedCitation) []AgentTraceCitation {
