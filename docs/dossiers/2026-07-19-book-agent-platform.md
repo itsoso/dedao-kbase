@@ -2412,6 +2412,23 @@ Exact commands and results so far:
   `ExecMainStatus=0` and `NRestarts=0`, and recent service logs contain no
   panic/fatal/error/failed lines. No source body, prompt, token, or secret was
   written to Git.
+- Downstream Health draft sync verification: after inspecting the Health
+  consumer repository `AGENTS.md`, `docs/system-map/INDEX.md`, and the existing
+  Release consumer dossier, production Health reported `healthy` with API,
+  database, Redis, and Celery connected. Server-side checks confirmed the KBase
+  Release URL, auth token, and review artifact directory were configured without
+  printing secret values; `health-backend`, `celery-worker`, and `celery-beat`
+  were all `active`. Running the existing
+  `sync_dedao_kbase_export_draft` task consumed exactly one new Release,
+  `release-67a509a13bbea28c40c6f7d0ed730ad25f1e3e97c582be4255bd3b8f5639fe59`,
+  in `incremental` mode from previous cursor
+  `release-43a7dbb5062e51e383597c1452dfe5b187a2ce8b78690915f18cb1bc8819bcbb`;
+  the result was `draft_written`, and the Health review gate returned
+  `serving_allowed=false` with blocking reasons `draft_artifacts_present` and
+  `manifest_not_reviewed`. The canonical System KB artifact fingerprint did not
+  change. A second immediate run returned `up_to_date`, `release_count=0`, and
+  the same cursor, proving idempotent cursor behavior. Public and local Health
+  health checks remained healthy after the sync.
 
 No structural route, operation, command, or durable-object inventory changed.
 `docs/_generated/system-map.json` was regenerated because adding
