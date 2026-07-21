@@ -2198,10 +2198,16 @@ Post-close concurrency audit:
 - `f58925b8` is an ancestor of `0fa40389`, and the Book Agent Health consumer,
   lifecycle task, and focused consumer test are byte-for-byte unchanged across
   that range;
-- those concurrent changes were not automatically deployed under this
-  feature's authority. The G6 evidence remains tied to the exact clean-main
-  revision actually tested and deployed, `f58925b8`, rather than claiming the
-  production host equals a later unreviewed main.
+- those concurrent changes were not deployed by this feature. A subsequent
+  external release advanced Health production to `0fa40389`, and remote main
+  then advanced to `c4be2399` through a dossier-only commit. Both ranges leave
+  the Book Agent consumer, lifecycle task, and focused test unchanged;
+- a post-release production read confirmed the original Health audit still has
+  status `held`, `serving_allowed=false`, the same two package hold records,
+  and a canonical serving fingerprint equal to the pilot's recorded base. G6
+  test evidence remains tied to exact `f58925b8`; current public health was
+  separately rechecked on the later production revision without attributing
+  unrelated changes to this feature.
 
 No structural source inventory changed in the final Proofroom remediation or
 checkpoint documentation, so no system-map artifact was regenerated. Privacy
