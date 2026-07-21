@@ -296,6 +296,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgeReview(w, r)
 		return
 	}
+	if r.URL.Path == "/api/knowledge/operations" {
+		h.handleKnowledgeOperations(w, r)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/operations/replay" {
+		h.handleKnowledgeOperationsReplay(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/pipeline" {
 		h.handleKnowledgePipeline(w, r)
 		return
@@ -1366,6 +1374,58 @@ func (h *kbaseHTTPHandler) handleKnowledgePipeline(w http.ResponseWriter, r *htt
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, dashboard)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeOperations(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > 500 {
+			writeHTTPError(w, http.StatusBadRequest, "limit must be between 1 and 500")
+			return
+		}
+		limit = parsed
+	}
+	console, err := BuildKnowledgeOperationsConsole(h.store, limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, console)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeOperationsReplay(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var request KnowledgeOperationsReplayRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	result, err := RunKnowledgeOperationsReplay(r.Context(), h.store, h.analysisGenerator, request)
+	if err != nil {
+		if strings.Contains(err.Error(), "not allowed") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "required") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "not found") {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgePipelineRun(w http.ResponseWriter, r *http.Request) {

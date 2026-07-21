@@ -67,4 +67,89 @@ Implementation plan:
 
 ## Checkpoints
 
-Implementation is starting from Task 2 with TDD.
+### Task 1
+
+- Created design, implementation plan, and dossier.
+- `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Commit: `250d7e9 docs(kbase): design knowledge operations console`.
+
+### Tasks 2-3
+
+- RED: `go test ./backend/app -run TestBuildKnowledgeOperationsConsoleCombinesPipelineReleaseAndHealthState -count=1`
+  failed with undefined `BuildKnowledgeOperationsConsole` and
+  `KnowledgeOperationsSchemaVersion`.
+- GREEN: `go test ./backend/app -run TestBuildKnowledgeOperationsConsoleCombinesPipelineReleaseAndHealthState -count=1`
+  — PASS.
+- RED: `go test ./backend/app -run TestKnowledgeOperationsHealthSummaryDoesNotExposeSourceBody -count=1`
+  failed because Health claim/citation/risk counts were absent.
+- GREEN:
+  `go test ./backend/app -run 'Test(BuildKnowledgeOperationsConsoleCombinesPipelineReleaseAndHealthState|KnowledgeOperationsHealthSummaryDoesNotExposeSourceBody)' -count=1`
+  — PASS.
+
+### Task 4
+
+- RED:
+  `go test ./backend/app -run 'TestKnowledgeOperationsExplainsFailuresWithSafeReplay|TestRunKnowledgeOperationsReplayRejectsDangerousActions' -count=1`
+  failed because `RunKnowledgeOperationsReplay` and request types were
+  undefined.
+- GREEN:
+  `go test ./backend/app -run 'TestKnowledgeOperationsExplainsFailuresWithSafeReplay|TestRunKnowledgeOperationsReplayRejectsDangerousActions' -count=1`
+  — PASS.
+- Safe replay allows only `analyze` and `evaluate_quality`; `publish`,
+  `health_serving_promote`, `feedback`, and unknown actions return a not-allowed
+  error.
+
+### Task 5
+
+- RED: `go test ./backend/app -run 'TestKBaseHTTPHandlerKnowledgeOperations' -count=1`
+  failed with missing routes (`404` for console, method routing for replay).
+- GREEN:
+  `go test ./backend/app -run 'TestKBaseHTTPHandlerKnowledgeOperations|Test(BuildKnowledgeOperationsConsole|KnowledgeOperationsHealthSummary|KnowledgeOperationsExplains|RunKnowledgeOperationsReplay)' -count=1`
+  — PASS.
+- Routes added after operator bearer authentication:
+  `GET /api/knowledge/operations` and
+  `POST /api/knowledge/operations/replay`.
+
+### Task 6
+
+- RED: `node frontend-web/scripts/knowledge-operations-console-smoke.mjs`
+  failed because `knowledgeOperationsState` and route markers were absent.
+- GREEN:
+  `node --check frontend-web/app.js && node frontend-web/scripts/knowledge-operations-console-smoke.mjs`
+  — PASS.
+- Added `/operations` frontend-web route with Release Status Center, Health
+  Evidence Review Workspace, Failure Explanation, and safe replay controls.
+
+## G3 · Test Gate
+
+- `go run ./cmd/system-map --root . --out docs/_generated/system-map.json && bash scripts/system-map-smoke.sh`
+  — PASS.
+- `go test ./backend/app -run 'KnowledgeOperations' -count=1` — PASS.
+- `go test ./... -timeout=180s` — PASS.
+- `node --check frontend-web/app.js` — PASS.
+- `for script in frontend-web/scripts/*smoke*.mjs; do node "$script"; done`
+  — PASS, including the new Knowledge Operations smoke.
+- `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+
+Decision: PASS.
+
+## G4 · Safety Review Gate
+
+- Operations aggregation returns release/pipeline/Health metadata and aggregate
+  Health claim/citation/risk counts only.
+- Regression coverage asserts claim statements are not serialized by
+  `BuildKnowledgeOperationsConsole` or the HTTP console route.
+- Replay runner rejects `publish`, `health_serving_promote`, `feedback`, and
+  unknown actions even with `confirm=true`.
+- Frontend smoke asserts unsafe replay labels are not rendered as buttons.
+- Health serving remains owned by Health; KBase UI copy states it does not
+  promote Health serving.
+- No source body, prompt, token, cookie, or downloaded content was added to
+  fixtures, docs, or UI.
+
+Decision: PASS.
+
+## G5/G6
+
+Pending. Deployment requires clean main after this feature is committed and
+pushed.

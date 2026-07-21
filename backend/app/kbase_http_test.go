@@ -374,6 +374,55 @@ func TestKBaseHTTPHandlerKnowledgePipeline(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeOperationsConsole(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "book-health", "hash-health")
+	saveHealthAnalysis(t, store, "book-health", "hash-health")
+	saveHealthQuality(t, store, "book-health", "hash-health", BookQualityPass, BookUsageEvidenceOnly)
+	saveFeedRelease(t, store, sampleHealthEvidenceRelease())
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/knowledge/operations", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	resp := requestKBase(handler, http.MethodGet, "/api/knowledge/operations?limit=10", "secret-token")
+	if resp.Code != http.StatusOK ||
+		!strings.Contains(resp.Body.String(), `"schema_version":"knowledge_operations.v1"`) ||
+		!strings.Contains(resp.Body.String(), `"health_published":1`) ||
+		!strings.Contains(resp.Body.String(), `"claim_count":2`) {
+		t.Fatalf("operations status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "规律运动可能帮助") {
+		t.Fatalf("operations response exposed claim statement: %s", resp.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodPost, "/api/knowledge/operations", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerKnowledgeOperationsReplayRejectsUnsafeActions(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	savePipelinePackage(t, store, "ready", "hash-ready")
+	savePipelineAnalysis(t, store, "ready", "hash-ready")
+	savePipelineQuality(t, store, "ready", "hash-ready", BookQualityPass)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	resp := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/operations/replay", "secret-token", `{"book_id":"ready","action":"publish","confirm":true}`)
+	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "not allowed") {
+		t.Fatalf("unsafe replay status=%d body=%s", resp.Code, resp.Body.String())
+	}
+	planned := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/operations/replay", "secret-token", `{"book_id":"ready","action":"evaluate_quality"}`)
+	if planned.Code != http.StatusOK || !strings.Contains(planned.Body.String(), `"status":"planned"`) || strings.Contains(planned.Body.String(), `"mutated":true`) {
+		t.Fatalf("planned replay status=%d body=%s", planned.Code, planned.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodGet, "/api/knowledge/operations/replay", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeQualityAndRelease(t *testing.T) {
 	store := qualityTestStore(t)
 	if _, err := EvaluateBookAnalysisQuality(store, "42"); err != nil {

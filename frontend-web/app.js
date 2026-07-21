@@ -17,6 +17,7 @@ const ROUTES = Object.freeze({
   agents: "/agents",
   bookApps: "/book-apps",
   healthReleases: "/delivery/health/releases",
+  operations: "/operations",
   jobs: "/jobs",
 });
 
@@ -200,6 +201,14 @@ const bookAgentState = {
   answer: null,
   loading: "",
   message: "",
+};
+
+const knowledgeOperationsState = {
+  console: null,
+  loading: "",
+  message: "",
+  replaying: "",
+  replayResult: null,
 };
 
 const knowledgeAnalysisPrompts = [
@@ -673,6 +682,7 @@ function renderShell(content, current = "") {
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
         <a class="${current === "agents" ? "active" : ""}" href="${escapeAttribute(ROUTES.agentPackages)}">Book Agents</a>
+        <a class="${current === "operations" ? "active" : ""}" href="${escapeAttribute(ROUTES.operations)}">Operations</a>
         <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
       </nav>
     </header>
@@ -5285,6 +5295,158 @@ async function runKnowledgePipelineAutomation({ dryRun = false } = {}) {
   }
 }
 
+function renderKnowledgeOperationsConsole() {
+  const dashboard = knowledgeOperationsState.console || {};
+  const summary = dashboard.summary || {};
+  const items = Array.isArray(dashboard.items) ? dashboard.items : [];
+  const status = knowledgeOperationsState.loading || knowledgeOperationsState.message || `${Number(summary.total || 0)} packages`;
+  const replay = knowledgeOperationsState.replayResult;
+  renderShell(`
+    <main class="knowledge-operations">
+      <section class="knowledge-operations__hero">
+        <p class="web-kicker">Knowledge Operations Console</p>
+        <h1>Release Status Center</h1>
+        <p>发布、Health 审核草稿和失败重放集中观察。这里不会展示源正文，也不会推进 Health serving。</p>
+        <div class="knowledge-operations__actions">
+          <button id="knowledge-operations-refresh" class="button button-primary" type="button" ${knowledgeOperationsState.loading ? "disabled" : ""}>刷新</button>
+          <span>${escapeHTML(status)}</span>
+        </div>
+      </section>
+      <section class="knowledge-operations__summary" aria-label="Release Status Center">
+        ${renderKnowledgeOperationsMetric("待分析", summary.needs_analysis)}
+        ${renderKnowledgeOperationsMetric("待质检", summary.needs_quality)}
+        ${renderKnowledgeOperationsMetric("可发布", summary.ready_to_publish)}
+        ${renderKnowledgeOperationsMetric("已发布", summary.published)}
+        ${renderKnowledgeOperationsMetric("Health 待审核", summary.health_ready_to_publish)}
+        ${renderKnowledgeOperationsMetric("Health 已拉取", summary.health_published)}
+      </section>
+      <section class="knowledge-operations__panel" aria-label="Health Evidence Review Workspace">
+        <div class="knowledge-operations__panel-head">
+          <div>
+            <p class="web-kicker">Health Evidence Review Workspace</p>
+            <h2>审核草稿和阻断原因</h2>
+          </div>
+          <small>serving_allowed 始终由 Health 审核系统决定；KBase 只显示证据元数据。</small>
+        </div>
+        <div class="knowledge-operations__table">
+          ${items.map(renderKnowledgeOperationsItem).join("") || `<p class="knowledge-operations__empty">暂无 operations 数据。</p>`}
+        </div>
+      </section>
+      <section class="knowledge-operations__panel" aria-label="Failure Explanation">
+        <div class="knowledge-operations__panel-head">
+          <div>
+            <p class="web-kicker">Failure Explanation</p>
+            <h2>安全重放结果</h2>
+          </div>
+          <small>只允许 analyze / evaluate_quality；publish 与 health_serving_promote 被后端拒绝。</small>
+        </div>
+        ${replay ? `<pre class="knowledge-operations__result">${escapeHTML(JSON.stringify(replay, null, 2))}</pre>` : `<p class="knowledge-operations__empty">选择一条安全 replay 操作后，结果会显示在这里。</p>`}
+      </section>
+    </main>
+  `, "operations");
+  bindKnowledgeOperationsEvents();
+}
+
+function renderKnowledgeOperationsMetric(label, value) {
+  return `<div class="knowledge-operations__metric"><span>${escapeHTML(label)}</span><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function renderKnowledgeOperationsItem(item) {
+  const health = item.health || {};
+  const failure = item.failure || {};
+  const riskCounts = health.risk_counts || {};
+  const riskText = Object.entries(riskCounts).map(([risk, count]) => `${risk}:${count}`).join(" · ") || "无风险计数";
+  const safeAction = failure.safe_replay_action || "";
+  const canReplay = safeAction === "analyze" || safeAction === "evaluate_quality";
+  return `
+    <article class="knowledge-operations__row">
+      <div>
+        <strong>${escapeHTML(item.title || item.book_id || "未命名知识")}</strong>
+        <small>${escapeHTML(item.book_id || "")}</small>
+      </div>
+      <div>
+        <span class="knowledge-operations__badge">${escapeHTML(item.pipeline_stage || "unknown")}</span>
+        <small>${escapeHTML(item.next_action || "-")}</small>
+      </div>
+      <div>
+        <span>${escapeHTML(item.release_id ? knowledgeHash(item.release_id) : "未发布")}</span>
+        <small>${escapeHTML(item.quality_decision || "未质检")} · ${escapeHTML(item.usage_policy || "-")}</small>
+      </div>
+      <div>
+        <span>${escapeHTML(health.status || "not_ready")}</span>
+        <small>claims ${Number(health.claim_count || 0)} · citations ${Number(health.citation_count || 0)} · ${escapeHTML(riskText)}</small>
+        ${(health.reasons || []).length ? `<small>${escapeHTML((health.reasons || []).join(" / "))}</small>` : ""}
+      </div>
+      <div>
+        <span>${escapeHTML(failure.explanation || "无失败解释")}</span>
+        ${canReplay ? `<button class="button button-ghost" type="button" data-knowledge-operations-replay="${escapeAttribute(safeAction)}" data-book-id="${escapeAttribute(item.book_id || "")}" ${knowledgeOperationsState.replaying ? "disabled" : ""}>安全重放：${escapeHTML(safeAction)}</button>` : `<small>无安全重放动作</small>`}
+      </div>
+    </article>
+  `;
+}
+
+function bindKnowledgeOperationsEvents() {
+  document.querySelector("#knowledge-operations-refresh")?.addEventListener("click", async () => {
+    await loadKnowledgeOperationsConsole();
+  });
+  for (const button of document.querySelectorAll("[data-knowledge-operations-replay]")) {
+    button.addEventListener("click", async () => {
+      const action = button.getAttribute("data-knowledge-operations-replay") || "";
+      const bookID = button.getAttribute("data-book-id") || "";
+      await replayKnowledgeOperationsAction(bookID, action);
+    });
+  }
+}
+
+async function loadKnowledgeOperationsConsole() {
+  knowledgeOperationsState.loading = "加载 Operations";
+  knowledgeOperationsState.message = "";
+  renderKnowledgeOperationsConsole();
+  try {
+    knowledgeOperationsState.console = await apiFetch("/api/knowledge/operations?limit=100");
+    knowledgeOperationsState.message = "Operations 已刷新。";
+  } catch (error) {
+    knowledgeOperationsState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeOperationsState.loading = "";
+    renderKnowledgeOperationsConsole();
+  }
+}
+
+async function replayKnowledgeOperationsAction(bookID, action) {
+  if (!(action === "analyze" || action === "evaluate_quality")) {
+    knowledgeOperationsState.message = "该动作不是安全 replay。";
+    renderKnowledgeOperationsConsole();
+    return;
+  }
+  const ok = window.confirm(`确认安全重放 ${action}？不会执行 publish，也不会推进 Health serving。`);
+  if (!ok) {
+    return;
+  }
+  knowledgeOperationsState.replaying = `${bookID}:${action}`;
+  knowledgeOperationsState.message = "安全重放执行中";
+  renderKnowledgeOperationsConsole();
+  try {
+    knowledgeOperationsState.replayResult = await apiFetch("/api/knowledge/operations/replay", {
+      method: "POST",
+      body: JSON.stringify({
+        book_id: bookID,
+        action,
+        confirm: true,
+        model: knowledgeState.analysisModel || "qwen3.7-max",
+        max_context_chars: 16000,
+      }),
+    });
+    knowledgeOperationsState.console = await apiFetch("/api/knowledge/operations?limit=100");
+    knowledgeOperationsState.message = "安全重放完成。";
+  } catch (error) {
+    knowledgeOperationsState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeOperationsState.replaying = "";
+    renderKnowledgeOperationsConsole();
+  }
+}
+
 async function loadKnowledgeReviewCockpit({ silent = false, renderResult = true } = {}) {
   if (!silent) {
     knowledgeState.reviewCockpitLoading = "加载全局复核";
@@ -5499,6 +5661,11 @@ async function boot() {
   if (routePathname === ROUTES.jobs || routePathname.startsWith(`${ROUTES.jobs}/`)) {
     renderJobCenter();
     await loadJobCenter();
+    return;
+  }
+  if (routePathname === ROUTES.operations) {
+    renderKnowledgeOperationsConsole();
+    await loadKnowledgeOperationsConsole();
     return;
   }
   const dedaoCourseEnID = getDedaoCourseDetailEnID();
