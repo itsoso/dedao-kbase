@@ -1784,6 +1784,60 @@ Online verification:
 Health deployment may now resume. G6 remains pending until the consumer
 deployment and pilot publication/import/feedback sequence pass online.
 
+## Health consumer production deployment checkpoint
+
+**Decision: Health G5 PASS on clean `main@f58925b8`; consumer review and
+safety ownership remain in Health.** The Agent Package task remains explicit,
+draft-only, and unscheduled.
+
+Preflight and deployment evidence:
+
+- a fresh fetch confirmed `origin/main` remained
+  `f58925b8a4ad1d9abbf16ebe567f96dac818a71d`; the deployment clone was clean,
+  its root environment was linked to the existing production-form secret
+  source without copying values into Git, and `git diff --check` passed;
+- the first deployment invocation stopped before production mutation because
+  the clean clone was on a detached HEAD. It exited `128`; switching the same
+  exact revision onto local branch `main` closed that precondition;
+- the next attempt completed the database and environment backups, but its
+  unconditional 42 MiB Git bundle upload was interrupted by the server's SFTP
+  path. Production remained on the prior service revision and healthy;
+- the retry used the same deployment script with a process-local `scp`
+  compatibility wrapper that routed only the deploy-bundle destination through
+  resumable `rsync`; environment-file transfers still used normal `scp`. No
+  repository or production script was edited;
+- the final backup succeeded at
+  `/opt/health-app/backups/health_db_2026-07-21_10-18.sql.gz` (`40M`, mode
+  `0600`), including both force-RLS data checks. The previous environment was
+  backed up as `backend/.env.backup.20260721_101845`;
+- the server reset its clean `main` to exact `f58925b8`; dependency install,
+  managed migration validation (`applied: none`), food baseline seed, Phase 0
+  seed, and V2 artifact import completed before the deployment transaction
+  restarted backend, Celery worker, and Celery beat;
+- the local SSH transport detached while the long V2 import was still running.
+  Process inspection proved the one existing import transaction continued; no
+  duplicate deployment was started. It exited and performed the planned
+  service restarts.
+
+Online verification:
+
+- backend, Celery worker, and Celery beat are `active/running`, each with
+  `ExecMainStatus=0` and `NRestarts=0`; the deployed repository is clean
+  `main@f58925b8`;
+- local and public `/api/v1/health` report API, database, Redis, and Celery
+  healthy;
+- `system_health_score.py --skip-tests --url http://localhost:8000 --json`
+  returned `60/60`, `pass=true`, 11 ms health latency, 6 ms API P95, and zero
+  errors in the sampled 200 log lines;
+- the public skills manifest count matches the clean release: `22` local and
+  `22` online;
+- a production-process-form authenticated KBase probe returned HTTP 200 with
+  `packages_type=list packages_count=0`, confirming the fail-closed consumer
+  can now execute safely.
+
+G6 remains pending because no pilot Agent Package has yet been evaluated,
+published, imported into Proofroom, or held/imported as a Health review draft.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
