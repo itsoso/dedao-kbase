@@ -46,6 +46,31 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+
+	response := requestKBase(handler, http.MethodGet, "/api/agent-packages?limit=1", "consumer-token")
+	if response.Code != http.StatusOK {
+		t.Fatalf("empty package list status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Packages []AgentPackageRecord `json:"packages"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode empty package list: %v", err)
+	}
+	if payload.Packages == nil {
+		t.Fatalf("empty package list encoded as null: %s", response.Body.String())
+	}
+	if len(payload.Packages) != 0 {
+		t.Fatalf("empty package list = %#v", payload.Packages)
+	}
+}
+
 func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

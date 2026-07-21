@@ -1,6 +1,6 @@
 # Book Agent Platform Dossier
 
-**Status:** KBase production G5 PASS; consumer deployment and G6 online verification pending
+**Status:** KBase and Proofroom G5 PASS; empty-list contract hotfix verified locally, Health deployment pending
 
 ## Objective
 
@@ -33,10 +33,11 @@ prescription or dosage decisions, and personal-data write tools.
 - **G4 Review: PASS.** Fresh independent architecture and cross-consumer
   reviews returned GO on exact clean heads `eabd98e`, `c3324fec`, and
   `b7b1a610d`. No Critical, High, or Medium blockers remain.
-- **G5 Deployment health: IN PROGRESS.** KBase is deployed and healthy; consumer
-  deployment checks remain pending.
-- **G6 Online verification: PENDING.** Production publication and both consumer
-  flows still require exact online verification.
+- **G5 Deployment health: IN PROGRESS.** KBase and Proofroom are deployed and
+  healthy; Health deployment remains pending.
+- **G6 Online verification: BLOCKED.** A production empty-list probe found
+  `packages:null` instead of the required array. The hotfix passes locally but
+  has not yet been reviewed, published, and deployed.
 
 ## Checkpoint: Tasks 1-2
 
@@ -1663,6 +1664,72 @@ Successful rollout and G5 evidence:
 KBase is healthy at G5. Proofroom and Health deployment verification plus the
 pilot publication/import/feedback sequence remain pending; G6 has not been
 claimed.
+
+## Proofroom deployment and Health online-contract checkpoint
+
+**Decision: Proofroom G5 PASS; Health deployment stopped at a real online
+contract failure and returned upstream.** No Health service or production data
+was mutated.
+
+Proofroom deployment evidence:
+
+- production was healthy but behind at `9b155400`; its 84 worktree entries were
+  inspected before the repository deployment script's hard reset. Deleted
+  tracked entries were generated static assets, and every untracked code/data
+  path was absent from the new remote tree, so none would be overwritten;
+- the existing KBase consumer token was transferred directly between the two
+  servers without printing it and atomically added to
+  `/etc/browser-llm/env.conf`; the file remained `0600 root:root`;
+- the first local frontend preflight had no `node_modules` and failed only with
+  missing-module TypeScript errors. It was not counted. After `npm ci`, the
+  TypeScript/Vite production build and static verification passed on clean
+  `c3324fec`;
+- the locked server deployment reset to exact `main@c3324fec`, installed
+  dependencies, built and verified 111 manifest assets, atomically selected
+  `react-app-c3324fec`, restarted the backend, verified anonymous auth `401`,
+  and verified nine public frontend assets at HTTP 200;
+- online `/api/deploy-health` reported `ok=true`, DB and scheduler healthy, and
+  matching Git/frontend SHAs `c3324fec`; `/api/llm/health` reported `ok=true`,
+  six exposed models, and a configured token; systemd reported `active` and
+  `NRestarts=0`;
+- a server-side authenticated request from Proofroom to KBase returned HTTP
+  200. At that point no Agent Packages had been published.
+
+Health preflight evidence:
+
+- after the reviewed `b7b1a610` head, Health `main` advanced to `f58925b8` by
+  mobile, generated-type, and documentation commits. `b7b1a610` is an ancestor,
+  and the Book Agent integration, lifecycle task, tests, and deployment script
+  are unchanged between the revisions;
+- the current clean `main@f58925b8` eleven-file backend/reconciliation/safety
+  matrix passed: `235 passed, 7 warnings in 86.80s`; document drift, diff, and
+  clean status checks passed;
+- the production-form root environment authenticated to KBase with HTTP 200,
+  but the response field inspection returned `packages_type=NoneType`;
+- Health's consumer correctly requires `packages` to be a JSON array and would
+  fail closed. Health deployment was therefore stopped before mutation.
+
+Upstream empty-list contract remediation:
+
+- RED: `go test ./backend/app -run
+  TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray -count=1` failed with
+  `empty package list encoded as null` and body
+  `{"next_cursor":"","packages":null}`;
+- the store now returns a non-nil empty `[]AgentPackageRecord`, preserving the
+  same behavior for non-empty pages while normalizing every caller;
+- focused HTTP/store tests — PASS in `3.348s`;
+- `go test ./...` — PASS, including backend app `35.040s` and KBase server
+  `2.624s`;
+- `go test -race ./backend/app ./cmd/kbase-server` — PASS in `32.226s` and
+  `4.160s`, with only the existing macOS linker warnings;
+- knowledge contract/evaluation, Proof consumer, Health evidence, source-agent,
+  and WC Plus packaging smokes — PASS; system-map drift, privacy smoke, and
+  `git diff --check` — PASS;
+- no structural inventory changed, so system-map artifacts were not regenerated.
+
+The remediation is not yet deployed. G6 remains BLOCKED until the reviewed
+hotfix is on clean main, KBase is redeployed, and the Health probe receives
+`packages:[]` before Health deployment resumes.
 
 ## Decisions
 

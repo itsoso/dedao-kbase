@@ -212,7 +212,7 @@ func (s *BookKnowledgeStore) ListAgentPackages(after string, limit int) ([]Agent
 	if end > len(manifest.Packages) {
 		end = len(manifest.Packages)
 	}
-	return append([]AgentPackageRecord(nil), manifest.Packages[start:end]...), nil
+	return append([]AgentPackageRecord{}, manifest.Packages[start:end]...), nil
 }
 
 func (s *BookKnowledgeStore) loadAgentPackageByIdentityUnlocked(manifest *AgentPackageManifest, packageID, version string) (*AgentPackage, error) {
