@@ -1577,6 +1577,23 @@ production KBase secret store, then resume G5 deployment from the clean main
 revision and run the full package publication, Proofroom import, Health
 hold/import, citation, receipt, and feedback-closure online checks.
 
+### Blocker recheck after requested resume
+
+The public health probe and production environment presence-only check were
+repeated on 2026-07-20. Exact results:
+
+- `/health` returned `{"ok":true,"service":"dedao-kbase"}`;
+- `KBASE_AUTH_TOKEN=present`;
+- `KBASE_AGENT_PUBLISHER_TOKEN=missing`;
+- `KBASE_EMBEDDING_BASE_URL=missing`;
+- `KBASE_EMBEDDING_PROVIDER=missing`;
+- `KBASE_EMBEDDING_MODEL=missing`;
+- `KBASE_EMBEDDING_VERSION=missing`;
+- `KBASE_EMBEDDING_API_KEY=missing`.
+
+The blocker is unchanged. No secret values were read or printed, and no
+production mutation or deployment was attempted.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
