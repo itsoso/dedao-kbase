@@ -1736,6 +1736,54 @@ The remediation is not yet deployed. G6 remains BLOCKED until the reviewed
 hotfix is on clean main, KBase is redeployed, and the Health probe receives
 `packages:[]` before Health deployment resumes.
 
+## KBase empty-page hotfix deployment checkpoint
+
+**Decision: KBase G5 remains PASS on reviewed `main@e5b86bb`; the online
+contract blocker is closed.** No production secret was printed or changed.
+
+Release and build evidence:
+
+- immediately before both explicit pushes, `bash scripts/privacy-smoke.sh`,
+  `git diff --check`, and clean-status checks passed; `git fetch` plus
+  `git merge-base --is-ancestor` passed before the main push, and
+  `git ls-remote` confirmed both `main` and `codex/book-agent-platform` at
+  `e5b86bbd0c0b3c9e14bd51eddc7b941b544ceeb9`;
+- the clean-main frontend production build passed. The exact source archive
+  SHA-256 was
+  `7975846c2f7d4de4caaec5904a41f1d832630da5b3f41e73085984f7c640c600`;
+  an interrupted first transfer produced a different server hash and was
+  rejected before extraction. The resumed transfer matched exactly;
+- the server reused the previously checksum-verified official Go `1.23.12`
+  Linux amd64 toolchain and normal module checksum verification. Linux CGO
+  `go test ./...` passed: backend app `9.944s`, services `3.559s`, utils
+  `0.484s`, KBase server `0.080s`, source agent `0.143s`, system map `0.114s`,
+  and WC Plus agent `0.178s`;
+- the reviewed Linux CGO binary SHA-256 is
+  `26c4e5bc3d11489ee6748bca35597d30e4f5564d64f833b33f5dfbdb8780fcd1`.
+  Its only dynamic runtime dependency is the production glibc surface;
+- an isolated service-user SQLite/health smoke passed and returned
+  `packages_type=list packages_count=0` before rollout;
+- the atomic rollout retained the prior binary at
+  `/opt/dedao-kbase/bin/kbase-server.backup-e5b86bb-20260721101132` and
+  succeeded without invoking rollback.
+
+Online verification:
+
+- local and public health passed; systemd reported `active/running`,
+  `ExecMainStatus=0`, and `NRestarts=0`;
+- anonymous list, authenticated consumer list, consumer evaluation, and
+  publisher-authenticated invalid evaluation returned `401`, `200`, `401`,
+  and `400` respectively;
+- the authenticated empty collection now returns a JSON array with zero
+  elements, closing the Health fail-closed preflight blocker;
+- the loopback embedding probe returned a finite, non-zero 768-dimensional
+  vector. Docker reported the pinned container running with
+  `restart=unless-stopped`, the pinned model digest prefix `85462619ee72`, and
+  port `11434` remained loopback-only.
+
+Health deployment may now resume. G6 remains pending until the consumer
+deployment and pilot publication/import/feedback sequence pass online.
+
 ## Decisions
 
 1. KBase remains the knowledge authoring and release control plane.
