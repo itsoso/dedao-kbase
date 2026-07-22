@@ -15,13 +15,20 @@ import (
 )
 
 const (
-	ClinicalTrialsGovBaseURL         = "https://clinicaltrials.gov"
-	ClinicalTrialsGovStudySourceType = "clinicaltrials_gov_study"
-	ClinicalTrialsGovMaxStudyBytes   = 1 << 20
-	ClinicalTrialsGovMaxVersionBytes = 64 << 10
-	ClinicalTrialsGovMaxRetryAfter   = time.Hour
+	ClinicalTrialsGovBaseURL              = "https://clinicaltrials.gov"
+	ClinicalTrialsGovStudySourceType      = "clinicaltrials_gov_study"
+	ClinicalTrialsGovMaxStudyBytes        = 1 << 20
+	ClinicalTrialsGovMaxVersionBytes      = 64 << 10
+	ClinicalTrialsGovMaxRetryAfter        = time.Hour
+	ClinicalTrialsGovMaxRequestTimeout    = 2 * time.Minute
+	ClinicalTrialsGovMaxReportedOutcomes  = 256
+	ClinicalTrialsGovMaxResultGroups      = 128
+	ClinicalTrialsGovMaxResultClasses     = 256
+	ClinicalTrialsGovMaxResultCategories  = 512
+	ClinicalTrialsGovMaxGroupMeasurements = 2048
 
-	clinicalTrialsGovUserAgent = "dedao-kbase/clinical-trial-audit"
+	clinicalTrialsGovUserAgent             = "dedao-kbase/clinical-trial-audit"
+	clinicalTrialsGovDefaultRequestTimeout = 20 * time.Second
 )
 
 type ClinicalTrialsGovErrorKind string
@@ -123,6 +130,45 @@ type ClinicalTrialsGovPublicationReference struct {
 	Citation string `json:"citation"`
 }
 
+type ClinicalTrialsGovResultGroup struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description,omitempty"`
+}
+
+type ClinicalTrialsGovGroupMeasurement struct {
+	GroupID    string `json:"group_id"`
+	Value      string `json:"value,omitempty"`
+	Spread     string `json:"spread,omitempty"`
+	LowerLimit string `json:"lower_limit,omitempty"`
+	UpperLimit string `json:"upper_limit,omitempty"`
+	Comment    string `json:"comment,omitempty"`
+}
+
+type ClinicalTrialsGovResultCategory struct {
+	Title        string                              `json:"title,omitempty"`
+	Measurements []ClinicalTrialsGovGroupMeasurement `json:"measurements,omitempty"`
+}
+
+type ClinicalTrialsGovResultClass struct {
+	Title      string                            `json:"title,omitempty"`
+	Categories []ClinicalTrialsGovResultCategory `json:"categories,omitempty"`
+}
+
+type ClinicalTrialsGovReportedOutcome struct {
+	Type                  string                         `json:"type"`
+	Title                 string                         `json:"title"`
+	Description           string                         `json:"description,omitempty"`
+	TimeFrame             string                         `json:"time_frame,omitempty"`
+	Units                 string                         `json:"units,omitempty"`
+	Parameter             string                         `json:"parameter,omitempty"`
+	Dispersion            string                         `json:"dispersion,omitempty"`
+	ReportingStatus       string                         `json:"reporting_status,omitempty"`
+	PopulationDescription string                         `json:"population_description,omitempty"`
+	Groups                []ClinicalTrialsGovResultGroup `json:"groups,omitempty"`
+	Classes               []ClinicalTrialsGovResultClass `json:"classes,omitempty"`
+}
+
 type ClinicalTrialsGovStudy struct {
 	SourceAPIVersion      string                                  `json:"source_api_version"`
 	NCTID                 string                                  `json:"nct_id"`
@@ -144,6 +190,7 @@ type ClinicalTrialsGovStudy struct {
 	ResultsFirstPosted    ClinicalTrialsGovDate                   `json:"results_first_posted,omitempty"`
 	LastUpdatePosted      ClinicalTrialsGovDate                   `json:"last_update_posted"`
 	HasResults            bool                                    `json:"has_results"`
+	ReportedOutcomes      []ClinicalTrialsGovReportedOutcome      `json:"reported_outcomes,omitempty"`
 	PublicationReferences []ClinicalTrialsGovPublicationReference `json:"publication_references,omitempty"`
 }
 
@@ -154,9 +201,9 @@ type ClinicalTrialsGovStudyResult struct {
 	DataTimestamp string                      `json:"data_timestamp"`
 }
 
-type ClinicalTrialsGovOption func(*ClinicalTrialsGovClient)
+type clinicalTrialsGovOption func(*ClinicalTrialsGovClient)
 
-func WithClinicalTrialsGovClock(clock func() time.Time) ClinicalTrialsGovOption {
+func withClinicalTrialsGovClock(clock func() time.Time) clinicalTrialsGovOption {
 	return func(client *ClinicalTrialsGovClient) {
 		if clock != nil {
 			client.now = clock
@@ -164,23 +211,39 @@ func WithClinicalTrialsGovClock(clock func() time.Time) ClinicalTrialsGovOption 
 	}
 }
 
-type ClinicalTrialsGovClient struct {
-	httpClient *http.Client
-	baseURL    *url.URL
-	now        func() time.Time
+func withClinicalTrialsGovRequestTimeout(timeout time.Duration) clinicalTrialsGovOption {
+	return func(client *ClinicalTrialsGovClient) {
+		client.requestTimeout = timeout
+	}
 }
 
-func NewClinicalTrialsGovClient(httpClient *http.Client, baseURL string, options ...ClinicalTrialsGovOption) (*ClinicalTrialsGovClient, error) {
-	if strings.TrimSpace(baseURL) == "" {
-		baseURL = ClinicalTrialsGovBaseURL
+type ClinicalTrialsGovClient struct {
+	httpClient     *http.Client
+	baseURL        *url.URL
+	now            func() time.Time
+	requestTimeout time.Duration
+}
+
+func NewClinicalTrialsGovClient() *ClinicalTrialsGovClient {
+	client, err := newClinicalTrialsGovClient(
+		&http.Client{Timeout: clinicalTrialsGovDefaultRequestTimeout},
+		ClinicalTrialsGovBaseURL,
+		withClinicalTrialsGovRequestTimeout(clinicalTrialsGovDefaultRequestTimeout),
+	)
+	if err != nil {
+		panic("invalid fixed ClinicalTrials.gov client configuration")
 	}
+	return client
+}
+
+func newClinicalTrialsGovClient(httpClient *http.Client, baseURL string, options ...clinicalTrialsGovOption) (*ClinicalTrialsGovClient, error) {
 	parsed, err := url.Parse(baseURL)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return nil, fmt.Errorf("invalid ClinicalTrials.gov base URL")
 	}
 	parsed.Path = strings.TrimRight(parsed.Path, "/")
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 20 * time.Second}
+		httpClient = &http.Client{}
 	}
 	cloned := *httpClient
 	originalRedirect := cloned.CheckRedirect
@@ -198,11 +261,19 @@ func NewClinicalTrialsGovClient(httpClient *http.Client, baseURL string, options
 		}
 		return nil
 	}
-	client := &ClinicalTrialsGovClient{httpClient: &cloned, baseURL: parsed, now: time.Now}
+	client := &ClinicalTrialsGovClient{
+		httpClient:     &cloned,
+		baseURL:        parsed,
+		now:            time.Now,
+		requestTimeout: clinicalTrialsGovDefaultRequestTimeout,
+	}
 	for _, option := range options {
 		if option != nil {
 			option(client)
 		}
+	}
+	if client.requestTimeout <= 0 || client.requestTimeout > ClinicalTrialsGovMaxRequestTimeout {
+		return nil, fmt.Errorf("invalid ClinicalTrials.gov request timeout")
 	}
 	return client, nil
 }
@@ -215,6 +286,8 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 	if err != nil {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorInvalidInput, cause: err}
 	}
+	ctx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+	defer cancel()
 	version, err := c.getVersion(ctx)
 	if err != nil {
 		return ClinicalTrialsGovStudyResult{}, err
@@ -349,7 +422,53 @@ func parseClinicalTrialsGovRetryAfter(raw string, now time.Time) time.Duration {
 
 type clinicalTrialsGovRawStudy struct {
 	ProtocolSection json.RawMessage `json:"protocolSection"`
+	ResultsSection  json.RawMessage `json:"resultsSection"`
 	HasResults      bool            `json:"hasResults"`
+}
+
+type clinicalTrialsGovResultsSection struct {
+	OutcomeMeasuresModule struct {
+		OutcomeMeasures []clinicalTrialsGovUpstreamReportedOutcome `json:"outcomeMeasures"`
+	} `json:"outcomeMeasuresModule"`
+}
+
+type clinicalTrialsGovUpstreamReportedOutcome struct {
+	Type                  string                                 `json:"type"`
+	Title                 string                                 `json:"title"`
+	Description           string                                 `json:"description"`
+	TimeFrame             string                                 `json:"timeFrame"`
+	Units                 string                                 `json:"units"`
+	Parameter             string                                 `json:"paramType"`
+	Dispersion            string                                 `json:"dispersionType"`
+	ReportingStatus       string                                 `json:"reportingStatus"`
+	PopulationDescription string                                 `json:"populationDescription"`
+	Groups                []clinicalTrialsGovUpstreamResultGroup `json:"groups"`
+	Classes               []clinicalTrialsGovUpstreamResultClass `json:"classes"`
+}
+
+type clinicalTrialsGovUpstreamResultGroup struct {
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+type clinicalTrialsGovUpstreamResultClass struct {
+	Title      string                                    `json:"title"`
+	Categories []clinicalTrialsGovUpstreamResultCategory `json:"categories"`
+}
+
+type clinicalTrialsGovUpstreamResultCategory struct {
+	Title        string                                      `json:"title"`
+	Measurements []clinicalTrialsGovUpstreamGroupMeasurement `json:"measurements"`
+}
+
+type clinicalTrialsGovUpstreamGroupMeasurement struct {
+	GroupID    string `json:"groupId"`
+	Value      string `json:"value"`
+	Spread     string `json:"spread"`
+	LowerLimit string `json:"lowerLimit"`
+	UpperLimit string `json:"upperLimit"`
+	Comment    string `json:"comment"`
 }
 
 type clinicalTrialsGovProtocol struct {
@@ -457,6 +576,9 @@ func normalizeClinicalTrialsGovStudy(body []byte, apiVersion string) (ClinicalTr
 		PublicationReferences: normalizeClinicalTrialsGovReferences(protocol.ReferencesModule.References),
 	}
 	var err error
+	if study.ReportedOutcomes, err = normalizeClinicalTrialsGovReportedOutcomes(raw.ResultsSection); err != nil {
+		return ClinicalTrialsGovStudy{}, err
+	}
 	if study.StartDate, err = normalizeClinicalTrialsGovDate(protocol.StatusModule.StartDateStruct); err != nil {
 		return ClinicalTrialsGovStudy{}, schemaInvalidClinicalTrialsGovError(err)
 	}
@@ -578,6 +700,99 @@ func normalizeClinicalTrialsGovOutcomes(values []clinicalTrialsGovUpstreamOutcom
 		}
 	}
 	return normalized
+}
+
+func normalizeClinicalTrialsGovReportedOutcomes(raw json.RawMessage) ([]ClinicalTrialsGovReportedOutcome, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var results clinicalTrialsGovResultsSection
+	if err := json.Unmarshal(raw, &results); err != nil {
+		return nil, schemaInvalidClinicalTrialsGovError(err)
+	}
+	values := results.OutcomeMeasuresModule.OutcomeMeasures
+	if len(values) > ClinicalTrialsGovMaxReportedOutcomes {
+		return nil, schemaInvalidClinicalTrialsGovError(errors.New("reported outcomes exceed limit"))
+	}
+	normalized := make([]ClinicalTrialsGovReportedOutcome, 0, len(values))
+	for _, value := range values {
+		outcome, err := normalizeClinicalTrialsGovReportedOutcome(value)
+		if err != nil {
+			return nil, err
+		}
+		normalized = append(normalized, outcome)
+	}
+	return normalized, nil
+}
+
+func normalizeClinicalTrialsGovReportedOutcome(value clinicalTrialsGovUpstreamReportedOutcome) (ClinicalTrialsGovReportedOutcome, error) {
+	if len(value.Groups) > ClinicalTrialsGovMaxResultGroups || len(value.Classes) > ClinicalTrialsGovMaxResultClasses {
+		return ClinicalTrialsGovReportedOutcome{}, schemaInvalidClinicalTrialsGovError(errors.New("reported outcome structure exceeds limit"))
+	}
+	outcome := ClinicalTrialsGovReportedOutcome{
+		Type:                  strings.TrimSpace(value.Type),
+		Title:                 strings.TrimSpace(value.Title),
+		Description:           strings.TrimSpace(value.Description),
+		TimeFrame:             strings.TrimSpace(value.TimeFrame),
+		Units:                 strings.TrimSpace(value.Units),
+		Parameter:             strings.TrimSpace(value.Parameter),
+		Dispersion:            strings.TrimSpace(value.Dispersion),
+		ReportingStatus:       strings.TrimSpace(value.ReportingStatus),
+		PopulationDescription: strings.TrimSpace(value.PopulationDescription),
+		Groups:                make([]ClinicalTrialsGovResultGroup, 0, len(value.Groups)),
+		Classes:               make([]ClinicalTrialsGovResultClass, 0, len(value.Classes)),
+	}
+	if outcome.Type == "" || outcome.Title == "" {
+		return ClinicalTrialsGovReportedOutcome{}, schemaInvalidClinicalTrialsGovError(errors.New("reported outcome identity is required"))
+	}
+	for _, valueGroup := range value.Groups {
+		group := ClinicalTrialsGovResultGroup{
+			ID:          strings.TrimSpace(valueGroup.ID),
+			Title:       strings.TrimSpace(valueGroup.Title),
+			Description: strings.TrimSpace(valueGroup.Description),
+		}
+		if group.ID == "" || group.Title == "" {
+			return ClinicalTrialsGovReportedOutcome{}, schemaInvalidClinicalTrialsGovError(errors.New("reported outcome group identity is required"))
+		}
+		outcome.Groups = append(outcome.Groups, group)
+	}
+	measurementCount := 0
+	for _, valueClass := range value.Classes {
+		if len(valueClass.Categories) > ClinicalTrialsGovMaxResultCategories {
+			return ClinicalTrialsGovReportedOutcome{}, schemaInvalidClinicalTrialsGovError(errors.New("reported outcome categories exceed limit"))
+		}
+		class := ClinicalTrialsGovResultClass{
+			Title:      strings.TrimSpace(valueClass.Title),
+			Categories: make([]ClinicalTrialsGovResultCategory, 0, len(valueClass.Categories)),
+		}
+		for _, valueCategory := range valueClass.Categories {
+			measurementCount += len(valueCategory.Measurements)
+			if measurementCount > ClinicalTrialsGovMaxGroupMeasurements {
+				return ClinicalTrialsGovReportedOutcome{}, schemaInvalidClinicalTrialsGovError(errors.New("reported outcome measurements exceed limit"))
+			}
+			category := ClinicalTrialsGovResultCategory{
+				Title:        strings.TrimSpace(valueCategory.Title),
+				Measurements: make([]ClinicalTrialsGovGroupMeasurement, 0, len(valueCategory.Measurements)),
+			}
+			for _, valueMeasurement := range valueCategory.Measurements {
+				measurement := ClinicalTrialsGovGroupMeasurement{
+					GroupID:    strings.TrimSpace(valueMeasurement.GroupID),
+					Value:      strings.TrimSpace(valueMeasurement.Value),
+					Spread:     strings.TrimSpace(valueMeasurement.Spread),
+					LowerLimit: strings.TrimSpace(valueMeasurement.LowerLimit),
+					UpperLimit: strings.TrimSpace(valueMeasurement.UpperLimit),
+					Comment:    strings.TrimSpace(valueMeasurement.Comment),
+				}
+				if measurement.GroupID == "" {
+					return ClinicalTrialsGovReportedOutcome{}, schemaInvalidClinicalTrialsGovError(errors.New("reported outcome measurement group is required"))
+				}
+				category.Measurements = append(category.Measurements, measurement)
+			}
+			class.Categories = append(class.Categories, category)
+		}
+		outcome.Classes = append(outcome.Classes, class)
+	}
+	return outcome, nil
 }
 
 func normalizeClinicalTrialsGovReferences(values []ClinicalTrialsGovPublicationReference) []ClinicalTrialsGovPublicationReference {

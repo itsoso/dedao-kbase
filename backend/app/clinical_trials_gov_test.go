@@ -62,7 +62,35 @@ const clinicalTrialsGovStudyFixture = `{
       ]
     }
   },
-  "resultsSection": {"participantFlowModule": {}},
+  "resultsSection": {
+    "outcomeMeasuresModule": {
+      "outcomeMeasures": [{
+        "type": "PRIMARY",
+        "title": "Primary synthetic score",
+        "description": "Reported change from baseline",
+        "populationDescription": "Synthetic analysis population",
+        "reportingStatus": "POSTED",
+        "paramType": "MEAN",
+        "dispersionType": "STANDARD_DEVIATION",
+        "units": "points",
+        "timeFrame": "Week 24",
+        "groups": [
+          {"id": "FG000", "title": "Experimental", "description": "Synthetic intervention arm"},
+          {"id": "FG001", "title": "Control", "description": "Synthetic control arm"}
+        ],
+        "classes": [{
+          "title": "Overall",
+          "categories": [{
+            "title": "Change from baseline",
+            "measurements": [
+              {"groupId": "FG000", "value": "8.2", "spread": "1.1", "lowerLimit": "7.9", "upperLimit": "8.5", "comment": "Synthetic value"},
+              {"groupId": "FG001", "value": "5.0", "spread": "1.4"}
+            ]
+          }]
+        }]
+      }]
+    }
+  },
   "annotationSection": {"annotationModule": {}},
   "documentSection": {"largeDocumentModule": {}},
   "derivedSection": {"miscInfoModule": {"versionHolder": "2026-07-20"}},
@@ -91,7 +119,7 @@ func TestClinicalTrialsGovGetStudyNormalizesCurrentRecord(t *testing.T) {
 	defer server.Close()
 
 	retrievedAt := time.Date(2026, 7, 22, 9, 30, 0, 123, time.FixedZone("test", -4*60*60))
-	client, err := NewClinicalTrialsGovClient(server.Client(), server.URL, WithClinicalTrialsGovClock(func() time.Time { return retrievedAt }))
+	client, err := newClinicalTrialsGovClient(server.Client(), server.URL, withClinicalTrialsGovClock(func() time.Time { return retrievedAt }))
 	if err != nil {
 		t.Fatalf("NewClinicalTrialsGovClient() error = %v", err)
 	}
@@ -128,6 +156,20 @@ func TestClinicalTrialsGovGetStudyNormalizesCurrentRecord(t *testing.T) {
 	if !study.HasResults || len(study.PublicationReferences) != 2 || study.PublicationReferences[0].PMID != "12345678" {
 		t.Fatalf("results/references = %#v", study)
 	}
+	if len(study.ReportedOutcomes) != 1 {
+		t.Fatalf("reported outcomes = %#v", study.ReportedOutcomes)
+	}
+	reported := study.ReportedOutcomes[0]
+	if reported.Type != "PRIMARY" || reported.Title != "Primary synthetic score" || reported.Description == "" || reported.TimeFrame != "Week 24" || reported.Units != "points" || reported.Parameter != "MEAN" || reported.Dispersion != "STANDARD_DEVIATION" || reported.ReportingStatus != "POSTED" || reported.PopulationDescription == "" {
+		t.Fatalf("reported outcome identity = %#v", reported)
+	}
+	if len(reported.Groups) != 2 || reported.Groups[0].ID != "FG000" || len(reported.Classes) != 1 || len(reported.Classes[0].Categories) != 1 || len(reported.Classes[0].Categories[0].Measurements) != 2 {
+		t.Fatalf("reported outcome values = %#v", reported)
+	}
+	measurement := reported.Classes[0].Categories[0].Measurements[0]
+	if measurement.GroupID != "FG000" || measurement.Value != "8.2" || measurement.Spread != "1.1" || measurement.LowerLimit != "7.9" || measurement.UpperLimit != "8.5" {
+		t.Fatalf("reported measurement = %#v", measurement)
+	}
 	if result.Snapshot.SourceType != ClinicalTrialsGovStudySourceType || result.Snapshot.CanonicalID != "NCT01234567" || result.Snapshot.LicenseScope != "public_metadata" {
 		t.Fatalf("snapshot identity = %#v", result.Snapshot)
 	}
@@ -146,7 +188,7 @@ func TestClinicalTrialsGovSnapshotIdentityIsCanonical(t *testing.T) {
 			fmt.Fprintf(w, `{"dataTimestamp":"2026-07-21T15:04:05Z","apiVersion":%q}`, apiVersion)
 		case "/api/v2/studies/NCT01234567":
 			if requestCount.Add(1)%2 == 0 {
-				fmt.Fprintf(w, " { \n \"hasResults\": true, \"protocolSection\": %s } ", extractProtocolSection(t, studyBody))
+				fmt.Fprintf(w, " { \n \"hasResults\": true, \"resultsSection\": %s, \"protocolSection\": %s } ", extractResultsSection(t, studyBody), extractProtocolSection(t, studyBody))
 				return
 			}
 			fmt.Fprint(w, studyBody)
@@ -157,7 +199,7 @@ func TestClinicalTrialsGovSnapshotIdentityIsCanonical(t *testing.T) {
 	defer server.Close()
 
 	now := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
-	client, err := NewClinicalTrialsGovClient(server.Client(), server.URL, WithClinicalTrialsGovClock(func() time.Time { return now }))
+	client, err := newClinicalTrialsGovClient(server.Client(), server.URL, withClinicalTrialsGovClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +243,7 @@ func TestClinicalTrialsGovRejectsNonNCTBeforeHTTP(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests.Add(1) }))
 	defer server.Close()
-	client, err := NewClinicalTrialsGovClient(server.Client(), server.URL)
+	client, err := newClinicalTrialsGovClient(server.Client(), server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +293,7 @@ func TestClinicalTrialsGovClassifiesUpstreamFailures(t *testing.T) {
 				fmt.Fprint(w, test.studyBody)
 			}))
 			defer server.Close()
-			client, err := NewClinicalTrialsGovClient(server.Client(), server.URL)
+			client, err := newClinicalTrialsGovClient(server.Client(), server.URL)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -272,7 +314,7 @@ func TestClinicalTrialsGovClassifiesContextCancellationAndTimeout(t *testing.T) 
 		<-r.Context().Done()
 	}))
 	defer server.Close()
-	client, err := NewClinicalTrialsGovClient(server.Client(), server.URL)
+	client, err := newClinicalTrialsGovClient(server.Client(), server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,12 +337,77 @@ func TestClinicalTrialsGovClassifiesHTTPClientTimeout(t *testing.T) {
 	defer server.Close()
 	httpClient := server.Client()
 	httpClient.Timeout = 10 * time.Millisecond
-	client, err := NewClinicalTrialsGovClient(httpClient, server.URL)
+	client, err := newClinicalTrialsGovClient(httpClient, server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = client.GetStudy(context.Background(), "NCT01234567")
 	assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorTimeout)
+}
+
+func TestClinicalTrialsGovAppliesInternalTimeoutToZeroTimeoutHTTPClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	httpClient := server.Client()
+	httpClient.Timeout = 0
+	client, err := newClinicalTrialsGovClient(httpClient, server.URL, withClinicalTrialsGovRequestTimeout(15*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, err = client.GetStudy(context.Background(), "NCT01234567")
+	assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorTimeout)
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("internal timeout took %v", elapsed)
+	}
+}
+
+func TestClinicalTrialsGovProductionConstructorIsFixed(t *testing.T) {
+	client := NewClinicalTrialsGovClient()
+	if client.baseURL.Scheme != "https" || client.baseURL.Host != "clinicaltrials.gov" || client.baseURL.Path != "" {
+		t.Fatalf("production base URL = %q", client.baseURL.String())
+	}
+	if client.requestTimeout <= 0 || client.requestTimeout > ClinicalTrialsGovMaxRequestTimeout {
+		t.Fatalf("production request timeout = %v", client.requestTimeout)
+	}
+}
+
+func TestClinicalTrialsGovRejectsResultsSchemaDriftAndBounds(t *testing.T) {
+	protocol := extractProtocolSection(t, clinicalTrialsGovStudyFixture)
+	validOutcome := `{"type":"PRIMARY","title":"Synthetic outcome","groups":[{"id":"FG000","title":"Arm"}],"classes":[{"categories":[{"measurements":[{"groupId":"FG000","value":"1"}]}]}]}`
+	tests := []struct {
+		name    string
+		results string
+	}{
+		{name: "outcomes schema drift", results: `{"outcomeMeasuresModule":{"outcomeMeasures":"unexpected"}}`},
+		{name: "too many outcomes", results: fmt.Sprintf(`{"outcomeMeasuresModule":{"outcomeMeasures":[%s]}}`, strings.Join(repeatClinicalTrialsGovFixture(validOutcome, ClinicalTrialsGovMaxReportedOutcomes+1), ","))},
+		{name: "too many groups", results: fmt.Sprintf(`{"outcomeMeasuresModule":{"outcomeMeasures":[{"type":"PRIMARY","title":"Synthetic outcome","groups":[%s]}]}}`, strings.Join(repeatClinicalTrialsGovFixture(`{"id":"FG000","title":"Arm"}`, ClinicalTrialsGovMaxResultGroups+1), ","))},
+		{name: "too many classes", results: fmt.Sprintf(`{"outcomeMeasuresModule":{"outcomeMeasures":[{"type":"PRIMARY","title":"Synthetic outcome","classes":[%s]}]}}`, strings.Join(repeatClinicalTrialsGovFixture(`{"title":"Class"}`, ClinicalTrialsGovMaxResultClasses+1), ","))},
+		{name: "too many categories", results: fmt.Sprintf(`{"outcomeMeasuresModule":{"outcomeMeasures":[{"type":"PRIMARY","title":"Synthetic outcome","classes":[{"categories":[%s]}]}]}}`, strings.Join(repeatClinicalTrialsGovFixture(`{"title":"Category"}`, ClinicalTrialsGovMaxResultCategories+1), ","))},
+		{name: "too many measurements", results: fmt.Sprintf(`{"outcomeMeasuresModule":{"outcomeMeasures":[{"type":"PRIMARY","title":"Synthetic outcome","classes":[{"categories":[{"measurements":[%s]}]}]}]}}`, strings.Join(repeatClinicalTrialsGovFixture(`{"groupId":"FG000","value":"1"}`, ClinicalTrialsGovMaxGroupMeasurements+1), ","))},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"protocolSection":%s,"resultsSection":%s,"hasResults":true}`, protocol, test.results)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v2/version" {
+					fmt.Fprint(w, clinicalTrialsGovVersionFixture)
+					return
+				}
+				fmt.Fprint(w, body)
+			}))
+			defer server.Close()
+			client, err := newClinicalTrialsGovClient(server.Client(), server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.GetStudy(context.Background(), "NCT01234567")
+			assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorSchemaInvalid)
+		})
+	}
 }
 
 func TestClinicalTrialsGovBlocksRedirectHostEscape(t *testing.T) {
@@ -312,7 +419,7 @@ func TestClinicalTrialsGovBlocksRedirectHostEscape(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	client, err := NewClinicalTrialsGovClient(origin.Client(), origin.URL)
+	client, err := newClinicalTrialsGovClient(origin.Client(), origin.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,4 +458,27 @@ func extractProtocolSection(t *testing.T, body string) string {
 		t.Fatal("fixture lacks resultsSection boundary")
 	}
 	return strings.TrimSpace(body[start : start+end])
+}
+
+func extractResultsSection(t *testing.T, body string) string {
+	t.Helper()
+	start := strings.Index(body, `"resultsSection":`)
+	if start < 0 {
+		t.Fatal("fixture lacks resultsSection")
+	}
+	start += len(`"resultsSection":`)
+	end := strings.Index(body[start:], `,
+  "annotationSection"`)
+	if end < 0 {
+		t.Fatal("fixture lacks annotationSection boundary")
+	}
+	return strings.TrimSpace(body[start : start+end])
+}
+
+func repeatClinicalTrialsGovFixture(value string, count int) []string {
+	values := make([]string, count)
+	for index := range values {
+		values[index] = value
+	}
+	return values
 }
