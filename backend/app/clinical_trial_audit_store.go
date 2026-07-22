@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,10 +19,13 @@ import (
 )
 
 const (
-	clinicalTrialAuditDBName            = "clinical_trial_audits.sqlite3"
-	clinicalTrialAuditJSONMaxBytes      = 1 << 20
-	clinicalTrialAuditRequestMaxBytes   = 64 << 10
-	clinicalTrialAuditErrorCodeMaxBytes = 64
+	clinicalTrialAuditDBName                = "clinical_trial_audits.sqlite3"
+	clinicalTrialAuditJSONMaxBytes          = 1 << 20
+	clinicalTrialAuditRequestMaxBytes       = 64 << 10
+	clinicalTrialAuditErrorCodeMaxBytes     = 64
+	clinicalTrialAuditCursorEncodedMaxBytes = 1024
+	clinicalTrialAuditCursorDecodedMaxBytes = 512
+	clinicalTrialAuditSchemaVersion         = 2
 
 	ClinicalTrialAuditErrorIdentifierInvalid   = "identifier_invalid"
 	ClinicalTrialAuditErrorSourceNotFound      = "source_not_found"
@@ -43,6 +48,7 @@ var (
 	ErrClinicalTrialAuditTerminal            = errors.New("clinical trial audit run is terminal")
 	ErrClinicalTrialAuditInvalidTransition   = errors.New("invalid clinical trial audit transition")
 	ErrClinicalTrialAuditNotRetryable        = errors.New("clinical trial audit run is not retryable")
+	errClinicalTrialAuditRandomUnavailable   = errors.New("clinical trial audit secure randomness unavailable")
 )
 
 type ClinicalTrialAuditStoredRun struct {
@@ -92,10 +98,12 @@ type ClinicalTrialAuditPage struct {
 }
 
 type ClinicalTrialAuditStore struct {
-	root   string
-	dbPath string
-	now    func() time.Time
-	db     *sql.DB
+	root            string
+	dbPath          string
+	now             func() time.Time
+	random          io.Reader
+	db              *sql.DB
+	afterRunRowRead func()
 }
 
 func NewClinicalTrialAuditStore(root string) (*ClinicalTrialAuditStore, error) {
@@ -119,21 +127,21 @@ func newClinicalTrialAuditStore(root string, now func() time.Time) (*ClinicalTri
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	for _, statement := range []string{
-		`PRAGMA busy_timeout = 5000`,
-		`PRAGMA foreign_keys = ON`,
-		`PRAGMA journal_mode = WAL`,
-	} {
-		if _, err := db.Exec(statement); err != nil {
-			db.Close()
-			return nil, err
-		}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if err := migrateClinicalTrialAuditDB(db); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return &ClinicalTrialAuditStore{root: root, dbPath: dbPath, now: now, db: db}, nil
+	for _, statement := range []string{`PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	return &ClinicalTrialAuditStore{root: root, dbPath: dbPath, now: now, random: rand.Reader, db: db}, nil
 }
 
 func (s *ClinicalTrialAuditStore) Root() string {
@@ -158,7 +166,29 @@ func (s *ClinicalTrialAuditStore) Close() error {
 }
 
 func migrateClinicalTrialAuditDB(db *sql.DB) error {
-	_, err := db.Exec(`
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN EXCLUSIVE`); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+	var currentVersion int
+	if err := conn.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&currentVersion); err != nil {
+		return err
+	}
+	if currentVersion > clinicalTrialAuditSchemaVersion {
+		return fmt.Errorf("clinical trial audit schema version %d is newer than supported version %d", currentVersion, clinicalTrialAuditSchemaVersion)
+	}
+	_, err = conn.ExecContext(ctx, `
 		CREATE TABLE IF NOT EXISTS clinical_trial_audit_runs (
 			run_id TEXT PRIMARY KEY,
 			package_id TEXT NOT NULL,
@@ -223,22 +253,29 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 		{"lease_token_hash", "TEXT NOT NULL DEFAULT ''"},
 		{"lease_generation", "INTEGER NOT NULL DEFAULT 0"},
 	} {
-		if err := ensureClinicalTrialAuditColumn(db, "clinical_trial_audit_runs", column.name, column.definition); err != nil {
+		if err := ensureClinicalTrialAuditColumn(ctx, conn, "clinical_trial_audit_runs", column.name, column.definition); err != nil {
 			return err
 		}
 	}
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, clinicalTrialAuditSchemaVersion)); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return err
+	}
+	committed = true
 	return nil
 }
 
-func ensureClinicalTrialAuditColumn(db *sql.DB, table, column, definition string) error {
+func ensureClinicalTrialAuditColumn(ctx context.Context, conn *sql.Conn, table, column, definition string) error {
 	var count int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
 		return err
 	}
 	if count != 0 {
 		return nil
 	}
-	_, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	_, err := conn.ExecContext(ctx, `ALTER TABLE `+table+` ADD COLUMN `+column+` `+definition)
 	return err
 }
 
@@ -261,28 +298,18 @@ func (s *ClinicalTrialAuditStore) CreateRun(packageID, packageVersion string, re
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
+	operationNow := s.now().UTC()
+	runID, err := newClinicalTrialAuditStoreID(s.random)
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
 	defer tx.Rollback()
 
-	existing, err := clinicalTrialAuditIdempotency(tx, idempotencyKey)
-	if err == nil {
-		if existing.packageID != packageID || existing.packageVersion != packageVersion || existing.inputHash != finalized.InputHash {
-			return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditIdempotencyConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return ClinicalTrialAuditStoredRun{}, err
-		}
-		return s.GetRun(existing.runID)
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return ClinicalTrialAuditStoredRun{}, err
-	}
-
-	now := s.timestamp()
-	runID := newClinicalTrialAuditStoreID(s.now())
+	now := operationNow.Format(time.RFC3339Nano)
 	if _, err := tx.Exec(`
 		INSERT INTO clinical_trial_audit_runs (
 			run_id, package_id, package_version, idempotency_key, request_json,
@@ -292,12 +319,31 @@ func (s *ClinicalTrialAuditStore) CreateRun(packageID, packageVersion string, re
 		ClinicalTrialAuditRunQueued, now, now); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
-	if _, err := tx.Exec(`
+	result, err := tx.Exec(`
 		INSERT INTO clinical_trial_audit_idempotency_keys (
 			idempotency_key, run_id, package_id, package_version, input_hash, created_at
 		) VALUES (?, ?, ?, ?, ?, ?)
-	`, idempotencyKey, runID, packageID, packageVersion, finalized.InputHash, now); err != nil {
+		ON CONFLICT(idempotency_key) DO NOTHING
+	`, idempotencyKey, runID, packageID, packageVersion, finalized.InputHash, now)
+	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	if inserted == 0 {
+		existing, err := clinicalTrialAuditIdempotency(tx, idempotencyKey)
+		if err != nil {
+			return ClinicalTrialAuditStoredRun{}, err
+		}
+		if existing.packageID != packageID || existing.packageVersion != packageVersion || existing.inputHash != finalized.InputHash {
+			return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditIdempotencyConflict
+		}
+		if err := tx.Rollback(); err != nil {
+			return ClinicalTrialAuditStoredRun{}, err
+		}
+		return s.GetRun(existing.runID)
 	}
 	if err := tx.Commit(); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
@@ -306,14 +352,25 @@ func (s *ClinicalTrialAuditStore) CreateRun(packageID, packageVersion string, re
 }
 
 func (s *ClinicalTrialAuditStore) GetRun(runID string) (ClinicalTrialAuditStoredRun, error) {
-	run, err := scanClinicalTrialAuditStoredRun(s.db.QueryRow(clinicalTrialAuditRunSelect+` WHERE run_id = ?`, strings.TrimSpace(runID)))
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	defer tx.Rollback()
+	run, err := scanClinicalTrialAuditStoredRun(tx.QueryRow(clinicalTrialAuditRunSelect+` WHERE run_id = ?`, strings.TrimSpace(runID)))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditRunNotFound
 	}
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
-	if err := s.loadClinicalTrialAuditRunData(&run); err != nil {
+	if s.afterRunRowRead != nil {
+		s.afterRunRowRead()
+	}
+	if err := loadClinicalTrialAuditRunData(tx, &run); err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
 	return run, nil
@@ -379,17 +436,21 @@ func (s *ClinicalTrialAuditStore) LeaseNextRun(workerID string, leaseDuration ti
 	if leaseDuration <= 0 {
 		leaseDuration = 2 * time.Minute
 	}
+	operationNow := s.now().UTC()
+	leaseToken, err := newClinicalTrialAuditLeaseToken(s.random)
+	if err != nil {
+		return nil, err
+	}
+	leaseTokenHash := hashClinicalTrialValue(leaseToken)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err := recoverExpiredClinicalTrialAuditLeases(tx, s.timestamp()); err != nil {
+	operationTimestamp := operationNow.Format(time.RFC3339Nano)
+	if _, err := recoverExpiredClinicalTrialAuditLeases(tx, operationTimestamp); err != nil {
 		return nil, err
 	}
-	now := s.now().UTC()
-	leaseToken := newClinicalTrialAuditLeaseToken(workerID, now)
-	leaseTokenHash := hashClinicalTrialValue(leaseToken)
 	var runID string
 	err = tx.QueryRow(`
 		UPDATE clinical_trial_audit_runs SET
@@ -402,8 +463,8 @@ func (s *ClinicalTrialAuditStore) LeaseNextRun(workerID string, leaseDuration ti
 			ORDER BY created_at, run_id LIMIT 1
 		) AND state = ? AND lease_owner = ''
 		RETURNING run_id
-	`, ClinicalTrialAuditRunCollecting, workerID, leaseTokenHash, now.Add(leaseDuration).Format(time.RFC3339Nano),
-		now.Format(time.RFC3339Nano), ClinicalTrialAuditRunQueued, ClinicalTrialAuditRunQueued).Scan(&runID)
+	`, ClinicalTrialAuditRunCollecting, workerID, leaseTokenHash, operationNow.Add(leaseDuration).Format(time.RFC3339Nano),
+		operationTimestamp, ClinicalTrialAuditRunQueued, ClinicalTrialAuditRunQueued).Scan(&runID)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, err
@@ -445,6 +506,8 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	if err := validateClinicalTrialAuditCheckpointEvidence(checkpoint); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
+	operationNow := s.now().UTC()
+	operationTimestamp := operationNow.Format(time.RFC3339Nano)
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -465,7 +528,7 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	if run.leaseTokenHash == "" || run.leaseTokenHash != leaseTokenHash {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseFence
 	}
-	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, s.now()) {
+	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, operationNow) {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
 	}
 	if !validClinicalTrialAuditTransition(run.State, checkpoint.State) {
@@ -482,7 +545,7 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 		contractRun := ClinicalTrialAuditRun{
 			SchemaVersion: ClinicalTrialAuditRunSchemaVersion,
 			RunID:         run.RunID, State: checkpoint.State, Request: run.Request, Audit: &audit,
-			CreatedAt: run.CreatedAt, UpdatedAt: s.timestamp(),
+			CreatedAt: run.CreatedAt, UpdatedAt: operationTimestamp,
 		}
 		if _, err := FinalizeClinicalTrialAuditRun(contractRun); err != nil {
 			return ClinicalTrialAuditStoredRun{}, err
@@ -498,7 +561,6 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	if err := persistClinicalTrialAuditCheckpoint(tx, runID, checkpoint); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
-	now := s.timestamp()
 	leaseOwner := run.LeaseOwner
 	storedLeaseTokenHash := run.leaseTokenHash
 	leaseExpiresAt := run.LeaseExpiresAt
@@ -511,13 +573,14 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 		UPDATE clinical_trial_audit_runs SET state = ?, retryable = ?, error_code = ?,
 			lease_owner = ?, lease_token_hash = ?, lease_expires_at = ?, updated_at = ?
 		WHERE run_id = ? AND state = ? AND lease_owner = ? AND lease_token_hash = ?
+			AND julianday(lease_expires_at) > julianday(?)
 	`, checkpoint.State, boolToClinicalTrialAuditInt(checkpoint.Retryable), strings.TrimSpace(checkpoint.ErrorCode),
-		leaseOwner, storedLeaseTokenHash, leaseExpiresAt, now, runID, run.State, workerID, leaseTokenHash)
+		leaseOwner, storedLeaseTokenHash, leaseExpiresAt, operationTimestamp, runID, run.State, workerID, leaseTokenHash, operationTimestamp)
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
 	if rows, _ := result.RowsAffected(); rows != 1 {
-		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditInvalidTransition
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
 	}
 	if err := tx.Commit(); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
@@ -525,13 +588,74 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	return s.GetRun(runID)
 }
 
+func (s *ClinicalTrialAuditStore) RenewLease(runID, workerID, leaseToken string, leaseDuration time.Duration) (ClinicalTrialAuditStoredRun, error) {
+	runID = strings.TrimSpace(runID)
+	workerID = strings.TrimSpace(workerID)
+	leaseToken = strings.TrimSpace(leaseToken)
+	if runID == "" || workerID == "" || leaseToken == "" {
+		return ClinicalTrialAuditStoredRun{}, fmt.Errorf("run_id, worker_id, and lease_token are required")
+	}
+	if leaseDuration <= 0 {
+		leaseDuration = 2 * time.Minute
+	}
+	operationNow := s.now().UTC()
+	operationTimestamp := operationNow.Format(time.RFC3339Nano)
+	leaseTokenHash := hashClinicalTrialValue(leaseToken)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	defer tx.Rollback()
+	run, err := getClinicalTrialAuditRunTx(tx, runID)
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	if isTerminalClinicalTrialAuditState(run.State) {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditTerminal
+	}
+	if run.LeaseOwner != workerID {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseOwner
+	}
+	if run.leaseTokenHash == "" || run.leaseTokenHash != leaseTokenHash {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseFence
+	}
+	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, operationNow) {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
+	}
+	if !isActiveClinicalTrialAuditState(run.State) {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditInvalidTransition
+	}
+	newExpiry := operationNow.Add(leaseDuration).Format(time.RFC3339Nano)
+	result, err := tx.Exec(`
+		UPDATE clinical_trial_audit_runs SET lease_expires_at = ?, updated_at = ?
+		WHERE run_id = ? AND state = ? AND lease_owner = ? AND lease_token_hash = ?
+			AND julianday(lease_expires_at) > julianday(?)
+	`, newExpiry, operationTimestamp, run.RunID, run.State, workerID, leaseTokenHash, operationTimestamp)
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
+	}
+	if err := tx.Commit(); err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	renewed, err := s.GetRun(run.RunID)
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	renewed.LeaseToken = leaseToken
+	return renewed, nil
+}
+
 func (s *ClinicalTrialAuditStore) RecoverExpiredLeases() (int64, error) {
+	operationTimestamp := s.now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	count, err := recoverExpiredClinicalTrialAuditLeases(tx, s.timestamp())
+	count, err := recoverExpiredClinicalTrialAuditLeases(tx, operationTimestamp)
 	if err != nil {
 		return 0, err
 	}
@@ -610,8 +734,13 @@ func getClinicalTrialAuditRunTx(tx *sql.Tx, runID string) (ClinicalTrialAuditSto
 	return run, err
 }
 
-func (s *ClinicalTrialAuditStore) loadClinicalTrialAuditRunData(run *ClinicalTrialAuditStoredRun) error {
-	rows, err := s.db.Query(`SELECT snapshot_json FROM clinical_trial_audit_snapshots WHERE run_id = ? ORDER BY fingerprint`, run.RunID)
+type clinicalTrialAuditQueryer interface {
+	Query(query string, args ...any) (*sql.Rows, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *ClinicalTrialAuditStoredRun) error {
+	rows, err := queryer.Query(`SELECT snapshot_json FROM clinical_trial_audit_snapshots WHERE run_id = ? ORDER BY fingerprint`, run.RunID)
 	if err != nil {
 		return err
 	}
@@ -631,7 +760,7 @@ func (s *ClinicalTrialAuditStore) loadClinicalTrialAuditRunData(run *ClinicalTri
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	rows, err = s.db.Query(`SELECT finding_json FROM clinical_trial_audit_findings WHERE run_id = ? ORDER BY finding_id`, run.RunID)
+	rows, err = queryer.Query(`SELECT finding_json FROM clinical_trial_audit_findings WHERE run_id = ? ORDER BY finding_id`, run.RunID)
 	if err != nil {
 		return err
 	}
@@ -652,7 +781,7 @@ func (s *ClinicalTrialAuditStore) loadClinicalTrialAuditRunData(run *ClinicalTri
 		return err
 	}
 	var citationsJSON, auditJSON string
-	err = s.db.QueryRow(`SELECT citations_json, audit_json FROM clinical_trial_audit_results WHERE run_id = ?`, run.RunID).Scan(&citationsJSON, &auditJSON)
+	err = queryer.QueryRow(`SELECT citations_json, audit_json FROM clinical_trial_audit_results WHERE run_id = ?`, run.RunID).Scan(&citationsJSON, &auditJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -915,8 +1044,15 @@ func encodeClinicalTrialAuditCursor(createdAt, runID string) string {
 }
 
 func decodeClinicalTrialAuditCursor(value string) (clinicalTrialAuditCursor, error) {
-	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(value))
+	value = strings.TrimSpace(value)
+	if len(value) > clinicalTrialAuditCursorEncodedMaxBytes {
+		return clinicalTrialAuditCursor{}, fmt.Errorf("invalid clinical trial audit cursor")
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
+		return clinicalTrialAuditCursor{}, fmt.Errorf("invalid clinical trial audit cursor")
+	}
+	if len(decoded) > clinicalTrialAuditCursorDecodedMaxBytes {
 		return clinicalTrialAuditCursor{}, fmt.Errorf("invalid clinical trial audit cursor")
 	}
 	var cursor clinicalTrialAuditCursor
@@ -933,20 +1069,20 @@ func (s *ClinicalTrialAuditStore) timestamp() string {
 	return s.now().UTC().Format(time.RFC3339Nano)
 }
 
-func newClinicalTrialAuditStoreID(now time.Time) string {
+func newClinicalTrialAuditStoreID(random io.Reader) (string, error) {
 	var randomBytes [8]byte
-	if _, err := rand.Read(randomBytes[:]); err != nil {
-		return "clinical-audit-" + now.UTC().Format("20060102T150405.000000000Z")
+	if _, err := io.ReadFull(random, randomBytes[:]); err != nil {
+		return "", fmt.Errorf("%w: generate run ID", errClinicalTrialAuditRandomUnavailable)
 	}
-	return "clinical-audit-" + hex.EncodeToString(randomBytes[:])
+	return "clinical-audit-" + hex.EncodeToString(randomBytes[:]), nil
 }
 
-func newClinicalTrialAuditLeaseToken(workerID string, now time.Time) string {
+func newClinicalTrialAuditLeaseToken(random io.Reader) (string, error) {
 	var randomBytes [24]byte
-	if _, err := rand.Read(randomBytes[:]); err == nil {
-		return base64.RawURLEncoding.EncodeToString(randomBytes[:])
+	if _, err := io.ReadFull(random, randomBytes[:]); err != nil {
+		return "", fmt.Errorf("%w: generate lease token", errClinicalTrialAuditRandomUnavailable)
 	}
-	return hashClinicalTrialValue("lease\x00" + workerID + "\x00" + now.UTC().Format(time.RFC3339Nano))
+	return base64.RawURLEncoding.EncodeToString(randomBytes[:]), nil
 }
 
 func boolToClinicalTrialAuditInt(value bool) int {

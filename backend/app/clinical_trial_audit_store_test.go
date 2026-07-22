@@ -1,6 +1,8 @@
 package app
 
 import (
+	"database/sql"
+	"encoding/base64"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -61,6 +63,122 @@ func TestClinicalTrialAuditStoreCreatesAndReplaysIdempotently(t *testing.T) {
 	}
 }
 
+func TestClinicalTrialAuditStoreCreatesSameIdempotencyKeyConcurrently(t *testing.T) {
+	root := t.TempDir()
+	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 12, 30, 0, 0, time.UTC))
+	first, err := newClinicalTrialAuditStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := newClinicalTrialAuditStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	type result struct {
+		run ClinicalTrialAuditStoredRun
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, store := range []*ClinicalTrialAuditStore{first, second} {
+		wg.Add(1)
+		go func(store *ClinicalTrialAuditStore) {
+			defer wg.Done()
+			<-start
+			run, createErr := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000008"}, "concurrent-key")
+			results <- result{run: run, err: createErr}
+		}(store)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var runID string
+	for item := range results {
+		if item.err != nil {
+			t.Fatalf("concurrent create: %v", item.err)
+		}
+		if runID == "" {
+			runID = item.run.RunID
+		} else if item.run.RunID != runID {
+			t.Fatalf("concurrent run IDs differ: %q / %q", runID, item.run.RunID)
+		}
+	}
+	if _, err := second.CreateRun("package-a", "2.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000008"}, "concurrent-key"); !errors.Is(err, ErrClinicalTrialAuditIdempotencyConflict) {
+		t.Fatalf("concurrent identity conflict = %v", err)
+	}
+}
+
+func TestClinicalTrialAuditStoreMigratesLegacyDatabaseConcurrently(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, clinicalTrialAuditDBName)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE clinical_trial_audit_runs (
+		run_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, package_version TEXT NOT NULL,
+		idempotency_key TEXT NOT NULL, request_json TEXT NOT NULL, input_hash TEXT NOT NULL,
+		state TEXT NOT NULL, resume_state TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 1,
+		retryable INTEGER NOT NULL DEFAULT 0, error_code TEXT NOT NULL DEFAULT '',
+		lease_owner TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+	)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	stores := make(chan *ClinicalTrialAuditStore, 2)
+	var wg sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			store, openErr := NewClinicalTrialAuditStore(root)
+			if openErr == nil {
+				stores <- store
+			}
+			errs <- openErr
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(stores)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent migration: %v", err)
+		}
+	}
+	for store := range stores {
+		defer store.Close()
+	}
+	check, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+	for _, column := range []string{"lease_token_hash", "lease_generation"} {
+		var count int
+		if err := check.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('clinical_trial_audit_runs') WHERE name = ?`, column).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("column %s count=%d err=%v", column, count, err)
+		}
+	}
+	var version int
+	if err := check.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil || version != clinicalTrialAuditSchemaVersion {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+}
+
 func TestClinicalTrialAuditStoreGetsAndListsWithStableCursor(t *testing.T) {
 	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 13, 0, 0, 0, time.UTC))
 	store, err := newClinicalTrialAuditStore(t.TempDir(), clock.Now)
@@ -98,6 +216,65 @@ func TestClinicalTrialAuditStoreGetsAndListsWithStableCursor(t *testing.T) {
 	second, err := store.ListRuns(ClinicalTrialAuditListOptions{PackageID: "package-a", Limit: 1, Cursor: first.NextCursor})
 	if err != nil || len(second.Runs) != 1 || second.Runs[0].RunID != ids[0] || second.NextCursor != "" {
 		t.Fatalf("second page = %#v, err=%v", second, err)
+	}
+}
+
+func TestClinicalTrialAuditStoreGetUsesConsistentReadSnapshot(t *testing.T) {
+	root := t.TempDir()
+	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 13, 30, 0, 0, time.UTC))
+	reader, err := newClinicalTrialAuditStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	writer, err := newClinicalTrialAuditStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	created, err := writer.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000009"}, "consistent-read")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := writer.LeaseNextRun("worker-a", time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("lease=%#v err=%v", lease, err)
+	}
+	snapshot := clinicalTrialAuditStoreSnapshot(t, clock.Now())
+	if _, err := writer.CheckpointRun(created.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rowRead := make(chan struct{})
+	writerDone := make(chan struct{})
+	reader.afterRunRowRead = func() {
+		close(rowRead)
+		<-writerDone
+	}
+	type readResult struct {
+		run ClinicalTrialAuditStoredRun
+		err error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		run, readErr := reader.GetRun(created.RunID)
+		result <- readResult{run: run, err: readErr}
+	}()
+	<-rowRead
+	finding := ClinicalTrialFinding{FindingID: "finding-consistent", Class: ClinicalTrialFindingRegisteredFact, Summary: "Enrollment is registered.", CitationIDs: []string{"citation-consistent"}}
+	citation := ClinicalTrialAuditCitation{CitationID: "citation-consistent", SourceFingerprint: snapshot.Fingerprint, Locator: "protocolSection"}
+	if _, err := writer.CheckpointRun(created.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+		State: ClinicalTrialAuditRunReasoning, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Findings: []ClinicalTrialFinding{finding}, Citations: []ClinicalTrialAuditCitation{citation},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(writerDone)
+	read := <-result
+	if read.err != nil {
+		t.Fatal(read.err)
+	}
+	if read.run.State != ClinicalTrialAuditRunComparing || len(read.run.Findings) != 0 {
+		t.Fatalf("mixed read snapshot = %#v", read.run)
 	}
 }
 
@@ -303,6 +480,94 @@ func TestClinicalTrialAuditStoreRecoversExpiredLeaseAtCheckpoint(t *testing.T) {
 	}
 }
 
+func TestClinicalTrialAuditStoreRenewsOnlyCurrentUnexpiredLease(t *testing.T) {
+	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 18, 0, 0, 0, time.UTC))
+	store, err := newClinicalTrialAuditStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000010"}, "renew")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.LeaseNextRun("worker-a", time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("lease=%#v err=%v", lease, err)
+	}
+	clock.Advance(30 * time.Second)
+	renewed, err := store.RenewLease(created.RunID, "worker-a", lease.LeaseToken, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	wantExpiry := clock.Now().Add(2 * time.Minute).Format(time.RFC3339Nano)
+	if renewed.LeaseExpiresAt != wantExpiry || renewed.LeaseGeneration != lease.LeaseGeneration || renewed.LeaseToken != lease.LeaseToken {
+		t.Fatalf("renewed lease = %#v", renewed)
+	}
+	if _, err := store.RenewLease(created.RunID, "worker-a", "stale-token", time.Minute); !errors.Is(err, ErrClinicalTrialAuditLeaseFence) {
+		t.Fatalf("stale renew = %v", err)
+	}
+	clock.Advance(2 * time.Minute)
+	if _, err := store.RenewLease(created.RunID, "worker-a", lease.LeaseToken, time.Minute); !errors.Is(err, ErrClinicalTrialAuditLeaseExpired) {
+		t.Fatalf("expired renew = %v", err)
+	}
+	snapshot := clinicalTrialAuditStoreSnapshot(t, clock.Now())
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); !errors.Is(err, ErrClinicalTrialAuditLeaseExpired) {
+		t.Fatalf("expired checkpoint = %v", err)
+	}
+	current, err := store.GetRun(created.RunID)
+	if err != nil || current.State != ClinicalTrialAuditRunCollecting {
+		t.Fatalf("expired mutation changed run = %#v err=%v", current, err)
+	}
+}
+
+func TestClinicalTrialAuditStoreFailsClosedWhenRandomnessFails(t *testing.T) {
+	store, err := newClinicalTrialAuditStore(t.TempDir(), time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	store.random = clinicalTrialAuditFailingReader{}
+	if _, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000011"}, "random-create"); !errors.Is(err, errClinicalTrialAuditRandomUnavailable) {
+		t.Fatalf("create randomness failure = %v", err)
+	}
+	page, err := store.ListRuns(ClinicalTrialAuditListOptions{})
+	if err != nil || len(page.Runs) != 0 {
+		t.Fatalf("failed create persisted run = %#v err=%v", page, err)
+	}
+	store.random = strings.NewReader(strings.Repeat("r", 128))
+	created, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000012"}, "random-lease")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.random = clinicalTrialAuditFailingReader{}
+	if _, err := store.LeaseNextRun("worker-a", time.Minute); !errors.Is(err, errClinicalTrialAuditRandomUnavailable) {
+		t.Fatalf("lease randomness failure = %v", err)
+	}
+	current, err := store.GetRun(created.RunID)
+	if err != nil || current.State != ClinicalTrialAuditRunQueued || current.LeaseOwner != "" {
+		t.Fatalf("failed lease mutated run = %#v err=%v", current, err)
+	}
+}
+
+func TestClinicalTrialAuditStoreRejectsOversizedCursor(t *testing.T) {
+	store, err := NewClinicalTrialAuditStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.ListRuns(ClinicalTrialAuditListOptions{Cursor: strings.Repeat("A", clinicalTrialAuditCursorEncodedMaxBytes+1)}); err == nil {
+		t.Fatal("oversized encoded cursor accepted")
+	}
+	decodedOversized := make([]byte, clinicalTrialAuditCursorDecodedMaxBytes+1)
+	for index := range decodedOversized {
+		decodedOversized[index] = 'x'
+	}
+	if _, err := decodeClinicalTrialAuditCursor(base64.RawURLEncoding.EncodeToString(decodedOversized)); err == nil {
+		t.Fatal("oversized decoded cursor accepted")
+	}
+}
+
 func TestClinicalTrialAuditStoreDefinesTerminalErrorCodeAllowlist(t *testing.T) {
 	want := []string{
 		ClinicalTrialAuditErrorIdentifierInvalid,
@@ -346,6 +611,12 @@ func clinicalTrialAuditStoreSnapshot(t *testing.T, now time.Time) ClinicalTrialS
 type clinicalTrialAuditStoreTestClock struct {
 	mu  sync.Mutex
 	now time.Time
+}
+
+type clinicalTrialAuditFailingReader struct{}
+
+func (clinicalTrialAuditFailingReader) Read([]byte) (int, error) {
+	return 0, errClinicalTrialAuditRandomUnavailable
 }
 
 func newClinicalTrialAuditStoreTestClock(now time.Time) *clinicalTrialAuditStoreTestClock {
