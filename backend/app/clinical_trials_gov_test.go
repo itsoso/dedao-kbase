@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -246,8 +247,43 @@ func TestClinicalTrialsGovGetStudyNormalizesCurrentRecord(t *testing.T) {
 	if result.Evidence.ContentHash != result.Snapshot.ContentHash || result.Evidence.SourceType != result.Snapshot.SourceType {
 		t.Fatalf("snapshot/evidence identity mismatch: snapshot=%#v evidence=%#v", result.Snapshot, result.Evidence)
 	}
+	if result.Evidence.Provenance.DataTimestamp != result.DataTimestamp {
+		t.Fatalf("evidence provenance = %#v, result data timestamp = %q", result.Evidence.Provenance, result.DataTimestamp)
+	}
 	if recovered, err := DecodeClinicalTrialsGovEvidencePayload(result.Evidence); err != nil || recovered.NCTID != study.NCTID {
 		t.Fatalf("recover result evidence = %#v err=%v", recovered, err)
+	}
+}
+
+func TestClinicalTrialsGovEvidenceRejectsHashValidForgedStudy(t *testing.T) {
+	study, err := normalizeClinicalTrialsGovStudy([]byte(clinicalTrialsGovStudyFixture), "2.0.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	study.Coverage.ExcludedModules = []string{"baseline_characteristics"}
+	data, err := json.Marshal(study)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := ClinicalTrialAuditEvidencePayload{
+		SchemaVersion: ClinicalTrialAuditEvidenceSchemaVersion,
+		SourceType:    ClinicalTrialsGovStudySourceType,
+		ContentHash:   hashClinicalTrialValue(string(data)),
+		Provenance:    ClinicalTrialAuditEvidenceProvenance{DataTimestamp: "2026-07-21T15:04:05Z"},
+		Data:          data,
+	}
+	if _, err := DecodeClinicalTrialsGovEvidencePayload(forged); err == nil {
+		t.Fatal("hash-valid forged evidence bypassed study domain validation")
+	}
+}
+
+func TestClinicalTrialsGovEvidenceRejectsNonCanonicalDataTimestamp(t *testing.T) {
+	study, err := normalizeClinicalTrialsGovStudy([]byte(clinicalTrialsGovStudyFixture), "2.0.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewClinicalTrialsGovEvidencePayload(study, "2026-07-21T11:04:05-04:00"); err == nil {
+		t.Fatal("accepted noncanonical evidence data timestamp")
 	}
 }
 

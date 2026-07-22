@@ -85,10 +85,15 @@ type ClinicalTrialAuditStoredRun struct {
 }
 
 type ClinicalTrialAuditEvidencePayload struct {
-	SchemaVersion string          `json:"schema_version"`
-	SourceType    string          `json:"source_type"`
-	ContentHash   string          `json:"content_hash"`
-	Data          json.RawMessage `json:"data"`
+	SchemaVersion string                               `json:"schema_version"`
+	SourceType    string                               `json:"source_type"`
+	ContentHash   string                               `json:"content_hash"`
+	Provenance    ClinicalTrialAuditEvidenceProvenance `json:"provenance"`
+	Data          json.RawMessage                      `json:"data"`
+}
+
+type ClinicalTrialAuditEvidenceProvenance struct {
+	DataTimestamp string `json:"data_timestamp"`
 }
 
 type ClinicalTrialAuditFailure struct {
@@ -825,54 +830,93 @@ type clinicalTrialAuditQueryer interface {
 }
 
 func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *ClinicalTrialAuditStoredRun) error {
-	rows, err := queryer.Query(`SELECT snapshot_json FROM clinical_trial_audit_snapshots WHERE run_id = ? ORDER BY fingerprint`, run.RunID)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var encoded string
-		if err := rows.Scan(&encoded); err != nil {
-			rows.Close()
-			return err
-		}
-		var snapshot ClinicalTrialSourceSnapshot
-		if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
-			rows.Close()
-			return err
-		}
-		run.Sources = append(run.Sources, snapshot)
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	rows, err = queryer.Query(`
-		SELECT evidence.evidence_json
-		FROM clinical_trial_audit_snapshot_evidence AS link
-		JOIN clinical_trial_audit_evidence AS evidence ON evidence.content_hash = link.content_hash
-		WHERE link.run_id = ? ORDER BY link.fingerprint
+	rows, err := queryer.Query(`
+		SELECT snapshot.fingerprint, snapshot.snapshot_json,
+			link.content_hash, evidence.content_hash, evidence.source_type, evidence.evidence_json
+		FROM clinical_trial_audit_snapshots AS snapshot
+		LEFT JOIN clinical_trial_audit_snapshot_evidence AS link
+			ON link.run_id = snapshot.run_id AND link.fingerprint = snapshot.fingerprint
+		LEFT JOIN clinical_trial_audit_evidence AS evidence
+			ON evidence.content_hash = link.content_hash
+		WHERE snapshot.run_id = ? ORDER BY snapshot.fingerprint
 	`, run.RunID)
 	if err != nil {
 		return err
 	}
+	linkedRows := 0
+	evidenceSeen := make(map[string]struct{})
 	for rows.Next() {
-		var encoded string
-		if err := rows.Scan(&encoded); err != nil {
+		var storedFingerprint, snapshotJSON string
+		var linkHash, evidenceHash, evidenceSource, evidenceJSON sql.NullString
+		if err := rows.Scan(&storedFingerprint, &snapshotJSON, &linkHash, &evidenceHash, &evidenceSource, &evidenceJSON); err != nil {
 			rows.Close()
 			return err
+		}
+		if len(snapshotJSON) > clinicalTrialAuditJSONMaxBytes {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial snapshot exceeds bounds")
+		}
+		var snapshot ClinicalTrialSourceSnapshot
+		if err := json.Unmarshal([]byte(snapshotJSON), &snapshot); err != nil {
+			rows.Close()
+			return err
+		}
+		finalizedSnapshot, err := FinalizeClinicalTrialSourceSnapshot(snapshot)
+		if err != nil || finalizedSnapshot.Fingerprint != snapshot.Fingerprint || storedFingerprint != snapshot.Fingerprint {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial snapshot fingerprint mismatch")
+		}
+		run.Sources = append(run.Sources, snapshot)
+		linked := linkHash.Valid || evidenceHash.Valid || evidenceSource.Valid || evidenceJSON.Valid
+		if !linked {
+			if snapshot.SourceType == ClinicalTrialsGovStudySourceType {
+				rows.Close()
+				return fmt.Errorf("ClinicalTrials.gov snapshot is missing normalized evidence")
+			}
+			continue
+		}
+		if !linkHash.Valid || !evidenceHash.Valid || !evidenceSource.Valid || !evidenceJSON.Valid {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial evidence link is incomplete")
+		}
+		linkedRows++
+		if linkHash.String != evidenceHash.String || linkHash.String != snapshot.ContentHash || evidenceSource.String != snapshot.SourceType {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial snapshot and evidence identity mismatch")
+		}
+		if len(evidenceJSON.String) > clinicalTrialAuditJSONMaxBytes {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial evidence exceeds bounds")
 		}
 		var evidence ClinicalTrialAuditEvidencePayload
-		if err := json.Unmarshal([]byte(encoded), &evidence); err != nil {
+		if err := json.Unmarshal([]byte(evidenceJSON.String), &evidence); err != nil {
 			rows.Close()
 			return err
 		}
-		if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+		finalizedEvidence, err := finalizeClinicalTrialAuditEvidencePayload(evidence)
+		if err != nil || finalizedEvidence.ContentHash != evidenceHash.String || finalizedEvidence.SourceType != evidenceSource.String {
 			rows.Close()
-			return err
+			return fmt.Errorf("persisted clinical trial evidence failed validation")
 		}
-		run.Evidence = append(run.Evidence, evidence)
+		canonicalEvidence, err := marshalBoundedClinicalTrialAuditJSON(finalizedEvidence, clinicalTrialAuditJSONMaxBytes)
+		if err != nil || string(canonicalEvidence) != evidenceJSON.String {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial evidence is not canonical")
+		}
+		if _, exists := evidenceSeen[evidenceHash.String]; !exists {
+			run.Evidence = append(run.Evidence, finalizedEvidence)
+			evidenceSeen[evidenceHash.String] = struct{}{}
+		}
 	}
 	if err := rows.Close(); err != nil {
 		return err
+	}
+	var persistedLinks int
+	if err := queryer.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_snapshot_evidence WHERE run_id = ?`, run.RunID).Scan(&persistedLinks); err != nil {
+		return err
+	}
+	if persistedLinks != linkedRows {
+		return fmt.Errorf("persisted clinical trial evidence contains orphaned links")
 	}
 	rows, err = queryer.Query(`SELECT finding_json FROM clinical_trial_audit_findings WHERE run_id = ? ORDER BY finding_id`, run.RunID)
 	if err != nil {
@@ -938,19 +982,27 @@ func persistClinicalTrialAuditCheckpoint(tx *sql.Tx, runID string, checkpoint Cl
 				rows.Close()
 				return err
 			}
-			if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+			finalized, err := finalizeClinicalTrialAuditEvidencePayload(evidence)
+			if err != nil {
 				rows.Close()
 				return err
 			}
-			availableEvidence[evidence.SourceType+"\x00"+evidence.ContentHash] = evidence
+			canonical, err := marshalBoundedClinicalTrialAuditJSON(finalized, clinicalTrialAuditJSONMaxBytes)
+			if err != nil || string(canonical) != encoded {
+				rows.Close()
+				return fmt.Errorf("persisted clinical trial evidence is not canonical")
+			}
+			availableEvidence[finalized.SourceType+"\x00"+finalized.ContentHash] = finalized
 		}
 		if err := rows.Close(); err != nil {
 			return err
 		}
 		for _, evidence := range checkpoint.Evidence {
-			if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+			finalized, err := finalizeClinicalTrialAuditEvidencePayload(evidence)
+			if err != nil {
 				return err
 			}
+			evidence = finalized
 			availableEvidence[evidence.SourceType+"\x00"+evidence.ContentHash] = evidence
 			encoded, err := marshalBoundedClinicalTrialAuditJSON(evidence, clinicalTrialAuditJSONMaxBytes)
 			if err != nil {
@@ -1126,16 +1178,20 @@ func validateClinicalTrialAuditCheckpointEvidence(checkpoint ClinicalTrialAuditC
 }
 
 func validateClinicalTrialAuditEvidencePayload(evidence ClinicalTrialAuditEvidencePayload) error {
+	_, err := finalizeClinicalTrialAuditEvidencePayload(evidence)
+	return err
+}
+
+func finalizeClinicalTrialAuditEvidencePayload(evidence ClinicalTrialAuditEvidencePayload) (ClinicalTrialAuditEvidencePayload, error) {
 	if evidence.SchemaVersion != ClinicalTrialAuditEvidenceSchemaVersion {
-		return fmt.Errorf("evidence schema_version must be %q", ClinicalTrialAuditEvidenceSchemaVersion)
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("evidence schema_version must be %q", ClinicalTrialAuditEvidenceSchemaVersion)
 	}
-	if strings.TrimSpace(evidence.SourceType) == "" || !json.Valid(evidence.Data) {
-		return fmt.Errorf("clinical trial evidence source_type and valid data are required")
+	switch evidence.SourceType {
+	case ClinicalTrialsGovStudySourceType:
+		return finalizeClinicalTrialsGovEvidencePayload(evidence)
+	default:
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("unsupported clinical trial evidence source_type %q", evidence.SourceType)
 	}
-	if got := hashClinicalTrialValue(string(evidence.Data)); got != evidence.ContentHash {
-		return fmt.Errorf("clinical trial evidence content_hash does not match normalized data")
-	}
-	return nil
 }
 
 func validClinicalTrialAuditTransition(from, to string) bool {

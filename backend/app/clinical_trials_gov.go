@@ -321,6 +321,247 @@ type ClinicalTrialsGovStudy struct {
 	PublicationReferences []ClinicalTrialsGovPublicationReference `json:"publication_references,omitempty"`
 }
 
+func ValidateClinicalTrialsGovStudy(study ClinicalTrialsGovStudy) error {
+	for field, value := range map[string]string{
+		"source_api_version": study.SourceAPIVersion,
+		"nct_id":             study.NCTID,
+		"brief_title":        study.BriefTitle,
+		"overall_status":     study.OverallStatus,
+		"study_type":         study.StudyType,
+	} {
+		if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) {
+			return fmt.Errorf("normalized ClinicalTrials.gov %s is required and canonical", field)
+		}
+	}
+	if !clinicalTrialNCTPattern.MatchString(study.NCTID) {
+		return fmt.Errorf("normalized ClinicalTrials.gov nct_id is invalid")
+	}
+	if study.Enrollment.Count < 0 {
+		return fmt.Errorf("normalized ClinicalTrials.gov enrollment cannot be negative")
+	}
+	if err := validateClinicalTrialsGovNormalizedDate(study.LastUpdatePosted, true); err != nil {
+		return fmt.Errorf("last_update_posted: %w", err)
+	}
+	for _, date := range []ClinicalTrialsGovDate{study.StartDate, study.PrimaryCompletionDate, study.CompletionDate, study.ResultsFirstPosted} {
+		if err := validateClinicalTrialsGovNormalizedDate(date, false); err != nil {
+			return err
+		}
+	}
+	if err := validateClinicalTrialsGovCoverage(study.Coverage); err != nil {
+		return err
+	}
+	if len(study.Conditions) > ClinicalTrialsGovMaxProtocolConditions || len(study.Arms) > ClinicalTrialsGovMaxProtocolArms ||
+		len(study.Interventions) > ClinicalTrialsGovMaxProtocolInterventions || len(study.PrimaryOutcomes)+len(study.SecondaryOutcomes) > ClinicalTrialsGovMaxProtocolOutcomes*2 ||
+		len(study.PublicationReferences) > ClinicalTrialsGovMaxProtocolReferences || len(study.ReportedOutcomes) > ClinicalTrialsGovMaxReportedOutcomes {
+		return fmt.Errorf("normalized ClinicalTrials.gov collection exceeds bounds")
+	}
+	for _, arm := range study.Arms {
+		if strings.TrimSpace(arm.Label) == "" || arm.Label != strings.TrimSpace(arm.Label) {
+			return fmt.Errorf("normalized ClinicalTrials.gov arm label is invalid")
+		}
+	}
+	for _, intervention := range study.Interventions {
+		if strings.TrimSpace(intervention.Name) == "" || intervention.Name != strings.TrimSpace(intervention.Name) {
+			return fmt.Errorf("normalized ClinicalTrials.gov intervention name is invalid")
+		}
+	}
+	for _, outcome := range append(append([]ClinicalTrialsGovOutcome{}, study.PrimaryOutcomes...), study.SecondaryOutcomes...) {
+		if strings.TrimSpace(outcome.Measure) == "" || outcome.Measure != strings.TrimSpace(outcome.Measure) {
+			return fmt.Errorf("normalized ClinicalTrials.gov protocol outcome measure is invalid")
+		}
+	}
+	if err := validateClinicalTrialsGovParticipantFlow(study.ParticipantFlow); err != nil {
+		return err
+	}
+	for _, outcome := range study.ReportedOutcomes {
+		if err := validateClinicalTrialsGovReportedOutcome(outcome); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateClinicalTrialsGovNormalizedDate(date ClinicalTrialsGovDate, required bool) error {
+	if date.Value == "" {
+		if required {
+			return fmt.Errorf("normalized date is required")
+		}
+		if date.Type != "" || date.Precision != "" {
+			return fmt.Errorf("empty normalized date cannot contain metadata")
+		}
+		return nil
+	}
+	canonical, err := canonicalClinicalTrialTimestamp("normalized_date", date.Value, true)
+	if err != nil || canonical != date.Value {
+		return fmt.Errorf("normalized date must be canonical UTC RFC3339")
+	}
+	switch date.Precision {
+	case "time", "day", "month", "year":
+	default:
+		return fmt.Errorf("normalized date precision is invalid")
+	}
+	if date.Type != strings.TrimSpace(date.Type) {
+		return fmt.Errorf("normalized date type is not canonical")
+	}
+	return nil
+}
+
+func validateClinicalTrialsGovCoverage(coverage ClinicalTrialsGovEvidenceCoverage) error {
+	if !clinicalTrialsGovStringSetEquals(coverage.IncludedModules, []string{"protocol", "participant_flow", "outcome_measures"}) ||
+		!clinicalTrialsGovStringSetEquals(coverage.ExcludedModules, []string{"baseline_characteristics", "adverse_events", "more_info"}) {
+		return fmt.Errorf("ClinicalTrials.gov v1 coverage declarations are invalid")
+	}
+	if len(coverage.Limitations) == 0 {
+		return fmt.Errorf("ClinicalTrials.gov v1 coverage limitations are required")
+	}
+	seen := make(map[string]struct{}, len(coverage.Limitations))
+	for _, limitation := range coverage.Limitations {
+		if strings.TrimSpace(limitation) == "" || limitation != strings.TrimSpace(limitation) {
+			return fmt.Errorf("ClinicalTrials.gov coverage limitation is not canonical")
+		}
+		if _, exists := seen[limitation]; exists {
+			return fmt.Errorf("ClinicalTrials.gov coverage limitations contain duplicates")
+		}
+		seen[limitation] = struct{}{}
+	}
+	return nil
+}
+
+func clinicalTrialsGovStringSetEquals(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	values := make(map[string]struct{}, len(got))
+	for _, value := range got {
+		if value == "" || value != strings.TrimSpace(value) {
+			return false
+		}
+		values[value] = struct{}{}
+	}
+	if len(values) != len(want) {
+		return false
+	}
+	for _, value := range want {
+		if _, exists := values[value]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func validateClinicalTrialsGovParticipantFlow(flow ClinicalTrialsGovParticipantFlow) error {
+	if len(flow.Groups) > ClinicalTrialsGovMaxFlowGroups || len(flow.Periods) > ClinicalTrialsGovMaxFlowPeriods {
+		return fmt.Errorf("normalized participant flow exceeds bounds")
+	}
+	groups := make(map[string]struct{}, len(flow.Groups))
+	for _, group := range flow.Groups {
+		if group.ID == "" || group.Title == "" || group.ID != strings.TrimSpace(group.ID) || group.Title != strings.TrimSpace(group.Title) {
+			return fmt.Errorf("normalized participant flow group identity is invalid")
+		}
+		if _, exists := groups[group.ID]; exists {
+			return fmt.Errorf("normalized participant flow group is duplicated")
+		}
+		groups[group.ID] = struct{}{}
+	}
+	milestones, achievements, drops, reasons := 0, 0, 0, 0
+	for _, period := range flow.Periods {
+		if period.Title == "" || period.Title != strings.TrimSpace(period.Title) {
+			return fmt.Errorf("normalized participant flow period title is invalid")
+		}
+		milestones += len(period.Milestones)
+		drops += len(period.DropWithdraws)
+		for _, milestone := range period.Milestones {
+			if milestone.Type == "" || milestone.Type != strings.TrimSpace(milestone.Type) {
+				return fmt.Errorf("normalized participant flow milestone type is invalid")
+			}
+			achievements += len(milestone.Achievements)
+			if err := validateClinicalTrialsGovFlowCounts(milestone.Achievements, groups); err != nil {
+				return err
+			}
+		}
+		for _, drop := range period.DropWithdraws {
+			if drop.Type == "" || drop.Type != strings.TrimSpace(drop.Type) {
+				return fmt.Errorf("normalized participant flow drop-withdraw type is invalid")
+			}
+			reasons += len(drop.Reasons)
+			if err := validateClinicalTrialsGovFlowCounts(drop.Reasons, groups); err != nil {
+				return err
+			}
+		}
+	}
+	if milestones > ClinicalTrialsGovMaxFlowMilestones || achievements > ClinicalTrialsGovMaxFlowAchievements || drops > ClinicalTrialsGovMaxFlowDropWithdraws || reasons > ClinicalTrialsGovMaxFlowReasons {
+		return fmt.Errorf("normalized participant flow aggregate exceeds bounds")
+	}
+	return nil
+}
+
+func validateClinicalTrialsGovFlowCounts(counts []ClinicalTrialsGovFlowCount, groups map[string]struct{}) error {
+	seen := make(map[string]struct{}, len(counts))
+	for _, count := range counts {
+		if count.Subjects == "" || count.Subjects != strings.TrimSpace(count.Subjects) {
+			return fmt.Errorf("normalized participant flow subject count is invalid")
+		}
+		if _, exists := groups[count.GroupID]; !exists {
+			return fmt.Errorf("normalized participant flow references unknown group")
+		}
+		if _, exists := seen[count.GroupID]; exists {
+			return fmt.Errorf("normalized participant flow repeats a group count")
+		}
+		seen[count.GroupID] = struct{}{}
+	}
+	return nil
+}
+
+func validateClinicalTrialsGovReportedOutcome(outcome ClinicalTrialsGovReportedOutcome) error {
+	if outcome.Type == "" || outcome.Title == "" || outcome.Type != strings.TrimSpace(outcome.Type) || outcome.Title != strings.TrimSpace(outcome.Title) {
+		return fmt.Errorf("normalized reported outcome identity is invalid")
+	}
+	if len(outcome.Groups) > ClinicalTrialsGovMaxResultGroups || len(outcome.Classes) > ClinicalTrialsGovMaxResultClasses || len(outcome.Denominators) > ClinicalTrialsGovMaxResultDenominators || len(outcome.Analyses) > ClinicalTrialsGovMaxResultAnalyses {
+		return fmt.Errorf("normalized reported outcome exceeds bounds")
+	}
+	groups := make(map[string]struct{}, len(outcome.Groups))
+	for _, group := range outcome.Groups {
+		if group.ID == "" || group.Title == "" {
+			return fmt.Errorf("normalized reported outcome group identity is invalid")
+		}
+		if _, exists := groups[group.ID]; exists {
+			return fmt.Errorf("normalized reported outcome group is duplicated")
+		}
+		groups[group.ID] = struct{}{}
+	}
+	measurements, denominatorCounts, analysisGroups := 0, 0, 0
+	for _, class := range outcome.Classes {
+		for _, category := range class.Categories {
+			measurements += len(category.Measurements)
+			for _, measurement := range category.Measurements {
+				if _, exists := groups[measurement.GroupID]; !exists {
+					return fmt.Errorf("normalized reported outcome measurement references unknown group")
+				}
+			}
+		}
+	}
+	for _, denominator := range outcome.Denominators {
+		denominatorCounts += len(denominator.Counts)
+		for _, count := range denominator.Counts {
+			if _, exists := groups[count.GroupID]; !exists {
+				return fmt.Errorf("normalized reported outcome denominator references unknown group")
+			}
+		}
+	}
+	for _, analysis := range outcome.Analyses {
+		analysisGroups += len(analysis.GroupIDs)
+		for _, groupID := range analysis.GroupIDs {
+			if _, exists := groups[groupID]; !exists {
+				return fmt.Errorf("normalized reported outcome analysis references unknown group")
+			}
+		}
+	}
+	if measurements > ClinicalTrialsGovMaxGroupMeasurements || denominatorCounts > ClinicalTrialsGovMaxDenominatorCounts || analysisGroups > ClinicalTrialsGovMaxAnalysisGroups {
+		return fmt.Errorf("normalized reported outcome aggregate exceeds bounds")
+	}
+	return nil
+}
+
 type ClinicalTrialsGovStudyResult struct {
 	Study         ClinicalTrialsGovStudy            `json:"study"`
 	Snapshot      ClinicalTrialSourceSnapshot       `json:"snapshot"`
@@ -329,40 +570,64 @@ type ClinicalTrialsGovStudyResult struct {
 	DataTimestamp string                            `json:"data_timestamp"`
 }
 
-func NewClinicalTrialsGovEvidencePayload(study ClinicalTrialsGovStudy) (ClinicalTrialAuditEvidencePayload, error) {
+func NewClinicalTrialsGovEvidencePayload(study ClinicalTrialsGovStudy, dataTimestamp string) (ClinicalTrialAuditEvidencePayload, error) {
+	evidence := ClinicalTrialAuditEvidencePayload{
+		SchemaVersion: ClinicalTrialAuditEvidenceSchemaVersion,
+		SourceType:    ClinicalTrialsGovStudySourceType,
+		Provenance:    ClinicalTrialAuditEvidenceProvenance{DataTimestamp: dataTimestamp},
+	}
 	encoded, err := json.Marshal(study)
 	if err != nil {
 		return ClinicalTrialAuditEvidencePayload{}, err
 	}
-	evidence := ClinicalTrialAuditEvidencePayload{
-		SchemaVersion: ClinicalTrialAuditEvidenceSchemaVersion,
-		SourceType:    ClinicalTrialsGovStudySourceType,
-		ContentHash:   hashClinicalTrialValue(string(encoded)),
-		Data:          json.RawMessage(encoded),
-	}
-	if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
-		return ClinicalTrialAuditEvidencePayload{}, err
-	}
-	return evidence, nil
+	evidence.Data = encoded
+	return finalizeClinicalTrialsGovEvidencePayload(evidence)
 }
 
 func DecodeClinicalTrialsGovEvidencePayload(evidence ClinicalTrialAuditEvidencePayload) (ClinicalTrialsGovStudy, error) {
-	if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+	finalized, err := finalizeClinicalTrialsGovEvidencePayload(evidence)
+	if err != nil {
 		return ClinicalTrialsGovStudy{}, err
 	}
-	if evidence.SourceType != ClinicalTrialsGovStudySourceType {
-		return ClinicalTrialsGovStudy{}, fmt.Errorf("evidence is not a ClinicalTrials.gov study")
+	var study ClinicalTrialsGovStudy
+	if err := json.Unmarshal(finalized.Data, &study); err != nil {
+		return ClinicalTrialsGovStudy{}, err
+	}
+	return study, nil
+}
+
+func finalizeClinicalTrialsGovEvidencePayload(evidence ClinicalTrialAuditEvidencePayload) (ClinicalTrialAuditEvidencePayload, error) {
+	if evidence.SchemaVersion != ClinicalTrialAuditEvidenceSchemaVersion || evidence.SourceType != ClinicalTrialsGovStudySourceType {
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("invalid ClinicalTrials.gov evidence identity")
+	}
+	dataTimestamp, err := canonicalClinicalTrialTimestamp("data_timestamp", evidence.Provenance.DataTimestamp, true)
+	if err != nil || dataTimestamp != evidence.Provenance.DataTimestamp {
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("ClinicalTrials.gov evidence data_timestamp must be canonical UTC RFC3339")
 	}
 	var study ClinicalTrialsGovStudy
 	decoder := json.NewDecoder(bytes.NewReader(evidence.Data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&study); err != nil {
-		return ClinicalTrialsGovStudy{}, fmt.Errorf("decode normalized ClinicalTrials.gov evidence: %w", err)
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("decode normalized ClinicalTrials.gov evidence: %w", err)
 	}
-	if strings.TrimSpace(study.NCTID) == "" || strings.TrimSpace(study.SourceAPIVersion) == "" {
-		return ClinicalTrialsGovStudy{}, fmt.Errorf("normalized ClinicalTrials.gov evidence is missing identity")
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("normalized ClinicalTrials.gov evidence must contain one JSON value")
 	}
-	return study, nil
+	if err := ValidateClinicalTrialsGovStudy(study); err != nil {
+		return ClinicalTrialAuditEvidencePayload{}, err
+	}
+	canonical, err := json.Marshal(study)
+	if err != nil {
+		return ClinicalTrialAuditEvidencePayload{}, err
+	}
+	contentHash := hashClinicalTrialValue(string(canonical))
+	if evidence.ContentHash != "" && evidence.ContentHash != contentHash {
+		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("clinical trial evidence content_hash does not match canonical normalized data")
+	}
+	evidence.ContentHash = contentHash
+	evidence.Provenance.DataTimestamp = dataTimestamp
+	evidence.Data = canonical
+	return evidence, nil
 }
 
 type clinicalTrialsGovOption func(*ClinicalTrialsGovClient)
@@ -467,7 +732,7 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 	if study.NCTID != request.NormalizedInput {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorIdentifierMismatch}
 	}
-	evidence, err := NewClinicalTrialsGovEvidencePayload(study)
+	evidence, err := NewClinicalTrialsGovEvidencePayload(study, version.DataTimestamp)
 	if err != nil {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorSchemaInvalid, cause: err}
 	}
@@ -844,6 +1109,9 @@ func normalizeClinicalTrialsGovStudy(body []byte, apiVersion string) (ClinicalTr
 	}
 	if study.SourceAPIVersion == "" || study.NCTID == "" || study.BriefTitle == "" || study.OverallStatus == "" || study.StudyType == "" || study.LastUpdatePosted.Value == "" {
 		return ClinicalTrialsGovStudy{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorSchemaInvalid}
+	}
+	if err := ValidateClinicalTrialsGovStudy(study); err != nil {
+		return ClinicalTrialsGovStudy{}, schemaInvalidClinicalTrialsGovError(err)
 	}
 	return study, nil
 }
