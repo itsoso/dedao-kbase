@@ -243,7 +243,7 @@ func (a *WeChatSourceAdapter) archiveArticleMedia(ctx context.Context, runID, ar
 }
 
 func weChatArticleIdempotencyKey(accountKey, articleKey string, updateTime int64, content string) string {
-	sum := sha256.Sum256([]byte("wechat_mp_article\x00" + strings.TrimSpace(accountKey) + "\x00" + strings.TrimSpace(articleKey) + "\x00" + fmt.Sprintf("%d", updateTime) + "\x00" + content))
+	sum := sha256.Sum256([]byte("wechat_mp_article:v2\x00" + strings.TrimSpace(accountKey) + "\x00" + strings.TrimSpace(articleKey) + "\x00" + fmt.Sprintf("%d", updateTime) + "\x00" + content))
 	return hex.EncodeToString(sum[:])
 }
 
