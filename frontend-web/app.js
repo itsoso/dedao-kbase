@@ -5454,6 +5454,7 @@ function renderKnowledgeOperationsConsole() {
   const dashboard = knowledgeOperationsState.console || {};
   const summary = dashboard.summary || {};
   const items = Array.isArray(dashboard.items) ? dashboard.items : [];
+  const healthReviewQueue = Array.isArray(dashboard.health_review_queue) ? dashboard.health_review_queue : [];
   const status = knowledgeOperationsState.loading || knowledgeOperationsState.message || `${Number(summary.total || 0)} packages`;
   const replay = knowledgeOperationsState.replayResult;
   renderShell(`
@@ -5475,11 +5476,12 @@ function renderKnowledgeOperationsConsole() {
         ${renderKnowledgeOperationsMetric("Health 待审核", summary.health_ready_to_publish)}
         ${renderKnowledgeOperationsMetric("Health 已拉取", summary.health_published)}
       </section>
+      ${renderKnowledgeOperationsHealthReviewQueue(healthReviewQueue)}
       <section class="knowledge-operations__panel" aria-label="Health Evidence Review Workspace">
         <div class="knowledge-operations__panel-head">
           <div>
             <p class="web-kicker">Health Evidence Review Workspace</p>
-            <h2>审核草稿和阻断原因</h2>
+            <h2>全部包状态和阻断原因</h2>
           </div>
           <small>serving_allowed 始终由 Health 审核系统决定；KBase 只显示证据元数据。</small>
         </div>
@@ -5504,6 +5506,51 @@ function renderKnowledgeOperationsConsole() {
 
 function renderKnowledgeOperationsMetric(label, value) {
   return `<div class="knowledge-operations__metric"><span>${escapeHTML(label)}</span><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function renderKnowledgeOperationsHealthReviewQueue(queue) {
+  return `
+    <section class="knowledge-operations__panel" aria-label="Health Evidence Review Queue">
+      <div class="knowledge-operations__panel-head">
+        <div>
+          <p class="web-kicker">Health Evidence Review Queue</p>
+          <h2>待审核优先级队列</h2>
+        </div>
+        <small>只读队列：不写入 Health 审核状态，也不推进 serving。</small>
+      </div>
+      <div class="knowledge-operations__queue">
+        ${queue.map(renderKnowledgeOperationsHealthReviewItem).join("") || `<p class="knowledge-operations__empty">暂无 Health 审核队列。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderKnowledgeOperationsHealthReviewItem(item) {
+  const riskCounts = item.risk_counts || {};
+  const riskText = Object.entries(riskCounts).map(([risk, count]) => `${risk}:${count}`).join(" · ") || "无风险计数";
+  const reasons = Array.isArray(item.reasons) ? item.reasons : [];
+  return `
+    <article class="knowledge-operations__queue-item">
+      <div>
+        <span class="knowledge-operations__badge">${escapeHTML(item.priority_label || "monitor")}</span>
+        <strong>${escapeHTML(item.title || item.book_id || "未命名知识")}</strong>
+        <small>${escapeHTML(item.book_id || "")}${item.release_id ? ` · ${escapeHTML(knowledgeHash(item.release_id))}` : ""}</small>
+      </div>
+      <div>
+        <span>${escapeHTML(item.status || "unknown")}</span>
+        <small>priority ${Number(item.priority || 0)} · ${item.consumer_review_required ? "需要 Health 人工审核" : "KBase 侧准备中"}</small>
+      </div>
+      <div>
+        <span data-knowledge-health-review-action="${escapeAttribute(item.next_operator_action || "")}">${escapeHTML(item.next_operator_action || "inspect_status")}</span>
+        <small>serving_allowed=${item.serving_allowed ? "true" : "false"}</small>
+      </div>
+      <div>
+        <span>claims ${Number(item.claim_count || 0)} · citations ${Number(item.citation_count || 0)}</span>
+        <small>${escapeHTML(riskText)}</small>
+        ${reasons.length ? `<small>${escapeHTML(reasons.join(" / "))}</small>` : ""}
+      </div>
+    </article>
+  `;
 }
 
 function renderKnowledgeOperationsItem(item) {

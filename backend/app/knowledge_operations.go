@@ -3,15 +3,17 @@ package app
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 )
 
 const KnowledgeOperationsSchemaVersion = "knowledge_operations.v1"
 
 type KnowledgeOperationsConsole struct {
-	SchemaVersion string                     `json:"schema_version"`
-	Summary       KnowledgeOperationsSummary `json:"summary"`
-	Items         []KnowledgeOperationsItem  `json:"items"`
+	SchemaVersion     string                                `json:"schema_version"`
+	Summary           KnowledgeOperationsSummary            `json:"summary"`
+	HealthReviewQueue []KnowledgeOperationsHealthReviewItem `json:"health_review_queue"`
+	Items             []KnowledgeOperationsItem             `json:"items"`
 }
 
 type KnowledgeOperationsSummary struct {
@@ -49,6 +51,22 @@ type KnowledgeOperationsHealthSummary struct {
 	ClaimCount     int            `json:"claim_count,omitempty"`
 	CitationCount  int            `json:"citation_count,omitempty"`
 	RiskCounts     map[string]int `json:"risk_counts,omitempty"`
+}
+
+type KnowledgeOperationsHealthReviewItem struct {
+	BookID                 string         `json:"book_id"`
+	Title                  string         `json:"title"`
+	ReleaseID              string         `json:"release_id,omitempty"`
+	Status                 string         `json:"status"`
+	Priority               int            `json:"priority"`
+	PriorityLabel          string         `json:"priority_label"`
+	NextOperatorAction     string         `json:"next_operator_action"`
+	ConsumerReviewRequired bool           `json:"consumer_review_required"`
+	ServingAllowed         bool           `json:"serving_allowed"`
+	ClaimCount             int            `json:"claim_count,omitempty"`
+	CitationCount          int            `json:"citation_count,omitempty"`
+	RiskCounts             map[string]int `json:"risk_counts,omitempty"`
+	Reasons                []string       `json:"reasons,omitempty"`
 }
 
 type KnowledgeOperationsFailureSummary struct {
@@ -145,6 +163,7 @@ func BuildKnowledgeOperationsConsole(store *BookKnowledgeStore, limit int) (*Kno
 	console.Summary.HealthReadyToPublish = healthReadiness.Totals.ReadyToPublish
 	console.Summary.HealthPublished = healthReadiness.Totals.Published
 	console.Summary.HealthBlocked = healthReadiness.Totals.Blocked
+	console.HealthReviewQueue = buildKnowledgeOperationsHealthReviewQueue(console.Items)
 	return console, nil
 }
 
@@ -268,4 +287,84 @@ func summarizeKnowledgeOperationsHealthEvidence(store *BookKnowledgeStore, relea
 		summary.RiskCounts = riskCounts
 	}
 	return summary
+}
+
+func buildKnowledgeOperationsHealthReviewQueue(items []KnowledgeOperationsItem) []KnowledgeOperationsHealthReviewItem {
+	queue := make([]KnowledgeOperationsHealthReviewItem, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.Health.Status) == "" {
+			continue
+		}
+		reviewItem := knowledgeOperationsHealthReviewItemFromOperationsItem(item)
+		if reviewItem.Priority <= 0 {
+			continue
+		}
+		queue = append(queue, reviewItem)
+	}
+	sort.SliceStable(queue, func(i, j int) bool {
+		if queue[i].Priority != queue[j].Priority {
+			return queue[i].Priority > queue[j].Priority
+		}
+		if queue[i].Title != queue[j].Title {
+			return queue[i].Title < queue[j].Title
+		}
+		return queue[i].BookID < queue[j].BookID
+	})
+	return queue
+}
+
+func knowledgeOperationsHealthReviewItemFromOperationsItem(item KnowledgeOperationsItem) KnowledgeOperationsHealthReviewItem {
+	priority, priorityLabel, nextOperatorAction, consumerReviewRequired := knowledgeOperationsHealthReviewPriority(item.Health.Status)
+	reviewItem := KnowledgeOperationsHealthReviewItem{
+		BookID:                 item.BookID,
+		Title:                  item.Title,
+		ReleaseID:              item.ReleaseID,
+		Status:                 item.Health.Status,
+		Priority:               priority,
+		PriorityLabel:          priorityLabel,
+		NextOperatorAction:     nextOperatorAction,
+		ConsumerReviewRequired: consumerReviewRequired,
+		ServingAllowed:         false,
+		ClaimCount:             item.Health.ClaimCount,
+		CitationCount:          item.Health.CitationCount,
+		Reasons:                append([]string(nil), item.Health.Reasons...),
+	}
+	if len(item.Health.RiskCounts) > 0 {
+		reviewItem.RiskCounts = make(map[string]int, len(item.Health.RiskCounts))
+		for riskLevel, count := range item.Health.RiskCounts {
+			reviewItem.RiskCounts[riskLevel] = count
+		}
+	}
+	if reviewItem.ConsumerReviewRequired && !knowledgeOperationsContainsString(reviewItem.Reasons, "consumer_review_required") {
+		reviewItem.Reasons = append(reviewItem.Reasons, "consumer_review_required")
+	}
+	return reviewItem
+}
+
+func knowledgeOperationsHealthReviewPriority(status string) (int, string, string, bool) {
+	switch status {
+	case HealthEvidenceReadinessPublished:
+		return 90, "review_next", "send_to_health_review", true
+	case HealthEvidenceReadinessReadyToPublish:
+		return 80, "prepare_review", "prepare_health_release", false
+	case HealthEvidenceReadinessPolicyBlocked:
+		return 70, "blocked", "inspect_policy_block", false
+	case HealthEvidenceReadinessQualityBlocked:
+		return 65, "blocked", "inspect_quality_block", false
+	case HealthEvidenceReadinessNeedsQuality:
+		return 50, "needs_work", "evaluate_quality", false
+	case HealthEvidenceReadinessNeedsAnalysis:
+		return 40, "needs_work", "run_analysis", false
+	default:
+		return 10, "monitor", "inspect_status", false
+	}
+}
+
+func knowledgeOperationsContainsString(items []string, needle string) bool {
+	for _, item := range items {
+		if item == needle {
+			return true
+		}
+	}
+	return false
 }

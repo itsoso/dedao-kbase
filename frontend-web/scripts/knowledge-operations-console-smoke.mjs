@@ -17,6 +17,9 @@ for (const marker of [
   "/api/knowledge/operations/replay",
   "Release Status Center",
   "Health Evidence Review Workspace",
+  "health_review_queue",
+  "renderKnowledgeOperationsHealthReviewQueue",
+  "data-knowledge-health-review-action",
   "Failure Explanation",
   "data-knowledge-operations-replay",
 ]) {

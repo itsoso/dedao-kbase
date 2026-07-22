@@ -78,6 +78,63 @@ func TestKnowledgeOperationsHealthSummaryDoesNotExposeSourceBody(t *testing.T) {
 	}
 }
 
+func TestKnowledgeOperationsBuildsHealthReviewQueue(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveHealthReadinessBook(t, store, "needs-analysis", "hash-analysis")
+	saveHealthReadinessBook(t, store, "ready", "hash-ready")
+	saveHealthAnalysis(t, store, "ready", "hash-ready")
+	saveHealthQuality(t, store, "ready", "hash-ready", BookQualityPass, BookUsageEvidenceOnly)
+	saveHealthReadinessBook(t, store, "book-health", "hash-health")
+	saveHealthAnalysis(t, store, "book-health", "hash-health")
+	saveHealthQuality(t, store, "book-health", "hash-health", BookQualityPass, BookUsageEvidenceOnly)
+	saveFeedRelease(t, store, sampleHealthEvidenceRelease())
+
+	console, err := BuildKnowledgeOperationsConsole(store, 10)
+	if err != nil {
+		t.Fatalf("BuildKnowledgeOperationsConsole returned error: %v", err)
+	}
+	if len(console.HealthReviewQueue) != 3 {
+		t.Fatalf("health review queue = %#v", console.HealthReviewQueue)
+	}
+	published := findKnowledgeOperationsHealthReviewItem(t, console.HealthReviewQueue, "book-health")
+	if published.Status != HealthEvidenceReadinessPublished || published.NextOperatorAction != "send_to_health_review" {
+		t.Fatalf("published review item = %#v", published)
+	}
+	if published.ReleaseID != "release-health" || published.PriorityLabel != "review_next" || published.Priority <= 0 {
+		t.Fatalf("published priority = %#v", published)
+	}
+	if !published.ConsumerReviewRequired || published.ServingAllowed {
+		t.Fatalf("published safety = %#v", published)
+	}
+	if published.ClaimCount != 2 || published.CitationCount != 2 || published.RiskCounts["high"] != 1 {
+		t.Fatalf("published evidence metadata = %#v", published)
+	}
+	ready := findKnowledgeOperationsHealthReviewItem(t, console.HealthReviewQueue, "ready")
+	if ready.NextOperatorAction != "prepare_health_release" || ready.ConsumerReviewRequired {
+		t.Fatalf("ready action = %#v", ready)
+	}
+	needsAnalysis := findKnowledgeOperationsHealthReviewItem(t, console.HealthReviewQueue, "needs-analysis")
+	if needsAnalysis.NextOperatorAction != "run_analysis" || needsAnalysis.PriorityLabel != "needs_work" {
+		t.Fatalf("needs-analysis action = %#v", needsAnalysis)
+	}
+	if console.HealthReviewQueue[0].BookID != "book-health" {
+		t.Fatalf("queue not sorted by priority: %#v", console.HealthReviewQueue)
+	}
+
+	body, err := json.Marshal(console.HealthReviewQueue)
+	if err != nil {
+		t.Fatalf("marshal health review queue: %v", err)
+	}
+	if strings.Contains(string(body), "规律运动可能帮助") || strings.Contains(string(body), "糖尿病药物调整") {
+		t.Fatalf("health review queue exposed claim statements: %s", string(body))
+	}
+	for _, item := range console.HealthReviewQueue {
+		if item.NextOperatorAction == "publish" || item.NextOperatorAction == "health_serving_promote" {
+			t.Fatalf("health review queue exposed unsafe action: %#v", item)
+		}
+	}
+}
+
 func TestKnowledgeOperationsExplainsFailuresWithSafeReplay(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	savePipelinePackage(t, store, "stale-quality", "hash-current")
@@ -118,6 +175,17 @@ func TestKnowledgeOperationsExplainsFailuresWithSafeReplay(t *testing.T) {
 	if result.Status != "succeeded" || !result.Mutated || result.NextAction != "ready_to_publish" {
 		t.Fatalf("confirmed replay = %#v", result)
 	}
+}
+
+func findKnowledgeOperationsHealthReviewItem(t *testing.T, items []KnowledgeOperationsHealthReviewItem, bookID string) KnowledgeOperationsHealthReviewItem {
+	t.Helper()
+	for _, item := range items {
+		if item.BookID == bookID {
+			return item
+		}
+	}
+	t.Fatalf("health review item %s not found in %#v", bookID, items)
+	return KnowledgeOperationsHealthReviewItem{}
 }
 
 func TestRunKnowledgeOperationsReplayRejectsDangerousActions(t *testing.T) {
