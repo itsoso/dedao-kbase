@@ -57,9 +57,36 @@ allowed only with these constraints:
 - no copyrighted full-text ingestion without authorization;
 - durable execution so browser timeouts cannot orphan model work.
 
+## Delivery Progress
+
+The first implementation slice is complete:
+
+- Task 1 defines and validates the public audit request, source, finding,
+  result, and run contracts.
+- Task 2 persists leased runs, checkpoints, immutable normalized evidence,
+  and idempotency records in SQLite.
+- Task 3 collects bounded ClinicalTrials.gov API v2 protocol, outcome,
+  participant-flow, denominator, and analysis evidence from the fixed official
+  HTTPS origin.
+- Database v4 separates stable evidence identity from collection provenance
+  and atomically migrates known v3 single- and multi-source terminal audits.
+
+Implementation commits: `afd5c61` through `02c2f3e`. Independent task and
+integration reviews found no remaining Critical or Important findings.
+
+## G3 First-Slice Test Evidence — PASS
+
+- focused and race tests for `ClinicalTrialAudit` and `ClinicalTrialsGov`;
+- complete `backend/app` and `backend/...` tests;
+- `go vet`, `go mod verify`, and JSON syntax validation;
+- privacy smoke and `git diff --check`.
+
+The macOS race build emits the existing non-fatal `LC_DYSYMTAB` linker warning;
+tests still exit successfully.
+
 ## Current Stage
 
-`S4 Task decomposition ready` — design and implementation plan are complete.
-No production code or package version has changed in this dossier yet. The
-first implementation slice is Tasks 1-3: domain contract, durable store, and
-ClinicalTrials.gov snapshots.
+`S5 implementation in progress` — Tasks 1-3 are complete and approved. The
+next delivery slice begins with Task 4: bounded PubMed collection and explicit
+DOI/PMID/NCT identity resolution. No production route or package version has
+changed yet.
