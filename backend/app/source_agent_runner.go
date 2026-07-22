@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const defaultSourceAgentLeaseDuration = 30 * time.Minute
+const defaultSourceAgentLeaseDuration = 90 * time.Minute
 
 type SourceAgentRunnerConfig struct {
 	Client        *SourceAgentClient
