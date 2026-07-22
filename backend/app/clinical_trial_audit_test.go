@@ -260,6 +260,53 @@ func TestClinicalTrialAuditRunAllowsDeclaredStatesAndRequiresCompleteTerminalSta
 	}
 }
 
+func TestClinicalTrialAuditRunCanonicalizesAndValidatesLifecycleTimestamps(t *testing.T) {
+	request, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := ClinicalTrialAuditRun{
+		SchemaVersion: ClinicalTrialAuditRunSchemaVersion,
+		RunID:         "run-1",
+		State:         ClinicalTrialAuditRunQueued,
+		Request:       request,
+		CreatedAt:     "2026-07-21T08:00:00-04:00",
+		UpdatedAt:     "2026-07-21T09:30:00-04:00",
+	}
+	finalized, err := FinalizeClinicalTrialAuditRun(run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalized.CreatedAt != "2026-07-21T12:00:00Z" || finalized.UpdatedAt != "2026-07-21T13:30:00Z" {
+		t.Fatalf("canonical run timestamps = %q, %q", finalized.CreatedAt, finalized.UpdatedAt)
+	}
+	if err := ValidateClinicalTrialAuditRun(finalized); err != nil {
+		t.Fatalf("ValidateClinicalTrialAuditRun(finalized) error = %v", err)
+	}
+
+	for name, timestamps := range map[string][2]string{
+		"invalid created_at":     {"not-a-time", ""},
+		"invalid updated_at":     {"2026-07-21T12:00:00Z", "not-a-time"},
+		"noncanonical created":   {"2026-07-21T08:00:00-04:00", ""},
+		"noncanonical updated":   {"", "2026-07-21T08:00:00-04:00"},
+		"updated before created": {"2026-07-21T13:00:00Z", "2026-07-21T12:59:59Z"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := ClinicalTrialAuditRun{
+				SchemaVersion: ClinicalTrialAuditRunSchemaVersion,
+				RunID:         "run-1",
+				State:         ClinicalTrialAuditRunQueued,
+				Request:       request,
+				CreatedAt:     timestamps[0],
+				UpdatedAt:     timestamps[1],
+			}
+			if err := ValidateClinicalTrialAuditRun(candidate); err == nil {
+				t.Fatal("ValidateClinicalTrialAuditRun() error = nil")
+			}
+		})
+	}
+}
+
 func TestClinicalTrialAuditRunRejectsMismatchedRequestsAndExclusivePayloadViolations(t *testing.T) {
 	audit := validClinicalTrialAudit(t)
 	request := audit.Request
@@ -348,9 +395,58 @@ func TestClinicalTrialAuditJSONSchemaMirrorsRunAndCollectionBoundaries(t *testin
 		t.Fatal("audit schema limitations must reject surrounding whitespace")
 	}
 	run := defs["run"].(map[string]any)
-	if len(run["allOf"].([]any)) != 4 {
+	runProperties := run["properties"].(map[string]any)
+	for _, field := range []string{"created_at", "updated_at"} {
+		if runProperties[field].(map[string]any)["format"] != "date-time" {
+			t.Fatalf("run schema %s must use date-time format", field)
+		}
+	}
+	rules := run["allOf"].([]any)
+	if len(rules) != 4 {
 		t.Fatal("run schema must define one exclusive payload rule per state class")
 	}
+	assertClinicalTrialSchemaStateRule(t, rules, "failed", "error", "audit", "")
+	assertClinicalTrialSchemaStateRule(t, rules, "completed", "audit", "error", "#/$defs/audit")
+	assertClinicalTrialSchemaStateRule(t, rules, "abstained", "audit", "error", "#/$defs/abstained_audit")
+
+	nonterminal := rules[0].(map[string]any)
+	states := nonterminal["if"].(map[string]any)["properties"].(map[string]any)["state"].(map[string]any)["enum"].([]any)
+	if len(states) != 5 {
+		t.Fatal("nonterminal schema rule must cover all five states")
+	}
+	forbidden := nonterminal["then"].(map[string]any)["not"].(map[string]any)["anyOf"].([]any)
+	if len(forbidden) != 2 || firstRequiredClinicalTrialSchemaField(forbidden[0]) != "audit" || firstRequiredClinicalTrialSchemaField(forbidden[1]) != "error" {
+		t.Fatal("nonterminal schema rule must reject contradictory audit and error payloads")
+	}
+}
+
+func assertClinicalTrialSchemaStateRule(t *testing.T, rules []any, state, required, forbidden, auditRef string) {
+	t.Helper()
+	for _, rawRule := range rules {
+		rule := rawRule.(map[string]any)
+		stateSchema := rule["if"].(map[string]any)["properties"].(map[string]any)["state"].(map[string]any)
+		if stateSchema["const"] != state {
+			continue
+		}
+		then := rule["then"].(map[string]any)
+		if firstRequiredClinicalTrialSchemaField(then) != required || firstRequiredClinicalTrialSchemaField(then["not"]) != forbidden {
+			t.Fatalf("schema rule %s does not enforce required=%s forbidden=%s", state, required, forbidden)
+		}
+		if auditRef != "" {
+			got := then["properties"].(map[string]any)["audit"].(map[string]any)["$ref"]
+			if got != auditRef {
+				t.Fatalf("schema rule %s audit ref = %v, want %s", state, got, auditRef)
+			}
+		}
+		return
+	}
+	t.Fatalf("schema rule for state %s is missing", state)
+}
+
+func firstRequiredClinicalTrialSchemaField(value any) string {
+	object := value.(map[string]any)
+	required := object["required"].([]any)
+	return required[0].(string)
 }
 
 func validClinicalTrialAudit(t *testing.T) ClinicalTrialAudit {

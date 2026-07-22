@@ -164,6 +164,23 @@ func ValidateClinicalTrialAudit(audit ClinicalTrialAudit) error {
 	return validateClinicalTrialAudit(audit, true)
 }
 
+func FinalizeClinicalTrialAuditRun(run ClinicalTrialAuditRun) (ClinicalTrialAuditRun, error) {
+	createdAt, err := canonicalClinicalTrialTimestamp("created_at", run.CreatedAt, false)
+	if err != nil {
+		return ClinicalTrialAuditRun{}, err
+	}
+	updatedAt, err := canonicalClinicalTrialTimestamp("updated_at", run.UpdatedAt, false)
+	if err != nil {
+		return ClinicalTrialAuditRun{}, err
+	}
+	run.CreatedAt = createdAt
+	run.UpdatedAt = updatedAt
+	if err := ValidateClinicalTrialAuditRun(run); err != nil {
+		return ClinicalTrialAuditRun{}, err
+	}
+	return run, nil
+}
+
 func ValidateClinicalTrialAuditRun(run ClinicalTrialAuditRun) error {
 	if run.SchemaVersion != ClinicalTrialAuditRunSchemaVersion {
 		return fmt.Errorf("schema_version must be %q", ClinicalTrialAuditRunSchemaVersion)
@@ -173,6 +190,17 @@ func ValidateClinicalTrialAuditRun(run ClinicalTrialAuditRun) error {
 	}
 	if err := validateClinicalTrialAuditRequest(run.Request); err != nil {
 		return fmt.Errorf("request: %w", err)
+	}
+	createdAt, hasCreatedAt, err := validateCanonicalClinicalTrialTimestamp("created_at", run.CreatedAt)
+	if err != nil {
+		return err
+	}
+	updatedAt, hasUpdatedAt, err := validateCanonicalClinicalTrialTimestamp("updated_at", run.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if hasCreatedAt && hasUpdatedAt && updatedAt.Before(createdAt) {
+		return fmt.Errorf("updated_at must not be before created_at")
 	}
 	switch run.State {
 	case ClinicalTrialAuditRunQueued, ClinicalTrialAuditRunCollecting, ClinicalTrialAuditRunComparing,
@@ -396,6 +424,24 @@ func canonicalClinicalTrialTimestamp(field, value string, required bool) (string
 		return "", fmt.Errorf("%s must be RFC3339: %w", field, err)
 	}
 	return parsed.UTC().Format(time.RFC3339Nano), nil
+}
+
+func validateCanonicalClinicalTrialTimestamp(field, value string) (time.Time, bool, error) {
+	if value == "" {
+		return time.Time{}, false, nil
+	}
+	canonical, err := canonicalClinicalTrialTimestamp(field, value, true)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	if value != canonical {
+		return time.Time{}, false, fmt.Errorf("%s must use canonical UTC RFC3339 representation", field)
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, canonical)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("%s must be RFC3339: %w", field, err)
+	}
+	return parsed, true, nil
 }
 
 func validateClinicalTrialLimitations(limitations []string) error {
