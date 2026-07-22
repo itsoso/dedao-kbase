@@ -32,7 +32,8 @@ Reusable foundations:
 
 - Design: `docs/plans/2026-07-22-clinical-trial-truth-agent-design.md`
 - Parent architecture: `docs/plans/2026-07-19-book-as-agent-platform-design.md`
-- Implementation plan: pending
+- Implementation plan:
+  `docs/plans/2026-07-22-clinical-trial-truth-agent.md`
 
 ## Gate Decisions
 
@@ -58,6 +59,7 @@ allowed only with these constraints:
 
 ## Current Stage
 
-`S3 Planning` — design approved; implementation plan and task decomposition are
-next. No production code or package version has changed in this dossier yet.
-
+`S4 Task decomposition ready` — design and implementation plan are complete.
+No production code or package version has changed in this dossier yet. The
+first implementation slice is Tasks 1-3: domain contract, durable store, and
+ClinicalTrials.gov snapshots.
