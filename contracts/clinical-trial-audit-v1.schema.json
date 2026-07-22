@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/clinical-trial-audit-v1.schema.json",
+  "title": "KBase Clinical Trial Audit v1",
+  "oneOf": [
+    { "$ref": "#/$defs/audit" },
+    { "$ref": "#/$defs/run" }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "request": {
+      "type": "object",
+      "required": ["input_type", "input", "normalized_input", "input_hash"],
+      "properties": {
+        "input_type": { "enum": ["nct_id", "doi", "pmid", "claim"] },
+        "input": { "type": "string", "minLength": 1 },
+        "normalized_input": { "type": "string", "minLength": 1 },
+        "input_hash": { "$ref": "#/$defs/sha256" }
+      },
+      "additionalProperties": false
+    },
+    "source_snapshot": {
+      "type": "object",
+      "required": ["source_type", "canonical_id", "retrieved_at", "content_hash", "fingerprint", "license_scope"],
+      "properties": {
+        "source_type": { "type": "string", "minLength": 1 },
+        "canonical_id": { "type": "string", "minLength": 1 },
+        "retrieved_at": { "type": "string", "format": "date-time" },
+        "upstream_updated_at": { "type": "string", "format": "date-time" },
+        "content_hash": { "$ref": "#/$defs/sha256" },
+        "fingerprint": { "$ref": "#/$defs/sha256" },
+        "license_scope": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "citation": {
+      "type": "object",
+      "required": ["citation_id", "source_fingerprint", "locator"],
+      "properties": {
+        "citation_id": { "type": "string", "minLength": 1 },
+        "source_fingerprint": { "$ref": "#/$defs/sha256" },
+        "locator": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "finding": {
+      "type": "object",
+      "required": ["finding_id", "class", "summary", "citation_ids"],
+      "properties": {
+        "finding_id": { "type": "string", "minLength": 1 },
+        "class": {
+          "enum": [
+            "registered_fact",
+            "publication_claim",
+            "deterministic_discrepancy",
+            "model_interpretation",
+            "unresolved_conflict"
+          ]
+        },
+        "summary": { "type": "string", "minLength": 1 },
+        "citation_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "audit": {
+      "type": "object",
+      "required": ["schema_version", "audit_id", "request", "sources", "findings", "citations", "confidence", "limitations", "completed_at"],
+      "properties": {
+        "schema_version": { "const": "clinical-trial-audit.v1" },
+        "audit_id": { "type": "string", "minLength": 1 },
+        "request": { "$ref": "#/$defs/request" },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/source_snapshot" }
+        },
+        "findings": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/finding" }
+        },
+        "citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/citation" }
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "limitations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "completed_at": { "type": "string", "format": "date-time" }
+      },
+      "additionalProperties": false
+    },
+    "run": {
+      "type": "object",
+      "required": ["schema_version", "run_id", "state", "request"],
+      "properties": {
+        "schema_version": { "const": "clinical-trial-audit-run.v1" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "state": {
+          "enum": ["queued", "collecting", "comparing", "reasoning", "awaiting_review", "completed", "failed", "abstained"]
+        },
+        "request": { "$ref": "#/$defs/request" },
+        "audit": { "$ref": "#/$defs/audit" },
+        "error": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "enum": ["completed", "abstained"] } }, "required": ["state"] },
+          "then": { "required": ["audit"] }
+        },
+        {
+          "if": { "properties": { "state": { "const": "failed" } }, "required": ["state"] },
+          "then": { "required": ["error"] }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
+}

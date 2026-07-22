@@ -23,6 +23,29 @@ Package manifests contain prompt profile and output-schema identifiers, not
 private prompt bodies. They do not transfer downloaded source bodies,
 credentials, consumer user data, or consumer-owned review decisions.
 
+## Clinical Trial Audit
+
+Clinical-trial evidence workflows exchange immutable audit requests and results
+using `contracts/clinical-trial-audit-v1.schema.json`. An input is one NCT ID,
+DOI, PMID, or bounded trial claim. Publishers normalize the identifier before
+computing `input_hash`, so equivalent forms reuse the same audit identity.
+
+Every source snapshot carries a canonical source ID, upstream version time,
+content hash, license scope, and deterministic fingerprint. Audit findings are
+typed as registered facts, publication claims, deterministic discrepancies,
+model interpretations, or unresolved conflicts. Each finding must resolve to
+one or more unique citation IDs, and each citation must resolve to a source
+fingerprint. Consumers must preserve confidence, limitations, and source
+fingerprints when importing an audit.
+
+Audit runs use `clinical-trial-audit-run.v1` and advance through `queued`,
+`collecting`, `comparing`, `reasoning`, and `awaiting_review` before reaching
+`completed`, `failed`, or `abstained`. Completed and abstained runs include an
+audit; failed runs include an explicit error. These artifacts contain no source
+bodies, credentials, patient data, or private prompts. They are evidence-review
+inputs only and cannot enter a health serving index without downstream domain
+approval.
+
 Before publication, a publisher submits the finalized package and its synthetic
 golden suite to:
 
