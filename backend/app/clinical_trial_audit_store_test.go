@@ -539,26 +539,112 @@ func TestClinicalTrialAuditStoreMigratesVersion3TerminalAuditSnapshots(t *testin
 			if err != nil {
 				t.Fatalf("read migrated terminal run: %v", err)
 			}
-			if loaded.State != state || loaded.Audit == nil || len(loaded.Sources) != 1 || len(loaded.Audit.Sources) != 1 {
+			if loaded.State != state || loaded.Audit == nil || len(loaded.Sources) != 2 || len(loaded.Audit.Sources) != 2 {
 				t.Fatalf("migrated terminal run = %#v", loaded)
 			}
-			if !reflect.DeepEqual(loaded.Audit.Sources[0], loaded.Sources[0]) {
-				t.Fatalf("embedded audit source = %#v, stored source = %#v", loaded.Audit.Sources[0], loaded.Sources[0])
+			storedSources := make(map[string]ClinicalTrialSourceSnapshot, len(loaded.Sources))
+			for _, source := range loaded.Sources {
+				storedSources[source.Fingerprint] = source
+			}
+			for _, source := range loaded.Audit.Sources {
+				if !reflect.DeepEqual(source, storedSources[source.Fingerprint]) || source.ProvenanceDigest == "" {
+					t.Fatalf("embedded audit source = %#v, stored sources = %#v", source, storedSources)
+				}
 			}
 			for _, citation := range loaded.Audit.Citations {
-				if citation.SourceFingerprint != loaded.Sources[0].Fingerprint {
-					t.Fatalf("migrated audit citation = %#v, source = %#v", citation, loaded.Sources[0])
+				if _, exists := storedSources[citation.SourceFingerprint]; !exists {
+					t.Fatalf("migrated audit citation = %#v, sources = %#v", citation, storedSources)
 				}
 			}
 			for _, citation := range loaded.Citations {
-				if citation.SourceFingerprint != loaded.Sources[0].Fingerprint {
-					t.Fatalf("migrated stored citation = %#v, source = %#v", citation, loaded.Sources[0])
+				if _, exists := storedSources[citation.SourceFingerprint]; !exists {
+					t.Fatalf("migrated stored citation = %#v, sources = %#v", citation, storedSources)
 				}
 			}
 			if _, err := ProjectClinicalTrialAuditRun(loaded); err != nil {
 				t.Fatalf("project migrated terminal run: %v", err)
 			}
 		})
+	}
+}
+
+func TestClinicalTrialAuditStoreMarksUnknownVersion3SourceIncompatibleAtomically(t *testing.T) {
+	root, runID, _ := prepareClinicalTrialAuditV3TerminalFixture(t, ClinicalTrialAuditRunCompleted)
+	dbPath := filepath.Join(root, clinicalTrialAuditDBName)
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT fingerprint, snapshot_json FROM clinical_trial_audit_snapshots WHERE run_id = ?`, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var publicationFingerprint, publicationJSON string
+	for rows.Next() {
+		var fingerprint, encoded string
+		if err := rows.Scan(&fingerprint, &encoded); err != nil {
+			t.Fatal(err)
+		}
+		var snapshot map[string]any
+		if err := json.Unmarshal([]byte(encoded), &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		if snapshot["source_type"] == "pubmed" {
+			snapshot["source_type"] = "unknown_legacy_source"
+			mutated, _ := json.Marshal(snapshot)
+			publicationFingerprint, publicationJSON = fingerprint, string(mutated)
+		}
+	}
+	rows.Close()
+	if publicationFingerprint == "" {
+		t.Fatal("literal v3 fixture is missing publication snapshot")
+	}
+	if _, err := db.Exec(`UPDATE clinical_trial_audit_snapshots SET snapshot_json = ? WHERE run_id = ? AND fingerprint = ?`, publicationJSON, runID, publicationFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	var auditJSON string
+	if err := db.QueryRow(`SELECT audit_json FROM clinical_trial_audit_results WHERE run_id = ?`, runID).Scan(&auditJSON); err != nil {
+		t.Fatal(err)
+	}
+	var audit map[string]any
+	if err := json.Unmarshal([]byte(auditJSON), &audit); err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range audit["sources"].([]any) {
+		sourceObject := source.(map[string]any)
+		if sourceObject["source_type"] == "pubmed" {
+			sourceObject["source_type"] = "unknown_legacy_source"
+		}
+	}
+	mutatedAudit, _ := json.Marshal(audit)
+	if _, err := db.Exec(`UPDATE clinical_trial_audit_results SET audit_json = ? WHERE run_id = ?`, string(mutatedAudit), runID); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewClinicalTrialAuditStore(root)
+	if err != nil {
+		t.Fatalf("open database containing unknown v3 source: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.GetRun(runID); !errors.Is(err, ErrClinicalTrialAuditEvidenceIncompatible) {
+		t.Fatalf("unknown source migration error = %v", err)
+	}
+	var evidenceRows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_evidence`).Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	var migratedSnapshots int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_snapshots WHERE run_id = ? AND snapshot_json LIKE '%provenance_digest%'`, runID).Scan(&migratedSnapshots); err != nil {
+		t.Fatal(err)
+	}
+	var migratedResults int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_results WHERE run_id = ? AND audit_json LIKE '%provenance_digest%'`, runID).Scan(&migratedResults); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRows != 1 || migratedSnapshots != 0 || migratedResults != 0 {
+		t.Fatalf("incompatible run was partially migrated: evidence=%d migrated_snapshots=%d migrated_results=%d", evidenceRows, migratedSnapshots, migratedResults)
 	}
 }
 
@@ -1210,6 +1296,8 @@ func clinicalTrialAuditStoreEvidenceFixtureAt(t *testing.T, root string) (*Clini
 
 const clinicalTrialAuditV3StudyJSON = `{"source_api_version":"2.0.4","nct_id":"NCT01234567","brief_title":"Synthetic trial","overall_status":"COMPLETED","study_type":"INTERVENTIONAL","enrollment":{"count":240,"type":"ACTUAL"},"design":{},"start_date":{},"primary_completion_date":{},"completion_date":{},"results_first_posted":{},"last_update_posted":{"value":"2026-07-20T00:00:00Z","type":"ACTUAL","precision":"day"},"has_results":false,"participant_flow":{"groups":[{"id":"FG000","title":"Experimental"}],"periods":[{"title":"Overall","milestones":[{"type":"STARTED","achievements":[{"group_id":"FG000","subjects":"120"}]}]}]},"coverage":{"included_modules":["protocol","participant_flow","outcome_measures"],"excluded_modules":["baseline_characteristics","adverse_events","more_info"],"limitations":["ClinicalTrials.gov baseline characteristics, adverse events, and more-info modules are outside v1 normalized evidence coverage."]}}`
 
+const clinicalTrialAuditV3PublicationSnapshotJSON = `{"source_type":"pubmed","canonical_id":"PMID:12345678","retrieved_at":"2026-07-22T13:05:00Z","upstream_updated_at":"2026-07-19T00:00:00Z","content_hash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","license_scope":"abstract_metadata","fingerprint":"sha256:87a176cd88cae2506a57b1ee4cf62477d82b050536b037044187861ae59fb968"}`
+
 func prepareClinicalTrialAuditV3EvidenceFixture(t *testing.T, mutateEvidence func(map[string]any)) (string, string, string) {
 	return prepareClinicalTrialAuditV3Fixture(t, "", mutateEvidence)
 }
@@ -1222,16 +1310,32 @@ func prepareClinicalTrialAuditV3Fixture(t *testing.T, terminalState string, muta
 	t.Helper()
 	root := t.TempDir()
 	store, run, lease, snapshot, evidence := clinicalTrialAuditStoreEvidenceFixtureAt(t, root)
+	sources := []ClinicalTrialSourceSnapshot{snapshot}
+	var publication ClinicalTrialSourceSnapshot
+	if terminalState != "" {
+		var err error
+		publication, err = FinalizeClinicalTrialSourceSnapshot(ClinicalTrialSourceSnapshot{
+			SourceType: "pubmed", CanonicalID: "PMID:12345678", RetrievedAt: "2026-07-22T13:05:00Z",
+			UpstreamUpdatedAt: "2026-07-19T00:00:00Z", ContentHash: "sha256:" + strings.Repeat("b", 64), LicenseScope: "abstract_metadata",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sources = append(sources, publication)
+	}
 	if _, err := store.CheckpointRun(run.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
-		State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
+		State: ClinicalTrialAuditRunComparing, Sources: sources, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if terminalState != "" {
-		citation := ClinicalTrialAuditCitation{CitationID: "citation-1", SourceFingerprint: snapshot.Fingerprint, Locator: "participant_flow.periods[0]"}
-		finding := ClinicalTrialFinding{FindingID: "finding-1", Class: ClinicalTrialFindingRegisteredFact, Summary: "Registry participant flow was collected.", CitationIDs: []string{citation.CitationID}}
+		citations := []ClinicalTrialAuditCitation{
+			{CitationID: "citation-registry", SourceFingerprint: snapshot.Fingerprint, Locator: "participant_flow.periods[0]"},
+			{CitationID: "citation-publication", SourceFingerprint: publication.Fingerprint, Locator: "abstract.results"},
+		}
+		finding := ClinicalTrialFinding{FindingID: "finding-1", Class: ClinicalTrialFindingRegisteredFact, Summary: "Registry participant flow was collected.", CitationIDs: []string{citations[0].CitationID, citations[1].CitationID}}
 		if _, err := store.CheckpointRun(run.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
-			State: ClinicalTrialAuditRunReasoning, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Findings: []ClinicalTrialFinding{finding}, Citations: []ClinicalTrialAuditCitation{citation},
+			State: ClinicalTrialAuditRunReasoning, Sources: sources, Findings: []ClinicalTrialFinding{finding}, Citations: citations,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -1240,7 +1344,7 @@ func prepareClinicalTrialAuditV3Fixture(t *testing.T, terminalState string, muta
 		}
 		audit := ClinicalTrialAudit{
 			SchemaVersion: ClinicalTrialAuditSchemaVersion, AuditID: "audit-v3", Request: run.Request,
-			Sources: []ClinicalTrialSourceSnapshot{snapshot}, Findings: []ClinicalTrialFinding{finding}, Citations: []ClinicalTrialAuditCitation{citation},
+			Sources: sources, Findings: []ClinicalTrialFinding{finding}, Citations: citations,
 			Confidence: 0.9, Limitations: []string{"Publication comparison is pending."}, CompletedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		}
 		if terminalState == ClinicalTrialAuditRunAbstained {
@@ -1262,7 +1366,11 @@ func prepareClinicalTrialAuditV3Fixture(t *testing.T, terminalState string, muta
 	if err := db.QueryRow(`SELECT evidence_json FROM clinical_trial_audit_evidence`).Scan(&evidenceJSON); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT snapshot_json FROM clinical_trial_audit_snapshots WHERE run_id = ?`, run.RunID).Scan(&snapshotJSON); err != nil {
+	if err := db.QueryRow(`
+		SELECT snapshot.snapshot_json FROM clinical_trial_audit_snapshots AS snapshot
+		JOIN clinical_trial_audit_snapshot_evidence AS link ON link.run_id = snapshot.run_id AND link.fingerprint = snapshot.fingerprint
+		WHERE snapshot.run_id = ?
+	`, run.RunID).Scan(&snapshotJSON); err != nil {
 		t.Fatal(err)
 	}
 	var evidenceObject map[string]any
@@ -1320,13 +1428,24 @@ func prepareClinicalTrialAuditV3Fixture(t *testing.T, terminalState string, muta
 	if _, err := db.Exec(`INSERT INTO clinical_trial_audit_evidence(content_hash, source_type, evidence_json) VALUES (?, ?, ?)`, legacyContentHash, ClinicalTrialsGovStudySourceType, string(legacyEvidence)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE clinical_trial_audit_snapshots SET fingerprint = ?, snapshot_json = ? WHERE run_id = ?`, legacySnapshot.Fingerprint, string(legacySnapshotJSON), run.RunID); err != nil {
+	if _, err := db.Exec(`UPDATE clinical_trial_audit_snapshots SET fingerprint = ?, snapshot_json = ? WHERE run_id = ? AND fingerprint = ?`, legacySnapshot.Fingerprint, string(legacySnapshotJSON), run.RunID, snapshot.Fingerprint); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE clinical_trial_audit_snapshot_evidence SET fingerprint = ?, content_hash = ? WHERE run_id = ?`, legacySnapshot.Fingerprint, legacyContentHash, run.RunID); err != nil {
 		t.Fatal(err)
 	}
 	if terminalState != "" {
+		var literalPublication ClinicalTrialSourceSnapshot
+		if err := json.Unmarshal([]byte(clinicalTrialAuditV3PublicationSnapshotJSON), &literalPublication); err != nil {
+			t.Fatalf("literal v3 publication fixture is invalid: %v", err)
+		}
+		literalFinalized, err := FinalizeClinicalTrialSourceSnapshot(literalPublication)
+		if err != nil || literalFinalized.Fingerprint != publication.Fingerprint {
+			t.Fatalf("literal v3 publication identity mismatch: finalized=%#v current=%#v err=%v", literalFinalized, publication, err)
+		}
+		if _, err := db.Exec(`UPDATE clinical_trial_audit_snapshots SET snapshot_json = ? WHERE run_id = ? AND fingerprint = ?`, clinicalTrialAuditV3PublicationSnapshotJSON, run.RunID, publication.Fingerprint); err != nil {
+			t.Fatal(err)
+		}
 		var citationsJSON, auditJSON string
 		if err := db.QueryRow(`SELECT citations_json, audit_json FROM clinical_trial_audit_results WHERE run_id = ?`, run.RunID).Scan(&citationsJSON, &auditJSON); err != nil {
 			t.Fatal(err)
