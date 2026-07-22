@@ -16,6 +16,8 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+const defaultWeChatSourceMaxItems = 500
+
 const sourceSyncDBName = "source_sync.sqlite3"
 const sourceDiagnosticMaxRunes = 4000
 
@@ -615,7 +617,7 @@ func normalizeSourceSubscriptionInput(input SourceSubscriptionInput) (SourceSubs
 		if pageSize < 1 {
 			pageSize = 1
 		}
-		maxItems := sourceAgentOptionInt(input.Options, "max_items", 100, 100)
+		maxItems := sourceAgentOptionInt(input.Options, "max_items", defaultWeChatSourceMaxItems, defaultWeChatSourceMaxItems)
 		if maxItems < 1 {
 			maxItems = 1
 		}

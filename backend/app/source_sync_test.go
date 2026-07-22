@@ -126,7 +126,7 @@ func TestSourceSyncNormalizesWeChatSubscriptionOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sourceAgentOptionInt(input.Options, "page_size", 0, 1000) != 20 || sourceAgentOptionInt(input.Options, "max_items", 0, 1000) != 100 {
+	if sourceAgentOptionInt(input.Options, "page_size", 0, 1000) != 20 || sourceAgentOptionInt(input.Options, "max_items", 0, 1000) != 500 {
 		t.Fatalf("options=%#v", input.Options)
 	}
 	if !sourceAgentOptionBool(input.Options, "include_media", false) || len([]rune(sourceAgentOptionString(input.Options, "title_query", ""))) != 100 {

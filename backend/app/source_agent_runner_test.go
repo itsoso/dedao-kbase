@@ -131,8 +131,8 @@ func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 	if failedCursor != "safe-cursor" {
 		t.Fatalf("failed cursor=%q", failedCursor)
 	}
-	if leaseSeconds != 600 {
-		t.Fatalf("lease seconds=%d, want 600", leaseSeconds)
+	if leaseSeconds != 1800 {
+		t.Fatalf("lease seconds=%d, want 1800", leaseSeconds)
 	}
 	if strings.Join(calls, ",") != "upload,fail" {
 		t.Fatalf("calls=%v, want upload before fail", calls)

@@ -73,7 +73,7 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		return SourceAdapterResult{}, fmt.Errorf("wechat discovery is not configured")
 	}
 	pageSize := sourceAgentOptionInt(run.Subscription.Options, "page_size", 10, 20)
-	maxItems := sourceAgentOptionInt(run.Subscription.Options, "max_items", 100, 100)
+	maxItems := sourceAgentOptionInt(run.Subscription.Options, "max_items", defaultWeChatSourceMaxItems, defaultWeChatSourceMaxItems)
 	if run.RequestedOperation != "sync_articles" && run.RequestedOperation != "sync_media" {
 		if run.RequestedOperation != "discover_articles" {
 			return SourceAdapterResult{}, fmt.Errorf("unsupported source sync operation %q", run.RequestedOperation)

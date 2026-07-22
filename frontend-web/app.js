@@ -3381,7 +3381,7 @@ async function createSourceSubscription() {
         agent_id: draft.sourceAgentID,
         schedule,
         operation: draft.sourceOperation,
-        options: { page_size: 10, max_items: 100, include_media: true, title_query: "" },
+        options: { page_size: 10, max_items: 500, include_media: true, title_query: "" },
         enabled: true,
       }),
     });
