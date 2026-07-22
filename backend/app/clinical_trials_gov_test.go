@@ -64,6 +64,23 @@ const clinicalTrialsGovStudyFixture = `{
     }
   },
   "resultsSection": {
+    "participantFlowModule": {
+      "recruitmentDetails": "Synthetic participants were recruited at two sites.",
+      "preAssignmentDetails": "Two participants were excluded before assignment.",
+      "typeUnitsAnalyzed": "PARTICIPANTS",
+      "groups": [
+        {"id": "FG000", "title": "Experimental", "description": "Synthetic intervention arm"},
+        {"id": "FG001", "title": "Control", "description": "Synthetic control arm"}
+      ],
+      "periods": [{
+        "title": "Overall Study",
+        "milestones": [
+          {"type": "STARTED", "achievements": [{"groupId": "FG000", "numSubjects": "120"}, {"groupId": "FG001", "numSubjects": "120"}]},
+          {"type": "COMPLETED", "achievements": [{"groupId": "FG000", "numSubjects": "115"}, {"groupId": "FG001", "numSubjects": "110"}]}
+        ],
+        "dropWithdraws": [{"type": "Adverse Event", "reasons": [{"groupId": "FG000", "numSubjects": "5"}, {"groupId": "FG001", "numSubjects": "10"}]}]
+      }]
+    },
     "outcomeMeasuresModule": {
       "outcomeMeasures": [{
         "type": "PRIMARY",
@@ -202,11 +219,35 @@ func TestClinicalTrialsGovGetStudyNormalizesCurrentRecord(t *testing.T) {
 	if strings.Join(analysis.GroupIDs, ",") != "FG000,FG001" || analysis.PValue != "0.004" || analysis.StatisticalMethod != "ANCOVA" || analysis.EffectParameter != "MEAN_DIFFERENCE" || analysis.EffectEstimate != "3.2" || analysis.DispersionType != "STANDARD_ERROR" || analysis.DispersionValue != "0.8" || analysis.ConfidenceLevel != "95" || analysis.ConfidenceLower != "1.1" || analysis.ConfidenceUpper != "5.3" {
 		t.Fatalf("reported analysis = %#v", analysis)
 	}
+	flow := study.ParticipantFlow
+	if flow.TypeUnitsAnalyzed != "PARTICIPANTS" || len(flow.Groups) != 2 || len(flow.Periods) != 1 || len(flow.Periods[0].Milestones) != 2 || len(flow.Periods[0].DropWithdraws) != 1 {
+		t.Fatalf("participant flow = %#v", flow)
+	}
+	if flow.Periods[0].Milestones[0].Achievements[0].GroupID != "FG000" || flow.Periods[0].Milestones[0].Achievements[0].Subjects != "120" || flow.Periods[0].DropWithdraws[0].Reasons[1].Subjects != "10" {
+		t.Fatalf("participant flow counts = %#v", flow.Periods[0])
+	}
+	if !containsClinicalTrialsGovString(study.Coverage.IncludedModules, "participant_flow") || !containsClinicalTrialsGovString(study.Coverage.IncludedModules, "outcome_measures") {
+		t.Fatalf("included coverage = %#v", study.Coverage)
+	}
+	for _, excluded := range []string{"baseline_characteristics", "adverse_events", "more_info"} {
+		if !containsClinicalTrialsGovString(study.Coverage.ExcludedModules, excluded) {
+			t.Fatalf("coverage does not exclude %q: %#v", excluded, study.Coverage)
+		}
+	}
+	if len(study.Coverage.Limitations) == 0 {
+		t.Fatal("v1 coverage requires a machine-readable limitation")
+	}
 	if result.Snapshot.SourceType != ClinicalTrialsGovStudySourceType || result.Snapshot.CanonicalID != "NCT01234567" || result.Snapshot.LicenseScope != "public_metadata" {
 		t.Fatalf("snapshot identity = %#v", result.Snapshot)
 	}
 	if result.Snapshot.RetrievedAt != "2026-07-22T13:30:00.000000123Z" || result.Snapshot.UpstreamUpdatedAt != "2026-07-20T00:00:00Z" || result.Snapshot.ContentHash == "" || result.Snapshot.Fingerprint == "" {
 		t.Fatalf("snapshot metadata = %#v", result.Snapshot)
+	}
+	if result.Evidence.ContentHash != result.Snapshot.ContentHash || result.Evidence.SourceType != result.Snapshot.SourceType {
+		t.Fatalf("snapshot/evidence identity mismatch: snapshot=%#v evidence=%#v", result.Snapshot, result.Evidence)
+	}
+	if recovered, err := DecodeClinicalTrialsGovEvidencePayload(result.Evidence); err != nil || recovered.NCTID != study.NCTID {
+		t.Fatalf("recover result evidence = %#v err=%v", recovered, err)
 	}
 }
 
@@ -270,6 +311,15 @@ func TestClinicalTrialsGovSnapshotIdentityIsCanonical(t *testing.T) {
 		t.Fatal("reported analysis dispersion change must change content hash")
 	}
 
+	studyBody = strings.Replace(clinicalTrialsGovStudyFixture, `"numSubjects": "115"`, `"numSubjects": "114"`, 1)
+	flowChanged, err := client.GetStudy(context.Background(), "NCT01234567")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flowChanged.Snapshot.ContentHash == first.Snapshot.ContentHash {
+		t.Fatal("participant flow change must change content hash")
+	}
+
 	studyBody = strings.Replace(clinicalTrialsGovStudyFixture, `"count": 240`, `"count": 241`, 1)
 	dataChanged, err := client.GetStudy(context.Background(), "NCT01234567")
 	if err != nil {
@@ -278,6 +328,39 @@ func TestClinicalTrialsGovSnapshotIdentityIsCanonical(t *testing.T) {
 	if dataChanged.Snapshot.ContentHash == first.Snapshot.ContentHash || dataChanged.Snapshot.Fingerprint == first.Snapshot.Fingerprint {
 		t.Fatal("normalized study change must change content hash and fingerprint")
 	}
+}
+
+func TestClinicalTrialsGovParticipantFlowRejectsUnknownAndDuplicateGroups(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "unknown achievement group", body: strings.Replace(clinicalTrialsGovStudyFixture, `"groupId": "FG000", "numSubjects": "120"`, `"groupId": "FG999", "numSubjects": "120"`, 1)},
+		{name: "duplicate flow group", body: strings.Replace(clinicalTrialsGovStudyFixture, `"id": "FG001", "title": "Control"`, `"id": "FG000", "title": "Control"`, 1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := normalizeClinicalTrialsGovStudy([]byte(test.body), "2.0.4")
+			assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorSchemaInvalid)
+		})
+	}
+}
+
+func TestClinicalTrialsGovParticipantFlowEnforcesStreamingAggregateBounds(t *testing.T) {
+	flow := `{"participantFlowModule":{"groups":[{"id":"FG000","title":"Experimental"}],"periods":[{"title":"Overall","milestones":[{"type":"STARTED","achievements":[` +
+		strings.TrimSuffix(strings.Repeat(`{"groupId":"FG000","numSubjects":"1"},`, ClinicalTrialsGovMaxFlowAchievements+1), ",") +
+		`]}]}]},"outcomeMeasuresModule":{"outcomeMeasures":[]}}`
+	body := `{"protocolSection":` + extractProtocolSection(t, clinicalTrialsGovStudyFixture) + `,"resultsSection":` + flow + `,"hasResults":true}`
+	_, err := normalizeClinicalTrialsGovStudy([]byte(body), "2.0.4")
+	assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorSchemaInvalid)
+}
+
+func containsClinicalTrialsGovString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestClinicalTrialsGovRejectsNonNCTBeforeHTTP(t *testing.T) {
@@ -366,12 +449,18 @@ func TestClinicalTrialsGovClassifiesContextCancellationAndTimeout(t *testing.T) 
 	if classified := assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorCanceled); classified.Retryable() {
 		t.Fatal("caller cancellation must be permanent")
 	}
+	if failure, mapErr := MapClinicalTrialsGovErrorToAuditFailure(err); mapErr != nil || failure.Code != ClinicalTrialAuditErrorSourceCanceled || failure.Retryable {
+		t.Fatalf("canceled audit failure = %#v err=%v", failure, mapErr)
+	}
 
 	timed, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	_, err = client.GetStudy(timed, "NCT01234567")
 	if classified := assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorTimeout); !classified.Retryable() {
 		t.Fatal("timeout must be retryable")
+	}
+	if failure, mapErr := MapClinicalTrialsGovErrorToAuditFailure(err); mapErr != nil || failure.Code != ClinicalTrialAuditErrorSourceTimeout || !failure.Retryable {
+		t.Fatalf("timeout audit failure = %#v err=%v", failure, mapErr)
 	}
 }
 
@@ -564,26 +653,30 @@ func TestClinicalTrialsGovBlocksRedirectHostEscape(t *testing.T) {
 	if escaped.Load() {
 		t.Fatal("redirect escaped configured ClinicalTrials.gov host")
 	}
+	if failure, mapErr := MapClinicalTrialsGovErrorToAuditFailure(err); mapErr != nil || failure.Code != ClinicalTrialAuditErrorSourceUpstreamPermanent || failure.Retryable {
+		t.Fatalf("redirect audit failure = %#v err=%v", failure, mapErr)
+	}
 }
 
 func TestClinicalTrialsGovRetryClassification(t *testing.T) {
 	tests := []struct {
 		name      string
 		status    int
+		code      string
 		retryable bool
 	}{
-		{name: "bad request", status: http.StatusBadRequest},
-		{name: "unauthorized", status: http.StatusUnauthorized},
-		{name: "forbidden", status: http.StatusForbidden},
-		{name: "not found", status: http.StatusNotFound},
-		{name: "request timeout", status: http.StatusRequestTimeout, retryable: true},
-		{name: "rate limited", status: http.StatusTooManyRequests, retryable: true},
-		{name: "internal server error", status: http.StatusInternalServerError, retryable: true},
-		{name: "bad gateway", status: http.StatusBadGateway, retryable: true},
-		{name: "service unavailable", status: http.StatusServiceUnavailable, retryable: true},
-		{name: "gateway timeout", status: http.StatusGatewayTimeout, retryable: true},
-		{name: "not implemented", status: http.StatusNotImplemented},
-		{name: "HTTP version unsupported", status: http.StatusHTTPVersionNotSupported},
+		{name: "bad request", status: http.StatusBadRequest, code: ClinicalTrialAuditErrorSourceUpstreamPermanent},
+		{name: "unauthorized", status: http.StatusUnauthorized, code: ClinicalTrialAuditErrorSourceUpstreamPermanent},
+		{name: "forbidden", status: http.StatusForbidden, code: ClinicalTrialAuditErrorSourceUpstreamPermanent},
+		{name: "not found", status: http.StatusNotFound, code: ClinicalTrialAuditErrorSourceNotFound},
+		{name: "request timeout", status: http.StatusRequestTimeout, code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: true},
+		{name: "rate limited", status: http.StatusTooManyRequests, code: ClinicalTrialAuditErrorSourceRateLimited, retryable: true},
+		{name: "internal server error", status: http.StatusInternalServerError, code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: true},
+		{name: "bad gateway", status: http.StatusBadGateway, code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: true},
+		{name: "service unavailable", status: http.StatusServiceUnavailable, code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: true},
+		{name: "gateway timeout", status: http.StatusGatewayTimeout, code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: true},
+		{name: "not implemented", status: http.StatusNotImplemented, code: ClinicalTrialAuditErrorSourceUpstreamPermanent},
+		{name: "HTTP version unsupported", status: http.StatusHTTPVersionNotSupported, code: ClinicalTrialAuditErrorSourceUpstreamPermanent},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -603,7 +696,62 @@ func TestClinicalTrialsGovRetryClassification(t *testing.T) {
 			if classified.Retryable() != test.retryable {
 				t.Fatalf("Retryable() = %v, want %v for status %d", classified.Retryable(), test.retryable, test.status)
 			}
+			failure, mapErr := MapClinicalTrialsGovErrorToAuditFailure(err)
+			if mapErr != nil || failure.Code != test.code || failure.Retryable != test.retryable {
+				t.Fatalf("audit failure = %#v err=%v, want code=%q retryable=%v", failure, mapErr, test.code, test.retryable)
+			}
 		})
+	}
+}
+
+func TestClinicalTrialsGovErrorMapsToAuthoritativeAuditFailurePolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		source    *ClinicalTrialsGovError
+		code      string
+		retryable bool
+	}{
+		{name: "invalid input", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorInvalidInput}, code: ClinicalTrialAuditErrorIdentifierInvalid},
+		{name: "not found", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorNotFound}, code: ClinicalTrialAuditErrorSourceNotFound},
+		{name: "rate limited", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorRateLimited, retryable: true}, code: ClinicalTrialAuditErrorSourceRateLimited, retryable: true},
+		{name: "timeout", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorTimeout, retryable: true}, code: ClinicalTrialAuditErrorSourceTimeout, retryable: true},
+		{name: "canceled", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorCanceled}, code: ClinicalTrialAuditErrorSourceCanceled},
+		{name: "response too large", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorResponseTooLarge}, code: ClinicalTrialAuditErrorSourceResponseTooLarge},
+		{name: "malformed json", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorMalformedJSON}, code: ClinicalTrialAuditErrorSourceMalformedJSON},
+		{name: "identifier mismatch", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorIdentifierMismatch}, code: ClinicalTrialAuditErrorSourceIdentifierMismatch},
+		{name: "schema invalid", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorSchemaInvalid}, code: ClinicalTrialAuditErrorSourceSchemaInvalid},
+		{name: "permanent upstream", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorUpstream}, code: ClinicalTrialAuditErrorSourceUpstreamPermanent},
+		{name: "transient upstream", source: &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorUpstream, retryable: true}, code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			failure, err := MapClinicalTrialsGovErrorToAuditFailure(test.source)
+			if err != nil {
+				t.Fatalf("MapClinicalTrialsGovErrorToAuditFailure() error = %v", err)
+			}
+			if failure.Code != test.code || failure.Retryable != test.retryable {
+				t.Fatalf("failure = %#v, want code=%q retryable=%v", failure, test.code, test.retryable)
+			}
+			if err := validateClinicalTrialAuditFailure(failure.Code, failure.Retryable); err != nil {
+				t.Fatalf("mapped failure is not persistable: %v", err)
+			}
+		})
+	}
+}
+
+func TestClinicalTrialAuditFailurePolicyRejectsIllegalRetryCombinations(t *testing.T) {
+	for _, test := range []struct {
+		code      string
+		retryable bool
+	}{
+		{code: ClinicalTrialAuditErrorSourceNotFound, retryable: true},
+		{code: ClinicalTrialAuditErrorSourceTimeout, retryable: false},
+		{code: ClinicalTrialAuditErrorSourceUpstreamPermanent, retryable: true},
+		{code: ClinicalTrialAuditErrorSourceUpstreamTransient, retryable: false},
+	} {
+		if err := validateClinicalTrialAuditFailure(test.code, test.retryable); err == nil {
+			t.Fatalf("accepted illegal failure combination code=%q retryable=%v", test.code, test.retryable)
+		}
 	}
 }
 
@@ -629,6 +777,9 @@ func TestClinicalTrialsGovTemporaryTransportFailuresAreRetryable(t *testing.T) {
 			if !classified.Retryable() {
 				t.Fatal("temporary transport failure must be retryable")
 			}
+			if failure, mapErr := MapClinicalTrialsGovErrorToAuditFailure(err); mapErr != nil || failure.Code != ClinicalTrialAuditErrorSourceUpstreamTransient || !failure.Retryable {
+				t.Fatalf("temporary transport audit failure = %#v err=%v", failure, mapErr)
+			}
 		})
 	}
 }
@@ -645,6 +796,9 @@ func TestClinicalTrialsGovUnclassifiedTransportFailureIsPermanent(t *testing.T) 
 	classified := assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorUpstream)
 	if classified.Retryable() {
 		t.Fatal("unclassified transport failure must be permanent")
+	}
+	if failure, mapErr := MapClinicalTrialsGovErrorToAuditFailure(err); mapErr != nil || failure.Code != ClinicalTrialAuditErrorSourceUpstreamPermanent || failure.Retryable {
+		t.Fatalf("permanent transport audit failure = %#v err=%v", failure, mapErr)
 	}
 }
 

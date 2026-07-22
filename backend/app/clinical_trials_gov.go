@@ -40,6 +40,12 @@ const (
 	ClinicalTrialsGovMaxProtocolInterventionNames = 512
 	ClinicalTrialsGovMaxProtocolArmGroupLabels    = 256
 	ClinicalTrialsGovMaxProtocolOtherNames        = 256
+	ClinicalTrialsGovMaxFlowGroups                = 128
+	ClinicalTrialsGovMaxFlowPeriods               = 64
+	ClinicalTrialsGovMaxFlowMilestones            = 512
+	ClinicalTrialsGovMaxFlowAchievements          = 4096
+	ClinicalTrialsGovMaxFlowDropWithdraws         = 512
+	ClinicalTrialsGovMaxFlowReasons               = 4096
 
 	clinicalTrialsGovUserAgent             = "dedao-kbase/clinical-trial-audit"
 	clinicalTrialsGovDefaultRequestTimeout = 20 * time.Second
@@ -99,6 +105,46 @@ func (e *ClinicalTrialsGovError) Unwrap() error { return e.cause }
 
 func (e *ClinicalTrialsGovError) Retryable() bool {
 	return e.retryable
+}
+
+func MapClinicalTrialsGovErrorToAuditFailure(err error) (ClinicalTrialAuditFailure, error) {
+	var source *ClinicalTrialsGovError
+	if !errors.As(err, &source) {
+		return ClinicalTrialAuditFailure{}, fmt.Errorf("clinical trial source error is not classified")
+	}
+	failure := ClinicalTrialAuditFailure{}
+	switch source.Kind {
+	case ClinicalTrialsGovErrorInvalidInput:
+		failure.Code = ClinicalTrialAuditErrorIdentifierInvalid
+	case ClinicalTrialsGovErrorNotFound:
+		failure.Code = ClinicalTrialAuditErrorSourceNotFound
+	case ClinicalTrialsGovErrorRateLimited:
+		failure.Code, failure.Retryable = ClinicalTrialAuditErrorSourceRateLimited, true
+	case ClinicalTrialsGovErrorTimeout:
+		failure.Code, failure.Retryable = ClinicalTrialAuditErrorSourceTimeout, true
+	case ClinicalTrialsGovErrorCanceled:
+		failure.Code = ClinicalTrialAuditErrorSourceCanceled
+	case ClinicalTrialsGovErrorResponseTooLarge:
+		failure.Code = ClinicalTrialAuditErrorSourceResponseTooLarge
+	case ClinicalTrialsGovErrorMalformedJSON:
+		failure.Code = ClinicalTrialAuditErrorSourceMalformedJSON
+	case ClinicalTrialsGovErrorIdentifierMismatch:
+		failure.Code = ClinicalTrialAuditErrorSourceIdentifierMismatch
+	case ClinicalTrialsGovErrorSchemaInvalid:
+		failure.Code = ClinicalTrialAuditErrorSourceSchemaInvalid
+	case ClinicalTrialsGovErrorUpstream:
+		if source.Retryable() {
+			failure.Code, failure.Retryable = ClinicalTrialAuditErrorSourceUpstreamTransient, true
+		} else {
+			failure.Code = ClinicalTrialAuditErrorSourceUpstreamPermanent
+		}
+	default:
+		return ClinicalTrialAuditFailure{}, fmt.Errorf("unsupported ClinicalTrials.gov error kind %q", source.Kind)
+	}
+	if err := validateClinicalTrialAuditFailure(failure.Code, failure.Retryable); err != nil {
+		return ClinicalTrialAuditFailure{}, err
+	}
+	return failure, nil
 }
 
 type ClinicalTrialsGovDate struct {
@@ -213,6 +259,41 @@ type ClinicalTrialsGovResultAnalysis struct {
 	ConfidenceUpper    string   `json:"confidence_upper,omitempty"`
 }
 
+type ClinicalTrialsGovEvidenceCoverage struct {
+	IncludedModules []string `json:"included_modules"`
+	ExcludedModules []string `json:"excluded_modules"`
+	Limitations     []string `json:"limitations"`
+}
+
+type ClinicalTrialsGovFlowCount struct {
+	GroupID  string `json:"group_id"`
+	Subjects string `json:"subjects"`
+}
+
+type ClinicalTrialsGovFlowMilestone struct {
+	Type         string                       `json:"type"`
+	Achievements []ClinicalTrialsGovFlowCount `json:"achievements,omitempty"`
+}
+
+type ClinicalTrialsGovFlowDropWithdraw struct {
+	Type    string                       `json:"type"`
+	Reasons []ClinicalTrialsGovFlowCount `json:"reasons,omitempty"`
+}
+
+type ClinicalTrialsGovFlowPeriod struct {
+	Title         string                              `json:"title"`
+	Milestones    []ClinicalTrialsGovFlowMilestone    `json:"milestones,omitempty"`
+	DropWithdraws []ClinicalTrialsGovFlowDropWithdraw `json:"drop_withdraws,omitempty"`
+}
+
+type ClinicalTrialsGovParticipantFlow struct {
+	RecruitmentDetails   string                         `json:"recruitment_details,omitempty"`
+	PreAssignmentDetails string                         `json:"pre_assignment_details,omitempty"`
+	TypeUnitsAnalyzed    string                         `json:"type_units_analyzed,omitempty"`
+	Groups               []ClinicalTrialsGovResultGroup `json:"groups,omitempty"`
+	Periods              []ClinicalTrialsGovFlowPeriod  `json:"periods,omitempty"`
+}
+
 type ClinicalTrialsGovStudy struct {
 	SourceAPIVersion      string                                  `json:"source_api_version"`
 	NCTID                 string                                  `json:"nct_id"`
@@ -235,14 +316,53 @@ type ClinicalTrialsGovStudy struct {
 	LastUpdatePosted      ClinicalTrialsGovDate                   `json:"last_update_posted"`
 	HasResults            bool                                    `json:"has_results"`
 	ReportedOutcomes      []ClinicalTrialsGovReportedOutcome      `json:"reported_outcomes,omitempty"`
+	ParticipantFlow       ClinicalTrialsGovParticipantFlow        `json:"participant_flow,omitempty"`
+	Coverage              ClinicalTrialsGovEvidenceCoverage       `json:"coverage"`
 	PublicationReferences []ClinicalTrialsGovPublicationReference `json:"publication_references,omitempty"`
 }
 
 type ClinicalTrialsGovStudyResult struct {
-	Study         ClinicalTrialsGovStudy      `json:"study"`
-	Snapshot      ClinicalTrialSourceSnapshot `json:"snapshot"`
-	APIVersion    string                      `json:"api_version"`
-	DataTimestamp string                      `json:"data_timestamp"`
+	Study         ClinicalTrialsGovStudy            `json:"study"`
+	Snapshot      ClinicalTrialSourceSnapshot       `json:"snapshot"`
+	Evidence      ClinicalTrialAuditEvidencePayload `json:"evidence"`
+	APIVersion    string                            `json:"api_version"`
+	DataTimestamp string                            `json:"data_timestamp"`
+}
+
+func NewClinicalTrialsGovEvidencePayload(study ClinicalTrialsGovStudy) (ClinicalTrialAuditEvidencePayload, error) {
+	encoded, err := json.Marshal(study)
+	if err != nil {
+		return ClinicalTrialAuditEvidencePayload{}, err
+	}
+	evidence := ClinicalTrialAuditEvidencePayload{
+		SchemaVersion: ClinicalTrialAuditEvidenceSchemaVersion,
+		SourceType:    ClinicalTrialsGovStudySourceType,
+		ContentHash:   hashClinicalTrialValue(string(encoded)),
+		Data:          json.RawMessage(encoded),
+	}
+	if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+		return ClinicalTrialAuditEvidencePayload{}, err
+	}
+	return evidence, nil
+}
+
+func DecodeClinicalTrialsGovEvidencePayload(evidence ClinicalTrialAuditEvidencePayload) (ClinicalTrialsGovStudy, error) {
+	if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+		return ClinicalTrialsGovStudy{}, err
+	}
+	if evidence.SourceType != ClinicalTrialsGovStudySourceType {
+		return ClinicalTrialsGovStudy{}, fmt.Errorf("evidence is not a ClinicalTrials.gov study")
+	}
+	var study ClinicalTrialsGovStudy
+	decoder := json.NewDecoder(bytes.NewReader(evidence.Data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&study); err != nil {
+		return ClinicalTrialsGovStudy{}, fmt.Errorf("decode normalized ClinicalTrials.gov evidence: %w", err)
+	}
+	if strings.TrimSpace(study.NCTID) == "" || strings.TrimSpace(study.SourceAPIVersion) == "" {
+		return ClinicalTrialsGovStudy{}, fmt.Errorf("normalized ClinicalTrials.gov evidence is missing identity")
+	}
+	return study, nil
 }
 
 type clinicalTrialsGovOption func(*ClinicalTrialsGovClient)
@@ -347,7 +467,7 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 	if study.NCTID != request.NormalizedInput {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorIdentifierMismatch}
 	}
-	canonicalStudy, err := json.Marshal(study)
+	evidence, err := NewClinicalTrialsGovEvidencePayload(study)
 	if err != nil {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorSchemaInvalid, cause: err}
 	}
@@ -356,7 +476,7 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 		CanonicalID:       study.NCTID,
 		RetrievedAt:       c.now().UTC().Format(time.RFC3339Nano),
 		UpstreamUpdatedAt: study.LastUpdatePosted.Value,
-		ContentHash:       hashClinicalTrialValue(string(canonicalStudy)),
+		ContentHash:       evidence.ContentHash,
 		LicenseScope:      "public_metadata",
 	})
 	if err != nil {
@@ -365,6 +485,7 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 	return ClinicalTrialsGovStudyResult{
 		Study:         study,
 		Snapshot:      snapshot,
+		Evidence:      evidence,
 		APIVersion:    version.APIVersion,
 		DataTimestamp: version.DataTimestamp,
 	}, nil
@@ -489,9 +610,34 @@ type clinicalTrialsGovRawStudy struct {
 }
 
 type clinicalTrialsGovResultsSection struct {
+	ParticipantFlowModule clinicalTrialsGovUpstreamParticipantFlow `json:"participantFlowModule"`
 	OutcomeMeasuresModule struct {
 		OutcomeMeasures []clinicalTrialsGovUpstreamReportedOutcome `json:"outcomeMeasures"`
 	} `json:"outcomeMeasuresModule"`
+}
+
+type clinicalTrialsGovUpstreamParticipantFlow struct {
+	RecruitmentDetails   string                                 `json:"recruitmentDetails"`
+	PreAssignmentDetails string                                 `json:"preAssignmentDetails"`
+	TypeUnitsAnalyzed    string                                 `json:"typeUnitsAnalyzed"`
+	Groups               []clinicalTrialsGovUpstreamResultGroup `json:"groups"`
+	Periods              []struct {
+		Title      string `json:"title"`
+		Milestones []struct {
+			Type         string `json:"type"`
+			Achievements []struct {
+				GroupID     string `json:"groupId"`
+				NumSubjects string `json:"numSubjects"`
+			} `json:"achievements"`
+		} `json:"milestones"`
+		DropWithdraws []struct {
+			Type    string `json:"type"`
+			Reasons []struct {
+				GroupID     string `json:"groupId"`
+				NumSubjects string `json:"numSubjects"`
+			} `json:"reasons"`
+		} `json:"dropWithdraws"`
+	} `json:"periods"`
 }
 
 type clinicalTrialsGovUpstreamReportedOutcome struct {
@@ -664,9 +810,17 @@ func normalizeClinicalTrialsGovStudy(body []byte, apiVersion string) (ClinicalTr
 		SecondaryOutcomes:     normalizeClinicalTrialsGovOutcomes(protocol.OutcomesModule.SecondaryOutcomes),
 		HasResults:            raw.HasResults,
 		PublicationReferences: normalizeClinicalTrialsGovReferences(protocol.ReferencesModule.References),
+		Coverage: ClinicalTrialsGovEvidenceCoverage{
+			IncludedModules: []string{"protocol", "participant_flow", "outcome_measures"},
+			ExcludedModules: []string{"baseline_characteristics", "adverse_events", "more_info"},
+			Limitations:     []string{"ClinicalTrials.gov baseline characteristics, adverse events, and more-info modules are outside v1 normalized evidence coverage."},
+		},
 	}
 	var err error
 	if study.ReportedOutcomes, err = normalizeClinicalTrialsGovReportedOutcomes(raw.ResultsSection); err != nil {
+		return ClinicalTrialsGovStudy{}, err
+	}
+	if study.ParticipantFlow, err = normalizeClinicalTrialsGovParticipantFlow(raw.ResultsSection); err != nil {
 		return ClinicalTrialsGovStudy{}, err
 	}
 	if study.StartDate, err = normalizeClinicalTrialsGovDate(protocol.StatusModule.StartDateStruct); err != nil {
@@ -701,10 +855,17 @@ type clinicalTrialsGovOutcomeBounds struct {
 	analysisGroups int
 }
 
+type clinicalTrialsGovFlowBounds struct {
+	milestones    int
+	achievements  int
+	dropWithdraws int
+	reasons       int
+}
+
 func validateClinicalTrialsGovDocumentBounds(body []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
-	if err := walkClinicalTrialsGovJSON(decoder, nil, nil); err != nil {
+	if err := walkClinicalTrialsGovJSON(decoder, nil, nil, &clinicalTrialsGovFlowBounds{}); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -713,7 +874,7 @@ func validateClinicalTrialsGovDocumentBounds(body []byte) error {
 	return nil
 }
 
-func walkClinicalTrialsGovJSON(decoder *json.Decoder, path []string, outcomeBounds *clinicalTrialsGovOutcomeBounds) error {
+func walkClinicalTrialsGovJSON(decoder *json.Decoder, path []string, outcomeBounds *clinicalTrialsGovOutcomeBounds, flowBounds *clinicalTrialsGovFlowBounds) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorMalformedJSON, cause: err}
@@ -733,7 +894,7 @@ func walkClinicalTrialsGovJSON(decoder *json.Decoder, path []string, outcomeBoun
 			if !ok {
 				return &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorMalformedJSON}
 			}
-			if err := walkClinicalTrialsGovJSON(decoder, append(path, key), outcomeBounds); err != nil {
+			if err := walkClinicalTrialsGovJSON(decoder, append(path, key), outcomeBounds, flowBounds); err != nil {
 				return err
 			}
 		}
@@ -753,10 +914,10 @@ func walkClinicalTrialsGovJSON(decoder *json.Decoder, path []string, outcomeBoun
 			if isOutcomeArray {
 				childBounds = &clinicalTrialsGovOutcomeBounds{}
 			}
-			if err := incrementClinicalTrialsGovAggregateBound(path, childBounds); err != nil {
+			if err := incrementClinicalTrialsGovAggregateBound(path, childBounds, flowBounds); err != nil {
 				return err
 			}
-			if err := walkClinicalTrialsGovJSON(decoder, path, childBounds); err != nil {
+			if err := walkClinicalTrialsGovJSON(decoder, path, childBounds, flowBounds); err != nil {
 				return err
 			}
 		}
@@ -802,35 +963,56 @@ func clinicalTrialsGovArrayLimit(path []string, outcomeBounds *clinicalTrialsGov
 		return ClinicalTrialsGovMaxProtocolOutcomes
 	case clinicalTrialsGovPathHasSuffix(path, "protocolSection", "referencesModule", "references"):
 		return ClinicalTrialsGovMaxProtocolReferences
+	case clinicalTrialsGovPathHasSuffix(path, "resultsSection", "participantFlowModule", "groups"):
+		return ClinicalTrialsGovMaxFlowGroups
+	case clinicalTrialsGovPathHasSuffix(path, "resultsSection", "participantFlowModule", "periods"):
+		return ClinicalTrialsGovMaxFlowPeriods
 	default:
 		return 0
 	}
 }
 
-func incrementClinicalTrialsGovAggregateBound(path []string, bounds *clinicalTrialsGovOutcomeBounds) error {
-	if bounds == nil {
-		return nil
-	}
+func incrementClinicalTrialsGovAggregateBound(path []string, bounds *clinicalTrialsGovOutcomeBounds, flow *clinicalTrialsGovFlowBounds) error {
 	switch {
-	case clinicalTrialsGovPathHasSuffix(path, "categories"):
+	case bounds != nil && clinicalTrialsGovPathHasSuffix(path, "categories"):
 		bounds.categories++
 		if bounds.categories > ClinicalTrialsGovMaxResultCategories {
 			return schemaInvalidClinicalTrialsGovError(errors.New("reported outcome categories exceed aggregate limit"))
 		}
-	case clinicalTrialsGovPathHasSuffix(path, "measurements"):
+	case bounds != nil && clinicalTrialsGovPathHasSuffix(path, "measurements"):
 		bounds.measurements++
 		if bounds.measurements > ClinicalTrialsGovMaxGroupMeasurements {
 			return schemaInvalidClinicalTrialsGovError(errors.New("reported outcome measurements exceed aggregate limit"))
 		}
-	case clinicalTrialsGovPathHasSuffix(path, "counts"):
+	case bounds != nil && clinicalTrialsGovPathHasSuffix(path, "counts"):
 		bounds.denomCounts++
 		if bounds.denomCounts > ClinicalTrialsGovMaxDenominatorCounts {
 			return schemaInvalidClinicalTrialsGovError(errors.New("reported outcome denominator counts exceed aggregate limit"))
 		}
-	case clinicalTrialsGovPathHasSuffix(path, "groupIds"):
+	case bounds != nil && clinicalTrialsGovPathHasSuffix(path, "groupIds"):
 		bounds.analysisGroups++
 		if bounds.analysisGroups > ClinicalTrialsGovMaxAnalysisGroups {
 			return schemaInvalidClinicalTrialsGovError(errors.New("reported outcome analysis groups exceed aggregate limit"))
+		}
+	case flow != nil && clinicalTrialsGovPathHasSuffix(path, "participantFlowModule", "periods", "milestones"):
+		flow.milestones++
+		if flow.milestones > ClinicalTrialsGovMaxFlowMilestones {
+			return schemaInvalidClinicalTrialsGovError(errors.New("participant flow milestones exceed aggregate limit"))
+		}
+	case flow != nil && clinicalTrialsGovPathHasSuffix(path, "participantFlowModule", "periods", "milestones", "achievements"):
+		flow.achievements++
+		if flow.achievements > ClinicalTrialsGovMaxFlowAchievements {
+			return schemaInvalidClinicalTrialsGovError(errors.New("participant flow achievements exceed aggregate limit"))
+		}
+	case flow != nil && clinicalTrialsGovPathHasSuffix(path, "participantFlowModule", "periods", "dropWithdraws"):
+		flow.dropWithdraws++
+		if flow.dropWithdraws > ClinicalTrialsGovMaxFlowDropWithdraws {
+			return schemaInvalidClinicalTrialsGovError(errors.New("participant flow drop-withdraw rows exceed aggregate limit"))
+		}
+	case flow != nil && clinicalTrialsGovPathHasSuffix(path, "participantFlowModule", "periods", "dropWithdraws", "reasons"):
+		flow.reasons++
+		if flow.reasons > ClinicalTrialsGovMaxFlowReasons {
+			return schemaInvalidClinicalTrialsGovError(errors.New("participant flow reasons exceed aggregate limit"))
 		}
 	}
 	return nil
@@ -968,6 +1150,88 @@ func normalizeClinicalTrialsGovReportedOutcomes(raw json.RawMessage) ([]Clinical
 		normalized = append(normalized, outcome)
 	}
 	return normalized, nil
+}
+
+func normalizeClinicalTrialsGovParticipantFlow(raw json.RawMessage) (ClinicalTrialsGovParticipantFlow, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ClinicalTrialsGovParticipantFlow{}, nil
+	}
+	var results clinicalTrialsGovResultsSection
+	if err := json.Unmarshal(raw, &results); err != nil {
+		return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(err)
+	}
+	value := results.ParticipantFlowModule
+	if len(value.Groups) > ClinicalTrialsGovMaxFlowGroups || len(value.Periods) > ClinicalTrialsGovMaxFlowPeriods {
+		return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow structure exceeds limit"))
+	}
+	flow := ClinicalTrialsGovParticipantFlow{
+		RecruitmentDetails:   strings.TrimSpace(value.RecruitmentDetails),
+		PreAssignmentDetails: strings.TrimSpace(value.PreAssignmentDetails),
+		TypeUnitsAnalyzed:    strings.TrimSpace(value.TypeUnitsAnalyzed),
+		Groups:               make([]ClinicalTrialsGovResultGroup, 0, len(value.Groups)),
+		Periods:              make([]ClinicalTrialsGovFlowPeriod, 0, len(value.Periods)),
+	}
+	groupIDs := make(map[string]struct{}, len(value.Groups))
+	for _, rawGroup := range value.Groups {
+		group := ClinicalTrialsGovResultGroup{ID: strings.TrimSpace(rawGroup.ID), Title: strings.TrimSpace(rawGroup.Title), Description: strings.TrimSpace(rawGroup.Description)}
+		if group.ID == "" || group.Title == "" {
+			return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow group identity is required"))
+		}
+		if _, exists := groupIDs[group.ID]; exists {
+			return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(errors.New("duplicate participant flow group identity"))
+		}
+		groupIDs[group.ID] = struct{}{}
+		flow.Groups = append(flow.Groups, group)
+	}
+	for _, rawPeriod := range value.Periods {
+		period := ClinicalTrialsGovFlowPeriod{Title: strings.TrimSpace(rawPeriod.Title)}
+		if period.Title == "" {
+			return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow period title is required"))
+		}
+		period.Milestones = make([]ClinicalTrialsGovFlowMilestone, 0, len(rawPeriod.Milestones))
+		for _, rawMilestone := range rawPeriod.Milestones {
+			milestone := ClinicalTrialsGovFlowMilestone{Type: strings.TrimSpace(rawMilestone.Type), Achievements: make([]ClinicalTrialsGovFlowCount, 0, len(rawMilestone.Achievements))}
+			if milestone.Type == "" {
+				return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow milestone type is required"))
+			}
+			for _, rawCount := range rawMilestone.Achievements {
+				count, err := normalizeClinicalTrialsGovFlowCount(rawCount.GroupID, rawCount.NumSubjects, groupIDs)
+				if err != nil {
+					return ClinicalTrialsGovParticipantFlow{}, err
+				}
+				milestone.Achievements = append(milestone.Achievements, count)
+			}
+			period.Milestones = append(period.Milestones, milestone)
+		}
+		period.DropWithdraws = make([]ClinicalTrialsGovFlowDropWithdraw, 0, len(rawPeriod.DropWithdraws))
+		for _, rawDrop := range rawPeriod.DropWithdraws {
+			drop := ClinicalTrialsGovFlowDropWithdraw{Type: strings.TrimSpace(rawDrop.Type), Reasons: make([]ClinicalTrialsGovFlowCount, 0, len(rawDrop.Reasons))}
+			if drop.Type == "" {
+				return ClinicalTrialsGovParticipantFlow{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow drop-withdraw type is required"))
+			}
+			for _, rawCount := range rawDrop.Reasons {
+				count, err := normalizeClinicalTrialsGovFlowCount(rawCount.GroupID, rawCount.NumSubjects, groupIDs)
+				if err != nil {
+					return ClinicalTrialsGovParticipantFlow{}, err
+				}
+				drop.Reasons = append(drop.Reasons, count)
+			}
+			period.DropWithdraws = append(period.DropWithdraws, drop)
+		}
+		flow.Periods = append(flow.Periods, period)
+	}
+	return flow, nil
+}
+
+func normalizeClinicalTrialsGovFlowCount(groupID, subjects string, groupIDs map[string]struct{}) (ClinicalTrialsGovFlowCount, error) {
+	count := ClinicalTrialsGovFlowCount{GroupID: strings.TrimSpace(groupID), Subjects: strings.TrimSpace(subjects)}
+	if count.GroupID == "" || count.Subjects == "" {
+		return ClinicalTrialsGovFlowCount{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow count identity and subjects are required"))
+	}
+	if _, exists := groupIDs[count.GroupID]; !exists {
+		return ClinicalTrialsGovFlowCount{}, schemaInvalidClinicalTrialsGovError(errors.New("participant flow count references unknown group"))
+	}
+	return count, nil
 }
 
 func normalizeClinicalTrialsGovReportedOutcome(value clinicalTrialsGovUpstreamReportedOutcome) (ClinicalTrialsGovReportedOutcome, error) {

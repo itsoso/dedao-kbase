@@ -3,13 +3,77 @@ package app
 import (
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestClinicalTrialAuditStoredRunProjectsStrictPublicContract(t *testing.T) {
+	request, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := ClinicalTrialAuditStoredRun{
+		SchemaVersion:  ClinicalTrialAuditStoredRunSchemaVersion,
+		RunID:          "run-projection",
+		PackageID:      "book-agent-clinical-trials-truth",
+		PackageVersion: "1.2.0",
+		State:          ClinicalTrialAuditRunFailed,
+		Request:        request,
+		ErrorCode:      ClinicalTrialAuditErrorSourceNotFound,
+		CreatedAt:      "2026-07-22T12:00:00Z",
+		UpdatedAt:      "2026-07-22T12:01:00Z",
+	}
+	publicRun, err := ProjectClinicalTrialAuditRun(stored)
+	if err != nil {
+		t.Fatalf("ProjectClinicalTrialAuditRun() error = %v", err)
+	}
+	if publicRun.SchemaVersion != ClinicalTrialAuditRunSchemaVersion || publicRun.Error == nil || *publicRun.Error != ClinicalTrialAuditErrorSourceNotFound {
+		t.Fatalf("public run = %#v", publicRun)
+	}
+	encoded, err := json.Marshal(publicRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var publicShape map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &publicShape); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"package_id", "package_version", "idempotency_key", "error_code", "retryable", "lease_owner", "lease_expires_at"} {
+		if _, exists := publicShape[forbidden]; exists {
+			t.Fatalf("public projection leaked %q: %s", forbidden, encoded)
+		}
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
+	decoder.DisallowUnknownFields()
+	var roundTrip ClinicalTrialAuditRun
+	if err := decoder.Decode(&roundTrip); err != nil {
+		t.Fatalf("strict public round trip: %v", err)
+	}
+	if err := ValidateClinicalTrialAuditRun(roundTrip); err != nil {
+		t.Fatalf("projected public run is invalid: %v", err)
+	}
+}
+
+func TestClinicalTrialAuditStoredRunUsesInternalSchema(t *testing.T) {
+	store, err := NewClinicalTrialAuditStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"}, "schema-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.SchemaVersion != ClinicalTrialAuditStoredRunSchemaVersion || run.SchemaVersion == ClinicalTrialAuditRunSchemaVersion {
+		t.Fatalf("stored schema version = %q", run.SchemaVersion)
+	}
+}
 
 func TestClinicalTrialAuditStoreCreatesAndReplaysIdempotently(t *testing.T) {
 	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC))
@@ -109,6 +173,177 @@ func TestClinicalTrialAuditStoreCreatesSameIdempotencyKeyConcurrently(t *testing
 	}
 	if _, err := second.CreateRun("package-a", "2.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000008"}, "concurrent-key"); !errors.Is(err, ErrClinicalTrialAuditIdempotencyConflict) {
 		t.Fatalf("concurrent identity conflict = %v", err)
+	}
+}
+
+func TestClinicalTrialAuditStorePersistsImmutableEvidenceAndRecoversAfterReopen(t *testing.T) {
+	root := t.TempDir()
+	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 13, 0, 0, 0, time.UTC))
+	store, err := newClinicalTrialAuditStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"}, "evidence-reopen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.LeaseNextRun("worker-a", time.Minute)
+	if err != nil || lease == nil || lease.RunID != run.RunID {
+		t.Fatalf("lease = %#v err=%v", lease, err)
+	}
+	study := clinicalTrialAuditStoreStudy()
+	evidence, err := NewClinicalTrialsGovEvidencePayload(study)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := clinicalTrialAuditStoreEvidenceSnapshot(t, evidence.ContentHash, clock.Now())
+	checkpointed, err := store.CheckpointRun(run.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+		State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
+	})
+	if err != nil {
+		t.Fatalf("checkpoint evidence: %v", err)
+	}
+	if len(checkpointed.Evidence) != 1 || checkpointed.Evidence[0].ContentHash != snapshot.ContentHash {
+		t.Fatalf("checkpointed evidence = %#v", checkpointed.Evidence)
+	}
+	citation := ClinicalTrialAuditCitation{CitationID: "flow-started", SourceFingerprint: snapshot.Fingerprint, Locator: "participant_flow.periods[0].milestones[0].achievements[0]"}
+	finding := ClinicalTrialFinding{FindingID: "actual-enrollment", Class: ClinicalTrialFindingRegisteredFact, Summary: "120 participants started in the experimental group.", CitationIDs: []string{citation.CitationID}}
+	checkpointed, err = store.CheckpointRun(run.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+		State: ClinicalTrialAuditRunReasoning, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Citations: []ClinicalTrialAuditCitation{citation}, Findings: []ClinicalTrialFinding{finding},
+	})
+	if err != nil {
+		t.Fatalf("reuse persisted evidence: %v", err)
+	}
+	if len(checkpointed.Evidence) != 1 {
+		t.Fatalf("later checkpoint lost immutable evidence: %#v", checkpointed.Evidence)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := newClinicalTrialAuditStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered, err := reopened.GetRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered.Evidence) != 1 {
+		t.Fatalf("recovered evidence = %#v", recovered.Evidence)
+	}
+	recoveredStudy, err := DecodeClinicalTrialsGovEvidencePayload(recovered.Evidence[0])
+	if err != nil {
+		t.Fatalf("decode recovered evidence: %v", err)
+	}
+	if recoveredStudy.NCTID != study.NCTID || recoveredStudy.ParticipantFlow.Periods[0].Milestones[0].Achievements[0].Subjects != "120" {
+		t.Fatalf("recovered study = %#v", recoveredStudy)
+	}
+}
+
+func TestClinicalTrialAuditStoreRejectsEvidenceHashMismatchTransactionally(t *testing.T) {
+	store, err := NewClinicalTrialAuditStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	run, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"}, "evidence-mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.LeaseNextRun("worker-a", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence.ContentHash = "sha256:" + strings.Repeat("f", 64)
+	snapshot := clinicalTrialAuditStoreEvidenceSnapshot(t, evidence.ContentHash, time.Now())
+	if _, err := store.CheckpointRun(run.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+		State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
+	}); err == nil {
+		t.Fatal("checkpoint accepted evidence hash mismatch")
+	}
+	var evidenceRows, snapshotRows int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_evidence`).Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_snapshots WHERE run_id = ?`, run.RunID).Scan(&snapshotRows); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRows != 0 || snapshotRows != 0 {
+		t.Fatalf("partial checkpoint persisted evidence=%d snapshots=%d", evidenceRows, snapshotRows)
+	}
+}
+
+func TestClinicalTrialAuditStoreDeduplicatesEvidenceAcrossConcurrentStores(t *testing.T) {
+	root := t.TempDir()
+	first, err := NewClinicalTrialAuditStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := NewClinicalTrialAuditStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	type leasedRun struct {
+		store *ClinicalTrialAuditStore
+		run   ClinicalTrialAuditStoredRun
+		lease *ClinicalTrialAuditStoredRun
+	}
+	items := make([]leasedRun, 0, 2)
+	for index, store := range []*ClinicalTrialAuditStore{first, second} {
+		run, createErr := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"}, fmt.Sprintf("evidence-concurrent-%d", index))
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		lease, leaseErr := store.LeaseNextRun(fmt.Sprintf("worker-%d", index), time.Minute)
+		if leaseErr != nil || lease == nil {
+			t.Fatalf("lease %d = %#v err=%v", index, lease, leaseErr)
+		}
+		items = append(items, leasedRun{store: store, run: run, lease: lease})
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(items))
+	var wg sync.WaitGroup
+	for index, item := range items {
+		wg.Add(1)
+		go func(index int, item leasedRun) {
+			defer wg.Done()
+			<-start
+			snapshot := clinicalTrialAuditStoreEvidenceSnapshot(t, evidence.ContentHash, time.Now())
+			_, checkpointErr := item.store.CheckpointRun(item.run.RunID, fmt.Sprintf("worker-%d", index), item.lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+				State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
+			})
+			errs <- checkpointErr
+		}(index, item)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent evidence checkpoint: %v", err)
+		}
+	}
+	var evidenceRows, links int
+	if err := first.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_evidence`).Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_snapshot_evidence`).Scan(&links); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRows != 1 || links != 2 {
+		t.Fatalf("dedup rows=%d links=%d", evidenceRows, links)
 	}
 }
 
@@ -645,7 +880,13 @@ func TestClinicalTrialAuditStoreDefinesTerminalErrorCodeAllowlist(t *testing.T) 
 		ClinicalTrialAuditErrorSourceNotFound,
 		ClinicalTrialAuditErrorSourceRateLimited,
 		ClinicalTrialAuditErrorSourceTimeout,
+		ClinicalTrialAuditErrorSourceCanceled,
+		ClinicalTrialAuditErrorSourceResponseTooLarge,
+		ClinicalTrialAuditErrorSourceMalformedJSON,
+		ClinicalTrialAuditErrorSourceIdentifierMismatch,
 		ClinicalTrialAuditErrorSourceSchemaInvalid,
+		ClinicalTrialAuditErrorSourceUpstreamPermanent,
+		ClinicalTrialAuditErrorSourceUpstreamTransient,
 		ClinicalTrialAuditErrorModelTimeout,
 		ClinicalTrialAuditErrorModelInvalidOutput,
 		ClinicalTrialAuditErrorEvidenceInvalid,
@@ -677,6 +918,34 @@ func clinicalTrialAuditStoreSnapshot(t *testing.T, now time.Time) ClinicalTrialS
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func clinicalTrialAuditStoreEvidenceSnapshot(t *testing.T, contentHash string, now time.Time) ClinicalTrialSourceSnapshot {
+	t.Helper()
+	snapshot, err := FinalizeClinicalTrialSourceSnapshot(ClinicalTrialSourceSnapshot{
+		SourceType: ClinicalTrialsGovStudySourceType, CanonicalID: "NCT01234567", RetrievedAt: now.UTC().Format(time.RFC3339Nano),
+		ContentHash: contentHash, LicenseScope: "public_metadata",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func clinicalTrialAuditStoreStudy() ClinicalTrialsGovStudy {
+	return ClinicalTrialsGovStudy{
+		SourceAPIVersion: "2.0.4", NCTID: "NCT01234567", BriefTitle: "Synthetic trial", OverallStatus: "COMPLETED", StudyType: "INTERVENTIONAL",
+		Enrollment: ClinicalTrialsGovEnrollment{Count: 240, Type: "ACTUAL"},
+		Coverage: ClinicalTrialsGovEvidenceCoverage{
+			IncludedModules: []string{"protocol", "participant_flow", "outcome_measures"},
+			ExcludedModules: []string{"baseline_characteristics", "adverse_events", "more_info"},
+			Limitations:     []string{"ClinicalTrials.gov baseline characteristics, adverse events, and more-info modules are outside v1 coverage."},
+		},
+		ParticipantFlow: ClinicalTrialsGovParticipantFlow{
+			Groups:  []ClinicalTrialsGovResultGroup{{ID: "FG000", Title: "Experimental"}},
+			Periods: []ClinicalTrialsGovFlowPeriod{{Title: "Overall", Milestones: []ClinicalTrialsGovFlowMilestone{{Type: "STARTED", Achievements: []ClinicalTrialsGovFlowCount{{GroupID: "FG000", Subjects: "120"}}}}}},
+		},
+	}
 }
 
 type clinicalTrialAuditStoreTestClock struct {

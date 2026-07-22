@@ -46,6 +46,30 @@ bodies, credentials, patient data, or private prompts. They are evidence-review
 inputs only and cannot enter a health serving index without downstream domain
 approval.
 
+The durable queue uses the separate internal schema
+`clinical-trial-audit-stored-run.v1`; it must be projected and validated before
+publication as `clinical-trial-audit-run.v1`. Package identity, idempotency,
+lease, attempt, and retry metadata are never part of the public run artifact.
+Failed public runs expose only the allowlisted failure code. Retryability is an
+internal policy with one legal value per code; permanent source failures cannot
+be replayed.
+
+ClinicalTrials.gov collection stores a bounded normalized evidence payload by
+`content_hash` in the same transaction as its source snapshot. Payloads are
+immutable and deduplicated, contain no raw upstream body, and can reconstruct
+the typed registry study after restart. Clinical audit v1 normalizes protocol,
+participant-flow, and outcome-measure modules. Its machine-readable coverage
+explicitly excludes baseline characteristics, adverse events, and more-info;
+consumers must preserve that limitation and must not describe v1 as complete
+ClinicalTrials.gov results coverage.
+
+The repository currently has no existing JSON Schema validator dependency.
+Public Go runs are therefore verified by strict projection, unknown-field
+rejection on round trip, and domain validation against the same state rules as
+the JSON Schema. Independent JSON Schema engine validation remains a release
+integration check rather than adding a heavyweight runtime dependency solely
+for tests.
+
 Before publication, a publisher submits the finalized package and its synthetic
 golden suite to:
 

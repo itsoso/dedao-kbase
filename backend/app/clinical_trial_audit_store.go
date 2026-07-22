@@ -19,24 +19,32 @@ import (
 )
 
 const (
-	clinicalTrialAuditDBName                = "clinical_trial_audits.sqlite3"
-	clinicalTrialAuditJSONMaxBytes          = 1 << 20
-	clinicalTrialAuditRequestMaxBytes       = 64 << 10
-	clinicalTrialAuditErrorCodeMaxBytes     = 64
-	clinicalTrialAuditCursorEncodedMaxBytes = 1024
-	clinicalTrialAuditCursorDecodedMaxBytes = 512
-	clinicalTrialAuditSchemaVersion         = 2
+	clinicalTrialAuditDBName                 = "clinical_trial_audits.sqlite3"
+	clinicalTrialAuditJSONMaxBytes           = 1 << 20
+	clinicalTrialAuditRequestMaxBytes        = 64 << 10
+	clinicalTrialAuditErrorCodeMaxBytes      = 64
+	clinicalTrialAuditCursorEncodedMaxBytes  = 1024
+	clinicalTrialAuditCursorDecodedMaxBytes  = 512
+	clinicalTrialAuditSchemaVersion          = 3
+	ClinicalTrialAuditStoredRunSchemaVersion = "clinical-trial-audit-stored-run.v1"
+	ClinicalTrialAuditEvidenceSchemaVersion  = "clinical-trial-normalized-evidence.v1"
 
-	ClinicalTrialAuditErrorIdentifierInvalid   = "identifier_invalid"
-	ClinicalTrialAuditErrorSourceNotFound      = "source_not_found"
-	ClinicalTrialAuditErrorSourceRateLimited   = "source_rate_limited"
-	ClinicalTrialAuditErrorSourceTimeout       = "source_timeout"
-	ClinicalTrialAuditErrorSourceSchemaInvalid = "source_schema_invalid"
-	ClinicalTrialAuditErrorModelTimeout        = "model_timeout"
-	ClinicalTrialAuditErrorModelInvalidOutput  = "model_invalid_output"
-	ClinicalTrialAuditErrorEvidenceInvalid     = "evidence_invalid"
-	ClinicalTrialAuditErrorRetryExhausted      = "retry_exhausted"
-	ClinicalTrialAuditErrorInternal            = "internal_error"
+	ClinicalTrialAuditErrorIdentifierInvalid        = "identifier_invalid"
+	ClinicalTrialAuditErrorSourceNotFound           = "source_not_found"
+	ClinicalTrialAuditErrorSourceRateLimited        = "source_rate_limited"
+	ClinicalTrialAuditErrorSourceTimeout            = "source_timeout"
+	ClinicalTrialAuditErrorSourceCanceled           = "source_canceled"
+	ClinicalTrialAuditErrorSourceResponseTooLarge   = "source_response_too_large"
+	ClinicalTrialAuditErrorSourceMalformedJSON      = "source_malformed_json"
+	ClinicalTrialAuditErrorSourceIdentifierMismatch = "source_identifier_mismatch"
+	ClinicalTrialAuditErrorSourceSchemaInvalid      = "source_schema_invalid"
+	ClinicalTrialAuditErrorSourceUpstreamPermanent  = "source_upstream_permanent"
+	ClinicalTrialAuditErrorSourceUpstreamTransient  = "source_upstream_transient"
+	ClinicalTrialAuditErrorModelTimeout             = "model_timeout"
+	ClinicalTrialAuditErrorModelInvalidOutput       = "model_invalid_output"
+	ClinicalTrialAuditErrorEvidenceInvalid          = "evidence_invalid"
+	ClinicalTrialAuditErrorRetryExhausted           = "retry_exhausted"
+	ClinicalTrialAuditErrorInternal                 = "internal_error"
 )
 
 var (
@@ -52,37 +60,74 @@ var (
 )
 
 type ClinicalTrialAuditStoredRun struct {
-	SchemaVersion   string                        `json:"schema_version"`
-	RunID           string                        `json:"run_id"`
-	PackageID       string                        `json:"package_id"`
-	PackageVersion  string                        `json:"package_version"`
-	IdempotencyKey  string                        `json:"idempotency_key"`
-	State           string                        `json:"state"`
-	Request         ClinicalTrialAuditRequest     `json:"request"`
-	Sources         []ClinicalTrialSourceSnapshot `json:"sources,omitempty"`
-	Findings        []ClinicalTrialFinding        `json:"findings,omitempty"`
-	Citations       []ClinicalTrialAuditCitation  `json:"citations,omitempty"`
-	Audit           *ClinicalTrialAudit           `json:"audit,omitempty"`
-	Attempt         int                           `json:"attempt"`
-	Retryable       bool                          `json:"retryable"`
-	ErrorCode       string                        `json:"error_code,omitempty"`
-	LeaseOwner      string                        `json:"lease_owner,omitempty"`
-	LeaseToken      string                        `json:"-"`
-	LeaseGeneration int                           `json:"lease_generation,omitempty"`
-	LeaseExpiresAt  string                        `json:"lease_expires_at,omitempty"`
-	CreatedAt       string                        `json:"created_at"`
-	UpdatedAt       string                        `json:"updated_at"`
+	SchemaVersion   string                              `json:"schema_version"`
+	RunID           string                              `json:"run_id"`
+	PackageID       string                              `json:"package_id"`
+	PackageVersion  string                              `json:"package_version"`
+	IdempotencyKey  string                              `json:"idempotency_key"`
+	State           string                              `json:"state"`
+	Request         ClinicalTrialAuditRequest           `json:"request"`
+	Sources         []ClinicalTrialSourceSnapshot       `json:"sources,omitempty"`
+	Findings        []ClinicalTrialFinding              `json:"findings,omitempty"`
+	Citations       []ClinicalTrialAuditCitation        `json:"citations,omitempty"`
+	Evidence        []ClinicalTrialAuditEvidencePayload `json:"evidence,omitempty"`
+	Audit           *ClinicalTrialAudit                 `json:"audit,omitempty"`
+	Attempt         int                                 `json:"attempt"`
+	Retryable       bool                                `json:"retryable"`
+	ErrorCode       string                              `json:"error_code,omitempty"`
+	LeaseOwner      string                              `json:"lease_owner,omitempty"`
+	LeaseToken      string                              `json:"-"`
+	LeaseGeneration int                                 `json:"lease_generation,omitempty"`
+	LeaseExpiresAt  string                              `json:"lease_expires_at,omitempty"`
+	CreatedAt       string                              `json:"created_at"`
+	UpdatedAt       string                              `json:"updated_at"`
 	leaseTokenHash  string
 }
 
+type ClinicalTrialAuditEvidencePayload struct {
+	SchemaVersion string          `json:"schema_version"`
+	SourceType    string          `json:"source_type"`
+	ContentHash   string          `json:"content_hash"`
+	Data          json.RawMessage `json:"data"`
+}
+
+type ClinicalTrialAuditFailure struct {
+	Code      string `json:"code"`
+	Retryable bool   `json:"retryable"`
+}
+
+func ProjectClinicalTrialAuditRun(stored ClinicalTrialAuditStoredRun) (ClinicalTrialAuditRun, error) {
+	if stored.SchemaVersion != ClinicalTrialAuditStoredRunSchemaVersion {
+		return ClinicalTrialAuditRun{}, fmt.Errorf("stored schema_version must be %q", ClinicalTrialAuditStoredRunSchemaVersion)
+	}
+	publicRun := ClinicalTrialAuditRun{
+		SchemaVersion: ClinicalTrialAuditRunSchemaVersion,
+		RunID:         stored.RunID,
+		State:         stored.State,
+		Request:       stored.Request,
+		Audit:         stored.Audit,
+		CreatedAt:     stored.CreatedAt,
+		UpdatedAt:     stored.UpdatedAt,
+	}
+	if stored.State == ClinicalTrialAuditRunFailed {
+		if err := validateClinicalTrialAuditFailure(stored.ErrorCode, stored.Retryable); err != nil {
+			return ClinicalTrialAuditRun{}, err
+		}
+		errorCode := stored.ErrorCode
+		publicRun.Error = &errorCode
+	}
+	return FinalizeClinicalTrialAuditRun(publicRun)
+}
+
 type ClinicalTrialAuditCheckpoint struct {
-	State     string                        `json:"state"`
-	Sources   []ClinicalTrialSourceSnapshot `json:"sources,omitempty"`
-	Findings  []ClinicalTrialFinding        `json:"findings,omitempty"`
-	Citations []ClinicalTrialAuditCitation  `json:"citations,omitempty"`
-	Audit     *ClinicalTrialAudit           `json:"audit,omitempty"`
-	ErrorCode string                        `json:"error_code,omitempty"`
-	Retryable bool                          `json:"retryable"`
+	State     string                              `json:"state"`
+	Sources   []ClinicalTrialSourceSnapshot       `json:"sources,omitempty"`
+	Findings  []ClinicalTrialFinding              `json:"findings,omitempty"`
+	Citations []ClinicalTrialAuditCitation        `json:"citations,omitempty"`
+	Evidence  []ClinicalTrialAuditEvidencePayload `json:"evidence,omitempty"`
+	Audit     *ClinicalTrialAudit                 `json:"audit,omitempty"`
+	ErrorCode string                              `json:"error_code,omitempty"`
+	Retryable bool                                `json:"retryable"`
 }
 
 type ClinicalTrialAuditListOptions struct {
@@ -245,6 +290,21 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 			citations_json TEXT NOT NULL DEFAULT '[]',
 			audit_json TEXT NOT NULL DEFAULT '',
 			FOREIGN KEY(run_id) REFERENCES clinical_trial_audit_runs(run_id) ON DELETE CASCADE
+		);
+
+		CREATE TABLE IF NOT EXISTS clinical_trial_audit_evidence (
+			content_hash TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL,
+			evidence_json TEXT NOT NULL
+		);
+
+		CREATE TABLE IF NOT EXISTS clinical_trial_audit_snapshot_evidence (
+			run_id TEXT NOT NULL,
+			fingerprint TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			PRIMARY KEY(run_id, fingerprint),
+			FOREIGN KEY(run_id, fingerprint) REFERENCES clinical_trial_audit_snapshots(run_id, fingerprint) ON DELETE CASCADE,
+			FOREIGN KEY(content_hash) REFERENCES clinical_trial_audit_evidence(content_hash)
 		);
 	`)
 	if err != nil {
@@ -495,7 +555,7 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 		return ClinicalTrialAuditStoredRun{}, fmt.Errorf("run_id, worker_id, lease_token, and checkpoint state are required")
 	}
 	if checkpoint.State == ClinicalTrialAuditRunFailed {
-		if err := validateClinicalTrialAuditErrorCode(checkpoint.ErrorCode); err != nil {
+		if err := validateClinicalTrialAuditFailure(checkpoint.ErrorCode, checkpoint.Retryable); err != nil {
 			return ClinicalTrialAuditStoredRun{}, err
 		}
 	} else if strings.TrimSpace(checkpoint.ErrorCode) != "" {
@@ -515,6 +575,9 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 		return ClinicalTrialAuditStoredRun{}, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE clinical_trial_audit_runs SET updated_at = updated_at WHERE run_id = ?`, runID); err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
 	run, err := getClinicalTrialAuditRunTx(tx, runID)
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
@@ -743,7 +806,7 @@ func scanClinicalTrialAuditStoredRun(row clinicalTrialAuditScanner) (ClinicalTri
 	if err := json.Unmarshal([]byte(requestJSON), &run.Request); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
-	run.SchemaVersion = ClinicalTrialAuditRunSchemaVersion
+	run.SchemaVersion = ClinicalTrialAuditStoredRunSchemaVersion
 	run.Retryable = retryable == 1
 	return run, nil
 }
@@ -778,6 +841,35 @@ func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *Clini
 			return err
 		}
 		run.Sources = append(run.Sources, snapshot)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	rows, err = queryer.Query(`
+		SELECT evidence.evidence_json
+		FROM clinical_trial_audit_snapshot_evidence AS link
+		JOIN clinical_trial_audit_evidence AS evidence ON evidence.content_hash = link.content_hash
+		WHERE link.run_id = ? ORDER BY link.fingerprint
+	`, run.RunID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var encoded string
+		if err := rows.Scan(&encoded); err != nil {
+			rows.Close()
+			return err
+		}
+		var evidence ClinicalTrialAuditEvidencePayload
+		if err := json.Unmarshal([]byte(encoded), &evidence); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+			rows.Close()
+			return err
+		}
+		run.Evidence = append(run.Evidence, evidence)
 	}
 	if err := rows.Close(); err != nil {
 		return err
@@ -825,6 +917,69 @@ func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *Clini
 
 func persistClinicalTrialAuditCheckpoint(tx *sql.Tx, runID string, checkpoint ClinicalTrialAuditCheckpoint) error {
 	if checkpoint.Sources != nil {
+		availableEvidence := make(map[string]ClinicalTrialAuditEvidencePayload)
+		rows, err := tx.Query(`
+			SELECT evidence.evidence_json
+			FROM clinical_trial_audit_snapshot_evidence AS link
+			JOIN clinical_trial_audit_evidence AS evidence ON evidence.content_hash = link.content_hash
+			WHERE link.run_id = ?
+		`, runID)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var encoded string
+			if err := rows.Scan(&encoded); err != nil {
+				rows.Close()
+				return err
+			}
+			var evidence ClinicalTrialAuditEvidencePayload
+			if err := json.Unmarshal([]byte(encoded), &evidence); err != nil {
+				rows.Close()
+				return err
+			}
+			if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+				rows.Close()
+				return err
+			}
+			availableEvidence[evidence.SourceType+"\x00"+evidence.ContentHash] = evidence
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		for _, evidence := range checkpoint.Evidence {
+			if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+				return err
+			}
+			availableEvidence[evidence.SourceType+"\x00"+evidence.ContentHash] = evidence
+			encoded, err := marshalBoundedClinicalTrialAuditJSON(evidence, clinicalTrialAuditJSONMaxBytes)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO clinical_trial_audit_evidence (content_hash, source_type, evidence_json)
+				VALUES (?, ?, ?) ON CONFLICT(content_hash) DO NOTHING
+			`, evidence.ContentHash, evidence.SourceType, string(encoded)); err != nil {
+				return err
+			}
+			var storedSourceType, storedJSON string
+			if err := tx.QueryRow(`SELECT source_type, evidence_json FROM clinical_trial_audit_evidence WHERE content_hash = ?`, evidence.ContentHash).Scan(&storedSourceType, &storedJSON); err != nil {
+				return err
+			}
+			if storedSourceType != evidence.SourceType || storedJSON != string(encoded) {
+				return fmt.Errorf("clinical trial evidence content hash collision or payload mismatch")
+			}
+		}
+		for _, snapshot := range checkpoint.Sources {
+			if snapshot.SourceType == ClinicalTrialsGovStudySourceType {
+				if _, exists := availableEvidence[snapshot.SourceType+"\x00"+snapshot.ContentHash]; !exists {
+					return fmt.Errorf("ClinicalTrials.gov snapshot requires matching normalized evidence")
+				}
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM clinical_trial_audit_snapshot_evidence WHERE run_id = ?`, runID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DELETE FROM clinical_trial_audit_snapshots WHERE run_id = ?`, runID); err != nil {
 			return err
 		}
@@ -842,6 +997,11 @@ func persistClinicalTrialAuditCheckpoint(tx *sql.Tx, runID string, checkpoint Cl
 			}
 			if _, err := tx.Exec(`INSERT INTO clinical_trial_audit_snapshots (run_id, fingerprint, snapshot_json) VALUES (?, ?, ?)`, runID, finalized.Fingerprint, string(encoded)); err != nil {
 				return err
+			}
+			if evidence, exists := availableEvidence[snapshot.SourceType+"\x00"+snapshot.ContentHash]; exists {
+				if _, err := tx.Exec(`INSERT INTO clinical_trial_audit_snapshot_evidence (run_id, fingerprint, content_hash) VALUES (?, ?, ?)`, runID, snapshot.Fingerprint, evidence.ContentHash); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -888,7 +1048,7 @@ func persistClinicalTrialAuditCheckpoint(tx *sql.Tx, runID string, checkpoint Cl
 }
 
 func validateClinicalTrialAuditCheckpointBounds(checkpoint ClinicalTrialAuditCheckpoint) error {
-	for _, value := range []any{checkpoint.Sources, checkpoint.Findings, checkpoint.Citations, checkpoint.Audit} {
+	for _, value := range []any{checkpoint.Sources, checkpoint.Evidence, checkpoint.Findings, checkpoint.Citations, checkpoint.Audit} {
 		if _, err := marshalBoundedClinicalTrialAuditJSON(value, clinicalTrialAuditJSONMaxBytes); err != nil {
 			return err
 		}
@@ -899,6 +1059,17 @@ func validateClinicalTrialAuditCheckpointBounds(checkpoint ClinicalTrialAuditChe
 func validateClinicalTrialAuditCheckpointEvidence(checkpoint ClinicalTrialAuditCheckpoint) error {
 	if checkpoint.State == ClinicalTrialAuditRunComparing && len(checkpoint.Sources) == 0 {
 		return fmt.Errorf("comparing checkpoint requires source snapshots")
+	}
+	evidenceByIdentity := make(map[string]struct{}, len(checkpoint.Evidence))
+	for _, evidence := range checkpoint.Evidence {
+		if err := validateClinicalTrialAuditEvidencePayload(evidence); err != nil {
+			return err
+		}
+		identity := evidence.SourceType + "\x00" + evidence.ContentHash
+		if _, exists := evidenceByIdentity[identity]; exists {
+			return fmt.Errorf("duplicate clinical trial evidence payload")
+		}
+		evidenceByIdentity[identity] = struct{}{}
 	}
 	if checkpoint.State != ClinicalTrialAuditRunReasoning {
 		return nil
@@ -950,6 +1121,19 @@ func validateClinicalTrialAuditCheckpointEvidence(checkpoint ClinicalTrialAuditC
 			}
 			seen[citationID] = struct{}{}
 		}
+	}
+	return nil
+}
+
+func validateClinicalTrialAuditEvidencePayload(evidence ClinicalTrialAuditEvidencePayload) error {
+	if evidence.SchemaVersion != ClinicalTrialAuditEvidenceSchemaVersion {
+		return fmt.Errorf("evidence schema_version must be %q", ClinicalTrialAuditEvidenceSchemaVersion)
+	}
+	if strings.TrimSpace(evidence.SourceType) == "" || !json.Valid(evidence.Data) {
+		return fmt.Errorf("clinical trial evidence source_type and valid data are required")
+	}
+	if got := hashClinicalTrialValue(string(evidence.Data)); got != evidence.ContentHash {
+		return fmt.Errorf("clinical trial evidence content_hash does not match normalized data")
 	}
 	return nil
 }
@@ -1033,7 +1217,13 @@ func validateClinicalTrialAuditErrorCode(code string) error {
 		ClinicalTrialAuditErrorSourceNotFound,
 		ClinicalTrialAuditErrorSourceRateLimited,
 		ClinicalTrialAuditErrorSourceTimeout,
+		ClinicalTrialAuditErrorSourceCanceled,
+		ClinicalTrialAuditErrorSourceResponseTooLarge,
+		ClinicalTrialAuditErrorSourceMalformedJSON,
+		ClinicalTrialAuditErrorSourceIdentifierMismatch,
 		ClinicalTrialAuditErrorSourceSchemaInvalid,
+		ClinicalTrialAuditErrorSourceUpstreamPermanent,
+		ClinicalTrialAuditErrorSourceUpstreamTransient,
 		ClinicalTrialAuditErrorModelTimeout,
 		ClinicalTrialAuditErrorModelInvalidOutput,
 		ClinicalTrialAuditErrorEvidenceInvalid,
@@ -1043,6 +1233,34 @@ func validateClinicalTrialAuditErrorCode(code string) error {
 	default:
 		return fmt.Errorf("unsupported clinical trial audit error code %q", code)
 	}
+}
+
+func validateClinicalTrialAuditFailure(code string, retryable bool) error {
+	if err := validateClinicalTrialAuditErrorCode(code); err != nil {
+		return err
+	}
+	policy := map[string]bool{
+		ClinicalTrialAuditErrorIdentifierInvalid:        false,
+		ClinicalTrialAuditErrorSourceNotFound:           false,
+		ClinicalTrialAuditErrorSourceRateLimited:        true,
+		ClinicalTrialAuditErrorSourceTimeout:            true,
+		ClinicalTrialAuditErrorSourceCanceled:           false,
+		ClinicalTrialAuditErrorSourceResponseTooLarge:   false,
+		ClinicalTrialAuditErrorSourceMalformedJSON:      false,
+		ClinicalTrialAuditErrorSourceIdentifierMismatch: false,
+		ClinicalTrialAuditErrorSourceSchemaInvalid:      false,
+		ClinicalTrialAuditErrorSourceUpstreamPermanent:  false,
+		ClinicalTrialAuditErrorSourceUpstreamTransient:  true,
+		ClinicalTrialAuditErrorModelTimeout:             true,
+		ClinicalTrialAuditErrorModelInvalidOutput:       false,
+		ClinicalTrialAuditErrorEvidenceInvalid:          false,
+		ClinicalTrialAuditErrorRetryExhausted:           false,
+		ClinicalTrialAuditErrorInternal:                 false,
+	}
+	if policy[code] != retryable {
+		return fmt.Errorf("clinical trial audit error code %q requires retryable=%v", code, policy[code])
+	}
+	return nil
 }
 
 func marshalBoundedClinicalTrialAuditJSON(value any, limit int) ([]byte, error) {
