@@ -1,6 +1,6 @@
 # Health Evidence Review Workspace v2 Dossier
 
-**Status:** IMPLEMENTED — G3/G4 PASS locally; push/deploy pending
+**Status:** IMPLEMENTED — G3/G4 PASS; feature branch pushed; deploy not attempted
 
 ## S0 · User request
 
@@ -157,3 +157,16 @@ Decision: PASS.
 
 Not attempted. Deployment requires push/integration and must happen only from a
 clean main branch after the user authorizes the release path.
+
+## Push
+
+- Feature implementation commit:
+  `4d8e202 feat(kbase): add health review queue`.
+- Before push:
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- `git status --short` — clean.
+- `git push -u dedao-kbase codex/health-review-workspace-v2` — PASS.
+- Remote branch:
+  `dedao-kbase/codex/health-review-workspace-v2`.
+- Pull request URL suggested by GitHub:
+  `https://github.com/itsoso/dedao-kbase/pull/new/codex/health-review-workspace-v2`.
