@@ -199,3 +199,65 @@ func TestSourceAgentRunnerReportsAdapterItemFailuresBeforeCompletion(t *testing.
 		t.Fatalf("result=%#v calls=%v", result, calls)
 	}
 }
+
+func TestSourceAgentRunnerDrainsOutboxLargerThanUploadPage(t *testing.T) {
+	uploaded := 0
+	completed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a"}}`)
+		case "/api/source-agent/lease":
+			fmt.Fprint(w, `{"run":{"id":"run-bulk","status":"running","requested_operation":"sync_fake","subscription":{"id":"sub-1","source_account_key":"account-key","source_account":"Account"}}}`)
+		case "/api/source-agent/runs/run-bulk/items":
+			uploaded++
+			fmt.Fprint(w, `{"receipt":{"run_id":"run-bulk"}}`)
+		case "/api/source-agent/runs/run-bulk/complete":
+			completed = true
+			fmt.Fprint(w, `{"run":{"id":"run-bulk","status":"succeeded"}}`)
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewSourceAgentClient(SourceAgentConfig{RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(), HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	for index := 0; index < 205; index++ {
+		itemKey := fmt.Sprintf("article-%03d", index)
+		if _, err := outbox.Enqueue("run-bulk", SourceArticleEnvelope{
+			IdempotencyKey:  "idem-" + itemKey,
+			SourceType:      "wechat_mp_article",
+			SourceAccountID: "account-key",
+			SourceAccount:   "Account",
+			SourceItemID:    itemKey,
+			Title:           "Article " + itemKey,
+			SourceURL:       "https://mp.weixin.qq.com/s/" + itemKey,
+			Content:         "# Article\n\nThis article contains enough deterministic content for the bulk outbox drain test.",
+			ContentFormat:   "markdown",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	adapter := &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploaded != 205 || !completed || result.OutboxRemaining != 0 {
+		t.Fatalf("uploaded=%d completed=%t result=%#v", uploaded, completed, result)
+	}
+}

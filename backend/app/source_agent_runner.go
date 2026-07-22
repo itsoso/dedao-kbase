@@ -122,33 +122,37 @@ func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult
 }
 
 func (r *SourceAgentRunner) flush(ctx context.Context, runID string) (int, error) {
-	items, err := r.outbox.PeekReadyForRun(runID, 100)
-	if err != nil {
-		return 0, err
-	}
 	uploaded := 0
-	for _, item := range items {
-		if _, err := r.client.UploadArticle(ctx, runID, item.Envelope); err != nil {
-			status := 0
-			var httpErr *SourceAgentHTTPError
-			if errors.As(err, &httpErr) {
-				status = httpErr.StatusCode
-			}
-			updated, recordErr := r.outbox.RecordFailure(item.ID, status, err)
-			if recordErr != nil {
-				return uploaded, recordErr
-			}
-			if status == http.StatusBadRequest && updated.State == SourceOutboxDead {
-				continue
-			}
-			return uploaded, fmt.Errorf("upload source article: %w", err)
-		}
-		if err := r.outbox.Acknowledge(item.ID); err != nil {
+	for {
+		items, err := r.outbox.PeekReadyForRun(runID, 100)
+		if err != nil {
 			return uploaded, err
 		}
-		uploaded++
+		if len(items) == 0 {
+			return uploaded, nil
+		}
+		for _, item := range items {
+			if _, err := r.client.UploadArticle(ctx, runID, item.Envelope); err != nil {
+				status := 0
+				var httpErr *SourceAgentHTTPError
+				if errors.As(err, &httpErr) {
+					status = httpErr.StatusCode
+				}
+				updated, recordErr := r.outbox.RecordFailure(item.ID, status, err)
+				if recordErr != nil {
+					return uploaded, recordErr
+				}
+				if status == http.StatusBadRequest && updated.State == SourceOutboxDead {
+					continue
+				}
+				return uploaded, fmt.Errorf("upload source article: %w", err)
+			}
+			if err := r.outbox.Acknowledge(item.ID); err != nil {
+				return uploaded, err
+			}
+			uploaded++
+		}
 	}
-	return uploaded, nil
 }
 
 func (r *SourceAgentRunner) failRun(ctx context.Context, runID string, cause error, cursor ...string) error {
