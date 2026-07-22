@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const defaultSourceAgentLeaseDuration = 10 * time.Minute
+
 type SourceAgentRunnerConfig struct {
 	Client        *SourceAgentClient
 	Outbox        *SourceAgentOutbox
@@ -38,7 +40,7 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 		return nil, fmt.Errorf("source agent client, outbox, and adapter are required")
 	}
 	if config.LeaseDuration <= 0 {
-		config.LeaseDuration = 2 * time.Minute
+		config.LeaseDuration = defaultSourceAgentLeaseDuration
 	}
 	return &SourceAgentRunner{client: config.Client, outbox: config.Outbox, adapter: config.Adapter, version: strings.TrimSpace(config.Version), leaseDuration: config.LeaseDuration}, nil
 }

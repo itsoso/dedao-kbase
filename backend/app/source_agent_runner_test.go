@@ -52,6 +52,7 @@ func TestSourceAgentRunnerUsesAdapterContract(t *testing.T) {
 
 func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 	var failedCursor string
+	var leaseSeconds int
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -59,6 +60,13 @@ func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 		case "/api/source-agent/heartbeat":
 			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a"}}`)
 		case "/api/source-agent/lease":
+			var payload struct {
+				LeaseSeconds int `json:"lease_seconds"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode lease payload: %v", err)
+			}
+			leaseSeconds = payload.LeaseSeconds
 			fmt.Fprint(w, `{"run":{"id":"run-1","status":"running","requested_operation":"sync_fake","subscription":{"id":"sub-1","source_account_key":"account-key","source_account":"Account"}}}`)
 		case "/api/source-agent/runs/run-1/items":
 			calls = append(calls, "upload")
@@ -122,6 +130,9 @@ func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 	}
 	if failedCursor != "safe-cursor" {
 		t.Fatalf("failed cursor=%q", failedCursor)
+	}
+	if leaseSeconds != 600 {
+		t.Fatalf("lease seconds=%d, want 600", leaseSeconds)
 	}
 	if strings.Join(calls, ",") != "upload,fail" {
 		t.Fatalf("calls=%v, want upload before fail", calls)
