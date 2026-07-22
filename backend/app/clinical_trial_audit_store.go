@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -22,39 +21,52 @@ const (
 	clinicalTrialAuditJSONMaxBytes      = 1 << 20
 	clinicalTrialAuditRequestMaxBytes   = 64 << 10
 	clinicalTrialAuditErrorCodeMaxBytes = 64
+
+	ClinicalTrialAuditErrorIdentifierInvalid   = "identifier_invalid"
+	ClinicalTrialAuditErrorSourceNotFound      = "source_not_found"
+	ClinicalTrialAuditErrorSourceRateLimited   = "source_rate_limited"
+	ClinicalTrialAuditErrorSourceTimeout       = "source_timeout"
+	ClinicalTrialAuditErrorSourceSchemaInvalid = "source_schema_invalid"
+	ClinicalTrialAuditErrorModelTimeout        = "model_timeout"
+	ClinicalTrialAuditErrorModelInvalidOutput  = "model_invalid_output"
+	ClinicalTrialAuditErrorEvidenceInvalid     = "evidence_invalid"
+	ClinicalTrialAuditErrorRetryExhausted      = "retry_exhausted"
+	ClinicalTrialAuditErrorInternal            = "internal_error"
 )
 
 var (
 	ErrClinicalTrialAuditRunNotFound         = errors.New("clinical trial audit run not found")
 	ErrClinicalTrialAuditIdempotencyConflict = errors.New("clinical trial audit idempotency conflict")
 	ErrClinicalTrialAuditLeaseOwner          = errors.New("clinical trial audit run belongs to another worker")
+	ErrClinicalTrialAuditLeaseFence          = errors.New("clinical trial audit lease token is stale")
 	ErrClinicalTrialAuditLeaseExpired        = errors.New("clinical trial audit run lease expired")
 	ErrClinicalTrialAuditTerminal            = errors.New("clinical trial audit run is terminal")
 	ErrClinicalTrialAuditInvalidTransition   = errors.New("invalid clinical trial audit transition")
 	ErrClinicalTrialAuditNotRetryable        = errors.New("clinical trial audit run is not retryable")
-
-	clinicalTrialAuditErrorCodePattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 )
 
 type ClinicalTrialAuditStoredRun struct {
-	SchemaVersion  string                        `json:"schema_version"`
-	RunID          string                        `json:"run_id"`
-	PackageID      string                        `json:"package_id"`
-	PackageVersion string                        `json:"package_version"`
-	IdempotencyKey string                        `json:"idempotency_key"`
-	State          string                        `json:"state"`
-	Request        ClinicalTrialAuditRequest     `json:"request"`
-	Sources        []ClinicalTrialSourceSnapshot `json:"sources,omitempty"`
-	Findings       []ClinicalTrialFinding        `json:"findings,omitempty"`
-	Citations      []ClinicalTrialAuditCitation  `json:"citations,omitempty"`
-	Audit          *ClinicalTrialAudit           `json:"audit,omitempty"`
-	Attempt        int                           `json:"attempt"`
-	Retryable      bool                          `json:"retryable"`
-	ErrorCode      string                        `json:"error_code,omitempty"`
-	LeaseOwner     string                        `json:"lease_owner,omitempty"`
-	LeaseExpiresAt string                        `json:"lease_expires_at,omitempty"`
-	CreatedAt      string                        `json:"created_at"`
-	UpdatedAt      string                        `json:"updated_at"`
+	SchemaVersion   string                        `json:"schema_version"`
+	RunID           string                        `json:"run_id"`
+	PackageID       string                        `json:"package_id"`
+	PackageVersion  string                        `json:"package_version"`
+	IdempotencyKey  string                        `json:"idempotency_key"`
+	State           string                        `json:"state"`
+	Request         ClinicalTrialAuditRequest     `json:"request"`
+	Sources         []ClinicalTrialSourceSnapshot `json:"sources,omitempty"`
+	Findings        []ClinicalTrialFinding        `json:"findings,omitempty"`
+	Citations       []ClinicalTrialAuditCitation  `json:"citations,omitempty"`
+	Audit           *ClinicalTrialAudit           `json:"audit,omitempty"`
+	Attempt         int                           `json:"attempt"`
+	Retryable       bool                          `json:"retryable"`
+	ErrorCode       string                        `json:"error_code,omitempty"`
+	LeaseOwner      string                        `json:"lease_owner,omitempty"`
+	LeaseToken      string                        `json:"-"`
+	LeaseGeneration int                           `json:"lease_generation,omitempty"`
+	LeaseExpiresAt  string                        `json:"lease_expires_at,omitempty"`
+	CreatedAt       string                        `json:"created_at"`
+	UpdatedAt       string                        `json:"updated_at"`
+	leaseTokenHash  string
 }
 
 type ClinicalTrialAuditCheckpoint struct {
@@ -160,6 +172,8 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 			retryable INTEGER NOT NULL DEFAULT 0,
 			error_code TEXT NOT NULL DEFAULT '',
 			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_token_hash TEXT NOT NULL DEFAULT '',
+			lease_generation INTEGER NOT NULL DEFAULT 0,
 			lease_expires_at TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
@@ -202,6 +216,29 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 			FOREIGN KEY(run_id) REFERENCES clinical_trial_audit_runs(run_id) ON DELETE CASCADE
 		);
 	`)
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct{ name, definition string }{
+		{"lease_token_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"lease_generation", "INTEGER NOT NULL DEFAULT 0"},
+	} {
+		if err := ensureClinicalTrialAuditColumn(db, "clinical_trial_audit_runs", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureClinicalTrialAuditColumn(db *sql.DB, table, column, definition string) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 {
+		return nil
+	}
+	_, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
 	return err
 }
 
@@ -351,18 +388,21 @@ func (s *ClinicalTrialAuditStore) LeaseNextRun(workerID string, leaseDuration ti
 		return nil, err
 	}
 	now := s.now().UTC()
+	leaseToken := newClinicalTrialAuditLeaseToken(workerID, now)
+	leaseTokenHash := hashClinicalTrialValue(leaseToken)
 	var runID string
 	err = tx.QueryRow(`
 		UPDATE clinical_trial_audit_runs SET
 			state = CASE WHEN resume_state = '' THEN ? ELSE resume_state END,
-			resume_state = '', lease_owner = ?, lease_expires_at = ?, updated_at = ?
+			resume_state = '', lease_owner = ?, lease_token_hash = ?,
+			lease_generation = lease_generation + 1, lease_expires_at = ?, updated_at = ?
 		WHERE run_id = (
 			SELECT run_id FROM clinical_trial_audit_runs
 			WHERE state = ? AND lease_owner = ''
 			ORDER BY created_at, run_id LIMIT 1
 		) AND state = ? AND lease_owner = ''
 		RETURNING run_id
-	`, ClinicalTrialAuditRunCollecting, workerID, now.Add(leaseDuration).Format(time.RFC3339Nano),
+	`, ClinicalTrialAuditRunCollecting, workerID, leaseTokenHash, now.Add(leaseDuration).Format(time.RFC3339Nano),
 		now.Format(time.RFC3339Nano), ClinicalTrialAuditRunQueued, ClinicalTrialAuditRunQueued).Scan(&runID)
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
@@ -380,15 +420,17 @@ func (s *ClinicalTrialAuditStore) LeaseNextRun(workerID string, leaseDuration ti
 	if err != nil {
 		return nil, err
 	}
+	run.LeaseToken = leaseToken
 	return &run, nil
 }
 
-func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID string, checkpoint ClinicalTrialAuditCheckpoint) (ClinicalTrialAuditStoredRun, error) {
+func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken string, checkpoint ClinicalTrialAuditCheckpoint) (ClinicalTrialAuditStoredRun, error) {
 	runID = strings.TrimSpace(runID)
 	workerID = strings.TrimSpace(workerID)
+	leaseToken = strings.TrimSpace(leaseToken)
 	checkpoint.State = strings.TrimSpace(checkpoint.State)
-	if runID == "" || workerID == "" || checkpoint.State == "" {
-		return ClinicalTrialAuditStoredRun{}, fmt.Errorf("run_id, worker_id, and checkpoint state are required")
+	if runID == "" || workerID == "" || leaseToken == "" || checkpoint.State == "" {
+		return ClinicalTrialAuditStoredRun{}, fmt.Errorf("run_id, worker_id, lease_token, and checkpoint state are required")
 	}
 	if checkpoint.State == ClinicalTrialAuditRunFailed {
 		if err := validateClinicalTrialAuditErrorCode(checkpoint.ErrorCode); err != nil {
@@ -418,6 +460,10 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID string, checkpoi
 	}
 	if run.LeaseOwner != workerID {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseOwner
+	}
+	leaseTokenHash := hashClinicalTrialValue(leaseToken)
+	if run.leaseTokenHash == "" || run.leaseTokenHash != leaseTokenHash {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseFence
 	}
 	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, s.now()) {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
@@ -454,17 +500,19 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID string, checkpoi
 	}
 	now := s.timestamp()
 	leaseOwner := run.LeaseOwner
+	storedLeaseTokenHash := run.leaseTokenHash
 	leaseExpiresAt := run.LeaseExpiresAt
 	if isTerminalClinicalTrialAuditState(checkpoint.State) {
 		leaseOwner = ""
+		storedLeaseTokenHash = ""
 		leaseExpiresAt = ""
 	}
 	result, err := tx.Exec(`
 		UPDATE clinical_trial_audit_runs SET state = ?, retryable = ?, error_code = ?,
-			lease_owner = ?, lease_expires_at = ?, updated_at = ?
-		WHERE run_id = ? AND state = ? AND lease_owner = ?
+			lease_owner = ?, lease_token_hash = ?, lease_expires_at = ?, updated_at = ?
+		WHERE run_id = ? AND state = ? AND lease_owner = ? AND lease_token_hash = ?
 	`, checkpoint.State, boolToClinicalTrialAuditInt(checkpoint.Retryable), strings.TrimSpace(checkpoint.ErrorCode),
-		leaseOwner, leaseExpiresAt, now, runID, run.State, workerID)
+		leaseOwner, storedLeaseTokenHash, leaseExpiresAt, now, runID, run.State, workerID, leaseTokenHash)
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
@@ -509,7 +557,7 @@ func (s *ClinicalTrialAuditStore) RetryRun(runID string) (ClinicalTrialAuditStor
 	now := s.timestamp()
 	result, err := tx.Exec(`
 		UPDATE clinical_trial_audit_runs SET state = ?, resume_state = '', attempt = attempt + 1,
-			error_code = '', lease_owner = '', lease_expires_at = '', updated_at = ?
+			error_code = '', lease_owner = '', lease_token_hash = '', lease_expires_at = '', updated_at = ?
 		WHERE run_id = ? AND state = ? AND retryable = 1
 	`, ClinicalTrialAuditRunQueued, now, run.RunID, ClinicalTrialAuditRunFailed)
 	if err != nil {
@@ -526,7 +574,8 @@ func (s *ClinicalTrialAuditStore) RetryRun(runID string) (ClinicalTrialAuditStor
 
 const clinicalTrialAuditRunSelect = `
 	SELECT run_id, package_id, package_version, idempotency_key, request_json,
-		state, attempt, retryable, error_code, lease_owner, lease_expires_at,
+		state, attempt, retryable, error_code, lease_owner, lease_token_hash,
+		lease_generation, lease_expires_at,
 		created_at, updated_at
 	FROM clinical_trial_audit_runs`
 
@@ -539,7 +588,8 @@ func scanClinicalTrialAuditStoredRun(row clinicalTrialAuditScanner) (ClinicalTri
 	var requestJSON string
 	var retryable int
 	err := row.Scan(&run.RunID, &run.PackageID, &run.PackageVersion, &run.IdempotencyKey, &requestJSON,
-		&run.State, &run.Attempt, &retryable, &run.ErrorCode, &run.LeaseOwner, &run.LeaseExpiresAt,
+		&run.State, &run.Attempt, &retryable, &run.ErrorCode, &run.LeaseOwner, &run.leaseTokenHash,
+		&run.LeaseGeneration, &run.LeaseExpiresAt,
 		&run.CreatedAt, &run.UpdatedAt)
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
@@ -792,7 +842,7 @@ func isTerminalClinicalTrialAuditState(state string) bool {
 func recoverExpiredClinicalTrialAuditLeases(tx *sql.Tx, now string) (int64, error) {
 	result, err := tx.Exec(`
 		UPDATE clinical_trial_audit_runs SET resume_state = state, state = ?, lease_owner = '',
-			lease_expires_at = '', updated_at = ?
+			lease_token_hash = '', lease_expires_at = '', updated_at = ?
 		WHERE state IN (?, ?, ?, ?) AND lease_owner != '' AND lease_expires_at != ''
 			AND julianday(lease_expires_at) <= julianday(?)
 	`, ClinicalTrialAuditRunQueued, now, ClinicalTrialAuditRunCollecting, ClinicalTrialAuditRunComparing,
@@ -810,10 +860,24 @@ func clinicalTrialAuditLeaseExpired(value string, now time.Time) bool {
 
 func validateClinicalTrialAuditErrorCode(code string) error {
 	code = strings.TrimSpace(code)
-	if code == "" || len(code) > clinicalTrialAuditErrorCodeMaxBytes || !clinicalTrialAuditErrorCodePattern.MatchString(code) {
-		return fmt.Errorf("clinical trial audit error code must be a bounded lowercase identifier")
+	if code == "" || len(code) > clinicalTrialAuditErrorCodeMaxBytes {
+		return fmt.Errorf("clinical trial audit error code must be an allowlisted bounded identifier")
 	}
-	return nil
+	switch code {
+	case ClinicalTrialAuditErrorIdentifierInvalid,
+		ClinicalTrialAuditErrorSourceNotFound,
+		ClinicalTrialAuditErrorSourceRateLimited,
+		ClinicalTrialAuditErrorSourceTimeout,
+		ClinicalTrialAuditErrorSourceSchemaInvalid,
+		ClinicalTrialAuditErrorModelTimeout,
+		ClinicalTrialAuditErrorModelInvalidOutput,
+		ClinicalTrialAuditErrorEvidenceInvalid,
+		ClinicalTrialAuditErrorRetryExhausted,
+		ClinicalTrialAuditErrorInternal:
+		return nil
+	default:
+		return fmt.Errorf("unsupported clinical trial audit error code %q", code)
+	}
 }
 
 func marshalBoundedClinicalTrialAuditJSON(value any, limit int) ([]byte, error) {
@@ -875,6 +939,14 @@ func newClinicalTrialAuditStoreID(now time.Time) string {
 		return "clinical-audit-" + now.UTC().Format("20060102T150405.000000000Z")
 	}
 	return "clinical-audit-" + hex.EncodeToString(randomBytes[:])
+}
+
+func newClinicalTrialAuditLeaseToken(workerID string, now time.Time) string {
+	var randomBytes [24]byte
+	if _, err := rand.Read(randomBytes[:]); err == nil {
+		return base64.RawURLEncoding.EncodeToString(randomBytes[:])
+	}
+	return hashClinicalTrialValue("lease\x00" + workerID + "\x00" + now.UTC().Format(time.RFC3339Nano))
 }
 
 func boolToClinicalTrialAuditInt(value bool) int {

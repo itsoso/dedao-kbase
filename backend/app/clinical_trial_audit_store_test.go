@@ -167,14 +167,14 @@ func TestClinicalTrialAuditStoreCheckpointsOwnedStagesAndPersistsTerminalAudit(t
 		t.Fatalf("lease = %#v, err=%v", leased, err)
 	}
 	snapshot := clinicalTrialAuditStoreSnapshot(t, clock.Now())
-	if _, err := store.CheckpointRun(created.RunID, "worker-b", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); !errors.Is(err, ErrClinicalTrialAuditLeaseOwner) {
+	if _, err := store.CheckpointRun(created.RunID, "worker-b", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); !errors.Is(err, ErrClinicalTrialAuditLeaseOwner) {
 		t.Fatalf("foreign checkpoint = %v", err)
 	}
-	comparing, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}})
+	comparing, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}})
 	if err != nil || comparing.State != ClinicalTrialAuditRunComparing || len(comparing.Sources) != 1 {
 		t.Fatalf("comparing = %#v, err=%v", comparing, err)
 	}
-	if _, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunCompleted}); !errors.Is(err, ErrClinicalTrialAuditInvalidTransition) {
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunCompleted}); !errors.Is(err, ErrClinicalTrialAuditInvalidTransition) {
 		t.Fatalf("invalid transition = %v", err)
 	}
 
@@ -182,18 +182,18 @@ func TestClinicalTrialAuditStoreCheckpointsOwnedStagesAndPersistsTerminalAudit(t
 	citation := ClinicalTrialAuditCitation{CitationID: "citation-1", SourceFingerprint: snapshot.Fingerprint, Locator: "protocolSection.designModule.enrollmentInfo"}
 	badFinding := finding
 	badFinding.CitationIDs = []string{"missing-citation"}
-	if _, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{
 		State: ClinicalTrialAuditRunReasoning, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Findings: []ClinicalTrialFinding{badFinding}, Citations: []ClinicalTrialAuditCitation{citation},
 	}); err == nil {
 		t.Fatal("reasoning checkpoint accepted an unknown citation")
 	}
-	reasoning, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{
+	reasoning, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{
 		State: ClinicalTrialAuditRunReasoning, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Findings: []ClinicalTrialFinding{finding}, Citations: []ClinicalTrialAuditCitation{citation},
 	})
 	if err != nil || reasoning.State != ClinicalTrialAuditRunReasoning || len(reasoning.Findings) != 1 {
 		t.Fatalf("reasoning = %#v, err=%v", reasoning, err)
 	}
-	if _, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunAwaitingReview}); err != nil {
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunAwaitingReview}); err != nil {
 		t.Fatalf("awaiting review: %v", err)
 	}
 	audit := ClinicalTrialAudit{
@@ -207,7 +207,7 @@ func TestClinicalTrialAuditStoreCheckpointsOwnedStagesAndPersistsTerminalAudit(t
 		Limitations:   []string{"Publication comparison is pending."},
 		CompletedAt:   clock.Now().Format(time.RFC3339Nano),
 	}
-	completed, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunCompleted, Audit: &audit})
+	completed, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunCompleted, Audit: &audit})
 	if err != nil || completed.Audit == nil || completed.Audit.AuditID != "audit-1" || completed.LeaseOwner != "" {
 		t.Fatalf("completed = %#v, err=%v", completed, err)
 	}
@@ -215,7 +215,7 @@ func TestClinicalTrialAuditStoreCheckpointsOwnedStagesAndPersistsTerminalAudit(t
 	if err != nil || len(loaded.Sources) != 1 || len(loaded.Findings) != 1 || len(loaded.Citations) != 1 || loaded.Audit == nil {
 		t.Fatalf("loaded = %#v, err=%v", loaded, err)
 	}
-	if _, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: "late_failure"}); !errors.Is(err, ErrClinicalTrialAuditTerminal) {
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: ClinicalTrialAuditErrorInternal}); !errors.Is(err, ErrClinicalTrialAuditTerminal) {
 		t.Fatalf("terminal mutation = %v", err)
 	}
 }
@@ -234,24 +234,32 @@ func TestClinicalTrialAuditStoreBoundsFailureAndRetriesOnlyEligibleRuns(t *testi
 	if _, err := store.RetryRun(created.RunID); !errors.Is(err, ErrClinicalTrialAuditNotRetryable) {
 		t.Fatalf("retry queued = %v", err)
 	}
-	if _, err := store.LeaseNextRun("worker-a", time.Minute); err != nil {
+	leased, err := store.LeaseNextRun("worker-a", time.Minute)
+	if err != nil || leased == nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: "upstream timeout: dial tcp", Retryable: true}); err == nil {
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: "upstream timeout: dial tcp", Retryable: true}); err == nil {
 		t.Fatal("unsafe error code accepted")
 	}
-	failed, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: "upstream_timeout", Retryable: true})
-	if err != nil || failed.ErrorCode != "upstream_timeout" || !failed.Retryable {
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: "arbitrary_lowercase", Retryable: true}); err == nil {
+		t.Fatal("unregistered lowercase error code accepted")
+	}
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: "token_exposed_value", Retryable: true}); err == nil {
+		t.Fatal("credential-shaped error code accepted")
+	}
+	failed, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: ClinicalTrialAuditErrorSourceTimeout, Retryable: true})
+	if err != nil || failed.ErrorCode != ClinicalTrialAuditErrorSourceTimeout || !failed.Retryable {
 		t.Fatalf("failed = %#v, err=%v", failed, err)
 	}
 	retried, err := store.RetryRun(created.RunID)
 	if err != nil || retried.State != ClinicalTrialAuditRunQueued || retried.Attempt != 2 || retried.ErrorCode != "" || !retried.Retryable {
 		t.Fatalf("retried = %#v, err=%v", retried, err)
 	}
-	if _, err := store.LeaseNextRun("worker-b", time.Minute); err != nil {
+	retriedLease, err := store.LeaseNextRun("worker-b", time.Minute)
+	if err != nil || retriedLease == nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CheckpointRun(created.RunID, "worker-b", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: strings.Repeat("x", clinicalTrialAuditErrorCodeMaxBytes+1), Retryable: false}); err == nil {
+	if _, err := store.CheckpointRun(created.RunID, "worker-b", retriedLease.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunFailed, ErrorCode: strings.Repeat("x", clinicalTrialAuditErrorCodeMaxBytes+1), Retryable: false}); err == nil {
 		t.Fatal("oversized error code accepted")
 	}
 }
@@ -267,21 +275,56 @@ func TestClinicalTrialAuditStoreRecoversExpiredLeaseAtCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.LeaseNextRun("worker-a", time.Minute); err != nil {
+	firstLease, err := store.LeaseNextRun("worker-a", time.Minute)
+	if err != nil || firstLease == nil {
 		t.Fatal(err)
 	}
 	clock.Advance(time.Minute)
 	snapshot := clinicalTrialAuditStoreSnapshot(t, clock.Now())
-	if _, err := store.CheckpointRun(created.RunID, "worker-a", ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); !errors.Is(err, ErrClinicalTrialAuditLeaseExpired) {
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", firstLease.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); !errors.Is(err, ErrClinicalTrialAuditLeaseExpired) {
 		t.Fatalf("expired checkpoint = %v", err)
 	}
 	recovered, err := store.RecoverExpiredLeases()
 	if err != nil || recovered != 1 {
 		t.Fatalf("recover = %d, err=%v", recovered, err)
 	}
-	leased, err := store.LeaseNextRun("worker-b", time.Minute)
+	leased, err := store.LeaseNextRun("worker-a", time.Minute)
 	if err != nil || leased == nil || leased.RunID != created.RunID || leased.State != ClinicalTrialAuditRunCollecting || leased.Attempt != 1 {
 		t.Fatalf("re-lease = %#v, err=%v", leased, err)
+	}
+	if leased.LeaseToken == "" || leased.LeaseToken == firstLease.LeaseToken || leased.LeaseGeneration <= firstLease.LeaseGeneration {
+		t.Fatalf("lease was not fenced: first=%#v second=%#v", firstLease, leased)
+	}
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", firstLease.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); !errors.Is(err, ErrClinicalTrialAuditLeaseFence) {
+		t.Fatalf("stale same-owner checkpoint = %v", err)
+	}
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", leased.LeaseToken, ClinicalTrialAuditCheckpoint{State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}}); err != nil {
+		t.Fatalf("current fenced checkpoint: %v", err)
+	}
+}
+
+func TestClinicalTrialAuditStoreDefinesTerminalErrorCodeAllowlist(t *testing.T) {
+	want := []string{
+		ClinicalTrialAuditErrorIdentifierInvalid,
+		ClinicalTrialAuditErrorSourceNotFound,
+		ClinicalTrialAuditErrorSourceRateLimited,
+		ClinicalTrialAuditErrorSourceTimeout,
+		ClinicalTrialAuditErrorSourceSchemaInvalid,
+		ClinicalTrialAuditErrorModelTimeout,
+		ClinicalTrialAuditErrorModelInvalidOutput,
+		ClinicalTrialAuditErrorEvidenceInvalid,
+		ClinicalTrialAuditErrorRetryExhausted,
+		ClinicalTrialAuditErrorInternal,
+	}
+	for _, code := range want {
+		if err := validateClinicalTrialAuditErrorCode(code); err != nil {
+			t.Errorf("allowlisted code %q: %v", code, err)
+		}
+	}
+	for _, code := range []string{"", "arbitrary_lowercase", "token_value", "source timeout", strings.Repeat("x", clinicalTrialAuditErrorCodeMaxBytes+1)} {
+		if err := validateClinicalTrialAuditErrorCode(code); err == nil {
+			t.Errorf("unexpectedly accepted code %q", code)
+		}
 	}
 }
 
