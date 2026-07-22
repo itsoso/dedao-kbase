@@ -12,30 +12,34 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const (
-	ClinicalTrialsGovBaseURL                  = "https://clinicaltrials.gov"
-	ClinicalTrialsGovStudySourceType          = "clinicaltrials_gov_study"
-	ClinicalTrialsGovMaxStudyBytes            = 1 << 20
-	ClinicalTrialsGovMaxVersionBytes          = 64 << 10
-	ClinicalTrialsGovMaxRetryAfter            = time.Hour
-	ClinicalTrialsGovMaxRequestTimeout        = 2 * time.Minute
-	ClinicalTrialsGovMaxReportedOutcomes      = 256
-	ClinicalTrialsGovMaxResultGroups          = 128
-	ClinicalTrialsGovMaxResultClasses         = 256
-	ClinicalTrialsGovMaxResultCategories      = 512
-	ClinicalTrialsGovMaxGroupMeasurements     = 2048
-	ClinicalTrialsGovMaxResultDenominators    = 128
-	ClinicalTrialsGovMaxDenominatorCounts     = 2048
-	ClinicalTrialsGovMaxResultAnalyses        = 128
-	ClinicalTrialsGovMaxAnalysisGroups        = 128
-	ClinicalTrialsGovMaxProtocolConditions    = 512
-	ClinicalTrialsGovMaxProtocolArms          = 256
-	ClinicalTrialsGovMaxProtocolInterventions = 512
-	ClinicalTrialsGovMaxProtocolOutcomes      = 512
-	ClinicalTrialsGovMaxProtocolReferences    = 1024
+	ClinicalTrialsGovBaseURL                      = "https://clinicaltrials.gov"
+	ClinicalTrialsGovStudySourceType              = "clinicaltrials_gov_study"
+	ClinicalTrialsGovMaxStudyBytes                = 1 << 20
+	ClinicalTrialsGovMaxVersionBytes              = 64 << 10
+	ClinicalTrialsGovMaxRetryAfter                = time.Hour
+	ClinicalTrialsGovMaxRequestTimeout            = 2 * time.Minute
+	ClinicalTrialsGovMaxReportedOutcomes          = 256
+	ClinicalTrialsGovMaxResultGroups              = 128
+	ClinicalTrialsGovMaxResultClasses             = 256
+	ClinicalTrialsGovMaxResultCategories          = 512
+	ClinicalTrialsGovMaxGroupMeasurements         = 2048
+	ClinicalTrialsGovMaxResultDenominators        = 128
+	ClinicalTrialsGovMaxDenominatorCounts         = 2048
+	ClinicalTrialsGovMaxResultAnalyses            = 128
+	ClinicalTrialsGovMaxAnalysisGroups            = 128
+	ClinicalTrialsGovMaxProtocolConditions        = 512
+	ClinicalTrialsGovMaxProtocolArms              = 256
+	ClinicalTrialsGovMaxProtocolInterventions     = 512
+	ClinicalTrialsGovMaxProtocolOutcomes          = 512
+	ClinicalTrialsGovMaxProtocolReferences        = 1024
+	ClinicalTrialsGovMaxProtocolInterventionNames = 512
+	ClinicalTrialsGovMaxProtocolArmGroupLabels    = 256
+	ClinicalTrialsGovMaxProtocolOtherNames        = 256
 
 	clinicalTrialsGovUserAgent             = "dedao-kbase/clinical-trial-audit"
 	clinicalTrialsGovDefaultRequestTimeout = 20 * time.Second
@@ -201,6 +205,8 @@ type ClinicalTrialsGovResultAnalysis struct {
 	StatisticalMethod  string   `json:"statistical_method,omitempty"`
 	EffectParameter    string   `json:"effect_parameter,omitempty"`
 	EffectEstimate     string   `json:"effect_estimate,omitempty"`
+	DispersionType     string   `json:"dispersion_type,omitempty"`
+	DispersionValue    string   `json:"dispersion_value,omitempty"`
 	ConfidenceLevel    string   `json:"confidence_level,omitempty"`
 	ConfidenceSides    string   `json:"confidence_sides,omitempty"`
 	ConfidenceLower    string   `json:"confidence_lower,omitempty"`
@@ -431,6 +437,12 @@ func classifyClinicalTrialsGovTransportError(ctx context.Context, err error) err
 	if errors.Is(err, errClinicalTrialsGovRedirectBlocked) {
 		return &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorUpstream, cause: err}
 	}
+	if errors.As(err, &networkError) && networkError.Temporary() {
+		return &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorUpstream, cause: err, retryable: true}
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorUpstream, cause: err, retryable: true}
+	}
 	return &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorUpstream, cause: err}
 }
 
@@ -443,9 +455,12 @@ func classifyClinicalTrialsGovStatus(response *http.Response) error {
 		classified.Kind = ClinicalTrialsGovErrorRateLimited
 		classified.RetryAfter = parseClinicalTrialsGovRetryAfter(response.Header.Get("Retry-After"), time.Now())
 		classified.retryable = true
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		classified.Kind = ClinicalTrialsGovErrorUpstream
+		classified.retryable = true
 	default:
 		classified.Kind = ClinicalTrialsGovErrorUpstream
-		classified.retryable = response.StatusCode >= 500 && response.StatusCode <= 599
 	}
 	return classified
 }
@@ -510,6 +525,8 @@ type clinicalTrialsGovUpstreamAnalysis struct {
 	StatisticalMethod  string   `json:"statisticalMethod"`
 	EffectParameter    string   `json:"paramType"`
 	EffectEstimate     string   `json:"paramValue"`
+	DispersionType     string   `json:"dispersionType"`
+	DispersionValue    string   `json:"dispersionValue"`
 	ConfidenceLevel    string   `json:"ciPctValue"`
 	ConfidenceSides    string   `json:"ciNumSides"`
 	ConfidenceLower    string   `json:"ciLowerLimit"`
@@ -774,6 +791,12 @@ func clinicalTrialsGovArrayLimit(path []string, outcomeBounds *clinicalTrialsGov
 		return ClinicalTrialsGovMaxProtocolArms
 	case clinicalTrialsGovPathHasSuffix(path, "protocolSection", "armsInterventionsModule", "interventions"):
 		return ClinicalTrialsGovMaxProtocolInterventions
+	case clinicalTrialsGovPathHasSuffix(path, "protocolSection", "armsInterventionsModule", "armGroups", "interventionNames"):
+		return ClinicalTrialsGovMaxProtocolInterventionNames
+	case clinicalTrialsGovPathHasSuffix(path, "protocolSection", "armsInterventionsModule", "interventions", "armGroupLabels"):
+		return ClinicalTrialsGovMaxProtocolArmGroupLabels
+	case clinicalTrialsGovPathHasSuffix(path, "protocolSection", "armsInterventionsModule", "interventions", "otherNames"):
+		return ClinicalTrialsGovMaxProtocolOtherNames
 	case clinicalTrialsGovPathHasSuffix(path, "protocolSection", "outcomesModule", "primaryOutcomes"),
 		clinicalTrialsGovPathHasSuffix(path, "protocolSection", "outcomesModule", "secondaryOutcomes"):
 		return ClinicalTrialsGovMaxProtocolOutcomes
@@ -1059,6 +1082,8 @@ func normalizeClinicalTrialsGovReportedOutcome(value clinicalTrialsGovUpstreamRe
 			StatisticalMethod:  strings.TrimSpace(valueAnalysis.StatisticalMethod),
 			EffectParameter:    strings.TrimSpace(valueAnalysis.EffectParameter),
 			EffectEstimate:     strings.TrimSpace(valueAnalysis.EffectEstimate),
+			DispersionType:     strings.TrimSpace(valueAnalysis.DispersionType),
+			DispersionValue:    strings.TrimSpace(valueAnalysis.DispersionValue),
 			ConfidenceLevel:    strings.TrimSpace(valueAnalysis.ConfidenceLevel),
 			ConfidenceSides:    strings.TrimSpace(valueAnalysis.ConfidenceSides),
 			ConfidenceLower:    strings.TrimSpace(valueAnalysis.ConfidenceLower),

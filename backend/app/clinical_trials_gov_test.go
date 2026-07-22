@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -92,6 +93,8 @@ const clinicalTrialsGovStudyFixture = `{
 		  "statisticalMethod": "ANCOVA",
 		  "paramType": "MEAN_DIFFERENCE",
 		  "paramValue": "3.2",
+		  "dispersionType": "STANDARD_ERROR",
+		  "dispersionValue": "0.8",
 		  "ciPctValue": "95",
 		  "ciNumSides": "TWO_SIDED",
 		  "ciLowerLimit": "1.1",
@@ -196,7 +199,7 @@ func TestClinicalTrialsGovGetStudyNormalizesCurrentRecord(t *testing.T) {
 		t.Fatalf("reported analyses = %#v", reported.Analyses)
 	}
 	analysis := reported.Analyses[0]
-	if strings.Join(analysis.GroupIDs, ",") != "FG000,FG001" || analysis.PValue != "0.004" || analysis.StatisticalMethod != "ANCOVA" || analysis.EffectParameter != "MEAN_DIFFERENCE" || analysis.EffectEstimate != "3.2" || analysis.ConfidenceLevel != "95" || analysis.ConfidenceLower != "1.1" || analysis.ConfidenceUpper != "5.3" {
+	if strings.Join(analysis.GroupIDs, ",") != "FG000,FG001" || analysis.PValue != "0.004" || analysis.StatisticalMethod != "ANCOVA" || analysis.EffectParameter != "MEAN_DIFFERENCE" || analysis.EffectEstimate != "3.2" || analysis.DispersionType != "STANDARD_ERROR" || analysis.DispersionValue != "0.8" || analysis.ConfidenceLevel != "95" || analysis.ConfidenceLower != "1.1" || analysis.ConfidenceUpper != "5.3" {
 		t.Fatalf("reported analysis = %#v", analysis)
 	}
 	if result.Snapshot.SourceType != ClinicalTrialsGovStudySourceType || result.Snapshot.CanonicalID != "NCT01234567" || result.Snapshot.LicenseScope != "public_metadata" {
@@ -258,13 +261,13 @@ func TestClinicalTrialsGovSnapshotIdentityIsCanonical(t *testing.T) {
 	}
 
 	apiVersion = "2.0.4"
-	studyBody = strings.Replace(clinicalTrialsGovStudyFixture, `"pValue": "0.004"`, `"pValue": "0.005"`, 1)
+	studyBody = strings.Replace(clinicalTrialsGovStudyFixture, `"dispersionValue": "0.8"`, `"dispersionValue": "0.9"`, 1)
 	analysisChanged, err := client.GetStudy(context.Background(), "NCT01234567")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if analysisChanged.Snapshot.ContentHash == first.Snapshot.ContentHash {
-		t.Fatal("reported analysis change must change content hash")
+		t.Fatal("reported analysis dispersion change must change content hash")
 	}
 
 	studyBody = strings.Replace(clinicalTrialsGovStudyFixture, `"count": 240`, `"count": 241`, 1)
@@ -461,22 +464,51 @@ func TestClinicalTrialsGovRejectsResultsSchemaDriftAndBounds(t *testing.T) {
 }
 
 func TestClinicalTrialsGovRejectsProtocolCollectionBounds(t *testing.T) {
-	conditions := strings.Join(repeatClinicalTrialsGovFixture(`"Synthetic condition"`, ClinicalTrialsGovMaxProtocolConditions+1), ",")
-	body := strings.Replace(clinicalTrialsGovStudyFixture, `"conditions": ["Synthetic condition", "Evidence disorder"]`, `"conditions": [`+conditions+`]`, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v2/version" {
-			fmt.Fprint(w, clinicalTrialsGovVersionFixture)
-			return
-		}
-		fmt.Fprint(w, body)
-	}))
-	defer server.Close()
-	client, err := newClinicalTrialsGovClient(server.Client(), server.URL)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name     string
+		original string
+		field    string
+		value    string
+		limit    int
+	}{
+		{name: "conditions", original: `"conditions": ["Synthetic condition", "Evidence disorder"]`, field: "conditions", value: `"Synthetic condition"`, limit: ClinicalTrialsGovMaxProtocolConditions},
+		{name: "arm intervention names", original: `"interventionNames": ["DRUG: Study drug"]`, field: "interventionNames", value: `"DRUG: Synthetic"`, limit: ClinicalTrialsGovMaxProtocolInterventionNames},
+		{name: "intervention arm labels", original: `"armGroupLabels": ["Experimental"]`, field: "armGroupLabels", value: `"Experimental"`, limit: ClinicalTrialsGovMaxProtocolArmGroupLabels},
+		{name: "intervention other names", original: `"otherNames": ["Compound S"]`, field: "otherNames", value: `"Synthetic alias"`, limit: ClinicalTrialsGovMaxProtocolOtherNames},
 	}
-	_, err = client.GetStudy(context.Background(), "NCT01234567")
-	assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorSchemaInvalid)
+	for _, test := range tests {
+		for _, boundary := range []struct {
+			name    string
+			count   int
+			invalid bool
+		}{
+			{name: "at limit", count: test.limit},
+			{name: "over limit", count: test.limit + 1, invalid: true},
+		} {
+			t.Run(test.name+"/"+boundary.name, func(t *testing.T) {
+				values := strings.Join(repeatClinicalTrialsGovFixture(test.value, boundary.count), ",")
+				body := strings.Replace(clinicalTrialsGovStudyFixture, test.original, `"`+test.field+`": [`+values+`]`, 1)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/api/v2/version" {
+						fmt.Fprint(w, clinicalTrialsGovVersionFixture)
+						return
+					}
+					fmt.Fprint(w, body)
+				}))
+				defer server.Close()
+				client, err := newClinicalTrialsGovClient(server.Client(), server.URL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = client.GetStudy(context.Background(), "NCT01234567")
+				if boundary.invalid {
+					assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorSchemaInvalid)
+				} else if err != nil {
+					t.Fatalf("GetStudy() at limit error = %v", err)
+				}
+			})
+		}
+	}
 }
 
 func TestClinicalTrialsGovRejectsInvalidResultGroupReferences(t *testing.T) {
@@ -544,8 +576,14 @@ func TestClinicalTrialsGovRetryClassification(t *testing.T) {
 		{name: "unauthorized", status: http.StatusUnauthorized},
 		{name: "forbidden", status: http.StatusForbidden},
 		{name: "not found", status: http.StatusNotFound},
+		{name: "request timeout", status: http.StatusRequestTimeout, retryable: true},
 		{name: "rate limited", status: http.StatusTooManyRequests, retryable: true},
-		{name: "server error", status: http.StatusServiceUnavailable, retryable: true},
+		{name: "internal server error", status: http.StatusInternalServerError, retryable: true},
+		{name: "bad gateway", status: http.StatusBadGateway, retryable: true},
+		{name: "service unavailable", status: http.StatusServiceUnavailable, retryable: true},
+		{name: "gateway timeout", status: http.StatusGatewayTimeout, retryable: true},
+		{name: "not implemented", status: http.StatusNotImplemented},
+		{name: "HTTP version unsupported", status: http.StatusHTTPVersionNotSupported},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -564,6 +602,32 @@ func TestClinicalTrialsGovRetryClassification(t *testing.T) {
 			}
 			if classified.Retryable() != test.retryable {
 				t.Fatalf("Retryable() = %v, want %v for status %d", classified.Retryable(), test.retryable, test.status)
+			}
+		})
+	}
+}
+
+func TestClinicalTrialsGovTemporaryTransportFailuresAreRetryable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "temporary DNS", err: clinicalTrialsGovTemporaryNetworkError{}},
+		{name: "connection reset", err: syscall.ECONNRESET},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			httpClient := &http.Client{Transport: clinicalTrialsGovRoundTripFunc(func(*http.Request) (*http.Response, error) {
+				return nil, test.err
+			})}
+			client, err := newClinicalTrialsGovClient(httpClient, "https://clinicaltrials.gov")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = client.GetStudy(context.Background(), "NCT01234567")
+			classified := assertClinicalTrialsGovError(t, err, ClinicalTrialsGovErrorUpstream)
+			if !classified.Retryable() {
+				t.Fatal("temporary transport failure must be retryable")
 			}
 		})
 	}
@@ -663,3 +727,11 @@ type clinicalTrialsGovRoundTripFunc func(*http.Request) (*http.Response, error)
 func (function clinicalTrialsGovRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
 }
+
+type clinicalTrialsGovTemporaryNetworkError struct{}
+
+func (clinicalTrialsGovTemporaryNetworkError) Error() string {
+	return "synthetic temporary DNS failure"
+}
+func (clinicalTrialsGovTemporaryNetworkError) Timeout() bool   { return false }
+func (clinicalTrialsGovTemporaryNetworkError) Temporary() bool { return true }
