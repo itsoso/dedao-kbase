@@ -566,6 +566,63 @@ func TestWeChatAgentDrainsAllAvailablePagesInOneRunNewestFirst(t *testing.T) {
 	}
 }
 
+func TestWeChatAgentSkipsUntitledArticleAndContinuesRun(t *testing.T) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.URL.Path == "/untitled" {
+			fmt.Fprint(w, `<html><body><a id="js_name">Account</a><div id="js_content"><p>This untitled article still has enough content to parse.</p></div></body></html>`)
+			return
+		}
+		fmt.Fprint(w, `<html><body><h1 id="activity-name">Valid article</h1><a id="js_name">Account</a><div id="js_content"><p>This valid article must still be synchronized after a malformed item.</p></div></body></html>`)
+	}))
+	defer articleServer.Close()
+
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		publications := []map[string]any{}
+		if r.URL.Query().Get("begin") == "0" {
+			for _, article := range []WeChatOfficialArticle{
+				{Link: articleServer.URL + "/untitled", AID: "untitled", UpdateTime: 200},
+				{Title: "Valid article", Link: articleServer.URL + "/valid", AID: "valid", UpdateTime: 100},
+			} {
+				publishInfo, _ := json.Marshal(map[string]any{"appmsgex": []WeChatOfficialArticle{article}})
+				publications = append(publications, map[string]any{"publish_info": string(publishInfo)})
+			}
+		}
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": publications})
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 0}, "publish_page": string(publishPage)})
+	}))
+	defer discoveryServer.Close()
+
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery, Source: newTestWeChatSourceService(t, articleServer)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSourceEnvelopeSink{}
+	result, err := adapter.Execute(context.Background(), SourceSyncRun{
+		ID:                 "run-untitled",
+		RequestedOperation: "sync_articles",
+		Subscription: &SourceSubscription{
+			SourceAccountKey: "account-key",
+			SourceAccount:    "Account",
+			Options:          map[string]any{"page_size": float64(10), "max_items": float64(10)},
+		},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.envelopes) != 1 || sink.envelopes[0].SourceItemID != "valid" {
+		t.Fatalf("envelopes=%#v", sink.envelopes)
+	}
+	if len(result.Failures) != 1 || result.Failures[0].SourceItemKey != "untitled" {
+		t.Fatalf("failures=%#v", result.Failures)
+	}
+}
+
 func TestWeChatAgentSetsInitialFrontierToNewestFilteredMatch(t *testing.T) {
 	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<html><body><h1 id="activity-name">%s</h1><a id="js_name">Account</a><div id="js_content"><p>This filtered article contains enough content for frontier testing.</p></div></body></html>`, r.URL.Path)
