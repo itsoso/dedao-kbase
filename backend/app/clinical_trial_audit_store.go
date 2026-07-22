@@ -98,12 +98,13 @@ type ClinicalTrialAuditPage struct {
 }
 
 type ClinicalTrialAuditStore struct {
-	root            string
-	dbPath          string
-	now             func() time.Time
-	random          io.Reader
-	db              *sql.DB
-	afterRunRowRead func()
+	root                   string
+	dbPath                 string
+	now                    func() time.Time
+	random                 io.Reader
+	db                     *sql.DB
+	afterRunRowRead        func()
+	beforeLeaseFinalUpdate func()
 }
 
 func NewClinicalTrialAuditStore(root string) (*ClinicalTrialAuditStore, error) {
@@ -506,8 +507,8 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	if err := validateClinicalTrialAuditCheckpointEvidence(checkpoint); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
-	operationNow := s.now().UTC()
-	operationTimestamp := operationNow.Format(time.RFC3339Nano)
+	validationNow := s.now().UTC()
+	validationTimestamp := validationNow.Format(time.RFC3339Nano)
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -528,7 +529,7 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	if run.leaseTokenHash == "" || run.leaseTokenHash != leaseTokenHash {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseFence
 	}
-	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, operationNow) {
+	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, validationNow) {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
 	}
 	if !validClinicalTrialAuditTransition(run.State, checkpoint.State) {
@@ -545,7 +546,7 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 		contractRun := ClinicalTrialAuditRun{
 			SchemaVersion: ClinicalTrialAuditRunSchemaVersion,
 			RunID:         run.RunID, State: checkpoint.State, Request: run.Request, Audit: &audit,
-			CreatedAt: run.CreatedAt, UpdatedAt: operationTimestamp,
+			CreatedAt: run.CreatedAt, UpdatedAt: validationTimestamp,
 		}
 		if _, err := FinalizeClinicalTrialAuditRun(contractRun); err != nil {
 			return ClinicalTrialAuditStoredRun{}, err
@@ -561,6 +562,9 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 	if err := persistClinicalTrialAuditCheckpoint(tx, runID, checkpoint); err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
+	if err := acquireClinicalTrialAuditLeaseWriteLock(tx, runID, run.State, workerID, leaseTokenHash); err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
 	leaseOwner := run.LeaseOwner
 	storedLeaseTokenHash := run.leaseTokenHash
 	leaseExpiresAt := run.LeaseExpiresAt
@@ -569,13 +573,17 @@ func (s *ClinicalTrialAuditStore) CheckpointRun(runID, workerID, leaseToken stri
 		storedLeaseTokenHash = ""
 		leaseExpiresAt = ""
 	}
+	if s.beforeLeaseFinalUpdate != nil {
+		s.beforeLeaseFinalUpdate()
+	}
+	freshTimestamp := s.now().UTC().Format(time.RFC3339Nano)
 	result, err := tx.Exec(`
 		UPDATE clinical_trial_audit_runs SET state = ?, retryable = ?, error_code = ?,
 			lease_owner = ?, lease_token_hash = ?, lease_expires_at = ?, updated_at = ?
 		WHERE run_id = ? AND state = ? AND lease_owner = ? AND lease_token_hash = ?
 			AND julianday(lease_expires_at) > julianday(?)
 	`, checkpoint.State, boolToClinicalTrialAuditInt(checkpoint.Retryable), strings.TrimSpace(checkpoint.ErrorCode),
-		leaseOwner, storedLeaseTokenHash, leaseExpiresAt, operationTimestamp, runID, run.State, workerID, leaseTokenHash, operationTimestamp)
+		leaseOwner, storedLeaseTokenHash, leaseExpiresAt, freshTimestamp, runID, run.State, workerID, leaseTokenHash, freshTimestamp)
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
@@ -598,8 +606,7 @@ func (s *ClinicalTrialAuditStore) RenewLease(runID, workerID, leaseToken string,
 	if leaseDuration <= 0 {
 		leaseDuration = 2 * time.Minute
 	}
-	operationNow := s.now().UTC()
-	operationTimestamp := operationNow.Format(time.RFC3339Nano)
+	validationNow := s.now().UTC()
 	leaseTokenHash := hashClinicalTrialValue(leaseToken)
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -619,18 +626,33 @@ func (s *ClinicalTrialAuditStore) RenewLease(runID, workerID, leaseToken string,
 	if run.leaseTokenHash == "" || run.leaseTokenHash != leaseTokenHash {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseFence
 	}
-	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, operationNow) {
+	if clinicalTrialAuditLeaseExpired(run.LeaseExpiresAt, validationNow) {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
 	}
 	if !isActiveClinicalTrialAuditState(run.State) {
 		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditInvalidTransition
 	}
-	newExpiry := operationNow.Add(leaseDuration).Format(time.RFC3339Nano)
+	existingExpiry, err := time.Parse(time.RFC3339Nano, run.LeaseExpiresAt)
+	if err != nil {
+		return ClinicalTrialAuditStoredRun{}, ErrClinicalTrialAuditLeaseExpired
+	}
+	if err := acquireClinicalTrialAuditLeaseWriteLock(tx, runID, run.State, workerID, leaseTokenHash); err != nil {
+		return ClinicalTrialAuditStoredRun{}, err
+	}
+	if s.beforeLeaseFinalUpdate != nil {
+		s.beforeLeaseFinalUpdate()
+	}
+	freshNow := s.now().UTC()
+	freshTimestamp := freshNow.Format(time.RFC3339Nano)
+	newExpiry := freshNow.Add(leaseDuration)
+	if existingExpiry.After(newExpiry) {
+		newExpiry = existingExpiry
+	}
 	result, err := tx.Exec(`
 		UPDATE clinical_trial_audit_runs SET lease_expires_at = ?, updated_at = ?
 		WHERE run_id = ? AND state = ? AND lease_owner = ? AND lease_token_hash = ?
 			AND julianday(lease_expires_at) > julianday(?)
-	`, newExpiry, operationTimestamp, run.RunID, run.State, workerID, leaseTokenHash, operationTimestamp)
+	`, newExpiry.UTC().Format(time.RFC3339Nano), freshTimestamp, run.RunID, run.State, workerID, leaseTokenHash, freshTimestamp)
 	if err != nil {
 		return ClinicalTrialAuditStoredRun{}, err
 	}
@@ -966,6 +988,20 @@ func isTerminalClinicalTrialAuditState(state string) bool {
 	default:
 		return false
 	}
+}
+
+func acquireClinicalTrialAuditLeaseWriteLock(tx *sql.Tx, runID, state, workerID, leaseTokenHash string) error {
+	result, err := tx.Exec(`
+		UPDATE clinical_trial_audit_runs SET lease_generation = lease_generation
+		WHERE run_id = ? AND state = ? AND lease_owner = ? AND lease_token_hash = ?
+	`, runID, state, workerID, leaseTokenHash)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows != 1 {
+		return ErrClinicalTrialAuditLeaseFence
+	}
+	return nil
 }
 
 func recoverExpiredClinicalTrialAuditLeases(tx *sql.Tx, now string) (int64, error) {

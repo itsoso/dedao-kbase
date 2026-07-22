@@ -480,6 +480,38 @@ func TestClinicalTrialAuditStoreRecoversExpiredLeaseAtCheckpoint(t *testing.T) {
 	}
 }
 
+func TestClinicalTrialAuditStoreRollsBackCheckpointWhenLeaseExpiresBeforeFinalFence(t *testing.T) {
+	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 17, 30, 0, 0, time.UTC))
+	store, err := newClinicalTrialAuditStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000013"}, "checkpoint-expiry-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.LeaseNextRun("worker-a", time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("lease=%#v err=%v", lease, err)
+	}
+	clock.Advance(59 * time.Second)
+	store.beforeLeaseFinalUpdate = func() { clock.Advance(2 * time.Second) }
+	snapshot := clinicalTrialAuditStoreSnapshot(t, clock.Now())
+	if _, err := store.CheckpointRun(created.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+		State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot},
+	}); !errors.Is(err, ErrClinicalTrialAuditLeaseExpired) {
+		t.Fatalf("checkpoint expiry race = %v", err)
+	}
+	current, err := store.GetRun(created.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.State != ClinicalTrialAuditRunCollecting || len(current.Sources) != 0 {
+		t.Fatalf("expired checkpoint leaked partial evidence = %#v", current)
+	}
+}
+
 func TestClinicalTrialAuditStoreRenewsOnlyCurrentUnexpiredLease(t *testing.T) {
 	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 18, 0, 0, 0, time.UTC))
 	store, err := newClinicalTrialAuditStore(t.TempDir(), clock.Now)
@@ -518,6 +550,45 @@ func TestClinicalTrialAuditStoreRenewsOnlyCurrentUnexpiredLease(t *testing.T) {
 	current, err := store.GetRun(created.RunID)
 	if err != nil || current.State != ClinicalTrialAuditRunCollecting {
 		t.Fatalf("expired mutation changed run = %#v err=%v", current, err)
+	}
+}
+
+func TestClinicalTrialAuditStoreRenewUsesFreshFenceAndNeverShortensLease(t *testing.T) {
+	clock := newClinicalTrialAuditStoreTestClock(time.Date(2026, 7, 22, 18, 30, 0, 0, time.UTC))
+	store, err := newClinicalTrialAuditStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT00000014"}, "renew-fresh-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.LeaseNextRun("worker-a", 5*time.Minute)
+	if err != nil || lease == nil {
+		t.Fatalf("lease=%#v err=%v", lease, err)
+	}
+	originalExpiry := lease.LeaseExpiresAt
+	clock.Advance(30 * time.Second)
+	renewed, err := store.RenewLease(created.RunID, "worker-a", lease.LeaseToken, time.Minute)
+	if err != nil {
+		t.Fatalf("short renewal: %v", err)
+	}
+	if renewed.LeaseExpiresAt != originalExpiry {
+		t.Fatalf("renewal shortened lease: original=%q renewed=%q", originalExpiry, renewed.LeaseExpiresAt)
+	}
+
+	clock.Advance(4*time.Minute + 29*time.Second)
+	store.beforeLeaseFinalUpdate = func() { clock.Advance(2 * time.Second) }
+	if _, err := store.RenewLease(created.RunID, "worker-a", lease.LeaseToken, 2*time.Minute); !errors.Is(err, ErrClinicalTrialAuditLeaseExpired) {
+		t.Fatalf("renew expiry race = %v", err)
+	}
+	current, err := store.GetRun(created.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.LeaseExpiresAt != originalExpiry {
+		t.Fatalf("expired renewal changed lease: original=%q current=%q", originalExpiry, current.LeaseExpiresAt)
 	}
 }
 
