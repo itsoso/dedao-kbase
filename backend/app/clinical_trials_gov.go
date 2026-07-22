@@ -47,6 +47,7 @@ const (
 	ClinicalTrialsGovMaxFlowDropWithdraws                       = 512
 	ClinicalTrialsGovMaxFlowReasons                             = 4096
 	ClinicalTrialsGovCoverageLimitationResultsModulesExcludedV1 = "results_modules_excluded_v1"
+	clinicalTrialsGovLegacyCoverageLimitationResultsModulesV1   = "ClinicalTrials.gov baseline characteristics, adverse events, and more-info modules are outside v1 normalized evidence coverage."
 
 	clinicalTrialsGovUserAgent             = "dedao-kbase/clinical-trial-audit"
 	clinicalTrialsGovDefaultRequestTimeout = 20 * time.Second
@@ -613,6 +614,34 @@ func finalizeClinicalTrialsGovEvidencePayload(evidence ClinicalTrialAuditEvidenc
 	evidence.ContentHash = contentHash
 	evidence.Data = canonical
 	return evidence, nil
+}
+
+func migrateClinicalTrialsGovV1EvidenceData(data json.RawMessage) (json.RawMessage, string, string, error) {
+	var study ClinicalTrialsGovStudy
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&study); err != nil {
+		return nil, "", "", err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, "", "", fmt.Errorf("legacy ClinicalTrials.gov evidence must contain one JSON value")
+	}
+	legacyCanonical, err := json.Marshal(study)
+	if err != nil {
+		return nil, "", "", err
+	}
+	if !clinicalTrialsGovStringSetEquals(study.Coverage.Limitations, []string{clinicalTrialsGovLegacyCoverageLimitationResultsModulesV1}) {
+		return nil, "", "", fmt.Errorf("unsupported legacy ClinicalTrials.gov coverage limitations")
+	}
+	study.Coverage.Limitations = []string{ClinicalTrialsGovCoverageLimitationResultsModulesExcludedV1}
+	if err := ValidateClinicalTrialsGovStudy(study); err != nil {
+		return nil, "", "", err
+	}
+	canonical, err := json.Marshal(study)
+	if err != nil {
+		return nil, "", "", err
+	}
+	return canonical, hashClinicalTrialValue(string(legacyCanonical)), hashClinicalTrialValue(string(canonical)), nil
 }
 
 type clinicalTrialsGovOption func(*ClinicalTrialsGovClient)

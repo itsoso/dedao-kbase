@@ -290,6 +290,9 @@ func validateClinicalTrialAudit(audit ClinicalTrialAudit, requireFindings bool) 
 		if source.Fingerprint != finalized.Fingerprint {
 			return fmt.Errorf("sources[%d].fingerprint does not match source content", index)
 		}
+		if source.ProvenanceDigest == "" || source.ProvenanceDigest != finalized.ProvenanceDigest {
+			return fmt.Errorf("sources[%d].provenance_digest does not match source retrieval provenance", index)
+		}
 		if _, exists := sourceFingerprints[source.Fingerprint]; exists {
 			return fmt.Errorf("duplicate source fingerprint %q", source.Fingerprint)
 		}

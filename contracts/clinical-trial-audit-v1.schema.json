@@ -24,7 +24,7 @@
     },
     "source_snapshot": {
       "type": "object",
-      "required": ["source_type", "canonical_id", "retrieved_at", "content_hash", "fingerprint", "license_scope"],
+      "required": ["source_type", "canonical_id", "retrieved_at", "content_hash", "fingerprint", "provenance_digest", "license_scope"],
       "properties": {
         "source_type": { "type": "string", "minLength": 1 },
         "canonical_id": { "type": "string", "minLength": 1 },
@@ -36,6 +36,12 @@
         "provenance_digest": { "$ref": "#/$defs/sha256" },
         "license_scope": { "type": "string", "minLength": 1 }
       },
+      "allOf": [
+        {
+          "if": { "properties": { "source_type": { "const": "clinicaltrials_gov_study" } }, "required": ["source_type"] },
+          "then": { "required": ["data_timestamp"] }
+        }
+      ],
       "additionalProperties": false
     },
     "citation": {

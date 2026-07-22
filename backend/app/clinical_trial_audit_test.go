@@ -121,6 +121,14 @@ func TestClinicalTrialSourceSnapshotProtectsRetrievalProvenanceSeparately(t *tes
 	}
 }
 
+func TestClinicalTrialAuditRejectsMissingSourceProvenanceDigest(t *testing.T) {
+	audit := validClinicalTrialAudit(t)
+	audit.Sources[0].ProvenanceDigest = ""
+	if err := ValidateClinicalTrialAudit(audit); err == nil || !strings.Contains(err.Error(), "provenance_digest") {
+		t.Fatalf("missing provenance digest error = %v", err)
+	}
+}
+
 func TestClinicalTrialTimestampsAreParsedAndCanonicalized(t *testing.T) {
 	snapshot, err := FinalizeClinicalTrialSourceSnapshot(ClinicalTrialSourceSnapshot{
 		SourceType:        "clinicaltrials.gov",
@@ -406,10 +414,21 @@ func TestClinicalTrialAuditJSONSchemaMirrorsRunAndCollectionBoundaries(t *testin
 	defs := schema["$defs"].(map[string]any)
 	snapshot := defs["source_snapshot"].(map[string]any)
 	snapshotProperties := snapshot["properties"].(map[string]any)
+	requiredSnapshotFields := make(map[string]bool)
+	for _, field := range snapshot["required"].([]any) {
+		requiredSnapshotFields[field.(string)] = true
+	}
 	for _, field := range []string{"data_timestamp", "provenance_digest"} {
 		if snapshotProperties[field] == nil {
 			t.Fatalf("source snapshot schema is missing %s", field)
 		}
+	}
+	if !requiredSnapshotFields["provenance_digest"] {
+		t.Fatal("source snapshot schema does not require provenance_digest")
+	}
+	snapshotConditions := snapshot["allOf"].([]any)
+	if len(snapshotConditions) != 1 || firstRequiredClinicalTrialSchemaField(snapshotConditions[0].(map[string]any)["then"]) != "data_timestamp" {
+		t.Fatal("ClinicalTrials.gov source snapshot schema does not conditionally require data_timestamp")
 	}
 	audit := defs["audit"].(map[string]any)
 	auditProperties := audit["properties"].(map[string]any)
