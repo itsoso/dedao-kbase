@@ -143,7 +143,11 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 			if publishedAt == "" && item.UpdateTime > 0 {
 				publishedAt = time.Unix(item.UpdateTime, 0).UTC().Format(time.RFC3339)
 			}
-			envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: weChatArticleIdempotencyKey(run.Subscription.SourceAccountKey, item.ArticleKey, item.UpdateTime, content), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: publishedAt, Content: content, ContentFormat: "markdown"}
+			title := strings.TrimSpace(article.Title)
+			if title == "" {
+				title = strings.TrimSpace(item.Title)
+			}
+			envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: weChatArticleIdempotencyKey(run.Subscription.SourceAccountKey, item.ArticleKey, item.UpdateTime, content), Title: title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: publishedAt, Content: content, ContentFormat: "markdown"}
 			itemErr := mediaErr
 			if _, err := sink.Enqueue(run.ID, envelope); err != nil {
 				if errors.Is(err, ErrSourceArticleContentTooShort) || errors.Is(err, ErrSourceArticleInvalidURL) {

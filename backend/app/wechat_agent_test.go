@@ -485,6 +485,10 @@ func TestWeChatAgentCommitsFrontierAndOnlyProcessesNewArticles(t *testing.T) {
 func TestWeChatAgentDrainsAllAvailablePagesInOneRunNewestFirst(t *testing.T) {
 	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if r.URL.Path == "/oldest" {
+			fmt.Fprint(w, `<html><body><a id="js_name">Account</a><div id="js_content"><p>This article contains enough content to verify a missing parsed title fallback.</p></div></body></html>`)
+			return
+		}
 		fmt.Fprintf(w, `<html><body><h1 id="activity-name">%s</h1><a id="js_name">Account</a><div id="js_content"><p>This article contains enough content to verify a complete subscription sync.</p></div></body></html>`, r.URL.Path)
 	}))
 	defer articleServer.Close()
@@ -539,6 +543,9 @@ func TestWeChatAgentDrainsAllAvailablePagesInOneRunNewestFirst(t *testing.T) {
 	}
 	if got := []string{sink.envelopes[0].SourceItemID, sink.envelopes[1].SourceItemID, sink.envelopes[2].SourceItemID}; !reflect.DeepEqual(got, []string{"newest", "second", "oldest"}) {
 		t.Fatalf("processed order=%v", got)
+	}
+	if sink.envelopes[2].Title != "Oldest" {
+		t.Fatalf("fallback title=%q", sink.envelopes[2].Title)
 	}
 	if got := []string{sink.envelopes[0].PublishedAt, sink.envelopes[1].PublishedAt, sink.envelopes[2].PublishedAt}; !reflect.DeepEqual(got, []string{
 		time.Unix(300, 0).UTC().Format(time.RFC3339),
