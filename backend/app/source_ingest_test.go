@@ -153,6 +153,81 @@ func TestIngestSourceArticleIsIdempotentAndUpdatesKnowledge(t *testing.T) {
 	}
 }
 
+func TestIngestSourceArticleBackfillsMetadataWithoutRebuildingKnowledge(t *testing.T) {
+	clock := newSourceSyncTestClock(time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC))
+	root := t.TempDir()
+	bookStore := NewBookKnowledgeStore(root)
+	syncStore, err := newSourceSyncStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syncStore.Close()
+	subscription := createSourceIngestSubscription(t, syncStore)
+	ingestor := newSourceIngestService(bookStore, syncStore, clock.Now)
+	envelope := SourceArticleEnvelope{
+		IdempotencyKey:  "metadata-v1",
+		SourceType:      "wechat_mp_article",
+		SourceAccountID: "account-key",
+		SourceAccount:   "Account",
+		SourceItemID:    "article-metadata",
+		Title:           "Metadata backfill",
+		SourceURL:       "https://mp.weixin.qq.com/s/article-metadata",
+		Content:         "# Metadata backfill\n\n" + strings.Repeat("This article has stable content for metadata-only ingestion. ", 20),
+		ContentFormat:   "markdown",
+	}
+	firstRun := createRunningSourceIngestRun(t, syncStore, subscription.ID, "agent-a")
+	first, err := ingestor.IngestArticle(firstRun.ID, "agent-a", envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := syncStore.CompleteRun(firstRun.ID, "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := bookStore.LoadPackage(first.TargetBookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	analysisBefore, err := bookStore.LoadAnalysisManifest(first.TargetBookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clock.Advance(time.Hour)
+	secondRun := createRunningSourceIngestRun(t, syncStore, subscription.ID, "agent-a")
+	backfill := envelope
+	backfill.IdempotencyKey = "metadata-v2"
+	backfill.PublishedAt = "2026-07-17T05:52:36Z"
+	receipt, err := ingestor.IngestArticle(secondRun.ID, "agent-a", backfill)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Outcome != SourceItemUpdated {
+		t.Fatalf("outcome=%q", receipt.Outcome)
+	}
+	after, err := bookStore.LoadPackage(first.TargetBookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Book.PublishedAt != backfill.PublishedAt || after.Book.UpdatedAt == before.Book.UpdatedAt {
+		t.Fatalf("book before=%#v after=%#v", before.Book, after.Book)
+	}
+	if !reflect.DeepEqual(after.Chunks, before.Chunks) || !reflect.DeepEqual(after.Claims, before.Claims) {
+		t.Fatal("metadata backfill rebuilt knowledge content")
+	}
+	for _, citation := range after.Citations {
+		if citation.PublishedAt != backfill.PublishedAt {
+			t.Fatalf("citation=%#v", citation)
+		}
+	}
+	analysisAfter, err := bookStore.LoadAnalysisManifest(first.TargetBookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(analysisAfter, analysisBefore) {
+		t.Fatalf("analysis changed: before=%#v after=%#v", analysisBefore, analysisAfter)
+	}
+}
+
 func TestIngestSourceArticleRejectsShortContentWithoutManifest(t *testing.T) {
 	root := t.TempDir()
 	bookStore := NewBookKnowledgeStore(root)
