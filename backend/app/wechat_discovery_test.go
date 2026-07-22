@@ -47,6 +47,28 @@ func TestWeChatDiscoveryReportsPublicationProgress(t *testing.T) {
 	}
 }
 
+func TestWeChatDiscoveryOrdersArticlesNewestFirst(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"base_resp":{"ret":0},"publish_page":"{\"publish_list\":[{\"publish_info\":\"{\\\"appmsgex\\\":[{\\\"title\\\":\\\"Older\\\",\\\"link\\\":\\\"https://mp.weixin.qq.com/s/older\\\",\\\"aid\\\":\\\"older\\\",\\\"update_time\\\":100},{\\\"title\\\":\\\"Newest\\\",\\\"link\\\":\\\"https://mp.weixin.qq.com/s/newest\\\",\\\"aid\\\":\\\"newest\\\",\\\"update_time\\\":300},{\\\"title\\\":\\\"Middle\\\",\\\"link\\\":\\\"https://mp.weixin.qq.com/s/middle\\\",\\\"aid\\\":\\\"middle\\\",\\\"update_time\\\":200}]}\"}]}"}`)
+	}))
+	defer server.Close()
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{
+		BaseURL:         server.URL,
+		HTTPClient:      server.Client(),
+		SessionProvider: staticWeChatSessionProvider{session: WeChatMPSession{Token: "test-value"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := discovery.Discover(context.Background(), "account-key", WeChatDiscoveryCursor{}, 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Articles) != 3 || page.Articles[0].ArticleKey != "newest" || page.Articles[1].ArticleKey != "middle" || page.Articles[2].ArticleKey != "older" {
+		t.Fatalf("articles=%#v", page.Articles)
+	}
+}
+
 func TestWeChatDiscoveryAdvancesFilteredEmptyPage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("begin") != "7" {

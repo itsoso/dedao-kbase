@@ -74,89 +74,105 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	}
 	pageSize := sourceAgentOptionInt(run.Subscription.Options, "page_size", 10, 20)
 	maxItems := sourceAgentOptionInt(run.Subscription.Options, "max_items", 100, 100)
-	discoveryCursor := WeChatDiscoveryCursor{
-		Begin:          cursor.UpstreamBegin,
-		LastArticleKey: cursor.LastArticleKey,
-		LastTimestamp:  cursor.LastTimestamp,
-	}
-	page, err := a.discovery.Discover(ctx, run.Subscription.SourceAccountKey, discoveryCursor, pageSize, sourceAgentOptionString(run.Subscription.Options, "title_query", ""))
-	if err != nil {
-		return SourceAdapterResult{}, err
-	}
-	items := page.Articles
-	next := cursor
-	failures := make([]SourceAdapterItemFailure, 0)
-	if next.PublicationItemIndex == 0 && next.PendingFrontierKey == "" && len(items) > 0 {
-		next.PendingFrontierKey = items[0].ArticleKey
-		next.PendingFrontierTime = items[0].UpdateTime
-	}
-	processableEnd, reachedFrontier := weChatAgentPageBoundary(cursor.FrontierArticleKey, items)
-	if run.RequestedOperation == "discover_articles" {
-		if next.PublicationItemIndex > processableEnd {
-			return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
-		}
-		if processableEnd > next.PublicationItemIndex {
-			last := items[processableEnd-1]
-			next.LastArticleKey = last.ArticleKey
-			next.LastTimestamp = last.UpdateTime
-		}
-		next.PublicationItemIndex = processableEnd
-		advanceWeChatAgentPage(&next, page, processableEnd, reachedFrontier)
-		encoded, err := encodeWeChatAgentCursor(next)
-		if err != nil {
-			return SourceAdapterResult{}, err
-		}
-		return SourceAdapterResult{Cursor: encoded}, nil
-	}
 	if run.RequestedOperation != "sync_articles" && run.RequestedOperation != "sync_media" {
-		return SourceAdapterResult{}, fmt.Errorf("unsupported source sync operation %q", run.RequestedOperation)
+		if run.RequestedOperation != "discover_articles" {
+			return SourceAdapterResult{}, fmt.Errorf("unsupported source sync operation %q", run.RequestedOperation)
+		}
 	}
-	if a.source == nil {
+	if run.RequestedOperation != "discover_articles" && a.source == nil {
 		return SourceAdapterResult{}, fmt.Errorf("wechat article source is not configured")
 	}
 	includeMedia := run.RequestedOperation == "sync_media" || sourceAgentOptionBool(run.Subscription.Options, "include_media", false)
 	if includeMedia && (a.media == nil || a.assets == nil) {
 		return SourceAdapterResult{}, fmt.Errorf("wechat media downloader and asset uploader are required")
 	}
-	if next.PublicationItemIndex > processableEnd {
-		return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
-	}
-	items = items[next.PublicationItemIndex:processableEnd]
-	if len(items) > maxItems {
-		items = items[:maxItems]
-	}
-	for _, item := range items {
-		article, err := a.source.DownloadArticle(ctx, item.Link)
-		if err != nil {
+
+	next := cursor
+	failures := make([]SourceAdapterItemFailure, 0)
+	processed := 0
+	titleQuery := sourceAgentOptionString(run.Subscription.Options, "title_query", "")
+	for {
+		if err := ctx.Err(); err != nil {
 			return weChatAdapterFailure(next, err)
 		}
-		content := article.Markdown
-		var mediaErr error
-		if includeMedia {
-			content, mediaErr = a.archiveArticleMedia(ctx, run.ID, item.ArticleKey, article)
+		discoveryCursor := WeChatDiscoveryCursor{
+			Begin:          next.UpstreamBegin,
+			LastArticleKey: next.LastArticleKey,
+			LastTimestamp:  next.LastTimestamp,
 		}
-		envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: weChatArticleIdempotencyKey(run.Subscription.SourceAccountKey, item.ArticleKey, content), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: article.PublishedAt, Content: content, ContentFormat: "markdown"}
-		itemErr := mediaErr
-		if _, err := sink.Enqueue(run.ID, envelope); err != nil {
-			if errors.Is(err, ErrSourceArticleContentTooShort) || errors.Is(err, ErrSourceArticleInvalidURL) {
-				itemErr = err
-			} else {
+		page, err := a.discovery.Discover(ctx, run.Subscription.SourceAccountKey, discoveryCursor, pageSize, titleQuery)
+		if err != nil {
+			return SourceAdapterResult{}, err
+		}
+		items := page.Articles
+		if next.PublicationItemIndex == 0 && next.PendingFrontierKey == "" && len(items) > 0 {
+			next.PendingFrontierKey = items[0].ArticleKey
+			next.PendingFrontierTime = items[0].UpdateTime
+		}
+		processableEnd, reachedFrontier := weChatAgentPageBoundary(cursor.FrontierArticleKey, items)
+		if next.PublicationItemIndex > processableEnd {
+			return SourceAdapterResult{}, fmt.Errorf("wechat discovery cursor is beyond the current page")
+		}
+		if run.RequestedOperation == "discover_articles" {
+			if processableEnd > next.PublicationItemIndex {
+				last := items[processableEnd-1]
+				next.LastArticleKey = last.ArticleKey
+				next.LastTimestamp = last.UpdateTime
+			}
+			next.PublicationItemIndex = processableEnd
+			advanceWeChatAgentPage(&next, page, processableEnd, reachedFrontier)
+			return encodeWeChatAgentResult(next, failures)
+		}
+
+		pageItems := items[next.PublicationItemIndex:processableEnd]
+		remaining := maxItems - processed
+		if len(pageItems) > remaining {
+			pageItems = pageItems[:remaining]
+		}
+		for _, item := range pageItems {
+			article, err := a.source.DownloadArticle(ctx, item.Link)
+			if err != nil {
 				return weChatAdapterFailure(next, err)
 			}
+			content := article.Markdown
+			var mediaErr error
+			if includeMedia {
+				content, mediaErr = a.archiveArticleMedia(ctx, run.ID, item.ArticleKey, article)
+			}
+			publishedAt := strings.TrimSpace(article.PublishedAt)
+			if publishedAt == "" && item.UpdateTime > 0 {
+				publishedAt = time.Unix(item.UpdateTime, 0).UTC().Format(time.RFC3339)
+			}
+			envelope := SourceArticleEnvelope{SourceType: "wechat_mp_article", SourceAccountID: run.Subscription.SourceAccountKey, SourceAccount: run.Subscription.SourceAccount, SourceItemID: item.ArticleKey, IdempotencyKey: weChatArticleIdempotencyKey(run.Subscription.SourceAccountKey, item.ArticleKey, item.UpdateTime, content), Title: article.Title, Author: article.AccountName, SourceURL: article.SourceURL, PublishedAt: publishedAt, Content: content, ContentFormat: "markdown"}
+			itemErr := mediaErr
+			if _, err := sink.Enqueue(run.ID, envelope); err != nil {
+				if errors.Is(err, ErrSourceArticleContentTooShort) || errors.Is(err, ErrSourceArticleInvalidURL) {
+					itemErr = err
+				} else {
+					return weChatAdapterFailure(next, err)
+				}
+			}
+			if itemErr != nil {
+				failures = append(failures, SourceAdapterItemFailure{
+					SourceItemKey:  item.ArticleKey,
+					IdempotencyKey: envelope.IdempotencyKey,
+					Error:          itemErr.Error(),
+				})
+			}
+			next.PublicationItemIndex++
+			next.LastArticleKey = item.ArticleKey
+			next.LastTimestamp = item.UpdateTime
+			processed++
 		}
-		if itemErr != nil {
-			failures = append(failures, SourceAdapterItemFailure{
-				SourceItemKey:  item.ArticleKey,
-				IdempotencyKey: envelope.IdempotencyKey,
-				Error:          itemErr.Error(),
-			})
+		advanceWeChatAgentPage(&next, page, processableEnd, reachedFrontier)
+		if reachedFrontier || page.PublicationCount == 0 || processed >= maxItems {
+			return encodeWeChatAgentResult(next, failures)
 		}
-		next.PublicationItemIndex++
-		next.LastArticleKey = item.ArticleKey
-		next.LastTimestamp = item.UpdateTime
 	}
-	advanceWeChatAgentPage(&next, page, processableEnd, reachedFrontier)
-	encoded, err := encodeWeChatAgentCursor(next)
+}
+
+func encodeWeChatAgentResult(cursor weChatAgentCursor, failures []SourceAdapterItemFailure) (SourceAdapterResult, error) {
+	encoded, err := encodeWeChatAgentCursor(cursor)
 	if err != nil {
 		return SourceAdapterResult{}, err
 	}
@@ -222,8 +238,8 @@ func (a *WeChatSourceAdapter) archiveArticleMedia(ctx context.Context, runID, ar
 	return content, nil
 }
 
-func weChatArticleIdempotencyKey(accountKey, articleKey, content string) string {
-	sum := sha256.Sum256([]byte("wechat_mp_article\x00" + strings.TrimSpace(accountKey) + "\x00" + strings.TrimSpace(articleKey) + "\x00" + content))
+func weChatArticleIdempotencyKey(accountKey, articleKey string, updateTime int64, content string) string {
+	sum := sha256.Sum256([]byte("wechat_mp_article\x00" + strings.TrimSpace(accountKey) + "\x00" + strings.TrimSpace(articleKey) + "\x00" + fmt.Sprintf("%d", updateTime) + "\x00" + content))
 	return hex.EncodeToString(sum[:])
 }
 

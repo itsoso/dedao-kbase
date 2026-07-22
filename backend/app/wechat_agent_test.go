@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -139,9 +140,9 @@ func TestWeChatAgentResumesMidPublication(t *testing.T) {
 
 	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		articles := []WeChatOfficialArticle{
-			{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 101},
+			{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 103},
 			{Title: "Article 2", Link: articleServer.URL + "/2", AID: "article-2", UpdateTime: 102},
-			{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 103},
+			{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 101},
 		}
 		publishInfo, _ := json.Marshal(map[string]any{"appmsgex": articles})
 		publishPage, _ := json.Marshal(map[string]any{"publish_list": []map[string]any{{"publish_info": string(publishInfo)}}})
@@ -400,10 +401,11 @@ func TestWeChatAgentSyncMediaUploadsAssetsAndRewritesArticle(t *testing.T) {
 }
 
 func TestWeChatAgentIdempotencyKeyIsScopedToSourceItem(t *testing.T) {
-	first := weChatArticleIdempotencyKey("account", "article-1", "same content")
-	second := weChatArticleIdempotencyKey("account", "article-2", "same content")
-	if first == second || first != weChatArticleIdempotencyKey("account", "article-1", "same content") {
-		t.Fatalf("first=%q second=%q", first, second)
+	first := weChatArticleIdempotencyKey("account", "article-1", 100, "same content")
+	second := weChatArticleIdempotencyKey("account", "article-2", 100, "same content")
+	republished := weChatArticleIdempotencyKey("account", "article-1", 200, "same content")
+	if first == second || first == republished || first != weChatArticleIdempotencyKey("account", "article-1", 100, "same content") {
+		t.Fatalf("first=%q second=%q republished=%q", first, second, republished)
 	}
 }
 
@@ -480,6 +482,83 @@ func TestWeChatAgentCommitsFrontierAndOnlyProcessesNewArticles(t *testing.T) {
 	}
 }
 
+func TestWeChatAgentDrainsAllAvailablePagesInOneRunNewestFirst(t *testing.T) {
+	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<html><body><h1 id="activity-name">%s</h1><a id="js_name">Account</a><div id="js_content"><p>This article contains enough content to verify a complete subscription sync.</p></div></body></html>`, r.URL.Path)
+	}))
+	defer articleServer.Close()
+
+	var begins []int
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		begin, _ := strconv.Atoi(r.URL.Query().Get("begin"))
+		begins = append(begins, begin)
+		publications := []map[string]any{}
+		switch begin {
+		case 0:
+			for _, article := range []WeChatOfficialArticle{
+				{Title: "Second", Link: articleServer.URL + "/second", AID: "second", UpdateTime: 200},
+				{Title: "Newest", Link: articleServer.URL + "/newest", AID: "newest", UpdateTime: 300},
+			} {
+				publishInfo, _ := json.Marshal(map[string]any{"appmsgex": []WeChatOfficialArticle{article}})
+				publications = append(publications, map[string]any{"publish_info": string(publishInfo)})
+			}
+		case 2:
+			publishInfo, _ := json.Marshal(map[string]any{"appmsgex": []WeChatOfficialArticle{{Title: "Oldest", Link: articleServer.URL + "/oldest", AID: "oldest", UpdateTime: 100}}})
+			publications = append(publications, map[string]any{"publish_info": string(publishInfo)})
+		}
+		publishPage, _ := json.Marshal(map[string]any{"publish_list": publications})
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 0}, "publish_page": string(publishPage)})
+	}))
+	defer discoveryServer.Close()
+
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery, Source: newTestWeChatSourceService(t, articleServer)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &recordingSourceEnvelopeSink{}
+	result, err := adapter.Execute(context.Background(), SourceSyncRun{
+		ID:                 "run-drain",
+		RequestedOperation: "sync_articles",
+		Subscription: &SourceSubscription{
+			SourceAccountKey: "account-key",
+			SourceAccount:    "Account",
+			Options:          map[string]any{"page_size": float64(2), "max_items": float64(10)},
+		},
+	}, sink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.envelopes) != 3 {
+		t.Fatalf("processed envelopes=%#v", sink.envelopes)
+	}
+	if got := []string{sink.envelopes[0].SourceItemID, sink.envelopes[1].SourceItemID, sink.envelopes[2].SourceItemID}; !reflect.DeepEqual(got, []string{"newest", "second", "oldest"}) {
+		t.Fatalf("processed order=%v", got)
+	}
+	if got := []string{sink.envelopes[0].PublishedAt, sink.envelopes[1].PublishedAt, sink.envelopes[2].PublishedAt}; !reflect.DeepEqual(got, []string{
+		time.Unix(300, 0).UTC().Format(time.RFC3339),
+		time.Unix(200, 0).UTC().Format(time.RFC3339),
+		time.Unix(100, 0).UTC().Format(time.RFC3339),
+	}) {
+		t.Fatalf("published times=%v", got)
+	}
+	if !reflect.DeepEqual(begins, []int{0, 2, 3}) {
+		t.Fatalf("discovery begins=%v", begins)
+	}
+	cursor, err := decodeWeChatAgentCursor(result.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.UpstreamBegin != 0 || cursor.PublicationItemIndex != 0 || cursor.FrontierArticleKey != "newest" {
+		t.Fatalf("cursor=%#v", cursor)
+	}
+}
+
 func TestWeChatAgentSetsInitialFrontierToNewestFilteredMatch(t *testing.T) {
 	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<html><body><h1 id="activity-name">%s</h1><a id="js_name">Account</a><div id="js_content"><p>This filtered article contains enough content for frontier testing.</p></div></body></html>`, r.URL.Path)
@@ -541,9 +620,9 @@ func newFailureTestWeChatAgentAdapter(t *testing.T, failedPath string) *WeChatSo
 	t.Cleanup(articleServer.Close)
 	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		articles := []WeChatOfficialArticle{
-			{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 101},
+			{Title: "Article 1", Link: articleServer.URL + "/1", AID: "article-1", UpdateTime: 103},
 			{Title: "Article 2", Link: articleServer.URL + "/2", AID: "article-2", UpdateTime: 102},
-			{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 103},
+			{Title: "Article 3", Link: articleServer.URL + "/3", AID: "article-3", UpdateTime: 101},
 		}
 		publishInfo, _ := json.Marshal(map[string]any{"appmsgex": articles})
 		publishPage, _ := json.Marshal(map[string]any{"publish_list": []map[string]any{{"publish_info": string(publishInfo)}}})
