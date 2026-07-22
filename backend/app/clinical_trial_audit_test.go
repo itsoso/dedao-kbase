@@ -1,6 +1,9 @@
 package app
 
 import (
+	"encoding/json"
+	"math"
+	"os"
 	"strings"
 	"testing"
 )
@@ -39,6 +42,31 @@ func TestClinicalTrialAuditRequestNormalizesSupportedInputsAndHashes(t *testing.
 	}
 }
 
+func TestClinicalTrialAuditRequestNormalizesUnicodeClaimsAndPMIDLeadingZeros(t *testing.T) {
+	composed, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputClaim, Input: "Caf\u00e9 endpoint"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decomposed, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputClaim, Input: "  Cafe\u0301\nendpoint  "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decomposed.NormalizedInput != "Caf\u00e9 endpoint" || decomposed.InputHash != composed.InputHash {
+		t.Fatalf("decomposed request = %#v, composed = %#v", decomposed, composed)
+	}
+
+	canonical, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputPMID, Input: "PMID: 000123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical.NormalizedInput != "123" {
+		t.Fatalf("normalized PMID = %q", canonical.NormalizedInput)
+	}
+	if _, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputPMID, Input: "0000"}); err == nil {
+		t.Fatal("all-zero PMID error = nil")
+	}
+}
+
 func TestClinicalTrialSourceSnapshotFingerprintIsStable(t *testing.T) {
 	base := ClinicalTrialSourceSnapshot{
 		SourceType:        "clinicaltrials.gov",
@@ -59,6 +87,44 @@ func TestClinicalTrialSourceSnapshotFingerprintIsStable(t *testing.T) {
 	}
 	if first.Fingerprint == "" || !strings.HasPrefix(first.Fingerprint, "sha256:") || first.Fingerprint != second.Fingerprint {
 		t.Fatalf("source fingerprints = %q and %q", first.Fingerprint, second.Fingerprint)
+	}
+}
+
+func TestClinicalTrialTimestampsAreParsedAndCanonicalized(t *testing.T) {
+	snapshot, err := FinalizeClinicalTrialSourceSnapshot(ClinicalTrialSourceSnapshot{
+		SourceType:        "clinicaltrials.gov",
+		CanonicalID:       "NCT01234567",
+		RetrievedAt:       "2026-07-21T08:00:00-04:00",
+		UpstreamUpdatedAt: "2026-07-20T08:00:00-04:00",
+		ContentHash:       "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		LicenseScope:      "public_metadata",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.RetrievedAt != "2026-07-21T12:00:00Z" || snapshot.UpstreamUpdatedAt != "2026-07-20T12:00:00Z" {
+		t.Fatalf("canonical snapshot timestamps = %q, %q", snapshot.RetrievedAt, snapshot.UpstreamUpdatedAt)
+	}
+
+	audit := validClinicalTrialAudit(t)
+	audit.CompletedAt = "2026-07-21T09:00:00-04:00"
+	finalized, err := FinalizeClinicalTrialAudit(audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalized.CompletedAt != "2026-07-21T13:00:00Z" {
+		t.Fatalf("canonical completed_at = %q", finalized.CompletedAt)
+	}
+
+	invalidSnapshot := snapshot
+	invalidSnapshot.RetrievedAt = "yesterday"
+	if _, err := FinalizeClinicalTrialSourceSnapshot(invalidSnapshot); err == nil {
+		t.Fatal("invalid retrieved_at error = nil")
+	}
+	invalidAudit := validClinicalTrialAudit(t)
+	invalidAudit.CompletedAt = "later"
+	if err := ValidateClinicalTrialAudit(invalidAudit); err == nil {
+		t.Fatal("invalid completed_at error = nil")
 	}
 }
 
@@ -107,6 +173,44 @@ func TestClinicalTrialAuditRejectsUnknownFindingClassAndDuplicateCitationIDs(t *
 	})
 }
 
+func TestClinicalTrialAuditRejectsNonFiniteConfidenceAndInvalidLimitations(t *testing.T) {
+	for _, confidence := range []float64{0, 1} {
+		audit := validClinicalTrialAudit(t)
+		audit.Confidence = confidence
+		if err := ValidateClinicalTrialAudit(audit); err != nil {
+			t.Fatalf("boundary confidence %v error = %v", confidence, err)
+		}
+	}
+
+	for name, confidence := range map[string]float64{
+		"nan":      math.NaN(),
+		"positive": math.Inf(1),
+		"negative": math.Inf(-1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			audit := validClinicalTrialAudit(t)
+			audit.Confidence = confidence
+			if err := ValidateClinicalTrialAudit(audit); err == nil || !strings.Contains(err.Error(), "confidence") {
+				t.Fatalf("ValidateClinicalTrialAudit() error = %v", err)
+			}
+		})
+	}
+
+	for name, limitations := range map[string][]string{
+		"empty":      {""},
+		"duplicate":  {"Protocol unavailable", "Protocol unavailable"},
+		"whitespace": {" Protocol unavailable "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			audit := validClinicalTrialAudit(t)
+			audit.Limitations = limitations
+			if err := ValidateClinicalTrialAudit(audit); err == nil || !strings.Contains(err.Error(), "limitations") {
+				t.Fatalf("ValidateClinicalTrialAudit() error = %v", err)
+			}
+		})
+	}
+}
+
 func TestClinicalTrialAuditRunAllowsDeclaredStatesAndRequiresCompleteTerminalState(t *testing.T) {
 	request, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"})
 	if err != nil {
@@ -137,7 +241,7 @@ func TestClinicalTrialAuditRunAllowsDeclaredStatesAndRequiresCompleteTerminalSta
 		}
 	}
 
-	failed := ClinicalTrialAuditRun{SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunFailed, Request: request, Error: "source_timeout"}
+	failed := ClinicalTrialAuditRun{SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunFailed, Request: request, Error: clinicalTrialStringPointer("source_timeout")}
 	if err := ValidateClinicalTrialAuditRun(failed); err != nil {
 		t.Fatalf("failed state error = %v", err)
 	}
@@ -153,6 +257,99 @@ func TestClinicalTrialAuditRunAllowsDeclaredStatesAndRequiresCompleteTerminalSta
 				t.Fatal("ValidateClinicalTrialAuditRun() error = nil")
 			}
 		})
+	}
+}
+
+func TestClinicalTrialAuditRunRejectsMismatchedRequestsAndExclusivePayloadViolations(t *testing.T) {
+	audit := validClinicalTrialAudit(t)
+	request := audit.Request
+	otherRequest, err := FinalizeClinicalTrialAuditRequest(ClinicalTrialAuditRequest{InputType: ClinicalTrialInputPMID, Input: "12345678"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mismatched := ClinicalTrialAuditRun{
+		SchemaVersion: ClinicalTrialAuditRunSchemaVersion,
+		RunID:         "run-1",
+		State:         ClinicalTrialAuditRunCompleted,
+		Request:       otherRequest,
+		Audit:         &audit,
+	}
+	if err := ValidateClinicalTrialAuditRun(mismatched); err == nil || !strings.Contains(err.Error(), "request") {
+		t.Fatalf("mismatched request error = %v", err)
+	}
+
+	for name, run := range map[string]ClinicalTrialAuditRun{
+		"nonterminal audit": {SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunCollecting, Request: request, Audit: &audit},
+		"nonterminal error": {SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunReasoning, Request: request, Error: clinicalTrialStringPointer("unexpected")},
+		"failed audit":      {SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunFailed, Request: request, Audit: &audit, Error: clinicalTrialStringPointer("source_timeout")},
+		"completed error":   {SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunCompleted, Request: request, Audit: &audit, Error: clinicalTrialStringPointer("stale")},
+		"abstained error":   {SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunAbstained, Request: request, Audit: &audit, Error: clinicalTrialStringPointer("stale")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateClinicalTrialAuditRun(run); err == nil {
+				t.Fatal("ValidateClinicalTrialAuditRun() error = nil")
+			}
+		})
+	}
+
+	completedWithoutFindings := audit
+	completedWithoutFindings.Findings = nil
+	completed := ClinicalTrialAuditRun{SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunCompleted, Request: request, Audit: &completedWithoutFindings}
+	if err := ValidateClinicalTrialAuditRun(completed); err == nil || !strings.Contains(err.Error(), "findings") {
+		t.Fatalf("completed without findings error = %v", err)
+	}
+
+	abstainedWithoutFindings := audit
+	abstainedWithoutFindings.Findings = nil
+	abstained := ClinicalTrialAuditRun{SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunAbstained, Request: request, Audit: &abstainedWithoutFindings}
+	if err := ValidateClinicalTrialAuditRun(abstained); err != nil {
+		t.Fatalf("abstained without findings error = %v", err)
+	}
+	abstainedWithFindings := ClinicalTrialAuditRun{SchemaVersion: ClinicalTrialAuditRunSchemaVersion, RunID: "run-1", State: ClinicalTrialAuditRunAbstained, Request: request, Audit: &audit}
+	if err := ValidateClinicalTrialAuditRun(abstainedWithFindings); err == nil || !strings.Contains(err.Error(), "findings") {
+		t.Fatalf("abstained with findings error = %v", err)
+	}
+}
+
+func clinicalTrialStringPointer(value string) *string {
+	return &value
+}
+
+func TestClinicalTrialAuditJSONSchemaMirrorsRunAndCollectionBoundaries(t *testing.T) {
+	raw, err := os.ReadFile("../../contracts/clinical-trial-audit-v1.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
+	}
+	defs := schema["$defs"].(map[string]any)
+	audit := defs["audit"].(map[string]any)
+	auditProperties := audit["properties"].(map[string]any)
+	if auditProperties["findings"].(map[string]any)["minItems"] != float64(1) {
+		t.Fatal("completed audit schema must require findings")
+	}
+	abstained := defs["abstained_audit"].(map[string]any)
+	abstainedProperties := abstained["properties"].(map[string]any)
+	if abstainedProperties["findings"].(map[string]any)["maxItems"] != float64(0) {
+		t.Fatal("abstained audit schema must explicitly require empty findings")
+	}
+	abstainedLimitations := abstainedProperties["limitations"].(map[string]any)
+	if abstainedLimitations["uniqueItems"] != true || abstainedLimitations["items"].(map[string]any)["pattern"] == nil {
+		t.Fatal("abstained audit schema must enforce canonical unique limitations")
+	}
+	limitations := auditProperties["limitations"].(map[string]any)
+	if limitations["minItems"] != float64(1) || limitations["uniqueItems"] != true {
+		t.Fatal("audit schema must require unique non-empty limitations")
+	}
+	if limitations["items"].(map[string]any)["pattern"] == nil {
+		t.Fatal("audit schema limitations must reject surrounding whitespace")
+	}
+	run := defs["run"].(map[string]any)
+	if len(run["allOf"].([]any)) != 4 {
+		t.Fatal("run schema must define one exclusive payload rule per state class")
 	}
 }
 

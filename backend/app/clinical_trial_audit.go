@@ -5,8 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
+	"time"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -88,7 +92,7 @@ type ClinicalTrialAuditRun struct {
 	State         string                    `json:"state"`
 	Request       ClinicalTrialAuditRequest `json:"request"`
 	Audit         *ClinicalTrialAudit       `json:"audit,omitempty"`
-	Error         string                    `json:"error,omitempty"`
+	Error         *string                   `json:"error,omitempty"`
 	CreatedAt     string                    `json:"created_at,omitempty"`
 	UpdatedAt     string                    `json:"updated_at,omitempty"`
 }
@@ -109,6 +113,14 @@ func FinalizeClinicalTrialSourceSnapshot(snapshot ClinicalTrialSourceSnapshot) (
 	if err := validateClinicalTrialSourceFields(snapshot); err != nil {
 		return ClinicalTrialSourceSnapshot{}, err
 	}
+	retrievedAt, err := canonicalClinicalTrialTimestamp("retrieved_at", snapshot.RetrievedAt, true)
+	if err != nil {
+		return ClinicalTrialSourceSnapshot{}, err
+	}
+	upstreamUpdatedAt, err := canonicalClinicalTrialTimestamp("upstream_updated_at", snapshot.UpstreamUpdatedAt, false)
+	if err != nil {
+		return ClinicalTrialSourceSnapshot{}, err
+	}
 	payload := struct {
 		SourceType        string `json:"source_type"`
 		CanonicalID       string `json:"canonical_id"`
@@ -118,7 +130,7 @@ func FinalizeClinicalTrialSourceSnapshot(snapshot ClinicalTrialSourceSnapshot) (
 	}{
 		SourceType:        strings.TrimSpace(snapshot.SourceType),
 		CanonicalID:       strings.TrimSpace(snapshot.CanonicalID),
-		UpstreamUpdatedAt: strings.TrimSpace(snapshot.UpstreamUpdatedAt),
+		UpstreamUpdatedAt: upstreamUpdatedAt,
 		ContentHash:       strings.TrimSpace(snapshot.ContentHash),
 		LicenseScope:      strings.TrimSpace(snapshot.LicenseScope),
 	}
@@ -131,9 +143,21 @@ func FinalizeClinicalTrialSourceSnapshot(snapshot ClinicalTrialSourceSnapshot) (
 	snapshot.UpstreamUpdatedAt = payload.UpstreamUpdatedAt
 	snapshot.ContentHash = payload.ContentHash
 	snapshot.LicenseScope = payload.LicenseScope
-	snapshot.RetrievedAt = strings.TrimSpace(snapshot.RetrievedAt)
+	snapshot.RetrievedAt = retrievedAt
 	snapshot.Fingerprint = hashClinicalTrialValue(string(encoded))
 	return snapshot, nil
+}
+
+func FinalizeClinicalTrialAudit(audit ClinicalTrialAudit) (ClinicalTrialAudit, error) {
+	completedAt, err := canonicalClinicalTrialTimestamp("completed_at", audit.CompletedAt, true)
+	if err != nil {
+		return ClinicalTrialAudit{}, err
+	}
+	audit.CompletedAt = completedAt
+	if err := ValidateClinicalTrialAudit(audit); err != nil {
+		return ClinicalTrialAudit{}, err
+	}
+	return audit, nil
 }
 
 func ValidateClinicalTrialAudit(audit ClinicalTrialAudit) error {
@@ -153,20 +177,41 @@ func ValidateClinicalTrialAuditRun(run ClinicalTrialAuditRun) error {
 	switch run.State {
 	case ClinicalTrialAuditRunQueued, ClinicalTrialAuditRunCollecting, ClinicalTrialAuditRunComparing,
 		ClinicalTrialAuditRunReasoning, ClinicalTrialAuditRunAwaitingReview:
+		if run.Audit != nil || run.Error != nil {
+			return fmt.Errorf("nonterminal run cannot contain audit or error")
+		}
 		return nil
 	case ClinicalTrialAuditRunCompleted:
 		if run.Audit == nil {
 			return fmt.Errorf("completed run requires an audit")
+		}
+		if run.Error != nil {
+			return fmt.Errorf("completed run cannot contain an error")
+		}
+		if err := validateClinicalTrialRunAuditRequest(run.Request, run.Audit.Request); err != nil {
+			return err
 		}
 		return validateClinicalTrialAudit(*run.Audit, true)
 	case ClinicalTrialAuditRunAbstained:
 		if run.Audit == nil {
 			return fmt.Errorf("abstained run requires an audit")
 		}
+		if run.Error != nil {
+			return fmt.Errorf("abstained run cannot contain an error")
+		}
+		if err := validateClinicalTrialRunAuditRequest(run.Request, run.Audit.Request); err != nil {
+			return err
+		}
+		if len(run.Audit.Findings) != 0 {
+			return fmt.Errorf("abstained run audit findings must be empty")
+		}
 		return validateClinicalTrialAudit(*run.Audit, false)
 	case ClinicalTrialAuditRunFailed:
-		if strings.TrimSpace(run.Error) == "" {
+		if run.Error == nil || strings.TrimSpace(*run.Error) == "" {
 			return fmt.Errorf("failed run requires an error")
+		}
+		if run.Audit != nil {
+			return fmt.Errorf("failed run cannot contain an audit")
 		}
 		return nil
 	default:
@@ -246,14 +291,14 @@ func validateClinicalTrialAudit(audit ClinicalTrialAudit, requireFindings bool) 
 			seen[citationID] = struct{}{}
 		}
 	}
-	if audit.Confidence < 0 || audit.Confidence > 1 {
+	if math.IsNaN(audit.Confidence) || math.IsInf(audit.Confidence, 0) || audit.Confidence < 0 || audit.Confidence > 1 {
 		return fmt.Errorf("confidence must be between 0 and 1")
 	}
-	if len(uniqueNonEmptyClinicalTrialStrings(audit.Limitations)) == 0 {
-		return fmt.Errorf("limitations are required")
+	if err := validateClinicalTrialLimitations(audit.Limitations); err != nil {
+		return err
 	}
-	if strings.TrimSpace(audit.CompletedAt) == "" {
-		return fmt.Errorf("completed_at is required")
+	if _, err := canonicalClinicalTrialTimestamp("completed_at", audit.CompletedAt, true); err != nil {
+		return err
 	}
 	return nil
 }
@@ -295,7 +340,12 @@ func normalizeClinicalTrialAuditInput(inputType, input string) (string, error) {
 		if !clinicalTrialPMIDPattern.MatchString(value) {
 			return "", fmt.Errorf("pmid must contain only digits")
 		}
+		value = strings.TrimLeft(value, "0")
+		if value == "" {
+			return "", fmt.Errorf("pmid must be positive")
+		}
 	case ClinicalTrialInputClaim:
+		value = norm.NFC.String(value)
 		value = strings.Join(strings.Fields(value), " ")
 		if value == "" {
 			return "", fmt.Errorf("claim is required")
@@ -315,6 +365,57 @@ func validateClinicalTrialSourceFields(snapshot ClinicalTrialSourceSnapshot) err
 	if !regexp.MustCompile(`^sha256:[a-f0-9]{64}$`).MatchString(strings.TrimSpace(snapshot.ContentHash)) {
 		return fmt.Errorf("content_hash must be a sha256 fingerprint")
 	}
+	if _, err := canonicalClinicalTrialTimestamp("retrieved_at", snapshot.RetrievedAt, true); err != nil {
+		return err
+	}
+	if _, err := canonicalClinicalTrialTimestamp("upstream_updated_at", snapshot.UpstreamUpdatedAt, false); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateClinicalTrialRunAuditRequest(runRequest, auditRequest ClinicalTrialAuditRequest) error {
+	if runRequest.InputType != auditRequest.InputType ||
+		runRequest.NormalizedInput != auditRequest.NormalizedInput ||
+		runRequest.InputHash != auditRequest.InputHash {
+		return fmt.Errorf("run request does not match audit request")
+	}
+	return nil
+}
+
+func canonicalClinicalTrialTimestamp(field, value string, required bool) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		if required {
+			return "", fmt.Errorf("%s is required", field)
+		}
+		return "", nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return "", fmt.Errorf("%s must be RFC3339: %w", field, err)
+	}
+	return parsed.UTC().Format(time.RFC3339Nano), nil
+}
+
+func validateClinicalTrialLimitations(limitations []string) error {
+	if len(limitations) == 0 {
+		return fmt.Errorf("limitations are required")
+	}
+	seen := make(map[string]struct{}, len(limitations))
+	for index, limitation := range limitations {
+		trimmed := strings.TrimSpace(limitation)
+		if trimmed == "" {
+			return fmt.Errorf("limitations[%d] must not be empty", index)
+		}
+		if limitation != trimmed {
+			return fmt.Errorf("limitations[%d] must not contain surrounding whitespace", index)
+		}
+		if _, exists := seen[limitation]; exists {
+			return fmt.Errorf("limitations must not contain duplicates")
+		}
+		seen[limitation] = struct{}{}
+	}
 	return nil
 }
 
@@ -332,21 +433,4 @@ func isClinicalTrialFindingClass(class string) bool {
 func hashClinicalTrialValue(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-func uniqueNonEmptyClinicalTrialStrings(values []string) []string {
-	seen := make(map[string]struct{}, len(values))
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			continue
-		}
-		if _, exists := seen[value]; exists {
-			continue
-		}
-		seen[value] = struct{}{}
-		result = append(result, value)
-	}
-	return result
 }
