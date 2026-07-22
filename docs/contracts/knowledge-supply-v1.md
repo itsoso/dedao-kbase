@@ -38,6 +38,12 @@ one or more unique citation IDs, and each citation must resolve to a source
 fingerprint. Consumers must preserve confidence, limitations, and source
 fingerprints when importing an audit.
 
+The stable source fingerprint excludes retrieval time. A separate
+`provenance_digest` binds that fingerprint to canonical `retrieved_at` and,
+for ClinicalTrials.gov, the upstream `data_timestamp`. Durable storage keeps
+those values on both the snapshot and its evidence link and fails closed if
+either copy or the digest is altered.
+
 Audit runs use `clinical-trial-audit-run.v1` and advance through `queued`,
 `collecting`, `comparing`, `reasoning`, and `awaiting_review` before reaching
 `completed`, `failed`, or `abstained`. Completed and abstained runs include an
@@ -61,7 +67,14 @@ the typed registry study after restart. Clinical audit v1 normalizes protocol,
 participant-flow, and outcome-measure modules. Its machine-readable coverage
 explicitly excludes baseline characteristics, adverse events, and more-info;
 consumers must preserve that limitation and must not describe v1 as complete
-ClinicalTrials.gov results coverage.
+ClinicalTrials.gov results coverage. The authoritative v1 limitation code is
+`results_modules_excluded_v1`; arbitrary limitation prose is invalid.
+
+Database schema v4 moves ClinicalTrials.gov `data_timestamp` out of the
+content-addressed evidence envelope and into snapshot/link provenance. Valid v3
+evidence rows are rewritten without changing `content_hash`. Rows that cannot
+be verified are retained with deterministic `evidence_v1_incompatible` state,
+and reads return a typed incompatibility error.
 
 The repository currently has no existing JSON Schema validator dependency.
 Public Go runs are therefore verified by strict projection, unknown-field

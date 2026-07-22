@@ -90,6 +90,37 @@ func TestClinicalTrialSourceSnapshotFingerprintIsStable(t *testing.T) {
 	}
 }
 
+func TestClinicalTrialSourceSnapshotProtectsRetrievalProvenanceSeparately(t *testing.T) {
+	base := ClinicalTrialSourceSnapshot{
+		SourceType:        ClinicalTrialsGovStudySourceType,
+		CanonicalID:       "NCT01234567",
+		UpstreamUpdatedAt: "2026-07-20T12:00:00Z",
+		ContentHash:       "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		LicenseScope:      "public_metadata",
+		RetrievedAt:       "2026-07-21T12:00:00Z",
+		DataTimestamp:     "2026-07-21T15:04:05Z",
+	}
+	first, err := FinalizeClinicalTrialSourceSnapshot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.RetrievedAt = "2026-07-22T12:00:00Z"
+	second, err := FinalizeClinicalTrialSourceSnapshot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Fingerprint != second.Fingerprint {
+		t.Fatalf("retrieval provenance changed stable fingerprint: %q / %q", first.Fingerprint, second.Fingerprint)
+	}
+	if first.ProvenanceDigest == "" || first.ProvenanceDigest == second.ProvenanceDigest {
+		t.Fatalf("provenance digests = %q / %q", first.ProvenanceDigest, second.ProvenanceDigest)
+	}
+	first.DataTimestamp = "2026-07-22T15:04:05Z"
+	if _, err := FinalizeClinicalTrialSourceSnapshot(first); err == nil {
+		t.Fatal("accepted tampered data timestamp with stale provenance digest")
+	}
+}
+
 func TestClinicalTrialTimestampsAreParsedAndCanonicalized(t *testing.T) {
 	snapshot, err := FinalizeClinicalTrialSourceSnapshot(ClinicalTrialSourceSnapshot{
 		SourceType:        "clinicaltrials.gov",
@@ -373,6 +404,13 @@ func TestClinicalTrialAuditJSONSchemaMirrorsRunAndCollectionBoundaries(t *testin
 		t.Fatal(err)
 	}
 	defs := schema["$defs"].(map[string]any)
+	snapshot := defs["source_snapshot"].(map[string]any)
+	snapshotProperties := snapshot["properties"].(map[string]any)
+	for _, field := range []string{"data_timestamp", "provenance_digest"} {
+		if snapshotProperties[field] == nil {
+			t.Fatalf("source snapshot schema is missing %s", field)
+		}
+	}
 	audit := defs["audit"].(map[string]any)
 	auditProperties := audit["properties"].(map[string]any)
 	if auditProperties["findings"].(map[string]any)["minItems"] != float64(1) {

@@ -247,8 +247,8 @@ func TestClinicalTrialsGovGetStudyNormalizesCurrentRecord(t *testing.T) {
 	if result.Evidence.ContentHash != result.Snapshot.ContentHash || result.Evidence.SourceType != result.Snapshot.SourceType {
 		t.Fatalf("snapshot/evidence identity mismatch: snapshot=%#v evidence=%#v", result.Snapshot, result.Evidence)
 	}
-	if result.Evidence.Provenance.DataTimestamp != result.DataTimestamp {
-		t.Fatalf("evidence provenance = %#v, result data timestamp = %q", result.Evidence.Provenance, result.DataTimestamp)
+	if result.Snapshot.DataTimestamp != result.DataTimestamp || result.Snapshot.ProvenanceDigest == "" {
+		t.Fatalf("snapshot provenance = %#v, result data timestamp = %q", result.Snapshot, result.DataTimestamp)
 	}
 	if recovered, err := DecodeClinicalTrialsGovEvidencePayload(result.Evidence); err != nil || recovered.NCTID != study.NCTID {
 		t.Fatalf("recover result evidence = %#v err=%v", recovered, err)
@@ -269,7 +269,6 @@ func TestClinicalTrialsGovEvidenceRejectsHashValidForgedStudy(t *testing.T) {
 		SchemaVersion: ClinicalTrialAuditEvidenceSchemaVersion,
 		SourceType:    ClinicalTrialsGovStudySourceType,
 		ContentHash:   hashClinicalTrialValue(string(data)),
-		Provenance:    ClinicalTrialAuditEvidenceProvenance{DataTimestamp: "2026-07-21T15:04:05Z"},
 		Data:          data,
 	}
 	if _, err := DecodeClinicalTrialsGovEvidencePayload(forged); err == nil {
@@ -277,13 +276,32 @@ func TestClinicalTrialsGovEvidenceRejectsHashValidForgedStudy(t *testing.T) {
 	}
 }
 
-func TestClinicalTrialsGovEvidenceRejectsNonCanonicalDataTimestamp(t *testing.T) {
+func TestClinicalTrialsGovEvidenceIdentityIgnoresUpstreamDataTimestamp(t *testing.T) {
 	study, err := normalizeClinicalTrialsGovStudy([]byte(clinicalTrialsGovStudyFixture), "2.0.4")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewClinicalTrialsGovEvidencePayload(study, "2026-07-21T11:04:05-04:00"); err == nil {
-		t.Fatal("accepted noncanonical evidence data timestamp")
+	first, err := NewClinicalTrialsGovEvidencePayload(study)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewClinicalTrialsGovEvidencePayload(study)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ContentHash != second.ContentHash {
+		t.Fatalf("stable evidence hashes differ: %q / %q", first.ContentHash, second.ContentHash)
+	}
+}
+
+func TestClinicalTrialsGovCoverageRejectsArbitraryLimitationText(t *testing.T) {
+	study, err := normalizeClinicalTrialsGovStudy([]byte(clinicalTrialsGovStudyFixture), "2.0.4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	study.Coverage.Limitations = []string{"No limitations"}
+	if err := ValidateClinicalTrialsGovStudy(study); err == nil {
+		t.Fatal("accepted arbitrary coverage limitation text")
 	}
 }
 

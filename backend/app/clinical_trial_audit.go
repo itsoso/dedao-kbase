@@ -55,9 +55,11 @@ type ClinicalTrialSourceSnapshot struct {
 	SourceType        string `json:"source_type"`
 	CanonicalID       string `json:"canonical_id"`
 	RetrievedAt       string `json:"retrieved_at"`
+	DataTimestamp     string `json:"data_timestamp,omitempty"`
 	UpstreamUpdatedAt string `json:"upstream_updated_at,omitempty"`
 	ContentHash       string `json:"content_hash"`
 	Fingerprint       string `json:"fingerprint"`
+	ProvenanceDigest  string `json:"provenance_digest,omitempty"`
 	LicenseScope      string `json:"license_scope"`
 }
 
@@ -121,6 +123,10 @@ func FinalizeClinicalTrialSourceSnapshot(snapshot ClinicalTrialSourceSnapshot) (
 	if err != nil {
 		return ClinicalTrialSourceSnapshot{}, err
 	}
+	dataTimestamp, err := canonicalClinicalTrialTimestamp("data_timestamp", snapshot.DataTimestamp, snapshot.SourceType == ClinicalTrialsGovStudySourceType)
+	if err != nil {
+		return ClinicalTrialSourceSnapshot{}, err
+	}
 	payload := struct {
 		SourceType        string `json:"source_type"`
 		CanonicalID       string `json:"canonical_id"`
@@ -145,6 +151,21 @@ func FinalizeClinicalTrialSourceSnapshot(snapshot ClinicalTrialSourceSnapshot) (
 	snapshot.LicenseScope = payload.LicenseScope
 	snapshot.RetrievedAt = retrievedAt
 	snapshot.Fingerprint = hashClinicalTrialValue(string(encoded))
+	provenancePayload := struct {
+		Fingerprint   string `json:"fingerprint"`
+		RetrievedAt   string `json:"retrieved_at"`
+		DataTimestamp string `json:"data_timestamp,omitempty"`
+	}{snapshot.Fingerprint, retrievedAt, dataTimestamp}
+	provenanceEncoded, err := json.Marshal(provenancePayload)
+	if err != nil {
+		return ClinicalTrialSourceSnapshot{}, err
+	}
+	provenanceDigest := hashClinicalTrialValue(string(provenanceEncoded))
+	if snapshot.ProvenanceDigest != "" && snapshot.ProvenanceDigest != provenanceDigest {
+		return ClinicalTrialSourceSnapshot{}, fmt.Errorf("provenance_digest does not match source retrieval provenance")
+	}
+	snapshot.DataTimestamp = dataTimestamp
+	snapshot.ProvenanceDigest = provenanceDigest
 	return snapshot, nil
 }
 

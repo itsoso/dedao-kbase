@@ -29,9 +29,11 @@
         "source_type": { "type": "string", "minLength": 1 },
         "canonical_id": { "type": "string", "minLength": 1 },
         "retrieved_at": { "type": "string", "format": "date-time" },
+        "data_timestamp": { "type": "string", "format": "date-time" },
         "upstream_updated_at": { "type": "string", "format": "date-time" },
         "content_hash": { "$ref": "#/$defs/sha256" },
         "fingerprint": { "$ref": "#/$defs/sha256" },
+        "provenance_digest": { "$ref": "#/$defs/sha256" },
         "license_scope": { "type": "string", "minLength": 1 }
       },
       "additionalProperties": false

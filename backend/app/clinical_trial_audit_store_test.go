@@ -193,7 +193,7 @@ func TestClinicalTrialAuditStorePersistsImmutableEvidenceAndRecoversAfterReopen(
 		t.Fatalf("lease = %#v err=%v", lease, err)
 	}
 	study := clinicalTrialAuditStoreStudy()
-	evidence, err := NewClinicalTrialsGovEvidencePayload(study, "2026-07-21T15:04:05Z")
+	evidence, err := NewClinicalTrialsGovEvidencePayload(study)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,8 +234,8 @@ func TestClinicalTrialAuditStorePersistsImmutableEvidenceAndRecoversAfterReopen(
 	if len(recovered.Evidence) != 1 {
 		t.Fatalf("recovered evidence = %#v", recovered.Evidence)
 	}
-	if recovered.Evidence[0].Provenance.DataTimestamp != "2026-07-21T15:04:05Z" {
-		t.Fatalf("recovered provenance = %#v", recovered.Evidence[0].Provenance)
+	if recovered.Sources[0].DataTimestamp != "2026-07-21T15:04:05Z" || recovered.Sources[0].ProvenanceDigest == "" {
+		t.Fatalf("recovered provenance = %#v", recovered.Sources[0])
 	}
 	recoveredStudy, err := DecodeClinicalTrialsGovEvidencePayload(recovered.Evidence[0])
 	if err != nil {
@@ -291,7 +291,7 @@ func TestClinicalTrialAuditStoreFailsClosedOnCorruptSnapshotEvidenceChain(t *tes
 		{name: "link content hash", corrupt: func(t *testing.T, store *ClinicalTrialAuditStore, run ClinicalTrialAuditStoredRun, evidence ClinicalTrialAuditEvidencePayload) {
 			otherStudy := clinicalTrialAuditStoreStudy()
 			otherStudy.BriefTitle = "Different normalized evidence"
-			other, err := NewClinicalTrialsGovEvidencePayload(otherStudy, evidence.Provenance.DataTimestamp)
+			other, err := NewClinicalTrialsGovEvidencePayload(otherStudy)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -310,6 +310,21 @@ func TestClinicalTrialAuditStoreFailsClosedOnCorruptSnapshotEvidenceChain(t *tes
 		}},
 		{name: "evidence payload", corrupt: func(t *testing.T, store *ClinicalTrialAuditStore, _ ClinicalTrialAuditStoredRun, evidence ClinicalTrialAuditEvidencePayload) {
 			if _, err := store.db.Exec(`UPDATE clinical_trial_audit_evidence SET evidence_json = ? WHERE content_hash = ?`, "{", evidence.ContentHash); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "link retrieved at", corrupt: func(t *testing.T, store *ClinicalTrialAuditStore, run ClinicalTrialAuditStoredRun, _ ClinicalTrialAuditEvidencePayload) {
+			if _, err := store.db.Exec(`UPDATE clinical_trial_audit_snapshot_evidence SET retrieved_at = '2026-07-22T14:00:00Z' WHERE run_id = ?`, run.RunID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "link data timestamp", corrupt: func(t *testing.T, store *ClinicalTrialAuditStore, run ClinicalTrialAuditStoredRun, _ ClinicalTrialAuditEvidencePayload) {
+			if _, err := store.db.Exec(`UPDATE clinical_trial_audit_snapshot_evidence SET data_timestamp = '2026-07-21T16:04:05Z' WHERE run_id = ?`, run.RunID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "link provenance digest", corrupt: func(t *testing.T, store *ClinicalTrialAuditStore, run ClinicalTrialAuditStoredRun, _ ClinicalTrialAuditEvidencePayload) {
+			if _, err := store.db.Exec(`UPDATE clinical_trial_audit_snapshot_evidence SET provenance_digest = ? WHERE run_id = ?`, "sha256:"+strings.Repeat("f", 64), run.RunID); err != nil {
 				t.Fatal(err)
 			}
 		}},
@@ -345,7 +360,7 @@ func TestClinicalTrialAuditStoreRejectsEvidenceHashMismatchTransactionally(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy(), "2026-07-21T15:04:05Z")
+	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +395,7 @@ func TestClinicalTrialAuditStoreDeduplicatesEvidenceAcrossConcurrentStores(t *te
 		t.Fatal(err)
 	}
 	defer second.Close()
-	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy(), "2026-07-21T15:04:05Z")
+	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,6 +448,97 @@ func TestClinicalTrialAuditStoreDeduplicatesEvidenceAcrossConcurrentStores(t *te
 	}
 	if evidenceRows != 1 || links != 2 {
 		t.Fatalf("dedup rows=%d links=%d", evidenceRows, links)
+	}
+}
+
+func TestClinicalTrialAuditStoreDeduplicatesEvidenceAcrossDistinctProvenance(t *testing.T) {
+	store, err := NewClinicalTrialAuditStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, item := range []struct {
+		retrievedAt, dataTimestamp string
+	}{
+		{"2026-07-22T13:00:00Z", "2026-07-21T15:04:05Z"},
+		{"2026-07-22T14:00:00Z", "2026-07-21T16:04:05Z"},
+	} {
+		run, createErr := store.CreateRun("package-a", "1.0.0", ClinicalTrialAuditRequest{InputType: ClinicalTrialInputNCTID, Input: "NCT01234567"}, fmt.Sprintf("provenance-%d", index))
+		if createErr != nil {
+			t.Fatal(createErr)
+		}
+		lease, leaseErr := store.LeaseNextRun(fmt.Sprintf("worker-%d", index), time.Minute)
+		if leaseErr != nil || lease == nil || lease.RunID != run.RunID {
+			t.Fatalf("lease %d = %#v err=%v", index, lease, leaseErr)
+		}
+		snapshot := clinicalTrialAuditStoreEvidenceSnapshotAt(t, evidence.ContentHash, item.retrievedAt, item.dataTimestamp)
+		if _, checkpointErr := store.CheckpointRun(run.RunID, fmt.Sprintf("worker-%d", index), lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+			State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
+		}); checkpointErr != nil {
+			t.Fatal(checkpointErr)
+		}
+		loaded, loadErr := store.GetRun(run.RunID)
+		if loadErr != nil || loaded.Sources[0].RetrievedAt != item.retrievedAt || loaded.Sources[0].DataTimestamp != item.dataTimestamp {
+			t.Fatalf("loaded provenance %d = %#v err=%v", index, loaded.Sources, loadErr)
+		}
+	}
+	var evidenceRows, links int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_evidence`).Scan(&evidenceRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM clinical_trial_audit_snapshot_evidence`).Scan(&links); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRows != 1 || links != 2 {
+		t.Fatalf("stable evidence dedup rows=%d links=%d", evidenceRows, links)
+	}
+}
+
+func TestClinicalTrialAuditStoreMigratesVersion3EvidenceProvenance(t *testing.T) {
+	root, runID, dataTimestamp := prepareClinicalTrialAuditV3EvidenceFixture(t, nil)
+	reopened, err := NewClinicalTrialAuditStore(root)
+	if err != nil {
+		t.Fatalf("migrate v3 fixture: %v", err)
+	}
+	defer reopened.Close()
+	loaded, err := reopened.GetRun(runID)
+	if err != nil {
+		t.Fatalf("read migrated v3 run: %v", err)
+	}
+	if len(loaded.Evidence) != 1 || len(loaded.Sources) != 1 || loaded.Sources[0].DataTimestamp != dataTimestamp || loaded.Sources[0].ProvenanceDigest == "" {
+		t.Fatalf("migrated run = %#v", loaded)
+	}
+	var migratedVersion int
+	if err := reopened.db.QueryRow(`PRAGMA user_version`).Scan(&migratedVersion); err != nil || migratedVersion != clinicalTrialAuditSchemaVersion {
+		t.Fatalf("migrated version=%d err=%v", migratedVersion, err)
+	}
+}
+
+func TestClinicalTrialAuditStoreMarksInvalidVersion3EvidenceIncompatible(t *testing.T) {
+	root, runID, _ := prepareClinicalTrialAuditV3EvidenceFixture(t, func(evidence map[string]any) {
+		data := evidence["data"].(map[string]any)
+		coverage := data["coverage"].(map[string]any)
+		coverage["limitations"] = []any{"No limitations"}
+	})
+	store, err := NewClinicalTrialAuditStore(root)
+	if err != nil {
+		t.Fatalf("open database containing incompatible v3 evidence: %v", err)
+	}
+	defer store.Close()
+	if _, err := store.GetRun(runID); !errors.Is(err, ErrClinicalTrialAuditEvidenceIncompatible) {
+		t.Fatalf("incompatible v3 evidence error = %v", err)
+	}
+	var compatible int
+	var code string
+	if err := store.db.QueryRow(`SELECT compatible, incompatibility_code FROM clinical_trial_audit_evidence`).Scan(&compatible, &code); err != nil {
+		t.Fatal(err)
+	}
+	if compatible != 0 || code != clinicalTrialAuditEvidenceV1Incompatible {
+		t.Fatalf("compatibility state = %d %q", compatible, code)
 	}
 }
 
@@ -1011,9 +1117,14 @@ func clinicalTrialAuditStoreSnapshot(t *testing.T, now time.Time) ClinicalTrialS
 
 func clinicalTrialAuditStoreEvidenceSnapshot(t *testing.T, contentHash string, now time.Time) ClinicalTrialSourceSnapshot {
 	t.Helper()
+	return clinicalTrialAuditStoreEvidenceSnapshotAt(t, contentHash, now.UTC().Format(time.RFC3339Nano), "2026-07-21T15:04:05Z")
+}
+
+func clinicalTrialAuditStoreEvidenceSnapshotAt(t *testing.T, contentHash, retrievedAt, dataTimestamp string) ClinicalTrialSourceSnapshot {
+	t.Helper()
 	snapshot, err := FinalizeClinicalTrialSourceSnapshot(ClinicalTrialSourceSnapshot{
-		SourceType: ClinicalTrialsGovStudySourceType, CanonicalID: "NCT01234567", RetrievedAt: now.UTC().Format(time.RFC3339Nano),
-		ContentHash: contentHash, LicenseScope: "public_metadata",
+		SourceType: ClinicalTrialsGovStudySourceType, CanonicalID: "NCT01234567", RetrievedAt: retrievedAt,
+		DataTimestamp: dataTimestamp, ContentHash: contentHash, LicenseScope: "public_metadata",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1021,9 +1132,9 @@ func clinicalTrialAuditStoreEvidenceSnapshot(t *testing.T, contentHash string, n
 	return snapshot
 }
 
-func clinicalTrialAuditStoreEvidenceFixture(t *testing.T) (*ClinicalTrialAuditStore, ClinicalTrialAuditStoredRun, *ClinicalTrialAuditStoredRun, ClinicalTrialSourceSnapshot, ClinicalTrialAuditEvidencePayload) {
+func clinicalTrialAuditStoreEvidenceFixtureAt(t *testing.T, root string) (*ClinicalTrialAuditStore, ClinicalTrialAuditStoredRun, *ClinicalTrialAuditStoredRun, ClinicalTrialSourceSnapshot, ClinicalTrialAuditEvidencePayload) {
 	t.Helper()
-	store, err := NewClinicalTrialAuditStore(t.TempDir())
+	store, err := NewClinicalTrialAuditStore(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1037,13 +1148,82 @@ func clinicalTrialAuditStoreEvidenceFixture(t *testing.T) (*ClinicalTrialAuditSt
 		store.Close()
 		t.Fatalf("lease = %#v err=%v", lease, err)
 	}
-	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy(), "2026-07-21T15:04:05Z")
+	evidence, err := NewClinicalTrialsGovEvidencePayload(clinicalTrialAuditStoreStudy())
 	if err != nil {
 		store.Close()
 		t.Fatal(err)
 	}
 	snapshot := clinicalTrialAuditStoreEvidenceSnapshot(t, evidence.ContentHash, time.Now())
 	return store, run, lease, snapshot, evidence
+}
+
+func prepareClinicalTrialAuditV3EvidenceFixture(t *testing.T, mutateEvidence func(map[string]any)) (string, string, string) {
+	t.Helper()
+	root := t.TempDir()
+	store, run, lease, snapshot, evidence := clinicalTrialAuditStoreEvidenceFixtureAt(t, root)
+	if _, err := store.CheckpointRun(run.RunID, "worker-a", lease.LeaseToken, ClinicalTrialAuditCheckpoint{
+		State: ClinicalTrialAuditRunComparing, Sources: []ClinicalTrialSourceSnapshot{snapshot}, Evidence: []ClinicalTrialAuditEvidencePayload{evidence},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, clinicalTrialAuditDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var evidenceJSON, snapshotJSON string
+	if err := db.QueryRow(`SELECT evidence_json FROM clinical_trial_audit_evidence`).Scan(&evidenceJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT snapshot_json FROM clinical_trial_audit_snapshots WHERE run_id = ?`, run.RunID).Scan(&snapshotJSON); err != nil {
+		t.Fatal(err)
+	}
+	var evidenceObject, snapshotObject map[string]any
+	if err := json.Unmarshal([]byte(evidenceJSON), &evidenceObject); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(snapshotJSON), &snapshotObject); err != nil {
+		t.Fatal(err)
+	}
+	evidenceObject["provenance"] = map[string]any{"data_timestamp": snapshot.DataTimestamp}
+	delete(snapshotObject, "data_timestamp")
+	delete(snapshotObject, "provenance_digest")
+	if mutateEvidence != nil {
+		mutateEvidence(evidenceObject)
+	}
+	legacyEvidence, err := json.Marshal(evidenceObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySnapshot, err := json.Marshal(snapshotObject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE clinical_trial_audit_evidence SET evidence_json = ?`, string(legacyEvidence)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE clinical_trial_audit_snapshots SET snapshot_json = ? WHERE run_id = ?`, string(legacySnapshot), run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		`ALTER TABLE clinical_trial_audit_snapshot_evidence DROP COLUMN retrieved_at`,
+		`ALTER TABLE clinical_trial_audit_snapshot_evidence DROP COLUMN data_timestamp`,
+		`ALTER TABLE clinical_trial_audit_snapshot_evidence DROP COLUMN provenance_digest`,
+		`PRAGMA user_version = 3`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatalf("prepare v3 fixture %q: %v", statement, err)
+		}
+	}
+	return root, run.RunID, snapshot.DataTimestamp
+}
+
+func clinicalTrialAuditStoreEvidenceFixture(t *testing.T) (*ClinicalTrialAuditStore, ClinicalTrialAuditStoredRun, *ClinicalTrialAuditStoredRun, ClinicalTrialSourceSnapshot, ClinicalTrialAuditEvidencePayload) {
+	t.Helper()
+	return clinicalTrialAuditStoreEvidenceFixtureAt(t, t.TempDir())
 }
 
 func clinicalTrialAuditStoreStudy() ClinicalTrialsGovStudy {
@@ -1054,7 +1234,7 @@ func clinicalTrialAuditStoreStudy() ClinicalTrialsGovStudy {
 		Coverage: ClinicalTrialsGovEvidenceCoverage{
 			IncludedModules: []string{"protocol", "participant_flow", "outcome_measures"},
 			ExcludedModules: []string{"baseline_characteristics", "adverse_events", "more_info"},
-			Limitations:     []string{"ClinicalTrials.gov baseline characteristics, adverse events, and more-info modules are outside v1 coverage."},
+			Limitations:     []string{ClinicalTrialsGovCoverageLimitationResultsModulesExcludedV1},
 		},
 		ParticipantFlow: ClinicalTrialsGovParticipantFlow{
 			Groups:  []ClinicalTrialsGovResultGroup{{ID: "FG000", Title: "Experimental"}},

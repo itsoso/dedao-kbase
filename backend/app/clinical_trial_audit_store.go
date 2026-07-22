@@ -25,9 +25,10 @@ const (
 	clinicalTrialAuditErrorCodeMaxBytes      = 64
 	clinicalTrialAuditCursorEncodedMaxBytes  = 1024
 	clinicalTrialAuditCursorDecodedMaxBytes  = 512
-	clinicalTrialAuditSchemaVersion          = 3
+	clinicalTrialAuditSchemaVersion          = 4
 	ClinicalTrialAuditStoredRunSchemaVersion = "clinical-trial-audit-stored-run.v1"
 	ClinicalTrialAuditEvidenceSchemaVersion  = "clinical-trial-normalized-evidence.v1"
+	clinicalTrialAuditEvidenceV1Incompatible = "evidence_v1_incompatible"
 
 	ClinicalTrialAuditErrorIdentifierInvalid        = "identifier_invalid"
 	ClinicalTrialAuditErrorSourceNotFound           = "source_not_found"
@@ -48,15 +49,16 @@ const (
 )
 
 var (
-	ErrClinicalTrialAuditRunNotFound         = errors.New("clinical trial audit run not found")
-	ErrClinicalTrialAuditIdempotencyConflict = errors.New("clinical trial audit idempotency conflict")
-	ErrClinicalTrialAuditLeaseOwner          = errors.New("clinical trial audit run belongs to another worker")
-	ErrClinicalTrialAuditLeaseFence          = errors.New("clinical trial audit lease token is stale")
-	ErrClinicalTrialAuditLeaseExpired        = errors.New("clinical trial audit run lease expired")
-	ErrClinicalTrialAuditTerminal            = errors.New("clinical trial audit run is terminal")
-	ErrClinicalTrialAuditInvalidTransition   = errors.New("invalid clinical trial audit transition")
-	ErrClinicalTrialAuditNotRetryable        = errors.New("clinical trial audit run is not retryable")
-	errClinicalTrialAuditRandomUnavailable   = errors.New("clinical trial audit secure randomness unavailable")
+	ErrClinicalTrialAuditRunNotFound          = errors.New("clinical trial audit run not found")
+	ErrClinicalTrialAuditIdempotencyConflict  = errors.New("clinical trial audit idempotency conflict")
+	ErrClinicalTrialAuditLeaseOwner           = errors.New("clinical trial audit run belongs to another worker")
+	ErrClinicalTrialAuditLeaseFence           = errors.New("clinical trial audit lease token is stale")
+	ErrClinicalTrialAuditLeaseExpired         = errors.New("clinical trial audit run lease expired")
+	ErrClinicalTrialAuditTerminal             = errors.New("clinical trial audit run is terminal")
+	ErrClinicalTrialAuditInvalidTransition    = errors.New("invalid clinical trial audit transition")
+	ErrClinicalTrialAuditNotRetryable         = errors.New("clinical trial audit run is not retryable")
+	ErrClinicalTrialAuditEvidenceIncompatible = errors.New("clinical trial audit evidence is incompatible")
+	errClinicalTrialAuditRandomUnavailable    = errors.New("clinical trial audit secure randomness unavailable")
 )
 
 type ClinicalTrialAuditStoredRun struct {
@@ -85,15 +87,10 @@ type ClinicalTrialAuditStoredRun struct {
 }
 
 type ClinicalTrialAuditEvidencePayload struct {
-	SchemaVersion string                               `json:"schema_version"`
-	SourceType    string                               `json:"source_type"`
-	ContentHash   string                               `json:"content_hash"`
-	Provenance    ClinicalTrialAuditEvidenceProvenance `json:"provenance"`
-	Data          json.RawMessage                      `json:"data"`
-}
-
-type ClinicalTrialAuditEvidenceProvenance struct {
-	DataTimestamp string `json:"data_timestamp"`
+	SchemaVersion string          `json:"schema_version"`
+	SourceType    string          `json:"source_type"`
+	ContentHash   string          `json:"content_hash"`
+	Data          json.RawMessage `json:"data"`
 }
 
 type ClinicalTrialAuditFailure struct {
@@ -300,13 +297,18 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 		CREATE TABLE IF NOT EXISTS clinical_trial_audit_evidence (
 			content_hash TEXT PRIMARY KEY,
 			source_type TEXT NOT NULL,
-			evidence_json TEXT NOT NULL
+			evidence_json TEXT NOT NULL,
+			compatible INTEGER NOT NULL DEFAULT 1,
+			incompatibility_code TEXT NOT NULL DEFAULT ''
 		);
 
 		CREATE TABLE IF NOT EXISTS clinical_trial_audit_snapshot_evidence (
 			run_id TEXT NOT NULL,
 			fingerprint TEXT NOT NULL,
 			content_hash TEXT NOT NULL,
+			retrieved_at TEXT NOT NULL DEFAULT '',
+			data_timestamp TEXT NOT NULL DEFAULT '',
+			provenance_digest TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY(run_id, fingerprint),
 			FOREIGN KEY(run_id, fingerprint) REFERENCES clinical_trial_audit_snapshots(run_id, fingerprint) ON DELETE CASCADE,
 			FOREIGN KEY(content_hash) REFERENCES clinical_trial_audit_evidence(content_hash)
@@ -323,6 +325,22 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 			return err
 		}
 	}
+	for _, column := range []struct{ table, name, definition string }{
+		{"clinical_trial_audit_evidence", "compatible", "INTEGER NOT NULL DEFAULT 1"},
+		{"clinical_trial_audit_evidence", "incompatibility_code", "TEXT NOT NULL DEFAULT ''"},
+		{"clinical_trial_audit_snapshot_evidence", "retrieved_at", "TEXT NOT NULL DEFAULT ''"},
+		{"clinical_trial_audit_snapshot_evidence", "data_timestamp", "TEXT NOT NULL DEFAULT ''"},
+		{"clinical_trial_audit_snapshot_evidence", "provenance_digest", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureClinicalTrialAuditColumn(ctx, conn, column.table, column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	if currentVersion == 3 {
+		if err := migrateClinicalTrialAuditV3Evidence(ctx, conn); err != nil {
+			return err
+		}
+	}
 	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`PRAGMA user_version = %d`, clinicalTrialAuditSchemaVersion)); err != nil {
 		return err
 	}
@@ -330,6 +348,106 @@ func migrateClinicalTrialAuditDB(db *sql.DB) error {
 		return err
 	}
 	committed = true
+	return nil
+}
+
+func migrateClinicalTrialAuditV3Evidence(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `SELECT content_hash, evidence_json FROM clinical_trial_audit_evidence`)
+	if err != nil {
+		return err
+	}
+	type migratedEvidence struct {
+		contentHash, encoded, dataTimestamp string
+		compatible                          bool
+	}
+	var migrated []migratedEvidence
+	for rows.Next() {
+		var contentHash, encoded string
+		if err := rows.Scan(&contentHash, &encoded); err != nil {
+			rows.Close()
+			return err
+		}
+		var legacy struct {
+			SchemaVersion string `json:"schema_version"`
+			SourceType    string `json:"source_type"`
+			ContentHash   string `json:"content_hash"`
+			Provenance    struct {
+				DataTimestamp string `json:"data_timestamp"`
+			} `json:"provenance"`
+			Data json.RawMessage `json:"data"`
+		}
+		item := migratedEvidence{contentHash: contentHash}
+		if json.Unmarshal([]byte(encoded), &legacy) == nil {
+			timestamp, timestampErr := canonicalClinicalTrialTimestamp("data_timestamp", legacy.Provenance.DataTimestamp, true)
+			current := ClinicalTrialAuditEvidencePayload{SchemaVersion: legacy.SchemaVersion, SourceType: legacy.SourceType, ContentHash: legacy.ContentHash, Data: legacy.Data}
+			finalized, finalizeErr := finalizeClinicalTrialAuditEvidencePayload(current)
+			canonical, marshalErr := marshalBoundedClinicalTrialAuditJSON(finalized, clinicalTrialAuditJSONMaxBytes)
+			if timestampErr == nil && timestamp == legacy.Provenance.DataTimestamp && finalizeErr == nil && marshalErr == nil && finalized.ContentHash == contentHash {
+				item.encoded, item.dataTimestamp, item.compatible = string(canonical), timestamp, true
+			}
+		}
+		migrated = append(migrated, item)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range migrated {
+		if !item.compatible {
+			if _, err := conn.ExecContext(ctx, `UPDATE clinical_trial_audit_evidence SET compatible = 0, incompatibility_code = ? WHERE content_hash = ?`, clinicalTrialAuditEvidenceV1Incompatible, item.contentHash); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, `UPDATE clinical_trial_audit_evidence SET evidence_json = ?, compatible = 1, incompatibility_code = '' WHERE content_hash = ?`, item.encoded, item.contentHash); err != nil {
+			return err
+		}
+		linkRows, err := conn.QueryContext(ctx, `
+			SELECT snapshot.run_id, snapshot.fingerprint, snapshot.snapshot_json
+			FROM clinical_trial_audit_snapshot_evidence AS link
+			JOIN clinical_trial_audit_snapshots AS snapshot ON snapshot.run_id = link.run_id AND snapshot.fingerprint = link.fingerprint
+			WHERE link.content_hash = ?`, item.contentHash)
+		if err != nil {
+			return err
+		}
+		type migratedLink struct{ runID, fingerprint, snapshotJSON, retrievedAt, digest string }
+		var links []migratedLink
+		for linkRows.Next() {
+			var link migratedLink
+			if err := linkRows.Scan(&link.runID, &link.fingerprint, &link.snapshotJSON); err != nil {
+				linkRows.Close()
+				return err
+			}
+			var snapshot ClinicalTrialSourceSnapshot
+			if json.Unmarshal([]byte(link.snapshotJSON), &snapshot) != nil {
+				linkRows.Close()
+				return fmt.Errorf("migrate clinical trial v3 snapshot: invalid JSON")
+			}
+			snapshot.DataTimestamp = item.dataTimestamp
+			finalized, err := FinalizeClinicalTrialSourceSnapshot(snapshot)
+			if err != nil || finalized.Fingerprint != link.fingerprint {
+				linkRows.Close()
+				return fmt.Errorf("migrate clinical trial v3 snapshot: identity mismatch")
+			}
+			canonical, err := marshalBoundedClinicalTrialAuditJSON(finalized, clinicalTrialAuditJSONMaxBytes)
+			if err != nil {
+				linkRows.Close()
+				return err
+			}
+			link.snapshotJSON, link.retrievedAt, link.digest = string(canonical), finalized.RetrievedAt, finalized.ProvenanceDigest
+			links = append(links, link)
+		}
+		if err := linkRows.Close(); err != nil {
+			return err
+		}
+		for _, link := range links {
+			if _, err := conn.ExecContext(ctx, `UPDATE clinical_trial_audit_snapshots SET snapshot_json = ? WHERE run_id = ? AND fingerprint = ?`, link.snapshotJSON, link.runID, link.fingerprint); err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, `UPDATE clinical_trial_audit_snapshot_evidence SET retrieved_at = ?, data_timestamp = ?, provenance_digest = ? WHERE run_id = ? AND fingerprint = ?`, link.retrievedAt, item.dataTimestamp, link.digest, link.runID, link.fingerprint); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -832,7 +950,9 @@ type clinicalTrialAuditQueryer interface {
 func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *ClinicalTrialAuditStoredRun) error {
 	rows, err := queryer.Query(`
 		SELECT snapshot.fingerprint, snapshot.snapshot_json,
-			link.content_hash, evidence.content_hash, evidence.source_type, evidence.evidence_json
+			link.content_hash, link.retrieved_at, link.data_timestamp, link.provenance_digest,
+			evidence.content_hash, evidence.source_type, evidence.evidence_json,
+			evidence.compatible, evidence.incompatibility_code
 		FROM clinical_trial_audit_snapshots AS snapshot
 		LEFT JOIN clinical_trial_audit_snapshot_evidence AS link
 			ON link.run_id = snapshot.run_id AND link.fingerprint = snapshot.fingerprint
@@ -847,8 +967,11 @@ func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *Clini
 	evidenceSeen := make(map[string]struct{})
 	for rows.Next() {
 		var storedFingerprint, snapshotJSON string
-		var linkHash, evidenceHash, evidenceSource, evidenceJSON sql.NullString
-		if err := rows.Scan(&storedFingerprint, &snapshotJSON, &linkHash, &evidenceHash, &evidenceSource, &evidenceJSON); err != nil {
+		var linkHash, linkRetrievedAt, linkDataTimestamp, linkProvenanceDigest sql.NullString
+		var evidenceHash, evidenceSource, evidenceJSON, incompatibilityCode sql.NullString
+		var compatible sql.NullInt64
+		if err := rows.Scan(&storedFingerprint, &snapshotJSON, &linkHash, &linkRetrievedAt, &linkDataTimestamp, &linkProvenanceDigest,
+			&evidenceHash, &evidenceSource, &evidenceJSON, &compatible, &incompatibilityCode); err != nil {
 			rows.Close()
 			return err
 		}
@@ -861,24 +984,40 @@ func loadClinicalTrialAuditRunData(queryer clinicalTrialAuditQueryer, run *Clini
 			rows.Close()
 			return err
 		}
-		finalizedSnapshot, err := FinalizeClinicalTrialSourceSnapshot(snapshot)
-		if err != nil || finalizedSnapshot.Fingerprint != snapshot.Fingerprint || storedFingerprint != snapshot.Fingerprint {
-			rows.Close()
-			return fmt.Errorf("persisted clinical trial snapshot fingerprint mismatch")
-		}
-		run.Sources = append(run.Sources, snapshot)
-		linked := linkHash.Valid || evidenceHash.Valid || evidenceSource.Valid || evidenceJSON.Valid
+		linked := linkHash.Valid || linkRetrievedAt.Valid || linkDataTimestamp.Valid || linkProvenanceDigest.Valid ||
+			evidenceHash.Valid || evidenceSource.Valid || evidenceJSON.Valid || compatible.Valid || incompatibilityCode.Valid
 		if !linked {
 			if snapshot.SourceType == ClinicalTrialsGovStudySourceType {
 				rows.Close()
 				return fmt.Errorf("ClinicalTrials.gov snapshot is missing normalized evidence")
 			}
+			finalizedSnapshot, err := FinalizeClinicalTrialSourceSnapshot(snapshot)
+			if err != nil || finalizedSnapshot.Fingerprint != snapshot.Fingerprint || storedFingerprint != snapshot.Fingerprint {
+				rows.Close()
+				return fmt.Errorf("persisted clinical trial snapshot fingerprint mismatch")
+			}
+			run.Sources = append(run.Sources, snapshot)
 			continue
 		}
-		if !linkHash.Valid || !evidenceHash.Valid || !evidenceSource.Valid || !evidenceJSON.Valid {
+		if !linkHash.Valid || !linkRetrievedAt.Valid || !linkDataTimestamp.Valid || !linkProvenanceDigest.Valid ||
+			!evidenceHash.Valid || !evidenceSource.Valid || !evidenceJSON.Valid || !compatible.Valid || !incompatibilityCode.Valid {
 			rows.Close()
 			return fmt.Errorf("persisted clinical trial evidence link is incomplete")
 		}
+		if compatible.Int64 != 1 {
+			rows.Close()
+			return fmt.Errorf("%w: %s", ErrClinicalTrialAuditEvidenceIncompatible, incompatibilityCode.String)
+		}
+		finalizedSnapshot, err := FinalizeClinicalTrialSourceSnapshot(snapshot)
+		if err != nil || finalizedSnapshot.Fingerprint != snapshot.Fingerprint || storedFingerprint != snapshot.Fingerprint {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial snapshot fingerprint mismatch")
+		}
+		if linkRetrievedAt.String != snapshot.RetrievedAt || linkDataTimestamp.String != snapshot.DataTimestamp || linkProvenanceDigest.String != snapshot.ProvenanceDigest {
+			rows.Close()
+			return fmt.Errorf("persisted clinical trial snapshot provenance mismatch")
+		}
+		run.Sources = append(run.Sources, snapshot)
 		linkedRows++
 		if linkHash.String != evidenceHash.String || linkHash.String != snapshot.ContentHash || evidenceSource.String != snapshot.SourceType {
 			rows.Close()
@@ -1009,8 +1148,8 @@ func persistClinicalTrialAuditCheckpoint(tx *sql.Tx, runID string, checkpoint Cl
 				return err
 			}
 			if _, err := tx.Exec(`
-				INSERT INTO clinical_trial_audit_evidence (content_hash, source_type, evidence_json)
-				VALUES (?, ?, ?) ON CONFLICT(content_hash) DO NOTHING
+				INSERT INTO clinical_trial_audit_evidence (content_hash, source_type, evidence_json, compatible, incompatibility_code)
+				VALUES (?, ?, ?, 1, '') ON CONFLICT(content_hash) DO NOTHING
 			`, evidence.ContentHash, evidence.SourceType, string(encoded)); err != nil {
 				return err
 			}
@@ -1051,7 +1190,11 @@ func persistClinicalTrialAuditCheckpoint(tx *sql.Tx, runID string, checkpoint Cl
 				return err
 			}
 			if evidence, exists := availableEvidence[snapshot.SourceType+"\x00"+snapshot.ContentHash]; exists {
-				if _, err := tx.Exec(`INSERT INTO clinical_trial_audit_snapshot_evidence (run_id, fingerprint, content_hash) VALUES (?, ?, ?)`, runID, snapshot.Fingerprint, evidence.ContentHash); err != nil {
+				if _, err := tx.Exec(`
+					INSERT INTO clinical_trial_audit_snapshot_evidence
+						(run_id, fingerprint, content_hash, retrieved_at, data_timestamp, provenance_digest)
+					VALUES (?, ?, ?, ?, ?, ?)
+				`, runID, finalized.Fingerprint, evidence.ContentHash, finalized.RetrievedAt, finalized.DataTimestamp, finalized.ProvenanceDigest); err != nil {
 					return err
 				}
 			}

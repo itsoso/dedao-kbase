@@ -17,35 +17,36 @@ import (
 )
 
 const (
-	ClinicalTrialsGovBaseURL                      = "https://clinicaltrials.gov"
-	ClinicalTrialsGovStudySourceType              = "clinicaltrials_gov_study"
-	ClinicalTrialsGovMaxStudyBytes                = 1 << 20
-	ClinicalTrialsGovMaxVersionBytes              = 64 << 10
-	ClinicalTrialsGovMaxRetryAfter                = time.Hour
-	ClinicalTrialsGovMaxRequestTimeout            = 2 * time.Minute
-	ClinicalTrialsGovMaxReportedOutcomes          = 256
-	ClinicalTrialsGovMaxResultGroups              = 128
-	ClinicalTrialsGovMaxResultClasses             = 256
-	ClinicalTrialsGovMaxResultCategories          = 512
-	ClinicalTrialsGovMaxGroupMeasurements         = 2048
-	ClinicalTrialsGovMaxResultDenominators        = 128
-	ClinicalTrialsGovMaxDenominatorCounts         = 2048
-	ClinicalTrialsGovMaxResultAnalyses            = 128
-	ClinicalTrialsGovMaxAnalysisGroups            = 128
-	ClinicalTrialsGovMaxProtocolConditions        = 512
-	ClinicalTrialsGovMaxProtocolArms              = 256
-	ClinicalTrialsGovMaxProtocolInterventions     = 512
-	ClinicalTrialsGovMaxProtocolOutcomes          = 512
-	ClinicalTrialsGovMaxProtocolReferences        = 1024
-	ClinicalTrialsGovMaxProtocolInterventionNames = 512
-	ClinicalTrialsGovMaxProtocolArmGroupLabels    = 256
-	ClinicalTrialsGovMaxProtocolOtherNames        = 256
-	ClinicalTrialsGovMaxFlowGroups                = 128
-	ClinicalTrialsGovMaxFlowPeriods               = 64
-	ClinicalTrialsGovMaxFlowMilestones            = 512
-	ClinicalTrialsGovMaxFlowAchievements          = 4096
-	ClinicalTrialsGovMaxFlowDropWithdraws         = 512
-	ClinicalTrialsGovMaxFlowReasons               = 4096
+	ClinicalTrialsGovBaseURL                                    = "https://clinicaltrials.gov"
+	ClinicalTrialsGovStudySourceType                            = "clinicaltrials_gov_study"
+	ClinicalTrialsGovMaxStudyBytes                              = 1 << 20
+	ClinicalTrialsGovMaxVersionBytes                            = 64 << 10
+	ClinicalTrialsGovMaxRetryAfter                              = time.Hour
+	ClinicalTrialsGovMaxRequestTimeout                          = 2 * time.Minute
+	ClinicalTrialsGovMaxReportedOutcomes                        = 256
+	ClinicalTrialsGovMaxResultGroups                            = 128
+	ClinicalTrialsGovMaxResultClasses                           = 256
+	ClinicalTrialsGovMaxResultCategories                        = 512
+	ClinicalTrialsGovMaxGroupMeasurements                       = 2048
+	ClinicalTrialsGovMaxResultDenominators                      = 128
+	ClinicalTrialsGovMaxDenominatorCounts                       = 2048
+	ClinicalTrialsGovMaxResultAnalyses                          = 128
+	ClinicalTrialsGovMaxAnalysisGroups                          = 128
+	ClinicalTrialsGovMaxProtocolConditions                      = 512
+	ClinicalTrialsGovMaxProtocolArms                            = 256
+	ClinicalTrialsGovMaxProtocolInterventions                   = 512
+	ClinicalTrialsGovMaxProtocolOutcomes                        = 512
+	ClinicalTrialsGovMaxProtocolReferences                      = 1024
+	ClinicalTrialsGovMaxProtocolInterventionNames               = 512
+	ClinicalTrialsGovMaxProtocolArmGroupLabels                  = 256
+	ClinicalTrialsGovMaxProtocolOtherNames                      = 256
+	ClinicalTrialsGovMaxFlowGroups                              = 128
+	ClinicalTrialsGovMaxFlowPeriods                             = 64
+	ClinicalTrialsGovMaxFlowMilestones                          = 512
+	ClinicalTrialsGovMaxFlowAchievements                        = 4096
+	ClinicalTrialsGovMaxFlowDropWithdraws                       = 512
+	ClinicalTrialsGovMaxFlowReasons                             = 4096
+	ClinicalTrialsGovCoverageLimitationResultsModulesExcludedV1 = "results_modules_excluded_v1"
 
 	clinicalTrialsGovUserAgent             = "dedao-kbase/clinical-trial-audit"
 	clinicalTrialsGovDefaultRequestTimeout = 20 * time.Second
@@ -411,18 +412,8 @@ func validateClinicalTrialsGovCoverage(coverage ClinicalTrialsGovEvidenceCoverag
 		!clinicalTrialsGovStringSetEquals(coverage.ExcludedModules, []string{"baseline_characteristics", "adverse_events", "more_info"}) {
 		return fmt.Errorf("ClinicalTrials.gov v1 coverage declarations are invalid")
 	}
-	if len(coverage.Limitations) == 0 {
-		return fmt.Errorf("ClinicalTrials.gov v1 coverage limitations are required")
-	}
-	seen := make(map[string]struct{}, len(coverage.Limitations))
-	for _, limitation := range coverage.Limitations {
-		if strings.TrimSpace(limitation) == "" || limitation != strings.TrimSpace(limitation) {
-			return fmt.Errorf("ClinicalTrials.gov coverage limitation is not canonical")
-		}
-		if _, exists := seen[limitation]; exists {
-			return fmt.Errorf("ClinicalTrials.gov coverage limitations contain duplicates")
-		}
-		seen[limitation] = struct{}{}
+	if !clinicalTrialsGovStringSetEquals(coverage.Limitations, []string{ClinicalTrialsGovCoverageLimitationResultsModulesExcludedV1}) {
+		return fmt.Errorf("ClinicalTrials.gov v1 coverage limitation codes are invalid")
 	}
 	return nil
 }
@@ -570,11 +561,10 @@ type ClinicalTrialsGovStudyResult struct {
 	DataTimestamp string                            `json:"data_timestamp"`
 }
 
-func NewClinicalTrialsGovEvidencePayload(study ClinicalTrialsGovStudy, dataTimestamp string) (ClinicalTrialAuditEvidencePayload, error) {
+func NewClinicalTrialsGovEvidencePayload(study ClinicalTrialsGovStudy) (ClinicalTrialAuditEvidencePayload, error) {
 	evidence := ClinicalTrialAuditEvidencePayload{
 		SchemaVersion: ClinicalTrialAuditEvidenceSchemaVersion,
 		SourceType:    ClinicalTrialsGovStudySourceType,
-		Provenance:    ClinicalTrialAuditEvidenceProvenance{DataTimestamp: dataTimestamp},
 	}
 	encoded, err := json.Marshal(study)
 	if err != nil {
@@ -600,10 +590,6 @@ func finalizeClinicalTrialsGovEvidencePayload(evidence ClinicalTrialAuditEvidenc
 	if evidence.SchemaVersion != ClinicalTrialAuditEvidenceSchemaVersion || evidence.SourceType != ClinicalTrialsGovStudySourceType {
 		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("invalid ClinicalTrials.gov evidence identity")
 	}
-	dataTimestamp, err := canonicalClinicalTrialTimestamp("data_timestamp", evidence.Provenance.DataTimestamp, true)
-	if err != nil || dataTimestamp != evidence.Provenance.DataTimestamp {
-		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("ClinicalTrials.gov evidence data_timestamp must be canonical UTC RFC3339")
-	}
 	var study ClinicalTrialsGovStudy
 	decoder := json.NewDecoder(bytes.NewReader(evidence.Data))
 	decoder.DisallowUnknownFields()
@@ -625,7 +611,6 @@ func finalizeClinicalTrialsGovEvidencePayload(evidence ClinicalTrialAuditEvidenc
 		return ClinicalTrialAuditEvidencePayload{}, fmt.Errorf("clinical trial evidence content_hash does not match canonical normalized data")
 	}
 	evidence.ContentHash = contentHash
-	evidence.Provenance.DataTimestamp = dataTimestamp
 	evidence.Data = canonical
 	return evidence, nil
 }
@@ -732,7 +717,7 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 	if study.NCTID != request.NormalizedInput {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorIdentifierMismatch}
 	}
-	evidence, err := NewClinicalTrialsGovEvidencePayload(study, version.DataTimestamp)
+	evidence, err := NewClinicalTrialsGovEvidencePayload(study)
 	if err != nil {
 		return ClinicalTrialsGovStudyResult{}, &ClinicalTrialsGovError{Kind: ClinicalTrialsGovErrorSchemaInvalid, cause: err}
 	}
@@ -740,6 +725,7 @@ func (c *ClinicalTrialsGovClient) GetStudy(ctx context.Context, nctID string) (C
 		SourceType:        ClinicalTrialsGovStudySourceType,
 		CanonicalID:       study.NCTID,
 		RetrievedAt:       c.now().UTC().Format(time.RFC3339Nano),
+		DataTimestamp:     version.DataTimestamp,
 		UpstreamUpdatedAt: study.LastUpdatePosted.Value,
 		ContentHash:       evidence.ContentHash,
 		LicenseScope:      "public_metadata",
@@ -1078,7 +1064,7 @@ func normalizeClinicalTrialsGovStudy(body []byte, apiVersion string) (ClinicalTr
 		Coverage: ClinicalTrialsGovEvidenceCoverage{
 			IncludedModules: []string{"protocol", "participant_flow", "outcome_measures"},
 			ExcludedModules: []string{"baseline_characteristics", "adverse_events", "more_info"},
-			Limitations:     []string{"ClinicalTrials.gov baseline characteristics, adverse events, and more-info modules are outside v1 normalized evidence coverage."},
+			Limitations:     []string{ClinicalTrialsGovCoverageLimitationResultsModulesExcludedV1},
 		},
 	}
 	var err error
