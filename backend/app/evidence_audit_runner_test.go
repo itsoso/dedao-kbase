@@ -145,7 +145,7 @@ func TestEvidenceAuditRunnerGroupsAndCapsSupportingEvidenceAcrossReleases(t *tes
 		t.Fatal(err)
 	}
 	retrieved, err := retrieveEvidenceAuditSupportingEvidence(
-		store, loaded, releases, "Synthetic grounded statement",
+		context.Background(), store, loaded, releases, "Synthetic grounded statement",
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -208,21 +208,219 @@ func TestEvidenceAuditRunnerFailsClosedAndPersistsFailedTrace(t *testing.T) {
 }
 
 func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
+	for _, scope := range []string{
+		"Diagnose me and recommend an individual treatment.",
+		"Should I stop aspirin?",
+		"What dose should I take?",
+		"Could another medicine work better for me?",
+		"Could this rash be melanoma?",
+		"Is chemotherapy right for my case?",
+		"我是否应该停药？",
+		"能不能给我换药？",
+		"这个药要不要加量？",
+		"阿司匹林怎么吃",
+		"我的头痛是什么病？",
+	} {
+		t.Run(scope, func(t *testing.T) {
+			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+			audit := createEvidenceAuditRunnerTask(
+				t, store, pkg, "runner-medical-advice-"+sha256Fingerprint([]byte(scope)), scope,
+			)
+			client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+			completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(client.calls) != 0 || completed.ClaimAudits[0].Verdict != EvidenceAuditVerdictInsufficient {
+				t.Fatalf("unsafe advice path = %#v calls=%d", completed, len(client.calls))
+			}
+			trace, err := store.LoadAgentTrace(completed.TraceID)
+			if err != nil || trace.Final.Outcome != AgentTraceOutcomeAbstained {
+				t.Fatalf("abstained trace = %#v err=%v", trace, err)
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditRunnerTraceFinalCitationsMatchOnlyReportEvidence(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
-	audit := createEvidenceAuditRunnerTask(
-		t, store, pkg, "runner-medical-advice", "Diagnose me and recommend an individual treatment.",
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-selected-citations", "Evidence comparison only.")
+	answer := `{"candidate_verdict":"supported","rationale":"one selected item","evidence":[` +
+		`{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],` +
+		`"limitations":[],"knowledge_gaps":[],"review_actions":[]}`
+	completed, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID,
+		&evidenceAuditFakeClient{answers: []string{answer}}, evidenceAuditRunnerConfig(),
 	)
-	client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
-	completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(client.calls) != 0 || completed.ClaimAudits[0].Verdict != EvidenceAuditVerdictInsufficient {
-		t.Fatalf("unsafe advice path = %#v calls=%d", completed, len(client.calls))
-	}
 	trace, err := store.LoadAgentTrace(completed.TraceID)
-	if err != nil || trace.Final.Outcome != AgentTraceOutcomeAbstained {
-		t.Fatalf("abstained trace = %#v err=%v", trace, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Retrievals) < 2 {
+		t.Fatalf("retrieval trace lost unselected hits: %#v", trace.Retrievals)
+	}
+	if len(trace.Final.Citations) != 1 ||
+		trace.Final.Citations[0].CitationID != completed.ClaimAudits[0].Evidence[0].CitationID {
+		t.Fatalf("final citations = %#v, report evidence = %#v", trace.Final.Citations, completed.ClaimAudits[0].Evidence)
+	}
+}
+
+func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
+	tests := []struct {
+		name        string
+		installFail func(t *testing.T)
+		firstStatus string
+		traceExists bool
+	}{
+		{
+			name:        "report store failure",
+			firstStatus: EvidenceAuditRunning,
+			installFail: func(t *testing.T) {
+				previous := evidenceAuditStorageFault
+				manifestWrites := 0
+				evidenceAuditStorageFault = func(stage, _ string) error {
+					if stage == evidenceAuditFaultManifestBeforePublish {
+						manifestWrites++
+						if manifestWrites == 2 {
+							return errors.New("synthetic report manifest failure")
+						}
+					}
+					return nil
+				}
+				t.Cleanup(func() { evidenceAuditStorageFault = previous })
+			},
+		},
+		{
+			name:        "trace save failure",
+			firstStatus: EvidenceAuditCompleted,
+			installFail: func(t *testing.T) {
+				previous := evidenceAuditTraceStorageFault
+				failed := false
+				evidenceAuditTraceStorageFault = func(stage, _ string) error {
+					if stage == evidenceAuditTraceFaultBeforeSave && !failed {
+						failed = true
+						return errors.New("synthetic trace save failure")
+					}
+					return nil
+				}
+				t.Cleanup(func() { evidenceAuditTraceStorageFault = previous })
+			},
+		},
+		{
+			name:        "trace finalize failure",
+			firstStatus: EvidenceAuditCompleted,
+			traceExists: true,
+			installFail: func(t *testing.T) {
+				previous := evidenceAuditTraceStorageFault
+				failed := false
+				evidenceAuditTraceStorageFault = func(stage, _ string) error {
+					if stage == evidenceAuditTraceFaultBeforeFinalize && !failed {
+						failed = true
+						return errors.New("synthetic trace finalize failure")
+					}
+					return nil
+				}
+				t.Cleanup(func() { evidenceAuditTraceStorageFault = previous })
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+			audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-recovery-"+tt.name, "Evidence comparison only.")
+			client := &evidenceAuditFakeClient{answers: []string{
+				`{"candidate_verdict":"supported","rationale":"support","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+			}}
+			tt.installFail(t)
+			if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig()); err == nil {
+				t.Fatal("first run unexpectedly succeeded")
+			}
+			first, err := store.LoadEvidenceAudit(audit.AuditID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.Status != tt.firstStatus {
+				t.Fatalf("audit status after injected failure = %q, want %q", first.Status, tt.firstStatus)
+			}
+			_, traceErr := store.LoadAgentTrace(first.TraceID)
+			if (traceErr == nil) != tt.traceExists {
+				t.Fatalf("trace existence after injected failure = %v, want %v", traceErr == nil, tt.traceExists)
+			}
+			recovered, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
+			if err != nil {
+				t.Fatalf("recovery run failed: %v", err)
+			}
+			if recovered.Status != EvidenceAuditCompleted {
+				t.Fatalf("recovered audit = %#v", recovered)
+			}
+			trace, err := store.LoadAgentTrace(recovered.TraceID)
+			if err != nil || trace.Final.Outcome != AgentTraceOutcomeCompleted {
+				t.Fatalf("recovered trace = %#v err=%v", trace, err)
+			}
+			if len(client.calls) != 1 {
+				t.Fatalf("recovery reran model %d times", len(client.calls))
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditRunnerFailsClosedWhenTracePreparationCannotPersist(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-trace-prepare-failure", "Evidence comparison only.")
+	previous := evidenceAuditTraceStorageFault
+	evidenceAuditTraceStorageFault = func(stage, _ string) error {
+		if stage == evidenceAuditTraceFaultBeforePrepare {
+			return errors.New("synthetic trace prepare failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditTraceStorageFault = previous })
+	client := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"support","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig()); err == nil {
+		t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+	}
+	stored, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status == EvidenceAuditCompleted {
+		t.Fatalf("audit completed without a recoverable trace: %#v", stored)
+	}
+}
+
+func TestEvidenceAuditRunnerContextCoversRetrievalAndCitationResolution(t *testing.T) {
+	for _, stage := range []string{"retrieval", "citation"} {
+		t.Run(stage, func(t *testing.T) {
+			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+			audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-context-"+stage, "Evidence comparison only.")
+			previous := evidenceAuditRuntimeStageHook
+			evidenceAuditRuntimeStageHook = func(ctx context.Context, current string) error {
+				if current != stage {
+					return nil
+				}
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+			cfg := evidenceAuditRunnerConfig()
+			cfg.Timeout = 10 * time.Millisecond
+			client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+			if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, cfg); err == nil {
+				t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+			}
+			if len(client.calls) != 0 {
+				t.Fatalf("model called after %s timeout", stage)
+			}
+			failed, err := store.LoadEvidenceAudit(audit.AuditID)
+			if err != nil || failed.Status != EvidenceAuditFailed {
+				t.Fatalf("failed audit = %#v err=%v", failed, err)
+			}
+		})
 	}
 }
 

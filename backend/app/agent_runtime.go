@@ -157,6 +157,26 @@ func searchAgentPackageReleaseEvidence(
 	return results, nil
 }
 
+func searchAgentPackageReleaseEvidenceContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	releaseID, query string,
+	limit int,
+) ([]AgentPackageEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	results, err := searchAgentPackageReleaseEvidence(store, pkg, releaseID, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return results, nil
+}
+
 func resolveAgentPackageReleaseCitation(
 	store *BookKnowledgeStore,
 	pkg AgentPackage,
@@ -185,6 +205,25 @@ func resolveAgentPackageReleaseCitation(
 	return AgentScopedCitation{}, fmt.Errorf(
 		"citation %q in pinned release %q cannot be resolved", citationID, releaseID,
 	)
+}
+
+func resolveAgentPackageReleaseCitationContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	releaseID, claimID, citationID string,
+) (AgentScopedCitation, error) {
+	if err := ctx.Err(); err != nil {
+		return AgentScopedCitation{}, err
+	}
+	citation, err := resolveAgentPackageReleaseCitation(store, pkg, releaseID, claimID, citationID)
+	if err != nil {
+		return AgentScopedCitation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return AgentScopedCitation{}, err
+	}
+	return citation, nil
 }
 
 func agentPackagePinnedReleaseRef(pkg AgentPackage, releaseID string) (AgentPackageReleaseRef, error) {

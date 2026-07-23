@@ -15,7 +15,12 @@ import (
 )
 
 const (
-	AgentTraceSchemaVersion = "agent-trace.v1"
+	AgentTraceSchemaVersion           = "agent-trace.v1"
+	evidenceAuditTraceTerminalVersion = "evidence-audit-trace-terminal.v1"
+
+	evidenceAuditTraceFaultBeforePrepare  = "before_prepare"
+	evidenceAuditTraceFaultBeforeSave     = "before_save"
+	evidenceAuditTraceFaultBeforeFinalize = "before_finalize"
 
 	AgentToolOutcomeNotExecuted          = "not_executed"
 	AgentToolOutcomeSucceeded            = "succeeded"
@@ -27,6 +32,8 @@ const (
 	AgentTraceOutcomeAbstained = "abstained"
 	AgentTraceOutcomeFailed    = "failed"
 )
+
+var evidenceAuditTraceStorageFault = func(string, string) error { return nil }
 
 type AgentTrace struct {
 	SchemaVersion  string                      `json:"schema_version"`
@@ -51,6 +58,18 @@ type AgentTrace struct {
 type AgentTraceEvidenceAuditRef struct {
 	AuditID   string `json:"audit_id"`
 	InputHash string `json:"input_hash"`
+}
+
+type evidenceAuditTraceTerminal struct {
+	Version           string         `json:"version"`
+	AuditID           string         `json:"audit_id"`
+	InputHash         string         `json:"input_hash"`
+	TraceID           string         `json:"trace_id"`
+	ReportFingerprint string         `json:"report_fingerprint"`
+	Report            *EvidenceAudit `json:"report,omitempty"`
+	FailureCode       string         `json:"failure_code,omitempty"`
+	FailureSummary    string         `json:"failure_summary,omitempty"`
+	Trace             AgentTrace     `json:"trace"`
 }
 
 type AgentTraceRetrievalRoute struct {
@@ -332,6 +351,153 @@ func (s *BookKnowledgeStore) AgentTraceDir() string {
 
 func (s *BookKnowledgeStore) AgentTracePath(traceID string) string {
 	return filepath.Join(s.AgentTraceDir(), sanitizeBookKnowledgeID(traceID)+".json")
+}
+
+func (s *BookKnowledgeStore) EvidenceAuditTraceTerminalPath(auditID string) string {
+	return filepath.Join(s.AgentTraceDir(), "prepared", sanitizeBookKnowledgeID(auditID)+".json")
+}
+
+func (s *BookKnowledgeStore) prepareEvidenceAuditTraceTerminal(terminal evidenceAuditTraceTerminal) error {
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		return err
+	}
+	payload, err := encodeJSONFile(terminal)
+	if err != nil {
+		return err
+	}
+	path := s.EvidenceAuditTraceTerminalPath(terminal.AuditID)
+	if err := evidenceAuditTraceStorageFault(evidenceAuditTraceFaultBeforePrepare, path); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return err
+	}
+	existing, err := os.ReadFile(path)
+	if err == nil {
+		if bytes.Equal(existing, payload) {
+			return nil
+		}
+		return fmt.Errorf("prepared evidence audit terminal already exists with different content")
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	return writeFileAtomically(path, payload)
+}
+
+func (s *BookKnowledgeStore) loadEvidenceAuditTraceTerminal(auditID string) (*evidenceAuditTraceTerminal, error) {
+	auditID = strings.TrimSpace(auditID)
+	if auditID == "" {
+		return nil, fmt.Errorf("audit_id is required")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var terminal evidenceAuditTraceTerminal
+	if err := readJSONFile(s.EvidenceAuditTraceTerminalPath(auditID), &terminal); err != nil {
+		return nil, err
+	}
+	if terminal.AuditID != auditID {
+		return nil, fmt.Errorf("prepared evidence audit terminal identity does not match audit_id")
+	}
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		return nil, err
+	}
+	return &terminal, nil
+}
+
+func (s *BookKnowledgeStore) finalizeEvidenceAuditTraceTerminal(terminal evidenceAuditTraceTerminal) error {
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		return err
+	}
+	path := s.EvidenceAuditTraceTerminalPath(terminal.AuditID)
+	if err := evidenceAuditTraceStorageFault(evidenceAuditTraceFaultBeforeSave, path); err != nil {
+		return err
+	}
+	if err := s.SaveAgentTrace(terminal.Trace); err != nil {
+		return err
+	}
+	if err := evidenceAuditTraceStorageFault(evidenceAuditTraceFaultBeforeFinalize, path); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func validateEvidenceAuditTraceTerminal(terminal evidenceAuditTraceTerminal) error {
+	if terminal.Version != evidenceAuditTraceTerminalVersion {
+		return fmt.Errorf("unsupported evidence audit trace terminal version %q", terminal.Version)
+	}
+	if strings.TrimSpace(terminal.AuditID) == "" || strings.TrimSpace(terminal.TraceID) == "" {
+		return fmt.Errorf("prepared evidence audit terminal requires audit_id and trace_id")
+	}
+	if err := validateAgentSHA256("prepared input_hash", terminal.InputHash); err != nil {
+		return err
+	}
+	if err := validateAgentSHA256("prepared report_fingerprint", terminal.ReportFingerprint); err != nil {
+		return err
+	}
+	if err := ValidateAgentTrace(terminal.Trace); err != nil {
+		return fmt.Errorf("validate prepared evidence audit trace: %w", err)
+	}
+	if terminal.Trace.TraceID != terminal.TraceID ||
+		terminal.Trace.EvidenceAudit == nil ||
+		terminal.Trace.EvidenceAudit.AuditID != terminal.AuditID ||
+		terminal.Trace.EvidenceAudit.InputHash != terminal.InputHash ||
+		terminal.Trace.Final.ResponseFingerprint != terminal.ReportFingerprint {
+		return fmt.Errorf("prepared evidence audit terminal trace identity is inconsistent")
+	}
+	switch terminal.Trace.Final.Outcome {
+	case AgentTraceOutcomeCompleted, AgentTraceOutcomeAbstained:
+		if terminal.Report == nil || terminal.FailureCode != "" || terminal.FailureSummary != "" {
+			return fmt.Errorf("successful evidence audit terminal requires only a report")
+		}
+		if terminal.Report.AuditID != terminal.AuditID || terminal.Report.TraceID != terminal.TraceID {
+			return fmt.Errorf("prepared evidence audit terminal report identity is inconsistent")
+		}
+		if terminal.Report.InputHash != terminal.InputHash ||
+			terminal.Report.Package.PackageID != terminal.Trace.Package.PackageID ||
+			terminal.Report.Package.Version != terminal.Trace.Package.Version ||
+			terminal.Report.Package.ContentHash != terminal.Trace.Package.ContentHash {
+			return fmt.Errorf("prepared evidence audit terminal report scope is inconsistent")
+		}
+		fingerprint, err := evidenceAuditReportFingerprint(*terminal.Report)
+		if err != nil {
+			return err
+		}
+		if fingerprint != terminal.ReportFingerprint {
+			return fmt.Errorf("prepared evidence audit terminal report fingerprint is inconsistent")
+		}
+		expectedCitations := make(map[string]struct{})
+		for _, claim := range terminal.Report.ClaimAudits {
+			for _, ref := range claim.Evidence {
+				key := ref.CitationID + "\x00" + ref.ReleaseID + "\x00" +
+					ref.ReleaseID + ":" + ref.ClaimID + ":" + ref.CitationID
+				expectedCitations[key] = struct{}{}
+			}
+		}
+		actualCitations := make(map[string]struct{}, len(terminal.Trace.Final.Citations))
+		for _, citation := range terminal.Trace.Final.Citations {
+			key := citation.CitationID + "\x00" + citation.ReleaseID + "\x00" + citation.EvidenceID
+			actualCitations[key] = struct{}{}
+		}
+		if !reflect.DeepEqual(expectedCitations, actualCitations) {
+			return fmt.Errorf("prepared evidence audit terminal final citations do not match report evidence")
+		}
+	case AgentTraceOutcomeFailed:
+		if terminal.Report != nil || strings.TrimSpace(terminal.FailureCode) == "" ||
+			strings.TrimSpace(terminal.FailureSummary) == "" {
+			return fmt.Errorf("failed evidence audit terminal requires failure metadata only")
+		}
+	default:
+		return fmt.Errorf("unsupported evidence audit terminal outcome %q", terminal.Trace.Final.Outcome)
+	}
+	return nil
 }
 
 func (s *BookKnowledgeStore) SaveAgentTrace(trace AgentTrace) error {

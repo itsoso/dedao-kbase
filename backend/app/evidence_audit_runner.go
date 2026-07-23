@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +20,8 @@ type EvidenceAuditRunnerConfig struct {
 	Timeout     time.Duration
 	Now         func() time.Time
 }
+
+var evidenceAuditRuntimeStageHook = func(context.Context, string) error { return nil }
 
 type evidenceAuditModelDecision struct {
 	CandidateVerdict string                       `json:"candidate_verdict"`
@@ -114,20 +117,48 @@ func RunEvidenceAudit(
 	if store == nil {
 		return nil, fmt.Errorf("evidence audit store is required")
 	}
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if config.Timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, config.Timeout)
+		defer cancel()
+	}
+	if err := evidenceAuditRunnerStage(runCtx, "load"); err != nil {
+		return nil, err
+	}
 	audit, err := store.LoadEvidenceAudit(strings.TrimSpace(auditID))
 	if err != nil {
 		return nil, err
 	}
-	if audit.Status != EvidenceAuditQueued {
-		return nil, fmt.Errorf("evidence audit %q must be queued, got %q", audit.AuditID, audit.Status)
+	if recovered, ok, recoverErr := recoverEvidenceAuditTerminal(runCtx, store, *audit, config); ok || recoverErr != nil {
+		return recovered, recoverErr
 	}
-	traceID, err := newAgentRuntimeTraceID()
-	if err != nil {
-		return nil, err
+	switch audit.Status {
+	case EvidenceAuditCompleted:
+		if _, err := store.LoadAgentTrace(audit.TraceID); err != nil {
+			return nil, fmt.Errorf("completed evidence audit trace is unavailable: %w", err)
+		}
+		return audit, nil
+	case EvidenceAuditFailed:
+		if _, err := store.LoadAgentTrace(audit.TraceID); err != nil {
+			return nil, fmt.Errorf("failed evidence audit trace is unavailable: %w", err)
+		}
+		return nil, fmt.Errorf("evidence audit %q already failed: %s", audit.AuditID, audit.FailureCode)
+	case EvidenceAuditQueued, EvidenceAuditRunning:
+	default:
+		return nil, fmt.Errorf("evidence audit %q has unsupported status %q", audit.AuditID, audit.Status)
 	}
-	now := evidenceAuditRunnerNow(config)
-	if _, err := StartEvidenceAudit(store, audit.AuditID, traceID, now); err != nil {
-		return nil, err
+	traceID := audit.TraceID
+	if audit.Status == EvidenceAuditQueued {
+		traceID, err = newAgentRuntimeTraceID()
+		if err != nil {
+			return nil, err
+		}
+		now := evidenceAuditRunnerNow(config)
+		audit, err = StartEvidenceAudit(store, audit.AuditID, traceID, now)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	pkg, releases, runErr := loadEvidenceAuditPackageSnapshot(
@@ -142,7 +173,14 @@ func RunEvidenceAudit(
 	if runErr != nil {
 		return nil, failEvidenceAuditRun(store, *audit, nil, nil, traceID, config, runErr)
 	}
-	if evidenceAuditRequestsMedicalAdvice(audit.Subject + "\n" + audit.Scope) {
+	if config.Timeout <= 0 && pkg.ModelPolicy.TimeoutMS > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, time.Duration(pkg.ModelPolicy.TimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
+	if runErr = evidenceAuditRunnerStage(runCtx, "policy"); runErr != nil {
+		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, runErr)
+	}
+	if evidenceAuditRequestsMedicalAdvice(audit.Subject) || evidenceAuditRequestsMedicalAdvice(audit.Scope) {
 		claims := make([]EvidenceAuditClaim, 0, len(audit.SelectedClaims))
 		for _, claim := range audit.SelectedClaims {
 			claims = append(claims, EvidenceAuditClaim{
@@ -154,7 +192,7 @@ func RunEvidenceAudit(
 			})
 		}
 		return completeEvidenceAuditRun(
-			store, *audit, pkg, nil, claims, traceID, config, AgentTraceOutcomeAbstained,
+			runCtx, store, *audit, pkg, nil, claims, traceID, config, AgentTraceOutcomeAbstained,
 		)
 	}
 	if client == nil {
@@ -167,7 +205,7 @@ func RunEvidenceAudit(
 	allRetrieved := make([]evidenceAuditRetrievedItem, 0)
 	claimAudits := make([]EvidenceAuditClaim, 0, len(audit.SelectedClaims))
 	for _, sourceClaim := range audit.SelectedClaims {
-		retrieved, retrievalErr := retrieveEvidenceAuditSupportingEvidence(store, pkg, releases, sourceClaim)
+		retrieved, retrievalErr := retrieveEvidenceAuditSupportingEvidence(runCtx, store, pkg, releases, sourceClaim)
 		if retrievalErr != nil {
 			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, retrievalErr)
 		}
@@ -176,19 +214,10 @@ func RunEvidenceAudit(
 		if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
 			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
 		}
-		callCtx := ctx
-		timeout := config.Timeout
-		if timeout <= 0 && pkg.ModelPolicy.TimeoutMS > 0 {
-			timeout = time.Duration(pkg.ModelPolicy.TimeoutMS) * time.Millisecond
+		if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
+			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
 		}
-		var cancel context.CancelFunc
-		if timeout > 0 {
-			callCtx, cancel = context.WithTimeout(ctx, timeout)
-		}
-		raw, modelErr := client.Chat(callCtx, modelConfig, messages)
-		if cancel != nil {
-			cancel()
-		}
+		raw, modelErr := client.Chat(runCtx, modelConfig, messages)
 		if modelErr != nil {
 			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, modelErr)
 		}
@@ -203,7 +232,7 @@ func RunEvidenceAudit(
 		claimAudits = append(claimAudits, claimAudit)
 	}
 	return completeEvidenceAuditRun(
-		store, *audit, pkg, allRetrieved, claimAudits, traceID, config, AgentTraceOutcomeCompleted,
+		runCtx, store, *audit, pkg, allRetrieved, claimAudits, traceID, config, AgentTraceOutcomeCompleted,
 	)
 }
 
@@ -329,6 +358,7 @@ func validateEvidenceAuditRunnerInput(
 }
 
 func retrieveEvidenceAuditSupportingEvidence(
+	ctx context.Context,
 	store *BookKnowledgeStore,
 	pkg AgentPackage,
 	releases map[string]KnowledgeRelease,
@@ -344,17 +374,23 @@ func retrieveEvidenceAuditSupportingEvidence(
 		if role.Role != AgentEvidenceReleaseSupporting {
 			continue
 		}
+		if err := evidenceAuditRunnerStage(ctx, "retrieval"); err != nil {
+			return nil, err
+		}
 		release := releases[role.ReleaseID]
-		found, err := searchAgentPackageReleaseEvidence(
-			store, pkg, release.ReleaseID, sourceClaim, pkg.EvidencePolicy.MaxEvidencePerClaim,
+		found, err := searchAgentPackageReleaseEvidenceContext(
+			ctx, store, pkg, release.ReleaseID, sourceClaim, pkg.EvidencePolicy.MaxEvidencePerClaim,
 		)
 		if err != nil {
 			return nil, err
 		}
 		for _, item := range found {
 			for _, citationID := range item.CitationIDs {
-				citation, err := resolveAgentPackageReleaseCitation(
-					store, pkg, release.ReleaseID, item.ClaimID, citationID,
+				if err := evidenceAuditRunnerStage(ctx, "citation"); err != nil {
+					return nil, err
+				}
+				citation, err := resolveAgentPackageReleaseCitationContext(
+					ctx, store, pkg, release.ReleaseID, item.ClaimID, citationID,
 				)
 				if err != nil || strings.TrimSpace(citation.ChunkID) == "" {
 					if err == nil {
@@ -632,6 +668,7 @@ func evidenceAuditRunnerModelConfig(
 }
 
 func completeEvidenceAuditRun(
+	ctx context.Context,
 	store *BookKnowledgeStore,
 	audit EvidenceAudit,
 	pkg AgentPackage,
@@ -652,8 +689,17 @@ func completeEvidenceAuditRun(
 		reviewItems = []string{"Review evidence applicability and unresolved gaps."}
 	}
 	report := EvidenceAudit{
-		AuditID:     audit.AuditID,
-		ClaimAudits: claims,
+		AuditID:        audit.AuditID,
+		InputHash:      audit.InputHash,
+		Package:        audit.Package,
+		EvidencePolicy: audit.EvidencePolicy,
+		Model:          audit.Model,
+		Retrieval:      audit.Retrieval,
+		Releases:       append([]EvidenceAuditReleaseRef(nil), audit.Releases...),
+		Subject:        audit.Subject,
+		Scope:          audit.Scope,
+		SelectedClaims: append([]string(nil), audit.SelectedClaims...),
+		ClaimAudits:    claims,
 		Summary: EvidenceAuditSummary{
 			Conclusion:    "Deterministic audit completed within the pinned evidence scope.",
 			VerdictCounts: counts, Limitations: limitations,
@@ -669,14 +715,38 @@ func completeEvidenceAuditRun(
 	if err != nil {
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
-	if err := saveEvidenceAuditTrace(
-		store, audit, pkg, retrieved, traceID, traceOutcome, fingerprint, config,
-	); err != nil {
+	if traceOutcome == AgentTraceOutcomeCompleted {
+		selectedEvidence := 0
+		for _, claim := range claims {
+			selectedEvidence += len(claim.Evidence)
+		}
+		if selectedEvidence == 0 {
+			traceOutcome = AgentTraceOutcomeAbstained
+		}
+	}
+	trace, err := buildEvidenceAuditTrace(
+		store, audit, pkg, retrieved, claims, traceID, traceOutcome, fingerprint, config,
+	)
+	if err != nil {
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
+	}
+	terminal := evidenceAuditTraceTerminal{
+		Version: evidenceAuditTraceTerminalVersion, AuditID: audit.AuditID,
+		InputHash: audit.InputHash, TraceID: traceID, ReportFingerprint: fingerprint,
+		Report: &report, Trace: trace,
+	}
+	if err := evidenceAuditRunnerStage(ctx, "persist"); err != nil {
+		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
+	}
+	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
+		return nil, fmt.Errorf("prepare evidence audit terminal: %w", err)
 	}
 	completed, err := CompleteEvidenceAudit(store, report, evidenceAuditRunnerNow(config))
 	if err != nil {
 		return nil, err
+	}
+	if err := store.finalizeEvidenceAuditTraceTerminal(terminal); err != nil {
+		return nil, fmt.Errorf("finalize evidence audit trace: %w", err)
 	}
 	return completed, nil
 }
@@ -697,22 +767,103 @@ func failEvidenceAuditRun(
 	if concrete, ok := pkg.(*AgentPackage); ok && concrete != nil {
 		packageValue = *concrete
 	}
-	_ = saveEvidenceAuditTrace(
-		store, audit, packageValue, retrieved, traceID, AgentTraceOutcomeFailed,
-		sha256Fingerprint([]byte(evidenceAuditFailureCode(runErr))), config,
+	failureCode := evidenceAuditFailureCode(runErr)
+	failureSummary := "Evidence audit failed closed."
+	fingerprint := sha256Fingerprint([]byte(failureCode))
+	trace, traceErr := buildEvidenceAuditTrace(
+		store, audit, packageValue, retrieved, nil, traceID, AgentTraceOutcomeFailed, fingerprint, config,
 	)
+	if traceErr != nil {
+		return fmt.Errorf("%v; build failed trace: %w", runErr, traceErr)
+	}
+	terminal := evidenceAuditTraceTerminal{
+		Version: evidenceAuditTraceTerminalVersion, AuditID: audit.AuditID,
+		InputHash: audit.InputHash, TraceID: traceID, ReportFingerprint: fingerprint,
+		FailureCode: failureCode, FailureSummary: failureSummary, Trace: trace,
+	}
+	if traceErr := store.prepareEvidenceAuditTraceTerminal(terminal); traceErr != nil {
+		return fmt.Errorf("%v; prepare failed trace: %w", runErr, traceErr)
+	}
 	_, failErr := FailEvidenceAudit(
-		store, audit.AuditID, evidenceAuditFailureCode(runErr), "Evidence audit failed closed.", evidenceAuditRunnerNow(config),
+		store, audit.AuditID, failureCode, failureSummary, evidenceAuditRunnerNow(config),
 	)
 	if failErr != nil {
 		return fmt.Errorf("%v; persist failed audit: %w", runErr, failErr)
 	}
+	if traceErr := store.finalizeEvidenceAuditTraceTerminal(terminal); traceErr != nil {
+		return fmt.Errorf("%v; finalize failed trace: %w", runErr, traceErr)
+	}
 	return runErr
+}
+
+func recoverEvidenceAuditTerminal(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	audit EvidenceAudit,
+	config EvidenceAuditRunnerConfig,
+) (*EvidenceAudit, bool, error) {
+	terminal, err := store.loadEvidenceAuditTraceTerminal(audit.AuditID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, fmt.Errorf("load prepared evidence audit terminal: %w", err)
+	}
+	if terminal.InputHash != audit.InputHash || terminal.TraceID != audit.TraceID {
+		return nil, true, fmt.Errorf("prepared evidence audit terminal does not match running audit")
+	}
+	if err := evidenceAuditRunnerStage(ctx, "persist"); err != nil {
+		return nil, true, err
+	}
+	switch terminal.Trace.Final.Outcome {
+	case AgentTraceOutcomeCompleted, AgentTraceOutcomeAbstained:
+		switch audit.Status {
+		case EvidenceAuditRunning:
+			if _, err := CompleteEvidenceAudit(store, *terminal.Report, evidenceAuditRunnerNow(config)); err != nil {
+				return nil, true, fmt.Errorf("recover completed evidence audit: %w", err)
+			}
+		case EvidenceAuditCompleted:
+		default:
+			return nil, true, fmt.Errorf(
+				"prepared successful terminal cannot recover audit in %q", audit.Status,
+			)
+		}
+	case AgentTraceOutcomeFailed:
+		switch audit.Status {
+		case EvidenceAuditQueued, EvidenceAuditRunning:
+			if _, err := FailEvidenceAudit(
+				store, audit.AuditID, terminal.FailureCode, terminal.FailureSummary,
+				evidenceAuditRunnerNow(config),
+			); err != nil {
+				return nil, true, fmt.Errorf("recover failed evidence audit: %w", err)
+			}
+		case EvidenceAuditFailed:
+		default:
+			return nil, true, fmt.Errorf(
+				"prepared failed terminal cannot recover audit in %q", audit.Status,
+			)
+		}
+	default:
+		return nil, true, fmt.Errorf("unsupported prepared terminal outcome")
+	}
+	if err := store.finalizeEvidenceAuditTraceTerminal(*terminal); err != nil {
+		return nil, true, fmt.Errorf("recover evidence audit trace: %w", err)
+	}
+	recovered, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil {
+		return nil, true, err
+	}
+	if recovered.Status == EvidenceAuditFailed {
+		return nil, true, fmt.Errorf(
+			"evidence audit %q failed closed: %s", recovered.AuditID, recovered.FailureCode,
+		)
+	}
+	return recovered, true, nil
 }
 
 func evidenceAuditFailureCode(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return "model_timeout"
+		return "runner_timeout"
 	}
 	message := strings.ToLower(err.Error())
 	switch {
@@ -727,14 +878,15 @@ func evidenceAuditFailureCode(err error) string {
 	}
 }
 
-func saveEvidenceAuditTrace(
+func buildEvidenceAuditTrace(
 	store *BookKnowledgeStore,
 	audit EvidenceAudit,
 	pkg AgentPackage,
 	retrieved []evidenceAuditRetrievedItem,
+	claims []EvidenceAuditClaim,
 	traceID, outcome, responseFingerprint string,
 	config EvidenceAuditRunnerConfig,
-) error {
+) (AgentTrace, error) {
 	releases := make([]AgentTraceReleaseRef, 0, len(audit.Releases))
 	for _, release := range audit.Releases {
 		version := "unknown"
@@ -746,10 +898,11 @@ func saveEvidenceAuditTrace(
 		})
 	}
 	retrievals := make([]AgentTraceRetrieval, 0, len(retrieved))
-	citations := make([]AgentTraceCitation, 0, len(retrieved))
+	evidenceIDs := make(map[string]string, len(retrieved))
 	seenEvidence := map[string]bool{}
 	for _, item := range retrieved {
 		evidenceID := agentRuntimeEvidenceID(item.Evidence) + ":" + item.Ref.CitationID
+		evidenceIDs[item.Ref.ReleaseID+"\x00"+item.Ref.ClaimID+"\x00"+item.Ref.CitationID] = evidenceID
 		if seenEvidence[evidenceID] {
 			continue
 		}
@@ -758,12 +911,29 @@ func saveEvidenceAuditTrace(
 			EvidenceID: evidenceID, ReleaseID: item.Ref.ReleaseID,
 			Score: item.Evidence.Score, Rank: len(retrievals) + 1,
 		})
-		citations = append(citations, AgentTraceCitation{
-			CitationID: item.Ref.CitationID, ReleaseID: item.Ref.ReleaseID, EvidenceID: evidenceID,
-		})
 	}
-	if outcome != AgentTraceOutcomeCompleted {
-		citations = nil
+	citations := make([]AgentTraceCitation, 0)
+	seenCitations := map[string]bool{}
+	if outcome == AgentTraceOutcomeCompleted {
+		for _, claim := range claims {
+			for _, ref := range claim.Evidence {
+				key := ref.ReleaseID + "\x00" + ref.ClaimID + "\x00" + ref.CitationID
+				evidenceID := evidenceIDs[key]
+				if evidenceID == "" {
+					return AgentTrace{}, fmt.Errorf(
+						"report citation %q in release %q is outside retrieved evidence",
+						ref.CitationID, ref.ReleaseID,
+					)
+				}
+				if seenCitations[key] {
+					continue
+				}
+				seenCitations[key] = true
+				citations = append(citations, AgentTraceCitation{
+					CitationID: ref.CitationID, ReleaseID: ref.ReleaseID, EvidenceID: evidenceID,
+				})
+			}
+		}
 	}
 	strategy := audit.Retrieval.Strategy
 	route := AgentTraceRetrievalRoute{Strategy: strategy}
@@ -781,7 +951,7 @@ func saveEvidenceAuditTrace(
 	if parsed, err := time.Parse(time.RFC3339Nano, audit.StartedAt); err == nil {
 		startedAt = parsed
 	}
-	trace := AgentTrace{
+	return AgentTrace{
 		SchemaVersion: AgentTraceSchemaVersion,
 		TraceID:       traceID,
 		Package: AgentTracePackageRef{
@@ -801,8 +971,7 @@ func saveEvidenceAuditTrace(
 		},
 		StartedAt:   startedAt.UTC().Format(time.RFC3339Nano),
 		CompletedAt: now.UTC().Format(time.RFC3339Nano),
-	}
-	return store.SaveAgentTrace(trace)
+	}, nil
 }
 
 func evidenceAuditReportFingerprint(report EvidenceAudit) (string, error) {
@@ -818,16 +987,68 @@ func evidenceAuditReportFingerprint(report EvidenceAudit) (string, error) {
 }
 
 func evidenceAuditRequestsMedicalAdvice(value string) bool {
-	value = strings.ToLower(value)
-	for _, marker := range []string{
-		"diagnose me", "diagnosis for me", "recommend a treatment", "individual treatment",
-		"individual medical advice", "prescribe", "给我诊断", "诊断我", "治疗方案", "用药建议", "开药",
-	} {
-		if strings.Contains(value, marker) {
-			return true
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return true
+	}
+	hasAny := func(markers ...string) bool {
+		for _, marker := range markers {
+			if strings.Contains(value, marker) {
+				return true
+			}
 		}
+		return false
+	}
+	safeEvidenceIntent := hasAny(
+		"evidence audit", "evidence comparison", "clinical trial evidence", "review the evidence",
+		"compare studies", "assess the claim", "population-level", "证据审计", "证据比较",
+		"临床试验证据", "评估观点", "文献综述",
+	)
+	personalContext := hasAny(
+		" i ", " me", " my ", "for me", "should i", "can i", "could i",
+		"我", "给我", "帮我", "本人", "家人", "孩子", "老人",
+	)
+	diagnosisOrTreatment := hasAny(
+		"diagnos", "treat", "therapy for", "prescri", "medical advice", "what do i have",
+		"do i have", "cure me", "诊断", "治疗", "处方", "看病", "治好", "是什么病",
+	)
+	medicationContext := hasAny(
+		"medicine", "medication", "drug", "aspirin", "tablet", "pill", "dose", "dosage",
+		"药", "阿司匹林", "剂量", "用量", "服用", "吃",
+	)
+	clinicalContext := diagnosisOrTreatment || medicationContext || hasAny(
+		"symptom", "rash", "pain", "fever", "cancer", "melanoma", "chemotherapy",
+		"头痛", "发热", "皮疹", "肿瘤", "癌", "化疗", "症状",
+	)
+	decisionRequest := hasAny(
+		"should", "can i", "could i", "would it be better", "what dose", "how much",
+		"could this", "is chemotherapy right", "stop", "start", "switch", "substitute",
+		"replace", "increase", "decrease", "take",
+		"是否", "要不要", "该不该", "能不能", "可不可以", "怎么", "停", "换",
+		"替代", "加量", "减量", "开始", "继续",
+	)
+	explicitAdvice := hasAny(
+		"recommend a treatment", "individual treatment", "individual medical advice",
+		"用药建议", "治疗方案", "开药", "给我诊断", "诊断我",
+	)
+	if explicitAdvice || (diagnosisOrTreatment && (personalContext || decisionRequest)) ||
+		(medicationContext && (personalContext || decisionRequest)) {
+		return true
+	}
+	if (clinicalContext || decisionRequest) && !safeEvidenceIntent {
+		return true
 	}
 	return false
+}
+
+func evidenceAuditRunnerStage(ctx context.Context, stage string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := evidenceAuditRuntimeStageHook(ctx, stage); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 func evidenceAuditRunnerNow(config EvidenceAuditRunnerConfig) time.Time {
