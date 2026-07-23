@@ -524,7 +524,7 @@
     {
       "path": "/api/source-assets/",
       "file": "backend/app/wechat_agent.go",
-      "line": 237,
+      "line": 248,
       "authenticated": true
     },
     {
