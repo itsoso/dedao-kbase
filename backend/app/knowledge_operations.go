@@ -10,10 +10,11 @@ import (
 const KnowledgeOperationsSchemaVersion = "knowledge_operations.v1"
 
 type KnowledgeOperationsConsole struct {
-	SchemaVersion     string                                `json:"schema_version"`
-	Summary           KnowledgeOperationsSummary            `json:"summary"`
-	HealthReviewQueue []KnowledgeOperationsHealthReviewItem `json:"health_review_queue"`
-	Items             []KnowledgeOperationsItem             `json:"items"`
+	SchemaVersion           string                                     `json:"schema_version"`
+	Summary                 KnowledgeOperationsSummary                 `json:"summary"`
+	HealthReviewDiagnostics KnowledgeOperationsHealthReviewDiagnostics `json:"health_review_diagnostics"`
+	HealthReviewQueue       []KnowledgeOperationsHealthReviewItem      `json:"health_review_queue"`
+	Items                   []KnowledgeOperationsItem                  `json:"items"`
 }
 
 type KnowledgeOperationsSummary struct {
@@ -67,6 +68,26 @@ type KnowledgeOperationsHealthReviewItem struct {
 	CitationCount          int            `json:"citation_count,omitempty"`
 	RiskCounts             map[string]int `json:"risk_counts,omitempty"`
 	Reasons                []string       `json:"reasons,omitempty"`
+}
+
+type KnowledgeOperationsHealthReviewDiagnostics struct {
+	QueueEmptyReason string                                             `json:"queue_empty_reason,omitempty"`
+	StatusCounts     map[string]int                                     `json:"status_counts,omitempty"`
+	NextSafeActions  []KnowledgeOperationsHealthReviewDiagnosticAction  `json:"next_safe_actions,omitempty"`
+	Blockers         []KnowledgeOperationsHealthReviewDiagnosticBlocker `json:"blockers,omitempty"`
+}
+
+type KnowledgeOperationsHealthReviewDiagnosticAction struct {
+	Action string `json:"action"`
+	Label  string `json:"label"`
+	Count  int    `json:"count,omitempty"`
+}
+
+type KnowledgeOperationsHealthReviewDiagnosticBlocker struct {
+	Status     string `json:"status"`
+	Label      string `json:"label"`
+	Count      int    `json:"count"`
+	SafeAction string `json:"safe_action"`
 }
 
 type KnowledgeOperationsFailureSummary struct {
@@ -164,6 +185,7 @@ func BuildKnowledgeOperationsConsole(store *BookKnowledgeStore, limit int) (*Kno
 	console.Summary.HealthPublished = healthReadiness.Totals.Published
 	console.Summary.HealthBlocked = healthReadiness.Totals.Blocked
 	console.HealthReviewQueue = buildKnowledgeOperationsHealthReviewQueue(console.Items)
+	console.HealthReviewDiagnostics = buildKnowledgeOperationsHealthReviewDiagnostics(console.Items, console.HealthReviewQueue, console.Summary)
 	return console, nil
 }
 
@@ -367,4 +389,200 @@ func knowledgeOperationsContainsString(items []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+func buildKnowledgeOperationsHealthReviewDiagnostics(
+	items []KnowledgeOperationsItem,
+	queue []KnowledgeOperationsHealthReviewItem,
+	summary KnowledgeOperationsSummary,
+) KnowledgeOperationsHealthReviewDiagnostics {
+	diagnostics := KnowledgeOperationsHealthReviewDiagnostics{
+		StatusCounts: map[string]int{},
+	}
+	for _, item := range items {
+		status := strings.TrimSpace(item.Health.Status)
+		if status == "" {
+			continue
+		}
+		diagnostics.StatusCounts[status]++
+	}
+	if len(diagnostics.StatusCounts) == 0 {
+		diagnostics.StatusCounts = nil
+	}
+	diagnostics.Blockers = knowledgeOperationsHealthReviewDiagnosticBlockers(diagnostics.StatusCounts)
+	diagnostics.NextSafeActions = knowledgeOperationsHealthReviewDiagnosticActions(diagnostics.StatusCounts)
+	switch {
+	case len(queue) > 0:
+		diagnostics.QueueEmptyReason = "queue_has_items"
+		diagnostics.NextSafeActions = append([]KnowledgeOperationsHealthReviewDiagnosticAction{{
+			Action: "review_queue",
+			Label:  "Review the Health queue items shown above",
+			Count:  len(queue),
+		}}, diagnostics.NextSafeActions...)
+	case len(items) == 0:
+		diagnostics.QueueEmptyReason = "no_operations_items"
+		diagnostics.NextSafeActions = []KnowledgeOperationsHealthReviewDiagnosticAction{{
+			Action: "import_or_sync_sources",
+			Label:  "Import or sync source packages before reviewing Health evidence",
+		}}
+	case len(diagnostics.StatusCounts) == 0 && knowledgeOperationsHealthSummaryTotal(summary) > 0:
+		diagnostics.QueueEmptyReason = "no_items_match_current_limit"
+		diagnostics.NextSafeActions = []KnowledgeOperationsHealthReviewDiagnosticAction{{
+			Action: "increase_limit_or_filter",
+			Label:  "Increase the console limit or inspect all packages before assuming there is no Health work",
+			Count:  len(items),
+		}}
+	case len(diagnostics.StatusCounts) == 0:
+		diagnostics.QueueEmptyReason = "no_health_readiness_items"
+		diagnostics.NextSafeActions = []KnowledgeOperationsHealthReviewDiagnosticAction{{
+			Action: "inspect_health_readiness",
+			Label:  "Inspect Health readiness generation for the visible packages",
+			Count:  len(items),
+		}}
+	case knowledgeOperationsAllDiagnosticStatusesAreUpstreamWork(diagnostics.StatusCounts):
+		diagnostics.QueueEmptyReason = "all_visible_items_need_upstream_work"
+	case knowledgeOperationsAllDiagnosticStatusesAreReadyOrImported(diagnostics.StatusCounts):
+		diagnostics.QueueEmptyReason = "all_visible_items_ready_or_imported"
+	default:
+		diagnostics.QueueEmptyReason = "no_items_match_current_limit"
+	}
+	return diagnostics
+}
+
+func knowledgeOperationsHealthSummaryTotal(summary KnowledgeOperationsSummary) int {
+	return summary.HealthReadyToPublish + summary.HealthPublished + summary.HealthBlocked
+}
+
+func knowledgeOperationsHealthReviewDiagnosticBlockers(statusCounts map[string]int) []KnowledgeOperationsHealthReviewDiagnosticBlocker {
+	if len(statusCounts) == 0 {
+		return nil
+	}
+	statuses := []string{
+		HealthEvidenceReadinessNeedsAnalysis,
+		HealthEvidenceReadinessNeedsQuality,
+		HealthEvidenceReadinessPolicyBlocked,
+		HealthEvidenceReadinessQualityBlocked,
+	}
+	blockers := []KnowledgeOperationsHealthReviewDiagnosticBlocker{}
+	for _, status := range statuses {
+		count := statusCounts[status]
+		if count == 0 {
+			continue
+		}
+		blockers = append(blockers, KnowledgeOperationsHealthReviewDiagnosticBlocker{
+			Status:     status,
+			Label:      knowledgeOperationsHealthReviewDiagnosticLabel(status),
+			Count:      count,
+			SafeAction: knowledgeOperationsHealthReviewDiagnosticAction(status),
+		})
+	}
+	return blockers
+}
+
+func knowledgeOperationsHealthReviewDiagnosticActions(statusCounts map[string]int) []KnowledgeOperationsHealthReviewDiagnosticAction {
+	if len(statusCounts) == 0 {
+		return nil
+	}
+	statuses := []string{
+		HealthEvidenceReadinessPublished,
+		HealthEvidenceReadinessReadyToPublish,
+		HealthEvidenceReadinessNeedsAnalysis,
+		HealthEvidenceReadinessNeedsQuality,
+		HealthEvidenceReadinessPolicyBlocked,
+		HealthEvidenceReadinessQualityBlocked,
+	}
+	actions := []KnowledgeOperationsHealthReviewDiagnosticAction{}
+	for _, status := range statuses {
+		count := statusCounts[status]
+		if count == 0 {
+			continue
+		}
+		actions = append(actions, KnowledgeOperationsHealthReviewDiagnosticAction{
+			Action: knowledgeOperationsHealthReviewDiagnosticAction(status),
+			Label:  knowledgeOperationsHealthReviewDiagnosticActionLabel(status),
+			Count:  count,
+		})
+	}
+	return actions
+}
+
+func knowledgeOperationsHealthReviewDiagnosticAction(status string) string {
+	switch status {
+	case HealthEvidenceReadinessPublished:
+		return "send_to_health_review"
+	case HealthEvidenceReadinessReadyToPublish:
+		return "prepare_health_release"
+	case HealthEvidenceReadinessNeedsAnalysis:
+		return "run_analysis"
+	case HealthEvidenceReadinessNeedsQuality:
+		return "evaluate_quality"
+	case HealthEvidenceReadinessPolicyBlocked:
+		return "inspect_policy_block"
+	case HealthEvidenceReadinessQualityBlocked:
+		return "inspect_quality_block"
+	default:
+		return "inspect_status"
+	}
+}
+
+func knowledgeOperationsHealthReviewDiagnosticActionLabel(status string) string {
+	switch status {
+	case HealthEvidenceReadinessPublished:
+		return "Send imported Health evidence metadata to downstream Health review"
+	case HealthEvidenceReadinessReadyToPublish:
+		return "Prepare evidence-only release metadata for Health review"
+	case HealthEvidenceReadinessNeedsAnalysis:
+		return "Run analysis for packages missing Health evidence analysis"
+	case HealthEvidenceReadinessNeedsQuality:
+		return "Evaluate quality for packages missing deterministic quality reports"
+	case HealthEvidenceReadinessPolicyBlocked:
+		return "Inspect usage policy blocks before Health review"
+	case HealthEvidenceReadinessQualityBlocked:
+		return "Inspect quality blocks before Health review"
+	default:
+		return "Inspect Health readiness status"
+	}
+}
+
+func knowledgeOperationsHealthReviewDiagnosticLabel(status string) string {
+	switch status {
+	case HealthEvidenceReadinessNeedsAnalysis:
+		return "Analysis is missing or stale"
+	case HealthEvidenceReadinessNeedsQuality:
+		return "Quality evaluation is missing or stale"
+	case HealthEvidenceReadinessPolicyBlocked:
+		return "Usage policy is not evidence-only"
+	case HealthEvidenceReadinessQualityBlocked:
+		return "Quality did not pass"
+	default:
+		return "Health readiness is blocked"
+	}
+}
+
+func knowledgeOperationsAllDiagnosticStatusesAreUpstreamWork(statusCounts map[string]int) bool {
+	if len(statusCounts) == 0 {
+		return false
+	}
+	for status := range statusCounts {
+		switch status {
+		case HealthEvidenceReadinessNeedsAnalysis, HealthEvidenceReadinessNeedsQuality, HealthEvidenceReadinessPolicyBlocked, HealthEvidenceReadinessQualityBlocked:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func knowledgeOperationsAllDiagnosticStatusesAreReadyOrImported(statusCounts map[string]int) bool {
+	if len(statusCounts) == 0 {
+		return false
+	}
+	for status := range statusCounts {
+		switch status {
+		case HealthEvidenceReadinessReadyToPublish, HealthEvidenceReadinessPublished:
+		default:
+			return false
+		}
+	}
+	return true
 }

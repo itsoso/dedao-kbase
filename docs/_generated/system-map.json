@@ -1154,37 +1154,52 @@
     {
       "name": "KnowledgeOperationsFailureSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 72
+      "line": 93
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewDiagnosticAction",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 80
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewDiagnosticBlocker",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 86
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewDiagnostics",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 73
     },
     {
       "name": "KnowledgeOperationsHealthReviewItem",
       "file": "backend/app/knowledge_operations.go",
-      "line": 56
+      "line": 57
     },
     {
       "name": "KnowledgeOperationsHealthSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 46
+      "line": 47
     },
     {
       "name": "KnowledgeOperationsItem",
       "file": "backend/app/knowledge_operations.go",
-      "line": 31
+      "line": 32
     },
     {
       "name": "KnowledgeOperationsReplayRequest",
       "file": "backend/app/knowledge_operations.go",
-      "line": 79
+      "line": 100
     },
     {
       "name": "KnowledgeOperationsReplayResult",
       "file": "backend/app/knowledge_operations.go",
-      "line": 88
+      "line": 109
     },
     {
       "name": "KnowledgeOperationsSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 19
+      "line": 20
     },
     {
       "name": "KnowledgePipelineAutomationRequest",

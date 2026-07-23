@@ -2641,6 +2641,50 @@ a.button {
   gap: 4px;
 }
 
+.knowledge-operations__diagnostics {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-top: 14px;
+}
+
+.knowledge-operations__diagnostics article {
+  background: rgba(15, 23, 42, 0.03);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+  border-radius: 14px;
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+}
+
+.knowledge-operations__diagnostics small {
+  color: #64748b;
+}
+
+.knowledge-operations__pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.knowledge-operations__pill,
+.knowledge-operations__diagnostic-action {
+  background: rgba(20, 184, 166, 0.1);
+  border-radius: 999px;
+  color: #0f766e;
+  display: inline-flex;
+  font-size: 12px;
+  padding: 4px 8px;
+  width: fit-content;
+}
+
+.knowledge-operations__diagnostic-action {
+  align-items: flex-start;
+  border-radius: 12px;
+  color: #0f172a;
+  display: grid;
+}
+
 .knowledge-operations__row {
   align-items: start;
   display: grid;

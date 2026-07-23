@@ -135,6 +135,48 @@ func TestKnowledgeOperationsBuildsHealthReviewQueue(t *testing.T) {
 	}
 }
 
+func TestKnowledgeOperationsExplainsEmptyHealthReviewQueue(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+
+	console, err := BuildKnowledgeOperationsConsole(store, 10)
+	if err != nil {
+		t.Fatalf("BuildKnowledgeOperationsConsole returned error: %v", err)
+	}
+	if console.HealthReviewDiagnostics.QueueEmptyReason != "no_operations_items" {
+		t.Fatalf("empty store diagnostics = %#v", console.HealthReviewDiagnostics)
+	}
+	if len(console.HealthReviewDiagnostics.NextSafeActions) != 1 || console.HealthReviewDiagnostics.NextSafeActions[0].Action != "import_or_sync_sources" {
+		t.Fatalf("empty store next actions = %#v", console.HealthReviewDiagnostics.NextSafeActions)
+	}
+
+	diagnostics := buildKnowledgeOperationsHealthReviewDiagnostics(
+		[]KnowledgeOperationsItem{{
+			BookID:        "visible-without-health",
+			Title:         "Visible Package",
+			PipelineStage: KnowledgePipelineStagePublished,
+		}},
+		nil,
+		KnowledgeOperationsSummary{
+			Total:           1,
+			HealthPublished: 3,
+		},
+	)
+	if diagnostics.QueueEmptyReason != "no_items_match_current_limit" {
+		t.Fatalf("limit mismatch diagnostics = %#v", diagnostics)
+	}
+	if diagnostics.NextSafeActions[0].Action != "increase_limit_or_filter" || diagnostics.NextSafeActions[0].Count != 1 {
+		t.Fatalf("limit mismatch actions = %#v", diagnostics.NextSafeActions)
+	}
+
+	body, err := json.Marshal(diagnostics)
+	if err != nil {
+		t.Fatalf("marshal diagnostics: %v", err)
+	}
+	if strings.Contains(string(body), "publish") || strings.Contains(string(body), "health_serving_promote") {
+		t.Fatalf("diagnostics exposed unsafe action: %s", string(body))
+	}
+}
+
 func TestKnowledgeOperationsExplainsFailuresWithSafeReplay(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	savePipelinePackage(t, store, "stale-quality", "hash-current")
