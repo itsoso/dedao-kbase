@@ -63,6 +63,18 @@ func TestAgentPackageV2RequiresEvidencePolicyAndKeepsV1Compatible(t *testing.T) 
 		!strings.Contains(err.Error(), "evidence_policy") {
 		t.Fatalf("v2 package without evidence policy error = %v", err)
 	}
+
+	saveAgentPackageSupportingRelease(t, store)
+	v1WithPolicy := validAgentPackageV2()
+	v1WithPolicy.SchemaVersion = AgentPackageSchemaVersionV1
+	v1WithPolicy, err = FinalizeAgentPackage(v1WithPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(v1WithPolicy, store, AgentReadOnlyToolIDs()); err == nil ||
+		!strings.Contains(err.Error(), "v1") || !strings.Contains(err.Error(), "evidence_policy") {
+		t.Fatalf("v1 package with evidence policy error = %v", err)
+	}
 }
 
 func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
@@ -113,6 +125,13 @@ func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
 			want: "role",
 		},
 		{
+			name: "multiple primary releases",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].Role = AgentEvidenceReleasePrimary
+			},
+			want: "exactly one primary",
+		},
+		{
 			name: "primary release is not independent support",
 			edit: func(pkg *AgentPackage) {
 				pkg.EvidencePolicy.MinimumIndependentSources = 2
@@ -141,9 +160,23 @@ func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
 			want: "max_claims",
 		},
 		{
+			name: "max claims exceeds contract limit",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MaxClaims = 9
+			},
+			want: "max_claims",
+		},
+		{
 			name: "invalid max evidence per claim",
 			edit: func(pkg *AgentPackage) {
 				pkg.EvidencePolicy.MaxEvidencePerClaim = 0
+			},
+			want: "max_evidence_per_claim",
+		},
+		{
+			name: "max evidence per claim exceeds contract limit",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MaxEvidencePerClaim = 6
 			},
 			want: "max_evidence_per_claim",
 		},
@@ -153,6 +186,13 @@ func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
 				pkg.EvidencePolicy.MinimumIndependentSources = -1
 			},
 			want: "minimum_independent_sources",
+		},
+		{
+			name: "release role rejects surrounding whitespace",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].ReleaseID = " release-2 "
+			},
+			want: "canonical",
 		},
 		{
 			name: "invalid freshness policy",
@@ -181,6 +221,68 @@ func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
 			err = ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs())
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("ValidateAgentPackage() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestAgentPackageV2CountsIndependentSupportingSourceIdentities(t *testing.T) {
+	tests := []struct {
+		name           string
+		firstAccount   string
+		secondAccount  string
+		wantValidation string
+	}{
+		{
+			name:           "same normalized account is one source",
+			firstAccount:   " Medical Desk ",
+			secondAccount:  "medical desk",
+			wantValidation: "independent supporting",
+		},
+		{
+			name:           "unknown accounts of same type are one source",
+			firstAccount:   "",
+			secondAccount:  "",
+			wantValidation: "independent supporting",
+		},
+		{
+			name:          "different normalized accounts are independent",
+			firstAccount:  "Medical Desk",
+			secondAccount: "Trial Registry",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			saveAgentPackageTestRelease(t, store)
+			saveAgentPackageSupportingReleaseWithIdentity(t, store, "release-2", "book-2", "citation-2", tt.firstAccount)
+			saveAgentPackageSupportingReleaseWithIdentity(t, store, "release-3", "book-3", "citation-3", tt.secondAccount)
+
+			pkg := validAgentPackageV2()
+			pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
+				ReleaseID:   "release-3",
+				ContentHash: "sha256:release-3-content",
+				CitationIDs: []string{"citation-3"},
+			})
+			pkg.EvidencePolicy.ReleaseRoles = append(pkg.EvidencePolicy.ReleaseRoles, AgentPackageEvidenceReleaseRole{
+				ReleaseID: "release-3",
+				Role:      AgentEvidenceReleaseSupporting,
+			})
+			pkg.EvidencePolicy.MinimumIndependentSources = 2
+			pkg, err := FinalizeAgentPackage(pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs())
+			if tt.wantValidation == "" {
+				if err != nil {
+					t.Fatalf("ValidateAgentPackage() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantValidation) {
+				t.Fatalf("ValidateAgentPackage() error = %v, want %q", err, tt.wantValidation)
 			}
 		})
 	}
@@ -545,8 +647,8 @@ func validAgentPackageV2() AgentPackage {
 			{ReleaseID: "release-2", Role: AgentEvidenceReleaseSupporting},
 		},
 		MinimumIndependentSources: 1,
-		MaxClaims:                 20,
-		MaxEvidencePerClaim:       8,
+		MaxClaims:                 8,
+		MaxEvidencePerClaim:       5,
 		AllowedVerdicts: []string{
 			AgentEvidenceVerdictSupported,
 			AgentEvidenceVerdictContradicted,
@@ -572,20 +674,38 @@ func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 
 func saveAgentPackageSupportingRelease(t *testing.T, store *BookKnowledgeStore) {
 	t.Helper()
+	saveAgentPackageSupportingReleaseWithIdentity(t, store, "release-2", "book-2", "citation-2", "")
+}
+
+func saveAgentPackageSupportingReleaseWithIdentity(
+	t *testing.T,
+	store *BookKnowledgeStore,
+	releaseID string,
+	bookID string,
+	citationID string,
+	sourceAccount string,
+) {
+	t.Helper()
 	release := agentPackageTestRelease()
-	release.ReleaseID = "release-2"
-	release.BookID = "book-2"
-	release.ContentHash = "sha256:supporting-release-content"
-	release.Book = BookKnowledgeBook{
-		BookID:     "book-2",
-		Title:      "Synthetic Supporting Source",
-		SourceType: "wechat_mp_article",
+	release.ReleaseID = releaseID
+	release.BookID = bookID
+	if releaseID == "release-2" {
+		release.ContentHash = "sha256:supporting-release-content"
+	} else {
+		release.ContentHash = "sha256:" + releaseID + "-content"
 	}
-	release.Analysis.Claims[0].CitationIDs = []string{"citation-2"}
+	release.Book = BookKnowledgeBook{
+		BookID:        bookID,
+		Title:         "Synthetic Supporting Source",
+		SourceType:    "wechat_mp_article",
+		SourceKey:     "item-" + releaseID,
+		SourceAccount: sourceAccount,
+	}
+	release.Analysis.Claims[0].CitationIDs = []string{citationID}
 	release.Citations = []BookKnowledgeCitation{{
-		CitationID: "citation-2",
-		BookID:     "book-2",
-		ChunkID:    "chunk-2",
+		CitationID: citationID,
+		BookID:     bookID,
+		ChunkID:    "chunk-" + releaseID,
 	}}
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		t.Fatal(err)

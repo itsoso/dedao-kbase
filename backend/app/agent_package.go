@@ -33,6 +33,9 @@ const (
 	AgentEvidenceVerdictInsufficient = "insufficient"
 
 	AgentEvidenceReportSchemaV1 = "evidence-audit.v1"
+
+	agentEvidenceMaxClaims           = 8
+	agentEvidenceMaxEvidencePerClaim = 5
 )
 
 type AgentPackage struct {
@@ -155,6 +158,9 @@ func AgentPackageContentHash(pkg AgentPackage) (string, error) {
 func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTools []string) error {
 	switch pkg.SchemaVersion {
 	case AgentPackageSchemaVersionV1:
+		if pkg.EvidencePolicy != nil {
+			return fmt.Errorf("schema_version v1 does not allow evidence_policy")
+		}
 	case AgentPackageSchemaVersionV2:
 		if pkg.EvidencePolicy == nil {
 			return fmt.Errorf("evidence_policy is required for schema_version %q", AgentPackageSchemaVersionV2)
@@ -209,15 +215,16 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	if err := validateAgentPackageEvaluation(pkg.EvaluationPolicy); err != nil {
 		return err
 	}
-	if pkg.EvidencePolicy != nil {
-		if err := validateAgentPackageEvidence(*pkg.EvidencePolicy, pkg.Releases); err != nil {
-			return err
-		}
-	}
 	if err := validateAgentPackageUI(pkg.UIManifest); err != nil {
 		return err
 	}
-	return validateAgentPackageReleases(pkg, store)
+	if err := validateAgentPackageReleases(pkg, store); err != nil {
+		return err
+	}
+	if pkg.EvidencePolicy != nil {
+		return validateAgentPackageEvidence(*pkg.EvidencePolicy, pkg.Releases, store)
+	}
+	return nil
 }
 
 func validateAgentPackageState(pkg AgentPackage) error {
@@ -365,7 +372,11 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 	return nil
 }
 
-func validateAgentPackageEvidence(policy AgentPackageEvidencePolicy, releases []AgentPackageReleaseRef) error {
+func validateAgentPackageEvidence(
+	policy AgentPackageEvidencePolicy,
+	releases []AgentPackageReleaseRef,
+	store *BookKnowledgeStore,
+) error {
 	if len(policy.ReleaseRoles) == 0 {
 		return fmt.Errorf("evidence_policy.release_roles is required")
 	}
@@ -378,11 +389,17 @@ func validateAgentPackageEvidence(policy AgentPackageEvidencePolicy, releases []
 	}
 	seen := make(map[string]struct{}, len(policy.ReleaseRoles))
 	primaryCount := 0
-	supportingCount := 0
+	supportingReleaseIDs := make([]string, 0, len(policy.ReleaseRoles))
 	for index, releaseRole := range policy.ReleaseRoles {
 		releaseID := strings.TrimSpace(releaseRole.ReleaseID)
 		if releaseID == "" {
 			return fmt.Errorf("evidence_policy.release_roles[%d].release_id is required", index)
+		}
+		if releaseRole.ReleaseID != releaseID {
+			return fmt.Errorf(
+				"evidence_policy.release_roles[%d].release_id must use canonical form without surrounding whitespace",
+				index,
+			)
 		}
 		if _, ok := pinned[releaseID]; !ok {
 			return fmt.Errorf("evidence_policy release %q must reference a pinned release", releaseID)
@@ -395,7 +412,7 @@ func validateAgentPackageEvidence(policy AgentPackageEvidencePolicy, releases []
 		case AgentEvidenceReleasePrimary:
 			primaryCount++
 		case AgentEvidenceReleaseSupporting:
-			supportingCount++
+			supportingReleaseIDs = append(supportingReleaseIDs, releaseID)
 		default:
 			return fmt.Errorf("evidence_policy release %q has unsupported role %q", releaseID, releaseRole.Role)
 		}
@@ -405,24 +422,31 @@ func validateAgentPackageEvidence(policy AgentPackageEvidencePolicy, releases []
 			return fmt.Errorf("pinned release %q requires exactly one evidence_policy role", releaseID)
 		}
 	}
-	if primaryCount == 0 {
-		return fmt.Errorf("evidence_policy requires at least one primary release")
+	if primaryCount != 1 {
+		return fmt.Errorf("evidence_policy requires exactly one primary release; got %d", primaryCount)
 	}
 	if policy.MinimumIndependentSources <= 0 {
 		return fmt.Errorf("evidence_policy.minimum_independent_sources must be positive")
 	}
-	if supportingCount < policy.MinimumIndependentSources {
+	independentSources, err := agentPackageIndependentSupportingSources(store, supportingReleaseIDs)
+	if err != nil {
+		return err
+	}
+	if independentSources < policy.MinimumIndependentSources {
 		return fmt.Errorf(
-			"evidence_policy requires %d independent supporting sources; only %d supporting releases are assigned (primary releases do not count)",
+			"evidence_policy requires %d independent supporting sources; only %d stable source identities are assigned (primary releases do not count)",
 			policy.MinimumIndependentSources,
-			supportingCount,
+			independentSources,
 		)
 	}
-	if policy.MaxClaims <= 0 {
-		return fmt.Errorf("evidence_policy.max_claims must be positive")
+	if policy.MaxClaims <= 0 || policy.MaxClaims > agentEvidenceMaxClaims {
+		return fmt.Errorf("evidence_policy.max_claims must be between 1 and %d", agentEvidenceMaxClaims)
 	}
-	if policy.MaxEvidencePerClaim <= 0 {
-		return fmt.Errorf("evidence_policy.max_evidence_per_claim must be positive")
+	if policy.MaxEvidencePerClaim <= 0 || policy.MaxEvidencePerClaim > agentEvidenceMaxEvidencePerClaim {
+		return fmt.Errorf(
+			"evidence_policy.max_evidence_per_claim must be between 1 and %d",
+			agentEvidenceMaxEvidencePerClaim,
+		)
 	}
 	if len(policy.AllowedVerdicts) == 0 {
 		return fmt.Errorf("evidence_policy.allowed_verdicts is required")
@@ -451,6 +475,23 @@ func validateAgentPackageEvidence(policy AgentPackageEvidencePolicy, releases []
 		return fmt.Errorf("evidence_policy.report_schema must be %q", AgentEvidenceReportSchemaV1)
 	}
 	return nil
+}
+
+func agentPackageIndependentSupportingSources(store *BookKnowledgeStore, releaseIDs []string) (int, error) {
+	if store == nil {
+		return 0, fmt.Errorf("published release store is required")
+	}
+	identities := make(map[string]struct{}, len(releaseIDs))
+	for _, releaseID := range releaseIDs {
+		release, err := store.LoadKnowledgeRelease(releaseID)
+		if err != nil {
+			return 0, fmt.Errorf("load supporting release %q for evidence policy: %w", releaseID, err)
+		}
+		sourceType := strings.ToLower(strings.TrimSpace(release.Book.SourceType))
+		sourceAccount := strings.ToLower(strings.TrimSpace(release.Book.SourceAccount))
+		identities[sourceType+"\x00"+sourceAccount] = struct{}{}
+	}
+	return len(identities), nil
 }
 
 func validateAgentPackageUI(manifest AgentPackageUIManifest) error {
