@@ -2155,6 +2155,59 @@ a.button {
   margin-bottom: 14px;
 }
 
+.knowledge-web__header-actions,
+.knowledge-web__detail-toolbar,
+.knowledge-web__detail-toolbar > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.knowledge-web--detail {
+  padding-top: 16px;
+}
+
+.knowledge-web--detail .knowledge-web__header {
+  margin-bottom: 8px;
+}
+
+.knowledge-web--detail .knowledge-web__header h1 {
+  font-size: 28px;
+}
+
+.knowledge-web__detail-toolbar {
+  position: sticky;
+  z-index: 12;
+  top: 54px;
+  justify-content: space-between;
+  min-height: 52px;
+  margin-bottom: 12px;
+  border: 1px solid rgba(141, 132, 117, 0.18);
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: rgba(255, 253, 248, 0.96);
+  box-shadow: 0 8px 20px rgba(61, 50, 32, 0.06);
+  backdrop-filter: blur(14px);
+}
+
+.knowledge-web__detail-toolbar > span {
+  color: #756c60;
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.knowledge-web__detail-back {
+  color: #3f382f;
+  font-size: 14px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.knowledge-web__detail-toolbar .is-disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
 .knowledge-web__header h1,
 .knowledge-web__title-row h2 {
   margin: 0;
@@ -2175,6 +2228,82 @@ a.button {
   grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
   gap: 14px;
   margin-top: 14px;
+}
+
+.knowledge-web--detail .knowledge-web__layout {
+  align-items: start;
+  margin-top: 0;
+}
+
+.knowledge-web--detail .knowledge-web__sidebar {
+  position: sticky;
+  top: 118px;
+  max-height: calc(100vh - 132px);
+}
+
+.knowledge-web--detail .knowledge-web__main {
+  scroll-margin-top: 120px;
+}
+
+.knowledge-web__catalog {
+  margin-top: 14px;
+  border: 1px solid rgba(141, 132, 117, 0.18);
+  border-radius: 10px;
+  padding: 16px;
+  background: rgba(255, 253, 248, 0.88);
+  box-shadow: 0 12px 30px rgba(61, 50, 32, 0.06);
+}
+
+.knowledge-web__catalog-head {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 12px;
+}
+
+.knowledge-web__catalog-head h2,
+.knowledge-web__catalog-head p {
+  margin: 0;
+}
+
+.knowledge-web__catalog-head h2 {
+  color: #24231f;
+  font-size: 24px;
+}
+
+.knowledge-web__catalog-head p:not(.web-kicker) {
+  margin-top: 4px;
+  color: #756c60;
+  font-size: 13px;
+}
+
+.knowledge-web__catalog-search {
+  display: grid;
+  grid-template-columns: minmax(240px, 380px) auto;
+  gap: 8px;
+}
+
+.knowledge-web__catalog-search input {
+  min-width: 0;
+  border: 1px solid rgba(141, 132, 117, 0.25);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #fff;
+  color: #24231f;
+}
+
+.knowledge-web__catalog-grid {
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 6px;
+  max-height: none;
+  overflow: visible;
+  padding: 0;
+}
+
+.knowledge-web__catalog-grid .knowledge-web__book {
+  border-color: rgba(141, 132, 117, 0.14);
+  background: rgba(255, 255, 255, 0.56);
 }
 
 .knowledge-web__sidebar,
@@ -2517,6 +2646,7 @@ a.button {
 
 .knowledge-pipeline__items {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -4198,10 +4328,51 @@ a.button {
     flex-direction: column;
   }
 
+  .knowledge-web__header-actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .knowledge-web__detail-toolbar {
+    position: static;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .knowledge-web__detail-toolbar > div {
+    width: 100%;
+  }
+
+  .knowledge-web__detail-toolbar .button {
+    flex: 1;
+    justify-content: center;
+  }
+
   .knowledge-web__layout,
   .knowledge-web__content,
   .knowledge-supply__grid,
   .knowledge-review__evidence {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .knowledge-web--detail .knowledge-web__sidebar {
+    position: static;
+    max-height: 320px;
+    overflow: auto;
+  }
+
+  .knowledge-web--detail .knowledge-web__main {
+    order: -1;
+  }
+
+  .knowledge-web__catalog-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .knowledge-web__catalog-search,
+  .knowledge-web__catalog-grid,
+  .knowledge-pipeline__items {
     grid-template-columns: minmax(0, 1fr);
   }
 

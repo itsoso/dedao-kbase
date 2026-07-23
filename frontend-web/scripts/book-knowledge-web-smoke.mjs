@@ -261,6 +261,25 @@ for (const marker of [
 }
 assert.ok(js.includes("limit: 1"), "pipeline automation should advance one package per browser request");
 
+for (const marker of [
+  "isKnowledgePackageDetailRoute",
+  "knowledge-web--detail",
+  "knowledge-web__detail-toolbar",
+  "返回全部知识包",
+  "上一条",
+  "下一条",
+]) {
+  assert.ok(js.includes(marker), `knowledge package detail-first layout should include ${marker}`);
+}
+assert.ok(
+  js.includes('isPackageDetail ? "" : renderKnowledgeReviewCockpit()'),
+  "global review cockpit should be hidden on package detail routes",
+);
+assert.ok(
+  js.includes('isPackageDetail ? "" : renderKnowledgePipelineDashboard()'),
+  "global pipeline should be hidden on package detail routes",
+);
+
 for (const className of [
   ".knowledge-review",
   ".knowledge-review__summary",
@@ -272,6 +291,8 @@ for (const className of [
   ".knowledge-supply",
   ".knowledge-supply__card",
   ".knowledge-supply__status",
+  ".knowledge-web--detail",
+  ".knowledge-web__detail-toolbar",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }

@@ -540,6 +540,10 @@ function getKnowledgeBookID() {
   }
 }
 
+function isKnowledgePackageDetailRoute() {
+  return Boolean(getKnowledgeBookID());
+}
+
 function getDedaoCourseDetailEnID() {
   const raw = getPathSegmentAfter(`${ROUTES.dedaoCourses}/detail/`) || getPathSegmentAfter("/course/detail/");
   if (!raw) {
@@ -1819,6 +1823,7 @@ function knowledgePipelineActionLabel(action) {
 }
 
 function renderBookKnowledge() {
+  const isPackageDetail = isKnowledgePackageDetailRoute();
   const bookRows = knowledgeState.books.map((book, index) => {
     const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
     return `
@@ -1860,23 +1865,40 @@ function renderBookKnowledge() {
     failed: "需重试",
   };
   const manifestActionLabel = analysisManifest.answer ? "重新生成" : "生成基线分析";
-  const cockpitHTML = renderKnowledgeReviewCockpit();
-  const pipelineHTML = renderKnowledgePipelineDashboard();
+  const cockpitHTML = isPackageDetail ? "" : renderKnowledgeReviewCockpit();
+  const pipelineHTML = isPackageDetail ? "" : renderKnowledgePipelineDashboard();
+  const currentIndex = knowledgeState.books.findIndex((book) => book.book_id === currentBook.book_id);
+  const previousBook = currentIndex > 0 ? knowledgeState.books[currentIndex - 1] : null;
+  const nextBook = currentIndex >= 0 && currentIndex < knowledgeState.books.length - 1
+    ? knowledgeState.books[currentIndex + 1]
+    : null;
 
   renderShell(`
-    <main class="knowledge-web">
+    <main class="knowledge-web ${isPackageDetail ? "knowledge-web--detail" : "knowledge-web--index"}">
       <section class="knowledge-web__header">
         <div>
-          <p class="web-kicker">Book Knowledge</p>
-          <h1>书籍知识库</h1>
+          <p class="web-kicker">${isPackageDetail ? "Knowledge Package" : "Book Knowledge"}</p>
+          <h1>${isPackageDetail ? "知识包" : "书籍知识库"}</h1>
         </div>
-        <button id="knowledge-refresh" class="button button-ghost" type="button">刷新</button>
+        <div class="knowledge-web__header-actions">
+          <button id="knowledge-refresh" class="button button-ghost" type="button">刷新</button>
+        </div>
       </section>
       ${status}
+      ${isPackageDetail ? `
+        <nav class="knowledge-web__detail-toolbar" aria-label="知识包导航">
+          <a class="knowledge-web__detail-back" href="${escapeAttribute(ROUTES.knowledgePackages)}">← 返回全部知识包</a>
+          <span>${currentIndex >= 0 ? `${currentIndex + 1} / ${knowledgeState.books.length}` : "知识包详情"}</span>
+          <div>
+            ${previousBook ? `<a class="button button-ghost" href="${escapeAttribute(sourceKnowledgeURL(previousBook.book_id))}" title="${escapeAttribute(previousBook.title || "上一条")}">← 上一条</a>` : `<span class="button button-ghost is-disabled">← 上一条</span>`}
+            ${nextBook ? `<a class="button button-ghost" href="${escapeAttribute(sourceKnowledgeURL(nextBook.book_id))}" title="${escapeAttribute(nextBook.title || "下一条")}">下一条 →</a>` : `<span class="button button-ghost is-disabled">下一条 →</span>`}
+          </div>
+        </nav>
+      ` : ""}
       ${cockpitHTML}
       ${pipelineHTML}
 
-      <div class="knowledge-web__layout">
+      ${isPackageDetail ? `<div class="knowledge-web__layout">
         <aside class="knowledge-web__sidebar">
           <form id="knowledge-search-form" class="source-form">
             <label>
@@ -1968,7 +1990,24 @@ function renderBookKnowledge() {
             </section>
           ` : "<p class=\"web-muted\">请选择书籍或导入新来源。</p>"}
         </section>
-      </div>
+      </div>` : `
+        <section class="knowledge-web__catalog" aria-label="知识包目录">
+          <div class="knowledge-web__catalog-head">
+            <div>
+              <p class="web-kicker">Knowledge Catalog</p>
+              <h2>全部知识包</h2>
+              <p>选择一个知识包进入阅读、复核与大模型分析工作区。</p>
+            </div>
+            <form id="knowledge-search-form" class="knowledge-web__catalog-search">
+              <input name="query" value="${escapeAttribute(knowledgeState.query)}" placeholder="搜索标题、claims 或 chunks" aria-label="搜索知识包">
+              <button class="button button-primary" type="submit">搜索</button>
+            </form>
+          </div>
+          <div class="knowledge-web__books knowledge-web__catalog-grid">
+            ${bookRows || "<p class=\"web-muted\">暂无知识库条目，可先从微信来源导入。</p>"}
+          </div>
+        </section>
+      `}
     </main>
   `, "knowledge");
   bindBookKnowledgeEvents();
@@ -5281,8 +5320,7 @@ function bindBookKnowledgeEvents() {
       if (!book) {
         return;
       }
-      window.history?.pushState?.({}, "", sourceKnowledgeURL(book.book_id));
-      await selectKnowledgeBook(book);
+      await navigateKnowledgeBook(book);
     });
   }
   for (const button of document.querySelectorAll("[data-cockpit-book-id]")) {
@@ -5292,9 +5330,7 @@ function bindBookKnowledgeEvents() {
       if (!book) {
         return;
       }
-      window.history?.pushState?.({}, "", `${sourceKnowledgeURL(book.book_id)}?review=1`);
-      await selectKnowledgeBook(book);
-      setKnowledgeReviewOpen(true);
+      await navigateKnowledgeBook(book, { review: true });
     });
   }
   document.querySelector("#knowledge-search-form")?.addEventListener("submit", async (event) => {
@@ -5341,8 +5377,7 @@ function bindBookKnowledgeEvents() {
       const index = Number(button.getAttribute("data-book-index") || "0");
       const book = knowledgeState.books[index] || null;
       if (book) {
-        window.history?.pushState?.({}, "", sourceKnowledgeURL(book.book_id));
-        await selectKnowledgeBook(book);
+        await navigateKnowledgeBook(book);
       }
     });
   }
@@ -5376,20 +5411,22 @@ async function loadBookKnowledge() {
   knowledgeState.message = "";
   renderBookKnowledge();
   try {
-    await Promise.all([
-      loadKnowledgeReviewCockpit({ silent: true, renderResult: false }),
-      loadKnowledgePipelineDashboard({ silent: true, renderResult: false }),
-    ]);
+    if (!isKnowledgePackageDetailRoute()) {
+      await Promise.all([
+        loadKnowledgeReviewCockpit({ silent: true, renderResult: false }),
+        loadKnowledgePipelineDashboard({ silent: true, renderResult: false }),
+      ]);
+    }
     const payload = await apiFetch("/api/books");
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
-    if (knowledgeState.books.length) {
+    if (knowledgeState.books.length && isKnowledgePackageDetailRoute()) {
       const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
       const preferredID = getKnowledgeBookID() || queryBookID || knowledgeState.selectedBook?.book_id || "";
       const preferred = preferredID
         ? knowledgeState.books.find((book) => book.book_id === preferredID)
         : null;
       await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
-    } else {
+    } else if (!knowledgeState.books.length) {
       knowledgeState.selectedBook = null;
       knowledgeState.package = null;
       knowledgeState.results = [];
@@ -5402,6 +5439,24 @@ async function loadBookKnowledge() {
     knowledgeState.loading = "";
     renderBookKnowledge();
   }
+}
+
+async function navigateKnowledgeBook(book, { review = false } = {}) {
+  if (!book?.book_id) {
+    return;
+  }
+  const target = `${sourceKnowledgeURL(book.book_id)}${review ? "?review=1" : ""}`;
+  window.history?.pushState?.({}, "", target);
+  await selectKnowledgeBook(book);
+  if (review) {
+    setKnowledgeReviewOpen(true);
+  }
+  window.requestAnimationFrame?.(() => {
+    document.querySelector(".knowledge-web__main")?.scrollIntoView({
+      block: "start",
+      behavior: "smooth",
+    });
+  });
 }
 
 async function loadKnowledgePipelineDashboard({ silent = false, renderResult = true } = {}) {
@@ -6019,5 +6074,9 @@ async function boot() {
     renderError(error instanceof Error ? error.message : String(error));
   }
 }
+
+window.addEventListener?.("popstate", () => {
+  boot();
+});
 
 boot();
