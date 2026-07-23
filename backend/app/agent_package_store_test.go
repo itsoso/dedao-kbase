@@ -61,6 +61,34 @@ func TestAgentPackageStorePublishesAtomicallyAndIdempotently(t *testing.T) {
 	}
 }
 
+func TestAgentPackageV1StoreRoundTripDoesNotRequireEvidencePolicy(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+
+	published, _, err := PublishAgentPackage(
+		store,
+		pkg,
+		"publish-v1-without-evidence-policy",
+		AgentReadOnlyToolIDs(),
+		time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("PublishAgentPackage(v1) error = %v", err)
+	}
+	loaded, err := store.LoadAgentPackage(published.PackageID, published.Version)
+	if err != nil {
+		t.Fatalf("LoadAgentPackage(v1) error = %v", err)
+	}
+	if loaded.SchemaVersion != AgentPackageSchemaVersionV1 || loaded.EvidencePolicy != nil {
+		t.Fatalf("v1 round trip = %#v", loaded)
+	}
+}
+
 func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
