@@ -1,10 +1,12 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -98,6 +100,108 @@ func TestEvidenceAuditStoreConcurrentCreatesShareOneAudit(t *testing.T) {
 	}
 }
 
+func TestEvidenceAuditStoreConcurrentCreatesAcrossStoreInstances(t *testing.T) {
+	root := t.TempDir()
+	stores := []*BookKnowledgeStore{NewBookKnowledgeStore(root), NewBookKnowledgeStore(root)}
+	input := validEvidenceAuditInput()
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+
+	const workers = 12
+	auditIDs := make(chan string, workers)
+	errs := make(chan error, workers)
+	var wait sync.WaitGroup
+	for index := 0; index < workers; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			audit, _, err := CreateEvidenceAudit(
+				stores[index%len(stores)],
+				input,
+				fmt.Sprintf("cross-store-%d", index),
+				now,
+			)
+			if err != nil {
+				errs <- err
+				return
+			}
+			auditIDs <- audit.AuditID
+		}(index)
+	}
+	wait.Wait()
+	close(auditIDs)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("CreateEvidenceAudit() error = %v", err)
+	}
+	var shared string
+	for auditID := range auditIDs {
+		if shared == "" {
+			shared = auditID
+		} else if auditID != shared {
+			t.Fatalf("auditID = %q, want %q", auditID, shared)
+		}
+	}
+	records, err := stores[0].ListEvidenceAudits("", "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+}
+
+func TestEvidenceAuditStoreConcurrentCreatesAcrossProcesses(t *testing.T) {
+	root := t.TempDir()
+	const workers = 6
+	commands := make([]*exec.Cmd, 0, workers)
+	outputs := make([]*bytes.Buffer, 0, workers)
+	for index := 0; index < workers; index++ {
+		command := exec.Command(os.Args[0], "-test.run=^TestEvidenceAuditStoreCrossProcessHelper$")
+		command.Env = append(
+			os.Environ(),
+			"EVIDENCE_AUDIT_HELPER=1",
+			"EVIDENCE_AUDIT_ROOT="+root,
+			fmt.Sprintf("EVIDENCE_AUDIT_KEY=process-%d", index),
+		)
+		output := &bytes.Buffer{}
+		outputs = append(outputs, output)
+		command.Stdout = output
+		command.Stderr = output
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	for index, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Fatalf("helper failed: %v\n%s", err, outputs[index].String())
+		}
+	}
+	store := NewBookKnowledgeStore(root)
+	records, err := store.ListEvidenceAudits("", "", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %#v, want one cross-process audit", records)
+	}
+}
+
+func TestEvidenceAuditStoreCrossProcessHelper(t *testing.T) {
+	if os.Getenv("EVIDENCE_AUDIT_HELPER") != "1" {
+		t.Skip("helper process only")
+	}
+	store := NewBookKnowledgeStore(os.Getenv("EVIDENCE_AUDIT_ROOT"))
+	if _, _, err := CreateEvidenceAudit(
+		store,
+		validEvidenceAuditInput(),
+		os.Getenv("EVIDENCE_AUDIT_KEY"),
+		time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEvidenceAuditStorePersistsLifecycleAndCompletedReportIsImmutable(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
@@ -166,14 +270,15 @@ func TestEvidenceAuditStorePersistsFailedStateWithoutPartialReport(t *testing.T)
 		store,
 		queued.AuditID,
 		"model_invalid",
-		"Bearer secret-token prompt=private remote body: patient data",
+		"Model route rejected the request.",
 		now.Add(2*time.Minute),
 	)
 	if err != nil {
 		t.Fatalf("FailEvidenceAudit() error = %v", err)
 	}
 	if failed.Status != EvidenceAuditFailed || failed.FailedAt == "" ||
-		failed.FailureCode != "model_invalid" || failed.FailureSummary == "" || failed.OutputHash != "" {
+		failed.FailureCode != "model_invalid" || failed.FailureSummary != "Model route rejected the request." ||
+		failed.OutputHash != "" {
 		t.Fatalf("failed audit = %#v", failed)
 	}
 	rawManifest, err := os.ReadFile(store.EvidenceAuditManifestPath())
@@ -184,6 +289,118 @@ func TestEvidenceAuditStorePersistsFailedStateWithoutPartialReport(t *testing.T)
 		if strings.Contains(string(rawManifest), forbidden) {
 			t.Fatalf("manifest leaked failure detail %q: %s", forbidden, rawManifest)
 		}
+	}
+}
+
+func TestEvidenceAuditStoreRedactsSensitiveFailureSummary(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	queued, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "request-redaction", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := FailEvidenceAudit(
+		store,
+		queued.AuditID,
+		"upstream_error",
+		"Bearer secret-token prompt=private remote body: patient data",
+		now.Add(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.FailureSummary != "Audit failed; sensitive upstream detail was redacted." {
+		t.Fatalf("failure summary = %q", failed.FailureSummary)
+	}
+	raw, err := os.ReadFile(store.EvidenceAuditManifestPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret-token", "prompt=private", "patient data", "Bearer"} {
+		if strings.Contains(string(raw), forbidden) {
+			t.Fatalf("manifest leaked %q: %s", forbidden, raw)
+		}
+	}
+}
+
+func TestEvidenceAuditStoreRejectsLegacyAndUnknownManifestVersions(t *testing.T) {
+	for _, version := range []string{"1", "999"} {
+		t.Run(version, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			if err := os.MkdirAll(store.EvidenceAuditDir(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte(`{"version":"` + version + `","audits":[],"idempotency":[]}`)
+			if err := os.WriteFile(store.EvidenceAuditManifestPath(), payload, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ListEvidenceAudits("", "", 10); err == nil ||
+				!strings.Contains(err.Error(), "manifest version") {
+				t.Fatalf("ListEvidenceAudits() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditStoreEnforcesManifestCapacity(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	auditOverflow := EvidenceAuditManifest{
+		Version:     evidenceAuditStoreVersion,
+		Audits:      make([]EvidenceAuditRecord, evidenceAuditMaxManifestAudits+1),
+		Idempotency: []EvidenceAuditIdempotencyRecord{},
+	}
+	if err := store.writeEvidenceAuditManifestUnlocked(&auditOverflow); err == nil ||
+		!strings.Contains(err.Error(), "capacity") {
+		t.Fatalf("writeEvidenceAuditManifestUnlocked() error = %v", err)
+	}
+	idempotencyOverflow := EvidenceAuditManifest{
+		Version:     evidenceAuditStoreVersion,
+		Audits:      []EvidenceAuditRecord{},
+		Idempotency: make([]EvidenceAuditIdempotencyRecord, evidenceAuditMaxManifestIdempotency+1),
+	}
+	if err := store.writeEvidenceAuditManifestUnlocked(&idempotencyOverflow); err == nil ||
+		!strings.Contains(err.Error(), "capacity") {
+		t.Fatalf("writeEvidenceAuditManifestUnlocked() idempotency error = %v", err)
+	}
+}
+
+func TestEvidenceAuditStoreRejectsAtCapacityBeforeWritingInput(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := os.MkdirAll(store.EvidenceAuditDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := EvidenceAuditManifest{
+		Version:     evidenceAuditStoreVersion,
+		Audits:      make([]EvidenceAuditRecord, evidenceAuditMaxManifestAudits),
+		Idempotency: []EvidenceAuditIdempotencyRecord{},
+	}
+	for index := range manifest.Audits {
+		manifest.Audits[index] = EvidenceAuditRecord{
+			AuditID:   fmt.Sprintf("audit-capacity-%d", index),
+			PackageID: "another-package",
+			InputHash: fmt.Sprintf("sha256:%064x", index),
+			CreatedAt: "2026-07-23T10:00:00Z",
+			UpdatedAt: "2026-07-23T10:00:00Z",
+		}
+	}
+	if err := store.writeEvidenceAuditManifestUnlocked(&manifest); err != nil {
+		t.Fatal(err)
+	}
+	input := validEvidenceAuditInput()
+	inputHash, err := EvidenceAuditInputHash(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := CreateEvidenceAudit(
+		store,
+		input,
+		"capacity-request",
+		time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC),
+	); err == nil || !strings.Contains(err.Error(), "capacity") {
+		t.Fatalf("CreateEvidenceAudit() error = %v", err)
+	}
+	if _, err := os.Stat(store.EvidenceAuditInputPath(inputHash)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("capacity rejection wrote input artifact: %v", err)
 	}
 }
 
@@ -235,6 +452,16 @@ func TestEvidenceAuditStoreRecoversWhenManifestWriteFailsAfterReportWrite(t *tes
 		t.Fatalf("first completion error = %v", err)
 	}
 	writeEvidenceAuditManifestFile = originalWriter
+	if _, err := os.Stat(store.EvidenceAuditPreparedPath(queued.AuditID)); err != nil {
+		t.Fatalf("prepared journal missing: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(store.EvidenceAuditDir(), "reports", "unrelated-corrupt.json"),
+		[]byte("{broken"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
 
 	completed, err := CompleteEvidenceAudit(store, report, now.Add(5*time.Minute))
 	if err != nil {
@@ -247,8 +474,52 @@ func TestEvidenceAuditStoreRecoversWhenManifestWriteFailsAfterReportWrite(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(reports) != 1 {
-		t.Fatalf("report artifacts = %v, want exactly one immutable report", reports)
+	if len(reports) != 2 {
+		t.Fatalf("report artifacts = %v, want report plus injected corrupt artifact", reports)
+	}
+	if _, err := os.Stat(store.EvidenceAuditPreparedPath(queued.AuditID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("prepared journal still exists: %v", err)
+	}
+}
+
+func TestEvidenceAuditStoreRejectsPreparedJournalWithMismatchedReportIdentity(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	queued, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "request-journal", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, queued.AuditID, "trace-journal", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report := validCompletedEvidenceAudit()
+	report.AuditID = queued.AuditID
+
+	originalWriter := writeEvidenceAuditManifestFile
+	writeEvidenceAuditManifestFile = func(string, []byte) error {
+		return errors.New("injected manifest failure")
+	}
+	t.Cleanup(func() { writeEvidenceAuditManifestFile = originalWriter })
+	if _, err := CompleteEvidenceAudit(store, report, now.Add(2*time.Minute)); err == nil {
+		t.Fatal("completion unexpectedly succeeded")
+	}
+	writeEvidenceAuditManifestFile = originalWriter
+
+	var prepared evidenceAuditPreparedRecord
+	if err := readJSONFile(store.EvidenceAuditPreparedPath(queued.AuditID), &prepared); err != nil {
+		t.Fatal(err)
+	}
+	prepared.OutputHash = testSecondSupportHash
+	payload, err := encodeJSONFile(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.EvidenceAuditPreparedPath(queued.AuditID), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompleteEvidenceAudit(store, report, now.Add(3*time.Minute)); err == nil ||
+		(!strings.Contains(err.Error(), "prepared") && !errors.Is(err, os.ErrNotExist)) {
+		t.Fatalf("CompleteEvidenceAudit() error = %v", err)
 	}
 }
 

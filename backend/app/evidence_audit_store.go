@@ -15,6 +15,13 @@ import (
 
 const evidenceAuditStoreVersion = "2"
 
+const (
+	evidenceAuditMaxManifestAudits      = 10000
+	evidenceAuditMaxManifestIdempotency = 20000
+	evidenceAuditRootLockWait           = 5 * time.Second
+	evidenceAuditRootLockStaleAfter     = 2 * time.Minute
+)
+
 var (
 	ErrEvidenceAuditIdempotencyConflict = errors.New("evidence audit idempotency conflict")
 	ErrEvidenceAuditImmutable           = errors.New("completed evidence audit is immutable")
@@ -54,6 +61,13 @@ type EvidenceAuditManifest struct {
 	Idempotency []EvidenceAuditIdempotencyRecord `json:"idempotency"`
 }
 
+type evidenceAuditPreparedRecord struct {
+	Version    string `json:"version"`
+	AuditID    string `json:"audit_id"`
+	InputHash  string `json:"input_hash"`
+	OutputHash string `json:"output_hash"`
+}
+
 func (s *BookKnowledgeStore) EvidenceAuditDir() string {
 	return filepath.Join(s.root, "agent-audits")
 }
@@ -68,6 +82,10 @@ func (s *BookKnowledgeStore) EvidenceAuditInputPath(inputHash string) string {
 
 func (s *BookKnowledgeStore) EvidenceAuditReportPath(outputHash string) string {
 	return filepath.Join(s.EvidenceAuditDir(), "reports", evidenceAuditHashName(outputHash)+".json")
+}
+
+func (s *BookKnowledgeStore) EvidenceAuditPreparedPath(auditID string) string {
+	return filepath.Join(s.EvidenceAuditDir(), "prepared", sanitizeBookKnowledgeID(auditID)+".json")
 }
 
 func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, idempotencyKey string, now time.Time) (*EvidenceAudit, bool, error) {
@@ -95,6 +113,11 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	unlockRoot, err := store.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlockRoot()
 	if err := os.MkdirAll(store.EvidenceAuditDir(), os.ModePerm); err != nil {
 		return nil, false, err
 	}
@@ -118,6 +141,12 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 			record.InputHash != inputHash {
 			continue
 		}
+		if len(manifest.Idempotency) >= evidenceAuditMaxManifestIdempotency {
+			return nil, false, fmt.Errorf(
+				"evidence audit manifest idempotency capacity %d reached",
+				evidenceAuditMaxManifestIdempotency,
+			)
+		}
 		manifest.Idempotency = append(manifest.Idempotency, EvidenceAuditIdempotencyRecord{
 			IdempotencyIdentity: idempotencyIdentity,
 			AuditID:             record.AuditID,
@@ -129,6 +158,18 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 		}
 		audit, err := store.loadEvidenceAuditRecordUnlocked(record)
 		return audit, false, err
+	}
+	if len(manifest.Audits) >= evidenceAuditMaxManifestAudits {
+		return nil, false, fmt.Errorf(
+			"evidence audit manifest audit capacity %d reached",
+			evidenceAuditMaxManifestAudits,
+		)
+	}
+	if len(manifest.Idempotency) >= evidenceAuditMaxManifestIdempotency {
+		return nil, false, fmt.Errorf(
+			"evidence audit manifest idempotency capacity %d reached",
+			evidenceAuditMaxManifestIdempotency,
+		)
 	}
 	if err := store.writeEvidenceAuditInputUnlocked(normalized); err != nil {
 		return nil, false, err
@@ -200,7 +241,7 @@ func FailEvidenceAudit(
 		record.Status = EvidenceAuditFailed
 		record.FailedAt = evidenceAuditTimestamp(now)
 		record.FailureCode = code
-		record.FailureSummary = sanitizeEvidenceAuditFailureSummary(code)
+		record.FailureSummary = sanitizeEvidenceAuditFailureSummary(summary)
 		record.OutputHash = ""
 		return nil
 	})
@@ -212,6 +253,11 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	unlockRoot, err := store.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlockRoot()
 	manifest, err := store.loadEvidenceAuditManifestUnlocked()
 	if err != nil {
 		return nil, err
@@ -242,6 +288,7 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 		if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
 			return nil, err
 		}
+		_ = os.Remove(store.EvidenceAuditPreparedPath(record.AuditID))
 		return prepared, nil
 	}
 	input, err := store.loadEvidenceAuditInputUnlocked(record.InputHash)
@@ -262,6 +309,7 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	report.IdempotencyKey = idempotencyKey
 	report.InputHash = record.InputHash
 	report.Package = input.Package
+	report.EvidencePolicy = input.EvidencePolicy
 	report.Model = input.Model
 	report.Retrieval = input.Retrieval
 	report.Releases = input.Releases
@@ -277,6 +325,9 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	if err := store.writeEvidenceAuditReportUnlocked(finalized); err != nil {
 		return nil, err
 	}
+	if err := store.writePreparedEvidenceAuditReportUnlocked(finalized); err != nil {
+		return nil, err
+	}
 	record.Status = EvidenceAuditCompleted
 	record.OutputHash = finalized.OutputHash
 	record.UpdatedAt = finalized.UpdatedAt
@@ -285,12 +336,18 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
 		return nil, err
 	}
+	_ = os.Remove(store.EvidenceAuditPreparedPath(record.AuditID))
 	return &finalized, nil
 }
 
 func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlockRoot()
 	manifest, err := s.loadEvidenceAuditManifestUnlocked()
 	if err != nil {
 		return nil, err
@@ -301,6 +358,11 @@ func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, 
 func (s *BookKnowledgeStore) ListEvidenceAudits(packageID, version string, limit int) ([]EvidenceAuditRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlockRoot()
 	manifest, err := s.loadEvidenceAuditManifestUnlocked()
 	if err != nil {
 		return nil, err
@@ -332,6 +394,11 @@ func updateEvidenceAuditRecord(store *BookKnowledgeStore, auditID string, now ti
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	unlockRoot, err := store.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlockRoot()
 	manifest, err := store.loadEvidenceAuditManifestUnlocked()
 	if err != nil {
 		return nil, err
@@ -439,7 +506,7 @@ func (s *BookKnowledgeStore) writeEvidenceAuditInputUnlocked(input EvidenceAudit
 	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
 		return err
 	}
-	return writeFileAtomically(path, payload)
+	return writeEvidenceAuditImmutableFile(path, payload)
 }
 
 func (s *BookKnowledgeStore) writeEvidenceAuditReportUnlocked(report EvidenceAudit) error {
@@ -465,7 +532,7 @@ func (s *BookKnowledgeStore) writeEvidenceAuditReportUnlocked(report EvidenceAud
 	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
 		return err
 	}
-	return writeFileAtomically(path, payload)
+	return writeEvidenceAuditImmutableFile(path, payload)
 }
 
 func (s *BookKnowledgeStore) loadEvidenceAuditManifestUnlocked() (*EvidenceAuditManifest, error) {
@@ -479,6 +546,16 @@ func (s *BookKnowledgeStore) loadEvidenceAuditManifestUnlocked() (*EvidenceAudit
 	} else if err != nil {
 		return nil, err
 	}
+	if manifest.Version != evidenceAuditStoreVersion {
+		return nil, fmt.Errorf(
+			"unsupported evidence audit manifest version %q; expected %q",
+			manifest.Version,
+			evidenceAuditStoreVersion,
+		)
+	}
+	if err := validateEvidenceAuditManifestCapacity(&manifest); err != nil {
+		return nil, err
+	}
 	sort.SliceStable(manifest.Audits, func(i, j int) bool {
 		if manifest.Audits[i].CreatedAt != manifest.Audits[j].CreatedAt {
 			return manifest.Audits[i].CreatedAt < manifest.Audits[j].CreatedAt
@@ -489,11 +566,28 @@ func (s *BookKnowledgeStore) loadEvidenceAuditManifestUnlocked() (*EvidenceAudit
 }
 
 func (s *BookKnowledgeStore) writeEvidenceAuditManifestUnlocked(manifest *EvidenceAuditManifest) error {
+	manifest.Version = evidenceAuditStoreVersion
+	if err := validateEvidenceAuditManifestCapacity(manifest); err != nil {
+		return err
+	}
 	payload, err := encodeJSONFile(manifest)
 	if err != nil {
 		return err
 	}
 	return writeEvidenceAuditManifestFile(s.EvidenceAuditManifestPath(), payload)
+}
+
+func validateEvidenceAuditManifestCapacity(manifest *EvidenceAuditManifest) error {
+	if len(manifest.Audits) > evidenceAuditMaxManifestAudits {
+		return fmt.Errorf("evidence audit manifest audit capacity %d exceeded", evidenceAuditMaxManifestAudits)
+	}
+	if len(manifest.Idempotency) > evidenceAuditMaxManifestIdempotency {
+		return fmt.Errorf(
+			"evidence audit manifest idempotency capacity %d exceeded",
+			evidenceAuditMaxManifestIdempotency,
+		)
+	}
+	return nil
 }
 
 func evidenceAuditFromInput(input EvidenceAuditInput, record EvidenceAuditRecord, idempotencyKey string) EvidenceAudit {
@@ -509,6 +603,7 @@ func evidenceAuditFromInput(input EvidenceAuditInput, record EvidenceAuditRecord
 		IdempotencyKey: idempotencyKey,
 		InputHash:      record.InputHash,
 		Package:        input.Package,
+		EvidencePolicy: input.EvidencePolicy,
 		Model:          input.Model,
 		Retrieval:      input.Retrieval,
 		Releases:       input.Releases,
@@ -543,29 +638,54 @@ func evidenceAuditIdempotencyKey(manifest *EvidenceAuditManifest, auditID string
 func (s *BookKnowledgeStore) findPreparedEvidenceAuditReportUnlocked(
 	auditID, inputHash string,
 ) (*EvidenceAudit, error) {
-	paths, err := filepath.Glob(filepath.Join(s.EvidenceAuditDir(), "reports", "*.json"))
-	if err != nil {
+	var prepared evidenceAuditPreparedRecord
+	if err := readJSONFile(s.EvidenceAuditPreparedPath(auditID), &prepared); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
 		return nil, err
 	}
-	var found *EvidenceAudit
-	for _, path := range paths {
-		var report EvidenceAudit
-		if err := readJSONFile(path, &report); err != nil {
-			return nil, err
-		}
-		if report.AuditID != auditID || report.InputHash != inputHash {
-			continue
-		}
-		if err := ValidateEvidenceAudit(report); err != nil {
-			return nil, fmt.Errorf("validate prepared evidence audit report: %w", err)
-		}
-		if found != nil && found.OutputHash != report.OutputHash {
-			return nil, fmt.Errorf("%w: multiple prepared reports for audit %q", ErrEvidenceAuditStateConflict, auditID)
-		}
-		copy := report
-		found = &copy
+	if prepared.Version != evidenceAuditStoreVersion ||
+		prepared.AuditID != auditID ||
+		prepared.InputHash != inputHash ||
+		!validEvidenceAuditSHA256(prepared.OutputHash) {
+		return nil, fmt.Errorf("prepared evidence audit journal identity is invalid")
 	}
-	return found, nil
+	path := s.EvidenceAuditReportPath(prepared.OutputHash)
+	if filepath.Base(path) != evidenceAuditHashName(prepared.OutputHash)+".json" {
+		return nil, fmt.Errorf("prepared evidence audit report filename does not match output_hash")
+	}
+	var report EvidenceAudit
+	if err := readJSONFile(path, &report); err != nil {
+		return nil, err
+	}
+	if report.AuditID != auditID ||
+		report.InputHash != inputHash ||
+		report.OutputHash != prepared.OutputHash ||
+		filepath.Base(path) != evidenceAuditHashName(report.OutputHash)+".json" {
+		return nil, fmt.Errorf("prepared evidence audit report identity is invalid")
+	}
+	if err := ValidateEvidenceAudit(report); err != nil {
+		return nil, fmt.Errorf("validate prepared evidence audit report: %w", err)
+	}
+	return &report, nil
+}
+
+func (s *BookKnowledgeStore) writePreparedEvidenceAuditReportUnlocked(report EvidenceAudit) error {
+	prepared := evidenceAuditPreparedRecord{
+		Version:    evidenceAuditStoreVersion,
+		AuditID:    report.AuditID,
+		InputHash:  report.InputHash,
+		OutputHash: report.OutputHash,
+	}
+	payload, err := encodeJSONFile(prepared)
+	if err != nil {
+		return err
+	}
+	path := s.EvidenceAuditPreparedPath(report.AuditID)
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return err
+	}
+	return writeFileAtomically(path, payload)
 }
 
 func evidenceAuditReportContentEqual(left, right EvidenceAudit) bool {
@@ -601,8 +721,26 @@ func sanitizeEvidenceAuditFailureCode(value string) string {
 	return builder.String()
 }
 
-func sanitizeEvidenceAuditFailureSummary(code string) string {
-	return "audit failed with code " + code
+func sanitizeEvidenceAuditFailureSummary(summary string) string {
+	summary = strings.TrimSpace(summary)
+	if len(summary) > 160 {
+		summary = summary[:160]
+	}
+	for _, sensitive := range []string{"bearer", "token", "prompt=", "patient data", "remote body"} {
+		if strings.Contains(strings.ToLower(summary), sensitive) {
+			return "Audit failed; sensitive upstream detail was redacted."
+		}
+	}
+	var builder strings.Builder
+	for _, char := range summary {
+		if char >= 0x20 && char != 0x7f {
+			builder.WriteRune(char)
+		}
+	}
+	if strings.TrimSpace(builder.String()) == "" {
+		return "Audit failed without a safe diagnostic summary."
+	}
+	return builder.String()
 }
 
 func evidenceAuditTimestamp(now time.Time) string {
@@ -614,4 +752,68 @@ func evidenceAuditTimestamp(now time.Time) string {
 
 func evidenceAuditHashName(hash string) string {
 	return sanitizeBookKnowledgeID(strings.TrimPrefix(strings.TrimSpace(hash), "sha256:"))
+}
+
+func writeEvidenceAuditImmutableFile(path string, payload []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		stored, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if string(stored) != string(payload) {
+			return ErrEvidenceAuditImmutable
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(payload); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	remove = false
+	return nil
+}
+
+func (s *BookKnowledgeStore) acquireEvidenceAuditRootLock() (func(), error) {
+	if err := os.MkdirAll(s.EvidenceAuditDir(), os.ModePerm); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(s.EvidenceAuditDir(), ".store.lock")
+	deadline := time.Now().Add(evidenceAuditRootLockWait)
+	for {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
+			_ = file.Sync()
+			_ = file.Close()
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		if info, statErr := os.Stat(path); statErr == nil &&
+			time.Since(info.ModTime()) > evidenceAuditRootLockStaleAfter {
+			_ = os.Remove(path)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out acquiring evidence audit root lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

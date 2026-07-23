@@ -26,6 +26,13 @@ const (
 
 	EvidenceAuditReleasePrimary    = "primary"
 	EvidenceAuditReleaseSupporting = "supporting"
+
+	evidenceAuditMaxReleases            = 32
+	evidenceAuditMaxCitationsPerRelease = 512
+	evidenceAuditMaxTotalCitations      = 2048
+	evidenceAuditMaxTextBytes           = 4096
+	evidenceAuditMaxIdentifierBytes     = 256
+	evidenceAuditMaxListItems           = 32
 )
 
 type EvidenceAudit struct {
@@ -40,6 +47,7 @@ type EvidenceAudit struct {
 	IdempotencyKey string                           `json:"idempotency_key"`
 	InputHash      string                           `json:"input_hash"`
 	Package        EvidenceAuditPackageRef          `json:"package"`
+	EvidencePolicy EvidenceAuditPolicySnapshot      `json:"evidence_policy"`
 	Model          EvidenceAuditModelIdentity       `json:"model"`
 	Retrieval      EvidenceAuditRetrievalIdentity   `json:"retrieval"`
 	Releases       []EvidenceAuditReleaseRef        `json:"releases"`
@@ -59,6 +67,7 @@ type EvidenceAuditInput struct {
 	SchemaVersion  string                         `json:"schema_version"`
 	InputHash      string                         `json:"input_hash,omitempty"`
 	Package        EvidenceAuditPackageRef        `json:"package"`
+	EvidencePolicy EvidenceAuditPolicySnapshot    `json:"evidence_policy"`
 	Model          EvidenceAuditModelIdentity     `json:"model"`
 	Retrieval      EvidenceAuditRetrievalIdentity `json:"retrieval"`
 	Releases       []EvidenceAuditReleaseRef      `json:"releases"`
@@ -71,6 +80,12 @@ type EvidenceAuditPackageRef struct {
 	PackageID   string `json:"package_id"`
 	Version     string `json:"version"`
 	ContentHash string `json:"content_hash"`
+}
+
+type EvidenceAuditPolicySnapshot struct {
+	MinimumIndependentSources int `json:"minimum_independent_sources"`
+	MaxClaims                 int `json:"max_claims"`
+	MaxEvidencePerClaim       int `json:"max_evidence_per_claim"`
 }
 
 type EvidenceAuditModelIdentity struct {
@@ -196,6 +211,25 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 	}); err != nil {
 		return err
 	}
+	for name, value := range map[string]string{
+		"audit_id":        audit.AuditID,
+		"status":          audit.Status,
+		"idempotency_key": audit.IdempotencyKey,
+		"input_hash":      audit.InputHash,
+		"trace_id":        audit.TraceID,
+		"failure_code":    audit.FailureCode,
+	} {
+		if err := validateEvidenceAuditString(name, value, evidenceAuditMaxIdentifierBytes); err != nil {
+			return err
+		}
+	}
+	if err := validateEvidenceAuditString(
+		"failure_summary",
+		audit.FailureSummary,
+		evidenceAuditMaxTextBytes,
+	); err != nil {
+		return err
+	}
 	if err := validateEvidenceAuditTimestamp("created_at", audit.CreatedAt); err != nil {
 		return err
 	}
@@ -211,6 +245,9 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 	}
 	if audit.InputHash != wantInputHash {
 		return fmt.Errorf("input_hash does not match deterministic audit input")
+	}
+	if !validEvidenceAuditSHA256(audit.InputHash) {
+		return fmt.Errorf("input_hash must be a sha256 digest")
 	}
 	switch audit.Status {
 	case EvidenceAuditQueued:
@@ -252,6 +289,9 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 		}
 		if audit.OutputHash == "" {
 			return fmt.Errorf("completed status requires output_hash")
+		}
+		if !validEvidenceAuditSHA256(audit.OutputHash) {
+			return fmt.Errorf("output_hash must be a sha256 digest")
 		}
 		if err := validateCompletedEvidenceAudit(audit); err != nil {
 			return err
@@ -321,12 +361,51 @@ func validateEvidenceAuditInput(input EvidenceAuditInput) error {
 	}); err != nil {
 		return err
 	}
-	if len(input.Releases) == 0 {
-		return fmt.Errorf("releases must pin at least one immutable release")
+	if !validEvidenceAuditSHA256(input.Package.ContentHash) {
+		return fmt.Errorf("package.content_hash must be a sha256 digest")
+	}
+	if input.EvidencePolicy.MinimumIndependentSources < 1 {
+		return fmt.Errorf("evidence_policy.minimum_independent_sources must be positive")
+	}
+	if input.EvidencePolicy.MaxClaims < 1 || input.EvidencePolicy.MaxClaims > agentEvidenceMaxClaims {
+		return fmt.Errorf("evidence_policy.max_claims must be between 1 and %d", agentEvidenceMaxClaims)
+	}
+	if input.EvidencePolicy.MaxEvidencePerClaim < 1 ||
+		input.EvidencePolicy.MaxEvidencePerClaim > agentEvidenceMaxEvidencePerClaim {
+		return fmt.Errorf(
+			"evidence_policy.max_evidence_per_claim must be between 1 and %d",
+			agentEvidenceMaxEvidencePerClaim,
+		)
+	}
+	for name, value := range map[string]string{
+		"package.package_id":          input.Package.PackageID,
+		"package.version":             input.Package.Version,
+		"model.provider":              input.Model.Provider,
+		"model.model":                 input.Model.Model,
+		"model.route":                 input.Model.Route,
+		"retrieval.strategy":          input.Retrieval.Strategy,
+		"retrieval.index_version":     input.Retrieval.IndexVersion,
+		"retrieval.reranker_version":  input.Retrieval.RerankerVersion,
+		"retrieval.embedding_version": input.Retrieval.EmbeddingVersion,
+	} {
+		if err := validateEvidenceAuditString(name, value, evidenceAuditMaxIdentifierBytes); err != nil {
+			return err
+		}
+	}
+	if err := validateEvidenceAuditString("subject", input.Subject, evidenceAuditMaxTextBytes); err != nil {
+		return err
+	}
+	if err := validateEvidenceAuditString("scope", input.Scope, evidenceAuditMaxTextBytes); err != nil {
+		return err
+	}
+	if len(input.Releases) == 0 || len(input.Releases) > evidenceAuditMaxReleases {
+		return fmt.Errorf("releases must contain between 1 and %d immutable releases", evidenceAuditMaxReleases)
 	}
 	seenReleases := map[string]struct{}{}
 	primaryCount := 0
 	supportingCount := 0
+	supportingPublications := map[string]struct{}{}
+	totalCitations := 0
 	for index, release := range input.Releases {
 		if err := requireContractFields(map[string]string{
 			fmt.Sprintf("releases[%d].release_id", index):           release.ReleaseID,
@@ -337,19 +416,40 @@ func validateEvidenceAuditInput(input EvidenceAuditInput) error {
 		}); err != nil {
 			return err
 		}
+		for name, value := range map[string]string{
+			fmt.Sprintf("releases[%d].release_id", index):  release.ReleaseID,
+			fmt.Sprintf("releases[%d].role", index):        release.Role,
+			fmt.Sprintf("releases[%d].source_type", index): release.SourceType,
+		} {
+			if err := validateEvidenceAuditString(name, value, evidenceAuditMaxIdentifierBytes); err != nil {
+				return err
+			}
+		}
+		if !validEvidenceAuditSHA256(release.ContentHash) {
+			return fmt.Errorf("releases[%d].content_hash must be a sha256 digest", index)
+		}
 		switch release.Role {
 		case EvidenceAuditReleasePrimary:
 			primaryCount++
 		case EvidenceAuditReleaseSupporting:
 			supportingCount++
+			supportingPublications[release.PublicationIdentity] = struct{}{}
 		default:
 			return fmt.Errorf("releases[%d].role must be primary or supporting", index)
 		}
 		if !validEvidenceAuditSHA256(release.PublicationIdentity) {
 			return fmt.Errorf("releases[%d].publication_identity must be an immutable sha256 identity", index)
 		}
-		if len(release.Citations) == 0 {
-			return fmt.Errorf("releases[%d].citations must pin at least one citation binding", index)
+		if len(release.Citations) == 0 || len(release.Citations) > evidenceAuditMaxCitationsPerRelease {
+			return fmt.Errorf(
+				"releases[%d].citations must contain between 1 and %d bindings",
+				index,
+				evidenceAuditMaxCitationsPerRelease,
+			)
+		}
+		totalCitations += len(release.Citations)
+		if totalCitations > evidenceAuditMaxTotalCitations {
+			return fmt.Errorf("releases citations exceed total limit %d", evidenceAuditMaxTotalCitations)
 		}
 		seenCitations := map[string]struct{}{}
 		for citationIndex, citation := range release.Citations {
@@ -359,6 +459,15 @@ func validateEvidenceAuditInput(input EvidenceAuditInput) error {
 				fmt.Sprintf("releases[%d].citations[%d].chunk_id", index, citationIndex):    citation.ChunkID,
 			}); err != nil {
 				return err
+			}
+			for name, value := range map[string]string{
+				fmt.Sprintf("releases[%d].citations[%d].citation_id", index, citationIndex): citation.CitationID,
+				fmt.Sprintf("releases[%d].citations[%d].claim_id", index, citationIndex):    citation.ClaimID,
+				fmt.Sprintf("releases[%d].citations[%d].chunk_id", index, citationIndex):    citation.ChunkID,
+			} {
+				if err := validateEvidenceAuditString(name, value, evidenceAuditMaxIdentifierBytes); err != nil {
+					return err
+				}
 			}
 			citationID := strings.TrimSpace(citation.CitationID)
 			if _, duplicate := seenCitations[citationID]; duplicate {
@@ -375,11 +484,21 @@ func validateEvidenceAuditInput(input EvidenceAuditInput) error {
 	if primaryCount != 1 || supportingCount == 0 {
 		return fmt.Errorf("releases must contain exactly one primary and at least one supporting release")
 	}
-	if len(input.SelectedClaims) == 0 || len(input.SelectedClaims) > agentEvidenceMaxClaims {
-		return fmt.Errorf("selected_claims must contain between 1 and %d claims", agentEvidenceMaxClaims)
+	if len(supportingPublications) < input.EvidencePolicy.MinimumIndependentSources {
+		return fmt.Errorf(
+			"releases provide %d independent supporting publications; evidence policy requires %d",
+			len(supportingPublications),
+			input.EvidencePolicy.MinimumIndependentSources,
+		)
+	}
+	if len(input.SelectedClaims) == 0 || len(input.SelectedClaims) > input.EvidencePolicy.MaxClaims {
+		return fmt.Errorf("selected_claims must contain between 1 and %d claims", input.EvidencePolicy.MaxClaims)
 	}
 	seenClaims := map[string]struct{}{}
 	for _, claim := range input.SelectedClaims {
+		if err := validateEvidenceAuditString("selected_claims", claim, evidenceAuditMaxTextBytes); err != nil {
+			return err
+		}
 		if _, duplicate := seenClaims[claim]; duplicate {
 			return fmt.Errorf("selected_claims contains duplicate claim %q", claim)
 		}
@@ -410,6 +529,29 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 		}); err != nil {
 			return err
 		}
+		if err := validateEvidenceAuditString(
+			fmt.Sprintf("claim_audits[%d].source_claim", index),
+			claim.SourceClaim,
+			evidenceAuditMaxTextBytes,
+		); err != nil {
+			return err
+		}
+		if err := validateEvidenceAuditString(
+			fmt.Sprintf("claim_audits[%d].normalized_statement", index),
+			claim.NormalizedStatement,
+			evidenceAuditMaxTextBytes,
+		); err != nil {
+			return err
+		}
+		for name, values := range map[string][]string{
+			fmt.Sprintf("claim_audits[%d].limitations", index):    claim.Limitations,
+			fmt.Sprintf("claim_audits[%d].knowledge_gaps", index): claim.KnowledgeGaps,
+			fmt.Sprintf("claim_audits[%d].review_actions", index): claim.ReviewActions,
+		} {
+			if err := validateEvidenceAuditStringList(name, values); err != nil {
+				return err
+			}
+		}
 		sourceClaim := strings.TrimSpace(claim.SourceClaim)
 		if _, selected := selectedClaims[sourceClaim]; !selected {
 			return fmt.Errorf("claim_audits[%d].source_claim must belong to selected_claims", index)
@@ -427,10 +569,16 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 		default:
 			return fmt.Errorf("claim_audits[%d] has unsupported verdict %q", index, claim.Verdict)
 		}
-		if len(claim.Evidence) > agentEvidenceMaxEvidencePerClaim {
-			return fmt.Errorf("claim_audits[%d] exceeds evidence limit %d", index, agentEvidenceMaxEvidencePerClaim)
+		if len(claim.Evidence) > audit.EvidencePolicy.MaxEvidencePerClaim {
+			return fmt.Errorf(
+				"claim_audits[%d] exceeds evidence limit %d",
+				index,
+				audit.EvidencePolicy.MaxEvidencePerClaim,
+			)
 		}
 		conflicts := 0
+		seenEvidence := make(map[string]struct{}, len(claim.Evidence))
+		supportingPublications := make(map[string]struct{})
 		for evidenceIndex, ref := range claim.Evidence {
 			if !evidenceAuditRefResolvable(ref) {
 				return fmt.Errorf("claim_audits[%d].evidence_refs[%d] requires a pinned citation", index, evidenceIndex)
@@ -479,9 +627,29 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 					release.ReleaseID,
 				)
 			}
+			identity := evidenceAuditEvidenceIdentity(ref)
+			if _, duplicate := seenEvidence[identity]; duplicate {
+				return fmt.Errorf(
+					"claim_audits[%d].evidence_refs contains duplicate evidence identity %q",
+					index,
+					identity,
+				)
+			}
+			seenEvidence[identity] = struct{}{}
+			if ref.Role == EvidenceAuditReleaseSupporting {
+				supportingPublications[ref.PublicationIdentity] = struct{}{}
+			}
 			if ref.Conflict {
 				conflicts++
 			}
+		}
+		if claim.Verdict != EvidenceAuditVerdictInsufficient &&
+			len(supportingPublications) < audit.EvidencePolicy.MinimumIndependentSources {
+			return fmt.Errorf(
+				"claim_audits[%d] requires at least %d independent supporting publications; use insufficient verdict",
+				index,
+				audit.EvidencePolicy.MinimumIndependentSources,
+			)
 		}
 		computed := ComputeEvidenceAuditConfidence(claim.Evidence, conflicts)
 		if math.Abs(claim.ComputedConfidence-computed) > 0.000001 {
@@ -492,6 +660,12 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 	if strings.TrimSpace(audit.Summary.Conclusion) == "" {
 		return fmt.Errorf("summary.conclusion is required")
 	}
+	if err := validateEvidenceAuditString("summary.conclusion", audit.Summary.Conclusion, evidenceAuditMaxTextBytes); err != nil {
+		return err
+	}
+	if err := validateEvidenceAuditStringList("summary.limitations", audit.Summary.Limitations); err != nil {
+		return err
+	}
 	if !equalEvidenceAuditVerdictCounts(actualCounts, audit.Summary.VerdictCounts) {
 		return fmt.Errorf("summary.verdict_counts does not match claim audits")
 	}
@@ -500,7 +674,37 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 		len(audit.Proofroom.ReviewItems) == 0 {
 		return fmt.Errorf("proofroom_projection must be complete")
 	}
+	if err := validateEvidenceAuditString(
+		"proofroom_projection.schema_version",
+		audit.Proofroom.SchemaVersion,
+		evidenceAuditMaxIdentifierBytes,
+	); err != nil {
+		return err
+	}
+	if err := validateEvidenceAuditString(
+		"proofroom_projection.title",
+		audit.Proofroom.Title,
+		evidenceAuditMaxTextBytes,
+	); err != nil {
+		return err
+	}
+	if err := validateEvidenceAuditStringList(
+		"proofroom_projection.review_items",
+		audit.Proofroom.ReviewItems,
+	); err != nil {
+		return err
+	}
 	return nil
+}
+
+func evidenceAuditEvidenceIdentity(ref EvidenceAuditEvidenceRef) string {
+	return strings.Join([]string{
+		strings.TrimSpace(ref.ReleaseID),
+		strings.TrimSpace(ref.PublicationIdentity),
+		strings.TrimSpace(ref.CitationID),
+		strings.TrimSpace(ref.ClaimID),
+		strings.TrimSpace(ref.ChunkID),
+	}, "\x00")
 }
 
 func evidenceAuditRefResolvable(ref EvidenceAuditEvidenceRef) bool {
@@ -535,6 +739,32 @@ func validEvidenceAuditSHA256(value string) bool {
 	}
 	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
 	return err == nil
+}
+
+func validateEvidenceAuditString(name, value string, maxBytes int) error {
+	if len(value) > maxBytes {
+		return fmt.Errorf("%s exceeds byte limit %d", name, maxBytes)
+	}
+	return nil
+}
+
+func validateEvidenceAuditStringList(name string, values []string) error {
+	if len(values) > evidenceAuditMaxListItems {
+		return fmt.Errorf("%s exceeds item limit %d", name, evidenceAuditMaxListItems)
+	}
+	for index, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s[%d] is required", name, index)
+		}
+		if err := validateEvidenceAuditString(
+			fmt.Sprintf("%s[%d]", name, index),
+			value,
+			evidenceAuditMaxTextBytes,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func evidenceAuditHasPartialReport(audit EvidenceAudit) bool {
@@ -619,6 +849,7 @@ func auditInputFromAudit(audit EvidenceAudit) EvidenceAuditInput {
 		SchemaVersion:  audit.SchemaVersion,
 		InputHash:      audit.InputHash,
 		Package:        audit.Package,
+		EvidencePolicy: audit.EvidencePolicy,
 		Model:          audit.Model,
 		Retrieval:      audit.Retrieval,
 		Releases:       audit.Releases,

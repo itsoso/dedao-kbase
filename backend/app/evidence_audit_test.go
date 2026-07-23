@@ -9,6 +9,10 @@ const (
 	testPrimaryPublication = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	testSupportPublication = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 	testSecondPublication  = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+	testPackageHash        = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testPrimaryHash        = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	testSupportHash        = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	testSecondSupportHash  = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
 func TestEvidenceAuditHashesAreDeterministicAndCompletedReportsValidate(t *testing.T) {
@@ -62,6 +66,12 @@ func TestEvidenceAuditValidationRejectsInvalidContractAndUngroundedVerdicts(t *t
 		{name: "schema", edit: func(a *EvidenceAudit) { a.SchemaVersion = "evidence-audit.v2" }, want: "schema_version"},
 		{name: "status", edit: func(a *EvidenceAudit) { a.Status = "published" }, want: "status"},
 		{name: "missing input hash", edit: func(a *EvidenceAudit) { a.InputHash = "" }, want: "input_hash"},
+		{name: "invalid package hash", edit: func(a *EvidenceAudit) {
+			a.Package.ContentHash = "sha256:package"
+		}, want: "package.content_hash"},
+		{name: "invalid release hash", edit: func(a *EvidenceAudit) {
+			a.Releases[0].ContentHash = "sha256:primary"
+		}, want: "releases[0].content_hash"},
 		{name: "completed without output hash", edit: func(a *EvidenceAudit) { a.OutputHash = "" }, want: "output_hash"},
 		{name: "unsupported without evidence", edit: func(a *EvidenceAudit) {
 			a.ClaimAudits[0].Evidence = nil
@@ -138,6 +148,96 @@ func TestEvidenceAuditValidationRejectsInvalidContractAndUngroundedVerdicts(t *t
 	}
 }
 
+func TestEvidenceAuditRejectsVerdictWithoutPolicyMinimumIndependentSupport(t *testing.T) {
+	audit := validCompletedEvidenceAudit()
+	audit.EvidencePolicy.MinimumIndependentSources = 2
+	audit.Releases = append(audit.Releases, EvidenceAuditReleaseRef{
+		ReleaseID:           "release-support-2",
+		ContentHash:         testSecondSupportHash,
+		Role:                EvidenceAuditReleaseSupporting,
+		SourceType:          "clinical_guideline",
+		PublicationIdentity: testSecondPublication,
+		Citations: []EvidenceAuditCitationRef{{
+			CitationID: "citation-d",
+			ClaimID:    "claim-d",
+			ChunkID:    "chunk-d",
+		}},
+	})
+	audit.InputHash, _ = EvidenceAuditInputHash(auditInputFromAudit(audit))
+	audit.ClaimAudits[0].Evidence = audit.ClaimAudits[0].Evidence[:1]
+	audit.ClaimAudits[0].ComputedConfidence = ComputeEvidenceAuditConfidence(audit.ClaimAudits[0].Evidence, 0)
+	if _, err := FinalizeEvidenceAuditReport(audit); err == nil ||
+		!strings.Contains(err.Error(), "independent supporting publications") {
+		t.Fatalf("FinalizeEvidenceAuditReport() error = %v", err)
+	}
+}
+
+func TestEvidenceAuditRejectsDuplicateEvidenceIdentity(t *testing.T) {
+	audit := validCompletedEvidenceAudit()
+	duplicate := audit.ClaimAudits[0].Evidence[1]
+	duplicate.Conflict = true
+	audit.ClaimAudits[0].Evidence = append(audit.ClaimAudits[0].Evidence, duplicate)
+	audit.ClaimAudits[0].ComputedConfidence = ComputeEvidenceAuditConfidence(audit.ClaimAudits[0].Evidence, 1)
+	if _, err := FinalizeEvidenceAuditReport(audit); err == nil ||
+		!strings.Contains(err.Error(), "duplicate evidence") {
+		t.Fatalf("FinalizeEvidenceAuditReport() error = %v", err)
+	}
+}
+
+func TestEvidenceAuditRejectsUnboundedInputAndReportFields(t *testing.T) {
+	input := validEvidenceAuditInput()
+	input.Subject = strings.Repeat("x", evidenceAuditMaxTextBytes+1)
+	if _, err := EvidenceAuditInputHash(input); err == nil || !strings.Contains(err.Error(), "subject") {
+		t.Fatalf("EvidenceAuditInputHash() error = %v", err)
+	}
+
+	input = validEvidenceAuditInput()
+	input.Releases = make([]EvidenceAuditReleaseRef, evidenceAuditMaxReleases+1)
+	for index := range input.Releases {
+		input.Releases[index] = validEvidenceAuditInput().Releases[1]
+		input.Releases[index].ReleaseID = "release-" + strings.Repeat("x", index+1)
+	}
+	if _, err := EvidenceAuditInputHash(input); err == nil || !strings.Contains(err.Error(), "releases") {
+		t.Fatalf("EvidenceAuditInputHash() error = %v", err)
+	}
+
+	input = validEvidenceAuditInput()
+	input.Releases[0].Citations = make(
+		[]EvidenceAuditCitationRef,
+		evidenceAuditMaxCitationsPerRelease+1,
+	)
+	for index := range input.Releases[0].Citations {
+		input.Releases[0].Citations[index] = EvidenceAuditCitationRef{
+			CitationID: "citation-" + strings.Repeat("x", index+1),
+			ClaimID:    "claim",
+			ChunkID:    "chunk",
+		}
+	}
+	if _, err := EvidenceAuditInputHash(input); err == nil || !strings.Contains(err.Error(), "citations") {
+		t.Fatalf("EvidenceAuditInputHash() citation error = %v", err)
+	}
+
+	audit := validCompletedEvidenceAudit()
+	audit.Summary.Limitations = make([]string, evidenceAuditMaxListItems+1)
+	for index := range audit.Summary.Limitations {
+		audit.Summary.Limitations[index] = "bounded"
+	}
+	if _, err := FinalizeEvidenceAuditReport(audit); err == nil ||
+		!strings.Contains(err.Error(), "summary.limitations") {
+		t.Fatalf("FinalizeEvidenceAuditReport() error = %v", err)
+	}
+
+	audit = validCompletedEvidenceAudit()
+	audit.Proofroom.ReviewItems = make([]string, evidenceAuditMaxListItems+1)
+	for index := range audit.Proofroom.ReviewItems {
+		audit.Proofroom.ReviewItems[index] = "review"
+	}
+	if _, err := FinalizeEvidenceAuditReport(audit); err == nil ||
+		!strings.Contains(err.Error(), "proofroom_projection.review_items") {
+		t.Fatalf("FinalizeEvidenceAuditReport() proofroom error = %v", err)
+	}
+}
+
 func TestEvidenceAuditInsufficientVerdictMayDeclareKnowledgeGapWithoutEvidence(t *testing.T) {
 	audit := validCompletedEvidenceAudit()
 	audit.ClaimAudits[0] = EvidenceAuditClaim{
@@ -189,9 +289,9 @@ func TestEvidenceAuditValidationRejectsInvalidLifecycleOrdering(t *testing.T) {
 
 func TestEvidenceAuditConfidenceSeparatesIndependentPublicationsAndSourceDiversity(t *testing.T) {
 	evidence := []EvidenceAuditEvidenceRef{
-		validEvidenceRef("release-primary", "sha256:primary", EvidenceAuditReleasePrimary, "dedao_ebook", testPrimaryPublication, "citation-a", "claim-a", "chunk-a"),
-		validEvidenceRef("release-support", "sha256:support", EvidenceAuditReleaseSupporting, "wechat_mp_article", testSupportPublication, "citation-c", "claim-c", "chunk-c"),
-		validEvidenceRef("release-support-2", "sha256:support-2", EvidenceAuditReleaseSupporting, "wechat_mp_article", testSecondPublication, "citation-d", "claim-d", "chunk-d"),
+		validEvidenceRef("release-primary", testPrimaryHash, EvidenceAuditReleasePrimary, "dedao_ebook", testPrimaryPublication, "citation-a", "claim-a", "chunk-a"),
+		validEvidenceRef("release-support", testSupportHash, EvidenceAuditReleaseSupporting, "wechat_mp_article", testSupportPublication, "citation-c", "claim-c", "chunk-c"),
+		validEvidenceRef("release-support-2", testSecondSupportHash, EvidenceAuditReleaseSupporting, "wechat_mp_article", testSecondPublication, "citation-d", "claim-d", "chunk-d"),
 	}
 	got := ComputeEvidenceAuditConfidence(evidence, 0)
 	if got != 0.8 {
@@ -219,12 +319,17 @@ func TestEvidenceAuditConfidenceSeparatesIndependentPublicationsAndSourceDiversi
 func validEvidenceAuditInput() EvidenceAuditInput {
 	return EvidenceAuditInput{
 		SchemaVersion: EvidenceAuditSchemaVersion,
-		Package:       EvidenceAuditPackageRef{PackageID: "book-agent-clinical-trials-truth", Version: "2.0.0", ContentHash: "sha256:package"},
-		Model:         EvidenceAuditModelIdentity{Provider: "tokenplan", Model: "qwen3.7-max", Route: "evidence-audit"},
-		Retrieval:     EvidenceAuditRetrievalIdentity{Strategy: "hybrid", IndexVersion: "index-v1", RerankerVersion: "reranker-v1"},
+		Package:       EvidenceAuditPackageRef{PackageID: "book-agent-clinical-trials-truth", Version: "2.0.0", ContentHash: testPackageHash},
+		EvidencePolicy: EvidenceAuditPolicySnapshot{
+			MinimumIndependentSources: 1,
+			MaxClaims:                 agentEvidenceMaxClaims,
+			MaxEvidencePerClaim:       agentEvidenceMaxEvidencePerClaim,
+		},
+		Model:     EvidenceAuditModelIdentity{Provider: "tokenplan", Model: "qwen3.7-max", Route: "evidence-audit"},
+		Retrieval: EvidenceAuditRetrievalIdentity{Strategy: "hybrid", IndexVersion: "index-v1", RerankerVersion: "reranker-v1"},
 		Releases: []EvidenceAuditReleaseRef{
 			{
-				ReleaseID: "release-primary", ContentHash: "sha256:primary",
+				ReleaseID: "release-primary", ContentHash: testPrimaryHash,
 				Role: EvidenceAuditReleasePrimary, SourceType: "dedao_ebook",
 				PublicationIdentity: testPrimaryPublication,
 				Citations: []EvidenceAuditCitationRef{
@@ -233,7 +338,7 @@ func validEvidenceAuditInput() EvidenceAuditInput {
 				},
 			},
 			{
-				ReleaseID: "release-support", ContentHash: "sha256:support",
+				ReleaseID: "release-support", ContentHash: testSupportHash,
 				Role: EvidenceAuditReleaseSupporting, SourceType: "wechat_mp_article",
 				PublicationIdentity: testSupportPublication,
 				Citations: []EvidenceAuditCitationRef{
@@ -251,8 +356,8 @@ func validCompletedEvidenceAudit() EvidenceAudit {
 	input := validEvidenceAuditInput()
 	inputHash, _ := EvidenceAuditInputHash(input)
 	evidence := []EvidenceAuditEvidenceRef{
-		validEvidenceRef("release-primary", "sha256:primary", EvidenceAuditReleasePrimary, "dedao_ebook", testPrimaryPublication, "citation-a", "claim-a", "chunk-a"),
-		validEvidenceRef("release-support", "sha256:support", EvidenceAuditReleaseSupporting, "wechat_mp_article", testSupportPublication, "citation-c", "claim-c", "chunk-c"),
+		validEvidenceRef("release-primary", testPrimaryHash, EvidenceAuditReleasePrimary, "dedao_ebook", testPrimaryPublication, "citation-a", "claim-a", "chunk-a"),
+		validEvidenceRef("release-support", testSupportHash, EvidenceAuditReleaseSupporting, "wechat_mp_article", testSupportPublication, "citation-c", "claim-c", "chunk-c"),
 	}
 	return EvidenceAudit{
 		SchemaVersion:  EvidenceAuditSchemaVersion,
@@ -265,6 +370,7 @@ func validCompletedEvidenceAudit() EvidenceAudit {
 		IdempotencyKey: "audit-request-1",
 		InputHash:      inputHash,
 		Package:        input.Package,
+		EvidencePolicy: input.EvidencePolicy,
 		Model:          input.Model,
 		Retrieval:      input.Retrieval,
 		Releases:       input.Releases,
