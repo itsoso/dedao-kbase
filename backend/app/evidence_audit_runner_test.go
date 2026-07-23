@@ -2,7 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,6 +151,7 @@ func TestEvidenceAuditRunnerGroupsAndCapsSupportingEvidenceAcrossReleases(t *tes
 	}
 	retrieved, err := retrieveEvidenceAuditSupportingEvidence(
 		context.Background(), store, loaded, releases, "Synthetic grounded statement",
+		newEvidenceAuditObserver(evidenceAuditRunnerConfig()),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -441,22 +446,16 @@ func TestEvidenceAuditRunnerFailsClosedWhenLaterClaimModelOutcomeIsUnknown(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if running.Status != EvidenceAuditRunning {
-		t.Fatalf("audit status after resumable interruption = %q", running.Status)
+	if running.Status != EvidenceAuditFailed ||
+		running.FailureCode != "model_outcome_unknown" {
+		t.Fatalf("audit after uncertain model timeout = %#v", running)
 	}
-
-	second := &evidenceAuditFakeClient{answers: []string{
-		`must not be called`,
-	}}
-	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig()); err == nil ||
-		!strings.Contains(err.Error(), "model_outcome_unknown") {
-		t.Fatalf("resume error = %v, want model_outcome_unknown", err)
+	trace, err := store.LoadAgentTrace(running.TraceID)
+	if err != nil || trace.Final.Outcome != AgentTraceOutcomeFailed {
+		t.Fatalf("failed trace = %#v err=%v", trace, err)
 	}
-	failed, err := store.LoadEvidenceAudit(audit.AuditID)
-	if err != nil || failed.Status != EvidenceAuditFailed ||
-		failed.FailureCode != "model_outcome_unknown" ||
-		len(first.calls) != 2 || len(second.calls) != 0 {
-		t.Fatalf("failed=%#v err=%v first_calls=%d second_calls=%d", failed, err, len(first.calls), len(second.calls))
+	if len(first.calls) != 2 {
+		t.Fatalf("model calls = %d, want 2", len(first.calls))
 	}
 }
 
@@ -815,6 +814,178 @@ func TestEvidenceAuditRunnerContextCoversRetrievalAndCitationResolution(t *testi
 				t.Fatalf("failed audit = %#v err=%v", failed, err)
 			}
 		})
+	}
+}
+
+func TestEvidenceAuditRunnerFailsImmediatelyWhenLaterClaimRetrievalOrCitationTimesOut(t *testing.T) {
+	for _, target := range []string{"retrieval", "citation"} {
+		t.Run(target, func(t *testing.T) {
+			store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
+			audit := createEvidenceAuditRunnerTask(
+				t, store, pkg, "runner-later-timeout-"+target, "Evidence comparison only.",
+			)
+			previous := evidenceAuditRuntimeStageHook
+			seen := 0
+			evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+				if stage != target {
+					return nil
+				}
+				seen++
+				if seen > 2 {
+					return context.DeadlineExceeded
+				}
+				return nil
+			}
+			t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+			client := &evidenceAuditFakeClient{answers: []string{
+				`{"candidate_verdict":"supported","rationale":"first","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+				`must not be called`,
+			}}
+			if _, err := RunEvidenceAudit(
+				context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig(),
+			); err == nil {
+				t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+			}
+			failed, err := store.LoadEvidenceAudit(audit.AuditID)
+			if err != nil || failed.Status != EvidenceAuditFailed ||
+				failed.FailureCode != "runner_timeout" {
+				t.Fatalf("failed audit = %#v err=%v", failed, err)
+			}
+			trace, err := store.LoadAgentTrace(failed.TraceID)
+			if err != nil || trace.Final.Outcome != AgentTraceOutcomeFailed {
+				t.Fatalf("failed trace = %#v err=%v", trace, err)
+			}
+			if len(client.calls) != 1 {
+				t.Fatalf("model calls = %d, want only the completed first claim", len(client.calls))
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditRunnerTraceIncludesBoundedDeterministicObservability(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-observability", "Evidence comparison only.")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{
+			"choices":[{"message":{"content":"{\"candidate_verdict\":\"supported\",\"rationale\":\"support\",\"evidence\":[{\"release_id\":\"support-a\",\"citation_id\":\"support-a-c1\",\"stance\":\"supports\"}],\"limitations\":[],\"knowledge_gaps\":[],\"review_actions\":[]}"}}],
+			"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"cost":0.0042}
+		}`)
+	}))
+	defer server.Close()
+	base := testAgentPackageTime().Add(2 * time.Hour)
+	tick := 0
+	cfg := evidenceAuditRunnerConfig()
+	cfg.ModelConfig.BaseURL = server.URL
+	cfg.Now = func() time.Time {
+		current := base.Add(time.Duration(tick) * 5 * time.Millisecond)
+		tick++
+		return current
+	}
+	completed, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, NewTokenPlanChatClient(server.Client()), cfg,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace, err := store.LoadAgentTrace(completed.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(payload, &document); err != nil {
+		t.Fatal(err)
+	}
+	observability, ok := document["observability"].(map[string]any)
+	if !ok {
+		t.Fatalf("trace has no structured observability: %s", payload)
+	}
+	stages, ok := observability["stages"].([]any)
+	if !ok || len(stages) != 7 {
+		t.Fatalf("stages = %#v, want seven bounded stages", observability["stages"])
+	}
+	for index, want := range []string{
+		"package_validation", "claim_selection", "retrieval", "citation_resolution",
+		"model", "report_persistence", "trace_persistence",
+	} {
+		stage := stages[index].(map[string]any)
+		wantDurations := []float64{20, 5, 25, 10, 5, 5, 5}
+		if stage["name"] != want || stage["status"] != "completed" ||
+			stage["duration_ms"] != wantDurations[index] {
+			t.Fatalf("stage[%d] = %#v", index, stage)
+		}
+	}
+	if observability["citation_resolution_rate"] != float64(1) ||
+		observability["independent_publication_source_count"] != float64(1) {
+		t.Fatalf("evidence metrics = %#v", observability)
+	}
+	usage := observability["usage"].(map[string]any)
+	if usage["status"] != "reported" ||
+		usage["prompt_tokens"] != float64(120) ||
+		usage["completion_tokens"] != float64(30) ||
+		usage["total_tokens"] != float64(150) ||
+		usage["cost_usd"] != 0.0042 {
+		t.Fatalf("provider usage = %#v", usage)
+	}
+}
+
+func TestEvidenceAuditRunnerTraceObservabilityCoversFailedAndAbstainedRuns(t *testing.T) {
+	t.Run("failed retrieval", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-observability-failed", "Evidence comparison only.")
+		previous := evidenceAuditRuntimeStageHook
+		evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+			if stage == "retrieval" {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}
+		t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+		if _, err := RunEvidenceAudit(
+			context.Background(), store, audit.AuditID,
+			&evidenceAuditFakeClient{answers: []string{`must not be called`}}, evidenceAuditRunnerConfig(),
+		); err == nil {
+			t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+		}
+		failed, err := store.LoadEvidenceAudit(audit.AuditID)
+		if err != nil || failed.Status != EvidenceAuditFailed {
+			t.Fatalf("failed audit = %#v err=%v", failed, err)
+		}
+		trace, err := store.LoadAgentTrace(failed.TraceID)
+		if err != nil || trace.Observability.Stages[2].Status != "failed" ||
+			trace.Observability.Usage.Status != "unknown" {
+			t.Fatalf("failed observability = %#v err=%v", trace, err)
+		}
+	})
+	t.Run("abstained", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-observability-abstain", "Should this patient stop aspirin?")
+		completed, err := RunEvidenceAudit(
+			context.Background(), store, audit.AuditID,
+			&evidenceAuditFakeClient{answers: []string{`must not be called`}}, evidenceAuditRunnerConfig(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		trace, err := store.LoadAgentTrace(completed.TraceID)
+		if err != nil || trace.Final.Outcome != AgentTraceOutcomeAbstained ||
+			trace.Observability.AbstentionReason == "" ||
+			trace.Observability.Usage.Status != "unknown" {
+			t.Fatalf("abstained observability = %#v err=%v", trace, err)
+		}
+	})
+}
+
+func TestEvidenceAuditFailureCodeDistinguishesCancellationFromTimeout(t *testing.T) {
+	if got := evidenceAuditFailureCode(context.DeadlineExceeded); got != "runner_timeout" {
+		t.Fatalf("deadline failure code = %q", got)
+	}
+	if got := evidenceAuditFailureCode(context.Canceled); got != "runner_cancelled" {
+		t.Fatalf("cancellation failure code = %q", got)
 	}
 }
 

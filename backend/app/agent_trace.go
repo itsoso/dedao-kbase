@@ -56,11 +56,35 @@ type AgentTrace struct {
 	StartedAt      string                      `json:"started_at"`
 	CompletedAt    string                      `json:"completed_at"`
 	EvidenceAudit  *AgentTraceEvidenceAuditRef `json:"evidence_audit,omitempty"`
+	Observability  *AgentTraceObservability    `json:"observability,omitempty"`
 
 	Credentials    string   `json:"-"`
 	SourceBodies   []string `json:"-"`
 	PrivatePrompt  string   `json:"-"`
 	ConsumerUserID string   `json:"-"`
+}
+
+type AgentTraceObservability struct {
+	Stages                            []AgentTraceStage `json:"stages"`
+	CitationResolutionRate            float64           `json:"citation_resolution_rate"`
+	IndependentPublicationSourceCount int               `json:"independent_publication_source_count"`
+	AbstentionReason                  string            `json:"abstention_reason,omitempty"`
+	Usage                             AgentTraceUsage   `json:"usage"`
+}
+
+type AgentTraceStage struct {
+	Name       string `json:"name"`
+	Status     string `json:"status"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+type AgentTraceUsage struct {
+	Status           string  `json:"status"`
+	PromptTokens     int     `json:"prompt_tokens,omitempty"`
+	CompletionTokens int     `json:"completion_tokens,omitempty"`
+	TotalTokens      int     `json:"total_tokens,omitempty"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
+	CostStatus       string  `json:"cost_status,omitempty"`
 }
 
 type AgentTraceEvidenceAuditRef struct {
@@ -233,6 +257,9 @@ func ValidateAgentTrace(trace AgentTrace) error {
 		if err := validateAgentSHA256("evidence_audit.input_hash", trace.EvidenceAudit.InputHash); err != nil {
 			return err
 		}
+		if err := validateAgentTraceObservability(trace.Observability); err != nil {
+			return err
+		}
 	}
 	switch trace.RetrievalRoute.Strategy {
 	case "lexical", "graph":
@@ -316,6 +343,72 @@ func ValidateAgentTrace(trace AgentTrace) error {
 		return fmt.Errorf("completed trace requires grounded evidence and citations")
 	}
 	return validateAgentTraceCitations(trace.Final.Citations, releases, evidence)
+}
+
+func validateAgentTraceObservability(value *AgentTraceObservability) error {
+	if value == nil {
+		return fmt.Errorf("evidence audit trace requires observability")
+	}
+	if len(value.Stages) == 0 || len(value.Stages) > 7 {
+		return fmt.Errorf("observability.stages must contain at most seven stages")
+	}
+	allowedStages := map[string]bool{
+		"package_validation": true, "claim_selection": true, "retrieval": true,
+		"citation_resolution": true, "model": true, "report_persistence": true,
+		"trace_persistence": true,
+	}
+	seen := map[string]bool{}
+	for _, stage := range value.Stages {
+		if !allowedStages[stage.Name] || seen[stage.Name] || stage.DurationMS < 0 {
+			return fmt.Errorf("observability.stages contains an invalid stage")
+		}
+		if stage.DurationMS > int64((24*time.Hour)/time.Millisecond) {
+			return fmt.Errorf("observability.stages duration exceeds 24 hours")
+		}
+		seen[stage.Name] = true
+		switch stage.Status {
+		case "pending", "completed", "failed", "skipped":
+		default:
+			return fmt.Errorf("observability stage %q has invalid status", stage.Name)
+		}
+	}
+	if value.CitationResolutionRate < 0 || value.CitationResolutionRate > 1 {
+		return fmt.Errorf("observability.citation_resolution_rate must be between zero and one")
+	}
+	if value.IndependentPublicationSourceCount < 0 || value.IndependentPublicationSourceCount > evidenceAuditMaxReleases {
+		return fmt.Errorf("observability independent source count is invalid")
+	}
+	if value.AbstentionReason != "" &&
+		(len(value.AbstentionReason) > 128 || !agentPackageIDPattern.MatchString(value.AbstentionReason)) {
+		return fmt.Errorf("observability.abstention_reason must be a bounded reason code")
+	}
+	switch value.Usage.Status {
+	case "unknown":
+		if value.Usage.PromptTokens != 0 || value.Usage.CompletionTokens != 0 ||
+			value.Usage.TotalTokens != 0 || value.Usage.CostUSD != 0 {
+			return fmt.Errorf("observability usage marked unknown must not contain values")
+		}
+	case "reported":
+		if value.Usage.PromptTokens < 0 || value.Usage.CompletionTokens < 0 ||
+			value.Usage.TotalTokens < 0 ||
+			value.Usage.TotalTokens != value.Usage.PromptTokens+value.Usage.CompletionTokens ||
+			value.Usage.TotalTokens > 5_000_000 ||
+			value.Usage.CostUSD < 0 || value.Usage.CostUSD > 1_000_000 {
+			return fmt.Errorf("observability usage is invalid")
+		}
+		switch value.Usage.CostStatus {
+		case "reported":
+		case "unknown":
+			if value.Usage.CostUSD != 0 {
+				return fmt.Errorf("observability usage cost marked unknown must be zero")
+			}
+		default:
+			return fmt.Errorf("observability usage cost_status is invalid")
+		}
+	default:
+		return fmt.Errorf("observability usage status is invalid")
+	}
+	return nil
 }
 
 func validateAgentTraceToolCall(call AgentTraceToolCall) error {

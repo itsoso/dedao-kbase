@@ -81,6 +81,22 @@ type BookKnowledgeLLMClient interface {
 	Chat(context.Context, BookTokenPlanConfig, []BookKnowledgeMessage) (string, error)
 }
 
+type BookKnowledgeLLMUsage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CostUSD          *float64
+}
+
+type BookKnowledgeLLMResult struct {
+	Content string
+	Usage   *BookKnowledgeLLMUsage
+}
+
+type BookKnowledgeLLMClientWithResult interface {
+	ChatWithResult(context.Context, BookTokenPlanConfig, []BookKnowledgeMessage) (BookKnowledgeLLMResult, error)
+}
+
 type TokenPlanChatClient struct {
 	httpClient *http.Client
 }
@@ -309,8 +325,13 @@ func NewTokenPlanChatClient(httpClient *http.Client) *TokenPlanChatClient {
 }
 
 func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig, messages []BookKnowledgeMessage) (string, error) {
+	result, err := c.ChatWithResult(ctx, cfg, messages)
+	return result.Content, err
+}
+
+func (c *TokenPlanChatClient) ChatWithResult(ctx context.Context, cfg BookTokenPlanConfig, messages []BookKnowledgeMessage) (BookKnowledgeLLMResult, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return "", fmt.Errorf("TOKENPLAN_API_KEY 未配置")
+		return BookKnowledgeLLMResult{}, fmt.Errorf("TOKENPLAN_API_KEY 未配置")
 	}
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		cfg.BaseURL = defaultTokenPlanBaseURL
@@ -334,27 +355,27 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("TokenPlan 调用失败: status=%d body=%s", resp.StatusCode, trimRunes(string(respBody), 600))
+		return BookKnowledgeLLMResult{}, fmt.Errorf("TokenPlan 调用失败: status=%d body=%s", resp.StatusCode, trimRunes(string(respBody), 600))
 	}
 	var parsed struct {
 		Choices []struct {
@@ -362,14 +383,32 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int      `json:"prompt_tokens"`
+			CompletionTokens int      `json:"completion_tokens"`
+			TotalTokens      int      `json:"total_tokens"`
+			Cost             *float64 `json:"cost"`
+			CostUSD          *float64 `json:"cost_usd"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	if len(parsed.Choices) == 0 || strings.TrimSpace(parsed.Choices[0].Message.Content) == "" {
-		return "", fmt.Errorf("TokenPlan 响应为空")
+		return BookKnowledgeLLMResult{}, fmt.Errorf("TokenPlan 响应为空")
 	}
-	return parsed.Choices[0].Message.Content, nil
+	result := BookKnowledgeLLMResult{Content: parsed.Choices[0].Message.Content}
+	if parsed.Usage != nil {
+		cost := parsed.Usage.CostUSD
+		if cost == nil {
+			cost = parsed.Usage.Cost
+		}
+		result.Usage = &BookKnowledgeLLMUsage{
+			PromptTokens: parsed.Usage.PromptTokens, CompletionTokens: parsed.Usage.CompletionTokens,
+			TotalTokens: parsed.Usage.TotalTokens, CostUSD: cost,
+		}
+	}
+	return result, nil
 }
 
 func normalizeBookTokenPlanModel(model string) string {

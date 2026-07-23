@@ -129,6 +129,7 @@ func TestAgentTraceEvidenceAuditPersistsOnlyBoundedIdentity(t *testing.T) {
 		AuditID:   "audit-test",
 		InputHash: "sha256:" + strings.Repeat("7", 64),
 	}
+	trace.Observability = validEvidenceAuditTraceObservability()
 	trace.PrivatePrompt = "private-evidence-audit-prompt"
 	trace.SourceBodies = []string{"private-evidence-body"}
 	if err := store.SaveAgentTrace(trace); err != nil {
@@ -149,10 +150,56 @@ func TestAgentTraceEvidenceAuditPersistsOnlyBoundedIdentity(t *testing.T) {
 	}
 }
 
+func TestEvidenceAuditTraceRejectsUnboundedOrPrivateObservability(t *testing.T) {
+	trace := agentTraceTestTrace()
+	trace.EvidenceAudit = &AgentTraceEvidenceAuditRef{
+		AuditID: "audit-observability", InputHash: "sha256:" + strings.Repeat("7", 64),
+	}
+	trace.Observability = &AgentTraceObservability{
+		Stages: []AgentTraceStage{{
+			Name: "package_validation", Status: "completed", DurationMS: 1,
+		}},
+		CitationResolutionRate:            1,
+		IndependentPublicationSourceCount: 1,
+		Usage:                             AgentTraceUsage{Status: "unknown"},
+	}
+	trace.Observability.AbstentionReason = strings.Repeat("private-prompt-marker", 100)
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "abstention_reason") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.AbstentionReason = ""
+	trace.Observability.Stages = make([]AgentTraceStage, 20)
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "stages") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.Stages = []AgentTraceStage{{
+		Name: "package_validation", Status: "completed", DurationMS: 1,
+	}}
+	trace.Observability.Usage = AgentTraceUsage{
+		Status: "reported", PromptTokens: -1, CompletionTokens: 1, TotalTokens: 0,
+	}
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.Usage = AgentTraceUsage{
+		Status: "reported", PromptTokens: 5_000_001, CompletionTokens: 1,
+		TotalTokens: 5_000_002, CostStatus: "unknown",
+	}
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.Usage = AgentTraceUsage{Status: "unknown"}
+	trace.Observability.AbstentionReason = "private prompt marker"
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "abstention_reason") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+}
+
 func TestEvidenceAuditTraceTerminalStrictlyBindsAuditReportAndTraceIdentity(t *testing.T) {
 	trace := agentTraceTestTrace()
 	inputHash := "sha256:" + strings.Repeat("9", 64)
 	trace.EvidenceAudit = &AgentTraceEvidenceAuditRef{AuditID: "audit-strict-binding", InputHash: inputHash}
+	trace.Observability = validEvidenceAuditTraceObservability()
 	trace.Retrievals[0].EvidenceID = "release-1:claim-1:citation-1"
 	trace.Final.Citations[0].EvidenceID = trace.Retrievals[0].EvidenceID
 	report := EvidenceAudit{
@@ -232,6 +279,16 @@ func TestEvidenceAuditTraceTerminalStrictlyBindsAuditReportAndTraceIdentity(t *t
 				t.Fatal("mutated terminal unexpectedly validated")
 			}
 		})
+	}
+}
+
+func validEvidenceAuditTraceObservability() *AgentTraceObservability {
+	return &AgentTraceObservability{
+		Stages: []AgentTraceStage{{
+			Name: "package_validation", Status: "completed", DurationMS: 1,
+		}},
+		CitationResolutionRate: 1,
+		Usage:                  AgentTraceUsage{Status: "unknown"},
 	}
 }
 

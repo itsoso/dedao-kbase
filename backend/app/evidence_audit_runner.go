@@ -30,9 +30,146 @@ type EvidenceAuditRunnerConfig struct {
 	ModelConfig BookTokenPlanConfig
 	Timeout     time.Duration
 	Now         func() time.Time
+	observer    *evidenceAuditObserver
 }
 
 var evidenceAuditRuntimeStageHook = func(context.Context, string) error { return nil }
+
+var evidenceAuditStageNames = []string{
+	"package_validation", "claim_selection", "retrieval", "citation_resolution",
+	"model", "report_persistence", "trace_persistence",
+}
+
+type evidenceAuditObserver struct {
+	now               func() time.Time
+	stages            map[string]*evidenceAuditStageState
+	citationAttempted int
+	citationResolved  int
+	publications      map[string]bool
+	abstentionReason  string
+	usage             AgentTraceUsage
+}
+
+type evidenceAuditStageState struct {
+	status    string
+	startedAt time.Time
+	duration  time.Duration
+}
+
+func newEvidenceAuditObserver(config EvidenceAuditRunnerConfig) *evidenceAuditObserver {
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
+	stages := make(map[string]*evidenceAuditStageState, len(evidenceAuditStageNames))
+	for _, name := range evidenceAuditStageNames {
+		stages[name] = &evidenceAuditStageState{status: "pending"}
+	}
+	return &evidenceAuditObserver{
+		now: now, stages: stages, publications: map[string]bool{},
+		usage: AgentTraceUsage{Status: "unknown"},
+	}
+}
+
+func (o *evidenceAuditObserver) begin(name string) {
+	if o == nil {
+		return
+	}
+	stage := o.stages[name]
+	if stage == nil || !stage.startedAt.IsZero() {
+		return
+	}
+	stage.startedAt = o.now()
+}
+
+func (o *evidenceAuditObserver) end(name, status string) {
+	if o == nil {
+		return
+	}
+	stage := o.stages[name]
+	if stage == nil {
+		return
+	}
+	if !stage.startedAt.IsZero() {
+		elapsed := o.now().Sub(stage.startedAt)
+		if elapsed > 0 {
+			stage.duration += elapsed
+		}
+		stage.startedAt = time.Time{}
+	}
+	if stage.status != "failed" {
+		stage.status = status
+	}
+}
+
+func (o *evidenceAuditObserver) fail(name string) {
+	o.end(name, "failed")
+}
+
+func (o *evidenceAuditObserver) snapshot(traceOutcome string) *AgentTraceObservability {
+	if o == nil {
+		return nil
+	}
+	stages := make([]AgentTraceStage, 0, len(evidenceAuditStageNames))
+	for _, name := range evidenceAuditStageNames {
+		stage := o.stages[name]
+		status := stage.status
+		if status == "pending" {
+			status = "skipped"
+		}
+		stages = append(stages, AgentTraceStage{
+			Name: name, Status: status, DurationMS: stage.duration.Milliseconds(),
+		})
+	}
+	rate := float64(0)
+	if o.citationAttempted > 0 {
+		rate = float64(o.citationResolved) / float64(o.citationAttempted)
+	}
+	reason := ""
+	if traceOutcome == AgentTraceOutcomeAbstained {
+		reason = trimRunes(strings.TrimSpace(o.abstentionReason), 256)
+	}
+	return &AgentTraceObservability{
+		Stages: stages, CitationResolutionRate: rate,
+		IndependentPublicationSourceCount: len(o.publications),
+		AbstentionReason:                  reason, Usage: o.usage,
+	}
+}
+
+func (o *evidenceAuditObserver) addUsage(usage *BookKnowledgeLLMUsage) {
+	if o == nil || usage == nil {
+		return
+	}
+	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 ||
+		usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens ||
+		usage.TotalTokens > 5_000_000 ||
+		(usage.CostUSD != nil && (*usage.CostUSD < 0 || *usage.CostUSD > 1_000_000)) {
+		return
+	}
+	if o.usage.Status == "unknown" {
+		o.usage = AgentTraceUsage{Status: "reported", CostStatus: "unknown"}
+	}
+	o.usage.PromptTokens += usage.PromptTokens
+	o.usage.CompletionTokens += usage.CompletionTokens
+	o.usage.TotalTokens += usage.TotalTokens
+	if usage.CostUSD != nil {
+		o.usage.CostStatus = "reported"
+		o.usage.CostUSD += *usage.CostUSD
+	}
+}
+
+func evidenceAuditChatWithUsage(
+	ctx context.Context,
+	client BookKnowledgeLLMClient,
+	config BookTokenPlanConfig,
+	messages []BookKnowledgeMessage,
+) (BookKnowledgeLLMResult, error) {
+	if enhanced, ok := client.(BookKnowledgeLLMClientWithResult); ok {
+		return enhanced.ChatWithResult(ctx, config, messages)
+	}
+	content, err := client.Chat(ctx, config, messages)
+	return BookKnowledgeLLMResult{Content: content}, err
+}
 
 type evidenceAuditModelDecision struct {
 	CandidateVerdict string                       `json:"candidate_verdict"`
@@ -143,10 +280,13 @@ func RunEvidenceAudit(
 	if err != nil {
 		return nil, err
 	}
+	config.observer = newEvidenceAuditObserver(config)
+	config.observer.begin("package_validation")
 	descriptor, err := store.LoadAgentPackageV2RuntimeDescriptor(
 		audit.Package.PackageID, audit.Package.Version, audit.Package.ContentHash,
 	)
 	if err != nil {
+		config.observer.fail("package_validation")
 		return nil, fmt.Errorf("load package runtime descriptor: %w", err)
 	}
 	if config.Timeout <= 0 {
@@ -214,15 +354,24 @@ func RunEvidenceAudit(
 		runErr = fmt.Errorf("published package hash changed")
 	}
 	if runErr == nil {
+		config.observer.begin("claim_selection")
 		runErr = validateEvidenceAuditRunnerInput(*audit, pkg, releases)
+		if runErr == nil {
+			config.observer.end("claim_selection", "completed")
+		} else {
+			config.observer.fail("claim_selection")
+		}
 	}
 	if runErr != nil {
+		config.observer.fail("package_validation")
 		return nil, failEvidenceAuditRun(store, *audit, nil, nil, traceID, config, runErr)
 	}
+	config.observer.end("package_validation", "completed")
 	if runErr = evidenceAuditRunnerStage(runCtx, "policy"); runErr != nil {
 		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, runErr)
 	}
 	if evidenceAuditRequestsMedicalAdvice(audit.Subject) || evidenceAuditRequestsMedicalAdvice(audit.Scope) {
+		config.observer.abstentionReason = "individual_medical_advice_out_of_scope"
 		claims := make([]EvidenceAuditClaim, 0, len(audit.SelectedClaims))
 		for _, claim := range audit.SelectedClaims {
 			claims = append(claims, EvidenceAuditClaim{
@@ -255,15 +404,15 @@ func RunEvidenceAudit(
 		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, err)
 	}
 	for claimIndex, sourceClaim := range audit.SelectedClaims {
-		retrieved, retrievalErr := retrieveEvidenceAuditSupportingEvidence(runCtx, store, pkg, releases, sourceClaim)
+		config.observer.begin("retrieval")
+		retrieved, retrievalErr := retrieveEvidenceAuditSupportingEvidence(
+			runCtx, store, pkg, releases, sourceClaim, config.observer,
+		)
 		if retrievalErr != nil {
-			if len(checkpoints) > 0 &&
-				(errors.Is(retrievalErr, context.Canceled) ||
-					errors.Is(retrievalErr, context.DeadlineExceeded)) {
-				return nil, retrievalErr
-			}
+			config.observer.fail("retrieval")
 			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, retrievalErr)
 		}
+		config.observer.end("retrieval", "completed")
 		allRetrieved = append(allRetrieved, retrieved...)
 		var decision evidenceAuditModelDecision
 		if checkpoint, ok := checkpoints[claimIndex]; ok {
@@ -298,28 +447,40 @@ func RunEvidenceAudit(
 				)
 			}
 			if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
-				if len(checkpoints) > 0 && errors.Is(err, context.DeadlineExceeded) {
-					return nil, err
-				}
+				config.observer.fail("model")
 				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
 			}
-			raw, modelErr := client.Chat(runCtx, modelConfig, messages)
+			config.observer.begin("model")
+			result, modelErr := evidenceAuditChatWithUsage(runCtx, client, modelConfig, messages)
 			if modelErr != nil {
-				if len(checkpoints) > 0 &&
-					(errors.Is(modelErr, context.Canceled) || errors.Is(modelErr, context.DeadlineExceeded)) {
-					return nil, modelErr
+				config.observer.fail("model")
+				if errors.Is(modelErr, context.Canceled) || errors.Is(modelErr, context.DeadlineExceeded) {
+					modelErr = ErrEvidenceAuditModelOutcomeUnknown
 				}
 				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, modelErr)
 			}
+			config.observer.end("model", "completed")
+			config.observer.addUsage(result.Usage)
+			raw := result.Content
 			if err := evidenceAuditRunnerStage(runCtx, "model_completed_before_checkpoint"); err != nil {
+				config.observer.fail("model")
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, failEvidenceAuditRun(
+						store, *audit, pkg, allRetrieved, traceID, config,
+						ErrEvidenceAuditModelOutcomeUnknown,
+					)
+				}
 				return nil, err
 			}
 			if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
-				if len(checkpoints) > 0 &&
-					(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-					return nil, err
+				config.observer.fail("model")
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, failEvidenceAuditRun(
+						store, *audit, pkg, allRetrieved, traceID, config,
+						ErrEvidenceAuditModelOutcomeUnknown,
+					)
 				}
-				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+				return nil, err
 			}
 			parsed, parseErr := parseEvidenceAuditModelDecision(raw)
 			if parseErr != nil {
@@ -344,6 +505,12 @@ func RunEvidenceAudit(
 				)
 			}
 			if checkpointErr := evidenceAuditRunnerStage(runCtx, "checkpoint"); checkpointErr != nil {
+				if errors.Is(checkpointErr, context.Canceled) ||
+					errors.Is(checkpointErr, context.DeadlineExceeded) {
+					return nil, failEvidenceAuditRun(
+						store, *audit, pkg, allRetrieved, traceID, config, checkpointErr,
+					)
+				}
 				return nil, checkpointErr
 			}
 		}
@@ -580,6 +747,7 @@ func retrieveEvidenceAuditSupportingEvidence(
 	pkg AgentPackage,
 	releases map[string]KnowledgeRelease,
 	sourceClaim string,
+	observer *evidenceAuditObserver,
 ) ([]evidenceAuditRetrievedItem, error) {
 	roles := make(map[string]string, len(pkg.EvidencePolicy.ReleaseRoles))
 	for _, role := range pkg.EvidencePolicy.ReleaseRoles {
@@ -603,13 +771,17 @@ func retrieveEvidenceAuditSupportingEvidence(
 		}
 		for _, item := range found {
 			for _, citationID := range item.CitationIDs {
+				observer.begin("citation_resolution")
+				observer.citationAttempted++
 				if err := evidenceAuditRunnerStage(ctx, "citation"); err != nil {
+					observer.fail("citation_resolution")
 					return nil, err
 				}
 				citation, err := resolveAgentPackageReleaseCitationContext(
 					ctx, store, pkg, release.ReleaseID, item.ClaimID, citationID,
 				)
 				if err != nil || strings.TrimSpace(citation.ChunkID) == "" {
+					observer.fail("citation_resolution")
 					if err == nil {
 						err = fmt.Errorf("citation has no immutable chunk identity")
 					}
@@ -618,12 +790,15 @@ func retrieveEvidenceAuditSupportingEvidence(
 						citationID, release.ReleaseID, err,
 					)
 				}
+				observer.citationResolved++
+				observer.end("citation_resolution", "completed")
 				ref := EvidenceAuditEvidenceRef{
 					ReleaseID: release.ReleaseID, ContentHash: agentTraceReleaseContentHash(release.ContentHash),
 					Role: EvidenceAuditReleaseSupporting, SourceType: strings.ToLower(strings.TrimSpace(release.Book.SourceType)),
 					PublicationIdentity: sha256Fingerprint([]byte(strings.ToLower(strings.TrimSpace(release.Book.SourceType)))),
 					ClaimID:             item.ClaimID, ChunkID: citation.ChunkID, CitationID: citationID,
 				}
+				observer.publications[ref.PublicationIdentity] = true
 				key := evidenceAuditEvidenceIdentity(ref)
 				if seen[key] {
 					continue
@@ -941,6 +1116,10 @@ func completeEvidenceAuditRun(
 			traceOutcome = AgentTraceOutcomeAbstained
 		}
 	}
+	config.observer.begin("report_persistence")
+	config.observer.end("report_persistence", "completed")
+	config.observer.begin("trace_persistence")
+	config.observer.end("trace_persistence", "completed")
 	trace, err := buildEvidenceAuditTrace(
 		store, audit, pkg, retrieved, claims, traceID, traceOutcome, fingerprint, config,
 	)
@@ -948,12 +1127,14 @@ func completeEvidenceAuditRun(
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
 	if err := evidenceAuditRunnerStage(ctx, "persist"); err != nil {
+		config.observer.fail("report_persistence")
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
 	preparedReport, err := PrepareEvidenceAuditCompletion(
 		store, report, evidenceAuditRunnerNow(config),
 	)
 	if err != nil {
+		config.observer.fail("report_persistence")
 		return nil, err
 	}
 	terminal := evidenceAuditTraceTerminal{
@@ -962,12 +1143,14 @@ func completeEvidenceAuditRun(
 		Report: preparedReport, Trace: trace,
 	}
 	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
+		config.observer.fail("trace_persistence")
 		return nil, fmt.Errorf("prepare evidence audit terminal: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := store.finalizeEvidenceAuditTraceTerminal(terminal); err != nil {
+		config.observer.fail("trace_persistence")
 		return nil, fmt.Errorf("finalize evidence audit trace: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -975,8 +1158,10 @@ func completeEvidenceAuditRun(
 	}
 	completed, err := PublishEvidenceAuditCompletion(store, audit.AuditID)
 	if err != nil {
+		config.observer.fail("report_persistence")
 		return nil, err
 	}
+	config.observer.end("report_persistence", "completed")
 	if err := store.removeEvidenceAuditTraceTerminal(audit.AuditID); err != nil {
 		return nil, err
 	}
@@ -1002,6 +1187,10 @@ func failEvidenceAuditRun(
 	failureCode := evidenceAuditFailureCode(runErr)
 	failureSummary := "Evidence audit failed closed."
 	fingerprint := sha256Fingerprint([]byte(failureCode))
+	if config.observer != nil {
+		config.observer.begin("trace_persistence")
+		config.observer.end("trace_persistence", "completed")
+	}
 	trace, traceErr := buildEvidenceAuditTrace(
 		store, audit, packageValue, retrieved, nil, traceID, AgentTraceOutcomeFailed, fingerprint, config,
 	)
@@ -1100,7 +1289,10 @@ func evidenceAuditFailureCode(err error) string {
 	if errors.Is(err, ErrEvidenceAuditModelOutcomeUnknown) {
 		return "model_outcome_unknown"
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) {
+		return "runner_cancelled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
 		return "runner_timeout"
 	}
 	message := strings.ToLower(err.Error())
@@ -1125,6 +1317,19 @@ func buildEvidenceAuditTrace(
 	traceID, outcome, responseFingerprint string,
 	config EvidenceAuditRunnerConfig,
 ) (AgentTrace, error) {
+	if config.observer == nil {
+		config.observer = newEvidenceAuditObserver(config)
+	}
+	if len(claims) > 0 {
+		config.observer.publications = map[string]bool{}
+		for _, claim := range claims {
+			for _, evidence := range claim.Evidence {
+				if evidence.Role == EvidenceAuditReleaseSupporting {
+					config.observer.publications[evidence.PublicationIdentity] = true
+				}
+			}
+		}
+	}
 	releases := make([]AgentTraceReleaseRef, 0, len(audit.Releases))
 	for _, release := range audit.Releases {
 		version := "unknown"
@@ -1207,8 +1412,9 @@ func buildEvidenceAuditTrace(
 		Final: AgentTraceFinal{
 			Outcome: outcome, ResponseFingerprint: responseFingerprint, Citations: citations,
 		},
-		StartedAt:   startedAt.UTC().Format(time.RFC3339Nano),
-		CompletedAt: now.UTC().Format(time.RFC3339Nano),
+		StartedAt:     startedAt.UTC().Format(time.RFC3339Nano),
+		CompletedAt:   now.UTC().Format(time.RFC3339Nano),
+		Observability: config.observer.snapshot(outcome),
 	}, nil
 }
 
