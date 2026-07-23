@@ -524,7 +524,7 @@
     {
       "path": "/api/source-assets/",
       "file": "backend/app/wechat_agent.go",
-      "line": 217,
+      "line": 237,
       "authenticated": true
     },
     {
@@ -802,7 +802,7 @@
     {
       "name": "discover_articles",
       "file": "backend/app/source_sync.go",
-      "line": 606
+      "line": 608
     },
     {
       "name": "discover_articles",
@@ -817,7 +817,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/source_sync.go",
-      "line": 593
+      "line": 595
     },
     {
       "name": "existing_articles",
@@ -837,7 +837,7 @@
     {
       "name": "sync_articles",
       "file": "backend/app/source_sync.go",
-      "line": 591
+      "line": 593
     },
     {
       "name": "sync_articles",
@@ -867,7 +867,7 @@
     {
       "name": "sync_media",
       "file": "backend/app/source_sync.go",
-      "line": 606
+      "line": 608
     },
     {
       "name": "sync_media",
@@ -1149,37 +1149,42 @@
     {
       "name": "KnowledgeOperationsConsole",
       "file": "backend/app/knowledge_operations.go",
-      "line": 11
+      "line": 12
     },
     {
       "name": "KnowledgeOperationsFailureSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 54
+      "line": 72
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewItem",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 56
     },
     {
       "name": "KnowledgeOperationsHealthSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 44
+      "line": 46
     },
     {
       "name": "KnowledgeOperationsItem",
       "file": "backend/app/knowledge_operations.go",
-      "line": 29
+      "line": 31
     },
     {
       "name": "KnowledgeOperationsReplayRequest",
       "file": "backend/app/knowledge_operations.go",
-      "line": 61
+      "line": 79
     },
     {
       "name": "KnowledgeOperationsReplayResult",
       "file": "backend/app/knowledge_operations.go",
-      "line": 70
+      "line": 88
     },
     {
       "name": "KnowledgeOperationsSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 17
+      "line": 19
     },
     {
       "name": "KnowledgePipelineAutomationRequest",
@@ -1309,7 +1314,7 @@
     {
       "name": "SourceAgent",
       "file": "backend/app/source_sync.go",
-      "line": 67
+      "line": 69
     },
     {
       "name": "SourceAgentClient",
@@ -1324,7 +1329,7 @@
     {
       "name": "SourceAgentCycleResult",
       "file": "backend/app/source_agent_runner.go",
-      "line": 28
+      "line": 30
     },
     {
       "name": "SourceAgentHTTPError",
@@ -1334,7 +1339,7 @@
     {
       "name": "SourceAgentHeartbeat",
       "file": "backend/app/source_sync.go",
-      "line": 50
+      "line": 52
     },
     {
       "name": "SourceAgentOutbox",
@@ -1349,12 +1354,12 @@
     {
       "name": "SourceAgentRunner",
       "file": "backend/app/source_agent_runner.go",
-      "line": 20
+      "line": 22
     },
     {
       "name": "SourceAgentRunnerConfig",
       "file": "backend/app/source_agent_runner.go",
-      "line": 12
+      "line": 14
     },
     {
       "name": "SourceArticleEnvelope",
@@ -1379,7 +1384,7 @@
     {
       "name": "SourceCapabilityHealth",
       "file": "backend/app/source_sync.go",
-      "line": 60
+      "line": 62
     },
     {
       "name": "SourceCheckpoint",
@@ -1439,32 +1444,32 @@
     {
       "name": "SourceSubscription",
       "file": "backend/app/source_sync.go",
-      "line": 92
+      "line": 94
     },
     {
       "name": "SourceSubscriptionInput",
       "file": "backend/app/source_sync.go",
-      "line": 80
+      "line": 82
     },
     {
       "name": "SourceSyncItem",
       "file": "backend/app/source_sync.go",
-      "line": 139
+      "line": 141
     },
     {
       "name": "SourceSyncItemInput",
       "file": "backend/app/source_sync.go",
-      "line": 130
+      "line": 132
     },
     {
       "name": "SourceSyncRun",
       "file": "backend/app/source_sync.go",
-      "line": 108
+      "line": 110
     },
     {
       "name": "SourceSyncStore",
       "file": "backend/app/source_sync.go",
-      "line": 152
+      "line": 154
     },
     {
       "name": "WCPlusAccount",
@@ -1604,32 +1609,32 @@
     {
       "name": "WeChatDiscoveredArticle",
       "file": "backend/app/wechat_discovery.go",
-      "line": 24
+      "line": 25
     },
     {
       "name": "WeChatDiscovery",
       "file": "backend/app/wechat_discovery.go",
-      "line": 38
+      "line": 39
     },
     {
       "name": "WeChatDiscoveryConfig",
       "file": "backend/app/wechat_discovery.go",
-      "line": 33
+      "line": 34
     },
     {
       "name": "WeChatDiscoveryCursor",
       "file": "backend/app/wechat_discovery.go",
-      "line": 19
+      "line": 20
     },
     {
       "name": "WeChatDiscoveryError",
       "file": "backend/app/wechat_discovery.go",
-      "line": 43
+      "line": 44
     },
     {
       "name": "WeChatDiscoveryPage",
       "file": "backend/app/wechat_discovery.go",
-      "line": 28
+      "line": 29
     },
     {
       "name": "WeChatMPCookie",

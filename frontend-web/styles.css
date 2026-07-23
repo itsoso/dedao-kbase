@@ -2602,6 +2602,7 @@ a.button {
 }
 
 .knowledge-operations__metric span,
+.knowledge-operations__queue-item small,
 .knowledge-operations__row small {
   color: #64748b;
 }
@@ -2616,6 +2617,28 @@ a.button {
   display: grid;
   gap: 10px;
   margin-top: 14px;
+}
+
+.knowledge-operations__queue {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.knowledge-operations__queue-item {
+  align-items: start;
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.08), rgba(20, 184, 166, 0.08));
+  border: 1px solid rgba(37, 99, 235, 0.12);
+  border-radius: 16px;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(200px, 1.4fr) repeat(3, minmax(140px, 1fr));
+  padding: 14px;
+}
+
+.knowledge-operations__queue-item > div {
+  display: grid;
+  gap: 4px;
 }
 
 .knowledge-operations__row {
