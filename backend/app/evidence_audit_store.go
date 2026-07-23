@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,9 +9,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const evidenceAuditStoreVersion = "2"
@@ -19,7 +23,13 @@ const (
 	evidenceAuditMaxManifestAudits      = 10000
 	evidenceAuditMaxManifestIdempotency = 20000
 	evidenceAuditRootLockWait           = 5 * time.Second
-	evidenceAuditRootLockStaleAfter     = 2 * time.Minute
+)
+
+const (
+	evidenceAuditFaultImmutableTempSynced     = "immutable_temp_synced"
+	evidenceAuditFaultManifestTempSynced      = "manifest_temp_synced"
+	evidenceAuditFaultManifestBackupPublished = "manifest_backup_published"
+	evidenceAuditFaultManifestBeforePublish   = "manifest_before_publish"
 )
 
 var (
@@ -52,7 +62,10 @@ type EvidenceAuditIdempotencyRecord struct {
 	InputHash           string `json:"input_hash"`
 }
 
-var writeEvidenceAuditManifestFile = writeFileAtomically
+var (
+	writeEvidenceAuditManifestFile = writeEvidenceAuditManifestCrashSafe
+	evidenceAuditStorageFault      = func(string, string) error { return nil }
+)
 
 type EvidenceAuditManifest struct {
 	Version     string                           `json:"version"`
@@ -536,14 +549,51 @@ func (s *BookKnowledgeStore) writeEvidenceAuditReportUnlocked(report EvidenceAud
 }
 
 func (s *BookKnowledgeStore) loadEvidenceAuditManifestUnlocked() (*EvidenceAuditManifest, error) {
-	var manifest EvidenceAuditManifest
-	if err := readJSONFile(s.EvidenceAuditManifestPath(), &manifest); errors.Is(err, os.ErrNotExist) {
+	path := s.EvidenceAuditManifestPath()
+	backupPath := path + ".bak"
+	manifest, primaryErr := loadEvidenceAuditManifestFile(path)
+	if primaryErr == nil {
+		if _, err := os.Stat(backupPath); err == nil {
+			if _, backupErr := loadEvidenceAuditManifestFile(backupPath); backupErr != nil {
+				return nil, fmt.Errorf("validate evidence audit manifest backup: %w", backupErr)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		sortEvidenceAuditManifest(manifest)
+		return manifest, nil
+	}
+
+	backup, backupErr := loadEvidenceAuditManifestFile(backupPath)
+	if backupErr == nil {
+		payload, err := encodeJSONFile(backup)
+		if err != nil {
+			return nil, err
+		}
+		if err := restoreEvidenceAuditManifestPrimary(path, payload); err != nil {
+			return nil, fmt.Errorf("restore evidence audit manifest from backup: %w", err)
+		}
+		sortEvidenceAuditManifest(backup)
+		return backup, nil
+	}
+
+	if errors.Is(primaryErr, os.ErrNotExist) && errors.Is(backupErr, os.ErrNotExist) {
 		return &EvidenceAuditManifest{
 			Version:     evidenceAuditStoreVersion,
 			Audits:      []EvidenceAuditRecord{},
 			Idempotency: []EvidenceAuditIdempotencyRecord{},
 		}, nil
-	} else if err != nil {
+	}
+	return nil, fmt.Errorf(
+		"evidence audit manifest unavailable: primary=%v; backup=%v",
+		primaryErr,
+		backupErr,
+	)
+}
+
+func loadEvidenceAuditManifestFile(path string) (*EvidenceAuditManifest, error) {
+	var manifest EvidenceAuditManifest
+	if err := readJSONFile(path, &manifest); err != nil {
 		return nil, err
 	}
 	if manifest.Version != evidenceAuditStoreVersion {
@@ -556,13 +606,16 @@ func (s *BookKnowledgeStore) loadEvidenceAuditManifestUnlocked() (*EvidenceAudit
 	if err := validateEvidenceAuditManifestCapacity(&manifest); err != nil {
 		return nil, err
 	}
+	return &manifest, nil
+}
+
+func sortEvidenceAuditManifest(manifest *EvidenceAuditManifest) {
 	sort.SliceStable(manifest.Audits, func(i, j int) bool {
 		if manifest.Audits[i].CreatedAt != manifest.Audits[j].CreatedAt {
 			return manifest.Audits[i].CreatedAt < manifest.Audits[j].CreatedAt
 		}
 		return manifest.Audits[i].AuditID < manifest.Audits[j].AuditID
 	})
-	return &manifest, nil
 }
 
 func (s *BookKnowledgeStore) writeEvidenceAuditManifestUnlocked(manifest *EvidenceAuditManifest) error {
@@ -755,8 +808,18 @@ func evidenceAuditHashName(hash string) string {
 }
 
 func writeEvidenceAuditImmutableFile(path string, payload []byte) error {
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if errors.Is(err, os.ErrExist) {
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return err
+	}
+	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-", payload)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempPath)
+	if err := evidenceAuditStorageFault(evidenceAuditFaultImmutableTempSynced, path); err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil {
 		stored, readErr := os.ReadFile(path)
 		if readErr != nil {
 			return readErr
@@ -765,10 +828,130 @@ func writeEvidenceAuditImmutableFile(path string, payload []byte) error {
 			return ErrEvidenceAuditImmutable
 		}
 		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
+	if err := os.Rename(tempPath, path); err != nil {
+		if _, statErr := os.Stat(path); statErr == nil {
+			stored, readErr := os.ReadFile(path)
+			if readErr != nil {
+				return readErr
+			}
+			if string(stored) == string(payload) {
+				return nil
+			}
+			return ErrEvidenceAuditImmutable
+		}
+		return err
+	}
+	return syncEvidenceAuditDir(filepath.Dir(path))
+}
+
+func (s *BookKnowledgeStore) acquireEvidenceAuditRootLock() (func(), error) {
+	if err := os.MkdirAll(s.EvidenceAuditDir(), os.ModePerm); err != nil {
+		return nil, err
+	}
+	fileLock := flock.New(filepath.Join(s.EvidenceAuditDir(), ".store.lock"))
+	ctx, cancel := context.WithTimeout(context.Background(), evidenceAuditRootLockWait)
+	locked, err := fileLock.TryLockContext(ctx, 10*time.Millisecond)
+	cancel()
+	if err != nil || !locked {
+		_ = fileLock.Close()
+		if err == nil {
+			err = fmt.Errorf("timed out acquiring evidence audit root lock")
+		}
+		return nil, err
+	}
+	return func() { _ = fileLock.Close() }, nil
+}
+
+func writeEvidenceAuditManifestCrashSafe(path string, payload []byte) error {
+	if _, err := decodeEvidenceAuditManifestPayload(payload); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return err
+	}
+	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), ".manifest.next-", payload)
 	if err != nil {
 		return err
 	}
+	defer os.Remove(tempPath)
+	if err := evidenceAuditStorageFault(evidenceAuditFaultManifestTempSynced, path); err != nil {
+		return err
+	}
+
+	backupPath := path + ".bak"
+	if currentPayload, readErr := os.ReadFile(path); readErr == nil {
+		if _, err := decodeEvidenceAuditManifestPayload(currentPayload); err != nil {
+			return fmt.Errorf("refuse to replace invalid evidence audit manifest: %w", err)
+		}
+		if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Rename(path, backupPath); err != nil {
+			return err
+		}
+		if err := syncEvidenceAuditDir(filepath.Dir(path)); err != nil {
+			return err
+		}
+		if err := evidenceAuditStorageFault(evidenceAuditFaultManifestBackupPublished, path); err != nil {
+			return err
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	if err := evidenceAuditStorageFault(evidenceAuditFaultManifestBeforePublish, path); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	return syncEvidenceAuditDir(filepath.Dir(path))
+}
+
+func restoreEvidenceAuditManifestPrimary(path string, payload []byte) error {
+	if _, err := decodeEvidenceAuditManifestPayload(payload); err != nil {
+		return err
+	}
+	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), ".manifest.restore-", payload)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempPath)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	return syncEvidenceAuditDir(filepath.Dir(path))
+}
+
+func decodeEvidenceAuditManifestPayload(payload []byte) (*EvidenceAuditManifest, error) {
+	var manifest EvidenceAuditManifest
+	if err := json.Unmarshal(payload, &manifest); err != nil {
+		return nil, err
+	}
+	if manifest.Version != evidenceAuditStoreVersion {
+		return nil, fmt.Errorf(
+			"unsupported evidence audit manifest version %q; expected %q",
+			manifest.Version,
+			evidenceAuditStoreVersion,
+		)
+	}
+	if err := validateEvidenceAuditManifestCapacity(&manifest); err != nil {
+		return nil, err
+	}
+	return &manifest, nil
+}
+
+func writeEvidenceAuditSyncedTemp(dir, pattern string, payload []byte) (string, error) {
+	file, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
 	remove := true
 	defer func() {
 		_ = file.Close()
@@ -776,44 +959,30 @@ func writeEvidenceAuditImmutableFile(path string, payload []byte) error {
 			_ = os.Remove(path)
 		}
 	}()
+	if err := file.Chmod(0o600); err != nil {
+		return "", err
+	}
 	if _, err := file.Write(payload); err != nil {
-		return err
+		return "", err
 	}
 	if err := file.Sync(); err != nil {
-		return err
+		return "", err
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return "", err
 	}
 	remove = false
-	return nil
+	return path, nil
 }
 
-func (s *BookKnowledgeStore) acquireEvidenceAuditRootLock() (func(), error) {
-	if err := os.MkdirAll(s.EvidenceAuditDir(), os.ModePerm); err != nil {
-		return nil, err
+func syncEvidenceAuditDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
 	}
-	path := filepath.Join(s.EvidenceAuditDir(), ".store.lock")
-	deadline := time.Now().Add(evidenceAuditRootLockWait)
-	for {
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err == nil {
-			_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
-			_ = file.Sync()
-			_ = file.Close()
-			return func() { _ = os.Remove(path) }, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, err
-		}
-		if info, statErr := os.Stat(path); statErr == nil &&
-			time.Since(info.ModTime()) > evidenceAuditRootLockStaleAfter {
-			_ = os.Remove(path)
-			continue
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("timed out acquiring evidence audit root lock")
-		}
-		time.Sleep(10 * time.Millisecond)
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
 	}
+	defer dir.Close()
+	return dir.Sync()
 }

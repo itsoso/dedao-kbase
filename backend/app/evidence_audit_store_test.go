@@ -150,6 +150,54 @@ func TestEvidenceAuditStoreConcurrentCreatesAcrossStoreInstances(t *testing.T) {
 	}
 }
 
+func TestEvidenceAuditStoreRootLockBlocksOtherStoreInstances(t *testing.T) {
+	root := t.TempDir()
+	first := NewBookKnowledgeStore(root)
+	second := NewBookKnowledgeStore(root)
+
+	unlockFirst, err := first.acquireEvidenceAuditRootLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReleased := false
+	defer func() {
+		if !firstReleased {
+			unlockFirst()
+		}
+	}()
+
+	acquired := make(chan func(), 1)
+	errs := make(chan error, 1)
+	go func() {
+		unlockSecond, lockErr := second.acquireEvidenceAuditRootLock()
+		if lockErr != nil {
+			errs <- lockErr
+			return
+		}
+		acquired <- unlockSecond
+	}()
+
+	select {
+	case unlockSecond := <-acquired:
+		unlockSecond()
+		t.Fatal("second store acquired root lock while first store still held it")
+	case err := <-errs:
+		t.Fatalf("second store lock failed while waiting: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	unlockFirst()
+	firstReleased = true
+	select {
+	case unlockSecond := <-acquired:
+		unlockSecond()
+	case err := <-errs:
+		t.Fatalf("second store lock failed after release: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("second store did not acquire root lock after release")
+	}
+}
+
 func TestEvidenceAuditStoreConcurrentCreatesAcrossProcesses(t *testing.T) {
 	root := t.TempDir()
 	const workers = 6
@@ -520,6 +568,135 @@ func TestEvidenceAuditStoreRejectsPreparedJournalWithMismatchedReportIdentity(t 
 	if _, err := CompleteEvidenceAudit(store, report, now.Add(3*time.Minute)); err == nil ||
 		(!strings.Contains(err.Error(), "prepared") && !errors.Is(err, os.ErrNotExist)) {
 		t.Fatalf("CompleteEvidenceAudit() error = %v", err)
+	}
+}
+
+func TestEvidenceAuditImmutableWriteNeverPublishesPartialFinal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reports", "report.json")
+	payload := []byte("{\"complete\":true}\n")
+	originalFault := evidenceAuditStorageFault
+	evidenceAuditStorageFault = func(stage, _ string) error {
+		if stage == evidenceAuditFaultImmutableTempSynced {
+			return errors.New("injected crash after immutable temp sync")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditStorageFault = originalFault })
+
+	if err := writeEvidenceAuditImmutableFile(path, payload); err == nil ||
+		!strings.Contains(err.Error(), "injected crash") {
+		t.Fatalf("writeEvidenceAuditImmutableFile() error = %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial final artifact was published: %v", err)
+	}
+
+	evidenceAuditStorageFault = originalFault
+	if err := writeEvidenceAuditImmutableFile(path, payload); err != nil {
+		t.Fatalf("retry immutable write: %v", err)
+	}
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, payload) {
+		t.Fatalf("stored payload = %q, want %q", stored, payload)
+	}
+}
+
+func TestEvidenceAuditManifestRecoversLastKnownGoodAtEveryPublishStage(t *testing.T) {
+	stages := []string{
+		evidenceAuditFaultManifestTempSynced,
+		evidenceAuditFaultManifestBackupPublished,
+		evidenceAuditFaultManifestBeforePublish,
+	}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+			firstInput := validEvidenceAuditInput()
+			first, _, err := CreateEvidenceAudit(store, firstInput, "manifest-first", now)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			originalFault := evidenceAuditStorageFault
+			evidenceAuditStorageFault = func(current, _ string) error {
+				if current == stage {
+					return errors.New("injected manifest publish crash")
+				}
+				return nil
+			}
+			t.Cleanup(func() { evidenceAuditStorageFault = originalFault })
+
+			secondInput := validEvidenceAuditInput()
+			secondInput.Subject = "A distinct second audit"
+			if _, _, err := CreateEvidenceAudit(
+				store,
+				secondInput,
+				"manifest-second",
+				now.Add(time.Minute),
+			); err == nil || !strings.Contains(err.Error(), "injected manifest publish crash") {
+				t.Fatalf("CreateEvidenceAudit() error = %v", err)
+			}
+			evidenceAuditStorageFault = originalFault
+
+			reopened := NewBookKnowledgeStore(store.root)
+			records, err := reopened.ListEvidenceAudits("", "", 10)
+			if err != nil {
+				t.Fatalf("recover manifest: %v", err)
+			}
+			if len(records) != 1 || records[0].AuditID != first.AuditID {
+				t.Fatalf("recovered records = %#v, want only last-known-good audit %q", records, first.AuditID)
+			}
+			assertEvidenceAuditManifestFileValid(t, reopened.EvidenceAuditManifestPath())
+			if _, err := os.Stat(reopened.EvidenceAuditManifestPath() + ".bak"); err == nil {
+				assertEvidenceAuditManifestFileValid(t, reopened.EvidenceAuditManifestPath()+".bak")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditManifestFallsBackFromCorruptPrimaryToValidBackup(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	first, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "backup-first", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondInput := validEvidenceAuditInput()
+	secondInput.Subject = "Second manifest generation"
+	if _, _, err := CreateEvidenceAudit(store, secondInput, "backup-second", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.EvidenceAuditManifestPath(), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := NewBookKnowledgeStore(store.root).ListEvidenceAudits("", "", 10)
+	if err != nil {
+		t.Fatalf("load backup manifest: %v", err)
+	}
+	if len(records) != 1 || records[0].AuditID != first.AuditID {
+		t.Fatalf("backup records = %#v, want last-known-good audit %q", records, first.AuditID)
+	}
+	assertEvidenceAuditManifestFileValid(t, store.EvidenceAuditManifestPath())
+	assertEvidenceAuditManifestFileValid(t, store.EvidenceAuditManifestPath()+".bak")
+}
+
+func assertEvidenceAuditManifestFileValid(t *testing.T, path string) {
+	t.Helper()
+	var manifest EvidenceAuditManifest
+	if err := readJSONFile(path, &manifest); err != nil {
+		t.Fatalf("read manifest %s: %v", path, err)
+	}
+	if manifest.Version != evidenceAuditStoreVersion {
+		t.Fatalf("manifest %s version = %q", path, manifest.Version)
+	}
+	if err := validateEvidenceAuditManifestCapacity(&manifest); err != nil {
+		t.Fatalf("validate manifest %s: %v", path, err)
 	}
 }
 
