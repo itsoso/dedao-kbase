@@ -5,13 +5,22 @@ import (
 	"testing"
 )
 
+const (
+	testPrimaryPublication = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	testSupportPublication = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	testSecondPublication  = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+)
+
 func TestEvidenceAuditHashesAreDeterministicAndCompletedReportsValidate(t *testing.T) {
 	input := validEvidenceAuditInput()
 	firstHash, err := EvidenceAuditInputHash(input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	input.Releases[0].CitationIDs = []string{"citation-b", "citation-a"}
+	input.Releases[0].Citations = []EvidenceAuditCitationRef{
+		{CitationID: "citation-b", ClaimID: "claim-b", ChunkID: "chunk-b"},
+		{CitationID: "citation-a", ClaimID: "claim-a", ChunkID: "chunk-a"},
+	}
 	secondHash, err := EvidenceAuditInputHash(input)
 	if err != nil {
 		t.Fatal(err)
@@ -74,9 +83,27 @@ func TestEvidenceAuditValidationRejectsInvalidContractAndUngroundedVerdicts(t *t
 		{name: "citation is not pinned", edit: func(a *EvidenceAudit) {
 			a.ClaimAudits[0].Evidence[0].CitationID = "citation-unpinned"
 		}, want: "pinned citation"},
+		{name: "citation claim mismatch", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits[0].Evidence[0].ClaimID = "claim-unpinned"
+		}, want: "citation binding"},
+		{name: "citation chunk mismatch", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits[0].Evidence[0].ChunkID = "chunk-unpinned"
+		}, want: "citation binding"},
+		{name: "publication identity mismatch", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits[0].Evidence[0].PublicationIdentity = testSecondPublication
+		}, want: "publication_identity"},
 		{name: "evidence source type mismatch", edit: func(a *EvidenceAudit) {
 			a.ClaimAudits[0].Evidence[0].SourceType = "wechat_mp_article"
 		}, want: "source_type"},
+		{name: "injected claim", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits[0].SourceClaim = "claim not selected by the input"
+		}, want: "selected_claims"},
+		{name: "duplicate claim audit", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits = append(a.ClaimAudits, a.ClaimAudits[0])
+		}, want: "selected_claims"},
+		{name: "missing claim audit", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits = nil
+		}, want: "selected_claims"},
 		{name: "running audit carries partial report", edit: func(a *EvidenceAudit) {
 			a.Status = EvidenceAuditRunning
 			a.CompletedAt = ""
@@ -93,7 +120,8 @@ func TestEvidenceAuditValidationRejectsInvalidContractAndUngroundedVerdicts(t *t
 			a.Status = EvidenceAuditFailed
 			a.CompletedAt = ""
 			a.FailedAt = "2026-07-23T10:02:00Z"
-			a.FailureReason = "audit failed"
+			a.FailureCode = "audit_failed"
+			a.FailureSummary = "audit failed with code audit_failed"
 			a.OutputHash = ""
 		}, want: "partial report"},
 	}
@@ -131,19 +159,57 @@ func TestEvidenceAuditInsufficientVerdictMayDeclareKnowledgeGapWithoutEvidence(t
 	}
 }
 
-func TestEvidenceAuditConfidenceIsComputedFromCitationsSourcesAndConflicts(t *testing.T) {
+func TestEvidenceAuditValidationRejectsInvalidLifecycleOrdering(t *testing.T) {
+	valid, err := FinalizeEvidenceAuditReport(validCompletedEvidenceAudit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		edit func(*EvidenceAudit)
+	}{
+		{name: "updated before created", edit: func(a *EvidenceAudit) { a.UpdatedAt = "2026-07-23T09:59:00Z" }},
+		{name: "started before created", edit: func(a *EvidenceAudit) { a.StartedAt = "2026-07-23T09:59:00Z" }},
+		{name: "completed before started", edit: func(a *EvidenceAudit) { a.CompletedAt = "2026-07-23T10:00:30Z" }},
+		{name: "updated before completed", edit: func(a *EvidenceAudit) { a.UpdatedAt = "2026-07-23T10:01:30Z" }},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			changed := valid
+			changed.Releases = append([]EvidenceAuditReleaseRef{}, valid.Releases...)
+			changed.ClaimAudits = cloneEvidenceAuditClaims(valid.ClaimAudits)
+			testCase.edit(&changed)
+			changed.OutputHash, _ = EvidenceAuditOutputHash(changed)
+			if err := ValidateEvidenceAudit(changed); err == nil || !strings.Contains(err.Error(), "timestamp order") {
+				t.Fatalf("ValidateEvidenceAudit() error = %v, want timestamp order", err)
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditConfidenceSeparatesIndependentPublicationsAndSourceDiversity(t *testing.T) {
 	evidence := []EvidenceAuditEvidenceRef{
-		{ReleaseID: "release-a", ContentHash: "sha256:release-a", SourceType: "dedao_ebook", CitationID: "citation-a"},
-		{ReleaseID: "release-b", ContentHash: "sha256:release-b", SourceType: "wechat_mp_article", CitationID: "citation-b"},
-		{ReleaseID: "release-c", ContentHash: "sha256:release-c", SourceType: "wechat_mp_article"},
+		validEvidenceRef("release-primary", "sha256:primary", EvidenceAuditReleasePrimary, "dedao_ebook", testPrimaryPublication, "citation-a", "claim-a", "chunk-a"),
+		validEvidenceRef("release-support", "sha256:support", EvidenceAuditReleaseSupporting, "wechat_mp_article", testSupportPublication, "citation-c", "claim-c", "chunk-c"),
+		validEvidenceRef("release-support-2", "sha256:support-2", EvidenceAuditReleaseSupporting, "wechat_mp_article", testSecondPublication, "citation-d", "claim-d", "chunk-d"),
 	}
 	got := ComputeEvidenceAuditConfidence(evidence, 0)
-	if got != 0.67 {
-		t.Fatalf("confidence = %.2f, want 0.67", got)
+	if got != 0.8 {
+		t.Fatalf("confidence = %.2f, want 0.80", got)
 	}
 	withConflict := ComputeEvidenceAuditConfidence(evidence, 2)
 	if withConflict >= got || withConflict < 0 || withConflict > 1 {
 		t.Fatalf("conflicted confidence = %.2f, base = %.2f", withConflict, got)
+	}
+	samePublication := append([]EvidenceAuditEvidenceRef{}, evidence...)
+	samePublication[2].PublicationIdentity = testSupportPublication
+	if score := ComputeEvidenceAuditConfidence(samePublication, 0); score >= got {
+		t.Fatalf("same-publication confidence = %.2f, want below %.2f", score, got)
+	}
+	differentSourceType := append([]EvidenceAuditEvidenceRef{}, evidence...)
+	differentSourceType[2].SourceType = "clinical_guideline"
+	if score := ComputeEvidenceAuditConfidence(differentSourceType, 0); score <= got {
+		t.Fatalf("diverse-source confidence = %.2f, want above %.2f", score, got)
 	}
 	if got := ComputeEvidenceAuditConfidence(nil, 100); got != 0 {
 		t.Fatalf("empty confidence = %.2f, want 0", got)
@@ -152,11 +218,29 @@ func TestEvidenceAuditConfidenceIsComputedFromCitationsSourcesAndConflicts(t *te
 
 func validEvidenceAuditInput() EvidenceAuditInput {
 	return EvidenceAuditInput{
-		SchemaVersion:  EvidenceAuditSchemaVersion,
-		Package:        EvidenceAuditPackageRef{PackageID: "book-agent-clinical-trials-truth", Version: "2.0.0", ContentHash: "sha256:package"},
-		Model:          EvidenceAuditModelIdentity{Provider: "tokenplan", Model: "qwen3.7-max", Route: "evidence-audit"},
-		Retrieval:      EvidenceAuditRetrievalIdentity{Strategy: "hybrid", IndexVersion: "index-v1", RerankerVersion: "reranker-v1"},
-		Releases:       []EvidenceAuditReleaseRef{{ReleaseID: "release-primary", ContentHash: "sha256:primary", SourceType: "dedao_ebook", CitationIDs: []string{"citation-a", "citation-b"}}, {ReleaseID: "release-support", ContentHash: "sha256:support", SourceType: "wechat_mp_article", CitationIDs: []string{"citation-c"}}},
+		SchemaVersion: EvidenceAuditSchemaVersion,
+		Package:       EvidenceAuditPackageRef{PackageID: "book-agent-clinical-trials-truth", Version: "2.0.0", ContentHash: "sha256:package"},
+		Model:         EvidenceAuditModelIdentity{Provider: "tokenplan", Model: "qwen3.7-max", Route: "evidence-audit"},
+		Retrieval:     EvidenceAuditRetrievalIdentity{Strategy: "hybrid", IndexVersion: "index-v1", RerankerVersion: "reranker-v1"},
+		Releases: []EvidenceAuditReleaseRef{
+			{
+				ReleaseID: "release-primary", ContentHash: "sha256:primary",
+				Role: EvidenceAuditReleasePrimary, SourceType: "dedao_ebook",
+				PublicationIdentity: testPrimaryPublication,
+				Citations: []EvidenceAuditCitationRef{
+					{CitationID: "citation-a", ClaimID: "claim-a", ChunkID: "chunk-a"},
+					{CitationID: "citation-b", ClaimID: "claim-b", ChunkID: "chunk-b"},
+				},
+			},
+			{
+				ReleaseID: "release-support", ContentHash: "sha256:support",
+				Role: EvidenceAuditReleaseSupporting, SourceType: "wechat_mp_article",
+				PublicationIdentity: testSupportPublication,
+				Citations: []EvidenceAuditCitationRef{
+					{CitationID: "citation-c", ClaimID: "claim-c", ChunkID: "chunk-c"},
+				},
+			},
+		},
 		Subject:        "Clinical trial truth claims",
 		Scope:          "Cross-check selected claims against pinned KBase releases.",
 		SelectedClaims: []string{"source claim 1"},
@@ -167,8 +251,8 @@ func validCompletedEvidenceAudit() EvidenceAudit {
 	input := validEvidenceAuditInput()
 	inputHash, _ := EvidenceAuditInputHash(input)
 	evidence := []EvidenceAuditEvidenceRef{
-		{ReleaseID: "release-primary", ContentHash: "sha256:primary", SourceType: "dedao_ebook", CitationID: "citation-a", ClaimID: "claim-a", ChunkID: "chunk-a"},
-		{ReleaseID: "release-support", ContentHash: "sha256:support", SourceType: "wechat_mp_article", CitationID: "citation-c", ClaimID: "claim-c", ChunkID: "chunk-c"},
+		validEvidenceRef("release-primary", "sha256:primary", EvidenceAuditReleasePrimary, "dedao_ebook", testPrimaryPublication, "citation-a", "claim-a", "chunk-a"),
+		validEvidenceRef("release-support", "sha256:support", EvidenceAuditReleaseSupporting, "wechat_mp_article", testSupportPublication, "citation-c", "claim-c", "chunk-c"),
 	}
 	return EvidenceAudit{
 		SchemaVersion:  EvidenceAuditSchemaVersion,
@@ -208,6 +292,16 @@ func validCompletedEvidenceAudit() EvidenceAudit {
 			ReviewItems:   []string{"Verify citation applicability."},
 		},
 		TraceID: "trace-1",
+	}
+}
+
+func validEvidenceRef(
+	releaseID, contentHash, role, sourceType, publicationIdentity, citationID, claimID, chunkID string,
+) EvidenceAuditEvidenceRef {
+	return EvidenceAuditEvidenceRef{
+		ReleaseID: releaseID, ContentHash: contentHash, Role: role, SourceType: sourceType,
+		PublicationIdentity: publicationIdentity,
+		CitationID:          citationID, ClaimID: claimID, ChunkID: chunkID,
 	}
 }
 

@@ -162,12 +162,93 @@ func TestEvidenceAuditStorePersistsFailedStateWithoutPartialReport(t *testing.T)
 	if _, err := StartEvidenceAudit(store, queued.AuditID, "trace-failed", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	failed, err := FailEvidenceAudit(store, queued.AuditID, "model output failed validation", now.Add(2*time.Minute))
+	failed, err := FailEvidenceAudit(
+		store,
+		queued.AuditID,
+		"model_invalid",
+		"Bearer secret-token prompt=private remote body: patient data",
+		now.Add(2*time.Minute),
+	)
 	if err != nil {
 		t.Fatalf("FailEvidenceAudit() error = %v", err)
 	}
-	if failed.Status != EvidenceAuditFailed || failed.FailedAt == "" || failed.FailureReason == "" || failed.OutputHash != "" {
+	if failed.Status != EvidenceAuditFailed || failed.FailedAt == "" ||
+		failed.FailureCode != "model_invalid" || failed.FailureSummary == "" || failed.OutputHash != "" {
 		t.Fatalf("failed audit = %#v", failed)
+	}
+	rawManifest, err := os.ReadFile(store.EvidenceAuditManifestPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret-token", "prompt=private", "patient data", "Bearer"} {
+		if strings.Contains(string(rawManifest), forbidden) {
+			t.Fatalf("manifest leaked failure detail %q: %s", forbidden, rawManifest)
+		}
+	}
+}
+
+func TestEvidenceAuditStoreRejectsOutOfOrderTransitionsWithoutPersistingThem(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	queued, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "request-timeline", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, queued.AuditID, "trace-too-early", now.Add(-time.Minute)); err == nil {
+		t.Fatal("StartEvidenceAudit() accepted started_at before created_at")
+	}
+	reloaded, err := store.LoadEvidenceAudit(queued.AuditID)
+	if err != nil {
+		t.Fatalf("LoadEvidenceAudit() after rejected transition = %v", err)
+	}
+	if reloaded.Status != EvidenceAuditQueued || reloaded.StartedAt != "" {
+		t.Fatalf("rejected transition persisted: %#v", reloaded)
+	}
+}
+
+func TestEvidenceAuditStoreRecoversWhenManifestWriteFailsAfterReportWrite(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	queued, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "request-recovery", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, queued.AuditID, "trace-recovery", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report := validCompletedEvidenceAudit()
+	report.AuditID = queued.AuditID
+
+	originalWriter := writeEvidenceAuditManifestFile
+	failedOnce := false
+	writeEvidenceAuditManifestFile = func(path string, payload []byte) error {
+		if !failedOnce {
+			failedOnce = true
+			return errors.New("injected manifest failure")
+		}
+		return originalWriter(path, payload)
+	}
+	t.Cleanup(func() { writeEvidenceAuditManifestFile = originalWriter })
+
+	if _, err := CompleteEvidenceAudit(store, report, now.Add(2*time.Minute)); err == nil ||
+		!strings.Contains(err.Error(), "injected manifest failure") {
+		t.Fatalf("first completion error = %v", err)
+	}
+	writeEvidenceAuditManifestFile = originalWriter
+
+	completed, err := CompleteEvidenceAudit(store, report, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("recovered completion error = %v", err)
+	}
+	if completed.Status != EvidenceAuditCompleted {
+		t.Fatalf("recovered audit = %#v", completed)
+	}
+	reports, err := filepath.Glob(filepath.Join(store.EvidenceAuditDir(), "reports", "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Fatalf("report artifacts = %v, want exactly one immutable report", reports)
 	}
 }
 
@@ -176,13 +257,15 @@ func TestEvidenceAuditStoreListOrderingAndManifestPrivacyAreStable(t *testing.T)
 	base := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
 	inputB := validEvidenceAuditInput()
 	inputB.Subject = "PRIVATE SUBJECT B"
-	first, _, err := CreateEvidenceAudit(store, inputB, "request-b", base.Add(time.Minute))
+	rawKeyB := "request-b Bearer private-token prompt=secret"
+	first, _, err := CreateEvidenceAudit(store, inputB, rawKeyB, base.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
 	inputA := validEvidenceAuditInput()
 	inputA.Subject = "PRIVATE SUBJECT A"
-	second, _, err := CreateEvidenceAudit(store, inputA, "request-a", base)
+	rawKeyA := "request-a remote-response private"
+	second, _, err := CreateEvidenceAudit(store, inputA, rawKeyA, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +286,10 @@ func TestEvidenceAuditStoreListOrderingAndManifestPrivacyAreStable(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{"PRIVATE SUBJECT", inputA.Scope, "credential", "source_body", "raw_prompt"} {
+	for _, forbidden := range []string{
+		"PRIVATE SUBJECT", inputA.Scope, "credential", "source_body", "raw_prompt",
+		rawKeyA, rawKeyB, "private-token", "prompt=secret", "remote-response",
+	} {
 		if strings.Contains(string(rawManifest), forbidden) {
 			t.Fatalf("manifest persisted forbidden content %q: %s", forbidden, rawManifest)
 		}
@@ -214,6 +300,11 @@ func TestEvidenceAuditStoreListOrderingAndManifestPrivacyAreStable(t *testing.T)
 	}
 	if len(manifest.Audits) != 2 || len(manifest.Idempotency) != 2 {
 		t.Fatalf("manifest metadata = %#v", manifest)
+	}
+	for _, record := range manifest.Idempotency {
+		if !strings.HasPrefix(record.IdempotencyIdentity, "sha256:") || len(record.IdempotencyIdentity) != 71 {
+			t.Fatalf("idempotency identity = %q", record.IdempotencyIdentity)
+		}
 	}
 	temporary, err := filepath.Glob(filepath.Join(store.EvidenceAuditDir(), ".*.tmp-*"))
 	if err != nil {

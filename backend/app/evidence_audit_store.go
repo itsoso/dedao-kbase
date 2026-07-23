@@ -1,6 +1,9 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -10,7 +13,7 @@ import (
 	"time"
 )
 
-const evidenceAuditStoreVersion = "1"
+const evidenceAuditStoreVersion = "2"
 
 var (
 	ErrEvidenceAuditIdempotencyConflict = errors.New("evidence audit idempotency conflict")
@@ -32,14 +35,17 @@ type EvidenceAuditRecord struct {
 	StartedAt          string `json:"started_at,omitempty"`
 	CompletedAt        string `json:"completed_at,omitempty"`
 	FailedAt           string `json:"failed_at,omitempty"`
-	FailureReason      string `json:"failure_reason,omitempty"`
+	FailureCode        string `json:"failure_code,omitempty"`
+	FailureSummary     string `json:"failure_summary,omitempty"`
 }
 
 type EvidenceAuditIdempotencyRecord struct {
-	IdempotencyKey string `json:"idempotency_key"`
-	AuditID        string `json:"audit_id"`
-	InputHash      string `json:"input_hash"`
+	IdempotencyIdentity string `json:"idempotency_identity"`
+	AuditID             string `json:"audit_id"`
+	InputHash           string `json:"input_hash"`
 }
+
+var writeEvidenceAuditManifestFile = writeFileAtomically
 
 type EvidenceAuditManifest struct {
 	Version     string                           `json:"version"`
@@ -72,6 +78,7 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 	if idempotencyKey == "" {
 		return nil, false, fmt.Errorf("idempotency_key is required")
 	}
+	idempotencyIdentity := evidenceAuditOpaqueIdentity(idempotencyKey)
 	normalized, err := normalizeEvidenceAuditInput(input)
 	if err != nil {
 		return nil, false, err
@@ -96,11 +103,11 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 		return nil, false, err
 	}
 	for _, record := range manifest.Idempotency {
-		if record.IdempotencyKey != idempotencyKey {
+		if record.IdempotencyIdentity != idempotencyIdentity {
 			continue
 		}
 		if record.InputHash != inputHash {
-			return nil, false, fmt.Errorf("%w: key %q already references different input", ErrEvidenceAuditIdempotencyConflict, idempotencyKey)
+			return nil, false, fmt.Errorf("%w: opaque identity already references different input", ErrEvidenceAuditIdempotencyConflict)
 		}
 		audit, err := store.loadEvidenceAuditByIDUnlocked(manifest, record.AuditID)
 		return audit, false, err
@@ -112,9 +119,9 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 			continue
 		}
 		manifest.Idempotency = append(manifest.Idempotency, EvidenceAuditIdempotencyRecord{
-			IdempotencyKey: idempotencyKey,
-			AuditID:        record.AuditID,
-			InputHash:      inputHash,
+			IdempotencyIdentity: idempotencyIdentity,
+			AuditID:             record.AuditID,
+			InputHash:           inputHash,
 		})
 		manifest.UpdatedAt = timestamp
 		if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
@@ -141,14 +148,14 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 	manifest.UpdatedAt = timestamp
 	manifest.Audits = append(manifest.Audits, record)
 	manifest.Idempotency = append(manifest.Idempotency, EvidenceAuditIdempotencyRecord{
-		IdempotencyKey: idempotencyKey,
-		AuditID:        auditID,
-		InputHash:      inputHash,
+		IdempotencyIdentity: idempotencyIdentity,
+		AuditID:             auditID,
+		InputHash:           inputHash,
 	})
 	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
 		return nil, false, err
 	}
-	audit := evidenceAuditFromInput(normalized, record, idempotencyKey)
+	audit := evidenceAuditFromInput(normalized, record, idempotencyIdentity)
 	return &audit, true, nil
 }
 
@@ -171,7 +178,11 @@ func StartEvidenceAudit(store *BookKnowledgeStore, auditID, traceID string, now 
 	})
 }
 
-func FailEvidenceAudit(store *BookKnowledgeStore, auditID, reason string, now time.Time) (*EvidenceAudit, error) {
+func FailEvidenceAudit(
+	store *BookKnowledgeStore,
+	auditID, code, summary string,
+	now time.Time,
+) (*EvidenceAudit, error) {
 	return updateEvidenceAuditRecord(store, auditID, now, func(record *EvidenceAuditRecord) error {
 		if record.Status == EvidenceAuditCompleted {
 			return ErrEvidenceAuditImmutable
@@ -179,16 +190,17 @@ func FailEvidenceAudit(store *BookKnowledgeStore, auditID, reason string, now ti
 		if record.Status != EvidenceAuditQueued && record.Status != EvidenceAuditRunning {
 			return fmt.Errorf("%w: cannot fail audit in %q", ErrEvidenceAuditStateConflict, record.Status)
 		}
-		reason = strings.TrimSpace(reason)
-		if reason == "" {
-			return fmt.Errorf("failure reason is required")
+		code = sanitizeEvidenceAuditFailureCode(code)
+		if code == "" {
+			return fmt.Errorf("failure code is required")
 		}
-		if len(reason) > 256 {
-			reason = reason[:256]
+		if strings.TrimSpace(summary) == "" {
+			return fmt.Errorf("failure summary is required")
 		}
 		record.Status = EvidenceAuditFailed
 		record.FailedAt = evidenceAuditTimestamp(now)
-		record.FailureReason = reason
+		record.FailureCode = code
+		record.FailureSummary = sanitizeEvidenceAuditFailureSummary(code)
 		record.OutputHash = ""
 		return nil
 	})
@@ -214,6 +226,24 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	if record.Status != EvidenceAuditRunning {
 		return nil, fmt.Errorf("%w: cannot complete audit in %q", ErrEvidenceAuditStateConflict, record.Status)
 	}
+	prepared, err := store.findPreparedEvidenceAuditReportUnlocked(record.AuditID, record.InputHash)
+	if err != nil {
+		return nil, err
+	}
+	if prepared != nil {
+		if !evidenceAuditReportContentEqual(*prepared, report) {
+			return nil, ErrEvidenceAuditImmutable
+		}
+		record.Status = EvidenceAuditCompleted
+		record.OutputHash = prepared.OutputHash
+		record.UpdatedAt = prepared.UpdatedAt
+		record.CompletedAt = prepared.CompletedAt
+		manifest.UpdatedAt = prepared.UpdatedAt
+		if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+			return nil, err
+		}
+		return prepared, nil
+	}
 	input, err := store.loadEvidenceAuditInputUnlocked(record.InputHash)
 	if err != nil {
 		return nil, err
@@ -227,7 +257,8 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	report.StartedAt = record.StartedAt
 	report.CompletedAt = evidenceAuditTimestamp(now)
 	report.FailedAt = ""
-	report.FailureReason = ""
+	report.FailureCode = ""
+	report.FailureSummary = ""
 	report.IdempotencyKey = idempotencyKey
 	report.InputHash = record.InputHash
 	report.Package = input.Package
@@ -314,10 +345,22 @@ func updateEvidenceAuditRecord(store *BookKnowledgeStore, auditID string, now ti
 	}
 	record.UpdatedAt = evidenceAuditTimestamp(now)
 	manifest.UpdatedAt = record.UpdatedAt
+	input, err := store.loadEvidenceAuditInputUnlocked(record.InputHash)
+	if err != nil {
+		return nil, err
+	}
+	candidate := evidenceAuditFromInput(
+		input,
+		*record,
+		evidenceAuditIdempotencyKey(manifest, record.AuditID),
+	)
+	if err := ValidateEvidenceAudit(candidate); err != nil {
+		return nil, err
+	}
 	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
 		return nil, err
 	}
-	return store.loadEvidenceAuditRecordUnlocked(*record)
+	return &candidate, nil
 }
 
 func (s *BookKnowledgeStore) loadEvidenceAuditByIDUnlocked(manifest *EvidenceAuditManifest, auditID string) (*EvidenceAudit, error) {
@@ -402,7 +445,16 @@ func (s *BookKnowledgeStore) writeEvidenceAuditInputUnlocked(input EvidenceAudit
 func (s *BookKnowledgeStore) writeEvidenceAuditReportUnlocked(report EvidenceAudit) error {
 	path := s.EvidenceAuditReportPath(report.OutputHash)
 	if _, err := os.Stat(path); err == nil {
-		return ErrEvidenceAuditImmutable
+		var stored EvidenceAudit
+		if readErr := readJSONFile(path, &stored); readErr != nil {
+			return readErr
+		}
+		storedPayload, _ := json.Marshal(stored)
+		reportPayload, _ := json.Marshal(report)
+		if string(storedPayload) != string(reportPayload) {
+			return ErrEvidenceAuditImmutable
+		}
+		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -441,7 +493,7 @@ func (s *BookKnowledgeStore) writeEvidenceAuditManifestUnlocked(manifest *Eviden
 	if err != nil {
 		return err
 	}
-	return writeFileAtomically(s.EvidenceAuditManifestPath(), payload)
+	return writeEvidenceAuditManifestFile(s.EvidenceAuditManifestPath(), payload)
 }
 
 func evidenceAuditFromInput(input EvidenceAuditInput, record EvidenceAuditRecord, idempotencyKey string) EvidenceAudit {
@@ -465,7 +517,8 @@ func evidenceAuditFromInput(input EvidenceAuditInput, record EvidenceAuditRecord
 		SelectedClaims: input.SelectedClaims,
 		OutputHash:     record.OutputHash,
 		TraceID:        record.TraceID,
-		FailureReason:  record.FailureReason,
+		FailureCode:    record.FailureCode,
+		FailureSummary: record.FailureSummary,
 	}
 }
 
@@ -481,10 +534,75 @@ func findEvidenceAuditRecord(manifest *EvidenceAuditManifest, auditID string) *E
 func evidenceAuditIdempotencyKey(manifest *EvidenceAuditManifest, auditID string) string {
 	for _, record := range manifest.Idempotency {
 		if record.AuditID == auditID {
-			return record.IdempotencyKey
+			return record.IdempotencyIdentity
 		}
 	}
 	return ""
+}
+
+func (s *BookKnowledgeStore) findPreparedEvidenceAuditReportUnlocked(
+	auditID, inputHash string,
+) (*EvidenceAudit, error) {
+	paths, err := filepath.Glob(filepath.Join(s.EvidenceAuditDir(), "reports", "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	var found *EvidenceAudit
+	for _, path := range paths {
+		var report EvidenceAudit
+		if err := readJSONFile(path, &report); err != nil {
+			return nil, err
+		}
+		if report.AuditID != auditID || report.InputHash != inputHash {
+			continue
+		}
+		if err := ValidateEvidenceAudit(report); err != nil {
+			return nil, fmt.Errorf("validate prepared evidence audit report: %w", err)
+		}
+		if found != nil && found.OutputHash != report.OutputHash {
+			return nil, fmt.Errorf("%w: multiple prepared reports for audit %q", ErrEvidenceAuditStateConflict, auditID)
+		}
+		copy := report
+		found = &copy
+	}
+	return found, nil
+}
+
+func evidenceAuditReportContentEqual(left, right EvidenceAudit) bool {
+	leftPayload, _ := json.Marshal(struct {
+		Claims    []EvidenceAuditClaim
+		Summary   EvidenceAuditSummary
+		Proofroom EvidenceAuditProofroomProjection
+	}{left.ClaimAudits, left.Summary, left.Proofroom})
+	rightPayload, _ := json.Marshal(struct {
+		Claims    []EvidenceAuditClaim
+		Summary   EvidenceAuditSummary
+		Proofroom EvidenceAuditProofroomProjection
+	}{right.ClaimAudits, right.Summary, right.Proofroom})
+	return string(leftPayload) == string(rightPayload)
+}
+
+func evidenceAuditOpaqueIdentity(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func sanitizeEvidenceAuditFailureCode(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' {
+			builder.WriteRune(char)
+		}
+		if builder.Len() == 48 {
+			break
+		}
+	}
+	return builder.String()
+}
+
+func sanitizeEvidenceAuditFailureSummary(code string) string {
+	return "audit failed with code " + code
 }
 
 func evidenceAuditTimestamp(now time.Time) string {

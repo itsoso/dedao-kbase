@@ -23,6 +23,9 @@ const (
 	EvidenceAuditVerdictContradicted = "contradicted"
 	EvidenceAuditVerdictMixed        = "mixed"
 	EvidenceAuditVerdictInsufficient = "insufficient"
+
+	EvidenceAuditReleasePrimary    = "primary"
+	EvidenceAuditReleaseSupporting = "supporting"
 )
 
 type EvidenceAudit struct {
@@ -48,7 +51,8 @@ type EvidenceAudit struct {
 	Proofroom      EvidenceAuditProofroomProjection `json:"proofroom_projection,omitempty"`
 	OutputHash     string                           `json:"output_hash,omitempty"`
 	TraceID        string                           `json:"trace_id,omitempty"`
-	FailureReason  string                           `json:"failure_reason,omitempty"`
+	FailureCode    string                           `json:"failure_code,omitempty"`
+	FailureSummary string                           `json:"failure_summary,omitempty"`
 }
 
 type EvidenceAuditInput struct {
@@ -83,10 +87,18 @@ type EvidenceAuditRetrievalIdentity struct {
 }
 
 type EvidenceAuditReleaseRef struct {
-	ReleaseID   string   `json:"release_id"`
-	ContentHash string   `json:"content_hash"`
-	SourceType  string   `json:"source_type"`
-	CitationIDs []string `json:"citation_ids,omitempty"`
+	ReleaseID           string                     `json:"release_id"`
+	ContentHash         string                     `json:"content_hash"`
+	Role                string                     `json:"role"`
+	SourceType          string                     `json:"source_type"`
+	PublicationIdentity string                     `json:"publication_identity"`
+	Citations           []EvidenceAuditCitationRef `json:"citations"`
+}
+
+type EvidenceAuditCitationRef struct {
+	CitationID string `json:"citation_id"`
+	ClaimID    string `json:"claim_id"`
+	ChunkID    string `json:"chunk_id"`
 }
 
 type EvidenceAuditClaim struct {
@@ -101,13 +113,15 @@ type EvidenceAuditClaim struct {
 }
 
 type EvidenceAuditEvidenceRef struct {
-	ReleaseID   string `json:"release_id"`
-	ContentHash string `json:"content_hash"`
-	SourceType  string `json:"source_type"`
-	ClaimID     string `json:"claim_id,omitempty"`
-	ChunkID     string `json:"chunk_id,omitempty"`
-	CitationID  string `json:"citation_id,omitempty"`
-	Conflict    bool   `json:"conflict,omitempty"`
+	ReleaseID           string `json:"release_id"`
+	ContentHash         string `json:"content_hash"`
+	Role                string `json:"role"`
+	SourceType          string `json:"source_type"`
+	PublicationIdentity string `json:"publication_identity"`
+	ClaimID             string `json:"claim_id"`
+	ChunkID             string `json:"chunk_id"`
+	CitationID          string `json:"citation_id"`
+	Conflict            bool   `json:"conflict,omitempty"`
 }
 
 type EvidenceAuditSummary struct {
@@ -204,7 +218,7 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 			return fmt.Errorf("queued status cannot contain a partial report")
 		}
 		if audit.StartedAt != "" || audit.CompletedAt != "" || audit.FailedAt != "" ||
-			audit.TraceID != "" || audit.FailureReason != "" {
+			audit.TraceID != "" || audit.FailureCode != "" || audit.FailureSummary != "" {
 			return fmt.Errorf("queued status cannot contain terminal metadata")
 		}
 	case EvidenceAuditRunning:
@@ -214,15 +228,17 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 		if audit.StartedAt == "" || audit.TraceID == "" {
 			return fmt.Errorf("running status requires started_at and trace_id")
 		}
-		if audit.CompletedAt != "" || audit.FailedAt != "" || audit.FailureReason != "" {
+		if audit.CompletedAt != "" || audit.FailedAt != "" ||
+			audit.FailureCode != "" || audit.FailureSummary != "" {
 			return fmt.Errorf("running status cannot contain terminal metadata")
 		}
 	case EvidenceAuditFailed:
 		if evidenceAuditHasPartialReport(audit) {
 			return fmt.Errorf("failed status cannot contain a partial report")
 		}
-		if audit.FailedAt == "" || strings.TrimSpace(audit.FailureReason) == "" {
-			return fmt.Errorf("failed status requires failed_at and failure_reason")
+		if audit.FailedAt == "" || strings.TrimSpace(audit.FailureCode) == "" ||
+			strings.TrimSpace(audit.FailureSummary) == "" {
+			return fmt.Errorf("failed status requires failed_at, failure_code, and failure_summary")
 		}
 		if audit.CompletedAt != "" {
 			return fmt.Errorf("failed status cannot contain completed_at")
@@ -231,7 +247,7 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 		if audit.StartedAt == "" || audit.CompletedAt == "" || audit.TraceID == "" {
 			return fmt.Errorf("completed status requires started_at, completed_at, and trace_id")
 		}
-		if audit.FailedAt != "" || audit.FailureReason != "" {
+		if audit.FailedAt != "" || audit.FailureCode != "" || audit.FailureSummary != "" {
 			return fmt.Errorf("completed status cannot contain failure metadata")
 		}
 		if audit.OutputHash == "" {
@@ -259,7 +275,7 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 			}
 		}
 	}
-	return nil
+	return validateEvidenceAuditTimeline(audit)
 }
 
 func ComputeEvidenceAuditConfidence(evidence []EvidenceAuditEvidenceRef, conflicts int) float64 {
@@ -267,17 +283,22 @@ func ComputeEvidenceAuditConfidence(evidence []EvidenceAuditEvidenceRef, conflic
 		return 0
 	}
 	resolvable := 0
+	publications := map[string]struct{}{}
 	sourceTypes := map[string]struct{}{}
 	for _, ref := range evidence {
 		if evidenceAuditRefResolvable(ref) {
 			resolvable++
-			sourceTypes[strings.TrimSpace(ref.SourceType)] = struct{}{}
+			if strings.TrimSpace(ref.Role) == EvidenceAuditReleaseSupporting {
+				publications[strings.TrimSpace(ref.PublicationIdentity)] = struct{}{}
+				sourceTypes[strings.TrimSpace(ref.SourceType)] = struct{}{}
+			}
 		}
 	}
 	completeness := float64(resolvable) / float64(len(evidence))
-	independence := math.Min(float64(len(sourceTypes))/2, 1)
+	independence := math.Min(float64(len(publications))/2, 1)
+	diversity := math.Min(float64(len(sourceTypes))/2, 1)
 	conflictRatio := math.Min(math.Max(float64(conflicts), 0)/float64(len(evidence)), 1)
-	score := completeness * independence * (1 - 0.5*conflictRatio)
+	score := completeness * (0.6*independence + 0.4*diversity) * (1 - 0.5*conflictRatio)
 	score = math.Max(0, math.Min(score, 1))
 	return math.Round(score*100) / 100
 }
@@ -304,13 +325,46 @@ func validateEvidenceAuditInput(input EvidenceAuditInput) error {
 		return fmt.Errorf("releases must pin at least one immutable release")
 	}
 	seenReleases := map[string]struct{}{}
+	primaryCount := 0
+	supportingCount := 0
 	for index, release := range input.Releases {
 		if err := requireContractFields(map[string]string{
-			fmt.Sprintf("releases[%d].release_id", index):   release.ReleaseID,
-			fmt.Sprintf("releases[%d].content_hash", index): release.ContentHash,
-			fmt.Sprintf("releases[%d].source_type", index):  release.SourceType,
+			fmt.Sprintf("releases[%d].release_id", index):           release.ReleaseID,
+			fmt.Sprintf("releases[%d].content_hash", index):         release.ContentHash,
+			fmt.Sprintf("releases[%d].role", index):                 release.Role,
+			fmt.Sprintf("releases[%d].source_type", index):          release.SourceType,
+			fmt.Sprintf("releases[%d].publication_identity", index): release.PublicationIdentity,
 		}); err != nil {
 			return err
+		}
+		switch release.Role {
+		case EvidenceAuditReleasePrimary:
+			primaryCount++
+		case EvidenceAuditReleaseSupporting:
+			supportingCount++
+		default:
+			return fmt.Errorf("releases[%d].role must be primary or supporting", index)
+		}
+		if !validEvidenceAuditSHA256(release.PublicationIdentity) {
+			return fmt.Errorf("releases[%d].publication_identity must be an immutable sha256 identity", index)
+		}
+		if len(release.Citations) == 0 {
+			return fmt.Errorf("releases[%d].citations must pin at least one citation binding", index)
+		}
+		seenCitations := map[string]struct{}{}
+		for citationIndex, citation := range release.Citations {
+			if err := requireContractFields(map[string]string{
+				fmt.Sprintf("releases[%d].citations[%d].citation_id", index, citationIndex): citation.CitationID,
+				fmt.Sprintf("releases[%d].citations[%d].claim_id", index, citationIndex):    citation.ClaimID,
+				fmt.Sprintf("releases[%d].citations[%d].chunk_id", index, citationIndex):    citation.ChunkID,
+			}); err != nil {
+				return err
+			}
+			citationID := strings.TrimSpace(citation.CitationID)
+			if _, duplicate := seenCitations[citationID]; duplicate {
+				return fmt.Errorf("releases[%d].citations contains duplicate citation_id %q", index, citationID)
+			}
+			seenCitations[citationID] = struct{}{}
 		}
 		releaseID := strings.TrimSpace(release.ReleaseID)
 		if _, duplicate := seenReleases[releaseID]; duplicate {
@@ -318,21 +372,36 @@ func validateEvidenceAuditInput(input EvidenceAuditInput) error {
 		}
 		seenReleases[releaseID] = struct{}{}
 	}
+	if primaryCount != 1 || supportingCount == 0 {
+		return fmt.Errorf("releases must contain exactly one primary and at least one supporting release")
+	}
 	if len(input.SelectedClaims) == 0 || len(input.SelectedClaims) > agentEvidenceMaxClaims {
 		return fmt.Errorf("selected_claims must contain between 1 and %d claims", agentEvidenceMaxClaims)
+	}
+	seenClaims := map[string]struct{}{}
+	for _, claim := range input.SelectedClaims {
+		if _, duplicate := seenClaims[claim]; duplicate {
+			return fmt.Errorf("selected_claims contains duplicate claim %q", claim)
+		}
+		seenClaims[claim] = struct{}{}
 	}
 	return nil
 }
 
 func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
-	if len(audit.ClaimAudits) == 0 || len(audit.ClaimAudits) > agentEvidenceMaxClaims {
-		return fmt.Errorf("claim_audits must contain between 1 and %d claims", agentEvidenceMaxClaims)
+	if len(audit.ClaimAudits) != len(audit.SelectedClaims) {
+		return fmt.Errorf("claim_audits must match selected_claims exactly")
 	}
 	pinnedReleases := make(map[string]EvidenceAuditReleaseRef, len(audit.Releases))
 	for _, release := range audit.Releases {
 		pinnedReleases[release.ReleaseID] = release
 	}
 	actualCounts := map[string]int{}
+	selectedClaims := make(map[string]struct{}, len(audit.SelectedClaims))
+	for _, selected := range audit.SelectedClaims {
+		selectedClaims[strings.TrimSpace(selected)] = struct{}{}
+	}
+	seenClaims := make(map[string]struct{}, len(audit.ClaimAudits))
 	for index, claim := range audit.ClaimAudits {
 		if err := requireContractFields(map[string]string{
 			fmt.Sprintf("claim_audits[%d].source_claim", index):         claim.SourceClaim,
@@ -341,6 +410,14 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 		}); err != nil {
 			return err
 		}
+		sourceClaim := strings.TrimSpace(claim.SourceClaim)
+		if _, selected := selectedClaims[sourceClaim]; !selected {
+			return fmt.Errorf("claim_audits[%d].source_claim must belong to selected_claims", index)
+		}
+		if _, duplicate := seenClaims[sourceClaim]; duplicate {
+			return fmt.Errorf("claim_audits must match selected_claims without duplicates")
+		}
+		seenClaims[sourceClaim] = struct{}{}
 		switch claim.Verdict {
 		case EvidenceAuditVerdictSupported, EvidenceAuditVerdictContradicted, EvidenceAuditVerdictMixed:
 			if len(claim.Evidence) == 0 {
@@ -373,6 +450,13 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 					evidenceIndex,
 				)
 			}
+			if strings.TrimSpace(ref.Role) != release.Role {
+				return fmt.Errorf(
+					"claim_audits[%d].evidence_refs[%d] role does not match pinned release",
+					index,
+					evidenceIndex,
+				)
+			}
 			if strings.TrimSpace(ref.SourceType) != release.SourceType {
 				return fmt.Errorf(
 					"claim_audits[%d].evidence_refs[%d] source_type does not match pinned release",
@@ -380,9 +464,16 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 					evidenceIndex,
 				)
 			}
-			if !evidenceAuditReleaseAllowsCitation(release, ref.CitationID) {
+			if strings.TrimSpace(ref.PublicationIdentity) != release.PublicationIdentity {
 				return fmt.Errorf(
-					"claim_audits[%d].evidence_refs[%d] must reference a pinned citation from release %q",
+					"claim_audits[%d].evidence_refs[%d] publication_identity does not match pinned release",
+					index,
+					evidenceIndex,
+				)
+			}
+			if !evidenceAuditReleaseAllowsCitation(release, ref) {
+				return fmt.Errorf(
+					"claim_audits[%d].evidence_refs[%d] citation binding must match pinned citation from release %q",
 					index,
 					evidenceIndex,
 					release.ReleaseID,
@@ -415,20 +506,35 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 func evidenceAuditRefResolvable(ref EvidenceAuditEvidenceRef) bool {
 	if strings.TrimSpace(ref.ReleaseID) == "" ||
 		strings.TrimSpace(ref.ContentHash) == "" ||
-		strings.TrimSpace(ref.SourceType) == "" {
+		strings.TrimSpace(ref.Role) == "" ||
+		strings.TrimSpace(ref.SourceType) == "" ||
+		strings.TrimSpace(ref.PublicationIdentity) == "" ||
+		strings.TrimSpace(ref.CitationID) == "" ||
+		strings.TrimSpace(ref.ClaimID) == "" ||
+		strings.TrimSpace(ref.ChunkID) == "" {
 		return false
 	}
-	return strings.TrimSpace(ref.CitationID) != ""
+	return validEvidenceAuditSHA256(ref.PublicationIdentity)
 }
 
-func evidenceAuditReleaseAllowsCitation(release EvidenceAuditReleaseRef, citationID string) bool {
-	citationID = strings.TrimSpace(citationID)
-	for _, allowed := range release.CitationIDs {
-		if strings.TrimSpace(allowed) == citationID {
+func evidenceAuditReleaseAllowsCitation(release EvidenceAuditReleaseRef, ref EvidenceAuditEvidenceRef) bool {
+	for _, allowed := range release.Citations {
+		if strings.TrimSpace(allowed.CitationID) == strings.TrimSpace(ref.CitationID) &&
+			strings.TrimSpace(allowed.ClaimID) == strings.TrimSpace(ref.ClaimID) &&
+			strings.TrimSpace(allowed.ChunkID) == strings.TrimSpace(ref.ChunkID) {
 			return true
 		}
 	}
 	return false
+}
+
+func validEvidenceAuditSHA256(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
 }
 
 func evidenceAuditHasPartialReport(audit EvidenceAudit) bool {
@@ -445,7 +551,7 @@ func evidenceAuditHasPartialReport(audit EvidenceAudit) bool {
 func normalizeEvidenceAuditInput(input EvidenceAuditInput) (EvidenceAuditInput, error) {
 	input.Releases = append([]EvidenceAuditReleaseRef(nil), input.Releases...)
 	for index := range input.Releases {
-		input.Releases[index].CitationIDs = append([]string(nil), input.Releases[index].CitationIDs...)
+		input.Releases[index].Citations = append([]EvidenceAuditCitationRef(nil), input.Releases[index].Citations...)
 	}
 	input.InputHash = ""
 	input.SchemaVersion = strings.TrimSpace(input.SchemaVersion)
@@ -464,8 +570,26 @@ func normalizeEvidenceAuditInput(input EvidenceAuditInput) (EvidenceAuditInput, 
 	for index := range input.Releases {
 		input.Releases[index].ReleaseID = strings.TrimSpace(input.Releases[index].ReleaseID)
 		input.Releases[index].ContentHash = strings.TrimSpace(input.Releases[index].ContentHash)
+		input.Releases[index].Role = strings.TrimSpace(input.Releases[index].Role)
 		input.Releases[index].SourceType = strings.TrimSpace(input.Releases[index].SourceType)
-		input.Releases[index].CitationIDs = normalizeEvidenceAuditStrings(input.Releases[index].CitationIDs, true)
+		input.Releases[index].PublicationIdentity = strings.TrimSpace(input.Releases[index].PublicationIdentity)
+		for citationIndex := range input.Releases[index].Citations {
+			citation := &input.Releases[index].Citations[citationIndex]
+			citation.CitationID = strings.TrimSpace(citation.CitationID)
+			citation.ClaimID = strings.TrimSpace(citation.ClaimID)
+			citation.ChunkID = strings.TrimSpace(citation.ChunkID)
+		}
+		sort.Slice(input.Releases[index].Citations, func(i, j int) bool {
+			left := input.Releases[index].Citations[i]
+			right := input.Releases[index].Citations[j]
+			if left.CitationID != right.CitationID {
+				return left.CitationID < right.CitationID
+			}
+			if left.ClaimID != right.ClaimID {
+				return left.ClaimID < right.ClaimID
+			}
+			return left.ChunkID < right.ChunkID
+		})
 	}
 	sort.Slice(input.Releases, func(i, j int) bool {
 		return input.Releases[i].ReleaseID < input.Releases[j].ReleaseID
@@ -507,6 +631,38 @@ func auditInputFromAudit(audit EvidenceAudit) EvidenceAuditInput {
 func validateEvidenceAuditTimestamp(name, value string) error {
 	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
 		return fmt.Errorf("%s must be RFC3339: %w", name, err)
+	}
+	return nil
+}
+
+func validateEvidenceAuditTimeline(audit EvidenceAudit) error {
+	created, _ := time.Parse(time.RFC3339Nano, audit.CreatedAt)
+	updated, _ := time.Parse(time.RFC3339Nano, audit.UpdatedAt)
+	if updated.Before(created) {
+		return fmt.Errorf("invalid timestamp order: updated_at precedes created_at")
+	}
+	var started time.Time
+	if audit.StartedAt != "" {
+		started, _ = time.Parse(time.RFC3339Nano, audit.StartedAt)
+		if started.Before(created) || updated.Before(started) {
+			return fmt.Errorf("invalid timestamp order: started_at must be between created_at and updated_at")
+		}
+	}
+	if audit.CompletedAt != "" {
+		completed, _ := time.Parse(time.RFC3339Nano, audit.CompletedAt)
+		if started.IsZero() || completed.Before(started) || updated.Before(completed) {
+			return fmt.Errorf("invalid timestamp order: completed_at must be between started_at and updated_at")
+		}
+	}
+	if audit.FailedAt != "" {
+		failed, _ := time.Parse(time.RFC3339Nano, audit.FailedAt)
+		lowerBound := created
+		if !started.IsZero() {
+			lowerBound = started
+		}
+		if failed.Before(lowerBound) || updated.Before(failed) {
+			return fmt.Errorf("invalid timestamp order: failed_at must follow lifecycle start and not exceed updated_at")
+		}
 	}
 	return nil
 }
