@@ -1,6 +1,6 @@
 # Health Evidence Review Workspace v2 Dossier
 
-**Status:** IMPLEMENTED — G3/G4 PASS; feature branch pushed; deploy not attempted
+**Status:** COMPLETE — G1-G6 PASS; production KBase deployed and verified
 
 ## S0 · User request
 
@@ -153,10 +153,121 @@ Decision: PASS.
 
 Decision: PASS.
 
-## G5/G6
+## Main integration and deployment authorization
 
-Not attempted. Deployment requires push/integration and must happen only from a
-clean main branch after the user authorizes the release path.
+- User requested deployment after the feature branch was pushed.
+- Deployment did not proceed from the feature branch because remote
+  `dedao-kbase/main` had advanced to
+  `6f35cbb097ff2a687387d3d4373dc0b0361a60d0`.
+- Created clean integration worktree branch
+  `deploy/health-review-workspace-v2` from `dedao-kbase/main`.
+- Merged `dedao-kbase/codex/health-review-workspace-v2` with no conflicts:
+  `0a4adbb feat(kbase): merge health review queue`.
+- `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Initial merged-main `bash scripts/system-map-smoke.sh` failed because
+  concurrent main changes moved generated source line numbers.
+- Regenerated `docs/_generated/system-map.json`; `bash scripts/system-map-smoke.sh`
+  — PASS.
+- Committed the generated map sync:
+  `93ba05a docs(kbase): refresh deploy system map`.
+- `npm install` in the clean main worktree — PASS; npm reported existing audit
+  findings: 1 low, 6 moderate, 9 high.
+- `npm run build` from `frontend/` — PASS; Vite reported existing eval/chunk
+  size warnings.
+- `go test ./backend/app -run 'KnowledgeOperations' -count=1` — PASS.
+- `node --check frontend-web/app.js` — PASS.
+- `node frontend-web/scripts/knowledge-operations-console-smoke.mjs` — PASS.
+- `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- Sandboxed `go test ./... -timeout=180s` failed on environment restrictions:
+  local `httptest` port binding, DNS, and macOS keychain access.
+- Non-sandbox rerun:
+  `go test ./... -timeout=180s` — PASS.
+- `git push dedao-kbase HEAD:main` fast-forwarded main from `6f35cbb` to
+  `93ba05a`.
+
+## Deployment cache-bust hardening
+
+- Pre-deploy static check found `frontend-web/index.html` still referenced
+  `20260721-audio-detail` while this release changed `/app.js` and
+  `/styles.css`.
+- RED: `node frontend-web/scripts/knowledge-operations-console-smoke.mjs`
+  failed with `index.html should bust cache for health review queue assets`.
+- Updated `frontend-web/index.html` to
+  `20260722-health-review-queue`.
+- `book-knowledge-web-smoke` then failed because it still expected the previous
+  cache version. Updated it to the new release version.
+- GREEN:
+  `set -e; node frontend-web/scripts/knowledge-operations-console-smoke.mjs; node frontend-web/scripts/book-knowledge-web-smoke.mjs; node --check frontend-web/app.js; bash scripts/privacy-smoke.sh; git diff --check`
+  — PASS.
+- Committed:
+  `7dfe2a8 fix(kbase): refresh health review assets`.
+- `git push dedao-kbase HEAD:main` fast-forwarded main from `93ba05a` to
+  `7dfe2a8`.
+
+## G5 · Deployment Health Gate
+
+Decision: PASS.
+
+- Deployed exact clean-main revision:
+  `7dfe2a884e0ab51c9883a793c3381cee797d48ca`.
+- Local release archive:
+  `/private/tmp/kbase-release-7dfe2a8.tar.gz`.
+- Release archive SHA-256:
+  `4721db3143031ada08b389e6eeda08d3d1dd50554ab1df927e1c0449ac30a019`.
+- Production preflight before rollout:
+  `systemctl is-active dedao-kbase` — `active`;
+  `ExecMainStatus=0`; `NRestarts=0`;
+  local `/health` returned `{"ok":true,"service":"dedao-kbase"}`;
+  `/opt/go-toolchains/go1.23.0/bin/go version` returned
+  `go version go1.23.0 linux/amd64`.
+- Server-side release preflight in `/tmp/kbase-release-7dfe2a8`:
+  `node --check frontend-web/app.js` — PASS;
+  all `frontend-web/scripts/*smoke*.mjs` — PASS;
+  `/opt/go-toolchains/go1.23.0/bin/go test ./... -timeout=180s` — PASS.
+- Server-side Linux CGO build:
+  `CGO_ENABLED=1 /opt/go-toolchains/go1.23.0/bin/go build -trimpath -o /tmp/kbase-server-7dfe2a8 ./cmd/kbase-server`
+  — PASS.
+- Production binary SHA-256:
+  `b52d9e85ed68943bbdc235c5365bf89734dafe6c99f90e3d8e7bbc5ed1549b4a`.
+- Deployment replaced only:
+  `/opt/dedao-kbase/bin/kbase-server` and
+  `/opt/dedao-kbase/frontend-web`.
+- KBase data, artifact, and secret directories were not touched.
+- Backups:
+  `/opt/dedao-kbase/bin/kbase-server.backup-7dfe2a8-20260723112116`;
+  `/opt/dedao-kbase/frontend-web.backup-7dfe2a8-20260723112116`.
+- Post-rollout checks:
+  deployed binary hash matched
+  `b52d9e85ed68943bbdc235c5365bf89734dafe6c99f90e3d8e7bbc5ed1549b4a`;
+  `systemctl is-active dedao-kbase` — `active`;
+  `ExecMainStatus=0`; `NRestarts=0`;
+  local `/health` returned `{"ok":true,"service":"dedao-kbase"}`.
+
+## G6 · Online Verification Gate
+
+Decision: PASS.
+
+- Public `https://kbase.executor.life/health` returned
+  `{"ok":true,"service":"dedao-kbase"}`.
+- Public `https://health.executor.life/api/v1/health` returned healthy with
+  API, database, Redis, and Celery connected.
+- Local deployed `/operations` references
+  `20260722-health-review-queue`.
+- Local deployed `/app.js` contains `health_review_queue` and
+  `Health Evidence Review Queue`.
+- Local deployed `/styles.css` contains `knowledge-operations__queue`.
+- Authenticated production
+  `GET /api/knowledge/operations?limit=5` returned
+  `schema=knowledge_operations.v1`, `total=5`, `items=5`, and
+  `queue=0`.
+- Authenticated dangerous replay probe with action `publish` returned HTTP
+  `409` and contained `not allowed`.
+- Authenticated safe replay planning probe with action `evaluate_quality`
+  returned HTTP `200`, `status=planned`, and `mutated=false`.
+- `systemctl is-active dedao-kbase` remained `active`;
+  `ExecMainStatus=0`; `NRestarts=0`.
+- `journalctl -u dedao-kbase --since "5 minutes ago"` contained no
+  `panic|fatal|error|failed` lines.
 
 ## Push
 
