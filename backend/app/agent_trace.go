@@ -29,22 +29,28 @@ const (
 )
 
 type AgentTrace struct {
-	SchemaVersion  string                   `json:"schema_version"`
-	TraceID        string                   `json:"trace_id"`
-	Package        AgentTracePackageRef     `json:"package"`
-	Releases       []AgentTraceReleaseRef   `json:"releases"`
-	RetrievalRoute AgentTraceRetrievalRoute `json:"retrieval_route"`
-	Retrievals     []AgentTraceRetrieval    `json:"retrievals"`
-	ModelRoute     AgentTraceModelRoute     `json:"model_route"`
-	ToolCalls      []AgentTraceToolCall     `json:"tool_calls"`
-	Final          AgentTraceFinal          `json:"final"`
-	StartedAt      string                   `json:"started_at"`
-	CompletedAt    string                   `json:"completed_at"`
+	SchemaVersion  string                      `json:"schema_version"`
+	TraceID        string                      `json:"trace_id"`
+	Package        AgentTracePackageRef        `json:"package"`
+	Releases       []AgentTraceReleaseRef      `json:"releases"`
+	RetrievalRoute AgentTraceRetrievalRoute    `json:"retrieval_route"`
+	Retrievals     []AgentTraceRetrieval       `json:"retrievals"`
+	ModelRoute     AgentTraceModelRoute        `json:"model_route"`
+	ToolCalls      []AgentTraceToolCall        `json:"tool_calls"`
+	Final          AgentTraceFinal             `json:"final"`
+	StartedAt      string                      `json:"started_at"`
+	CompletedAt    string                      `json:"completed_at"`
+	EvidenceAudit  *AgentTraceEvidenceAuditRef `json:"evidence_audit,omitempty"`
 
 	Credentials    string   `json:"-"`
 	SourceBodies   []string `json:"-"`
 	PrivatePrompt  string   `json:"-"`
 	ConsumerUserID string   `json:"-"`
+}
+
+type AgentTraceEvidenceAuditRef struct {
+	AuditID   string `json:"audit_id"`
+	InputHash string `json:"input_hash"`
 }
 
 type AgentTraceRetrievalRoute struct {
@@ -159,6 +165,15 @@ func ValidateAgentTrace(trace AgentTrace) error {
 	}
 	if err := validateAgentSHA256("final.response_fingerprint", trace.Final.ResponseFingerprint); err != nil {
 		return err
+	}
+	if trace.EvidenceAudit != nil {
+		if strings.TrimSpace(trace.EvidenceAudit.AuditID) == "" ||
+			!agentPackageIDPattern.MatchString(trace.EvidenceAudit.AuditID) {
+			return fmt.Errorf("evidence_audit.audit_id must be a URL-safe identifier")
+		}
+		if err := validateAgentSHA256("evidence_audit.input_hash", trace.EvidenceAudit.InputHash); err != nil {
+			return err
+		}
 	}
 	switch trace.RetrievalRoute.Strategy {
 	case "lexical", "graph":

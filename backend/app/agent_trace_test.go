@@ -122,6 +122,33 @@ func TestAgentTraceRejectsIncompleteOrUnsafeRuntimeRecords(t *testing.T) {
 	}
 }
 
+func TestAgentTraceEvidenceAuditPersistsOnlyBoundedIdentity(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	trace := agentTraceTestTrace()
+	trace.EvidenceAudit = &AgentTraceEvidenceAuditRef{
+		AuditID:   "audit-test",
+		InputHash: "sha256:" + strings.Repeat("7", 64),
+	}
+	trace.PrivatePrompt = "private-evidence-audit-prompt"
+	trace.SourceBodies = []string{"private-evidence-body"}
+	if err := store.SaveAgentTrace(trace); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(store.AgentTracePath(trace.TraceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"audit_id": "audit-test"`) ||
+		strings.Contains(string(payload), "private-evidence-audit-prompt") ||
+		strings.Contains(string(payload), "private-evidence-body") {
+		t.Fatalf("evidence audit trace payload = %s", payload)
+	}
+	loaded, err := store.LoadAgentTrace(trace.TraceID)
+	if err != nil || loaded.EvidenceAudit == nil || loaded.EvidenceAudit.AuditID != "audit-test" {
+		t.Fatalf("loaded evidence audit trace = %#v err=%v", loaded, err)
+	}
+}
+
 func TestReplayAgentTraceIsDeterministicOverStoredEvidenceAndMockResults(t *testing.T) {
 	trace := agentTraceTestTrace()
 	fixture := AgentReplayFixture{
