@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 for (const marker of [
   "knowledgeOperationsState",
@@ -27,5 +28,6 @@ for (const marker of [
 }
 
 assert.ok(css.includes(".knowledge-operations"), "styles.css should include operations styles");
+assert.ok(html.includes("20260722-health-review-queue"), "index.html should bust cache for health review queue assets");
 assert.ok(!js.includes("health_serving_promote</button>"), "UI must not expose Health serving promotion as a replay button");
 assert.ok(!js.includes("publish</button>"), "UI must not expose publish as safe replay");
