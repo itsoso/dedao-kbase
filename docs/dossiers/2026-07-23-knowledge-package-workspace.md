@@ -2,7 +2,7 @@
 
 ## Status
 
-Ready for production deployment on 2026-07-23.
+Released to production on 2026-07-23.
 
 ## Requirement
 
@@ -58,11 +58,27 @@ instead of silently reporting a false state.
 
 ### G5 - Deployment Health
 
-Pending deployment.
+PASS.
+
+- Release commit: `a7d55c9`
+- Archive SHA-256:
+  `f99038876232600fcef0a94b95ff1bb55c55ba74ced2502798cf298607cbd824`
+- Production frontend backup:
+  `/opt/dedao-kbase/frontend-web.backup-a7d55c9-20260723104744`
+- Server-side syntax and all frontend smoke checks passed before replacement.
+- Local service health returned `{"ok":true,"service":"dedao-kbase"}` after
+  replacement.
 
 ### G6 - Online Verification
 
-Pending deployment.
+PASS.
+
+- Public `https://kbase.executor.life/health` returned successfully.
+- The protected package route returned the expected Nginx Basic Auth `401`
+  without credentials.
+- The installed page contains cache marker
+  `20260723-package-workspace`.
+- The installed stylesheet contains `knowledge-workspace__agent`.
 
 ## Outcome
 
