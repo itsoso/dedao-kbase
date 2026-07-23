@@ -1,6 +1,6 @@
 # Operations Empty-State Diagnostics Dossier
 
-**Status:** IMPLEMENTED — G3/G4 PASS; feature branch pending push
+**Status:** IMPLEMENTED — G3/G4 PASS; feature branch pushed; deploy not attempted
 
 ## S0 · User request
 
@@ -133,6 +133,24 @@ Implementation plan:
 - Privacy smoke and whitespace checks passed immediately before commit.
 
 Decision: PASS.
+
+## Push
+
+- Feature commit:
+  `fe10760 feat(kbase): explain operations queue empty state`.
+- Before push:
+  `bash scripts/privacy-smoke.sh && git diff --check` — PASS.
+- `git status --short` — clean.
+- `git push -u dedao-kbase codex/operations-diagnostics-v3` — PASS.
+- Remote branch:
+  `dedao-kbase/codex/operations-diagnostics-v3`.
+- Pull request URL suggested by GitHub:
+  `https://github.com/itsoso/dedao-kbase/pull/new/codex/operations-diagnostics-v3`.
+
+## G5/G6
+
+Not attempted. Deployment requires clean-main integration, G3/G4 rerun on that
+exact main revision, G5 rollout health, and G6 online verification.
 
 ## G4 · Safety Review Gate
 
