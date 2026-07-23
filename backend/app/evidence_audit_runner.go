@@ -172,9 +172,24 @@ func RunEvidenceAudit(
 		}
 	}
 
-	pkg, releases, runErr := loadEvidenceAuditPackageSnapshotContext(
+	pkg, runErr := loadEvidenceAuditPackageContext(
 		runCtx, store, audit.Package.PackageID, audit.Package.Version,
 	)
+	if runErr == nil && config.Timeout <= 0 && pkg.ModelPolicy.TimeoutMS > 0 {
+		packageDeadline := startedAt.Add(time.Duration(pkg.ModelPolicy.TimeoutMS) * time.Millisecond)
+		if currentDeadline, ok := runCtx.Deadline(); !ok || packageDeadline.Before(currentDeadline) {
+			cancel()
+			runCtx, cancel = context.WithDeadline(ctx, packageDeadline)
+			defer cancel()
+		}
+	}
+	var releases map[string]KnowledgeRelease
+	if runErr == nil {
+		runErr = evidenceAuditRunnerStage(runCtx, "package_loaded")
+	}
+	if runErr == nil {
+		releases, runErr = loadEvidenceAuditReleasesContext(runCtx, store, pkg)
+	}
 	if runErr == nil && pkg.ContentHash != audit.Package.ContentHash {
 		runErr = fmt.Errorf("published package hash changed")
 	}
@@ -183,13 +198,6 @@ func RunEvidenceAudit(
 	}
 	if runErr != nil {
 		return nil, failEvidenceAuditRun(store, *audit, nil, nil, traceID, config, runErr)
-	}
-	if config.Timeout <= 0 && pkg.ModelPolicy.TimeoutMS > 0 {
-		cancel()
-		runCtx, cancel = context.WithDeadline(
-			ctx, startedAt.Add(time.Duration(pkg.ModelPolicy.TimeoutMS)*time.Millisecond),
-		)
-		defer cancel()
 	}
 	if runErr = evidenceAuditRunnerStage(runCtx, "policy"); runErr != nil {
 		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, runErr)
@@ -381,37 +389,70 @@ func loadEvidenceAuditPackageSnapshotContext(
 	store *BookKnowledgeStore,
 	packageID, version string,
 ) (AgentPackage, map[string]KnowledgeRelease, error) {
-	if err := ctx.Err(); err != nil {
-		return AgentPackage{}, nil, err
-	}
-	pkg, err := loadRunnableAgentPackage(store, packageID, version, "evidence")
+	pkg, err := loadEvidenceAuditPackageContext(ctx, store, packageID, version)
 	if err != nil {
 		return AgentPackage{}, nil, err
 	}
-	if err := ctx.Err(); err != nil {
+	releases, err := loadEvidenceAuditReleasesContext(ctx, store, pkg)
+	if err != nil {
 		return AgentPackage{}, nil, err
 	}
+	return pkg, releases, nil
+}
+
+func loadEvidenceAuditPackageContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	packageID, version string,
+) (AgentPackage, error) {
+	if err := ctx.Err(); err != nil {
+		return AgentPackage{}, err
+	}
+	if err := evidenceAuditRunnerStage(ctx, "package_load"); err != nil {
+		return AgentPackage{}, err
+	}
+	pkg, err := loadRunnableAgentPackage(store, packageID, version, "evidence")
+	if err != nil {
+		return AgentPackage{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return AgentPackage{}, err
+	}
 	if pkg.SchemaVersion != AgentPackageSchemaVersionV2 || pkg.EvidencePolicy == nil {
-		return AgentPackage{}, nil, fmt.Errorf("evidence audit requires a published agent-package.v2 with evidence_policy")
+		return AgentPackage{}, fmt.Errorf("evidence audit requires a published agent-package.v2 with evidence_policy")
+	}
+	return *pkg, nil
+}
+
+func loadEvidenceAuditReleasesContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+) (map[string]KnowledgeRelease, error) {
+	if err := evidenceAuditRunnerStage(ctx, "release_load"); err != nil {
+		return nil, err
 	}
 	releases := make(map[string]KnowledgeRelease, len(pkg.Releases))
 	for _, ref := range pkg.Releases {
 		if err := ctx.Err(); err != nil {
-			return AgentPackage{}, nil, err
+			return nil, err
 		}
 		release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
 		if loadErr != nil {
-			return AgentPackage{}, nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
+			return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if agentTraceReleaseContentHash(release.ContentHash) != agentTraceReleaseContentHash(ref.ContentHash) {
-			return AgentPackage{}, nil, fmt.Errorf("pinned release %q content hash changed", ref.ReleaseID)
+			return nil, fmt.Errorf("pinned release %q content hash changed", ref.ReleaseID)
 		}
 		releases[ref.ReleaseID] = *release
 	}
 	if err := ctx.Err(); err != nil {
-		return AgentPackage{}, nil, err
+		return nil, err
 	}
-	return *pkg, releases, nil
+	return releases, nil
 }
 
 func evidenceAuditInputReleaseRefs(
@@ -1183,14 +1224,22 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"patients with", "adults with", "children with", "in adults", "pico",
 		"人群", "群体级", "队列", "受试者", "成年患者", "儿童患者",
 	)
-	personalContext := hasAny(
+	firstPersonContext := hasAny(
 		" i ", " me", " my ", "for me", "should i", "can i", "could i",
 		"right for me", "appropriate for me",
-		"this patient", "the patient", "patient ", "this person", "case ",
-		"year-old", "aged ", "age ",
 		"我", "我的", "给我", "帮我", "本人", "家人", "孩子", "老人", "适合我",
-		"患者", "病例", "个案", "岁", "年龄",
 	)
+	specificPatientContext := hasAny(
+		"this patient", "the patient", "this person", "case ", "year-old",
+		"病例", "个案", "这个患者", "该患者", "这名患者", "岁",
+	) || (strings.Contains(value, "patient ") &&
+		!strings.Contains(value, "patient population") &&
+		!strings.Contains(value, "patients ")) ||
+		(strings.Contains(value, "患者") &&
+			!strings.Contains(value, "成年患者") &&
+			!strings.Contains(value, "儿童患者") &&
+			!strings.Contains(value, "患者人群"))
+	personalContext := firstPersonContext || specificPatientContext
 	diagnosisOrTreatment := hasAny(
 		"diagnos", "treat", "therapy for", "prescri", "medical advice", "what do i have",
 		"do i have", "cure me", "诊断", "治疗", "处方", "看病", "治好", "是什么病",
@@ -1215,7 +1264,7 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"recommend a treatment", "individual treatment", "individual medical advice",
 		"用药建议", "治疗方案", "开药", "给我诊断", "诊断我",
 	)
-	if personalContext && !populationContext && (clinicalContext || decisionRequest) {
+	if personalContext && (clinicalContext || decisionRequest) {
 		return true
 	}
 	if explicitAdvice || (diagnosisOrTreatment && (personalContext || decisionRequest)) ||

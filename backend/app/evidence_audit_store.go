@@ -54,6 +54,9 @@ type EvidenceAuditRecord struct {
 	FailedAt           string `json:"failed_at,omitempty"`
 	FailureCode        string `json:"failure_code,omitempty"`
 	FailureSummary     string `json:"failure_summary,omitempty"`
+	RetryOf            string `json:"retry_of,omitempty"`
+	Attempt            int    `json:"attempt,omitempty"`
+	RequestIdentity    string `json:"request_identity,omitempty"`
 }
 
 type EvidenceAuditIdempotencyRecord struct {
@@ -213,6 +216,108 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 	return &audit, true, nil
 }
 
+func ManualRetryEvidenceAudit(
+	store *BookKnowledgeStore,
+	failedAuditID, authorizationToken, idempotencyKey string,
+	now time.Time,
+) (*EvidenceAudit, bool, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	failedAuditID = strings.TrimSpace(failedAuditID)
+	authorizationToken = strings.TrimSpace(authorizationToken)
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if failedAuditID == "" || authorizationToken == "" || idempotencyKey == "" {
+		return nil, false, fmt.Errorf("failed_audit_id, authorization_token, and idempotency_key are required")
+	}
+	requestIdentity := evidenceAuditOpaqueIdentity(
+		"manual-retry\x00" + failedAuditID + "\x00" + authorizationToken + "\x00" + idempotencyKey,
+	)
+	if now.IsZero() {
+		now = time.Now()
+	}
+	timestamp := evidenceAuditTimestamp(now)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	unlockRoot, err := store.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlockRoot()
+	manifest, err := store.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, identity := range manifest.Idempotency {
+		if identity.IdempotencyIdentity != requestIdentity {
+			continue
+		}
+		audit, loadErr := store.loadEvidenceAuditByIDUnlocked(manifest, identity.AuditID)
+		return audit, false, loadErr
+	}
+	source := findEvidenceAuditRecord(manifest, failedAuditID)
+	if source == nil {
+		return nil, false, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, failedAuditID)
+	}
+	if source.Status != EvidenceAuditFailed || !evidenceAuditFailureAllowsManualRetry(source.FailureCode) {
+		return nil, false, fmt.Errorf(
+			"%w: audit %q failure %q does not allow manual retry",
+			ErrEvidenceAuditStateConflict,
+			failedAuditID,
+			source.FailureCode,
+		)
+	}
+	if len(manifest.Audits) >= evidenceAuditMaxManifestAudits ||
+		len(manifest.Idempotency) >= evidenceAuditMaxManifestIdempotency {
+		return nil, false, fmt.Errorf("evidence audit manifest capacity reached")
+	}
+	attempt := source.Attempt + 1
+	if attempt < 2 {
+		attempt = 2
+	}
+	auditID := fmt.Sprintf(
+		"audit-%s-attempt-%d-%s",
+		strings.TrimPrefix(source.InputHash, "sha256:")[:16],
+		attempt,
+		strings.TrimPrefix(requestIdentity, "sha256:")[:12],
+	)
+	record := EvidenceAuditRecord{
+		AuditID:            auditID,
+		Status:             EvidenceAuditQueued,
+		PackageID:          source.PackageID,
+		PackageVersion:     source.PackageVersion,
+		PackageContentHash: source.PackageContentHash,
+		InputHash:          source.InputHash,
+		CreatedAt:          timestamp,
+		UpdatedAt:          timestamp,
+		RetryOf:            source.AuditID,
+		Attempt:            attempt,
+		RequestIdentity:    requestIdentity,
+	}
+	manifest.Audits = append(manifest.Audits, record)
+	manifest.Idempotency = append(manifest.Idempotency, EvidenceAuditIdempotencyRecord{
+		IdempotencyIdentity: requestIdentity,
+		AuditID:             auditID,
+		InputHash:           source.InputHash,
+	})
+	manifest.UpdatedAt = timestamp
+	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+		return nil, false, err
+	}
+	audit, err := store.loadEvidenceAuditRecordUnlocked(record)
+	return audit, true, err
+}
+
+func evidenceAuditFailureAllowsManualRetry(code string) bool {
+	switch strings.TrimSpace(code) {
+	case "model_outcome_unknown", "requires_manual_retry":
+		return true
+	default:
+		return false
+	}
+}
+
 func StartEvidenceAudit(store *BookKnowledgeStore, auditID, traceID string, now time.Time) (*EvidenceAudit, error) {
 	return updateEvidenceAuditRecord(store, auditID, now, func(record *EvidenceAuditRecord) error {
 		if record.Status != EvidenceAuditQueued {
@@ -321,6 +426,9 @@ func PrepareEvidenceAuditCompletion(store *BookKnowledgeStore, report EvidenceAu
 	report.Scope = input.Scope
 	report.SelectedClaims = input.SelectedClaims
 	report.TraceID = record.TraceID
+	report.RetryOf = record.RetryOf
+	report.Attempt = record.Attempt
+	report.RequestIdentity = record.RequestIdentity
 	report.OutputHash = ""
 	finalized, err := FinalizeEvidenceAuditReport(report)
 	if err != nil {
@@ -404,8 +512,8 @@ func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, 
 }
 
 func (s *BookKnowledgeStore) ListEvidenceAudits(packageID, version string, limit int) ([]EvidenceAuditRecord, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	unlockRoot, err := s.acquireEvidenceAuditRootLock()
 	if err != nil {
 		return nil, err
@@ -414,6 +522,15 @@ func (s *BookKnowledgeStore) ListEvidenceAudits(packageID, version string, limit
 	manifest, err := s.loadEvidenceAuditManifestUnlocked()
 	if err != nil {
 		return nil, err
+	}
+	for index := range manifest.Audits {
+		record := &manifest.Audits[index]
+		if record.Status != EvidenceAuditQueued && record.Status != EvidenceAuditRunning {
+			continue
+		}
+		if err := s.reconcileEvidenceAuditTerminalUnlocked(manifest, record); err != nil {
+			return nil, err
+		}
 	}
 	if limit <= 0 || limit > 200 {
 		limit = 50
@@ -781,28 +898,31 @@ func validateEvidenceAuditManifestCapacity(manifest *EvidenceAuditManifest) erro
 
 func evidenceAuditFromInput(input EvidenceAuditInput, record EvidenceAuditRecord, idempotencyKey string) EvidenceAudit {
 	return EvidenceAudit{
-		SchemaVersion:  input.SchemaVersion,
-		AuditID:        record.AuditID,
-		Status:         record.Status,
-		CreatedAt:      record.CreatedAt,
-		UpdatedAt:      record.UpdatedAt,
-		StartedAt:      record.StartedAt,
-		CompletedAt:    record.CompletedAt,
-		FailedAt:       record.FailedAt,
-		IdempotencyKey: idempotencyKey,
-		InputHash:      record.InputHash,
-		Package:        input.Package,
-		EvidencePolicy: input.EvidencePolicy,
-		Model:          input.Model,
-		Retrieval:      input.Retrieval,
-		Releases:       input.Releases,
-		Subject:        input.Subject,
-		Scope:          input.Scope,
-		SelectedClaims: input.SelectedClaims,
-		OutputHash:     record.OutputHash,
-		TraceID:        record.TraceID,
-		FailureCode:    record.FailureCode,
-		FailureSummary: record.FailureSummary,
+		SchemaVersion:   input.SchemaVersion,
+		AuditID:         record.AuditID,
+		Status:          record.Status,
+		CreatedAt:       record.CreatedAt,
+		UpdatedAt:       record.UpdatedAt,
+		StartedAt:       record.StartedAt,
+		CompletedAt:     record.CompletedAt,
+		FailedAt:        record.FailedAt,
+		IdempotencyKey:  idempotencyKey,
+		InputHash:       record.InputHash,
+		Package:         input.Package,
+		EvidencePolicy:  input.EvidencePolicy,
+		Model:           input.Model,
+		Retrieval:       input.Retrieval,
+		Releases:        input.Releases,
+		Subject:         input.Subject,
+		Scope:           input.Scope,
+		SelectedClaims:  input.SelectedClaims,
+		OutputHash:      record.OutputHash,
+		TraceID:         record.TraceID,
+		FailureCode:     record.FailureCode,
+		FailureSummary:  record.FailureSummary,
+		RetryOf:         record.RetryOf,
+		Attempt:         record.Attempt,
+		RequestIdentity: record.RequestIdentity,
 	}
 }
 

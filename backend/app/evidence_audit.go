@@ -36,31 +36,34 @@ const (
 )
 
 type EvidenceAudit struct {
-	SchemaVersion  string                           `json:"schema_version"`
-	AuditID        string                           `json:"audit_id"`
-	Status         string                           `json:"status"`
-	CreatedAt      string                           `json:"created_at"`
-	UpdatedAt      string                           `json:"updated_at"`
-	StartedAt      string                           `json:"started_at,omitempty"`
-	CompletedAt    string                           `json:"completed_at,omitempty"`
-	FailedAt       string                           `json:"failed_at,omitempty"`
-	IdempotencyKey string                           `json:"idempotency_key"`
-	InputHash      string                           `json:"input_hash"`
-	Package        EvidenceAuditPackageRef          `json:"package"`
-	EvidencePolicy EvidenceAuditPolicySnapshot      `json:"evidence_policy"`
-	Model          EvidenceAuditModelIdentity       `json:"model"`
-	Retrieval      EvidenceAuditRetrievalIdentity   `json:"retrieval"`
-	Releases       []EvidenceAuditReleaseRef        `json:"releases"`
-	Subject        string                           `json:"subject"`
-	Scope          string                           `json:"scope"`
-	SelectedClaims []string                         `json:"selected_claims"`
-	ClaimAudits    []EvidenceAuditClaim             `json:"claim_audits,omitempty"`
-	Summary        EvidenceAuditSummary             `json:"summary,omitempty"`
-	Proofroom      EvidenceAuditProofroomProjection `json:"proofroom_projection,omitempty"`
-	OutputHash     string                           `json:"output_hash,omitempty"`
-	TraceID        string                           `json:"trace_id,omitempty"`
-	FailureCode    string                           `json:"failure_code,omitempty"`
-	FailureSummary string                           `json:"failure_summary,omitempty"`
+	SchemaVersion   string                           `json:"schema_version"`
+	AuditID         string                           `json:"audit_id"`
+	Status          string                           `json:"status"`
+	CreatedAt       string                           `json:"created_at"`
+	UpdatedAt       string                           `json:"updated_at"`
+	StartedAt       string                           `json:"started_at,omitempty"`
+	CompletedAt     string                           `json:"completed_at,omitempty"`
+	FailedAt        string                           `json:"failed_at,omitempty"`
+	IdempotencyKey  string                           `json:"idempotency_key"`
+	InputHash       string                           `json:"input_hash"`
+	Package         EvidenceAuditPackageRef          `json:"package"`
+	EvidencePolicy  EvidenceAuditPolicySnapshot      `json:"evidence_policy"`
+	Model           EvidenceAuditModelIdentity       `json:"model"`
+	Retrieval       EvidenceAuditRetrievalIdentity   `json:"retrieval"`
+	Releases        []EvidenceAuditReleaseRef        `json:"releases"`
+	Subject         string                           `json:"subject"`
+	Scope           string                           `json:"scope"`
+	SelectedClaims  []string                         `json:"selected_claims"`
+	ClaimAudits     []EvidenceAuditClaim             `json:"claim_audits,omitempty"`
+	Summary         EvidenceAuditSummary             `json:"summary,omitempty"`
+	Proofroom       EvidenceAuditProofroomProjection `json:"proofroom_projection,omitempty"`
+	OutputHash      string                           `json:"output_hash,omitempty"`
+	TraceID         string                           `json:"trace_id,omitempty"`
+	FailureCode     string                           `json:"failure_code,omitempty"`
+	FailureSummary  string                           `json:"failure_summary,omitempty"`
+	RetryOf         string                           `json:"retry_of,omitempty"`
+	Attempt         int                              `json:"attempt,omitempty"`
+	RequestIdentity string                           `json:"request_identity,omitempty"`
 }
 
 type EvidenceAuditInput struct {
@@ -212,12 +215,14 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 		return err
 	}
 	for name, value := range map[string]string{
-		"audit_id":        audit.AuditID,
-		"status":          audit.Status,
-		"idempotency_key": audit.IdempotencyKey,
-		"input_hash":      audit.InputHash,
-		"trace_id":        audit.TraceID,
-		"failure_code":    audit.FailureCode,
+		"audit_id":         audit.AuditID,
+		"status":           audit.Status,
+		"idempotency_key":  audit.IdempotencyKey,
+		"input_hash":       audit.InputHash,
+		"trace_id":         audit.TraceID,
+		"failure_code":     audit.FailureCode,
+		"retry_of":         audit.RetryOf,
+		"request_identity": audit.RequestIdentity,
 	} {
 		if err := validateEvidenceAuditString(name, value, evidenceAuditMaxIdentifierBytes); err != nil {
 			return err
@@ -238,6 +243,21 @@ func ValidateEvidenceAudit(audit EvidenceAudit) error {
 	}
 	if err := validateEvidenceAuditInput(auditInputFromAudit(audit)); err != nil {
 		return err
+	}
+	if audit.RetryOf == "" {
+		if audit.Attempt != 0 || audit.RequestIdentity != "" {
+			return fmt.Errorf("non-retry audit cannot contain retry metadata")
+		}
+	} else {
+		if audit.Attempt < 2 || strings.TrimSpace(audit.RequestIdentity) == "" {
+			return fmt.Errorf("retry audit requires retry_of, attempt >= 2, and request_identity")
+		}
+		if audit.RetryOf == audit.AuditID {
+			return fmt.Errorf("retry_of cannot reference the audit itself")
+		}
+		if !validEvidenceAuditSHA256(audit.RequestIdentity) {
+			return fmt.Errorf("request_identity must be a sha256 digest")
+		}
 	}
 	wantInputHash, err := EvidenceAuditInputHash(auditInputFromAudit(audit))
 	if err != nil {

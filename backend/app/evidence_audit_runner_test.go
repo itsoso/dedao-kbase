@@ -280,6 +280,98 @@ func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
 	}
 }
 
+func TestEvidenceAuditRunnerRejectsIndividualDecisionsDespitePopulationPrefixes(t *testing.T) {
+	for _, scope := range []string{
+		"Population-level PICO: should this patient undergo surgery?",
+		"Clinical trial evidence for adults: should patient John stop aspirin?",
+		"群体级PICO：患者张三是否应该做手术？",
+		"人群证据比较：这个 62 岁病例要不要停药？",
+	} {
+		if !evidenceAuditRequestsMedicalAdvice(scope) {
+			t.Fatalf("individual decision was not rejected: %q", scope)
+		}
+	}
+	for _, scope := range []string{
+		"Population-level PICO: does surgery improve survival in adults?",
+		"群体级PICO：手术是否改善成年患者五年生存率？",
+	} {
+		if evidenceAuditRequestsMedicalAdvice(scope) {
+			t.Fatalf("population evidence question was rejected: %q", scope)
+		}
+	}
+}
+
+func TestEvidenceAuditRunnerTimeoutCoversPackageAndReleaseLoading(t *testing.T) {
+	t.Run("explicit timeout interrupts package load", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-package-load-timeout", "Evidence comparison only.")
+		previous := evidenceAuditRuntimeStageHook
+		evidenceAuditRuntimeStageHook = func(ctx context.Context, stage string) error {
+			if stage == "package_load" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		}
+		t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+		cfg := evidenceAuditRunnerConfig()
+		cfg.Timeout = 10 * time.Millisecond
+		client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+		if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, cfg); err == nil {
+			t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+		}
+		if len(client.calls) != 0 {
+			t.Fatal("model called after package load timeout")
+		}
+	})
+
+	t.Run("package deadline counts release load from original start", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		pkg.Version = "2.0.1-short-timeout"
+		pkg.ModelPolicy.TimeoutMS = 5
+		pkg.ContentHash = ""
+		pkg, err := FinalizeAgentPackage(pkg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		savePassingAgentPackageTestEvaluation(t, store, pkg)
+		published, _, err := PublishAgentPackage(
+			store, pkg, "publish-short-timeout", AgentReadOnlyToolIDs(), testAgentPackageTime(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input, err := PrepareEvidenceAuditInput(
+			store, published.PackageID, published.Version, "Clinical trial evidence", "Evidence comparison only.",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		audit, _, err := CreateEvidenceAudit(store, input, "runner-release-load-timeout", testAgentPackageTime())
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous := evidenceAuditRuntimeStageHook
+		evidenceAuditRuntimeStageHook = func(ctx context.Context, stage string) error {
+			if stage == "release_load" {
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			return nil
+		}
+		t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+		client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+		cfg := evidenceAuditRunnerConfig()
+		cfg.Timeout = 0
+		if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, cfg); err == nil {
+			t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+		}
+		if len(client.calls) != 0 {
+			t.Fatal("model called after package deadline expired")
+		}
+	})
+}
+
 func TestEvidenceAuditRunnerFailsClosedWhenLaterClaimModelOutcomeIsUnknown(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
 	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-claim-checkpoint", "Evidence comparison only.")

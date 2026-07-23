@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -855,5 +856,124 @@ func TestEvidenceAuditStoreListOrderingAndManifestPrivacyAreStable(t *testing.T)
 	}
 	if len(temporary) != 0 {
 		t.Fatalf("atomic writes left temporary files: %v", temporary)
+	}
+}
+
+func TestManualRetryEvidenceAuditCreatesImmutableIdempotentAttempt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := NewBookKnowledgeStore(t.TempDir())
+	input := validEvidenceAuditInput()
+	original, _, err := CreateEvidenceAudit(store, input, "original-request", testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, original.AuditID, "trace-original", testAgentPackageTime().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FailEvidenceAudit(
+		store,
+		original.AuditID,
+		"model_outcome_unknown",
+		"requires manual retry",
+		testAgentPackageTime().Add(2*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	retry, created, err := ManualRetryEvidenceAudit(
+		store,
+		original.AuditID,
+		"human-authorization-token",
+		"manual-retry-request",
+		testAgentPackageTime().Add(3*time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || retry.AuditID == original.AuditID || retry.RetryOf != original.AuditID ||
+		retry.Attempt != 2 || retry.RequestIdentity == "" ||
+		strings.Contains(retry.RequestIdentity, "human-authorization-token") {
+		t.Fatalf("manual retry = %#v created=%v", retry, created)
+	}
+	repeated, created, err := ManualRetryEvidenceAudit(
+		store,
+		original.AuditID,
+		"human-authorization-token",
+		"manual-retry-request",
+		testAgentPackageTime().Add(4*time.Minute),
+	)
+	if err != nil || created || repeated.AuditID != retry.AuditID {
+		t.Fatalf("repeated retry = %#v created=%v err=%v", repeated, created, err)
+	}
+	ordinary, created, err := CreateEvidenceAudit(
+		store, input, "ordinary-create-cannot-bypass", testAgentPackageTime().Add(5*time.Minute),
+	)
+	if err != nil || created || ordinary.AuditID != original.AuditID {
+		t.Fatalf("ordinary create bypassed failed audit: %#v created=%v err=%v", ordinary, created, err)
+	}
+	loadedOriginal, err := store.LoadEvidenceAudit(original.AuditID)
+	if err != nil || loadedOriginal.Status != EvidenceAuditFailed || loadedOriginal.RetryOf != "" {
+		t.Fatalf("original audit mutated: %#v err=%v", loadedOriginal, err)
+	}
+}
+
+func TestManualRetryEvidenceAuditRejectsUnauthorizedOrIneligibleFailures(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := NewBookKnowledgeStore(t.TempDir())
+	input := validEvidenceAuditInput()
+	audit, _, err := CreateEvidenceAudit(store, input, "not-retryable", testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FailEvidenceAudit(
+		store, audit.AuditID, "invalid_model_output", "not manually retryable", testAgentPackageTime().Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, authorization := range []string{"", "human-authorization-token"} {
+		if _, _, err := ManualRetryEvidenceAudit(
+			store, audit.AuditID, authorization, "manual-retry-invalid", testAgentPackageTime().Add(2*time.Minute),
+		); err == nil {
+			t.Fatalf("ManualRetryEvidenceAudit() accepted authorization=%q", authorization)
+		}
+	}
+}
+
+func TestListEvidenceAuditsReconcilesPreparedTerminalState(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(
+		t, store, pkg, "list-terminal-reconcile", "Evidence comparison only.",
+	)
+	originalWriter := writeEvidenceAuditManifestFile
+	failedOnce := false
+	writeEvidenceAuditManifestFile = func(path string, payload []byte) error {
+		if !failedOnce && strings.Contains(string(payload), `"status":"failed"`) {
+			failedOnce = true
+			return errors.New("synthetic terminal manifest failure")
+		}
+		return originalWriter(path, payload)
+	}
+	t.Cleanup(func() { writeEvidenceAuditManifestFile = originalWriter })
+	client := &evidenceAuditFakeClient{answers: []string{`not-json`}}
+	if _, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig(),
+	); err == nil {
+		t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+	}
+	writeEvidenceAuditManifestFile = originalWriter
+	records, err := store.ListEvidenceAudits(pkg.PackageID, pkg.Version, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Status != EvidenceAuditFailed ||
+		records[0].FailureCode != "invalid_model_output" {
+		t.Fatalf("reconciled list = %#v", records)
+	}
+	detail, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detail.Status != records[0].Status || detail.FailureCode != records[0].FailureCode {
+		t.Fatalf("list/detail terminal mismatch: record=%#v detail=%#v", records[0], detail)
 	}
 }
