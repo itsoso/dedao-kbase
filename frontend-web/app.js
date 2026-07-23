@@ -5454,6 +5454,7 @@ function renderKnowledgeOperationsConsole() {
   const dashboard = knowledgeOperationsState.console || {};
   const summary = dashboard.summary || {};
   const items = Array.isArray(dashboard.items) ? dashboard.items : [];
+  const healthReviewDiagnostics = dashboard.health_review_diagnostics || {};
   const healthReviewQueue = Array.isArray(dashboard.health_review_queue) ? dashboard.health_review_queue : [];
   const status = knowledgeOperationsState.loading || knowledgeOperationsState.message || `${Number(summary.total || 0)} packages`;
   const replay = knowledgeOperationsState.replayResult;
@@ -5477,6 +5478,7 @@ function renderKnowledgeOperationsConsole() {
         ${renderKnowledgeOperationsMetric("Health 已拉取", summary.health_published)}
       </section>
       ${renderKnowledgeOperationsHealthReviewQueue(healthReviewQueue)}
+      ${renderKnowledgeOperationsHealthReviewDiagnostics(healthReviewDiagnostics)}
       <section class="knowledge-operations__panel" aria-label="Health Evidence Review Workspace">
         <div class="knowledge-operations__panel-head">
           <div>
@@ -5523,6 +5525,70 @@ function renderKnowledgeOperationsHealthReviewQueue(queue) {
       </div>
     </section>
   `;
+}
+
+function renderKnowledgeOperationsHealthReviewDiagnostics(diagnostics) {
+  const statusCounts = diagnostics.status_counts || {};
+  const blockers = Array.isArray(diagnostics.blockers) ? diagnostics.blockers : [];
+  const actions = Array.isArray(diagnostics.next_safe_actions) ? diagnostics.next_safe_actions : [];
+  const statusRows = Object.entries(statusCounts).map(([status, count]) => `
+    <span class="knowledge-operations__pill">${escapeHTML(status)}: ${Number(count || 0)}</span>
+  `).join("");
+  return `
+    <section class="knowledge-operations__panel" aria-label="Health Queue Diagnostics">
+      <div class="knowledge-operations__panel-head">
+        <div>
+          <p class="web-kicker">Health Queue Diagnostics</p>
+          <h2>为什么没有待审核项？</h2>
+        </div>
+        <small>只显示元数据诊断；这里不会执行发布、Health serving 或外部写入。</small>
+      </div>
+      <div class="knowledge-operations__diagnostics">
+        <article>
+          <strong>${escapeHTML(knowledgeOperationsDiagnosticReasonLabel(diagnostics.queue_empty_reason || "unknown"))}</strong>
+          <small>${escapeHTML(diagnostics.queue_empty_reason || "unknown")}</small>
+          <div class="knowledge-operations__pills">${statusRows || `<span class="knowledge-operations__pill">无 Health readiness 命中</span>`}</div>
+        </article>
+        <article>
+          <strong>安全下一步</strong>
+          ${actions.length ? actions.map((action) => `
+            <div class="knowledge-operations__diagnostic-action" data-knowledge-health-diagnostic-action="${escapeAttribute(action.action || "")}">
+              <span>${escapeHTML(action.label || action.action || "inspect_status")}</span>
+              <small>${escapeHTML(action.action || "inspect_status")}${action.count ? ` · ${Number(action.count)} 项` : ""}</small>
+            </div>
+          `).join("") : `<p class="knowledge-operations__empty">暂无建议动作。</p>`}
+        </article>
+        <article>
+          <strong>阻断分类</strong>
+          ${blockers.length ? blockers.map((blocker) => `
+            <div class="knowledge-operations__diagnostic-action">
+              <span>${escapeHTML(blocker.label || blocker.status || "blocked")}</span>
+              <small>${escapeHTML(blocker.safe_action || "inspect_status")} · ${Number(blocker.count || 0)} 项</small>
+            </div>
+          `).join("") : `<p class="knowledge-operations__empty">当前可见范围没有阻断分类。</p>`}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function knowledgeOperationsDiagnosticReasonLabel(reason) {
+  switch (reason) {
+    case "queue_has_items":
+      return "队列已有可处理项";
+    case "no_operations_items":
+      return "当前没有 operations 数据";
+    case "no_health_readiness_items":
+      return "当前可见包没有 Health readiness 状态";
+    case "no_items_match_current_limit":
+      return "当前可见范围没有命中 Health 队列";
+    case "all_visible_items_need_upstream_work":
+      return "可见包需要先完成上游分析或质检";
+    case "all_visible_items_ready_or_imported":
+      return "可见包已准备好，下一步归 Health 审核侧";
+    default:
+      return "等待更多诊断数据";
+  }
 }
 
 function renderKnowledgeOperationsHealthReviewItem(item) {

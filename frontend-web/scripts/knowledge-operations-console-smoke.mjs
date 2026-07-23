@@ -18,8 +18,11 @@ for (const marker of [
   "/api/knowledge/operations/replay",
   "Release Status Center",
   "Health Evidence Review Workspace",
+  "health_review_diagnostics",
   "health_review_queue",
+  "renderKnowledgeOperationsHealthReviewDiagnostics",
   "renderKnowledgeOperationsHealthReviewQueue",
+  "data-knowledge-health-diagnostic-action",
   "data-knowledge-health-review-action",
   "Failure Explanation",
   "data-knowledge-operations-replay",
@@ -28,6 +31,6 @@ for (const marker of [
 }
 
 assert.ok(css.includes(".knowledge-operations"), "styles.css should include operations styles");
-assert.ok(html.includes("20260722-health-review-queue"), "index.html should bust cache for health review queue assets");
+assert.ok(html.includes("20260723-operations-diagnostics"), "index.html should bust cache for operations diagnostics assets");
 assert.ok(!js.includes("health_serving_promote</button>"), "UI must not expose Health serving promotion as a replay button");
 assert.ok(!js.includes("publish</button>"), "UI must not expose publish as safe replay");

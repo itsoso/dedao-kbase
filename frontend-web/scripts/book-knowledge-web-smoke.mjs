@@ -161,7 +161,7 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
-assert.ok(html.includes("20260722-health-review-queue"), "health review queue release should use a fresh browser cache version");
+assert.ok(html.includes("20260723-operations-diagnostics"), "operations diagnostics release should use a fresh browser cache version");
 assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
 assert.ok(js.includes('"/course": ROUTES.dedaoCourses'), "legacy course alias should be preserved");
 assert.ok(js.includes('"/ebook": ROUTES.dedaoEbooks'), "legacy ebook alias should be preserved");
