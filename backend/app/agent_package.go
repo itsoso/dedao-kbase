@@ -218,11 +218,12 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	if err := validateAgentPackageUI(pkg.UIManifest); err != nil {
 		return err
 	}
-	if err := validateAgentPackageReleases(pkg, store); err != nil {
+	validatedReleases, err := validateAgentPackageReleases(pkg, store)
+	if err != nil {
 		return err
 	}
 	if pkg.EvidencePolicy != nil {
-		return validateAgentPackageEvidence(*pkg.EvidencePolicy, pkg.Releases, store)
+		return validateAgentPackageEvidence(*pkg.EvidencePolicy, pkg.Releases, validatedReleases)
 	}
 	return nil
 }
@@ -375,7 +376,7 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 func validateAgentPackageEvidence(
 	policy AgentPackageEvidencePolicy,
 	releases []AgentPackageReleaseRef,
-	store *BookKnowledgeStore,
+	validatedReleases map[string]*KnowledgeRelease,
 ) error {
 	if len(policy.ReleaseRoles) == 0 {
 		return fmt.Errorf("evidence_policy.release_roles is required")
@@ -428,7 +429,7 @@ func validateAgentPackageEvidence(
 	if policy.MinimumIndependentSources <= 0 {
 		return fmt.Errorf("evidence_policy.minimum_independent_sources must be positive")
 	}
-	independentSources, err := agentPackageIndependentSupportingSources(store, supportingReleaseIDs)
+	independentSources, err := agentPackageIndependentSupportingSources(validatedReleases, supportingReleaseIDs)
 	if err != nil {
 		return err
 	}
@@ -477,19 +478,18 @@ func validateAgentPackageEvidence(
 	return nil
 }
 
-func agentPackageIndependentSupportingSources(store *BookKnowledgeStore, releaseIDs []string) (int, error) {
-	if store == nil {
-		return 0, fmt.Errorf("published release store is required")
-	}
+func agentPackageIndependentSupportingSources(
+	validatedReleases map[string]*KnowledgeRelease,
+	releaseIDs []string,
+) (int, error) {
 	identities := make(map[string]struct{}, len(releaseIDs))
 	for _, releaseID := range releaseIDs {
-		release, err := store.LoadKnowledgeRelease(releaseID)
-		if err != nil {
-			return 0, fmt.Errorf("load supporting release %q for evidence policy: %w", releaseID, err)
+		release, ok := validatedReleases[releaseID]
+		if !ok {
+			return 0, fmt.Errorf("supporting release %q was not present in the validated release snapshot", releaseID)
 		}
 		sourceType := strings.ToLower(strings.TrimSpace(release.Book.SourceType))
-		sourceAccount := strings.ToLower(strings.TrimSpace(release.Book.SourceAccount))
-		identities[sourceType+"\x00"+sourceAccount] = struct{}{}
+		identities[sourceType] = struct{}{}
 	}
 	return len(identities), nil
 }
@@ -510,13 +510,16 @@ func validateAgentPackageUI(manifest AgentPackageUIManifest) error {
 	return nil
 }
 
-func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) error {
+func validateAgentPackageReleases(
+	pkg AgentPackage,
+	store *BookKnowledgeStore,
+) (map[string]*KnowledgeRelease, error) {
 	if store == nil {
-		return fmt.Errorf("published release store is required")
+		return nil, fmt.Errorf("published release store is required")
 	}
 	manifest, err := store.loadKnowledgeReleaseManifest()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	published := make(map[string]KnowledgeReleaseRecord, len(manifest.Releases))
 	for _, record := range manifest.Releases {
@@ -525,65 +528,67 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 	allowedSources := stringSet(pkg.RetrievalPolicy.AllowedSourceTypes)
 	seen := make(map[string]struct{}, len(pkg.Releases))
 	citationReleases := make(map[string]string)
+	validated := make(map[string]*KnowledgeRelease, len(pkg.Releases))
 	for index, ref := range pkg.Releases {
 		if strings.TrimSpace(ref.ReleaseID) == "" {
-			return fmt.Errorf("releases[%d].release_id is required", index)
+			return nil, fmt.Errorf("releases[%d].release_id is required", index)
 		}
 		if strings.TrimSpace(ref.ContentHash) == "" {
-			return fmt.Errorf("releases[%d].content_hash is required for an immutable reference", index)
+			return nil, fmt.Errorf("releases[%d].content_hash is required for an immutable reference", index)
 		}
 		if _, ok := seen[ref.ReleaseID]; ok {
-			return fmt.Errorf("duplicate release reference %q", ref.ReleaseID)
+			return nil, fmt.Errorf("duplicate release reference %q", ref.ReleaseID)
 		}
 		seen[ref.ReleaseID] = struct{}{}
 		record, ok := published[ref.ReleaseID]
 		if !ok {
-			return fmt.Errorf("published release %q was not found", ref.ReleaseID)
+			return nil, fmt.Errorf("published release %q was not found", ref.ReleaseID)
 		}
 		if record.ContentHash != ref.ContentHash {
-			return fmt.Errorf("release %q content hash does not match pinned content hash", ref.ReleaseID)
+			return nil, fmt.Errorf("release %q content hash does not match pinned content hash", ref.ReleaseID)
 		}
 		release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
 		if err != nil {
-			return fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
+			return nil, fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
 		}
 		sourceType := strings.TrimSpace(release.Book.SourceType)
 		if sourceType == "" {
-			return fmt.Errorf("release %q source type is required", ref.ReleaseID)
+			return nil, fmt.Errorf("release %q source type is required", ref.ReleaseID)
 		}
 		if !allowedSources[sourceType] {
-			return fmt.Errorf("release %q source type %q is outside retrieval policy", ref.ReleaseID, sourceType)
+			return nil, fmt.Errorf("release %q source type %q is outside retrieval policy", ref.ReleaseID, sourceType)
 		}
 		switch release.UsagePolicy {
 		case BookUsageStandard:
 		case BookUsageEvidenceOnly:
 			if pkg.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly {
-				return fmt.Errorf("release %q usage policy %q cannot be downgraded to package policy %q", ref.ReleaseID, release.UsagePolicy, pkg.SafetyPolicy.UsagePolicy)
+				return nil, fmt.Errorf("release %q usage policy %q cannot be downgraded to package policy %q", ref.ReleaseID, release.UsagePolicy, pkg.SafetyPolicy.UsagePolicy)
 			}
 		default:
-			return fmt.Errorf("release %q usage policy %q is unsupported", ref.ReleaseID, release.UsagePolicy)
+			return nil, fmt.Errorf("release %q usage policy %q is unsupported", ref.ReleaseID, release.UsagePolicy)
 		}
 		if pkg.RetrievalPolicy.RequireCitations && len(ref.CitationIDs) == 0 {
-			return fmt.Errorf("release %q citation_ids is required", ref.ReleaseID)
+			return nil, fmt.Errorf("release %q citation_ids is required", ref.ReleaseID)
 		}
 		availableCitations := make(map[string]struct{}, len(release.Citations))
 		for _, citation := range release.Citations {
 			if _, exists := availableCitations[citation.CitationID]; exists {
-				return fmt.Errorf("release %q contains duplicate citation %q", ref.ReleaseID, citation.CitationID)
+				return nil, fmt.Errorf("release %q contains duplicate citation %q", ref.ReleaseID, citation.CitationID)
 			}
 			availableCitations[citation.CitationID] = struct{}{}
 		}
 		for _, citationID := range uniqueTrimmedStrings(ref.CitationIDs) {
 			if _, ok := availableCitations[citationID]; !ok {
-				return fmt.Errorf("release %q citation %q cannot be resolved", ref.ReleaseID, citationID)
+				return nil, fmt.Errorf("release %q citation %q cannot be resolved", ref.ReleaseID, citationID)
 			}
 			if previousReleaseID, ok := citationReleases[citationID]; ok && previousReleaseID != ref.ReleaseID {
-				return fmt.Errorf("citation %q is ambiguous across multiple releases %q and %q", citationID, previousReleaseID, ref.ReleaseID)
+				return nil, fmt.Errorf("citation %q is ambiguous across multiple releases %q and %q", citationID, previousReleaseID, ref.ReleaseID)
 			}
 			citationReleases[citationID] = ref.ReleaseID
 		}
+		validated[ref.ReleaseID] = release
 	}
-	return nil
+	return validated, nil
 }
 
 func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {

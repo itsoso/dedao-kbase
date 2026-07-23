@@ -229,26 +229,42 @@ func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
 func TestAgentPackageV2CountsIndependentSupportingSourceIdentities(t *testing.T) {
 	tests := []struct {
 		name           string
+		firstType      string
+		secondType     string
 		firstAccount   string
 		secondAccount  string
 		wantValidation string
 	}{
 		{
 			name:           "same normalized account is one source",
+			firstType:      "wechat_mp_article",
+			secondType:     "wechat_mp_article",
 			firstAccount:   " Medical Desk ",
 			secondAccount:  "medical desk",
 			wantValidation: "independent supporting",
 		},
 		{
 			name:           "unknown accounts of same type are one source",
+			firstType:      "wechat_mp_article",
+			secondType:     "wechat_mp_article",
 			firstAccount:   "",
 			secondAccount:  "",
 			wantValidation: "independent supporting",
 		},
 		{
-			name:          "different normalized accounts are independent",
+			name:           "different display names of same type are one source",
+			firstType:      "wechat_mp_article",
+			secondType:     "wechat_mp_article",
+			firstAccount:   "Medical Desk",
+			secondAccount:  "Trial Registry",
+			wantValidation: "independent supporting",
+		},
+		{
+			name:          "different source types are independent",
+			firstType:     "dedao_course_article",
+			secondType:    "wechat_mp_article",
 			firstAccount:  "Medical Desk",
-			secondAccount: "Trial Registry",
+			secondAccount: "Medical Desk",
 		},
 	}
 
@@ -256,10 +272,18 @@ func TestAgentPackageV2CountsIndependentSupportingSourceIdentities(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			store := NewBookKnowledgeStore(t.TempDir())
 			saveAgentPackageTestRelease(t, store)
-			saveAgentPackageSupportingReleaseWithIdentity(t, store, "release-2", "book-2", "citation-2", tt.firstAccount)
-			saveAgentPackageSupportingReleaseWithIdentity(t, store, "release-3", "book-3", "citation-3", tt.secondAccount)
+			saveAgentPackageSupportingReleaseWithIdentity(
+				t, store, "release-2", "book-2", "citation-2", tt.firstType, tt.firstAccount,
+			)
+			saveAgentPackageSupportingReleaseWithIdentity(
+				t, store, "release-3", "book-3", "citation-3", tt.secondType, tt.secondAccount,
+			)
 
 			pkg := validAgentPackageV2()
+			pkg.RetrievalPolicy.AllowedSourceTypes = append(
+				pkg.RetrievalPolicy.AllowedSourceTypes,
+				"dedao_course_article",
+			)
 			pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
 				ReleaseID:   "release-3",
 				ContentHash: "sha256:release-3-content",
@@ -674,7 +698,9 @@ func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 
 func saveAgentPackageSupportingRelease(t *testing.T, store *BookKnowledgeStore) {
 	t.Helper()
-	saveAgentPackageSupportingReleaseWithIdentity(t, store, "release-2", "book-2", "citation-2", "")
+	saveAgentPackageSupportingReleaseWithIdentity(
+		t, store, "release-2", "book-2", "citation-2", "wechat_mp_article", "",
+	)
 }
 
 func saveAgentPackageSupportingReleaseWithIdentity(
@@ -683,6 +709,7 @@ func saveAgentPackageSupportingReleaseWithIdentity(
 	releaseID string,
 	bookID string,
 	citationID string,
+	sourceType string,
 	sourceAccount string,
 ) {
 	t.Helper()
@@ -697,7 +724,7 @@ func saveAgentPackageSupportingReleaseWithIdentity(
 	release.Book = BookKnowledgeBook{
 		BookID:        bookID,
 		Title:         "Synthetic Supporting Source",
-		SourceType:    "wechat_mp_article",
+		SourceType:    sourceType,
 		SourceKey:     "item-" + releaseID,
 		SourceAccount: sourceAccount,
 	}
