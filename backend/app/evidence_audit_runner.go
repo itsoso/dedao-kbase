@@ -14,6 +14,7 @@ import (
 )
 
 const evidenceAuditModelOutputSchema = "evidence-audit-model.v1"
+const evidenceAuditInitialTimeout = 30 * time.Second
 
 type EvidenceAuditRunnerConfig struct {
 	ModelConfig BookTokenPlanConfig
@@ -117,15 +118,23 @@ func RunEvidenceAudit(
 	if store == nil {
 		return nil, fmt.Errorf("evidence audit store is required")
 	}
-	runCtx := ctx
-	var cancel context.CancelFunc
-	if config.Timeout > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, config.Timeout)
-		defer cancel()
+	startedAt := time.Now()
+	initialTimeout := config.Timeout
+	if initialTimeout <= 0 {
+		initialTimeout = evidenceAuditInitialTimeout
 	}
+	runCtx, cancel := context.WithTimeout(ctx, initialTimeout)
+	defer cancel()
 	if err := evidenceAuditRunnerStage(runCtx, "load"); err != nil {
 		return nil, err
 	}
+	unlockExecution, err := store.acquireEvidenceAuditExecutionLock(
+		runCtx, strings.TrimSpace(auditID),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockExecution()
 	audit, err := store.LoadEvidenceAudit(strings.TrimSpace(auditID))
 	if err != nil {
 		return nil, err
@@ -161,8 +170,8 @@ func RunEvidenceAudit(
 		}
 	}
 
-	pkg, releases, runErr := loadEvidenceAuditPackageSnapshot(
-		store, audit.Package.PackageID, audit.Package.Version,
+	pkg, releases, runErr := loadEvidenceAuditPackageSnapshotContext(
+		runCtx, store, audit.Package.PackageID, audit.Package.Version,
 	)
 	if runErr == nil && pkg.ContentHash != audit.Package.ContentHash {
 		runErr = fmt.Errorf("published package hash changed")
@@ -174,7 +183,10 @@ func RunEvidenceAudit(
 		return nil, failEvidenceAuditRun(store, *audit, nil, nil, traceID, config, runErr)
 	}
 	if config.Timeout <= 0 && pkg.ModelPolicy.TimeoutMS > 0 {
-		runCtx, cancel = context.WithTimeout(ctx, time.Duration(pkg.ModelPolicy.TimeoutMS)*time.Millisecond)
+		cancel()
+		runCtx, cancel = context.WithDeadline(
+			ctx, startedAt.Add(time.Duration(pkg.ModelPolicy.TimeoutMS)*time.Millisecond),
+		)
 		defer cancel()
 	}
 	if runErr = evidenceAuditRunnerStage(runCtx, "policy"); runErr != nil {
@@ -204,26 +216,72 @@ func RunEvidenceAudit(
 	}
 	allRetrieved := make([]evidenceAuditRetrievedItem, 0)
 	claimAudits := make([]EvidenceAuditClaim, 0, len(audit.SelectedClaims))
-	for _, sourceClaim := range audit.SelectedClaims {
+	executionPlan, err := store.prepareEvidenceAuditExecutionPlan(*audit)
+	if err != nil {
+		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, err)
+	}
+	checkpoints, err := store.loadEvidenceAuditClaimCandidates(executionPlan)
+	if err != nil {
+		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, err)
+	}
+	for claimIndex, sourceClaim := range audit.SelectedClaims {
 		retrieved, retrievalErr := retrieveEvidenceAuditSupportingEvidence(runCtx, store, pkg, releases, sourceClaim)
 		if retrievalErr != nil {
+			if len(checkpoints) > 0 &&
+				(errors.Is(retrievalErr, context.Canceled) ||
+					errors.Is(retrievalErr, context.DeadlineExceeded)) {
+				return nil, retrievalErr
+			}
 			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, retrievalErr)
 		}
 		allRetrieved = append(allRetrieved, retrieved...)
-		messages := buildEvidenceAuditModelMessages(pkg, sourceClaim, retrieved)
-		if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
-			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
-		}
-		if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
-			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
-		}
-		raw, modelErr := client.Chat(runCtx, modelConfig, messages)
-		if modelErr != nil {
-			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, modelErr)
-		}
-		decision, parseErr := parseEvidenceAuditModelDecision(raw)
-		if parseErr != nil {
-			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, parseErr)
+		var decision evidenceAuditModelDecision
+		if checkpoint, ok := checkpoints[claimIndex]; ok {
+			decision = checkpoint.Decision
+		} else {
+			messages := buildEvidenceAuditModelMessages(pkg, sourceClaim, retrieved)
+			if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+			if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
+				if len(checkpoints) > 0 && errors.Is(err, context.DeadlineExceeded) {
+					return nil, err
+				}
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+			raw, modelErr := client.Chat(runCtx, modelConfig, messages)
+			if modelErr != nil {
+				if len(checkpoints) > 0 &&
+					(errors.Is(modelErr, context.Canceled) || errors.Is(modelErr, context.DeadlineExceeded)) {
+					return nil, modelErr
+				}
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, modelErr)
+			}
+			if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
+				if len(checkpoints) > 0 &&
+					(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+					return nil, err
+				}
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+			parsed, parseErr := parseEvidenceAuditModelDecision(raw)
+			if parseErr != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, parseErr)
+			}
+			parsed = evidenceAuditCheckpointDecision(parsed)
+			checkpoint, checkpointErr := store.saveEvidenceAuditClaimCandidate(
+				executionPlan, claimIndex, parsed,
+			)
+			if checkpointErr != nil {
+				return nil, failEvidenceAuditRun(
+					store, *audit, pkg, allRetrieved, traceID, config, checkpointErr,
+				)
+			}
+			checkpoints[claimIndex] = checkpoint
+			decision = checkpoint.Decision
+			if checkpointErr := evidenceAuditRunnerStage(runCtx, "checkpoint"); checkpointErr != nil {
+				return nil, checkpointErr
+			}
 		}
 		claimAudit, decisionErr := decideEvidenceAuditClaim(pkg, sourceClaim, retrieved, decision)
 		if decisionErr != nil {
@@ -236,12 +294,38 @@ func RunEvidenceAudit(
 	)
 }
 
+func evidenceAuditCheckpointDecision(
+	decision evidenceAuditModelDecision,
+) evidenceAuditModelDecision {
+	return evidenceAuditModelDecision{
+		CandidateVerdict: decision.CandidateVerdict,
+		Rationale:        "Candidate evaluated against immutable pinned evidence.",
+		Evidence:         append([]evidenceAuditModelEvidence(nil), decision.Evidence...),
+	}
+}
+
 func loadEvidenceAuditPackageSnapshot(
 	store *BookKnowledgeStore,
 	packageID, version string,
 ) (AgentPackage, map[string]KnowledgeRelease, error) {
+	return loadEvidenceAuditPackageSnapshotContext(
+		context.Background(), store, packageID, version,
+	)
+}
+
+func loadEvidenceAuditPackageSnapshotContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	packageID, version string,
+) (AgentPackage, map[string]KnowledgeRelease, error) {
+	if err := ctx.Err(); err != nil {
+		return AgentPackage{}, nil, err
+	}
 	pkg, err := loadRunnableAgentPackage(store, packageID, version, "evidence")
 	if err != nil {
+		return AgentPackage{}, nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return AgentPackage{}, nil, err
 	}
 	if pkg.SchemaVersion != AgentPackageSchemaVersionV2 || pkg.EvidencePolicy == nil {
@@ -249,6 +333,9 @@ func loadEvidenceAuditPackageSnapshot(
 	}
 	releases := make(map[string]KnowledgeRelease, len(pkg.Releases))
 	for _, ref := range pkg.Releases {
+		if err := ctx.Err(); err != nil {
+			return AgentPackage{}, nil, err
+		}
 		release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
 		if loadErr != nil {
 			return AgentPackage{}, nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
@@ -257,6 +344,9 @@ func loadEvidenceAuditPackageSnapshot(
 			return AgentPackage{}, nil, fmt.Errorf("pinned release %q content hash changed", ref.ReleaseID)
 		}
 		releases[ref.ReleaseID] = *release
+	}
+	if err := ctx.Err(); err != nil {
+		return AgentPackage{}, nil, err
 	}
 	return *pkg, releases, nil
 }
@@ -741,12 +831,21 @@ func completeEvidenceAuditRun(
 	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
 		return nil, fmt.Errorf("prepare evidence audit terminal: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	completed, err := CompleteEvidenceAudit(store, report, evidenceAuditRunnerNow(config))
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := store.finalizeEvidenceAuditTraceTerminal(terminal); err != nil {
 		return nil, fmt.Errorf("finalize evidence audit trace: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return completed, nil
 }
@@ -1001,12 +1100,13 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 	}
 	safeEvidenceIntent := hasAny(
 		"evidence audit", "evidence comparison", "clinical trial evidence", "review the evidence",
-		"compare studies", "assess the claim", "population-level", "证据审计", "证据比较",
-		"临床试验证据", "评估观点", "文献综述",
+		"compare studies", "assess the claim", "population-level", "pico", "in adults",
+		"证据审计", "证据比较", "临床试验证据", "评估观点", "文献综述", "群体级", "人群",
 	)
 	personalContext := hasAny(
 		" i ", " me", " my ", "for me", "should i", "can i", "could i",
-		"我", "给我", "帮我", "本人", "家人", "孩子", "老人",
+		"right for me", "appropriate for me",
+		"我", "我的", "给我", "帮我", "本人", "家人", "孩子", "老人", "适合我",
 	)
 	diagnosisOrTreatment := hasAny(
 		"diagnos", "treat", "therapy for", "prescri", "medical advice", "what do i have",
@@ -1018,7 +1118,8 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 	)
 	clinicalContext := diagnosisOrTreatment || medicationContext || hasAny(
 		"symptom", "rash", "pain", "fever", "cancer", "melanoma", "chemotherapy",
-		"头痛", "发热", "皮疹", "肿瘤", "癌", "化疗", "症状",
+		"surgery", "operation", "procedure", "screening", "medical test", " test ", "therapy",
+		"头痛", "发热", "皮疹", "肿瘤", "癌", "化疗", "症状", "手术", "检查", "治疗",
 	)
 	decisionRequest := hasAny(
 		"should", "can i", "could i", "would it be better", "what dose", "how much",
@@ -1031,6 +1132,9 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"recommend a treatment", "individual treatment", "individual medical advice",
 		"用药建议", "治疗方案", "开药", "给我诊断", "诊断我",
 	)
+	if personalContext && (clinicalContext || decisionRequest) {
+		return true
+	}
 	if explicitAdvice || (diagnosisOrTreatment && (personalContext || decisionRequest)) ||
 		(medicationContext && (personalContext || decisionRequest)) {
 		return true

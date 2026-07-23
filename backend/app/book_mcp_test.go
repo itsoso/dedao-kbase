@@ -1,13 +1,45 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+type blockingAgentSemanticEmbedder struct{}
+
+func (blockingAgentSemanticEmbedder) Identity() string {
+	return agentPackageSemanticEmbedderIdentity(validAgentPackage().RetrievalPolicy)
+}
+
+func (blockingAgentSemanticEmbedder) Embed(ctx context.Context, _ []string) ([][]float64, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestAgentSemanticSearchHonorsContextCancellation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	store.SetAgentSemanticEmbedder(blockingAgentSemanticEmbedder{})
+	policy := validAgentPackage().RetrievalPolicy
+	policy.Strategy = "vector"
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := searchAgentReleaseClaimsWithStrategyContext(
+		ctx, store, agentPackageTestRelease(), "grounded", 5, policy,
+	)
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("semantic search error = %v", err)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatalf("semantic search ignored cancellation")
+	}
+}
 
 func TestResolveAgentClaimCitationIDsIsDeterministicAndPrefersDirectIDs(t *testing.T) {
 	citations := []BookKnowledgeCitation{

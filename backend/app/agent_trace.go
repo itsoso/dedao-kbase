@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -12,11 +13,14 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/gofrs/flock"
 )
 
 const (
 	AgentTraceSchemaVersion           = "agent-trace.v1"
 	evidenceAuditTraceTerminalVersion = "evidence-audit-trace-terminal.v1"
+	evidenceAuditExecutionVersion     = "evidence-audit-execution.v1"
 
 	evidenceAuditTraceFaultBeforePrepare  = "before_prepare"
 	evidenceAuditTraceFaultBeforeSave     = "before_save"
@@ -70,6 +74,27 @@ type evidenceAuditTraceTerminal struct {
 	FailureCode       string         `json:"failure_code,omitempty"`
 	FailureSummary    string         `json:"failure_summary,omitempty"`
 	Trace             AgentTrace     `json:"trace"`
+}
+
+type evidenceAuditExecutionPlan struct {
+	Version     string                     `json:"version"`
+	AuditID     string                     `json:"audit_id"`
+	InputHash   string                     `json:"input_hash"`
+	Package     EvidenceAuditPackageRef    `json:"package"`
+	Model       EvidenceAuditModelIdentity `json:"model"`
+	ClaimHashes []string                   `json:"claim_hashes"`
+}
+
+type evidenceAuditClaimCandidate struct {
+	Version       string                     `json:"version"`
+	AuditID       string                     `json:"audit_id"`
+	InputHash     string                     `json:"input_hash"`
+	Package       EvidenceAuditPackageRef    `json:"package"`
+	Model         EvidenceAuditModelIdentity `json:"model"`
+	ClaimIndex    int                        `json:"claim_index"`
+	ClaimHash     string                     `json:"claim_hash"`
+	Decision      evidenceAuditModelDecision `json:"decision"`
+	CandidateHash string                     `json:"candidate_hash"`
 }
 
 type AgentTraceRetrievalRoute struct {
@@ -355,6 +380,224 @@ func (s *BookKnowledgeStore) AgentTracePath(traceID string) string {
 
 func (s *BookKnowledgeStore) EvidenceAuditTraceTerminalPath(auditID string) string {
 	return filepath.Join(s.AgentTraceDir(), "prepared", sanitizeBookKnowledgeID(auditID)+".json")
+}
+
+func (s *BookKnowledgeStore) evidenceAuditExecutionDir(auditID string) string {
+	return filepath.Join(s.AgentTraceDir(), "execution", sanitizeBookKnowledgeID(auditID))
+}
+
+func (s *BookKnowledgeStore) acquireEvidenceAuditExecutionLock(
+	ctx context.Context,
+	auditID string,
+) (func(), error) {
+	dir := s.evidenceAuditExecutionDir(auditID)
+	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+		return nil, err
+	}
+	fileLock := flock.New(filepath.Join(dir, ".run.lock"))
+	locked, err := fileLock.TryLockContext(ctx, 10*time.Millisecond)
+	if err != nil || !locked {
+		_ = fileLock.Close()
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err == nil {
+			err = fmt.Errorf("could not acquire evidence audit execution lock")
+		}
+		return nil, err
+	}
+	return func() { _ = fileLock.Close() }, nil
+}
+
+func (s *BookKnowledgeStore) prepareEvidenceAuditExecutionPlan(
+	audit EvidenceAudit,
+) (evidenceAuditExecutionPlan, error) {
+	plan := evidenceAuditExecutionPlan{
+		Version: evidenceAuditExecutionVersion,
+		AuditID: audit.AuditID, InputHash: audit.InputHash,
+		Package: audit.Package, Model: audit.Model,
+		ClaimHashes: make([]string, 0, len(audit.SelectedClaims)),
+	}
+	for _, claim := range audit.SelectedClaims {
+		plan.ClaimHashes = append(plan.ClaimHashes, sha256Fingerprint([]byte(strings.TrimSpace(claim))))
+	}
+	if err := validateEvidenceAuditExecutionPlan(plan); err != nil {
+		return evidenceAuditExecutionPlan{}, err
+	}
+	payload, err := encodeJSONFile(plan)
+	if err != nil {
+		return evidenceAuditExecutionPlan{}, err
+	}
+	path := filepath.Join(s.evidenceAuditExecutionDir(audit.AuditID), "plan.json")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return evidenceAuditExecutionPlan{}, err
+	}
+	if existing, readErr := os.ReadFile(path); readErr == nil {
+		if !bytes.Equal(existing, payload) {
+			return evidenceAuditExecutionPlan{}, fmt.Errorf("evidence audit execution plan identity conflict")
+		}
+		return plan, nil
+	} else if !os.IsNotExist(readErr) {
+		return evidenceAuditExecutionPlan{}, readErr
+	}
+	if err := writeEvidenceAuditImmutableFile(path, payload); err != nil {
+		return evidenceAuditExecutionPlan{}, err
+	}
+	return plan, nil
+}
+
+func validateEvidenceAuditExecutionPlan(plan evidenceAuditExecutionPlan) error {
+	if plan.Version != evidenceAuditExecutionVersion {
+		return fmt.Errorf("unsupported evidence audit execution version %q", plan.Version)
+	}
+	if strings.TrimSpace(plan.AuditID) == "" {
+		return fmt.Errorf("evidence audit execution plan requires audit_id")
+	}
+	if err := validateAgentSHA256("execution input_hash", plan.InputHash); err != nil {
+		return err
+	}
+	if err := validateAgentSHA256("execution package content_hash", plan.Package.ContentHash); err != nil {
+		return err
+	}
+	if strings.TrimSpace(plan.Package.PackageID) == "" || strings.TrimSpace(plan.Package.Version) == "" ||
+		strings.TrimSpace(plan.Model.Provider) == "" || strings.TrimSpace(plan.Model.Model) == "" ||
+		len(plan.ClaimHashes) == 0 || len(plan.ClaimHashes) > agentEvidenceMaxClaims {
+		return fmt.Errorf("evidence audit execution plan identity is incomplete")
+	}
+	for _, claimHash := range plan.ClaimHashes {
+		if err := validateAgentSHA256("execution claim_hash", claimHash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
+	plan evidenceAuditExecutionPlan,
+	claimIndex int,
+	decision evidenceAuditModelDecision,
+) (evidenceAuditClaimCandidate, error) {
+	if err := validateEvidenceAuditExecutionPlan(plan); err != nil {
+		return evidenceAuditClaimCandidate{}, err
+	}
+	if claimIndex < 0 || claimIndex >= len(plan.ClaimHashes) {
+		return evidenceAuditClaimCandidate{}, fmt.Errorf("claim checkpoint index is outside execution plan")
+	}
+	candidate := evidenceAuditClaimCandidate{
+		Version: evidenceAuditExecutionVersion,
+		AuditID: plan.AuditID, InputHash: plan.InputHash,
+		Package: plan.Package, Model: plan.Model,
+		ClaimIndex: claimIndex, ClaimHash: plan.ClaimHashes[claimIndex],
+		Decision: decision,
+	}
+	hash, err := evidenceAuditClaimCandidateHash(candidate)
+	if err != nil {
+		return evidenceAuditClaimCandidate{}, err
+	}
+	candidate.CandidateHash = hash
+	if err := validateEvidenceAuditClaimCandidate(plan, candidate); err != nil {
+		return evidenceAuditClaimCandidate{}, err
+	}
+	payload, err := encodeJSONFile(candidate)
+	if err != nil {
+		return evidenceAuditClaimCandidate{}, err
+	}
+	path := filepath.Join(
+		s.evidenceAuditExecutionDir(plan.AuditID), "results",
+		evidenceAuditHashName(candidate.CandidateHash)+".json",
+	)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := writeEvidenceAuditImmutableFile(path, payload); err != nil {
+		return evidenceAuditClaimCandidate{}, err
+	}
+	return candidate, nil
+}
+
+func (s *BookKnowledgeStore) loadEvidenceAuditClaimCandidates(
+	plan evidenceAuditExecutionPlan,
+) (map[int]evidenceAuditClaimCandidate, error) {
+	if err := validateEvidenceAuditExecutionPlan(plan); err != nil {
+		return nil, err
+	}
+	dir := filepath.Join(s.evidenceAuditExecutionDir(plan.AuditID), "results")
+	s.mu.RLock()
+	entries, err := os.ReadDir(dir)
+	s.mu.RUnlock()
+	if os.IsNotExist(err) {
+		return map[int]evidenceAuditClaimCandidate{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) > agentEvidenceMaxClaims {
+		return nil, fmt.Errorf("evidence audit execution has too many candidate files")
+	}
+	result := make(map[int]evidenceAuditClaimCandidate, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			return nil, fmt.Errorf("unexpected evidence audit checkpoint entry %q", entry.Name())
+		}
+		var candidate evidenceAuditClaimCandidate
+		s.mu.RLock()
+		readErr := readJSONFile(filepath.Join(dir, entry.Name()), &candidate)
+		s.mu.RUnlock()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if err := validateEvidenceAuditClaimCandidate(plan, candidate); err != nil {
+			return nil, err
+		}
+		if strings.TrimSuffix(entry.Name(), ".json") != evidenceAuditHashName(candidate.CandidateHash) {
+			return nil, fmt.Errorf("evidence audit candidate filename does not match content hash")
+		}
+		if prior, ok := result[candidate.ClaimIndex]; ok && prior.CandidateHash != candidate.CandidateHash {
+			return nil, fmt.Errorf("conflicting evidence audit candidates for claim %d", candidate.ClaimIndex)
+		}
+		result[candidate.ClaimIndex] = candidate
+	}
+	return result, nil
+}
+
+func evidenceAuditClaimCandidateHash(candidate evidenceAuditClaimCandidate) (string, error) {
+	candidate.CandidateHash = ""
+	payload, err := json.Marshal(candidate)
+	if err != nil {
+		return "", err
+	}
+	return sha256Fingerprint(payload), nil
+}
+
+func validateEvidenceAuditClaimCandidate(
+	plan evidenceAuditExecutionPlan,
+	candidate evidenceAuditClaimCandidate,
+) error {
+	if candidate.Version != evidenceAuditExecutionVersion ||
+		candidate.AuditID != plan.AuditID || candidate.InputHash != plan.InputHash ||
+		!reflect.DeepEqual(candidate.Package, plan.Package) ||
+		!reflect.DeepEqual(candidate.Model, plan.Model) ||
+		candidate.ClaimIndex < 0 || candidate.ClaimIndex >= len(plan.ClaimHashes) ||
+		candidate.ClaimHash != plan.ClaimHashes[candidate.ClaimIndex] {
+		return fmt.Errorf("evidence audit candidate identity does not match execution plan")
+	}
+	if _, err := parseEvidenceAuditModelDecision(mustEncodeEvidenceAuditDecision(candidate.Decision)); err != nil {
+		return fmt.Errorf("validate evidence audit candidate decision: %w", err)
+	}
+	expected, err := evidenceAuditClaimCandidateHash(candidate)
+	if err != nil {
+		return err
+	}
+	if candidate.CandidateHash != expected {
+		return fmt.Errorf("evidence audit candidate content hash mismatch")
+	}
+	return nil
+}
+
+func mustEncodeEvidenceAuditDecision(decision evidenceAuditModelDecision) string {
+	payload, _ := json.Marshal(decision)
+	return string(payload)
 }
 
 func (s *BookKnowledgeStore) prepareEvidenceAuditTraceTerminal(terminal evidenceAuditTraceTerminal) error {

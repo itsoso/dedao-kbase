@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -210,6 +211,10 @@ func TestEvidenceAuditRunnerFailsClosedAndPersistsFailedTrace(t *testing.T) {
 func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 	for _, scope := range []string{
 		"Diagnose me and recommend an individual treatment.",
+		"Evidence audit: Should I undergo surgery?",
+		"Clinical trial evidence: Can I have this procedure?",
+		"Would this test be appropriate for me?",
+		"Is this therapy right for me?",
 		"Should I stop aspirin?",
 		"What dose should I take?",
 		"Could another medicine work better for me?",
@@ -220,6 +225,9 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 		"这个药要不要加量？",
 		"阿司匹林怎么吃",
 		"我的头痛是什么病？",
+		"证据审计：我是否应该做手术？",
+		"临床试验证据：这个检查适合我吗？",
+		"我能不能接受这个治疗？",
 	} {
 		t.Run(scope, func(t *testing.T) {
 			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
@@ -239,6 +247,156 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 				t.Fatalf("abstained trace = %#v err=%v", trace, err)
 			}
 		})
+	}
+}
+
+func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
+	for _, scope := range []string{
+		"Population-level PICO: does surgery improve five-year survival in adults?",
+		"Compare evidence for screening tests in adults aged 50 to 75.",
+		"群体级PICO：手术是否改善成年患者五年生存率？",
+	} {
+		t.Run(scope, func(t *testing.T) {
+			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+			audit := createEvidenceAuditRunnerTask(
+				t, store, pkg, "runner-population-evidence-"+sha256Fingerprint([]byte(scope)), scope,
+			)
+			client := &evidenceAuditFakeClient{answers: []string{
+				`{"candidate_verdict":"supported","rationale":"population evidence","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+			}}
+			completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(client.calls) != 1 || completed.ClaimAudits[0].Verdict == EvidenceAuditVerdictInsufficient {
+				t.Fatalf("population evidence path = %#v calls=%d", completed, len(client.calls))
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditRunnerResumesCompletedClaimCheckpointWithoutRepeatingModel(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-claim-checkpoint", "Evidence comparison only.")
+	first := &evidenceAuditSequenceClient{
+		answers: []string{
+			`{"candidate_verdict":"supported","rationale":"first","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+		},
+		blockAfterAnswers: true,
+	}
+	cfg := evidenceAuditRunnerConfig()
+	cfg.Timeout = 2 * time.Second
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, first, cfg); err == nil {
+		t.Fatal("first run unexpectedly succeeded")
+	}
+	running, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running.Status != EvidenceAuditRunning {
+		t.Fatalf("audit status after resumable interruption = %q", running.Status)
+	}
+
+	second := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"second","evidence":[{"release_id":"support-a","citation_id":"support-a-c2","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != EvidenceAuditCompleted || len(first.calls) != 2 || len(second.calls) != 1 {
+		t.Fatalf("checkpoint resume completed=%#v first_calls=%d second_calls=%d", completed, len(first.calls), len(second.calls))
+	}
+}
+
+func TestEvidenceAuditRunnerRecoversCandidateWhenCheckpointFollowupFails(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-checkpoint-followup", "Evidence comparison only.")
+	previous := evidenceAuditRuntimeStageHook
+	failed := false
+	evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+		if stage == "checkpoint" && !failed {
+			failed = true
+			return errors.New("synthetic checkpoint followup failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+	first := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"saved candidate","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, first, evidenceAuditRunnerConfig()); err == nil {
+		t.Fatal("first run unexpectedly succeeded")
+	}
+	running, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil || running.Status != EvidenceAuditRunning {
+		t.Fatalf("running audit = %#v err=%v", running, err)
+	}
+	second := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+	completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != EvidenceAuditCompleted || len(first.calls) != 1 || len(second.calls) != 0 {
+		t.Fatalf("checkpoint recovery completed=%#v first_calls=%d second_calls=%d", completed, len(first.calls), len(second.calls))
+	}
+}
+
+func TestEvidenceAuditRunnerCheckpointDoesNotPersistPromptOrSourceBody(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-checkpoint-privacy", "Evidence comparison only.")
+	privateMarker := "private-source-body-must-not-persist"
+	client := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"` + privateMarker + `","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":["` + privateMarker + `"],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig()); err != nil {
+		t.Fatal(err)
+	}
+	checkpointRoot := store.evidenceAuditExecutionDir(audit.AuditID)
+	err := filepath.WalkDir(checkpointRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		payload, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.Contains(string(payload), privateMarker) ||
+			strings.Contains(string(payload), "Pinned supporting evidence") {
+			t.Fatalf("checkpoint leaked private model or prompt content: %s", payload)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestEvidenceAuditRunnerSerializesConcurrentExecutionWithoutDuplicateModelCalls(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-concurrent-checkpoint", "Evidence comparison only.")
+	client := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"one call","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	var wait sync.WaitGroup
+	wait.Add(2)
+	errs := make(chan error, 2)
+	for index := 0; index < 2; index++ {
+		go func() {
+			defer wait.Done()
+			_, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
+			errs <- err
+		}()
+	}
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent run failed: %v", err)
+		}
+	}
+	if len(client.calls) != 1 {
+		t.Fatalf("concurrent execution called model %d times", len(client.calls))
 	}
 }
 
@@ -450,6 +608,30 @@ type evidenceAuditBlockingClient struct{}
 func (evidenceAuditBlockingClient) Chat(ctx context.Context, _ BookTokenPlanConfig, _ []BookKnowledgeMessage) (string, error) {
 	<-ctx.Done()
 	return "", ctx.Err()
+}
+
+type evidenceAuditSequenceClient struct {
+	mu                sync.Mutex
+	answers           []string
+	blockAfterAnswers bool
+	calls             [][]BookKnowledgeMessage
+}
+
+func (c *evidenceAuditSequenceClient) Chat(ctx context.Context, _ BookTokenPlanConfig, messages []BookKnowledgeMessage) (string, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, append([]BookKnowledgeMessage(nil), messages...))
+	index := len(c.calls) - 1
+	if index < len(c.answers) {
+		answer := c.answers[index]
+		c.mu.Unlock()
+		return answer, nil
+	}
+	c.mu.Unlock()
+	if c.blockAfterAnswers {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	return "", errors.New("missing fake model answer")
 }
 
 func evidenceAuditRunnerConfig() EvidenceAuditRunnerConfig {

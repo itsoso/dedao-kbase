@@ -167,12 +167,46 @@ func searchAgentPackageReleaseEvidenceContext(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	results, err := searchAgentPackageReleaseEvidence(store, pkg, releaseID, query, limit)
+	ref, err := agentPackagePinnedReleaseRef(pkg, releaseID)
 	if err != nil {
 		return nil, err
 	}
+	release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, err)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if agentTraceReleaseContentHash(release.ContentHash) != agentTraceReleaseContentHash(ref.ContentHash) {
+		return nil, fmt.Errorf("pinned release %q content hash changed", ref.ReleaseID)
+	}
+	releaseResults, err := searchAgentReleaseClaimsWithStrategyContext(
+		ctx, store, *release, query, limit, pkg.RetrievalPolicy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	allowedCitations := stringBoolSet(ref.CitationIDs...)
+	results := make([]AgentPackageEvidence, 0, len(releaseResults))
+	for _, result := range releaseResults {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		filteredCitations := make([]string, 0, len(result.CitationIDs))
+		for _, citationID := range result.CitationIDs {
+			if allowedCitations[citationID] {
+				filteredCitations = append(filteredCitations, citationID)
+			}
+		}
+		if pkg.RetrievalPolicy.RequireCitations && len(filteredCitations) == 0 {
+			continue
+		}
+		results = append(results, AgentPackageEvidence{
+			ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
+			Statement: result.Statement, CitationIDs: filteredCitations,
+			Score: result.Score,
+		})
 	}
 	return results, nil
 }
