@@ -1,0 +1,499 @@
+package app
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+const evidenceAuditStoreVersion = "1"
+
+var (
+	ErrEvidenceAuditIdempotencyConflict = errors.New("evidence audit idempotency conflict")
+	ErrEvidenceAuditImmutable           = errors.New("completed evidence audit is immutable")
+	ErrEvidenceAuditStateConflict       = errors.New("evidence audit state conflict")
+)
+
+type EvidenceAuditRecord struct {
+	AuditID            string `json:"audit_id"`
+	Status             string `json:"status"`
+	PackageID          string `json:"package_id"`
+	PackageVersion     string `json:"package_version"`
+	PackageContentHash string `json:"package_content_hash"`
+	InputHash          string `json:"input_hash"`
+	OutputHash         string `json:"output_hash,omitempty"`
+	TraceID            string `json:"trace_id,omitempty"`
+	CreatedAt          string `json:"created_at"`
+	UpdatedAt          string `json:"updated_at"`
+	StartedAt          string `json:"started_at,omitempty"`
+	CompletedAt        string `json:"completed_at,omitempty"`
+	FailedAt           string `json:"failed_at,omitempty"`
+	FailureReason      string `json:"failure_reason,omitempty"`
+}
+
+type EvidenceAuditIdempotencyRecord struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	AuditID        string `json:"audit_id"`
+	InputHash      string `json:"input_hash"`
+}
+
+type EvidenceAuditManifest struct {
+	Version     string                           `json:"version"`
+	UpdatedAt   string                           `json:"updated_at"`
+	Audits      []EvidenceAuditRecord            `json:"audits"`
+	Idempotency []EvidenceAuditIdempotencyRecord `json:"idempotency"`
+}
+
+func (s *BookKnowledgeStore) EvidenceAuditDir() string {
+	return filepath.Join(s.root, "agent-audits")
+}
+
+func (s *BookKnowledgeStore) EvidenceAuditManifestPath() string {
+	return filepath.Join(s.EvidenceAuditDir(), "manifest.json")
+}
+
+func (s *BookKnowledgeStore) EvidenceAuditInputPath(inputHash string) string {
+	return filepath.Join(s.EvidenceAuditDir(), "inputs", evidenceAuditHashName(inputHash)+".json")
+}
+
+func (s *BookKnowledgeStore) EvidenceAuditReportPath(outputHash string) string {
+	return filepath.Join(s.EvidenceAuditDir(), "reports", evidenceAuditHashName(outputHash)+".json")
+}
+
+func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, idempotencyKey string, now time.Time) (*EvidenceAudit, bool, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	idempotencyKey = strings.TrimSpace(idempotencyKey)
+	if idempotencyKey == "" {
+		return nil, false, fmt.Errorf("idempotency_key is required")
+	}
+	normalized, err := normalizeEvidenceAuditInput(input)
+	if err != nil {
+		return nil, false, err
+	}
+	inputHash, err := EvidenceAuditInputHash(normalized)
+	if err != nil {
+		return nil, false, err
+	}
+	normalized.InputHash = inputHash
+	if now.IsZero() {
+		now = time.Now()
+	}
+	timestamp := now.UTC().Format(time.RFC3339Nano)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := os.MkdirAll(store.EvidenceAuditDir(), os.ModePerm); err != nil {
+		return nil, false, err
+	}
+	manifest, err := store.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, false, err
+	}
+	for _, record := range manifest.Idempotency {
+		if record.IdempotencyKey != idempotencyKey {
+			continue
+		}
+		if record.InputHash != inputHash {
+			return nil, false, fmt.Errorf("%w: key %q already references different input", ErrEvidenceAuditIdempotencyConflict, idempotencyKey)
+		}
+		audit, err := store.loadEvidenceAuditByIDUnlocked(manifest, record.AuditID)
+		return audit, false, err
+	}
+	for _, record := range manifest.Audits {
+		if record.PackageID != normalized.Package.PackageID ||
+			record.PackageVersion != normalized.Package.Version ||
+			record.InputHash != inputHash {
+			continue
+		}
+		manifest.Idempotency = append(manifest.Idempotency, EvidenceAuditIdempotencyRecord{
+			IdempotencyKey: idempotencyKey,
+			AuditID:        record.AuditID,
+			InputHash:      inputHash,
+		})
+		manifest.UpdatedAt = timestamp
+		if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+			return nil, false, err
+		}
+		audit, err := store.loadEvidenceAuditRecordUnlocked(record)
+		return audit, false, err
+	}
+	if err := store.writeEvidenceAuditInputUnlocked(normalized); err != nil {
+		return nil, false, err
+	}
+	auditID := "audit-" + strings.TrimPrefix(inputHash, "sha256:")[:24]
+	record := EvidenceAuditRecord{
+		AuditID:            auditID,
+		Status:             EvidenceAuditQueued,
+		PackageID:          normalized.Package.PackageID,
+		PackageVersion:     normalized.Package.Version,
+		PackageContentHash: normalized.Package.ContentHash,
+		InputHash:          inputHash,
+		CreatedAt:          timestamp,
+		UpdatedAt:          timestamp,
+	}
+	manifest.Version = evidenceAuditStoreVersion
+	manifest.UpdatedAt = timestamp
+	manifest.Audits = append(manifest.Audits, record)
+	manifest.Idempotency = append(manifest.Idempotency, EvidenceAuditIdempotencyRecord{
+		IdempotencyKey: idempotencyKey,
+		AuditID:        auditID,
+		InputHash:      inputHash,
+	})
+	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+		return nil, false, err
+	}
+	audit := evidenceAuditFromInput(normalized, record, idempotencyKey)
+	return &audit, true, nil
+}
+
+func StartEvidenceAudit(store *BookKnowledgeStore, auditID, traceID string, now time.Time) (*EvidenceAudit, error) {
+	return updateEvidenceAuditRecord(store, auditID, now, func(record *EvidenceAuditRecord) error {
+		if record.Status != EvidenceAuditQueued {
+			if record.Status == EvidenceAuditCompleted {
+				return ErrEvidenceAuditImmutable
+			}
+			return fmt.Errorf("%w: cannot start audit in %q", ErrEvidenceAuditStateConflict, record.Status)
+		}
+		traceID = strings.TrimSpace(traceID)
+		if traceID == "" {
+			return fmt.Errorf("trace_id is required")
+		}
+		record.Status = EvidenceAuditRunning
+		record.TraceID = traceID
+		record.StartedAt = evidenceAuditTimestamp(now)
+		return nil
+	})
+}
+
+func FailEvidenceAudit(store *BookKnowledgeStore, auditID, reason string, now time.Time) (*EvidenceAudit, error) {
+	return updateEvidenceAuditRecord(store, auditID, now, func(record *EvidenceAuditRecord) error {
+		if record.Status == EvidenceAuditCompleted {
+			return ErrEvidenceAuditImmutable
+		}
+		if record.Status != EvidenceAuditQueued && record.Status != EvidenceAuditRunning {
+			return fmt.Errorf("%w: cannot fail audit in %q", ErrEvidenceAuditStateConflict, record.Status)
+		}
+		reason = strings.TrimSpace(reason)
+		if reason == "" {
+			return fmt.Errorf("failure reason is required")
+		}
+		if len(reason) > 256 {
+			reason = reason[:256]
+		}
+		record.Status = EvidenceAuditFailed
+		record.FailedAt = evidenceAuditTimestamp(now)
+		record.FailureReason = reason
+		record.OutputHash = ""
+		return nil
+	})
+}
+
+func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now time.Time) (*EvidenceAudit, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	manifest, err := store.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(report.AuditID))
+	if record == nil {
+		return nil, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, report.AuditID)
+	}
+	if record.Status == EvidenceAuditCompleted {
+		return nil, ErrEvidenceAuditImmutable
+	}
+	if record.Status != EvidenceAuditRunning {
+		return nil, fmt.Errorf("%w: cannot complete audit in %q", ErrEvidenceAuditStateConflict, record.Status)
+	}
+	input, err := store.loadEvidenceAuditInputUnlocked(record.InputHash)
+	if err != nil {
+		return nil, err
+	}
+	idempotencyKey := evidenceAuditIdempotencyKey(manifest, record.AuditID)
+	report.SchemaVersion = EvidenceAuditSchemaVersion
+	report.AuditID = record.AuditID
+	report.Status = EvidenceAuditCompleted
+	report.CreatedAt = record.CreatedAt
+	report.UpdatedAt = evidenceAuditTimestamp(now)
+	report.StartedAt = record.StartedAt
+	report.CompletedAt = evidenceAuditTimestamp(now)
+	report.FailedAt = ""
+	report.FailureReason = ""
+	report.IdempotencyKey = idempotencyKey
+	report.InputHash = record.InputHash
+	report.Package = input.Package
+	report.Model = input.Model
+	report.Retrieval = input.Retrieval
+	report.Releases = input.Releases
+	report.Subject = input.Subject
+	report.Scope = input.Scope
+	report.SelectedClaims = input.SelectedClaims
+	report.TraceID = record.TraceID
+	report.OutputHash = ""
+	finalized, err := FinalizeEvidenceAuditReport(report)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.writeEvidenceAuditReportUnlocked(finalized); err != nil {
+		return nil, err
+	}
+	record.Status = EvidenceAuditCompleted
+	record.OutputHash = finalized.OutputHash
+	record.UpdatedAt = finalized.UpdatedAt
+	record.CompletedAt = finalized.CompletedAt
+	manifest.UpdatedAt = finalized.UpdatedAt
+	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+		return nil, err
+	}
+	return &finalized, nil
+}
+
+func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	return s.loadEvidenceAuditByIDUnlocked(manifest, strings.TrimSpace(auditID))
+}
+
+func (s *BookKnowledgeStore) ListEvidenceAudits(packageID, version string, limit int) ([]EvidenceAuditRecord, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	packageID = strings.TrimSpace(packageID)
+	version = strings.TrimSpace(version)
+	records := make([]EvidenceAuditRecord, 0, len(manifest.Audits))
+	for _, record := range manifest.Audits {
+		if packageID != "" && record.PackageID != packageID {
+			continue
+		}
+		if version != "" && record.PackageVersion != version {
+			continue
+		}
+		records = append(records, record)
+		if len(records) == limit {
+			break
+		}
+	}
+	return records, nil
+}
+
+func updateEvidenceAuditRecord(store *BookKnowledgeStore, auditID string, now time.Time, update func(*EvidenceAuditRecord) error) (*EvidenceAudit, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	manifest, err := store.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID))
+	if record == nil {
+		return nil, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	if err := update(record); err != nil {
+		return nil, err
+	}
+	record.UpdatedAt = evidenceAuditTimestamp(now)
+	manifest.UpdatedAt = record.UpdatedAt
+	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+		return nil, err
+	}
+	return store.loadEvidenceAuditRecordUnlocked(*record)
+}
+
+func (s *BookKnowledgeStore) loadEvidenceAuditByIDUnlocked(manifest *EvidenceAuditManifest, auditID string) (*EvidenceAudit, error) {
+	record := findEvidenceAuditRecord(manifest, auditID)
+	if record == nil {
+		return nil, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	return s.loadEvidenceAuditRecordUnlocked(*record)
+}
+
+func (s *BookKnowledgeStore) loadEvidenceAuditRecordUnlocked(record EvidenceAuditRecord) (*EvidenceAudit, error) {
+	if record.Status == EvidenceAuditCompleted {
+		var report EvidenceAudit
+		if err := readJSONFile(s.EvidenceAuditReportPath(record.OutputHash), &report); err != nil {
+			return nil, err
+		}
+		if report.AuditID != record.AuditID || report.InputHash != record.InputHash ||
+			report.OutputHash != record.OutputHash || report.Status != record.Status {
+			return nil, fmt.Errorf("evidence audit report identity does not match manifest record")
+		}
+		if err := ValidateEvidenceAudit(report); err != nil {
+			return nil, fmt.Errorf("validate persisted evidence audit report: %w", err)
+		}
+		return &report, nil
+	}
+	input, err := s.loadEvidenceAuditInputUnlocked(record.InputHash)
+	if err != nil {
+		return nil, err
+	}
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	audit := evidenceAuditFromInput(input, record, evidenceAuditIdempotencyKey(manifest, record.AuditID))
+	if err := ValidateEvidenceAudit(audit); err != nil {
+		return nil, fmt.Errorf("validate persisted evidence audit: %w", err)
+	}
+	return &audit, nil
+}
+
+func (s *BookKnowledgeStore) loadEvidenceAuditInputUnlocked(inputHash string) (EvidenceAuditInput, error) {
+	var input EvidenceAuditInput
+	if err := readJSONFile(s.EvidenceAuditInputPath(inputHash), &input); err != nil {
+		return EvidenceAuditInput{}, err
+	}
+	wantHash, err := EvidenceAuditInputHash(input)
+	if err != nil {
+		return EvidenceAuditInput{}, err
+	}
+	if input.InputHash != inputHash || wantHash != inputHash {
+		return EvidenceAuditInput{}, fmt.Errorf("evidence audit input content hash does not match artifact")
+	}
+	return input, nil
+}
+
+func (s *BookKnowledgeStore) writeEvidenceAuditInputUnlocked(input EvidenceAuditInput) error {
+	path := s.EvidenceAuditInputPath(input.InputHash)
+	if _, err := os.Stat(path); err == nil {
+		stored, loadErr := s.loadEvidenceAuditInputUnlocked(input.InputHash)
+		if loadErr != nil {
+			return loadErr
+		}
+		storedPayload, _ := encodeJSONFile(stored)
+		inputPayload, _ := encodeJSONFile(input)
+		if string(storedPayload) != string(inputPayload) {
+			return fmt.Errorf("immutable evidence audit input artifact conflict")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	payload, err := encodeJSONFile(input)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return err
+	}
+	return writeFileAtomically(path, payload)
+}
+
+func (s *BookKnowledgeStore) writeEvidenceAuditReportUnlocked(report EvidenceAudit) error {
+	path := s.EvidenceAuditReportPath(report.OutputHash)
+	if _, err := os.Stat(path); err == nil {
+		return ErrEvidenceAuditImmutable
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	payload, err := encodeJSONFile(report)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return err
+	}
+	return writeFileAtomically(path, payload)
+}
+
+func (s *BookKnowledgeStore) loadEvidenceAuditManifestUnlocked() (*EvidenceAuditManifest, error) {
+	var manifest EvidenceAuditManifest
+	if err := readJSONFile(s.EvidenceAuditManifestPath(), &manifest); errors.Is(err, os.ErrNotExist) {
+		return &EvidenceAuditManifest{
+			Version:     evidenceAuditStoreVersion,
+			Audits:      []EvidenceAuditRecord{},
+			Idempotency: []EvidenceAuditIdempotencyRecord{},
+		}, nil
+	} else if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(manifest.Audits, func(i, j int) bool {
+		if manifest.Audits[i].CreatedAt != manifest.Audits[j].CreatedAt {
+			return manifest.Audits[i].CreatedAt < manifest.Audits[j].CreatedAt
+		}
+		return manifest.Audits[i].AuditID < manifest.Audits[j].AuditID
+	})
+	return &manifest, nil
+}
+
+func (s *BookKnowledgeStore) writeEvidenceAuditManifestUnlocked(manifest *EvidenceAuditManifest) error {
+	payload, err := encodeJSONFile(manifest)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(s.EvidenceAuditManifestPath(), payload)
+}
+
+func evidenceAuditFromInput(input EvidenceAuditInput, record EvidenceAuditRecord, idempotencyKey string) EvidenceAudit {
+	return EvidenceAudit{
+		SchemaVersion:  input.SchemaVersion,
+		AuditID:        record.AuditID,
+		Status:         record.Status,
+		CreatedAt:      record.CreatedAt,
+		UpdatedAt:      record.UpdatedAt,
+		StartedAt:      record.StartedAt,
+		CompletedAt:    record.CompletedAt,
+		FailedAt:       record.FailedAt,
+		IdempotencyKey: idempotencyKey,
+		InputHash:      record.InputHash,
+		Package:        input.Package,
+		Model:          input.Model,
+		Retrieval:      input.Retrieval,
+		Releases:       input.Releases,
+		Subject:        input.Subject,
+		Scope:          input.Scope,
+		SelectedClaims: input.SelectedClaims,
+		OutputHash:     record.OutputHash,
+		TraceID:        record.TraceID,
+		FailureReason:  record.FailureReason,
+	}
+}
+
+func findEvidenceAuditRecord(manifest *EvidenceAuditManifest, auditID string) *EvidenceAuditRecord {
+	for index := range manifest.Audits {
+		if manifest.Audits[index].AuditID == auditID {
+			return &manifest.Audits[index]
+		}
+	}
+	return nil
+}
+
+func evidenceAuditIdempotencyKey(manifest *EvidenceAuditManifest, auditID string) string {
+	for _, record := range manifest.Idempotency {
+		if record.AuditID == auditID {
+			return record.IdempotencyKey
+		}
+	}
+	return ""
+}
+
+func evidenceAuditTimestamp(now time.Time) string {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.UTC().Format(time.RFC3339Nano)
+}
+
+func evidenceAuditHashName(hash string) string {
+	return sanitizeBookKnowledgeID(strings.TrimPrefix(strings.TrimSpace(hash), "sha256:"))
+}
