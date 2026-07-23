@@ -514,6 +514,16 @@ func agentRuntimeTraceCitations(evidence []AgentPackageEvidence, citations []Age
 }
 
 func loadRunnableAgentPackage(store *BookKnowledgeStore, packageID, version, capability string) (*AgentPackage, error) {
+	return loadRunnableAgentPackageContext(
+		context.Background(), store, packageID, version, capability,
+	)
+}
+
+func loadRunnableAgentPackageContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	packageID, version, capability string,
+) (*AgentPackage, error) {
 	if store == nil {
 		return nil, fmt.Errorf("agent package store is required")
 	}
@@ -522,14 +532,20 @@ func loadRunnableAgentPackage(store *BookKnowledgeStore, packageID, version, cap
 	if packageID == "" || version == "" {
 		return nil, fmt.Errorf("package_id and package_version are required")
 	}
-	pkg, err := store.LoadAgentPackage(packageID, version)
+	pkg, err := store.LoadAgentPackageContext(ctx, packageID, version)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if pkg.LifecycleState != AgentPackagePublished {
 		return nil, fmt.Errorf("agent package %s is not published", agentPackageReference(pkg.PackageID, pkg.Version))
 	}
 	if err := ValidateAgentPackageEvaluationGate(store, *pkg); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if !agentPackageHasCapability(*pkg, capability) {

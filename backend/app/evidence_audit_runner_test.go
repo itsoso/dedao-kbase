@@ -259,7 +259,9 @@ func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
 	for _, scope := range []string{
 		"Population-level PICO: does surgery improve five-year survival in adults?",
 		"Compare evidence for screening tests in adults aged 50 to 75.",
+		"Should adults with resectable disease receive surgery according to trial evidence?",
 		"群体级PICO：手术是否改善成年患者五年生存率？",
+		"成年患者是否应该接受手术？请比较临床试验证据。",
 	} {
 		t.Run(scope, func(t *testing.T) {
 			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
@@ -284,7 +286,11 @@ func TestEvidenceAuditRunnerRejectsIndividualDecisionsDespitePopulationPrefixes(
 	for _, scope := range []string{
 		"Population-level PICO: should this patient undergo surgery?",
 		"Clinical trial evidence for adults: should patient John stop aspirin?",
+		"Population-level PICO: should John, age 62, undergo surgery?",
+		"Population-level PICO: should Maria undergo surgery?",
 		"群体级PICO：患者张三是否应该做手术？",
+		"群体级 PICO：年龄 62 的张三是否应该做手术？",
+		"群体级 PICO：李雷是否应该做手术？",
 		"人群证据比较：这个 62 岁病例要不要停药？",
 	} {
 		if !evidenceAuditRequestsMedicalAdvice(scope) {
@@ -293,7 +299,9 @@ func TestEvidenceAuditRunnerRejectsIndividualDecisionsDespitePopulationPrefixes(
 	}
 	for _, scope := range []string{
 		"Population-level PICO: does surgery improve survival in adults?",
+		"Should adults with resectable disease receive surgery according to trial evidence?",
 		"群体级PICO：手术是否改善成年患者五年生存率？",
+		"成年患者是否应该接受手术？请比较临床试验证据。",
 	} {
 		if evidenceAuditRequestsMedicalAdvice(scope) {
 			t.Fatalf("population evidence question was rejected: %q", scope)
@@ -368,6 +376,49 @@ func TestEvidenceAuditRunnerTimeoutCoversPackageAndReleaseLoading(t *testing.T) 
 		}
 		if len(client.calls) != 0 {
 			t.Fatal("model called after package deadline expired")
+		}
+	})
+
+	t.Run("v2 package deadline interrupts artifact load", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		pkg.Version = "2.0.2-artifact-timeout"
+		pkg.ModelPolicy.TimeoutMS = 5
+		pkg.ContentHash = ""
+		pkg, err := FinalizeAgentPackage(pkg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		savePassingAgentPackageTestEvaluation(t, store, pkg)
+		published, _, err := PublishAgentPackage(
+			store, pkg, "publish-artifact-timeout", AgentReadOnlyToolIDs(), testAgentPackageTime(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input, err := PrepareEvidenceAuditInput(
+			store, published.PackageID, published.Version, "Clinical trial evidence", "Evidence comparison only.",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		audit, _, err := CreateEvidenceAudit(store, input, "runner-artifact-load-timeout", testAgentPackageTime())
+		if err != nil {
+			t.Fatal(err)
+		}
+		previous := agentPackageArtifactLoadHook
+		agentPackageArtifactLoadHook = func(ctx context.Context, _ string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		t.Cleanup(func() { agentPackageArtifactLoadHook = previous })
+		client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+		cfg := evidenceAuditRunnerConfig()
+		cfg.Timeout = 0
+		if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, cfg); err == nil {
+			t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+		}
+		if len(client.calls) != 0 {
+			t.Fatal("model called after v2 package artifact deadline expired")
 		}
 	})
 }

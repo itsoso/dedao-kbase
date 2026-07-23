@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -16,16 +18,27 @@ const agentPackageStoreVersion = "1"
 var (
 	ErrAgentPackageIdempotencyConflict = errors.New("agent package idempotency conflict")
 	ErrAgentPackageVersionConflict     = errors.New("agent package version conflict")
+	agentPackageArtifactLoadHook       = func(context.Context, string) error { return nil }
 )
 
 type AgentPackageRecord struct {
+	PackageID      string                         `json:"package_id"`
+	Version        string                         `json:"version"`
+	ContentHash    string                         `json:"content_hash"`
+	LifecycleState string                         `json:"lifecycle_state"`
+	Supersedes     string                         `json:"supersedes,omitempty"`
+	PublishedAt    string                         `json:"published_at"`
+	URL            string                         `json:"url"`
+	Runtime        *AgentPackageRuntimeDescriptor `json:"runtime,omitempty"`
+}
+
+type AgentPackageRuntimeDescriptor struct {
+	SchemaVersion  string `json:"schema_version"`
 	PackageID      string `json:"package_id"`
 	Version        string `json:"version"`
 	ContentHash    string `json:"content_hash"`
-	LifecycleState string `json:"lifecycle_state"`
-	Supersedes     string `json:"supersedes,omitempty"`
-	PublishedAt    string `json:"published_at"`
-	URL            string `json:"url"`
+	TimeoutMS      int    `json:"timeout_ms"`
+	DescriptorHash string `json:"descriptor_hash"`
 }
 
 type AgentPackageIdempotencyRecord struct {
@@ -154,6 +167,13 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 		PublishedAt:    published.PublishedAt,
 		URL:            agentPackageURL(published.PackageID, published.Version),
 	}
+	if published.SchemaVersion == AgentPackageSchemaVersionV2 {
+		descriptor, descriptorErr := newAgentPackageRuntimeDescriptor(published)
+		if descriptorErr != nil {
+			return nil, false, descriptorErr
+		}
+		record.Runtime = &descriptor
+	}
 	manifest.Version = agentPackageStoreVersion
 	manifest.UpdatedAt = timestamp
 	manifest.Packages = append(manifest.Packages, record)
@@ -170,21 +190,68 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 }
 
 func (s *BookKnowledgeStore) LoadAgentPackage(packageID, version string) (*AgentPackage, error) {
+	return s.LoadAgentPackageContext(context.Background(), packageID, version)
+}
+
+func (s *BookKnowledgeStore) LoadAgentPackageContext(
+	ctx context.Context, packageID, version string,
+) (*AgentPackage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	manifest, err := s.loadAgentPackageManifestUnlocked()
 	if err != nil {
 		s.mu.RUnlock()
 		return nil, err
 	}
-	pkg, err := s.loadAgentPackageByIdentityUnlocked(manifest, strings.TrimSpace(packageID), strings.TrimSpace(version))
+	record, err := selectAgentPackageRecord(
+		manifest, strings.TrimSpace(packageID), strings.TrimSpace(version),
+	)
+	if err != nil {
+		s.mu.RUnlock()
+		return nil, err
+	}
+	pkg, err := s.loadAgentPackageRecordContextUnlocked(ctx, *record)
 	s.mu.RUnlock()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := ValidateAgentPackage(*pkg, s, AgentReadOnlyToolIDs()); err != nil {
 		return nil, fmt.Errorf("validate persisted agent package: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	return pkg, nil
+}
+
+func (s *BookKnowledgeStore) LoadAgentPackageV2RuntimeDescriptor(
+	packageID, version, contentHash string,
+) (*AgentPackageRuntimeDescriptor, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	manifest, err := s.loadAgentPackageManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	record, err := selectAgentPackageRecord(
+		manifest, strings.TrimSpace(packageID), strings.TrimSpace(version),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if record.ContentHash != strings.TrimSpace(contentHash) {
+		return nil, fmt.Errorf("agent package runtime descriptor content hash does not match audit")
+	}
+	if err := validateAgentPackageRuntimeDescriptor(*record, nil); err != nil {
+		return nil, err
+	}
+	descriptor := *record.Runtime
+	return &descriptor, nil
 }
 
 func (s *BookKnowledgeStore) ListAgentPackages(after string, limit int) ([]AgentPackageRecord, error) {
@@ -216,6 +283,16 @@ func (s *BookKnowledgeStore) ListAgentPackages(after string, limit int) ([]Agent
 }
 
 func (s *BookKnowledgeStore) loadAgentPackageByIdentityUnlocked(manifest *AgentPackageManifest, packageID, version string) (*AgentPackage, error) {
+	selected, err := selectAgentPackageRecord(manifest, packageID, version)
+	if err != nil {
+		return nil, err
+	}
+	return s.loadAgentPackageRecordUnlocked(*selected)
+}
+
+func selectAgentPackageRecord(
+	manifest *AgentPackageManifest, packageID, version string,
+) (*AgentPackageRecord, error) {
 	if packageID == "" {
 		return nil, fmt.Errorf("package_id is required")
 	}
@@ -239,16 +316,37 @@ func (s *BookKnowledgeStore) loadAgentPackageByIdentityUnlocked(manifest *AgentP
 	if selected == nil {
 		return nil, fmt.Errorf("%w: agent package %q", os.ErrNotExist, packageID)
 	}
-	return s.loadAgentPackageRecordUnlocked(*selected)
+	return selected, nil
 }
 
 func (s *BookKnowledgeStore) loadAgentPackageRecordUnlocked(record AgentPackageRecord) (*AgentPackage, error) {
+	return s.loadAgentPackageRecordContextUnlocked(context.Background(), record)
+}
+
+func (s *BookKnowledgeStore) loadAgentPackageRecordContextUnlocked(
+	ctx context.Context, record AgentPackageRecord,
+) (*AgentPackage, error) {
+	artifactPath := s.AgentPackagePath(record.ContentHash)
+	if err := agentPackageArtifactLoadHook(ctx, artifactPath); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var pkg AgentPackage
-	if err := readJSONFile(s.AgentPackagePath(record.ContentHash), &pkg); err != nil {
+	if err := readJSONFile(artifactPath, &pkg); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if pkg.PackageID != record.PackageID || pkg.Version != record.Version {
 		return nil, fmt.Errorf("agent package artifact identity does not match manifest record")
+	}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err != nil {
+			return nil, err
+		}
 	}
 	wantHash, err := AgentPackageContentHash(pkg)
 	if err != nil {
@@ -265,6 +363,71 @@ func (s *BookKnowledgeStore) loadAgentPackageRecordUnlocked(record AgentPackageR
 	pkg.Supersedes = record.Supersedes
 	pkg.PublishedAt = record.PublishedAt
 	return &pkg, nil
+}
+
+func newAgentPackageRuntimeDescriptor(pkg AgentPackage) (AgentPackageRuntimeDescriptor, error) {
+	descriptor := AgentPackageRuntimeDescriptor{
+		SchemaVersion: pkg.SchemaVersion,
+		PackageID:     pkg.PackageID,
+		Version:       pkg.Version,
+		ContentHash:   pkg.ContentHash,
+		TimeoutMS:     pkg.ModelPolicy.TimeoutMS,
+	}
+	hash, err := agentPackageRuntimeDescriptorHash(descriptor)
+	if err != nil {
+		return AgentPackageRuntimeDescriptor{}, err
+	}
+	descriptor.DescriptorHash = hash
+	return descriptor, nil
+}
+
+func validateAgentPackageRuntimeDescriptor(record AgentPackageRecord, pkg *AgentPackage) error {
+	if record.Runtime == nil {
+		return fmt.Errorf("agent package v2 runtime descriptor is required")
+	}
+	descriptor := *record.Runtime
+	if descriptor.SchemaVersion != AgentPackageSchemaVersionV2 ||
+		descriptor.PackageID != record.PackageID ||
+		descriptor.Version != record.Version ||
+		descriptor.ContentHash != record.ContentHash ||
+		descriptor.TimeoutMS <= 0 {
+		return fmt.Errorf("agent package runtime descriptor does not match manifest record")
+	}
+	wantHash, err := agentPackageRuntimeDescriptorHash(descriptor)
+	if err != nil {
+		return err
+	}
+	if descriptor.DescriptorHash != wantHash {
+		return fmt.Errorf("agent package runtime descriptor hash does not match")
+	}
+	if pkg != nil && (pkg.SchemaVersion != descriptor.SchemaVersion ||
+		pkg.PackageID != descriptor.PackageID ||
+		pkg.Version != descriptor.Version ||
+		pkg.ContentHash != descriptor.ContentHash ||
+		pkg.ModelPolicy.TimeoutMS != descriptor.TimeoutMS) {
+		return fmt.Errorf("agent package runtime descriptor does not match artifact")
+	}
+	return nil
+}
+
+func agentPackageRuntimeDescriptorHash(descriptor AgentPackageRuntimeDescriptor) (string, error) {
+	payload, err := json.Marshal(struct {
+		SchemaVersion string `json:"schema_version"`
+		PackageID     string `json:"package_id"`
+		Version       string `json:"version"`
+		ContentHash   string `json:"content_hash"`
+		TimeoutMS     int    `json:"timeout_ms"`
+	}{
+		SchemaVersion: descriptor.SchemaVersion,
+		PackageID:     descriptor.PackageID,
+		Version:       descriptor.Version,
+		ContentHash:   descriptor.ContentHash,
+		TimeoutMS:     descriptor.TimeoutMS,
+	})
+	if err != nil {
+		return "", err
+	}
+	return sha256Fingerprint(payload), nil
 }
 
 func (s *BookKnowledgeStore) loadAgentPackageManifestUnlocked() (*AgentPackageManifest, error) {

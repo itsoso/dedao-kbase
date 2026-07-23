@@ -87,6 +87,122 @@ func TestAgentPackageV1StoreRoundTripDoesNotRequireEvidencePolicy(t *testing.T) 
 	if loaded.SchemaVersion != AgentPackageSchemaVersionV1 || loaded.EvidencePolicy != nil {
 		t.Fatalf("v1 round trip = %#v", loaded)
 	}
+	records, err := store.ListAgentPackages("", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Runtime != nil {
+		t.Fatalf("v1 manifest record unexpectedly requires runtime descriptor: %#v", records)
+	}
+}
+
+func TestAgentPackageV2PublishesBoundRuntimeTimeoutDescriptor(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	saveAgentPackageSupportingRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+
+	published, _, err := PublishAgentPackage(
+		store, pkg, "publish-v2-runtime-descriptor", AgentReadOnlyToolIDs(),
+		time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := store.LoadAgentPackageV2RuntimeDescriptor(
+		published.PackageID, published.Version, published.ContentHash,
+	)
+	if err != nil {
+		t.Fatalf("LoadAgentPackageV2RuntimeDescriptor() error = %v", err)
+	}
+	if descriptor.PackageID != published.PackageID ||
+		descriptor.Version != published.Version ||
+		descriptor.ContentHash != published.ContentHash ||
+		descriptor.SchemaVersion != AgentPackageSchemaVersionV2 ||
+		descriptor.TimeoutMS != published.ModelPolicy.TimeoutMS ||
+		descriptor.DescriptorHash == "" {
+		t.Fatalf("runtime descriptor = %#v", descriptor)
+	}
+}
+
+func TestAgentPackageV2RejectsTamperedRuntimeTimeoutDescriptor(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	saveAgentPackageSupportingRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	published, _, err := PublishAgentPackage(
+		store, pkg, "publish-v2-runtime-tamper", AgentReadOnlyToolIDs(), time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var manifest AgentPackageManifest
+	if err := readJSONFile(store.AgentPackageManifestPath(), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Packages[0].Runtime.TimeoutMS++
+	payload, err := encodeJSONFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.AgentPackageManifestPath(), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.LoadAgentPackageV2RuntimeDescriptor(
+		published.PackageID, published.Version, published.ContentHash,
+	); err == nil || !strings.Contains(err.Error(), "runtime descriptor") {
+		t.Fatalf("tampered runtime descriptor error = %v", err)
+	}
+	if _, err := store.LoadAgentPackage(published.PackageID, published.Version); err == nil ||
+		!strings.Contains(err.Error(), "runtime descriptor") {
+		t.Fatalf("tampered v2 package load error = %v", err)
+	}
+}
+
+func TestAgentPackageV2RejectsMissingRuntimeTimeoutDescriptor(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	saveAgentPackageSupportingRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	published, _, err := PublishAgentPackage(
+		store, pkg, "publish-v2-runtime-missing", AgentReadOnlyToolIDs(), time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var manifest AgentPackageManifest
+	if err := readJSONFile(store.AgentPackageManifestPath(), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Packages[0].Runtime = nil
+	payload, err := encodeJSONFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.AgentPackageManifestPath(), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.LoadAgentPackageV2RuntimeDescriptor(
+		published.PackageID, published.Version, published.ContentHash,
+	); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("missing runtime descriptor error = %v", err)
+	}
 }
 
 func TestAgentPackageStoreSupersedesVersionsWithoutMutatingArtifacts(t *testing.T) {

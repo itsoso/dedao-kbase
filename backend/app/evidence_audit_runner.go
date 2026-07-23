@@ -8,15 +8,23 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 )
 
 const evidenceAuditModelOutputSchema = "evidence-audit-model.v1"
-const evidenceAuditInitialTimeout = 30 * time.Second
 
 var ErrEvidenceAuditModelOutcomeUnknown = errors.New("model_outcome_unknown: requires_manual_retry")
+
+var (
+	evidenceAuditEnglishAgePattern      = regexp.MustCompile(`(?i)\bage\s*[:=]?\s*\d+|\b\d+\s*[- ]?year[- ]old\b`)
+	evidenceAuditChineseAgePattern      = regexp.MustCompile(`年龄\s*[:：]?\s*\d+|\d+\s*岁`)
+	evidenceAuditDecisionSubjectPattern = regexp.MustCompile(
+		`(?i)\b(?:should|can|could|would)\s+([a-z][a-z'-]*)`,
+	)
+)
 
 type EvidenceAuditRunnerConfig struct {
 	ModelConfig BookTokenPlanConfig
@@ -121,23 +129,43 @@ func RunEvidenceAudit(
 		return nil, fmt.Errorf("evidence audit store is required")
 	}
 	startedAt := time.Now()
-	initialTimeout := config.Timeout
-	if initialTimeout <= 0 {
-		initialTimeout = evidenceAuditInitialTimeout
+	runCtx := ctx
+	cancel := func() {}
+	if config.Timeout > 0 {
+		runCtx, cancel = context.WithDeadline(ctx, startedAt.Add(config.Timeout))
 	}
-	runCtx, cancel := context.WithTimeout(ctx, initialTimeout)
 	defer cancel()
 	if err := evidenceAuditRunnerStage(runCtx, "load"); err != nil {
 		return nil, err
 	}
+	auditID = strings.TrimSpace(auditID)
+	audit, err := store.LoadEvidenceAudit(auditID)
+	if err != nil {
+		return nil, err
+	}
+	descriptor, err := store.LoadAgentPackageV2RuntimeDescriptor(
+		audit.Package.PackageID, audit.Package.Version, audit.Package.ContentHash,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load package runtime descriptor: %w", err)
+	}
+	if config.Timeout <= 0 {
+		runCtx, cancel = context.WithDeadline(
+			ctx, startedAt.Add(time.Duration(descriptor.TimeoutMS)*time.Millisecond),
+		)
+		defer cancel()
+	}
+	if err := evidenceAuditRunnerStage(runCtx, "package_descriptor_loaded"); err != nil {
+		return nil, err
+	}
 	unlockExecution, err := store.acquireEvidenceAuditExecutionLock(
-		runCtx, strings.TrimSpace(auditID),
+		runCtx, auditID,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer unlockExecution()
-	audit, err := store.LoadEvidenceAudit(strings.TrimSpace(auditID))
+	audit, err = store.LoadEvidenceAudit(auditID)
 	if err != nil {
 		return nil, err
 	}
@@ -175,14 +203,6 @@ func RunEvidenceAudit(
 	pkg, runErr := loadEvidenceAuditPackageContext(
 		runCtx, store, audit.Package.PackageID, audit.Package.Version,
 	)
-	if runErr == nil && config.Timeout <= 0 && pkg.ModelPolicy.TimeoutMS > 0 {
-		packageDeadline := startedAt.Add(time.Duration(pkg.ModelPolicy.TimeoutMS) * time.Millisecond)
-		if currentDeadline, ok := runCtx.Deadline(); !ok || packageDeadline.Before(currentDeadline) {
-			cancel()
-			runCtx, cancel = context.WithDeadline(ctx, packageDeadline)
-			defer cancel()
-		}
-	}
 	var releases map[string]KnowledgeRelease
 	if runErr == nil {
 		runErr = evidenceAuditRunnerStage(runCtx, "package_loaded")
@@ -411,7 +431,10 @@ func loadEvidenceAuditPackageContext(
 	if err := evidenceAuditRunnerStage(ctx, "package_load"); err != nil {
 		return AgentPackage{}, err
 	}
-	pkg, err := loadRunnableAgentPackage(store, packageID, version, "evidence")
+	if err := evidenceAuditRunnerStage(ctx, "package_artifact_load"); err != nil {
+		return AgentPackage{}, err
+	}
+	pkg, err := loadRunnableAgentPackageContext(ctx, store, packageID, version, "evidence")
 	if err != nil {
 		return AgentPackage{}, err
 	}
@@ -1214,15 +1237,13 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		}
 		return false
 	}
-	safeEvidenceIntent := hasAny(
-		"evidence audit", "evidence comparison", "clinical trial evidence", "review the evidence",
-		"compare studies", "assess the claim", "population-level", "pico", "in adults",
-		"证据审计", "证据比较", "临床试验证据", "评估观点", "文献综述", "群体级", "人群",
-	)
-	populationContext := hasAny(
-		"population", "population-level", "cohort", "participants", "subjects",
-		"patients with", "adults with", "children with", "in adults", "pico",
-		"人群", "群体级", "队列", "受试者", "成年患者", "儿童患者",
+	explicitPopulationSubject := hasAny(
+		"patients ", "patients with", "adults ", "adults with", "children ",
+		"children with", "participants ", "subjects ", "people with", "persons with",
+		"cohort of", "population of", "group of", "groups of", "among patients",
+		"among adults", "among children", "in patients", "in adults", "in children",
+		"患者群体", "患者人群", "成年患者", "儿童患者", "受试者", "研究人群",
+		"队列人群", "成年人群", "儿童群体",
 	)
 	firstPersonContext := hasAny(
 		" i ", " me", " my ", "for me", "should i", "can i", "could i",
@@ -1231,7 +1252,7 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 	)
 	specificPatientContext := hasAny(
 		"this patient", "the patient", "this person", "case ", "year-old",
-		"病例", "个案", "这个患者", "该患者", "这名患者", "岁",
+		"病例", "个案", "这个患者", "该患者", "这名患者",
 	) || (strings.Contains(value, "patient ") &&
 		!strings.Contains(value, "patient population") &&
 		!strings.Contains(value, "patients ")) ||
@@ -1239,7 +1260,10 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 			!strings.Contains(value, "成年患者") &&
 			!strings.Contains(value, "儿童患者") &&
 			!strings.Contains(value, "患者人群"))
-	personalContext := firstPersonContext || specificPatientContext
+	ageOrNamedPersonContext := evidenceAuditEnglishAgePattern.MatchString(value) ||
+		evidenceAuditChineseAgePattern.MatchString(value) ||
+		evidenceAuditDecisionHasNonPopulationSubject(value)
+	personalContext := firstPersonContext || specificPatientContext || ageOrNamedPersonContext
 	diagnosisOrTreatment := hasAny(
 		"diagnos", "treat", "therapy for", "prescri", "medical advice", "what do i have",
 		"do i have", "cure me", "诊断", "治疗", "处方", "看病", "治好", "是什么病",
@@ -1271,11 +1295,52 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		(medicationContext && (personalContext || decisionRequest)) {
 		return true
 	}
-	if populationContext && safeEvidenceIntent {
+	if explicitPopulationSubject && !personalContext {
 		return false
 	}
 	if clinicalContext || decisionRequest {
 		return true
+	}
+	return false
+}
+
+func evidenceAuditDecisionHasNonPopulationSubject(value string) bool {
+	populationSubjects := map[string]bool{
+		"patients": true, "adults": true, "children": true, "participants": true,
+		"subjects": true, "people": true, "persons": true, "cohorts": true,
+		"groups": true, "populations": true,
+		"surgery": true, "screening": true, "treatment": true, "therapy": true,
+		"procedure": true, "test": true, "drug": true, "medication": true,
+	}
+	for _, match := range evidenceAuditDecisionSubjectPattern.FindAllStringSubmatch(value, -1) {
+		if len(match) == 2 && !populationSubjects[strings.ToLower(match[1])] {
+			return true
+		}
+	}
+	for _, marker := range []string{"是否应该", "是否应当", "要不要", "该不该", "能不能", "可不可以"} {
+		index := strings.Index(value, marker)
+		if index < 0 {
+			continue
+		}
+		subject := strings.TrimSpace(value[:index])
+		if separator := strings.LastIndexAny(subject, ":：,，。！？?;；"); separator >= 0 {
+			subject = strings.TrimSpace(subject[separator+1:])
+		}
+		if subject == "" || !evidenceAuditHasExplicitPopulationSubject(subject) {
+			return true
+		}
+	}
+	return false
+}
+
+func evidenceAuditHasExplicitPopulationSubject(value string) bool {
+	for _, marker := range []string{
+		"患者群体", "患者人群", "成年患者", "儿童患者", "受试者", "研究人群",
+		"队列人群", "成年人群", "儿童群体",
+	} {
+		if strings.Contains(value, marker) {
+			return true
+		}
 	}
 	return false
 }
