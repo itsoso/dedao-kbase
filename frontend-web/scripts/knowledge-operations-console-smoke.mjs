@@ -31,6 +31,6 @@ for (const marker of [
 }
 
 assert.ok(css.includes(".knowledge-operations"), "styles.css should include operations styles");
-assert.ok(html.includes("20260723-package-detail-first"), "index.html should keep a fresh shared asset cache version");
+assert.ok(html.includes("20260723-package-workspace"), "index.html should keep a fresh shared asset cache version");
 assert.ok(!js.includes("health_serving_promote</button>"), "UI must not expose Health serving promotion as a replay button");
 assert.ok(!js.includes("publish</button>"), "UI must not expose publish as safe replay");

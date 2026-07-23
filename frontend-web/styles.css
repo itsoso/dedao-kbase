@@ -2245,6 +2245,174 @@ a.button {
   scroll-margin-top: 120px;
 }
 
+.knowledge-web.is-directory-collapsed .knowledge-web__layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.knowledge-web.is-directory-collapsed .knowledge-web__sidebar {
+  display: none;
+}
+
+.knowledge-workspace__overview,
+.knowledge-workspace__section {
+  scroll-margin-top: 130px;
+}
+
+.knowledge-workspace__metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 8px 0 0;
+  color: #8d8475;
+  font-size: 12px;
+}
+
+.knowledge-workspace__metadata span + span::before {
+  margin-right: 14px;
+  color: rgba(141, 132, 117, 0.52);
+  content: "/";
+}
+
+.knowledge-workspace__lifecycle {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 18px;
+  border-top: 1px solid rgba(141, 132, 117, 0.18);
+  border-bottom: 1px solid rgba(141, 132, 117, 0.18);
+}
+
+.knowledge-workspace__stage {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr);
+  gap: 8px;
+  min-height: 82px;
+  border-top: 3px solid rgba(141, 132, 117, 0.22);
+  padding: 12px 14px;
+  color: #24231f;
+  text-decoration: none;
+}
+
+.knowledge-workspace__stage + .knowledge-workspace__stage {
+  border-left: 1px solid rgba(141, 132, 117, 0.18);
+}
+
+.knowledge-workspace__stage > span {
+  color: #a2998c;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.knowledge-workspace__stage div {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  min-width: 0;
+}
+
+.knowledge-workspace__stage strong {
+  font-size: 14px;
+}
+
+.knowledge-workspace__stage small {
+  overflow-wrap: anywhere;
+  color: #71675b;
+  line-height: 1.4;
+}
+
+.knowledge-workspace__stage.is-ready {
+  border-top-color: #1e7e5c;
+}
+
+.knowledge-workspace__stage.is-pending {
+  border-top-color: #d58a1f;
+}
+
+.knowledge-workspace__stage.is-failed {
+  border-top-color: #a9412f;
+}
+
+.knowledge-workspace__stage:hover {
+  background: rgba(255, 107, 0, 0.035);
+}
+
+.knowledge-workspace__nav {
+  position: sticky;
+  z-index: 11;
+  top: 118px;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin: 14px 0 0;
+  border-top: 1px solid rgba(141, 132, 117, 0.18);
+  border-bottom: 1px solid rgba(141, 132, 117, 0.18);
+  background: rgba(255, 253, 248, 0.96);
+  backdrop-filter: blur(14px);
+}
+
+.knowledge-workspace__nav a {
+  padding: 11px 8px;
+  color: #71675b;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+  text-decoration: none;
+}
+
+.knowledge-workspace__nav a:hover {
+  color: #ff6b00;
+}
+
+.knowledge-workspace__section {
+  padding-top: 18px;
+}
+
+.knowledge-workspace__section > .knowledge-review,
+.knowledge-workspace__section > .knowledge-web__manifest,
+.knowledge-workspace__section > .knowledge-web__analysis {
+  margin-top: 0;
+}
+
+.knowledge-workspace__analysis {
+  display: grid;
+  gap: 18px;
+}
+
+.knowledge-workspace__agent {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  margin-top: 18px;
+  border-top: 1px solid rgba(141, 132, 117, 0.2);
+  border-bottom: 1px solid rgba(141, 132, 117, 0.2);
+  padding-bottom: 18px;
+}
+
+.knowledge-workspace__agent-copy {
+  max-width: 780px;
+}
+
+.knowledge-workspace__agent h3,
+.knowledge-workspace__agent p {
+  margin: 0;
+}
+
+.knowledge-workspace__agent h3 {
+  color: #24231f;
+  font-size: 22px;
+}
+
+.knowledge-workspace__agent p:not(.web-kicker) {
+  margin-top: 8px;
+  color: #71675b;
+  line-height: 1.65;
+}
+
+.knowledge-workspace__agent-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
 .knowledge-web__catalog {
   margin-top: 14px;
   border: 1px solid rgba(141, 132, 117, 0.18);
@@ -4363,6 +4531,32 @@ a.button {
 
   .knowledge-web--detail .knowledge-web__main {
     order: -1;
+  }
+
+  .knowledge-workspace__lifecycle {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .knowledge-workspace__stage:nth-child(odd) {
+    border-left: 0;
+  }
+
+  .knowledge-workspace__nav {
+    position: static;
+  }
+
+  .knowledge-workspace__agent {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .knowledge-workspace__agent-actions {
+    flex-wrap: wrap;
+  }
+
+  .knowledge-workspace__agent-actions .button {
+    flex: 1;
+    justify-content: center;
   }
 
   .knowledge-web__catalog-head {

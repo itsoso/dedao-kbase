@@ -190,6 +190,10 @@ const knowledgeState = {
   pipelineAutomation: null,
   pipelineAutomationLoading: "",
   pipelineAutomationError: "",
+  agentPackages: [],
+  agentPackagesLoading: "",
+  agentPackagesError: "",
+  directoryCollapsed: false,
   loading: "",
   message: "",
 };
@@ -248,6 +252,7 @@ let sourceControlPollTimer = null;
 let sourceControlLoadSequence = 0;
 let knowledgeReviewPollTimer = null;
 let knowledgeReviewLoadSequence = 0;
+let knowledgeAgentLoadSequence = 0;
 
 function getToken() {
   for (const key of tokenKeys) {
@@ -1581,6 +1586,73 @@ function knowledgeReviewStatusLabel(status) {
   })[status] || status || "未知";
 }
 
+function knowledgePackageAgentMatch() {
+  const releaseID = knowledgeState.selectedRelease?.release_id
+    || knowledgeState.releaseDetail?.release_id
+    || "";
+  if (!releaseID) {
+    return null;
+  }
+  return (knowledgeState.agentPackages || []).find((pkg) => (
+    pkg.lifecycle_state === "published"
+    && Array.isArray(pkg.releases)
+    && pkg.releases.some((release) => release.release_id === releaseID)
+  )) || null;
+}
+
+function knowledgePackageLifecycle() {
+  const pkg = knowledgeState.package || {};
+  const book = pkg.book || knowledgeState.selectedBook || {};
+  const task = knowledgeReviewLatestTask();
+  const reviewStatus = knowledgeReviewStatus();
+  const manifest = knowledgeState.analysisManifest || {};
+  const agentPackage = knowledgePackageAgentMatch();
+  const contentReady = Boolean(
+    book.book_id
+    && ((pkg.chapters || []).length || (pkg.claims || []).length || (pkg.chunks || []).length),
+  );
+  const analysisReady = manifest.status === "ready" && Boolean(manifest.answer);
+  const releaseReady = Boolean(knowledgeState.selectedRelease?.release_id);
+  const qualityFailed = task?.status === "failed"
+    || knowledgeState.qualityReport?.decision === "fail";
+
+  return [
+    {
+      key: "content",
+      label: "内容",
+      state: contentReady ? "ready" : "blocked",
+      detail: contentReady ? "已形成可检索知识包" : "等待章节、claims 或 chunks",
+      target: "#knowledge-overview",
+    },
+    {
+      key: "analysis",
+      label: "分析",
+      state: analysisReady ? "ready" : (manifest.status === "failed" ? "failed" : "pending"),
+      detail: analysisReady ? "基线分析已生成" : (manifest.error || "等待生成知识基线"),
+      target: "#knowledge-analysis",
+    },
+    {
+      key: "quality",
+      label: "质量与发布",
+      state: releaseReady ? "ready" : (qualityFailed ? "failed" : "pending"),
+      detail: releaseReady
+        ? `Release ${knowledgeHash(knowledgeState.selectedRelease.release_id)}`
+        : knowledgeReviewStatusLabel(reviewStatus),
+      target: "#knowledge-quality",
+    },
+    {
+      key: "agent",
+      label: "Agent",
+      state: agentPackage ? "ready" : (releaseReady ? "pending" : "blocked"),
+      detail: agentPackage
+        ? `${agentPackage.package_id} · ${agentPackage.version}`
+        : (releaseReady ? "等待 Agent Package 评测与发布" : "需先发布知识 Release"),
+      target: "#knowledge-agent",
+      href: agentPackage ? buildAgentPackageURL(agentPackage.package_id, agentPackage.version) : "",
+    },
+  ];
+}
+
 function knowledgeHash(value) {
   const clean = String(value || "").trim();
   return clean ? clean.slice(0, 12) : "-";
@@ -1822,6 +1894,16 @@ function knowledgePipelineActionLabel(action) {
   })[String(action || "")] || action || "未知";
 }
 
+function scrollKnowledgeHashTarget() {
+  const targetID = String(window.location.hash || "").replace(/^#/, "");
+  if (!["knowledge-overview", "knowledge-quality", "knowledge-evidence", "knowledge-analysis", "knowledge-agent"].includes(targetID)) {
+    return;
+  }
+  window.requestAnimationFrame?.(() => {
+    document.getElementById(targetID)?.scrollIntoView({ block: "start" });
+  });
+}
+
 function renderBookKnowledge() {
   const isPackageDetail = isKnowledgePackageDetailRoute();
   const bookRows = knowledgeState.books.map((book, index) => {
@@ -1872,9 +1954,29 @@ function renderBookKnowledge() {
   const nextBook = currentIndex >= 0 && currentIndex < knowledgeState.books.length - 1
     ? knowledgeState.books[currentIndex + 1]
     : null;
+  const lifecycle = isPackageDetail ? knowledgePackageLifecycle() : [];
+  const agentPackage = isPackageDetail ? knowledgePackageAgentMatch() : null;
+  const metadata = [
+    currentBook.source_type,
+    currentBook.extractor,
+    currentBook.updated_at ? `更新 ${formatSourceControlTime(currentBook.updated_at)}` : "",
+  ].filter(Boolean);
+  const lifecycleHTML = lifecycle.map((stage, index) => `
+    <a
+      class="knowledge-workspace__stage is-${escapeAttribute(stage.state)}"
+      href="${escapeAttribute(stage.href || stage.target)}"
+      ${stage.key === "quality" ? 'data-knowledge-lifecycle="quality"' : ""}
+    >
+      <span>${String(index + 1).padStart(2, "0")}</span>
+      <div>
+        <strong>${escapeHTML(stage.label)}</strong>
+        <small>${escapeHTML(stage.detail)}</small>
+      </div>
+    </a>
+  `).join("");
 
   renderShell(`
-    <main class="knowledge-web ${isPackageDetail ? "knowledge-web--detail" : "knowledge-web--index"}">
+    <main class="knowledge-web ${isPackageDetail ? "knowledge-web--detail" : "knowledge-web--index"} ${knowledgeState.directoryCollapsed ? "is-directory-collapsed" : ""}">
       <section class="knowledge-web__header">
         <div>
           <p class="web-kicker">${isPackageDetail ? "Knowledge Package" : "Book Knowledge"}</p>
@@ -1890,6 +1992,9 @@ function renderBookKnowledge() {
           <a class="knowledge-web__detail-back" href="${escapeAttribute(ROUTES.knowledgePackages)}">← 返回全部知识包</a>
           <span>${currentIndex >= 0 ? `${currentIndex + 1} / ${knowledgeState.books.length}` : "知识包详情"}</span>
           <div>
+            <button id="knowledge-directory-toggle" class="button button-ghost" type="button" aria-expanded="${!knowledgeState.directoryCollapsed}">
+              ${knowledgeState.directoryCollapsed ? "展开目录" : "收起目录"}
+            </button>
             ${previousBook ? `<a class="button button-ghost" href="${escapeAttribute(sourceKnowledgeURL(previousBook.book_id))}" title="${escapeAttribute(previousBook.title || "上一条")}">← 上一条</a>` : `<span class="button button-ghost is-disabled">← 上一条</span>`}
             ${nextBook ? `<a class="button button-ghost" href="${escapeAttribute(sourceKnowledgeURL(nextBook.book_id))}" title="${escapeAttribute(nextBook.title || "下一条")}">下一条 →</a>` : `<span class="button button-ghost is-disabled">下一条 →</span>`}
           </div>
@@ -1914,20 +2019,35 @@ function renderBookKnowledge() {
 
         <section class="knowledge-web__main">
           ${currentBook.book_id ? `
-            <div class="knowledge-web__title-row">
-              <div>
-                <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
-                <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
+            <section id="knowledge-overview" class="knowledge-workspace__overview">
+              <div class="knowledge-web__title-row">
+                <div>
+                  <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
+                  <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
+                  ${metadata.length ? `<p class="knowledge-workspace__metadata">${metadata.map((item) => `<span>${escapeHTML(item)}</span>`).join("")}</p>` : ""}
+                </div>
+                <a class="button button-primary" href="${escapeAttribute(buildBookReaderURL(currentBook.book_id))}">阅读</a>
               </div>
-              <a class="button button-primary" href="${escapeAttribute(buildBookReaderURL(currentBook.book_id))}">阅读</a>
-            </div>
-            <div class="knowledge-web__stats">
-              <span>${(pkg.chapters || []).length} 章</span>
-              <span>${(pkg.claims || []).length} claims</span>
-              <span>${(pkg.chunks || []).length} chunks</span>
-            </div>
-            ${renderKnowledgeReview()}
-            <div class="knowledge-web__content">
+              <div class="knowledge-web__stats">
+                <span>${(pkg.chapters || []).length} 章</span>
+                <span>${(pkg.claims || []).length} claims</span>
+                <span>${(pkg.chunks || []).length} chunks</span>
+              </div>
+              <div class="knowledge-workspace__lifecycle" aria-label="知识包生命周期">
+                ${lifecycleHTML}
+              </div>
+            </section>
+            <nav class="knowledge-workspace__nav" aria-label="知识包工作区">
+              <a href="#knowledge-overview">概览</a>
+              <a href="#knowledge-quality">质量</a>
+              <a href="#knowledge-evidence">证据</a>
+              <a href="#knowledge-analysis">分析</a>
+              <a href="#knowledge-agent">Agent</a>
+            </nav>
+            <section id="knowledge-quality" class="knowledge-workspace__section">
+              ${renderKnowledgeReview()}
+            </section>
+            <div id="knowledge-evidence" class="knowledge-web__content knowledge-workspace__section">
               <section>
                 <p class="web-kicker">Chapters</p>
                 <ul>${chapterRows || "<li><span>暂无章节</span></li>"}</ul>
@@ -1937,6 +2057,7 @@ function renderBookKnowledge() {
                 ${resultRows || "<p class=\"web-muted\">输入关键词后查看检索结果。</p>"}
               </section>
             </div>
+            <section id="knowledge-analysis" class="knowledge-workspace__section knowledge-workspace__analysis">
             <section class="knowledge-web__manifest" aria-label="知识基线分析">
               <div class="knowledge-web__manifest-head">
                 <div>
@@ -1988,6 +2109,26 @@ function renderBookKnowledge() {
                 </article>
               ` : ""}
             </section>
+            </section>
+            <section id="knowledge-agent" class="knowledge-workspace__section knowledge-workspace__agent">
+              <div class="knowledge-workspace__agent-copy">
+                <p class="web-kicker">Agent Supply</p>
+                <h3>${agentPackage ? "Agent Package 已可用" : "供给到 Agent"}</h3>
+                <p>
+                  ${agentPackage
+                    ? `当前知识 Release 已固定到 ${escapeHTML(agentPackage.package_id)} ${escapeHTML(agentPackage.version)}，可进入受控检索、证据问答和工具调用。`
+                    : escapeHTML(knowledgeState.agentPackagesLoading || knowledgeState.agentPackagesError || (knowledgeState.selectedRelease
+                      ? "知识 Release 已发布，等待 Agent Package 完成策略配置、评测和独立发布。"
+                      : "先完成基线分析、质量校验和知识 Release 发布，才能生成可运行 Agent。"))}
+                </p>
+              </div>
+              <div class="knowledge-workspace__agent-actions">
+                ${agentPackage ? `
+                  <a class="button button-primary" href="${escapeAttribute(buildAgentPackageURL(agentPackage.package_id, agentPackage.version))}">打开 Agent Package</a>
+                  <a class="button button-ghost" href="${escapeAttribute(buildAgentURL(agentPackage.package_id, agentPackage.version))}">运行 Agent</a>
+                ` : `<a class="button button-ghost" href="${escapeAttribute(ROUTES.agentPackages)}">查看 Book Agents</a>`}
+              </div>
+            </section>
           ` : "<p class=\"web-muted\">请选择书籍或导入新来源。</p>"}
         </section>
       </div>` : `
@@ -2011,6 +2152,7 @@ function renderBookKnowledge() {
     </main>
   `, "knowledge");
   bindBookKnowledgeEvents();
+  scrollKnowledgeHashTarget();
 }
 
 function hasBookAgentCapability(capability) {
@@ -2464,6 +2606,7 @@ function resetKnowledgeAnalysis(prompt = "") {
 
 function resetKnowledgeReview() {
   knowledgeReviewLoadSequence++;
+  knowledgeAgentLoadSequence++;
   if (knowledgeReviewPollTimer) {
     clearTimeout(knowledgeReviewPollTimer);
     knowledgeReviewPollTimer = null;
@@ -2478,6 +2621,88 @@ function resetKnowledgeReview() {
   knowledgeState.reviewLoading = "";
   knowledgeState.reviewError = "";
   knowledgeState.reviewOperation = "";
+  knowledgeState.agentPackages = [];
+  knowledgeState.agentPackagesLoading = "";
+  knowledgeState.agentPackagesError = "";
+}
+
+async function loadKnowledgeAgentPackageRecords() {
+  const packages = [];
+  let after = "";
+  for (let page = 0; page < 20; page++) {
+    const path = after
+      ? `/api/agent-packages?limit=200&after=${encodeURIComponent(after)}`
+      : "/api/agent-packages?limit=200";
+    const payload = await apiFetch(path);
+    const pagePackages = Array.isArray(payload.packages) ? payload.packages : [];
+    packages.push(...pagePackages);
+    if (pagePackages.length < 200 || !payload.next_cursor || payload.next_cursor === after) {
+      break;
+    }
+    after = payload.next_cursor;
+  }
+  return packages;
+}
+
+async function loadKnowledgeAgentPackageDetails(records) {
+  const publishedRecords = (records || []).filter((record) => (
+    record.lifecycle_state === "published"
+    && record.package_id
+    && record.version
+  ));
+  const packages = [];
+  const errors = [];
+  const concurrency = 8;
+  for (let offset = 0; offset < publishedRecords.length; offset += concurrency) {
+    const batch = publishedRecords.slice(offset, offset + concurrency);
+    const results = await Promise.allSettled(batch.map((record) => (
+      apiFetch(`/api/agent-packages/${encodeURIComponent(record.package_id)}?version=${encodeURIComponent(record.version)}`)
+    )));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        packages.push(result.value);
+        return;
+      }
+      const record = batch[index];
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      errors.push(`${record.package_id} ${record.version}: ${reason}`);
+    });
+  }
+  return { packages, errors };
+}
+
+async function loadKnowledgeAgentPackages(bookID, { silent = false, renderResult = true } = {}) {
+  const sequence = ++knowledgeAgentLoadSequence;
+  if (!silent) {
+    knowledgeState.agentPackagesLoading = "加载 Agent 供给状态";
+    knowledgeState.agentPackagesError = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
+  }
+  try {
+    const records = await loadKnowledgeAgentPackageRecords();
+    const { packages, errors } = await loadKnowledgeAgentPackageDetails(records);
+    if (sequence !== knowledgeAgentLoadSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.agentPackages = packages;
+    knowledgeState.agentPackagesError = errors.length
+      ? `${errors.length} 个 Agent Package 详情加载失败：${errors[0]}`
+      : "";
+  } catch (error) {
+    if (sequence === knowledgeAgentLoadSequence) {
+      knowledgeState.agentPackages = [];
+      knowledgeState.agentPackagesError = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (sequence === knowledgeAgentLoadSequence) {
+      knowledgeState.agentPackagesLoading = "";
+      if (renderResult) {
+        renderBookKnowledge();
+      }
+    }
+  }
 }
 
 async function loadKnowledgeReleaseRecords(bookID) {
@@ -2573,12 +2798,12 @@ function scheduleKnowledgeReviewPoll() {
     knowledgeReviewPollTimer = null;
   }
   const task = knowledgeReviewLatestTask();
-  if (!window.location.pathname.startsWith("/book-knowledge") || !["queued", "running"].includes(task?.status)) {
+  if (!isKnowledgePackageDetailRoute() || !["queued", "running"].includes(task?.status)) {
     return;
   }
   knowledgeReviewPollTimer = setTimeout(() => {
     knowledgeReviewPollTimer = null;
-    if (!window.location.pathname.startsWith("/book-knowledge")) {
+    if (!isKnowledgePackageDetailRoute()) {
       return;
     }
     const bookID = knowledgeState.selectedBook?.book_id || "";
@@ -2597,7 +2822,7 @@ function setKnowledgeReviewOpen(open) {
     params.delete("review");
   }
   const query = params.toString();
-  window.history?.replaceState?.({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+  window.history?.replaceState?.({}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash || ""}`);
   renderBookKnowledge();
 }
 
@@ -5297,6 +5522,19 @@ function bindBookKnowledgeEvents() {
   document.querySelector("#knowledge-refresh")?.addEventListener("click", () => {
     loadBookKnowledge();
   });
+  document.querySelector("#knowledge-directory-toggle")?.addEventListener("click", () => {
+    knowledgeState.directoryCollapsed = !knowledgeState.directoryCollapsed;
+    renderBookKnowledge();
+  });
+  document.querySelector("[data-knowledge-lifecycle='quality']")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    setKnowledgeReviewOpen(true);
+    window.requestAnimationFrame?.(() => {
+      document.querySelector("#knowledge-quality")?.scrollIntoView({ block: "start", behavior: "smooth" });
+      const params = new URLSearchParams(window.location.search);
+      window.history?.replaceState?.({}, "", `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}#knowledge-quality`);
+    });
+  });
   document.querySelector("#knowledge-cockpit-refresh")?.addEventListener("click", () => {
     loadKnowledgeReviewCockpit();
   });
@@ -5808,6 +6046,7 @@ async function selectKnowledgeBook(book, renderBefore = true) {
     await Promise.all([
       loadKnowledgeAnalysisManifest(book.book_id),
       loadKnowledgeReview(book.book_id, { silent: true, renderResult: false }),
+      loadKnowledgeAgentPackages(book.book_id, { silent: true, renderResult: false }),
     ]);
   } catch (error) {
     knowledgeState.message = error instanceof Error ? error.message : String(error);

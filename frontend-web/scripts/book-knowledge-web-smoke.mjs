@@ -161,7 +161,7 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
-assert.ok(html.includes("20260723-package-detail-first"), "package detail-first release should use a fresh browser cache version");
+assert.ok(html.includes("20260723-package-workspace"), "package workspace release should use a fresh browser cache version");
 assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
 assert.ok(js.includes('"/course": ROUTES.dedaoCourses'), "legacy course alias should be preserved");
 assert.ok(js.includes('"/ebook": ROUTES.dedaoEbooks'), "legacy ebook alias should be preserved");
@@ -280,6 +280,25 @@ assert.ok(
   "global pipeline should be hidden on package detail routes",
 );
 
+for (const marker of [
+  "knowledgePackageAgentMatch",
+  "knowledgePackageLifecycle",
+  "loadKnowledgeAgentPackageRecords",
+  "loadKnowledgeAgentPackageDetails",
+  "/api/agent-packages?limit=200",
+  "/api/agent-packages/${encodeURIComponent(record.package_id)}?version=${encodeURIComponent(record.version)}",
+  "next_cursor",
+  "knowledge-workspace__lifecycle",
+  "knowledge-workspace__nav",
+  "knowledge-directory-toggle",
+  'id="knowledge-overview"',
+  'id="knowledge-evidence"',
+  'id="knowledge-analysis"',
+  'id="knowledge-agent"',
+]) {
+  assert.ok(js.includes(marker), `knowledge package workspace should include ${marker}`);
+}
+
 for (const className of [
   ".knowledge-review",
   ".knowledge-review__summary",
@@ -293,6 +312,10 @@ for (const className of [
   ".knowledge-supply__status",
   ".knowledge-web--detail",
   ".knowledge-web__detail-toolbar",
+  ".knowledge-workspace__lifecycle",
+  ".knowledge-workspace__nav",
+  ".knowledge-web.is-directory-collapsed",
+  ".knowledge-workspace__agent",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
