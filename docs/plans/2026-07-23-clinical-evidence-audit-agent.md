@@ -352,8 +352,8 @@ git commit -m "feat(web): add clinical evidence audit workspace"
 - Modify: `backend/app/agent_package_evaluation.go`
 - Modify: `backend/app/agent_package_evaluation_test.go`
 - Create: `backend/app/evidence_audit_evaluation_test.go`
-- Modify: `docs/schemas/agent-package.schema.json`
-- Create: `docs/schemas/evidence-audit.schema.json`
+- Create: `contracts/agent-package-v2.schema.json`
+- Create: `contracts/evidence-audit-v1.schema.json`
 
 **Step 1: Write failing evaluation tests**
 
@@ -385,8 +385,8 @@ article text.
 
 ```bash
 go test ./backend/app -run 'TestAgentPackageEvaluation|TestEvidenceAuditEvaluation' -count=1
-python3 -m json.tool docs/schemas/agent-package.schema.json >/dev/null
-python3 -m json.tool docs/schemas/evidence-audit.schema.json >/dev/null
+python3 -m json.tool contracts/agent-package-v2.schema.json >/dev/null
+python3 -m json.tool contracts/evidence-audit-v1.schema.json >/dev/null
 ```
 
 Expected: PASS.
@@ -394,7 +394,7 @@ Expected: PASS.
 **Step 5: Commit**
 
 ```bash
-git add backend/app/agent_package_evaluation.go backend/app/agent_package_evaluation_test.go backend/app/evidence_audit_evaluation_test.go docs/schemas/agent-package.schema.json docs/schemas/evidence-audit.schema.json
+git add backend/app/agent_package_evaluation.go backend/app/agent_package_evaluation_test.go backend/app/evidence_audit_evaluation_test.go contracts/agent-package-v2.schema.json contracts/evidence-audit-v1.schema.json
 git commit -m "feat(agent): gate clinical evidence audit quality"
 ```
 
