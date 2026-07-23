@@ -260,7 +260,7 @@ func FailEvidenceAudit(
 	})
 }
 
-func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now time.Time) (*EvidenceAudit, error) {
+func PrepareEvidenceAuditCompletion(store *BookKnowledgeStore, report EvidenceAudit, now time.Time) (*EvidenceAudit, error) {
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
@@ -293,15 +293,6 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 		if !evidenceAuditReportContentEqual(*prepared, report) {
 			return nil, ErrEvidenceAuditImmutable
 		}
-		record.Status = EvidenceAuditCompleted
-		record.OutputHash = prepared.OutputHash
-		record.UpdatedAt = prepared.UpdatedAt
-		record.CompletedAt = prepared.CompletedAt
-		manifest.UpdatedAt = prepared.UpdatedAt
-		if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
-			return nil, err
-		}
-		_ = os.Remove(store.EvidenceAuditPreparedPath(record.AuditID))
 		return prepared, nil
 	}
 	input, err := store.loadEvidenceAuditInputUnlocked(record.InputHash)
@@ -341,21 +332,59 @@ func CompleteEvidenceAudit(store *BookKnowledgeStore, report EvidenceAudit, now 
 	if err := store.writePreparedEvidenceAuditReportUnlocked(finalized); err != nil {
 		return nil, err
 	}
+	return &finalized, nil
+}
+
+func PublishEvidenceAuditCompletion(store *BookKnowledgeStore, auditID string) (*EvidenceAudit, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	unlockRoot, err := store.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlockRoot()
+	manifest, err := store.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID))
+	if record == nil {
+		return nil, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	if record.Status == EvidenceAuditCompleted {
+		return store.loadEvidenceAuditRecordUnlocked(*record)
+	}
+	if record.Status != EvidenceAuditRunning {
+		return nil, fmt.Errorf("%w: cannot publish completion in %q", ErrEvidenceAuditStateConflict, record.Status)
+	}
+	prepared, err := store.findPreparedEvidenceAuditReportUnlocked(record.AuditID, record.InputHash)
+	if err != nil {
+		return nil, err
+	}
+	if prepared == nil {
+		return nil, fmt.Errorf("prepared evidence audit report is unavailable")
+	}
+	if err := store.validatePublishedEvidenceAuditTraceUnlocked(*record, *prepared); err != nil {
+		return nil, err
+	}
 	record.Status = EvidenceAuditCompleted
-	record.OutputHash = finalized.OutputHash
-	record.UpdatedAt = finalized.UpdatedAt
-	record.CompletedAt = finalized.CompletedAt
-	manifest.UpdatedAt = finalized.UpdatedAt
+	record.OutputHash = prepared.OutputHash
+	record.UpdatedAt = prepared.UpdatedAt
+	record.CompletedAt = prepared.CompletedAt
+	manifest.UpdatedAt = prepared.UpdatedAt
 	if err := store.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
 		return nil, err
 	}
 	_ = os.Remove(store.EvidenceAuditPreparedPath(record.AuditID))
-	return &finalized, nil
+	return prepared, nil
 }
 
 func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	unlockRoot, err := s.acquireEvidenceAuditRootLock()
 	if err != nil {
 		return nil, err
@@ -364,6 +393,12 @@ func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, 
 	manifest, err := s.loadEvidenceAuditManifestUnlocked()
 	if err != nil {
 		return nil, err
+	}
+	if record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID)); record != nil &&
+		(record.Status == EvidenceAuditQueued || record.Status == EvidenceAuditRunning) {
+		if err := s.reconcileEvidenceAuditTerminalUnlocked(manifest, record); err != nil {
+			return nil, err
+		}
 	}
 	return s.loadEvidenceAuditByIDUnlocked(manifest, strings.TrimSpace(auditID))
 }
@@ -449,6 +484,107 @@ func (s *BookKnowledgeStore) loadEvidenceAuditByIDUnlocked(manifest *EvidenceAud
 		return nil, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
 	}
 	return s.loadEvidenceAuditRecordUnlocked(*record)
+}
+
+func (s *BookKnowledgeStore) validatePublishedEvidenceAuditTraceUnlocked(
+	record EvidenceAuditRecord,
+	report EvidenceAudit,
+) error {
+	var terminal evidenceAuditTraceTerminal
+	if err := readJSONFile(s.EvidenceAuditTraceTerminalPath(record.AuditID), &terminal); err != nil {
+		return fmt.Errorf("prepared evidence audit terminal is unavailable: %w", err)
+	}
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		return err
+	}
+	if terminal.Report == nil ||
+		terminal.Report.OutputHash != report.OutputHash ||
+		terminal.ReportFingerprint != terminal.Trace.Final.ResponseFingerprint {
+		return fmt.Errorf("prepared evidence audit terminal does not match prepared report")
+	}
+	var trace AgentTrace
+	if err := readJSONFile(s.AgentTracePath(record.TraceID), &trace); err != nil {
+		return fmt.Errorf("completed evidence audit trace is unavailable: %w", err)
+	}
+	if err := ValidateAgentTrace(trace); err != nil {
+		return fmt.Errorf("validate completed evidence audit trace: %w", err)
+	}
+	if trace.TraceID != record.TraceID ||
+		trace.EvidenceAudit == nil ||
+		trace.EvidenceAudit.AuditID != record.AuditID ||
+		trace.EvidenceAudit.InputHash != record.InputHash ||
+		trace.Final.ResponseFingerprint != terminal.ReportFingerprint ||
+		(trace.Final.Outcome != AgentTraceOutcomeCompleted &&
+			trace.Final.Outcome != AgentTraceOutcomeAbstained) {
+		return fmt.Errorf("completed evidence audit trace identity is inconsistent")
+	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) reconcileEvidenceAuditTerminalUnlocked(
+	manifest *EvidenceAuditManifest,
+	record *EvidenceAuditRecord,
+) error {
+	var terminal evidenceAuditTraceTerminal
+	if err := readJSONFile(s.EvidenceAuditTraceTerminalPath(record.AuditID), &terminal); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		return err
+	}
+	var trace AgentTrace
+	if err := readJSONFile(s.AgentTracePath(record.TraceID), &trace); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if err := ValidateAgentTrace(trace); err != nil {
+		return err
+	}
+	if trace.TraceID != terminal.TraceID ||
+		trace.Final.ResponseFingerprint != terminal.ReportFingerprint {
+		return fmt.Errorf("published trace does not match prepared evidence audit terminal")
+	}
+	switch trace.Final.Outcome {
+	case AgentTraceOutcomeCompleted, AgentTraceOutcomeAbstained:
+		prepared, err := s.findPreparedEvidenceAuditReportUnlocked(record.AuditID, record.InputHash)
+		if err != nil {
+			return err
+		}
+		if prepared == nil {
+			return fmt.Errorf("prepared evidence audit report is unavailable")
+		}
+		if err := s.validatePublishedEvidenceAuditTraceUnlocked(*record, *prepared); err != nil {
+			return err
+		}
+		record.Status = EvidenceAuditCompleted
+		record.OutputHash = prepared.OutputHash
+		record.UpdatedAt = prepared.UpdatedAt
+		record.CompletedAt = prepared.CompletedAt
+		manifest.UpdatedAt = prepared.UpdatedAt
+		if err := s.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+			return err
+		}
+		_ = os.Remove(s.EvidenceAuditPreparedPath(record.AuditID))
+	case AgentTraceOutcomeFailed:
+		record.Status = EvidenceAuditFailed
+		record.OutputHash = ""
+		record.CompletedAt = ""
+		record.FailedAt = trace.CompletedAt
+		record.UpdatedAt = trace.CompletedAt
+		record.FailureCode = terminal.FailureCode
+		record.FailureSummary = sanitizeEvidenceAuditFailureSummary(terminal.FailureSummary)
+		manifest.UpdatedAt = trace.CompletedAt
+		if err := s.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported prepared evidence audit terminal outcome %q", trace.Final.Outcome)
+	}
+	_ = os.Remove(s.EvidenceAuditTraceTerminalPath(record.AuditID))
+	return nil
 }
 
 func (s *BookKnowledgeStore) loadEvidenceAuditRecordUnlocked(record EvidenceAuditRecord) (*EvidenceAudit, error) {

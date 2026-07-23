@@ -212,6 +212,9 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 	for _, scope := range []string{
 		"Diagnose me and recommend an individual treatment.",
 		"Evidence audit: Should I undergo surgery?",
+		"Evidence audit: Should this patient undergo surgery?",
+		"Clinical trial evidence: Should patient John undergo surgery?",
+		"Review the evidence: should this 52-year-old person start treatment?",
 		"Clinical trial evidence: Can I have this procedure?",
 		"Would this test be appropriate for me?",
 		"Is this therapy right for me?",
@@ -226,6 +229,8 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 		"阿司匹林怎么吃",
 		"我的头痛是什么病？",
 		"证据审计：我是否应该做手术？",
+		"证据审计：患者张三是否应该做手术？",
+		"文献综述：这个 62 岁病例要不要接受治疗？",
 		"临床试验证据：这个检查适合我吗？",
 		"我能不能接受这个治疗？",
 	} {
@@ -275,7 +280,7 @@ func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
 	}
 }
 
-func TestEvidenceAuditRunnerResumesCompletedClaimCheckpointWithoutRepeatingModel(t *testing.T) {
+func TestEvidenceAuditRunnerFailsClosedWhenLaterClaimModelOutcomeIsUnknown(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
 	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-claim-checkpoint", "Evidence comparison only.")
 	first := &evidenceAuditSequenceClient{
@@ -298,14 +303,17 @@ func TestEvidenceAuditRunnerResumesCompletedClaimCheckpointWithoutRepeatingModel
 	}
 
 	second := &evidenceAuditFakeClient{answers: []string{
-		`{"candidate_verdict":"supported","rationale":"second","evidence":[{"release_id":"support-a","citation_id":"support-a-c2","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+		`must not be called`,
 	}}
-	completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig())
-	if err != nil {
-		t.Fatal(err)
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig()); err == nil ||
+		!strings.Contains(err.Error(), "model_outcome_unknown") {
+		t.Fatalf("resume error = %v, want model_outcome_unknown", err)
 	}
-	if completed.Status != EvidenceAuditCompleted || len(first.calls) != 2 || len(second.calls) != 1 {
-		t.Fatalf("checkpoint resume completed=%#v first_calls=%d second_calls=%d", completed, len(first.calls), len(second.calls))
+	failed, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil || failed.Status != EvidenceAuditFailed ||
+		failed.FailureCode != "model_outcome_unknown" ||
+		len(first.calls) != 2 || len(second.calls) != 0 {
+		t.Fatalf("failed=%#v err=%v first_calls=%d second_calls=%d", failed, err, len(first.calls), len(second.calls))
 	}
 }
 
@@ -372,6 +380,47 @@ func TestEvidenceAuditRunnerCheckpointDoesNotPersistPromptOrSourceBody(t *testin
 	}
 }
 
+func TestEvidenceAuditRunnerDoesNotRetryUnknownInFlightModelOutcome(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-model-outcome-unknown", "Evidence comparison only.")
+	first := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"returned but not persisted","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	previous := evidenceAuditRuntimeStageHook
+	crashed := false
+	evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+		if stage == "model_completed_before_checkpoint" && !crashed {
+			crashed = true
+			return errors.New("synthetic process crash after model response")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, first, evidenceAuditRunnerConfig()); err == nil {
+		t.Fatal("first run unexpectedly succeeded")
+	}
+	running, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil || running.Status != EvidenceAuditRunning {
+		t.Fatalf("audit after simulated crash = %#v err=%v", running, err)
+	}
+
+	evidenceAuditRuntimeStageHook = previous
+	second := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig()); err == nil ||
+		!strings.Contains(err.Error(), "model_outcome_unknown") {
+		t.Fatalf("resume error = %v, want model_outcome_unknown", err)
+	}
+	failed, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil || failed.Status != EvidenceAuditFailed ||
+		failed.FailureCode != "model_outcome_unknown" {
+		t.Fatalf("failed audit = %#v err=%v", failed, err)
+	}
+	if len(first.calls) != 1 || len(second.calls) != 0 {
+		t.Fatalf("model calls first=%d second=%d", len(first.calls), len(second.calls))
+	}
+}
+
 func TestEvidenceAuditRunnerSerializesConcurrentExecutionWithoutDuplicateModelCalls(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
 	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-concurrent-checkpoint", "Evidence comparison only.")
@@ -435,7 +484,8 @@ func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
 	}{
 		{
 			name:        "report store failure",
-			firstStatus: EvidenceAuditRunning,
+			firstStatus: EvidenceAuditCompleted,
+			traceExists: true,
 			installFail: func(t *testing.T) {
 				previous := evidenceAuditStorageFault
 				manifestWrites := 0
@@ -453,7 +503,7 @@ func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
 		},
 		{
 			name:        "trace save failure",
-			firstStatus: EvidenceAuditCompleted,
+			firstStatus: EvidenceAuditRunning,
 			installFail: func(t *testing.T) {
 				previous := evidenceAuditTraceStorageFault
 				failed := false
@@ -507,7 +557,10 @@ func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
 			if (traceErr == nil) != tt.traceExists {
 				t.Fatalf("trace existence after injected failure = %v, want %v", traceErr == nil, tt.traceExists)
 			}
-			recovered, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
+			recovered, err := store.LoadEvidenceAudit(audit.AuditID)
+			if err == nil && recovered.Status != EvidenceAuditCompleted {
+				recovered, err = RunEvidenceAudit(context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig())
+			}
 			if err != nil {
 				t.Fatalf("recovery run failed: %v", err)
 			}
@@ -548,6 +601,46 @@ func TestEvidenceAuditRunnerFailsClosedWhenTracePreparationCannotPersist(t *test
 	}
 	if stored.Status == EvidenceAuditCompleted {
 		t.Fatalf("audit completed without a recoverable trace: %#v", stored)
+	}
+}
+
+func TestEvidenceAuditRunnerReadSideReconcilesPreparedFailure(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-failed-read-reconcile", "Evidence comparison only.")
+	if _, err := StartEvidenceAudit(
+		store, audit.AuditID, "trace-failed-read-reconcile",
+		time.Date(2026, 7, 19, 17, 0, 0, 0, time.UTC),
+	); err != nil {
+		t.Fatal(err)
+	}
+	originalWriter := writeEvidenceAuditManifestFile
+	failedOnce := false
+	writeEvidenceAuditManifestFile = func(path string, payload []byte) error {
+		if !failedOnce {
+			failedOnce = true
+			return errors.New("synthetic failed terminal publish interruption")
+		}
+		return originalWriter(path, payload)
+	}
+	t.Cleanup(func() { writeEvidenceAuditManifestFile = originalWriter })
+	client := &evidenceAuditFakeClient{answers: []string{`not-json`}}
+	if _, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig(),
+	); err == nil {
+		t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+	}
+	writeEvidenceAuditManifestFile = originalWriter
+	reconciled, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.Status != EvidenceAuditFailed ||
+		reconciled.FailureCode != "invalid_model_output" ||
+		len(client.calls) != 1 {
+		t.Fatalf("reconciled failed audit = %#v calls=%d", reconciled, len(client.calls))
+	}
+	if _, err := os.Stat(store.EvidenceAuditTraceTerminalPath(audit.AuditID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed terminal was not cleaned after read reconciliation: %v", err)
 	}
 }
 

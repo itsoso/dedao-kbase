@@ -21,6 +21,10 @@ const (
 	AgentTraceSchemaVersion           = "agent-trace.v1"
 	evidenceAuditTraceTerminalVersion = "evidence-audit-trace-terminal.v1"
 	evidenceAuditExecutionVersion     = "evidence-audit-execution.v1"
+	evidenceAuditInvocationVersion    = "evidence-audit-model-invocation.v1"
+
+	evidenceAuditInvocationInFlight  = "in_flight"
+	evidenceAuditInvocationCompleted = "completed"
 
 	evidenceAuditTraceFaultBeforePrepare  = "before_prepare"
 	evidenceAuditTraceFaultBeforeSave     = "before_save"
@@ -95,6 +99,17 @@ type evidenceAuditClaimCandidate struct {
 	ClaimHash     string                     `json:"claim_hash"`
 	Decision      evidenceAuditModelDecision `json:"decision"`
 	CandidateHash string                     `json:"candidate_hash"`
+}
+
+type evidenceAuditModelInvocation struct {
+	Version         string `json:"version"`
+	AuditID         string `json:"audit_id"`
+	InputHash       string `json:"input_hash"`
+	ClaimIndex      int    `json:"claim_index"`
+	ClaimHash       string `json:"claim_hash"`
+	RequestIdentity string `json:"request_identity"`
+	Status          string `json:"status"`
+	CandidateHash   string `json:"candidate_hash,omitempty"`
 }
 
 type AgentTraceRetrievalRoute struct {
@@ -516,6 +531,116 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 	return candidate, nil
 }
 
+func (s *BookKnowledgeStore) beginEvidenceAuditModelInvocation(
+	plan evidenceAuditExecutionPlan,
+	claimIndex int,
+	requestIdentity string,
+) (evidenceAuditModelInvocation, bool, error) {
+	invocation := evidenceAuditModelInvocation{
+		Version: evidenceAuditInvocationVersion,
+		AuditID: plan.AuditID, InputHash: plan.InputHash,
+		ClaimIndex: claimIndex, RequestIdentity: requestIdentity,
+		Status: evidenceAuditInvocationInFlight,
+	}
+	if claimIndex >= 0 && claimIndex < len(plan.ClaimHashes) {
+		invocation.ClaimHash = plan.ClaimHashes[claimIndex]
+	}
+	if err := validateEvidenceAuditModelInvocation(plan, invocation); err != nil {
+		return evidenceAuditModelInvocation{}, false, err
+	}
+	path := filepath.Join(
+		s.evidenceAuditExecutionDir(plan.AuditID), "requests",
+		fmt.Sprintf("%02d.json", claimIndex),
+	)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existingPayload, err := os.ReadFile(path); err == nil {
+		var existing evidenceAuditModelInvocation
+		if err := json.Unmarshal(existingPayload, &existing); err != nil {
+			return evidenceAuditModelInvocation{}, false, err
+		}
+		if err := validateEvidenceAuditModelInvocation(plan, existing); err != nil {
+			return evidenceAuditModelInvocation{}, false, err
+		}
+		if existing.RequestIdentity != requestIdentity {
+			return evidenceAuditModelInvocation{}, false, fmt.Errorf("model invocation request identity conflict")
+		}
+		return existing, false, nil
+	} else if !os.IsNotExist(err) {
+		return evidenceAuditModelInvocation{}, false, err
+	}
+	payload, err := encodeJSONFile(invocation)
+	if err != nil {
+		return evidenceAuditModelInvocation{}, false, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+		return evidenceAuditModelInvocation{}, false, err
+	}
+	if err := writeFileAtomically(path, payload); err != nil {
+		return evidenceAuditModelInvocation{}, false, err
+	}
+	return invocation, true, nil
+}
+
+func (s *BookKnowledgeStore) completeEvidenceAuditModelInvocation(
+	plan evidenceAuditExecutionPlan,
+	invocation evidenceAuditModelInvocation,
+	candidateHash string,
+) error {
+	if invocation.Status != evidenceAuditInvocationInFlight {
+		return fmt.Errorf("only an in-flight model invocation can be completed")
+	}
+	invocation.Status = evidenceAuditInvocationCompleted
+	invocation.CandidateHash = candidateHash
+	if err := validateEvidenceAuditModelInvocation(plan, invocation); err != nil {
+		return err
+	}
+	path := filepath.Join(
+		s.evidenceAuditExecutionDir(plan.AuditID), "requests",
+		fmt.Sprintf("%02d.json", invocation.ClaimIndex),
+	)
+	payload, err := encodeJSONFile(invocation)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return writeFileAtomically(path, payload)
+}
+
+func validateEvidenceAuditModelInvocation(
+	plan evidenceAuditExecutionPlan,
+	invocation evidenceAuditModelInvocation,
+) error {
+	if err := validateEvidenceAuditExecutionPlan(plan); err != nil {
+		return err
+	}
+	if invocation.Version != evidenceAuditInvocationVersion ||
+		invocation.AuditID != plan.AuditID ||
+		invocation.InputHash != plan.InputHash ||
+		invocation.ClaimIndex < 0 ||
+		invocation.ClaimIndex >= len(plan.ClaimHashes) ||
+		invocation.ClaimHash != plan.ClaimHashes[invocation.ClaimIndex] {
+		return fmt.Errorf("model invocation identity does not match execution plan")
+	}
+	if err := validateAgentSHA256("model request_identity", invocation.RequestIdentity); err != nil {
+		return err
+	}
+	switch invocation.Status {
+	case evidenceAuditInvocationInFlight:
+		if invocation.CandidateHash != "" {
+			return fmt.Errorf("in-flight model invocation cannot reference a candidate")
+		}
+	case evidenceAuditInvocationCompleted:
+		if err := validateAgentSHA256("model candidate_hash", invocation.CandidateHash); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported model invocation status %q", invocation.Status)
+	}
+	return nil
+}
+
 func (s *BookKnowledgeStore) loadEvidenceAuditClaimCandidates(
 	plan evidenceAuditExecutionPlan,
 ) (map[int]evidenceAuditClaimCandidate, error) {
@@ -664,6 +789,11 @@ func (s *BookKnowledgeStore) finalizeEvidenceAuditTraceTerminal(terminal evidenc
 	if err := evidenceAuditTraceStorageFault(evidenceAuditTraceFaultBeforeFinalize, path); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) removeEvidenceAuditTraceTerminal(auditID string) error {
+	path := s.EvidenceAuditTraceTerminalPath(auditID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {

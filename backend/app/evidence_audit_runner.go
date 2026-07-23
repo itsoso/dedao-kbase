@@ -16,6 +16,8 @@ import (
 const evidenceAuditModelOutputSchema = "evidence-audit-model.v1"
 const evidenceAuditInitialTimeout = 30 * time.Second
 
+var ErrEvidenceAuditModelOutcomeUnknown = errors.New("model_outcome_unknown: requires_manual_retry")
+
 type EvidenceAuditRunnerConfig struct {
 	ModelConfig BookTokenPlanConfig
 	Timeout     time.Duration
@@ -243,6 +245,30 @@ func RunEvidenceAudit(
 			if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
 				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
 			}
+			requestIdentity, err := evidenceAuditModelRequestIdentity(
+				executionPlan, claimIndex, modelConfig, messages,
+			)
+			if err != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+			invocation, created, err := store.beginEvidenceAuditModelInvocation(
+				executionPlan, claimIndex, requestIdentity,
+			)
+			if err != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+			if !created {
+				if invocation.Status == evidenceAuditInvocationInFlight {
+					return nil, failEvidenceAuditRun(
+						store, *audit, pkg, allRetrieved, traceID, config,
+						ErrEvidenceAuditModelOutcomeUnknown,
+					)
+				}
+				return nil, failEvidenceAuditRun(
+					store, *audit, pkg, allRetrieved, traceID, config,
+					fmt.Errorf("completed model invocation is missing its candidate"),
+				)
+			}
 			if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
 				if len(checkpoints) > 0 && errors.Is(err, context.DeadlineExceeded) {
 					return nil, err
@@ -256,6 +282,9 @@ func RunEvidenceAudit(
 					return nil, modelErr
 				}
 				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, modelErr)
+			}
+			if err := evidenceAuditRunnerStage(runCtx, "model_completed_before_checkpoint"); err != nil {
+				return nil, err
 			}
 			if err := evidenceAuditRunnerStage(runCtx, "model"); err != nil {
 				if len(checkpoints) > 0 &&
@@ -279,6 +308,13 @@ func RunEvidenceAudit(
 			}
 			checkpoints[claimIndex] = checkpoint
 			decision = checkpoint.Decision
+			if checkpointErr := store.completeEvidenceAuditModelInvocation(
+				executionPlan, invocation, checkpoint.CandidateHash,
+			); checkpointErr != nil {
+				return nil, failEvidenceAuditRun(
+					store, *audit, pkg, allRetrieved, traceID, config, checkpointErr,
+				)
+			}
 			if checkpointErr := evidenceAuditRunnerStage(runCtx, "checkpoint"); checkpointErr != nil {
 				return nil, checkpointErr
 			}
@@ -302,6 +338,33 @@ func evidenceAuditCheckpointDecision(
 		Rationale:        "Candidate evaluated against immutable pinned evidence.",
 		Evidence:         append([]evidenceAuditModelEvidence(nil), decision.Evidence...),
 	}
+}
+
+func evidenceAuditModelRequestIdentity(
+	plan evidenceAuditExecutionPlan,
+	claimIndex int,
+	config BookTokenPlanConfig,
+	messages []BookKnowledgeMessage,
+) (string, error) {
+	payload, err := json.Marshal(struct {
+		AuditID        string                 `json:"audit_id"`
+		InputHash      string                 `json:"input_hash"`
+		ClaimIndex     int                    `json:"claim_index"`
+		ClaimHash      string                 `json:"claim_hash"`
+		Model          string                 `json:"model"`
+		MaxTokens      int                    `json:"max_tokens"`
+		EnableThinking *bool                  `json:"enable_thinking,omitempty"`
+		Messages       []BookKnowledgeMessage `json:"messages"`
+	}{
+		AuditID: plan.AuditID, InputHash: plan.InputHash,
+		ClaimIndex: claimIndex, ClaimHash: plan.ClaimHashes[claimIndex],
+		Model: normalizeBookTokenPlanModel(config.Model), MaxTokens: config.MaxTokens,
+		EnableThinking: config.EnableThinking, Messages: messages,
+	})
+	if err != nil {
+		return "", err
+	}
+	return sha256Fingerprint(payload), nil
 }
 
 func loadEvidenceAuditPackageSnapshot(
@@ -820,23 +883,22 @@ func completeEvidenceAuditRun(
 	if err != nil {
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
-	terminal := evidenceAuditTraceTerminal{
-		Version: evidenceAuditTraceTerminalVersion, AuditID: audit.AuditID,
-		InputHash: audit.InputHash, TraceID: traceID, ReportFingerprint: fingerprint,
-		Report: &report, Trace: trace,
-	}
 	if err := evidenceAuditRunnerStage(ctx, "persist"); err != nil {
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
-	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
-		return nil, fmt.Errorf("prepare evidence audit terminal: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	completed, err := CompleteEvidenceAudit(store, report, evidenceAuditRunnerNow(config))
+	preparedReport, err := PrepareEvidenceAuditCompletion(
+		store, report, evidenceAuditRunnerNow(config),
+	)
 	if err != nil {
 		return nil, err
+	}
+	terminal := evidenceAuditTraceTerminal{
+		Version: evidenceAuditTraceTerminalVersion, AuditID: audit.AuditID,
+		InputHash: audit.InputHash, TraceID: traceID, ReportFingerprint: fingerprint,
+		Report: preparedReport, Trace: trace,
+	}
+	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
+		return nil, fmt.Errorf("prepare evidence audit terminal: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -845,6 +907,13 @@ func completeEvidenceAuditRun(
 		return nil, fmt.Errorf("finalize evidence audit trace: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	completed, err := PublishEvidenceAuditCompletion(store, audit.AuditID)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.removeEvidenceAuditTraceTerminal(audit.AuditID); err != nil {
 		return nil, err
 	}
 	return completed, nil
@@ -883,14 +952,17 @@ func failEvidenceAuditRun(
 	if traceErr := store.prepareEvidenceAuditTraceTerminal(terminal); traceErr != nil {
 		return fmt.Errorf("%v; prepare failed trace: %w", runErr, traceErr)
 	}
+	if traceErr := store.finalizeEvidenceAuditTraceTerminal(terminal); traceErr != nil {
+		return fmt.Errorf("%v; finalize failed trace: %w", runErr, traceErr)
+	}
 	_, failErr := FailEvidenceAudit(
 		store, audit.AuditID, failureCode, failureSummary, evidenceAuditRunnerNow(config),
 	)
 	if failErr != nil {
 		return fmt.Errorf("%v; persist failed audit: %w", runErr, failErr)
 	}
-	if traceErr := store.finalizeEvidenceAuditTraceTerminal(terminal); traceErr != nil {
-		return fmt.Errorf("%v; finalize failed trace: %w", runErr, traceErr)
+	if traceErr := store.removeEvidenceAuditTraceTerminal(audit.AuditID); traceErr != nil {
+		return fmt.Errorf("%v; remove failed terminal: %w", runErr, traceErr)
 	}
 	return runErr
 }
@@ -916,37 +988,37 @@ func recoverEvidenceAuditTerminal(
 	}
 	switch terminal.Trace.Final.Outcome {
 	case AgentTraceOutcomeCompleted, AgentTraceOutcomeAbstained:
-		switch audit.Status {
-		case EvidenceAuditRunning:
-			if _, err := CompleteEvidenceAudit(store, *terminal.Report, evidenceAuditRunnerNow(config)); err != nil {
-				return nil, true, fmt.Errorf("recover completed evidence audit: %w", err)
-			}
-		case EvidenceAuditCompleted:
-		default:
+		if audit.Status != EvidenceAuditRunning {
 			return nil, true, fmt.Errorf(
 				"prepared successful terminal cannot recover audit in %q", audit.Status,
 			)
 		}
+		if err := store.finalizeEvidenceAuditTraceTerminal(*terminal); err != nil {
+			return nil, true, fmt.Errorf("recover evidence audit trace: %w", err)
+		}
+		if _, err := PublishEvidenceAuditCompletion(store, audit.AuditID); err != nil {
+			return nil, true, fmt.Errorf("recover completed evidence audit: %w", err)
+		}
 	case AgentTraceOutcomeFailed:
-		switch audit.Status {
-		case EvidenceAuditQueued, EvidenceAuditRunning:
-			if _, err := FailEvidenceAudit(
-				store, audit.AuditID, terminal.FailureCode, terminal.FailureSummary,
-				evidenceAuditRunnerNow(config),
-			); err != nil {
-				return nil, true, fmt.Errorf("recover failed evidence audit: %w", err)
-			}
-		case EvidenceAuditFailed:
-		default:
+		if audit.Status != EvidenceAuditQueued && audit.Status != EvidenceAuditRunning {
 			return nil, true, fmt.Errorf(
 				"prepared failed terminal cannot recover audit in %q", audit.Status,
 			)
 		}
+		if err := store.finalizeEvidenceAuditTraceTerminal(*terminal); err != nil {
+			return nil, true, fmt.Errorf("recover evidence audit trace: %w", err)
+		}
+		if _, err := FailEvidenceAudit(
+			store, audit.AuditID, terminal.FailureCode, terminal.FailureSummary,
+			evidenceAuditRunnerNow(config),
+		); err != nil {
+			return nil, true, fmt.Errorf("recover failed evidence audit: %w", err)
+		}
 	default:
 		return nil, true, fmt.Errorf("unsupported prepared terminal outcome")
 	}
-	if err := store.finalizeEvidenceAuditTraceTerminal(*terminal); err != nil {
-		return nil, true, fmt.Errorf("recover evidence audit trace: %w", err)
+	if err := store.removeEvidenceAuditTraceTerminal(audit.AuditID); err != nil {
+		return nil, true, fmt.Errorf("remove recovered evidence audit terminal: %w", err)
 	}
 	recovered, err := store.LoadEvidenceAudit(audit.AuditID)
 	if err != nil {
@@ -961,6 +1033,9 @@ func recoverEvidenceAuditTerminal(
 }
 
 func evidenceAuditFailureCode(err error) string {
+	if errors.Is(err, ErrEvidenceAuditModelOutcomeUnknown) {
+		return "model_outcome_unknown"
+	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return "runner_timeout"
 	}
@@ -1103,10 +1178,18 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"compare studies", "assess the claim", "population-level", "pico", "in adults",
 		"证据审计", "证据比较", "临床试验证据", "评估观点", "文献综述", "群体级", "人群",
 	)
+	populationContext := hasAny(
+		"population", "population-level", "cohort", "participants", "subjects",
+		"patients with", "adults with", "children with", "in adults", "pico",
+		"人群", "群体级", "队列", "受试者", "成年患者", "儿童患者",
+	)
 	personalContext := hasAny(
 		" i ", " me", " my ", "for me", "should i", "can i", "could i",
 		"right for me", "appropriate for me",
+		"this patient", "the patient", "patient ", "this person", "case ",
+		"year-old", "aged ", "age ",
 		"我", "我的", "给我", "帮我", "本人", "家人", "孩子", "老人", "适合我",
+		"患者", "病例", "个案", "岁", "年龄",
 	)
 	diagnosisOrTreatment := hasAny(
 		"diagnos", "treat", "therapy for", "prescri", "medical advice", "what do i have",
@@ -1132,14 +1215,17 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"recommend a treatment", "individual treatment", "individual medical advice",
 		"用药建议", "治疗方案", "开药", "给我诊断", "诊断我",
 	)
-	if personalContext && (clinicalContext || decisionRequest) {
+	if personalContext && !populationContext && (clinicalContext || decisionRequest) {
 		return true
 	}
 	if explicitAdvice || (diagnosisOrTreatment && (personalContext || decisionRequest)) ||
 		(medicationContext && (personalContext || decisionRequest)) {
 		return true
 	}
-	if (clinicalContext || decisionRequest) && !safeEvidenceIntent {
+	if populationContext && safeEvidenceIntent {
+		return false
+	}
+	if clinicalContext || decisionRequest {
 		return true
 	}
 	return false

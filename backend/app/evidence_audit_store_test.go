@@ -271,7 +271,7 @@ func TestEvidenceAuditStorePersistsLifecycleAndCompletedReportIsImmutable(t *tes
 	report.InputHash = queued.InputHash
 	report.CreatedAt = queued.CreatedAt
 	report.StartedAt = running.StartedAt
-	completed, err := CompleteEvidenceAudit(store, report, now.Add(2*time.Minute))
+	completed, err := completeEvidenceAuditForTest(t, store, report, now.Add(2*time.Minute))
 	if err != nil {
 		t.Fatalf("CompleteEvidenceAudit() error = %v", err)
 	}
@@ -284,7 +284,7 @@ func TestEvidenceAuditStorePersistsLifecycleAndCompletedReportIsImmutable(t *tes
 		t.Fatal(err)
 	}
 	report.Summary.Conclusion = "mutated conclusion"
-	if _, err := CompleteEvidenceAudit(store, report, now.Add(3*time.Minute)); !errors.Is(err, ErrEvidenceAuditImmutable) {
+	if _, err := completeEvidenceAuditForTest(t, store, report, now.Add(3*time.Minute)); !errors.Is(err, ErrEvidenceAuditImmutable) {
 		t.Fatalf("overwrite completed report error = %v", err)
 	}
 	after, err := os.ReadFile(reportPath)
@@ -301,6 +301,36 @@ func TestEvidenceAuditStorePersistsLifecycleAndCompletedReportIsImmutable(t *tes
 	}
 	if loaded.OutputHash != completed.OutputHash || loaded.Summary.Conclusion != completed.Summary.Conclusion {
 		t.Fatalf("loaded audit = %#v", loaded)
+	}
+}
+
+func TestEvidenceAuditPreparedReportIsNotObservableAsCompletedBeforeTrace(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	queued, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "request-two-phase", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, queued.AuditID, "trace-two-phase", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	report := validCompletedEvidenceAudit()
+	report.AuditID = queued.AuditID
+	prepared, err := PrepareEvidenceAuditCompletion(store, report, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible, err := store.LoadEvidenceAudit(queued.AuditID)
+	if err != nil || visible.Status != EvidenceAuditRunning || visible.OutputHash != "" {
+		t.Fatalf("prepared audit leaked completed state: %#v err=%v", visible, err)
+	}
+	if _, err := PublishEvidenceAuditCompletion(store, queued.AuditID); err == nil ||
+		!strings.Contains(err.Error(), "terminal") {
+		t.Fatalf("publish without trace error = %v", err)
+	}
+	completed, err := completeEvidenceAuditForTest(t, store, *prepared, now.Add(3*time.Minute))
+	if err != nil || completed.Status != EvidenceAuditCompleted {
+		t.Fatalf("two-phase completion = %#v err=%v", completed, err)
 	}
 }
 
@@ -495,7 +525,7 @@ func TestEvidenceAuditStoreRecoversWhenManifestWriteFailsAfterReportWrite(t *tes
 	}
 	t.Cleanup(func() { writeEvidenceAuditManifestFile = originalWriter })
 
-	if _, err := CompleteEvidenceAudit(store, report, now.Add(2*time.Minute)); err == nil ||
+	if _, err := completeEvidenceAuditForTest(t, store, report, now.Add(2*time.Minute)); err == nil ||
 		!strings.Contains(err.Error(), "injected manifest failure") {
 		t.Fatalf("first completion error = %v", err)
 	}
@@ -511,7 +541,7 @@ func TestEvidenceAuditStoreRecoversWhenManifestWriteFailsAfterReportWrite(t *tes
 		t.Fatal(err)
 	}
 
-	completed, err := CompleteEvidenceAudit(store, report, now.Add(5*time.Minute))
+	completed, err := completeEvidenceAuditForTest(t, store, report, now.Add(5*time.Minute))
 	if err != nil {
 		t.Fatalf("recovered completion error = %v", err)
 	}
@@ -548,7 +578,7 @@ func TestEvidenceAuditStoreRejectsPreparedJournalWithMismatchedReportIdentity(t 
 		return errors.New("injected manifest failure")
 	}
 	t.Cleanup(func() { writeEvidenceAuditManifestFile = originalWriter })
-	if _, err := CompleteEvidenceAudit(store, report, now.Add(2*time.Minute)); err == nil {
+	if _, err := completeEvidenceAuditForTest(t, store, report, now.Add(2*time.Minute)); err == nil {
 		t.Fatal("completion unexpectedly succeeded")
 	}
 	writeEvidenceAuditManifestFile = originalWriter
@@ -565,7 +595,7 @@ func TestEvidenceAuditStoreRejectsPreparedJournalWithMismatchedReportIdentity(t 
 	if err := os.WriteFile(store.EvidenceAuditPreparedPath(queued.AuditID), payload, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CompleteEvidenceAudit(store, report, now.Add(3*time.Minute)); err == nil ||
+	if _, err := completeEvidenceAuditForTest(t, store, report, now.Add(3*time.Minute)); err == nil ||
 		(!strings.Contains(err.Error(), "prepared") && !errors.Is(err, os.ErrNotExist)) {
 		t.Fatalf("CompleteEvidenceAudit() error = %v", err)
 	}
@@ -657,6 +687,71 @@ func TestEvidenceAuditManifestRecoversLastKnownGoodAtEveryPublishStage(t *testin
 			}
 		})
 	}
+}
+
+func completeEvidenceAuditForTest(
+	t *testing.T,
+	store *BookKnowledgeStore,
+	report EvidenceAudit,
+	now time.Time,
+) (*EvidenceAudit, error) {
+	t.Helper()
+	if existing, err := store.LoadEvidenceAudit(report.AuditID); err == nil &&
+		existing.Status == EvidenceAuditCompleted {
+		if !evidenceAuditReportContentEqual(*existing, report) {
+			return nil, ErrEvidenceAuditImmutable
+		}
+		return existing, nil
+	}
+	prepared, err := PrepareEvidenceAuditCompletion(store, report, now)
+	if err != nil {
+		return nil, err
+	}
+	retrieved := make([]evidenceAuditRetrievedItem, 0)
+	for _, claim := range prepared.ClaimAudits {
+		for _, ref := range claim.Evidence {
+			retrieved = append(retrieved, evidenceAuditRetrievedItem{
+				Evidence: AgentPackageEvidence{
+					ReleaseID: ref.ReleaseID, ClaimID: ref.ClaimID,
+					Statement:   "bounded test evidence",
+					CitationIDs: []string{ref.CitationID}, Score: 1,
+				},
+				Ref: ref,
+			})
+		}
+	}
+	fingerprint, err := evidenceAuditReportFingerprint(*prepared)
+	if err != nil {
+		return nil, err
+	}
+	trace, err := buildEvidenceAuditTrace(
+		store, *prepared, AgentPackage{}, retrieved, prepared.ClaimAudits,
+		prepared.TraceID, AgentTraceOutcomeCompleted, fingerprint,
+		EvidenceAuditRunnerConfig{Now: func() time.Time { return now }},
+	)
+	if err != nil {
+		return nil, err
+	}
+	terminal := evidenceAuditTraceTerminal{
+		Version: evidenceAuditTraceTerminalVersion,
+		AuditID: prepared.AuditID, InputHash: prepared.InputHash,
+		TraceID: prepared.TraceID, ReportFingerprint: fingerprint,
+		Report: prepared, Trace: trace,
+	}
+	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
+		return nil, err
+	}
+	if err := store.finalizeEvidenceAuditTraceTerminal(terminal); err != nil {
+		return nil, err
+	}
+	completed, err := PublishEvidenceAuditCompletion(store, prepared.AuditID)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.removeEvidenceAuditTraceTerminal(prepared.AuditID); err != nil {
+		return nil, err
+	}
+	return completed, nil
 }
 
 func TestEvidenceAuditManifestFallsBackFromCorruptPrimaryToValidBackup(t *testing.T) {
