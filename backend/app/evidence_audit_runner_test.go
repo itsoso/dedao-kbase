@@ -492,6 +492,85 @@ func TestEvidenceAuditRunnerRecoversCandidateWhenCheckpointFollowupFails(t *test
 	}
 }
 
+func TestEvidenceAuditRunnerRestoresCheckpointUsageWithoutRepeatingModelCall(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-checkpoint-usage", "Evidence comparison only.")
+	previous := evidenceAuditRuntimeStageHook
+	failed := false
+	evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+		if stage == "checkpoint" && !failed {
+			failed = true
+			return errors.New("synthetic checkpoint followup failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+	cost := 0.0125
+	first := &evidenceAuditResultClient{results: []BookKnowledgeLLMResult{{
+		Content: `{"candidate_verdict":"supported","rationale":"saved candidate","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+		Usage: &BookKnowledgeLLMUsage{
+			PromptTokens: 40, CompletionTokens: 10, TotalTokens: 50, CostUSD: &cost,
+		},
+	}}}
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, first, evidenceAuditRunnerConfig()); err == nil {
+		t.Fatal("first run unexpectedly succeeded")
+	}
+	second := &evidenceAuditResultClient{}
+	completed, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace, err := store.LoadAgentTrace(completed.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.calls) != 1 || len(second.calls) != 0 {
+		t.Fatalf("model calls first=%d second=%d", len(first.calls), len(second.calls))
+	}
+	want := AgentTraceUsage{
+		Status: "reported", PromptTokens: 40, CompletionTokens: 10, TotalTokens: 50,
+		CostUSD: 0.0125, CostStatus: "reported",
+	}
+	if trace.Observability == nil || trace.Observability.Usage != want {
+		t.Fatalf("recovered usage = %#v, want %#v", trace.Observability, want)
+	}
+}
+
+func TestEvidenceAuditRunnerCheckpointUnknownUsageRemainsUnknownAfterRecovery(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-checkpoint-unknown-usage", "Evidence comparison only.")
+	previous := evidenceAuditRuntimeStageHook
+	failed := false
+	evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+		if stage == "checkpoint" && !failed {
+			failed = true
+			return errors.New("synthetic checkpoint followup failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+	first := &evidenceAuditResultClient{results: []BookKnowledgeLLMResult{{
+		Content: `{"candidate_verdict":"supported","rationale":"saved candidate","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+		Usage:   nil,
+	}}}
+	if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, first, evidenceAuditRunnerConfig()); err == nil {
+		t.Fatal("first run unexpectedly succeeded")
+	}
+	completed, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, &evidenceAuditResultClient{}, evidenceAuditRunnerConfig(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace, err := store.LoadAgentTrace(completed.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.Observability == nil || trace.Observability.Usage != (AgentTraceUsage{Status: "unknown"}) {
+		t.Fatalf("recovered unknown usage = %#v", trace.Observability)
+	}
+}
+
 func TestEvidenceAuditRunnerCheckpointDoesNotPersistPromptOrSourceBody(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
 	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-checkpoint-privacy", "Evidence comparison only.")
@@ -862,6 +941,82 @@ func TestEvidenceAuditRunnerFailsImmediatelyWhenLaterClaimRetrievalOrCitationTim
 	}
 }
 
+func TestEvidenceAuditRunnerPersistenceStagesMeasureRealFailures(t *testing.T) {
+	tests := []struct {
+		name      string
+		stageName string
+		install   func(t *testing.T)
+	}{
+		{
+			name:      "report persistence",
+			stageName: "report_persistence",
+			install: func(t *testing.T) {
+				previous := evidenceAuditStorageFault
+				failed := false
+				evidenceAuditStorageFault = func(stage, path string) error {
+					if stage == evidenceAuditFaultImmutableTempSynced &&
+						strings.Contains(path, string(filepath.Separator)+"reports"+string(filepath.Separator)) &&
+						!failed {
+						failed = true
+						return errors.New("synthetic report persistence failure")
+					}
+					return nil
+				}
+				t.Cleanup(func() { evidenceAuditStorageFault = previous })
+			},
+		},
+		{
+			name:      "trace persistence",
+			stageName: "trace_persistence",
+			install: func(t *testing.T) {
+				previous := evidenceAuditTraceStorageFault
+				failed := false
+				evidenceAuditTraceStorageFault = func(stage, _ string) error {
+					if stage == evidenceAuditTraceFaultBeforePrepare && !failed {
+						failed = true
+						return errors.New("synthetic trace persistence failure")
+					}
+					return nil
+				}
+				t.Cleanup(func() { evidenceAuditTraceStorageFault = previous })
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+			audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-stage-failure-"+tt.name, "Evidence comparison only.")
+			tt.install(t)
+			base := testAgentPackageTime().Add(3 * time.Hour)
+			tick := 0
+			cfg := evidenceAuditRunnerConfig()
+			cfg.Now = func() time.Time {
+				current := base.Add(time.Duration(tick) * 7 * time.Millisecond)
+				tick++
+				return current
+			}
+			client := &evidenceAuditFakeClient{answers: []string{
+				`{"candidate_verdict":"supported","rationale":"support","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+			}}
+			if _, err := RunEvidenceAudit(context.Background(), store, audit.AuditID, client, cfg); err == nil {
+				t.Fatal("RunEvidenceAudit() unexpectedly succeeded")
+			}
+			stored, err := store.LoadEvidenceAudit(audit.AuditID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			trace, err := store.LoadAgentTrace(stored.TraceID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stage := findEvidenceAuditTraceStage(t, trace, tt.stageName)
+			if stage.Status != "failed" || stage.DurationMS <= 0 {
+				t.Fatalf("%s stage = %#v, want failed with measured duration", tt.stageName, stage)
+			}
+		})
+	}
+}
+
 func TestEvidenceAuditRunnerTraceIncludesBoundedDeterministicObservability(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
 	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-observability", "Evidence comparison only.")
@@ -913,11 +1068,20 @@ func TestEvidenceAuditRunnerTraceIncludesBoundedDeterministicObservability(t *te
 		"model", "report_persistence", "trace_persistence",
 	} {
 		stage := stages[index].(map[string]any)
-		wantDurations := []float64{20, 5, 25, 10, 5, 5, 5}
+		wantDurations := []float64{20, 5, 25, 10, 5, 10, 10}
 		if stage["name"] != want || stage["status"] != "completed" ||
 			stage["duration_ms"] != wantDurations[index] {
 			t.Fatalf("stage[%d] = %#v", index, stage)
 		}
+		if want == "report_persistence" && stage["definition"] != "immutable_report_preparation" {
+			t.Fatalf("report persistence definition = %#v", stage)
+		}
+		if want == "trace_persistence" && stage["definition"] != "durable_trace_terminal_preparation" {
+			t.Fatalf("trace persistence definition = %#v", stage)
+		}
+	}
+	if observability["terminal_protocol"] != "prepared-report-trace-then-audit-publish.v1" {
+		t.Fatalf("terminal protocol = %#v", observability["terminal_protocol"])
 	}
 	if observability["citation_resolution_rate"] != float64(1) ||
 		observability["independent_publication_source_count"] != float64(1) {
@@ -1008,6 +1172,54 @@ func (c *evidenceAuditFakeClient) Chat(_ context.Context, _ BookTokenPlanConfig,
 		return "", errors.New("missing fake model answer")
 	}
 	return c.answers[index], nil
+}
+
+type evidenceAuditResultClient struct {
+	mu      sync.Mutex
+	results []BookKnowledgeLLMResult
+	err     error
+	calls   [][]BookKnowledgeMessage
+}
+
+func (c *evidenceAuditResultClient) Chat(
+	ctx context.Context,
+	config BookTokenPlanConfig,
+	messages []BookKnowledgeMessage,
+) (string, error) {
+	result, err := c.ChatWithResult(ctx, config, messages)
+	return result.Content, err
+}
+
+func (c *evidenceAuditResultClient) ChatWithResult(
+	_ context.Context,
+	_ BookTokenPlanConfig,
+	messages []BookKnowledgeMessage,
+) (BookKnowledgeLLMResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, append([]BookKnowledgeMessage(nil), messages...))
+	if c.err != nil {
+		return BookKnowledgeLLMResult{}, c.err
+	}
+	index := len(c.calls) - 1
+	if index >= len(c.results) {
+		return BookKnowledgeLLMResult{}, errors.New("missing fake model result")
+	}
+	return c.results[index], nil
+}
+
+func findEvidenceAuditTraceStage(t *testing.T, trace *AgentTrace, name string) AgentTraceStage {
+	t.Helper()
+	if trace == nil || trace.Observability == nil {
+		t.Fatalf("trace observability is missing: %#v", trace)
+	}
+	for _, stage := range trace.Observability.Stages {
+		if stage.Name == name {
+			return stage
+		}
+	}
+	t.Fatalf("trace stage %q is missing", name)
+	return AgentTraceStage{}
 }
 
 type evidenceAuditBlockingClient struct{}

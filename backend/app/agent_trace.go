@@ -20,7 +20,7 @@ import (
 const (
 	AgentTraceSchemaVersion           = "agent-trace.v1"
 	evidenceAuditTraceTerminalVersion = "evidence-audit-trace-terminal.v1"
-	evidenceAuditExecutionVersion     = "evidence-audit-execution.v1"
+	evidenceAuditExecutionVersion     = "evidence-audit-execution.v2"
 	evidenceAuditInvocationVersion    = "evidence-audit-model-invocation.v1"
 
 	evidenceAuditInvocationInFlight  = "in_flight"
@@ -70,12 +70,14 @@ type AgentTraceObservability struct {
 	IndependentPublicationSourceCount int               `json:"independent_publication_source_count"`
 	AbstentionReason                  string            `json:"abstention_reason,omitempty"`
 	Usage                             AgentTraceUsage   `json:"usage"`
+	TerminalProtocol                  string            `json:"terminal_protocol,omitempty"`
 }
 
 type AgentTraceStage struct {
 	Name       string `json:"name"`
 	Status     string `json:"status"`
 	DurationMS int64  `json:"duration_ms"`
+	Definition string `json:"definition,omitempty"`
 }
 
 type AgentTraceUsage struct {
@@ -122,6 +124,7 @@ type evidenceAuditClaimCandidate struct {
 	ClaimIndex    int                        `json:"claim_index"`
 	ClaimHash     string                     `json:"claim_hash"`
 	Decision      evidenceAuditModelDecision `json:"decision"`
+	Usage         AgentTraceUsage            `json:"usage"`
 	CandidateHash string                     `json:"candidate_hash"`
 }
 
@@ -371,6 +374,19 @@ func validateAgentTraceObservability(value *AgentTraceObservability) error {
 		default:
 			return fmt.Errorf("observability stage %q has invalid status", stage.Name)
 		}
+		switch stage.Definition {
+		case "", "immutable_report_preparation", "durable_trace_terminal_preparation":
+		default:
+			return fmt.Errorf("observability stage %q has invalid definition", stage.Name)
+		}
+		if stage.Name == "report_persistence" && stage.Definition != "" &&
+			stage.Definition != "immutable_report_preparation" {
+			return fmt.Errorf("report_persistence has invalid definition")
+		}
+		if stage.Name == "trace_persistence" && stage.Definition != "" &&
+			stage.Definition != "durable_trace_terminal_preparation" {
+			return fmt.Errorf("trace_persistence has invalid definition")
+		}
 	}
 	if value.CitationResolutionRate < 0 || value.CitationResolutionRate > 1 {
 		return fmt.Errorf("observability.citation_resolution_rate must be between zero and one")
@@ -382,24 +398,32 @@ func validateAgentTraceObservability(value *AgentTraceObservability) error {
 		(len(value.AbstentionReason) > 128 || !agentPackageIDPattern.MatchString(value.AbstentionReason)) {
 		return fmt.Errorf("observability.abstention_reason must be a bounded reason code")
 	}
-	switch value.Usage.Status {
+	if value.TerminalProtocol != "" &&
+		value.TerminalProtocol != "prepared-report-trace-then-audit-publish.v1" {
+		return fmt.Errorf("observability terminal_protocol is invalid")
+	}
+	return validateAgentTraceUsage(value.Usage)
+}
+
+func validateAgentTraceUsage(value AgentTraceUsage) error {
+	switch value.Status {
 	case "unknown":
-		if value.Usage.PromptTokens != 0 || value.Usage.CompletionTokens != 0 ||
-			value.Usage.TotalTokens != 0 || value.Usage.CostUSD != 0 {
+		if value.PromptTokens != 0 || value.CompletionTokens != 0 ||
+			value.TotalTokens != 0 || value.CostUSD != 0 || value.CostStatus != "" {
 			return fmt.Errorf("observability usage marked unknown must not contain values")
 		}
 	case "reported":
-		if value.Usage.PromptTokens < 0 || value.Usage.CompletionTokens < 0 ||
-			value.Usage.TotalTokens < 0 ||
-			value.Usage.TotalTokens != value.Usage.PromptTokens+value.Usage.CompletionTokens ||
-			value.Usage.TotalTokens > 5_000_000 ||
-			value.Usage.CostUSD < 0 || value.Usage.CostUSD > 1_000_000 {
+		if value.PromptTokens < 0 || value.CompletionTokens < 0 ||
+			value.TotalTokens < 0 ||
+			value.TotalTokens != value.PromptTokens+value.CompletionTokens ||
+			value.TotalTokens > 5_000_000 ||
+			value.CostUSD < 0 || value.CostUSD > 1_000_000 {
 			return fmt.Errorf("observability usage is invalid")
 		}
-		switch value.Usage.CostStatus {
+		switch value.CostStatus {
 		case "reported":
 		case "unknown":
-			if value.Usage.CostUSD != 0 {
+			if value.CostUSD != 0 {
 				return fmt.Errorf("observability usage cost marked unknown must be zero")
 			}
 		default:
@@ -586,6 +610,7 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 	plan evidenceAuditExecutionPlan,
 	claimIndex int,
 	decision evidenceAuditModelDecision,
+	usage AgentTraceUsage,
 ) (evidenceAuditClaimCandidate, error) {
 	if err := validateEvidenceAuditExecutionPlan(plan); err != nil {
 		return evidenceAuditClaimCandidate{}, err
@@ -598,7 +623,7 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 		AuditID: plan.AuditID, InputHash: plan.InputHash,
 		Package: plan.Package, Model: plan.Model,
 		ClaimIndex: claimIndex, ClaimHash: plan.ClaimHashes[claimIndex],
-		Decision: decision,
+		Decision: decision, Usage: usage,
 	}
 	hash, err := evidenceAuditClaimCandidateHash(candidate)
 	if err != nil {
@@ -803,6 +828,9 @@ func validateEvidenceAuditClaimCandidate(
 	if _, err := parseEvidenceAuditModelDecision(mustEncodeEvidenceAuditDecision(candidate.Decision)); err != nil {
 		return fmt.Errorf("validate evidence audit candidate decision: %w", err)
 	}
+	if err := validateAgentTraceUsage(candidate.Usage); err != nil {
+		return fmt.Errorf("validate evidence audit candidate usage: %w", err)
+	}
 	expected, err := evidenceAuditClaimCandidateHash(candidate)
 	if err != nil {
 		return err
@@ -843,6 +871,25 @@ func (s *BookKnowledgeStore) prepareEvidenceAuditTraceTerminal(terminal evidence
 		return fmt.Errorf("prepared evidence audit terminal already exists with different content")
 	}
 	if !os.IsNotExist(err) {
+		return err
+	}
+	return writeFileAtomically(path, payload)
+}
+
+func (s *BookKnowledgeStore) finalizeEvidenceAuditTraceTerminalMetadata(
+	terminal evidenceAuditTraceTerminal,
+) error {
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		return err
+	}
+	payload, err := encodeJSONFile(terminal)
+	if err != nil {
+		return err
+	}
+	path := s.EvidenceAuditTraceTerminalPath(terminal.AuditID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := os.Stat(path); err != nil {
 		return err
 	}
 	return writeFileAtomically(path, payload)

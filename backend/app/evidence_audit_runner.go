@@ -48,6 +48,7 @@ type evidenceAuditObserver struct {
 	publications      map[string]bool
 	abstentionReason  string
 	usage             AgentTraceUsage
+	usageIncomplete   bool
 }
 
 type evidenceAuditStageState struct {
@@ -114,11 +115,12 @@ func (o *evidenceAuditObserver) snapshot(traceOutcome string) *AgentTraceObserva
 	for _, name := range evidenceAuditStageNames {
 		stage := o.stages[name]
 		status := stage.status
-		if status == "pending" {
+		if status == "pending" && stage.startedAt.IsZero() {
 			status = "skipped"
 		}
 		stages = append(stages, AgentTraceStage{
 			Name: name, Status: status, DurationMS: stage.duration.Milliseconds(),
+			Definition: evidenceAuditStageDefinition(name),
 		})
 	}
 	rate := float64(0)
@@ -133,28 +135,70 @@ func (o *evidenceAuditObserver) snapshot(traceOutcome string) *AgentTraceObserva
 		Stages: stages, CitationResolutionRate: rate,
 		IndependentPublicationSourceCount: len(o.publications),
 		AbstentionReason:                  reason, Usage: o.usage,
+		TerminalProtocol: "prepared-report-trace-then-audit-publish.v1",
 	}
 }
 
-func (o *evidenceAuditObserver) addUsage(usage *BookKnowledgeLLMUsage) {
-	if o == nil || usage == nil {
+func (o *evidenceAuditObserver) mergeUsage(value AgentTraceUsage) {
+	if o == nil {
 		return
 	}
-	if usage.PromptTokens < 0 || usage.CompletionTokens < 0 ||
-		usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens ||
-		usage.TotalTokens > 5_000_000 ||
-		(usage.CostUSD != nil && (*usage.CostUSD < 0 || *usage.CostUSD > 1_000_000)) {
+	if validateAgentTraceUsage(value) != nil || value.Status == "unknown" {
+		o.usageIncomplete = true
+		o.usage = AgentTraceUsage{Status: "unknown"}
+		return
+	}
+	if o.usageIncomplete {
 		return
 	}
 	if o.usage.Status == "unknown" {
-		o.usage = AgentTraceUsage{Status: "reported", CostStatus: "unknown"}
+		o.usage = AgentTraceUsage{Status: "reported", CostStatus: value.CostStatus}
 	}
-	o.usage.PromptTokens += usage.PromptTokens
-	o.usage.CompletionTokens += usage.CompletionTokens
-	o.usage.TotalTokens += usage.TotalTokens
+	if o.usage.TotalTokens+value.TotalTokens > 5_000_000 ||
+		o.usage.CostUSD+value.CostUSD > 1_000_000 {
+		o.usageIncomplete = true
+		o.usage = AgentTraceUsage{Status: "unknown"}
+		return
+	}
+	o.usage.PromptTokens += value.PromptTokens
+	o.usage.CompletionTokens += value.CompletionTokens
+	o.usage.TotalTokens += value.TotalTokens
+	if o.usage.CostStatus == "unknown" || value.CostStatus == "unknown" {
+		o.usage.CostStatus = "unknown"
+		o.usage.CostUSD = 0
+		return
+	}
+	o.usage.CostStatus = "reported"
+	o.usage.CostUSD += value.CostUSD
+}
+
+func agentTraceUsageFromProvider(usage *BookKnowledgeLLMUsage) AgentTraceUsage {
+	if usage == nil || usage.PromptTokens < 0 || usage.CompletionTokens < 0 ||
+		usage.TotalTokens != usage.PromptTokens+usage.CompletionTokens ||
+		usage.TotalTokens > 5_000_000 ||
+		(usage.CostUSD != nil && (*usage.CostUSD < 0 || *usage.CostUSD > 1_000_000)) {
+		return AgentTraceUsage{Status: "unknown"}
+	}
+	value := AgentTraceUsage{
+		Status: "reported", PromptTokens: usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens, TotalTokens: usage.TotalTokens,
+		CostStatus: "unknown",
+	}
 	if usage.CostUSD != nil {
-		o.usage.CostStatus = "reported"
-		o.usage.CostUSD += *usage.CostUSD
+		value.CostStatus = "reported"
+		value.CostUSD = *usage.CostUSD
+	}
+	return value
+}
+
+func evidenceAuditStageDefinition(name string) string {
+	switch name {
+	case "report_persistence":
+		return "immutable_report_preparation"
+	case "trace_persistence":
+		return "durable_trace_terminal_preparation"
+	default:
+		return ""
 	}
 }
 
@@ -417,6 +461,7 @@ func RunEvidenceAudit(
 		var decision evidenceAuditModelDecision
 		if checkpoint, ok := checkpoints[claimIndex]; ok {
 			decision = checkpoint.Decision
+			config.observer.mergeUsage(checkpoint.Usage)
 		} else {
 			messages := buildEvidenceAuditModelMessages(pkg, sourceClaim, retrieved)
 			if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
@@ -460,7 +505,8 @@ func RunEvidenceAudit(
 				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, modelErr)
 			}
 			config.observer.end("model", "completed")
-			config.observer.addUsage(result.Usage)
+			checkpointUsage := agentTraceUsageFromProvider(result.Usage)
+			config.observer.mergeUsage(checkpointUsage)
 			raw := result.Content
 			if err := evidenceAuditRunnerStage(runCtx, "model_completed_before_checkpoint"); err != nil {
 				config.observer.fail("model")
@@ -488,7 +534,7 @@ func RunEvidenceAudit(
 			}
 			parsed = evidenceAuditCheckpointDecision(parsed)
 			checkpoint, checkpointErr := store.saveEvidenceAuditClaimCandidate(
-				executionPlan, claimIndex, parsed,
+				executionPlan, claimIndex, parsed, checkpointUsage,
 			)
 			if checkpointErr != nil {
 				return nil, failEvidenceAuditRun(
@@ -1117,15 +1163,6 @@ func completeEvidenceAuditRun(
 		}
 	}
 	config.observer.begin("report_persistence")
-	config.observer.end("report_persistence", "completed")
-	config.observer.begin("trace_persistence")
-	config.observer.end("trace_persistence", "completed")
-	trace, err := buildEvidenceAuditTrace(
-		store, audit, pkg, retrieved, claims, traceID, traceOutcome, fingerprint, config,
-	)
-	if err != nil {
-		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
-	}
 	if err := evidenceAuditRunnerStage(ctx, "persist"); err != nil {
 		config.observer.fail("report_persistence")
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
@@ -1135,7 +1172,16 @@ func completeEvidenceAuditRun(
 	)
 	if err != nil {
 		config.observer.fail("report_persistence")
-		return nil, err
+		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
+	}
+	config.observer.end("report_persistence", "completed")
+	config.observer.begin("trace_persistence")
+	trace, err := buildEvidenceAuditTrace(
+		store, audit, pkg, retrieved, claims, traceID, traceOutcome, fingerprint, config,
+	)
+	if err != nil {
+		config.observer.fail("trace_persistence")
+		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
 	terminal := evidenceAuditTraceTerminal{
 		Version: evidenceAuditTraceTerminalVersion, AuditID: audit.AuditID,
@@ -1144,7 +1190,28 @@ func completeEvidenceAuditRun(
 	}
 	if err := store.prepareEvidenceAuditTraceTerminal(terminal); err != nil {
 		config.observer.fail("trace_persistence")
-		return nil, fmt.Errorf("prepare evidence audit terminal: %w", err)
+		return nil, failEvidenceAuditRun(
+			store, audit, pkg, retrieved, traceID, config,
+			fmt.Errorf("prepare evidence audit terminal: %w", err),
+		)
+	}
+	config.observer.end("trace_persistence", "completed")
+	trace, err = buildEvidenceAuditTrace(
+		store, audit, pkg, retrieved, claims, traceID, traceOutcome, fingerprint, config,
+	)
+	if err != nil {
+		config.observer.fail("trace_persistence")
+		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
+		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
+	}
+	terminal.Trace = trace
+	if err := store.finalizeEvidenceAuditTraceTerminalMetadata(terminal); err != nil {
+		config.observer.fail("trace_persistence")
+		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
+		return nil, failEvidenceAuditRun(
+			store, audit, pkg, retrieved, traceID, config,
+			fmt.Errorf("finalize evidence audit terminal metadata: %w", err),
+		)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1158,10 +1225,8 @@ func completeEvidenceAuditRun(
 	}
 	completed, err := PublishEvidenceAuditCompletion(store, audit.AuditID)
 	if err != nil {
-		config.observer.fail("report_persistence")
 		return nil, err
 	}
-	config.observer.end("report_persistence", "completed")
 	if err := store.removeEvidenceAuditTraceTerminal(audit.AuditID); err != nil {
 		return nil, err
 	}
@@ -1189,7 +1254,6 @@ func failEvidenceAuditRun(
 	fingerprint := sha256Fingerprint([]byte(failureCode))
 	if config.observer != nil {
 		config.observer.begin("trace_persistence")
-		config.observer.end("trace_persistence", "completed")
 	}
 	trace, traceErr := buildEvidenceAuditTrace(
 		store, audit, packageValue, retrieved, nil, traceID, AgentTraceOutcomeFailed, fingerprint, config,
@@ -1203,7 +1267,29 @@ func failEvidenceAuditRun(
 		FailureCode: failureCode, FailureSummary: failureSummary, Trace: trace,
 	}
 	if traceErr := store.prepareEvidenceAuditTraceTerminal(terminal); traceErr != nil {
+		if config.observer != nil {
+			config.observer.fail("trace_persistence")
+		}
 		return fmt.Errorf("%v; prepare failed trace: %w", runErr, traceErr)
+	}
+	if config.observer != nil {
+		config.observer.end("trace_persistence", "completed")
+	}
+	trace, traceErr = buildEvidenceAuditTrace(
+		store, audit, packageValue, retrieved, nil, traceID,
+		AgentTraceOutcomeFailed, fingerprint, config,
+	)
+	if traceErr != nil {
+		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
+		return fmt.Errorf("%v; rebuild failed trace: %w", runErr, traceErr)
+	}
+	terminal.Trace = trace
+	if traceErr := store.finalizeEvidenceAuditTraceTerminalMetadata(terminal); traceErr != nil {
+		if config.observer != nil {
+			config.observer.fail("trace_persistence")
+		}
+		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
+		return fmt.Errorf("%v; finalize failed trace metadata: %w", runErr, traceErr)
 	}
 	if traceErr := store.finalizeEvidenceAuditTraceTerminal(terminal); traceErr != nil {
 		return fmt.Errorf("%v; finalize failed trace: %w", runErr, traceErr)
