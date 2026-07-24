@@ -352,7 +352,8 @@ func TestKBaseHTTPHandlerEvidenceAuditValidationAndAvailabilityErrors(t *testing
 		Store: store, AuthToken: "secret-token", AuditUnavailableReason: "TokenPlan API key is not configured",
 	})
 	response := requestJSONKBase(unconfigured, http.MethodPost, path, "secret-token", `{"subject":"x","scope":"y","idempotency_key":"unavailable"}`)
-	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "TokenPlan") {
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"audit_service_unavailable"`) {
 		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
 	}
 	missingAudit := requestKBase(handler, http.MethodGet, "/api/agent-audits/missing-audit", "secret-token")
@@ -472,6 +473,77 @@ func TestKBaseHTTPHandlerRejectsForgedAndExpiredRetryGrants(t *testing.T) {
 	)
 	if err := handler.validateEvidenceAuditRetryAuthorization(expired, now); err == nil {
 		t.Fatal("expired authorization accepted")
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditErrorsAreStableAndDoNotLeakStorageDetails(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := os.MkdirAll(store.EvidenceAuditDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	privateDetail := store.EvidenceAuditManifestPath() + " bearer super-secret-token"
+	if err := os.WriteFile(store.EvidenceAuditManifestPath(), []byte("{"+privateDetail), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.EvidenceAuditManifestPath()+".bak", []byte("{broken-backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := make([]EvidenceAuditHTTPLogEvent, 0, 1)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a",
+		AuditLogger: func(event EvidenceAuditHTTPLogEvent) { logs = append(logs, event) },
+	})
+	response := requestKBase(handler, http.MethodGet, "/api/agent-audits", "consumer-a")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error response: %v body=%s", err, response.Body.String())
+	}
+	if payload.Code != "audit_store_unavailable" || payload.Error != "evidence audit storage is unavailable" {
+		t.Fatalf("stable error payload = %+v", payload)
+	}
+	if strings.Contains(response.Body.String(), store.Root()) ||
+		strings.Contains(response.Body.String(), "super-secret-token") ||
+		strings.Contains(response.Body.String(), "invalid character") {
+		t.Fatalf("response leaked internal detail: %s", response.Body.String())
+	}
+	if len(logs) != 1 || logs[0].Code != payload.Code || logs[0].Operation != "list_audits" {
+		t.Fatalf("audit logs = %+v", logs)
+	}
+	if !strings.Contains(logs[0].Cause, "invalid character") {
+		t.Fatalf("logger did not receive complete storage diagnostic: %+v", logs[0])
+	}
+	if strings.Contains(logs[0].Cause, "super-secret-token") {
+		t.Fatalf("logger leaked token: %+v", logs[0])
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditQueueErrorUsesStableResponse(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	queue := &recordingEvidenceAuditEnqueuer{err: fmt.Errorf("%w: /private/path token=secret", ErrEvidenceAuditQueueFull)}
+	logs := make([]EvidenceAuditHTTPLogEvent, 0, 1)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditLogger: func(event EvidenceAuditHTTPLogEvent) { logs = append(logs, event) },
+	})
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	response := requestJSONKBase(
+		handler, http.MethodPost, path, "consumer-a",
+		`{"subject":"Trial claim","scope":"Population evidence comparison","idempotency_key":"queue-error"}`,
+	)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"audit_queue_full"`) ||
+		strings.Contains(response.Body.String(), "/private/path") {
+		t.Fatalf("queue error status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(logs) != 1 || logs[0].Code != "audit_queue_full" ||
+		strings.Contains(logs[0].Cause, "secret") {
+		t.Fatalf("queue logs = %+v", logs)
 	}
 }
 

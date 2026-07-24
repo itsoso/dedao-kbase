@@ -24,7 +24,10 @@ const (
 		"Pinned supporting evidence (metadata and statements only):\n{{evidence}}"
 )
 
-var ErrEvidenceAuditModelOutcomeUnknown = errors.New("model_outcome_unknown: requires_manual_retry")
+var (
+	ErrEvidenceAuditModelOutcomeUnknown = errors.New("model_outcome_unknown: requires_manual_retry")
+	ErrEvidenceAuditExecutionBusy       = errors.New("evidence audit execution busy")
+)
 
 var (
 	evidenceAuditEnglishAgePattern      = regexp.MustCompile(`(?i)\bage\s*[:=]?\s*\d+|\b\d+\s*[- ]?year[- ]old\b`)
@@ -51,6 +54,7 @@ type EvidenceAuditRunnerConfig struct {
 	// descriptor has been validated and covers the remaining workflow.
 	BootstrapTimeout time.Duration
 	Now              func() time.Time
+	LeaseOwner       string
 	observer         *evidenceAuditObserver
 }
 
@@ -378,6 +382,11 @@ func RunEvidenceAudit(
 	if err != nil {
 		return nil, err
 	}
+	if strings.TrimSpace(config.LeaseOwner) != "" {
+		if err := store.ValidateEvidenceAuditLease(auditID, config.LeaseOwner, evidenceAuditRunnerNow(config)); err != nil {
+			return nil, err
+		}
+	}
 	config.observer = newEvidenceAuditObserver(config)
 	config.observer.begin("package_validation")
 	traceID := audit.TraceID
@@ -427,6 +436,9 @@ func RunEvidenceAudit(
 		runCtx, auditID,
 	)
 	if err != nil {
+		if errors.Is(err, ErrEvidenceAuditExecutionBusy) || errors.Is(err, ErrEvidenceAuditLeaseLost) {
+			return nil, err
+		}
 		return failEarly(err)
 	}
 	defer unlockExecution()

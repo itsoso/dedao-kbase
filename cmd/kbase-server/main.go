@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -70,6 +71,10 @@ func main() {
 		AuditUnavailableReason: auditRuntime.UnavailableReason,
 		AuditMaxBodyBytes:      evidenceAuditMaxBodyBytes(),
 		AuditRetrySigningKey:   retrySigningKey,
+		AuditLogger: func(event app.EvidenceAuditHTTPLogEvent) {
+			log.Printf("evidence audit HTTP error: operation=%s code=%s cause=%s",
+				event.Operation, event.Code, event.Cause)
+		},
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
@@ -111,7 +116,10 @@ func main() {
 	reverificationRunner := app.NewKnowledgeReverificationRunner(bookStore, nil, time.Now, knowledgeReverificationStaleAfter())
 	_, reverificationDone := startKnowledgeReverificationRunner(ctx, knowledgeReverificationTickInterval(), reverificationRunner, log.Printf)
 
-	server := &http.Server{Addr: *addr, Handler: handler}
+	server, err := newKBaseHTTPServer(*addr, handler)
+	if err != nil {
+		log.Fatalf("invalid HTTP server configuration: %v", err)
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -158,6 +166,10 @@ func newEvidenceAuditServerRuntime(
 		RunnerConfig: app.EvidenceAuditRunnerConfig{ModelConfig: modelConfig},
 		Workers:      evidenceAuditWorkerCount(), QueueSize: evidenceAuditQueueSize(),
 		PollInterval: time.Second,
+		Metrics: func(event app.EvidenceAuditCoordinatorEvent) {
+			log.Printf("evidence audit coordinator: event=%s audit=%s code=%s attempt=%d retry_after=%s",
+				event.Type, event.AuditID, event.ErrorCode, event.Attempt, event.RetryAfter)
+		},
 	})
 	if err != nil {
 		return evidenceAuditServerRuntime{UnavailableReason: "evidence audit coordinator initialization failed: " + err.Error()}
@@ -331,6 +343,62 @@ func evidenceAuditRetrySigningKey() ([]byte, error) {
 		return nil, errors.New("KBASE_AUDIT_RETRY_SIGNING_KEY must contain at least 32 bytes")
 	}
 	return []byte(value), nil
+}
+
+func newKBaseHTTPServer(addr string, handler http.Handler) (*http.Server, error) {
+	readHeaderTimeout, err := strictDurationEnvironment(
+		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", 5, 60,
+	)
+	if err != nil {
+		return nil, err
+	}
+	readTimeout, err := strictDurationEnvironment("KBASE_HTTP_READ_TIMEOUT_SECONDS", 30, 300)
+	if err != nil {
+		return nil, err
+	}
+	writeTimeout, err := strictDurationEnvironment("KBASE_HTTP_WRITE_TIMEOUT_SECONDS", 120, 300)
+	if err != nil {
+		return nil, err
+	}
+	idleTimeout, err := strictDurationEnvironment("KBASE_HTTP_IDLE_TIMEOUT_SECONDS", 60, 600)
+	if err != nil {
+		return nil, err
+	}
+	maxHeaderBytes, err := strictIntegerEnvironment(
+		"KBASE_HTTP_MAX_HEADER_BYTES", 1<<20, 8<<10, 4<<20,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}, nil
+}
+
+func strictDurationEnvironment(key string, fallback, maximum int) (time.Duration, error) {
+	value, err := strictIntegerEnvironment(key, fallback, 1, maximum)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(value) * time.Second, nil
+}
+
+func strictIntegerEnvironment(key string, fallback, minimum, maximum int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, minimum, maximum)
+	}
+	return value, nil
 }
 
 func validateEvidenceAuditRetryKeySeparation(key []byte, bearerTokens ...string) error {

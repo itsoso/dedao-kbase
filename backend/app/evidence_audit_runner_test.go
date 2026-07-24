@@ -623,7 +623,7 @@ func TestEvidenceAuditRunnerTimeoutCoversPackageAndReleaseLoading(t *testing.T) 
 	})
 }
 
-func TestEvidenceAuditRunnerEarlyLoadAndLockFailuresReachFailedTerminal(t *testing.T) {
+func TestEvidenceAuditRunnerEarlyLoadFailureReachesTerminalAndBusyLockDoesNotFail(t *testing.T) {
 	t.Run("bootstrap load failure", func(t *testing.T) {
 		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
 		audit := createEvidenceAuditRunnerTask(
@@ -660,10 +660,16 @@ func TestEvidenceAuditRunnerEarlyLoadAndLockFailuresReachFailedTerminal(t *testi
 		cfg.BootstrapTimeout = 20 * time.Millisecond
 		if _, err := RunEvidenceAudit(
 			context.Background(), store, audit.AuditID, &evidenceAuditFakeClient{}, cfg,
-		); err == nil {
-			t.Fatal("lock failure unexpectedly succeeded")
+		); !errors.Is(err, ErrEvidenceAuditExecutionBusy) {
+			t.Fatalf("lock failure error = %v, want execution busy", err)
 		}
-		assertEvidenceAuditFailedTerminal(t, store, audit.AuditID)
+		loaded, err := store.LoadEvidenceAudit(audit.AuditID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loaded.Status == EvidenceAuditFailed {
+			t.Fatalf("busy lock incorrectly failed audit: %+v", loaded)
+		}
 	})
 }
 
@@ -1061,10 +1067,20 @@ func TestEvidenceAuditRunnerSerializesConcurrentExecutionWithoutDuplicateModelCa
 	}
 	wait.Wait()
 	close(errs)
+	successes := 0
+	busy := 0
 	for err := range errs {
-		if err != nil {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrEvidenceAuditExecutionBusy):
+			busy++
+		default:
 			t.Errorf("concurrent run failed: %v", err)
 		}
+	}
+	if successes != 1 || busy != 1 {
+		t.Fatalf("concurrent outcomes successes=%d busy=%d", successes, busy)
 	}
 	if len(client.calls) != 1 {
 		t.Fatalf("concurrent execution called model %d times", len(client.calls))
@@ -1808,4 +1824,40 @@ func sameStringSet(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func TestRunEvidenceAuditExecutionLockBusyDoesNotFailAnotherOwnersAudit(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(
+		t, store, pkg, "execution-lock-busy", "Population evidence comparison.",
+	)
+	now := testAgentPackageTime()
+	claim, err := store.ClaimEvidenceAuditLease(audit.AuditID, "lease-owner", now, time.Minute)
+	if err != nil || !claim.Claimed {
+		t.Fatalf("ClaimEvidenceAuditLease() claim=%+v err=%v", claim, err)
+	}
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), time.Second)
+	defer lockCancel()
+	unlock, err := store.acquireEvidenceAuditExecutionLock(lockCtx, audit.AuditID)
+	if err != nil {
+		t.Fatalf("acquireEvidenceAuditExecutionLock() error = %v", err)
+	}
+	defer unlock()
+
+	config := evidenceAuditRunnerConfig()
+	config.LeaseOwner = "lease-owner"
+	config.Now = func() time.Time { return now }
+	config.Timeout = 5 * time.Second
+	if _, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, &evidenceAuditFakeClient{}, config,
+	); !errors.Is(err, ErrEvidenceAuditExecutionBusy) {
+		t.Fatalf("RunEvidenceAudit() error = %v, want execution busy", err)
+	}
+	loaded, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil {
+		t.Fatalf("LoadEvidenceAudit() error = %v", err)
+	}
+	if loaded.Status == EvidenceAuditFailed {
+		t.Fatalf("busy execution incorrectly failed audit: %+v", loaded)
+	}
 }

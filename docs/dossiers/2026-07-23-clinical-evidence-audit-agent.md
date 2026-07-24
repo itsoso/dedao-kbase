@@ -90,17 +90,28 @@ Audit/Trace terminal coordination.
 
 ### Task 4 - Durable Coordinator And HTTP API
 
-Completed and verified.
+Completed, hardened, and verified.
 
 - The coordinator uses the persistent Audit store as the queue of record.
-  Bounded workers and an in-memory wake-up queue recover queued or running
-  Audits at startup.
+  Cross-process leases with owner, expiry, heartbeat, and attempt metadata
+  ensure that only one server instance executes an Audit. Expired leases can
+  be claimed after a crashed worker, while a busy execution lock never fails
+  another owner's Audit.
+- Recovery scans use a bounded cursor page instead of reading all Audit
+  records each second. Queue pressure remains durable and visible; scan and
+  execution failures use bounded exponential backoff with injectable jitter
+  and structured metric events.
 - Authenticated asynchronous create, list, detail, and explicit manual retry
   endpoints expose the workflow without automatically retrying failed Audits.
+- Audit API failures return stable public error codes and messages. Full
+  internal diagnostics go only to the injected server logger after credential
+  redaction.
 - Retry authorization is derived from the authenticated actor and signed with
   a server-side HMAC key. Bearer credentials and signing keys are not persisted.
 - Missing TokenPlan configuration leaves the service online but makes Audit
   creation return a diagnostic service-unavailable response.
+- The HTTP server has fail-closed environment parsing and safe defaults for
+  header, read, write, and idle timeouts plus maximum header size.
 - Focused and race-enabled coordinator/API tests pass without data races.
 - The complete backend and server command suites, `go vet`, privacy and system
   map smoke checks, diff checks, and Linux, Windows, and macOS compile checks

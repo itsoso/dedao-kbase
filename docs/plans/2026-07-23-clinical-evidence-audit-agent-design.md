@@ -107,6 +107,18 @@ Release hash mismatch, invalid output, or policy violation produces a failed
 audit and failed Trace; partial output is never presented as a completed
 report.
 
+The Audit manifest is also the durable queue of record. A coordinator must
+hold a persisted, renewable lease before enqueueing or executing an Audit.
+Recovery scans bounded cursor pages, expired leases are reclaimable, and scan
+or execution failures use bounded exponential backoff with structured
+metrics. A process that cannot acquire the execution lock returns
+`execution_busy` without changing another owner's Audit terminal state.
+
+Audit HTTP failures use stable public codes and messages. Storage paths,
+parser details, credentials, and upstream bodies are restricted to a redacted
+server-side diagnostic hook. The HTTP server enforces bounded headers and
+read, write, header, and idle deadlines.
+
 ### Runtime integrity and deadlines
 
 The caller context and a bounded bootstrap deadline cover initial audit and

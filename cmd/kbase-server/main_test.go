@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,6 +266,75 @@ func TestEvidenceAuditServerLimitsUseBoundedEnvironmentValues(t *testing.T) {
 	}
 	if got := evidenceAuditShutdownTimeout(); got != time.Minute {
 		t.Fatalf("bounded shutdown timeout = %s", got)
+	}
+}
+
+func TestKBaseHTTPServerUsesSafeTimeoutDefaults(t *testing.T) {
+	for _, key := range []string{
+		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
+		"KBASE_HTTP_READ_TIMEOUT_SECONDS",
+		"KBASE_HTTP_WRITE_TIMEOUT_SECONDS",
+		"KBASE_HTTP_IDLE_TIMEOUT_SECONDS",
+		"KBASE_HTTP_MAX_HEADER_BYTES",
+	} {
+		t.Setenv(key, "")
+	}
+	server, err := newKBaseHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	if err != nil {
+		t.Fatalf("newKBaseHTTPServer() error = %v", err)
+	}
+	if server.ReadHeaderTimeout != 5*time.Second ||
+		server.ReadTimeout != 30*time.Second ||
+		server.WriteTimeout != 2*time.Minute ||
+		server.IdleTimeout != time.Minute ||
+		server.MaxHeaderBytes != 1<<20 {
+		t.Fatalf("unsafe server defaults: %+v", server)
+	}
+}
+
+func TestKBaseHTTPServerReadsStrictBoundedEnvironment(t *testing.T) {
+	t.Setenv("KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", "7")
+	t.Setenv("KBASE_HTTP_READ_TIMEOUT_SECONDS", "31")
+	t.Setenv("KBASE_HTTP_WRITE_TIMEOUT_SECONDS", "121")
+	t.Setenv("KBASE_HTTP_IDLE_TIMEOUT_SECONDS", "61")
+	t.Setenv("KBASE_HTTP_MAX_HEADER_BYTES", "65536")
+	server, err := newKBaseHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	if err != nil {
+		t.Fatalf("newKBaseHTTPServer() error = %v", err)
+	}
+	if server.ReadHeaderTimeout != 7*time.Second ||
+		server.ReadTimeout != 31*time.Second ||
+		server.WriteTimeout != 121*time.Second ||
+		server.IdleTimeout != 61*time.Second ||
+		server.MaxHeaderBytes != 65536 {
+		t.Fatalf("configured server = %+v", server)
+	}
+
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", value: "0"},
+		{key: "KBASE_HTTP_READ_TIMEOUT_SECONDS", value: "invalid"},
+		{key: "KBASE_HTTP_WRITE_TIMEOUT_SECONDS", value: "301"},
+		{key: "KBASE_HTTP_IDLE_TIMEOUT_SECONDS", value: "-1"},
+		{key: "KBASE_HTTP_MAX_HEADER_BYTES", value: "4096"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			for _, key := range []string{
+				"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
+				"KBASE_HTTP_READ_TIMEOUT_SECONDS",
+				"KBASE_HTTP_WRITE_TIMEOUT_SECONDS",
+				"KBASE_HTTP_IDLE_TIMEOUT_SECONDS",
+				"KBASE_HTTP_MAX_HEADER_BYTES",
+			} {
+				t.Setenv(key, "")
+			}
+			t.Setenv(test.key, test.value)
+			if _, err := newKBaseHTTPServer("127.0.0.1:0", http.NotFoundHandler()); err == nil {
+				t.Fatalf("newKBaseHTTPServer() accepted %s=%q", test.key, test.value)
+			}
+		})
 	}
 }
 

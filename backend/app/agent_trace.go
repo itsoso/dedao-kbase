@@ -598,17 +598,17 @@ func (s *BookKnowledgeStore) acquireEvidenceAuditExecutionLock(
 	if err := ensureEvidenceAuditPrivateDir(dir); err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	fileLock := flock.New(filepath.Join(dir, ".run.lock"))
-	locked, err := fileLock.TryLockContext(ctx, 10*time.Millisecond)
+	locked, err := fileLock.TryLock()
 	if err != nil || !locked {
 		_ = fileLock.Close()
 		if err == nil {
-			err = ctx.Err()
+			err = ErrEvidenceAuditExecutionBusy
 		}
-		if err == nil {
-			err = fmt.Errorf("could not acquire evidence audit execution lock")
-		}
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrEvidenceAuditExecutionBusy, err)
 	}
 	return func() { _ = fileLock.Close() }, nil
 }

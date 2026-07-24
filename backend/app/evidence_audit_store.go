@@ -36,6 +36,7 @@ var (
 	ErrEvidenceAuditIdempotencyConflict = errors.New("evidence audit idempotency conflict")
 	ErrEvidenceAuditImmutable           = errors.New("completed evidence audit is immutable")
 	ErrEvidenceAuditStateConflict       = errors.New("evidence audit state conflict")
+	ErrEvidenceAuditLeaseLost           = errors.New("evidence audit lease lost")
 )
 
 type EvidenceAuditRecord struct {
@@ -57,6 +58,20 @@ type EvidenceAuditRecord struct {
 	RetryOf            string `json:"retry_of,omitempty"`
 	Attempt            int    `json:"attempt,omitempty"`
 	RequestIdentity    string `json:"request_identity,omitempty"`
+	LeaseOwner         string `json:"lease_owner,omitempty"`
+	LeaseExpiresAt     string `json:"lease_expires_at,omitempty"`
+	LeaseAttempt       int    `json:"lease_attempt,omitempty"`
+}
+
+type EvidenceAuditLeaseClaim struct {
+	Claimed bool
+	Record  EvidenceAuditRecord
+}
+
+type EvidenceAuditRecoveryPage struct {
+	Records    []EvidenceAuditRecord
+	NextCursor string
+	Scanned    int
 }
 
 type EvidenceAuditIdempotencyRecord struct {
@@ -604,12 +619,242 @@ func (s *BookKnowledgeStore) ListEvidenceAudits(packageID, version string, limit
 		if version != "" && record.PackageVersion != version {
 			continue
 		}
-		records = append(records, record)
+		publicRecord := record
+		publicRecord.LeaseOwner = ""
+		publicRecord.LeaseExpiresAt = ""
+		records = append(records, publicRecord)
 		if len(records) == limit {
 			break
 		}
 	}
 	return records, nil
+}
+
+func (s *BookKnowledgeStore) LoadEvidenceAuditRecord(auditID string) (EvidenceAuditRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return EvidenceAuditRecord{}, err
+	}
+	defer unlockRoot()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return EvidenceAuditRecord{}, err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID))
+	if record == nil {
+		return EvidenceAuditRecord{}, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	return *record, nil
+}
+
+func (s *BookKnowledgeStore) ClaimEvidenceAuditLease(
+	auditID, owner string,
+	now time.Time,
+	duration time.Duration,
+) (EvidenceAuditLeaseClaim, error) {
+	owner = strings.TrimSpace(owner)
+	if !validEvidenceAuditLeaseOwner(owner) || duration <= 0 {
+		return EvidenceAuditLeaseClaim{}, fmt.Errorf("lease owner and positive duration are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return EvidenceAuditLeaseClaim{}, err
+	}
+	defer unlockRoot()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return EvidenceAuditLeaseClaim{}, err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID))
+	if record == nil {
+		return EvidenceAuditLeaseClaim{}, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	if record.Status != EvidenceAuditQueued && record.Status != EvidenceAuditRunning {
+		return EvidenceAuditLeaseClaim{Record: *record}, nil
+	}
+	now = now.UTC()
+	if evidenceAuditLeaseActive(*record, now) && record.LeaseOwner != owner {
+		return EvidenceAuditLeaseClaim{Record: *record}, nil
+	}
+	if record.LeaseOwner != owner || !evidenceAuditLeaseActive(*record, now) {
+		record.LeaseAttempt++
+	}
+	if record.LeaseAttempt > 1_000_000 {
+		return EvidenceAuditLeaseClaim{}, fmt.Errorf("evidence audit lease attempt capacity exceeded")
+	}
+	record.LeaseOwner = owner
+	record.LeaseExpiresAt = now.Add(duration).Format(time.RFC3339Nano)
+	record.UpdatedAt = evidenceAuditTimestamp(now)
+	manifest.UpdatedAt = record.UpdatedAt
+	if err := s.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+		return EvidenceAuditLeaseClaim{}, err
+	}
+	return EvidenceAuditLeaseClaim{Claimed: true, Record: *record}, nil
+}
+
+func (s *BookKnowledgeStore) RenewEvidenceAuditLease(
+	auditID, owner string,
+	now time.Time,
+	duration time.Duration,
+) (EvidenceAuditRecord, error) {
+	owner = strings.TrimSpace(owner)
+	if !validEvidenceAuditLeaseOwner(owner) || duration <= 0 {
+		return EvidenceAuditRecord{}, fmt.Errorf("lease owner and positive duration are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return EvidenceAuditRecord{}, err
+	}
+	defer unlockRoot()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return EvidenceAuditRecord{}, err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID))
+	if record == nil {
+		return EvidenceAuditRecord{}, fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	now = now.UTC()
+	if record.LeaseOwner != owner || !evidenceAuditLeaseActive(*record, now) {
+		return EvidenceAuditRecord{}, fmt.Errorf("%w: audit %q", ErrEvidenceAuditLeaseLost, auditID)
+	}
+	record.LeaseExpiresAt = now.Add(duration).Format(time.RFC3339Nano)
+	record.UpdatedAt = evidenceAuditTimestamp(now)
+	manifest.UpdatedAt = record.UpdatedAt
+	if err := s.writeEvidenceAuditManifestUnlocked(manifest); err != nil {
+		return EvidenceAuditRecord{}, err
+	}
+	return *record, nil
+}
+
+func (s *BookKnowledgeStore) ReleaseEvidenceAuditLease(
+	auditID, owner string,
+	now time.Time,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return err
+	}
+	defer unlockRoot()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return err
+	}
+	record := findEvidenceAuditRecord(manifest, strings.TrimSpace(auditID))
+	if record == nil {
+		return fmt.Errorf("%w: evidence audit %q", os.ErrNotExist, auditID)
+	}
+	if record.LeaseOwner != strings.TrimSpace(owner) {
+		return fmt.Errorf("%w: audit %q", ErrEvidenceAuditLeaseLost, auditID)
+	}
+	record.LeaseOwner = ""
+	record.LeaseExpiresAt = ""
+	record.UpdatedAt = evidenceAuditTimestamp(now)
+	manifest.UpdatedAt = record.UpdatedAt
+	return s.writeEvidenceAuditManifestUnlocked(manifest)
+}
+
+func (s *BookKnowledgeStore) ValidateEvidenceAuditLease(auditID, owner string, now time.Time) error {
+	record, err := s.LoadEvidenceAuditRecord(auditID)
+	if err != nil {
+		return err
+	}
+	if record.LeaseOwner != strings.TrimSpace(owner) || !evidenceAuditLeaseActive(record, now.UTC()) {
+		return fmt.Errorf("%w: audit %q", ErrEvidenceAuditLeaseLost, auditID)
+	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) ListRecoverableEvidenceAuditsPage(
+	cursor string,
+	limit int,
+	now time.Time,
+) (EvidenceAuditRecoveryPage, error) {
+	if limit <= 0 || limit > 500 {
+		return EvidenceAuditRecoveryPage{}, fmt.Errorf("recovery page limit must be between 1 and 500")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return EvidenceAuditRecoveryPage{}, err
+	}
+	defer unlockRoot()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return EvidenceAuditRecoveryPage{}, err
+	}
+	start := 0
+	if cursor = strings.TrimSpace(cursor); cursor != "" {
+		found := false
+		for index := range manifest.Audits {
+			if manifest.Audits[index].AuditID == cursor {
+				start = index + 1
+				found = true
+				break
+			}
+		}
+		if !found {
+			return EvidenceAuditRecoveryPage{}, fmt.Errorf("invalid evidence audit recovery cursor")
+		}
+	}
+	end := start + limit
+	if end > len(manifest.Audits) {
+		end = len(manifest.Audits)
+	}
+	page := EvidenceAuditRecoveryPage{
+		Records: make([]EvidenceAuditRecord, 0, end-start),
+		Scanned: end - start,
+	}
+	for index := start; index < end; index++ {
+		record := &manifest.Audits[index]
+		if record.Status != EvidenceAuditQueued && record.Status != EvidenceAuditRunning {
+			continue
+		}
+		if err := s.reconcileEvidenceAuditTerminalUnlocked(manifest, record); err != nil {
+			return EvidenceAuditRecoveryPage{}, err
+		}
+		if (record.Status == EvidenceAuditQueued || record.Status == EvidenceAuditRunning) &&
+			!evidenceAuditLeaseActive(*record, now.UTC()) {
+			page.Records = append(page.Records, *record)
+		}
+	}
+	if end < len(manifest.Audits) && end > 0 {
+		page.NextCursor = manifest.Audits[end-1].AuditID
+	}
+	return page, nil
+}
+
+func evidenceAuditLeaseActive(record EvidenceAuditRecord, now time.Time) bool {
+	if strings.TrimSpace(record.LeaseOwner) == "" || strings.TrimSpace(record.LeaseExpiresAt) == "" {
+		return false
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, record.LeaseExpiresAt)
+	return err == nil && expiresAt.After(now)
+}
+
+func validEvidenceAuditLeaseOwner(owner string) bool {
+	if owner == "" || len(owner) > 128 {
+		return false
+	}
+	for _, char := range owner {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-' || char == '_' || char == '.' || char == ':' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func updateEvidenceAuditRecord(store *BookKnowledgeStore, auditID string, now time.Time, update func(*EvidenceAuditRecord) error) (*EvidenceAudit, error) {
@@ -951,6 +1196,26 @@ func validateEvidenceAuditManifestCapacity(manifest *EvidenceAuditManifest) erro
 			"evidence audit manifest idempotency capacity %d exceeded",
 			evidenceAuditMaxManifestIdempotency,
 		)
+	}
+	for _, record := range manifest.Audits {
+		if record.LeaseAttempt < 0 || record.LeaseAttempt > 1_000_000 {
+			return fmt.Errorf("evidence audit lease attempt is invalid")
+		}
+		if record.LeaseOwner == "" {
+			if record.LeaseExpiresAt != "" {
+				return fmt.Errorf("evidence audit lease expiry requires an owner")
+			}
+			continue
+		}
+		if !validEvidenceAuditLeaseOwner(record.LeaseOwner) {
+			return fmt.Errorf("evidence audit lease owner is invalid")
+		}
+		if record.LeaseAttempt == 0 {
+			return fmt.Errorf("evidence audit lease owner requires a positive attempt")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, record.LeaseExpiresAt); err != nil {
+			return fmt.Errorf("evidence audit lease expiry is invalid")
+		}
 	}
 	return nil
 }

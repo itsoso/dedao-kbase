@@ -1114,3 +1114,117 @@ func TestListEvidenceAuditsReconcilesPreparedTerminalState(t *testing.T) {
 		t.Fatalf("list/detail terminal mismatch: record=%#v detail=%#v", records[0], detail)
 	}
 }
+
+func TestEvidenceAuditLeaseClaimRenewReleaseAndExpiryTakeover(t *testing.T) {
+	storeA := NewBookKnowledgeStore(t.TempDir())
+	storeB := NewBookKnowledgeStore(storeA.Root())
+	now := testAgentPackageTime()
+	audit, _, err := CreateEvidenceAudit(storeA, validEvidenceAuditInput(), "lease-lifecycle", now)
+	if err != nil {
+		t.Fatalf("CreateEvidenceAudit() error = %v", err)
+	}
+
+	claimed, err := storeA.ClaimEvidenceAuditLease(audit.AuditID, "owner-a", now, time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimEvidenceAuditLease(owner-a) error = %v", err)
+	}
+	if !claimed.Claimed || claimed.Record.LeaseOwner != "owner-a" || claimed.Record.LeaseAttempt != 1 {
+		t.Fatalf("first lease = %+v", claimed)
+	}
+
+	blocked, err := storeB.ClaimEvidenceAuditLease(audit.AuditID, "owner-b", now.Add(30*time.Second), time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimEvidenceAuditLease(owner-b active) error = %v", err)
+	}
+	if blocked.Claimed || blocked.Record.LeaseOwner != "owner-a" {
+		t.Fatalf("active lease takeover = %+v, want blocked by owner-a", blocked)
+	}
+
+	renewed, err := storeA.RenewEvidenceAuditLease(audit.AuditID, "owner-a", now.Add(40*time.Second), time.Minute)
+	if err != nil {
+		t.Fatalf("RenewEvidenceAuditLease() error = %v", err)
+	}
+	if renewed.LeaseExpiresAt != now.Add(100*time.Second).UTC().Format(time.RFC3339Nano) {
+		t.Fatalf("renewed expiry = %q", renewed.LeaseExpiresAt)
+	}
+
+	taken, err := storeB.ClaimEvidenceAuditLease(audit.AuditID, "owner-b", now.Add(101*time.Second), time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimEvidenceAuditLease(owner-b expired) error = %v", err)
+	}
+	if !taken.Claimed || taken.Record.LeaseOwner != "owner-b" || taken.Record.LeaseAttempt != 2 {
+		t.Fatalf("expired lease takeover = %+v", taken)
+	}
+
+	if err := storeA.ReleaseEvidenceAuditLease(audit.AuditID, "owner-a", now.Add(102*time.Second)); !errors.Is(err, ErrEvidenceAuditLeaseLost) {
+		t.Fatalf("stale ReleaseEvidenceAuditLease() error = %v, want lease lost", err)
+	}
+	if err := storeB.ReleaseEvidenceAuditLease(audit.AuditID, "owner-b", now.Add(103*time.Second)); err != nil {
+		t.Fatalf("ReleaseEvidenceAuditLease(owner-b) error = %v", err)
+	}
+}
+
+func TestEvidenceAuditRecoveryPageIsBoundedAndCursorBased(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := testAgentPackageTime()
+	for index := 0; index < 7; index++ {
+		input := validEvidenceAuditInput()
+		input.Subject = fmt.Sprintf("recovery-page-%d", index)
+		if _, _, err := CreateEvidenceAudit(store, input, fmt.Sprintf("recovery-page-%d", index), now); err != nil {
+			t.Fatalf("CreateEvidenceAudit(%d) error = %v", index, err)
+		}
+	}
+
+	first, err := store.ListRecoverableEvidenceAuditsPage("", 3, now)
+	if err != nil {
+		t.Fatalf("first page error = %v", err)
+	}
+	if len(first.Records) != 3 || first.NextCursor == "" || first.Scanned != 3 {
+		t.Fatalf("first page = %+v", first)
+	}
+	second, err := store.ListRecoverableEvidenceAuditsPage(first.NextCursor, 3, now)
+	if err != nil {
+		t.Fatalf("second page error = %v", err)
+	}
+	if len(second.Records) != 3 || second.NextCursor == "" || second.Scanned != 3 {
+		t.Fatalf("second page = %+v", second)
+	}
+	third, err := store.ListRecoverableEvidenceAuditsPage(second.NextCursor, 3, now)
+	if err != nil {
+		t.Fatalf("third page error = %v", err)
+	}
+	if len(third.Records) != 1 || third.NextCursor != "" || third.Scanned != 1 {
+		t.Fatalf("third page = %+v", third)
+	}
+}
+
+func TestEvidenceAuditLeaseMetadataIsBoundedAndHiddenFromPublicList(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := testAgentPackageTime()
+	audit, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "lease-public-boundary", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimEvidenceAuditLease(
+		audit.AuditID, strings.Repeat("x", 129), now, time.Minute,
+	); err == nil {
+		t.Fatal("oversized lease owner was accepted")
+	}
+	if _, err := store.ClaimEvidenceAuditLease(audit.AuditID, "private-owner", now, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	records, err := store.ListEvidenceAudits("", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].LeaseOwner != "" || records[0].LeaseExpiresAt != "" {
+		t.Fatalf("public audit list exposed lease metadata: %+v", records)
+	}
+	internal, err := store.LoadEvidenceAuditRecord(audit.AuditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if internal.LeaseOwner != "private-owner" || internal.LeaseExpiresAt == "" {
+		t.Fatalf("persisted lease metadata missing: %+v", internal)
+	}
+}
