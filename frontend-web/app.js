@@ -2471,15 +2471,15 @@ function renderEvidenceAuditStatus(audit) {
   return `
     <section class="evidence-audit__status is-${escapeAttribute(audit.status)}" aria-live="polite" aria-busy="${terminal ? "false" : "true"}">
       <div>
-        <span>STATUS</span>
+        <span>状态</span>
         <strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong>
       </div>
       <div>
-        <span>AUDIT ID</span>
+        <span>审计 ID</span>
         <code>${escapeHTML(audit.audit_id || "")}</code>
       </div>
       <div>
-        <span>ATTEMPT</span>
+        <span>尝试次数</span>
         <strong>${Number(audit.attempt || 1)}</strong>
       </div>
       ${audit.status === "failed" ? `
@@ -2523,9 +2523,9 @@ function renderEvidenceAuditClaim(claim, index) {
   return `
     <article class="evidence-audit__claim">
       <header>
-        <span>CLAIM ${String(index + 1).padStart(2, "0")}</span>
+        <span>主张 CLAIM ${String(index + 1).padStart(2, "0")}</span>
         <div class="evidence-audit__verdict is-${escapeAttribute(claim.verdict)}">${escapeHTML(evidenceAuditVerdictLabel(claim.verdict))}</div>
-        <strong>${confidence}% confidence</strong>
+        <strong>置信度 ${confidence}%</strong>
       </header>
       <div class="evidence-audit__claim-statement">${renderSimpleMarkdown(claim.normalized_statement || claim.source_claim || "")}</div>
       <section>
@@ -2618,7 +2618,7 @@ function renderEvidenceAuditReport(audit) {
     <section class="evidence-audit__report" aria-labelledby="evidence-audit-report-title">
       <header class="evidence-audit__report-head">
         <div>
-          <span>EVIDENCE AUDIT · ${escapeHTML(audit.schema_version || "evidence-audit.v1")}</span>
+          <span>证据审计 · ${escapeHTML(audit.schema_version || "evidence-audit.v1")}</span>
           <h2 id="evidence-audit-report-title">审计结论</h2>
           <div class="evidence-audit__conclusion">${renderSimpleMarkdown(audit.summary?.conclusion || "审计已完成。")}</div>
         </div>
@@ -2649,7 +2649,7 @@ function renderEvidenceAuditHistory(pkg) {
   }
   return `
     <nav class="evidence-audit__history" aria-label="最近证据审计">
-      <span>RECENT</span>
+      <span>最近审计</span>
       ${evidenceAuditState.audits.slice(0, 6).map((audit) => `
         <a href="${escapeAttribute(buildEvidenceAuditURL(pkg.package_id, audit.audit_id, pkg.version))}">
           <strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong>
@@ -2674,10 +2674,6 @@ function renderEvidenceAuditWorkspace(route, pkg) {
   const audit = evidenceAuditState.audit;
   return `
     <section class="evidence-audit" aria-label="临床证据审计桌">
-      <div class="evidence-audit__masthead">
-        <div><span>CLINICAL EVIDENCE DESK</span><h2>临床证据审计桌</h2></div>
-        <p>主报告优先 · 固定来源 · 可追溯引用 · Proofroom 最终裁决</p>
-      </div>
       ${evidenceAuditState.error && !audit ? `<div class="evidence-audit__error" role="alert"><strong>无法载入审计</strong><span>${escapeHTML(evidenceAuditState.error)}</span></div>` : ""}
       ${route.auditID ? `
         ${evidenceAuditState.loading && !audit ? `<div class="evidence-audit__waiting" role="status"><span aria-hidden="true"></span><strong>正在载入</strong><p>读取固定审计报告与状态。</p></div>` : ""}
@@ -2691,6 +2687,64 @@ function renderEvidenceAuditWorkspace(route, pkg) {
       `}
     </section>
   `;
+}
+
+function renderEvidenceAuditContext(route, pkg, evaluation) {
+  const packageName = pkg.display_name || pkg.name || pkg.title || pkg.package_id;
+  const model = pkg.model_policy?.preferred_capability || pkg.model_policy?.model || "未指定";
+  const sourceCount = Array.isArray(pkg.releases) ? pkg.releases.length : 0;
+  const agentURL = buildAgentURL(pkg.package_id, pkg.version);
+  return `
+    <header class="evidence-audit__context" aria-label="审计包上下文">
+      <div class="evidence-audit__context-title">
+        <a href="${escapeAttribute(agentURL)}">← 返回 Agent</a>
+        <div><span>临床证据审计</span><h1>${escapeHTML(packageName)}</h1></div>
+      </div>
+      <dl>
+        <div><dt>版本</dt><dd>${escapeHTML(pkg.version || "—")}</dd></div>
+        <div><dt>模型</dt><dd>${escapeHTML(model)}</dd></div>
+        <div><dt>来源</dt><dd>${sourceCount}</dd></div>
+        <div class="${evaluation.passed ? "is-pass" : "is-hold"}"><dt>评测</dt><dd>${evaluation.passed ? "已通过" : "待通过"}</dd></div>
+      </dl>
+    </header>
+  `;
+}
+
+function renderEvidenceAuditTools(pkg, release, bookID, searchRows) {
+  return `
+    <details class="evidence-audit__tools">
+      <summary>
+        <span>包内工具</span>
+        <small>阅读器与固定范围检索</small>
+      </summary>
+      <div class="evidence-audit__tools-body">
+        ${renderBookAgentCapability("reader", `
+          <section class="book-agent__capability book-agent__reader" data-capability="reader">
+            <div class="book-agent__section-head"><div><span>01</span><h2>阅读器 Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
+            ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
+          </section>
+        `)}
+        ${renderBookAgentCapability("search", `
+          <section class="book-agent__capability book-agent__search" data-capability="search">
+            <div class="book-agent__section-head"><div><span>02</span><h2>包内检索 Grounded Search</h2></div><p>结果保持 Claim、Chunk 与 Release 身份。</p></div>
+            <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="检索当前知识包"><button class="button button-primary" type="submit">检索</button></form>
+            <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
+          </section>
+        `, Boolean(pkg.package_id && pkg.version))}
+      </div>
+    </details>
+  `;
+}
+
+function renderGroundedConversation(pkg) {
+  return renderBookAgentCapability("grounded_chat", `
+    <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
+      <div class="book-agent__section-head"><div><span>03</span><h2>循证对话 Grounded Conversation</h2></div><p>回答必须经过 Package 的引用与拒答边界。</p></div>
+      <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="基于当前知识包提问">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">基于证据提问</button></form>
+      ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
+      ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>已拒答</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "证据不足")}</p></article>` : ""}
+    </section>
+  `, Boolean(pkg.package_id && pkg.version));
 }
 
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
@@ -2719,10 +2773,12 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
     <div><span>${escapeHTML(metric)}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
   `).join("");
   const runtimeStatus = bookAgentState.loading || bookAgentState.message;
+  const isEvidenceAuditRoute = route.view === "agent" && pkg.schema_version === "agent-package.v2";
 
   renderShell(`
-    <main class="book-agent book-agent--detail ${route.view === "agent" && pkg.schema_version === "agent-package.v2" ? "book-agent--audit" : ""}">
-      <header class="book-agent__hero">
+    <main class="book-agent book-agent--detail ${isEvidenceAuditRoute ? "book-agent--audit" : ""}">
+      ${isEvidenceAuditRoute ? renderEvidenceAuditContext(route, pkg, evaluation) : `
+        <header class="book-agent__hero">
         <div class="book-agent__hero-copy">
           <p class="web-kicker">${escapeHTML(viewLabel)}</p>
           <h1>${escapeHTML(pkg.package_id)}</h1>
@@ -2743,20 +2799,27 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <small>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "suite unavailable")}</small>
           </div>
         </aside>
-      </header>
+        </header>
+      `}
 
       ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
 
-      <section class="book-agent__manifest">
+      ${isEvidenceAuditRoute ? "" : `<section class="book-agent__manifest">
         <div><span>Package hash</span><code>${escapeHTML(pkg.content_hash)}</code></div>
         <div><span>Model route</span><strong>${escapeHTML(pkg.model_policy?.preferred_capability || "—")}</strong></div>
         <div><span>Retrieval</span><strong>${escapeHTML(pkg.retrieval_policy?.strategy || "—")}</strong></div>
         <div><span>Escalation</span><strong>${escapeHTML(pkg.safety_policy?.escalation_target || "—")}</strong></div>
         ${evaluationMetrics ? `<div class="book-agent__metric-strip">${evaluationMetrics}</div>` : ""}
-      </section>
+      </section>`}
 
       <section class="book-agent__capabilities" aria-label="Manifest capabilities">
-        ${renderBookAgentCapability("reader", `
+        ${isEvidenceAuditRoute ? `
+          ${renderEvidenceAuditWorkspace(route, pkg)}
+          ${renderEvidenceAuditTools(pkg, release, bookID, searchRows)}
+          ${renderGroundedConversation(pkg)}
+          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+        ` : `
+          ${renderBookAgentCapability("reader", `
           <section class="book-agent__capability book-agent__reader" data-capability="reader">
             <div class="book-agent__section-head"><div><span>01</span><h2>Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
             ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>Open the book</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
@@ -2769,18 +2832,12 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
           </section>
         `, Boolean(pkg.package_id && pkg.version))}
-        ${renderEvidenceAuditWorkspace(route, pkg)}
-        ${renderBookAgentCapability("grounded_chat", `
-          <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
-            <div class="book-agent__section-head"><div><span>03</span><h2>Grounded conversation</h2></div><p>回答必须经过 package 的 citation 与 abstention 边界。</p></div>
-            <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="Ask a question grounded in this package">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">Ask with evidence</button></form>
-            ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
-            ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>Abstained</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "insufficient_evidence")}</p></article>` : ""}
-          </section>
-        `, Boolean(pkg.package_id && pkg.version))}
-        ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
-        ${renderBookAgentCapability("quiz", "", false)}
-        ${renderBookAgentCapability("action_plan", "", false)}
+          ${renderEvidenceAuditWorkspace(route, pkg)}
+          ${renderGroundedConversation(pkg)}
+          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+          ${renderBookAgentCapability("quiz", "", false)}
+          ${renderBookAgentCapability("action_plan", "", false)}
+        `}
       </section>
     </main>
   `, "agents");

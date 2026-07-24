@@ -17,6 +17,8 @@ for (const marker of [
   "renderEvidenceAuditReport",
   "renderEvidenceAuditClaim",
   "renderEvidenceAuditTrace",
+  "renderEvidenceAuditContext",
+  "renderEvidenceAuditTools",
   "loadEvidenceAudit",
   "createEvidenceAudit",
   "retryEvidenceAudit",
@@ -84,13 +86,42 @@ assert.ok(js.includes("renderSimpleMarkdown"), "audit model text should use the 
 assert.ok(js.includes("buildKnowledgePackageURL"), "audit citations should link to existing KBase entities");
 assert.ok(js.includes('pkg.schema_version === "agent-package.v2"'), "only explicit v2 packages should expose audit composition");
 assert.ok(js.includes("当前版本不提供证据审计"), "v1 packages should not receive a false audit composer");
+
+const platformSource = js.match(/function renderBookAgentPlatform\([\s\S]*?\n\}\n\nfunction bindBookAgentPlatformEvents/)?.[0] || "";
+assert.ok(platformSource.includes("isEvidenceAuditRoute"), "platform should explicitly separate evidence audit routes");
+assert.ok(platformSource.includes("renderEvidenceAuditContext"), "audit routes should render compact package context");
+assert.ok(platformSource.includes("renderEvidenceAuditTools"), "audit routes should group secondary package tools");
 assert.ok(
-  js.indexOf('data-capability="grounded_chat"') > js.indexOf("renderEvidenceAuditWorkspace"),
-  "grounded chat should remain after the audit workspace",
+  platformSource.indexOf("renderEvidenceAuditContext") < platformSource.indexOf("renderEvidenceAuditWorkspace"),
+  "compact package context should precede the audit workspace",
 );
+assert.ok(
+  platformSource.indexOf("renderEvidenceAuditWorkspace") < platformSource.indexOf("renderEvidenceAuditTools"),
+  "Reader and search tools should follow the audit workspace",
+);
+assert.ok(
+  platformSource.indexOf("renderEvidenceAuditTools") < platformSource.indexOf("renderGroundedConversation"),
+  "grounded conversation should remain after the audit report and package tools",
+);
+
+const contextSource = js.match(/function renderEvidenceAuditContext\([\s\S]*?\n\}/)?.[0] || "";
+for (const label of ["返回 Agent", "版本", "模型", "来源", "评测"]) {
+  assert.ok(contextSource.includes(label), `compact context should expose ${label}`);
+}
+assert.ok(!contextSource.includes("book-agent__hero"), "compact audit context should not reuse the large package hero");
+assert.ok(!contextSource.includes("book-agent__manifest"), "compact audit context should not render the long manifest metrics");
+
+const toolsSource = js.match(/function renderEvidenceAuditTools\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(toolsSource.includes("<details"), "package tools should be collapsible");
+assert.ok(!toolsSource.includes("<details open"), "package tools should be collapsed by default");
+assert.ok(toolsSource.includes("包内工具"), "package tools should use the Chinese-first label");
+assert.ok(toolsSource.includes("阅读器"), "Reader should use a Chinese-first label");
+assert.ok(toolsSource.includes("包内检索"), "Grounded search should use a Chinese-first label");
 
 for (const className of [
   ".evidence-audit",
+  ".evidence-audit__context",
+  ".evidence-audit__tools",
   ".evidence-audit__composer",
   ".evidence-audit__status",
   ".evidence-audit__report",
@@ -104,6 +135,8 @@ for (const className of [
 
 assert.ok(css.includes("@media (max-width: 760px)"), "audit workspace should include a mobile layout");
 assert.ok(css.includes("minmax(0, 1fr)"), "audit layout should allow columns to shrink without overflow");
-assert.ok(html.includes("20260724-evidence-audit"), "audit workspace should publish a fresh asset version");
+assert.ok(css.includes("max-height: 140px"), "desktop audit context should enforce its compact height budget");
+assert.ok(css.includes("max-height: 220px"), "mobile audit context should enforce its compact height budget");
+assert.ok(html.includes("20260724-evidence-audit-priority"), "audit workspace should publish a fresh asset version");
 
 console.log("evidence audit agent smoke passed");
