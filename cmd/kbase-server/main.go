@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"flag"
 	"log"
@@ -40,6 +41,19 @@ func main() {
 		log.Fatalf("initialize knowledge catalog: %v", err)
 	}
 	defer knowledgeCatalog.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	auditRuntime := newEvidenceAuditServerRuntime(ctx, bookStore)
+	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
+	if retrySigningErr == nil {
+		retrySigningErr = validateEvidenceAuditRetryKeySeparation(
+			retrySigningKey, *authToken, *sourceAgentToken, *agentPublisherToken,
+		)
+	}
+	if retrySigningErr != nil {
+		log.Printf("evidence audit retry disabled: %v", retrySigningErr)
+		retrySigningKey = nil
+	}
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:                  bookStore,
@@ -52,6 +66,10 @@ func main() {
 		SourceSync:             sourceSync,
 		SourceAgentToken:       *sourceAgentToken,
 		ReverificationCooldown: knowledgeReverificationCooldown(),
+		AuditCoordinator:       auditRuntime.Coordinator,
+		AuditUnavailableReason: auditRuntime.UnavailableReason,
+		AuditMaxBodyBytes:      evidenceAuditMaxBodyBytes(),
+		AuditRetrySigningKey:   retrySigningKey,
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
@@ -79,8 +97,11 @@ func main() {
 	if !wcplusBaseURLConfiguredFromEnv() {
 		log.Printf("wcplus source: using default local API base http://127.0.0.1:5001")
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	if auditRuntime.Coordinator == nil {
+		log.Printf("evidence audits disabled: %s", auditRuntime.UnavailableReason)
+	} else {
+		log.Printf("evidence audits enabled: workers=%d queue=%d", evidenceAuditWorkerCount(), evidenceAuditQueueSize())
+	}
 	var schedulerDone <-chan struct{}
 	if scheduler, schedulerErr := app.NewSourceScheduler(sourceSync, time.Now); schedulerErr != nil {
 		log.Fatalf("initialize source scheduler: %v", schedulerErr)
@@ -105,9 +126,46 @@ func main() {
 		<-schedulerDone
 	}
 	<-reverificationDone
+	if auditRuntime.Coordinator != nil {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), evidenceAuditShutdownTimeout())
+		if err := auditRuntime.Coordinator.Shutdown(shutdownContext); err != nil {
+			log.Printf("evidence audit coordinator shutdown failed: %v", err)
+		}
+		cancel()
+	}
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
 		log.Fatal(listenErr)
 	}
+}
+
+type evidenceAuditServerRuntime struct {
+	Coordinator       *app.EvidenceAuditCoordinator
+	UnavailableReason string
+}
+
+func newEvidenceAuditServerRuntime(
+	ctx context.Context,
+	store *app.BookKnowledgeStore,
+) evidenceAuditServerRuntime {
+	modelConfig, err := app.LoadBookTokenPlanConfig()
+	if err != nil || strings.TrimSpace(modelConfig.APIKey) == "" {
+		return evidenceAuditServerRuntime{
+			UnavailableReason: "TokenPlan configuration is unavailable; configure DEDAO_TOKENPLAN_API_KEY",
+		}
+	}
+	coordinator, err := app.NewEvidenceAuditCoordinator(app.EvidenceAuditCoordinatorConfig{
+		Store: store, Client: app.NewTokenPlanChatClient(nil),
+		RunnerConfig: app.EvidenceAuditRunnerConfig{ModelConfig: modelConfig},
+		Workers:      evidenceAuditWorkerCount(), QueueSize: evidenceAuditQueueSize(),
+		PollInterval: time.Second,
+	})
+	if err != nil {
+		return evidenceAuditServerRuntime{UnavailableReason: "evidence audit coordinator initialization failed: " + err.Error()}
+	}
+	if err := coordinator.Start(ctx); err != nil {
+		return evidenceAuditServerRuntime{UnavailableReason: "evidence audit coordinator startup failed: " + err.Error()}
+	}
+	return evidenceAuditServerRuntime{Coordinator: coordinator}
 }
 
 func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherToken string) error {
@@ -249,6 +307,54 @@ func boundedSecondsEnvironment(key string, fallback, maximum int) time.Duration 
 		seconds = maximum
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func evidenceAuditWorkerCount() int {
+	return boundedIntegerEnvironment("KBASE_AUDIT_WORKERS", 2, 32)
+}
+
+func evidenceAuditQueueSize() int {
+	return boundedIntegerEnvironment("KBASE_AUDIT_QUEUE_SIZE", 64, 4096)
+}
+
+func evidenceAuditMaxBodyBytes() int64 {
+	return int64(boundedIntegerEnvironment("KBASE_AUDIT_MAX_BODY_BYTES", 64<<10, 1<<20))
+}
+
+func evidenceAuditShutdownTimeout() time.Duration {
+	return time.Duration(boundedIntegerEnvironment("KBASE_AUDIT_SHUTDOWN_SECONDS", 10, 60)) * time.Second
+}
+
+func evidenceAuditRetrySigningKey() ([]byte, error) {
+	value := strings.TrimSpace(os.Getenv("KBASE_AUDIT_RETRY_SIGNING_KEY"))
+	if len(value) < 32 {
+		return nil, errors.New("KBASE_AUDIT_RETRY_SIGNING_KEY must contain at least 32 bytes")
+	}
+	return []byte(value), nil
+}
+
+func validateEvidenceAuditRetryKeySeparation(key []byte, bearerTokens ...string) error {
+	for _, token := range bearerTokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare(key, []byte(token)) == 1 {
+			return errors.New("KBASE_AUDIT_RETRY_SIGNING_KEY must differ from bearer tokens")
+		}
+	}
+	return nil
+}
+
+func boundedIntegerEnvironment(key string, fallback, maximum int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil || value <= 0 {
+		value = fallback
+	}
+	if value > maximum {
+		value = maximum
+	}
+	return value
 }
 
 func envDefault(key string, fallback string) string {

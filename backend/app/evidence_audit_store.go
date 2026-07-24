@@ -277,9 +277,7 @@ func ManualRetryEvidenceAudit(
 		"manual-retry\x00" + failedAuditID + "\x00" +
 			strings.TrimSpace(authorization.Actor) + "\x00" +
 			strings.TrimSpace(authorization.Issuer) + "\x00" +
-			strings.TrimSpace(authorization.Scope) + "\x00" +
-			strings.TrimSpace(authorization.Nonce) + "\x00" +
-			strings.TrimSpace(authorization.Signature) + "\x00" + idempotencyKey,
+			strings.TrimSpace(authorization.Scope) + "\x00" + idempotencyKey,
 	)
 	timestamp := evidenceAuditTimestamp(now)
 

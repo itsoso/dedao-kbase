@@ -66,3 +66,42 @@ Pending implementation and private production evaluation.
 
 - `docs/plans/2026-07-23-clinical-evidence-audit-agent-design.md`
 - `docs/plans/2026-07-23-clinical-evidence-audit-agent.md`
+
+## Implementation Checkpoint
+
+### Task 1 - Agent Package v2 Evidence Policy
+
+Completed and independently reviewed. The immutable Package contract pins the
+primary and supporting Releases, verdict policy, freshness, evidence limits,
+and report schema.
+
+### Task 2 - Immutable Evidence Audit Store
+
+Completed and independently reviewed. Inputs and reports are
+content-addressed, terminal reports are immutable, cross-process writes are
+locked, and crash recovery uses bounded journals and last-known-good manifests.
+
+### Task 3 - Multi-source Evidence Audit Runner
+
+Completed and independently reviewed. The runner enforces Package-scoped
+retrieval, citation resolution, source independence, freshness, verdict and
+cost policy, deterministic medical abstention, model checkpoints, and durable
+Audit/Trace terminal coordination.
+
+### Task 4 - Durable Coordinator And HTTP API
+
+Completed and verified.
+
+- The coordinator uses the persistent Audit store as the queue of record.
+  Bounded workers and an in-memory wake-up queue recover queued or running
+  Audits at startup.
+- Authenticated asynchronous create, list, detail, and explicit manual retry
+  endpoints expose the workflow without automatically retrying failed Audits.
+- Retry authorization is derived from the authenticated actor and signed with
+  a server-side HMAC key. Bearer credentials and signing keys are not persisted.
+- Missing TokenPlan configuration leaves the service online but makes Audit
+  creation return a diagnostic service-unavailable response.
+- Focused and race-enabled coordinator/API tests pass without data races.
+- The complete backend and server command suites, `go vet`, privacy and system
+  map smoke checks, diff checks, and Linux, Windows, and macOS compile checks
+  pass.
