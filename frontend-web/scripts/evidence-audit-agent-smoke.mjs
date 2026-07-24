@@ -52,7 +52,10 @@ assert.ok(buildURLSource.includes("URLSearchParams"), "audit URL should safely e
 
 const loadSource = js.match(/async function loadEvidenceAudit\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(loadSource.includes("/api/agent-audits/"), "audit detail should load from its dedicated endpoint");
+assert.ok(loadSource.includes("/api/agent-traces/"), "audit detail should load authenticated Trace observability");
 assert.ok(loadSource.includes("route.auditID"), "audit detail loading should be scoped to the current route");
+assert.ok(loadSource.includes("audit?.package?.package_id"), "audit detail should reject cross-package route composition");
+assert.ok(loadSource.includes("audit?.package?.version"), "audit detail should reject cross-version route composition");
 
 const pollSource = js.match(/function scheduleEvidenceAuditPoll\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(pollSource.includes('"queued"'), "audit polling should include queued state");
@@ -64,6 +67,7 @@ const createSource = js.match(/async function createEvidenceAudit\([\s\S]*?\n\}/
 assert.ok(createSource.includes("/api/agent-packages/"), "composer should use the package audit endpoint");
 assert.ok(createSource.includes("/audits?"), "composer should pin the package version");
 assert.ok(createSource.includes("idempotency_key"), "audit creation should carry structured idempotency");
+assert.ok(createSource.includes("createRequestFingerprint"), "audit creation should reuse its idempotency key for the same request");
 assert.ok(createSource.includes("selected_claims"), "audit creation should submit selected primary claims");
 assert.ok(createSource.includes("history.replaceState"), "created audits should receive a stable browser URL");
 
@@ -75,8 +79,15 @@ assert.ok(js.includes("canRetryEvidenceAudit"), "retry visibility should be gove
 const proofroomSource = js.match(/async function deliverEvidenceAuditToProofroom\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(proofroomSource.includes("window.confirm"), "Proofroom delivery should require explicit confirmation");
 assert.ok(proofroomSource.includes("Idempotency-Key"), "Proofroom delivery should be idempotent");
+assert.ok(proofroomSource.includes("proofroomDeliveryKey"), "Proofroom retries should reuse the preview-bound idempotency key");
 assert.ok(proofroomSource.includes("/proofroom"), "Proofroom delivery should use the audit projection endpoint");
 assert.ok(!proofroomSource.includes("loadProofroomPreview()"), "delivery should not silently trigger preview loading");
+assert.ok(js.includes("renderProofroomPreviewClaim"), "Proofroom preview should expose the actual minimized claim payload");
+assert.ok(js.includes("proofroomOperationSequence"), "Proofroom responses should be scoped to the active audit route");
+assert.ok(js.includes("bookAgentLoadSequence"), "Agent package responses should be scoped to the active route");
+assert.ok(js.includes('"model_outcome_unknown", "requires_manual_retry"'), "retry control should match backend retryable failure codes");
+assert.ok(js.includes('["citation_id", evidence.citation_id]'), "citation links should preserve citation identity");
+assert.ok(js.includes('evidenceLocator.get("citation_id")'), "knowledge pages should resolve direct citation links");
 
 for (const state of ["queued", "running", "failed", "completed", "outcome_unknown", "rejected", "delivered"]) {
   assert.ok(js.includes(state), `audit UI should render ${state}`);
@@ -128,6 +139,8 @@ for (const className of [
   ".evidence-audit__claim",
   ".evidence-audit__evidence-row",
   ".evidence-audit__proofroom",
+  ".evidence-audit__proofroom-payload",
+  ".evidence-audit__proofroom-claim",
   ".evidence-audit__trace",
 ]) {
   assert.ok(css.includes(className), `styles should include ${className}`);
@@ -137,6 +150,7 @@ assert.ok(css.includes("@media (max-width: 760px)"), "audit workspace should inc
 assert.ok(css.includes("minmax(0, 1fr)"), "audit layout should allow columns to shrink without overflow");
 assert.ok(css.includes("max-height: 140px"), "desktop audit context should enforce its compact height budget");
 assert.ok(css.includes("max-height: 220px"), "mobile audit context should enforce its compact height budget");
-assert.ok(html.includes("20260724-evidence-audit-priority"), "audit workspace should publish a fresh asset version");
+assert.ok(css.includes(".evidence-audit__waiting > span"), "audit progress animation should honor reduced motion");
+assert.ok(html.includes("20260724-evidence-audit-review"), "audit workspace should publish a fresh asset version");
 
 console.log("evidence audit agent smoke passed");

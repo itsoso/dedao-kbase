@@ -74,6 +74,38 @@ func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerServesAuthenticatedAgentTraceWithoutPrivateFields(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	trace := agentTraceTestTrace()
+	trace.PrivatePrompt = "must-not-leave-store"
+	trace.SourceBodies = []string{"private source body"}
+	trace.Credentials = "secret credential"
+	if err := store.SaveAgentTrace(trace); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+	path := "/api/agent-traces/" + url.PathEscape(trace.TraceID)
+
+	unauthorized := requestKBase(handler, http.MethodGet, path, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized trace status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(handler, http.MethodGet, path, "consumer-token")
+	if response.Code != http.StatusOK {
+		t.Fatalf("trace status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"trace_id":"`+trace.TraceID+`"`) ||
+		strings.Contains(body, "must-not-leave-store") ||
+		strings.Contains(body, "private source body") ||
+		strings.Contains(body, "secret credential") {
+		t.Fatalf("trace response exposed invalid content: %s", body)
+	}
+}
+
 func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

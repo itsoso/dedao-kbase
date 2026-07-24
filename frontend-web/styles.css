@@ -5083,6 +5083,111 @@ a.button {
   margin-top: 12px;
 }
 
+.evidence-audit__proofroom-overlay {
+  position: fixed;
+  z-index: 80;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(22, 36, 31, 0.62);
+}
+
+.evidence-audit__proofroom-preview {
+  width: min(920px, 100%);
+  max-height: min(780px, calc(100vh - 56px));
+  padding: 22px;
+  overflow: auto;
+  border: 1px solid var(--agent-ink);
+  background: #fffef9;
+  box-shadow: 10px 10px 0 rgba(18, 42, 34, 0.28);
+}
+
+.evidence-audit__proofroom-preview > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.evidence-audit__proofroom-preview > header span {
+  color: var(--agent-moss);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.evidence-audit__proofroom-preview > header h4 {
+  margin: 4px 0 0;
+  font-size: 24px;
+  letter-spacing: 0;
+}
+
+.evidence-audit__proofroom-preview > dl {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.evidence-audit__proofroom-payload {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--agent-rule);
+}
+
+.evidence-audit__proofroom-payload h4 {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: 0;
+}
+
+.evidence-audit__proofroom-claim {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--agent-rule);
+  background: #fffef9;
+}
+
+.evidence-audit__proofroom-claim + .evidence-audit__proofroom-claim {
+  margin-top: 8px;
+}
+
+.evidence-audit__proofroom-claim header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: baseline;
+}
+
+.evidence-audit__proofroom-claim header span,
+.evidence-audit__proofroom-claim header small {
+  color: #66736d;
+  font-size: 10px;
+}
+
+.evidence-audit__proofroom-claim p,
+.evidence-audit__proofroom-claim ul,
+.evidence-audit__proofroom-payload aside ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.evidence-audit__proofroom-claim p {
+  padding-left: 0;
+}
+
+.evidence-audit__proofroom-claim li {
+  overflow-wrap: anywhere;
+}
+
+.evidence-audit__proofroom-claim li span {
+  display: block;
+  color: #66736d;
+}
+
 .evidence-audit__delivery {
   display: grid;
   gap: 4px;
@@ -5671,6 +5776,20 @@ a.button {
     gap: 2px;
   }
 
+  .evidence-audit__proofroom-overlay {
+    align-items: end;
+    padding: 10px;
+  }
+
+  .evidence-audit__proofroom-preview {
+    max-height: calc(100vh - 20px);
+    padding: 16px;
+  }
+
+  .evidence-audit__proofroom-preview > dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .wechat-source__preview {
     position: static;
     max-height: none;
@@ -5727,7 +5846,8 @@ a.button {
   }
 
   .book-agent__hero,
-  .book-agent__package-card {
+  .book-agent__package-card,
+  .evidence-audit__waiting > span {
     animation: none;
   }
 }

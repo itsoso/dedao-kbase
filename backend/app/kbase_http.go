@@ -386,6 +386,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAgentPackageAudits(w, r, packageID)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/agent-traces/") {
+		h.handleAgentTrace(w, r)
+		return
+	}
 	if r.URL.Path == "/api/agent-audits" || strings.HasPrefix(r.URL.Path, "/api/agent-audits/") {
 		h.handleEvidenceAudits(w, r)
 		return
@@ -1260,8 +1264,54 @@ func isEvidenceAuditAPIPath(path string) bool {
 	if path == "/api/agent-audits" || strings.HasPrefix(path, "/api/agent-audits/") {
 		return true
 	}
+	if strings.HasPrefix(path, "/api/agent-traces/") {
+		return true
+	}
 	_, ok := agentPackageAuditCollectionPathID(path)
 	return ok
+}
+
+func (h *kbaseHTTPHandler) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/agent-traces/"
+	if r.Method != http.MethodGet {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "load_trace", nil,
+		)
+		return
+	}
+	rawID := strings.TrimPrefix(r.URL.Path, prefix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "trace_not_found",
+			"agent trace not found", "load_trace", nil,
+		)
+		return
+	}
+	traceID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(traceID) == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid trace_id", "load_trace", nil,
+		)
+		return
+	}
+	trace, err := h.store.LoadAgentTrace(traceID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "trace_not_found",
+				"agent trace not found", "load_trace", nil,
+			)
+			return
+		}
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusInternalServerError, "audit_store_unavailable",
+			"agent trace storage is unavailable", "load_trace", err,
+		)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, trace)
 }
 
 func (h *kbaseHTTPHandler) handleAgentPackageAudits(w http.ResponseWriter, r *http.Request, packageID string) {
