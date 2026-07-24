@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,6 +85,68 @@ func TestProofroomProjectionRejectsNonCompletedOrTamperedAudit(t *testing.T) {
 	completed.OutputHash = "sha256:" + strings.Repeat("0", 64)
 	if _, err := BuildProofroomEvidenceAuditProjection(completed); !errors.Is(err, ErrProofroomAuditInvalid) {
 		t.Fatalf("tampered projection error = %v", err)
+	}
+}
+
+func TestProofroomPreviewUsesReadOnlySnapshot(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	queued, _, err := CreateEvidenceAudit(
+		store, validEvidenceAuditInput(), "proofroom-read-only", testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.EvidenceAuditManifestPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PreviewEvidenceAuditProofroom(store, queued.AuditID); !errors.Is(err, ErrProofroomAuditNotReady) {
+		t.Fatalf("queued preview error = %v", err)
+	}
+	after, err := os.ReadFile(store.EvidenceAuditManifestPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("GET-compatible preview changed the audit manifest")
+	}
+}
+
+func TestProofroomProjectionPreservesReviewContractWithoutRawClaims(t *testing.T) {
+	_, audit := completedEvidenceAuditForProofroomTest(t)
+	audit.Proofroom.Title = "Independent adjudication"
+	audit.Proofroom.ReviewItems = []string{"Verify allocation concealment", "Resolve endpoint conflict"}
+	audit.ClaimAudits[0].NormalizedStatement = "Bearer secret-token api_key=private password=hunter2"
+	audit.ClaimAudits[0].Limitations = []string{
+		"Patient Alice +1 212-555-0199; 患者 张三 身份证 11010519491231002X",
+	}
+	audit.Summary.Conclusion = "Contact alice@example.test before review"
+	finalized, err := FinalizeEvidenceAuditReport(audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := BuildProofroomEvidenceAuditProjection(finalized)
+	if err != nil {
+		t.Fatalf("BuildProofroomEvidenceAuditProjection() error = %v", err)
+	}
+	if preview.Payload.Proofroom.Title.Text == "" ||
+		len(preview.Payload.Proofroom.ReviewItems) != 2 {
+		t.Fatalf("proofroom review contract = %#v", preview.Payload.Proofroom)
+	}
+	if preview.Payload.Claims[0].SourceClaimIdentity == "" {
+		t.Fatalf("source claim was not identity-only: %#v", preview.Payload.Claims[0])
+	}
+	raw, err := json.Marshal(preview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range []string{
+		audit.ClaimAudits[0].SourceClaim, "alice@example.test", "212-555-0199", "secret-token",
+		"private", "hunter2", "张三", "11010519491231002X",
+	} {
+		if strings.Contains(string(raw), value) {
+			t.Fatalf("projection leaked %q: %s", value, raw)
+		}
 	}
 }
 
@@ -348,6 +411,182 @@ func TestProofroomDeliveryInvalidOrOversizedResponseRemainsUnknown(t *testing.T)
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestProofroomDeliveryClassifiesRemoteOutcomesFailClosed(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		want       error
+	}{
+		{name: "accepted", statusCode: 200, body: `{"receipt_id":"r-1","status":"accepted"}`},
+		{name: "business rejected", statusCode: 200, body: `{"receipt_id":"r-2","status":"rejected"}`, want: ErrProofroomDeliveryRejected},
+		{name: "business failed", statusCode: 200, body: `{"receipt_id":"r-3","status":"failed"}`, want: ErrProofroomDeliveryRejected},
+		{name: "request timeout", statusCode: 408, body: `{}`, want: ErrProofroomDeliveryOutcomeUnknown},
+		{name: "rate limited", statusCode: 429, body: `{}`, want: ErrProofroomDeliveryOutcomeUnknown},
+		{name: "server failure", statusCode: 503, body: `{}`, want: ErrProofroomDeliveryOutcomeUnknown},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, audit := completedEvidenceAuditForProofroomTest(t)
+			var calls atomic.Int32
+			service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+				Endpoint: "https://proofroom.example.test/api/audits",
+				Token:    "remote-secret",
+				Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+					calls.Add(1)
+					return proofroomJSONResponse(test.statusCode, test.body), nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			receipt, _, gotErr := service.Deliver(context.Background(), store, audit.AuditID, "classification-key")
+			if test.want == nil {
+				if gotErr != nil || receipt.Status != ProofroomDeliveryDelivered {
+					t.Fatalf("receipt=%#v error=%v", receipt, gotErr)
+				}
+				return
+			}
+			if !errors.Is(gotErr, test.want) {
+				t.Fatalf("error=%v, want %v", gotErr, test.want)
+			}
+			if _, _, secondErr := service.Deliver(context.Background(), store, audit.AuditID, "classification-key"); !errors.Is(secondErr, test.want) {
+				t.Fatalf("second error=%v, want %v", secondErr, test.want)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("remote calls=%d, want 1", calls.Load())
+			}
+			if errors.Is(test.want, ErrProofroomDeliveryRejected) {
+				entries, readErr := os.ReadDir(filepath.Join(store.EvidenceAuditProofroomDir(), "receipts"))
+				if readErr == nil && len(entries) != 0 {
+					t.Fatalf("rejected outcome created receipt: %#v", entries)
+				}
+				if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+					t.Fatal(readErr)
+				}
+			}
+		})
+	}
+}
+
+func TestProofroomDeliveryBindsStateToEndpointIdentity(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	first, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test:443/api/audits",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			return proofroomJSONResponse(503, `{}`), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := first.Deliver(context.Background(), store, audit.AuditID, "endpoint-key"); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+		t.Fatalf("first delivery error = %v", err)
+	}
+	var calls atomic.Int32
+	second, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test:8443/api/audits",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(200, `{"receipt_id":"wrong-target","status":"accepted"}`), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := second.Deliver(context.Background(), store, audit.AuditID, "endpoint-key"); !errors.Is(err, ErrProofroomDeliveryConflict) {
+		t.Fatalf("endpoint change error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("endpoint change reached remote: %d", calls.Load())
+	}
+	if err := CoordinateProofroomDeliveryForEndpoint(
+		store, audit.AuditID, "endpoint-key", second.endpointIdentity,
+		ProofroomCoordinationConfirmedNotDelivered, testAgentPackageTime(),
+	); !errors.Is(err, ErrProofroomDeliveryConflict) {
+		t.Fatalf("cross-endpoint coordination error = %v", err)
+	}
+}
+
+func TestProofroomEndpointIdentityNormalizesPortAndBindsPath(t *testing.T) {
+	first, _ := url.Parse("https://Proofroom.Example.test/api/audits")
+	explicit, _ := url.Parse("https://proofroom.example.test:443/api/audits")
+	differentPath, _ := url.Parse("https://proofroom.example.test:443/api/review")
+	if proofroomEndpointIdentity(first) != proofroomEndpointIdentity(explicit) {
+		t.Fatal("default HTTPS port was not normalized")
+	}
+	if proofroomEndpointIdentity(first) == proofroomEndpointIdentity(differentPath) {
+		t.Fatal("endpoint identity did not bind the path")
+	}
+}
+
+func TestProofroomDeliveryStateRecoversFromInterruptedPublish(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var injected atomic.Bool
+	previous := proofroomStateStorageFault
+	proofroomStateStorageFault = func(stage, _ string) error {
+		if stage == proofroomStateFaultBackupPublished && injected.CompareAndSwap(false, true) {
+			return errors.New("injected state publish failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { proofroomStateStorageFault = previous })
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/api/audits",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Deliver(context.Background(), store, audit.AuditID, "crash-key"); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+		t.Fatalf("interrupted delivery error = %v", err)
+	}
+	statePath := store.EvidenceAuditProofroomStatePath(audit.AuditID, evidenceAuditOpaqueIdentity("crash-key"))
+	state, err := loadProofroomDeliveryState(statePath)
+	if err != nil {
+		t.Fatalf("load recovered state: %v", err)
+	}
+	if state.Status != "in_flight" && state.Status != ProofroomDeliveryOutcomeUnknown {
+		t.Fatalf("recovered state = %#v", state)
+	}
+	if info, err := os.Stat(statePath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("recovered state permissions info=%v err=%v", info, err)
+	}
+}
+
+func TestProofroomDeliveryStateRecoversFromSemanticallyCorruptPrimary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deliveries", "state.json")
+	state := proofroomDeliveryState{
+		Version: "1", AuditID: "audit-1", IdempotencyIdentity: proofroomSHA256([]byte("key")),
+		ProjectionHash:   proofroomSHA256([]byte("projection")),
+		EndpointIdentity: "https://proofroom.example.test:443/path/" + proofroomSHA256([]byte("/api")),
+		Status:           "in_flight", RequestedAt: testAgentPackageTime().Format(time.RFC3339Nano),
+		UpdatedAt: testAgentPackageTime().Format(time.RFC3339Nano),
+	}
+	if err := writeProofroomDeliveryState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	state.Status = ProofroomDeliveryOutcomeUnknown
+	if err := writeProofroomDeliveryState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := loadProofroomDeliveryState(path)
+	if err != nil {
+		t.Fatalf("load recovered state: %v", err)
+	}
+	if recovered.Status != "in_flight" {
+		t.Fatalf("recovered state = %#v", recovered)
 	}
 }
 

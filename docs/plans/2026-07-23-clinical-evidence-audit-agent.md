@@ -262,7 +262,7 @@ Verify:
 **Step 2: Run focused tests**
 
 ```bash
-go test ./backend/app ./cmd/kbase-server -run 'TestEvidenceAuditProofroom' -count=1
+go test ./backend/app ./cmd/kbase-server -run 'TestProofroom|TestKBaseHTTPHandlerProofroom' -count=1
 ```
 
 Expected: FAIL because projection does not exist.
@@ -280,7 +280,7 @@ Add:
 **Step 4: Run focused tests**
 
 ```bash
-go test ./backend/app ./cmd/kbase-server -run 'TestEvidenceAuditProofroom|TestEvidenceAuditHTTP' -count=1
+go test ./backend/app ./cmd/kbase-server -run 'TestProofroom|TestKBaseHTTPHandlerProofroom' -count=1
 ```
 
 Expected: PASS.

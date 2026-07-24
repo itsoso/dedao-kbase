@@ -129,22 +129,30 @@ Completed, hardened, and verified.
 Completed, hardened, and verified.
 
 - A versioned, bounded Proofroom projection is derived only from completed,
-  validated Audit reports. It preserves evidence provenance and review actions
-  while replacing subject/scope text with domain-separated hashes and excluding
-  source bodies, prompts, credentials, and personal input text.
-- Preview is a read-only GET operation. It returns the deterministic payload
-  hash and a readable summary without writing receipts or contacting Proofroom.
+  validated Audit reports. Raw source claims are replaced with stable
+  identities; evidence contains only KBase Release/claim/chunk/citation IDs.
+  All remaining free text is bounded, redacted for secrets and patient
+  identifiers, and carries an original hash plus redaction marker. The complete
+  Proofroom title and review-item contract is retained.
+- Preview uses a non-coordinating snapshot loader. It returns the deterministic
+  payload hash and a readable summary without mutating Audit state, writing
+  receipts, or contacting Proofroom.
 - Delivery is an authenticated, idempotent POST operation. Endpoint and token
   are read only from server environment configuration; no request can override
   them.
-- Receipts are immutable, content-addressed, `0600` files. Opaque global
-  idempotency identities, cross-process locking, bounded responses, and an
-  explicit unknown-outcome coordination state prevent automatic duplicate
-  delivery. Operators can clear only a confirmed non-delivery using the
-  dedicated resolution header and the original idempotency key.
+- Receipts are immutable, content-addressed, `0600` files. Delivery states use
+  private, last-known-good backup recovery and bind the normalized scheme,
+  host, effective port, and path hash. Opaque global idempotency identities,
+  cross-process locking, bounded responses, and an explicit unknown-outcome
+  coordination state prevent automatic duplicate delivery. Operators can clear
+  only a confirmed non-delivery using the same endpoint, dedicated resolution
+  header, and original idempotency key.
+- Only explicit accepted/delivered/succeeded business outcomes create receipts.
+  Transport errors, 408, 429, 5xx, invalid/truncated responses, and unknown
+  business states fail closed as `outcome_unknown`.
 - Production URL policy requires HTTPS, disallows userinfo/fragments, blocks
-  loopback/private IPs during validation and dialing, and applies equivalent
-  redirect checks. Local endpoints exist only behind the explicit test hook.
+  loopback/private IPs during validation and dialing, and disables redirects by
+  default. Local endpoints exist only behind the explicit test hook.
 - Proofroom receives KBase findings as review input and retains final
   adjudication authority.
 - Focused and full race-enabled tests pass without data races. Complete backend

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -36,7 +37,16 @@ const (
 	proofroomMaxRemoteIDBytes     = 256
 	proofroomDeliveryLockWait     = 130 * time.Second
 	proofroomDefaultClientTimeout = 20 * time.Second
+	proofroomMaxSafeTextBytes     = 2048
 )
+
+const (
+	proofroomStateFaultTempSynced      = "proofroom_state_temp_synced"
+	proofroomStateFaultBackupPublished = "proofroom_state_backup_published"
+	proofroomStateFaultBeforePublish   = "proofroom_state_before_publish"
+)
+
+var proofroomStateStorageFault = func(string, string) error { return nil }
 
 var (
 	ErrProofroomAuditNotReady          = errors.New("evidence audit is not ready for Proofroom")
@@ -68,6 +78,7 @@ type ProofroomEvidenceAuditProjection struct {
 	ScopeIdentity         string                        `json:"scope_identity"`
 	Claims                []ProofroomEvidenceAuditClaim `json:"claims"`
 	Summary               ProofroomEvidenceAuditSummary `json:"summary"`
+	Proofroom             ProofroomReviewContract       `json:"proofroom"`
 	AdjudicationAuthority string                        `json:"adjudication_authority"`
 	KBaseDecisionFinal    bool                          `json:"kbase_decision_final"`
 }
@@ -79,20 +90,44 @@ type ProofroomAuditIdentity struct {
 }
 
 type ProofroomEvidenceAuditClaim struct {
-	SourceClaim         string                     `json:"source_claim"`
-	NormalizedStatement string                     `json:"normalized_statement"`
-	Verdict             string                     `json:"verdict"`
-	ComputedConfidence  float64                    `json:"computed_confidence"`
-	Evidence            []EvidenceAuditEvidenceRef `json:"evidence"`
-	Limitations         []string                   `json:"limitations"`
-	KnowledgeGaps       []string                   `json:"knowledge_gaps"`
-	ReviewActions       []string                   `json:"review_actions"`
+	SourceClaimIdentity string                 `json:"source_claim_identity"`
+	NormalizedStatement ProofroomSafeText      `json:"normalized_statement"`
+	Verdict             string                 `json:"verdict"`
+	ComputedConfidence  float64                `json:"computed_confidence"`
+	Evidence            []ProofroomEvidenceRef `json:"evidence"`
+	Limitations         []ProofroomSafeText    `json:"limitations"`
+	KnowledgeGaps       []ProofroomSafeText    `json:"knowledge_gaps"`
+	ReviewActions       []ProofroomSafeText    `json:"review_actions"`
+}
+
+type ProofroomEvidenceRef struct {
+	ReleaseID         string `json:"release_id"`
+	ContentHash       string `json:"content_hash"`
+	Role              string `json:"role"`
+	SourceType        string `json:"source_type"`
+	ClaimID           string `json:"claim_id"`
+	ChunkID           string `json:"chunk_id"`
+	CitationID        string `json:"citation_id"`
+	PublishedAt       string `json:"published_at"`
+	FreshnessDecision string `json:"freshness_decision"`
+	Conflict          bool   `json:"conflict,omitempty"`
 }
 
 type ProofroomEvidenceAuditSummary struct {
-	Conclusion    string         `json:"conclusion"`
-	VerdictCounts map[string]int `json:"verdict_counts"`
-	Limitations   []string       `json:"limitations"`
+	Conclusion    ProofroomSafeText   `json:"conclusion"`
+	VerdictCounts map[string]int      `json:"verdict_counts"`
+	Limitations   []ProofroomSafeText `json:"limitations"`
+}
+
+type ProofroomSafeText struct {
+	Text         string `json:"text"`
+	OriginalHash string `json:"original_hash"`
+	Redacted     bool   `json:"redacted"`
+}
+
+type ProofroomReviewContract struct {
+	Title       ProofroomSafeText   `json:"title"`
+	ReviewItems []ProofroomSafeText `json:"review_items"`
 }
 
 type ProofroomEvidenceAuditPreview struct {
@@ -102,15 +137,16 @@ type ProofroomEvidenceAuditPreview struct {
 }
 
 type ProofroomDeliveryReceipt struct {
-	SchemaVersion   string `json:"schema_version"`
-	AuditID         string `json:"audit_id"`
-	ProjectionHash  string `json:"projection_hash"`
-	RemoteReceiptID string `json:"remote_receipt_id"`
-	RemoteStatus    string `json:"remote_status"`
-	Status          string `json:"status"`
-	RequestedAt     string `json:"requested_at"`
-	DeliveredAt     string `json:"delivered_at"`
-	ReceiptHash     string `json:"receipt_hash"`
+	SchemaVersion    string `json:"schema_version"`
+	AuditID          string `json:"audit_id"`
+	ProjectionHash   string `json:"projection_hash"`
+	RemoteReceiptID  string `json:"remote_receipt_id"`
+	RemoteStatus     string `json:"remote_status"`
+	Status           string `json:"status"`
+	RequestedAt      string `json:"requested_at"`
+	DeliveredAt      string `json:"delivered_at"`
+	ReceiptHash      string `json:"receipt_hash"`
+	EndpointIdentity string `json:"endpoint_identity"`
 }
 
 type proofroomDeliveryState struct {
@@ -118,6 +154,7 @@ type proofroomDeliveryState struct {
 	AuditID             string `json:"audit_id"`
 	IdempotencyIdentity string `json:"idempotency_identity"`
 	ProjectionHash      string `json:"projection_hash"`
+	EndpointIdentity    string `json:"endpoint_identity"`
 	Status              string `json:"status"`
 	RequestedAt         string `json:"requested_at"`
 	UpdatedAt           string `json:"updated_at"`
@@ -153,6 +190,7 @@ type ProofroomDeliveryService struct {
 	allowPrivateTestEndpoints bool
 	resolver                  ProofroomDNSResolver
 	resolveEndpoint           bool
+	endpointIdentity          string
 }
 
 func BuildProofroomEvidenceAuditProjection(audit EvidenceAudit) (ProofroomEvidenceAuditPreview, error) {
@@ -169,14 +207,14 @@ func BuildProofroomEvidenceAuditProjection(audit EvidenceAudit) (ProofroomEviden
 	claims := make([]ProofroomEvidenceAuditClaim, 0, len(audit.ClaimAudits))
 	for _, claim := range audit.ClaimAudits {
 		claims = append(claims, ProofroomEvidenceAuditClaim{
-			SourceClaim:         claim.SourceClaim,
-			NormalizedStatement: claim.NormalizedStatement,
+			SourceClaimIdentity: proofroomPrivateTextIdentity("source_claim", claim.SourceClaim),
+			NormalizedStatement: proofroomMinimizeText(claim.NormalizedStatement),
 			Verdict:             claim.Verdict,
 			ComputedConfidence:  claim.ComputedConfidence,
-			Evidence:            append([]EvidenceAuditEvidenceRef(nil), claim.Evidence...),
-			Limitations:         append([]string(nil), claim.Limitations...),
-			KnowledgeGaps:       append([]string(nil), claim.KnowledgeGaps...),
-			ReviewActions:       append([]string(nil), claim.ReviewActions...),
+			Evidence:            proofroomEvidenceRefs(claim.Evidence),
+			Limitations:         proofroomMinimizeTexts(claim.Limitations),
+			KnowledgeGaps:       proofroomMinimizeTexts(claim.KnowledgeGaps),
+			ReviewActions:       proofroomMinimizeTexts(claim.ReviewActions),
 		})
 	}
 	projection := ProofroomEvidenceAuditProjection{
@@ -190,9 +228,13 @@ func BuildProofroomEvidenceAuditProjection(audit EvidenceAudit) (ProofroomEviden
 		ScopeIdentity:   proofroomPrivateTextIdentity("scope", audit.Scope),
 		Claims:          claims,
 		Summary: ProofroomEvidenceAuditSummary{
-			Conclusion:    audit.Summary.Conclusion,
+			Conclusion:    proofroomMinimizeText(audit.Summary.Conclusion),
 			VerdictCounts: cloneProofroomVerdictCounts(audit.Summary.VerdictCounts),
-			Limitations:   append([]string(nil), audit.Summary.Limitations...),
+			Limitations:   proofroomMinimizeTexts(audit.Summary.Limitations),
+		},
+		Proofroom: ProofroomReviewContract{
+			Title:       proofroomMinimizeText(audit.Proofroom.Title),
+			ReviewItems: proofroomMinimizeTexts(audit.Proofroom.ReviewItems),
 		},
 		AdjudicationAuthority: "proofroom",
 		KBaseDecisionFinal:    false,
@@ -221,7 +263,7 @@ func PreviewEvidenceAuditProofroom(store *BookKnowledgeStore, auditID string) (P
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
-	audit, err := store.LoadEvidenceAudit(auditID)
+	audit, err := store.LoadEvidenceAuditSnapshot(auditID)
 	if err != nil {
 		return ProofroomEvidenceAuditPreview{}, err
 	}
@@ -261,29 +303,17 @@ func NewProofroomDeliveryService(config ProofroomDeliveryConfig) (*ProofroomDeli
 			IdleConnTimeout:       30 * time.Second,
 		}
 		httpClient := &http.Client{Timeout: timeout, Transport: transport}
-		httpClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
-			if len(via) >= 3 {
-				return errors.New("too many Proofroom redirects")
-			}
-			redirect, err := validateProofroomEndpoint(
-				request.URL.String(), config.AllowPrivateTestEndpoints,
-			)
-			if err != nil {
-				return err
-			}
-			if !strings.EqualFold(redirect.Hostname(), endpoint.Hostname()) {
-				return errors.New("cross-host Proofroom redirect is not allowed")
-			}
-			return validateProofroomResolvedEndpoint(
-				request.Context(), redirect, config.AllowPrivateTestEndpoints, resolver,
-			)
+		httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
 		}
 		client = httpClient
 	}
+	endpointIdentity := proofroomEndpointIdentity(endpoint)
 	return &ProofroomDeliveryService{
 		endpoint: endpoint, token: token, client: client, now: now,
 		allowPrivateTestEndpoints: config.AllowPrivateTestEndpoints,
 		resolver:                  resolver, resolveEndpoint: resolveEndpoint,
+		endpointIdentity: endpointIdentity,
 	}, nil
 }
 
@@ -315,7 +345,8 @@ func (s *ProofroomDeliveryService) Deliver(
 	statePath := store.EvidenceAuditProofroomStatePath(auditID, identity)
 	state, stateErr := loadProofroomDeliveryState(statePath)
 	if stateErr == nil {
-		if state.ProjectionHash != preview.PayloadHash || state.AuditID != auditID {
+		if state.ProjectionHash != preview.PayloadHash || state.AuditID != auditID ||
+			state.EndpointIdentity != s.endpointIdentity {
 			return ProofroomDeliveryReceipt{}, false, ErrProofroomDeliveryConflict
 		}
 		switch state.Status {
@@ -335,7 +366,7 @@ func (s *ProofroomDeliveryService) Deliver(
 	} else if !errors.Is(stateErr, os.ErrNotExist) {
 		return ProofroomDeliveryReceipt{}, false, stateErr
 	}
-	if unknown, err := store.hasUnknownProofroomDelivery(preview.PayloadHash); err != nil {
+	if unknown, err := store.hasUnknownProofroomDelivery(preview.PayloadHash, s.endpointIdentity); err != nil {
 		return ProofroomDeliveryReceipt{}, false, err
 	} else if unknown {
 		return ProofroomDeliveryReceipt{}, false, ErrProofroomDeliveryOutcomeUnknown
@@ -350,7 +381,7 @@ func (s *ProofroomDeliveryService) Deliver(
 	now := s.now().UTC()
 	state = proofroomDeliveryState{
 		Version: "1", AuditID: auditID, IdempotencyIdentity: identity,
-		ProjectionHash: preview.PayloadHash, Status: "in_flight",
+		ProjectionHash: preview.PayloadHash, EndpointIdentity: s.endpointIdentity, Status: "in_flight",
 		RequestedAt: now.Format(time.RFC3339Nano), UpdatedAt: now.Format(time.RFC3339Nano),
 	}
 	if err := writeProofroomDeliveryState(statePath, state); err != nil {
@@ -384,6 +415,11 @@ func (s *ProofroomDeliveryService) Deliver(
 	if err != nil || len(body) > proofroomMaxResponseBytes {
 		return ProofroomDeliveryReceipt{}, false, s.markProofroomOutcomeUnknown(statePath, state, "response_outcome_unknown", err)
 	}
+	if proofroomRemoteOutcomeUnknown(response.StatusCode) {
+		return ProofroomDeliveryReceipt{}, false, s.markProofroomOutcomeUnknown(
+			statePath, state, fmt.Sprintf("remote_http_%d_outcome_unknown", response.StatusCode), nil,
+		)
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		state.Status = ProofroomDeliveryRejected
 		state.FailureCode = fmt.Sprintf("remote_http_%d", response.StatusCode)
@@ -407,14 +443,31 @@ func (s *ProofroomDeliveryService) Deliver(
 			statePath, state, "remote_response_invalid", errors.New("invalid remote response"),
 		)
 	}
+	remote.Status = strings.ToLower(strings.TrimSpace(remote.Status))
+	switch remote.Status {
+	case "accepted", "delivered", "succeeded":
+	case "rejected", "failed":
+		state.Status = ProofroomDeliveryRejected
+		state.FailureCode = "remote_business_" + remote.Status
+		state.UpdatedAt = s.now().UTC().Format(time.RFC3339Nano)
+		if err := writeProofroomDeliveryState(statePath, state); err != nil {
+			return ProofroomDeliveryReceipt{}, false, s.markProofroomOutcomeUnknown(statePath, state, "rejection_state_failed", err)
+		}
+		return ProofroomDeliveryReceipt{}, false, ErrProofroomDeliveryRejected
+	default:
+		return ProofroomDeliveryReceipt{}, false, s.markProofroomOutcomeUnknown(
+			statePath, state, "remote_status_unknown", errors.New("unrecognized remote status"),
+		)
+	}
 	deliveredAt := s.now().UTC()
 	receipt := ProofroomDeliveryReceipt{
 		SchemaVersion: ProofroomDeliveryReceiptVersion,
 		AuditID:       auditID, ProjectionHash: preview.PayloadHash,
-		RemoteReceiptID: strings.TrimSpace(remote.ReceiptID),
-		RemoteStatus:    strings.TrimSpace(remote.Status),
-		Status:          ProofroomDeliveryDelivered,
-		RequestedAt:     state.RequestedAt, DeliveredAt: deliveredAt.Format(time.RFC3339Nano),
+		RemoteReceiptID:  strings.TrimSpace(remote.ReceiptID),
+		RemoteStatus:     strings.TrimSpace(remote.Status),
+		Status:           ProofroomDeliveryDelivered,
+		EndpointIdentity: s.endpointIdentity,
+		RequestedAt:      state.RequestedAt, DeliveredAt: deliveredAt.Format(time.RFC3339Nano),
 	}
 	receiptHash, payload, err := proofroomReceiptHash(receipt)
 	if err != nil {
@@ -442,6 +495,16 @@ func CoordinateProofroomDelivery(
 	auditID, idempotencyKey, resolution string,
 	now time.Time,
 ) error {
+	return CoordinateProofroomDeliveryForEndpoint(
+		store, auditID, idempotencyKey, "", resolution, now,
+	)
+}
+
+func CoordinateProofroomDeliveryForEndpoint(
+	store *BookKnowledgeStore,
+	auditID, idempotencyKey, endpointIdentity, resolution string,
+	now time.Time,
+) error {
 	if resolution != ProofroomCoordinationConfirmedNotDelivered {
 		return fmt.Errorf("unsupported Proofroom coordination resolution")
 	}
@@ -463,6 +526,9 @@ func CoordinateProofroomDelivery(
 		return err
 	}
 	if state.AuditID != auditID {
+		return ErrProofroomDeliveryConflict
+	}
+	if endpointIdentity != "" && state.EndpointIdentity != endpointIdentity {
 		return ErrProofroomDeliveryConflict
 	}
 	if state.Status != ProofroomDeliveryOutcomeUnknown && state.Status != "in_flight" {
@@ -512,7 +578,7 @@ func (s *BookKnowledgeStore) acquireProofroomDeliveryLock(ctx context.Context, a
 	return func() { _ = lock.Close() }, nil
 }
 
-func (s *BookKnowledgeStore) hasUnknownProofroomDelivery(projectionHash string) (bool, error) {
+func (s *BookKnowledgeStore) hasUnknownProofroomDelivery(projectionHash, endpointIdentity string) (bool, error) {
 	entries, err := os.ReadDir(filepath.Join(s.EvidenceAuditProofroomDir(), "deliveries"))
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -533,7 +599,7 @@ func (s *BookKnowledgeStore) hasUnknownProofroomDelivery(projectionHash string) 
 		if err != nil {
 			return false, err
 		}
-		if state.ProjectionHash == projectionHash &&
+		if state.ProjectionHash == projectionHash && state.EndpointIdentity == endpointIdentity &&
 			(state.Status == ProofroomDeliveryOutcomeUnknown || state.Status == "in_flight") {
 			return true, nil
 		}
@@ -665,12 +731,31 @@ func proofroomSafeDialContext(
 }
 
 func loadProofroomDeliveryState(path string) (proofroomDeliveryState, error) {
+	state, primaryErr := loadProofroomDeliveryStateFile(path)
+	if primaryErr == nil {
+		return state, nil
+	}
+	state, backupErr := loadProofroomDeliveryStateFile(path + ".bak")
+	if backupErr != nil {
+		return proofroomDeliveryState{}, primaryErr
+	}
+	payload, err := json.Marshal(state)
+	if err != nil {
+		return proofroomDeliveryState{}, err
+	}
+	if err := restoreProofroomDeliveryState(path, payload); err != nil {
+		return proofroomDeliveryState{}, err
+	}
+	return state, nil
+}
+
+func loadProofroomDeliveryStateFile(path string) (proofroomDeliveryState, error) {
 	var state proofroomDeliveryState
 	if err := readJSONFile(path, &state); err != nil {
 		return proofroomDeliveryState{}, err
 	}
 	if state.Version != "1" || state.AuditID == "" || state.IdempotencyIdentity == "" ||
-		state.ProjectionHash == "" || state.Status == "" {
+		state.ProjectionHash == "" || state.EndpointIdentity == "" || state.Status == "" {
 		return proofroomDeliveryState{}, fmt.Errorf("invalid Proofroom delivery state")
 	}
 	return state, nil
@@ -681,7 +766,7 @@ func writeProofroomDeliveryState(path string, state proofroomDeliveryState) erro
 	if err != nil {
 		return err
 	}
-	return writeEvidenceAuditPrivateFile(path, payload)
+	return writeProofroomDeliveryStateCrashSafe(path, payload)
 }
 
 func proofroomReceiptHash(receipt ProofroomDeliveryReceipt) (string, []byte, error) {
@@ -708,4 +793,144 @@ func cloneProofroomVerdictCounts(input map[string]int) map[string]int {
 		output[key] = value
 	}
 	return output
+}
+
+func proofroomRemoteOutcomeUnknown(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
+func proofroomEndpointIdentity(endpoint *url.URL) string {
+	scheme := strings.ToLower(endpoint.Scheme)
+	host := strings.ToLower(endpoint.Hostname())
+	port := endpoint.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	pathHash := proofroomSHA256([]byte(endpoint.EscapedPath()))
+	return scheme + "://" + net.JoinHostPort(host, port) + "/path/" + pathHash
+}
+
+var proofroomSensitivePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`),
+	regexp.MustCompile(`(?i)\b(?:bearer|api[_-]?key|password|client[_-]?secret)\s*[:=]?\s*[^\s,;]+`),
+	regexp.MustCompile(`\b\d{17}[\dXx]\b`),
+	regexp.MustCompile(`(?i)(?:\+?\d[\d .()-]{7,}\d)`),
+	regexp.MustCompile(`(?i)\bpatient\s+[^\s,;]+`),
+	regexp.MustCompile(`患者\s*[\p{Han}]{2,4}`),
+}
+
+func proofroomMinimizeText(value string) ProofroomSafeText {
+	original := strings.TrimSpace(value)
+	text := original
+	redacted := false
+	for _, pattern := range proofroomSensitivePatterns {
+		if pattern.MatchString(text) {
+			redacted = true
+			text = pattern.ReplaceAllString(text, "[REDACTED]")
+		}
+	}
+	text = strings.TrimSpace(text)
+	if len(text) > proofroomMaxSafeTextBytes {
+		text = text[:proofroomMaxSafeTextBytes]
+		redacted = true
+	}
+	return ProofroomSafeText{
+		Text: text, OriginalHash: proofroomPrivateTextIdentity("proofroom_text", original),
+		Redacted: redacted,
+	}
+}
+
+func proofroomMinimizeTexts(values []string) []ProofroomSafeText {
+	output := make([]ProofroomSafeText, 0, len(values))
+	for _, value := range values {
+		output = append(output, proofroomMinimizeText(value))
+	}
+	return output
+}
+
+func proofroomEvidenceRefs(values []EvidenceAuditEvidenceRef) []ProofroomEvidenceRef {
+	output := make([]ProofroomEvidenceRef, 0, len(values))
+	for _, value := range values {
+		output = append(output, ProofroomEvidenceRef{
+			ReleaseID: value.ReleaseID, ContentHash: value.ContentHash,
+			Role: value.Role, SourceType: value.SourceType,
+			ClaimID: value.ClaimID, ChunkID: value.ChunkID, CitationID: value.CitationID,
+			PublishedAt: value.PublishedAt, FreshnessDecision: value.FreshnessDecision,
+			Conflict: value.Conflict,
+		})
+	}
+	return output
+}
+
+func writeProofroomDeliveryStateCrashSafe(path string, payload []byte) error {
+	var next proofroomDeliveryState
+	if err := json.Unmarshal(payload, &next); err != nil {
+		return err
+	}
+	if next.Version != "1" || next.AuditID == "" || next.IdempotencyIdentity == "" ||
+		next.ProjectionHash == "" || next.EndpointIdentity == "" || next.Status == "" {
+		return fmt.Errorf("invalid Proofroom delivery state")
+	}
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), ".proofroom-state.next-", payload)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempPath)
+	if err := proofroomStateStorageFault(proofroomStateFaultTempSynced, path); err != nil {
+		return err
+	}
+	backupPath := path + ".bak"
+	if _, readErr := loadProofroomDeliveryStateFile(path); readErr == nil {
+		if err := os.Remove(backupPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Rename(path, backupPath); err != nil {
+			return err
+		}
+		if err := syncEvidenceAuditDir(filepath.Dir(path)); err != nil {
+			return err
+		}
+		if err := proofroomStateStorageFault(proofroomStateFaultBackupPublished, path); err != nil {
+			return err
+		}
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	if err := proofroomStateStorageFault(proofroomStateFaultBeforePublish, path); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return err
+	}
+	return syncEvidenceAuditDir(filepath.Dir(path))
+}
+
+func restoreProofroomDeliveryState(path string, payload []byte) error {
+	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), ".proofroom-state.restore-", payload)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempPath)
+	if err := os.Rename(tempPath, path); err != nil {
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+		if err := os.Rename(tempPath, path); err != nil {
+			return err
+		}
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return err
+	}
+	return syncEvidenceAuditDir(filepath.Dir(path))
 }

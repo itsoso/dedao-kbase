@@ -1562,8 +1562,9 @@ func (h *kbaseHTTPHandler) handleEvidenceAuditProofroom(
 				)
 				return
 			}
-			if err := CoordinateProofroomDelivery(
-				h.store, auditID, idempotencyKey, resolution, h.auditNow(),
+			if err := CoordinateProofroomDeliveryForEndpoint(
+				h.store, auditID, idempotencyKey, h.proofroomDelivery.endpointIdentity,
+				resolution, h.auditNow(),
 			); err != nil {
 				h.writeProofroomHTTPError(w, "coordination", err)
 				return

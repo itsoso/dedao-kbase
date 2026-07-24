@@ -585,6 +585,23 @@ func (s *BookKnowledgeStore) LoadEvidenceAudit(auditID string) (*EvidenceAudit, 
 	return s.loadEvidenceAuditByIDUnlocked(manifest, strings.TrimSpace(auditID))
 }
 
+// LoadEvidenceAuditSnapshot returns the persisted audit state without terminal
+// reconciliation. It is safe for read-only previews and never writes files.
+func (s *BookKnowledgeStore) LoadEvidenceAuditSnapshot(auditID string) (*EvidenceAudit, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	unlockRoot, err := s.acquireEvidenceAuditRootLock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlockRoot()
+	manifest, err := s.loadEvidenceAuditManifestUnlocked()
+	if err != nil {
+		return nil, err
+	}
+	return s.loadEvidenceAuditByIDUnlocked(manifest, strings.TrimSpace(auditID))
+}
+
 func (s *BookKnowledgeStore) ListEvidenceAudits(packageID, version string, limit int) ([]EvidenceAuditRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
