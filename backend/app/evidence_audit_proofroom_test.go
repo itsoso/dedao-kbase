@@ -224,6 +224,145 @@ func TestProofroomDLPRedactsCredentialFormats(t *testing.T) {
 	}
 }
 
+func TestProofroomDLPRedactsCredentialLabelVariantsAndNames(t *testing.T) {
+	tests := []struct {
+		name   string
+		input  string
+		secret string
+	}{
+		{name: "reviewer regression", input: `API key sklive123 and Name: Alice Smith`, secret: "sklive123"},
+		{name: "api key spaced colon", input: `api key: alpha-secret`, secret: "alpha-secret"},
+		{name: "api key snake equal", input: `api_key=bravo-secret`, secret: "bravo-secret"},
+		{name: "api key kebab whitespace", input: `api-key charlie-secret`, secret: "charlie-secret"},
+		{name: "api key camel JSON", input: `{"apiKey":"delta-secret"}`, secret: "delta-secret"},
+		{name: "access token spaced", input: `access token echo-secret`, secret: "echo-secret"},
+		{name: "access token snake JSON", input: `{"access_token":"foxtrot-secret"}`, secret: "foxtrot-secret"},
+		{name: "access token kebab equal", input: `access-token=golf-secret`, secret: "golf-secret"},
+		{name: "access token camel colon", input: `accessToken: hotel-secret`, secret: "hotel-secret"},
+		{name: "refresh token spaced", input: `refresh token india-secret`, secret: "india-secret"},
+		{name: "refresh token snake", input: `refresh_token=juliet-secret`, secret: "juliet-secret"},
+		{name: "refresh token kebab", input: `refresh-token: kilo-secret`, secret: "kilo-secret"},
+		{name: "refresh token camel JSON", input: `{"refreshToken":"lima-secret"}`, secret: "lima-secret"},
+		{name: "client secret spaced", input: `client secret mike-secret`, secret: "mike-secret"},
+		{name: "client secret snake", input: `client_secret=november-secret`, secret: "november-secret"},
+		{name: "client secret kebab", input: `client-secret: oscar-secret`, secret: "oscar-secret"},
+		{name: "client secret camel JSON", input: `{"clientSecret":"papa-secret"}`, secret: "papa-secret"},
+		{name: "password whitespace", input: `password quebec-secret`, secret: "quebec-secret"},
+		{name: "session JSON", input: `{"session":"romeo-secret"}`, secret: "romeo-secret"},
+		{name: "cookie colon", input: `cookie: sierra-secret`, secret: "sierra-secret"},
+		{name: "csrf camel JSON", input: `{"csrfToken":"tango-secret"}`, secret: "tango-secret"},
+		{name: "csrf snake equal", input: `csrf_token=uniform-secret`, secret: "uniform-secret"},
+		{name: "authorization whitespace", input: `authorization victor-secret`, secret: "victor-secret"},
+		{name: "authorization JSON", input: `{"Authorization":"Bearer whiskey-secret"}`, secret: "whiskey-secret"},
+		{name: "English name", input: `Name: Alice Smith`, secret: "Alice Smith"},
+		{name: "patient multiword name", input: `Patient name: Alice Mary Smith Johnson`, secret: "Alice Mary Smith Johnson"},
+		{name: "Chinese name", input: `姓名：张三`, secret: "张三"},
+		{name: "Chinese patient name", input: `患者姓名：欧阳明月`, secret: "欧阳明月"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			safeText, err := proofroomMinimizeText(test.input)
+			if err != nil {
+				t.Fatalf("proofroomMinimizeText() error = %v", err)
+			}
+			if !safeText.Redacted || !strings.Contains(safeText.Text, "[REDACTED]") {
+				t.Fatalf("safe text = %#v", safeText)
+			}
+			if strings.Contains(safeText.Text, test.secret) {
+				t.Fatalf("sensitive value %q remained in %q", test.secret, safeText.Text)
+			}
+		})
+	}
+}
+
+func TestProofroomDLPDoesNotTreatCredentialPolicyPhraseAsSecret(t *testing.T) {
+	safeText, err := proofroomMinimizeText("API key rotation policy")
+	if err != nil {
+		t.Fatalf("proofroomMinimizeText() error = %v", err)
+	}
+	if safeText.Text != "API key rotation policy" || safeText.Redacted {
+		t.Fatalf("ordinary policy phrase changed: %#v", safeText)
+	}
+}
+
+func TestProofroomResidualDetectorCoversCredentialLabelVariants(t *testing.T) {
+	for _, input := range []string{
+		`API key sklive123`,
+		`api_key=secret`,
+		`api-key: secret`,
+		`{"apiKey":"secret"}`,
+		`access token secret`,
+		`access_token=secret`,
+		`access-token: secret`,
+		`{"accessToken":"secret"}`,
+		`refresh token secret`,
+		`refresh_token=secret`,
+		`refresh-token: secret`,
+		`{"refreshToken":"secret"}`,
+		`client secret secret-value`,
+		`client_secret=secret`,
+		`client-secret: secret`,
+		`{"clientSecret":"secret"}`,
+		`password secret`,
+		`session secret`,
+		`cookie secret`,
+		`csrf secret`,
+		`csrf_token=secret`,
+		`{"csrfToken":"secret"}`,
+		`authorization Bearer secret`,
+		`{"Authorization":"Bearer secret"}`,
+		`Name: Alice Smith`,
+		`Patient name: Alice Mary Smith`,
+		`姓名：张三`,
+	} {
+		if !proofroomContainsResidualSensitiveText(input) {
+			t.Fatalf("residual detector missed %q", input)
+		}
+	}
+	if proofroomContainsResidualSensitiveText("API key rotation policy") {
+		t.Fatal("residual detector blocked an ordinary policy phrase")
+	}
+}
+
+func TestProofroomProjectionRedactsReviewerRegressionInEveryFreeTextField(t *testing.T) {
+	const reviewerText = `API key sklive123 and Name: Alice Smith`
+	_, audit := completedEvidenceAuditForProofroomTest(t)
+	audit.ClaimAudits[0].NormalizedStatement = reviewerText
+	audit.ClaimAudits[0].Limitations = []string{reviewerText}
+	audit.ClaimAudits[0].KnowledgeGaps = []string{reviewerText}
+	audit.ClaimAudits[0].ReviewActions = []string{reviewerText}
+	audit.Summary.Conclusion = reviewerText
+	audit.Summary.Limitations = []string{reviewerText}
+	audit.Proofroom.Title = reviewerText
+	audit.Proofroom.ReviewItems = []string{reviewerText}
+	finalized, err := FinalizeEvidenceAuditReport(audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := BuildProofroomEvidenceAuditProjection(finalized)
+	if err != nil {
+		t.Fatalf("BuildProofroomEvidenceAuditProjection() error = %v", err)
+	}
+	safeTexts := []ProofroomSafeText{
+		preview.Payload.Claims[0].NormalizedStatement,
+		preview.Payload.Claims[0].Limitations[0],
+		preview.Payload.Claims[0].KnowledgeGaps[0],
+		preview.Payload.Claims[0].ReviewActions[0],
+		preview.Payload.Summary.Conclusion,
+		preview.Payload.Summary.Limitations[0],
+		preview.Payload.Proofroom.Title,
+		preview.Payload.Proofroom.ReviewItems[0],
+	}
+	for index, safeText := range safeTexts {
+		if !safeText.Redacted || !strings.Contains(safeText.Text, "[REDACTED]") ||
+			strings.Contains(safeText.Text, "sklive123") ||
+			strings.Contains(safeText.Text, "Alice Smith") {
+			t.Fatalf("free text %d leaked reviewer regression: %#v", index, safeText)
+		}
+	}
+}
+
 func TestProofroomDeliveryIsExplicitIdempotentAndStoresPrivateImmutableReceipt(t *testing.T) {
 	store, audit := completedEvidenceAuditForProofroomTest(t)
 	var calls atomic.Int32

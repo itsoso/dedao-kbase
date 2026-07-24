@@ -852,24 +852,38 @@ func proofroomEndpointIdentity(endpoint *url.URL) string {
 	return scheme + "://" + net.JoinHostPort(host, port) + "/path/" + pathHash
 }
 
+const proofroomCredentialLabelPattern = `(?:api(?:[ _-]+key|key)|access(?:[ _-]+token|token)|refresh(?:[ _-]+token|token)|client(?:[ _-]+secret|secret)|csrf(?:[ _-]+token|token)?|password|session|cookie|authorization|token|secret)`
+
+var (
+	proofroomCredentialAssignmentPattern = regexp.MustCompile(
+		`(?i)["']?` + proofroomCredentialLabelPattern + `["']?[ \t]*(?:=|:)[ \t]*(?:"[^"\r\n]*"|'[^'\r\n]*'|(?:bearer|basic)[ \t]+[^&,\s;}\]]+|[^&,\s;}\]]+)`,
+	)
+	proofroomCredentialWhitespacePattern = regexp.MustCompile(
+		`(?i)\b` + proofroomCredentialLabelPattern + `\b[ \t]+(?:(?:bearer|basic)[ \t]+)?[^\s,;}\]]+`,
+	)
+	proofroomSafeCredentialPolicyPattern = regexp.MustCompile(`(?i)\bapi[ _-]+key[ \t]+rotation[ \t]+policy\b`)
+)
+
 var proofroomSensitivePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`),
 	regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[^\s,;]+`),
-	regexp.MustCompile(`(?i)["']?(?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|password|session|cookie|csrf|token|secret)["']?\s*(?:=|:)\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^&,\s;}\]]+)`),
+	proofroomCredentialAssignmentPattern,
 	regexp.MustCompile(`\b\d{17}[\dXx]\b`),
 	regexp.MustCompile(`\b1[3-9]\d{9}\b`),
 	regexp.MustCompile(`(?i)(?:\+?\d[\d .()-]{7,}\d)`),
-	regexp.MustCompile(`(?i:\bpatient(?:\s+name\s*[:=]?)?\s+)[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){0,5}\b`),
+	regexp.MustCompile(`(?i)["']?(?:patient(?:(?:[ _-]+name)|name)?|name)["']?(?:[ \t]*[:=][ \t]*|[ \t]+)(?:"[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,5}"|'[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,5}'|[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,5})`),
 	regexp.MustCompile(`(?:患者|病例|姓名)\s*(?:姓名\s*)?[:：=]?\s*[\p{Han}]{2,6}`),
 }
 
 var proofroomResidualSensitivePatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|password|session|cookie|csrf|token|secret)\b`),
+	proofroomCredentialAssignmentPattern,
+	proofroomCredentialWhitespacePattern,
+	regexp.MustCompile(`(?i)\b(?:token|secret)\b`),
 	regexp.MustCompile(`(?i)\b(?:bearer|basic)\b`),
 	regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`),
 	regexp.MustCompile(`\b\d{17}[\dXx]\b`),
 	regexp.MustCompile(`\b1[3-9]\d{9}\b`),
-	regexp.MustCompile(`(?i:\bpatient(?:\s+name\s*[:=]?)?\s+)[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){0,5}\b`),
+	regexp.MustCompile(`(?i)["']?(?:patient(?:(?:[ _-]+name)|name)?|name)["']?(?:[ \t]*[:=][ \t]*|[ \t]+)(?:"[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,5}"|'[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,5}'|[A-Z][A-Za-z'’-]*(?:[ \t]+[A-Z][A-Za-z'’-]*){0,5})`),
 	regexp.MustCompile(`(?:患者|病例|姓名)\s*(?:姓名\s*)?[:：=]?\s*[\p{Han}]{2,6}`),
 }
 
@@ -886,6 +900,13 @@ func proofroomMinimizeText(value string) (ProofroomSafeText, error) {
 			text = pattern.ReplaceAllString(text, "[REDACTED]")
 		}
 	}
+	text = proofroomCredentialWhitespacePattern.ReplaceAllStringFunc(text, func(match string) string {
+		if proofroomCredentialWhitespaceIsSafePolicy(match) {
+			return match
+		}
+		redacted = true
+		return "[REDACTED]"
+	})
 	text = strings.TrimSpace(text)
 	if len(text) > proofroomMaxSafeTextBytes {
 		text = text[:proofroomMaxSafeTextBytes]
@@ -913,12 +934,18 @@ func proofroomMinimizeTexts(values []string) ([]ProofroomSafeText, error) {
 }
 
 func proofroomContainsResidualSensitiveText(value string) bool {
+	value = proofroomSafeCredentialPolicyPattern.ReplaceAllString(value, "")
 	for _, pattern := range proofroomResidualSensitivePatterns {
 		if pattern.MatchString(value) {
 			return true
 		}
 	}
 	return false
+}
+
+func proofroomCredentialWhitespaceIsSafePolicy(value string) bool {
+	normalized := strings.NewReplacer("_", " ", "-", " ").Replace(strings.ToLower(strings.TrimSpace(value)))
+	return normalized == "api key rotation"
 }
 
 func validProofroomEndpointIdentity(identity string) bool {
