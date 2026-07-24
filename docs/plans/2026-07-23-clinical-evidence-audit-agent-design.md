@@ -161,6 +161,32 @@ Proofroom receives structured claim, verdict, evidence-reference, limitation,
 and requested-action data. It does not receive unrestricted source bodies.
 Delivery is explicit, idempotent, and auditable.
 
+The `proofroom-evidence-audit.v1` projection is rebuilt only from a completed,
+validated, content-addressed Audit. It preserves claim, normalized statement,
+verdict, computed confidence, pinned Release/hash/publication/claim/chunk/
+citation/freshness evidence identity, limitations, gaps, actions, Trace, Package,
+and Audit identity. Subject and scope are represented only by domain-separated
+SHA-256 identities; source bodies, prompts, credentials, and personal text are
+excluded. `GET /api/agent-audits/{audit_id}/proofroom` is a pure preview and
+returns the payload hash plus a readable summary without writing state or
+calling Proofroom.
+
+Delivery occurs only through an authenticated
+`POST /api/agent-audits/{audit_id}/proofroom` with `Idempotency-Key`. The
+endpoint and credential are environment-only server configuration. Delivery
+receipts are immutable, content-addressed private files; a global opaque
+idempotency identity prevents one key from accepting different projections.
+Cross-process locking serializes delivery. Transport or invalid-response
+outcomes are recorded as unknown and cannot be posted again until an operator
+explicitly confirms non-delivery with the same endpoint, idempotency key, and
+`Proofroom-Delivery-Resolution: confirmed_not_delivered` header. Proofroom
+remains the final adjudication authority.
+
+Production delivery requires HTTPS, rejects URL credentials and fragments,
+blocks loopback/private addresses before and during dialing, and applies the
+same policy to redirects. Local HTTP/private addresses require the explicit
+test-only hook and an injected client.
+
 Health does not consume this Agent in the first release. Medical-domain review,
 freshness requirements, patient context, diagnosis, and treatment boundaries
 remain owned by Health and require a separate evidence-only package.

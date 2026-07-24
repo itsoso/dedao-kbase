@@ -49,6 +49,7 @@ type KBaseHTTPConfig struct {
 	AuditRetryTTL           time.Duration
 	AuditNow                func() time.Time
 	AuditLogger             func(EvidenceAuditHTTPLogEvent)
+	ProofroomDelivery       *ProofroomDeliveryService
 }
 
 type EvidenceAuditHTTPLogEvent struct {
@@ -98,6 +99,7 @@ type kbaseHTTPHandler struct {
 	auditRetryTTL           time.Duration
 	auditNow                func() time.Time
 	auditLogger             func(EvidenceAuditHTTPLogEvent)
+	proofroomDelivery       *ProofroomDeliveryService
 }
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
@@ -197,6 +199,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		auditRetryTTL:           auditRetryTTL,
 		auditNow:                auditNow,
 		auditLogger:             auditLogger,
+		proofroomDelivery:       cfg.ProofroomDelivery,
 	}
 }
 
@@ -1443,6 +1446,18 @@ func (h *kbaseHTTPHandler) handleEvidenceAudits(w http.ResponseWriter, r *http.R
 		return
 	}
 	remainder := strings.TrimPrefix(r.URL.Path, prefix)
+	if strings.HasSuffix(remainder, "/proofroom") {
+		rawID := strings.TrimSuffix(remainder, "/proofroom")
+		if rawID == "" || strings.Contains(rawID, "/") {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "audit_not_found",
+				"evidence audit not found", "proofroom_projection", nil,
+			)
+			return
+		}
+		h.handleEvidenceAuditProofroom(w, r, rawID)
+		return
+	}
 	if strings.HasSuffix(remainder, "/retry") {
 		rawID := strings.TrimSuffix(remainder, "/retry")
 		if rawID == "" || strings.Contains(rawID, "/") {
@@ -1493,6 +1508,149 @@ func (h *kbaseHTTPHandler) handleEvidenceAudits(w http.ResponseWriter, r *http.R
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, audit)
+}
+
+func (h *kbaseHTTPHandler) handleEvidenceAuditProofroom(
+	w http.ResponseWriter,
+	r *http.Request,
+	rawAuditID string,
+) {
+	auditID, err := url.PathUnescape(rawAuditID)
+	if err != nil || strings.TrimSpace(auditID) == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid audit_id", "proofroom_projection", nil,
+		)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		preview, err := PreviewEvidenceAuditProofroom(h.store, auditID)
+		if err != nil {
+			h.writeProofroomHTTPError(w, "preview", err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, preview)
+	case http.MethodPost:
+		if h.proofroomDelivery == nil {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusServiceUnavailable, "proofroom_unconfigured",
+				"Proofroom delivery is not configured", "proofroom_delivery", nil,
+			)
+			return
+		}
+		if r.ContentLength != 0 {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusRequestEntityTooLarge, "proofroom_request_body_not_allowed",
+				"Proofroom delivery request body is not allowed", "proofroom_delivery", nil,
+			)
+			return
+		}
+		idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if idempotencyKey == "" {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusBadRequest, "proofroom_idempotency_key_required",
+				"Idempotency-Key header is required", "proofroom_delivery", nil,
+			)
+			return
+		}
+		if resolution := strings.TrimSpace(r.Header.Get("Proofroom-Delivery-Resolution")); resolution != "" {
+			if resolution != ProofroomCoordinationConfirmedNotDelivered {
+				h.writeEvidenceAuditHTTPError(
+					w, http.StatusBadRequest, "proofroom_coordination_invalid",
+					"invalid Proofroom delivery resolution", "proofroom_coordination", nil,
+				)
+				return
+			}
+			if err := CoordinateProofroomDelivery(
+				h.store, auditID, idempotencyKey, resolution, h.auditNow(),
+			); err != nil {
+				h.writeProofroomHTTPError(w, "coordination", err)
+				return
+			}
+			writeHTTPJSON(w, http.StatusOK, map[string]any{
+				"coordinated": true, "resolution": resolution,
+			})
+			return
+		}
+		receipt, created, err := h.proofroomDelivery.Deliver(
+			r.Context(), h.store, auditID, idempotencyKey,
+		)
+		if err != nil {
+			h.writeProofroomHTTPError(w, "delivery", err)
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "receipt": receipt})
+	default:
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "proofroom_projection", nil,
+		)
+	}
+}
+
+func (h *kbaseHTTPHandler) writeProofroomHTTPError(w http.ResponseWriter, operation string, err error) {
+	var remoteError *ProofroomRemoteError
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "audit_not_found",
+			"evidence audit not found", "proofroom_"+operation, nil,
+		)
+	case errors.Is(err, ErrProofroomAuditNotReady):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusConflict, "proofroom_audit_not_ready",
+			"evidence audit is not ready for Proofroom", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomAuditInvalid):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnprocessableEntity, "proofroom_audit_invalid",
+			"evidence audit failed Proofroom projection validation", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryConflict):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusConflict, "proofroom_idempotency_conflict",
+			"idempotency key conflicts with a different projection", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryOutcomeUnknown):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadGateway, "proofroom_outcome_unknown",
+			"Proofroom delivery outcome is unknown and requires explicit coordination",
+			"proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryRejected):
+		if errors.As(err, &remoteError) {
+			h.auditLogger(EvidenceAuditHTTPLogEvent{
+				Operation: "proofroom_" + operation,
+				Code:      "proofroom_remote_rejected",
+				Cause:     sanitizeEvidenceAuditHTTPLogCause(err.Error()),
+			})
+			writeHTTPJSON(w, http.StatusBadGateway, map[string]any{
+				"code":          "proofroom_remote_rejected",
+				"error":         "Proofroom rejected the delivery",
+				"remote_status": remoteError.StatusCode,
+			})
+			return
+		}
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadGateway, "proofroom_remote_rejected",
+			"Proofroom rejected the delivery", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryUnconfigured):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusServiceUnavailable, "proofroom_unconfigured",
+			"Proofroom delivery is not configured", "proofroom_"+operation, nil,
+		)
+	default:
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusInternalServerError, "proofroom_delivery_unavailable",
+			"Proofroom delivery is unavailable", "proofroom_"+operation, err,
+		)
+	}
 }
 
 func (h *kbaseHTTPHandler) handleEvidenceAuditRetry(w http.ResponseWriter, r *http.Request, rawAuditID string) {

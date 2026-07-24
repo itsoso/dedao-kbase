@@ -372,3 +372,41 @@ func TestNewEvidenceAuditServerRuntimeReturnsDiagnosticWhenTokenPlanMissing(t *t
 		t.Fatalf("unavailable reason = %q", runtime.UnavailableReason)
 	}
 }
+
+func TestProofroomDeliveryRuntimeUsesEnvironmentOnlyConfiguration(t *testing.T) {
+	t.Setenv("KBASE_PROOFROOM_ENDPOINT", "")
+	t.Setenv("KBASE_PROOFROOM_TOKEN", "")
+	service, reason := newProofroomDeliveryRuntime()
+	if service != nil || !strings.Contains(reason, "KBASE_PROOFROOM_ENDPOINT") {
+		t.Fatalf("missing runtime service=%v reason=%q", service, reason)
+	}
+
+	t.Setenv("KBASE_PROOFROOM_ENDPOINT", "http://proofroom.example.test/deliver")
+	t.Setenv("KBASE_PROOFROOM_TOKEN", "remote-secret")
+	service, reason = newProofroomDeliveryRuntime()
+	if service != nil || !strings.Contains(reason, "https") {
+		t.Fatalf("unsafe runtime service=%v reason=%q", service, reason)
+	}
+
+	t.Setenv("KBASE_PROOFROOM_ENDPOINT", "https://proofroom.example.test/deliver")
+	t.Setenv("KBASE_PROOFROOM_TOKEN", "remote-secret")
+	t.Setenv("KBASE_PROOFROOM_TIMEOUT_SECONDS", "17")
+	service, reason = newProofroomDeliveryRuntime()
+	if service == nil || reason != "" {
+		t.Fatalf("configured runtime service=%v reason=%q", service, reason)
+	}
+}
+
+func TestProofroomDeliveryTimeoutEnvironmentIsStrictAndBounded(t *testing.T) {
+	t.Setenv("KBASE_PROOFROOM_TIMEOUT_SECONDS", "")
+	timeout, err := proofroomDeliveryTimeout()
+	if err != nil || timeout != 20*time.Second {
+		t.Fatalf("default timeout=%s err=%v", timeout, err)
+	}
+	for _, value := range []string{"0", "invalid", "121"} {
+		t.Setenv("KBASE_PROOFROOM_TIMEOUT_SECONDS", value)
+		if _, err := proofroomDeliveryTimeout(); err == nil {
+			t.Fatalf("timeout accepted %q", value)
+		}
+	}
+}

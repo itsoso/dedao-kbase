@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -447,6 +449,202 @@ func TestKBaseHTTPHandlerEvidenceAuditIdempotencyConflictAndManualRetry(t *testi
 	}
 }
 
+func TestKBaseHTTPHandlerProofroomPreviewIsReadOnlyAndDeliveryIsExplicit(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(
+				http.StatusOK,
+				`{"receipt_id":"proofroom-http-1","status":"accepted"}`,
+			), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	preview := requestKBase(handler, http.MethodGet, path, "consumer-a")
+	if preview.Code != http.StatusOK ||
+		!strings.Contains(preview.Body.String(), `"payload_hash":"sha256:`) ||
+		!strings.Contains(preview.Body.String(), `"adjudication_authority":"proofroom"`) {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("preview called remote %d times", calls.Load())
+	}
+	if _, err := os.Stat(store.EvidenceAuditProofroomDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preview wrote receipt state: %v", err)
+	}
+
+	missingKey := requestKBase(handler, http.MethodPost, path, "consumer-a")
+	if missingKey.Code != http.StatusBadRequest ||
+		!strings.Contains(missingKey.Body.String(), `"code":"proofroom_idempotency_key_required"`) {
+		t.Fatalf("missing key status=%d body=%s", missingKey.Code, missingKey.Body.String())
+	}
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	request.Header.Set("Idempotency-Key", "proofroom-http-key")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated ||
+		!strings.Contains(response.Body.String(), `"created":true`) ||
+		!strings.Contains(response.Body.String(), `"remote_receipt_id":"proofroom-http-1"`) {
+		t.Fatalf("delivery status=%d body=%s", response.Code, response.Body.String())
+	}
+	replay := httptest.NewRequest(http.MethodPost, path, nil)
+	replay.Header.Set("Authorization", "Bearer consumer-a")
+	replay.Header.Set("Idempotency-Key", "proofroom-http-key")
+	replayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusOK ||
+		!strings.Contains(replayResponse.Body.String(), `"created":false`) ||
+		calls.Load() != 1 {
+		t.Fatalf("replay status=%d calls=%d body=%s",
+			replayResponse.Code, calls.Load(), replayResponse.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomDeliveryErrorsAreStable(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	unconfigured := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a",
+	})
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	request.Header.Set("Idempotency-Key", "proofroom-key")
+	response := httptest.NewRecorder()
+	unconfigured.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"proofroom_unconfigured"`) {
+		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, test := range []struct {
+		name       string
+		client     ProofroomHTTPClient
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "remote rejection",
+			client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+				return proofroomJSONResponse(http.StatusUnprocessableEntity, `{"error":"rejected"}`), nil
+			}),
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "proofroom_remote_rejected",
+		},
+		{
+			name: "unknown transport outcome",
+			client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "proofroom_outcome_unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testStore, testAudit := completedEvidenceAuditForProofroomTest(t)
+			service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+				Endpoint: "https://proofroom.example.test/deliver",
+				Token:    "remote-secret", Client: test.client,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store: testStore, AuthToken: "consumer-a", ProofroomDelivery: service,
+			})
+			testRequest := httptest.NewRequest(
+				http.MethodPost,
+				"/api/agent-audits/"+testAudit.AuditID+"/proofroom",
+				nil,
+			)
+			testRequest.Header.Set("Authorization", "Bearer consumer-a")
+			testRequest.Header.Set("Idempotency-Key", "proofroom-error-key")
+			testResponse := httptest.NewRecorder()
+			handler.ServeHTTP(testResponse, testRequest)
+			if testResponse.Code != test.wantStatus ||
+				!strings.Contains(testResponse.Body.String(), `"code":"`+test.wantCode+`"`) ||
+				strings.Contains(testResponse.Body.String(), "remote-secret") {
+				t.Fatalf("status=%d body=%s", testResponse.Code, testResponse.Body.String())
+			}
+			if test.name == "remote rejection" &&
+				!strings.Contains(testResponse.Body.String(), `"remote_status":422`) {
+				t.Fatalf("remote status is not visible: %s", testResponse.Body.String())
+			}
+			replay := httptest.NewRecorder()
+			handler.ServeHTTP(replay, testRequest.Clone(context.Background()))
+			if replay.Code != test.wantStatus ||
+				!strings.Contains(replay.Body.String(), `"code":"`+test.wantCode+`"`) {
+				t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+			}
+			if test.name == "remote rejection" &&
+				!strings.Contains(replay.Body.String(), `"remote_status":422`) {
+				t.Fatalf("replayed remote status is not visible: %s", replay.Body.String())
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomUnknownRequiresExplicitCoordination(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return nil, context.DeadlineExceeded
+			}
+			return proofroomJSONResponse(
+				http.StatusOK, `{"receipt_id":"coordinated","status":"accepted"}`,
+			), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	send := func(resolution string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, nil)
+		request.Header.Set("Authorization", "Bearer consumer-a")
+		request.Header.Set("Idempotency-Key", "coordinate-key")
+		if resolution != "" {
+			request.Header.Set("Proofroom-Delivery-Resolution", resolution)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if first := send(""); first.Code != http.StatusBadGateway ||
+		!strings.Contains(first.Body.String(), `"code":"proofroom_outcome_unknown"`) {
+		t.Fatalf("unknown status=%d body=%s", first.Code, first.Body.String())
+	}
+	if replay := send(""); replay.Code != http.StatusBadGateway || calls.Load() != 1 {
+		t.Fatalf("automatic replay status=%d calls=%d body=%s",
+			replay.Code, calls.Load(), replay.Body.String())
+	}
+	if coordinated := send(ProofroomCoordinationConfirmedNotDelivered); coordinated.Code != http.StatusOK ||
+		!strings.Contains(coordinated.Body.String(), `"coordinated":true`) {
+		t.Fatalf("coordination status=%d body=%s", coordinated.Code, coordinated.Body.String())
+	}
+	if delivered := send(""); delivered.Code != http.StatusCreated || calls.Load() != 2 {
+		t.Fatalf("post-coordinate status=%d calls=%d body=%s",
+			delivered.Code, calls.Load(), delivered.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerRejectsForgedAndExpiredRetryGrants(t *testing.T) {
 	now := testAgentPackageTime()
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
@@ -580,6 +778,7 @@ func TestKBaseHTTPHandlerAllEvidenceAuditMethodErrorsUseStableResponse(t *testin
 		"/api/agent-audits",
 		"/api/agent-audits/audit-1",
 		"/api/agent-audits/audit-1/retry",
+		"/api/agent-audits/audit-1/proofroom",
 		"/api/agent-packages/pkg/audits?version=2.0.0",
 	} {
 		response := requestKBase(handler, http.MethodDelete, path, "consumer-a")

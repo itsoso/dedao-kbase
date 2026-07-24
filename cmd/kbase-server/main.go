@@ -55,6 +55,7 @@ func main() {
 		log.Printf("evidence audit retry disabled: %v", retrySigningErr)
 		retrySigningKey = nil
 	}
+	proofroomDelivery, proofroomUnavailableReason := newProofroomDeliveryRuntime()
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:                  bookStore,
@@ -75,6 +76,7 @@ func main() {
 			log.Printf("evidence audit HTTP error: operation=%s code=%s cause=%s",
 				event.Operation, event.Code, event.Cause)
 		},
+		ProofroomDelivery: proofroomDelivery,
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
@@ -106,6 +108,11 @@ func main() {
 		log.Printf("evidence audits disabled: %s", auditRuntime.UnavailableReason)
 	} else {
 		log.Printf("evidence audits enabled: workers=%d queue=%d", evidenceAuditWorkerCount(), evidenceAuditQueueSize())
+	}
+	if proofroomDelivery == nil {
+		log.Printf("Proofroom delivery disabled: %s", proofroomUnavailableReason)
+	} else {
+		log.Printf("Proofroom explicit delivery enabled")
 	}
 	var schedulerDone <-chan struct{}
 	if scheduler, schedulerErr := app.NewSourceScheduler(sourceSync, time.Now); schedulerErr != nil {
@@ -149,6 +156,31 @@ func main() {
 type evidenceAuditServerRuntime struct {
 	Coordinator       *app.EvidenceAuditCoordinator
 	UnavailableReason string
+}
+
+func newProofroomDeliveryRuntime() (*app.ProofroomDeliveryService, string) {
+	endpoint := strings.TrimSpace(os.Getenv("KBASE_PROOFROOM_ENDPOINT"))
+	token := strings.TrimSpace(os.Getenv("KBASE_PROOFROOM_TOKEN"))
+	if endpoint == "" || token == "" {
+		return nil, "configure KBASE_PROOFROOM_ENDPOINT and KBASE_PROOFROOM_TOKEN"
+	}
+	timeout, err := proofroomDeliveryTimeout()
+	if err != nil {
+		return nil, err.Error()
+	}
+	service, err := app.NewProofroomDeliveryService(app.ProofroomDeliveryConfig{
+		Endpoint: endpoint,
+		Token:    token,
+		Timeout:  timeout,
+	})
+	if err != nil {
+		return nil, err.Error()
+	}
+	return service, ""
+}
+
+func proofroomDeliveryTimeout() (time.Duration, error) {
+	return strictDurationEnvironment("KBASE_PROOFROOM_TIMEOUT_SECONDS", 20, 120)
 }
 
 func newEvidenceAuditServerRuntime(
