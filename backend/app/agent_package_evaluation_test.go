@@ -364,6 +364,10 @@ func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeSto
 	t.Helper()
 	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	suite := loadAgentEvaluationFixture(t)
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		auditSuite := evidenceAuditEvaluationSuite(t, pkg)
+		suite.Cases = append(suite.Cases, auditSuite.Cases...)
+	}
 	for index := range suite.Cases {
 		if len(suite.Cases[index].ProposedArguments) > 0 {
 			for _, arguments := range []map[string]string{

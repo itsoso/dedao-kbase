@@ -77,6 +77,55 @@ func TestAgentPackageV2RequiresEvidencePolicyAndKeepsV1Compatible(t *testing.T) 
 	}
 }
 
+func TestAgentPackageV2RequiresEvidenceAuditEvaluationThresholds(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	saveAgentPackageSupportingRelease(t, store)
+
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(v1, store, AgentReadOnlyToolIDs()); err != nil {
+		t.Fatalf("v1 package should not require evidence audit thresholds: %v", err)
+	}
+
+	required := []string{
+		"adjudication_consistency",
+		"source_independence",
+		"conflict_detection",
+		"report_citation_completeness",
+		"safe_insufficiency",
+		"proofroom_projection_completeness",
+	}
+	for _, missing := range required {
+		t.Run(missing, func(t *testing.T) {
+			pkg := validAgentPackageV2()
+			delete(pkg.EvaluationPolicy.MinimumScores, missing)
+			finalized, err := FinalizeAgentPackage(pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs())
+			if err == nil || !strings.Contains(err.Error(), missing) {
+				t.Fatalf("missing threshold %q error = %v", missing, err)
+			}
+		})
+	}
+
+	pkg := validAgentPackageV2()
+	pkg.EvaluationPolicy.MinimumScores["safe_insufficiency"] = 0
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs()); err == nil ||
+		!strings.Contains(err.Error(), "safe_insufficiency") ||
+		!strings.Contains(err.Error(), "greater than zero") {
+		t.Fatalf("zero evidence audit threshold error = %v", err)
+	}
+}
+
 func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
@@ -604,7 +653,7 @@ func validAgentPackage() AgentPackage {
 		LifecycleState: AgentPackageDraft,
 		Releases: []AgentPackageReleaseRef{{
 			ReleaseID:   "release-1",
-			ContentHash: "sha256:release-content",
+			ContentHash: sha256Fingerprint([]byte("synthetic-release-content")),
 			CitationIDs: []string{"citation-1"},
 		}},
 		RetrievalPolicy: AgentPackageRetrievalPolicy{
@@ -662,7 +711,7 @@ func validAgentPackageV2() AgentPackage {
 	pkg.Version = "2.0.0"
 	pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
 		ReleaseID:   "release-2",
-		ContentHash: "sha256:supporting-release-content",
+		ContentHash: sha256Fingerprint([]byte("synthetic-supporting-release-content")),
 		CitationIDs: []string{"citation-2"},
 	})
 	pkg.EvidencePolicy = &AgentPackageEvidencePolicy{
@@ -684,6 +733,9 @@ func validAgentPackageV2() AgentPackage {
 			RequirePublicationDate: true,
 		},
 		ReportSchema: AgentEvidenceReportSchemaV1,
+	}
+	for _, metric := range evidenceAuditEvaluationMetrics {
+		pkg.EvaluationPolicy.MinimumScores[metric] = 1
 	}
 	return pkg
 }
@@ -717,7 +769,7 @@ func saveAgentPackageSupportingReleaseWithIdentity(
 	release.ReleaseID = releaseID
 	release.BookID = bookID
 	if releaseID == "release-2" {
-		release.ContentHash = "sha256:supporting-release-content"
+		release.ContentHash = sha256Fingerprint([]byte("synthetic-supporting-release-content"))
 	} else {
 		release.ContentHash = "sha256:" + releaseID + "-content"
 	}
@@ -745,7 +797,7 @@ func agentPackageTestRelease() KnowledgeRelease {
 		Version:       "1",
 		ReleaseID:     "release-1",
 		BookID:        "book-1",
-		ContentHash:   "sha256:release-content",
+		ContentHash:   sha256Fingerprint([]byte("synthetic-release-content")),
 		UsagePolicy:   BookUsageStandard,
 		Book:          BookKnowledgeBook{BookID: "book-1", Title: "Synthetic Book", SourceType: "dedao_ebook"},
 		Analysis: &BookAnalysisPayload{

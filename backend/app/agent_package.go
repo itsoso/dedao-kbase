@@ -212,7 +212,7 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	if err := validateAgentPackageSafety(pkg.SafetyPolicy); err != nil {
 		return err
 	}
-	if err := validateAgentPackageEvaluation(pkg.EvaluationPolicy); err != nil {
+	if err := validateAgentPackageEvaluation(pkg.SchemaVersion, pkg.EvaluationPolicy); err != nil {
 		return err
 	}
 	if err := validateAgentPackageUI(pkg.UIManifest); err != nil {
@@ -344,7 +344,7 @@ func validateAgentPackageSafety(policy AgentPackageSafetyPolicy) error {
 	return nil
 }
 
-func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
+func validateAgentPackageEvaluation(schemaVersion string, policy AgentPackageEvaluationPolicy) error {
 	if strings.TrimSpace(policy.SuiteVersion) == "" {
 		return fmt.Errorf("evaluation_policy.suite_version is required")
 	}
@@ -357,6 +357,20 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 	} {
 		if _, ok := policy.MinimumScores[metric]; !ok {
 			return fmt.Errorf("required evaluation metric %q is missing", metric)
+		}
+	}
+	if schemaVersion == AgentPackageSchemaVersionV2 {
+		for _, metric := range []string{
+			"adjudication_consistency",
+			"source_independence",
+			"conflict_detection",
+			"report_citation_completeness",
+			"safe_insufficiency",
+			"proofroom_projection_completeness",
+		} {
+			if _, ok := policy.MinimumScores[metric]; !ok {
+				return fmt.Errorf("required evaluation metric %q is missing", metric)
+			}
 		}
 	}
 	for metric, threshold := range policy.MinimumScores {

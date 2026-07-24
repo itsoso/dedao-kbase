@@ -42,6 +42,7 @@ type AgentEvaluationCase struct {
 	MaxLatencyMS      int               `json:"max_latency_ms,omitempty"`
 	RecordedLatencyMS int               `json:"recorded_latency_ms,omitempty"`
 	MaxCostUSD        float64           `json:"max_cost_usd,omitempty"`
+	EvidenceAudit     *EvidenceAudit    `json:"evidence_audit,omitempty"`
 }
 
 type AgentEvaluationReport struct {
@@ -128,6 +129,9 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 }
 
 func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
+	if isEvidenceAuditEvaluationMetric(evalCase.Metric) {
+		return executeEvidenceAuditEvaluationCase(pkg, evalCase)
+	}
 	input := strings.TrimSpace(evalCase.Input)
 	if input == "" {
 		return false, fmt.Errorf("input is required for behavioral metric %q", evalCase.Metric)
@@ -251,6 +255,178 @@ func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, eva
 	default:
 		return false, fmt.Errorf("unsupported behavioral metric %q", evalCase.Metric)
 	}
+}
+
+func isEvidenceAuditEvaluationMetric(metric string) bool {
+	switch metric {
+	case "adjudication_consistency",
+		"source_independence",
+		"conflict_detection",
+		"report_citation_completeness",
+		"safe_insufficiency",
+		"proofroom_projection_completeness":
+		return true
+	default:
+		return false
+	}
+}
+
+func executeEvidenceAuditEvaluationCase(pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
+	if evalCase.EvidenceAudit == nil {
+		return false, fmt.Errorf("evidence_audit is required for behavioral metric %q", evalCase.Metric)
+	}
+	audit := *evalCase.EvidenceAudit
+	if !evidenceAuditMatchesEvaluationPackage(pkg, audit) || ValidateEvidenceAudit(audit) != nil {
+		return false, nil
+	}
+
+	switch evalCase.Metric {
+	case "adjudication_consistency":
+		expected := strings.TrimSpace(evalCase.ExpectedValue)
+		if expected == "" {
+			return true, nil
+		}
+		for _, claim := range audit.ClaimAudits {
+			if claim.Verdict == expected {
+				return true, nil
+			}
+		}
+		return false, nil
+	case "source_independence":
+		for _, claim := range audit.ClaimAudits {
+			if claim.Verdict == EvidenceAuditVerdictInsufficient {
+				continue
+			}
+			publications := map[string]struct{}{}
+			for _, evidence := range claim.Evidence {
+				if evidence.Role == EvidenceAuditReleaseSupporting {
+					publications[strings.TrimSpace(evidence.PublicationIdentity)] = struct{}{}
+				}
+			}
+			if len(publications) < audit.EvidencePolicy.MinimumIndependentSources {
+				return false, nil
+			}
+		}
+		return true, nil
+	case "conflict_detection":
+		detected := false
+		for _, claim := range audit.ClaimAudits {
+			hasConflict := false
+			for _, evidence := range claim.Evidence {
+				hasConflict = hasConflict || evidence.Conflict
+			}
+			if hasConflict {
+				detected = true
+				if claim.Verdict != EvidenceAuditVerdictMixed &&
+					claim.Verdict != EvidenceAuditVerdictContradicted {
+					return false, nil
+				}
+			}
+			if claim.Verdict == EvidenceAuditVerdictMixed && !hasConflict {
+				return false, nil
+			}
+		}
+		switch strings.TrimSpace(evalCase.ExpectedValue) {
+		case "":
+			return true, nil
+		case "detected":
+			return detected, nil
+		case "none":
+			return !detected, nil
+		default:
+			return false, nil
+		}
+	case "report_citation_completeness":
+		return evidenceAuditCitationsComplete(audit), nil
+	case "safe_insufficiency":
+		found := false
+		for _, claim := range audit.ClaimAudits {
+			if claim.Verdict != EvidenceAuditVerdictInsufficient {
+				continue
+			}
+			found = true
+			if len(claim.Limitations) == 0 || len(claim.KnowledgeGaps) == 0 ||
+				len(claim.ReviewActions) == 0 {
+				return false, nil
+			}
+			publications := map[string]struct{}{}
+			for _, evidence := range claim.Evidence {
+				if evidence.Role == EvidenceAuditReleaseSupporting {
+					publications[strings.TrimSpace(evidence.PublicationIdentity)] = struct{}{}
+				}
+			}
+			if len(publications) >= audit.EvidencePolicy.MinimumIndependentSources {
+				return false, nil
+			}
+		}
+		return found, nil
+	case "proofroom_projection_completeness":
+		preview, err := BuildProofroomEvidenceAuditProjection(audit)
+		if err != nil {
+			return false, nil
+		}
+		return preview.Payload.Audit.AuditID == audit.AuditID &&
+			preview.Payload.Audit.InputHash == audit.InputHash &&
+			preview.Payload.Audit.OutputHash == audit.OutputHash &&
+			preview.Payload.Package == audit.Package &&
+			len(preview.Payload.Claims) == len(audit.ClaimAudits) &&
+			len(preview.Payload.Proofroom.ReviewItems) == len(audit.Proofroom.ReviewItems), nil
+	default:
+		return false, fmt.Errorf("unsupported evidence audit metric %q", evalCase.Metric)
+	}
+}
+
+func evidenceAuditMatchesEvaluationPackage(pkg AgentPackage, audit EvidenceAudit) bool {
+	if audit.Package.PackageID != pkg.PackageID ||
+		audit.Package.Version != pkg.Version ||
+		audit.Package.ContentHash != pkg.ContentHash {
+		return false
+	}
+	packageReleases := make(map[string]AgentPackageReleaseRef, len(pkg.Releases))
+	for _, release := range pkg.Releases {
+		packageReleases[release.ReleaseID] = release
+	}
+	roles := make(map[string]string)
+	if pkg.EvidencePolicy != nil {
+		for _, role := range pkg.EvidencePolicy.ReleaseRoles {
+			roles[role.ReleaseID] = role.Role
+		}
+	}
+	for _, release := range audit.Releases {
+		pinned, ok := packageReleases[release.ReleaseID]
+		if !ok || pinned.ContentHash != release.ContentHash || roles[release.ReleaseID] != release.Role {
+			return false
+		}
+		allowed := stringBoolSet(pinned.CitationIDs...)
+		for _, citation := range release.Citations {
+			if !allowed[citation.CitationID] {
+				return false
+			}
+		}
+	}
+	return len(audit.Releases) == len(packageReleases)
+}
+
+func evidenceAuditCitationsComplete(audit EvidenceAudit) bool {
+	releases := make(map[string]EvidenceAuditReleaseRef, len(audit.Releases))
+	for _, release := range audit.Releases {
+		releases[release.ReleaseID] = release
+	}
+	for _, claim := range audit.ClaimAudits {
+		if claim.Verdict != EvidenceAuditVerdictInsufficient && len(claim.Evidence) == 0 {
+			return false
+		}
+		for _, evidence := range claim.Evidence {
+			release, ok := releases[evidence.ReleaseID]
+			if !ok || release.ContentHash != evidence.ContentHash ||
+				release.Role != evidence.Role || release.SourceType != evidence.SourceType ||
+				release.PublicationIdentity != evidence.PublicationIdentity ||
+				!evidenceAuditReleaseAllowsCitation(release, evidence) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 type agentEvaluationModelClient struct {
