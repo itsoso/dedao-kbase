@@ -14,7 +14,14 @@ import (
 	"time"
 )
 
-const evidenceAuditModelOutputSchema = "evidence-audit-model.v1"
+const (
+	evidenceAuditModelOutputSchema         = "evidence-audit-model.v1"
+	evidenceAuditModelSystemPromptTemplate = "Return one strict JSON object for schema {{schema}}. " +
+		"Use only the listed pinned evidence. candidate_verdict is advisory; code decides the final verdict. " +
+		"Evidence stance must be supports or contradicts. Do not provide diagnosis, treatment, or individual medical advice."
+	evidenceAuditModelUserPromptTemplate = "Source claim: {{source_claim}}\n" +
+		"Pinned supporting evidence (metadata and statements only):\n{{evidence}}"
+)
 
 var ErrEvidenceAuditModelOutcomeUnknown = errors.New("model_outcome_unknown: requires_manual_retry")
 
@@ -24,13 +31,26 @@ var (
 	evidenceAuditDecisionSubjectPattern = regexp.MustCompile(
 		`(?i)\b(?:should|can|could|would)\s+([a-z][a-z'-]*)`,
 	)
+	evidenceAuditEnglishPICOPattern = regexp.MustCompile(
+		`(?i)\bin\s+(?:adults|patients|children|participants)\s+with\s+[^?]{1,180},\s*does\s+[^?]{1,180}\s+(?:improve|reduce|increase|affect|prevent)\s+[^?]{1,180}\s+compared\s+with\s+[^?]{1,180}\??$`,
+	)
+	evidenceAuditChineseIndividualDecisionPattern = regexp.MustCompile(
+		`[\p{Han}]{2,4}(?:做|接受|进行|使用|服用).{0,30}(?:手术|治疗|检查|药).{0,20}(?:合适|应该|可以|是否|吗)`,
+	)
+	evidenceAuditEnglishNamedDecisionPattern = regexp.MustCompile(
+		`(?i)\b(?:appropriate|suitable|right|recommended)\s+for\s+[A-Z][a-z'-]+\b|\bshould\s+[A-Z][a-z'-]+\b`,
+	)
 )
 
 type EvidenceAuditRunnerConfig struct {
 	ModelConfig BookTokenPlanConfig
 	Timeout     time.Duration
-	Now         func() time.Time
-	observer    *evidenceAuditObserver
+	// BootstrapTimeout bounds loading the audit and its runtime descriptor when
+	// Timeout is not explicitly supplied. The package timeout starts after the
+	// descriptor has been validated and covers the remaining workflow.
+	BootstrapTimeout time.Duration
+	Now              func() time.Time
+	observer         *evidenceAuditObserver
 }
 
 var evidenceAuditRuntimeStageHook = func(context.Context, string) error { return nil }
@@ -135,7 +155,7 @@ func (o *evidenceAuditObserver) snapshot(traceOutcome string) *AgentTraceObserva
 		Stages: stages, CitationResolutionRate: rate,
 		IndependentPublicationSourceCount: len(o.publications),
 		AbstentionReason:                  reason, Usage: o.usage,
-		TerminalProtocol: "prepared-report-trace-then-audit-publish.v1",
+		TerminalProtocol: "prepared-report-trace-receipt-audit-publish.v2",
 	}
 }
 
@@ -310,14 +330,17 @@ func RunEvidenceAudit(
 		return nil, fmt.Errorf("evidence audit store is required")
 	}
 	startedAt := time.Now()
-	runCtx := ctx
-	cancel := func() {}
-	if config.Timeout > 0 {
-		runCtx, cancel = context.WithDeadline(ctx, startedAt.Add(config.Timeout))
+	bootstrapTimeout := config.BootstrapTimeout
+	if bootstrapTimeout <= 0 {
+		bootstrapTimeout = 30 * time.Second
 	}
-	defer cancel()
-	if err := evidenceAuditRunnerStage(runCtx, "load"); err != nil {
-		return nil, err
+	runCtx, bootstrapCancel := context.WithTimeout(ctx, bootstrapTimeout)
+	defer bootstrapCancel()
+	if config.Timeout > 0 {
+		bootstrapCancel()
+		var explicitCancel context.CancelFunc
+		runCtx, explicitCancel = context.WithDeadline(ctx, startedAt.Add(config.Timeout))
+		defer explicitCancel()
 	}
 	auditID = strings.TrimSpace(auditID)
 	audit, err := store.LoadEvidenceAudit(auditID)
@@ -326,32 +349,59 @@ func RunEvidenceAudit(
 	}
 	config.observer = newEvidenceAuditObserver(config)
 	config.observer.begin("package_validation")
-	descriptor, err := store.LoadAgentPackageV2RuntimeDescriptor(
+	traceID := audit.TraceID
+	if audit.Status == EvidenceAuditQueued {
+		traceID, err = newAgentRuntimeTraceID()
+		if err != nil {
+			traceID = "trace-" + strings.TrimPrefix(audit.InputHash, "sha256:")[:24]
+		}
+		audit, err = StartEvidenceAudit(store, audit.AuditID, traceID, evidenceAuditRunnerNow(config))
+		if err != nil {
+			reloaded, loadErr := store.LoadEvidenceAudit(auditID)
+			if loadErr != nil || (reloaded.Status != EvidenceAuditRunning &&
+				reloaded.Status != EvidenceAuditCompleted &&
+				reloaded.Status != EvidenceAuditFailed) {
+				return nil, err
+			}
+			audit = reloaded
+			traceID = audit.TraceID
+		}
+	}
+	failEarly := func(cause error) (*EvidenceAudit, error) {
+		config.observer.fail("package_validation")
+		return nil, failEvidenceAuditRun(store, *audit, nil, nil, traceID, config, cause)
+	}
+	if err := evidenceAuditRunnerStage(runCtx, "load"); err != nil {
+		return failEarly(err)
+	}
+	descriptor, err := store.LoadAgentPackageV2RuntimeDescriptorContext(
+		runCtx,
 		audit.Package.PackageID, audit.Package.Version, audit.Package.ContentHash,
 	)
 	if err != nil {
-		config.observer.fail("package_validation")
-		return nil, fmt.Errorf("load package runtime descriptor: %w", err)
+		return failEarly(fmt.Errorf("load package runtime descriptor: %w", err))
 	}
 	if config.Timeout <= 0 {
-		runCtx, cancel = context.WithDeadline(
-			ctx, startedAt.Add(time.Duration(descriptor.TimeoutMS)*time.Millisecond),
+		bootstrapCancel()
+		var packageCancel context.CancelFunc
+		runCtx, packageCancel = context.WithTimeout(
+			ctx, time.Duration(descriptor.TimeoutMS)*time.Millisecond,
 		)
-		defer cancel()
+		defer packageCancel()
 	}
 	if err := evidenceAuditRunnerStage(runCtx, "package_descriptor_loaded"); err != nil {
-		return nil, err
+		return failEarly(err)
 	}
 	unlockExecution, err := store.acquireEvidenceAuditExecutionLock(
 		runCtx, auditID,
 	)
 	if err != nil {
-		return nil, err
+		return failEarly(err)
 	}
 	defer unlockExecution()
 	audit, err = store.LoadEvidenceAudit(auditID)
 	if err != nil {
-		return nil, err
+		return failEarly(fmt.Errorf("reload evidence audit after execution lock: %w", err))
 	}
 	if recovered, ok, recoverErr := recoverEvidenceAuditTerminal(runCtx, store, *audit, config); ok || recoverErr != nil {
 		return recovered, recoverErr
@@ -371,19 +421,6 @@ func RunEvidenceAudit(
 	default:
 		return nil, fmt.Errorf("evidence audit %q has unsupported status %q", audit.AuditID, audit.Status)
 	}
-	traceID := audit.TraceID
-	if audit.Status == EvidenceAuditQueued {
-		traceID, err = newAgentRuntimeTraceID()
-		if err != nil {
-			return nil, err
-		}
-		now := evidenceAuditRunnerNow(config)
-		audit, err = StartEvidenceAudit(store, audit.AuditID, traceID, now)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	pkg, runErr := loadEvidenceAuditPackageContext(
 		runCtx, store, audit.Package.PackageID, audit.Package.Version,
 	)
@@ -458,21 +495,32 @@ func RunEvidenceAudit(
 		}
 		config.observer.end("retrieval", "completed")
 		allRetrieved = append(allRetrieved, retrieved...)
+		messages := buildEvidenceAuditModelMessages(pkg, sourceClaim, retrieved)
+		if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
+			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+		}
+		requestIdentity, err := evidenceAuditModelRequestIdentity(
+			executionPlan, claimIndex, modelConfig, messages,
+		)
+		if err != nil {
+			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+		}
+		retrievalFingerprint, err := evidenceAuditRetrievalSnapshotFingerprint(audit.Releases, retrieved)
+		if err != nil {
+			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+		}
 		var decision evidenceAuditModelDecision
 		if checkpoint, ok := checkpoints[claimIndex]; ok {
+			if checkpoint.RequestIdentity != requestIdentity ||
+				checkpoint.RetrievalFingerprint != retrievalFingerprint {
+				return nil, failEvidenceAuditRun(
+					store, *audit, pkg, allRetrieved, traceID, config,
+					fmt.Errorf("checkpoint identity no longer matches canonical model request and retrieval snapshot"),
+				)
+			}
 			decision = checkpoint.Decision
 			config.observer.mergeUsage(checkpoint.Usage)
 		} else {
-			messages := buildEvidenceAuditModelMessages(pkg, sourceClaim, retrieved)
-			if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
-				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
-			}
-			requestIdentity, err := evidenceAuditModelRequestIdentity(
-				executionPlan, claimIndex, modelConfig, messages,
-			)
-			if err != nil {
-				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
-			}
 			invocation, created, err := store.beginEvidenceAuditModelInvocation(
 				executionPlan, claimIndex, requestIdentity,
 			)
@@ -534,7 +582,8 @@ func RunEvidenceAudit(
 			}
 			parsed = evidenceAuditCheckpointDecision(parsed)
 			checkpoint, checkpointErr := store.saveEvidenceAuditClaimCandidate(
-				executionPlan, claimIndex, parsed, checkpointUsage,
+				executionPlan, claimIndex, requestIdentity, retrievalFingerprint,
+				parsed, checkpointUsage,
 			)
 			if checkpointErr != nil {
 				return nil, failEvidenceAuditRun(
@@ -578,7 +627,65 @@ func evidenceAuditCheckpointDecision(
 		CandidateVerdict: decision.CandidateVerdict,
 		Rationale:        "Candidate evaluated against immutable pinned evidence.",
 		Evidence:         append([]evidenceAuditModelEvidence(nil), decision.Evidence...),
+		Limitations:      evidenceAuditBoundedStrings(decision.Limitations),
+		KnowledgeGaps:    evidenceAuditBoundedStrings(decision.KnowledgeGaps),
+		ReviewActions:    evidenceAuditBoundedStrings(decision.ReviewActions),
 	}
+}
+
+func evidenceAuditRetrievalSnapshotFingerprint(
+	releases []EvidenceAuditReleaseRef,
+	retrieved []evidenceAuditRetrievedItem,
+) (string, error) {
+	type releaseIdentity struct {
+		ReleaseID   string `json:"release_id"`
+		ContentHash string `json:"content_hash"`
+	}
+	type evidenceIdentity struct {
+		ReleaseID   string `json:"release_id"`
+		ContentHash string `json:"content_hash"`
+		ClaimID     string `json:"claim_id"`
+		ChunkID     string `json:"chunk_id"`
+		CitationID  string `json:"citation_id"`
+	}
+	releaseValues := make([]releaseIdentity, 0, len(releases))
+	for _, release := range releases {
+		releaseValues = append(releaseValues, releaseIdentity{
+			ReleaseID: release.ReleaseID, ContentHash: release.ContentHash,
+		})
+	}
+	sort.Slice(releaseValues, func(i, j int) bool {
+		return releaseValues[i].ReleaseID < releaseValues[j].ReleaseID
+	})
+	evidenceValues := make([]evidenceIdentity, 0, len(retrieved))
+	for _, item := range retrieved {
+		evidenceValues = append(evidenceValues, evidenceIdentity{
+			ReleaseID: item.Ref.ReleaseID, ContentHash: item.Ref.ContentHash,
+			ClaimID: item.Ref.ClaimID, ChunkID: item.Ref.ChunkID,
+			CitationID: item.Ref.CitationID,
+		})
+	}
+	sort.Slice(evidenceValues, func(i, j int) bool {
+		left, right := evidenceValues[i], evidenceValues[j]
+		if left.ReleaseID != right.ReleaseID {
+			return left.ReleaseID < right.ReleaseID
+		}
+		if left.ClaimID != right.ClaimID {
+			return left.ClaimID < right.ClaimID
+		}
+		if left.ChunkID != right.ChunkID {
+			return left.ChunkID < right.ChunkID
+		}
+		return left.CitationID < right.CitationID
+	})
+	payload, err := json.Marshal(struct {
+		Releases []releaseIdentity  `json:"releases"`
+		Evidence []evidenceIdentity `json:"evidence"`
+	}{Releases: releaseValues, Evidence: evidenceValues})
+	if err != nil {
+		return "", err
+	}
+	return sha256Fingerprint(payload), nil
 }
 
 func evidenceAuditModelRequestIdentity(
@@ -587,20 +694,31 @@ func evidenceAuditModelRequestIdentity(
 	config BookTokenPlanConfig,
 	messages []BookKnowledgeMessage,
 ) (string, error) {
+	messagesPayload, err := json.Marshal(messages)
+	if err != nil {
+		return "", err
+	}
 	payload, err := json.Marshal(struct {
-		AuditID        string                 `json:"audit_id"`
-		InputHash      string                 `json:"input_hash"`
-		ClaimIndex     int                    `json:"claim_index"`
-		ClaimHash      string                 `json:"claim_hash"`
-		Model          string                 `json:"model"`
-		MaxTokens      int                    `json:"max_tokens"`
-		EnableThinking *bool                  `json:"enable_thinking,omitempty"`
-		Messages       []BookKnowledgeMessage `json:"messages"`
+		AuditID            string `json:"audit_id"`
+		InputHash          string `json:"input_hash"`
+		ClaimIndex         int    `json:"claim_index"`
+		ClaimHash          string `json:"claim_hash"`
+		Model              string `json:"model"`
+		MaxTokens          int    `json:"max_tokens"`
+		EnableThinking     *bool  `json:"enable_thinking,omitempty"`
+		OutputSchemaHash   string `json:"output_schema_hash"`
+		PromptTemplateHash string `json:"prompt_template_hash"`
+		MessagesHash       string `json:"messages_hash"`
 	}{
 		AuditID: plan.AuditID, InputHash: plan.InputHash,
 		ClaimIndex: claimIndex, ClaimHash: plan.ClaimHashes[claimIndex],
 		Model: normalizeBookTokenPlanModel(config.Model), MaxTokens: config.MaxTokens,
-		EnableThinking: config.EnableThinking, Messages: messages,
+		EnableThinking:   config.EnableThinking,
+		OutputSchemaHash: sha256Fingerprint([]byte(evidenceAuditModelOutputSchema)),
+		PromptTemplateHash: sha256Fingerprint([]byte(
+			evidenceAuditModelSystemPromptTemplate + "\x00" + evidenceAuditModelUserPromptTemplate,
+		)),
+		MessagesHash: sha256Fingerprint(messagesPayload),
 	})
 	if err != nil {
 		return "", err
@@ -923,26 +1041,27 @@ func buildEvidenceAuditModelMessages(
 	sourceClaim string,
 	evidence []evidenceAuditRetrievedItem,
 ) []BookKnowledgeMessage {
-	var builder strings.Builder
-	builder.WriteString("Source claim: ")
-	builder.WriteString(sourceClaim)
-	builder.WriteString("\nPinned supporting evidence (metadata and statements only):\n")
+	var evidenceBuilder strings.Builder
 	for _, item := range evidence {
 		fmt.Fprintf(
-			&builder,
+			&evidenceBuilder,
 			"- release_id=%s citation_id=%s claim_id=%s publication_identity=%s source_type=%s\n  %s\n",
 			item.Ref.ReleaseID, item.Ref.CitationID, item.Ref.ClaimID,
 			item.Ref.PublicationIdentity, item.Ref.SourceType, item.Evidence.Statement,
 		)
 	}
+	userPrompt := strings.NewReplacer(
+		"{{source_claim}}", sourceClaim,
+		"{{evidence}}", evidenceBuilder.String(),
+	).Replace(evidenceAuditModelUserPromptTemplate)
 	return []BookKnowledgeMessage{
 		{
 			Role: "system",
-			Content: "Return one strict JSON object for schema " + evidenceAuditModelOutputSchema +
-				". Use only the listed pinned evidence. candidate_verdict is advisory; code decides the final verdict. " +
-				"Evidence stance must be supports or contradicts. Do not provide diagnosis, treatment, or individual medical advice.",
+			Content: strings.ReplaceAll(
+				evidenceAuditModelSystemPromptTemplate, "{{schema}}", evidenceAuditModelOutputSchema,
+			),
 		},
-		{Role: "user", Content: builder.String()},
+		{Role: "user", Content: userPrompt},
 	}
 }
 
@@ -1195,30 +1314,21 @@ func completeEvidenceAuditRun(
 			fmt.Errorf("prepare evidence audit terminal: %w", err),
 		)
 	}
-	config.observer.end("trace_persistence", "completed")
-	trace, err = buildEvidenceAuditTrace(
-		store, audit, pkg, retrieved, claims, traceID, traceOutcome, fingerprint, config,
-	)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		config.observer.fail("trace_persistence")
 		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
 		return nil, failEvidenceAuditRun(store, audit, pkg, retrieved, traceID, config, err)
 	}
-	terminal.Trace = trace
-	if err := store.finalizeEvidenceAuditTraceTerminalMetadata(terminal); err != nil {
+	if err := store.finalizeEvidenceAuditTraceTerminal(terminal); err != nil {
 		config.observer.fail("trace_persistence")
+		if _, loadErr := store.LoadAgentTrace(traceID); loadErr == nil {
+			return nil, fmt.Errorf("finalize evidence audit trace: %w", err)
+		}
 		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
 		return nil, failEvidenceAuditRun(
 			store, audit, pkg, retrieved, traceID, config,
-			fmt.Errorf("finalize evidence audit terminal metadata: %w", err),
+			fmt.Errorf("finalize evidence audit trace: %w", err),
 		)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if err := store.finalizeEvidenceAuditTraceTerminal(terminal); err != nil {
-		config.observer.fail("trace_persistence")
-		return nil, fmt.Errorf("finalize evidence audit trace: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1272,26 +1382,10 @@ func failEvidenceAuditRun(
 		}
 		return fmt.Errorf("%v; prepare failed trace: %w", runErr, traceErr)
 	}
-	if config.observer != nil {
-		config.observer.end("trace_persistence", "completed")
-	}
-	trace, traceErr = buildEvidenceAuditTrace(
-		store, audit, packageValue, retrieved, nil, traceID,
-		AgentTraceOutcomeFailed, fingerprint, config,
-	)
-	if traceErr != nil {
-		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
-		return fmt.Errorf("%v; rebuild failed trace: %w", runErr, traceErr)
-	}
-	terminal.Trace = trace
-	if traceErr := store.finalizeEvidenceAuditTraceTerminalMetadata(terminal); traceErr != nil {
+	if traceErr := store.finalizeEvidenceAuditTraceTerminal(terminal); traceErr != nil {
 		if config.observer != nil {
 			config.observer.fail("trace_persistence")
 		}
-		_ = store.removeEvidenceAuditTraceTerminal(audit.AuditID)
-		return fmt.Errorf("%v; finalize failed trace metadata: %w", runErr, traceErr)
-	}
-	if traceErr := store.finalizeEvidenceAuditTraceTerminal(terminal); traceErr != nil {
 		return fmt.Errorf("%v; finalize failed trace: %w", runErr, traceErr)
 	}
 	_, failErr := FailEvidenceAudit(
@@ -1517,8 +1611,9 @@ func evidenceAuditReportFingerprint(report EvidenceAudit) (string, error) {
 }
 
 func evidenceAuditRequestsMedicalAdvice(value string) bool {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" {
+	raw := strings.TrimSpace(value)
+	value = strings.ToLower(raw)
+	if raw == "" {
 		return true
 	}
 	hasAny := func(markers ...string) bool {
@@ -1529,14 +1624,6 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		}
 		return false
 	}
-	explicitPopulationSubject := hasAny(
-		"patients ", "patients with", "adults ", "adults with", "children ",
-		"children with", "participants ", "subjects ", "people with", "persons with",
-		"cohort of", "population of", "group of", "groups of", "among patients",
-		"among adults", "among children", "in patients", "in adults", "in children",
-		"患者群体", "患者人群", "成年患者", "儿童患者", "受试者", "研究人群",
-		"队列人群", "成年人群", "儿童群体",
-	)
 	firstPersonContext := hasAny(
 		" i ", " me", " my ", "for me", "should i", "can i", "could i",
 		"right for me", "appropriate for me",
@@ -1554,7 +1641,9 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 			!strings.Contains(value, "患者人群"))
 	ageOrNamedPersonContext := evidenceAuditEnglishAgePattern.MatchString(value) ||
 		evidenceAuditChineseAgePattern.MatchString(value) ||
-		evidenceAuditDecisionHasNonPopulationSubject(value)
+		evidenceAuditDecisionHasNonPopulationSubject(value) ||
+		evidenceAuditEnglishNamedDecisionPattern.MatchString(raw) ||
+		evidenceAuditChineseIndividualDecisionPattern.MatchString(raw)
 	personalContext := firstPersonContext || specificPatientContext || ageOrNamedPersonContext
 	diagnosisOrTreatment := hasAny(
 		"diagnos", "treat", "therapy for", "prescri", "medical advice", "what do i have",
@@ -1580,6 +1669,15 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"recommend a treatment", "individual treatment", "individual medical advice",
 		"用药建议", "治疗方案", "开药", "给我诊断", "诊断我",
 	)
+	explicitAcademicPICO := evidenceAuditEnglishPICOPattern.MatchString(raw) ||
+		evidenceAuditIsChinesePICO(raw)
+	strongPersonalContext := firstPersonContext || ageOrNamedPersonContext || hasAny(
+		"this patient", "the patient", "this person", "case ",
+		"病例", "个案", "这个患者", "该患者", "这名患者",
+	)
+	if explicitAcademicPICO && !strongPersonalContext {
+		return false
+	}
 	if personalContext && (clinicalContext || decisionRequest) {
 		return true
 	}
@@ -1587,13 +1685,27 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		(medicationContext && (personalContext || decisionRequest)) {
 		return true
 	}
-	if explicitPopulationSubject && !personalContext {
-		return false
-	}
 	if clinicalContext || decisionRequest {
 		return true
 	}
 	return false
+}
+
+func evidenceAuditIsChinesePICO(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "在") {
+		return false
+	}
+	hasPopulation := strings.Contains(value, "患者中") ||
+		strings.Contains(value, "人群中") ||
+		strings.Contains(value, "受试者中")
+	hasComparator := strings.Contains(value, "相比") || strings.Contains(value, "对比")
+	hasOutcome := strings.Contains(value, "是否改善") ||
+		strings.Contains(value, "是否降低") ||
+		strings.Contains(value, "是否提高") ||
+		strings.Contains(value, "是否减少") ||
+		strings.Contains(value, "是否预防")
+	return hasPopulation && hasComparator && hasOutcome
 }
 
 func evidenceAuditDecisionHasNonPopulationSubject(value string) bool {

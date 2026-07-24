@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -534,6 +535,40 @@ func TestEvidenceAuditStoreRecoversWhenManifestWriteFailsAfterReportWrite(t *tes
 	if _, err := os.Stat(store.EvidenceAuditPreparedPath(queued.AuditID)); err != nil {
 		t.Fatalf("prepared journal missing: %v", err)
 	}
+	if runtime.GOOS != "windows" {
+		var prepared evidenceAuditPreparedRecord
+		if err := readJSONFile(store.EvidenceAuditPreparedPath(queued.AuditID), &prepared); err != nil {
+			t.Fatal(err)
+		}
+		for _, path := range []string{
+			store.EvidenceAuditManifestPath(),
+			store.EvidenceAuditInputPath(queued.InputHash),
+			store.EvidenceAuditReportPath(prepared.OutputHash),
+			store.EvidenceAuditPreparedPath(queued.AuditID),
+		} {
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("private audit state file %s mode=%#o", path, info.Mode().Perm())
+			}
+		}
+		for _, path := range []string{
+			store.EvidenceAuditDir(),
+			filepath.Dir(store.EvidenceAuditInputPath(queued.InputHash)),
+			filepath.Dir(store.EvidenceAuditReportPath(prepared.OutputHash)),
+			filepath.Dir(store.EvidenceAuditPreparedPath(queued.AuditID)),
+		} {
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode().Perm() != 0o700 {
+				t.Fatalf("private audit state directory %s mode=%#o", path, info.Mode().Perm())
+			}
+		}
+	}
 	if err := os.WriteFile(
 		filepath.Join(store.EvidenceAuditDir(), "reports", "unrelated-corrupt.json"),
 		[]byte("{broken"),
@@ -883,7 +918,8 @@ func TestManualRetryEvidenceAuditCreatesImmutableIdempotentAttempt(t *testing.T)
 	retry, created, err := ManualRetryEvidenceAudit(
 		store,
 		original.AuditID,
-		"human-authorization-token",
+		validEvidenceAuditRetryAuthorization(original.AuditID, testAgentPackageTime()),
+		acceptEvidenceAuditRetryAuthorization,
 		"manual-retry-request",
 		testAgentPackageTime().Add(3*time.Minute),
 	)
@@ -898,7 +934,8 @@ func TestManualRetryEvidenceAuditCreatesImmutableIdempotentAttempt(t *testing.T)
 	repeated, created, err := ManualRetryEvidenceAudit(
 		store,
 		original.AuditID,
-		"human-authorization-token",
+		validEvidenceAuditRetryAuthorization(original.AuditID, testAgentPackageTime()),
+		acceptEvidenceAuditRetryAuthorization,
 		"manual-retry-request",
 		testAgentPackageTime().Add(4*time.Minute),
 	)
@@ -930,13 +967,113 @@ func TestManualRetryEvidenceAuditRejectsUnauthorizedOrIneligibleFailures(t *test
 	); err != nil {
 		t.Fatal(err)
 	}
-	for _, authorization := range []string{"", "human-authorization-token"} {
+	for _, authorization := range []EvidenceAuditRetryAuthorization{
+		{},
+		validEvidenceAuditRetryAuthorization(audit.AuditID, testAgentPackageTime()),
+	} {
 		if _, _, err := ManualRetryEvidenceAudit(
-			store, audit.AuditID, authorization, "manual-retry-invalid", testAgentPackageTime().Add(2*time.Minute),
+			store, audit.AuditID, authorization, acceptEvidenceAuditRetryAuthorization,
+			"manual-retry-invalid", testAgentPackageTime().Add(2*time.Minute),
 		); err == nil {
-			t.Fatalf("ManualRetryEvidenceAudit() accepted authorization=%q", authorization)
+			t.Fatalf("ManualRetryEvidenceAudit() accepted authorization=%#v", authorization)
 		}
 	}
+}
+
+func TestManualRetryEvidenceAuditValidatesAuthorizationAndAllowsOnlyOneActiveAttempt(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store := NewBookKnowledgeStore(t.TempDir())
+	input := validEvidenceAuditInput()
+	original, _, err := CreateEvidenceAudit(store, input, "retry-auth-source", testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FailEvidenceAudit(
+		store, original.AuditID, "model_outcome_unknown", "unknown",
+		testAgentPackageTime().Add(time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	now := testAgentPackageTime().Add(2 * time.Minute)
+	tests := []struct {
+		name   string
+		mutate func(*EvidenceAuditRetryAuthorization)
+	}{
+		{"unverified", func(value *EvidenceAuditRetryAuthorization) { value.Verified = false }},
+		{"expired", func(value *EvidenceAuditRetryAuthorization) { value.ExpiresAt = now.Add(-time.Second) }},
+		{"wrong audit", func(value *EvidenceAuditRetryAuthorization) { value.AuditID = "other-audit" }},
+		{"wrong scope", func(value *EvidenceAuditRetryAuthorization) { value.Scope = "evidence-audit:read" }},
+		{"missing signature", func(value *EvidenceAuditRetryAuthorization) { value.Signature = "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			authorization := validEvidenceAuditRetryAuthorization(original.AuditID, now)
+			tt.mutate(&authorization)
+			if _, _, err := ManualRetryEvidenceAudit(
+				store, original.AuditID, authorization, acceptEvidenceAuditRetryAuthorization,
+				"invalid-"+tt.name, now,
+			); err == nil {
+				t.Fatal("invalid retry authorization unexpectedly succeeded")
+			}
+		})
+	}
+
+	type result struct {
+		audit   *EvidenceAudit
+		created bool
+		err     error
+	}
+	results := make(chan result, 2)
+	for index := 0; index < 2; index++ {
+		index := index
+		go func() {
+			authorization := validEvidenceAuditRetryAuthorization(original.AuditID, now)
+			authorization.Nonce = fmt.Sprintf("nonce-%d", index)
+			authorization.Signature = fmt.Sprintf("signature-%d", index)
+			audit, created, retryErr := ManualRetryEvidenceAudit(
+				store, original.AuditID, authorization, acceptEvidenceAuditRetryAuthorization,
+				fmt.Sprintf("parallel-%d", index), now,
+			)
+			results <- result{audit: audit, created: created, err: retryErr}
+		}()
+	}
+	successes, conflicts := 0, 0
+	for index := 0; index < 2; index++ {
+		value := <-results
+		if value.err == nil && value.created {
+			successes++
+			continue
+		}
+		if errors.Is(value.err, ErrEvidenceAuditStateConflict) {
+			conflicts++
+			continue
+		}
+		t.Fatalf("unexpected parallel retry result: %#v", value)
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("parallel retries successes=%d conflicts=%d", successes, conflicts)
+	}
+}
+
+func validEvidenceAuditRetryAuthorization(
+	auditID string,
+	now time.Time,
+) EvidenceAuditRetryAuthorization {
+	return EvidenceAuditRetryAuthorization{
+		AuditID: auditID, Actor: "reviewer-1", Issuer: "kbase-test",
+		Scope: EvidenceAuditRetryScope, ExpiresAt: now.Add(time.Hour),
+		Nonce: "nonce-1", Signature: "verified-test-signature", Verified: true,
+	}
+}
+
+func acceptEvidenceAuditRetryAuthorization(
+	authorization EvidenceAuditRetryAuthorization,
+	now time.Time,
+) error {
+	if !authorization.Verified || !authorization.ExpiresAt.After(now) {
+		return errors.New("authorization rejected")
+	}
+	return nil
 }
 
 func TestListEvidenceAuditsReconcilesPreparedTerminalState(t *testing.T) {

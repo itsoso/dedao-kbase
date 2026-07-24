@@ -107,6 +107,26 @@ Release hash mismatch, invalid output, or policy violation produces a failed
 audit and failed Trace; partial output is never presented as a completed
 report.
 
+### Runtime integrity and deadlines
+
+The caller context and a bounded bootstrap deadline cover initial audit and
+runtime-descriptor acquisition. After the descriptor is validated, its package
+deadline covers locking, pinned retrieval, model execution, report preparation,
+Trace persistence, and audit publication. An explicit caller-supplied timeout
+instead bounds the complete workflow.
+
+Recovery checkpoints bind to a canonical model request identity (model,
+parameters, output schema, and prompt-template hash without storing the prompt)
+and a pinned retrieval fingerprint (Release hashes plus citation, chunk, and
+claim IDs). Recovery recomputes both identities and fails closed on drift.
+Prepared terminals, checkpoints, invocation records, and Trace persistence
+receipts use private state directories (`0700`) and files (`0600`).
+
+These hashes detect accidental or unauthorized workflow drift under the
+application's storage contract. Write access to the local state directory is a
+trusted boundary; the design does not claim cryptographic tamper resistance
+against an actor that already controls that directory.
+
 ## Web Workspace
 
 The Agent page presents:

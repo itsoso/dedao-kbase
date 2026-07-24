@@ -232,10 +232,28 @@ func (s *BookKnowledgeStore) LoadAgentPackageContext(
 func (s *BookKnowledgeStore) LoadAgentPackageV2RuntimeDescriptor(
 	packageID, version, contentHash string,
 ) (*AgentPackageRuntimeDescriptor, error) {
+	return s.LoadAgentPackageV2RuntimeDescriptorContext(
+		context.Background(), packageID, version, contentHash,
+	)
+}
+
+func (s *BookKnowledgeStore) LoadAgentPackageV2RuntimeDescriptorContext(
+	ctx context.Context,
+	packageID, version, contentHash string,
+) (*AgentPackageRuntimeDescriptor, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	manifest, err := s.loadAgentPackageManifestUnlocked()
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	record, err := selectAgentPackageRecord(

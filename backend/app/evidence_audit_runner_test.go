@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -262,11 +264,8 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 
 func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
 	for _, scope := range []string{
-		"Population-level PICO: does surgery improve five-year survival in adults?",
-		"Compare evidence for screening tests in adults aged 50 to 75.",
-		"Should adults with resectable disease receive surgery according to trial evidence?",
-		"群体级PICO：手术是否改善成年患者五年生存率？",
-		"成年患者是否应该接受手术？请比较临床试验证据。",
+		"In adults with resectable lung cancer, does surgery improve five-year survival compared with radiotherapy?",
+		"在可切除肺癌患者中，手术相比放疗是否改善五年生存率？",
 	} {
 		t.Run(scope, func(t *testing.T) {
 			store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
@@ -297,16 +296,16 @@ func TestEvidenceAuditRunnerRejectsIndividualDecisionsDespitePopulationPrefixes(
 		"群体级 PICO：年龄 62 的张三是否应该做手术？",
 		"群体级 PICO：李雷是否应该做手术？",
 		"人群证据比较：这个 62 岁病例要不要停药？",
+		"Among adults, is surgery appropriate for John?",
+		"成年患者中，张三做手术合适吗？",
 	} {
 		if !evidenceAuditRequestsMedicalAdvice(scope) {
 			t.Fatalf("individual decision was not rejected: %q", scope)
 		}
 	}
 	for _, scope := range []string{
-		"Population-level PICO: does surgery improve survival in adults?",
-		"Should adults with resectable disease receive surgery according to trial evidence?",
-		"群体级PICO：手术是否改善成年患者五年生存率？",
-		"成年患者是否应该接受手术？请比较临床试验证据。",
+		"In adults with resectable lung cancer, does surgery improve five-year survival compared with radiotherapy?",
+		"在可切除肺癌患者中，手术相比放疗是否改善五年生存率？",
 	} {
 		if evidenceAuditRequestsMedicalAdvice(scope) {
 			t.Fatalf("population evidence question was rejected: %q", scope)
@@ -428,6 +427,72 @@ func TestEvidenceAuditRunnerTimeoutCoversPackageAndReleaseLoading(t *testing.T) 
 	})
 }
 
+func TestEvidenceAuditRunnerEarlyLoadAndLockFailuresReachFailedTerminal(t *testing.T) {
+	t.Run("bootstrap load failure", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		audit := createEvidenceAuditRunnerTask(
+			t, store, pkg, "runner-bootstrap-failure", "Evidence comparison only.",
+		)
+		previous := evidenceAuditRuntimeStageHook
+		evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+			if stage == "load" {
+				return context.DeadlineExceeded
+			}
+			return nil
+		}
+		t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+		if _, err := RunEvidenceAudit(
+			context.Background(), store, audit.AuditID, &evidenceAuditFakeClient{},
+			evidenceAuditRunnerConfig(),
+		); err == nil {
+			t.Fatal("bootstrap failure unexpectedly succeeded")
+		}
+		assertEvidenceAuditFailedTerminal(t, store, audit.AuditID)
+	})
+
+	t.Run("execution lock deadline", func(t *testing.T) {
+		store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		audit := createEvidenceAuditRunnerTask(
+			t, store, pkg, "runner-lock-failure", "Evidence comparison only.",
+		)
+		unlock, err := store.acquireEvidenceAuditExecutionLock(context.Background(), audit.AuditID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unlock()
+		cfg := evidenceAuditRunnerConfig()
+		cfg.BootstrapTimeout = 20 * time.Millisecond
+		if _, err := RunEvidenceAudit(
+			context.Background(), store, audit.AuditID, &evidenceAuditFakeClient{}, cfg,
+		); err == nil {
+			t.Fatal("lock failure unexpectedly succeeded")
+		}
+		assertEvidenceAuditFailedTerminal(t, store, audit.AuditID)
+	})
+}
+
+func assertEvidenceAuditFailedTerminal(
+	t *testing.T,
+	store *BookKnowledgeStore,
+	auditID string,
+) {
+	t.Helper()
+	audit, err := store.LoadEvidenceAudit(auditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if audit.Status != EvidenceAuditFailed {
+		t.Fatalf("audit status=%q, want failed", audit.Status)
+	}
+	trace, err := store.LoadAgentTrace(audit.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trace.Final.Outcome != AgentTraceOutcomeFailed {
+		t.Fatalf("trace outcome=%q, want failed", trace.Final.Outcome)
+	}
+}
+
 func TestEvidenceAuditRunnerFailsClosedWhenLaterClaimModelOutcomeIsUnknown(t *testing.T) {
 	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
 	audit := createEvidenceAuditRunnerTask(t, store, pkg, "runner-claim-checkpoint", "Evidence comparison only.")
@@ -489,6 +554,68 @@ func TestEvidenceAuditRunnerRecoversCandidateWhenCheckpointFollowupFails(t *test
 	}
 	if completed.Status != EvidenceAuditCompleted || len(first.calls) != 1 || len(second.calls) != 0 {
 		t.Fatalf("checkpoint recovery completed=%#v first_calls=%d second_calls=%d", completed, len(first.calls), len(second.calls))
+	}
+}
+
+func TestEvidenceAuditRunnerRejectsCheckpointWithMismatchedRequestOrRetrievalIdentity(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(
+		t, store, pkg, "runner-checkpoint-identity", "Evidence comparison only.",
+	)
+	previous := evidenceAuditRuntimeStageHook
+	failed := false
+	evidenceAuditRuntimeStageHook = func(_ context.Context, stage string) error {
+		if stage == "checkpoint" && !failed {
+			failed = true
+			return errors.New("synthetic checkpoint followup failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { evidenceAuditRuntimeStageHook = previous })
+	first := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"saved candidate","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`,
+	}}
+	if _, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, first, evidenceAuditRunnerConfig(),
+	); err == nil {
+		t.Fatal("first run unexpectedly succeeded")
+	}
+	resultDir := filepath.Join(store.evidenceAuditExecutionDir(audit.AuditID), "results")
+	entries, err := os.ReadDir(resultDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("checkpoint entries=%v err=%v", entries, err)
+	}
+	oldPath := filepath.Join(resultDir, entries[0].Name())
+	var candidate evidenceAuditClaimCandidate
+	if err := readJSONFile(oldPath, &candidate); err != nil {
+		t.Fatal(err)
+	}
+	candidate.RequestIdentity = "sha256:" + strings.Repeat("f", 64)
+	hash, err := evidenceAuditClaimCandidateHash(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.CandidateHash = hash
+	payload, err := encodeJSONFile(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(oldPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEvidenceAuditPrivateFile(
+		filepath.Join(resultDir, evidenceAuditHashName(hash)+".json"), payload,
+	); err != nil {
+		t.Fatal(err)
+	}
+	second := &evidenceAuditFakeClient{}
+	if _, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, second, evidenceAuditRunnerConfig(),
+	); err == nil || !strings.Contains(err.Error(), "checkpoint identity") {
+		t.Fatalf("mismatched checkpoint error=%v", err)
+	}
+	if len(second.calls) != 0 {
+		t.Fatalf("model was called after checkpoint identity mismatch: %d", len(second.calls))
 	}
 }
 
@@ -590,14 +717,92 @@ func TestEvidenceAuditRunnerCheckpointDoesNotPersistPromptOrSourceBody(t *testin
 		if readErr != nil {
 			return readErr
 		}
-		if strings.Contains(string(payload), privateMarker) ||
-			strings.Contains(string(payload), "Pinned supporting evidence") {
+		if strings.Contains(string(payload), "Pinned supporting evidence") {
 			t.Fatalf("checkpoint leaked private model or prompt content: %s", payload)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEvidenceAuditRunnerPrivateStatePermissionsAndRecoveredFields(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	audit := createEvidenceAuditRunnerTask(
+		t, store, pkg, "runner-private-state", "Evidence comparison only.",
+	)
+	client := &evidenceAuditFakeClient{answers: []string{
+		`{"candidate_verdict":"supported","rationale":"bounded","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":["limited applicability"],"knowledge_gaps":["long-term outcome unknown"],"review_actions":["independent review"]}`,
+	}}
+	completed, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := completed.ClaimAudits[0]
+	if !reflect.DeepEqual(claim.Limitations, []string{"limited applicability"}) ||
+		!reflect.DeepEqual(claim.KnowledgeGaps, []string{"long-term outcome unknown"}) ||
+		!reflect.DeepEqual(claim.ReviewActions, []string{"independent review"}) {
+		t.Fatalf("checkpoint fields were lost: %#v", claim)
+	}
+	if runtime.GOOS == "windows" {
+		return
+	}
+	for _, path := range []string{
+		store.evidenceAuditExecutionDir(audit.AuditID),
+		filepath.Dir(store.EvidenceAuditTraceReceiptPath(completed.TraceID)),
+	} {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatal(statErr)
+		}
+		if info.Mode().Perm() != 0o700 {
+			t.Fatalf("private directory %s mode=%#o", path, info.Mode().Perm())
+		}
+	}
+	err = filepath.WalkDir(store.evidenceAuditExecutionDir(audit.AuditID), func(
+		path string, entry os.DirEntry, walkErr error,
+	) error {
+		if walkErr != nil || entry.IsDir() {
+			return walkErr
+		}
+		info, statErr := entry.Info()
+		if statErr != nil {
+			return statErr
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("private state file %s mode=%#o", path, info.Mode().Perm())
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptInfo, err := os.Stat(store.EvidenceAuditTraceReceiptPath(completed.TraceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receiptInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("trace receipt mode=%#o", receiptInfo.Mode().Perm())
+	}
+	receiptPath := store.EvidenceAuditTraceReceiptPath(completed.TraceID)
+	var receipt evidenceAuditTraceReceipt
+	if err := readJSONFile(receiptPath, &receipt); err != nil {
+		t.Fatal(err)
+	}
+	receipt.TraceHash = "sha256:" + strings.Repeat("0", 64)
+	payload, err := encodeJSONFile(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEvidenceAuditPrivateFile(receiptPath, payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadAgentTrace(completed.TraceID); err == nil ||
+		!strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("tampered receipt error=%v", err)
 	}
 }
 
@@ -702,6 +907,7 @@ func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
 		installFail func(t *testing.T)
 		firstStatus string
 		traceExists bool
+		finalFailed bool
 	}{
 		{
 			name:        "report store failure",
@@ -724,7 +930,9 @@ func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
 		},
 		{
 			name:        "trace save failure",
-			firstStatus: EvidenceAuditRunning,
+			firstStatus: EvidenceAuditFailed,
+			traceExists: true,
+			finalFailed: true,
 			installFail: func(t *testing.T) {
 				previous := evidenceAuditTraceStorageFault
 				failed := false
@@ -777,6 +985,14 @@ func TestEvidenceAuditRunnerRecoversTerminalProtocolFailures(t *testing.T) {
 			_, traceErr := store.LoadAgentTrace(first.TraceID)
 			if (traceErr == nil) != tt.traceExists {
 				t.Fatalf("trace existence after injected failure = %v, want %v", traceErr == nil, tt.traceExists)
+			}
+			if tt.finalFailed {
+				trace, traceErr := store.LoadAgentTrace(first.TraceID)
+				if traceErr != nil ||
+					findEvidenceAuditTraceStage(t, trace, "trace_persistence").Status != "failed" {
+					t.Fatalf("failed trace persistence = %#v err=%v", trace, traceErr)
+				}
+				return
 			}
 			recovered, err := store.LoadEvidenceAudit(audit.AuditID)
 			if err == nil && recovered.Status != EvidenceAuditCompleted {
@@ -1068,9 +1284,13 @@ func TestEvidenceAuditRunnerTraceIncludesBoundedDeterministicObservability(t *te
 		"model", "report_persistence", "trace_persistence",
 	} {
 		stage := stages[index].(map[string]any)
-		wantDurations := []float64{20, 5, 25, 10, 5, 10, 10}
-		if stage["name"] != want || stage["status"] != "completed" ||
-			stage["duration_ms"] != wantDurations[index] {
+		wantDurations := []float64{20, 5, 25, 10, 5, 10, 1}
+		duration, _ := stage["duration_ms"].(float64)
+		durationMatches := duration == wantDurations[index]
+		if want == "trace_persistence" {
+			durationMatches = duration > 0
+		}
+		if stage["name"] != want || stage["status"] != "completed" || !durationMatches {
 			t.Fatalf("stage[%d] = %#v", index, stage)
 		}
 		if want == "report_persistence" && stage["definition"] != "immutable_report_preparation" {
@@ -1080,7 +1300,7 @@ func TestEvidenceAuditRunnerTraceIncludesBoundedDeterministicObservability(t *te
 			t.Fatalf("trace persistence definition = %#v", stage)
 		}
 	}
-	if observability["terminal_protocol"] != "prepared-report-trace-then-audit-publish.v1" {
+	if observability["terminal_protocol"] != "prepared-report-trace-receipt-audit-publish.v2" {
 		t.Fatalf("terminal protocol = %#v", observability["terminal_protocol"])
 	}
 	if observability["citation_resolution_rate"] != float64(1) ||

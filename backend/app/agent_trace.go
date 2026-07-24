@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ const (
 	evidenceAuditTraceTerminalVersion = "evidence-audit-trace-terminal.v1"
 	evidenceAuditExecutionVersion     = "evidence-audit-execution.v2"
 	evidenceAuditInvocationVersion    = "evidence-audit-model-invocation.v1"
+	evidenceAuditTraceReceiptVersion  = "evidence-audit-trace-receipt.v1"
 
 	evidenceAuditInvocationInFlight  = "in_flight"
 	evidenceAuditInvocationCompleted = "completed"
@@ -106,6 +108,15 @@ type evidenceAuditTraceTerminal struct {
 	Trace             AgentTrace     `json:"trace"`
 }
 
+type evidenceAuditTraceReceipt struct {
+	Version    string `json:"version"`
+	TraceID    string `json:"trace_id"`
+	TraceHash  string `json:"trace_hash"`
+	Status     string `json:"status"`
+	DurationMS int64  `json:"duration_ms"`
+	SavedAt    string `json:"saved_at"`
+}
+
 type evidenceAuditExecutionPlan struct {
 	Version     string                     `json:"version"`
 	AuditID     string                     `json:"audit_id"`
@@ -116,16 +127,18 @@ type evidenceAuditExecutionPlan struct {
 }
 
 type evidenceAuditClaimCandidate struct {
-	Version       string                     `json:"version"`
-	AuditID       string                     `json:"audit_id"`
-	InputHash     string                     `json:"input_hash"`
-	Package       EvidenceAuditPackageRef    `json:"package"`
-	Model         EvidenceAuditModelIdentity `json:"model"`
-	ClaimIndex    int                        `json:"claim_index"`
-	ClaimHash     string                     `json:"claim_hash"`
-	Decision      evidenceAuditModelDecision `json:"decision"`
-	Usage         AgentTraceUsage            `json:"usage"`
-	CandidateHash string                     `json:"candidate_hash"`
+	Version              string                     `json:"version"`
+	AuditID              string                     `json:"audit_id"`
+	InputHash            string                     `json:"input_hash"`
+	Package              EvidenceAuditPackageRef    `json:"package"`
+	Model                EvidenceAuditModelIdentity `json:"model"`
+	ClaimIndex           int                        `json:"claim_index"`
+	ClaimHash            string                     `json:"claim_hash"`
+	RequestIdentity      string                     `json:"request_identity"`
+	RetrievalFingerprint string                     `json:"retrieval_fingerprint"`
+	Decision             evidenceAuditModelDecision `json:"decision"`
+	Usage                AgentTraceUsage            `json:"usage"`
+	CandidateHash        string                     `json:"candidate_hash"`
 }
 
 type evidenceAuditModelInvocation struct {
@@ -399,7 +412,8 @@ func validateAgentTraceObservability(value *AgentTraceObservability) error {
 		return fmt.Errorf("observability.abstention_reason must be a bounded reason code")
 	}
 	if value.TerminalProtocol != "" &&
-		value.TerminalProtocol != "prepared-report-trace-then-audit-publish.v1" {
+		value.TerminalProtocol != "prepared-report-trace-then-audit-publish.v1" &&
+		value.TerminalProtocol != "prepared-report-trace-receipt-audit-publish.v2" {
 		return fmt.Errorf("observability terminal_protocol is invalid")
 	}
 	return validateAgentTraceUsage(value.Usage)
@@ -510,6 +524,12 @@ func (s *BookKnowledgeStore) AgentTracePath(traceID string) string {
 	return filepath.Join(s.AgentTraceDir(), sanitizeBookKnowledgeID(traceID)+".json")
 }
 
+func (s *BookKnowledgeStore) EvidenceAuditTraceReceiptPath(traceID string) string {
+	return filepath.Join(
+		s.AgentTraceDir(), "receipts", sanitizeBookKnowledgeID(traceID)+".json",
+	)
+}
+
 func (s *BookKnowledgeStore) EvidenceAuditTraceTerminalPath(auditID string) string {
 	return filepath.Join(s.AgentTraceDir(), "prepared", sanitizeBookKnowledgeID(auditID)+".json")
 }
@@ -523,7 +543,7 @@ func (s *BookKnowledgeStore) acquireEvidenceAuditExecutionLock(
 	auditID string,
 ) (func(), error) {
 	dir := s.evidenceAuditExecutionDir(auditID)
-	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(dir); err != nil {
 		return nil, err
 	}
 	fileLock := flock.New(filepath.Join(dir, ".run.lock"))
@@ -563,7 +583,7 @@ func (s *BookKnowledgeStore) prepareEvidenceAuditExecutionPlan(
 	path := filepath.Join(s.evidenceAuditExecutionDir(audit.AuditID), "plan.json")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return evidenceAuditExecutionPlan{}, err
 	}
 	if existing, readErr := os.ReadFile(path); readErr == nil {
@@ -609,6 +629,7 @@ func validateEvidenceAuditExecutionPlan(plan evidenceAuditExecutionPlan) error {
 func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 	plan evidenceAuditExecutionPlan,
 	claimIndex int,
+	requestIdentity, retrievalFingerprint string,
 	decision evidenceAuditModelDecision,
 	usage AgentTraceUsage,
 ) (evidenceAuditClaimCandidate, error) {
@@ -623,6 +644,7 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 		AuditID: plan.AuditID, InputHash: plan.InputHash,
 		Package: plan.Package, Model: plan.Model,
 		ClaimIndex: claimIndex, ClaimHash: plan.ClaimHashes[claimIndex],
+		RequestIdentity: requestIdentity, RetrievalFingerprint: retrievalFingerprint,
 		Decision: decision, Usage: usage,
 	}
 	hash, err := evidenceAuditClaimCandidateHash(candidate)
@@ -643,6 +665,9 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 	)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
+		return evidenceAuditClaimCandidate{}, err
+	}
 	if err := writeEvidenceAuditImmutableFile(path, payload); err != nil {
 		return evidenceAuditClaimCandidate{}, err
 	}
@@ -691,10 +716,10 @@ func (s *BookKnowledgeStore) beginEvidenceAuditModelInvocation(
 	if err != nil {
 		return evidenceAuditModelInvocation{}, false, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return evidenceAuditModelInvocation{}, false, err
 	}
-	if err := writeFileAtomically(path, payload); err != nil {
+	if err := writeEvidenceAuditPrivateFile(path, payload); err != nil {
 		return evidenceAuditModelInvocation{}, false, err
 	}
 	return invocation, true, nil
@@ -723,7 +748,7 @@ func (s *BookKnowledgeStore) completeEvidenceAuditModelInvocation(
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return writeFileAtomically(path, payload)
+	return writeEvidenceAuditPrivateFile(path, payload)
 }
 
 func validateEvidenceAuditModelInvocation(
@@ -817,6 +842,9 @@ func validateEvidenceAuditClaimCandidate(
 	plan evidenceAuditExecutionPlan,
 	candidate evidenceAuditClaimCandidate,
 ) error {
+	// These hashes bind recovery to the canonical request and retrieval snapshot.
+	// The local state directory remains a trusted boundary; this is drift
+	// detection, not a claim of cryptographic authenticity against a local writer.
 	if candidate.Version != evidenceAuditExecutionVersion ||
 		candidate.AuditID != plan.AuditID || candidate.InputHash != plan.InputHash ||
 		!reflect.DeepEqual(candidate.Package, plan.Package) ||
@@ -824,6 +852,12 @@ func validateEvidenceAuditClaimCandidate(
 		candidate.ClaimIndex < 0 || candidate.ClaimIndex >= len(plan.ClaimHashes) ||
 		candidate.ClaimHash != plan.ClaimHashes[candidate.ClaimIndex] {
 		return fmt.Errorf("evidence audit candidate identity does not match execution plan")
+	}
+	if err := validateAgentSHA256("candidate request_identity", candidate.RequestIdentity); err != nil {
+		return err
+	}
+	if err := validateAgentSHA256("candidate retrieval_fingerprint", candidate.RetrievalFingerprint); err != nil {
+		return err
 	}
 	if _, err := parseEvidenceAuditModelDecision(mustEncodeEvidenceAuditDecision(candidate.Decision)); err != nil {
 		return fmt.Errorf("validate evidence audit candidate decision: %w", err)
@@ -860,7 +894,7 @@ func (s *BookKnowledgeStore) prepareEvidenceAuditTraceTerminal(terminal evidence
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	existing, err := os.ReadFile(path)
@@ -873,7 +907,7 @@ func (s *BookKnowledgeStore) prepareEvidenceAuditTraceTerminal(terminal evidence
 	if !os.IsNotExist(err) {
 		return err
 	}
-	return writeFileAtomically(path, payload)
+	return writeEvidenceAuditPrivateFile(path, payload)
 }
 
 func (s *BookKnowledgeStore) finalizeEvidenceAuditTraceTerminalMetadata(
@@ -892,7 +926,7 @@ func (s *BookKnowledgeStore) finalizeEvidenceAuditTraceTerminalMetadata(
 	if _, err := os.Stat(path); err != nil {
 		return err
 	}
-	return writeFileAtomically(path, payload)
+	return writeEvidenceAuditPrivateFile(path, payload)
 }
 
 func (s *BookKnowledgeStore) loadEvidenceAuditTraceTerminal(auditID string) (*evidenceAuditTraceTerminal, error) {
@@ -923,11 +957,110 @@ func (s *BookKnowledgeStore) finalizeEvidenceAuditTraceTerminal(terminal evidenc
 	if err := evidenceAuditTraceStorageFault(evidenceAuditTraceFaultBeforeSave, path); err != nil {
 		return err
 	}
+	startedAt := time.Now()
 	if err := s.SaveAgentTrace(terminal.Trace); err != nil {
+		return err
+	}
+	duration := time.Since(startedAt).Milliseconds()
+	if duration < 1 {
+		duration = 1
+	}
+	if err := s.saveEvidenceAuditTraceReceipt(terminal.Trace, duration); err != nil {
+		s.mu.Lock()
+		_ = os.Remove(s.AgentTracePath(terminal.Trace.TraceID))
+		s.mu.Unlock()
 		return err
 	}
 	if err := evidenceAuditTraceStorageFault(evidenceAuditTraceFaultBeforeFinalize, path); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) saveEvidenceAuditTraceReceipt(
+	trace AgentTrace,
+	durationMS int64,
+) error {
+	payload, err := encodeJSONFile(trace)
+	if err != nil {
+		return err
+	}
+	receipt := evidenceAuditTraceReceipt{
+		Version: evidenceAuditTraceReceiptVersion, TraceID: trace.TraceID,
+		TraceHash: sha256Fingerprint(payload), Status: evidenceAuditTraceReceiptStatus(trace),
+		DurationMS: durationMS, SavedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := validateEvidenceAuditTraceReceipt(receipt, payload); err != nil {
+		return err
+	}
+	receiptPayload, err := encodeJSONFile(receipt)
+	if err != nil {
+		return err
+	}
+	return writeEvidenceAuditPrivateFile(
+		s.EvidenceAuditTraceReceiptPath(trace.TraceID), receiptPayload,
+	)
+}
+
+func evidenceAuditTraceReceiptStatus(trace AgentTrace) string {
+	if trace.Observability != nil {
+		for _, stage := range trace.Observability.Stages {
+			if stage.Name == "trace_persistence" && stage.Status == "failed" {
+				return "failed"
+			}
+		}
+	}
+	return "completed"
+}
+
+func validateEvidenceAuditTraceReceipt(
+	receipt evidenceAuditTraceReceipt,
+	tracePayload []byte,
+) error {
+	if receipt.Version != evidenceAuditTraceReceiptVersion ||
+		strings.TrimSpace(receipt.TraceID) == "" ||
+		(receipt.Status != "completed" && receipt.Status != "failed") ||
+		receipt.DurationMS < 0 || receipt.DurationMS > int64((24*time.Hour)/time.Millisecond) {
+		return fmt.Errorf("invalid evidence audit trace persistence receipt")
+	}
+	if err := validateAgentSHA256("trace receipt hash", receipt.TraceHash); err != nil {
+		return err
+	}
+	if receipt.TraceHash != sha256Fingerprint(tracePayload) {
+		return fmt.Errorf("trace persistence receipt does not match stored trace")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, receipt.SavedAt); err != nil {
+		return fmt.Errorf("trace receipt saved_at must be RFC3339: %w", err)
+	}
+	return nil
+}
+
+func mergeEvidenceAuditTraceReceipt(
+	trace *AgentTrace,
+	receipt evidenceAuditTraceReceipt,
+	tracePayload []byte,
+) error {
+	if trace == nil || trace.TraceID != receipt.TraceID {
+		return fmt.Errorf("trace persistence receipt identity mismatch")
+	}
+	if err := validateEvidenceAuditTraceReceipt(receipt, tracePayload); err != nil {
+		return err
+	}
+	if trace.Observability == nil {
+		return fmt.Errorf("evidence audit trace receipt requires observability")
+	}
+	found := false
+	for index := range trace.Observability.Stages {
+		stage := &trace.Observability.Stages[index]
+		if stage.Name != "trace_persistence" {
+			continue
+		}
+		stage.Status = receipt.Status
+		stage.DurationMS = receipt.DurationMS
+		found = true
+	}
+	if !found {
+		return fmt.Errorf("trace persistence receipt has no target stage")
 	}
 	return nil
 }
@@ -1046,17 +1179,66 @@ func (s *BookKnowledgeStore) LoadAgentTrace(traceID string) (*AgentTrace, error)
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	tracePayload, err := os.ReadFile(s.AgentTracePath(traceID))
+	if err != nil {
+		return nil, err
+	}
 	var trace AgentTrace
-	if err := readJSONFile(s.AgentTracePath(traceID), &trace); err != nil {
+	if err := json.Unmarshal(tracePayload, &trace); err != nil {
 		return nil, err
 	}
 	if trace.TraceID != traceID {
 		return nil, fmt.Errorf("stored trace identity does not match requested trace_id")
 	}
+	if trace.EvidenceAudit != nil && trace.Observability != nil &&
+		trace.Observability.TerminalProtocol == "prepared-report-trace-receipt-audit-publish.v2" {
+		var receipt evidenceAuditTraceReceipt
+		if err := readJSONFile(s.EvidenceAuditTraceReceiptPath(traceID), &receipt); err != nil {
+			return nil, fmt.Errorf("load evidence audit trace persistence receipt: %w", err)
+		}
+		if err := mergeEvidenceAuditTraceReceipt(&trace, receipt, tracePayload); err != nil {
+			return nil, err
+		}
+	}
 	if err := ValidateAgentTrace(trace); err != nil {
 		return nil, err
 	}
 	return &trace, nil
+}
+
+func ensureEvidenceAuditPrivateDir(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o700)
+}
+
+func writeEvidenceAuditPrivateFile(path string, payload []byte) error {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
+		return err
+	}
+	tempPath, err := writeEvidenceAuditSyncedTemp(
+		filepath.Dir(path), "."+filepath.Base(path)+".tmp-", payload,
+	)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempPath)
+	if err := os.Rename(tempPath, path); err != nil {
+		if runtime.GOOS != "windows" {
+			return err
+		}
+		if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
+			return removeErr
+		}
+		if err := os.Rename(tempPath, path); err != nil {
+			return err
+		}
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return err
+	}
+	return syncEvidenceAuditDir(filepath.Dir(path))
 }
 
 func ReplayAgentTrace(trace AgentTrace, fixture AgentReplayFixture) (AgentReplayResult, error) {

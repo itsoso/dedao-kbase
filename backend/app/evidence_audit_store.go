@@ -134,7 +134,7 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 		return nil, false, err
 	}
 	defer unlockRoot()
-	if err := os.MkdirAll(store.EvidenceAuditDir(), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(store.EvidenceAuditDir()); err != nil {
 		return nil, false, err
 	}
 	manifest, err := store.loadEvidenceAuditManifestUnlocked()
@@ -216,26 +216,71 @@ func CreateEvidenceAudit(store *BookKnowledgeStore, input EvidenceAuditInput, id
 	return &audit, true, nil
 }
 
+const EvidenceAuditRetryScope = "evidence-audit:retry"
+
+type EvidenceAuditRetryAuthorization struct {
+	AuditID   string
+	Actor     string
+	Issuer    string
+	Scope     string
+	ExpiresAt time.Time
+	Nonce     string
+	Signature string
+	Verified  bool
+}
+
+type EvidenceAuditRetryAuthorizationValidator func(
+	authorization EvidenceAuditRetryAuthorization,
+	now time.Time,
+) error
+
 func ManualRetryEvidenceAudit(
 	store *BookKnowledgeStore,
-	failedAuditID, authorizationToken, idempotencyKey string,
+	failedAuditID string,
+	authorization EvidenceAuditRetryAuthorization,
+	validateAuthorization EvidenceAuditRetryAuthorizationValidator,
+	idempotencyKey string,
 	now time.Time,
 ) (*EvidenceAudit, bool, error) {
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
 	failedAuditID = strings.TrimSpace(failedAuditID)
-	authorizationToken = strings.TrimSpace(authorizationToken)
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
-	if failedAuditID == "" || authorizationToken == "" || idempotencyKey == "" {
-		return nil, false, fmt.Errorf("failed_audit_id, authorization_token, and idempotency_key are required")
+	if failedAuditID == "" || idempotencyKey == "" {
+		return nil, false, fmt.Errorf("failed_audit_id and idempotency_key are required")
 	}
-	requestIdentity := evidenceAuditOpaqueIdentity(
-		"manual-retry\x00" + failedAuditID + "\x00" + authorizationToken + "\x00" + idempotencyKey,
-	)
 	if now.IsZero() {
 		now = time.Now()
 	}
+	if validateAuthorization == nil {
+		return nil, false, fmt.Errorf("verified retry authorization validator is required")
+	}
+	if !authorization.Verified ||
+		strings.TrimSpace(authorization.AuditID) != failedAuditID ||
+		strings.TrimSpace(authorization.Actor) == "" ||
+		len(authorization.Actor) > 128 ||
+		strings.TrimSpace(authorization.Issuer) == "" ||
+		len(authorization.Issuer) > 128 ||
+		strings.TrimSpace(authorization.Scope) != EvidenceAuditRetryScope ||
+		strings.TrimSpace(authorization.Nonce) == "" ||
+		len(authorization.Nonce) > 256 ||
+		strings.TrimSpace(authorization.Signature) == "" ||
+		len(authorization.Signature) > 1024 ||
+		authorization.ExpiresAt.IsZero() || !authorization.ExpiresAt.After(now) {
+		return nil, false, fmt.Errorf("retry authorization is invalid or expired")
+	}
+	if err := validateAuthorization(authorization, now); err != nil {
+		return nil, false, fmt.Errorf("validate retry authorization: %w", err)
+	}
+	requestIdentity := evidenceAuditOpaqueIdentity(
+		"manual-retry\x00" + failedAuditID + "\x00" +
+			strings.TrimSpace(authorization.Actor) + "\x00" +
+			strings.TrimSpace(authorization.Issuer) + "\x00" +
+			strings.TrimSpace(authorization.Scope) + "\x00" +
+			strings.TrimSpace(authorization.Nonce) + "\x00" +
+			strings.TrimSpace(authorization.Signature) + "\x00" + idempotencyKey,
+	)
 	timestamp := evidenceAuditTimestamp(now)
 
 	store.mu.Lock()
@@ -268,6 +313,16 @@ func ManualRetryEvidenceAudit(
 			source.FailureCode,
 		)
 	}
+	for index := range manifest.Audits {
+		active := &manifest.Audits[index]
+		if active.RetryOf == source.AuditID &&
+			(active.Status == EvidenceAuditQueued || active.Status == EvidenceAuditRunning) {
+			return nil, false, fmt.Errorf(
+				"%w: audit %q already has active retry %q",
+				ErrEvidenceAuditStateConflict, failedAuditID, active.AuditID,
+			)
+		}
+	}
 	if len(manifest.Audits) >= evidenceAuditMaxManifestAudits ||
 		len(manifest.Idempotency) >= evidenceAuditMaxManifestIdempotency {
 		return nil, false, fmt.Errorf("evidence audit manifest capacity reached")
@@ -275,6 +330,12 @@ func ManualRetryEvidenceAudit(
 	attempt := source.Attempt + 1
 	if attempt < 2 {
 		attempt = 2
+	}
+	for index := range manifest.Audits {
+		if manifest.Audits[index].RetryOf == source.AuditID &&
+			manifest.Audits[index].Attempt >= attempt {
+			attempt = manifest.Audits[index].Attempt + 1
+		}
 	}
 	auditID := fmt.Sprintf(
 		"audit-%s-attempt-%d-%s",
@@ -769,7 +830,7 @@ func (s *BookKnowledgeStore) writeEvidenceAuditInputUnlocked(input EvidenceAudit
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	return writeEvidenceAuditImmutableFile(path, payload)
@@ -795,7 +856,7 @@ func (s *BookKnowledgeStore) writeEvidenceAuditReportUnlocked(report EvidenceAud
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	return writeEvidenceAuditImmutableFile(path, payload)
@@ -991,10 +1052,7 @@ func (s *BookKnowledgeStore) writePreparedEvidenceAuditReportUnlocked(report Evi
 		return err
 	}
 	path := s.EvidenceAuditPreparedPath(report.AuditID)
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
-		return err
-	}
-	return writeFileAtomically(path, payload)
+	return writeEvidenceAuditPrivateFile(path, payload)
 }
 
 func evidenceAuditReportContentEqual(left, right EvidenceAudit) bool {
@@ -1064,7 +1122,7 @@ func evidenceAuditHashName(hash string) string {
 }
 
 func writeEvidenceAuditImmutableFile(path string, payload []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-", payload)
@@ -1104,7 +1162,7 @@ func writeEvidenceAuditImmutableFile(path string, payload []byte) error {
 }
 
 func (s *BookKnowledgeStore) acquireEvidenceAuditRootLock() (func(), error) {
-	if err := os.MkdirAll(s.EvidenceAuditDir(), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(s.EvidenceAuditDir()); err != nil {
 		return nil, err
 	}
 	fileLock := flock.New(filepath.Join(s.EvidenceAuditDir(), ".store.lock"))
@@ -1125,7 +1183,7 @@ func writeEvidenceAuditManifestCrashSafe(path string, payload []byte) error {
 	if _, err := decodeEvidenceAuditManifestPayload(payload); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), os.ModePerm); err != nil {
+	if err := ensureEvidenceAuditPrivateDir(filepath.Dir(path)); err != nil {
 		return err
 	}
 	tempPath, err := writeEvidenceAuditSyncedTemp(filepath.Dir(path), ".manifest.next-", payload)
