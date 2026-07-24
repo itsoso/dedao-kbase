@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -67,12 +68,21 @@ type AgentTrace struct {
 }
 
 type AgentTraceObservability struct {
-	Stages                            []AgentTraceStage `json:"stages"`
-	CitationResolutionRate            float64           `json:"citation_resolution_rate"`
-	IndependentPublicationSourceCount int               `json:"independent_publication_source_count"`
-	AbstentionReason                  string            `json:"abstention_reason,omitempty"`
-	Usage                             AgentTraceUsage   `json:"usage"`
-	TerminalProtocol                  string            `json:"terminal_protocol,omitempty"`
+	Stages                            []AgentTraceStage             `json:"stages"`
+	CitationResolutionRate            float64                       `json:"citation_resolution_rate"`
+	IndependentPublicationSourceCount int                           `json:"independent_publication_source_count"`
+	FreshnessDecisions                []AgentTraceFreshnessDecision `json:"freshness_decisions,omitempty"`
+	ReservedCostUSD                   float64                       `json:"reserved_cost_usd,omitempty"`
+	AbstentionReason                  string                        `json:"abstention_reason,omitempty"`
+	Usage                             AgentTraceUsage               `json:"usage"`
+	TerminalProtocol                  string                        `json:"terminal_protocol,omitempty"`
+}
+
+type AgentTraceFreshnessDecision struct {
+	ReleaseID   string `json:"release_id"`
+	CitationID  string `json:"citation_id"`
+	PublishedAt string `json:"published_at,omitempty"`
+	Decision    string `json:"decision"`
 }
 
 type AgentTraceStage struct {
@@ -138,6 +148,7 @@ type evidenceAuditClaimCandidate struct {
 	RetrievalFingerprint string                     `json:"retrieval_fingerprint"`
 	Decision             evidenceAuditModelDecision `json:"decision"`
 	Usage                AgentTraceUsage            `json:"usage"`
+	ReservationUSD       float64                    `json:"reservation_usd"`
 	CandidateHash        string                     `json:"candidate_hash"`
 }
 
@@ -200,9 +211,11 @@ type AgentTraceFinal struct {
 }
 
 type AgentTraceCitation struct {
-	CitationID string `json:"citation_id"`
-	ReleaseID  string `json:"release_id"`
-	EvidenceID string `json:"evidence_id"`
+	CitationID        string `json:"citation_id"`
+	ReleaseID         string `json:"release_id"`
+	EvidenceID        string `json:"evidence_id"`
+	PublishedAt       string `json:"published_at,omitempty"`
+	FreshnessDecision string `json:"freshness_decision,omitempty"`
 }
 
 type AgentReplayFixture struct {
@@ -407,6 +420,31 @@ func validateAgentTraceObservability(value *AgentTraceObservability) error {
 	if value.IndependentPublicationSourceCount < 0 || value.IndependentPublicationSourceCount > evidenceAuditMaxReleases {
 		return fmt.Errorf("observability independent source count is invalid")
 	}
+	if value.ReservedCostUSD < 0 || value.ReservedCostUSD > 1_000_000 ||
+		math.IsNaN(value.ReservedCostUSD) || math.IsInf(value.ReservedCostUSD, 0) {
+		return fmt.Errorf("observability reserved cost is invalid")
+	}
+	if len(value.FreshnessDecisions) > evidenceAuditMaxListItems {
+		return fmt.Errorf("observability freshness decisions exceed limit")
+	}
+	for index, decision := range value.FreshnessDecisions {
+		if strings.TrimSpace(decision.ReleaseID) == "" ||
+			strings.TrimSpace(decision.CitationID) == "" {
+			return fmt.Errorf("observability freshness_decisions[%d] identity is required", index)
+		}
+		switch decision.Decision {
+		case EvidenceAuditFreshnessFresh, EvidenceAuditFreshnessStale:
+			if _, err := parseEvidenceAuditPublicationDate(decision.PublishedAt); err != nil {
+				return fmt.Errorf("observability freshness_decisions[%d].published_at: %w", index, err)
+			}
+		case EvidenceAuditFreshnessMissing:
+			if strings.TrimSpace(decision.PublishedAt) != "" {
+				return fmt.Errorf("observability freshness_decisions[%d] missing date must be empty", index)
+			}
+		default:
+			return fmt.Errorf("observability freshness_decisions[%d] decision is invalid", index)
+		}
+	}
 	if value.AbstentionReason != "" &&
 		(len(value.AbstentionReason) > 128 || !agentPackageIDPattern.MatchString(value.AbstentionReason)) {
 		return fmt.Errorf("observability.abstention_reason must be a bounded reason code")
@@ -502,6 +540,20 @@ func validateAgentTraceCitations(
 		}
 		if _, ok := releases[citation.ReleaseID]; !ok {
 			return fmt.Errorf("citation release %q is outside trace scope", citation.ReleaseID)
+		}
+		if citation.PublishedAt != "" || citation.FreshnessDecision != "" {
+			switch citation.FreshnessDecision {
+			case EvidenceAuditFreshnessFresh, EvidenceAuditFreshnessStale:
+				if _, err := parseEvidenceAuditPublicationDate(citation.PublishedAt); err != nil {
+					return fmt.Errorf("citations[%d].published_at: %w", index, err)
+				}
+			case EvidenceAuditFreshnessMissing:
+				if strings.TrimSpace(citation.PublishedAt) != "" {
+					return fmt.Errorf("citations[%d] missing publication date must be empty", index)
+				}
+			default:
+				return fmt.Errorf("citations[%d].freshness_decision is invalid", index)
+			}
 		}
 		retrieval, ok := evidence[citation.EvidenceID]
 		if !ok || retrieval.ReleaseID != citation.ReleaseID {
@@ -632,6 +684,7 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 	requestIdentity, retrievalFingerprint string,
 	decision evidenceAuditModelDecision,
 	usage AgentTraceUsage,
+	reservationUSD float64,
 ) (evidenceAuditClaimCandidate, error) {
 	if err := validateEvidenceAuditExecutionPlan(plan); err != nil {
 		return evidenceAuditClaimCandidate{}, err
@@ -645,7 +698,7 @@ func (s *BookKnowledgeStore) saveEvidenceAuditClaimCandidate(
 		Package: plan.Package, Model: plan.Model,
 		ClaimIndex: claimIndex, ClaimHash: plan.ClaimHashes[claimIndex],
 		RequestIdentity: requestIdentity, RetrievalFingerprint: retrievalFingerprint,
-		Decision: decision, Usage: usage,
+		Decision: decision, Usage: usage, ReservationUSD: reservationUSD,
 	}
 	hash, err := evidenceAuditClaimCandidateHash(candidate)
 	if err != nil {
@@ -864,6 +917,10 @@ func validateEvidenceAuditClaimCandidate(
 	}
 	if err := validateAgentTraceUsage(candidate.Usage); err != nil {
 		return fmt.Errorf("validate evidence audit candidate usage: %w", err)
+	}
+	if candidate.ReservationUSD <= 0 || candidate.ReservationUSD > 1_000_000 ||
+		math.IsNaN(candidate.ReservationUSD) || math.IsInf(candidate.ReservationUSD, 0) {
+		return fmt.Errorf("candidate reservation_usd is invalid")
 	}
 	expected, err := evidenceAuditClaimCandidateHash(candidate)
 	if err != nil {

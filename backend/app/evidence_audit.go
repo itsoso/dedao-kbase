@@ -27,6 +27,10 @@ const (
 	EvidenceAuditReleasePrimary    = "primary"
 	EvidenceAuditReleaseSupporting = "supporting"
 
+	EvidenceAuditFreshnessFresh   = "fresh"
+	EvidenceAuditFreshnessStale   = "stale"
+	EvidenceAuditFreshnessMissing = "missing"
+
 	evidenceAuditMaxReleases            = 32
 	evidenceAuditMaxCitationsPerRelease = 512
 	evidenceAuditMaxTotalCitations      = 2048
@@ -139,6 +143,8 @@ type EvidenceAuditEvidenceRef struct {
 	ClaimID             string `json:"claim_id"`
 	ChunkID             string `json:"chunk_id"`
 	CitationID          string `json:"citation_id"`
+	PublishedAt         string `json:"published_at"`
+	FreshnessDecision   string `json:"freshness_decision"`
 	Conflict            bool   `json:"conflict,omitempty"`
 }
 
@@ -603,6 +609,18 @@ func validateCompletedEvidenceAudit(audit EvidenceAudit) error {
 			if !evidenceAuditRefResolvable(ref) {
 				return fmt.Errorf("claim_audits[%d].evidence_refs[%d] requires a pinned citation", index, evidenceIndex)
 			}
+			switch ref.FreshnessDecision {
+			case EvidenceAuditFreshnessFresh:
+				if _, err := parseEvidenceAuditPublicationDate(ref.PublishedAt); err != nil {
+					return fmt.Errorf("claim_audits[%d].evidence_refs[%d] published_at: %w", index, evidenceIndex, err)
+				}
+			case EvidenceAuditFreshnessMissing:
+				if strings.TrimSpace(ref.PublishedAt) != "" {
+					return fmt.Errorf("claim_audits[%d].evidence_refs[%d] missing date must be empty", index, evidenceIndex)
+				}
+			default:
+				return fmt.Errorf("claim_audits[%d].evidence_refs[%d] is not freshness eligible", index, evidenceIndex)
+			}
 			release, ok := pinnedReleases[strings.TrimSpace(ref.ReleaseID)]
 			if !ok {
 				return fmt.Errorf(
@@ -735,10 +753,24 @@ func evidenceAuditRefResolvable(ref EvidenceAuditEvidenceRef) bool {
 		strings.TrimSpace(ref.PublicationIdentity) == "" ||
 		strings.TrimSpace(ref.CitationID) == "" ||
 		strings.TrimSpace(ref.ClaimID) == "" ||
-		strings.TrimSpace(ref.ChunkID) == "" {
+		strings.TrimSpace(ref.ChunkID) == "" ||
+		strings.TrimSpace(ref.FreshnessDecision) == "" {
 		return false
 	}
 	return validEvidenceAuditSHA256(ref.PublicationIdentity)
+}
+
+func parseEvidenceAuditPublicationDate(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return time.Time{}, fmt.Errorf("must be a bounded RFC3339 timestamp or date")
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02"} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("must be a valid RFC3339 timestamp or date")
 }
 
 func evidenceAuditReleaseAllowsCitation(release EvidenceAuditReleaseRef, ref EvidenceAuditEvidenceRef) bool {

@@ -105,6 +105,12 @@ func TestEvidenceAuditValidationRejectsInvalidContractAndUngroundedVerdicts(t *t
 		{name: "evidence source type mismatch", edit: func(a *EvidenceAudit) {
 			a.ClaimAudits[0].Evidence[0].SourceType = "wechat_mp_article"
 		}, want: "source_type"},
+		{name: "invalid evidence publication date", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits[0].Evidence[0].PublishedAt = "not-a-date"
+		}, want: "published_at"},
+		{name: "stale evidence in report", edit: func(a *EvidenceAudit) {
+			a.ClaimAudits[0].Evidence[0].FreshnessDecision = EvidenceAuditFreshnessStale
+		}, want: "freshness eligible"},
 		{name: "injected claim", edit: func(a *EvidenceAudit) {
 			a.ClaimAudits[0].SourceClaim = "claim not selected by the input"
 		}, want: "selected_claims"},
@@ -408,6 +414,8 @@ func validEvidenceRef(
 		ReleaseID: releaseID, ContentHash: contentHash, Role: role, SourceType: sourceType,
 		PublicationIdentity: publicationIdentity,
 		CitationID:          citationID, ClaimID: claimID, ChunkID: chunkID,
+		PublishedAt:       "2026-07-20T00:00:00Z",
+		FreshnessDecision: EvidenceAuditFreshnessFresh,
 	}
 }
 

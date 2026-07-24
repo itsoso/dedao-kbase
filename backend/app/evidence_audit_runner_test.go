@@ -153,7 +153,7 @@ func TestEvidenceAuditRunnerGroupsAndCapsSupportingEvidenceAcrossReleases(t *tes
 	}
 	retrieved, err := retrieveEvidenceAuditSupportingEvidence(
 		context.Background(), store, loaded, releases, "Synthetic grounded statement",
-		newEvidenceAuditObserver(evidenceAuditRunnerConfig()),
+		testAgentPackageTime(), newEvidenceAuditObserver(evidenceAuditRunnerConfig()),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -219,6 +219,7 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 	for _, scope := range []string{
 		"Diagnose me and recommend an individual treatment.",
 		"Evidence audit: Should I undergo surgery?",
+		"I need surgery.",
 		"Evidence audit: Should this patient undergo surgery?",
 		"Clinical trial evidence: Should patient John undergo surgery?",
 		"Review the evidence: should this 52-year-old person start treatment?",
@@ -265,6 +266,7 @@ func TestEvidenceAuditRunnerSafelyAbstainsFromMedicalAdvice(t *testing.T) {
 func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
 	for _, scope := range []string{
 		"In adults with resectable lung cancer, does surgery improve five-year survival compared with radiotherapy?",
+		"Chemotherapy improves survival in adults.",
 		"在可切除肺癌患者中，手术相比放疗是否改善五年生存率？",
 	} {
 		t.Run(scope, func(t *testing.T) {
@@ -283,6 +285,199 @@ func TestEvidenceAuditRunnerAllowsPopulationEvidenceQuestions(t *testing.T) {
 				t.Fatalf("population evidence path = %#v calls=%d", completed, len(client.calls))
 			}
 		})
+	}
+}
+
+func TestEvidenceAuditRunnerEnforcesAllowedVerdictSubset(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	loaded, releases, err := loadEvidenceAuditPackageSnapshot(store, pkg.PackageID, pkg.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retrieved, err := retrieveEvidenceAuditSupportingEvidence(
+		context.Background(), store, loaded, releases, "Synthetic grounded statement",
+		testAgentPackageTime(), newEvidenceAuditObserver(evidenceAuditRunnerConfig()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := evidenceAuditModelDecision{
+		CandidateVerdict: EvidenceAuditVerdictSupported,
+		Rationale:        "supported",
+		Evidence: []evidenceAuditModelEvidence{{
+			ReleaseID: "support-a", CitationID: "support-a-c1", Stance: "supports",
+		}},
+	}
+
+	loaded.EvidencePolicy.AllowedVerdicts = []string{EvidenceAuditVerdictInsufficient}
+	claim, err := decideEvidenceAuditClaim(loaded, "Synthetic grounded statement", retrieved, decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Verdict != EvidenceAuditVerdictInsufficient || len(claim.Evidence) != 0 {
+		t.Fatalf("disallowed verdict was not downgraded: %#v", claim)
+	}
+
+	loaded.EvidencePolicy.AllowedVerdicts = []string{EvidenceAuditVerdictMixed}
+	if _, err := decideEvidenceAuditClaim(loaded, "Synthetic grounded statement", retrieved, decision); err == nil ||
+		!strings.Contains(err.Error(), "allowed_verdicts") {
+		t.Fatalf("missing insufficient policy violation = %v", err)
+	}
+}
+
+func TestEvidenceAuditRunnerFiltersMissingAndStaleSupportingEvidence(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	loaded, releases, err := loadEvidenceAuditPackageSnapshot(store, pkg.PackageID, pkg.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.EvidencePolicy.FreshnessPolicy.MaxAgeDays = 30
+	loaded.EvidencePolicy.FreshnessPolicy.RequirePublicationDate = true
+	now := testAgentPackageTime()
+
+	stale := releases["support-a"]
+	stale.Book.PublishedAt = now.AddDate(0, 0, -31).Format(time.RFC3339)
+	stale.Citations[0].PublishedAt = stale.Book.PublishedAt
+	releases["support-a"] = stale
+	stalePayload, err := encodeJSONFile(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.KnowledgeReleasePath(stale.ReleaseID), stalePayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := releases["support-b"]
+	missing.Book.PublishedAt = ""
+	missing.Citations[0].PublishedAt = ""
+	releases["support-b"] = missing
+	missingPayload, err := encodeJSONFile(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.KnowledgeReleasePath(missing.ReleaseID), missingPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	observer := newEvidenceAuditObserver(evidenceAuditRunnerConfig())
+	retrieved, err := retrieveEvidenceAuditSupportingEvidence(
+		context.Background(), store, loaded, releases, "Synthetic grounded statement",
+		now, observer,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retrieved) != 0 {
+		t.Fatalf("stale or undated evidence remained eligible: %#v", retrieved)
+	}
+	snapshot := observer.snapshot(AgentTraceOutcomeCompleted)
+	if len(snapshot.FreshnessDecisions) != 2 {
+		t.Fatalf("trace freshness decisions = %#v", snapshot.FreshnessDecisions)
+	}
+
+	fresh := releases["support-a"]
+	fresh.Citations[0].PublishedAt = now.AddDate(0, 0, -2).Format(time.RFC3339)
+	releases["support-a"] = fresh
+	freshPayload, err := encodeJSONFile(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.KnowledgeReleasePath(fresh.ReleaseID), freshPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	retrieved, err = retrieveEvidenceAuditSupportingEvidence(
+		context.Background(), store, loaded, releases, "Synthetic grounded statement",
+		now, newEvidenceAuditObserver(evidenceAuditRunnerConfig()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retrieved) != 1 ||
+		retrieved[0].Ref.PublishedAt != fresh.Citations[0].PublishedAt ||
+		retrieved[0].Ref.FreshnessDecision != EvidenceAuditFreshnessFresh {
+		t.Fatalf("freshness metadata = %#v", retrieved)
+	}
+
+	loaded.EvidencePolicy.FreshnessPolicy.RequirePublicationDate = false
+	retrieved, err = retrieveEvidenceAuditSupportingEvidence(
+		context.Background(), store, loaded, releases, "Synthetic grounded statement",
+		now, newEvidenceAuditObserver(evidenceAuditRunnerConfig()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundMissing := false
+	for _, item := range retrieved {
+		if item.Ref.ReleaseID == "support-b" &&
+			item.Ref.FreshnessDecision == EvidenceAuditFreshnessMissing &&
+			item.Ref.PublishedAt == "" {
+			foundMissing = true
+		}
+	}
+	if !foundMissing {
+		t.Fatalf("optional missing publication date was not retained: %#v", retrieved)
+	}
+}
+
+func TestEvidenceAuditCostLedgerReservesWholeAuditBudgetAndRestoresCheckpoints(t *testing.T) {
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "short evidence request"}}
+	ledger := newEvidenceAuditCostLedger(0.25)
+	cfg := BookTokenPlanConfig{}
+	first, err := ledger.Reserve(messages, &cfg, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first <= 0 || ledger.Remaining() >= 0.25 {
+		t.Fatalf("first reservation=%f remaining=%f", first, ledger.Remaining())
+	}
+	restored := newEvidenceAuditCostLedger(0.25)
+	if err := restored.Restore(first); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Remaining() != ledger.Remaining() {
+		t.Fatalf("restored remaining=%f want=%f", restored.Remaining(), ledger.Remaining())
+	}
+	if _, err := restored.Reserve(messages, &cfg, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restored.Reserve(messages, &cfg, 1); err == nil {
+		t.Fatal("audit budget allowed an extra model reservation")
+	}
+}
+
+func TestEvidenceAuditRunnerDoesNotCallModelWhenWholeAuditBudgetIsInsufficient(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
+	pkg.Version = "2.0.1-low-budget"
+	pkg.LifecycleState = AgentPackageDraft
+	pkg.CreatedAt = ""
+	pkg.PublishedAt = ""
+	pkg.ContentHash = ""
+	pkg.ModelPolicy.MaxCostUSD = 0.1
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, finalized)
+	published, _, err := PublishAgentPackage(
+		store, finalized, "publish-low-budget", AgentReadOnlyToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit := createEvidenceAuditRunnerTask(
+		t, store, *published, "runner-low-whole-audit-budget", "Evidence comparison only.",
+	)
+	client := &evidenceAuditFakeClient{answers: []string{`must not be called`}}
+	if _, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID, client, evidenceAuditRunnerConfig(),
+	); err == nil || !strings.Contains(err.Error(), "max_cost_usd") {
+		t.Fatalf("budget error = %v", err)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("model calls = %d, want zero", len(client.calls))
+	}
+	failed, err := store.LoadEvidenceAudit(audit.AuditID)
+	if err != nil || failed.Status != EvidenceAuditFailed {
+		t.Fatalf("failed audit = %#v err=%v", failed, err)
 	}
 }
 
@@ -305,6 +500,7 @@ func TestEvidenceAuditRunnerRejectsIndividualDecisionsDespitePopulationPrefixes(
 	}
 	for _, scope := range []string{
 		"In adults with resectable lung cancer, does surgery improve five-year survival compared with radiotherapy?",
+		"Chemotherapy improves survival in adults.",
 		"在可切除肺癌患者中，手术相比放疗是否改善五年生存率？",
 	} {
 		if evidenceAuditRequestsMedicalAdvice(scope) {
@@ -1307,6 +1503,14 @@ func TestEvidenceAuditRunnerTraceIncludesBoundedDeterministicObservability(t *te
 		observability["independent_publication_source_count"] != float64(1) {
 		t.Fatalf("evidence metrics = %#v", observability)
 	}
+	if observability["reserved_cost_usd"].(float64) <= 0 {
+		t.Fatalf("audit budget reservation is missing: %#v", observability)
+	}
+	freshness, ok := observability["freshness_decisions"].([]any)
+	if !ok || len(freshness) == 0 ||
+		freshness[0].(map[string]any)["decision"] != EvidenceAuditFreshnessFresh {
+		t.Fatalf("freshness decisions = %#v", observability["freshness_decisions"])
+	}
 	usage := observability["usage"].(map[string]any)
 	if usage["status"] != "reported" ||
 		usage["prompt_tokens"] != float64(120) ||
@@ -1515,6 +1719,7 @@ func evidenceAuditRunnerTestStoreWithLimits(
 	primary := agentPackageTestRelease()
 	primary.ReleaseID = "primary"
 	primary.ContentHash = "sha256:" + strings.Repeat("1", 64)
+	primary.Book.PublishedAt = testAgentPackageTime().AddDate(0, 0, -10).Format(time.RFC3339)
 	primary.Analysis.Claims = []BookAnalysisClaim{
 		{ID: "claim-1", Statement: "Synthetic grounded statement", CitationIDs: []string{"citation-1"}},
 		{ID: "primary-c2", Statement: "Primary claim two", CitationIDs: []string{"primary-citation-2"}},
@@ -1541,14 +1746,15 @@ func evidenceAuditRunnerTestStoreWithLimits(
 		release.Book.BookID = release.BookID
 		release.Book.SourceType = supportTypes[index]
 		release.Book.SourceHTML = "private-body-marker"
+		release.Book.PublishedAt = testAgentPackageTime().AddDate(0, 0, -5-index).Format(time.RFC3339)
 		release.ContentHash = "sha256:" + strings.Repeat(string(rune('a'+index)), 64)
 		release.Analysis.Claims = []BookAnalysisClaim{
 			{ID: releaseID + "-claim-1", Statement: "Synthetic grounded statement supporting evidence", CitationIDs: []string{releaseID + "-c1"}},
 			{ID: releaseID + "-claim-2", Statement: "Primary claim two supporting evidence", CitationIDs: []string{releaseID + "-c2"}},
 		}
 		release.Citations = []BookKnowledgeCitation{
-			{CitationID: releaseID + "-c1", BookID: release.BookID, ChunkID: releaseID + "-chunk-1"},
-			{CitationID: releaseID + "-c2", BookID: release.BookID, ChunkID: releaseID + "-chunk-2"},
+			{CitationID: releaseID + "-c1", BookID: release.BookID, ChunkID: releaseID + "-chunk-1", PublishedAt: release.Book.PublishedAt},
+			{CitationID: releaseID + "-c2", BookID: release.BookID, ChunkID: releaseID + "-chunk-2", PublishedAt: release.Book.PublishedAt},
 		}
 		if err := store.saveKnowledgeRelease(release); err != nil {
 			t.Fatal(err)

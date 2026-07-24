@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -66,6 +67,9 @@ type evidenceAuditObserver struct {
 	citationAttempted int
 	citationResolved  int
 	publications      map[string]bool
+	freshness         []AgentTraceFreshnessDecision
+	freshnessSeen     map[string]bool
+	reservedCostUSD   float64
 	abstentionReason  string
 	usage             AgentTraceUsage
 	usageIncomplete   bool
@@ -88,7 +92,8 @@ func newEvidenceAuditObserver(config EvidenceAuditRunnerConfig) *evidenceAuditOb
 	}
 	return &evidenceAuditObserver{
 		now: now, stages: stages, publications: map[string]bool{},
-		usage: AgentTraceUsage{Status: "unknown"},
+		freshnessSeen: map[string]bool{},
+		usage:         AgentTraceUsage{Status: "unknown"},
 	}
 }
 
@@ -154,9 +159,35 @@ func (o *evidenceAuditObserver) snapshot(traceOutcome string) *AgentTraceObserva
 	return &AgentTraceObservability{
 		Stages: stages, CitationResolutionRate: rate,
 		IndependentPublicationSourceCount: len(o.publications),
+		FreshnessDecisions:                append([]AgentTraceFreshnessDecision(nil), o.freshness...),
+		ReservedCostUSD:                   o.reservedCostUSD,
 		AbstentionReason:                  reason, Usage: o.usage,
 		TerminalProtocol: "prepared-report-trace-receipt-audit-publish.v2",
 	}
+}
+
+func (o *evidenceAuditObserver) recordFreshness(
+	releaseID, citationID, publishedAt, decision string,
+) {
+	if o == nil || len(o.freshness) >= evidenceAuditMaxListItems {
+		return
+	}
+	key := releaseID + "\x00" + citationID
+	if o.freshnessSeen[key] {
+		return
+	}
+	o.freshnessSeen[key] = true
+	o.freshness = append(o.freshness, AgentTraceFreshnessDecision{
+		ReleaseID: releaseID, CitationID: citationID,
+		PublishedAt: strings.TrimSpace(publishedAt), Decision: decision,
+	})
+}
+
+func (o *evidenceAuditObserver) recordReservation(value float64) {
+	if o == nil || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return
+	}
+	o.reservedCostUSD += value
 }
 
 func (o *evidenceAuditObserver) mergeUsage(value AgentTraceUsage) {
@@ -452,6 +483,12 @@ func RunEvidenceAudit(
 		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, runErr)
 	}
 	if evidenceAuditRequestsMedicalAdvice(audit.Subject) || evidenceAuditRequestsMedicalAdvice(audit.Scope) {
+		if !evidenceAuditVerdictAllowed(pkg, EvidenceAuditVerdictInsufficient) {
+			return nil, failEvidenceAuditRun(
+				store, *audit, pkg, nil, traceID, config,
+				fmt.Errorf("evidence_policy.allowed_verdicts excludes required insufficient abstention"),
+			)
+		}
 		config.observer.abstentionReason = "individual_medical_advice_out_of_scope"
 		claims := make([]EvidenceAuditClaim, 0, len(audit.SelectedClaims))
 		for _, claim := range audit.SelectedClaims {
@@ -484,10 +521,19 @@ func RunEvidenceAudit(
 	if err != nil {
 		return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, err)
 	}
+	costLedger := newEvidenceAuditCostLedger(pkg.ModelPolicy.MaxCostUSD)
+	for claimIndex := 0; claimIndex < len(audit.SelectedClaims); claimIndex++ {
+		if checkpoint, ok := checkpoints[claimIndex]; ok {
+			if err := costLedger.Restore(checkpoint.ReservationUSD); err != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, nil, traceID, config, err)
+			}
+			config.observer.recordReservation(checkpoint.ReservationUSD)
+		}
+	}
 	for claimIndex, sourceClaim := range audit.SelectedClaims {
 		config.observer.begin("retrieval")
 		retrieved, retrievalErr := retrieveEvidenceAuditSupportingEvidence(
-			runCtx, store, pkg, releases, sourceClaim, config.observer,
+			runCtx, store, pkg, releases, sourceClaim, evidenceAuditReferenceTime(*audit, config), config.observer,
 		)
 		if retrievalErr != nil {
 			config.observer.fail("retrieval")
@@ -496,11 +542,24 @@ func RunEvidenceAudit(
 		config.observer.end("retrieval", "completed")
 		allRetrieved = append(allRetrieved, retrieved...)
 		messages := buildEvidenceAuditModelMessages(pkg, sourceClaim, retrieved)
-		if err := applyAgentRuntimeCostBudget(&modelConfig, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
-			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+		claimModelConfig := modelConfig
+		reservationUSD := float64(0)
+		if checkpoint, ok := checkpoints[claimIndex]; ok {
+			reservationUSD = checkpoint.ReservationUSD
+			if err := applyAgentRuntimeCostBudget(&claimModelConfig, messages, reservationUSD); err != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+		} else {
+			reservationUSD, err = costLedger.Reserve(
+				messages, &claimModelConfig, len(audit.SelectedClaims)-claimIndex,
+			)
+			if err != nil {
+				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
+			}
+			config.observer.recordReservation(reservationUSD)
 		}
 		requestIdentity, err := evidenceAuditModelRequestIdentity(
-			executionPlan, claimIndex, modelConfig, messages,
+			executionPlan, claimIndex, claimModelConfig, messages,
 		)
 		if err != nil {
 			return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
@@ -544,7 +603,7 @@ func RunEvidenceAudit(
 				return nil, failEvidenceAuditRun(store, *audit, pkg, allRetrieved, traceID, config, err)
 			}
 			config.observer.begin("model")
-			result, modelErr := evidenceAuditChatWithUsage(runCtx, client, modelConfig, messages)
+			result, modelErr := evidenceAuditChatWithUsage(runCtx, client, claimModelConfig, messages)
 			if modelErr != nil {
 				config.observer.fail("model")
 				if errors.Is(modelErr, context.Canceled) || errors.Is(modelErr, context.DeadlineExceeded) {
@@ -583,7 +642,7 @@ func RunEvidenceAudit(
 			parsed = evidenceAuditCheckpointDecision(parsed)
 			checkpoint, checkpointErr := store.saveEvidenceAuditClaimCandidate(
 				executionPlan, claimIndex, requestIdentity, retrievalFingerprint,
-				parsed, checkpointUsage,
+				parsed, checkpointUsage, reservationUSD,
 			)
 			if checkpointErr != nil {
 				return nil, failEvidenceAuditRun(
@@ -618,6 +677,55 @@ func RunEvidenceAudit(
 	return completeEvidenceAuditRun(
 		runCtx, store, *audit, pkg, allRetrieved, claimAudits, traceID, config, AgentTraceOutcomeCompleted,
 	)
+}
+
+type evidenceAuditCostLedger struct {
+	maxUSD      float64
+	reservedUSD float64
+}
+
+func newEvidenceAuditCostLedger(maxUSD float64) *evidenceAuditCostLedger {
+	return &evidenceAuditCostLedger{maxUSD: maxUSD}
+}
+
+func (l *evidenceAuditCostLedger) Remaining() float64 {
+	if l == nil {
+		return 0
+	}
+	remaining := l.maxUSD - l.reservedUSD
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (l *evidenceAuditCostLedger) Restore(reservationUSD float64) error {
+	if l == nil || reservationUSD <= 0 || math.IsNaN(reservationUSD) ||
+		math.IsInf(reservationUSD, 0) || reservationUSD > l.Remaining()+1e-9 {
+		return fmt.Errorf("model_policy.max_cost_usd checkpoint reservation exceeds audit budget")
+	}
+	l.reservedUSD += reservationUSD
+	return nil
+}
+
+func (l *evidenceAuditCostLedger) Reserve(
+	messages []BookKnowledgeMessage,
+	config *BookTokenPlanConfig,
+	remainingClaims int,
+) (float64, error) {
+	if l == nil || remainingClaims <= 0 {
+		return 0, fmt.Errorf("model_policy.max_cost_usd cost ledger is invalid")
+	}
+	share := l.Remaining() / float64(remainingClaims)
+	if err := applyAgentRuntimeCostBudget(config, messages, share); err != nil {
+		return 0, err
+	}
+	reservation := agentRuntimeEstimatedMaxCostUSD(messages, config.MaxTokens)
+	if reservation <= 0 || reservation > l.Remaining()+1e-9 {
+		return 0, fmt.Errorf("model_policy.max_cost_usd cost budget is exhausted before the model call")
+	}
+	l.reservedUSD += reservation
+	return reservation, nil
 }
 
 func evidenceAuditCheckpointDecision(
@@ -911,6 +1019,7 @@ func retrieveEvidenceAuditSupportingEvidence(
 	pkg AgentPackage,
 	releases map[string]KnowledgeRelease,
 	sourceClaim string,
+	auditTime time.Time,
 	observer *evidenceAuditObserver,
 ) ([]evidenceAuditRetrievedItem, error) {
 	roles := make(map[string]string, len(pkg.EvidencePolicy.ReleaseRoles))
@@ -956,11 +1065,31 @@ func retrieveEvidenceAuditSupportingEvidence(
 				}
 				observer.citationResolved++
 				observer.end("citation_resolution", "completed")
+				publishedAt := strings.TrimSpace(citation.PublishedAt)
+				if publishedAt == "" {
+					publishedAt = strings.TrimSpace(release.Book.PublishedAt)
+				}
+				freshness, freshnessErr := evidenceAuditFreshnessDecision(
+					publishedAt, auditTime, pkg.EvidencePolicy.FreshnessPolicy,
+				)
+				if freshnessErr != nil {
+					return nil, fmt.Errorf(
+						"citation %q in release %q freshness: %w",
+						citationID, release.ReleaseID, freshnessErr,
+					)
+				}
+				observer.recordFreshness(release.ReleaseID, citationID, publishedAt, freshness)
+				if freshness == EvidenceAuditFreshnessStale ||
+					(freshness == EvidenceAuditFreshnessMissing &&
+						pkg.EvidencePolicy.FreshnessPolicy.RequirePublicationDate) {
+					continue
+				}
 				ref := EvidenceAuditEvidenceRef{
 					ReleaseID: release.ReleaseID, ContentHash: agentTraceReleaseContentHash(release.ContentHash),
 					Role: EvidenceAuditReleaseSupporting, SourceType: strings.ToLower(strings.TrimSpace(release.Book.SourceType)),
 					PublicationIdentity: sha256Fingerprint([]byte(strings.ToLower(strings.TrimSpace(release.Book.SourceType)))),
 					ClaimID:             item.ClaimID, ChunkID: citation.ChunkID, CitationID: citationID,
+					PublishedAt: publishedAt, FreshnessDecision: freshness,
 				}
 				observer.publications[ref.PublicationIdentity] = true
 				key := evidenceAuditEvidenceIdentity(ref)
@@ -988,6 +1117,40 @@ func retrieveEvidenceAuditSupportingEvidence(
 		return evidenceAuditEvidenceIdentity(result[i].Ref) < evidenceAuditEvidenceIdentity(result[j].Ref)
 	})
 	return capEvidenceAuditSupportingGroups(result, pkg.EvidencePolicy.MaxEvidencePerClaim), nil
+}
+
+func evidenceAuditFreshnessDecision(
+	publishedAt string,
+	auditTime time.Time,
+	policy AgentPackageEvidenceFreshnessPolicy,
+) (string, error) {
+	publishedAt = strings.TrimSpace(publishedAt)
+	if publishedAt == "" {
+		return EvidenceAuditFreshnessMissing, nil
+	}
+	published, err := parseEvidenceAuditPublicationDate(publishedAt)
+	if err != nil {
+		return "", err
+	}
+	if auditTime.IsZero() {
+		auditTime = time.Now()
+	}
+	if published.After(auditTime) {
+		return "", fmt.Errorf("publication date is after the audit clock")
+	}
+	if auditTime.Sub(published) > time.Duration(policy.MaxAgeDays)*24*time.Hour {
+		return EvidenceAuditFreshnessStale, nil
+	}
+	return EvidenceAuditFreshnessFresh, nil
+}
+
+func evidenceAuditReferenceTime(audit EvidenceAudit, config EvidenceAuditRunnerConfig) time.Time {
+	for _, value := range []string{audit.StartedAt, audit.CreatedAt} {
+		if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+			return parsed
+		}
+	}
+	return evidenceAuditRunnerNow(config)
 }
 
 func capEvidenceAuditSupportingGroups(
@@ -1113,6 +1276,15 @@ func decideEvidenceAuditClaim(
 	retrieved []evidenceAuditRetrievedItem,
 	decision evidenceAuditModelDecision,
 ) (EvidenceAuditClaim, error) {
+	if !evidenceAuditVerdictAllowed(pkg, decision.CandidateVerdict) {
+		if !evidenceAuditVerdictAllowed(pkg, EvidenceAuditVerdictInsufficient) {
+			return EvidenceAuditClaim{}, fmt.Errorf(
+				"evidence_policy.allowed_verdicts excludes candidate %q and insufficient fallback",
+				decision.CandidateVerdict,
+			)
+		}
+		decision.Evidence = nil
+	}
 	available := make(map[string]evidenceAuditRetrievedItem, len(retrieved))
 	for _, item := range retrieved {
 		available[item.Ref.ReleaseID+"\x00"+item.Ref.CitationID] = item
@@ -1170,6 +1342,16 @@ func decideEvidenceAuditClaim(
 		verdict = EvidenceAuditVerdictInsufficient
 		selected = nil
 	}
+	if !evidenceAuditVerdictAllowed(pkg, verdict) {
+		if !evidenceAuditVerdictAllowed(pkg, EvidenceAuditVerdictInsufficient) {
+			return EvidenceAuditClaim{}, fmt.Errorf(
+				"evidence_policy.allowed_verdicts excludes computed verdict %q and insufficient fallback",
+				verdict,
+			)
+		}
+		verdict = EvidenceAuditVerdictInsufficient
+		selected = nil
+	}
 	conflicts := evidenceConflictCount(selected)
 	return EvidenceAuditClaim{
 		SourceClaim: sourceClaim, NormalizedStatement: sourceClaim, Verdict: verdict,
@@ -1178,6 +1360,15 @@ func decideEvidenceAuditClaim(
 		KnowledgeGaps: evidenceAuditBoundedStrings(decision.KnowledgeGaps),
 		ReviewActions: evidenceAuditBoundedStrings(decision.ReviewActions),
 	}, nil
+}
+
+func evidenceAuditVerdictAllowed(pkg AgentPackage, verdict string) bool {
+	for _, allowed := range pkg.EvidencePolicy.AllowedVerdicts {
+		if strings.TrimSpace(allowed) == verdict {
+			return true
+		}
+	}
+	return false
 }
 
 func evidenceConflictCount(evidence []EvidenceAuditEvidenceRef) int {
@@ -1554,6 +1745,7 @@ func buildEvidenceAuditTrace(
 				seenCitations[key] = true
 				citations = append(citations, AgentTraceCitation{
 					CitationID: ref.CitationID, ReleaseID: ref.ReleaseID, EvidenceID: evidenceID,
+					PublishedAt: ref.PublishedAt, FreshnessDecision: ref.FreshnessDecision,
 				})
 			}
 		}
@@ -1624,8 +1816,11 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		}
 		return false
 	}
-	firstPersonContext := hasAny(
-		" i ", " me", " my ", "for me", "should i", "can i", "could i",
+	paddedValue := " " + value + " "
+	firstPersonContext := strings.Contains(paddedValue, " i ") ||
+		strings.Contains(paddedValue, " me ") ||
+		strings.Contains(paddedValue, " my ") || hasAny(
+		"for me", "should i", "can i", "could i", "i need", "i want",
 		"right for me", "appropriate for me",
 		"我", "我的", "给我", "帮我", "本人", "家人", "孩子", "老人", "适合我",
 	)
@@ -1638,7 +1833,8 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		(strings.Contains(value, "患者") &&
 			!strings.Contains(value, "成年患者") &&
 			!strings.Contains(value, "儿童患者") &&
-			!strings.Contains(value, "患者人群"))
+			!strings.Contains(value, "患者人群") &&
+			!strings.Contains(value, "患者中"))
 	ageOrNamedPersonContext := evidenceAuditEnglishAgePattern.MatchString(value) ||
 		evidenceAuditChineseAgePattern.MatchString(value) ||
 		evidenceAuditDecisionHasNonPopulationSubject(value) ||
@@ -1662,6 +1858,7 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"should", "can i", "could i", "would it be better", "what dose", "how much",
 		"could this", "is chemotherapy right", "stop", "start", "switch", "substitute",
 		"replace", "increase", "decrease", "take",
+		"need", "want", "undergo", "receive",
 		"是否", "要不要", "该不该", "能不能", "可不可以", "怎么", "停", "换",
 		"替代", "加量", "减量", "开始", "继续",
 	)
@@ -1675,18 +1872,17 @@ func evidenceAuditRequestsMedicalAdvice(value string) bool {
 		"this patient", "the patient", "this person", "case ",
 		"病例", "个案", "这个患者", "该患者", "这名患者",
 	)
-	if explicitAcademicPICO && !strongPersonalContext {
+	if strongPersonalContext && (clinicalContext || decisionRequest || explicitAdvice) {
+		return true
+	}
+	if personalContext && (decisionRequest || explicitAdvice) {
+		return true
+	}
+	if medicationContext && decisionRequest {
+		return true
+	}
+	if explicitAcademicPICO {
 		return false
-	}
-	if personalContext && (clinicalContext || decisionRequest) {
-		return true
-	}
-	if explicitAdvice || (diagnosisOrTreatment && (personalContext || decisionRequest)) ||
-		(medicationContext && (personalContext || decisionRequest)) {
-		return true
-	}
-	if clinicalContext || decisionRequest {
-		return true
 	}
 	return false
 }
