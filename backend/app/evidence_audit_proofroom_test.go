@@ -114,13 +114,23 @@ func TestProofroomPreviewUsesReadOnlySnapshot(t *testing.T) {
 
 func TestProofroomProjectionPreservesReviewContractWithoutRawClaims(t *testing.T) {
 	_, audit := completedEvidenceAuditForProofroomTest(t)
-	audit.Proofroom.Title = "Independent adjudication"
-	audit.Proofroom.ReviewItems = []string{"Verify allocation concealment", "Resolve endpoint conflict"}
-	audit.ClaimAudits[0].NormalizedStatement = "Bearer secret-token api_key=private password=hunter2"
-	audit.ClaimAudits[0].Limitations = []string{
-		"Patient Alice +1 212-555-0199; 患者 张三 身份证 11010519491231002X",
+	audit.Proofroom.Title = `Review token=title-secret for Patient Alice Smith Johnson`
+	audit.Proofroom.ReviewItems = []string{
+		`{"access_token":"review-secret","client_secret":"client-secret"}`,
+		`病例姓名：张三丰，手机号：13800138000`,
 	}
-	audit.Summary.Conclusion = "Contact alice@example.test before review"
+	audit.ClaimAudits[0].NormalizedStatement = `Bearer bearer-secret api_key=key-secret password:hunter2`
+	audit.ClaimAudits[0].Limitations = []string{
+		`Patient Alice Smith Johnson, session=session-secret, +1 212-555-0199`,
+	}
+	audit.ClaimAudits[0].KnowledgeGaps = []string{
+		`患者李四，身份证=11010519491231002X，邮箱=gap@example.test`,
+	}
+	audit.ClaimAudits[0].ReviewActions = []string{
+		`refresh_token: refresh-secret; cookie=session-cookie; csrf=csrf-secret`,
+	}
+	audit.Summary.Conclusion = `Contact alice@example.test; secret=conclusion-secret`
+	audit.Summary.Limitations = []string{`client_secret=summary-secret`}
 	finalized, err := FinalizeEvidenceAuditReport(audit)
 	if err != nil {
 		t.Fatal(err)
@@ -136,17 +146,81 @@ func TestProofroomProjectionPreservesReviewContractWithoutRawClaims(t *testing.T
 	if preview.Payload.Claims[0].SourceClaimIdentity == "" {
 		t.Fatalf("source claim was not identity-only: %#v", preview.Payload.Claims[0])
 	}
+	safeTexts := []ProofroomSafeText{
+		preview.Payload.Claims[0].NormalizedStatement,
+		preview.Payload.Claims[0].Limitations[0],
+		preview.Payload.Claims[0].KnowledgeGaps[0],
+		preview.Payload.Claims[0].ReviewActions[0],
+		preview.Payload.Summary.Conclusion,
+		preview.Payload.Summary.Limitations[0],
+		preview.Payload.Proofroom.Title,
+		preview.Payload.Proofroom.ReviewItems[0],
+		preview.Payload.Proofroom.ReviewItems[1],
+	}
+	for index, safeText := range safeTexts {
+		if !safeText.Redacted || safeText.OriginalHash == "" ||
+			!strings.Contains(safeText.Text, "[REDACTED]") {
+			t.Fatalf("safe text %d lacks hash/redaction marker: %#v", index, safeText)
+		}
+	}
 	raw, err := json.Marshal(preview)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, value := range []string{
-		audit.ClaimAudits[0].SourceClaim, "alice@example.test", "212-555-0199", "secret-token",
-		"private", "hunter2", "张三", "11010519491231002X",
+		audit.ClaimAudits[0].SourceClaim,
+		"title-secret", "Alice", "Smith", "Johnson", "review-secret", "client-secret",
+		"张三丰", "13800138000", "bearer-secret", "key-secret", "hunter2",
+		"session-secret", "212-555-0199", "李四", "11010519491231002X",
+		"gap@example.test", "refresh-secret", "session-cookie", "csrf-secret",
+		"alice@example.test", "conclusion-secret", "summary-secret",
 	} {
 		if strings.Contains(string(raw), value) {
 			t.Fatalf("projection leaked %q: %s", value, raw)
 		}
+	}
+}
+
+func TestProofroomProjectionBlocksResidualHighRiskText(t *testing.T) {
+	_, audit := completedEvidenceAuditForProofroomTest(t)
+	audit.Summary.Conclusion = "token"
+	finalized, err := FinalizeEvidenceAuditReport(audit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildProofroomEvidenceAuditProjection(finalized); err == nil ||
+		!strings.Contains(err.Error(), "privacy") {
+		t.Fatalf("residual high-risk projection error = %v", err)
+	}
+}
+
+func TestProofroomDLPRedactsCredentialFormats(t *testing.T) {
+	tests := []string{
+		`token=token-value`,
+		`secret: secret-value`,
+		`https://example.test/callback?access_token=access-value&next=1`,
+		`{"refresh_token":"refresh-value"}`,
+		`api_key=api-value`,
+		`client_secret: client-value`,
+		`password=password-value`,
+		`session:session-value`,
+		`cookie=cookie-value`,
+		`csrf: csrf-value`,
+	}
+	for _, input := range tests {
+		t.Run(input[:strings.IndexAny(input, "=:?")], func(t *testing.T) {
+			safeText, err := proofroomMinimizeText(input)
+			if err != nil {
+				t.Fatalf("proofroomMinimizeText() error = %v", err)
+			}
+			if !safeText.Redacted || safeText.OriginalHash == "" ||
+				!strings.Contains(safeText.Text, "[REDACTED]") {
+				t.Fatalf("safe text = %#v", safeText)
+			}
+			if strings.Contains(safeText.Text, "value") {
+				t.Fatalf("credential value remained in %q", safeText.Text)
+			}
+		})
 	}
 }
 
@@ -365,11 +439,11 @@ func TestProofroomDeliveryUnknownDoesNotAutomaticallyRepeatPOST(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("unknown outcome bypass repeated remote POST: calls=%d", calls.Load())
 	}
-	if err := CoordinateProofroomDelivery(
-		store, audit.AuditID, "unknown-key", ProofroomCoordinationConfirmedNotDelivered,
-		testAgentPackageTime().Add(14*time.Hour),
+	if err := CoordinateProofroomDeliveryForEndpoint(
+		store, audit.AuditID, "unknown-key", service.endpointIdentity,
+		ProofroomCoordinationConfirmedNotDelivered, testAgentPackageTime().Add(14*time.Hour),
 	); err != nil {
-		t.Fatalf("CoordinateProofroomDelivery() error = %v", err)
+		t.Fatalf("CoordinateProofroomDeliveryForEndpoint() error = %v", err)
 	}
 }
 
@@ -562,6 +636,129 @@ func TestProofroomDeliveryStateRecoversFromInterruptedPublish(t *testing.T) {
 	}
 }
 
+func TestProofroomUnknownBackupBlocksEveryNewKeyUntilSameEndpointCoordination(t *testing.T) {
+	for _, faultStage := range []string{
+		proofroomStateFaultTempSynced,
+		proofroomStateFaultBackupPublished,
+		proofroomStateFaultBeforePublish,
+	} {
+		t.Run(faultStage, func(t *testing.T) {
+			store, audit := completedEvidenceAuditForProofroomTest(t)
+			var calls atomic.Int32
+			service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+				Endpoint: "https://proofroom.example.test/api/audits",
+				Token:    "remote-secret",
+				Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+					calls.Add(1)
+					return nil, context.DeadlineExceeded
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var injected atomic.Bool
+			previous := proofroomStateStorageFault
+			proofroomStateStorageFault = func(stage, _ string) error {
+				if calls.Load() > 0 && stage == faultStage && injected.CompareAndSwap(false, true) {
+					return errors.New("injected state publish failure")
+				}
+				return nil
+			}
+			t.Cleanup(func() { proofroomStateStorageFault = previous })
+
+			if _, _, err := service.Deliver(
+				context.Background(), store, audit.AuditID, "original-key",
+			); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+				t.Fatalf("original delivery error = %v", err)
+			}
+			if _, _, err := service.Deliver(
+				context.Background(), store, audit.AuditID, "new-key",
+			); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+				t.Fatalf("new key was not blocked by last-known-good state: %v", err)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("remote calls = %d, want 1", calls.Load())
+			}
+			if err := CoordinateProofroomDeliveryForEndpoint(
+				store, audit.AuditID, "original-key", service.endpointIdentity,
+				ProofroomCoordinationConfirmedNotDelivered, testAgentPackageTime(),
+			); err != nil {
+				t.Fatalf("same-endpoint coordination failed: %v", err)
+			}
+			if _, _, err := service.Deliver(
+				context.Background(), store, audit.AuditID, "new-key",
+			); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+				t.Fatalf("post-coordination delivery error = %v", err)
+			}
+			if calls.Load() != 2 {
+				t.Fatalf("post-coordination remote calls = %d, want 2", calls.Load())
+			}
+		})
+	}
+}
+
+func TestProofroomUnknownBackupBlocksNewKeyWhenPrimaryIsCorrupt(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/api/audits",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return nil, context.DeadlineExceeded
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Deliver(
+		context.Background(), store, audit.AuditID, "corrupt-primary-key",
+	); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+		t.Fatalf("original delivery error = %v", err)
+	}
+	statePath := store.EvidenceAuditProofroomStatePath(
+		audit.AuditID, evidenceAuditOpaqueIdentity("corrupt-primary-key"),
+	)
+	if err := os.WriteFile(statePath, []byte(`{"status":"corrupt"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Deliver(
+		context.Background(), store, audit.AuditID, "new-key",
+	); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+		t.Fatalf("new key was not blocked by backup recovery: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("remote calls = %d, want 1", calls.Load())
+	}
+}
+
+func TestProofroomCoordinationRequiresEndpointIdentity(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/api/audits",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			return nil, context.DeadlineExceeded
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.Deliver(
+		context.Background(), store, audit.AuditID, "coordinate-key",
+	); !errors.Is(err, ErrProofroomDeliveryOutcomeUnknown) {
+		t.Fatalf("delivery error = %v", err)
+	}
+	for _, endpointIdentity := range []string{"", "https://not-a-generated-endpoint"} {
+		if err := CoordinateProofroomDeliveryForEndpoint(
+			store, audit.AuditID, "coordinate-key", endpointIdentity,
+			ProofroomCoordinationConfirmedNotDelivered, testAgentPackageTime(),
+		); err == nil {
+			t.Fatalf("coordination with invalid endpoint identity %q succeeded", endpointIdentity)
+		}
+	}
+}
+
 func TestProofroomDeliveryStateRecoversFromSemanticallyCorruptPrimary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "deliveries", "state.json")
 	state := proofroomDeliveryState{
@@ -700,6 +897,15 @@ func completedEvidenceAuditForProofroomInputTest(
 	root string,
 	input EvidenceAuditInput,
 ) (*BookKnowledgeStore, EvidenceAudit) {
+	return completedEvidenceAuditForProofroomReportTest(t, root, input, nil)
+}
+
+func completedEvidenceAuditForProofroomReportTest(
+	t *testing.T,
+	root string,
+	input EvidenceAuditInput,
+	mutate func(*EvidenceAudit),
+) (*BookKnowledgeStore, EvidenceAudit) {
 	t.Helper()
 	store := NewBookKnowledgeStore(root)
 	now := testAgentPackageTime()
@@ -732,6 +938,13 @@ func completedEvidenceAuditForProofroomInputTest(
 	report.CompletedAt = now.Add(2 * time.Minute).UTC().Format(time.RFC3339Nano)
 	report.IdempotencyKey = queued.IdempotencyKey
 	report.InputHash = queued.InputHash
+	if mutate != nil {
+		mutate(&report)
+		report.OutputHash, err = EvidenceAuditOutputHash(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	completed, err := completeEvidenceAuditForTest(t, store, report, now.Add(2*time.Minute))
 	if err != nil {
 		t.Fatal(err)

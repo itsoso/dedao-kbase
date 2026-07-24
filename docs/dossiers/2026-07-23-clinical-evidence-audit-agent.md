@@ -147,6 +147,19 @@ Completed, hardened, and verified.
   coordination state prevent automatic duplicate delivery. Operators can clear
   only a confirmed non-delivery using the same endpoint, dedicated resolution
   header, and original idempotency key.
+- Global unknown-outcome lookup treats the primary state and its `.bak`
+  last-known-good copy as one durable record. Missing or corrupt primaries are
+  recovered before a new idempotency key is considered, so every interrupted
+  publish phase remains blocked until an explicit same-endpoint coordination.
+- Every outbound free-text field carries an original identity hash and an
+  explicit redaction marker when modified. Credential forms, English and
+  Chinese patient identifiers, phone numbers, national IDs, and email
+  addresses are removed before projection. A residual high-risk detector fails
+  closed with the stable `privacy_blocked` response; blocked previews and
+  deliveries never contact Proofroom.
+- The endpoint-less coordination helper was removed. All coordination paths
+  now require and validate the same normalized HTTPS endpoint identity used by
+  the original delivery.
 - Only explicit accepted/delivered/succeeded business outcomes create receipts.
   Transport errors, 408, 429, 5xx, invalid/truncated responses, and unknown
   business states fail closed as `outcome_unknown`.

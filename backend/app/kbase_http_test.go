@@ -511,6 +511,44 @@ func TestKBaseHTTPHandlerProofroomPreviewIsReadOnlyAndDeliveryIsExplicit(t *test
 	}
 }
 
+func TestKBaseHTTPHandlerProofroomPrivacyBlockedDoesNotSend(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomReportTest(
+		t, t.TempDir(), validEvidenceAuditInput(), func(report *EvidenceAudit) {
+			report.Proofroom.Title = "token"
+		},
+	)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(http.StatusOK, `{"receipt_id":"bad","status":"accepted"}`), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		request := httptest.NewRequest(method, path, nil)
+		request.Header.Set("Authorization", "Bearer consumer-a")
+		request.Header.Set("Idempotency-Key", "privacy-key")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnprocessableEntity ||
+			!strings.Contains(response.Body.String(), `"code":"privacy_blocked"`) {
+			t.Fatalf("%s status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("privacy-blocked projection reached remote: %d", calls.Load())
+	}
+}
+
 func TestKBaseHTTPHandlerProofroomDeliveryErrorsAreStable(t *testing.T) {
 	store, audit := completedEvidenceAuditForProofroomTest(t)
 	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"

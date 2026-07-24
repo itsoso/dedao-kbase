@@ -1612,6 +1612,11 @@ func (h *kbaseHTTPHandler) writeProofroomHTTPError(w http.ResponseWriter, operat
 			w, http.StatusUnprocessableEntity, "proofroom_audit_invalid",
 			"evidence audit failed Proofroom projection validation", "proofroom_"+operation, err,
 		)
+	case errors.Is(err, ErrProofroomPrivacyBlocked):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnprocessableEntity, "privacy_blocked",
+			"Proofroom projection was blocked by privacy policy", "proofroom_"+operation, err,
+		)
 	case errors.Is(err, ErrProofroomDeliveryConflict):
 		h.writeEvidenceAuditHTTPError(
 			w, http.StatusConflict, "proofroom_idempotency_conflict",

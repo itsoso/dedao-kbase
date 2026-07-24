@@ -15,8 +15,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gofrs/flock"
 )
@@ -51,6 +53,7 @@ var proofroomStateStorageFault = func(string, string) error { return nil }
 var (
 	ErrProofroomAuditNotReady          = errors.New("evidence audit is not ready for Proofroom")
 	ErrProofroomAuditInvalid           = errors.New("evidence audit is invalid for Proofroom")
+	ErrProofroomPrivacyBlocked         = errors.New("Proofroom projection blocked by privacy policy")
 	ErrProofroomDeliveryUnconfigured   = errors.New("Proofroom delivery is not configured")
 	ErrProofroomDeliveryConflict       = errors.New("Proofroom delivery idempotency conflict")
 	ErrProofroomDeliveryRejected       = errors.New("Proofroom rejected delivery")
@@ -206,16 +209,48 @@ func BuildProofroomEvidenceAuditProjection(audit EvidenceAudit) (ProofroomEviden
 	}
 	claims := make([]ProofroomEvidenceAuditClaim, 0, len(audit.ClaimAudits))
 	for _, claim := range audit.ClaimAudits {
+		statement, err := proofroomMinimizeText(claim.NormalizedStatement)
+		if err != nil {
+			return ProofroomEvidenceAuditPreview{}, err
+		}
+		limitations, err := proofroomMinimizeTexts(claim.Limitations)
+		if err != nil {
+			return ProofroomEvidenceAuditPreview{}, err
+		}
+		gaps, err := proofroomMinimizeTexts(claim.KnowledgeGaps)
+		if err != nil {
+			return ProofroomEvidenceAuditPreview{}, err
+		}
+		actions, err := proofroomMinimizeTexts(claim.ReviewActions)
+		if err != nil {
+			return ProofroomEvidenceAuditPreview{}, err
+		}
 		claims = append(claims, ProofroomEvidenceAuditClaim{
 			SourceClaimIdentity: proofroomPrivateTextIdentity("source_claim", claim.SourceClaim),
-			NormalizedStatement: proofroomMinimizeText(claim.NormalizedStatement),
+			NormalizedStatement: statement,
 			Verdict:             claim.Verdict,
 			ComputedConfidence:  claim.ComputedConfidence,
 			Evidence:            proofroomEvidenceRefs(claim.Evidence),
-			Limitations:         proofroomMinimizeTexts(claim.Limitations),
-			KnowledgeGaps:       proofroomMinimizeTexts(claim.KnowledgeGaps),
-			ReviewActions:       proofroomMinimizeTexts(claim.ReviewActions),
+			Limitations:         limitations,
+			KnowledgeGaps:       gaps,
+			ReviewActions:       actions,
 		})
+	}
+	conclusion, err := proofroomMinimizeText(audit.Summary.Conclusion)
+	if err != nil {
+		return ProofroomEvidenceAuditPreview{}, err
+	}
+	summaryLimitations, err := proofroomMinimizeTexts(audit.Summary.Limitations)
+	if err != nil {
+		return ProofroomEvidenceAuditPreview{}, err
+	}
+	reviewTitle, err := proofroomMinimizeText(audit.Proofroom.Title)
+	if err != nil {
+		return ProofroomEvidenceAuditPreview{}, err
+	}
+	reviewItems, err := proofroomMinimizeTexts(audit.Proofroom.ReviewItems)
+	if err != nil {
+		return ProofroomEvidenceAuditPreview{}, err
 	}
 	projection := ProofroomEvidenceAuditProjection{
 		SchemaVersion: ProofroomEvidenceAuditSchemaVersion,
@@ -228,13 +263,13 @@ func BuildProofroomEvidenceAuditProjection(audit EvidenceAudit) (ProofroomEviden
 		ScopeIdentity:   proofroomPrivateTextIdentity("scope", audit.Scope),
 		Claims:          claims,
 		Summary: ProofroomEvidenceAuditSummary{
-			Conclusion:    proofroomMinimizeText(audit.Summary.Conclusion),
+			Conclusion:    conclusion,
 			VerdictCounts: cloneProofroomVerdictCounts(audit.Summary.VerdictCounts),
-			Limitations:   proofroomMinimizeTexts(audit.Summary.Limitations),
+			Limitations:   summaryLimitations,
 		},
 		Proofroom: ProofroomReviewContract{
-			Title:       proofroomMinimizeText(audit.Proofroom.Title),
-			ReviewItems: proofroomMinimizeTexts(audit.Proofroom.ReviewItems),
+			Title:       reviewTitle,
+			ReviewItems: reviewItems,
 		},
 		AdjudicationAuthority: "proofroom",
 		KBaseDecisionFinal:    false,
@@ -490,16 +525,6 @@ func (s *ProofroomDeliveryService) Deliver(
 	return receipt, true, nil
 }
 
-func CoordinateProofroomDelivery(
-	store *BookKnowledgeStore,
-	auditID, idempotencyKey, resolution string,
-	now time.Time,
-) error {
-	return CoordinateProofroomDeliveryForEndpoint(
-		store, auditID, idempotencyKey, "", resolution, now,
-	)
-}
-
 func CoordinateProofroomDeliveryForEndpoint(
 	store *BookKnowledgeStore,
 	auditID, idempotencyKey, endpointIdentity, resolution string,
@@ -507,6 +532,10 @@ func CoordinateProofroomDeliveryForEndpoint(
 ) error {
 	if resolution != ProofroomCoordinationConfirmedNotDelivered {
 		return fmt.Errorf("unsupported Proofroom coordination resolution")
+	}
+	endpointIdentity = strings.TrimSpace(endpointIdentity)
+	if !validProofroomEndpointIdentity(endpointIdentity) {
+		return fmt.Errorf("valid Proofroom endpoint identity is required")
 	}
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
@@ -528,7 +557,7 @@ func CoordinateProofroomDeliveryForEndpoint(
 	if state.AuditID != auditID {
 		return ErrProofroomDeliveryConflict
 	}
-	if endpointIdentity != "" && state.EndpointIdentity != endpointIdentity {
+	if state.EndpointIdentity != endpointIdentity {
 		return ErrProofroomDeliveryConflict
 	}
 	if state.Status != ProofroomDeliveryOutcomeUnknown && state.Status != "in_flight" {
@@ -586,16 +615,25 @@ func (s *BookKnowledgeStore) hasUnknownProofroomDelivery(projectionHash, endpoin
 	if err != nil {
 		return false, err
 	}
-	if len(entries) > evidenceAuditMaxManifestIdempotency {
-		return false, fmt.Errorf("Proofroom delivery state capacity exceeded")
-	}
+	statePaths := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+		if entry.IsDir() {
 			continue
 		}
-		state, err := loadProofroomDeliveryState(filepath.Join(
-			s.EvidenceAuditProofroomDir(), "deliveries", entry.Name(),
-		))
+		name := entry.Name()
+		if strings.HasSuffix(name, ".bak") {
+			name = strings.TrimSuffix(name, ".bak")
+		}
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		statePaths[filepath.Join(s.EvidenceAuditProofroomDir(), "deliveries", name)] = struct{}{}
+	}
+	if len(statePaths) > evidenceAuditMaxManifestIdempotency {
+		return false, fmt.Errorf("Proofroom delivery state capacity exceeded")
+	}
+	for path := range statePaths {
+		state, err := loadProofroomDeliveryState(path)
 		if err != nil {
 			return false, err
 		}
@@ -816,14 +854,29 @@ func proofroomEndpointIdentity(endpoint *url.URL) string {
 
 var proofroomSensitivePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`),
-	regexp.MustCompile(`(?i)\b(?:bearer|api[_-]?key|password|client[_-]?secret)\s*[:=]?\s*[^\s,;]+`),
+	regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[^\s,;]+`),
+	regexp.MustCompile(`(?i)["']?(?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|password|session|cookie|csrf|token|secret)["']?\s*(?:=|:)\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|[^&,\s;}\]]+)`),
 	regexp.MustCompile(`\b\d{17}[\dXx]\b`),
+	regexp.MustCompile(`\b1[3-9]\d{9}\b`),
 	regexp.MustCompile(`(?i)(?:\+?\d[\d .()-]{7,}\d)`),
-	regexp.MustCompile(`(?i)\bpatient\s+[^\s,;]+`),
-	regexp.MustCompile(`患者\s*[\p{Han}]{2,4}`),
+	regexp.MustCompile(`(?i:\bpatient(?:\s+name\s*[:=]?)?\s+)[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){0,5}\b`),
+	regexp.MustCompile(`(?:患者|病例|姓名)\s*(?:姓名\s*)?[:：=]?\s*[\p{Han}]{2,6}`),
 }
 
-func proofroomMinimizeText(value string) ProofroomSafeText {
+var proofroomResidualSensitivePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(?:access[_-]?token|refresh[_-]?token|api[_-]?key|client[_-]?secret|password|session|cookie|csrf|token|secret)\b`),
+	regexp.MustCompile(`(?i)\b(?:bearer|basic)\b`),
+	regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`),
+	regexp.MustCompile(`\b\d{17}[\dXx]\b`),
+	regexp.MustCompile(`\b1[3-9]\d{9}\b`),
+	regexp.MustCompile(`(?i:\bpatient(?:\s+name\s*[:=]?)?\s+)[A-Z][A-Za-z'’-]*(?:\s+[A-Z][A-Za-z'’-]*){0,5}\b`),
+	regexp.MustCompile(`(?:患者|病例|姓名)\s*(?:姓名\s*)?[:：=]?\s*[\p{Han}]{2,6}`),
+}
+
+func proofroomMinimizeText(value string) (ProofroomSafeText, error) {
+	if !utf8.ValidString(value) {
+		return ProofroomSafeText{}, ErrProofroomPrivacyBlocked
+	}
 	original := strings.TrimSpace(value)
 	text := original
 	redacted := false
@@ -838,18 +891,48 @@ func proofroomMinimizeText(value string) ProofroomSafeText {
 		text = text[:proofroomMaxSafeTextBytes]
 		redacted = true
 	}
+	if !utf8.ValidString(text) || proofroomContainsResidualSensitiveText(text) {
+		return ProofroomSafeText{}, ErrProofroomPrivacyBlocked
+	}
 	return ProofroomSafeText{
 		Text: text, OriginalHash: proofroomPrivateTextIdentity("proofroom_text", original),
 		Redacted: redacted,
-	}
+	}, nil
 }
 
-func proofroomMinimizeTexts(values []string) []ProofroomSafeText {
+func proofroomMinimizeTexts(values []string) ([]ProofroomSafeText, error) {
 	output := make([]ProofroomSafeText, 0, len(values))
 	for _, value := range values {
-		output = append(output, proofroomMinimizeText(value))
+		safeText, err := proofroomMinimizeText(value)
+		if err != nil {
+			return nil, err
+		}
+		output = append(output, safeText)
 	}
-	return output
+	return output, nil
+}
+
+func proofroomContainsResidualSensitiveText(value string) bool {
+	for _, pattern := range proofroomResidualSensitivePatterns {
+		if pattern.MatchString(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func validProofroomEndpointIdentity(identity string) bool {
+	parsed, err := url.Parse(identity)
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return false
+	}
+	pathHash := strings.TrimPrefix(parsed.EscapedPath(), "/path/")
+	return pathHash != parsed.EscapedPath() && validEvidenceAuditSHA256(pathHash)
 }
 
 func proofroomEvidenceRefs(values []EvidenceAuditEvidenceRef) []ProofroomEvidenceRef {
