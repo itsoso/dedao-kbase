@@ -229,6 +229,160 @@ func TestEvidenceAuditCoordinatorsUsePersistentLeaseAcrossInstances(t *testing.T
 	}
 }
 
+func TestEvidenceAuditCoordinatorClaimsLeaseOnlyWhenWorkerStarts(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := testAgentPackageTime()
+	firstStarted := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var calls atomic.Int32
+	coordinator, err := NewEvidenceAuditCoordinator(EvidenceAuditCoordinatorConfig{
+		Store: store, OwnerID: "worker-claim-owner", Workers: 1, QueueSize: 2,
+		PollInterval: time.Hour, LeaseDuration: 40 * time.Millisecond,
+		HeartbeatInterval: 10 * time.Millisecond,
+		Run: func(ctx context.Context, _ *BookKnowledgeStore, auditID string, _ BookKnowledgeLLMClient, _ EvidenceAuditRunnerConfig) (*EvidenceAudit, error) {
+			switch calls.Add(1) {
+			case 1:
+				close(firstStarted)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-releaseFirst:
+				}
+			case 2:
+				close(secondStarted)
+			}
+			return &EvidenceAudit{AuditID: auditID, Status: EvidenceAuditCompleted}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator.mu.Lock()
+	coordinator.ctx, coordinator.cancel = context.WithCancel(context.Background())
+	coordinator.started = true
+	coordinator.wg.Add(1)
+	go coordinator.worker()
+	coordinator.mu.Unlock()
+	audits := make([]*EvidenceAudit, 0, 2)
+	for index := 0; index < 2; index++ {
+		input := validEvidenceAuditInput()
+		input.Subject = fmt.Sprintf("worker-claim-%d", index)
+		audit, _, err := CreateEvidenceAudit(store, input, fmt.Sprintf("worker-claim-%d", index), now)
+		if err != nil {
+			t.Fatalf("CreateEvidenceAudit(%d) error = %v", index, err)
+		}
+		audits = append(audits, audit)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = coordinator.Shutdown(ctx)
+		cancel()
+	})
+	if err := coordinator.Enqueue(audits[0].AuditID); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Enqueue(audits[1].AuditID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first audit did not start")
+	}
+	time.Sleep(80 * time.Millisecond)
+	queued, err := store.LoadEvidenceAuditRecord(audits[1].AuditID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.LeaseOwner != "" || queued.LeaseExpiresAt != "" {
+		t.Fatalf("queued audit held expiring lease: %+v", queued)
+	}
+	close(releaseFirst)
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second audit starved after waiting longer than lease duration")
+	}
+}
+
+func TestEvidenceAuditCoordinatorDuplicateQueueAcrossInstancesHasSingleOwnerAndNoStarvation(t *testing.T) {
+	root := t.TempDir()
+	storeA := NewBookKnowledgeStore(root)
+	storeB := NewBookKnowledgeStore(root)
+	audit, _, err := CreateEvidenceAudit(
+		storeA, validEvidenceAuditInput(), "duplicate-queue-across-instances", testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	ran := make(chan string, 2)
+	skipped := make(chan EvidenceAuditCoordinatorEvent, 2)
+	run := func(_ context.Context, _ *BookKnowledgeStore, _ string, _ BookKnowledgeLLMClient, cfg EvidenceAuditRunnerConfig) (*EvidenceAudit, error) {
+		calls.Add(1)
+		ran <- cfg.LeaseOwner
+		time.Sleep(75 * time.Millisecond)
+		return audit, nil
+	}
+	newCoordinator := func(store *BookKnowledgeStore, owner string) *EvidenceAuditCoordinator {
+		coordinator, err := NewEvidenceAuditCoordinator(EvidenceAuditCoordinatorConfig{
+			Store: store, OwnerID: owner, Workers: 1, QueueSize: 1,
+			PollInterval: time.Hour, LeaseDuration: time.Second,
+			HeartbeatInterval: 50 * time.Millisecond, Run: run,
+			Metrics: func(event EvidenceAuditCoordinatorEvent) {
+				if event.Type == EvidenceAuditCoordinatorLeaseSkipped {
+					skipped <- event
+				}
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		return coordinator
+	}
+	first := newCoordinator(storeA, "duplicate-owner-a")
+	second := newCoordinator(storeB, "duplicate-owner-b")
+	t.Cleanup(func() {
+		for _, coordinator := range []*EvidenceAuditCoordinator{first, second} {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = coordinator.Shutdown(ctx)
+			cancel()
+		}
+	})
+	if err := first.Enqueue(audit.AuditID); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Enqueue(audit.AuditID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ran:
+	case <-time.After(time.Second):
+		t.Fatal("neither coordinator executed the audit")
+	}
+	select {
+	case event := <-skipped:
+		if event.AuditID != audit.AuditID || event.ErrorCode != "lease_not_claimed" {
+			t.Fatalf("lease skip event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("competing coordinator did not emit structured lease skip")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("runner calls = %d, want exactly one owner", got)
+	}
+}
+
 func TestEvidenceAuditCoordinatorRecoversExpiredLease(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	now := testAgentPackageTime()
@@ -279,7 +433,7 @@ func TestEvidenceAuditCoordinatorRecoversExpiredLease(t *testing.T) {
 	}
 }
 
-func TestEvidenceAuditCoordinatorQueueFullReleasesLeaseAndEmitsMetric(t *testing.T) {
+func TestEvidenceAuditCoordinatorQueueFullDoesNotAcquireLeaseAndEmitsMetric(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	now := testAgentPackageTime()
 	audits := make([]*EvidenceAudit, 0, 3)
@@ -358,6 +512,166 @@ func TestEvidenceAuditCoordinatorQueueFullReleasesLeaseAndEmitsMetric(t *testing
 	case <-time.After(time.Second):
 		t.Fatal("queue_full metric was not emitted")
 	}
+}
+
+func TestEvidenceAuditCoordinatorWorkerLeaseFailuresUseBoundedBackoffAndMetrics(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	now := testAgentPackageTime()
+	current := now
+	audit, _, err := CreateEvidenceAudit(store, validEvidenceAuditInput(), "worker-lease-backoff", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := make(chan EvidenceAuditCoordinatorEvent, 4)
+	var claims atomic.Int32
+	coordinator, err := NewEvidenceAuditCoordinator(EvidenceAuditCoordinatorConfig{
+		Store: store, OwnerID: "worker-backoff-owner", Workers: 1, QueueSize: 1,
+		PollInterval: time.Hour, LeaseDuration: time.Minute,
+		HeartbeatInterval: 10 * time.Second, Now: func() time.Time { return current },
+		BackoffInitial: 100 * time.Millisecond, BackoffMax: 150 * time.Millisecond,
+		Jitter:  func(delay time.Duration) time.Duration { return delay + 7*time.Millisecond },
+		Metrics: func(event EvidenceAuditCoordinatorEvent) { events <- event },
+		ClaimLease: func(string, string, time.Time, time.Duration) (EvidenceAuditLeaseClaim, error) {
+			claims.Add(1)
+			return EvidenceAuditLeaseClaim{}, errors.New("storage unavailable api_key=claim-secret")
+		},
+		Run: func(context.Context, *BookKnowledgeStore, string, BookKnowledgeLLMClient, EvidenceAuditRunnerConfig) (*EvidenceAudit, error) {
+			t.Fatal("runner must not execute without lease")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = coordinator.Shutdown(ctx)
+		cancel()
+	})
+	if err := coordinator.Enqueue(audit.AuditID); err != nil {
+		t.Fatal(err)
+	}
+	first := <-events
+	if first.Type != EvidenceAuditCoordinatorLeaseClaimFailed ||
+		first.Attempt != 1 || first.RetryAfter != 107*time.Millisecond {
+		t.Fatalf("first claim failure event = %+v", first)
+	}
+	coordinator.scan()
+	time.Sleep(10 * time.Millisecond)
+	if got := claims.Load(); got != 1 {
+		t.Fatalf("claim attempts during backoff = %d, want 1", got)
+	}
+	current = current.Add(108 * time.Millisecond)
+	coordinator.scan()
+	second := <-events
+	if second.Type != EvidenceAuditCoordinatorLeaseClaimFailed ||
+		second.Attempt != 2 || second.RetryAfter != 157*time.Millisecond {
+		t.Fatalf("second claim failure event = %+v", second)
+	}
+}
+
+func TestEvidenceAuditCoordinatorRenewAndReleaseFailuresEmitStructuredBackoff(t *testing.T) {
+	t.Run("renew", func(t *testing.T) {
+		store := NewBookKnowledgeStore(t.TempDir())
+		audit, _, err := CreateEvidenceAudit(
+			store, validEvidenceAuditInput(), "worker-renew-backoff", testAgentPackageTime(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := make(chan EvidenceAuditCoordinatorEvent, 4)
+		var renewCalls atomic.Int32
+		coordinator, err := NewEvidenceAuditCoordinator(EvidenceAuditCoordinatorConfig{
+			Store: store, OwnerID: "renew-failure-owner", Workers: 1, QueueSize: 1,
+			PollInterval: time.Hour, LeaseDuration: time.Second,
+			HeartbeatInterval: 5 * time.Millisecond,
+			BackoffInitial:    20 * time.Millisecond, BackoffMax: 40 * time.Millisecond,
+			Metrics: func(event EvidenceAuditCoordinatorEvent) { events <- event },
+			RenewLease: func(auditID, owner string, now time.Time, duration time.Duration) (EvidenceAuditRecord, error) {
+				if renewCalls.Add(1) == 1 {
+					return EvidenceAuditRecord{}, errors.New("manifest write failed password=renew-secret")
+				}
+				return store.RenewEvidenceAuditLease(auditID, owner, now, duration)
+			},
+			Run: func(ctx context.Context, _ *BookKnowledgeStore, _ string, _ BookKnowledgeLLMClient, _ EvidenceAuditRunnerConfig) (*EvidenceAudit, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = coordinator.Shutdown(ctx)
+			cancel()
+		})
+		if err := coordinator.Enqueue(audit.AuditID); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case event := <-events:
+			if event.Type != EvidenceAuditCoordinatorLeaseRenewFailed ||
+				event.ErrorCode != "lease_renew_failed" || event.RetryAfter != 20*time.Millisecond {
+				t.Fatalf("renew failure event = %+v", event)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("renew failure metric was not emitted")
+		}
+	})
+
+	t.Run("release", func(t *testing.T) {
+		store := NewBookKnowledgeStore(t.TempDir())
+		audit, _, err := CreateEvidenceAudit(
+			store, validEvidenceAuditInput(), "worker-release-backoff", testAgentPackageTime(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		events := make(chan EvidenceAuditCoordinatorEvent, 4)
+		coordinator, err := NewEvidenceAuditCoordinator(EvidenceAuditCoordinatorConfig{
+			Store: store, OwnerID: "release-failure-owner", Workers: 1, QueueSize: 1,
+			PollInterval: time.Hour, LeaseDuration: time.Minute,
+			HeartbeatInterval: time.Second,
+			BackoffInitial:    20 * time.Millisecond, BackoffMax: 40 * time.Millisecond,
+			Metrics: func(event EvidenceAuditCoordinatorEvent) { events <- event },
+			ReleaseLease: func(string, string, time.Time) error {
+				return errors.New("manifest write failed client_secret=release-secret")
+			},
+			Run: func(_ context.Context, _ *BookKnowledgeStore, _ string, _ BookKnowledgeLLMClient, _ EvidenceAuditRunnerConfig) (*EvidenceAudit, error) {
+				return audit, nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.Start(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			_ = coordinator.Shutdown(ctx)
+			cancel()
+		})
+		if err := coordinator.Enqueue(audit.AuditID); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case event := <-events:
+			if event.Type != EvidenceAuditCoordinatorLeaseReleaseFailed ||
+				event.ErrorCode != "lease_release_failed" || event.RetryAfter != 20*time.Millisecond {
+				t.Fatalf("release failure event = %+v", event)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("release failure metric was not emitted")
+		}
+	})
 }
 
 func TestEvidenceAuditCoordinatorScanErrorsBackOffWithInjectedJitter(t *testing.T) {

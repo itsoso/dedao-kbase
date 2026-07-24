@@ -15,10 +15,14 @@ var ErrEvidenceAuditQueueFull = errors.New("evidence audit coordinator queue is 
 type EvidenceAuditCoordinatorEventType string
 
 const (
-	EvidenceAuditCoordinatorScanFailed      EvidenceAuditCoordinatorEventType = "scan_failed"
-	EvidenceAuditCoordinatorExecutionFailed EvidenceAuditCoordinatorEventType = "execution_failed"
-	EvidenceAuditCoordinatorQueueFull       EvidenceAuditCoordinatorEventType = "queue_full"
-	EvidenceAuditCoordinatorLeaseLost       EvidenceAuditCoordinatorEventType = "lease_lost"
+	EvidenceAuditCoordinatorScanFailed         EvidenceAuditCoordinatorEventType = "scan_failed"
+	EvidenceAuditCoordinatorExecutionFailed    EvidenceAuditCoordinatorEventType = "execution_failed"
+	EvidenceAuditCoordinatorQueueFull          EvidenceAuditCoordinatorEventType = "queue_full"
+	EvidenceAuditCoordinatorLeaseLost          EvidenceAuditCoordinatorEventType = "lease_lost"
+	EvidenceAuditCoordinatorLeaseSkipped       EvidenceAuditCoordinatorEventType = "lease_skipped"
+	EvidenceAuditCoordinatorLeaseClaimFailed   EvidenceAuditCoordinatorEventType = "lease_claim_failed"
+	EvidenceAuditCoordinatorLeaseRenewFailed   EvidenceAuditCoordinatorEventType = "lease_renew_failed"
+	EvidenceAuditCoordinatorLeaseReleaseFailed EvidenceAuditCoordinatorEventType = "lease_release_failed"
 )
 
 type EvidenceAuditCoordinatorEvent struct {
@@ -37,6 +41,16 @@ type EvidenceAuditRunFunc func(
 	EvidenceAuditRunnerConfig,
 ) (*EvidenceAudit, error)
 
+type EvidenceAuditLeaseClaimFunc func(
+	string, string, time.Time, time.Duration,
+) (EvidenceAuditLeaseClaim, error)
+
+type EvidenceAuditLeaseRenewFunc func(
+	string, string, time.Time, time.Duration,
+) (EvidenceAuditRecord, error)
+
+type EvidenceAuditLeaseReleaseFunc func(string, string, time.Time) error
+
 type EvidenceAuditCoordinatorConfig struct {
 	Store             *BookKnowledgeStore
 	Client            BookKnowledgeLLMClient
@@ -54,6 +68,9 @@ type EvidenceAuditCoordinatorConfig struct {
 	Metrics           func(EvidenceAuditCoordinatorEvent)
 	Now               func() time.Time
 	Run               EvidenceAuditRunFunc
+	ClaimLease        EvidenceAuditLeaseClaimFunc
+	RenewLease        EvidenceAuditLeaseRenewFunc
+	ReleaseLease      EvidenceAuditLeaseReleaseFunc
 }
 
 type EvidenceAuditCoordinator struct {
@@ -72,6 +89,9 @@ type EvidenceAuditCoordinator struct {
 	metrics           func(EvidenceAuditCoordinatorEvent)
 	now               func() time.Time
 	run               EvidenceAuditRunFunc
+	claimLease        EvidenceAuditLeaseClaimFunc
+	renewLease        EvidenceAuditLeaseRenewFunc
+	releaseLease      EvidenceAuditLeaseReleaseFunc
 	queue             chan string
 
 	mu           sync.Mutex
@@ -147,6 +167,18 @@ func NewEvidenceAuditCoordinator(config EvidenceAuditCoordinatorConfig) (*Eviden
 	if run == nil {
 		run = RunEvidenceAudit
 	}
+	claimLease := config.ClaimLease
+	if claimLease == nil {
+		claimLease = config.Store.ClaimEvidenceAuditLease
+	}
+	renewLease := config.RenewLease
+	if renewLease == nil {
+		renewLease = config.Store.RenewEvidenceAuditLease
+	}
+	releaseLease := config.ReleaseLease
+	if releaseLease == nil {
+		releaseLease = config.Store.ReleaseEvidenceAuditLease
+	}
 	return &EvidenceAuditCoordinator{
 		store: config.Store, client: config.Client, runnerConfig: config.RunnerConfig,
 		workers: config.Workers, pollInterval: config.PollInterval,
@@ -154,6 +186,7 @@ func NewEvidenceAuditCoordinator(config EvidenceAuditCoordinatorConfig) (*Eviden
 		heartbeatInterval: config.HeartbeatInterval, recoveryBatch: config.RecoveryBatch,
 		backoffInitial: config.BackoffInitial, backoffMax: config.BackoffMax,
 		jitter: config.Jitter, metrics: config.Metrics, now: config.Now, run: run,
+		claimLease: claimLease, renewLease: renewLease, releaseLease: releaseLease,
 		queue: make(chan string, config.QueueSize), pending: map[string]struct{}{},
 		runFailures: map[string]int{}, runRetryAt: map[string]time.Time{},
 	}, nil
@@ -201,25 +234,6 @@ func (c *EvidenceAuditCoordinator) Enqueue(auditID string) error {
 		return nil
 	}
 	ctx := c.ctx
-	c.mu.Unlock()
-
-	claim, err := c.store.ClaimEvidenceAuditLease(auditID, c.ownerID, c.now(), c.leaseDuration)
-	if err != nil {
-		return err
-	}
-	if !claim.Claimed {
-		return nil
-	}
-	c.mu.Lock()
-	if c.stopped {
-		c.mu.Unlock()
-		_ = c.store.ReleaseEvidenceAuditLease(auditID, c.ownerID, c.now())
-		return fmt.Errorf("evidence audit coordinator is not running")
-	}
-	if _, exists := c.pending[auditID]; exists {
-		c.mu.Unlock()
-		return nil
-	}
 	c.pending[auditID] = struct{}{}
 	queue := c.queue
 	c.mu.Unlock()
@@ -228,11 +242,9 @@ func (c *EvidenceAuditCoordinator) Enqueue(auditID string) error {
 		return nil
 	case <-ctx.Done():
 		c.removePending(auditID)
-		_ = c.store.ReleaseEvidenceAuditLease(auditID, c.ownerID, c.now())
 		return ctx.Err()
 	default:
 		c.removePending(auditID)
-		_ = c.store.ReleaseEvidenceAuditLease(auditID, c.ownerID, c.now())
 		c.emit(EvidenceAuditCoordinatorEvent{
 			Type: EvidenceAuditCoordinatorQueueFull, AuditID: auditID, ErrorCode: "queue_full",
 		})
@@ -310,20 +322,31 @@ func (c *EvidenceAuditCoordinator) scan() {
 	c.mu.Lock()
 	c.scanFailures = 0
 	c.scanRetryAt = time.Time{}
-	c.cursor = page.NextCursor
 	c.mu.Unlock()
+	processedCursor := cursor
 	for _, record := range page.Records {
 		c.mu.Lock()
 		retryAt := c.runRetryAt[record.AuditID]
 		c.mu.Unlock()
 		if now.Before(retryAt) {
+			processedCursor = record.AuditID
 			continue
 		}
 		err := c.Enqueue(record.AuditID)
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrEvidenceAuditQueueFull) {
+		if errors.Is(err, ErrEvidenceAuditQueueFull) {
+			c.mu.Lock()
+			c.cursor = processedCursor
+			c.mu.Unlock()
 			return
 		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return
+		}
+		processedCursor = record.AuditID
 	}
+	c.mu.Lock()
+	c.cursor = page.NextCursor
+	c.mu.Unlock()
 }
 
 func (c *EvidenceAuditCoordinator) worker() {
@@ -339,6 +362,22 @@ func (c *EvidenceAuditCoordinator) worker() {
 }
 
 func (c *EvidenceAuditCoordinator) execute(auditID string) {
+	claim, err := c.claimLease(auditID, c.ownerID, c.now(), c.leaseDuration)
+	if err != nil {
+		c.recordWorkerFailure(
+			EvidenceAuditCoordinatorLeaseClaimFailed, auditID, "lease_claim_failed",
+		)
+		c.removePending(auditID)
+		return
+	}
+	if !claim.Claimed {
+		c.emit(EvidenceAuditCoordinatorEvent{
+			Type: EvidenceAuditCoordinatorLeaseSkipped, AuditID: auditID,
+			ErrorCode: "lease_not_claimed",
+		})
+		c.removePending(auditID)
+		return
+	}
 	ctx, cancel := context.WithCancel(c.ctx)
 	heartbeatDone := make(chan struct{})
 	heartbeatErr := make(chan error, 1)
@@ -351,7 +390,7 @@ func (c *EvidenceAuditCoordinator) execute(auditID string) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if _, err := c.store.RenewEvidenceAuditLease(
+				if _, err := c.renewLease(
 					auditID, c.ownerID, c.now(), c.leaseDuration,
 				); err != nil {
 					heartbeatErr <- err
@@ -366,44 +405,83 @@ func (c *EvidenceAuditCoordinator) execute(auditID string) {
 	_, runErr := c.run(ctx, c.store, auditID, c.client, config)
 	cancel()
 	<-heartbeatDone
+	var heartbeatFailure error
 	select {
 	case err := <-heartbeatErr:
+		heartbeatFailure = err
 		runErr = err
 	default:
 	}
 	var releaseErr error
 	if runErr != nil && !errors.Is(runErr, context.Canceled) {
-		c.mu.Lock()
-		c.runFailures[auditID]++
-		attempt := c.runFailures[auditID]
-		c.mu.Unlock()
-		delay := c.backoffDelay(attempt)
-		c.mu.Lock()
-		c.runRetryAt[auditID] = c.now().Add(delay)
-		c.mu.Unlock()
+		eventType := EvidenceAuditCoordinatorExecutionFailed
+		errorCode := "execution_failed"
+		if errors.Is(runErr, ErrEvidenceAuditLeaseLost) {
+			eventType = EvidenceAuditCoordinatorLeaseLost
+			errorCode = "lease_lost"
+		} else if heartbeatFailure != nil {
+			eventType = EvidenceAuditCoordinatorLeaseRenewFailed
+			errorCode = "lease_renew_failed"
+		}
+		attempt, delay := c.noteWorkerFailure(auditID)
 		if !errors.Is(runErr, ErrEvidenceAuditLeaseLost) {
-			_, releaseErr = c.store.RenewEvidenceAuditLease(
+			_, releaseErr = c.renewLease(
 				auditID, c.ownerID, c.now(), delay,
 			)
 		}
-		eventType := EvidenceAuditCoordinatorExecutionFailed
-		errorCode := "execution_failed"
 		if errors.Is(runErr, ErrEvidenceAuditLeaseLost) || errors.Is(releaseErr, ErrEvidenceAuditLeaseLost) {
 			eventType = EvidenceAuditCoordinatorLeaseLost
 			errorCode = "lease_lost"
+		} else if releaseErr != nil {
+			eventType = EvidenceAuditCoordinatorLeaseRenewFailed
+			errorCode = "lease_renew_failed"
 		}
 		c.emit(EvidenceAuditCoordinatorEvent{
 			Type: eventType, AuditID: auditID, ErrorCode: errorCode,
 			Attempt: attempt, RetryAfter: delay,
 		})
 	} else {
-		releaseErr = c.store.ReleaseEvidenceAuditLease(auditID, c.ownerID, c.now())
-		c.mu.Lock()
-		delete(c.runFailures, auditID)
-		delete(c.runRetryAt, auditID)
-		c.mu.Unlock()
+		releaseErr = c.releaseLease(auditID, c.ownerID, c.now())
+		if releaseErr != nil && !errors.Is(releaseErr, ErrEvidenceAuditLeaseLost) {
+			c.recordWorkerFailure(
+				EvidenceAuditCoordinatorLeaseReleaseFailed, auditID, "lease_release_failed",
+			)
+		} else {
+			c.clearWorkerFailure(auditID)
+		}
 	}
 	c.removePending(auditID)
+}
+
+func (c *EvidenceAuditCoordinator) noteWorkerFailure(auditID string) (int, time.Duration) {
+	c.mu.Lock()
+	c.runFailures[auditID]++
+	attempt := c.runFailures[auditID]
+	c.mu.Unlock()
+	delay := c.backoffDelay(attempt)
+	retryAt := c.now().Add(delay)
+	c.mu.Lock()
+	c.runRetryAt[auditID] = retryAt
+	c.mu.Unlock()
+	return attempt, delay
+}
+
+func (c *EvidenceAuditCoordinator) recordWorkerFailure(
+	eventType EvidenceAuditCoordinatorEventType,
+	auditID, errorCode string,
+) {
+	attempt, delay := c.noteWorkerFailure(auditID)
+	c.emit(EvidenceAuditCoordinatorEvent{
+		Type: eventType, AuditID: auditID, ErrorCode: errorCode,
+		Attempt: attempt, RetryAfter: delay,
+	})
+}
+
+func (c *EvidenceAuditCoordinator) clearWorkerFailure(auditID string) {
+	c.mu.Lock()
+	delete(c.runFailures, auditID)
+	delete(c.runRetryAt, auditID)
+	c.mu.Unlock()
 }
 
 func (c *EvidenceAuditCoordinator) removePending(auditID string) {

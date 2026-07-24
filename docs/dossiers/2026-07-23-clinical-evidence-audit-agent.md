@@ -93,19 +93,26 @@ Audit/Trace terminal coordination.
 Completed, hardened, and verified.
 
 - The coordinator uses the persistent Audit store as the queue of record.
-  Cross-process leases with owner, expiry, heartbeat, and attempt metadata
-  ensure that only one server instance executes an Audit. Expired leases can
-  be claimed after a crashed worker, while a busy execution lock never fails
-  another owner's Audit.
+  In-memory queues carry Audit IDs only; a worker atomically claims the
+  cross-process lease immediately before execution and starts heartbeats at
+  once. Competing instances may observe and enqueue the same durable task, but
+  non-owners emit a structured skip and never execute it. This prevents queued
+  work from holding an expiring lease or starving behind a long-running Audit.
+  Expired leases can still be claimed after a crashed worker, while a busy
+  execution lock never fails another owner's Audit.
 - Recovery scans use a bounded cursor page instead of reading all Audit
-  records each second. Queue pressure remains durable and visible; scan and
-  execution failures use bounded exponential backoff with injectable jitter
-  and structured metric events.
+  records each second. The cursor advances only through work successfully
+  processed by the local queue, so queue pressure cannot skip or starve later
+  records. Scan, claim, renew, release, and execution failures use bounded
+  exponential backoff with injectable jitter and structured metric/log events.
 - Authenticated asynchronous create, list, detail, and explicit manual retry
   endpoints expose the workflow without automatically retrying failed Audits.
-- Audit API failures return stable public error codes and messages. Full
-  internal diagnostics go only to the injected server logger after credential
-  redaction.
+- Every Audit API failure, including authentication, method errors, missing
+  Packages, and storage failures, returns a stable `{code,error}` response.
+  Full internal diagnostics go only to the injected server logger after
+  case-insensitive redaction of bearer/basic credentials, API keys, secrets,
+  passwords, sessions, CSRF values, and access/refresh tokens in JSON, query,
+  and header forms.
 - Retry authorization is derived from the authenticated actor and signed with
   a server-side HMAC key. Bearer credentials and signing keys are not persisted.
 - Missing TokenPlan configuration leaves the service online but makes Audit

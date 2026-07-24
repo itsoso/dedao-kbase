@@ -547,6 +547,99 @@ func TestKBaseHTTPHandlerEvidenceAuditQueueErrorUsesStableResponse(t *testing.T)
 	}
 }
 
+func TestKBaseHTTPHandlerEvidenceAuditPackageMissingUsesStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	response := requestJSONKBase(
+		handler, http.MethodPost,
+		"/api/agent-packages/missing-package/audits?version=2.0.0",
+		"consumer-a",
+		`{"subject":"Trial claim","scope":"Population evidence comparison","idempotency_key":"missing-package"}`,
+	)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["code"] != "audit_package_not_found" ||
+		payload["error"] != "agent package not found" {
+		t.Fatalf("stable package error = %+v", payload)
+	}
+}
+
+func TestKBaseHTTPHandlerAllEvidenceAuditMethodErrorsUseStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	for _, path := range []string{
+		"/api/agent-audits",
+		"/api/agent-audits/audit-1",
+		"/api/agent-audits/audit-1/retry",
+		"/api/agent-packages/pkg/audits?version=2.0.0",
+	} {
+		response := requestKBase(handler, http.MethodDelete, path, "consumer-a")
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d body=%s", path, response.Code, response.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s invalid JSON: %v", path, err)
+		}
+		if payload["code"] != "audit_method_not_allowed" ||
+			payload["error"] != "method not allowed" {
+			t.Fatalf("%s unstable method error = %+v", path, payload)
+		}
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditAuthorizationErrorsUseStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	for _, token := range []string{"", "wrong-token"} {
+		response := requestKBase(handler, http.MethodGet, "/api/agent-audits", token)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("token=%q status=%d body=%s", token, response.Code, response.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["code"] != "audit_unauthorized" ||
+			payload["error"] != "unauthorized" {
+			t.Fatalf("token=%q unstable auth error = %+v", token, payload)
+		}
+	}
+}
+
+func TestSanitizeEvidenceAuditHTTPLogCauseRedactsCommonCredentialForms(t *testing.T) {
+	secrets := []string{
+		"query-api-key", "json-apikey", "client-secret", "plain-secret",
+		"password-value", "passwd-value", "session-value", "csrf-value",
+		"access-value", "refresh-value", "bearer-value", "basic-value",
+	}
+	cause := `request failed?api_key=query-api-key ` +
+		`{"ApiKey":"json-apikey","client_secret":"client-secret","SECRET":"plain-secret",` +
+		`"password":"password-value","passwd":"passwd-value","session":"session-value",` +
+		`"csrf":"csrf-value","access_token":"access-value","refresh_token":"refresh-value"} ` +
+		`Authorization: Bearer bearer-value Proxy-Authorization: Basic basic-value`
+	sanitized := sanitizeEvidenceAuditHTTPLogCause(cause)
+	for _, secret := range secrets {
+		if strings.Contains(sanitized, secret) {
+			t.Fatalf("sanitized log leaked %q: %s", secret, sanitized)
+		}
+	}
+	if !strings.Contains(sanitized, "[redacted]") {
+		t.Fatalf("sanitized log omitted redaction marker: %s", sanitized)
+	}
+}
+
 func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {

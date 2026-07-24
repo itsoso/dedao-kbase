@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -267,7 +268,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAgentPackages(w, r)
 		return
 	}
-	if !h.authorize(w, r) {
+	if isEvidenceAuditAPIPath(r.URL.Path) {
+		if !h.authorizeEvidenceAudit(w, r) {
+			return
+		}
+	} else if !h.authorize(w, r) {
 		return
 	}
 	if isSourceSyncAdminPath(r.URL.Path) {
@@ -1248,6 +1253,14 @@ func agentPackageAuditCollectionPathID(path string) (string, bool) {
 	return packageID, true
 }
 
+func isEvidenceAuditAPIPath(path string) bool {
+	if path == "/api/agent-audits" || strings.HasPrefix(path, "/api/agent-audits/") {
+		return true
+	}
+	_, ok := agentPackageAuditCollectionPathID(path)
+	return ok
+}
+
 func (h *kbaseHTTPHandler) handleAgentPackageAudits(w http.ResponseWriter, r *http.Request, packageID string) {
 	version := strings.TrimSpace(r.URL.Query().Get("version"))
 	if version == "" {
@@ -1278,7 +1291,10 @@ func (h *kbaseHTTPHandler) handleAgentPackageAudits(w http.ResponseWriter, r *ht
 		return
 	}
 	if r.Method != http.MethodPost {
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "create_audit", nil,
+		)
 		return
 	}
 	if h.auditCoordinator == nil {
@@ -1397,7 +1413,10 @@ func (h *kbaseHTTPHandler) handleEvidenceAudits(w http.ResponseWriter, r *http.R
 	const prefix = "/api/agent-audits/"
 	if r.URL.Path == "/api/agent-audits" {
 		if r.Method != http.MethodGet {
-			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+				"method not allowed", "list_audits", nil,
+			)
 			return
 		}
 		limit := parseBoundedInt(r.URL.Query().Get("limit"), 50, 1, 200)
@@ -1437,7 +1456,10 @@ func (h *kbaseHTTPHandler) handleEvidenceAudits(w http.ResponseWriter, r *http.R
 		return
 	}
 	if r.Method != http.MethodGet {
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "load_audit", nil,
+		)
 		return
 	}
 	if remainder == "" || strings.Contains(remainder, "/") {
@@ -1475,7 +1497,10 @@ func (h *kbaseHTTPHandler) handleEvidenceAudits(w http.ResponseWriter, r *http.R
 
 func (h *kbaseHTTPHandler) handleEvidenceAuditRetry(w http.ResponseWriter, r *http.Request, rawAuditID string) {
 	if r.Method != http.MethodPost {
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "retry_audit", nil,
+		)
 		return
 	}
 	if h.auditCoordinator == nil {
@@ -1605,7 +1630,10 @@ func (h *kbaseHTTPHandler) evidenceAuditRetryMAC(parts ...string) string {
 func (h *kbaseHTTPHandler) writeEvidenceAuditCreateError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		writeHTTPError(w, http.StatusNotFound, "agent package not found")
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "audit_package_not_found",
+			"agent package not found", "create_audit", nil,
+		)
 	case errors.Is(err, ErrEvidenceAuditIdempotencyConflict):
 		h.writeEvidenceAuditHTTPError(
 			w, http.StatusConflict, "audit_idempotency_conflict",
@@ -1645,18 +1673,19 @@ func (h *kbaseHTTPHandler) writeEvidenceAuditHTTPError(
 	writeHTTPJSON(w, status, map[string]string{"code": code, "error": message})
 }
 
+var (
+	evidenceAuditAuthorizationPattern = regexp.MustCompile(
+		`(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+`,
+	)
+	evidenceAuditCredentialPattern = regexp.MustCompile(
+		`(?i)((?:["']?)(?:api[_-]?key|apikey|client[_-]?secret|secret|password|passwd|session|csrf|access[_-]?token|refresh[_-]?token|token|cookie|authorization|proxy-authorization)(?:["']?)\s*(?::|=)\s*)(?:"[^"]*"|'[^']*'|[^\s&,;}]+)`,
+	)
+)
+
 func sanitizeEvidenceAuditHTTPLogCause(value string) string {
-	fields := strings.Fields(strings.TrimSpace(value))
-	for index := range fields {
-		lower := strings.ToLower(fields[index])
-		if strings.Contains(lower, "token") ||
-			strings.Contains(lower, "cookie") ||
-			strings.Contains(lower, "authorization") ||
-			(index > 0 && strings.Contains(strings.ToLower(fields[index-1]), "bearer")) {
-			fields[index] = "[redacted]"
-		}
-	}
-	return strings.Join(fields, " ")
+	value = strings.TrimSpace(value)
+	value = evidenceAuditAuthorizationPattern.ReplaceAllString(value, "$1 [redacted]")
+	return evidenceAuditCredentialPattern.ReplaceAllString(value, "${1}[redacted]")
 }
 
 func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
@@ -2126,6 +2155,20 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 		return false
 	}
 	return authorizeBearerToken(w, r, h.authToken)
+}
+
+func (h *kbaseHTTPHandler) authorizeEvidenceAudit(w http.ResponseWriter, r *http.Request) bool {
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
+	if h.authToken == "" || token == value ||
+		subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) != 1 {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnauthorized, "audit_unauthorized",
+			"unauthorized", "authorize_audit", nil,
+		)
+		return false
+	}
+	return true
 }
 
 func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected string) bool {
