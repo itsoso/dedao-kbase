@@ -444,7 +444,7 @@ func evidenceAuditCitationsMatchStoredReleases(
 		}
 		expectedSourceType := strings.ToLower(strings.TrimSpace(actual.Book.SourceType))
 		if release.SourceType != expectedSourceType ||
-			release.PublicationIdentity != evidenceAuditPublicationIdentity(expectedSourceType) {
+			release.PublicationIdentity != evidenceAuditPublicationIdentity(actual) {
 			return false
 		}
 		claims := make(map[string]BookAnalysisClaim)
@@ -507,8 +507,15 @@ func evidenceAuditCitationsComplete(audit EvidenceAudit) bool {
 	return true
 }
 
-func evidenceAuditPublicationIdentity(sourceType string) string {
-	return sha256Fingerprint([]byte(strings.ToLower(strings.TrimSpace(sourceType))))
+func evidenceAuditPublicationIdentity(release KnowledgeRelease) string {
+	publisher := strings.ToLower(strings.TrimSpace(release.Book.SourceAccount))
+	if publisher == "" {
+		publisher = strings.ToLower(strings.TrimSpace(release.Book.Author))
+	}
+	if publisher == "" {
+		publisher = strings.ToLower(strings.TrimSpace(release.BookID))
+	}
+	return sha256Fingerprint([]byte(publisher))
 }
 
 func evidenceAuditClaimIdentity(sourceClaim string) string {

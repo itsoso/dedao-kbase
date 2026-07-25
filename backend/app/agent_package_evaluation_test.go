@@ -10,6 +10,37 @@ import (
 	"time"
 )
 
+func TestEvidenceAuditPublicationIdentityUsesPublisherNotTransport(t *testing.T) {
+	first := KnowledgeRelease{
+		BookID: "release-a",
+		Book: BookKnowledgeBook{
+			SourceType:    "wechat_mp_article",
+			SourceAccount: "Clinical Evidence Review",
+		},
+	}
+	samePublisherDifferentTransport := KnowledgeRelease{
+		BookID: "release-b",
+		Book: BookKnowledgeBook{
+			SourceType:    "dedao_course_article",
+			SourceAccount: " clinical evidence review ",
+		},
+	}
+	differentPublisherSameTransport := KnowledgeRelease{
+		BookID: "release-c",
+		Book: BookKnowledgeBook{
+			SourceType:    "wechat_mp_article",
+			SourceAccount: "Independent Trial Journal",
+		},
+	}
+
+	if evidenceAuditPublicationIdentity(first) != evidenceAuditPublicationIdentity(samePublisherDifferentTransport) {
+		t.Fatal("the same publisher must keep one publication identity across transport types")
+	}
+	if evidenceAuditPublicationIdentity(first) == evidenceAuditPublicationIdentity(differentPublisherSameTransport) {
+		t.Fatal("different publishers must not collapse into one identity for the same transport type")
+	}
+}
+
 func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

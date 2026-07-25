@@ -278,8 +278,10 @@ let evidenceAuditWorkspaceSequence = 0;
 let bookAgentLoadSequence = 0;
 let proofroomOperationSequence = 0;
 let bookKnowledgeLoadSequence = 0;
+let bookKnowledgeDetailSequence = 0;
 let proofroomPreviousFocus = null;
 let proofroomKeydownHandler = null;
+let proofroomReturnFocusSelector = "";
 
 function getToken() {
   for (const key of tokenKeys) {
@@ -2717,16 +2719,28 @@ function deactivateProofroomModal({ restoreFocus = false } = {}) {
   }
   if (restoreFocus) {
     proofroomPreviousFocus = null;
+    proofroomReturnFocusSelector = "";
   }
 }
 
 function closeProofroomPreview(route) {
-  deactivateProofroomModal({ restoreFocus: true });
+  const returnFocusSelector = proofroomReturnFocusSelector;
+  deactivateProofroomModal();
   evidenceAuditState.proofroomPreview = null;
   evidenceAuditState.proofroomDeliveryKey = "";
   evidenceAuditState.proofroomStatus = "";
   evidenceAuditState.proofroomError = "";
   renderBookAgentPlatform(route);
+  window.requestAnimationFrame?.(() => {
+    const target = returnFocusSelector ? document.querySelector(returnFocusSelector) : null;
+    if (target && typeof target.focus === "function") {
+      target.focus();
+    } else if (proofroomPreviousFocus?.isConnected && typeof proofroomPreviousFocus.focus === "function") {
+      proofroomPreviousFocus.focus();
+    }
+    proofroomPreviousFocus = null;
+    proofroomReturnFocusSelector = "";
+  });
 }
 
 function activateProofroomModal(route) {
@@ -2735,7 +2749,7 @@ function activateProofroomModal(route) {
     return;
   }
   deactivateProofroomModal();
-  proofroomPreviousFocus = document.activeElement;
+  proofroomPreviousFocus = proofroomPreviousFocus || document.activeElement;
   document.body?.appendChild?.(overlay);
   document.body?.classList?.add("has-proofroom-modal");
   app.inert = true;
@@ -3286,6 +3300,8 @@ async function loadProofroomPreview(route) {
   }
   evidenceAuditState.proofroomStatus = "loading";
   evidenceAuditState.proofroomError = "";
+  proofroomPreviousFocus = document.activeElement;
+  proofroomReturnFocusSelector = "[data-proofroom-preview]";
   const operation = ++proofroomOperationSequence;
   const auditID = audit.audit_id;
   renderBookAgentPlatform(route);
@@ -7081,6 +7097,7 @@ async function loadKnowledgeReviewCockpit({ silent = false, renderResult = true 
 }
 
 async function selectKnowledgeBook(book, renderBefore = true) {
+  const sequence = ++bookKnowledgeDetailSequence;
   const previousID = knowledgeState.selectedBook?.book_id || "";
   knowledgeState.selectedBook = book;
   knowledgeState.package = null;
@@ -7094,27 +7111,42 @@ async function selectKnowledgeBook(book, renderBefore = true) {
     renderBookKnowledge();
   }
   try {
-    knowledgeState.package = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    const pkg = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== book.book_id) {
+      return;
+    }
+    knowledgeState.package = pkg;
     await Promise.all([
-      loadKnowledgeAnalysisManifest(book.book_id),
+      loadKnowledgeAnalysisManifest(book.book_id, sequence),
       loadKnowledgeReview(book.book_id, { silent: true, renderResult: false }),
       loadKnowledgeAgentPackages(book.book_id, { silent: true, renderResult: false }),
     ]);
   } catch (error) {
-    knowledgeState.message = error instanceof Error ? error.message : String(error);
+    if (sequence === bookKnowledgeDetailSequence && knowledgeState.selectedBook?.book_id === book.book_id) {
+      knowledgeState.message = error instanceof Error ? error.message : String(error);
+    }
   } finally {
-    knowledgeState.loading = "";
-    if (renderBefore) {
-      renderBookKnowledge();
+    if (sequence === bookKnowledgeDetailSequence && knowledgeState.selectedBook?.book_id === book.book_id) {
+      knowledgeState.loading = "";
+      if (renderBefore) {
+        renderBookKnowledge();
+      }
     }
   }
 }
 
-async function loadKnowledgeAnalysisManifest(bookID) {
+async function loadKnowledgeAnalysisManifest(bookID, sequence = bookKnowledgeDetailSequence) {
   knowledgeState.analysisManifestError = "";
   try {
-    knowledgeState.analysisManifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+    const manifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.analysisManifest = manifest;
   } catch (error) {
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes("HTTP 404")) {
       knowledgeState.analysisManifest = null;

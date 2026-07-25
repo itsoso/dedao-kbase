@@ -26,6 +26,8 @@ for (const marker of [
   "cancelEvidenceAuditPoll",
   "loadProofroomPreview",
   "deliverEvidenceAuditToProofroom",
+  "proofroomReturnFocusSelector",
+  "bookKnowledgeDetailSequence",
   "新建证据审计",
   "来源独立性",
   "证据时效",
@@ -78,6 +80,12 @@ assert.ok(js.includes("canRetryEvidenceAudit"), "retry visibility should be gove
 
 const proofroomSource = js.match(/async function deliverEvidenceAuditToProofroom\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(proofroomSource.includes("window.confirm"), "Proofroom delivery should require explicit confirmation");
+const closeProofroomStart = js.indexOf("function closeProofroomPreview(");
+const closeProofroomEnd = js.indexOf("\nfunction activateProofroomModal(", closeProofroomStart);
+const closeProofroomSource = js.slice(closeProofroomStart, closeProofroomEnd);
+assert.ok(closeProofroomSource.includes("proofroomReturnFocusSelector"), "closing Proofroom should use the captured rerendered trigger selector");
+assert.ok(js.includes('proofroomReturnFocusSelector = "[data-proofroom-preview]"'), "Proofroom preview should capture its stable trigger selector");
+assert.ok(closeProofroomSource.includes("requestAnimationFrame"), "focus restoration should wait for the preview trigger to rerender");
 assert.ok(proofroomSource.includes("Idempotency-Key"), "Proofroom delivery should be idempotent");
 assert.ok(proofroomSource.includes("proofroomDeliveryKey"), "Proofroom retries should reuse the preview-bound idempotency key");
 assert.ok(proofroomSource.includes("/proofroom"), "Proofroom delivery should use the audit projection endpoint");
@@ -166,6 +174,6 @@ assert.ok(css.includes("minmax(0, 1fr)"), "audit layout should allow columns to 
 assert.ok(css.includes("max-height: 140px"), "desktop audit context should enforce its compact height budget");
 assert.ok(css.includes("max-height: 220px"), "mobile audit context should enforce its compact height budget");
 assert.ok(css.includes(".evidence-audit__waiting > span"), "audit progress animation should honor reduced motion");
-assert.ok(html.includes("20260724-evidence-audit-modal"), "audit workspace should publish a fresh asset version");
+assert.ok(html.includes("20260724-evidence-audit-focus"), "audit workspace should publish a fresh asset version");
 
 console.log("evidence audit agent smoke passed");

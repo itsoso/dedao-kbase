@@ -161,7 +161,7 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
-assert.ok(html.includes("20260724-evidence-audit-modal"), "evidence audit workspace release should use a fresh browser cache version");
+assert.ok(html.includes("20260724-evidence-audit-focus"), "evidence audit workspace release should use a fresh browser cache version");
 assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
 assert.ok(js.includes('"/course": ROUTES.dedaoCourses'), "legacy course alias should be preserved");
 assert.ok(js.includes('"/ebook": ROUTES.dedaoEbooks'), "legacy ebook alias should be preserved");
@@ -189,6 +189,7 @@ assert.ok(js.includes('id: "qwen3.7-max", label: "Qwen-3.7-Max"'), "Qwen display
 for (const marker of [
   "analysisManifest",
   "loadKnowledgeAnalysisManifest",
+  "bookKnowledgeDetailSequence",
   "generateKnowledgeAnalysisManifest",
   "知识基线分析",
   "生成基线分析",
@@ -200,6 +201,10 @@ for (const marker of [
   assert.ok(js.includes(marker), `book knowledge web UI should include durable analysis marker ${marker}`);
 }
 assert.ok(css.includes(".knowledge-web__manifest"), "styles.css should style the durable analysis manifest");
+const selectKnowledgeBookSource = js.match(/async function selectKnowledgeBook\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(selectKnowledgeBookSource.includes("++bookKnowledgeDetailSequence"), "book detail loading should assign a route-scoped sequence");
+assert.ok(selectKnowledgeBookSource.includes("sequence !== bookKnowledgeDetailSequence"), "stale book detail responses should be discarded");
+assert.ok(selectKnowledgeBookSource.includes("knowledgeState.selectedBook?.book_id !== book.book_id"), "book detail writes should remain scoped to the selected book");
 
 for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]) {
   assert.ok(
