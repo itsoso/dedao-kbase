@@ -57,6 +57,7 @@ type AgentEvaluationReport struct {
 	PackageID          string                           `json:"package_id"`
 	PackageContentHash string                           `json:"package_content_hash"`
 	SuiteVersion       string                           `json:"suite_version"`
+	TrustedSuiteHash   string                           `json:"trusted_suite_hash,omitempty"`
 	InputHash          string                           `json:"input_hash"`
 	EvaluatorVersion   string                           `json:"evaluator_version"`
 	RetrievalIdentity  AgentEvaluationRetrievalIdentity `json:"retrieval_identity"`
@@ -133,6 +134,24 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 		Failures:           failures,
 		EvaluatedAt:        now.UTC().Format(time.RFC3339Nano),
 	}, nil
+}
+
+func EvaluateAgentPackageAgainstTrustedSuite(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	submitted AgentEvaluationSuite,
+	now time.Time,
+) (AgentEvaluationSuite, AgentEvaluationReport, error) {
+	resolved, trustedSuiteHash, err := store.ResolveTrustedAgentEvaluationSuite(pkg, submitted)
+	if err != nil {
+		return AgentEvaluationSuite{}, AgentEvaluationReport{}, err
+	}
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, resolved, now)
+	if err != nil {
+		return AgentEvaluationSuite{}, AgentEvaluationReport{}, err
+	}
+	report.TrustedSuiteHash = trustedSuiteHash
+	return resolved, report, nil
 }
 
 func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
@@ -307,10 +326,12 @@ func executeEvidenceAuditEvaluationCase(
 	case "adjudication_consistency":
 		return evidenceAuditExpectedClaimsMatch(*audit, evalCase.ExpectedClaims, true, false), nil
 	case "source_independence":
+		assessed := false
 		for _, claim := range audit.ClaimAudits {
 			if claim.Verdict == EvidenceAuditVerdictInsufficient {
 				continue
 			}
+			assessed = true
 			publications := map[string]struct{}{}
 			for _, evidence := range claim.Evidence {
 				if evidence.Role == EvidenceAuditReleaseSupporting {
@@ -321,7 +342,7 @@ func executeEvidenceAuditEvaluationCase(
 				return false, nil
 			}
 		}
-		return true, nil
+		return assessed, nil
 	case "conflict_detection":
 		return evidenceAuditExpectedClaimsMatch(*audit, evalCase.ExpectedClaims, false, true), nil
 	case "report_citation_completeness":
@@ -793,7 +814,12 @@ func (s *BookKnowledgeStore) SaveAgentPackageEvaluation(pkg AgentPackage, suite 
 	if err != nil {
 		return fmt.Errorf("evaluation evaluated_at is invalid: %w", err)
 	}
-	expected, err := EvaluateAgentPackageDeterministically(s, pkg, suite, evaluatedAt)
+	expected := AgentEvaluationReport{}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		_, expected, err = EvaluateAgentPackageAgainstTrustedSuite(s, pkg, suite, evaluatedAt)
+	} else {
+		expected, err = EvaluateAgentPackageDeterministically(s, pkg, suite, evaluatedAt)
+	}
 	if err != nil {
 		return err
 	}
@@ -897,7 +923,12 @@ func ValidateAgentPackageEvaluationGate(store *BookKnowledgeStore, pkg AgentPack
 	if err != nil {
 		return fmt.Errorf("load trusted evaluation suite: %w", err)
 	}
-	expected, err := EvaluateAgentPackageDeterministically(store, pkg, *suite, evaluatedAt)
+	expected := AgentEvaluationReport{}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		_, expected, err = EvaluateAgentPackageAgainstTrustedSuite(store, pkg, *suite, evaluatedAt)
+	} else {
+		expected, err = EvaluateAgentPackageDeterministically(store, pkg, *suite, evaluatedAt)
+	}
 	if err != nil {
 		return fmt.Errorf("recompute trusted evaluation: %w", err)
 	}

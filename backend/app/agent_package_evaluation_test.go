@@ -441,7 +441,24 @@ func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeSto
 			}
 		}
 	}
-	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC))
+	now := time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC)
+	report := AgentEvaluationReport{}
+	var err error
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		trusted := suite
+		trusted.Cases = append([]AgentEvaluationCase(nil), suite.Cases...)
+		for index := range trusted.Cases {
+			if isEvidenceAuditEvaluationMetric(trusted.Cases[index].Metric) {
+				trusted.Cases[index].AuditID = ""
+			}
+		}
+		if err := store.SaveTrustedAgentEvaluationSuite(pkg, trusted); err != nil {
+			t.Fatal(err)
+		}
+		suite, report, err = EvaluateAgentPackageAgainstTrustedSuite(store, pkg, suite, now)
+	} else {
+		report, err = EvaluateAgentPackageDeterministically(store, pkg, suite, now)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

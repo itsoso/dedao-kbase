@@ -58,6 +58,81 @@ func TestEvidenceAuditEvaluationReadsCompletedAuditsAndTracesFromStore(t *testin
 	}
 }
 
+func TestTrustedEvidenceAuditEvaluationSuiteBindsOnlyAuditIDs(t *testing.T) {
+	store, pkg := evidenceAuditEvaluationStore(t)
+	supported := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "trusted-supported")
+	conflicted := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictMixed, true, "trusted-conflicted")
+	insufficient := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictInsufficient, false, "trusted-insufficient")
+	submitted := evidenceAuditEvaluationSuite(pkg, supported, conflicted, insufficient)
+	trusted := submitted
+	trusted.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	for index := range trusted.Cases {
+		trusted.Cases[index].AuditID = ""
+	}
+	if err := store.SaveTrustedAgentEvaluationSuite(pkg, trusted); err != nil {
+		t.Fatalf("SaveTrustedAgentEvaluationSuite() error = %v", err)
+	}
+
+	resolved, identity, err := store.ResolveTrustedAgentEvaluationSuite(pkg, submitted)
+	if err != nil {
+		t.Fatalf("ResolveTrustedAgentEvaluationSuite() error = %v", err)
+	}
+	if !strings.HasPrefix(identity, "sha256:") || !reflect.DeepEqual(resolved, submitted) {
+		t.Fatalf("resolved trusted suite identity=%q suite=%#v", identity, resolved)
+	}
+
+	tampered := submitted
+	tampered.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	tampered.Cases[0].ExpectedClaims = append(
+		[]AgentEvaluationExpectedClaim(nil),
+		submitted.Cases[0].ExpectedClaims...,
+	)
+	tampered.Cases[0].ExpectedClaims[0].Verdict = EvidenceAuditVerdictContradicted
+	if _, _, err := store.ResolveTrustedAgentEvaluationSuite(pkg, tampered); err == nil ||
+		!strings.Contains(err.Error(), "trusted evaluation suite") {
+		t.Fatalf("tampered caller gold error = %v", err)
+	}
+
+	reusedAudit := submitted
+	reusedAudit.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	reusedAudit.Cases[2].AuditID = reusedAudit.Cases[0].AuditID
+	if _, _, err := store.ResolveTrustedAgentEvaluationSuite(pkg, reusedAudit); err == nil ||
+		!strings.Contains(err.Error(), "distinct") {
+		t.Fatalf("reused positive/conflict audit error = %v", err)
+	}
+}
+
+func TestEvidenceAuditEvaluationRejectsAllInsufficientCoverage(t *testing.T) {
+	store, pkg := evidenceAuditEvaluationStore(t)
+	insufficient := persistEvidenceAuditEvaluationReport(
+		t, store, pkg, EvidenceAuditVerdictInsufficient, false, "all-insufficient",
+	)
+	passed, err := executeEvidenceAuditEvaluationCase(store, pkg, AgentEvaluationCase{
+		CaseID: "all-insufficient-independence", Metric: "source_independence", AuditID: insufficient.AuditID,
+	})
+	if err != nil {
+		t.Fatalf("executeEvidenceAuditEvaluationCase() error = %v", err)
+	}
+	if passed {
+		t.Fatal("an all-insufficient audit passed source independence")
+	}
+
+	allInsufficient := evidenceAuditEvaluationSuite(pkg, insufficient, insufficient, insufficient)
+	for index := range allInsufficient.Cases {
+		allInsufficient.Cases[index].AuditID = ""
+		if len(allInsufficient.Cases[index].ExpectedClaims) > 0 {
+			allInsufficient.Cases[index].ExpectedClaims[0].Verdict = EvidenceAuditVerdictInsufficient
+			if allInsufficient.Cases[index].ExpectedClaims[0].Conflict != nil {
+				conflict := false
+				allInsufficient.Cases[index].ExpectedClaims[0].Conflict = &conflict
+			}
+		}
+	}
+	if err := ValidateTrustedAgentEvaluationSuite(pkg, allInsufficient); err == nil {
+		t.Fatal("trusted evaluation suite accepted all-insufficient coverage")
+	}
+}
+
 func TestEvidenceAuditEvaluationRejectsMissingAuditAndTamperedTraceIdentity(t *testing.T) {
 	store, pkg := evidenceAuditEvaluationStore(t)
 	supported := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "trace")
@@ -292,6 +367,8 @@ func TestContractSchemasValidateGoPositiveAndNegativeExamples(t *testing.T) {
 	queued["summary"] = map[string]any{}
 	queued["proofroom_projection"] = map[string]any{}
 	validateSchemaInstance(t, "evidence-audit-v1.schema.json", queued, true)
+	queued["claim_audits"] = []any{}
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", queued, true)
 
 	queuedPartial := toObject(queued)
 	queuedPartial["summary"] = toObject(audit)["summary"]
@@ -302,12 +379,16 @@ func TestContractSchemasValidateGoPositiveAndNegativeExamples(t *testing.T) {
 	running["started_at"] = audit.StartedAt
 	running["trace_id"] = audit.TraceID
 	validateSchemaInstance(t, "evidence-audit-v1.schema.json", running, true)
+	running["claim_audits"] = []any{}
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", running, true)
 
 	failed := toObject(running)
 	failed["status"] = EvidenceAuditFailed
 	failed["failed_at"] = audit.CompletedAt
 	failed["failure_code"] = "invalid_model_output"
 	failed["failure_summary"] = "model output did not match the contract"
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", failed, true)
+	failed["claim_audits"] = []any{}
 	validateSchemaInstance(t, "evidence-audit-v1.schema.json", failed, true)
 
 	failedPartial := toObject(failed)

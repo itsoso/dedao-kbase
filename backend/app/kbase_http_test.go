@@ -283,6 +283,76 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
+func TestKBaseHTTPHandlerSeparatesTrustedGoldInstallationFromPublisherEvaluation(t *testing.T) {
+	store, pkg := evidenceAuditEvaluationStore(t)
+	supported := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "http-trusted-supported")
+	conflicted := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictMixed, true, "http-trusted-conflicted")
+	insufficient := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictInsufficient, false, "http-trusted-insufficient")
+	submitted := evidenceAuditEvaluationSuite(pkg, supported, conflicted, insufficient)
+	trusted := submitted
+	trusted.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	for index := range trusted.Cases {
+		trusted.Cases[index].AuditID = ""
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "admin-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	trustPayload, err := json.Marshal(AgentPackageTrustedEvaluationSuiteRequest{
+		Package: pkg,
+		Suite:   trusted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisherTrust := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluation-suites/trust",
+		"publisher-token",
+		string(trustPayload),
+	)
+	if publisherTrust.Code != http.StatusUnauthorized {
+		t.Fatalf("publisher installed trusted gold status=%d body=%s", publisherTrust.Code, publisherTrust.Body.String())
+	}
+	adminTrust := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluation-suites/trust",
+		"admin-token",
+		string(trustPayload),
+	)
+	if adminTrust.Code != http.StatusCreated || !strings.Contains(adminTrust.Body.String(), `"trusted":true`) {
+		t.Fatalf("admin trusted suite status=%d body=%s", adminTrust.Code, adminTrust.Body.String())
+	}
+
+	tampered := submitted
+	tampered.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	tampered.Cases[0].ExpectedClaims = append(
+		[]AgentEvaluationExpectedClaim(nil),
+		submitted.Cases[0].ExpectedClaims...,
+	)
+	tampered.Cases[0].ExpectedClaims[0].Verdict = EvidenceAuditVerdictContradicted
+	evaluatePayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: tampered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluate",
+		"publisher-token",
+		string(evaluatePayload),
+	)
+	if evaluated.Code != http.StatusBadRequest || !strings.Contains(evaluated.Body.String(), "trusted evaluation suite") {
+		t.Fatalf("tampered publisher gold status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	if _, err := store.LoadAgentPackageEvaluation(pkg.ContentHash); !os.IsNotExist(err) {
+		t.Fatalf("tampered evaluation persisted sidecar: %v", err)
+	}
+}
+
 func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:        NewBookKnowledgeStore(t.TempDir()),

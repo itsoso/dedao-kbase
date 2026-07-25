@@ -1238,6 +1238,11 @@ type AgentPackageEvaluationRequest struct {
 	Suite   AgentEvaluationSuite `json:"suite"`
 }
 
+type AgentPackageTrustedEvaluationSuiteRequest struct {
+	Package AgentPackage         `json:"package"`
+	Suite   AgentEvaluationSuite `json:"suite"`
+}
+
 type evidenceAuditCreateRequest struct {
 	Subject        string   `json:"subject"`
 	Scope          string   `json:"scope"`
@@ -1909,8 +1914,46 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		collectionPath = "/api/agent-packages"
 		evaluatePath   = "/api/agent-packages/evaluate"
 		publishPath    = "/api/agent-packages/publish"
+		trustSuitePath = "/api/agent-packages/evaluation-suites/trust"
 		detailPrefix   = "/api/agent-packages/"
 	)
+	if r.URL.Path == trustSuitePath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input AgentPackageTrustedEvaluationSuiteRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := ValidateAgentPackage(input.Package, h.store, h.agentTools); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.store.SaveTrustedAgentEvaluationSuite(input.Package, input.Suite); err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "immutable") {
+				status = http.StatusConflict
+			}
+			writeHTTPError(w, status, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{
+			"trusted":       true,
+			"package_id":    input.Package.PackageID,
+			"version":       input.Package.Version,
+			"suite_version": input.Suite.SuiteVersion,
+		})
+		return
+	}
 	if r.URL.Path == evaluatePath {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1932,13 +1975,26 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		evaluationSuite := input.Suite
+		trustedSuiteHash := ""
+		if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+			var resolveErr error
+			evaluationSuite, trustedSuiteHash, resolveErr = h.store.ResolveTrustedAgentEvaluationSuite(
+				input.Package,
+				input.Suite,
+			)
+			if resolveErr != nil {
+				writeHTTPError(w, http.StatusBadRequest, resolveErr.Error())
+				return
+			}
+		}
 		if existing, err := h.store.LoadAgentPackageEvaluation(input.Package.ContentHash); err == nil {
 			storedSuite, suiteErr := h.store.LoadAgentPackageEvaluationSuite(input.Package.ContentHash)
 			if suiteErr != nil {
 				writeHTTPError(w, http.StatusInternalServerError, suiteErr.Error())
 				return
 			}
-			if !reflect.DeepEqual(*storedSuite, input.Suite) {
+			if !reflect.DeepEqual(*storedSuite, evaluationSuite) {
 				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
 				return
 			}
@@ -1948,12 +2004,13 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 			writeHTTPError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		report, err := EvaluateAgentPackageDeterministically(h.store, input.Package, input.Suite, time.Now())
+		report, err := EvaluateAgentPackageDeterministically(h.store, input.Package, evaluationSuite, time.Now())
 		if err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := h.store.SaveAgentPackageEvaluation(input.Package, input.Suite, report); err != nil {
+		report.TrustedSuiteHash = trustedSuiteHash
+		if err := h.store.SaveAgentPackageEvaluation(input.Package, evaluationSuite, report); err != nil {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}
