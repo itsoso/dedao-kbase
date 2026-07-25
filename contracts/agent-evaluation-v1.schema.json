@@ -105,13 +105,44 @@
         {
           "if": {
             "properties": {
-              "metric": {
-                "enum": ["adjudication_consistency", "conflict_detection"]
-              }
+              "metric": { "const": "adjudication_consistency" }
             },
             "required": ["metric"]
           },
-          "then": { "required": ["expected_claims"] }
+          "then": {
+            "required": ["expected_claims"],
+            "properties": {
+              "expected_claims": {
+                "items": {
+                  "allOf": [
+                    { "$ref": "#/$defs/claim_gold" },
+                    { "required": ["verdict"] }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": { "const": "conflict_detection" }
+            },
+            "required": ["metric"]
+          },
+          "then": {
+            "required": ["expected_claims"],
+            "properties": {
+              "expected_claims": {
+                "items": {
+                  "allOf": [
+                    { "$ref": "#/$defs/claim_gold" },
+                    { "required": ["verdict", "conflict"] }
+                  ]
+                }
+              }
+            }
+          }
         }
       ],
       "additionalProperties": false

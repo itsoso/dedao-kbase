@@ -76,8 +76,18 @@
       "maxItems": 8,
       "items": { "$ref": "#/$defs/claim_audit" }
     },
-    "summary": { "$ref": "#/$defs/summary" },
-    "proofroom_projection": { "$ref": "#/$defs/proofroom_projection" },
+    "summary": {
+      "anyOf": [
+        { "$ref": "#/$defs/summary" },
+        { "type": "object", "maxProperties": 0 }
+      ]
+    },
+    "proofroom_projection": {
+      "anyOf": [
+        { "$ref": "#/$defs/proofroom_projection" },
+        { "type": "object", "maxProperties": 0 }
+      ]
+    },
     "output_hash": { "$ref": "#/$defs/sha256" },
     "trace_id": { "$ref": "#/$defs/identifier" },
     "failure_code": { "$ref": "#/$defs/identifier" },
@@ -88,8 +98,45 @@
   },
   "allOf": [
     {
+      "if": { "properties": { "status": { "const": "queued" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "claim_audits": { "maxItems": 0 },
+          "summary": { "type": "object", "maxProperties": 0 },
+          "proofroom_projection": { "type": "object", "maxProperties": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["started_at"] },
+            { "required": ["completed_at"] },
+            { "required": ["failed_at"] },
+            { "required": ["trace_id"] },
+            { "required": ["failure_code"] },
+            { "required": ["failure_summary"] },
+            { "required": ["output_hash"] }
+          ]
+        }
+      }
+    },
+    {
       "if": { "properties": { "status": { "const": "running" } }, "required": ["status"] },
-      "then": { "required": ["started_at", "trace_id"] }
+      "then": {
+        "required": ["started_at", "trace_id"],
+        "properties": {
+          "claim_audits": { "maxItems": 0 },
+          "summary": { "type": "object", "maxProperties": 0 },
+          "proofroom_projection": { "type": "object", "maxProperties": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["completed_at"] },
+            { "required": ["failed_at"] },
+            { "required": ["failure_code"] },
+            { "required": ["failure_summary"] },
+            { "required": ["output_hash"] }
+          ]
+        }
+      }
     },
     {
       "if": { "properties": { "status": { "const": "completed" } }, "required": ["status"] },
@@ -102,12 +149,37 @@
           "summary",
           "proofroom_projection",
           "output_hash"
-        ]
+        ],
+        "properties": {
+          "claim_audits": { "minItems": 1 },
+          "summary": { "$ref": "#/$defs/summary" },
+          "proofroom_projection": { "$ref": "#/$defs/proofroom_projection" }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["failed_at"] },
+            { "required": ["failure_code"] },
+            { "required": ["failure_summary"] }
+          ]
+        }
       }
     },
     {
       "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
-      "then": { "required": ["failed_at", "failure_code", "failure_summary"] }
+      "then": {
+        "required": ["failed_at", "failure_code", "failure_summary"],
+        "properties": {
+          "claim_audits": { "maxItems": 0 },
+          "summary": { "type": "object", "maxProperties": 0 },
+          "proofroom_projection": { "type": "object", "maxProperties": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["completed_at"] },
+            { "required": ["output_hash"] }
+          ]
+        }
+      }
     },
     {
       "if": { "required": ["retry_of"] },
@@ -234,7 +306,7 @@
         "chunk_id": { "$ref": "#/$defs/identifier" },
         "citation_id": { "$ref": "#/$defs/identifier" },
         "published_at": { "type": "string", "maxLength": 64 },
-        "freshness_decision": { "enum": ["fresh", "stale", "missing"] },
+        "freshness_decision": { "enum": ["fresh", "missing"] },
         "conflict": { "type": "boolean" }
       }
     },

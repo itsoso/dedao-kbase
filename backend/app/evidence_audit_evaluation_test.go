@@ -228,6 +228,18 @@ func TestAgentEvaluationV1RawFixtureHasHistoricalGoldenHash(t *testing.T) {
 func TestContractSchemasValidateGoPositiveAndNegativeExamples(t *testing.T) {
 	store, pkg := evidenceAuditEvaluationStore(t)
 	audit := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "schema")
+	toObject := func(value any) map[string]any {
+		t.Helper()
+		payload, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var object map[string]any
+		if err := json.Unmarshal(payload, &object); err != nil {
+			t.Fatal(err)
+		}
+		return object
+	}
 	conflict := false
 	suite := AgentEvaluationSuite{
 		SchemaVersion: AgentEvaluationSchemaVersion,
@@ -269,13 +281,59 @@ func TestContractSchemasValidateGoPositiveAndNegativeExamples(t *testing.T) {
 	retryDrift.RequestIdentity = sha256Fingerprint([]byte("retry"))
 	validateSchemaInstance(t, "evidence-audit-v1.schema.json", retryDrift, false)
 
-	var suiteObject map[string]any
-	payload, _ := json.Marshal(suite)
-	if err := json.Unmarshal(payload, &suiteObject); err != nil {
-		t.Fatal(err)
+	queued := toObject(audit)
+	queued["status"] = EvidenceAuditQueued
+	for _, field := range []string{
+		"started_at", "completed_at", "failed_at", "trace_id", "failure_code",
+		"failure_summary", "claim_audits", "output_hash",
+	} {
+		delete(queued, field)
 	}
+	queued["summary"] = map[string]any{}
+	queued["proofroom_projection"] = map[string]any{}
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", queued, true)
+
+	queuedPartial := toObject(queued)
+	queuedPartial["summary"] = toObject(audit)["summary"]
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", queuedPartial, false)
+
+	running := toObject(queued)
+	running["status"] = EvidenceAuditRunning
+	running["started_at"] = audit.StartedAt
+	running["trace_id"] = audit.TraceID
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", running, true)
+
+	failed := toObject(running)
+	failed["status"] = EvidenceAuditFailed
+	failed["failed_at"] = audit.CompletedAt
+	failed["failure_code"] = "invalid_model_output"
+	failed["failure_summary"] = "model output did not match the contract"
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", failed, true)
+
+	failedPartial := toObject(failed)
+	failedPartial["claim_audits"] = toObject(audit)["claim_audits"]
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", failedPartial, false)
+
+	stale := toObject(audit)
+	staleClaims := stale["claim_audits"].([]any)
+	staleEvidence := staleClaims[0].(map[string]any)["evidence_refs"].([]any)
+	staleEvidence[0].(map[string]any)["freshness_decision"] = "stale"
+	validateSchemaInstance(t, "evidence-audit-v1.schema.json", stale, false)
+
+	suiteObject := toObject(suite)
 	suiteObject["cases"].([]any)[0].(map[string]any)["evidence_audit"] = map[string]any{"status": "completed"}
 	validateSchemaInstance(t, "agent-evaluation-v1.schema.json", suiteObject, false)
+
+	adjudicationWithoutVerdict := toObject(suite)
+	adjudicationCase := adjudicationWithoutVerdict["cases"].([]any)[0].(map[string]any)
+	adjudicationCase["metric"] = "adjudication_consistency"
+	delete(adjudicationCase["expected_claims"].([]any)[0].(map[string]any), "verdict")
+	validateSchemaInstance(t, "agent-evaluation-v1.schema.json", adjudicationWithoutVerdict, false)
+
+	conflictWithoutGold := toObject(suite)
+	conflictCase := conflictWithoutGold["cases"].([]any)[0].(map[string]any)
+	delete(conflictCase["expected_claims"].([]any)[0].(map[string]any), "conflict")
+	validateSchemaInstance(t, "agent-evaluation-v1.schema.json", conflictWithoutGold, false)
 }
 
 func validateSchemaInstance(t *testing.T, name string, value any, wantValid bool) {
