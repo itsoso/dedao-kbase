@@ -48,11 +48,35 @@ PASS with controls.
 
 ### G3 - Tests
 
-Pending implementation.
+PASS on 2026-07-24.
+
+- `go test ./... -count=1`
+- `go test -race ./backend/app ./cmd/kbase-server -count=1`
+- `go vet ./...`
+- `go mod verify`
+- `npm --prefix frontend run build`
+- every `frontend-web/scripts/*.mjs` smoke check
+- generated system-map drift check, privacy smoke, and `git diff --check`
+- Playwright at 1440x900 and 390x844, including REST route stability,
+  poll cancellation, responsive overflow, Proofroom modal close/Escape, and
+  focus restoration
+
+The production frontend build still reports the existing Vite large-chunk and
+dependency `eval` warnings. They are recorded as follow-up performance/security
+debt; the build exits successfully and this feature does not add either
+warning. The macOS race build also emits the existing linker
+`LC_DYSYMTAB` warning without a race report or test failure.
 
 ### G4 - Review
 
-Pending implementation.
+PASS on 2026-07-24.
+
+- The evidence-audit workspace, route isolation, publication identity, citation
+  inspection, Proofroom focus handling, and responsive layout were reviewed
+  independently after the final fixes.
+- The evaluation contracts, server-held gold binding, positive/conflict/
+  insufficiency coverage, legacy-v2 migration, and publish gate were reviewed
+  independently. No release blocker remains.
 
 ### G5 - Deployment Health
 
@@ -171,3 +195,51 @@ Completed, hardened, and verified.
 - Focused and full race-enabled tests pass without data races. Complete backend
   and server command suites, `go vet`, privacy and system-map smoke checks,
   diff checks, and Linux, Windows, and macOS amd64/arm64 compile checks pass.
+
+### Task 6 - Evidence Audit Product Workspace
+
+Completed and independently reviewed.
+
+- Agent Package v2 opens a dedicated claim-level evidence audit workspace
+  instead of treating generic chat as the primary workflow.
+- Completed audits render verdicts, confidence, independent publication
+  evidence, freshness, conflicts, limitations, gaps, review actions, Trace
+  stages, token/cost use, and an explicit Proofroom preview.
+- Citation inspection exposes only bounded citation metadata and stable
+  Release/claim/chunk/citation identities. It does not return private source
+  paths, source bodies, prompts, cookies, or bearer tokens.
+- Audit, Package, and book-detail requests use route-scoped sequence guards so
+  late responses cannot overwrite the currently selected resource.
+- Proofroom is a real modal with background inertness, focus trapping, Escape
+  handling, scroll lock, and focus restoration to the rerendered preview
+  trigger.
+- Browser checks cover 1440x900 and 390x844 layouts, poll cancellation, stable
+  REST URLs, bearer-header-only authentication, desktop/mobile overflow, and
+  Proofroom focus restoration.
+
+### Task 7 - Trusted Evidence Audit Evaluation
+
+Completed and independently reviewed.
+
+- Six v2-only metrics now read completed Audits, immutable Agent Traces, pinned
+  Knowledge Releases, stored claims/citations, and the exact Proofroom
+  projection from the server store. Caller-supplied embedded audit results are
+  rejected.
+- Evaluation gold is installed through an administrator-only endpoint and
+  stored as an immutable `0600` trusted template bound to Package content hash
+  and suite version. Publisher credentials can bind only runtime `audit_id`
+  values and cannot change case behavior, expected claims, verdicts, or
+  conflict labels.
+- The trusted template hash is persisted in the evaluation report and
+  recomputed by the publication gate.
+- A passing v2 suite must cover a non-insufficient adjudication, a real
+  conflict, and safe insufficiency using three distinct audit runs. An
+  all-insufficient Agent cannot pass source-independence or the trusted-suite
+  coverage gate.
+- Existing pre-trust v2 evaluations have a bounded migration path: only an old
+  report without a trusted hash, an administrator-installed matching template,
+  and an exact stored-suite match may trigger server-side re-evaluation and
+  atomic report replacement. Trusted reports remain immutable.
+- JSON Schema and Go validation now agree for queued, running, failed, and
+  completed states. Explicit empty `claim_audits` arrays are legal only for
+  non-completed states; completed reports still require at least one claim.
