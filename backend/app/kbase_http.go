@@ -450,6 +450,8 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/api/books":
 		h.handleListBooks(w)
+	case strings.HasPrefix(r.URL.Path, "/api/citations/"):
+		h.handleGetCitation(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/books/"):
 		h.handleGetBook(w, r)
 	case r.URL.Path == "/api/search":
@@ -2426,6 +2428,61 @@ func (h *kbaseHTTPHandler) handleListBooks(w http.ResponseWriter) {
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"books": books})
+}
+
+func (h *kbaseHTTPHandler) handleGetCitation(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/citations/"
+	rawID := strings.TrimPrefix(r.URL.Path, prefix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		writeHTTPError(w, http.StatusNotFound, "citation not found")
+		return
+	}
+	citationID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(citationID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "citation_id is required")
+		return
+	}
+	bookID := strings.TrimSpace(r.URL.Query().Get("book_id"))
+	if bookID == "" {
+		writeHTTPError(w, http.StatusBadRequest, "book_id is required")
+		return
+	}
+	pkg, err := h.loadHTTPBookPackage(bookID)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, "book not found")
+		return
+	}
+	for _, citation := range pkg.Citations {
+		if citation.CitationID != citationID {
+			continue
+		}
+		claimIDs := make([]string, 0, 2)
+		for _, claim := range pkg.Claims {
+			for _, candidate := range claim.Citations {
+				if candidate == citationID {
+					claimIDs = append(claimIDs, claim.ClaimID)
+					break
+				}
+			}
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{
+			"citation": map[string]string{
+				"citation_id":     citation.CitationID,
+				"book_id":         citation.BookID,
+				"chapter_id":      citation.ChapterID,
+				"chunk_id":        citation.ChunkID,
+				"anchor":          citation.Anchor,
+				"note":            citation.Note,
+				"source_type":     citation.SourceType,
+				"source_account":  citation.SourceAccount,
+				"source_item_key": citation.SourceItemKey,
+				"published_at":    citation.PublishedAt,
+			},
+			"claim_ids": claimIDs,
+		})
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "citation not found")
 }
 
 func (h *kbaseHTTPHandler) handleGetBook(w http.ResponseWriter, r *http.Request) {

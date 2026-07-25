@@ -83,11 +83,18 @@ assert.ok(proofroomSource.includes("proofroomDeliveryKey"), "Proofroom retries s
 assert.ok(proofroomSource.includes("/proofroom"), "Proofroom delivery should use the audit projection endpoint");
 assert.ok(!proofroomSource.includes("loadProofroomPreview()"), "delivery should not silently trigger preview loading");
 assert.ok(js.includes("renderProofroomPreviewClaim"), "Proofroom preview should expose the actual minimized claim payload");
+assert.ok(js.includes("preview.payload?.summary?.conclusion"), "Proofroom preview should expose its projected summary");
+assert.ok(js.includes("claim?.knowledge_gaps"), "Proofroom preview should expose projected knowledge gaps");
+assert.ok(js.includes("item.source_type"), "Proofroom preview should expose evidence source type");
+assert.ok(js.includes("item.freshness_decision"), "Proofroom preview should expose evidence freshness");
+assert.ok(js.includes("item.conflict"), "Proofroom preview should expose evidence conflicts");
+assert.ok(js.includes("JSON.stringify(preview.payload, null, 2)"), "Proofroom preview should allow exact payload inspection");
 assert.ok(js.includes("proofroomOperationSequence"), "Proofroom responses should be scoped to the active audit route");
 assert.ok(js.includes("bookAgentLoadSequence"), "Agent package responses should be scoped to the active route");
 assert.ok(js.includes('"model_outcome_unknown", "requires_manual_retry"'), "retry control should match backend retryable failure codes");
 assert.ok(js.includes('["citation_id", evidence.citation_id]'), "citation links should preserve citation identity");
 assert.ok(js.includes('evidenceLocator.get("citation_id")'), "knowledge pages should resolve direct citation links");
+assert.ok(js.includes("/api/citations/"), "citation links should resolve exact citation identities");
 
 for (const state of ["queued", "running", "failed", "completed", "outcome_unknown", "rejected", "delivered"]) {
   assert.ok(js.includes(state), `audit UI should render ${state}`);
@@ -151,6 +158,6 @@ assert.ok(css.includes("minmax(0, 1fr)"), "audit layout should allow columns to 
 assert.ok(css.includes("max-height: 140px"), "desktop audit context should enforce its compact height budget");
 assert.ok(css.includes("max-height: 220px"), "mobile audit context should enforce its compact height budget");
 assert.ok(css.includes(".evidence-audit__waiting > span"), "audit progress animation should honor reduced motion");
-assert.ok(html.includes("20260724-evidence-audit-review"), "audit workspace should publish a fresh asset version");
+assert.ok(html.includes("20260724-evidence-audit-inspection"), "audit workspace should publish a fresh asset version");
 
 console.log("evidence audit agent smoke passed");

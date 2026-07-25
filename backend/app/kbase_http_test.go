@@ -106,6 +106,33 @@ func TestKBaseHTTPHandlerServesAuthenticatedAgentTraceWithoutPrivateFields(t *te
 	}
 }
 
+func TestKBaseHTTPHandlerResolvesCitationIdentityWithoutSourcePath(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+	response := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/citations/42-citation-1?book_id=42",
+		"consumer-token",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("citation status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"citation_id":"42-citation-1"`) ||
+		!strings.Contains(body, `"chunk_id":"42-chunk-1"`) ||
+		strings.Contains(body, "/tmp/book.html") ||
+		strings.Contains(body, "source_html") {
+		t.Fatalf("citation response is not a safe exact locator: %s", body)
+	}
+}
+
 func TestKBaseHTTPHandlerPublishesAndReadsAgentPackages(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

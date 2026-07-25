@@ -2609,6 +2609,7 @@ function renderProofroomSafeText(value, fallback = "—") {
 function renderProofroomPreviewClaim(claim, index) {
   const evidence = Array.isArray(claim?.evidence) ? claim.evidence : [];
   const limitations = Array.isArray(claim?.limitations) ? claim.limitations : [];
+  const gaps = Array.isArray(claim?.knowledge_gaps) ? claim.knowledge_gaps : [];
   const actions = Array.isArray(claim?.review_actions) ? claim.review_actions : [];
   return `
     <article class="evidence-audit__proofroom-claim">
@@ -2624,10 +2625,12 @@ function renderProofroomPreviewClaim(claim, index) {
           <li>
             <code>${escapeHTML(item.citation_id || "citation")}</code>
             <span>${escapeHTML(item.release_id || "release")} · ${escapeHTML(item.claim_id || "claim")} · ${escapeHTML(item.chunk_id || "chunk")}</span>
+            <small>${escapeHTML(item.role || "role")} · ${escapeHTML(item.source_type || "source")} · ${escapeHTML(evidenceAuditFreshnessLabel(item.freshness_decision))}${item.conflict ? " · 存在冲突" : ""}</small>
           </li>
         `).join("")}</ul>` : `<p>无引用。</p>`}
       </div>
       ${limitations.length ? `<div><strong>局限</strong><ul>${limitations.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+      ${gaps.length ? `<div><strong>知识缺口</strong><ul>${gaps.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
       ${actions.length ? `<div><strong>复核行动</strong><ul>${actions.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
     </article>
   `;
@@ -2639,6 +2642,9 @@ function renderEvidenceAuditProofroom(audit) {
   const previewClaims = Array.isArray(preview?.payload?.claims) ? preview.payload.claims : [];
   const reviewItems = Array.isArray(preview?.payload?.proofroom?.review_items)
     ? preview.payload.proofroom.review_items
+    : [];
+  const summaryLimitations = Array.isArray(preview?.payload?.summary?.limitations)
+    ? preview.payload.summary.limitations
     : [];
   return `
     <section class="evidence-audit__proofroom" aria-labelledby="evidence-audit-proofroom-title">
@@ -2662,6 +2668,11 @@ function renderEvidenceAuditProofroom(audit) {
           <p>${escapeHTML(preview.summary || "投递前最小化预览已生成。")}</p>
           <section class="evidence-audit__proofroom-payload" aria-label="Proofroom 实际投递内容">
             <h4>${renderProofroomSafeText(preview.payload?.proofroom?.title, "Proofroom 复核任务")}</h4>
+            <section>
+              <strong>审计摘要</strong>
+              <p>${renderProofroomSafeText(preview.payload?.summary?.conclusion, "未提供摘要")}</p>
+              ${summaryLimitations.length ? `<ul>${summaryLimitations.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul>` : ""}
+            </section>
             <div>${previewClaims.map(renderProofroomPreviewClaim).join("") || `<p>当前投影没有 claim。</p>`}</div>
             ${reviewItems.length ? `
               <aside>
@@ -2669,6 +2680,10 @@ function renderEvidenceAuditProofroom(audit) {
                 <ul>${reviewItems.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul>
               </aside>
             ` : ""}
+            <details>
+              <summary>核对完整结构化 Payload</summary>
+              <pre>${escapeHTML(JSON.stringify(preview.payload, null, 2))}</pre>
+            </details>
           </section>
           <button class="button button-primary" type="button" data-proofroom-deliver ${evidenceAuditState.proofroomStatus === "delivering" || ["delivered", "outcome_unknown"].includes(evidenceAuditState.proofroomStatus) ? "disabled" : ""}>发送到 Proofroom</button>
         </div>
@@ -6573,11 +6588,27 @@ async function loadBookKnowledge() {
         : null;
       await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
       const evidenceLocator = new URLSearchParams(window.location.search);
-      const evidenceQuery = evidenceLocator.get("citation_id") ||
-        evidenceLocator.get("chunk_id") ||
-        evidenceLocator.get("claim_id") ||
-        "";
-      if (evidenceQuery) {
+      const citationID = evidenceLocator.get("citation_id") || "";
+      const evidenceQuery = citationID || evidenceLocator.get("chunk_id") || evidenceLocator.get("claim_id") || "";
+      if (citationID) {
+        const resolved = await apiFetch(
+          `/api/citations/${encodeURIComponent(citationID)}?book_id=${encodeURIComponent(knowledgeState.selectedBook.book_id)}`,
+        );
+        const citation = resolved.citation || {};
+        knowledgeState.query = citationID;
+        knowledgeState.results = [{
+          kind: "citation",
+          id: citation.citation_id || citationID,
+          title: citation.note || `引用 ${citation.citation_id || citationID}`,
+          snippet: [
+            ...(Array.isArray(resolved.claim_ids) ? resolved.claim_ids : []),
+            citation.chapter_id,
+            citation.chunk_id,
+            citation.anchor,
+          ].filter(Boolean).join(" · "),
+        }];
+        knowledgeState.message = "已精确定位审计引用。";
+      } else if (evidenceQuery) {
         knowledgeState.query = evidenceQuery;
         await searchBookKnowledge();
       }
