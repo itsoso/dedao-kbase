@@ -87,33 +87,13 @@ func searchAgentPackageEvidence(
 	}
 	results := make([]AgentPackageEvidence, 0)
 	for _, ref := range pkg.Releases {
-		release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
-		if loadErr != nil {
-			return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, loadErr)
-		}
-		releaseResults, searchErr := searchAgentReleaseClaimsWithStrategy(
-			store, *release, query, pkg.RetrievalPolicy.MaxContextChunks, pkg.RetrievalPolicy,
+		releaseResults, searchErr := searchAgentPackageReleaseEvidence(
+			store, pkg, ref.ReleaseID, query, pkg.RetrievalPolicy.MaxContextChunks,
 		)
 		if searchErr != nil {
 			return nil, searchErr
 		}
-		allowedCitations := stringBoolSet(ref.CitationIDs...)
-		for _, result := range releaseResults {
-			filteredCitations := make([]string, 0, len(result.CitationIDs))
-			for _, citationID := range result.CitationIDs {
-				if allowedCitations[citationID] {
-					filteredCitations = append(filteredCitations, citationID)
-				}
-			}
-			if pkg.RetrievalPolicy.RequireCitations && len(filteredCitations) == 0 {
-				continue
-			}
-			results = append(results, AgentPackageEvidence{
-				ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
-				Statement: result.Statement, CitationIDs: filteredCitations,
-				Score: result.Score,
-			})
-		}
+		results = append(results, releaseResults...)
 	}
 	sort.SliceStable(results, func(i, j int) bool {
 		if results[i].Score != results[j].Score {
@@ -131,6 +111,162 @@ func searchAgentPackageEvidence(
 		PackageID: pkg.PackageID, PackageVersion: pkg.Version, PackageHash: pkg.ContentHash,
 		RetrievalStrategy: pkg.RetrievalPolicy.Strategy, Results: results,
 	}, nil
+}
+
+func searchAgentPackageReleaseEvidence(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	releaseID, query string,
+	limit int,
+) ([]AgentPackageEvidence, error) {
+	ref, err := agentPackagePinnedReleaseRef(pkg, releaseID)
+	if err != nil {
+		return nil, err
+	}
+	release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, err)
+	}
+	if agentTraceReleaseContentHash(release.ContentHash) != agentTraceReleaseContentHash(ref.ContentHash) {
+		return nil, fmt.Errorf("pinned release %q content hash changed", ref.ReleaseID)
+	}
+	releaseResults, err := searchAgentReleaseClaimsWithStrategy(
+		store, *release, query, limit, pkg.RetrievalPolicy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	allowedCitations := stringBoolSet(ref.CitationIDs...)
+	results := make([]AgentPackageEvidence, 0, len(releaseResults))
+	for _, result := range releaseResults {
+		filteredCitations := make([]string, 0, len(result.CitationIDs))
+		for _, citationID := range result.CitationIDs {
+			if allowedCitations[citationID] {
+				filteredCitations = append(filteredCitations, citationID)
+			}
+		}
+		if pkg.RetrievalPolicy.RequireCitations && len(filteredCitations) == 0 {
+			continue
+		}
+		results = append(results, AgentPackageEvidence{
+			ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
+			Statement: result.Statement, CitationIDs: filteredCitations,
+			Score: result.Score,
+		})
+	}
+	return results, nil
+}
+
+func searchAgentPackageReleaseEvidenceContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	releaseID, query string,
+	limit int,
+) ([]AgentPackageEvidence, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ref, err := agentPackagePinnedReleaseRef(pkg, releaseID)
+	if err != nil {
+		return nil, err
+	}
+	release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned release %q: %w", ref.ReleaseID, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if agentTraceReleaseContentHash(release.ContentHash) != agentTraceReleaseContentHash(ref.ContentHash) {
+		return nil, fmt.Errorf("pinned release %q content hash changed", ref.ReleaseID)
+	}
+	releaseResults, err := searchAgentReleaseClaimsWithStrategyContext(
+		ctx, store, *release, query, limit, pkg.RetrievalPolicy,
+	)
+	if err != nil {
+		return nil, err
+	}
+	allowedCitations := stringBoolSet(ref.CitationIDs...)
+	results := make([]AgentPackageEvidence, 0, len(releaseResults))
+	for _, result := range releaseResults {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		filteredCitations := make([]string, 0, len(result.CitationIDs))
+		for _, citationID := range result.CitationIDs {
+			if allowedCitations[citationID] {
+				filteredCitations = append(filteredCitations, citationID)
+			}
+		}
+		if pkg.RetrievalPolicy.RequireCitations && len(filteredCitations) == 0 {
+			continue
+		}
+		results = append(results, AgentPackageEvidence{
+			ReleaseID: ref.ReleaseID, ClaimID: result.ClaimID,
+			Statement: result.Statement, CitationIDs: filteredCitations,
+			Score: result.Score,
+		})
+	}
+	return results, nil
+}
+
+func resolveAgentPackageReleaseCitation(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	releaseID, claimID, citationID string,
+) (AgentScopedCitation, error) {
+	ref, err := agentPackagePinnedReleaseRef(pkg, releaseID)
+	if err != nil {
+		return AgentScopedCitation{}, err
+	}
+	if !stringBoolSet(ref.CitationIDs...)[citationID] {
+		return AgentScopedCitation{}, fmt.Errorf(
+			"citation %q is outside pinned release %q allowlist", citationID, releaseID,
+		)
+	}
+	citations, err := resolveAgentRuntimeCitations(store, []AgentPackageEvidence{{
+		ReleaseID: releaseID, ClaimID: claimID, CitationIDs: []string{citationID},
+	}})
+	if err != nil {
+		return AgentScopedCitation{}, err
+	}
+	for _, citation := range citations {
+		if citation.CitationID == citationID {
+			return citation, nil
+		}
+	}
+	return AgentScopedCitation{}, fmt.Errorf(
+		"citation %q in pinned release %q cannot be resolved", citationID, releaseID,
+	)
+}
+
+func resolveAgentPackageReleaseCitationContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	releaseID, claimID, citationID string,
+) (AgentScopedCitation, error) {
+	if err := ctx.Err(); err != nil {
+		return AgentScopedCitation{}, err
+	}
+	citation, err := resolveAgentPackageReleaseCitation(store, pkg, releaseID, claimID, citationID)
+	if err != nil {
+		return AgentScopedCitation{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return AgentScopedCitation{}, err
+	}
+	return citation, nil
+}
+
+func agentPackagePinnedReleaseRef(pkg AgentPackage, releaseID string) (AgentPackageReleaseRef, error) {
+	for _, ref := range pkg.Releases {
+		if ref.ReleaseID == releaseID {
+			return ref, nil
+		}
+	}
+	return AgentPackageReleaseRef{}, fmt.Errorf("release %q is outside the pinned Agent Package", releaseID)
 }
 
 func ChatAgentPackageWithClient(
@@ -378,6 +514,16 @@ func agentRuntimeTraceCitations(evidence []AgentPackageEvidence, citations []Age
 }
 
 func loadRunnableAgentPackage(store *BookKnowledgeStore, packageID, version, capability string) (*AgentPackage, error) {
+	return loadRunnableAgentPackageContext(
+		context.Background(), store, packageID, version, capability,
+	)
+}
+
+func loadRunnableAgentPackageContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	packageID, version, capability string,
+) (*AgentPackage, error) {
 	if store == nil {
 		return nil, fmt.Errorf("agent package store is required")
 	}
@@ -386,14 +532,20 @@ func loadRunnableAgentPackage(store *BookKnowledgeStore, packageID, version, cap
 	if packageID == "" || version == "" {
 		return nil, fmt.Errorf("package_id and package_version are required")
 	}
-	pkg, err := store.LoadAgentPackage(packageID, version)
+	pkg, err := store.LoadAgentPackageContext(ctx, packageID, version)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if pkg.LifecycleState != AgentPackagePublished {
 		return nil, fmt.Errorf("agent package %s is not published", agentPackageReference(pkg.PackageID, pkg.Version))
 	}
 	if err := ValidateAgentPackageEvaluationGate(store, *pkg); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if !agentPackageHasCapability(*pkg, capability) {

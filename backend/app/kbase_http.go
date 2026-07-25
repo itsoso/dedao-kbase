@@ -2,15 +2,20 @@ package app
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +42,24 @@ type KBaseHTTPConfig struct {
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
 	AgentTools              []string
+	AuditCoordinator        EvidenceAuditEnqueuer
+	AuditMaxBodyBytes       int64
+	AuditUnavailableReason  string
+	AuditRetrySigningKey    []byte
+	AuditRetryTTL           time.Duration
+	AuditNow                func() time.Time
+	AuditLogger             func(EvidenceAuditHTTPLogEvent)
+	ProofroomDelivery       *ProofroomDeliveryService
+}
+
+type EvidenceAuditHTTPLogEvent struct {
+	Operation string
+	Code      string
+	Cause     string
+}
+
+type EvidenceAuditEnqueuer interface {
+	Enqueue(string) error
 }
 
 type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
@@ -69,9 +92,18 @@ type kbaseHTTPHandler struct {
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
 	agentTools              []string
+	auditCoordinator        EvidenceAuditEnqueuer
+	auditMaxBodyBytes       int64
+	auditUnavailableReason  string
+	auditRetrySigningKey    []byte
+	auditRetryTTL           time.Duration
+	auditNow                func() time.Time
+	auditLogger             func(EvidenceAuditHTTPLogEvent)
+	proofroomDelivery       *ProofroomDeliveryService
 }
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
+const defaultEvidenceAuditMaxBodyBytes int64 = 64 << 10
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	store := cfg.Store
@@ -125,6 +157,22 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if len(agentTools) == 0 {
 		agentTools = AgentReadOnlyToolIDs()
 	}
+	auditMaxBodyBytes := cfg.AuditMaxBodyBytes
+	if auditMaxBodyBytes <= 0 {
+		auditMaxBodyBytes = defaultEvidenceAuditMaxBodyBytes
+	}
+	auditRetryTTL := cfg.AuditRetryTTL
+	if auditRetryTTL <= 0 {
+		auditRetryTTL = 5 * time.Minute
+	}
+	auditNow := cfg.AuditNow
+	if auditNow == nil {
+		auditNow = time.Now
+	}
+	auditLogger := cfg.AuditLogger
+	if auditLogger == nil {
+		auditLogger = func(EvidenceAuditHTTPLogEvent) {}
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
@@ -144,6 +192,14 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
 		agentTools:              agentTools,
+		auditCoordinator:        cfg.AuditCoordinator,
+		auditMaxBodyBytes:       auditMaxBodyBytes,
+		auditUnavailableReason:  strings.TrimSpace(cfg.AuditUnavailableReason),
+		auditRetrySigningKey:    append([]byte(nil), cfg.AuditRetrySigningKey...),
+		auditRetryTTL:           auditRetryTTL,
+		auditNow:                auditNow,
+		auditLogger:             auditLogger,
+		proofroomDelivery:       cfg.ProofroomDelivery,
 	}
 }
 
@@ -215,7 +271,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAgentPackages(w, r)
 		return
 	}
-	if !h.authorize(w, r) {
+	if isEvidenceAuditAPIPath(r.URL.Path) {
+		if !h.authorizeEvidenceAudit(w, r) {
+			return
+		}
+	} else if !h.authorize(w, r) {
 		return
 	}
 	if isSourceSyncAdminPath(r.URL.Path) {
@@ -322,6 +382,18 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgePipelineRun(w, r)
 		return
 	}
+	if packageID, ok := agentPackageAuditCollectionPathID(r.URL.Path); ok {
+		h.handleAgentPackageAudits(w, r, packageID)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/agent-traces/") {
+		h.handleAgentTrace(w, r)
+		return
+	}
+	if r.URL.Path == "/api/agent-audits" || strings.HasPrefix(r.URL.Path, "/api/agent-audits/") {
+		h.handleEvidenceAudits(w, r)
+		return
+	}
 	if r.URL.Path == "/api/agent-packages" || strings.HasPrefix(r.URL.Path, "/api/agent-packages/") {
 		h.handleAgentPackages(w, r)
 		return
@@ -378,6 +450,8 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/api/books":
 		h.handleListBooks(w)
+	case strings.HasPrefix(r.URL.Path, "/api/citations/"):
+		h.handleGetCitation(w, r)
 	case strings.HasPrefix(r.URL.Path, "/api/books/"):
 		h.handleGetBook(w, r)
 	case r.URL.Path == "/api/search":
@@ -1164,21 +1238,699 @@ type AgentPackageEvaluationRequest struct {
 	Suite   AgentEvaluationSuite `json:"suite"`
 }
 
+type AgentPackageTrustedEvaluationSuiteRequest struct {
+	Package AgentPackage         `json:"package"`
+	Suite   AgentEvaluationSuite `json:"suite"`
+}
+
+type evidenceAuditCreateRequest struct {
+	Subject        string   `json:"subject"`
+	Scope          string   `json:"scope"`
+	SelectedClaims []string `json:"selected_claims,omitempty"`
+	IdempotencyKey string   `json:"idempotency_key"`
+}
+
+func agentPackageAuditCollectionPathID(path string) (string, bool) {
+	const prefix = "/api/agent-packages/"
+	const suffix = "/audits"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		return "", false
+	}
+	packageID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(packageID) == "" {
+		return "", false
+	}
+	return packageID, true
+}
+
+func isEvidenceAuditAPIPath(path string) bool {
+	if path == "/api/agent-audits" || strings.HasPrefix(path, "/api/agent-audits/") {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/agent-traces/") {
+		return true
+	}
+	_, ok := agentPackageAuditCollectionPathID(path)
+	return ok
+}
+
+func (h *kbaseHTTPHandler) handleAgentTrace(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/agent-traces/"
+	if r.Method != http.MethodGet {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "load_trace", nil,
+		)
+		return
+	}
+	rawID := strings.TrimPrefix(r.URL.Path, prefix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "trace_not_found",
+			"agent trace not found", "load_trace", nil,
+		)
+		return
+	}
+	traceID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(traceID) == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid trace_id", "load_trace", nil,
+		)
+		return
+	}
+	trace, err := h.store.LoadAgentTrace(traceID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "trace_not_found",
+				"agent trace not found", "load_trace", nil,
+			)
+			return
+		}
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusInternalServerError, "audit_store_unavailable",
+			"agent trace storage is unavailable", "load_trace", err,
+		)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, trace)
+}
+
+func (h *kbaseHTTPHandler) handleAgentPackageAudits(w http.ResponseWriter, r *http.Request, packageID string) {
+	version := strings.TrimSpace(r.URL.Query().Get("version"))
+	if version == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"version is required", "validate_audit_request", nil,
+		)
+		return
+	}
+	if !agentPackageIDPattern.MatchString(packageID) || !agentPackageIDPattern.MatchString(version) {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid package_id or version", "validate_audit_request", nil,
+		)
+		return
+	}
+	if r.Method == http.MethodGet {
+		limit := parseBoundedInt(r.URL.Query().Get("limit"), 50, 1, 200)
+		records, err := h.store.ListEvidenceAudits(packageID, version, limit)
+		if err != nil {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusInternalServerError, "audit_store_unavailable",
+				"evidence audit storage is unavailable", "list_package_audits", err,
+			)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"audits": records})
+		return
+	}
+	if r.Method != http.MethodPost {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "create_audit", nil,
+		)
+		return
+	}
+	if h.auditCoordinator == nil {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusServiceUnavailable, "audit_service_unavailable",
+			"evidence audit service is unavailable", "create_audit", nil,
+		)
+		return
+	}
+	defer r.Body.Close()
+	var request evidenceAuditCreateRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, h.auditMaxBodyBytes))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusRequestEntityTooLarge, "audit_request_too_large",
+				"request body is too large", "decode_audit_request", nil,
+			)
+			return
+		}
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid JSON body", "decode_audit_request", nil,
+		)
+		return
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid JSON body", "decode_audit_request", nil,
+		)
+		return
+	}
+	if strings.TrimSpace(request.IdempotencyKey) == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"idempotency_key is required", "validate_audit_request", nil,
+		)
+		return
+	}
+	input, err := PrepareEvidenceAuditInput(
+		h.store, packageID, version, request.Subject, request.Scope,
+	)
+	if err != nil {
+		h.writeEvidenceAuditCreateError(w, err)
+		return
+	}
+	if len(request.SelectedClaims) > 0 {
+		if len(request.SelectedClaims) > input.EvidencePolicy.MaxClaims {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusUnprocessableEntity, "audit_policy_violation",
+				"selected_claims exceeds package evidence policy", "validate_audit_request", nil,
+			)
+			return
+		}
+		allowed := make(map[string]struct{}, len(input.SelectedClaims))
+		for _, claim := range input.SelectedClaims {
+			allowed[claim] = struct{}{}
+		}
+		selected := make([]string, 0, len(request.SelectedClaims))
+		seen := map[string]struct{}{}
+		for _, claim := range request.SelectedClaims {
+			claim = strings.TrimSpace(claim)
+			if _, ok := allowed[claim]; !ok {
+				h.writeEvidenceAuditHTTPError(
+					w, http.StatusUnprocessableEntity, "audit_policy_violation",
+					"selected_claims contains a claim outside the package primary release",
+					"validate_audit_request", nil,
+				)
+				return
+			}
+			if _, duplicate := seen[claim]; duplicate {
+				h.writeEvidenceAuditHTTPError(
+					w, http.StatusUnprocessableEntity, "audit_policy_violation",
+					"selected_claims contains duplicates", "validate_audit_request", nil,
+				)
+				return
+			}
+			seen[claim] = struct{}{}
+			selected = append(selected, claim)
+		}
+		input.SelectedClaims = selected
+	}
+	audit, created, err := CreateEvidenceAudit(h.store, input, request.IdempotencyKey, h.auditNow())
+	if err != nil {
+		if errors.Is(err, ErrEvidenceAuditIdempotencyConflict) {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusConflict, "audit_idempotency_conflict",
+				"idempotency key conflicts with a different audit request", "create_audit", err,
+			)
+			return
+		}
+		h.writeEvidenceAuditCreateError(w, err)
+		return
+	}
+	if audit.Status == EvidenceAuditQueued || audit.Status == EvidenceAuditRunning {
+		if err := h.auditCoordinator.Enqueue(audit.AuditID); err != nil {
+			code := "audit_coordinator_unavailable"
+			message := "evidence audit coordinator is unavailable"
+			if errors.Is(err, ErrEvidenceAuditQueueFull) {
+				code = "audit_queue_full"
+				message = "evidence audit queue is full; retry later"
+			}
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusServiceUnavailable, code, message, "enqueue_audit", err,
+			)
+			return
+		}
+	}
+	writeHTTPJSON(w, http.StatusAccepted, map[string]any{"created": created, "audit": audit})
+}
+
+func (h *kbaseHTTPHandler) handleEvidenceAudits(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/agent-audits/"
+	if r.URL.Path == "/api/agent-audits" {
+		if r.Method != http.MethodGet {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+				"method not allowed", "list_audits", nil,
+			)
+			return
+		}
+		limit := parseBoundedInt(r.URL.Query().Get("limit"), 50, 1, 200)
+		records, err := h.store.ListEvidenceAudits(
+			strings.TrimSpace(r.URL.Query().Get("package_id")),
+			strings.TrimSpace(r.URL.Query().Get("version")),
+			limit,
+		)
+		if err != nil {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusInternalServerError, "audit_store_unavailable",
+				"evidence audit storage is unavailable", "list_audits", err,
+			)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"audits": records})
+		return
+	}
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "audit_not_found",
+			"evidence audit not found", "load_audit", nil,
+		)
+		return
+	}
+	remainder := strings.TrimPrefix(r.URL.Path, prefix)
+	if strings.HasSuffix(remainder, "/proofroom") {
+		rawID := strings.TrimSuffix(remainder, "/proofroom")
+		if rawID == "" || strings.Contains(rawID, "/") {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "audit_not_found",
+				"evidence audit not found", "proofroom_projection", nil,
+			)
+			return
+		}
+		h.handleEvidenceAuditProofroom(w, r, rawID)
+		return
+	}
+	if strings.HasSuffix(remainder, "/retry") {
+		rawID := strings.TrimSuffix(remainder, "/retry")
+		if rawID == "" || strings.Contains(rawID, "/") {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "audit_not_found",
+				"evidence audit not found", "retry_audit", nil,
+			)
+			return
+		}
+		h.handleEvidenceAuditRetry(w, r, rawID)
+		return
+	}
+	if r.Method != http.MethodGet {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "load_audit", nil,
+		)
+		return
+	}
+	if remainder == "" || strings.Contains(remainder, "/") {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "audit_not_found",
+			"evidence audit not found", "load_audit", nil,
+		)
+		return
+	}
+	auditID, err := url.PathUnescape(remainder)
+	if err != nil {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid audit_id", "load_audit", nil,
+		)
+		return
+	}
+	audit, err := h.store.LoadEvidenceAudit(auditID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "audit_not_found",
+				"evidence audit not found", "load_audit", nil,
+			)
+			return
+		}
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusInternalServerError, "audit_store_unavailable",
+			"evidence audit storage is unavailable", "load_audit", err,
+		)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, audit)
+}
+
+func (h *kbaseHTTPHandler) handleEvidenceAuditProofroom(
+	w http.ResponseWriter,
+	r *http.Request,
+	rawAuditID string,
+) {
+	auditID, err := url.PathUnescape(rawAuditID)
+	if err != nil || strings.TrimSpace(auditID) == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid audit_id", "proofroom_projection", nil,
+		)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		preview, err := PreviewEvidenceAuditProofroom(h.store, auditID)
+		if err != nil {
+			h.writeProofroomHTTPError(w, "preview", err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, preview)
+	case http.MethodPost:
+		if h.proofroomDelivery == nil {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusServiceUnavailable, "proofroom_unconfigured",
+				"Proofroom delivery is not configured", "proofroom_delivery", nil,
+			)
+			return
+		}
+		if r.ContentLength != 0 {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusRequestEntityTooLarge, "proofroom_request_body_not_allowed",
+				"Proofroom delivery request body is not allowed", "proofroom_delivery", nil,
+			)
+			return
+		}
+		idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+		if idempotencyKey == "" {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusBadRequest, "proofroom_idempotency_key_required",
+				"Idempotency-Key header is required", "proofroom_delivery", nil,
+			)
+			return
+		}
+		if resolution := strings.TrimSpace(r.Header.Get("Proofroom-Delivery-Resolution")); resolution != "" {
+			if resolution != ProofroomCoordinationConfirmedNotDelivered {
+				h.writeEvidenceAuditHTTPError(
+					w, http.StatusBadRequest, "proofroom_coordination_invalid",
+					"invalid Proofroom delivery resolution", "proofroom_coordination", nil,
+				)
+				return
+			}
+			if err := CoordinateProofroomDeliveryForEndpoint(
+				h.store, auditID, idempotencyKey, h.proofroomDelivery.endpointIdentity,
+				resolution, h.auditNow(),
+			); err != nil {
+				h.writeProofroomHTTPError(w, "coordination", err)
+				return
+			}
+			writeHTTPJSON(w, http.StatusOK, map[string]any{
+				"coordinated": true, "resolution": resolution,
+			})
+			return
+		}
+		receipt, created, err := h.proofroomDelivery.Deliver(
+			r.Context(), h.store, auditID, idempotencyKey,
+		)
+		if err != nil {
+			h.writeProofroomHTTPError(w, "delivery", err)
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "receipt": receipt})
+	default:
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "proofroom_projection", nil,
+		)
+	}
+}
+
+func (h *kbaseHTTPHandler) writeProofroomHTTPError(w http.ResponseWriter, operation string, err error) {
+	var remoteError *ProofroomRemoteError
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "audit_not_found",
+			"evidence audit not found", "proofroom_"+operation, nil,
+		)
+	case errors.Is(err, ErrProofroomAuditNotReady):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusConflict, "proofroom_audit_not_ready",
+			"evidence audit is not ready for Proofroom", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomAuditInvalid):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnprocessableEntity, "proofroom_audit_invalid",
+			"evidence audit failed Proofroom projection validation", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomPrivacyBlocked):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnprocessableEntity, "privacy_blocked",
+			"Proofroom projection was blocked by privacy policy", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryConflict):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusConflict, "proofroom_idempotency_conflict",
+			"idempotency key conflicts with a different projection", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryOutcomeUnknown):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadGateway, "proofroom_outcome_unknown",
+			"Proofroom delivery outcome is unknown and requires explicit coordination",
+			"proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryRejected):
+		if errors.As(err, &remoteError) {
+			h.auditLogger(EvidenceAuditHTTPLogEvent{
+				Operation: "proofroom_" + operation,
+				Code:      "proofroom_remote_rejected",
+				Cause:     sanitizeEvidenceAuditHTTPLogCause(err.Error()),
+			})
+			writeHTTPJSON(w, http.StatusBadGateway, map[string]any{
+				"code":          "proofroom_remote_rejected",
+				"error":         "Proofroom rejected the delivery",
+				"remote_status": remoteError.StatusCode,
+			})
+			return
+		}
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadGateway, "proofroom_remote_rejected",
+			"Proofroom rejected the delivery", "proofroom_"+operation, err,
+		)
+	case errors.Is(err, ErrProofroomDeliveryUnconfigured):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusServiceUnavailable, "proofroom_unconfigured",
+			"Proofroom delivery is not configured", "proofroom_"+operation, nil,
+		)
+	default:
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusInternalServerError, "proofroom_delivery_unavailable",
+			"Proofroom delivery is unavailable", "proofroom_"+operation, err,
+		)
+	}
+}
+
+func (h *kbaseHTTPHandler) handleEvidenceAuditRetry(w http.ResponseWriter, r *http.Request, rawAuditID string) {
+	if r.Method != http.MethodPost {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusMethodNotAllowed, "audit_method_not_allowed",
+			"method not allowed", "retry_audit", nil,
+		)
+		return
+	}
+	if h.auditCoordinator == nil {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusServiceUnavailable, "audit_service_unavailable",
+			"evidence audit service is unavailable", "retry_audit", nil,
+		)
+		return
+	}
+	if len(h.auditRetrySigningKey) < 32 {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusServiceUnavailable, "audit_retry_unavailable",
+			"evidence audit retry is unavailable", "retry_audit", nil,
+		)
+		return
+	}
+	auditID, err := url.PathUnescape(rawAuditID)
+	if err != nil || strings.TrimSpace(auditID) == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"invalid audit_id", "retry_audit", nil,
+		)
+		return
+	}
+	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempotencyKey == "" {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"Idempotency-Key header is required", "retry_audit", nil,
+		)
+		return
+	}
+	now := h.auditNow()
+	authorization := h.issueEvidenceAuditRetryAuthorization(r, auditID, idempotencyKey, now)
+	retry, created, err := ManualRetryEvidenceAudit(
+		h.store, auditID, authorization, h.validateEvidenceAuditRetryAuthorization,
+		idempotencyKey, now,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusNotFound, "audit_not_found",
+				"evidence audit not found", "retry_audit", nil,
+			)
+		case errors.Is(err, ErrEvidenceAuditStateConflict):
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusConflict, "audit_retry_conflict",
+				"evidence audit retry conflicts with current state", "retry_audit", err,
+			)
+		default:
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusUnprocessableEntity, "audit_retry_invalid",
+				"evidence audit retry request is invalid", "retry_audit", err,
+			)
+		}
+		return
+	}
+	if retry.Status == EvidenceAuditQueued || retry.Status == EvidenceAuditRunning {
+		if err := h.auditCoordinator.Enqueue(retry.AuditID); err != nil {
+			code := "audit_coordinator_unavailable"
+			message := "evidence audit coordinator is unavailable"
+			if errors.Is(err, ErrEvidenceAuditQueueFull) {
+				code = "audit_queue_full"
+				message = "evidence audit queue is full; retry later"
+			}
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusServiceUnavailable, code, message, "enqueue_retry", err,
+			)
+			return
+		}
+	}
+	writeHTTPJSON(w, http.StatusAccepted, map[string]any{"created": created, "audit": retry})
+}
+
+func (h *kbaseHTTPHandler) issueEvidenceAuditRetryAuthorization(
+	r *http.Request,
+	auditID, idempotencyKey string,
+	now time.Time,
+) EvidenceAuditRetryAuthorization {
+	token := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer "))
+	actor := evidenceAuditOpaqueIdentity("bearer-actor\x00" + token)
+	expiresAt := now.UTC().Truncate(h.auditRetryTTL).Add(h.auditRetryTTL)
+	if !expiresAt.After(now) {
+		expiresAt = now.Add(h.auditRetryTTL)
+	}
+	nonce := h.evidenceAuditRetryMAC("nonce", auditID, actor, idempotencyKey)
+	authorization := EvidenceAuditRetryAuthorization{
+		AuditID: auditID, Actor: actor, Issuer: "kbase-http",
+		Scope: EvidenceAuditRetryScope, ExpiresAt: expiresAt,
+		Nonce: nonce, Verified: true,
+	}
+	authorization.Signature = h.evidenceAuditRetryMAC(
+		"grant", authorization.AuditID, authorization.Actor, authorization.Issuer,
+		authorization.Scope, authorization.ExpiresAt.Format(time.RFC3339Nano), authorization.Nonce,
+	)
+	return authorization
+}
+
+func (h *kbaseHTTPHandler) validateEvidenceAuditRetryAuthorization(
+	authorization EvidenceAuditRetryAuthorization,
+	now time.Time,
+) error {
+	if !authorization.Verified || authorization.Issuer != "kbase-http" ||
+		authorization.Scope != EvidenceAuditRetryScope || !authorization.ExpiresAt.After(now) {
+		return fmt.Errorf("retry authorization is invalid or expired")
+	}
+	want := h.evidenceAuditRetryMAC(
+		"grant", authorization.AuditID, authorization.Actor, authorization.Issuer,
+		authorization.Scope, authorization.ExpiresAt.Format(time.RFC3339Nano), authorization.Nonce,
+	)
+	if subtle.ConstantTimeCompare([]byte(want), []byte(authorization.Signature)) != 1 {
+		return fmt.Errorf("retry authorization signature is invalid")
+	}
+	return nil
+}
+
+func (h *kbaseHTTPHandler) evidenceAuditRetryMAC(parts ...string) string {
+	mac := hmac.New(sha256.New, h.auditRetrySigningKey)
+	for _, part := range parts {
+		_, _ = mac.Write([]byte(part))
+		_, _ = mac.Write([]byte{0})
+	}
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func (h *kbaseHTTPHandler) writeEvidenceAuditCreateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusNotFound, "audit_package_not_found",
+			"agent package not found", "create_audit", nil,
+		)
+	case errors.Is(err, ErrEvidenceAuditIdempotencyConflict):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusConflict, "audit_idempotency_conflict",
+			"idempotency key conflicts with a different audit request", "create_audit", err,
+		)
+	case strings.Contains(err.Error(), "schema_version"),
+		strings.Contains(err.Error(), "v2"),
+		strings.Contains(err.Error(), "evaluation"),
+		strings.Contains(err.Error(), "published"),
+		strings.Contains(err.Error(), "selected_claims"),
+		strings.Contains(err.Error(), "evidence_policy"):
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnprocessableEntity, "audit_package_not_ready",
+			"agent package is not eligible for evidence audit", "create_audit", err,
+		)
+	default:
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusBadRequest, "audit_request_invalid",
+			"evidence audit request is invalid", "create_audit", err,
+		)
+	}
+}
+
+func (h *kbaseHTTPHandler) writeEvidenceAuditHTTPError(
+	w http.ResponseWriter,
+	status int,
+	code, message, operation string,
+	cause error,
+) {
+	if cause != nil {
+		h.auditLogger(EvidenceAuditHTTPLogEvent{
+			Operation: operation,
+			Code:      code,
+			Cause:     sanitizeEvidenceAuditHTTPLogCause(cause.Error()),
+		})
+	}
+	writeHTTPJSON(w, status, map[string]string{"code": code, "error": message})
+}
+
+var (
+	evidenceAuditAuthorizationPattern = regexp.MustCompile(
+		`(?i)\b(bearer|basic)\s+[a-z0-9._~+/=-]+`,
+	)
+	evidenceAuditCredentialPattern = regexp.MustCompile(
+		`(?i)((?:["']?)(?:api[_-]?key|apikey|client[_-]?secret|secret|password|passwd|session|csrf|access[_-]?token|refresh[_-]?token|token|cookie|authorization|proxy-authorization)(?:["']?)\s*(?::|=)\s*)(?:"[^"]*"|'[^']*'|[^\s&,;}]+)`,
+	)
+)
+
+func sanitizeEvidenceAuditHTTPLogCause(value string) string {
+	value = strings.TrimSpace(value)
+	value = evidenceAuditAuthorizationPattern.ReplaceAllString(value, "$1 [redacted]")
+	return evidenceAuditCredentialPattern.ReplaceAllString(value, "${1}[redacted]")
+}
+
 func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
 	const (
 		collectionPath = "/api/agent-packages"
 		evaluatePath   = "/api/agent-packages/evaluate"
 		publishPath    = "/api/agent-packages/publish"
+		trustSuitePath = "/api/agent-packages/evaluation-suites/trust"
 		detailPrefix   = "/api/agent-packages/"
 	)
-	if r.URL.Path == evaluatePath {
+	if r.URL.Path == trustSuitePath {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
 		defer r.Body.Close()
-		var input AgentPackageEvaluationRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&input); err != nil {
+		var input AgentPackageTrustedEvaluationSuiteRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
 			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -1186,15 +1938,91 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if err := h.store.SaveTrustedAgentEvaluationSuite(input.Package, input.Suite); err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "immutable") {
+				status = http.StatusConflict
+			}
+			writeHTTPError(w, status, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, map[string]any{
+			"trusted":       true,
+			"package_id":    input.Package.PackageID,
+			"version":       input.Package.Version,
+			"suite_version": input.Suite.SuiteVersion,
+		})
+		return
+	}
+	if r.URL.Path == evaluatePath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input AgentPackageEvaluationRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := ValidateAgentPackage(input.Package, h.store, h.agentTools); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		evaluationSuite := input.Suite
+		trustedSuiteHash := ""
+		if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+			var resolveErr error
+			evaluationSuite, trustedSuiteHash, resolveErr = h.store.ResolveTrustedAgentEvaluationSuite(
+				input.Package,
+				input.Suite,
+			)
+			if resolveErr != nil {
+				writeHTTPError(w, http.StatusBadRequest, resolveErr.Error())
+				return
+			}
+		}
 		if existing, err := h.store.LoadAgentPackageEvaluation(input.Package.ContentHash); err == nil {
 			storedSuite, suiteErr := h.store.LoadAgentPackageEvaluationSuite(input.Package.ContentHash)
 			if suiteErr != nil {
 				writeHTTPError(w, http.StatusInternalServerError, suiteErr.Error())
 				return
 			}
-			if !reflect.DeepEqual(*storedSuite, input.Suite) {
+			if !reflect.DeepEqual(*storedSuite, evaluationSuite) {
 				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
 				return
+			}
+			if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+				if existing.TrustedSuiteHash == "" {
+					evaluatedAt, parseErr := time.Parse(time.RFC3339Nano, existing.EvaluatedAt)
+					if parseErr != nil {
+						writeHTTPError(w, http.StatusConflict, "legacy agent package evaluation timestamp is invalid")
+						return
+					}
+					migrated, migrateErr := h.store.MigrateLegacyTrustedAgentPackageEvaluation(
+						input.Package,
+						evaluationSuite,
+						evaluatedAt,
+					)
+					if migrateErr != nil {
+						writeHTTPError(w, http.StatusConflict, migrateErr.Error())
+						return
+					}
+					writeHTTPJSON(w, http.StatusOK, map[string]any{
+						"created": false, "migrated": true, "evaluation": migrated,
+					})
+					return
+				}
+				if existing.TrustedSuiteHash != trustedSuiteHash {
+					writeHTTPError(w, http.StatusConflict, "agent package trusted evaluation identity is immutable")
+					return
+				}
 			}
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"created": false, "evaluation": existing})
 			return
@@ -1202,12 +2030,13 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 			writeHTTPError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		report, err := EvaluateAgentPackageDeterministically(h.store, input.Package, input.Suite, time.Now())
+		report, err := EvaluateAgentPackageDeterministically(h.store, input.Package, evaluationSuite, time.Now())
 		if err != nil {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := h.store.SaveAgentPackageEvaluation(input.Package, input.Suite, report); err != nil {
+		report.TrustedSuiteHash = trustedSuiteHash
+		if err := h.store.SaveAgentPackageEvaluation(input.Package, evaluationSuite, report); err != nil {
 			writeHTTPError(w, http.StatusConflict, err.Error())
 			return
 		}
@@ -1633,6 +2462,20 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 	return authorizeBearerToken(w, r, h.authToken)
 }
 
+func (h *kbaseHTTPHandler) authorizeEvidenceAudit(w http.ResponseWriter, r *http.Request) bool {
+	value := strings.TrimSpace(r.Header.Get("Authorization"))
+	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
+	if h.authToken == "" || token == value ||
+		subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) != 1 {
+		h.writeEvidenceAuditHTTPError(
+			w, http.StatusUnauthorized, "audit_unauthorized",
+			"unauthorized", "authorize_audit", nil,
+		)
+		return false
+	}
+	return true
+}
+
 func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected string) bool {
 	value := strings.TrimSpace(r.Header.Get("Authorization"))
 	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
@@ -1674,6 +2517,57 @@ func (h *kbaseHTTPHandler) handleListBooks(w http.ResponseWriter) {
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"books": books})
+}
+
+func (h *kbaseHTTPHandler) handleGetCitation(w http.ResponseWriter, r *http.Request) {
+	const prefix = "/api/citations/"
+	rawID := strings.TrimPrefix(r.URL.Path, prefix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		writeHTTPError(w, http.StatusNotFound, "citation not found")
+		return
+	}
+	citationID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(citationID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "citation_id is required")
+		return
+	}
+	bookID := strings.TrimSpace(r.URL.Query().Get("book_id"))
+	if bookID == "" {
+		writeHTTPError(w, http.StatusBadRequest, "book_id is required")
+		return
+	}
+	pkg, err := h.loadHTTPBookPackage(bookID)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, "book not found")
+		return
+	}
+	for _, citation := range pkg.Citations {
+		if citation.CitationID != citationID {
+			continue
+		}
+		claimIDs := make([]string, 0, 2)
+		for _, claim := range pkg.Claims {
+			for _, candidate := range claim.Citations {
+				if candidate == citationID {
+					claimIDs = append(claimIDs, claim.ClaimID)
+					break
+				}
+			}
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{
+			"citation": map[string]string{
+				"citation_id":  citation.CitationID,
+				"book_id":      citation.BookID,
+				"chapter_id":   citation.ChapterID,
+				"chunk_id":     citation.ChunkID,
+				"source_type":  citation.SourceType,
+				"published_at": citation.PublishedAt,
+			},
+			"claim_ids": claimIDs,
+		})
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "citation not found")
 }
 
 func (h *kbaseHTTPHandler) handleGetBook(w http.ResponseWriter, r *http.Request) {

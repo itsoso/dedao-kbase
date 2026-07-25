@@ -211,6 +211,25 @@ const bookAgentState = {
   message: "",
 };
 
+const evidenceAuditState = {
+  audits: [],
+  audit: null,
+  routeAuditID: "",
+  subject: "",
+  scope: "",
+  selectedClaims: [],
+  loading: "",
+  error: "",
+  proofroomPreview: null,
+  proofroomStatus: "",
+  proofroomError: "",
+  deliveryReceipt: null,
+  proofroomDeliveryKey: "",
+  createIdempotencyKey: "",
+  createRequestFingerprint: "",
+  retryIdempotencyKey: "",
+};
+
 const knowledgeOperationsState = {
   console: null,
   loading: "",
@@ -253,6 +272,16 @@ let sourceControlLoadSequence = 0;
 let knowledgeReviewPollTimer = null;
 let knowledgeReviewLoadSequence = 0;
 let knowledgeAgentLoadSequence = 0;
+let evidenceAuditPollTimer = null;
+let evidenceAuditLoadSequence = 0;
+let evidenceAuditWorkspaceSequence = 0;
+let bookAgentLoadSequence = 0;
+let proofroomOperationSequence = 0;
+let bookKnowledgeLoadSequence = 0;
+let bookKnowledgeDetailSequence = 0;
+let proofroomPreviousFocus = null;
+let proofroomKeydownHandler = null;
+let proofroomReturnFocusSelector = "";
 
 function getToken() {
   for (const key of tokenKeys) {
@@ -674,7 +703,51 @@ function buildBookAppURL(packageID, version = "") {
   return packageID ? `${ROUTES.bookApps}/${encodeURIComponent(packageID)}${query}` : ROUTES.bookApps;
 }
 
+function buildEvidenceAuditURL(packageID, auditID, version = "") {
+  if (!packageID || !auditID) {
+    return buildAgentURL(packageID, version);
+  }
+  const params = new URLSearchParams();
+  if (version) {
+    params.set("version", version);
+  }
+  const query = params.toString();
+  return `${ROUTES.agents}/${encodeURIComponent(packageID)}/audits/${encodeURIComponent(auditID)}${query ? `?${query}` : ""}`;
+}
+
+function getEvidenceAuditRoute() {
+  const pathname = getRoutePathname();
+  const prefix = `${ROUTES.agents}/`;
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").filter(Boolean);
+  if (parts.length !== 3 || parts[1] !== "audits") {
+    return null;
+  }
+  const params = new URLSearchParams(window.location.search);
+  try {
+    return {
+      view: "agent",
+      packageID: decodeURIComponent(parts[0]),
+      auditID: decodeURIComponent(parts[2]),
+      version: params.get("version") || "",
+    };
+  } catch {
+    return {
+      view: "agent",
+      packageID: parts[0],
+      auditID: parts[2],
+      version: params.get("version") || "",
+    };
+  }
+}
+
 function getBookAgentRoute() {
+  const auditRoute = getEvidenceAuditRoute();
+  if (auditRoute) {
+    return auditRoute;
+  }
   const pathname = getRoutePathname();
   const routes = [
     [ROUTES.agentPackages, "package"],
@@ -683,15 +756,15 @@ function getBookAgentRoute() {
   ];
   for (const [base, view] of routes) {
     if (pathname === base) {
-      return { view, packageID: "", version: "" };
+      return { view, packageID: "", auditID: "", version: "" };
     }
     if (pathname.startsWith(`${base}/`)) {
       const raw = pathname.slice(base.length + 1).split("/")[0];
       const params = new URLSearchParams(window.location.search);
       try {
-        return { view, packageID: decodeURIComponent(raw), version: params.get("version") || "" };
+        return { view, packageID: decodeURIComponent(raw), auditID: "", version: params.get("version") || "" };
       } catch {
-        return { view, packageID: raw, version: params.get("version") || "" };
+        return { view, packageID: raw, auditID: "", version: params.get("version") || "" };
       }
     }
   }
@@ -2268,7 +2341,589 @@ function renderBookAgentAnswerCitations(answer) {
   `;
 }
 
+function evidenceAuditPrimaryRelease() {
+  const roles = bookAgentState.package?.evidence_policy?.release_roles;
+  const primaryID = Array.isArray(roles)
+    ? roles.find((item) => item.role === "primary")?.release_id
+    : "";
+  return bookAgentState.releases.find((release) => release.release_id === primaryID) || null;
+}
+
+function evidenceAuditPrimaryClaims() {
+  const claims = evidenceAuditPrimaryRelease()?.analysis?.claims;
+  return Array.isArray(claims) ? claims : [];
+}
+
+function evidenceAuditErrorDetails(error) {
+  const nested = error?.payload?.error;
+  if (nested && typeof nested === "object") {
+    return {
+      code: String(nested.code || "audit_request_failed"),
+      message: String(nested.message || error.message || "证据审计请求失败"),
+    };
+  }
+  return {
+    code: String(error?.payload?.code || "audit_request_failed"),
+    message: String(error?.message || "证据审计请求失败"),
+  };
+}
+
+function evidenceAuditIdempotencyKey(prefix, identity = "") {
+  const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}:${identity || "new"}:${random}`;
+}
+
+function evidenceAuditStatusLabel(status) {
+  return {
+    queued: "等待执行",
+    running: "审计中",
+    failed: "执行失败",
+    completed: "审计完成",
+  }[status] || status || "尚未开始";
+}
+
+function evidenceAuditVerdictLabel(verdict) {
+  return {
+    supported: "支持",
+    contradicted: "冲突",
+    mixed: "证据不一",
+    insufficient: "证据不足",
+    abstained: "暂不裁定",
+  }[verdict] || verdict || "未裁定";
+}
+
+function evidenceAuditFreshnessLabel(decision) {
+  return {
+    fresh: "时效合格",
+    stale: "已过时",
+    missing: "日期缺失",
+  }[decision] || decision || "未判定";
+}
+
+function evidenceAuditCitationURL(evidence) {
+  const release = bookAgentState.releases.find((item) => item.release_id === evidence.release_id);
+  const bookID = release?.book_id || release?.book?.book_id || "";
+  if (!bookID) {
+    return ROUTES.knowledgePackages;
+  }
+  const params = new URLSearchParams();
+  for (const [name, value] of [
+    ["release_id", evidence.release_id],
+    ["claim_id", evidence.claim_id],
+    ["chunk_id", evidence.chunk_id],
+    ["citation_id", evidence.citation_id],
+  ]) {
+    if (value) {
+      params.set(name, value);
+    }
+  }
+  const query = params.toString();
+  return `${buildKnowledgePackageURL(bookID)}${query ? `?${query}` : ""}#knowledge-evidence`;
+}
+
+function canRetryEvidenceAudit(audit) {
+  return audit?.status === "failed" &&
+    ["model_outcome_unknown", "requires_manual_retry"].includes(audit?.failure_code);
+}
+
+function renderEvidenceAuditComposer(pkg) {
+  if (pkg.schema_version !== "agent-package.v2") {
+    return `
+      <section class="book-agent__capability book-agent__unavailable">
+        <span class="book-agent__capability-index">evidence audit</span>
+        <div>
+          <strong>当前版本不提供证据审计</strong>
+          <p>此能力从 v2 package 开始，旧版本保持不可变，不显示可提交的审计表单。</p>
+        </div>
+      </section>
+    `;
+  }
+  const policy = pkg.evidence_policy || {};
+  const claims = evidenceAuditPrimaryClaims();
+  const maxClaims = Math.max(1, Number(policy.max_claims || 1));
+  const selected = new Set(evidenceAuditState.selectedClaims);
+  const atLimit = selected.size >= maxClaims;
+  return `
+    <section class="evidence-audit__composer" aria-labelledby="evidence-audit-composer-title">
+      <header class="evidence-audit__section-head">
+        <div>
+          <span>NEW AUDIT</span>
+          <h3 id="evidence-audit-composer-title">新建证据审计</h3>
+        </div>
+        <p>从主书 claim 出发，在固定支持来源中核验，不替代临床裁决。</p>
+      </header>
+      <div class="evidence-audit__policy" aria-label="审计策略摘要">
+        <div><span>来源独立性</span><strong>至少 ${Number(policy.minimum_independent_sources || 0)} 个独立来源</strong></div>
+        <div><span>证据时效</span><strong>${Number(policy.freshness_policy?.max_age_days || 0)} 天内${policy.freshness_policy?.require_publication_date ? " · 必须有日期" : ""}</strong></div>
+        <div><span>预算上限</span><strong>$${Number(pkg.model_policy?.max_cost_usd || 0).toFixed(2)} · ${Number(pkg.model_policy?.timeout_ms || 0) / 1000}s</strong></div>
+      </div>
+      <form id="evidence-audit-create-form" class="evidence-audit__form">
+        <label>
+          <span>审计主题</span>
+          <input name="subject" value="${escapeAttribute(evidenceAuditState.subject)}" maxlength="240" required placeholder="例如：关键临床试验结论复核">
+        </label>
+        <label>
+          <span>审计范围</span>
+          <textarea name="scope" rows="3" maxlength="1200" required placeholder="说明人群、干预、对照、结局或需要排除的范围">${escapeHTML(evidenceAuditState.scope)}</textarea>
+        </label>
+        <fieldset>
+          <legend>主书 claims <small>最多 ${maxClaims} 项 · 已选 ${selected.size}</small></legend>
+          <div class="evidence-audit__claim-picker">
+            ${claims.map((claim, index) => {
+              const id = String(claim.id || "");
+              const checked = selected.has(id);
+              return `
+                <label class="${checked ? "is-selected" : ""}">
+                  <input type="checkbox" name="selected_claims" value="${escapeAttribute(id)}" ${checked ? "checked" : ""} ${!checked && atLimit ? "disabled" : ""}>
+                  <span>${String(index + 1).padStart(2, "0")}</span>
+                  <strong>${escapeHTML(claim.statement || id)}</strong>
+                </label>
+              `;
+            }).join("") || `<p class="web-muted">主 release 暂无可选择的结构化 claims。</p>`}
+          </div>
+        </fieldset>
+        <footer>
+          <span aria-live="polite">${escapeHTML(evidenceAuditState.error || evidenceAuditState.loading || "审计创建后会生成稳定链接。")}</span>
+          <button class="button button-primary" type="submit" ${evidenceAuditState.loading || !claims.length || !selected.size ? "disabled" : ""}>创建审计</button>
+        </footer>
+      </form>
+    </section>
+  `;
+}
+
+function renderEvidenceAuditStatus(audit) {
+  if (!audit) {
+    return "";
+  }
+  const terminal = audit.status === "failed" || audit.status === "completed";
+  return `
+    <section class="evidence-audit__status is-${escapeAttribute(audit.status)}" aria-live="polite" aria-busy="${terminal ? "false" : "true"}">
+      <div>
+        <span>状态</span>
+        <strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong>
+      </div>
+      <div>
+        <span>审计 ID</span>
+        <code>${escapeHTML(audit.audit_id || "")}</code>
+      </div>
+      <div>
+        <span>尝试次数</span>
+        <strong>${Number(audit.attempt || 1)}</strong>
+      </div>
+      ${audit.status === "failed" ? `
+        <div class="evidence-audit__failure">
+          <span>${escapeHTML(audit.failure_code || "audit_failed")}</span>
+          <strong>${escapeHTML(audit.failure_summary || "审计未完成。")}</strong>
+        </div>
+        ${canRetryEvidenceAudit(audit) ? `<button class="button button-ghost" type="button" data-evidence-audit-retry>手动重试</button>` : ""}
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderEvidenceAuditEvidenceRow(evidence, index) {
+  return `
+    <details class="evidence-audit__evidence-row">
+      <summary>
+        <span>${String(index + 1).padStart(2, "0")}</span>
+        <strong>${escapeHTML(evidence.publication_identity || evidence.source_type || "证据来源")}</strong>
+        <small>${escapeHTML(evidenceAuditFreshnessLabel(evidence.freshness_decision))}${evidence.conflict ? " · 存在冲突" : ""}</small>
+      </summary>
+      <dl>
+        <div><dt>Release</dt><dd>${escapeHTML(evidence.release_id || "—")}</dd></div>
+        <div><dt>来源 / 角色</dt><dd>${escapeHTML(evidence.source_type || "—")} · ${escapeHTML(evidence.role || "—")}</dd></div>
+        <div><dt>发布日期</dt><dd>${escapeHTML(evidence.published_at || "未提供")}</dd></div>
+        <div><dt>Claim / Chunk</dt><dd>${escapeHTML(evidence.claim_id || "—")} · ${escapeHTML(evidence.chunk_id || "—")}</dd></div>
+      </dl>
+      <a href="${escapeAttribute(evidenceAuditCitationURL(evidence))}">查看 KBase 引用 ${escapeHTML(evidence.citation_id || "")} →</a>
+    </details>
+  `;
+}
+
+function renderEvidenceAuditClaim(claim, index) {
+  const evidence = Array.isArray(claim.evidence_refs) ? claim.evidence_refs : [];
+  const confidence = Math.round(Number(claim.computed_confidence || 0) * 100);
+  const renderList = (items, empty) => (
+    Array.isArray(items) && items.length
+      ? `<ul>${items.map((item) => `<li>${renderSimpleMarkdown(item)}</li>`).join("")}</ul>`
+      : `<p>${escapeHTML(empty)}</p>`
+  );
+  return `
+    <article class="evidence-audit__claim">
+      <header>
+        <span>主张 CLAIM ${String(index + 1).padStart(2, "0")}</span>
+        <div class="evidence-audit__verdict is-${escapeAttribute(claim.verdict)}">${escapeHTML(evidenceAuditVerdictLabel(claim.verdict))}</div>
+        <strong>置信度 ${confidence}%</strong>
+      </header>
+      <div class="evidence-audit__claim-statement">${renderSimpleMarkdown(claim.normalized_statement || claim.source_claim || "")}</div>
+      <section>
+        <h4>证据卷宗 <span>${evidence.length}</span></h4>
+        <div>${evidence.map(renderEvidenceAuditEvidenceRow).join("") || `<p class="web-muted">没有满足策略的可引用证据。</p>`}</div>
+      </section>
+      <div class="evidence-audit__review-grid">
+        <section><h4>局限</h4>${renderList(claim.limitations, "未记录额外局限。")}</section>
+        <section><h4>知识缺口</h4>${renderList(claim.knowledge_gaps, "未记录额外缺口。")}</section>
+        <section><h4>复核行动</h4>${renderList(claim.review_actions, "无需额外行动。")}</section>
+      </div>
+    </article>
+  `;
+}
+
+function renderEvidenceAuditTrace(audit) {
+  const trace = audit.trace || {};
+  const observability = audit.observability || trace.observability || {};
+  const stages = Array.isArray(observability.stages) ? observability.stages : [];
+  const usage = observability.usage || {};
+  const started = Date.parse(audit.started_at || "");
+  const ended = Date.parse(audit.completed_at || audit.failed_at || "");
+  const duration = Number.isFinite(started) && Number.isFinite(ended) ? Math.max(0, ended - started) : 0;
+  return `
+    <section class="evidence-audit__trace" aria-labelledby="evidence-audit-trace-title">
+      <header><span>TRACE</span><h3 id="evidence-audit-trace-title">Trace 与用量</h3></header>
+      <dl>
+        <div><dt>Trace ID</dt><dd>${escapeHTML(audit.trace_id || "未生成")}</dd></div>
+        <div><dt>总耗时</dt><dd>${duration ? `${(duration / 1000).toFixed(1)}s` : "未提供"}</dd></div>
+        <div><dt>独立来源</dt><dd>${Number(observability.independent_publication_source_count || 0) || "未提供"}</dd></div>
+        <div><dt>引用解析率</dt><dd>${Number.isFinite(Number(observability.citation_resolution_rate)) ? `${Math.round(Number(observability.citation_resolution_rate) * 100)}%` : "未提供"}</dd></div>
+        <div><dt>Tokens</dt><dd>${Number(usage.total_tokens || 0) || "未提供"}</dd></div>
+        <div><dt>Cost</dt><dd>${Number.isFinite(Number(usage.cost_usd)) && usage.status !== "unknown" ? `$${Number(usage.cost_usd).toFixed(4)}` : "unknown"}</dd></div>
+      </dl>
+      ${stages.length ? `
+        <div class="evidence-audit__stages">
+          ${stages.map((stage) => `<div><span>${escapeHTML(stage.name || "stage")}</span><strong>${escapeHTML(stage.status || "—")}</strong><small>${Number(stage.duration_ms || 0)}ms</small></div>`).join("")}
+        </div>
+      ` : `<p class="web-muted">${escapeHTML(audit.trace_error || "当前 Trace 未包含阶段耗时明细。")}</p>`}
+    </section>
+  `;
+}
+
+function countProofroomRedactions(value) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  if (Array.isArray(value)) {
+    return value.reduce((total, item) => total + countProofroomRedactions(item), 0);
+  }
+  return (value.redacted === true ? 1 : 0) +
+    Object.values(value).reduce((total, item) => total + countProofroomRedactions(item), 0);
+}
+
+function renderProofroomSafeText(value, fallback = "—") {
+  const text = typeof value === "string" ? value : value?.text;
+  return escapeHTML(text || fallback);
+}
+
+function renderProofroomPreviewClaim(claim, index) {
+  const evidence = Array.isArray(claim?.evidence) ? claim.evidence : [];
+  const limitations = Array.isArray(claim?.limitations) ? claim.limitations : [];
+  const gaps = Array.isArray(claim?.knowledge_gaps) ? claim.knowledge_gaps : [];
+  const actions = Array.isArray(claim?.review_actions) ? claim.review_actions : [];
+  return `
+    <article class="evidence-audit__proofroom-claim">
+      <header>
+        <span>CLAIM ${String(index + 1).padStart(2, "0")}</span>
+        <strong>${escapeHTML(evidenceAuditVerdictLabel(claim?.verdict))}</strong>
+        <small>置信度 ${Math.round(Number(claim?.computed_confidence || 0) * 100)}%</small>
+      </header>
+      <p>${renderProofroomSafeText(claim?.normalized_statement, "未提供规范化主张")}</p>
+      <div>
+        <strong>将投递的引用</strong>
+        ${evidence.length ? `<ul>${evidence.map((item) => `
+          <li>
+            <code>${escapeHTML(item.citation_id || "citation")}</code>
+            <span>${escapeHTML(item.release_id || "release")} · ${escapeHTML(item.claim_id || "claim")} · ${escapeHTML(item.chunk_id || "chunk")}</span>
+            <small>${escapeHTML(item.role || "role")} · ${escapeHTML(item.source_type || "source")} · ${escapeHTML(evidenceAuditFreshnessLabel(item.freshness_decision))}${item.conflict ? " · 存在冲突" : ""}</small>
+          </li>
+        `).join("")}</ul>` : `<p>无引用。</p>`}
+      </div>
+      ${limitations.length ? `<div><strong>局限</strong><ul>${limitations.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+      ${gaps.length ? `<div><strong>知识缺口</strong><ul>${gaps.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+      ${actions.length ? `<div><strong>复核行动</strong><ul>${actions.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+    </article>
+  `;
+}
+
+function renderEvidenceAuditProofroom(audit) {
+  const preview = evidenceAuditState.proofroomPreview;
+  const delivery = evidenceAuditState.deliveryReceipt;
+  const previewClaims = Array.isArray(preview?.payload?.claims) ? preview.payload.claims : [];
+  const reviewItems = Array.isArray(preview?.payload?.proofroom?.review_items)
+    ? preview.payload.proofroom.review_items
+    : [];
+  const summaryLimitations = Array.isArray(preview?.payload?.summary?.limitations)
+    ? preview.payload.summary.limitations
+    : [];
+  return `
+    <section class="evidence-audit__proofroom" aria-labelledby="evidence-audit-proofroom-title">
+      <header>
+        <div><span>DOWNSTREAM REVIEW</span><h3 id="evidence-audit-proofroom-title">Proofroom</h3></div>
+        <button class="button button-ghost" type="button" data-proofroom-preview ${evidenceAuditState.proofroomStatus === "loading" ? "disabled" : ""}>Proofroom 预览</button>
+      </header>
+      ${preview ? `
+        <div class="evidence-audit__proofroom-overlay" role="dialog" aria-modal="true" aria-labelledby="proofroom-preview-title">
+        <div class="evidence-audit__proofroom-preview">
+          <header>
+            <div><span>投递前审阅</span><h4 id="proofroom-preview-title">Proofroom 实际投递内容</h4></div>
+            <button class="button button-ghost" type="button" data-proofroom-close aria-label="关闭 Proofroom 预览">关闭</button>
+          </header>
+          <dl>
+            <div><dt>Payload hash</dt><dd>${escapeHTML(preview.payload_hash || "—")}</dd></div>
+            <div><dt>DLP redactions</dt><dd>${countProofroomRedactions(preview.payload)}</dd></div>
+            <div><dt>Claims</dt><dd>${preview.payload?.claims?.length || 0}</dd></div>
+            <div><dt>裁决归属</dt><dd>${escapeHTML(preview.payload?.adjudication_authority || "proofroom")}</dd></div>
+          </dl>
+          <p>${escapeHTML(preview.summary || "投递前最小化预览已生成。")}</p>
+          <section class="evidence-audit__proofroom-payload" aria-label="Proofroom 实际投递内容">
+            <h4>${renderProofroomSafeText(preview.payload?.proofroom?.title, "Proofroom 复核任务")}</h4>
+            <section>
+              <strong>审计摘要</strong>
+              <p>${renderProofroomSafeText(preview.payload?.summary?.conclusion, "未提供摘要")}</p>
+              ${summaryLimitations.length ? `<ul>${summaryLimitations.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul>` : ""}
+            </section>
+            <div>${previewClaims.map(renderProofroomPreviewClaim).join("") || `<p>当前投影没有 claim。</p>`}</div>
+            ${reviewItems.length ? `
+              <aside>
+                <strong>Proofroom 复核清单</strong>
+                <ul>${reviewItems.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul>
+              </aside>
+            ` : ""}
+            <details>
+              <summary>核对完整结构化 Payload</summary>
+              <pre>${escapeHTML(JSON.stringify(preview.payload, null, 2))}</pre>
+            </details>
+          </section>
+          <button class="button button-primary" type="button" data-proofroom-deliver ${evidenceAuditState.proofroomStatus === "delivering" || ["delivered", "outcome_unknown"].includes(evidenceAuditState.proofroomStatus) ? "disabled" : ""}>发送到 Proofroom</button>
+        </div>
+        </div>
+      ` : `<p>仅在点击预览后读取最小化 payload；审计完成不会自动发送。</p>`}
+      <div class="evidence-audit__delivery is-${escapeAttribute(evidenceAuditState.proofroomStatus || "idle")}" aria-live="polite">
+        ${delivery ? `<strong>${escapeHTML(delivery.status || "delivered")}</strong><span>${escapeHTML(delivery.remote_receipt_id || delivery.receipt_hash || "")}</span>` : ""}
+        ${evidenceAuditState.proofroomStatus === "outcome_unknown" ? `<strong>unknown</strong><span>远端结果未知，需人工核对后再处理，系统不会自动重发。</span>` : ""}
+        ${evidenceAuditState.proofroomStatus === "rejected" ? `<strong>rejected</strong><span>${escapeHTML(evidenceAuditState.proofroomError)}</span>` : ""}
+        ${evidenceAuditState.proofroomError && !["outcome_unknown", "rejected"].includes(evidenceAuditState.proofroomStatus) ? `<span>${escapeHTML(evidenceAuditState.proofroomError)}</span>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function deactivateProofroomModal({ restoreFocus = false } = {}) {
+  if (proofroomKeydownHandler) {
+    document.removeEventListener("keydown", proofroomKeydownHandler);
+    proofroomKeydownHandler = null;
+  }
+  document.body?.classList?.remove("has-proofroom-modal");
+  app.inert = false;
+  document.body?.querySelector?.(":scope > .evidence-audit__proofroom-overlay")?.remove();
+  if (restoreFocus && proofroomPreviousFocus?.isConnected && typeof proofroomPreviousFocus.focus === "function") {
+    proofroomPreviousFocus.focus();
+  }
+  if (restoreFocus) {
+    proofroomPreviousFocus = null;
+    proofroomReturnFocusSelector = "";
+  }
+}
+
+function closeProofroomPreview(route) {
+  const returnFocusSelector = proofroomReturnFocusSelector;
+  deactivateProofroomModal();
+  evidenceAuditState.proofroomPreview = null;
+  evidenceAuditState.proofroomDeliveryKey = "";
+  evidenceAuditState.proofroomStatus = "";
+  evidenceAuditState.proofroomError = "";
+  renderBookAgentPlatform(route);
+  window.requestAnimationFrame?.(() => {
+    const target = returnFocusSelector ? document.querySelector(returnFocusSelector) : null;
+    if (target && typeof target.focus === "function") {
+      target.focus();
+    } else if (proofroomPreviousFocus?.isConnected && typeof proofroomPreviousFocus.focus === "function") {
+      proofroomPreviousFocus.focus();
+    }
+    proofroomPreviousFocus = null;
+    proofroomReturnFocusSelector = "";
+  });
+}
+
+function activateProofroomModal(route) {
+  const overlay = app.querySelector(".evidence-audit__proofroom-overlay");
+  if (!overlay) {
+    return;
+  }
+  deactivateProofroomModal();
+  proofroomPreviousFocus = proofroomPreviousFocus || document.activeElement;
+  document.body?.appendChild?.(overlay);
+  document.body?.classList?.add("has-proofroom-modal");
+  app.inert = true;
+  const dialog = overlay.querySelector('[role="dialog"], .evidence-audit__proofroom-preview') || overlay;
+  const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const focusable = () => Array.from(dialog.querySelectorAll(focusableSelector));
+  proofroomKeydownHandler = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeProofroomPreview(route);
+      return;
+    }
+    if (event.key !== "Tab") {
+      return;
+    }
+    const items = focusable();
+    if (!items.length) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  document.addEventListener("keydown", proofroomKeydownHandler);
+  const close = overlay.querySelector("[data-proofroom-close]");
+  (close || focusable()[0] || dialog).focus();
+}
+
+function renderEvidenceAuditReport(audit) {
+  const claims = Array.isArray(audit?.claim_audits) ? audit.claim_audits : [];
+  const counts = audit?.summary?.verdict_counts || {};
+  return `
+    <section class="evidence-audit__report" aria-labelledby="evidence-audit-report-title">
+      <header class="evidence-audit__report-head">
+        <div>
+          <span>证据审计 · ${escapeHTML(audit.schema_version || "evidence-audit.v1")}</span>
+          <h2 id="evidence-audit-report-title">审计结论</h2>
+          <div class="evidence-audit__conclusion">${renderSimpleMarkdown(audit.summary?.conclusion || "审计已完成。")}</div>
+        </div>
+        <div class="evidence-audit__verdict-totals">
+          ${Object.entries(counts).map(([verdict, count]) => `<div><strong>${Number(count || 0)}</strong><span>${escapeHTML(evidenceAuditVerdictLabel(verdict))}</span></div>`).join("") || `<div><strong>${claims.length}</strong><span>claims</span></div>`}
+        </div>
+      </header>
+      <div class="evidence-audit__report-body">
+        <div class="evidence-audit__claims">${claims.map(renderEvidenceAuditClaim).join("") || `<p class="web-muted">报告未返回 claim 审计结果。</p>`}</div>
+        <aside>
+          <section>
+            <h3>局限与缺口</h3>
+            ${Array.isArray(audit.summary?.limitations) && audit.summary.limitations.length
+              ? `<ul>${audit.summary.limitations.map((item) => `<li>${renderSimpleMarkdown(item)}</li>`).join("")}</ul>`
+              : `<p>未记录全局局限。</p>`}
+          </section>
+          ${renderEvidenceAuditTrace(audit)}
+          ${renderEvidenceAuditProofroom(audit)}
+        </aside>
+      </div>
+    </section>
+  `;
+}
+
+function renderEvidenceAuditHistory(pkg) {
+  if (!evidenceAuditState.audits.length || pkg.schema_version !== "agent-package.v2") {
+    return "";
+  }
+  return `
+    <nav class="evidence-audit__history" aria-label="最近证据审计">
+      <span>最近审计</span>
+      ${evidenceAuditState.audits.slice(0, 6).map((audit) => `
+        <a href="${escapeAttribute(buildEvidenceAuditURL(pkg.package_id, audit.audit_id, pkg.version))}">
+          <strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong>
+          <small>${escapeHTML(audit.audit_id)}</small>
+        </a>
+      `).join("")}
+    </nav>
+  `;
+}
+
+function renderEvidenceAuditWorkspace(route, pkg) {
+  if (route.view !== "agent") {
+    return "";
+  }
+  if (pkg.schema_version !== "agent-package.v2") {
+    return `
+      <section class="evidence-audit evidence-audit--unavailable" aria-label="证据审计版本说明">
+        ${renderEvidenceAuditComposer(pkg)}
+      </section>
+    `;
+  }
+  const audit = evidenceAuditState.audit;
+  return `
+    <section class="evidence-audit" aria-label="临床证据审计桌">
+      ${evidenceAuditState.error && !audit ? `<div class="evidence-audit__error" role="alert"><strong>无法载入审计</strong><span>${escapeHTML(evidenceAuditState.error)}</span></div>` : ""}
+      ${route.auditID ? `
+        ${evidenceAuditState.loading && !audit ? `<div class="evidence-audit__waiting" role="status"><span aria-hidden="true"></span><strong>正在载入</strong><p>读取固定审计报告与状态。</p></div>` : ""}
+        ${renderEvidenceAuditStatus(audit)}
+        ${evidenceAuditState.error && audit ? `<div class="evidence-audit__error" role="alert"><strong>请求未完成</strong><span>${escapeHTML(evidenceAuditState.error)}</span></div>` : ""}
+        ${audit?.status === "completed" ? renderEvidenceAuditReport(audit) : ""}
+        ${audit && ["queued", "running"].includes(audit.status) ? `<div class="evidence-audit__waiting"><span aria-hidden="true"></span><strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong><p>只轮询当前审计；离开此链接或进入终态后自动停止。</p></div>` : ""}
+      ` : `
+        ${renderEvidenceAuditComposer(pkg)}
+        ${renderEvidenceAuditHistory(pkg)}
+      `}
+    </section>
+  `;
+}
+
+function renderEvidenceAuditContext(route, pkg, evaluation) {
+  const packageName = pkg.display_name || pkg.name || pkg.title || pkg.package_id;
+  const model = pkg.model_policy?.preferred_capability || pkg.model_policy?.model || "未指定";
+  const sourceCount = Array.isArray(pkg.releases) ? pkg.releases.length : 0;
+  const agentURL = buildAgentURL(pkg.package_id, pkg.version);
+  return `
+    <header class="evidence-audit__context" aria-label="审计包上下文">
+      <div class="evidence-audit__context-title">
+        <a href="${escapeAttribute(agentURL)}">← 返回 Agent</a>
+        <div><span>临床证据审计</span><h1>${escapeHTML(packageName)}</h1></div>
+      </div>
+      <dl>
+        <div><dt>版本</dt><dd>${escapeHTML(pkg.version || "—")}</dd></div>
+        <div><dt>模型</dt><dd>${escapeHTML(model)}</dd></div>
+        <div><dt>来源</dt><dd>${sourceCount}</dd></div>
+        <div class="${evaluation.passed ? "is-pass" : "is-hold"}"><dt>评测</dt><dd>${evaluation.passed ? "已通过" : "待通过"}</dd></div>
+      </dl>
+    </header>
+  `;
+}
+
+function renderEvidenceAuditTools(pkg, release, bookID, searchRows) {
+  return `
+    <details class="evidence-audit__tools">
+      <summary>
+        <span>包内工具</span>
+        <small>阅读器与固定范围检索</small>
+      </summary>
+      <div class="evidence-audit__tools-body">
+        ${renderBookAgentCapability("reader", `
+          <section class="book-agent__capability book-agent__reader" data-capability="reader">
+            <div class="book-agent__section-head"><div><span>01</span><h2>阅读器 Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
+            ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
+          </section>
+        `)}
+        ${renderBookAgentCapability("search", `
+          <section class="book-agent__capability book-agent__search" data-capability="search">
+            <div class="book-agent__section-head"><div><span>02</span><h2>包内检索 Grounded Search</h2></div><p>结果保持 Claim、Chunk 与 Release 身份。</p></div>
+            <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="检索当前知识包" aria-label="检索当前知识包"><button class="button button-primary" type="submit">检索</button></form>
+            <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
+          </section>
+        `, Boolean(pkg.package_id && pkg.version))}
+      </div>
+    </details>
+  `;
+}
+
+function renderGroundedConversation(pkg) {
+  return renderBookAgentCapability("grounded_chat", `
+    <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
+      <div class="book-agent__section-head"><div><span>03</span><h2>循证对话 Grounded Conversation</h2></div><p>回答必须经过 Package 的引用与拒答边界。</p></div>
+      <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="基于当前知识包提问" aria-label="基于当前知识包提问">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">基于证据提问</button></form>
+      ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
+      ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>已拒答</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "证据不足")}</p></article>` : ""}
+    </section>
+  `, Boolean(pkg.package_id && pkg.version));
+}
+
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
+  deactivateProofroomModal();
   if (!route.packageID || !bookAgentState.package) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
     return;
@@ -2294,10 +2949,12 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
     <div><span>${escapeHTML(metric)}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
   `).join("");
   const runtimeStatus = bookAgentState.loading || bookAgentState.message;
+  const isEvidenceAuditRoute = route.view === "agent" && pkg.schema_version === "agent-package.v2";
 
   renderShell(`
-    <main class="book-agent book-agent--detail">
-      <header class="book-agent__hero">
+    <main class="book-agent book-agent--detail ${isEvidenceAuditRoute ? "book-agent--audit" : ""}">
+      ${isEvidenceAuditRoute ? renderEvidenceAuditContext(route, pkg, evaluation) : `
+        <header class="book-agent__hero">
         <div class="book-agent__hero-copy">
           <p class="web-kicker">${escapeHTML(viewLabel)}</p>
           <h1>${escapeHTML(pkg.package_id)}</h1>
@@ -2318,20 +2975,27 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <small>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "suite unavailable")}</small>
           </div>
         </aside>
-      </header>
+        </header>
+      `}
 
       ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
 
-      <section class="book-agent__manifest">
+      ${isEvidenceAuditRoute ? "" : `<section class="book-agent__manifest">
         <div><span>Package hash</span><code>${escapeHTML(pkg.content_hash)}</code></div>
         <div><span>Model route</span><strong>${escapeHTML(pkg.model_policy?.preferred_capability || "—")}</strong></div>
         <div><span>Retrieval</span><strong>${escapeHTML(pkg.retrieval_policy?.strategy || "—")}</strong></div>
         <div><span>Escalation</span><strong>${escapeHTML(pkg.safety_policy?.escalation_target || "—")}</strong></div>
         ${evaluationMetrics ? `<div class="book-agent__metric-strip">${evaluationMetrics}</div>` : ""}
-      </section>
+      </section>`}
 
       <section class="book-agent__capabilities" aria-label="Manifest capabilities">
-        ${renderBookAgentCapability("reader", `
+        ${isEvidenceAuditRoute ? `
+          ${renderEvidenceAuditWorkspace(route, pkg)}
+          ${renderEvidenceAuditTools(pkg, release, bookID, searchRows)}
+          ${renderGroundedConversation(pkg)}
+          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+        ` : `
+          ${renderBookAgentCapability("reader", `
           <section class="book-agent__capability book-agent__reader" data-capability="reader">
             <div class="book-agent__section-head"><div><span>01</span><h2>Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
             ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>Open the book</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
@@ -2344,21 +3008,19 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
           </section>
         `, Boolean(pkg.package_id && pkg.version))}
-        ${renderBookAgentCapability("grounded_chat", `
-          <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
-            <div class="book-agent__section-head"><div><span>03</span><h2>Grounded conversation</h2></div><p>回答必须经过 package 的 citation 与 abstention 边界。</p></div>
-            <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="Ask a question grounded in this package">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">Ask with evidence</button></form>
-            ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
-            ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>Abstained</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "insufficient_evidence")}</p></article>` : ""}
-          </section>
-        `, Boolean(pkg.package_id && pkg.version))}
-        ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
-        ${renderBookAgentCapability("quiz", "", false)}
-        ${renderBookAgentCapability("action_plan", "", false)}
+          ${renderEvidenceAuditWorkspace(route, pkg)}
+          ${renderGroundedConversation(pkg)}
+          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+          ${renderBookAgentCapability("quiz", "", false)}
+          ${renderBookAgentCapability("action_plan", "", false)}
+        `}
       </section>
     </main>
   `, "agents");
   bindBookAgentPlatformEvents(route);
+  if (evidenceAuditState.proofroomPreview) {
+    window.requestAnimationFrame?.(() => activateProofroomModal(route));
+  }
 }
 
 function bindBookAgentPlatformEvents(route) {
@@ -2374,9 +3036,354 @@ function bindBookAgentPlatformEvents(route) {
     bookAgentState.question = String(data.get("question") || "").trim();
     await chatWithBookAgentPackage(route);
   });
+  document.querySelector("#evidence-audit-create-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    evidenceAuditState.subject = String(data.get("subject") || "").trim();
+    evidenceAuditState.scope = String(data.get("scope") || "").trim();
+    evidenceAuditState.selectedClaims = data.getAll("selected_claims").map((value) => String(value));
+    await createEvidenceAudit(route);
+  });
+  document.querySelectorAll('#evidence-audit-create-form input[name="selected_claims"]').forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const formData = new FormData(event.currentTarget.form);
+      const values = formData.getAll("selected_claims").map((value) => String(value));
+      const maxClaims = Math.max(1, Number(bookAgentState.package?.evidence_policy?.max_claims || 1));
+      evidenceAuditState.subject = String(formData.get("subject") || "").trim();
+      evidenceAuditState.scope = String(formData.get("scope") || "").trim();
+      evidenceAuditState.selectedClaims = values.slice(0, maxClaims);
+      renderBookAgentPlatform(route);
+    });
+  });
+  document.querySelector("[data-evidence-audit-retry]")?.addEventListener("click", () => retryEvidenceAudit(route));
+  document.querySelector("[data-proofroom-preview]")?.addEventListener("click", () => loadProofroomPreview(route));
+  document.querySelector("[data-proofroom-close]")?.addEventListener("click", () => closeProofroomPreview(route));
+  document.querySelector("[data-proofroom-deliver]")?.addEventListener("click", () => deliverEvidenceAuditToProofroom(route));
+}
+
+function resetEvidenceAuditState(auditID = "") {
+  cancelEvidenceAuditPoll();
+  evidenceAuditLoadSequence += 1;
+  proofroomOperationSequence += 1;
+  evidenceAuditState.audit = null;
+  evidenceAuditState.routeAuditID = auditID;
+  evidenceAuditState.loading = "";
+  evidenceAuditState.error = "";
+  evidenceAuditState.proofroomPreview = null;
+  evidenceAuditState.proofroomStatus = "";
+  evidenceAuditState.proofroomError = "";
+  evidenceAuditState.deliveryReceipt = null;
+  evidenceAuditState.proofroomDeliveryKey = "";
+  evidenceAuditState.retryIdempotencyKey = "";
+}
+
+function cancelEvidenceAuditPoll() {
+  if (evidenceAuditPollTimer) {
+    clearTimeout(evidenceAuditPollTimer);
+    evidenceAuditPollTimer = null;
+  }
+}
+
+function scheduleEvidenceAuditPoll(route) {
+  cancelEvidenceAuditPoll();
+  const auditID = String(route?.auditID || evidenceAuditState.audit?.audit_id || "");
+  const status = evidenceAuditState.audit?.status;
+  if (!auditID || !["queued", "running"].includes(status)) {
+    return;
+  }
+  evidenceAuditPollTimer = window.setTimeout(async () => {
+    if (evidenceAuditState.routeAuditID !== auditID || bookAgentState.route?.auditID !== auditID) {
+      cancelEvidenceAuditPoll();
+      return;
+    }
+    await loadEvidenceAudit({ ...route, auditID }, { silent: true });
+  }, 1800);
+}
+
+async function loadEvidenceAuditWorkspace(route) {
+  const sequence = ++evidenceAuditWorkspaceSequence;
+  const pkg = bookAgentState.package || {};
+  const packageID = String(pkg.package_id || "");
+  const version = String(pkg.version || "");
+  if (pkg.schema_version !== "agent-package.v2") {
+    resetEvidenceAuditState("");
+    evidenceAuditState.audits = [];
+    return;
+  }
+  if (route.auditID) {
+    resetEvidenceAuditState(route.auditID);
+    await loadEvidenceAudit(route);
+    return;
+  }
+  resetEvidenceAuditState("");
+  evidenceAuditState.audits = [];
+  const claims = evidenceAuditPrimaryClaims();
+  const maxClaims = Math.max(1, Number(pkg.evidence_policy?.max_claims || 1));
+  evidenceAuditState.selectedClaims = claims.slice(0, maxClaims).map((claim) => String(claim.id || "")).filter(Boolean);
+  evidenceAuditState.subject = evidenceAuditState.subject || `${evidenceAuditPrimaryRelease()?.book?.title || pkg.package_id} 临床证据复核`;
+  evidenceAuditState.scope = evidenceAuditState.scope || "核验主书关键临床结论，检查独立来源、证据时效、冲突与需要人工复核的知识缺口。";
+  try {
+    const params = new URLSearchParams({ version: pkg.version, limit: "10" });
+    const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/audits?${params.toString()}`);
+    if (
+      sequence !== evidenceAuditWorkspaceSequence ||
+      String(bookAgentState.package?.package_id || "") !== packageID ||
+      String(bookAgentState.package?.version || "") !== version
+    ) {
+      return;
+    }
+    evidenceAuditState.audits = Array.isArray(payload.audits) ? payload.audits : [];
+  } catch (error) {
+    if (sequence !== evidenceAuditWorkspaceSequence) {
+      return;
+    }
+    evidenceAuditState.error = evidenceAuditErrorDetails(error).message;
+  }
+}
+
+async function loadEvidenceAudit(route, { silent = false } = {}) {
+  const auditID = String(route?.auditID || "");
+  if (!auditID || evidenceAuditState.routeAuditID !== auditID) {
+    return;
+  }
+  const sequence = ++evidenceAuditLoadSequence;
+  if (!silent) {
+    evidenceAuditState.loading = "正在载入证据审计";
+    evidenceAuditState.error = "";
+    renderBookAgentPlatform(route);
+  }
+  try {
+    const audit = await apiFetch(`/api/agent-audits/${encodeURIComponent(route.auditID)}`);
+    const expectedPackageID = String(route.packageID || bookAgentState.package?.package_id || "");
+    const expectedVersion = String(route.version || bookAgentState.package?.version || "");
+    if (
+      String(audit?.audit_id || "") !== auditID ||
+      String(audit?.package?.package_id || "") !== expectedPackageID ||
+      (expectedVersion && String(audit?.package?.version || "") !== expectedVersion)
+    ) {
+      throw new Error("审计报告身份与当前 Package/version 不匹配，已拒绝展示。");
+    }
+    if (sequence !== evidenceAuditLoadSequence || evidenceAuditState.routeAuditID !== auditID) {
+      return;
+    }
+    if (audit.trace_id) {
+      try {
+        const trace = await apiFetch(`/api/agent-traces/${encodeURIComponent(audit.trace_id)}`);
+        if (
+          String(trace?.trace_id || "") !== String(audit.trace_id) ||
+          String(trace?.package?.package_id || "") !== expectedPackageID ||
+          (trace?.evidence_audit?.audit_id && String(trace.evidence_audit.audit_id) !== auditID)
+        ) {
+          throw new Error("Trace 身份与当前审计不匹配。");
+        }
+        audit.trace = trace;
+      } catch (traceError) {
+        audit.trace_error = traceError instanceof Error ? traceError.message : String(traceError);
+      }
+    }
+    if (sequence !== evidenceAuditLoadSequence || evidenceAuditState.routeAuditID !== auditID) {
+      return;
+    }
+    evidenceAuditState.audit = audit;
+    evidenceAuditState.error = "";
+  } catch (error) {
+    if (sequence !== evidenceAuditLoadSequence || evidenceAuditState.routeAuditID !== auditID) {
+      return;
+    }
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.error = `${details.code}: ${details.message}`;
+  } finally {
+    if (sequence === evidenceAuditLoadSequence && evidenceAuditState.routeAuditID === auditID) {
+      evidenceAuditState.loading = "";
+      renderBookAgentPlatform(route);
+      scheduleEvidenceAuditPoll(route);
+    }
+  }
+}
+
+async function createEvidenceAudit(route) {
+  const pkg = bookAgentState.package || {};
+  const maxClaims = Math.max(1, Number(pkg.evidence_policy?.max_claims || 1));
+  if (
+    pkg.schema_version !== "agent-package.v2" ||
+    !evidenceAuditState.subject ||
+    !evidenceAuditState.scope ||
+    !evidenceAuditState.selectedClaims.length ||
+    evidenceAuditState.selectedClaims.length > maxClaims
+  ) {
+    evidenceAuditState.error = "请填写主题、范围，并在策略上限内选择主书 claims。";
+    renderBookAgentPlatform(route);
+    return;
+  }
+  evidenceAuditState.loading = "正在创建审计";
+  evidenceAuditState.error = "";
+  renderBookAgentPlatform(route);
+  try {
+    const requestFingerprint = JSON.stringify({
+      package_id: pkg.package_id,
+      version: pkg.version,
+      subject: evidenceAuditState.subject,
+      scope: evidenceAuditState.scope,
+      selected_claims: evidenceAuditState.selectedClaims,
+    });
+    if (
+      evidenceAuditState.createRequestFingerprint !== requestFingerprint ||
+      !evidenceAuditState.createIdempotencyKey
+    ) {
+      evidenceAuditState.createRequestFingerprint = requestFingerprint;
+      evidenceAuditState.createIdempotencyKey = evidenceAuditIdempotencyKey("create", pkg.package_id);
+    }
+    const params = new URLSearchParams({ version: pkg.version });
+    const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/audits?${params.toString()}`, {
+      method: "POST",
+      body: JSON.stringify({
+        subject: evidenceAuditState.subject,
+        scope: evidenceAuditState.scope,
+        selected_claims: evidenceAuditState.selectedClaims,
+        idempotency_key: evidenceAuditState.createIdempotencyKey,
+      }),
+    });
+    const audit = payload.audit;
+    const nextRoute = { ...route, view: "agent", auditID: audit.audit_id, version: pkg.version };
+    const stableURL = buildEvidenceAuditURL(pkg.package_id, audit.audit_id, pkg.version);
+    window.history.replaceState({}, "", stableURL);
+    bookAgentState.route = nextRoute;
+    resetEvidenceAuditState(audit.audit_id);
+    evidenceAuditState.audit = audit;
+    renderBookAgentPlatform(nextRoute);
+    scheduleEvidenceAuditPoll(nextRoute);
+  } catch (error) {
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.error = `${details.code}: ${details.message}`;
+    evidenceAuditState.loading = "";
+    renderBookAgentPlatform(route);
+  }
+}
+
+async function retryEvidenceAudit(route) {
+  const audit = evidenceAuditState.audit;
+  if (!canRetryEvidenceAudit(audit)) {
+    return;
+  }
+  evidenceAuditState.loading = "正在提交重试";
+  evidenceAuditState.error = "";
+  renderBookAgentPlatform(route);
+  try {
+    evidenceAuditState.retryIdempotencyKey =
+      evidenceAuditState.retryIdempotencyKey || `retry:${audit.audit_id}:manual-v1`;
+    const payload = await apiFetch(`/api/agent-audits/${encodeURIComponent(audit.audit_id)}/retry`, {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": evidenceAuditState.retryIdempotencyKey,
+      },
+    });
+    const retry = payload.audit;
+    const nextRoute = { ...route, auditID: retry.audit_id };
+    window.history.replaceState({}, "", buildEvidenceAuditURL(retry.package?.package_id || route.packageID, retry.audit_id, retry.package?.version || route.version));
+    bookAgentState.route = nextRoute;
+    resetEvidenceAuditState(retry.audit_id);
+    evidenceAuditState.audit = retry;
+    renderBookAgentPlatform(nextRoute);
+    scheduleEvidenceAuditPoll(nextRoute);
+  } catch (error) {
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.error = `${details.code}: ${details.message}`;
+    evidenceAuditState.loading = "";
+    renderBookAgentPlatform(route);
+  }
+}
+
+async function loadProofroomPreview(route) {
+  const audit = evidenceAuditState.audit;
+  if (audit?.status !== "completed") {
+    return;
+  }
+  evidenceAuditState.proofroomStatus = "loading";
+  evidenceAuditState.proofroomError = "";
+  proofroomPreviousFocus = document.activeElement;
+  proofroomReturnFocusSelector = "[data-proofroom-preview]";
+  const operation = ++proofroomOperationSequence;
+  const auditID = audit.audit_id;
+  renderBookAgentPlatform(route);
+  try {
+    const preview = await apiFetch(`/api/agent-audits/${encodeURIComponent(auditID)}/proofroom`);
+    if (
+      operation !== proofroomOperationSequence ||
+      evidenceAuditState.audit?.audit_id !== auditID ||
+      bookAgentState.route?.auditID !== auditID
+    ) {
+      return;
+    }
+    evidenceAuditState.proofroomPreview = preview;
+    evidenceAuditState.proofroomDeliveryKey = `proofroom:${auditID}:${preview?.payload_hash || audit.output_hash || "projection"}`;
+    evidenceAuditState.proofroomStatus = "previewed";
+  } catch (error) {
+    if (operation !== proofroomOperationSequence || evidenceAuditState.audit?.audit_id !== auditID) {
+      return;
+    }
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.proofroomStatus = "error";
+    evidenceAuditState.proofroomError = `${details.code}: ${details.message}`;
+  } finally {
+    if (operation === proofroomOperationSequence && evidenceAuditState.audit?.audit_id === auditID) {
+      renderBookAgentPlatform(route);
+    }
+  }
+}
+
+async function deliverEvidenceAuditToProofroom(route) {
+  const audit = evidenceAuditState.audit;
+  if (audit?.status !== "completed" || !evidenceAuditState.proofroomPreview) {
+    return;
+  }
+  if (!window.confirm("确认发送到 Proofroom？该操作会创建可追溯投递回执，审计完成本身不会自动发送。")) {
+    return;
+  }
+  evidenceAuditState.proofroomStatus = "delivering";
+  evidenceAuditState.proofroomError = "";
+  const operation = ++proofroomOperationSequence;
+  const auditID = audit.audit_id;
+  renderBookAgentPlatform(route);
+  try {
+    const payload = await apiFetch(`/api/agent-audits/${encodeURIComponent(auditID)}/proofroom`, {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": evidenceAuditState.proofroomDeliveryKey ||
+          `proofroom:${auditID}:${evidenceAuditState.proofroomPreview.payload_hash || audit.output_hash || "projection"}`,
+      },
+    });
+    if (
+      operation !== proofroomOperationSequence ||
+      evidenceAuditState.audit?.audit_id !== auditID ||
+      bookAgentState.route?.auditID !== auditID
+    ) {
+      return;
+    }
+    evidenceAuditState.deliveryReceipt = payload.receipt || null;
+    evidenceAuditState.proofroomStatus = payload.receipt?.status || "delivered";
+  } catch (error) {
+    if (operation !== proofroomOperationSequence || evidenceAuditState.audit?.audit_id !== auditID) {
+      return;
+    }
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.proofroomError = `${details.code}: ${details.message}`;
+    if (details.code === "proofroom_outcome_unknown") {
+      evidenceAuditState.proofroomStatus = "outcome_unknown";
+    } else if (details.code === "proofroom_remote_rejected") {
+      evidenceAuditState.proofroomStatus = "rejected";
+    } else {
+      evidenceAuditState.proofroomStatus = "error";
+    }
+  } finally {
+    if (operation === proofroomOperationSequence && evidenceAuditState.audit?.audit_id === auditID) {
+      renderBookAgentPlatform(route);
+    }
+  }
 }
 
 async function loadBookAgentPlatform(route) {
+  cancelEvidenceAuditPoll();
+  const sequence = ++bookAgentLoadSequence;
   bookAgentState.route = route;
   bookAgentState.loading = "Loading Agent Packages";
   bookAgentState.message = "";
@@ -2384,21 +3391,40 @@ async function loadBookAgentPlatform(route) {
   try {
     if (!route.packageID) {
       const payload = await apiFetch("/api/agent-packages?limit=100");
+      if (sequence !== bookAgentLoadSequence) {
+        return;
+      }
       bookAgentState.packages = Array.isArray(payload.packages) ? payload.packages : [];
       bookAgentState.message = `${bookAgentState.packages.length} published packages`;
       return;
     }
     const query = route.version ? `?version=${encodeURIComponent(route.version)}` : "";
-    bookAgentState.package = await apiFetch(`/api/agent-packages/${encodeURIComponent(route.packageID)}${query}`);
-    bookAgentState.releases = await Promise.all((bookAgentState.package.releases || []).map((reference) => (
+    const pkg = await apiFetch(`/api/agent-packages/${encodeURIComponent(route.packageID)}${query}`);
+    if (sequence !== bookAgentLoadSequence) {
+      return;
+    }
+    bookAgentState.package = pkg;
+    const releases = await Promise.all((pkg.releases || []).map((reference) => (
       apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
     )));
+    if (sequence !== bookAgentLoadSequence) {
+      return;
+    }
+    bookAgentState.releases = releases;
+    if (route.view === "agent") {
+      await loadEvidenceAuditWorkspace(route);
+      if (sequence !== bookAgentLoadSequence) {
+        return;
+      }
+    }
     bookAgentState.message = "Package, releases, and evaluation loaded";
   } catch (error) {
     bookAgentState.message = error instanceof Error ? error.message : String(error);
   } finally {
-    bookAgentState.loading = "";
-    renderBookAgentPlatform(route);
+    if (sequence === bookAgentLoadSequence) {
+      bookAgentState.loading = "";
+      renderBookAgentPlatform(route);
+    }
   }
 }
 
@@ -5645,6 +6671,7 @@ function bindDedaoCourseArticleAnalysis(route) {
 }
 
 async function loadBookKnowledge() {
+  const sequence = ++bookKnowledgeLoadSequence;
   knowledgeState.loading = "加载书籍";
   knowledgeState.message = "";
   renderBookKnowledge();
@@ -5656,6 +6683,9 @@ async function loadBookKnowledge() {
       ]);
     }
     const payload = await apiFetch("/api/books");
+    if (sequence !== bookKnowledgeLoadSequence) {
+      return;
+    }
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length && isKnowledgePackageDetailRoute()) {
       const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
@@ -5664,6 +6694,39 @@ async function loadBookKnowledge() {
         ? knowledgeState.books.find((book) => book.book_id === preferredID)
         : null;
       await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
+      if (sequence !== bookKnowledgeLoadSequence) {
+        return;
+      }
+      const evidenceLocator = new URLSearchParams(window.location.search);
+      const citationID = evidenceLocator.get("citation_id") || "";
+      const evidenceQuery = citationID || evidenceLocator.get("chunk_id") || evidenceLocator.get("claim_id") || "";
+      if (citationID) {
+        const resolved = await apiFetch(
+          `/api/citations/${encodeURIComponent(citationID)}?book_id=${encodeURIComponent(knowledgeState.selectedBook.book_id)}`,
+        );
+        if (
+          sequence !== bookKnowledgeLoadSequence ||
+          String(knowledgeState.selectedBook?.book_id || "") !== String(preferred?.book_id || knowledgeState.books[0]?.book_id || "")
+        ) {
+          return;
+        }
+        const citation = resolved.citation || {};
+        knowledgeState.query = citationID;
+        knowledgeState.results = [{
+          kind: "citation",
+          id: citation.citation_id || citationID,
+          title: `引用 ${citation.citation_id || citationID}`,
+          snippet: [
+            ...(Array.isArray(resolved.claim_ids) ? resolved.claim_ids : []),
+            citation.chapter_id,
+            citation.chunk_id,
+          ].filter(Boolean).join(" · "),
+        }];
+        knowledgeState.message = "已精确定位审计引用。";
+      } else if (evidenceQuery) {
+        knowledgeState.query = evidenceQuery;
+        await searchBookKnowledge();
+      }
     } else if (!knowledgeState.books.length) {
       knowledgeState.selectedBook = null;
       knowledgeState.package = null;
@@ -5672,10 +6735,15 @@ async function loadBookKnowledge() {
     }
     knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
   } catch (error) {
+    if (sequence !== bookKnowledgeLoadSequence) {
+      return;
+    }
     knowledgeState.message = error instanceof Error ? error.message : String(error);
   } finally {
-    knowledgeState.loading = "";
-    renderBookKnowledge();
+    if (sequence === bookKnowledgeLoadSequence) {
+      knowledgeState.loading = "";
+      renderBookKnowledge();
+    }
   }
 }
 
@@ -6029,6 +7097,7 @@ async function loadKnowledgeReviewCockpit({ silent = false, renderResult = true 
 }
 
 async function selectKnowledgeBook(book, renderBefore = true) {
+  const sequence = ++bookKnowledgeDetailSequence;
   const previousID = knowledgeState.selectedBook?.book_id || "";
   knowledgeState.selectedBook = book;
   knowledgeState.package = null;
@@ -6042,27 +7111,42 @@ async function selectKnowledgeBook(book, renderBefore = true) {
     renderBookKnowledge();
   }
   try {
-    knowledgeState.package = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    const pkg = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== book.book_id) {
+      return;
+    }
+    knowledgeState.package = pkg;
     await Promise.all([
-      loadKnowledgeAnalysisManifest(book.book_id),
+      loadKnowledgeAnalysisManifest(book.book_id, sequence),
       loadKnowledgeReview(book.book_id, { silent: true, renderResult: false }),
       loadKnowledgeAgentPackages(book.book_id, { silent: true, renderResult: false }),
     ]);
   } catch (error) {
-    knowledgeState.message = error instanceof Error ? error.message : String(error);
+    if (sequence === bookKnowledgeDetailSequence && knowledgeState.selectedBook?.book_id === book.book_id) {
+      knowledgeState.message = error instanceof Error ? error.message : String(error);
+    }
   } finally {
-    knowledgeState.loading = "";
-    if (renderBefore) {
-      renderBookKnowledge();
+    if (sequence === bookKnowledgeDetailSequence && knowledgeState.selectedBook?.book_id === book.book_id) {
+      knowledgeState.loading = "";
+      if (renderBefore) {
+        renderBookKnowledge();
+      }
     }
   }
 }
 
-async function loadKnowledgeAnalysisManifest(bookID) {
+async function loadKnowledgeAnalysisManifest(bookID, sequence = bookKnowledgeDetailSequence) {
   knowledgeState.analysisManifestError = "";
   try {
-    knowledgeState.analysisManifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+    const manifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.analysisManifest = manifest;
   } catch (error) {
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes("HTTP 404")) {
       knowledgeState.analysisManifest = null;
@@ -6214,7 +7298,22 @@ function formatArticleTime(value) {
 }
 
 async function boot() {
+  bookKnowledgeLoadSequence += 1;
   const routePathname = getRoutePathname();
+  const isBookAgentRoute = (
+    routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
+    routePathname === ROUTES.agents || routePathname.startsWith(`${ROUTES.agents}/`) ||
+    routePathname === ROUTES.bookApps || routePathname.startsWith(`${ROUTES.bookApps}/`)
+  );
+  if (!isBookAgentRoute) {
+    deactivateProofroomModal({ restoreFocus: true });
+    cancelEvidenceAuditPoll();
+    evidenceAuditLoadSequence += 1;
+    evidenceAuditWorkspaceSequence += 1;
+    bookAgentLoadSequence += 1;
+    proofroomOperationSequence += 1;
+    evidenceAuditState.routeAuditID = "";
+  }
   if (window.location.pathname === "/" || routePathname === ROUTES.dedaoHome) {
     renderDedaoHome();
     await loadDedaoHome();
@@ -6275,11 +7374,7 @@ async function boot() {
     await loadDedaoLibrary("odob");
     return;
   }
-  if (
-    routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
-    routePathname === ROUTES.agents || routePathname.startsWith(`${ROUTES.agents}/`) ||
-    routePathname === ROUTES.bookApps || routePathname.startsWith(`${ROUTES.bookApps}/`)
-  ) {
+  if (isBookAgentRoute) {
     const bookAgentRoute = getBookAgentRoute();
     renderBookAgentPlatform(bookAgentRoute);
     await loadBookAgentPlatform(bookAgentRoute);

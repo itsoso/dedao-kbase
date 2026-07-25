@@ -280,6 +280,22 @@ func searchAgentReleaseClaimsWithStrategy(
 	limit int,
 	policy AgentPackageRetrievalPolicy,
 ) ([]AgentScopedSearchResult, error) {
+	return searchAgentReleaseClaimsWithStrategyContext(
+		context.Background(), store, release, query, limit, policy,
+	)
+}
+
+func searchAgentReleaseClaimsWithStrategyContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	release KnowledgeRelease,
+	query string,
+	limit int,
+	policy AgentPackageRetrievalPolicy,
+) ([]AgentScopedSearchResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if release.Analysis == nil {
 		return []AgentScopedSearchResult{}, nil
 	}
@@ -300,11 +316,11 @@ func searchAgentReleaseClaimsWithStrategy(
 		if err != nil {
 			return nil, err
 		}
-		index, err := store.loadOrBuildAgentSemanticVectorIndex(context.Background(), release, embedder)
+		index, err := store.loadOrBuildAgentSemanticVectorIndex(ctx, release, embedder)
 		if err != nil {
 			return nil, fmt.Errorf("build semantic vector index: %w", err)
 		}
-		queryVectors, err := embedder.Embed(context.Background(), []string{query})
+		queryVectors, err := embedder.Embed(ctx, []string{query})
 		if err != nil {
 			return nil, fmt.Errorf("embed semantic query: %w", err)
 		}
@@ -320,6 +336,9 @@ func searchAgentReleaseClaimsWithStrategy(
 	}
 	results := make([]AgentScopedSearchResult, 0)
 	for _, claim := range release.Analysis.Claims {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		haystack := strings.ToLower(strings.Join(append([]string{claim.Statement}, claim.Scope...), " "))
 		matched := 0
 		for _, term := range terms {

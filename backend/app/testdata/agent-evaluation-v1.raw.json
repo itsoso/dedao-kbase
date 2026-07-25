@@ -1,0 +1,18 @@
+{
+  "schema_version": "agent-evaluation.v1",
+  "suite_version": "book-agent-v1",
+  "cases": [
+    {
+      "case_id": "historical-retrieval",
+      "metric": "retrieval",
+      "input": "synthetic grounded statement",
+      "expected_ids": ["chunk-1"]
+    },
+    {
+      "case_id": "historical-abstention",
+      "metric": "abstention",
+      "input": "outside fixture scope",
+      "expected_value": "insufficient_evidence"
+    }
+  ]
+}

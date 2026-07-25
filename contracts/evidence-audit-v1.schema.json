@@ -1,0 +1,390 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/evidence-audit-v1.schema.json",
+  "title": "KBase Evidence Audit v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "audit_id",
+    "status",
+    "created_at",
+    "updated_at",
+    "idempotency_key",
+    "input_hash",
+    "package",
+    "evidence_policy",
+    "model",
+    "retrieval",
+    "releases",
+    "subject",
+    "scope",
+    "selected_claims"
+  ],
+  "properties": {
+    "schema_version": { "const": "evidence-audit.v1" },
+    "audit_id": { "$ref": "#/$defs/identifier" },
+    "status": { "enum": ["queued", "running", "completed", "failed"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "started_at": { "type": "string", "format": "date-time" },
+    "completed_at": { "type": "string", "format": "date-time" },
+    "failed_at": { "type": "string", "format": "date-time" },
+    "idempotency_key": { "$ref": "#/$defs/identifier" },
+    "input_hash": { "$ref": "#/$defs/sha256" },
+    "package": { "$ref": "#/$defs/package" },
+    "evidence_policy": { "$ref": "#/$defs/evidence_policy" },
+    "model": { "$ref": "#/$defs/model" },
+    "retrieval": { "$ref": "#/$defs/retrieval" },
+    "releases": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 32,
+      "x-kbase-max-total-citations": 2048,
+      "items": { "$ref": "#/$defs/release" },
+      "allOf": [
+        {
+          "contains": {
+            "type": "object",
+            "properties": { "role": { "const": "primary" } },
+            "required": ["role"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "type": "object",
+            "properties": { "role": { "const": "supporting" } },
+            "required": ["role"]
+          },
+          "minContains": 1
+        }
+      ]
+    },
+    "subject": { "$ref": "#/$defs/text" },
+    "scope": { "$ref": "#/$defs/text" },
+    "selected_claims": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/text" }
+    },
+    "claim_audits": {
+      "type": "array",
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/claim_audit" }
+    },
+    "summary": {
+      "anyOf": [
+        { "$ref": "#/$defs/summary" },
+        { "type": "object", "maxProperties": 0 }
+      ]
+    },
+    "proofroom_projection": {
+      "anyOf": [
+        { "$ref": "#/$defs/proofroom_projection" },
+        { "type": "object", "maxProperties": 0 }
+      ]
+    },
+    "output_hash": { "$ref": "#/$defs/sha256" },
+    "trace_id": { "$ref": "#/$defs/identifier" },
+    "failure_code": { "$ref": "#/$defs/identifier" },
+    "failure_summary": { "$ref": "#/$defs/text" },
+    "retry_of": { "$ref": "#/$defs/identifier" },
+    "attempt": { "type": "integer", "minimum": 2 },
+    "request_identity": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "queued" } }, "required": ["status"] },
+      "then": {
+        "properties": {
+          "claim_audits": { "maxItems": 0 },
+          "summary": { "type": "object", "maxProperties": 0 },
+          "proofroom_projection": { "type": "object", "maxProperties": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["started_at"] },
+            { "required": ["completed_at"] },
+            { "required": ["failed_at"] },
+            { "required": ["trace_id"] },
+            { "required": ["failure_code"] },
+            { "required": ["failure_summary"] },
+            { "required": ["output_hash"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "running" } }, "required": ["status"] },
+      "then": {
+        "required": ["started_at", "trace_id"],
+        "properties": {
+          "claim_audits": { "maxItems": 0 },
+          "summary": { "type": "object", "maxProperties": 0 },
+          "proofroom_projection": { "type": "object", "maxProperties": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["completed_at"] },
+            { "required": ["failed_at"] },
+            { "required": ["failure_code"] },
+            { "required": ["failure_summary"] },
+            { "required": ["output_hash"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "completed" } }, "required": ["status"] },
+      "then": {
+        "required": [
+          "started_at",
+          "completed_at",
+          "trace_id",
+          "claim_audits",
+          "summary",
+          "proofroom_projection",
+          "output_hash"
+        ],
+        "properties": {
+          "claim_audits": { "minItems": 1 },
+          "summary": { "$ref": "#/$defs/summary" },
+          "proofroom_projection": { "$ref": "#/$defs/proofroom_projection" }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["failed_at"] },
+            { "required": ["failure_code"] },
+            { "required": ["failure_summary"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+      "then": {
+        "required": ["failed_at", "failure_code", "failure_summary"],
+        "properties": {
+          "claim_audits": { "maxItems": 0 },
+          "summary": { "type": "object", "maxProperties": 0 },
+          "proofroom_projection": { "type": "object", "maxProperties": 0 }
+        },
+        "not": {
+          "anyOf": [
+            { "required": ["completed_at"] },
+            { "required": ["output_hash"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": { "required": ["retry_of"] },
+      "then": { "required": ["attempt", "request_identity"] }
+    },
+    {
+      "if": { "not": { "required": ["retry_of"] } },
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["attempt"] },
+            { "required": ["request_identity"] }
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "package": {
+      "type": "object",
+      "required": ["package_id", "version", "content_hash"],
+      "properties": {
+        "package_id": { "$ref": "#/$defs/identifier" },
+        "version": { "$ref": "#/$defs/identifier" },
+        "content_hash": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidence_policy": {
+      "type": "object",
+      "required": ["minimum_independent_sources", "max_claims", "max_evidence_per_claim"],
+      "properties": {
+        "minimum_independent_sources": { "type": "integer", "minimum": 1 },
+        "max_claims": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "max_evidence_per_claim": { "type": "integer", "minimum": 1, "maximum": 5 }
+      }
+    },
+    "model": {
+      "type": "object",
+      "required": ["provider", "model", "route"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/identifier" },
+        "model": { "$ref": "#/$defs/identifier" },
+        "route": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "required": ["strategy", "index_version"],
+      "properties": {
+        "strategy": { "$ref": "#/$defs/identifier" },
+        "index_version": { "$ref": "#/$defs/identifier" },
+        "reranker_version": { "$ref": "#/$defs/identifier" },
+        "embedding_version": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "citation": {
+      "type": "object",
+      "required": ["citation_id", "claim_id", "chunk_id"],
+      "properties": {
+        "citation_id": { "$ref": "#/$defs/identifier" },
+        "claim_id": { "$ref": "#/$defs/identifier" },
+        "chunk_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "release": {
+      "type": "object",
+      "required": [
+        "release_id",
+        "content_hash",
+        "role",
+        "source_type",
+        "publication_identity",
+        "citations"
+      ],
+      "properties": {
+        "release_id": { "$ref": "#/$defs/identifier" },
+        "content_hash": { "$ref": "#/$defs/sha256" },
+        "role": { "enum": ["primary", "supporting"] },
+        "source_type": { "$ref": "#/$defs/identifier" },
+        "publication_identity": { "$ref": "#/$defs/sha256" },
+        "citations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/citation" }
+        }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "required": [
+        "release_id",
+        "content_hash",
+        "role",
+        "source_type",
+        "publication_identity",
+        "claim_id",
+        "chunk_id",
+        "citation_id",
+        "published_at",
+        "freshness_decision"
+      ],
+      "properties": {
+        "release_id": { "$ref": "#/$defs/identifier" },
+        "content_hash": { "$ref": "#/$defs/sha256" },
+        "role": { "enum": ["primary", "supporting"] },
+        "source_type": { "$ref": "#/$defs/identifier" },
+        "publication_identity": { "$ref": "#/$defs/sha256" },
+        "claim_id": { "$ref": "#/$defs/identifier" },
+        "chunk_id": { "$ref": "#/$defs/identifier" },
+        "citation_id": { "$ref": "#/$defs/identifier" },
+        "published_at": { "type": "string", "maxLength": 64 },
+        "freshness_decision": { "enum": ["fresh", "missing"] },
+        "conflict": { "type": "boolean" }
+      }
+    },
+    "claim_audit": {
+      "type": "object",
+      "required": [
+        "source_claim",
+        "normalized_statement",
+        "verdict",
+        "computed_confidence",
+        "limitations",
+        "knowledge_gaps",
+        "review_actions"
+      ],
+      "properties": {
+        "source_claim": { "$ref": "#/$defs/text" },
+        "normalized_statement": { "$ref": "#/$defs/text" },
+        "verdict": { "enum": ["supported", "contradicted", "mixed", "insufficient"] },
+        "evidence_refs": {
+          "type": "array",
+          "maxItems": 5,
+          "items": { "$ref": "#/$defs/evidence_ref" }
+        },
+        "computed_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "limitations": { "$ref": "#/$defs/text_list" },
+        "knowledge_gaps": { "$ref": "#/$defs/text_list" },
+        "review_actions": { "$ref": "#/$defs/text_list" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "enum": ["supported", "contradicted", "mixed"]
+              }
+            },
+            "required": ["verdict"]
+          },
+          "then": {
+            "required": ["evidence_refs"],
+            "properties": {
+              "evidence_refs": { "minItems": 1 }
+            }
+          }
+        }
+      ]
+    },
+    "text_list": {
+      "type": "array",
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/text" }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["conclusion", "verdict_counts", "limitations"],
+      "properties": {
+        "conclusion": { "$ref": "#/$defs/text" },
+        "verdict_counts": {
+          "type": "object",
+          "propertyNames": { "enum": ["supported", "contradicted", "mixed", "insufficient"] },
+          "additionalProperties": { "type": "integer", "minimum": 0, "maximum": 8 }
+        },
+        "limitations": { "$ref": "#/$defs/text_list" }
+      }
+    },
+    "proofroom_projection": {
+      "type": "object",
+      "required": ["schema_version", "title", "review_items"],
+      "properties": {
+        "schema_version": { "$ref": "#/$defs/identifier" },
+        "title": { "$ref": "#/$defs/text" },
+        "review_items": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/text" }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

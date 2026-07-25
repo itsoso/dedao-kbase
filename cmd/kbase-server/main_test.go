@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,5 +230,183 @@ func TestKnowledgeReverificationDurationsUseBoundedEnvironmentValues(t *testing.
 	}
 	if got := knowledgeReverificationStaleAfter(); got != 24*time.Hour {
 		t.Fatalf("bounded stale after = %s", got)
+	}
+}
+
+func TestEvidenceAuditServerLimitsUseBoundedEnvironmentValues(t *testing.T) {
+	t.Setenv("KBASE_AUDIT_WORKERS", "4")
+	t.Setenv("KBASE_AUDIT_QUEUE_SIZE", "128")
+	t.Setenv("KBASE_AUDIT_MAX_BODY_BYTES", "131072")
+	t.Setenv("KBASE_AUDIT_SHUTDOWN_SECONDS", "20")
+	if got := evidenceAuditWorkerCount(); got != 4 {
+		t.Fatalf("worker count = %d", got)
+	}
+	if got := evidenceAuditQueueSize(); got != 128 {
+		t.Fatalf("queue size = %d", got)
+	}
+	if got := evidenceAuditMaxBodyBytes(); got != 131072 {
+		t.Fatalf("max body = %d", got)
+	}
+	if got := evidenceAuditShutdownTimeout(); got != 20*time.Second {
+		t.Fatalf("shutdown timeout = %s", got)
+	}
+
+	t.Setenv("KBASE_AUDIT_WORKERS", "999")
+	t.Setenv("KBASE_AUDIT_QUEUE_SIZE", "999999")
+	t.Setenv("KBASE_AUDIT_MAX_BODY_BYTES", "99999999")
+	t.Setenv("KBASE_AUDIT_SHUTDOWN_SECONDS", "999")
+	if got := evidenceAuditWorkerCount(); got != 32 {
+		t.Fatalf("bounded worker count = %d", got)
+	}
+	if got := evidenceAuditQueueSize(); got != 4096 {
+		t.Fatalf("bounded queue size = %d", got)
+	}
+	if got := evidenceAuditMaxBodyBytes(); got != 1<<20 {
+		t.Fatalf("bounded max body = %d", got)
+	}
+	if got := evidenceAuditShutdownTimeout(); got != time.Minute {
+		t.Fatalf("bounded shutdown timeout = %s", got)
+	}
+}
+
+func TestKBaseHTTPServerUsesSafeTimeoutDefaults(t *testing.T) {
+	for _, key := range []string{
+		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
+		"KBASE_HTTP_READ_TIMEOUT_SECONDS",
+		"KBASE_HTTP_WRITE_TIMEOUT_SECONDS",
+		"KBASE_HTTP_IDLE_TIMEOUT_SECONDS",
+		"KBASE_HTTP_MAX_HEADER_BYTES",
+	} {
+		t.Setenv(key, "")
+	}
+	server, err := newKBaseHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	if err != nil {
+		t.Fatalf("newKBaseHTTPServer() error = %v", err)
+	}
+	if server.ReadHeaderTimeout != 5*time.Second ||
+		server.ReadTimeout != 30*time.Second ||
+		server.WriteTimeout != 2*time.Minute ||
+		server.IdleTimeout != time.Minute ||
+		server.MaxHeaderBytes != 1<<20 {
+		t.Fatalf("unsafe server defaults: %+v", server)
+	}
+}
+
+func TestKBaseHTTPServerReadsStrictBoundedEnvironment(t *testing.T) {
+	t.Setenv("KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", "7")
+	t.Setenv("KBASE_HTTP_READ_TIMEOUT_SECONDS", "31")
+	t.Setenv("KBASE_HTTP_WRITE_TIMEOUT_SECONDS", "121")
+	t.Setenv("KBASE_HTTP_IDLE_TIMEOUT_SECONDS", "61")
+	t.Setenv("KBASE_HTTP_MAX_HEADER_BYTES", "65536")
+	server, err := newKBaseHTTPServer("127.0.0.1:0", http.NotFoundHandler())
+	if err != nil {
+		t.Fatalf("newKBaseHTTPServer() error = %v", err)
+	}
+	if server.ReadHeaderTimeout != 7*time.Second ||
+		server.ReadTimeout != 31*time.Second ||
+		server.WriteTimeout != 121*time.Second ||
+		server.IdleTimeout != 61*time.Second ||
+		server.MaxHeaderBytes != 65536 {
+		t.Fatalf("configured server = %+v", server)
+	}
+
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{key: "KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", value: "0"},
+		{key: "KBASE_HTTP_READ_TIMEOUT_SECONDS", value: "invalid"},
+		{key: "KBASE_HTTP_WRITE_TIMEOUT_SECONDS", value: "301"},
+		{key: "KBASE_HTTP_IDLE_TIMEOUT_SECONDS", value: "-1"},
+		{key: "KBASE_HTTP_MAX_HEADER_BYTES", value: "4096"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			for _, key := range []string{
+				"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
+				"KBASE_HTTP_READ_TIMEOUT_SECONDS",
+				"KBASE_HTTP_WRITE_TIMEOUT_SECONDS",
+				"KBASE_HTTP_IDLE_TIMEOUT_SECONDS",
+				"KBASE_HTTP_MAX_HEADER_BYTES",
+			} {
+				t.Setenv(key, "")
+			}
+			t.Setenv(test.key, test.value)
+			if _, err := newKBaseHTTPServer("127.0.0.1:0", http.NotFoundHandler()); err == nil {
+				t.Fatalf("newKBaseHTTPServer() accepted %s=%q", test.key, test.value)
+			}
+		})
+	}
+}
+
+func TestEvidenceAuditRetrySigningKeyRequiresServerSecret(t *testing.T) {
+	t.Setenv("KBASE_AUDIT_RETRY_SIGNING_KEY", "short")
+	if _, err := evidenceAuditRetrySigningKey(); err == nil {
+		t.Fatal("short retry signing key accepted")
+	}
+	t.Setenv("KBASE_AUDIT_RETRY_SIGNING_KEY", "a-server-secret-with-at-least-32-bytes")
+	key, err := evidenceAuditRetrySigningKey()
+	if err != nil || string(key) != "a-server-secret-with-at-least-32-bytes" {
+		t.Fatalf("retry signing key = %q err=%v", key, err)
+	}
+	if err := validateEvidenceAuditRetryKeySeparation(
+		key, "a-server-secret-with-at-least-32-bytes", "source-token", "publisher-token",
+	); err == nil {
+		t.Fatal("retry signing key was allowed to match bearer token")
+	}
+	if err := validateEvidenceAuditRetryKeySeparation(
+		key, "admin-token", "source-token", "publisher-token",
+	); err != nil {
+		t.Fatalf("distinct retry signing key rejected: %v", err)
+	}
+}
+
+func TestNewEvidenceAuditServerRuntimeReturnsDiagnosticWhenTokenPlanMissing(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "")
+	t.Setenv("TOKENPLAN_API_KEY", "")
+	t.Setenv("DEDAO_TOKENPLAN_ENV_FILE", filepath.Join(t.TempDir(), "missing.env"))
+	runtime := newEvidenceAuditServerRuntime(context.Background(), app.NewBookKnowledgeStore(t.TempDir()))
+	if runtime.Coordinator != nil {
+		t.Fatal("coordinator initialized without TokenPlan credentials")
+	}
+	if !strings.Contains(runtime.UnavailableReason, "TokenPlan") {
+		t.Fatalf("unavailable reason = %q", runtime.UnavailableReason)
+	}
+}
+
+func TestProofroomDeliveryRuntimeUsesEnvironmentOnlyConfiguration(t *testing.T) {
+	t.Setenv("KBASE_PROOFROOM_ENDPOINT", "")
+	t.Setenv("KBASE_PROOFROOM_TOKEN", "")
+	service, reason := newProofroomDeliveryRuntime()
+	if service != nil || !strings.Contains(reason, "KBASE_PROOFROOM_ENDPOINT") {
+		t.Fatalf("missing runtime service=%v reason=%q", service, reason)
+	}
+
+	t.Setenv("KBASE_PROOFROOM_ENDPOINT", "http://proofroom.example.test/deliver")
+	t.Setenv("KBASE_PROOFROOM_TOKEN", "remote-secret")
+	service, reason = newProofroomDeliveryRuntime()
+	if service != nil || !strings.Contains(reason, "https") {
+		t.Fatalf("unsafe runtime service=%v reason=%q", service, reason)
+	}
+
+	t.Setenv("KBASE_PROOFROOM_ENDPOINT", "https://proofroom.example.test/deliver")
+	t.Setenv("KBASE_PROOFROOM_TOKEN", "remote-secret")
+	t.Setenv("KBASE_PROOFROOM_TIMEOUT_SECONDS", "17")
+	service, reason = newProofroomDeliveryRuntime()
+	if service == nil || reason != "" {
+		t.Fatalf("configured runtime service=%v reason=%q", service, reason)
+	}
+}
+
+func TestProofroomDeliveryTimeoutEnvironmentIsStrictAndBounded(t *testing.T) {
+	t.Setenv("KBASE_PROOFROOM_TIMEOUT_SECONDS", "")
+	timeout, err := proofroomDeliveryTimeout()
+	if err != nil || timeout != 20*time.Second {
+		t.Fatalf("default timeout=%s err=%v", timeout, err)
+	}
+	for _, value := range []string{"0", "invalid", "121"} {
+		t.Setenv("KBASE_PROOFROOM_TIMEOUT_SECONDS", value)
+		if _, err := proofroomDeliveryTimeout(); err == nil {
+			t.Fatalf("timeout accepted %q", value)
+		}
 	}
 }

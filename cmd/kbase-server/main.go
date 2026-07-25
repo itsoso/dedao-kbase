@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -40,6 +42,20 @@ func main() {
 		log.Fatalf("initialize knowledge catalog: %v", err)
 	}
 	defer knowledgeCatalog.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	auditRuntime := newEvidenceAuditServerRuntime(ctx, bookStore)
+	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
+	if retrySigningErr == nil {
+		retrySigningErr = validateEvidenceAuditRetryKeySeparation(
+			retrySigningKey, *authToken, *sourceAgentToken, *agentPublisherToken,
+		)
+	}
+	if retrySigningErr != nil {
+		log.Printf("evidence audit retry disabled: %v", retrySigningErr)
+		retrySigningKey = nil
+	}
+	proofroomDelivery, proofroomUnavailableReason := newProofroomDeliveryRuntime()
 
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:                  bookStore,
@@ -52,6 +68,15 @@ func main() {
 		SourceSync:             sourceSync,
 		SourceAgentToken:       *sourceAgentToken,
 		ReverificationCooldown: knowledgeReverificationCooldown(),
+		AuditCoordinator:       auditRuntime.Coordinator,
+		AuditUnavailableReason: auditRuntime.UnavailableReason,
+		AuditMaxBodyBytes:      evidenceAuditMaxBodyBytes(),
+		AuditRetrySigningKey:   retrySigningKey,
+		AuditLogger: func(event app.EvidenceAuditHTTPLogEvent) {
+			log.Printf("evidence audit HTTP error: operation=%s code=%s cause=%s",
+				event.Operation, event.Code, event.Cause)
+		},
+		ProofroomDelivery: proofroomDelivery,
 	})
 
 	log.Printf("dedao kbase server listening on %s", *addr)
@@ -79,8 +104,16 @@ func main() {
 	if !wcplusBaseURLConfiguredFromEnv() {
 		log.Printf("wcplus source: using default local API base http://127.0.0.1:5001")
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	if auditRuntime.Coordinator == nil {
+		log.Printf("evidence audits disabled: %s", auditRuntime.UnavailableReason)
+	} else {
+		log.Printf("evidence audits enabled: workers=%d queue=%d", evidenceAuditWorkerCount(), evidenceAuditQueueSize())
+	}
+	if proofroomDelivery == nil {
+		log.Printf("Proofroom delivery disabled: %s", proofroomUnavailableReason)
+	} else {
+		log.Printf("Proofroom explicit delivery enabled")
+	}
 	var schedulerDone <-chan struct{}
 	if scheduler, schedulerErr := app.NewSourceScheduler(sourceSync, time.Now); schedulerErr != nil {
 		log.Fatalf("initialize source scheduler: %v", schedulerErr)
@@ -90,7 +123,10 @@ func main() {
 	reverificationRunner := app.NewKnowledgeReverificationRunner(bookStore, nil, time.Now, knowledgeReverificationStaleAfter())
 	_, reverificationDone := startKnowledgeReverificationRunner(ctx, knowledgeReverificationTickInterval(), reverificationRunner, log.Printf)
 
-	server := &http.Server{Addr: *addr, Handler: handler}
+	server, err := newKBaseHTTPServer(*addr, handler)
+	if err != nil {
+		log.Fatalf("invalid HTTP server configuration: %v", err)
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -105,9 +141,75 @@ func main() {
 		<-schedulerDone
 	}
 	<-reverificationDone
+	if auditRuntime.Coordinator != nil {
+		shutdownContext, cancel := context.WithTimeout(context.Background(), evidenceAuditShutdownTimeout())
+		if err := auditRuntime.Coordinator.Shutdown(shutdownContext); err != nil {
+			log.Printf("evidence audit coordinator shutdown failed: %v", err)
+		}
+		cancel()
+	}
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
 		log.Fatal(listenErr)
 	}
+}
+
+type evidenceAuditServerRuntime struct {
+	Coordinator       *app.EvidenceAuditCoordinator
+	UnavailableReason string
+}
+
+func newProofroomDeliveryRuntime() (*app.ProofroomDeliveryService, string) {
+	endpoint := strings.TrimSpace(os.Getenv("KBASE_PROOFROOM_ENDPOINT"))
+	token := strings.TrimSpace(os.Getenv("KBASE_PROOFROOM_TOKEN"))
+	if endpoint == "" || token == "" {
+		return nil, "configure KBASE_PROOFROOM_ENDPOINT and KBASE_PROOFROOM_TOKEN"
+	}
+	timeout, err := proofroomDeliveryTimeout()
+	if err != nil {
+		return nil, err.Error()
+	}
+	service, err := app.NewProofroomDeliveryService(app.ProofroomDeliveryConfig{
+		Endpoint: endpoint,
+		Token:    token,
+		Timeout:  timeout,
+	})
+	if err != nil {
+		return nil, err.Error()
+	}
+	return service, ""
+}
+
+func proofroomDeliveryTimeout() (time.Duration, error) {
+	return strictDurationEnvironment("KBASE_PROOFROOM_TIMEOUT_SECONDS", 20, 120)
+}
+
+func newEvidenceAuditServerRuntime(
+	ctx context.Context,
+	store *app.BookKnowledgeStore,
+) evidenceAuditServerRuntime {
+	modelConfig, err := app.LoadBookTokenPlanConfig()
+	if err != nil || strings.TrimSpace(modelConfig.APIKey) == "" {
+		return evidenceAuditServerRuntime{
+			UnavailableReason: "TokenPlan configuration is unavailable; configure DEDAO_TOKENPLAN_API_KEY",
+		}
+	}
+	coordinator, err := app.NewEvidenceAuditCoordinator(app.EvidenceAuditCoordinatorConfig{
+		Store: store, Client: app.NewTokenPlanChatClient(nil),
+		RunnerConfig: app.EvidenceAuditRunnerConfig{ModelConfig: modelConfig},
+		Workers:      evidenceAuditWorkerCount(), QueueSize: evidenceAuditQueueSize(),
+		PollInterval: time.Second,
+		Metrics: func(event app.EvidenceAuditCoordinatorEvent) {
+			log.Printf("evidence audit coordinator: event=%s audit=%s code=%s attempt=%d retry_after=%s",
+				event.Type, event.AuditID, event.ErrorCode, event.Attempt, event.RetryAfter)
+		},
+	})
+	if err != nil {
+		return evidenceAuditServerRuntime{UnavailableReason: "evidence audit coordinator initialization failed: " + err.Error()}
+	}
+	if err := coordinator.Start(ctx); err != nil {
+		return evidenceAuditServerRuntime{UnavailableReason: "evidence audit coordinator startup failed: " + err.Error()}
+	}
+	return evidenceAuditServerRuntime{Coordinator: coordinator}
 }
 
 func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherToken string) error {
@@ -249,6 +351,110 @@ func boundedSecondsEnvironment(key string, fallback, maximum int) time.Duration 
 		seconds = maximum
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+func evidenceAuditWorkerCount() int {
+	return boundedIntegerEnvironment("KBASE_AUDIT_WORKERS", 2, 32)
+}
+
+func evidenceAuditQueueSize() int {
+	return boundedIntegerEnvironment("KBASE_AUDIT_QUEUE_SIZE", 64, 4096)
+}
+
+func evidenceAuditMaxBodyBytes() int64 {
+	return int64(boundedIntegerEnvironment("KBASE_AUDIT_MAX_BODY_BYTES", 64<<10, 1<<20))
+}
+
+func evidenceAuditShutdownTimeout() time.Duration {
+	return time.Duration(boundedIntegerEnvironment("KBASE_AUDIT_SHUTDOWN_SECONDS", 10, 60)) * time.Second
+}
+
+func evidenceAuditRetrySigningKey() ([]byte, error) {
+	value := strings.TrimSpace(os.Getenv("KBASE_AUDIT_RETRY_SIGNING_KEY"))
+	if len(value) < 32 {
+		return nil, errors.New("KBASE_AUDIT_RETRY_SIGNING_KEY must contain at least 32 bytes")
+	}
+	return []byte(value), nil
+}
+
+func newKBaseHTTPServer(addr string, handler http.Handler) (*http.Server, error) {
+	readHeaderTimeout, err := strictDurationEnvironment(
+		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", 5, 60,
+	)
+	if err != nil {
+		return nil, err
+	}
+	readTimeout, err := strictDurationEnvironment("KBASE_HTTP_READ_TIMEOUT_SECONDS", 30, 300)
+	if err != nil {
+		return nil, err
+	}
+	writeTimeout, err := strictDurationEnvironment("KBASE_HTTP_WRITE_TIMEOUT_SECONDS", 120, 300)
+	if err != nil {
+		return nil, err
+	}
+	idleTimeout, err := strictDurationEnvironment("KBASE_HTTP_IDLE_TIMEOUT_SECONDS", 60, 600)
+	if err != nil {
+		return nil, err
+	}
+	maxHeaderBytes, err := strictIntegerEnvironment(
+		"KBASE_HTTP_MAX_HEADER_BYTES", 1<<20, 8<<10, 4<<20,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}, nil
+}
+
+func strictDurationEnvironment(key string, fallback, maximum int) (time.Duration, error) {
+	value, err := strictIntegerEnvironment(key, fallback, 1, maximum)
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(value) * time.Second, nil
+}
+
+func strictIntegerEnvironment(key string, fallback, minimum, maximum int) (int, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < minimum || value > maximum {
+		return 0, fmt.Errorf("%s must be an integer between %d and %d", key, minimum, maximum)
+	}
+	return value, nil
+}
+
+func validateEvidenceAuditRetryKeySeparation(key []byte, bearerTokens ...string) error {
+	for _, token := range bearerTokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
+		}
+		if subtle.ConstantTimeCompare(key, []byte(token)) == 1 {
+			return errors.New("KBASE_AUDIT_RETRY_SIGNING_KEY must differ from bearer tokens")
+		}
+	}
+	return nil
+}
+
+func boundedIntegerEnvironment(key string, fallback, maximum int) int {
+	value, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil || value <= 0 {
+		value = fallback
+	}
+	if value > maximum {
+		value = maximum
+	}
+	return value
 }
 
 func envDefault(key string, fallback string) string {

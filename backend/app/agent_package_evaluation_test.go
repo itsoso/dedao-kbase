@@ -10,6 +10,37 @@ import (
 	"time"
 )
 
+func TestEvidenceAuditPublicationIdentityUsesPublisherNotTransport(t *testing.T) {
+	first := KnowledgeRelease{
+		BookID: "release-a",
+		Book: BookKnowledgeBook{
+			SourceType:    "wechat_mp_article",
+			SourceAccount: "Clinical Evidence Review",
+		},
+	}
+	samePublisherDifferentTransport := KnowledgeRelease{
+		BookID: "release-b",
+		Book: BookKnowledgeBook{
+			SourceType:    "dedao_course_article",
+			SourceAccount: " clinical evidence review ",
+		},
+	}
+	differentPublisherSameTransport := KnowledgeRelease{
+		BookID: "release-c",
+		Book: BookKnowledgeBook{
+			SourceType:    "wechat_mp_article",
+			SourceAccount: "Independent Trial Journal",
+		},
+	}
+
+	if evidenceAuditPublicationIdentity(first) != evidenceAuditPublicationIdentity(samePublisherDifferentTransport) {
+		t.Fatal("the same publisher must keep one publication identity across transport types")
+	}
+	if evidenceAuditPublicationIdentity(first) == evidenceAuditPublicationIdentity(differentPublisherSameTransport) {
+		t.Fatal("different publishers must not collapse into one identity for the same transport type")
+	}
+}
+
 func TestAgentPackageEvaluationDeterministicAdapterCoversRequiredMetrics(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
@@ -364,6 +395,23 @@ func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeSto
 	t.Helper()
 	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	suite := loadAgentEvaluationFixture(t)
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		identity := strings.TrimPrefix(pkg.ContentHash, "sha256:")
+		if len(identity) > 12 {
+			identity = identity[:12]
+		}
+		supported := persistEvidenceAuditEvaluationReport(
+			t, store, pkg, EvidenceAuditVerdictSupported, false, "publish-"+identity+"-supported",
+		)
+		conflicted := persistEvidenceAuditEvaluationReport(
+			t, store, pkg, EvidenceAuditVerdictMixed, true, "publish-"+identity+"-conflicted",
+		)
+		insufficient := persistEvidenceAuditEvaluationReport(
+			t, store, pkg, EvidenceAuditVerdictInsufficient, false, "publish-"+identity+"-insufficient",
+		)
+		auditSuite := evidenceAuditEvaluationSuite(pkg, supported, conflicted, insufficient)
+		suite.Cases = append(suite.Cases, auditSuite.Cases...)
+	}
 	for index := range suite.Cases {
 		if len(suite.Cases[index].ProposedArguments) > 0 {
 			for _, arguments := range []map[string]string{
@@ -393,7 +441,24 @@ func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeSto
 			}
 		}
 	}
-	report, err := EvaluateAgentPackageDeterministically(store, pkg, suite, time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC))
+	now := time.Date(2026, 7, 19, 13, 0, 0, 0, time.UTC)
+	report := AgentEvaluationReport{}
+	var err error
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		trusted := suite
+		trusted.Cases = append([]AgentEvaluationCase(nil), suite.Cases...)
+		for index := range trusted.Cases {
+			if isEvidenceAuditEvaluationMetric(trusted.Cases[index].Metric) {
+				trusted.Cases[index].AuditID = ""
+			}
+		}
+		if err := store.SaveTrustedAgentEvaluationSuite(pkg, trusted); err != nil {
+			t.Fatal(err)
+		}
+		suite, report, err = EvaluateAgentPackageAgainstTrustedSuite(store, pkg, suite, now)
+	} else {
+		report, err = EvaluateAgentPackageDeterministically(store, pkg, suite, now)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

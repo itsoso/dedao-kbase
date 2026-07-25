@@ -41,6 +41,370 @@ func TestAgentPackageValidatesPinnedReleasePoliciesAndCapabilities(t *testing.T)
 	}
 }
 
+func TestAgentPackageV2RequiresEvidencePolicyAndKeepsV1Compatible(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(v1, store, AgentReadOnlyToolIDs()); err != nil {
+		t.Fatalf("v1 package without evidence policy no longer validates: %v", err)
+	}
+
+	v2 := validAgentPackage()
+	v2.SchemaVersion = AgentPackageSchemaVersionV2
+	v2, err = FinalizeAgentPackage(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(v2, store, AgentReadOnlyToolIDs()); err == nil ||
+		!strings.Contains(err.Error(), "evidence_policy") {
+		t.Fatalf("v2 package without evidence policy error = %v", err)
+	}
+
+	saveAgentPackageSupportingRelease(t, store)
+	v1WithPolicy := validAgentPackageV2()
+	v1WithPolicy.SchemaVersion = AgentPackageSchemaVersionV1
+	v1WithPolicy, err = FinalizeAgentPackage(v1WithPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(v1WithPolicy, store, AgentReadOnlyToolIDs()); err == nil ||
+		!strings.Contains(err.Error(), "v1") || !strings.Contains(err.Error(), "evidence_policy") {
+		t.Fatalf("v1 package with evidence policy error = %v", err)
+	}
+}
+
+func TestAgentPackageV2RequiresEvidenceAuditEvaluationThresholds(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	saveAgentPackageSupportingRelease(t, store)
+
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(v1, store, AgentReadOnlyToolIDs()); err != nil {
+		t.Fatalf("v1 package should not require evidence audit thresholds: %v", err)
+	}
+
+	required := []string{
+		"adjudication_consistency",
+		"source_independence",
+		"conflict_detection",
+		"report_citation_completeness",
+		"safe_insufficiency",
+		"proofroom_projection_completeness",
+	}
+	for _, missing := range required {
+		t.Run(missing, func(t *testing.T) {
+			pkg := validAgentPackageV2()
+			delete(pkg.EvaluationPolicy.MinimumScores, missing)
+			finalized, err := FinalizeAgentPackage(pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs())
+			if err == nil || !strings.Contains(err.Error(), missing) {
+				t.Fatalf("missing threshold %q error = %v", missing, err)
+			}
+		})
+	}
+
+	pkg := validAgentPackageV2()
+	pkg.EvaluationPolicy.MinimumScores["safe_insufficiency"] = 0
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs()); err == nil ||
+		!strings.Contains(err.Error(), "safe_insufficiency") ||
+		!strings.Contains(err.Error(), "greater than zero") {
+		t.Fatalf("zero evidence audit threshold error = %v", err)
+	}
+}
+
+func TestAgentPackageV2ValidatesEvidencePolicy(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	saveAgentPackageSupportingRelease(t, store)
+
+	valid, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(valid, store, AgentReadOnlyToolIDs()); err != nil {
+		t.Fatalf("valid v2 package error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*AgentPackage)
+		want string
+	}{
+		{
+			name: "role references unpinned release",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].ReleaseID = "release-unpinned"
+			},
+			want: "pinned",
+		},
+		{
+			name: "role reference is duplicated",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].ReleaseID = "release-1"
+			},
+			want: "duplicate",
+		},
+		{
+			name: "pinned release has no role",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles = pkg.EvidencePolicy.ReleaseRoles[:1]
+				pkg.EvidencePolicy.MinimumIndependentSources = 0
+			},
+			want: "role",
+		},
+		{
+			name: "unsupported release role",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].Role = "background"
+			},
+			want: "role",
+		},
+		{
+			name: "multiple primary releases",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].Role = AgentEvidenceReleasePrimary
+			},
+			want: "exactly one primary",
+		},
+		{
+			name: "primary release is not independent support",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MinimumIndependentSources = 2
+			},
+			want: "independent supporting",
+		},
+		{
+			name: "unsupported verdict",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.AllowedVerdicts = append(pkg.EvidencePolicy.AllowedVerdicts, "likely")
+			},
+			want: "verdict",
+		},
+		{
+			name: "missing verdict",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.AllowedVerdicts = nil
+			},
+			want: "allowed_verdicts",
+		},
+		{
+			name: "invalid max claims",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MaxClaims = 0
+			},
+			want: "max_claims",
+		},
+		{
+			name: "max claims exceeds contract limit",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MaxClaims = 9
+			},
+			want: "max_claims",
+		},
+		{
+			name: "invalid max evidence per claim",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MaxEvidencePerClaim = 0
+			},
+			want: "max_evidence_per_claim",
+		},
+		{
+			name: "max evidence per claim exceeds contract limit",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MaxEvidencePerClaim = 6
+			},
+			want: "max_evidence_per_claim",
+		},
+		{
+			name: "invalid independent source minimum",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.MinimumIndependentSources = -1
+			},
+			want: "minimum_independent_sources",
+		},
+		{
+			name: "release role rejects surrounding whitespace",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReleaseRoles[1].ReleaseID = " release-2 "
+			},
+			want: "canonical",
+		},
+		{
+			name: "invalid freshness policy",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.FreshnessPolicy.MaxAgeDays = 0
+			},
+			want: "freshness_policy.max_age_days",
+		},
+		{
+			name: "invalid report schema",
+			edit: func(pkg *AgentPackage) {
+				pkg.EvidencePolicy.ReportSchema = "freeform"
+			},
+			want: "report_schema",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pkg := validAgentPackageV2()
+			tt.edit(&pkg)
+			finalized, err := FinalizeAgentPackage(pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs())
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ValidateAgentPackage() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestAgentPackageV2CountsIndependentSupportingSourceIdentities(t *testing.T) {
+	tests := []struct {
+		name           string
+		firstType      string
+		secondType     string
+		firstAccount   string
+		secondAccount  string
+		wantValidation string
+	}{
+		{
+			name:           "same normalized account is one source",
+			firstType:      "wechat_mp_article",
+			secondType:     "wechat_mp_article",
+			firstAccount:   " Medical Desk ",
+			secondAccount:  "medical desk",
+			wantValidation: "independent supporting",
+		},
+		{
+			name:           "unknown accounts of same type are one source",
+			firstType:      "wechat_mp_article",
+			secondType:     "wechat_mp_article",
+			firstAccount:   "",
+			secondAccount:  "",
+			wantValidation: "independent supporting",
+		},
+		{
+			name:           "different display names of same type are one source",
+			firstType:      "wechat_mp_article",
+			secondType:     "wechat_mp_article",
+			firstAccount:   "Medical Desk",
+			secondAccount:  "Trial Registry",
+			wantValidation: "independent supporting",
+		},
+		{
+			name:          "different source types are independent",
+			firstType:     "dedao_course_article",
+			secondType:    "wechat_mp_article",
+			firstAccount:  "Medical Desk",
+			secondAccount: "Medical Desk",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			saveAgentPackageTestRelease(t, store)
+			saveAgentPackageSupportingReleaseWithIdentity(
+				t, store, "release-2", "book-2", "citation-2", tt.firstType, tt.firstAccount,
+			)
+			saveAgentPackageSupportingReleaseWithIdentity(
+				t, store, "release-3", "book-3", "citation-3", tt.secondType, tt.secondAccount,
+			)
+
+			pkg := validAgentPackageV2()
+			pkg.RetrievalPolicy.AllowedSourceTypes = append(
+				pkg.RetrievalPolicy.AllowedSourceTypes,
+				"dedao_course_article",
+			)
+			pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
+				ReleaseID:   "release-3",
+				ContentHash: "sha256:release-3-content",
+				CitationIDs: []string{"citation-3"},
+			})
+			pkg.EvidencePolicy.ReleaseRoles = append(pkg.EvidencePolicy.ReleaseRoles, AgentPackageEvidenceReleaseRole{
+				ReleaseID: "release-3",
+				Role:      AgentEvidenceReleaseSupporting,
+			})
+			pkg.EvidencePolicy.MinimumIndependentSources = 2
+			pkg, err := FinalizeAgentPackage(pkg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = ValidateAgentPackage(pkg, store, AgentReadOnlyToolIDs())
+			if tt.wantValidation == "" {
+				if err != nil {
+					t.Fatalf("ValidateAgentPackage() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantValidation) {
+				t.Fatalf("ValidateAgentPackage() error = %v, want %q", err, tt.wantValidation)
+			}
+		})
+	}
+}
+
+func TestAgentPackageHashBindsEvidencePolicy(t *testing.T) {
+	base, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutations := []func(*AgentPackage){
+		func(pkg *AgentPackage) { pkg.EvidencePolicy.MaxClaims++ },
+		func(pkg *AgentPackage) { pkg.EvidencePolicy.MaxEvidencePerClaim++ },
+		func(pkg *AgentPackage) { pkg.EvidencePolicy.MinimumIndependentSources = 0 },
+		func(pkg *AgentPackage) { pkg.EvidencePolicy.FreshnessPolicy.MaxAgeDays++ },
+		func(pkg *AgentPackage) { pkg.EvidencePolicy.FreshnessPolicy.RequirePublicationDate = false },
+		func(pkg *AgentPackage) { pkg.EvidencePolicy.ReportSchema = "evidence-audit.v2" },
+	}
+	for index, mutate := range mutations {
+		changed := validAgentPackageV2()
+		mutate(&changed)
+		changed, err = FinalizeAgentPackage(changed)
+		if err != nil {
+			t.Fatalf("mutation %d: %v", index, err)
+		}
+		if changed.ContentHash == base.ContentHash {
+			t.Fatalf("evidence policy mutation %d did not change package hash", index)
+		}
+	}
+
+	reordered := validAgentPackageV2()
+	reordered.EvidencePolicy.ReleaseRoles[0], reordered.EvidencePolicy.ReleaseRoles[1] =
+		reordered.EvidencePolicy.ReleaseRoles[1], reordered.EvidencePolicy.ReleaseRoles[0]
+	reordered.EvidencePolicy.AllowedVerdicts = []string{
+		AgentEvidenceVerdictInsufficient,
+		AgentEvidenceVerdictMixed,
+		AgentEvidenceVerdictContradicted,
+		AgentEvidenceVerdictSupported,
+	}
+	reordered, err = FinalizeAgentPackage(reordered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reordered.ContentHash != base.ContentHash {
+		t.Fatalf("set-like evidence policy ordering changed hash: %q != %q", reordered.ContentHash, base.ContentHash)
+	}
+}
+
 func TestAgentPackageHashPreservesRuntimeSignificantOrder(t *testing.T) {
 	pkg := validAgentPackage()
 	pkg.ModelPolicy.Fallbacks = []string{"qwen-plus", "qwen-max"}
@@ -289,7 +653,7 @@ func validAgentPackage() AgentPackage {
 		LifecycleState: AgentPackageDraft,
 		Releases: []AgentPackageReleaseRef{{
 			ReleaseID:   "release-1",
-			ContentHash: "sha256:release-content",
+			ContentHash: sha256Fingerprint([]byte("synthetic-release-content")),
 			CitationIDs: []string{"citation-1"},
 		}},
 		RetrievalPolicy: AgentPackageRetrievalPolicy{
@@ -341,10 +705,88 @@ func validAgentPackage() AgentPackage {
 	}
 }
 
+func validAgentPackageV2() AgentPackage {
+	pkg := validAgentPackage()
+	pkg.SchemaVersion = AgentPackageSchemaVersionV2
+	pkg.Version = "2.0.0"
+	pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
+		ReleaseID:   "release-2",
+		ContentHash: sha256Fingerprint([]byte("synthetic-supporting-release-content")),
+		CitationIDs: []string{"citation-2"},
+	})
+	pkg.EvidencePolicy = &AgentPackageEvidencePolicy{
+		ReleaseRoles: []AgentPackageEvidenceReleaseRole{
+			{ReleaseID: "release-1", Role: AgentEvidenceReleasePrimary},
+			{ReleaseID: "release-2", Role: AgentEvidenceReleaseSupporting},
+		},
+		MinimumIndependentSources: 1,
+		MaxClaims:                 8,
+		MaxEvidencePerClaim:       5,
+		AllowedVerdicts: []string{
+			AgentEvidenceVerdictSupported,
+			AgentEvidenceVerdictContradicted,
+			AgentEvidenceVerdictMixed,
+			AgentEvidenceVerdictInsufficient,
+		},
+		FreshnessPolicy: AgentPackageEvidenceFreshnessPolicy{
+			MaxAgeDays:             365,
+			RequirePublicationDate: true,
+		},
+		ReportSchema: AgentEvidenceReportSchemaV1,
+	}
+	for _, metric := range evidenceAuditEvaluationMetrics {
+		pkg.EvaluationPolicy.MinimumScores[metric] = 1
+	}
+	return pkg
+}
+
 func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {
 	t.Helper()
 	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	if err := store.saveKnowledgeRelease(agentPackageTestRelease()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func saveAgentPackageSupportingRelease(t *testing.T, store *BookKnowledgeStore) {
+	t.Helper()
+	saveAgentPackageSupportingReleaseWithIdentity(
+		t, store, "release-2", "book-2", "citation-2", "wechat_mp_article", "",
+	)
+}
+
+func saveAgentPackageSupportingReleaseWithIdentity(
+	t *testing.T,
+	store *BookKnowledgeStore,
+	releaseID string,
+	bookID string,
+	citationID string,
+	sourceType string,
+	sourceAccount string,
+) {
+	t.Helper()
+	release := agentPackageTestRelease()
+	release.ReleaseID = releaseID
+	release.BookID = bookID
+	if releaseID == "release-2" {
+		release.ContentHash = sha256Fingerprint([]byte("synthetic-supporting-release-content"))
+	} else {
+		release.ContentHash = "sha256:" + releaseID + "-content"
+	}
+	release.Book = BookKnowledgeBook{
+		BookID:        bookID,
+		Title:         "Synthetic Supporting Source",
+		SourceType:    sourceType,
+		SourceKey:     "item-" + releaseID,
+		SourceAccount: sourceAccount,
+	}
+	release.Analysis.Claims[0].CitationIDs = []string{citationID}
+	release.Citations = []BookKnowledgeCitation{{
+		CitationID: citationID,
+		BookID:     bookID,
+		ChunkID:    "chunk-" + releaseID,
+	}}
+	if err := store.saveKnowledgeRelease(release); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -355,7 +797,7 @@ func agentPackageTestRelease() KnowledgeRelease {
 		Version:       "1",
 		ReleaseID:     "release-1",
 		BookID:        "book-1",
-		ContentHash:   "sha256:release-content",
+		ContentHash:   sha256Fingerprint([]byte("synthetic-release-content")),
 		UsagePolicy:   BookUsageStandard,
 		Book:          BookKnowledgeBook{BookID: "book-1", Title: "Synthetic Book", SourceType: "dedao_ebook"},
 		Analysis: &BookAnalysisPayload{

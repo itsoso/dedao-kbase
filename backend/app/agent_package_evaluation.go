@@ -27,21 +27,29 @@ type AgentEvaluationSuite struct {
 }
 
 type AgentEvaluationCase struct {
-	CaseID            string            `json:"case_id"`
-	Metric            string            `json:"metric"`
-	Input             string            `json:"input,omitempty"`
-	ExpectedIDs       []string          `json:"expected_ids,omitempty"`
-	ObservedIDs       []string          `json:"-"`
-	ExpectedValue     string            `json:"expected_value,omitempty"`
-	ModelOutput       string            `json:"model_output,omitempty"`
-	ProposedTool      string            `json:"proposed_tool,omitempty"`
-	ProposedArguments map[string]string `json:"proposed_arguments,omitempty"`
-	ObservedValue     string            `json:"-"`
-	ExpectedArguments map[string]string `json:"expected_arguments,omitempty"`
-	ObservedArguments map[string]string `json:"-"`
-	MaxLatencyMS      int               `json:"max_latency_ms,omitempty"`
-	RecordedLatencyMS int               `json:"recorded_latency_ms,omitempty"`
-	MaxCostUSD        float64           `json:"max_cost_usd,omitempty"`
+	CaseID            string                         `json:"case_id"`
+	Metric            string                         `json:"metric"`
+	Input             string                         `json:"input,omitempty"`
+	AuditID           string                         `json:"audit_id,omitempty"`
+	ExpectedClaims    []AgentEvaluationExpectedClaim `json:"expected_claims,omitempty"`
+	ExpectedIDs       []string                       `json:"expected_ids,omitempty"`
+	ObservedIDs       []string                       `json:"-"`
+	ExpectedValue     string                         `json:"expected_value,omitempty"`
+	ModelOutput       string                         `json:"model_output,omitempty"`
+	ProposedTool      string                         `json:"proposed_tool,omitempty"`
+	ProposedArguments map[string]string              `json:"proposed_arguments,omitempty"`
+	ObservedValue     string                         `json:"-"`
+	ExpectedArguments map[string]string              `json:"expected_arguments,omitempty"`
+	ObservedArguments map[string]string              `json:"-"`
+	MaxLatencyMS      int                            `json:"max_latency_ms,omitempty"`
+	RecordedLatencyMS int                            `json:"recorded_latency_ms,omitempty"`
+	MaxCostUSD        float64                        `json:"max_cost_usd,omitempty"`
+}
+
+type AgentEvaluationExpectedClaim struct {
+	ClaimIdentity string `json:"claim_identity"`
+	Verdict       string `json:"verdict,omitempty"`
+	Conflict      *bool  `json:"conflict,omitempty"`
 }
 
 type AgentEvaluationReport struct {
@@ -49,6 +57,7 @@ type AgentEvaluationReport struct {
 	PackageID          string                           `json:"package_id"`
 	PackageContentHash string                           `json:"package_content_hash"`
 	SuiteVersion       string                           `json:"suite_version"`
+	TrustedSuiteHash   string                           `json:"trusted_suite_hash,omitempty"`
 	InputHash          string                           `json:"input_hash"`
 	EvaluatorVersion   string                           `json:"evaluator_version"`
 	RetrievalIdentity  AgentEvaluationRetrievalIdentity `json:"retrieval_identity"`
@@ -127,7 +136,28 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 	}, nil
 }
 
+func EvaluateAgentPackageAgainstTrustedSuite(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	submitted AgentEvaluationSuite,
+	now time.Time,
+) (AgentEvaluationSuite, AgentEvaluationReport, error) {
+	resolved, trustedSuiteHash, err := store.ResolveTrustedAgentEvaluationSuite(pkg, submitted)
+	if err != nil {
+		return AgentEvaluationSuite{}, AgentEvaluationReport{}, err
+	}
+	report, err := EvaluateAgentPackageDeterministically(store, pkg, resolved, now)
+	if err != nil {
+		return AgentEvaluationSuite{}, AgentEvaluationReport{}, err
+	}
+	report.TrustedSuiteHash = trustedSuiteHash
+	return resolved, report, nil
+}
+
 func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
+	if isEvidenceAuditEvaluationMetric(evalCase.Metric) {
+		return executeEvidenceAuditEvaluationCase(store, pkg, evalCase)
+	}
 	input := strings.TrimSpace(evalCase.Input)
 	if input == "" {
 		return false, fmt.Errorf("input is required for behavioral metric %q", evalCase.Metric)
@@ -251,6 +281,391 @@ func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, eva
 	default:
 		return false, fmt.Errorf("unsupported behavioral metric %q", evalCase.Metric)
 	}
+}
+
+func isEvidenceAuditEvaluationMetric(metric string) bool {
+	switch metric {
+	case "adjudication_consistency",
+		"source_independence",
+		"conflict_detection",
+		"report_citation_completeness",
+		"safe_insufficiency",
+		"proofroom_projection_completeness":
+		return true
+	default:
+		return false
+	}
+}
+
+func executeEvidenceAuditEvaluationCase(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	evalCase AgentEvaluationCase,
+) (bool, error) {
+	auditID := strings.TrimSpace(evalCase.AuditID)
+	if auditID == "" {
+		return false, fmt.Errorf("audit_id is required for behavioral metric %q", evalCase.Metric)
+	}
+	audit, err := store.LoadEvidenceAuditSnapshot(auditID)
+	if err != nil {
+		return false, fmt.Errorf("load completed evidence audit: %w", err)
+	}
+	if audit.Status != EvidenceAuditCompleted {
+		return false, fmt.Errorf("evidence audit %q is not completed", auditID)
+	}
+	trace, err := store.LoadAgentTrace(audit.TraceID)
+	if err != nil {
+		return false, fmt.Errorf("load completed evidence audit trace: %w", err)
+	}
+	if !evidenceAuditMatchesEvaluationPackage(store, pkg, *audit, *trace) ||
+		ValidateEvidenceAudit(*audit) != nil {
+		return false, nil
+	}
+
+	switch evalCase.Metric {
+	case "adjudication_consistency":
+		return evidenceAuditExpectedClaimsMatch(*audit, evalCase.ExpectedClaims, true, false), nil
+	case "source_independence":
+		assessed := false
+		for _, claim := range audit.ClaimAudits {
+			if claim.Verdict == EvidenceAuditVerdictInsufficient {
+				continue
+			}
+			assessed = true
+			publications := map[string]struct{}{}
+			for _, evidence := range claim.Evidence {
+				if evidence.Role == EvidenceAuditReleaseSupporting {
+					publications[strings.TrimSpace(evidence.PublicationIdentity)] = struct{}{}
+				}
+			}
+			if len(publications) < audit.EvidencePolicy.MinimumIndependentSources {
+				return false, nil
+			}
+		}
+		return assessed, nil
+	case "conflict_detection":
+		return evidenceAuditExpectedClaimsMatch(*audit, evalCase.ExpectedClaims, false, true), nil
+	case "report_citation_completeness":
+		return evidenceAuditCitationsComplete(*audit), nil
+	case "safe_insufficiency":
+		found := false
+		for _, claim := range audit.ClaimAudits {
+			if claim.Verdict != EvidenceAuditVerdictInsufficient {
+				continue
+			}
+			found = true
+			if len(claim.Limitations) == 0 || len(claim.KnowledgeGaps) == 0 ||
+				len(claim.ReviewActions) == 0 {
+				return false, nil
+			}
+			publications := map[string]struct{}{}
+			for _, evidence := range claim.Evidence {
+				if evidence.Role == EvidenceAuditReleaseSupporting {
+					publications[strings.TrimSpace(evidence.PublicationIdentity)] = struct{}{}
+				}
+			}
+			if len(publications) >= audit.EvidencePolicy.MinimumIndependentSources {
+				return false, nil
+			}
+		}
+		return found, nil
+	case "proofroom_projection_completeness":
+		preview, err := BuildProofroomEvidenceAuditProjection(*audit)
+		if err != nil {
+			return false, nil
+		}
+		return evidenceAuditProofroomProjectionComplete(*audit, preview.Payload), nil
+	default:
+		return false, fmt.Errorf("unsupported evidence audit metric %q", evalCase.Metric)
+	}
+}
+
+func evidenceAuditMatchesEvaluationPackage(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	audit EvidenceAudit,
+	trace AgentTrace,
+) bool {
+	if store == nil ||
+		audit.Status != EvidenceAuditCompleted ||
+		strings.TrimSpace(audit.OutputHash) == "" ||
+		strings.TrimSpace(audit.TraceID) == "" ||
+		trace.TraceID != audit.TraceID ||
+		trace.Package != (AgentTracePackageRef{
+			PackageID: pkg.PackageID, Version: pkg.Version, ContentHash: pkg.ContentHash,
+		}) ||
+		trace.EvidenceAudit == nil ||
+		trace.EvidenceAudit.AuditID != audit.AuditID ||
+		trace.EvidenceAudit.InputHash != audit.InputHash ||
+		(trace.Final.Outcome != AgentTraceOutcomeCompleted &&
+			trace.Final.Outcome != AgentTraceOutcomeAbstained) {
+		return false
+	}
+	fingerprint, err := evidenceAuditReportFingerprint(audit)
+	if err != nil || trace.Final.ResponseFingerprint != fingerprint {
+		return false
+	}
+	if audit.Package.PackageID != pkg.PackageID ||
+		audit.Package.Version != pkg.Version ||
+		audit.Package.ContentHash != pkg.ContentHash {
+		return false
+	}
+	releases := make(map[string]KnowledgeRelease, len(pkg.Releases))
+	packageReleases := make(map[string]AgentPackageReleaseRef, len(pkg.Releases))
+	for _, release := range pkg.Releases {
+		packageReleases[release.ReleaseID] = release
+		stored, loadErr := store.LoadKnowledgeRelease(release.ReleaseID)
+		if loadErr != nil ||
+			agentTraceReleaseContentHash(stored.ContentHash) !=
+				agentTraceReleaseContentHash(release.ContentHash) {
+			return false
+		}
+		releases[release.ReleaseID] = *stored
+	}
+	expectedReleases, err := evidenceAuditInputReleaseRefs(pkg, releases)
+	if err != nil || !reflect.DeepEqual(expectedReleases, audit.Releases) {
+		return false
+	}
+	traceReleases := make(map[string]AgentTraceReleaseRef, len(trace.Releases))
+	for _, release := range trace.Releases {
+		if _, duplicated := traceReleases[release.ReleaseID]; duplicated {
+			return false
+		}
+		traceReleases[release.ReleaseID] = release
+	}
+	for releaseID, pinned := range packageReleases {
+		traced, ok := traceReleases[releaseID]
+		if !ok ||
+			agentTraceReleaseContentHash(traced.ContentHash) !=
+				agentTraceReleaseContentHash(pinned.ContentHash) {
+			return false
+		}
+	}
+	if len(traceReleases) != len(packageReleases) {
+		return false
+	}
+	if trace.ModelRoute.Provider != audit.Model.Provider ||
+		trace.ModelRoute.Model != audit.Model.Model ||
+		trace.RetrievalRoute.Strategy != audit.Retrieval.Strategy {
+		return false
+	}
+	return evidenceAuditCitationsMatchStoredReleases(releases, audit)
+}
+
+func evidenceAuditCitationsMatchStoredReleases(
+	stored map[string]KnowledgeRelease,
+	audit EvidenceAudit,
+) bool {
+	releases := make(map[string]EvidenceAuditReleaseRef, len(audit.Releases))
+	for _, release := range audit.Releases {
+		releases[release.ReleaseID] = release
+		actual, ok := stored[release.ReleaseID]
+		if !ok {
+			return false
+		}
+		expectedSourceType := strings.ToLower(strings.TrimSpace(actual.Book.SourceType))
+		if release.SourceType != expectedSourceType ||
+			release.PublicationIdentity != evidenceAuditPublicationIdentity(actual) {
+			return false
+		}
+		claims := make(map[string]BookAnalysisClaim)
+		if actual.Analysis == nil {
+			return false
+		}
+		for _, claim := range actual.Analysis.Claims {
+			claims[claim.ID] = claim
+		}
+		citations := make(map[string]BookKnowledgeCitation)
+		for _, citation := range actual.Citations {
+			citations[citation.CitationID] = citation
+		}
+		for _, ref := range release.Citations {
+			claim, claimOK := claims[ref.ClaimID]
+			citation, citationOK := citations[ref.CitationID]
+			if !claimOK || !citationOK ||
+				citation.ChunkID != ref.ChunkID ||
+				!stringBoolSet(resolveAgentClaimCitationIDs(actual.Citations, claim.CitationIDs)...)[ref.CitationID] {
+				return false
+			}
+		}
+	}
+	for _, claim := range audit.ClaimAudits {
+		if claim.Verdict != EvidenceAuditVerdictInsufficient && len(claim.Evidence) == 0 {
+			return false
+		}
+		for _, evidence := range claim.Evidence {
+			release, ok := releases[evidence.ReleaseID]
+			if !ok || release.ContentHash != evidence.ContentHash ||
+				release.Role != evidence.Role || release.SourceType != evidence.SourceType ||
+				release.PublicationIdentity != evidence.PublicationIdentity ||
+				!evidenceAuditReleaseAllowsCitation(release, evidence) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func evidenceAuditCitationsComplete(audit EvidenceAudit) bool {
+	releases := make(map[string]EvidenceAuditReleaseRef, len(audit.Releases))
+	for _, release := range audit.Releases {
+		releases[release.ReleaseID] = release
+	}
+	for _, claim := range audit.ClaimAudits {
+		if claim.Verdict != EvidenceAuditVerdictInsufficient && len(claim.Evidence) == 0 {
+			return false
+		}
+		for _, evidence := range claim.Evidence {
+			release, ok := releases[evidence.ReleaseID]
+			if !ok || release.ContentHash != evidence.ContentHash ||
+				release.Role != evidence.Role || release.SourceType != evidence.SourceType ||
+				release.PublicationIdentity != evidence.PublicationIdentity ||
+				!evidenceAuditReleaseAllowsCitation(release, evidence) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func evidenceAuditPublicationIdentity(release KnowledgeRelease) string {
+	publisher := strings.ToLower(strings.TrimSpace(release.Book.SourceAccount))
+	if publisher == "" {
+		publisher = strings.ToLower(strings.TrimSpace(release.Book.Author))
+	}
+	if publisher == "" {
+		publisher = strings.ToLower(strings.TrimSpace(release.BookID))
+	}
+	return sha256Fingerprint([]byte(publisher))
+}
+
+func evidenceAuditClaimIdentity(sourceClaim string) string {
+	return sha256Fingerprint([]byte(strings.TrimSpace(sourceClaim)))
+}
+
+func evidenceAuditExpectedClaimsMatch(
+	audit EvidenceAudit,
+	expected []AgentEvaluationExpectedClaim,
+	requireVerdict bool,
+	requireConflict bool,
+) bool {
+	if len(expected) == 0 || len(expected) != len(audit.ClaimAudits) {
+		return false
+	}
+	actual := make(map[string]EvidenceAuditClaim, len(audit.ClaimAudits))
+	for _, claim := range audit.ClaimAudits {
+		identity := evidenceAuditClaimIdentity(claim.SourceClaim)
+		if _, exists := actual[identity]; exists {
+			return false
+		}
+		actual[identity] = claim
+	}
+	seen := make(map[string]bool, len(expected))
+	for _, gold := range expected {
+		identity := strings.TrimSpace(gold.ClaimIdentity)
+		claim, ok := actual[identity]
+		if identity == "" || !ok || seen[identity] {
+			return false
+		}
+		seen[identity] = true
+		if requireVerdict {
+			if strings.TrimSpace(gold.Verdict) == "" || claim.Verdict != gold.Verdict {
+				return false
+			}
+		}
+		if requireConflict {
+			if gold.Conflict == nil || strings.TrimSpace(gold.Verdict) == "" ||
+				claim.Verdict != gold.Verdict {
+				return false
+			}
+			hasConflict := false
+			for _, evidence := range claim.Evidence {
+				hasConflict = hasConflict || evidence.Conflict
+			}
+			if hasConflict != *gold.Conflict {
+				return false
+			}
+			if hasConflict &&
+				claim.Verdict != EvidenceAuditVerdictMixed &&
+				claim.Verdict != EvidenceAuditVerdictContradicted {
+				return false
+			}
+			if !hasConflict && claim.Verdict == EvidenceAuditVerdictMixed {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func evidenceAuditProofroomProjectionComplete(
+	audit EvidenceAudit,
+	actual ProofroomEvidenceAuditProjection,
+) bool {
+	claims := make([]ProofroomEvidenceAuditClaim, 0, len(audit.ClaimAudits))
+	for _, claim := range audit.ClaimAudits {
+		statement, err := proofroomMinimizeText(claim.NormalizedStatement)
+		if err != nil {
+			return false
+		}
+		limitations, err := proofroomMinimizeTexts(claim.Limitations)
+		if err != nil {
+			return false
+		}
+		gaps, err := proofroomMinimizeTexts(claim.KnowledgeGaps)
+		if err != nil {
+			return false
+		}
+		actions, err := proofroomMinimizeTexts(claim.ReviewActions)
+		if err != nil {
+			return false
+		}
+		claims = append(claims, ProofroomEvidenceAuditClaim{
+			SourceClaimIdentity: proofroomPrivateTextIdentity("source_claim", claim.SourceClaim),
+			NormalizedStatement: statement,
+			Verdict:             claim.Verdict,
+			ComputedConfidence:  claim.ComputedConfidence,
+			Evidence:            proofroomEvidenceRefs(claim.Evidence),
+			Limitations:         limitations,
+			KnowledgeGaps:       gaps,
+			ReviewActions:       actions,
+		})
+	}
+	conclusion, err := proofroomMinimizeText(audit.Summary.Conclusion)
+	if err != nil {
+		return false
+	}
+	summaryLimitations, err := proofroomMinimizeTexts(audit.Summary.Limitations)
+	if err != nil {
+		return false
+	}
+	title, err := proofroomMinimizeText(audit.Proofroom.Title)
+	if err != nil {
+		return false
+	}
+	reviewItems, err := proofroomMinimizeTexts(audit.Proofroom.ReviewItems)
+	if err != nil {
+		return false
+	}
+	expected := ProofroomEvidenceAuditProjection{
+		SchemaVersion: ProofroomEvidenceAuditSchemaVersion,
+		Audit: ProofroomAuditIdentity{
+			AuditID: audit.AuditID, InputHash: audit.InputHash, OutputHash: audit.OutputHash,
+		},
+		Package:         audit.Package,
+		TraceID:         audit.TraceID,
+		SubjectIdentity: proofroomPrivateTextIdentity("subject", audit.Subject),
+		ScopeIdentity:   proofroomPrivateTextIdentity("scope", audit.Scope),
+		Claims:          claims,
+		Summary: ProofroomEvidenceAuditSummary{
+			Conclusion: conclusion, VerdictCounts: cloneProofroomVerdictCounts(audit.Summary.VerdictCounts),
+			Limitations: summaryLimitations,
+		},
+		Proofroom:             ProofroomReviewContract{Title: title, ReviewItems: reviewItems},
+		AdjudicationAuthority: "proofroom",
+		KBaseDecisionFinal:    false,
+	}
+	return reflect.DeepEqual(expected, actual)
 }
 
 type agentEvaluationModelClient struct {
@@ -399,7 +814,12 @@ func (s *BookKnowledgeStore) SaveAgentPackageEvaluation(pkg AgentPackage, suite 
 	if err != nil {
 		return fmt.Errorf("evaluation evaluated_at is invalid: %w", err)
 	}
-	expected, err := EvaluateAgentPackageDeterministically(s, pkg, suite, evaluatedAt)
+	expected := AgentEvaluationReport{}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		_, expected, err = EvaluateAgentPackageAgainstTrustedSuite(s, pkg, suite, evaluatedAt)
+	} else {
+		expected, err = EvaluateAgentPackageDeterministically(s, pkg, suite, evaluatedAt)
+	}
 	if err != nil {
 		return err
 	}
@@ -444,6 +864,44 @@ func (s *BookKnowledgeStore) SaveAgentPackageEvaluation(pkg AgentPackage, suite 
 		return err
 	}
 	return writeFileAtomically(s.AgentPackageEvaluationPath(report.PackageContentHash), payload)
+}
+
+func (s *BookKnowledgeStore) MigrateLegacyTrustedAgentPackageEvaluation(
+	pkg AgentPackage,
+	suite AgentEvaluationSuite,
+	evaluatedAt time.Time,
+) (*AgentEvaluationReport, error) {
+	if pkg.SchemaVersion != AgentPackageSchemaVersionV2 {
+		return nil, fmt.Errorf("legacy trusted evaluation migration requires agent-package.v2")
+	}
+	resolved, expected, err := EvaluateAgentPackageAgainstTrustedSuite(s, pkg, suite, evaluatedAt)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var existing AgentEvaluationReport
+	if err := readJSONFile(s.AgentPackageEvaluationPath(pkg.ContentHash), &existing); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(existing.TrustedSuiteHash) != "" {
+		return nil, fmt.Errorf("trusted agent package evaluation is immutable")
+	}
+	var existingSuite AgentEvaluationSuite
+	if err := readJSONFile(s.AgentPackageEvaluationSuitePath(pkg.ContentHash), &existingSuite); err != nil {
+		return nil, err
+	}
+	if !reflect.DeepEqual(existingSuite, resolved) {
+		return nil, fmt.Errorf("legacy evaluation suite does not match trusted evaluation suite")
+	}
+	payload, err := encodeJSONFile(expected)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomically(s.AgentPackageEvaluationPath(pkg.ContentHash), payload); err != nil {
+		return nil, err
+	}
+	return &expected, nil
 }
 
 func (s *BookKnowledgeStore) LoadAgentPackageEvaluationSuite(packageContentHash string) (*AgentEvaluationSuite, error) {
@@ -503,7 +961,12 @@ func ValidateAgentPackageEvaluationGate(store *BookKnowledgeStore, pkg AgentPack
 	if err != nil {
 		return fmt.Errorf("load trusted evaluation suite: %w", err)
 	}
-	expected, err := EvaluateAgentPackageDeterministically(store, pkg, *suite, evaluatedAt)
+	expected := AgentEvaluationReport{}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+		_, expected, err = EvaluateAgentPackageAgainstTrustedSuite(store, pkg, *suite, evaluatedAt)
+	} else {
+		expected, err = EvaluateAgentPackageDeterministically(store, pkg, *suite, evaluatedAt)
+	}
 	if err != nil {
 		return fmt.Errorf("recompute trusted evaluation: %w", err)
 	}

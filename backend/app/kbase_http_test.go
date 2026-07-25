@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,6 +71,69 @@ func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
 	}
 	if len(payload.Packages) != 0 {
 		t.Fatalf("empty package list = %#v", payload.Packages)
+	}
+}
+
+func TestKBaseHTTPHandlerServesAuthenticatedAgentTraceWithoutPrivateFields(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	trace := agentTraceTestTrace()
+	trace.PrivatePrompt = "must-not-leave-store"
+	trace.SourceBodies = []string{"private source body"}
+	trace.Credentials = "secret credential"
+	if err := store.SaveAgentTrace(trace); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+	path := "/api/agent-traces/" + url.PathEscape(trace.TraceID)
+
+	unauthorized := requestKBase(handler, http.MethodGet, path, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized trace status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(handler, http.MethodGet, path, "consumer-token")
+	if response.Code != http.StatusOK {
+		t.Fatalf("trace status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"trace_id":"`+trace.TraceID+`"`) ||
+		strings.Contains(body, "must-not-leave-store") ||
+		strings.Contains(body, "private source body") ||
+		strings.Contains(body, "secret credential") {
+		t.Fatalf("trace response exposed invalid content: %s", body)
+	}
+}
+
+func TestKBaseHTTPHandlerResolvesCitationIdentityWithoutSourcePath(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+	response := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/citations/42-citation-1?book_id=42",
+		"consumer-token",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("citation status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"citation_id":"42-citation-1"`) ||
+		!strings.Contains(body, `"chunk_id":"42-chunk-1"`) ||
+		strings.Contains(body, "/tmp/book.html") ||
+		strings.Contains(body, "source_html") ||
+		strings.Contains(body, "source_account") ||
+		strings.Contains(body, "source_item_key") ||
+		strings.Contains(body, `"anchor"`) ||
+		strings.Contains(body, `"note"`) {
+		t.Fatalf("citation response is not a safe exact locator: %s", body)
 	}
 }
 
@@ -178,6 +244,23 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 			t.Fatalf("%s evaluation status=%d body=%s", name, response.Code, response.Body.String())
 		}
 	}
+	var forged map[string]any
+	if err := json.Unmarshal(payload, &forged); err != nil {
+		t.Fatal(err)
+	}
+	cases := forged["suite"].(map[string]any)["cases"].([]any)
+	cases[0].(map[string]any)["evidence_audit"] = map[string]any{"status": EvidenceAuditCompleted}
+	forgedPayload, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected := requestJSONKBase(
+		handler, http.MethodPost, "/api/agent-packages/evaluate",
+		"publisher-token", string(forgedPayload),
+	)
+	if rejected.Code != http.StatusBadRequest {
+		t.Fatalf("embedded evidence audit status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
 	evaluated := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(payload))
 	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"created":true`) ||
 		!strings.Contains(evaluated.Body.String(), `"passed":true`) {
@@ -197,6 +280,125 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishPayload))
 	if published.Code != http.StatusCreated {
 		t.Fatalf("publish evaluated package status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerSeparatesTrustedGoldInstallationFromPublisherEvaluation(t *testing.T) {
+	store, pkg := evidenceAuditEvaluationStore(t)
+	supported := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "http-trusted-supported")
+	conflicted := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictMixed, true, "http-trusted-conflicted")
+	insufficient := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictInsufficient, false, "http-trusted-insufficient")
+	submitted := evidenceAuditEvaluationSuite(pkg, supported, conflicted, insufficient)
+	trusted := submitted
+	trusted.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	for index := range trusted.Cases {
+		trusted.Cases[index].AuditID = ""
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "admin-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	trustPayload, err := json.Marshal(AgentPackageTrustedEvaluationSuiteRequest{
+		Package: pkg,
+		Suite:   trusted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisherTrust := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluation-suites/trust",
+		"publisher-token",
+		string(trustPayload),
+	)
+	if publisherTrust.Code != http.StatusUnauthorized {
+		t.Fatalf("publisher installed trusted gold status=%d body=%s", publisherTrust.Code, publisherTrust.Body.String())
+	}
+	adminTrust := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluation-suites/trust",
+		"admin-token",
+		string(trustPayload),
+	)
+	if adminTrust.Code != http.StatusCreated || !strings.Contains(adminTrust.Body.String(), `"trusted":true`) {
+		t.Fatalf("admin trusted suite status=%d body=%s", adminTrust.Code, adminTrust.Body.String())
+	}
+
+	tampered := submitted
+	tampered.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	tampered.Cases[0].ExpectedClaims = append(
+		[]AgentEvaluationExpectedClaim(nil),
+		submitted.Cases[0].ExpectedClaims...,
+	)
+	tampered.Cases[0].ExpectedClaims[0].Verdict = EvidenceAuditVerdictContradicted
+	evaluatePayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: tampered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluate",
+		"publisher-token",
+		string(evaluatePayload),
+	)
+	if evaluated.Code != http.StatusBadRequest || !strings.Contains(evaluated.Body.String(), "trusted evaluation suite") {
+		t.Fatalf("tampered publisher gold status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	if _, err := store.LoadAgentPackageEvaluation(pkg.ContentHash); !os.IsNotExist(err) {
+		t.Fatalf("tampered evaluation persisted sidecar: %v", err)
+	}
+
+	legacyReport, err := EvaluateAgentPackageDeterministically(
+		store,
+		pkg,
+		submitted,
+		testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySuitePayload, err := encodeJSONFile(submitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReportPayload, err := encodeJSONFile(legacyReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.AgentPackageEvaluationDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(store.AgentPackageEvaluationSuitePath(pkg.ContentHash), legacySuitePayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(store.AgentPackageEvaluationPath(pkg.ContentHash), legacyReportPayload); err != nil {
+		t.Fatal(err)
+	}
+	validPayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: submitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrated := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluate",
+		"publisher-token",
+		string(validPayload),
+	)
+	if migrated.Code != http.StatusOK ||
+		!strings.Contains(migrated.Body.String(), `"migrated":true`) {
+		t.Fatalf("legacy trusted evaluation migration status=%d body=%s", migrated.Code, migrated.Body.String())
+	}
+	stored, err := store.LoadAgentPackageEvaluation(pkg.ContentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.TrustedSuiteHash == "" {
+		t.Fatal("legacy evaluation migration did not persist trusted_suite_hash")
 	}
 }
 
@@ -256,6 +458,621 @@ func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	missingDetail := requestKBase(handler, http.MethodGet, "/api/dedao/course", "secret-token")
 	if missingDetail.Code != http.StatusBadRequest {
 		t.Fatalf("missing course detail enid status=%d body=%s", missingDetail.Code, missingDetail.Body.String())
+	}
+}
+
+type recordingEvidenceAuditEnqueuer struct {
+	mu       sync.Mutex
+	auditIDs []string
+	err      error
+}
+
+func (e *recordingEvidenceAuditEnqueuer) Enqueue(auditID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auditIDs = append(e.auditIDs, auditID)
+	return e.err
+}
+
+func TestKBaseHTTPHandlerCreatesListsAndLoadsEvidenceAuditsAsynchronously(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
+	queue := &recordingEvidenceAuditEnqueuer{}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditMaxBodyBytes: 4096, AuditRetrySigningKey: []byte("test-retry-signing-key-32-bytes!!"),
+	})
+	body := `{"subject":"Trial claim","scope":"Population evidence comparison","selected_claims":["Synthetic grounded statement"],"idempotency_key":"audit-http-1"}`
+	created := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version, "consumer-a", body)
+	if created.Code != http.StatusAccepted || !strings.Contains(created.Body.String(), `"status":"queued"`) {
+		t.Fatalf("create audit status=%d body=%s", created.Code, created.Body.String())
+	}
+	var createdPayload struct {
+		Created bool           `json:"created"`
+		Audit   *EvidenceAudit `json:"audit"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdPayload); err != nil || createdPayload.Audit == nil {
+		t.Fatalf("decode created audit: payload=%#v err=%v", createdPayload, err)
+	}
+	replayed := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version, "consumer-a", body)
+	if replayed.Code != http.StatusAccepted || !strings.Contains(replayed.Body.String(), `"created":false`) ||
+		!strings.Contains(replayed.Body.String(), createdPayload.Audit.AuditID) {
+		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	listed := requestKBase(handler, http.MethodGet, "/api/agent-audits?package_id="+pkg.PackageID+"&version="+pkg.Version, "consumer-a")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), createdPayload.Audit.AuditID) {
+		t.Fatalf("list status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	packageList := requestKBase(handler, http.MethodGet, "/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version, "consumer-a")
+	if packageList.Code != http.StatusOK || !strings.Contains(packageList.Body.String(), createdPayload.Audit.AuditID) {
+		t.Fatalf("package list status=%d body=%s", packageList.Code, packageList.Body.String())
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/agent-audits/"+createdPayload.Audit.AuditID, "consumer-a")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"selected_claims":["Synthetic grounded statement"]`) {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	otherBearer := requestKBase(handler, http.MethodGet, "/api/agent-audits/"+createdPayload.Audit.AuditID, "consumer-b")
+	if otherBearer.Code != http.StatusUnauthorized {
+		t.Fatalf("other bearer status=%d body=%s", otherBearer.Code, otherBearer.Body.String())
+	}
+	if len(queue.auditIDs) != 2 || queue.auditIDs[0] != createdPayload.Audit.AuditID {
+		t.Fatalf("enqueued audit IDs = %#v", queue.auditIDs)
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditValidationAndAvailabilityErrors(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	base := KBaseHTTPConfig{
+		Store: store, AuthToken: "secret-token", AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+		AuditMaxBodyBytes: 128,
+	}
+	handler := NewKBaseHTTPHandler(base)
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{name: "invalid json", method: http.MethodPost, path: path, body: `{`, status: http.StatusBadRequest},
+		{name: "missing version", method: http.MethodPost, path: "/api/agent-packages/" + pkg.PackageID + "/audits", body: `{}`, status: http.StatusBadRequest},
+		{name: "invalid version", method: http.MethodPost, path: "/api/agent-packages/" + pkg.PackageID + "/audits?version=bad%2Fversion", body: `{}`, status: http.StatusBadRequest},
+		{name: "missing package", method: http.MethodPost, path: "/api/agent-packages/missing/audits?version=2.0.0", body: `{"subject":"x","scope":"y","idempotency_key":"z"}`, status: http.StatusNotFound},
+		{name: "too many claims", method: http.MethodPost, path: path, body: `{"subject":"x","scope":"y","selected_claims":["Synthetic grounded statement","Primary claim two"],"idempotency_key":"too-many"}`, status: http.StatusUnprocessableEntity},
+		{name: "body too large", method: http.MethodPost, path: path, body: `{"subject":"` + strings.Repeat("x", 256) + `","scope":"y","idempotency_key":"large"}`, status: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := requestJSONKBase(handler, test.method, test.path, "secret-token", test.body)
+			if response.Code != test.status {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.status, response.Body.String())
+			}
+		})
+	}
+
+	unconfigured := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "secret-token", AuditUnavailableReason: "TokenPlan API key is not configured",
+	})
+	response := requestJSONKBase(unconfigured, http.MethodPost, path, "secret-token", `{"subject":"x","scope":"y","idempotency_key":"unavailable"}`)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"audit_service_unavailable"`) {
+		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
+	}
+	missingAudit := requestKBase(handler, http.MethodGet, "/api/agent-audits/missing-audit", "secret-token")
+	if missingAudit.Code != http.StatusNotFound {
+		t.Fatalf("missing audit status=%d body=%s", missingAudit.Code, missingAudit.Body.String())
+	}
+
+	v1Store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, v1Store)
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, v1Store, v1)
+	publishedV1, _, err := PublishAgentPackage(
+		v1Store, v1, "publish-http-v1", AgentReadOnlyToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: v1Store, AuthToken: "secret-token", AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	v1Response := requestJSONKBase(
+		v1Handler, http.MethodPost,
+		"/api/agent-packages/"+publishedV1.PackageID+"/audits?version="+publishedV1.Version,
+		"secret-token", `{"subject":"x","scope":"y","idempotency_key":"v1"}`,
+	)
+	if v1Response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("v1 package status=%d body=%s", v1Response.Code, v1Response.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditIdempotencyConflictAndManualRetry(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	queue := &recordingEvidenceAuditEnqueuer{}
+	now := testAgentPackageTime().Add(4 * time.Hour)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditRetrySigningKey: []byte("test-retry-signing-key-32-bytes!!"),
+		AuditNow:             func() time.Time { return now },
+	})
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	first := requestJSONKBase(handler, http.MethodPost, path, "consumer-a", `{"subject":"one","scope":"Population evidence comparison","idempotency_key":"same-key"}`)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("create status=%d body=%s", first.Code, first.Body.String())
+	}
+	conflict := requestJSONKBase(handler, http.MethodPost, path, "consumer-a", `{"subject":"different","scope":"Population evidence comparison","idempotency_key":"same-key"}`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("idempotency conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+
+	var payload struct {
+		Audit EvidenceAudit `json:"audit"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, payload.Audit.AuditID, "trace-http-retry", testAgentPackageTime().Add(5*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FailEvidenceAudit(store, payload.Audit.AuditID, "model_outcome_unknown", "manual retry required", testAgentPackageTime().Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	now = testAgentPackageTime().Add(7 * time.Hour)
+	retryPath := "/api/agent-audits/" + payload.Audit.AuditID + "/retry"
+	retry := httptest.NewRequest(http.MethodPost, retryPath, nil)
+	retry.Header.Set("Authorization", "Bearer consumer-a")
+	retry.Header.Set("Idempotency-Key", "retry-http-1")
+	retryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(retryResponse, retry)
+	if retryResponse.Code != http.StatusAccepted || !strings.Contains(retryResponse.Body.String(), `"retry_of":"`+payload.Audit.AuditID+`"`) {
+		t.Fatalf("retry status=%d body=%s", retryResponse.Code, retryResponse.Body.String())
+	}
+	now = now.Add(20 * time.Minute)
+	replayed := httptest.NewRequest(http.MethodPost, retryPath, nil)
+	replayed.Header.Set("Authorization", "Bearer consumer-a")
+	replayed.Header.Set("Idempotency-Key", "retry-http-1")
+	replayedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayedResponse, replayed)
+	if replayedResponse.Code != http.StatusAccepted || !strings.Contains(replayedResponse.Body.String(), `"created":false`) {
+		t.Fatalf("retry replay status=%d body=%s", replayedResponse.Code, replayedResponse.Body.String())
+	}
+	second := httptest.NewRequest(http.MethodPost, retryPath, nil)
+	second.Header.Set("Authorization", "Bearer consumer-a")
+	second.Header.Set("Idempotency-Key", "retry-http-2")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, second)
+	if secondResponse.Code != http.StatusConflict {
+		t.Fatalf("second active retry status=%d body=%s", secondResponse.Code, secondResponse.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomPreviewIsReadOnlyAndDeliveryIsExplicit(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(
+				http.StatusOK,
+				`{"receipt_id":"proofroom-http-1","status":"accepted"}`,
+			), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	preview := requestKBase(handler, http.MethodGet, path, "consumer-a")
+	if preview.Code != http.StatusOK ||
+		!strings.Contains(preview.Body.String(), `"payload_hash":"sha256:`) ||
+		!strings.Contains(preview.Body.String(), `"adjudication_authority":"proofroom"`) {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("preview called remote %d times", calls.Load())
+	}
+	if _, err := os.Stat(store.EvidenceAuditProofroomDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preview wrote receipt state: %v", err)
+	}
+
+	missingKey := requestKBase(handler, http.MethodPost, path, "consumer-a")
+	if missingKey.Code != http.StatusBadRequest ||
+		!strings.Contains(missingKey.Body.String(), `"code":"proofroom_idempotency_key_required"`) {
+		t.Fatalf("missing key status=%d body=%s", missingKey.Code, missingKey.Body.String())
+	}
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	request.Header.Set("Idempotency-Key", "proofroom-http-key")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated ||
+		!strings.Contains(response.Body.String(), `"created":true`) ||
+		!strings.Contains(response.Body.String(), `"remote_receipt_id":"proofroom-http-1"`) {
+		t.Fatalf("delivery status=%d body=%s", response.Code, response.Body.String())
+	}
+	replay := httptest.NewRequest(http.MethodPost, path, nil)
+	replay.Header.Set("Authorization", "Bearer consumer-a")
+	replay.Header.Set("Idempotency-Key", "proofroom-http-key")
+	replayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusOK ||
+		!strings.Contains(replayResponse.Body.String(), `"created":false`) ||
+		calls.Load() != 1 {
+		t.Fatalf("replay status=%d calls=%d body=%s",
+			replayResponse.Code, calls.Load(), replayResponse.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomPrivacyBlockedDoesNotSend(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomReportTest(
+		t, t.TempDir(), validEvidenceAuditInput(), func(report *EvidenceAudit) {
+			report.Proofroom.Title = "token"
+		},
+	)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(http.StatusOK, `{"receipt_id":"bad","status":"accepted"}`), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		request := httptest.NewRequest(method, path, nil)
+		request.Header.Set("Authorization", "Bearer consumer-a")
+		request.Header.Set("Idempotency-Key", "privacy-key")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnprocessableEntity ||
+			!strings.Contains(response.Body.String(), `"code":"privacy_blocked"`) {
+			t.Fatalf("%s status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("privacy-blocked projection reached remote: %d", calls.Load())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomDeliveryErrorsAreStable(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	unconfigured := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a",
+	})
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	request.Header.Set("Idempotency-Key", "proofroom-key")
+	response := httptest.NewRecorder()
+	unconfigured.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"proofroom_unconfigured"`) {
+		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, test := range []struct {
+		name       string
+		client     ProofroomHTTPClient
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "remote rejection",
+			client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+				return proofroomJSONResponse(http.StatusUnprocessableEntity, `{"error":"rejected"}`), nil
+			}),
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "proofroom_remote_rejected",
+		},
+		{
+			name: "unknown transport outcome",
+			client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "proofroom_outcome_unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testStore, testAudit := completedEvidenceAuditForProofroomTest(t)
+			service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+				Endpoint: "https://proofroom.example.test/deliver",
+				Token:    "remote-secret", Client: test.client,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store: testStore, AuthToken: "consumer-a", ProofroomDelivery: service,
+			})
+			testRequest := httptest.NewRequest(
+				http.MethodPost,
+				"/api/agent-audits/"+testAudit.AuditID+"/proofroom",
+				nil,
+			)
+			testRequest.Header.Set("Authorization", "Bearer consumer-a")
+			testRequest.Header.Set("Idempotency-Key", "proofroom-error-key")
+			testResponse := httptest.NewRecorder()
+			handler.ServeHTTP(testResponse, testRequest)
+			if testResponse.Code != test.wantStatus ||
+				!strings.Contains(testResponse.Body.String(), `"code":"`+test.wantCode+`"`) ||
+				strings.Contains(testResponse.Body.String(), "remote-secret") {
+				t.Fatalf("status=%d body=%s", testResponse.Code, testResponse.Body.String())
+			}
+			if test.name == "remote rejection" &&
+				!strings.Contains(testResponse.Body.String(), `"remote_status":422`) {
+				t.Fatalf("remote status is not visible: %s", testResponse.Body.String())
+			}
+			replay := httptest.NewRecorder()
+			handler.ServeHTTP(replay, testRequest.Clone(context.Background()))
+			if replay.Code != test.wantStatus ||
+				!strings.Contains(replay.Body.String(), `"code":"`+test.wantCode+`"`) {
+				t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+			}
+			if test.name == "remote rejection" &&
+				!strings.Contains(replay.Body.String(), `"remote_status":422`) {
+				t.Fatalf("replayed remote status is not visible: %s", replay.Body.String())
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomUnknownRequiresExplicitCoordination(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return nil, context.DeadlineExceeded
+			}
+			return proofroomJSONResponse(
+				http.StatusOK, `{"receipt_id":"coordinated","status":"accepted"}`,
+			), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	send := func(resolution string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, nil)
+		request.Header.Set("Authorization", "Bearer consumer-a")
+		request.Header.Set("Idempotency-Key", "coordinate-key")
+		if resolution != "" {
+			request.Header.Set("Proofroom-Delivery-Resolution", resolution)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if first := send(""); first.Code != http.StatusBadGateway ||
+		!strings.Contains(first.Body.String(), `"code":"proofroom_outcome_unknown"`) {
+		t.Fatalf("unknown status=%d body=%s", first.Code, first.Body.String())
+	}
+	if replay := send(""); replay.Code != http.StatusBadGateway || calls.Load() != 1 {
+		t.Fatalf("automatic replay status=%d calls=%d body=%s",
+			replay.Code, calls.Load(), replay.Body.String())
+	}
+	if coordinated := send(ProofroomCoordinationConfirmedNotDelivered); coordinated.Code != http.StatusOK ||
+		!strings.Contains(coordinated.Body.String(), `"coordinated":true`) {
+		t.Fatalf("coordination status=%d body=%s", coordinated.Code, coordinated.Body.String())
+	}
+	if delivered := send(""); delivered.Code != http.StatusCreated || calls.Load() != 2 {
+		t.Fatalf("post-coordinate status=%d calls=%d body=%s",
+			delivered.Code, calls.Load(), delivered.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerRejectsForgedAndExpiredRetryGrants(t *testing.T) {
+	now := testAgentPackageTime()
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditRetrySigningKey: []byte("test-retry-signing-key-32-bytes!!"),
+		AuditNow:             func() time.Time { return now },
+	}).(*kbaseHTTPHandler)
+	request := httptest.NewRequest(http.MethodPost, "/api/agent-audits/audit-1/retry", nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	valid := handler.issueEvidenceAuditRetryAuthorization(request, "audit-1", "retry-1", now)
+	if err := handler.validateEvidenceAuditRetryAuthorization(valid, now); err != nil {
+		t.Fatalf("valid authorization rejected: %v", err)
+	}
+	forged := valid
+	forged.Actor = evidenceAuditOpaqueIdentity("different-actor")
+	if err := handler.validateEvidenceAuditRetryAuthorization(forged, now); err == nil {
+		t.Fatal("forged authorization accepted")
+	}
+	expired := valid
+	expired.ExpiresAt = now.Add(-time.Second)
+	expired.Signature = handler.evidenceAuditRetryMAC(
+		"grant", expired.AuditID, expired.Actor, expired.Issuer, expired.Scope,
+		expired.ExpiresAt.Format(time.RFC3339Nano), expired.Nonce,
+	)
+	if err := handler.validateEvidenceAuditRetryAuthorization(expired, now); err == nil {
+		t.Fatal("expired authorization accepted")
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditErrorsAreStableAndDoNotLeakStorageDetails(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := os.MkdirAll(store.EvidenceAuditDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	privateDetail := store.EvidenceAuditManifestPath() + " bearer super-secret-token"
+	if err := os.WriteFile(store.EvidenceAuditManifestPath(), []byte("{"+privateDetail), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.EvidenceAuditManifestPath()+".bak", []byte("{broken-backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := make([]EvidenceAuditHTTPLogEvent, 0, 1)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a",
+		AuditLogger: func(event EvidenceAuditHTTPLogEvent) { logs = append(logs, event) },
+	})
+	response := requestKBase(handler, http.MethodGet, "/api/agent-audits", "consumer-a")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error response: %v body=%s", err, response.Body.String())
+	}
+	if payload.Code != "audit_store_unavailable" || payload.Error != "evidence audit storage is unavailable" {
+		t.Fatalf("stable error payload = %+v", payload)
+	}
+	if strings.Contains(response.Body.String(), store.Root()) ||
+		strings.Contains(response.Body.String(), "super-secret-token") ||
+		strings.Contains(response.Body.String(), "invalid character") {
+		t.Fatalf("response leaked internal detail: %s", response.Body.String())
+	}
+	if len(logs) != 1 || logs[0].Code != payload.Code || logs[0].Operation != "list_audits" {
+		t.Fatalf("audit logs = %+v", logs)
+	}
+	if !strings.Contains(logs[0].Cause, "invalid character") {
+		t.Fatalf("logger did not receive complete storage diagnostic: %+v", logs[0])
+	}
+	if strings.Contains(logs[0].Cause, "super-secret-token") {
+		t.Fatalf("logger leaked token: %+v", logs[0])
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditQueueErrorUsesStableResponse(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	queue := &recordingEvidenceAuditEnqueuer{err: fmt.Errorf("%w: /private/path token=secret", ErrEvidenceAuditQueueFull)}
+	logs := make([]EvidenceAuditHTTPLogEvent, 0, 1)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditLogger: func(event EvidenceAuditHTTPLogEvent) { logs = append(logs, event) },
+	})
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	response := requestJSONKBase(
+		handler, http.MethodPost, path, "consumer-a",
+		`{"subject":"Trial claim","scope":"Population evidence comparison","idempotency_key":"queue-error"}`,
+	)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"audit_queue_full"`) ||
+		strings.Contains(response.Body.String(), "/private/path") {
+		t.Fatalf("queue error status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(logs) != 1 || logs[0].Code != "audit_queue_full" ||
+		strings.Contains(logs[0].Cause, "secret") {
+		t.Fatalf("queue logs = %+v", logs)
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditPackageMissingUsesStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	response := requestJSONKBase(
+		handler, http.MethodPost,
+		"/api/agent-packages/missing-package/audits?version=2.0.0",
+		"consumer-a",
+		`{"subject":"Trial claim","scope":"Population evidence comparison","idempotency_key":"missing-package"}`,
+	)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["code"] != "audit_package_not_found" ||
+		payload["error"] != "agent package not found" {
+		t.Fatalf("stable package error = %+v", payload)
+	}
+}
+
+func TestKBaseHTTPHandlerAllEvidenceAuditMethodErrorsUseStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	for _, path := range []string{
+		"/api/agent-audits",
+		"/api/agent-audits/audit-1",
+		"/api/agent-audits/audit-1/retry",
+		"/api/agent-audits/audit-1/proofroom",
+		"/api/agent-packages/pkg/audits?version=2.0.0",
+	} {
+		response := requestKBase(handler, http.MethodDelete, path, "consumer-a")
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d body=%s", path, response.Code, response.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s invalid JSON: %v", path, err)
+		}
+		if payload["code"] != "audit_method_not_allowed" ||
+			payload["error"] != "method not allowed" {
+			t.Fatalf("%s unstable method error = %+v", path, payload)
+		}
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditAuthorizationErrorsUseStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	for _, token := range []string{"", "wrong-token"} {
+		response := requestKBase(handler, http.MethodGet, "/api/agent-audits", token)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("token=%q status=%d body=%s", token, response.Code, response.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["code"] != "audit_unauthorized" ||
+			payload["error"] != "unauthorized" {
+			t.Fatalf("token=%q unstable auth error = %+v", token, payload)
+		}
+	}
+}
+
+func TestSanitizeEvidenceAuditHTTPLogCauseRedactsCommonCredentialForms(t *testing.T) {
+	secrets := []string{
+		"query-api-key", "json-apikey", "client-secret", "plain-secret",
+		"password-value", "passwd-value", "session-value", "csrf-value",
+		"access-value", "refresh-value", "bearer-value", "basic-value",
+	}
+	cause := `request failed?api_key=query-api-key ` +
+		`{"ApiKey":"json-apikey","client_secret":"client-secret","SECRET":"plain-secret",` +
+		`"password":"password-value","passwd":"passwd-value","session":"session-value",` +
+		`"csrf":"csrf-value","access_token":"access-value","refresh_token":"refresh-value"} ` +
+		`Authorization: Bearer bearer-value Proxy-Authorization: Basic basic-value`
+	sanitized := sanitizeEvidenceAuditHTTPLogCause(cause)
+	for _, secret := range secrets {
+		if strings.Contains(sanitized, secret) {
+			t.Fatalf("sanitized log leaked %q: %s", secret, sanitized)
+		}
+	}
+	if !strings.Contains(sanitized, "[redacted]") {
+		t.Fatalf("sanitized log omitted redaction marker: %s", sanitized)
 	}
 }
 
