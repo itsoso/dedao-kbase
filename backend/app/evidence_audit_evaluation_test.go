@@ -72,6 +72,13 @@ func TestTrustedEvidenceAuditEvaluationSuiteBindsOnlyAuditIDs(t *testing.T) {
 	if err := store.SaveTrustedAgentEvaluationSuite(pkg, trusted); err != nil {
 		t.Fatalf("SaveTrustedAgentEvaluationSuite() error = %v", err)
 	}
+	info, err := os.Stat(store.TrustedAgentEvaluationSuitePath(pkg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("trusted evaluation suite mode = %o, want 600", info.Mode().Perm())
+	}
 
 	resolved, identity, err := store.ResolveTrustedAgentEvaluationSuite(pkg, submitted)
 	if err != nil {

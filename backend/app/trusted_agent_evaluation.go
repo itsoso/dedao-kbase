@@ -113,13 +113,16 @@ func (s *BookKnowledgeStore) SaveTrustedAgentEvaluationSuite(pkg AgentPackage, s
 	var existing AgentEvaluationSuite
 	if err := readJSONFile(path, &existing); err == nil {
 		if reflect.DeepEqual(existing, suite) {
-			return nil
+			return os.Chmod(path, 0o600)
 		}
 		return fmt.Errorf("trusted evaluation suite is immutable for package content hash %q", pkg.ContentHash)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	return writeFileAtomically(path, payload)
+	if err := writeFileAtomically(path, payload); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }
 
 func (s *BookKnowledgeStore) LoadTrustedAgentEvaluationSuite(pkg AgentPackage) (*AgentEvaluationSuite, error) {
