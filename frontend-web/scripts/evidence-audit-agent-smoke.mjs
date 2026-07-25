@@ -90,11 +90,19 @@ assert.ok(js.includes("item.freshness_decision"), "Proofroom preview should expo
 assert.ok(js.includes("item.conflict"), "Proofroom preview should expose evidence conflicts");
 assert.ok(js.includes("JSON.stringify(preview.payload, null, 2)"), "Proofroom preview should allow exact payload inspection");
 assert.ok(js.includes("proofroomOperationSequence"), "Proofroom responses should be scoped to the active audit route");
+assert.ok(js.includes("evidenceAuditWorkspaceSequence"), "audit history responses should be scoped to the active package route");
 assert.ok(js.includes("bookAgentLoadSequence"), "Agent package responses should be scoped to the active route");
 assert.ok(js.includes('"model_outcome_unknown", "requires_manual_retry"'), "retry control should match backend retryable failure codes");
 assert.ok(js.includes('["citation_id", evidence.citation_id]'), "citation links should preserve citation identity");
 assert.ok(js.includes('evidenceLocator.get("citation_id")'), "knowledge pages should resolve direct citation links");
 assert.ok(js.includes("/api/citations/"), "citation links should resolve exact citation identities");
+assert.ok(js.includes("bookKnowledgeLoadSequence"), "citation resolution should be invalidated when the knowledge route changes");
+assert.ok(js.includes('`retry:${audit.audit_id}:manual-v1`'), "manual retry should use a stable audit-bound idempotency key");
+assert.ok(js.includes("activateProofroomModal"), "Proofroom preview should activate a real modal");
+assert.ok(js.includes("deactivateProofroomModal"), "Proofroom modal state should be cleaned up on close and navigation");
+assert.ok(js.includes('event.key === "Escape"'), "Proofroom modal should close with Escape");
+assert.ok(js.includes('event.key !== "Tab"'), "Proofroom modal should trap keyboard focus");
+assert.ok(js.includes("app.inert = true"), "Proofroom modal should make the background inert");
 
 for (const state of ["queued", "running", "failed", "completed", "outcome_unknown", "rejected", "delivered"]) {
   assert.ok(js.includes(state), `audit UI should render ${state}`);
@@ -158,6 +166,6 @@ assert.ok(css.includes("minmax(0, 1fr)"), "audit layout should allow columns to 
 assert.ok(css.includes("max-height: 140px"), "desktop audit context should enforce its compact height budget");
 assert.ok(css.includes("max-height: 220px"), "mobile audit context should enforce its compact height budget");
 assert.ok(css.includes(".evidence-audit__waiting > span"), "audit progress animation should honor reduced motion");
-assert.ok(html.includes("20260724-evidence-audit-inspection"), "audit workspace should publish a fresh asset version");
+assert.ok(html.includes("20260724-evidence-audit-modal"), "audit workspace should publish a fresh asset version");
 
 console.log("evidence audit agent smoke passed");

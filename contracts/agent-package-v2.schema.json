@@ -208,7 +208,7 @@
         "max_evidence_per_claim": { "type": "integer", "minimum": 1, "maximum": 5 },
         "allowed_verdicts": {
           "type": "array",
-          "minItems": 4,
+          "minItems": 1,
           "uniqueItems": true,
           "items": { "enum": ["supported", "contradicted", "mixed", "insufficient"] }
         },

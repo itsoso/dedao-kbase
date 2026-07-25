@@ -128,7 +128,11 @@ func TestKBaseHTTPHandlerResolvesCitationIdentityWithoutSourcePath(t *testing.T)
 	if !strings.Contains(body, `"citation_id":"42-citation-1"`) ||
 		!strings.Contains(body, `"chunk_id":"42-chunk-1"`) ||
 		strings.Contains(body, "/tmp/book.html") ||
-		strings.Contains(body, "source_html") {
+		strings.Contains(body, "source_html") ||
+		strings.Contains(body, "source_account") ||
+		strings.Contains(body, "source_item_key") ||
+		strings.Contains(body, `"anchor"`) ||
+		strings.Contains(body, `"note"`) {
 		t.Fatalf("citation response is not a safe exact locator: %s", body)
 	}
 }
@@ -239,6 +243,23 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 		if response.Code != http.StatusUnauthorized {
 			t.Fatalf("%s evaluation status=%d body=%s", name, response.Code, response.Body.String())
 		}
+	}
+	var forged map[string]any
+	if err := json.Unmarshal(payload, &forged); err != nil {
+		t.Fatal(err)
+	}
+	cases := forged["suite"].(map[string]any)["cases"].([]any)
+	cases[0].(map[string]any)["evidence_audit"] = map[string]any{"status": EvidenceAuditCompleted}
+	forgedPayload, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected := requestJSONKBase(
+		handler, http.MethodPost, "/api/agent-packages/evaluate",
+		"publisher-token", string(forgedPayload),
+	)
+	if rejected.Code != http.StatusBadRequest {
+		t.Fatalf("embedded evidence audit status=%d body=%s", rejected.Code, rejected.Body.String())
 	}
 	evaluated := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(payload))
 	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"created":true`) ||

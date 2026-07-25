@@ -944,7 +944,7 @@ func evidenceAuditInputReleaseRefs(
 		ref := EvidenceAuditReleaseRef{
 			ReleaseID: pkgRef.ReleaseID, ContentHash: agentTraceReleaseContentHash(pkgRef.ContentHash),
 			Role: roles[pkgRef.ReleaseID], SourceType: sourceType,
-			PublicationIdentity: sha256Fingerprint([]byte(sourceType)),
+			PublicationIdentity: evidenceAuditPublicationIdentity(sourceType),
 		}
 		allowed := stringBoolSet(pkgRef.CitationIDs...)
 		seen := map[string]bool{}
@@ -1099,7 +1099,7 @@ func retrieveEvidenceAuditSupportingEvidence(
 				ref := EvidenceAuditEvidenceRef{
 					ReleaseID: release.ReleaseID, ContentHash: agentTraceReleaseContentHash(release.ContentHash),
 					Role: EvidenceAuditReleaseSupporting, SourceType: strings.ToLower(strings.TrimSpace(release.Book.SourceType)),
-					PublicationIdentity: sha256Fingerprint([]byte(strings.ToLower(strings.TrimSpace(release.Book.SourceType)))),
+					PublicationIdentity: evidenceAuditPublicationIdentity(release.Book.SourceType),
 					ClaimID:             item.ClaimID, ChunkID: citation.ChunkID, CitationID: citationID,
 					PublishedAt: publishedAt, FreshnessDecision: freshness,
 				}

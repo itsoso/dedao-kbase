@@ -365,7 +365,20 @@ func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeSto
 	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
 	suite := loadAgentEvaluationFixture(t)
 	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
-		auditSuite := evidenceAuditEvaluationSuite(t, pkg)
+		identity := strings.TrimPrefix(pkg.ContentHash, "sha256:")
+		if len(identity) > 12 {
+			identity = identity[:12]
+		}
+		supported := persistEvidenceAuditEvaluationReport(
+			t, store, pkg, EvidenceAuditVerdictSupported, false, "publish-"+identity+"-supported",
+		)
+		conflicted := persistEvidenceAuditEvaluationReport(
+			t, store, pkg, EvidenceAuditVerdictMixed, true, "publish-"+identity+"-conflicted",
+		)
+		insufficient := persistEvidenceAuditEvaluationReport(
+			t, store, pkg, EvidenceAuditVerdictInsufficient, false, "publish-"+identity+"-insufficient",
+		)
+		auditSuite := evidenceAuditEvaluationSuite(pkg, supported, conflicted, insufficient)
 		suite.Cases = append(suite.Cases, auditSuite.Cases...)
 	}
 	for index := range suite.Cases {

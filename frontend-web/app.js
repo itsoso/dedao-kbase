@@ -227,6 +227,7 @@ const evidenceAuditState = {
   proofroomDeliveryKey: "",
   createIdempotencyKey: "",
   createRequestFingerprint: "",
+  retryIdempotencyKey: "",
 };
 
 const knowledgeOperationsState = {
@@ -273,8 +274,12 @@ let knowledgeReviewLoadSequence = 0;
 let knowledgeAgentLoadSequence = 0;
 let evidenceAuditPollTimer = null;
 let evidenceAuditLoadSequence = 0;
+let evidenceAuditWorkspaceSequence = 0;
 let bookAgentLoadSequence = 0;
 let proofroomOperationSequence = 0;
+let bookKnowledgeLoadSequence = 0;
+let proofroomPreviousFocus = null;
+let proofroomKeydownHandler = null;
 
 function getToken() {
   for (const key of tokenKeys) {
@@ -2699,6 +2704,74 @@ function renderEvidenceAuditProofroom(audit) {
   `;
 }
 
+function deactivateProofroomModal({ restoreFocus = false } = {}) {
+  if (proofroomKeydownHandler) {
+    document.removeEventListener("keydown", proofroomKeydownHandler);
+    proofroomKeydownHandler = null;
+  }
+  document.body?.classList?.remove("has-proofroom-modal");
+  app.inert = false;
+  document.body?.querySelector?.(":scope > .evidence-audit__proofroom-overlay")?.remove();
+  if (restoreFocus && proofroomPreviousFocus?.isConnected && typeof proofroomPreviousFocus.focus === "function") {
+    proofroomPreviousFocus.focus();
+  }
+  if (restoreFocus) {
+    proofroomPreviousFocus = null;
+  }
+}
+
+function closeProofroomPreview(route) {
+  deactivateProofroomModal({ restoreFocus: true });
+  evidenceAuditState.proofroomPreview = null;
+  evidenceAuditState.proofroomDeliveryKey = "";
+  evidenceAuditState.proofroomStatus = "";
+  evidenceAuditState.proofroomError = "";
+  renderBookAgentPlatform(route);
+}
+
+function activateProofroomModal(route) {
+  const overlay = app.querySelector(".evidence-audit__proofroom-overlay");
+  if (!overlay) {
+    return;
+  }
+  deactivateProofroomModal();
+  proofroomPreviousFocus = document.activeElement;
+  document.body?.appendChild?.(overlay);
+  document.body?.classList?.add("has-proofroom-modal");
+  app.inert = true;
+  const dialog = overlay.querySelector('[role="dialog"], .evidence-audit__proofroom-preview') || overlay;
+  const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const focusable = () => Array.from(dialog.querySelectorAll(focusableSelector));
+  proofroomKeydownHandler = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeProofroomPreview(route);
+      return;
+    }
+    if (event.key !== "Tab") {
+      return;
+    }
+    const items = focusable();
+    if (!items.length) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  document.addEventListener("keydown", proofroomKeydownHandler);
+  const close = overlay.querySelector("[data-proofroom-close]");
+  (close || focusable()[0] || dialog).focus();
+}
+
 function renderEvidenceAuditReport(audit) {
   const claims = Array.isArray(audit?.claim_audits) ? audit.claim_audits : [];
   const counts = audit?.summary?.verdict_counts || {};
@@ -2836,6 +2909,7 @@ function renderGroundedConversation(pkg) {
 }
 
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
+  deactivateProofroomModal();
   if (!route.packageID || !bookAgentState.package) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
     return;
@@ -2930,6 +3004,9 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
     </main>
   `, "agents");
   bindBookAgentPlatformEvents(route);
+  if (evidenceAuditState.proofroomPreview) {
+    window.requestAnimationFrame?.(() => activateProofroomModal(route));
+  }
 }
 
 function bindBookAgentPlatformEvents(route) {
@@ -2966,13 +3043,7 @@ function bindBookAgentPlatformEvents(route) {
   });
   document.querySelector("[data-evidence-audit-retry]")?.addEventListener("click", () => retryEvidenceAudit(route));
   document.querySelector("[data-proofroom-preview]")?.addEventListener("click", () => loadProofroomPreview(route));
-  document.querySelector("[data-proofroom-close]")?.addEventListener("click", () => {
-    evidenceAuditState.proofroomPreview = null;
-    evidenceAuditState.proofroomDeliveryKey = "";
-    evidenceAuditState.proofroomStatus = "";
-    evidenceAuditState.proofroomError = "";
-    renderBookAgentPlatform(route);
-  });
+  document.querySelector("[data-proofroom-close]")?.addEventListener("click", () => closeProofroomPreview(route));
   document.querySelector("[data-proofroom-deliver]")?.addEventListener("click", () => deliverEvidenceAuditToProofroom(route));
 }
 
@@ -2989,6 +3060,7 @@ function resetEvidenceAuditState(auditID = "") {
   evidenceAuditState.proofroomError = "";
   evidenceAuditState.deliveryReceipt = null;
   evidenceAuditState.proofroomDeliveryKey = "";
+  evidenceAuditState.retryIdempotencyKey = "";
 }
 
 function cancelEvidenceAuditPoll() {
@@ -3015,7 +3087,10 @@ function scheduleEvidenceAuditPoll(route) {
 }
 
 async function loadEvidenceAuditWorkspace(route) {
+  const sequence = ++evidenceAuditWorkspaceSequence;
   const pkg = bookAgentState.package || {};
+  const packageID = String(pkg.package_id || "");
+  const version = String(pkg.version || "");
   if (pkg.schema_version !== "agent-package.v2") {
     resetEvidenceAuditState("");
     evidenceAuditState.audits = [];
@@ -3036,8 +3111,18 @@ async function loadEvidenceAuditWorkspace(route) {
   try {
     const params = new URLSearchParams({ version: pkg.version, limit: "10" });
     const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/audits?${params.toString()}`);
+    if (
+      sequence !== evidenceAuditWorkspaceSequence ||
+      String(bookAgentState.package?.package_id || "") !== packageID ||
+      String(bookAgentState.package?.version || "") !== version
+    ) {
+      return;
+    }
     evidenceAuditState.audits = Array.isArray(payload.audits) ? payload.audits : [];
   } catch (error) {
+    if (sequence !== evidenceAuditWorkspaceSequence) {
+      return;
+    }
     evidenceAuditState.error = evidenceAuditErrorDetails(error).message;
   }
 }
@@ -3170,10 +3255,12 @@ async function retryEvidenceAudit(route) {
   evidenceAuditState.error = "";
   renderBookAgentPlatform(route);
   try {
+    evidenceAuditState.retryIdempotencyKey =
+      evidenceAuditState.retryIdempotencyKey || `retry:${audit.audit_id}:manual-v1`;
     const payload = await apiFetch(`/api/agent-audits/${encodeURIComponent(audit.audit_id)}/retry`, {
       method: "POST",
       headers: {
-        "Idempotency-Key": evidenceAuditIdempotencyKey("retry", audit.audit_id),
+        "Idempotency-Key": evidenceAuditState.retryIdempotencyKey,
       },
     });
     const retry = payload.audit;
@@ -6568,6 +6655,7 @@ function bindDedaoCourseArticleAnalysis(route) {
 }
 
 async function loadBookKnowledge() {
+  const sequence = ++bookKnowledgeLoadSequence;
   knowledgeState.loading = "加载书籍";
   knowledgeState.message = "";
   renderBookKnowledge();
@@ -6579,6 +6667,9 @@ async function loadBookKnowledge() {
       ]);
     }
     const payload = await apiFetch("/api/books");
+    if (sequence !== bookKnowledgeLoadSequence) {
+      return;
+    }
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length && isKnowledgePackageDetailRoute()) {
       const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
@@ -6587,6 +6678,9 @@ async function loadBookKnowledge() {
         ? knowledgeState.books.find((book) => book.book_id === preferredID)
         : null;
       await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
+      if (sequence !== bookKnowledgeLoadSequence) {
+        return;
+      }
       const evidenceLocator = new URLSearchParams(window.location.search);
       const citationID = evidenceLocator.get("citation_id") || "";
       const evidenceQuery = citationID || evidenceLocator.get("chunk_id") || evidenceLocator.get("claim_id") || "";
@@ -6594,17 +6688,22 @@ async function loadBookKnowledge() {
         const resolved = await apiFetch(
           `/api/citations/${encodeURIComponent(citationID)}?book_id=${encodeURIComponent(knowledgeState.selectedBook.book_id)}`,
         );
+        if (
+          sequence !== bookKnowledgeLoadSequence ||
+          String(knowledgeState.selectedBook?.book_id || "") !== String(preferred?.book_id || knowledgeState.books[0]?.book_id || "")
+        ) {
+          return;
+        }
         const citation = resolved.citation || {};
         knowledgeState.query = citationID;
         knowledgeState.results = [{
           kind: "citation",
           id: citation.citation_id || citationID,
-          title: citation.note || `引用 ${citation.citation_id || citationID}`,
+          title: `引用 ${citation.citation_id || citationID}`,
           snippet: [
             ...(Array.isArray(resolved.claim_ids) ? resolved.claim_ids : []),
             citation.chapter_id,
             citation.chunk_id,
-            citation.anchor,
           ].filter(Boolean).join(" · "),
         }];
         knowledgeState.message = "已精确定位审计引用。";
@@ -6620,10 +6719,15 @@ async function loadBookKnowledge() {
     }
     knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
   } catch (error) {
+    if (sequence !== bookKnowledgeLoadSequence) {
+      return;
+    }
     knowledgeState.message = error instanceof Error ? error.message : String(error);
   } finally {
-    knowledgeState.loading = "";
-    renderBookKnowledge();
+    if (sequence === bookKnowledgeLoadSequence) {
+      knowledgeState.loading = "";
+      renderBookKnowledge();
+    }
   }
 }
 
@@ -7162,6 +7266,7 @@ function formatArticleTime(value) {
 }
 
 async function boot() {
+  bookKnowledgeLoadSequence += 1;
   const routePathname = getRoutePathname();
   const isBookAgentRoute = (
     routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
@@ -7169,8 +7274,10 @@ async function boot() {
     routePathname === ROUTES.bookApps || routePathname.startsWith(`${ROUTES.bookApps}/`)
   );
   if (!isBookAgentRoute) {
+    deactivateProofroomModal({ restoreFocus: true });
     cancelEvidenceAuditPoll();
     evidenceAuditLoadSequence += 1;
+    evidenceAuditWorkspaceSequence += 1;
     bookAgentLoadSequence += 1;
     proofroomOperationSequence += 1;
     evidenceAuditState.routeAuditID = "";

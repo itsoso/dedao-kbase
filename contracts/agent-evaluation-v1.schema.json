@@ -10,37 +10,111 @@
     "cases": {
       "type": "array",
       "minItems": 1,
-      "items": {
-        "type": "object",
-        "required": ["case_id", "metric"],
-        "properties": {
-          "case_id": { "type": "string", "minLength": 1 },
-          "metric": {
-            "enum": ["retrieval", "retrieval_precision", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "task_completion", "latency", "cost"]
-          },
-          "input": { "type": "string", "minLength": 1 },
-          "expected_ids": {
-            "type": "array",
-            "items": { "type": "string", "minLength": 1 }
-          },
-          "expected_value": { "type": "string" },
-          "model_output": { "type": "string" },
-          "proposed_tool": { "type": "string" },
-          "proposed_arguments": {
-            "type": "object",
-            "additionalProperties": { "type": "string" }
-          },
-          "expected_arguments": {
-            "type": "object",
-            "additionalProperties": { "type": "string" }
-          },
-          "max_latency_ms": { "type": "integer", "minimum": 1 },
-          "recorded_latency_ms": { "type": "integer", "minimum": 1 },
-          "max_cost_usd": { "type": "number", "exclusiveMinimum": 0 }
-        },
-        "additionalProperties": true
-      }
+      "items": { "$ref": "#/$defs/case" }
     }
   },
-  "additionalProperties": true
+  "additionalProperties": false,
+  "$defs": {
+    "metric": {
+      "enum": [
+        "retrieval",
+        "retrieval_precision",
+        "citations",
+        "faithfulness",
+        "abstention",
+        "tool_choice",
+        "tool_arguments",
+        "task_completion",
+        "latency",
+        "cost",
+        "adjudication_consistency",
+        "source_independence",
+        "conflict_detection",
+        "report_citation_completeness",
+        "safe_insufficiency",
+        "proofroom_projection_completeness"
+      ]
+    },
+    "claim_gold": {
+      "type": "object",
+      "required": ["claim_identity"],
+      "properties": {
+        "claim_identity": {
+          "type": "string",
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "verdict": {
+          "enum": ["supported", "contradicted", "mixed", "insufficient"]
+        },
+        "conflict": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "case": {
+      "type": "object",
+      "required": ["case_id", "metric"],
+      "properties": {
+        "case_id": { "type": "string", "minLength": 1 },
+        "metric": { "$ref": "#/$defs/metric" },
+        "input": { "type": "string", "minLength": 1 },
+        "audit_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "expected_claims": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/claim_gold" }
+        },
+        "expected_ids": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "expected_value": { "type": "string" },
+        "model_output": { "type": "string" },
+        "proposed_tool": { "type": "string" },
+        "proposed_arguments": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "expected_arguments": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "max_latency_ms": { "type": "integer", "minimum": 1 },
+        "recorded_latency_ms": { "type": "integer", "minimum": 1 },
+        "max_cost_usd": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "enum": [
+                  "adjudication_consistency",
+                  "source_independence",
+                  "conflict_detection",
+                  "report_citation_completeness",
+                  "safe_insufficiency",
+                  "proofroom_projection_completeness"
+                ]
+              }
+            },
+            "required": ["metric"]
+          },
+          "then": { "required": ["audit_id"] }
+        },
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "enum": ["adjudication_consistency", "conflict_detection"]
+              }
+            },
+            "required": ["metric"]
+          },
+          "then": { "required": ["expected_claims"] }
+        }
+      ],
+      "additionalProperties": false
+    }
+  }
 }

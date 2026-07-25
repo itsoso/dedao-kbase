@@ -1102,16 +1102,23 @@ func TestListEvidenceAuditsReconcilesPreparedTerminalState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 1 || records[0].Status != EvidenceAuditFailed ||
-		records[0].FailureCode != "invalid_model_output" {
+	var reconciled *EvidenceAuditRecord
+	for index := range records {
+		if records[index].AuditID == audit.AuditID {
+			reconciled = &records[index]
+			break
+		}
+	}
+	if reconciled == nil || reconciled.Status != EvidenceAuditFailed ||
+		reconciled.FailureCode != "invalid_model_output" {
 		t.Fatalf("reconciled list = %#v", records)
 	}
 	detail, err := store.LoadEvidenceAudit(audit.AuditID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.Status != records[0].Status || detail.FailureCode != records[0].FailureCode {
-		t.Fatalf("list/detail terminal mismatch: record=%#v detail=%#v", records[0], detail)
+	if detail.Status != reconciled.Status || detail.FailureCode != reconciled.FailureCode {
+		t.Fatalf("list/detail terminal mismatch: record=%#v detail=%#v", reconciled, detail)
 	}
 }
 

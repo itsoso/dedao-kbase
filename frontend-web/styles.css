@@ -5093,6 +5093,10 @@ a.button {
   background: rgba(22, 36, 31, 0.62);
 }
 
+body.has-proofroom-modal {
+  overflow: hidden;
+}
+
 .evidence-audit__proofroom-preview {
   width: min(920px, 100%);
   max-height: min(780px, calc(100vh - 56px));

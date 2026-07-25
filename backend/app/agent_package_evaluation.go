@@ -27,22 +27,29 @@ type AgentEvaluationSuite struct {
 }
 
 type AgentEvaluationCase struct {
-	CaseID            string            `json:"case_id"`
-	Metric            string            `json:"metric"`
-	Input             string            `json:"input,omitempty"`
-	ExpectedIDs       []string          `json:"expected_ids,omitempty"`
-	ObservedIDs       []string          `json:"-"`
-	ExpectedValue     string            `json:"expected_value,omitempty"`
-	ModelOutput       string            `json:"model_output,omitempty"`
-	ProposedTool      string            `json:"proposed_tool,omitempty"`
-	ProposedArguments map[string]string `json:"proposed_arguments,omitempty"`
-	ObservedValue     string            `json:"-"`
-	ExpectedArguments map[string]string `json:"expected_arguments,omitempty"`
-	ObservedArguments map[string]string `json:"-"`
-	MaxLatencyMS      int               `json:"max_latency_ms,omitempty"`
-	RecordedLatencyMS int               `json:"recorded_latency_ms,omitempty"`
-	MaxCostUSD        float64           `json:"max_cost_usd,omitempty"`
-	EvidenceAudit     *EvidenceAudit    `json:"evidence_audit,omitempty"`
+	CaseID            string                         `json:"case_id"`
+	Metric            string                         `json:"metric"`
+	Input             string                         `json:"input,omitempty"`
+	AuditID           string                         `json:"audit_id,omitempty"`
+	ExpectedClaims    []AgentEvaluationExpectedClaim `json:"expected_claims,omitempty"`
+	ExpectedIDs       []string                       `json:"expected_ids,omitempty"`
+	ObservedIDs       []string                       `json:"-"`
+	ExpectedValue     string                         `json:"expected_value,omitempty"`
+	ModelOutput       string                         `json:"model_output,omitempty"`
+	ProposedTool      string                         `json:"proposed_tool,omitempty"`
+	ProposedArguments map[string]string              `json:"proposed_arguments,omitempty"`
+	ObservedValue     string                         `json:"-"`
+	ExpectedArguments map[string]string              `json:"expected_arguments,omitempty"`
+	ObservedArguments map[string]string              `json:"-"`
+	MaxLatencyMS      int                            `json:"max_latency_ms,omitempty"`
+	RecordedLatencyMS int                            `json:"recorded_latency_ms,omitempty"`
+	MaxCostUSD        float64                        `json:"max_cost_usd,omitempty"`
+}
+
+type AgentEvaluationExpectedClaim struct {
+	ClaimIdentity string `json:"claim_identity"`
+	Verdict       string `json:"verdict,omitempty"`
+	Conflict      *bool  `json:"conflict,omitempty"`
 }
 
 type AgentEvaluationReport struct {
@@ -130,7 +137,7 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 
 func executeAgentEvaluationCase(store *BookKnowledgeStore, pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
 	if isEvidenceAuditEvaluationMetric(evalCase.Metric) {
-		return executeEvidenceAuditEvaluationCase(pkg, evalCase)
+		return executeEvidenceAuditEvaluationCase(store, pkg, evalCase)
 	}
 	input := strings.TrimSpace(evalCase.Input)
 	if input == "" {
@@ -271,27 +278,34 @@ func isEvidenceAuditEvaluationMetric(metric string) bool {
 	}
 }
 
-func executeEvidenceAuditEvaluationCase(pkg AgentPackage, evalCase AgentEvaluationCase) (bool, error) {
-	if evalCase.EvidenceAudit == nil {
-		return false, fmt.Errorf("evidence_audit is required for behavioral metric %q", evalCase.Metric)
+func executeEvidenceAuditEvaluationCase(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	evalCase AgentEvaluationCase,
+) (bool, error) {
+	auditID := strings.TrimSpace(evalCase.AuditID)
+	if auditID == "" {
+		return false, fmt.Errorf("audit_id is required for behavioral metric %q", evalCase.Metric)
 	}
-	audit := *evalCase.EvidenceAudit
-	if !evidenceAuditMatchesEvaluationPackage(pkg, audit) || ValidateEvidenceAudit(audit) != nil {
+	audit, err := store.LoadEvidenceAuditSnapshot(auditID)
+	if err != nil {
+		return false, fmt.Errorf("load completed evidence audit: %w", err)
+	}
+	if audit.Status != EvidenceAuditCompleted {
+		return false, fmt.Errorf("evidence audit %q is not completed", auditID)
+	}
+	trace, err := store.LoadAgentTrace(audit.TraceID)
+	if err != nil {
+		return false, fmt.Errorf("load completed evidence audit trace: %w", err)
+	}
+	if !evidenceAuditMatchesEvaluationPackage(store, pkg, *audit, *trace) ||
+		ValidateEvidenceAudit(*audit) != nil {
 		return false, nil
 	}
 
 	switch evalCase.Metric {
 	case "adjudication_consistency":
-		expected := strings.TrimSpace(evalCase.ExpectedValue)
-		if expected == "" {
-			return true, nil
-		}
-		for _, claim := range audit.ClaimAudits {
-			if claim.Verdict == expected {
-				return true, nil
-			}
-		}
-		return false, nil
+		return evidenceAuditExpectedClaimsMatch(*audit, evalCase.ExpectedClaims, true, false), nil
 	case "source_independence":
 		for _, claim := range audit.ClaimAudits {
 			if claim.Verdict == EvidenceAuditVerdictInsufficient {
@@ -309,35 +323,9 @@ func executeEvidenceAuditEvaluationCase(pkg AgentPackage, evalCase AgentEvaluati
 		}
 		return true, nil
 	case "conflict_detection":
-		detected := false
-		for _, claim := range audit.ClaimAudits {
-			hasConflict := false
-			for _, evidence := range claim.Evidence {
-				hasConflict = hasConflict || evidence.Conflict
-			}
-			if hasConflict {
-				detected = true
-				if claim.Verdict != EvidenceAuditVerdictMixed &&
-					claim.Verdict != EvidenceAuditVerdictContradicted {
-					return false, nil
-				}
-			}
-			if claim.Verdict == EvidenceAuditVerdictMixed && !hasConflict {
-				return false, nil
-			}
-		}
-		switch strings.TrimSpace(evalCase.ExpectedValue) {
-		case "":
-			return true, nil
-		case "detected":
-			return detected, nil
-		case "none":
-			return !detected, nil
-		default:
-			return false, nil
-		}
+		return evidenceAuditExpectedClaimsMatch(*audit, evalCase.ExpectedClaims, false, true), nil
 	case "report_citation_completeness":
-		return evidenceAuditCitationsComplete(audit), nil
+		return evidenceAuditCitationsComplete(*audit), nil
 	case "safe_insufficiency":
 		found := false
 		for _, claim := range audit.ClaimAudits {
@@ -361,50 +349,140 @@ func executeEvidenceAuditEvaluationCase(pkg AgentPackage, evalCase AgentEvaluati
 		}
 		return found, nil
 	case "proofroom_projection_completeness":
-		preview, err := BuildProofroomEvidenceAuditProjection(audit)
+		preview, err := BuildProofroomEvidenceAuditProjection(*audit)
 		if err != nil {
 			return false, nil
 		}
-		return preview.Payload.Audit.AuditID == audit.AuditID &&
-			preview.Payload.Audit.InputHash == audit.InputHash &&
-			preview.Payload.Audit.OutputHash == audit.OutputHash &&
-			preview.Payload.Package == audit.Package &&
-			len(preview.Payload.Claims) == len(audit.ClaimAudits) &&
-			len(preview.Payload.Proofroom.ReviewItems) == len(audit.Proofroom.ReviewItems), nil
+		return evidenceAuditProofroomProjectionComplete(*audit, preview.Payload), nil
 	default:
 		return false, fmt.Errorf("unsupported evidence audit metric %q", evalCase.Metric)
 	}
 }
 
-func evidenceAuditMatchesEvaluationPackage(pkg AgentPackage, audit EvidenceAudit) bool {
+func evidenceAuditMatchesEvaluationPackage(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	audit EvidenceAudit,
+	trace AgentTrace,
+) bool {
+	if store == nil ||
+		audit.Status != EvidenceAuditCompleted ||
+		strings.TrimSpace(audit.OutputHash) == "" ||
+		strings.TrimSpace(audit.TraceID) == "" ||
+		trace.TraceID != audit.TraceID ||
+		trace.Package != (AgentTracePackageRef{
+			PackageID: pkg.PackageID, Version: pkg.Version, ContentHash: pkg.ContentHash,
+		}) ||
+		trace.EvidenceAudit == nil ||
+		trace.EvidenceAudit.AuditID != audit.AuditID ||
+		trace.EvidenceAudit.InputHash != audit.InputHash ||
+		(trace.Final.Outcome != AgentTraceOutcomeCompleted &&
+			trace.Final.Outcome != AgentTraceOutcomeAbstained) {
+		return false
+	}
+	fingerprint, err := evidenceAuditReportFingerprint(audit)
+	if err != nil || trace.Final.ResponseFingerprint != fingerprint {
+		return false
+	}
 	if audit.Package.PackageID != pkg.PackageID ||
 		audit.Package.Version != pkg.Version ||
 		audit.Package.ContentHash != pkg.ContentHash {
 		return false
 	}
+	releases := make(map[string]KnowledgeRelease, len(pkg.Releases))
 	packageReleases := make(map[string]AgentPackageReleaseRef, len(pkg.Releases))
 	for _, release := range pkg.Releases {
 		packageReleases[release.ReleaseID] = release
-	}
-	roles := make(map[string]string)
-	if pkg.EvidencePolicy != nil {
-		for _, role := range pkg.EvidencePolicy.ReleaseRoles {
-			roles[role.ReleaseID] = role.Role
-		}
-	}
-	for _, release := range audit.Releases {
-		pinned, ok := packageReleases[release.ReleaseID]
-		if !ok || pinned.ContentHash != release.ContentHash || roles[release.ReleaseID] != release.Role {
+		stored, loadErr := store.LoadKnowledgeRelease(release.ReleaseID)
+		if loadErr != nil ||
+			agentTraceReleaseContentHash(stored.ContentHash) !=
+				agentTraceReleaseContentHash(release.ContentHash) {
 			return false
 		}
-		allowed := stringBoolSet(pinned.CitationIDs...)
-		for _, citation := range release.Citations {
-			if !allowed[citation.CitationID] {
+		releases[release.ReleaseID] = *stored
+	}
+	expectedReleases, err := evidenceAuditInputReleaseRefs(pkg, releases)
+	if err != nil || !reflect.DeepEqual(expectedReleases, audit.Releases) {
+		return false
+	}
+	traceReleases := make(map[string]AgentTraceReleaseRef, len(trace.Releases))
+	for _, release := range trace.Releases {
+		if _, duplicated := traceReleases[release.ReleaseID]; duplicated {
+			return false
+		}
+		traceReleases[release.ReleaseID] = release
+	}
+	for releaseID, pinned := range packageReleases {
+		traced, ok := traceReleases[releaseID]
+		if !ok ||
+			agentTraceReleaseContentHash(traced.ContentHash) !=
+				agentTraceReleaseContentHash(pinned.ContentHash) {
+			return false
+		}
+	}
+	if len(traceReleases) != len(packageReleases) {
+		return false
+	}
+	if trace.ModelRoute.Provider != audit.Model.Provider ||
+		trace.ModelRoute.Model != audit.Model.Model ||
+		trace.RetrievalRoute.Strategy != audit.Retrieval.Strategy {
+		return false
+	}
+	return evidenceAuditCitationsMatchStoredReleases(releases, audit)
+}
+
+func evidenceAuditCitationsMatchStoredReleases(
+	stored map[string]KnowledgeRelease,
+	audit EvidenceAudit,
+) bool {
+	releases := make(map[string]EvidenceAuditReleaseRef, len(audit.Releases))
+	for _, release := range audit.Releases {
+		releases[release.ReleaseID] = release
+		actual, ok := stored[release.ReleaseID]
+		if !ok {
+			return false
+		}
+		expectedSourceType := strings.ToLower(strings.TrimSpace(actual.Book.SourceType))
+		if release.SourceType != expectedSourceType ||
+			release.PublicationIdentity != evidenceAuditPublicationIdentity(expectedSourceType) {
+			return false
+		}
+		claims := make(map[string]BookAnalysisClaim)
+		if actual.Analysis == nil {
+			return false
+		}
+		for _, claim := range actual.Analysis.Claims {
+			claims[claim.ID] = claim
+		}
+		citations := make(map[string]BookKnowledgeCitation)
+		for _, citation := range actual.Citations {
+			citations[citation.CitationID] = citation
+		}
+		for _, ref := range release.Citations {
+			claim, claimOK := claims[ref.ClaimID]
+			citation, citationOK := citations[ref.CitationID]
+			if !claimOK || !citationOK ||
+				citation.ChunkID != ref.ChunkID ||
+				!stringBoolSet(resolveAgentClaimCitationIDs(actual.Citations, claim.CitationIDs)...)[ref.CitationID] {
 				return false
 			}
 		}
 	}
-	return len(audit.Releases) == len(packageReleases)
+	for _, claim := range audit.ClaimAudits {
+		if claim.Verdict != EvidenceAuditVerdictInsufficient && len(claim.Evidence) == 0 {
+			return false
+		}
+		for _, evidence := range claim.Evidence {
+			release, ok := releases[evidence.ReleaseID]
+			if !ok || release.ContentHash != evidence.ContentHash ||
+				release.Role != evidence.Role || release.SourceType != evidence.SourceType ||
+				release.PublicationIdentity != evidence.PublicationIdentity ||
+				!evidenceAuditReleaseAllowsCitation(release, evidence) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func evidenceAuditCitationsComplete(audit EvidenceAudit) bool {
@@ -427,6 +505,139 @@ func evidenceAuditCitationsComplete(audit EvidenceAudit) bool {
 		}
 	}
 	return true
+}
+
+func evidenceAuditPublicationIdentity(sourceType string) string {
+	return sha256Fingerprint([]byte(strings.ToLower(strings.TrimSpace(sourceType))))
+}
+
+func evidenceAuditClaimIdentity(sourceClaim string) string {
+	return sha256Fingerprint([]byte(strings.TrimSpace(sourceClaim)))
+}
+
+func evidenceAuditExpectedClaimsMatch(
+	audit EvidenceAudit,
+	expected []AgentEvaluationExpectedClaim,
+	requireVerdict bool,
+	requireConflict bool,
+) bool {
+	if len(expected) == 0 || len(expected) != len(audit.ClaimAudits) {
+		return false
+	}
+	actual := make(map[string]EvidenceAuditClaim, len(audit.ClaimAudits))
+	for _, claim := range audit.ClaimAudits {
+		identity := evidenceAuditClaimIdentity(claim.SourceClaim)
+		if _, exists := actual[identity]; exists {
+			return false
+		}
+		actual[identity] = claim
+	}
+	seen := make(map[string]bool, len(expected))
+	for _, gold := range expected {
+		identity := strings.TrimSpace(gold.ClaimIdentity)
+		claim, ok := actual[identity]
+		if identity == "" || !ok || seen[identity] {
+			return false
+		}
+		seen[identity] = true
+		if requireVerdict {
+			if strings.TrimSpace(gold.Verdict) == "" || claim.Verdict != gold.Verdict {
+				return false
+			}
+		}
+		if requireConflict {
+			if gold.Conflict == nil || strings.TrimSpace(gold.Verdict) == "" ||
+				claim.Verdict != gold.Verdict {
+				return false
+			}
+			hasConflict := false
+			for _, evidence := range claim.Evidence {
+				hasConflict = hasConflict || evidence.Conflict
+			}
+			if hasConflict != *gold.Conflict {
+				return false
+			}
+			if hasConflict &&
+				claim.Verdict != EvidenceAuditVerdictMixed &&
+				claim.Verdict != EvidenceAuditVerdictContradicted {
+				return false
+			}
+			if !hasConflict && claim.Verdict == EvidenceAuditVerdictMixed {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func evidenceAuditProofroomProjectionComplete(
+	audit EvidenceAudit,
+	actual ProofroomEvidenceAuditProjection,
+) bool {
+	claims := make([]ProofroomEvidenceAuditClaim, 0, len(audit.ClaimAudits))
+	for _, claim := range audit.ClaimAudits {
+		statement, err := proofroomMinimizeText(claim.NormalizedStatement)
+		if err != nil {
+			return false
+		}
+		limitations, err := proofroomMinimizeTexts(claim.Limitations)
+		if err != nil {
+			return false
+		}
+		gaps, err := proofroomMinimizeTexts(claim.KnowledgeGaps)
+		if err != nil {
+			return false
+		}
+		actions, err := proofroomMinimizeTexts(claim.ReviewActions)
+		if err != nil {
+			return false
+		}
+		claims = append(claims, ProofroomEvidenceAuditClaim{
+			SourceClaimIdentity: proofroomPrivateTextIdentity("source_claim", claim.SourceClaim),
+			NormalizedStatement: statement,
+			Verdict:             claim.Verdict,
+			ComputedConfidence:  claim.ComputedConfidence,
+			Evidence:            proofroomEvidenceRefs(claim.Evidence),
+			Limitations:         limitations,
+			KnowledgeGaps:       gaps,
+			ReviewActions:       actions,
+		})
+	}
+	conclusion, err := proofroomMinimizeText(audit.Summary.Conclusion)
+	if err != nil {
+		return false
+	}
+	summaryLimitations, err := proofroomMinimizeTexts(audit.Summary.Limitations)
+	if err != nil {
+		return false
+	}
+	title, err := proofroomMinimizeText(audit.Proofroom.Title)
+	if err != nil {
+		return false
+	}
+	reviewItems, err := proofroomMinimizeTexts(audit.Proofroom.ReviewItems)
+	if err != nil {
+		return false
+	}
+	expected := ProofroomEvidenceAuditProjection{
+		SchemaVersion: ProofroomEvidenceAuditSchemaVersion,
+		Audit: ProofroomAuditIdentity{
+			AuditID: audit.AuditID, InputHash: audit.InputHash, OutputHash: audit.OutputHash,
+		},
+		Package:         audit.Package,
+		TraceID:         audit.TraceID,
+		SubjectIdentity: proofroomPrivateTextIdentity("subject", audit.Subject),
+		ScopeIdentity:   proofroomPrivateTextIdentity("scope", audit.Scope),
+		Claims:          claims,
+		Summary: ProofroomEvidenceAuditSummary{
+			Conclusion: conclusion, VerdictCounts: cloneProofroomVerdictCounts(audit.Summary.VerdictCounts),
+			Limitations: summaryLimitations,
+		},
+		Proofroom:             ProofroomReviewContract{Title: title, ReviewItems: reviewItems},
+		AdjudicationAuthority: "proofroom",
+		KBaseDecisionFinal:    false,
+	}
+	return reflect.DeepEqual(expected, actual)
 }
 
 type agentEvaluationModelClient struct {

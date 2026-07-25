@@ -1918,7 +1918,13 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		}
 		defer r.Body.Close()
 		var input AgentPackageEvaluationRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20)).Decode(&input); err != nil {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
 			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
@@ -2467,16 +2473,12 @@ func (h *kbaseHTTPHandler) handleGetCitation(w http.ResponseWriter, r *http.Requ
 		}
 		writeHTTPJSON(w, http.StatusOK, map[string]any{
 			"citation": map[string]string{
-				"citation_id":     citation.CitationID,
-				"book_id":         citation.BookID,
-				"chapter_id":      citation.ChapterID,
-				"chunk_id":        citation.ChunkID,
-				"anchor":          citation.Anchor,
-				"note":            citation.Note,
-				"source_type":     citation.SourceType,
-				"source_account":  citation.SourceAccount,
-				"source_item_key": citation.SourceItemKey,
-				"published_at":    citation.PublishedAt,
+				"citation_id":  citation.CitationID,
+				"book_id":      citation.BookID,
+				"chapter_id":   citation.ChapterID,
+				"chunk_id":     citation.ChunkID,
+				"source_type":  citation.SourceType,
+				"published_at": citation.PublishedAt,
 			},
 			"claim_ids": claimIDs,
 		})

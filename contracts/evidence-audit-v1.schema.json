@@ -72,6 +72,7 @@
     },
     "claim_audits": {
       "type": "array",
+      "minItems": 1,
       "maxItems": 8,
       "items": { "$ref": "#/$defs/claim_audit" }
     },
@@ -111,6 +112,17 @@
     {
       "if": { "required": ["retry_of"] },
       "then": { "required": ["attempt", "request_identity"] }
+    },
+    {
+      "if": { "not": { "required": ["retry_of"] } },
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["attempt"] },
+            { "required": ["request_identity"] }
+          ]
+        }
+      }
     }
   ],
   "$defs": {
@@ -222,7 +234,7 @@
         "chunk_id": { "$ref": "#/$defs/identifier" },
         "citation_id": { "$ref": "#/$defs/identifier" },
         "published_at": { "type": "string", "maxLength": 64 },
-        "freshness_decision": { "enum": ["fresh", "missing"] },
+        "freshness_decision": { "enum": ["fresh", "stale", "missing"] },
         "conflict": { "type": "boolean" }
       }
     },
@@ -250,7 +262,25 @@
         "limitations": { "$ref": "#/$defs/text_list" },
         "knowledge_gaps": { "$ref": "#/$defs/text_list" },
         "review_actions": { "$ref": "#/$defs/text_list" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "enum": ["supported", "contradicted", "mixed"]
+              }
+            },
+            "required": ["verdict"]
+          },
+          "then": {
+            "required": ["evidence_refs"],
+            "properties": {
+              "evidence_refs": { "minItems": 1 }
+            }
+          }
+        }
+      ]
     },
     "text_list": {
       "type": "array",
@@ -285,5 +315,5 @@
       }
     }
   },
-  "additionalProperties": true
+  "additionalProperties": false
 }
