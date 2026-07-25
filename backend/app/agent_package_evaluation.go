@@ -866,6 +866,44 @@ func (s *BookKnowledgeStore) SaveAgentPackageEvaluation(pkg AgentPackage, suite 
 	return writeFileAtomically(s.AgentPackageEvaluationPath(report.PackageContentHash), payload)
 }
 
+func (s *BookKnowledgeStore) MigrateLegacyTrustedAgentPackageEvaluation(
+	pkg AgentPackage,
+	suite AgentEvaluationSuite,
+	evaluatedAt time.Time,
+) (*AgentEvaluationReport, error) {
+	if pkg.SchemaVersion != AgentPackageSchemaVersionV2 {
+		return nil, fmt.Errorf("legacy trusted evaluation migration requires agent-package.v2")
+	}
+	resolved, expected, err := EvaluateAgentPackageAgainstTrustedSuite(s, pkg, suite, evaluatedAt)
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var existing AgentEvaluationReport
+	if err := readJSONFile(s.AgentPackageEvaluationPath(pkg.ContentHash), &existing); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(existing.TrustedSuiteHash) != "" {
+		return nil, fmt.Errorf("trusted agent package evaluation is immutable")
+	}
+	var existingSuite AgentEvaluationSuite
+	if err := readJSONFile(s.AgentPackageEvaluationSuitePath(pkg.ContentHash), &existingSuite); err != nil {
+		return nil, err
+	}
+	if !reflect.DeepEqual(existingSuite, resolved) {
+		return nil, fmt.Errorf("legacy evaluation suite does not match trusted evaluation suite")
+	}
+	payload, err := encodeJSONFile(expected)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeFileAtomically(s.AgentPackageEvaluationPath(pkg.ContentHash), payload); err != nil {
+		return nil, err
+	}
+	return &expected, nil
+}
+
 func (s *BookKnowledgeStore) LoadAgentPackageEvaluationSuite(packageContentHash string) (*AgentEvaluationSuite, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

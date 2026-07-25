@@ -351,6 +351,55 @@ func TestKBaseHTTPHandlerSeparatesTrustedGoldInstallationFromPublisherEvaluation
 	if _, err := store.LoadAgentPackageEvaluation(pkg.ContentHash); !os.IsNotExist(err) {
 		t.Fatalf("tampered evaluation persisted sidecar: %v", err)
 	}
+
+	legacyReport, err := EvaluateAgentPackageDeterministically(
+		store,
+		pkg,
+		submitted,
+		testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySuitePayload, err := encodeJSONFile(submitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReportPayload, err := encodeJSONFile(legacyReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.AgentPackageEvaluationDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(store.AgentPackageEvaluationSuitePath(pkg.ContentHash), legacySuitePayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(store.AgentPackageEvaluationPath(pkg.ContentHash), legacyReportPayload); err != nil {
+		t.Fatal(err)
+	}
+	validPayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: submitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrated := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluate",
+		"publisher-token",
+		string(validPayload),
+	)
+	if migrated.Code != http.StatusOK ||
+		!strings.Contains(migrated.Body.String(), `"migrated":true`) {
+		t.Fatalf("legacy trusted evaluation migration status=%d body=%s", migrated.Code, migrated.Body.String())
+	}
+	stored, err := store.LoadAgentPackageEvaluation(pkg.ContentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.TrustedSuiteHash == "" {
+		t.Fatal("legacy evaluation migration did not persist trusted_suite_hash")
+	}
 }
 
 func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {

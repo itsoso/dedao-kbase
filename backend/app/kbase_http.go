@@ -1998,6 +1998,32 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
 				return
 			}
+			if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+				if existing.TrustedSuiteHash == "" {
+					evaluatedAt, parseErr := time.Parse(time.RFC3339Nano, existing.EvaluatedAt)
+					if parseErr != nil {
+						writeHTTPError(w, http.StatusConflict, "legacy agent package evaluation timestamp is invalid")
+						return
+					}
+					migrated, migrateErr := h.store.MigrateLegacyTrustedAgentPackageEvaluation(
+						input.Package,
+						evaluationSuite,
+						evaluatedAt,
+					)
+					if migrateErr != nil {
+						writeHTTPError(w, http.StatusConflict, migrateErr.Error())
+						return
+					}
+					writeHTTPJSON(w, http.StatusOK, map[string]any{
+						"created": false, "migrated": true, "evaluation": migrated,
+					})
+					return
+				}
+				if existing.TrustedSuiteHash != trustedSuiteHash {
+					writeHTTPError(w, http.StatusConflict, "agent package trusted evaluation identity is immutable")
+					return
+				}
+			}
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"created": false, "evaluation": existing})
 			return
 		} else if !os.IsNotExist(err) {

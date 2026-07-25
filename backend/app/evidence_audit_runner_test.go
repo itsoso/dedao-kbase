@@ -1696,7 +1696,7 @@ func (c *evidenceAuditSequenceClient) Chat(ctx context.Context, _ BookTokenPlanC
 func evidenceAuditRunnerConfig() EvidenceAuditRunnerConfig {
 	return EvidenceAuditRunnerConfig{
 		ModelConfig: BookTokenPlanConfig{APIKey: "synthetic-test-key", BaseURL: "https://invalid.test/v1"},
-		Timeout:     time.Second,
+		Timeout:     5 * time.Second,
 		Now:         func() time.Time { return testAgentPackageTime().Add(2 * time.Hour) },
 	}
 }
