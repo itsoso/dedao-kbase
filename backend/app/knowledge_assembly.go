@@ -28,6 +28,11 @@ const (
 	knowledgeAssemblyDefaultLimit  = 100
 	knowledgeAssemblyMaxLimit      = 500
 	knowledgeAssemblyMaxQueryRunes = 256
+
+	knowledgeAssemblyMaxClaimsPerCluster    = 128
+	knowledgeAssemblyMaxStatementRunes      = 4096
+	knowledgeAssemblyMaxCitationIDsPerClaim = 128
+	knowledgeAssemblyMaxConflictsPerCluster = 256
 )
 
 type KnowledgeReleaseAssemblyQuery struct {
@@ -149,7 +154,23 @@ func BuildKnowledgeReleaseAssembly(
 	for _, release := range releases {
 		publication := canonicalKnowledgeAssemblyPublicationIdentity(release.Book)
 		for _, claim := range release.Analysis.Claims {
-			normalized := normalizeKnowledgeAssemblyClaim(claim.Statement)
+			statement := strings.TrimSpace(claim.Statement)
+			if utf8.RuneCountInString(statement) > knowledgeAssemblyMaxStatementRunes {
+				return nil, fmt.Errorf(
+					"claim %q statement exceeds %d characters",
+					boundedEvidenceID(claim.ID),
+					knowledgeAssemblyMaxStatementRunes,
+				)
+			}
+			citationIDs := uniqueSortedStrings(claim.CitationIDs)
+			if len(citationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+				return nil, fmt.Errorf(
+					"claim %q citation_ids exceeds %d items",
+					boundedEvidenceID(claim.ID),
+					knowledgeAssemblyMaxCitationIDsPerClaim,
+				)
+			}
+			normalized := normalizeKnowledgeAssemblyClaim(statement)
 			if strings.TrimSpace(claim.ID) == "" || normalized == "" || len(claim.CitationIDs) == 0 {
 				return nil, fmt.Errorf(
 					"selected release %q contains an incomplete analysis claim",
@@ -174,13 +195,20 @@ func BuildKnowledgeReleaseAssembly(
 				}
 				clusterMap[clusterID] = cluster
 			}
+			if len(cluster.Claims) >= knowledgeAssemblyMaxClaimsPerCluster {
+				return nil, fmt.Errorf(
+					"cluster %q claims exceeds %d items",
+					boundedEvidenceID(clusterID),
+					knowledgeAssemblyMaxClaimsPerCluster,
+				)
+			}
 			cluster.Claims = append(cluster.Claims, KnowledgeReleaseAssemblyClaimRef{
 				ReleaseID:                      release.ReleaseID,
 				BookID:                         release.BookID,
 				ClaimID:                        claim.ID,
-				Statement:                      strings.TrimSpace(claim.Statement),
+				Statement:                      statement,
 				Polarity:                       polarity,
-				CitationIDs:                    uniqueSortedStrings(claim.CitationIDs),
+				CitationIDs:                    citationIDs,
 				PublicationIdentity:            publication.Key,
 				PublicationIdentityBasis:       publication.Basis,
 				IndependentPublicationEligible: publication.IndependentSourceEligible,
@@ -196,7 +224,9 @@ func BuildKnowledgeReleaseAssembly(
 		ClusterCount: len(clusterMap),
 	}
 	for _, cluster := range clusterMap {
-		finalizeKnowledgeAssemblyCluster(cluster)
+		if err := finalizeKnowledgeAssemblyCluster(cluster); err != nil {
+			return nil, err
+		}
 		switch cluster.Status {
 		case KnowledgeAssemblyStatusPotentialConflict:
 			summary.PotentialConflictClusters++
@@ -373,6 +403,27 @@ func ValidateKnowledgeReleaseAssembly(assembly KnowledgeReleaseAssembly) error {
 			return fmt.Errorf("clusters contains duplicate cluster_id %q", boundedEvidenceID(cluster.ClusterID))
 		}
 		seenClusters[cluster.ClusterID] = struct{}{}
+		if utf8.RuneCountInString(cluster.NormalizedAssertion) > knowledgeAssemblyMaxStatementRunes {
+			return fmt.Errorf(
+				"clusters[%d].normalized_assertion exceeds %d characters",
+				index,
+				knowledgeAssemblyMaxStatementRunes,
+			)
+		}
+		if len(cluster.Claims) > knowledgeAssemblyMaxClaimsPerCluster {
+			return fmt.Errorf(
+				"clusters[%d].claims exceeds %d items",
+				index,
+				knowledgeAssemblyMaxClaimsPerCluster,
+			)
+		}
+		if len(cluster.PotentialConflicts) > knowledgeAssemblyMaxConflictsPerCluster {
+			return fmt.Errorf(
+				"clusters[%d].potential_conflicts exceeds %d items",
+				index,
+				knowledgeAssemblyMaxConflictsPerCluster,
+			)
+		}
 		switch cluster.Status {
 		case KnowledgeAssemblyStatusPotentialConflict,
 			KnowledgeAssemblyStatusCorroborated,
@@ -401,6 +452,22 @@ func ValidateKnowledgeReleaseAssembly(assembly KnowledgeReleaseAssembly) error {
 			}
 			if len(claim.CitationIDs) == 0 {
 				return fmt.Errorf("clusters[%d].claims[%d].citation_ids is required", index, claimIndex)
+			}
+			if utf8.RuneCountInString(claim.Statement) > knowledgeAssemblyMaxStatementRunes {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].statement exceeds %d characters",
+					index,
+					claimIndex,
+					knowledgeAssemblyMaxStatementRunes,
+				)
+			}
+			if len(claim.CitationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].citation_ids exceeds %d items",
+					index,
+					claimIndex,
+					knowledgeAssemblyMaxCitationIDsPerClaim,
+				)
 			}
 		}
 	}
@@ -472,7 +539,7 @@ func latestKnowledgeAssemblyReleaseRecords(
 	return result, nil
 }
 
-func finalizeKnowledgeAssemblyCluster(cluster *KnowledgeReleaseAssemblyCluster) {
+func finalizeKnowledgeAssemblyCluster(cluster *KnowledgeReleaseAssemblyCluster) error {
 	sort.Slice(cluster.Claims, func(i, j int) bool {
 		if cluster.Claims[i].ReleaseID != cluster.Claims[j].ReleaseID {
 			return cluster.Claims[i].ReleaseID < cluster.Claims[j].ReleaseID
@@ -498,6 +565,13 @@ func finalizeKnowledgeAssemblyCluster(cluster *KnowledgeReleaseAssemblyCluster) 
 	cluster.IndependentPublicationCount = len(independent)
 	for _, positiveClaim := range positive {
 		for _, negativeClaim := range negative {
+			if len(cluster.PotentialConflicts) >= knowledgeAssemblyMaxConflictsPerCluster {
+				return fmt.Errorf(
+					"cluster %q potential_conflicts exceeds %d items",
+					boundedEvidenceID(cluster.ClusterID),
+					knowledgeAssemblyMaxConflictsPerCluster,
+				)
+			}
 			seed := strings.Join([]string{
 				cluster.ClusterID,
 				positiveClaim.ReleaseID,
@@ -528,6 +602,7 @@ func finalizeKnowledgeAssemblyCluster(cluster *KnowledgeReleaseAssemblyCluster) 
 	default:
 		cluster.Status = KnowledgeAssemblyStatusInsufficientIdentity
 	}
+	return nil
 }
 
 func normalizeKnowledgeAssemblyClaim(value string) string {

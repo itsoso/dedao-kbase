@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -254,6 +255,186 @@ func TestBuildKnowledgeReleaseAssemblyReadsLegacyReleaseEvidence(t *testing.T) {
 	}
 }
 
+func TestBuildKnowledgeReleaseAssemblyRejectsOversizedCluster(t *testing.T) {
+	tests := []struct {
+		name  string
+		build func(*testing.T, *BookKnowledgeStore)
+		want  string
+	}{
+		{
+			name: "claims",
+			build: func(t *testing.T, store *BookKnowledgeStore) {
+				for index := 0; index < 129; index++ {
+					saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
+						fmt.Sprintf("release-claim-%03d", index),
+						fmt.Sprintf("book-claim-%03d", index),
+						fmt.Sprintf("2026-07-26T10:%02d:%02dZ", index/60, index%60),
+						"同一受限结论",
+						fmt.Sprintf("Publisher %03d", index),
+						"wechat_mp_article",
+					))
+				}
+			},
+			want: "claims exceeds 128",
+		},
+		{
+			name: "statement",
+			build: func(t *testing.T, store *BookKnowledgeStore) {
+				saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
+					"release-statement",
+					"book-statement",
+					"2026-07-26T10:00:00Z",
+					strings.Repeat("界", 4097),
+					"Publisher",
+					"wechat_mp_article",
+				))
+			},
+			want: "statement exceeds 4096",
+		},
+		{
+			name: "citation ids",
+			build: func(t *testing.T, store *BookKnowledgeStore) {
+				release := knowledgeAssemblyTestRelease(
+					"release-citations",
+					"book-citations",
+					"2026-07-26T10:00:00Z",
+					"引用数量受限",
+					"Publisher",
+					"wechat_mp_article",
+				)
+				release.Analysis.Claims[0].CitationIDs = nil
+				release.Citations = nil
+				for index := 0; index < 129; index++ {
+					citationID := fmt.Sprintf("citation-%03d", index)
+					release.Analysis.Claims[0].CitationIDs = append(
+						release.Analysis.Claims[0].CitationIDs,
+						citationID,
+					)
+					release.Citations = append(release.Citations, BookKnowledgeCitation{
+						CitationID: citationID,
+						BookID:     release.BookID,
+						ChunkID:    fmt.Sprintf("chunk-%03d", index),
+					})
+				}
+				saveKnowledgeAssemblyRelease(t, store, release)
+			},
+			want: "citation_ids exceeds 128",
+		},
+		{
+			name: "potential conflicts",
+			build: func(t *testing.T, store *BookKnowledgeStore) {
+				for index := 0; index < 34; index++ {
+					statement := "治疗能降低风险"
+					if index >= 17 {
+						statement = "治疗不能降低风险"
+					}
+					saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
+						fmt.Sprintf("release-conflict-%03d", index),
+						fmt.Sprintf("book-conflict-%03d", index),
+						fmt.Sprintf("2026-07-26T10:00:%02dZ", index),
+						statement,
+						fmt.Sprintf("Publisher %03d", index),
+						"wechat_mp_article",
+					))
+				}
+			},
+			want: "potential_conflicts exceeds 256",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			testCase.build(t, store)
+			if _, err := BuildKnowledgeReleaseAssembly(
+				store,
+				KnowledgeReleaseAssemblyQuery{Limit: 500},
+			); err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("oversized assembly error = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestValidateKnowledgeReleaseAssemblyRejectsOversizedCluster(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
+		"release-a",
+		"book-a",
+		"2026-07-26T10:00:00Z",
+		"受限结论",
+		"Publisher",
+		"wechat_mp_article",
+	))
+	base, err := BuildKnowledgeReleaseAssembly(
+		store,
+		KnowledgeReleaseAssemblyQuery{Limit: 500},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*KnowledgeReleaseAssembly)
+		want   string
+	}{
+		{
+			name: "claims",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				claim := assembly.Clusters[0].Claims[0]
+				assembly.Clusters[0].Claims = nil
+				for index := 0; index < 129; index++ {
+					next := claim
+					next.ClaimID = fmt.Sprintf("claim-%03d", index)
+					assembly.Clusters[0].Claims = append(assembly.Clusters[0].Claims, next)
+				}
+				assembly.Summary.ClaimCount = 129
+			},
+			want: "claims exceeds 128",
+		},
+		{
+			name: "statement",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Claims[0].Statement = strings.Repeat("界", 4097)
+			},
+			want: "statement exceeds 4096",
+		},
+		{
+			name: "citation ids",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Claims[0].CitationIDs = nil
+				for index := 0; index < 129; index++ {
+					assembly.Clusters[0].Claims[0].CitationIDs = append(
+						assembly.Clusters[0].Claims[0].CitationIDs,
+						fmt.Sprintf("citation-%03d", index),
+					)
+				}
+			},
+			want: "citation_ids exceeds 128",
+		},
+		{
+			name: "potential conflicts",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Status = KnowledgeAssemblyStatusPotentialConflict
+				assembly.Clusters[0].PotentialConflicts = make(
+					[]KnowledgeReleaseAssemblyPotentialConflict,
+					257,
+				)
+			},
+			want: "potential_conflicts exceeds 256",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			assembly := cloneKnowledgeReleaseAssembly(t, *base)
+			testCase.mutate(&assembly)
+			if err := ValidateKnowledgeReleaseAssembly(assembly); err == nil ||
+				!strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("oversized contract error = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+}
+
 func TestBuildKnowledgeReleaseAssemblyIsBoundedQueryableAndPrivacySafe(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	first := knowledgeAssemblyTestRelease(
@@ -344,4 +525,20 @@ func saveKnowledgeAssemblyRelease(t *testing.T, store *BookKnowledgeStore, relea
 	if err := store.saveKnowledgeRelease(release); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func cloneKnowledgeReleaseAssembly(
+	t *testing.T,
+	assembly KnowledgeReleaseAssembly,
+) KnowledgeReleaseAssembly {
+	t.Helper()
+	payload, err := json.Marshal(assembly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cloned KnowledgeReleaseAssembly
+	if err := json.Unmarshal(payload, &cloned); err != nil {
+		t.Fatal(err)
+	}
+	return cloned
 }
