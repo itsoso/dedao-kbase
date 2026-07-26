@@ -63,6 +63,31 @@ func TestEvaluateKnowledgeEvidenceBlocksMissingClaimEvidence(t *testing.T) {
 	}
 }
 
+func TestEvaluateKnowledgeEvidenceBlocksAnalysisFromAnotherBook(t *testing.T) {
+	analysis := evidenceTestAnalysis("citation-1")
+	analysis.BookID = "other-book"
+
+	report := EvaluateKnowledgeEvidence(evidenceTestPackage(), analysis)
+
+	if !report.HasStructuralBlockers() || !evidenceIssueExists(report, "analysis_book_mismatch", "blocker") {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
+func TestEvaluateKnowledgeEvidenceBlocksDeclaredSourceWithoutPackageObject(t *testing.T) {
+	analysis := evidenceTestAnalysis("invented-source")
+	analysis.Sources = []BookKnowledgeChatSource{{Kind: "chunk", ID: "invented-source"}}
+
+	report := EvaluateKnowledgeEvidence(evidenceTestPackage(), analysis)
+
+	if !report.HasStructuralBlockers() || !evidenceIssueExists(report, "declared_source_unresolved", "blocker") {
+		t.Fatalf("report = %#v", report)
+	}
+	if report.ResolvedReferences != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
 func TestEvaluateKnowledgeEvidenceBlocksConflictingDuplicateID(t *testing.T) {
 	pkg := evidenceTestPackage()
 	pkg.Chunks = append(pkg.Chunks, BookKnowledgeChunk{

@@ -34,12 +34,6 @@ func TestKnowledgeReleasePublicationIsContentAddressedAndIdempotent(t *testing.T
 
 func TestKnowledgeReleaseEmbedsValidatedManifestSources(t *testing.T) {
 	store := qualityTestStore(t)
-	manifest, _ := store.LoadAnalysisManifest("42")
-	manifest.Payload.Claims[0].CitationIDs = []string{"synthetic-source"}
-	manifest.Sources = append(manifest.Sources, BookKnowledgeChatSource{Kind: "chunk", ID: "synthetic-source"})
-	if err := store.SaveAnalysisManifest(*manifest); err != nil {
-		t.Fatal(err)
-	}
 	if report, err := EvaluateBookAnalysisQuality(store, "42"); err != nil || report.Decision != BookQualityPass {
 		t.Fatalf("quality report = %#v, err=%v", report, err)
 	}
@@ -49,7 +43,7 @@ func TestKnowledgeReleaseEmbedsValidatedManifestSources(t *testing.T) {
 	}
 	found := false
 	for _, source := range release.Sources {
-		if source.ID == "synthetic-source" {
+		if source.ID == "42-chunk-1" {
 			found = true
 		}
 	}
@@ -93,8 +87,9 @@ func TestKnowledgeReleaseRejectsAnalysisChangedAfterQualityPass(t *testing.T) {
 func TestKnowledgeReleaseRejectsSourcesChangedAfterQualityPass(t *testing.T) {
 	store := qualityTestStore(t)
 	manifest, _ := store.LoadAnalysisManifest("42")
-	manifest.Payload.Claims[0].CitationIDs = []string{"synthetic-source"}
-	manifest.Sources = append(manifest.Sources, BookKnowledgeChatSource{Kind: "chunk", ID: "synthetic-source"})
+	manifest.Sources = append(manifest.Sources, BookKnowledgeChatSource{
+		Kind: "claim", ID: "42-claim-1", ChapterID: "42-chapter-1",
+	})
 	if err := store.SaveAnalysisManifest(*manifest); err != nil {
 		t.Fatal(err)
 	}

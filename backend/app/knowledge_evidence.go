@@ -246,11 +246,35 @@ func EvaluateKnowledgeEvidence(pkg BookKnowledgePackage, analysis *BookAnalysisM
 		finalizeKnowledgeEvidenceReport(&report)
 		return report
 	}
-	declaredSources := make(map[string]BookKnowledgeChatSource)
+	if !sameKnowledgeBook(report.BookID, analysis.BookID) {
+		addIssue("analysis_book_mismatch", KnowledgeEvidenceBlocker, "analysis", analysis.BookID, report.BookID)
+	}
 	for _, source := range analysis.Sources {
 		id := strings.TrimSpace(source.ID)
-		if id != "" {
-			declaredSources[id] = source
+		valid := false
+		switch strings.ToLower(strings.TrimSpace(source.Kind)) {
+		case "citation":
+			valid = validCitations[id]
+		case "chunk":
+			valid = validChunks[id]
+		case "chapter":
+			valid = validChapters[id]
+		case "claim":
+			valid = validClaims[id]
+		}
+		if !valid {
+			addIssue("declared_source_unresolved", KnowledgeEvidenceBlocker, "analysis_source", id, source.Kind)
+			continue
+		}
+		chapterID := strings.TrimSpace(source.ChapterID)
+		if chapterID != "" && !validChapters[chapterID] {
+			addIssue("declared_source_chapter_unresolved", KnowledgeEvidenceBlocker, "analysis_source", id, chapterID)
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(source.Kind), "chunk") && chapterID != "" {
+			if chunkChapterID := strings.TrimSpace(chunks[id].ChapterID); chunkChapterID != "" && chunkChapterID != chapterID {
+				addIssue("declared_source_chapter_mismatch", KnowledgeEvidenceBlocker, "analysis_source", id, chapterID)
+			}
 		}
 	}
 	for _, claim := range analysis.Payload.Claims {
@@ -282,11 +306,6 @@ func EvaluateKnowledgeEvidence(pkg BookKnowledgePackage, analysis *BookAnalysisM
 				result.ResolvedReferences++
 				result.LegacyDirectReferences++
 				addIssue("legacy_direct_object_reference", KnowledgeEvidenceWarning, "analysis_claim", claim.ID, referenceID)
-			case declaredSourceResolves(referenceID, declaredSources, idKinds):
-				report.ResolvedReferences++
-				result.ResolvedReferences++
-				result.LegacyDirectReferences++
-				addIssue("declared_analysis_source_reference", KnowledgeEvidenceWarning, "analysis_claim", claim.ID, referenceID)
 			default:
 				if len(idKinds[referenceID]) > 1 {
 					addIssue("ambiguous_evidence_reference", KnowledgeEvidenceBlocker, "analysis_claim", claim.ID, referenceID)
@@ -400,29 +419,17 @@ func knowledgeEvidenceIssueIsStructural(code string) bool {
 		"missing_object_id",
 		"conflicting_duplicate_id",
 		"ambiguous_object_id",
+		"analysis_book_mismatch",
 		"cross_book_reference",
 		"chunk_chapter_unresolved",
 		"claim_chapter_unresolved",
 		"citation_chunk_unresolved",
 		"citation_chapter_unresolved",
 		"citation_chunk_chapter_mismatch",
+		"declared_source_unresolved",
+		"declared_source_chapter_unresolved",
+		"declared_source_chapter_mismatch",
 		"package_claim_evidence_unresolved":
-		return true
-	default:
-		return false
-	}
-}
-
-func declaredSourceResolves(id string, sources map[string]BookKnowledgeChatSource, idKinds map[string]map[string]struct{}) bool {
-	source, ok := sources[id]
-	if !ok {
-		return false
-	}
-	if len(idKinds[id]) > 1 {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(source.Kind)) {
-	case "citation", "chunk", "chapter", "claim":
 		return true
 	default:
 		return false

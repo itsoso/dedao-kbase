@@ -78,7 +78,8 @@ Resolve each `BookAnalysisClaim.CitationIDs` entry in this order:
 2. chunk;
 3. chapter;
 4. package claim;
-5. declared `BookKnowledgeChatSource`.
+5. declared `BookKnowledgeChatSource`, only when its kind and ID resolve to one
+   of the current package objects.
 
 Explicit citations must terminate in a valid chunk. Direct chunk references are
 accepted during Phase 1 and counted separately. Unknown or ambiguous IDs block
