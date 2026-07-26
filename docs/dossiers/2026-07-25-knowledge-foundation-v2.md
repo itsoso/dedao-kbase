@@ -2,7 +2,9 @@
 
 ## Status
 
-Implementation in progress on branch `codex/knowledge-foundation-v2`.
+Implementation and local verification complete on branch
+`codex/knowledge-foundation-v2`. Awaiting clean-main integration, deployment,
+and online verification.
 
 ## User Requirement
 
@@ -59,12 +61,44 @@ PASS with controls.
 
 ### G3 - Tests
 
-Pending implementation.
+PASS on 2026-07-25.
+
+- `npm --prefix frontend run build`
+- `go test ./... -count=1`
+- `go test -race ./backend/app ./cmd/kbase-server -count=1`
+- `go vet ./...`
+- `go mod verify`
+- `bash scripts/knowledge-contract-smoke.sh`
+- `node frontend/scripts/markdown-render-smoke.mjs`
+- `node frontend/scripts/book-knowledge-ui-smoke.mjs`
+- generated system-map drift check
+- `bash scripts/privacy-smoke.sh`
+- `git diff --check`
+
+The frontend build retains the existing dependency `eval` and large-chunk
+warnings. The race build retains the existing macOS `LC_DYSYMTAB` linker
+warning. All commands exited successfully; no race report or test failure was
+emitted.
 
 ### G4 - Review
 
-Pending implementation and independent review because this changes publication
-and external API behavior.
+PASS after remediation on 2026-07-25.
+
+The first independent review returned BLOCK:
+
+- a citation could terminate at a chunk without a chapter;
+- readiness exposed raw `source_account`;
+- readiness summary counted only the `limit`-truncated item set.
+
+The implementation was returned to S5. Failing regression tests were added
+before fixing each issue. Chunks now require a resolvable chapter, readiness
+exposes only the bounded canonical publication identity, and summary metrics
+cover every matching package while `limit` bounds only returned items.
+
+The second review found no remaining P1/P2 implementation issue. Its final
+conditional blocker was the uncommitted generated system map. Commit `c09f4a7`
+added the generated route/type inventory, and the drift check passed from a
+clean worktree.
 
 ### G5 - Deployment Health
 
@@ -84,12 +118,26 @@ fixtures.
 
 ## Implementation Checkpoints
 
-- Task 1 - Documentation: in progress.
-- Task 2 - Evidence graph contract: pending.
-- Task 3 - Quality and publication gates: pending.
-- Task 4 - Readiness projection: pending.
-- Task 5 - HTTP and JSON Schema contract: pending.
-- Task 6 - full verification and review: pending.
+- Task 1 - Documentation: completed in `a92d1b5`.
+- Task 2 - Evidence graph contract: completed in `62bfc63` and hardened in
+  `7be9f0a`.
+- Task 3 - Quality and publication gates: completed in `02b237a`.
+- Task 4 - Readiness projection: completed in `2a250b4`.
+- Task 5 - HTTP and JSON Schema contract: completed in `5390cf5`.
+- Task 6 - review remediation and generated system map: completed in `2acd71b`
+  and `c09f4a7`.
+
+## Delivered Behavior
+
+- Deterministic package identity and evidence graph validation.
+- Complete citation-to-chunk-to-chapter ownership checks.
+- Conservative publication identity with independence eligibility.
+- Quality quarantine/reject rules for unresolved and structurally unsafe
+  evidence.
+- Publication-time evidence revalidation independent of stored quality state.
+- Authenticated `GET /api/knowledge/readiness` with corpus-wide aggregate
+  coverage and bounded item projection.
+- `knowledge-readiness-v1.schema.json` and supply-contract documentation.
 
 ## Rollback
 
