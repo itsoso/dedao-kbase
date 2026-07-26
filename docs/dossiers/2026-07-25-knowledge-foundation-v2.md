@@ -2,9 +2,7 @@
 
 ## Status
 
-Implementation and local verification complete on branch
-`codex/knowledge-foundation-v2`. Awaiting clean-main integration, deployment,
-and online verification.
+Released to production on 2026-07-26. G1-G6 PASS.
 
 ## User Requirement
 
@@ -102,12 +100,40 @@ clean worktree.
 
 ### G5 - Deployment Health
 
-Pending explicit deployment decision after clean-main integration.
+PASS on 2026-07-26.
+
+- Remote `dedao-kbase/main` remained at `b62e53c`; the reviewed feature was a
+  direct descendant, so `main` fast-forwarded to exact revision `d6c17e1`.
+- The release archive SHA-256 was
+  `096c3c9d76ea3814ecdec6c2c03a7b6d15229de5c7414d3a70b59788e613778f`.
+- Production preflight built `frontend/dist`, passed every
+  `frontend-web/scripts/*smoke*.mjs` check, passed
+  `go test ./... -timeout=240s`, and built the Linux CGO server.
+- The deployed binary SHA-256 was
+  `a054421263944e2fdec0fe7839fcf3a6a2093856be41b0f06d7a76e66c4937bb`.
+- Deployment replaced only the service binary and static Web bundle; knowledge
+  data, configuration, and secrets were not changed.
+- Scoped binary and static Web backups were retained under rollback identifier
+  `d6c17e1-20260726123746`.
+- Post-deploy service state was `active`, `ExecMainStatus=0`, `NRestarts=0`,
+  and the local health endpoint returned
+  `{"ok":true,"service":"dedao-kbase"}`.
 
 ### G6 - Online Verification
 
-Pending production verification with synthetic or authorized metadata-only
-fixtures.
+PASS on 2026-07-26.
+
+- Public `https://kbase.executor.life/health` returned
+  `{"ok":true,"service":"dedao-kbase"}`.
+- Unauthenticated local
+  `GET /api/knowledge/readiness?limit=3` returned HTTP `401`.
+- Authenticated metadata-only verification returned HTTP `200`,
+  `schema_version=knowledge_readiness.v1`, corpus `total=266`, `ready=10`,
+  `blocked=5`, and three bounded items.
+- The response contained no raw `source_account` field.
+- Service state remained `active`, `ExecMainStatus=0`, and `NRestarts=0`.
+- Recent service logs contained no `panic`, `fatal`, `error`, or `failed`
+  entries.
 
 ## Artifacts
 
