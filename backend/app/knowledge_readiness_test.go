@@ -131,12 +131,16 @@ func TestBuildKnowledgeReadinessFiltersAndLimitsDeterministically(t *testing.T) 
 	if len(limited.Items) != 1 || limited.Items[0].BookID != "book-a" {
 		t.Fatalf("limited = %#v", limited)
 	}
+	if limited.Summary.Total != 2 || limited.Summary.NeedsAnalysis != 2 {
+		t.Fatalf("limited summary must cover all matching books: %#v", limited.Summary)
+	}
 }
 
 func TestBuildKnowledgeReadinessResponseIsPrivacySafe(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	pkg := evidenceTestPackage()
 	pkg.Book.SourceHTML = "sensitive-local-path/downloaded.html"
+	pkg.Book.SourceAccount = "sensitive-local-path/account"
 	pkg.Chunks[0].Text = "private body sentinel"
 	if err := store.SavePackage(pkg); err != nil {
 		t.Fatal(err)
@@ -151,7 +155,7 @@ func TestBuildKnowledgeReadinessResponseIsPrivacySafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := string(payload)
-	for _, forbidden := range []string{"sensitive-local-path", "private body sentinel", "downloaded.html", `"prompt"`, `"answer"`, `"token"`} {
+	for _, forbidden := range []string{"sensitive-local-path", "private body sentinel", "downloaded.html", `"source_account":`, `"prompt"`, `"answer"`, `"token"`} {
 		if strings.Contains(raw, forbidden) {
 			t.Fatalf("readiness leaked %q: %s", forbidden, raw)
 		}

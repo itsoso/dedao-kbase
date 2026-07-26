@@ -39,7 +39,6 @@ type KnowledgeReadinessItem struct {
 	BookID                      string                       `json:"book_id"`
 	Title                       string                       `json:"title"`
 	SourceType                  string                       `json:"source_type,omitempty"`
-	SourceAccount               string                       `json:"source_account,omitempty"`
 	Publication                 KnowledgePublicationIdentity `json:"publication"`
 	Stage                       string                       `json:"stage"`
 	NextAction                  string                       `json:"next_action"`
@@ -80,9 +79,6 @@ func BuildKnowledgeReadiness(store *BookKnowledgeStore, limit int, bookID string
 		if bookID != "" && book.BookID != bookID {
 			continue
 		}
-		if len(result.Items) >= limit {
-			break
-		}
 		pkg, err := store.LoadPackage(book.BookID)
 		if err != nil {
 			return nil, err
@@ -108,7 +104,6 @@ func BuildKnowledgeReadiness(store *BookKnowledgeStore, limit int, bookID string
 			BookID:                      book.BookID,
 			Title:                       book.Title,
 			SourceType:                  book.SourceType,
-			SourceAccount:               book.SourceAccount,
 			Publication:                 evidence.Publication,
 			Stage:                       projection.Stage,
 			NextAction:                  nextAction,
@@ -128,8 +123,10 @@ func BuildKnowledgeReadiness(store *BookKnowledgeStore, limit int, bookID string
 			BlockerCodes:                boundedKnowledgeEvidenceCodes(evidence.Issues, KnowledgeEvidenceBlocker, 20),
 			WarningCodes:                boundedKnowledgeEvidenceCodes(evidence.Issues, KnowledgeEvidenceWarning, 20),
 		}
-		result.Items = append(result.Items, item)
 		accumulateKnowledgeReadinessSummary(&result.Summary, item)
+		if len(result.Items) < limit {
+			result.Items = append(result.Items, item)
+		}
 	}
 	finalizeKnowledgeReadinessSummary(&result.Summary)
 	return result, nil

@@ -1201,6 +1201,7 @@ func TestKBaseHTTPHandlerKnowledgeReadiness(t *testing.T) {
 	pkg := sampleBookKnowledgePackageForExport()
 	pkg.Book.ContentHash = "readiness-hash"
 	pkg.Book.SourceHTML = "sensitive-local-path/downloaded.html"
+	pkg.Book.SourceAccount = "sensitive-local-path/account"
 	if err := store.SavePackage(pkg); err != nil {
 		t.Fatal(err)
 	}
@@ -1217,7 +1218,7 @@ func TestKBaseHTTPHandlerKnowledgeReadiness(t *testing.T) {
 		!strings.Contains(response.Body.String(), `"next_action":"needs_analysis"`) {
 		t.Fatalf("readiness status=%d body=%s", response.Code, response.Body.String())
 	}
-	for _, forbidden := range []string{"sensitive-local-path", "downloaded.html", `"prompt"`, `"answer"`} {
+	for _, forbidden := range []string{"sensitive-local-path", "downloaded.html", `"source_account":`, `"prompt"`, `"answer"`} {
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("readiness leaked %q: %s", forbidden, response.Body.String())
 		}

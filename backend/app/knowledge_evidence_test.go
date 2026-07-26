@@ -126,6 +126,14 @@ func TestEvaluateKnowledgeEvidenceBlocksCrossBookAndBrokenCitationEdges(t *testi
 			code: "cross_book_reference",
 		},
 		{
+			name: "chunk has no chapter",
+			edit: func(pkg *BookKnowledgePackage) {
+				pkg.Chunks[0].ChapterID = ""
+				pkg.Citations[0].ChapterID = ""
+			},
+			code: "chunk_chapter_unresolved",
+		},
+		{
 			name: "citation points to missing chunk",
 			edit: func(pkg *BookKnowledgePackage) {
 				pkg.Citations[0].ChunkID = "missing"

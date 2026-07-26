@@ -108,7 +108,6 @@
             "book_id": { "type": "string", "minLength": 1 },
             "title": { "type": "string", "minLength": 1 },
             "source_type": { "type": "string" },
-            "source_account": { "type": "string" },
             "publication": { "$ref": "#/$defs/publication" },
             "stage": {
               "enum": ["collected", "normalized", "analyzed", "verified", "candidate", "published"]

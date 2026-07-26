@@ -172,7 +172,7 @@ func EvaluateKnowledgeEvidence(pkg BookKnowledgePackage, analysis *BookAnalysisM
 			addIssue("cross_book_reference", KnowledgeEvidenceBlocker, "chunk", id, chunk.BookID)
 		}
 		chapterID := strings.TrimSpace(chunk.ChapterID)
-		if chapterID != "" && (!validChapters[chapterID] || !sameKnowledgeBook(report.BookID, chapters[chapterID].BookID)) {
+		if chapterID == "" || !validChapters[chapterID] || !sameKnowledgeBook(report.BookID, chapters[chapterID].BookID) {
 			addIssue("chunk_chapter_unresolved", KnowledgeEvidenceBlocker, "chunk", id, chapterID)
 			valid = false
 		}

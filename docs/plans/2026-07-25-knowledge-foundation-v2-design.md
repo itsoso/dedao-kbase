@@ -166,7 +166,7 @@ It returns:
 }
 ```
 
-Items contain book and release IDs, title, source type/account, publication
+Items contain book and release IDs, title, source type, canonical publication
 identity, stage, next action, counts, ratios, and bounded issue codes. They do
 not contain source content or machine-specific paths.
 
