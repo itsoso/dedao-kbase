@@ -47,6 +47,29 @@ func TestEvaluateBookAnalysisQualityQuarantinesUnknownCitation(t *testing.T) {
 	if report.Decision != BookQualityQuarantine || !qualityRuleFailed(report, "citation_integrity") {
 		t.Fatalf("report = %#v", report)
 	}
+	if !qualityRuleFailed(report, "evidence_reference_resolution") {
+		t.Fatalf("missing evidence resolution rule: %#v", report)
+	}
+}
+
+func TestEvaluateBookAnalysisQualityRejectsCrossBookEvidenceStructure(t *testing.T) {
+	store := qualityTestStore(t)
+	pkg, err := store.LoadPackage("42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Chunks[0].BookID = "other-book"
+	if err := store.SavePackage(*pkg); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := EvaluateBookAnalysisQuality(store, "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Decision != BookQualityReject || !qualityRuleFailed(report, "evidence_structure") {
+		t.Fatalf("report = %#v", report)
+	}
 }
 
 func TestEvaluateBookAnalysisQualityQuarantinesInvalidClaimMetadata(t *testing.T) {

@@ -129,6 +129,14 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if quality.AnalysisHash == "" || quality.AnalysisHash != analysisHash {
 		return nil, fmt.Errorf("knowledge release analysis hash is stale")
 	}
+	evidence := EvaluateKnowledgeEvidence(*pkg, analysis)
+	if evidence.HasBlockers() || evidence.ResolvedReferences == 0 {
+		codes := evidence.BlockerCodes()
+		if len(codes) == 0 {
+			codes = []string{"no_resolved_evidence"}
+		}
+		return nil, fmt.Errorf("knowledge release evidence gate failed: %s", strings.Join(codes, ","))
+	}
 	reverificationTask, err := store.ValidateKnowledgeReverificationPublication(bookID, analysisHash)
 	if err != nil {
 		return nil, err

@@ -67,6 +67,32 @@ func (r KnowledgeEvidenceReport) HasBlockers() bool {
 	return false
 }
 
+func (r KnowledgeEvidenceReport) HasStructuralBlockers() bool {
+	for _, issue := range r.Issues {
+		if issue.Severity == KnowledgeEvidenceBlocker && knowledgeEvidenceIssueIsStructural(issue.Code) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r KnowledgeEvidenceReport) BlockerCodes() []string {
+	seen := make(map[string]struct{})
+	codes := make([]string, 0)
+	for _, issue := range r.Issues {
+		if issue.Severity != KnowledgeEvidenceBlocker {
+			continue
+		}
+		if _, exists := seen[issue.Code]; exists {
+			continue
+		}
+		seen[issue.Code] = struct{}{}
+		codes = append(codes, issue.Code)
+	}
+	sort.Strings(codes)
+	return codes
+}
+
 func EvaluateKnowledgeEvidence(pkg BookKnowledgePackage, analysis *BookAnalysisManifest) KnowledgeEvidenceReport {
 	report := KnowledgeEvidenceReport{
 		SchemaVersion: KnowledgeEvidenceSchemaVersion,
@@ -365,6 +391,25 @@ func evidenceSeverityRank(severity string) int {
 		return 1
 	default:
 		return 2
+	}
+}
+
+func knowledgeEvidenceIssueIsStructural(code string) bool {
+	switch code {
+	case "missing_book_id",
+		"missing_object_id",
+		"conflicting_duplicate_id",
+		"ambiguous_object_id",
+		"cross_book_reference",
+		"chunk_chapter_unresolved",
+		"claim_chapter_unresolved",
+		"citation_chunk_unresolved",
+		"citation_chapter_unresolved",
+		"citation_chunk_chapter_mismatch",
+		"package_claim_evidence_unresolved":
+		return true
+	default:
+		return false
 	}
 }
 

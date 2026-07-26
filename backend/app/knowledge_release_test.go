@@ -112,6 +112,26 @@ func TestKnowledgeReleaseRejectsSourcesChangedAfterQualityPass(t *testing.T) {
 	}
 }
 
+func TestKnowledgeReleaseRejectsInvalidEvidenceAfterQualityPass(t *testing.T) {
+	store := qualityTestStore(t)
+	if report, err := EvaluateBookAnalysisQuality(store, "42"); err != nil || report.Decision != BookQualityPass {
+		t.Fatalf("quality report = %#v, err=%v", report, err)
+	}
+	pkg, err := store.LoadPackage("42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Citations[0].ChunkID = "missing-after-quality"
+	if err := store.SavePackage(*pkg); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = PublishKnowledgeRelease(store, "42")
+	if err == nil || !strings.Contains(err.Error(), "evidence gate") {
+		t.Fatalf("publish invalid evidence error = %v", err)
+	}
+}
+
 func TestKnowledgeReleaseUppercaseHighRiskIsEvidenceOnly(t *testing.T) {
 	store := qualityTestStore(t)
 	manifest, _ := store.LoadAnalysisManifest("42")
