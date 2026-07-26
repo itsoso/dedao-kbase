@@ -2,7 +2,8 @@
 
 ## Status
 
-G1-G4 complete on the final implementation candidate. Deployment pending.
+Deployed from canonical `main` at
+`3379e490b4e598e48abc6a891cb5acd0aa47ad99`. G1-G6 are complete.
 
 ## Requirement
 
@@ -67,11 +68,41 @@ focused Assembly suite and full G3 gates passed after the fix.
 
 ### G5 - Deployment Health
 
-Pending.
+PASS.
+
+- Canonical `main` advanced by fast-forward to `3379e49`.
+- The exact source archive SHA256 was
+  `f62837a3cf9d51496d2bbf021fb0d2b98ec53c33369287d7e381546e89ad6568`.
+- Linux preflight repeated dependency installation, Vue production build,
+  every static UI smoke, the full Go suite, vet, module verification, contract,
+  evaluation, Proof consumer, Source Agent packaging, system-map drift, and
+  privacy checks.
+- A read-only pre-deployment probe executed the final builder and validator
+  against the production Release store without changing stored artifacts.
+- The installed binary SHA256 is
+  `0124efb0f68e0013b3e7ae1821e92fd5ea444aac2f2a8a5d051dc8c70fe0ab27`.
+- `dedao-kbase` is active with `NRestarts=0` and `ExecMainStatus=0`; local and
+  public health probes return `{"ok":true,"service":"dedao-kbase"}`.
+- Rollback snapshot: `3379e49-20260726T115234Z`.
 
 ### G6 - Online Verification
 
-Pending.
+PASS.
+
+Authenticated production verification returned:
+
+- `schema_version=knowledge_release_assembly.v1`;
+- `algorithm_version=deterministic-claim-assembly.v1`;
+- assembly ID
+  `assembly-4b54adc5c419ef23c2e460989bc9f1d0dd966e8764f5834371c3d877a3e1bb21`;
+- 2 Releases, 15 claims, 15 clusters, 3 returned clusters, and `has_more=true`.
+
+A recursive verification independently checked response bounds, summary and
+pagination relationships, claim membership and uniqueness, opaque publication
+identities, and absence of raw account, prompt, answer, content, or local-path
+data. The public API still returns `401` without authorization. Post-restart
+logs contain no panic, fatal error, or failed request. Existing optional
+integration warnings are unchanged and do not affect Assembly.
 
 ## Rollback
 
