@@ -81,4 +81,3 @@ The response uses `knowledge_release_assembly.v1` and includes:
 - Same-publication claims never inflate independent-source counts.
 - Explicit positive/negative variants create a review candidate.
 - Output validation and privacy tests fail closed.
-

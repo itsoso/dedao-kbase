@@ -118,4 +118,3 @@ git commit -m "feat(api): expose release assembly"
 6. Fast-forward clean canonical `main`.
 7. Run isolated server preflight, deploy with scoped rollback, and verify
    public health plus an authenticated metadata-only assembly request.
-
