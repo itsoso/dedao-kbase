@@ -461,15 +461,32 @@ func splitKnowledgeAssemblyClaimPolarity(normalized string) (string, string) {
 		fields = append(fields[:index], fields[index+1:]...)
 		return strings.Join(fields, " "), KnowledgeAssemblyPolarityNegative
 	}
-	if index := strings.Index(normalized, "并非"); index >= 0 {
-		return normalizeKnowledgeAssemblyClaim(
-			normalized[:index] + normalized[index+len("并非"):],
-		), KnowledgeAssemblyPolarityNegative
-	}
-	for _, marker := range []string{"不", "未", "没"} {
-		if index := strings.Index(normalized, marker); index >= 0 {
+	for _, rewrite := range []struct {
+		marker      string
+		replacement string
+	}{
+		{marker: "不能够", replacement: "能够"},
+		{marker: "不可能", replacement: "可能"},
+		{marker: "不应该", replacement: "应该"},
+		{marker: "不支持", replacement: "支持"},
+		{marker: "不符合", replacement: "符合"},
+		{marker: "不存在", replacement: "存在"},
+		{marker: "并非"},
+		{marker: "未能", replacement: "能"},
+		{marker: "没有", replacement: "有"},
+		{marker: "无法"},
+		{marker: "不是", replacement: "是"},
+		{marker: "不能", replacement: "能"},
+		{marker: "不会", replacement: "会"},
+		{marker: "不应", replacement: "应"},
+		{marker: "不宜", replacement: "宜"},
+		{marker: "不可", replacement: "可"},
+	} {
+		if index := strings.Index(normalized, rewrite.marker); index >= 0 {
 			return normalizeKnowledgeAssemblyClaim(
-				normalized[:index] + normalized[index+len(marker):],
+				normalized[:index] +
+					rewrite.replacement +
+					normalized[index+len(rewrite.marker):],
 			), KnowledgeAssemblyPolarityNegative
 		}
 	}

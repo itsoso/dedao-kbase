@@ -21,6 +21,11 @@ func TestNormalizeKnowledgeAssemblyClaimAndPolarity(t *testing.T) {
 			positiveBase, positive, negativeBase, negative,
 		)
 	}
+	distinctBase, distinctPolarity := splitKnowledgeAssemblyClaimPolarity("不同治疗方案适合不同人群")
+	if distinctPolarity != KnowledgeAssemblyPolarityPositive ||
+		distinctBase != normalizeKnowledgeAssemblyClaim("不同治疗方案适合不同人群") {
+		t.Fatalf("non-negating 不 was treated as negative: base=%q polarity=%q", distinctBase, distinctPolarity)
+	}
 }
 
 func TestBuildKnowledgeReleaseAssemblyUsesLatestReleasePerBookAndIsDeterministic(t *testing.T) {
