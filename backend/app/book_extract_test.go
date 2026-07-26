@@ -1,6 +1,9 @@
 package app
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestExtractBookKnowledgeFromHTML(t *testing.T) {
 	html := `<!doctype html>
@@ -90,5 +93,54 @@ func TestExtractBookKnowledgeFromGeneratedHeaderHTML(t *testing.T) {
 	}
 	if pkg.Chapters[0].Title != "第一章" {
 		t.Fatalf("chapter title = %q, want 第一章", pkg.Chapters[0].Title)
+	}
+}
+
+func TestExtractBookKnowledgeCreatesCitationForEveryChunk(t *testing.T) {
+	html := `<html><body><h1>长章节</h1><p>` +
+		strings.Repeat("证据内容", 400) +
+		`</p></body></html>`
+	book := BookKnowledgeBook{
+		BookID:        "citation-book",
+		Title:         "引用迁移",
+		SourceHTML:    "https://example.test/book",
+		SourceType:    "dedao_ebook",
+		SourceAccount: "publisher",
+		SourceKey:     "book-key",
+		PublishedAt:   "2026-07-26T00:00:00Z",
+	}
+
+	pkg, err := ExtractBookKnowledgeFromHTML(book, html)
+	if err != nil {
+		t.Fatalf("ExtractBookKnowledgeFromHTML returned error: %v", err)
+	}
+	if len(pkg.Chunks) < 2 {
+		t.Fatalf("chunks = %d, want multiple chunks", len(pkg.Chunks))
+	}
+	if len(pkg.Citations) != len(pkg.Chunks) {
+		t.Fatalf("citations = %d, chunks = %d", len(pkg.Citations), len(pkg.Chunks))
+	}
+	seen := make(map[string]bool, len(pkg.Citations))
+	for index, citation := range pkg.Citations {
+		if citation.CitationID == "" || seen[citation.CitationID] {
+			t.Fatalf("citation[%d] has invalid identity: %#v", index, citation)
+		}
+		seen[citation.CitationID] = true
+		if citation.ChunkID != pkg.Chunks[index].ChunkID ||
+			citation.ChapterID != pkg.Chunks[index].ChapterID ||
+			citation.SourceType != book.SourceType ||
+			citation.SourceAccount != book.SourceAccount ||
+			citation.SourceItemKey != book.SourceKey ||
+			citation.PublishedAt != book.PublishedAt {
+			t.Fatalf("citation[%d] = %#v, chunk = %#v", index, citation, pkg.Chunks[index])
+		}
+	}
+	if len(pkg.Claims) != 1 || len(pkg.Claims[0].Citations) != len(pkg.Citations) {
+		t.Fatalf("chapter claim citations = %#v", pkg.Claims)
+	}
+	for _, citationID := range pkg.Claims[0].Citations {
+		if !seen[citationID] {
+			t.Fatalf("chapter claim references unknown citation %q", citationID)
+		}
 	}
 }

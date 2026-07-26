@@ -166,6 +166,7 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 	}
 	chapterText := strings.Join(paragraphs, "\n\n")
 	parts := splitBookKnowledgeText(chapterText, bookKnowledgeMaxChunkRunes)
+	chapterCitationIDs := make([]string, 0, len(parts))
 	for _, part := range parts {
 		b.chunkNumber++
 		chunkID := b.book.BookID + "-chunk-" + strconv.Itoa(b.chunkNumber)
@@ -179,21 +180,26 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 		}
 		b.chunks = append(b.chunks, chunk)
 		b.current.ChunkIDs = append(b.current.ChunkIDs, chunkID)
+		citationID := chunkID + "-citation"
+		b.citations = append(b.citations, BookKnowledgeCitation{
+			CitationID:    citationID,
+			BookID:        b.book.BookID,
+			ChapterID:     b.current.ChapterID,
+			ChunkID:       chunkID,
+			SourceHTML:    b.book.SourceHTML,
+			Anchor:        b.current.Title,
+			Note:          "自动提取，待人工复核",
+			SourceType:    b.book.SourceType,
+			SourceAccount: b.book.SourceAccount,
+			SourceItemKey: b.book.SourceKey,
+			PublishedAt:   b.book.PublishedAt,
+		})
+		chapterCitationIDs = append(chapterCitationIDs, citationID)
 	}
 
 	summary := trimRunes(chapterText, 240)
 	b.current.Summary = summary
-	if len(b.current.ChunkIDs) > 0 {
-		citationID := b.book.BookID + "-citation-" + strconv.Itoa(len(b.citations)+1)
-		b.citations = append(b.citations, BookKnowledgeCitation{
-			CitationID: citationID,
-			BookID:     b.book.BookID,
-			ChapterID:  b.current.ChapterID,
-			ChunkID:    b.current.ChunkIDs[0],
-			SourceHTML: b.book.SourceHTML,
-			Anchor:     b.current.Title,
-			Note:       "自动提取，待人工复核",
-		})
+	if len(chapterCitationIDs) > 0 {
 		b.claims = append(b.claims, BookKnowledgeClaim{
 			ClaimID:       b.book.BookID + "-claim-" + strconv.Itoa(len(b.claims)+1),
 			BookID:        b.book.BookID,
@@ -204,7 +210,7 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 			EvidenceLevel: "D",
 			Confidence:    0.4,
 			ReviewStatus:  "draft",
-			Citations:     []string{citationID},
+			Citations:     chapterCitationIDs,
 		})
 	}
 	b.currentText = nil
