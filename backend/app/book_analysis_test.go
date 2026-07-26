@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -242,6 +243,95 @@ func TestGenerateBookAnalysisManifestRejectsMalformedPayload(t *testing.T) {
 	}
 	if stored.Status != BookAnalysisFailed || stored.Answer != previous.Answer || stored.Payload == nil || stored.Payload.Summary != "previous summary" {
 		t.Fatalf("stored manifest = %#v", stored)
+	}
+}
+
+func TestGenerateBookAnalysisManifestRejectsNonCitationReferences(t *testing.T) {
+	tests := []struct {
+		name      string
+		claimRef  string
+		riskRef   string
+		actionRef string
+		wantID    string
+	}{
+		{
+			name:      "claim uses direct chunk",
+			claimRef:  "42-chunk-1",
+			riskRef:   "42-citation-1",
+			actionRef: "42-citation-1",
+			wantID:    "42-chunk-1",
+		},
+		{
+			name:      "risk uses unknown citation",
+			claimRef:  "42-citation-1",
+			riskRef:   "missing-citation",
+			actionRef: "42-citation-1",
+			wantID:    "missing-citation",
+		},
+		{
+			name:      "action uses chapter",
+			claimRef:  "42-citation-1",
+			riskRef:   "42-citation-1",
+			actionRef: "42-chapter-1",
+			wantID:    "42-chapter-1",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+			store := NewBookKnowledgeStore(t.TempDir())
+			pkg := sampleBookKnowledgePackageForExport()
+			pkg.Book.ContentHash = "content-hash-42"
+			if err := store.SavePackage(pkg); err != nil {
+				t.Fatal(err)
+			}
+			previous := BookAnalysisManifest{
+				Version: "1", BookID: "42", ContentHash: pkg.Book.ContentHash,
+				Status: BookAnalysisReady, PromptVersion: "structured-v1",
+				Answer: "previous answer",
+				Payload: &BookAnalysisPayload{
+					Summary: "previous summary",
+					Claims: []BookAnalysisClaim{{
+						ID: "previous-claim", Statement: "previous statement",
+						CitationIDs: []string{"42-citation-1"},
+						Confidence:  0.8, RiskLevel: "low",
+					}},
+				},
+				UpdatedAt: "2026-07-12T10:00:00Z",
+			}
+			if err := store.SaveAnalysisManifest(previous); err != nil {
+				t.Fatal(err)
+			}
+			answer := fmt.Sprintf(`{
+				"summary":"summary",
+				"claims":[{"id":"claim-1","statement":"statement","citation_ids":[%q],"confidence":0.8,"scope":[],"risk_level":"low"}],
+				"risks":[{"id":"risk-1","description":"risk","citation_ids":[%q],"severity":"low"}],
+				"actions":[{"id":"action-1","description":"action","citation_ids":[%q],"kind":"verify"}]
+			}`, testCase.claimRef, testCase.riskRef, testCase.actionRef)
+
+			_, err := GenerateBookAnalysisManifestWithClient(
+				context.Background(),
+				store,
+				BookAnalysisGenerateRequest{BookID: "42"},
+				&fakeBookKnowledgeLLMClient{answer: answer},
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), "citation_ids") ||
+				!strings.Contains(err.Error(), testCase.wantID) {
+				t.Fatalf("generation error = %v", err)
+			}
+			stored, loadErr := store.LoadAnalysisManifest("42")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if stored.Status != BookAnalysisFailed ||
+				stored.Answer != previous.Answer ||
+				stored.Payload == nil ||
+				stored.Payload.Summary != previous.Payload.Summary {
+				t.Fatalf("stored manifest = %#v", stored)
+			}
+		})
 	}
 }
 

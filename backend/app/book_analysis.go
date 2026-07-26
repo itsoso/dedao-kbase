@@ -264,6 +264,15 @@ func GenerateBookAnalysisManifestWithClient(
 		}
 		return nil, err
 	}
+	if err := validateGeneratedBookAnalysisCitationIDs(*pkg, *structured); err != nil {
+		manifest.Status = BookAnalysisFailed
+		manifest.Error = trimRunes(err.Error(), 2000)
+		manifest.UpdatedAt = completedAt
+		if saveErr := store.SaveAnalysisManifest(manifest); saveErr != nil {
+			return nil, fmt.Errorf("%w (save failed analysis manifest: %v)", err, saveErr)
+		}
+		return nil, err
+	}
 	manifest.Status = BookAnalysisReady
 	manifest.Payload = structured
 	manifest.Answer = renderBookAnalysisMarkdown(*structured)
@@ -299,6 +308,45 @@ func parseBookAnalysisPayload(answer string) (*BookAnalysisPayload, error) {
 		return nil, fmt.Errorf("structured analysis summary is required")
 	}
 	return &payload, nil
+}
+
+func validateGeneratedBookAnalysisCitationIDs(pkg BookKnowledgePackage, payload BookAnalysisPayload) error {
+	allowed := make(map[string]struct{}, len(pkg.Citations))
+	for _, citation := range pkg.Citations {
+		if id := strings.TrimSpace(citation.CitationID); id != "" {
+			allowed[id] = struct{}{}
+		}
+	}
+	validate := func(kind string, index int, ids []string) error {
+		for _, rawID := range ids {
+			id := strings.TrimSpace(rawID)
+			if _, ok := allowed[id]; !ok {
+				return fmt.Errorf(
+					"%s[%d].citation_ids contains non-package citation %q",
+					kind,
+					index,
+					trimRunes(id, 120),
+				)
+			}
+		}
+		return nil
+	}
+	for index, claim := range payload.Claims {
+		if err := validate("claims", index, claim.CitationIDs); err != nil {
+			return err
+		}
+	}
+	for index, risk := range payload.Risks {
+		if err := validate("risks", index, risk.CitationIDs); err != nil {
+			return err
+		}
+	}
+	for index, action := range payload.Actions {
+		if err := validate("actions", index, action.CitationIDs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func renderBookAnalysisMarkdown(payload BookAnalysisPayload) string {
