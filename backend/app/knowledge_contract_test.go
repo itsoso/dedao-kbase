@@ -233,6 +233,63 @@ func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 	}
 }
 
+func TestKnowledgeReleaseAssemblySchemaCarriesHardLimits(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(
+		"..",
+		"..",
+		"contracts",
+		"knowledge-release-assembly-v1.schema.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
+	}
+	defs := schema["$defs"].(map[string]any)
+	cluster := defs["cluster"].(map[string]any)
+	clusterProperties := cluster["properties"].(map[string]any)
+	claim := defs["claim"].(map[string]any)
+	claimProperties := claim["properties"].(map[string]any)
+	tests := []struct {
+		name string
+		got  any
+		want float64
+	}{
+		{
+			name: "claims maxItems",
+			got:  clusterProperties["claims"].(map[string]any)["maxItems"],
+			want: knowledgeAssemblyMaxClaimsPerCluster,
+		},
+		{
+			name: "normalized assertion maxLength",
+			got:  clusterProperties["normalized_assertion"].(map[string]any)["maxLength"],
+			want: knowledgeAssemblyMaxStatementRunes,
+		},
+		{
+			name: "potential conflicts maxItems",
+			got:  clusterProperties["potential_conflicts"].(map[string]any)["maxItems"],
+			want: knowledgeAssemblyMaxConflictsPerCluster,
+		},
+		{
+			name: "statement maxLength",
+			got:  claimProperties["statement"].(map[string]any)["maxLength"],
+			want: knowledgeAssemblyMaxStatementRunes,
+		},
+		{
+			name: "citation ids maxItems",
+			got:  claimProperties["citation_ids"].(map[string]any)["maxItems"],
+			want: knowledgeAssemblyMaxCitationIDsPerClaim,
+		},
+	}
+	for _, testCase := range tests {
+		if testCase.got != testCase.want {
+			t.Errorf("%s = %v, want %v", testCase.name, testCase.got, testCase.want)
+		}
+	}
+}
+
 func readContractFixture(t *testing.T, name string) []byte {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("..", "..", "contracts", "fixtures", name))

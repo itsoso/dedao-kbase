@@ -1361,32 +1361,32 @@
     {
       "name": "KnowledgeReleaseAssembly",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 38
+      "line": 43
     },
     {
       "name": "KnowledgeReleaseAssemblyClaimRef",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 70
+      "line": 75
     },
     {
       "name": "KnowledgeReleaseAssemblyCluster",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 60
+      "line": 65
     },
     {
       "name": "KnowledgeReleaseAssemblyPotentialConflict",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 82
+      "line": 87
     },
     {
       "name": "KnowledgeReleaseAssemblyQuery",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 33
+      "line": 38
     },
     {
       "name": "KnowledgeReleaseAssemblySummary",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 49
+      "line": 54
     },
     {
       "name": "KnowledgeReleaseManifest",
@@ -1886,7 +1886,7 @@
     {
       "name": "timedReleaseRecord",
       "file": "backend/app/knowledge_assembly.go",
-      "line": 439
+      "line": 719
     }
   ]
 }

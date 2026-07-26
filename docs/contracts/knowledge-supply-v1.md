@@ -151,6 +151,13 @@ consumer data. Query filtering and result limits change only the returned
 cluster view; the assembly identity and aggregate summary describe the full
 selected snapshot.
 
+Assembly validation fails closed when a cluster exceeds 128 claims, a statement
+or normalized assertion exceeds 4,096 Unicode code points, a claim exceeds 128
+citation IDs, or a cluster exceeds 256 potential-conflict edges. The runtime
+also recomputes cluster identity, publication counts, status, and conflict
+edges, and verifies release, summary, and pagination relationships. It never
+silently truncates evidence within a cluster.
+
 ## Health Evidence Consumer
 
 Health systems should use the evidence-only consumer surface instead of
