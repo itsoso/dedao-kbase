@@ -2,7 +2,7 @@
 
 ## Status
 
-Implementation in progress on `codex/citation-migration-v1`.
+Ready for clean-main deployment from `codex/citation-migration-v1`.
 
 ## Requirement
 
@@ -37,11 +37,32 @@ PASS with controls.
 
 ### G3 - Tests
 
-Pending.
+PASS.
+
+- `go test ./... -count=1`
+- `go test -race ./backend/app ./cmd/kbase-server -count=1`
+- `go vet ./...`
+- `go mod verify`
+- `npm run build` in `frontend/`
+- Knowledge contract, evaluation, system-map, privacy, Markdown, book UI, and
+  WC Plus UI smoke checks
+- Focused regression tests for citation identity, exposed-source allowlisting,
+  legacy-body omission, prompt migration, and invalid-reference redaction
 
 ### G4 - Review
 
-Pending.
+PASS after three independent review rounds.
+
+The first two reviews blocked delivery until analysis validation was limited to
+citations actually present in the model context, legacy chunk bodies were
+removed from citation-native context, risks and actions were fully validated,
+and invalid model references were made opaque. The final review found no P1 or
+P2 issues.
+
+Accepted P3 follow-up: completely identical chapters with the same title and
+body cannot have both unique and insertion-stable citation IDs without a stable
+upstream section identifier. Current identity is stable across ordinary
+earlier insertions and same-body chapters with distinct titles.
 
 ### G5 - Deployment Health
 
