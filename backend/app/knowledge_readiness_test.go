@@ -136,7 +136,7 @@ func TestBuildKnowledgeReadinessFiltersAndLimitsDeterministically(t *testing.T) 
 func TestBuildKnowledgeReadinessResponseIsPrivacySafe(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	pkg := evidenceTestPackage()
-	pkg.Book.SourceHTML = "/Users/private/downloaded.html"
+	pkg.Book.SourceHTML = "sensitive-local-path/downloaded.html"
 	pkg.Chunks[0].Text = "private body sentinel"
 	if err := store.SavePackage(pkg); err != nil {
 		t.Fatal(err)
@@ -151,7 +151,7 @@ func TestBuildKnowledgeReadinessResponseIsPrivacySafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := string(payload)
-	for _, forbidden := range []string{"/Users/private", "private body sentinel", "downloaded.html", `"prompt"`, `"answer"`, `"token"`} {
+	for _, forbidden := range []string{"sensitive-local-path", "private body sentinel", "downloaded.html", `"prompt"`, `"answer"`, `"token"`} {
 		if strings.Contains(raw, forbidden) {
 			t.Fatalf("readiness leaked %q: %s", forbidden, raw)
 		}

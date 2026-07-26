@@ -1196,6 +1196,42 @@ func TestKBaseHTTPHandlerKnowledgePipeline(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeReadiness(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.ContentHash = "readiness-hash"
+	pkg.Book.SourceHTML = "sensitive-local-path/downloaded.html"
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/knowledge/readiness", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(handler, http.MethodGet, "/api/knowledge/readiness?limit=10&book_id=42", "secret-token")
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"schema_version":"knowledge_readiness.v1"`) ||
+		!strings.Contains(response.Body.String(), `"book_id":"42"`) ||
+		!strings.Contains(response.Body.String(), `"next_action":"needs_analysis"`) {
+		t.Fatalf("readiness status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, forbidden := range []string{"sensitive-local-path", "downloaded.html", `"prompt"`, `"answer"`} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("readiness leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+	invalidLimit := requestKBase(handler, http.MethodGet, "/api/knowledge/readiness?limit=501", "secret-token")
+	if invalidLimit.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status=%d body=%s", invalidLimit.Code, invalidLimit.Body.String())
+	}
+	wrongMethod := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/readiness", "secret-token", `{}`)
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeOperationsConsole(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthReadinessBook(t, store, "book-health", "hash-health")

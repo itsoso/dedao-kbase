@@ -189,7 +189,7 @@ func TestCanonicalPublicationIdentityIsConservative(t *testing.T) {
 
 func TestKnowledgeEvidenceReportDoesNotExposeSourceBodiesOrPaths(t *testing.T) {
 	pkg := evidenceTestPackage()
-	pkg.Book.SourceHTML = "/Users/private/downloaded-book.html"
+	pkg.Book.SourceHTML = "sensitive-local-path/downloaded-book.html"
 	pkg.Chunks[0].Text = "private source body sentinel"
 	report := EvaluateKnowledgeEvidence(pkg, evidenceTestAnalysis("citation-1"))
 
@@ -198,7 +198,7 @@ func TestKnowledgeEvidenceReportDoesNotExposeSourceBodiesOrPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	raw := string(payload)
-	for _, forbidden := range []string{"/Users/private", "private source body sentinel", "downloaded-book.html"} {
+	for _, forbidden := range []string{"sensitive-local-path", "private source body sentinel", "downloaded-book.html"} {
 		if strings.Contains(raw, forbidden) {
 			t.Fatalf("report leaked %q: %s", forbidden, raw)
 		}

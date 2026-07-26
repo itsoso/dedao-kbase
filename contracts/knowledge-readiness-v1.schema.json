@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/knowledge-readiness-v1.schema.json",
+  "title": "Knowledge Readiness v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "summary", "items"],
+  "properties": {
+    "schema_version": { "const": "knowledge_readiness.v1" },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/item" }
+    }
+  },
+  "$defs": {
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ratio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "analysis_claims",
+        "claims_with_evidence",
+        "claims_with_explicit_citation",
+        "evidence_references",
+        "resolved_references",
+        "claim_coverage",
+        "resolution_rate",
+        "explicit_citation_coverage"
+      ],
+      "properties": {
+        "analysis_claims": { "$ref": "#/$defs/nonNegativeInteger" },
+        "claims_with_evidence": { "$ref": "#/$defs/nonNegativeInteger" },
+        "claims_with_explicit_citation": { "$ref": "#/$defs/nonNegativeInteger" },
+        "evidence_references": { "$ref": "#/$defs/nonNegativeInteger" },
+        "resolved_references": { "$ref": "#/$defs/nonNegativeInteger" },
+        "claim_coverage": { "$ref": "#/$defs/ratio" },
+        "resolution_rate": { "$ref": "#/$defs/ratio" },
+        "explicit_citation_coverage": { "$ref": "#/$defs/ratio" }
+      }
+    },
+    "summary": {
+      "allOf": [
+        { "$ref": "#/$defs/metrics" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "total",
+            "ready",
+            "needs_analysis",
+            "needs_quality",
+            "ready_to_publish",
+            "published",
+            "blocked"
+          ],
+          "properties": {
+            "total": { "$ref": "#/$defs/nonNegativeInteger" },
+            "ready": { "$ref": "#/$defs/nonNegativeInteger" },
+            "needs_analysis": { "$ref": "#/$defs/nonNegativeInteger" },
+            "needs_quality": { "$ref": "#/$defs/nonNegativeInteger" },
+            "ready_to_publish": { "$ref": "#/$defs/nonNegativeInteger" },
+            "published": { "$ref": "#/$defs/nonNegativeInteger" },
+            "blocked": { "$ref": "#/$defs/nonNegativeInteger" }
+          }
+        }
+      ]
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["key", "basis", "independent_source_eligible"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "basis": {
+          "enum": ["source_account", "source_host", "source_author", "source_item", "book_fallback"]
+        },
+        "independent_source_eligible": { "type": "boolean" }
+      }
+    },
+    "item": {
+      "allOf": [
+        { "$ref": "#/$defs/metrics" },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "book_id",
+            "title",
+            "publication",
+            "stage",
+            "next_action",
+            "explicit_citation_references",
+            "legacy_direct_chunk_references",
+            "blocker_codes",
+            "warning_codes"
+          ],
+          "properties": {
+            "book_id": { "type": "string", "minLength": 1 },
+            "title": { "type": "string", "minLength": 1 },
+            "source_type": { "type": "string" },
+            "source_account": { "type": "string" },
+            "publication": { "$ref": "#/$defs/publication" },
+            "stage": {
+              "enum": ["collected", "normalized", "analyzed", "verified", "candidate", "published"]
+            },
+            "next_action": {
+              "enum": ["needs_analysis", "needs_quality", "ready_to_publish", "published", "blocked"]
+            },
+            "updated_at": { "type": "string" },
+            "last_published_release_id": { "type": "string" },
+            "last_published_at": { "type": "string" },
+            "explicit_citation_references": { "$ref": "#/$defs/nonNegativeInteger" },
+            "legacy_direct_chunk_references": { "$ref": "#/$defs/nonNegativeInteger" },
+            "blocker_codes": {
+              "type": "array",
+              "maxItems": 20,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "warning_codes": {
+              "type": "array",
+              "maxItems": 20,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

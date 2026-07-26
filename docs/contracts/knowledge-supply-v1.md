@@ -108,6 +108,25 @@ Impact aggregates release count, receipt dispositions, and pipeline stages.
 Gaps are fingerprinted aggregates only. Consumers should submit or sync gap
 fingerprints rather than raw user queries.
 
+## Evidence Readiness
+
+Operators and Agent builders can inspect evidence integrity before publication:
+
+```text
+GET /api/knowledge/readiness?limit={n}&book_id={optional}
+```
+
+The response follows `contracts/knowledge-readiness-v1.schema.json`. It reports
+pipeline state, canonical publication identity, claim coverage, reference
+resolution, explicit citation coverage, compatibility references, and bounded
+blocker/warning codes. It contains no source bodies, model prompts or answers,
+credentials, or local source paths.
+
+Publication identity is conservative. Account- and host-derived identities can
+participate in later source-independence checks; item and book fallbacks cannot.
+During the citation migration, direct chunk references remain resolvable but
+are reported as `legacy_direct_chunk_reference`.
+
 ## Health Evidence Consumer
 
 Health systems should use the evidence-only consumer surface instead of

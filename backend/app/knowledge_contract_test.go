@@ -96,10 +96,68 @@ func TestKnowledgeContractHealthEvidenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestKnowledgeReadinessContractRoundTrip(t *testing.T) {
+	raw := []byte(`{
+		"schema_version":"knowledge_readiness.v1",
+		"summary":{
+			"total":1,
+			"ready":0,
+			"needs_analysis":1,
+			"needs_quality":0,
+			"ready_to_publish":0,
+			"published":0,
+			"blocked":0,
+			"analysis_claims":0,
+			"claims_with_evidence":0,
+			"claims_with_explicit_citation":0,
+			"evidence_references":0,
+			"resolved_references":0,
+			"claim_coverage":0,
+			"resolution_rate":0,
+			"explicit_citation_coverage":0
+		},
+		"items":[{
+			"book_id":"book-1",
+			"title":"Book",
+			"publication":{"key":"book:book-1","basis":"book_fallback","independent_source_eligible":false},
+			"stage":"normalized",
+			"next_action":"needs_analysis",
+			"analysis_claims":0,
+			"claims_with_evidence":0,
+			"claims_with_explicit_citation":0,
+			"evidence_references":0,
+			"resolved_references":0,
+			"explicit_citation_references":0,
+			"legacy_direct_chunk_references":0,
+			"claim_coverage":0,
+			"resolution_rate":0,
+			"explicit_citation_coverage":0,
+			"blocker_codes":[],
+			"warning_codes":["publication_identity_not_independent"]
+		}]
+	}`)
+	if err := ValidateKnowledgeReadinessContract(raw); err != nil {
+		t.Fatalf("ValidateKnowledgeReadinessContract() error = %v", err)
+	}
+	var missing map[string]any
+	if err := json.Unmarshal(raw, &missing); err != nil {
+		t.Fatal(err)
+	}
+	delete(missing, "summary")
+	invalid, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateKnowledgeReadinessContract(invalid); err == nil || !strings.Contains(err.Error(), "summary") {
+		t.Fatalf("missing summary error = %v", err)
+	}
+}
+
 func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 	for _, name := range []string{
 		"knowledge-release-v1.schema.json",
 		"knowledge-feed-v1.schema.json",
+		"knowledge-readiness-v1.schema.json",
 		"delivery-receipt-v1.schema.json",
 		"health-evidence-v1.schema.json",
 	} {

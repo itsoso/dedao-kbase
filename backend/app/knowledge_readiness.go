@@ -1,7 +1,9 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -133,6 +135,56 @@ func BuildKnowledgeReadiness(store *BookKnowledgeStore, limit int, bookID string
 	return result, nil
 }
 
+func ValidateKnowledgeReadinessContract(raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, required := range []string{"schema_version", "summary", "items"} {
+		if value, exists := fields[required]; !exists || len(value) == 0 || string(value) == "null" {
+			return fmt.Errorf("%s is required", required)
+		}
+	}
+	var readiness KnowledgeReadiness
+	if err := json.Unmarshal(raw, &readiness); err != nil {
+		return err
+	}
+	if readiness.SchemaVersion != KnowledgeReadinessSchemaVersion {
+		return fmt.Errorf("schema_version must be %q", KnowledgeReadinessSchemaVersion)
+	}
+	if err := validateKnowledgeReadinessSummary(readiness.Summary); err != nil {
+		return err
+	}
+	for index, item := range readiness.Items {
+		if err := requireContractFields(map[string]string{
+			"book_id":           item.BookID,
+			"title":             item.Title,
+			"publication.key":   item.Publication.Key,
+			"publication.basis": item.Publication.Basis,
+			"stage":             item.Stage,
+			"next_action":       item.NextAction,
+		}); err != nil {
+			return fmt.Errorf("items[%d]: %w", index, err)
+		}
+		if !validKnowledgeReadinessAction(item.NextAction) {
+			return fmt.Errorf("items[%d].next_action is invalid", index)
+		}
+		if err := validateKnowledgeReadinessMetrics(
+			item.AnalysisClaims,
+			item.ClaimsWithEvidence,
+			item.ClaimsWithExplicitCitation,
+			item.EvidenceReferences,
+			item.ResolvedReferences,
+			item.ClaimCoverage,
+			item.ResolutionRate,
+			item.ExplicitCitationCoverage,
+		); err != nil {
+			return fmt.Errorf("items[%d]: %w", index, err)
+		}
+	}
+	return nil
+}
+
 func accumulateKnowledgeReadinessSummary(summary *KnowledgeReadinessSummary, item KnowledgeReadinessItem) {
 	summary.Total++
 	switch item.NextAction {
@@ -193,4 +245,72 @@ func minInt(left, right int) int {
 		return left
 	}
 	return right
+}
+
+func validateKnowledgeReadinessSummary(summary KnowledgeReadinessSummary) error {
+	for name, value := range map[string]int{
+		"summary.total":            summary.Total,
+		"summary.ready":            summary.Ready,
+		"summary.needs_analysis":   summary.NeedsAnalysis,
+		"summary.needs_quality":    summary.NeedsQuality,
+		"summary.ready_to_publish": summary.ReadyToPublish,
+		"summary.published":        summary.Published,
+		"summary.blocked":          summary.Blocked,
+	} {
+		if value < 0 {
+			return fmt.Errorf("%s must be non-negative", name)
+		}
+	}
+	return validateKnowledgeReadinessMetrics(
+		summary.AnalysisClaims,
+		summary.ClaimsWithEvidence,
+		summary.ClaimsWithExplicitCitation,
+		summary.EvidenceReferences,
+		summary.ResolvedReferences,
+		summary.ClaimCoverage,
+		summary.ResolutionRate,
+		summary.ExplicitCitationCoverage,
+	)
+}
+
+func validateKnowledgeReadinessMetrics(
+	analysisClaims,
+	claimsWithEvidence,
+	claimsWithExplicitCitation,
+	evidenceReferences,
+	resolvedReferences int,
+	claimCoverage,
+	resolutionRate,
+	explicitCitationCoverage float64,
+) error {
+	for name, value := range map[string]int{
+		"analysis_claims":               analysisClaims,
+		"claims_with_evidence":          claimsWithEvidence,
+		"claims_with_explicit_citation": claimsWithExplicitCitation,
+		"evidence_references":           evidenceReferences,
+		"resolved_references":           resolvedReferences,
+	} {
+		if value < 0 {
+			return fmt.Errorf("%s must be non-negative", name)
+		}
+	}
+	for name, value := range map[string]float64{
+		"claim_coverage":             claimCoverage,
+		"resolution_rate":            resolutionRate,
+		"explicit_citation_coverage": explicitCitationCoverage,
+	} {
+		if value < 0 || value > 1 {
+			return fmt.Errorf("%s must be between 0 and 1", name)
+		}
+	}
+	return nil
+}
+
+func validKnowledgeReadinessAction(action string) bool {
+	switch action {
+	case "needs_analysis", "needs_quality", "ready_to_publish", "published", "blocked":
+		return true
+	default:
+		return false
+	}
 }
