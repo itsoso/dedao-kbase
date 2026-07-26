@@ -220,6 +220,18 @@ func TestCanonicalPublicationIdentityIsConservative(t *testing.T) {
 	}
 }
 
+func TestCanonicalPublicationIdentityIgnoresTransportForSamePublisher(t *testing.T) {
+	first := CanonicalKnowledgePublicationIdentity(BookKnowledgeBook{
+		BookID: "book-a", SourceType: "wechat_mp_article", SourceAccount: "Medical Desk",
+	})
+	second := CanonicalKnowledgePublicationIdentity(BookKnowledgeBook{
+		BookID: "book-b", SourceType: "dedao_course_article", SourceAccount: " medical desk ",
+	})
+	if first.Key != second.Key || !first.IndependentSourceEligible || !second.IndependentSourceEligible {
+		t.Fatalf("publication identities = %#v %#v", first, second)
+	}
+}
+
 func TestKnowledgeEvidenceReportDoesNotExposeSourceBodiesOrPaths(t *testing.T) {
 	pkg := evidenceTestPackage()
 	pkg.Book.SourceHTML = "sensitive-local-path/downloaded-book.html"
