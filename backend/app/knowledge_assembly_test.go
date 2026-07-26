@@ -435,6 +435,135 @@ func TestValidateKnowledgeReleaseAssemblyRejectsOversizedCluster(t *testing.T) {
 	}
 }
 
+func TestValidateKnowledgeReleaseAssemblyRelationships(t *testing.T) {
+	base := knowledgeAssemblyRelationshipFixture(t)
+	tests := []struct {
+		name   string
+		mutate func(*KnowledgeReleaseAssembly)
+		want   string
+	}{
+		{
+			name: "unknown claim release",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Claims[0].ReleaseID = "release-unknown"
+			},
+			want: "unknown release_id",
+		},
+		{
+			name: "cluster id",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].ClusterID = "cluster-forged"
+			},
+			want: "cluster_id is inconsistent",
+		},
+		{
+			name: "normalized assertion",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].NormalizedAssertion = "伪造断言"
+				assembly.Clusters[0].ClusterID = knowledgeAssemblyHashID("cluster", "伪造断言")
+			},
+			want: "normalized_assertion is inconsistent",
+		},
+		{
+			name: "duplicate claim",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Claims = append(
+					assembly.Clusters[0].Claims,
+					assembly.Clusters[0].Claims[0],
+				)
+				assembly.Summary.ClaimCount++
+			},
+			want: "duplicate claim",
+		},
+		{
+			name: "duplicate citation id",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				claim := &assembly.Clusters[0].Claims[0]
+				claim.CitationIDs = append(claim.CitationIDs, claim.CitationIDs[0])
+			},
+			want: "duplicate citation_id",
+		},
+		{
+			name: "publication count",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].PublicationCount++
+			},
+			want: "publication_count is inconsistent",
+		},
+		{
+			name: "publication eligibility",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Claims[0].IndependentPublicationEligible = false
+			},
+			want: "independent publication eligibility is inconsistent",
+		},
+		{
+			name: "publication identity",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Claims[0].PublicationIdentity = "account:private-publisher"
+			},
+			want: "publication_identity is invalid",
+		},
+		{
+			name: "status",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].Status = KnowledgeAssemblyStatusCorroborated
+			},
+			want: "status is inconsistent",
+		},
+		{
+			name: "conflict edge",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Clusters[0].PotentialConflicts[0].ConflictID = "conflict-forged"
+			},
+			want: "potential_conflicts is inconsistent",
+		},
+		{
+			name: "summary category totals",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Summary.CorroboratedClusters++
+			},
+			want: "summary category counts are inconsistent",
+		},
+		{
+			name: "has more",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.HasMore = true
+			},
+			want: "has_more is inconsistent",
+		},
+		{
+			name: "matched exceeds cluster count",
+			mutate: func(assembly *KnowledgeReleaseAssembly) {
+				assembly.Summary.MatchedClusterCount = 2
+				assembly.HasMore = true
+			},
+			want: "matched_cluster_count exceeds cluster_count",
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			assembly := cloneKnowledgeReleaseAssembly(t, base)
+			testCase.mutate(&assembly)
+			if err := ValidateKnowledgeReleaseAssembly(assembly); err == nil ||
+				!strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("relationship error = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestValidateKnowledgeReleaseAssemblyDoesNotMutateInput(t *testing.T) {
+	assembly := knowledgeAssemblyRelationshipFixture(t)
+	before := cloneKnowledgeReleaseAssembly(t, assembly)
+	if err := ValidateKnowledgeReleaseAssembly(assembly); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(assembly, before) {
+		t.Fatalf("validator mutated input: before=%#v after=%#v", before, assembly)
+	}
+}
+
 func TestBuildKnowledgeReleaseAssemblyIsBoundedQueryableAndPrivacySafe(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	first := knowledgeAssemblyTestRelease(
@@ -541,4 +670,33 @@ func cloneKnowledgeReleaseAssembly(
 		t.Fatal(err)
 	}
 	return cloned
+}
+
+func knowledgeAssemblyRelationshipFixture(t *testing.T) KnowledgeReleaseAssembly {
+	t.Helper()
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
+		"release-positive",
+		"book-positive",
+		"2026-07-26T10:00:00Z",
+		"治疗能降低风险",
+		"Publisher Positive",
+		"wechat_mp_article",
+	))
+	saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
+		"release-negative",
+		"book-negative",
+		"2026-07-26T11:00:00Z",
+		"治疗不能降低风险",
+		"Publisher Negative",
+		"dedao_course_article",
+	))
+	assembly, err := BuildKnowledgeReleaseAssembly(
+		store,
+		KnowledgeReleaseAssemblyQuery{Limit: 500},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return *assembly
 }

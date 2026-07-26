@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -154,7 +155,7 @@ func TestKnowledgeReadinessContractRoundTrip(t *testing.T) {
 }
 
 func TestKnowledgeReleaseAssemblyContractRoundTrip(t *testing.T) {
-	raw := []byte(`{
+	raw := []byte(fmt.Sprintf(`{
 		"schema_version":"knowledge_release_assembly.v1",
 		"algorithm_version":"deterministic-claim-assembly.v1",
 		"assembly_id":"assembly-fixture",
@@ -170,7 +171,7 @@ func TestKnowledgeReleaseAssemblyContractRoundTrip(t *testing.T) {
 			"insufficient_identity_clusters":0
 		},
 		"clusters":[{
-			"cluster_id":"cluster-fixture",
+			"cluster_id":%q,
 			"normalized_assertion":"assertion",
 			"status":"single_publication",
 			"publication_count":1,
@@ -182,14 +183,14 @@ func TestKnowledgeReleaseAssemblyContractRoundTrip(t *testing.T) {
 				"statement":"Assertion",
 				"polarity":"positive",
 				"citation_ids":["citation-fixture"],
-				"publication_identity":"account:sha256-fixture",
+				"publication_identity":"account:sha256-0123456789abcdef",
 				"publication_identity_basis":"source_account",
 				"independent_publication_eligible":true
 			}]
 		}],
 		"returned_clusters":1,
 		"has_more":false
-	}`)
+	}`, knowledgeAssemblyHashID("cluster", "assertion")))
 	if err := ValidateKnowledgeReleaseAssemblyContract(raw); err != nil {
 		t.Fatalf("ValidateKnowledgeReleaseAssemblyContract() error = %v", err)
 	}
