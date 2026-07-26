@@ -62,17 +62,36 @@ func TestGenerateBookAnalysisManifestPersistsGroundedResult(t *testing.T) {
 	if manifest.Payload == nil || manifest.Payload.Summary != "这是基于证据的分析。" || len(manifest.Payload.Claims) != 1 {
 		t.Fatalf("structured payload = %#v", manifest.Payload)
 	}
-	if !strings.Contains(manifest.Answer, "核心摘要") || !strings.Contains(manifest.Answer, "42-chunk-1") {
+	if !strings.Contains(manifest.Answer, "核心摘要") || !strings.Contains(manifest.Answer, "42-citation-1") {
 		t.Fatalf("rendered answer = %q", manifest.Answer)
+	}
+	if manifest.PromptVersion != "structured-v2-citations" {
+		t.Fatalf("prompt version = %q", manifest.PromptVersion)
 	}
 	if manifest.ContentHash != pkg.Book.ContentHash || manifest.CompletedAt == "" {
 		t.Fatalf("manifest provenance = %#v", manifest)
 	}
 	combined := client.messages[0].Content + "\n" + client.messages[1].Content
-	for _, marker := range []string{"结构化分析", "核心摘要", "可验证结论", "风险与局限", "阅读或验证行动", "来源 ID"} {
+	for _, marker := range []string{
+		"结构化分析",
+		"核心摘要",
+		"可验证结论",
+		"风险与局限",
+		"阅读或验证行动",
+		"citation ID",
+		"Evidence [citation:42-citation-1]",
+	} {
 		if !strings.Contains(combined, marker) {
 			t.Fatalf("analysis prompt missing %q:\n%s", marker, combined)
 		}
+	}
+	if strings.Contains(combined, "## Chunk [42-chunk-1]") {
+		t.Fatalf("analysis context exposed legacy chunk label:\n%s", combined)
+	}
+	if len(manifest.Sources) != 1 ||
+		manifest.Sources[0].Kind != "citation" ||
+		manifest.Sources[0].ID != "42-citation-1" {
+		t.Fatalf("analysis sources = %#v", manifest.Sources)
 	}
 	stored, err := store.LoadAnalysisManifest("42")
 	if err != nil || stored.Payload == nil || stored.Status != BookAnalysisReady {
@@ -118,7 +137,7 @@ func TestGenerateBookAnalysisManifestParsesStructuredPayload(t *testing.T) {
 		t.Fatalf("GenerateBookAnalysisManifestWithClient returned error: %v", err)
 	}
 	claim := manifest.Payload.Claims[0]
-	if claim.ID != "claim-1" || claim.Statement == "" || len(claim.CitationIDs) != 1 || claim.CitationIDs[0] != "42-chunk-1" {
+	if claim.ID != "claim-1" || claim.Statement == "" || len(claim.CitationIDs) != 1 || claim.CitationIDs[0] != "42-citation-1" {
 		t.Fatalf("claim = %#v", claim)
 	}
 	if claim.Confidence != 0.86 || claim.RiskLevel != "medium" || len(claim.Scope) != 1 {
@@ -229,9 +248,9 @@ func TestGenerateBookAnalysisManifestRejectsMalformedPayload(t *testing.T) {
 func sampleStructuredBookAnalysisJSON() string {
 	return `{
   "summary":"这是基于证据的分析。",
-  "claims":[{"id":"claim-1","statement":"趋势过滤是该方法的前置条件。","citation_ids":["42-chunk-1"],"confidence":0.86,"scope":["示例策略"],"risk_level":"medium"}],
-  "risks":[{"id":"risk-1","description":"需要外部数据验证。","citation_ids":["42-chunk-1"],"severity":"medium"}],
-  "actions":[{"id":"action-1","description":"核对原始样本。","citation_ids":["42-chunk-1"],"kind":"verify"}]
+  "claims":[{"id":"claim-1","statement":"趋势过滤是该方法的前置条件。","citation_ids":["42-citation-1"],"confidence":0.86,"scope":["示例策略"],"risk_level":"medium"}],
+  "risks":[{"id":"risk-1","description":"需要外部数据验证。","citation_ids":["42-citation-1"],"severity":"medium"}],
+  "actions":[{"id":"action-1","description":"核对原始样本。","citation_ids":["42-citation-1"],"kind":"verify"}]
 }`
 }
 

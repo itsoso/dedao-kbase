@@ -443,6 +443,25 @@ func buildBookChatContext(
 	question string,
 	maxChars int,
 ) (string, BookKnowledgeChatContextStats, []BookKnowledgeChatSource, error) {
+	return buildBookKnowledgeContext(store, pkg, question, maxChars, false)
+}
+
+func buildBookAnalysisContext(
+	store *BookKnowledgeStore,
+	pkg *BookKnowledgePackage,
+	question string,
+	maxChars int,
+) (string, BookKnowledgeChatContextStats, []BookKnowledgeChatSource, error) {
+	return buildBookKnowledgeContext(store, pkg, question, maxChars, true)
+}
+
+func buildBookKnowledgeContext(
+	store *BookKnowledgeStore,
+	pkg *BookKnowledgePackage,
+	question string,
+	maxChars int,
+	citationNative bool,
+) (string, BookKnowledgeChatContextStats, []BookKnowledgeChatSource, error) {
 	var builder strings.Builder
 	stats := BookKnowledgeChatContextStats{}
 	sources := make([]BookKnowledgeChatSource, 0)
@@ -465,37 +484,94 @@ func buildBookChatContext(
 			break
 		}
 		stats.Chapters++
-		sources = append(sources, BookKnowledgeChatSource{
-			Kind:      "chapter",
-			ID:        chapter.ChapterID,
-			Title:     chapter.Title,
-			ChapterID: chapter.ChapterID,
-		})
+		if !citationNative {
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "chapter",
+				ID:        chapter.ChapterID,
+				Title:     chapter.Title,
+				ChapterID: chapter.ChapterID,
+			})
+		}
 	}
 	for _, claim := range pkg.Claims {
 		if !appendSection(fmt.Sprintf("## Claim [%s]\n标题: %s\n内容: %s\n状态: %s", claim.ClaimID, claim.Title, claim.Summary, claim.ReviewStatus)) {
 			break
 		}
 		stats.Claims++
-		sources = append(sources, BookKnowledgeChatSource{
-			Kind:      "claim",
-			ID:        claim.ClaimID,
-			Title:     claim.Title,
-			ChapterID: claim.ChapterID,
-		})
+		if !citationNative {
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "claim",
+				ID:        claim.ClaimID,
+				Title:     claim.Title,
+				ChapterID: claim.ChapterID,
+			})
+		}
 	}
 
+	citationsByChunk := make(map[string][]BookKnowledgeCitation)
+	if citationNative {
+		for _, citation := range pkg.Citations {
+			chunkID := strings.TrimSpace(citation.ChunkID)
+			if chunkID == "" || strings.TrimSpace(citation.CitationID) == "" {
+				continue
+			}
+			citationsByChunk[chunkID] = append(citationsByChunk[chunkID], citation)
+		}
+		for chunkID := range citationsByChunk {
+			sort.Slice(citationsByChunk[chunkID], func(i, j int) bool {
+				return citationsByChunk[chunkID][i].CitationID < citationsByChunk[chunkID][j].CitationID
+			})
+		}
+	}
 	chunks := selectBookChatChunks(store, pkg, question)
 	for _, chunk := range chunks {
-		if !appendSection(fmt.Sprintf("## Chunk [%s]\nchapter_id: %s\n%s", chunk.ChunkID, chunk.ChapterID, chunk.Text)) {
+		if !citationNative {
+			if !appendSection(fmt.Sprintf("## Chunk [%s]\nchapter_id: %s\n%s", chunk.ChunkID, chunk.ChapterID, chunk.Text)) {
+				break
+			}
+			stats.Chunks++
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "chunk",
+				ID:        chunk.ChunkID,
+				ChapterID: chunk.ChapterID,
+			})
+			continue
+		}
+		citations := citationsByChunk[chunk.ChunkID]
+		if len(citations) == 0 {
+			if !appendSection(fmt.Sprintf("## Legacy Chunk [chunk:%s]\nchapter_id: %s\ncitation_status: unavailable\n%s", chunk.ChunkID, chunk.ChapterID, chunk.Text)) {
+				break
+			}
+			stats.Chunks++
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "legacy_chunk",
+				ID:        chunk.ChunkID,
+				ChapterID: chunk.ChapterID,
+			})
+			continue
+		}
+		markers := make([]string, 0, len(citations))
+		for _, citation := range citations {
+			markers = append(markers, "citation:"+citation.CitationID)
+		}
+		if !appendSection(fmt.Sprintf(
+			"## Evidence [%s]\nchunk_id: %s\nchapter_id: %s\n%s",
+			strings.Join(markers, ", "),
+			chunk.ChunkID,
+			chunk.ChapterID,
+			chunk.Text,
+		)) {
 			break
 		}
 		stats.Chunks++
-		sources = append(sources, BookKnowledgeChatSource{
-			Kind:      "chunk",
-			ID:        chunk.ChunkID,
-			ChapterID: chunk.ChapterID,
-		})
+		for _, citation := range citations {
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "citation",
+				ID:        citation.CitationID,
+				Title:     citation.Anchor,
+				ChapterID: citation.ChapterID,
+			})
+		}
 	}
 	stats.Chars = len([]rune(builder.String()))
 	return strings.TrimSpace(builder.String()), stats, dedupeBookChatSources(sources), nil

@@ -13,7 +13,7 @@ import (
 
 const (
 	bookAnalysisVersion       = "1"
-	bookAnalysisPromptVersion = "structured-v1"
+	bookAnalysisPromptVersion = "structured-v2-citations"
 	bookAnalysisMaxTokens     = 4096
 
 	BookAnalysisPending = "pending"
@@ -204,9 +204,9 @@ func GenerateBookAnalysisManifestWithClient(
 	}
 
 	prompt := `请对当前文章做结构化分析。只输出一个 JSON 对象，不要输出解释文字或 Markdown 围栏。结构必须为：
-{"summary":"核心摘要","claims":[{"id":"claim-1","statement":"可验证结论","citation_ids":["来源 ID"],"confidence":0.0,"scope":["适用范围"],"risk_level":"low|medium|high"}],"risks":[{"id":"risk-1","description":"风险与局限","citation_ids":["来源 ID"],"severity":"low|medium|high"}],"actions":[{"id":"action-1","description":"阅读或验证行动","citation_ids":["来源 ID"],"kind":"read|verify|monitor"}]}
-每个事实性结论必须引用提供的来源 ID。区分原文事实与模型推理。actions 只能是阅读、核验或跟踪动作，不能给出个人医疗建议。`
-	contextText, stats, sources, err := buildBookChatContext(store, pkg, prompt, request.MaxContextChars)
+{"summary":"核心摘要","claims":[{"id":"claim-1","statement":"可验证结论","citation_ids":["citation ID"],"confidence":0.0,"scope":["适用范围"],"risk_level":"low|medium|high"}],"risks":[{"id":"risk-1","description":"风险与局限","citation_ids":["citation ID"],"severity":"low|medium|high"}],"actions":[{"id":"action-1","description":"阅读或验证行动","citation_ids":["citation ID"],"kind":"read|verify|monitor"}]}
+每个事实性结论必须引用上下文中 [citation:<id>] 提供的 citation ID。citation_ids 禁止填写 chunk、chapter、claim 或未提供的 ID。Legacy Chunk 只能帮助识别证据缺口，不能作为 citation_ids。区分原文事实与模型推理。actions 只能是阅读、核验或跟踪动作，不能给出个人医疗建议。`
+	contextText, stats, sources, err := buildBookAnalysisContext(store, pkg, prompt, request.MaxContextChars)
 	if err != nil {
 		return nil, err
 	}
@@ -236,7 +236,7 @@ func GenerateBookAnalysisManifestWithClient(
 	messages := []BookKnowledgeMessage{
 		{
 			Role:    "system",
-			Content: "你是 KBase 的知识生产分析器。只使用提供的文章知识包，产出可复核的结构化分析；不得补充知识包中不存在的事实；所有事实性结论都要引用来源 ID。",
+			Content: "你是 KBase 的知识生产分析器。只使用提供的文章知识包，产出可复核的结构化分析；不得补充知识包中不存在的事实；所有事实性结论都要引用显式 citation ID。",
 		},
 		{
 			Role:    "user",
