@@ -127,6 +127,30 @@ participate in later source-independence checks; item and book fallbacks cannot.
 During the citation migration, direct chunk references remain resolvable but
 are reported as `legacy_direct_chunk_reference`.
 
+## Release Assembly
+
+Operators and Agent builders can inspect the deterministic latest-release
+snapshot through:
+
+```text
+GET /api/knowledge/assembly?limit={1..500}&query={optional}
+```
+
+The response follows
+`contracts/knowledge-release-assembly-v1.schema.json`. Exact normalized
+assertions are clustered across the newest immutable Release for each book.
+The projection counts canonical independent publications and labels explicit
+positive/negative pairs as `potential_conflict`; it does not issue an
+authoritative contradiction verdict. Semantic adjudication remains the
+responsibility of Evidence Audit.
+
+The assembly is content-addressed and read-only. It exposes stable release,
+book, claim, citation, and opaque publication identities, but never source
+bodies, local paths, source-account values, prompts, answers, credentials, or
+consumer data. Query filtering and result limits change only the returned
+cluster view; the assembly identity and aggregate summary describe the full
+selected snapshot.
+
 ## Health Evidence Consumer
 
 Health systems should use the evidence-only consumer surface instead of

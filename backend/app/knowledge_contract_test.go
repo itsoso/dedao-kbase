@@ -153,11 +153,67 @@ func TestKnowledgeReadinessContractRoundTrip(t *testing.T) {
 	}
 }
 
+func TestKnowledgeReleaseAssemblyContractRoundTrip(t *testing.T) {
+	raw := []byte(`{
+		"schema_version":"knowledge_release_assembly.v1",
+		"algorithm_version":"deterministic-claim-assembly.v1",
+		"assembly_id":"assembly-fixture",
+		"release_ids":["release-fixture"],
+		"summary":{
+			"release_count":1,
+			"claim_count":1,
+			"cluster_count":1,
+			"matched_cluster_count":1,
+			"corroborated_clusters":0,
+			"potential_conflict_clusters":0,
+			"single_publication_clusters":1,
+			"insufficient_identity_clusters":0
+		},
+		"clusters":[{
+			"cluster_id":"cluster-fixture",
+			"normalized_assertion":"assertion",
+			"status":"single_publication",
+			"publication_count":1,
+			"independent_publication_count":1,
+			"claims":[{
+				"release_id":"release-fixture",
+				"book_id":"book-fixture",
+				"claim_id":"claim-fixture",
+				"statement":"Assertion",
+				"polarity":"positive",
+				"citation_ids":["citation-fixture"],
+				"publication_identity":"account:sha256-fixture",
+				"publication_identity_basis":"source_account",
+				"independent_publication_eligible":true
+			}]
+		}],
+		"returned_clusters":1,
+		"has_more":false
+	}`)
+	if err := ValidateKnowledgeReleaseAssemblyContract(raw); err != nil {
+		t.Fatalf("ValidateKnowledgeReleaseAssemblyContract() error = %v", err)
+	}
+	var missing map[string]any
+	if err := json.Unmarshal(raw, &missing); err != nil {
+		t.Fatal(err)
+	}
+	delete(missing, "assembly_id")
+	invalid, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateKnowledgeReleaseAssemblyContract(invalid); err == nil ||
+		!strings.Contains(err.Error(), "assembly_id") {
+		t.Fatalf("missing assembly_id error = %v", err)
+	}
+}
+
 func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 	for _, name := range []string{
 		"knowledge-release-v1.schema.json",
 		"knowledge-feed-v1.schema.json",
 		"knowledge-readiness-v1.schema.json",
+		"knowledge-release-assembly-v1.schema.json",
 		"delivery-receipt-v1.schema.json",
 		"health-evidence-v1.schema.json",
 	} {

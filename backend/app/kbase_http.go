@@ -378,6 +378,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleKnowledgeReadiness(w, r)
 		return
 	}
+	if r.URL.Path == "/api/knowledge/assembly" {
+		h.handleKnowledgeAssembly(w, r)
+		return
+	}
 	if r.URL.Path == "/api/knowledge/pipeline" {
 		h.handleKnowledgePipeline(w, r)
 		return
@@ -2290,6 +2294,40 @@ func (h *kbaseHTTPHandler) handleKnowledgeReadiness(w http.ResponseWriter, r *ht
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, readiness)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeAssembly(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limit := knowledgeAssemblyDefaultLimit
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 || parsed > knowledgeAssemblyMaxLimit {
+			writeHTTPError(
+				w,
+				http.StatusBadRequest,
+				fmt.Sprintf("limit must be between 1 and %d", knowledgeAssemblyMaxLimit),
+			)
+			return
+		}
+		limit = parsed
+	}
+	assembly, err := BuildKnowledgeReleaseAssembly(h.store, KnowledgeReleaseAssemblyQuery{
+		Limit: limit,
+		Query: r.URL.Query().Get("query"),
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "query must not exceed") ||
+			strings.Contains(err.Error(), "limit must be between") {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, assembly)
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeOperations(w http.ResponseWriter, r *http.Request) {

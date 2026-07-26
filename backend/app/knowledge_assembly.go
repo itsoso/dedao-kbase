@@ -310,6 +310,32 @@ func ValidateKnowledgeReleaseAssembly(assembly KnowledgeReleaseAssembly) error {
 	return nil
 }
 
+func ValidateKnowledgeReleaseAssemblyContract(raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, required := range []string{
+		"schema_version",
+		"algorithm_version",
+		"assembly_id",
+		"release_ids",
+		"summary",
+		"clusters",
+		"returned_clusters",
+		"has_more",
+	} {
+		if value, exists := fields[required]; !exists || len(value) == 0 || string(value) == "null" {
+			return fmt.Errorf("%s is required", required)
+		}
+	}
+	var assembly KnowledgeReleaseAssembly
+	if err := json.Unmarshal(raw, &assembly); err != nil {
+		return err
+	}
+	return ValidateKnowledgeReleaseAssembly(assembly)
+}
+
 func latestKnowledgeAssemblyReleaseRecords(
 	records []KnowledgeReleaseRecord,
 ) ([]KnowledgeReleaseRecord, error) {

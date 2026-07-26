@@ -1233,6 +1233,65 @@ func TestKBaseHTTPHandlerKnowledgeReadiness(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeAssembly(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-assembly",
+		"book-assembly",
+		"2026-07-26T10:00:00Z",
+		"干预能改善结局",
+		"private publisher value",
+		"wechat_mp_article",
+	)
+	release.Book.SourceHTML = "local/private/source.html"
+	release.Analysis.Summary = "private summary sentinel"
+	saveKnowledgeAssemblyRelease(t, store, release)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/knowledge/assembly", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/knowledge/assembly?limit=1&query="+url.QueryEscape("改善结局"),
+		"secret-token",
+	)
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"schema_version":"knowledge_release_assembly.v1"`) ||
+		!strings.Contains(response.Body.String(), `"release_id":"release-assembly"`) ||
+		!strings.Contains(response.Body.String(), `"claim_id":"release-assembly-claim"`) {
+		t.Fatalf("assembly status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, forbidden := range []string{
+		"private publisher value",
+		"private summary sentinel",
+		"local/private",
+		`"source_account":`,
+		`"prompt"`,
+		`"answer"`,
+	} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("assembly leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+	for _, path := range []string{
+		"/api/knowledge/assembly?limit=501",
+		"/api/knowledge/assembly?limit=invalid",
+		"/api/knowledge/assembly?query=" + url.QueryEscape(strings.Repeat("界", 257)),
+	} {
+		invalid := requestKBase(handler, http.MethodGet, path, "secret-token")
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("invalid request %q status=%d body=%s", path, invalid.Code, invalid.Body.String())
+		}
+	}
+	wrongMethod := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/assembly", "secret-token", `{}`)
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeOperationsConsole(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthReadinessBook(t, store, "book-health", "hash-health")
