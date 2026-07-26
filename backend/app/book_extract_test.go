@@ -144,3 +144,97 @@ func TestExtractBookKnowledgeCreatesCitationForEveryChunk(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractBookKnowledgeCitationIdentityDoesNotShiftAfterEarlierInsertion(t *testing.T) {
+	book := BookKnowledgeBook{BookID: "stable-book", Title: "稳定引用"}
+	original, err := ExtractBookKnowledgeFromHTML(book, `<html><body>
+		<h1>第一章</h1><p>原始第一段证据。</p>
+		<h1>第二章</h1><p>需要保持引用身份的证据。</p>
+	</body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := ExtractBookKnowledgeFromHTML(book, `<html><body>
+		<h1>新增章节</h1><p>后来插入的不同证据。</p>
+		<h1>第一章</h1><p>原始第一段证据。</p>
+		<h1>第二章</h1><p>需要保持引用身份的证据。</p>
+	</body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	originalID := citationIDForChunkText(t, original, "需要保持引用身份的证据。")
+	insertedID := citationIDForChunkText(t, inserted, "需要保持引用身份的证据。")
+	if originalID != insertedID {
+		t.Fatalf("citation identity shifted after earlier insertion: %q != %q", originalID, insertedID)
+	}
+}
+
+func TestExtractBookKnowledgeCitationIdentitySeparatesDuplicateTextByChapter(t *testing.T) {
+	book := BookKnowledgeBook{BookID: "duplicate-book", Title: "重复正文"}
+	original, err := ExtractBookKnowledgeFromHTML(book, `<html><body>
+		<h1>甲章节</h1><p>跨章节重复证据。</p>
+		<h1>乙章节</h1><p>跨章节重复证据。</p>
+	</body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := ExtractBookKnowledgeFromHTML(book, `<html><body>
+		<h1>新增章节</h1><p>跨章节重复证据。</p>
+		<h1>甲章节</h1><p>跨章节重复证据。</p>
+		<h1>乙章节</h1><p>跨章节重复证据。</p>
+	</body></html>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, title := range []string{"甲章节", "乙章节"} {
+		originalID := citationIDForChapterTitle(t, original, title)
+		insertedID := citationIDForChapterTitle(t, inserted, title)
+		if originalID != insertedID {
+			t.Fatalf("%s citation shifted after duplicate insertion: %q != %q", title, originalID, insertedID)
+		}
+	}
+}
+
+func citationIDForChunkText(t *testing.T, pkg *BookKnowledgePackage, text string) string {
+	t.Helper()
+	chunkID := ""
+	for _, chunk := range pkg.Chunks {
+		if chunk.Text == text {
+			chunkID = chunk.ChunkID
+			break
+		}
+	}
+	if chunkID == "" {
+		t.Fatalf("chunk text %q not found", text)
+	}
+	for _, citation := range pkg.Citations {
+		if citation.ChunkID == chunkID {
+			return citation.CitationID
+		}
+	}
+	t.Fatalf("citation for chunk %q not found", chunkID)
+	return ""
+}
+
+func citationIDForChapterTitle(t *testing.T, pkg *BookKnowledgePackage, title string) string {
+	t.Helper()
+	chapterID := ""
+	for _, chapter := range pkg.Chapters {
+		if chapter.Title == title {
+			chapterID = chapter.ChapterID
+			break
+		}
+	}
+	if chapterID == "" {
+		t.Fatalf("chapter title %q not found", title)
+	}
+	for _, citation := range pkg.Citations {
+		if citation.ChapterID == chapterID {
+			return citation.CitationID
+		}
+	}
+	t.Fatalf("citation for chapter %q not found", title)
+	return ""
+}

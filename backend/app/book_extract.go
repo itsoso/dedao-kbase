@@ -1,6 +1,8 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
@@ -131,6 +133,7 @@ type bookKnowledgePackageBuilder struct {
 	currentText   []string
 	chapterNumber int
 	chunkNumber   int
+	citationIDs   map[string]int
 }
 
 func (b *bookKnowledgePackageBuilder) startChapter(title string) {
@@ -180,7 +183,7 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 		}
 		b.chunks = append(b.chunks, chunk)
 		b.current.ChunkIDs = append(b.current.ChunkIDs, chunkID)
-		citationID := chunkID + "-citation"
+		citationID := b.nextChunkCitationID(part)
 		b.citations = append(b.citations, BookKnowledgeCitation{
 			CitationID:    citationID,
 			BookID:        b.book.BookID,
@@ -214,6 +217,19 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 		})
 	}
 	b.currentText = nil
+}
+
+func (b *bookKnowledgePackageBuilder) nextChunkCitationID(text string) string {
+	sum := sha256.Sum256([]byte(b.book.BookID + "\x00" + b.current.Title + "\x00" + text))
+	base := b.book.BookID + "-citation-" + hex.EncodeToString(sum[:8])
+	if b.citationIDs == nil {
+		b.citationIDs = make(map[string]int)
+	}
+	b.citationIDs[base]++
+	if b.citationIDs[base] == 1 {
+		return base
+	}
+	return base + "-" + strconv.Itoa(b.citationIDs[base])
 }
 
 func (b *bookKnowledgePackageBuilder) build() *BookKnowledgePackage {

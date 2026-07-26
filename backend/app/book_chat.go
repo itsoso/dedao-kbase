@@ -479,12 +479,12 @@ func buildBookKnowledgeContext(
 	}
 
 	appendSection("## 书籍\n" + pkg.Book.Title + "\nbook_id: " + pkg.Book.BookID)
-	for _, chapter := range pkg.Chapters {
-		if !appendSection(fmt.Sprintf("## 章节 [%s]\n%s\n%s", chapter.ChapterID, chapter.Title, chapter.Summary)) {
-			break
-		}
-		stats.Chapters++
-		if !citationNative {
+	if !citationNative {
+		for _, chapter := range pkg.Chapters {
+			if !appendSection(fmt.Sprintf("## 章节 [%s]\n%s\n%s", chapter.ChapterID, chapter.Title, chapter.Summary)) {
+				break
+			}
+			stats.Chapters++
 			sources = append(sources, BookKnowledgeChatSource{
 				Kind:      "chapter",
 				ID:        chapter.ChapterID,
@@ -492,13 +492,11 @@ func buildBookKnowledgeContext(
 				ChapterID: chapter.ChapterID,
 			})
 		}
-	}
-	for _, claim := range pkg.Claims {
-		if !appendSection(fmt.Sprintf("## Claim [%s]\n标题: %s\n内容: %s\n状态: %s", claim.ClaimID, claim.Title, claim.Summary, claim.ReviewStatus)) {
-			break
-		}
-		stats.Claims++
-		if !citationNative {
+		for _, claim := range pkg.Claims {
+			if !appendSection(fmt.Sprintf("## Claim [%s]\n标题: %s\n内容: %s\n状态: %s", claim.ClaimID, claim.Title, claim.Summary, claim.ReviewStatus)) {
+				break
+			}
+			stats.Claims++
 			sources = append(sources, BookKnowledgeChatSource{
 				Kind:      "claim",
 				ID:        claim.ClaimID,
@@ -539,7 +537,11 @@ func buildBookKnowledgeContext(
 		}
 		citations := citationsByChunk[chunk.ChunkID]
 		if len(citations) == 0 {
-			if !appendSection(fmt.Sprintf("## Legacy Chunk [chunk:%s]\nchapter_id: %s\ncitation_status: unavailable\n%s", chunk.ChunkID, chunk.ChapterID, chunk.Text)) {
+			if !appendSection(fmt.Sprintf(
+				"## Legacy Chunk [chunk:%s]\nchapter_id: %s\ncitation_status: unavailable\ncontent_status: omitted",
+				chunk.ChunkID,
+				chunk.ChapterID,
+			)) {
 				break
 			}
 			stats.Chunks++

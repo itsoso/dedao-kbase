@@ -1,6 +1,6 @@
 # Citation Migration v1 PRD
 
-**Status:** Approved for implementation  
+**Status:** Approved for implementation
 **Date:** 2026-07-26
 
 ## Goal
