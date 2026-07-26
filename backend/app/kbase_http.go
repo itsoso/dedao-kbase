@@ -2324,7 +2324,7 @@ func (h *kbaseHTTPHandler) handleKnowledgeAssembly(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		writeHTTPError(w, http.StatusInternalServerError, "knowledge assembly unavailable")
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, assembly)

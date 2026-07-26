@@ -146,6 +146,25 @@ func TestBuildKnowledgeReleaseAssemblyCountsPublisherAcrossTransportsOnce(t *tes
 	}
 }
 
+func TestKnowledgeAssemblyPublicationIdentityIsOpaqueAndTransportIndependent(t *testing.T) {
+	first := canonicalKnowledgeAssemblyPublicationIdentity(BookKnowledgeBook{
+		BookID: "book-a", SourceType: "wechat_mp_article", SourceAccount: "Medical Desk",
+	})
+	second := canonicalKnowledgeAssemblyPublicationIdentity(BookKnowledgeBook{
+		BookID: "book-b", SourceType: "dedao_course_article", SourceAccount: " medical desk ",
+	})
+	host := canonicalKnowledgeAssemblyPublicationIdentity(BookKnowledgeBook{
+		BookID: "book-host", SourceHTML: "https://private.internal.example/article",
+	})
+	if first.Key != second.Key ||
+		strings.Contains(first.Key, "medical") ||
+		strings.Contains(host.Key, "private.internal.example") ||
+		!first.IndependentSourceEligible ||
+		!host.IndependentSourceEligible {
+		t.Fatalf("assembly publication identities = %#v %#v %#v", first, second, host)
+	}
+}
+
 func TestBuildKnowledgeReleaseAssemblyDoesNotMergeBroadParaphrases(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveKnowledgeAssemblyRelease(t, store, knowledgeAssemblyTestRelease(
@@ -163,6 +182,44 @@ func TestBuildKnowledgeReleaseAssemblyDoesNotMergeBroadParaphrases(t *testing.T)
 	}
 	if assembly.Summary.ClusterCount != 2 || len(assembly.Clusters) != 2 {
 		t.Fatalf("broad paraphrases were merged: %#v", assembly)
+	}
+}
+
+func TestBuildKnowledgeReleaseAssemblyRejectsInvalidSelectedRelease(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-invalid",
+		"book-invalid",
+		"2026-07-26T10:00:00Z",
+		"不完整结论",
+		"Publisher",
+		"wechat_mp_article",
+	)
+	release.ContentHash = ""
+	saveKnowledgeAssemblyRelease(t, store, release)
+
+	if _, err := BuildKnowledgeReleaseAssembly(store, KnowledgeReleaseAssemblyQuery{Limit: 100}); err == nil ||
+		!strings.Contains(err.Error(), "content_hash") {
+		t.Fatalf("invalid selected release error = %v", err)
+	}
+}
+
+func TestBuildKnowledgeReleaseAssemblyRejectsDanglingClaimCitation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-dangling",
+		"book-dangling",
+		"2026-07-26T10:00:00Z",
+		"悬空证据结论",
+		"Publisher",
+		"wechat_mp_article",
+	)
+	release.Analysis.Claims[0].CitationIDs = []string{"missing-citation"}
+	saveKnowledgeAssemblyRelease(t, store, release)
+
+	if _, err := BuildKnowledgeReleaseAssembly(store, KnowledgeReleaseAssemblyQuery{Limit: 100}); err == nil ||
+		!strings.Contains(err.Error(), "missing-citation") {
+		t.Fatalf("dangling citation error = %v", err)
 	}
 }
 

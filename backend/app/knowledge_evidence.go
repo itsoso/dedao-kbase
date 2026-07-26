@@ -330,7 +330,7 @@ func CanonicalKnowledgePublicationIdentity(book BookKnowledgeBook) KnowledgePubl
 	sourceType := publicationIdentityComponent(firstNonEmpty(book.SourceType, "unknown"))
 	if account := strings.TrimSpace(book.SourceAccount); account != "" {
 		return KnowledgePublicationIdentity{
-			Key:   "account:" + opaquePublicationIdentityComponent(account),
+			Key:   "account:" + sourceType + ":" + publicationIdentityComponent(account),
 			Basis: "source_account", IndependentSourceEligible: true,
 		}
 	}
@@ -343,7 +343,7 @@ func CanonicalKnowledgePublicationIdentity(book BookKnowledgeBook) KnowledgePubl
 	}
 	if author := strings.TrimSpace(book.Author); author != "" && authoredKnowledgeSourceType(book.SourceType) {
 		return KnowledgePublicationIdentity{
-			Key:   "author:" + opaquePublicationIdentityComponent(author),
+			Key:   "author:" + sourceType + ":" + publicationIdentityComponent(author),
 			Basis: "source_author", IndependentSourceEligible: true,
 		}
 	}
@@ -464,12 +464,6 @@ func publicationIdentityComponent(value string) string {
 	if safe {
 		return value
 	}
-	sum := sha256.Sum256([]byte(value))
-	return "sha256-" + hex.EncodeToString(sum[:8])
-}
-
-func opaquePublicationIdentityComponent(value string) string {
-	value = strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
 	sum := sha256.Sum256([]byte(value))
 	return "sha256-" + hex.EncodeToString(sum[:8])
 }

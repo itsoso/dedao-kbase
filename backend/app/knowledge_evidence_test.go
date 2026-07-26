@@ -220,14 +220,18 @@ func TestCanonicalPublicationIdentityIsConservative(t *testing.T) {
 	}
 }
 
-func TestCanonicalPublicationIdentityIgnoresTransportForSamePublisher(t *testing.T) {
+func TestCanonicalPublicationIdentityPreservesVersionedTransportSemantics(t *testing.T) {
 	first := CanonicalKnowledgePublicationIdentity(BookKnowledgeBook{
 		BookID: "book-a", SourceType: "wechat_mp_article", SourceAccount: "Medical Desk",
 	})
 	second := CanonicalKnowledgePublicationIdentity(BookKnowledgeBook{
 		BookID: "book-b", SourceType: "dedao_course_article", SourceAccount: " medical desk ",
 	})
-	if first.Key != second.Key || !first.IndependentSourceEligible || !second.IndependentSourceEligible {
+	if first.Key != "account:wechat_mp_article:medical-desk" ||
+		second.Key != "account:dedao_course_article:medical-desk" ||
+		first.Key == second.Key ||
+		!first.IndependentSourceEligible ||
+		!second.IndependentSourceEligible {
 		t.Fatalf("publication identities = %#v %#v", first, second)
 	}
 }

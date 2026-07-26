@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -131,6 +132,9 @@ func BuildKnowledgeReleaseAssembly(
 			release.CreatedAt != record.CreatedAt {
 			return nil, fmt.Errorf("selected release %q does not match its manifest record", boundedEvidenceID(record.ReleaseID))
 		}
+		if err := validateKnowledgeAssemblyReleaseEvidence(*release); err != nil {
+			return nil, fmt.Errorf("selected release %q is invalid: %w", boundedEvidenceID(record.ReleaseID), err)
+		}
 		releases = append(releases, *release)
 		releaseIDs = append(releaseIDs, release.ReleaseID)
 	}
@@ -142,7 +146,7 @@ func BuildKnowledgeReleaseAssembly(
 	clusterMap := make(map[string]*KnowledgeReleaseAssemblyCluster)
 	claimCount := 0
 	for _, release := range releases {
-		publication := CanonicalKnowledgePublicationIdentity(release.Book)
+		publication := canonicalKnowledgeAssemblyPublicationIdentity(release.Book)
 		for _, claim := range release.Analysis.Claims {
 			normalized := normalizeKnowledgeAssemblyClaim(claim.Statement)
 			if strings.TrimSpace(claim.ID) == "" || normalized == "" || len(claim.CitationIDs) == 0 {
@@ -235,6 +239,80 @@ func BuildKnowledgeReleaseAssembly(
 		return nil, err
 	}
 	return result, nil
+}
+
+func validateKnowledgeAssemblyReleaseEvidence(release KnowledgeRelease) error {
+	citations := make(map[string]struct{}, len(release.Citations))
+	for index, citation := range release.Citations {
+		citationID := strings.TrimSpace(citation.CitationID)
+		if citationID == "" {
+			return fmt.Errorf("citations[%d].citation_id is required", index)
+		}
+		if citation.BookID != "" && citation.BookID != release.BookID {
+			return fmt.Errorf("citation %q belongs to a different book", boundedEvidenceID(citationID))
+		}
+		if _, duplicate := citations[citationID]; duplicate {
+			return fmt.Errorf("citation_id %q is duplicated", boundedEvidenceID(citationID))
+		}
+		citations[citationID] = struct{}{}
+	}
+	for _, claim := range release.Analysis.Claims {
+		for _, citationID := range claim.CitationIDs {
+			citationID = strings.TrimSpace(citationID)
+			if _, exists := citations[citationID]; !exists {
+				return fmt.Errorf(
+					"claim %q references unknown citation %q",
+					boundedEvidenceID(claim.ID),
+					boundedEvidenceID(citationID),
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalKnowledgeAssemblyPublicationIdentity(book BookKnowledgeBook) KnowledgePublicationIdentity {
+	if account := strings.TrimSpace(book.SourceAccount); account != "" {
+		return KnowledgePublicationIdentity{
+			Key:                       "account:" + opaqueKnowledgeAssemblyIdentityComponent(account),
+			Basis:                     "source_account",
+			IndependentSourceEligible: true,
+		}
+	}
+	if parsed, err := url.Parse(strings.TrimSpace(book.SourceHTML)); err == nil &&
+		(parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Hostname() != "" {
+		return KnowledgePublicationIdentity{
+			Key:                       "host:" + opaqueKnowledgeAssemblyIdentityComponent(parsed.Hostname()),
+			Basis:                     "source_host",
+			IndependentSourceEligible: true,
+		}
+	}
+	if author := strings.TrimSpace(book.Author); author != "" && authoredKnowledgeSourceType(book.SourceType) {
+		return KnowledgePublicationIdentity{
+			Key:                       "author:" + opaqueKnowledgeAssemblyIdentityComponent(author),
+			Basis:                     "source_author",
+			IndependentSourceEligible: true,
+		}
+	}
+	sourceType := strings.TrimSpace(firstNonEmpty(book.SourceType, "unknown"))
+	if item := strings.TrimSpace(firstNonEmpty(book.SourceKey, book.EnID)); item != "" {
+		return KnowledgePublicationIdentity{
+			Key:                       "item:" + opaqueKnowledgeAssemblyIdentityComponent(sourceType+"\x00"+item),
+			Basis:                     "source_item",
+			IndependentSourceEligible: false,
+		}
+	}
+	return KnowledgePublicationIdentity{
+		Key:                       "book:" + opaqueKnowledgeAssemblyIdentityComponent(firstNonEmpty(book.BookID, "unknown")),
+		Basis:                     "book_fallback",
+		IndependentSourceEligible: false,
+	}
+}
+
+func opaqueKnowledgeAssemblyIdentityComponent(value string) string {
+	value = strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+	sum := sha256.Sum256([]byte(value))
+	return "sha256-" + hex.EncodeToString(sum[:8])
 }
 
 func ValidateKnowledgeReleaseAssembly(assembly KnowledgeReleaseAssembly) error {

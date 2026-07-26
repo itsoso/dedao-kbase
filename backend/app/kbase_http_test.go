@@ -1292,6 +1292,32 @@ func TestKBaseHTTPHandlerKnowledgeAssembly(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeAssemblyRedactsInternalErrors(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-missing",
+		"book-missing",
+		"2026-07-26T10:00:00Z",
+		"缺失文件结论",
+		"Publisher",
+		"wechat_mp_article",
+	)
+	saveKnowledgeAssemblyRelease(t, store, release)
+	if err := os.Remove(store.KnowledgeReleasePath(release.ReleaseID)); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	response := requestKBase(handler, http.MethodGet, "/api/knowledge/assembly", "secret-token")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Body.String() != "{\"error\":\"knowledge assembly unavailable\"}\n" ||
+		strings.Contains(response.Body.String(), store.Root()) {
+		t.Fatalf("internal error was not redacted: %s", response.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeOperationsConsole(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveHealthReadinessBook(t, store, "book-health", "hash-health")
