@@ -321,6 +321,26 @@ func TestBuildKnowledgeReleaseAssemblyRejectsOversizedCluster(t *testing.T) {
 			want: "citation_ids exceeds 128",
 		},
 		{
+			name: "citation ids before deduplication",
+			build: func(t *testing.T, store *BookKnowledgeStore) {
+				release := knowledgeAssemblyTestRelease(
+					"release-duplicate-citations",
+					"book-duplicate-citations",
+					"2026-07-26T10:00:00Z",
+					"重复引用数量仍然受限",
+					"Publisher",
+					"wechat_mp_article",
+				)
+				citationID := release.Analysis.Claims[0].CitationIDs[0]
+				release.Analysis.Claims[0].CitationIDs = make([]string, 129)
+				for index := range release.Analysis.Claims[0].CitationIDs {
+					release.Analysis.Claims[0].CitationIDs[index] = citationID
+				}
+				saveKnowledgeAssemblyRelease(t, store, release)
+			},
+			want: "citation_ids exceeds 128",
+		},
+		{
 			name: "potential conflicts",
 			build: func(t *testing.T, store *BookKnowledgeStore) {
 				for index := 0; index < 34; index++ {

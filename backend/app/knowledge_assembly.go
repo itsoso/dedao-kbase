@@ -126,6 +126,17 @@ func BuildKnowledgeReleaseAssembly(
 		if err != nil {
 			return nil, fmt.Errorf("load selected release %q: %w", boundedEvidenceID(record.ReleaseID), err)
 		}
+		if release.Analysis != nil {
+			for _, claim := range release.Analysis.Claims {
+				if len(claim.CitationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+					return nil, fmt.Errorf(
+						"claim %q citation_ids exceeds %d items",
+						boundedEvidenceID(claim.ID),
+						knowledgeAssemblyMaxCitationIDsPerClaim,
+					)
+				}
+			}
+		}
 		adaptKnowledgeAssemblyReleaseForRead(release)
 		releasePayload, err := json.Marshal(release)
 		if err != nil {
@@ -162,14 +173,14 @@ func BuildKnowledgeReleaseAssembly(
 					knowledgeAssemblyMaxStatementRunes,
 				)
 			}
-			citationIDs := uniqueSortedStrings(claim.CitationIDs)
-			if len(citationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+			if len(claim.CitationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
 				return nil, fmt.Errorf(
 					"claim %q citation_ids exceeds %d items",
 					boundedEvidenceID(claim.ID),
 					knowledgeAssemblyMaxCitationIDsPerClaim,
 				)
 			}
+			citationIDs := uniqueSortedStrings(claim.CitationIDs)
 			normalized := normalizeKnowledgeAssemblyClaim(statement)
 			if strings.TrimSpace(claim.ID) == "" || normalized == "" || len(claim.CitationIDs) == 0 {
 				return nil, fmt.Errorf(
