@@ -223,6 +223,37 @@ func TestBuildKnowledgeReleaseAssemblyRejectsDanglingClaimCitation(t *testing.T)
 	}
 }
 
+func TestBuildKnowledgeReleaseAssemblyReadsLegacyReleaseEvidence(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-legacy",
+		"book-legacy",
+		"2026-07-26T10:00:00Z",
+		"旧版证据仍可组装",
+		"Publisher",
+		"wechat_mp_article",
+	)
+	release.SchemaVersion = ""
+	release.Analysis.Claims[0].CitationIDs = []string{release.Citations[0].ChunkID}
+	saveKnowledgeAssemblyRelease(t, store, release)
+
+	assembly, err := BuildKnowledgeReleaseAssembly(
+		store,
+		KnowledgeReleaseAssemblyQuery{Limit: 100},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assembly.Clusters) != 1 ||
+		len(assembly.Clusters[0].Claims) != 1 ||
+		!reflect.DeepEqual(
+			assembly.Clusters[0].Claims[0].CitationIDs,
+			[]string{release.Citations[0].CitationID},
+		) {
+		t.Fatalf("legacy release assembly = %#v", assembly)
+	}
+}
+
 func TestBuildKnowledgeReleaseAssemblyIsBoundedQueryableAndPrivacySafe(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	first := knowledgeAssemblyTestRelease(

@@ -121,6 +121,7 @@ func BuildKnowledgeReleaseAssembly(
 		if err != nil {
 			return nil, fmt.Errorf("load selected release %q: %w", boundedEvidenceID(record.ReleaseID), err)
 		}
+		adaptKnowledgeAssemblyReleaseForRead(release)
 		releasePayload, err := json.Marshal(release)
 		if err != nil {
 			return nil, fmt.Errorf("encode selected release %q: %w", boundedEvidenceID(record.ReleaseID), err)
@@ -239,6 +240,24 @@ func BuildKnowledgeReleaseAssembly(
 		return nil, err
 	}
 	return result, nil
+}
+
+func adaptKnowledgeAssemblyReleaseForRead(release *KnowledgeRelease) {
+	if release == nil {
+		return
+	}
+	if release.SchemaVersion == "" && release.Version == knowledgeReleaseVersion {
+		release.SchemaVersion = KnowledgeReleaseSchemaVersion
+	}
+	if release.Analysis == nil {
+		return
+	}
+	for index := range release.Analysis.Claims {
+		release.Analysis.Claims[index].CitationIDs = resolveAgentClaimCitationIDs(
+			release.Citations,
+			release.Analysis.Claims[index].CitationIDs,
+		)
+	}
 }
 
 func validateKnowledgeAssemblyReleaseEvidence(release KnowledgeRelease) error {
