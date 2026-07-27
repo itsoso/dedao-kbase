@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -426,7 +427,30 @@ func TestContractSchemasValidateGoPositiveAndNegativeExamples(t *testing.T) {
 
 func validateSchemaInstance(t *testing.T, name string, value any, wantValid bool) {
 	t.Helper()
-	schema, err := jsonschema.Compile(filepath.Join("..", "..", "contracts", name))
+	compiler := jsonschema.NewCompiler()
+	contractPaths, err := filepath.Glob(filepath.Join("..", "..", "contracts", "*.schema.json"))
+	if err != nil {
+		t.Fatalf("list contract schemas: %v", err)
+	}
+	for _, contractPath := range contractPaths {
+		raw, readErr := os.ReadFile(contractPath)
+		if readErr != nil {
+			t.Fatalf("read %s: %v", contractPath, readErr)
+		}
+		var identity struct {
+			ID string `json:"$id"`
+		}
+		if unmarshalErr := json.Unmarshal(raw, &identity); unmarshalErr != nil {
+			t.Fatalf("decode %s identity: %v", contractPath, unmarshalErr)
+		}
+		if identity.ID == "" {
+			t.Fatalf("%s has no $id", contractPath)
+		}
+		if addErr := compiler.AddResource(identity.ID, bytes.NewReader(raw)); addErr != nil {
+			t.Fatalf("register %s: %v", contractPath, addErr)
+		}
+	}
+	schema, err := compiler.Compile("https://kbase.executor.life/contracts/" + name)
 	if err != nil {
 		t.Fatalf("compile %s: %v", name, err)
 	}

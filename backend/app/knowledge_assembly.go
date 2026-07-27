@@ -28,6 +28,7 @@ const (
 	knowledgeAssemblyDefaultLimit  = 100
 	knowledgeAssemblyMaxLimit      = 500
 	knowledgeAssemblyMaxQueryRunes = 256
+	knowledgeAssemblyMaxScope      = 17
 
 	knowledgeAssemblyMaxClaimsPerCluster    = 128
 	knowledgeAssemblyMaxStatementRunes      = 4096
@@ -36,8 +37,9 @@ const (
 )
 
 type KnowledgeReleaseAssemblyQuery struct {
-	Limit int
-	Query string
+	Limit      int
+	Query      string
+	ReleaseIDs []string
 }
 
 type KnowledgeReleaseAssembly struct {
@@ -110,6 +112,22 @@ func BuildKnowledgeReleaseAssembly(
 	if utf8.RuneCountInString(query.Query) > knowledgeAssemblyMaxQueryRunes {
 		return nil, fmt.Errorf("query must not exceed %d characters", knowledgeAssemblyMaxQueryRunes)
 	}
+	if len(query.ReleaseIDs) > knowledgeAssemblyMaxScope {
+		return nil, fmt.Errorf(
+			"release_ids must not exceed %d items",
+			knowledgeAssemblyMaxScope,
+		)
+	}
+	scopedReleaseIDs := make(map[string]struct{}, len(query.ReleaseIDs))
+	for index, releaseID := range query.ReleaseIDs {
+		if releaseID != strings.TrimSpace(releaseID) || releaseID == "" {
+			return nil, fmt.Errorf("release_ids[%d] must use canonical form", index)
+		}
+		if _, duplicate := scopedReleaseIDs[releaseID]; duplicate {
+			return nil, fmt.Errorf("release_ids contains duplicate %q", boundedEvidenceID(releaseID))
+		}
+		scopedReleaseIDs[releaseID] = struct{}{}
+	}
 
 	manifest, err := store.loadKnowledgeReleaseManifest()
 	if err != nil {
@@ -118,6 +136,19 @@ func BuildKnowledgeReleaseAssembly(
 	records, err := latestKnowledgeAssemblyReleaseRecords(manifest.Releases)
 	if err != nil {
 		return nil, err
+	}
+	if len(scopedReleaseIDs) > 0 {
+		filtered := make([]KnowledgeReleaseRecord, 0, len(scopedReleaseIDs))
+		for _, record := range records {
+			if _, selected := scopedReleaseIDs[record.ReleaseID]; selected {
+				filtered = append(filtered, record)
+				delete(scopedReleaseIDs, record.ReleaseID)
+			}
+		}
+		if len(scopedReleaseIDs) > 0 {
+			return nil, fmt.Errorf("one or more scoped releases are not latest")
+		}
+		records = filtered
 	}
 	releases := make([]KnowledgeRelease, 0, len(records))
 	releaseIDs := make([]string, 0, len(records))

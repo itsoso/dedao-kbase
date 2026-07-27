@@ -4,7 +4,7 @@
 
 **Goal:** Compile deterministic dual, evidence, and study Agent Package candidates from strict Release Assembly state.
 
-**Architecture:** Add a pure profile-driven compiler in `backend/app` and keep compilation read-only. The compiler emits finalized package candidates plus bounded diagnostics; existing trusted evaluation and publication functions remain the only persistence path. A thin publisher-authenticated HTTP route and Book Agents preview panel expose the capability.
+**Architecture:** Add a pure profile-driven compiler in `backend/app` and keep compilation read-only. The compiler emits finalized package candidates plus bounded diagnostics; existing trusted evaluation and publication functions remain the only persistence path. A thin authenticated read-only HTTP route and Book Agents preview panel expose the capability without disclosing publisher credentials.
 
 **Tech Stack:** Go, `net/http`, JSON Schema, existing KBase Release/Assembly/Agent Package contracts, vanilla Web frontend, Node static smoke tests.
 
@@ -127,9 +127,9 @@ func CompileAgentPackages(
 ) (*AgentCompilation, error)
 ```
 
-Build the unfiltered Assembly once, require the primary Release to be a member,
-load and compatibility-adapt selected immutable Releases, invoke fixed study
-and evidence profile builders, validate every ready package with
+Resolve the latest Release per book, build one Assembly scoped to the selected
+Release IDs, load and compatibility-adapt only those immutable Releases, invoke
+fixed study and evidence profile builders, validate every ready package with
 `ValidateAgentPackage`, then derive the compilation ID from compiler version,
 Assembly ID, normalized request, candidate status, issues, and package hashes.
 
@@ -177,9 +177,11 @@ Expected: FAIL on evidence selection and profile assertions.
 
 **Step 3: Implement evidence selection and fixed profile**
 
-Use Assembly claim refs as the only source of publication identity and automatic
-relationship evidence. Explicit support may be unrelated but must be in the
-Assembly and independently eligible with a different identity from the primary.
+Derive publication identity from the selected immutable Releases and require
+every support source to share a normalized assertion or explicit polarity
+conflict with the primary. Explicit and automatically discovered support must
+both be independently eligible with a different publication identity. Automatic
+discovery scans the newest 500 latest-per-book Release records.
 
 Build a fixed v2 package:
 
@@ -257,8 +259,8 @@ git commit -m "feat(kbase): compile study agent candidates"
 Require:
 
 - `POST /api/agent-packages/compile`;
-- publisher token succeeds;
-- normal API, consumer, missing, and wrong tokens return `401`;
+- normal API token succeeds;
+- publisher-only, source-agent, missing, and wrong tokens return `401`;
 - methods other than POST return `405`;
 - body above 64 KiB, unknown fields, trailing JSON, and invalid requests return
   `400`;
@@ -276,9 +278,11 @@ Expected: FAIL with route not found.
 
 **Step 3: Implement the thin handler**
 
-Add the compile path to the dedicated publisher-auth branch. Decode with
+Keep the compile path behind normal API authentication. Decode with
 `http.MaxBytesReader`, `DisallowUnknownFields`, and a trailing-token check.
-Call the pure compiler and return the contract without persistence.
+Call the pure compiler and return the contract without persistence. Do not
+expose the publisher token to the browser; evaluation and publication retain
+their dedicated publisher-auth branch.
 
 **Step 4: Run tests to verify GREEN**
 
@@ -315,9 +319,12 @@ Expected: FAIL because the compiler panel is absent.
 **Step 3: Implement compact compiler panel**
 
 Reuse the current Book Agents workspace and API helper. Keep the package list
-and selected package stable. Render ready and blocked candidates near the
-compile controls; do not send package content to storage or local persistence.
-Use existing segmented controls and restrained workspace styling.
+and selected package stable. Load only the latest Release per book, newest
+first. Isolate package and Release-list failures with `Promise.allSettled`, and
+discard stale compilation responses with a request sequence. Render ready and
+blocked candidates near the compile controls; do not send package content to
+storage or local persistence. Use existing segmented controls and restrained
+workspace styling.
 
 **Step 4: Run smoke to verify GREEN**
 
@@ -407,7 +414,9 @@ health fails.
 Verify:
 
 - service active, zero restarts, successful local/public health;
-- compile endpoint rejects unauthenticated and normal API credentials;
+- compile endpoint rejects unauthenticated, publisher-only, and invalid
+  credentials;
+- normal authenticated API session succeeds;
 - authenticated study compilation is ready for a production Release;
 - dual compilation is ready or honestly partial based on support evidence;
 - repeated compilation returns identical IDs and hashes;

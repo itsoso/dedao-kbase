@@ -117,6 +117,8 @@ go run ./cmd/kbase-server --addr 127.0.0.1:8719
 - `POST /api/knowledge/releases/{release_id}/receipts`：下游导入后的幂等 delivery receipt。
 - `GET /api/knowledge/lineage/{object_id}`：查询 release 或 book 的来源、hash、artifact refs 和 citation IDs。
 - `GET /api/knowledge/impact`、`GET /api/knowledge/gaps`：查看导入回执、pipeline 阶段和隐私安全 gap 聚合。
+- `POST /api/agent-packages/compile`：使用普通已登录 Bearer 会话，从不可变 Release 只读生成 `dual`、`evidence` 或 `study` 候选包；不保存、不评测、不发布。
+- `GET /api/knowledge/releases?latest=true`：按书返回最新 Release，并按发布时间倒序分页，供 Agent Compiler 选择器使用。
 - `POST /api/agent-packages/evaluate`：使用独立 publisher token 执行并保存不可变的黄金集评估；`vector`/`hybrid` 包要求显式配置获授权的语义嵌入服务。
 - `POST /api/agent-packages/publish`：仅接受独立的 `KBASE_AGENT_PUBLISHER_TOKEN`；普通 API/consumer token 不能发布 Agent Package。
 

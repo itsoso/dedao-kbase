@@ -27,9 +27,11 @@ study candidate remains ready when the evidence candidate is blocked.
 ### Evidence
 
 Compile an `agent-package.v2` candidate. It requires one primary Release and at
-least one independent supporting Release. Automatic support selection is
-allowed only when Release Assembly proves a shared assertion or potential
-conflict and the publication identity is independently eligible.
+least one independent, related supporting Release. Explicit and automatic
+support selection are allowed only when the scoped Release Assembly proves a
+shared normalized assertion or polarity conflict and the publication identity
+is independently eligible. Automatic discovery scans a bounded newest-first
+window.
 
 ### Study
 
@@ -43,10 +45,16 @@ reading, search, grounded chat, and evidence inspection with read-only tools.
 - Every ready candidate passes `ValidateAgentPackage`.
 - A missing or unrelated supporting source produces bounded issue codes rather
   than a weak evidence package.
+- Compiler browsing returns only the latest Release per book, newest first.
+- A Release-list failure does not hide already published packages, and a stale
+  compilation response cannot overwrite a newer operator selection.
 - Compiler output cannot publish or trust its own evaluation.
-- The API requires the dedicated Agent publisher credential.
+- The read-only API requires a normal authenticated API session and never
+  exposes the dedicated Agent publisher credential.
 - Output contains no source body, prompt text, token, cookie, raw account, or
   machine-specific path.
+- Request and response Release IDs are bounded, and response mode/status must
+  agree with the exact candidate set.
 - Operators can preview all three modes from the Book Agents Web workspace.
 
 ## Non-Goals
@@ -69,6 +77,6 @@ candidate status, packages when ready, bounded issues, and next actions.
 
 ## Rollout
 
-Deliver the pure compiler and contract first, then publisher-authenticated HTTP
-access, then the Web preview. Existing Agent Package evaluation, publication,
-runtime, and consumer behavior must remain unchanged.
+Deliver the pure compiler and contract first, then authenticated read-only HTTP
+access, then the Web preview. Existing publisher-authenticated Agent Package
+evaluation, publication, runtime, and consumer behavior must remain unchanged.

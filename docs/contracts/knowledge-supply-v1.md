@@ -23,6 +23,21 @@ Package manifests contain prompt profile and output-schema identifiers, not
 private prompt bodies. They do not transfer downloaded source bodies,
 credentials, consumer user data, or consumer-owned review decisions.
 
+An authenticated operator may compile deterministic candidates from immutable
+Release Assembly state:
+
+```text
+POST /api/agent-packages/compile
+```
+
+The request and response follow
+`contracts/agent-compilation-request-v1.schema.json` and
+`contracts/agent-compilation-v1.schema.json`. Compilation accepts only fixed
+`dual`, `evidence`, or `study` profiles. It is read-only: the response is a
+preview and does not persist, evaluate, trust, or publish a package. The route
+uses the normal authenticated API session so the Web workspace never receives
+the publisher credential.
+
 Before publication, a publisher submits the finalized package and its synthetic
 golden suite to:
 
@@ -31,7 +46,8 @@ POST /api/agent-packages/evaluate
 POST /api/agent-packages/publish
 ```
 
-Both routes require the dedicated Agent Package publisher token. Evaluation
+The evaluation and publication routes require the dedicated Agent Package
+publisher token. Evaluation
 executes the package retrieval and grounded-chat path, the proposed read-only
 tool policy, retrieval recall and precision, citations, faithfulness,
 abstention, task completion, observed latency, and bounded observed cost. The
@@ -157,6 +173,17 @@ citation IDs, or a cluster exceeds 256 potential-conflict edges. The runtime
 also recomputes cluster identity, publication counts, status, and conflict
 edges, and verifies release, summary, and pagination relationships. It never
 silently truncates evidence within a cluster.
+
+Agent compilation uses a scoped Assembly containing at most the primary Release
+plus 16 selected supporting Releases. Evidence support must have a distinct,
+independently eligible publication identity and a shared normalized assertion
+or explicit polarity conflict with the primary. Automatic discovery examines at
+most the newest 500 latest Release records. Release IDs are bounded to 128
+Unicode code points. Compilation mode and overall status must agree with the
+candidate kinds and candidate statuses in both runtime validation and JSON
+Schema. The Web selector uses
+`GET /api/knowledge/releases?latest=true`, which returns one latest Release per
+book in newest-first order.
 
 ## Health Evidence Consumer
 

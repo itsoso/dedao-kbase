@@ -13,12 +13,12 @@
   "properties": {
     "schema_version": { "const": "agent-compilation-request.v1" },
     "mode": { "enum": ["dual", "evidence", "study"] },
-    "primary_release_id": { "type": "string", "minLength": 1 },
+    "primary_release_id": { "type": "string", "minLength": 1, "maxLength": 128 },
     "supporting_release_ids": {
       "type": "array",
       "maxItems": 16,
       "uniqueItems": true,
-      "items": { "type": "string", "minLength": 1 }
+      "items": { "type": "string", "minLength": 1, "maxLength": 128 }
     },
     "version": {
       "type": "string",

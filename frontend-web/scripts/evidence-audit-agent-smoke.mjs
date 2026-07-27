@@ -34,6 +34,16 @@ const compileSource = js.match(/async function compileAgentPackages\([\s\S]*?\n\
 assert.ok(compileSource.includes("apiFetch"), "compiler should use the authenticated browser API session");
 assert.ok(!compileSource.includes("publisher"), "read-only compilation must not request publisher credentials");
 assert.ok(!compileSource.includes("localStorage"), "compiler must not persist additional credentials");
+assert.ok(compileSource.includes("agentCompilerRequestSequence"), "stale compiler responses should be ignored");
+assert.ok(compileSource.includes("sequence !== agentCompilerRequestSequence"), "compiler response should match the active request");
+assert.ok(js.includes('document.querySelector(".agent-compiler__result")?.remove()'), "selection changes should remove stale rendered results");
+
+const releaseSource = js.match(/async function loadAgentCompilerReleases\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(releaseSource.includes('latest: "true"'), "compiler should only browse the latest release per book");
+
+const platformLoaderSource = js.match(/async function loadBookAgentPlatform\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(platformLoaderSource.includes("Promise.allSettled"), "package listing should survive compiler release failures");
+assert.ok(platformLoaderSource.includes('releasesResult.status === "fulfilled"'), "compiler release failures should be isolated");
 
 for (const className of [
   ".agent-compiler",

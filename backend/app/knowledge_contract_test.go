@@ -253,6 +253,13 @@ func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
 	if got := requestProperties["supporting_release_ids"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxSupportingReleases) {
 		t.Fatalf("supporting_release_ids maxItems = %#v", got)
 	}
+	if got := requestProperties["primary_release_id"].(map[string]any)["maxLength"]; got != float64(agentCompilationMaxReleaseIDRunes) {
+		t.Fatalf("primary_release_id maxLength = %#v", got)
+	}
+	requestSupportItems := requestProperties["supporting_release_ids"].(map[string]any)["items"].(map[string]any)
+	if got := requestSupportItems["maxLength"]; got != float64(agentCompilationMaxReleaseIDRunes) {
+		t.Fatalf("supporting release maxLength = %#v", got)
+	}
 
 	responseRaw, err := os.ReadFile(filepath.Join(
 		"..",
@@ -271,11 +278,74 @@ func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
 	if got := responseProperties["candidates"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxCandidates) {
 		t.Fatalf("candidates maxItems = %#v", got)
 	}
+	if got := responseProperties["release_ids"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxSupportingReleases+1) {
+		t.Fatalf("release_ids maxItems = %#v", got)
+	}
+	if got := len(responseSchema["allOf"].([]any)); got != 6 {
+		t.Fatalf("response mode/status conditional contracts = %d", got)
+	}
 	defs := responseSchema["$defs"].(map[string]any)
 	issueProperties := defs["issue"].(map[string]any)["properties"].(map[string]any)
 	if got := issueProperties["message"].(map[string]any)["maxLength"]; got != float64(agentCompilationMaxIssueMessageRunes) {
 		t.Fatalf("issue message maxLength = %#v", got)
 	}
+	candidate := defs["candidate"].(map[string]any)
+	candidateProperties := candidate["properties"].(map[string]any)
+	if got := len(candidateProperties["package"].(map[string]any)["oneOf"].([]any)); got != 2 {
+		t.Fatalf("candidate package schema refs = %d", got)
+	}
+	if got := len(candidate["allOf"].([]any)); got != 4 {
+		t.Fatalf("candidate conditional contracts = %d", got)
+	}
+	nextActionItems := candidateProperties["next_actions"].(map[string]any)["items"].(map[string]any)
+	if got := nextActionItems["maxLength"]; got != float64(agentCompilationMaxNextActionRunes) {
+		t.Fatalf("next action maxLength = %#v", got)
+	}
+}
+
+func TestAgentCompilationSchemaRequiresPackageVersionForCandidateKind(t *testing.T) {
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilation := AgentCompilation{
+		SchemaVersion:   AgentCompilationSchemaVersion,
+		CompilerVersion: AgentCompilerVersion,
+		CompilationID:   "compilation-schema-fixture",
+		Mode:            AgentCompilationModeStudy,
+		AssemblyID:      "assembly-schema-fixture",
+		ReleaseIDs:      []string{"release-schema-fixture"},
+		Status:          AgentCompilationStatusReady,
+		Candidates: []AgentCompilationCandidate{{
+			Kind:        AgentCompilationCandidateStudy,
+			Status:      AgentCompilationCandidateReady,
+			Package:     &v1,
+			NextActions: []string{AgentCompilationNextActionEvaluate},
+		}},
+	}
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, true)
+
+	compilation.Candidates[0].Package = &v2
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+
+	compilation.Mode = AgentCompilationModeEvidence
+	compilation.Candidates[0].Kind = AgentCompilationCandidateEvidence
+	compilation.Candidates[0].Package = &v1
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+
+	compilation.Mode = AgentCompilationModeStudy
+	compilation.Candidates[0].Kind = AgentCompilationCandidateStudy
+	compilation.Candidates[0].Package = &v1
+	compilation.Status = AgentCompilationStatusBlocked
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+
+	compilation.Status = AgentCompilationStatusReady
+	compilation.Mode = AgentCompilationModeDual
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
 }
 
 func TestKnowledgeReleaseAssemblySchemaCarriesHardLimits(t *testing.T) {

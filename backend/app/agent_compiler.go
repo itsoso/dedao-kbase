@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -34,6 +33,7 @@ const (
 	AgentCompilationIssueReleaseNotInAssembly      = "release_not_in_assembly"
 	AgentCompilationIssueReleaseInvalid            = "release_invalid"
 	AgentCompilationIssueReleaseNotIndependent     = "release_not_independent"
+	AgentCompilationIssueReleaseNotRelated         = "release_not_related"
 	AgentCompilationIssueMissingCitations          = "missing_citations"
 
 	AgentCompilationNextActionEvaluate            = "run_trusted_evaluation"
@@ -45,7 +45,10 @@ const (
 	agentCompilationMaxCandidates         = 2
 	agentCompilationMaxIssuesPerCandidate = 8
 	agentCompilationMaxNextActions        = 4
+	agentCompilationMaxReleaseIDRunes     = 128
 	agentCompilationMaxIssueMessageRunes  = 256
+	agentCompilationMaxNextActionRunes    = 128
+	agentCompilationMaxDiscoveryReleases  = 500
 )
 
 var agentCompilationVersionPattern = regexp.MustCompile(
@@ -99,6 +102,12 @@ func ValidateAgentCompilationRequest(request AgentCompilationRequest) error {
 	if request.PrimaryReleaseID != strings.TrimSpace(request.PrimaryReleaseID) {
 		return fmt.Errorf("primary_release_id must use canonical form without surrounding whitespace")
 	}
+	if utf8.RuneCountInString(request.PrimaryReleaseID) > agentCompilationMaxReleaseIDRunes {
+		return fmt.Errorf(
+			"primary_release_id must not exceed %d characters",
+			agentCompilationMaxReleaseIDRunes,
+		)
+	}
 	if !agentCompilationVersionPattern.MatchString(request.Version) {
 		return fmt.Errorf("version must be a semantic version")
 	}
@@ -118,6 +127,13 @@ func ValidateAgentCompilationRequest(request AgentCompilationRequest) error {
 			return fmt.Errorf(
 				"supporting_release_ids[%d] must use canonical form without surrounding whitespace",
 				index,
+			)
+		}
+		if utf8.RuneCountInString(releaseID) > agentCompilationMaxReleaseIDRunes {
+			return fmt.Errorf(
+				"supporting_release_ids[%d] must not exceed %d characters",
+				index,
+				agentCompilationMaxReleaseIDRunes,
 			)
 		}
 		if releaseID == request.PrimaryReleaseID {
@@ -152,14 +168,29 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 	if len(compilation.ReleaseIDs) == 0 {
 		return fmt.Errorf("release_ids is required")
 	}
+	if len(compilation.ReleaseIDs) > agentCompilationMaxSupportingReleases+1 {
+		return fmt.Errorf(
+			"release_ids must not exceed %d items",
+			agentCompilationMaxSupportingReleases+1,
+		)
+	}
 	if len(compilation.Candidates) == 0 || len(compilation.Candidates) > agentCompilationMaxCandidates {
 		return fmt.Errorf("candidates must contain between 1 and %d items", agentCompilationMaxCandidates)
 	}
 
 	seenReleases := make(map[string]struct{}, len(compilation.ReleaseIDs))
 	for index, releaseID := range compilation.ReleaseIDs {
-		if strings.TrimSpace(releaseID) == "" {
+		canonical := strings.TrimSpace(releaseID)
+		if canonical == "" {
 			return fmt.Errorf("release_ids[%d] is required", index)
+		}
+		if canonical != releaseID ||
+			utf8.RuneCountInString(releaseID) > agentCompilationMaxReleaseIDRunes {
+			return fmt.Errorf(
+				"release_ids[%d] must use canonical form and not exceed %d characters",
+				index,
+				agentCompilationMaxReleaseIDRunes,
+			)
 		}
 		if _, duplicate := seenReleases[releaseID]; duplicate {
 			return fmt.Errorf("release_ids contains duplicate %q", boundedEvidenceID(releaseID))
@@ -194,6 +225,22 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 				agentCompilationMaxNextActions,
 			)
 		}
+		seenActions := make(map[string]struct{}, len(candidate.NextActions))
+		for actionIndex, action := range candidate.NextActions {
+			if strings.TrimSpace(action) == "" ||
+				utf8.RuneCountInString(action) > agentCompilationMaxNextActionRunes {
+				return fmt.Errorf(
+					"candidates[%d].next_actions[%d] must contain between 1 and %d characters",
+					index,
+					actionIndex,
+					agentCompilationMaxNextActionRunes,
+				)
+			}
+			if _, duplicate := seenActions[action]; duplicate {
+				return fmt.Errorf("candidates[%d].next_actions contains duplicates", index)
+			}
+			seenActions[action] = struct{}{}
+		}
 		for issueIndex, issue := range candidate.Issues {
 			if strings.TrimSpace(issue.Code) == "" {
 				return fmt.Errorf("candidates[%d].issues[%d].code is required", index, issueIndex)
@@ -216,6 +263,18 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 			if candidate.Package == nil {
 				return fmt.Errorf("ready candidates[%d] requires a package", index)
 			}
+			expectedSchemaVersion := AgentPackageSchemaVersionV1
+			if candidate.Kind == AgentCompilationCandidateEvidence {
+				expectedSchemaVersion = AgentPackageSchemaVersionV2
+			}
+			if candidate.Package.SchemaVersion != expectedSchemaVersion {
+				return fmt.Errorf(
+					"ready candidates[%d] kind %q requires package schema_version %q",
+					index,
+					candidate.Kind,
+					expectedSchemaVersion,
+				)
+			}
 			if len(candidate.Issues) != 0 {
 				return fmt.Errorf("ready candidates[%d] must not contain issues", index)
 			}
@@ -229,6 +288,32 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 			}
 		default:
 			return fmt.Errorf("candidates[%d].status is invalid", index)
+		}
+	}
+
+	expectedKinds := map[string][]string{
+		AgentCompilationModeDual: {
+			AgentCompilationCandidateStudy,
+			AgentCompilationCandidateEvidence,
+		},
+		AgentCompilationModeEvidence: {AgentCompilationCandidateEvidence},
+		AgentCompilationModeStudy:    {AgentCompilationCandidateStudy},
+	}[compilation.Mode]
+	if len(compilation.Candidates) != len(expectedKinds) {
+		return fmt.Errorf(
+			"mode %q requires %d candidates",
+			compilation.Mode,
+			len(expectedKinds),
+		)
+	}
+	for index, expectedKind := range expectedKinds {
+		if compilation.Candidates[index].Kind != expectedKind {
+			return fmt.Errorf(
+				"mode %q requires candidate %d to use kind %q",
+				compilation.Mode,
+				index,
+				expectedKind,
+			)
 		}
 	}
 
@@ -259,21 +344,56 @@ func CompileAgentPackages(
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
-	assembly, err := BuildKnowledgeReleaseAssembly(
-		store,
-		KnowledgeReleaseAssemblyQuery{Limit: knowledgeAssemblyMaxLimit},
-	)
+	manifest, err := store.loadKnowledgeReleaseManifest()
 	if err != nil {
-		return nil, fmt.Errorf("build release assembly: %w", err)
+		return nil, fmt.Errorf("load release manifest: %w", err)
+	}
+	latestRecords, err := latestKnowledgeAssemblyReleaseRecords(manifest.Releases)
+	if err != nil {
+		return nil, fmt.Errorf("resolve latest releases: %w", err)
 	}
 	normalizedRequest := request
 	normalizedRequest.SupportingReleaseIDs = sortedUniqueStrings(request.SupportingReleaseIDs)
+	if len(normalizedRequest.SupportingReleaseIDs) == 0 &&
+		(normalizedRequest.Mode == AgentCompilationModeDual ||
+			normalizedRequest.Mode == AgentCompilationModeEvidence) {
+		normalizedRequest.SupportingReleaseIDs = discoverAgentCompilationSupport(
+			store,
+			latestRecords,
+			normalizedRequest.PrimaryReleaseID,
+		)
+	}
 	selectedReleaseIDs := append(
 		[]string{normalizedRequest.PrimaryReleaseID},
 		normalizedRequest.SupportingReleaseIDs...,
 	)
 	selectedReleaseIDs = sortedUniqueStrings(selectedReleaseIDs)
 
+	latestReleaseIDs := make(map[string]struct{}, len(latestRecords))
+	for _, record := range latestRecords {
+		latestReleaseIDs[record.ReleaseID] = struct{}{}
+	}
+	scopedReleaseIDs := make([]string, 0, len(selectedReleaseIDs))
+	for _, releaseID := range selectedReleaseIDs {
+		if _, latest := latestReleaseIDs[releaseID]; latest {
+			scopedReleaseIDs = append(scopedReleaseIDs, releaseID)
+		}
+	}
+	var assembly *KnowledgeReleaseAssembly
+	if len(scopedReleaseIDs) == 0 {
+		assembly = agentCompilationEmptyAssembly()
+	} else {
+		assembly, err = BuildKnowledgeReleaseAssembly(
+			store,
+			KnowledgeReleaseAssemblyQuery{
+				Limit:      knowledgeAssemblyMaxLimit,
+				ReleaseIDs: scopedReleaseIDs,
+			},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("build scoped release assembly: %w", err)
+		}
+	}
 	assemblyReleaseIDs := stringSet(assembly.ReleaseIDs)
 	releases := make(map[string]*KnowledgeRelease, len(selectedReleaseIDs))
 	for _, releaseID := range selectedReleaseIDs {
@@ -415,7 +535,7 @@ func compileEvidenceAgentCandidate(
 	if issue != nil {
 		return blockedAgentCompilationCandidate(AgentCompilationCandidateEvidence, *issue)
 	}
-	publications := agentCompilationAssemblyPublications(assembly)
+	publications := agentCompilationReleasePublications(releases)
 	primaryPublication, ok := publications[primary.ReleaseID]
 	if !ok {
 		return blockedAgentCompilationCandidate(
@@ -427,13 +547,6 @@ func compileEvidenceAgentCandidate(
 		)
 	}
 	supportingReleaseIDs := append([]string(nil), request.SupportingReleaseIDs...)
-	if len(supportingReleaseIDs) == 0 {
-		supportingReleaseIDs = automaticallySelectAgentCompilationSupport(
-			assembly,
-			primary.ReleaseID,
-			primaryPublication,
-		)
-	}
 	if len(supportingReleaseIDs) == 0 {
 		return blockedAgentCompilationCandidate(
 			AgentCompilationCandidateEvidence,
@@ -485,6 +598,16 @@ func compileEvidenceAgentCandidate(
 		release, supportIssue := requireAgentCompilationRelease(releaseID, assembly, releases)
 		if supportIssue != nil {
 			return blockedAgentCompilationCandidate(AgentCompilationCandidateEvidence, *supportIssue)
+		}
+		if !agentCompilationReleasesRelated(*primary, *release) {
+			return blockedAgentCompilationCandidate(
+				AgentCompilationCandidateEvidence,
+				AgentCompilationIssue{
+					Code: AgentCompilationIssueReleaseNotRelated,
+					Message: "The supporting release has no shared assertion or " +
+						"explicit conflict with the primary release.",
+				},
+			)
 		}
 		selected = append(selected, release)
 	}
@@ -574,70 +697,105 @@ func compileEvidenceAgentCandidate(
 	return finalizeAgentCompilationCandidate(store, AgentCompilationCandidateEvidence, pkg)
 }
 
-func agentCompilationAssemblyPublications(
-	assembly *KnowledgeReleaseAssembly,
+func agentCompilationReleasePublications(
+	releases map[string]*KnowledgeRelease,
 ) map[string]KnowledgePublicationIdentity {
 	publications := make(map[string]KnowledgePublicationIdentity)
-	if assembly == nil {
-		return publications
-	}
-	for _, cluster := range assembly.Clusters {
-		for _, claim := range cluster.Claims {
-			if _, exists := publications[claim.ReleaseID]; exists {
-				continue
-			}
-			publications[claim.ReleaseID] = KnowledgePublicationIdentity{
-				Key:                       claim.PublicationIdentity,
-				Basis:                     claim.PublicationIdentityBasis,
-				IndependentSourceEligible: claim.IndependentPublicationEligible,
-			}
+	for releaseID, release := range releases {
+		if release != nil {
+			publications[releaseID] = canonicalKnowledgeAssemblyPublicationIdentity(release.Book)
 		}
 	}
 	return publications
 }
 
-func automaticallySelectAgentCompilationSupport(
-	assembly *KnowledgeReleaseAssembly,
+func discoverAgentCompilationSupport(
+	store *BookKnowledgeStore,
+	latestRecords []KnowledgeReleaseRecord,
 	primaryReleaseID string,
-	primaryPublication KnowledgePublicationIdentity,
 ) []string {
-	if assembly == nil {
+	if store == nil {
 		return nil
 	}
-	candidates := make(map[string]struct{})
-	for _, cluster := range assembly.Clusters {
-		if cluster.Status != KnowledgeAssemblyStatusCorroborated &&
-			cluster.Status != KnowledgeAssemblyStatusPotentialConflict {
+	var primary *KnowledgeRelease
+	for _, record := range latestRecords {
+		if record.ReleaseID != primaryReleaseID {
 			continue
 		}
-		hasPrimary := false
-		for _, claim := range cluster.Claims {
-			if claim.ReleaseID == primaryReleaseID {
-				hasPrimary = true
-				break
-			}
+		loaded, err := store.LoadKnowledgeRelease(record.ReleaseID)
+		if err == nil {
+			adaptKnowledgeAssemblyReleaseForRead(loaded)
+			primary = loaded
 		}
-		if !hasPrimary {
+		break
+	}
+	if primary == nil {
+		return nil
+	}
+	primaryPublication := canonicalKnowledgeAssemblyPublicationIdentity(primary.Book)
+	candidates := append([]KnowledgeReleaseRecord(nil), latestRecords...)
+	sortKnowledgeReleaseRecordsNewestFirst(candidates)
+	if len(candidates) > agentCompilationMaxDiscoveryReleases {
+		candidates = candidates[:agentCompilationMaxDiscoveryReleases]
+	}
+	for _, record := range candidates {
+		if record.ReleaseID == primaryReleaseID {
 			continue
 		}
-		for _, claim := range cluster.Claims {
-			if claim.ReleaseID == primaryReleaseID ||
-				!claim.IndependentPublicationEligible ||
-				claim.PublicationIdentity == primaryPublication.Key {
-				continue
-			}
-			candidates[claim.ReleaseID] = struct{}{}
+		candidate, err := store.LoadKnowledgeRelease(record.ReleaseID)
+		if err != nil {
+			continue
+		}
+		adaptKnowledgeAssemblyReleaseForRead(candidate)
+		publication := canonicalKnowledgeAssemblyPublicationIdentity(candidate.Book)
+		if !publication.IndependentSourceEligible ||
+			publication.Key == primaryPublication.Key ||
+			!agentCompilationReleasesRelated(*primary, *candidate) {
+			continue
+		}
+		if _, err := BuildKnowledgeReleaseAssembly(
+			store,
+			KnowledgeReleaseAssemblyQuery{
+				Limit:      knowledgeAssemblyMaxLimit,
+				ReleaseIDs: []string{primaryReleaseID, record.ReleaseID},
+			},
+		); err != nil {
+			continue
+		}
+		return []string{record.ReleaseID}
+	}
+	return nil
+}
+
+func agentCompilationReleasesRelated(primary, support KnowledgeRelease) bool {
+	if primary.Analysis == nil || support.Analysis == nil {
+		return false
+	}
+	assertions := make(map[string]struct{}, len(primary.Analysis.Claims))
+	for _, claim := range primary.Analysis.Claims {
+		base, _ := splitKnowledgeAssemblyClaimPolarity(
+			normalizeKnowledgeAssemblyClaim(claim.Statement),
+		)
+		if base != "" {
+			assertions[base] = struct{}{}
 		}
 	}
-	releaseIDs := make([]string, 0, len(candidates))
-	for releaseID := range candidates {
-		releaseIDs = append(releaseIDs, releaseID)
+	for _, claim := range support.Analysis.Claims {
+		base, _ := splitKnowledgeAssemblyClaimPolarity(
+			normalizeKnowledgeAssemblyClaim(claim.Statement),
+		)
+		if _, related := assertions[base]; related && base != "" {
+			return true
+		}
 	}
-	sort.Strings(releaseIDs)
-	if len(releaseIDs) > 1 {
-		releaseIDs = releaseIDs[:1]
+	return false
+}
+
+func agentCompilationEmptyAssembly() *KnowledgeReleaseAssembly {
+	return &KnowledgeReleaseAssembly{
+		AssemblyID: "assembly-empty",
+		ReleaseIDs: []string{},
 	}
-	return releaseIDs
 }
 
 func requireAgentCompilationRelease(
@@ -734,7 +892,7 @@ func finalizeAgentCompilationCandidate(
 	if err != nil {
 		return blockedAgentCompilationCandidate(kind, AgentCompilationIssue{
 			Code:    AgentCompilationIssueReleaseInvalid,
-			Message: boundedAgentCompilationIssueMessage(err.Error()),
+			Message: "The generated candidate failed package validation.",
 		})
 	}
 	return AgentCompilationCandidate{

@@ -79,10 +79,11 @@ model, tool, safety, or evaluation policy injection is not accepted.
 - existing evidence audit metrics and policy limits;
 - reader, search, grounded chat, and evidence UI capabilities.
 
-Explicit supporting Release IDs must belong to the same Assembly and pass
-independent-publication checks. Automatic selection additionally requires a
-cluster shared with the primary Release or a potential-conflict edge involving
-both Releases. It never infers semantic similarity.
+Every supporting Release must belong to the scoped Assembly, pass
+independent-publication checks, and share a normalized assertion or explicit
+polarity conflict with the primary Release. Automatic selection applies the
+same relationship rule while scanning at most 500 latest Release records. It
+uses newest-first ordering and never infers semantic similarity.
 
 ## Dual Semantics
 
@@ -93,20 +94,23 @@ goal without weakening the evidence contract.
 
 ## API And Authorization
 
-Add `POST /api/agent-packages/compile`. It uses the dedicated Agent publisher
-credential, a bounded body, strict unknown-field rejection, and generic
-internal errors. Invalid request structure returns `400`; a valid request that
-lacks support returns `200` with structured blocked candidates.
+Add `POST /api/agent-packages/compile`. It uses the normal authenticated API
+session, a bounded body, strict unknown-field rejection, and generic internal
+errors. The publisher credential is intentionally unavailable to the browser.
+Invalid request structure returns `400`; a valid request that lacks support
+returns `200` with structured blocked candidates.
 
 Compilation is read-only. Existing trusted-suite, evaluation, and publication
-routes remain the only path to a runnable persisted package.
+routes remain publisher-authenticated and are the only path to a runnable
+persisted package.
 
 ## Web Workspace
 
 The Book Agents workspace gains a compact compiler panel:
 
 - mode segmented control;
-- primary and supporting Release selectors;
+- primary and supporting Release selectors populated from the latest Release
+  per book, newest first;
 - package version;
 - compile command;
 - ready/blocked candidate summaries and next actions.
@@ -120,6 +124,13 @@ required before existing publication actions can succeed.
 - Empty claim citation allowlists block the affected candidate.
 - Duplicate selections and unsupported modes are rejected.
 - Candidate and issue counts, strings, and request body size are bounded.
+- Primary, supporting, and response Release IDs are bounded to 128 Unicode code
+  points. Runtime and JSON Schema both enforce mode/candidate and
+  status/candidate agreement.
+- Each compilation builds Assembly state only for the selected Releases.
+  Automatic support discovery is bounded to 500 latest Release records.
+- Compiler responses are sequence-scoped in the browser so a stale response
+  cannot overwrite a newer Release or profile selection.
 - No Release source body, raw source identity, prompt content, secret, or local
   path is returned.
 - Compilation never mutates Releases, Assembly, evaluations, or package stores.
@@ -128,6 +139,7 @@ required before existing publication actions can succeed.
 
 Use RED/GREEN tests for deterministic hashes, all modes, partial dual output,
 support selection, independent-source enforcement, package validation, input
-immutability, publisher authentication, body bounds, generic internal errors,
-privacy, and Web rendering. Run full Go, race, vet, module, frontend build,
-contract, consumer, system-map, privacy, and static UI gates before deployment.
+immutability, read-only API authentication, publisher isolation, body bounds,
+generic internal errors, privacy, and Web rendering. Run full Go, race, vet,
+module, frontend build, contract, consumer, system-map, privacy, and static UI
+gates before deployment.

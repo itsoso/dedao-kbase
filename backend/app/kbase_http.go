@@ -1226,7 +1226,21 @@ func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *htt
 		}
 		limit = parsed
 	}
-	releases, err := h.store.ListKnowledgeReleasesForBook(r.URL.Query().Get("after"), limit, r.URL.Query().Get("book_id"))
+	var releases []KnowledgeReleaseRecord
+	var err error
+	if r.URL.Query().Get("latest") == "true" {
+		releases, err = h.store.ListLatestKnowledgeReleasesForBook(
+			r.URL.Query().Get("after"),
+			limit,
+			r.URL.Query().Get("book_id"),
+		)
+	} else {
+		releases, err = h.store.ListKnowledgeReleasesForBook(
+			r.URL.Query().Get("after"),
+			limit,
+			r.URL.Query().Get("book_id"),
+		)
+	}
 	if err != nil {
 		writeHTTPError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -287,6 +287,7 @@ let evidenceAuditPollTimer = null;
 let evidenceAuditLoadSequence = 0;
 let evidenceAuditWorkspaceSequence = 0;
 let bookAgentLoadSequence = 0;
+let agentCompilerRequestSequence = 0;
 let proofroomOperationSequence = 0;
 let bookKnowledgeLoadSequence = 0;
 let bookKnowledgeDetailSequence = 0;
@@ -2390,7 +2391,7 @@ function renderAgentCompiler() {
         `}
         <footer>
           <span role="status">${escapeHTML(agentCompilerState.error || agentCompilerState.loading || `${releases.length} 个最新 Release 可用于编译`)}</span>
-          <button class="button button-primary" type="submit" ${agentCompilerState.loading || !releases.length ? "disabled" : ""}>编译候选包</button>
+          <button class="button button-primary" type="submit" ${!releases.length ? "disabled" : ""}>编译候选包</button>
         </footer>
       </form>
       ${result ? `
@@ -3150,8 +3151,7 @@ function bindAgentCompilerEvents(route) {
         return;
       }
       agentCompilerState.mode = mode;
-      agentCompilerState.result = null;
-      agentCompilerState.error = "";
+      resetAgentCompilerResult();
       if (mode === "study") {
         agentCompilerState.supportingReleaseIDs = [];
       }
@@ -3164,21 +3164,18 @@ function bindAgentCompilerEvents(route) {
     agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
       (releaseID) => releaseID !== agentCompilerState.primaryReleaseID,
     );
-    agentCompilerState.result = null;
-    agentCompilerState.error = "";
+    resetAgentCompilerResult();
     renderBookAgentPlatform(route);
   });
   form?.querySelector('[name="version"]')?.addEventListener("input", (event) => {
     agentCompilerState.version = String(event.currentTarget.value || "");
-    agentCompilerState.result = null;
-    agentCompilerState.error = "";
+    resetAgentCompilerResult();
   });
   form?.querySelectorAll('[name="supporting_release_ids"]').forEach((input) => {
     input.addEventListener("change", () => {
       const data = new FormData(form);
       agentCompilerState.supportingReleaseIDs = data.getAll("supporting_release_ids").map(String);
-      agentCompilerState.result = null;
-      agentCompilerState.error = "";
+      resetAgentCompilerResult();
     });
   });
   form?.addEventListener("submit", async (event) => {
@@ -3231,11 +3228,23 @@ function bindBookAgentPlatformEvents(route) {
   document.querySelector("[data-proofroom-deliver]")?.addEventListener("click", () => deliverEvidenceAuditToProofroom(route));
 }
 
+function resetAgentCompilerResult() {
+  agentCompilerRequestSequence += 1;
+  agentCompilerState.result = null;
+  agentCompilerState.loading = "";
+  agentCompilerState.error = "";
+  document.querySelector(".agent-compiler__result")?.remove();
+  const status = document.querySelector("#agent-compiler-form [role=status]");
+  if (status) {
+    status.textContent = `${agentCompilerState.releases.length} 个最新 Release 可用于编译`;
+  }
+}
+
 async function loadAgentCompilerReleases() {
   const releases = [];
   let after = "";
   while (releases.length < 500) {
-    const query = new URLSearchParams({ limit: "200" });
+    const query = new URLSearchParams({ latest: "true", limit: "200" });
     if (after) {
       query.set("after", after);
     }
@@ -3255,6 +3264,7 @@ async function compileAgentPackages(route) {
   if (!agentCompilerState.primaryReleaseID || !agentCompilerState.version) {
     return;
   }
+  const sequence = ++agentCompilerRequestSequence;
   agentCompilerState.loading = "正在构建 Release Assembly 与候选包";
   agentCompilerState.error = "";
   agentCompilerState.result = null;
@@ -3269,15 +3279,24 @@ async function compileAgentPackages(route) {
     if (agentCompilerState.mode !== "study" && agentCompilerState.supportingReleaseIDs.length) {
       payload.supporting_release_ids = [...agentCompilerState.supportingReleaseIDs].sort();
     }
-    agentCompilerState.result = await apiFetch("/api/agent-packages/compile", {
+    const result = await apiFetch("/api/agent-packages/compile", {
       method: "POST",
       body: JSON.stringify(payload),
     });
+    if (sequence !== agentCompilerRequestSequence) {
+      return;
+    }
+    agentCompilerState.result = result;
   } catch (error) {
+    if (sequence !== agentCompilerRequestSequence) {
+      return;
+    }
     agentCompilerState.error = error instanceof Error ? error.message : String(error);
   } finally {
-    agentCompilerState.loading = "";
-    renderBookAgentPlatform(route);
+    if (sequence === agentCompilerRequestSequence) {
+      agentCompilerState.loading = "";
+      renderBookAgentPlatform(route);
+    }
   }
 }
 
@@ -3610,23 +3629,45 @@ async function loadBookAgentPlatform(route) {
   renderBookAgentPlatform(route);
   try {
     if (!route.packageID) {
-      const [payload, releases] = await Promise.all([
+      resetAgentCompilerResult();
+      agentCompilerState.loading = "正在加载最新 Release";
+      renderBookAgentPlatform(route);
+      const [packagesResult, releasesResult] = await Promise.allSettled([
         apiFetch("/api/agent-packages?limit=100"),
         loadAgentCompilerReleases(),
       ]);
       if (sequence !== bookAgentLoadSequence) {
         return;
       }
-      bookAgentState.packages = Array.isArray(payload.packages) ? payload.packages : [];
-      agentCompilerState.releases = releases;
-      if (!releases.some((release) => release.release_id === agentCompilerState.primaryReleaseID)) {
-        agentCompilerState.primaryReleaseID = releases[0]?.release_id || "";
+      if (releasesResult.status === "fulfilled") {
+        const releases = releasesResult.value;
+        agentCompilerState.releases = releases;
+        agentCompilerState.loading = "";
+        agentCompilerState.error = "";
+        if (!releases.some((release) => release.release_id === agentCompilerState.primaryReleaseID)) {
+          agentCompilerState.primaryReleaseID = releases[0]?.release_id || "";
+        }
+        const availableReleaseIDs = new Set(releases.map((release) => release.release_id));
+        agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
+          (releaseID) => availableReleaseIDs.has(releaseID) &&
+            releaseID !== agentCompilerState.primaryReleaseID,
+        );
+      } else {
+        agentCompilerState.releases = [];
+        agentCompilerState.primaryReleaseID = "";
+        agentCompilerState.supportingReleaseIDs = [];
+        agentCompilerState.loading = "";
+        agentCompilerState.error = `Release 列表加载失败：${
+          releasesResult.reason instanceof Error
+            ? releasesResult.reason.message
+            : String(releasesResult.reason)
+        }`;
       }
-      const availableReleaseIDs = new Set(releases.map((release) => release.release_id));
-      agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
-        (releaseID) => availableReleaseIDs.has(releaseID) &&
-          releaseID !== agentCompilerState.primaryReleaseID,
-      );
+      if (packagesResult.status === "rejected") {
+        throw packagesResult.reason;
+      }
+      const payload = packagesResult.value;
+      bookAgentState.packages = Array.isArray(payload.packages) ? payload.packages : [];
       bookAgentState.message = `${bookAgentState.packages.length} published packages`;
       return;
     }

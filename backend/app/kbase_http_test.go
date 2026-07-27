@@ -1710,6 +1710,58 @@ func TestKBaseHTTPHandlerKnowledgeReleasesFiltersBookBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeReleasesListsLatestPerBookNewestFirst(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	for _, release := range []KnowledgeRelease{
+		{
+			Version:   knowledgeReleaseVersion,
+			ReleaseID: "release-book-a-old",
+			BookID:    "book-a",
+			CreatedAt: "2026-07-14T12:00:00Z",
+		},
+		{
+			Version:   knowledgeReleaseVersion,
+			ReleaseID: "release-book-a-new",
+			BookID:    "book-a",
+			CreatedAt: "2026-07-14T12:02:00Z",
+		},
+		{
+			Version:   knowledgeReleaseVersion,
+			ReleaseID: "release-book-b-newest",
+			BookID:    "book-b",
+			CreatedAt: "2026-07-14T12:03:00Z",
+		},
+	} {
+		if err := store.saveKnowledgeRelease(release); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	first := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/knowledge/releases?latest=true&limit=1",
+		"secret-token",
+	)
+	if first.Code != http.StatusOK ||
+		!strings.Contains(first.Body.String(), `"release_id":"release-book-b-newest"`) ||
+		strings.Contains(first.Body.String(), `"release-book-a-old"`) {
+		t.Fatalf("latest release first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	second := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/knowledge/releases?latest=true&limit=1&after=release-book-b-newest",
+		"secret-token",
+	)
+	if second.Code != http.StatusOK ||
+		!strings.Contains(second.Body.String(), `"release_id":"release-book-a-new"`) ||
+		strings.Contains(second.Body.String(), `"release-book-a-old"`) {
+		t.Fatalf("latest release second page status=%d body=%s", second.Code, second.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeReviewCockpit(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(root)
