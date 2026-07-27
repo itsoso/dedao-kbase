@@ -104,6 +104,7 @@ type kbaseHTTPHandler struct {
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
 const defaultEvidenceAuditMaxBodyBytes int64 = 64 << 10
+const defaultAgentCompilationMaxBodyBytes int64 = 64 << 10
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	store := cfg.Store
@@ -260,7 +261,9 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleSourceAgent(w, r)
 		return
 	}
-	if r.URL.Path == "/api/agent-packages/publish" || r.URL.Path == "/api/agent-packages/evaluate" {
+	if r.URL.Path == "/api/agent-packages/publish" ||
+		r.URL.Path == "/api/agent-packages/evaluate" ||
+		r.URL.Path == "/api/agent-packages/compile" {
 		if h.agentPublisherToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "agent package publisher API is not configured")
 			return
@@ -1920,11 +1923,49 @@ func sanitizeEvidenceAuditHTTPLogCause(value string) string {
 func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
 	const (
 		collectionPath = "/api/agent-packages"
+		compilePath    = "/api/agent-packages/compile"
 		evaluatePath   = "/api/agent-packages/evaluate"
 		publishPath    = "/api/agent-packages/publish"
 		trustSuitePath = "/api/agent-packages/evaluation-suites/trust"
 		detailPrefix   = "/api/agent-packages/"
 	)
+	if r.URL.Path == compilePath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input AgentCompilationRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(
+			w,
+			r.Body,
+			defaultAgentCompilationMaxBodyBytes,
+		))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := ValidateAgentCompilationRequest(input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		compilation, err := CompileAgentPackages(h.store, input)
+		if err != nil {
+			writeHTTPError(
+				w,
+				http.StatusInternalServerError,
+				"agent compilation unavailable",
+			)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, compilation)
+		return
+	}
 	if r.URL.Path == trustSuitePath {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")

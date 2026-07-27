@@ -283,6 +283,168 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
+func TestKBaseHTTPHandlerAgentCompilationRequiresPublisherAndReturnsCandidates(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-primary",
+		"book-primary",
+		"2026-07-26T10:00:00Z",
+		"单一来源结论",
+		"Publisher Primary",
+		"dedao_ebook",
+	)
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	payload, err := json.Marshal(AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeDual,
+		PrimaryReleaseID: primary.ReleaseID,
+		Version:          "1.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/agent-packages/compile"
+	for name, token := range map[string]string{
+		"missing":  "",
+		"consumer": "consumer-token",
+		"wrong":    "wrong-token",
+	} {
+		response := requestJSONKBase(handler, http.MethodPost, path, token, string(payload))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf(
+				"%s compilation status=%d body=%s",
+				name,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+	}
+	response := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		path,
+		"publisher-token",
+		string(payload),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("compilation status=%d body=%s", response.Code, response.Body.String())
+	}
+	var compilation AgentCompilation
+	if err := json.Unmarshal(response.Body.Bytes(), &compilation); err != nil {
+		t.Fatal(err)
+	}
+	if compilation.Status != AgentCompilationStatusPartial ||
+		len(compilation.Candidates) != 2 ||
+		compilation.Candidates[0].Status != AgentCompilationCandidateReady ||
+		compilation.Candidates[1].Status != AgentCompilationCandidateBlocked {
+		t.Fatalf("compilation response = %#v", compilation)
+	}
+
+	wrongMethod := requestKBase(handler, http.MethodGet, path, "publisher-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf(
+			"compilation wrong method status=%d body=%s",
+			wrongMethod.Code,
+			wrongMethod.Body.String(),
+		)
+	}
+}
+
+func TestKBaseHTTPHandlerAgentCompilationRejectsInvalidBodies(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	path := "/api/agent-packages/compile"
+	valid := `{
+		"schema_version":"agent-compilation-request.v1",
+		"mode":"study",
+		"primary_release_id":"release-primary",
+		"version":"1.0.0"
+	}`
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{name: "invalid JSON", body: `{`},
+		{
+			name: "unknown field",
+			body: `{
+				"schema_version":"agent-compilation-request.v1",
+				"mode":"study",
+				"primary_release_id":"release-primary",
+				"version":"1.0.0",
+				"model":"caller-controlled"
+			}`,
+		},
+		{name: "trailing JSON", body: valid + `{}`},
+		{
+			name: "body too large",
+			body: `{"schema_version":"agent-compilation-request.v1","mode":"study","primary_release_id":"` +
+				strings.Repeat("x", 70<<10) +
+				`","version":"1.0.0"}`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := requestJSONKBase(
+				handler,
+				http.MethodPost,
+				path,
+				"publisher-token",
+				testCase.body,
+			)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerAgentCompilationHidesStoreFailures(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(root, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               NewBookKnowledgeStore(root),
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	response := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/compile",
+		"publisher-token",
+		`{
+			"schema_version":"agent-compilation-request.v1",
+			"mode":"study",
+			"primary_release_id":"release-primary",
+			"version":"1.0.0"
+		}`,
+	)
+	if response.Code != http.StatusInternalServerError ||
+		!strings.Contains(response.Body.String(), "agent compilation unavailable") ||
+		strings.Contains(response.Body.String(), root) ||
+		strings.Contains(response.Body.String(), "not a directory") {
+		t.Fatalf(
+			"store failure status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+}
+
 func TestKBaseHTTPHandlerSeparatesTrustedGoldInstallationFromPublisherEvaluation(t *testing.T) {
 	store, pkg := evidenceAuditEvaluationStore(t)
 	supported := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "http-trusted-supported")
