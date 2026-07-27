@@ -9,6 +9,42 @@ const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 for (const marker of [
+  "agentCompilerState",
+  "renderAgentCompiler",
+  "compileAgentPackages",
+  "/api/agent-packages/compile",
+  'name="primary_release_id"',
+  'name="supporting_release_ids"',
+  'name="version"',
+  '["dual", "evidence", "study"]',
+  'data-agent-compiler-mode="${mode}"',
+  "run_trusted_evaluation",
+  "可信评测",
+]) {
+  assert.ok(js.includes(marker), `Agent Compiler workspace should include ${marker}`);
+}
+
+const compilerSource = js.match(/function renderAgentCompiler\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(compilerSource.includes("candidate.status"), "compiler should render candidate status");
+assert.ok(compilerSource.includes("candidate.issues"), "compiler should render bounded candidate issues");
+assert.ok(compilerSource.includes("candidate.next_actions"), "compiler should render candidate next actions");
+assert.ok(!compilerSource.includes("/publish"), "compiler preview must not add a direct publish shortcut");
+
+const compileSource = js.match(/async function compileAgentPackages\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(compileSource.includes("apiFetch"), "compiler should use the authenticated browser API session");
+assert.ok(!compileSource.includes("publisher"), "read-only compilation must not request publisher credentials");
+assert.ok(!compileSource.includes("localStorage"), "compiler must not persist additional credentials");
+
+for (const className of [
+  ".agent-compiler",
+  ".agent-compiler__controls",
+  ".agent-compiler__release-list",
+  ".agent-compiler__candidate",
+]) {
+  assert.ok(css.includes(className), `styles should include ${className}`);
+}
+
+for (const marker of [
   "evidenceAuditState",
   "getEvidenceAuditRoute",
   "buildEvidenceAuditURL",

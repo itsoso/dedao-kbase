@@ -211,6 +211,17 @@ const bookAgentState = {
   message: "",
 };
 
+const agentCompilerState = {
+  mode: "dual",
+  releases: [],
+  primaryReleaseID: "",
+  supportingReleaseIDs: [],
+  version: "1.0.0",
+  result: null,
+  loading: "",
+  error: "",
+};
+
 const evidenceAuditState = {
   audits: [],
   audit: null,
@@ -2279,10 +2290,113 @@ function renderBookAgentPackageIndex(route) {
         <p>一个版本化知识包，三条稳定路径。Package 展示契约，Agent 展示运行边界，Book App 只呈现清单声明的能力。</p>
       </header>
       ${bookAgentState.message ? `<p class="web-status">${escapeHTML(bookAgentState.message)}</p>` : ""}
+      ${renderAgentCompiler()}
       <section class="book-agent__package-grid" aria-label="Published Agent Packages">
         ${rows || `<div class="book-agent__empty"><strong>尚无已发布 Agent Package</strong><p>先完成知识发布与评测；这里不会用示例内容伪造可运行产品。</p></div>`}
       </section>
     </main>
+  `;
+}
+
+function renderAgentCompiler() {
+  const releases = Array.isArray(agentCompilerState.releases) ? agentCompilerState.releases : [];
+  const selectedSupport = new Set(agentCompilerState.supportingReleaseIDs);
+  const releaseLabel = (release) => (
+    `${release.book_id || "book"} · ${release.release_id || "release"}`
+  );
+  const result = agentCompilerState.result;
+  const candidateRows = (result?.candidates || []).map((candidate) => {
+    const issues = Array.isArray(candidate.issues) ? candidate.issues : [];
+    const nextActions = Array.isArray(candidate.next_actions) ? candidate.next_actions : [];
+    return `
+      <article class="agent-compiler__candidate is-${escapeAttribute(candidate.status || "blocked")}">
+        <header>
+          <span>${escapeHTML(candidate.kind || "candidate")}</span>
+          <strong>${candidate.status === "ready" ? "已生成" : "被阻断"}</strong>
+        </header>
+        ${candidate.package ? `
+          <dl>
+            <div><dt>Package</dt><dd>${escapeHTML(candidate.package.package_id || "—")}</dd></div>
+            <div><dt>Version</dt><dd>${escapeHTML(candidate.package.version || "—")}</dd></div>
+            <div><dt>Hash</dt><dd><code>${escapeHTML(candidate.package.content_hash || "—")}</code></dd></div>
+          </dl>
+        ` : ""}
+        ${issues.length ? `
+          <ul class="agent-compiler__issues">
+            ${issues.map((issue) => `<li><code>${escapeHTML(issue.code || "blocked")}</code><span>${escapeHTML(issue.message || "")}</span></li>`).join("")}
+          </ul>
+        ` : ""}
+        ${nextActions.length ? `<p>下一步：${nextActions.map((action) => escapeHTML(action)).join(" · ")}</p>` : ""}
+      </article>
+    `;
+  }).join("");
+  return `
+    <section class="agent-compiler" aria-labelledby="agent-compiler-title">
+      <header>
+        <div>
+          <p class="web-kicker">Agent Compiler</p>
+          <h2 id="agent-compiler-title">从 Release 生成候选包</h2>
+        </div>
+        <p>只读编译，不保存草稿。候选包必须经过可信评测，才能进入既有发布流程。</p>
+      </header>
+      <div class="agent-compiler__mode" role="group" aria-label="编译模式">
+        ${[
+          ["dual", "双模板"],
+          ["evidence", "证据"],
+          ["study", "学习"],
+        ].map(([mode, label]) => `
+          <button
+            type="button"
+            class="${agentCompilerState.mode === mode ? "is-active" : ""}"
+            data-agent-compiler-mode="${mode}"
+            aria-pressed="${agentCompilerState.mode === mode ? "true" : "false"}"
+          >${label}</button>
+        `).join("")}
+      </div>
+      <form id="agent-compiler-form" class="agent-compiler__controls">
+        <label>
+          <span>主 Release</span>
+          <select name="primary_release_id" required ${releases.length ? "" : "disabled"}>
+            ${releases.map((release) => `
+              <option value="${escapeAttribute(release.release_id)}" ${release.release_id === agentCompilerState.primaryReleaseID ? "selected" : ""}>
+                ${escapeHTML(releaseLabel(release))}
+              </option>
+            `).join("")}
+          </select>
+        </label>
+        <label>
+          <span>版本</span>
+          <input name="version" value="${escapeAttribute(agentCompilerState.version)}" inputmode="text" pattern="[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?" required>
+        </label>
+        <fieldset class="agent-compiler__release-list" ${agentCompilerState.mode === "study" ? "disabled" : ""}>
+          <legend>支持 Release <small>${agentCompilerState.mode === "study" ? "学习模式无需支持源" : "可留空，由 Assembly 自动选择相关独立来源"}</small></legend>
+          <div>
+            ${releases.filter((release) => release.release_id !== agentCompilerState.primaryReleaseID).map((release) => `
+              <label>
+                <input
+                  type="checkbox"
+                  name="supporting_release_ids"
+                  value="${escapeAttribute(release.release_id)}"
+                  ${selectedSupport.has(release.release_id) ? "checked" : ""}
+                >
+                <span>${escapeHTML(releaseLabel(release))}</span>
+              </label>
+            `).join("") || `<p>当前没有其他可选 Release。</p>`}
+          </div>
+        </fieldset>
+        <footer>
+          <span role="status">${escapeHTML(agentCompilerState.error || agentCompilerState.loading || `${releases.length} 个最新 Release 可用于编译`)}</span>
+          <button class="button button-primary" type="submit" ${agentCompilerState.loading || !releases.length ? "disabled" : ""}>编译候选包</button>
+        </footer>
+      </form>
+      ${result ? `
+        <section class="agent-compiler__result" aria-live="polite">
+          <header><span>Compilation</span><strong>${escapeHTML(result.status || "blocked")}</strong><code>${escapeHTML(result.compilation_id || "")}</code></header>
+          <div>${candidateRows}</div>
+          <p>候选内容未持久化。下一步使用 <code>run_trusted_evaluation</code> 完成可信评测，再由 publisher API 发布。</p>
+        </section>
+      ` : ""}
+    </section>
   `;
 }
 
@@ -2926,6 +3040,7 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
   deactivateProofroomModal();
   if (!route.packageID || !bookAgentState.package) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
+    bindAgentCompilerEvents(route);
     return;
   }
   const pkg = bookAgentState.package;
@@ -3023,6 +3138,57 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
   }
 }
 
+function bindAgentCompilerEvents(route) {
+  document.querySelectorAll("[data-agent-compiler-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const mode = String(button.dataset.agentCompilerMode || "");
+      if (!["dual", "evidence", "study"].includes(mode) || mode === agentCompilerState.mode) {
+        return;
+      }
+      agentCompilerState.mode = mode;
+      agentCompilerState.result = null;
+      agentCompilerState.error = "";
+      if (mode === "study") {
+        agentCompilerState.supportingReleaseIDs = [];
+      }
+      renderBookAgentPlatform(route);
+    });
+  });
+  const form = document.querySelector("#agent-compiler-form");
+  form?.querySelector('[name="primary_release_id"]')?.addEventListener("change", (event) => {
+    agentCompilerState.primaryReleaseID = String(event.currentTarget.value || "");
+    agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
+      (releaseID) => releaseID !== agentCompilerState.primaryReleaseID,
+    );
+    agentCompilerState.result = null;
+    agentCompilerState.error = "";
+    renderBookAgentPlatform(route);
+  });
+  form?.querySelector('[name="version"]')?.addEventListener("input", (event) => {
+    agentCompilerState.version = String(event.currentTarget.value || "");
+    agentCompilerState.result = null;
+    agentCompilerState.error = "";
+  });
+  form?.querySelectorAll('[name="supporting_release_ids"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      const data = new FormData(form);
+      agentCompilerState.supportingReleaseIDs = data.getAll("supporting_release_ids").map(String);
+      agentCompilerState.result = null;
+      agentCompilerState.error = "";
+    });
+  });
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    agentCompilerState.primaryReleaseID = String(data.get("primary_release_id") || "").trim();
+    agentCompilerState.version = String(data.get("version") || "").trim();
+    agentCompilerState.supportingReleaseIDs = agentCompilerState.mode === "study"
+      ? []
+      : data.getAll("supporting_release_ids").map((value) => String(value).trim()).filter(Boolean);
+    await compileAgentPackages(route);
+  });
+}
+
 function bindBookAgentPlatformEvents(route) {
   document.querySelector("#book-agent-search-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -3059,6 +3225,56 @@ function bindBookAgentPlatformEvents(route) {
   document.querySelector("[data-proofroom-preview]")?.addEventListener("click", () => loadProofroomPreview(route));
   document.querySelector("[data-proofroom-close]")?.addEventListener("click", () => closeProofroomPreview(route));
   document.querySelector("[data-proofroom-deliver]")?.addEventListener("click", () => deliverEvidenceAuditToProofroom(route));
+}
+
+async function loadAgentCompilerReleases() {
+  const releases = [];
+  let after = "";
+  while (releases.length < 500) {
+    const query = new URLSearchParams({ limit: "200" });
+    if (after) {
+      query.set("after", after);
+    }
+    const payload = await apiFetch(`/api/knowledge/releases?${query.toString()}`);
+    const page = Array.isArray(payload.releases) ? payload.releases : [];
+    releases.push(...page);
+    const next = String(payload.next_cursor || "");
+    if (!page.length || page.length < 200 || !next || next === after) {
+      break;
+    }
+    after = next;
+  }
+  return releases.slice(0, 500);
+}
+
+async function compileAgentPackages(route) {
+  if (!agentCompilerState.primaryReleaseID || !agentCompilerState.version) {
+    return;
+  }
+  agentCompilerState.loading = "正在构建 Release Assembly 与候选包";
+  agentCompilerState.error = "";
+  agentCompilerState.result = null;
+  renderBookAgentPlatform(route);
+  try {
+    const payload = {
+      schema_version: "agent-compilation-request.v1",
+      mode: agentCompilerState.mode,
+      primary_release_id: agentCompilerState.primaryReleaseID,
+      version: agentCompilerState.version,
+    };
+    if (agentCompilerState.mode !== "study" && agentCompilerState.supportingReleaseIDs.length) {
+      payload.supporting_release_ids = [...agentCompilerState.supportingReleaseIDs].sort();
+    }
+    agentCompilerState.result = await apiFetch("/api/agent-packages/compile", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    agentCompilerState.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    agentCompilerState.loading = "";
+    renderBookAgentPlatform(route);
+  }
 }
 
 function resetEvidenceAuditState(auditID = "") {
@@ -3390,11 +3606,23 @@ async function loadBookAgentPlatform(route) {
   renderBookAgentPlatform(route);
   try {
     if (!route.packageID) {
-      const payload = await apiFetch("/api/agent-packages?limit=100");
+      const [payload, releases] = await Promise.all([
+        apiFetch("/api/agent-packages?limit=100"),
+        loadAgentCompilerReleases(),
+      ]);
       if (sequence !== bookAgentLoadSequence) {
         return;
       }
       bookAgentState.packages = Array.isArray(payload.packages) ? payload.packages : [];
+      agentCompilerState.releases = releases;
+      if (!releases.some((release) => release.release_id === agentCompilerState.primaryReleaseID)) {
+        agentCompilerState.primaryReleaseID = releases[0]?.release_id || "";
+      }
+      const availableReleaseIDs = new Set(releases.map((release) => release.release_id));
+      agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
+        (releaseID) => availableReleaseIDs.has(releaseID) &&
+          releaseID !== agentCompilerState.primaryReleaseID,
+      );
       bookAgentState.message = `${bookAgentState.packages.length} published packages`;
       return;
     }
