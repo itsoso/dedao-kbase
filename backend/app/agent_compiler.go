@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode/utf8"
 )
@@ -304,6 +305,15 @@ func CompileAgentPackages(
 			compileStudyAgentCandidate(store, normalizedRequest, assembly, releases),
 		)
 	}
+	for _, candidate := range candidates {
+		if candidate.Package == nil {
+			continue
+		}
+		for _, ref := range candidate.Package.Releases {
+			selectedReleaseIDs = append(selectedReleaseIDs, ref.ReleaseID)
+		}
+	}
+	selectedReleaseIDs = sortedUniqueStrings(selectedReleaseIDs)
 
 	compilation := AgentCompilation{
 		SchemaVersion:   AgentCompilationSchemaVersion,
@@ -403,7 +413,26 @@ func compileEvidenceAgentCandidate(
 	if issue != nil {
 		return blockedAgentCompilationCandidate(AgentCompilationCandidateEvidence, *issue)
 	}
-	if len(request.SupportingReleaseIDs) == 0 {
+	publications := agentCompilationAssemblyPublications(assembly)
+	primaryPublication, ok := publications[primary.ReleaseID]
+	if !ok {
+		return blockedAgentCompilationCandidate(
+			AgentCompilationCandidateEvidence,
+			AgentCompilationIssue{
+				Code:    AgentCompilationIssueReleaseInvalid,
+				Message: "The primary release has no Assembly publication identity.",
+			},
+		)
+	}
+	supportingReleaseIDs := append([]string(nil), request.SupportingReleaseIDs...)
+	if len(supportingReleaseIDs) == 0 {
+		supportingReleaseIDs = automaticallySelectAgentCompilationSupport(
+			assembly,
+			primary.ReleaseID,
+			primaryPublication,
+		)
+	}
+	if len(supportingReleaseIDs) == 0 {
 		return blockedAgentCompilationCandidate(
 			AgentCompilationCandidateEvidence,
 			AgentCompilationIssue{
@@ -413,9 +442,44 @@ func compileEvidenceAgentCandidate(
 		)
 	}
 
-	selected := make([]*KnowledgeRelease, 0, len(request.SupportingReleaseIDs)+1)
+	selected := make([]*KnowledgeRelease, 0, len(supportingReleaseIDs)+1)
 	selected = append(selected, primary)
-	for _, releaseID := range request.SupportingReleaseIDs {
+	for _, releaseID := range sortedUniqueStrings(supportingReleaseIDs) {
+		if !stringSet(assembly.ReleaseIDs)[releaseID] {
+			return blockedAgentCompilationCandidate(
+				AgentCompilationCandidateEvidence,
+				AgentCompilationIssue{
+					Code:    AgentCompilationIssueReleaseNotInAssembly,
+					Message: "The selected supporting release is not part of the latest Release Assembly.",
+				},
+			)
+		}
+		publication, exists := publications[releaseID]
+		if !exists || !publication.IndependentSourceEligible ||
+			publication.Key == primaryPublication.Key {
+			return blockedAgentCompilationCandidate(
+				AgentCompilationCandidateEvidence,
+				AgentCompilationIssue{
+					Code: AgentCompilationIssueReleaseNotIndependent,
+					Message: "The supporting release requires a distinct, " +
+						"independently eligible Assembly publication identity.",
+				},
+			)
+		}
+		if releases[releaseID] == nil && stringSet(assembly.ReleaseIDs)[releaseID] {
+			release, loadErr := store.LoadKnowledgeRelease(releaseID)
+			if loadErr != nil {
+				return blockedAgentCompilationCandidate(
+					AgentCompilationCandidateEvidence,
+					AgentCompilationIssue{
+						Code:    AgentCompilationIssueReleaseInvalid,
+						Message: "The supporting release could not be loaded from the Assembly snapshot.",
+					},
+				)
+			}
+			adaptKnowledgeAssemblyReleaseForRead(release)
+			releases[releaseID] = release
+		}
 		release, supportIssue := requireAgentCompilationRelease(releaseID, assembly, releases)
 		if supportIssue != nil {
 			return blockedAgentCompilationCandidate(AgentCompilationCandidateEvidence, *supportIssue)
@@ -506,6 +570,72 @@ func compileEvidenceAgentCandidate(
 		},
 	}
 	return finalizeAgentCompilationCandidate(store, AgentCompilationCandidateEvidence, pkg)
+}
+
+func agentCompilationAssemblyPublications(
+	assembly *KnowledgeReleaseAssembly,
+) map[string]KnowledgePublicationIdentity {
+	publications := make(map[string]KnowledgePublicationIdentity)
+	if assembly == nil {
+		return publications
+	}
+	for _, cluster := range assembly.Clusters {
+		for _, claim := range cluster.Claims {
+			if _, exists := publications[claim.ReleaseID]; exists {
+				continue
+			}
+			publications[claim.ReleaseID] = KnowledgePublicationIdentity{
+				Key:                       claim.PublicationIdentity,
+				Basis:                     claim.PublicationIdentityBasis,
+				IndependentSourceEligible: claim.IndependentPublicationEligible,
+			}
+		}
+	}
+	return publications
+}
+
+func automaticallySelectAgentCompilationSupport(
+	assembly *KnowledgeReleaseAssembly,
+	primaryReleaseID string,
+	primaryPublication KnowledgePublicationIdentity,
+) []string {
+	if assembly == nil {
+		return nil
+	}
+	candidates := make(map[string]struct{})
+	for _, cluster := range assembly.Clusters {
+		if cluster.Status != KnowledgeAssemblyStatusCorroborated &&
+			cluster.Status != KnowledgeAssemblyStatusPotentialConflict {
+			continue
+		}
+		hasPrimary := false
+		for _, claim := range cluster.Claims {
+			if claim.ReleaseID == primaryReleaseID {
+				hasPrimary = true
+				break
+			}
+		}
+		if !hasPrimary {
+			continue
+		}
+		for _, claim := range cluster.Claims {
+			if claim.ReleaseID == primaryReleaseID ||
+				!claim.IndependentPublicationEligible ||
+				claim.PublicationIdentity == primaryPublication.Key {
+				continue
+			}
+			candidates[claim.ReleaseID] = struct{}{}
+		}
+	}
+	releaseIDs := make([]string, 0, len(candidates))
+	for releaseID := range candidates {
+		releaseIDs = append(releaseIDs, releaseID)
+	}
+	sort.Strings(releaseIDs)
+	if len(releaseIDs) > 1 {
+		releaseIDs = releaseIDs[:1]
+	}
+	return releaseIDs
 }
 
 func requireAgentCompilationRelease(

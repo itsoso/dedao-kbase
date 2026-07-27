@@ -355,3 +355,286 @@ func agentCompilerTestRelease(
 	release.Quality.UsagePolicy = BookUsageStandard
 	return release
 }
+
+func TestCompileAgentPackagesEvidenceAcceptsExplicitIndependentSupport(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-primary",
+		"book-primary",
+		"2026-07-26T10:00:00Z",
+		"主要结论",
+		"Publisher Primary",
+		"dedao_ebook",
+	)
+	primary.Analysis.Claims[0].CitationIDs = append(
+		primary.Analysis.Claims[0].CitationIDs,
+		primary.Analysis.Claims[0].CitationIDs[0],
+	)
+	support := agentCompilerTestRelease(
+		"release-support",
+		"book-support",
+		"2026-07-26T11:00:00Z",
+		"另一个明确结论",
+		"Publisher Support",
+		"wechat_mp_article",
+	)
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	saveKnowledgeAssemblyRelease(t, store, support)
+
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:        AgentCompilationRequestSchemaVersion,
+		Mode:                 AgentCompilationModeEvidence,
+		PrimaryReleaseID:     primary.ReleaseID,
+		SupportingReleaseIDs: []string{support.ReleaseID},
+		Version:              "2.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != AgentCompilationStatusReady || len(result.Candidates) != 1 {
+		t.Fatalf("evidence compilation = %#v", result)
+	}
+	pkg := result.Candidates[0].Package
+	if pkg == nil || pkg.SchemaVersion != AgentPackageSchemaVersionV2 ||
+		pkg.EvidencePolicy == nil {
+		t.Fatalf("evidence package = %#v", pkg)
+	}
+	if len(pkg.EvidencePolicy.ReleaseRoles) != 2 ||
+		pkg.EvidencePolicy.ReleaseRoles[0] != (AgentPackageEvidenceReleaseRole{
+			ReleaseID: primary.ReleaseID,
+			Role:      AgentEvidenceReleasePrimary,
+		}) ||
+		pkg.EvidencePolicy.ReleaseRoles[1] != (AgentPackageEvidenceReleaseRole{
+			ReleaseID: support.ReleaseID,
+			Role:      AgentEvidenceReleaseSupporting,
+		}) {
+		t.Fatalf("release roles = %#v", pkg.EvidencePolicy.ReleaseRoles)
+	}
+	for _, ref := range pkg.Releases {
+		if len(ref.CitationIDs) == 0 ||
+			!reflect.DeepEqual(ref.CitationIDs, sortedUniqueStrings(ref.CitationIDs)) {
+			t.Fatalf("release citation allowlist is not canonical: %#v", ref)
+		}
+		release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		available := stringSet(agentCompilationReleaseCitationIDs(*release))
+		for _, citationID := range ref.CitationIDs {
+			if !available[citationID] {
+				t.Fatalf("citation %q does not resolve to release %q", citationID, ref.ReleaseID)
+			}
+		}
+	}
+}
+
+func TestCompileAgentPackagesEvidenceRejectsInvalidExplicitSupport(t *testing.T) {
+	tests := []struct {
+		name          string
+		primarySource string
+		supportSource string
+		supporter     string
+		saveSupport   bool
+		wantCode      string
+	}{
+		{
+			name:          "outside assembly",
+			primarySource: "Publisher Primary",
+			supportSource: "Publisher Support",
+			supporter:     "release-missing",
+			saveSupport:   false,
+			wantCode:      AgentCompilationIssueReleaseNotInAssembly,
+		},
+		{
+			name:          "same publication",
+			primarySource: "Same Publisher",
+			supportSource: " same publisher ",
+			supporter:     "release-support",
+			saveSupport:   true,
+			wantCode:      AgentCompilationIssueReleaseNotIndependent,
+		},
+		{
+			name:          "ineligible publication",
+			primarySource: "Publisher Primary",
+			supportSource: "",
+			supporter:     "release-support",
+			saveSupport:   true,
+			wantCode:      AgentCompilationIssueReleaseNotIndependent,
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			primary := agentCompilerTestRelease(
+				"release-primary",
+				"book-primary",
+				"2026-07-26T10:00:00Z",
+				"主要结论",
+				testCase.primarySource,
+				"dedao_ebook",
+			)
+			saveKnowledgeAssemblyRelease(t, store, primary)
+			if testCase.saveSupport {
+				support := agentCompilerTestRelease(
+					"release-support",
+					"book-support",
+					"2026-07-26T11:00:00Z",
+					"支持结论",
+					testCase.supportSource,
+					"wechat_mp_article",
+				)
+				saveKnowledgeAssemblyRelease(t, store, support)
+			}
+			result, err := CompileAgentPackages(store, AgentCompilationRequest{
+				SchemaVersion:        AgentCompilationRequestSchemaVersion,
+				Mode:                 AgentCompilationModeEvidence,
+				PrimaryReleaseID:     primary.ReleaseID,
+				SupportingReleaseIDs: []string{testCase.supporter},
+				Version:              "2.0.0",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != AgentCompilationStatusBlocked ||
+				len(result.Candidates) != 1 ||
+				len(result.Candidates[0].Issues) != 1 ||
+				result.Candidates[0].Issues[0].Code != testCase.wantCode {
+				t.Fatalf("evidence compilation = %#v", result)
+			}
+		})
+	}
+
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-primary",
+		"book-primary",
+		"2026-07-26T10:00:00Z",
+		"主要结论",
+		"Publisher Primary",
+		"dedao_ebook",
+	)
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	if _, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:        AgentCompilationRequestSchemaVersion,
+		Mode:                 AgentCompilationModeEvidence,
+		PrimaryReleaseID:     primary.ReleaseID,
+		SupportingReleaseIDs: []string{primary.ReleaseID},
+		Version:              "2.0.0",
+	}); err == nil || !strings.Contains(err.Error(), "primary") {
+		t.Fatalf("primary repeated as support error = %v", err)
+	}
+}
+
+func TestCompileAgentPackagesEvidenceAutomaticallySelectsRelatedSupport(t *testing.T) {
+	for _, testCase := range []struct {
+		name             string
+		primaryStatement string
+		supportStatement string
+	}{
+		{
+			name:             "shared assertion",
+			primaryStatement: "治疗能降低风险",
+			supportStatement: "治疗能降低风险",
+		},
+		{
+			name:             "explicit conflict",
+			primaryStatement: "治疗能降低风险",
+			supportStatement: "治疗不能降低风险",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			primary := agentCompilerTestRelease(
+				"release-primary",
+				"book-primary",
+				"2026-07-26T10:00:00Z",
+				testCase.primaryStatement,
+				"Publisher Primary",
+				"dedao_ebook",
+			)
+			support := agentCompilerTestRelease(
+				"release-support",
+				"book-support",
+				"2026-07-26T11:00:00Z",
+				testCase.supportStatement,
+				"Publisher Support",
+				"wechat_mp_article",
+			)
+			unrelated := agentCompilerTestRelease(
+				"release-unrelated",
+				"book-unrelated",
+				"2026-07-26T12:00:00Z",
+				"完全无关的结论",
+				"Publisher Unrelated",
+				"dedao_course_article",
+			)
+			saveKnowledgeAssemblyRelease(t, store, primary)
+			saveKnowledgeAssemblyRelease(t, store, support)
+			saveKnowledgeAssemblyRelease(t, store, unrelated)
+
+			result, err := CompileAgentPackages(store, AgentCompilationRequest{
+				SchemaVersion:    AgentCompilationRequestSchemaVersion,
+				Mode:             AgentCompilationModeEvidence,
+				PrimaryReleaseID: primary.ReleaseID,
+				Version:          "2.0.0",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != AgentCompilationStatusReady ||
+				result.Candidates[0].Package == nil ||
+				len(result.Candidates[0].Package.Releases) != 2 {
+				t.Fatalf("automatic evidence compilation = %#v", result)
+			}
+			releaseIDs := []string{
+				result.Candidates[0].Package.Releases[0].ReleaseID,
+				result.Candidates[0].Package.Releases[1].ReleaseID,
+			}
+			if !reflect.DeepEqual(releaseIDs, []string{primary.ReleaseID, support.ReleaseID}) {
+				t.Fatalf("automatic release selection = %#v", releaseIDs)
+			}
+			if !reflect.DeepEqual(
+				result.ReleaseIDs,
+				[]string{primary.ReleaseID, support.ReleaseID},
+			) {
+				t.Fatalf("compilation release IDs = %#v", result.ReleaseIDs)
+			}
+		})
+	}
+}
+
+func TestCompileAgentPackagesEvidenceDoesNotAutomaticallySelectUnrelatedSupport(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-primary",
+		"book-primary",
+		"2026-07-26T10:00:00Z",
+		"主要结论",
+		"Publisher Primary",
+		"dedao_ebook",
+	)
+	unrelated := agentCompilerTestRelease(
+		"release-unrelated",
+		"book-unrelated",
+		"2026-07-26T11:00:00Z",
+		"完全无关的结论",
+		"Publisher Unrelated",
+		"wechat_mp_article",
+	)
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	saveKnowledgeAssemblyRelease(t, store, unrelated)
+
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeEvidence,
+		PrimaryReleaseID: primary.ReleaseID,
+		Version:          "2.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != AgentCompilationStatusBlocked ||
+		result.Candidates[0].Issues[0].Code != AgentCompilationIssueSupportingReleaseRequired {
+		t.Fatalf("unrelated evidence compilation = %#v", result)
+	}
+}
