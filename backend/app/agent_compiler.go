@@ -36,8 +36,10 @@ const (
 	AgentCompilationIssueReleaseNotIndependent     = "release_not_independent"
 	AgentCompilationIssueMissingCitations          = "missing_citations"
 
-	AgentCompilationNextActionEvaluate      = "run_trusted_evaluation"
-	AgentCompilationNextActionSelectSupport = "select_supporting_release"
+	AgentCompilationNextActionEvaluate            = "run_trusted_evaluation"
+	AgentCompilationNextActionSelectSupport       = "select_supporting_release"
+	AgentCompilationNextActionRepairEvidence      = "repair_release_evidence"
+	AgentCompilationNextActionSelectLatestRelease = "select_latest_release"
 
 	agentCompilationMaxSupportingReleases = 16
 	agentCompilationMaxCandidates         = 2
@@ -747,11 +749,20 @@ func blockedAgentCompilationCandidate(
 	kind string,
 	issues ...AgentCompilationIssue,
 ) AgentCompilationCandidate {
+	nextAction := AgentCompilationNextActionSelectSupport
+	if kind == AgentCompilationCandidateStudy && len(issues) > 0 {
+		switch issues[0].Code {
+		case AgentCompilationIssueReleaseNotInAssembly:
+			nextAction = AgentCompilationNextActionSelectLatestRelease
+		default:
+			nextAction = AgentCompilationNextActionRepairEvidence
+		}
+	}
 	return AgentCompilationCandidate{
 		Kind:        kind,
 		Status:      AgentCompilationCandidateBlocked,
 		Issues:      append([]AgentCompilationIssue(nil), issues...),
-		NextActions: []string{AgentCompilationNextActionSelectSupport},
+		NextActions: []string{nextAction},
 	}
 }
 

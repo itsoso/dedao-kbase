@@ -638,3 +638,156 @@ func TestCompileAgentPackagesEvidenceDoesNotAutomaticallySelectUnrelatedSupport(
 		t.Fatalf("unrelated evidence compilation = %#v", result)
 	}
 }
+
+func TestCompileAgentPackagesStudyBuildsSingleReleasePackage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentCompilerTestRelease(
+		"release-study",
+		"private-book-identity",
+		"2026-07-26T10:00:00Z",
+		"学习结论",
+		"Publisher Study",
+		"dedao_ebook",
+	)
+	release.Citations = append(release.Citations, BookKnowledgeCitation{
+		CitationID: "unused-citation",
+		BookID:     release.BookID,
+		ChapterID:  "unused-chapter",
+		ChunkID:    "unused-chunk",
+	})
+	saveKnowledgeAssemblyRelease(t, store, release)
+
+	first, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeStudy,
+		PrimaryReleaseID: release.ReleaseID,
+		Version:          "1.1.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeStudy,
+		PrimaryReleaseID: release.ReleaseID,
+		Version:          "1.1.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != AgentCompilationStatusReady ||
+		len(first.Candidates) != 1 ||
+		first.Candidates[0].Package == nil {
+		t.Fatalf("study compilation = %#v", first)
+	}
+	pkg := first.Candidates[0].Package
+	if pkg.SchemaVersion != AgentPackageSchemaVersionV1 ||
+		len(pkg.Releases) != 1 ||
+		pkg.Releases[0].ReleaseID != release.ReleaseID ||
+		!reflect.DeepEqual(
+			pkg.Releases[0].CitationIDs,
+			release.Analysis.Claims[0].CitationIDs,
+		) {
+		t.Fatalf("study release pin = %#v", pkg.Releases)
+	}
+	if strings.Contains(pkg.PackageID, release.BookID) ||
+		!strings.HasSuffix(pkg.PackageID, "-study") ||
+		pkg.PackageID != second.Candidates[0].Package.PackageID ||
+		pkg.ContentHash != second.Candidates[0].Package.ContentHash {
+		t.Fatalf("study package identity = %q hash=%q", pkg.PackageID, pkg.ContentHash)
+	}
+	if !reflect.DeepEqual(pkg.RetrievalPolicy.AllowedSourceTypes, []string{"dedao_ebook"}) ||
+		!reflect.DeepEqual(pkg.ModelPolicy.Fallbacks, []string{"qwen3.7-max"}) {
+		t.Fatalf(
+			"study retrieval/model policy = %#v %#v",
+			pkg.RetrievalPolicy,
+			pkg.ModelPolicy,
+		)
+	}
+	toolIDs := make([]string, 0, len(pkg.ToolPolicy.Tools))
+	for _, rule := range pkg.ToolPolicy.Tools {
+		if rule.Decision != AgentToolAllow {
+			t.Fatalf("study tool is not read-only allow: %#v", rule)
+		}
+		toolIDs = append(toolIDs, rule.MCPServer+"/"+rule.ToolName)
+	}
+	if !reflect.DeepEqual(toolIDs, AgentReadOnlyToolIDs()) {
+		t.Fatalf("study tool IDs = %#v", toolIDs)
+	}
+	if pkg.CreatedAt != "" || pkg.PublishedAt != "" {
+		t.Fatalf("study candidate contains operational timestamps: %#v", pkg)
+	}
+}
+
+func TestCompileAgentPackagesStudyBlocksMissingCitations(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentCompilerTestRelease(
+		"release-study",
+		"book-study",
+		"2026-07-26T10:00:00Z",
+		"没有引用的结论",
+		"Publisher Study",
+		"dedao_ebook",
+	)
+	release.Analysis.Claims = nil
+	saveKnowledgeAssemblyRelease(t, store, release)
+
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeStudy,
+		PrimaryReleaseID: release.ReleaseID,
+		Version:          "1.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != AgentCompilationStatusBlocked ||
+		result.Candidates[0].Issues[0].Code != AgentCompilationIssueMissingCitations ||
+		!reflect.DeepEqual(
+			result.Candidates[0].NextActions,
+			[]string{AgentCompilationNextActionRepairEvidence},
+		) {
+		t.Fatalf("missing citations compilation = %#v", result)
+	}
+}
+
+func TestCompileAgentPackagesStudyBlocksSupersededRelease(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldRelease := agentCompilerTestRelease(
+		"release-old",
+		"book-study",
+		"2026-07-25T10:00:00Z",
+		"旧结论",
+		"Publisher Study",
+		"dedao_ebook",
+	)
+	newRelease := agentCompilerTestRelease(
+		"release-new",
+		"book-study",
+		"2026-07-26T10:00:00Z",
+		"新结论",
+		"Publisher Study",
+		"dedao_ebook",
+	)
+	newRelease.Supersedes = oldRelease.ReleaseID
+	saveKnowledgeAssemblyRelease(t, store, oldRelease)
+	saveKnowledgeAssemblyRelease(t, store, newRelease)
+
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeStudy,
+		PrimaryReleaseID: oldRelease.ReleaseID,
+		Version:          "1.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != AgentCompilationStatusBlocked ||
+		result.Candidates[0].Issues[0].Code != AgentCompilationIssueReleaseNotInAssembly ||
+		!reflect.DeepEqual(
+			result.Candidates[0].NextActions,
+			[]string{AgentCompilationNextActionSelectLatestRelease},
+		) {
+		t.Fatalf("superseded study compilation = %#v", result)
+	}
+}
