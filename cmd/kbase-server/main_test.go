@@ -124,6 +124,48 @@ func TestValidateKBaseTokenSeparation(t *testing.T) {
 	}
 }
 
+func TestValidateBrowserSessionConfiguration(t *testing.T) {
+	browserProxyValue := strings.Repeat("browser-proxy-", 3)
+	for _, test := range []struct {
+		name      string
+		addr      string
+		secret    string
+		tokens    []string
+		wantError bool
+	}{
+		{name: "disabled", addr: "0.0.0.0:8719"},
+		{name: "IPv4 loopback", addr: "127.0.0.1:8719", secret: browserProxyValue},
+		{name: "IPv6 loopback", addr: "[::1]:8719", secret: browserProxyValue},
+		{name: "localhost", addr: "localhost:8719", secret: browserProxyValue},
+		{name: "zero port", addr: "127.0.0.1:0", secret: browserProxyValue, wantError: true},
+		{name: "port above range", addr: "127.0.0.1:65536", secret: browserProxyValue, wantError: true},
+		{name: "wildcard", addr: ":8719", secret: browserProxyValue, wantError: true},
+		{name: "IPv4 wildcard", addr: "0.0.0.0:8719", secret: browserProxyValue, wantError: true},
+		{name: "public address", addr: "192.0.2.10:8719", secret: browserProxyValue, wantError: true},
+		{name: "short secret", addr: "127.0.0.1:8719", secret: "short", wantError: true},
+		{name: "too long", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 129), wantError: true},
+		{name: "whitespace secret", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + " ", wantError: true},
+		{name: "dollar expansion", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + "$", wantError: true},
+		{name: "quoted syntax", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + `"`, wantError: true},
+		{name: "path separator", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + "/", wantError: true},
+		{name: "shared admin token", addr: "127.0.0.1:8719", secret: browserProxyValue, tokens: []string{browserProxyValue}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateBrowserSessionConfiguration(test.addr, test.secret, test.tokens...)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validateBrowserSessionConfiguration() error = %v, wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestDefaultBrowserSessionSecretUsesTrimmedEnvironment(t *testing.T) {
+	t.Setenv("KBASE_BROWSER_SESSION_SECRET", "  browser-proxy-secret-0123456789abcdef  ")
+	if got := defaultBrowserSessionSecret(); got != "browser-proxy-secret-0123456789abcdef" {
+		t.Fatalf("defaultBrowserSessionSecret() = %q", got)
+	}
+}
+
 func TestStartSourceSchedulerRequiresSourceAgentTokenAndStopsWithContext(t *testing.T) {
 	runnerStarted := make(chan struct{}, 1)
 	runner := sourceSchedulerRunFunc(func(ctx context.Context, interval time.Duration, onTick func(app.SourceSchedulerTickResult, error)) {

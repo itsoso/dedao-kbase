@@ -83,11 +83,12 @@ flowchart LR
 
 ### kbase HTTP 服务
 
-本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。浏览器页面由 Nginx Basic Auth 保护；登录后 Web UI 会通过 `/browser/session-token` 自动换取同源 Bearer token 并写入浏览器本地存储。自动化客户端仍应直接使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`。
+本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。浏览器静态壳不包含私有知识数据，可以直接加载；`/browser/session-token` 单独由 Nginx Basic Auth 保护。首次登录后 Web UI 会换取同源 Bearer token 并写入浏览器本地存储，后续重新打开页面会复用该 token，只有 token 缺失、失效或轮换时才重新登录。自动化客户端仍应直接使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`。生产 Nginx 配置模板见 `deploy/nginx/kbase.executor.life.conf`。
 
 ```bash
 cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
+KBASE_BROWSER_SESSION_SECRET="replace-with-separate-random-proxy-secret" \
 KBASE_AGENT_PUBLISHER_TOKEN="replace-with-separate-publisher-secret" \
 KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
 KBASE_EMBEDDING_BASE_URL="https://embedding-provider.example.invalid/v1" \
@@ -101,6 +102,29 @@ KBASE_REVERIFICATION_TICK_SECONDS="30" \
 KBASE_REVERIFICATION_COOLDOWN_SECONDS="300" \
 KBASE_REVERIFICATION_STALE_SECONDS="900" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
+```
+
+浏览器交换密钥必须与所有 API token 不同，使用 32-128 位
+`A-Za-z0-9_-` 字符，并且只在回环监听的后端与 Nginx 之间传递。部署时必须
+通过渲染器生成私有 location 配置，不要直接安装带占位符的模板：
+
+```bash
+sudo install -m 644 deploy/nginx/kbase.executor.life.conf \
+  /etc/nginx/conf.d/kbase.executor.life.conf
+sudo bash -c \
+  'set -a; . /etc/dedao-kbase/kbase.env; set +a; exec bash "$@"' \
+  bash deploy/nginx/render-kbase-config.sh \
+  deploy/nginx/kbase.locations.conf.template \
+  /etc/dedao-kbase/kbase.locations.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Linux 预发布环境可用真实 Nginx 和候选服务验证完整交换链：
+
+```bash
+KBASE_SERVER_BIN=/tmp/kbase-server \
+  bash deploy/nginx/browser-session-proxy-smoke.sh
 ```
 
 对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：

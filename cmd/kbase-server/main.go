@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,7 +29,17 @@ func main() {
 	agentPublisherToken := flag.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
 	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
 	flag.Parse()
+	browserSessionSecret := defaultBrowserSessionSecret()
 	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken, *agentPublisherToken); err != nil {
+		log.Fatal(err)
+	}
+	if err := validateBrowserSessionConfiguration(
+		*addr,
+		browserSessionSecret,
+		*authToken,
+		*sourceAgentToken,
+		*agentPublisherToken,
+	); err != nil {
 		log.Fatal(err)
 	}
 	sourceSync, err := app.NewSourceSyncStore(*root)
@@ -60,6 +71,7 @@ func main() {
 	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
 		Store:                  bookStore,
 		AuthToken:              *authToken,
+		BrowserSessionSecret:   browserSessionSecret,
 		AgentPublisherToken:    *agentPublisherToken,
 		SystemKBExportPath:     *exportPath,
 		StaticDir:              *webDir,
@@ -230,6 +242,60 @@ func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherTo
 
 func defaultAgentPublisherToken() string {
 	return strings.TrimSpace(os.Getenv("KBASE_AGENT_PUBLISHER_TOKEN"))
+}
+
+func defaultBrowserSessionSecret() string {
+	return strings.TrimSpace(os.Getenv("KBASE_BROWSER_SESSION_SECRET"))
+}
+
+func validateBrowserSessionConfiguration(
+	addr string,
+	browserSessionSecret string,
+	reservedTokens ...string,
+) error {
+	rawSecret := browserSessionSecret
+	browserSessionSecret = strings.TrimSpace(browserSessionSecret)
+	if browserSessionSecret == "" {
+		return nil
+	}
+	if rawSecret != browserSessionSecret ||
+		len(browserSessionSecret) < 32 ||
+		len(browserSessionSecret) > 128 {
+		return errors.New("KBASE_BROWSER_SESSION_SECRET must contain 32-128 URL-safe ASCII characters")
+	}
+	for _, char := range []byte(browserSessionSecret) {
+		isAlphaNumeric := char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9'
+		if !isAlphaNumeric && char != '_' && char != '-' {
+			return errors.New("KBASE_BROWSER_SESSION_SECRET must contain 32-128 URL-safe ASCII characters")
+		}
+	}
+	for _, token := range reservedTokens {
+		token = strings.TrimSpace(token)
+		if token != "" && subtle.ConstantTimeCompare(
+			[]byte(browserSessionSecret),
+			[]byte(token),
+		) == 1 {
+			return errors.New("KBASE_BROWSER_SESSION_SECRET must differ from every API token")
+		}
+	}
+	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return fmt.Errorf("KBASE_BROWSER_SESSION_SECRET requires a valid loopback listen address: %w", err)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return errors.New("KBASE_BROWSER_SESSION_SECRET requires a listen port between 1 and 65535")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("KBASE_BROWSER_SESSION_SECRET requires a loopback listen address")
+	}
+	return nil
 }
 
 type sourceSchedulerRunner interface {

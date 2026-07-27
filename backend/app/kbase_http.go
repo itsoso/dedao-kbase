@@ -26,6 +26,7 @@ import (
 type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
 	AuthToken               string
+	BrowserSessionSecret    string
 	AgentPublisherToken     string
 	SystemKBExportPath      string
 	StaticDir               string
@@ -76,6 +77,7 @@ type DedaoLibraryService interface {
 type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
 	authToken               string
+	browserSessionSecret    string
 	agentPublisherToken     string
 	systemKBExportPath      string
 	staticDir               string
@@ -120,8 +122,15 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceIngest = NewSourceIngestService(store, cfg.SourceSync)
 	}
 	authToken := strings.TrimSpace(cfg.AuthToken)
+	browserSessionSecret := strings.TrimSpace(cfg.BrowserSessionSecret)
 	agentPublisherToken := strings.TrimSpace(cfg.AgentPublisherToken)
 	sourceAgentToken := strings.TrimSpace(cfg.SourceAgentToken)
+	if browserSessionSecret != "" &&
+		(browserSessionSecret == authToken ||
+			browserSessionSecret == agentPublisherToken ||
+			browserSessionSecret == sourceAgentToken) {
+		browserSessionSecret = ""
+	}
 	if agentPublisherToken != "" && agentPublisherToken == authToken {
 		agentPublisherToken = ""
 	}
@@ -177,6 +186,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
+		browserSessionSecret:    browserSessionSecret,
 		agentPublisherToken:     agentPublisherToken,
 		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:               strings.TrimSpace(cfg.StaticDir),
@@ -2619,7 +2629,12 @@ func (h *kbaseHTTPHandler) handleBrowserSessionToken(w http.ResponseWriter, r *h
 		writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
 		return
 	}
-	if strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session")) != "1" {
+	proxySecret := strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session"))
+	if h.browserSessionSecret == "" ||
+		subtle.ConstantTimeCompare(
+			[]byte(proxySecret),
+			[]byte(h.browserSessionSecret),
+		) != 1 {
 		writeHTTPError(w, http.StatusUnauthorized, "browser session is not authorized")
 		return
 	}

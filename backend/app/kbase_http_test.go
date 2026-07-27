@@ -2161,8 +2161,9 @@ func TestKBaseHTTPHandlerSetsSubscriptionEnabledWithoutReplacingCursor(t *testin
 
 func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store:     NewBookKnowledgeStore(t.TempDir()),
-		AuthToken: "secret-token",
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            "secret-token",
+		BrowserSessionSecret: "browser-proxy-secret-0123456789abcdef",
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
@@ -2179,6 +2180,14 @@ func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) 
 	req.Header.Set("X-KBase-Browser-Session", "1")
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status with forgeable header = %d, want 401", resp.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
+	req.Header.Set("X-KBase-Browser-Session", "browser-proxy-secret-0123456789abcdef")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status with trusted header = %d, body=%s", resp.Code, resp.Body.String())
 	}
@@ -2187,6 +2196,15 @@ func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) 
 	}
 	if got := resp.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
+	req.Header.Set("Authorization", "Basic browser-credential")
+	req.Header.Set("X-KBase-Browser-Session", "browser-proxy-secret-0123456789abcdef")
+	resp = httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("status with forwarded basic auth = %d, want 401", resp.Code)
 	}
 }
 
