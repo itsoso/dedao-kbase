@@ -262,8 +262,7 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/api/agent-packages/publish" ||
-		r.URL.Path == "/api/agent-packages/evaluate" ||
-		r.URL.Path == "/api/agent-packages/compile" {
+		r.URL.Path == "/api/agent-packages/evaluate" {
 		if h.agentPublisherToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "agent package publisher API is not configured")
 			return

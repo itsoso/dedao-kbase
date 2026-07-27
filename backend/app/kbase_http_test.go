@@ -283,7 +283,7 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
-func TestKBaseHTTPHandlerAgentCompilationRequiresPublisherAndReturnsCandidates(t *testing.T) {
+func TestKBaseHTTPHandlerAgentCompilationUsesReadOnlyAPIAuthAndReturnsCandidates(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	primary := agentCompilerTestRelease(
 		"release-primary",
@@ -310,9 +310,9 @@ func TestKBaseHTTPHandlerAgentCompilationRequiresPublisherAndReturnsCandidates(t
 	}
 	path := "/api/agent-packages/compile"
 	for name, token := range map[string]string{
-		"missing":  "",
-		"consumer": "consumer-token",
-		"wrong":    "wrong-token",
+		"missing":   "",
+		"publisher": "publisher-token",
+		"wrong":     "wrong-token",
 	} {
 		response := requestJSONKBase(handler, http.MethodPost, path, token, string(payload))
 		if response.Code != http.StatusUnauthorized {
@@ -328,7 +328,7 @@ func TestKBaseHTTPHandlerAgentCompilationRequiresPublisherAndReturnsCandidates(t
 		handler,
 		http.MethodPost,
 		path,
-		"publisher-token",
+		"consumer-token",
 		string(payload),
 	)
 	if response.Code != http.StatusOK {
@@ -345,7 +345,7 @@ func TestKBaseHTTPHandlerAgentCompilationRequiresPublisherAndReturnsCandidates(t
 		t.Fatalf("compilation response = %#v", compilation)
 	}
 
-	wrongMethod := requestKBase(handler, http.MethodGet, path, "publisher-token")
+	wrongMethod := requestKBase(handler, http.MethodGet, path, "consumer-token")
 	if wrongMethod.Code != http.StatusMethodNotAllowed {
 		t.Fatalf(
 			"compilation wrong method status=%d body=%s",
@@ -397,7 +397,7 @@ func TestKBaseHTTPHandlerAgentCompilationRejectsInvalidBodies(t *testing.T) {
 				handler,
 				http.MethodPost,
 				path,
-				"publisher-token",
+				"consumer-token",
 				testCase.body,
 			)
 			if response.Code != http.StatusBadRequest {
@@ -425,7 +425,7 @@ func TestKBaseHTTPHandlerAgentCompilationHidesStoreFailures(t *testing.T) {
 		handler,
 		http.MethodPost,
 		"/api/agent-packages/compile",
-		"publisher-token",
+		"consumer-token",
 		`{
 			"schema_version":"agent-compilation-request.v1",
 			"mode":"study",
