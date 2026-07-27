@@ -2,8 +2,8 @@
 
 ## Status
 
-Implementation and repeated Gate 3 verification complete. Gate 4 passed after
-two review/remediation rounds and a focused final re-review.
+Released to production from runtime revision `0d21ffc` on 2026-07-27.
+G1-G6 are complete.
 
 ## Requirement
 
@@ -114,14 +114,65 @@ No P0-P2 findings remain.
 
 ### G5 - Deployment Health
 
-Pending.
+PASS.
+
+- Production `dedao-kbase/main` remained at the reviewed base `76b2648`, so it
+  fast-forwarded by 11 commits to exact runtime revision `0d21ffc`.
+- The exact source archive SHA-256 was
+  `42490ac0f58296b0ba593f6e1a93a06a60f879c7aee533581bb59edc438befd7`.
+- Linux preflight rebuilt the Vue frontend, passed every Web static smoke,
+  `go test ./...`, the race detector for `backend/app` and
+  `cmd/kbase-server`, `go vet`, module verification, knowledge contract and
+  evaluation checks, source-agent packaging, generated system-map drift,
+  privacy, and diff checks.
+- The first archived-tree preflight was blocked because `git archive` omits
+  `.git`, which the drift checks require. The retry created an isolated Git
+  baseline from the exact archive before running tests. A later command stopped
+  on an incorrect packaging-script filename, and the corrected Linux run
+  stopped when the macOS-only WC Plus packaging check correctly rejected
+  Linux. No production file had changed. The WC Plus and source-agent packaging
+  checks then passed on macOS, while all Linux-applicable checks and the final
+  CGO build passed on the server.
+- The installed binary SHA-256 is
+  `78036f11b9ad59ddca095b025d8c5fdc918bb6bb954662f7f07c58b39e8f5ce7`.
+- Only the service binary and static Web bundle changed. Knowledge data,
+  configuration, and secrets were preserved.
+- Rollback snapshot: `0d21ffc-20260727T063004Z`.
+- Post-deploy state was `active/running`, `ExecMainStatus=0`, `NRestarts=0`,
+  and the local health endpoint returned
+  `{"ok":true,"service":"dedao-kbase"}`.
 
 ### G6 - Online Verification
 
-Pending.
+PASS.
+
+- Public `https://kbase.executor.life/health` returned
+  `{"ok":true,"service":"dedao-kbase"}`.
+- The protected browser route and compiler API each returned `401` without
+  authentication.
+- The deployed static bundle contains the Agent Compiler endpoint and workspace
+  markers.
+- Authenticated latest-per-book Release listing returned the requested bounded
+  page with a continuation cursor.
+- Authenticated, read-only production requests exercised `study`, `evidence`,
+  and `dual` and returned `agent-compilation.v1` with the exact candidate kinds
+  and bounded status relationships required by the contract.
+- A production Release generated a ready `study` candidate containing
+  `agent-package.v1`. Compiling the same Release in `dual` mode returned
+  `partial`: the study candidate was ready and evidence failed closed.
+- No evidence-ready pair was found in the bounded sample of 20 newest Releases.
+  Those requests returned the expected `supporting_release_required` outcome;
+  this is an independent-support data gap, not a runtime failure.
+- An invalid historical Release returned the generic `release_invalid` code
+  without exposing a machine path.
+- The service remained `active` with `ExecMainStatus=0` and `NRestarts=0`.
+  Recent logs contained no panic, fatal error, failed request, or error-level
+  event.
 
 ## Rollback
 
-Remove the compiler route and Web panel, then restore the prior binary and
-static snapshot. No stored artifact rollback is required because compilation is
+Restore
+`/opt/dedao-kbase/bin/kbase-server.backup-0d21ffc-20260727T063004Z` and
+`/opt/dedao-kbase/frontend-web.backup-0d21ffc-20260727T063004Z`, then restart
+`dedao-kbase`. No stored artifact rollback is required because compilation is
 read-only.
