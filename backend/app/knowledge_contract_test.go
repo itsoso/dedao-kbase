@@ -217,6 +217,8 @@ func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 		"knowledge-release-assembly-v1.schema.json",
 		"delivery-receipt-v1.schema.json",
 		"health-evidence-v1.schema.json",
+		"agent-compilation-request-v1.schema.json",
+		"agent-compilation-v1.schema.json",
 	} {
 		raw, err := os.ReadFile(filepath.Join("..", "..", "contracts", name))
 		if err != nil {
@@ -230,6 +232,49 @@ func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 		if !ok || len(required) == 0 {
 			t.Fatalf("%s missing required fields", name)
 		}
+	}
+}
+
+func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
+	requestRaw, err := os.ReadFile(filepath.Join(
+		"..",
+		"..",
+		"contracts",
+		"agent-compilation-request-v1.schema.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestSchema map[string]any
+	if err := json.Unmarshal(requestRaw, &requestSchema); err != nil {
+		t.Fatal(err)
+	}
+	requestProperties := requestSchema["properties"].(map[string]any)
+	if got := requestProperties["supporting_release_ids"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxSupportingReleases) {
+		t.Fatalf("supporting_release_ids maxItems = %#v", got)
+	}
+
+	responseRaw, err := os.ReadFile(filepath.Join(
+		"..",
+		"..",
+		"contracts",
+		"agent-compilation-v1.schema.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var responseSchema map[string]any
+	if err := json.Unmarshal(responseRaw, &responseSchema); err != nil {
+		t.Fatal(err)
+	}
+	responseProperties := responseSchema["properties"].(map[string]any)
+	if got := responseProperties["candidates"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxCandidates) {
+		t.Fatalf("candidates maxItems = %#v", got)
+	}
+	defs := responseSchema["$defs"].(map[string]any)
+	issueProperties := defs["issue"].(map[string]any)["properties"].(map[string]any)
+	if got := issueProperties["message"].(map[string]any)["maxLength"]; got != float64(agentCompilationMaxIssueMessageRunes) {
+		t.Fatalf("issue message maxLength = %#v", got)
 	}
 }
 
