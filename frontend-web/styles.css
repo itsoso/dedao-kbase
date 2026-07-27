@@ -3995,7 +3995,7 @@ a.button {
 }
 
 .agent-compiler__controls select,
-.agent-compiler__controls input {
+.agent-compiler__controls input[name="version"] {
   width: 100%;
   min-height: 44px;
   border: 1px solid var(--agent-rule);
@@ -4003,6 +4003,13 @@ a.button {
   background: #fffdf8;
   color: var(--agent-ink);
   font: 500 14px/1.4 "PingFang SC", sans-serif;
+}
+
+.agent-compiler__study-note {
+  grid-column: 1 / -1;
+  margin: 2px 0 0;
+  color: #637069;
+  font: 500 12px/1.5 "PingFang SC", sans-serif;
 }
 
 .agent-compiler__release-list {
@@ -4042,6 +4049,14 @@ a.button {
   border-right: 1px solid var(--agent-rule);
   border-bottom: 1px solid var(--agent-rule);
   font: 500 12px/1.45 "PingFang SC", sans-serif;
+}
+
+.agent-compiler__release-list input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  min-height: 0;
+  flex: 0 0 16px;
+  accent-color: var(--agent-moss);
 }
 
 .agent-compiler__release-list > div > label span {
@@ -5834,6 +5849,7 @@ body.has-proofroom-modal {
   }
 
   .agent-compiler__release-list,
+  .agent-compiler__study-note,
   .agent-compiler__controls > footer {
     grid-column: 1;
   }

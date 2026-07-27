@@ -39,10 +39,28 @@ for (const className of [
   ".agent-compiler",
   ".agent-compiler__controls",
   ".agent-compiler__release-list",
+  ".agent-compiler__study-note",
   ".agent-compiler__candidate",
 ]) {
   assert.ok(css.includes(className), `styles should include ${className}`);
 }
+assert.ok(
+  css.includes('.agent-compiler__controls input[name="version"]'),
+  "Agent Compiler text input styles should not resize support checkboxes",
+);
+assert.ok(
+  css.includes('.agent-compiler__release-list input[type="checkbox"]'),
+  "Agent Compiler support checkboxes should have stable dimensions",
+);
+
+const versionPatternSource = js.match(/name="version"[\s\S]*?pattern="([^"]+)"/)?.[1] || "";
+const versionPattern = versionPatternSource.replaceAll("\\\\", "\\");
+assert.doesNotThrow(
+  () => new RegExp(`^(?:${versionPattern})$`, "v"),
+  "Agent Compiler version pattern should be valid under the HTML pattern Unicode Sets mode",
+);
+assert.match("1.0.0", new RegExp(`^(?:${versionPattern})$`, "v"));
+assert.match("1.0.0-rc.1", new RegExp(`^(?:${versionPattern})$`, "v"));
 
 for (const marker of [
   "evidenceAuditState",

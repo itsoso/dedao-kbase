@@ -2366,24 +2366,28 @@ function renderAgentCompiler() {
         </label>
         <label>
           <span>版本</span>
-          <input name="version" value="${escapeAttribute(agentCompilerState.version)}" inputmode="text" pattern="[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?" required>
+          <input name="version" value="${escapeAttribute(agentCompilerState.version)}" inputmode="text" pattern="[0-9]+\\.[0-9]+\\.[0-9]+(?:[+\\-][0-9A-Za-z.\\-]+)?" required>
         </label>
-        <fieldset class="agent-compiler__release-list" ${agentCompilerState.mode === "study" ? "disabled" : ""}>
-          <legend>支持 Release <small>${agentCompilerState.mode === "study" ? "学习模式无需支持源" : "可留空，由 Assembly 自动选择相关独立来源"}</small></legend>
-          <div>
-            ${releases.filter((release) => release.release_id !== agentCompilerState.primaryReleaseID).map((release) => `
-              <label>
-                <input
-                  type="checkbox"
-                  name="supporting_release_ids"
-                  value="${escapeAttribute(release.release_id)}"
-                  ${selectedSupport.has(release.release_id) ? "checked" : ""}
-                >
-                <span>${escapeHTML(releaseLabel(release))}</span>
-              </label>
-            `).join("") || `<p>当前没有其他可选 Release。</p>`}
-          </div>
-        </fieldset>
+        ${agentCompilerState.mode === "study" ? `
+          <p class="agent-compiler__study-note">学习模式只绑定主 Release，不选择支持源。</p>
+        ` : `
+          <fieldset class="agent-compiler__release-list">
+            <legend>支持 Release <small>可留空，由 Assembly 自动选择相关独立来源</small></legend>
+            <div>
+              ${releases.filter((release) => release.release_id !== agentCompilerState.primaryReleaseID).map((release) => `
+                <label>
+                  <input
+                    type="checkbox"
+                    name="supporting_release_ids"
+                    value="${escapeAttribute(release.release_id)}"
+                    ${selectedSupport.has(release.release_id) ? "checked" : ""}
+                  >
+                  <span>${escapeHTML(releaseLabel(release))}</span>
+                </label>
+              `).join("") || `<p>当前没有其他可选 Release。</p>`}
+            </div>
+          </fieldset>
+        `}
         <footer>
           <span role="status">${escapeHTML(agentCompilerState.error || agentCompilerState.loading || `${releases.length} 个最新 Release 可用于编译`)}</span>
           <button class="button button-primary" type="submit" ${agentCompilerState.loading || !releases.length ? "disabled" : ""}>编译候选包</button>
