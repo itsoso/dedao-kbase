@@ -2,7 +2,8 @@
 
 ## Status
 
-Implementation, Gate 3, and Gate 4 are complete. G5-G6 are pending.
+COMPLETE. Commit `b940c33` is on `dedao-kbase/main` and deployed to
+`kbase.executor.life`; G1-G6 passed.
 
 ## Requirement
 
@@ -110,14 +111,70 @@ covered operationally by generating the value without whitespace.
 
 ### G5 - Deployment Health
 
-Pending.
+PASS on 2026-07-27.
+
+- The user explicitly authorized pushing `b940c33` to
+  `github.com/itsoso/dedao-kbase`, fast-forwarding `main`, and deploying it to
+  `kbase.executor.life`.
+- Remote `main` remained at `22c8aae`; it was an ancestor of `b940c33`, so both
+  the feature branch and `main` advanced without a merge commit.
+- Fresh local verification passed the full Go suite, Vue type check and
+  production build, every frontend smoke, system-map drift check, privacy
+  check, and `git diff --check`. The sandboxed Go attempt was rejected by
+  local-port, DNS, and Keychain restrictions; the identical unrestricted
+  command passed and the sandbox failure was not counted.
+- The exact Git archive SHA-256 was
+  `baf01ec4ece2b1c64db2a0316fc1c793816a2afdefd577c3cc9cc9ff65f2c05b`.
+  Production preflight verified the archive, rebuilt the Vue assets, passed
+  every Web smoke and the full Linux Go suite, built the CGO server, and passed
+  the real isolated Nginx proxy-chain smoke.
+- The candidate and installed server binary SHA-256 is
+  `98a64d93c7dfec893fd797674d2147a0fc435d65ead3389cd0d426cab10e957b`.
+- Deployment generated a separate 64-character browser proxy secret without
+  printing it, preserved `/etc/dedao-kbase/kbase.env` as mode `0600`, rendered
+  the Nginx location file as mode `0600`, and changed no API token or knowledge
+  artifact.
+- Rollout `b940c33-20260727T135226Z` completed with the service active,
+  `ExecMainStatus=0`, `NRestarts=0`, and matching local and public health
+  responses. Nginx configuration validation passed; it reported only existing
+  duplicate-server-name warnings unrelated to this site.
 
 ### G6 - Online Verification
 
-Pending.
+PASS on 2026-07-27.
+
+- `/`, `/book-knowledge`, and `/app.js` returned `200` without a Basic Auth
+  challenge, allowing the browser to load and reuse its persisted token.
+- Anonymous and invalid-Basic requests to `/browser/session-token` returned
+  `401` with a Basic Auth challenge; anonymous `/api/books` returned `401`
+  without exposing private data.
+- A direct loopback exchange using the private proxy secret returned `200`, and
+  the returned token matched the configured browser API token without either
+  value being printed.
+- The production Nginx chain was exercised with the existing root-only browser
+  login file through a mode `0600` temporary curl configuration. Basic exchange
+  returned `200`; the returned Bearer token then accessed `/api/books` with
+  `200` and valid JSON. All temporary credential files were removed.
+- Two preceding verification-fixture attempts were rejected before a successful
+  assertion: the first intentionally refused punctuation in the stored password,
+  and the second used a `netrc` representation that did not authenticate. The
+  final curl-config representation exercised the same production route without
+  placing credentials in process arguments. Neither failed fixture caused a
+  production mutation or was counted as a pass.
+- The deployed binary hash remained exact, service restart counters remained
+  healthy, and the ten-minute service log contained no
+  `panic|fatal|error|failed` match.
 
 ## Rollback
 
-Restore the previous service binary, environment file, and Nginx site
-configuration, then restart the service and reload Nginx. No static asset,
-knowledge artifact, API token, or browser storage migration is required.
+Restore the following rollout snapshots, restart `dedao-kbase`, validate Nginx,
+and reload it:
+
+- `/opt/dedao-kbase/bin/kbase-server.backup-b940c33-20260727T135226Z`
+- `/opt/dedao-kbase/frontend-web.backup-b940c33-20260727T135226Z`
+- `/etc/dedao-kbase/kbase.env.backup-b940c33-20260727T135226Z`
+- `/etc/nginx/conf.d/kbase.executor.life.conf.backup-b940c33-20260727T135226Z`
+
+The location file did not exist before this rollout and should be removed on
+rollback. No knowledge artifact, API token, or browser storage migration is
+required.
