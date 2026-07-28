@@ -3690,7 +3690,12 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *h
 		writeBrowserSessionStoreError(w, err)
 		return
 	}
-	setBrowserSessionCookie(w, credentials.Token, credentials.Session.ExpiresAt)
+	setBrowserSessionCookie(
+		w,
+		credentials.Token,
+		credentials.Session.ExpiresAt,
+		h.browserSessions.TTL,
+	)
 	writeBrowserSessionMetadata(w, credentials.Session)
 }
 
@@ -3716,7 +3721,12 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 		auth, err := h.browserSessions.Store.AuthenticateAndRenew(sessionToken)
 		if err == nil {
 			if auth.SetCookie {
-				setBrowserSessionCookie(w, sessionToken, auth.CookieExpiresAt)
+				setBrowserSessionCookie(
+					w,
+					sessionToken,
+					auth.CookieExpiresAt,
+					h.browserSessions.TTL,
+				)
 			}
 			writeBrowserSessionMetadata(w, auth.Session)
 			return
@@ -3737,7 +3747,12 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 			writeBrowserSessionStoreError(w, err)
 			return
 		}
-		setBrowserSessionCookie(w, credentials.Token, credentials.Session.ExpiresAt)
+		setBrowserSessionCookie(
+			w,
+			credentials.Token,
+			credentials.Session.ExpiresAt,
+			h.browserSessions.TTL,
+		)
 		writeBrowserSessionMetadata(w, credentials.Session)
 		return
 	}
@@ -3748,13 +3763,18 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 	writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 }
 
-func setBrowserSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+func setBrowserSessionCookie(
+	w http.ResponseWriter,
+	token string,
+	expires time.Time,
+	ttl time.Duration,
+) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     browserSessionCookieName,
 		Value:    token,
 		Path:     "/",
 		Expires:  expires.UTC(),
-		MaxAge:   int(defaultBrowserSessionTTL / time.Second),
+		MaxAge:   int(ttl / time.Second),
 		Secure:   true,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
@@ -3774,11 +3794,7 @@ func clearBrowserSessionCookie(w http.ResponseWriter) {
 	})
 }
 
-func writeBrowserSessionStoreError(w http.ResponseWriter, err error) {
-	if errors.Is(err, ErrBrowserSessionConflict) {
-		writeHTTPError(w, http.StatusConflict, "session conflict")
-		return
-	}
+func writeBrowserSessionStoreError(w http.ResponseWriter, _ error) {
 	writeHTTPError(w, http.StatusServiceUnavailable, "service unavailable")
 }
 

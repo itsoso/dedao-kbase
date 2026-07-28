@@ -2283,6 +2283,83 @@ func TestKBaseHTTPHandlerBrowserSessionProxyConstantTimeBoundaryAndCookieContrac
 	assertKBaseBrowserSessionCount(t, sessionStore, 1)
 }
 
+func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
+	const configuredTTL = 2*time.Hour + 30*time.Second
+	newClock := func() *browserSessionTestClock {
+		return &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+	}
+
+	t.Run("login", func(t *testing.T) {
+		clock := newClock()
+		handler, _ := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+			t,
+			clock,
+			409,
+			configuredTTL,
+		)
+		request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+		request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("login status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(t, response, configuredTTL, clock.Now().Add(configuredTTL))
+	})
+
+	t.Run("bearer_migration", func(t *testing.T) {
+		clock := newClock()
+		handler, _ := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+			t,
+			clock,
+			410,
+			configuredTTL,
+		)
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("migration status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(t, response, configuredTTL, clock.Now().Add(configuredTTL))
+	})
+
+	t.Run("lifecycle_renewal", func(t *testing.T) {
+		clock := newClock()
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+			t,
+			clock,
+			411,
+			configuredTTL,
+		)
+		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Renewed Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Minute)
+
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.AddCookie(&http.Cookie{
+			Name:  "__Host-kbase_session",
+			Value: credentials.Token,
+		})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("renewal status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(t, response, configuredTTL, clock.Now().Add(configuredTTL))
+	})
+}
+
 func TestKBaseHTTPHandlerBrowserSessionUnavailableIsGeneric(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:                NewBookKnowledgeStore(t.TempDir()),
@@ -2303,6 +2380,87 @@ func TestKBaseHTTPHandlerBrowserSessionUnavailableIsGeneric(t *testing.T) {
 	}
 	assertKBaseBrowserSessionNoStore(t, response)
 	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionStoreConflictsAreGenericServiceUnavailable(t *testing.T) {
+	t.Run("create_credential_collision", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+		sessionDirectory := t.TempDir()
+		if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		credentialPair := deterministicBrowserSessionBytes(412, 1)
+		repeatedCredentials := append(append([]byte(nil), credentialPair...), credentialPair...)
+		sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+			Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+			Now:             clock.Now,
+			Random:          bytes.NewReader(repeatedCredentials),
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := sessionStore.Close(); err != nil {
+				t.Errorf("close browser session store: %v", err)
+			}
+		})
+		if _, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Existing Browser"}); err != nil {
+			t.Fatal(err)
+		}
+		handler := newKBaseBrowserSessionHTTPTestHandlerForStore(
+			t,
+			sessionStore,
+			testBrowserSessionCookieTTL,
+		)
+
+		request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+		request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionGenericServiceUnavailable(t, response)
+		assertKBaseBrowserSessionCount(t, sessionStore, 1)
+	})
+
+	t.Run("authenticate_renewal_collision", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 413)
+		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Renewal Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sessionStore.db.Exec(`
+			CREATE TRIGGER force_browser_session_renewal_conflict
+			BEFORE UPDATE OF last_active_at ON browser_sessions
+			BEGIN
+				SELECT RAISE(ABORT, 'forced renewal conflict');
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Minute)
+
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.AddCookie(&http.Cookie{
+			Name:  "__Host-kbase_session",
+			Value: credentials.Token,
+		})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionGenericServiceUnavailable(t, response)
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("conflicted renewal changed Cookie: %q", got)
+		}
+	})
 }
 
 func TestKBaseHTTPHandlerBrowserSessionDeviceLabelPrivacyAndBounds(t *testing.T) {
@@ -2660,6 +2818,21 @@ func newKBaseBrowserSessionHTTPTestHandler(
 	randomSeed int,
 ) (http.Handler, *BrowserSessionStore) {
 	t.Helper()
+	return newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+		t,
+		clock,
+		randomSeed,
+		testBrowserSessionCookieTTL,
+	)
+}
+
+func newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+	ttl time.Duration,
+) (http.Handler, *BrowserSessionStore) {
+	t.Helper()
 	sessionDirectory := t.TempDir()
 	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
 		t.Fatal(err)
@@ -2668,7 +2841,7 @@ func newKBaseBrowserSessionHTTPTestHandler(
 		Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
 		Now:             clock.Now,
 		Random:          bytes.NewReader(deterministicBrowserSessionBytes(randomSeed, 32)),
-		TTL:             testBrowserSessionCookieTTL,
+		TTL:             ttl,
 		RenewalInterval: 5 * time.Minute,
 		MaxActive:       10,
 	})
@@ -2680,19 +2853,27 @@ func newKBaseBrowserSessionHTTPTestHandler(
 			t.Errorf("close browser session store: %v", err)
 		}
 	})
-	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+	return newKBaseBrowserSessionHTTPTestHandlerForStore(t, sessionStore, ttl), sessionStore
+}
+
+func newKBaseBrowserSessionHTTPTestHandlerForStore(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+	ttl time.Duration,
+) http.Handler {
+	t.Helper()
+	return NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:                NewBookKnowledgeStore(t.TempDir()),
 		AuthToken:            testKBaseAuthToken,
 		BrowserSessionSecret: testBrowserSessionSecret,
 		BrowserSessions: BrowserSessionHTTPConfig{
 			Store:           sessionStore,
 			PublicOrigin:    testBrowserSessionOrigin,
-			TTL:             testBrowserSessionCookieTTL,
+			TTL:             ttl,
 			RenewalInterval: 5 * time.Minute,
 			MaxActive:       10,
 		},
 	})
-	return handler, sessionStore
 }
 
 func assertKBaseBrowserSessionNoStore(t *testing.T, response *httptest.ResponseRecorder) {
@@ -2700,6 +2881,38 @@ func assertKBaseBrowserSessionNoStore(t *testing.T, response *httptest.ResponseR
 	if got := response.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
+}
+
+func assertKBaseBrowserSessionCookieTTL(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantTTL time.Duration,
+	wantExpires time.Time,
+) {
+	t.Helper()
+	cookie := requireKBaseBrowserSessionCookie(t, response)
+	if cookie.MaxAge != int(wantTTL/time.Second) {
+		t.Fatalf("session Cookie MaxAge = %d, want %d", cookie.MaxAge, int(wantTTL/time.Second))
+	}
+	if !cookie.Expires.Equal(wantExpires) {
+		t.Fatalf("session Cookie Expires = %s, want %s", cookie.Expires, wantExpires)
+	}
+}
+
+func assertKBaseBrowserSessionGenericServiceUnavailable(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+		t.Fatalf("store conflict response = status %d body %q", response.Code, response.Body.String())
+	}
+	if strings.Contains(strings.ToLower(response.Body.String()), "conflict") {
+		t.Fatalf("store conflict response exposed internal state: %s", response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
 }
 
 func assertKBaseBrowserSessionPublicResponse(
