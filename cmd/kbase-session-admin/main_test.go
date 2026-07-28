@@ -320,6 +320,68 @@ func TestSessionAdminCLITokenSourcesRejectWhitespaceAndSymlinks(t *testing.T) {
 	}
 }
 
+func TestReadProtectedTokenFileRejectsPathReplacementAfterOpen(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "admin-token")
+	openedPath := filepath.Join(dir, "opened-token")
+	if err := os.WriteFile(tokenFile, []byte(testAdminToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	openAndReplace := func(path string) (*os.File, error) {
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Rename(path, openedPath); err != nil {
+			file.Close()
+			return nil, err
+		}
+		if err := os.WriteFile(path, []byte(strings.Repeat("x", 32)), 0o600); err != nil {
+			file.Close()
+			return nil, err
+		}
+		return file, nil
+	}
+
+	_, err := readProtectedTokenFileWithOps(tokenFile, openAndReplace, os.Lstat)
+	if err == nil {
+		t.Fatal("replaced token path was accepted")
+	}
+	if strings.Contains(err.Error(), testAdminToken) {
+		t.Fatal("token leaked in path replacement error")
+	}
+}
+
+func TestReadProtectedTokenFileRejectsPermissiveOpenedFile(t *testing.T) {
+	dir := t.TempDir()
+	tokenFile := filepath.Join(dir, "admin-token")
+	permissiveFile := filepath.Join(dir, "permissive-token")
+	if err := os.WriteFile(tokenFile, []byte(testAdminToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(permissiveFile, []byte(testAdminToken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(permissiveFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	openPermissive := func(string) (*os.File, error) {
+		return os.Open(permissiveFile)
+	}
+	lstatOpened := func(string) (os.FileInfo, error) {
+		return os.Lstat(permissiveFile)
+	}
+	_, err := readProtectedTokenFileWithOps(tokenFile, openPermissive, lstatOpened)
+	if err == nil {
+		t.Fatal("permissive opened token file was accepted")
+	}
+	if strings.Contains(err.Error(), testAdminToken) {
+		t.Fatal("token leaked in permissive file error")
+	}
+}
+
 func TestSessionAdminCLIBaseURLRejectsEmptyQueryMarker(t *testing.T) {
 	if _, err := validateBaseURL("https://example.com?"); err == nil {
 		t.Fatal("base URL with empty query marker was accepted")

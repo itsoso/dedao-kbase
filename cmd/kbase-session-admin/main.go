@@ -202,19 +202,37 @@ func loadAdminToken(getenv envLookup, optionFile string) (string, error) {
 }
 
 func readProtectedTokenFile(path string) (string, error) {
+	return readProtectedTokenFileWithOps(path, os.Open, os.Lstat)
+}
+
+func readProtectedTokenFileWithOps(
+	path string,
+	openFile func(string) (*os.File, error),
+	lstatFile func(string) (os.FileInfo, error),
+) (string, error) {
 	path = filepath.Clean(strings.TrimSpace(path))
-	info, err := os.Lstat(path)
-	if err != nil {
-		return "", errors.New("read admin token file")
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
-		return "", errors.New("admin token file must be a protected regular file")
-	}
-	file, err := os.Open(path)
+	file, err := openFile(path)
 	if err != nil {
 		return "", errors.New("read admin token file")
 	}
 	defer file.Close()
+
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return "", errors.New("read admin token file")
+	}
+	pathInfo, err := lstatFile(path)
+	if err != nil {
+		return "", errors.New("read admin token file")
+	}
+	if !openedInfo.Mode().IsRegular() ||
+		!pathInfo.Mode().IsRegular() ||
+		pathInfo.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(pathInfo, openedInfo) ||
+		openedInfo.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("admin token file must be a protected regular file")
+	}
+
 	body, err := io.ReadAll(io.LimitReader(file, maxAdminTokenBytes+2))
 	if err != nil || len(body) > maxAdminTokenBytes+1 {
 		return "", errors.New("read admin token file")
