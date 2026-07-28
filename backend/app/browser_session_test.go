@@ -53,7 +53,13 @@ func TestBrowserSessionStoreSchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rows.Close()
+	type columnInfo struct {
+		dataType     string
+		notNull      bool
+		defaultValue any
+	}
 	var columns []string
+	columnDetails := make(map[string]columnInfo)
 	for rows.Next() {
 		var cid, notNull, primaryKey int
 		var name, dataType string
@@ -62,6 +68,11 @@ func TestBrowserSessionStoreSchema(t *testing.T) {
 			t.Fatal(err)
 		}
 		columns = append(columns, name)
+		columnDetails[name] = columnInfo{
+			dataType:     dataType,
+			notNull:      notNull != 0,
+			defaultValue: defaultValue,
+		}
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
@@ -82,19 +93,57 @@ func TestBrowserSessionStoreSchema(t *testing.T) {
 	if !reflect.DeepEqual(columns, wantColumns) {
 		t.Fatalf("browser_sessions columns = %#v, want %#v", columns, wantColumns)
 	}
+	revokedAtColumn := columnDetails["revoked_at"]
+	if revokedAtColumn.dataType != "TEXT" ||
+		!revokedAtColumn.notNull ||
+		revokedAtColumn.defaultValue != "''" {
+		t.Fatalf("revoked_at schema = %#v, want TEXT NOT NULL DEFAULT ''", revokedAtColumn)
+	}
 
 	var indexSQL string
 	if err := db.QueryRow(`
 		SELECT sql
 		FROM sqlite_master
-		WHERE type = 'index' AND name = 'idx_browser_sessions_active_token'
+		WHERE type = 'index' AND name = 'idx_browser_sessions_active'
 	`).Scan(&indexSQL); err != nil {
 		t.Fatal(err)
 	}
 	normalizedIndex := strings.Join(strings.Fields(strings.ToLower(indexSQL)), " ")
-	if !strings.Contains(normalizedIndex, "on browser_sessions(token_hash)") ||
-		!strings.Contains(normalizedIndex, "where revoked_at is null") {
-		t.Fatalf("active token index does not constrain active sessions: %s", indexSQL)
+	const wantIndexSQL = "create index idx_browser_sessions_active on browser_sessions(revoked_at, expires_at, last_active_at)"
+	if normalizedIndex != wantIndexSQL {
+		t.Fatalf("active session index = %q, want %q", normalizedIndex, wantIndexSQL)
+	}
+	indexRows, err := db.Query(`PRAGMA index_info(idx_browser_sessions_active)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer indexRows.Close()
+	var indexColumns []string
+	for indexRows.Next() {
+		var sequence, cid int
+		var name string
+		if err := indexRows.Scan(&sequence, &cid, &name); err != nil {
+			t.Fatal(err)
+		}
+		indexColumns = append(indexColumns, name)
+	}
+	if err := indexRows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	wantIndexColumns := []string{"revoked_at", "expires_at", "last_active_at"}
+	if !reflect.DeepEqual(indexColumns, wantIndexColumns) {
+		t.Fatalf("active session index columns = %#v, want %#v", indexColumns, wantIndexColumns)
+	}
+	var legacyIndexCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_browser_sessions_active_token'
+	`).Scan(&legacyIndexCount); err != nil {
+		t.Fatal(err)
+	}
+	if legacyIndexCount != 0 {
+		t.Fatal("legacy active token partial index must not exist")
 	}
 }
 
@@ -119,11 +168,12 @@ func TestBrowserSessionStoreCreateHashesPrivateCredentials(t *testing.T) {
 	}
 
 	const (
-		deviceLabel = "Work Mac"
-		userAgent   = "KBaseBrowser/1.0 private-agent-value"
+		deviceLabelInput = " \tWork Mac  "
+		deviceLabel      = "Work Mac"
+		userAgent        = "KBaseBrowser/1.0 private-agent-value"
 	)
 	credentials, err := store.Create(BrowserSessionCreate{
-		DeviceLabel: deviceLabel,
+		DeviceLabel: deviceLabelInput,
 		UserAgent:   userAgent,
 	})
 	if err != nil {
@@ -162,13 +212,12 @@ func TestBrowserSessionStoreCreateHashesPrivateCredentials(t *testing.T) {
 
 	var (
 		tokenHash, csrfHash, userAgentHash []byte
-		csrfExpiresAt, createdAt           string
-		lastActiveAt, expiresAt            string
-		revokedAt                          sql.NullString
-		revokeReason                       string
+		csrfExpiresAt, storedDeviceLabel   string
+		createdAt, lastActiveAt, expiresAt string
+		revokedAt, revokeReason            string
 	)
 	err = store.db.QueryRow(`
-		SELECT token_hash, csrf_hash, csrf_expires_at, user_agent_hash,
+		SELECT token_hash, csrf_hash, csrf_expires_at, device_label, user_agent_hash,
 			created_at, last_active_at, expires_at, revoked_at, revoke_reason
 		FROM browser_sessions
 		WHERE id = ?
@@ -176,6 +225,7 @@ func TestBrowserSessionStoreCreateHashesPrivateCredentials(t *testing.T) {
 		&tokenHash,
 		&csrfHash,
 		&csrfExpiresAt,
+		&storedDeviceLabel,
 		&userAgentHash,
 		&createdAt,
 		&lastActiveAt,
@@ -198,11 +248,14 @@ func TestBrowserSessionStoreCreateHashesPrivateCredentials(t *testing.T) {
 	if !bytes.Equal(userAgentHash, wantUserAgentHash[:]) {
 		t.Fatalf("stored User-Agent hash = %x, want %x", userAgentHash, wantUserAgentHash)
 	}
+	if storedDeviceLabel != deviceLabel {
+		t.Fatalf("stored device label = %q, want normalized %q", storedDeviceLabel, deviceLabel)
+	}
 	if csrfExpiresAt == "" || createdAt == "" || lastActiveAt == "" || expiresAt == "" {
 		t.Fatal("session timestamps must be stored")
 	}
-	if revokedAt.Valid || revokeReason != "" {
-		t.Fatalf("new session is unexpectedly revoked: revoked_at=%q reason=%q", revokedAt.String, revokeReason)
+	if revokedAt != "" || revokeReason != "" {
+		t.Fatalf("new session is unexpectedly revoked: revoked_at=%q reason=%q", revokedAt, revokeReason)
 	}
 
 	if err := store.Close(); err != nil {

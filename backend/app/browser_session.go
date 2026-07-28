@@ -160,7 +160,7 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 			id, token_hash, csrf_hash, csrf_expires_at, device_label,
 			user_agent_hash, created_at, last_active_at, expires_at,
 			revoked_at, revoke_reason
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '')
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
 	`,
 		session.ID,
 		tokenHash[:],
@@ -205,12 +205,11 @@ func migrateBrowserSessionDB(db *sql.DB) error {
 			created_at TEXT NOT NULL,
 			last_active_at TEXT NOT NULL,
 			expires_at TEXT NOT NULL,
-			revoked_at TEXT,
+			revoked_at TEXT NOT NULL DEFAULT '',
 			revoke_reason TEXT NOT NULL DEFAULT ''
 		);
-		CREATE INDEX IF NOT EXISTS idx_browser_sessions_active_token
-			ON browser_sessions(token_hash)
-			WHERE revoked_at IS NULL;
+		CREATE INDEX IF NOT EXISTS idx_browser_sessions_active
+			ON browser_sessions(revoked_at, expires_at, last_active_at);
 	`)
 	return err
 }
