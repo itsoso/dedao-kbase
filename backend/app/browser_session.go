@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -257,6 +258,13 @@ func prepareBrowserSessionDirectory(directory string) error {
 }
 
 func validateBrowserSessionDirectoryMode(mode os.FileMode) error {
+	return validateBrowserSessionDirectoryModeForOS(runtime.GOOS, mode)
+}
+
+func validateBrowserSessionDirectoryModeForOS(goos string, mode os.FileMode) error {
+	if goos == "windows" {
+		return nil
+	}
 	const (
 		requiredOwnerPermissions = os.FileMode(0o700)
 		allowedPermissions       = os.FileMode(0o750)
@@ -320,6 +328,9 @@ func migrateBrowserSessionDB(db *sql.DB) error {
 	case browserSessionSchemaVersion:
 		if err := validateBrowserSessionSchemaV1(tx); err != nil {
 			return fmt.Errorf("validate browser session schema version 1: %w", err)
+		}
+		if err := normalizeBrowserSessionTimesV1(tx); err != nil {
+			return fmt.Errorf("normalize browser session schema version 1 times: %w", err)
 		}
 	default:
 		return fmt.Errorf("unsupported browser session database version %d", version)
@@ -417,28 +428,32 @@ func rebuildBrowserSessionTableV1(tx *sql.Tx) error {
 			); err != nil {
 				return nil, fmt.Errorf("scan legacy browser session: %w", err)
 			}
-			if csrfExpiresAt, err = canonicalizeLegacyBrowserSessionTime(
+			if csrfExpiresAt, err = canonicalizePersistedBrowserSessionTime(
+				"legacy",
 				"csrf_expires_at",
 				csrfExpiresAt,
 				false,
 			); err != nil {
 				return nil, err
 			}
-			if createdAt, err = canonicalizeLegacyBrowserSessionTime(
+			if createdAt, err = canonicalizePersistedBrowserSessionTime(
+				"legacy",
 				"created_at",
 				createdAt,
 				false,
 			); err != nil {
 				return nil, err
 			}
-			if lastActiveAt, err = canonicalizeLegacyBrowserSessionTime(
+			if lastActiveAt, err = canonicalizePersistedBrowserSessionTime(
+				"legacy",
 				"last_active_at",
 				lastActiveAt,
 				false,
 			); err != nil {
 				return nil, err
 			}
-			if expiresAt, err = canonicalizeLegacyBrowserSessionTime(
+			if expiresAt, err = canonicalizePersistedBrowserSessionTime(
+				"legacy",
 				"expires_at",
 				expiresAt,
 				false,
@@ -448,7 +463,8 @@ func rebuildBrowserSessionTableV1(tx *sql.Tx) error {
 			if revokedAt.Valid {
 				canonicalRevokedAt = revokedAt.String
 			}
-			if canonicalRevokedAt, err = canonicalizeLegacyBrowserSessionTime(
+			if canonicalRevokedAt, err = canonicalizePersistedBrowserSessionTime(
+				"legacy",
 				"revoked_at",
 				canonicalRevokedAt,
 				true,
@@ -511,13 +527,117 @@ func rebuildBrowserSessionTableV1(tx *sql.Tx) error {
 	return nil
 }
 
-func canonicalizeLegacyBrowserSessionTime(field, value string, allowEmpty bool) (string, error) {
+func normalizeBrowserSessionTimesV1(tx *sql.Tx) error {
+	readUpdates := func() ([][]any, error) {
+		rows, err := tx.Query(`
+			SELECT id, csrf_expires_at, created_at, last_active_at, expires_at, revoked_at
+			FROM browser_sessions
+		`)
+		if err != nil {
+			return nil, fmt.Errorf("read version 1 browser session times: %w", err)
+		}
+		defer rows.Close()
+
+		var updates [][]any
+		for rows.Next() {
+			var id, csrfExpiresAt, createdAt, lastActiveAt, expiresAt, revokedAt string
+			if err := rows.Scan(
+				&id,
+				&csrfExpiresAt,
+				&createdAt,
+				&lastActiveAt,
+				&expiresAt,
+				&revokedAt,
+			); err != nil {
+				return nil, fmt.Errorf("scan version 1 browser session times: %w", err)
+			}
+			original := []string{csrfExpiresAt, createdAt, lastActiveAt, expiresAt, revokedAt}
+			if csrfExpiresAt, err = canonicalizePersistedBrowserSessionTime(
+				"version 1",
+				"csrf_expires_at",
+				csrfExpiresAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if createdAt, err = canonicalizePersistedBrowserSessionTime(
+				"version 1",
+				"created_at",
+				createdAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if lastActiveAt, err = canonicalizePersistedBrowserSessionTime(
+				"version 1",
+				"last_active_at",
+				lastActiveAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if expiresAt, err = canonicalizePersistedBrowserSessionTime(
+				"version 1",
+				"expires_at",
+				expiresAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if revokedAt, err = canonicalizePersistedBrowserSessionTime(
+				"version 1",
+				"revoked_at",
+				revokedAt,
+				true,
+			); err != nil {
+				return nil, err
+			}
+			canonical := []string{csrfExpiresAt, createdAt, lastActiveAt, expiresAt, revokedAt}
+			if equalBrowserSessionStrings(original, canonical) {
+				continue
+			}
+			updates = append(updates, []any{
+				csrfExpiresAt,
+				createdAt,
+				lastActiveAt,
+				expiresAt,
+				revokedAt,
+				id,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate version 1 browser session times: %w", err)
+		}
+		return updates, nil
+	}
+
+	updates, err := readUpdates()
+	if err != nil {
+		return err
+	}
+	for _, update := range updates {
+		if _, err := tx.Exec(`
+			UPDATE browser_sessions
+			SET csrf_expires_at = ?,
+				created_at = ?,
+				last_active_at = ?,
+				expires_at = ?,
+				revoked_at = ?
+			WHERE id = ?
+		`, update...); err != nil {
+			return fmt.Errorf("update version 1 browser session %q times: %w", update[5], err)
+		}
+	}
+	return nil
+}
+
+func canonicalizePersistedBrowserSessionTime(scope, field, value string, allowEmpty bool) (string, error) {
 	if allowEmpty && value == "" {
 		return "", nil
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize legacy browser session %s: %w", field, err)
+		return "", fmt.Errorf("canonicalize %s browser session %s: %w", scope, field, err)
 	}
 	return formatBrowserSessionTime(parsed), nil
 }

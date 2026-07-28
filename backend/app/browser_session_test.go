@@ -550,6 +550,120 @@ func TestBrowserSessionStoreMigratesLegacyV0WithBothKnownIndexes(t *testing.T) {
 	assertMigratedBrowserSessionIndexes(t, store.db)
 }
 
+func TestBrowserSessionStoreNormalizesPersistedV1Times(t *testing.T) {
+	dbPath := newBrowserSessionTestDBPath(t)
+	tokenHash := sha256.Sum256([]byte("version-one-token"))
+	csrfHash := sha256.Sum256([]byte("version-one-csrf"))
+	userAgentHash := sha256.Sum256([]byte("version-one-agent"))
+	revokedAt := "2026-07-28T12:05:00.1Z"
+	seed := legacyBrowserSessionSeed{
+		id:            "session_version_one",
+		tokenHash:     tokenHash[:],
+		csrfHash:      csrfHash[:],
+		csrfExpiresAt: "2026-07-28T12:15:00Z",
+		deviceLabel:   "Persisted Browser",
+		userAgentHash: userAgentHash[:],
+		createdAt:     "2026-07-28T12:00:00.1Z",
+		lastActiveAt:  "2026-07-28T12:01:00.100000001Z",
+		expiresAt:     "2026-08-27T20:01:00+08:00",
+		revokedAt:     &revokedAt,
+		revokeReason:  "signed out",
+	}
+	seedV1BrowserSessionDB(t, dbPath, []legacyBrowserSessionSeed{seed})
+
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readLegacyBrowserSessionSeed(t, store.db, seed.id)
+	assertCanonicalMigratedTime(t, "csrf_expires_at", seed.csrfExpiresAt, got.csrfExpiresAt)
+	assertCanonicalMigratedTime(t, "created_at", seed.createdAt, got.createdAt)
+	assertCanonicalMigratedTime(t, "last_active_at", seed.lastActiveAt, got.lastActiveAt)
+	assertCanonicalMigratedTime(t, "expires_at", seed.expiresAt, got.expiresAt)
+	assertCanonicalMigratedTime(t, "revoked_at", *seed.revokedAt, got.revokedAt)
+	assertMigratedBrowserSessionIndexes(t, store.db)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	reopened := readLegacyBrowserSessionSeed(t, store.db, seed.id)
+	if !reflect.DeepEqual(reopened, got) {
+		t.Fatalf("second v1 normalization changed canonical row:\nfirst:  %#v\nsecond: %#v", got, reopened)
+	}
+}
+
+func TestBrowserSessionStorePersistedV1InvalidTimeRollsBack(t *testing.T) {
+	dbPath := newBrowserSessionTestDBPath(t)
+	firstTokenHash := sha256.Sum256([]byte("version-one-first-token"))
+	firstCSRFHash := sha256.Sum256([]byte("version-one-first-csrf"))
+	firstUserAgentHash := sha256.Sum256([]byte("version-one-first-agent"))
+	secondTokenHash := sha256.Sum256([]byte("version-one-invalid-token"))
+	secondCSRFHash := sha256.Sum256([]byte("version-one-invalid-csrf"))
+	secondUserAgentHash := sha256.Sum256([]byte("version-one-invalid-agent"))
+	seeds := []legacyBrowserSessionSeed{
+		{
+			id:            "session_version_one_valid",
+			tokenHash:     firstTokenHash[:],
+			csrfHash:      firstCSRFHash[:],
+			csrfExpiresAt: "2026-07-28T12:15:00Z",
+			deviceLabel:   "First Browser",
+			userAgentHash: firstUserAgentHash[:],
+			createdAt:     "2026-07-28T12:00:00.1Z",
+			lastActiveAt:  "2026-07-28T12:01:00.1Z",
+			expiresAt:     "2026-08-27T12:01:00Z",
+		},
+		{
+			id:            "session_version_one_invalid",
+			tokenHash:     secondTokenHash[:],
+			csrfHash:      secondCSRFHash[:],
+			csrfExpiresAt: "2026-07-28T12:15:00Z",
+			deviceLabel:   "Invalid Browser",
+			userAgentHash: secondUserAgentHash[:],
+			createdAt:     "2026-07-28T12:00:00Z",
+			lastActiveAt:  "not-a-time",
+			expiresAt:     "2026-08-27T12:01:00Z",
+		},
+	}
+	seedV1BrowserSessionDB(t, dbPath, seeds)
+
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+	if store != nil {
+		store.Close()
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), "normalize browser session schema version 1 times") ||
+		!strings.Contains(err.Error(), "canonicalize version 1 browser session last_active_at") {
+		t.Fatalf("persisted v1 invalid-time error = %v, want contextual normalization error", err)
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first := readLegacyBrowserSessionSeed(t, db, seeds[0].id)
+	second := readLegacyBrowserSessionSeed(t, db, seeds[1].id)
+	if first.createdAt != seeds[0].createdAt || second.lastActiveAt != seeds[1].lastActiveAt {
+		t.Fatalf(
+			"failed v1 normalization did not roll back: first created_at=%q second last_active_at=%q",
+			first.createdAt,
+			second.lastActiveAt,
+		)
+	}
+	var schemaVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if schemaVersion != 1 {
+		t.Fatalf("failed v1 normalization schema version = %d, want 1", schemaVersion)
+	}
+}
+
 func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 	t.Run("invalid version one schema", func(t *testing.T) {
 		dbPath := existingBrowserSessionTestDBPath(t)
@@ -695,6 +809,12 @@ func TestBrowserSessionStoreDirectoryPermissionCeiling(t *testing.T) {
 				t.Fatalf("rejected directory mode = %o, want unchanged %o", got, mode)
 			}
 		})
+	}
+}
+
+func TestBrowserSessionStoreWindowsSkipsPOSIXModeCeiling(t *testing.T) {
+	if err := validateBrowserSessionDirectoryModeForOS("windows", 0o777); err != nil {
+		t.Fatalf("Windows mode validation error = %v, want POSIX mode bits ignored", err)
 	}
 }
 
@@ -975,6 +1095,50 @@ func seedLegacyBrowserSessionDB(
 	}
 	for _, seed := range seeds {
 		var revokedAt any
+		if seed.revokedAt != nil {
+			revokedAt = *seed.revokedAt
+		}
+		if _, err := db.Exec(`
+			INSERT INTO browser_sessions (
+				id, token_hash, csrf_hash, csrf_expires_at, device_label,
+				user_agent_hash, created_at, last_active_at, expires_at,
+				revoked_at, revoke_reason
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			seed.id,
+			seed.tokenHash,
+			seed.csrfHash,
+			seed.csrfExpiresAt,
+			seed.deviceLabel,
+			seed.userAgentHash,
+			seed.createdAt,
+			seed.lastActiveAt,
+			seed.expiresAt,
+			revokedAt,
+			seed.revokeReason,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func seedV1BrowserSessionDB(t *testing.T, dbPath string, seeds []legacyBrowserSessionSeed) {
+	t.Helper()
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, seed := range seeds {
+		revokedAt := ""
 		if seed.revokedAt != nil {
 			revokedAt = *seed.revokedAt
 		}
