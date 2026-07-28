@@ -7,23 +7,35 @@ const tokenKeys = [
   "KBASE_AUTH_TOKEN",
 ];
 
+const browserClientIDKey = "kbase.browser-client-id";
+const browserClientIDHeader = "X-KBase-Browser-Client-ID";
+const browserEpochHeader = "X-KBase-Browser-Epoch";
+
 const browserSessionState = {
   ready: false,
   session: null,
   csrfToken: "",
   csrfExpiresAt: "",
+  clientID: "",
+  epoch: null,
   loginPromise: null,
   statusPromise: null,
+  familyPromise: null,
   recoveryPromise: null,
   migrationAttempted: false,
   generation: 0,
   invalidationGeneration: 0,
   invalidationReason: "",
   logoutGeneration: 0,
+  logoutPending: false,
+  operationControllers: new Set(),
 };
 
 const browserSessionSignalKey = "kbase.browser-session.signal";
 let browserSessionChannel = null;
+const browserSessionSeenSignalNonces = new Set();
+const browserSessionSeenSignalNonceLimit = 128;
+const guardedBrowserResponses = new WeakMap();
 
 const ROUTES = Object.freeze({
   dedaoHome: "/sources/dedao/home",
@@ -322,7 +334,18 @@ function isSafeBearerToken(token) {
 }
 
 function browserTokenStores() {
-  return [window.localStorage, window.sessionStorage].filter(Boolean);
+  const stores = [];
+  for (const property of ["localStorage", "sessionStorage"]) {
+    try {
+      const storage = window[property];
+      if (storage) {
+        stores.push(storage);
+      }
+    } catch {
+      // Storage property access itself may be blocked by browser privacy policy.
+    }
+  }
+  return stores;
 }
 
 function clearLegacyBrowserTokens() {
@@ -355,26 +378,152 @@ function findLegacyBrowserToken() {
   return legacyToken;
 }
 
-function resetBrowserSessionMemory(reason = "reset") {
+function isValidBrowserClientID(value) {
+  return (
+    typeof value === "string" &&
+    value.length >= 16 &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(value)
+  );
+}
+
+function generateBrowserClientID() {
+  if (!globalThis.crypto || typeof globalThis.crypto.getRandomValues !== "function") {
+    const error = new Error("secure browser identity is unavailable");
+    error.status = 503;
+    throw error;
+  }
+  const bytes = new Uint8Array(24);
+  globalThis.crypto.getRandomValues(bytes);
+  return `client_${Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function persistBrowserClientID(clientID) {
+  if (!isValidBrowserClientID(clientID)) {
+    const error = new Error("invalid browser client id");
+    error.status = 503;
+    throw error;
+  }
+  try {
+    window.localStorage?.setItem(browserClientIDKey, clientID);
+  } catch {
+    // The in-memory identity still works when persistent storage is unavailable.
+  }
+  browserSessionState.clientID = clientID;
+  return clientID;
+}
+
+function getBrowserClientID() {
+  if (isValidBrowserClientID(browserSessionState.clientID)) {
+    return browserSessionState.clientID;
+  }
+  let stored = "";
+  try {
+    stored = String(window.localStorage?.getItem(browserClientIDKey) || "");
+  } catch {
+    stored = "";
+  }
+  return persistBrowserClientID(
+    isValidBrowserClientID(stored) ? stored : generateBrowserClientID(),
+  );
+}
+
+function parseBrowserEpoch(value) {
+  const epoch = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(epoch) || epoch <= 0 || String(epoch) !== String(value)) {
+    const error = new Error("invalid browser session epoch");
+    error.status = 503;
+    throw error;
+  }
+  return epoch;
+}
+
+function calibrateBrowserClientMetadata(payload) {
+  const clientID = String(payload?.client_id || "");
+  if (!isValidBrowserClientID(clientID)) {
+    const error = new Error("invalid browser client metadata");
+    error.status = 503;
+    throw error;
+  }
+  const epoch = parseBrowserEpoch(payload?.epoch);
+  persistBrowserClientID(clientID);
+  browserSessionState.epoch = epoch;
+  return { clientID, epoch };
+}
+
+function abortBrowserSessionOperations() {
+  for (const controller of browserSessionState.operationControllers) {
+    try {
+      controller.abort();
+    } catch {
+      // Generation checks still fence runtimes without abortable fetch.
+    }
+  }
+  browserSessionState.operationControllers.clear();
+}
+
+function resetBrowserSessionMemory(reason = "reset", logoutPending = false) {
+  abortBrowserSessionOperations();
   browserSessionState.ready = false;
   browserSessionState.session = null;
   browserSessionState.csrfToken = "";
   browserSessionState.csrfExpiresAt = "";
+  browserSessionState.epoch = null;
+  browserSessionState.loginPromise = null;
+  browserSessionState.statusPromise = null;
+  browserSessionState.familyPromise = null;
+  browserSessionState.recoveryPromise = null;
   browserSessionState.generation += 1;
   browserSessionState.invalidationGeneration += 1;
   browserSessionState.invalidationReason = reason;
-  if (reason === "logout") {
+  browserSessionState.logoutPending = logoutPending;
+  if (reason === "logout-start" || reason === "logout") {
     browserSessionState.logoutGeneration = browserSessionState.invalidationGeneration;
   }
+}
+
+function browserSessionStaleError() {
+  const error = new Error("browser session state changed");
+  error.code = "browser_session_stale";
+  return error;
 }
 
 function assertBrowserSessionGeneration(expectedGeneration) {
   if (browserSessionState.generation === expectedGeneration) {
     return;
   }
-  const error = new Error("browser session state changed");
-  error.code = "browser_session_stale";
-  throw error;
+  throw browserSessionStaleError();
+}
+
+function browserSessionOperationController(externalSignal = null) {
+  if (typeof AbortController !== "function") {
+    return { signal: undefined, abort() {}, release() {} };
+  }
+  const controller = new AbortController();
+  let released = false;
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else {
+    externalSignal?.addEventListener?.("abort", abortFromExternal, { once: true });
+  }
+  const operation = {
+    signal: controller.signal,
+    abort() {
+      controller.abort();
+      operation.release();
+    },
+    release() {
+      if (released) {
+        return;
+      }
+      released = true;
+      externalSignal?.removeEventListener?.("abort", abortFromExternal);
+      browserSessionState.operationControllers.delete(operation);
+    },
+  };
+  browserSessionState.operationControllers.add(operation);
+  return operation;
 }
 
 function browserSessionSignal(type) {
@@ -397,10 +546,24 @@ function browserSessionSignal(type) {
 }
 
 function applyBrowserSessionSignal(message) {
-  if (!message || (message.type !== "login" && message.type !== "logout")) {
+  if (
+    !message ||
+    !["login", "logout-start", "logout"].includes(message.type)
+  ) {
     return;
   }
-  resetBrowserSessionMemory(message.type);
+  const nonce = typeof message.nonce === "string" ? message.nonce : "";
+  if (nonce && nonce.length <= 256) {
+    if (browserSessionSeenSignalNonces.has(nonce)) {
+      return;
+    }
+    browserSessionSeenSignalNonces.add(nonce);
+    if (browserSessionSeenSignalNonces.size > browserSessionSeenSignalNonceLimit) {
+      const oldestNonce = browserSessionSeenSignalNonces.values().next().value;
+      browserSessionSeenSignalNonces.delete(oldestNonce);
+    }
+  }
+  resetBrowserSessionMemory(message.type, message.type === "logout-start");
 }
 
 if (typeof window.BroadcastChannel === "function") {
@@ -446,7 +609,58 @@ function browserResponseError(response, result) {
   return error;
 }
 
-async function migrateLegacyBrowserSession() {
+function handleBrowserEpochConflict(response, result) {
+  const error = browserResponseError(response, result);
+  resetBrowserSessionMemory("logout", false);
+  browserSessionSignal("logout");
+  throw error;
+}
+
+async function loadBrowserClientEpoch(expectedGeneration) {
+  if (browserSessionState.familyPromise) {
+    return browserSessionState.familyPromise;
+  }
+  const clientID = getBrowserClientID();
+  const operation = browserSessionOperationController();
+  const familyPromise = (async () => {
+    try {
+      const headers = new Headers({ Accept: "application/json" });
+      headers.set(browserClientIDHeader, clientID);
+      const response = await fetch("/browser/session", {
+        method: "GET",
+        headers,
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: operation.signal,
+      });
+      const result = await readBrowserResponse(response);
+      assertBrowserSessionGeneration(expectedGeneration);
+      if (!response.ok) {
+        throw browserResponseError(response, result);
+      }
+      return calibrateBrowserClientMetadata(result.payload);
+    } finally {
+      operation.release();
+    }
+  })();
+  browserSessionState.familyPromise = familyPromise;
+  try {
+    return await familyPromise;
+  } finally {
+    if (browserSessionState.familyPromise === familyPromise) {
+      browserSessionState.familyPromise = null;
+    }
+  }
+}
+
+function browserClientRequestHeaders(snapshot) {
+  const headers = new Headers({ Accept: "application/json" });
+  headers.set(browserClientIDHeader, snapshot.clientID);
+  headers.set(browserEpochHeader, String(snapshot.epoch));
+  return headers;
+}
+
+async function migrateLegacyBrowserSession(snapshot, expectedGeneration) {
   if (browserSessionState.migrationAttempted) {
     return "absent";
   }
@@ -455,69 +669,93 @@ async function migrateLegacyBrowserSession() {
   if (!legacyToken) {
     return "absent";
   }
-  const headers = new Headers({ Accept: "application/json" });
+  const headers = browserClientRequestHeaders(snapshot);
   headers.set("Authorization", `Bearer ${legacyToken}`);
-  const response = await fetch("/browser/session/migrate", {
-    method: "POST",
-    headers,
-    credentials: "same-origin",
-    cache: "no-store",
-  });
-  const result = await readBrowserResponse(response);
-  if (response.ok) {
-    clearLegacyBrowserTokens();
-    return "migrated";
-  }
-  if (response.status === 401) {
-    clearLegacyBrowserTokens();
-    return "unauthorized";
-  }
-  throw browserResponseError(response, result);
-}
-
-async function requestBrowserSessionLogin() {
-  const response = await fetch("/browser/session", {
-    method: "POST",
-    headers: { Accept: "application/json" },
-    credentials: "same-origin",
-    cache: "no-store",
-  });
-  const result = await readBrowserResponse(response);
-  if (!response.ok) {
-    throw browserResponseError(response, result);
-  }
-  return result.payload;
-}
-
-async function loadBrowserSession() {
-  if (browserSessionState.statusPromise) {
-    return browserSessionState.statusPromise;
-  }
-  const requestGeneration = browserSessionState.generation;
-  const statusPromise = (async () => {
-    const response = await fetch("/api/browser/session", {
-      headers: { Accept: "application/json" },
+  const operation = browserSessionOperationController();
+  try {
+    const response = await fetch("/browser/session/migrate", {
+      method: "POST",
+      headers,
       credentials: "same-origin",
       cache: "no-store",
+      signal: operation.signal,
     });
     const result = await readBrowserResponse(response);
-    assertBrowserSessionGeneration(requestGeneration);
+    assertBrowserSessionGeneration(expectedGeneration);
+    if (response.ok) {
+      return "migrated";
+    }
+    if (response.status === 401) {
+      clearLegacyBrowserTokens();
+      return "unauthorized";
+    }
+    if (response.status === 409) {
+      handleBrowserEpochConflict(response, result);
+    }
+    throw browserResponseError(response, result);
+  } finally {
+    operation.release();
+  }
+}
+
+async function requestBrowserSessionLogin(snapshot, expectedGeneration) {
+  const operation = browserSessionOperationController();
+  try {
+    const response = await fetch("/browser/session", {
+      method: "POST",
+      headers: browserClientRequestHeaders(snapshot),
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: operation.signal,
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(expectedGeneration);
+    if (response.status === 409) {
+      handleBrowserEpochConflict(response, result);
+    }
     if (!response.ok) {
       throw browserResponseError(response, result);
     }
-    const session = result.payload?.session || null;
-    const csrfToken = String(result.payload?.csrf_token || "");
-    if (!session || !csrfToken) {
-      const error = new Error("invalid browser session response");
-      error.status = 503;
-      throw error;
+    return result.payload;
+  } finally {
+    operation.release();
+  }
+}
+
+async function loadBrowserSession(expectedGeneration = browserSessionState.generation) {
+  if (browserSessionState.statusPromise) {
+    return browserSessionState.statusPromise;
+  }
+  const operation = browserSessionOperationController();
+  const statusPromise = (async () => {
+    try {
+      const response = await fetch("/api/browser/session", {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: operation.signal,
+      });
+      const result = await readBrowserResponse(response);
+      assertBrowserSessionGeneration(expectedGeneration);
+      if (!response.ok) {
+        throw browserResponseError(response, result);
+      }
+      const session = result.payload?.session || null;
+      const csrfToken = String(result.payload?.csrf_token || "");
+      if (!session || !csrfToken) {
+        const error = new Error("invalid browser session response");
+        error.status = 503;
+        throw error;
+      }
+      calibrateBrowserClientMetadata(result.payload);
+      browserSessionState.ready = true;
+      browserSessionState.session = session;
+      browserSessionState.csrfToken = csrfToken;
+      browserSessionState.csrfExpiresAt = String(result.payload?.csrf_expires_at || "");
+      return session;
+    } finally {
+      operation.release();
     }
-    browserSessionState.ready = true;
-    browserSessionState.session = session;
-    browserSessionState.csrfToken = csrfToken;
-    browserSessionState.csrfExpiresAt = String(result.payload?.csrf_expires_at || "");
-    browserSessionState.generation += 1;
-    return session;
   })();
   browserSessionState.statusPromise = statusPromise;
   try {
@@ -529,43 +767,54 @@ async function loadBrowserSession() {
   }
 }
 
-async function ensureBrowserSession() {
-  if (browserSessionState.ready && browserSessionState.session && browserSessionState.csrfToken) {
-    return browserSessionState.session;
-  }
-  if (browserSessionState.loginPromise) {
-    return browserSessionState.loginPromise;
-  }
-  const requestGeneration = browserSessionState.generation;
-  const loginPromise = (async () => {
-    const migration = await migrateLegacyBrowserSession();
-    assertBrowserSessionGeneration(requestGeneration);
-    if (migration === "migrated") {
-      const session = await loadBrowserSession();
-      browserSessionSignal("login");
-      return session;
-    }
-    if (migration === "unauthorized") {
-      await requestBrowserSessionLogin();
-      assertBrowserSessionGeneration(requestGeneration);
-      const session = await loadBrowserSession();
-      browserSessionSignal("login");
-      return session;
-    }
+async function establishBrowserSession(expectedGeneration, skipStatus = false) {
+  if (!skipStatus) {
     try {
-      return await loadBrowserSession();
+      return await loadBrowserSession(expectedGeneration);
     } catch (error) {
       if (error?.status !== 401) {
         throw error;
       }
     }
-    assertBrowserSessionGeneration(requestGeneration);
-    await requestBrowserSessionLogin();
-    assertBrowserSessionGeneration(requestGeneration);
-    const session = await loadBrowserSession();
-    browserSessionSignal("login");
-    return session;
-  })();
+  }
+  assertBrowserSessionGeneration(expectedGeneration);
+  const snapshot = await loadBrowserClientEpoch(expectedGeneration);
+  assertBrowserSessionGeneration(expectedGeneration);
+  const migration = await migrateLegacyBrowserSession(snapshot, expectedGeneration);
+  assertBrowserSessionGeneration(expectedGeneration);
+  if (migration !== "migrated") {
+    await requestBrowserSessionLogin(snapshot, expectedGeneration);
+    assertBrowserSessionGeneration(expectedGeneration);
+  }
+  const session = await loadBrowserSession(expectedGeneration);
+  if (
+    migration === "migrated" &&
+    browserSessionState.clientID === snapshot.clientID &&
+    browserSessionState.epoch === snapshot.epoch
+  ) {
+    clearLegacyBrowserTokens();
+  }
+  browserSessionSignal("login");
+  return session;
+}
+
+async function ensureBrowserSession() {
+  if (browserSessionState.logoutPending) {
+    const error = new Error("browser logout is in progress");
+    error.code = "browser_session_logout_pending";
+    throw error;
+  }
+  if (browserSessionState.ready && browserSessionState.session && browserSessionState.csrfToken) {
+    return browserSessionState.session;
+  }
+  if (browserSessionState.recoveryPromise) {
+    return browserSessionState.recoveryPromise;
+  }
+  if (browserSessionState.loginPromise) {
+    return browserSessionState.loginPromise;
+  }
+  const requestGeneration = browserSessionState.generation;
+  const loginPromise = establishBrowserSession(requestGeneration, false);
   browserSessionState.loginPromise = loginPromise;
   try {
     return await loginPromise;
@@ -580,15 +829,9 @@ async function recoverBrowserSession() {
   if (browserSessionState.recoveryPromise) {
     return browserSessionState.recoveryPromise;
   }
-  const recoveryPromise = (async () => {
-    resetBrowserSessionMemory("recovery");
-    const recoveryGeneration = browserSessionState.generation;
-    await requestBrowserSessionLogin();
-    assertBrowserSessionGeneration(recoveryGeneration);
-    const session = await loadBrowserSession();
-    browserSessionSignal("login");
-    return session;
-  })();
+  resetBrowserSessionMemory("recovery", false);
+  const recoveryGeneration = browserSessionState.generation;
+  const recoveryPromise = establishBrowserSession(recoveryGeneration, true);
   browserSessionState.recoveryPromise = recoveryPromise;
   try {
     return await recoveryPromise;
@@ -612,9 +855,18 @@ function browserSessionCSRFNeedsRefresh() {
 }
 
 function requireSameOriginBrowserRequest(path) {
+  if (
+    typeof path !== "string" ||
+    !path ||
+    path.startsWith("//")
+  ) {
+    const error = new Error("cross-origin browser request rejected");
+    error.code = "cross_origin_request";
+    throw error;
+  }
   let requestURL = null;
   try {
-    requestURL = new URL(String(path || ""), window.location.origin);
+    requestURL = new URL(path, window.location.origin);
   } catch {
     requestURL = null;
   }
@@ -628,10 +880,98 @@ function requireSameOriginBrowserRequest(path) {
     error.code = "cross_origin_request";
     throw error;
   }
+  return requestURL.href;
 }
 
-async function browserSessionFetch(path, options = {}, didRecover = false) {
-  requireSameOriginBrowserRequest(path);
+function isBrowserResponseLifecycleCurrent(expectedGeneration, expectedLogoutGeneration) {
+  return (
+    browserSessionState.generation === expectedGeneration &&
+    browserSessionState.logoutGeneration === expectedLogoutGeneration &&
+    !browserSessionState.logoutPending
+  );
+}
+
+function assertBrowserResponseLifecycle(expectedGeneration, expectedLogoutGeneration) {
+  if (isBrowserResponseLifecycleCurrent(expectedGeneration, expectedLogoutGeneration)) {
+    return;
+  }
+  throw browserSessionStaleError();
+}
+
+function releaseBrowserSessionResponse(response, abort = false) {
+  const lifecycle = guardedBrowserResponses.get(response);
+  if (!lifecycle) {
+    return;
+  }
+  guardedBrowserResponses.delete(response);
+  if (abort) {
+    lifecycle.operation.abort();
+    return;
+  }
+  lifecycle.operation.release();
+}
+
+function assertBrowserSessionResponseCurrent(response) {
+  const lifecycle = guardedBrowserResponses.get(response);
+  if (!lifecycle) {
+    return;
+  }
+  assertBrowserResponseLifecycle(
+    lifecycle.expectedGeneration,
+    lifecycle.expectedLogoutGeneration,
+  );
+}
+
+function guardBrowserSessionResponse(
+  response,
+  operation,
+  expectedGeneration,
+  expectedLogoutGeneration,
+) {
+  const guardedBodyMethods = new Set([
+    "arrayBuffer",
+    "blob",
+    "bytes",
+    "formData",
+    "json",
+    "text",
+  ]);
+  let guardedResponse = null;
+  guardedResponse = new Proxy(response, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (!guardedBodyMethods.has(property) || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args) => {
+        try {
+          assertBrowserSessionResponseCurrent(guardedResponse);
+          const result = await value.apply(target, args);
+          assertBrowserSessionResponseCurrent(guardedResponse);
+          return result;
+        } catch (error) {
+          if (!isBrowserResponseLifecycleCurrent(expectedGeneration, expectedLogoutGeneration)) {
+            throw browserSessionStaleError();
+          }
+          throw error;
+        }
+      };
+    },
+  });
+  guardedBrowserResponses.set(guardedResponse, {
+    operation,
+    expectedGeneration,
+    expectedLogoutGeneration,
+  });
+  return guardedResponse;
+}
+
+function browserSessionFetch(path, options = {}, didRecover = false) {
+  const target = requireSameOriginBrowserRequest(path);
+  return performBrowserSessionFetch(target, options, didRecover);
+}
+
+async function performBrowserSessionFetch(target, options, didRecover) {
   await ensureBrowserSession();
   const headers = new Headers(options.headers || {});
   headers.delete("Authorization");
@@ -645,21 +985,36 @@ async function browserSessionFetch(path, options = {}, didRecover = false) {
           throw error;
         }
         await recoverBrowserSession();
-        return browserSessionFetch(path, options, true);
+        return browserSessionFetch(target, options, true);
       }
     }
     headers.set("X-KBase-CSRF", browserSessionState.csrfToken);
   }
   const requestGeneration = browserSessionState.generation;
-  const requestInvalidationGeneration = browserSessionState.invalidationGeneration;
-  const response = await fetch(path, {
-    ...options,
-    method,
-    headers,
-    credentials: "same-origin",
-  });
+  const requestLogoutGeneration = browserSessionState.logoutGeneration;
+  const operation = browserSessionOperationController(options.signal);
+  let response = null;
+  try {
+    response = await fetch(target, {
+      ...options,
+      method,
+      headers,
+      credentials: "same-origin",
+      signal: operation.signal,
+    });
+  } catch (error) {
+    operation.release();
+    if (!isBrowserResponseLifecycleCurrent(requestGeneration, requestLogoutGeneration)) {
+      throw browserSessionStaleError();
+    }
+    throw error;
+  }
   if (response.status === 401 && !didRecover) {
-    if (browserSessionState.logoutGeneration > requestInvalidationGeneration) {
+    operation.abort();
+    if (
+      browserSessionState.logoutPending ||
+      browserSessionState.logoutGeneration > requestLogoutGeneration
+    ) {
       return response;
     }
     const activeRecovery = browserSessionState.recoveryPromise;
@@ -670,9 +1025,20 @@ async function browserSessionFetch(path, options = {}, didRecover = false) {
     } else {
       await ensureBrowserSession();
     }
-    return browserSessionFetch(path, options, true);
+    return browserSessionFetch(target, options, true);
   }
-  return response;
+  try {
+    assertBrowserResponseLifecycle(requestGeneration, requestLogoutGeneration);
+  } catch (error) {
+    operation.abort();
+    throw error;
+  }
+  return guardBrowserSessionResponse(
+    response,
+    operation,
+    requestGeneration,
+    requestLogoutGeneration,
+  );
 }
 
 async function logoutBrowserSession() {
@@ -680,21 +1046,38 @@ async function logoutBrowserSession() {
   if (browserSessionCSRFNeedsRefresh()) {
     await loadBrowserSession();
   }
+  const csrfToken = browserSessionState.csrfToken;
+  resetBrowserSessionMemory("logout-start", true);
+  const logoutBarrierGeneration = browserSessionState.generation;
+  browserSessionSignal("logout-start");
   const headers = new Headers({
     Accept: "application/json",
-    "X-KBase-CSRF": browserSessionState.csrfToken,
+    "X-KBase-CSRF": csrfToken,
   });
-  const response = await fetch("/api/browser/session/logout", {
-    method: "POST",
-    headers,
-    credentials: "same-origin",
-    cache: "no-store",
-  });
-  const result = await readBrowserResponse(response);
-  if (!response.ok) {
-    throw browserResponseError(response, result);
+  try {
+    const response = await fetch("/api/browser/session/logout", {
+      method: "POST",
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(logoutBarrierGeneration);
+    if (!response.ok) {
+      throw browserResponseError(response, result);
+    }
+  } catch (error) {
+    if (browserSessionState.generation !== logoutBarrierGeneration) {
+      throw browserSessionStaleError();
+    }
+    browserSessionState.logoutPending = false;
+    browserSessionState.invalidationReason = "logout-failed";
+    browserSessionSignal("login");
+    throw error;
   }
-  resetBrowserSessionMemory("logout");
+  assertBrowserSessionGeneration(logoutBarrierGeneration);
+  browserSessionState.logoutPending = false;
+  browserSessionState.invalidationReason = "logout";
   browserSessionSignal("logout");
 }
 
@@ -721,11 +1104,16 @@ async function apiFetch(path, options = {}) {
     ...options,
     headers,
   });
-  const result = await readBrowserResponse(response);
-  if (!response.ok) {
-    throw browserResponseError(response, result);
+  try {
+    const result = await readBrowserResponse(response);
+    if (!response.ok) {
+      throw browserResponseError(response, result);
+    }
+    assertBrowserSessionResponseCurrent(response);
+    return result.payload;
+  } finally {
+    releaseBrowserSessionResponse(response);
   }
-  return result.payload;
 }
 
 async function apiDownload(path, options = {}, filename = "download.bin") {
@@ -737,26 +1125,37 @@ async function apiDownload(path, options = {}, filename = "download.bin") {
     ...options,
     headers,
   });
-  if (!response.ok) {
-    const text = await response.text();
-    let payload = text;
-    try {
-      payload = text ? JSON.parse(text) : null;
-    } catch {
-      // Keep the raw error body.
+  let objectURL = "";
+  let link = null;
+  try {
+    if (!response.ok) {
+      const text = await response.text();
+      let payload = text;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        // Keep the raw error body.
+      }
+      throw browserResponseError(response, { text, payload });
     }
-    throw browserResponseError(response, { text, payload });
+    const blob = await response.blob();
+    assertBrowserSessionResponseCurrent(response);
+    objectURL = URL.createObjectURL(blob);
+    link = document.createElement("a");
+    link.href = objectURL;
+    link.download = filename;
+    assertBrowserSessionResponseCurrent(response);
+    document.body.append(link);
+    assertBrowserSessionResponseCurrent(response);
+    link.click();
+    return blob.size;
+  } finally {
+    link?.remove();
+    if (objectURL) {
+      setTimeout(() => URL.revokeObjectURL(objectURL), 0);
+    }
+    releaseBrowserSessionResponse(response);
   }
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
-  return blob.size;
 }
 
 const readerRouteSuffixes = [
@@ -4131,10 +4530,13 @@ async function loadPrivateSourceAssets(container = app) {
     const source = image.dataset.privateSrc || "";
     const figure = image.closest("figure");
     const status = figure?.querySelector(".reader-page__image-status");
+    let response = null;
+    let objectURL = "";
+    let committed = false;
     try {
       const headers = new Headers();
       headers.set("Accept", "image/*");
-      const response = await browserSessionFetch(source, {
+      response = await browserSessionFetch(source, {
         headers,
         credentials: "same-origin",
       });
@@ -4145,18 +4547,26 @@ async function loadPrivateSourceAssets(container = app) {
       if (!String(blob.type || "").startsWith("image/")) {
         throw new Error("invalid image response");
       }
-      const objectURL = URL.createObjectURL(blob);
+      assertBrowserSessionResponseCurrent(response);
+      objectURL = URL.createObjectURL(blob);
+      assertBrowserSessionResponseCurrent(response);
       readerAssetObjectURLs.push(objectURL);
       image.src = objectURL;
       image.removeAttribute("data-private-src");
       figure?.classList.remove("is-loading");
       status?.remove();
+      committed = true;
     } catch (error) {
       figure?.classList.remove("is-loading");
       figure?.classList.add("is-error");
       if (status) {
         status.textContent = `图片加载失败：${error instanceof Error ? error.message : String(error)}`;
       }
+    } finally {
+      if (objectURL && !committed) {
+        URL.revokeObjectURL(objectURL);
+      }
+      releaseBrowserSessionResponse(response);
     }
   }));
 }

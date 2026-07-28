@@ -23,11 +23,51 @@ function responseJSON(status, payload) {
   });
 }
 
+function deferredBodyResponse(body, contentType) {
+  let markBodyStarted;
+  let resolveBody;
+  const bodyStarted = new Promise((resolve) => {
+    markBodyStarted = resolve;
+  });
+  const response = new Response(null, {
+    status: 200,
+    headers: { "content-type": contentType },
+  });
+  function waitForBody(value) {
+    markBodyStarted();
+    return new Promise((resolve) => {
+      resolveBody = () => resolve(value);
+    });
+  }
+  Object.defineProperty(response, "blob", {
+    configurable: true,
+    value: () => waitForBody(new Blob([body], { type: contentType })),
+  });
+  Object.defineProperty(response, "text", {
+    configurable: true,
+    value: () => waitForBody(body),
+  });
+  return {
+    bodyStarted,
+    releaseBody(afterResolve = null) {
+      resolveBody();
+      if (afterResolve) {
+        // VM promise adoption uses two jobs; the third lands after guard return, before commit.
+        queueMicrotask(() => queueMicrotask(() => queueMicrotask(afterResolve)));
+      }
+    },
+    response,
+  };
+}
+
 function createHarness({
   localEntries = [],
   sessionEntries = [],
   responder,
   now = Date.parse("2026-07-28T22:00:00Z"),
+  randomByte = 0x5a,
+  familyEpoch = 1,
+  storageAccessError = false,
 } = {}) {
   const local = new Map(localEntries);
   const session = new Map(sessionEntries);
@@ -92,14 +132,46 @@ function createHarness({
     }
   }
 
+  const testWindow = {
+    BroadcastChannel: TestBroadcastChannel,
+    location: {
+      pathname: "/unit-test",
+      origin: "https://kbase.example",
+    },
+    addEventListener(type, listener) {
+      windowListeners.set(type, listener);
+    },
+  };
+  if (storageAccessError) {
+    for (const property of ["localStorage", "sessionStorage"]) {
+      Object.defineProperty(testWindow, property, {
+        configurable: true,
+        get() {
+          throw new DOMException("storage access denied", "SecurityError");
+        },
+      });
+    }
+  } else {
+    testWindow.localStorage = storageFor(local);
+    testWindow.sessionStorage = storageFor(session);
+  }
+
   const context = {
+    AbortController,
     Blob,
     Date: TestDate,
     Headers,
+    Request,
     Response,
     URL: TestURL,
     URLSearchParams,
     structuredClone,
+    crypto: {
+      getRandomValues(values) {
+        values.fill(randomByte);
+        return values;
+      },
+    },
     setTimeout(callback) {
       callback();
       return 1;
@@ -142,34 +214,53 @@ function createHarness({
         return null;
       },
     },
-    window: {
-      BroadcastChannel: TestBroadcastChannel,
-      localStorage: storageFor(local),
-      sessionStorage: storageFor(session),
-      location: {
-        pathname: "/unit-test",
-        origin: "https://kbase.example",
-      },
-      addEventListener(type, listener) {
-        windowListeners.set(type, listener);
-      },
-    },
+    window: testWindow,
   };
   context.globalThis = context;
   context.fetch = async (input, options = {}) => {
     const headers = options.headers instanceof Headers
       ? options.headers
       : new Headers(options.headers || {});
+    const target = String(input);
+    let normalizedURL = target;
+    try {
+      const parsed = new URL(target, "https://kbase.example");
+      if (parsed.origin === "https://kbase.example") {
+        normalizedURL = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      }
+    } catch {
+      normalizedURL = target;
+    }
     const call = {
-      url: String(input),
+      url: normalizedURL,
+      target,
       method: String(options.method || "GET").toUpperCase(),
       credentials: options.credentials || "",
       authorization: headers.get("Authorization") || "",
       csrf: headers.get("X-KBase-CSRF") || "",
+      clientID: headers.get("X-KBase-Browser-Client-ID") || "",
+      epoch: headers.get("X-KBase-Browser-Epoch") || "",
+      signal: options.signal || null,
     };
     fetchCalls.push(call);
+    if (call.url === "/browser/session" && call.method === "GET") {
+      const currentEpoch = typeof familyEpoch === "function" ? familyEpoch() : familyEpoch;
+      return responseJSON(200, {
+        client_id: call.clientID,
+        epoch: currentEpoch,
+      });
+    }
     if (responder) {
-      return responder(call, fetchCalls);
+      const response = await responder(call, fetchCalls);
+      if (call.url === "/api/browser/session" && response.ok) {
+        const payload = await response.clone().json();
+        return responseJSON(response.status, {
+          client_id: call.clientID || "client_cookie_default",
+          epoch: 1,
+          ...payload,
+        });
+      }
+      return response;
     }
     throw new Error(`unexpected fetch ${call.method} ${call.url}`);
   };
@@ -182,6 +273,9 @@ globalThis.__auth = {
   loadBrowserSession,
   logoutBrowserSession,
   browserSessionState,
+  browserSessionFetch,
+  assertBrowserSessionResponseCurrent,
+  releaseBrowserSessionResponse,
 };`, context, { filename: "frontend-web/app.js" });
 
   return {
@@ -208,10 +302,158 @@ globalThis.__auth = {
         newValue: JSON.stringify(message),
       });
     },
+    setOrigin(origin) {
+      context.window.location.origin = origin;
+    },
   };
 }
 
+const persistedClientID = "client_existing_0123456789";
+const cookieClientID = "client_cookie_family_9876543210";
+const cookieFirst = createHarness({
+  localEntries: [
+    ["kbase.browser-client-id", persistedClientID],
+    ["kbase.token", "legacy-token-must-not-run"],
+  ],
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "existing-cookie-session" },
+        client_id: cookieClientID,
+        epoch: 7,
+        csrf_token: "existing-cookie-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    throw new Error(`cookie status must win before migration: ${call.method} ${call.url}`);
+  },
+});
+await cookieFirst.ensureBrowserSession();
+assert.equal(
+  cookieFirst.fetchCalls[0]?.url,
+  "/api/browser/session",
+  "an existing HttpOnly Cookie must be checked before legacy migration",
+);
+assert.equal(
+  cookieFirst.fetchCalls.some((call) => call.url === "/browser/session/migrate"),
+  false,
+  "an existing Cookie must not be migrated into a different client family",
+);
+assert.equal(cookieFirst.local.get("kbase.browser-client-id"), cookieClientID);
+assert.equal(cookieFirst.browserSessionState.clientID, cookieClientID);
+assert.equal(cookieFirst.browserSessionState.epoch, 7);
+assert.equal(
+  cookieFirst.local.has("kbase.browser-epoch"),
+  false,
+  "epoch must never be persisted",
+);
+
+let generatedStatusCount = 0;
+const generatedClient = createHarness({
+  localEntries: [["kbase.browser-client-id", "错误 client id"]],
+  randomByte: 0x2a,
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      generatedStatusCount += 1;
+      if (generatedStatusCount === 1) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: { id: "generated-client-session" },
+        client_id: call.clientID || generatedClient.local.get("kbase.browser-client-id"),
+        epoch: 1,
+        csrf_token: "generated-client-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      assert.match(call.clientID, /^[A-Za-z0-9_-]{16,128}$/);
+      assert.equal(call.epoch, "1");
+      return responseJSON(200, {
+        session: { id: "generated-client-session" },
+        client_id: call.clientID,
+        epoch: 1,
+      });
+    }
+    throw new Error(`unexpected generated client fetch ${call.method} ${call.url}`);
+  },
+});
+await generatedClient.ensureBrowserSession();
+const generatedClientID = generatedClient.local.get("kbase.browser-client-id");
+assert.match(generatedClientID, /^[A-Za-z0-9_-]{16,128}$/);
+assert.notEqual(generatedClientID, "错误 client id");
+assert.equal(generatedClient.browserSessionState.clientID, generatedClientID);
+assert.equal(generatedClient.browserSessionState.epoch, 1);
+assert.equal(
+  generatedClient.fetchCalls.filter(
+    (call) => call.url === "/browser/session" && call.method === "GET",
+  ).length,
+  1,
+  "a no-Cookie login must acquire the current family epoch once",
+);
+assert.equal(
+  generatedClient.fetchCalls.filter(
+    (call) => call.url === "/browser/session" && call.method === "POST",
+  ).length,
+  1,
+);
+
+const restartedClient = createHarness({
+  localEntries: [...generatedClient.local.entries()],
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "restarted-client-session" },
+        client_id: generatedClientID,
+        epoch: 1,
+        csrf_token: "restarted-client-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    throw new Error(`unexpected restarted client fetch ${call.method} ${call.url}`);
+  },
+});
+await restartedClient.ensureBrowserSession();
+assert.equal(
+  restartedClient.local.get("kbase.browser-client-id"),
+  generatedClientID,
+  "the non-sensitive client identity must remain stable across page restarts",
+);
+
+let overlongStatusCount = 0;
+const overlongClient = createHarness({
+  localEntries: [["kbase.browser-client-id", "a".repeat(129)]],
+  randomByte: 0x4b,
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      overlongStatusCount += 1;
+      if (overlongStatusCount === 1) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: { id: "overlong-replacement-session" },
+        client_id: overlongClient.local.get("kbase.browser-client-id"),
+        epoch: 1,
+        csrf_token: "overlong-replacement-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      return responseJSON(200, {
+        session: { id: "overlong-replacement-session" },
+        client_id: call.clientID,
+        epoch: 1,
+      });
+    }
+    throw new Error(`unexpected overlong client fetch ${call.method} ${call.url}`);
+  },
+});
+await overlongClient.ensureBrowserSession();
+assert.match(overlongClient.local.get("kbase.browser-client-id"), /^[A-Za-z0-9_-]{16,128}$/);
+assert.notEqual(overlongClient.local.get("kbase.browser-client-id"), "a".repeat(129));
+
 const legacySecret = "legacy-secret-value";
+let migrationStatusCount = 0;
 const migration = createHarness({
   localEntries: [
     ["kbase.token", legacySecret],
@@ -219,15 +461,27 @@ const migration = createHarness({
   ],
   sessionEntries: [["KBASE_AUTH_TOKEN", legacySecret]],
   responder(call) {
-    if (call.url === "/browser/session/migrate") {
-      assert.equal(call.authorization, `Bearer ${legacySecret}`);
-      return responseJSON(200, { id: "session-migrated" });
-    }
     if (call.url === "/api/browser/session") {
+      migrationStatusCount += 1;
+      if (migrationStatusCount === 1) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
       return responseJSON(200, {
         session: { id: "session-migrated" },
+        client_id: call.clientID || migration.local.get("kbase.browser-client-id"),
+        epoch: 1,
         csrf_token: "csrf-migrated",
         csrf_expires_at: "2026-07-28T22:15:00Z",
+      });
+    }
+    if (call.url === "/browser/session/migrate") {
+      assert.equal(call.authorization, `Bearer ${legacySecret}`);
+      assert.match(call.clientID, /^[A-Za-z0-9_-]{16,128}$/);
+      assert.equal(call.epoch, "1");
+      return responseJSON(200, {
+        session: { id: "session-migrated" },
+        client_id: call.clientID,
+        epoch: 1,
       });
     }
     if (call.url === "/api/books") {
@@ -254,8 +508,8 @@ assert.equal(
 );
 assert.equal(
   migration.fetchCalls.filter((call) => call.url === "/api/browser/session").length,
-  1,
-  "concurrent requests should share session status loading",
+  2,
+  "concurrent requests should share both Cookie checks",
 );
 for (const key of ["kbase.token", "kbaseToken", "KBASE_AUTH_TOKEN"]) {
   assert.equal(migration.local.has(key), false, `localStorage ${key} should be removed`);
@@ -281,6 +535,81 @@ for (const hint of [...migration.broadcasts.map(JSON.stringify), ...migration.st
   assert.doesNotMatch(hint, /csrf|credential|authorization/i, "cross-tab hints must not carry credentials");
 }
 
+for (const confirmationStatus of [401, 503]) {
+  const unconfirmedSecret = `unconfirmed-migration-${confirmationStatus}`;
+  let unconfirmedStatusCount = 0;
+  const unconfirmedMigration = createHarness({
+    localEntries: [["kbase.token", unconfirmedSecret]],
+    sessionEntries: [["KBASE_AUTH_TOKEN", unconfirmedSecret]],
+    responder(call) {
+      if (call.url === "/api/browser/session") {
+        unconfirmedStatusCount += 1;
+        return responseJSON(
+          unconfirmedStatusCount === 1 ? 401 : confirmationStatus,
+          { error: confirmationStatus === 401 ? "unauthorized" : "service unavailable" },
+        );
+      }
+      if (call.url === "/browser/session/migrate") {
+        return responseJSON(200, {
+          session: { id: `unconfirmed-${confirmationStatus}` },
+          client_id: call.clientID,
+          epoch: Number(call.epoch),
+        });
+      }
+      throw new Error(`unexpected unconfirmed migration fetch ${call.method} ${call.url}`);
+    },
+  });
+  await assert.rejects(
+    unconfirmedMigration.ensureBrowserSession(),
+    (error) => error.status === confirmationStatus,
+  );
+  assert.equal(
+    unconfirmedMigration.local.get("kbase.token"),
+    unconfirmedSecret,
+    `migration ${confirmationStatus} confirmation failure must preserve localStorage`,
+  );
+  assert.equal(
+    unconfirmedMigration.session.get("KBASE_AUTH_TOKEN"),
+    unconfirmedSecret,
+    `migration ${confirmationStatus} confirmation failure must preserve sessionStorage`,
+  );
+}
+
+const mismatchedMigrationSecret = "mismatched-migration-secret";
+let mismatchedMigrationStatusCount = 0;
+const mismatchedMigration = createHarness({
+  localEntries: [["kbase.token", mismatchedMigrationSecret]],
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      mismatchedMigrationStatusCount += 1;
+      if (mismatchedMigrationStatusCount === 1) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: { id: "different-cookie-session" },
+        client_id: "client_different_cookie_family_123",
+        epoch: 2,
+        csrf_token: "different-cookie-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/browser/session/migrate") {
+      return responseJSON(200, {
+        session: { id: "migrated-cookie-session" },
+        client_id: call.clientID,
+        epoch: Number(call.epoch),
+      });
+    }
+    throw new Error(`unexpected mismatched migration fetch ${call.method} ${call.url}`);
+  },
+});
+await mismatchedMigration.ensureBrowserSession();
+assert.equal(
+  mismatchedMigration.local.get("kbase.token"),
+  mismatchedMigrationSecret,
+  "a different confirmed client family must not delete the migrated legacy token",
+);
+
 const transientSecret = "transient-migration-secret";
 const malformedLegacyValue = "错误 token";
 const transientMigration = createHarness({
@@ -290,6 +619,9 @@ const transientMigration = createHarness({
   ],
   sessionEntries: [["KBASE_AUTH_TOKEN", transientSecret]],
   responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(401, { error: "unauthorized" });
+    }
     if (call.url === "/browser/session/migrate") {
       return responseJSON(503, { error: "service unavailable" });
     }
@@ -341,23 +673,70 @@ assert.equal(
   "malformed legacy values must not be sent to migration",
 );
 
+let privateStorageStatusCount = 0;
+let privateStorageClientID = "";
+const privateStorage = createHarness({
+  storageAccessError: true,
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      privateStorageStatusCount += 1;
+      if (privateStorageStatusCount === 1) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: { id: "private-storage-session" },
+        client_id: privateStorageClientID,
+        epoch: 1,
+        csrf_token: "private-storage-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      privateStorageClientID = call.clientID;
+      return responseJSON(200, {
+        session: { id: "private-storage-session" },
+        client_id: call.clientID,
+        epoch: Number(call.epoch),
+      });
+    }
+    throw new Error(`unexpected private storage fetch ${call.method} ${call.url}`);
+  },
+});
+await privateStorage.ensureBrowserSession();
+assert.match(privateStorageClientID, /^[A-Za-z0-9_-]{16,128}$/);
+assert.equal(privateStorage.browserSessionState.ready, true);
+assert.equal(
+  privateStorage.fetchCalls.filter(
+    (call) => call.url === "/browser/session" && call.method === "POST",
+  ).length,
+  1,
+  "blocked storage getters must not prevent interactive Cookie login",
+);
+
 const rejectedSecret = "rejected-migration-secret";
+let rejectedMigrationStatusCount = 0;
 const rejectedMigration = createHarness({
   localEntries: [["kbase.token", rejectedSecret]],
   sessionEntries: [["KBASE_AUTH_TOKEN", rejectedSecret]],
   responder(call) {
+    if (call.url === "/api/browser/session") {
+      rejectedMigrationStatusCount += 1;
+      if (rejectedMigrationStatusCount === 1) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: { id: "replacement-session" },
+        client_id: call.clientID || rejectedMigration.local.get("kbase.browser-client-id"),
+        epoch: 1,
+        csrf_token: "replacement-csrf",
+        csrf_expires_at: "2026-07-28T22:15:00Z",
+      });
+    }
     if (call.url === "/browser/session/migrate") {
       return responseJSON(401, { error: "unauthorized" });
     }
     if (call.url === "/browser/session") {
       return responseJSON(200, { id: "replacement-session" });
-    }
-    if (call.url === "/api/browser/session") {
-      return responseJSON(200, {
-        session: { id: "replacement-session" },
-        csrf_token: "replacement-csrf",
-        csrf_expires_at: "2026-07-28T22:15:00Z",
-      });
     }
     throw new Error(`unexpected rejected migration fetch ${call.method} ${call.url}`);
   },
@@ -366,8 +745,146 @@ await rejectedMigration.ensureBrowserSession();
 assert.equal(rejectedMigration.local.has("kbase.token"), false);
 assert.equal(rejectedMigration.session.has("KBASE_AUTH_TOKEN"), false);
 
+const fencedMigrationSecret = "fenced-migration-secret";
+let fencedMigrationCount = 0;
+const fencedMigration = createHarness({
+  localEntries: [["kbase.token", fencedMigrationSecret]],
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(401, { error: "unauthorized" });
+    }
+    if (call.url === "/browser/session/migrate") {
+      fencedMigrationCount += 1;
+      return responseJSON(409, {
+        error: "stale browser session epoch",
+        client_id: call.clientID,
+        epoch: 2,
+      });
+    }
+    throw new Error(`unexpected fenced migration fetch ${call.method} ${call.url}`);
+  },
+});
+await assert.rejects(
+  fencedMigration.ensureBrowserSession(),
+  (error) => error.status === 409,
+);
+assert.equal(fencedMigrationCount, 1, "stale migration must not retry");
+assert.equal(
+  fencedMigration.local.get("kbase.token"),
+  fencedMigrationSecret,
+  "stale migration must preserve the legacy token for a later page-load attempt",
+);
+assert.ok(fencedMigration.broadcasts.some((message) => message?.type === "logout"));
+
+let staleEpoch = 1;
+let staleEpochStatusCount = 0;
+let staleEpochLoginCount = 0;
+const staleEpochLogin = createHarness({
+  familyEpoch: () => staleEpoch,
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      staleEpochStatusCount += 1;
+      if (staleEpochStatusCount < 3) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: { id: "post-fence-session" },
+        client_id: call.clientID || staleEpochLogin.local.get("kbase.browser-client-id"),
+        epoch: 2,
+        csrf_token: "post-fence-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      staleEpochLoginCount += 1;
+      if (staleEpochLoginCount === 1) {
+        assert.equal(call.epoch, "1");
+        staleEpoch = 2;
+        return responseJSON(409, {
+          error: "stale browser session epoch",
+          client_id: call.clientID,
+          epoch: 2,
+        });
+      }
+      assert.equal(call.epoch, "2");
+      return responseJSON(200, {
+        session: { id: "post-fence-session" },
+        client_id: call.clientID,
+        epoch: 2,
+      });
+    }
+    throw new Error(`unexpected stale epoch fetch ${call.method} ${call.url}`);
+  },
+});
+await assert.rejects(
+  staleEpochLogin.ensureBrowserSession(),
+  (error) => error.status === 409,
+  "a stale family epoch must surface without automatic login retry",
+);
+assert.equal(staleEpochLoginCount, 1);
+assert.equal(staleEpochStatusCount, 1);
+assert.ok(
+  staleEpochLogin.broadcasts.some((message) => message?.type === "logout"),
+  "stale epoch must notify other tabs of the family fence",
+);
+await staleEpochLogin.ensureBrowserSession();
+assert.equal(staleEpochLoginCount, 2, "the next explicit action may acquire the new epoch and login");
+assert.equal(staleEpochLogin.browserSessionState.epoch, 2);
+
+let duplicateSignalStatusCount = 0;
+let markDuplicateSignalRequestStarted;
+let releaseDuplicateSignalRequest;
+const duplicateSignalRequestStarted = new Promise((resolve) => {
+  markDuplicateSignalRequestStarted = resolve;
+});
+const duplicateSignalRequestGate = new Promise((resolve) => {
+  releaseDuplicateSignalRequest = resolve;
+});
+const duplicateSignal = createHarness({
+  responder: async (call) => {
+    if (call.url === "/api/browser/session") {
+      duplicateSignalStatusCount += 1;
+      return responseJSON(200, {
+        session: { id: `duplicate-signal-session-${duplicateSignalStatusCount}` },
+        client_id: "client_duplicate_signal_123",
+        epoch: 1,
+        csrf_token: `duplicate-signal-csrf-${duplicateSignalStatusCount}`,
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/duplicate-signal") {
+      markDuplicateSignalRequestStarted();
+      await duplicateSignalRequestGate;
+      return responseJSON(200, { ok: true });
+    }
+    throw new Error(`unexpected duplicate signal fetch ${call.method} ${call.url}`);
+  },
+});
+await duplicateSignal.ensureBrowserSession();
+const duplicateHint = {
+  type: "login",
+  at: 1,
+  nonce: "same-signal-over-two-transports",
+};
+duplicateSignal.emitBroadcast(duplicateHint);
+const duplicateSignalRequest = duplicateSignal.apiFetch("/api/duplicate-signal");
+await duplicateSignalRequestStarted;
+const generationAfterFirstSignal = duplicateSignal.browserSessionState.generation;
+duplicateSignal.emitStorage(duplicateHint);
+assert.equal(
+  duplicateSignal.browserSessionState.generation,
+  generationAfterFirstSignal,
+  "the same nonce delivered over BroadcastChannel and storage must reset once",
+);
+releaseDuplicateSignalRequest();
+assert.equal(
+  (await duplicateSignalRequest).ok,
+  true,
+  "a duplicate transport delivery must not abort work started after the first signal",
+);
+
 for (const signalCase of [
-  { type: "logout", transport: "broadcast" },
+  { type: "logout-start", transport: "broadcast" },
   { type: "login", transport: "storage" },
 ]) {
   let resolveStatus;
@@ -443,7 +960,7 @@ const staleLogin = createHarness({
 });
 const pendingLogin = staleLogin.ensureBrowserSession();
 await loginStarted;
-staleLogin.emitStorage({ type: "logout", at: 1, nonce: "logout-during-login" });
+staleLogin.emitStorage({ type: "logout-start", at: 1, nonce: "logout-during-login" });
 resolveLogin();
 await assert.rejects(
   pendingLogin,
@@ -454,6 +971,65 @@ assert.equal(staleLoginStatusCount, 1, "stale login must not start a follow-up s
 assert.equal(staleLogin.browserSessionState.ready, false);
 assert.equal(staleLogin.browserSessionState.session, null);
 assert.equal(staleLogin.browserSessionState.csrfToken, "");
+
+let staleRecoveryStatusCount = 0;
+let staleRecoveryLoginCount = 0;
+let staleRecoveryRequestCount = 0;
+let markStaleRecoveryLoginStarted;
+let releaseStaleRecoveryLogin;
+const staleRecoveryLoginStarted = new Promise((resolve) => {
+  markStaleRecoveryLoginStarted = resolve;
+});
+const delayedStaleRecoveryLogin = new Promise((resolve) => {
+  releaseStaleRecoveryLogin = resolve;
+});
+const staleRecovery = createHarness({
+  responder: async (call) => {
+    if (call.url === "/api/browser/session") {
+      staleRecoveryStatusCount += 1;
+      return responseJSON(200, {
+        session: { id: `stale-recovery-${staleRecoveryStatusCount}` },
+        client_id: "client_stale_recovery_123",
+        epoch: 1,
+        csrf_token: `stale-recovery-csrf-${staleRecoveryStatusCount}`,
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      staleRecoveryLoginCount += 1;
+      markStaleRecoveryLoginStarted();
+      await delayedStaleRecoveryLogin;
+      return responseJSON(200, {
+        session: { id: "stale-recovery-login" },
+        client_id: call.clientID,
+        epoch: Number(call.epoch),
+      });
+    }
+    if (call.url === "/api/stale-recovery") {
+      staleRecoveryRequestCount += 1;
+      return staleRecoveryRequestCount === 1
+        ? responseJSON(401, { error: "unauthorized" })
+        : responseJSON(200, { ok: true });
+    }
+    throw new Error(`unexpected stale recovery fetch ${call.method} ${call.url}`);
+  },
+});
+const staleRecoveryRequest = staleRecovery.apiFetch("/api/stale-recovery");
+await staleRecoveryLoginStarted;
+staleRecovery.emitBroadcast({
+  type: "logout-start",
+  at: 1,
+  nonce: "logout-during-recovery",
+});
+releaseStaleRecoveryLogin();
+await assert.rejects(
+  staleRecoveryRequest,
+  (error) => error.code === "browser_session_stale" || error.name === "AbortError",
+  "cross-tab logout-start must invalidate an in-flight recovery",
+);
+assert.equal(staleRecoveryLoginCount, 1);
+assert.equal(staleRecoveryRequestCount, 1, "stale recovery must not retry old API work");
+assert.equal(staleRecovery.browserSessionState.ready, false);
 
 for (const transport of ["broadcast", "storage"]) {
   let logoutRaceStatusCount = 0;
@@ -527,6 +1103,10 @@ const crossOrigin = createHarness({
 for (const target of [
   "https://evil.example/api/write",
   "//evil.example/api/write",
+  "//kbase.example/api/write",
+  "https://user:password@kbase.example/api/write",
+  new Request("https://evil.example/api/write", { method: "POST" }),
+  new URL("https://kbase.example/api/write"),
 ]) {
   await assert.rejects(
     crossOrigin.apiFetch(target, {
@@ -540,6 +1120,81 @@ for (const target of [
 }
 assert.equal(crossOrigin.fetchCalls.length, 0, "cross-origin requests must not reach fetch");
 assert.equal(crossOrigin.browserSessionState.csrfToken, "", "cross-origin rejection must not load CSRF");
+
+const mutableURLHarness = createHarness({
+  responder(call) {
+    throw new Error(`mutable URL reached fetch: ${call.method} ${call.url}`);
+  },
+});
+const mutableURL = new URL("https://kbase.example/api/write");
+const mutableURLRequest = mutableURLHarness.apiFetch(mutableURL, { method: "POST" });
+mutableURL.hostname = "evil.example";
+await assert.rejects(
+  mutableURLRequest,
+  (error) => error.code === "cross_origin_request",
+  "URL objects must be rejected before later mutation can redirect credentials",
+);
+assert.equal(mutableURLHarness.fetchCalls.length, 0);
+
+let sameOriginStatusCount = 0;
+const sameOrigin = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      sameOriginStatusCount += 1;
+      return responseJSON(200, {
+        session: { id: "same-origin-session" },
+        client_id: "client_same_origin_123456",
+        epoch: 1,
+        csrf_token: "same-origin-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/same-origin") {
+      assert.equal(call.target, "https://kbase.example/api/same-origin");
+      assert.equal(call.csrf, "same-origin-csrf");
+      return responseJSON(200, { ok: true });
+    }
+    throw new Error(`unexpected same-origin fetch ${call.method} ${call.url}`);
+  },
+});
+assert.equal(
+  (await sameOrigin.apiFetch("https://kbase.example/api/same-origin", {
+    method: "POST",
+  })).ok,
+  true,
+);
+assert.equal(sameOriginStatusCount, 1);
+
+const stableBase = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "stable-base-session" },
+        client_id: "client_stable_base_123456",
+        epoch: 1,
+        csrf_token: "stable-base-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/stable-base") {
+      assert.equal(
+        call.target,
+        "https://kbase.example/api/stable-base",
+        "the validated target must remain an immutable absolute URL",
+      );
+      assert.equal(call.csrf, "stable-base-csrf");
+      return responseJSON(200, { stable: true });
+    }
+    throw new Error(`unexpected stable-base fetch ${call.method} ${call.target}`);
+  },
+});
+const stableBaseRequest = stableBase.apiFetch("/api/stable-base", { method: "POST" });
+stableBase.setOrigin("https://evil.example");
+assert.equal((await stableBaseRequest).stable, true);
+assert.equal(
+  stableBase.fetchCalls.filter((call) => call.url === "/api/stable-base").length,
+  1,
+);
 
 let loginCount = 0;
 let statusCount = 0;
@@ -707,6 +1362,73 @@ assert.equal(delayedLoginCount, 1, "late concurrent 401 responses should share o
 assert.equal(delayedStatusCount, 2, "late concurrent 401 responses should share one status refresh");
 assert.equal(delayedRequestCount, 4, "each concurrent request should retry only once");
 
+let joinedRecoveryStatusCount = 0;
+let joinedRecoveryLoginCount = 0;
+let joinedRecoveryOwnerCount = 0;
+let joinedRecoveryLoginResolved = false;
+let markJoinedRecoveryLoginStarted;
+let releaseJoinedRecoveryLogin;
+const joinedRecoveryLoginStarted = new Promise((resolve) => {
+  markJoinedRecoveryLoginStarted = resolve;
+});
+const joinedRecoveryLogin = new Promise((resolve) => {
+  releaseJoinedRecoveryLogin = resolve;
+});
+const recoveryWithNewRequest = createHarness({
+  responder: async (call) => {
+    if (call.url === "/api/browser/session") {
+      joinedRecoveryStatusCount += 1;
+      if (joinedRecoveryStatusCount === 1 || joinedRecoveryLoginResolved) {
+        return responseJSON(200, {
+          session: { id: `joined-recovery-${joinedRecoveryStatusCount}` },
+          client_id: call.clientID || "client_joined_recovery_123",
+          epoch: 1,
+          csrf_token: `joined-recovery-csrf-${joinedRecoveryStatusCount}`,
+          csrf_expires_at: "2999-01-01T00:00:00Z",
+        });
+      }
+      return responseJSON(401, { error: "unauthorized" });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      joinedRecoveryLoginCount += 1;
+      if (joinedRecoveryLoginCount === 1) {
+        markJoinedRecoveryLoginStarted();
+        await joinedRecoveryLogin;
+        joinedRecoveryLoginResolved = true;
+      }
+      return responseJSON(200, {
+        session: { id: "joined-recovery-session" },
+        client_id: call.clientID,
+        epoch: Number(call.epoch),
+      });
+    }
+    if (call.url === "/api/recovery-owner") {
+      joinedRecoveryOwnerCount += 1;
+      return joinedRecoveryOwnerCount === 1
+        ? responseJSON(401, { error: "unauthorized" })
+        : responseJSON(200, { owner: true });
+    }
+    if (call.url === "/api/recovery-joiner") {
+      return responseJSON(200, { joiner: true });
+    }
+    throw new Error(`unexpected joined recovery fetch ${call.method} ${call.url}`);
+  },
+});
+const recoveryOwner = recoveryWithNewRequest.apiFetch("/api/recovery-owner");
+await joinedRecoveryLoginStarted;
+const recoveryJoiner = recoveryWithNewRequest.apiFetch("/api/recovery-joiner");
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(
+  joinedRecoveryLoginCount,
+  1,
+  "a new request must join an active recovery instead of starting another login",
+);
+releaseJoinedRecoveryLogin();
+const [ownerPayload, joinerPayload] = await Promise.all([recoveryOwner, recoveryJoiner]);
+assert.equal(ownerPayload.owner, true);
+assert.equal(joinerPayload.joiner, true);
+assert.equal(joinedRecoveryLoginCount, 1);
+
 let csrfStatusCount = 0;
 const csrfRefresh = createHarness({
   responder(call) {
@@ -780,8 +1502,13 @@ assert.equal(
 assert.equal(csrfRecoveryLoginCount, 1, "401 after proactive CSRF refresh should still recover once");
 assert.equal(csrfRecoveryStatusCount, 3);
 assert.equal(csrfRecoveryWriteCount, 2);
+assert.equal(
+  csrfThenUnauthorized.browserSessionState.operationControllers.size,
+  0,
+  "a 401 retry must release the old request operation",
+);
 
-for (const status of [403, 503]) {
+for (const status of [403, 409, 503]) {
   let requestCount = 0;
   let sessionRequests = 0;
   const failure = createHarness({
@@ -808,6 +1535,168 @@ for (const status of [403, 503]) {
   assert.equal(requestCount, 1, `${status} should not retry`);
   assert.equal(sessionRequests, 1, `${status} should not reopen login/status`);
 }
+
+let markLateJSONHeadersStarted;
+let releaseLateJSONHeaders;
+const lateJSONHeadersStarted = new Promise((resolve) => {
+  markLateJSONHeadersStarted = resolve;
+});
+const lateJSONHeaders = new Promise((resolve) => {
+  releaseLateJSONHeaders = resolve;
+});
+let lateJSONCall = null;
+const lateJSON = createHarness({
+  responder: async (call) => {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "late-json-session" },
+        client_id: "client_late_json_123456",
+        epoch: 1,
+        csrf_token: "late-json-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/late-json") {
+      lateJSONCall = call;
+      markLateJSONHeadersStarted();
+      await lateJSONHeaders;
+      return responseJSON(200, { stale: "must-not-render" });
+    }
+    throw new Error(`unexpected late JSON fetch ${call.method} ${call.target}`);
+  },
+});
+const lateJSONRequest = lateJSON.apiFetch("/api/late-json");
+await lateJSONHeadersStarted;
+lateJSON.emitBroadcast({ type: "logout", at: 1, nonce: "late-json-logout" });
+releaseLateJSONHeaders();
+await assert.rejects(
+  lateJSONRequest,
+  (error) => error.code === "browser_session_stale",
+  "a delayed successful API response must not reach rendering after logout",
+);
+assert.equal(lateJSONCall?.signal?.aborted, true, "logout must abort the in-flight API request");
+assert.equal(lateJSON.browserSessionState.operationControllers.size, 0);
+
+const lateDownloadBody = deferredBodyResponse(
+  "downloaded-after-logout",
+  "application/octet-stream",
+);
+let lateDownloadCall = null;
+const lateDownload = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "late-download-session" },
+        client_id: "client_late_download_123",
+        epoch: 1,
+        csrf_token: "late-download-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/late-download") {
+      lateDownloadCall = call;
+      return lateDownloadBody.response;
+    }
+    throw new Error(`unexpected late download fetch ${call.method} ${call.target}`);
+  },
+});
+const lateDownloadRequest = lateDownload.apiDownload(
+  "/api/late-download",
+  {},
+  "stale.bin",
+);
+await lateDownloadBody.bodyStarted;
+lateDownload.emitStorage({ type: "logout", at: 1, nonce: "late-download-logout" });
+lateDownloadBody.releaseBody();
+await assert.rejects(
+  lateDownloadRequest,
+  (error) => error.code === "browser_session_stale",
+  "a body completing after logout must not be saved",
+);
+assert.equal(lateDownloadCall?.signal?.aborted, true);
+assert.equal(lateDownload.links.length, 0);
+assert.equal(lateDownload.objectURLs.length, 0);
+assert.equal(lateDownload.browserSessionState.operationControllers.size, 0);
+
+const finalAPICommitBody = deferredBodyResponse(
+  JSON.stringify({ stale: "must-not-return" }),
+  "application/json",
+);
+const finalAPICommit = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "final-api-commit-session" },
+        client_id: "client_final_api_commit_123",
+        epoch: 1,
+        csrf_token: "final-api-commit-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/final-api-commit") {
+      return finalAPICommitBody.response;
+    }
+    throw new Error(`unexpected final API commit fetch ${call.method} ${call.target}`);
+  },
+});
+const finalAPICommitRequest = finalAPICommit.apiFetch("/api/final-api-commit");
+await finalAPICommitBody.bodyStarted;
+finalAPICommitBody.releaseBody(() => {
+  finalAPICommit.emitBroadcast({
+    type: "logout",
+    at: 4,
+    nonce: "final-api-commit-logout",
+  });
+});
+await assert.rejects(
+  finalAPICommitRequest,
+  (error) => error.code === "browser_session_stale",
+  "API payload must be fenced when logout lands after body completion but before return",
+);
+assert.equal(finalAPICommit.browserSessionState.operationControllers.size, 0);
+
+const finalDownloadCommitBody = deferredBodyResponse(
+  "download-must-not-commit",
+  "application/octet-stream",
+);
+const finalDownloadCommit = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "final-download-commit-session" },
+        client_id: "client_final_download_commit_123",
+        epoch: 1,
+        csrf_token: "final-download-commit-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/final-download-commit") {
+      return finalDownloadCommitBody.response;
+    }
+    throw new Error(`unexpected final download commit fetch ${call.method} ${call.target}`);
+  },
+});
+const finalDownloadCommitRequest = finalDownloadCommit.apiDownload(
+  "/api/final-download-commit",
+  {},
+  "stale-final.bin",
+);
+await finalDownloadCommitBody.bodyStarted;
+finalDownloadCommitBody.releaseBody(() => {
+  finalDownloadCommit.emitStorage({
+    type: "logout",
+    at: 5,
+    nonce: "final-download-commit-logout",
+  });
+});
+await assert.rejects(
+  finalDownloadCommitRequest,
+  (error) => error.code === "browser_session_stale",
+  "download side effects must be fenced after body completion",
+);
+assert.equal(finalDownloadCommit.objectURLs.length, 0);
+assert.equal(finalDownloadCommit.links.length, 0);
+assert.equal(finalDownloadCommit.browserSessionState.operationControllers.size, 0);
 
 const logout = createHarness({
   responder(call) {
@@ -836,6 +1725,165 @@ for (const hint of [...logout.broadcasts.map(JSON.stringify), ...logout.storageS
   assert.ok(!hint.includes("csrf-logout"), "logout hints must not contain CSRF credentials");
   assert.doesNotMatch(hint, /csrf|credential|authorization/i, "logout hints must remain credential-free");
 }
+
+for (const logoutStatus of [204, 503]) {
+  let markDelayedLogoutStarted;
+  let releaseDelayedLogout;
+  const delayedLogoutStarted = new Promise((resolve) => {
+    markDelayedLogoutStarted = resolve;
+  });
+  const delayedLogoutGate = new Promise((resolve) => {
+    releaseDelayedLogout = resolve;
+  });
+  const supersededLogout = createHarness({
+    responder: async (call) => {
+      if (call.url === "/api/browser/session") {
+        return responseJSON(200, {
+          session: { id: `superseded-logout-${logoutStatus}` },
+          client_id: `client_superseded_logout_${logoutStatus}`,
+          epoch: 1,
+          csrf_token: `csrf-superseded-${logoutStatus}`,
+          csrf_expires_at: "2999-01-01T00:00:00Z",
+        });
+      }
+      if (call.url === "/api/browser/session/logout") {
+        markDelayedLogoutStarted();
+        await delayedLogoutGate;
+        return logoutStatus === 204
+          ? new Response(null, { status: 204 })
+          : responseJSON(503, { error: "logout unavailable" });
+      }
+      throw new Error(`unexpected superseded logout fetch ${call.method} ${call.target}`);
+    },
+  });
+  await supersededLogout.ensureBrowserSession();
+  const delayedLogoutRequest = supersededLogout.logoutBrowserSession();
+  await delayedLogoutStarted;
+  supersededLogout.emitBroadcast({
+    type: "login",
+    at: 2,
+    nonce: `newer-login-${logoutStatus}`,
+  });
+  releaseDelayedLogout();
+  await assert.rejects(
+    delayedLogoutRequest,
+    (error) => error.code === "browser_session_stale",
+    `a ${logoutStatus} logout completion must not overwrite a newer cross-tab login`,
+  );
+  assert.equal(supersededLogout.browserSessionState.invalidationReason, "login");
+  assert.equal(supersededLogout.browserSessionState.logoutPending, false);
+  assert.deepEqual(
+    supersededLogout.broadcasts.map((message) => message.type),
+    ["logout-start"],
+    "a superseded logout completion must not broadcast stale logout or login",
+  );
+}
+
+let logoutBarrierAPIRequests = 0;
+let logoutBarrierLoginRequests = 0;
+let logoutBarrierEpoch = 1;
+let logoutBarrierLoggedOut = false;
+let logoutStartSeenBeforeHTTP = false;
+let markLogoutBarrierAPIStarted;
+let releaseLogoutBarrierAPI;
+let markLogoutBarrierHTTPStarted;
+let releaseLogoutBarrierHTTP;
+const logoutBarrierAPIStarted = new Promise((resolve) => {
+  markLogoutBarrierAPIStarted = resolve;
+});
+const delayedLogoutBarrierAPI = new Promise((resolve) => {
+  releaseLogoutBarrierAPI = resolve;
+});
+const logoutBarrierHTTPStarted = new Promise((resolve) => {
+  markLogoutBarrierHTTPStarted = resolve;
+});
+const delayedLogoutBarrierHTTP = new Promise((resolve) => {
+  releaseLogoutBarrierHTTP = resolve;
+});
+let logoutBarrier;
+logoutBarrier = createHarness({
+  familyEpoch: () => logoutBarrierEpoch,
+  responder: async (call) => {
+    if (call.url === "/api/browser/session") {
+      if (logoutBarrierLoggedOut && logoutBarrierLoginRequests === 0) {
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, {
+        session: {
+          id: logoutBarrierLoggedOut
+            ? "logout-barrier-new-session"
+            : "logout-barrier-session",
+        },
+        client_id: "client_logout_barrier_123",
+        epoch: logoutBarrierEpoch,
+        csrf_token: logoutBarrierLoggedOut
+          ? "logout-barrier-new-csrf"
+          : "logout-barrier-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/logout-barrier") {
+      logoutBarrierAPIRequests += 1;
+      if (logoutBarrierAPIRequests === 1) {
+        markLogoutBarrierAPIStarted();
+        await delayedLogoutBarrierAPI;
+        return responseJSON(401, { error: "unauthorized" });
+      }
+      return responseJSON(200, { ok: true });
+    }
+    if (call.url === "/browser/session" && call.method === "POST") {
+      logoutBarrierLoginRequests += 1;
+      assert.equal(call.epoch, "2");
+      return responseJSON(200, {
+        session: { id: "logout-barrier-recovered" },
+        client_id: call.clientID,
+        epoch: Number(call.epoch),
+      });
+    }
+    if (call.url === "/api/browser/session/logout") {
+      logoutStartSeenBeforeHTTP = logoutBarrier.broadcasts.some(
+        (message) => message?.type === "logout-start",
+      );
+      markLogoutBarrierHTTPStarted();
+      await delayedLogoutBarrierHTTP;
+      logoutBarrierEpoch = 2;
+      logoutBarrierLoggedOut = true;
+      return new Response(null, { status: 204 });
+    }
+    if (call.url === "/api/after-logout") {
+      return responseJSON(200, { fresh: true });
+    }
+    throw new Error(`unexpected logout barrier fetch ${call.method} ${call.url}`);
+  },
+});
+const oldAPIRequest = logoutBarrier.apiFetch("/api/logout-barrier");
+await logoutBarrierAPIStarted;
+const logoutRequest = logoutBarrier.logoutBrowserSession();
+await logoutBarrierHTTPStarted;
+releaseLogoutBarrierAPI();
+const oldAPIOutcome = await oldAPIRequest.then(
+  (value) => ({ value }),
+  (error) => ({ error }),
+);
+releaseLogoutBarrierHTTP();
+await logoutRequest;
+assert.equal(logoutStartSeenBeforeHTTP, true, "logout-start must be broadcast before HTTP logout");
+assert.equal(oldAPIOutcome.error?.status, 401, "a pre-logout API 401 must surface unchanged");
+assert.equal(logoutBarrierLoginRequests, 0, "logout must fence late 401 recovery");
+assert.equal(logoutBarrierAPIRequests, 1, "logout must prevent retry of pre-barrier work");
+assert.deepEqual(
+  logoutBarrier.broadcasts
+    .filter((message) => message?.type?.startsWith("logout"))
+    .map((message) => message.type),
+  ["logout-start", "logout"],
+);
+assert.equal(
+  (await logoutBarrier.apiFetch("/api/after-logout")).fresh,
+  true,
+  "the next user action after logout may acquire the fenced epoch and login",
+);
+assert.equal(logoutBarrierLoginRequests, 1);
+assert.equal(logoutBarrier.browserSessionState.epoch, 2);
 
 let logoutStatusCount = 0;
 const expiringLogout = createHarness({
@@ -891,5 +1939,218 @@ const privateAssets = source.match(/async function loadPrivateSourceAssets[\s\S]
 assert.match(privateAssets, /credentials:\s*"same-origin"/);
 assert.doesNotMatch(privateAssets, /Authorization|setAuthorizationHeader|getToken/);
 assert.match(privateAssets, /URL\.createObjectURL/);
+
+function privateAssetFixture(sourcePath) {
+  const classes = new Set(["is-loading"]);
+  const status = {
+    textContent: "图片加载中",
+    removed: false,
+    remove() {
+      this.removed = true;
+    },
+  };
+  const figure = {
+    classList: {
+      add(value) {
+        classes.add(value);
+      },
+      remove(value) {
+        classes.delete(value);
+      },
+    },
+    querySelector(selector) {
+      return selector === ".reader-page__image-status" ? status : null;
+    },
+  };
+  const image = {
+    dataset: { privateSrc: sourcePath },
+    src: "",
+    removedAttribute: "",
+    closest(selector) {
+      return selector === "figure" ? figure : null;
+    },
+    removeAttribute(name) {
+      this.removedAttribute = name;
+      if (name === "data-private-src") {
+        delete this.dataset.privateSrc;
+      }
+    },
+  };
+  return {
+    classes,
+    status,
+    image,
+    container: {
+      querySelectorAll(selector) {
+        assert.equal(selector, "img[data-private-src]");
+        return [image];
+      },
+    },
+  };
+}
+
+async function exercisePrivateAsset(
+  response,
+  fetchPrivateAsset = null,
+  responseLifecycle = null,
+) {
+  const fixture = privateAssetFixture("/api/source-assets/private-image");
+  const calls = [];
+  const created = [];
+  class PrivateAssetURL extends URL {
+    static createObjectURL(blob) {
+      created.push(blob);
+      return "blob:private-asset";
+    }
+  }
+  const context = {
+    Headers,
+    URL: PrivateAssetURL,
+    app: null,
+    readerAssetObjectURLs: [],
+    browserSessionFetch: async (path, options) => {
+      const headers = options.headers instanceof Headers
+        ? options.headers
+        : new Headers(options.headers || {});
+      calls.push({
+        path,
+        credentials: options.credentials,
+        accept: headers.get("Accept"),
+        authorization: headers.get("Authorization"),
+      });
+      return fetchPrivateAsset ? fetchPrivateAsset(path, options) : response;
+    },
+    assertBrowserSessionResponseCurrent: responseLifecycle
+      ? responseLifecycle.assertBrowserSessionResponseCurrent
+      : () => {},
+    releaseBrowserSessionResponse: responseLifecycle
+      ? responseLifecycle.releaseBrowserSessionResponse
+      : () => {},
+  };
+  context.globalThis = context;
+  vm.runInNewContext(
+    `${privateAssets}\nglobalThis.__loadPrivateSourceAssets = loadPrivateSourceAssets;`,
+    context,
+    { filename: "frontend-web/private-assets.js" },
+  );
+  await context.__loadPrivateSourceAssets(fixture.container);
+  return { ...fixture, calls, created, objectURLs: context.readerAssetObjectURLs };
+}
+
+const privateAssetSuccess = await exercisePrivateAsset(new Response(
+  new Blob(["image"], { type: "image/png" }),
+  { status: 200, headers: { "content-type": "image/png" } },
+));
+assert.deepEqual(privateAssetSuccess.calls, [{
+  path: "/api/source-assets/private-image",
+  credentials: "same-origin",
+  accept: "image/*",
+  authorization: null,
+}]);
+assert.equal(privateAssetSuccess.created[0]?.type, "image/png");
+assert.equal(privateAssetSuccess.image.src, "blob:private-asset");
+assert.equal(privateAssetSuccess.image.removedAttribute, "data-private-src");
+assert.equal(privateAssetSuccess.classes.has("is-loading"), false);
+assert.equal(privateAssetSuccess.status.removed, true);
+assert.deepEqual(privateAssetSuccess.objectURLs, ["blob:private-asset"]);
+
+const privateAssetFailure = await exercisePrivateAsset(new Response(
+  new Blob(["not an image"], { type: "text/plain" }),
+  { status: 200, headers: { "content-type": "text/plain" } },
+));
+assert.equal(privateAssetFailure.image.src, "");
+assert.equal(privateAssetFailure.classes.has("is-loading"), false);
+assert.equal(privateAssetFailure.classes.has("is-error"), true);
+assert.match(privateAssetFailure.status.textContent, /invalid image response/);
+assert.equal(privateAssetFailure.status.removed, false);
+
+const latePrivateAssetBody = deferredBodyResponse("private-after-logout", "image/png");
+let latePrivateAssetCall = null;
+const latePrivateAsset = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "late-private-asset-session" },
+        client_id: "client_late_private_asset_123",
+        epoch: 1,
+        csrf_token: "late-private-asset-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/source-assets/private-image") {
+      latePrivateAssetCall = call;
+      return latePrivateAssetBody.response;
+    }
+    throw new Error(`unexpected late private asset fetch ${call.method} ${call.target}`);
+  },
+});
+const latePrivateAssetRequest = exercisePrivateAsset(
+  null,
+  latePrivateAsset.browserSessionFetch,
+  latePrivateAsset,
+);
+await latePrivateAssetBody.bodyStarted;
+latePrivateAsset.emitBroadcast({
+  type: "logout",
+  at: 3,
+  nonce: "late-private-asset-logout",
+});
+latePrivateAssetBody.releaseBody();
+const latePrivateAssetResult = await latePrivateAssetRequest;
+assert.equal(latePrivateAssetCall?.signal?.aborted, true);
+assert.equal(latePrivateAssetResult.created.length, 0);
+assert.equal(latePrivateAssetResult.image.src, "");
+assert.equal(latePrivateAssetResult.image.dataset.privateSrc, "/api/source-assets/private-image");
+assert.equal(latePrivateAssetResult.classes.has("is-error"), true);
+assert.match(latePrivateAssetResult.status.textContent, /browser session state changed/);
+assert.equal(latePrivateAsset.browserSessionState.operationControllers.size, 0);
+
+const finalPrivateAssetCommitBody = deferredBodyResponse(
+  "private-image-must-not-commit",
+  "image/png",
+);
+const finalPrivateAssetCommit = createHarness({
+  responder(call) {
+    if (call.url === "/api/browser/session") {
+      return responseJSON(200, {
+        session: { id: "final-private-asset-commit-session" },
+        client_id: "client_final_private_asset_commit_123",
+        epoch: 1,
+        csrf_token: "final-private-asset-commit-csrf",
+        csrf_expires_at: "2999-01-01T00:00:00Z",
+      });
+    }
+    if (call.url === "/api/source-assets/private-image") {
+      return finalPrivateAssetCommitBody.response;
+    }
+    throw new Error(`unexpected final private asset fetch ${call.method} ${call.target}`);
+  },
+});
+const finalPrivateAssetCommitRequest = exercisePrivateAsset(
+  null,
+  finalPrivateAssetCommit.browserSessionFetch,
+  finalPrivateAssetCommit,
+);
+await finalPrivateAssetCommitBody.bodyStarted;
+finalPrivateAssetCommitBody.releaseBody(() => {
+  finalPrivateAssetCommit.emitBroadcast({
+    type: "logout",
+    at: 6,
+    nonce: "final-private-asset-commit-logout",
+  });
+});
+const finalPrivateAssetCommitResult = await finalPrivateAssetCommitRequest;
+assert.equal(finalPrivateAssetCommitResult.created.length, 0);
+assert.equal(finalPrivateAssetCommitResult.image.src, "");
+assert.equal(
+  finalPrivateAssetCommitResult.image.dataset.privateSrc,
+  "/api/source-assets/private-image",
+);
+assert.equal(finalPrivateAssetCommitResult.classes.has("is-error"), true);
+assert.match(
+  finalPrivateAssetCommitResult.status.textContent,
+  /browser session state changed/,
+);
+assert.equal(finalPrivateAssetCommit.browserSessionState.operationControllers.size, 0);
 
 console.log("browser cookie session smoke passed");

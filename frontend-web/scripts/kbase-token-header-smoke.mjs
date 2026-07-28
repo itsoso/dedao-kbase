@@ -24,11 +24,18 @@ const localStorage = {
 };
 
 const context = {
+  AbortController,
   Blob,
   Headers,
   Response,
   URL,
   URLSearchParams,
+  crypto: {
+    getRandomValues(values) {
+      values.fill(0x3c);
+      return values;
+    },
+  },
   console: {
     log(...values) {
       logs.push(values.map(String).join(" "));
@@ -71,6 +78,8 @@ context.fetch = async (url, options = {}) => {
     url: String(url),
     credentials: options.credentials || "",
     authorization: headers.get("Authorization") || "",
+    clientID: headers.get("X-KBase-Browser-Client-ID") || "",
+    epoch: headers.get("X-KBase-Browser-Epoch") || "",
   });
   if (url === "/api/browser/session") {
     statusCalls += 1;
@@ -82,6 +91,8 @@ context.fetch = async (url, options = {}) => {
     }
     return new Response(JSON.stringify({
       session: { id: "cookie-session" },
+      client_id: storage.get("kbase.browser-client-id"),
+      epoch: 1,
       csrf_token: "csrf-cookie",
       csrf_expires_at: "2026-07-28T22:15:00Z",
     }), {
@@ -89,8 +100,22 @@ context.fetch = async (url, options = {}) => {
       headers: { "content-type": "application/json" },
     });
   }
+  if (url === "/browser/session" && String(options.method || "GET").toUpperCase() === "GET") {
+    return new Response(JSON.stringify({
+      client_id: headers.get("X-KBase-Browser-Client-ID"),
+      epoch: 1,
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
   if (url === "/browser/session") {
-    return new Response(JSON.stringify({ id: "cookie-session" }), {
+    assert.equal(headers.get("X-KBase-Browser-Epoch"), "1");
+    return new Response(JSON.stringify({
+      session: { id: "cookie-session" },
+      client_id: headers.get("X-KBase-Browser-Client-ID"),
+      epoch: 1,
+    }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
