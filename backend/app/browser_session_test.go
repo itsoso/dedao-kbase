@@ -1794,6 +1794,102 @@ func TestBrowserSessionStoreConstructorErrorsAreTypedAndPreserveCause(t *testing
 	})
 }
 
+func TestBrowserSessionStoreValidatesRenewalIntervalBeforeFilesystemChanges(t *testing.T) {
+	t.Run("defaults remain valid", func(t *testing.T) {
+		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+			Path: newBrowserSessionTestDBPath(t),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		if store.ttl != 30*24*time.Hour || store.renewalInterval != 5*time.Minute {
+			t.Fatalf(
+				"default lifecycle = (ttl=%s renewal=%s), want (720h, 5m)",
+				store.ttl,
+				store.renewalInterval,
+			)
+		}
+	})
+
+	for _, testCase := range []struct {
+		name    string
+		ttl     time.Duration
+		renewal time.Duration
+	}{
+		{name: "renewal equals TTL", ttl: 5 * time.Minute, renewal: 5 * time.Minute},
+		{name: "renewal exceeds TTL", ttl: 4 * time.Minute, renewal: 5 * time.Minute},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			root := t.TempDir()
+			dbPath := filepath.Join(root, "must-not-exist", "browser_sessions.sqlite3")
+			_, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+				Path:            dbPath,
+				TTL:             testCase.ttl,
+				RenewalInterval: testCase.renewal,
+			})
+			if !errors.Is(err, ErrBrowserSessionInvalidArgument) {
+				t.Fatalf("invalid lifecycle error = %v, want ErrBrowserSessionInvalidArgument", err)
+			}
+			if _, statErr := os.Stat(filepath.Dir(dbPath)); !os.IsNotExist(statErr) {
+				t.Fatalf("invalid lifecycle created or modified database directory: stat error = %v", statErr)
+			}
+		})
+	}
+}
+
+func TestBrowserSessionLifecycleListIgnoresPrivateCSRFStorage(t *testing.T) {
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(305, 2)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	created, err := store.Create(BrowserSessionCreate{DeviceLabel: "Public browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.db.Exec(`
+		UPDATE browser_sessions
+		SET csrf_hash = X'', csrf_expires_at = 'not-a-time'
+		WHERE id = ?
+	`, created.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.List()
+	if err != nil {
+		t.Fatalf("List() parsed private CSRF storage: %v", err)
+	}
+	if len(sessions) != 1 ||
+		sessions[0].ID != created.Session.ID ||
+		sessions[0].DeviceLabel != created.Session.DeviceLabel {
+		t.Fatalf("List() public metadata = %#v, want created session", sessions)
+	}
+	payload, err := json.Marshal(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"token", "csrf", "user_agent", "hash"} {
+		if bytes.Contains(bytes.ToLower(payload), []byte(forbidden)) {
+			t.Fatalf("List() JSON contains private field %q: %s", forbidden, payload)
+		}
+	}
+
+	if _, err := store.db.Exec(`
+		UPDATE browser_sessions
+		SET expires_at = 'not-a-public-time'
+		WHERE id = ?
+	`, created.Session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(); !errors.Is(err, ErrBrowserSessionUnavailable) {
+		t.Fatalf("List() corrupt public time error = %v, want ErrBrowserSessionUnavailable", err)
+	}
+}
+
 func TestBrowserSessionCleanupNegativeRetentionIsInvalidAndDoesNotDelete(t *testing.T) {
 	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
 		Path:   newBrowserSessionTestDBPath(t),

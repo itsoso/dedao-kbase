@@ -110,6 +110,12 @@ func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionSt
 	if config.RenewalInterval <= 0 {
 		config.RenewalInterval = defaultBrowserSessionRenewalInterval
 	}
+	if config.RenewalInterval <= 0 || config.RenewalInterval >= config.TTL {
+		return nil, fmt.Errorf(
+			"browser session renewal interval must be greater than zero and less than TTL: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
 	if config.MaxActive <= 0 {
 		config.MaxActive = defaultBrowserSessionMaxActive
 	}
@@ -635,7 +641,7 @@ func (s *BrowserSessionStore) List() ([]BrowserSession, error) {
 
 	rows, err := s.db.Query(`
 		SELECT id, device_label, created_at, last_active_at, expires_at,
-			revoked_at, revoke_reason, csrf_hash, csrf_expires_at
+			revoked_at, revoke_reason
 		FROM browser_sessions
 		ORDER BY created_at DESC, id ASC
 	`)
@@ -646,11 +652,11 @@ func (s *BrowserSessionStore) List() ([]BrowserSession, error) {
 
 	sessions := make([]BrowserSession, 0)
 	for rows.Next() {
-		row, err := scanBrowserSessionRow(rows)
+		session, err := scanBrowserSessionPublic(rows)
 		if err != nil {
 			return nil, classifyBrowserSessionStoreError("scan listed browser session", err)
 		}
-		sessions = append(sessions, row.session)
+		sessions = append(sessions, session)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, classifyBrowserSessionStoreError("iterate listed browser sessions", err)
@@ -757,6 +763,35 @@ func readBrowserSessionByID(
 	return row, nil
 }
 
+func scanBrowserSessionPublic(scanner browserSessionScanner) (BrowserSession, error) {
+	var (
+		session                            BrowserSession
+		createdAt, lastActiveAt, expiresAt string
+		revokedAt                          string
+	)
+	if err := scanner.Scan(
+		&session.ID,
+		&session.DeviceLabel,
+		&createdAt,
+		&lastActiveAt,
+		&expiresAt,
+		&revokedAt,
+		&session.RevokeReason,
+	); err != nil {
+		return BrowserSession{}, err
+	}
+	if err := parseBrowserSessionPublicTimes(
+		&session,
+		createdAt,
+		lastActiveAt,
+		expiresAt,
+		revokedAt,
+	); err != nil {
+		return BrowserSession{}, err
+	}
+	return session, nil
+}
+
 func scanBrowserSessionRow(scanner browserSessionScanner) (browserSessionRow, error) {
 	var (
 		row                                browserSessionRow
@@ -776,32 +811,51 @@ func scanBrowserSessionRow(scanner browserSessionScanner) (browserSessionRow, er
 	); err != nil {
 		return browserSessionRow{}, err
 	}
-
+	if err := parseBrowserSessionPublicTimes(
+		&row.session,
+		createdAt,
+		lastActiveAt,
+		expiresAt,
+		revokedAt,
+	); err != nil {
+		return browserSessionRow{}, err
+	}
 	var err error
-	row.session.CreatedAt, err = parseBrowserSessionTime(createdAt)
-	if err != nil {
-		return browserSessionRow{}, err
-	}
-	row.session.LastActiveAt, err = parseBrowserSessionTime(lastActiveAt)
-	if err != nil {
-		return browserSessionRow{}, err
-	}
-	row.session.ExpiresAt, err = parseBrowserSessionTime(expiresAt)
-	if err != nil {
-		return browserSessionRow{}, err
-	}
-	if revokedAt != "" {
-		parsed, err := parseBrowserSessionTime(revokedAt)
-		if err != nil {
-			return browserSessionRow{}, err
-		}
-		row.session.RevokedAt = &parsed
-	}
 	row.csrfExpiresAt, err = parseBrowserSessionTime(csrfExpiresAt)
 	if err != nil {
 		return browserSessionRow{}, err
 	}
 	return row, nil
+}
+
+func parseBrowserSessionPublicTimes(
+	session *BrowserSession,
+	createdAt string,
+	lastActiveAt string,
+	expiresAt string,
+	revokedAt string,
+) error {
+	var err error
+	session.CreatedAt, err = parseBrowserSessionTime(createdAt)
+	if err != nil {
+		return err
+	}
+	session.LastActiveAt, err = parseBrowserSessionTime(lastActiveAt)
+	if err != nil {
+		return err
+	}
+	session.ExpiresAt, err = parseBrowserSessionTime(expiresAt)
+	if err != nil {
+		return err
+	}
+	if revokedAt != "" {
+		parsed, err := parseBrowserSessionTime(revokedAt)
+		if err != nil {
+			return err
+		}
+		session.RevokedAt = &parsed
+	}
+	return nil
 }
 
 func validateBrowserSessionActive(session BrowserSession, now time.Time) error {
