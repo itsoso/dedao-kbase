@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"golang.org/x/net/idna"
 )
 
 func main() {
@@ -272,6 +273,15 @@ const (
 	defaultSessionMaxActive       = 10
 )
 
+var browserIDNAProfile = idna.New(
+	idna.MapForLookup(),
+	idna.Transitional(false),
+	idna.StrictDomainName(false),
+	idna.CheckHyphens(false),
+	idna.VerifyDNSLength(false),
+	idna.BidiRule(),
+)
+
 type sessionServerConfig struct {
 	ListenAddr         string
 	BrowserProxySecret string
@@ -472,7 +482,7 @@ func canonicalOriginHost(host string) (string, net.IP, error) {
 		}
 	}
 	lowerHost := strings.ToLower(host)
-	if strings.Contains(lowerHost, ":") || !isCanonicalDNSHost(lowerHost) {
+	if strings.Contains(lowerHost, ":") || !isCanonicalDomainHost(lowerHost) {
 		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host must use canonical browser form")
 	}
 	return lowerHost, nil, nil
@@ -509,25 +519,44 @@ func serializeCanonicalIPv6(ip net.IP) string {
 	return left + "::" + right
 }
 
-func isCanonicalDNSHost(host string) bool {
-	if len(host) > 253 {
-		return false
-	}
+func isCanonicalDomainHost(host string) bool {
 	labels := strings.Split(host, ".")
+	lastLabel := ""
 	for _, label := range labels {
-		if len(label) == 0 || len(label) > 63 ||
-			label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, char := range label {
-			if (char < 'a' || char > 'z') &&
-				(char < '0' || char > '9') &&
-				char != '-' {
+		for _, char := range []byte(label) {
+			if isForbiddenDomainCodePoint(char) {
 				return false
 			}
 		}
+		if strings.HasPrefix(label, "xn--") && !isCanonicalALabel(label) {
+			return false
+		}
+		if label != "" {
+			lastLabel = label
+		}
 	}
-	return !isBrowserNumericLabel(labels[len(labels)-1])
+	return lastLabel != "" && !isBrowserNumericLabel(lastLabel)
+}
+
+func isForbiddenDomainCodePoint(char byte) bool {
+	if char <= 0x20 || char == 0x7f {
+		return true
+	}
+	switch char {
+	case '#', '%', '/', ':', '<', '>', '?', '@', '[', '\\', ']', '^', '|':
+		return true
+	default:
+		return false
+	}
+}
+
+func isCanonicalALabel(label string) bool {
+	decoded, err := browserIDNAProfile.ToUnicode(label)
+	if err != nil {
+		return false
+	}
+	encoded, err := browserIDNAProfile.ToASCII(decoded)
+	return err == nil && encoded == label
 }
 
 func isBrowserNumericLabel(label string) bool {
