@@ -287,16 +287,21 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	auditAPI := isEvidenceAuditAPIPath(r.URL.Path)
-	auth, authorized := h.authorizeKBaseRequest(w, r, auditAPI)
+	unsafe := isUnsafeKBaseRequestMethod(r.Method)
+	auth, authorized := h.authorizeKBaseRequest(w, r, auditAPI, !unsafe)
 	if !authorized {
 		return
 	}
-	r = r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
-	if auth.Method == kbaseAuthMethodCookie &&
-		isUnsafeKBaseRequestMethod(r.Method) &&
-		!h.authorizeBrowserSessionCSRF(w, r, auth, auditAPI) {
-		return
+	if auth.Method == kbaseAuthMethodCookie && unsafe {
+		if !h.authorizeBrowserSessionCSRF(w, r, auth, auditAPI) {
+			return
+		}
+		auth, authorized = h.renewBrowserSessionAfterCSRF(w, auth, auditAPI)
+		if !authorized {
+			return
+		}
 	}
+	r = requestWithKBaseAuth(r, auth)
 	if isSourceSyncAdminPath(r.URL.Path) {
 		h.handleSourceSyncAdmin(w, r)
 		return
@@ -2604,9 +2609,8 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 }
 
 func (h *kbaseHTTPHandler) authorizeEvidenceAudit(w http.ResponseWriter, r *http.Request) bool {
-	value := strings.TrimSpace(r.Header.Get("Authorization"))
-	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
-	if h.authToken == "" || token == value ||
+	token, valid := singleBearerToken(r)
+	if h.authToken == "" || !valid ||
 		subtle.ConstantTimeCompare([]byte(token), []byte(h.authToken)) != 1 {
 		h.writeEvidenceAuditHTTPError(
 			w, http.StatusUnauthorized, "audit_unauthorized",
@@ -2623,11 +2627,12 @@ const (
 )
 
 type kbaseRequestAuth struct {
-	Method    string
-	SessionID string
-	Renewed   bool
-	ExpiresAt time.Time
-	session   BrowserSession
+	Method       string
+	SessionID    string
+	Renewed      bool
+	ExpiresAt    time.Time
+	sessionToken string
+	session      BrowserSession
 }
 
 type kbaseRequestAuthContextKey struct{}
@@ -2637,10 +2642,16 @@ func kbaseRequestAuthFromContext(ctx context.Context) (kbaseRequestAuth, bool) {
 	return auth, ok
 }
 
+func requestWithKBaseAuth(r *http.Request, auth kbaseRequestAuth) *http.Request {
+	auth.sessionToken = ""
+	return r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
+}
+
 func (h *kbaseHTTPHandler) authorizeKBaseRequest(
 	w http.ResponseWriter,
 	r *http.Request,
 	auditAPI bool,
+	renew bool,
 ) (kbaseRequestAuth, bool) {
 	if len(r.Header.Values("Authorization")) != 0 {
 		if auditAPI {
@@ -2683,19 +2694,24 @@ func (h *kbaseHTTPHandler) authorizeKBaseRequest(
 		return kbaseRequestAuth{}, false
 	}
 
+	if !renew {
+		session, err := h.browserSessions.Store.Authenticate(token)
+		if err != nil {
+			h.writeBrowserSessionAuthenticationError(w, auditAPI, err)
+			return kbaseRequestAuth{}, false
+		}
+		return kbaseRequestAuth{
+			Method:       kbaseAuthMethodCookie,
+			SessionID:    session.ID,
+			ExpiresAt:    session.ExpiresAt,
+			sessionToken: token,
+			session:      session,
+		}, true
+	}
+
 	sessionAuth, err := h.browserSessions.Store.AuthenticateAndRenew(token)
 	if err != nil {
-		if isBrowserSessionCredentialError(err) {
-			clearBrowserSessionCookie(w)
-			h.writeKBaseRequestSecurityError(
-				w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
-			)
-		} else {
-			h.writeKBaseRequestSecurityError(
-				w, auditAPI, http.StatusServiceUnavailable,
-				"audit_service_unavailable", "service unavailable",
-			)
-		}
+		h.writeBrowserSessionAuthenticationError(w, auditAPI, err)
 		return kbaseRequestAuth{}, false
 	}
 	if sessionAuth.SetCookie {
@@ -2707,12 +2723,57 @@ func (h *kbaseHTTPHandler) authorizeKBaseRequest(
 		)
 	}
 	return kbaseRequestAuth{
-		Method:    kbaseAuthMethodCookie,
-		SessionID: sessionAuth.Session.ID,
-		Renewed:   sessionAuth.Renewed,
-		ExpiresAt: sessionAuth.Session.ExpiresAt,
-		session:   sessionAuth.Session,
+		Method:       kbaseAuthMethodCookie,
+		SessionID:    sessionAuth.Session.ID,
+		Renewed:      sessionAuth.Renewed,
+		ExpiresAt:    sessionAuth.Session.ExpiresAt,
+		sessionToken: token,
+		session:      sessionAuth.Session,
 	}, true
+}
+
+func (h *kbaseHTTPHandler) renewBrowserSessionAfterCSRF(
+	w http.ResponseWriter,
+	auth kbaseRequestAuth,
+	auditAPI bool,
+) (kbaseRequestAuth, bool) {
+	sessionAuth, err := h.browserSessions.Store.AuthenticateAndRenew(auth.sessionToken)
+	if err != nil {
+		h.writeBrowserSessionAuthenticationError(w, auditAPI, err)
+		return kbaseRequestAuth{}, false
+	}
+	if sessionAuth.SetCookie {
+		setBrowserSessionCookie(
+			w,
+			auth.sessionToken,
+			sessionAuth.CookieExpiresAt,
+			h.browserSessions.TTL,
+		)
+	}
+	auth.SessionID = sessionAuth.Session.ID
+	auth.Renewed = sessionAuth.Renewed
+	auth.ExpiresAt = sessionAuth.Session.ExpiresAt
+	auth.session = sessionAuth.Session
+	return auth, true
+}
+
+func (h *kbaseHTTPHandler) writeBrowserSessionAuthenticationError(
+	w http.ResponseWriter,
+	auditAPI bool,
+	err error,
+) {
+	if isBrowserSessionCredentialError(err) {
+		w.Header().Del("Set-Cookie")
+		clearBrowserSessionCookie(w)
+		h.writeKBaseRequestSecurityError(
+			w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
+		)
+		return
+	}
+	h.writeKBaseRequestSecurityError(
+		w, auditAPI, http.StatusServiceUnavailable,
+		"audit_service_unavailable", "service unavailable",
+	)
 }
 
 func (h *kbaseHTTPHandler) authorizeBrowserSessionCSRF(
@@ -2785,9 +2846,8 @@ func isUnsafeKBaseRequestMethod(method string) bool {
 }
 
 func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected string) bool {
-	value := strings.TrimSpace(r.Header.Get("Authorization"))
-	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
-	if token == value || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
+	token, valid := singleBearerToken(r)
+	if !valid || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}
@@ -3860,12 +3920,12 @@ func (h *kbaseHTTPHandler) handleBrowserSessionStatus(w http.ResponseWriter, r *
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	auth, authorized := h.authorizeBrowserSessionOnly(w, r)
+	auth, authorized := h.authorizeBrowserSessionOnly(w, r, true)
 	if !authorized {
 		return
 	}
-	r = r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
-	csrfToken, csrfExpiresAt, err := h.browserSessions.Store.RotateCSRF(auth.SessionID)
+	r = requestWithKBaseAuth(r, auth)
+	csrfToken, csrfExpiresAt, err := h.browserSessions.Store.IssueCSRF(auth.sessionToken)
 	if err != nil {
 		if isBrowserSessionCredentialError(err) {
 			w.Header().Del("Set-Cookie")
@@ -3890,11 +3950,11 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogout(w http.ResponseWriter, r *
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	auth, authorized := h.authorizeBrowserSessionOnly(w, r)
+	auth, authorized := h.authorizeBrowserSessionOnly(w, r, false)
 	if !authorized {
 		return
 	}
-	r = r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
+	r = requestWithKBaseAuth(r, auth)
 	if !h.authorizeBrowserSessionCSRF(w, r, auth, false) {
 		return
 	}
@@ -3910,12 +3970,13 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogout(w http.ResponseWriter, r *
 func (h *kbaseHTTPHandler) authorizeBrowserSessionOnly(
 	w http.ResponseWriter,
 	r *http.Request,
+	renew bool,
 ) (kbaseRequestAuth, bool) {
 	if len(r.Header.Values("Authorization")) != 0 {
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return kbaseRequestAuth{}, false
 	}
-	return h.authorizeKBaseRequest(w, r, false)
+	return h.authorizeKBaseRequest(w, r, false, renew)
 }
 
 func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *http.Request) {
@@ -4074,6 +4135,24 @@ func singleBoundedHeader(r *http.Request, name string, maxBytes int) (string, bo
 	return values[0], true
 }
 
+func singleBearerToken(r *http.Request) (string, bool) {
+	value, ok := singleBoundedHeader(
+		r,
+		"Authorization",
+		maxBrowserSessionAuthorizationBytes,
+	)
+	if !ok {
+		return "", false
+	}
+	value = strings.TrimSpace(value)
+	const prefix = "Bearer "
+	if !strings.HasPrefix(value, prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(value, prefix))
+	return token, token != ""
+}
+
 func boundedUserAgent(r *http.Request) string {
 	values := r.Header.Values("User-Agent")
 	if len(values) != 1 {
@@ -4107,21 +4186,8 @@ func validBrowserSessionMigrationBearer(r *http.Request, expected string) bool {
 	if expected == "" {
 		return false
 	}
-	value, ok := singleBoundedHeader(
-		r,
-		"Authorization",
-		maxBrowserSessionAuthorizationBytes,
-	)
-	if !ok {
-		return false
-	}
-	value = strings.TrimSpace(value)
-	const prefix = "Bearer "
-	if !strings.HasPrefix(value, prefix) {
-		return false
-	}
-	token := strings.TrimSpace(strings.TrimPrefix(value, prefix))
-	return token != "" && constantTimeStringEqual(token, expected)
+	token, valid := singleBearerToken(r)
+	return valid && constantTimeStringEqual(token, expected)
 }
 
 func constantTimeStringEqual(left, right string) bool {

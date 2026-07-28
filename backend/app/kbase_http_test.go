@@ -3140,6 +3140,47 @@ func TestKBaseHTTPHandlerCSRF(t *testing.T) {
 		t, auditValidResponse, "audit_request_invalid", "idempotency_key is required",
 	)
 
+	t.Run("rejected request at renewal boundary does not renew", func(t *testing.T) {
+		rejectionClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 19, 20, 0, 0, time.UTC),
+		}
+		rejectionHandler, rejectionStore := newKBaseBrowserSessionHTTPTestHandler(
+			t, rejectionClock, 428,
+		)
+		rejectionCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, rejectionStore, "Rejected Write Browser",
+		)
+		createdLastActiveAt := rejectionCredentials.Session.LastActiveAt
+		createdExpiresAt := rejectionCredentials.Session.ExpiresAt
+		rejectionClock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/books/source-article-1/analysis",
+			rejectionCredentials.Token,
+			`{"model":"Qwen-3.7-Max"}`,
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Sec-Fetch-Site", "same-origin")
+		response := httptest.NewRecorder()
+		rejectionHandler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusForbidden ||
+			response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+			t.Fatalf("boundary rejection = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("boundary rejection renewed Cookie: %q", got)
+		}
+		assertBrowserSessionStoredActivity(
+			t,
+			rejectionStore.db,
+			rejectionCredentials.Session.ID,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
+	})
+
 	t.Run("renewal boundary revocation replaces renewal with one clear Cookie", func(t *testing.T) {
 		raceClock := &browserSessionTestClock{
 			now: time.Date(2026, time.July, 28, 19, 30, 0, 0, time.UTC),
@@ -3182,6 +3223,58 @@ func TestKBaseHTTPHandlerCSRF(t *testing.T) {
 			t.Fatalf("renewal race response retained renewed credential: %q", response.Header().Values("Set-Cookie"))
 		}
 		assertKBaseBrowserSessionClearedCookie(t, response, raceClock.Now())
+		if _, err := raceStore.Authenticate(raceCredentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("renewal race auth error = %v, want persisted revocation", err)
+		}
+	})
+
+	t.Run("renewal boundary store failure returns 503 without changing Cookie", func(t *testing.T) {
+		failureClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 19, 40, 0, 0, time.UTC),
+		}
+		failureHandler, failureStore := newKBaseBrowserSessionHTTPTestHandler(
+			t, failureClock, 430,
+		)
+		failureCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, failureStore, "Renewal Failure Browser",
+		)
+		createdLastActiveAt := failureCredentials.Session.LastActiveAt
+		createdExpiresAt := failureCredentials.Session.ExpiresAt
+		if _, err := failureStore.db.Exec(`
+			CREATE TRIGGER fail_browser_session_renewal
+			BEFORE UPDATE OF last_active_at ON browser_sessions
+			BEGIN
+				SELECT RAISE(FAIL, 'forced renewal failure');
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		failureClock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/books/source-article-1/analysis",
+			failureCredentials.Token,
+			`{"model":"Qwen-3.7-Max"}`,
+		)
+		addKBaseBrowserSessionSecurityHeaders(request, failureCredentials.CSRFToken)
+		response := httptest.NewRecorder()
+		failureHandler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("renewal failure = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("renewal failure changed Cookie: %q", got)
+		}
+		assertBrowserSessionStoredActivity(
+			t,
+			failureStore.db,
+			failureCredentials.Session.ID,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
 	})
 
 	t.Run("audit retry actor uses Cookie session context", func(t *testing.T) {
@@ -3285,17 +3378,89 @@ func TestKBaseHTTPHandlerBrowserSessionStatus(t *testing.T) {
 		t.Fatalf("first status CSRF did not validate: %v", err)
 	}
 	secondToken, secondExpiry := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
-	if firstToken == secondToken {
-		t.Fatal("status did not rotate CSRF token")
+	if firstToken != secondToken {
+		t.Fatal("same-window status changed CSRF token")
 	}
 	if !firstExpiry.Equal(secondExpiry) || !secondExpiry.Equal(clock.Now().Add(15*time.Minute)) {
 		t.Fatalf("CSRF expiries = %s and %s, want %s", firstExpiry, secondExpiry, clock.Now().Add(15*time.Minute))
 	}
-	if err := sessionStore.ValidateCSRF(credentials.Session.ID, firstToken); !errors.Is(err, ErrBrowserSessionCSRFInvalid) {
-		t.Fatalf("rotated old CSRF error = %v, want invalid", err)
-	}
 	if err := sessionStore.ValidateCSRF(credentials.Session.ID, secondToken); err != nil {
 		t.Fatalf("second status CSRF did not validate: %v", err)
+	}
+
+	type statusResult struct {
+		response *httptest.ResponseRecorder
+	}
+	const tabCount = 8
+	start := make(chan struct{})
+	results := make(chan statusResult, tabCount)
+	var wait sync.WaitGroup
+	for index := 0; index < tabCount; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			results <- statusResult{response: requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/browser/session", credentials.Token, "",
+			)}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	for result := range results {
+		if result.response.Code != http.StatusOK {
+			t.Fatalf(
+				"concurrent status = %d body=%s",
+				result.response.Code,
+				result.response.Body.String(),
+			)
+		}
+		token, expiresAt := decodeKBaseBrowserSessionCSRFResponse(
+			t, result.response, credentials.Token,
+		)
+		if token != firstToken || !expiresAt.Equal(firstExpiry) {
+			t.Fatalf(
+				"concurrent status CSRF = (%q, %s), want (%q, %s)",
+				token,
+				expiresAt,
+				firstToken,
+				firstExpiry,
+			)
+		}
+	}
+
+	clock.Advance(browserSessionCSRFTTL)
+	rotatedResponse := requestKBaseWithBrowserCookie(
+		handler, http.MethodGet, "/api/browser/session", credentials.Token, "",
+	)
+	if rotatedResponse.Code != http.StatusOK {
+		t.Fatalf("post-expiry status = %d body=%s", rotatedResponse.Code, rotatedResponse.Body.String())
+	}
+	requireKBaseBrowserSessionCookie(t, rotatedResponse)
+	rotatedToken, rotatedExpiry := decodeKBaseBrowserSessionCSRFResponse(
+		t, rotatedResponse, credentials.Token,
+	)
+	if rotatedToken == firstToken ||
+		!rotatedExpiry.Equal(clock.Now().Add(browserSessionCSRFTTL)) {
+		t.Fatalf(
+			"post-expiry status CSRF = (%q, %s), previous token %q",
+			rotatedToken,
+			rotatedExpiry,
+			firstToken,
+		)
+	}
+	stableRotatedToken, stableRotatedExpiry := loadKBaseBrowserSessionCSRF(
+		t, handler, credentials.Token,
+	)
+	if stableRotatedToken != rotatedToken || !stableRotatedExpiry.Equal(rotatedExpiry) {
+		t.Fatalf(
+			"post-expiry same-window CSRF = (%q, %s), want (%q, %s)",
+			stableRotatedToken,
+			stableRotatedExpiry,
+			rotatedToken,
+			rotatedExpiry,
+		)
 	}
 
 	for _, testCase := range []struct {
@@ -3424,6 +3589,38 @@ func TestKBaseHTTPHandlerBrowserLogout(t *testing.T) {
 			t.Fatalf("concurrent logout terminal auth error = %v, want revoked", err)
 		}
 	})
+
+	t.Run("renewal boundary logout revokes without renewing activity", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 22, 30, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 429)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, sessionStore, "Boundary Logout Browser",
+		)
+		createdLastActiveAt := credentials.Session.LastActiveAt
+		createdExpiresAt := credentials.Session.ExpiresAt
+		clock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("boundary logout = status %d body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionClearedCookie(t, response, clock.Now())
+		assertBrowserSessionStoredActivity(
+			t,
+			sessionStore.db,
+			credentials.Session.ID,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
+	})
 }
 
 func TestKBaseHTTPHandlerBearerCompatibility(t *testing.T) {
@@ -3497,6 +3694,53 @@ func TestKBaseHTTPHandlerBearerCompatibility(t *testing.T) {
 	if got := publisherResponse.Header().Values("Set-Cookie"); len(got) != 0 {
 		t.Fatalf("dedicated publisher Bearer renewed browser Cookie: %q", got)
 	}
+
+	t.Run("duplicate Authorization headers are rejected at every Bearer boundary", func(t *testing.T) {
+		general := httptest.NewRequest(http.MethodGet, "/api/books", nil)
+		general.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		general.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		generalResponse := httptest.NewRecorder()
+		handler.ServeHTTP(generalResponse, general)
+		if generalResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate general Bearer = %d body=%s", generalResponse.Code, generalResponse.Body.String())
+		}
+
+		audit := httptest.NewRequest(http.MethodGet, "/api/agent-audits", nil)
+		audit.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		audit.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		auditResponse := httptest.NewRecorder()
+		handler.ServeHTTP(auditResponse, audit)
+		if auditResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate audit Bearer = %d body=%s", auditResponse.Code, auditResponse.Body.String())
+		}
+		assertKBaseEvidenceAuditErrorEnvelope(
+			t, auditResponse, "audit_unauthorized", "unauthorized",
+		)
+
+		source := httptest.NewRequest(
+			http.MethodPost,
+			"/api/source-agent/heartbeat",
+			strings.NewReader(`{"agent_id":"agent-a","version":"1.0.0","capabilities":[],"wcplus_healthy":true}`),
+		)
+		source.Header.Add("Authorization", "Bearer dedicated-source-agent-token")
+		source.Header.Add("Authorization", "Bearer dedicated-source-agent-token")
+		sourceResponse := httptest.NewRecorder()
+		handler.ServeHTTP(sourceResponse, source)
+		if sourceResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate source Bearer = %d body=%s", sourceResponse.Code, sourceResponse.Body.String())
+		}
+
+		publisher := httptest.NewRequest(
+			http.MethodPost, "/api/agent-packages/publish", strings.NewReader(`{}`),
+		)
+		publisher.Header.Add("Authorization", "Bearer dedicated-publisher-token")
+		publisher.Header.Add("Authorization", "Bearer dedicated-publisher-token")
+		publisherResponse := httptest.NewRecorder()
+		handler.ServeHTTP(publisherResponse, publisher)
+		if publisherResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate publisher Bearer = %d body=%s", publisherResponse.Code, publisherResponse.Body.String())
+		}
+	})
 
 	for _, authorization := range []string{"", "Basic invalid", "Bearer wrong-token"} {
 		t.Run("explicit Authorization "+fmt.Sprintf("%q", authorization), func(t *testing.T) {
@@ -3596,6 +3840,15 @@ func loadKBaseBrowserSessionCSRF(
 	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
 		t.Fatalf("status inside renewal interval reissued Cookie: %q", got)
 	}
+	return decodeKBaseBrowserSessionCSRFResponse(t, response, sessionToken)
+}
+
+func decodeKBaseBrowserSessionCSRFResponse(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	sessionToken string,
+) (string, time.Time) {
+	t.Helper()
 	var payload struct {
 		Session       BrowserSession `json:"session"`
 		CSRFToken     string         `json:"csrf_token"`

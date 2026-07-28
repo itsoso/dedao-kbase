@@ -1112,6 +1112,9 @@ func TestBrowserSessionLifecycleRejectsMissingExpiredAndRevoked(t *testing.T) {
 	if _, err := store.AuthenticateAndRenew("missing"); !errors.Is(err, ErrBrowserSessionMissing) {
 		t.Fatalf("missing AuthenticateAndRenew() error = %v, want ErrBrowserSessionMissing", err)
 	}
+	if _, err := store.Authenticate("missing"); !errors.Is(err, ErrBrowserSessionMissing) {
+		t.Fatalf("missing Authenticate() error = %v, want ErrBrowserSessionMissing", err)
+	}
 
 	expired, err := store.Create(BrowserSessionCreate{DeviceLabel: "Expired"})
 	if err != nil {
@@ -1120,6 +1123,9 @@ func TestBrowserSessionLifecycleRejectsMissingExpiredAndRevoked(t *testing.T) {
 	clock.Advance(time.Hour)
 	if _, err := store.AuthenticateAndRenew(expired.Token); !errors.Is(err, ErrBrowserSessionExpired) {
 		t.Fatalf("expired AuthenticateAndRenew() error = %v, want ErrBrowserSessionExpired", err)
+	}
+	if _, err := store.Authenticate(expired.Token); !errors.Is(err, ErrBrowserSessionExpired) {
+		t.Fatalf("expired Authenticate() error = %v, want ErrBrowserSessionExpired", err)
 	}
 
 	clock.Advance(-30 * time.Minute)
@@ -1132,6 +1138,9 @@ func TestBrowserSessionLifecycleRejectsMissingExpiredAndRevoked(t *testing.T) {
 	}
 	if _, err := store.AuthenticateAndRenew(revoked.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
 		t.Fatalf("revoked AuthenticateAndRenew() error = %v, want ErrBrowserSessionRevoked", err)
+	}
+	if _, err := store.Authenticate(revoked.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("revoked Authenticate() error = %v, want ErrBrowserSessionRevoked", err)
 	}
 }
 
@@ -1401,6 +1410,192 @@ func TestBrowserSessionCleanupHonorsRetentionBoundary(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionLifecycleAuthenticateDoesNotRenewActivity(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            newBrowserSessionTestDBPath(t),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(420, 2)),
+		TTL:             time.Hour,
+		RenewalInterval: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	credentials, err := store.Create(BrowserSessionCreate{DeviceLabel: "Read Only Auth"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdLastActiveAt := credentials.Session.LastActiveAt
+	createdExpiresAt := credentials.Session.ExpiresAt
+	clock.Advance(5 * time.Minute)
+
+	session, err := store.Authenticate(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !session.LastActiveAt.Equal(createdLastActiveAt) ||
+		!session.ExpiresAt.Equal(createdExpiresAt) {
+		t.Fatalf(
+			"Authenticate() session activity = (%s, %s), want stored (%s, %s)",
+			session.LastActiveAt,
+			session.ExpiresAt,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
+	}
+	assertBrowserSessionStoredActivity(
+		t,
+		store.db,
+		credentials.Session.ID,
+		createdLastActiveAt,
+		createdExpiresAt,
+	)
+
+	renewed, err := store.AuthenticateAndRenew(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewed.Renewed || !renewed.SetCookie {
+		t.Fatalf("AuthenticateAndRenew() at boundary = %#v, want renewal", renewed)
+	}
+	assertBrowserSessionStoredActivity(
+		t,
+		store.db,
+		credentials.Session.ID,
+		clock.Now(),
+		clock.Now().Add(time.Hour),
+	)
+}
+
+func TestBrowserSessionLifecycleIssueCSRFIsStableConcurrentAndRotatesAfterExpiry(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(421, 2)),
+		TTL:    time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	credentials, err := store.Create(BrowserSessionCreate{DeviceLabel: "Concurrent CSRF"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type issueResult struct {
+		token     string
+		expiresAt time.Time
+		err       error
+	}
+	const callers = 12
+	start := make(chan struct{})
+	results := make(chan issueResult, callers)
+	var wait sync.WaitGroup
+	for index := 0; index < callers; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			token, expiresAt, issueErr := store.IssueCSRF(credentials.Token)
+			results <- issueResult{token: token, expiresAt: expiresAt, err: issueErr}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+
+	var issuedToken string
+	var issuedExpiresAt time.Time
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent IssueCSRF() error: %v", result.err)
+		}
+		if issuedToken == "" {
+			issuedToken = result.token
+			issuedExpiresAt = result.expiresAt
+			continue
+		}
+		if result.token != issuedToken || !result.expiresAt.Equal(issuedExpiresAt) {
+			t.Fatalf(
+				"concurrent IssueCSRF() = (%q, %s), want (%q, %s)",
+				result.token,
+				result.expiresAt,
+				issuedToken,
+				issuedExpiresAt,
+			)
+		}
+	}
+	if issuedToken == "" || issuedToken == credentials.CSRFToken {
+		t.Fatalf("issued CSRF token = %q, want new stable credential", issuedToken)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(issuedToken)
+	if err != nil || len(decoded) != sha256.Size {
+		t.Fatalf("issued CSRF token encoding = %q len=%d err=%v", issuedToken, len(decoded), err)
+	}
+	if want := clock.Now().Add(browserSessionCSRFTTL); !issuedExpiresAt.Equal(want) {
+		t.Fatalf("issued CSRF expiry = %s, want %s", issuedExpiresAt, want)
+	}
+	if err := store.ValidateCSRF(credentials.Session.ID, issuedToken); err != nil {
+		t.Fatalf("issued CSRF did not validate: %v", err)
+	}
+	if err := store.ValidateCSRF(credentials.Session.ID, credentials.CSRFToken); !errors.Is(err, ErrBrowserSessionCSRFInvalid) {
+		t.Fatalf("creation CSRF after issuance error = %v, want invalid", err)
+	}
+	var storedHash []byte
+	if err := store.db.QueryRow(
+		`SELECT csrf_hash FROM browser_sessions WHERE id = ?`,
+		credentials.Session.ID,
+	).Scan(&storedHash); err != nil {
+		t.Fatal(err)
+	}
+	wantHash := sha256.Sum256([]byte(issuedToken))
+	if !bytes.Equal(storedHash, wantHash[:]) ||
+		bytes.Contains(storedHash, []byte(issuedToken)) {
+		t.Fatalf("stored CSRF value = %x, want hash-only %x", storedHash, wantHash)
+	}
+
+	reissued, reissuedExpiresAt, err := store.IssueCSRF(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reissued != issuedToken || !reissuedExpiresAt.Equal(issuedExpiresAt) {
+		t.Fatalf(
+			"same-window IssueCSRF() = (%q, %s), want (%q, %s)",
+			reissued,
+			reissuedExpiresAt,
+			issuedToken,
+			issuedExpiresAt,
+		)
+	}
+
+	clock.Advance(browserSessionCSRFTTL)
+	rotated, rotatedExpiresAt, err := store.IssueCSRF(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated == issuedToken || rotated == "" {
+		t.Fatalf("post-expiry IssueCSRF() token = %q, want rotation", rotated)
+	}
+	if want := clock.Now().Add(browserSessionCSRFTTL); !rotatedExpiresAt.Equal(want) {
+		t.Fatalf("post-expiry CSRF expiry = %s, want %s", rotatedExpiresAt, want)
+	}
+	if err := store.ValidateCSRF(credentials.Session.ID, issuedToken); !errors.Is(err, ErrBrowserSessionCSRFInvalid) {
+		t.Fatalf("superseded CSRF error = %v, want invalid", err)
+	}
+	if err := store.ValidateCSRF(credentials.Session.ID, rotated); err != nil {
+		t.Fatalf("rotated issued CSRF did not validate: %v", err)
+	}
+}
+
 func TestBrowserSessionLifecycleCSRFUsesRotationExpiryAndTypedConflicts(t *testing.T) {
 	clock := &browserSessionTestClock{
 		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
@@ -1523,6 +1718,9 @@ func TestBrowserSessionLifecycleCSRFRejectsMissingExpiredAndRevokedSessions(t *t
 	if err := store.ValidateCSRF("missing", "credential"); !errors.Is(err, ErrBrowserSessionMissing) {
 		t.Fatalf("missing ValidateCSRF() error = %v, want missing", err)
 	}
+	if _, _, err := store.IssueCSRF("missing"); !errors.Is(err, ErrBrowserSessionMissing) {
+		t.Fatalf("missing IssueCSRF() error = %v, want missing", err)
+	}
 
 	revoked, err := store.Create(BrowserSessionCreate{DeviceLabel: "Revoked"})
 	if err != nil {
@@ -1537,6 +1735,9 @@ func TestBrowserSessionLifecycleCSRFRejectsMissingExpiredAndRevokedSessions(t *t
 	if _, _, err := store.RotateCSRF(revoked.Session.ID); !errors.Is(err, ErrBrowserSessionRevoked) {
 		t.Fatalf("revoked RotateCSRF() error = %v, want revoked", err)
 	}
+	if _, _, err := store.IssueCSRF(revoked.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("revoked IssueCSRF() error = %v, want revoked", err)
+	}
 
 	expired, err := store.Create(BrowserSessionCreate{DeviceLabel: "Expired"})
 	if err != nil {
@@ -1548,6 +1749,9 @@ func TestBrowserSessionLifecycleCSRFRejectsMissingExpiredAndRevokedSessions(t *t
 	}
 	if _, _, err := store.RotateCSRF(expired.Session.ID); !errors.Is(err, ErrBrowserSessionExpired) {
 		t.Fatalf("expired RotateCSRF() error = %v, want expired", err)
+	}
+	if _, _, err := store.IssueCSRF(expired.Token); !errors.Is(err, ErrBrowserSessionExpired) {
+		t.Fatalf("expired IssueCSRF() error = %v, want expired", err)
 	}
 }
 
@@ -1569,6 +1773,12 @@ func TestBrowserSessionLifecycleMapsDatabaseFailureToUnavailable(t *testing.T) {
 
 	if _, err := store.AuthenticateAndRenew(credentials.Token); !errors.Is(err, ErrBrowserSessionUnavailable) {
 		t.Fatalf("AuthenticateAndRenew() closed DB error = %v, want unavailable", err)
+	}
+	if _, err := store.Authenticate(credentials.Token); !errors.Is(err, ErrBrowserSessionUnavailable) {
+		t.Fatalf("Authenticate() closed DB error = %v, want unavailable", err)
+	}
+	if _, _, err := store.IssueCSRF(credentials.Token); !errors.Is(err, ErrBrowserSessionUnavailable) {
+		t.Fatalf("IssueCSRF() closed DB error = %v, want unavailable", err)
 	}
 	if _, err := store.List(); !errors.Is(err, ErrBrowserSessionUnavailable) {
 		t.Fatalf("List() closed DB error = %v, want unavailable", err)
