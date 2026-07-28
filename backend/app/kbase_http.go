@@ -2889,7 +2889,16 @@ func setBrowserSessionNoStore(w http.ResponseWriter) {
 // Responses are intentionally limited to public session metadata.
 func writeBrowserSessionMetadata(w http.ResponseWriter, session BrowserSession) {
 	writeHTTPJSON(w, http.StatusOK, map[string]any{
-		"session": session,
+		"session":   session,
+		"client_id": session.ClientID,
+		"epoch":     session.IssuedEpoch,
+	})
+}
+
+func writeBrowserClientMetadata(w http.ResponseWriter, family BrowserClientFamily) {
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"client_id": family.ClientID,
+		"epoch":     family.Epoch,
 	})
 }
 
@@ -3885,6 +3894,8 @@ func normalizeBrowserSessionHTTPConfig(cfg BrowserSessionHTTPConfig) BrowserSess
 const (
 	browserSessionCookieName            = "__Host-kbase_session"
 	browserSessionProxyHeaderName       = "X-KBase-Browser-Session"
+	browserSessionClientIDHeaderName    = "X-KBase-Browser-Client-ID"
+	browserSessionEpochHeaderName       = "X-KBase-Browser-Epoch"
 	maxBrowserSessionProxySecretBytes   = 256
 	maxBrowserSessionAuthorizationBytes = 4096
 	maxBrowserSessionOriginBytes        = 2048
@@ -3892,6 +3903,7 @@ const (
 	maxBrowserSessionUserAgentBytes     = 512
 	maxBrowserSessionFetchSiteBytes     = 64
 	maxBrowserSessionCSRFBytes          = 256
+	maxBrowserSessionEpochBytes         = 19
 )
 
 const browserSessionAdminPath = "/api/admin/browser-sessions"
@@ -4043,6 +4055,8 @@ func (h *kbaseHTTPHandler) handleBrowserSessionStatus(w http.ResponseWriter, r *
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{
 		"session":         auth.session,
+		"client_id":       auth.session.ClientID,
+		"epoch":           auth.session.IssuedEpoch,
 		"csrf_token":      csrfToken,
 		"csrf_expires_at": csrfExpiresAt,
 	})
@@ -4063,7 +4077,7 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogout(w http.ResponseWriter, r *
 	if !h.authorizeBrowserSessionCSRF(w, r, auth, false) {
 		return
 	}
-	if err := h.browserSessions.Store.Revoke(auth.SessionID, "logout"); err != nil {
+	if _, err := h.browserSessions.Store.FenceClientBySession(auth.SessionID, "logout"); err != nil {
 		writeBrowserSessionStoreError(w, err)
 		return
 	}
@@ -4086,8 +4100,8 @@ func (h *kbaseHTTPHandler) authorizeBrowserSessionOnly(
 
 func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *http.Request) {
 	setBrowserSessionNoStore(w)
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -4108,11 +4122,26 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *h
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	clientID, expectedEpoch, valid := browserSessionClientPrecondition(w, r, r.Method == http.MethodPost)
+	if !valid {
+		return
+	}
+	if r.Method == http.MethodGet {
+		family, err := h.browserSessions.Store.AcquireClientEpoch(clientID)
+		if err != nil {
+			writeBrowserSessionStoreError(w, err)
+			return
+		}
+		writeBrowserClientMetadata(w, family)
+		return
+	}
 
 	userAgent := boundedUserAgent(r)
 	credentials, err := h.browserSessions.Store.Create(BrowserSessionCreate{
-		DeviceLabel: browserSessionDeviceLabel(userAgent),
-		UserAgent:   userAgent,
+		ClientID:      clientID,
+		ExpectedEpoch: expectedEpoch,
+		DeviceLabel:   browserSessionDeviceLabel(userAgent),
+		UserAgent:     userAgent,
 	})
 	if err != nil {
 		writeBrowserSessionStoreError(w, err)
@@ -4143,10 +4172,18 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 		writeHTTPError(w, http.StatusForbidden, "forbidden")
 		return
 	}
+	clientID, expectedEpoch, valid := browserSessionClientPrecondition(w, r, true)
+	if !valid {
+		return
+	}
 
 	sessionToken, cookiePresent, cookieValid := browserSessionCookieToken(r)
 	if cookieValid {
-		auth, err := h.browserSessions.Store.AuthenticateAndRenew(sessionToken)
+		auth, err := h.browserSessions.Store.AuthenticateAndRenewExpected(
+			sessionToken,
+			clientID,
+			expectedEpoch,
+		)
 		if err == nil {
 			if auth.SetCookie {
 				setBrowserSessionCookie(
@@ -4159,6 +4196,10 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 			writeBrowserSessionMetadata(w, auth.Session)
 			return
 		}
+		if errors.Is(err, ErrBrowserSessionStaleEpoch) {
+			writeBrowserSessionStoreError(w, err)
+			return
+		}
 		if !isBrowserSessionCredentialError(err) {
 			writeBrowserSessionStoreError(w, err)
 			return
@@ -4168,8 +4209,10 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 	if validBrowserSessionMigrationBearer(r, h.authToken) {
 		userAgent := boundedUserAgent(r)
 		credentials, err := h.browserSessions.Store.Create(BrowserSessionCreate{
-			DeviceLabel: browserSessionDeviceLabel(userAgent),
-			UserAgent:   userAgent,
+			ClientID:      clientID,
+			ExpectedEpoch: expectedEpoch,
+			DeviceLabel:   browserSessionDeviceLabel(userAgent),
+			UserAgent:     userAgent,
 		})
 		if err != nil {
 			writeBrowserSessionStoreError(w, err)
@@ -4185,6 +4228,18 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 		return
 	}
 
+	family, err := h.browserSessions.Store.ReadClientEpoch(clientID)
+	if err != nil {
+		writeBrowserSessionStoreError(w, err)
+		return
+	}
+	if family.Epoch != expectedEpoch {
+		writeBrowserSessionStaleEpoch(w, &BrowserSessionStaleEpochError{
+			ClientID:     clientID,
+			CurrentEpoch: family.Epoch,
+		})
+		return
+	}
 	if cookiePresent {
 		clearBrowserSessionCookie(w)
 	}
@@ -4222,14 +4277,81 @@ func clearBrowserSessionCookie(w http.ResponseWriter) {
 	})
 }
 
-func writeBrowserSessionStoreError(w http.ResponseWriter, _ error) {
+func writeBrowserSessionStoreError(w http.ResponseWriter, err error) {
+	var stale *BrowserSessionStaleEpochError
+	if errors.As(err, &stale) {
+		writeBrowserSessionStaleEpoch(w, stale)
+		return
+	}
+	if errors.Is(err, ErrBrowserSessionClientUninitialized) {
+		w.Header().Del("Set-Cookie")
+		writeHTTPError(
+			w,
+			http.StatusPreconditionRequired,
+			"browser client is not initialized",
+		)
+		return
+	}
 	writeHTTPError(w, http.StatusServiceUnavailable, "service unavailable")
+}
+
+func writeBrowserSessionStaleEpoch(w http.ResponseWriter, stale *BrowserSessionStaleEpochError) {
+	w.Header().Del("Set-Cookie")
+	writeHTTPJSON(w, http.StatusConflict, map[string]any{
+		"error":     "stale browser session epoch",
+		"client_id": stale.ClientID,
+		"epoch":     stale.CurrentEpoch,
+	})
+}
+
+func browserSessionClientPrecondition(
+	w http.ResponseWriter,
+	r *http.Request,
+	requireEpoch bool,
+) (string, int64, bool) {
+	clientValues := r.Header.Values(browserSessionClientIDHeaderName)
+	if len(clientValues) == 0 {
+		writeHTTPError(w, http.StatusPreconditionRequired, "browser client id is required")
+		return "", 0, false
+	}
+	if len(clientValues) != 1 ||
+		len(clientValues[0]) > maxBrowserSessionClientIDBytes ||
+		validateBrowserSessionClientID(clientValues[0]) != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid browser client id")
+		return "", 0, false
+	}
+	if !requireEpoch {
+		if len(r.Header.Values(browserSessionEpochHeaderName)) != 0 {
+			writeHTTPError(w, http.StatusBadRequest, "browser epoch is not allowed")
+			return "", 0, false
+		}
+		return clientValues[0], 0, true
+	}
+
+	epochValues := r.Header.Values(browserSessionEpochHeaderName)
+	if len(epochValues) == 0 {
+		writeHTTPError(w, http.StatusPreconditionRequired, "browser epoch is required")
+		return "", 0, false
+	}
+	if len(epochValues) != 1 ||
+		len(epochValues[0]) == 0 ||
+		len(epochValues[0]) > maxBrowserSessionEpochBytes {
+		writeHTTPError(w, http.StatusBadRequest, "invalid browser epoch")
+		return "", 0, false
+	}
+	epoch, err := strconv.ParseInt(epochValues[0], 10, 64)
+	if err != nil || epoch <= 0 || strconv.FormatInt(epoch, 10) != epochValues[0] {
+		writeHTTPError(w, http.StatusBadRequest, "invalid browser epoch")
+		return "", 0, false
+	}
+	return clientValues[0], epoch, true
 }
 
 func isBrowserSessionCredentialError(err error) bool {
 	return errors.Is(err, ErrBrowserSessionMissing) ||
 		errors.Is(err, ErrBrowserSessionExpired) ||
-		errors.Is(err, ErrBrowserSessionRevoked)
+		errors.Is(err, ErrBrowserSessionRevoked) ||
+		errors.Is(err, ErrBrowserSessionClientMismatch)
 }
 
 func singleBoundedHeader(r *http.Request, name string, maxBytes int) (string, bool) {

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2175,7 +2176,7 @@ func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
 
 	t.Run("dedicated bearer only", func(t *testing.T) {
 		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 501)
-		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Safari / macOS"})
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Safari / macOS"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2277,7 +2278,7 @@ func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
 
 	t.Run("list exposes bounded public metadata only", func(t *testing.T) {
 		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 504)
-		credentials, err := sessionStore.Create(BrowserSessionCreate{
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{
 			DeviceLabel: "Chrome / Linux",
 			UserAgent:   "private-user-agent-must-not-leak",
 		})
@@ -2306,6 +2307,8 @@ func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
 			"csrf_hash",
 			"user_agent",
 			"cookie",
+			"client_id",
+			"issued_epoch",
 		} {
 			if strings.Contains(body, strings.ToLower(privateValue)) {
 				t.Fatalf("admin list exposed private value %q: %s", privateValue, response.Body.String())
@@ -2324,7 +2327,7 @@ func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
 
 	t.Run("revoke one is immediate and idempotent", func(t *testing.T) {
 		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 505)
-		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Firefox / Linux"})
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Firefox / Linux"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2353,7 +2356,7 @@ func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
 	t.Run("revoke all is counted idempotently and preserves machine bearer", func(t *testing.T) {
 		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 506)
 		for _, label := range []string{"Chrome / macOS", "Safari / iOS"} {
-			if _, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: label}); err != nil {
+			if _, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: label}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -2432,7 +2435,6 @@ func TestKBaseHTTPHandlerBrowserSessionMethodRulesAndAuthorizationRejection(t *t
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 401)
 
 	for _, method := range []string{
-		http.MethodGet,
 		http.MethodHead,
 		http.MethodPut,
 		http.MethodPatch,
@@ -2448,8 +2450,8 @@ func TestKBaseHTTPHandlerBrowserSessionMethodRulesAndAuthorizationRejection(t *t
 			if response.Code != http.StatusMethodNotAllowed {
 				t.Fatalf("status = %d, want 405; body=%s", response.Code, response.Body.String())
 			}
-			if got := response.Header().Get("Allow"); got != http.MethodPost {
-				t.Fatalf("Allow = %q, want POST", got)
+			if got := response.Header().Get("Allow"); got != http.MethodGet+", "+http.MethodPost {
+				t.Fatalf("Allow = %q, want GET, POST", got)
 			}
 			assertKBaseBrowserSessionNoStore(t, response)
 		})
@@ -2509,6 +2511,7 @@ func TestKBaseHTTPHandlerBrowserSessionProxyConstantTimeBoundaryAndCookieContrac
 
 	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
 	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
 	request.Header.Set(
 		"User-Agent",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
@@ -2551,7 +2554,7 @@ func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
 
 	t.Run("login", func(t *testing.T) {
 		clock := newClock()
-		handler, _ := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
 			t,
 			clock,
 			409,
@@ -2559,6 +2562,7 @@ func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
 		)
 		request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
 		request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+		addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 
@@ -2570,7 +2574,7 @@ func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
 
 	t.Run("bearer_migration", func(t *testing.T) {
 		clock := newClock()
-		handler, _ := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
 			t,
 			clock,
 			410,
@@ -2579,6 +2583,7 @@ func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
 		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 		request.Header.Set("Origin", testBrowserSessionOrigin)
 		request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+		addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 
@@ -2596,7 +2601,7 @@ func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
 			411,
 			configuredTTL,
 		)
-		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Renewed Browser"})
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Renewed Browser"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2604,6 +2609,7 @@ func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
 
 		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 		request.Header.Set("Origin", testBrowserSessionOrigin)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
 		request.AddCookie(&http.Cookie{
 			Name:  "__Host-kbase_session",
 			Value: credentials.Token,
@@ -2667,7 +2673,7 @@ func TestKBaseHTTPHandlerBrowserSessionStoreConflictsAreGenericServiceUnavailabl
 				t.Errorf("close browser session store: %v", err)
 			}
 		})
-		if _, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Existing Browser"}); err != nil {
+		if _, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Existing Browser"}); err != nil {
 			t.Fatal(err)
 		}
 		handler := newKBaseBrowserSessionHTTPTestHandlerForStore(
@@ -2678,6 +2684,7 @@ func TestKBaseHTTPHandlerBrowserSessionStoreConflictsAreGenericServiceUnavailabl
 
 		request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
 		request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+		addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 
@@ -2690,7 +2697,7 @@ func TestKBaseHTTPHandlerBrowserSessionStoreConflictsAreGenericServiceUnavailabl
 			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
 		}
 		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 413)
-		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Renewal Browser"})
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Renewal Browser"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2707,6 +2714,7 @@ func TestKBaseHTTPHandlerBrowserSessionStoreConflictsAreGenericServiceUnavailabl
 
 		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 		request.Header.Set("Origin", testBrowserSessionOrigin)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
 		request.AddCookie(&http.Cookie{
 			Name:  "__Host-kbase_session",
 			Value: credentials.Token,
@@ -2733,6 +2741,7 @@ func TestKBaseHTTPHandlerBrowserSessionDeviceLabelPrivacyAndBounds(t *testing.T)
 
 	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
 	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
 	request.Header.Set("User-Agent", rawUserAgent)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -2843,7 +2852,7 @@ func TestKBaseHTTPHandlerBrowserMigrationValidCookieIsIdempotent(t *testing.T) {
 		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
 	}
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 405)
-	credentials, err := sessionStore.Create(BrowserSessionCreate{
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{
 		DeviceLabel: "Existing Browser",
 		UserAgent:   "existing-agent",
 	})
@@ -2855,6 +2864,7 @@ func TestKBaseHTTPHandlerBrowserMigrationValidCookieIsIdempotent(t *testing.T) {
 		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 		request.Header.Set("Origin", testBrowserSessionOrigin)
 		request.Header.Set("Authorization", "Bearer intentionally-invalid-token")
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
 		request.AddCookie(&http.Cookie{
 			Name:  "__Host-kbase_session",
 			Value: credentials.Token,
@@ -2895,6 +2905,7 @@ func TestKBaseHTTPHandlerBrowserMigrationValidBearerCreatesSession(t *testing.T)
 	request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 	request.Header.Set("Origin", testBrowserSessionOrigin)
 	request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
 	request.Header.Set(
 		"User-Agent",
 		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Version/17.5 Mobile/15E148 Safari/604.1",
@@ -2917,7 +2928,7 @@ func TestKBaseHTTPHandlerBrowserMigrationInvalidCredentialsAreIndistinguishable(
 		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
 	}
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 407)
-	revoked, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Revoked Browser"})
+	revoked, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Revoked Browser"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2948,6 +2959,7 @@ func TestKBaseHTTPHandlerBrowserMigrationInvalidCredentialsAreIndistinguishable(
 		t.Run(testCase.name, func(t *testing.T) {
 			request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 			request.Header.Set("Origin", testBrowserSessionOrigin)
+			addKBaseBrowserSessionHeadersForCredentials(request, revoked)
 			if testCase.authorization != "" {
 				request.Header.Set("Authorization", testCase.authorization)
 			}
@@ -2995,12 +3007,249 @@ func TestKBaseHTTPHandlerBrowserMigrationInvalidCredentialsAreIndistinguishable(
 	assertKBaseBrowserSessionCount(t, sessionStore, 1)
 }
 
+func TestKBaseHTTPHandlerBrowserMigrationCredentialInvalidCookieBearerFallback(t *testing.T) {
+	testCases := []struct {
+		name          string
+		prepareCookie func(
+			*testing.T,
+			*BrowserSessionStore,
+			*browserSessionTestClock,
+		) (string, BrowserClientFamily)
+	}{
+		{
+			name: "unknown cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				_ *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				family, err := store.AcquireClientEpoch("browser_client_unknown_fallback")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return "unknown-session-token", family
+			},
+		},
+		{
+			name: "revoked cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				_ *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+					ClientID: "browser_client_revoked_fallback",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.RevokeByToken(credentials.Token, "test"); err != nil {
+					t.Fatal(err)
+				}
+				return credentials.Token, BrowserClientFamily{
+					ClientID: credentials.Session.ClientID,
+					Epoch:    credentials.Session.IssuedEpoch,
+				}
+			},
+		},
+		{
+			name: "expired cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				clock *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+					ClientID: "browser_client_expired_fallback",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(testBrowserSessionCookieTTL + time.Second)
+				return credentials.Token, BrowserClientFamily{
+					ClientID: credentials.Session.ClientID,
+					Epoch:    credentials.Session.IssuedEpoch,
+				}
+			},
+		},
+		{
+			name: "other family cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				_ *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+					ClientID: "browser_client_mismatch_source",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				requested, err := store.AcquireClientEpoch("browser_client_mismatch_target")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return credentials.Token, requested
+			},
+		},
+	}
+
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+			}
+			handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 700+index)
+			oldToken, family := testCase.prepareCookie(t, store, clock)
+
+			request := newKBaseBrowserCookieRequest(
+				http.MethodPost,
+				"/browser/session/migrate",
+				oldToken,
+				"",
+			)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			request.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+			request.Header.Set(
+				browserSessionEpochHeaderName,
+				strconv.FormatInt(family.Epoch, 10),
+			)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf(
+					"Bearer fallback migration = %d body=%s, want 200",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			replacement := requireKBaseBrowserSessionCookie(t, response)
+			if replacement.Value == "" || replacement.Value == oldToken {
+				t.Fatalf("replacement Cookie = %#v, want a new credential", replacement)
+			}
+			session, err := store.Authenticate(replacement.Value)
+			if err != nil {
+				t.Fatalf("replacement Cookie authentication = %v", err)
+			}
+			if session.ClientID != family.ClientID || session.IssuedEpoch != family.Epoch {
+				t.Fatalf(
+					"replacement session family = (%q, %d), want (%q, %d)",
+					session.ClientID,
+					session.IssuedEpoch,
+					family.ClientID,
+					family.Epoch,
+				)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationCredentialInvalidCookiePrecedence(t *testing.T) {
+	t.Run("invalid Bearer clears invalid Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 30, 0, 0, time.UTC),
+		}
+		handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 703)
+		family, err := store.AcquireClientEpoch("browser_client_invalid_fallback")
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			"unknown-session-token",
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer invalid-token")
+		request.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+		request.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch, 10))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+	})
+
+	t.Run("invalid Bearer clears other family Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 40, 0, 0, time.UTC),
+		}
+		handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 705)
+		credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+			ClientID: "browser_client_mismatch_invalid_source",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		requested, err := store.AcquireClientEpoch("browser_client_mismatch_invalid_target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			credentials.Token,
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer invalid-token")
+		request.Header.Set(browserSessionClientIDHeaderName, requested.ClientID)
+		request.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(requested.Epoch, 10))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+	})
+
+	t.Run("stale epoch beats valid Bearer and Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 45, 0, 0, time.UTC),
+		}
+		handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 704)
+		credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+			ClientID: "browser_client_stale_fallback",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.RevokeAll("admin"); err != nil {
+			t.Fatal(err)
+		}
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			credentials.Token,
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusConflict {
+			t.Fatalf("stale migration = %d body=%s, want 409", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserClientMetadata(
+			t,
+			response,
+			credentials.Session.ClientID,
+			credentials.Session.IssuedEpoch+1,
+		)
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("stale migration set Cookie: %#v", got)
+		}
+	})
+}
+
 func TestKBaseHTTPHandlerBrowserMigrationUnavailableDoesNotClearCookie(t *testing.T) {
 	clock := &browserSessionTestClock{
 		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
 	}
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 408)
-	credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Unavailable Browser"})
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Unavailable Browser"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3010,6 +3259,7 @@ func TestKBaseHTTPHandlerBrowserMigrationUnavailableDoesNotClearCookie(t *testin
 
 	request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
 	request.Header.Set("Origin", testBrowserSessionOrigin)
+	addKBaseBrowserSessionHeadersForCredentials(request, credentials)
 	request.AddCookie(&http.Cookie{
 		Name:  "__Host-kbase_session",
 		Value: credentials.Token,
@@ -3674,6 +3924,13 @@ func TestKBaseHTTPHandlerBrowserSessionStatus(t *testing.T) {
 				result.response.Body.String(),
 			)
 		}
+		assertKBaseBrowserClientMetadata(
+			t,
+			result.response,
+			credentials.Session.ClientID,
+			credentials.Session.IssuedEpoch,
+		)
+		assertKBaseBrowserClientMetadataIsTopLevelOnly(t, result.response)
 		token, expiresAt := decodeKBaseBrowserSessionCSRFResponse(
 			t, result.response, credentials.Token,
 		)
@@ -3881,6 +4138,403 @@ func TestKBaseHTTPHandlerBrowserLogout(t *testing.T) {
 	})
 }
 
+func TestKBaseHTTPHandlerBrowserSessionClientEpochPreconditions(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 45, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 611)
+	const clientID = "browser_client_http_01"
+
+	acquire := httptest.NewRequest(http.MethodGet, "/browser/session", nil)
+	acquire.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	acquire.Header.Set(browserSessionClientIDHeaderName, clientID)
+	acquireResponse := httptest.NewRecorder()
+	handler.ServeHTTP(acquireResponse, acquire)
+	if acquireResponse.Code != http.StatusOK {
+		t.Fatalf("client epoch GET = %d body=%s", acquireResponse.Code, acquireResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, acquireResponse, clientID, 1)
+	if got := acquireResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("client epoch GET set Cookie: %#v", got)
+	}
+
+	missing := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	missing.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusPreconditionRequired {
+		t.Fatalf("login without client precondition = %d, want 428", missingResponse.Code)
+	}
+	if got := missingResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("login without client precondition set Cookie: %#v", got)
+	}
+
+	login := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	login.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	login.Header.Set(browserSessionClientIDHeaderName, clientID)
+	login.Header.Set(browserSessionEpochHeaderName, "1")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, login)
+	if loginResponse.Code != http.StatusOK {
+		t.Fatalf("epoch login = %d body=%s", loginResponse.Code, loginResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, loginResponse, clientID, 1)
+	assertKBaseBrowserClientMetadataIsTopLevelOnly(t, loginResponse)
+	requireKBaseBrowserSessionCookie(t, loginResponse)
+
+	if _, err := sessionStore.RevokeAll("admin"); err != nil {
+		t.Fatal(err)
+	}
+	stale := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	stale.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	stale.Header.Set(browserSessionClientIDHeaderName, clientID)
+	stale.Header.Set(browserSessionEpochHeaderName, "1")
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf("stale epoch login = %d body=%s, want 409", staleResponse.Code, staleResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, staleResponse, clientID, 2)
+	if got := staleResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("stale epoch login set Cookie: %#v", got)
+	}
+
+	fresh := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	fresh.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	fresh.Header.Set(browserSessionClientIDHeaderName, clientID)
+	fresh.Header.Set(browserSessionEpochHeaderName, "2")
+	freshResponse := httptest.NewRecorder()
+	handler.ServeHTTP(freshResponse, fresh)
+	if freshResponse.Code != http.StatusOK {
+		t.Fatalf("fresh epoch login = %d body=%s", freshResponse.Code, freshResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, freshResponse, clientID, 2)
+	requireKBaseBrowserSessionCookie(t, freshResponse)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionClientEpochValidation(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 50, 0, 0, time.UTC),
+	}
+	handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 612)
+
+	tests := []struct {
+		name       string
+		method     string
+		clientIDs  []string
+		epochs     []string
+		wantStatus int
+	}{
+		{name: "missing client", method: http.MethodGet, wantStatus: http.StatusPreconditionRequired},
+		{name: "duplicate client", method: http.MethodGet, clientIDs: []string{"browser_client_valid_01", "browser_client_valid_01"}, wantStatus: http.StatusBadRequest},
+		{name: "short client", method: http.MethodGet, clientIDs: []string{"too-short"}, wantStatus: http.StatusBadRequest},
+		{name: "oversized client", method: http.MethodGet, clientIDs: []string{strings.Repeat("a", maxBrowserSessionClientIDBytes+1)}, wantStatus: http.StatusBadRequest},
+		{name: "non ascii client", method: http.MethodGet, clientIDs: []string{"browser_client_浏览器_01"}, wantStatus: http.StatusBadRequest},
+		{name: "invalid client punctuation", method: http.MethodGet, clientIDs: []string{"browser.client.valid.01"}, wantStatus: http.StatusBadRequest},
+		{name: "epoch on GET", method: http.MethodGet, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"1"}, wantStatus: http.StatusBadRequest},
+		{name: "missing epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, wantStatus: http.StatusPreconditionRequired},
+		{name: "duplicate epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"1", "1"}, wantStatus: http.StatusBadRequest},
+		{name: "zero epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"0"}, wantStatus: http.StatusBadRequest},
+		{name: "signed epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"+1"}, wantStatus: http.StatusBadRequest},
+		{name: "leading zero epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"01"}, wantStatus: http.StatusBadRequest},
+		{name: "non ascii epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"１"}, wantStatus: http.StatusBadRequest},
+		{name: "oversized epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{strings.Repeat("9", maxBrowserSessionEpochBytes+1)}, wantStatus: http.StatusBadRequest},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(testCase.method, "/browser/session", nil)
+			request.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+			for _, value := range testCase.clientIDs {
+				request.Header.Add(browserSessionClientIDHeaderName, value)
+			}
+			for _, value := range testCase.epochs {
+				request.Header.Add(browserSessionEpochHeaderName, value)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != testCase.wantStatus {
+				t.Fatalf("status = %d body=%s, want %d", response.Code, response.Body.String(), testCase.wantStatus)
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("invalid precondition set Cookie: %#v", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserSessionUninitializedClientIsPreconditionRequired(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 52, 0, 0, time.UTC),
+	}
+	handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 617)
+	const clientID = "browser_client_http_uninitialized"
+
+	testCases := []struct {
+		name    string
+		path    string
+		headers map[string]string
+	}{
+		{
+			name: "login",
+			path: "/browser/session",
+			headers: map[string]string{
+				browserSessionProxyHeaderName: testBrowserSessionSecret,
+			},
+		},
+		{
+			name: "Bearer migration",
+			path: "/browser/session/migrate",
+			headers: map[string]string{
+				"Origin":        testBrowserSessionOrigin,
+				"Authorization": "Bearer " + testKBaseAuthToken,
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, testCase.path, nil)
+			for name, value := range testCase.headers {
+				request.Header.Set(name, value)
+			}
+			request.Header.Set(browserSessionClientIDHeaderName, clientID)
+			request.Header.Set(browserSessionEpochHeaderName, "1")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusPreconditionRequired ||
+				response.Body.String() != "{\"error\":\"browser client is not initialized\"}\n" {
+				t.Fatalf(
+					"uninitialized response = %d body=%q, want 428",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("uninitialized response set Cookie: %#v", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationStaleEpochDoesNotSetCookie(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 55, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 613)
+	missing := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	missing.Header.Set("Origin", testBrowserSessionOrigin)
+	missing.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusPreconditionRequired {
+		t.Fatalf("migration without client precondition = %d, want 428", missingResponse.Code)
+	}
+	if got := missingResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("migration without client precondition set Cookie: %#v", got)
+	}
+
+	family, err := sessionStore.AcquireClientEpoch("browser_client_migrate_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.RevokeAll("admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	stale.Header.Set("Origin", testBrowserSessionOrigin)
+	stale.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	stale.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+	stale.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch, 10))
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf("stale migration = %d body=%s, want 409", staleResponse.Code, staleResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, staleResponse, family.ClientID, family.Epoch+1)
+	if got := staleResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("stale migration set Cookie: %#v", got)
+	}
+
+	fresh := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	fresh.Header.Set("Origin", testBrowserSessionOrigin)
+	fresh.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	fresh.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+	fresh.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch+1, 10))
+	freshResponse := httptest.NewRecorder()
+	handler.ServeHTTP(freshResponse, fresh)
+	if freshResponse.Code != http.StatusOK {
+		t.Fatalf("fresh migration = %d body=%s", freshResponse.Code, freshResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, freshResponse, family.ClientID, family.Epoch+1)
+	requireKBaseBrowserSessionCookie(t, freshResponse)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationExpectedAuthLinearizesWithFence(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 58, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 615)
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{
+		ClientID: "browser_client_migrate_linear",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenceStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            sessionStore.DBPath(),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(616, 64)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fenceStore.Close()
+	clock.Advance(5 * time.Minute)
+
+	insideAuth := make(chan struct{})
+	releaseAuth := make(chan struct{})
+	sessionStore.expectedAuthBeforeCommit = func() {
+		close(insideAuth)
+		<-releaseAuth
+	}
+	migrateResponse := httptest.NewRecorder()
+	migrateDone := make(chan struct{})
+	go func() {
+		defer close(migrateDone)
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			credentials.Token,
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		handler.ServeHTTP(migrateResponse, request)
+	}()
+	<-insideAuth
+
+	fenceStarted := make(chan struct{})
+	fenceResult := make(chan error, 1)
+	go func() {
+		close(fenceStarted)
+		_, err := fenceStore.FenceClientBySession(credentials.Session.ID, "logout")
+		fenceResult <- err
+	}()
+	<-fenceStarted
+	close(releaseAuth)
+	<-migrateDone
+	if migrateResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"auth-first migration = %d body=%s, want 200",
+			migrateResponse.Code,
+			migrateResponse.Body.String(),
+		)
+	}
+	requireKBaseBrowserSessionCookie(t, migrateResponse)
+	if err := <-fenceResult; err != nil {
+		t.Fatalf("concurrent fence error = %v", err)
+	}
+	if _, err := sessionStore.Authenticate(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("auth-first response credential = %v, want revoked after fence", err)
+	}
+	sessionStore.expectedAuthBeforeCommit = nil
+
+	stale := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/browser/session/migrate",
+		credentials.Token,
+		"",
+	)
+	stale.Header.Set("Origin", testBrowserSessionOrigin)
+	addKBaseBrowserSessionHeadersForCredentials(stale, credentials)
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf(
+			"fence-first migration = %d body=%s, want 409",
+			staleResponse.Code,
+			staleResponse.Body.String(),
+		)
+	}
+	if got := staleResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("fence-first migration set Cookie: %#v", got)
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserLogoutFencesFamilyAndAllowsNewEpoch(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 23, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 614)
+	family, err := sessionStore.AcquireClientEpoch("browser_client_logout_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: family.ClientID, ExpectedEpoch: family.Epoch, DeviceLabel: "First tab",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: family.ClientID, ExpectedEpoch: family.Epoch, DeviceLabel: "Second tab",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFamily, err := sessionStore.AcquireClientEpoch("browser_client_other_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: otherFamily.ClientID, ExpectedEpoch: otherFamily.Epoch, DeviceLabel: "Other device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrfToken, _, err := sessionStore.IssueCSRF(first.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logout := newKBaseBrowserCookieRequest(
+		http.MethodPost, "/api/browser/session/logout", first.Token, "",
+	)
+	addKBaseBrowserSessionSecurityHeaders(logout, csrfToken)
+	logoutResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logoutResponse, logout)
+	if logoutResponse.Code != http.StatusNoContent {
+		t.Fatalf("family logout = %d body=%s", logoutResponse.Code, logoutResponse.Body.String())
+	}
+	for _, credentials := range []BrowserSessionCredentials{first, second} {
+		if _, err := sessionStore.Authenticate(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("same-family session after logout = %v, want revoked", err)
+		}
+	}
+	if _, err := sessionStore.Authenticate(other.Token); err != nil {
+		t.Fatalf("different-family session after logout = %v, want active", err)
+	}
+
+	next, err := sessionStore.ReadClientEpoch(family.ClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: next.ClientID, ExpectedEpoch: next.Epoch, DeviceLabel: "New login",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.Authenticate(fresh.Token); err != nil {
+		t.Fatalf("new-epoch session = %v, want active", err)
+	}
+}
+
 func TestKBaseHTTPHandlerBearerCompatibility(t *testing.T) {
 	clock := &browserSessionTestClock{
 		now: time.Date(2026, time.July, 28, 23, 0, 0, 0, time.UTC),
@@ -4031,13 +4685,97 @@ func TestKBaseHTTPHandlerBearerCompatibility(t *testing.T) {
 	}
 }
 
+func assertKBaseBrowserClientMetadata(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantClientID string,
+	wantEpoch int64,
+) {
+	t.Helper()
+	var body struct {
+		ClientID string `json:"client_id"`
+		Epoch    int64  `json:"epoch"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode browser client metadata: %v body=%s", err, response.Body.String())
+	}
+	if body.ClientID != wantClientID || body.Epoch != wantEpoch {
+		t.Fatalf(
+			"browser client metadata = (%q, %d), want (%q, %d)",
+			body.ClientID,
+			body.Epoch,
+			wantClientID,
+			wantEpoch,
+		)
+	}
+}
+
+func assertKBaseBrowserClientMetadataIsTopLevelOnly(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode browser session response: %v", err)
+	}
+	session, ok := body["session"].(map[string]any)
+	if !ok {
+		t.Fatalf("browser session response has no public session object: %#v", body)
+	}
+	for _, field := range []string{"client_id", "issued_epoch"} {
+		if _, exists := session[field]; exists {
+			t.Fatalf("browser session nested public metadata exposed %q", field)
+		}
+	}
+	if _, ok := body["client_id"].(string); !ok {
+		t.Fatal("browser session response missing top-level client_id")
+	}
+	if _, ok := body["epoch"].(float64); !ok {
+		t.Fatal("browser session response missing top-level epoch")
+	}
+}
+
+func addKBaseBrowserSessionClientHeaders(
+	t *testing.T,
+	request *http.Request,
+	sessionStore *BrowserSessionStore,
+	clientID string,
+) BrowserClientFamily {
+	t.Helper()
+	if clientID == "" {
+		clientID = fmt.Sprintf(
+			"http_client_%016x",
+			browserSessionTestClientSequence.Add(1),
+		)
+	}
+	family, err := sessionStore.AcquireClientEpoch(clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+	request.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch, 10))
+	return family
+}
+
+func addKBaseBrowserSessionHeadersForCredentials(
+	request *http.Request,
+	credentials BrowserSessionCredentials,
+) {
+	request.Header.Set(browserSessionClientIDHeaderName, credentials.Session.ClientID)
+	request.Header.Set(
+		browserSessionEpochHeaderName,
+		strconv.FormatInt(credentials.Session.IssuedEpoch, 10),
+	)
+}
+
 func createKBaseBrowserSessionHTTPTestCredentials(
 	t *testing.T,
 	sessionStore *BrowserSessionStore,
 	deviceLabel string,
 ) BrowserSessionCredentials {
 	t.Helper()
-	credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: deviceLabel})
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: deviceLabel})
 	if err != nil {
 		t.Fatal(err)
 	}

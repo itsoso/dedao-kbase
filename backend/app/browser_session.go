@@ -21,24 +21,31 @@ import (
 )
 
 const (
-	defaultBrowserSessionTTL             = 30 * 24 * time.Hour
-	defaultBrowserSessionRenewalInterval = 5 * time.Minute
-	defaultBrowserSessionMaxActive       = 10
-	browserSessionCSRFTTL                = 15 * time.Minute
-	browserSessionCredentialBytes        = 32
-	browserSessionSchemaVersion          = 1
-	browserSessionTimeLayout             = "2006-01-02T15:04:05.000000000Z07:00"
+	defaultBrowserSessionTTL                   = 30 * 24 * time.Hour
+	defaultBrowserSessionRenewalInterval       = 5 * time.Minute
+	defaultBrowserSessionMaxActive             = 10
+	browserSessionCSRFTTL                      = 15 * time.Minute
+	browserSessionCredentialBytes              = 32
+	browserSessionSchemaVersion                = 2
+	browserSessionTimeLayout                   = "2006-01-02T15:04:05.000000000Z07:00"
+	minBrowserSessionClientIDBytes             = 16
+	maxBrowserSessionClientIDBytes             = 128
+	maxBrowserSessionEpoch               int64 = 1<<63 - 1
 )
 
 var (
-	ErrBrowserSessionMissing         = errors.New("browser session missing")
-	ErrBrowserSessionExpired         = errors.New("browser session expired")
-	ErrBrowserSessionRevoked         = errors.New("browser session revoked")
-	ErrBrowserSessionConflict        = errors.New("browser session conflict")
-	ErrBrowserSessionUnavailable     = errors.New("browser session unavailable")
-	ErrBrowserSessionInvalidArgument = errors.New("browser session invalid argument")
-	ErrBrowserSessionCSRFInvalid     = errors.New("browser session CSRF invalid")
-	ErrBrowserSessionCSRFExpired     = errors.New("browser session CSRF expired")
+	ErrBrowserSessionMissing             = errors.New("browser session missing")
+	ErrBrowserSessionExpired             = errors.New("browser session expired")
+	ErrBrowserSessionRevoked             = errors.New("browser session revoked")
+	ErrBrowserSessionConflict            = errors.New("browser session conflict")
+	ErrBrowserSessionUnavailable         = errors.New("browser session unavailable")
+	ErrBrowserSessionInvalidArgument     = errors.New("browser session invalid argument")
+	ErrBrowserSessionCSRFInvalid         = errors.New("browser session CSRF invalid")
+	ErrBrowserSessionCSRFExpired         = errors.New("browser session CSRF expired")
+	ErrBrowserSessionStaleEpoch          = errors.New("browser session stale client epoch")
+	ErrBrowserSessionClientUninitialized = errors.New("browser session client is not initialized")
+	ErrBrowserSessionClientMismatch      = errors.New("browser session client mismatch")
+	ErrBrowserSessionEpochExhausted      = errors.New("browser session client epoch exhausted")
 )
 
 type BrowserSessionStoreConfig struct {
@@ -52,6 +59,8 @@ type BrowserSessionStoreConfig struct {
 
 type BrowserSession struct {
 	ID           string     `json:"id"`
+	ClientID     string     `json:"-"`
+	IssuedEpoch  int64      `json:"-"`
 	DeviceLabel  string     `json:"device_label"`
 	CreatedAt    time.Time  `json:"created_at"`
 	LastActiveAt time.Time  `json:"last_active_at"`
@@ -74,8 +83,56 @@ type BrowserSessionAuth struct {
 }
 
 type BrowserSessionCreate struct {
-	DeviceLabel string
-	UserAgent   string
+	ClientID      string
+	ExpectedEpoch int64
+	DeviceLabel   string
+	UserAgent     string
+}
+
+type BrowserClientFamily struct {
+	ClientID string `json:"client_id"`
+	Epoch    int64  `json:"epoch"`
+}
+
+type BrowserSessionStaleEpochError struct {
+	ClientID     string
+	CurrentEpoch int64
+}
+
+func (e *BrowserSessionStaleEpochError) Error() string {
+	return fmt.Sprintf(
+		"browser client %q epoch is stale; current epoch is %d",
+		e.ClientID,
+		e.CurrentEpoch,
+	)
+}
+
+func (e *BrowserSessionStaleEpochError) Unwrap() error {
+	return ErrBrowserSessionStaleEpoch
+}
+
+type BrowserSessionClientUninitializedError struct {
+	ClientID string
+}
+
+func (e *BrowserSessionClientUninitializedError) Error() string {
+	return fmt.Sprintf("browser client %q is not initialized", e.ClientID)
+}
+
+func (e *BrowserSessionClientUninitializedError) Unwrap() error {
+	return ErrBrowserSessionClientUninitialized
+}
+
+type BrowserSessionClientMismatchError struct {
+	ClientID string
+}
+
+func (e *BrowserSessionClientMismatchError) Error() string {
+	return fmt.Sprintf("browser session does not belong to client %q", e.ClientID)
+}
+
+func (e *BrowserSessionClientMismatchError) Unwrap() error {
+	return ErrBrowserSessionClientMismatch
 }
 
 type BrowserSessionStore struct {
@@ -88,6 +145,9 @@ type BrowserSessionStore struct {
 	db              *sql.DB
 	mu              sync.Mutex
 	closed          bool
+
+	// Tests use this hook to hold the expected-auth transaction before commit.
+	expectedAuthBeforeCommit func()
 }
 
 func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionStore, error) {
@@ -199,6 +259,85 @@ func (s *BrowserSessionStore) Close() error {
 	return nil
 }
 
+func (s *BrowserSessionStore) AcquireClientEpoch(clientID string) (BrowserClientFamily, error) {
+	if err := validateBrowserSessionClientID(clientID); err != nil {
+		return BrowserClientFamily{}, err
+	}
+	if s == nil {
+		return BrowserClientFamily{}, fmt.Errorf(
+			"acquire browser client epoch: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return BrowserClientFamily{}, fmt.Errorf(
+			"acquire browser client epoch: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	now := formatBrowserSessionTime(s.now().UTC())
+	family := BrowserClientFamily{ClientID: clientID}
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(context.Background(), `
+			INSERT INTO browser_client_families (client_id, epoch, created_at, updated_at)
+			VALUES (?, 1, ?, ?)
+			ON CONFLICT(client_id) DO NOTHING
+		`, clientID, now, now); err != nil {
+			return classifyBrowserSessionStoreError("initialize browser client family", err)
+		}
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT epoch FROM browser_client_families WHERE client_id = ?`,
+			clientID,
+		).Scan(&family.Epoch); err != nil {
+			return classifyBrowserSessionStoreError("read browser client epoch", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return BrowserClientFamily{}, fmt.Errorf("acquire browser client epoch: %w", err)
+	}
+	return family, nil
+}
+
+func (s *BrowserSessionStore) ReadClientEpoch(clientID string) (BrowserClientFamily, error) {
+	if err := validateBrowserSessionClientID(clientID); err != nil {
+		return BrowserClientFamily{}, err
+	}
+	if s == nil {
+		return BrowserClientFamily{}, fmt.Errorf(
+			"read browser client epoch: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return BrowserClientFamily{}, fmt.Errorf(
+			"read browser client epoch: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	family := BrowserClientFamily{ClientID: clientID}
+	if err := s.db.QueryRow(
+		`SELECT epoch FROM browser_client_families WHERE client_id = ?`,
+		clientID,
+	).Scan(&family.Epoch); errors.Is(err, sql.ErrNoRows) {
+		return BrowserClientFamily{}, fmt.Errorf("read browser client epoch: %w", &BrowserSessionClientUninitializedError{
+			ClientID: clientID,
+		})
+	} else if err != nil {
+		return BrowserClientFamily{}, classifyBrowserSessionStoreError(
+			"read browser client epoch",
+			err,
+		)
+	}
+	return family, nil
+}
+
 func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSessionCredentials, error) {
 	if s == nil {
 		return BrowserSessionCredentials{}, fmt.Errorf(
@@ -212,6 +351,15 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 		return BrowserSessionCredentials{}, fmt.Errorf(
 			"create browser session: browser session store is closed: %w",
 			ErrBrowserSessionUnavailable,
+		)
+	}
+	if err := validateBrowserSessionClientID(input.ClientID); err != nil {
+		return BrowserSessionCredentials{}, fmt.Errorf("create browser session: %w", err)
+	}
+	if input.ExpectedEpoch <= 0 {
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"create browser session: expected client epoch must be positive: %w",
+			ErrBrowserSessionInvalidArgument,
 		)
 	}
 
@@ -246,6 +394,8 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 	csrfExpiresAt := now.Add(browserSessionCSRFTTL)
 	session := BrowserSession{
 		ID:           "session_" + base64.RawURLEncoding.EncodeToString(tokenHash[:18]),
+		ClientID:     input.ClientID,
+		IssuedEpoch:  input.ExpectedEpoch,
 		DeviceLabel:  strings.TrimSpace(input.DeviceLabel),
 		CreatedAt:    now,
 		LastActiveAt: now,
@@ -253,6 +403,23 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 	}
 
 	err = s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		var currentEpoch int64
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT epoch FROM browser_client_families WHERE client_id = ?`,
+			input.ClientID,
+		).Scan(&currentEpoch); errors.Is(err, sql.ErrNoRows) {
+			return &BrowserSessionClientUninitializedError{ClientID: input.ClientID}
+		} else if err != nil {
+			return classifyBrowserSessionStoreError("read browser client epoch before create", err)
+		}
+		if currentEpoch != input.ExpectedEpoch {
+			return &BrowserSessionStaleEpochError{
+				ClientID:     input.ClientID,
+				CurrentEpoch: currentEpoch,
+			}
+		}
+
 		var collisions int
 		if err := conn.QueryRowContext(
 			context.Background(),
@@ -316,12 +483,14 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 
 		_, err := conn.ExecContext(context.Background(), `
 			INSERT INTO browser_sessions (
-				id, token_hash, csrf_hash, csrf_expires_at, device_label,
+				id, client_id, issued_epoch, token_hash, csrf_hash, csrf_expires_at, device_label,
 				user_agent_hash, created_at, last_active_at, expires_at,
 				revoked_at, revoke_reason
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
 		`,
 			session.ID,
+			session.ClientID,
+			session.IssuedEpoch,
 			tokenHash[:],
 			csrfHash[:],
 			formatBrowserSessionTime(csrfExpiresAt),
@@ -469,6 +638,143 @@ func (s *BrowserSessionStore) AuthenticateAndRenew(token string) (BrowserSession
 				renewalCredentialErr,
 			)
 		}
+	}
+
+	auth.Session.LastActiveAt = now
+	auth.Session.ExpiresAt = now.Add(s.ttl)
+	return auth, nil
+}
+
+func (s *BrowserSessionStore) AuthenticateAndRenewExpected(
+	token string,
+	clientID string,
+	expectedEpoch int64,
+) (BrowserSessionAuth, error) {
+	if s == nil {
+		return BrowserSessionAuth{}, fmt.Errorf(
+			"authenticate expected browser session: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	if err := validateBrowserSessionClientID(clientID); err != nil {
+		return BrowserSessionAuth{}, fmt.Errorf("authenticate expected browser session: %w", err)
+	}
+	if expectedEpoch <= 0 {
+		return BrowserSessionAuth{}, fmt.Errorf(
+			"authenticate expected browser session: expected client epoch must be positive: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return BrowserSessionAuth{}, fmt.Errorf(
+			"authenticate expected browser session: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	tokenHash := sha256.Sum256([]byte(token))
+	now := s.now().UTC()
+	auth := BrowserSessionAuth{}
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		var currentEpoch int64
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT epoch FROM browser_client_families WHERE client_id = ?`,
+			clientID,
+		).Scan(&currentEpoch); errors.Is(err, sql.ErrNoRows) {
+			return &BrowserSessionClientUninitializedError{ClientID: clientID}
+		} else if err != nil {
+			return classifyBrowserSessionStoreError(
+				"read browser client epoch before expected authentication",
+				err,
+			)
+		}
+		if currentEpoch != expectedEpoch {
+			return &BrowserSessionStaleEpochError{
+				ClientID:     clientID,
+				CurrentEpoch: currentEpoch,
+			}
+		}
+
+		record, err := readBrowserSessionByToken(context.Background(), conn, tokenHash[:])
+		if err != nil {
+			return err
+		}
+		if err := validateBrowserSessionActive(record.session, now); err != nil {
+			return err
+		}
+		if record.session.ClientID != clientID ||
+			record.session.IssuedEpoch != expectedEpoch {
+			return &BrowserSessionClientMismatchError{ClientID: clientID}
+		}
+
+		auth = BrowserSessionAuth{
+			Session:         record.session,
+			CookieExpiresAt: record.session.ExpiresAt,
+		}
+		if !now.Before(record.session.LastActiveAt.Add(s.renewalInterval)) {
+			expiresAt := now.Add(s.ttl)
+			result, err := conn.ExecContext(context.Background(), `
+				UPDATE browser_sessions
+				SET last_active_at = ?, expires_at = ?
+				WHERE id = ? AND client_id = ? AND issued_epoch = ?
+					AND revoked_at = '' AND expires_at > ?
+			`,
+				formatBrowserSessionTime(now),
+				formatBrowserSessionTime(expiresAt),
+				record.session.ID,
+				clientID,
+				expectedEpoch,
+				formatBrowserSessionTime(now),
+			)
+			if err != nil {
+				return classifyBrowserSessionStoreError(
+					"renew expected browser session",
+					err,
+				)
+			}
+			updated, err := result.RowsAffected()
+			if err != nil {
+				return classifyBrowserSessionStoreError(
+					"read renewed expected browser session count",
+					err,
+				)
+			}
+			if updated != 1 {
+				return fmt.Errorf(
+					"renew expected browser session: %w",
+					ErrBrowserSessionConflict,
+				)
+			}
+			renewed, err := readBrowserSessionByToken(
+				context.Background(),
+				conn,
+				tokenHash[:],
+			)
+			if err != nil {
+				return err
+			}
+			if err := validateBrowserSessionActive(renewed.session, now); err != nil {
+				return err
+			}
+			auth.Renewed = true
+			auth.SetCookie = true
+			auth.Session = renewed.session
+			auth.CookieExpiresAt = renewed.session.ExpiresAt
+		}
+		if s.expectedAuthBeforeCommit != nil {
+			s.expectedAuthBeforeCommit()
+		}
+		return nil
+	})
+	if err != nil {
+		return BrowserSessionAuth{}, fmt.Errorf(
+			"authenticate expected browser session: %w",
+			err,
+		)
 	}
 
 	auth.Session.LastActiveAt = now
@@ -727,6 +1033,75 @@ func (s *BrowserSessionStore) RevokeByToken(token, reason string) error {
 	return nil
 }
 
+func (s *BrowserSessionStore) FenceClientBySession(
+	id string,
+	reason string,
+) (BrowserClientFamily, error) {
+	if s == nil {
+		return BrowserClientFamily{}, fmt.Errorf(
+			"fence browser client family: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return BrowserClientFamily{}, fmt.Errorf(
+			"fence browser client family: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	now := formatBrowserSessionTime(s.now().UTC())
+	family := BrowserClientFamily{}
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		var issuedEpoch int64
+		if err := conn.QueryRowContext(context.Background(), `
+			SELECT client_id, issued_epoch
+			FROM browser_sessions
+			WHERE id = ?
+		`, id).Scan(&family.ClientID, &issuedEpoch); errors.Is(err, sql.ErrNoRows) {
+			return ErrBrowserSessionMissing
+		} else if err != nil {
+			return classifyBrowserSessionStoreError("read browser session family", err)
+		}
+
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT epoch FROM browser_client_families WHERE client_id = ?`,
+			family.ClientID,
+		).Scan(&family.Epoch); err != nil {
+			return classifyBrowserSessionStoreError("read browser client epoch before fence", err)
+		}
+		if family.Epoch == maxBrowserSessionEpoch ||
+			issuedEpoch == maxBrowserSessionEpoch {
+			return ErrBrowserSessionEpochExhausted
+		}
+		if family.Epoch <= issuedEpoch {
+			family.Epoch = issuedEpoch + 1
+			if _, err := conn.ExecContext(context.Background(), `
+				UPDATE browser_client_families
+				SET epoch = ?, updated_at = ?
+				WHERE client_id = ? AND epoch <= ?
+			`, family.Epoch, now, family.ClientID, issuedEpoch); err != nil {
+				return classifyBrowserSessionStoreError("advance browser client epoch", err)
+			}
+		}
+		if _, err := conn.ExecContext(context.Background(), `
+			UPDATE browser_sessions
+			SET revoked_at = ?, revoke_reason = ?
+			WHERE client_id = ? AND issued_epoch < ? AND revoked_at = ''
+		`, now, strings.TrimSpace(reason), family.ClientID, family.Epoch); err != nil {
+			return classifyBrowserSessionStoreError("revoke browser client family sessions", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return BrowserClientFamily{}, fmt.Errorf("fence browser client family: %w", err)
+	}
+	return family, nil
+}
+
 func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
 	if s == nil {
 		return 0, fmt.Errorf(
@@ -742,17 +1117,45 @@ func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
 			ErrBrowserSessionUnavailable,
 		)
 	}
-	result, err := s.db.Exec(`
-		UPDATE browser_sessions
-		SET revoked_at = ?, revoke_reason = ?
-		WHERE revoked_at = ''
-	`, formatBrowserSessionTime(s.now().UTC()), strings.TrimSpace(reason))
+	var updated int64
+	now := formatBrowserSessionTime(s.now().UTC())
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		var exhausted int
+		if err := conn.QueryRowContext(context.Background(), `
+			SELECT COUNT(*)
+			FROM browser_client_families
+			WHERE epoch >= ?
+		`, maxBrowserSessionEpoch).Scan(&exhausted); err != nil {
+			return classifyBrowserSessionStoreError(
+				"check browser client epoch exhaustion",
+				err,
+			)
+		}
+		if exhausted != 0 {
+			return ErrBrowserSessionEpochExhausted
+		}
+		if _, err := conn.ExecContext(context.Background(), `
+			UPDATE browser_client_families
+			SET epoch = epoch + 1, updated_at = ?
+		`, now); err != nil {
+			return classifyBrowserSessionStoreError("advance all browser client epochs", err)
+		}
+		result, err := conn.ExecContext(context.Background(), `
+			UPDATE browser_sessions
+			SET revoked_at = ?, revoke_reason = ?
+			WHERE revoked_at = ''
+		`, now, strings.TrimSpace(reason))
+		if err != nil {
+			return classifyBrowserSessionStoreError("revoke all browser sessions", err)
+		}
+		updated, err = result.RowsAffected()
+		if err != nil {
+			return classifyBrowserSessionStoreError("read revoked browser session count", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, classifyBrowserSessionStoreError("revoke all browser sessions", err)
-	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return 0, classifyBrowserSessionStoreError("read revoked browser session count", err)
+		return 0, fmt.Errorf("revoke all browser sessions: %w", err)
 	}
 	return updated, nil
 }
@@ -774,7 +1177,7 @@ func (s *BrowserSessionStore) List() ([]BrowserSession, error) {
 	}
 
 	rows, err := s.db.Query(`
-		SELECT id, device_label, created_at, last_active_at, expires_at,
+		SELECT id, client_id, issued_epoch, device_label, created_at, last_active_at, expires_at,
 			revoked_at, revoke_reason
 		FROM browser_sessions
 		ORDER BY created_at DESC, id ASC
@@ -863,7 +1266,7 @@ func readBrowserSessionByToken(
 	tokenHash []byte,
 ) (browserSessionRow, error) {
 	row, err := scanBrowserSessionRow(db.QueryRowContext(ctx, `
-		SELECT id, device_label, created_at, last_active_at, expires_at,
+		SELECT id, client_id, issued_epoch, device_label, created_at, last_active_at, expires_at,
 			revoked_at, revoke_reason, csrf_hash, csrf_expires_at
 		FROM browser_sessions
 		WHERE token_hash = ?
@@ -883,7 +1286,7 @@ func readBrowserSessionByID(
 	id string,
 ) (browserSessionRow, error) {
 	row, err := scanBrowserSessionRow(db.QueryRowContext(ctx, `
-		SELECT id, device_label, created_at, last_active_at, expires_at,
+		SELECT id, client_id, issued_epoch, device_label, created_at, last_active_at, expires_at,
 			revoked_at, revoke_reason, csrf_hash, csrf_expires_at
 		FROM browser_sessions
 		WHERE id = ?
@@ -905,6 +1308,8 @@ func scanBrowserSessionPublic(scanner browserSessionScanner) (BrowserSession, er
 	)
 	if err := scanner.Scan(
 		&session.ID,
+		&session.ClientID,
+		&session.IssuedEpoch,
 		&session.DeviceLabel,
 		&createdAt,
 		&lastActiveAt,
@@ -934,6 +1339,8 @@ func scanBrowserSessionRow(scanner browserSessionScanner) (browserSessionRow, er
 	)
 	if err := scanner.Scan(
 		&row.session.ID,
+		&row.session.ClientID,
+		&row.session.IssuedEpoch,
 		&row.session.DeviceLabel,
 		&createdAt,
 		&lastActiveAt,
@@ -1065,6 +1472,10 @@ func classifyBrowserSessionStoreError(operation string, err error) error {
 		ErrBrowserSessionInvalidArgument,
 		ErrBrowserSessionCSRFInvalid,
 		ErrBrowserSessionCSRFExpired,
+		ErrBrowserSessionStaleEpoch,
+		ErrBrowserSessionClientUninitialized,
+		ErrBrowserSessionClientMismatch,
+		ErrBrowserSessionEpochExhausted,
 	} {
 		if errors.Is(err, sentinel) {
 			return fmt.Errorf("%s: %w", operation, err)
@@ -1100,6 +1511,32 @@ func parseBrowserSessionTime(value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("parse browser session time: value is not canonical UTC nanoseconds")
 	}
 	return parsed, nil
+}
+
+func validateBrowserSessionClientID(clientID string) error {
+	if len(clientID) < minBrowserSessionClientIDBytes ||
+		len(clientID) > maxBrowserSessionClientIDBytes {
+		return fmt.Errorf(
+			"browser client id length must be between %d and %d bytes: %w",
+			minBrowserSessionClientIDBytes,
+			maxBrowserSessionClientIDBytes,
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	for _, value := range []byte(clientID) {
+		if (value >= 'a' && value <= 'z') ||
+			(value >= 'A' && value <= 'Z') ||
+			(value >= '0' && value <= '9') ||
+			value == '_' ||
+			value == '-' {
+			continue
+		}
+		return fmt.Errorf(
+			"browser client id contains invalid characters: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	return nil
 }
 
 func prepareBrowserSessionDirectory(directory string) error {
@@ -1182,25 +1619,49 @@ func migrateBrowserSessionDB(db *sql.DB) error {
 				return fmt.Errorf("rebuild browser session schema version 1: %w", err)
 			}
 		} else {
-			if err := createBrowserSessionTableV1(tx, "browser_sessions"); err != nil {
-				return fmt.Errorf("create browser session schema version 1: %w", err)
+			if err := createBrowserClientFamilyTableV2(tx); err != nil {
+				return fmt.Errorf("create browser client family schema version 2: %w", err)
+			}
+			if err := createBrowserSessionTableV2(tx, "browser_sessions"); err != nil {
+				return fmt.Errorf("create browser session schema version 2: %w", err)
 			}
 			if err := createBrowserSessionActiveIndex(tx); err != nil {
 				return fmt.Errorf("create browser session active index: %w", err)
 			}
 		}
-		if _, err := tx.Exec(`PRAGMA user_version = 1`); err != nil {
-			return fmt.Errorf("set browser session schema version 1: %w", err)
+		if exists {
+			if err := migrateBrowserSessionV1ToV2(tx); err != nil {
+				return fmt.Errorf("migrate browser session schema version 1 to 2: %w", err)
+			}
 		}
-		if err := validateBrowserSessionSchemaV1(tx); err != nil {
-			return fmt.Errorf("validate browser session schema version 1: %w", err)
+		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
+			return fmt.Errorf("set browser session schema version 2: %w", err)
 		}
-	case browserSessionSchemaVersion:
+		if err := validateBrowserSessionSchemaV2(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 2: %w", err)
+		}
+	case 1:
 		if err := validateBrowserSessionSchemaV1(tx); err != nil {
 			return fmt.Errorf("validate browser session schema version 1: %w", err)
 		}
 		if err := normalizeBrowserSessionTimesV1(tx); err != nil {
 			return fmt.Errorf("normalize browser session schema version 1 times: %w", err)
+		}
+		if err := migrateBrowserSessionV1ToV2(tx); err != nil {
+			return fmt.Errorf("migrate browser session schema version 1 to 2: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
+			return fmt.Errorf("set browser session schema version 2: %w", err)
+		}
+		if err := validateBrowserSessionSchemaV2(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 2: %w", err)
+		}
+	case browserSessionSchemaVersion:
+		if err := validateBrowserSessionSchemaV2(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 2: %w", err)
+		}
+		if err := normalizeBrowserSessionTimesV2(tx); err != nil {
+			return fmt.Errorf("normalize browser session schema version 2 times: %w", err)
 		}
 	default:
 		return fmt.Errorf("unsupported browser session database version %d", version)
@@ -1248,6 +1709,150 @@ func createBrowserSessionTableV1(tx *sql.Tx, tableName string) error {
 		return fmt.Errorf("create %s table: %w", tableName, err)
 	}
 	return nil
+}
+
+func createBrowserClientFamilyTableV2(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		CREATE TABLE browser_client_families (
+			client_id TEXT PRIMARY KEY,
+			epoch INTEGER NOT NULL CHECK (epoch >= 1),
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("create browser_client_families table: %w", err)
+	}
+	return nil
+}
+
+func createBrowserSessionTableV2(tx *sql.Tx, tableName string) error {
+	switch tableName {
+	case "browser_sessions", "browser_sessions_v2":
+	default:
+		return fmt.Errorf("unsupported browser session migration table %q", tableName)
+	}
+	statement := fmt.Sprintf(`
+		CREATE TABLE %s (
+			id TEXT PRIMARY KEY,
+			client_id TEXT NOT NULL REFERENCES browser_client_families(client_id),
+			issued_epoch INTEGER NOT NULL CHECK (issued_epoch >= 1),
+			token_hash BLOB NOT NULL UNIQUE,
+			csrf_hash BLOB NOT NULL,
+			csrf_expires_at TEXT NOT NULL,
+			device_label TEXT NOT NULL,
+			user_agent_hash BLOB NOT NULL,
+			created_at TEXT NOT NULL,
+			last_active_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			revoked_at TEXT NOT NULL DEFAULT '',
+			revoke_reason TEXT NOT NULL DEFAULT ''
+		)`, tableName)
+	if _, err := tx.Exec(statement); err != nil {
+		return fmt.Errorf("create %s table: %w", tableName, err)
+	}
+	return nil
+}
+
+func migrateBrowserSessionV1ToV2(tx *sql.Tx) error {
+	rows, err := tx.Query(`
+		SELECT id, token_hash, csrf_hash, csrf_expires_at, device_label,
+			user_agent_hash, created_at, last_active_at, expires_at,
+			revoked_at, revoke_reason
+		FROM browser_sessions
+		ORDER BY id
+	`)
+	if err != nil {
+		return fmt.Errorf("read version 1 browser sessions: %w", err)
+	}
+	var sessions [][]any
+	for rows.Next() {
+		var (
+			id, csrfExpiresAt, deviceLabel     string
+			createdAt, lastActiveAt, expiresAt string
+			revokedAt, revokeReason            string
+			tokenHash, csrfHash, userAgentHash []byte
+		)
+		if err := rows.Scan(
+			&id,
+			&tokenHash,
+			&csrfHash,
+			&csrfExpiresAt,
+			&deviceLabel,
+			&userAgentHash,
+			&createdAt,
+			&lastActiveAt,
+			&expiresAt,
+			&revokedAt,
+			&revokeReason,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan version 1 browser session: %w", err)
+		}
+		sessions = append(sessions, []any{
+			id,
+			legacyBrowserSessionClientID(id),
+			int64(1),
+			tokenHash,
+			csrfHash,
+			csrfExpiresAt,
+			deviceLabel,
+			userAgentHash,
+			createdAt,
+			lastActiveAt,
+			expiresAt,
+			revokedAt,
+			revokeReason,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate version 1 browser sessions: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close version 1 browser session rows: %w", err)
+	}
+
+	if err := createBrowserClientFamilyTableV2(tx); err != nil {
+		return err
+	}
+	if err := createBrowserSessionTableV2(tx, "browser_sessions_v2"); err != nil {
+		return err
+	}
+	for _, session := range sessions {
+		if _, err := tx.Exec(`
+			INSERT INTO browser_client_families (client_id, epoch, created_at, updated_at)
+			VALUES (?, 1, ?, ?)
+		`, session[1], session[8], session[9]); err != nil {
+			return fmt.Errorf("copy browser client family %q: %w", session[1], err)
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO browser_sessions_v2 (
+				id, client_id, issued_epoch, token_hash, csrf_hash, csrf_expires_at,
+				device_label, user_agent_hash, created_at, last_active_at, expires_at,
+				revoked_at, revoke_reason
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, session...); err != nil {
+			return fmt.Errorf("copy version 1 browser session %q: %w", session[0], err)
+		}
+	}
+	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_browser_sessions_active`); err != nil {
+		return fmt.Errorf("drop version 1 browser session active index: %w", err)
+	}
+	if _, err := tx.Exec(`DROP TABLE browser_sessions`); err != nil {
+		return fmt.Errorf("drop version 1 browser session table: %w", err)
+	}
+	if _, err := tx.Exec(`ALTER TABLE browser_sessions_v2 RENAME TO browser_sessions`); err != nil {
+		return fmt.Errorf("activate browser session schema version 2: %w", err)
+	}
+	if err := createBrowserSessionActiveIndex(tx); err != nil {
+		return fmt.Errorf("create browser session active index: %w", err)
+	}
+	return nil
+}
+
+func legacyBrowserSessionClientID(sessionID string) string {
+	hash := sha256.Sum256([]byte("kbase-browser-client-v2\x00" + sessionID))
+	return "legacy_" + base64.RawURLEncoding.EncodeToString(hash[:18])
 }
 
 func createBrowserSessionActiveIndex(tx *sql.Tx) error {
@@ -1501,6 +2106,66 @@ func normalizeBrowserSessionTimesV1(tx *sql.Tx) error {
 	return nil
 }
 
+func normalizeBrowserSessionTimesV2(tx *sql.Tx) error {
+	if err := normalizeBrowserSessionTimesV1(tx); err != nil {
+		return err
+	}
+	rows, err := tx.Query(`
+		SELECT client_id, created_at, updated_at
+		FROM browser_client_families
+	`)
+	if err != nil {
+		return fmt.Errorf("read version 2 browser client family times: %w", err)
+	}
+	var updates [][]any
+	for rows.Next() {
+		var clientID, createdAt, updatedAt string
+		if err := rows.Scan(&clientID, &createdAt, &updatedAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan version 2 browser client family: %w", err)
+		}
+		originalCreatedAt, originalUpdatedAt := createdAt, updatedAt
+		if createdAt, err = canonicalizePersistedBrowserSessionTime(
+			"version 2",
+			"client created_at",
+			createdAt,
+			false,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+		if updatedAt, err = canonicalizePersistedBrowserSessionTime(
+			"version 2",
+			"client updated_at",
+			updatedAt,
+			false,
+		); err != nil {
+			rows.Close()
+			return err
+		}
+		if createdAt != originalCreatedAt || updatedAt != originalUpdatedAt {
+			updates = append(updates, []any{createdAt, updatedAt, clientID})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate version 2 browser client families: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close version 2 browser client family rows: %w", err)
+	}
+	for _, update := range updates {
+		if _, err := tx.Exec(`
+			UPDATE browser_client_families
+			SET created_at = ?, updated_at = ?
+			WHERE client_id = ?
+		`, update...); err != nil {
+			return fmt.Errorf("update version 2 browser client family %q times: %w", update[2], err)
+		}
+	}
+	return nil
+}
+
 func canonicalizePersistedBrowserSessionTime(scope, field, value string, allowEmpty bool) (string, error) {
 	if allowEmpty && value == "" {
 		return "", nil
@@ -1532,6 +2197,29 @@ var browserSessionColumnsV1 = []browserSessionColumnInfo{
 	{name: "expires_at", dataType: "TEXT", notNull: true},
 	{name: "revoked_at", dataType: "TEXT", notNull: true, defaultValue: sql.NullString{String: "''", Valid: true}},
 	{name: "revoke_reason", dataType: "TEXT", notNull: true, defaultValue: sql.NullString{String: "''", Valid: true}},
+}
+
+var browserSessionColumnsV2 = []browserSessionColumnInfo{
+	{name: "id", dataType: "TEXT", primaryKey: 1},
+	{name: "client_id", dataType: "TEXT", notNull: true},
+	{name: "issued_epoch", dataType: "INTEGER", notNull: true},
+	{name: "token_hash", dataType: "BLOB", notNull: true},
+	{name: "csrf_hash", dataType: "BLOB", notNull: true},
+	{name: "csrf_expires_at", dataType: "TEXT", notNull: true},
+	{name: "device_label", dataType: "TEXT", notNull: true},
+	{name: "user_agent_hash", dataType: "BLOB", notNull: true},
+	{name: "created_at", dataType: "TEXT", notNull: true},
+	{name: "last_active_at", dataType: "TEXT", notNull: true},
+	{name: "expires_at", dataType: "TEXT", notNull: true},
+	{name: "revoked_at", dataType: "TEXT", notNull: true, defaultValue: sql.NullString{String: "''", Valid: true}},
+	{name: "revoke_reason", dataType: "TEXT", notNull: true, defaultValue: sql.NullString{String: "''", Valid: true}},
+}
+
+var browserClientFamilyColumnsV2 = []browserSessionColumnInfo{
+	{name: "client_id", dataType: "TEXT", primaryKey: 1},
+	{name: "epoch", dataType: "INTEGER", notNull: true},
+	{name: "created_at", dataType: "TEXT", notNull: true},
+	{name: "updated_at", dataType: "TEXT", notNull: true},
 }
 
 func readBrowserSessionColumns(tx *sql.Tx) ([]browserSessionColumnInfo, error) {
@@ -1576,6 +2264,426 @@ func validateBrowserSessionSchemaV1(tx *sql.Tx) error {
 		return err
 	}
 	return validateBrowserSessionIndexes(tx, false)
+}
+
+func validateBrowserSessionSchemaV2(tx *sql.Tx) error {
+	columns, err := readBrowserSessionColumns(tx)
+	if err != nil {
+		return err
+	}
+	if err := compareBrowserSessionColumns(columns, browserSessionColumnsV2); err != nil {
+		return err
+	}
+	familyColumns, err := readBrowserSessionTableColumns(tx, "browser_client_families")
+	if err != nil {
+		return err
+	}
+	if err := compareBrowserSessionColumns(familyColumns, browserClientFamilyColumnsV2); err != nil {
+		return fmt.Errorf("browser_client_families schema: %w", err)
+	}
+	if err := validateSQLiteTableCheckConstraint(
+		tx,
+		"browser_sessions",
+		[]string{"issued_epoch", ">=", "1"},
+	); err != nil {
+		return fmt.Errorf("browser_sessions CHECK constraints: %w", err)
+	}
+	if err := validateSQLiteTableCheckConstraint(
+		tx,
+		"browser_client_families",
+		[]string{"epoch", ">=", "1"},
+	); err != nil {
+		return fmt.Errorf("browser_client_families CHECK constraints: %w", err)
+	}
+	if err := validateBrowserSessionClientForeignKey(tx); err != nil {
+		return err
+	}
+	if err := validateBrowserSessionIndexes(tx, false); err != nil {
+		return err
+	}
+	if err := validateBrowserSessionForeignKeyData(tx); err != nil {
+		return err
+	}
+	return validateBrowserSessionEpochData(tx)
+}
+
+func validateSQLiteTableCheckConstraint(
+	tx *sql.Tx,
+	tableName string,
+	expected []string,
+) error {
+	switch tableName {
+	case "browser_sessions", "browser_client_families":
+	default:
+		return fmt.Errorf("unsupported CHECK constraint table %q", tableName)
+	}
+	var statement string
+	if err := tx.QueryRow(`
+		SELECT sql
+		FROM sqlite_master
+		WHERE type = 'table' AND name = ?
+	`, tableName).Scan(&statement); err != nil {
+		return fmt.Errorf("read %s table SQL: %w", tableName, err)
+	}
+	tokens, err := tokenizeSQLiteSchema(statement)
+	if err != nil {
+		return fmt.Errorf("tokenize %s table SQL: %w", tableName, err)
+	}
+	checks, err := extractSQLiteCheckExpressions(tokens)
+	if err != nil {
+		return fmt.Errorf("parse %s CHECK constraints: %w", tableName, err)
+	}
+	for _, check := range checks {
+		if equalSQLiteSchemaTokens(check, expected) {
+			return nil
+		}
+	}
+	return fmt.Errorf("required CHECK (%s) is missing", strings.Join(expected, " "))
+}
+
+func tokenizeSQLiteSchema(statement string) ([]string, error) {
+	tokens := make([]string, 0, len(statement)/4)
+	for index := 0; index < len(statement); {
+		value := statement[index]
+		switch {
+		case value == ' ' || value == '\t' || value == '\r' || value == '\n':
+			index++
+		case value == '-' && index+1 < len(statement) && statement[index+1] == '-':
+			index += 2
+			for index < len(statement) && statement[index] != '\n' {
+				index++
+			}
+		case value == '/' && index+1 < len(statement) && statement[index+1] == '*':
+			end := strings.Index(statement[index+2:], "*/")
+			if end < 0 {
+				return nil, fmt.Errorf("unterminated block comment")
+			}
+			index += end + 4
+		case isSQLiteIdentifierStart(value):
+			end := index + 1
+			for end < len(statement) && isSQLiteIdentifierPart(statement[end]) {
+				end++
+			}
+			tokens = append(tokens, strings.ToLower(statement[index:end]))
+			index = end
+		case value >= '0' && value <= '9':
+			end := index + 1
+			for end < len(statement) &&
+				statement[end] >= '0' &&
+				statement[end] <= '9' {
+				end++
+			}
+			tokens = append(tokens, statement[index:end])
+			index = end
+		case value == '\'':
+			end, err := consumeSQLiteQuotedToken(statement, index, '\'', '\'')
+			if err != nil {
+				return nil, err
+			}
+			tokens = append(tokens, "<string>")
+			index = end
+		case value == '"' || value == '`':
+			end, content, err := consumeSQLiteQuotedIdentifier(statement, index, value, value)
+			if err != nil {
+				return nil, err
+			}
+			tokens = append(tokens, strings.ToLower(content))
+			index = end
+		case value == '[':
+			end, content, err := consumeSQLiteQuotedIdentifier(statement, index, '[', ']')
+			if err != nil {
+				return nil, err
+			}
+			tokens = append(tokens, strings.ToLower(content))
+			index = end
+		case value == '>' || value == '<' || value == '!' || value == '=':
+			operator := string(value)
+			if index+1 < len(statement) && statement[index+1] == '=' {
+				operator += "="
+				index++
+			} else if value == '<' &&
+				index+1 < len(statement) &&
+				statement[index+1] == '>' {
+				operator += ">"
+				index++
+			}
+			tokens = append(tokens, operator)
+			index++
+		case strings.ContainsRune("(),.;+-*/", rune(value)):
+			tokens = append(tokens, string(value))
+			index++
+		default:
+			return nil, fmt.Errorf("unsupported schema byte 0x%02x", value)
+		}
+	}
+	return tokens, nil
+}
+
+func isSQLiteIdentifierStart(value byte) bool {
+	return (value >= 'a' && value <= 'z') ||
+		(value >= 'A' && value <= 'Z') ||
+		value == '_'
+}
+
+func isSQLiteIdentifierPart(value byte) bool {
+	return isSQLiteIdentifierStart(value) || (value >= '0' && value <= '9')
+}
+
+func consumeSQLiteQuotedToken(
+	statement string,
+	start int,
+	open byte,
+	close byte,
+) (int, error) {
+	index := start + 1
+	for index < len(statement) {
+		if statement[index] != close {
+			index++
+			continue
+		}
+		if close != ']' &&
+			index+1 < len(statement) &&
+			statement[index+1] == close {
+			index += 2
+			continue
+		}
+		return index + 1, nil
+	}
+	return 0, fmt.Errorf("unterminated quoted token %q", open)
+}
+
+func consumeSQLiteQuotedIdentifier(
+	statement string,
+	start int,
+	open byte,
+	close byte,
+) (int, string, error) {
+	end, err := consumeSQLiteQuotedToken(statement, start, open, close)
+	if err != nil {
+		return 0, "", err
+	}
+	content := statement[start+1 : end-1]
+	if close != ']' {
+		content = strings.ReplaceAll(content, string(close)+string(close), string(close))
+	}
+	return end, content, nil
+}
+
+func extractSQLiteCheckExpressions(tokens []string) ([][]string, error) {
+	var checks [][]string
+	for index := 0; index < len(tokens); index++ {
+		if tokens[index] != "check" {
+			continue
+		}
+		if index+1 >= len(tokens) || tokens[index+1] != "(" {
+			return nil, fmt.Errorf("CHECK is not followed by an expression")
+		}
+		depth := 1
+		start := index + 2
+		end := start
+		for ; end < len(tokens) && depth != 0; end++ {
+			switch tokens[end] {
+			case "(":
+				depth++
+			case ")":
+				depth--
+			}
+		}
+		if depth != 0 {
+			return nil, fmt.Errorf("unterminated CHECK expression")
+		}
+		checks = append(checks, trimSQLiteExpressionParentheses(tokens[start:end-1]))
+		index = end - 1
+	}
+	return checks, nil
+}
+
+func trimSQLiteExpressionParentheses(tokens []string) []string {
+	for len(tokens) >= 2 && tokens[0] == "(" && tokens[len(tokens)-1] == ")" {
+		depth := 0
+		wrapsWholeExpression := true
+		for index, token := range tokens {
+			switch token {
+			case "(":
+				depth++
+			case ")":
+				depth--
+				if depth == 0 && index != len(tokens)-1 {
+					wrapsWholeExpression = false
+				}
+			}
+			if depth < 0 {
+				return tokens
+			}
+		}
+		if !wrapsWholeExpression || depth != 0 {
+			return tokens
+		}
+		tokens = tokens[1 : len(tokens)-1]
+	}
+	return tokens
+}
+
+func equalSQLiteSchemaTokens(actual, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for index := range actual {
+		if actual[index] != expected[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateBrowserSessionForeignKeyData(tx *sql.Tx) error {
+	rows, err := tx.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return fmt.Errorf("run browser session foreign key check: %w", err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var (
+			table  string
+			rowID  sql.NullInt64
+			parent string
+			fkID   int
+		)
+		if err := rows.Scan(&table, &rowID, &parent, &fkID); err != nil {
+			return fmt.Errorf("scan browser session foreign key check: %w", err)
+		}
+		return fmt.Errorf(
+			"browser session foreign key check failed for table %q parent %q constraint %d",
+			table,
+			parent,
+			fkID,
+		)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate browser session foreign key check: %w", err)
+	}
+	return nil
+}
+
+func validateBrowserSessionEpochData(tx *sql.Tx) error {
+	var invalid int
+	if err := tx.QueryRow(`
+		SELECT COUNT(*)
+		FROM browser_client_families
+		WHERE typeof(epoch) != 'integer' OR epoch < 1
+	`).Scan(&invalid); err != nil {
+		return fmt.Errorf("validate browser client family epoch data: %w", err)
+	}
+	if invalid != 0 {
+		return fmt.Errorf("invalid browser client family epoch data: %d rows", invalid)
+	}
+	if err := tx.QueryRow(`
+		SELECT COUNT(*)
+		FROM browser_sessions
+		WHERE typeof(issued_epoch) != 'integer' OR issued_epoch < 1
+	`).Scan(&invalid); err != nil {
+		return fmt.Errorf("validate browser session issued epoch data: %w", err)
+	}
+	if invalid != 0 {
+		return fmt.Errorf("invalid browser session issued epoch data: %d rows", invalid)
+	}
+	if err := tx.QueryRow(`
+		SELECT COUNT(*)
+		FROM browser_sessions AS sessions
+		JOIN browser_client_families AS families
+			ON families.client_id = sessions.client_id
+		WHERE sessions.revoked_at = ''
+			AND sessions.issued_epoch != families.epoch
+	`).Scan(&invalid); err != nil {
+		return fmt.Errorf("validate active browser session epoch data: %w", err)
+	}
+	if invalid != 0 {
+		return fmt.Errorf("invalid active browser session epoch data: %d rows", invalid)
+	}
+	return nil
+}
+
+func readBrowserSessionTableColumns(
+	tx *sql.Tx,
+	tableName string,
+) ([]browserSessionColumnInfo, error) {
+	if tableName != "browser_client_families" {
+		return nil, fmt.Errorf("unsupported browser session schema table %q", tableName)
+	}
+	rows, err := tx.Query(`PRAGMA table_info(browser_client_families)`)
+	if err != nil {
+		return nil, fmt.Errorf("inspect %s columns: %w", tableName, err)
+	}
+	defer rows.Close()
+	columns := make([]browserSessionColumnInfo, 0, len(browserClientFamilyColumnsV2))
+	for rows.Next() {
+		var (
+			cid, notNull, primaryKey int
+			column                   browserSessionColumnInfo
+		)
+		if err := rows.Scan(
+			&cid,
+			&column.name,
+			&column.dataType,
+			&notNull,
+			&column.defaultValue,
+			&primaryKey,
+		); err != nil {
+			return nil, fmt.Errorf("scan %s column: %w", tableName, err)
+		}
+		column.dataType = strings.ToUpper(column.dataType)
+		column.notNull = notNull != 0
+		column.primaryKey = primaryKey
+		columns = append(columns, column)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s columns: %w", tableName, err)
+	}
+	return columns, nil
+}
+
+func validateBrowserSessionClientForeignKey(tx *sql.Tx) error {
+	rows, err := tx.Query(`PRAGMA foreign_key_list(browser_sessions)`)
+	if err != nil {
+		return fmt.Errorf("inspect browser session foreign keys: %w", err)
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var (
+			id, sequence                        int
+			table, from, to, onUpdate, onDelete string
+			match                               string
+		)
+		if err := rows.Scan(
+			&id,
+			&sequence,
+			&table,
+			&from,
+			&to,
+			&onUpdate,
+			&onDelete,
+			&match,
+		); err != nil {
+			return fmt.Errorf("scan browser session foreign key: %w", err)
+		}
+		if table != "browser_client_families" ||
+			from != "client_id" ||
+			to != "client_id" ||
+			onUpdate != "NO ACTION" ||
+			onDelete != "NO ACTION" ||
+			match != "NONE" {
+			return fmt.Errorf("browser session client foreign key is incompatible")
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate browser session foreign keys: %w", err)
+	}
+	if count != 1 {
+		return fmt.Errorf("browser session client foreign key count = %d, want 1", count)
+	}
+	return nil
 }
 
 func validateLegacyBrowserSessionSchema(tx *sql.Tx) error {
