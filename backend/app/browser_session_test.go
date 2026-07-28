@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -961,6 +963,9 @@ func TestBrowserSessionStoreRandomFailuresDoNotInsert(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), testCase.wantContext) {
 				t.Fatalf("Create() error = %v, want context %q", err, testCase.wantContext)
 			}
+			if !errors.Is(err, ErrBrowserSessionUnavailable) {
+				t.Fatalf("Create() entropy error = %v, want ErrBrowserSessionUnavailable", err)
+			}
 			var count int
 			if err := store.db.QueryRow(`SELECT COUNT(*) FROM browser_sessions`).Scan(&count); err != nil {
 				t.Fatal(err)
@@ -1020,6 +1025,718 @@ func TestBrowserSessionStoreWrapsErrorsWithoutCredentials(t *testing.T) {
 			t.Fatalf("duplicate insert left %d records, want 1", count)
 		}
 	})
+}
+
+func TestBrowserSessionLifecycleSlidingExpiryAndRenewal(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            newBrowserSessionTestDBPath(t),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(1, 8)),
+		RenewalInterval: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	credentials, err := store.Create(BrowserSessionCreate{DeviceLabel: "Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := clock.Now().Add(30 * 24 * time.Hour); !credentials.Session.ExpiresAt.Equal(want) {
+		t.Fatalf("Create() expiry = %s, want exactly %s", credentials.Session.ExpiresAt, want)
+	}
+	createdExpiresAt := readBrowserSessionStoredTime(t, store.db, credentials.Session.ID, "expires_at")
+
+	clock.Advance(4*time.Minute + 59*time.Second)
+	first, err := store.AuthenticateAndRenew(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Renewed || first.SetCookie {
+		t.Fatalf("activity inside coalescing window renewed storage/cookie: %#v", first)
+	}
+	if want := clock.Now().Add(30 * 24 * time.Hour); !first.Session.ExpiresAt.Equal(want) {
+		t.Fatalf("logical expiry = %s, want %s", first.Session.ExpiresAt, want)
+	}
+	if !first.CookieExpiresAt.Equal(createdExpiresAt) {
+		t.Fatalf("unchanged Cookie expiry = %s, want persisted %s", first.CookieExpiresAt, createdExpiresAt)
+	}
+	assertBrowserSessionStoredActivity(t, store.db, credentials.Session.ID, credentials.Session.LastActiveAt, createdExpiresAt)
+
+	clock.Advance(time.Second)
+	second, err := store.AuthenticateAndRenew(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRenewedExpiry := clock.Now().Add(30 * 24 * time.Hour)
+	if !second.Renewed || !second.SetCookie {
+		t.Fatalf("activity at renewal boundary did not renew storage/cookie: %#v", second)
+	}
+	if !second.Session.LastActiveAt.Equal(clock.Now()) ||
+		!second.Session.ExpiresAt.Equal(wantRenewedExpiry) ||
+		!second.CookieExpiresAt.Equal(wantRenewedExpiry) {
+		t.Fatalf("renewed auth metadata = %#v, want activity=%s expiry=%s", second, clock.Now(), wantRenewedExpiry)
+	}
+	assertBrowserSessionStoredActivity(t, store.db, credentials.Session.ID, clock.Now(), wantRenewedExpiry)
+
+	clock.Advance(time.Minute)
+	third, err := store.AuthenticateAndRenew(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Renewed || third.SetCookie {
+		t.Fatalf("second activity inside new coalescing window renewed: %#v", third)
+	}
+	assertBrowserSessionStoredActivity(t, store.db, credentials.Session.ID, second.Session.LastActiveAt, wantRenewedExpiry)
+}
+
+func TestBrowserSessionLifecycleRejectsMissingExpiredAndRevoked(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(2, 8)),
+		TTL:    time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if _, err := store.AuthenticateAndRenew("missing"); !errors.Is(err, ErrBrowserSessionMissing) {
+		t.Fatalf("missing AuthenticateAndRenew() error = %v, want ErrBrowserSessionMissing", err)
+	}
+
+	expired, err := store.Create(BrowserSessionCreate{DeviceLabel: "Expired"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Hour)
+	if _, err := store.AuthenticateAndRenew(expired.Token); !errors.Is(err, ErrBrowserSessionExpired) {
+		t.Fatalf("expired AuthenticateAndRenew() error = %v, want ErrBrowserSessionExpired", err)
+	}
+
+	clock.Advance(-30 * time.Minute)
+	revoked, err := store.Create(BrowserSessionCreate{DeviceLabel: "Revoked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeByToken(revoked.Token, "self logout"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthenticateAndRenew(revoked.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("revoked AuthenticateAndRenew() error = %v, want ErrBrowserSessionRevoked", err)
+	}
+}
+
+func TestBrowserSessionLimitEvictsLeastRecentlyActive(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:      newBrowserSessionTestDBPath(t),
+		Now:       clock.Now,
+		Random:    bytes.NewReader(deterministicBrowserSessionBytes(3, 24)),
+		MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var created []BrowserSessionCredentials
+	for index := 0; index < 10; index++ {
+		credentials, err := store.Create(BrowserSessionCreate{
+			DeviceLabel: fmt.Sprintf("Browser %02d", index),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		created = append(created, credentials)
+		clock.Advance(time.Second)
+	}
+	eleventh, err := store.Create(BrowserSessionCreate{DeviceLabel: "Browser 10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.AuthenticateAndRenew(created[0].Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("least-recently-active token error = %v, want revoked", err)
+	}
+	if _, err := store.AuthenticateAndRenew(created[1].Token); err != nil {
+		t.Fatalf("second-oldest token was unexpectedly evicted: %v", err)
+	}
+	if _, err := store.AuthenticateAndRenew(eleventh.Token); err != nil {
+		t.Fatalf("new token did not authenticate: %v", err)
+	}
+	assertBrowserSessionActiveCount(t, store.db, clock.Now(), 10)
+}
+
+func TestBrowserSessionLimitConcurrentStoresNeverExceedMaximum(t *testing.T) {
+	dbPath := newBrowserSessionTestDBPath(t)
+	fixedNow := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	first, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:      dbPath,
+		Now:       func() time.Time { return fixedNow },
+		Random:    bytes.NewReader(deterministicBrowserSessionBytes(11, 24)),
+		MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:      dbPath,
+		Now:       func() time.Time { return fixedNow },
+		Random:    bytes.NewReader(deterministicBrowserSessionBytes(101, 24)),
+		MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+
+	const createsPerStore = 12
+	start := make(chan struct{})
+	errs := make(chan error, createsPerStore*2)
+	var wait sync.WaitGroup
+	for _, store := range []*BrowserSessionStore{first, second} {
+		for index := 0; index < createsPerStore; index++ {
+			wait.Add(1)
+			go func(store *BrowserSessionStore) {
+				defer wait.Done()
+				<-start
+				_, err := store.Create(BrowserSessionCreate{DeviceLabel: "Concurrent"})
+				errs <- err
+			}(store)
+		}
+	}
+	close(start)
+	wait.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Create() error = %v", err)
+		}
+	}
+	assertBrowserSessionActiveCount(t, first.db, fixedNow, 10)
+}
+
+func TestBrowserSessionRevokeOperationsAreIdempotent(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(4, 16)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.Create(BrowserSessionCreate{DeviceLabel: "First"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Create(BrowserSessionCreate{DeviceLabel: "Second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := store.Create(BrowserSessionCreate{DeviceLabel: "Third"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RevokeByToken(first.Token, "self logout"); err != nil {
+		t.Fatal(err)
+	}
+	firstRevokedAt, firstReason := readBrowserSessionRevocation(t, store.db, first.Session.ID)
+	clock.Advance(time.Hour)
+	if err := store.RevokeByToken(first.Token, "changed reason"); err != nil {
+		t.Fatal(err)
+	}
+	assertBrowserSessionRevocation(t, store.db, first.Session.ID, firstRevokedAt, firstReason)
+
+	if err := store.Revoke(second.Session.ID, "admin revoke"); err != nil {
+		t.Fatal(err)
+	}
+	secondRevokedAt, secondReason := readBrowserSessionRevocation(t, store.db, second.Session.ID)
+	clock.Advance(time.Hour)
+	if err := store.Revoke(second.Session.ID, "changed reason"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Revoke("missing", "no-op"); err != nil {
+		t.Fatalf("missing Revoke() error = %v, want idempotent no-op", err)
+	}
+	if err := store.RevokeByToken("missing", "no-op"); err != nil {
+		t.Fatalf("missing RevokeByToken() error = %v, want idempotent no-op", err)
+	}
+	assertBrowserSessionRevocation(t, store.db, second.Session.ID, secondRevokedAt, secondReason)
+
+	count, err := store.RevokeAll("admin revoke all")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("first RevokeAll() count = %d, want 1", count)
+	}
+	count, err = store.RevokeAll("changed reason")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("second RevokeAll() count = %d, want 0", count)
+	}
+	thirdRevokedAt, thirdReason := readBrowserSessionRevocation(t, store.db, third.Session.ID)
+	if thirdReason != "admin revoke all" || !thirdRevokedAt.Equal(clock.Now()) {
+		t.Fatalf("third revocation = (%s, %q), want (%s, %q)", thirdRevokedAt, thirdReason, clock.Now(), "admin revoke all")
+	}
+}
+
+func TestBrowserSessionLifecycleListReturnsStablePublicMetadata(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(5, 8)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.Create(BrowserSessionCreate{DeviceLabel: "First"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	second, err := store.Create(BrowserSessionCreate{DeviceLabel: "Second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Revoke(first.Session.ID, "signed out"); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 2 || sessions[0].ID != second.Session.ID || sessions[1].ID != first.Session.ID {
+		t.Fatalf("List() order = %#v, want newest creation first with stable IDs", sessions)
+	}
+	payload, err := json.Marshal(sessions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"token", "csrf", "user_agent", "hash"} {
+		if bytes.Contains(bytes.ToLower(payload), []byte(forbidden)) {
+			t.Fatalf("List() JSON contains private field %q: %s", forbidden, payload)
+		}
+	}
+}
+
+func TestBrowserSessionCleanupHonorsRetentionBoundary(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(6, 16)),
+		TTL:    48 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	oldExpired, err := store.Create(BrowserSessionCreate{DeviceLabel: "Old expired"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRevoked, err := store.Create(BrowserSessionCreate{DeviceLabel: "Old revoked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Revoke(oldRevoked.Session.ID, "old"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(72 * time.Hour)
+	boundary, err := store.Create(BrowserSessionCreate{DeviceLabel: "Boundary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Revoke(boundary.Session.ID, "boundary"); err != nil {
+		t.Fatal(err)
+	}
+	recent, err := store.Create(BrowserSessionCreate{DeviceLabel: "Recent active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Cleanup(-time.Second); !errors.Is(err, ErrBrowserSessionConflict) {
+		t.Fatalf("Cleanup(-1s) error = %v, want ErrBrowserSessionConflict", err)
+	}
+	deleted, err := store.Cleanup(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("Cleanup(0) deleted %d records, want old expired and old revoked", deleted)
+	}
+	assertBrowserSessionIDs(t, store.db, []string{boundary.Session.ID, recent.Session.ID})
+	if oldExpired.Session.ID == oldRevoked.Session.ID {
+		t.Fatal("test credentials unexpectedly collided")
+	}
+}
+
+func TestBrowserSessionLifecycleCSRFUsesRotationExpiryAndTypedConflicts(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(7, 12)),
+		TTL:    time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	first, err := store.Create(BrowserSessionCreate{DeviceLabel: "First"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if createdCSRFExpiresAt := readBrowserSessionStoredTime(
+		t,
+		store.db,
+		first.Session.ID,
+		"csrf_expires_at",
+	); !createdCSRFExpiresAt.Equal(clock.Now().Add(15 * time.Minute)) {
+		t.Fatalf(
+			"created CSRF expiry = %s, want %s",
+			createdCSRFExpiresAt,
+			clock.Now().Add(15*time.Minute),
+		)
+	}
+	if err := store.ValidateCSRF(first.Session.ID, first.CSRFToken); err != nil {
+		t.Fatalf("created CSRF did not validate: %v", err)
+	}
+	if err := store.ValidateCSRF(first.Session.ID, first.CSRFToken+"x"); !errors.Is(err, ErrBrowserSessionCSRFInvalid) {
+		t.Fatalf("wrong CSRF error = %v, want ErrBrowserSessionCSRFInvalid", err)
+	}
+
+	oldToken := first.CSRFToken
+	clock.Advance(time.Minute)
+	rotated, expiresAt, err := store.RotateCSRF(first.Session.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated == "" || rotated == oldToken {
+		t.Fatalf("RotateCSRF() token = %q, want new non-empty token", rotated)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(rotated)
+	if err != nil || len(decoded) != 32 {
+		t.Fatalf("rotated CSRF is not a 32-byte raw URL-safe token: len=%d err=%v", len(decoded), err)
+	}
+	if want := clock.Now().Add(15 * time.Minute); !expiresAt.Equal(want) {
+		t.Fatalf("RotateCSRF() expiry = %s, want %s", expiresAt, want)
+	}
+	var storedRotatedHash []byte
+	if err := store.db.QueryRow(`
+		SELECT csrf_hash
+		FROM browser_sessions
+		WHERE id = ?
+	`, first.Session.ID).Scan(&storedRotatedHash); err != nil {
+		t.Fatal(err)
+	}
+	wantRotatedHash := sha256.Sum256([]byte(rotated))
+	if !bytes.Equal(storedRotatedHash, wantRotatedHash[:]) {
+		t.Fatalf("stored rotated CSRF hash = %x, want %x", storedRotatedHash, wantRotatedHash)
+	}
+	if err := store.ValidateCSRF(first.Session.ID, oldToken); !errors.Is(err, ErrBrowserSessionCSRFInvalid) {
+		t.Fatalf("old CSRF error = %v, want invalid", err)
+	}
+	if err := store.ValidateCSRF(first.Session.ID, rotated); err != nil {
+		t.Fatalf("rotated CSRF did not validate: %v", err)
+	}
+	clock.Advance(15 * time.Minute)
+	if err := store.ValidateCSRF(first.Session.ID, rotated); !errors.Is(err, ErrBrowserSessionCSRFExpired) {
+		t.Fatalf("expired CSRF error = %v, want ErrBrowserSessionCSRFExpired", err)
+	}
+	if _, _, err := store.RotateCSRF("missing"); !errors.Is(err, ErrBrowserSessionMissing) {
+		t.Fatalf("missing RotateCSRF() error = %v, want missing", err)
+	}
+
+	second, err := store.Create(BrowserSessionCreate{DeviceLabel: "Second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCSRFBytes, err := base64.RawURLEncoding.DecodeString(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.random = bytes.NewReader(firstCSRFBytes)
+	if _, _, err := store.RotateCSRF(second.Session.ID); !errors.Is(err, ErrBrowserSessionConflict) {
+		t.Fatalf("colliding RotateCSRF() error = %v, want ErrBrowserSessionConflict", err)
+	}
+
+	collisionBytes := deterministicBrowserSessionBytes(200, 2)
+	store.random = bytes.NewReader(collisionBytes)
+	if _, err := store.Create(BrowserSessionCreate{DeviceLabel: "Third"}); err != nil {
+		t.Fatal(err)
+	}
+	store.random = bytes.NewReader(collisionBytes)
+	if _, err := store.Create(BrowserSessionCreate{DeviceLabel: "Collision"}); !errors.Is(err, ErrBrowserSessionConflict) {
+		t.Fatalf("colliding Create() error = %v, want ErrBrowserSessionConflict", err)
+	}
+}
+
+func TestBrowserSessionLifecycleCSRFRejectsMissingExpiredAndRevokedSessions(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Now:    clock.Now,
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(9, 8)),
+		TTL:    time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	if err := store.ValidateCSRF("missing", "credential"); !errors.Is(err, ErrBrowserSessionMissing) {
+		t.Fatalf("missing ValidateCSRF() error = %v, want missing", err)
+	}
+
+	revoked, err := store.Create(BrowserSessionCreate{DeviceLabel: "Revoked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Revoke(revoked.Session.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ValidateCSRF(revoked.Session.ID, revoked.CSRFToken); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("revoked ValidateCSRF() error = %v, want revoked", err)
+	}
+	if _, _, err := store.RotateCSRF(revoked.Session.ID); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("revoked RotateCSRF() error = %v, want revoked", err)
+	}
+
+	expired, err := store.Create(BrowserSessionCreate{DeviceLabel: "Expired"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Hour)
+	if err := store.ValidateCSRF(expired.Session.ID, expired.CSRFToken); !errors.Is(err, ErrBrowserSessionExpired) {
+		t.Fatalf("expired ValidateCSRF() error = %v, want expired", err)
+	}
+	if _, _, err := store.RotateCSRF(expired.Session.ID); !errors.Is(err, ErrBrowserSessionExpired) {
+		t.Fatalf("expired RotateCSRF() error = %v, want expired", err)
+	}
+}
+
+func TestBrowserSessionLifecycleMapsDatabaseFailureToUnavailable(t *testing.T) {
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(8, 4)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := store.Create(BrowserSessionCreate{DeviceLabel: "Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.AuthenticateAndRenew(credentials.Token); !errors.Is(err, ErrBrowserSessionUnavailable) {
+		t.Fatalf("AuthenticateAndRenew() closed DB error = %v, want unavailable", err)
+	}
+	if _, err := store.List(); !errors.Is(err, ErrBrowserSessionUnavailable) {
+		t.Fatalf("List() closed DB error = %v, want unavailable", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type browserSessionTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *browserSessionTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *browserSessionTestClock) Advance(delta time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(delta)
+}
+
+func deterministicBrowserSessionBytes(seed, credentialPairs int) []byte {
+	data := make([]byte, 0, credentialPairs*2*browserSessionCredentialBytes)
+	for index := 0; index < credentialPairs*2; index++ {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("browser-session-test/%d/%d", seed, index)))
+		data = append(data, sum[:]...)
+	}
+	return data
+}
+
+func readBrowserSessionStoredTime(t *testing.T, db *sql.DB, id, column string) time.Time {
+	t.Helper()
+	switch column {
+	case "created_at", "last_active_at", "expires_at", "csrf_expires_at", "revoked_at":
+	default:
+		t.Fatalf("unsupported browser session time column %q", column)
+	}
+	var value string
+	query := fmt.Sprintf(`SELECT %s FROM browser_sessions WHERE id = ?`, column)
+	if err := db.QueryRow(query, id).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseBrowserSessionTime(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+func assertBrowserSessionStoredActivity(
+	t *testing.T,
+	db *sql.DB,
+	id string,
+	wantLastActiveAt time.Time,
+	wantExpiresAt time.Time,
+) {
+	t.Helper()
+	var lastActiveAt, expiresAt string
+	if err := db.QueryRow(`
+		SELECT last_active_at, expires_at
+		FROM browser_sessions
+		WHERE id = ?
+	`, id).Scan(&lastActiveAt, &expiresAt); err != nil {
+		t.Fatal(err)
+	}
+	parsedLastActiveAt, err := parseBrowserSessionTime(lastActiveAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedExpiresAt, err := parseBrowserSessionTime(expiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsedLastActiveAt.Equal(wantLastActiveAt) || !parsedExpiresAt.Equal(wantExpiresAt) {
+		t.Fatalf(
+			"stored activity = (%s, %s), want (%s, %s)",
+			parsedLastActiveAt,
+			parsedExpiresAt,
+			wantLastActiveAt,
+			wantExpiresAt,
+		)
+	}
+}
+
+func assertBrowserSessionActiveCount(t *testing.T, db *sql.DB, now time.Time, want int) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM browser_sessions
+		WHERE revoked_at = '' AND expires_at > ?
+	`, formatBrowserSessionTime(now)).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("active browser session count = %d, want %d", count, want)
+	}
+}
+
+func readBrowserSessionRevocation(t *testing.T, db *sql.DB, id string) (time.Time, string) {
+	t.Helper()
+	var revokedAt, reason string
+	if err := db.QueryRow(`
+		SELECT revoked_at, revoke_reason
+		FROM browser_sessions
+		WHERE id = ?
+	`, id).Scan(&revokedAt, &reason); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseBrowserSessionTime(revokedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed, reason
+}
+
+func assertBrowserSessionRevocation(
+	t *testing.T,
+	db *sql.DB,
+	id string,
+	wantRevokedAt time.Time,
+	wantReason string,
+) {
+	t.Helper()
+	revokedAt, reason := readBrowserSessionRevocation(t, db, id)
+	if !revokedAt.Equal(wantRevokedAt) || reason != wantReason {
+		t.Fatalf(
+			"browser session %q revocation = (%s, %q), want (%s, %q)",
+			id,
+			revokedAt,
+			reason,
+			wantRevokedAt,
+			wantReason,
+		)
+	}
+}
+
+func assertBrowserSessionIDs(t *testing.T, db *sql.DB, want []string) {
+	t.Helper()
+	rows, err := db.Query(`SELECT id FROM browser_sessions ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	slices := func(values []string) []string {
+		cloned := append([]string(nil), values...)
+		sort.Strings(cloned)
+		return cloned
+	}
+	if !reflect.DeepEqual(slices(got), slices(want)) {
+		t.Fatalf("browser session IDs = %#v, want %#v", got, want)
+	}
 }
 
 type legacyBrowserSessionSeed struct {

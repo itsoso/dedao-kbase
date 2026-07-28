@@ -1,10 +1,13 @@
 package app
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,16 +17,27 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 const (
 	defaultBrowserSessionTTL             = 30 * 24 * time.Hour
 	defaultBrowserSessionRenewalInterval = 5 * time.Minute
 	defaultBrowserSessionMaxActive       = 10
+	browserSessionCSRFTTL                = 15 * time.Minute
 	browserSessionCredentialBytes        = 32
 	browserSessionSchemaVersion          = 1
 	browserSessionTimeLayout             = "2006-01-02T15:04:05.000000000Z07:00"
+)
+
+var (
+	ErrBrowserSessionMissing     = errors.New("browser session missing")
+	ErrBrowserSessionExpired     = errors.New("browser session expired")
+	ErrBrowserSessionRevoked     = errors.New("browser session revoked")
+	ErrBrowserSessionConflict    = errors.New("browser session conflict")
+	ErrBrowserSessionUnavailable = errors.New("browser session unavailable")
+	ErrBrowserSessionCSRFInvalid = errors.New("browser session CSRF invalid")
+	ErrBrowserSessionCSRFExpired = errors.New("browser session CSRF expired")
 )
 
 type BrowserSessionStoreConfig struct {
@@ -49,6 +63,13 @@ type BrowserSessionCredentials struct {
 	Session   BrowserSession
 	Token     string
 	CSRFToken string
+}
+
+type BrowserSessionAuth struct {
+	Session         BrowserSession
+	Renewed         bool
+	SetCookie       bool
+	CookieExpiresAt time.Time
 }
 
 type BrowserSessionCreate struct {
@@ -150,21 +171,35 @@ func (s *BrowserSessionStore) Close() error {
 
 func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSessionCredentials, error) {
 	if s == nil {
-		return BrowserSessionCredentials{}, fmt.Errorf("create browser session: browser session store is nil")
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"create browser session: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed || s.db == nil {
-		return BrowserSessionCredentials{}, fmt.Errorf("create browser session: browser session store is closed")
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"create browser session: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
 	}
 
 	token, err := s.randomCredential()
 	if err != nil {
-		return BrowserSessionCredentials{}, fmt.Errorf("generate session credential: %w", err)
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"generate session credential: %v: %w",
+			err,
+			ErrBrowserSessionUnavailable,
+		)
 	}
 	csrfToken, err := s.randomCredential()
 	if err != nil {
-		return BrowserSessionCredentials{}, fmt.Errorf("generate CSRF credential: %w", err)
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"generate CSRF credential: %v: %w",
+			err,
+			ErrBrowserSessionUnavailable,
+		)
 	}
 
 	tokenHash := sha256.Sum256([]byte(token))
@@ -172,6 +207,7 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 	userAgentHash := sha256.Sum256([]byte(input.UserAgent))
 	now := s.now().UTC()
 	expiresAt := now.Add(s.ttl)
+	csrfExpiresAt := now.Add(browserSessionCSRFTTL)
 	session := BrowserSession{
 		ID:           "session_" + base64.RawURLEncoding.EncodeToString(tokenHash[:18]),
 		DeviceLabel:  strings.TrimSpace(input.DeviceLabel),
@@ -180,31 +216,442 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 		ExpiresAt:    expiresAt,
 	}
 
-	_, err = s.db.Exec(`
-		INSERT INTO browser_sessions (
-			id, token_hash, csrf_hash, csrf_expires_at, device_label,
-			user_agent_hash, created_at, last_active_at, expires_at,
-			revoked_at, revoke_reason
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
-	`,
-		session.ID,
-		tokenHash[:],
-		csrfHash[:],
-		formatBrowserSessionTime(expiresAt),
-		session.DeviceLabel,
-		userAgentHash[:],
-		formatBrowserSessionTime(now),
-		formatBrowserSessionTime(now),
-		formatBrowserSessionTime(expiresAt),
-	)
+	err = s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		var collisions int
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT COUNT(*) FROM browser_sessions WHERE token_hash = ? OR csrf_hash = ?`,
+			tokenHash[:],
+			csrfHash[:],
+		).Scan(&collisions); err != nil {
+			return classifyBrowserSessionStoreError("check browser session credential collision", err)
+		}
+		if collisions != 0 {
+			return fmt.Errorf("insert browser session: %w", ErrBrowserSessionConflict)
+		}
+
+		var activeCount int
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT COUNT(*) FROM browser_sessions WHERE revoked_at = '' AND expires_at > ?`,
+			formatBrowserSessionTime(now),
+		).Scan(&activeCount); err != nil {
+			return classifyBrowserSessionStoreError("count active browser sessions", err)
+		}
+		evictCount := activeCount - s.maxActive + 1
+		if evictCount > 0 {
+			result, err := conn.ExecContext(context.Background(), `
+				UPDATE browser_sessions
+				SET revoked_at = ?, revoke_reason = ?
+				WHERE id IN (
+					SELECT id
+					FROM browser_sessions
+					WHERE revoked_at = '' AND expires_at > ?
+					ORDER BY last_active_at ASC, created_at ASC, id ASC
+					LIMIT ?
+				)
+				AND revoked_at = ''
+			`,
+				formatBrowserSessionTime(now),
+				"session_limit",
+				formatBrowserSessionTime(now),
+				evictCount,
+			)
+			if err != nil {
+				return classifyBrowserSessionStoreError("evict browser sessions over active limit", err)
+			}
+			evicted, err := result.RowsAffected()
+			if err != nil {
+				return classifyBrowserSessionStoreError("read evicted browser session count", err)
+			}
+			if evicted != int64(evictCount) {
+				return fmt.Errorf(
+					"evict browser sessions over active limit: got %d want %d: %w",
+					evicted,
+					evictCount,
+					ErrBrowserSessionConflict,
+				)
+			}
+		}
+
+		_, err := conn.ExecContext(context.Background(), `
+			INSERT INTO browser_sessions (
+				id, token_hash, csrf_hash, csrf_expires_at, device_label,
+				user_agent_hash, created_at, last_active_at, expires_at,
+				revoked_at, revoke_reason
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
+		`,
+			session.ID,
+			tokenHash[:],
+			csrfHash[:],
+			formatBrowserSessionTime(csrfExpiresAt),
+			session.DeviceLabel,
+			userAgentHash[:],
+			formatBrowserSessionTime(now),
+			formatBrowserSessionTime(now),
+			formatBrowserSessionTime(expiresAt),
+		)
+		if err != nil {
+			return classifyBrowserSessionStoreError("insert browser session", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return BrowserSessionCredentials{}, fmt.Errorf("insert browser session: %w", err)
+		return BrowserSessionCredentials{}, fmt.Errorf("create browser session: %w", err)
 	}
 	return BrowserSessionCredentials{
 		Session:   session,
 		Token:     token,
 		CSRFToken: csrfToken,
 	}, nil
+}
+
+func (s *BrowserSessionStore) AuthenticateAndRenew(token string) (BrowserSessionAuth, error) {
+	if s == nil {
+		return BrowserSessionAuth{}, fmt.Errorf(
+			"authenticate browser session: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return BrowserSessionAuth{}, fmt.Errorf(
+			"authenticate browser session: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	tokenHash := sha256.Sum256([]byte(token))
+	now := s.now().UTC()
+	record, err := readBrowserSessionByToken(context.Background(), s.db, tokenHash[:])
+	if err != nil {
+		return BrowserSessionAuth{}, fmt.Errorf("authenticate browser session: %w", err)
+	}
+	if err := validateBrowserSessionActive(record.session, now); err != nil {
+		return BrowserSessionAuth{}, fmt.Errorf("authenticate browser session: %w", err)
+	}
+
+	auth := BrowserSessionAuth{
+		Session:         record.session,
+		CookieExpiresAt: record.session.ExpiresAt,
+	}
+	if !now.Before(record.session.LastActiveAt.Add(s.renewalInterval)) {
+		err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+			current, err := readBrowserSessionByToken(context.Background(), conn, tokenHash[:])
+			if err != nil {
+				return err
+			}
+			if err := validateBrowserSessionActive(current.session, now); err != nil {
+				return err
+			}
+			auth.Session = current.session
+			auth.CookieExpiresAt = current.session.ExpiresAt
+			if now.Before(current.session.LastActiveAt.Add(s.renewalInterval)) {
+				return nil
+			}
+			expiresAt := now.Add(s.ttl)
+			result, err := conn.ExecContext(context.Background(), `
+				UPDATE browser_sessions
+				SET last_active_at = ?, expires_at = ?
+				WHERE id = ? AND revoked_at = '' AND expires_at > ?
+			`,
+				formatBrowserSessionTime(now),
+				formatBrowserSessionTime(expiresAt),
+				current.session.ID,
+				formatBrowserSessionTime(now),
+			)
+			if err != nil {
+				return classifyBrowserSessionStoreError("renew browser session", err)
+			}
+			updated, err := result.RowsAffected()
+			if err != nil {
+				return classifyBrowserSessionStoreError("read browser session renewal count", err)
+			}
+			if updated != 1 {
+				return fmt.Errorf("renew browser session: %w", ErrBrowserSessionConflict)
+			}
+			auth.Renewed = true
+			auth.SetCookie = true
+			auth.CookieExpiresAt = expiresAt
+			return nil
+		})
+		if err != nil {
+			return BrowserSessionAuth{}, fmt.Errorf("authenticate browser session: %w", err)
+		}
+	}
+
+	auth.Session.LastActiveAt = now
+	auth.Session.ExpiresAt = now.Add(s.ttl)
+	return auth, nil
+}
+
+func (s *BrowserSessionStore) RotateCSRF(id string) (string, time.Time, error) {
+	if s == nil {
+		return "", time.Time{}, fmt.Errorf(
+			"rotate browser session CSRF: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return "", time.Time{}, fmt.Errorf(
+			"rotate browser session CSRF: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	now := s.now().UTC()
+	var csrfToken string
+	expiresAt := now.Add(browserSessionCSRFTTL)
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		record, err := readBrowserSessionByID(context.Background(), conn, id)
+		if err != nil {
+			return err
+		}
+		if err := validateBrowserSessionActive(record.session, now); err != nil {
+			return err
+		}
+
+		csrfToken, err = s.randomCredential()
+		if err != nil {
+			return fmt.Errorf(
+				"generate rotated CSRF credential: %v: %w",
+				err,
+				ErrBrowserSessionUnavailable,
+			)
+		}
+		csrfHash := sha256.Sum256([]byte(csrfToken))
+		var collisions int
+		if err := conn.QueryRowContext(
+			context.Background(),
+			`SELECT COUNT(*) FROM browser_sessions WHERE csrf_hash = ?`,
+			csrfHash[:],
+		).Scan(&collisions); err != nil {
+			return classifyBrowserSessionStoreError("check rotated CSRF collision", err)
+		}
+		if collisions != 0 {
+			return fmt.Errorf("rotate browser session CSRF: %w", ErrBrowserSessionConflict)
+		}
+
+		result, err := conn.ExecContext(context.Background(), `
+			UPDATE browser_sessions
+			SET csrf_hash = ?, csrf_expires_at = ?
+			WHERE id = ? AND revoked_at = '' AND expires_at > ?
+		`,
+			csrfHash[:],
+			formatBrowserSessionTime(expiresAt),
+			id,
+			formatBrowserSessionTime(now),
+		)
+		if err != nil {
+			return classifyBrowserSessionStoreError("persist rotated browser session CSRF", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return classifyBrowserSessionStoreError("read rotated browser session CSRF count", err)
+		}
+		if updated != 1 {
+			return fmt.Errorf("rotate browser session CSRF: %w", ErrBrowserSessionConflict)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("rotate browser session CSRF: %w", err)
+	}
+	return csrfToken, expiresAt, nil
+}
+
+func (s *BrowserSessionStore) ValidateCSRF(id, token string) error {
+	if s == nil {
+		return fmt.Errorf(
+			"validate browser session CSRF: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return fmt.Errorf(
+			"validate browser session CSRF: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	record, err := readBrowserSessionByID(context.Background(), s.db, id)
+	if err != nil {
+		return fmt.Errorf("validate browser session CSRF: %w", err)
+	}
+	now := s.now().UTC()
+	if err := validateBrowserSessionActive(record.session, now); err != nil {
+		return fmt.Errorf("validate browser session CSRF: %w", err)
+	}
+	if !record.csrfExpiresAt.After(now) {
+		return fmt.Errorf("validate browser session CSRF: %w", ErrBrowserSessionCSRFExpired)
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(tokenHash[:], record.csrfHash) != 1 {
+		return fmt.Errorf("validate browser session CSRF: %w", ErrBrowserSessionCSRFInvalid)
+	}
+	return nil
+}
+
+func (s *BrowserSessionStore) Revoke(id, reason string) error {
+	if s == nil {
+		return fmt.Errorf(
+			"revoke browser session: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return fmt.Errorf(
+			"revoke browser session: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	_, err := s.db.Exec(`
+		UPDATE browser_sessions
+		SET revoked_at = ?, revoke_reason = ?
+		WHERE id = ? AND revoked_at = ''
+	`, formatBrowserSessionTime(s.now().UTC()), strings.TrimSpace(reason), id)
+	if err != nil {
+		return classifyBrowserSessionStoreError("revoke browser session", err)
+	}
+	return nil
+}
+
+func (s *BrowserSessionStore) RevokeByToken(token, reason string) error {
+	if s == nil {
+		return fmt.Errorf(
+			"revoke browser session by token: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return fmt.Errorf(
+			"revoke browser session by token: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	_, err := s.db.Exec(`
+		UPDATE browser_sessions
+		SET revoked_at = ?, revoke_reason = ?
+		WHERE token_hash = ? AND revoked_at = ''
+	`, formatBrowserSessionTime(s.now().UTC()), strings.TrimSpace(reason), tokenHash[:])
+	if err != nil {
+		return classifyBrowserSessionStoreError("revoke browser session by token", err)
+	}
+	return nil
+}
+
+func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
+	if s == nil {
+		return 0, fmt.Errorf(
+			"revoke all browser sessions: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return 0, fmt.Errorf(
+			"revoke all browser sessions: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	result, err := s.db.Exec(`
+		UPDATE browser_sessions
+		SET revoked_at = ?, revoke_reason = ?
+		WHERE revoked_at = ''
+	`, formatBrowserSessionTime(s.now().UTC()), strings.TrimSpace(reason))
+	if err != nil {
+		return 0, classifyBrowserSessionStoreError("revoke all browser sessions", err)
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return 0, classifyBrowserSessionStoreError("read revoked browser session count", err)
+	}
+	return updated, nil
+}
+
+func (s *BrowserSessionStore) List() ([]BrowserSession, error) {
+	if s == nil {
+		return nil, fmt.Errorf(
+			"list browser sessions: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return nil, fmt.Errorf(
+			"list browser sessions: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id, device_label, created_at, last_active_at, expires_at,
+			revoked_at, revoke_reason, csrf_hash, csrf_expires_at
+		FROM browser_sessions
+		ORDER BY created_at DESC, id ASC
+	`)
+	if err != nil {
+		return nil, classifyBrowserSessionStoreError("list browser sessions", err)
+	}
+	defer rows.Close()
+
+	sessions := make([]BrowserSession, 0)
+	for rows.Next() {
+		row, err := scanBrowserSessionRow(rows)
+		if err != nil {
+			return nil, classifyBrowserSessionStoreError("scan listed browser session", err)
+		}
+		sessions = append(sessions, row.session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyBrowserSessionStoreError("iterate listed browser sessions", err)
+	}
+	return sessions, nil
+}
+
+func (s *BrowserSessionStore) Cleanup(retainAfter time.Duration) (int64, error) {
+	if retainAfter < 0 {
+		return 0, fmt.Errorf("cleanup browser sessions: negative retention: %w", ErrBrowserSessionConflict)
+	}
+	if s == nil {
+		return 0, fmt.Errorf(
+			"cleanup browser sessions: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return 0, fmt.Errorf(
+			"cleanup browser sessions: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	boundary := formatBrowserSessionTime(s.now().UTC().Add(-retainAfter))
+	result, err := s.db.Exec(`
+		DELETE FROM browser_sessions
+		WHERE (revoked_at <> '' AND revoked_at < ?) OR expires_at < ?
+	`, boundary, boundary)
+	if err != nil {
+		return 0, classifyBrowserSessionStoreError("cleanup browser sessions", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, classifyBrowserSessionStoreError("read cleaned browser session count", err)
+	}
+	return deleted, nil
 }
 
 func (s *BrowserSessionStore) randomCredential() (string, error) {
@@ -214,6 +661,169 @@ func (s *BrowserSessionStore) randomCredential() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(randomBytes), nil
+}
+
+type browserSessionRow struct {
+	session       BrowserSession
+	csrfHash      []byte
+	csrfExpiresAt time.Time
+}
+
+type browserSessionScanner interface {
+	Scan(dest ...any) error
+}
+
+type browserSessionQueryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func readBrowserSessionByToken(
+	ctx context.Context,
+	db browserSessionQueryRower,
+	tokenHash []byte,
+) (browserSessionRow, error) {
+	row, err := scanBrowserSessionRow(db.QueryRowContext(ctx, `
+		SELECT id, device_label, created_at, last_active_at, expires_at,
+			revoked_at, revoke_reason, csrf_hash, csrf_expires_at
+		FROM browser_sessions
+		WHERE token_hash = ?
+	`, tokenHash))
+	if errors.Is(err, sql.ErrNoRows) {
+		return browserSessionRow{}, ErrBrowserSessionMissing
+	}
+	if err != nil {
+		return browserSessionRow{}, classifyBrowserSessionStoreError("read browser session by token", err)
+	}
+	return row, nil
+}
+
+func readBrowserSessionByID(
+	ctx context.Context,
+	db browserSessionQueryRower,
+	id string,
+) (browserSessionRow, error) {
+	row, err := scanBrowserSessionRow(db.QueryRowContext(ctx, `
+		SELECT id, device_label, created_at, last_active_at, expires_at,
+			revoked_at, revoke_reason, csrf_hash, csrf_expires_at
+		FROM browser_sessions
+		WHERE id = ?
+	`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return browserSessionRow{}, ErrBrowserSessionMissing
+	}
+	if err != nil {
+		return browserSessionRow{}, classifyBrowserSessionStoreError("read browser session by ID", err)
+	}
+	return row, nil
+}
+
+func scanBrowserSessionRow(scanner browserSessionScanner) (browserSessionRow, error) {
+	var (
+		row                                browserSessionRow
+		createdAt, lastActiveAt, expiresAt string
+		revokedAt, csrfExpiresAt           string
+	)
+	if err := scanner.Scan(
+		&row.session.ID,
+		&row.session.DeviceLabel,
+		&createdAt,
+		&lastActiveAt,
+		&expiresAt,
+		&revokedAt,
+		&row.session.RevokeReason,
+		&row.csrfHash,
+		&csrfExpiresAt,
+	); err != nil {
+		return browserSessionRow{}, err
+	}
+
+	var err error
+	row.session.CreatedAt, err = parseBrowserSessionTime(createdAt)
+	if err != nil {
+		return browserSessionRow{}, err
+	}
+	row.session.LastActiveAt, err = parseBrowserSessionTime(lastActiveAt)
+	if err != nil {
+		return browserSessionRow{}, err
+	}
+	row.session.ExpiresAt, err = parseBrowserSessionTime(expiresAt)
+	if err != nil {
+		return browserSessionRow{}, err
+	}
+	if revokedAt != "" {
+		parsed, err := parseBrowserSessionTime(revokedAt)
+		if err != nil {
+			return browserSessionRow{}, err
+		}
+		row.session.RevokedAt = &parsed
+	}
+	row.csrfExpiresAt, err = parseBrowserSessionTime(csrfExpiresAt)
+	if err != nil {
+		return browserSessionRow{}, err
+	}
+	return row, nil
+}
+
+func validateBrowserSessionActive(session BrowserSession, now time.Time) error {
+	if session.RevokedAt != nil {
+		return ErrBrowserSessionRevoked
+	}
+	if !session.ExpiresAt.After(now) {
+		return ErrBrowserSessionExpired
+	}
+	return nil
+}
+
+func (s *BrowserSessionStore) withImmediateTransaction(
+	ctx context.Context,
+	work func(*sql.Conn) error,
+) error {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return classifyBrowserSessionStoreError("acquire browser session database connection", err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return classifyBrowserSessionStoreError("begin immediate browser session transaction", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), `ROLLBACK`)
+		}
+	}()
+	if err := work(conn); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return classifyBrowserSessionStoreError("commit browser session transaction", err)
+	}
+	committed = true
+	return nil
+}
+
+func classifyBrowserSessionStoreError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	for _, sentinel := range []error{
+		ErrBrowserSessionMissing,
+		ErrBrowserSessionExpired,
+		ErrBrowserSessionRevoked,
+		ErrBrowserSessionConflict,
+		ErrBrowserSessionUnavailable,
+		ErrBrowserSessionCSRFInvalid,
+		ErrBrowserSessionCSRFExpired,
+	} {
+		if errors.Is(err, sentinel) {
+			return fmt.Errorf("%s: %w", operation, err)
+		}
+	}
+	var sqliteError sqlite3.Error
+	if errors.As(err, &sqliteError) && sqliteError.Code == sqlite3.ErrConstraint {
+		return fmt.Errorf("%s: %w", operation, ErrBrowserSessionConflict)
+	}
+	return fmt.Errorf("%s: %v: %w", operation, err, ErrBrowserSessionUnavailable)
 }
 
 func formatBrowserSessionTime(value time.Time) string {
