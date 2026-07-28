@@ -31,10 +31,18 @@ const browserSessionState = {
   operationControllers: new Set(),
 };
 
+const sessionSettingsState = {
+  status: "loading",
+  session: null,
+  message: "正在读取当前会话…",
+  sequence: 0,
+};
+
 const browserSessionSignalKey = "kbase.browser-session.signal";
 let browserSessionChannel = null;
 const browserSessionSeenSignalNonces = new Set();
 const browserSessionSeenSignalNonceLimit = 128;
+const browserSessionSignalListeners = new Set();
 const guardedBrowserResponses = new WeakMap();
 
 const ROUTES = Object.freeze({
@@ -50,6 +58,7 @@ const ROUTES = Object.freeze({
   healthReleases: "/delivery/health/releases",
   operations: "/operations",
   jobs: "/jobs",
+  sessionSettings: "/settings/session",
 });
 
 const legacyRouteAliases = Object.freeze({
@@ -564,6 +573,9 @@ function applyBrowserSessionSignal(message) {
     }
   }
   resetBrowserSessionMemory(message.type, message.type === "logout-start");
+  for (const listener of browserSessionSignalListeners) {
+    listener(message.type);
+  }
 }
 
 if (typeof window.BroadcastChannel === "function") {
@@ -1474,10 +1486,271 @@ function renderShell(content, current = "") {
         <a class="${current === "agents" ? "active" : ""}" href="${escapeAttribute(ROUTES.agentPackages)}">Book Agents</a>
         <a class="${current === "operations" ? "active" : ""}" href="${escapeAttribute(ROUTES.operations)}">Operations</a>
         <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
+        <a class="web-nav__session ${current === "session" ? "active" : ""}" ${current === "session" ? 'aria-current="page"' : ""} href="${escapeAttribute(ROUTES.sessionSettings)}">会话</a>
       </nav>
     </header>
     ${content}
   `;
+}
+
+function formatSessionSettingsTime(value) {
+  if (!value) {
+    return "—";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "—";
+  }
+  return parsed.toLocaleString("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    hour12: false,
+  });
+}
+
+function syncSessionSettingsAnnouncement() {
+  const announcer = document.querySelector("#session-settings-announcer");
+  if (!announcer) {
+    return;
+  }
+  const { status, session, message } = sessionSettingsState;
+  const stateMessages = {
+    loading: message || "正在读取当前会话",
+    revoked: "当前会话已退出",
+    unauthorized: "尚未登录",
+    forbidden: "无权访问当前会话",
+    unavailable: "会话服务暂不可用",
+  };
+  const isLoading = status === "loading";
+  if (isLoading) {
+    announcer.setAttribute("aria-busy", "true");
+  }
+  announcer.textContent = status === "active" && session
+    ? `当前会话已登录。当前设备：${session.device_label || "当前浏览器"}。`
+    : (stateMessages[status] || stateMessages.unavailable);
+  if (!isLoading) {
+    announcer.setAttribute("aria-busy", "false");
+  }
+}
+
+function isSessionSettingsRoute() {
+  return getRoutePathname() === ROUTES.sessionSettings;
+}
+
+function sessionSettingsErrorStatus(error) {
+  if (error?.status === 401) {
+    return "unauthorized";
+  }
+  if (error?.status === 403) {
+    return "forbidden";
+  }
+  return "unavailable";
+}
+
+function handleSessionSettingsSignal(type) {
+  if (!isSessionSettingsRoute()) {
+    return;
+  }
+  if (type === "logout-start" || type === "logout") {
+    sessionSettingsState.sequence += 1;
+    sessionSettingsState.status = "revoked";
+    sessionSettingsState.session = null;
+    sessionSettingsState.message = "";
+    renderSessionSettings();
+    return;
+  }
+  if (type === "login") {
+    loadSessionSettings();
+  }
+}
+
+browserSessionSignalListeners.add(handleSessionSettingsSignal);
+
+function renderSessionSettings() {
+  const { status, session, message } = sessionSettingsState;
+  let panelBody = "";
+  if (status === "active" && session) {
+    panelBody = `
+      <div class="session-settings__panel-head">
+        <div>
+          <p class="web-kicker">Current session</p>
+          <h2>当前会话</h2>
+        </div>
+        <span class="session-settings__signal is-active">已登录</span>
+      </div>
+      <dl class="session-settings__details">
+        <div>
+          <dt>当前设备</dt>
+          <dd>${escapeHTML(session.device_label || "当前浏览器")}</dd>
+        </div>
+        <div>
+          <dt>最近活跃</dt>
+          <dd><time datetime="${escapeAttribute(session.last_active_at || "")}">${escapeHTML(formatSessionSettingsTime(session.last_active_at))}</time></dd>
+        </div>
+        <div>
+          <dt>到期时间</dt>
+          <dd><time datetime="${escapeAttribute(session.expires_at || "")}">${escapeHTML(formatSessionSettingsTime(session.expires_at))}</time></dd>
+        </div>
+      </dl>
+      <div class="session-settings__actions">
+        <p>退出后，此浏览器需要重新登录才能访问私有内容。</p>
+        <button class="button button-primary" type="button" data-session-logout>退出登录</button>
+      </div>
+    `;
+  } else {
+    const states = {
+      loading: ["正在读取当前会话", message || "正在读取当前会话…", ""],
+      revoked: ["当前会话已退出", "此浏览器的会话已经失效。", "login"],
+      unauthorized: ["尚未登录", "登录后可查看并管理当前浏览器会话。", "login"],
+      forbidden: ["无权访问当前会话", "当前凭据不能读取此会话。", "retry"],
+      unavailable: ["会话服务暂不可用", "服务暂时无法响应，请稍后重试。", "retry"],
+    };
+    const [title, description, action] = states[status] || states.unavailable;
+    panelBody = `
+      <div class="session-settings__state is-${escapeAttribute(status)}">
+        <span class="session-settings__state-mark" aria-hidden="true"></span>
+        <div>
+          <p class="web-kicker">Current session</p>
+          <h2>${escapeHTML(title)}</h2>
+          <p>${escapeHTML(description)}</p>
+        </div>
+        ${action === "login" ? '<button class="button button-primary" type="button" data-session-login>登录</button>' : ""}
+        ${action === "retry" ? '<button class="button button-ghost" type="button" data-session-retry>重新检查</button>' : ""}
+      </div>
+    `;
+  }
+
+  renderShell(`
+    <main class="session-settings">
+      <section class="session-settings__band" aria-labelledby="session-settings-title">
+        <div>
+          <p class="web-kicker">Browser access</p>
+          <h1 id="session-settings-title">会话</h1>
+          <p>查看当前浏览器的登录状态和有效期，或从这台设备安全退出。</p>
+        </div>
+      </section>
+      <section class="session-settings__panel" aria-busy="${status === "loading" ? "true" : "false"}">
+        ${panelBody}
+      </section>
+    </main>
+  `, "session");
+  syncSessionSettingsAnnouncement();
+  bindSessionSettingsEvents();
+}
+
+async function loadSessionSettings() {
+  const sequence = sessionSettingsState.sequence + 1;
+  sessionSettingsState.sequence = sequence;
+  sessionSettingsState.status = "loading";
+  sessionSettingsState.session = null;
+  sessionSettingsState.message = "正在读取当前会话…";
+  renderSessionSettings();
+  try {
+    const session = await loadBrowserSession();
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    if (session?.revoked_at) {
+      sessionSettingsState.status = "revoked";
+      sessionSettingsState.session = null;
+    } else {
+      sessionSettingsState.status = "active";
+      sessionSettingsState.session = session;
+    }
+  } catch (error) {
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.session = null;
+    sessionSettingsState.status = sessionSettingsErrorStatus(error);
+  }
+  if (
+    sequence === sessionSettingsState.sequence &&
+    isSessionSettingsRoute()
+  ) {
+    renderSessionSettings();
+  }
+}
+
+async function logoutCurrentSession() {
+  const sequence = sessionSettingsState.sequence + 1;
+  sessionSettingsState.sequence = sequence;
+  sessionSettingsState.status = "loading";
+  sessionSettingsState.message = "正在退出当前会话…";
+  renderSessionSettings();
+  try {
+    await logoutBrowserSession();
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.status = "revoked";
+    sessionSettingsState.session = null;
+  } catch (error) {
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.session = null;
+    sessionSettingsState.status = sessionSettingsErrorStatus(error);
+  }
+  if (
+    sequence === sessionSettingsState.sequence &&
+    isSessionSettingsRoute()
+  ) {
+    renderSessionSettings();
+  }
+}
+
+async function loginCurrentSession() {
+  const sequence = sessionSettingsState.sequence + 1;
+  sessionSettingsState.sequence = sequence;
+  sessionSettingsState.status = "loading";
+  sessionSettingsState.session = null;
+  sessionSettingsState.message = "正在建立当前会话…";
+  renderSessionSettings();
+  try {
+    await ensureBrowserSession();
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    await loadSessionSettings();
+  } catch (error) {
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.session = null;
+    sessionSettingsState.status = sessionSettingsErrorStatus(error);
+    renderSessionSettings();
+  }
+}
+
+function bindSessionSettingsEvents() {
+  app.querySelector("[data-session-logout]")?.addEventListener("click", () => {
+    return logoutCurrentSession();
+  });
+  app.querySelector("[data-session-retry]")?.addEventListener("click", () => {
+    return loadSessionSettings();
+  });
+  app.querySelector("[data-session-login]")?.addEventListener("click", () => {
+    return loginCurrentSession();
+  });
 }
 
 function renderDedaoHome() {
@@ -8268,6 +8541,11 @@ async function boot() {
   if (window.location.pathname === "/" || routePathname === ROUTES.dedaoHome) {
     renderDedaoHome();
     await loadDedaoHome();
+    return;
+  }
+  if (routePathname === ROUTES.sessionSettings) {
+    renderSessionSettings();
+    await loadSessionSettings();
     return;
   }
   if (routePathname === ROUTES.jobs || routePathname.startsWith(`${ROUTES.jobs}/`)) {
