@@ -99,6 +99,12 @@ func TestBrowserSessionStoreSchema(t *testing.T) {
 		revokedAtColumn.defaultValue != "''" {
 		t.Fatalf("revoked_at schema = %#v, want TEXT NOT NULL DEFAULT ''", revokedAtColumn)
 	}
+	deviceLabelColumn := columnDetails["device_label"]
+	if deviceLabelColumn.dataType != "TEXT" ||
+		!deviceLabelColumn.notNull ||
+		deviceLabelColumn.defaultValue != nil {
+		t.Fatalf("device_label schema = %#v, want TEXT NOT NULL without a default", deviceLabelColumn)
+	}
 
 	var indexSQL string
 	if err := db.QueryRow(`

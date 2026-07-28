@@ -200,7 +200,7 @@ func migrateBrowserSessionDB(db *sql.DB) error {
 			token_hash BLOB NOT NULL UNIQUE,
 			csrf_hash BLOB NOT NULL,
 			csrf_expires_at TEXT NOT NULL,
-			device_label TEXT NOT NULL DEFAULT '',
+			device_label TEXT NOT NULL,
 			user_agent_hash BLOB NOT NULL,
 			created_at TEXT NOT NULL,
 			last_active_at TEXT NOT NULL,
