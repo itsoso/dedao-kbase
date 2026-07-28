@@ -570,7 +570,7 @@ func isBrowserNumericLabel(label string) bool {
 	if allDecimal {
 		return true
 	}
-	if !strings.HasPrefix(label, "0x") || len(label) == 2 {
+	if !strings.HasPrefix(label, "0x") {
 		return false
 	}
 	for _, char := range label[2:] {
