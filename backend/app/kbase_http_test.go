@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1877,7 +1878,7 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	browserReq.Header.Set("X-KBase-Browser-Session", "1")
 	browserResp := httptest.NewRecorder()
 	handler.ServeHTTP(browserResp, browserReq)
-	if browserResp.Code != http.StatusUnauthorized || strings.Contains(browserResp.Body.String(), "admin-secret") {
+	if browserResp.Code != http.StatusGone || strings.Contains(browserResp.Body.String(), "admin-secret") {
 		t.Fatalf("agent token exchanged for browser token: status=%d body=%s", browserResp.Code, browserResp.Body.String())
 	}
 
@@ -2159,52 +2160,630 @@ func TestKBaseHTTPHandlerSetsSubscriptionEnabledWithoutReplacingCursor(t *testin
 	}
 }
 
-func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
+const (
+	testKBaseAuthToken          = "kbase-api-token-must-not-leak"
+	testBrowserSessionSecret    = "browser-proxy-secret-0123456789abcdef"
+	testBrowserSessionOrigin    = "https://kbase.example"
+	testBrowserSessionCookieTTL = 30 * 24 * time.Hour
+)
+
+func TestKBaseHTTPHandlerBrowserSessionMethodRulesAndAuthorizationRejection(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 401)
+
+	for _, method := range []string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions,
+	} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "/browser/session", nil)
+			request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405; body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Allow"); got != http.MethodPost {
+				t.Fatalf("Allow = %q, want POST", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+
+	for _, authorization := range []string{"", " ", "Basic forwarded", "Bearer forwarded"} {
+		t.Run("authorization_"+fmt.Sprintf("%q", authorization), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+			request.Header.Set("Authorization", authorization)
+			request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 0)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionProxyConstantTimeBoundaryAndCookieContract(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 402)
+
+	rejectedSecrets := []struct {
+		name   string
+		values []string
+	}{
+		{name: "missing"},
+		{name: "short_prefix", values: []string{strings.TrimSuffix(testBrowserSessionSecret, "f")}},
+		{name: "long_suffix", values: []string{testBrowserSessionSecret + "x"}},
+		{name: "leading_space", values: []string{" " + testBrowserSessionSecret}},
+		{name: "trailing_space", values: []string{testBrowserSessionSecret + " "}},
+		{name: "oversized", values: []string{strings.Repeat("x", 1024)}},
+		{name: "duplicate", values: []string{testBrowserSessionSecret, testBrowserSessionSecret}},
+	}
+	for _, testCase := range rejectedSecrets {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+			for _, value := range testCase.values {
+				request.Header.Add("X-KBase-Browser-Session", value)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 0)
+
+	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	request.Header.Set(
+		"User-Agent",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionPublicResponse(t, response, "Chrome on macOS")
+	cookie := requireKBaseBrowserSessionCookie(t, response)
+	if cookie.Value == "" || cookie.Value == testKBaseAuthToken || cookie.Value == testBrowserSessionSecret {
+		t.Fatalf("session Cookie value is invalid or reused a configured secret")
+	}
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("session Cookie flags = Secure:%t HttpOnly:%t SameSite:%v", cookie.Secure, cookie.HttpOnly, cookie.SameSite)
+	}
+	if cookie.Path != "/" || cookie.Domain != "" {
+		t.Fatalf("session Cookie scope = Path:%q Domain:%q", cookie.Path, cookie.Domain)
+	}
+	if cookie.MaxAge != int(testBrowserSessionCookieTTL/time.Second) {
+		t.Fatalf("session Cookie MaxAge = %d, want %d", cookie.MaxAge, int(testBrowserSessionCookieTTL/time.Second))
+	}
+	if want := clock.Now().Add(testBrowserSessionCookieTTL); !cookie.Expires.Equal(want) {
+		t.Fatalf("session Cookie Expires = %s, want %s", cookie.Expires, want)
+	}
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionUnavailableIsGeneric(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:                NewBookKnowledgeStore(t.TempDir()),
-		AuthToken:            "secret-token",
-		BrowserSessionSecret: "browser-proxy-secret-0123456789abcdef",
+		AuthToken:            testKBaseAuthToken,
+		BrowserSessionSecret: testBrowserSessionSecret,
+		BrowserSessions: BrowserSessionHTTPConfig{
+			PublicOrigin: testBrowserSessionOrigin,
+		},
 	})
+	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
 
-	req := httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("status without trusted header = %d, want 401", resp.Code)
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+		t.Fatalf("unavailable response = status %d body %q", response.Code, response.Body.String())
 	}
-	if strings.Contains(resp.Body.String(), "secret-token") {
-		t.Fatalf("untrusted response leaked token: %s", resp.Body.String())
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionDeviceLabelPrivacyAndBounds(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 403)
+	const maxBoundedUserAgentBytes = 512
+	rawUserAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/126.0.0.0 " +
+		strings.Repeat("x", maxBoundedUserAgentBytes) +
+		" private-device-name raw-user-agent-tail"
+
+	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	request.Header.Set("User-Agent", rawUserAgent)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionPublicResponse(t, response, "Edge on Windows")
+	body := response.Body.String()
+	for _, privateValue := range []string{"126.0.0.0", "private-device-name", "raw-user-agent-tail", rawUserAgent} {
+		if strings.Contains(body, privateValue) {
+			t.Fatalf("public response exposed User-Agent detail %q: %s", privateValue, body)
+		}
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	req.Header.Set("X-KBase-Browser-Session", "1")
-	resp = httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("status with forgeable header = %d, want 401", resp.Code)
+	sessions, err := sessionStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].DeviceLabel != "Edge on Windows" ||
+		len(sessions[0].DeviceLabel) > 64 {
+		t.Fatalf("stored public device metadata = %#v", sessions)
+	}
+	var storedUserAgentHash []byte
+	if err := sessionStore.db.QueryRow(
+		`SELECT user_agent_hash FROM browser_sessions WHERE id = ?`,
+		sessions[0].ID,
+	).Scan(&storedUserAgentHash); err != nil {
+		t.Fatal(err)
+	}
+	wantHash := sha256.Sum256([]byte(rawUserAgent[:maxBoundedUserAgentBytes]))
+	if !bytes.Equal(storedUserAgentHash, wantHash[:]) {
+		t.Fatalf("stored User-Agent hash was not computed from the bounded header")
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationMethodAndExactOriginRules(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 404)
+
+	for _, method := range []string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions,
+	} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "/browser/session/migrate", nil)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405; body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Allow"); got != http.MethodPost {
+				t.Fatalf("Allow = %q, want POST", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	req.Header.Set("X-KBase-Browser-Session", "browser-proxy-secret-0123456789abcdef")
-	resp = httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status with trusted header = %d, body=%s", resp.Code, resp.Body.String())
+	for _, origin := range []string{
+		"",
+		"http://kbase.example",
+		testBrowserSessionOrigin + "/",
+		"https://KBASE.example",
+		" " + testBrowserSessionOrigin,
+		testBrowserSessionOrigin + " ",
+		strings.Repeat("x", 4096),
+	} {
+		t.Run("origin_"+fmt.Sprintf("%q", origin), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+			if origin != "" {
+				request.Header.Set("Origin", origin)
+			}
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden ||
+				response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+				t.Fatalf("origin %q response = status %d body %q", origin, response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
 	}
-	if !strings.Contains(resp.Body.String(), `"token":"secret-token"`) {
-		t.Fatalf("trusted response missing token: %s", resp.Body.String())
+
+	duplicateOrigin := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	duplicateOrigin.Header.Add("Origin", testBrowserSessionOrigin)
+	duplicateOrigin.Header.Add("Origin", testBrowserSessionOrigin)
+	duplicateOrigin.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	duplicateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(duplicateResponse, duplicateOrigin)
+	if duplicateResponse.Code != http.StatusForbidden {
+		t.Fatalf("duplicate Origin status = %d, want 403", duplicateResponse.Code)
 	}
-	if got := resp.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+	assertKBaseBrowserSessionCount(t, sessionStore, 0)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationValidCookieIsIdempotent(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 405)
+	credentials, err := sessionStore.Create(BrowserSessionCreate{
+		DeviceLabel: "Existing Browser",
+		UserAgent:   "existing-agent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	migrate := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer intentionally-invalid-token")
+		request.AddCookie(&http.Cookie{
+			Name:  "__Host-kbase_session",
+			Value: credentials.Token,
+		})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	response := migrate()
+	if response.Code != http.StatusOK {
+		t.Fatalf("idempotent migration status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionResponseID(t, response, credentials.Session.ID)
+	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("migration refreshed Cookie inside lifecycle window: %q", got)
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+
+	clock.Advance(5 * time.Minute)
+	renewed := migrate()
+	if renewed.Code != http.StatusOK {
+		t.Fatalf("renewed migration status = %d, body=%s", renewed.Code, renewed.Body.String())
+	}
+	assertKBaseBrowserSessionResponseID(t, renewed, credentials.Session.ID)
+	refreshedCookie := requireKBaseBrowserSessionCookie(t, renewed)
+	if want := clock.Now().Add(testBrowserSessionCookieTTL); !refreshedCookie.Expires.Equal(want) {
+		t.Fatalf("refreshed Cookie Expires = %s, want %s", refreshedCookie.Expires, want)
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationValidBearerCreatesSession(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 406)
+	request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	request.Header.Set("Origin", testBrowserSessionOrigin)
+	request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	request.Header.Set(
+		"User-Agent",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Version/17.5 Mobile/15E148 Safari/604.1",
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("migration status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionPublicResponse(t, response, "Safari on iOS")
+	requireKBaseBrowserSessionCookie(t, response)
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationInvalidCredentialsAreIndistinguishable(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 407)
+	revoked, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Revoked Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessionStore.RevokeByToken(revoked.Token, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name          string
+		authorization string
+		cookieToken   string
+		wantClear     bool
+	}{
+		{name: "missing"},
+		{name: "invalid_bearer", authorization: "Bearer invalid-token"},
+		{name: "unknown_cookie", cookieToken: "unknown-session-token", wantClear: true},
+		{name: "revoked_cookie", cookieToken: revoked.Token, wantClear: true},
+		{
+			name:          "revoked_cookie_and_invalid_bearer",
+			authorization: "Bearer invalid-token",
+			cookieToken:   revoked.Token,
+			wantClear:     true,
+		},
+	}
+	var wantStatus int
+	var wantBody string
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			if testCase.authorization != "" {
+				request.Header.Set("Authorization", testCase.authorization)
+			}
+			if testCase.cookieToken != "" {
+				request.AddCookie(&http.Cookie{
+					Name:  "__Host-kbase_session",
+					Value: testCase.cookieToken,
+				})
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if index == 0 {
+				wantStatus = response.Code
+				wantBody = response.Body.String()
+			}
+			if response.Code != wantStatus || response.Body.String() != wantBody {
+				t.Fatalf(
+					"response = status %d body %q, want status %d body %q",
+					response.Code,
+					response.Body.String(),
+					wantStatus,
+					wantBody,
+				)
+			}
+			if response.Code != http.StatusUnauthorized ||
+				response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+				t.Fatalf("generic credential response = status %d body %q", response.Code, response.Body.String())
+			}
+			if testCase.wantClear {
+				cookie := requireKBaseBrowserSessionCookie(t, response)
+				if cookie.Value != "" || cookie.MaxAge >= 0 || !cookie.Expires.Before(clock.Now()) {
+					t.Fatalf("cleared Cookie = %#v", cookie)
+				}
+				if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode ||
+					cookie.Path != "/" || cookie.Domain != "" {
+					t.Fatalf("cleared Cookie flags/scope = %#v", cookie)
+				}
+			} else if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("credential response unexpectedly changed Cookie: %q", got)
+			}
+			assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+		})
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationUnavailableDoesNotClearCookie(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 408)
+	credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Unavailable Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessionStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	request.Header.Set("Origin", testBrowserSessionOrigin)
+	request.AddCookie(&http.Cookie{
+		Name:  "__Host-kbase_session",
+		Value: credentials.Token,
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+		t.Fatalf("unavailable migration response = status %d body %q", response.Code, response.Body.String())
+	}
+	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("store-unavailable migration changed Cookie: %q", got)
+	}
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+}
+
+func TestKBaseHTTPHandlerBrowserLegacyTokenRetired(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            testKBaseAuthToken,
+		BrowserSessionSecret: testBrowserSessionSecret,
+	})
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "/browser/session-token", nil)
+			request.Header.Set("Authorization", "Bearer forwarded-token")
+			request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusGone {
+				t.Fatalf("status = %d, want 410; body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+			if method == http.MethodGet {
+				guidance := strings.ToLower(response.Body.String())
+				if !strings.Contains(guidance, "/browser/session") ||
+					!strings.Contains(guidance, "migrat") {
+					t.Fatalf("retirement guidance is not actionable: %s", response.Body.String())
+				}
+			} else if response.Body.Len() != 0 {
+				t.Fatalf("HEAD response body = %q, want empty", response.Body.String())
+			}
+			assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+		})
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		request := httptest.NewRequest(method, "/browser/session-token", nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d, want 405", method, response.Code)
+		}
+		assertKBaseBrowserSessionNoStore(t, response)
+		assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+	}
+}
+
+func newKBaseBrowserSessionHTTPTestHandler(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+) (http.Handler, *BrowserSessionStore) {
+	t.Helper()
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(randomSeed, 32)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sessionStore.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            testKBaseAuthToken,
+		BrowserSessionSecret: testBrowserSessionSecret,
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           sessionStore,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+	return handler, sessionStore
+}
+
+func assertKBaseBrowserSessionNoStore(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
+}
 
-	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	req.Header.Set("Authorization", "Basic browser-credential")
-	req.Header.Set("X-KBase-Browser-Session", "browser-proxy-secret-0123456789abcdef")
-	resp = httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("status with forwarded basic auth = %d, want 401", resp.Code)
+func assertKBaseBrowserSessionPublicResponse(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantDeviceLabel string,
+) {
+	t.Helper()
+	var payload struct {
+		Session BrowserSession `json:"session"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode browser session response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Session.ID == "" || payload.Session.DeviceLabel != wantDeviceLabel {
+		t.Fatalf("public session metadata = %#v, want device label %q", payload.Session, wantDeviceLabel)
+	}
+	lowerBody := strings.ToLower(response.Body.String())
+	for _, privateField := range []string{`"token"`, `"csrf`, `"user_agent"`, `"hash"`} {
+		if strings.Contains(lowerBody, privateField) {
+			t.Fatalf("browser session response contains private field %q: %s", privateField, response.Body.String())
+		}
+	}
+}
+
+func assertKBaseBrowserSessionResponseID(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantID string,
+) {
+	t.Helper()
+	var payload struct {
+		Session BrowserSession `json:"session"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode browser session response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Session.ID != wantID {
+		t.Fatalf("session ID = %q, want %q", payload.Session.ID, wantID)
+	}
+}
+
+func requireKBaseBrowserSessionCookie(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) *http.Cookie {
+	t.Helper()
+	var sessionCookies []*http.Cookie
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == "__Host-kbase_session" {
+			sessionCookies = append(sessionCookies, cookie)
+		}
+	}
+	if len(sessionCookies) != 1 {
+		t.Fatalf("session Cookies = %#v, want exactly one", sessionCookies)
+	}
+	return sessionCookies[0]
+}
+
+func assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	headers := fmt.Sprint(response.Header())
+	for _, secret := range []string{testKBaseAuthToken, testBrowserSessionSecret} {
+		if strings.Contains(response.Body.String(), secret) || strings.Contains(headers, secret) {
+			t.Fatalf("response leaked configured secret: status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+		}
+	}
+}
+
+func assertKBaseBrowserSessionCount(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+	want int,
+) {
+	t.Helper()
+	sessions, err := sessionStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != want {
+		t.Fatalf("browser session count = %d, want %d", len(sessions), want)
 	}
 }
 

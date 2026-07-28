@@ -252,10 +252,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if r.URL.Path == "/browser/session-token" {
-		h.handleBrowserSessionToken(w, r)
+	if h.handleBrowserSessionRoute(w, r) {
 		return
 	}
+
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
 		h.serveStatic(w, r)
 		return
@@ -2614,32 +2614,32 @@ func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected strin
 	return true
 }
 
-func (h *kbaseHTTPHandler) handleBrowserSessionToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+func (h *kbaseHTTPHandler) handleLegacyBrowserToken(w http.ResponseWriter, r *http.Request) {
+	setBrowserSessionNoStore(w)
+	w.Header().Set("Allow", http.MethodGet+", "+http.MethodHead)
+	switch r.Method {
+	case http.MethodGet:
+		writeHTTPJSON(w, http.StatusGone, map[string]any{
+			"error":     "browser token exchange retired",
+			"migration": "use POST /browser/session or POST /browser/session/migrate",
+		})
+	case http.MethodHead:
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusGone)
+	default:
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
 	}
+}
+
+func setBrowserSessionNoStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
-	if strings.TrimSpace(r.Header.Get("Authorization")) != "" {
-		writeHTTPError(w, http.StatusUnauthorized, "browser session does not accept bearer authorization")
-		return
-	}
-	if h.authToken == "" {
-		writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
-		return
-	}
-	proxySecret := strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session"))
-	if h.browserSessionSecret == "" ||
-		subtle.ConstantTimeCompare(
-			[]byte(proxySecret),
-			[]byte(h.browserSessionSecret),
-		) != 1 {
-		writeHTTPError(w, http.StatusUnauthorized, "browser session is not authorized")
-		return
-	}
+}
+
+// Responses are intentionally limited to public session metadata.
+func writeBrowserSessionMetadata(w http.ResponseWriter, session BrowserSession) {
 	writeHTTPJSON(w, http.StatusOK, map[string]any{
-		"token": h.authToken,
+		"session": session,
 	})
 }
 
@@ -3630,4 +3630,260 @@ func normalizeBrowserSessionHTTPConfig(cfg BrowserSessionHTTPConfig) BrowserSess
 		cfg.MaxActive = 10
 	}
 	return cfg
+}
+
+const (
+	browserSessionCookieName            = "__Host-kbase_session"
+	browserSessionProxyHeaderName       = "X-KBase-Browser-Session"
+	maxBrowserSessionProxySecretBytes   = 256
+	maxBrowserSessionAuthorizationBytes = 4096
+	maxBrowserSessionOriginBytes        = 2048
+	maxBrowserSessionCookieBytes        = 256
+	maxBrowserSessionUserAgentBytes     = 512
+)
+
+func (h *kbaseHTTPHandler) handleBrowserSessionRoute(w http.ResponseWriter, r *http.Request) bool {
+	switch r.URL.Path {
+	case "/browser/session":
+		h.handleBrowserSessionLogin(w, r)
+	case "/browser/session/migrate":
+		h.handleBrowserSessionMigration(w, r)
+	case "/browser/session-token":
+		h.handleLegacyBrowserToken(w, r)
+	default:
+		return false
+	}
+	return true
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *http.Request) {
+	setBrowserSessionNoStore(w)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if len(r.Header.Values("Authorization")) != 0 {
+		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if h.browserSessionSecret == "" || h.browserSessions.Store == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	proxySecret, ok := singleBoundedHeader(
+		r,
+		browserSessionProxyHeaderName,
+		maxBrowserSessionProxySecretBytes,
+	)
+	if !ok || !constantTimeStringEqual(proxySecret, h.browserSessionSecret) {
+		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	userAgent := boundedUserAgent(r)
+	credentials, err := h.browserSessions.Store.Create(BrowserSessionCreate{
+		DeviceLabel: browserSessionDeviceLabel(userAgent),
+		UserAgent:   userAgent,
+	})
+	if err != nil {
+		writeBrowserSessionStoreError(w, err)
+		return
+	}
+	setBrowserSessionCookie(w, credentials.Token, credentials.Session.ExpiresAt)
+	writeBrowserSessionMetadata(w, credentials.Session)
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, r *http.Request) {
+	setBrowserSessionNoStore(w)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.browserSessions.Store == nil || h.browserSessions.PublicOrigin == "" {
+		writeHTTPError(w, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
+	origin, ok := singleBoundedHeader(r, "Origin", maxBrowserSessionOriginBytes)
+	if !ok || origin != h.browserSessions.PublicOrigin {
+		writeHTTPError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	sessionToken, cookiePresent, cookieValid := browserSessionCookieToken(r)
+	if cookieValid {
+		auth, err := h.browserSessions.Store.AuthenticateAndRenew(sessionToken)
+		if err == nil {
+			if auth.SetCookie {
+				setBrowserSessionCookie(w, sessionToken, auth.CookieExpiresAt)
+			}
+			writeBrowserSessionMetadata(w, auth.Session)
+			return
+		}
+		if !isBrowserSessionCredentialError(err) {
+			writeBrowserSessionStoreError(w, err)
+			return
+		}
+	}
+
+	if validBrowserSessionMigrationBearer(r, h.authToken) {
+		userAgent := boundedUserAgent(r)
+		credentials, err := h.browserSessions.Store.Create(BrowserSessionCreate{
+			DeviceLabel: browserSessionDeviceLabel(userAgent),
+			UserAgent:   userAgent,
+		})
+		if err != nil {
+			writeBrowserSessionStoreError(w, err)
+			return
+		}
+		setBrowserSessionCookie(w, credentials.Token, credentials.Session.ExpiresAt)
+		writeBrowserSessionMetadata(w, credentials.Session)
+		return
+	}
+
+	if cookiePresent {
+		clearBrowserSessionCookie(w)
+	}
+	writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+}
+
+func setBrowserSessionCookie(w http.ResponseWriter, token string, expires time.Time) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     browserSessionCookieName,
+		Value:    token,
+		Path:     "/",
+		Expires:  expires.UTC(),
+		MaxAge:   int(defaultBrowserSessionTTL / time.Second),
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func clearBrowserSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     browserSessionCookieName,
+		Value:    "",
+		Path:     "/",
+		Expires:  time.Unix(1, 0).UTC(),
+		MaxAge:   -1,
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func writeBrowserSessionStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrBrowserSessionConflict) {
+		writeHTTPError(w, http.StatusConflict, "session conflict")
+		return
+	}
+	writeHTTPError(w, http.StatusServiceUnavailable, "service unavailable")
+}
+
+func isBrowserSessionCredentialError(err error) bool {
+	return errors.Is(err, ErrBrowserSessionMissing) ||
+		errors.Is(err, ErrBrowserSessionExpired) ||
+		errors.Is(err, ErrBrowserSessionRevoked)
+}
+
+func singleBoundedHeader(r *http.Request, name string, maxBytes int) (string, bool) {
+	values := r.Header.Values(name)
+	if len(values) != 1 || len(values[0]) > maxBytes {
+		return "", false
+	}
+	return values[0], true
+}
+
+func boundedUserAgent(r *http.Request) string {
+	values := r.Header.Values("User-Agent")
+	if len(values) != 1 {
+		return ""
+	}
+	userAgent := values[0]
+	if len(userAgent) > maxBrowserSessionUserAgentBytes {
+		userAgent = userAgent[:maxBrowserSessionUserAgentBytes]
+	}
+	return userAgent
+}
+
+func browserSessionCookieToken(r *http.Request) (token string, present bool, valid bool) {
+	for _, cookie := range r.Cookies() {
+		if cookie.Name != browserSessionCookieName {
+			continue
+		}
+		if present {
+			return "", true, false
+		}
+		present = true
+		token = cookie.Value
+	}
+	if !present || token == "" || len(token) > maxBrowserSessionCookieBytes {
+		return token, present, false
+	}
+	return token, true, true
+}
+
+func validBrowserSessionMigrationBearer(r *http.Request, expected string) bool {
+	if expected == "" {
+		return false
+	}
+	value, ok := singleBoundedHeader(
+		r,
+		"Authorization",
+		maxBrowserSessionAuthorizationBytes,
+	)
+	if !ok {
+		return false
+	}
+	value = strings.TrimSpace(value)
+	const prefix = "Bearer "
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(value, prefix))
+	return token != "" && constantTimeStringEqual(token, expected)
+}
+
+func constantTimeStringEqual(left, right string) bool {
+	leftHash := sha256.Sum256([]byte(left))
+	rightHash := sha256.Sum256([]byte(right))
+	return subtle.ConstantTimeCompare(leftHash[:], rightHash[:]) == 1
+}
+
+func browserSessionDeviceLabel(userAgent string) string {
+	lower := strings.ToLower(userAgent)
+	browser := "Other Browser"
+	switch {
+	case strings.Contains(lower, "edg/") ||
+		strings.Contains(lower, "edga/") ||
+		strings.Contains(lower, "edgios/"):
+		browser = "Edge"
+	case strings.Contains(lower, "firefox/") || strings.Contains(lower, "fxios/"):
+		browser = "Firefox"
+	case strings.Contains(lower, "chrome/") || strings.Contains(lower, "crios/"):
+		browser = "Chrome"
+	case strings.Contains(lower, "safari/"):
+		browser = "Safari"
+	}
+
+	operatingSystem := "Other OS"
+	switch {
+	case strings.Contains(lower, "iphone") ||
+		strings.Contains(lower, "ipad") ||
+		strings.Contains(lower, "ipod"):
+		operatingSystem = "iOS"
+	case strings.Contains(lower, "android"):
+		operatingSystem = "Android"
+	case strings.Contains(lower, "windows"):
+		operatingSystem = "Windows"
+	case strings.Contains(lower, "cros"):
+		operatingSystem = "ChromeOS"
+	case strings.Contains(lower, "mac os x") || strings.Contains(lower, "macintosh"):
+		operatingSystem = "macOS"
+	case strings.Contains(lower, "linux"):
+		operatingSystem = "Linux"
+	}
+	return browser + " on " + operatingSystem
 }
