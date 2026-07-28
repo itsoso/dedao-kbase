@@ -307,7 +307,7 @@ func TestBrowserSessionStoreTimeTextOrdering(t *testing.T) {
 		randomBytes[index] = byte(index + 1)
 	}
 	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
-		Path:            filepath.Join(t.TempDir(), "sessions.sqlite3"),
+		Path:            newBrowserSessionTestDBPath(t),
 		Now:             func() time.Time { return current },
 		Random:          bytes.NewReader(randomBytes),
 		TTL:             time.Hour,
@@ -366,60 +366,45 @@ func TestBrowserSessionStoreTimeTextOrdering(t *testing.T) {
 }
 
 func TestBrowserSessionStoreMigratesLegacyV0(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "browser_sessions.sqlite3")
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = db.Exec(`
-		CREATE TABLE browser_sessions (
-			id TEXT PRIMARY KEY,
-			token_hash BLOB NOT NULL UNIQUE,
-			csrf_hash BLOB NOT NULL,
-			csrf_expires_at TEXT NOT NULL,
-			device_label TEXT NOT NULL DEFAULT '',
-			user_agent_hash BLOB NOT NULL,
-			created_at TEXT NOT NULL,
-			last_active_at TEXT NOT NULL,
-			expires_at TEXT NOT NULL,
-			revoked_at TEXT,
-			revoke_reason TEXT NOT NULL DEFAULT ''
-		);
-		CREATE INDEX idx_browser_sessions_active_token
-			ON browser_sessions(token_hash)
-			WHERE revoked_at IS NULL;
-	`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dbPath := newBrowserSessionTestDBPath(t)
 	tokenHash := sha256.Sum256([]byte("legacy-token"))
 	csrfHash := sha256.Sum256([]byte("legacy-csrf"))
 	userAgentHash := sha256.Sum256([]byte("legacy-agent"))
+	secondTokenHash := sha256.Sum256([]byte("legacy-token-second"))
+	secondCSRFHash := sha256.Sum256([]byte("legacy-csrf-second"))
+	secondUserAgentHash := sha256.Sum256([]byte("legacy-agent-second"))
+	revokedAt := "2026-07-28T12:05:00.1Z"
 	const (
-		sessionID      = "session_legacy"
-		csrfExpiresAt  = "2026-07-28T12:15:00.000000000Z"
-		deviceLabel    = "Legacy Browser"
-		createdAt      = "2026-07-28T12:00:00.000000000Z"
-		lastActiveAt   = "2026-07-28T12:01:00.000000000Z"
-		expiresAt      = "2026-08-27T12:01:00.000000000Z"
-		legacyRevoke   = ""
-		legacyReason   = ""
-		expectedSchema = 1
+		sessionID       = "session_legacy"
+		secondSessionID = "session_legacy_second"
 	)
-	_, err = db.Exec(`
-		INSERT INTO browser_sessions (
-			id, token_hash, csrf_hash, csrf_expires_at, device_label,
-			user_agent_hash, created_at, last_active_at, expires_at,
-			revoked_at, revoke_reason
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-	`, sessionID, tokenHash[:], csrfHash[:], csrfExpiresAt, deviceLabel,
-		userAgentHash[:], createdAt, lastActiveAt, expiresAt, legacyReason)
-	if err != nil {
-		t.Fatal(err)
+	seeds := []legacyBrowserSessionSeed{
+		{
+			id:            sessionID,
+			tokenHash:     tokenHash[:],
+			csrfHash:      csrfHash[:],
+			csrfExpiresAt: "2026-07-28T12:15:00Z",
+			deviceLabel:   "Legacy Browser",
+			userAgentHash: userAgentHash[:],
+			createdAt:     "2026-07-28T12:00:00Z",
+			lastActiveAt:  "2026-07-28T12:01:00.1Z",
+			expiresAt:     "2026-08-27T12:01:00Z",
+			revokedAt:     &revokedAt,
+			revokeReason:  "signed out",
+		},
+		{
+			id:            secondSessionID,
+			tokenHash:     secondTokenHash[:],
+			csrfHash:      secondCSRFHash[:],
+			csrfExpiresAt: "2026-07-28T12:15:00.1Z",
+			deviceLabel:   "Second Browser",
+			userAgentHash: secondUserAgentHash[:],
+			createdAt:     "2026-07-28T12:00:00.1Z",
+			lastActiveAt:  "2026-07-28T12:01:00.100000001Z",
+			expiresAt:     "2026-08-27T12:01:00.1Z",
+		},
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	seedLegacyBrowserSessionDB(t, dbPath, false, seeds)
 
 	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
 	if err != nil {
@@ -431,63 +416,143 @@ func TestBrowserSessionStoreMigratesLegacyV0(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != expectedSchema {
-		t.Fatalf("migrated schema version = %d, want %d", schemaVersion, expectedSchema)
+	if schemaVersion != 1 {
+		t.Fatalf("migrated schema version = %d, want 1", schemaVersion)
 	}
-	var (
-		gotID, gotCSRFExpiresAt, gotDeviceLabel     string
-		gotCreatedAt, gotLastActiveAt, gotExpiresAt string
-		gotRevokedAt, gotRevokeReason               string
-		gotTokenHash, gotCSRFHash, gotUserAgentHash []byte
-	)
-	err = store.db.QueryRow(`
-		SELECT id, token_hash, csrf_hash, csrf_expires_at, device_label,
-			user_agent_hash, created_at, last_active_at, expires_at,
-			revoked_at, revoke_reason
-		FROM browser_sessions
-		WHERE id = ?
-	`, sessionID).Scan(
-		&gotID, &gotTokenHash, &gotCSRFHash, &gotCSRFExpiresAt, &gotDeviceLabel,
-		&gotUserAgentHash, &gotCreatedAt, &gotLastActiveAt, &gotExpiresAt,
-		&gotRevokedAt, &gotRevokeReason,
-	)
+
+	for _, seed := range seeds {
+		got := readLegacyBrowserSessionSeed(t, store.db, seed.id)
+		if got.id != seed.id ||
+			!bytes.Equal(got.tokenHash, seed.tokenHash) ||
+			!bytes.Equal(got.csrfHash, seed.csrfHash) ||
+			got.deviceLabel != seed.deviceLabel ||
+			!bytes.Equal(got.userAgentHash, seed.userAgentHash) ||
+			got.revokeReason != seed.revokeReason {
+			t.Fatalf("legacy non-time data changed during migration for %s", seed.id)
+		}
+		assertCanonicalMigratedTime(t, "csrf_expires_at", seed.csrfExpiresAt, got.csrfExpiresAt)
+		assertCanonicalMigratedTime(t, "created_at", seed.createdAt, got.createdAt)
+		assertCanonicalMigratedTime(t, "last_active_at", seed.lastActiveAt, got.lastActiveAt)
+		assertCanonicalMigratedTime(t, "expires_at", seed.expiresAt, got.expiresAt)
+		if seed.revokedAt == nil {
+			if got.revokedAt != "" {
+				t.Fatalf("migrated revoked_at for %s = %q, want empty", seed.id, got.revokedAt)
+			}
+		} else {
+			assertCanonicalMigratedTime(t, "revoked_at", *seed.revokedAt, got.revokedAt)
+		}
+	}
+
+	rows, err := store.db.Query(`SELECT id FROM browser_sessions ORDER BY last_active_at`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gotID != sessionID ||
-		!bytes.Equal(gotTokenHash, tokenHash[:]) ||
-		!bytes.Equal(gotCSRFHash, csrfHash[:]) ||
-		gotCSRFExpiresAt != csrfExpiresAt ||
-		gotDeviceLabel != deviceLabel ||
-		!bytes.Equal(gotUserAgentHash, userAgentHash[:]) ||
-		gotCreatedAt != createdAt ||
-		gotLastActiveAt != lastActiveAt ||
-		gotExpiresAt != expiresAt ||
-		gotRevokedAt != legacyRevoke ||
-		gotRevokeReason != legacyReason {
-		t.Fatalf("legacy row changed during migration")
+	defer rows.Close()
+	var orderedIDs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		orderedIDs = append(orderedIDs, id)
 	}
-	var legacyIndexCount, activeIndexCount int
-	if err := store.db.QueryRow(`
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{sessionID, secondSessionID}; !reflect.DeepEqual(orderedIDs, want) {
+		t.Fatalf("migrated TEXT order = %#v, want chronological order %#v", orderedIDs, want)
+	}
+	assertMigratedBrowserSessionIndexes(t, store.db)
+}
+
+func TestBrowserSessionStoreLegacyMigrationRollsBackInvalidTime(t *testing.T) {
+	dbPath := newBrowserSessionTestDBPath(t)
+	tokenHash := sha256.Sum256([]byte("legacy-invalid-token"))
+	csrfHash := sha256.Sum256([]byte("legacy-invalid-csrf"))
+	userAgentHash := sha256.Sum256([]byte("legacy-invalid-agent"))
+	seed := legacyBrowserSessionSeed{
+		id:            "session_invalid_time",
+		tokenHash:     tokenHash[:],
+		csrfHash:      csrfHash[:],
+		csrfExpiresAt: "2026-07-28T12:15:00Z",
+		deviceLabel:   "Legacy Browser",
+		userAgentHash: userAgentHash[:],
+		createdAt:     "not-a-time",
+		lastActiveAt:  "2026-07-28T12:01:00.1Z",
+		expiresAt:     "2026-08-27T12:01:00Z",
+	}
+	seedLegacyBrowserSessionDB(t, dbPath, false, []legacyBrowserSessionSeed{seed})
+
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+	if store != nil {
+		store.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "canonicalize legacy browser session created_at") {
+		t.Fatalf("legacy invalid-time migration error = %v, want contextual parse error", err)
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 0 {
+		t.Fatalf("failed migration schema version = %d, want rollback to 0", version)
+	}
+	got := readLegacyBrowserSessionSeed(t, db, seed.id)
+	if got.createdAt != seed.createdAt {
+		t.Fatalf("failed migration changed created_at to %q, want %q", got.createdAt, seed.createdAt)
+	}
+	var legacyIndexCount, temporaryTableCount int
+	if err := db.QueryRow(`
 		SELECT COUNT(*) FROM sqlite_master
 		WHERE type = 'index' AND name = 'idx_browser_sessions_active_token'
 	`).Scan(&legacyIndexCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.db.QueryRow(`
+	if err := db.QueryRow(`
 		SELECT COUNT(*) FROM sqlite_master
-		WHERE type = 'index' AND name = 'idx_browser_sessions_active'
-	`).Scan(&activeIndexCount); err != nil {
+		WHERE type = 'table' AND name = 'browser_sessions_v1'
+	`).Scan(&temporaryTableCount); err != nil {
 		t.Fatal(err)
 	}
-	if legacyIndexCount != 0 || activeIndexCount != 1 {
-		t.Fatalf("migration indexes: legacy=%d active=%d, want 0/1", legacyIndexCount, activeIndexCount)
+	if legacyIndexCount != 1 || temporaryTableCount != 0 {
+		t.Fatalf("failed migration did not roll back: legacy_index=%d temporary_table=%d", legacyIndexCount, temporaryTableCount)
 	}
+}
+
+func TestBrowserSessionStoreMigratesLegacyV0WithBothKnownIndexes(t *testing.T) {
+	dbPath := newBrowserSessionTestDBPath(t)
+	tokenHash := sha256.Sum256([]byte("legacy-dual-token"))
+	csrfHash := sha256.Sum256([]byte("legacy-dual-csrf"))
+	userAgentHash := sha256.Sum256([]byte("legacy-dual-agent"))
+	seedLegacyBrowserSessionDB(t, dbPath, true, []legacyBrowserSessionSeed{{
+		id:            "session_dual_indexes",
+		tokenHash:     tokenHash[:],
+		csrfHash:      csrfHash[:],
+		csrfExpiresAt: "2026-07-28T12:15:00Z",
+		deviceLabel:   "Legacy Browser",
+		userAgentHash: userAgentHash[:],
+		createdAt:     "2026-07-28T12:00:00Z",
+		lastActiveAt:  "2026-07-28T12:01:00.1Z",
+		expiresAt:     "2026-08-27T12:01:00Z",
+	}})
+
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	assertMigratedBrowserSessionIndexes(t, store.db)
 }
 
 func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 	t.Run("invalid version one schema", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "browser_sessions.sqlite3")
+		dbPath := existingBrowserSessionTestDBPath(t)
 		db, err := sql.Open("sqlite3", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -512,7 +577,7 @@ func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 	})
 
 	t.Run("future version", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "browser_sessions.sqlite3")
+		dbPath := existingBrowserSessionTestDBPath(t)
 		db, err := sql.Open("sqlite3", dbPath)
 		if err != nil {
 			t.Fatal(err)
@@ -534,7 +599,7 @@ func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 	})
 
 	t.Run("version one legacy index", func(t *testing.T) {
-		dbPath := filepath.Join(t.TempDir(), "browser_sessions.sqlite3")
+		dbPath := newBrowserSessionTestDBPath(t)
 		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
 		if err != nil {
 			t.Fatal(err)
@@ -575,10 +640,9 @@ func TestBrowserSessionStoreDirectoryPermissionCeiling(t *testing.T) {
 	for _, testCase := range []struct {
 		name string
 		mode os.FileMode
-		want os.FileMode
 	}{
-		{name: "restrict permissive directory", mode: 0o777, want: 0o750},
-		{name: "do not widen private directory", mode: 0o700, want: 0o700},
+		{name: "private directory", mode: 0o700},
+		{name: "group-readable directory", mode: 0o750},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			parent := filepath.Join(t.TempDir(), "sessions")
@@ -599,8 +663,36 @@ func TestBrowserSessionStoreDirectoryPermissionCeiling(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := info.Mode().Perm(); got != testCase.want {
-				t.Fatalf("directory mode = %o, want %o", got, testCase.want)
+			if got := info.Mode().Perm(); got != testCase.mode {
+				t.Fatalf("directory mode = %o, want unchanged %o", got, testCase.mode)
+			}
+		})
+	}
+
+	for _, mode := range []os.FileMode{0o777, 0o755} {
+		t.Run("reject unsafe "+mode.String(), func(t *testing.T) {
+			parent := filepath.Join(t.TempDir(), "sessions")
+			if err := os.Mkdir(parent, mode); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(parent, mode); err != nil {
+				t.Fatal(err)
+			}
+			store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+				Path: filepath.Join(parent, "browser_sessions.sqlite3"),
+			})
+			if store != nil {
+				store.Close()
+			}
+			if err == nil || !strings.Contains(err.Error(), "unsafe permissions") {
+				t.Fatalf("NewBrowserSessionStore() error = %v, want unsafe-permissions rejection", err)
+			}
+			info, statErr := os.Stat(parent)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if got := info.Mode().Perm(); got != mode {
+				t.Fatalf("rejected directory mode = %o, want unchanged %o", got, mode)
 			}
 		})
 	}
@@ -659,7 +751,7 @@ func TestBrowserSessionStoreClosedState(t *testing.T) {
 	t.Run("close is idempotent and create fails before randomness", func(t *testing.T) {
 		random := &countingReader{reader: bytes.NewReader(make([]byte, 64))}
 		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
-			Path:   filepath.Join(t.TempDir(), "browser_sessions.sqlite3"),
+			Path:   newBrowserSessionTestDBPath(t),
 			Random: random,
 		})
 		if err != nil {
@@ -683,7 +775,7 @@ func TestBrowserSessionStoreClosedState(t *testing.T) {
 
 func TestBrowserSessionStoreConcurrentCloseAndCreate(t *testing.T) {
 	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
-		Path: filepath.Join(t.TempDir(), "browser_sessions.sqlite3"),
+		Path: newBrowserSessionTestDBPath(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -737,7 +829,7 @@ func TestBrowserSessionStoreRandomFailuresDoNotInsert(t *testing.T) {
 				err:  errors.New("entropy unavailable"),
 			}
 			store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
-				Path:   filepath.Join(t.TempDir(), "browser_sessions.sqlite3"),
+				Path:   newBrowserSessionTestDBPath(t),
 				Random: random,
 			})
 			if err != nil {
@@ -781,7 +873,7 @@ func TestBrowserSessionStoreWrapsErrorsWithoutCredentials(t *testing.T) {
 		}
 		randomData := append(append([]byte(nil), randomPair...), randomPair...)
 		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
-			Path:   filepath.Join(t.TempDir(), "browser_sessions.sqlite3"),
+			Path:   newBrowserSessionTestDBPath(t),
 			Random: bytes.NewReader(randomData),
 		})
 		if err != nil {
@@ -808,6 +900,206 @@ func TestBrowserSessionStoreWrapsErrorsWithoutCredentials(t *testing.T) {
 			t.Fatalf("duplicate insert left %d records, want 1", count)
 		}
 	})
+}
+
+type legacyBrowserSessionSeed struct {
+	id            string
+	tokenHash     []byte
+	csrfHash      []byte
+	csrfExpiresAt string
+	deviceLabel   string
+	userAgentHash []byte
+	createdAt     string
+	lastActiveAt  string
+	expiresAt     string
+	revokedAt     *string
+	revokeReason  string
+}
+
+type migratedBrowserSessionRow struct {
+	id            string
+	tokenHash     []byte
+	csrfHash      []byte
+	csrfExpiresAt string
+	deviceLabel   string
+	userAgentHash []byte
+	createdAt     string
+	lastActiveAt  string
+	expiresAt     string
+	revokedAt     string
+	revokeReason  string
+}
+
+func seedLegacyBrowserSessionDB(
+	t *testing.T,
+	dbPath string,
+	bothIndexes bool,
+	seeds []legacyBrowserSessionSeed,
+) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`
+		CREATE TABLE browser_sessions (
+			id TEXT PRIMARY KEY,
+			token_hash BLOB NOT NULL UNIQUE,
+			csrf_hash BLOB NOT NULL,
+			csrf_expires_at TEXT NOT NULL,
+			device_label TEXT NOT NULL DEFAULT '',
+			user_agent_hash BLOB NOT NULL,
+			created_at TEXT NOT NULL,
+			last_active_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			revoked_at TEXT,
+			revoke_reason TEXT NOT NULL DEFAULT ''
+		);
+		CREATE INDEX idx_browser_sessions_active_token
+			ON browser_sessions(token_hash)
+			WHERE revoked_at IS NULL;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if bothIndexes {
+		if _, err := db.Exec(`
+			CREATE INDEX idx_browser_sessions_active
+				ON browser_sessions(revoked_at, expires_at, last_active_at)
+		`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, seed := range seeds {
+		var revokedAt any
+		if seed.revokedAt != nil {
+			revokedAt = *seed.revokedAt
+		}
+		if _, err := db.Exec(`
+			INSERT INTO browser_sessions (
+				id, token_hash, csrf_hash, csrf_expires_at, device_label,
+				user_agent_hash, created_at, last_active_at, expires_at,
+				revoked_at, revoke_reason
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+			seed.id,
+			seed.tokenHash,
+			seed.csrfHash,
+			seed.csrfExpiresAt,
+			seed.deviceLabel,
+			seed.userAgentHash,
+			seed.createdAt,
+			seed.lastActiveAt,
+			seed.expiresAt,
+			revokedAt,
+			seed.revokeReason,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func newBrowserSessionTestDBPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "sessions", "browser_sessions.sqlite3")
+}
+
+func existingBrowserSessionTestDBPath(t *testing.T) string {
+	t.Helper()
+	dbPath := newBrowserSessionTestDBPath(t)
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dbPath
+}
+
+func readLegacyBrowserSessionSeed(t *testing.T, db *sql.DB, id string) migratedBrowserSessionRow {
+	t.Helper()
+	var row migratedBrowserSessionRow
+	if err := db.QueryRow(`
+		SELECT id, token_hash, csrf_hash, csrf_expires_at, device_label,
+			user_agent_hash, created_at, last_active_at, expires_at,
+			COALESCE(revoked_at, ''), revoke_reason
+		FROM browser_sessions
+		WHERE id = ?
+	`, id).Scan(
+		&row.id,
+		&row.tokenHash,
+		&row.csrfHash,
+		&row.csrfExpiresAt,
+		&row.deviceLabel,
+		&row.userAgentHash,
+		&row.createdAt,
+		&row.lastActiveAt,
+		&row.expiresAt,
+		&row.revokedAt,
+		&row.revokeReason,
+	); err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func assertCanonicalMigratedTime(t *testing.T, field, legacy, migrated string) {
+	t.Helper()
+	legacyTime, err := time.Parse(time.RFC3339Nano, legacy)
+	if err != nil {
+		t.Fatalf("invalid legacy %s test value %q: %v", field, legacy, err)
+	}
+	migratedTime, err := parseBrowserSessionTime(migrated)
+	if err != nil {
+		t.Fatalf("migrated %s is not canonical: %q: %v", field, migrated, err)
+	}
+	if !migratedTime.Equal(legacyTime) {
+		t.Fatalf("migrated %s = %s, want instant %s", field, migratedTime, legacyTime)
+	}
+	if want := formatBrowserSessionTime(legacyTime); migrated != want {
+		t.Fatalf("migrated %s = %q, want canonical %q", field, migrated, want)
+	}
+}
+
+func assertMigratedBrowserSessionIndexes(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var legacyIndexCount, activeIndexCount int
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_browser_sessions_active_token'
+	`).Scan(&legacyIndexCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_browser_sessions_active'
+	`).Scan(&activeIndexCount); err != nil {
+		t.Fatal(err)
+	}
+	if legacyIndexCount != 0 || activeIndexCount != 1 {
+		t.Fatalf("migration indexes: legacy=%d active=%d, want 0/1", legacyIndexCount, activeIndexCount)
+	}
+
+	rows, err := db.Query(`PRAGMA index_info(idx_browser_sessions_active)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var sequence, columnID int
+		var name string
+		if err := rows.Scan(&sequence, &columnID, &name); err != nil {
+			t.Fatal(err)
+		}
+		columns = append(columns, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"revoked_at", "expires_at", "last_active_at"}; !reflect.DeepEqual(columns, want) {
+		t.Fatalf("active index columns = %#v, want %#v", columns, want)
+	}
 }
 
 type countingReader struct {

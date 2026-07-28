@@ -232,22 +232,41 @@ func parseBrowserSessionTime(value string) (time.Time, error) {
 }
 
 func prepareBrowserSessionDirectory(directory string) error {
+	info, err := os.Stat(directory)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("%s is not a directory", directory)
+		}
+		return validateBrowserSessionDirectoryMode(info.Mode().Perm())
+	case !os.IsNotExist(err):
+		return err
+	}
+
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return err
 	}
-	info, err := os.Stat(directory)
+	info, err = os.Stat(directory)
 	if err != nil {
 		return err
 	}
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", directory)
 	}
-	currentMode := info.Mode().Perm()
-	safeMode := currentMode & 0o750
-	if safeMode != currentMode {
-		if err := os.Chmod(directory, safeMode); err != nil {
-			return err
-		}
+	return validateBrowserSessionDirectoryMode(info.Mode().Perm())
+}
+
+func validateBrowserSessionDirectoryMode(mode os.FileMode) error {
+	const (
+		requiredOwnerPermissions = os.FileMode(0o700)
+		allowedPermissions       = os.FileMode(0o750)
+	)
+	if mode&requiredOwnerPermissions != requiredOwnerPermissions ||
+		mode&^allowedPermissions != 0 {
+		return fmt.Errorf(
+			"browser session database directory has unsafe permissions %04o; require permissions bounded by 0750 with owner access",
+			mode,
+		)
 	}
 	return nil
 }
@@ -325,41 +344,25 @@ func browserSessionTableExists(tx *sql.Tx) (bool, error) {
 }
 
 func createBrowserSessionTableV1(tx *sql.Tx, tableName string) error {
-	var statement string
 	switch tableName {
-	case "browser_sessions":
-		statement = `
-		CREATE TABLE browser_sessions (
-			id TEXT PRIMARY KEY,
-			token_hash BLOB NOT NULL UNIQUE,
-			csrf_hash BLOB NOT NULL,
-			csrf_expires_at TEXT NOT NULL,
-			device_label TEXT NOT NULL,
-			user_agent_hash BLOB NOT NULL,
-			created_at TEXT NOT NULL,
-			last_active_at TEXT NOT NULL,
-			expires_at TEXT NOT NULL,
-			revoked_at TEXT NOT NULL DEFAULT '',
-			revoke_reason TEXT NOT NULL DEFAULT ''
-		)`
-	case "browser_sessions_v1":
-		statement = `
-		CREATE TABLE browser_sessions_v1 (
-			id TEXT PRIMARY KEY,
-			token_hash BLOB NOT NULL UNIQUE,
-			csrf_hash BLOB NOT NULL,
-			csrf_expires_at TEXT NOT NULL,
-			device_label TEXT NOT NULL,
-			user_agent_hash BLOB NOT NULL,
-			created_at TEXT NOT NULL,
-			last_active_at TEXT NOT NULL,
-			expires_at TEXT NOT NULL,
-			revoked_at TEXT NOT NULL DEFAULT '',
-			revoke_reason TEXT NOT NULL DEFAULT ''
-		)`
+	case "browser_sessions", "browser_sessions_v1":
 	default:
 		return fmt.Errorf("unsupported browser session migration table %q", tableName)
 	}
+	statement := fmt.Sprintf(`
+		CREATE TABLE %s (
+			id TEXT PRIMARY KEY,
+			token_hash BLOB NOT NULL UNIQUE,
+			csrf_hash BLOB NOT NULL,
+			csrf_expires_at TEXT NOT NULL,
+			device_label TEXT NOT NULL,
+			user_agent_hash BLOB NOT NULL,
+			created_at TEXT NOT NULL,
+			last_active_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			revoked_at TEXT NOT NULL DEFAULT '',
+			revoke_reason TEXT NOT NULL DEFAULT ''
+		)`, tableName)
 	if _, err := tx.Exec(statement); err != nil {
 		return fmt.Errorf("create %s table: %w", tableName, err)
 	}
@@ -377,22 +380,118 @@ func createBrowserSessionActiveIndex(tx *sql.Tx) error {
 }
 
 func rebuildBrowserSessionTableV1(tx *sql.Tx) error {
+	readLegacySessions := func() ([][]any, error) {
+		rows, err := tx.Query(`
+			SELECT id, token_hash, csrf_hash, csrf_expires_at, device_label,
+				user_agent_hash, created_at, last_active_at, expires_at,
+				revoked_at, revoke_reason
+			FROM browser_sessions
+		`)
+		if err != nil {
+			return nil, fmt.Errorf("read legacy browser sessions: %w", err)
+		}
+		defer rows.Close()
+
+		var sessions [][]any
+		for rows.Next() {
+			var (
+				id                                    string
+				tokenHash, csrfHash, userAgentHash    []byte
+				csrfExpiresAt, deviceLabel, createdAt string
+				lastActiveAt, expiresAt, revokeReason string
+				revokedAt                             sql.NullString
+				canonicalRevokedAt                    string
+			)
+			if err := rows.Scan(
+				&id,
+				&tokenHash,
+				&csrfHash,
+				&csrfExpiresAt,
+				&deviceLabel,
+				&userAgentHash,
+				&createdAt,
+				&lastActiveAt,
+				&expiresAt,
+				&revokedAt,
+				&revokeReason,
+			); err != nil {
+				return nil, fmt.Errorf("scan legacy browser session: %w", err)
+			}
+			if csrfExpiresAt, err = canonicalizeLegacyBrowserSessionTime(
+				"csrf_expires_at",
+				csrfExpiresAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if createdAt, err = canonicalizeLegacyBrowserSessionTime(
+				"created_at",
+				createdAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if lastActiveAt, err = canonicalizeLegacyBrowserSessionTime(
+				"last_active_at",
+				lastActiveAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if expiresAt, err = canonicalizeLegacyBrowserSessionTime(
+				"expires_at",
+				expiresAt,
+				false,
+			); err != nil {
+				return nil, err
+			}
+			if revokedAt.Valid {
+				canonicalRevokedAt = revokedAt.String
+			}
+			if canonicalRevokedAt, err = canonicalizeLegacyBrowserSessionTime(
+				"revoked_at",
+				canonicalRevokedAt,
+				true,
+			); err != nil {
+				return nil, err
+			}
+			sessions = append(sessions, []any{
+				id,
+				tokenHash,
+				csrfHash,
+				csrfExpiresAt,
+				deviceLabel,
+				userAgentHash,
+				createdAt,
+				lastActiveAt,
+				expiresAt,
+				canonicalRevokedAt,
+				revokeReason,
+			})
+		}
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("iterate legacy browser sessions: %w", err)
+		}
+		return sessions, nil
+	}
+
+	sessions, err := readLegacySessions()
+	if err != nil {
+		return err
+	}
 	if err := createBrowserSessionTableV1(tx, "browser_sessions_v1"); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`
+	for _, session := range sessions {
+		if _, err := tx.Exec(`
 		INSERT INTO browser_sessions_v1 (
 			id, token_hash, csrf_hash, csrf_expires_at, device_label,
 			user_agent_hash, created_at, last_active_at, expires_at,
 			revoked_at, revoke_reason
-		)
-		SELECT
-			id, token_hash, csrf_hash, csrf_expires_at, device_label,
-			user_agent_hash, created_at, last_active_at, expires_at,
-			COALESCE(revoked_at, ''), revoke_reason
-		FROM browser_sessions
-	`); err != nil {
-		return fmt.Errorf("copy legacy browser sessions: %w", err)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, session...); err != nil {
+			return fmt.Errorf("copy legacy browser session %q: %w", session[0], err)
+		}
 	}
 	if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_browser_sessions_active_token`); err != nil {
 		return fmt.Errorf("drop legacy browser session index: %w", err)
@@ -410,6 +509,17 @@ func rebuildBrowserSessionTableV1(tx *sql.Tx) error {
 		return fmt.Errorf("create browser session active index: %w", err)
 	}
 	return nil
+}
+
+func canonicalizeLegacyBrowserSessionTime(field, value string, allowEmpty bool) (string, error) {
+	if allowEmpty && value == "" {
+		return "", nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize legacy browser session %s: %w", field, err)
+	}
+	return formatBrowserSessionTime(parsed), nil
 }
 
 type browserSessionColumnInfo struct {
@@ -564,7 +674,7 @@ func validateBrowserSessionIndexes(tx *sql.Tx, allowLegacy bool) error {
 	}
 
 	activeIndexCount := 0
-	recognizedIndexCount := 0
+	legacyIndexCount := 0
 	tokenUnique := false
 	for _, index := range indexes {
 		columns, err := browserSessionIndexColumns(tx, index.name)
@@ -583,8 +693,17 @@ func validateBrowserSessionIndexes(tx *sql.Tx, allowLegacy bool) error {
 				!equalBrowserSessionStrings(columns, []string{"revoked_at", "expires_at", "last_active_at"}) {
 				return fmt.Errorf("browser session active index is incompatible")
 			}
+			indexSQL, err := normalizedBrowserSessionIndexSQL(tx, index.name)
+			if err != nil {
+				return err
+			}
+			const activeIndexSQL = "create index idx_browser_sessions_active on browser_sessions(revoked_at, expires_at, last_active_at)"
+			const activeIndexSQLIfAbsent = "create index if not exists idx_browser_sessions_active on browser_sessions(revoked_at, expires_at, last_active_at)"
+			if indexSQL != activeIndexSQL &&
+				(!allowLegacy || indexSQL != activeIndexSQLIfAbsent) {
+				return fmt.Errorf("browser session active index definition is incompatible")
+			}
 			activeIndexCount++
-			recognizedIndexCount++
 		case "idx_browser_sessions_active_token":
 			if !allowLegacy ||
 				index.unique ||
@@ -601,7 +720,7 @@ func validateBrowserSessionIndexes(tx *sql.Tx, allowLegacy bool) error {
 			if indexSQL != legacyIndexSQL && indexSQL != legacyIndexSQLIfAbsent {
 				return fmt.Errorf("legacy browser session active token index definition is incompatible")
 			}
-			recognizedIndexCount++
+			legacyIndexCount++
 		default:
 			return fmt.Errorf("unexpected browser session index %q", index.name)
 		}
@@ -610,21 +729,18 @@ func validateBrowserSessionIndexes(tx *sql.Tx, allowLegacy bool) error {
 		return fmt.Errorf("browser session token_hash unique constraint is missing")
 	}
 	if allowLegacy {
-		if recognizedIndexCount != 1 {
-			return fmt.Errorf("legacy browser session explicit index count = %d, want 1", recognizedIndexCount)
+		if activeIndexCount > 1 || legacyIndexCount > 1 ||
+			activeIndexCount+legacyIndexCount == 0 {
+			return fmt.Errorf(
+				"legacy browser session index counts active=%d legacy=%d, want one known index of each kind at most",
+				activeIndexCount,
+				legacyIndexCount,
+			)
 		}
 		return nil
 	}
 	if activeIndexCount != 1 {
 		return fmt.Errorf("browser session active index count = %d, want 1", activeIndexCount)
-	}
-	indexSQL, err := normalizedBrowserSessionIndexSQL(tx, "idx_browser_sessions_active")
-	if err != nil {
-		return err
-	}
-	const expected = "create index idx_browser_sessions_active on browser_sessions(revoked_at, expires_at, last_active_at)"
-	if indexSQL != expected {
-		return fmt.Errorf("browser session active index definition is incompatible")
 	}
 	return nil
 }
