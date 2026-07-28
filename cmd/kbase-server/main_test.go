@@ -217,6 +217,8 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 		{name: "empty database path", mutate: func(cfg *sessionServerConfig) { cfg.DBPath = "" }},
 		{name: "zero port", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "127.0.0.1:0" }},
 		{name: "malformed listen", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "127.0.0.1" }},
+		{name: "listen leading whitespace", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = " 127.0.0.1:8719" }},
+		{name: "listen trailing whitespace", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "127.0.0.1:8719 " }},
 		{name: "public listen", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "192.0.2.10:8719" }},
 		{name: "short proxy", mutate: func(cfg *sessionServerConfig) { cfg.BrowserProxySecret = "short" }},
 		{name: "long proxy", mutate: func(cfg *sessionServerConfig) { cfg.BrowserProxySecret = strings.Repeat("p", 129) }},
@@ -240,6 +242,17 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 		{name: "origin HTTP default port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "http://localhost:80" }},
 		{name: "origin leading zero port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:08443" }},
 		{name: "origin expanded IPv6", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://[0:0:0:0:0:0:0:1]:8443" }},
+		{name: "origin legacy numeric IPv4", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://127.0.0.0x1" }},
+		{name: "origin numeric final domain label", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://example.127" }},
+		{name: "origin invalid octal final domain label", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://example.09" }},
+		{name: "origin hexadecimal final domain label", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://example.0x7f" }},
+		{name: "origin invalid DNS underscore", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase_test.example" }},
+		{name: "origin invalid DNS leading hyphen", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://-kbase.example" }},
+		{name: "origin invalid DNS trailing hyphen", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase-.example" }},
+		{name: "origin invalid empty DNS label", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase..example" }},
+		{name: "origin dotted mapped IPv6", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://[::ffff:192.0.2.1]" }},
+		{name: "origin expanded mapped IPv6", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://[0:0:0:0:0:ffff:c000:201]" }},
+		{name: "origin noncanonical tied IPv6 compression", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://[1:0:0:2::3:4]" }},
 		{name: "origin unsupported scheme", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "ftp://kbase.example.test" }},
 		{name: "empty admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = "" }},
 		{name: "short admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = "short" }},
@@ -261,6 +274,9 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 		"https://kbase.example.test",
 		"https://kbase.example.test:8443",
 		"https://[::1]:8443",
+		"https://[::ffff:c000:201]",
+		"https://[1:0:2:3:4:5:6:7]",
+		"https://[1::2:0:0:3:4]",
 		"http://localhost:8719",
 		"http://127.0.0.1:8719",
 		"http://[::1]:8719",
@@ -325,6 +341,22 @@ func TestBrowserSessionValidationErrorsRedactSecrets(t *testing.T) {
 			config:   base,
 			reserved: []string{reservedSecret, adminSecret},
 		},
+		{
+			name: "malformed listen remains private",
+			config: func() sessionServerConfig {
+				cfg := base
+				cfg.ListenAddr = "ListenLeakSentinel"
+				return cfg
+			}(),
+		},
+		{
+			name: "malformed origin remains private",
+			config: func() sessionServerConfig {
+				cfg := base
+				cfg.PublicOrigin = "https://OriginLeakSentinel.example/path"
+				return cfg
+			}(),
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -338,6 +370,8 @@ func TestBrowserSessionValidationErrorsRedactSecrets(t *testing.T) {
 				adminSecret,
 				proxySecret,
 				reservedSecret,
+				test.config.ListenAddr,
+				test.config.PublicOrigin,
 			} {
 				if secret != "" && strings.Contains(err.Error(), secret) {
 					t.Fatalf("validation error leaked a secret: %q", err)

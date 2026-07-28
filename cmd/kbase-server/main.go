@@ -458,10 +458,13 @@ func canonicalOriginHost(host string) (string, net.IP, error) {
 		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host is required")
 	}
 	if ip := net.ParseIP(host); ip != nil {
+		if strings.Contains(host, ":") {
+			return serializeCanonicalIPv6(ip), ip, nil
+		}
 		if ipv4 := ip.To4(); ipv4 != nil {
 			return ipv4.String(), ip, nil
 		}
-		return ip.String(), ip, nil
+		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host must use canonical browser form")
 	}
 	for _, char := range host {
 		if char > 127 {
@@ -469,17 +472,81 @@ func canonicalOriginHost(host string) (string, net.IP, error) {
 		}
 	}
 	lowerHost := strings.ToLower(host)
-	if strings.Contains(lowerHost, ":") ||
-		strings.HasPrefix(lowerHost, "0x") ||
-		isNumericOriginHost(lowerHost) {
+	if strings.Contains(lowerHost, ":") || !isCanonicalDNSHost(lowerHost) {
 		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host must use canonical browser form")
 	}
 	return lowerHost, nil, nil
 }
 
-func isNumericOriginHost(host string) bool {
-	for _, char := range host {
-		if (char < '0' || char > '9') && char != '.' {
+func serializeCanonicalIPv6(ip net.IP) string {
+	ip = ip.To16()
+	pieces := make([]string, 8)
+	values := make([]uint16, 8)
+	for i := range pieces {
+		values[i] = uint16(ip[i*2])<<8 | uint16(ip[i*2+1])
+		pieces[i] = strconv.FormatUint(uint64(values[i]), 16)
+	}
+	longestStart, longestLength := -1, 0
+	for i := 0; i < len(values); i++ {
+		if values[i] != 0 {
+			continue
+		}
+		runEnd := i + 1
+		for runEnd < len(values) && values[runEnd] == 0 {
+			runEnd++
+		}
+		if runEnd-i > longestLength {
+			longestStart = i
+			longestLength = runEnd - i
+		}
+		i = runEnd - 1
+	}
+	if longestLength < 2 {
+		return strings.Join(pieces, ":")
+	}
+	left := strings.Join(pieces[:longestStart], ":")
+	right := strings.Join(pieces[longestStart+longestLength:], ":")
+	return left + "::" + right
+}
+
+func isCanonicalDNSHost(host string) bool {
+	if len(host) > 253 {
+		return false
+	}
+	labels := strings.Split(host, ".")
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 ||
+			label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, char := range label {
+			if (char < 'a' || char > 'z') &&
+				(char < '0' || char > '9') &&
+				char != '-' {
+				return false
+			}
+		}
+	}
+	return !isBrowserNumericLabel(labels[len(labels)-1])
+}
+
+func isBrowserNumericLabel(label string) bool {
+	allDecimal := true
+	for _, char := range label {
+		if char < '0' || char > '9' {
+			allDecimal = false
+			break
+		}
+	}
+	if allDecimal {
+		return true
+	}
+	if !strings.HasPrefix(label, "0x") || len(label) == 2 {
+		return false
+	}
+	for _, char := range label[2:] {
+		if (char < '0' || char > '9') &&
+			(char < 'a' || char > 'f') {
 			return false
 		}
 	}
@@ -522,9 +589,13 @@ func validateBrowserSessionConfiguration(
 			return errors.New("KBASE_BROWSER_SESSION_SECRET must differ from every API token")
 		}
 	}
-	host, port, err := net.SplitHostPort(strings.TrimSpace(addr))
+	listenAddr := strings.TrimSpace(addr)
+	if listenAddr == "" || addr != listenAddr {
+		return errors.New("KBASE_BROWSER_SESSION_SECRET requires an exact loopback listen address")
+	}
+	host, port, err := net.SplitHostPort(listenAddr)
 	if err != nil {
-		return fmt.Errorf("KBASE_BROWSER_SESSION_SECRET requires a valid loopback listen address: %w", err)
+		return errors.New("KBASE_BROWSER_SESSION_SECRET requires a valid loopback listen address")
 	}
 	portNumber, err := strconv.Atoi(port)
 	if err != nil || portNumber < 1 || portNumber > 65535 {
