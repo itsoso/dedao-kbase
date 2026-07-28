@@ -3079,6 +3079,23 @@ func TestKBaseHTTPHandlerCSRF(t *testing.T) {
 		t.Fatalf("rejected CSRF requests reached mutation handler %d times", got)
 	}
 
+	for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		t.Run(method+"_requires_CSRF", func(t *testing.T) {
+			request := newKBaseBrowserCookieRequest(
+				method, "/api/books", credentials.Token, "",
+			)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			request.Header.Set("Sec-Fetch-Site", "same-origin")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden ||
+				response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+				t.Fatalf("%s without CSRF = status %d body %q", method, response.Code, response.Body.String())
+			}
+		})
+	}
+
 	validRequest := newKBaseBrowserCookieRequest(
 		http.MethodPost,
 		"/api/books/source-article-1/analysis",
@@ -3122,6 +3139,138 @@ func TestKBaseHTTPHandlerCSRF(t *testing.T) {
 	assertKBaseEvidenceAuditErrorEnvelope(
 		t, auditValidResponse, "audit_request_invalid", "idempotency_key is required",
 	)
+
+	t.Run("renewal boundary revocation replaces renewal with one clear Cookie", func(t *testing.T) {
+		raceClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 19, 30, 0, 0, time.UTC),
+		}
+		raceHandler, raceStore := newKBaseBrowserSessionHTTPTestHandler(t, raceClock, 426)
+		raceCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, raceStore, "Renewal Race Browser",
+		)
+		if _, err := raceStore.db.Exec(`
+			CREATE TRIGGER revoke_after_browser_session_renewal
+			AFTER UPDATE OF last_active_at ON browser_sessions
+			BEGIN
+				UPDATE browser_sessions
+				SET revoked_at = NEW.last_active_at, revoke_reason = 'concurrent revoke'
+				WHERE id = NEW.id;
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		raceClock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/books/source-article-1/analysis",
+			raceCredentials.Token,
+			`{"model":"Qwen-3.7-Max"}`,
+		)
+		addKBaseBrowserSessionSecurityHeaders(request, raceCredentials.CSRFToken)
+		response := httptest.NewRecorder()
+		raceHandler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusUnauthorized ||
+			response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+			t.Fatalf("renewal race response = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 1 {
+			t.Fatalf("renewal race Set-Cookie headers = %q, want one clear Cookie", got)
+		}
+		if strings.Contains(response.Header().Get("Set-Cookie"), raceCredentials.Token) {
+			t.Fatalf("renewal race response retained renewed credential: %q", response.Header().Values("Set-Cookie"))
+		}
+		assertKBaseBrowserSessionClearedCookie(t, response, raceClock.Now())
+	})
+
+	t.Run("audit retry actor uses Cookie session context", func(t *testing.T) {
+		retryStore, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		retryClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 20, 0, 0, 0, time.UTC),
+		}
+		retryHandler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, retryClock, 427)
+		retryCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, sessionStore, "Audit Retry Browser",
+		)
+		csrfToken, _ := loadKBaseBrowserSessionCSRF(
+			t, retryHandler, retryCredentials.Token,
+		)
+		auditNow := testAgentPackageTime().Add(4 * time.Hour)
+		concrete := retryHandler.(*kbaseHTTPHandler)
+		concrete.store = retryStore
+		concrete.auditCoordinator = &recordingEvidenceAuditEnqueuer{}
+		concrete.auditRetrySigningKey = []byte("test-retry-signing-key-32-bytes!!")
+		concrete.auditNow = func() time.Time { return auditNow }
+
+		createRequest := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version,
+			retryCredentials.Token,
+			`{"subject":"one","scope":"Population evidence comparison","idempotency_key":"cookie-create"}`,
+		)
+		addKBaseBrowserSessionSecurityHeaders(createRequest, csrfToken)
+		createResponse := httptest.NewRecorder()
+		retryHandler.ServeHTTP(createResponse, createRequest)
+		if createResponse.Code != http.StatusAccepted {
+			t.Fatalf("Cookie audit create = status %d body=%s", createResponse.Code, createResponse.Body.String())
+		}
+		var createPayload struct {
+			Audit EvidenceAudit `json:"audit"`
+		}
+		if err := json.Unmarshal(createResponse.Body.Bytes(), &createPayload); err != nil {
+			t.Fatal(err)
+		}
+		auditID := createPayload.Audit.AuditID
+		if _, err := StartEvidenceAudit(
+			retryStore, auditID, "trace-cookie-retry",
+			testAgentPackageTime().Add(5*time.Hour),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FailEvidenceAudit(
+			retryStore, auditID, "model_outcome_unknown", "manual retry required",
+			testAgentPackageTime().Add(6*time.Hour),
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		auditNow = testAgentPackageTime().Add(7 * time.Hour)
+		retryRequest := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/agent-audits/"+auditID+"/retry",
+			retryCredentials.Token,
+			"",
+		)
+		retryRequest.Header.Set("Idempotency-Key", "cookie-retry-1")
+		addKBaseBrowserSessionSecurityHeaders(retryRequest, csrfToken)
+		retryResponse := httptest.NewRecorder()
+		retryHandler.ServeHTTP(retryResponse, retryRequest)
+		if retryResponse.Code != http.StatusAccepted {
+			t.Fatalf("Cookie audit retry = status %d body=%s", retryResponse.Code, retryResponse.Body.String())
+		}
+		var retryPayload struct {
+			Audit EvidenceAudit `json:"audit"`
+		}
+		if err := json.Unmarshal(retryResponse.Body.Bytes(), &retryPayload); err != nil {
+			t.Fatal(err)
+		}
+		actor := evidenceAuditOpaqueIdentity(
+			"session-actor\x00" + retryCredentials.Session.ID,
+		)
+		wantIdentity := evidenceAuditOpaqueIdentity(
+			"manual-retry\x00" + auditID + "\x00" +
+				actor + "\x00kbase-http\x00" + EvidenceAuditRetryScope +
+				"\x00cookie-retry-1",
+		)
+		if retryPayload.Audit.RequestIdentity != wantIdentity {
+			t.Fatalf(
+				"Cookie retry request identity = %q, want session-context identity %q",
+				retryPayload.Audit.RequestIdentity,
+				wantIdentity,
+			)
+		}
+	})
 }
 
 func TestKBaseHTTPHandlerBrowserSessionStatus(t *testing.T) {

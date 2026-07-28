@@ -2739,6 +2739,7 @@ func (h *kbaseHTTPHandler) authorizeBrowserSessionCSRF(
 	if err := h.browserSessions.Store.ValidateCSRF(auth.SessionID, csrfToken); err != nil {
 		switch {
 		case isBrowserSessionCredentialError(err):
+			w.Header().Del("Set-Cookie")
 			clearBrowserSessionCookie(w)
 			h.writeKBaseRequestSecurityError(
 				w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
