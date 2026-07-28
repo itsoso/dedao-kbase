@@ -6,10 +6,22 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const source = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const authEnd = source.indexOf("\nconst readerRouteSuffixes");
 const storage = new Map([["kbase.token", "错误 token"]]);
-const app = { className: "", innerHTML: "" };
 const fetchCalls = [];
-let sessionToken = "fresh-token";
+const logs = [];
+
+const localStorage = {
+  getItem(key) {
+    return storage.get(key) || null;
+  },
+  removeItem(key) {
+    storage.delete(key);
+  },
+  setItem(key, value) {
+    storage.set(key, String(value));
+  },
+};
 
 const context = {
   Blob,
@@ -17,57 +29,69 @@ const context = {
   Response,
   URL,
   URLSearchParams,
-  console,
-  document: {
-    body: {
-      append() {},
+  console: {
+    log(...values) {
+      logs.push(values.map(String).join(" "));
     },
+    warn(...values) {
+      logs.push(values.map(String).join(" "));
+    },
+  },
+  document: {
+    body: { append() {} },
     createElement() {
-      return {
-        click() {},
-        remove() {},
-      };
+      return { click() {}, remove() {} };
     },
     querySelector(selector) {
-      return selector === "#app" ? app : null;
-    },
-    querySelectorAll() {
-      return [];
+      return selector === "#app" ? { className: "", innerHTML: "" } : null;
     },
   },
   window: {
-    localStorage: {
-      getItem(key) {
-        return storage.get(key) || null;
+    localStorage,
+    sessionStorage: {
+      getItem() {
+        return null;
       },
-      removeItem(key) {
-        storage.delete(key);
-      },
-      setItem(key, value) {
-        storage.set(key, String(value));
-      },
+      removeItem() {},
     },
     location: {
       pathname: "/unit-test",
+      origin: "https://kbase.example",
     },
+    addEventListener() {},
   },
 };
 
+let statusCalls = 0;
 context.fetch = async (url, options = {}) => {
-  const headers = options.headers instanceof Headers ? options.headers : new Headers(options.headers || {});
+  const headers = options.headers instanceof Headers
+    ? options.headers
+    : new Headers(options.headers || {});
   fetchCalls.push({
     url: String(url),
+    credentials: options.credentials || "",
     authorization: headers.get("Authorization") || "",
   });
-  if (url === "/browser/session-token") {
-    return new Response(JSON.stringify({ token: sessionToken }), {
+  if (url === "/api/browser/session") {
+    statusCalls += 1;
+    if (statusCalls === 1) {
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({
+      session: { id: "cookie-session" },
+      csrf_token: "csrf-cookie",
+      csrf_expires_at: "2026-07-28T22:15:00Z",
+    }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
   }
-  if (url === "/api/rotated" && headers.get("Authorization") === "Bearer stale-token") {
-    return new Response(JSON.stringify({ error: "unauthorized" }), {
-      status: 401,
+  if (url === "/browser/session") {
+    return new Response(JSON.stringify({ id: "cookie-session" }), {
+      status: 200,
       headers: { "content-type": "application/json" },
     });
   }
@@ -77,40 +101,21 @@ context.fetch = async (url, options = {}) => {
   });
 };
 
-vm.runInNewContext(`${source}\nglobalThis.__apiFetch = apiFetch;`, context, {
+vm.runInNewContext(`${source.slice(0, authEnd)}
+globalThis.__apiFetch = apiFetch;`, context, {
   filename: "frontend-web/app.js",
 });
 
-await context.__apiFetch("/api/books");
-
-assert.equal(storage.get("kbase.token"), "fresh-token");
-assert.ok(fetchCalls.some((call) => call.url === "/browser/session-token"));
-assert.equal(fetchCalls.at(-1).authorization, "Bearer fresh-token");
-assert.ok(fetchCalls.every((call) => !call.authorization.includes("错误")));
-
-const sessionTokenCalls = fetchCalls.filter(
-  (call) => call.url === "/browser/session-token",
-).length;
-await context.__apiFetch("/api/books");
+const payload = await context.__apiFetch("/api/books");
+assert.equal(payload.ok, true);
 assert.equal(
-  fetchCalls.filter((call) => call.url === "/browser/session-token").length,
-  sessionTokenCalls,
+  storage.get("kbase.token"),
+  "错误 token",
+  "legacy discovery should not mutate malformed browser storage",
 );
-assert.equal(fetchCalls.at(-1).authorization, "Bearer fresh-token");
+assert.ok(fetchCalls.every((call) => call.credentials === "same-origin"));
+assert.ok(fetchCalls.every((call) => !call.authorization), "ordinary requests must not build a Bearer header");
+assert.ok(!logs.join("\n").includes("错误 token"), "invalid token values must not reach logs");
+assert.ok(!source.includes("/browser/session-token"), "the retired token exchange endpoint must not be called");
 
-storage.set("kbase.token", "stale-token");
-sessionToken = "rotated-token";
-const refreshStart = fetchCalls.length;
-await context.__apiFetch("/api/rotated");
-const refreshCalls = fetchCalls.slice(refreshStart);
-assert.deepEqual(
-  refreshCalls.map((call) => [call.url, call.authorization]),
-  [
-    ["/api/rotated", "Bearer stale-token"],
-    ["/browser/session-token", ""],
-    ["/api/rotated", "Bearer rotated-token"],
-  ],
-);
-assert.equal(storage.get("kbase.token"), "rotated-token");
-
-console.log("kbase token header smoke passed");
+console.log("kbase cookie auth smoke passed");

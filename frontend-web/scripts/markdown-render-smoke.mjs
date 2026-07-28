@@ -62,6 +62,9 @@ const unsafeImage = context.renderCourseMarkdown("![危险图片](javascript:ale
 assert.ok(!unsafeImage.includes("<img"), "Markdown renderer must reject unsafe image URLs");
 assert.ok(js.includes("loadPrivateSourceAssets"), "reader should hydrate private source images with authenticated fetches");
 assert.ok(js.includes('headers.set("Accept", "image/*")'), "private image fetches should request image content");
-assert.ok(js.includes("setAuthorizationHeader(headers, token)"), "private image fetches should include bearer auth");
+const privateAssets = js.match(/async function loadPrivateSourceAssets[\s\S]*?\n\}/)?.[0] || "";
+assert.ok(privateAssets.includes("browserSessionFetch"), "private image fetches should use the Cookie session");
+assert.ok(privateAssets.includes('credentials: "same-origin"'), "private image fetches should send same-origin credentials");
+assert.doesNotMatch(privateAssets, /Authorization|Bearer|token/i, "private image fetches must not use browser Bearer auth");
 
 console.log("markdown render smoke passed");

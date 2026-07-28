@@ -28,8 +28,10 @@ for (const marker of [
   "loadDedaoLibrary",
   "renderBookKnowledge",
   "knowledgeState",
-  "ensureBrowserSessionToken",
-  "refreshBrowserSessionToken",
+  "browserSessionState",
+  "ensureBrowserSession",
+  "loadBrowserSession",
+  "logoutBrowserSession",
   "loadBookKnowledge",
   "searchBookKnowledge",
   "routePathname === ROUTES.dedaoHome",
@@ -65,7 +67,10 @@ assert.ok(
 );
 
 for (const endpoint of [
-  "/browser/session-token",
+  "/browser/session/migrate",
+  "/browser/session",
+  "/api/browser/session",
+  "/api/browser/session/logout",
   "/api/dedao/home",
   "/api/dedao/library?",
   "/api/dedao/course?",
@@ -119,13 +124,13 @@ for (const marker of [
 }
 
 for (const authMarker of [
-  "localStorage.setItem",
   'credentials: "same-origin"',
   "response.status === 401",
   "isSafeBearerToken",
-  "clearStoredToken",
-  "setAuthorizationHeader",
-  "skip invalid kbase token",
+  "clearLegacyBrowserTokens",
+  "browserSessionFetch",
+  "X-KBase-CSRF",
+  'new window.BroadcastChannel("kbase-browser-session")',
 ]) {
   assert.ok(js.includes(authMarker), `book knowledge web UI should include auth marker ${authMarker}`);
 }

@@ -7,6 +7,24 @@ const tokenKeys = [
   "KBASE_AUTH_TOKEN",
 ];
 
+const browserSessionState = {
+  ready: false,
+  session: null,
+  csrfToken: "",
+  csrfExpiresAt: "",
+  loginPromise: null,
+  statusPromise: null,
+  recoveryPromise: null,
+  migrationAttempted: false,
+  generation: 0,
+  invalidationGeneration: 0,
+  invalidationReason: "",
+  logoutGeneration: 0,
+};
+
+const browserSessionSignalKey = "kbase.browser-session.signal";
+let browserSessionChannel = null;
+
 const ROUTES = Object.freeze({
   dedaoHome: "/sources/dedao/home",
   dedaoCourses: "/sources/dedao/courses",
@@ -295,22 +313,6 @@ let proofroomPreviousFocus = null;
 let proofroomKeydownHandler = null;
 let proofroomReturnFocusSelector = "";
 
-function getToken() {
-  for (const key of tokenKeys) {
-    const value = window.localStorage.getItem(key);
-    const clean = String(value || "").trim();
-    if (!clean) {
-      continue;
-    }
-    if (isSafeBearerToken(clean)) {
-      return clean;
-    }
-    console.warn("skip invalid kbase token", key);
-    window.localStorage.removeItem(key);
-  }
-  return "";
-}
-
 function isSafeBearerToken(token) {
   const clean = String(token || "").trim();
   if (!clean || /\s/.test(clean)) {
@@ -319,74 +321,381 @@ function isSafeBearerToken(token) {
   return /^[\x21-\x7e]+$/.test(clean);
 }
 
-function clearStoredToken() {
-  for (const key of tokenKeys) {
-    window.localStorage.removeItem(key);
-  }
+function browserTokenStores() {
+  return [window.localStorage, window.sessionStorage].filter(Boolean);
 }
 
-function storeToken(token) {
-  const clean = String(token || "").trim();
-  if (!isSafeBearerToken(clean)) {
-    clearStoredToken();
-    return "";
-  }
-  for (const key of tokenKeys) {
-    window.localStorage.setItem(key, clean);
-  }
-  return clean;
-}
-
-function setAuthorizationHeader(headers, token) {
-  const clean = String(token || "").trim();
-  if (!isSafeBearerToken(clean)) {
-    if (clean) {
-      clearStoredToken();
-      console.warn("skip invalid kbase token", "authorization");
+function clearLegacyBrowserTokens() {
+  for (const storage of browserTokenStores()) {
+    for (const key of tokenKeys) {
+      try {
+        storage.removeItem(key);
+      } catch {
+        // Storage may be unavailable in privacy-restricted browser contexts.
+      }
     }
-    return false;
   }
-  headers.set("Authorization", `Bearer ${clean}`);
-  return true;
 }
 
-async function refreshBrowserSessionToken() {
-  const response = await fetch("/browser/session-token", {
-    headers: {
-      Accept: "application/json",
-    },
-    credentials: "same-origin",
-    cache: "no-store",
-  });
+function findLegacyBrowserToken() {
+  let legacyToken = "";
+  for (const storage of browserTokenStores()) {
+    for (const key of tokenKeys) {
+      let value = "";
+      try {
+        value = String(storage.getItem(key) || "").trim();
+      } catch {
+        value = "";
+      }
+      if (!legacyToken && isSafeBearerToken(value)) {
+        legacyToken = value;
+      }
+    }
+  }
+  return legacyToken;
+}
+
+function resetBrowserSessionMemory(reason = "reset") {
+  browserSessionState.ready = false;
+  browserSessionState.session = null;
+  browserSessionState.csrfToken = "";
+  browserSessionState.csrfExpiresAt = "";
+  browserSessionState.generation += 1;
+  browserSessionState.invalidationGeneration += 1;
+  browserSessionState.invalidationReason = reason;
+  if (reason === "logout") {
+    browserSessionState.logoutGeneration = browserSessionState.invalidationGeneration;
+  }
+}
+
+function assertBrowserSessionGeneration(expectedGeneration) {
+  if (browserSessionState.generation === expectedGeneration) {
+    return;
+  }
+  const error = new Error("browser session state changed");
+  error.code = "browser_session_stale";
+  throw error;
+}
+
+function browserSessionSignal(type) {
+  const message = {
+    type,
+    at: Date.now(),
+    nonce: Math.random().toString(36).slice(2),
+  };
+  try {
+    browserSessionChannel?.postMessage(message);
+  } catch {
+    // Other tabs will still receive the storage hint when available.
+  }
+  try {
+    window.localStorage?.setItem(browserSessionSignalKey, JSON.stringify(message));
+    window.localStorage?.removeItem(browserSessionSignalKey);
+  } catch {
+    // Cross-tab synchronization is best effort and carries no credentials.
+  }
+}
+
+function applyBrowserSessionSignal(message) {
+  if (!message || (message.type !== "login" && message.type !== "logout")) {
+    return;
+  }
+  resetBrowserSessionMemory(message.type);
+}
+
+if (typeof window.BroadcastChannel === "function") {
+  try {
+    browserSessionChannel = new window.BroadcastChannel("kbase-browser-session");
+    browserSessionChannel.onmessage = (event) => applyBrowserSessionSignal(event?.data);
+  } catch {
+    browserSessionChannel = null;
+  }
+}
+
+window.addEventListener?.("storage", (event) => {
+  if (event?.key !== browserSessionSignalKey || !event.newValue) {
+    return;
+  }
+  try {
+    applyBrowserSessionSignal(JSON.parse(event.newValue));
+  } catch {
+    // Ignore malformed cross-tab hints.
+  }
+});
+
+async function readBrowserResponse(response) {
   const text = await response.text();
   let payload = null;
   if (text) {
     try {
       payload = JSON.parse(text);
     } catch {
-      payload = null;
+      payload = text;
     }
   }
-  if (!response.ok) {
-    const message = payload && typeof payload === "object"
-      ? (payload.error || payload.message || JSON.stringify(payload))
-      : (text || `HTTP ${response.status}`);
-    throw new Error(message);
-  }
-  return storeToken(payload?.token || "");
+  return { text, payload };
 }
 
-async function ensureBrowserSessionToken() {
-  const existing = getToken();
-  if (existing) {
-    return existing;
+function browserResponseError(response, result) {
+  const message = typeof result.payload === "object" && result.payload
+    ? (result.payload.error || result.payload.message || JSON.stringify(result.payload))
+    : (result.payload || result.text || `HTTP ${response.status}`);
+  const error = new Error(message);
+  error.status = response.status;
+  error.payload = result.payload;
+  return error;
+}
+
+async function migrateLegacyBrowserSession() {
+  if (browserSessionState.migrationAttempted) {
+    return "absent";
   }
+  browserSessionState.migrationAttempted = true;
+  const legacyToken = findLegacyBrowserToken();
+  if (!legacyToken) {
+    return "absent";
+  }
+  const headers = new Headers({ Accept: "application/json" });
+  headers.set("Authorization", `Bearer ${legacyToken}`);
+  const response = await fetch("/browser/session/migrate", {
+    method: "POST",
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  const result = await readBrowserResponse(response);
+  if (response.ok) {
+    clearLegacyBrowserTokens();
+    return "migrated";
+  }
+  if (response.status === 401) {
+    clearLegacyBrowserTokens();
+    return "unauthorized";
+  }
+  throw browserResponseError(response, result);
+}
+
+async function requestBrowserSessionLogin() {
+  const response = await fetch("/browser/session", {
+    method: "POST",
+    headers: { Accept: "application/json" },
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  const result = await readBrowserResponse(response);
+  if (!response.ok) {
+    throw browserResponseError(response, result);
+  }
+  return result.payload;
+}
+
+async function loadBrowserSession() {
+  if (browserSessionState.statusPromise) {
+    return browserSessionState.statusPromise;
+  }
+  const requestGeneration = browserSessionState.generation;
+  const statusPromise = (async () => {
+    const response = await fetch("/api/browser/session", {
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(requestGeneration);
+    if (!response.ok) {
+      throw browserResponseError(response, result);
+    }
+    const session = result.payload?.session || null;
+    const csrfToken = String(result.payload?.csrf_token || "");
+    if (!session || !csrfToken) {
+      const error = new Error("invalid browser session response");
+      error.status = 503;
+      throw error;
+    }
+    browserSessionState.ready = true;
+    browserSessionState.session = session;
+    browserSessionState.csrfToken = csrfToken;
+    browserSessionState.csrfExpiresAt = String(result.payload?.csrf_expires_at || "");
+    browserSessionState.generation += 1;
+    return session;
+  })();
+  browserSessionState.statusPromise = statusPromise;
   try {
-    return await refreshBrowserSessionToken();
-  } catch (error) {
-    console.warn("Unable to load kbase browser session token", error);
-    return "";
+    return await statusPromise;
+  } finally {
+    if (browserSessionState.statusPromise === statusPromise) {
+      browserSessionState.statusPromise = null;
+    }
   }
+}
+
+async function ensureBrowserSession() {
+  if (browserSessionState.ready && browserSessionState.session && browserSessionState.csrfToken) {
+    return browserSessionState.session;
+  }
+  if (browserSessionState.loginPromise) {
+    return browserSessionState.loginPromise;
+  }
+  const requestGeneration = browserSessionState.generation;
+  const loginPromise = (async () => {
+    const migration = await migrateLegacyBrowserSession();
+    assertBrowserSessionGeneration(requestGeneration);
+    if (migration === "migrated") {
+      const session = await loadBrowserSession();
+      browserSessionSignal("login");
+      return session;
+    }
+    if (migration === "unauthorized") {
+      await requestBrowserSessionLogin();
+      assertBrowserSessionGeneration(requestGeneration);
+      const session = await loadBrowserSession();
+      browserSessionSignal("login");
+      return session;
+    }
+    try {
+      return await loadBrowserSession();
+    } catch (error) {
+      if (error?.status !== 401) {
+        throw error;
+      }
+    }
+    assertBrowserSessionGeneration(requestGeneration);
+    await requestBrowserSessionLogin();
+    assertBrowserSessionGeneration(requestGeneration);
+    const session = await loadBrowserSession();
+    browserSessionSignal("login");
+    return session;
+  })();
+  browserSessionState.loginPromise = loginPromise;
+  try {
+    return await loginPromise;
+  } finally {
+    if (browserSessionState.loginPromise === loginPromise) {
+      browserSessionState.loginPromise = null;
+    }
+  }
+}
+
+async function recoverBrowserSession() {
+  if (browserSessionState.recoveryPromise) {
+    return browserSessionState.recoveryPromise;
+  }
+  const recoveryPromise = (async () => {
+    resetBrowserSessionMemory("recovery");
+    const recoveryGeneration = browserSessionState.generation;
+    await requestBrowserSessionLogin();
+    assertBrowserSessionGeneration(recoveryGeneration);
+    const session = await loadBrowserSession();
+    browserSessionSignal("login");
+    return session;
+  })();
+  browserSessionState.recoveryPromise = recoveryPromise;
+  try {
+    return await recoveryPromise;
+  } finally {
+    if (browserSessionState.recoveryPromise === recoveryPromise) {
+      browserSessionState.recoveryPromise = null;
+    }
+  }
+}
+
+function isUnsafeBrowserMethod(method) {
+  return !["GET", "HEAD", "OPTIONS"].includes(String(method || "GET").toUpperCase());
+}
+
+function browserSessionCSRFNeedsRefresh() {
+  if (!browserSessionState.csrfToken) {
+    return true;
+  }
+  const expiresAt = Date.parse(browserSessionState.csrfExpiresAt);
+  return !Number.isFinite(expiresAt) || expiresAt <= Date.now() + 30_000;
+}
+
+function requireSameOriginBrowserRequest(path) {
+  let requestURL = null;
+  try {
+    requestURL = new URL(String(path || ""), window.location.origin);
+  } catch {
+    requestURL = null;
+  }
+  if (
+    !requestURL ||
+    requestURL.origin !== window.location.origin ||
+    requestURL.username ||
+    requestURL.password
+  ) {
+    const error = new Error("cross-origin browser request rejected");
+    error.code = "cross_origin_request";
+    throw error;
+  }
+}
+
+async function browserSessionFetch(path, options = {}, didRecover = false) {
+  requireSameOriginBrowserRequest(path);
+  await ensureBrowserSession();
+  const headers = new Headers(options.headers || {});
+  headers.delete("Authorization");
+  const method = String(options.method || "GET").toUpperCase();
+  if (isUnsafeBrowserMethod(method)) {
+    if (browserSessionCSRFNeedsRefresh()) {
+      try {
+        await loadBrowserSession();
+      } catch (error) {
+        if (error?.status !== 401 || didRecover) {
+          throw error;
+        }
+        await recoverBrowserSession();
+        return browserSessionFetch(path, options, true);
+      }
+    }
+    headers.set("X-KBase-CSRF", browserSessionState.csrfToken);
+  }
+  const requestGeneration = browserSessionState.generation;
+  const requestInvalidationGeneration = browserSessionState.invalidationGeneration;
+  const response = await fetch(path, {
+    ...options,
+    method,
+    headers,
+    credentials: "same-origin",
+  });
+  if (response.status === 401 && !didRecover) {
+    if (browserSessionState.logoutGeneration > requestInvalidationGeneration) {
+      return response;
+    }
+    const activeRecovery = browserSessionState.recoveryPromise;
+    if (activeRecovery) {
+      await activeRecovery;
+    } else if (browserSessionState.generation === requestGeneration) {
+      await recoverBrowserSession();
+    } else {
+      await ensureBrowserSession();
+    }
+    return browserSessionFetch(path, options, true);
+  }
+  return response;
+}
+
+async function logoutBrowserSession() {
+  await ensureBrowserSession();
+  if (browserSessionCSRFNeedsRefresh()) {
+    await loadBrowserSession();
+  }
+  const headers = new Headers({
+    Accept: "application/json",
+    "X-KBase-CSRF": browserSessionState.csrfToken,
+  });
+  const response = await fetch("/api/browser/session/logout", {
+    method: "POST",
+    headers,
+    credentials: "same-origin",
+    cache: "no-store",
+  });
+  const result = await readBrowserResponse(response);
+  if (!response.ok) {
+    throw browserResponseError(response, result);
+  }
+  resetBrowserSessionMemory("logout");
+  browserSessionSignal("logout");
 }
 
 function escapeHTML(value) {
@@ -402,78 +711,41 @@ function escapeAttribute(value) {
   return escapeHTML(value).replaceAll("\n", " ");
 }
 
-async function apiFetch(path, options = {}, didRefreshAuth = false) {
+async function apiFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json");
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const token = getToken() || await ensureBrowserSessionToken();
-  if (token) {
-    setAuthorizationHeader(headers, token);
-  }
-
-  const response = await fetch(path, {
+  const response = await browserSessionFetch(path, {
     ...options,
     headers,
   });
-  const text = await response.text();
-  let payload = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = text;
-    }
-  }
+  const result = await readBrowserResponse(response);
   if (!response.ok) {
-    if (response.status === 401 && !didRefreshAuth) {
-      try {
-        const refreshed = await refreshBrowserSessionToken();
-        if (refreshed) {
-          return apiFetch(path, options, true);
-        }
-      } catch (error) {
-        console.warn("Unable to refresh kbase browser session token", error);
-      }
-    }
-    const message = typeof payload === "object" && payload
-      ? (payload.error || payload.message || JSON.stringify(payload))
-      : (payload || `HTTP ${response.status}`);
-    const error = new Error(message);
-    error.status = response.status;
-    error.payload = payload;
-    throw error;
+    throw browserResponseError(response, result);
   }
-  return payload;
+  return result.payload;
 }
 
-async function apiDownload(path, options = {}, filename = "download.bin", didRefreshAuth = false) {
+async function apiDownload(path, options = {}, filename = "download.bin") {
   const headers = new Headers(options.headers || {});
-  const token = getToken() || await ensureBrowserSessionToken();
-  if (token) {
-    setAuthorizationHeader(headers, token);
-  }
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(path, {
+  const response = await browserSessionFetch(path, {
     ...options,
     headers,
   });
   if (!response.ok) {
-    if (response.status === 401 && !didRefreshAuth) {
-      try {
-        const refreshed = await refreshBrowserSessionToken();
-        if (refreshed) {
-          return apiDownload(path, options, filename, true);
-        }
-      } catch (error) {
-        console.warn("Unable to refresh kbase browser session token", error);
-      }
-    }
     const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    let payload = text;
+    try {
+      payload = text ? JSON.parse(text) : null;
+    } catch {
+      // Keep the raw error body.
+    }
+    throw browserResponseError(response, { text, payload });
   }
   const blob = await response.blob();
   const url = URL.createObjectURL(blob);
@@ -483,7 +755,7 @@ async function apiDownload(path, options = {}, filename = "download.bin", didRef
   document.body.append(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
   return blob.size;
 }
 
@@ -3855,7 +4127,6 @@ async function loadPrivateSourceAssets(container = app) {
   if (!images.length) {
     return;
   }
-  const token = getToken() || await ensureBrowserSessionToken();
   await Promise.allSettled(images.map(async (image) => {
     const source = image.dataset.privateSrc || "";
     const figure = image.closest("figure");
@@ -3863,10 +4134,7 @@ async function loadPrivateSourceAssets(container = app) {
     try {
       const headers = new Headers();
       headers.set("Accept", "image/*");
-      if (token) {
-        setAuthorizationHeader(headers, token);
-      }
-      const response = await fetch(source, {
+      const response = await browserSessionFetch(source, {
         headers,
         credentials: "same-origin",
       });
