@@ -298,11 +298,11 @@ func defaultBrowserSessionDBPath() string {
 }
 
 func defaultPublicOrigin() string {
-	return strings.TrimSpace(os.Getenv("KBASE_PUBLIC_ORIGIN"))
+	return os.Getenv("KBASE_PUBLIC_ORIGIN")
 }
 
 func defaultSessionAdminToken() string {
-	return strings.TrimSpace(os.Getenv("KBASE_SESSION_ADMIN_TOKEN"))
+	return os.Getenv("KBASE_SESSION_ADMIN_TOKEN")
 }
 
 func defaultSessionServerConfig() sessionServerConfig {
@@ -413,22 +413,77 @@ func validatePublicOrigin(rawOrigin string) error {
 		parsed.Fragment != "" {
 		return errors.New("KBASE_PUBLIC_ORIGIN must contain only scheme and host with an optional port")
 	}
-	switch strings.ToLower(parsed.Scheme) {
+	scheme := strings.ToLower(parsed.Scheme)
+	switch scheme {
 	case "https":
-		return nil
 	case "http":
-		host := parsed.Hostname()
-		if strings.EqualFold(host, "localhost") {
-			return nil
-		}
-		ip := net.ParseIP(host)
-		if ip != nil && ip.IsLoopback() {
-			return nil
-		}
-		return errors.New("KBASE_PUBLIC_ORIGIN must use HTTPS for a public host")
 	default:
 		return errors.New("KBASE_PUBLIC_ORIGIN must use HTTPS, or HTTP only for loopback development")
 	}
+
+	host := parsed.Hostname()
+	canonicalHost, ip, err := canonicalOriginHost(host)
+	if err != nil {
+		return err
+	}
+	port := parsed.Port()
+	canonicalAuthority := canonicalHost
+	if strings.Contains(canonicalHost, ":") {
+		canonicalAuthority = "[" + canonicalHost + "]"
+	}
+	if port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return errors.New("KBASE_PUBLIC_ORIGIN port must be between 1 and 65535")
+		}
+		if (scheme == "https" && portNumber == 443) ||
+			(scheme == "http" && portNumber == 80) {
+			return errors.New("KBASE_PUBLIC_ORIGIN must omit the default port")
+		}
+		canonicalAuthority = net.JoinHostPort(canonicalHost, strconv.Itoa(portNumber))
+	}
+	if origin != scheme+"://"+canonicalAuthority {
+		return errors.New("KBASE_PUBLIC_ORIGIN must use canonical browser Origin serialization")
+	}
+	if scheme == "http" &&
+		!strings.EqualFold(canonicalHost, "localhost") &&
+		(ip == nil || !ip.IsLoopback()) {
+		return errors.New("KBASE_PUBLIC_ORIGIN must use HTTPS for a public host")
+	}
+	return nil
+}
+
+func canonicalOriginHost(host string) (string, net.IP, error) {
+	if host == "" {
+		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host is required")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return ipv4.String(), ip, nil
+		}
+		return ip.String(), ip, nil
+	}
+	for _, char := range host {
+		if char > 127 {
+			return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host must use canonical ASCII form")
+		}
+	}
+	lowerHost := strings.ToLower(host)
+	if strings.Contains(lowerHost, ":") ||
+		strings.HasPrefix(lowerHost, "0x") ||
+		isNumericOriginHost(lowerHost) {
+		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host must use canonical browser form")
+	}
+	return lowerHost, nil, nil
+}
+
+func isNumericOriginHost(host string) bool {
+	for _, char := range host {
+		if (char < '0' || char > '9') && char != '.' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateURLSafeSessionSecret(name, rawSecret string) error {

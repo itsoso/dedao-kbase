@@ -145,11 +145,31 @@ func TestBrowserSessionEnvironmentHelpers(t *testing.T) {
 	if got := defaultBrowserSessionDBPath(); got != filepath.Join("state", "custom.sqlite3") {
 		t.Fatalf("configured browser session path = %q", got)
 	}
-	if got := defaultPublicOrigin(); got != "https://kbase.example.test" {
+	if got := defaultPublicOrigin(); got != "  https://kbase.example.test  " {
 		t.Fatalf("configured public origin = %q", got)
 	}
-	if got := defaultSessionAdminToken(); got != strings.Repeat("a", 32) {
+	if got := defaultSessionAdminToken(); got != "  "+strings.Repeat("a", 32)+"  " {
 		t.Fatalf("configured session admin token = %q", got)
+	}
+}
+
+func TestBrowserSessionEnvironmentWhitespaceFailsWhenEnabled(t *testing.T) {
+	t.Setenv("KBASE_PUBLIC_ORIGIN", " https://kbase.example.test")
+	t.Setenv("KBASE_SESSION_ADMIN_TOKEN", strings.Repeat("a", 32))
+	cfg := defaultSessionServerConfig()
+	cfg.ListenAddr = "127.0.0.1:8719"
+	cfg.BrowserProxySecret = strings.Repeat("p", 32)
+	if err := validateSessionConfiguration(cfg); err == nil {
+		t.Fatal("enabled browser sessions accepted whitespace around KBASE_PUBLIC_ORIGIN")
+	}
+
+	t.Setenv("KBASE_PUBLIC_ORIGIN", "https://kbase.example.test")
+	t.Setenv("KBASE_SESSION_ADMIN_TOKEN", strings.Repeat("a", 32)+" ")
+	cfg = defaultSessionServerConfig()
+	cfg.ListenAddr = "127.0.0.1:8719"
+	cfg.BrowserProxySecret = strings.Repeat("p", 32)
+	if err := validateSessionConfiguration(cfg); err == nil {
+		t.Fatal("enabled browser sessions accepted whitespace around KBASE_SESSION_ADMIN_TOKEN")
 	}
 }
 
@@ -211,6 +231,15 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 		{name: "origin missing scheme", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "kbase.example.test" }},
 		{name: "origin missing host", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://" }},
 		{name: "origin malformed port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:bad" }},
+		{name: "origin uppercase scheme", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "HTTPS://kbase.example.test" }},
+		{name: "origin uppercase host", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://KBASE.example.test" }},
+		{name: "origin empty port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:" }},
+		{name: "origin zero port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:0" }},
+		{name: "origin port above range", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:65536" }},
+		{name: "origin HTTPS default port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:443" }},
+		{name: "origin HTTP default port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "http://localhost:80" }},
+		{name: "origin leading zero port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:08443" }},
+		{name: "origin expanded IPv6", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://[0:0:0:0:0:0:0:1]:8443" }},
 		{name: "origin unsupported scheme", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "ftp://kbase.example.test" }},
 		{name: "empty admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = "" }},
 		{name: "short admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = "short" }},
@@ -231,6 +260,7 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 	for _, origin := range []string{
 		"https://kbase.example.test",
 		"https://kbase.example.test:8443",
+		"https://[::1]:8443",
 		"http://localhost:8719",
 		"http://127.0.0.1:8719",
 		"http://[::1]:8719",
@@ -240,6 +270,78 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 			cfg.PublicOrigin = origin
 			if err := validateSessionConfiguration(cfg); err != nil {
 				t.Fatalf("validateSessionConfiguration(%q) error = %v", origin, err)
+			}
+		})
+	}
+}
+
+func TestBrowserSessionValidationErrorsRedactSecrets(t *testing.T) {
+	adminSecret := "AdminLeakSentinel_" + strings.Repeat("a", 32)
+	proxySecret := "ProxyLeakSentinel_" + strings.Repeat("p", 32)
+	reservedSecret := "ReservedLeakSentinel_" + strings.Repeat("r", 32)
+	base := sessionServerConfig{
+		ListenAddr:         "127.0.0.1:8719",
+		BrowserProxySecret: proxySecret,
+		DBPath:             filepath.Join("state", "browser_sessions.sqlite3"),
+		PublicOrigin:       "https://kbase.example.test",
+		AdminToken:         adminSecret,
+		TTL:                30 * 24 * time.Hour,
+		RenewalInterval:    5 * time.Minute,
+		MaxActive:          10,
+	}
+	tests := []struct {
+		name     string
+		config   sessionServerConfig
+		reserved []string
+	}{
+		{
+			name: "invalid admin",
+			config: func() sessionServerConfig {
+				cfg := base
+				cfg.AdminToken += "$"
+				return cfg
+			}(),
+		},
+		{
+			name: "invalid proxy",
+			config: func() sessionServerConfig {
+				cfg := base
+				cfg.BrowserProxySecret += "$"
+				return cfg
+			}(),
+		},
+		{
+			name:     "admin collision",
+			config:   base,
+			reserved: []string{adminSecret},
+		},
+		{
+			name:     "proxy collision",
+			config:   base,
+			reserved: []string{proxySecret},
+		},
+		{
+			name:     "distinct reserved remains private",
+			config:   base,
+			reserved: []string{reservedSecret, adminSecret},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateSessionConfiguration(test.config, test.reserved...)
+			if err == nil {
+				t.Fatal("validateSessionConfiguration() error = nil")
+			}
+			for _, secret := range []string{
+				test.config.AdminToken,
+				test.config.BrowserProxySecret,
+				adminSecret,
+				proxySecret,
+				reservedSecret,
+			} {
+				if secret != "" && strings.Contains(err.Error(), secret) {
+					t.Fatalf("validation error leaked a secret: %q", err)
+				}
 			}
 		})
 	}
