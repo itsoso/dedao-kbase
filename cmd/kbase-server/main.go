@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -30,18 +31,41 @@ func main() {
 	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
 	flag.Parse()
 	browserSessionSecret := defaultBrowserSessionSecret()
+	sessionConfig := defaultSessionServerConfig()
+	sessionConfig.ListenAddr = *addr
+	sessionConfig.BrowserProxySecret = browserSessionSecret
+	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
 	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken, *agentPublisherToken); err != nil {
 		log.Fatal(err)
 	}
-	if err := validateBrowserSessionConfiguration(
-		*addr,
-		browserSessionSecret,
+	if err := validateSessionConfiguration(
+		sessionConfig,
 		*authToken,
 		*sourceAgentToken,
 		*agentPublisherToken,
+		string(retrySigningKey),
 	); err != nil {
 		log.Fatal(err)
 	}
+	if retrySigningErr == nil {
+		retrySigningErr = validateEvidenceAuditRetryKeySeparation(
+			retrySigningKey,
+			*authToken,
+			*sourceAgentToken,
+			*agentPublisherToken,
+			sessionConfig.AdminToken,
+			sessionConfig.BrowserProxySecret,
+		)
+	}
+	browserSessions, err := newBrowserSessionRuntime(sessionConfig)
+	if err != nil {
+		log.Fatalf("initialize browser session store: %v", err)
+	}
+	defer func() {
+		if err := browserSessions.Close(); err != nil {
+			log.Printf("close browser session store: %v", err)
+		}
+	}()
 	sourceSync, err := app.NewSourceSyncStore(*root)
 	if err != nil {
 		log.Fatalf("initialize source sync store: %v", err)
@@ -56,22 +80,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	auditRuntime := newEvidenceAuditServerRuntime(ctx, bookStore)
-	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
-	if retrySigningErr == nil {
-		retrySigningErr = validateEvidenceAuditRetryKeySeparation(
-			retrySigningKey, *authToken, *sourceAgentToken, *agentPublisherToken,
-		)
-	}
 	if retrySigningErr != nil {
 		log.Printf("evidence audit retry disabled: %v", retrySigningErr)
 		retrySigningKey = nil
 	}
 	proofroomDelivery, proofroomUnavailableReason := newProofroomDeliveryRuntime()
 
-	handler := app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
+	handlerConfig := app.KBaseHTTPConfig{
 		Store:                  bookStore,
 		AuthToken:              *authToken,
-		BrowserSessionSecret:   browserSessionSecret,
 		AgentPublisherToken:    *agentPublisherToken,
 		SystemKBExportPath:     *exportPath,
 		StaticDir:              *webDir,
@@ -89,7 +106,8 @@ func main() {
 				event.Operation, event.Code, event.Cause)
 		},
 		ProofroomDelivery: proofroomDelivery,
-	})
+	}
+	handler := app.NewKBaseHTTPHandler(applyBrowserSessionRuntime(handlerConfig, browserSessions))
 
 	log.Printf("dedao kbase server listening on %s", *addr)
 	log.Printf("book knowledge root: %s", *root)
@@ -248,28 +266,197 @@ func defaultBrowserSessionSecret() string {
 	return strings.TrimSpace(os.Getenv("KBASE_BROWSER_SESSION_SECRET"))
 }
 
+const (
+	defaultSessionTTL             = 30 * 24 * time.Hour
+	defaultSessionRenewalInterval = 5 * time.Minute
+	defaultSessionMaxActive       = 10
+)
+
+type sessionServerConfig struct {
+	ListenAddr         string
+	BrowserProxySecret string
+	DBPath             string
+	PublicOrigin       string
+	AdminToken         string
+	TTL                time.Duration
+	RenewalInterval    time.Duration
+	MaxActive          int
+}
+
+type browserSessionRuntime struct {
+	Store              *app.BrowserSessionStore
+	BrowserProxySecret string
+	PublicOrigin       string
+	AdminToken         string
+	TTL                time.Duration
+	RenewalInterval    time.Duration
+	MaxActive          int
+}
+
+func defaultBrowserSessionDBPath() string {
+	return envDefault("KBASE_BROWSER_SESSION_DB_PATH", filepath.Join("state", "browser_sessions.sqlite3"))
+}
+
+func defaultPublicOrigin() string {
+	return strings.TrimSpace(os.Getenv("KBASE_PUBLIC_ORIGIN"))
+}
+
+func defaultSessionAdminToken() string {
+	return strings.TrimSpace(os.Getenv("KBASE_SESSION_ADMIN_TOKEN"))
+}
+
+func defaultSessionServerConfig() sessionServerConfig {
+	return sessionServerConfig{
+		BrowserProxySecret: defaultBrowserSessionSecret(),
+		DBPath:             defaultBrowserSessionDBPath(),
+		PublicOrigin:       defaultPublicOrigin(),
+		AdminToken:         defaultSessionAdminToken(),
+		TTL:                defaultSessionTTL,
+		RenewalInterval:    defaultSessionRenewalInterval,
+		MaxActive:          defaultSessionMaxActive,
+	}
+}
+
+func newBrowserSessionRuntime(cfg sessionServerConfig) (browserSessionRuntime, error) {
+	runtime := browserSessionRuntime{
+		BrowserProxySecret: strings.TrimSpace(cfg.BrowserProxySecret),
+		PublicOrigin:       strings.TrimSpace(cfg.PublicOrigin),
+		AdminToken:         strings.TrimSpace(cfg.AdminToken),
+		TTL:                cfg.TTL,
+		RenewalInterval:    cfg.RenewalInterval,
+		MaxActive:          cfg.MaxActive,
+	}
+	if runtime.BrowserProxySecret == "" {
+		return runtime, nil
+	}
+	store, err := app.NewBrowserSessionStore(app.BrowserSessionStoreConfig{
+		Path:            cfg.DBPath,
+		TTL:             cfg.TTL,
+		RenewalInterval: cfg.RenewalInterval,
+		MaxActive:       cfg.MaxActive,
+	})
+	if err != nil {
+		return browserSessionRuntime{}, fmt.Errorf("open browser session database: %w", err)
+	}
+	runtime.Store = store
+	return runtime, nil
+}
+
+func (runtime browserSessionRuntime) Close() error {
+	if runtime.Store == nil {
+		return nil
+	}
+	return runtime.Store.Close()
+}
+
+func applyBrowserSessionRuntime(cfg app.KBaseHTTPConfig, runtime browserSessionRuntime) app.KBaseHTTPConfig {
+	cfg.BrowserSessionSecret = runtime.BrowserProxySecret
+	cfg.BrowserSessions = app.BrowserSessionHTTPConfig{
+		Store:           runtime.Store,
+		AdminToken:      runtime.AdminToken,
+		PublicOrigin:    runtime.PublicOrigin,
+		TTL:             runtime.TTL,
+		RenewalInterval: runtime.RenewalInterval,
+		MaxActive:       runtime.MaxActive,
+	}
+	return cfg
+}
+
+func validateSessionConfiguration(cfg sessionServerConfig, reservedSecrets ...string) error {
+	browserProxySecret := strings.TrimSpace(cfg.BrowserProxySecret)
+	if browserProxySecret == "" {
+		return nil
+	}
+	if strings.TrimSpace(cfg.DBPath) == "" {
+		return errors.New("KBASE_BROWSER_SESSION_DB_PATH is required when browser sessions are enabled")
+	}
+	if cfg.TTL <= 0 || cfg.RenewalInterval <= 0 || cfg.RenewalInterval >= cfg.TTL || cfg.MaxActive <= 0 {
+		return errors.New("browser session lifecycle configuration is invalid")
+	}
+	if err := validateBrowserSessionConfiguration(
+		cfg.ListenAddr,
+		cfg.BrowserProxySecret,
+		append(reservedSecrets, cfg.AdminToken)...,
+	); err != nil {
+		return err
+	}
+	if err := validatePublicOrigin(cfg.PublicOrigin); err != nil {
+		return err
+	}
+	if err := validateURLSafeSessionSecret("KBASE_SESSION_ADMIN_TOKEN", cfg.AdminToken); err != nil {
+		return err
+	}
+	for _, secret := range append(reservedSecrets, cfg.BrowserProxySecret) {
+		secret = strings.TrimSpace(secret)
+		if secret != "" && subtle.ConstantTimeCompare([]byte(cfg.AdminToken), []byte(secret)) == 1 {
+			return errors.New("KBASE_SESSION_ADMIN_TOKEN must differ from every reserved secret")
+		}
+	}
+	return nil
+}
+
+func validatePublicOrigin(rawOrigin string) error {
+	origin := strings.TrimSpace(rawOrigin)
+	if origin == "" || rawOrigin != origin {
+		return errors.New("KBASE_PUBLIC_ORIGIN must be an exact origin without surrounding whitespace")
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil ||
+		parsed.Scheme == "" ||
+		parsed.Host == "" ||
+		parsed.Opaque != "" ||
+		parsed.User != nil ||
+		parsed.Path != "" ||
+		parsed.RawPath != "" ||
+		parsed.RawQuery != "" ||
+		parsed.ForceQuery ||
+		parsed.Fragment != "" {
+		return errors.New("KBASE_PUBLIC_ORIGIN must contain only scheme and host with an optional port")
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		host := parsed.Hostname()
+		if strings.EqualFold(host, "localhost") {
+			return nil
+		}
+		ip := net.ParseIP(host)
+		if ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		return errors.New("KBASE_PUBLIC_ORIGIN must use HTTPS for a public host")
+	default:
+		return errors.New("KBASE_PUBLIC_ORIGIN must use HTTPS, or HTTP only for loopback development")
+	}
+}
+
+func validateURLSafeSessionSecret(name, rawSecret string) error {
+	secret := strings.TrimSpace(rawSecret)
+	if rawSecret != secret || len(secret) < 32 || len(secret) > 128 {
+		return fmt.Errorf("%s must contain 32-128 URL-safe ASCII characters", name)
+	}
+	for _, char := range []byte(secret) {
+		isAlphaNumeric := char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9'
+		if !isAlphaNumeric && char != '_' && char != '-' {
+			return fmt.Errorf("%s must contain 32-128 URL-safe ASCII characters", name)
+		}
+	}
+	return nil
+}
+
 func validateBrowserSessionConfiguration(
 	addr string,
 	browserSessionSecret string,
 	reservedTokens ...string,
 ) error {
-	rawSecret := browserSessionSecret
-	browserSessionSecret = strings.TrimSpace(browserSessionSecret)
-	if browserSessionSecret == "" {
+	if strings.TrimSpace(browserSessionSecret) == "" {
 		return nil
 	}
-	if rawSecret != browserSessionSecret ||
-		len(browserSessionSecret) < 32 ||
-		len(browserSessionSecret) > 128 {
-		return errors.New("KBASE_BROWSER_SESSION_SECRET must contain 32-128 URL-safe ASCII characters")
-	}
-	for _, char := range []byte(browserSessionSecret) {
-		isAlphaNumeric := char >= 'a' && char <= 'z' ||
-			char >= 'A' && char <= 'Z' ||
-			char >= '0' && char <= '9'
-		if !isAlphaNumeric && char != '_' && char != '-' {
-			return errors.New("KBASE_BROWSER_SESSION_SECRET must contain 32-128 URL-safe ASCII characters")
-		}
+	if err := validateURLSafeSessionSecret("KBASE_BROWSER_SESSION_SECRET", browserSessionSecret); err != nil {
+		return err
 	}
 	for _, token := range reservedTokens {
 		token = strings.TrimSpace(token)

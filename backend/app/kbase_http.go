@@ -27,6 +27,7 @@ type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
 	AuthToken               string
 	BrowserSessionSecret    string
+	BrowserSessions         BrowserSessionHTTPConfig
 	AgentPublisherToken     string
 	SystemKBExportPath      string
 	StaticDir               string
@@ -52,19 +53,15 @@ type KBaseHTTPConfig struct {
 	AuditLogger             func(EvidenceAuditHTTPLogEvent)
 	ProofroomDelivery       *ProofroomDeliveryService
 }
-
 type EvidenceAuditHTTPLogEvent struct {
 	Operation string
 	Code      string
 	Cause     string
 }
-
 type EvidenceAuditEnqueuer interface {
 	Enqueue(string) error
 }
-
 type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
-
 type DedaoLibraryService interface {
 	CourseList(category, order string, page, limit int) (*services.CourseList, error)
 	CourseInfo(enid string) (*services.CourseInfo, error)
@@ -78,6 +75,7 @@ type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
 	authToken               string
 	browserSessionSecret    string
+	browserSessions         BrowserSessionHTTPConfig
 	agentPublisherToken     string
 	systemKBExportPath      string
 	staticDir               string
@@ -123,6 +121,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	}
 	authToken := strings.TrimSpace(cfg.AuthToken)
 	browserSessionSecret := strings.TrimSpace(cfg.BrowserSessionSecret)
+	browserSessions := normalizeBrowserSessionHTTPConfig(cfg.BrowserSessions)
 	agentPublisherToken := strings.TrimSpace(cfg.AgentPublisherToken)
 	sourceAgentToken := strings.TrimSpace(cfg.SourceAgentToken)
 	if browserSessionSecret != "" &&
@@ -187,6 +186,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		store:                   store,
 		authToken:               authToken,
 		browserSessionSecret:    browserSessionSecret,
+		browserSessions:         browserSessions,
 		agentPublisherToken:     agentPublisherToken,
 		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:               strings.TrimSpace(cfg.StaticDir),
@@ -3606,4 +3606,28 @@ func writeHTTPJSON(w http.ResponseWriter, status int, value any) {
 
 func writeHTTPError(w http.ResponseWriter, status int, message string) {
 	writeHTTPJSON(w, status, map[string]any{"error": message})
+}
+
+type BrowserSessionHTTPConfig struct {
+	Store           *BrowserSessionStore
+	AdminToken      string
+	PublicOrigin    string
+	TTL             time.Duration
+	RenewalInterval time.Duration
+	MaxActive       int
+}
+
+func normalizeBrowserSessionHTTPConfig(cfg BrowserSessionHTTPConfig) BrowserSessionHTTPConfig {
+	cfg.AdminToken = strings.TrimSpace(cfg.AdminToken)
+	cfg.PublicOrigin = strings.TrimSpace(cfg.PublicOrigin)
+	if cfg.TTL <= 0 {
+		cfg.TTL = 30 * 24 * time.Hour
+	}
+	if cfg.RenewalInterval <= 0 {
+		cfg.RenewalInterval = 5 * time.Minute
+	}
+	if cfg.MaxActive <= 0 {
+		cfg.MaxActive = 10
+	}
+	return cfg
 }

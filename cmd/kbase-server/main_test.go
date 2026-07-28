@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -124,38 +125,261 @@ func TestValidateKBaseTokenSeparation(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionEnvironmentHelpers(t *testing.T) {
+	t.Setenv("KBASE_BROWSER_SESSION_DB_PATH", "")
+	t.Setenv("KBASE_PUBLIC_ORIGIN", "")
+	t.Setenv("KBASE_SESSION_ADMIN_TOKEN", "")
+	if got := defaultBrowserSessionDBPath(); got != filepath.Join("state", "browser_sessions.sqlite3") {
+		t.Fatalf("defaultBrowserSessionDBPath() = %q", got)
+	}
+	if got := defaultPublicOrigin(); got != "" {
+		t.Fatalf("defaultPublicOrigin() = %q", got)
+	}
+	if got := defaultSessionAdminToken(); got != "" {
+		t.Fatalf("defaultSessionAdminToken() = %q", got)
+	}
+
+	t.Setenv("KBASE_BROWSER_SESSION_DB_PATH", "  state/custom.sqlite3  ")
+	t.Setenv("KBASE_PUBLIC_ORIGIN", "  https://kbase.example.test  ")
+	t.Setenv("KBASE_SESSION_ADMIN_TOKEN", "  "+strings.Repeat("a", 32)+"  ")
+	if got := defaultBrowserSessionDBPath(); got != filepath.Join("state", "custom.sqlite3") {
+		t.Fatalf("configured browser session path = %q", got)
+	}
+	if got := defaultPublicOrigin(); got != "https://kbase.example.test" {
+		t.Fatalf("configured public origin = %q", got)
+	}
+	if got := defaultSessionAdminToken(); got != strings.Repeat("a", 32) {
+		t.Fatalf("configured session admin token = %q", got)
+	}
+}
+
+func TestBrowserSessionDefaults(t *testing.T) {
+	cfg := defaultSessionServerConfig()
+	if cfg.TTL != 30*24*time.Hour {
+		t.Fatalf("TTL = %s", cfg.TTL)
+	}
+	if cfg.RenewalInterval != 5*time.Minute {
+		t.Fatalf("renewal interval = %s", cfg.RenewalInterval)
+	}
+	if cfg.MaxActive != 10 {
+		t.Fatalf("max active = %d", cfg.MaxActive)
+	}
+}
+
 func TestValidateBrowserSessionConfiguration(t *testing.T) {
-	browserProxyValue := strings.Repeat("browser-proxy-", 3)
+	proxySecret := strings.Repeat("p", 32)
+	adminToken := strings.Repeat("a", 32)
+	valid := sessionServerConfig{
+		ListenAddr:         "127.0.0.1:8719",
+		BrowserProxySecret: proxySecret,
+		DBPath:             filepath.Join("state", "browser_sessions.sqlite3"),
+		PublicOrigin:       "https://kbase.example.test",
+		AdminToken:         adminToken,
+		TTL:                30 * 24 * time.Hour,
+		RenewalInterval:    5 * time.Minute,
+		MaxActive:          10,
+	}
+
+	disabled := valid
+	disabled.ListenAddr = "0.0.0.0:8719"
+	disabled.BrowserProxySecret = ""
+	disabled.PublicOrigin = ""
+	disabled.AdminToken = ""
+	if err := validateSessionConfiguration(disabled); err != nil {
+		t.Fatalf("disabled browser sessions rejected: %v", err)
+	}
+
 	for _, test := range []struct {
-		name      string
-		addr      string
-		secret    string
-		tokens    []string
-		wantError bool
+		name   string
+		mutate func(*sessionServerConfig)
 	}{
-		{name: "disabled", addr: "0.0.0.0:8719"},
-		{name: "IPv4 loopback", addr: "127.0.0.1:8719", secret: browserProxyValue},
-		{name: "IPv6 loopback", addr: "[::1]:8719", secret: browserProxyValue},
-		{name: "localhost", addr: "localhost:8719", secret: browserProxyValue},
-		{name: "zero port", addr: "127.0.0.1:0", secret: browserProxyValue, wantError: true},
-		{name: "port above range", addr: "127.0.0.1:65536", secret: browserProxyValue, wantError: true},
-		{name: "wildcard", addr: ":8719", secret: browserProxyValue, wantError: true},
-		{name: "IPv4 wildcard", addr: "0.0.0.0:8719", secret: browserProxyValue, wantError: true},
-		{name: "public address", addr: "192.0.2.10:8719", secret: browserProxyValue, wantError: true},
-		{name: "short secret", addr: "127.0.0.1:8719", secret: "short", wantError: true},
-		{name: "too long", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 129), wantError: true},
-		{name: "whitespace secret", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + " ", wantError: true},
-		{name: "dollar expansion", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + "$", wantError: true},
-		{name: "quoted syntax", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + `"`, wantError: true},
-		{name: "path separator", addr: "127.0.0.1:8719", secret: strings.Repeat("x", 31) + "/", wantError: true},
-		{name: "shared admin token", addr: "127.0.0.1:8719", secret: browserProxyValue, tokens: []string{browserProxyValue}, wantError: true},
+		{name: "empty origin", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "" }},
+		{name: "empty database path", mutate: func(cfg *sessionServerConfig) { cfg.DBPath = "" }},
+		{name: "zero port", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "127.0.0.1:0" }},
+		{name: "malformed listen", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "127.0.0.1" }},
+		{name: "public listen", mutate: func(cfg *sessionServerConfig) { cfg.ListenAddr = "192.0.2.10:8719" }},
+		{name: "short proxy", mutate: func(cfg *sessionServerConfig) { cfg.BrowserProxySecret = "short" }},
+		{name: "long proxy", mutate: func(cfg *sessionServerConfig) { cfg.BrowserProxySecret = strings.Repeat("p", 129) }},
+		{name: "proxy whitespace", mutate: func(cfg *sessionServerConfig) { cfg.BrowserProxySecret = " " + strings.Repeat("p", 32) }},
+		{name: "proxy non URL safe", mutate: func(cfg *sessionServerConfig) { cfg.BrowserProxySecret = strings.Repeat("p", 31) + "$" }},
+		{name: "public HTTP", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "http://kbase.example.test" }},
+		{name: "origin path", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test/app" }},
+		{name: "origin query", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test?x=1" }},
+		{name: "origin fragment", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test#fragment" }},
+		{name: "origin userinfo", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://user@kbase.example.test" }},
+		{name: "origin trailing slash", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test/" }},
+		{name: "origin missing scheme", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "kbase.example.test" }},
+		{name: "origin missing host", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://" }},
+		{name: "origin malformed port", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "https://kbase.example.test:bad" }},
+		{name: "origin unsupported scheme", mutate: func(cfg *sessionServerConfig) { cfg.PublicOrigin = "ftp://kbase.example.test" }},
+		{name: "empty admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = "" }},
+		{name: "short admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = "short" }},
+		{name: "long admin", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = strings.Repeat("a", 129) }},
+		{name: "admin whitespace", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = " " + strings.Repeat("a", 32) }},
+		{name: "admin non URL safe", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = strings.Repeat("a", 31) + "$" }},
+		{name: "admin equals proxy", mutate: func(cfg *sessionServerConfig) { cfg.AdminToken = cfg.BrowserProxySecret }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateBrowserSessionConfiguration(test.addr, test.secret, test.tokens...)
-			if (err != nil) != test.wantError {
-				t.Fatalf("validateBrowserSessionConfiguration() error = %v, wantError=%v", err, test.wantError)
+			cfg := valid
+			test.mutate(&cfg)
+			if err := validateSessionConfiguration(cfg); err == nil {
+				t.Fatalf("validateSessionConfiguration() accepted %+v", cfg)
 			}
 		})
+	}
+
+	for _, origin := range []string{
+		"https://kbase.example.test",
+		"https://kbase.example.test:8443",
+		"http://localhost:8719",
+		"http://127.0.0.1:8719",
+		"http://[::1]:8719",
+	} {
+		t.Run("accept "+origin, func(t *testing.T) {
+			cfg := valid
+			cfg.PublicOrigin = origin
+			if err := validateSessionConfiguration(cfg); err != nil {
+				t.Fatalf("validateSessionConfiguration(%q) error = %v", origin, err)
+			}
+		})
+	}
+}
+
+func TestBrowserSessionTokenSeparation(t *testing.T) {
+	proxySecret := strings.Repeat("p", 32)
+	adminToken := strings.Repeat("a", 32)
+	base := sessionServerConfig{
+		ListenAddr:         "127.0.0.1:8719",
+		BrowserProxySecret: proxySecret,
+		DBPath:             filepath.Join("state", "browser_sessions.sqlite3"),
+		PublicOrigin:       "https://kbase.example.test",
+		AdminToken:         adminToken,
+		TTL:                30 * 24 * time.Hour,
+		RenewalInterval:    5 * time.Minute,
+		MaxActive:          10,
+	}
+	for _, name := range []string{"API", "publisher", "source agent", "retry signing"} {
+		t.Run("admin differs from "+name, func(t *testing.T) {
+			if err := validateSessionConfiguration(base, adminToken); err == nil {
+				t.Fatalf("admin token was allowed to equal %s token", name)
+			}
+		})
+		t.Run("proxy differs from "+name, func(t *testing.T) {
+			if err := validateSessionConfiguration(base, proxySecret); err == nil {
+				t.Fatalf("browser proxy secret was allowed to equal %s token", name)
+			}
+		})
+	}
+	if err := validateSessionConfiguration(
+		base,
+		strings.Repeat("b", 32),
+		strings.Repeat("c", 32),
+		strings.Repeat("d", 32),
+		strings.Repeat("e", 32),
+	); err != nil {
+		t.Fatalf("distinct session secrets rejected: %v", err)
+	}
+}
+
+func TestBrowserSessionRuntimeRejectsUnusableDatabasePath(t *testing.T) {
+	parent := t.TempDir()
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+	dbPath := filepath.Join(parent, "database-is-a-directory")
+	if err := os.Mkdir(dbPath, 0o700); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+	cfg := defaultSessionServerConfig()
+	cfg.ListenAddr = "127.0.0.1:8719"
+	cfg.BrowserProxySecret = strings.Repeat("p", 32)
+	cfg.DBPath = dbPath
+	cfg.PublicOrigin = "https://kbase.example.test"
+	cfg.AdminToken = strings.Repeat("a", 32)
+	if _, err := newBrowserSessionRuntime(cfg); err == nil {
+		t.Fatal("newBrowserSessionRuntime() accepted a directory as the SQLite database")
+	}
+}
+
+func TestBrowserSessionRuntimeDisabledRemainsCompatible(t *testing.T) {
+	cfg := defaultSessionServerConfig()
+	cfg.ListenAddr = "0.0.0.0:8719"
+	cfg.BrowserProxySecret = ""
+	cfg.DBPath = filepath.Join(t.TempDir(), "missing", "browser_sessions.sqlite3")
+	cfg.PublicOrigin = ""
+	cfg.AdminToken = ""
+	runtime, err := newBrowserSessionRuntime(cfg)
+	if err != nil {
+		t.Fatalf("newBrowserSessionRuntime() disabled error = %v", err)
+	}
+	if runtime.Store != nil {
+		t.Fatal("disabled browser session runtime initialized a store")
+	}
+	if _, err := os.Stat(cfg.DBPath); !os.IsNotExist(err) {
+		t.Fatalf("disabled browser session runtime touched database path: %v", err)
+	}
+}
+
+func TestBrowserSessionRuntimeConfiguresHTTPHandler(t *testing.T) {
+	cfg := defaultSessionServerConfig()
+	cfg.ListenAddr = "127.0.0.1:8719"
+	cfg.BrowserProxySecret = strings.Repeat("p", 32)
+	cfg.DBPath = filepath.Join(t.TempDir(), "sessions", "browser_sessions.sqlite3")
+	cfg.PublicOrigin = "https://kbase.example.test"
+	cfg.AdminToken = strings.Repeat("a", 32)
+	runtime, err := newBrowserSessionRuntime(cfg)
+	if err != nil {
+		t.Fatalf("newBrowserSessionRuntime() error = %v", err)
+	}
+	t.Cleanup(func() { runtime.Close() })
+
+	handlerConfig := applyBrowserSessionRuntime(app.KBaseHTTPConfig{}, runtime)
+	if handlerConfig.BrowserSessions.Store != runtime.Store ||
+		handlerConfig.BrowserSessionSecret != cfg.BrowserProxySecret ||
+		handlerConfig.BrowserSessions.AdminToken != cfg.AdminToken ||
+		handlerConfig.BrowserSessions.PublicOrigin != cfg.PublicOrigin ||
+		handlerConfig.BrowserSessions.TTL != 30*24*time.Hour ||
+		handlerConfig.BrowserSessions.RenewalInterval != 5*time.Minute ||
+		handlerConfig.BrowserSessions.MaxActive != 10 {
+		t.Fatalf("handler session config = %+v", handlerConfig)
+	}
+
+	handlerValue := reflect.ValueOf(app.NewKBaseHTTPHandler(handlerConfig)).Elem()
+	sessionValue := handlerValue.FieldByName("browserSessions")
+	if got := sessionValue.FieldByName("Store").Pointer(); got != reflect.ValueOf(runtime.Store).Pointer() {
+		t.Fatalf("handler browser session store pointer = %x", got)
+	}
+	if got := handlerValue.FieldByName("browserSessionSecret").String(); got != cfg.BrowserProxySecret {
+		t.Fatalf("handler browser proxy secret = %q", got)
+	}
+	if got := sessionValue.FieldByName("AdminToken").String(); got != cfg.AdminToken {
+		t.Fatalf("handler session admin token = %q", got)
+	}
+	if got := sessionValue.FieldByName("PublicOrigin").String(); got != cfg.PublicOrigin {
+		t.Fatalf("handler public origin = %q", got)
+	}
+	if got := time.Duration(sessionValue.FieldByName("TTL").Int()); got != 30*24*time.Hour {
+		t.Fatalf("handler TTL = %s", got)
+	}
+	if got := time.Duration(sessionValue.FieldByName("RenewalInterval").Int()); got != 5*time.Minute {
+		t.Fatalf("handler renewal interval = %s", got)
+	}
+	if got := int(sessionValue.FieldByName("MaxActive").Int()); got != 10 {
+		t.Fatalf("handler max active = %d", got)
+	}
+
+	defaultedHandler := reflect.ValueOf(app.NewKBaseHTTPHandler(app.KBaseHTTPConfig{
+		Store: app.NewBookKnowledgeStore(t.TempDir()),
+	})).Elem()
+	defaultedSession := defaultedHandler.FieldByName("browserSessions")
+	if got := time.Duration(defaultedSession.FieldByName("TTL").Int()); got != 30*24*time.Hour {
+		t.Fatalf("default handler TTL = %s", got)
+	}
+	if got := time.Duration(defaultedSession.FieldByName("RenewalInterval").Int()); got != 5*time.Minute {
+		t.Fatalf("default handler renewal interval = %s", got)
+	}
+	if got := int(defaultedSession.FieldByName("MaxActive").Int()); got != 10 {
+		t.Fatalf("default handler max active = %d", got)
 	}
 }
 
