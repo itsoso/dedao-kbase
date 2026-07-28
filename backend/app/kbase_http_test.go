@@ -2812,6 +2812,712 @@ func TestKBaseHTTPHandlerBrowserLegacyTokenRetired(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerCookieAuth(t *testing.T) {
+	t.Run("reads general and audit APIs and renews only on interval", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 414)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Cookie Browser")
+
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf("Cookie read status = %d, body=%s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("Cookie read inside renewal interval reissued Cookie: %q", got)
+		}
+
+		auditResponse := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/agent-audits", credentials.Token, "",
+		)
+		if auditResponse.Code != http.StatusOK ||
+			!strings.Contains(auditResponse.Body.String(), `"audits":[]`) {
+			t.Fatalf("Cookie audit read status = %d, body=%s", auditResponse.Code, auditResponse.Body.String())
+		}
+
+		clock.Advance(5 * time.Minute)
+		staticResponse := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/", credentials.Token, "",
+		)
+		if got := staticResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("static request authenticated or renewed Cookie: %q", got)
+		}
+
+		renewed := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if renewed.Code != http.StatusOK {
+			t.Fatalf("renewed Cookie read status = %d, body=%s", renewed.Code, renewed.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(
+			t,
+			renewed,
+			testBrowserSessionCookieTTL,
+			clock.Now().Add(testBrowserSessionCookieTTL),
+		)
+
+		coalesced := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if got := coalesced.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("coalesced Cookie read reissued Cookie: %q", got)
+		}
+	})
+
+	t.Run("dedicated Bearer routes reject Cookie without renewing it", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 13, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 415)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Ordinary Browser")
+		sourceSync, err := NewSourceSyncStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		concrete := handler.(*kbaseHTTPHandler)
+		concrete.sourceSync = sourceSync
+		concrete.sourceAgentToken = "dedicated-source-agent-token"
+		concrete.agentPublisherToken = "dedicated-publisher-token"
+		clock.Advance(5 * time.Minute)
+
+		sourceResponse := requestKBaseWithBrowserCookie(
+			handler,
+			http.MethodPost,
+			"/api/source-agent/heartbeat",
+			credentials.Token,
+			`{"agent_id":"browser","version":"1","capabilities":[],"wcplus_healthy":true}`,
+		)
+		if sourceResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("Cookie source-agent status = %d, body=%s", sourceResponse.Code, sourceResponse.Body.String())
+		}
+		if got := sourceResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("source-agent route renewed browser Cookie: %q", got)
+		}
+
+		publisherResponse := requestKBaseWithBrowserCookie(
+			handler,
+			http.MethodPost,
+			"/api/agent-packages/publish",
+			credentials.Token,
+			`{}`,
+		)
+		if publisherResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("Cookie publisher status = %d, body=%s", publisherResponse.Code, publisherResponse.Body.String())
+		}
+		if got := publisherResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("publisher route renewed browser Cookie: %q", got)
+		}
+
+		generalResponse := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if generalResponse.Code != http.StatusOK {
+			t.Fatalf("Cookie general read status = %d, body=%s", generalResponse.Code, generalResponse.Body.String())
+		}
+		requireKBaseBrowserSessionCookie(t, generalResponse)
+	})
+
+	t.Run("expired revoked and missing sessions clear Cookie with 401", func(t *testing.T) {
+		t.Run("expired", func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 14, 0, 0, 0, time.UTC),
+			}
+			handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+				t, clock, 416, 10*time.Minute,
+			)
+			credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Expired Browser")
+			clock.Advance(10 * time.Minute)
+
+			response := requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/books", credentials.Token, "",
+			)
+			assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+		})
+
+		t.Run("revoked", func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 15, 0, 0, 0, time.UTC),
+			}
+			handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 417)
+			credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Revoked Browser")
+			if err := sessionStore.RevokeByToken(credentials.Token, "test"); err != nil {
+				t.Fatal(err)
+			}
+
+			response := requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/books", credentials.Token, "",
+			)
+			assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+		})
+
+		t.Run("missing", func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 16, 0, 0, 0, time.UTC),
+			}
+			handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 418)
+			response := requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/books", "missing-session-token", "",
+			)
+			assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+		})
+	})
+
+	t.Run("store unavailable is generic 503 and preserves Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 17, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 419)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Unavailable Browser")
+		if err := sessionStore.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("unavailable Cookie auth = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("unavailable Cookie auth changed Cookie: %q", got)
+		}
+	})
+
+	t.Run("audit auth failures keep stable envelope", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 18, 0, 0, 0, time.UTC),
+		}
+		handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 420)
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/agent-audits", "missing-session-token", "",
+		)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("audit Cookie auth status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseEvidenceAuditErrorEnvelope(t, response, "audit_unauthorized", "unauthorized")
+		requireKBaseBrowserSessionCookie(t, response)
+	})
+}
+
+func TestKBaseHTTPHandlerCSRF(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 19, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 421)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "CSRF Browser")
+	csrfToken, _ := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+
+	var mutationCalls atomic.Int32
+	concrete := handler.(*kbaseHTTPHandler)
+	concrete.auditCoordinator = &recordingEvidenceAuditEnqueuer{}
+	concrete.analysisGenerator = func(
+		_ context.Context,
+		_ *BookKnowledgeStore,
+		request BookAnalysisGenerateRequest,
+	) (*BookAnalysisManifest, error) {
+		mutationCalls.Add(1)
+		return &BookAnalysisManifest{
+			Version: "1", BookID: request.BookID, Status: BookAnalysisReady, Answer: "analysis",
+		}, nil
+	}
+
+	type headerValues struct {
+		origin    []string
+		fetchSite []string
+		csrf      []string
+	}
+	validHeaders := headerValues{
+		origin:    []string{testBrowserSessionOrigin},
+		fetchSite: []string{"same-origin"},
+		csrf:      []string{csrfToken},
+	}
+	testCases := []struct {
+		name    string
+		headers headerValues
+	}{
+		{name: "missing_origin", headers: headerValues{fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "duplicate_origin", headers: headerValues{origin: []string{testBrowserSessionOrigin, testBrowserSessionOrigin}, fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "wrong_origin", headers: headerValues{origin: []string{"https://other.example"}, fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "oversized_origin", headers: headerValues{origin: []string{strings.Repeat("x", 4096)}, fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "missing_fetch_site", headers: headerValues{origin: validHeaders.origin, csrf: validHeaders.csrf}},
+		{name: "duplicate_fetch_site", headers: headerValues{origin: validHeaders.origin, fetchSite: []string{"same-origin", "same-origin"}, csrf: validHeaders.csrf}},
+		{name: "wrong_fetch_site", headers: headerValues{origin: validHeaders.origin, fetchSite: []string{"cross-site"}, csrf: validHeaders.csrf}},
+		{name: "oversized_fetch_site", headers: headerValues{origin: validHeaders.origin, fetchSite: []string{strings.Repeat("x", 512)}, csrf: validHeaders.csrf}},
+		{name: "missing_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite}},
+		{name: "duplicate_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite, csrf: []string{csrfToken, csrfToken}}},
+		{name: "wrong_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite, csrf: []string{"wrong-csrf-token"}}},
+		{name: "oversized_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite, csrf: []string{strings.Repeat("x", 1024)}}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := newKBaseBrowserCookieRequest(
+				http.MethodPost,
+				"/api/books/source-article-1/analysis",
+				credentials.Token,
+				`{"model":"Qwen-3.7-Max"}`,
+			)
+			addKBaseHeaderValues(request, "Origin", testCase.headers.origin)
+			addKBaseHeaderValues(request, "Sec-Fetch-Site", testCase.headers.fetchSite)
+			addKBaseHeaderValues(request, "X-KBase-CSRF", testCase.headers.csrf)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden ||
+				response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+				t.Fatalf("CSRF rejection = status %d body %q", response.Code, response.Body.String())
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("CSRF rejection changed Cookie: %q", got)
+			}
+		})
+	}
+	if got := mutationCalls.Load(); got != 0 {
+		t.Fatalf("rejected CSRF requests reached mutation handler %d times", got)
+	}
+
+	validRequest := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/books/source-article-1/analysis",
+		credentials.Token,
+		`{"model":"Qwen-3.7-Max"}`,
+	)
+	addKBaseBrowserSessionSecurityHeaders(validRequest, csrfToken)
+	validResponse := httptest.NewRecorder()
+	handler.ServeHTTP(validResponse, validRequest)
+	if validResponse.Code != http.StatusOK || mutationCalls.Load() != 1 {
+		t.Fatalf("valid Cookie write = status %d calls %d body=%s", validResponse.Code, mutationCalls.Load(), validResponse.Body.String())
+	}
+
+	auditForbidden := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/agent-packages/package-1/audits?version=1.0.0",
+		credentials.Token,
+		`{}`,
+	)
+	auditForbidden.Header.Set("Origin", testBrowserSessionOrigin)
+	auditForbidden.Header.Set("Sec-Fetch-Site", "same-origin")
+	auditForbiddenResponse := httptest.NewRecorder()
+	handler.ServeHTTP(auditForbiddenResponse, auditForbidden)
+	if auditForbiddenResponse.Code != http.StatusForbidden {
+		t.Fatalf("audit CSRF status = %d, body=%s", auditForbiddenResponse.Code, auditForbiddenResponse.Body.String())
+	}
+	assertKBaseEvidenceAuditErrorEnvelope(t, auditForbiddenResponse, "audit_forbidden", "forbidden")
+
+	auditValid := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/agent-packages/package-1/audits?version=1.0.0",
+		credentials.Token,
+		`{}`,
+	)
+	addKBaseBrowserSessionSecurityHeaders(auditValid, csrfToken)
+	auditValidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(auditValidResponse, auditValid)
+	if auditValidResponse.Code != http.StatusBadRequest {
+		t.Fatalf("valid audit CSRF status = %d, body=%s", auditValidResponse.Code, auditValidResponse.Body.String())
+	}
+	assertKBaseEvidenceAuditErrorEnvelope(
+		t, auditValidResponse, "audit_request_invalid", "idempotency_key is required",
+	)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionStatus(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 20, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 422)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Status Browser")
+
+	firstToken, firstExpiry := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+	if err := sessionStore.ValidateCSRF(credentials.Session.ID, firstToken); err != nil {
+		t.Fatalf("first status CSRF did not validate: %v", err)
+	}
+	secondToken, secondExpiry := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+	if firstToken == secondToken {
+		t.Fatal("status did not rotate CSRF token")
+	}
+	if !firstExpiry.Equal(secondExpiry) || !secondExpiry.Equal(clock.Now().Add(15*time.Minute)) {
+		t.Fatalf("CSRF expiries = %s and %s, want %s", firstExpiry, secondExpiry, clock.Now().Add(15*time.Minute))
+	}
+	if err := sessionStore.ValidateCSRF(credentials.Session.ID, firstToken); !errors.Is(err, ErrBrowserSessionCSRFInvalid) {
+		t.Fatalf("rotated old CSRF error = %v, want invalid", err)
+	}
+	if err := sessionStore.ValidateCSRF(credentials.Session.ID, secondToken); err != nil {
+		t.Fatalf("second status CSRF did not validate: %v", err)
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		withCookie bool
+	}{
+		{name: "Bearer only"},
+		{name: "Bearer and Cookie", withCookie: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/api/browser/session", nil)
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			if testCase.withCookie {
+				request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: credentials.Token})
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("Bearer status endpoint = %d, body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("Bearer status endpoint changed Cookie: %q", got)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserLogout(t *testing.T) {
+	t.Run("requires Cookie CSRF revokes then clears and retry is stable", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 21, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 423)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Logout Browser")
+		csrfToken, _ := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+
+		forbidden := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		forbidden.Header.Set("Origin", testBrowserSessionOrigin)
+		forbidden.Header.Set("Sec-Fetch-Site", "same-origin")
+		forbiddenResponse := httptest.NewRecorder()
+		handler.ServeHTTP(forbiddenResponse, forbidden)
+		if forbiddenResponse.Code != http.StatusForbidden {
+			t.Fatalf("logout without CSRF = %d, body=%s", forbiddenResponse.Code, forbiddenResponse.Body.String())
+		}
+		if got := forbiddenResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("forbidden logout cleared Cookie: %q", got)
+		}
+		if _, err := sessionStore.AuthenticateAndRenew(credentials.Token); err != nil {
+			t.Fatalf("forbidden logout revoked session: %v", err)
+		}
+
+		logout := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		addKBaseBrowserSessionSecurityHeaders(logout, csrfToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, logout)
+		if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+			t.Fatalf("logout response = status %d body %q", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionNoStore(t, response)
+		assertKBaseBrowserSessionClearedCookie(t, response, clock.Now())
+		if _, err := sessionStore.AuthenticateAndRenew(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("logout auth error = %v, want revoked before Cookie clear", err)
+		}
+
+		retry := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		addKBaseBrowserSessionSecurityHeaders(retry, csrfToken)
+		retryResponse := httptest.NewRecorder()
+		handler.ServeHTTP(retryResponse, retry)
+		assertKBaseBrowserSessionUnauthorizedAndCleared(t, retryResponse, clock.Now())
+	})
+
+	t.Run("concurrent requests have idempotent terminal state", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 22, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 424)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Concurrent Logout Browser")
+		csrfToken, _ := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+
+		const requestCount = 8
+		start := make(chan struct{})
+		responses := make(chan *httptest.ResponseRecorder, requestCount)
+		var wait sync.WaitGroup
+		for index := 0; index < requestCount; index++ {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				<-start
+				request := newKBaseBrowserCookieRequest(
+					http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+				)
+				addKBaseBrowserSessionSecurityHeaders(request, csrfToken)
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				responses <- response
+			}()
+		}
+		close(start)
+		wait.Wait()
+		close(responses)
+
+		successes := 0
+		for response := range responses {
+			switch response.Code {
+			case http.StatusNoContent:
+				successes++
+			case http.StatusUnauthorized:
+				if response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+					t.Fatalf("concurrent unauthorized body = %q", response.Body.String())
+				}
+			default:
+				t.Fatalf("concurrent logout status = %d, body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionClearedCookie(t, response, clock.Now())
+		}
+		if successes == 0 {
+			t.Fatal("concurrent logout had no successful revocation")
+		}
+		if _, err := sessionStore.AuthenticateAndRenew(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("concurrent logout terminal auth error = %v, want revoked", err)
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerBearerCompatibility(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 23, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 425)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Bearer Compatibility Browser")
+	concrete := handler.(*kbaseHTTPHandler)
+	var mutationCalls atomic.Int32
+	concrete.analysisGenerator = func(
+		_ context.Context,
+		_ *BookKnowledgeStore,
+		request BookAnalysisGenerateRequest,
+	) (*BookAnalysisManifest, error) {
+		mutationCalls.Add(1)
+		return &BookAnalysisManifest{
+			Version: "1", BookID: request.BookID, Status: BookAnalysisReady, Answer: "analysis",
+		}, nil
+	}
+
+	read := requestKBase(handler, http.MethodGet, "/api/books", testKBaseAuthToken)
+	if read.Code != http.StatusOK {
+		t.Fatalf("Bearer read status = %d, body=%s", read.Code, read.Body.String())
+	}
+	write := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/books/source-article-1/analysis",
+		testKBaseAuthToken,
+		`{"model":"Qwen-3.7-Max"}`,
+	)
+	if write.Code != http.StatusOK || mutationCalls.Load() != 1 {
+		t.Fatalf("Bearer unsafe write = status %d calls %d body=%s", write.Code, mutationCalls.Load(), write.Body.String())
+	}
+
+	sourceSync, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete.sourceSync = sourceSync
+	concrete.sourceAgentToken = "dedicated-source-agent-token"
+	concrete.agentPublisherToken = "dedicated-publisher-token"
+	clock.Advance(5 * time.Minute)
+
+	sourceRequest := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/source-agent/heartbeat",
+		credentials.Token,
+		`{"agent_id":"agent-a","version":"1.0.0","capabilities":["sync_content"],"wcplus_healthy":true}`,
+	)
+	sourceRequest.Header.Set("Authorization", "Bearer dedicated-source-agent-token")
+	sourceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(sourceResponse, sourceRequest)
+	if sourceResponse.Code != http.StatusOK {
+		t.Fatalf("dedicated source Bearer status = %d, body=%s", sourceResponse.Code, sourceResponse.Body.String())
+	}
+	if got := sourceResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("dedicated source Bearer renewed browser Cookie: %q", got)
+	}
+
+	publisherRequest := newKBaseBrowserCookieRequest(
+		http.MethodPost, "/api/agent-packages/publish", credentials.Token, `{}`,
+	)
+	publisherRequest.Header.Set("Authorization", "Bearer dedicated-publisher-token")
+	publisherResponse := httptest.NewRecorder()
+	handler.ServeHTTP(publisherResponse, publisherRequest)
+	if publisherResponse.Code != http.StatusBadRequest {
+		t.Fatalf("dedicated publisher Bearer status = %d, body=%s", publisherResponse.Code, publisherResponse.Body.String())
+	}
+	if got := publisherResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("dedicated publisher Bearer renewed browser Cookie: %q", got)
+	}
+
+	for _, authorization := range []string{"", "Basic invalid", "Bearer wrong-token"} {
+		t.Run("explicit Authorization "+fmt.Sprintf("%q", authorization), func(t *testing.T) {
+			request := newKBaseBrowserCookieRequest(
+				http.MethodGet, "/api/books", credentials.Token, "",
+			)
+			request.Header["Authorization"] = []string{authorization}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("ambiguous auth status = %d, body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("invalid explicit Bearer changed valid Cookie: %q", got)
+			}
+		})
+	}
+
+	bearerWins := newKBaseBrowserCookieRequest(
+		http.MethodGet, "/api/books", "invalid-cookie-token", "",
+	)
+	bearerWins.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	bearerWinsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(bearerWinsResponse, bearerWins)
+	if bearerWinsResponse.Code != http.StatusOK {
+		t.Fatalf("valid Bearer with invalid Cookie status = %d, body=%s", bearerWinsResponse.Code, bearerWinsResponse.Body.String())
+	}
+	if got := bearerWinsResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("valid Bearer inspected invalid Cookie: %q", got)
+	}
+}
+
+func createKBaseBrowserSessionHTTPTestCredentials(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+	deviceLabel string,
+) BrowserSessionCredentials {
+	t.Helper()
+	credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: deviceLabel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return credentials
+}
+
+func newKBaseBrowserCookieRequest(
+	method, path, token, body string,
+) *http.Request {
+	var request *http.Request
+	if body == "" {
+		request = httptest.NewRequest(method, path, nil)
+	} else {
+		request = httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: token})
+	}
+	return request
+}
+
+func requestKBaseWithBrowserCookie(
+	handler http.Handler,
+	method, path, token, body string,
+) *httptest.ResponseRecorder {
+	request := newKBaseBrowserCookieRequest(method, path, token, body)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func addKBaseHeaderValues(request *http.Request, name string, values []string) {
+	for _, value := range values {
+		request.Header.Add(name, value)
+	}
+}
+
+func addKBaseBrowserSessionSecurityHeaders(request *http.Request, csrfToken string) {
+	request.Header.Set("Origin", testBrowserSessionOrigin)
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	request.Header.Set("X-KBase-CSRF", csrfToken)
+}
+
+func loadKBaseBrowserSessionCSRF(
+	t *testing.T,
+	handler http.Handler,
+	sessionToken string,
+) (string, time.Time) {
+	t.Helper()
+	response := requestKBaseWithBrowserCookie(
+		handler, http.MethodGet, "/api/browser/session", sessionToken, "",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("browser session status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("status inside renewal interval reissued Cookie: %q", got)
+	}
+	var payload struct {
+		Session       BrowserSession `json:"session"`
+		CSRFToken     string         `json:"csrf_token"`
+		CSRFExpiresAt time.Time      `json:"csrf_expires_at"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode browser session status: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Session.ID == "" || payload.CSRFToken == "" || payload.CSRFExpiresAt.IsZero() {
+		t.Fatalf("browser session status payload = %#v", payload)
+	}
+	body := strings.ToLower(response.Body.String())
+	for _, privateValue := range []string{
+		sessionToken,
+		`"token_hash"`,
+		`"csrf_hash"`,
+		`"user_agent"`,
+		`"hash"`,
+		`"revoke_reason"`,
+	} {
+		if strings.Contains(body, strings.ToLower(privateValue)) {
+			t.Fatalf("browser session status exposed private value %q: %s", privateValue, response.Body.String())
+		}
+	}
+	return payload.CSRFToken, payload.CSRFExpiresAt
+}
+
+func assertKBaseBrowserSessionUnauthorizedAndCleared(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	now time.Time,
+) {
+	t.Helper()
+	if response.Code != http.StatusUnauthorized ||
+		response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+		t.Fatalf("Cookie auth response = status %d body %q", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionClearedCookie(t, response, now)
+}
+
+func assertKBaseBrowserSessionClearedCookie(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	now time.Time,
+) {
+	t.Helper()
+	cookie := requireKBaseBrowserSessionCookie(t, response)
+	if cookie.Value != "" || cookie.MaxAge >= 0 || !cookie.Expires.Before(now) {
+		t.Fatalf("cleared Cookie = %#v", cookie)
+	}
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode ||
+		cookie.Path != "/" || cookie.Domain != "" {
+		t.Fatalf("cleared Cookie flags/scope = %#v", cookie)
+	}
+}
+
+func assertKBaseEvidenceAuditErrorEnvelope(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantCode, wantError string,
+) {
+	t.Helper()
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode audit error envelope: %v; body=%s", err, response.Body.String())
+	}
+	if len(payload) != 2 || payload["code"] != wantCode || payload["error"] != wantError {
+		t.Fatalf("audit error envelope = %#v, want code %q error %q", payload, wantCode, wantError)
+	}
+}
+
 func newKBaseBrowserSessionHTTPTestHandler(
 	t *testing.T,
 	clock *browserSessionTestClock,

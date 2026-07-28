@@ -283,11 +283,18 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleAgentPackages(w, r)
 		return
 	}
-	if isEvidenceAuditAPIPath(r.URL.Path) {
-		if !h.authorizeEvidenceAudit(w, r) {
-			return
-		}
-	} else if !h.authorize(w, r) {
+	if h.handleBrowserSessionAPIRoute(w, r) {
+		return
+	}
+	auditAPI := isEvidenceAuditAPIPath(r.URL.Path)
+	auth, authorized := h.authorizeKBaseRequest(w, r, auditAPI)
+	if !authorized {
+		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
+	if auth.Method == kbaseAuthMethodCookie &&
+		isUnsafeKBaseRequestMethod(r.Method) &&
+		!h.authorizeBrowserSessionCSRF(w, r, auth, auditAPI) {
 		return
 	}
 	if isSourceSyncAdminPath(r.URL.Path) {
@@ -1836,8 +1843,14 @@ func (h *kbaseHTTPHandler) issueEvidenceAuditRetryAuthorization(
 	auditID, idempotencyKey string,
 	now time.Time,
 ) EvidenceAuditRetryAuthorization {
-	token := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer "))
-	actor := evidenceAuditOpaqueIdentity("bearer-actor\x00" + token)
+	auth, _ := kbaseRequestAuthFromContext(r.Context())
+	var actor string
+	if auth.Method == kbaseAuthMethodCookie {
+		actor = evidenceAuditOpaqueIdentity("session-actor\x00" + auth.SessionID)
+	} else {
+		token := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer "))
+		actor = evidenceAuditOpaqueIdentity("bearer-actor\x00" + token)
+	}
 	expiresAt := now.UTC().Truncate(h.auditRetryTTL).Add(h.auditRetryTTL)
 	if !expiresAt.After(now) {
 		expiresAt = now.Add(h.auditRetryTTL)
@@ -2602,6 +2615,172 @@ func (h *kbaseHTTPHandler) authorizeEvidenceAudit(w http.ResponseWriter, r *http
 		return false
 	}
 	return true
+}
+
+const (
+	kbaseAuthMethodBearer = "bearer"
+	kbaseAuthMethodCookie = "cookie"
+)
+
+type kbaseRequestAuth struct {
+	Method    string
+	SessionID string
+	Renewed   bool
+	ExpiresAt time.Time
+	session   BrowserSession
+}
+
+type kbaseRequestAuthContextKey struct{}
+
+func kbaseRequestAuthFromContext(ctx context.Context) (kbaseRequestAuth, bool) {
+	auth, ok := ctx.Value(kbaseRequestAuthContextKey{}).(kbaseRequestAuth)
+	return auth, ok
+}
+
+func (h *kbaseHTTPHandler) authorizeKBaseRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	auditAPI bool,
+) (kbaseRequestAuth, bool) {
+	if len(r.Header.Values("Authorization")) != 0 {
+		if auditAPI {
+			if !h.authorizeEvidenceAudit(w, r) {
+				return kbaseRequestAuth{}, false
+			}
+		} else if !h.authorize(w, r) {
+			return kbaseRequestAuth{}, false
+		}
+		return kbaseRequestAuth{Method: kbaseAuthMethodBearer}, true
+	}
+
+	token, present, valid := browserSessionCookieToken(r)
+	if !present {
+		clearBrowserSessionCookie(w)
+		if auditAPI {
+			h.writeEvidenceAuditHTTPError(
+				w, http.StatusUnauthorized, "audit_unauthorized",
+				"unauthorized", "authorize_audit", nil,
+			)
+		} else if h.authToken == "" {
+			writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
+		} else {
+			writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		}
+		return kbaseRequestAuth{}, false
+	}
+	if !valid {
+		clearBrowserSessionCookie(w)
+		h.writeKBaseRequestSecurityError(
+			w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
+		)
+		return kbaseRequestAuth{}, false
+	}
+	if h.browserSessions.Store == nil {
+		h.writeKBaseRequestSecurityError(
+			w, auditAPI, http.StatusServiceUnavailable,
+			"audit_service_unavailable", "service unavailable",
+		)
+		return kbaseRequestAuth{}, false
+	}
+
+	sessionAuth, err := h.browserSessions.Store.AuthenticateAndRenew(token)
+	if err != nil {
+		if isBrowserSessionCredentialError(err) {
+			clearBrowserSessionCookie(w)
+			h.writeKBaseRequestSecurityError(
+				w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
+			)
+		} else {
+			h.writeKBaseRequestSecurityError(
+				w, auditAPI, http.StatusServiceUnavailable,
+				"audit_service_unavailable", "service unavailable",
+			)
+		}
+		return kbaseRequestAuth{}, false
+	}
+	if sessionAuth.SetCookie {
+		setBrowserSessionCookie(
+			w,
+			token,
+			sessionAuth.CookieExpiresAt,
+			h.browserSessions.TTL,
+		)
+	}
+	return kbaseRequestAuth{
+		Method:    kbaseAuthMethodCookie,
+		SessionID: sessionAuth.Session.ID,
+		Renewed:   sessionAuth.Renewed,
+		ExpiresAt: sessionAuth.Session.ExpiresAt,
+		session:   sessionAuth.Session,
+	}, true
+}
+
+func (h *kbaseHTTPHandler) authorizeBrowserSessionCSRF(
+	w http.ResponseWriter,
+	r *http.Request,
+	auth kbaseRequestAuth,
+	auditAPI bool,
+) bool {
+	origin, originOK := singleBoundedHeader(r, "Origin", maxBrowserSessionOriginBytes)
+	fetchSite, fetchSiteOK := singleBoundedHeader(
+		r, "Sec-Fetch-Site", maxBrowserSessionFetchSiteBytes,
+	)
+	csrfToken, csrfOK := singleBoundedHeader(
+		r, "X-KBase-CSRF", maxBrowserSessionCSRFBytes,
+	)
+	if !originOK || origin != h.browserSessions.PublicOrigin ||
+		!fetchSiteOK || fetchSite != "same-origin" ||
+		!csrfOK || csrfToken == "" {
+		h.writeKBaseRequestSecurityError(
+			w, auditAPI, http.StatusForbidden, "audit_forbidden", "forbidden",
+		)
+		return false
+	}
+	if err := h.browserSessions.Store.ValidateCSRF(auth.SessionID, csrfToken); err != nil {
+		switch {
+		case isBrowserSessionCredentialError(err):
+			clearBrowserSessionCookie(w)
+			h.writeKBaseRequestSecurityError(
+				w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
+			)
+		case errors.Is(err, ErrBrowserSessionCSRFInvalid),
+			errors.Is(err, ErrBrowserSessionCSRFExpired):
+			h.writeKBaseRequestSecurityError(
+				w, auditAPI, http.StatusForbidden, "audit_forbidden", "forbidden",
+			)
+		default:
+			h.writeKBaseRequestSecurityError(
+				w, auditAPI, http.StatusServiceUnavailable,
+				"audit_service_unavailable", "service unavailable",
+			)
+		}
+		return false
+	}
+	return true
+}
+
+func (h *kbaseHTTPHandler) writeKBaseRequestSecurityError(
+	w http.ResponseWriter,
+	auditAPI bool,
+	status int,
+	auditCode, message string,
+) {
+	if auditAPI {
+		h.writeEvidenceAuditHTTPError(
+			w, status, auditCode, message, "authorize_audit", nil,
+		)
+		return
+	}
+	writeHTTPError(w, status, message)
+}
+
+func isUnsafeKBaseRequestMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
 }
 
 func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected string) bool {
@@ -3640,6 +3819,8 @@ const (
 	maxBrowserSessionOriginBytes        = 2048
 	maxBrowserSessionCookieBytes        = 256
 	maxBrowserSessionUserAgentBytes     = 512
+	maxBrowserSessionFetchSiteBytes     = 64
+	maxBrowserSessionCSRFBytes          = 256
 )
 
 func (h *kbaseHTTPHandler) handleBrowserSessionRoute(w http.ResponseWriter, r *http.Request) bool {
@@ -3654,6 +3835,86 @@ func (h *kbaseHTTPHandler) handleBrowserSessionRoute(w http.ResponseWriter, r *h
 		return false
 	}
 	return true
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionAPIRoute(
+	w http.ResponseWriter,
+	r *http.Request,
+) bool {
+	switch r.URL.Path {
+	case "/api/browser/session":
+		h.handleBrowserSessionStatus(w, r)
+	case "/api/browser/session/logout":
+		h.handleBrowserSessionLogout(w, r)
+	default:
+		return false
+	}
+	return true
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionStatus(w http.ResponseWriter, r *http.Request) {
+	setBrowserSessionNoStore(w)
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	auth, authorized := h.authorizeBrowserSessionOnly(w, r)
+	if !authorized {
+		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
+	csrfToken, csrfExpiresAt, err := h.browserSessions.Store.RotateCSRF(auth.SessionID)
+	if err != nil {
+		if isBrowserSessionCredentialError(err) {
+			w.Header().Del("Set-Cookie")
+			clearBrowserSessionCookie(w)
+			writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		} else {
+			writeBrowserSessionStoreError(w, err)
+		}
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"session":         auth.session,
+		"csrf_token":      csrfToken,
+		"csrf_expires_at": csrfExpiresAt,
+	})
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionLogout(w http.ResponseWriter, r *http.Request) {
+	setBrowserSessionNoStore(w)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	auth, authorized := h.authorizeBrowserSessionOnly(w, r)
+	if !authorized {
+		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), kbaseRequestAuthContextKey{}, auth))
+	if !h.authorizeBrowserSessionCSRF(w, r, auth, false) {
+		return
+	}
+	if err := h.browserSessions.Store.Revoke(auth.SessionID, "logout"); err != nil {
+		writeBrowserSessionStoreError(w, err)
+		return
+	}
+	w.Header().Del("Set-Cookie")
+	clearBrowserSessionCookie(w)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *kbaseHTTPHandler) authorizeBrowserSessionOnly(
+	w http.ResponseWriter,
+	r *http.Request,
+) (kbaseRequestAuth, bool) {
+	if len(r.Header.Values("Authorization")) != 0 {
+		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		return kbaseRequestAuth{}, false
+	}
+	return h.authorizeKBaseRequest(w, r, false)
 }
 
 func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *http.Request) {
