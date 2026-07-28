@@ -83,12 +83,20 @@ flowchart LR
 
 ### kbase HTTP 服务
 
-本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。浏览器静态壳不包含私有知识数据，可以直接加载；`/browser/session-token` 单独由 Nginx Basic Auth 保护。首次登录后 Web UI 会换取同源 Bearer token 并写入浏览器本地存储，后续重新打开页面会复用该 token，只有 token 缺失、失效或轮换时才重新登录。自动化客户端仍应直接使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`。生产 Nginx 配置模板见 `deploy/nginx/kbase.executor.life.conf`。
+本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。浏览器和自动化客户端使用两条独立认证链：
+
+- 浏览器只保存 30 天滑动续期的 `Secure; HttpOnly; SameSite=Strict` Cookie。Nginx 仅在 `/browser/session` 校验 Basic Auth，清除客户端 `Authorization` 后注入独立的回环代理密钥；API token 不进入响应体、HTML 或浏览器存储。
+- 自动化、Health、Proofroom 和其他机器客户端继续使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`，无需 Cookie、Basic 或 CSRF。
+
+旧版 Web UI 中已有的 Bearer token 只允许通过 `POST /browser/session/migrate` 迁移一次。该路由不受 Nginx Basic Auth 保护，由后端严格校验 Bearer、`Origin`、browser client ID 和 epoch；前端确认新 Cookie 会话后再删除旧 token。已退役的 `/browser/session-token` 始终返回 `410 Gone`。生产 Nginx 配置模板见 `deploy/nginx/kbase.executor.life.conf`。
 
 ```bash
 cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
 KBASE_BROWSER_SESSION_SECRET="replace-with-separate-random-proxy-secret" \
+KBASE_BROWSER_SESSION_DB_PATH="${KBASE_STATE_DIR:?}/browser_sessions.sqlite3" \
+KBASE_PUBLIC_ORIGIN="https://kbase.example.invalid" \
+KBASE_SESSION_ADMIN_TOKEN="replace-with-separate-session-admin-secret" \
 KBASE_AGENT_PUBLISHER_TOKEN="replace-with-separate-publisher-secret" \
 KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
 KBASE_EMBEDDING_BASE_URL="https://embedding-provider.example.invalid/v1" \
@@ -104,9 +112,7 @@ KBASE_REVERIFICATION_STALE_SECONDS="900" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
-浏览器交换密钥必须与所有 API token 不同，使用 32-128 位
-`A-Za-z0-9_-` 字符，并且只在回环监听的后端与 Nginx 之间传递。部署时必须
-通过渲染器生成私有 location 配置，不要直接安装带占位符的模板：
+`KBASE_BROWSER_SESSION_DB_PATH` 必须指向服务账户可写的持久 SQLite 文件；`KBASE_PUBLIC_ORIGIN` 必须与浏览器看到的 HTTPS Origin 完全一致且不带路径或尾斜杠。`KBASE_BROWSER_SESSION_SECRET` 与 `KBASE_SESSION_ADMIN_TOKEN` 都使用 32-128 位 `A-Za-z0-9_-` 字符，并且必须与 API、publisher、source-agent 等所有 token 互不相同。代理密钥只在回环监听的后端与 Nginx 之间传递。部署时必须通过渲染器生成私有 location 配置，不要直接安装带占位符的模板：
 
 ```bash
 sudo install -m 644 deploy/nginx/kbase.executor.life.conf \
@@ -126,6 +132,19 @@ Linux 预发布环境可用真实 Nginx 和候选服务验证完整交换链：
 KBASE_SERVER_BIN=/tmp/kbase-server \
   bash deploy/nginx/browser-session-proxy-smoke.sh
 ```
+
+浏览器会话管理使用独立的 admin token。优先从权限受限文件读取，不要把 token 写入命令历史：
+
+```bash
+KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
+  go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" list
+KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
+  go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" revoke "${SESSION_ID:?}"
+KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
+  go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" revoke-all --confirm
+```
+
+发布必须把后端二进制、Web 静态文件、环境文件和渲染后的 Nginx 配置作为同一回滚事务。回滚时恢复这四项并重新加载 Nginx；新的会话 SQLite 可以保留，旧版本不会读取它。已完成一次迁移并删除旧 token 的浏览器在回滚后可能需要重新进行一次 Basic 登录，知识库产物和机器 Bearer token 不受影响。
 
 对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：
 

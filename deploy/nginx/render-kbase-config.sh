@@ -33,6 +33,99 @@ if [[ ! -f "${template}" ]]; then
   echo "Nginx template not found" >&2
   exit 2
 fi
+
+location_block() {
+  local marker="$1"
+  awk -v marker="${marker}" '
+    $0 == marker {
+      active = 1
+    }
+    active {
+      print
+    }
+    active && $0 == "}" {
+      exit
+    }
+  ' "${template}"
+}
+
+require_exact_location() {
+  local marker="$1"
+  local count
+  count="$(awk -v marker="${marker}" '$0 == marker { count++ } END { print count + 0 }' "${template}")"
+  if [[ "${count}" != "1" ]]; then
+    echo "Nginx template must contain exactly one ${marker}" >&2
+    exit 2
+  fi
+}
+
+require_block_line() {
+  local block="$1"
+  local line="$2"
+  local label="$3"
+  if ! grep -Fq "${line}" <<<"${block}"; then
+    echo "${label} is missing required directive: ${line}" >&2
+    exit 2
+  fi
+}
+
+reject_block_line() {
+  local block="$1"
+  local line="$2"
+  local label="$3"
+  if grep -Fq "${line}" <<<"${block}"; then
+    echo "${label} contains forbidden directive: ${line}" >&2
+    exit 2
+  fi
+}
+
+for marker in \
+  'location = /browser/session {' \
+  'location = /browser/session/migrate {' \
+  'location = /browser/session-token {' \
+  'location /api/ {' \
+  'location / {'; do
+  require_exact_location "${marker}"
+done
+
+login_block="$(location_block 'location = /browser/session {')"
+require_block_line "${login_block}" 'auth_basic "dedao-kbase";' "browser session login location"
+require_block_line "${login_block}" 'auth_basic_user_file __KBASE_BASIC_AUTH_FILE__;' "browser session login location"
+require_block_line "${login_block}" 'proxy_set_header Authorization "";' "browser session login location"
+require_block_line "${login_block}" 'proxy_set_header Proxy-Authorization "";' "browser session login location"
+require_block_line "${login_block}" 'proxy_set_header X-KBase-Browser-Session "__KBASE_BROWSER_SESSION_SECRET__";' "browser session login location"
+
+migration_block="$(location_block 'location = /browser/session/migrate {')"
+require_block_line "${migration_block}" 'auth_basic off;' "browser session migration location"
+require_block_line "${migration_block}" 'proxy_set_header Proxy-Authorization "";' "browser session migration location"
+require_block_line "${migration_block}" 'proxy_set_header X-KBase-Browser-Session "";' "browser session migration location"
+reject_block_line "${migration_block}" 'auth_basic_user_file' "browser session migration location"
+reject_block_line "${migration_block}" 'proxy_set_header Authorization "";' "browser session migration location"
+reject_block_line "${migration_block}" '__KBASE_BROWSER_SESSION_SECRET__' "browser session migration location"
+
+retired_block="$(location_block 'location = /browser/session-token {')"
+require_block_line "${retired_block}" 'auth_basic off;' "retired browser token location"
+require_block_line "${retired_block}" 'proxy_set_header Authorization "";' "retired browser token location"
+require_block_line "${retired_block}" 'proxy_set_header Proxy-Authorization "";' "retired browser token location"
+require_block_line "${retired_block}" 'proxy_set_header X-KBase-Browser-Session "";' "retired browser token location"
+reject_block_line "${retired_block}" 'auth_basic_user_file' "retired browser token location"
+reject_block_line "${retired_block}" '__KBASE_BROWSER_SESSION_SECRET__' "retired browser token location"
+
+for marker in 'location /api/ {' 'location / {'; do
+  block="$(location_block "${marker}")"
+  require_block_line "${block}" 'proxy_set_header Proxy-Authorization "";' "${marker}"
+  require_block_line "${block}" 'proxy_set_header X-KBase-Browser-Session "";' "${marker}"
+  reject_block_line "${block}" 'proxy_set_header Authorization "";' "${marker}"
+done
+
+browser_secret_placeholder_count="$(
+  awk 'index($0, "__KBASE_BROWSER_SESSION_SECRET__") { count++ } END { print count + 0 }' "${template}"
+)"
+if [[ "${browser_secret_placeholder_count}" != "1" ]]; then
+  echo "Nginx template must inject the browser session secret exactly once" >&2
+  exit 2
+fi
+
 for placeholder in \
   __KBASE_BROWSER_SESSION_SECRET__ \
   __KBASE_BACKEND_ADDR__ \
