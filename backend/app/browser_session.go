@@ -31,13 +31,14 @@ const (
 )
 
 var (
-	ErrBrowserSessionMissing     = errors.New("browser session missing")
-	ErrBrowserSessionExpired     = errors.New("browser session expired")
-	ErrBrowserSessionRevoked     = errors.New("browser session revoked")
-	ErrBrowserSessionConflict    = errors.New("browser session conflict")
-	ErrBrowserSessionUnavailable = errors.New("browser session unavailable")
-	ErrBrowserSessionCSRFInvalid = errors.New("browser session CSRF invalid")
-	ErrBrowserSessionCSRFExpired = errors.New("browser session CSRF expired")
+	ErrBrowserSessionMissing         = errors.New("browser session missing")
+	ErrBrowserSessionExpired         = errors.New("browser session expired")
+	ErrBrowserSessionRevoked         = errors.New("browser session revoked")
+	ErrBrowserSessionConflict        = errors.New("browser session conflict")
+	ErrBrowserSessionUnavailable     = errors.New("browser session unavailable")
+	ErrBrowserSessionInvalidArgument = errors.New("browser session invalid argument")
+	ErrBrowserSessionCSRFInvalid     = errors.New("browser session CSRF invalid")
+	ErrBrowserSessionCSRFExpired     = errors.New("browser session CSRF expired")
 )
 
 type BrowserSessionStoreConfig struct {
@@ -92,7 +93,10 @@ type BrowserSessionStore struct {
 func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionStore, error) {
 	dbPath := strings.TrimSpace(config.Path)
 	if dbPath == "" {
-		return nil, fmt.Errorf("browser session database path is required")
+		return nil, fmt.Errorf(
+			"browser session database path is required: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -110,26 +114,46 @@ func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionSt
 		config.MaxActive = defaultBrowserSessionMaxActive
 	}
 	if err := prepareBrowserSessionDirectory(filepath.Dir(dbPath)); err != nil {
-		return nil, fmt.Errorf("prepare browser session database directory: %w", err)
+		return nil, newBrowserSessionCategorizedError(
+			"prepare browser session database directory",
+			ErrBrowserSessionUnavailable,
+			err,
+		)
 	}
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("open browser session database: %w", err)
+		return nil, newBrowserSessionCategorizedError(
+			"open browser session database",
+			ErrBrowserSessionUnavailable,
+			err,
+		)
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("configure browser session database busy timeout: %w", err)
+		return nil, newBrowserSessionCategorizedError(
+			"configure browser session database busy timeout",
+			ErrBrowserSessionUnavailable,
+			err,
+		)
 	}
 	if _, err := db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("enable browser session database foreign keys: %w", err)
+		return nil, newBrowserSessionCategorizedError(
+			"enable browser session database foreign keys",
+			ErrBrowserSessionUnavailable,
+			err,
+		)
 	}
 	if err := migrateBrowserSessionDB(db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate browser session database: %w", err)
+		return nil, newBrowserSessionCategorizedError(
+			"migrate browser session database",
+			ErrBrowserSessionUnavailable,
+			err,
+		)
 	}
 
 	return &BrowserSessionStore{
@@ -204,6 +228,12 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 
 	tokenHash := sha256.Sum256([]byte(token))
 	csrfHash := sha256.Sum256([]byte(csrfToken))
+	if subtle.ConstantTimeCompare(tokenHash[:], csrfHash[:]) == 1 {
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"create browser session credentials: %w",
+			ErrBrowserSessionConflict,
+		)
+	}
 	userAgentHash := sha256.Sum256([]byte(input.UserAgent))
 	now := s.now().UTC()
 	expiresAt := now.Add(s.ttl)
@@ -220,7 +250,11 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 		var collisions int
 		if err := conn.QueryRowContext(
 			context.Background(),
-			`SELECT COUNT(*) FROM browser_sessions WHERE token_hash = ? OR csrf_hash = ?`,
+			`SELECT COUNT(*)
+			 FROM browser_sessions
+			 WHERE token_hash IN (?, ?) OR csrf_hash IN (?, ?)`,
+			tokenHash[:],
+			csrfHash[:],
 			tokenHash[:],
 			csrfHash[:],
 		).Scan(&collisions); err != nil {
@@ -426,7 +460,10 @@ func (s *BrowserSessionStore) RotateCSRF(id string) (string, time.Time, error) {
 		var collisions int
 		if err := conn.QueryRowContext(
 			context.Background(),
-			`SELECT COUNT(*) FROM browser_sessions WHERE csrf_hash = ?`,
+			`SELECT COUNT(*)
+			 FROM browser_sessions
+			 WHERE token_hash = ? OR csrf_hash = ?`,
+			csrfHash[:],
 			csrfHash[:],
 		).Scan(&collisions); err != nil {
 			return classifyBrowserSessionStoreError("check rotated CSRF collision", err)
@@ -623,7 +660,10 @@ func (s *BrowserSessionStore) List() ([]BrowserSession, error) {
 
 func (s *BrowserSessionStore) Cleanup(retainAfter time.Duration) (int64, error) {
 	if retainAfter < 0 {
-		return 0, fmt.Errorf("cleanup browser sessions: negative retention: %w", ErrBrowserSessionConflict)
+		return 0, fmt.Errorf(
+			"cleanup browser sessions: negative retention: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
 	}
 	if s == nil {
 		return 0, fmt.Errorf(
@@ -802,6 +842,28 @@ func (s *BrowserSessionStore) withImmediateTransaction(
 	return nil
 }
 
+type browserSessionCategorizedError struct {
+	operation string
+	category  error
+	cause     error
+}
+
+func newBrowserSessionCategorizedError(operation string, category, cause error) error {
+	return &browserSessionCategorizedError{
+		operation: operation,
+		category:  category,
+		cause:     cause,
+	}
+}
+
+func (e *browserSessionCategorizedError) Error() string {
+	return fmt.Sprintf("%s: %v", e.operation, e.cause)
+}
+
+func (e *browserSessionCategorizedError) Unwrap() []error {
+	return []error{e.category, e.cause}
+}
+
 func classifyBrowserSessionStoreError(operation string, err error) error {
 	if err == nil {
 		return nil
@@ -812,6 +874,7 @@ func classifyBrowserSessionStoreError(operation string, err error) error {
 		ErrBrowserSessionRevoked,
 		ErrBrowserSessionConflict,
 		ErrBrowserSessionUnavailable,
+		ErrBrowserSessionInvalidArgument,
 		ErrBrowserSessionCSRFInvalid,
 		ErrBrowserSessionCSRFExpired,
 	} {
@@ -821,9 +884,9 @@ func classifyBrowserSessionStoreError(operation string, err error) error {
 	}
 	var sqliteError sqlite3.Error
 	if errors.As(err, &sqliteError) && sqliteError.Code == sqlite3.ErrConstraint {
-		return fmt.Errorf("%s: %w", operation, ErrBrowserSessionConflict)
+		return newBrowserSessionCategorizedError(operation, ErrBrowserSessionConflict, err)
 	}
-	return fmt.Errorf("%s: %v: %w", operation, err, ErrBrowserSessionUnavailable)
+	return newBrowserSessionCategorizedError(operation, ErrBrowserSessionUnavailable, err)
 }
 
 func formatBrowserSessionTime(value time.Time) string {

@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 func TestBrowserSessionStoreSchema(t *testing.T) {
@@ -1385,8 +1385,8 @@ func TestBrowserSessionCleanupHonorsRetentionBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := store.Cleanup(-time.Second); !errors.Is(err, ErrBrowserSessionConflict) {
-		t.Fatalf("Cleanup(-1s) error = %v, want ErrBrowserSessionConflict", err)
+	if _, err := store.Cleanup(-time.Second); !errors.Is(err, ErrBrowserSessionInvalidArgument) {
+		t.Fatalf("Cleanup(-1s) error = %v, want ErrBrowserSessionInvalidArgument", err)
 	}
 	deleted, err := store.Cleanup(0)
 	if err != nil {
@@ -1578,6 +1578,300 @@ func TestBrowserSessionLifecycleMapsDatabaseFailureToUnavailable(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionStoreRejectsCompleteCredentialCollisionMatrix(t *testing.T) {
+	t.Run("same token and CSRF in one Create", func(t *testing.T) {
+		raw := sha256.Sum256([]byte("same-create-credential"))
+		random := append(append([]byte(nil), raw[:]...), raw[:]...)
+		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+			Path:   newBrowserSessionTestDBPath(t),
+			Random: bytes.NewReader(random),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+
+		if _, err := store.Create(BrowserSessionCreate{DeviceLabel: "Collision"}); !errors.Is(err, ErrBrowserSessionConflict) {
+			t.Fatalf("same-credential Create() error = %v, want ErrBrowserSessionConflict", err)
+		}
+		assertBrowserSessionRowCount(t, store.db, 0)
+	})
+
+	for _, testCase := range []struct {
+		name                string
+		collidingCredential string
+		collisionAsNewToken bool
+	}{
+		{
+			name:                "new token collides with existing CSRF",
+			collidingCredential: "csrf",
+			collisionAsNewToken: true,
+		},
+		{
+			name:                "new CSRF collides with existing token",
+			collidingCredential: "token",
+			collisionAsNewToken: false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+				Path:   newBrowserSessionTestDBPath(t),
+				Random: bytes.NewReader(deterministicBrowserSessionBytes(301, 4)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			existing, err := store.Create(BrowserSessionCreate{DeviceLabel: "Existing"})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			colliding := existing.Token
+			if testCase.collidingCredential == "csrf" {
+				colliding = existing.CSRFToken
+			}
+			collidingRaw, err := base64.RawURLEncoding.DecodeString(colliding)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uniqueRaw := sha256.Sum256([]byte("unique-" + testCase.name))
+			var random []byte
+			if testCase.collisionAsNewToken {
+				random = append(append([]byte(nil), collidingRaw...), uniqueRaw[:]...)
+			} else {
+				random = append(append([]byte(nil), uniqueRaw[:]...), collidingRaw...)
+			}
+			store.random = bytes.NewReader(random)
+
+			if _, err := store.Create(BrowserSessionCreate{DeviceLabel: "Cross-column"}); !errors.Is(err, ErrBrowserSessionConflict) {
+				t.Fatalf("cross-column Create() error = %v, want ErrBrowserSessionConflict", err)
+			}
+			assertBrowserSessionRowCount(t, store.db, 1)
+		})
+	}
+}
+
+func TestBrowserSessionLifecycleRotateCSRFRejectsSessionTokenCollision(t *testing.T) {
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(302, 6)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := store.Create(BrowserSessionCreate{DeviceLabel: "First"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Create(BrowserSessionCreate{DeviceLabel: "Second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenRaw, err := base64.RawURLEncoding.DecodeString(first.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.random = bytes.NewReader(tokenRaw)
+
+	if _, _, err := store.RotateCSRF(second.Session.ID); !errors.Is(err, ErrBrowserSessionConflict) {
+		t.Fatalf("RotateCSRF() session-token collision error = %v, want ErrBrowserSessionConflict", err)
+	}
+	if err := store.ValidateCSRF(second.Session.ID, second.CSRFToken); err != nil {
+		t.Fatalf("RotateCSRF() collision changed the previous CSRF: %v", err)
+	}
+}
+
+func TestBrowserSessionStoreConstructorErrorsAreTypedAndPreserveCause(t *testing.T) {
+	t.Run("empty path is invalid argument", func(t *testing.T) {
+		_, err := NewBrowserSessionStore(BrowserSessionStoreConfig{})
+		if !errors.Is(err, ErrBrowserSessionInvalidArgument) {
+			t.Fatalf("empty-path error = %v, want ErrBrowserSessionInvalidArgument", err)
+		}
+		if errors.Is(err, ErrBrowserSessionUnavailable) {
+			t.Fatalf("empty-path error = %v, must not be unavailable", err)
+		}
+	})
+
+	t.Run("directory permission failure", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("POSIX directory permissions are not enforced on Windows")
+		}
+		parent := filepath.Join(t.TempDir(), "blocked")
+		if err := os.Mkdir(parent, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chmod(parent, 0o700)
+		_, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+			Path: filepath.Join(parent, "child", "browser_sessions.sqlite3"),
+		})
+		if !errors.Is(err, ErrBrowserSessionUnavailable) {
+			t.Fatalf("directory error = %v, want ErrBrowserSessionUnavailable", err)
+		}
+		if !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("directory error = %v, want underlying os.ErrPermission preserved", err)
+		}
+	})
+
+	t.Run("database open or pragma IO failure", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		directoryPath := filepath.Join(root, "database-directory")
+		if err := os.Mkdir(directoryPath, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		_, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: directoryPath})
+		if !errors.Is(err, ErrBrowserSessionUnavailable) {
+			t.Fatalf("database directory error = %v, want ErrBrowserSessionUnavailable", err)
+		}
+		var sqliteError sqlite3.Error
+		if !errors.As(err, &sqliteError) {
+			t.Fatalf("database directory error = %v, want underlying sqlite3.Error preserved", err)
+		}
+	})
+
+	t.Run("migration failure", func(t *testing.T) {
+		dbPath := newBrowserSessionTestDBPath(t)
+		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 999`); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+		if !errors.Is(err, ErrBrowserSessionUnavailable) {
+			t.Fatalf("migration error = %v, want ErrBrowserSessionUnavailable", err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "migrate browser session database") {
+			t.Fatalf("migration error = %v, want migration context", err)
+		}
+	})
+
+	t.Run("migration busy failure preserves sqlite cause", func(t *testing.T) {
+		dbPath := newBrowserSessionTestDBPath(t)
+		store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		lockDB, err := sql.Open("sqlite3", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lockDB.Close()
+		lockDB.SetMaxOpenConns(1)
+		if _, err := lockDB.Exec(`BEGIN EXCLUSIVE`); err != nil {
+			t.Fatal(err)
+		}
+		defer lockDB.Exec(`ROLLBACK`)
+
+		_, err = NewBrowserSessionStore(BrowserSessionStoreConfig{Path: dbPath})
+		if !errors.Is(err, ErrBrowserSessionUnavailable) {
+			t.Fatalf("busy migration error = %v, want ErrBrowserSessionUnavailable", err)
+		}
+		var sqliteError sqlite3.Error
+		if !errors.As(err, &sqliteError) || sqliteError.Code != sqlite3.ErrBusy {
+			t.Fatalf("busy migration error = %v, want underlying SQLITE_BUSY", err)
+		}
+	})
+}
+
+func TestBrowserSessionCleanupNegativeRetentionIsInvalidAndDoesNotDelete(t *testing.T) {
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:   newBrowserSessionTestDBPath(t),
+		Random: bytes.NewReader(deterministicBrowserSessionBytes(303, 2)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.Create(BrowserSessionCreate{DeviceLabel: "Retained"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Cleanup(-time.Second); !errors.Is(err, ErrBrowserSessionInvalidArgument) {
+		t.Fatalf("Cleanup(-1s) error = %v, want ErrBrowserSessionInvalidArgument", err)
+	}
+	assertBrowserSessionRowCount(t, store.db, 1)
+}
+
+func TestBrowserSessionLimitUsesIDAsStableFinalTieBreak(t *testing.T) {
+	now := time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC)
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:      newBrowserSessionTestDBPath(t),
+		Now:       func() time.Time { return now },
+		Random:    bytes.NewReader(deterministicBrowserSessionBytes(304, 2)),
+		MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	var seededIDs []string
+	for index := 9; index >= 0; index-- {
+		id := fmt.Sprintf("session_seed_%02d", index)
+		seededIDs = append(seededIDs, id)
+		tokenHash := sha256.Sum256([]byte("seed-token-" + id))
+		csrfHash := sha256.Sum256([]byte("seed-csrf-" + id))
+		userAgentHash := sha256.Sum256([]byte("seed-agent-" + id))
+		if _, err := store.db.Exec(`
+			INSERT INTO browser_sessions (
+				id, token_hash, csrf_hash, csrf_expires_at, device_label,
+				user_agent_hash, created_at, last_active_at, expires_at,
+				revoked_at, revoke_reason
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')
+		`,
+			id,
+			tokenHash[:],
+			csrfHash[:],
+			formatBrowserSessionTime(now.Add(15*time.Minute)),
+			id,
+			userAgentHash[:],
+			formatBrowserSessionTime(now),
+			formatBrowserSessionTime(now),
+			formatBrowserSessionTime(now.Add(30*24*time.Hour)),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := store.Create(BrowserSessionCreate{DeviceLabel: "Eleventh"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range seededIDs {
+		revokedAt, reason := readBrowserSessionRevocationState(t, store.db, id)
+		if id == "session_seed_00" {
+			if revokedAt == "" || reason != "session_limit" {
+				t.Fatalf("smallest ID revocation = (%q, %q), want session_limit", revokedAt, reason)
+			}
+			continue
+		}
+		if revokedAt != "" || reason != "" {
+			t.Fatalf("seeded session %q was unexpectedly revoked: (%q, %q)", id, revokedAt, reason)
+		}
+	}
+	assertBrowserSessionActiveCount(t, store.db, now, 10)
+}
+
 type browserSessionTestClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -1671,6 +1965,30 @@ func assertBrowserSessionActiveCount(t *testing.T, db *sql.DB, now time.Time, wa
 	if count != want {
 		t.Fatalf("active browser session count = %d, want %d", count, want)
 	}
+}
+
+func assertBrowserSessionRowCount(t *testing.T, db *sql.DB, want int) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM browser_sessions`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("browser session row count = %d, want %d", count, want)
+	}
+}
+
+func readBrowserSessionRevocationState(t *testing.T, db *sql.DB, id string) (string, string) {
+	t.Helper()
+	var revokedAt, reason string
+	if err := db.QueryRow(`
+		SELECT revoked_at, revoke_reason
+		FROM browser_sessions
+		WHERE id = ?
+	`, id).Scan(&revokedAt, &reason); err != nil {
+		t.Fatal(err)
+	}
+	return revokedAt, reason
 }
 
 func readBrowserSessionRevocation(t *testing.T, db *sql.DB, id string) (time.Time, string) {
