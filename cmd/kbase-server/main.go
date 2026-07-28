@@ -272,15 +272,34 @@ func serveKBaseServer(
 		<-reverificationDone
 	}()
 
+	return serveHTTPServer(ctx, stop, server, 10*time.Second)
+}
+
+type httpServerLifecycle interface {
+	ListenAndServe() error
+	Shutdown(context.Context) error
+}
+
+func serveHTTPServer(
+	ctx context.Context,
+	stop func(),
+	server httpServerLifecycle,
+	shutdownTimeout time.Duration,
+) error {
+	shutdownResult := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownContext, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		if err := server.Shutdown(shutdownContext); err != nil {
-			log.Printf("kbase server shutdown failed: %v", err)
-		}
+		shutdownResult <- server.Shutdown(shutdownContext)
 	}()
+
 	listenErr := server.ListenAndServe()
+	stop()
+	shutdownErr := <-shutdownResult
+	if shutdownErr != nil && !errors.Is(shutdownErr, http.ErrServerClosed) {
+		return fmt.Errorf("kbase server shutdown failed: %w", shutdownErr)
+	}
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
 		return listenErr
 	}
@@ -567,6 +586,8 @@ func validatePublicOrigin(rawOrigin string) error {
 	return nil
 }
 
+// canonicalOriginHost mirrors WHATWG host serialization so configured origins
+// exactly match browser Origin headers. See https://url.spec.whatwg.org/#host-serializing.
 func canonicalOriginHost(host string) (string, net.IP, error) {
 	if host == "" {
 		return "", nil, errors.New("KBASE_PUBLIC_ORIGIN host is required")

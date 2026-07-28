@@ -14,6 +14,19 @@ import (
 	"github.com/yann0917/dedao-gui/backend/app"
 )
 
+type controlledHTTPServer struct {
+	listen   func() error
+	shutdown func(context.Context) error
+}
+
+func (server controlledHTTPServer) ListenAndServe() error {
+	return server.listen()
+}
+
+func (server controlledHTTPServer) Shutdown(ctx context.Context) error {
+	return server.shutdown(ctx)
+}
+
 func TestDefaultSystemKBExportPathUsesRepoDirEnv(t *testing.T) {
 	t.Setenv("KBASE_SYSTEM_KB_EXPORT_PATH", "")
 	t.Setenv("DEDAO_KBASE_ROOT", "")
@@ -831,6 +844,84 @@ func TestKBaseHTTPServerReadsStrictBoundedEnvironment(t *testing.T) {
 				t.Fatalf("newKBaseHTTPServer() accepted %s=%q", test.key, test.value)
 			}
 		})
+	}
+}
+
+func TestServeHTTPServerWaitsForShutdownAfterListenFailure(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	listenErr := errors.New("listen failed")
+	shutdownStarted := make(chan struct{})
+	releaseShutdown := make(chan struct{})
+	server := controlledHTTPServer{
+		listen: func() error {
+			return listenErr
+		},
+		shutdown: func(context.Context) error {
+			close(shutdownStarted)
+			<-releaseShutdown
+			return nil
+		},
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- serveHTTPServer(ctx, stop, server, time.Second)
+	}()
+
+	select {
+	case <-shutdownStarted:
+	case <-time.After(time.Second):
+		t.Fatal("listen failure did not unblock HTTP shutdown")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("serveHTTPServer() returned before shutdown completed: %v", err)
+	default:
+	}
+	close(releaseShutdown)
+	select {
+	case err := <-result:
+		if !errors.Is(err, listenErr) {
+			t.Fatalf("serveHTTPServer() error = %v, want listen error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serveHTTPServer() did not return after shutdown completed")
+	}
+}
+
+func TestServeHTTPServerReturnsRealShutdownError(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	shutdownErr := errors.New("shutdown failed")
+	server := controlledHTTPServer{
+		listen: func() error {
+			return errors.New("listen also failed")
+		},
+		shutdown: func(context.Context) error {
+			return shutdownErr
+		},
+	}
+
+	err := serveHTTPServer(ctx, stop, server, time.Second)
+	if !errors.Is(err, shutdownErr) {
+		t.Fatalf("serveHTTPServer() error = %v, want shutdown error", err)
+	}
+}
+
+func TestServeHTTPServerTreatsServerClosedAsNormal(t *testing.T) {
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	server := controlledHTTPServer{
+		listen: func() error {
+			return http.ErrServerClosed
+		},
+		shutdown: func(context.Context) error {
+			return http.ErrServerClosed
+		},
+	}
+
+	if err := serveHTTPServer(ctx, stop, server, time.Second); err != nil {
+		t.Fatalf("serveHTTPServer() error = %v", err)
 	}
 }
 
