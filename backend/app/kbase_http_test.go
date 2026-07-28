@@ -2161,11 +2161,269 @@ func TestKBaseHTTPHandlerSetsSubscriptionEnabledWithoutReplacingCursor(t *testin
 }
 
 const (
-	testKBaseAuthToken          = "kbase-api-token-must-not-leak"
-	testBrowserSessionSecret    = "browser-proxy-secret-0123456789abcdef"
-	testBrowserSessionOrigin    = "https://kbase.example"
-	testBrowserSessionCookieTTL = 30 * 24 * time.Hour
+	testKBaseAuthToken           = "kbase-api-token-must-not-leak"
+	testBrowserSessionSecret     = "browser-proxy-secret-0123456789abcdef"
+	testBrowserSessionOrigin     = "https://kbase.example"
+	testBrowserSessionCookieTTL  = 30 * 24 * time.Hour
+	testBrowserSessionAdminToken = "session-admin-token-0123456789abcdef"
 )
+
+func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+
+	t.Run("dedicated bearer only", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 501)
+		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Safari / macOS"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/admin/browser-sessions"
+		for name, request := range map[string]*http.Request{
+			"missing":          httptest.NewRequest(http.MethodGet, path, nil),
+			"main bearer":      adminSessionRequest(http.MethodGet, path, testKBaseAuthToken),
+			"source bearer":    adminSessionRequest(http.MethodGet, path, "dedicated-source-agent-token"),
+			"publisher bearer": adminSessionRequest(http.MethodGet, path, "dedicated-publisher-token"),
+			"malformed":        adminSessionRequest(http.MethodGet, path, "wrong"),
+			"browser cookie": func() *http.Request {
+				request := httptest.NewRequest(http.MethodGet, path, nil)
+				request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: credentials.Token})
+				return request
+			}(),
+			"duplicate": func() *http.Request {
+				request := adminSessionRequest(http.MethodGet, path, testBrowserSessionAdminToken)
+				request.Header.Add("Authorization", "Bearer "+testBrowserSessionAdminToken)
+				return request
+			}(),
+		} {
+			t.Run(name, func(t *testing.T) {
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				if response.Code != http.StatusUnauthorized ||
+					response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+					t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+				}
+				if response.Header().Get("Set-Cookie") != "" {
+					t.Fatalf("admin rejection mutated browser Cookie: %q", response.Header().Get("Set-Cookie"))
+				}
+			})
+		}
+	})
+
+	t.Run("configuration and methods fail closed", func(t *testing.T) {
+		handler, _ := newKBaseSessionAdminHTTPTestHandler(t, clock, 502)
+		for _, test := range []struct {
+			method string
+			path   string
+			allow  string
+		}{
+			{http.MethodPost, "/api/admin/browser-sessions", http.MethodGet},
+			{http.MethodGet, "/api/admin/browser-sessions/session_id", http.MethodDelete},
+			{http.MethodGet, "/api/admin/browser-sessions/revoke-all", http.MethodPost},
+		} {
+			response := serveAdminSessionRequest(handler, test.method, test.path, testBrowserSessionAdminToken)
+			if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != test.allow {
+				t.Fatalf("%s %s status=%d Allow=%q body=%s",
+					test.method, test.path, response.Code, response.Header().Get("Allow"), response.Body.String())
+			}
+		}
+		preflight := adminSessionRequest(
+			http.MethodOptions,
+			"/api/admin/browser-sessions",
+			testBrowserSessionAdminToken,
+		)
+		preflight.Header.Set("Origin", "http://127.0.0.1:5173")
+		preflightResponse := httptest.NewRecorder()
+		handler.ServeHTTP(preflightResponse, preflight)
+		if preflightResponse.Code != http.StatusMethodNotAllowed ||
+			preflightResponse.Header().Get("Allow") != http.MethodGet {
+			t.Fatalf("OPTIONS status=%d Allow=%q body=%s",
+				preflightResponse.Code,
+				preflightResponse.Header().Get("Allow"),
+				preflightResponse.Body.String())
+		}
+
+		missingAdmin := NewKBaseHTTPHandler(KBaseHTTPConfig{
+			Store: NewBookKnowledgeStore(t.TempDir()),
+			BrowserSessions: BrowserSessionHTTPConfig{
+				Store:        newBrowserSessionStoreForAdminTest(t, clock, 503),
+				PublicOrigin: testBrowserSessionOrigin,
+			},
+		})
+		response := serveAdminSessionRequest(
+			missingAdmin, http.MethodGet, "/api/admin/browser-sessions", testBrowserSessionAdminToken,
+		)
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("missing admin status=%d body=%q", response.Code, response.Body.String())
+		}
+
+		missingStore := NewKBaseHTTPHandler(KBaseHTTPConfig{
+			Store: NewBookKnowledgeStore(t.TempDir()),
+			BrowserSessions: BrowserSessionHTTPConfig{
+				AdminToken:   testBrowserSessionAdminToken,
+				PublicOrigin: testBrowserSessionOrigin,
+			},
+		})
+		response = serveAdminSessionRequest(
+			missingStore, http.MethodGet, "/api/admin/browser-sessions", testBrowserSessionAdminToken,
+		)
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("missing store status=%d body=%q", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("list exposes bounded public metadata only", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 504)
+		credentials, err := sessionStore.Create(BrowserSessionCreate{
+			DeviceLabel: "Chrome / Linux",
+			UserAgent:   "private-user-agent-must-not-leak",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := adminSessionRequest(
+			http.MethodGet, "/api/admin/browser-sessions", testBrowserSessionAdminToken,
+		)
+		request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: credentials.Token})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionNoStore(t, response)
+		if response.Header().Get("Set-Cookie") != "" {
+			t.Fatalf("admin list mutated browser Cookie: %q", response.Header().Get("Set-Cookie"))
+		}
+		body := strings.ToLower(response.Body.String())
+		for _, privateValue := range []string{
+			credentials.Token,
+			credentials.CSRFToken,
+			"private-user-agent-must-not-leak",
+			"token_hash",
+			"csrf_hash",
+			"user_agent",
+			"cookie",
+		} {
+			if strings.Contains(body, strings.ToLower(privateValue)) {
+				t.Fatalf("admin list exposed private value %q: %s", privateValue, response.Body.String())
+			}
+		}
+		var payload struct {
+			Sessions []BrowserSession `json:"sessions"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Sessions) != 1 || payload.Sessions[0].ID != credentials.Session.ID {
+			t.Fatalf("sessions=%#v", payload.Sessions)
+		}
+	})
+
+	t.Run("revoke one is immediate and idempotent", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 505)
+		credentials, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: "Firefox / Linux"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/admin/browser-sessions/" + url.PathEscape(credentials.Session.ID)
+		for attempt := 0; attempt < 2; attempt++ {
+			response := serveAdminSessionRequest(
+				handler, http.MethodDelete, path, testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+				t.Fatalf("attempt %d status=%d body=%q", attempt, response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+			if response.Header().Get("Set-Cookie") != "" {
+				t.Fatalf("admin revoke mutated browser Cookie: %q", response.Header().Get("Set-Cookie"))
+			}
+		}
+
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("revoked session next request status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("revoke all is counted idempotently and preserves machine bearer", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 506)
+		for _, label := range []string{"Chrome / macOS", "Safari / iOS"} {
+			if _, err := sessionStore.Create(BrowserSessionCreate{DeviceLabel: label}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for attempt, want := range []int64{2, 0} {
+			response := serveAdminSessionRequest(
+				handler,
+				http.MethodPost,
+				"/api/admin/browser-sessions/revoke-all",
+				testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf("attempt %d status=%d body=%s", attempt, response.Code, response.Body.String())
+			}
+			var payload map[string]int64
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) != 1 || payload["revoked_count"] != want {
+				t.Fatalf("attempt %d payload=%#v", attempt, payload)
+			}
+		}
+		response := requestKBase(handler, http.MethodGet, "/api/books", testKBaseAuthToken)
+		if response.Code != http.StatusOK {
+			t.Fatalf("machine bearer status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("invalid revoke paths are rejected", func(t *testing.T) {
+		handler, _ := newKBaseSessionAdminHTTPTestHandler(t, clock, 507)
+		for _, path := range []string{
+			"/api/admin/browser-sessions/",
+			"/api/admin/browser-sessions/session_a/nested",
+			"/api/admin/browser-sessions/session_a?session_id=session_b",
+			"/api/admin/browser-sessions/%2F",
+			"/api/admin/browser-sessions/%00",
+		} {
+			response := serveAdminSessionRequest(
+				handler, http.MethodDelete, path, testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusBadRequest && response.Code != http.StatusNotFound {
+				t.Fatalf("path %q status=%d body=%s", path, response.Code, response.Body.String())
+			}
+		}
+	})
+
+	t.Run("store failures are generic", func(t *testing.T) {
+		for index, request := range []struct {
+			method string
+			path   string
+		}{
+			{http.MethodGet, "/api/admin/browser-sessions"},
+			{http.MethodDelete, "/api/admin/browser-sessions/session_missing"},
+			{http.MethodPost, "/api/admin/browser-sessions/revoke-all"},
+		} {
+			sessionStore := newBrowserSessionStoreForAdminTest(t, clock, 508+index)
+			handler := newKBaseSessionAdminHTTPTestHandlerForStore(t, sessionStore)
+			if err := sessionStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			response := serveAdminSessionRequest(
+				handler, request.method, request.path, testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusServiceUnavailable ||
+				response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+				t.Fatalf("%s %s closed store status=%d body=%q",
+					request.method, request.path, response.Code, response.Body.String())
+			}
+		}
+	})
+}
 
 func TestKBaseHTTPHandlerBrowserSessionMethodRulesAndAuthorizationRejection(t *testing.T) {
 	clock := &browserSessionTestClock{
@@ -3982,6 +4240,83 @@ func newKBaseBrowserSessionHTTPTestHandlerForStore(
 			MaxActive:       10,
 		},
 	})
+}
+
+func newKBaseSessionAdminHTTPTestHandler(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+) (http.Handler, *BrowserSessionStore) {
+	t.Helper()
+	sessionStore := newBrowserSessionStoreForAdminTest(t, clock, randomSeed)
+	return newKBaseSessionAdminHTTPTestHandlerForStore(t, sessionStore), sessionStore
+}
+
+func newBrowserSessionStoreForAdminTest(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+) *BrowserSessionStore {
+	t.Helper()
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(randomSeed, 32)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sessionStore.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	return sessionStore
+}
+
+func newKBaseSessionAdminHTTPTestHandlerForStore(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+) http.Handler {
+	t.Helper()
+	return NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:           testKBaseAuthToken,
+		SourceAgentToken:    "dedicated-source-agent-token",
+		AgentPublisherToken: "dedicated-publisher-token",
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           sessionStore,
+			AdminToken:      testBrowserSessionAdminToken,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+}
+
+func adminSessionRequest(method, path, token string) *http.Request {
+	request := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return request
+}
+
+func serveAdminSessionRequest(
+	handler http.Handler,
+	method, path, token string,
+) *httptest.ResponseRecorder {
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, adminSessionRequest(method, path, token))
+	return response
 }
 
 func assertKBaseBrowserSessionNoStore(t *testing.T, response *httptest.ResponseRecorder) {

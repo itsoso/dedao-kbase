@@ -139,6 +139,13 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if authToken != "" && sourceAgentToken == authToken {
 		sourceAgentToken = ""
 	}
+	if browserSessions.AdminToken != "" &&
+		(browserSessions.AdminToken == authToken ||
+			browserSessions.AdminToken == sourceAgentToken ||
+			browserSessions.AdminToken == agentPublisherToken ||
+			browserSessions.AdminToken == browserSessionSecret) {
+		browserSessions.AdminToken = ""
+	}
 	assets := cfg.SourceAssets
 	if assets == nil {
 		assets, _ = NewSourceAssetStore(store.Root())
@@ -241,6 +248,9 @@ func (defaultDedaoLibrary) OdobArticleDetail(aliasID string) (*services.ArticleD
 }
 
 func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.handleBrowserSessionAdminRoute(w, r) {
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/") && h.applyCORS(w, r) && r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -3883,6 +3893,101 @@ const (
 	maxBrowserSessionFetchSiteBytes     = 64
 	maxBrowserSessionCSRFBytes          = 256
 )
+
+const browserSessionAdminPath = "/api/admin/browser-sessions"
+
+var browserSessionIDPattern = regexp.MustCompile(`^session_[A-Za-z0-9_-]{1,128}$`)
+
+func (h *kbaseHTTPHandler) handleBrowserSessionAdminRoute(
+	w http.ResponseWriter,
+	r *http.Request,
+) bool {
+	if r.URL.Path != browserSessionAdminPath &&
+		!strings.HasPrefix(r.URL.Path, browserSessionAdminPath+"/") {
+		return false
+	}
+	setBrowserSessionNoStore(w)
+	if h.browserSessions.AdminToken == "" || h.browserSessions.Store == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "service unavailable")
+		return true
+	}
+	token, valid := singleBearerToken(r)
+	if !valid || !constantTimeStringEqual(token, h.browserSessions.AdminToken) {
+		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		return true
+	}
+
+	switch r.URL.Path {
+	case browserSessionAdminPath:
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return true
+		}
+		h.handleBrowserSessionAdminList(w)
+	case browserSessionAdminPath + "/revoke-all":
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return true
+		}
+		h.handleBrowserSessionAdminRevokeAll(w)
+	default:
+		if r.Method != http.MethodDelete {
+			w.Header().Set("Allow", http.MethodDelete)
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return true
+		}
+		h.handleBrowserSessionAdminRevoke(w, r)
+	}
+	return true
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionAdminList(w http.ResponseWriter) {
+	sessions, err := h.browserSessions.Store.List()
+	if err != nil {
+		writeBrowserSessionStoreError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionAdminRevoke(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" {
+		writeHTTPError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	escapedPath := r.URL.EscapedPath()
+	escapedPrefix := browserSessionAdminPath + "/"
+	if !strings.HasPrefix(escapedPath, escapedPrefix) {
+		writeHTTPError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	escapedID := strings.TrimPrefix(escapedPath, escapedPrefix)
+	if escapedID == "" || strings.Contains(escapedID, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	sessionID, err := url.PathUnescape(escapedID)
+	if err != nil || !browserSessionIDPattern.MatchString(sessionID) {
+		writeHTTPError(w, http.StatusBadRequest, "invalid session id")
+		return
+	}
+	if err := h.browserSessions.Store.Revoke(sessionID, "admin"); err != nil {
+		writeBrowserSessionStoreError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *kbaseHTTPHandler) handleBrowserSessionAdminRevokeAll(w http.ResponseWriter) {
+	revokedCount, err := h.browserSessions.Store.RevokeAll("admin")
+	if err != nil {
+		writeBrowserSessionStoreError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"revoked_count": revokedCount})
+}
 
 func (h *kbaseHTTPHandler) handleBrowserSessionRoute(w http.ResponseWriter, r *http.Request) bool {
 	switch r.URL.Path {
