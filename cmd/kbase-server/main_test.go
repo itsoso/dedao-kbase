@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -284,6 +285,7 @@ func TestValidateBrowserSessionConfiguration(t *testing.T) {
 		"https://kbase!test.example",
 		"https://xn--bcher-kva.example",
 		"http://localhost:8719",
+		"http://app.localhost:8719",
 		"http://127.0.0.1:8719",
 		"http://[::1]:8719",
 	} {
@@ -390,6 +392,22 @@ func TestBrowserSessionValidationErrorsRedactSecrets(t *testing.T) {
 func TestBrowserSessionTokenSeparation(t *testing.T) {
 	proxySecret := strings.Repeat("p", 32)
 	adminToken := strings.Repeat("a", 32)
+	secrets := startupSecretSet{
+		API:            strings.Repeat("b", 32),
+		SourceAgent:    strings.Repeat("c", 32),
+		AgentPublisher: strings.Repeat("d", 32),
+		AuditRetry:     strings.Repeat("e", 32),
+	}
+	reserved := browserSessionReservedSecrets(secrets)
+	wantReserved := []string{
+		secrets.API,
+		secrets.SourceAgent,
+		secrets.AgentPublisher,
+		secrets.AuditRetry,
+	}
+	if !reflect.DeepEqual(reserved, wantReserved) {
+		t.Fatalf("browserSessionReservedSecrets() = %#v, want %#v", reserved, wantReserved)
+	}
 	base := sessionServerConfig{
 		ListenAddr:         "127.0.0.1:8719",
 		BrowserProxySecret: proxySecret,
@@ -400,26 +418,96 @@ func TestBrowserSessionTokenSeparation(t *testing.T) {
 		RenewalInterval:    5 * time.Minute,
 		MaxActive:          10,
 	}
-	for _, name := range []string{"API", "publisher", "source agent", "retry signing"} {
+	for index, name := range []string{"API", "source agent", "publisher", "retry signing"} {
 		t.Run("admin differs from "+name, func(t *testing.T) {
-			if err := validateSessionConfiguration(base, adminToken); err == nil {
-				t.Fatalf("admin token was allowed to equal %s token", name)
+			cfg := base
+			cfg.AdminToken = reserved[index]
+			if err := validateSessionConfiguration(cfg, reserved...); err == nil {
+				t.Fatalf("admin token was allowed to equal reserved position %d (%s)", index, name)
 			}
 		})
 		t.Run("proxy differs from "+name, func(t *testing.T) {
-			if err := validateSessionConfiguration(base, proxySecret); err == nil {
-				t.Fatalf("browser proxy secret was allowed to equal %s token", name)
+			cfg := base
+			cfg.BrowserProxySecret = reserved[index]
+			if err := validateSessionConfiguration(cfg, reserved...); err == nil {
+				t.Fatalf("browser proxy secret was allowed to equal reserved position %d (%s)", index, name)
 			}
 		})
 	}
-	if err := validateSessionConfiguration(
-		base,
-		strings.Repeat("b", 32),
-		strings.Repeat("c", 32),
-		strings.Repeat("d", 32),
-		strings.Repeat("e", 32),
-	); err != nil {
+	if err := validateSessionConfiguration(base, reserved...); err != nil {
 		t.Fatalf("distinct session secrets rejected: %v", err)
+	}
+}
+
+func TestRunKBaseServerPreflightsHTTPBeforeBrowserSessionStore(t *testing.T) {
+	t.Setenv("KBASE_HTTP_READ_TIMEOUT_SECONDS", "invalid")
+	dbPath := filepath.Join(t.TempDir(), "sessions", "browser_sessions.sqlite3")
+	config := kBaseServerConfig{
+		Addr: "127.0.0.1:8719",
+		Root: t.TempDir(),
+		Session: sessionServerConfig{
+			ListenAddr:         "127.0.0.1:8719",
+			BrowserProxySecret: strings.Repeat("p", 32),
+			DBPath:             dbPath,
+			PublicOrigin:       "https://kbase.example.test",
+			AdminToken:         strings.Repeat("a", 32),
+			TTL:                defaultSessionTTL,
+			RenewalInterval:    defaultSessionRenewalInterval,
+			MaxActive:          defaultSessionMaxActive,
+		},
+		RetrySigningErr: errors.New("retry signing disabled for test"),
+	}
+	err := runKBaseServer(config)
+	if err == nil || !strings.Contains(err.Error(), "invalid HTTP server configuration") {
+		t.Fatalf("runKBaseServer() error = %v", err)
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("HTTP preflight failure touched browser session database: %v", statErr)
+	}
+}
+
+func TestRunKBaseServerReturnsListenErrors(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "")
+	t.Setenv("TOKENPLAN_API_KEY", "")
+	t.Setenv("DEDAO_TOKENPLAN_ENV_FILE", filepath.Join(t.TempDir(), "missing.env"))
+	config := kBaseServerConfig{
+		Addr:            "invalid-listen-address",
+		Root:            t.TempDir(),
+		ExportPath:      filepath.Join(t.TempDir(), "system-kb.json"),
+		Session:         sessionServerConfig{ListenAddr: "invalid-listen-address"},
+		RetrySigningErr: errors.New("retry signing disabled for test"),
+	}
+	err := runKBaseServer(config)
+	if err == nil {
+		t.Fatal("runKBaseServer() swallowed the listen error")
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		t.Fatalf("runKBaseServer() returned a normal shutdown error: %v", err)
+	}
+}
+
+func TestWithBrowserSessionRuntimeClosesStoreOnLaterFailure(t *testing.T) {
+	cfg := defaultSessionServerConfig()
+	cfg.ListenAddr = "127.0.0.1:8719"
+	cfg.BrowserProxySecret = strings.Repeat("p", 32)
+	cfg.DBPath = filepath.Join(t.TempDir(), "sessions", "browser_sessions.sqlite3")
+	cfg.PublicOrigin = "https://kbase.example.test"
+	cfg.AdminToken = strings.Repeat("a", 32)
+	laterFailure := errors.New("later startup failure")
+	var store *app.BrowserSessionStore
+
+	err := withBrowserSessionRuntime(cfg, func(runtime browserSessionRuntime) error {
+		store = runtime.Store
+		return laterFailure
+	})
+	if !errors.Is(err, laterFailure) {
+		t.Fatalf("withBrowserSessionRuntime() error = %v", err)
+	}
+	if store == nil {
+		t.Fatal("withBrowserSessionRuntime() did not initialize the store")
+	}
+	if _, err := store.Create(app.BrowserSessionCreate{DeviceLabel: "closed-store-check"}); !errors.Is(err, app.ErrBrowserSessionUnavailable) {
+		t.Fatalf("browser session store remained usable after failure: %v", err)
 	}
 }
 

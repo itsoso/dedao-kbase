@@ -22,109 +22,214 @@ import (
 	"golang.org/x/net/idna"
 )
 
+type kBaseServerConfig struct {
+	Addr                string
+	Root                string
+	ExportPath          string
+	WebDir              string
+	AuthToken           string
+	AgentPublisherToken string
+	SourceAgentToken    string
+	Session             sessionServerConfig
+	RetrySigningKey     []byte
+	RetrySigningErr     error
+}
+
+type startupSecretSet struct {
+	API            string
+	SourceAgent    string
+	AgentPublisher string
+	AuditRetry     string
+}
+
 func main() {
-	addr := flag.String("addr", envDefault("KBASE_HTTP_ADDR", "127.0.0.1:8719"), "HTTP listen address")
-	root := flag.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")
-	exportPath := flag.String("system-kb-export", defaultSystemKBExportPath(), "system_kb_export.json path")
-	webDir := flag.String("web-dir", defaultWebDir(), "static web UI directory")
-	authToken := flag.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
-	agentPublisherToken := flag.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
-	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
-	flag.Parse()
-	browserSessionSecret := defaultBrowserSessionSecret()
+	if err := run(); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	flags := flag.NewFlagSet("kbase-server", flag.ContinueOnError)
+	addr := flags.String("addr", envDefault("KBASE_HTTP_ADDR", "127.0.0.1:8719"), "HTTP listen address")
+	root := flags.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")
+	exportPath := flags.String("system-kb-export", defaultSystemKBExportPath(), "system_kb_export.json path")
+	webDir := flags.String("web-dir", defaultWebDir(), "static web UI directory")
+	authToken := flags.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
+	agentPublisherToken := flags.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
+	sourceAgentToken := flags.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
+	if err := flags.Parse(os.Args[1:]); err != nil {
+		return err
+	}
+
 	sessionConfig := defaultSessionServerConfig()
 	sessionConfig.ListenAddr = *addr
-	sessionConfig.BrowserProxySecret = browserSessionSecret
+	sessionConfig.BrowserProxySecret = defaultBrowserSessionSecret()
 	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
-	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken, *agentPublisherToken); err != nil {
-		log.Fatal(err)
+	return runKBaseServer(kBaseServerConfig{
+		Addr:                *addr,
+		Root:                *root,
+		ExportPath:          *exportPath,
+		WebDir:              *webDir,
+		AuthToken:           *authToken,
+		AgentPublisherToken: *agentPublisherToken,
+		SourceAgentToken:    *sourceAgentToken,
+		Session:             sessionConfig,
+		RetrySigningKey:     retrySigningKey,
+		RetrySigningErr:     retrySigningErr,
+	})
+}
+
+func browserSessionReservedSecrets(secrets startupSecretSet) []string {
+	return []string{
+		secrets.API,
+		secrets.SourceAgent,
+		secrets.AgentPublisher,
+		secrets.AuditRetry,
 	}
-	if err := validateSessionConfiguration(
-		sessionConfig,
-		*authToken,
-		*sourceAgentToken,
-		*agentPublisherToken,
-		string(retrySigningKey),
+}
+
+func runKBaseServer(config kBaseServerConfig) error {
+	if err := validateKBaseTokenSeparation(
+		config.AuthToken,
+		config.SourceAgentToken,
+		config.AgentPublisherToken,
 	); err != nil {
-		log.Fatal(err)
+		return err
 	}
-	if retrySigningErr == nil {
-		retrySigningErr = validateEvidenceAuditRetryKeySeparation(
-			retrySigningKey,
-			*authToken,
-			*sourceAgentToken,
-			*agentPublisherToken,
-			sessionConfig.AdminToken,
-			sessionConfig.BrowserProxySecret,
+	reservedSecrets := browserSessionReservedSecrets(startupSecretSet{
+		API:            config.AuthToken,
+		SourceAgent:    config.SourceAgentToken,
+		AgentPublisher: config.AgentPublisherToken,
+		AuditRetry:     string(config.RetrySigningKey),
+	})
+	if err := validateSessionConfiguration(
+		config.Session,
+		reservedSecrets...,
+	); err != nil {
+		return err
+	}
+	if config.RetrySigningErr == nil {
+		config.RetrySigningErr = validateEvidenceAuditRetryKeySeparation(
+			config.RetrySigningKey,
+			config.AuthToken,
+			config.SourceAgentToken,
+			config.AgentPublisherToken,
+			config.Session.AdminToken,
+			config.Session.BrowserProxySecret,
 		)
 	}
-	browserSessions, err := newBrowserSessionRuntime(sessionConfig)
+	server, err := newKBaseHTTPServer(config.Addr, nil)
 	if err != nil {
-		log.Fatalf("initialize browser session store: %v", err)
+		return fmt.Errorf("invalid HTTP server configuration: %w", err)
+	}
+
+	return withBrowserSessionRuntime(config.Session, func(browserSessions browserSessionRuntime) error {
+		return serveKBaseServer(config, server, browserSessions)
+	})
+}
+
+func withBrowserSessionRuntime(
+	config sessionServerConfig,
+	run func(browserSessionRuntime) error,
+) error {
+	browserSessions, err := newBrowserSessionRuntime(config)
+	if err != nil {
+		return fmt.Errorf("initialize browser session store: %w", err)
 	}
 	defer func() {
 		if err := browserSessions.Close(); err != nil {
 			log.Printf("close browser session store: %v", err)
 		}
 	}()
-	sourceSync, err := app.NewSourceSyncStore(*root)
+	return run(browserSessions)
+}
+
+func serveKBaseServer(
+	config kBaseServerConfig,
+	server *http.Server,
+	browserSessions browserSessionRuntime,
+) error {
+	sourceSync, err := app.NewSourceSyncStore(config.Root)
 	if err != nil {
-		log.Fatalf("initialize source sync store: %v", err)
+		return fmt.Errorf("initialize source sync store: %w", err)
 	}
-	defer sourceSync.Close()
-	bookStore := app.NewBookKnowledgeStore(*root)
-	knowledgeCatalog, err := app.NewKnowledgeCatalogStore(*root, time.Now)
+	defer func() {
+		if err := sourceSync.Close(); err != nil {
+			log.Printf("close source sync store: %v", err)
+		}
+	}()
+	bookStore := app.NewBookKnowledgeStore(config.Root)
+	knowledgeCatalog, err := app.NewKnowledgeCatalogStore(config.Root, time.Now)
 	if err != nil {
-		log.Fatalf("initialize knowledge catalog: %v", err)
+		return fmt.Errorf("initialize knowledge catalog: %w", err)
 	}
-	defer knowledgeCatalog.Close()
+	defer func() {
+		if err := knowledgeCatalog.Close(); err != nil {
+			log.Printf("close knowledge catalog: %v", err)
+		}
+	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	auditRuntime := newEvidenceAuditServerRuntime(ctx, bookStore)
-	if retrySigningErr != nil {
-		log.Printf("evidence audit retry disabled: %v", retrySigningErr)
-		retrySigningKey = nil
+	if auditRuntime.Coordinator != nil {
+		defer func() {
+			shutdownContext, cancel := context.WithTimeout(
+				context.Background(),
+				evidenceAuditShutdownTimeout(),
+			)
+			defer cancel()
+			if err := auditRuntime.Coordinator.Shutdown(shutdownContext); err != nil {
+				log.Printf("evidence audit coordinator shutdown failed: %v", err)
+			}
+		}()
+	}
+	if config.RetrySigningErr != nil {
+		log.Printf("evidence audit retry disabled: %v", config.RetrySigningErr)
+		config.RetrySigningKey = nil
 	}
 	proofroomDelivery, proofroomUnavailableReason := newProofroomDeliveryRuntime()
 
 	handlerConfig := app.KBaseHTTPConfig{
 		Store:                  bookStore,
-		AuthToken:              *authToken,
-		AgentPublisherToken:    *agentPublisherToken,
-		SystemKBExportPath:     *exportPath,
-		StaticDir:              *webDir,
+		AuthToken:              config.AuthToken,
+		AgentPublisherToken:    config.AgentPublisherToken,
+		SystemKBExportPath:     config.ExportPath,
+		StaticDir:              config.WebDir,
 		WeChat:                 app.NewWeChatSourceService(app.WeChatSourceConfigFromEnv()),
 		WCPlus:                 app.NewWCPlusSourceService(app.WCPlusSourceConfigFromEnv()),
 		SourceSync:             sourceSync,
-		SourceAgentToken:       *sourceAgentToken,
+		SourceAgentToken:       config.SourceAgentToken,
 		ReverificationCooldown: knowledgeReverificationCooldown(),
 		AuditCoordinator:       auditRuntime.Coordinator,
 		AuditUnavailableReason: auditRuntime.UnavailableReason,
 		AuditMaxBodyBytes:      evidenceAuditMaxBodyBytes(),
-		AuditRetrySigningKey:   retrySigningKey,
+		AuditRetrySigningKey:   config.RetrySigningKey,
 		AuditLogger: func(event app.EvidenceAuditHTTPLogEvent) {
 			log.Printf("evidence audit HTTP error: operation=%s code=%s cause=%s",
 				event.Operation, event.Code, event.Cause)
 		},
 		ProofroomDelivery: proofroomDelivery,
 	}
-	handler := app.NewKBaseHTTPHandler(applyBrowserSessionRuntime(handlerConfig, browserSessions))
+	server.Handler = app.NewKBaseHTTPHandler(applyBrowserSessionRuntime(handlerConfig, browserSessions))
 
-	log.Printf("dedao kbase server listening on %s", *addr)
-	log.Printf("book knowledge root: %s", *root)
-	log.Printf("system kb export: %s", *exportPath)
-	if strings.TrimSpace(*webDir) != "" {
-		log.Printf("web dir: %s", *webDir)
+	log.Printf("dedao kbase server listening on %s", config.Addr)
+	log.Printf("book knowledge root: %s", config.Root)
+	log.Printf("system kb export: %s", config.ExportPath)
+	if strings.TrimSpace(config.WebDir) != "" {
+		log.Printf("web dir: %s", config.WebDir)
 	}
-	if strings.TrimSpace(*authToken) == "" {
+	if strings.TrimSpace(config.AuthToken) == "" {
 		log.Printf("warning: KBASE_AUTH_TOKEN is empty; /api/* routes will reject requests")
 	}
-	if strings.TrimSpace(*sourceAgentToken) == "" {
+	if strings.TrimSpace(config.SourceAgentToken) == "" {
 		log.Printf("source agent API disabled until KBASE_SOURCE_AGENT_TOKEN is configured")
 	} else {
 		log.Printf("source agent API enabled")
 	}
-	if strings.TrimSpace(*agentPublisherToken) == "" {
+	if strings.TrimSpace(config.AgentPublisherToken) == "" {
 		log.Printf("agent package publisher API disabled until KBASE_AGENT_PUBLISHER_TOKEN is configured")
 	} else {
 		log.Printf("agent package publisher API enabled with a dedicated token")
@@ -147,17 +252,26 @@ func main() {
 	}
 	var schedulerDone <-chan struct{}
 	if scheduler, schedulerErr := app.NewSourceScheduler(sourceSync, time.Now); schedulerErr != nil {
-		log.Fatalf("initialize source scheduler: %v", schedulerErr)
+		return fmt.Errorf("initialize source scheduler: %w", schedulerErr)
 	} else {
-		_, schedulerDone = startSourceScheduler(ctx, *sourceAgentToken, sourceSchedulerTickInterval(), scheduler, log.Printf)
+		_, schedulerDone = startSourceScheduler(
+			ctx,
+			config.SourceAgentToken,
+			sourceSchedulerTickInterval(),
+			scheduler,
+			log.Printf,
+		)
 	}
 	reverificationRunner := app.NewKnowledgeReverificationRunner(bookStore, nil, time.Now, knowledgeReverificationStaleAfter())
 	_, reverificationDone := startKnowledgeReverificationRunner(ctx, knowledgeReverificationTickInterval(), reverificationRunner, log.Printf)
+	defer func() {
+		stop()
+		if schedulerDone != nil {
+			<-schedulerDone
+		}
+		<-reverificationDone
+	}()
 
-	server, err := newKBaseHTTPServer(*addr, handler)
-	if err != nil {
-		log.Fatalf("invalid HTTP server configuration: %v", err)
-	}
 	go func() {
 		<-ctx.Done()
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -167,21 +281,10 @@ func main() {
 		}
 	}()
 	listenErr := server.ListenAndServe()
-	stop()
-	if schedulerDone != nil {
-		<-schedulerDone
-	}
-	<-reverificationDone
-	if auditRuntime.Coordinator != nil {
-		shutdownContext, cancel := context.WithTimeout(context.Background(), evidenceAuditShutdownTimeout())
-		if err := auditRuntime.Coordinator.Shutdown(shutdownContext); err != nil {
-			log.Printf("evidence audit coordinator shutdown failed: %v", err)
-		}
-		cancel()
-	}
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
-		log.Fatal(listenErr)
+		return listenErr
 	}
+	return nil
 }
 
 type evidenceAuditServerRuntime struct {
@@ -456,7 +559,8 @@ func validatePublicOrigin(rawOrigin string) error {
 		return errors.New("KBASE_PUBLIC_ORIGIN must use canonical browser Origin serialization")
 	}
 	if scheme == "http" &&
-		!strings.EqualFold(canonicalHost, "localhost") &&
+		canonicalHost != "localhost" &&
+		!strings.HasSuffix(canonicalHost, ".localhost") &&
 		(ip == nil || !ip.IsLoopback()) {
 		return errors.New("KBASE_PUBLIC_ORIGIN must use HTTPS for a public host")
 	}
