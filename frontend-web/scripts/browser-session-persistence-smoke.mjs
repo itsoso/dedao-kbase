@@ -21,6 +21,7 @@ assert.match(
   /include \/etc\/dedao-kbase\/kbase\.locations\.conf;/,
 );
 assert.doesNotMatch(config, /auth_basic/);
+assert.doesNotMatch(config, /persisted Bearer token/);
 assert.doesNotMatch(
   renderer,
   /sed[\s\S]*KBASE_BROWSER_SESSION_SECRET|sed[\s\S]*browser_secret/,
@@ -34,7 +35,7 @@ function renderedLocationBlock(source, pattern) {
 
 const browserSession = renderedLocationBlock(
   locations,
-  /location = \/browser\/session-token \{[^}]+\}/,
+  /location = \/browser\/session \{[^}]+\}/,
 );
 assert.match(browserSession, /auth_basic "dedao-kbase";/);
 assert.match(
@@ -47,9 +48,30 @@ assert.match(
   /proxy_set_header X-KBase-Browser-Session "__KBASE_BROWSER_SESSION_SECRET__";/,
 );
 
+const migration = renderedLocationBlock(
+  locations,
+  /location = \/browser\/session\/migrate \{[^}]+\}/,
+);
+assert.match(migration, /auth_basic off;/);
+assert.doesNotMatch(migration, /auth_basic_user_file/);
+assert.doesNotMatch(migration, /proxy_set_header Authorization "";/);
+assert.match(migration, /proxy_set_header X-KBase-Browser-Session "";/);
+
+const retired = renderedLocationBlock(
+  locations,
+  /location = \/browser\/session-token \{[^}]+\}/,
+);
+assert.match(retired, /auth_basic off;/);
+assert.doesNotMatch(retired, /auth_basic_user_file/);
+assert.match(retired, /proxy_set_header Authorization "";/);
+assert.match(retired, /proxy_set_header X-KBase-Browser-Session "";/);
+assert.doesNotMatch(retired, /__KBASE_BROWSER_SESSION_SECRET__/);
+
 const api = renderedLocationBlock(locations, /location \/api\/ \{[^}]+\}/);
 assert.doesNotMatch(api, /auth_basic/);
 assert.match(api, /proxy_pass http:\/\/__KBASE_BACKEND_ADDR__;/);
+assert.doesNotMatch(api, /proxy_set_header Authorization "";/);
+assert.match(api, /proxy_set_header X-KBase-Browser-Session "";/);
 
 const rootLocations = [
   ...locations.matchAll(/\nlocation \/ \{[^}]+\}/g),
@@ -58,6 +80,8 @@ assert.equal(rootLocations.length, 1);
 const staticShell = rootLocations[0];
 assert.doesNotMatch(staticShell, /auth_basic/);
 assert.match(staticShell, /proxy_pass http:\/\/__KBASE_BACKEND_ADDR__;/);
+assert.match(staticShell, /proxy_set_header Authorization "";/);
+assert.match(staticShell, /proxy_set_header X-KBase-Browser-Session "";/);
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "kbase-nginx-render-"));
 try {
@@ -83,6 +107,10 @@ try {
   assert.match(
     rendered,
     new RegExp(`X-KBase-Browser-Session "${browserProxyValue}";`),
+  );
+  assert.equal(
+    rendered.split(`X-KBase-Browser-Session "${browserProxyValue}";`).length - 1,
+    1,
   );
   assert.match(rendered, /proxy_pass http:\/\/127\.0\.0\.1:18719;/);
   assert.match(
