@@ -304,13 +304,14 @@ func TestBrowserSessionAuditCoalescesRejectedAuthenticationAndBoundsRows(t *test
 		now: time.Date(2026, time.July, 28, 13, 0, 0, 0, time.UTC),
 	}
 	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
-		Path:            newBrowserSessionTestDBPath(t),
-		Now:             clock.Now,
-		Random:          bytes.NewReader(deterministicBrowserSessionBytes(905, 8)),
-		TTL:             30 * 24 * time.Hour,
-		RenewalInterval: 5 * time.Minute,
-		MaxActive:       10,
-		AuditMaxEvents:  3,
+		Path:                   newBrowserSessionTestDBPath(t),
+		Now:                    clock.Now,
+		Random:                 bytes.NewReader(deterministicBrowserSessionBytes(905, 8)),
+		TTL:                    30 * 24 * time.Hour,
+		RenewalInterval:        5 * time.Minute,
+		MaxActive:              10,
+		AuditMaxEvents:         3,
+		AuditMaxRejectedEvents: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +331,7 @@ func TestBrowserSessionAuditCoalescesRejectedAuthenticationAndBoundsRows(t *test
 		t.Fatalf("duplicate rejected-auth events = %d, want 1", len(events))
 	}
 
-	clock.Advance(time.Minute)
+	clock.Advance(time.Hour)
 	if err := store.RecordAuthenticationRejected("", "", "invalid_cookie"); err != nil {
 		t.Fatal(err)
 	}
@@ -345,11 +346,118 @@ func TestBrowserSessionAuditCoalescesRejectedAuthenticationAndBoundsRows(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 3 {
-		t.Fatalf("bounded audit events = %d, want 3", len(events))
+	var lifecycle, rejected int
+	for _, event := range events {
+		if event.Type == BrowserSessionAuditAuthenticationRejected {
+			rejected++
+		} else {
+			lifecycle++
+		}
 	}
-	if events[0].Type != BrowserSessionAuditLogin ||
-		events[0].DeviceLabel != "Bounded browser 0" {
-		t.Fatalf("oldest retained audit event = %#v, want first bounded login", events[0])
+	if lifecycle != 3 || rejected != 1 {
+		t.Fatalf(
+			"bounded audit events retained lifecycle=%d rejected=%d, want 3 and 1",
+			lifecycle,
+			rejected,
+		)
+	}
+}
+
+func TestBrowserSessionAuditKeepsLifecycleAndRejectedQuotasSeparate(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 14, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:                   newBrowserSessionTestDBPath(t),
+		Now:                    clock.Now,
+		Random:                 bytes.NewReader(deterministicBrowserSessionBytes(906, 8)),
+		TTL:                    30 * 24 * time.Hour,
+		RenewalInterval:        5 * time.Minute,
+		MaxActive:              10,
+		AuditMaxEvents:         2,
+		AuditMaxRejectedEvents: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for index := 0; index < 2; index++ {
+		if _, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+			DeviceLabel: "Lifecycle browser " + strconv.Itoa(index),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, reason := range []string{"invalid_cookie", "proxy_credential", "unexpected_authorization"} {
+		if err := store.RecordAuthenticationRejected("", "", reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	events, err := store.ListAuditEvents(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lifecycle, rejected int
+	for _, event := range events {
+		if event.Type == BrowserSessionAuditAuthenticationRejected {
+			rejected++
+		} else {
+			lifecycle++
+		}
+	}
+	if lifecycle != 2 || rejected != 2 {
+		t.Fatalf(
+			"separate audit quotas retained lifecycle=%d rejected=%d, want 2 and 2",
+			lifecycle,
+			rejected,
+		)
+	}
+}
+
+func TestBrowserSessionRejectedAuditInsertionAndPruningAreAtomic(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 15, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:                   newBrowserSessionTestDBPath(t),
+		Now:                    clock.Now,
+		Random:                 bytes.NewReader(deterministicBrowserSessionBytes(907, 4)),
+		TTL:                    30 * 24 * time.Hour,
+		RenewalInterval:        5 * time.Minute,
+		MaxActive:              10,
+		AuditMaxEvents:         10,
+		AuditMaxRejectedEvents: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.RecordAuthenticationRejected("", "", "invalid_cookie"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`
+		CREATE TRIGGER fail_rejected_audit_prune
+		BEFORE DELETE ON browser_session_audit_events
+		WHEN OLD.event_type = 'authentication_rejected'
+		BEGIN
+			SELECT RAISE(ABORT, 'forced rejected audit prune failure');
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Hour)
+	if err := store.RecordAuthenticationRejected("", "", "proxy_credential"); err == nil {
+		t.Fatal("RecordAuthenticationRejected() succeeded despite forced prune failure")
+	}
+	events, err := store.ListAuditEvents(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 ||
+		events[0].ReasonCode != "invalid_cookie" {
+		t.Fatalf("failed atomic audit write left events %#v", events)
 	}
 }

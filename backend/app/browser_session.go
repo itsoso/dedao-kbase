@@ -22,21 +22,23 @@ import (
 )
 
 const (
-	defaultBrowserSessionTTL                        = 30 * 24 * time.Hour
-	defaultBrowserSessionRenewalInterval            = 5 * time.Minute
-	defaultBrowserSessionMaxActive                  = 10
-	browserSessionCSRFTTL                           = 15 * time.Minute
-	browserSessionCredentialBytes                   = 32
-	browserSessionSchemaVersion                     = 3
-	browserSessionTimeLayout                        = "2006-01-02T15:04:05.000000000Z07:00"
-	minBrowserSessionClientIDBytes                  = 16
-	maxBrowserSessionClientIDBytes                  = 128
-	maxBrowserSessionEpoch                    int64 = 1<<63 - 1
-	maxBrowserSessionAuditEvents                    = 1000
-	maxBrowserSessionAuditDeviceLabelBytes          = 128
-	defaultBrowserSessionAuditMaxEvents             = 10_000
-	maxBrowserSessionAuditMaxEvents                 = 1_000_000
-	browserSessionRejectedAuditCoalesceWindow       = time.Minute
+	defaultBrowserSessionTTL                          = 30 * 24 * time.Hour
+	defaultBrowserSessionRenewalInterval              = 5 * time.Minute
+	defaultBrowserSessionMaxActive                    = 10
+	browserSessionCSRFTTL                             = 15 * time.Minute
+	browserSessionCredentialBytes                     = 32
+	browserSessionSchemaVersion                       = 3
+	browserSessionTimeLayout                          = "2006-01-02T15:04:05.000000000Z07:00"
+	minBrowserSessionClientIDBytes                    = 16
+	maxBrowserSessionClientIDBytes                    = 128
+	maxBrowserSessionEpoch                      int64 = 1<<63 - 1
+	maxBrowserSessionAuditEvents                      = 1000
+	maxBrowserSessionAuditDeviceLabelBytes            = 128
+	defaultBrowserSessionAuditMaxEvents               = 10_000
+	maxBrowserSessionAuditMaxEvents                   = 1_000_000
+	defaultBrowserSessionAuditMaxRejectedEvents       = 5_000
+	maxBrowserSessionAuditMaxRejectedEvents           = 100_000
+	browserSessionRejectedAuditCoalesceWindow         = time.Hour
 )
 
 var (
@@ -66,13 +68,14 @@ const (
 )
 
 type BrowserSessionStoreConfig struct {
-	Path            string
-	Now             func() time.Time
-	Random          io.Reader
-	TTL             time.Duration
-	RenewalInterval time.Duration
-	MaxActive       int
-	AuditMaxEvents  int
+	Path                   string
+	Now                    func() time.Time
+	Random                 io.Reader
+	TTL                    time.Duration
+	RenewalInterval        time.Duration
+	MaxActive              int
+	AuditMaxEvents         int
+	AuditMaxRejectedEvents int
 }
 
 type BrowserSession struct {
@@ -164,16 +167,17 @@ func (e *BrowserSessionClientMismatchError) Unwrap() error {
 }
 
 type BrowserSessionStore struct {
-	dbPath          string
-	now             func() time.Time
-	random          io.Reader
-	ttl             time.Duration
-	renewalInterval time.Duration
-	maxActive       int
-	auditMaxEvents  int
-	db              *sql.DB
-	mu              sync.Mutex
-	closed          bool
+	dbPath                 string
+	now                    func() time.Time
+	random                 io.Reader
+	ttl                    time.Duration
+	renewalInterval        time.Duration
+	maxActive              int
+	auditMaxEvents         int
+	auditMaxRejectedEvents int
+	db                     *sql.DB
+	mu                     sync.Mutex
+	closed                 bool
 
 	// Tests use this hook to hold the expected-auth transaction before commit.
 	expectedAuthBeforeCommit func()
@@ -213,6 +217,12 @@ func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionSt
 	}
 	if config.AuditMaxEvents > maxBrowserSessionAuditMaxEvents {
 		config.AuditMaxEvents = maxBrowserSessionAuditMaxEvents
+	}
+	if config.AuditMaxRejectedEvents <= 0 {
+		config.AuditMaxRejectedEvents = defaultBrowserSessionAuditMaxRejectedEvents
+	}
+	if config.AuditMaxRejectedEvents > maxBrowserSessionAuditMaxRejectedEvents {
+		config.AuditMaxRejectedEvents = maxBrowserSessionAuditMaxRejectedEvents
 	}
 	if err := prepareBrowserSessionDirectory(filepath.Dir(dbPath)); err != nil {
 		return nil, newBrowserSessionCategorizedError(
@@ -258,14 +268,15 @@ func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionSt
 	}
 
 	return &BrowserSessionStore{
-		dbPath:          dbPath,
-		now:             config.Now,
-		random:          config.Random,
-		ttl:             config.TTL,
-		renewalInterval: config.RenewalInterval,
-		maxActive:       config.MaxActive,
-		auditMaxEvents:  config.AuditMaxEvents,
-		db:              db,
+		dbPath:                 dbPath,
+		now:                    config.Now,
+		random:                 config.Random,
+		ttl:                    config.TTL,
+		renewalInterval:        config.RenewalInterval,
+		maxActive:              config.MaxActive,
+		auditMaxEvents:         config.AuditMaxEvents,
+		auditMaxRejectedEvents: config.AuditMaxRejectedEvents,
+		db:                     db,
 	}, nil
 }
 
@@ -1520,7 +1531,9 @@ func (s *BrowserSessionStore) RecordAuthenticationRejected(
 			ErrBrowserSessionUnavailable,
 		)
 	}
-	if err := s.insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
+	if err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		return s.insertBrowserSessionAuditEvent(context.Background(), conn, event)
+	}); err != nil {
 		return fmt.Errorf("record rejected browser session authentication: %w", err)
 	}
 	return nil
@@ -1550,17 +1563,21 @@ func (s *BrowserSessionStore) RecordAuthenticationRejectedByToken(
 		CreatedAt:  s.now().UTC(),
 	}
 	tokenHash := sha256.Sum256([]byte(token))
-	record, err := readBrowserSessionByToken(context.Background(), s.db, tokenHash[:])
-	if err == nil {
-		event.SessionID = record.session.ID
-		event.DeviceLabel = record.session.DeviceLabel
-	} else if !errors.Is(err, ErrBrowserSessionMissing) {
-		return fmt.Errorf(
-			"record rejected browser session authentication by token: %w",
-			err,
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		record, err := readBrowserSessionByToken(
+			context.Background(),
+			conn,
+			tokenHash[:],
 		)
-	}
-	if err := s.insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
+		if err == nil {
+			event.SessionID = record.session.ID
+			event.DeviceLabel = record.session.DeviceLabel
+		} else if !errors.Is(err, ErrBrowserSessionMissing) {
+			return err
+		}
+		return s.insertBrowserSessionAuditEvent(context.Background(), conn, event)
+	})
+	if err != nil {
 		return fmt.Errorf(
 			"record rejected browser session authentication by token: %w",
 			err,
@@ -1673,15 +1690,41 @@ func (s *BrowserSessionStore) insertBrowserSessionAuditEvent(
 	if _, err := execer.ExecContext(ctx, statement, args...); err != nil {
 		return classifyBrowserSessionStoreError("insert browser session audit event", err)
 	}
-	if _, err := execer.ExecContext(ctx, `
+	pruneStatement := `
 		DELETE FROM browser_session_audit_events
-		WHERE sequence <= COALESCE((
-			SELECT sequence
-			FROM browser_session_audit_events
-			ORDER BY sequence DESC
-			LIMIT 1 OFFSET ?
-		), 0)
-	`, s.auditMaxEvents); err != nil {
+		WHERE event_type <> ?
+			AND sequence <= COALESCE((
+				SELECT sequence
+				FROM browser_session_audit_events
+				WHERE event_type <> ?
+				ORDER BY sequence DESC
+				LIMIT 1 OFFSET ?
+			), 0)
+	`
+	pruneArgs := []any{
+		BrowserSessionAuditAuthenticationRejected,
+		BrowserSessionAuditAuthenticationRejected,
+		s.auditMaxEvents,
+	}
+	if event.Type == BrowserSessionAuditAuthenticationRejected {
+		pruneStatement = `
+			DELETE FROM browser_session_audit_events
+			WHERE event_type = ?
+				AND sequence <= COALESCE((
+					SELECT sequence
+					FROM browser_session_audit_events
+					WHERE event_type = ?
+					ORDER BY sequence DESC
+					LIMIT 1 OFFSET ?
+				), 0)
+		`
+		pruneArgs = []any{
+			BrowserSessionAuditAuthenticationRejected,
+			BrowserSessionAuditAuthenticationRejected,
+			s.auditMaxRejectedEvents,
+		}
+	}
+	if _, err := execer.ExecContext(ctx, pruneStatement, pruneArgs...); err != nil {
 		return classifyBrowserSessionStoreError("bound browser session audit events", err)
 	}
 	return nil
