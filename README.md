@@ -205,6 +205,12 @@ bash deploy/kbase/install-release.sh install \
 自动回滚无法完成时，从 retained backup 手工恢复四项快照，再依次重启、校验、重载和探活：
 
 ```bash
+set -Eeuo pipefail
+test -f "${KBASE_BACKUP_DIR:?}/snapshot/kbase-server"
+test -d "${KBASE_BACKUP_DIR:?}/snapshot/web"
+test -f "${KBASE_BACKUP_DIR:?}/snapshot/service.env"
+test -f "${KBASE_BACKUP_DIR:?}/snapshot/nginx.conf"
+test ! -e "${KBASE_FAILED_WEB_TARGET:?}"
 sudo install -m 0755 "${KBASE_BACKUP_DIR:?}/snapshot/kbase-server" "${KBASE_BINARY_TARGET:?}"
 sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
 sudo cp -a "${KBASE_BACKUP_DIR:?}/snapshot/web" "${KBASE_WEB_TARGET:?}"
