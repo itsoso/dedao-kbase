@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -25,6 +26,146 @@ func (server controlledHTTPServer) ListenAndServe() error {
 
 func (server controlledHTTPServer) Shutdown(ctx context.Context) error {
 	return server.shutdown(ctx)
+}
+
+func configureValidCheckConfigEnvironment(t *testing.T, dbPath string) map[string]string {
+	t.Helper()
+	secrets := map[string]string{
+		"KBASE_AUTH_TOKEN":              strings.Repeat("a", 32),
+		"KBASE_SOURCE_AGENT_TOKEN":      strings.Repeat("s", 32),
+		"KBASE_AGENT_PUBLISHER_TOKEN":   strings.Repeat("p", 32),
+		"KBASE_BROWSER_SESSION_SECRET":  strings.Repeat("b", 32),
+		"KBASE_SESSION_ADMIN_TOKEN":     strings.Repeat("m", 32),
+		"KBASE_AUDIT_RETRY_SIGNING_KEY": strings.Repeat("r", 32),
+	}
+	for key, value := range secrets {
+		t.Setenv(key, value)
+	}
+	t.Setenv("KBASE_BROWSER_SESSION_DB_PATH", dbPath)
+	t.Setenv("KBASE_PUBLIC_ORIGIN", "https://kbase.example.test")
+	for _, key := range []string{
+		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
+		"KBASE_HTTP_READ_TIMEOUT_SECONDS",
+		"KBASE_HTTP_WRITE_TIMEOUT_SECONDS",
+		"KBASE_HTTP_IDLE_TIMEOUT_SECONDS",
+		"KBASE_HTTP_MAX_HEADER_BYTES",
+	} {
+		t.Setenv(key, "")
+	}
+	return secrets
+}
+
+func TestCheckConfigEmitsStableJSON(t *testing.T) {
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	var stdout bytes.Buffer
+
+	err := runCommand([]string{"--check-config", "--addr", "127.0.0.1:8719"}, &stdout)
+	if err != nil {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	if got, want := stdout.String(), "{\"schema_version\":1,\"status\":\"ok\"}\n"; got != want {
+		t.Fatalf("check-config stdout = %q, want %q", got, want)
+	}
+}
+
+func TestCheckConfigRejectsTokenSeparation(t *testing.T) {
+	secrets := configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	t.Setenv("KBASE_SOURCE_AGENT_TOKEN", secrets["KBASE_AUTH_TOKEN"])
+	var stdout bytes.Buffer
+
+	err := runCommand([]string{"--check-config", "--addr", "127.0.0.1:8719"}, &stdout)
+	if err == nil || !strings.Contains(err.Error(), "KBASE_SOURCE_AGENT_TOKEN must differ from KBASE_AUTH_TOKEN") {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("invalid check-config stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestCheckConfigRejectsInvalidPublicOrigin(t *testing.T) {
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	t.Setenv("KBASE_PUBLIC_ORIGIN", "https://kbase.example.test/path")
+	var stdout bytes.Buffer
+
+	err := runCommand([]string{"--check-config", "--addr", "127.0.0.1:8719"}, &stdout)
+	if err == nil || !strings.Contains(err.Error(), "KBASE_PUBLIC_ORIGIN") {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("invalid check-config stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestCheckConfigRejectsRetrySigningKeySeparation(t *testing.T) {
+	secrets := configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	t.Setenv("KBASE_AUDIT_RETRY_SIGNING_KEY", secrets["KBASE_AUTH_TOKEN"])
+	var stdout bytes.Buffer
+
+	err := runCommand([]string{"--check-config", "--addr", "127.0.0.1:8719"}, &stdout)
+	if err == nil || !strings.Contains(err.Error(), "KBASE_AUDIT_RETRY_SIGNING_KEY must differ from bearer tokens") {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("invalid check-config stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestCheckConfigRejectsInvalidHTTPAddressWhenSessionsDisabled(t *testing.T) {
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	t.Setenv("KBASE_BROWSER_SESSION_SECRET", "")
+	t.Setenv("KBASE_PUBLIC_ORIGIN", "")
+	t.Setenv("KBASE_SESSION_ADMIN_TOKEN", "")
+	var stdout bytes.Buffer
+
+	err := runCommand([]string{"--check-config", "--addr", "invalid-listen-address"}, &stdout)
+	if err == nil || !strings.Contains(err.Error(), "invalid HTTP server configuration") {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("invalid check-config stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestCheckConfigHasNoListenerOrStorageSideEffects(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing-knowledge-root")
+	dbPath := filepath.Join(t.TempDir(), "missing-state", "sessions.sqlite3")
+	configureValidCheckConfigEnvironment(t, dbPath)
+	var stdout bytes.Buffer
+	runnerCalled := false
+
+	err := runCommandWithServerRunner([]string{
+		"--check-config",
+		"--addr", "127.0.0.1:8719",
+		"--root", root,
+	}, &stdout, func(kBaseServerConfig) error {
+		runnerCalled = true
+		return errors.New("server runner must not be called")
+	})
+	if err != nil {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	if runnerCalled {
+		t.Fatal("check-config entered the server runtime")
+	}
+	for _, path := range []string{root, dbPath} {
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("check-config touched %q: %v", path, statErr)
+		}
+	}
+}
+
+func TestCheckConfigOutputDoesNotContainSecrets(t *testing.T) {
+	secrets := configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	var stdout bytes.Buffer
+
+	if err := runCommand([]string{"--check-config", "--addr", "127.0.0.1:8719"}, &stdout); err != nil {
+		t.Fatalf("runCommand(--check-config) error = %v", err)
+	}
+	for name, secret := range secrets {
+		if strings.Contains(stdout.String(), secret) {
+			t.Fatalf("check-config stdout contains %s", name)
+		}
+	}
 }
 
 func TestDefaultSystemKBExportPathUsesRepoDirEnv(t *testing.T) {

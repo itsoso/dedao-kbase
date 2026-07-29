@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -42,6 +44,11 @@ type startupSecretSet struct {
 	AuditRetry     string
 }
 
+type configCheckResult struct {
+	SchemaVersion int    `json:"schema_version"`
+	Status        string `json:"status"`
+}
+
 func main() {
 	if err := run(); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -52,6 +59,18 @@ func main() {
 }
 
 func run() error {
+	return runCommand(os.Args[1:], os.Stdout)
+}
+
+func runCommand(args []string, stdout io.Writer) error {
+	return runCommandWithServerRunner(args, stdout, runKBaseServer)
+}
+
+func runCommandWithServerRunner(
+	args []string,
+	stdout io.Writer,
+	runServer func(kBaseServerConfig) error,
+) error {
 	flags := flag.NewFlagSet("kbase-server", flag.ContinueOnError)
 	addr := flags.String("addr", envDefault("KBASE_HTTP_ADDR", "127.0.0.1:8719"), "HTTP listen address")
 	root := flags.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")
@@ -60,7 +79,8 @@ func run() error {
 	authToken := flags.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
 	agentPublisherToken := flags.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
 	sourceAgentToken := flags.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
-	if err := flags.Parse(os.Args[1:]); err != nil {
+	checkConfig := flags.Bool("check-config", false, "validate server configuration without starting")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 
@@ -68,7 +88,7 @@ func run() error {
 	sessionConfig.ListenAddr = *addr
 	sessionConfig.BrowserProxySecret = defaultBrowserSessionSecret()
 	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
-	return runKBaseServer(kBaseServerConfig{
+	config := kBaseServerConfig{
 		Addr:                *addr,
 		Root:                *root,
 		ExportPath:          *exportPath,
@@ -79,6 +99,16 @@ func run() error {
 		Session:             sessionConfig,
 		RetrySigningKey:     retrySigningKey,
 		RetrySigningErr:     retrySigningErr,
+	}
+	if !*checkConfig {
+		return runServer(config)
+	}
+	if _, _, err := preflightKBaseServer(config); err != nil {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(configCheckResult{
+		SchemaVersion: 1,
+		Status:        "ok",
 	})
 }
 
@@ -92,12 +122,23 @@ func browserSessionReservedSecrets(secrets startupSecretSet) []string {
 }
 
 func runKBaseServer(config kBaseServerConfig) error {
+	config, server, err := preflightKBaseServer(config)
+	if err != nil {
+		return err
+	}
+
+	return withBrowserSessionRuntime(config.Session, func(browserSessions browserSessionRuntime) error {
+		return serveKBaseServer(config, server, browserSessions)
+	})
+}
+
+func preflightKBaseServer(config kBaseServerConfig) (kBaseServerConfig, *http.Server, error) {
 	if err := validateKBaseTokenSeparation(
 		config.AuthToken,
 		config.SourceAgentToken,
 		config.AgentPublisherToken,
 	); err != nil {
-		return err
+		return kBaseServerConfig{}, nil, err
 	}
 	reservedSecrets := browserSessionReservedSecrets(startupSecretSet{
 		API:            config.AuthToken,
@@ -109,26 +150,25 @@ func runKBaseServer(config kBaseServerConfig) error {
 		config.Session,
 		reservedSecrets...,
 	); err != nil {
-		return err
+		return kBaseServerConfig{}, nil, err
 	}
 	if config.RetrySigningErr == nil {
-		config.RetrySigningErr = validateEvidenceAuditRetryKeySeparation(
+		if err := validateEvidenceAuditRetryKeySeparation(
 			config.RetrySigningKey,
 			config.AuthToken,
 			config.SourceAgentToken,
 			config.AgentPublisherToken,
 			config.Session.AdminToken,
 			config.Session.BrowserProxySecret,
-		)
+		); err != nil {
+			return kBaseServerConfig{}, nil, err
+		}
 	}
 	server, err := newKBaseHTTPServer(config.Addr, nil)
 	if err != nil {
-		return fmt.Errorf("invalid HTTP server configuration: %w", err)
+		return kBaseServerConfig{}, nil, fmt.Errorf("invalid HTTP server configuration: %w", err)
 	}
-
-	return withBrowserSessionRuntime(config.Session, func(browserSessions browserSessionRuntime) error {
-		return serveKBaseServer(config, server, browserSessions)
-	})
+	return config, server, nil
 }
 
 func withBrowserSessionRuntime(
@@ -1005,6 +1045,9 @@ func evidenceAuditRetrySigningKey() ([]byte, error) {
 }
 
 func newKBaseHTTPServer(addr string, handler http.Handler) (*http.Server, error) {
+	if err := validateHTTPServerAddress(addr); err != nil {
+		return nil, err
+	}
 	readHeaderTimeout, err := strictDurationEnvironment(
 		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS", 5, 60,
 	)
@@ -1038,6 +1081,28 @@ func newKBaseHTTPServer(addr string, handler http.Handler) (*http.Server, error)
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}, nil
+}
+
+func validateHTTPServerAddress(addr string) error {
+	listenAddr := strings.TrimSpace(addr)
+	if listenAddr == "" || listenAddr != addr {
+		return errors.New("KBASE_HTTP_ADDR must be an exact host:port listen address")
+	}
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return errors.New("KBASE_HTTP_ADDR must be a valid host:port listen address")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 0 || portNumber > 65535 {
+		return errors.New("KBASE_HTTP_ADDR port must be between 0 and 65535")
+	}
+	if strings.ContainsAny(host, " \t\r\n/") {
+		return errors.New("KBASE_HTTP_ADDR host is invalid")
+	}
+	if strings.Contains(host, ":") && net.ParseIP(host) == nil {
+		return errors.New("KBASE_HTTP_ADDR host is invalid")
+	}
+	return nil
 }
 
 func strictDurationEnvironment(key string, fallback, maximum int) (time.Duration, error) {
