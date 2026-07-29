@@ -2690,6 +2690,13 @@ func (h *kbaseHTTPHandler) authorizeKBaseRequest(
 		return kbaseRequestAuth{}, false
 	}
 	if !valid {
+		if !h.recordBrowserSessionAuthenticationRejected(
+			w,
+			auditAPI,
+			"invalid_cookie",
+		) {
+			return kbaseRequestAuth{}, false
+		}
 		clearBrowserSessionCookie(w)
 		h.writeKBaseRequestSecurityError(
 			w, auditAPI, http.StatusUnauthorized, "audit_unauthorized", "unauthorized",
@@ -2795,6 +2802,28 @@ func (h *kbaseHTTPHandler) writeBrowserSessionAuthenticationError(
 		w, auditAPI, http.StatusServiceUnavailable,
 		"audit_service_unavailable", "service unavailable",
 	)
+}
+
+func (h *kbaseHTTPHandler) recordBrowserSessionAuthenticationRejected(
+	w http.ResponseWriter,
+	auditAPI bool,
+	reasonCode string,
+) bool {
+	if h.browserSessions.Store == nil {
+		return true
+	}
+	if err := h.browserSessions.Store.RecordAuthenticationRejected(
+		"",
+		"",
+		reasonCode,
+	); err != nil {
+		h.writeKBaseRequestSecurityError(
+			w, auditAPI, http.StatusServiceUnavailable,
+			"audit_service_unavailable", "service unavailable",
+		)
+		return false
+	}
+	return true
 }
 
 func browserSessionAuthenticationAuditReason(err error) string {
@@ -4116,6 +4145,13 @@ func (h *kbaseHTTPHandler) authorizeBrowserSessionOnly(
 	renew bool,
 ) (kbaseRequestAuth, bool) {
 	if len(r.Header.Values("Authorization")) != 0 {
+		if !h.recordBrowserSessionAuthenticationRejected(
+			w,
+			false,
+			"unexpected_authorization",
+		) {
+			return kbaseRequestAuth{}, false
+		}
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return kbaseRequestAuth{}, false
 	}
@@ -4130,6 +4166,13 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *h
 		return
 	}
 	if len(r.Header.Values("Authorization")) != 0 {
+		if !h.recordBrowserSessionAuthenticationRejected(
+			w,
+			false,
+			"unexpected_authorization",
+		) {
+			return
+		}
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -4143,6 +4186,13 @@ func (h *kbaseHTTPHandler) handleBrowserSessionLogin(w http.ResponseWriter, r *h
 		maxBrowserSessionProxySecretBytes,
 	)
 	if !ok || !constantTimeStringEqual(proxySecret, h.browserSessionSecret) {
+		if !h.recordBrowserSessionAuthenticationRejected(
+			w,
+			false,
+			"proxy_credential",
+		) {
+			return
+		}
 		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}

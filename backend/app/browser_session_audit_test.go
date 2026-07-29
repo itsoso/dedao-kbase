@@ -201,6 +201,43 @@ func TestKBaseHTTPBrowserSessionAuditClassifiesMigrationAndRejectedCredentials(t
 			rejectedMigrationResponse.Body.String(),
 		)
 	}
+	invalidCookie := newKBaseBrowserCookieRequest(
+		http.MethodGet,
+		"/api/books",
+		string(bytes.Repeat([]byte("x"), maxBrowserSessionCookieBytes+1)),
+		"",
+	)
+	invalidCookieResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidCookieResponse, invalidCookie)
+	if invalidCookieResponse.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"invalid Cookie status = %d body=%s",
+			invalidCookieResponse.Code,
+			invalidCookieResponse.Body.String(),
+		)
+	}
+	rejectedProxyLogin := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	rejectedProxyLogin.Header.Set(browserSessionProxyHeaderName, "invalid-proxy-secret")
+	rejectedProxyLoginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(rejectedProxyLoginResponse, rejectedProxyLogin)
+	if rejectedProxyLoginResponse.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"invalid proxy login status = %d body=%s",
+			rejectedProxyLoginResponse.Code,
+			rejectedProxyLoginResponse.Body.String(),
+		)
+	}
+	unexpectedAuthorization := httptest.NewRequest(http.MethodGet, "/api/browser/session", nil)
+	unexpectedAuthorization.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	unexpectedAuthorizationResponse := httptest.NewRecorder()
+	handler.ServeHTTP(unexpectedAuthorizationResponse, unexpectedAuthorization)
+	if unexpectedAuthorizationResponse.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"unexpected browser Authorization status = %d body=%s",
+			unexpectedAuthorizationResponse.Code,
+			unexpectedAuthorizationResponse.Body.String(),
+		)
+	}
 
 	events, err := store.ListAuditEvents(100)
 	if err != nil {
@@ -214,6 +251,9 @@ func TestKBaseHTTPBrowserSessionAuditClassifiesMigrationAndRejectedCredentials(t
 		BrowserSessionAuditMigration + "|" + events[0].SessionID + "|migration",
 		BrowserSessionAuditAuthenticationRejected + "||missing",
 		BrowserSessionAuditAuthenticationRejected + "||migration_credential",
+		BrowserSessionAuditAuthenticationRejected + "||invalid_cookie",
+		BrowserSessionAuditAuthenticationRejected + "||proxy_credential",
+		BrowserSessionAuditAuthenticationRejected + "||unexpected_authorization",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("HTTP audit events = %#v, want %#v", got, want)
@@ -256,5 +296,60 @@ func TestBrowserSessionCleanupAppliesRetentionToAuditEvents(t *testing.T) {
 	}
 	if len(events) != 0 {
 		t.Fatalf("Cleanup() retained %d expired audit events, want 0", len(events))
+	}
+}
+
+func TestBrowserSessionAuditCoalescesRejectedAuthenticationAndBoundsRows(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 13, 0, 0, 0, time.UTC),
+	}
+	store, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            newBrowserSessionTestDBPath(t),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(905, 8)),
+		TTL:             30 * 24 * time.Hour,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+		AuditMaxEvents:  3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	for index := 0; index < 2; index++ {
+		if err := store.RecordAuthenticationRejected("", "", "invalid_cookie"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err := store.ListAuditEvents(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("duplicate rejected-auth events = %d, want 1", len(events))
+	}
+
+	clock.Advance(time.Minute)
+	if err := store.RecordAuthenticationRejected("", "", "invalid_cookie"); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 3; index++ {
+		if _, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+			DeviceLabel: "Bounded browser " + strconv.Itoa(index),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	events, err = store.ListAuditEvents(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("bounded audit events = %d, want 3", len(events))
+	}
+	if events[0].Type != BrowserSessionAuditLogin ||
+		events[0].DeviceLabel != "Bounded browser 0" {
+		t.Fatalf("oldest retained audit event = %#v, want first bounded login", events[0])
 	}
 }

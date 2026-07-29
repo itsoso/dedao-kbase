@@ -22,18 +22,21 @@ import (
 )
 
 const (
-	defaultBrowserSessionTTL                     = 30 * 24 * time.Hour
-	defaultBrowserSessionRenewalInterval         = 5 * time.Minute
-	defaultBrowserSessionMaxActive               = 10
-	browserSessionCSRFTTL                        = 15 * time.Minute
-	browserSessionCredentialBytes                = 32
-	browserSessionSchemaVersion                  = 3
-	browserSessionTimeLayout                     = "2006-01-02T15:04:05.000000000Z07:00"
-	minBrowserSessionClientIDBytes               = 16
-	maxBrowserSessionClientIDBytes               = 128
-	maxBrowserSessionEpoch                 int64 = 1<<63 - 1
-	maxBrowserSessionAuditEvents                 = 1000
-	maxBrowserSessionAuditDeviceLabelBytes       = 128
+	defaultBrowserSessionTTL                        = 30 * 24 * time.Hour
+	defaultBrowserSessionRenewalInterval            = 5 * time.Minute
+	defaultBrowserSessionMaxActive                  = 10
+	browserSessionCSRFTTL                           = 15 * time.Minute
+	browserSessionCredentialBytes                   = 32
+	browserSessionSchemaVersion                     = 3
+	browserSessionTimeLayout                        = "2006-01-02T15:04:05.000000000Z07:00"
+	minBrowserSessionClientIDBytes                  = 16
+	maxBrowserSessionClientIDBytes                  = 128
+	maxBrowserSessionEpoch                    int64 = 1<<63 - 1
+	maxBrowserSessionAuditEvents                    = 1000
+	maxBrowserSessionAuditDeviceLabelBytes          = 128
+	defaultBrowserSessionAuditMaxEvents             = 10_000
+	maxBrowserSessionAuditMaxEvents                 = 1_000_000
+	browserSessionRejectedAuditCoalesceWindow       = time.Minute
 )
 
 var (
@@ -69,6 +72,7 @@ type BrowserSessionStoreConfig struct {
 	TTL             time.Duration
 	RenewalInterval time.Duration
 	MaxActive       int
+	AuditMaxEvents  int
 }
 
 type BrowserSession struct {
@@ -166,6 +170,7 @@ type BrowserSessionStore struct {
 	ttl             time.Duration
 	renewalInterval time.Duration
 	maxActive       int
+	auditMaxEvents  int
 	db              *sql.DB
 	mu              sync.Mutex
 	closed          bool
@@ -202,6 +207,12 @@ func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionSt
 	}
 	if config.MaxActive <= 0 {
 		config.MaxActive = defaultBrowserSessionMaxActive
+	}
+	if config.AuditMaxEvents <= 0 {
+		config.AuditMaxEvents = defaultBrowserSessionAuditMaxEvents
+	}
+	if config.AuditMaxEvents > maxBrowserSessionAuditMaxEvents {
+		config.AuditMaxEvents = maxBrowserSessionAuditMaxEvents
 	}
 	if err := prepareBrowserSessionDirectory(filepath.Dir(dbPath)); err != nil {
 		return nil, newBrowserSessionCategorizedError(
@@ -253,6 +264,7 @@ func NewBrowserSessionStore(config BrowserSessionStoreConfig) (*BrowserSessionSt
 		ttl:             config.TTL,
 		renewalInterval: config.RenewalInterval,
 		maxActive:       config.MaxActive,
+		auditMaxEvents:  config.AuditMaxEvents,
 		db:              db,
 	}, nil
 }
@@ -523,7 +535,7 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 				)
 			}
 			for _, evictedSession := range evictedSessions {
-				if err := insertBrowserSessionAuditEvent(
+				if err := s.insertBrowserSessionAuditEvent(
 					context.Background(),
 					conn,
 					BrowserSessionAuditEvent{
@@ -561,7 +573,7 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 		if err != nil {
 			return classifyBrowserSessionStoreError("insert browser session", err)
 		}
-		if err := insertBrowserSessionAuditEvent(
+		if err := s.insertBrowserSessionAuditEvent(
 			context.Background(),
 			conn,
 			BrowserSessionAuditEvent{
@@ -694,7 +706,7 @@ func (s *BrowserSessionStore) AuthenticateAndRenew(token string) (BrowserSession
 				renewalCredentialErr = err
 				return nil
 			}
-			if err := insertBrowserSessionAuditEvent(
+			if err := s.insertBrowserSessionAuditEvent(
 				context.Background(),
 				conn,
 				BrowserSessionAuditEvent{
@@ -844,7 +856,7 @@ func (s *BrowserSessionStore) AuthenticateAndRenewExpected(
 			if err := validateBrowserSessionActive(renewed.session, now); err != nil {
 				return err
 			}
-			if err := insertBrowserSessionAuditEvent(
+			if err := s.insertBrowserSessionAuditEvent(
 				context.Background(),
 				conn,
 				BrowserSessionAuditEvent{
@@ -1119,7 +1131,7 @@ func (s *BrowserSessionStore) Revoke(id, reason string) error {
 		if updated != 1 {
 			return fmt.Errorf("revoke browser session: %w", ErrBrowserSessionConflict)
 		}
-		return insertBrowserSessionAuditEvent(
+		return s.insertBrowserSessionAuditEvent(
 			context.Background(),
 			conn,
 			BrowserSessionAuditEvent{
@@ -1180,7 +1192,7 @@ func (s *BrowserSessionStore) RevokeByToken(token, reason string) error {
 		if updated != 1 {
 			return fmt.Errorf("revoke browser session by token: %w", ErrBrowserSessionConflict)
 		}
-		return insertBrowserSessionAuditEvent(
+		return s.insertBrowserSessionAuditEvent(
 			context.Background(),
 			conn,
 			BrowserSessionAuditEvent{
@@ -1270,7 +1282,7 @@ func (s *BrowserSessionStore) FenceClientBySession(
 			return classifyBrowserSessionStoreError("revoke browser client family sessions", err)
 		}
 		if revokedAt == "" {
-			if err := insertBrowserSessionAuditEvent(
+			if err := s.insertBrowserSessionAuditEvent(
 				context.Background(),
 				conn,
 				BrowserSessionAuditEvent{
@@ -1351,7 +1363,7 @@ func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
 			return fmt.Errorf("revoke all browser sessions: %w", ErrBrowserSessionConflict)
 		}
 		for _, session := range activeSessions {
-			if err := insertBrowserSessionAuditEvent(
+			if err := s.insertBrowserSessionAuditEvent(
 				context.Background(),
 				conn,
 				BrowserSessionAuditEvent{
@@ -1508,7 +1520,7 @@ func (s *BrowserSessionStore) RecordAuthenticationRejected(
 			ErrBrowserSessionUnavailable,
 		)
 	}
-	if err := insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
+	if err := s.insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
 		return fmt.Errorf("record rejected browser session authentication: %w", err)
 	}
 	return nil
@@ -1548,7 +1560,7 @@ func (s *BrowserSessionStore) RecordAuthenticationRejectedByToken(
 			err,
 		)
 	}
-	if err := insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
+	if err := s.insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
 		return fmt.Errorf(
 			"record rejected browser session authentication by token: %w",
 			err,
@@ -1613,7 +1625,7 @@ type browserSessionAuditExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
-func insertBrowserSessionAuditEvent(
+func (s *BrowserSessionStore) insertBrowserSessionAuditEvent(
 	ctx context.Context,
 	execer browserSessionAuditExecer,
 	event BrowserSessionAuditEvent,
@@ -1621,18 +1633,56 @@ func insertBrowserSessionAuditEvent(
 	if err := validateBrowserSessionAuditEvent(event); err != nil {
 		return err
 	}
-	if _, err := execer.ExecContext(ctx, `
+	statement := `
 		INSERT INTO browser_session_audit_events (
 			event_type, session_id, device_label, reason_code, created_at
 		) VALUES (?, ?, ?, ?, ?)
-	`,
+	`
+	args := []any{
 		event.Type,
 		event.SessionID,
 		event.DeviceLabel,
 		event.ReasonCode,
 		formatBrowserSessionTime(event.CreatedAt),
-	); err != nil {
+	}
+	if event.Type == BrowserSessionAuditAuthenticationRejected {
+		statement = `
+			INSERT INTO browser_session_audit_events (
+				event_type, session_id, device_label, reason_code, created_at
+			)
+			SELECT ?, ?, ?, ?, ?
+			WHERE NOT EXISTS (
+				SELECT 1
+				FROM browser_session_audit_events
+				WHERE event_type = ?
+					AND session_id = ?
+					AND reason_code = ?
+					AND created_at > ?
+			)
+		`
+		args = append(
+			args,
+			event.Type,
+			event.SessionID,
+			event.ReasonCode,
+			formatBrowserSessionTime(
+				event.CreatedAt.Add(-browserSessionRejectedAuditCoalesceWindow),
+			),
+		)
+	}
+	if _, err := execer.ExecContext(ctx, statement, args...); err != nil {
 		return classifyBrowserSessionStoreError("insert browser session audit event", err)
+	}
+	if _, err := execer.ExecContext(ctx, `
+		DELETE FROM browser_session_audit_events
+		WHERE sequence <= COALESCE((
+			SELECT sequence
+			FROM browser_session_audit_events
+			ORDER BY sequence DESC
+			LIMIT 1 OFFSET ?
+		), 0)
+	`, s.auditMaxEvents); err != nil {
+		return classifyBrowserSessionStoreError("bound browser session audit events", err)
 	}
 	return nil
 }
