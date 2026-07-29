@@ -107,8 +107,8 @@ func TestBrowserSessionStoreSchema(t *testing.T) {
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 2 {
-		t.Fatalf("browser session schema version = %d, want 2", schemaVersion)
+	if schemaVersion != 3 {
+		t.Fatalf("browser session schema version = %d, want 3", schemaVersion)
 	}
 	revokedAtColumn := columnDetails["revoked_at"]
 	if revokedAtColumn.dataType != "TEXT" ||
@@ -432,8 +432,8 @@ func TestBrowserSessionStoreMigratesLegacyV0(t *testing.T) {
 	if err := store.db.QueryRow(`PRAGMA user_version`).Scan(&schemaVersion); err != nil {
 		t.Fatal(err)
 	}
-	if schemaVersion != 2 {
-		t.Fatalf("migrated schema version = %d, want 2", schemaVersion)
+	if schemaVersion != 3 {
+		t.Fatalf("migrated schema version = %d, want 3", schemaVersion)
 	}
 
 	for _, seed := range seeds {
@@ -747,7 +747,7 @@ func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 			t.Fatal(err)
 		}
 		if err := db.Close(); err != nil {
@@ -758,7 +758,7 @@ func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 		if store != nil {
 			store.Close()
 		}
-		if err == nil || !strings.Contains(err.Error(), "unsupported browser session database version 3") {
+		if err == nil || !strings.Contains(err.Error(), "unsupported browser session database version 4") {
 			t.Fatalf("NewBrowserSessionStore() error = %v, want future-version rejection", err)
 		}
 	})
@@ -859,7 +859,7 @@ func TestBrowserSessionStoreRejectsIncompatibleVersions(t *testing.T) {
 		if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 			t.Fatal(err)
 		}
-		if version != 2 {
+		if version != 3 {
 			t.Fatalf("failed v2 validation changed schema version to %d", version)
 		}
 	})
@@ -1090,7 +1090,7 @@ func TestBrowserSessionStoreRejectsV2OrphansAndInvalidEpochDataWithoutMutation(t
 			if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 				t.Fatal(err)
 			}
-			if version != 2 {
+			if version != 3 {
 				t.Fatalf("failed integrity validation changed schema version to %d", version)
 			}
 		})

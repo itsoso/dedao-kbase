@@ -2707,7 +2707,7 @@ func (h *kbaseHTTPHandler) authorizeKBaseRequest(
 	if !renew {
 		session, err := h.browserSessions.Store.Authenticate(token)
 		if err != nil {
-			h.writeBrowserSessionAuthenticationError(w, auditAPI, err)
+			h.writeBrowserSessionAuthenticationError(w, auditAPI, token, err)
 			return kbaseRequestAuth{}, false
 		}
 		return kbaseRequestAuth{
@@ -2721,7 +2721,7 @@ func (h *kbaseHTTPHandler) authorizeKBaseRequest(
 
 	sessionAuth, err := h.browserSessions.Store.AuthenticateAndRenew(token)
 	if err != nil {
-		h.writeBrowserSessionAuthenticationError(w, auditAPI, err)
+		h.writeBrowserSessionAuthenticationError(w, auditAPI, token, err)
 		return kbaseRequestAuth{}, false
 	}
 	if sessionAuth.SetCookie {
@@ -2749,7 +2749,7 @@ func (h *kbaseHTTPHandler) renewBrowserSessionAfterCSRF(
 ) (kbaseRequestAuth, bool) {
 	sessionAuth, err := h.browserSessions.Store.AuthenticateAndRenew(auth.sessionToken)
 	if err != nil {
-		h.writeBrowserSessionAuthenticationError(w, auditAPI, err)
+		h.writeBrowserSessionAuthenticationError(w, auditAPI, auth.sessionToken, err)
 		return kbaseRequestAuth{}, false
 	}
 	if sessionAuth.SetCookie {
@@ -2770,9 +2770,20 @@ func (h *kbaseHTTPHandler) renewBrowserSessionAfterCSRF(
 func (h *kbaseHTTPHandler) writeBrowserSessionAuthenticationError(
 	w http.ResponseWriter,
 	auditAPI bool,
+	token string,
 	err error,
 ) {
 	if isBrowserSessionCredentialError(err) {
+		if auditErr := h.browserSessions.Store.RecordAuthenticationRejectedByToken(
+			token,
+			browserSessionAuthenticationAuditReason(err),
+		); auditErr != nil {
+			h.writeKBaseRequestSecurityError(
+				w, auditAPI, http.StatusServiceUnavailable,
+				"audit_service_unavailable", "service unavailable",
+			)
+			return
+		}
 		w.Header().Del("Set-Cookie")
 		clearBrowserSessionCookie(w)
 		h.writeKBaseRequestSecurityError(
@@ -2784,6 +2795,19 @@ func (h *kbaseHTTPHandler) writeBrowserSessionAuthenticationError(
 		w, auditAPI, http.StatusServiceUnavailable,
 		"audit_service_unavailable", "service unavailable",
 	)
+}
+
+func browserSessionAuthenticationAuditReason(err error) string {
+	switch {
+	case errors.Is(err, ErrBrowserSessionExpired):
+		return "expired"
+	case errors.Is(err, ErrBrowserSessionRevoked):
+		return "revoked"
+	case errors.Is(err, ErrBrowserSessionClientMismatch):
+		return "client_mismatch"
+	default:
+		return "missing"
+	}
 }
 
 func (h *kbaseHTTPHandler) authorizeBrowserSessionCSRF(
@@ -4178,6 +4202,7 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 	}
 
 	sessionToken, cookiePresent, cookieValid := browserSessionCookieToken(r)
+	var cookieCredentialErr error
 	if cookieValid {
 		auth, err := h.browserSessions.Store.AuthenticateAndRenewExpected(
 			sessionToken,
@@ -4204,6 +4229,7 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 			writeBrowserSessionStoreError(w, err)
 			return
 		}
+		cookieCredentialErr = err
 	}
 
 	if validBrowserSessionMigrationBearer(r, h.authToken) {
@@ -4213,6 +4239,7 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 			ExpectedEpoch: expectedEpoch,
 			DeviceLabel:   browserSessionDeviceLabel(userAgent),
 			UserAgent:     userAgent,
+			AuditType:     BrowserSessionAuditMigration,
 		})
 		if err != nil {
 			writeBrowserSessionStoreError(w, err)
@@ -4238,6 +4265,30 @@ func (h *kbaseHTTPHandler) handleBrowserSessionMigration(w http.ResponseWriter, 
 			ClientID:     clientID,
 			CurrentEpoch: family.Epoch,
 		})
+		return
+	}
+	var auditErr error
+	switch {
+	case cookieCredentialErr != nil:
+		auditErr = h.browserSessions.Store.RecordAuthenticationRejectedByToken(
+			sessionToken,
+			browserSessionAuthenticationAuditReason(cookieCredentialErr),
+		)
+	case cookiePresent:
+		auditErr = h.browserSessions.Store.RecordAuthenticationRejected(
+			"",
+			"",
+			"invalid_cookie",
+		)
+	default:
+		auditErr = h.browserSessions.Store.RecordAuthenticationRejected(
+			"",
+			"",
+			"migration_credential",
+		)
+	}
+	if auditErr != nil {
+		writeBrowserSessionStoreError(w, auditErr)
 		return
 	}
 	if cookiePresent {

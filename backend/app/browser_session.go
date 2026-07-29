@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -21,16 +22,18 @@ import (
 )
 
 const (
-	defaultBrowserSessionTTL                   = 30 * 24 * time.Hour
-	defaultBrowserSessionRenewalInterval       = 5 * time.Minute
-	defaultBrowserSessionMaxActive             = 10
-	browserSessionCSRFTTL                      = 15 * time.Minute
-	browserSessionCredentialBytes              = 32
-	browserSessionSchemaVersion                = 2
-	browserSessionTimeLayout                   = "2006-01-02T15:04:05.000000000Z07:00"
-	minBrowserSessionClientIDBytes             = 16
-	maxBrowserSessionClientIDBytes             = 128
-	maxBrowserSessionEpoch               int64 = 1<<63 - 1
+	defaultBrowserSessionTTL                     = 30 * 24 * time.Hour
+	defaultBrowserSessionRenewalInterval         = 5 * time.Minute
+	defaultBrowserSessionMaxActive               = 10
+	browserSessionCSRFTTL                        = 15 * time.Minute
+	browserSessionCredentialBytes                = 32
+	browserSessionSchemaVersion                  = 3
+	browserSessionTimeLayout                     = "2006-01-02T15:04:05.000000000Z07:00"
+	minBrowserSessionClientIDBytes               = 16
+	maxBrowserSessionClientIDBytes               = 128
+	maxBrowserSessionEpoch                 int64 = 1<<63 - 1
+	maxBrowserSessionAuditEvents                 = 1000
+	maxBrowserSessionAuditDeviceLabelBytes       = 128
 )
 
 var (
@@ -46,6 +49,17 @@ var (
 	ErrBrowserSessionClientUninitialized = errors.New("browser session client is not initialized")
 	ErrBrowserSessionClientMismatch      = errors.New("browser session client mismatch")
 	ErrBrowserSessionEpochExhausted      = errors.New("browser session client epoch exhausted")
+	browserSessionAuditReasonPattern     = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+)
+
+const (
+	BrowserSessionAuditLogin                  = "login"
+	BrowserSessionAuditMigration              = "migration"
+	BrowserSessionAuditRenewal                = "renewal"
+	BrowserSessionAuditLogout                 = "logout"
+	BrowserSessionAuditAdminRevocation        = "admin_revocation"
+	BrowserSessionAuditLimitEviction          = "session_limit_eviction"
+	BrowserSessionAuditAuthenticationRejected = "authentication_rejected"
 )
 
 type BrowserSessionStoreConfig struct {
@@ -87,6 +101,16 @@ type BrowserSessionCreate struct {
 	ExpectedEpoch int64
 	DeviceLabel   string
 	UserAgent     string
+	AuditType     string
+}
+
+type BrowserSessionAuditEvent struct {
+	Sequence    int64     `json:"sequence"`
+	Type        string    `json:"type"`
+	SessionID   string    `json:"session_id,omitempty"`
+	DeviceLabel string    `json:"device_label,omitempty"`
+	ReasonCode  string    `json:"reason_code"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type BrowserClientFamily struct {
@@ -362,6 +386,16 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 			ErrBrowserSessionInvalidArgument,
 		)
 	}
+	if input.AuditType == "" {
+		input.AuditType = BrowserSessionAuditLogin
+	}
+	if input.AuditType != BrowserSessionAuditLogin &&
+		input.AuditType != BrowserSessionAuditMigration {
+		return BrowserSessionCredentials{}, fmt.Errorf(
+			"create browser session: invalid audit type: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
 
 	token, err := s.randomCredential()
 	if err != nil {
@@ -447,6 +481,15 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 		}
 		evictCount := activeCount - s.maxActive + 1
 		if evictCount > 0 {
+			evictedSessions, err := readBrowserSessionsForEviction(
+				context.Background(),
+				conn,
+				now,
+				evictCount,
+			)
+			if err != nil {
+				return err
+			}
 			result, err := conn.ExecContext(context.Background(), `
 				UPDATE browser_sessions
 				SET revoked_at = ?, revoke_reason = ?
@@ -479,6 +522,21 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 					ErrBrowserSessionConflict,
 				)
 			}
+			for _, evictedSession := range evictedSessions {
+				if err := insertBrowserSessionAuditEvent(
+					context.Background(),
+					conn,
+					BrowserSessionAuditEvent{
+						Type:        BrowserSessionAuditLimitEviction,
+						SessionID:   evictedSession.ID,
+						DeviceLabel: evictedSession.DeviceLabel,
+						ReasonCode:  "session_limit",
+						CreatedAt:   now,
+					},
+				); err != nil {
+					return err
+				}
+			}
 		}
 
 		_, err := conn.ExecContext(context.Background(), `
@@ -502,6 +560,19 @@ func (s *BrowserSessionStore) Create(input BrowserSessionCreate) (BrowserSession
 		)
 		if err != nil {
 			return classifyBrowserSessionStoreError("insert browser session", err)
+		}
+		if err := insertBrowserSessionAuditEvent(
+			context.Background(),
+			conn,
+			BrowserSessionAuditEvent{
+				Type:        input.AuditType,
+				SessionID:   session.ID,
+				DeviceLabel: session.DeviceLabel,
+				ReasonCode:  input.AuditType,
+				CreatedAt:   now,
+			},
+		); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -622,6 +693,19 @@ func (s *BrowserSessionStore) AuthenticateAndRenew(token string) (BrowserSession
 			if err := validateBrowserSessionActive(renewed.session, now); err != nil {
 				renewalCredentialErr = err
 				return nil
+			}
+			if err := insertBrowserSessionAuditEvent(
+				context.Background(),
+				conn,
+				BrowserSessionAuditEvent{
+					Type:        BrowserSessionAuditRenewal,
+					SessionID:   renewed.session.ID,
+					DeviceLabel: renewed.session.DeviceLabel,
+					ReasonCode:  "sliding_renewal",
+					CreatedAt:   now,
+				},
+			); err != nil {
+				return err
 			}
 			auth.Renewed = true
 			auth.SetCookie = true
@@ -758,6 +842,19 @@ func (s *BrowserSessionStore) AuthenticateAndRenewExpected(
 				return err
 			}
 			if err := validateBrowserSessionActive(renewed.session, now); err != nil {
+				return err
+			}
+			if err := insertBrowserSessionAuditEvent(
+				context.Background(),
+				conn,
+				BrowserSessionAuditEvent{
+					Type:        BrowserSessionAuditRenewal,
+					SessionID:   renewed.session.ID,
+					DeviceLabel: renewed.session.DeviceLabel,
+					ReasonCode:  "sliding_renewal",
+					CreatedAt:   now,
+				},
+			); err != nil {
 				return err
 			}
 			auth.Renewed = true
@@ -995,13 +1092,47 @@ func (s *BrowserSessionStore) Revoke(id, reason string) error {
 			ErrBrowserSessionUnavailable,
 		)
 	}
-	_, err := s.db.Exec(`
-		UPDATE browser_sessions
-		SET revoked_at = ?, revoke_reason = ?
-		WHERE id = ? AND revoked_at = ''
-	`, formatBrowserSessionTime(s.now().UTC()), strings.TrimSpace(reason), id)
+	now := s.now().UTC()
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		record, err := readBrowserSessionByID(context.Background(), conn, id)
+		if errors.Is(err, ErrBrowserSessionMissing) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if record.session.RevokedAt != nil {
+			return nil
+		}
+		result, err := conn.ExecContext(context.Background(), `
+			UPDATE browser_sessions
+			SET revoked_at = ?, revoke_reason = ?
+			WHERE id = ? AND revoked_at = ''
+		`, formatBrowserSessionTime(now), strings.TrimSpace(reason), id)
+		if err != nil {
+			return classifyBrowserSessionStoreError("revoke browser session", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return classifyBrowserSessionStoreError("read revoked browser session count", err)
+		}
+		if updated != 1 {
+			return fmt.Errorf("revoke browser session: %w", ErrBrowserSessionConflict)
+		}
+		return insertBrowserSessionAuditEvent(
+			context.Background(),
+			conn,
+			BrowserSessionAuditEvent{
+				Type:        BrowserSessionAuditAdminRevocation,
+				SessionID:   record.session.ID,
+				DeviceLabel: record.session.DeviceLabel,
+				ReasonCode:  normalizedBrowserSessionAuditReason(reason, "admin"),
+				CreatedAt:   now,
+			},
+		)
+	})
 	if err != nil {
-		return classifyBrowserSessionStoreError("revoke browser session", err)
+		return fmt.Errorf("revoke browser session: %w", err)
 	}
 	return nil
 }
@@ -1022,13 +1153,47 @@ func (s *BrowserSessionStore) RevokeByToken(token, reason string) error {
 		)
 	}
 	tokenHash := sha256.Sum256([]byte(token))
-	_, err := s.db.Exec(`
-		UPDATE browser_sessions
-		SET revoked_at = ?, revoke_reason = ?
-		WHERE token_hash = ? AND revoked_at = ''
-	`, formatBrowserSessionTime(s.now().UTC()), strings.TrimSpace(reason), tokenHash[:])
+	now := s.now().UTC()
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		record, err := readBrowserSessionByToken(context.Background(), conn, tokenHash[:])
+		if errors.Is(err, ErrBrowserSessionMissing) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if record.session.RevokedAt != nil {
+			return nil
+		}
+		result, err := conn.ExecContext(context.Background(), `
+			UPDATE browser_sessions
+			SET revoked_at = ?, revoke_reason = ?
+			WHERE token_hash = ? AND revoked_at = ''
+		`, formatBrowserSessionTime(now), strings.TrimSpace(reason), tokenHash[:])
+		if err != nil {
+			return classifyBrowserSessionStoreError("revoke browser session by token", err)
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return classifyBrowserSessionStoreError("read revoked browser session by token count", err)
+		}
+		if updated != 1 {
+			return fmt.Errorf("revoke browser session by token: %w", ErrBrowserSessionConflict)
+		}
+		return insertBrowserSessionAuditEvent(
+			context.Background(),
+			conn,
+			BrowserSessionAuditEvent{
+				Type:        BrowserSessionAuditLogout,
+				SessionID:   record.session.ID,
+				DeviceLabel: record.session.DeviceLabel,
+				ReasonCode:  normalizedBrowserSessionAuditReason(reason, "logout"),
+				CreatedAt:   now,
+			},
+		)
+	})
 	if err != nil {
-		return classifyBrowserSessionStoreError("revoke browser session by token", err)
+		return fmt.Errorf("revoke browser session by token: %w", err)
 	}
 	return nil
 }
@@ -1052,15 +1217,25 @@ func (s *BrowserSessionStore) FenceClientBySession(
 		)
 	}
 
-	now := formatBrowserSessionTime(s.now().UTC())
+	eventTime := s.now().UTC()
+	now := formatBrowserSessionTime(eventTime)
 	family := BrowserClientFamily{}
 	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
-		var issuedEpoch int64
+		var (
+			issuedEpoch int64
+			deviceLabel string
+			revokedAt   string
+		)
 		if err := conn.QueryRowContext(context.Background(), `
-			SELECT client_id, issued_epoch
+			SELECT client_id, issued_epoch, device_label, revoked_at
 			FROM browser_sessions
 			WHERE id = ?
-		`, id).Scan(&family.ClientID, &issuedEpoch); errors.Is(err, sql.ErrNoRows) {
+		`, id).Scan(
+			&family.ClientID,
+			&issuedEpoch,
+			&deviceLabel,
+			&revokedAt,
+		); errors.Is(err, sql.ErrNoRows) {
 			return ErrBrowserSessionMissing
 		} else if err != nil {
 			return classifyBrowserSessionStoreError("read browser session family", err)
@@ -1094,6 +1269,21 @@ func (s *BrowserSessionStore) FenceClientBySession(
 		`, now, strings.TrimSpace(reason), family.ClientID, family.Epoch); err != nil {
 			return classifyBrowserSessionStoreError("revoke browser client family sessions", err)
 		}
+		if revokedAt == "" {
+			if err := insertBrowserSessionAuditEvent(
+				context.Background(),
+				conn,
+				BrowserSessionAuditEvent{
+					Type:        BrowserSessionAuditLogout,
+					SessionID:   id,
+					DeviceLabel: deviceLabel,
+					ReasonCode:  normalizedBrowserSessionAuditReason(reason, "logout"),
+					CreatedAt:   eventTime,
+				},
+			); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -1118,7 +1308,8 @@ func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
 		)
 	}
 	var updated int64
-	now := formatBrowserSessionTime(s.now().UTC())
+	eventTime := s.now().UTC()
+	now := formatBrowserSessionTime(eventTime)
 	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
 		var exhausted int
 		if err := conn.QueryRowContext(context.Background(), `
@@ -1140,6 +1331,10 @@ func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
 		`, now); err != nil {
 			return classifyBrowserSessionStoreError("advance all browser client epochs", err)
 		}
+		activeSessions, err := readActiveBrowserSessions(context.Background(), conn)
+		if err != nil {
+			return err
+		}
 		result, err := conn.ExecContext(context.Background(), `
 			UPDATE browser_sessions
 			SET revoked_at = ?, revoke_reason = ?
@@ -1151,6 +1346,24 @@ func (s *BrowserSessionStore) RevokeAll(reason string) (int64, error) {
 		updated, err = result.RowsAffected()
 		if err != nil {
 			return classifyBrowserSessionStoreError("read revoked browser session count", err)
+		}
+		if updated != int64(len(activeSessions)) {
+			return fmt.Errorf("revoke all browser sessions: %w", ErrBrowserSessionConflict)
+		}
+		for _, session := range activeSessions {
+			if err := insertBrowserSessionAuditEvent(
+				context.Background(),
+				conn,
+				BrowserSessionAuditEvent{
+					Type:        BrowserSessionAuditAdminRevocation,
+					SessionID:   session.ID,
+					DeviceLabel: session.DeviceLabel,
+					ReasonCode:  normalizedBrowserSessionAuditReason(reason, "admin"),
+					CreatedAt:   eventTime,
+				},
+			); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -1201,6 +1414,149 @@ func (s *BrowserSessionStore) List() ([]BrowserSession, error) {
 	return sessions, nil
 }
 
+func (s *BrowserSessionStore) ListAuditEvents(limit int) ([]BrowserSessionAuditEvent, error) {
+	if limit <= 0 || limit > maxBrowserSessionAuditEvents {
+		return nil, fmt.Errorf(
+			"list browser session audit events: limit must be between 1 and %d: %w",
+			maxBrowserSessionAuditEvents,
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	if s == nil {
+		return nil, fmt.Errorf(
+			"list browser session audit events: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return nil, fmt.Errorf(
+			"list browser session audit events: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+
+	rows, err := s.db.Query(`
+		SELECT sequence, event_type, session_id, device_label, reason_code, created_at
+		FROM browser_session_audit_events
+		ORDER BY sequence ASC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, classifyBrowserSessionStoreError("list browser session audit events", err)
+	}
+	defer rows.Close()
+
+	events := make([]BrowserSessionAuditEvent, 0)
+	for rows.Next() {
+		var (
+			event     BrowserSessionAuditEvent
+			createdAt string
+		)
+		if err := rows.Scan(
+			&event.Sequence,
+			&event.Type,
+			&event.SessionID,
+			&event.DeviceLabel,
+			&event.ReasonCode,
+			&createdAt,
+		); err != nil {
+			return nil, classifyBrowserSessionStoreError("scan browser session audit event", err)
+		}
+		event.CreatedAt, err = parseBrowserSessionTime(createdAt)
+		if err != nil {
+			return nil, classifyBrowserSessionStoreError(
+				"parse browser session audit event time",
+				err,
+			)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyBrowserSessionStoreError("iterate browser session audit events", err)
+	}
+	return events, nil
+}
+
+func (s *BrowserSessionStore) RecordAuthenticationRejected(
+	sessionID string,
+	deviceLabel string,
+	reasonCode string,
+) error {
+	if s == nil {
+		return fmt.Errorf(
+			"record rejected browser session authentication: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	event := BrowserSessionAuditEvent{
+		Type:        BrowserSessionAuditAuthenticationRejected,
+		SessionID:   strings.TrimSpace(sessionID),
+		DeviceLabel: strings.TrimSpace(deviceLabel),
+		ReasonCode:  strings.TrimSpace(reasonCode),
+		CreatedAt:   s.now().UTC(),
+	}
+	if err := validateBrowserSessionAuditEvent(event); err != nil {
+		return fmt.Errorf("record rejected browser session authentication: %w", err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return fmt.Errorf(
+			"record rejected browser session authentication: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	if err := insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
+		return fmt.Errorf("record rejected browser session authentication: %w", err)
+	}
+	return nil
+}
+
+func (s *BrowserSessionStore) RecordAuthenticationRejectedByToken(
+	token string,
+	reasonCode string,
+) error {
+	if s == nil {
+		return fmt.Errorf(
+			"record rejected browser session authentication by token: browser session store is nil: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.db == nil {
+		return fmt.Errorf(
+			"record rejected browser session authentication by token: browser session store is closed: %w",
+			ErrBrowserSessionUnavailable,
+		)
+	}
+	event := BrowserSessionAuditEvent{
+		Type:       BrowserSessionAuditAuthenticationRejected,
+		ReasonCode: strings.TrimSpace(reasonCode),
+		CreatedAt:  s.now().UTC(),
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+	record, err := readBrowserSessionByToken(context.Background(), s.db, tokenHash[:])
+	if err == nil {
+		event.SessionID = record.session.ID
+		event.DeviceLabel = record.session.DeviceLabel
+	} else if !errors.Is(err, ErrBrowserSessionMissing) {
+		return fmt.Errorf(
+			"record rejected browser session authentication by token: %w",
+			err,
+		)
+	}
+	if err := insertBrowserSessionAuditEvent(context.Background(), s.db, event); err != nil {
+		return fmt.Errorf(
+			"record rejected browser session authentication by token: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 func (s *BrowserSessionStore) Cleanup(retainAfter time.Duration) (int64, error) {
 	if retainAfter < 0 {
 		return 0, fmt.Errorf(
@@ -1223,18 +1579,189 @@ func (s *BrowserSessionStore) Cleanup(retainAfter time.Duration) (int64, error) 
 		)
 	}
 	boundary := formatBrowserSessionTime(s.now().UTC().Add(-retainAfter))
-	result, err := s.db.Exec(`
-		DELETE FROM browser_sessions
-		WHERE (revoked_at <> '' AND revoked_at < ?) OR expires_at < ?
-	`, boundary, boundary)
+	var deleted int64
+	err := s.withImmediateTransaction(context.Background(), func(conn *sql.Conn) error {
+		result, err := conn.ExecContext(context.Background(), `
+			DELETE FROM browser_sessions
+			WHERE (revoked_at <> '' AND revoked_at < ?) OR expires_at < ?
+		`, boundary, boundary)
+		if err != nil {
+			return classifyBrowserSessionStoreError("cleanup browser sessions", err)
+		}
+		deleted, err = result.RowsAffected()
+		if err != nil {
+			return classifyBrowserSessionStoreError("read cleaned browser session count", err)
+		}
+		if _, err := conn.ExecContext(context.Background(), `
+			DELETE FROM browser_session_audit_events
+			WHERE created_at < ?
+		`, boundary); err != nil {
+			return classifyBrowserSessionStoreError(
+				"cleanup browser session audit events",
+				err,
+			)
+		}
+		return nil
+	})
 	if err != nil {
-		return 0, classifyBrowserSessionStoreError("cleanup browser sessions", err)
-	}
-	deleted, err := result.RowsAffected()
-	if err != nil {
-		return 0, classifyBrowserSessionStoreError("read cleaned browser session count", err)
+		return 0, fmt.Errorf("cleanup browser sessions: %w", err)
 	}
 	return deleted, nil
+}
+
+type browserSessionAuditExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertBrowserSessionAuditEvent(
+	ctx context.Context,
+	execer browserSessionAuditExecer,
+	event BrowserSessionAuditEvent,
+) error {
+	if err := validateBrowserSessionAuditEvent(event); err != nil {
+		return err
+	}
+	if _, err := execer.ExecContext(ctx, `
+		INSERT INTO browser_session_audit_events (
+			event_type, session_id, device_label, reason_code, created_at
+		) VALUES (?, ?, ?, ?, ?)
+	`,
+		event.Type,
+		event.SessionID,
+		event.DeviceLabel,
+		event.ReasonCode,
+		formatBrowserSessionTime(event.CreatedAt),
+	); err != nil {
+		return classifyBrowserSessionStoreError("insert browser session audit event", err)
+	}
+	return nil
+}
+
+func validateBrowserSessionAuditEvent(event BrowserSessionAuditEvent) error {
+	switch event.Type {
+	case BrowserSessionAuditLogin,
+		BrowserSessionAuditMigration,
+		BrowserSessionAuditRenewal,
+		BrowserSessionAuditLogout,
+		BrowserSessionAuditAdminRevocation,
+		BrowserSessionAuditLimitEviction,
+		BrowserSessionAuditAuthenticationRejected:
+	default:
+		return fmt.Errorf(
+			"invalid browser session audit event type: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	if event.SessionID != "" &&
+		(!strings.HasPrefix(event.SessionID, "session_") || len(event.SessionID) > 136) {
+		return fmt.Errorf(
+			"invalid browser session audit event session id: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	if len(event.DeviceLabel) > maxBrowserSessionAuditDeviceLabelBytes {
+		return fmt.Errorf(
+			"browser session audit device label is too long: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	if !browserSessionAuditReasonPattern.MatchString(event.ReasonCode) {
+		return fmt.Errorf(
+			"invalid browser session audit reason code: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	if event.CreatedAt.IsZero() {
+		return fmt.Errorf(
+			"browser session audit event time is required: %w",
+			ErrBrowserSessionInvalidArgument,
+		)
+	}
+	return nil
+}
+
+func normalizedBrowserSessionAuditReason(reason string, fallback string) string {
+	reason = strings.TrimSpace(reason)
+	if browserSessionAuditReasonPattern.MatchString(reason) {
+		return reason
+	}
+	return fallback
+}
+
+func readBrowserSessionsForEviction(
+	ctx context.Context,
+	conn *sql.Conn,
+	now time.Time,
+	limit int,
+) ([]BrowserSession, error) {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT id, device_label
+		FROM browser_sessions
+		WHERE revoked_at = '' AND expires_at > ?
+		ORDER BY last_active_at ASC, created_at ASC, id ASC
+		LIMIT ?
+	`, formatBrowserSessionTime(now), limit)
+	if err != nil {
+		return nil, classifyBrowserSessionStoreError(
+			"read browser sessions selected for active limit eviction",
+			err,
+		)
+	}
+	defer rows.Close()
+	sessions := make([]BrowserSession, 0, limit)
+	for rows.Next() {
+		var session BrowserSession
+		if err := rows.Scan(&session.ID, &session.DeviceLabel); err != nil {
+			return nil, classifyBrowserSessionStoreError(
+				"scan browser session selected for active limit eviction",
+				err,
+			)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyBrowserSessionStoreError(
+			"iterate browser sessions selected for active limit eviction",
+			err,
+		)
+	}
+	if len(sessions) != limit {
+		return nil, fmt.Errorf(
+			"read browser sessions selected for active limit eviction: got %d want %d: %w",
+			len(sessions),
+			limit,
+			ErrBrowserSessionConflict,
+		)
+	}
+	return sessions, nil
+}
+
+func readActiveBrowserSessions(
+	ctx context.Context,
+	conn *sql.Conn,
+) ([]BrowserSession, error) {
+	rows, err := conn.QueryContext(ctx, `
+		SELECT id, device_label
+		FROM browser_sessions
+		WHERE revoked_at = ''
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return nil, classifyBrowserSessionStoreError("read active browser sessions", err)
+	}
+	defer rows.Close()
+	sessions := make([]BrowserSession, 0)
+	for rows.Next() {
+		var session BrowserSession
+		if err := rows.Scan(&session.ID, &session.DeviceLabel); err != nil {
+			return nil, classifyBrowserSessionStoreError("scan active browser session", err)
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifyBrowserSessionStoreError("iterate active browser sessions", err)
+	}
+	return sessions, nil
 }
 
 func (s *BrowserSessionStore) randomCredential() (string, error) {
@@ -1634,11 +2161,17 @@ func migrateBrowserSessionDB(db *sql.DB) error {
 				return fmt.Errorf("migrate browser session schema version 1 to 2: %w", err)
 			}
 		}
-		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
-			return fmt.Errorf("set browser session schema version 2: %w", err)
-		}
 		if err := validateBrowserSessionSchemaV2(tx); err != nil {
 			return fmt.Errorf("validate browser session schema version 2: %w", err)
+		}
+		if err := migrateBrowserSessionV2ToV3(tx); err != nil {
+			return fmt.Errorf("migrate browser session schema version 2 to 3: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+			return fmt.Errorf("set browser session schema version 3: %w", err)
+		}
+		if err := validateBrowserSessionSchemaV3(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 3: %w", err)
 		}
 	case 1:
 		if err := validateBrowserSessionSchemaV1(tx); err != nil {
@@ -1650,18 +2183,43 @@ func migrateBrowserSessionDB(db *sql.DB) error {
 		if err := migrateBrowserSessionV1ToV2(tx); err != nil {
 			return fmt.Errorf("migrate browser session schema version 1 to 2: %w", err)
 		}
-		if _, err := tx.Exec(`PRAGMA user_version = 2`); err != nil {
-			return fmt.Errorf("set browser session schema version 2: %w", err)
-		}
 		if err := validateBrowserSessionSchemaV2(tx); err != nil {
 			return fmt.Errorf("validate browser session schema version 2: %w", err)
 		}
-	case browserSessionSchemaVersion:
+		if err := migrateBrowserSessionV2ToV3(tx); err != nil {
+			return fmt.Errorf("migrate browser session schema version 2 to 3: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+			return fmt.Errorf("set browser session schema version 3: %w", err)
+		}
+		if err := validateBrowserSessionSchemaV3(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 3: %w", err)
+		}
+	case 2:
 		if err := validateBrowserSessionSchemaV2(tx); err != nil {
 			return fmt.Errorf("validate browser session schema version 2: %w", err)
 		}
 		if err := normalizeBrowserSessionTimesV2(tx); err != nil {
 			return fmt.Errorf("normalize browser session schema version 2 times: %w", err)
+		}
+		if err := migrateBrowserSessionV2ToV3(tx); err != nil {
+			return fmt.Errorf("migrate browser session schema version 2 to 3: %w", err)
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 3`); err != nil {
+			return fmt.Errorf("set browser session schema version 3: %w", err)
+		}
+		if err := validateBrowserSessionSchemaV3(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 3: %w", err)
+		}
+	case browserSessionSchemaVersion:
+		if err := validateBrowserSessionSchemaV3(tx); err != nil {
+			return fmt.Errorf("validate browser session schema version 3: %w", err)
+		}
+		if err := normalizeBrowserSessionTimesV2(tx); err != nil {
+			return fmt.Errorf("normalize browser session schema version 3 session times: %w", err)
+		}
+		if err := normalizeBrowserSessionAuditTimesV3(tx); err != nil {
+			return fmt.Errorf("normalize browser session schema version 3 audit times: %w", err)
 		}
 	default:
 		return fmt.Errorf("unsupported browser session database version %d", version)
@@ -1749,6 +2307,28 @@ func createBrowserSessionTableV2(tx *sql.Tx, tableName string) error {
 		)`, tableName)
 	if _, err := tx.Exec(statement); err != nil {
 		return fmt.Errorf("create %s table: %w", tableName, err)
+	}
+	return nil
+}
+
+func migrateBrowserSessionV2ToV3(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		CREATE TABLE browser_session_audit_events (
+			sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+			event_type TEXT NOT NULL,
+			session_id TEXT NOT NULL DEFAULT '',
+			device_label TEXT NOT NULL DEFAULT '',
+			reason_code TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("create browser_session_audit_events table: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE INDEX idx_browser_session_audit_events_created
+			ON browser_session_audit_events(created_at, sequence)
+	`); err != nil {
+		return fmt.Errorf("create browser session audit event index: %w", err)
 	}
 	return nil
 }
@@ -2166,6 +2746,61 @@ func normalizeBrowserSessionTimesV2(tx *sql.Tx) error {
 	return nil
 }
 
+func normalizeBrowserSessionAuditTimesV3(tx *sql.Tx) error {
+	rows, err := tx.Query(`
+		SELECT sequence, created_at
+		FROM browser_session_audit_events
+	`)
+	if err != nil {
+		return fmt.Errorf("read version 3 browser session audit event times: %w", err)
+	}
+	var updates [][]any
+	for rows.Next() {
+		var (
+			sequence  int64
+			createdAt string
+		)
+		if err := rows.Scan(&sequence, &createdAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan version 3 browser session audit event: %w", err)
+		}
+		canonical, err := canonicalizePersistedBrowserSessionTime(
+			"version 3",
+			"audit created_at",
+			createdAt,
+			false,
+		)
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		if canonical != createdAt {
+			updates = append(updates, []any{canonical, sequence})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate version 3 browser session audit events: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close version 3 browser session audit event rows: %w", err)
+	}
+	for _, update := range updates {
+		if _, err := tx.Exec(`
+			UPDATE browser_session_audit_events
+			SET created_at = ?
+			WHERE sequence = ?
+		`, update...); err != nil {
+			return fmt.Errorf(
+				"update version 3 browser session audit event %v time: %w",
+				update[1],
+				err,
+			)
+		}
+	}
+	return nil
+}
+
 func canonicalizePersistedBrowserSessionTime(scope, field, value string, allowEmpty bool) (string, error) {
 	if allowEmpty && value == "" {
 		return "", nil
@@ -2220,6 +2855,15 @@ var browserClientFamilyColumnsV2 = []browserSessionColumnInfo{
 	{name: "epoch", dataType: "INTEGER", notNull: true},
 	{name: "created_at", dataType: "TEXT", notNull: true},
 	{name: "updated_at", dataType: "TEXT", notNull: true},
+}
+
+var browserSessionAuditColumnsV3 = []browserSessionColumnInfo{
+	{name: "sequence", dataType: "INTEGER", primaryKey: 1},
+	{name: "event_type", dataType: "TEXT", notNull: true},
+	{name: "session_id", dataType: "TEXT", notNull: true, defaultValue: sql.NullString{String: "''", Valid: true}},
+	{name: "device_label", dataType: "TEXT", notNull: true, defaultValue: sql.NullString{String: "''", Valid: true}},
+	{name: "reason_code", dataType: "TEXT", notNull: true},
+	{name: "created_at", dataType: "TEXT", notNull: true},
 }
 
 func readBrowserSessionColumns(tx *sql.Tx) ([]browserSessionColumnInfo, error) {
@@ -2305,6 +2949,37 @@ func validateBrowserSessionSchemaV2(tx *sql.Tx) error {
 		return err
 	}
 	return validateBrowserSessionEpochData(tx)
+}
+
+func validateBrowserSessionSchemaV3(tx *sql.Tx) error {
+	if err := validateBrowserSessionSchemaV2(tx); err != nil {
+		return err
+	}
+	columns, err := readBrowserSessionTableColumns(tx, "browser_session_audit_events")
+	if err != nil {
+		return err
+	}
+	if err := compareBrowserSessionColumns(columns, browserSessionAuditColumnsV3); err != nil {
+		return fmt.Errorf("browser_session_audit_events schema: %w", err)
+	}
+	var indexSQL string
+	if err := tx.QueryRow(`
+		SELECT sql
+		FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_browser_session_audit_events_created'
+	`).Scan(&indexSQL); err != nil {
+		return fmt.Errorf("read browser session audit event index: %w", err)
+	}
+	normalized := strings.Join(strings.Fields(strings.ToLower(indexSQL)), " ")
+	const expected = "create index idx_browser_session_audit_events_created on browser_session_audit_events(created_at, sequence)"
+	if normalized != expected {
+		return fmt.Errorf(
+			"browser session audit event index = %q, want %q",
+			normalized,
+			expected,
+		)
+	}
+	return nil
 }
 
 func validateSQLiteTableCheckConstraint(
@@ -2607,15 +3282,21 @@ func readBrowserSessionTableColumns(
 	tx *sql.Tx,
 	tableName string,
 ) ([]browserSessionColumnInfo, error) {
-	if tableName != "browser_client_families" {
+	var capacityHint int
+	switch tableName {
+	case "browser_client_families":
+		capacityHint = len(browserClientFamilyColumnsV2)
+	case "browser_session_audit_events":
+		capacityHint = len(browserSessionAuditColumnsV3)
+	default:
 		return nil, fmt.Errorf("unsupported browser session schema table %q", tableName)
 	}
-	rows, err := tx.Query(`PRAGMA table_info(browser_client_families)`)
+	rows, err := tx.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, tableName))
 	if err != nil {
 		return nil, fmt.Errorf("inspect %s columns: %w", tableName, err)
 	}
 	defer rows.Close()
-	columns := make([]browserSessionColumnInfo, 0, len(browserClientFamilyColumnsV2))
+	columns := make([]browserSessionColumnInfo, 0, capacityHint)
 	for rows.Next() {
 		var (
 			cid, notNull, primaryKey int
