@@ -584,7 +584,7 @@ if ((sourceStat.mode & 0o022) !== 0) {
   fail("environment source must not be group/other writable");
 }
 
-function trustedFile(pathname, label) {
+function trustedPath(pathname, label, finalType) {
   const currentUid = typeof process.getuid === "function" ? process.getuid() : 0;
   const normalized = path.resolve(pathname);
   const segments = normalized.split(path.sep).filter(Boolean);
@@ -596,7 +596,12 @@ function trustedFile(pathname, label) {
       fail(`${label} path must not contain symbolic links`);
     }
     const isFile = index === segments.length - 1;
-    if (isFile ? !stat.isFile() : !stat.isDirectory()) {
+    const validType = isFile
+      ? finalType === "file"
+        ? stat.isFile()
+        : stat.isDirectory()
+      : stat.isDirectory();
+    if (!validType) {
       fail(`${label} path has an invalid component`);
     }
     if (currentUid === 0 ? stat.uid !== 0 : stat.uid !== 0 && stat.uid !== currentUid) {
@@ -612,9 +617,10 @@ function trustedFile(pathname, label) {
   }
 }
 
-trustedFile(envSource, "environment source");
-trustedFile(basicAuth, "basic auth file");
-trustedFile(publicKey, "trusted public key");
+trustedPath(envSource, "environment source", "file");
+trustedPath(basicAuth, "basic auth file", "file");
+trustedPath(publicKey, "trusted public key", "file");
+trustedPath(path.dirname(backupDirectory), "backup parent", "directory");
 
 const targets = [binaryTarget, webTarget, envTarget, nginxTarget].map(
   (target) => fs.realpathSync(target),

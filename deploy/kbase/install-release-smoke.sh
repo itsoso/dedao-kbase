@@ -699,6 +699,15 @@ if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
 fi
 assert_pre_mutation_failure
 
+setup_case untrusted-backup-parent
+save_expected_targets
+chmod 0777 "$(dirname "$BACKUP_DIR")"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "group/other-writable backup parent unexpectedly installed"
+fi
+assert_pre_mutation_failure
+chmod 0700 "$(dirname "$BACKUP_DIR")"
+
 setup_case overlapping-backup
 mkdir -p "${WEB_TARGET}/backups"
 BACKUP_DIR="${WEB_TARGET}/backups/release"
