@@ -88,6 +88,8 @@ flowchart LR
 - 浏览器只保存 30 天滑动续期的 `Secure; HttpOnly; SameSite=Strict` Cookie。Nginx 仅在 `/browser/session` 校验 Basic Auth，清除客户端 `Authorization` 后注入独立的回环代理密钥；API token 不进入响应体、HTML 或浏览器存储。
 - 自动化、Health、Proofroom 和其他机器客户端继续使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`，无需 Cookie、Basic 或 CSRF。
 
+Nginx 只允许 `/api/*` 和精确的 `/browser/session/migrate` 向后端保留客户端 `Authorization`。健康检查、公开元数据、静态壳与其他 fallback 路由、登录和 retired 路由都会显式清空 `Authorization`、`Proxy-Authorization` 与客户端提供的 `X-KBase-Browser-Session`；只有 Basic 验证成功的 `/browser/session` 会覆盖并注入真实回环代理密钥。
+
 旧版 Web UI 中已有的 Bearer token 只允许通过 `POST /browser/session/migrate` 迁移一次。该路由不受 Nginx Basic Auth 保护，由后端严格校验 Bearer、`Origin`、browser client ID 和 epoch；前端确认新 Cookie 会话后再删除旧 token。已退役的 `/browser/session-token` 始终返回 `410 Gone`。生产 Nginx 配置模板见 `deploy/nginx/kbase.executor.life.conf`。
 
 ```bash

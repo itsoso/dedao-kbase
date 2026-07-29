@@ -59,27 +59,90 @@ require_exact_location() {
   fi
 }
 
-require_block_line() {
+active_directive_count() {
   local block="$1"
-  local line="$2"
-  local label="$3"
-  if ! grep -Fq "${line}" <<<"${block}"; then
-    echo "${label} is missing required directive: ${line}" >&2
+  local expected="$2"
+  awk -v expected="${expected}" '
+    function normalize(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/[[:space:]]+/, " ", value)
+      return value
+    }
+    BEGIN {
+      expected = normalize(expected)
+    }
+    {
+      directive = normalize($0)
+      if (directive == "" || substr(directive, 1, 1) == "#") {
+        next
+      }
+      if (directive == expected) {
+        count++
+      }
+    }
+    END {
+      print count + 0
+    }
+  ' <<<"${block}"
+}
+
+active_directive_prefix_count() {
+  local block="$1"
+  local prefix="$2"
+  awk -v prefix="${prefix}" '
+    function normalize(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/[[:space:]]+/, " ", value)
+      return value
+    }
+    BEGIN {
+      prefix = normalize(prefix)
+    }
+    {
+      directive = normalize($0)
+      if (directive == "" || substr(directive, 1, 1) == "#") {
+        next
+      }
+      if (directive == prefix || index(directive, prefix " ") == 1) {
+        count++
+      }
+    }
+    END {
+      print count + 0
+    }
+  ' <<<"${block}"
+}
+
+require_only_active_directive() {
+  local block="$1"
+  local prefix="$2"
+  local expected="$3"
+  local label="$4"
+  local prefix_count
+  local exact_count
+  prefix_count="$(active_directive_prefix_count "${block}" "${prefix}")"
+  exact_count="$(active_directive_count "${block}" "${expected}")"
+  if [[ "${prefix_count}" != "1" || "${exact_count}" != "1" ]]; then
+    echo "${label} must contain exactly one active directive: ${expected}" >&2
     exit 2
   fi
 }
 
-reject_block_line() {
+require_no_active_directive() {
   local block="$1"
-  local line="$2"
+  local prefix="$2"
   local label="$3"
-  if grep -Fq "${line}" <<<"${block}"; then
-    echo "${label} contains forbidden directive: ${line}" >&2
+  local count
+  count="$(active_directive_prefix_count "${block}" "${prefix}")"
+  if [[ "${count}" != "0" ]]; then
+    echo "${label} contains forbidden active directive prefix: ${prefix}" >&2
     exit 2
   fi
 }
 
 for marker in \
+  'location = /health {' \
+  'location = /.well-known/dedao-kbase-skills.json {' \
   'location = /browser/session {' \
   'location = /browser/session/migrate {' \
   'location = /browser/session-token {' \
@@ -88,34 +151,103 @@ for marker in \
   require_exact_location "${marker}"
 done
 
+for marker in \
+  'location = /health {' \
+  'location = /.well-known/dedao-kbase-skills.json {' \
+  'location = /browser/session {' \
+  'location = /browser/session/migrate {' \
+  'location = /browser/session-token {' \
+  'location /api/ {' \
+  'location / {'; do
+  block="$(location_block "${marker}")"
+  require_only_active_directive \
+    "${block}" \
+    'proxy_pass ' \
+    'proxy_pass http://__KBASE_BACKEND_ADDR__;' \
+    "${marker}"
+  require_only_active_directive \
+    "${block}" \
+    'proxy_set_header Proxy-Authorization ' \
+    'proxy_set_header Proxy-Authorization "";' \
+    "${marker}"
+done
+
 login_block="$(location_block 'location = /browser/session {')"
-require_block_line "${login_block}" 'auth_basic "dedao-kbase";' "browser session login location"
-require_block_line "${login_block}" 'auth_basic_user_file __KBASE_BASIC_AUTH_FILE__;' "browser session login location"
-require_block_line "${login_block}" 'proxy_set_header Authorization "";' "browser session login location"
-require_block_line "${login_block}" 'proxy_set_header Proxy-Authorization "";' "browser session login location"
-require_block_line "${login_block}" 'proxy_set_header X-KBase-Browser-Session "__KBASE_BROWSER_SESSION_SECRET__";' "browser session login location"
+require_only_active_directive \
+  "${login_block}" \
+  'auth_basic ' \
+  'auth_basic "dedao-kbase";' \
+  "browser session login location"
+require_only_active_directive \
+  "${login_block}" \
+  'auth_basic_user_file ' \
+  'auth_basic_user_file __KBASE_BASIC_AUTH_FILE__;' \
+  "browser session login location"
+require_only_active_directive \
+  "${login_block}" \
+  'proxy_set_header X-KBase-Browser-Session ' \
+  'proxy_set_header X-KBase-Browser-Session "__KBASE_BROWSER_SESSION_SECRET__";' \
+  "browser session login location"
 
 migration_block="$(location_block 'location = /browser/session/migrate {')"
-require_block_line "${migration_block}" 'auth_basic off;' "browser session migration location"
-require_block_line "${migration_block}" 'proxy_set_header Proxy-Authorization "";' "browser session migration location"
-require_block_line "${migration_block}" 'proxy_set_header X-KBase-Browser-Session "";' "browser session migration location"
-reject_block_line "${migration_block}" 'auth_basic_user_file' "browser session migration location"
-reject_block_line "${migration_block}" 'proxy_set_header Authorization "";' "browser session migration location"
-reject_block_line "${migration_block}" '__KBASE_BROWSER_SESSION_SECRET__' "browser session migration location"
+require_only_active_directive \
+  "${migration_block}" \
+  'auth_basic ' \
+  'auth_basic off;' \
+  "browser session migration location"
+require_no_active_directive \
+  "${migration_block}" \
+  'auth_basic_user_file ' \
+  "browser session migration location"
 
 retired_block="$(location_block 'location = /browser/session-token {')"
-require_block_line "${retired_block}" 'auth_basic off;' "retired browser token location"
-require_block_line "${retired_block}" 'proxy_set_header Authorization "";' "retired browser token location"
-require_block_line "${retired_block}" 'proxy_set_header Proxy-Authorization "";' "retired browser token location"
-require_block_line "${retired_block}" 'proxy_set_header X-KBase-Browser-Session "";' "retired browser token location"
-reject_block_line "${retired_block}" 'auth_basic_user_file' "retired browser token location"
-reject_block_line "${retired_block}" '__KBASE_BROWSER_SESSION_SECRET__' "retired browser token location"
+require_only_active_directive \
+  "${retired_block}" \
+  'auth_basic ' \
+  'auth_basic off;' \
+  "retired browser token location"
+require_no_active_directive \
+  "${retired_block}" \
+  'auth_basic_user_file ' \
+  "retired browser token location"
 
-for marker in 'location /api/ {' 'location / {'; do
+for marker in \
+  'location = /health {' \
+  'location = /.well-known/dedao-kbase-skills.json {' \
+  'location = /browser/session {' \
+  'location = /browser/session-token {' \
+  'location / {'; do
   block="$(location_block "${marker}")"
-  require_block_line "${block}" 'proxy_set_header Proxy-Authorization "";' "${marker}"
-  require_block_line "${block}" 'proxy_set_header X-KBase-Browser-Session "";' "${marker}"
-  reject_block_line "${block}" 'proxy_set_header Authorization "";' "${marker}"
+  require_only_active_directive \
+    "${block}" \
+    'proxy_set_header Authorization ' \
+    'proxy_set_header Authorization "";' \
+    "${marker}"
+done
+
+for marker in \
+  'location = /browser/session/migrate {' \
+  'location /api/ {'; do
+  block="$(location_block "${marker}")"
+  require_no_active_directive \
+    "${block}" \
+    'proxy_set_header Authorization ' \
+    "${marker}"
+done
+
+for marker in \
+  'location = /health {' \
+  'location = /.well-known/dedao-kbase-skills.json {' \
+  'location = /browser/session/migrate {' \
+  'location = /browser/session-token {' \
+  'location /api/ {' \
+  'location / {'; do
+  block="$(location_block "${marker}")"
+  require_only_active_directive \
+    "${block}" \
+    'proxy_set_header X-KBase-Browser-Session ' \
+    'proxy_set_header X-KBase-Browser-Session "";' \
+    "${marker}"
 done
 
 browser_secret_placeholder_count="$(

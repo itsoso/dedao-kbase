@@ -90,6 +90,36 @@ bash "${root}/deploy/nginx/render-kbase-config.sh" \
   "${root}/deploy/nginx/kbase.locations.conf.template" \
   "${temporary}/locations.conf"
 
+sed \
+  's/^[[:space:]]*auth_basic "dedao-kbase";/    # auth_basic "dedao-kbase";/' \
+  "${root}/deploy/nginx/kbase.locations.conf.template" \
+  >"${temporary}/commented-required-directive.template"
+if KBASE_BROWSER_SESSION_SECRET="${browser_proxy_value}" \
+  KBASE_BACKEND_ADDR="127.0.0.1:${backend_port}" \
+  KBASE_BASIC_AUTH_FILE="${temporary}/browser.htpasswd" \
+  bash "${root}/deploy/nginx/render-kbase-config.sh" \
+    "${temporary}/commented-required-directive.template" \
+    "${temporary}/commented-required-directive.conf" >/dev/null 2>&1; then
+  echo "renderer accepted a commented-out required security directive" >&2
+  exit 1
+fi
+
+sed \
+  '1,/^[[:space:]]*proxy_pass http:\/\/__KBASE_BACKEND_ADDR__;/{
+    s/^[[:space:]]*proxy_pass http:\/\/__KBASE_BACKEND_ADDR__;/    # proxy_pass http:\/\/__KBASE_BACKEND_ADDR__;/
+  }' \
+  "${root}/deploy/nginx/kbase.locations.conf.template" \
+  >"${temporary}/commented-proxy-pass.template"
+if KBASE_BROWSER_SESSION_SECRET="${browser_proxy_value}" \
+  KBASE_BACKEND_ADDR="127.0.0.1:${backend_port}" \
+  KBASE_BASIC_AUTH_FILE="${temporary}/browser.htpasswd" \
+  bash "${root}/deploy/nginx/render-kbase-config.sh" \
+    "${temporary}/commented-proxy-pass.template" \
+    "${temporary}/commented-proxy-pass.conf" >/dev/null 2>&1; then
+  echo "renderer accepted a commented-out required proxy_pass" >&2
+  exit 1
+fi
+
 for required in \
   'location = /browser/session {' \
   'location = /browser/session/migrate {' \
@@ -160,6 +190,69 @@ json_number() {
   sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+).*/\\1/p" "${file}" | head -n 1
 }
 
+location_block() {
+  local marker="$1"
+  awk -v marker="${marker}" '
+    $0 == marker {
+      active = 1
+    }
+    active {
+      print
+    }
+    active && $0 == "}" {
+      exit
+    }
+  ' "${temporary}/locations.conf"
+}
+
+block_has_active_directive() {
+  local block="$1"
+  local expected="$2"
+  awk -v expected="${expected}" '
+    function normalize(value) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/[[:space:]]+/, " ", value)
+      return value
+    }
+    BEGIN {
+      expected = normalize(expected)
+    }
+    /^[[:space:]]*#/ {
+      next
+    }
+    normalize($0) == expected {
+      found = 1
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' <<<"${block}"
+}
+
+for marker in \
+  'location = /health {' \
+  'location = /.well-known/dedao-kbase-skills.json {' \
+  'location = /browser/session {' \
+  'location = /browser/session-token {' \
+  'location / {'; do
+  if ! block_has_active_directive \
+    "$(location_block "${marker}")" \
+    'proxy_set_header Authorization "";'; then
+    echo "${marker} does not strip client Authorization" >&2
+    exit 1
+  fi
+done
+for marker in \
+  'location = /browser/session/migrate {' \
+  'location /api/ {'; do
+  if block_has_active_directive \
+    "$(location_block "${marker}")" \
+    'proxy_set_header Authorization "";'; then
+    echo "${marker} unexpectedly strips client Authorization" >&2
+    exit 1
+  fi
+done
+
 curl -fsS "${proxy_base}/" >/dev/null
 
 curl -sS -D "${temporary}/login-no-basic.headers" \
@@ -209,8 +302,9 @@ if [[ "$(response_status "${temporary}/login.headers")" != "200" ]]; then
   echo "browser session login failed" >&2
   exit 1
 fi
-if ! grep -Eiq '^Set-Cookie:[[:space:]]*__Host-kbase_session=[^;]+;.*HttpOnly;[[:space:]]*Secure;[[:space:]]*SameSite=Strict' \
-  "${temporary}/login.headers"; then
+if ! grep -Eiq '^Set-Cookie:[[:space:]]*__Host-kbase_session=[^;]+;[[:space:]]*Path=/;.*HttpOnly;[[:space:]]*Secure;[[:space:]]*SameSite=Strict' \
+  "${temporary}/login.headers" ||
+  grep -Eiq '^Set-Cookie:.*;[[:space:]]*Domain=' "${temporary}/login.headers"; then
   echo "browser session login did not return the required secure Cookie" >&2
   exit 1
 fi
@@ -246,6 +340,35 @@ if [[ -z "${csrf_token}" ]]; then
   exit 1
 fi
 
+missing_csrf_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X POST \
+  -H "Cookie: ${session_cookie}" \
+  -H "Origin: ${public_origin}" \
+  -H "Sec-Fetch-Site: same-origin" \
+  "${proxy_base}/api/browser/session/logout")"
+if [[ "${missing_csrf_status}" != "403" ]] ||
+  [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${session_cookie}" \
+    "${proxy_base}/api/books")" != "200" ]]; then
+  echo "missing-CSRF logout was not rejected without revoking the session" >&2
+  exit 1
+fi
+
+invalid_csrf_status="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -X POST \
+  -H "Cookie: ${session_cookie}" \
+  -H "Origin: ${public_origin}" \
+  -H "Sec-Fetch-Site: same-origin" \
+  -H "X-KBase-CSRF: invalid-${csrf_token}" \
+  "${proxy_base}/api/browser/session/logout")"
+if [[ "${invalid_csrf_status}" != "403" ]] ||
+  [[ "$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Cookie: ${session_cookie}" \
+    "${proxy_base}/api/books")" != "200" ]]; then
+  echo "invalid-CSRF logout was not rejected without revoking the session" >&2
+  exit 1
+fi
+
 curl -sS -D "${temporary}/logout.headers" \
   -o "${temporary}/logout.body" \
   -X POST \
@@ -255,8 +378,9 @@ curl -sS -D "${temporary}/logout.headers" \
   -H "X-KBase-CSRF: ${csrf_token}" \
   "${proxy_base}/api/browser/session/logout"
 if [[ "$(response_status "${temporary}/logout.headers")" != "204" ]] ||
-  ! grep -Eiq '^Set-Cookie:[[:space:]]*__Host-kbase_session=;.*Max-Age=0;.*HttpOnly;[[:space:]]*Secure;[[:space:]]*SameSite=Strict' \
-    "${temporary}/logout.headers"; then
+  ! grep -Eiq '^Set-Cookie:[[:space:]]*__Host-kbase_session=;[[:space:]]*Path=/;.*Max-Age=0;.*HttpOnly;[[:space:]]*Secure;[[:space:]]*SameSite=Strict' \
+    "${temporary}/logout.headers" ||
+  grep -Eiq '^Set-Cookie:.*;[[:space:]]*Domain=' "${temporary}/logout.headers"; then
   echo "CSRF-protected browser logout did not clear the Cookie" >&2
   exit 1
 fi
@@ -318,8 +442,9 @@ curl -sS -D "${temporary}/migration.headers" \
   -H "X-KBase-Browser-Epoch: ${migration_epoch}" \
   "${proxy_base}/browser/session/migrate"
 if [[ "$(response_status "${temporary}/migration.headers")" != "200" ]] ||
-  ! grep -Eiq '^Set-Cookie:[[:space:]]*__Host-kbase_session=[^;]+;.*HttpOnly;[[:space:]]*Secure;[[:space:]]*SameSite=Strict' \
-    "${temporary}/migration.headers"; then
+  ! grep -Eiq '^Set-Cookie:[[:space:]]*__Host-kbase_session=[^;]+;[[:space:]]*Path=/;.*HttpOnly;[[:space:]]*Secure;[[:space:]]*SameSite=Strict' \
+    "${temporary}/migration.headers" ||
+  grep -Eiq '^Set-Cookie:.*;[[:space:]]*Domain=' "${temporary}/migration.headers"; then
   echo "Bearer migration did not create a secure Cookie" >&2
   exit 1
 fi
