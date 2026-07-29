@@ -148,6 +148,76 @@ KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
 
 发布必须把后端二进制、Web 静态文件、环境文件和渲染后的 Nginx 配置作为同一回滚事务。回滚时恢复这四项并重新加载 Nginx；新的会话 SQLite 可以保留，旧版本不会读取它。已完成一次迁移并删除旧 token 的浏览器在回滚后可能需要重新进行一次 Basic 登录，知识库产物和机器 Bearer token 不受影响。
 
+### KBase release kit
+
+发布分为不可变源码包、Linux 构建包和事务安装三个阶段。源码组装必须针对干净工作树中的明确 commit：
+
+```bash
+bash deploy/kbase/assemble-release.sh create \
+  --repo "${KBASE_REPO_ROOT:?}" \
+  --revision "${KBASE_REVISION:?}" \
+  --output-dir "${KBASE_SOURCE_RELEASE_DIR:?}"
+```
+
+在 Linux 构建机上验证源码 manifest、执行全部测试和真实 Nginx smoke，并生成四组件构建包：
+
+```bash
+bash deploy/kbase/prepare-release.sh create \
+  --source-manifest "${KBASE_SOURCE_MANIFEST:?}" \
+  --output-dir "${KBASE_PREPARED_RELEASE_DIR:?}" \
+  --node-bin "${NODE_BIN:?}" \
+  --go-bin "${GO_BIN:?}" \
+  --npm-bin "${NPM_BIN:?}" \
+  --tar-bin "${TAR_BIN:?}" \
+  --gzip-bin "${GZIP_BIN:?}" \
+  --nginx-bin "${NGINX_BIN:?}" \
+  --uname-bin "${UNAME_BIN:?}"
+bash deploy/kbase/prepare-release.sh verify \
+  --manifest "${KBASE_PREPARED_MANIFEST:?}" \
+  --node-bin "${NODE_BIN:?}"
+```
+
+安装器要求所有目标、配置源、服务、健康检查和备份参数显式提供；文件路径必须是绝对路径。失败会自动恢复后端、Web、环境文件和 Nginx 配置，并保留快照：
+
+```bash
+bash deploy/kbase/install-release.sh install \
+  --manifest "${KBASE_PREPARED_MANIFEST:?}" \
+  --binary-target "${KBASE_BINARY_TARGET:?}" \
+  --web-target "${KBASE_WEB_TARGET:?}" \
+  --env-source "${KBASE_ENV_SOURCE:?}" \
+  --env-target "${KBASE_ENV_TARGET:?}" \
+  --nginx-config-target "${KBASE_NGINX_CONFIG_TARGET:?}" \
+  --basic-auth-file "${KBASE_BASIC_AUTH_FILE:?}" \
+  --backend-addr "${KBASE_BACKEND_ADDR:?}" \
+  --service-name "${KBASE_SERVICE_NAME:?}" \
+  --nginx-service-name "${KBASE_NGINX_SERVICE_NAME:?}" \
+  --health-url "${KBASE_HEALTH_URL:?}" \
+  --backup-dir "${KBASE_BACKUP_DIR:?}" \
+  --node-bin "${NODE_BIN:?}" \
+  --tar-bin "${TAR_BIN:?}" \
+  --gzip-bin "${GZIP_BIN:?}" \
+  --nginx-bin "${NGINX_BIN:?}" \
+  --systemctl-bin "${SYSTEMCTL_BIN:?}" \
+  --curl-bin "${CURL_BIN:?}" \
+  --uname-bin "${UNAME_BIN:?}"
+```
+
+自动回滚无法完成时，从 retained backup 手工恢复四项快照，再依次重启、校验、重载和探活：
+
+```bash
+sudo install -m 0755 "${KBASE_BACKUP_DIR:?}/snapshot/kbase-server" "${KBASE_BINARY_TARGET:?}"
+sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
+sudo cp -a "${KBASE_BACKUP_DIR:?}/snapshot/web" "${KBASE_WEB_TARGET:?}"
+sudo install -m 0600 "${KBASE_BACKUP_DIR:?}/snapshot/service.env" "${KBASE_ENV_TARGET:?}"
+sudo install -m 0600 "${KBASE_BACKUP_DIR:?}/snapshot/nginx.conf" "${KBASE_NGINX_CONFIG_TARGET:?}"
+sudo "${SYSTEMCTL_BIN:?}" restart "${KBASE_SERVICE_NAME:?}"
+sudo "${NGINX_BIN:?}" -t
+sudo "${SYSTEMCTL_BIN:?}" reload "${KBASE_NGINX_SERVICE_NAME:?}"
+"${CURL_BIN:?}" --fail --silent --show-error "${KBASE_HEALTH_URL:?}"
+```
+
+`KBase Release Gates` CI 不读取 secrets，也不部署。它只在隔离目录中构建、校验发布包，并运行 installer 的临时 fixture smoke。
+
 对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：
 
 - `GET /health`：无需 token，用于服务探活。
