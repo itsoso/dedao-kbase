@@ -267,11 +267,12 @@ cmp "$ARCHIVE_ONE" "${OUTPUT_TWO}/source.tar.gz" ||
   fail "archive is not deterministic for the same revision"
 
 FAKE_BIN="${TMP_ROOT}/fake-bin"
+POISON_BIN="${TMP_ROOT}/poison-bin"
 GATE_LOG="${TMP_ROOT}/release-gates.log"
 PREPARED_ONE="${TMP_ROOT}/prepared-one"
 PREPARED_TWO="${TMP_ROOT}/prepared-two"
 PREPARED_CONFLICT="${TMP_ROOT}/prepared-conflict"
-mkdir -p "$FAKE_BIN"
+mkdir -p "$FAKE_BIN" "$POISON_BIN"
 export RELEASE_GATE_LOG="$GATE_LOG"
 export RELEASE_REAL_TAR="$(command -v tar)"
 export RELEASE_REAL_GZIP="$(command -v gzip)"
@@ -334,14 +335,28 @@ printf 'node:%s\n' "$*" >>"$RELEASE_GATE_LOG"
 exec "$RELEASE_REAL_NODE" "$@"
 FAKE_NODE
 
+cat >"${POISON_BIN}/node" <<'POISON_NODE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'poison-node\n' >>"$RELEASE_GATE_LOG"
+printf 'poison PATH node invoked\n' >&2
+exit 91
+POISON_NODE
+
 cat >"${FAKE_BIN}/tar" <<'FAKE_TAR'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'tar:%s\n' "$*" >>"$RELEASE_GATE_LOG"
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'tar (GNU tar) fixture\n'
+  exit 0
+fi
 filtered=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --sort=*|--mtime=*|--owner=*|--group=*|--numeric-owner)
+    --sort=*|--mtime=*|--owner=*|--group=*|--numeric-owner|\
+    --quoting-style=escape|--no-same-owner|--no-same-permissions|\
+    --delay-directory-restore)
       shift
       ;;
     *)
@@ -377,12 +392,13 @@ chmod 755 \
   "${FAKE_BIN}/node" \
   "${FAKE_BIN}/tar" \
   "${FAKE_BIN}/gzip" \
-  "${FAKE_BIN}/proxy-smoke.sh"
+  "${FAKE_BIN}/proxy-smoke.sh" \
+  "${POISON_BIN}/node"
 
 prepare_fixture() {
   source_manifest="$1"
   output_dir="$2"
-  "$PREPARER" create \
+  PATH="${POISON_BIN}:$PATH" "$PREPARER" create \
     --source-manifest "$source_manifest" \
     --output-dir "$output_dir" \
     --go-bin "${FAKE_BIN}/go" \
@@ -395,6 +411,56 @@ prepare_fixture() {
     --proxy-smoke-script "${FAKE_BIN}/proxy-smoke.sh"
 }
 
+UNSAFE_REPO="${TMP_ROOT}/unsafe-fixture"
+UNSAFE_EXTERNAL="${TMP_ROOT}/unsafe-external-frontend"
+UNSAFE_SOURCE="${TMP_ROOT}/unsafe-source-release"
+mkdir -p \
+  "$UNSAFE_REPO" \
+  "${UNSAFE_EXTERNAL}/scripts" \
+  "${UNSAFE_REPO}/deploy" \
+  "${UNSAFE_REPO}/cmd"
+printf '{"name":"unsafe-fixture"}\n' \
+  >"${UNSAFE_EXTERNAL}/package.json"
+printf '{"name":"unsafe-fixture","lockfileVersion":3,"packages":{}}\n' \
+  >"${UNSAFE_EXTERNAL}/package-lock.json"
+printf 'export {};\n' \
+  >"${UNSAFE_EXTERNAL}/scripts/unsafe-smoke.mjs"
+printf 'outside must remain unchanged\n' \
+  >"${UNSAFE_EXTERNAL}/marker.txt"
+ln -s "$UNSAFE_EXTERNAL" "${UNSAFE_REPO}/frontend"
+cp -R "${FIXTURE_REPO}/frontend-web" "${UNSAFE_REPO}/frontend-web"
+cp -R "${FIXTURE_REPO}/deploy/nginx" "${UNSAFE_REPO}/deploy/nginx"
+cp -R "${FIXTURE_REPO}/cmd/kbase-server" "${UNSAFE_REPO}/cmd/kbase-server"
+cp "${FIXTURE_REPO}/go.mod" "${UNSAFE_REPO}/go.mod"
+git -C "$UNSAFE_REPO" init -q
+git -C "$UNSAFE_REPO" config user.name "Unsafe Release Smoke"
+git -C "$UNSAFE_REPO" config user.email "unsafe-release@example.invalid"
+git -C "$UNSAFE_REPO" add frontend frontend-web deploy cmd go.mod
+git -C "$UNSAFE_REPO" commit -q -m "unsafe symlink fixture"
+"$ASSEMBLER" create \
+  --repo "$UNSAFE_REPO" \
+  --revision HEAD \
+  --output-dir "$UNSAFE_SOURCE"
+
+: >"$GATE_LOG"
+expect_failure "unsafe source symlink rejection" \
+  prepare_fixture \
+  "${UNSAFE_SOURCE}/release-manifest.json" \
+  "${TMP_ROOT}/unsafe-prepared"
+if grep -E -q \
+  '^(npm:|go:|frontend-smoke$|web-smoke$|proxy:|nginx:)' \
+  "$GATE_LOG"
+then
+  fail "build gates ran for an unsafe source archive"
+fi
+grep -q '^outside must remain unchanged$' \
+  "${UNSAFE_EXTERNAL}/marker.txt" ||
+  fail "unsafe source preparation changed the external marker"
+[[ ! -e "${UNSAFE_EXTERNAL}/dist" ]] ||
+  fail "unsafe source preparation wrote outside its staging directory"
+[[ ! -e "${TMP_ROOT}/unsafe-prepared" ]] ||
+  fail "unsafe source archive produced a prepared release"
+
 cp -R "$OUTPUT_ONE" "${TMP_ROOT}/tampered-source"
 printf 'tampered before prepare\n' \
   >>"${TMP_ROOT}/tampered-source/source.tar.gz"
@@ -403,8 +469,12 @@ expect_failure "tampered source rejected before build" \
   prepare_fixture \
   "${TMP_ROOT}/tampered-source/release-manifest.json" \
   "${TMP_ROOT}/tampered-prepared"
-[[ ! -s "$GATE_LOG" ]] ||
+if grep -E -q \
+  '^(npm:|go:|frontend-smoke$|web-smoke$|proxy:|nginx:|tar:|gzip:|uname:)' \
+  "$GATE_LOG"
+then
   fail "build commands ran before tampered source rejection"
+fi
 [[ ! -e "${TMP_ROOT}/tampered-prepared" ]] ||
   fail "tampered source produced a prepared release"
 
@@ -420,6 +490,7 @@ for gate in \
   '^npm:.*:ci$' \
   '^npm:.*:run build$' \
   '^frontend-smoke$' \
+  '^node:- .*release-manifest\.json dedao-kbase-source-release/v1$' \
   '^node:--check .*/frontend-web/app\.js$' \
   '^web-smoke$' \
   '^go:.*:test \./\.\.\.:cgo=$' \
@@ -514,8 +585,15 @@ expect_failure "existing prepared output rejection" \
   prepare_fixture "$MANIFEST_ONE" "$PREPARED_CONFLICT"
 grep -q '^do not replace$' "${PREPARED_CONFLICT}/marker.txt" ||
   fail "existing prepared output was modified"
-[[ ! -s "$GATE_LOG" ]] ||
+if grep -E -q \
+  '^(npm:|go:|frontend-smoke$|web-smoke$|proxy:|nginx:|tar:|gzip:|uname:)' \
+  "$GATE_LOG"
+then
   fail "build gates ran for an existing output target"
+fi
+if grep -q '^poison-node$' "$GATE_LOG"; then
+  fail "source verification ignored the explicit Node tool"
+fi
 
 export RELEASE_FAIL_GATE="npm-ci"
 expect_failure "build failure propagation" \

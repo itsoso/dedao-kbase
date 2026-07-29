@@ -13,7 +13,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   assemble-release.sh create --repo PATH --revision REVISION --output-dir PATH
-  assemble-release.sh verify --manifest PATH
+  assemble-release.sh verify --manifest PATH [--node-bin PATH]
 USAGE
 }
 
@@ -24,6 +24,17 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+require_executable() {
+  value="$1"
+  label="$2"
+  if [[ "$value" == */* ]]; then
+    [[ -x "$value" ]] || fail "${label} is not executable: $value"
+  else
+    command -v "$value" >/dev/null 2>&1 ||
+      fail "${label} command not found: $value"
+  fi
 }
 
 require_option_value() {
@@ -177,12 +188,18 @@ NODE
 
 verify_release() {
   manifest=""
+  node_bin="node"
 
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --manifest)
         require_option_value "$1" "${2:-}"
         manifest="$2"
+        shift 2
+        ;;
+      --node-bin)
+        require_option_value "$1" "${2:-}"
+        node_bin="$2"
         shift 2
         ;;
       -h|--help)
@@ -196,10 +213,10 @@ verify_release() {
   done
 
   [[ -n "$manifest" ]] || fail "verify requires --manifest"
-  require_command node
+  require_executable "$node_bin" "Node"
   [[ -f "$manifest" ]] || fail "manifest does not exist: $manifest"
 
-  node - "$manifest" "$SCHEMA" <<'NODE'
+  "$node_bin" - "$manifest" "$SCHEMA" <<'NODE'
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");

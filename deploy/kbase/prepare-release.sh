@@ -92,6 +92,122 @@ if (field === "revision") {
 NODE
 }
 
+validate_source_archive() {
+  node_bin="$1"
+  tar_bin="$2"
+  gzip_bin="$3"
+  source_archive="$4"
+  validation_dir="$5"
+  names_file="${validation_dir}/source-members.txt"
+  verbose_file="${validation_dir}/source-members.verbose.txt"
+
+  "$gzip_bin" -dc "$source_archive" |
+    "$tar_bin" --quoting-style=escape -tf - >"$names_file"
+  "$gzip_bin" -dc "$source_archive" |
+    "$tar_bin" --quoting-style=escape -tvf - >"$verbose_file"
+
+  "$node_bin" - \
+    "$names_file" \
+    "$verbose_file" \
+    "$SOURCE_ROOT_NAME" <<'NODE'
+const fs = require("fs");
+
+const namesPath = process.argv[2];
+const verbosePath = process.argv[3];
+const expectedRoot = process.argv[4];
+
+function fail(message) {
+  process.stderr.write(`prepare-release: ${message}\n`);
+  process.exit(1);
+}
+
+function lines(filePath) {
+  const value = fs.readFileSync(filePath, "utf8");
+  const result = value.split("\n");
+  if (result[result.length - 1] === "") {
+    result.pop();
+  }
+  return result;
+}
+
+const names = lines(namesPath);
+const verbose = lines(verbosePath);
+if (names.length === 0 || names.length !== verbose.length) {
+  fail("source archive member listing is empty or inconsistent");
+}
+
+for (let index = 0; index < names.length; index += 1) {
+  const name = names[index];
+  if (
+    name.length === 0 ||
+    name.startsWith("/") ||
+    name.includes("\\") ||
+    [...name].some((character) => {
+      const code = character.codePointAt(0);
+      return code < 0x20 || code === 0x7f;
+    })
+  ) {
+    fail(`source archive contains an unsafe member path: ${name}`);
+  }
+  if (!name.startsWith(`${expectedRoot}/`)) {
+    fail(`source archive member is outside ${expectedRoot}/: ${name}`);
+  }
+  const segments = name.split("/");
+  if (segments[segments.length - 1] === "") {
+    segments.pop();
+  }
+  if (
+    segments.length === 0 ||
+    segments[0] !== expectedRoot ||
+    segments.some(
+      (segment) => segment === "" || segment === "." || segment === "..",
+    )
+  ) {
+    fail(`source archive contains an invalid path segment: ${name}`);
+  }
+
+  const type = verbose[index][0];
+  if (type !== "-" && type !== "d") {
+    fail(`source archive member type is not allowed: ${name}`);
+  }
+}
+NODE
+}
+
+verify_extracted_source() {
+  node_bin="$1"
+  extract_dir="$2"
+  source_root="$3"
+
+  unsafe_entry="$(
+    find "$extract_dir" \
+      -mindepth 1 \
+      ! -type f \
+      ! -type d \
+      -print \
+      -quit
+  )"
+  [[ -z "$unsafe_entry" ]] ||
+    fail "extracted source contains a non-file/non-directory entry"
+
+  "$node_bin" - "$extract_dir" "$source_root" "$SOURCE_ROOT_NAME" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const extractDirectory = fs.realpathSync(process.argv[2]);
+const sourceRoot = fs.realpathSync(process.argv[3]);
+const expectedRoot = process.argv[4];
+const expectedPath = path.join(extractDirectory, expectedRoot);
+
+if (sourceRoot !== expectedPath) {
+  process.stderr.write(
+    "prepare-release: extracted source root resolves outside staging\n",
+  );
+  process.exit(1);
+}
+NODE
+}
+
 write_prepared_manifest() {
   node_bin="$1"
   manifest="$2"
@@ -232,7 +348,9 @@ create_release() {
   [[ -f "$source_manifest" ]] || fail "source manifest does not exist"
 
   # Source integrity is the first release gate. No build command may run first.
-  "$ASSEMBLER" verify --manifest "$source_manifest"
+  "$ASSEMBLER" verify \
+    --node-bin "$node_bin" \
+    --manifest "$source_manifest"
 
   validate_output_target "$output_dir"
   require_executable "$node_bin" "Node"
@@ -240,12 +358,19 @@ create_release() {
   platform="$("$uname_bin" -s)"
   [[ "$platform" == "Linux" ]] ||
     fail "release preparation only supports Linux"
+  export LC_ALL=C
 
   require_executable "$go_bin" "Go"
   require_executable "$npm_bin" "npm"
   require_executable "$tar_bin" "tar"
   require_executable "$gzip_bin" "gzip"
   require_executable "$nginx_bin" "Nginx"
+  tar_version="$("$tar_bin" --version 2>&1)" ||
+    fail "cannot inspect tar implementation"
+  case "$tar_version" in
+    *"GNU tar"*) ;;
+    *) fail "release preparation requires GNU tar" ;;
+  esac
 
   revision="$(source_manifest_value "$node_bin" "$source_manifest" revision)"
   source_archive="$(source_manifest_value "$node_bin" "$source_manifest" artifact)"
@@ -265,9 +390,22 @@ create_release() {
 
   extract_dir="${temporary_dir}/source"
   bundle_dir="${temporary_dir}/bundle"
-  mkdir -p "$extract_dir" "$bundle_dir"
+  validation_dir="${temporary_dir}/validation"
+  mkdir -p "$extract_dir" "$bundle_dir" "$validation_dir"
+  validate_source_archive \
+    "$node_bin" \
+    "$tar_bin" \
+    "$gzip_bin" \
+    "$source_archive" \
+    "$validation_dir"
+  rm -rf "$validation_dir"
   "$gzip_bin" -dc "$source_archive" |
-    "$tar_bin" -xf - -C "$extract_dir"
+    "$tar_bin" \
+      --no-same-owner \
+      --no-same-permissions \
+      --delay-directory-restore \
+      -xf - \
+      -C "$extract_dir"
 
   top_level_count="$(
     find "$extract_dir" -mindepth 1 -maxdepth 1 -print | wc -l |
@@ -276,6 +414,7 @@ create_release() {
   source_root="${extract_dir}/${SOURCE_ROOT_NAME}"
   [[ "$top_level_count" == "1" && -d "$source_root" ]] ||
     fail "source archive must contain exactly ${SOURCE_ROOT_NAME}/"
+  verify_extracted_source "$node_bin" "$extract_dir" "$source_root"
 
   [[ -d "${source_root}/frontend" ]] ||
     fail "source release is missing frontend/"
@@ -292,7 +431,6 @@ create_release() {
     "$npm_bin" run build
   )
 
-  export LC_ALL=C
   shopt -s nullglob
   frontend_smokes=("${source_root}"/frontend/scripts/*-smoke.mjs)
   shopt -u nullglob
