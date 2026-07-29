@@ -2301,6 +2301,13 @@ func TestBrowserSessionStoreConstructorErrorsAreTypedAndPreserveCause(t *testing
 			t.Fatal(err)
 		}
 		defer os.Chmod(parent, 0o700)
+		probePath := filepath.Join(parent, "permission-probe")
+		if err := os.WriteFile(probePath, nil, 0o600); err == nil {
+			_ = os.Remove(probePath)
+			t.Skip("current user bypasses POSIX directory permissions")
+		} else if !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("permission probe error = %v, want os.ErrPermission", err)
+		}
 		_, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
 			Path: filepath.Join(parent, "child", "browser_sessions.sqlite3"),
 		})
