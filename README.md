@@ -156,14 +156,20 @@ KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
 bash deploy/kbase/assemble-release.sh create \
   --repo "${KBASE_REPO_ROOT:?}" \
   --revision "${KBASE_REVISION:?}" \
-  --output-dir "${KBASE_SOURCE_RELEASE_DIR:?}"
+  --output-dir "${KBASE_SOURCE_RELEASE_DIR:?}" \
+  --signing-key "${KBASE_SOURCE_SIGNING_KEY:?}" \
+  --openssl-bin "${OPENSSL_BIN:?}"
 ```
 
-在 Linux 构建机上验证源码 manifest、执行全部测试和真实 Nginx smoke，并生成四组件构建包：
+源码与 prepared manifest 都必须生成分离的 `MANIFEST.sig`。私钥由外部密钥管理系统或权限为 `0600` 的受控文件提供，不能进入仓库或发布目录；安装机只保存 root 所有、不可被 group/other 修改的可信公钥。
+
+在隔离的 Linux 构建机上以非 root 用户验证源码签名与 manifest、执行全部测试和真实 Nginx smoke，并生成四组件构建包：
 
 ```bash
 bash deploy/kbase/prepare-release.sh create \
   --source-manifest "${KBASE_SOURCE_MANIFEST:?}" \
+  --source-public-key "${KBASE_SOURCE_PUBLIC_KEY:?}" \
+  --signing-key "${KBASE_PREPARED_SIGNING_KEY:?}" \
   --output-dir "${KBASE_PREPARED_RELEASE_DIR:?}" \
   --node-bin "${NODE_BIN:?}" \
   --go-bin "${GO_BIN:?}" \
@@ -171,17 +177,21 @@ bash deploy/kbase/prepare-release.sh create \
   --tar-bin "${TAR_BIN:?}" \
   --gzip-bin "${GZIP_BIN:?}" \
   --nginx-bin "${NGINX_BIN:?}" \
-  --uname-bin "${UNAME_BIN:?}"
+  --uname-bin "${UNAME_BIN:?}" \
+  --openssl-bin "${OPENSSL_BIN:?}"
 bash deploy/kbase/prepare-release.sh verify \
   --manifest "${KBASE_PREPARED_MANIFEST:?}" \
-  --node-bin "${NODE_BIN:?}"
+  --trusted-public-key "${KBASE_PREPARED_PUBLIC_KEY:?}" \
+  --node-bin "${NODE_BIN:?}" \
+  --openssl-bin "${OPENSSL_BIN:?}"
 ```
 
-安装器要求所有目标、配置源、服务、健康检查和备份参数显式提供；文件路径必须是绝对路径。失败会自动恢复后端、Web、环境文件和 Nginx 配置，并保留快照：
+安装器先把签名、manifest、四个 artifact 和环境文件复制到私有 staging，再验签并只消费 staged bytes。环境文件只接受受控前缀的 `KEY=VALUE`，不会作为 shell 执行。`--health-url` 必须严格等于 `http://<backend-addr>/health`，且响应必须是 KBase 健康契约。失败会自动恢复后端、Web、环境文件和 Nginx 配置，并保留快照：
 
 ```bash
 bash deploy/kbase/install-release.sh install \
   --manifest "${KBASE_PREPARED_MANIFEST:?}" \
+  --trusted-public-key "${KBASE_PREPARED_PUBLIC_KEY:?}" \
   --binary-target "${KBASE_BINARY_TARGET:?}" \
   --web-target "${KBASE_WEB_TARGET:?}" \
   --env-source "${KBASE_ENV_SOURCE:?}" \
@@ -199,7 +209,8 @@ bash deploy/kbase/install-release.sh install \
   --nginx-bin "${NGINX_BIN:?}" \
   --systemctl-bin "${SYSTEMCTL_BIN:?}" \
   --curl-bin "${CURL_BIN:?}" \
-  --uname-bin "${UNAME_BIN:?}"
+  --uname-bin "${UNAME_BIN:?}" \
+  --openssl-bin "${OPENSSL_BIN:?}"
 ```
 
 自动回滚无法完成时，从 retained backup 手工恢复四项快照，再依次重启、校验、重载和探活：

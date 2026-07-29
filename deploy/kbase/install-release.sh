@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if [[ "${EUID:-$(id -u)}" == "0" ]]; then
+  PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+  export PATH
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREPARER="${SCRIPT_DIR}/prepare-release.sh"
 WEB_ROOT_NAME="frontend-web"
+MAX_WEB_ARCHIVE_BYTES=$((32 * 1024 * 1024))
+MAX_WEB_MEMBERS=20000
+MAX_WEB_FILE_BYTES=$((32 * 1024 * 1024))
+MAX_WEB_TOTAL_BYTES=$((256 * 1024 * 1024))
 
 transaction_active=0
 rollback_in_progress=0
@@ -15,7 +24,9 @@ nginx_config_target=""
 service_name=""
 nginx_service_name=""
 health_url=""
+trusted_public_key=""
 node_bin="node"
+openssl_bin="openssl"
 tar_bin="tar"
 gzip_bin="gzip"
 nginx_bin="nginx"
@@ -28,12 +39,17 @@ env_temp=""
 nginx_temp=""
 web_displaced=""
 doctor_result=""
+release_staging=""
+staged_manifest=""
+staged_environment=""
+staged_public_key=""
 
 usage() {
   cat <<'USAGE'
 Usage:
   install-release.sh install \
     --manifest PATH \
+    --trusted-public-key ABS \
     --binary-target ABS \
     --web-target ABS \
     --env-source ABS \
@@ -46,6 +62,7 @@ Usage:
     --health-url URL \
     --backup-dir ABS \
     [--node-bin PATH] \
+    [--openssl-bin PATH] \
     [--tar-bin PATH] \
     [--gzip-bin PATH] \
     [--nginx-bin PATH] \
@@ -112,20 +129,97 @@ cleanup_temporary_targets() {
   if [[ -n "$doctor_result" ]]; then
     rm -f "$doctor_result"
   fi
+  if [[ -n "$release_staging" ]]; then
+    rm -rf "$release_staging"
+    release_staging=""
+  fi
+}
+
+parsed_environment=()
+
+load_environment_arguments() {
+  local environment_file="$1"
+  local key
+  local value
+  local parsed_file
+  parsed_environment=()
+  parsed_file="$(mktemp "${release_staging}/environment.XXXXXX")"
+  chmod 0600 "$parsed_file"
+  if ! "$node_bin" - "$environment_file" >"$parsed_file" <<'NODE'
+const fs = require("fs");
+
+const environmentPath = process.argv[2];
+const allowed = /^(?:KBASE_|DEDAO_|TOKENPLAN_|WECHAT_|WCPLUS|EVIDENCE_AUDIT_|PROOFROOM_)[A-Z0-9_]*$/;
+const safeStandard = new Set(["HOME", "LANG", "LC_ALL", "TZ"]);
+const seen = new Set();
+const output = [];
+const lines = fs.readFileSync(environmentPath, "utf8").split(/\n/);
+
+function fail(message) {
+  process.stderr.write(`install-release: ${message}\n`);
+  process.exit(1);
+}
+
+for (let index = 0; index < lines.length; index += 1) {
+  let line = lines[index];
+  if (line.endsWith("\r")) {
+    line = line.slice(0, -1);
+  }
+  const trimmed = line.trim();
+  if (trimmed === "" || trimmed.startsWith("#")) {
+    continue;
+  }
+  const separator = line.indexOf("=");
+  if (separator < 1) {
+    fail(`environment line ${index + 1} must be KEY=VALUE`);
+  }
+  const key = line.slice(0, separator).trim();
+  let value = line.slice(separator + 1).trim();
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(key)) {
+    fail(`environment line ${index + 1} has an invalid key`);
+  }
+  if (!allowed.test(key) && !safeStandard.has(key)) {
+    fail(`environment key is not allowed: ${key}`);
+  }
+  if (seen.has(key)) {
+    fail(`environment key is duplicated: ${key}`);
+  }
+  seen.add(key);
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1);
+  } else if (value.startsWith('"') || value.startsWith("'")) {
+    fail(`environment line ${index + 1} has an unterminated quote`);
+  }
+  if ([...value].some((character) => {
+    const code = character.codePointAt(0);
+    return code === 0 || code === 10 || code === 13;
+  })) {
+    fail(`environment line ${index + 1} contains a control character`);
+  }
+  output.push(key, value);
+}
+
+process.stdout.write(`${output.join("\0")}${output.length > 0 ? "\0" : ""}`);
+NODE
+  then
+    rm -f "$parsed_file"
+    return 1
+  fi
+  while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+    parsed_environment+=("${key}=${value}")
+  done <"$parsed_file"
+  rm -f "$parsed_file"
 }
 
 run_with_environment() {
   local environment_file="$1"
   shift
-  bash -c '
-    set -Eeuo pipefail
-    environment_file="$1"
-    shift
-    set -a
-    . "$environment_file"
-    set +a
-    exec "$@"
-  ' install-release-env "$environment_file" "$@"
+  load_environment_arguments "$environment_file"
+  env "${parsed_environment[@]}" "$@"
 }
 
 run_renderer() {
@@ -135,27 +229,14 @@ run_renderer() {
   local output="$4"
   local backend="$5"
   local auth_file="$6"
-  bash -c '
-    set -Eeuo pipefail
-    environment_file="$1"
-    renderer="$2"
-    template="$3"
-    output="$4"
-    backend="$5"
-    auth_file="$6"
-    set -a
-    . "$environment_file"
-    set +a
-    export KBASE_BACKEND_ADDR="$backend"
-    export KBASE_BASIC_AUTH_FILE="$auth_file"
-    exec "$renderer" "$template" "$output"
-  ' install-release-render \
-    "$environment_file" \
+  load_environment_arguments "$environment_file"
+  env \
+    "${parsed_environment[@]}" \
+    "KBASE_BACKEND_ADDR=$backend" \
+    "KBASE_BASIC_AUTH_FILE=$auth_file" \
     "$renderer" \
     "$template" \
-    "$output" \
-    "$backend" \
-    "$auth_file"
+    "$output"
 }
 
 validate_doctor_result() {
@@ -190,16 +271,41 @@ NODE
 
 retry_health() {
   local attempts="$1"
+  local url="$2"
   local index=1
+  local response_file="${release_staging}/health-response.json"
   while ((index <= attempts)); do
     if "$curl_bin" \
       --fail \
       --silent \
       --show-error \
       --max-time 2 \
-      "$health_url" >/dev/null; then
+      "$url" >"$response_file" &&
+      "$node_bin" - "$response_file" <<'NODE'
+const fs = require("fs");
+let value;
+try {
+  value = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+} catch {
+  process.exit(1);
+}
+if (
+  value === null ||
+  Array.isArray(value) ||
+  typeof value !== "object" ||
+  JSON.stringify(Object.keys(value).sort()) !==
+    JSON.stringify(["ok", "service"]) ||
+  value.ok !== true ||
+  value.service !== "dedao-kbase"
+) {
+  process.exit(1);
+}
+NODE
+    then
+      rm -f "$response_file"
       return 0
     fi
+    rm -f "$response_file"
     if ((index < attempts)); then
       sleep 0.1
     fi
@@ -337,7 +443,7 @@ rollback_transaction() {
     printf 'install-release: rollback Nginx reload failed\n' >&2
     failed=1
   fi
-  if ! retry_health 5; then
+  if ! retry_health 5 "$health_url"; then
     printf 'install-release: rollback health check failed\n' >&2
     failed=1
   fi
@@ -401,6 +507,7 @@ validate_paths_and_inputs() {
   local manifest="$1"
   local env_source="$2"
   local basic_auth_file="$3"
+  local public_key="$4"
   local backup_parent
   local target_parent
 
@@ -412,6 +519,7 @@ validate_paths_and_inputs() {
     "$env_target" \
     "$nginx_config_target" \
     "$basic_auth_file" \
+    "$public_key" \
     "$backup_dir" \
     "$health_url" <<'NODE'
 const fs = require("fs");
@@ -425,6 +533,7 @@ const [
   envTarget,
   nginxTarget,
   basicAuth,
+  publicKey,
   backupDirectory,
   healthUrl,
 ] = process.argv.slice(2);
@@ -442,6 +551,7 @@ const absolutePaths = [
   ["environment target", envTarget],
   ["Nginx config target", nginxTarget],
   ["basic auth file", basicAuth],
+  ["trusted public key", publicKey],
   ["backup directory", backupDirectory],
 ];
 for (const [label, value] of absolutePaths) {
@@ -468,10 +578,43 @@ const sourceStat = regular(envSource, "environment source");
 regular(envTarget, "environment target");
 regular(nginxTarget, "Nginx config target");
 regular(basicAuth, "basic auth file");
+regular(publicKey, "trusted public key");
 
 if ((sourceStat.mode & 0o022) !== 0) {
   fail("environment source must not be group/other writable");
 }
+
+function trustedFile(pathname, label) {
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const normalized = path.resolve(pathname);
+  const segments = normalized.split(path.sep).filter(Boolean);
+  let cursor = path.parse(normalized).root;
+  for (let index = 0; index < segments.length; index += 1) {
+    cursor = path.join(cursor, segments[index]);
+    const stat = fs.lstatSync(cursor);
+    if (stat.isSymbolicLink()) {
+      fail(`${label} path must not contain symbolic links`);
+    }
+    const isFile = index === segments.length - 1;
+    if (isFile ? !stat.isFile() : !stat.isDirectory()) {
+      fail(`${label} path has an invalid component`);
+    }
+    if (currentUid === 0 ? stat.uid !== 0 : stat.uid !== 0 && stat.uid !== currentUid) {
+      fail(`${label} path has an untrusted owner`);
+    }
+    if ((stat.mode & 0o022) !== 0) {
+      const trustedStickyDirectory =
+        !isFile && stat.uid === 0 && (stat.mode & 0o1000) !== 0;
+      if (!trustedStickyDirectory) {
+        fail(`${label} path is group/other writable`);
+      }
+    }
+  }
+}
+
+trustedFile(envSource, "environment source");
+trustedFile(basicAuth, "basic auth file");
+trustedFile(publicKey, "trusted public key");
 
 const targets = [binaryTarget, webTarget, envTarget, nginxTarget].map(
   (target) => fs.realpathSync(target),
@@ -564,17 +707,42 @@ validate_web_archive() {
   local names_file="${validation_dir}/web-members.txt"
   local verbose_file="${validation_dir}/web-members.verbose.txt"
 
+  "$node_bin" - "$archive" "$MAX_WEB_ARCHIVE_BYTES" <<'NODE'
+const fs = require("fs");
+const archiveBytes = BigInt(fs.statSync(process.argv[2]).size);
+const maximum = BigInt(process.argv[3]);
+if (archiveBytes > maximum) {
+  process.stderr.write(
+    `install-release: web archive exceeds the compressed size limit: ${archiveBytes} > ${maximum}\n`,
+  );
+  process.exit(1);
+}
+NODE
+
   "$gzip_bin" -dc "$archive" |
     "$tar_bin" --quoting-style=escape -tf - >"$names_file"
   "$gzip_bin" -dc "$archive" |
     "$tar_bin" --quoting-style=escape -tvf - >"$verbose_file"
 
-  "$node_bin" - "$names_file" "$verbose_file" "$WEB_ROOT_NAME" <<'NODE'
+  "$node_bin" - \
+    "$archive" \
+    "$names_file" \
+    "$verbose_file" \
+    "$WEB_ROOT_NAME" \
+    "$MAX_WEB_ARCHIVE_BYTES" \
+    "$MAX_WEB_MEMBERS" \
+    "$MAX_WEB_FILE_BYTES" \
+    "$MAX_WEB_TOTAL_BYTES" <<'NODE'
 const fs = require("fs");
 
-const namesPath = process.argv[2];
-const verbosePath = process.argv[3];
-const expectedRoot = process.argv[4];
+const archivePath = process.argv[2];
+const namesPath = process.argv[3];
+const verbosePath = process.argv[4];
+const expectedRoot = process.argv[5];
+const maxArchiveBytes = Number(process.argv[6]);
+const maxMembers = Number(process.argv[7]);
+const maxFileBytes = Number(process.argv[8]);
+const maxTotalBytes = Number(process.argv[9]);
 
 function fail(message) {
   process.stderr.write(`install-release: ${message}\n`);
@@ -594,7 +762,26 @@ const verbose = lines(verbosePath);
 if (names.length === 0 || names.length !== verbose.length) {
   fail("web archive member listing is empty or inconsistent");
 }
+if (fs.statSync(archivePath).size > maxArchiveBytes) {
+  fail("web archive exceeds the compressed size limit");
+}
+if (names.length > maxMembers) {
+  fail("web archive exceeds the member count limit");
+}
 
+function memberSize(value) {
+  const gnu = value.match(/^\S+\s+\S+\/\S+\s+(\d+)\s+/);
+  if (gnu) {
+    return Number(gnu[1]);
+  }
+  const bsd = value.match(/^\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s+/);
+  if (bsd) {
+    return Number(bsd[1]);
+  }
+  fail("web archive has an unrecognized verbose listing");
+}
+
+let totalBytes = 0;
 for (let index = 0; index < names.length; index += 1) {
   const name = names[index];
   if (
@@ -627,6 +814,17 @@ for (let index = 0; index < names.length; index += 1) {
   const type = verbose[index][0];
   if (type !== "-" && type !== "d") {
     fail(`web archive member type is not allowed: ${name}`);
+  }
+  const size = memberSize(verbose[index]);
+  if (!Number.isSafeInteger(size) || size < 0) {
+    fail(`web archive member has an invalid size: ${name}`);
+  }
+  if (type === "-" && size > maxFileBytes) {
+    fail(`web archive member exceeds the file size limit: ${name}`);
+  }
+  totalBytes += size;
+  if (!Number.isSafeInteger(totalBytes) || totalBytes > maxTotalBytes) {
+    fail("web archive exceeds the expanded size limit");
   }
 }
 NODE
@@ -695,6 +893,58 @@ prepare_target_temporary_files() {
   chmod 0600 "$nginx_temp"
 }
 
+stage_prepared_release() {
+  local manifest="$1"
+  local env_source="$2"
+  local public_key="$3"
+  local original_release
+  local staged_release
+  local name
+
+  [[ "$(base_name "$manifest")" == "prepared-manifest.json" ]] ||
+    die "prepared manifest must use the canonical filename"
+  original_release="$(cd "$(dirname "$manifest")" && pwd -P)"
+  staged_release="${release_staging}/release"
+  mkdir -m 0700 "$staged_release" "${staged_release}/bundle"
+
+  for name in \
+    prepared-manifest.json \
+    MANIFEST.sig \
+    bundle/kbase-server \
+    bundle/web.tar.gz \
+    bundle/kbase.locations.conf.template \
+    bundle/render-kbase-config.sh; do
+    if [[ ! -f "${original_release}/${name}" || -L "${original_release}/${name}" ]]; then
+      die "prepared release input must be a regular file: $name"
+    fi
+    cp "${original_release}/${name}" "${staged_release}/${name}"
+  done
+  chmod 0600 \
+    "${staged_release}/prepared-manifest.json" \
+    "${staged_release}/MANIFEST.sig"
+  chmod 0755 \
+    "${staged_release}/bundle/kbase-server" \
+    "${staged_release}/bundle/render-kbase-config.sh"
+  chmod 0644 \
+    "${staged_release}/bundle/web.tar.gz" \
+    "${staged_release}/bundle/kbase.locations.conf.template"
+
+  staged_public_key="${release_staging}/trusted-release-public-key.pem"
+  cp "$public_key" "$staged_public_key"
+  chmod 0600 "$staged_public_key"
+  staged_environment="${release_staging}/candidate.env"
+  cp "$env_source" "$staged_environment"
+  chmod 0600 "$staged_environment"
+  staged_manifest="${staged_release}/prepared-manifest.json"
+
+  "$PREPARER" verify \
+    --node-bin "$node_bin" \
+    --openssl-bin "$openssl_bin" \
+    --trusted-public-key "$staged_public_key" \
+    --manifest "$staged_manifest" \
+    >/dev/null
+}
+
 install_release() {
   local manifest="$1"
   local env_source="$2"
@@ -708,12 +958,6 @@ install_release() {
   local candidate_nginx
   local template
   local renderer
-
-  "$PREPARER" verify \
-    --node-bin "$node_bin" \
-    --manifest "$manifest" \
-    >/dev/null
-  validate_paths_and_inputs "$manifest" "$env_source" "$basic_auth_file"
 
   if [[ "$("$uname_bin" -s)" != "Linux" ]]; then
     die "install is supported only on Linux"
@@ -732,13 +976,25 @@ install_release() {
   if ((10#$backend_port < 1 || 10#$backend_port > 65535)); then
     die "backend port must be between 1 and 65535"
   fi
+  local expected_health_url="http://${backend_addr}/health"
+  if [[ "$health_url" != "$expected_health_url" ]]; then
+    die "health URL must be the selected loopback backend /health endpoint"
+  fi
+
+  validate_paths_and_inputs \
+    "$manifest" \
+    "$env_source" \
+    "$basic_auth_file" \
+    "$trusted_public_key"
 
   (umask 077; mkdir "$backup_dir")
   chmod 0700 "$backup_dir"
   staging="${backup_dir}/staging"
   mkdir -m 0700 "$staging"
+  release_staging="$staging"
+  stage_prepared_release "$manifest" "$env_source" "$trusted_public_key"
 
-  release_dir="$(cd "$(dirname "$manifest")" && pwd -P)"
+  release_dir="$(cd "$(dirname "$staged_manifest")" && pwd -P)"
   bundle_dir="${release_dir}/bundle"
   candidate_binary="${staging}/kbase-server"
   candidate_web="${staging}/web"
@@ -758,7 +1014,7 @@ install_release() {
 
   doctor_result="${staging}/doctor-result.json"
   run_with_environment \
-    "$env_source" \
+    "$staged_environment" \
     "$candidate_binary" \
     --check-config \
     --web-dir \
@@ -769,7 +1025,7 @@ install_release() {
   doctor_result=""
 
   run_renderer \
-    "$env_source" \
+    "$staged_environment" \
     "$renderer" \
     "$template" \
     "$candidate_nginx" \
@@ -784,7 +1040,7 @@ install_release() {
   prepare_target_temporary_files \
     "$candidate_binary" \
     "$candidate_web" \
-    "$env_source" \
+    "$staged_environment" \
     "$candidate_nginx"
 
   transaction_active=1
@@ -799,15 +1055,16 @@ install_release() {
   nginx_temp=""
 
   "$systemctl_bin" restart "$service_name"
-  retry_health 20
+  retry_health 20 "$health_url"
   "$nginx_bin" -t
   "$systemctl_bin" reload "$nginx_service_name"
-  retry_health 20
+  retry_health 20 "$health_url"
 
   transaction_active=0
   rm -rf "$web_displaced"
   web_displaced=""
   rm -rf "$staging"
+  release_staging=""
   printf '{"schema_version":1,"status":"installed","backup":"retained"}\n'
 }
 
@@ -829,6 +1086,11 @@ main() {
       --manifest)
         require_value "$1" "${2:-}"
         manifest="$2"
+        shift 2
+        ;;
+      --trusted-public-key)
+        require_value "$1" "${2:-}"
+        trusted_public_key="$2"
         shift 2
         ;;
       --binary-target)
@@ -891,6 +1153,11 @@ main() {
         node_bin="$2"
         shift 2
         ;;
+      --openssl-bin)
+        require_value "$1" "${2:-}"
+        openssl_bin="$2"
+        shift 2
+        ;;
       --tar-bin)
         require_value "$1" "${2:-}"
         tar_bin="$2"
@@ -933,6 +1200,7 @@ main() {
 
   for value in \
     "$manifest" \
+    "$trusted_public_key" \
     "$binary_target" \
     "$web_target" \
     "$env_source" \
@@ -954,6 +1222,7 @@ main() {
     die "prepare-release.sh is missing or not executable"
   fi
   require_executable "$node_bin" "Node"
+  require_executable "$openssl_bin" "OpenSSL"
   require_executable "$tar_bin" "tar"
   require_executable "$gzip_bin" "gzip"
   require_executable "$nginx_bin" "Nginx"

@@ -4,10 +4,17 @@ set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 INSTALLER="${ROOT}/deploy/kbase/install-release.sh"
 PREPARER="${ROOT}/deploy/kbase/prepare-release.sh"
+SIGNER="${ROOT}/deploy/kbase/release-signature.sh"
 NODE_BIN="$(command -v node)"
+OPENSSL_BIN="$(command -v openssl)"
 REAL_TAR="$(command -v tar)"
 REAL_GZIP="$(command -v gzip)"
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kbase-install-release.XXXXXX")"
+TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"
+SIGNING_KEY="${TMP_ROOT}/prepared-signing-key.pem"
+TRUSTED_PUBLIC_KEY="${TMP_ROOT}/prepared-public-key.pem"
+WRONG_SIGNING_KEY="${TMP_ROOT}/wrong-signing-key.pem"
+WRONG_PUBLIC_KEY="${TMP_ROOT}/wrong-public-key.pem"
 
 cleanup() {
   rm -rf "$TMP_ROOT"
@@ -60,6 +67,12 @@ fs.writeFileSync(
   { mode: 0o644 },
 );
 NODE
+  rm -f "${release_dir}/MANIFEST.sig"
+  "$SIGNER" sign \
+    --manifest "${release_dir}/prepared-manifest.json" \
+    --signature "${release_dir}/MANIFEST.sig" \
+    --signing-key "$SIGNING_KEY" \
+    --openssl-bin "$OPENSSL_BIN"
 }
 
 create_release() {
@@ -84,11 +97,11 @@ grep -q '^OLD_WEB$' "$ASSERT_WEB_TARGET/index.html"
 grep -q '^OLD_ENV=' "$ASSERT_ENV_TARGET"
 grep -q '^OLD_NGINX$' "$ASSERT_NGINX_TARGET"
 [[ -n "${KBASE_BROWSER_SESSION_SECRET:-}" ]]
-if [[ "${DOCTOR_FAIL:-0}" == "1" ]]; then
+if [[ "${KBASE_TEST_DOCTOR_FAIL:-0}" == "1" ]]; then
   printf 'doctor rejected fixture\n' >&2
   exit 42
 fi
-case "${DOCTOR_OUTPUT_MODE:-valid}" in
+case "${KBASE_TEST_DOCTOR_OUTPUT_MODE:-valid}" in
   empty)
     ;;
   malformed)
@@ -124,7 +137,7 @@ template="${1:-}"
 output="${2:-}"
 [[ -f "$template" ]]
 [[ -n "$output" ]]
-[[ "${RENDER_SECRET:-}" == "available" ]]
+[[ "${KBASE_TEST_RENDER_SECRET:-}" == "available" ]]
 [[ -n "${KBASE_BROWSER_SESSION_SECRET:-}" ]]
 [[ "${KBASE_BACKEND_ADDR:-}" == "127.0.0.1:8719" ]]
 [[ "${KBASE_BASIC_AUTH_FILE:-}" == "$ASSERT_BASIC_AUTH_FILE" ]]
@@ -143,7 +156,9 @@ RENDERER
   rm -rf "$web_source"
   "$PREPARER" verify \
     --node-bin "$NODE_BIN" \
-    --manifest "${release_dir}/prepared-manifest.json"
+    --manifest "${release_dir}/prepared-manifest.json" \
+    --trusted-public-key "$TRUSTED_PUBLIC_KEY" \
+    --openssl-bin "$OPENSSL_BIN"
 }
 
 setup_fake_tools() {
@@ -173,8 +188,10 @@ FAKE_NGINX
   cat >"${fake_dir}/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+invalid_body=0
 if grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
   printf 'health:candidate\n' >>"$INSTALL_LOG"
+  invalid_body="${KBASE_TEST_INVALID_HEALTH_BODY:-0}"
   if [[ "${FAIL_HEALTH:-0}" == "1" ]]; then
     if [[ "${FAIL_ROLLBACK_PREP:-0}" == "1" ]]; then
       rm -rf "${BACKUP_DIR}/snapshot/web"
@@ -184,7 +201,11 @@ if grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
 else
   printf 'health:old\n' >>"$INSTALL_LOG"
 fi
-printf '{"status":"ok"}\n'
+if [[ "$invalid_body" == "1" ]]; then
+  printf '{"status":"ok"}\n'
+else
+  printf '{"ok":true,"service":"dedao-kbase"}\n'
+fi
 FAKE_CURL
 
   cat >"${fake_dir}/tar" <<'FAKE_TAR'
@@ -200,12 +221,25 @@ done
 exec "$REAL_TAR" "${arguments[@]}"
 FAKE_TAR
 
+  cat >"${fake_dir}/openssl-mutate" <<'FAKE_OPENSSL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+"$REAL_OPENSSL" "$@"
+status=$?
+if [[ "$status" == "0" && " $* " == *" -verify "* && -n "${MUTATE_AFTER_VERIFY_FILE:-}" ]]; then
+  printf 'TAMPERED_AFTER_VERIFY\n' >"$MUTATE_AFTER_VERIFY_FILE"
+  unset MUTATE_AFTER_VERIFY_FILE
+fi
+exit "$status"
+FAKE_OPENSSL
+
   chmod 0755 \
     "${fake_dir}/uname" \
     "${fake_dir}/systemctl" \
     "${fake_dir}/nginx" \
     "${fake_dir}/curl" \
-    "${fake_dir}/tar"
+    "${fake_dir}/tar" \
+    "${fake_dir}/openssl-mutate"
 }
 
 setup_case() {
@@ -243,7 +277,7 @@ OLD_BINARY
   chmod 0600 "$BASIC_AUTH_FILE"
   cat >"$ENV_SOURCE" <<'ENVIRONMENT'
 KBASE_BROWSER_SESSION_SECRET=test_only_browser_session_value_1234567890
-RENDER_SECRET=available
+KBASE_TEST_RENDER_SECRET=available
 ENVIRONMENT
   chmod 0600 "$ENV_SOURCE"
   : >"$INSTALL_LOG"
@@ -256,8 +290,10 @@ ENVIRONMENT
   export ASSERT_ENV_TARGET="$ENV_TARGET"
   export ASSERT_NGINX_TARGET="$NGINX_TARGET"
   export ASSERT_BASIC_AUTH_FILE="$BASIC_AUTH_FILE"
-  export REAL_TAR
+  export REAL_TAR REAL_OPENSSL="$OPENSSL_BIN"
   unset FAIL_HEALTH FAIL_ROLLBACK_PREP
+  unset HEALTH_URL_OVERRIDE KBASE_TEST_INVALID_HEALTH_BODY
+  unset OPENSSL_OVERRIDE MUTATE_AFTER_VERIFY_FILE
 }
 
 save_expected_targets() {
@@ -306,8 +342,12 @@ assert_no_target_temporary_entries() {
 
 run_install() {
   local manifest="$1"
+  local trusted_public_key="${2:-$TRUSTED_PUBLIC_KEY}"
+  local health_url="${HEALTH_URL_OVERRIDE:-http://127.0.0.1:8719/health}"
+  local openssl_bin="${OPENSSL_OVERRIDE:-$OPENSSL_BIN}"
   "$INSTALLER" install \
     --manifest "$manifest" \
+    --trusted-public-key "$trusted_public_key" \
     --binary-target "$BINARY_TARGET" \
     --web-target "$WEB_TARGET" \
     --env-source "$ENV_SOURCE" \
@@ -317,7 +357,7 @@ run_install() {
     --backend-addr 127.0.0.1:8719 \
     --service-name dedao-kbase.service \
     --nginx-service-name nginx.service \
-    --health-url http://127.0.0.1:8719/health \
+    --health-url "$health_url" \
     --backup-dir "$BACKUP_DIR" \
     --node-bin "$NODE_BIN" \
     --tar-bin "${FAKE_TOOLS}/tar" \
@@ -325,7 +365,8 @@ run_install() {
     --nginx-bin "${FAKE_TOOLS}/nginx" \
     --systemctl-bin "${FAKE_TOOLS}/systemctl" \
     --curl-bin "${FAKE_TOOLS}/curl" \
-    --uname-bin "${FAKE_TOOLS}/uname"
+    --uname-bin "${FAKE_TOOLS}/uname" \
+    --openssl-bin "$openssl_bin"
 }
 
 assert_log_order() {
@@ -390,6 +431,30 @@ assert_pre_mutation_failure() {
 
 [[ -x "$INSTALLER" ]] || fail "install-release.sh is missing or not executable"
 [[ -x "$PREPARER" ]] || fail "prepare-release.sh is missing or not executable"
+[[ -x "$SIGNER" ]] || fail "release-signature.sh is missing or not executable"
+
+"$OPENSSL_BIN" genpkey \
+  -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 \
+  -out "$SIGNING_KEY" \
+  >/dev/null 2>&1
+"$OPENSSL_BIN" pkey \
+  -in "$SIGNING_KEY" \
+  -pubout \
+  -out "$TRUSTED_PUBLIC_KEY" \
+  >/dev/null 2>&1
+"$OPENSSL_BIN" genpkey \
+  -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 \
+  -out "$WRONG_SIGNING_KEY" \
+  >/dev/null 2>&1
+"$OPENSSL_BIN" pkey \
+  -in "$WRONG_SIGNING_KEY" \
+  -pubout \
+  -out "$WRONG_PUBLIC_KEY" \
+  >/dev/null 2>&1
+chmod 0600 "$SIGNING_KEY" "$WRONG_SIGNING_KEY"
+chmod 0644 "$TRUSTED_PUBLIC_KEY" "$WRONG_PUBLIC_KEY"
 
 FAKE_TOOLS="${TMP_ROOT}/fake-tools"
 BASE_RELEASE="${TMP_ROOT}/prepared-release"
@@ -507,9 +572,72 @@ if run_install "${INVALID_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
 fi
 assert_pre_mutation_failure
 
+setup_case wrong-signing-key
+save_expected_targets
+if run_install \
+  "${BASE_RELEASE}/prepared-manifest.json" \
+  "$WRONG_PUBLIC_KEY" \
+  >/dev/null 2>&1; then
+  fail "release signed by an untrusted key unexpectedly installed"
+fi
+assert_pre_mutation_failure
+
+setup_case staged-release-bytes
+save_expected_targets
+MUTABLE_RELEASE="${CASE_DIR}/release"
+cp -R "$BASE_RELEASE" "$MUTABLE_RELEASE"
+export MUTATE_AFTER_VERIFY_FILE="${MUTABLE_RELEASE}/bundle/kbase-server"
+export OPENSSL_OVERRIDE="${FAKE_TOOLS}/openssl-mutate"
+run_install "${MUTABLE_RELEASE}/prepared-manifest.json" >/dev/null
+grep -q 'CANDIDATE_BINARY_MARKER' "$BINARY_TARGET" ||
+  fail "installer consumed a mutable artifact after verification"
+grep -q '^TAMPERED_AFTER_VERIFY$' "$MUTATE_AFTER_VERIFY_FILE" ||
+  fail "TOCTOU fixture did not mutate the original release"
+unset MUTATE_AFTER_VERIFY_FILE OPENSSL_OVERRIDE
+
+setup_case inert-environment-values
+save_expected_targets
+ENV_MARKER="${CASE_DIR}/environment-executed"
+printf 'KBASE_TEST_INERT=$(touch %s)\n' "$ENV_MARKER" >>"$ENV_SOURCE"
+run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null
+[[ ! -e "$ENV_MARKER" ]] ||
+  fail "environment value was evaluated as shell code"
+
+setup_case disallowed-environment-key
+save_expected_targets
+ENV_MARKER="${CASE_DIR}/bash-env-executed"
+ENV_PAYLOAD="${CASE_DIR}/bash-env.sh"
+printf 'touch "%s"\n' "$ENV_MARKER" >"$ENV_PAYLOAD"
+printf 'BASH_ENV=%s\n' "$ENV_PAYLOAD" >>"$ENV_SOURCE"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "disallowed environment key unexpectedly installed"
+fi
+[[ ! -e "$ENV_MARKER" ]] ||
+  fail "disallowed environment key executed shell code"
+assert_pre_mutation_failure
+
+setup_case unrelated-health-url
+save_expected_targets
+export HEALTH_URL_OVERRIDE="http://127.0.0.1:9999/health"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "unrelated health URL unexpectedly approved install"
+fi
+assert_pre_mutation_failure
+unset HEALTH_URL_OVERRIDE
+
+setup_case invalid-health-contract
+save_expected_targets
+export KBASE_TEST_INVALID_HEALTH_BODY=1
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "invalid KBase health response unexpectedly approved install"
+fi
+assert_targets_match_expected
+assert_rollback_log
+unset KBASE_TEST_INVALID_HEALTH_BODY
+
 setup_case doctor-failure
 save_expected_targets
-printf 'DOCTOR_FAIL=1\n' >>"$ENV_SOURCE"
+printf 'KBASE_TEST_DOCTOR_FAIL=1\n' >>"$ENV_SOURCE"
 if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
   fail "doctor failure unexpectedly installed"
 fi
@@ -524,7 +652,7 @@ assert_no_target_temporary_entries
 for doctor_mode in empty malformed wrong-status wrong-schema; do
   setup_case "doctor-output-${doctor_mode}"
   save_expected_targets
-  printf 'DOCTOR_OUTPUT_MODE=%s\n' "$doctor_mode" >>"$ENV_SOURCE"
+  printf 'KBASE_TEST_DOCTOR_OUTPUT_MODE=%s\n' "$doctor_mode" >>"$ENV_SOURCE"
   if run_install "${BASE_RELEASE}/prepared-manifest.json" \
     >"${CASE_DIR}/stdout" \
     2>"${CASE_DIR}/stderr"; then
@@ -614,12 +742,50 @@ printf 'NEW_WEB\n' >"${UNSAFE_SOURCE}/frontend-web/index.html"
 write_prepared_manifest "$UNSAFE_RELEASE"
 "$PREPARER" verify \
   --node-bin "$NODE_BIN" \
-  --manifest "${UNSAFE_RELEASE}/prepared-manifest.json"
+  --manifest "${UNSAFE_RELEASE}/prepared-manifest.json" \
+  --trusted-public-key "$TRUSTED_PUBLIC_KEY" \
+  --openssl-bin "$OPENSSL_BIN"
 if run_install "${UNSAFE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
   fail "unsafe web archive unexpectedly installed"
 fi
 [[ "$(cat "$OUTSIDE_WEB")" == "OUTSIDE_UNCHANGED" ]] ||
   fail "unsafe archive modified an outside file"
+assert_pre_mutation_failure
+
+setup_case oversized-web-member
+save_expected_targets
+OVERSIZED_RELEASE="${CASE_DIR}/release"
+cp -R "$BASE_RELEASE" "$OVERSIZED_RELEASE"
+OVERSIZED_SOURCE="${CASE_DIR}/oversized-source"
+mkdir -p "${OVERSIZED_SOURCE}/frontend-web"
+printf 'NEW_WEB\n' >"${OVERSIZED_SOURCE}/frontend-web/index.html"
+"$NODE_BIN" - "${OVERSIZED_SOURCE}/frontend-web/huge.bin" <<'NODE'
+const fs = require("fs");
+fs.closeSync(fs.openSync(process.argv[2], "w"));
+fs.truncateSync(process.argv[2], 32 * 1024 * 1024 + 1);
+NODE
+"$REAL_TAR" -C "$OVERSIZED_SOURCE" -cf - frontend-web |
+  "$REAL_GZIP" -n >"${OVERSIZED_RELEASE}/bundle/web.tar.gz"
+write_prepared_manifest "$OVERSIZED_RELEASE"
+if run_install "${OVERSIZED_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "oversized Web archive member unexpectedly installed"
+fi
+assert_pre_mutation_failure
+
+setup_case oversized-compressed-web
+save_expected_targets
+OVERSIZED_COMPRESSED_RELEASE="${CASE_DIR}/release"
+cp -R "$BASE_RELEASE" "$OVERSIZED_COMPRESSED_RELEASE"
+"$NODE_BIN" - "${OVERSIZED_COMPRESSED_RELEASE}/bundle/web.tar.gz" <<'NODE'
+const fs = require("fs");
+fs.truncateSync(process.argv[2], 32 * 1024 * 1024 + 1);
+NODE
+write_prepared_manifest "$OVERSIZED_COMPRESSED_RELEASE"
+if run_install \
+  "${OVERSIZED_COMPRESSED_RELEASE}/prepared-manifest.json" \
+  >/dev/null 2>&1; then
+  fail "oversized compressed Web archive unexpectedly installed"
+fi
 assert_pre_mutation_failure
 
 printf 'install release smoke: PASS\n'

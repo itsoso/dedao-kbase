@@ -31,6 +31,23 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Resolve trusted Go binary
+        id: trusted-go
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          go_bin="$(realpath "$(command -v go)")"
+          tool_cache="$(realpath "$RUNNER_TOOL_CACHE")"
+          case "$go_bin" in
+            "$tool_cache"/*/bin/go) ;;
+            *)
+              printf 'Go binary is outside RUNNER_TOOL_CACHE: %s\n' "$go_bin" >&2
+              exit 1
+              ;;
+          esac
+          test -x "$go_bin"
+          printf 'bin=%s\n' "$go_bin" >> "$GITHUB_OUTPUT"
+
       - name: Set up Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -49,13 +66,42 @@ jobs:
       - name: Assert normal-user execution
         run: test "$(id -u)" -ne 0
 
+      - name: Generate ephemeral release signing keys
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          openssl_bin="$(command -v openssl)"
+          test -x "$openssl_bin"
+          key_dir="$RUNNER_TEMP/kbase-release-signing"
+          install -d -m 0700 "$key_dir"
+          "$openssl_bin" genpkey \
+            -algorithm RSA \
+            -pkeyopt rsa_keygen_bits:3072 \
+            -out "$key_dir/source-private.pem"
+          "$openssl_bin" pkey \
+            -in "$key_dir/source-private.pem" \
+            -pubout \
+            -out "$key_dir/source-public.pem"
+          "$openssl_bin" genpkey \
+            -algorithm RSA \
+            -pkeyopt rsa_keygen_bits:3072 \
+            -out "$key_dir/prepared-private.pem"
+          "$openssl_bin" pkey \
+            -in "$key_dir/prepared-private.pem" \
+            -pubout \
+            -out "$key_dir/prepared-public.pem"
+          chmod 0600 "$key_dir/source-private.pem" "$key_dir/prepared-private.pem"
+          chmod 0644 "$key_dir/source-public.pem" "$key_dir/prepared-public.pem"
+
       - name: Assemble immutable source release
         run: |
           mkdir -p "$RUNNER_TEMP/kbase-release-e2e"
           bash deploy/kbase/assemble-release.sh create \
             --repo "$GITHUB_WORKSPACE" \
             --revision "$GITHUB_SHA" \
-            --output-dir "$RUNNER_TEMP/kbase-release-e2e/source"
+            --output-dir "$RUNNER_TEMP/kbase-release-e2e/source" \
+            --signing-key "$RUNNER_TEMP/kbase-release-signing/source-private.pem" \
+            --openssl-bin "$(command -v openssl)"
 
       - name: Verify Go modules
         run: go mod verify
@@ -81,10 +127,9 @@ jobs:
       - name: Test root-only permission ceiling
         run: |
           sudo env \
-            "PATH=$PATH" \
             "GOCACHE=$RUNNER_TEMP/go-build-root" \
             "GOFLAGS=$GOFLAGS" \
-            go test ./backend/app \
+            "${{ steps.trusted-go.outputs.bin }}" test ./backend/app \
               -run '^TestBrowserSessionStoreDirectoryPermissionCeiling$' \
               -count=1
 
@@ -124,13 +169,18 @@ jobs:
           bash deploy/kbase/prepare-release.sh create \
             --source-manifest "$RUNNER_TEMP/kbase-release-e2e/source/release-manifest.json" \
             --output-dir "$RUNNER_TEMP/kbase-release-e2e/prepared" \
+            --source-public-key "$RUNNER_TEMP/kbase-release-signing/source-public.pem" \
+            --signing-key "$RUNNER_TEMP/kbase-release-signing/prepared-private.pem" \
             --node-bin "$(command -v node)" \
             --go-bin "$(command -v go)" \
             --npm-bin "$(command -v npm)" \
             --tar-bin "$(command -v tar)" \
             --gzip-bin "$(command -v gzip)" \
             --nginx-bin "$(command -v nginx)" \
-            --uname-bin "$(command -v uname)"
+            --uname-bin "$(command -v uname)" \
+            --openssl-bin "$(command -v openssl)"
           bash deploy/kbase/prepare-release.sh verify \
             --manifest "$RUNNER_TEMP/kbase-release-e2e/prepared/prepared-manifest.json" \
-            --node-bin "$(command -v node)"
+            --trusted-public-key "$RUNNER_TEMP/kbase-release-signing/prepared-public.pem" \
+            --node-bin "$(command -v node)" \
+            --openssl-bin "$(command -v openssl)"

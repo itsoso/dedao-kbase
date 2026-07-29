@@ -4,16 +4,18 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ASSEMBLER="${SCRIPT_DIR}/assemble-release.sh"
+SIGNATURE_HELPER="${SCRIPT_DIR}/release-signature.sh"
 SCHEMA="dedao-kbase-source-release/v1"
 ARCHIVE_NAME="source.tar.gz"
 MANIFEST_NAME="release-manifest.json"
+SIGNATURE_NAME="MANIFEST.sig"
 ARCHIVE_PREFIX="dedao-kbase-source/"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  assemble-release.sh create --repo PATH --revision REVISION --output-dir PATH
-  assemble-release.sh verify --manifest PATH [--node-bin PATH]
+  assemble-release.sh create --repo PATH --revision REVISION --output-dir PATH --signing-key PATH [--openssl-bin PATH]
+  assemble-release.sh verify --manifest PATH --trusted-public-key PATH [--node-bin PATH] [--openssl-bin PATH]
 USAGE
 }
 
@@ -47,6 +49,8 @@ create_release() {
   repo=""
   revision=""
   output_dir=""
+  signing_key=""
+  openssl_bin="openssl"
 
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -65,6 +69,16 @@ create_release() {
         output_dir="$2"
         shift 2
         ;;
+      --signing-key)
+        require_option_value "$1" "${2:-}"
+        signing_key="$2"
+        shift 2
+        ;;
+      --openssl-bin)
+        require_option_value "$1" "${2:-}"
+        openssl_bin="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -78,6 +92,7 @@ create_release() {
   [[ -n "$repo" ]] || fail "create requires --repo"
   [[ -n "$revision" ]] || fail "create requires --revision"
   [[ -n "$output_dir" ]] || fail "create requires --output-dir"
+  [[ -n "$signing_key" ]] || fail "create requires --signing-key"
   case "$revision" in
     -*) fail "revision must not begin with '-'" ;;
   esac
@@ -85,6 +100,11 @@ create_release() {
   require_command git
   require_command gzip
   require_command node
+  require_executable "$openssl_bin" "OpenSSL"
+  [[ -x "$SIGNATURE_HELPER" ]] ||
+    fail "release signature helper is not executable"
+  [[ -f "$signing_key" && ! -L "$signing_key" ]] ||
+    fail "signing key must be a regular file"
 
   [[ -d "$repo" ]] || fail "repository does not exist: $repo"
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
@@ -134,6 +154,8 @@ create_release() {
 
   temporary_archive="${temporary_dir}/${ARCHIVE_NAME}"
   temporary_manifest="${temporary_dir}/${MANIFEST_NAME}"
+  temporary_signature="${temporary_dir}/${SIGNATURE_NAME}"
+  temporary_public_key="${temporary_dir}/.verification-public.pem"
 
   git -C "$repo" archive \
     --format=tar \
@@ -177,7 +199,21 @@ stream.on("end", () => {
 });
 NODE
 
-  "$ASSEMBLER" verify --manifest "$temporary_manifest"
+  "$SIGNATURE_HELPER" sign \
+    --manifest "$temporary_manifest" \
+    --signature "$temporary_signature" \
+    --signing-key "$signing_key" \
+    --openssl-bin "$openssl_bin"
+  "$openssl_bin" pkey \
+    -in "$signing_key" \
+    -pubout \
+    -out "$temporary_public_key" >/dev/null 2>&1 ||
+    fail "cannot derive verification public key from signing key"
+  "$ASSEMBLER" verify \
+    --manifest "$temporary_manifest" \
+    --trusted-public-key "$temporary_public_key" \
+    --openssl-bin "$openssl_bin"
+  rm -f "$temporary_public_key"
   if [[ -e "$output_dir" || -L "$output_dir" ]]; then
     fail "output directory appeared during assembly: $output_dir"
   fi
@@ -189,6 +225,8 @@ NODE
 verify_release() {
   manifest=""
   node_bin="node"
+  trusted_public_key=""
+  openssl_bin="openssl"
 
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -202,6 +240,16 @@ verify_release() {
         node_bin="$2"
         shift 2
         ;;
+      --trusted-public-key)
+        require_option_value "$1" "${2:-}"
+        trusted_public_key="$2"
+        shift 2
+        ;;
+      --openssl-bin)
+        require_option_value "$1" "${2:-}"
+        openssl_bin="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -213,8 +261,26 @@ verify_release() {
   done
 
   [[ -n "$manifest" ]] || fail "verify requires --manifest"
+  [[ -n "$trusted_public_key" ]] ||
+    fail "verify requires --trusted-public-key"
   require_executable "$node_bin" "Node"
-  [[ -f "$manifest" ]] || fail "manifest does not exist: $manifest"
+  require_executable "$openssl_bin" "OpenSSL"
+  [[ -x "$SIGNATURE_HELPER" ]] ||
+    fail "release signature helper is not executable"
+  [[ -f "$manifest" && ! -L "$manifest" ]] ||
+    fail "manifest must be a regular file"
+  if [[ "$manifest" == */* ]]; then
+    manifest_directory="${manifest%/*}"
+    [[ -n "$manifest_directory" ]] || manifest_directory="/"
+  else
+    manifest_directory="."
+  fi
+  signature="${manifest_directory}/${SIGNATURE_NAME}"
+  "$SIGNATURE_HELPER" verify \
+    --manifest "$manifest" \
+    --signature "$signature" \
+    --trusted-public-key "$trusted_public_key" \
+    --openssl-bin "$openssl_bin"
 
   "$node_bin" - "$manifest" "$SCHEMA" <<'NODE'
 const crypto = require("crypto");

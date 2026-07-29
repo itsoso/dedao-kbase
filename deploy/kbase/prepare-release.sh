@@ -5,15 +5,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ASSEMBLER="${SCRIPT_DIR}/assemble-release.sh"
 PREPARER="${SCRIPT_DIR}/prepare-release.sh"
+SIGNATURE_HELPER="${SCRIPT_DIR}/release-signature.sh"
 SCHEMA="dedao-kbase-prepared-release/v1"
 MANIFEST_NAME="prepared-manifest.json"
+SIGNATURE_NAME="MANIFEST.sig"
+SOURCE_MANIFEST_NAME="release-manifest.json"
+SOURCE_SIGNATURE_NAME="MANIFEST.sig"
+SOURCE_ARCHIVE_NAME="source.tar.gz"
 SOURCE_ROOT_NAME="dedao-kbase-source"
+DEFAULT_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES=268435456
+DEFAULT_SOURCE_ARCHIVE_MAX_MEMBERS=100000
+DEFAULT_SOURCE_ARCHIVE_MAX_FILE_BYTES=67108864
+DEFAULT_SOURCE_ARCHIVE_MAX_EXPANDED_BYTES=1073741824
 
 usage() {
   cat <<'USAGE'
 Usage:
-  prepare-release.sh create --source-manifest PATH --output-dir PATH [tool options]
-  prepare-release.sh verify --manifest PATH [--node-bin PATH]
+  prepare-release.sh create --source-manifest PATH --source-public-key PATH --signing-key PATH --output-dir PATH [tool options]
+  prepare-release.sh verify --manifest PATH --trusted-public-key PATH [--node-bin PATH] [--openssl-bin PATH]
 
 Create tool options:
   --go-bin PATH
@@ -23,7 +32,14 @@ Create tool options:
   --gzip-bin PATH
   --nginx-bin PATH
   --uname-bin PATH
+  --openssl-bin PATH
   --proxy-smoke-script PATH
+
+Source archive quotas may be lowered with:
+  KBASE_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES
+  KBASE_SOURCE_ARCHIVE_MAX_MEMBERS
+  KBASE_SOURCE_ARCHIVE_MAX_FILE_BYTES
+  KBASE_SOURCE_ARCHIVE_MAX_EXPANDED_BYTES
 USAGE
 }
 
@@ -49,6 +65,32 @@ require_executable() {
   fi
 }
 
+require_positive_integer() {
+  value="$1"
+  label="$2"
+  case "$value" in
+    ""|*[!0-9]*) fail "${label} must be a positive integer" ;;
+  esac
+  [[ "$value" != "0" ]] || fail "${label} must be greater than zero"
+}
+
+require_quota_not_above() {
+  value="$1"
+  maximum="$2"
+  label="$3"
+  "$node_bin" - "$value" "$maximum" "$label" <<'NODE'
+const value = BigInt(process.argv[2]);
+const maximum = BigInt(process.argv[3]);
+const label = process.argv[4];
+if (value > maximum) {
+  process.stderr.write(
+    `prepare-release: ${label} may only lower the default quota\n`,
+  );
+  process.exit(1);
+}
+NODE
+}
+
 validate_output_target() {
   output_dir="$1"
   output_name="${output_dir##*/}"
@@ -70,6 +112,37 @@ validate_output_target() {
   fi
 }
 
+stage_source_release() {
+  source_manifest="$1"
+  source_input_dir="$2"
+
+  if [[ "$source_manifest" == */* ]]; then
+    source_release_dir="${source_manifest%/*}"
+    [[ -n "$source_release_dir" ]] || source_release_dir="/"
+  else
+    source_release_dir="."
+  fi
+  source_signature="${source_release_dir}/${SOURCE_SIGNATURE_NAME}"
+  source_archive="${source_release_dir}/${SOURCE_ARCHIVE_NAME}"
+
+  [[ -f "$source_manifest" && ! -L "$source_manifest" ]] ||
+    fail "source manifest must be a regular file"
+  [[ -f "$source_signature" && ! -L "$source_signature" ]] ||
+    fail "source signature must be a regular file"
+  [[ -f "$source_archive" && ! -L "$source_archive" ]] ||
+    fail "source archive must be a regular file"
+
+  mkdir "$source_input_dir"
+  chmod 0700 "$source_input_dir"
+  cp "$source_manifest" "${source_input_dir}/${SOURCE_MANIFEST_NAME}"
+  cp "$source_signature" "${source_input_dir}/${SOURCE_SIGNATURE_NAME}"
+  cp "$source_archive" "${source_input_dir}/${SOURCE_ARCHIVE_NAME}"
+  chmod 0600 \
+    "${source_input_dir}/${SOURCE_MANIFEST_NAME}" \
+    "${source_input_dir}/${SOURCE_SIGNATURE_NAME}" \
+    "${source_input_dir}/${SOURCE_ARCHIVE_NAME}"
+}
+
 source_manifest_value() {
   node_bin="$1"
   manifest="$2"
@@ -86,8 +159,29 @@ if (field === "revision") {
   process.stdout.write(manifest.revision);
 } else if (field === "artifact") {
   process.stdout.write(path.resolve(path.dirname(manifestPath), manifest.artifact));
+} else if (field === "artifact-name") {
+  process.stdout.write(manifest.artifact);
 } else {
   throw new Error(`unsupported source manifest field: ${field}`);
+}
+NODE
+}
+
+validate_source_archive_compressed_size() {
+  node_bin="$1"
+  source_archive="$2"
+  max_compressed_bytes="$3"
+  "$node_bin" - "$source_archive" "$max_compressed_bytes" <<'NODE'
+const fs = require("fs");
+
+const archivePath = process.argv[2];
+const maxCompressedBytes = BigInt(process.argv[3]);
+const compressedBytes = BigInt(fs.statSync(archivePath).size);
+if (compressedBytes > maxCompressedBytes) {
+  process.stderr.write(
+    `prepare-release: source archive compressed size exceeds quota: ${compressedBytes} > ${maxCompressedBytes}\n`,
+  );
+  process.exit(1);
 }
 NODE
 }
@@ -98,6 +192,10 @@ validate_source_archive() {
   gzip_bin="$3"
   source_archive="$4"
   validation_dir="$5"
+  max_compressed_bytes="$6"
+  max_members="$7"
+  max_file_bytes="$8"
+  max_expanded_bytes="$9"
   names_file="${validation_dir}/source-members.txt"
   verbose_file="${validation_dir}/source-members.verbose.txt"
 
@@ -109,12 +207,22 @@ validate_source_archive() {
   "$node_bin" - \
     "$names_file" \
     "$verbose_file" \
-    "$SOURCE_ROOT_NAME" <<'NODE'
+    "$SOURCE_ROOT_NAME" \
+    "$source_archive" \
+    "$max_compressed_bytes" \
+    "$max_members" \
+    "$max_file_bytes" \
+    "$max_expanded_bytes" <<'NODE'
 const fs = require("fs");
 
 const namesPath = process.argv[2];
 const verbosePath = process.argv[3];
 const expectedRoot = process.argv[4];
+const archivePath = process.argv[5];
+const maxCompressedBytes = BigInt(process.argv[6]);
+const maxMembers = BigInt(process.argv[7]);
+const maxFileBytes = BigInt(process.argv[8]);
+const maxExpandedBytes = BigInt(process.argv[9]);
 
 function fail(message) {
   process.stderr.write(`prepare-release: ${message}\n`);
@@ -135,7 +243,42 @@ const verbose = lines(verbosePath);
 if (names.length === 0 || names.length !== verbose.length) {
   fail("source archive member listing is empty or inconsistent");
 }
+const compressedBytes = BigInt(fs.statSync(archivePath).size);
+if (compressedBytes > maxCompressedBytes) {
+  fail(
+    `source archive compressed size exceeds quota: ${compressedBytes} > ${maxCompressedBytes}`,
+  );
+}
+if (BigInt(names.length) > maxMembers) {
+  fail(
+    `source archive member count exceeds quota: ${names.length} > ${maxMembers}`,
+  );
+}
 
+function memberSize(line, type, name) {
+  if (type === "d") {
+    return 0n;
+  }
+  const fields = line.trim().split(/\s+/);
+  let rawSize;
+  if (fields.length >= 3 && fields[1].includes("/")) {
+    // GNU tar: mode owner/group size timestamp name
+    rawSize = fields[2];
+  } else if (
+    fields.length >= 5 &&
+    /^\d+$/.test(fields[1]) &&
+    !fields[2].includes("/")
+  ) {
+    // BSD tar: mode link-count owner group size timestamp name
+    rawSize = fields[4];
+  }
+  if (!rawSize || !/^\d+$/.test(rawSize)) {
+    fail(`cannot determine expanded size for source member: ${name}`);
+  }
+  return BigInt(rawSize);
+}
+
+let expandedBytes = 0n;
 for (let index = 0; index < names.length; index += 1) {
   const name = names[index];
   if (
@@ -169,6 +312,18 @@ for (let index = 0; index < names.length; index += 1) {
   const type = verbose[index][0];
   if (type !== "-" && type !== "d") {
     fail(`source archive member type is not allowed: ${name}`);
+  }
+  const size = memberSize(verbose[index], type, name);
+  if (size > maxFileBytes) {
+    fail(
+      `source archive member exceeds per-file quota: ${name} (${size} > ${maxFileBytes})`,
+    );
+  }
+  expandedBytes += size;
+  if (expandedBytes > maxExpandedBytes) {
+    fail(
+      `source archive expanded size exceeds quota: ${expandedBytes} > ${maxExpandedBytes}`,
+    );
   }
 }
 NODE
@@ -270,6 +425,8 @@ NODE
 
 create_release() {
   source_manifest=""
+  source_public_key=""
+  signing_key=""
   output_dir=""
   go_bin="go"
   npm_bin="npm"
@@ -278,6 +435,7 @@ create_release() {
   gzip_bin="gzip"
   nginx_bin="nginx"
   uname_bin="uname"
+  openssl_bin="openssl"
   proxy_smoke_script=""
 
   while [[ "$#" -gt 0 ]]; do
@@ -285,6 +443,16 @@ create_release() {
       --source-manifest)
         require_option_value "$1" "${2:-}"
         source_manifest="$2"
+        shift 2
+        ;;
+      --source-public-key)
+        require_option_value "$1" "${2:-}"
+        source_public_key="$2"
+        shift 2
+        ;;
+      --signing-key)
+        require_option_value "$1" "${2:-}"
+        signing_key="$2"
         shift 2
         ;;
       --output-dir)
@@ -327,6 +495,11 @@ create_release() {
         uname_bin="$2"
         shift 2
         ;;
+      --openssl-bin)
+        require_option_value "$1" "${2:-}"
+        openssl_bin="$2"
+        shift 2
+        ;;
       --proxy-smoke-script)
         require_option_value "$1" "${2:-}"
         proxy_smoke_script="$2"
@@ -343,17 +516,103 @@ create_release() {
   done
 
   [[ -n "$source_manifest" ]] || fail "create requires --source-manifest"
+  [[ -n "$source_public_key" ]] ||
+    fail "create requires --source-public-key"
+  [[ -n "$signing_key" ]] || fail "create requires --signing-key"
   [[ -n "$output_dir" ]] || fail "create requires --output-dir"
-  [[ -x "$ASSEMBLER" ]] || fail "source release assembler is not executable"
-  [[ -f "$source_manifest" ]] || fail "source manifest does not exist"
+  effective_uid="${EUID:-$(id -u)}"
+  [[ "$effective_uid" != "0" ]] ||
+    fail "release preparation must not run as root"
+  validate_output_target "$output_dir"
 
-  # Source integrity is the first release gate. No build command may run first.
+  [[ -x "$ASSEMBLER" ]] || fail "source release assembler is not executable"
+  [[ -x "$SIGNATURE_HELPER" ]] ||
+    fail "release signature helper is not executable"
+  require_executable "$node_bin" "Node"
+  require_executable "$openssl_bin" "OpenSSL"
+  [[ -f "$source_public_key" && ! -L "$source_public_key" ]] ||
+    fail "source public key must be a regular file"
+  [[ -f "$signing_key" && ! -L "$signing_key" ]] ||
+    fail "signing key must be a regular file"
+
+  max_compressed_bytes="$(
+    printf '%s' "${KBASE_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES:-$DEFAULT_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES}"
+  )"
+  max_members="$(
+    printf '%s' "${KBASE_SOURCE_ARCHIVE_MAX_MEMBERS:-$DEFAULT_SOURCE_ARCHIVE_MAX_MEMBERS}"
+  )"
+  max_file_bytes="$(
+    printf '%s' "${KBASE_SOURCE_ARCHIVE_MAX_FILE_BYTES:-$DEFAULT_SOURCE_ARCHIVE_MAX_FILE_BYTES}"
+  )"
+  max_expanded_bytes="$(
+    printf '%s' "${KBASE_SOURCE_ARCHIVE_MAX_EXPANDED_BYTES:-$DEFAULT_SOURCE_ARCHIVE_MAX_EXPANDED_BYTES}"
+  )"
+  require_positive_integer \
+    "$max_compressed_bytes" \
+    "source compressed-size quota"
+  require_positive_integer "$max_members" "source member-count quota"
+  require_positive_integer "$max_file_bytes" "source per-file quota"
+  require_positive_integer \
+    "$max_expanded_bytes" \
+    "source expanded-size quota"
+  require_quota_not_above \
+    "$max_compressed_bytes" \
+    "$DEFAULT_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES" \
+    "source compressed-size quota"
+  require_quota_not_above \
+    "$max_members" \
+    "$DEFAULT_SOURCE_ARCHIVE_MAX_MEMBERS" \
+    "source member-count quota"
+  require_quota_not_above \
+    "$max_file_bytes" \
+    "$DEFAULT_SOURCE_ARCHIVE_MAX_FILE_BYTES" \
+    "source per-file quota"
+  require_quota_not_above \
+    "$max_expanded_bytes" \
+    "$DEFAULT_SOURCE_ARCHIVE_MAX_EXPANDED_BYTES" \
+    "source expanded-size quota"
+
+  temporary_dir="$(
+    mktemp -d "${output_parent}/.${output_name}.staging.XXXXXX"
+  )"
+  chmod 0700 "$temporary_dir"
+  cleanup_staging() {
+    if [[ -n "${temporary_dir:-}" && -d "$temporary_dir" ]]; then
+      rm -rf "$temporary_dir"
+    fi
+  }
+  trap cleanup_staging EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  source_input_dir="${temporary_dir}/source-input"
+  stage_source_release "$source_manifest" "$source_input_dir"
+  staged_source_manifest="${source_input_dir}/${SOURCE_MANIFEST_NAME}"
+
+  # Verify and consume only the private staged source bytes.
   "$ASSEMBLER" verify \
     --node-bin "$node_bin" \
-    --manifest "$source_manifest"
+    --manifest "$staged_source_manifest" \
+    --trusted-public-key "$source_public_key" \
+    --openssl-bin "$openssl_bin"
+  revision="$(
+    source_manifest_value "$node_bin" "$staged_source_manifest" revision
+  )"
+  source_artifact="$(
+    source_manifest_value \
+      "$node_bin" \
+      "$staged_source_manifest" \
+      artifact-name
+  )"
+  [[ "$source_artifact" == "$SOURCE_ARCHIVE_NAME" ]] ||
+    fail "source manifest artifact must be ${SOURCE_ARCHIVE_NAME}"
+  source_archive="${source_input_dir}/${SOURCE_ARCHIVE_NAME}"
+  validate_source_archive_compressed_size \
+    "$node_bin" \
+    "$source_archive" \
+    "$max_compressed_bytes"
 
-  validate_output_target "$output_dir"
-  require_executable "$node_bin" "Node"
   require_executable "$uname_bin" "uname"
   platform="$("$uname_bin" -s)"
   [[ "$platform" == "Linux" ]] ||
@@ -372,22 +631,6 @@ create_release() {
     *) fail "release preparation requires GNU tar" ;;
   esac
 
-  revision="$(source_manifest_value "$node_bin" "$source_manifest" revision)"
-  source_archive="$(source_manifest_value "$node_bin" "$source_manifest" artifact)"
-
-  temporary_dir="$(
-    mktemp -d "${output_parent}/.${output_name}.staging.XXXXXX"
-  )"
-  cleanup_staging() {
-    if [[ -n "${temporary_dir:-}" && -d "$temporary_dir" ]]; then
-      rm -rf "$temporary_dir"
-    fi
-  }
-  trap cleanup_staging EXIT
-  trap 'exit 129' HUP
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-
   extract_dir="${temporary_dir}/source"
   bundle_dir="${temporary_dir}/bundle"
   validation_dir="${temporary_dir}/validation"
@@ -397,7 +640,11 @@ create_release() {
     "$tar_bin" \
     "$gzip_bin" \
     "$source_archive" \
-    "$validation_dir"
+    "$validation_dir" \
+    "$max_compressed_bytes" \
+    "$max_members" \
+    "$max_file_bytes" \
+    "$max_expanded_bytes"
   rm -rf "$validation_dir"
   "$gzip_bin" -dc "$source_archive" |
     "$tar_bin" \
@@ -511,11 +758,26 @@ create_release() {
     "$prepared_manifest" \
     "$revision" \
     "$bundle_dir"
+  prepared_signature="${temporary_dir}/${SIGNATURE_NAME}"
+  verification_public_key="${temporary_dir}/.verification-public.pem"
+  "$SIGNATURE_HELPER" sign \
+    --manifest "$prepared_manifest" \
+    --signature "$prepared_signature" \
+    --signing-key "$signing_key" \
+    --openssl-bin "$openssl_bin"
+  "$openssl_bin" pkey \
+    -in "$signing_key" \
+    -pubout \
+    -out "$verification_public_key" >/dev/null 2>&1 ||
+    fail "cannot derive verification public key from signing key"
   "$PREPARER" verify \
     --node-bin "$node_bin" \
-    --manifest "$prepared_manifest"
+    --manifest "$prepared_manifest" \
+    --trusted-public-key "$verification_public_key" \
+    --openssl-bin "$openssl_bin"
+  rm -f "$verification_public_key"
 
-  rm -rf "$extract_dir"
+  rm -rf "$extract_dir" "$source_input_dir"
   if [[ -e "$output_dir" || -L "$output_dir" ]]; then
     fail "output directory appeared during preparation: $output_dir"
   fi
@@ -527,6 +789,8 @@ create_release() {
 verify_release() {
   manifest=""
   node_bin="node"
+  trusted_public_key=""
+  openssl_bin="openssl"
 
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
@@ -540,6 +804,16 @@ verify_release() {
         node_bin="$2"
         shift 2
         ;;
+      --trusted-public-key)
+        require_option_value "$1" "${2:-}"
+        trusted_public_key="$2"
+        shift 2
+        ;;
+      --openssl-bin)
+        require_option_value "$1" "${2:-}"
+        openssl_bin="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -551,9 +825,26 @@ verify_release() {
   done
 
   [[ -n "$manifest" ]] || fail "verify requires --manifest"
+  [[ -n "$trusted_public_key" ]] ||
+    fail "verify requires --trusted-public-key"
   require_executable "$node_bin" "Node"
+  require_executable "$openssl_bin" "OpenSSL"
+  [[ -x "$SIGNATURE_HELPER" ]] ||
+    fail "release signature helper is not executable"
   [[ -f "$manifest" && ! -L "$manifest" ]] ||
     fail "prepared manifest must be a regular file"
+  if [[ "$manifest" == */* ]]; then
+    manifest_directory="${manifest%/*}"
+    [[ -n "$manifest_directory" ]] || manifest_directory="/"
+  else
+    manifest_directory="."
+  fi
+  signature="${manifest_directory}/${SIGNATURE_NAME}"
+  "$SIGNATURE_HELPER" verify \
+    --manifest "$manifest" \
+    --signature "$signature" \
+    --trusted-public-key "$trusted_public_key" \
+    --openssl-bin "$openssl_bin"
 
   "$node_bin" - "$manifest" "$SCHEMA" <<'NODE'
 const crypto = require("crypto");
