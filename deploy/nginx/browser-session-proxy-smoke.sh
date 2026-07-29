@@ -19,6 +19,10 @@ for command in "${nginx_bin}" curl openssl; do
 done
 
 temporary="$(mktemp -d)"
+nginx_error_args=()
+if "${nginx_bin}" -h 2>&1 | grep -Fq ' -e '; then
+  nginx_error_args=(-e "${temporary}/nginx-error.log")
+fi
 backend_pid=""
 nginx_started=0
 cleanup() {
@@ -26,7 +30,7 @@ cleanup() {
     "${nginx_bin}" \
       -p "${temporary}/nginx-prefix" \
       -c "${temporary}/nginx.conf" \
-      -e "${temporary}/nginx-error.log" \
+      "${nginx_error_args[@]}" \
       -s quit >/dev/null 2>&1 || true
   fi
   if [[ -n "${backend_pid}" ]]; then
@@ -156,12 +160,12 @@ EOF
 "${nginx_bin}" \
   -p "${temporary}/nginx-prefix" \
   -c "${temporary}/nginx.conf" \
-  -e "${temporary}/nginx-error.log" \
+  "${nginx_error_args[@]}" \
   -t >/dev/null
 "${nginx_bin}" \
   -p "${temporary}/nginx-prefix" \
   -c "${temporary}/nginx.conf" \
-  -e "${temporary}/nginx-error.log"
+  "${nginx_error_args[@]}"
 nginx_started=1
 
 proxy_base="http://127.0.0.1:${proxy_port}"
