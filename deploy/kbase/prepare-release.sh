@@ -13,7 +13,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   prepare-release.sh create --source-manifest PATH --output-dir PATH [tool options]
-  prepare-release.sh verify --manifest PATH
+  prepare-release.sh verify --manifest PATH [--node-bin PATH]
 
 Create tool options:
   --go-bin PATH
@@ -373,7 +373,9 @@ create_release() {
     "$prepared_manifest" \
     "$revision" \
     "$bundle_dir"
-  "$PREPARER" verify --manifest "$prepared_manifest"
+  "$PREPARER" verify \
+    --node-bin "$node_bin" \
+    --manifest "$prepared_manifest"
 
   rm -rf "$extract_dir"
   if [[ -e "$output_dir" || -L "$output_dir" ]]; then
@@ -386,12 +388,18 @@ create_release() {
 
 verify_release() {
   manifest=""
+  node_bin="node"
 
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --manifest)
         require_option_value "$1" "${2:-}"
         manifest="$2"
+        shift 2
+        ;;
+      --node-bin)
+        require_option_value "$1" "${2:-}"
+        node_bin="$2"
         shift 2
         ;;
       -h|--help)
@@ -405,11 +413,11 @@ verify_release() {
   done
 
   [[ -n "$manifest" ]] || fail "verify requires --manifest"
-  require_executable node "Node"
+  require_executable "$node_bin" "Node"
   [[ -f "$manifest" && ! -L "$manifest" ]] ||
     fail "prepared manifest must be a regular file"
 
-  node - "$manifest" "$SCHEMA" <<'NODE'
+  "$node_bin" - "$manifest" "$SCHEMA" <<'NODE'
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");

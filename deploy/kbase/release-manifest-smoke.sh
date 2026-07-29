@@ -490,6 +490,13 @@ if (raw.includes(privateRoot)) {
 NODE
 
 : >"$GATE_LOG"
+"$PREPARER" verify \
+  --node-bin "${FAKE_BIN}/node" \
+  --manifest "$PREPARED_MANIFEST"
+grep -E -q '^node:- .*prepared-manifest\.json ' "$GATE_LOG" ||
+  fail "explicit verifier Node wrapper was not invoked"
+
+: >"$GATE_LOG"
 prepare_fixture "$MANIFEST_ONE" "$PREPARED_TWO"
 cmp \
   "${PREPARED_ONE}/bundle/web.tar.gz" \
