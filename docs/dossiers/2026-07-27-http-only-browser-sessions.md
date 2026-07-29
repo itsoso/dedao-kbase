@@ -2,9 +2,10 @@
 
 ## Status
 
-G1-G4 passed. G5-G6 have not started.
+COMPLETE. G1-G6 passed.
 
-No commit in this dossier has been pushed, merged to `main`, or deployed.
+Commit `28401b0` is deployed to `kbase.executor.life`. The feature branch and
+`dedao-kbase/main` were fast-forwarded without a merge commit.
 
 ## Requirement
 
@@ -162,15 +163,86 @@ PASS on 2026-07-28 after two blocked review/remediation cycles.
 
 ### G5 - Deployment Health
 
-PENDING explicit release authorization.
+PASS on 2026-07-29.
+
+- The user explicitly authorized merging and deploying the verified release.
+- Remote `main` remained at `b940c33`, an ancestor of the feature branch, so
+  the branch and `main` advanced by non-forced fast-forward pushes.
+- Local release verification passed the full Go suite, focused race suite,
+  `go vet`, module verification, Vue build, every Web smoke, downstream
+  contract smoke, privacy check, system-map drift check, and
+  `git diff --check`.
+- Linux preflight exposed two release-tool portability defects before any
+  production mutation. Commit `3e43aa8` makes the directory-permission test
+  detect root permission bypass instead of reporting a false failure. Commit
+  `28401b0` makes the isolated Nginx smoke support both the production
+  Nginx 1.18 command line and newer Nginx versions.
+- The server verified the exact Git archive before rebuilding the Vue assets,
+  passing every Web smoke and the full Linux Go suite, building the CGO server,
+  and passing the real Nginx proxy-chain smoke. The installed binary matched
+  the tested candidate.
+- The deployment added an explicit persistent session database path, canonical
+  public Origin, and a separately generated session-administrator secret.
+  Existing API, publisher, source-agent, browser-proxy, and model credentials
+  were preserved and validated as distinct without printing them.
+- The rollout completed with the service active, `ExecMainStatus=0`,
+  `NRestarts=0`, matching local health, successful Nginx validation, and no
+  recent service error match. Existing unrelated duplicate server-name
+  warnings remain.
 
 ### G6 - Online Verification
 
-PENDING successful G5.
+PASS on 2026-07-29.
+
+- Public `/health`, `/`, `/book-knowledge`, and `/app.js` returned `200`.
+- Anonymous `/api/books` returned `401`, unauthenticated browser login returned
+  a Basic challenge with `401`, and the retired token-returning route returned
+  `410`.
+- A root-only production fixture exercised the complete Nginx chain without
+  printing credentials: client-family acquisition `200`, Basic login `200`,
+  Cookie status `200`, Cookie-authenticated books `200`, missing CSRF `403`,
+  valid logout `204`, and immediate reuse rejection `401`.
+- Machine `Authorization: Bearer` access to `/api/books` remained `200`.
+- The persistent SQLite database is owned by the service account, the deployed
+  binary hash still matches the candidate, and the ten-minute service log
+  contained no `panic|fatal|error|failed` match.
+
+## Delivery Latency Analysis
+
+The elapsed time came from scope and release risk, not from one difficult code
+path.
+
+1. The requirement crossed five security boundaries at once: browser state,
+   backend authentication, CSRF, Nginx credential exchange, and administrator
+   revocation. It also had to preserve machine Bearer clients and legacy
+   migration.
+2. Independent reviews found real omissions late in the first implementation:
+   cleanup was not scheduled, security audit events were absent, rejected
+   traffic could evict lifecycle evidence, and rejection retention was not
+   atomic. The Gate contract correctly stopped delivery for each issue.
+3. Verification ran across macOS, Linux, SQLite, Vue, real Nginx, and production
+   systemd. Sandboxed Go cache/config/port restrictions, root permission
+   semantics, Git archives excluding `frontend/dist`, and production Nginx
+   1.18 each produced a distinct environment failure that had to be separated
+   from product failures.
+4. Release assembly was still partly manual. Frontend build ordering, required
+   environment keys, exact archive verification, rollback snapshots, and
+   production probes were coordinated during this delivery instead of by one
+   repeatable release command.
+5. Full regression and fresh security review were repeated after every
+   blocking remediation. This increased elapsed time but prevented shipping a
+   session system without cleanup, durable audit evidence, or atomic abuse
+   controls.
+
+Follow-up engineering work should package the Web assets and server in CI,
+exercise root and non-root Linux plus Nginx 1.18 and current Nginx in a release
+matrix, add a configuration-doctor command, and turn the transaction used here
+into a repository deployment script. Those changes remove environment
+discovery from future feature delivery without weakening any Gate.
 
 ## Reviewed Commits
 
-The implementation currently ends at `f67d4b8`. The main milestones are:
+The deployed implementation ends at `28401b0`. The main milestones are:
 
 - `1ba7f6a` through `395c2f9`: persistent opaque session store and hardening;
 - `3df61ff` through `a571ab1`: lifecycle, renewal, eviction, and fencing;
@@ -186,13 +258,16 @@ The implementation currently ends at `f67d4b8`. The main milestones are:
 - `c0f364a`: regenerated code-derived system map;
 - `aec83f6`: bounded and coalesced rejected-authentication audits;
 - `f67d4b8`: isolated audit quotas and atomic rejected-event retention.
+- `3e43aa8`: root-aware permission failure verification.
+- `28401b0`: Nginx 1.18-compatible real proxy smoke.
 
 ## Rollback
 
-Before deployment, snapshot the current server binary, Web directory,
-environment file, site configuration, and rendered location file. Restore all
-five together if any rollout or verification step fails, then restart KBase,
-validate Nginx, and reload it.
+The host-local release log records protected snapshots for the server binary,
+Web directory, environment file, site configuration, and rendered location
+configuration. Restore all five from the same rollout, restart KBase, validate
+Nginx, and reload it. Exact host paths and rollout identifiers are intentionally
+not published.
 
 The new browser-session SQLite database may remain on disk because the old
 server does not read it. A browser that already removed its legacy token will
