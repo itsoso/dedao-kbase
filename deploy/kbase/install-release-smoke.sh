@@ -88,7 +88,25 @@ if [[ "${DOCTOR_FAIL:-0}" == "1" ]]; then
   printf 'doctor rejected fixture\n' >&2
   exit 42
 fi
-printf '{"schema_version":1,"status":"ok"}\n'
+case "${DOCTOR_OUTPUT_MODE:-valid}" in
+  empty)
+    ;;
+  malformed)
+    printf 'not-json\n'
+    ;;
+  wrong-status)
+    printf '{"schema_version":1,"status":"error"}\n'
+    ;;
+  wrong-schema)
+    printf '{"schema_version":2,"status":"ok"}\n'
+    ;;
+  valid)
+    printf '{"schema_version":1,"status":"ok"}\n'
+    ;;
+  *)
+    exit 43
+    ;;
+esac
 CANDIDATE
   chmod 0755 "${release_dir}/bundle/kbase-server"
 
@@ -382,8 +400,20 @@ setup_case success
 save_expected_targets
 SUCCESS_OUTPUT="${CASE_DIR}/output.json"
 run_install "${BASE_RELEASE}/prepared-manifest.json" >"$SUCCESS_OUTPUT"
-grep -q '"status":"installed"' "$SUCCESS_OUTPUT" ||
-  fail "successful install did not return structured status"
+"$NODE_BIN" - "$SUCCESS_OUTPUT" <<'NODE'
+const fs = require("fs");
+const raw = fs.readFileSync(process.argv[2], "utf8");
+const result = JSON.parse(raw);
+if (
+  JSON.stringify(Object.keys(result).sort()) !==
+    JSON.stringify(["backup", "schema_version", "status"]) ||
+  result.schema_version !== 1 ||
+  result.status !== "installed" ||
+  result.backup !== "retained"
+) {
+  throw new Error("successful install output is not the single expected result");
+}
+NODE
 grep -q 'CANDIDATE_BINARY_MARKER' "$BINARY_TARGET" ||
   fail "candidate binary was not installed"
 grep -q '^NEW_WEB$' "${WEB_TARGET}/index.html" ||
@@ -490,6 +520,24 @@ if grep -Eq '^(render|systemctl:|health:|nginx:)' "$INSTALL_LOG"; then
 fi
 assert_targets_match_expected
 assert_no_target_temporary_entries
+
+for doctor_mode in empty malformed wrong-status wrong-schema; do
+  setup_case "doctor-output-${doctor_mode}"
+  save_expected_targets
+  printf 'DOCTOR_OUTPUT_MODE=%s\n' "$doctor_mode" >>"$ENV_SOURCE"
+  if run_install "${BASE_RELEASE}/prepared-manifest.json" \
+    >"${CASE_DIR}/stdout" \
+    2>"${CASE_DIR}/stderr"; then
+    fail "invalid doctor output unexpectedly installed: ${doctor_mode}"
+  fi
+  grep -q '^doctor$' "$INSTALL_LOG" ||
+    fail "invalid doctor output did not invoke doctor: ${doctor_mode}"
+  if grep -Eq '^(render|systemctl:|health:|nginx:)' "$INSTALL_LOG"; then
+    fail "invalid doctor output progressed past doctor: ${doctor_mode}"
+  fi
+  assert_targets_match_expected
+  assert_no_target_temporary_entries
+done
 
 setup_case writable-env
 save_expected_targets

@@ -27,6 +27,7 @@ web_temp=""
 env_temp=""
 nginx_temp=""
 web_displaced=""
+doctor_result=""
 
 usage() {
   cat <<'USAGE'
@@ -108,6 +109,9 @@ cleanup_temporary_targets() {
   if [[ -n "$nginx_temp" ]]; then
     rm -f "$nginx_temp"
   fi
+  if [[ -n "$doctor_result" ]]; then
+    rm -f "$doctor_result"
+  fi
 }
 
 run_with_environment() {
@@ -152,6 +156,36 @@ run_renderer() {
     "$output" \
     "$backend" \
     "$auth_file"
+}
+
+validate_doctor_result() {
+  local result_file="$1"
+  "$node_bin" - "$result_file" <<'NODE'
+const fs = require("fs");
+
+const resultPath = process.argv[2];
+let result;
+try {
+  result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+} catch {
+  process.stderr.write("install-release: configuration doctor returned invalid JSON\n");
+  process.exit(1);
+}
+if (
+  result === null ||
+  Array.isArray(result) ||
+  typeof result !== "object" ||
+  JSON.stringify(Object.keys(result).sort()) !==
+    JSON.stringify(["schema_version", "status"]) ||
+  result.schema_version !== 1 ||
+  result.status !== "ok"
+) {
+  process.stderr.write(
+    "install-release: configuration doctor returned an invalid result\n",
+  );
+  process.exit(1);
+}
+NODE
 }
 
 retry_health() {
@@ -675,7 +709,10 @@ install_release() {
   local template
   local renderer
 
-  "$PREPARER" verify --node-bin "$node_bin" --manifest "$manifest"
+  "$PREPARER" verify \
+    --node-bin "$node_bin" \
+    --manifest "$manifest" \
+    >/dev/null
   validate_paths_and_inputs "$manifest" "$env_source" "$basic_auth_file"
 
   if [[ "$("$uname_bin" -s)" != "Linux" ]]; then
@@ -719,12 +756,17 @@ install_release() {
     "$tar_bin" -xf - -C "$candidate_web" --strip-components=1
   verify_extracted_web "$candidate_web"
 
+  doctor_result="${staging}/doctor-result.json"
   run_with_environment \
     "$env_source" \
     "$candidate_binary" \
     --check-config \
     --web-dir \
-    "$candidate_web"
+    "$candidate_web" \
+    >"$doctor_result"
+  validate_doctor_result "$doctor_result"
+  rm -f "$doctor_result"
+  doctor_result=""
 
   run_renderer \
     "$env_source" \
