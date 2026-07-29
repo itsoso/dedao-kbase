@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASSEMBLER="${SCRIPT_DIR}/assemble-release.sh"
 SCHEMA="dedao-kbase-source-release/v1"
 ARCHIVE_NAME="source.tar.gz"
 MANIFEST_NAME="release-manifest.json"
@@ -89,11 +91,35 @@ create_release() {
   [[ "${#canonical_revision}" -eq 40 ]] ||
     fail "Git returned a malformed canonical revision"
 
-  mkdir -p "$output_dir"
-  [[ -d "$output_dir" ]] || fail "output path is not a directory: $output_dir"
+  output_name="${output_dir##*/}"
+  case "$output_name" in
+    ""|"."|"..") fail "output directory must have a valid final name" ;;
+  esac
+  if [[ "$output_dir" == */* ]]; then
+    output_parent="${output_dir%/*}"
+    [[ -n "$output_parent" ]] || output_parent="/"
+  else
+    output_parent="."
+  fi
 
-  temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/kbase-source-release.XXXXXX")"
-  trap 'rm -rf "$temporary_dir"' EXIT HUP INT TERM
+  [[ -d "$output_parent" ]] ||
+    fail "output parent directory does not exist: $output_parent"
+  if [[ -e "$output_dir" || -L "$output_dir" ]]; then
+    fail "output directory already exists: $output_dir"
+  fi
+
+  temporary_dir="$(
+    mktemp -d "${output_parent}/.${output_name}.staging.XXXXXX"
+  )"
+  cleanup_staging() {
+    if [[ -n "${temporary_dir:-}" && -d "$temporary_dir" ]]; then
+      rm -rf "$temporary_dir"
+    fi
+  }
+  trap cleanup_staging EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   temporary_archive="${temporary_dir}/${ARCHIVE_NAME}"
   temporary_manifest="${temporary_dir}/${MANIFEST_NAME}"
@@ -140,8 +166,12 @@ stream.on("end", () => {
 });
 NODE
 
-  mv "$temporary_archive" "${output_dir}/${ARCHIVE_NAME}"
-  mv "$temporary_manifest" "${output_dir}/${MANIFEST_NAME}"
+  "$ASSEMBLER" verify --manifest "$temporary_manifest"
+  if [[ -e "$output_dir" || -L "$output_dir" ]]; then
+    fail "output directory appeared during assembly: $output_dir"
+  fi
+  mv "$temporary_dir" "$output_dir"
+  temporary_dir=""
   printf 'source release created: %s\n' "${output_dir}/${MANIFEST_NAME}"
 }
 

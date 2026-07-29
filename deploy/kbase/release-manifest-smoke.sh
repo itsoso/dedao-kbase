@@ -76,6 +76,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 FIXTURE_REPO="${TMP_ROOT}/fixture"
 OUTPUT_ONE="${TMP_ROOT}/release-one"
 OUTPUT_TWO="${TMP_ROOT}/release-two"
+CONFLICT_TARGET="${TMP_ROOT}/conflict-target"
 mkdir -p "$FIXTURE_REPO"
 
 git -C "$FIXTURE_REPO" init -q
@@ -153,6 +154,67 @@ cmp "$MANIFEST_ONE" "${OUTPUT_TWO}/release-manifest.json" ||
   fail "manifest is not deterministic for the same revision"
 cmp "$ARCHIVE_ONE" "${OUTPUT_TWO}/source.tar.gz" ||
   fail "archive is not deterministic for the same revision"
+
+printf 'existing release marker\n' >"${OUTPUT_ONE}/existing-release.txt"
+cp "$MANIFEST_ONE" "${TMP_ROOT}/existing-manifest.json"
+cp "$ARCHIVE_ONE" "${TMP_ROOT}/existing-source.tar.gz"
+expect_failure "existing release directory rejection" \
+  "$ASSEMBLER" create \
+  --repo "$FIXTURE_REPO" \
+  --revision HEAD \
+  --output-dir "$OUTPUT_ONE"
+cmp "${TMP_ROOT}/existing-manifest.json" "$MANIFEST_ONE" ||
+  fail "existing release manifest changed after rejected create"
+cmp "${TMP_ROOT}/existing-source.tar.gz" "$ARCHIVE_ONE" ||
+  fail "existing release archive changed after rejected create"
+grep -q '^existing release marker$' "${OUTPUT_ONE}/existing-release.txt" ||
+  fail "existing release marker changed after rejected create"
+
+printf 'existing file\n' >"$CONFLICT_TARGET"
+cp "$CONFLICT_TARGET" "${TMP_ROOT}/conflict-target.clean"
+expect_failure "existing file target rejection" \
+  "$ASSEMBLER" create \
+  --repo "$FIXTURE_REPO" \
+  --revision HEAD \
+  --output-dir "$CONFLICT_TARGET"
+cmp "${TMP_ROOT}/conflict-target.clean" "$CONFLICT_TARGET" ||
+  fail "existing file target changed after rejected create"
+
+mkdir -p "${TMP_ROOT}/symlink-target"
+printf 'symlink target marker\n' >"${TMP_ROOT}/symlink-target/marker.txt"
+ln -s "${TMP_ROOT}/symlink-target" "${TMP_ROOT}/release-symlink"
+expect_failure "existing symlink target rejection" \
+  "$ASSEMBLER" create \
+  --repo "$FIXTURE_REPO" \
+  --revision HEAD \
+  --output-dir "${TMP_ROOT}/release-symlink"
+grep -q '^symlink target marker$' "${TMP_ROOT}/symlink-target/marker.txt" ||
+  fail "symlink target changed after rejected create"
+[[ ! -e "${TMP_ROOT}/symlink-target/source.tar.gz" ]] ||
+  fail "rejected symlink target received release artifacts"
+
+expect_failure "missing output parent rejection" \
+  "$ASSEMBLER" create \
+  --repo "$FIXTURE_REPO" \
+  --revision HEAD \
+  --output-dir "${TMP_ROOT}/missing-parent/release"
+[[ ! -e "${TMP_ROOT}/missing-parent" ]] ||
+  fail "create made a missing output parent"
+
+expect_failure "dot basename rejection" \
+  "$ASSEMBLER" create \
+  --repo "$FIXTURE_REPO" \
+  --revision HEAD \
+  --output-dir "${TMP_ROOT}/."
+expect_failure "dot-dot basename rejection" \
+  "$ASSEMBLER" create \
+  --repo "$FIXTURE_REPO" \
+  --revision HEAD \
+  --output-dir "${TMP_ROOT}/nested-parent/.."
+
+if find "$TMP_ROOT" -maxdepth 1 -name '.*.staging.*' -print | grep -q .; then
+  fail "release staging directory was not cleaned"
+fi
 
 printf 'dirty source\n' >>"${FIXTURE_REPO}/README.md"
 expect_failure "dirty worktree rejection" \
