@@ -742,6 +742,93 @@ func TestKnowledgeReverificationDurationsUseBoundedEnvironmentValues(t *testing.
 	}
 }
 
+type browserSessionCleanupFunc func(time.Duration) (int64, error)
+
+func (f browserSessionCleanupFunc) Cleanup(retainAfter time.Duration) (int64, error) {
+	return f(retainAfter)
+}
+
+func TestStartBrowserSessionCleanupRunsImmediatelyAndStopsWithContext(t *testing.T) {
+	cleanupStarted := make(chan time.Duration, 1)
+	cleaner := browserSessionCleanupFunc(func(retainAfter time.Duration) (int64, error) {
+		cleanupStarted <- retainAfter
+		return 2, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	started, done := startBrowserSessionCleanup(
+		ctx,
+		time.Hour,
+		30*24*time.Hour,
+		cleaner,
+		func(string, ...any) {},
+	)
+	if !started {
+		t.Fatal("browser session cleanup did not start")
+	}
+	select {
+	case got := <-cleanupStarted:
+		if got != 30*24*time.Hour {
+			t.Fatalf("cleanup retention = %s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("browser session cleanup did not run immediately")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("browser session cleanup did not stop with context")
+	}
+
+	started, done = startBrowserSessionCleanup(context.Background(), time.Hour, 30*24*time.Hour, nil, nil)
+	if started {
+		t.Fatal("nil browser session cleaner started")
+	}
+	select {
+	case <-done:
+	default:
+		t.Fatal("nil cleaner completion signal is not closed")
+	}
+}
+
+func TestBrowserSessionCleanupDurationsUseBoundedEnvironmentValues(t *testing.T) {
+	t.Setenv("KBASE_BROWSER_SESSION_CLEANUP_INTERVAL_SECONDS", "7200")
+	t.Setenv("KBASE_BROWSER_SESSION_RETENTION_SECONDS", "5184000")
+	if got := browserSessionCleanupInterval(); got != 2*time.Hour {
+		t.Fatalf("cleanup interval = %s", got)
+	}
+	if got := browserSessionRetention(); got != 60*24*time.Hour {
+		t.Fatalf("cleanup retention = %s", got)
+	}
+
+	t.Setenv("KBASE_BROWSER_SESSION_CLEANUP_INTERVAL_SECONDS", "0")
+	t.Setenv("KBASE_BROWSER_SESSION_RETENTION_SECONDS", "invalid")
+	if got := browserSessionCleanupInterval(); got != time.Hour {
+		t.Fatalf("default cleanup interval = %s", got)
+	}
+	if got := browserSessionRetention(); got != 30*24*time.Hour {
+		t.Fatalf("default cleanup retention = %s", got)
+	}
+
+	t.Setenv("KBASE_BROWSER_SESSION_CLEANUP_INTERVAL_SECONDS", "1")
+	t.Setenv("KBASE_BROWSER_SESSION_RETENTION_SECONDS", "1")
+	if got := browserSessionCleanupInterval(); got != time.Hour {
+		t.Fatalf("unsafe cleanup interval = %s", got)
+	}
+	if got := browserSessionRetention(); got != 30*24*time.Hour {
+		t.Fatalf("unsafe cleanup retention = %s", got)
+	}
+
+	t.Setenv("KBASE_BROWSER_SESSION_CLEANUP_INTERVAL_SECONDS", "999999")
+	t.Setenv("KBASE_BROWSER_SESSION_RETENTION_SECONDS", "999999999")
+	if got := browserSessionCleanupInterval(); got != 24*time.Hour {
+		t.Fatalf("bounded cleanup interval = %s", got)
+	}
+	if got := browserSessionRetention(); got != 365*24*time.Hour {
+		t.Fatalf("bounded cleanup retention = %s", got)
+	}
+}
+
 func TestEvidenceAuditServerLimitsUseBoundedEnvironmentValues(t *testing.T) {
 	t.Setenv("KBASE_AUDIT_WORKERS", "4")
 	t.Setenv("KBASE_AUDIT_QUEUE_SIZE", "128")

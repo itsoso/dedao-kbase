@@ -264,12 +264,20 @@ func serveKBaseServer(
 	}
 	reverificationRunner := app.NewKnowledgeReverificationRunner(bookStore, nil, time.Now, knowledgeReverificationStaleAfter())
 	_, reverificationDone := startKnowledgeReverificationRunner(ctx, knowledgeReverificationTickInterval(), reverificationRunner, log.Printf)
+	_, browserSessionCleanupDone := startBrowserSessionCleanup(
+		ctx,
+		browserSessionCleanupInterval(),
+		browserSessionRetention(),
+		browserSessions.Store,
+		log.Printf,
+	)
 	defer func() {
 		stop()
 		if schedulerDone != nil {
 			<-schedulerDone
 		}
 		<-reverificationDone
+		<-browserSessionCleanupDone
 	}()
 
 	return serveHTTPServer(ctx, stop, server, 10*time.Second)
@@ -873,6 +881,92 @@ func knowledgeReverificationCooldown() time.Duration {
 
 func knowledgeReverificationStaleAfter() time.Duration {
 	return boundedSecondsEnvironment("KBASE_REVERIFICATION_STALE_SECONDS", 900, 86400)
+}
+
+type browserSessionCleaner interface {
+	Cleanup(time.Duration) (int64, error)
+}
+
+func startBrowserSessionCleanup(
+	ctx context.Context,
+	interval time.Duration,
+	retention time.Duration,
+	cleaner browserSessionCleaner,
+	logf func(string, ...any),
+) (bool, <-chan struct{}) {
+	done := make(chan struct{})
+	if cleaner == nil {
+		close(done)
+		return false, done
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	if retention <= 0 {
+		retention = 30 * 24 * time.Hour
+	}
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	go func() {
+		defer close(done)
+		runCleanup := func() {
+			deleted, err := cleaner.Cleanup(retention)
+			if err != nil {
+				logf("browser session cleanup failed: %v", err)
+				return
+			}
+			if deleted > 0 {
+				logf("browser session cleanup: deleted=%d retention=%s", deleted, retention)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			runCleanup()
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				runCleanup()
+			}
+		}
+	}()
+	return true, done
+}
+
+func browserSessionCleanupInterval() time.Duration {
+	return boundedBrowserSessionDuration(
+		"KBASE_BROWSER_SESSION_CLEANUP_INTERVAL_SECONDS",
+		3600,
+		300,
+		86400,
+	)
+}
+
+func browserSessionRetention() time.Duration {
+	return boundedBrowserSessionDuration(
+		"KBASE_BROWSER_SESSION_RETENTION_SECONDS",
+		30*24*60*60,
+		24*60*60,
+		365*24*60*60,
+	)
+}
+
+func boundedBrowserSessionDuration(key string, fallback, minimum, maximum int) time.Duration {
+	seconds, err := strconv.Atoi(strings.TrimSpace(os.Getenv(key)))
+	if err != nil || seconds < minimum {
+		seconds = fallback
+	}
+	if seconds > maximum {
+		seconds = maximum
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func boundedSecondsEnvironment(key string, fallback, maximum int) time.Duration {
