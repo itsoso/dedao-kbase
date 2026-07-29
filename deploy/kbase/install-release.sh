@@ -108,9 +108,6 @@ cleanup_temporary_targets() {
   if [[ -n "$nginx_temp" ]]; then
     rm -f "$nginx_temp"
   fi
-  if [[ -n "$web_displaced" ]]; then
-    rm -rf "$web_displaced"
-  fi
 }
 
 run_with_environment() {
@@ -313,10 +310,18 @@ rollback_transaction() {
 
   cleanup_temporary_targets
   if [[ "$failed" != "0" ]]; then
+    if [[ -n "$web_displaced" && -d "$web_displaced" ]]; then
+      printf 'install-release: displaced Web retained at %s\n' \
+        "$web_displaced" >&2
+    fi
     printf 'install-release: rollback incomplete; backup retained\n' >&2
     return 1
   fi
 
+  if [[ -n "$web_displaced" ]]; then
+    rm -rf "$web_displaced"
+    web_displaced=""
+  fi
   transaction_active=0
   printf 'install-release: rollback complete; backup retained\n' >&2
   return 0
@@ -434,13 +439,36 @@ if ((sourceStat.mode & 0o022) !== 0) {
   fail("environment source must not be group/other writable");
 }
 
-const targets = [binaryTarget, webTarget, envTarget, nginxTarget];
+const targets = [binaryTarget, webTarget, envTarget, nginxTarget].map(
+  (target) => fs.realpathSync(target),
+);
 const identities = targets.map((target) => {
   const stat = fs.statSync(target);
-  return `${fs.realpathSync(target)}:${stat.dev}:${stat.ino}`;
+  return `${stat.dev}:${stat.ino}`;
 });
 if (new Set(identities).size !== identities.length) {
   fail("installation targets must be distinct");
+}
+
+function contains(parent, child) {
+  const relative = path.relative(parent, child);
+  return (
+    relative === "" ||
+    (relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative))
+  );
+}
+
+for (let left = 0; left < targets.length; left += 1) {
+  for (let right = left + 1; right < targets.length; right += 1) {
+    if (
+      contains(targets[left], targets[right]) ||
+      contains(targets[right], targets[left])
+    ) {
+      fail("installation targets must not contain one another");
+    }
+  }
 }
 if (fs.realpathSync(envSource) === fs.realpathSync(envTarget)) {
   fail("environment source must differ from environment target");
@@ -452,6 +480,18 @@ if (fs.existsSync(backupDirectory) || fs.lstatSync(path.dirname(backupDirectory)
 const backupParent = fs.lstatSync(path.dirname(backupDirectory));
 if (!backupParent.isDirectory()) {
   fail("backup parent must be a directory");
+}
+const realBackupDirectory = path.join(
+  fs.realpathSync(path.dirname(backupDirectory)),
+  path.basename(backupDirectory),
+);
+for (const target of targets) {
+  if (
+    contains(target, realBackupDirectory) ||
+    contains(realBackupDirectory, target)
+  ) {
+    fail("backup directory must not overlap an installation target");
+  }
 }
 
 let parsed;

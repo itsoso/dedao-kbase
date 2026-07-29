@@ -158,6 +158,9 @@ set -Eeuo pipefail
 if grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
   printf 'health:candidate\n' >>"$INSTALL_LOG"
   if [[ "${FAIL_HEALTH:-0}" == "1" ]]; then
+    if [[ "${FAIL_ROLLBACK_PREP:-0}" == "1" ]]; then
+      rm -rf "${BACKUP_DIR}/snapshot/web"
+    fi
     exit 22
   fi
 else
@@ -236,7 +239,7 @@ ENVIRONMENT
   export ASSERT_NGINX_TARGET="$NGINX_TARGET"
   export ASSERT_BASIC_AUTH_FILE="$BASIC_AUTH_FILE"
   export REAL_TAR
-  unset FAIL_HEALTH
+  unset FAIL_HEALTH FAIL_ROLLBACK_PREP
 }
 
 save_expected_targets() {
@@ -433,6 +436,31 @@ assert_rollback_log
 assert_no_target_temporary_entries
 unset FAIL_HEALTH
 
+setup_case rollback-preparation-failure
+save_expected_targets
+export FAIL_HEALTH=1
+export FAIL_ROLLBACK_PREP=1
+if run_install "${BASE_RELEASE}/prepared-manifest.json" \
+  >"${CASE_DIR}/stdout" \
+  2>"${CASE_DIR}/stderr"; then
+  fail "forced rollback preparation failure unexpectedly succeeded"
+fi
+DISPLACED_WEB="$(
+  find "$(dirname "$WEB_TARGET")" \
+    -maxdepth 1 \
+    -type d \
+    -name ".$(basename "$WEB_TARGET").kbase-install.previous.*" \
+    -print \
+    -quit
+)"
+[[ -n "$DISPLACED_WEB" ]] ||
+  fail "rollback failure deleted the displaced old Web directory"
+grep -q '^OLD_WEB$' "${DISPLACED_WEB}/index.html" ||
+  fail "displaced old Web directory was not preserved intact"
+[[ -d "$BACKUP_DIR" ]] ||
+  fail "rollback preparation failure removed the backup directory"
+unset FAIL_HEALTH FAIL_ROLLBACK_PREP
+
 setup_case invalid-manifest
 save_expected_targets
 INVALID_RELEASE="${CASE_DIR}/release"
@@ -494,6 +522,34 @@ if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
   fail "missing backup parent unexpectedly installed"
 fi
 assert_pre_mutation_failure
+
+setup_case overlapping-backup
+mkdir -p "${WEB_TARGET}/backups"
+BACKUP_DIR="${WEB_TARGET}/backups/release"
+export BACKUP_DIR
+save_expected_targets
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "backup directory inside Web target unexpectedly installed"
+fi
+[[ ! -s "$INSTALL_LOG" ]] ||
+  fail "overlapping backup path progressed to doctor or service tools"
+assert_targets_match_expected
+[[ ! -e "$BACKUP_DIR" ]] ||
+  fail "overlapping backup path was created"
+
+setup_case overlapping-targets
+printf 'OLD_NESTED_BINARY\n' >"${WEB_TARGET}/nested-kbase-server"
+chmod 0700 "${WEB_TARGET}/nested-kbase-server"
+BINARY_TARGET="${WEB_TARGET}/nested-kbase-server"
+export BINARY_TARGET
+export ASSERT_BINARY_TARGET="$BINARY_TARGET"
+save_expected_targets
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "nested installation targets unexpectedly installed"
+fi
+[[ ! -s "$INSTALL_LOG" ]] ||
+  fail "nested targets progressed to doctor or service tools"
+assert_targets_match_expected
 
 setup_case unsafe-web
 save_expected_targets
