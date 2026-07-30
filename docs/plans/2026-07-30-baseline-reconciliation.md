@@ -124,6 +124,7 @@ Expected: PASS.
 **Files:**
 - Verify: `backend/app/kbase_http.go`
 - Verify: `backend/app/kbase_http_test.go`
+- Regenerate: `docs/_generated/system-map.json`
 - Verify: `docs/plans/2026-07-30-baseline-reconciliation-design.md`
 - Verify: `docs/plans/2026-07-30-baseline-reconciliation.md`
 
@@ -157,9 +158,8 @@ Expected: PASS.
 
 **Step 5: Commit only reconciled files**
 
-Stage the two HTTP files and the two plan files explicitly, then commit with a
-short scoped subject.
+Stage the two HTTP files, regenerated system map, and plan update explicitly,
+then commit with a short scoped subject.
 
 Expected: the legacy working tree remains untouched and no dependency,
 generated output, or build-asset change is included.
-
