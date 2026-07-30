@@ -246,6 +246,18 @@ for marker in \
     exit 1
   fi
 done
+
+health_block="$(location_block 'location = /health {')"
+if ! block_has_active_directive \
+  "$health_block" \
+  'add_header Cache-Control "no-store" always;'; then
+  echo "health location does not disable downstream caching" >&2
+  exit 1
+fi
+if ! block_has_active_directive "$health_block" 'proxy_no_cache 1;'; then
+  echo "health location does not disable proxy caching" >&2
+  exit 1
+fi
 for marker in \
   'location = /browser/session/migrate {' \
   'location /api/ {'; do

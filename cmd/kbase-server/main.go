@@ -24,6 +24,8 @@ import (
 	"golang.org/x/net/idna"
 )
 
+var buildRevision = "development"
+
 type kBaseServerConfig struct {
 	Addr                string
 	Root                string
@@ -235,6 +237,7 @@ func serveKBaseServer(
 	handlerConfig := app.KBaseHTTPConfig{
 		Store:                  bookStore,
 		AuthToken:              config.AuthToken,
+		ReleaseRevision:        buildRevision,
 		AgentPublisherToken:    config.AgentPublisherToken,
 		SystemKBExportPath:     config.ExportPath,
 		StaticDir:              config.WebDir,

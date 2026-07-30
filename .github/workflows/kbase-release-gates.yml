@@ -66,7 +66,7 @@ jobs:
       - name: Assert normal-user execution
         run: test "$(id -u)" -ne 0
 
-      - name: Generate ephemeral release signing keys
+      - name: Generate ephemeral source signing key
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -82,16 +82,8 @@ jobs:
             -in "$key_dir/source-private.pem" \
             -pubout \
             -out "$key_dir/source-public.pem"
-          "$openssl_bin" genpkey \
-            -algorithm RSA \
-            -pkeyopt rsa_keygen_bits:3072 \
-            -out "$key_dir/prepared-private.pem"
-          "$openssl_bin" pkey \
-            -in "$key_dir/prepared-private.pem" \
-            -pubout \
-            -out "$key_dir/prepared-public.pem"
-          chmod 0600 "$key_dir/source-private.pem" "$key_dir/prepared-private.pem"
-          chmod 0644 "$key_dir/source-public.pem" "$key_dir/prepared-public.pem"
+          chmod 0600 "$key_dir/source-private.pem"
+          chmod 0644 "$key_dir/source-public.pem"
 
       - name: Assemble immutable source release
         run: |
@@ -99,9 +91,13 @@ jobs:
           bash deploy/kbase/assemble-release.sh create \
             --repo "$GITHUB_WORKSPACE" \
             --revision "$GITHUB_SHA" \
-            --output-dir "$RUNNER_TEMP/kbase-release-e2e/source" \
+            --output-dir "$RUNNER_TEMP/kbase-release-e2e/source"
+          bash deploy/kbase/release-signature.sh sign \
+            --manifest "$RUNNER_TEMP/kbase-release-e2e/source/release-manifest.json" \
+            --signature "$RUNNER_TEMP/kbase-release-e2e/source/MANIFEST.sig" \
             --signing-key "$RUNNER_TEMP/kbase-release-signing/source-private.pem" \
             --openssl-bin "$(command -v openssl)"
+          rm -f "$RUNNER_TEMP/kbase-release-signing/source-private.pem"
 
       - name: Verify Go modules
         run: go mod verify
@@ -154,23 +150,101 @@ jobs:
             bash deploy/nginx/browser-session-proxy-smoke.sh
 
       - name: Smoke-test release assembly
-        run: bash deploy/kbase/release-manifest-smoke.sh
+        run: |
+          node --check deploy/kbase/archive-list.mjs
+          node --check deploy/kbase/stage-files.mjs
+          node --check deploy/kbase/fsync-paths.mjs
+          bash deploy/kbase/archive-list-smoke.sh
+          bash deploy/kbase/stage-files-smoke.sh
+          bash deploy/kbase/release-manifest-smoke.sh
 
       - name: Smoke-test transactional installer
         run: bash deploy/kbase/install-release-smoke.sh
+
+      - name: Reject privileged install from checkout
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          install_args=(
+            install
+            --manifest /nonexistent/prepared-manifest.json
+            --trusted-public-key /nonexistent/public.pem
+            --binary-target /nonexistent/kbase-server
+            --web-target /nonexistent/web
+            --env-source /nonexistent/candidate.env
+            --env-target /nonexistent/service.env
+            --nginx-config-target /nonexistent/kbase.locations.conf
+            --basic-auth-file /nonexistent/browser.htpasswd
+            --backend-addr 127.0.0.1:8719
+            --service-name dedao-kbase.service
+            --nginx-service-name nginx.service
+            --health-url http://127.0.0.1:8719/health
+            --public-health-url https://example.invalid/health
+            --backup-dir /nonexistent/backups/release
+            --transaction-state-file /nonexistent/install.json
+          )
+          error_file="$RUNNER_TEMP/root-install-boundary.error"
+          set +e
+          sudo env -i \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/root \
+            bash "$GITHUB_WORKSPACE/deploy/kbase/install-release.sh" install \
+            "${install_args[@]:1}" \
+            >"$error_file" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q \
+            'root installation requires release tools at /opt/dedao-kbase/release-tools' \
+            "$error_file"
+
+          tool_dir=/opt/dedao-kbase/release-tools
+          sudo install -d -o root -g root -m 0755 "$tool_dir"
+          sudo install -o root -g root -m 0755 \
+            deploy/kbase/install-release.sh \
+            deploy/kbase/prepare-release.sh \
+            deploy/kbase/release-signature.sh \
+            "$tool_dir/"
+          sudo install -o root -g root -m 0644 \
+            deploy/kbase/archive-list.mjs \
+            deploy/kbase/stage-files.mjs \
+            deploy/kbase/fsync-paths.mjs \
+            "$tool_dir/"
+          evil_node="$RUNNER_TEMP/evil-node"
+          evil_marker="$RUNNER_TEMP/evil-node.executed"
+          cat >"$evil_node" <<EOF
+          #!/usr/bin/env bash
+          : >"$evil_marker"
+          exit 99
+          EOF
+          chmod 0755 "$evil_node"
+          set +e
+          sudo env -i \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            HOME=/root \
+            bash "$tool_dir/install-release.sh" \
+            "${install_args[@]}" \
+            --node-bin "$evil_node" \
+            >"$error_file" 2>&1
+          status=$?
+          set -e
+          test "$status" -ne 0
+          grep -q \
+            'root installation does not accept executable overrides' \
+            "$error_file"
+          test ! -e "$evil_marker"
 
       - name: Verify privacy and generated system map
         run: |
           bash scripts/privacy-smoke.sh
           bash scripts/system-map-smoke.sh
 
-      - name: Prepare and verify Linux release
+      - name: Prepare unsigned Linux release
         run: |
           bash deploy/kbase/prepare-release.sh create \
             --source-manifest "$RUNNER_TEMP/kbase-release-e2e/source/release-manifest.json" \
             --output-dir "$RUNNER_TEMP/kbase-release-e2e/prepared" \
             --source-public-key "$RUNNER_TEMP/kbase-release-signing/source-public.pem" \
-            --signing-key "$RUNNER_TEMP/kbase-release-signing/prepared-private.pem" \
             --node-bin "$(command -v node)" \
             --go-bin "$(command -v go)" \
             --npm-bin "$(command -v npm)" \
@@ -179,8 +253,34 @@ jobs:
             --nginx-bin "$(command -v nginx)" \
             --uname-bin "$(command -v uname)" \
             --openssl-bin "$(command -v openssl)"
+
+      - name: Sign and verify prepared release
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          openssl_bin="$(command -v openssl)"
+          key_dir="$RUNNER_TEMP/kbase-release-signing"
+          # This disposable CI key validates mechanics only. Production signing
+          # happens offline or in KMS after the untrusted build has completed.
+          "$openssl_bin" genpkey \
+            -algorithm RSA \
+            -pkeyopt rsa_keygen_bits:3072 \
+            -out "$key_dir/prepared-private.pem"
+          "$openssl_bin" pkey \
+            -in "$key_dir/prepared-private.pem" \
+            -pubout \
+            -out "$key_dir/prepared-public.pem"
+          chmod 0600 "$key_dir/prepared-private.pem"
+          chmod 0644 "$key_dir/prepared-public.pem"
+          bash deploy/kbase/release-signature.sh sign \
+            --manifest "$RUNNER_TEMP/kbase-release-e2e/prepared/prepared-manifest.json" \
+            --signature "$RUNNER_TEMP/kbase-release-e2e/prepared/MANIFEST.sig" \
+            --signing-key "$key_dir/prepared-private.pem" \
+            --openssl-bin "$openssl_bin"
           bash deploy/kbase/prepare-release.sh verify \
             --manifest "$RUNNER_TEMP/kbase-release-e2e/prepared/prepared-manifest.json" \
-            --trusted-public-key "$RUNNER_TEMP/kbase-release-signing/prepared-public.pem" \
+            --trusted-public-key "$key_dir/prepared-public.pem" \
             --node-bin "$(command -v node)" \
-            --openssl-bin "$(command -v openssl)"
+            --tar-bin "$(command -v tar)" \
+            --gzip-bin "$(command -v gzip)" \
+            --openssl-bin "$openssl_bin"

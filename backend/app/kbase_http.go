@@ -26,6 +26,7 @@ import (
 type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
 	AuthToken               string
+	ReleaseRevision         string
 	BrowserSessionSecret    string
 	BrowserSessions         BrowserSessionHTTPConfig
 	AgentPublisherToken     string
@@ -74,6 +75,7 @@ type DedaoLibraryService interface {
 type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
 	authToken               string
+	releaseRevision         string
 	browserSessionSecret    string
 	browserSessions         BrowserSessionHTTPConfig
 	agentPublisherToken     string
@@ -120,6 +122,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceIngest = NewSourceIngestService(store, cfg.SourceSync)
 	}
 	authToken := strings.TrimSpace(cfg.AuthToken)
+	releaseRevision := strings.TrimSpace(cfg.ReleaseRevision)
+	if releaseRevision == "" {
+		releaseRevision = "development"
+	}
 	browserSessionSecret := strings.TrimSpace(cfg.BrowserSessionSecret)
 	browserSessions := normalizeBrowserSessionHTTPConfig(cfg.BrowserSessions)
 	agentPublisherToken := strings.TrimSpace(cfg.AgentPublisherToken)
@@ -192,6 +198,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
+		releaseRevision:         releaseRevision,
 		browserSessionSecret:    browserSessionSecret,
 		browserSessions:         browserSessions,
 		agentPublisherToken:     agentPublisherToken,
@@ -256,9 +263,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/health" {
+		w.Header().Set("Cache-Control", "no-store")
 		writeHTTPJSON(w, http.StatusOK, map[string]any{
-			"ok":      true,
-			"service": "dedao-kbase",
+			"ok":       true,
+			"service":  "dedao-kbase",
+			"revision": h.releaseRevision,
 		})
 		return
 	}

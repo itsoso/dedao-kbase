@@ -141,6 +141,7 @@ command -v openssl >/dev/null 2>&1 || fail "OpenSSL is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kbase-release-manifest.XXXXXX")"
+TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"
 trap 'rm -rf "$TMP_ROOT"' EXIT
 
 OPENSSL_BIN="$(command -v openssl)"
@@ -152,7 +153,7 @@ WRONG_PRIVATE_KEY="${TMP_ROOT}/wrong-private.pem"
 WRONG_PUBLIC_KEY="${TMP_ROOT}/wrong-public.pem"
 "$OPENSSL_BIN" genpkey \
   -algorithm RSA \
-  -pkeyopt rsa_keygen_bits:2048 \
+  -pkeyopt rsa_keygen_bits:3072 \
   -out "$SOURCE_PRIVATE_KEY" >/dev/null 2>&1
 "$OPENSSL_BIN" pkey \
   -in "$SOURCE_PRIVATE_KEY" \
@@ -160,7 +161,7 @@ WRONG_PUBLIC_KEY="${TMP_ROOT}/wrong-public.pem"
   -out "$SOURCE_PUBLIC_KEY" >/dev/null 2>&1
 "$OPENSSL_BIN" genpkey \
   -algorithm RSA \
-  -pkeyopt rsa_keygen_bits:2048 \
+  -pkeyopt rsa_keygen_bits:3072 \
   -out "$PREPARED_PRIVATE_KEY" >/dev/null 2>&1
 "$OPENSSL_BIN" pkey \
   -in "$PREPARED_PRIVATE_KEY" \
@@ -168,7 +169,7 @@ WRONG_PUBLIC_KEY="${TMP_ROOT}/wrong-public.pem"
   -out "$PREPARED_PUBLIC_KEY" >/dev/null 2>&1
 "$OPENSSL_BIN" genpkey \
   -algorithm RSA \
-  -pkeyopt rsa_keygen_bits:2048 \
+  -pkeyopt rsa_keygen_bits:3072 \
   -out "$WRONG_PRIVATE_KEY" >/dev/null 2>&1
 "$OPENSSL_BIN" pkey \
   -in "$WRONG_PRIVATE_KEY" \
@@ -187,10 +188,19 @@ assemble_fixture() {
   repo="$1"
   revision="$2"
   output_dir="$3"
+  set +e
   "$ASSEMBLER" create \
     --repo "$repo" \
     --revision "$revision" \
-    --output-dir "$output_dir" \
+    --output-dir "$output_dir"
+  create_status="$?"
+  set -e
+  [[ "$create_status" -eq 0 ]] || return "$create_status"
+  [[ ! -e "${output_dir}/MANIFEST.sig" ]] ||
+    fail "source assembly unexpectedly accessed a signing boundary"
+  "$SIGNATURE_HELPER" sign \
+    --manifest "${output_dir}/release-manifest.json" \
+    --signature "${output_dir}/MANIFEST.sig" \
     --signing-key "$SOURCE_PRIVATE_KEY" \
     --openssl-bin "$OPENSSL_BIN"
 }
@@ -210,6 +220,9 @@ verify_prepared_fixture() {
   "$PREPARER" verify \
     --manifest "$manifest" \
     --trusted-public-key "$trusted_public_key" \
+    --node-bin "${FAKE_BIN}/node" \
+    --tar-bin "${FAKE_BIN}/tar" \
+    --gzip-bin "${FAKE_BIN}/gzip" \
     --openssl-bin "$OPENSSL_BIN"
 }
 
@@ -276,17 +289,47 @@ git -C "$FIXTURE_REPO" commit -q -m "fixture"
 
 REVISION="$(git -C "$FIXTURE_REPO" rev-parse HEAD)"
 
-expect_failure "source create requires signing key" \
+expect_failure "source create rejects signing key" \
   "$ASSEMBLER" create \
   --repo "$FIXTURE_REPO" \
   --revision HEAD \
   --output-dir "${TMP_ROOT}/unsigned-source" \
-  --openssl-bin "$OPENSSL_BIN"
+  --signing-key "$SOURCE_PRIVATE_KEY"
 assemble_fixture "$FIXTURE_REPO" HEAD "$OUTPUT_ONE"
 
 MANIFEST_ONE="${OUTPUT_ONE}/release-manifest.json"
 SIGNATURE_ONE="${OUTPUT_ONE}/MANIFEST.sig"
 ARCHIVE_ONE="${OUTPUT_ONE}/source.tar.gz"
+WEAK_PRIVATE_KEY="${TMP_ROOT}/weak-private.pem"
+WEAK_PUBLIC_KEY="${TMP_ROOT}/weak-public.pem"
+WEAK_SIGNATURE="${TMP_ROOT}/weak-signature"
+"$OPENSSL_BIN" genpkey \
+  -algorithm RSA \
+  -pkeyopt rsa_keygen_bits:2048 \
+  -out "$WEAK_PRIVATE_KEY" >/dev/null 2>&1
+"$OPENSSL_BIN" pkey \
+  -in "$WEAK_PRIVATE_KEY" \
+  -pubout \
+  -out "$WEAK_PUBLIC_KEY" >/dev/null 2>&1
+chmod 0600 "$WEAK_PRIVATE_KEY"
+chmod 0644 "$WEAK_PUBLIC_KEY"
+expect_failure "weak signing key rejected" \
+  "$SIGNATURE_HELPER" sign \
+  --manifest "$MANIFEST_ONE" \
+  --signature "$WEAK_SIGNATURE" \
+  --signing-key "$WEAK_PRIVATE_KEY" \
+  --openssl-bin "$OPENSSL_BIN"
+"$OPENSSL_BIN" dgst \
+  -sha256 \
+  -sign "$WEAK_PRIVATE_KEY" \
+  -out "$WEAK_SIGNATURE" \
+  "$MANIFEST_ONE"
+expect_failure "weak trusted public key rejected" \
+  "$SIGNATURE_HELPER" verify \
+  --manifest "$MANIFEST_ONE" \
+  --signature "$WEAK_SIGNATURE" \
+  --trusted-public-key "$WEAK_PUBLIC_KEY" \
+  --openssl-bin "$OPENSSL_BIN"
 [[ -f "$MANIFEST_ONE" ]] || fail "create did not write release-manifest.json"
 [[ -f "$SIGNATURE_ONE" ]] || fail "create did not write MANIFEST.sig"
 [[ -f "$ARCHIVE_ONE" ]] || fail "create did not write source.tar.gz"
@@ -462,7 +505,7 @@ fi
 filtered=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    --sort=*|--mtime=*|--owner=*|--group=*|--numeric-owner|\
+    --sort=*|--mtime=*|--owner=*|--group=*|--numeric-owner|--full-time|\
     --quoting-style=escape|--no-same-owner|--no-same-permissions|\
     --delay-directory-restore)
       shift
@@ -535,11 +578,12 @@ chmod 755 \
 prepare_fixture() {
   source_manifest="$1"
   output_dir="$2"
+  chmod 000 "$PREPARED_PRIVATE_KEY"
+  set +e
   PATH="${POISON_BIN}:$PATH" "$PREPARER" create \
     --source-manifest "$source_manifest" \
     --output-dir "$output_dir" \
     --source-public-key "$SOURCE_PUBLIC_KEY" \
-    --signing-key "$PREPARED_PRIVATE_KEY" \
     --openssl-bin "${PREPARE_OPENSSL_BIN:-$OPENSSL_BIN}" \
     --go-bin "${FAKE_BIN}/go" \
     --npm-bin "${FAKE_BIN}/npm" \
@@ -549,6 +593,17 @@ prepare_fixture() {
     --nginx-bin "${FAKE_BIN}/nginx" \
     --uname-bin "${FAKE_BIN}/uname" \
     --proxy-smoke-script "${FAKE_BIN}/proxy-smoke.sh"
+  create_status="$?"
+  set -e
+  chmod 0600 "$PREPARED_PRIVATE_KEY"
+  [[ "$create_status" -eq 0 ]] || return "$create_status"
+  [[ ! -e "${output_dir}/MANIFEST.sig" ]] ||
+    fail "prepare create unexpectedly signed the release"
+  "$SIGNATURE_HELPER" sign \
+    --manifest "${output_dir}/prepared-manifest.json" \
+    --signature "${output_dir}/MANIFEST.sig" \
+    --signing-key "$PREPARED_PRIVATE_KEY" \
+    --openssl-bin "$OPENSSL_BIN"
 }
 
 expect_source_quota_failure() {
@@ -581,13 +636,17 @@ grep -q 'release preparation must not run as root' "$PREPARER" ||
 expect_failure "prepare create requires source public key" \
   "$PREPARER" create \
   --source-manifest "$MANIFEST_ONE" \
-  --signing-key "$PREPARED_PRIVATE_KEY" \
   --output-dir "${TMP_ROOT}/missing-source-key-prepared"
-expect_failure "prepare create requires signing key" \
+expect_failure "prepare create rejects signing key" \
   "$PREPARER" create \
   --source-manifest "$MANIFEST_ONE" \
   --source-public-key "$SOURCE_PUBLIC_KEY" \
+  --signing-key "$PREPARED_PRIVATE_KEY" \
   --output-dir "${TMP_ROOT}/missing-signing-key-prepared"
+expect_failure "prepare rejects private-key signing command" \
+  "$PREPARER" sign \
+  --manifest "${TMP_ROOT}/missing-signing-key-prepared/prepared-manifest.json" \
+  --signing-key "$PREPARED_PRIVATE_KEY"
 
 UNSAFE_REPO="${TMP_ROOT}/unsafe-fixture"
 UNSAFE_EXTERNAL="${TMP_ROOT}/unsafe-external-frontend"
@@ -708,6 +767,19 @@ PREPARED_MANIFEST="${PREPARED_ONE}/prepared-manifest.json"
 PREPARED_SIGNATURE="${PREPARED_ONE}/MANIFEST.sig"
 [[ -f "$PREPARED_SIGNATURE" ]] ||
   fail "prepare did not write MANIFEST.sig"
+
+SIGN_BOUNDARY_RELEASE="${TMP_ROOT}/prepared-sign-boundary"
+cp -R "$PREPARED_ONE" "$SIGN_BOUNDARY_RELEASE"
+rm "${SIGN_BOUNDARY_RELEASE}/MANIFEST.sig"
+if "$PREPARER" sign \
+  --manifest "${SIGN_BOUNDARY_RELEASE}/prepared-manifest.json" \
+  --signing-key "$PREPARED_PRIVATE_KEY" \
+  --node-bin "${FAKE_BIN}/node" \
+  --tar-bin "${FAKE_BIN}/tar" \
+  --gzip-bin "${FAKE_BIN}/gzip" \
+  --openssl-bin "$OPENSSL_BIN" >/dev/null 2>&1; then
+  fail "prepare command unexpectedly accepted a private signing key"
+fi
 verify_prepared_fixture "$PREPARED_MANIFEST"
 expect_failure "prepared verify requires trusted public key" \
   "$PREPARER" verify \
@@ -746,7 +818,7 @@ for gate in \
   '^node:--check .*/frontend-web/app\.js$' \
   '^web-smoke$' \
   '^go:.*:test \./\.\.\.:cgo=$' \
-  '^go:.*:build -trimpath -o .* \./cmd/kbase-server:cgo=1$' \
+  '^go:.*:build -trimpath -ldflags -X main\.buildRevision=[0-9a-f]{40} -o .* \./cmd/kbase-server:cgo=1$' \
   '^proxy:.*$' \
   '^nginx:-v$' \
   '^tar:--sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C .* -cf - frontend-web$' \
@@ -815,6 +887,8 @@ NODE
 : >"$GATE_LOG"
 "$PREPARER" verify \
   --node-bin "${FAKE_BIN}/node" \
+  --tar-bin "${FAKE_BIN}/tar" \
+  --gzip-bin "${FAKE_BIN}/gzip" \
   --manifest "$PREPARED_MANIFEST" \
   --trusted-public-key "$PREPARED_PUBLIC_KEY" \
   --openssl-bin "$OPENSSL_BIN"
@@ -869,6 +943,23 @@ cp "${TMP_ROOT}/kbase-server.clean" \
   "${PREPARED_ONE}/bundle/kbase-server"
 chmod 755 "${PREPARED_ONE}/bundle/kbase-server"
 verify_prepared_fixture "$PREPARED_MANIFEST"
+
+OVERSIZED_PREPARED="${TMP_ROOT}/oversized-prepared"
+OVERSIZED_ERROR="${TMP_ROOT}/oversized-prepared.error"
+cp -R "$PREPARED_ONE" "$OVERSIZED_PREPARED"
+node - "${OVERSIZED_PREPARED}/bundle/kbase.locations.conf.template" <<'NODE'
+const fs = require("fs");
+fs.writeFileSync(process.argv[2], Buffer.alloc(1024 * 1024 + 1, 0x61));
+NODE
+if verify_prepared_fixture \
+  "${OVERSIZED_PREPARED}/prepared-manifest.json" \
+  >"$OVERSIZED_ERROR" 2>&1
+then
+  fail "oversized prepared artifact unexpectedly verified"
+fi
+grep -q 'prepared artifact exceeds byte limit: nginx-template' \
+  "$OVERSIZED_ERROR" ||
+  fail "oversized prepared artifact was not rejected by its byte limit"
 
 printf 'unexpected\n' >"${PREPARED_ONE}/bundle/extra.txt"
 expect_failure "extra prepared bundle file rejection" \

@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+unset \
+  BASH_ENV \
+  CDPATH \
+  DYLD_FALLBACK_LIBRARY_PATH \
+  DYLD_INSERT_LIBRARIES \
+  DYLD_LIBRARY_PATH \
+  ENV \
+  GZIP \
+  LD_LIBRARY_PATH \
+  LD_PRELOAD \
+  NODE_OPTIONS \
+  NODE_PATH \
+  OPENSSL_CONF \
+  OPENSSL_MODULES \
+  PYTHONHOME \
+  PYTHONPATH \
+  TAR_OPTIONS \
+  TAPE
+
 if [[ "${EUID:-$(id -u)}" == "0" ]]; then
   PATH="/usr/sbin:/usr/bin:/sbin:/bin"
   export PATH
@@ -8,11 +27,27 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREPARER="${SCRIPT_DIR}/prepare-release.sh"
+SIGNATURE_HELPER="${SCRIPT_DIR}/release-signature.sh"
+ARCHIVE_LISTER="${SCRIPT_DIR}/archive-list.mjs"
+FSYNC_HELPER="${SCRIPT_DIR}/fsync-paths.mjs"
+STAGE_HELPER="${SCRIPT_DIR}/stage-files.mjs"
 WEB_ROOT_NAME="frontend-web"
+TRUSTED_EXEC_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+TRUSTED_RELEASE_TOOL_DIR="/opt/dedao-kbase/release-tools"
 MAX_WEB_ARCHIVE_BYTES=$((32 * 1024 * 1024))
 MAX_WEB_MEMBERS=20000
 MAX_WEB_FILE_BYTES=$((32 * 1024 * 1024))
 MAX_WEB_TOTAL_BYTES=$((256 * 1024 * 1024))
+MAX_PREPARED_MANIFEST_BYTES=$((1 * 1024 * 1024))
+MAX_RELEASE_SIGNATURE_BYTES=$((64 * 1024))
+MAX_SERVER_BINARY_BYTES=$((256 * 1024 * 1024))
+MAX_NGINX_TEMPLATE_BYTES=$((1 * 1024 * 1024))
+MAX_CONFIG_RENDERER_BYTES=$((1 * 1024 * 1024))
+MAX_PUBLIC_KEY_BYTES=$((64 * 1024))
+MAX_ENVIRONMENT_BYTES=$((1 * 1024 * 1024))
+ARCHIVE_LIST_TIMEOUT_MS=30000
+ARCHIVE_LIST_STDOUT_LIMIT_BYTES=4194304
+ARCHIVE_LIST_STDERR_LIMIT_BYTES=1048576
 
 transaction_active=0
 rollback_in_progress=0
@@ -24,6 +59,10 @@ nginx_config_target=""
 service_name=""
 nginx_service_name=""
 health_url=""
+public_health_url=""
+candidate_revision=""
+previous_revision=""
+transaction_state_file=""
 trusted_public_key=""
 node_bin="node"
 openssl_bin="openssl"
@@ -32,6 +71,7 @@ gzip_bin="gzip"
 nginx_bin="nginx"
 systemctl_bin="systemctl"
 curl_bin="curl"
+flock_bin="flock"
 uname_bin="uname"
 binary_temp=""
 web_temp=""
@@ -60,7 +100,9 @@ Usage:
     --service-name NAME \
     --nginx-service-name NAME \
     --health-url URL \
+    --public-health-url URL \
     --backup-dir ABS \
+    --transaction-state-file ABS \
     [--node-bin PATH] \
     [--openssl-bin PATH] \
     [--tar-bin PATH] \
@@ -68,6 +110,7 @@ Usage:
     [--nginx-bin PATH] \
     [--systemctl-bin PATH] \
     [--curl-bin PATH] \
+    [--flock-bin PATH] \
     [--uname-bin PATH]
 USAGE
 }
@@ -94,6 +137,180 @@ require_executable() {
     fi
   elif ! command -v "$value" >/dev/null 2>&1; then
     die "${label} command not found"
+  fi
+}
+
+canonical_executable() {
+  local value="$1"
+  local label="$2"
+  local resolved
+  if [[ "$value" == */* ]]; then
+    resolved="$(/usr/bin/realpath -e -- "$value")" ||
+      die "${label} cannot be resolved: $value"
+  else
+    resolved="$(builtin type -P -- "$value")" ||
+      die "${label} command not found: $value"
+    resolved="$(/usr/bin/realpath -e -- "$resolved")" ||
+      die "${label} cannot be resolved: $value"
+  fi
+  [[ -x "$resolved" ]] || die "${label} is not executable: $resolved"
+  printf '%s\n' "$resolved"
+}
+
+validate_privileged_runtime() {
+  [[ "${EUID:-$(id -u)}" == "0" ]] || return 0
+  [[ "$SCRIPT_DIR" == "$TRUSTED_RELEASE_TOOL_DIR" ]] ||
+    die "root installation requires release tools at ${TRUSTED_RELEASE_TOOL_DIR}"
+  if [[ "$node_bin" != "node" ||
+    "$openssl_bin" != "openssl" ||
+    "$tar_bin" != "tar" ||
+    "$gzip_bin" != "gzip" ||
+    "$nginx_bin" != "nginx" ||
+    "$systemctl_bin" != "systemctl" ||
+    "$curl_bin" != "curl" ||
+    "$flock_bin" != "flock" ||
+    "$uname_bin" != "uname" ]]; then
+    die "root installation does not accept executable overrides"
+  fi
+
+  node_bin="$(canonical_executable "$node_bin" "Node")"
+  openssl_bin="$(canonical_executable "$openssl_bin" "OpenSSL")"
+  tar_bin="$(canonical_executable "$tar_bin" "tar")"
+  gzip_bin="$(canonical_executable "$gzip_bin" "gzip")"
+  nginx_bin="$(canonical_executable "$nginx_bin" "Nginx")"
+  systemctl_bin="$(canonical_executable "$systemctl_bin" "systemctl")"
+  curl_bin="$(canonical_executable "$curl_bin" "curl")"
+  flock_bin="$(canonical_executable "$flock_bin" "flock")"
+  uname_bin="$(canonical_executable "$uname_bin" "uname")"
+
+  "$node_bin" - \
+    "$SCRIPT_DIR" \
+    "${SCRIPT_DIR}/install-release.sh" \
+    "$PREPARER" \
+    "$SIGNATURE_HELPER" \
+    "$ARCHIVE_LISTER" \
+    "$FSYNC_HELPER" \
+    "$STAGE_HELPER" \
+    "$node_bin" \
+    "$openssl_bin" \
+    "$tar_bin" \
+    "$gzip_bin" \
+    "$nginx_bin" \
+    "$systemctl_bin" \
+    "$curl_bin" \
+    "$flock_bin" \
+    "$uname_bin" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const [toolDirectory, ...files] = process.argv.slice(2);
+
+function fail(message) {
+  process.stderr.write(`install-release: ${message}\n`);
+  process.exit(1);
+}
+
+function validate(pathname, finalType, label) {
+  if (!path.isAbsolute(pathname)) {
+    fail(`${label} path must be absolute`);
+  }
+  const normalized = path.resolve(pathname);
+  const segments = normalized.split(path.sep).filter(Boolean);
+  let cursor = path.parse(normalized).root;
+  for (let index = 0; index < segments.length; index += 1) {
+    cursor = path.join(cursor, segments[index]);
+    const stat = fs.lstatSync(cursor);
+    const final = index === segments.length - 1;
+    if (stat.isSymbolicLink()) {
+      fail(`${label} path must not contain symbolic links`);
+    }
+    if (
+      final
+        ? finalType === "file"
+          ? !stat.isFile()
+          : !stat.isDirectory()
+        : !stat.isDirectory()
+    ) {
+      fail(`${label} path has an invalid component`);
+    }
+    if (stat.uid !== 0) {
+      fail(`${label} path must be root-owned`);
+    }
+    if ((stat.mode & 0o022) !== 0) {
+      fail(`${label} path must not be group/other writable`);
+    }
+  }
+}
+
+validate(toolDirectory, "directory", "release tool directory");
+for (const pathname of files) {
+  validate(pathname, "file", `privileged tool ${pathname}`);
+}
+NODE
+}
+
+acquire_install_lock() {
+  local lock_file="${transaction_state_file}.lock"
+  "$node_bin" - "$transaction_state_file" "$lock_file" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const stateFile = process.argv[2];
+const lockFile = process.argv[3];
+const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+
+function fail(message) {
+  process.stderr.write(`install-release: ${message}\n`);
+  process.exit(1);
+}
+
+if (!path.isAbsolute(stateFile) || !path.isAbsolute(lockFile)) {
+  fail("transaction state and lock paths must be absolute");
+}
+const parent = path.dirname(lockFile);
+const segments = path.resolve(parent).split(path.sep).filter(Boolean);
+let cursor = path.parse(parent).root;
+for (const segment of segments) {
+  cursor = path.join(cursor, segment);
+  const stat = fs.lstatSync(cursor);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    fail("transaction lock parent path is invalid");
+  }
+  if (stat.uid !== 0 && stat.uid !== uid) {
+    fail("transaction lock parent path has an untrusted owner");
+  }
+  if ((stat.mode & 0o022) !== 0) {
+    fail("transaction lock parent path is group/other writable");
+  }
+}
+for (const [pathname, label] of [
+  [stateFile, "transaction state file"],
+  [lockFile, "transaction lock file"],
+]) {
+  try {
+    const stat = fs.lstatSync(pathname);
+    if (stat.isSymbolicLink() || !stat.isFile()) {
+      fail(`${label} must be a real regular file`);
+    }
+    if (stat.uid !== 0 && stat.uid !== uid) {
+      fail(`${label} has an untrusted owner`);
+    }
+    if ((stat.mode & 0o077) !== 0) {
+      fail(`${label} must use mode 0600 or stricter`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+}
+NODE
+
+  umask 077
+  exec 9>>"$lock_file"
+  chmod 0600 "$lock_file"
+  if ! "$flock_bin" -n 9; then
+    die "another installation is already running"
   fi
 }
 
@@ -219,7 +436,10 @@ run_with_environment() {
   local environment_file="$1"
   shift
   load_environment_arguments "$environment_file"
-  env "${parsed_environment[@]}" "$@"
+  env -i \
+    "PATH=$TRUSTED_EXEC_PATH" \
+    "${parsed_environment[@]}" \
+    "$@"
 }
 
 run_renderer() {
@@ -230,13 +450,88 @@ run_renderer() {
   local backend="$5"
   local auth_file="$6"
   load_environment_arguments "$environment_file"
-  env \
+  env -i \
+    "PATH=$TRUSTED_EXEC_PATH" \
     "${parsed_environment[@]}" \
     "KBASE_BACKEND_ADDR=$backend" \
     "KBASE_BASIC_AUTH_FILE=$auth_file" \
     "$renderer" \
     "$template" \
     "$output"
+}
+
+required_environment_value() {
+  local environment_file="$1"
+  local wanted_key="$2"
+  local entry
+  load_environment_arguments "$environment_file"
+  for entry in "${parsed_environment[@]}"; do
+    if [[ "${entry%%=*}" == "$wanted_key" ]]; then
+      printf '%s\n' "${entry#*=}"
+      return 0
+    fi
+  done
+  die "candidate environment is missing ${wanted_key}"
+}
+
+prepared_manifest_revision() {
+  local manifest="$1"
+  "$node_bin" - "$manifest" <<'NODE'
+const fs = require("fs");
+const manifest = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (
+  typeof manifest.revision !== "string" ||
+  !/^[0-9a-f]{40}$/.test(manifest.revision)
+) {
+  process.stderr.write("install-release: prepared revision is invalid\n");
+  process.exit(1);
+}
+process.stdout.write(manifest.revision);
+NODE
+}
+
+validate_public_health_endpoint() {
+  local public_origin="$1"
+  local endpoint="$2"
+  "$node_bin" - "$public_origin" "$endpoint" <<'NODE'
+const originValue = process.argv[2];
+const endpointValue = process.argv[3];
+
+function fail(message) {
+  process.stderr.write(`install-release: ${message}\n`);
+  process.exit(1);
+}
+
+let origin;
+let endpoint;
+try {
+  origin = new URL(originValue);
+  endpoint = new URL(endpointValue);
+} catch {
+  fail("public origin or public health URL is invalid");
+}
+for (const [value, label] of [
+  [origin, "public origin"],
+  [endpoint, "public health URL"],
+]) {
+  if (
+    (value.protocol !== "http:" && value.protocol !== "https:") ||
+    value.username !== "" ||
+    value.password !== "" ||
+    value.search !== "" ||
+    value.hash !== ""
+  ) {
+    fail(`${label} must be HTTP(S) without credentials, query, or fragment`);
+  }
+}
+if (origin.pathname !== "/" || endpoint.pathname !== "/health") {
+  fail("public origin must be site-root and public health URL must end at /health");
+}
+const expected = new URL("/health", origin).toString();
+if (endpoint.toString() !== expected) {
+  fail("public health URL must match KBASE_PUBLIC_ORIGIN/health");
+}
+NODE
 }
 
 validate_doctor_result() {
@@ -269,20 +564,26 @@ if (
 NODE
 }
 
-retry_health() {
-  local attempts="$1"
-  local url="$2"
-  local index=1
+read_health_revision() {
+  local url="$1"
+  local allow_legacy="${2:-0}"
   local response_file="${release_staging}/health-response.json"
-  while ((index <= attempts)); do
-    if "$curl_bin" \
-      --fail \
-      --silent \
-      --show-error \
-      --max-time 2 \
-      "$url" >"$response_file" &&
-      "$node_bin" - "$response_file" <<'NODE'
+  if ! "$curl_bin" \
+    -q \
+	    --noproxy '*' \
+	    --proto '=http,https' \
+	    --header 'Cache-Control: no-cache' \
+	    --fail \
+    --silent \
+    --show-error \
+    --max-time 2 \
+    "$url" >"$response_file"; then
+    rm -f "$response_file"
+    return 1
+  fi
+  if ! "$node_bin" - "$response_file" "$allow_legacy" <<'NODE'
 const fs = require("fs");
+const allowLegacy = process.argv[3] === "1";
 let value;
 try {
   value = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -290,22 +591,54 @@ try {
   process.exit(1);
 }
 if (
+  allowLegacy &&
+  value !== null &&
+  !Array.isArray(value) &&
+  typeof value === "object" &&
+  JSON.stringify(Object.keys(value).sort()) ===
+    JSON.stringify(["ok", "service"]) &&
+  value.ok === true &&
+  value.service === "dedao-kbase"
+) {
+  process.stdout.write("legacy");
+  process.exit(0);
+}
+if (
   value === null ||
   Array.isArray(value) ||
   typeof value !== "object" ||
   JSON.stringify(Object.keys(value).sort()) !==
-    JSON.stringify(["ok", "service"]) ||
+    JSON.stringify(["ok", "revision", "service"]) ||
   value.ok !== true ||
-  value.service !== "dedao-kbase"
+  value.service !== "dedao-kbase" ||
+  typeof value.revision !== "string" ||
+  value.revision.length === 0
 ) {
   process.exit(1);
 }
+process.stdout.write(value.revision);
 NODE
-    then
-      rm -f "$response_file"
+  then
+    rm -f "$response_file"
+    return 1
+  fi
+  rm -f "$response_file"
+}
+
+retry_health() {
+  local attempts="$1"
+  local url="$2"
+  local expected_revision="$3"
+  local index=1
+  local actual_revision
+  local allow_legacy
+  while ((index <= attempts)); do
+    allow_legacy=0
+    [[ "$expected_revision" == "legacy" ]] && allow_legacy=1
+    if actual_revision="$(read_health_revision "$url" "$allow_legacy")" &&
+      [[ "$actual_revision" == "$expected_revision" ]]; then
       return 0
     fi
-    rm -f "$response_file"
     if ((index < attempts)); then
       sleep 0.1
     fi
@@ -354,6 +687,292 @@ NODE
     return 1
   fi
   printf -v "$variable_name" '%s' "$temporary"
+}
+
+write_transaction_journal() {
+  "$node_bin" - \
+    "$transaction_state_file" \
+    "$backup_dir" \
+    "$binary_target" \
+    "$web_target" \
+    "$env_target" \
+    "$nginx_config_target" \
+    "$service_name" \
+    "$nginx_service_name" \
+    "$health_url" \
+    "$public_health_url" \
+    "$previous_revision" \
+    "$web_displaced" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const [
+  stateFile,
+  backupDirectory,
+  binaryTarget,
+  webTarget,
+  environmentTarget,
+  nginxTarget,
+  serviceName,
+  nginxServiceName,
+  backendHealthUrl,
+  publicHealthUrl,
+  previousRevision,
+  webDisplaced,
+] = process.argv.slice(2);
+const parent = path.dirname(stateFile);
+const temporary = path.join(
+  parent,
+  `.${path.basename(stateFile)}.staging.${process.pid}`,
+);
+const journal = {
+  schema_version: 1,
+  backup_dir: backupDirectory,
+  targets: {
+    binary: binaryTarget,
+    web: webTarget,
+    environment: environmentTarget,
+    nginx: nginxTarget,
+  },
+  services: {
+    kbase: serviceName,
+    nginx: nginxServiceName,
+  },
+  health: {
+    backend: backendHealthUrl,
+    public: publicHealthUrl,
+    previous_revision: previousRevision,
+  },
+  web_displaced: webDisplaced,
+};
+let descriptor;
+try {
+  descriptor = fs.openSync(
+    temporary,
+    fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+    0o600,
+  );
+  fs.writeFileSync(descriptor, `${JSON.stringify(journal, null, 2)}\n`);
+  fs.fsyncSync(descriptor);
+  fs.closeSync(descriptor);
+  descriptor = undefined;
+  fs.linkSync(temporary, stateFile);
+  fs.unlinkSync(temporary);
+  const parentDescriptor = fs.openSync(parent, fs.constants.O_RDONLY);
+  fs.fsyncSync(parentDescriptor);
+  fs.closeSync(parentDescriptor);
+} catch (error) {
+  if (descriptor !== undefined) {
+    fs.closeSync(descriptor);
+  }
+  try {
+    fs.unlinkSync(temporary);
+  } catch {}
+  process.stderr.write(
+    `install-release: cannot persist transaction journal: ${error.message}\n`,
+  );
+  process.exit(1);
+}
+NODE
+}
+
+clear_transaction_journal() {
+  [[ -e "$transaction_state_file" || -L "$transaction_state_file" ]] || return 0
+  "$node_bin" - "$transaction_state_file" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const stateFile = process.argv[2];
+const parent = path.dirname(stateFile);
+fs.unlinkSync(stateFile);
+const descriptor = fs.openSync(parent, fs.constants.O_RDONLY);
+fs.fsyncSync(descriptor);
+fs.closeSync(descriptor);
+NODE
+}
+
+recover_unfinished_transaction() {
+  [[ -e "$transaction_state_file" || -L "$transaction_state_file" ]] ||
+    return 0
+
+  local requested_backup_dir="$backup_dir"
+  local recovered_values
+  local recovered_backup=""
+  local recovered_previous_revision=""
+  local recovered_web_displaced=""
+  recovered_values="$(
+    mktemp "$(parent_directory "$transaction_state_file")/.kbase-recovery.XXXXXX"
+  )"
+  chmod 0600 "$recovered_values"
+  if ! "$node_bin" - \
+    "$transaction_state_file" \
+    "$binary_target" \
+    "$web_target" \
+    "$env_target" \
+    "$nginx_config_target" \
+    "$service_name" \
+    "$nginx_service_name" \
+    "$health_url" \
+    "$public_health_url" \
+    >"$recovered_values" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const [
+  stateFile,
+  binaryTarget,
+  webTarget,
+  environmentTarget,
+  nginxTarget,
+  serviceName,
+  nginxServiceName,
+  backendHealthUrl,
+  publicHealthUrl,
+] = process.argv.slice(2);
+
+function fail(message) {
+  process.stderr.write(`install-release: ${message}\n`);
+  process.exit(1);
+}
+
+function exactKeys(value, keys, label) {
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    fail(`${label} must be an object`);
+  }
+  if (
+    JSON.stringify(Object.keys(value).sort()) !==
+    JSON.stringify([...keys].sort())
+  ) {
+    fail(`${label} has unexpected fields`);
+  }
+}
+
+let journal;
+try {
+  journal = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+} catch (error) {
+  fail(`transaction journal is invalid: ${error.message}`);
+}
+exactKeys(
+  journal,
+  [
+    "schema_version",
+    "backup_dir",
+    "targets",
+    "services",
+    "health",
+    "web_displaced",
+  ],
+  "transaction journal",
+);
+exactKeys(journal.targets, ["binary", "web", "environment", "nginx"], "targets");
+exactKeys(journal.services, ["kbase", "nginx"], "services");
+exactKeys(
+  journal.health,
+  ["backend", "public", "previous_revision"],
+  "health",
+);
+if (journal.schema_version !== 1) {
+  fail("transaction journal schema is unsupported");
+}
+const expectedTargets = {
+  binary: binaryTarget,
+  web: webTarget,
+  environment: environmentTarget,
+  nginx: nginxTarget,
+};
+const expectedServices = { kbase: serviceName, nginx: nginxServiceName };
+if (JSON.stringify(journal.targets) !== JSON.stringify(expectedTargets)) {
+  fail("transaction journal targets do not match this installation");
+}
+if (JSON.stringify(journal.services) !== JSON.stringify(expectedServices)) {
+  fail("transaction journal services do not match this installation");
+}
+if (
+  journal.health.backend !== backendHealthUrl ||
+  journal.health.public !== publicHealthUrl
+) {
+  fail("transaction journal health endpoints do not match this installation");
+}
+if (
+  typeof journal.health.previous_revision !== "string" ||
+  journal.health.previous_revision.length === 0
+) {
+  fail("transaction journal previous revision is invalid");
+}
+for (const [value, label] of [
+  [journal.backup_dir, "backup directory"],
+  [journal.web_displaced, "displaced Web path"],
+]) {
+  if (typeof value !== "string" || !path.isAbsolute(value)) {
+    fail(`${label} in transaction journal is invalid`);
+  }
+}
+
+const currentUid = typeof process.getuid === "function" ? process.getuid() : 0;
+function trustedExistingDirectory(pathname, label) {
+  const normalized = path.resolve(pathname);
+  const segments = normalized.split(path.sep).filter(Boolean);
+  let cursor = path.parse(normalized).root;
+  for (let index = 0; index < segments.length; index += 1) {
+    cursor = path.join(cursor, segments[index]);
+    const stat = fs.lstatSync(cursor);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      fail(`${label} path is not a real directory`);
+    }
+    if (currentUid === 0 ? stat.uid !== 0 : stat.uid !== 0 && stat.uid !== currentUid) {
+      fail(`${label} path has an untrusted owner`);
+    }
+    if ((stat.mode & 0o022) !== 0) {
+      const trustedSticky =
+        stat.uid === 0 && (stat.mode & 0o1000) !== 0;
+      if (!trustedSticky) {
+        fail(`${label} path is group/other writable`);
+      }
+    }
+  }
+}
+trustedExistingDirectory(journal.backup_dir, "recovery backup");
+const snapshot = path.join(journal.backup_dir, "snapshot");
+trustedExistingDirectory(snapshot, "recovery snapshot");
+for (const name of ["kbase-server", "service.env", "nginx.conf"]) {
+  const stat = fs.lstatSync(path.join(snapshot, name));
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    fail(`recovery snapshot is missing ${name}`);
+  }
+}
+const webStat = fs.lstatSync(path.join(snapshot, "web"));
+if (webStat.isSymbolicLink() || !webStat.isDirectory()) {
+  fail("recovery snapshot is missing Web content");
+}
+
+process.stdout.write(
+  `${journal.backup_dir}\0${journal.health.previous_revision}\0${journal.web_displaced}\0`,
+);
+NODE
+  then
+    rm -f "$recovered_values"
+    return 1
+  fi
+  exec 3<"$recovered_values"
+  IFS= read -r -d '' recovered_backup <&3
+  IFS= read -r -d '' recovered_previous_revision <&3
+  IFS= read -r -d '' recovered_web_displaced <&3
+  exec 3<&-
+  rm -f "$recovered_values"
+
+  backup_dir="$recovered_backup"
+  previous_revision="$recovered_previous_revision"
+  web_displaced="$recovered_web_displaced"
+  release_staging="${backup_dir}/recovery-staging"
+  rm -rf "$release_staging"
+  mkdir -m 0700 "$release_staging"
+  transaction_active=1
+  rollback_in_progress=0
+  printf 'install-release: recovering interrupted installation\n' >&2
+  rollback_transaction
+  backup_dir="$requested_backup_dir"
+  rollback_in_progress=0
+  transaction_active=0
 }
 
 rollback_transaction() {
@@ -424,6 +1043,11 @@ rollback_transaction() {
       printf 'install-release: rollback failed to restore Nginx config\n' >&2
       failed=1
     fi
+
+    if [[ "$failed" == "0" ]] && ! sync_installed_targets; then
+      printf 'install-release: rollback could not persist restored targets\n' >&2
+      failed=1
+    fi
   fi
 
   [[ -z "$restore_binary" ]] || rm -f "$restore_binary"
@@ -443,8 +1067,12 @@ rollback_transaction() {
     printf 'install-release: rollback Nginx reload failed\n' >&2
     failed=1
   fi
-  if ! retry_health 5 "$health_url"; then
+  if ! retry_health 5 "$health_url" "$previous_revision"; then
     printf 'install-release: rollback health check failed\n' >&2
+    failed=1
+  fi
+  if ! retry_health 5 "$public_health_url" "$previous_revision"; then
+    printf 'install-release: rollback public health check failed\n' >&2
     failed=1
   fi
 
@@ -461,6 +1089,10 @@ rollback_transaction() {
   if [[ -n "$web_displaced" ]]; then
     rm -rf "$web_displaced"
     web_displaced=""
+  fi
+  if ! clear_transaction_journal; then
+    printf 'install-release: rollback could not clear transaction journal\n' >&2
+    return 1
   fi
   transaction_active=0
   printf 'install-release: rollback complete; backup retained\n' >&2
@@ -521,6 +1153,7 @@ validate_paths_and_inputs() {
     "$basic_auth_file" \
     "$public_key" \
     "$backup_dir" \
+    "$transaction_state_file" \
     "$health_url" <<'NODE'
 const fs = require("fs");
 const path = require("path");
@@ -535,6 +1168,7 @@ const [
   basicAuth,
   publicKey,
   backupDirectory,
+  transactionStateFile,
   healthUrl,
 ] = process.argv.slice(2);
 
@@ -553,6 +1187,7 @@ const absolutePaths = [
   ["basic auth file", basicAuth],
   ["trusted public key", publicKey],
   ["backup directory", backupDirectory],
+  ["transaction state file", transactionStateFile],
 ];
 for (const [label, value] of absolutePaths) {
   if (!path.isAbsolute(value)) {
@@ -570,8 +1205,16 @@ function regular(pathname, label) {
 
 regular(manifest, "manifest");
 regular(binaryTarget, "binary target");
-const webStat = fs.lstatSync(webTarget);
-if (webStat.isSymbolicLink() || !webStat.isDirectory()) {
+const recovering = fs.existsSync(transactionStateFile);
+let webStat;
+try {
+  webStat = fs.lstatSync(webTarget);
+} catch (error) {
+  if (!recovering || error.code !== "ENOENT") {
+    fail("web target must be a real directory");
+  }
+}
+if (webStat && (webStat.isSymbolicLink() || !webStat.isDirectory())) {
   fail("web target must be a real directory");
 }
 const sourceStat = regular(envSource, "environment source");
@@ -608,11 +1251,7 @@ function trustedPath(pathname, label, finalType) {
       fail(`${label} path has an untrusted owner`);
     }
     if ((stat.mode & 0o022) !== 0) {
-      const trustedStickyDirectory =
-        !isFile && stat.uid === 0 && (stat.mode & 0o1000) !== 0;
-      if (!trustedStickyDirectory) {
-        fail(`${label} path is group/other writable`);
-      }
+      fail(`${label} path is group/other writable`);
     }
   }
 }
@@ -621,14 +1260,56 @@ trustedPath(envSource, "environment source", "file");
 trustedPath(basicAuth, "basic auth file", "file");
 trustedPath(publicKey, "trusted public key", "file");
 trustedPath(path.dirname(backupDirectory), "backup parent", "directory");
-
-const targets = [binaryTarget, webTarget, envTarget, nginxTarget].map(
-  (target) => fs.realpathSync(target),
+trustedPath(
+  path.dirname(transactionStateFile),
+  "transaction state parent",
+  "directory",
 );
-const identities = targets.map((target) => {
-  const stat = fs.statSync(target);
-  return `${stat.dev}:${stat.ino}`;
-});
+if (fs.existsSync(transactionStateFile)) {
+  const stateStat = regular(transactionStateFile, "transaction state file");
+  if ((stateStat.mode & 0o077) !== 0) {
+    fail("transaction state file must use mode 0600 or stricter");
+  }
+  trustedPath(transactionStateFile, "transaction state file", "file");
+}
+trustedPath(binaryTarget, "binary target", "file");
+if (webStat) {
+  trustedPath(webTarget, "web target", "directory");
+} else {
+  trustedPath(path.dirname(webTarget), "web target parent", "directory");
+}
+trustedPath(envTarget, "environment target", "file");
+trustedPath(nginxTarget, "Nginx config target", "file");
+
+const targets = [binaryTarget, webTarget, envTarget, nginxTarget].map((target) =>
+  target === webTarget && !webStat
+    ? path.join(fs.realpathSync(path.dirname(target)), path.basename(target))
+    : fs.realpathSync(target),
+);
+const transactionStateParent = fs.realpathSync(
+  path.dirname(transactionStateFile),
+);
+const realTransactionStateFile = path.join(
+  transactionStateParent,
+  path.basename(transactionStateFile),
+);
+for (const target of targets) {
+  if (
+    contains(target, realTransactionStateFile) ||
+    contains(realTransactionStateFile, target)
+  ) {
+    fail("transaction state file must not overlap an installation target");
+  }
+}
+if (new Set(targets).size !== targets.length) {
+  fail("installation targets must be distinct");
+}
+const identities = targets
+  .filter((target) => fs.existsSync(target))
+  .map((target) => {
+    const stat = fs.statSync(target);
+    return `${stat.dev}:${stat.ino}`;
+  });
 if (new Set(identities).size !== identities.length) {
   fail("installation targets must be distinct");
 }
@@ -705,13 +1386,16 @@ NODE
   if [[ ! -d "$backup_parent" || ! -w "$backup_parent" ]]; then
     die "backup parent must exist and be writable"
   fi
+  transaction_state_parent="$(parent_directory "$transaction_state_file")"
+  if [[ ! -d "$transaction_state_parent" || ! -w "$transaction_state_parent" ]]; then
+    die "transaction state parent must exist and be writable"
+  fi
 }
 
 validate_web_archive() {
   local archive="$1"
   local validation_dir="$2"
-  local names_file="${validation_dir}/web-members.txt"
-  local verbose_file="${validation_dir}/web-members.verbose.txt"
+  local members_file="${validation_dir}/web-members.json"
 
   "$node_bin" - "$archive" "$MAX_WEB_ARCHIVE_BYTES" <<'NODE'
 const fs = require("fs");
@@ -725,72 +1409,63 @@ if (archiveBytes > maximum) {
 }
 NODE
 
-  "$gzip_bin" -dc "$archive" |
-    "$tar_bin" --quoting-style=escape -tf - >"$names_file"
-  "$gzip_bin" -dc "$archive" |
-    "$tar_bin" --quoting-style=escape -tvf - >"$verbose_file"
+  "$node_bin" "$ARCHIVE_LISTER" \
+    --archive "$archive" \
+    --gzip-bin "$gzip_bin" \
+    --tar-bin "$tar_bin" \
+    --timeout-ms "$ARCHIVE_LIST_TIMEOUT_MS" \
+    --stdout-limit-bytes "$ARCHIVE_LIST_STDOUT_LIMIT_BYTES" \
+    --stderr-limit-bytes "$ARCHIVE_LIST_STDERR_LIMIT_BYTES" \
+    >"$members_file"
 
   "$node_bin" - \
-    "$archive" \
-    "$names_file" \
-    "$verbose_file" \
+    "$members_file" \
     "$WEB_ROOT_NAME" \
-    "$MAX_WEB_ARCHIVE_BYTES" \
     "$MAX_WEB_MEMBERS" \
     "$MAX_WEB_FILE_BYTES" \
     "$MAX_WEB_TOTAL_BYTES" <<'NODE'
 const fs = require("fs");
 
-const archivePath = process.argv[2];
-const namesPath = process.argv[3];
-const verbosePath = process.argv[4];
-const expectedRoot = process.argv[5];
-const maxArchiveBytes = Number(process.argv[6]);
-const maxMembers = Number(process.argv[7]);
-const maxFileBytes = Number(process.argv[8]);
-const maxTotalBytes = Number(process.argv[9]);
+const membersPath = process.argv[2];
+const expectedRoot = process.argv[3];
+const maxMembers = Number(process.argv[4]);
+const maxFileBytes = Number(process.argv[5]);
+const maxTotalBytes = Number(process.argv[6]);
 
 function fail(message) {
   process.stderr.write(`install-release: ${message}\n`);
   process.exit(1);
 }
 
-function lines(filePath) {
-  const values = fs.readFileSync(filePath, "utf8").split("\n");
-  if (values[values.length - 1] === "") {
-    values.pop();
-  }
-  return values;
+const document = JSON.parse(fs.readFileSync(membersPath, "utf8"));
+if (
+  document === null ||
+  Array.isArray(document) ||
+  typeof document !== "object" ||
+  JSON.stringify(Object.keys(document)) !== JSON.stringify(["members"]) ||
+  !Array.isArray(document.members) ||
+  document.members.length === 0
+) {
+  fail("web archive member listing is empty or invalid");
 }
-
-const names = lines(namesPath);
-const verbose = lines(verbosePath);
-if (names.length === 0 || names.length !== verbose.length) {
-  fail("web archive member listing is empty or inconsistent");
-}
-if (fs.statSync(archivePath).size > maxArchiveBytes) {
-  fail("web archive exceeds the compressed size limit");
-}
-if (names.length > maxMembers) {
+if (document.members.length > maxMembers) {
   fail("web archive exceeds the member count limit");
 }
 
-function memberSize(value) {
-  const gnu = value.match(/^\S+\s+\S+\/\S+\s+(\d+)\s+/);
-  if (gnu) {
-    return Number(gnu[1]);
-  }
-  const bsd = value.match(/^\S+\s+\d+\s+\S+\s+\S+\s+(\d+)\s+/);
-  if (bsd) {
-    return Number(bsd[1]);
-  }
-  fail("web archive has an unrecognized verbose listing");
-}
-
 let totalBytes = 0;
-for (let index = 0; index < names.length; index += 1) {
-  const name = names[index];
+for (const member of document.members) {
   if (
+    member === null ||
+    Array.isArray(member) ||
+    typeof member !== "object" ||
+    JSON.stringify(Object.keys(member).sort()) !==
+      JSON.stringify(["path", "size", "type"])
+  ) {
+    fail("web archive member metadata is invalid");
+  }
+  const name = member.path;
+  if (
+    typeof name !== "string" ||
     name.length === 0 ||
     name.startsWith("/") ||
     name.includes("\\") ||
@@ -817,15 +1492,14 @@ for (let index = 0; index < names.length; index += 1) {
   ) {
     fail(`web archive contains an invalid path segment: ${name}`);
   }
-  const type = verbose[index][0];
-  if (type !== "-" && type !== "d") {
+  if (member.type !== "file" && member.type !== "directory") {
     fail(`web archive member type is not allowed: ${name}`);
   }
-  const size = memberSize(verbose[index]);
+  const size = member.size;
   if (!Number.isSafeInteger(size) || size < 0) {
     fail(`web archive member has an invalid size: ${name}`);
   }
-  if (type === "-" && size > maxFileBytes) {
+  if (member.type === "file" && size > maxFileBytes) {
     fail(`web archive member exceeds the file size limit: ${name}`);
   }
   totalBytes += size;
@@ -862,6 +1536,10 @@ snapshot_targets() {
   cp -a "$web_target" "${snapshot}/web"
   cp -p "$env_target" "${snapshot}/service.env"
   cp -p "$nginx_config_target" "${snapshot}/nginx.conf"
+  "$node_bin" "$FSYNC_HELPER" \
+    --tree "$snapshot" \
+    --path "$backup_dir" \
+    --path "$(parent_directory "$backup_dir")"
 }
 
 prepare_target_temporary_files() {
@@ -897,6 +1575,28 @@ prepare_target_temporary_files() {
   nginx_temp="$(mktemp "${parent}/.${name}.kbase-install.XXXXXX")"
   cp "$candidate_nginx" "$nginx_temp"
   chmod 0600 "$nginx_temp"
+
+  "$node_bin" "$FSYNC_HELPER" \
+    --path "$binary_temp" \
+    --tree "$web_temp" \
+    --path "$env_temp" \
+    --path "$nginx_temp" \
+    --path "$(parent_directory "$binary_target")" \
+    --path "$(parent_directory "$web_target")" \
+    --path "$(parent_directory "$env_target")" \
+    --path "$(parent_directory "$nginx_config_target")"
+}
+
+sync_installed_targets() {
+  "$node_bin" "$FSYNC_HELPER" \
+    --path "$binary_target" \
+    --tree "$web_target" \
+    --path "$env_target" \
+    --path "$nginx_config_target" \
+    --path "$(parent_directory "$binary_target")" \
+    --path "$(parent_directory "$web_target")" \
+    --path "$(parent_directory "$env_target")" \
+    --path "$(parent_directory "$nginx_config_target")"
 }
 
 stage_prepared_release() {
@@ -905,46 +1605,61 @@ stage_prepared_release() {
   local public_key="$3"
   local original_release
   local staged_release
-  local name
 
   [[ "$(base_name "$manifest")" == "prepared-manifest.json" ]] ||
     die "prepared manifest must use the canonical filename"
   original_release="$(cd "$(dirname "$manifest")" && pwd -P)"
   staged_release="${release_staging}/release"
   mkdir -m 0700 "$staged_release" "${staged_release}/bundle"
-
-  for name in \
-    prepared-manifest.json \
-    MANIFEST.sig \
-    bundle/kbase-server \
-    bundle/web.tar.gz \
-    bundle/kbase.locations.conf.template \
-    bundle/render-kbase-config.sh; do
-    if [[ ! -f "${original_release}/${name}" || -L "${original_release}/${name}" ]]; then
-      die "prepared release input must be a regular file: $name"
-    fi
-    cp "${original_release}/${name}" "${staged_release}/${name}"
-  done
-  chmod 0600 \
-    "${staged_release}/prepared-manifest.json" \
-    "${staged_release}/MANIFEST.sig"
-  chmod 0755 \
-    "${staged_release}/bundle/kbase-server" \
-    "${staged_release}/bundle/render-kbase-config.sh"
-  chmod 0644 \
-    "${staged_release}/bundle/web.tar.gz" \
-    "${staged_release}/bundle/kbase.locations.conf.template"
-
   staged_public_key="${release_staging}/trusted-release-public-key.pem"
-  cp "$public_key" "$staged_public_key"
-  chmod 0600 "$staged_public_key"
   staged_environment="${release_staging}/candidate.env"
-  cp "$env_source" "$staged_environment"
-  chmod 0600 "$staged_environment"
+  "$node_bin" "$STAGE_HELPER" \
+    --file \
+    "${original_release}/prepared-manifest.json" \
+    "${staged_release}/prepared-manifest.json" \
+    "$MAX_PREPARED_MANIFEST_BYTES" \
+    0600 \
+    --file \
+    "${original_release}/MANIFEST.sig" \
+    "${staged_release}/MANIFEST.sig" \
+    "$MAX_RELEASE_SIGNATURE_BYTES" \
+    0600 \
+    --file \
+    "${original_release}/bundle/kbase-server" \
+    "${staged_release}/bundle/kbase-server" \
+    "$MAX_SERVER_BINARY_BYTES" \
+    0755 \
+    --file \
+    "${original_release}/bundle/web.tar.gz" \
+    "${staged_release}/bundle/web.tar.gz" \
+    "$MAX_WEB_ARCHIVE_BYTES" \
+    0644 \
+    --file \
+    "${original_release}/bundle/kbase.locations.conf.template" \
+    "${staged_release}/bundle/kbase.locations.conf.template" \
+    "$MAX_NGINX_TEMPLATE_BYTES" \
+    0644 \
+    --file \
+    "${original_release}/bundle/render-kbase-config.sh" \
+    "${staged_release}/bundle/render-kbase-config.sh" \
+    "$MAX_CONFIG_RENDERER_BYTES" \
+    0755 \
+    --file \
+    "$public_key" \
+    "$staged_public_key" \
+    "$MAX_PUBLIC_KEY_BYTES" \
+    0600 \
+    --file \
+    "$env_source" \
+    "$staged_environment" \
+    "$MAX_ENVIRONMENT_BYTES" \
+    0600
   staged_manifest="${staged_release}/prepared-manifest.json"
 
   "$PREPARER" verify \
     --node-bin "$node_bin" \
+    --tar-bin "$tar_bin" \
+    --gzip-bin "$gzip_bin" \
     --openssl-bin "$openssl_bin" \
     --trusted-public-key "$staged_public_key" \
     --manifest "$staged_manifest" \
@@ -964,6 +1679,8 @@ install_release() {
   local candidate_nginx
   local template
   local renderer
+  local public_origin
+  local previous_public_revision
 
   if [[ "$("$uname_bin" -s)" != "Linux" ]]; then
     die "install is supported only on Linux"
@@ -992,6 +1709,7 @@ install_release() {
     "$env_source" \
     "$basic_auth_file" \
     "$trusted_public_key"
+  recover_unfinished_transaction
 
   (umask 077; mkdir "$backup_dir")
   chmod 0700 "$backup_dir"
@@ -999,6 +1717,18 @@ install_release() {
   mkdir -m 0700 "$staging"
   release_staging="$staging"
   stage_prepared_release "$manifest" "$env_source" "$trusted_public_key"
+  candidate_revision="$(prepared_manifest_revision "$staged_manifest")"
+  public_origin="$(
+    required_environment_value "$staged_environment" KBASE_PUBLIC_ORIGIN
+  )"
+  validate_public_health_endpoint "$public_origin" "$public_health_url"
+  previous_revision="$(read_health_revision "$health_url" 1)" ||
+    die "current backend health contract is unavailable"
+  previous_public_revision="$(read_health_revision "$public_health_url" 1)" ||
+    die "current public health contract is unavailable"
+  if [[ "$previous_public_revision" != "$previous_revision" ]]; then
+    die "backend and public health revisions disagree before installation"
+  fi
 
   release_dir="$(cd "$(dirname "$staged_manifest")" && pwd -P)"
   bundle_dir="${release_dir}/bundle"
@@ -1049,6 +1779,7 @@ install_release() {
     "$staged_environment" \
     "$candidate_nginx"
 
+  write_transaction_journal
   transaction_active=1
   mv -f "$binary_temp" "$binary_target"
   binary_temp=""
@@ -1059,18 +1790,20 @@ install_release() {
   env_temp=""
   mv -f "$nginx_temp" "$nginx_config_target"
   nginx_temp=""
+  sync_installed_targets
 
   "$systemctl_bin" restart "$service_name"
-  retry_health 20 "$health_url"
+  retry_health 20 "$health_url" "$candidate_revision"
   "$nginx_bin" -t
   "$systemctl_bin" reload "$nginx_service_name"
-  retry_health 20 "$health_url"
+  retry_health 20 "$public_health_url" "$candidate_revision"
 
-  transaction_active=0
   rm -rf "$web_displaced"
   web_displaced=""
   rm -rf "$staging"
   release_staging=""
+  clear_transaction_journal
+  transaction_active=0
   printf '{"schema_version":1,"status":"installed","backup":"retained"}\n'
 }
 
@@ -1149,9 +1882,19 @@ main() {
         health_url="$2"
         shift 2
         ;;
+      --public-health-url)
+        require_value "$1" "${2:-}"
+        public_health_url="$2"
+        shift 2
+        ;;
       --backup-dir)
         require_value "$1" "${2:-}"
         backup_dir="$2"
+        shift 2
+        ;;
+      --transaction-state-file)
+        require_value "$1" "${2:-}"
+        transaction_state_file="$2"
         shift 2
         ;;
       --node-bin)
@@ -1189,6 +1932,11 @@ main() {
         curl_bin="$2"
         shift 2
         ;;
+      --flock-bin)
+        require_value "$1" "${2:-}"
+        flock_bin="$2"
+        shift 2
+        ;;
       --uname-bin)
         require_value "$1" "${2:-}"
         uname_bin="$2"
@@ -1217,15 +1965,30 @@ main() {
     "$service_name" \
     "$nginx_service_name" \
     "$health_url" \
-    "$backup_dir"; do
+    "$public_health_url" \
+    "$backup_dir" \
+    "$transaction_state_file"; do
     if [[ -z "$value" ]]; then
       usage >&2
       die "all install options are required"
     fi
   done
 
+  validate_privileged_runtime
   if [[ ! -x "$PREPARER" ]]; then
     die "prepare-release.sh is missing or not executable"
+  fi
+  if [[ ! -x "$SIGNATURE_HELPER" ]]; then
+    die "release-signature.sh is missing or not executable"
+  fi
+  if [[ ! -f "$ARCHIVE_LISTER" || -L "$ARCHIVE_LISTER" ]]; then
+    die "archive listing helper is missing"
+  fi
+  if [[ ! -f "$FSYNC_HELPER" || -L "$FSYNC_HELPER" ]]; then
+    die "filesystem sync helper is missing"
+  fi
+  if [[ ! -f "$STAGE_HELPER" || -L "$STAGE_HELPER" ]]; then
+    die "bounded staging helper is missing"
   fi
   require_executable "$node_bin" "Node"
   require_executable "$openssl_bin" "OpenSSL"
@@ -1234,8 +1997,10 @@ main() {
   require_executable "$nginx_bin" "Nginx"
   require_executable "$systemctl_bin" "systemctl"
   require_executable "$curl_bin" "curl"
+  require_executable "$flock_bin" "flock"
   require_executable "$uname_bin" "uname"
 
+  acquire_install_lock
   install_release "$manifest" "$env_source" "$basic_auth_file" "$backend_addr"
 }
 

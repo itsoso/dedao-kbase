@@ -9,12 +9,15 @@ NODE_BIN="$(command -v node)"
 OPENSSL_BIN="$(command -v openssl)"
 REAL_TAR="$(command -v tar)"
 REAL_GZIP="$(command -v gzip)"
+export REAL_TAR
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/kbase-install-release.XXXXXX")"
 TMP_ROOT="$(cd "$TMP_ROOT" && pwd -P)"
 SIGNING_KEY="${TMP_ROOT}/prepared-signing-key.pem"
 TRUSTED_PUBLIC_KEY="${TMP_ROOT}/prepared-public-key.pem"
 WRONG_SIGNING_KEY="${TMP_ROOT}/wrong-signing-key.pem"
 WRONG_PUBLIC_KEY="${TMP_ROOT}/wrong-public-key.pem"
+CANDIDATE_REVISION="1234567890abcdef1234567890abcdef12345678"
+OLD_REVISION="abcdef1234567890abcdef1234567890abcdef12"
 
 cleanup() {
   rm -rf "$TMP_ROOT"
@@ -88,15 +91,18 @@ create_release() {
 #!/usr/bin/env bash
 set -Eeuo pipefail
 # CANDIDATE_BINARY_MARKER
-printf 'doctor\n' >>"$INSTALL_LOG"
+printf 'doctor\n' >>"$KBASE_TEST_INSTALL_LOG"
 [[ "${1:-}" == "--check-config" ]]
 [[ "${2:-}" == "--web-dir" ]]
 [[ -f "${3:-}/index.html" ]]
-grep -q '^OLD_BINARY_MARKER$' "$ASSERT_BINARY_TARGET"
-grep -q '^OLD_WEB$' "$ASSERT_WEB_TARGET/index.html"
-grep -q '^OLD_ENV=' "$ASSERT_ENV_TARGET"
-grep -q '^OLD_NGINX$' "$ASSERT_NGINX_TARGET"
-[[ -n "${KBASE_BROWSER_SESSION_SECRET:-}" ]]
+grep -q '^OLD_BINARY_MARKER$' "$KBASE_TEST_ASSERT_BINARY_TARGET"
+grep -q '^OLD_WEB$' "$KBASE_TEST_ASSERT_WEB_TARGET/index.html"
+grep -q '^OLD_ENV=' "$KBASE_TEST_ASSERT_ENV_TARGET"
+grep -q '^OLD_NGINX$' "$KBASE_TEST_ASSERT_NGINX_TARGET"
+if [[ -z "${KBASE_BROWSER_SESSION_SECRET:-}" ]]; then
+  printf 'doctor missing browser session secret\n' >&2
+  exit 44
+fi
 if [[ "${KBASE_TEST_DOCTOR_FAIL:-0}" == "1" ]]; then
   printf 'doctor rejected fixture\n' >&2
   exit 42
@@ -140,12 +146,12 @@ output="${2:-}"
 [[ "${KBASE_TEST_RENDER_SECRET:-}" == "available" ]]
 [[ -n "${KBASE_BROWSER_SESSION_SECRET:-}" ]]
 [[ "${KBASE_BACKEND_ADDR:-}" == "127.0.0.1:8719" ]]
-[[ "${KBASE_BASIC_AUTH_FILE:-}" == "$ASSERT_BASIC_AUTH_FILE" ]]
-grep -q '^OLD_BINARY_MARKER$' "$ASSERT_BINARY_TARGET"
-grep -q '^OLD_WEB$' "$ASSERT_WEB_TARGET/index.html"
-grep -q '^OLD_ENV=' "$ASSERT_ENV_TARGET"
-grep -q '^OLD_NGINX$' "$ASSERT_NGINX_TARGET"
-printf 'render\n' >>"$INSTALL_LOG"
+[[ "${KBASE_BASIC_AUTH_FILE:-}" == "$KBASE_TEST_ASSERT_BASIC_AUTH_FILE" ]]
+grep -q '^OLD_BINARY_MARKER$' "$KBASE_TEST_ASSERT_BINARY_TARGET"
+grep -q '^OLD_WEB$' "$KBASE_TEST_ASSERT_WEB_TARGET/index.html"
+grep -q '^OLD_ENV=' "$KBASE_TEST_ASSERT_ENV_TARGET"
+grep -q '^OLD_NGINX$' "$KBASE_TEST_ASSERT_NGINX_TARGET"
+printf 'render\n' >>"$KBASE_TEST_INSTALL_LOG"
 printf 'RENDERED_NGINX\nbackend=%s\nauth=%s\n' \
   "$KBASE_BACKEND_ADDR" \
   "$KBASE_BASIC_AUTH_FILE" >"$output"
@@ -156,6 +162,8 @@ RENDERER
   rm -rf "$web_source"
   "$PREPARER" verify \
     --node-bin "$NODE_BIN" \
+    --tar-bin "${FAKE_TOOLS}/tar" \
+    --gzip-bin "$REAL_GZIP" \
     --manifest "${release_dir}/prepared-manifest.json" \
     --trusted-public-key "$TRUSTED_PUBLIC_KEY" \
     --openssl-bin "$OPENSSL_BIN"
@@ -176,6 +184,19 @@ FAKE_UNAME
 #!/usr/bin/env bash
 set -Eeuo pipefail
 printf 'systemctl:%s:%s\n' "${1:-}" "${2:-}" >>"$INSTALL_LOG"
+if [[ "${KBASE_TEST_KILL_INSTALLER:-0}" == "1" ]] &&
+  [[ "${1:-}" == "restart" ]] &&
+  grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
+  kill -9 "$PPID"
+fi
+if [[ -n "${KBASE_TEST_PAUSE_RESTART_FILE:-}" ]] &&
+  [[ "${1:-}" == "restart" ]] &&
+  grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
+  : >"${KBASE_TEST_PAUSE_RESTART_FILE}.ready"
+  while [[ ! -f "${KBASE_TEST_PAUSE_RESTART_FILE}.release" ]]; do
+    sleep 0.01
+  done
+fi
 FAKE_SYSTEMCTL
 
   cat >"${fake_dir}/nginx" <<'FAKE_NGINX'
@@ -188,9 +209,20 @@ FAKE_NGINX
   cat >"${fake_dir}/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+[[ "${1:-}" == "-q" ]]
+arguments=" $* "
+[[ "$arguments" == *" --noproxy * "* ]]
+[[ "$arguments" == *" --proto =http,https "* ]]
+[[ "$arguments" == *" --header Cache-Control: no-cache "* ]]
+url="${!#}"
+case "$url" in
+  http://127.0.0.1:8719/health) route="backend" ;;
+  https://kbase.example.test/health) route="public" ;;
+  *) printf 'unexpected health URL: %s\n' "$url" >&2; exit 64 ;;
+esac
 invalid_body=0
 if grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
-  printf 'health:candidate\n' >>"$INSTALL_LOG"
+  printf 'health:candidate:%s\n' "$route" >>"$INSTALL_LOG"
   invalid_body="${KBASE_TEST_INVALID_HEALTH_BODY:-0}"
   if [[ "${FAIL_HEALTH:-0}" == "1" ]]; then
     if [[ "${FAIL_ROLLBACK_PREP:-0}" == "1" ]]; then
@@ -199,12 +231,16 @@ if grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
     exit 22
   fi
 else
-  printf 'health:old\n' >>"$INSTALL_LOG"
+  printf 'health:old:%s\n' "$route" >>"$INSTALL_LOG"
 fi
 if [[ "$invalid_body" == "1" ]]; then
   printf '{"status":"ok"}\n'
+elif grep -q 'CANDIDATE_BINARY_MARKER' "$ASSERT_BINARY_TARGET"; then
+  printf '{"ok":true,"service":"dedao-kbase","revision":"%s"}\n' \
+    "${KBASE_TEST_CANDIDATE_REVISION_OVERRIDE:-$CANDIDATE_REVISION}"
 else
-  printf '{"ok":true,"service":"dedao-kbase"}\n'
+  printf '{"ok":true,"service":"dedao-kbase","revision":"%s"}\n' \
+    "$OLD_REVISION"
 fi
 FAKE_CURL
 
@@ -214,7 +250,7 @@ set -Eeuo pipefail
 arguments=()
 for argument in "$@"; do
   case "$argument" in
-    --quoting-style=escape) ;;
+    --quoting-style=escape|--numeric-owner|--full-time) ;;
     *) arguments+=("$argument") ;;
   esac
 done
@@ -233,13 +269,37 @@ fi
 exit "$status"
 FAKE_OPENSSL
 
+  cat >"${fake_dir}/flock" <<'FAKE_FLOCK'
+#!/usr/bin/env python3
+import fcntl
+import sys
+
+if len(sys.argv) != 3 or sys.argv[1] != "-n":
+    raise SystemExit(64)
+try:
+    fcntl.flock(int(sys.argv[2]), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(75)
+FAKE_FLOCK
+
+  cat >"${fake_dir}/node-record-sync" <<'FAKE_NODE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ "${1:-}" == */fsync-paths.mjs ]]; then
+  printf '%s\n' "$*" >>"$KBASE_TEST_FSYNC_LOG"
+fi
+exec "$REAL_NODE" "$@"
+FAKE_NODE
+
   chmod 0755 \
     "${fake_dir}/uname" \
     "${fake_dir}/systemctl" \
     "${fake_dir}/nginx" \
     "${fake_dir}/curl" \
     "${fake_dir}/tar" \
-    "${fake_dir}/openssl-mutate"
+    "${fake_dir}/openssl-mutate" \
+    "${fake_dir}/flock" \
+    "${fake_dir}/node-record-sync"
 }
 
 setup_case() {
@@ -253,6 +313,7 @@ setup_case() {
   NGINX_TARGET="${TARGET_ROOT}/nginx/kbase.locations.conf"
   BASIC_AUTH_FILE="${CASE_DIR}/browser.htpasswd"
   BACKUP_DIR="${CASE_DIR}/backups/release-1"
+  TRANSACTION_STATE_FILE="${CASE_DIR}/install-transaction.json"
   INSTALL_LOG="${CASE_DIR}/install.log"
 
   mkdir -p \
@@ -278,22 +339,46 @@ OLD_BINARY
   cat >"$ENV_SOURCE" <<'ENVIRONMENT'
 KBASE_BROWSER_SESSION_SECRET=test_only_browser_session_value_1234567890
 KBASE_TEST_RENDER_SECRET=available
+KBASE_PUBLIC_ORIGIN=https://kbase.example.test
+KBASE_TEST_INSTALL_LOG=__INSTALL_LOG__
+KBASE_TEST_ASSERT_BINARY_TARGET=__BINARY_TARGET__
+KBASE_TEST_ASSERT_WEB_TARGET=__WEB_TARGET__
+KBASE_TEST_ASSERT_ENV_TARGET=__ENV_TARGET__
+KBASE_TEST_ASSERT_NGINX_TARGET=__NGINX_TARGET__
+KBASE_TEST_ASSERT_BASIC_AUTH_FILE=__BASIC_AUTH_FILE__
 ENVIRONMENT
+  sed -i.bak \
+    -e "s|__INSTALL_LOG__|${INSTALL_LOG}|g" \
+    -e "s|__BINARY_TARGET__|${BINARY_TARGET}|g" \
+    -e "s|__WEB_TARGET__|${WEB_TARGET}|g" \
+    -e "s|__ENV_TARGET__|${ENV_TARGET}|g" \
+    -e "s|__NGINX_TARGET__|${NGINX_TARGET}|g" \
+    -e "s|__BASIC_AUTH_FILE__|${BASIC_AUTH_FILE}|g" \
+    "$ENV_SOURCE"
+  rm -f "${ENV_SOURCE}.bak"
   chmod 0600 "$ENV_SOURCE"
   : >"$INSTALL_LOG"
 
   export CASE_DIR TARGET_ROOT BINARY_TARGET WEB_TARGET
   export ENV_SOURCE ENV_TARGET NGINX_TARGET BASIC_AUTH_FILE
   export BACKUP_DIR INSTALL_LOG
+  export TRANSACTION_STATE_FILE
   export ASSERT_BINARY_TARGET="$BINARY_TARGET"
   export ASSERT_WEB_TARGET="$WEB_TARGET"
   export ASSERT_ENV_TARGET="$ENV_TARGET"
   export ASSERT_NGINX_TARGET="$NGINX_TARGET"
   export ASSERT_BASIC_AUTH_FILE="$BASIC_AUTH_FILE"
   export REAL_TAR REAL_OPENSSL="$OPENSSL_BIN"
+  export REAL_NODE="$NODE_BIN"
+  export CANDIDATE_REVISION OLD_REVISION
   unset FAIL_HEALTH FAIL_ROLLBACK_PREP
-  unset HEALTH_URL_OVERRIDE KBASE_TEST_INVALID_HEALTH_BODY
+  unset HEALTH_URL_OVERRIDE PUBLIC_HEALTH_URL_OVERRIDE
+  unset KBASE_TEST_INVALID_HEALTH_BODY
+  unset KBASE_TEST_CANDIDATE_REVISION_OVERRIDE
   unset OPENSSL_OVERRIDE MUTATE_AFTER_VERIFY_FILE
+  unset KBASE_TEST_KILL_INSTALLER
+  unset KBASE_TEST_PAUSE_RESTART_FILE
+  unset KBASE_TEST_FSYNC_LOG NODE_OVERRIDE
 }
 
 save_expected_targets() {
@@ -344,7 +429,9 @@ run_install() {
   local manifest="$1"
   local trusted_public_key="${2:-$TRUSTED_PUBLIC_KEY}"
   local health_url="${HEALTH_URL_OVERRIDE:-http://127.0.0.1:8719/health}"
+  local public_health_url="${PUBLIC_HEALTH_URL_OVERRIDE:-https://kbase.example.test/health}"
   local openssl_bin="${OPENSSL_OVERRIDE:-$OPENSSL_BIN}"
+  local node_bin="${NODE_OVERRIDE:-$NODE_BIN}"
   "$INSTALLER" install \
     --manifest "$manifest" \
     --trusted-public-key "$trusted_public_key" \
@@ -358,15 +445,29 @@ run_install() {
     --service-name dedao-kbase.service \
     --nginx-service-name nginx.service \
     --health-url "$health_url" \
+    --public-health-url "$public_health_url" \
     --backup-dir "$BACKUP_DIR" \
-    --node-bin "$NODE_BIN" \
+    --transaction-state-file "$TRANSACTION_STATE_FILE" \
+    --node-bin "$node_bin" \
     --tar-bin "${FAKE_TOOLS}/tar" \
     --gzip-bin "$REAL_GZIP" \
     --nginx-bin "${FAKE_TOOLS}/nginx" \
     --systemctl-bin "${FAKE_TOOLS}/systemctl" \
     --curl-bin "${FAKE_TOOLS}/curl" \
+    --flock-bin "${FAKE_TOOLS}/flock" \
     --uname-bin "${FAKE_TOOLS}/uname" \
     --openssl-bin "$openssl_bin"
+}
+
+wait_for_file() {
+  local pathname="$1"
+  local attempts=500
+  while ((attempts > 0)); do
+    [[ -f "$pathname" ]] && return 0
+    sleep 0.01
+    attempts=$((attempts - 1))
+  done
+  return 1
 }
 
 assert_log_order() {
@@ -374,13 +475,15 @@ assert_log_order() {
 const fs = require("fs");
 const lines = fs.readFileSync(process.argv[2], "utf8").trim().split("\n");
 const expected = [
+  "health:old:backend",
+  "health:old:public",
   "doctor",
   "render",
   "systemctl:restart:dedao-kbase.service",
-  "health:candidate",
+  "health:candidate:backend",
   "nginx:-t",
   "systemctl:reload:nginx.service",
-  "health:candidate",
+  "health:candidate:public",
 ];
 let cursor = -1;
 for (const value of expected) {
@@ -398,7 +501,7 @@ assert_rollback_log() {
 const fs = require("fs");
 const lines = fs.readFileSync(process.argv[2], "utf8").trim().split("\n");
 const firstRestart = lines.indexOf("systemctl:restart:dedao-kbase.service");
-const firstCandidateHealth = lines.indexOf("health:candidate", firstRestart + 1);
+const firstCandidateHealth = lines.indexOf("health:candidate:backend", firstRestart + 1);
 const rollbackRestart = lines.indexOf(
   "systemctl:restart:dedao-kbase.service",
   firstCandidateHealth + 1,
@@ -408,14 +511,16 @@ const nginxReload = lines.indexOf(
   "systemctl:reload:nginx.service",
   nginxTest + 1,
 );
-const oldHealth = lines.indexOf("health:old", nginxReload + 1);
+const oldBackendHealth = lines.indexOf("health:old:backend", rollbackRestart + 1);
+const oldPublicHealth = lines.indexOf("health:old:public", nginxReload + 1);
 if (
   firstRestart < 0 ||
   firstCandidateHealth < 0 ||
   rollbackRestart < 0 ||
   nginxTest < 0 ||
   nginxReload < 0 ||
-  oldHealth < 0
+  oldBackendHealth < 0 ||
+  oldPublicHealth < 0
 ) {
   throw new Error("rollback service verification sequence is incomplete");
 }
@@ -435,7 +540,7 @@ assert_pre_mutation_failure() {
 
 "$OPENSSL_BIN" genpkey \
   -algorithm RSA \
-  -pkeyopt rsa_keygen_bits:2048 \
+  -pkeyopt rsa_keygen_bits:3072 \
   -out "$SIGNING_KEY" \
   >/dev/null 2>&1
 "$OPENSSL_BIN" pkey \
@@ -445,7 +550,7 @@ assert_pre_mutation_failure() {
   >/dev/null 2>&1
 "$OPENSSL_BIN" genpkey \
   -algorithm RSA \
-  -pkeyopt rsa_keygen_bits:2048 \
+  -pkeyopt rsa_keygen_bits:3072 \
   -out "$WRONG_SIGNING_KEY" \
   >/dev/null 2>&1
 "$OPENSSL_BIN" pkey \
@@ -495,6 +600,8 @@ grep -q '^RENDERED_NGINX$' "$NGINX_TARGET" ||
   fail "installed Nginx mode is not 0600"
 [[ "$(mode_of "$BACKUP_DIR")" == "0700" ]] ||
   fail "backup directory mode is not 0700"
+[[ ! -e "$TRANSACTION_STATE_FILE" ]] ||
+  fail "successful install retained its transaction journal"
 cmp "${BACKUP_DIR}/snapshot/kbase-server" "${EXPECTED_ROOT}/kbase-server" ||
   fail "binary snapshot was not retained"
 diff -r "${BACKUP_DIR}/snapshot/web" "${EXPECTED_ROOT}/web" >/dev/null ||
@@ -517,6 +624,66 @@ if grep -q 'test_only_browser_session_value' "$INSTALL_LOG" "$NGINX_TARGET"; the
   fail "installation output leaked an environment secret"
 fi
 
+setup_case concurrent-install
+save_expected_targets
+PAUSE_FILE="${CASE_DIR}/pause-install"
+export KBASE_TEST_PAUSE_RESTART_FILE="$PAUSE_FILE"
+run_install "${BASE_RELEASE}/prepared-manifest.json" \
+  >"${CASE_DIR}/first.stdout" \
+  2>"${CASE_DIR}/first.stderr" &
+first_install_pid="$!"
+wait_for_file "${PAUSE_FILE}.ready" ||
+  fail "first concurrent installer did not reach the pause point"
+BACKUP_DIR="${CASE_DIR}/backups/release-concurrent"
+export BACKUP_DIR
+if run_install "${BASE_RELEASE}/prepared-manifest.json" \
+  >"${CASE_DIR}/second.stdout" \
+  2>"${CASE_DIR}/second.stderr"; then
+  fail "concurrent installer unexpectedly acquired the transaction"
+fi
+grep -q 'another installation is already running' "${CASE_DIR}/second.stderr" ||
+  fail "concurrent installer did not report lock contention"
+: >"${PAUSE_FILE}.release"
+wait "$first_install_pid" ||
+  fail "first concurrent installer failed after lock contention"
+unset KBASE_TEST_PAUSE_RESTART_FILE
+grep -q 'CANDIDATE_BINARY_MARKER' "$BINARY_TARGET" ||
+  fail "first concurrent installer did not retain the candidate"
+[[ ! -e "$TRANSACTION_STATE_FILE" ]] ||
+  fail "concurrent install retained its transaction journal"
+
+setup_case durable-transaction
+save_expected_targets
+FSYNC_LOG="${CASE_DIR}/fsync.log"
+: >"$FSYNC_LOG"
+export KBASE_TEST_FSYNC_LOG="$FSYNC_LOG"
+export NODE_OVERRIDE="${FAKE_TOOLS}/node-record-sync"
+run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null
+grep -F -- "--tree ${BACKUP_DIR}/snapshot" "$FSYNC_LOG" >/dev/null ||
+  fail "installer did not durably sync the snapshot tree"
+grep -F -- "--tree ${WEB_TARGET}" "$FSYNC_LOG" >/dev/null ||
+  fail "installer did not durably sync the installed Web tree"
+grep -F -- "--path $(dirname "$BINARY_TARGET")" "$FSYNC_LOG" >/dev/null ||
+  fail "installer did not durably sync a target parent"
+unset KBASE_TEST_FSYNC_LOG NODE_OVERRIDE
+
+setup_case inherited-tool-environment
+save_expected_targets
+TOOL_ENV_MARKER="${CASE_DIR}/node-options-executed"
+TOOL_ENV_PAYLOAD="${CASE_DIR}/node-options-payload.cjs"
+cat >"$TOOL_ENV_PAYLOAD" <<'NODE'
+require("fs").writeFileSync(
+  process.env.KBASE_TEST_TOOL_ENV_MARKER,
+  "inherited tool environment executed\n",
+);
+NODE
+export KBASE_TEST_TOOL_ENV_MARKER="$TOOL_ENV_MARKER"
+export NODE_OPTIONS="--require=${TOOL_ENV_PAYLOAD}"
+run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null
+unset NODE_OPTIONS KBASE_TEST_TOOL_ENV_MARKER
+[[ ! -e "$TOOL_ENV_MARKER" ]] ||
+  fail "installer inherited NODE_OPTIONS into a privileged tool"
+
 setup_case rollback
 save_expected_targets
 export FAIL_HEALTH=1
@@ -530,6 +697,36 @@ assert_rollback_log
 [[ -d "$BACKUP_DIR" ]] || fail "rollback removed the backup directory"
 assert_no_target_temporary_entries
 unset FAIL_HEALTH
+[[ ! -e "$TRANSACTION_STATE_FILE" ]] ||
+  fail "successful rollback retained its transaction journal"
+
+setup_case crash-recovery
+save_expected_targets
+export KBASE_TEST_KILL_INSTALLER=1
+set +e
+run_install "${BASE_RELEASE}/prepared-manifest.json" \
+  >"${CASE_DIR}/crash.stdout" \
+  2>"${CASE_DIR}/crash.stderr"
+crash_status="$?"
+set -e
+[[ "$crash_status" -ne 0 ]] ||
+  fail "SIGKILL fixture unexpectedly completed installation"
+[[ -f "$TRANSACTION_STATE_FILE" ]] ||
+  fail "SIGKILL did not leave a recovery journal"
+rm -rf "$WEB_TARGET"
+[[ ! -e "$WEB_TARGET" ]] ||
+  fail "missing-Web crash fixture did not remove the target"
+unset KBASE_TEST_KILL_INSTALLER
+BACKUP_DIR="${CASE_DIR}/backups/release-after-crash"
+export BACKUP_DIR
+printf 'KBASE_TEST_DOCTOR_FAIL=1\n' >>"$ENV_SOURCE"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "post-recovery doctor failure unexpectedly installed"
+fi
+assert_targets_match_expected
+[[ ! -e "$TRANSACTION_STATE_FILE" ]] ||
+  fail "automatic crash recovery retained its transaction journal"
+assert_no_target_temporary_entries
 
 setup_case rollback-preparation-failure
 save_expected_targets
@@ -616,6 +813,25 @@ fi
   fail "disallowed environment key executed shell code"
 assert_pre_mutation_failure
 
+setup_case inherited-environment-isolation
+save_expected_targets
+"$NODE_BIN" - "$ENV_SOURCE" <<'NODE'
+const fs = require("fs");
+const pathname = process.argv[2];
+const lines = fs
+  .readFileSync(pathname, "utf8")
+  .split("\n")
+  .filter((line) => !line.startsWith("KBASE_BROWSER_SESSION_SECRET="));
+fs.writeFileSync(pathname, lines.join("\n"));
+NODE
+export KBASE_BROWSER_SESSION_SECRET="inherited_value_must_not_be_used"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "inherited environment unexpectedly satisfied candidate doctor"
+fi
+unset KBASE_BROWSER_SESSION_SECRET
+assert_targets_match_expected
+assert_no_target_temporary_entries
+
 setup_case unrelated-health-url
 save_expected_targets
 export HEALTH_URL_OVERRIDE="http://127.0.0.1:9999/health"
@@ -624,6 +840,16 @@ if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
 fi
 assert_pre_mutation_failure
 unset HEALTH_URL_OVERRIDE
+
+setup_case unrelated-public-health-url
+save_expected_targets
+export PUBLIC_HEALTH_URL_OVERRIDE="https://unrelated.example.test/health"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "unrelated public health URL unexpectedly approved install"
+fi
+assert_targets_match_expected
+assert_no_target_temporary_entries
+unset PUBLIC_HEALTH_URL_OVERRIDE
 
 setup_case invalid-health-contract
 save_expected_targets
@@ -635,6 +861,16 @@ assert_targets_match_expected
 assert_rollback_log
 unset KBASE_TEST_INVALID_HEALTH_BODY
 
+setup_case wrong-candidate-revision
+save_expected_targets
+export KBASE_TEST_CANDIDATE_REVISION_OVERRIDE="$OLD_REVISION"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "wrong candidate revision unexpectedly approved install"
+fi
+assert_targets_match_expected
+assert_rollback_log
+unset KBASE_TEST_CANDIDATE_REVISION_OVERRIDE
+
 setup_case doctor-failure
 save_expected_targets
 printf 'KBASE_TEST_DOCTOR_FAIL=1\n' >>"$ENV_SOURCE"
@@ -643,7 +879,7 @@ if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
 fi
 grep -q '^doctor$' "$INSTALL_LOG" ||
   fail "doctor failure did not invoke the configuration doctor"
-if grep -Eq '^(render|systemctl:|health:|nginx:)' "$INSTALL_LOG"; then
+if grep -Eq '^(render|systemctl:|health:candidate|nginx:)' "$INSTALL_LOG"; then
   fail "doctor failure progressed past the doctor Gate"
 fi
 assert_targets_match_expected
@@ -660,7 +896,7 @@ for doctor_mode in empty malformed wrong-status wrong-schema; do
   fi
   grep -q '^doctor$' "$INSTALL_LOG" ||
     fail "invalid doctor output did not invoke doctor: ${doctor_mode}"
-  if grep -Eq '^(render|systemctl:|health:|nginx:)' "$INSTALL_LOG"; then
+  if grep -Eq '^(render|systemctl:|health:candidate|nginx:)' "$INSTALL_LOG"; then
     fail "invalid doctor output progressed past doctor: ${doctor_mode}"
   fi
   assert_targets_match_expected
@@ -708,6 +944,29 @@ fi
 assert_pre_mutation_failure
 chmod 0700 "$(dirname "$BACKUP_DIR")"
 
+setup_case untrusted-target-parent
+save_expected_targets
+chmod 0777 "$(dirname "$BINARY_TARGET")"
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "group/other-writable target parent unexpectedly installed"
+fi
+assert_pre_mutation_failure
+chmod 0700 "$(dirname "$BINARY_TARGET")"
+
+setup_case untrusted-transaction-parent
+save_expected_targets
+mkdir "${CASE_DIR}/untrusted-transaction"
+chmod 0777 "${CASE_DIR}/untrusted-transaction"
+TRANSACTION_STATE_FILE="${CASE_DIR}/untrusted-transaction/install.json"
+export TRANSACTION_STATE_FILE
+if run_install "${BASE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
+  fail "group/other-writable transaction parent unexpectedly installed"
+fi
+assert_pre_mutation_failure
+[[ ! -e "${TRANSACTION_STATE_FILE}.lock" ]] ||
+  fail "untrusted transaction parent received a lock file"
+chmod 0700 "${CASE_DIR}/untrusted-transaction"
+
 setup_case overlapping-backup
 mkdir -p "${WEB_TARGET}/backups"
 BACKUP_DIR="${WEB_TARGET}/backups/release"
@@ -749,11 +1008,16 @@ printf 'NEW_WEB\n' >"${UNSAFE_SOURCE}/frontend-web/index.html"
 "$REAL_TAR" -C "$UNSAFE_SOURCE" -cf - frontend-web |
   "$REAL_GZIP" -n >"${UNSAFE_RELEASE}/bundle/web.tar.gz"
 write_prepared_manifest "$UNSAFE_RELEASE"
-"$PREPARER" verify \
+if "$PREPARER" verify \
   --node-bin "$NODE_BIN" \
+  --tar-bin "${FAKE_TOOLS}/tar" \
+  --gzip-bin "$REAL_GZIP" \
   --manifest "${UNSAFE_RELEASE}/prepared-manifest.json" \
   --trusted-public-key "$TRUSTED_PUBLIC_KEY" \
-  --openssl-bin "$OPENSSL_BIN"
+  --openssl-bin "$OPENSSL_BIN" \
+  >/dev/null 2>&1; then
+  fail "prepared release verifier accepted an unsafe Web archive"
+fi
 if run_install "${UNSAFE_RELEASE}/prepared-manifest.json" >/dev/null 2>&1; then
   fail "unsafe web archive unexpectedly installed"
 fi

@@ -41,14 +41,21 @@ authorized operation.
 
 ## Architecture
 
-The release has three immutable stages:
+The release has four immutable stages:
 
 1. **Assemble** verifies a clean Git revision, creates an exact source archive,
    and writes a public manifest containing the revision and archive digest.
 2. **Prepare** verifies that manifest on Linux, builds the locked Vue frontend,
-   runs Go and Web gates, builds the CGO server, runs the real Nginx proxy
-   smoke, and emits an install bundle with component digests.
-3. **Install** verifies the prepared manifest, runs the candidate server's
+   runs Go and Web gates, builds the CGO server with the source revision,
+   runs the real Nginx proxy smoke, and emits an unsigned install bundle with
+   component digests. Repository-controlled build code never receives the
+   prepared-release private key.
+3. **Sign** transfers immutable manifest bytes and read-only artifacts to an
+   independent offline/KMS boundary. That boundary validates schema, revision,
+   digests, and limits without a private key, then signs only the fixed
+   manifest bytes in a separate signer process. Production private keys and
+   signer credentials are never passed to repository scripts.
+4. **Install** verifies the prepared manifest, runs the candidate server's
    configuration doctor, snapshots all replacement targets, switches the
    binary/Web/configuration as one transaction, and rolls back on service,
    health, or Nginx failure.
@@ -66,8 +73,40 @@ at startup, but it does not bind a port, create a database, or print secrets.
 - The install script refuses an unverified bundle, incomplete target set,
   writable-by-others secret file, or missing rollback capacity.
 - Every mutation has a corresponding snapshot before the first replacement.
-- Rollback restores the complete target set and rechecks service and Nginx.
+- An exclusive transaction lock prevents concurrent installers from sharing a
+  journal or backup state.
+- The transaction journal, retained snapshot, candidate targets, and their
+  parent directories are fsynced around each rename boundary. The next install
+  restores the complete snapshot after `SIGKILL` or power loss, including the
+  window where the previous Web directory has moved but the candidate has not.
+- Backend and public Nginx health checks must both report the signed release
+  revision. Curl ignores user config and proxies, sends `Cache-Control:
+  no-cache`, and the health response itself is `no-store`.
+- Archive listing is single-pass, time-bounded, and output-bounded before
+  extraction; prepare and install enforce the same Web quotas. Inputs are
+  staged with `O_NOFOLLOW`, bounded streaming copies, and per-artifact limits;
+  hashes are streamed instead of loading artifacts into memory.
+- The privileged installer clears shell, dynamic-linker, Node, OpenSSL, Python,
+  and Tar override variables before invoking child tools. The production
+  runbook also starts it with `env -i`.
+- Root installation is accepted only from
+  `/opt/dedao-kbase/release-tools`. Every repository helper and external tool
+  is canonicalized and checked for root ownership, real non-symlink ancestry,
+  and no group/other write permission before use.
+- Root mode rejects every executable override before starting Node or another
+  overridable child. It resolves only the default command names through the
+  fixed system `PATH`; explicit overrides remain available only to non-root
+  fixture tests.
+- Transaction state and lock parents cannot be group/other writable. This
+  removes the path-replacement race between lock validation and Bash opening
+  the persistent lock descriptor.
+- Rollback restores the complete target set and rechecks both health paths.
 - CI has no deployment job and receives no production credential.
+
+Release schema v1 does not infer ordering from Git SHA. A signed older release
+remains cryptographically valid and requires the same explicit operator
+authorization as any other install. A future schema may add a monotonic release
+generation plus a separately authorized emergency-downgrade policy.
 
 ## Verification
 
@@ -80,4 +119,3 @@ at startup, but it does not bind a port, create a database, or print secrets.
   as root, then runs the proxy smoke against the runner's Nginx.
 - Full repository tests, privacy smoke, and system-map drift checks remain the
   final local gate.
-

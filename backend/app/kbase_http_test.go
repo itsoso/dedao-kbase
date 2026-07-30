@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,54 @@ import (
 
 	"github.com/yann0917/dedao-gui/backend/services"
 )
+
+func TestKBaseHTTPHandlerHealthIncludesReleaseRevision(t *testing.T) {
+	tests := []struct {
+		name             string
+		releaseRevision  string
+		expectedRevision string
+	}{
+		{
+			name:             "configured revision",
+			releaseRevision:  "1234567890abcdef",
+			expectedRevision: "1234567890abcdef",
+		},
+		{
+			name:             "development default",
+			expectedRevision: "development",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store:           NewBookKnowledgeStore(t.TempDir()),
+				ReleaseRevision: tt.releaseRevision,
+			})
+
+			response := requestKBase(handler, http.MethodGet, "/health", "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("health status=%d body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("health Cache-Control=%q, want no-store", got)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode health response: %v", err)
+			}
+			expected := map[string]any{
+				"ok":       true,
+				"service":  "dedao-kbase",
+				"revision": tt.expectedRevision,
+			}
+			if !reflect.DeepEqual(payload, expected) {
+				t.Fatalf("health response=%#v, want %#v", payload, expected)
+			}
+		})
+	}
+}
 
 func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())

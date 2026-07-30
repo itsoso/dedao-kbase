@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ASSEMBLER="${SCRIPT_DIR}/assemble-release.sh"
 PREPARER="${SCRIPT_DIR}/prepare-release.sh"
 SIGNATURE_HELPER="${SCRIPT_DIR}/release-signature.sh"
+ARCHIVE_LISTER="${SCRIPT_DIR}/archive-list.mjs"
+STAGE_HELPER="${SCRIPT_DIR}/stage-files.mjs"
 SCHEMA="dedao-kbase-prepared-release/v1"
 MANIFEST_NAME="prepared-manifest.json"
 SIGNATURE_NAME="MANIFEST.sig"
@@ -13,16 +15,31 @@ SOURCE_MANIFEST_NAME="release-manifest.json"
 SOURCE_SIGNATURE_NAME="MANIFEST.sig"
 SOURCE_ARCHIVE_NAME="source.tar.gz"
 SOURCE_ROOT_NAME="dedao-kbase-source"
+WEB_ROOT_NAME="frontend-web"
 DEFAULT_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES=268435456
 DEFAULT_SOURCE_ARCHIVE_MAX_MEMBERS=100000
 DEFAULT_SOURCE_ARCHIVE_MAX_FILE_BYTES=67108864
 DEFAULT_SOURCE_ARCHIVE_MAX_EXPANDED_BYTES=1073741824
+DEFAULT_WEB_ARCHIVE_MAX_COMPRESSED_BYTES=33554432
+DEFAULT_WEB_ARCHIVE_MAX_MEMBERS=20000
+DEFAULT_WEB_ARCHIVE_MAX_FILE_BYTES=33554432
+DEFAULT_WEB_ARCHIVE_MAX_EXPANDED_BYTES=268435456
+DEFAULT_SERVER_BINARY_MAX_BYTES=268435456
+DEFAULT_NGINX_TEMPLATE_MAX_BYTES=1048576
+DEFAULT_CONFIG_RENDERER_MAX_BYTES=1048576
+ARCHIVE_LIST_TIMEOUT_MS=30000
+ARCHIVE_LIST_STDERR_LIMIT_BYTES=1048576
+SOURCE_ARCHIVE_LIST_STDOUT_LIMIT_BYTES=16777216
+WEB_ARCHIVE_LIST_STDOUT_LIMIT_BYTES=4194304
+RELEASE_MANIFEST_MAX_BYTES=1048576
+RELEASE_SIGNATURE_MAX_BYTES=65536
+RELEASE_PUBLIC_KEY_MAX_BYTES=65536
 
 usage() {
   cat <<'USAGE'
 Usage:
-  prepare-release.sh create --source-manifest PATH --source-public-key PATH --signing-key PATH --output-dir PATH [tool options]
-  prepare-release.sh verify --manifest PATH --trusted-public-key PATH [--node-bin PATH] [--openssl-bin PATH]
+  prepare-release.sh create --source-manifest PATH --source-public-key PATH --output-dir PATH [tool options]
+  prepare-release.sh verify --manifest PATH --trusted-public-key PATH [--node-bin PATH] [--tar-bin PATH] [--gzip-bin PATH] [--openssl-bin PATH]
 
 Create tool options:
   --go-bin PATH
@@ -112,9 +129,55 @@ validate_output_target() {
   fi
 }
 
+validate_trusted_file_path() {
+  node_bin="$1"
+  pathname="$2"
+  label="$3"
+  "$node_bin" - "$pathname" "$label" <<'NODE'
+const fs = require("fs");
+const path = require("path");
+
+const pathname = path.resolve(process.argv[2]);
+const label = process.argv[3];
+const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+const segments = pathname.split(path.sep).filter(Boolean);
+let cursor = path.parse(pathname).root;
+
+function fail(message) {
+  process.stderr.write(`prepare-release: ${message}\n`);
+  process.exit(1);
+}
+
+for (let index = 0; index < segments.length; index += 1) {
+  cursor = path.join(cursor, segments[index]);
+  const stat = fs.lstatSync(cursor);
+  const final = index === segments.length - 1;
+  if (stat.isSymbolicLink()) {
+    fail(`${label} path must not contain symbolic links`);
+  }
+  if (final ? !stat.isFile() : !stat.isDirectory()) {
+    fail(`${label} path has an invalid component`);
+  }
+  if (stat.uid !== 0 && stat.uid !== uid) {
+    fail(`${label} path has an untrusted owner`);
+  }
+  if ((stat.mode & 0o022) !== 0) {
+    const trustedStickyDirectory =
+      !final && stat.uid === 0 && (stat.mode & 0o1000) !== 0;
+    if (!trustedStickyDirectory) {
+      fail(`${label} path is group/other writable`);
+    }
+  }
+}
+NODE
+}
+
 stage_source_release() {
-  source_manifest="$1"
-  source_input_dir="$2"
+  node_bin="$1"
+  source_manifest="$2"
+  source_input_dir="$3"
+  source_public_key="$4"
+  source_archive_max_bytes="$5"
 
   if [[ "$source_manifest" == */* ]]; then
     source_release_dir="${source_manifest%/*}"
@@ -134,13 +197,27 @@ stage_source_release() {
 
   mkdir "$source_input_dir"
   chmod 0700 "$source_input_dir"
-  cp "$source_manifest" "${source_input_dir}/${SOURCE_MANIFEST_NAME}"
-  cp "$source_signature" "${source_input_dir}/${SOURCE_SIGNATURE_NAME}"
-  cp "$source_archive" "${source_input_dir}/${SOURCE_ARCHIVE_NAME}"
-  chmod 0600 \
+  "$node_bin" "$STAGE_HELPER" \
+    --file \
+    "$source_manifest" \
     "${source_input_dir}/${SOURCE_MANIFEST_NAME}" \
+    "$RELEASE_MANIFEST_MAX_BYTES" \
+    0600 \
+    --file \
+    "$source_signature" \
     "${source_input_dir}/${SOURCE_SIGNATURE_NAME}" \
-    "${source_input_dir}/${SOURCE_ARCHIVE_NAME}"
+    "$RELEASE_SIGNATURE_MAX_BYTES" \
+    0600 \
+    --file \
+    "$source_archive" \
+    "${source_input_dir}/${SOURCE_ARCHIVE_NAME}" \
+    "$source_archive_max_bytes" \
+    0600 \
+    --file \
+    "$source_public_key" \
+    "${source_input_dir}/source-public.pem" \
+    "$RELEASE_PUBLIC_KEY_MAX_BYTES" \
+    0600
 }
 
 source_manifest_value() {
@@ -196,17 +273,19 @@ validate_source_archive() {
   max_members="$7"
   max_file_bytes="$8"
   max_expanded_bytes="$9"
-  names_file="${validation_dir}/source-members.txt"
-  verbose_file="${validation_dir}/source-members.verbose.txt"
+  members_file="${validation_dir}/source-members.json"
 
-  "$gzip_bin" -dc "$source_archive" |
-    "$tar_bin" --quoting-style=escape -tf - >"$names_file"
-  "$gzip_bin" -dc "$source_archive" |
-    "$tar_bin" --quoting-style=escape -tvf - >"$verbose_file"
+  "$node_bin" "$ARCHIVE_LISTER" \
+    --archive "$source_archive" \
+    --gzip-bin "$gzip_bin" \
+    --tar-bin "$tar_bin" \
+    --timeout-ms "$ARCHIVE_LIST_TIMEOUT_MS" \
+    --stdout-limit-bytes "$SOURCE_ARCHIVE_LIST_STDOUT_LIMIT_BYTES" \
+    --stderr-limit-bytes "$ARCHIVE_LIST_STDERR_LIMIT_BYTES" \
+    >"$members_file"
 
   "$node_bin" - \
-    "$names_file" \
-    "$verbose_file" \
+    "$members_file" \
     "$SOURCE_ROOT_NAME" \
     "$source_archive" \
     "$max_compressed_bytes" \
@@ -215,33 +294,34 @@ validate_source_archive() {
     "$max_expanded_bytes" <<'NODE'
 const fs = require("fs");
 
-const namesPath = process.argv[2];
-const verbosePath = process.argv[3];
-const expectedRoot = process.argv[4];
-const archivePath = process.argv[5];
-const maxCompressedBytes = BigInt(process.argv[6]);
-const maxMembers = BigInt(process.argv[7]);
-const maxFileBytes = BigInt(process.argv[8]);
-const maxExpandedBytes = BigInt(process.argv[9]);
+const membersPath = process.argv[2];
+const expectedRoot = process.argv[3];
+const archivePath = process.argv[4];
+const maxCompressedBytes = BigInt(process.argv[5]);
+const maxMembers = BigInt(process.argv[6]);
+const maxFileBytes = BigInt(process.argv[7]);
+const maxExpandedBytes = BigInt(process.argv[8]);
 
 function fail(message) {
   process.stderr.write(`prepare-release: ${message}\n`);
   process.exit(1);
 }
 
-function lines(filePath) {
-  const value = fs.readFileSync(filePath, "utf8");
-  const result = value.split("\n");
-  if (result[result.length - 1] === "") {
-    result.pop();
-  }
-  return result;
+let document;
+try {
+  document = JSON.parse(fs.readFileSync(membersPath, "utf8"));
+} catch (error) {
+  fail(`source archive listing is invalid JSON: ${error.message}`);
 }
-
-const names = lines(namesPath);
-const verbose = lines(verbosePath);
-if (names.length === 0 || names.length !== verbose.length) {
-  fail("source archive member listing is empty or inconsistent");
+if (
+  document === null ||
+  Array.isArray(document) ||
+  typeof document !== "object" ||
+  JSON.stringify(Object.keys(document)) !== JSON.stringify(["members"]) ||
+  !Array.isArray(document.members) ||
+  document.members.length === 0
+) {
+  fail("source archive member listing is empty or invalid");
 }
 const compressedBytes = BigInt(fs.statSync(archivePath).size);
 if (compressedBytes > maxCompressedBytes) {
@@ -249,38 +329,24 @@ if (compressedBytes > maxCompressedBytes) {
     `source archive compressed size exceeds quota: ${compressedBytes} > ${maxCompressedBytes}`,
   );
 }
-if (BigInt(names.length) > maxMembers) {
+if (BigInt(document.members.length) > maxMembers) {
   fail(
-    `source archive member count exceeds quota: ${names.length} > ${maxMembers}`,
+    `source archive member count exceeds quota: ${document.members.length} > ${maxMembers}`,
   );
 }
 
-function memberSize(line, type, name) {
-  if (type === "d") {
-    return 0n;
-  }
-  const fields = line.trim().split(/\s+/);
-  let rawSize;
-  if (fields.length >= 3 && fields[1].includes("/")) {
-    // GNU tar: mode owner/group size timestamp name
-    rawSize = fields[2];
-  } else if (
-    fields.length >= 5 &&
-    /^\d+$/.test(fields[1]) &&
-    !fields[2].includes("/")
-  ) {
-    // BSD tar: mode link-count owner group size timestamp name
-    rawSize = fields[4];
-  }
-  if (!rawSize || !/^\d+$/.test(rawSize)) {
-    fail(`cannot determine expanded size for source member: ${name}`);
-  }
-  return BigInt(rawSize);
-}
-
 let expandedBytes = 0n;
-for (let index = 0; index < names.length; index += 1) {
-  const name = names[index];
+for (const member of document.members) {
+  if (
+    member === null ||
+    Array.isArray(member) ||
+    typeof member !== "object" ||
+    JSON.stringify(Object.keys(member).sort()) !==
+      JSON.stringify(["path", "size", "type"])
+  ) {
+    fail("source archive member metadata is invalid");
+  }
+  const name = member.path;
   if (
     name.length === 0 ||
     name.startsWith("/") ||
@@ -309,11 +375,13 @@ for (let index = 0; index < names.length; index += 1) {
     fail(`source archive contains an invalid path segment: ${name}`);
   }
 
-  const type = verbose[index][0];
-  if (type !== "-" && type !== "d") {
+  if (member.type !== "file" && member.type !== "directory") {
     fail(`source archive member type is not allowed: ${name}`);
   }
-  const size = memberSize(verbose[index], type, name);
+  if (!Number.isSafeInteger(member.size) || member.size < 0) {
+    fail(`source archive member has an invalid size: ${name}`);
+  }
+  const size = BigInt(member.size);
   if (size > maxFileBytes) {
     fail(
       `source archive member exceeds per-file quota: ${name} (${size} > ${maxFileBytes})`,
@@ -324,6 +392,126 @@ for (let index = 0; index < names.length; index += 1) {
     fail(
       `source archive expanded size exceeds quota: ${expandedBytes} > ${maxExpandedBytes}`,
     );
+  }
+}
+NODE
+}
+
+validate_prepared_web_archive() {
+  node_bin="$1"
+  tar_bin="$2"
+  gzip_bin="$3"
+  archive="$4"
+  validation_dir="$5"
+  members_file="${validation_dir}/web-members.json"
+
+  "$node_bin" - "$archive" "$DEFAULT_WEB_ARCHIVE_MAX_COMPRESSED_BYTES" <<'NODE'
+const fs = require("fs");
+const compressed = BigInt(fs.statSync(process.argv[2]).size);
+const maximum = BigInt(process.argv[3]);
+if (compressed > maximum) {
+  process.stderr.write(
+    `prepare-release: web archive compressed size exceeds quota: ${compressed} > ${maximum}\n`,
+  );
+  process.exit(1);
+}
+NODE
+
+  "$node_bin" "$ARCHIVE_LISTER" \
+    --archive "$archive" \
+    --gzip-bin "$gzip_bin" \
+    --tar-bin "$tar_bin" \
+    --timeout-ms "$ARCHIVE_LIST_TIMEOUT_MS" \
+    --stdout-limit-bytes "$WEB_ARCHIVE_LIST_STDOUT_LIMIT_BYTES" \
+    --stderr-limit-bytes "$ARCHIVE_LIST_STDERR_LIMIT_BYTES" \
+    >"$members_file"
+
+  "$node_bin" - \
+    "$members_file" \
+    "$WEB_ROOT_NAME" \
+    "$DEFAULT_WEB_ARCHIVE_MAX_MEMBERS" \
+    "$DEFAULT_WEB_ARCHIVE_MAX_FILE_BYTES" \
+    "$DEFAULT_WEB_ARCHIVE_MAX_EXPANDED_BYTES" <<'NODE'
+const fs = require("fs");
+
+const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const expectedRoot = process.argv[3];
+const maxMembers = BigInt(process.argv[4]);
+const maxFileBytes = BigInt(process.argv[5]);
+const maxExpandedBytes = BigInt(process.argv[6]);
+
+function fail(message) {
+  process.stderr.write(`prepare-release: ${message}\n`);
+  process.exit(1);
+}
+
+if (
+  document === null ||
+  Array.isArray(document) ||
+  typeof document !== "object" ||
+  JSON.stringify(Object.keys(document)) !== JSON.stringify(["members"]) ||
+  !Array.isArray(document.members) ||
+  document.members.length === 0
+) {
+  fail("web archive member listing is empty or invalid");
+}
+if (BigInt(document.members.length) > maxMembers) {
+  fail("web archive exceeds the member count limit");
+}
+
+let expandedBytes = 0n;
+for (const member of document.members) {
+  if (
+    member === null ||
+    Array.isArray(member) ||
+    typeof member !== "object" ||
+    JSON.stringify(Object.keys(member).sort()) !==
+      JSON.stringify(["path", "size", "type"])
+  ) {
+    fail("web archive member metadata is invalid");
+  }
+  const name = member.path;
+  if (
+    typeof name !== "string" ||
+    name.length === 0 ||
+    name.startsWith("/") ||
+    name.includes("\\") ||
+    [...name].some((character) => {
+      const code = character.codePointAt(0);
+      return code < 0x20 || code === 0x7f;
+    })
+  ) {
+    fail(`web archive contains an unsafe member path: ${String(name)}`);
+  }
+  if (!name.startsWith(`${expectedRoot}/`)) {
+    fail(`web archive member is outside ${expectedRoot}/: ${name}`);
+  }
+  const segments = name.split("/");
+  if (segments[segments.length - 1] === "") {
+    segments.pop();
+  }
+  if (
+    segments.length === 0 ||
+    segments[0] !== expectedRoot ||
+    segments.some(
+      (segment) => segment === "" || segment === "." || segment === "..",
+    )
+  ) {
+    fail(`web archive contains an invalid path segment: ${name}`);
+  }
+  if (member.type !== "file" && member.type !== "directory") {
+    fail(`web archive member type is not allowed: ${name}`);
+  }
+  if (!Number.isSafeInteger(member.size) || member.size < 0) {
+    fail(`web archive member has an invalid size: ${name}`);
+  }
+  const size = BigInt(member.size);
+  if (member.type === "file" && size > maxFileBytes) {
+    fail(`web archive member exceeds the file size limit: ${name}`);
+  }
+  expandedBytes += size;
+  if (expandedBytes > maxExpandedBytes) {
+    fail("web archive exceeds the expanded size limit");
   }
 }
 NODE
@@ -368,7 +556,15 @@ write_prepared_manifest() {
   manifest="$2"
   revision="$3"
   bundle_dir="$4"
-  "$node_bin" - "$manifest" "$revision" "$bundle_dir" "$SCHEMA" <<'NODE'
+  "$node_bin" - \
+    "$manifest" \
+    "$revision" \
+    "$bundle_dir" \
+    "$SCHEMA" \
+    "$DEFAULT_SERVER_BINARY_MAX_BYTES" \
+    "$DEFAULT_WEB_ARCHIVE_MAX_COMPRESSED_BYTES" \
+    "$DEFAULT_NGINX_TEMPLATE_MAX_BYTES" \
+    "$DEFAULT_CONFIG_RENDERER_MAX_BYTES" <<'NODE'
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
@@ -377,44 +573,81 @@ const manifestPath = process.argv[2];
 const revision = process.argv[3];
 const bundleDirectory = process.argv[4];
 const schema = process.argv[5];
+const serverMaximum = Number(process.argv[6]);
+const webMaximum = Number(process.argv[7]);
+const nginxMaximum = Number(process.argv[8]);
+const rendererMaximum = Number(process.argv[9]);
 const specifications = [
   {
     name: "kbase-server",
     path: "bundle/kbase-server",
     mode: "0755",
+    maximum: serverMaximum,
   },
   {
     name: "web",
     path: "bundle/web.tar.gz",
     mode: "0644",
+    maximum: webMaximum,
   },
   {
     name: "nginx-template",
     path: "bundle/kbase.locations.conf.template",
     mode: "0644",
+    maximum: nginxMaximum,
   },
   {
     name: "config-renderer",
     path: "bundle/render-kbase-config.sh",
     mode: "0755",
+    maximum: rendererMaximum,
   },
 ];
 
 function digest(filePath) {
-  return crypto
-    .createHash("sha256")
-    .update(fs.readFileSync(filePath))
-    .digest("hex");
+  const hash = crypto.createHash("sha256");
+  const descriptor = fs.openSync(filePath, "r");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(
+        descriptor,
+        buffer,
+        0,
+        buffer.length,
+        null,
+      );
+      if (bytesRead === 0) {
+        return hash.digest("hex");
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
 }
 
-const artifacts = specifications.map((specification) => ({
-  name: specification.name,
-  path: specification.path,
-  sha256: digest(
-    path.join(bundleDirectory, path.basename(specification.path)),
-  ),
-  mode: specification.mode,
-}));
+const artifacts = specifications.map((specification) => {
+  const artifactPath = path.join(
+    bundleDirectory,
+    path.basename(specification.path),
+  );
+  const stat = fs.lstatSync(artifactPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`prepared artifact is not a regular file: ${specification.name}`);
+  }
+  if (stat.size > specification.maximum) {
+    throw new Error(
+      `prepared artifact exceeds byte limit: ${specification.name}`,
+    );
+  }
+  return {
+    name: specification.name,
+    path: specification.path,
+    sha256: digest(artifactPath),
+    mode: specification.mode,
+  };
+});
 const manifest = { schema, revision, artifacts };
 fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, {
   encoding: "utf8",
@@ -426,7 +659,6 @@ NODE
 create_release() {
   source_manifest=""
   source_public_key=""
-  signing_key=""
   output_dir=""
   go_bin="go"
   npm_bin="npm"
@@ -448,11 +680,6 @@ create_release() {
       --source-public-key)
         require_option_value "$1" "${2:-}"
         source_public_key="$2"
-        shift 2
-        ;;
-      --signing-key)
-        require_option_value "$1" "${2:-}"
-        signing_key="$2"
         shift 2
         ;;
       --output-dir)
@@ -518,7 +745,6 @@ create_release() {
   [[ -n "$source_manifest" ]] || fail "create requires --source-manifest"
   [[ -n "$source_public_key" ]] ||
     fail "create requires --source-public-key"
-  [[ -n "$signing_key" ]] || fail "create requires --signing-key"
   [[ -n "$output_dir" ]] || fail "create requires --output-dir"
   effective_uid="${EUID:-$(id -u)}"
   [[ "$effective_uid" != "0" ]] ||
@@ -528,13 +754,18 @@ create_release() {
   [[ -x "$ASSEMBLER" ]] || fail "source release assembler is not executable"
   [[ -x "$SIGNATURE_HELPER" ]] ||
     fail "release signature helper is not executable"
+  [[ -f "$ARCHIVE_LISTER" && ! -L "$ARCHIVE_LISTER" ]] ||
+    fail "archive listing helper is missing"
+  [[ -f "$STAGE_HELPER" && ! -L "$STAGE_HELPER" ]] ||
+    fail "bounded staging helper is missing"
   require_executable "$node_bin" "Node"
   require_executable "$openssl_bin" "OpenSSL"
   [[ -f "$source_public_key" && ! -L "$source_public_key" ]] ||
     fail "source public key must be a regular file"
-  [[ -f "$signing_key" && ! -L "$signing_key" ]] ||
-    fail "signing key must be a regular file"
-
+  validate_trusted_file_path \
+    "$node_bin" \
+    "$source_public_key" \
+    "source public key"
   max_compressed_bytes="$(
     printf '%s' "${KBASE_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES:-$DEFAULT_SOURCE_ARCHIVE_MAX_COMPRESSED_BYTES}"
   )"
@@ -587,14 +818,20 @@ create_release() {
   trap 'exit 143' TERM
 
   source_input_dir="${temporary_dir}/source-input"
-  stage_source_release "$source_manifest" "$source_input_dir"
+  stage_source_release \
+    "$node_bin" \
+    "$source_manifest" \
+    "$source_input_dir" \
+    "$source_public_key" \
+    "$max_compressed_bytes"
   staged_source_manifest="${source_input_dir}/${SOURCE_MANIFEST_NAME}"
+  staged_source_public_key="${source_input_dir}/source-public.pem"
 
   # Verify and consume only the private staged source bytes.
   "$ASSEMBLER" verify \
     --node-bin "$node_bin" \
     --manifest "$staged_source_manifest" \
-    --trusted-public-key "$source_public_key" \
+    --trusted-public-key "$staged_source_public_key" \
     --openssl-bin "$openssl_bin"
   revision="$(
     source_manifest_value "$node_bin" "$staged_source_manifest" revision
@@ -715,7 +952,11 @@ create_release() {
   candidate="${bundle_dir}/kbase-server"
   (
     cd "$source_root"
-    CGO_ENABLED=1 "$go_bin" build -trimpath -o "$candidate" ./cmd/kbase-server
+    CGO_ENABLED=1 "$go_bin" build \
+      -trimpath \
+      -ldflags "-X main.buildRevision=${revision}" \
+      -o "$candidate" \
+      ./cmd/kbase-server
   )
   chmod 0755 "$candidate"
 
@@ -740,8 +981,16 @@ create_release() {
     -C "$source_root" \
     -cf - \
     frontend-web |
-    "$gzip_bin" -n >"${bundle_dir}/web.tar.gz"
+  "$gzip_bin" -n >"${bundle_dir}/web.tar.gz"
   chmod 0644 "${bundle_dir}/web.tar.gz"
+  mkdir "$validation_dir"
+  validate_prepared_web_archive \
+    "$node_bin" \
+    "$tar_bin" \
+    "$gzip_bin" \
+    "${bundle_dir}/web.tar.gz" \
+    "$validation_dir"
+  rm -rf "$validation_dir"
 
   cp \
     "${source_root}/deploy/nginx/kbase.locations.conf.template" \
@@ -758,24 +1007,11 @@ create_release() {
     "$prepared_manifest" \
     "$revision" \
     "$bundle_dir"
-  prepared_signature="${temporary_dir}/${SIGNATURE_NAME}"
-  verification_public_key="${temporary_dir}/.verification-public.pem"
-  "$SIGNATURE_HELPER" sign \
-    --manifest "$prepared_manifest" \
-    --signature "$prepared_signature" \
-    --signing-key "$signing_key" \
-    --openssl-bin "$openssl_bin"
-  "$openssl_bin" pkey \
-    -in "$signing_key" \
-    -pubout \
-    -out "$verification_public_key" >/dev/null 2>&1 ||
-    fail "cannot derive verification public key from signing key"
-  "$PREPARER" verify \
-    --node-bin "$node_bin" \
-    --manifest "$prepared_manifest" \
-    --trusted-public-key "$verification_public_key" \
-    --openssl-bin "$openssl_bin"
-  rm -f "$verification_public_key"
+  validate_prepared_release_content \
+    "$prepared_manifest" \
+    "$node_bin" \
+    "$tar_bin" \
+    "$gzip_bin"
 
   rm -rf "$extract_dir" "$source_input_dir"
   if [[ -e "$output_dir" || -L "$output_dir" ]]; then
@@ -786,85 +1022,58 @@ create_release() {
   printf 'prepared release created: %s\n' "${output_dir}/${MANIFEST_NAME}"
 }
 
-verify_release() {
-  manifest=""
-  node_bin="node"
-  trusted_public_key=""
-  openssl_bin="openssl"
-
-  while [[ "$#" -gt 0 ]]; do
-    case "$1" in
-      --manifest)
-        require_option_value "$1" "${2:-}"
-        manifest="$2"
-        shift 2
-        ;;
-      --node-bin)
-        require_option_value "$1" "${2:-}"
-        node_bin="$2"
-        shift 2
-        ;;
-      --trusted-public-key)
-        require_option_value "$1" "${2:-}"
-        trusted_public_key="$2"
-        shift 2
-        ;;
-      --openssl-bin)
-        require_option_value "$1" "${2:-}"
-        openssl_bin="$2"
-        shift 2
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        fail "unknown verify option: $1"
-        ;;
-    esac
-  done
-
-  [[ -n "$manifest" ]] || fail "verify requires --manifest"
-  [[ -n "$trusted_public_key" ]] ||
-    fail "verify requires --trusted-public-key"
-  require_executable "$node_bin" "Node"
-  require_executable "$openssl_bin" "OpenSSL"
-  [[ -x "$SIGNATURE_HELPER" ]] ||
-    fail "release signature helper is not executable"
-  [[ -f "$manifest" && ! -L "$manifest" ]] ||
-    fail "prepared manifest must be a regular file"
-  if [[ "$manifest" == */* ]]; then
-    manifest_directory="${manifest%/*}"
-    [[ -n "$manifest_directory" ]] || manifest_directory="/"
-  else
-    manifest_directory="."
-  fi
-  signature="${manifest_directory}/${SIGNATURE_NAME}"
-  "$SIGNATURE_HELPER" verify \
-    --manifest "$manifest" \
-    --signature "$signature" \
-    --trusted-public-key "$trusted_public_key" \
-    --openssl-bin "$openssl_bin"
-
-  "$node_bin" - "$manifest" "$SCHEMA" <<'NODE'
+validate_prepared_release_content() {
+  manifest="$1"
+  node_bin="$2"
+  tar_bin="$3"
+  gzip_bin="$4"
+  "$node_bin" - \
+    "$manifest" \
+    "$SCHEMA" \
+    "$DEFAULT_SERVER_BINARY_MAX_BYTES" \
+    "$DEFAULT_WEB_ARCHIVE_MAX_COMPRESSED_BYTES" \
+    "$DEFAULT_NGINX_TEMPLATE_MAX_BYTES" \
+    "$DEFAULT_CONFIG_RENDERER_MAX_BYTES" <<'NODE'
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 
 const manifestPath = path.resolve(process.argv[2]);
 const expectedSchema = process.argv[3];
+const serverMaximum = Number(process.argv[4]);
+const webMaximum = Number(process.argv[5]);
+const nginxMaximum = Number(process.argv[6]);
+const rendererMaximum = Number(process.argv[7]);
 const releaseDirectory = path.dirname(manifestPath);
 const bundleDirectory = path.join(releaseDirectory, "bundle");
 const expected = new Map([
-  ["kbase-server", { path: "bundle/kbase-server", mode: "0755" }],
-  ["web", { path: "bundle/web.tar.gz", mode: "0644" }],
+  [
+    "kbase-server",
+    {
+      path: "bundle/kbase-server",
+      mode: "0755",
+      maximum: serverMaximum,
+    },
+  ],
+  [
+    "web",
+    { path: "bundle/web.tar.gz", mode: "0644", maximum: webMaximum },
+  ],
   [
     "nginx-template",
-    { path: "bundle/kbase.locations.conf.template", mode: "0644" },
+    {
+      path: "bundle/kbase.locations.conf.template",
+      mode: "0644",
+      maximum: nginxMaximum,
+    },
   ],
   [
     "config-renderer",
-    { path: "bundle/render-kbase-config.sh", mode: "0755" },
+    {
+      path: "bundle/render-kbase-config.sh",
+      mode: "0755",
+      maximum: rendererMaximum,
+    },
   ],
 ]);
 
@@ -881,6 +1090,29 @@ function exactKeys(value, keys, label) {
   const wanted = [...keys].sort();
   if (JSON.stringify(actual) !== JSON.stringify(wanted)) {
     fail(`${label} fields must be exactly: ${wanted.join(", ")}`);
+  }
+}
+
+function digest(filePath) {
+  const hash = crypto.createHash("sha256");
+  const descriptor = fs.openSync(filePath, "r");
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    while (true) {
+      const bytesRead = fs.readSync(
+        descriptor,
+        buffer,
+        0,
+        buffer.length,
+        null,
+      );
+      if (bytesRead === 0) {
+        return hash.digest("hex");
+      }
+      hash.update(buffer.subarray(0, bytesRead));
+    }
+  } finally {
+    fs.closeSync(descriptor);
   }
 }
 
@@ -970,6 +1202,9 @@ for (const artifact of manifest.artifacts) {
   if (!stat.isFile() || stat.isSymbolicLink()) {
     fail(`prepared artifact must be a regular file: ${artifact.name}`);
   }
+  if (stat.size > specification.maximum) {
+    fail(`prepared artifact exceeds byte limit: ${artifact.name}`);
+  }
   const realArtifactPath = fs.realpathSync(artifactPath);
   const realReleasePrefix = `${realReleaseDirectory}${path.sep}`;
   if (!realArtifactPath.startsWith(realReleasePrefix)) {
@@ -979,10 +1214,7 @@ for (const artifact of manifest.artifacts) {
   if (actualMode !== artifact.mode) {
     fail(`prepared artifact mode mismatch: ${artifact.name}`);
   }
-  const actualDigest = crypto
-    .createHash("sha256")
-    .update(fs.readFileSync(artifactPath))
-    .digest("hex");
+  const actualDigest = digest(artifactPath);
   if (actualDigest !== artifact.sha256) {
     fail(`prepared artifact digest mismatch: ${artifact.name}`);
   }
@@ -1012,6 +1244,101 @@ if (
 
 process.stdout.write("prepared release verified\n");
 NODE
+
+  release_directory="$(cd "$(dirname "$manifest")" && pwd -P)"
+  content_validation_dir="$(
+    mktemp -d "${TMPDIR:-/tmp}/kbase-prepared-validation.XXXXXX"
+  )"
+  if ! validate_prepared_web_archive \
+    "$node_bin" \
+    "$tar_bin" \
+    "$gzip_bin" \
+    "${release_directory}/bundle/web.tar.gz" \
+    "$content_validation_dir"; then
+    rm -rf "$content_validation_dir"
+    return 1
+  fi
+  rm -rf "$content_validation_dir"
+}
+
+verify_release() {
+  manifest=""
+  node_bin="node"
+  tar_bin="tar"
+  gzip_bin="gzip"
+  trusted_public_key=""
+  openssl_bin="openssl"
+
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      --manifest)
+        require_option_value "$1" "${2:-}"
+        manifest="$2"
+        shift 2
+        ;;
+      --node-bin)
+        require_option_value "$1" "${2:-}"
+        node_bin="$2"
+        shift 2
+        ;;
+      --tar-bin)
+        require_option_value "$1" "${2:-}"
+        tar_bin="$2"
+        shift 2
+        ;;
+      --gzip-bin)
+        require_option_value "$1" "${2:-}"
+        gzip_bin="$2"
+        shift 2
+        ;;
+      --trusted-public-key)
+        require_option_value "$1" "${2:-}"
+        trusted_public_key="$2"
+        shift 2
+        ;;
+      --openssl-bin)
+        require_option_value "$1" "${2:-}"
+        openssl_bin="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "unknown verify option: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "$manifest" ]] || fail "verify requires --manifest"
+  [[ -n "$trusted_public_key" ]] ||
+    fail "verify requires --trusted-public-key"
+  require_executable "$node_bin" "Node"
+  require_executable "$tar_bin" "tar"
+  require_executable "$gzip_bin" "gzip"
+  require_executable "$openssl_bin" "OpenSSL"
+  [[ -x "$SIGNATURE_HELPER" ]] ||
+    fail "release signature helper is not executable"
+  [[ -f "$ARCHIVE_LISTER" && ! -L "$ARCHIVE_LISTER" ]] ||
+    fail "archive listing helper is missing"
+  [[ -f "$manifest" && ! -L "$manifest" ]] ||
+    fail "prepared manifest must be a regular file"
+  [[ "${manifest##*/}" == "$MANIFEST_NAME" ]] ||
+    fail "prepared manifest must use the canonical filename"
+  if [[ "$manifest" == */* ]]; then
+    manifest_directory="${manifest%/*}"
+    [[ -n "$manifest_directory" ]] || manifest_directory="/"
+  else
+    manifest_directory="."
+  fi
+  signature="${manifest_directory}/${SIGNATURE_NAME}"
+  "$SIGNATURE_HELPER" verify \
+    --manifest "$manifest" \
+    --signature "$signature" \
+    --trusted-public-key "$trusted_public_key" \
+    --openssl-bin "$openssl_bin"
+  validate_prepared_release_content "$manifest" "$node_bin" "$tar_bin" "$gzip_bin"
 }
 
 main() {

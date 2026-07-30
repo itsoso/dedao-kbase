@@ -114,6 +114,27 @@ sign_manifest() {
   require_regular_file "$manifest" "manifest"
   require_regular_file "$signing_key" "signing key"
   require_private_key_mode "$signing_key"
+  private_key_text="$(
+    "$openssl_bin" pkey \
+      -in "$signing_key" \
+      -text \
+      -noout 2>/dev/null
+  )" || fail "signing key is not a valid private key"
+  private_key_bits=""
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^Private-Key:\ \(([0-9]+)\ bit ]]; then
+      private_key_bits="${BASH_REMATCH[1]}"
+      break
+    fi
+    if [[ "$line" =~ ^RSA\ Private-Key:\ \(([0-9]+)\ bit ]]; then
+      private_key_bits="${BASH_REMATCH[1]}"
+      break
+    fi
+  done <<<"$private_key_text"
+  [[ -n "$private_key_bits" ]] ||
+    fail "signing key must be RSA"
+  ((private_key_bits >= 3072)) ||
+    fail "signing RSA key must contain at least 3072 bits"
   [[ ! -e "$signature" && ! -L "$signature" ]] ||
     fail "signature output already exists: $signature"
 
@@ -219,6 +240,8 @@ verify_manifest() {
   done <<<"$public_key_text"
   [[ -n "$public_key_bits" ]] ||
     fail "cannot determine trusted RSA public key size"
+  ((public_key_bits >= 3072)) ||
+    fail "trusted RSA public key must contain at least 3072 bits"
   read -r signature_bytes _ < <(wc -c "$signature")
   expected_signature_bytes="$(( (public_key_bits + 7) / 8 ))"
   [[ "$signature_bytes" == "$expected_signature_bytes" ]] ||
