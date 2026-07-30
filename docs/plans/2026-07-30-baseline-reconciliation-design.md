@@ -77,4 +77,3 @@ existing request validation and internal-error behavior unchanged.
 - Run system-map drift, packaging, privacy, and diff checks.
 - Do not claim G6 completion: first-party WeChat collection still requires
   explicit local enrollment and an operator-selected account.
-
