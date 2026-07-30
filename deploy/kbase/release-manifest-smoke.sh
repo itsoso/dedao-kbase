@@ -502,6 +502,9 @@ if [[ "${1:-}" == "--version" ]]; then
   printf 'tar (GNU tar) fixture\n'
   exit 0
 fi
+if "$RELEASE_REAL_TAR" --version 2>&1 | grep -q 'GNU tar'; then
+  exec "$RELEASE_REAL_TAR" "$@"
+fi
 filtered=()
 while [[ "$#" -gt 0 ]]; do
   case "$1" in

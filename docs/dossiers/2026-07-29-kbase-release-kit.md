@@ -197,6 +197,14 @@ and byte-limit checks unchanged. Local archive-list and complete release
 manifest smokes pass. A new `main` gate run must pass before installation
 continues.
 
+The next Linux run exposed a separate smoke-harness defect. Its cross-platform
+tar wrapper removed `--numeric-owner` even when the real implementation was
+GNU tar, changing the production listing contract from numeric `uid/gid` to
+symbolic `root/root`. The strict parser correctly rejected that synthetic
+format. The wrapper now passes all production arguments through unchanged on
+GNU tar and filters unsupported GNU-only flags only for the local BSD tar
+compatibility path. The parser continues to reject symbolic owners.
+
 ### G6 - Online Verification
 
 PENDING successful G5.
