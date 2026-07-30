@@ -247,6 +247,9 @@ FAKE_CURL
   cat >"${fake_dir}/tar" <<'FAKE_TAR'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+if "$REAL_TAR" --version 2>&1 | grep -q 'GNU tar'; then
+  exec "$REAL_TAR" "$@"
+fi
 arguments=()
 for argument in "$@"; do
   case "$argument" in

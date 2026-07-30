@@ -205,6 +205,19 @@ format. The wrapper now passes all production arguments through unchanged on
 GNU tar and filters unsupported GNU-only flags only for the local BSD tar
 compatibility path. The parser continues to reject symbolic owners.
 
+After release assembly passed, the transactional installer smoke exposed the
+same unconditional filtering in its independent tar fixture. That fixture now
+uses the same GNU pass-through and BSD compatibility split. This changes test
+fidelity only; the production preparer and installer already invoke GNU tar
+with the required numeric-owner and strict-listing options.
+
+The following Linux run reached the transaction-parent trust check and
+correctly rejected the runner's default sticky `/tmp` ancestry. The workflow
+now runs the installer smoke under GitHub's private `$RUNNER_TEMP`, matching
+the installer's documented requirement that journal and lock ancestry is not
+group/other writable. Production transaction state remains outside temporary
+sticky directories.
+
 ### G6 - Online Verification
 
 PENDING successful G5.

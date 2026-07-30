@@ -159,6 +159,8 @@ jobs:
           bash deploy/kbase/release-manifest-smoke.sh
 
       - name: Smoke-test transactional installer
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: bash deploy/kbase/install-release-smoke.sh
 
       - name: Reject privileged install from checkout
