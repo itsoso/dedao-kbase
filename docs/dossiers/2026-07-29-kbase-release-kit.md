@@ -181,7 +181,21 @@ than being implied by Git SHA ordering.
 
 ### G5 - Deployment Health
 
-PENDING explicit release authorization after G4.
+IN PROGRESS after explicit release authorization on 2026-07-29.
+
+The first `main` release-gate run for `91df112` stopped before production
+mutation. Ubuntu GNU tar omitted the numeric timezone from `--full-time`
+listing output for a Git archive member, while the bounded archive parser
+required that optional display field. The Linux gate therefore rejected the
+unsafe-symlink fixture during strict listing parsing instead of reaching the
+intended safety rejection.
+
+The remediation adds a Linux-format regression fixture that was observed RED
+before the parser change, accepts GNU listings both with and without the
+display timezone, and keeps all path, type, size, control-character, timeout,
+and byte-limit checks unchanged. Local archive-list and complete release
+manifest smokes pass. A new `main` gate run must pass before installation
+continues.
 
 ### G6 - Online Verification
 

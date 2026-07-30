@@ -78,6 +78,12 @@ lrwxrwxrwx 0/0 0 2026-07-29 12:34:56.000000000 +0000 bundle/link -> file with sp
 hrw-r--r-- 0/0 0 2026-07-29 12:34:56.000000000 +0000 bundle/hard-link link to bundle/file with spaces.txt
 LISTING
     ;;
+  success-no-timezone)
+    cat <<'LISTING'
+drwxrwxr-x 0/0 0 2026-07-30 09:33:21 bundle/
+lrwxrwxrwx 0/0 0 2026-07-30 09:33:21 bundle/link -> /var/tmp/external
+LISTING
+    ;;
   malformed)
     printf 'this is not a GNU tar verbose member\n'
     ;;
@@ -142,6 +148,22 @@ NODE
 
 [[ "$(wc -l <"$TAR_COUNT" | tr -d ' ')" == "1" ]] ||
   fail "the tar listing command must run exactly once"
+
+FAKE_TAR_MODE=success-no-timezone run_parser >"${TMP_ROOT}/members-no-timezone.json"
+node - "${TMP_ROOT}/members-no-timezone.json" <<'NODE'
+const fs = require("fs");
+
+const document = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const expected = {
+  members: [
+    { path: "bundle/", type: "directory", size: 0 },
+    { path: "bundle/link", type: "symlink", size: 0 },
+  ],
+};
+if (JSON.stringify(document) !== JSON.stringify(expected)) {
+  throw new Error(`unexpected member document: ${JSON.stringify(document)}`);
+}
+NODE
 
 FAKE_TAR_MODE=malformed \
   expect_failure_contains \
