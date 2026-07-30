@@ -2,10 +2,8 @@
 
 ## Status
 
-G1-G4 passed. G5-G6 require a new, explicit release
-authorization and have not started.
-
-No release-kit commit has been pushed, merged, or deployed.
+G1-G6 passed. The release-kit commits are merged into `main`; production is
+running revision `0dcc0f5c45af6c8a9bf47f6025635bddee7b6857`.
 
 ## Requirement
 
@@ -218,9 +216,42 @@ the installer's documented requirement that journal and lock ancestry is not
 group/other writable. Production transaction state remains outside temporary
 sticky directories.
 
+PASS on 2026-07-30.
+
+- GitHub release-gate run `30508133224` passed every frontend, Go, Nginx,
+  privacy, system-map, release assembly, installer, and signed prepared-release
+  step for revision `0dcc0f5c45af6c8a9bf47f6025635bddee7b6857`.
+- The source and prepared manifests were signed outside repository scripts.
+  Both signatures and all prepared artifact digests were independently
+  verified before installation.
+- The production host prepared the Linux bundle as the unprivileged service
+  user. The default Go module endpoint was unreachable from that network, so
+  the clean build was rerun through the checksummed `goproxy.cn` and
+  `sum.golang.google.cn` endpoints and passed the full preparation gate.
+- The first installer invocation stopped during the pre-mutation public-health
+  DNS check. It left no transaction journal or target mutation; its empty
+  staging directory was removed after the existing service and public endpoint
+  were revalidated.
+- After three consecutive public-health preflight passes, the root-only
+  installer completed the signed transaction, restarted the service, validated
+  Nginx, and retained the rollback snapshot.
+
 ### G6 - Online Verification
 
-PENDING successful G5.
+PASS on 2026-07-30.
+
+- Loopback and public `/health` returned the exact deployed revision and the
+  `dedao-kbase` service contract with `Cache-Control: no-store`.
+- `dedao-kbase.service` was active with `ExecMainStatus=0` and `NRestarts=0`.
+- The installed server SHA-256 matched the signed prepared manifest.
+- Nginx configuration validation passed. Existing duplicate-name warnings for
+  unrelated virtual hosts remain visible but do not affect KBase.
+- `/`, `/book-knowledge`, `/sources/dedao/courses`, the clinical-trials book
+  agent route, and `/app.js` returned HTTP 200.
+- Anonymous `/api/books` and `/browser/session` requests returned HTTP 401.
+- The transaction journal was cleared, the rollback snapshot was retained, and
+  the deployment-window service log contained no panic, fatal error,
+  segmentation fault, or failed-start event.
 
 ## Delivery Commits
 
@@ -234,3 +265,6 @@ PENDING successful G5.
 - `3e256d5`, `fefddcb` - secret-free CI release gates and review remediation
 - `b62e4ec`, `948bba9` - authenticated artifacts, immutable staging, bounded
   archives, non-executing environment parsing, and trusted staging ancestry
+- `91df112` - crash-safe release transaction and recovery hardening
+- `463e66f`, `8121b03`, `0dcc0f5` - GNU tar compatibility and Linux CI
+  environment fidelity fixes
