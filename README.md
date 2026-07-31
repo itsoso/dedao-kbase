@@ -146,136 +146,120 @@ KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
   go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" revoke-all --confirm
 ```
 
-发布必须把后端二进制、Web 静态文件、环境文件和渲染后的 Nginx 配置作为同一回滚事务。回滚时恢复这四项并重新加载 Nginx；新的会话 SQLite 可以保留，旧版本不会读取它。已完成一次迁移并删除旧 token 的浏览器在回滚后可能需要重新进行一次 Basic 登录，知识库产物和机器 Bearer token 不受影响。
+直接部署只替换后端二进制和 Web 静态文件，不改环境文件、会话数据库或
+Nginx 配置。需要变更这些配置时应使用独立维护窗口和独立备份，不能夹带在
+普通代码发布中。知识库产物、机器 Bearer token 和浏览器凭据不属于发布包。
 
-### KBase release kit
+### KBase direct deployment
 
-发布分为不可变源码包、Linux 构建包和事务安装三个阶段。源码组装必须针对干净工作树中的明确 commit：
+KBase 使用干净 `main` revision 的直接部署流程，不生成发布签名、manifest
+或事务 journal。先在开发机固定 revision、创建 Git 归档并记录 SHA-256：
 
 ```bash
-bash deploy/kbase/assemble-release.sh create \
-  --repo "${KBASE_REPO_ROOT:?}" \
-  --revision "${KBASE_REVISION:?}" \
-  --output-dir "${KBASE_SOURCE_RELEASE_DIR:?}"
+test -z "$(git -C "${KBASE_REPO_ROOT:?}" status --porcelain)"
+KBASE_REVISION="$(git -C "${KBASE_REPO_ROOT:?}" rev-parse main)"
+test "$KBASE_REVISION" = "$(git -C "${KBASE_REPO_ROOT:?}" rev-parse HEAD)"
+(
+  cd "${KBASE_REPO_ROOT:?}"
+  git archive \
+    --format=tar.gz \
+    --output="${KBASE_SOURCE_ARCHIVE:?}" \
+    "$KBASE_REVISION"
+)
+shasum -a 256 "${KBASE_SOURCE_ARCHIVE:?}"
+scp "${KBASE_SOURCE_ARCHIVE:?}" \
+  "${KBASE_DEPLOY_HOST:?}:${KBASE_REMOTE_ARCHIVE:?}"
+ssh "${KBASE_DEPLOY_HOST:?}" \
+  sha256sum "${KBASE_REMOTE_ARCHIVE:?}"
 ```
 
-源码与 prepared manifest 都必须生成分离的 `MANIFEST.sig`。生产签名系统先在隔离环境中独立校验 schema、revision、artifact 清单、大小上限和 digest，只接收最终 manifest 字节并返回 detached signature。生产私钥只能存在于 KMS/HSM 或离线签名机；禁止把私钥路径、私钥内容或签名 API 凭据传给本仓库中的任何脚本。`release-signature.sh sign` 只用于本地 smoke 和一次性 CI 密钥，不是生产签名入口。安装机只保存 root 所有、不可被 group/other 修改的可信公钥。
-
-源码组装产物必须先离开构建进程，再由外部签名系统签名。签名返回后，在不含私钥的环境中验证：
+服务端必须把归档解压到新的私有目录，并由非 root 服务账号重复构建和测试。
+以下变量由受控部署 shell 显式传入，不要在仓库中写真实主机或凭据：
 
 ```bash
-bash deploy/kbase/assemble-release.sh verify \
-  --manifest "${KBASE_SOURCE_MANIFEST:?}" \
-  --trusted-public-key "${KBASE_SOURCE_PUBLIC_KEY:?}" \
-  --node-bin "${NODE_BIN:?}" \
-  --openssl-bin "${OPENSSL_BIN:?}"
+sudo install -d -m 0700 \
+  -o "${KBASE_SERVICE_USER:?}" \
+  -g "${KBASE_SERVICE_GROUP:?}" \
+  "${KBASE_REMOTE_SOURCE_DIR:?}"
+sudo tar -xzf "${KBASE_REMOTE_ARCHIVE:?}" \
+  -C "${KBASE_REMOTE_SOURCE_DIR:?}"
+sudo runuser --user "${KBASE_SERVICE_USER:?}" -- env \
+  HOME="${KBASE_SERVICE_HOME:?}" \
+  PATH="${KBASE_BUILD_PATH:?}" \
+  KBASE_REVISION="${KBASE_REVISION:?}" \
+  KBASE_REMOTE_SOURCE_DIR="${KBASE_REMOTE_SOURCE_DIR:?}" \
+  KBASE_CANDIDATE_BIN="${KBASE_CANDIDATE_BIN:?}" \
+  bash -Eeuo pipefail -c '
+    cd "$KBASE_REMOTE_SOURCE_DIR"
+    (cd frontend && npm ci && npm run build)
+    for smoke in frontend/scripts/*-smoke.mjs; do node "$smoke"; done
+    node --check frontend-web/app.js
+    for smoke in frontend-web/scripts/*smoke*.mjs; do node "$smoke"; done
+    go mod verify
+    go vet ./...
+    go test ./...
+    CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.buildRevision=${KBASE_REVISION}" \
+      -o "$KBASE_CANDIDATE_BIN" \
+      ./cmd/kbase-server
+  '
+sha256sum "${KBASE_CANDIDATE_BIN:?}"
 ```
 
-在隔离的 Linux 构建机上以非 root 用户验证源码签名与 manifest、执行全部测试和真实 Nginx smoke，并生成四组件构建包：
+生产切换前为二进制和 Web 目录创建同一批次的备份。候选文件先复制到目标
+文件系统，再直接替换两个目标：
 
 ```bash
-bash deploy/kbase/prepare-release.sh create \
-  --source-manifest "${KBASE_SOURCE_MANIFEST:?}" \
-  --source-public-key "${KBASE_SOURCE_PUBLIC_KEY:?}" \
-  --output-dir "${KBASE_PREPARED_RELEASE_DIR:?}" \
-  --node-bin "${NODE_BIN:?}" \
-  --go-bin "${GO_BIN:?}" \
-  --npm-bin "${NPM_BIN:?}" \
-  --tar-bin "${TAR_BIN:?}" \
-  --gzip-bin "${GZIP_BIN:?}" \
-  --nginx-bin "${NGINX_BIN:?}" \
-  --uname-bin "${UNAME_BIN:?}" \
-  --openssl-bin "${OPENSSL_BIN:?}"
-```
-
-构建结束后，将完整 prepared 目录作为只读输入送入独立验证/签名流水线。流水线在无私钥阶段完成内容校验，在新的隔离签名阶段只签署已固定的 manifest 字节，并把 `MANIFEST.sig` 返回构建包。下面只展示签名返回后的公开验证，不在仓库命令中传递生产私钥：
-
-```bash
-bash deploy/kbase/prepare-release.sh verify \
-  --manifest "${KBASE_PREPARED_MANIFEST:?}" \
-  --trusted-public-key "${KBASE_PREPARED_PUBLIC_KEY:?}" \
-  --node-bin "${NODE_BIN:?}" \
-  --tar-bin "${TAR_BIN:?}" \
-  --gzip-bin "${GZIP_BIN:?}" \
-  --openssl-bin "${OPENSSL_BIN:?}"
-```
-
-安装器使用 `O_NOFOLLOW` 和逐文件硬上限把签名、manifest、四个 artifact、可信公钥和环境文件流式复制到私有 staging，再验签并只消费 staged bytes。环境文件只接受受控前缀的 `KEY=VALUE`，不会作为 shell 执行。`--health-url` 必须严格等于 `http://<backend-addr>/health`，`--public-health-url` 必须等于环境文件中 `KBASE_PUBLIC_ORIGIN` 的 `/health`；两者都必须返回 signed revision，并使用 `Cache-Control: no-cache` 请求。安装事务使用独占锁；journal、快照、候选目标和父目录都会在切换点 fsync。进程被 `SIGKILL` 或主机掉电后，下次安装会先从 retained snapshot 自动恢复，包含 Web 目标已被移走但尚未放入候选目录的窗口。失败会恢复后端、Web、环境文件和 Nginx 配置，并保留快照。
-
-先把同一已审查 revision 的安装工具放入固定、root 所有且不可由
-group/other 写入的目录：
-
-```bash
-sudo install -d -o root -g root -m 0755 /opt/dedao-kbase/release-tools
+sudo install -d -o root -g root -m 0700 "${KBASE_BACKUP_DIR:?}"
 sudo install -o root -g root -m 0755 \
-  deploy/kbase/install-release.sh \
-  deploy/kbase/prepare-release.sh \
-  deploy/kbase/release-signature.sh \
-  /opt/dedao-kbase/release-tools/
-sudo install -o root -g root -m 0644 \
-  deploy/kbase/archive-list.mjs \
-  deploy/kbase/stage-files.mjs \
-  deploy/kbase/fsync-paths.mjs \
-  /opt/dedao-kbase/release-tools/
+  "${KBASE_BINARY_TARGET:?}" \
+  "${KBASE_BACKUP_DIR:?}/kbase-server"
+sudo cp -a \
+  "${KBASE_WEB_TARGET:?}" \
+  "${KBASE_BACKUP_DIR:?}/frontend-web"
+sudo install -o root -g root -m 0755 \
+  "${KBASE_CANDIDATE_BIN:?}" \
+  "${KBASE_BINARY_CANDIDATE_TARGET:?}"
+sudo cp -a \
+  "${KBASE_REMOTE_SOURCE_DIR:?}/frontend-web" \
+  "${KBASE_WEB_CANDIDATE_TARGET:?}"
+sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"
+sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_WEB_PREVIOUS_TARGET:?}"
+sudo mv "${KBASE_WEB_CANDIDATE_TARGET:?}" "${KBASE_WEB_TARGET:?}"
+sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
+curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
 ```
 
-生产安装必须从清空继承变量的 root 环境启动，避免 shell 启动文件、Node/OpenSSL/Tar 配置或动态链接器变量影响验证：
+替换、重启或 loopback 健康检查任一步失败，都必须立即恢复同一批次的两项
+备份并停止发布：
 
 ```bash
-sudo env -i \
-  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-  HOME=/root \
-  bash /opt/dedao-kbase/release-tools/install-release.sh install \
-  --manifest "${KBASE_PREPARED_MANIFEST:?}" \
-  --trusted-public-key "${KBASE_PREPARED_PUBLIC_KEY:?}" \
-  --binary-target "${KBASE_BINARY_TARGET:?}" \
-  --web-target "${KBASE_WEB_TARGET:?}" \
-  --env-source "${KBASE_ENV_SOURCE:?}" \
-  --env-target "${KBASE_ENV_TARGET:?}" \
-  --nginx-config-target "${KBASE_NGINX_CONFIG_TARGET:?}" \
-  --basic-auth-file "${KBASE_BASIC_AUTH_FILE:?}" \
-  --backend-addr "${KBASE_BACKEND_ADDR:?}" \
-  --service-name "${KBASE_SERVICE_NAME:?}" \
-  --nginx-service-name "${KBASE_NGINX_SERVICE_NAME:?}" \
-  --health-url "${KBASE_HEALTH_URL:?}" \
-  --public-health-url "${KBASE_PUBLIC_HEALTH_URL:?}" \
-  --backup-dir "${KBASE_BACKUP_DIR:?}" \
-  --transaction-state-file "${KBASE_TRANSACTION_STATE_FILE:?}"
-```
-
-安装主机上的 `install-release.sh` 必须与同一已审查版本的
-`prepare-release.sh`、`release-signature.sh`、`archive-list.mjs`、
-`stage-files.mjs` 和 `fsync-paths.mjs` 一起部署，不能混用不同 revision。
-这些工具必须先安装到 root 所有、group/other 不可写的专用目录，再从该
-目录执行；不要直接以 root 运行用户可写 worktree 中的脚本。root 模式
-禁止 `--node-bin`、`--openssl-bin` 等可执行文件 override，只从上面的固定
-系统 `PATH` 解析并校验 root-owned 工具。
-
-自动回滚无法完成时，从 retained backup 手工恢复四项快照，再依次重启、校验、重载和探活：
-
-```bash
-set -Eeuo pipefail
-test -f "${KBASE_BACKUP_DIR:?}/snapshot/kbase-server"
-test -d "${KBASE_BACKUP_DIR:?}/snapshot/web"
-test -f "${KBASE_BACKUP_DIR:?}/snapshot/service.env"
-test -f "${KBASE_BACKUP_DIR:?}/snapshot/nginx.conf"
-test ! -e "${KBASE_FAILED_WEB_TARGET:?}"
-sudo install -m 0755 "${KBASE_BACKUP_DIR:?}/snapshot/kbase-server" "${KBASE_BINARY_TARGET:?}"
+sudo install -o root -g root -m 0755 \
+  "${KBASE_BACKUP_DIR:?}/kbase-server" \
+  "${KBASE_BINARY_TARGET:?}"
 sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
-sudo cp -a "${KBASE_BACKUP_DIR:?}/snapshot/web" "${KBASE_WEB_TARGET:?}"
-sudo install -m 0600 "${KBASE_BACKUP_DIR:?}/snapshot/service.env" "${KBASE_ENV_TARGET:?}"
-sudo install -m 0600 "${KBASE_BACKUP_DIR:?}/snapshot/nginx.conf" "${KBASE_NGINX_CONFIG_TARGET:?}"
-sudo "${SYSTEMCTL_BIN:?}" restart "${KBASE_SERVICE_NAME:?}"
-sudo "${NGINX_BIN:?}" -t
-sudo "${SYSTEMCTL_BIN:?}" reload "${KBASE_NGINX_SERVICE_NAME:?}"
-"${CURL_BIN:?}" -q --noproxy '*' --proto '=http,https' \
-  --fail --silent --show-error "${KBASE_HEALTH_URL:?}"
-"${CURL_BIN:?}" -q --noproxy '*' --proto '=http,https' \
-  --fail --silent --show-error "${KBASE_PUBLIC_HEALTH_URL:?}"
-sudo rm -f "${KBASE_TRANSACTION_STATE_FILE:?}"
+sudo cp -a \
+  "${KBASE_BACKUP_DIR:?}/frontend-web" \
+  "${KBASE_WEB_TARGET:?}"
+sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
+curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
+exit 1
 ```
 
-`KBase Release Gates` CI 不读取生产 secrets，也不部署。它只在隔离目录中构建、校验发布包，并运行 installer 的临时 fixture smoke；CI 在全部仓库代码运行结束后生成一次性 prepared key，仅验证签名机制，不能替代离线/KMS 生产签名。
+本地健康成功后，再检查公网 revision、静态路由、鉴权边界和服务日志：
+
+```bash
+curl --fail --silent --show-error "${KBASE_PUBLIC_HEALTH_URL:?}"
+sudo systemctl is-active "${KBASE_SERVICE_NAME:?}"
+sudo systemctl show "${KBASE_SERVICE_NAME:?}" \
+  -p ExecMainStatus \
+  -p NRestarts
+```
+
+该流程保留明确 revision、双端测试、SHA-256、范围化备份和检测到失败后的
+即时恢复，但不提供 artifact 身份认证、部署锁、持久事务、fsync 切换或断电
+恢复。禁止并发部署；进程被强制终止或主机在切换窗口断电时，必须从
+`KBASE_BACKUP_DIR` 手工恢复两个目标。
 
 对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：
 

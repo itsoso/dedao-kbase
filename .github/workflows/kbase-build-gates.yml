@@ -1,0 +1,108 @@
+name: KBase Build Gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kbase-build-gates-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-gates:
+    name: Verify KBase build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GOFLAGS: -tags=webkit2_41
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            nginx
+
+      - name: Assert normal-user execution
+        run: test "$(id -u)" -ne 0
+
+      - name: Verify Go modules
+        run: go mod verify
+
+      - name: Build and smoke-test desktop frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+          shopt -s nullglob
+          smokes=(scripts/*-smoke.mjs)
+          test "${#smokes[@]}" -gt 0
+          for smoke in "${smokes[@]}"; do
+            node "$smoke"
+          done
+
+      - name: Vet Go packages
+        run: go vet ./...
+
+      - name: Test Go packages
+        run: go test ./...
+
+      - name: Test root-only permission ceiling
+        run: |
+          sudo env \
+            "GOCACHE=$RUNNER_TEMP/go-build-root" \
+            "GOFLAGS=$GOFLAGS" \
+            "$(command -v go)" test ./backend/app \
+              -run '^TestBrowserSessionStoreDirectoryPermissionCeiling$' \
+              -count=1
+
+      - name: Smoke-test production Web frontend
+        run: |
+          node --check frontend-web/app.js
+          shopt -s nullglob
+          smokes=(frontend-web/scripts/*smoke*.mjs)
+          test "${#smokes[@]}" -gt 0
+          for smoke in "${smokes[@]}"; do
+            node "$smoke"
+          done
+
+      - name: Build CGO server and test real Nginx proxy
+        run: |
+          CGO_ENABLED=1 go build \
+            -trimpath \
+            -o "$RUNNER_TEMP/kbase-server" \
+            ./cmd/kbase-server
+          KBASE_SERVER_BIN="$RUNNER_TEMP/kbase-server" \
+            NGINX_BIN="$(command -v nginx)" \
+            bash deploy/nginx/browser-session-proxy-smoke.sh
+
+      - name: Verify direct-deployment contract
+        run: bash scripts/kbase-direct-deployment-smoke.sh
+
+      - name: Verify privacy and generated system map
+        run: |
+          bash scripts/privacy-smoke.sh
+          bash scripts/system-map-smoke.sh
