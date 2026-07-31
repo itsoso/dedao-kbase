@@ -1305,6 +1305,36 @@ func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerBookChatMissingBookDoesNotExposeFilesystemPath(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")
+	root := t.TempDir()
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(filepath.Join(root, "book_knowledge")),
+		AuthToken: "secret-token",
+	})
+
+	resp := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/book-chat",
+		"secret-token",
+		`{"book_id":"missing-prompts","mode":"chat","question":"ping"}`,
+	)
+	body := resp.Body.String()
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("missing book chat status = %d, want 404, body=%s", resp.Code, body)
+	}
+	for _, leak := range []string{root, "manifest.json", "book_knowledge"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("missing book chat response leaked %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "book not found") {
+		t.Errorf("missing book chat response should be actionable: %s", body)
+	}
+}
+
 func TestKBaseHTTPHandlerContextChatAllowsCourseArticleAnalysis(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")

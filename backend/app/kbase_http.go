@@ -3124,6 +3124,11 @@ func (h *kbaseHTTPHandler) handleBookChat(w http.ResponseWriter, r *http.Request
 	}
 	response, err := BookKnowledgeChat(r.Context(), h.store, request)
 	if err != nil {
+		if os.IsNotExist(err) {
+			bookID := sanitizeBookKnowledgeID(stripReaderRouteSuffix(request.BookID))
+			writeHTTPError(w, http.StatusNotFound, fmt.Sprintf("book not found: %s", bookID))
+			return
+		}
 		if strings.Contains(err.Error(), "book_id is required") || strings.Contains(err.Error(), "question is required") {
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
