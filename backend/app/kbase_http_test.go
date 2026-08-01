@@ -2536,6 +2536,138 @@ func TestKBaseHTTPHandlerSourceAgentArtifactDownloadBoundsConcurrentResponses(t 
 	}
 }
 
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadRevalidatesAfterQueue(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *kbaseHTTPHandler, *SourceSyncStore)
+	}{
+		{
+			name: "rollout disabled",
+			mutate: func(t *testing.T, handler *kbaseHTTPHandler, _ *SourceSyncStore) {
+				setSourceAgentArtifactRolloutForTest(t, handler.sourceArtifacts.root, "artifact-worker", false)
+			},
+		},
+		{
+			name: "registry version changed",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, sourceSync *SourceSyncStore) {
+				if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+					AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+					Version: "1.1.0", ProtocolVersion: "2026-08-01",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+			concrete := handler.(*kbaseHTTPHandler)
+			if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+				AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+				Version: "1.0.0", ProtocolVersion: "2026-08-01",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			leaseObserved := make(chan struct{}, 3)
+			concrete.sourceArtifacts.snapshotLeaseObserver = func() { leaseObserved <- struct{}{} }
+
+			agentIDs := []string{"agent-a", "agent-b", "agent-c"}
+			paths := make([]string, 0, len(agentIDs))
+			for index, agentID := range agentIDs {
+				command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, agentID, "artifact-worker", fmt.Sprintf("artifact-revalidate-%d", index))
+				claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				paths = append(paths, "/api/source-agent/artifacts/artifact-worker/download?agent_id="+url.QueryEscape(agentID)+"&command_id="+url.QueryEscape(claimed.ID))
+			}
+
+			release := make(chan struct{})
+			startBlocking := func(path string) (<-chan struct{}, context.CancelFunc, <-chan struct{}) {
+				ctx, cancel := context.WithCancel(context.Background())
+				entered := make(chan struct{})
+				done := make(chan struct{})
+				writer := &blockingSourceAgentArtifactResponseWriter{
+					header: make(http.Header), ctx: ctx, entered: entered, release: release,
+				}
+				request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+				request.Header.Set("Authorization", "Bearer agent-secret")
+				go func() {
+					defer close(done)
+					handler.ServeHTTP(writer, request)
+				}()
+				return entered, cancel, done
+			}
+			firstEntered, cancelFirst, firstDone := startBlocking(paths[0])
+			secondEntered, cancelSecond, secondDone := startBlocking(paths[1])
+			for _, entered := range []<-chan struct{}{firstEntered, secondEntered} {
+				select {
+				case <-entered:
+				case <-time.After(2 * time.Second):
+					cancelFirst()
+					cancelSecond()
+					t.Fatal("blocking download did not enter response")
+				}
+			}
+			for index := 0; index < 2; index++ {
+				select {
+				case <-leaseObserved:
+				case <-time.After(time.Second):
+					cancelFirst()
+					cancelSecond()
+					t.Fatal("blocking download lease was not observed")
+				}
+			}
+
+			thirdCtx, cancelThird := context.WithCancel(context.Background())
+			thirdResponse := httptest.NewRecorder()
+			thirdRequest := httptest.NewRequest(http.MethodGet, paths[2], nil).WithContext(thirdCtx)
+			thirdRequest.Header.Set("Authorization", "Bearer agent-secret")
+			thirdDone := make(chan struct{})
+			go func() {
+				defer close(thirdDone)
+				handler.ServeHTTP(thirdResponse, thirdRequest)
+			}()
+			select {
+			case <-leaseObserved:
+			case <-time.After(time.Second):
+				cancelFirst()
+				cancelSecond()
+				cancelThird()
+				t.Fatal("queued download lease attempt was not observed")
+			}
+
+			test.mutate(t, concrete, sourceSync)
+			cancelFirst()
+			select {
+			case <-thirdDone:
+			case <-time.After(2 * time.Second):
+				cancelSecond()
+				cancelThird()
+				t.Fatal("queued download did not finish after a slot was released")
+			}
+			cancelSecond()
+			cancelThird()
+			for _, done := range []<-chan struct{}{firstDone, secondDone} {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("blocking download did not stop after cancellation")
+				}
+			}
+			if thirdResponse.Code != http.StatusConflict {
+				t.Fatalf("queued download status=%d body=%q, want conflict", thirdResponse.Code, thirdResponse.Body.String())
+			}
+			for _, forbidden := range []string{"artifact-worker-bytes", "artifact-worker", concrete.sourceArtifacts.root, "catalog.json", "storage_key"} {
+				if strings.Contains(thirdResponse.Body.String(), forbidden) {
+					t.Fatalf("queued download error leaked %q: %s", forbidden, thirdResponse.Body.String())
+				}
+			}
+		})
+	}
+}
+
 type blockingSourceAgentArtifactResponseWriter struct {
 	header      http.Header
 	ctx         context.Context

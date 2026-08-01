@@ -74,7 +74,12 @@ func TestSourceAgentArtifactCatalogMetadataValidationDoesNotOpenArtifact(t *test
 	if selection.artifact.StorageKey != artifact.StorageKey {
 		t.Fatalf("selection = %#v", selection)
 	}
-	if _, err := catalog.prepareSnapshot(context.Background(), selection); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
+	lease, err := catalog.acquireSnapshotLease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	if _, err := lease.prepareSnapshot(context.Background(), selection); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
 		t.Fatalf("prepareSnapshot() error = %v, want ErrSourceAgentArtifactIntegrity", err)
 	}
 }
@@ -104,7 +109,12 @@ func TestSourceAgentArtifactCatalogSnapshotsArtifactOnceAndCleansPrivateTemp(t *
 	if openCount != 0 {
 		t.Fatalf("metadata validation opened artifact %d times", openCount)
 	}
-	snapshot, err := catalog.prepareSnapshot(context.Background(), selection)
+	lease, err := catalog.acquireSnapshotLease(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	snapshot, err := lease.prepareSnapshot(context.Background(), selection)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +465,12 @@ func readSourceAgentArtifactSnapshotForTest(catalog *SourceAgentArtifactCatalog,
 	if err != nil {
 		return SourceAgentArtifactPublic{}, nil, err
 	}
-	snapshot, err := catalog.prepareSnapshot(context.Background(), selection)
+	lease, err := catalog.acquireSnapshotLease(context.Background())
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	defer lease.Close()
+	snapshot, err := lease.prepareSnapshot(context.Background(), selection)
 	if err != nil {
 		return SourceAgentArtifactPublic{}, nil, err
 	}

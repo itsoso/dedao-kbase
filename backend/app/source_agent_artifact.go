@@ -77,10 +77,11 @@ type SourceAgentArtifactTarget struct {
 }
 
 type SourceAgentArtifactCatalog struct {
-	root            string
-	snapshotSlots   chan struct{}
-	snapshotTempDir string
-	openArtifact    func(string, []string) (*os.File, error)
+	root                  string
+	snapshotSlots         chan struct{}
+	snapshotTempDir       string
+	snapshotLeaseObserver func()
+	openArtifact          func(string, []string) (*os.File, error)
 }
 
 type sourceAgentArtifactSelection struct {

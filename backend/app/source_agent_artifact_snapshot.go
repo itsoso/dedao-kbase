@@ -19,40 +19,47 @@ const (
 type sourceAgentArtifactSnapshot struct {
 	file      *os.File
 	path      string
-	release   func()
 	closeOnce sync.Once
 	closeErr  error
 }
 
-func (c *SourceAgentArtifactCatalog) prepareSnapshot(ctx context.Context, selection sourceAgentArtifactSelection) (*sourceAgentArtifactSnapshot, error) {
+type sourceAgentArtifactSnapshotLease struct {
+	catalog   *SourceAgentArtifactCatalog
+	closeOnce sync.Once
+}
+
+func (c *SourceAgentArtifactCatalog) acquireSnapshotLease(ctx context.Context) (*sourceAgentArtifactSnapshotLease, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if c.snapshotLeaseObserver != nil {
+		c.snapshotLeaseObserver()
+	}
 	select {
 	case c.snapshotSlots <- struct{}{}:
+		return &sourceAgentArtifactSnapshotLease{catalog: c}, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	release := func() { <-c.snapshotSlots }
+}
 
+func (lease *sourceAgentArtifactSnapshotLease) prepareSnapshot(ctx context.Context, selection sourceAgentArtifactSelection) (*sourceAgentArtifactSnapshot, error) {
+	c := lease.catalog
 	source, err := c.openArtifact(c.root, strings.Split(selection.artifact.StorageKey, "/"))
 	if err != nil {
-		release()
 		return nil, ErrSourceAgentArtifactIntegrity
 	}
 	defer source.Close()
 	info, err := source.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != selection.artifact.Size {
-		release()
 		return nil, ErrSourceAgentArtifactIntegrity
 	}
 
 	temporary, err := os.CreateTemp(c.snapshotTempDir, ".source-agent-artifact-*")
 	if err != nil {
-		release()
 		return nil, ErrSourceAgentArtifactIntegrity
 	}
-	snapshot := &sourceAgentArtifactSnapshot{file: temporary, path: temporary.Name(), release: release}
+	snapshot := &sourceAgentArtifactSnapshot{file: temporary, path: temporary.Name()}
 	keep := false
 	defer func() {
 		if !keep {
@@ -104,11 +111,16 @@ func (snapshot *sourceAgentArtifactSnapshot) Close() error {
 			}
 		}
 		snapshot.closeErr = errors.Join(snapshot.closeErr, removeErr)
-		if snapshot.release != nil {
-			snapshot.release()
-		}
 	})
 	return snapshot.closeErr
+}
+
+func (lease *sourceAgentArtifactSnapshotLease) Close() error {
+	if lease == nil {
+		return nil
+	}
+	lease.closeOnce.Do(func() { <-lease.catalog.snapshotSlots })
+	return nil
 }
 
 func copySourceAgentArtifactWithContext(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {

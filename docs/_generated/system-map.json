@@ -42,7 +42,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 4550,
+      "line": 4559,
       "authenticated": true
     },
     {
@@ -192,13 +192,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 4664,
+      "line": 4673,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 4666,
+      "line": 4675,
       "authenticated": true
     },
     {
@@ -624,7 +624,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 3856,
+      "line": 3865,
       "authenticated": true
     },
     {

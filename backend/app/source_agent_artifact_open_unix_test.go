@@ -170,7 +170,12 @@ func TestSourceAgentArtifactFIFOHelper(t *testing.T) {
 		if err != nil {
 			t.Fatalf("selectForRollout() FIFO error = %v", err)
 		}
-		if _, err := catalog.prepareSnapshot(context.Background(), selection); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
+		lease, err := catalog.acquireSnapshotLease(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lease.Close()
+		if _, err := lease.prepareSnapshot(context.Background(), selection); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
 			t.Fatalf("prepareSnapshot() FIFO error = %v, want ErrSourceAgentArtifactIntegrity", err)
 		}
 	default:

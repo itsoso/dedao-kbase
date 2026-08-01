@@ -3688,6 +3688,15 @@ func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWrit
 		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
 		return
 	}
+	lease, err := h.sourceArtifacts.acquireSnapshotLease(r.Context())
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		h.writeSourceAgentArtifactWorkerError(w, err)
+		return
+	}
+	defer lease.Close()
 	command, _, selection, err := h.validateSourceAgentArtifactCommand(commandID, agentID,
 		SourceAgentCommandClaimed, SourceAgentCommandDownloading)
 	if err != nil {
@@ -3698,7 +3707,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWrit
 		h.writeSourceAgentArtifactWorkerError(w, ErrSourceAgentCommandTarget)
 		return
 	}
-	snapshot, err := h.sourceArtifacts.prepareSnapshot(r.Context(), selection)
+	snapshot, err := lease.prepareSnapshot(r.Context(), selection)
 	if err != nil {
 		if r.Context().Err() != nil {
 			return
