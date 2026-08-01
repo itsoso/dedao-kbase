@@ -528,6 +528,55 @@ func TestSourceLeaseRejectsPausedAgent(t *testing.T) {
 	}
 }
 
+func TestSourceLeaseClaimRejectsPauseCommittedAfterPrecheck(t *testing.T) {
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
+	store, err := newSourceSyncStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	registerSourceLeaseAgent(t, store, "agent-linearized-pause")
+	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wcplus_wechat_article",
+		SourceAccountKey: "linearized-pause",
+		SourceAccount:    "Linearized Pause",
+		AgentID:          "agent-linearized-pause",
+		Operation:        "sync_content",
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(subscription.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prechecked, err := store.getAgent("agent-linearized-pause")
+	if err != nil || prechecked.DesiredState != SourceAgentDesiredActive {
+		t.Fatalf("active precheck=%#v, err=%v", prechecked, err)
+	}
+	if _, err := store.SetAgentDesiredState("agent-linearized-pause", SourceAgentDesiredPaused); err != nil {
+		t.Fatalf("pause after precheck: %v", err)
+	}
+
+	leased, err := store.claimNextRun("agent-linearized-pause", []string{"sync_content"}, time.Minute)
+	if err != nil {
+		t.Fatalf("claim after committed pause: %v", err)
+	}
+	if leased != nil {
+		t.Fatalf("claim used stale active precheck: %#v", leased)
+	}
+	current, err := store.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != SourceRunQueued || current.LeaseOwner != "" {
+		t.Fatalf("claim after pause changed queued run: %#v", current)
+	}
+}
+
 func TestSourceSyncStoreRecoversExpiredLeaseAndRetries(t *testing.T) {
 	clock := newSourceSyncTestClock(time.Date(2026, 7, 9, 18, 0, 0, 0, time.UTC))
 	store, err := newSourceSyncStore(t.TempDir(), clock.Now)

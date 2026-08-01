@@ -39,7 +39,7 @@ func DeriveSourceAgentObservedState(agent SourceAgent, now time.Time, freshness 
 		return SourceAgentObservedOffline
 	}
 	heartbeatAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(agent.LastHeartbeatAt))
-	if err != nil || now.Sub(heartbeatAt) > freshness {
+	if err != nil || heartbeatAt.After(now) || now.Sub(heartbeatAt) > freshness {
 		return SourceAgentObservedOffline
 	}
 

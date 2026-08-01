@@ -772,49 +772,47 @@ func (s *SourceSyncStore) LeaseNextRun(agentID string, capabilities []string, le
 	if _, err := s.RequeueExpiredRuns(); err != nil {
 		return nil, err
 	}
+	return s.claimNextRun(agentID, capabilities, leaseDuration)
+}
 
+func (s *SourceSyncStore) claimNextRun(agentID string, capabilities []string, leaseDuration time.Duration) (*SourceSyncRun, error) {
 	placeholders := make([]string, len(capabilities))
-	args := make([]any, 0, len(capabilities)+1)
-	args = append(args, agentID)
+	now := s.now().UTC()
+	args := make([]any, 0, len(capabilities)+9)
+	args = append(args,
+		SourceRunLeased,
+		agentID,
+		now.Add(leaseDuration).Format(time.RFC3339Nano),
+		now.Format(time.RFC3339Nano),
+		SourceRunQueued,
+		agentID,
+	)
 	for index, capability := range capabilities {
 		placeholders[index] = "?"
 		args = append(args, capability)
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
+	args = append(args, SourceRunQueued, agentID, SourceAgentDesiredActive)
 	query := `
-		SELECT id FROM source_sync_runs
-		WHERE status = ? AND (agent_id = '' OR agent_id = ?)
-			AND requested_operation IN (` + strings.Join(placeholders, ",") + `)
-		ORDER BY created_at, id
-		LIMIT 1
+		UPDATE source_sync_runs
+		SET status = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ?
+		WHERE id = (
+			SELECT id FROM source_sync_runs
+			WHERE status = ? AND (agent_id = '' OR agent_id = ?)
+				AND requested_operation IN (` + strings.Join(placeholders, ",") + `)
+			ORDER BY created_at, id
+			LIMIT 1
+		)
+		AND status = ?
+		AND EXISTS (
+			SELECT 1 FROM source_agents
+			WHERE agent_id = ? AND desired_state = ?
+		)
+		RETURNING id
 	`
-	queryArgs := append([]any{SourceRunQueued}, args...)
 	var runID string
-	if err := tx.QueryRow(query, queryArgs...).Scan(&runID); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRow(query, args...).Scan(&runID); errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	} else if err != nil {
-		return nil, err
-	}
-	now := s.now().UTC()
-	result, err := tx.Exec(`
-		UPDATE source_sync_runs SET status = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ?
-		WHERE id = ? AND status = ?
-	`, SourceRunLeased, agentID, now.Add(leaseDuration).Format(time.RFC3339Nano),
-		now.Format(time.RFC3339Nano), runID, SourceRunQueued)
-	if err != nil {
-		return nil, err
-	}
-	if rows, _ := result.RowsAffected(); rows != 1 {
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-		return nil, nil
-	}
-	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	run, err := s.GetRun(runID)

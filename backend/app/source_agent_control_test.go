@@ -33,6 +33,7 @@ func TestSourceAgentObservedStateTruthTable(t *testing.T) {
 		},
 		{name: "missing heartbeat is offline", agent: SourceAgent{}, freshness: freshness, want: SourceAgentObservedOffline},
 		{name: "invalid heartbeat is offline", agent: SourceAgent{LastHeartbeatAt: "not-a-timestamp"}, freshness: freshness, want: SourceAgentObservedOffline},
+		{name: "future heartbeat is offline", agent: SourceAgent{LastHeartbeatAt: now.Add(time.Hour).Format(time.RFC3339Nano)}, freshness: freshness, want: SourceAgentObservedOffline},
 		{name: "heartbeat at freshness boundary is online", agent: SourceAgent{LastHeartbeatAt: now.Add(-freshness).Format(time.RFC3339Nano)}, freshness: freshness, want: SourceAgentObservedOnline},
 		{
 			name: "stale heartbeat overrides capability action",
