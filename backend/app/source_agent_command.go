@@ -882,11 +882,26 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	if schemeStart >= colon || !isASCIILetter(token[schemeStart]) {
 		return "", false
 	}
+	if schemeStart > 0 {
+		previous, _ := utf8.DecodeLastRuneInString(token[:schemeStart])
+		if previous == '/' || previous == '\\' {
+			return "", false
+		}
+	}
 	return token[schemeStart:colon], true
 }
 
 func sourceAgentCommandURIContextClosed(value string) bool {
-	return strings.ContainsAny(value, ")]}>\"'`")
+	for _, character := range value {
+		if unicode.Is(unicode.Pe, character) || unicode.Is(unicode.Pf, character) {
+			return true
+		}
+		switch character {
+		case '>', '"', '\'', '`':
+			return true
+		}
+	}
+	return false
 }
 
 func sourceAgentCommandWhitespaceTokenBounds(value string, index int) (int, int) {
