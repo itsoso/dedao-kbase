@@ -43,9 +43,9 @@ type SourceAgentRunner struct {
 	protocolVersion string
 	leaseDuration   time.Duration
 
-	controlMu sync.Mutex
-	stateMu   sync.Mutex
-	state     sourceAgentRunnerState
+	controlGate chan struct{}
+	stateMu     sync.Mutex
+	state       sourceAgentRunnerState
 }
 
 type sourceAgentRunnerState struct {
@@ -107,19 +107,26 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 	if err != nil || protocolVersion == "" {
 		return nil, fmt.Errorf("invalid source agent protocol_version")
 	}
-	return &SourceAgentRunner{
+	runner := &SourceAgentRunner{
 		client: config.Client, commandClient: config.CommandClient, outbox: config.Outbox,
 		adapter: config.Adapter, diagnoser: config.Diagnoser, updater: config.Updater,
 		workerType: workerType, platform: platform, architecture: architecture,
 		version: version, protocolVersion: protocolVersion, leaseDuration: config.LeaseDuration,
-	}, nil
+		controlGate: make(chan struct{}, 1),
+	}
+	runner.controlGate <- struct{}{}
+	return runner, nil
 }
 
 func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult, error) {
 	result := SourceAgentCycleResult{OK: true}
-	r.controlMu.Lock()
-	run, err := r.beginCycle(ctx)
-	r.controlMu.Unlock()
+	if err := r.acquireControl(ctx); err != nil {
+		return result, err
+	}
+	run, err := func() (*SourceSyncRun, error) {
+		defer r.releaseControl()
+		return r.beginCycle(ctx)
+	}()
 	if err != nil {
 		return result, err
 	}
@@ -128,6 +135,19 @@ func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult
 	}
 	defer r.finishSourceRun()
 	return r.executeLeasedRun(ctx, *run, result)
+}
+
+func (r *SourceAgentRunner) acquireControl(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.controlGate:
+		return nil
+	}
+}
+
+func (r *SourceAgentRunner) releaseControl() {
+	r.controlGate <- struct{}{}
 }
 
 func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, error) {
@@ -262,8 +282,12 @@ func (r *SourceAgentRunner) collectHeartbeat(ctx context.Context) (SourceCapabil
 	if err := ctx.Err(); err != nil {
 		return SourceCapabilityHealth{}, SourceAgentHeartbeat{}, err
 	}
-	health.LastError = boundedSourceAgentLocalMessage(health.LastError)
-	health.RequiresAction = boundedSourceAgentLocalMessage(health.RequiresAction)
+	if strings.TrimSpace(health.LastError) != "" {
+		health.LastError = "Capability check failed."
+	}
+	if strings.TrimSpace(health.RequiresAction) != "" {
+		health.RequiresAction = "Operator action is required."
+	}
 	normalizedHealth, err := normalizeSourceCapabilityHealth(map[string]SourceCapabilityHealth{capabilityName: health})
 	if err != nil {
 		return SourceCapabilityHealth{}, SourceAgentHeartbeat{}, fmt.Errorf("collect source agent capability health: %w", err)
@@ -285,14 +309,6 @@ func (r *SourceAgentRunner) collectHeartbeat(ctx context.Context) (SourceCapabil
 		CurrentRunID: currentRunID, CurrentCommandID: currentCommandID,
 		OutboxPending: pending, DeadLetterCount: deadLetters, LastSuccessAt: lastSuccessAt,
 	}, nil
-}
-
-func boundedSourceAgentLocalMessage(message string) string {
-	normalized, err := normalizeSourceAgentCommandMessage(message)
-	if err != nil {
-		return ""
-	}
-	return normalized
 }
 
 func (r *SourceAgentRunner) heartbeatStateSnapshot() (string, string, string) {

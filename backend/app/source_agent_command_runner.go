@@ -40,11 +40,14 @@ type sourceAgentPendingCommandReport struct {
 
 func sourceAgentDiagnosticCommandReports(report SourceAgentDiagnosticReport) []sourceAgentPendingCommandReport {
 	transition := SourceAgentCommandTransition{
-		State: report.State, ResultCode: report.Code, Message: report.Message,
+		State: report.State, ResultCode: report.Code,
 	}
-	if normalized, err := normalizeSourceAgentCommandTransition(transition); err == nil {
-		if validateSourceAgentCommandTerminalResult(SourceAgentCommandDiagnose, normalized) == nil {
-			return []sourceAgentPendingCommandReport{sourceAgentPendingReport(normalized)}
+	if report.State == SourceAgentCommandSucceeded || report.State == SourceAgentCommandFailed {
+		if normalized, err := normalizeSourceAgentCommandTransition(transition); err == nil {
+			if validateSourceAgentCommandTerminalResult(SourceAgentCommandDiagnose, normalized) == nil {
+				normalized.Message = sourceAgentDiagnosticResultMessage(normalized.State)
+				return []sourceAgentPendingCommandReport{sourceAgentPendingReport(normalized)}
+			}
 		}
 	}
 	return []sourceAgentPendingCommandReport{{
@@ -55,14 +58,17 @@ func sourceAgentDiagnosticCommandReports(report SourceAgentDiagnosticReport) []s
 
 func sourceAgentUpgradeCommandReports(result SourceAgentUpgradeResult) []sourceAgentPendingCommandReport {
 	transition := SourceAgentCommandTransition{
-		State: result.State, ResultCode: result.Code, Message: result.Message, ActualVersion: result.ActualVersion,
+		State: result.State, ResultCode: result.Code, ActualVersion: result.ActualVersion,
 	}
 	normalized, err := normalizeSourceAgentCommandTransition(transition)
-	if err != nil || validateSourceAgentCommandTerminalResult(SourceAgentCommandUpgrade, normalized) != nil {
+	terminalState := result.State == SourceAgentCommandSucceeded || result.State == SourceAgentCommandFailed || result.State == SourceAgentCommandRolledBack
+	if !terminalState || err != nil || validateSourceAgentCommandTerminalResult(SourceAgentCommandUpgrade, normalized) != nil {
 		normalized = SourceAgentCommandTransition{
 			State: SourceAgentCommandFailed, ResultCode: SourceAgentCommandCodeUpgradeFailed,
 			Message: "Upgrade result was invalid.",
 		}
+	} else {
+		normalized.Message = sourceAgentUpgradeResultMessage(normalized.ResultCode)
 	}
 
 	switch normalized.State {
@@ -81,6 +87,34 @@ func sourceAgentUpgradeCommandReports(result SourceAgentUpgradeResult) []sourceA
 		), sourceAgentPendingReport(normalized))
 	default:
 		return []sourceAgentPendingCommandReport{sourceAgentPendingReport(normalized)}
+	}
+}
+
+func sourceAgentDiagnosticResultMessage(state string) string {
+	if state == SourceAgentCommandSucceeded {
+		return "Diagnostics completed."
+	}
+	return "Diagnostics failed."
+}
+
+func sourceAgentUpgradeResultMessage(code string) string {
+	switch code {
+	case SourceAgentCommandCodeUpgradeComplete:
+		return "Upgrade completed."
+	case SourceAgentCommandCodeDownloadFailed:
+		return "Upgrade download failed."
+	case SourceAgentCommandCodeVerificationFailed:
+		return "Upgrade verification failed."
+	case SourceAgentCommandCodeInstallFailed:
+		return "Upgrade installation failed."
+	case SourceAgentCommandCodeRestartFailed:
+		return "Upgrade restart failed."
+	case SourceAgentCommandCodeRollbackComplete:
+		return "Upgrade rolled back."
+	case SourceAgentCommandCodeRollbackFailed:
+		return "Upgrade rollback failed."
+	default:
+		return "Upgrade failed."
 	}
 }
 
@@ -120,10 +154,7 @@ func (r *SourceAgentRunner) executeCurrentCommand(ctx context.Context, command S
 		}
 		if command.State == SourceAgentCommandClaimed {
 			r.setPendingCommandReports([]sourceAgentPendingCommandReport{{state: SourceAgentCommandDownloading}})
-			if err := r.reportPendingCommand(ctx); err != nil {
-				return err
-			}
-			command, _ = r.currentCommandSnapshot()
+			return r.reportPendingCommand(ctx)
 		}
 		if command.State != SourceAgentCommandDownloading {
 			return fmt.Errorf("upgrade command is not ready for updater handoff")

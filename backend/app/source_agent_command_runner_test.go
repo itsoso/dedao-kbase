@@ -50,6 +50,24 @@ type fakeSourceAgentCommandClient struct {
 	current     SourceAgentCommand
 }
 
+type blockingSourceAgentCommandClient struct {
+	log     *sourceAgentRunnerCallLog
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingSourceAgentCommandClient) ClaimCommand(context.Context) (*SourceAgentCommand, error) {
+	c.log.add("claim")
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return nil, nil
+}
+
+func (c *blockingSourceAgentCommandClient) ReportCommand(context.Context, string, string, string, string, string) (SourceAgentCommand, error) {
+	return SourceAgentCommand{}, errors.New("unexpected command report")
+}
+
 func (c *fakeSourceAgentCommandClient) ClaimCommand(context.Context) (*SourceAgentCommand, error) {
 	c.log.add("claim")
 	c.mu.Lock()
@@ -253,13 +271,14 @@ func TestSourceAgentCommandRunnerClaimsBeforeLeasingAndStopsOnClaimError(t *test
 
 func TestSourceAgentCommandRunnerDiagnoseIsTerminalAndNeverLeasesSameCycle(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		report SourceAgentDiagnosticReport
-		state  string
-		code   string
+		name    string
+		report  SourceAgentDiagnosticReport
+		state   string
+		code    string
+		message string
 	}{
-		{name: "success", report: SourceAgentDiagnosticReport{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticComplete, Message: "All built-in checks passed."}, state: SourceAgentCommandSucceeded, code: SourceAgentCommandCodeDiagnosticComplete},
-		{name: "failure", report: SourceAgentDiagnosticReport{State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeDiagnosticFailed, Message: "Source login requires attention."}, state: SourceAgentCommandFailed, code: SourceAgentCommandCodeDiagnosticFailed},
+		{name: "success", report: SourceAgentDiagnosticReport{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticComplete, Message: "cookie=secret article body excerpt"}, state: SourceAgentCommandSucceeded, code: SourceAgentCommandCodeDiagnosticComplete, message: "Diagnostics completed."},
+		{name: "failure", report: SourceAgentDiagnosticReport{State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeDiagnosticFailed, Message: "raw local diagnostic error"}, state: SourceAgentCommandFailed, code: SourceAgentCommandCodeDiagnosticFailed, message: "Diagnostics failed."},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			log := &sourceAgentRunnerCallLog{}
@@ -272,7 +291,7 @@ func TestSourceAgentCommandRunnerDiagnoseIsTerminalAndNeverLeasesSameCycle(t *te
 				t.Fatal(err)
 			}
 			_, reports := commands.counts()
-			if len(reports) != 1 || reports[0].State != test.state || reports[0].Code != test.code {
+			if len(reports) != 1 || reports[0].State != test.state || reports[0].Code != test.code || reports[0].Message != test.message {
 				t.Fatalf("reports=%#v", reports)
 			}
 			if got := strings.Join(log.snapshot(), ","); got != "heartbeat,claim,diagnose,report:"+test.state {
@@ -310,19 +329,22 @@ func TestSourceAgentCommandRunnerRetriesReportWithoutDiagnosingOrLeasing(t *test
 
 func TestSourceAgentCommandRunnerMapsUpgradeResultsToLegalTransitions(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		result     SourceAgentUpgradeResult
-		wantStates []string
+		name        string
+		result      SourceAgentUpgradeResult
+		wantStates  []string
+		wantMessage string
 	}{
 		{
-			name:       "success",
-			result:     SourceAgentUpgradeResult{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, Message: "Upgrade completed.", ActualVersion: "2.0.0"},
-			wantStates: []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting, SourceAgentCommandVerifying, SourceAgentCommandSucceeded},
+			name:        "success",
+			result:      SourceAgentUpgradeResult{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, Message: "cookie=secret article body excerpt", ActualVersion: "2.0.0"},
+			wantStates:  []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting, SourceAgentCommandVerifying, SourceAgentCommandSucceeded},
+			wantMessage: "Upgrade completed.",
 		},
 		{
-			name:       "failure",
-			result:     SourceAgentUpgradeResult{State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeUpgradeFailed, Message: "Upgrade failed safely."},
-			wantStates: []string{SourceAgentCommandDownloading, SourceAgentCommandFailed},
+			name:        "failure",
+			result:      SourceAgentUpgradeResult{State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeUpgradeFailed, Message: "raw local updater error"},
+			wantStates:  []string{SourceAgentCommandDownloading, SourceAgentCommandFailed},
+			wantMessage: "Upgrade failed.",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -332,6 +354,16 @@ func TestSourceAgentCommandRunnerMapsUpgradeResultsToLegalTransitions(t *testing
 			updater := &fakeSourceAgentUpdater{log: log, result: test.result}
 			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
 
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			_, firstCycleReports := commands.counts()
+			if len(firstCycleReports) != 1 || firstCycleReports[0].State != SourceAgentCommandDownloading || updater.calls.Load() != 0 {
+				t.Fatalf("first cycle reports=%#v updater calls=%d", firstCycleReports, updater.calls.Load())
+			}
+			if got := strings.Join(log.snapshot(), ","); got != "heartbeat,claim,report:downloading" {
+				t.Fatalf("first cycle call order=%q", got)
+			}
 			if _, err := runner.RunOnce(context.Background()); err != nil {
 				t.Fatal(err)
 			}
@@ -345,7 +377,7 @@ func TestSourceAgentCommandRunnerMapsUpgradeResultsToLegalTransitions(t *testing
 			}
 			if len(reports) > 0 {
 				last := reports[len(reports)-1]
-				if last.Code != test.result.Code || last.Message != test.result.Message || last.ActualVersion != test.result.ActualVersion {
+				if last.Code != test.result.Code || last.Message != test.wantMessage || last.ActualVersion != test.result.ActualVersion {
 					t.Fatalf("terminal report=%#v", last)
 				}
 			}
@@ -363,8 +395,15 @@ func TestSourceAgentCommandRunnerMapsUpgradeResultsToLegalTransitions(t *testing
 					upgradeIndex = index
 				}
 			}
-			if downloadIndex < 0 || upgradeIndex <= downloadIndex {
-				t.Fatalf("download progress must be durable before updater handoff: %v", calls)
+			secondHeartbeatIndex := -1
+			for index := downloadIndex + 1; index < len(calls); index++ {
+				if calls[index] == "heartbeat" {
+					secondHeartbeatIndex = index
+					break
+				}
+			}
+			if downloadIndex < 0 || secondHeartbeatIndex <= downloadIndex || upgradeIndex <= secondHeartbeatIndex {
+				t.Fatalf("updater handoff must wait for the next heartbeat cycle: %v", calls)
 			}
 		})
 	}
@@ -438,7 +477,7 @@ func TestSourceAgentCommandRunnerBoundsInvalidDiagnosticAndUpgradeResults(t *tes
 	diagnostic := sourceAgentDiagnosticCommandReports(SourceAgentDiagnosticReport{
 		State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticComplete, Message: privateMessage,
 	})
-	if len(diagnostic) != 1 || diagnostic[0].state != SourceAgentCommandFailed || diagnostic[0].code != SourceAgentCommandCodeDiagnosticFailed {
+	if len(diagnostic) != 1 || diagnostic[0].state != SourceAgentCommandSucceeded || diagnostic[0].code != SourceAgentCommandCodeDiagnosticComplete || diagnostic[0].message != "Diagnostics completed." {
 		t.Fatalf("diagnostic reports=%#v", diagnostic)
 	}
 	upgrade := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{
@@ -455,6 +494,120 @@ func TestSourceAgentCommandRunnerBoundsInvalidDiagnosticAndUpgradeResults(t *tes
 	}
 }
 
+func TestSourceAgentCommandRunnerUsesStableUpgradeMessages(t *testing.T) {
+	for _, test := range []struct {
+		state   string
+		code    string
+		version string
+		message string
+	}{
+		{state: SourceAgentCommandSucceeded, code: SourceAgentCommandCodeUpgradeComplete, version: "2.0.0", message: "Upgrade completed."},
+		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeUpgradeFailed, message: "Upgrade failed."},
+		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeDownloadFailed, message: "Upgrade download failed."},
+		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeVerificationFailed, message: "Upgrade verification failed."},
+		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeInstallFailed, message: "Upgrade installation failed."},
+		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeRestartFailed, message: "Upgrade restart failed."},
+		{state: SourceAgentCommandRolledBack, code: SourceAgentCommandCodeRollbackComplete, message: "Upgrade rolled back."},
+		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeRollbackFailed, message: "Upgrade rollback failed."},
+	} {
+		reports := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{
+			State: test.state, Code: test.code, Message: "cookie=secret article body excerpt raw error", ActualVersion: test.version,
+		})
+		if len(reports) == 0 {
+			t.Fatalf("state=%q code=%q produced no reports", test.state, test.code)
+		}
+		terminal := reports[len(reports)-1]
+		if terminal.state != test.state || terminal.code != test.code || terminal.message != test.message {
+			t.Fatalf("state=%q code=%q terminal=%#v", test.state, test.code, terminal)
+		}
+	}
+}
+
+func TestSourceAgentCommandRunnerRejectsNonTerminalComponentResultsAndClearsCommand(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		command   SourceAgentCommand
+		diagnoser SourceAgentDiagnoser
+		updater   SourceAgentUpdater
+		wantCode  string
+	}{
+		{
+			name:      "diagnose verified",
+			command:   SourceAgentCommand{ID: "cmd-diagnose", TargetAgentID: "agent-a", Type: SourceAgentCommandDiagnose, State: SourceAgentCommandClaimed},
+			diagnoser: &fakeSourceAgentDiagnoser{log: &sourceAgentRunnerCallLog{}, report: SourceAgentDiagnosticReport{State: SourceAgentCommandVerified}},
+			wantCode:  SourceAgentCommandCodeDiagnosticFailed,
+		},
+		{
+			name:     "upgrade installing",
+			command:  SourceAgentCommand{ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade, State: SourceAgentCommandClaimed, UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"}},
+			updater:  &fakeSourceAgentUpdater{log: &sourceAgentRunnerCallLog{}, result: SourceAgentUpgradeResult{State: SourceAgentCommandInstalling}},
+			wantCode: SourceAgentCommandCodeUpgradeFailed,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log}
+			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{&test.command, nil}}
+			if diagnoser, ok := test.diagnoser.(*fakeSourceAgentDiagnoser); ok {
+				diagnoser.log = log
+			}
+			if updater, ok := test.updater.(*fakeSourceAgentUpdater); ok {
+				updater.log = log
+			}
+			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, test.diagnoser, test.updater)
+
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if runner.hasCurrentCommand() {
+				if _, err := runner.RunOnce(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if runner.hasCurrentCommand() {
+				t.Fatal("invalid terminal result left command active")
+			}
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatalf("cycle after invalid terminal result: %v", err)
+			}
+			claims, reports := commands.counts()
+			if claims != 2 {
+				t.Fatalf("claim calls=%d, command did not clear", claims)
+			}
+			if len(reports) == 0 {
+				t.Fatal("no command reports")
+			}
+			terminal := reports[len(reports)-1]
+			if terminal.State != SourceAgentCommandFailed || terminal.Code != test.wantCode {
+				t.Fatalf("terminal report=%#v", terminal)
+			}
+		})
+	}
+
+	for _, state := range []string{"", SourceAgentCommandVerified, SourceAgentCommandInstalling, "unknown"} {
+		diagnostic := sourceAgentDiagnosticCommandReports(SourceAgentDiagnosticReport{State: state})
+		if len(diagnostic) != 1 || diagnostic[0].state != SourceAgentCommandFailed || diagnostic[0].code != SourceAgentCommandCodeDiagnosticFailed {
+			t.Fatalf("diagnostic state %q reports=%#v", state, diagnostic)
+		}
+		upgrade := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{State: state})
+		if len(upgrade) != 1 || upgrade[0].state != SourceAgentCommandFailed || upgrade[0].code != SourceAgentCommandCodeUpgradeFailed {
+			t.Fatalf("upgrade state %q reports=%#v", state, upgrade)
+		}
+	}
+	mismatchedDiagnostic := sourceAgentDiagnosticCommandReports(SourceAgentDiagnosticReport{
+		State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticFailed,
+	})
+	if len(mismatchedDiagnostic) != 1 || mismatchedDiagnostic[0].state != SourceAgentCommandFailed || mismatchedDiagnostic[0].code != SourceAgentCommandCodeDiagnosticFailed || mismatchedDiagnostic[0].message != "Diagnostic result was invalid." {
+		t.Fatalf("mismatched diagnostic reports=%#v", mismatchedDiagnostic)
+	}
+	mismatchedUpgrade := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{
+		State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeRollbackComplete, ActualVersion: "2.0.0",
+	})
+	if len(mismatchedUpgrade) != 1 || mismatchedUpgrade[0].state != SourceAgentCommandFailed || mismatchedUpgrade[0].code != SourceAgentCommandCodeUpgradeFailed || mismatchedUpgrade[0].message != "Upgrade result was invalid." {
+		t.Fatalf("mismatched upgrade reports=%#v", mismatchedUpgrade)
+	}
+}
+
 func TestSourceAgentCommandRunnerPropagatesCanceledContextBeforeNetwork(t *testing.T) {
 	log := &sourceAgentRunnerCallLog{}
 	harness := &sourceAgentRunnerHTTPHarness{log: log}
@@ -467,6 +620,59 @@ func TestSourceAgentCommandRunnerPropagatesCanceledContextBeforeNetwork(t *testi
 	}
 	if calls := log.snapshot(); len(calls) != 0 {
 		t.Fatalf("network calls after cancellation=%v", calls)
+	}
+}
+
+func TestSourceAgentCommandRunnerCancelsWhileWaitingForControlGate(t *testing.T) {
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &blockingSourceAgentCommandClient{
+		log: log, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, nil)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := runner.RunOnce(context.Background())
+		firstDone <- err
+	}()
+	select {
+	case <-commands.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first cycle did not acquire the control gate")
+	}
+	heartbeatsBefore, _ := harness.snapshot()
+
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := runner.RunOnce(secondCtx)
+		secondDone <- err
+	}()
+	cancelSecond()
+
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			close(commands.release)
+			<-firstDone
+			t.Fatalf("second RunOnce() error=%v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		close(commands.release)
+		<-firstDone
+		<-secondDone
+		t.Fatal("canceled RunOnce() remained blocked on the control gate")
+	}
+	heartbeatsAfter, _ := harness.snapshot()
+	if len(heartbeatsAfter) != len(heartbeatsBefore) {
+		close(commands.release)
+		<-firstDone
+		t.Fatalf("waiting canceled cycle sent network traffic: before=%d after=%d", len(heartbeatsBefore), len(heartbeatsAfter))
+	}
+	close(commands.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first RunOnce(): %v", err)
 	}
 }
 
@@ -549,6 +755,12 @@ func TestSourceAgentCommandRunnerKeepsClaimedUpgradeWaitingForActiveRun(t *testi
 		t.Fatal("source run did not finish")
 	}
 	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("report waiting upgrade download: %v", err)
+	}
+	if updater.calls.Load() != 0 {
+		t.Fatalf("updater ran before the next heartbeat cycle: %d", updater.calls.Load())
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
 		t.Fatalf("apply waiting upgrade: %v", err)
 	}
 	if updater.calls.Load() != 1 || updater.overlap.Load() {
@@ -599,7 +811,11 @@ func TestSourceAgentRunnerHeartbeatIncludesBoundedLocalMetadataAndCounts(t *test
 		t.Fatal(err)
 	}
 	commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
-	adapter := &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true, Version: "adapter-2"}}
+	adapter := &fakeSourceAdapter{status: SourceCapabilityHealth{
+		Healthy: false, Code: "dependency_unavailable", Version: "adapter-2",
+		LastError:      "cookie=secret raw local capability error",
+		RequiresAction: "article body excerpt requires local operator action",
+	}}
 	runner := newSourceAgentCommandTestRunner(t, harness, outbox, adapter, commands, nil, nil)
 
 	if _, err := runner.RunOnce(context.Background()); err != nil {
@@ -613,14 +829,20 @@ func TestSourceAgentRunnerHeartbeatIncludesBoundedLocalMetadataAndCounts(t *test
 	if heartbeat.WorkerType != "wechat-worker" || heartbeat.Platform != "darwin" || heartbeat.Architecture != "arm64" || heartbeat.Version != "1.0.0" || heartbeat.ProtocolVersion != "2026-08-01" {
 		t.Fatalf("runtime metadata=%#v", heartbeat)
 	}
-	if heartbeat.OutboxPending != 1 || heartbeat.DeadLetterCount != 1 || len(heartbeat.Capabilities) != 1 || heartbeat.CapabilityHealth["fake"].Version != "adapter-2" {
+	capabilityHealth := heartbeat.CapabilityHealth["fake"]
+	if heartbeat.OutboxPending != 1 || heartbeat.DeadLetterCount != 1 || len(heartbeat.Capabilities) != 1 ||
+		capabilityHealth.Healthy || capabilityHealth.Code != "dependency_unavailable" || capabilityHealth.Version != "adapter-2" ||
+		capabilityHealth.LastError != "Capability check failed." || capabilityHealth.RequiresAction != "Operator action is required." {
 		t.Fatalf("health metadata=%#v", heartbeat)
 	}
 	encoded, err := json.Marshal(heartbeat)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, private := range []string{"heartbeat-pending", "heartbeat-dead", sourceAgentOutboxDBName, outbox.DBPath(), "agent-secret", "cookie"} {
+	for _, private := range []string{
+		"heartbeat-pending", "heartbeat-dead", sourceAgentOutboxDBName, outbox.DBPath(), "agent-secret",
+		"cookie=secret", "raw local capability error", "article body excerpt requires local operator action",
+	} {
 		if strings.Contains(string(encoded), private) {
 			t.Fatalf("heartbeat leaked %q: %s", private, encoded)
 		}
