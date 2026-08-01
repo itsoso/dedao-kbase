@@ -871,9 +871,6 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	if colon <= 0 {
 		return "", false
 	}
-	if slashOffset > colon+2 && sourceAgentCommandURIContextTerminated(token[colon+3:slashOffset]) {
-		return "", false
-	}
 	schemeStart := colon - 1
 	for schemeStart >= 0 && isSourceAgentCommandURISchemeCharacter(token[schemeStart]) {
 		schemeStart--
@@ -882,29 +879,101 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	if schemeStart >= colon || !isASCIILetter(token[schemeStart]) {
 		return "", false
 	}
+	wrapper := rune(0)
 	if schemeStart > 0 {
 		previous, _ := utf8.DecodeLastRuneInString(token[:schemeStart])
 		if previous == '/' || previous == '\\' {
 			return "", false
 		}
+		if sourceAgentCommandURIWrapperOpener(previous) {
+			wrapper = previous
+		}
+	}
+	if slashOffset > colon+2 && sourceAgentCommandURIContextTerminated(token[colon+3:slashOffset], wrapper) {
+		return "", false
 	}
 	return token[schemeStart:colon], true
 }
 
-func sourceAgentCommandURIContextTerminated(value string) bool {
+func sourceAgentCommandURIContextTerminated(value string, wrapper rune) bool {
+	depth := 0
+	if wrapper != 0 {
+		depth = 1
+	}
 	for _, character := range value {
-		if unicode.IsSpace(character) || unicode.Is(unicode.Pe, character) || unicode.Is(unicode.Pf, character) {
+		if unicode.IsSpace(character) {
 			return true
 		}
-		switch character {
-		case '>', '"', '\'', '`':
-			return true
+		if depth > 0 {
+			if delta := sourceAgentCommandURIWrapperDepthDelta(wrapper, character); delta != 0 {
+				depth += delta
+				if depth == 0 {
+					return true
+				}
+				continue
+			}
 		}
 		if !isSourceAgentCommandRawURIIRIRune(character) {
 			return true
 		}
 	}
 	return false
+}
+
+func sourceAgentCommandURIWrapperOpener(character rune) bool {
+	switch character {
+	case '(', '[', '{', '<', '"', '\'', '`':
+		return true
+	default:
+		return unicode.Is(unicode.Ps, character) || unicode.Is(unicode.Pi, character)
+	}
+}
+
+func sourceAgentCommandURIWrapperDepthDelta(wrapper, character rune) int {
+	switch wrapper {
+	case '(':
+		return sourceAgentCommandURIExactWrapperDelta(character, '(', ')')
+	case '[':
+		return sourceAgentCommandURIExactWrapperDelta(character, '[', ']')
+	case '{':
+		return sourceAgentCommandURIExactWrapperDelta(character, '{', '}')
+	case '<':
+		return sourceAgentCommandURIExactWrapperDelta(character, '<', '>')
+	case '"', '\'', '`':
+		if character == wrapper {
+			return -1
+		}
+	case 0:
+		return 0
+	default:
+		if unicode.Is(unicode.Ps, wrapper) {
+			if unicode.Is(unicode.Ps, character) {
+				return 1
+			}
+			if unicode.Is(unicode.Pe, character) {
+				return -1
+			}
+		}
+		if unicode.Is(unicode.Pi, wrapper) {
+			if unicode.Is(unicode.Pi, character) {
+				return 1
+			}
+			if unicode.Is(unicode.Pf, character) {
+				return -1
+			}
+		}
+	}
+	return 0
+}
+
+func sourceAgentCommandURIExactWrapperDelta(character, opener, closer rune) int {
+	if character == opener {
+		return 1
+	}
+	if character == closer {
+		return -1
+	}
+	return 0
 }
 
 func isSourceAgentCommandRawURIIRIRune(character rune) bool {
