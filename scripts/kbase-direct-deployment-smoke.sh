@@ -44,6 +44,9 @@ for required in \
   'go test ./...' \
   'go build' \
   'KBASE_BACKUP_DIR' \
+  'rollback_direct_deployment()' \
+  'trap rollback_direct_deployment ERR' \
+  'trap - ERR' \
   'systemctl restart' \
   'KBASE_LOOPBACK_HEALTH_URL' \
   'KBASE_PUBLIC_HEALTH_URL'

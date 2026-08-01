@@ -206,10 +206,17 @@ sudo runuser --user "${KBASE_SERVICE_USER:?}" -- env \
 sha256sum "${KBASE_CANDIDATE_BIN:?}"
 ```
 
-生产切换前为二进制和 Web 目录创建同一批次的备份。候选文件先复制到目标
-文件系统，再直接替换两个目标：
+生产切换前为二进制和 Web 目录创建同一批次的备份。备份和候选都验证完成
+后才安装错误 trap；替换、重启或 loopback 健康检查失败时，trap 会立即恢复
+同一批次的两个目标并以失败状态停止发布：
 
 ```bash
+set -Eeuo pipefail
+test ! -e "${KBASE_BACKUP_DIR:?}"
+test ! -e "${KBASE_BINARY_CANDIDATE_TARGET:?}"
+test ! -e "${KBASE_WEB_CANDIDATE_TARGET:?}"
+test ! -e "${KBASE_WEB_PREVIOUS_TARGET:?}"
+test ! -e "${KBASE_FAILED_WEB_TARGET:?}"
 sudo install -d -o root -g root -m 0700 "${KBASE_BACKUP_DIR:?}"
 sudo install -o root -g root -m 0755 \
   "${KBASE_BINARY_TARGET:?}" \
@@ -223,27 +230,35 @@ sudo install -o root -g root -m 0755 \
 sudo cp -a \
   "${KBASE_REMOTE_SOURCE_DIR:?}/frontend-web" \
   "${KBASE_WEB_CANDIDATE_TARGET:?}"
+test -f "${KBASE_BACKUP_DIR:?}/kbase-server"
+test -d "${KBASE_BACKUP_DIR:?}/frontend-web"
+test -f "${KBASE_BINARY_CANDIDATE_TARGET:?}"
+test -d "${KBASE_WEB_CANDIDATE_TARGET:?}"
+
+rollback_direct_deployment() {
+  status=$?
+  trap - ERR
+  sudo install -o root -g root -m 0755 \
+    "${KBASE_BACKUP_DIR:?}/kbase-server" \
+    "${KBASE_BINARY_TARGET:?}"
+  if test -e "${KBASE_WEB_TARGET:?}"; then
+    sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
+  fi
+  sudo cp -a \
+    "${KBASE_BACKUP_DIR:?}/frontend-web" \
+    "${KBASE_WEB_TARGET:?}"
+  sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
+  curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
+  exit "$status"
+}
+
+trap rollback_direct_deployment ERR
 sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"
 sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_WEB_PREVIOUS_TARGET:?}"
 sudo mv "${KBASE_WEB_CANDIDATE_TARGET:?}" "${KBASE_WEB_TARGET:?}"
 sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
 curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
-```
-
-替换、重启或 loopback 健康检查任一步失败，都必须立即恢复同一批次的两项
-备份并停止发布：
-
-```bash
-sudo install -o root -g root -m 0755 \
-  "${KBASE_BACKUP_DIR:?}/kbase-server" \
-  "${KBASE_BINARY_TARGET:?}"
-sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
-sudo cp -a \
-  "${KBASE_BACKUP_DIR:?}/frontend-web" \
-  "${KBASE_WEB_TARGET:?}"
-sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
-curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
-exit 1
+trap - ERR
 ```
 
 本地健康成功后，再检查公网 revision、静态路由、鉴权边界和服务日志：

@@ -1,8 +1,11 @@
 # KBase Direct Deployment Dossier
 
-**Date:** 2026-07-31  
-**Status:** Delivery in progress  
-**Design:** `docs/plans/2026-07-31-kbase-direct-deployment-design.md`  
+**Date:** 2026-07-31
+
+**Status:** Delivery in progress
+
+**Design:** `docs/plans/2026-07-31-kbase-direct-deployment-design.md`
+
 **Implementation plan:** `docs/plans/2026-07-31-kbase-direct-deployment.md`
 
 ## Outcome
