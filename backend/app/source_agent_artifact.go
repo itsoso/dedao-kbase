@@ -3,7 +3,6 @@ package app
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -78,7 +77,14 @@ type SourceAgentArtifactTarget struct {
 }
 
 type SourceAgentArtifactCatalog struct {
-	root string
+	root            string
+	snapshotSlots   chan struct{}
+	snapshotTempDir string
+	openArtifact    func(string, []string) (*os.File, error)
+}
+
+type sourceAgentArtifactSelection struct {
+	artifact SourceAgentArtifact
 }
 
 type sourceAgentArtifactCatalogDocument struct {
@@ -93,7 +99,11 @@ func NewSourceAgentArtifactCatalog(root string) (*SourceAgentArtifactCatalog, er
 	if err := validateSourceAgentArtifactRoot(root); err != nil {
 		return nil, fmt.Errorf("%w: root is unavailable", ErrSourceAgentArtifactCatalogInvalid)
 	}
-	return &SourceAgentArtifactCatalog{root: root}, nil
+	return &SourceAgentArtifactCatalog{
+		root:          root,
+		snapshotSlots: make(chan struct{}, sourceAgentArtifactSnapshotConcurrency),
+		openArtifact:  openSourceAgentArtifactRelative,
+	}, nil
 }
 
 func (c *SourceAgentArtifactCatalog) List(limit int) ([]SourceAgentArtifactPublic, error) {
@@ -121,15 +131,15 @@ func (c *SourceAgentArtifactCatalog) List(limit int) ([]SourceAgentArtifactPubli
 	return result, nil
 }
 
-func (c *SourceAgentArtifactCatalog) ReadForRollout(id string, target SourceAgentArtifactTarget) (SourceAgentArtifactPublic, []byte, error) {
+func (c *SourceAgentArtifactCatalog) selectForRollout(id string, target SourceAgentArtifactTarget) (sourceAgentArtifactSelection, error) {
 	rawID := id
 	id, err := normalizeSourceAgentCommandIdentifier("artifact_id", rawID, true)
 	if err != nil || id != rawID {
-		return SourceAgentArtifactPublic{}, nil, ErrSourceAgentArtifactNotFound
+		return sourceAgentArtifactSelection{}, ErrSourceAgentArtifactNotFound
 	}
 	artifacts, err := c.load()
 	if err != nil {
-		return SourceAgentArtifactPublic{}, nil, err
+		return sourceAgentArtifactSelection{}, err
 	}
 	var selected *SourceAgentArtifact
 	for index := range artifacts {
@@ -139,28 +149,15 @@ func (c *SourceAgentArtifactCatalog) ReadForRollout(id string, target SourceAgen
 		}
 	}
 	if selected == nil {
-		return SourceAgentArtifactPublic{}, nil, ErrSourceAgentArtifactNotFound
+		return sourceAgentArtifactSelection{}, ErrSourceAgentArtifactNotFound
 	}
 	if !selected.AllowedForRollout {
-		return SourceAgentArtifactPublic{}, nil, ErrSourceAgentArtifactNotAllowed
+		return sourceAgentArtifactSelection{}, ErrSourceAgentArtifactNotAllowed
 	}
 	if err := selected.validateTarget(target); err != nil {
-		return SourceAgentArtifactPublic{}, nil, err
+		return sourceAgentArtifactSelection{}, err
 	}
-	file, err := openSourceAgentArtifactRelative(c.root, strings.Split(selected.StorageKey, "/"))
-	if err != nil {
-		return SourceAgentArtifactPublic{}, nil, ErrSourceAgentArtifactIntegrity
-	}
-	defer file.Close()
-	data, err := readBoundedRegularSourceAgentArtifact(file, sourceAgentArtifactMaxBytes)
-	if err != nil || int64(len(data)) != selected.Size {
-		return SourceAgentArtifactPublic{}, nil, ErrSourceAgentArtifactIntegrity
-	}
-	sum := sha256.Sum256(data)
-	if hex.EncodeToString(sum[:]) != selected.SHA256 {
-		return SourceAgentArtifactPublic{}, nil, ErrSourceAgentArtifactIntegrity
-	}
-	return selected.public(), data, nil
+	return sourceAgentArtifactSelection{artifact: *selected}, nil
 }
 
 func (c *SourceAgentArtifactCatalog) load() ([]SourceAgentArtifact, error) {

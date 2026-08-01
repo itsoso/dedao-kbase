@@ -2425,6 +2425,143 @@ func TestKBaseHTTPHandlerSourceAgentArtifactDownloadIsCommandBound(t *testing.T)
 	}
 }
 
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadBoundsConcurrentResponses(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	concrete := handler.(*kbaseHTTPHandler)
+	snapshotTempDir := t.TempDir()
+	concrete.sourceArtifacts.snapshotTempDir = snapshotTempDir
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentIDs := []string{"agent-a", "agent-b", "agent-c"}
+	paths := make([]string, 0, 3)
+	for index, agentID := range agentIDs {
+		command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, agentID, "artifact-worker", fmt.Sprintf("artifact-bounded-%d", index))
+		claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, "/api/source-agent/artifacts/artifact-worker/download?agent_id="+url.QueryEscape(agentID)+"&command_id="+url.QueryEscape(claimed.ID))
+	}
+
+	release := make(chan struct{})
+	start := func(path string) (<-chan struct{}, context.CancelFunc, <-chan struct{}) {
+		ctx, cancel := context.WithCancel(context.Background())
+		entered := make(chan struct{})
+		done := make(chan struct{})
+		writer := &blockingSourceAgentArtifactResponseWriter{
+			header:  make(http.Header),
+			ctx:     ctx,
+			entered: entered,
+			release: release,
+		}
+		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer agent-secret")
+		go func() {
+			defer close(done)
+			handler.ServeHTTP(writer, request)
+		}()
+		return entered, cancel, done
+	}
+
+	firstEntered, cancelFirst, firstDone := start(paths[0])
+	secondEntered, cancelSecond, secondDone := start(paths[1])
+	defer cancelFirst()
+	defer cancelSecond()
+	for index, entered := range []<-chan struct{}{firstEntered, secondEntered} {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatalf("download %d did not enter response", index+1)
+		}
+	}
+
+	thirdEntered, cancelThird, thirdDone := start(paths[2])
+	unexpectedThird := false
+	select {
+	case <-thirdEntered:
+		unexpectedThird = true
+	case <-time.After(time.Second):
+	}
+	cancelThird()
+	select {
+	case <-thirdDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled third download did not return promptly")
+	}
+
+	retryEntered, cancelRetry, retryDone := start(paths[2])
+	defer cancelRetry()
+	unexpectedRetry := false
+	select {
+	case <-retryEntered:
+		unexpectedRetry = true
+	case <-time.After(time.Second):
+	}
+	cancelFirst()
+	select {
+	case <-retryEntered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("active download cancellation did not release a snapshot slot")
+	}
+	cancelRetry()
+	select {
+	case <-retryDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled active retry did not return promptly")
+	}
+	close(release)
+	for index, done := range []<-chan struct{}{firstDone, secondDone} {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("download %d did not finish after release", index+1)
+		}
+	}
+	if unexpectedThird {
+		t.Fatal("third concurrent download entered the response before a slot was released")
+	}
+	if unexpectedRetry {
+		t.Fatal("retried third download entered the response before active cancellation released a slot")
+	}
+	if entries, err := os.ReadDir(snapshotTempDir); err != nil || len(entries) != 0 {
+		t.Fatalf("snapshot temp entries after cancellation = %#v, %v", entries, err)
+	}
+}
+
+type blockingSourceAgentArtifactResponseWriter struct {
+	header      http.Header
+	ctx         context.Context
+	entered     chan<- struct{}
+	release     <-chan struct{}
+	wroteHeader sync.Once
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) WriteHeader(_ int) {
+	w.wroteHeader.Do(func() { close(w.entered) })
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	select {
+	case <-w.release:
+		return len(data), nil
+	case <-w.ctx.Done():
+		return 0, w.ctx.Err()
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentArtifactRolloutGate(t *testing.T) {
 	handler, sourceSync, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
 	credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Artifact Rollout Browser"})

@@ -42,7 +42,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 4541,
+      "line": 4550,
       "authenticated": true
     },
     {
@@ -192,13 +192,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 4655,
+      "line": 4664,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 4657,
+      "line": 4666,
       "authenticated": true
     },
     {
@@ -624,7 +624,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 3847,
+      "line": 3856,
       "authenticated": true
     },
     {
@@ -1554,22 +1554,22 @@
     {
       "name": "SourceAgentArtifact",
       "file": "backend/app/source_agent_artifact.go",
-      "line": 38
+      "line": 37
     },
     {
       "name": "SourceAgentArtifactCatalog",
       "file": "backend/app/source_agent_artifact.go",
-      "line": 80
+      "line": 79
     },
     {
       "name": "SourceAgentArtifactPublic",
       "file": "backend/app/source_agent_artifact.go",
-      "line": 56
+      "line": 55
     },
     {
       "name": "SourceAgentArtifactTarget",
       "file": "backend/app/source_agent_artifact.go",
-      "line": 73
+      "line": 72
     },
     {
       "name": "SourceAgentClient",

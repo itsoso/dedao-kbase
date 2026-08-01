@@ -1,10 +1,12 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,14 +46,90 @@ func TestSourceAgentArtifactCatalogValidatesAndReadsExactBytes(t *testing.T) {
 		}
 	}
 
-	metadata, got, err := catalog.ReadForRollout(artifact.ID, SourceAgentArtifactTarget{
+	metadata, got, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, SourceAgentArtifactTarget{
 		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64", CurrentVersion: "1.0.0",
 	})
 	if err != nil {
-		t.Fatalf("ReadForRollout() error = %v", err)
+		t.Fatalf("snapshot error = %v", err)
 	}
 	if metadata.ID != artifact.ID || metadata.Revision != sourceAgentArtifactTestRevision || string(got) != string(data) {
-		t.Fatalf("ReadForRollout() = %#v, %q", metadata, got)
+		t.Fatalf("snapshot = %#v, %q", metadata, got)
+	}
+}
+
+func TestSourceAgentArtifactCatalogMetadataValidationDoesNotOpenArtifact(t *testing.T) {
+	requireSourceAgentArtifactFilesystem(t)
+	root := t.TempDir()
+	data := []byte("artifact")
+	artifact := validSourceAgentArtifactForTest("artifact-1", "missing/artifact.bin", data)
+	writeSourceAgentArtifactCatalog(t, root, []SourceAgentArtifact{artifact})
+	catalog, err := NewSourceAgentArtifactCatalog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection, err := catalog.selectForRollout(artifact.ID, sourceAgentArtifactTargetForTest())
+	if err != nil {
+		t.Fatalf("selectForRollout() read artifact bytes: %v", err)
+	}
+	if selection.artifact.StorageKey != artifact.StorageKey {
+		t.Fatalf("selection = %#v", selection)
+	}
+	if _, err := catalog.prepareSnapshot(context.Background(), selection); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
+		t.Fatalf("prepareSnapshot() error = %v, want ErrSourceAgentArtifactIntegrity", err)
+	}
+}
+
+func TestSourceAgentArtifactCatalogSnapshotsArtifactOnceAndCleansPrivateTemp(t *testing.T) {
+	requireSourceAgentArtifactFilesystem(t)
+	root := t.TempDir()
+	data := []byte("artifact snapshot bytes")
+	artifact := validSourceAgentArtifactForTest("artifact-1", "artifacts/artifact.bin", data)
+	writeSourceAgentArtifactFixture(t, root, []SourceAgentArtifact{artifact}, map[string][]byte{artifact.StorageKey: data})
+	catalog, err := NewSourceAgentArtifactCatalog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tempDir := t.TempDir()
+	catalog.snapshotTempDir = tempDir
+	originalOpen := catalog.openArtifact
+	openCount := 0
+	catalog.openArtifact = func(root string, parts []string) (*os.File, error) {
+		openCount++
+		return originalOpen(root, parts)
+	}
+	selection, err := catalog.selectForRollout(artifact.ID, sourceAgentArtifactTargetForTest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if openCount != 0 {
+		t.Fatalf("metadata validation opened artifact %d times", openCount)
+	}
+	snapshot, err := catalog.prepareSnapshot(context.Background(), selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if openCount != 1 {
+		t.Fatalf("prepareSnapshot() opened artifact %d times, want 1", openCount)
+	}
+	info, err := snapshot.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("snapshot mode = %#o, want 0600", got)
+	}
+	if entries, err := os.ReadDir(tempDir); err != nil || len(entries) != 0 {
+		t.Fatalf("snapshot temp entries before close = %#v, %v", entries, err)
+	}
+	got, err := io.ReadAll(snapshot.file)
+	if err != nil || string(got) != string(data) {
+		t.Fatalf("snapshot bytes = %q, %v", got, err)
+	}
+	if err := snapshot.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(tempDir); err != nil || len(entries) != 0 {
+		t.Fatalf("snapshot temp entries after close = %#v, %v", entries, err)
 	}
 }
 
@@ -65,14 +143,14 @@ func TestSourceAgentArtifactCatalogReloadsRolloutKillSwitch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := catalog.ReadForRollout(artifact.ID, sourceAgentArtifactTargetForTest()); err != nil {
-		t.Fatalf("initial ReadForRollout() error = %v", err)
+	if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, sourceAgentArtifactTargetForTest()); err != nil {
+		t.Fatalf("initial snapshot error = %v", err)
 	}
 
 	artifact.AllowedForRollout = false
 	writeSourceAgentArtifactCatalog(t, root, []SourceAgentArtifact{artifact})
-	if _, _, err := catalog.ReadForRollout(artifact.ID, sourceAgentArtifactTargetForTest()); !errors.Is(err, ErrSourceAgentArtifactNotAllowed) {
-		t.Fatalf("disabled ReadForRollout() error = %v, want ErrSourceAgentArtifactNotAllowed", err)
+	if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, sourceAgentArtifactTargetForTest()); !errors.Is(err, ErrSourceAgentArtifactNotAllowed) {
+		t.Fatalf("disabled snapshot error = %v, want ErrSourceAgentArtifactNotAllowed", err)
 	}
 	listed, err := catalog.List(0)
 	if err != nil || len(listed) != 1 || listed[0].AllowedForRollout {
@@ -187,8 +265,8 @@ func TestSourceAgentArtifactCatalogRejectsUnsafeFilesAndByteDrift(t *testing.T) 
 		artifact.Size++
 		writeSourceAgentArtifactFixture(t, root, []SourceAgentArtifact{artifact}, map[string][]byte{artifact.StorageKey: data})
 		catalog, _ := NewSourceAgentArtifactCatalog(root)
-		if _, _, err := catalog.ReadForRollout(artifact.ID, target); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
-			t.Fatalf("ReadForRollout() error = %v", err)
+		if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, target); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
+			t.Fatalf("snapshot error = %v", err)
 		}
 	})
 
@@ -198,8 +276,8 @@ func TestSourceAgentArtifactCatalogRejectsUnsafeFilesAndByteDrift(t *testing.T) 
 		artifact.SHA256 = strings.Repeat("0", 64)
 		writeSourceAgentArtifactFixture(t, root, []SourceAgentArtifact{artifact}, map[string][]byte{artifact.StorageKey: data})
 		catalog, _ := NewSourceAgentArtifactCatalog(root)
-		if _, _, err := catalog.ReadForRollout(artifact.ID, target); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
-			t.Fatalf("ReadForRollout() error = %v", err)
+		if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, target); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
+			t.Fatalf("snapshot error = %v", err)
 		}
 	})
 
@@ -217,8 +295,8 @@ func TestSourceAgentArtifactCatalogRejectsUnsafeFilesAndByteDrift(t *testing.T) 
 			t.Fatal(err)
 		}
 		catalog, _ := NewSourceAgentArtifactCatalog(root)
-		if _, _, err := catalog.ReadForRollout(artifact.ID, target); err == nil {
-			t.Fatal("ReadForRollout() followed artifact symlink")
+		if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, target); err == nil {
+			t.Fatal("snapshot followed artifact symlink")
 		}
 	})
 
@@ -233,8 +311,8 @@ func TestSourceAgentArtifactCatalogRejectsUnsafeFilesAndByteDrift(t *testing.T) 
 			t.Fatal(err)
 		}
 		catalog, _ := NewSourceAgentArtifactCatalog(root)
-		if _, _, err := catalog.ReadForRollout(artifact.ID, target); err == nil {
-			t.Fatal("ReadForRollout() followed component symlink")
+		if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, target); err == nil {
+			t.Fatal("snapshot followed component symlink")
 		}
 	})
 
@@ -271,8 +349,8 @@ func TestSourceAgentArtifactCatalogRejectsUnsafeFilesAndByteDrift(t *testing.T) 
 			t.Fatal(err)
 		}
 		catalog, _ := NewSourceAgentArtifactCatalog(root)
-		if _, _, err := catalog.ReadForRollout(artifact.ID, target); err == nil {
-			t.Fatal("ReadForRollout() accepted directory")
+		if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, target); err == nil {
+			t.Fatal("snapshot accepted directory")
 		}
 	})
 }
@@ -292,15 +370,15 @@ func TestSourceAgentArtifactCatalogRejectsIncompatibleTargetAndDisabledRollout(t
 		{WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64", CurrentVersion: "2.0.0"},
 		{WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64", CurrentVersion: "3.0.0"},
 	} {
-		if _, _, err := catalog.ReadForRollout(artifact.ID, target); !errors.Is(err, ErrSourceAgentArtifactIncompatible) {
-			t.Fatalf("ReadForRollout(%#v) error = %v", target, err)
+		if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, target); !errors.Is(err, ErrSourceAgentArtifactIncompatible) {
+			t.Fatalf("snapshot(%#v) error = %v", target, err)
 		}
 	}
 
 	artifact.AllowedForRollout = false
 	writeSourceAgentArtifactCatalog(t, root, []SourceAgentArtifact{artifact})
-	if _, _, err := catalog.ReadForRollout(artifact.ID, sourceAgentArtifactTargetForTest()); !errors.Is(err, ErrSourceAgentArtifactNotAllowed) {
-		t.Fatalf("disabled ReadForRollout() error = %v", err)
+	if _, _, err := readSourceAgentArtifactSnapshotForTest(catalog, artifact.ID, sourceAgentArtifactTargetForTest()); !errors.Is(err, ErrSourceAgentArtifactNotAllowed) {
+		t.Fatalf("disabled snapshot error = %v", err)
 	}
 }
 
@@ -313,7 +391,7 @@ func TestSourceAgentArtifactPackagingSmokeFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata, data, err := catalog.ReadForRollout("smoke-artifact", SourceAgentArtifactTarget{
+	metadata, data, err := readSourceAgentArtifactSnapshotForTest(catalog, "smoke-artifact", SourceAgentArtifactTarget{
 		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64", CurrentVersion: "1.0.0",
 	})
 	if err != nil {
@@ -370,6 +448,23 @@ func writeSourceAgentArtifactCatalog(t testing.TB, root string, artifacts []Sour
 func sha256HexForTest(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func readSourceAgentArtifactSnapshotForTest(catalog *SourceAgentArtifactCatalog, id string, target SourceAgentArtifactTarget) (SourceAgentArtifactPublic, []byte, error) {
+	selection, err := catalog.selectForRollout(id, target)
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	snapshot, err := catalog.prepareSnapshot(context.Background(), selection)
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	defer snapshot.Close()
+	data, err := io.ReadAll(snapshot.file)
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	return selection.artifact.public(), data, nil
 }
 
 func requireSourceAgentArtifactFilesystem(t *testing.T) {

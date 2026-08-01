@@ -5,6 +5,9 @@ package app
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,6 +105,52 @@ func TestSourceAgentArtifactCatalogRejectsFIFOWithoutBlocking(t *testing.T) {
 	})
 }
 
+func TestKBaseHTTPSourceAgentArtifactMetadataGatesDoNotReadFIFO(t *testing.T) {
+	handler, sourceSync, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+	credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Artifact FIFO Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifactRoot := sourceAgentArtifactRootFromHandlerForTest(t, handler)
+	artifactPath := filepath.Join(artifactRoot, "artifacts", "artifact-worker")
+	if err := os.Remove(artifactPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(artifactPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"type":"upgrade","idempotency_key":"fifo-metadata","payload":{"artifact_id":"artifact-worker","expected_current_version":"1.0.0"},"expires_at":"` + clock.Now().Add(time.Hour).Format(time.RFC3339Nano) + `"}`
+	request := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+	addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("metadata-only create status=%d body=%s", response.Code, response.Body.String())
+	}
+	commands, err := sourceSync.ListSourceAgentCommands("agent-a", 0)
+	if err != nil || len(commands) != 1 {
+		t.Fatalf("commands=%#v err=%v", commands, err)
+	}
+	claimed, err := sourceSync.ClaimSourceAgentCommand(commands[0].ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	downloadPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	download := requestKBase(handler, http.MethodGet, downloadPath, "agent-secret")
+	if download.Code != http.StatusConflict {
+		t.Fatalf("FIFO download status=%d body=%s", download.Code, download.Body.String())
+	}
+
+	commandPath := "/api/source-agent/commands/" + url.PathEscape(claimed.ID) + "/progress"
+	for _, state := range []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling} {
+		progress := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-a","state":"`+state+`"}`)
+		if progress.Code != http.StatusOK {
+			t.Fatalf("metadata-only progress %s status=%d body=%s", state, progress.Code, progress.Body.String())
+		}
+	}
+}
+
 func TestSourceAgentArtifactFIFOHelper(t *testing.T) {
 	if os.Getenv(sourceAgentArtifactFIFOHelperEnv) != "1" {
 		return
@@ -117,8 +166,12 @@ func TestSourceAgentArtifactFIFOHelper(t *testing.T) {
 			t.Fatalf("List() FIFO error = %v, want ErrSourceAgentArtifactCatalogInvalid", err)
 		}
 	case "artifact":
-		if _, _, err := catalog.ReadForRollout("artifact-1", sourceAgentArtifactTargetForTest()); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
-			t.Fatalf("ReadForRollout() FIFO error = %v, want ErrSourceAgentArtifactIntegrity", err)
+		selection, err := catalog.selectForRollout("artifact-1", sourceAgentArtifactTargetForTest())
+		if err != nil {
+			t.Fatalf("selectForRollout() FIFO error = %v", err)
+		}
+		if _, err := catalog.prepareSnapshot(context.Background(), selection); !errors.Is(err, ErrSourceAgentArtifactIntegrity) {
+			t.Fatalf("prepareSnapshot() FIFO error = %v, want ErrSourceAgentArtifactIntegrity", err)
 		}
 	default:
 		t.Fatal("unknown FIFO helper mode")

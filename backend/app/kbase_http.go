@@ -3630,7 +3630,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 		return
 	}
 	if payload.State == SourceAgentCommandInstalling {
-		if _, _, err := h.validateSourceAgentArtifactCommand(commandID, payload.AgentID, SourceAgentCommandVerified); err != nil {
+		if _, _, _, err := h.validateSourceAgentArtifactCommand(commandID, payload.AgentID, SourceAgentCommandVerified); err != nil {
 			h.writeSourceAgentArtifactWorkerError(w, err)
 			return
 		}
@@ -3688,7 +3688,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWrit
 		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
 		return
 	}
-	command, agent, err := h.validateSourceAgentArtifactCommand(commandID, agentID,
+	command, _, selection, err := h.validateSourceAgentArtifactCommand(commandID, agentID,
 		SourceAgentCommandClaimed, SourceAgentCommandDownloading)
 	if err != nil {
 		h.writeSourceAgentArtifactWorkerError(w, err)
@@ -3698,17 +3698,25 @@ func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWrit
 		h.writeSourceAgentArtifactWorkerError(w, ErrSourceAgentCommandTarget)
 		return
 	}
-	metadata, data, err := h.sourceArtifacts.ReadForRollout(artifactID, sourceAgentArtifactTargetFromAgent(agent))
+	snapshot, err := h.sourceArtifacts.prepareSnapshot(r.Context(), selection)
 	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
 		h.writeSourceAgentArtifactWorkerError(w, err)
 		return
 	}
+	defer snapshot.Close()
+	metadata := selection.artifact.public()
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
 	w.Header().Set("X-Source-Agent-Artifact-SHA256", metadata.SHA256)
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	written, err := copySourceAgentArtifactWithContext(r.Context(), w, snapshot.file)
+	if err != nil || written != metadata.Size {
+		return
+	}
 }
 
 func parseSourceAgentArtifactDownloadPath(r *http.Request) (string, bool, bool) {
@@ -3732,26 +3740,26 @@ func parseSourceAgentArtifactDownloadPath(r *http.Request) (string, bool, bool) 
 	return artifactID, true, false
 }
 
-func (h *kbaseHTTPHandler) validateSourceAgentArtifactCommand(commandID, agentID string, allowedStates ...string) (SourceAgentCommand, SourceAgent, error) {
+func (h *kbaseHTTPHandler) validateSourceAgentArtifactCommand(commandID, agentID string, allowedStates ...string) (SourceAgentCommand, SourceAgent, sourceAgentArtifactSelection, error) {
 	if h.sourceArtifacts == nil {
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentArtifactCatalogInvalid
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentArtifactCatalogInvalid
 	}
 	command, err := h.sourceSync.GetSourceAgentCommand(commandID)
 	if err != nil {
-		return SourceAgentCommand{}, SourceAgent{}, err
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, err
 	}
 	if command.TargetAgentID != agentID {
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandTarget
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentCommandTarget
 	}
 	if !isTerminalSourceAgentCommandState(command.State) && sourceAgentCommandIsExpired(command, h.sourceSync.now().UTC()) {
 		_, expireErr := h.sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
 		if expireErr != nil {
-			return SourceAgentCommand{}, SourceAgent{}, expireErr
+			return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, expireErr
 		}
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandExpired
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentCommandExpired
 	}
 	if command.Type != SourceAgentCommandUpgrade || command.UpgradeSpec == nil {
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandType
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentCommandType
 	}
 	stateAllowed := false
 	for _, allowed := range allowedStates {
@@ -3761,22 +3769,23 @@ func (h *kbaseHTTPHandler) validateSourceAgentArtifactCommand(commandID, agentID
 		}
 	}
 	if !stateAllowed {
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandInvalidState
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentCommandInvalidState
 	}
 	if command.ClaimOwner == "" || command.ClaimOwner != agentID {
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandClaimOwner
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentCommandClaimOwner
 	}
 	agent, err := h.sourceSync.GetSourceAgent(agentID)
 	if err != nil {
-		return SourceAgentCommand{}, SourceAgent{}, err
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, err
 	}
 	if command.ExpectedCurrentVersion == "" || command.ExpectedCurrentVersion != agent.Version {
-		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandVersionConflict
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, ErrSourceAgentCommandVersionConflict
 	}
-	if _, _, err := h.sourceArtifacts.ReadForRollout(command.UpgradeSpec.ArtifactID, sourceAgentArtifactTargetFromAgent(agent)); err != nil {
-		return SourceAgentCommand{}, SourceAgent{}, err
+	selection, err := h.sourceArtifacts.selectForRollout(command.UpgradeSpec.ArtifactID, sourceAgentArtifactTargetFromAgent(agent))
+	if err != nil {
+		return SourceAgentCommand{}, SourceAgent{}, sourceAgentArtifactSelection{}, err
 	}
-	return command, agent, nil
+	return command, agent, selection, nil
 }
 
 func sourceAgentArtifactTargetFromAgent(agent SourceAgent) SourceAgentArtifactTarget {
@@ -4142,7 +4151,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentManagementCommands(w http.ResponseWr
 				h.writeSourceAgentManagementError(w, err)
 				return
 			}
-			if _, _, err := h.sourceArtifacts.ReadForRollout(spec.ArtifactID, sourceAgentArtifactTargetFromAgent(agent)); err != nil {
+			if _, err := h.sourceArtifacts.selectForRollout(spec.ArtifactID, sourceAgentArtifactTargetFromAgent(agent)); err != nil {
 				h.writeSourceAgentManagementError(w, err)
 				return
 			}
