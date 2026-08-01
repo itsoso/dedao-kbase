@@ -339,6 +339,81 @@ func TestSourceAgentClientCommands(t *testing.T) {
 		name string
 		body string
 	}{
+		{name: "missing command key", body: `{}`},
+		{name: "null envelope", body: `null`},
+		{name: "empty command ID", body: `{"command":{"id":"","target_agent_id":"agent-a","type":"diagnose","state":"claimed"}}`},
+		{name: "wrong target", body: `{"command":{"id":"cmd-claim","target_agent_id":"agent-other-secret","type":"diagnose","state":"claimed"}}`},
+		{name: "wrong state", body: `{"command":{"id":"cmd-claim","target_agent_id":"agent-a","type":"diagnose","state":"queued"}}`},
+		{name: "unknown type", body: `{"command":{"id":"cmd-claim","target_agent_id":"agent-a","type":"private-shell","state":"claimed"}}`},
+	} {
+		t.Run("rejects claim response with "+test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, test.body)
+			}))
+			defer server.Close()
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+				StateDir: t.TempDir(), HTTPClient: server.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ClaimCommand(context.Background()); err == nil {
+				t.Fatalf("accepted invalid claim response: %s", test.body)
+			} else {
+				for _, private := range []string{"agent-other-secret", "private-shell", "cmd-claim"} {
+					if strings.Contains(err.Error(), private) {
+						t.Fatalf("claim response error leaked %q: %v", private, err)
+					}
+				}
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "missing command key", body: `{}`},
+		{name: "null envelope", body: `null`},
+		{name: "null command", body: `{"command":null}`},
+		{name: "wrong target", body: `{"command":{"id":"cmd-expected","target_agent_id":"agent-other-secret","type":"upgrade","state":"downloading"}}`},
+		{name: "wrong ID", body: `{"command":{"id":"cmd-other-secret","target_agent_id":"agent-a","type":"upgrade","state":"downloading"}}`},
+		{name: "wrong state", body: `{"command":{"id":"cmd-expected","target_agent_id":"agent-a","type":"upgrade","state":"verified"}}`},
+		{name: "unknown type", body: `{"command":{"id":"cmd-expected","target_agent_id":"agent-a","type":"private-shell","state":"downloading"}}`},
+	} {
+		t.Run("rejects report response with "+test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, test.body)
+			}))
+			defer server.Close()
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+				StateDir: t.TempDir(), HTTPClient: server.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ReportCommand(
+				context.Background(), "cmd-expected", SourceAgentCommandDownloading, "", "", "",
+			); err == nil {
+				t.Fatalf("accepted invalid report response: %s", test.body)
+			} else {
+				for _, private := range []string{"agent-other-secret", "cmd-other-secret", "private-shell"} {
+					if strings.Contains(err.Error(), private) {
+						t.Fatalf("report response error leaked %q: %v", private, err)
+					}
+				}
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
 		{name: "malformed", body: `{"command":`},
 		{name: "trailing", body: `{"command":null}{"secret":"trailing"}`},
 		{name: "oversized", body: `{"command":null,"padding":"` + strings.Repeat("x", (2<<20)+1) + `"}`},

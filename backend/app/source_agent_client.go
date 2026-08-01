@@ -16,6 +16,7 @@ import (
 
 const defaultWCPlusAgentBaseURL = "http://127.0.0.1:5001"
 const sourceAgentClientResponseMaxBytes int64 = 2 << 20
+const invalidSourceAgentCommandResponse = "invalid source agent command response"
 
 type SourceAgentConfig struct {
 	RemoteURL     string
@@ -180,12 +181,26 @@ func (c *SourceAgentClient) ClaimCommand(ctx context.Context) (*SourceAgentComma
 		AgentID string `json:"agent_id"`
 	}{AgentID: c.agentID}
 	var response struct {
-		Command *SourceAgentCommand `json:"command"`
+		Command json.RawMessage `json:"command"`
 	}
 	if err := c.doJSON(ctx, http.MethodPost, "/api/source-agent/commands/claim", payload, &response); err != nil {
 		return nil, err
 	}
-	return response.Command, nil
+	command, err := decodeSourceAgentCommandResponse(response.Command, true)
+	if err != nil {
+		return nil, err
+	}
+	if command == nil {
+		return nil, nil
+	}
+	if !validSourceAgentCommandResponseDomain(*command, c.agentID) || command.State != SourceAgentCommandClaimed {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", command.ID, true)
+	if err != nil || commandID != command.ID {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	return command, nil
 }
 
 func (c *SourceAgentClient) ReportCommand(
@@ -218,13 +233,49 @@ func (c *SourceAgentClient) ReportCommand(
 		ActualVersion: actualVersion,
 	}
 	var response struct {
-		Command SourceAgentCommand `json:"command"`
+		Command json.RawMessage `json:"command"`
 	}
 	requestPath := "/api/source-agent/commands/" + url.PathEscape(commandID) + "/" + action
 	if err := c.doJSON(ctx, http.MethodPost, requestPath, payload, &response); err != nil {
 		return SourceAgentCommand{}, err
 	}
-	return response.Command, nil
+	command, err := decodeSourceAgentCommandResponse(response.Command, false)
+	if err != nil {
+		return SourceAgentCommand{}, err
+	}
+	if !validSourceAgentCommandResponseDomain(*command, c.agentID) || command.ID != commandID || command.State != state {
+		return SourceAgentCommand{}, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	return *command, nil
+}
+
+func decodeSourceAgentCommandResponse(raw json.RawMessage, allowNull bool) (*SourceAgentCommand, error) {
+	if raw == nil {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if bytes.Equal(trimmed, []byte("null")) {
+		if allowNull {
+			return nil, nil
+		}
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	var command SourceAgentCommand
+	if err := json.Unmarshal(trimmed, &command); err != nil {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	return &command, nil
+}
+
+func validSourceAgentCommandResponseDomain(command SourceAgentCommand, expectedAgentID string) bool {
+	targetAgentID, err := normalizeSourceAgentCommandIdentifier("target_agent_id", command.TargetAgentID, true)
+	if err != nil || targetAgentID != command.TargetAgentID || targetAgentID != expectedAgentID {
+		return false
+	}
+	if !isSourceAgentCommandState(command.State) {
+		return false
+	}
+	return command.Type == SourceAgentCommandDiagnose || command.Type == SourceAgentCommandUpgrade
 }
 
 func (c *SourceAgentClient) UploadArticle(ctx context.Context, runID string, envelope SourceArticleEnvelope) (SourceIngestReceipt, error) {
