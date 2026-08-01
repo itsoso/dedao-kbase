@@ -810,7 +810,7 @@ func containsSourceAgentCommandAbsolutePath(value string) bool {
 		boundary := sourceAgentCommandPathTokenBoundary(value, index)
 		nonASCIIBoundary := sourceAgentCommandNonASCIIProseBoundary(value, index)
 		if character == '/' {
-			if scheme, ok := sourceAgentCommandURISchemeAtSlash(value, index); ok {
+			if scheme, ok := sourceAgentCommandURISchemeForTokenSlash(value, index); ok {
 				if strings.EqualFold(scheme, "file") {
 					return true
 				}
@@ -819,7 +819,7 @@ func containsSourceAgentCommandAbsolutePath(value string) bool {
 			if sourceAgentCommandHTTPRouteSlash(value, index) {
 				continue
 			}
-			if boundary || nonASCIIBoundary && sourceAgentCommandASCIIPathSegmentFollows(value, index) {
+			if boundary || nonASCIIBoundary && sourceAgentCommandTokenHasLaterSlash(value, index) {
 				return true
 			}
 		}
@@ -854,33 +854,45 @@ func sourceAgentCommandNonASCIIProseBoundary(value string, index int) bool {
 	return previous >= utf8.RuneSelf
 }
 
-func sourceAgentCommandASCIIPathSegmentFollows(value string, index int) bool {
-	if index+1 >= len(value) {
-		return false
-	}
-	next := value[index+1]
-	return isASCIILetter(next) || next >= '0' && next <= '9' || next == '.' || next == '_' || next == '-'
+func sourceAgentCommandTokenHasLaterSlash(value string, index int) bool {
+	_, end := sourceAgentCommandWhitespaceTokenBounds(value, index)
+	return strings.Contains(value[index+1:end], "/")
 }
 
-func sourceAgentCommandURISchemeAtSlash(value string, index int) (string, bool) {
-	colon := -1
-	if index > 0 && value[index-1] == ':' && index+1 < len(value) && value[index+1] == '/' {
-		colon = index - 1
-	} else if index > 1 && value[index-1] == '/' && value[index-2] == ':' {
-		colon = index - 2
-	}
-	if colon <= 0 {
+func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, bool) {
+	tokenStart, tokenEnd := sourceAgentCommandWhitespaceTokenBounds(value, index)
+	token := value[tokenStart:tokenEnd]
+	slashOffset := index - tokenStart
+	colon := strings.Index(token, "://")
+	if colon <= 0 || colon+1 > slashOffset || !isASCIILetter(token[0]) {
 		return "", false
 	}
-	start := colon - 1
-	for start >= 0 && isSourceAgentCommandURISchemeCharacter(value[start]) {
-		start--
+	for position := 1; position < colon; position++ {
+		if !isSourceAgentCommandURISchemeCharacter(token[position]) {
+			return "", false
+		}
 	}
-	start++
-	if start >= colon || !isASCIILetter(value[start]) {
-		return "", false
+	return token[:colon], true
+}
+
+func sourceAgentCommandWhitespaceTokenBounds(value string, index int) (int, int) {
+	start := index
+	for start > 0 {
+		previous, size := utf8.DecodeLastRuneInString(value[:start])
+		if unicode.IsSpace(previous) {
+			break
+		}
+		start -= size
 	}
-	return value[start:colon], true
+	end := index
+	for end < len(value) {
+		character, size := utf8.DecodeRuneInString(value[end:])
+		if unicode.IsSpace(character) {
+			break
+		}
+		end += size
+	}
+	return start, end
 }
 
 func sourceAgentCommandHTTPRouteSlash(value string, index int) bool {

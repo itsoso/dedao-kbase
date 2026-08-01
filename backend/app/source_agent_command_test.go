@@ -479,6 +479,9 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		"`~/file`",
 		"failure|/Volumes/Data/file",
 		"日志位于/" + "Users/alice/secret.log",
+		"日志位于/用户/爱丽丝/日志",
+		"/用户/爱丽丝",
+		"错误 /用户/爱丽丝",
 		`日志位于D:\Temp\secret.log`,
 		`日志位于\\server\share\secret.log`,
 		"日志位于~/secret.log",
@@ -508,10 +511,14 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 
 	for _, message := range []string{
 		"input/output healthy",
+		"输入/output healthy",
+		"输入/输出 healthy",
 		"version 1/2 complete",
 		"http://example.invalid/status",
 		"https://example.invalid/status",
+		"https://example.test/api/v1",
 		"custom+agent://node/status",
+		"see custom://域名/路径/更多",
 		"ordinary diagnostic text",
 	} {
 		normalized, err := normalizeSourceAgentCommandMessage(message)
