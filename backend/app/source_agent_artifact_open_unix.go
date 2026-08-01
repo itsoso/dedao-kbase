@@ -4,12 +4,13 @@ package app
 
 import (
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
 
 func validateSourceAgentArtifactRoot(root string) error {
-	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(filepath.Clean(root), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return ErrSourceAgentArtifactCatalogInvalid
 	}
@@ -23,7 +24,7 @@ func openSourceAgentArtifactRelative(root string, parts []string) (*os.File, err
 	if len(parts) == 0 {
 		return nil, ErrSourceAgentArtifactIntegrity
 	}
-	current, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	current, err := unix.Open(filepath.Clean(root), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, ErrSourceAgentArtifactIntegrity
 	}
@@ -35,6 +36,8 @@ func openSourceAgentArtifactRelative(root string, parts []string) (*os.File, err
 		flags := unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW
 		if index < len(parts)-1 {
 			flags |= unix.O_DIRECTORY
+		} else {
+			flags |= unix.O_NONBLOCK
 		}
 		next, openErr := unix.Openat(current, part, flags, 0)
 		closeErr := unix.Close(current)
