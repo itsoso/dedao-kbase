@@ -461,6 +461,28 @@ func TestSourceAgentCommandExpiryUsesChronologicalOrder(t *testing.T) {
 	})
 }
 
+func TestSourceAgentCommandRejectsDiagnosticURLs(t *testing.T) {
+	for _, message := range []string{
+		"https://example.test/api/v1",
+		"访问https://example.test/api/v1",
+		"endpoint=https://example.test/api/v1",
+		"inspect (URL: https://example.test/api/v1)/tmp",
+		"inspect [endpoint: https://example.test/api/v1]/tmp",
+		"https://[::1]/api/v1",
+		"https://[2001:db8::1]/api/v1?x=(one)",
+		"https://example.test/api?x=1&y=2/next",
+		"https://example.test/api/%7C/value",
+		"custom://域名/路径",
+		"custom+agent://node/status",
+		"file:///tmp/secret.log",
+		"path=file://localhost/" + "Users/alice/secret.log",
+	} {
+		if normalized, err := normalizeSourceAgentCommandMessage(message); err == nil {
+			t.Errorf("accepted URL-bearing message %q as %q", message, normalized)
+		}
+	}
+}
+
 func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 	for _, message := range []string{
 		"/tmp/source-agent.log",
@@ -485,32 +507,7 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		`日志位于D:\Temp\secret.log`,
 		`日志位于\\server\share\secret.log`,
 		"日志位于~/secret.log",
-		"file://localhost/" + "Users/alice/secret.log",
-		"FILE:///tmp/secret.log",
-		"访问file:///tmp/secret",
-		"path=file://localhost/" + "Users/alice/secret.log",
-		"(FILE:///tmp/secret)",
-		"inspect (https://example.test/api/v1)/tmp/secret",
-		"[https://example.test/api]/" + "Users/alice/secret",
-		"(https://example.test/api?x=(one))/tmp/secret",
-		`inspect "https://example.test/api"/tmp/secret`,
-		"inspect `https://example.test/api`/tmp/secret",
-		"inspect <https://example.test/api>/tmp/secret",
-		"inspect (URL=https://example.test/api)/" + "Users/alice/secret",
-		"inspect [endpoint=https://example.test/api]/" + "Users/alice/secret",
-		"检查（地址=https://example.test/api）/" + "Users/alice/secret",
-		"inspect (URL=https://example.test/api?x=(one))/tmp/secret",
-		"prefix/https://example.test/api/v1",
-		`prefix\https://example.test/api/v1`,
-		"检查（https://example.test/api）/tmp/secret",
-		"检查【custom://域名/路径】/" + "Users/alice/secret",
-		"检查《https://example.test/api》/Volumes/Data/secret",
-		"检查「custom://域名/路径」/home/alice/secret",
-		"检查［https://example.test/api］/private/tmp/secret",
-		"https://example.test/api|/" + "Users/alice/secret",
-		"https://example.test/api\\" + "/" + "Users/alice/secret",
-		"https://example.test/api</" + "Users/alice/secret",
-		"https://example.test/api。/" + "Users/alice/secret",
+		"pseudo:/tmp/secret",
 		"GETTING /api/source-agents guidance",
 		"GET /" + "Users/alice/secret.log",
 		"POST /tmp/secret.log",
@@ -538,22 +535,7 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		"输入/output healthy",
 		"输入/输出 healthy",
 		"version 1/2 complete",
-		"http://example.invalid/status",
-		"https://example.invalid/status",
-		"https://example.test/api/v1",
-		"https://[::1]/api/v1",
-		"https://[2001:db8::1]/api/v1",
-		"https://example.test/api?x=(one)/next",
-		"https://example.test/api?x=1&y=2/next",
-		"https://example.test/api/%7C/value",
-		"URL=https://example.test/api/v1",
-		"prefix(closed)URL=https://example.test/api/v1",
-		"访问https://example.test/api/v1",
-		"endpoint=https://example.test/api/v1",
-		"inspect (https://example.test/api/v1)",
-		`inspect "https://example.test/api/v1"`,
-		"custom+agent://node/status",
-		"see custom://域名/路径/更多",
+		"error: code",
 		"ordinary diagnostic text",
 	} {
 		normalized, err := normalizeSourceAgentCommandMessage(message)

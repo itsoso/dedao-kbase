@@ -798,10 +798,30 @@ func normalizeSourceAgentCommandMessage(value string) (string, error) {
 			return "", fmt.Errorf("message contains control characters")
 		}
 	}
+	// V1 messages are URL-free; the UI builds guidance links from stable result codes.
+	if containsSourceAgentCommandURL(value) {
+		return "", fmt.Errorf("message must not contain a URL")
+	}
 	if containsSourceAgentCommandAbsolutePath(value) {
 		return "", fmt.Errorf("message must not contain a local absolute path")
 	}
 	return value, nil
+}
+
+func containsSourceAgentCommandURL(value string) bool {
+	for colon := 1; colon+2 < len(value); colon++ {
+		if value[colon] != ':' || value[colon+1] != '/' || value[colon+2] != '/' {
+			continue
+		}
+		schemeStart := colon - 1
+		for schemeStart > 0 && isSourceAgentCommandURISchemeCharacter(value[schemeStart-1]) {
+			schemeStart--
+		}
+		if isASCIILetter(value[schemeStart]) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsSourceAgentCommandAbsolutePath(value string) bool {
@@ -810,12 +830,6 @@ func containsSourceAgentCommandAbsolutePath(value string) bool {
 		boundary := sourceAgentCommandPathTokenBoundary(value, index)
 		nonASCIIBoundary := sourceAgentCommandNonASCIIProseBoundary(value, index)
 		if character == '/' {
-			if scheme, ok := sourceAgentCommandURISchemeForTokenSlash(value, index); ok {
-				if strings.EqualFold(scheme, "file") {
-					return true
-				}
-				continue
-			}
 			if sourceAgentCommandHTTPRouteSlash(value, index) {
 				continue
 			}
@@ -855,182 +869,15 @@ func sourceAgentCommandNonASCIIProseBoundary(value string, index int) bool {
 }
 
 func sourceAgentCommandTokenHasLaterSlash(value string, index int) bool {
-	_, end := sourceAgentCommandWhitespaceTokenBounds(value, index)
-	return strings.Contains(value[index+1:end], "/")
-}
-
-func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, bool) {
-	tokenStart, tokenEnd := sourceAgentCommandWhitespaceTokenBounds(value, index)
-	token := value[tokenStart:tokenEnd]
-	slashOffset := index - tokenStart
-	searchEnd := slashOffset + 1
-	if searchEnd < len(token) && token[searchEnd] == '/' {
-		searchEnd++
-	}
-	colon := strings.LastIndex(token[:searchEnd], "://")
-	if colon <= 0 {
-		return "", false
-	}
-	schemeStart := colon - 1
-	for schemeStart >= 0 && isSourceAgentCommandURISchemeCharacter(token[schemeStart]) {
-		schemeStart--
-	}
-	schemeStart++
-	if schemeStart >= colon || !isASCIILetter(token[schemeStart]) {
-		return "", false
-	}
-	if schemeStart > 0 {
-		previous, _ := utf8.DecodeLastRuneInString(token[:schemeStart])
-		if previous == '/' || previous == '\\' {
-			return "", false
-		}
-	}
-	wrapper := sourceAgentCommandActiveURIWrapper(token[:schemeStart])
-	if slashOffset > colon+2 && sourceAgentCommandURIContextTerminated(token[colon+3:slashOffset], wrapper) {
-		return "", false
-	}
-	return token[schemeStart:colon], true
-}
-
-func sourceAgentCommandURIContextTerminated(value string, wrapper rune) bool {
-	depth := 0
-	if wrapper != 0 {
-		depth = 1
-	}
-	for _, character := range value {
+	for _, character := range value[index+1:] {
 		if unicode.IsSpace(character) {
-			return true
+			return false
 		}
-		if depth > 0 {
-			if delta := sourceAgentCommandURIWrapperDepthDelta(wrapper, character); delta != 0 {
-				depth += delta
-				if depth == 0 {
-					return true
-				}
-				continue
-			}
-		}
-		if !isSourceAgentCommandRawURIIRIRune(character) {
+		if character == '/' {
 			return true
 		}
 	}
 	return false
-}
-
-func sourceAgentCommandActiveURIWrapper(value string) rune {
-	stack := make([]rune, 0, 4)
-	for _, character := range value {
-		if len(stack) > 0 {
-			top := stack[len(stack)-1]
-			if sourceAgentCommandURIQuoteWrapper(top) {
-				if character == top {
-					stack = stack[:len(stack)-1]
-				}
-				continue
-			}
-			if sourceAgentCommandURIWrapperDepthDelta(top, character) < 0 {
-				stack = stack[:len(stack)-1]
-				continue
-			}
-		}
-		if sourceAgentCommandURIWrapperOpener(character) {
-			stack = append(stack, character)
-		}
-	}
-	if len(stack) == 0 {
-		return 0
-	}
-	return stack[len(stack)-1]
-}
-
-func sourceAgentCommandURIWrapperOpener(character rune) bool {
-	switch character {
-	case '(', '[', '{', '<', '"', '\'', '`':
-		return true
-	default:
-		return unicode.Is(unicode.Ps, character) || unicode.Is(unicode.Pi, character)
-	}
-}
-
-func sourceAgentCommandURIQuoteWrapper(character rune) bool {
-	return character == '"' || character == '\'' || character == '`'
-}
-
-func sourceAgentCommandURIWrapperDepthDelta(wrapper, character rune) int {
-	switch wrapper {
-	case '(':
-		return sourceAgentCommandURIExactWrapperDelta(character, '(', ')')
-	case '[':
-		return sourceAgentCommandURIExactWrapperDelta(character, '[', ']')
-	case '{':
-		return sourceAgentCommandURIExactWrapperDelta(character, '{', '}')
-	case '<':
-		return sourceAgentCommandURIExactWrapperDelta(character, '<', '>')
-	case '"', '\'', '`':
-		if character == wrapper {
-			return -1
-		}
-	case 0:
-		return 0
-	default:
-		if unicode.Is(unicode.Ps, wrapper) {
-			if unicode.Is(unicode.Ps, character) {
-				return 1
-			}
-			if unicode.Is(unicode.Pe, character) {
-				return -1
-			}
-		}
-		if unicode.Is(unicode.Pi, wrapper) {
-			if unicode.Is(unicode.Pi, character) {
-				return 1
-			}
-			if unicode.Is(unicode.Pf, character) {
-				return -1
-			}
-		}
-	}
-	return 0
-}
-
-func sourceAgentCommandURIExactWrapperDelta(character, opener, closer rune) int {
-	if character == opener {
-		return 1
-	}
-	if character == closer {
-		return -1
-	}
-	return 0
-}
-
-func isSourceAgentCommandRawURIIRIRune(character rune) bool {
-	if character > unicode.MaxASCII {
-		return unicode.IsLetter(character) || unicode.IsNumber(character) || unicode.IsMark(character)
-	}
-	if isASCIILetter(byte(character)) || character >= '0' && character <= '9' {
-		return true
-	}
-	return strings.ContainsRune("-._~:/?#[]@!$&'()*+,;=%", character)
-}
-
-func sourceAgentCommandWhitespaceTokenBounds(value string, index int) (int, int) {
-	start := index
-	for start > 0 {
-		previous, size := utf8.DecodeLastRuneInString(value[:start])
-		if unicode.IsSpace(previous) {
-			break
-		}
-		start -= size
-	}
-	end := index
-	for end < len(value) {
-		character, size := utf8.DecodeRuneInString(value[end:])
-		if unicode.IsSpace(character) {
-			break
-		}
-		end += size
-	}
-	return start, end
 }
 
 func sourceAgentCommandHTTPRouteSlash(value string, index int) bool {
