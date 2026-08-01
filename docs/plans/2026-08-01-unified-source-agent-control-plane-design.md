@@ -217,12 +217,21 @@ record contains:
 - binary and protocol versions;
 - byte size and SHA-256;
 - minimum supported source version;
+- rollout channel and bounded release notes;
 - build-gate result;
 - an explicit allowed-for-rollout flag.
 
 The Web UI cannot submit a download URL. It can only select a compatible,
 approved catalog item. The design intentionally uses exact revision and
 SHA-256 verification without an external signing service.
+
+This is an explicit operator-triggered private deployment mechanism, not an
+unattended desktop auto-update channel. Because the operator declined artifact
+signing, an artifact may never be scheduled, broadcast, or silently applied.
+SHA-256 detects byte drift but is not an independent publisher identity. Each
+worker is updated individually after browser confirmation, and the same
+already-verified artifact is promoted between rollout channels rather than
+rebuilt.
 
 Creating an upgrade command requires an authenticated browser management
 session, CSRF validation, and explicit confirmation. Ordinary machine Bearer
@@ -241,13 +250,15 @@ updater beside each worker. The updater:
 
 1. accepts only a known worker type and command identity;
 2. verifies platform, architecture, version compatibility, size, and SHA-256;
-3. stages and backs up the current binary on the same filesystem;
-4. atomically replaces the worker binary;
-5. asks LaunchAgent to restart the worker;
-6. waits for a local ready receipt containing the expected command and version;
-7. confirms only after the new worker loads configuration and state and sends
+3. rechecks rollout permission and waits for the worker to have no active run;
+4. preserves the state database and outbox, then stages and backs up the
+   current binary on the same filesystem;
+5. atomically replaces the worker binary;
+6. asks LaunchAgent to restart the worker;
+7. waits for a local ready receipt containing the expected command and version;
+8. confirms only after the new worker loads configuration and state and sends
    one authenticated heartbeat;
-8. restores the old binary and restarts it when verification fails or expires.
+9. restores the old binary and restarts it when verification fails or expires.
 
 The updater cannot execute arbitrary commands. Its first installation remains
 a local, explicit installer action so remote control cannot bootstrap a new
@@ -255,8 +266,9 @@ execution surface by itself.
 
 Download failure leaves the current worker running. Hash mismatch quarantines
 the staging file. An unexpected current version rejects the command. A worker
-does not lease source work while upgrading. Token rotation is not an upgrade
-operation.
+does not lease source work while upgrading. Disabling `allowed-for-rollout`
+stops new commands and prevents a claimed command from entering installation.
+Token rotation is not an upgrade operation.
 
 ## Web Product Surface
 
@@ -398,4 +410,3 @@ After this feature passes its delivery Gates:
    deduplication, citation trust, and conflict detection;
 2. design and deliver experience improvements covering initial setup,
    one-action workflows, notifications, and mobile usability.
-
