@@ -879,16 +879,13 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	if schemeStart >= colon || !isASCIILetter(token[schemeStart]) {
 		return "", false
 	}
-	wrapper := rune(0)
 	if schemeStart > 0 {
 		previous, _ := utf8.DecodeLastRuneInString(token[:schemeStart])
 		if previous == '/' || previous == '\\' {
 			return "", false
 		}
-		if sourceAgentCommandURIWrapperOpener(previous) {
-			wrapper = previous
-		}
 	}
+	wrapper := sourceAgentCommandActiveURIWrapper(token[:schemeStart])
 	if slashOffset > colon+2 && sourceAgentCommandURIContextTerminated(token[colon+3:slashOffset], wrapper) {
 		return "", false
 	}
@@ -920,6 +917,32 @@ func sourceAgentCommandURIContextTerminated(value string, wrapper rune) bool {
 	return false
 }
 
+func sourceAgentCommandActiveURIWrapper(value string) rune {
+	stack := make([]rune, 0, 4)
+	for _, character := range value {
+		if len(stack) > 0 {
+			top := stack[len(stack)-1]
+			if sourceAgentCommandURIQuoteWrapper(top) {
+				if character == top {
+					stack = stack[:len(stack)-1]
+				}
+				continue
+			}
+			if sourceAgentCommandURIWrapperDepthDelta(top, character) < 0 {
+				stack = stack[:len(stack)-1]
+				continue
+			}
+		}
+		if sourceAgentCommandURIWrapperOpener(character) {
+			stack = append(stack, character)
+		}
+	}
+	if len(stack) == 0 {
+		return 0
+	}
+	return stack[len(stack)-1]
+}
+
 func sourceAgentCommandURIWrapperOpener(character rune) bool {
 	switch character {
 	case '(', '[', '{', '<', '"', '\'', '`':
@@ -927,6 +950,10 @@ func sourceAgentCommandURIWrapperOpener(character rune) bool {
 	default:
 		return unicode.Is(unicode.Ps, character) || unicode.Is(unicode.Pi, character)
 	}
+}
+
+func sourceAgentCommandURIQuoteWrapper(character rune) bool {
+	return character == '"' || character == '\'' || character == '`'
 }
 
 func sourceAgentCommandURIWrapperDepthDelta(wrapper, character rune) int {
