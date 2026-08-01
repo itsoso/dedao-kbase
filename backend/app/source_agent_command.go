@@ -905,10 +905,30 @@ func sourceAgentCommandHTTPRouteSlash(value string, index int) bool {
 	}
 	switch strings.ToUpper(prefix[methodStart:]) {
 	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE":
-		return true
 	default:
 		return false
 	}
+	routeEnd := len(value)
+	for offset, character := range value[index:] {
+		if unicode.IsSpace(character) {
+			routeEnd = index + offset
+			break
+		}
+	}
+	routePath := value[index:routeEnd]
+	if query := strings.IndexByte(routePath, '?'); query >= 0 {
+		routePath = routePath[:query]
+	}
+	return sourceAgentCommandAllowedControlPlaneRoute(routePath)
+}
+
+func sourceAgentCommandAllowedControlPlaneRoute(routePath string) bool {
+	segments := strings.Split(strings.TrimPrefix(routePath, "/"), "/")
+	if len(segments) == 1 && segments[0] == "health" {
+		return true
+	}
+	return len(segments) >= 2 && segments[0] == "api" &&
+		(segments[1] == "source-agent" || segments[1] == "source-agents")
 }
 
 func isSourceAgentCommandURISchemeCharacter(value byte) bool {

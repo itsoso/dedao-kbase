@@ -485,6 +485,15 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		"file://localhost/" + "Users/alice/secret.log",
 		"FILE:///tmp/secret.log",
 		"GETTING /api/source-agents guidance",
+		"GET /" + "Users/alice/secret.log",
+		"POST /tmp/secret.log",
+		"DELETE /Volumes/Data/secret.log",
+		"HEAD /home/alice/secret.log",
+		"OPTIONS /private/tmp/secret.log",
+		"GET /api/source-agents-evil failed",
+		"GET /api/other failed",
+		"GET /healthcheck failed",
+		"GET /health/details failed",
 	} {
 		if normalized, err := normalizeSourceAgentCommandMessage(message); err == nil {
 			t.Errorf("accepted absolute path message %q as %q", message, normalized)
@@ -520,6 +529,10 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 	}{
 		{name: "get health", message: "GET /health failed"},
 		{name: "get", message: "GET /api/source-agents guidance"},
+		{name: "post agent command", message: "POST /api/source-agents/agent-1/commands failed"},
+		{name: "post claim", message: "POST /api/source-agent/commands/claim failed"},
+		{name: "health query", message: "GET /health?verbose=1 failed"},
+		{name: "agents query", message: "GET /api/source-agents?limit=1 failed"},
 		{name: "post lowercase", message: "post /api/source-agents guidance"},
 		{name: "put", message: "PUT /api/source-agents guidance"},
 		{name: "patch mixed case", message: "PaTcH /api/source-agents guidance"},
