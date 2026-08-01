@@ -478,6 +478,13 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		"`D:\\Temp\\file`",
 		"`~/file`",
 		"failure|/Volumes/Data/file",
+		"日志位于/" + "Users/alice/secret.log",
+		`日志位于D:\Temp\secret.log`,
+		`日志位于\\server\share\secret.log`,
+		"日志位于~/secret.log",
+		"file://localhost/" + "Users/alice/secret.log",
+		"FILE:///tmp/secret.log",
+		"GETTING /api/source-agents guidance",
 	} {
 		if normalized, err := normalizeSourceAgentCommandMessage(message); err == nil {
 			t.Errorf("accepted absolute path message %q as %q", message, normalized)
@@ -493,7 +500,9 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 	for _, message := range []string{
 		"input/output healthy",
 		"version 1/2 complete",
+		"http://example.invalid/status",
 		"https://example.invalid/status",
+		"custom+agent://node/status",
 		"ordinary diagnostic text",
 	} {
 		normalized, err := normalizeSourceAgentCommandMessage(message)
@@ -503,6 +512,30 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		if normalized != message {
 			t.Errorf("normalized ordinary message = %q, want %q", normalized, message)
 		}
+	}
+
+	for _, test := range []struct {
+		name    string
+		message string
+	}{
+		{name: "get health", message: "GET /health failed"},
+		{name: "get", message: "GET /api/source-agents guidance"},
+		{name: "post lowercase", message: "post /api/source-agents guidance"},
+		{name: "put", message: "PUT /api/source-agents guidance"},
+		{name: "patch mixed case", message: "PaTcH /api/source-agents guidance"},
+		{name: "delete", message: "DELETE /api/source-agents guidance"},
+		{name: "head", message: "HEAD /api/source-agents guidance"},
+		{name: "options", message: "OPTIONS /api/source-agents guidance"},
+	} {
+		t.Run("allows HTTP route guidance "+test.name, func(t *testing.T) {
+			normalized, err := normalizeSourceAgentCommandMessage(test.message)
+			if err != nil {
+				t.Fatalf("rejected HTTP route guidance %q: %v", test.message, err)
+			}
+			if normalized != test.message {
+				t.Fatalf("normalized HTTP route guidance = %q, want %q", normalized, test.message)
+			}
+		})
 	}
 }
 
@@ -625,6 +658,121 @@ func TestSourceAgentCommandActiveUpgradeConstraint(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("new upgrade after terminal state: %v", err)
 	}
+}
+
+func TestSourceAgentCommandCreateReleasesExpiredUpgrade(t *testing.T) {
+	t.Run("queued upgrade releases before new create", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-stale-queued", "1.0.0")
+		oldInput := SourceAgentCommandCreate{
+			TargetAgentID:  "agent-stale-queued",
+			Type:           SourceAgentCommandUpgrade,
+			IdempotencyKey: "stale-queued",
+			Payload:        json.RawMessage(`{"artifact_id":"artifact-old","expected_current_version":"1.0.0"}`),
+			ExpiresAt:      clock.Now().Add(time.Minute).Format(time.RFC3339Nano),
+		}
+		oldCommand, err := store.CreateSourceAgentCommand(oldInput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(2 * time.Minute)
+
+		newCommand, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+			TargetAgentID:  "agent-stale-queued",
+			Type:           SourceAgentCommandUpgrade,
+			IdempotencyKey: "replacement-queued",
+			Payload:        json.RawMessage(`{"artifact_id":"artifact-new","expected_current_version":"1.0.0"}`),
+			ExpiresAt:      clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Fatalf("create replacement upgrade: %v", err)
+		}
+		if newCommand.ID == oldCommand.ID || newCommand.State != SourceAgentCommandQueued {
+			t.Fatalf("replacement command = %#v", newCommand)
+		}
+		expired, err := store.GetSourceAgentCommand(oldCommand.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if expired.State != SourceAgentCommandExpired {
+			t.Fatalf("old command state = %q, want %q", expired.State, SourceAgentCommandExpired)
+		}
+		assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, oldCommand.ID),
+			SourceAgentCommandQueued, SourceAgentCommandExpired)
+	})
+
+	t.Run("claimed upgrade expires before idempotent replay", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-stale-claimed", "1.0.0")
+		oldInput := SourceAgentCommandCreate{
+			TargetAgentID:  "agent-stale-claimed",
+			Type:           SourceAgentCommandUpgrade,
+			IdempotencyKey: "stale-claimed",
+			Payload:        json.RawMessage(`{"artifact_id":"artifact-old","expected_current_version":"1.0.0"}`),
+			ExpiresAt:      clock.Now().Add(time.Minute).Format(time.RFC3339Nano),
+		}
+		oldCommand, err := store.CreateSourceAgentCommand(oldInput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimSourceAgentCommand(oldCommand.ID, "agent-stale-claimed", "process-stale"); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(2 * time.Minute)
+
+		replayed, err := store.CreateSourceAgentCommand(oldInput)
+		if err != nil {
+			t.Fatalf("replay expired command: %v", err)
+		}
+		if replayed.ID != oldCommand.ID || replayed.State != SourceAgentCommandExpired {
+			t.Fatalf("replayed command = %#v, want expired %q", replayed, oldCommand.ID)
+		}
+		replayedAgain, err := store.CreateSourceAgentCommand(oldInput)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if replayedAgain.ID != oldCommand.ID || replayedAgain.State != SourceAgentCommandExpired {
+			t.Fatalf("second replay = %#v", replayedAgain)
+		}
+		assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, oldCommand.ID),
+			SourceAgentCommandQueued, SourceAgentCommandClaimed, SourceAgentCommandExpired)
+
+		if _, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+			TargetAgentID:  "agent-stale-claimed",
+			Type:           SourceAgentCommandUpgrade,
+			IdempotencyKey: "replacement-claimed",
+			Payload:        json.RawMessage(`{"artifact_id":"artifact-new","expected_current_version":"1.0.0"}`),
+			ExpiresAt:      clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		}); err != nil {
+			t.Fatalf("create after claimed expiry: %v", err)
+		}
+	})
+
+	t.Run("failed create rolls back expiry materialization", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-stale-rollback", "1.0.0")
+		oldCommand := mustCreateSourceAgentUpgradeCommand(t, store, clock, "agent-stale-rollback", "artifact-old", "stale-rollback")
+		clock.Advance(2 * time.Hour)
+
+		_, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+			TargetAgentID:  "agent-stale-rollback",
+			Type:           SourceAgentCommandUpgrade,
+			IdempotencyKey: "replacement-version-conflict",
+			Payload:        json.RawMessage(`{"artifact_id":"artifact-new","expected_current_version":"0.9.0"}`),
+			ExpiresAt:      clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		})
+		if !errors.Is(err, ErrSourceAgentCommandVersionConflict) {
+			t.Fatalf("replacement error = %v, want version conflict", err)
+		}
+		persisted, err := store.GetSourceAgentCommand(oldCommand.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != SourceAgentCommandQueued {
+			t.Fatalf("rolled back command state = %q, want %q", persisted.State, SourceAgentCommandQueued)
+		}
+		assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, oldCommand.ID), SourceAgentCommandQueued)
+	})
 }
 
 func TestSourceAgentCommandConcurrentClaims(t *testing.T) {

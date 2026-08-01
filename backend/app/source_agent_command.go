@@ -228,6 +228,7 @@ func migrateSourceAgentCommandDB(db *sql.DB) error {
 
 func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreate) (SourceAgentCommand, error) {
 	operationNow := s.now().UTC()
+	now := formatSourceAgentCommandTime(operationNow)
 	normalized, specJSON, spec, err := normalizeSourceAgentCommandCreate(input, operationNow)
 	if err != nil {
 		return SourceAgentCommand{}, err
@@ -237,6 +238,9 @@ func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreat
 		return SourceAgentCommand{}, err
 	}
 	defer tx.Rollback()
+	if err := expireDueSourceAgentCommandsTx(tx, normalized.TargetAgentID, now); err != nil {
+		return SourceAgentCommand{}, err
+	}
 
 	var existingID, existingType, existingSpec, existingExpiry string
 	err = tx.QueryRow(`
@@ -258,6 +262,9 @@ func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreat
 	if !errors.Is(err, sql.ErrNoRows) {
 		return SourceAgentCommand{}, err
 	}
+	if err := validateNewSourceAgentCommandExpiry(normalized.ExpiresAt, operationNow); err != nil {
+		return SourceAgentCommand{}, err
+	}
 
 	var agentVersion string
 	if err := tx.QueryRow(`SELECT version FROM source_agents WHERE agent_id = ?`, normalized.TargetAgentID).Scan(&agentVersion); errors.Is(err, sql.ErrNoRows) {
@@ -273,7 +280,6 @@ func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreat
 		}
 	}
 
-	now := formatSourceAgentCommandTime(operationNow)
 	id := newSourceSyncID("cmd", operationNow)
 	_, err = tx.Exec(`
 		INSERT INTO source_agent_commands (
@@ -761,13 +767,21 @@ func normalizeSourceAgentCommandExpiry(value string, now time.Time) (string, err
 	}
 	expiresAt = expiresAt.UTC()
 	now = now.UTC()
-	if !expiresAt.After(now) {
-		return "", fmt.Errorf("expires_at must be in the future")
-	}
 	if expiresAt.Sub(now) > sourceAgentCommandMaxTTL {
 		return "", fmt.Errorf("expires_at exceeds maximum TTL of %s", sourceAgentCommandMaxTTL)
 	}
 	return formatSourceAgentCommandTime(expiresAt), nil
+}
+
+func validateNewSourceAgentCommandExpiry(value string, now time.Time) error {
+	expiresAt, err := time.Parse(sourceAgentCommandTimestampLayout, value)
+	if err != nil {
+		return fmt.Errorf("expires_at must be RFC3339: %w", err)
+	}
+	if !expiresAt.After(now.UTC()) {
+		return fmt.Errorf("expires_at must be in the future")
+	}
+	return nil
 }
 
 func formatSourceAgentCommandTime(value time.Time) string {
@@ -792,24 +806,32 @@ func normalizeSourceAgentCommandMessage(value string) (string, error) {
 
 func containsSourceAgentCommandAbsolutePath(value string) bool {
 	for index := 0; index < len(value); index++ {
-		if !sourceAgentCommandPathTokenBoundary(value, index) {
-			continue
-		}
 		character := value[index]
+		boundary := sourceAgentCommandPathTokenBoundary(value, index)
+		nonASCIIBoundary := sourceAgentCommandNonASCIIProseBoundary(value, index)
 		if character == '/' {
-			if sourceAgentCommandURISchemeSlash(value, index) {
+			if scheme, ok := sourceAgentCommandURISchemeAtSlash(value, index); ok {
+				if strings.EqualFold(scheme, "file") {
+					return true
+				}
 				continue
 			}
+			if sourceAgentCommandHTTPRouteSlash(value, index) {
+				continue
+			}
+			if boundary || nonASCIIBoundary && sourceAgentCommandASCIIPathSegmentFollows(value, index) {
+				return true
+			}
+		}
+		if character == '~' && (boundary || nonASCIIBoundary) && index+1 < len(value) &&
+			(value[index+1] == '/' || value[index+1] == '\\') {
 			return true
 		}
-		if character == '~' && index+1 < len(value) && (value[index+1] == '/' || value[index+1] == '\\') {
-			return true
-		}
-		if isASCIILetter(character) && index+2 < len(value) && value[index+1] == ':' &&
+		if (boundary || nonASCIIBoundary) && isASCIILetter(character) && index+2 < len(value) && value[index+1] == ':' &&
 			(value[index+2] == '/' || value[index+2] == '\\') {
 			return true
 		}
-		if character == '\\' && index+1 < len(value) && value[index+1] == '\\' {
+		if character == '\\' && (boundary || nonASCIIBoundary) && index+1 < len(value) && value[index+1] == '\\' {
 			return true
 		}
 	}
@@ -824,7 +846,23 @@ func sourceAgentCommandPathTokenBoundary(value string, index int) bool {
 	return !unicode.IsLetter(previous) && !unicode.IsDigit(previous) && previous != '_'
 }
 
-func sourceAgentCommandURISchemeSlash(value string, index int) bool {
+func sourceAgentCommandNonASCIIProseBoundary(value string, index int) bool {
+	if index == 0 {
+		return false
+	}
+	previous, _ := utf8.DecodeLastRuneInString(value[:index])
+	return previous >= utf8.RuneSelf
+}
+
+func sourceAgentCommandASCIIPathSegmentFollows(value string, index int) bool {
+	if index+1 >= len(value) {
+		return false
+	}
+	next := value[index+1]
+	return isASCIILetter(next) || next >= '0' && next <= '9' || next == '.' || next == '_' || next == '-'
+}
+
+func sourceAgentCommandURISchemeAtSlash(value string, index int) (string, bool) {
 	colon := -1
 	if index > 0 && value[index-1] == ':' && index+1 < len(value) && value[index+1] == '/' {
 		colon = index - 1
@@ -832,14 +870,45 @@ func sourceAgentCommandURISchemeSlash(value string, index int) bool {
 		colon = index - 2
 	}
 	if colon <= 0 {
-		return false
+		return "", false
 	}
 	start := colon - 1
 	for start >= 0 && isSourceAgentCommandURISchemeCharacter(value[start]) {
 		start--
 	}
 	start++
-	return start < colon && isASCIILetter(value[start])
+	if start >= colon || !isASCIILetter(value[start]) {
+		return "", false
+	}
+	return value[start:colon], true
+}
+
+func sourceAgentCommandHTTPRouteSlash(value string, index int) bool {
+	if index == 0 {
+		return false
+	}
+	separator, _ := utf8.DecodeLastRuneInString(value[:index])
+	if !unicode.IsSpace(separator) {
+		return false
+	}
+	prefix := strings.TrimSpace(value[:index])
+	if prefix == "" {
+		return false
+	}
+	methodStart := len(prefix)
+	for methodStart > 0 {
+		previous, size := utf8.DecodeLastRuneInString(prefix[:methodStart])
+		if unicode.IsSpace(previous) {
+			break
+		}
+		methodStart -= size
+	}
+	switch strings.ToUpper(prefix[methodStart:]) {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSourceAgentCommandURISchemeCharacter(value byte) bool {
