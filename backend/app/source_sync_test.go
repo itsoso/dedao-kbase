@@ -73,6 +73,61 @@ func TestSourceAgentCapabilityHealthMigratesLegacyDatabase(t *testing.T) {
 	}
 }
 
+func TestSourceAgentRegistryMigration(t *testing.T) {
+	root := t.TempDir()
+	db, err := sql.Open("sqlite3", filepath.Join(root, sourceSyncDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE source_agents (
+		agent_id TEXT PRIMARY KEY, version TEXT NOT NULL DEFAULT '', capabilities_json TEXT NOT NULL DEFAULT '[]',
+		wcplus_healthy INTEGER NOT NULL DEFAULT 0, wcplus_version TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '',
+		last_heartbeat_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+		capability_health_json TEXT NOT NULL DEFAULT '{}')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO source_agents (
+		agent_id, version, capabilities_json, wcplus_healthy, wcplus_version, last_error,
+		last_heartbeat_at, created_at, updated_at, capability_health_json
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"legacy-agent", "1.2.3", `["sync_content"]`, 1, "4.2.0", "",
+		"2026-07-31T12:00:00Z", "2026-07-31T11:00:00Z", "2026-07-31T12:00:00Z",
+		`{"wcplus":{"healthy":true,"version":"4.2.0"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatalf("migrate legacy store: %v", err)
+	}
+	defer store.Close()
+	agents, err := store.ListAgents()
+	if err != nil {
+		t.Fatalf("list migrated agents: %v", err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("migrated agents=%#v", agents)
+	}
+	agent := agents[0]
+	if agent.AgentID != "legacy-agent" || agent.Version != "1.2.3" || !agent.WCPlusHealthy {
+		t.Fatalf("legacy fields changed: %#v", agent)
+	}
+	if agent.WorkerType != "legacy" || agent.Platform != "" || agent.Architecture != "" || agent.ProtocolVersion != "" {
+		t.Fatalf("unsafe runtime defaults: %#v", agent)
+	}
+	if agent.DesiredState != SourceAgentDesiredActive || agent.CurrentRunID != "" || agent.CurrentCommandID != "" {
+		t.Fatalf("unsafe control defaults: %#v", agent)
+	}
+	if agent.OutboxPending != 0 || agent.DeadLetterCount != 0 || agent.LastSuccessAt != "" {
+		t.Fatalf("unsafe delivery defaults: %#v", agent)
+	}
+}
+
 func TestSourceAgentCapabilityHealthRoundTripAndBoundsDiagnostics(t *testing.T) {
 	store, err := NewSourceSyncStore(t.TempDir())
 	if err != nil {
