@@ -890,7 +890,7 @@
     {
       "name": "discover_articles",
       "file": "backend/app/source_sync.go",
-      "line": 672
+      "line": 676
     },
     {
       "name": "discover_articles",
@@ -905,7 +905,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/source_sync.go",
-      "line": 659
+      "line": 663
     },
     {
       "name": "existing_articles",
@@ -925,7 +925,7 @@
     {
       "name": "sync_articles",
       "file": "backend/app/source_sync.go",
-      "line": 657
+      "line": 661
     },
     {
       "name": "sync_articles",
@@ -955,7 +955,7 @@
     {
       "name": "sync_media",
       "file": "backend/app/source_sync.go",
-      "line": 672
+      "line": 676
     },
     {
       "name": "sync_media",
@@ -1515,6 +1515,26 @@
       "line": 112
     },
     {
+      "name": "SourceAgentCommand",
+      "file": "backend/app/source_agent_command.go",
+      "line": 143
+    },
+    {
+      "name": "SourceAgentCommandCreate",
+      "file": "backend/app/source_agent_command.go",
+      "line": 128
+    },
+    {
+      "name": "SourceAgentCommandEvent",
+      "file": "backend/app/source_agent_command.go",
+      "line": 162
+    },
+    {
+      "name": "SourceAgentCommandTransition",
+      "file": "backend/app/source_agent_command.go",
+      "line": 136
+    },
+    {
       "name": "SourceAgentConfig",
       "file": "backend/app/source_agent_client.go",
       "line": 19
@@ -1553,6 +1573,11 @@
       "name": "SourceAgentRunnerConfig",
       "file": "backend/app/source_agent_runner.go",
       "line": 14
+    },
+    {
+      "name": "SourceAgentUpgradeSpec",
+      "file": "backend/app/source_agent_command.go",
+      "line": 123
     },
     {
       "name": "SourceArticleEnvelope",

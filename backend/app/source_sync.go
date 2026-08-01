@@ -216,6 +216,10 @@ func newSourceSyncStore(root string, now func() time.Time) (*SourceSyncStore, er
 		db.Close()
 		return nil, err
 	}
+	if err := migrateSourceAgentCommandDB(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &SourceSyncStore{dbPath: dbPath, now: now, db: db}, nil
 }
 
