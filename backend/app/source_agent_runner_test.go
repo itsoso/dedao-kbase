@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,29 @@ func TestSourceAgentRunnerUsesAdapterContract(t *testing.T) {
 	var _ SourceEnvelopeSink = (*SourceAgentOutbox)(nil)
 }
 
+func TestSourceAgentRunnerDefaultsLocalRuntimeMetadataCompatibly(t *testing.T) {
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: "http://127.0.0.1:1", AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, Outbox: outbox, Adapter: &fakeSourceAdapter{}, Version: "1.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runner.workerType != "fake" || runner.platform != runtime.GOOS || runner.architecture != runtime.GOARCH || runner.protocolVersion != defaultSourceAgentProtocolVersion {
+		t.Fatalf("runner metadata=%q/%q/%q protocol=%q", runner.workerType, runner.platform, runner.architecture, runner.protocolVersion)
+	}
+}
+
 func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 	var failedCursor string
 	var leaseSeconds int
@@ -59,6 +83,8 @@ func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/source-agent/heartbeat":
 			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a"}}`)
+		case "/api/source-agent/commands/claim":
+			fmt.Fprint(w, `{"command":null}`)
 		case "/api/source-agent/lease":
 			var payload struct {
 				LeaseSeconds int `json:"lease_seconds"`
@@ -146,6 +172,8 @@ func TestSourceAgentRunnerReportsAdapterItemFailuresBeforeCompletion(t *testing.
 		switch r.URL.Path {
 		case "/api/source-agent/heartbeat":
 			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a"}}`)
+		case "/api/source-agent/commands/claim":
+			fmt.Fprint(w, `{"command":null}`)
 		case "/api/source-agent/lease":
 			fmt.Fprint(w, `{"run":{"id":"run-partial","status":"running","requested_operation":"sync_fake","subscription":{"id":"sub-1","source_account_key":"account-key","source_account":"Account"}}}`)
 		case "/api/source-agent/runs/run-partial/items":
@@ -208,6 +236,8 @@ func TestSourceAgentRunnerDrainsOutboxLargerThanUploadPage(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/source-agent/heartbeat":
 			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a"}}`)
+		case "/api/source-agent/commands/claim":
+			fmt.Fprint(w, `{"command":null}`)
 		case "/api/source-agent/lease":
 			fmt.Fprint(w, `{"run":{"id":"run-bulk","status":"running","requested_operation":"sync_fake","subscription":{"id":"sub-1","source_account_key":"account-key","source_account":"Account"}}}`)
 		case "/api/source-agent/runs/run-bulk/items":

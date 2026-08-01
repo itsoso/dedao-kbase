@@ -1604,7 +1604,12 @@
     {
       "name": "SourceAgentCycleResult",
       "file": "backend/app/source_agent_runner.go",
-      "line": 30
+      "line": 60
+    },
+    {
+      "name": "SourceAgentDiagnosticReport",
+      "file": "backend/app/source_agent_command_runner.go",
+      "line": 21
     },
     {
       "name": "SourceAgentHTTPError",
@@ -1629,12 +1634,17 @@
     {
       "name": "SourceAgentRunner",
       "file": "backend/app/source_agent_runner.go",
-      "line": 22
+      "line": 32
     },
     {
       "name": "SourceAgentRunnerConfig",
       "file": "backend/app/source_agent_runner.go",
-      "line": 14
+      "line": 17
+    },
+    {
+      "name": "SourceAgentUpgradeResult",
+      "file": "backend/app/source_agent_command_runner.go",
+      "line": 27
     },
     {
       "name": "SourceAgentUpgradeSpec",
@@ -2015,6 +2025,11 @@
       "name": "sourceAgentDoctorReport",
       "file": "cmd/source-agent/main.go",
       "line": 112
+    },
+    {
+      "name": "sourceAgentPendingCommandReport",
+      "file": "backend/app/source_agent_command_runner.go",
+      "line": 34
     },
     {
       "name": "timedReleaseRecord",

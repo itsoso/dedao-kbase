@@ -213,6 +213,20 @@ func (o *SourceAgentOutbox) CountPendingForRun(runID string) (int, error) {
 	return count, err
 }
 
+func (o *SourceAgentOutbox) CountPending() (int, error) {
+	return o.countState(SourceOutboxPending)
+}
+
+func (o *SourceAgentOutbox) CountDeadLetters() (int, error) {
+	return o.countState(SourceOutboxDead)
+}
+
+func (o *SourceAgentOutbox) countState(state string) (int, error) {
+	var count int
+	err := o.db.QueryRow(`SELECT COUNT(*) FROM source_agent_outbox WHERE state = ?`, state).Scan(&count)
+	return count, err
+}
+
 func (o *SourceAgentOutbox) Acknowledge(id string) error {
 	result, err := o.db.Exec(`DELETE FROM source_agent_outbox WHERE id = ?`, strings.TrimSpace(id))
 	if err != nil {
