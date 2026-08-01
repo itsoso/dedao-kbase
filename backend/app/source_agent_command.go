@@ -9,6 +9,8 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -225,7 +227,8 @@ func migrateSourceAgentCommandDB(db *sql.DB) error {
 }
 
 func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreate) (SourceAgentCommand, error) {
-	normalized, specJSON, spec, err := normalizeSourceAgentCommandCreate(input, s.now())
+	operationNow := s.now().UTC()
+	normalized, specJSON, spec, err := normalizeSourceAgentCommandCreate(input, operationNow)
 	if err != nil {
 		return SourceAgentCommand{}, err
 	}
@@ -270,8 +273,8 @@ func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreat
 		}
 	}
 
-	now := formatSourceAgentCommandTime(s.now())
-	id := newSourceSyncID("cmd", s.now())
+	now := formatSourceAgentCommandTime(operationNow)
+	id := newSourceSyncID("cmd", operationNow)
 	_, err = tx.Exec(`
 		INSERT INTO source_agent_commands (
 			command_id, target_agent_id, command_type, spec_json, state, idempotency_key,
@@ -342,6 +345,7 @@ func (s *SourceSyncStore) ListSourceAgentCommandEvents(commandID string) ([]Sour
 }
 
 func (s *SourceSyncStore) ClaimNextSourceAgentCommand(agentID, claimOwner string) (*SourceAgentCommand, error) {
+	operationNow := s.now().UTC()
 	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
 	if err != nil {
 		return nil, err
@@ -361,7 +365,7 @@ func (s *SourceSyncStore) ClaimNextSourceAgentCommand(agentID, claimOwner string
 	} else if err != nil {
 		return nil, err
 	}
-	now := formatSourceAgentCommandTime(s.now())
+	now := formatSourceAgentCommandTime(operationNow)
 	if err := expireDueSourceAgentCommandsTx(tx, agentID, now); err != nil {
 		return nil, err
 	}
@@ -392,6 +396,8 @@ func (s *SourceSyncStore) ClaimNextSourceAgentCommand(agentID, claimOwner string
 }
 
 func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner string) (SourceAgentCommand, error) {
+	operationNow := s.now().UTC()
+	now := formatSourceAgentCommandTime(operationNow)
 	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", commandID, true)
 	if err != nil {
 		return SourceAgentCommand{}, err
@@ -422,8 +428,8 @@ func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner
 	if command.State == SourceAgentCommandExpired {
 		return SourceAgentCommand{}, ErrSourceAgentCommandExpired
 	}
-	if sourceAgentCommandIsExpired(command, s.now()) && !isTerminalSourceAgentCommandState(command.State) {
-		if err := expireSourceAgentCommandTx(tx, command, formatSourceAgentCommandTime(s.now())); err != nil {
+	if sourceAgentCommandIsExpired(command, operationNow) && !isTerminalSourceAgentCommandState(command.State) {
+		if err := expireSourceAgentCommandTx(tx, command, now); err != nil {
 			return SourceAgentCommand{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -443,7 +449,7 @@ func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner
 		}
 		return SourceAgentCommand{}, ErrSourceAgentCommandInvalidState
 	}
-	if err := claimSourceAgentCommandTx(tx, command.ID, agentID, claimOwner, formatSourceAgentCommandTime(s.now())); err != nil {
+	if err := claimSourceAgentCommandTx(tx, command.ID, agentID, claimOwner, now); err != nil {
 		return SourceAgentCommand{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -453,6 +459,8 @@ func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner
 }
 
 func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claimOwner string, input SourceAgentCommandTransition) (SourceAgentCommand, error) {
+	operationNow := s.now().UTC()
+	now := formatSourceAgentCommandTime(operationNow)
 	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", commandID, true)
 	if err != nil {
 		return SourceAgentCommand{}, err
@@ -488,8 +496,8 @@ func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claim
 	if command.State == SourceAgentCommandExpired {
 		return SourceAgentCommand{}, ErrSourceAgentCommandExpired
 	}
-	if sourceAgentCommandIsExpired(command, s.now()) && !isTerminalSourceAgentCommandState(command.State) {
-		if err := expireSourceAgentCommandTx(tx, command, formatSourceAgentCommandTime(s.now())); err != nil {
+	if sourceAgentCommandIsExpired(command, operationNow) && !isTerminalSourceAgentCommandState(command.State) {
+		if err := expireSourceAgentCommandTx(tx, command, now); err != nil {
 			return SourceAgentCommand{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -521,7 +529,6 @@ func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claim
 	if err := validateSourceAgentCommandTerminalResult(command.Type, input); err != nil {
 		return SourceAgentCommand{}, err
 	}
-	now := formatSourceAgentCommandTime(s.now())
 	completedAt := ""
 	if isTerminalSourceAgentCommandState(input.State) {
 		completedAt = now
@@ -551,6 +558,8 @@ func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claim
 }
 
 func (s *SourceSyncStore) CancelSourceAgentCommand(commandID, message string) (SourceAgentCommand, error) {
+	operationNow := s.now().UTC()
+	now := formatSourceAgentCommandTime(operationNow)
 	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", commandID, true)
 	if err != nil {
 		return SourceAgentCommand{}, err
@@ -571,8 +580,8 @@ func (s *SourceSyncStore) CancelSourceAgentCommand(commandID, message string) (S
 	if err != nil {
 		return SourceAgentCommand{}, err
 	}
-	if sourceAgentCommandIsExpired(command, s.now()) && !isTerminalSourceAgentCommandState(command.State) {
-		if err := expireSourceAgentCommandTx(tx, command, formatSourceAgentCommandTime(s.now())); err != nil {
+	if sourceAgentCommandIsExpired(command, operationNow) && !isTerminalSourceAgentCommandState(command.State) {
+		if err := expireSourceAgentCommandTx(tx, command, now); err != nil {
 			return SourceAgentCommand{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -595,7 +604,6 @@ func (s *SourceSyncStore) CancelSourceAgentCommand(commandID, message string) (S
 	if !sourceAgentCommandTransitionAllowed(command.Type, command.State, SourceAgentCommandCanceled) {
 		return SourceAgentCommand{}, ErrSourceAgentCommandInvalidState
 	}
-	now := formatSourceAgentCommandTime(s.now())
 	result, err := tx.Exec(`
 		UPDATE source_agent_commands SET state = ?, result_code = ?, message_text = ?, updated_at = ?, completed_at = ?
 		WHERE command_id = ? AND state = ?
@@ -789,7 +797,7 @@ func containsSourceAgentCommandAbsolutePath(value string) bool {
 		}
 		character := value[index]
 		if character == '/' {
-			if index > 0 && value[index-1] == ':' && index+1 < len(value) && value[index+1] == '/' {
+			if sourceAgentCommandURISchemeSlash(value, index) {
 				continue
 			}
 			return true
@@ -812,11 +820,30 @@ func sourceAgentCommandPathTokenBoundary(value string, index int) bool {
 	if index == 0 {
 		return true
 	}
-	previous := value[index-1]
-	if previous == ' ' || previous == '\t' || previous == '\n' || previous == '\r' {
-		return true
+	previous, _ := utf8.DecodeLastRuneInString(value[:index])
+	return !unicode.IsLetter(previous) && !unicode.IsDigit(previous) && previous != '_'
+}
+
+func sourceAgentCommandURISchemeSlash(value string, index int) bool {
+	colon := -1
+	if index > 0 && value[index-1] == ':' && index+1 < len(value) && value[index+1] == '/' {
+		colon = index - 1
+	} else if index > 1 && value[index-1] == '/' && value[index-2] == ':' {
+		colon = index - 2
 	}
-	return strings.ContainsRune(`"'([{<>=,:;`, rune(previous))
+	if colon <= 0 {
+		return false
+	}
+	start := colon - 1
+	for start >= 0 && isSourceAgentCommandURISchemeCharacter(value[start]) {
+		start--
+	}
+	start++
+	return start < colon && isASCIILetter(value[start])
+}
+
+func isSourceAgentCommandURISchemeCharacter(value byte) bool {
+	return isASCIILetter(value) || value >= '0' && value <= '9' || value == '+' || value == '-' || value == '.'
 }
 
 func isASCIILetter(value byte) bool {

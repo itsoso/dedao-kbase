@@ -1517,22 +1517,22 @@
     {
       "name": "SourceAgentCommand",
       "file": "backend/app/source_agent_command.go",
-      "line": 144
+      "line": 146
     },
     {
       "name": "SourceAgentCommandCreate",
       "file": "backend/app/source_agent_command.go",
-      "line": 129
+      "line": 131
     },
     {
       "name": "SourceAgentCommandEvent",
       "file": "backend/app/source_agent_command.go",
-      "line": 163
+      "line": 165
     },
     {
       "name": "SourceAgentCommandTransition",
       "file": "backend/app/source_agent_command.go",
-      "line": 137
+      "line": 139
     },
     {
       "name": "SourceAgentConfig",
@@ -1577,7 +1577,7 @@
     {
       "name": "SourceAgentUpgradeSpec",
       "file": "backend/app/source_agent_command.go",
-      "line": 124
+      "line": 126
     },
     {
       "name": "SourceArticleEnvelope",

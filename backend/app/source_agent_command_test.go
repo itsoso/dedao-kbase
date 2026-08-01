@@ -474,9 +474,19 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 		"path=/tmp/source-agent.log",
 		`path='D:\Temp\file'`,
 		`share=\\server\share\file`,
+		"`/tmp/source-agent.log`",
+		"`D:\\Temp\\file`",
+		"`~/file`",
+		"failure|/Volumes/Data/file",
 	} {
 		if normalized, err := normalizeSourceAgentCommandMessage(message); err == nil {
 			t.Errorf("accepted absolute path message %q as %q", message, normalized)
+		}
+	}
+	for _, boundary := range []string{":", ";", ",", "[", "{", "<"} {
+		message := "failure" + boundary + "/tmp/source-agent.log"
+		if normalized, err := normalizeSourceAgentCommandMessage(message); err == nil {
+			t.Errorf("accepted absolute path after boundary %q as %q", boundary, normalized)
 		}
 	}
 
@@ -494,6 +504,100 @@ func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
 			t.Errorf("normalized ordinary message = %q, want %q", normalized, message)
 		}
 	}
+}
+
+func TestSourceAgentCommandOperationsUseSingleNow(t *testing.T) {
+	t.Run("claim by id", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-linear-claim", "1.0.0")
+		command := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-linear-claim", "linear-claim", time.Hour)
+		expiresAt, err := time.Parse(time.RFC3339Nano, command.ExpiresAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entryNow := expiresAt.Add(-time.Millisecond)
+		sequence := &sourceAgentCommandSequenceClock{values: []time.Time{entryNow, expiresAt.Add(time.Millisecond)}}
+		store.now = sequence.Now
+
+		claimed, err := store.ClaimSourceAgentCommand(command.ID, "agent-linear-claim", "process-linear-claim")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sequence.calls != 1 {
+			t.Fatalf("claim read clock %d times, want 1", sequence.calls)
+		}
+		want := formatSourceAgentCommandTime(entryNow)
+		if claimed.State != SourceAgentCommandClaimed || claimed.ClaimedAt != want || claimed.UpdatedAt != want {
+			t.Fatalf("claimed command timestamps = %#v, want %q", claimed, want)
+		}
+		events := mustListSourceAgentCommandEvents(t, store, command.ID)
+		if got := events[len(events)-1].CreatedAt; got != want {
+			t.Fatalf("claimed event time = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("transition", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-linear-transition", "1.0.0")
+		command := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-linear-transition", "linear-transition", time.Hour)
+		if _, err := store.ClaimSourceAgentCommand(command.ID, "agent-linear-transition", "process-linear-transition"); err != nil {
+			t.Fatal(err)
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, command.ExpiresAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entryNow := expiresAt.Add(-time.Millisecond)
+		sequence := &sourceAgentCommandSequenceClock{values: []time.Time{entryNow, expiresAt.Add(time.Millisecond)}}
+		store.now = sequence.Now
+
+		completed, err := store.TransitionSourceAgentCommand(command.ID, "agent-linear-transition", "process-linear-transition", SourceAgentCommandTransition{
+			State: SourceAgentCommandSucceeded, ResultCode: SourceAgentCommandCodeDiagnosticComplete,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sequence.calls != 1 {
+			t.Fatalf("transition read clock %d times, want 1", sequence.calls)
+		}
+		want := formatSourceAgentCommandTime(entryNow)
+		if completed.State != SourceAgentCommandSucceeded || completed.UpdatedAt != want || completed.CompletedAt != want {
+			t.Fatalf("completed command timestamps = %#v, want %q", completed, want)
+		}
+		events := mustListSourceAgentCommandEvents(t, store, command.ID)
+		if got := events[len(events)-1].CreatedAt; got != want {
+			t.Fatalf("completed event time = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("cancel", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-linear-cancel", "1.0.0")
+		command := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-linear-cancel", "linear-cancel", time.Hour)
+		expiresAt, err := time.Parse(time.RFC3339Nano, command.ExpiresAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entryNow := expiresAt.Add(-time.Millisecond)
+		sequence := &sourceAgentCommandSequenceClock{values: []time.Time{entryNow, expiresAt.Add(time.Millisecond)}}
+		store.now = sequence.Now
+
+		canceled, err := store.CancelSourceAgentCommand(command.ID, "operator canceled")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sequence.calls != 1 {
+			t.Fatalf("cancel read clock %d times, want 1", sequence.calls)
+		}
+		want := formatSourceAgentCommandTime(entryNow)
+		if canceled.State != SourceAgentCommandCanceled || canceled.UpdatedAt != want || canceled.CompletedAt != want {
+			t.Fatalf("canceled command timestamps = %#v, want %q", canceled, want)
+		}
+		events := mustListSourceAgentCommandEvents(t, store, command.ID)
+		if got := events[len(events)-1].CreatedAt; got != want {
+			t.Fatalf("canceled event time = %q, want %q", got, want)
+		}
+	})
 }
 
 func TestSourceAgentCommandActiveUpgradeConstraint(t *testing.T) {
@@ -749,4 +853,18 @@ func assertSourceAgentCommandEventStates(t testing.TB, events []SourceAgentComma
 func withSourceAgentCommandCreate(input SourceAgentCommandCreate, mutate func(*SourceAgentCommandCreate)) SourceAgentCommandCreate {
 	mutate(&input)
 	return input
+}
+
+type sourceAgentCommandSequenceClock struct {
+	values []time.Time
+	calls  int
+}
+
+func (c *sourceAgentCommandSequenceClock) Now() time.Time {
+	index := c.calls
+	c.calls++
+	if index >= len(c.values) {
+		return c.values[len(c.values)-1]
+	}
+	return c.values[index]
 }
