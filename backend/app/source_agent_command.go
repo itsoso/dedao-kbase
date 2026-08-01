@@ -53,6 +53,7 @@ const (
 	sourceAgentCommandMessageMaxRunes = 1000
 	sourceAgentCommandPayloadMaxBytes = 2048
 	sourceAgentCommandMaxTTL          = 7 * 24 * time.Hour
+	sourceAgentCommandTimestampLayout = "2006-01-02T15:04:05.000000000Z"
 )
 
 var (
@@ -269,7 +270,7 @@ func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreat
 		}
 	}
 
-	now := s.timestamp()
+	now := formatSourceAgentCommandTime(s.now())
 	id := newSourceSyncID("cmd", s.now())
 	_, err = tx.Exec(`
 		INSERT INTO source_agent_commands (
@@ -360,7 +361,7 @@ func (s *SourceSyncStore) ClaimNextSourceAgentCommand(agentID, claimOwner string
 	} else if err != nil {
 		return nil, err
 	}
-	now := s.timestamp()
+	now := formatSourceAgentCommandTime(s.now())
 	if err := expireDueSourceAgentCommandsTx(tx, agentID, now); err != nil {
 		return nil, err
 	}
@@ -422,7 +423,7 @@ func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner
 		return SourceAgentCommand{}, ErrSourceAgentCommandExpired
 	}
 	if sourceAgentCommandIsExpired(command, s.now()) && !isTerminalSourceAgentCommandState(command.State) {
-		if err := expireSourceAgentCommandTx(tx, command, s.timestamp()); err != nil {
+		if err := expireSourceAgentCommandTx(tx, command, formatSourceAgentCommandTime(s.now())); err != nil {
 			return SourceAgentCommand{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -442,7 +443,7 @@ func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner
 		}
 		return SourceAgentCommand{}, ErrSourceAgentCommandInvalidState
 	}
-	if err := claimSourceAgentCommandTx(tx, command.ID, agentID, claimOwner, s.timestamp()); err != nil {
+	if err := claimSourceAgentCommandTx(tx, command.ID, agentID, claimOwner, formatSourceAgentCommandTime(s.now())); err != nil {
 		return SourceAgentCommand{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -488,7 +489,7 @@ func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claim
 		return SourceAgentCommand{}, ErrSourceAgentCommandExpired
 	}
 	if sourceAgentCommandIsExpired(command, s.now()) && !isTerminalSourceAgentCommandState(command.State) {
-		if err := expireSourceAgentCommandTx(tx, command, s.timestamp()); err != nil {
+		if err := expireSourceAgentCommandTx(tx, command, formatSourceAgentCommandTime(s.now())); err != nil {
 			return SourceAgentCommand{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -520,7 +521,7 @@ func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claim
 	if err := validateSourceAgentCommandTerminalResult(command.Type, input); err != nil {
 		return SourceAgentCommand{}, err
 	}
-	now := s.timestamp()
+	now := formatSourceAgentCommandTime(s.now())
 	completedAt := ""
 	if isTerminalSourceAgentCommandState(input.State) {
 		completedAt = now
@@ -571,7 +572,7 @@ func (s *SourceSyncStore) CancelSourceAgentCommand(commandID, message string) (S
 		return SourceAgentCommand{}, err
 	}
 	if sourceAgentCommandIsExpired(command, s.now()) && !isTerminalSourceAgentCommandState(command.State) {
-		if err := expireSourceAgentCommandTx(tx, command, s.timestamp()); err != nil {
+		if err := expireSourceAgentCommandTx(tx, command, formatSourceAgentCommandTime(s.now())); err != nil {
 			return SourceAgentCommand{}, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -594,7 +595,7 @@ func (s *SourceSyncStore) CancelSourceAgentCommand(commandID, message string) (S
 	if !sourceAgentCommandTransitionAllowed(command.Type, command.State, SourceAgentCommandCanceled) {
 		return SourceAgentCommand{}, ErrSourceAgentCommandInvalidState
 	}
-	now := s.timestamp()
+	now := formatSourceAgentCommandTime(s.now())
 	result, err := tx.Exec(`
 		UPDATE source_agent_commands SET state = ?, result_code = ?, message_text = ?, updated_at = ?, completed_at = ?
 		WHERE command_id = ? AND state = ?
@@ -758,7 +759,11 @@ func normalizeSourceAgentCommandExpiry(value string, now time.Time) (string, err
 	if expiresAt.Sub(now) > sourceAgentCommandMaxTTL {
 		return "", fmt.Errorf("expires_at exceeds maximum TTL of %s", sourceAgentCommandMaxTTL)
 	}
-	return expiresAt.Format(time.RFC3339Nano), nil
+	return formatSourceAgentCommandTime(expiresAt), nil
+}
+
+func formatSourceAgentCommandTime(value time.Time) string {
+	return value.UTC().Format(sourceAgentCommandTimestampLayout)
 }
 
 func normalizeSourceAgentCommandMessage(value string) (string, error) {
@@ -771,12 +776,51 @@ func normalizeSourceAgentCommandMessage(value string) (string, error) {
 			return "", fmt.Errorf("message contains control characters")
 		}
 	}
-	lower := strings.ToLower(value)
-	if strings.Contains(lower, "/users/") || strings.Contains(lower, "/home/") ||
-		strings.Contains(lower, "/private/") || strings.Contains(lower, `:\users\`) {
+	if containsSourceAgentCommandAbsolutePath(value) {
 		return "", fmt.Errorf("message must not contain a local absolute path")
 	}
 	return value, nil
+}
+
+func containsSourceAgentCommandAbsolutePath(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if !sourceAgentCommandPathTokenBoundary(value, index) {
+			continue
+		}
+		character := value[index]
+		if character == '/' {
+			if index > 0 && value[index-1] == ':' && index+1 < len(value) && value[index+1] == '/' {
+				continue
+			}
+			return true
+		}
+		if character == '~' && index+1 < len(value) && (value[index+1] == '/' || value[index+1] == '\\') {
+			return true
+		}
+		if isASCIILetter(character) && index+2 < len(value) && value[index+1] == ':' &&
+			(value[index+2] == '/' || value[index+2] == '\\') {
+			return true
+		}
+		if character == '\\' && index+1 < len(value) && value[index+1] == '\\' {
+			return true
+		}
+	}
+	return false
+}
+
+func sourceAgentCommandPathTokenBoundary(value string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	previous := value[index-1]
+	if previous == ' ' || previous == '\t' || previous == '\n' || previous == '\r' {
+		return true
+	}
+	return strings.ContainsRune(`"'([{<>=,:;`, rune(previous))
+}
+
+func isASCIILetter(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z'
 }
 
 func validateSourceAgentCommandTerminalResult(commandType string, input SourceAgentCommandTransition) error {

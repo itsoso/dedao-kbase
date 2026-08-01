@@ -35,8 +35,9 @@ func TestSourceAgentCommandUpgradeLifecycle(t *testing.T) {
 	if command.UpgradeSpec == nil || command.UpgradeSpec.ArtifactID != "artifact-2-0-0" || command.ExpectedCurrentVersion != "1.0.0" {
 		t.Fatalf("typed upgrade spec = %#v", command)
 	}
-	if command.ExpiresAt != clock.Now().Add(time.Hour).Format(time.RFC3339Nano) {
-		t.Fatalf("expires_at = %q", command.ExpiresAt)
+	expiresAt, err := time.Parse(time.RFC3339Nano, command.ExpiresAt)
+	if err != nil || !expiresAt.Equal(clock.Now().Add(time.Hour)) {
+		t.Fatalf("expires_at = %q, parse error = %v", command.ExpiresAt, err)
 	}
 
 	persisted, err := store.GetSourceAgentCommand(command.ID)
@@ -393,6 +394,105 @@ func TestSourceAgentCommandTransitionsExpiryAndBounds(t *testing.T) {
 	}
 	if canceled.State != SourceAgentCommandCanceled || canceled.ResultCode != SourceAgentCommandCodeCanceled || canceled.Message != "operator canceled" {
 		t.Fatalf("canceled command = %#v", canceled)
+	}
+}
+
+func TestSourceAgentCommandExpiryUsesChronologicalOrder(t *testing.T) {
+	t.Run("fractional future remains claimable", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-fractional-future", "1.0.0")
+		command := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-fractional-future", "future-half-second", 500*time.Millisecond)
+
+		claimed, err := store.ClaimNextSourceAgentCommand("agent-fractional-future", "process-future")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed == nil || claimed.ID != command.ID || claimed.State != SourceAgentCommandClaimed {
+			t.Fatalf("future command claim = %#v", claimed)
+		}
+		assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, command.ID),
+			SourceAgentCommandQueued, SourceAgentCommandClaimed)
+	})
+
+	t.Run("whole-second expiry precedes fractional now", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-fractional-past", "1.0.0")
+		command := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-fractional-past", "past-tenth-second", time.Second)
+		clock.Advance(time.Second + 100*time.Millisecond)
+
+		claimed, err := store.ClaimNextSourceAgentCommand("agent-fractional-past", "process-past")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed != nil {
+			t.Fatalf("expired command was claimed: %#v", claimed)
+		}
+		persisted, err := store.GetSourceAgentCommand(command.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != SourceAgentCommandExpired {
+			t.Fatalf("past command state = %q, want %q", persisted.State, SourceAgentCommandExpired)
+		}
+		assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, command.ID),
+			SourceAgentCommandQueued, SourceAgentCommandExpired)
+	})
+
+	t.Run("exact expiry is expired", func(t *testing.T) {
+		store, clock := newSourceAgentCommandTestStore(t)
+		registerSourceAgentCommandTestAgent(t, store, "agent-exact-expiry", "1.0.0")
+		command := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-exact-expiry", "exact-expiry", time.Second)
+		clock.Advance(time.Second)
+
+		claimed, err := store.ClaimNextSourceAgentCommand("agent-exact-expiry", "process-exact")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed != nil {
+			t.Fatalf("exactly expired command was claimed: %#v", claimed)
+		}
+		persisted, err := store.GetSourceAgentCommand(command.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.State != SourceAgentCommandExpired {
+			t.Fatalf("exact command state = %q, want %q", persisted.State, SourceAgentCommandExpired)
+		}
+	})
+}
+
+func TestSourceAgentCommandRejectsAbsoluteDiagnosticPaths(t *testing.T) {
+	for _, message := range []string{
+		"/tmp/source-agent.log",
+		"/Volumes/Data/file",
+		`D:\Temp\file`,
+		`\\server\share\file`,
+		"~/file",
+		"D:/Temp/file",
+		"failure (/tmp/source-agent.log)",
+		`failure "/Volumes/Data/file"`,
+		"path=/tmp/source-agent.log",
+		`path='D:\Temp\file'`,
+		`share=\\server\share\file`,
+	} {
+		if normalized, err := normalizeSourceAgentCommandMessage(message); err == nil {
+			t.Errorf("accepted absolute path message %q as %q", message, normalized)
+		}
+	}
+
+	for _, message := range []string{
+		"input/output healthy",
+		"version 1/2 complete",
+		"https://example.invalid/status",
+		"ordinary diagnostic text",
+	} {
+		normalized, err := normalizeSourceAgentCommandMessage(message)
+		if err != nil {
+			t.Errorf("rejected ordinary message %q: %v", message, err)
+		}
+		if normalized != message {
+			t.Errorf("normalized ordinary message = %q, want %q", normalized, message)
+		}
 	}
 }
 
