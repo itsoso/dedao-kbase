@@ -2149,6 +2149,7 @@ func TestKBaseHTTPHandlerPersistsFailureCheckpointCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sourceSync.Close()
+	registerSourceLeaseAgent(t, sourceSync, "agent-a")
 	subscription, err := sourceSync.CreateSubscription(SourceSubscriptionInput{
 		SourceType:       "wechat_mp_article",
 		SourceAccountKey: "account-key",

@@ -3,7 +3,169 @@ package app
 import (
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestSourceAgentObservedStateTruthTable(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	freshness := 5 * time.Minute
+	freshHeartbeat := now.Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	staleHeartbeat := now.Add(-10 * time.Minute).Format(time.RFC3339Nano)
+
+	tests := []struct {
+		name          string
+		agent         SourceAgent
+		freshness     time.Duration
+		upgradeActive bool
+		want          string
+	}{
+		{
+			name: "upgrade overrides stale heartbeat and capability action",
+			agent: SourceAgent{
+				LastHeartbeatAt: staleHeartbeat,
+				CapabilityHealth: map[string]SourceCapabilityHealth{
+					"wechat": {Healthy: false, Code: "login_required"},
+				},
+			},
+			freshness:     freshness,
+			upgradeActive: true,
+			want:          SourceAgentObservedUpgrading,
+		},
+		{name: "missing heartbeat is offline", agent: SourceAgent{}, freshness: freshness, want: SourceAgentObservedOffline},
+		{name: "invalid heartbeat is offline", agent: SourceAgent{LastHeartbeatAt: "not-a-timestamp"}, freshness: freshness, want: SourceAgentObservedOffline},
+		{name: "heartbeat at freshness boundary is online", agent: SourceAgent{LastHeartbeatAt: now.Add(-freshness).Format(time.RFC3339Nano)}, freshness: freshness, want: SourceAgentObservedOnline},
+		{
+			name: "stale heartbeat overrides capability action",
+			agent: SourceAgent{
+				LastHeartbeatAt: staleHeartbeat,
+				CapabilityHealth: map[string]SourceCapabilityHealth{
+					"wechat": {Healthy: false, RequiresAction: "log in again"},
+				},
+			},
+			freshness: freshness,
+			want:      SourceAgentObservedOffline,
+		},
+		{name: "zero freshness is offline", agent: SourceAgent{LastHeartbeatAt: freshHeartbeat}, freshness: 0, want: SourceAgentObservedOffline},
+		{name: "negative freshness is offline", agent: SourceAgent{LastHeartbeatAt: freshHeartbeat}, freshness: -time.Minute, want: SourceAgentObservedOffline},
+		{
+			name: "requires action text",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: true, RequiresAction: "refresh credentials"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedRequiresAction,
+		},
+		{
+			name: "requires action code overrides ordinary unhealthy capability",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"dependency": {Healthy: false, Code: "dependency_unavailable"},
+				"wechat":     {Healthy: false, Code: "login_required"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedRequiresAction,
+		},
+		{
+			name: "vendor blocked requires action",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: false, Code: "vendor_blocked"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedRequiresAction,
+		},
+		{
+			name: "invalid config requires action",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: false, Code: "config_invalid"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedRequiresAction,
+		},
+		{
+			name: "upgrade required requires action",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: false, Code: "upgrade_required"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedRequiresAction,
+		},
+		{
+			name: "dependency unavailable is degraded",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: false, Code: "dependency_unavailable"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedDegraded,
+		},
+		{
+			name: "throttled is degraded",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: false, Code: "throttled"},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedDegraded,
+		},
+		{
+			name: "unhealthy without code is degraded",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: false},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedDegraded,
+		},
+		{
+			name: "healthy capabilities are online",
+			agent: SourceAgent{LastHeartbeatAt: freshHeartbeat, CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: true},
+			}},
+			freshness: freshness,
+			want:      SourceAgentObservedOnline,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := DeriveSourceAgentObservedState(test.agent, now, test.freshness, test.upgradeActive); got != test.want {
+				t.Fatalf("observed state=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSourceAgentObservedStateIsIndependentFromDesiredState(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	store, err := newSourceSyncStore(t.TempDir(), func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	heartbeat := SourceAgentHeartbeat{
+		AgentID:    "agent-paused-online",
+		WorkerType: "source-agent",
+		CapabilityHealth: map[string]SourceCapabilityHealth{
+			"wechat": {Healthy: true},
+		},
+	}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetAgentDesiredState(heartbeat.AgentID, SourceAgentDesiredPaused); err != nil {
+		t.Fatal(err)
+	}
+	agent, err := store.HeartbeatAgent(heartbeat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.DesiredState != SourceAgentDesiredPaused {
+		t.Fatalf("heartbeat changed desired state to %q", agent.DesiredState)
+	}
+
+	if got := DeriveSourceAgentObservedState(agent, now, 5*time.Minute, false); got != SourceAgentObservedOnline {
+		t.Fatalf("paused agent observed state=%q, want %q", got, SourceAgentObservedOnline)
+	}
+	if agent.DesiredState != SourceAgentDesiredPaused {
+		t.Fatalf("derive changed desired state to %q", agent.DesiredState)
+	}
+}
 
 func TestSourceAgentHeartbeatRuntimeMetadata(t *testing.T) {
 	store, err := NewSourceSyncStore(t.TempDir())

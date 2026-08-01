@@ -31,6 +31,63 @@ var allowedSourceCapabilityCodes = map[string]struct{}{
 	"upgrade_required": {}, "throttled": {},
 }
 
+func DeriveSourceAgentObservedState(agent SourceAgent, now time.Time, freshness time.Duration, upgradeActive bool) string {
+	if upgradeActive {
+		return SourceAgentObservedUpgrading
+	}
+	if freshness <= 0 {
+		return SourceAgentObservedOffline
+	}
+	heartbeatAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(agent.LastHeartbeatAt))
+	if err != nil || now.Sub(heartbeatAt) > freshness {
+		return SourceAgentObservedOffline
+	}
+
+	degraded := false
+	for _, health := range agent.CapabilityHealth {
+		if strings.TrimSpace(health.RequiresAction) != "" {
+			return SourceAgentObservedRequiresAction
+		}
+		switch strings.ToLower(strings.TrimSpace(health.Code)) {
+		case "login_required", "vendor_blocked", "config_invalid", "upgrade_required":
+			return SourceAgentObservedRequiresAction
+		}
+		if !health.Healthy {
+			degraded = true
+		}
+	}
+	if degraded {
+		return SourceAgentObservedDegraded
+	}
+	return SourceAgentObservedOnline
+}
+
+func (s *SourceSyncStore) SetAgentDesiredState(agentID, desired string) (SourceAgent, error) {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return SourceAgent{}, fmt.Errorf("agent_id is required")
+	}
+	desired = strings.TrimSpace(desired)
+	if desired != SourceAgentDesiredActive && desired != SourceAgentDesiredPaused {
+		return SourceAgent{}, ErrSourceAgentDesiredState
+	}
+	result, err := s.db.Exec(`
+		UPDATE source_agents SET desired_state = ?, updated_at = ?
+		WHERE agent_id = ?
+	`, desired, s.timestamp(), agentID)
+	if err != nil {
+		return SourceAgent{}, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return SourceAgent{}, err
+	}
+	if rows == 0 {
+		return SourceAgent{}, ErrSourceAgentNotFound
+	}
+	return s.getAgent(agentID)
+}
+
 func normalizeSourceAgentHeartbeat(heartbeat SourceAgentHeartbeat) (SourceAgentHeartbeat, error) {
 	var err error
 	if heartbeat.AgentID, err = normalizeSourceAgentName("agent_id", heartbeat.AgentID, sourceAgentIDMaxRunes, false); err != nil {

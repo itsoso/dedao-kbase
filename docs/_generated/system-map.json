@@ -890,7 +890,7 @@
     {
       "name": "discover_articles",
       "file": "backend/app/source_sync.go",
-      "line": 670
+      "line": 672
     },
     {
       "name": "discover_articles",
@@ -905,7 +905,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/source_sync.go",
-      "line": 657
+      "line": 659
     },
     {
       "name": "existing_articles",
@@ -925,7 +925,7 @@
     {
       "name": "sync_articles",
       "file": "backend/app/source_sync.go",
-      "line": 655
+      "line": 657
     },
     {
       "name": "sync_articles",
@@ -955,7 +955,7 @@
     {
       "name": "sync_media",
       "file": "backend/app/source_sync.go",
-      "line": 670
+      "line": 672
     },
     {
       "name": "sync_media",
@@ -1507,7 +1507,7 @@
     {
       "name": "SourceAgent",
       "file": "backend/app/source_sync.go",
-      "line": 81
+      "line": 83
     },
     {
       "name": "SourceAgentClient",
@@ -1532,7 +1532,7 @@
     {
       "name": "SourceAgentHeartbeat",
       "file": "backend/app/source_sync.go",
-      "line": 52
+      "line": 54
     },
     {
       "name": "SourceAgentOutbox",
@@ -1577,7 +1577,7 @@
     {
       "name": "SourceCapabilityHealth",
       "file": "backend/app/source_sync.go",
-      "line": 73
+      "line": 75
     },
     {
       "name": "SourceCheckpoint",
@@ -1637,32 +1637,32 @@
     {
       "name": "SourceSubscription",
       "file": "backend/app/source_sync.go",
-      "line": 118
+      "line": 120
     },
     {
       "name": "SourceSubscriptionInput",
       "file": "backend/app/source_sync.go",
-      "line": 106
+      "line": 108
     },
     {
       "name": "SourceSyncItem",
       "file": "backend/app/source_sync.go",
-      "line": 165
+      "line": 167
     },
     {
       "name": "SourceSyncItemInput",
       "file": "backend/app/source_sync.go",
-      "line": 156
+      "line": 158
     },
     {
       "name": "SourceSyncRun",
       "file": "backend/app/source_sync.go",
-      "line": 134
+      "line": 136
     },
     {
       "name": "SourceSyncStore",
       "file": "backend/app/source_sync.go",
-      "line": 178
+      "line": 180
     },
     {
       "name": "WCPlusAccount",

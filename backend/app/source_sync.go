@@ -39,6 +39,8 @@ const (
 )
 
 var (
+	ErrSourceAgentNotFound      = errors.New("source agent not found")
+	ErrSourceAgentDesiredState  = errors.New("source agent desired state must be active or paused")
 	ErrSourceRunNotFound        = errors.New("source sync run not found")
 	ErrSourceRunLeaseOwner      = errors.New("source sync run belongs to another agent")
 	ErrSourceRunLeaseExpired    = errors.New("source sync run lease expired")
@@ -752,6 +754,16 @@ func (s *SourceSyncStore) LeaseNextRun(agentID string, capabilities []string, le
 	}
 	capabilities = normalizeSourceCapabilities(capabilities)
 	if len(capabilities) == 0 {
+		return nil, nil
+	}
+	agent, err := s.getAgent(agentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if agent.DesiredState != SourceAgentDesiredActive {
 		return nil, nil
 	}
 	if leaseDuration <= 0 {
