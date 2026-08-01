@@ -7,6 +7,9 @@
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
 
+**Approved implementation plan:**
+`docs/plans/2026-08-01-unified-source-agent-control-plane.md`
+
 **System map contract:** `docs/system-map/INDEX.md`
 
 ## Outcome
@@ -21,12 +24,21 @@ by `docs/system-map/INDEX.md`; route, command, operation, durable-object, or
 other structural counts must never be hand-written into this dossier or other
 narrative documentation.
 
+## Current Stage and Next Handoff
+
+Definition is complete and delivery has not started. The next task is Task 2:
+implement the Source Agent registry schema and persistence. The approved
+implementation plan above is the delivery sequence, while this dossier remains
+the handoff spine and Gate record for resuming work.
+
 ## Approved Constraints
 
 - WeChat and WC Plus remain independent workers with separate processes,
   state, outboxes, logs, and failure domains.
-- The first release is manually scheduled. Automatic and interval scheduling
-  remain disabled.
+- Source work in the first release is manual-only: an operator must explicitly
+  trigger every run, new subscriptions default to `manual`, and interval
+  scheduling must remain disabled. This source-work constraint is distinct
+  from the upgrade-scheduling prohibition below.
 - Workers share `KBASE_SOURCE_AGENT_TOKEN`. An `agent_id` is only an
   operational identifier: it is not a trusted identity, is not non-forgeable
   audit evidence, and cannot be revoked independently. A token compromise
