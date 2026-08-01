@@ -239,7 +239,7 @@ func TestSourceAgentClientCommands(t *testing.T) {
 				want := map[string]any{
 					"agent_id":       "agent-a",
 					"state":          SourceAgentCommandSucceeded,
-					"result_code":    SourceAgentCommandCodeUpgradeComplete,
+					"code":           SourceAgentCommandCodeUpgradeComplete,
 					"message":        "installed",
 					"actual_version": "2.0.0",
 				}

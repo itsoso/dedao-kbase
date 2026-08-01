@@ -207,13 +207,13 @@ func (c *SourceAgentClient) ReportCommand(
 	payload := struct {
 		AgentID       string `json:"agent_id"`
 		State         string `json:"state"`
-		ResultCode    string `json:"result_code,omitempty"`
+		Code          string `json:"code,omitempty"`
 		Message       string `json:"message,omitempty"`
 		ActualVersion string `json:"actual_version,omitempty"`
 	}{
 		AgentID:       c.agentID,
 		State:         state,
-		ResultCode:    code,
+		Code:          code,
 		Message:       message,
 		ActualVersion: actualVersion,
 	}

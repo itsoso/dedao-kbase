@@ -2165,6 +2165,16 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		if empty.Code != http.StatusOK || strings.TrimSpace(empty.Body.String()) != `{"command":null}` {
 			t.Fatalf("empty queue status=%d body=%s", empty.Code, empty.Body.String())
 		}
+		legacyResultCode := requestJSONKBase(
+			handler,
+			http.MethodPost,
+			"/api/source-agent/commands/"+url.PathEscape(diagnose.ID)+"/complete",
+			"agent-secret",
+			`{"agent_id":"agent-a","state":"succeeded","result_code":"diagnostic_complete"}`,
+		)
+		if legacyResultCode.Code != http.StatusBadRequest {
+			t.Fatalf("legacy result_code status=%d body=%s", legacyResultCode.Code, legacyResultCode.Body.String())
+		}
 
 		claimUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
 		if claimUpgrade.Code != http.StatusOK {
@@ -2190,7 +2200,7 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 				t.Fatalf("progress %s status=%d body=%s", state, response.Code, response.Body.String())
 			}
 		}
-		completionBody := `{"agent_id":"agent-a","state":"succeeded","result_code":"upgrade_complete","message":"installed","actual_version":"2.0.0"}`
+		completionBody := `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","message":"installed","actual_version":"2.0.0"}`
 		complete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
 		if complete.Code != http.StatusOK || !strings.Contains(complete.Body.String(), `"state":"succeeded"`) {
 			t.Fatalf("complete status=%d body=%s", complete.Code, complete.Body.String())
@@ -2211,7 +2221,7 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		}{
 			{name: "claim unknown field", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a","target_agent_id":"agent-b"}`},
 			{name: "claim trailing", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a"}{"secret":"private"}`},
-			{name: "report unknown field", path: commandPath + "/complete", body: `{"agent_id":"agent-a","state":"succeeded","result_code":"upgrade_complete","actual_version":"2.0.0","spec_json":"private"}`},
+			{name: "report unknown field", path: commandPath + "/complete", body: `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","actual_version":"2.0.0","spec_json":"private"}`},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				response := requestJSONKBase(handler, http.MethodPost, test.path, "agent-secret", test.body)
@@ -2226,7 +2236,7 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 			})
 		}
 
-		unknown := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/missing-command/complete", "agent-secret", `{"agent_id":"agent-a","state":"failed","result_code":"upgrade_failed"}`)
+		unknown := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/missing-command/complete", "agent-secret", `{"agent_id":"agent-a","state":"failed","code":"upgrade_failed"}`)
 		if unknown.Code != http.StatusNotFound {
 			t.Fatalf("unknown command status=%d body=%s", unknown.Code, unknown.Body.String())
 		}

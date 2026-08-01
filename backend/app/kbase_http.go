@@ -3608,7 +3608,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 	var payload struct {
 		AgentID       string `json:"agent_id"`
 		State         string `json:"state"`
-		ResultCode    string `json:"result_code,omitempty"`
+		Code          string `json:"code,omitempty"`
 		Message       string `json:"message,omitempty"`
 		ActualVersion string `json:"actual_version,omitempty"`
 	}
@@ -3627,7 +3627,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 		payload.AgentID,
 		SourceAgentCommandTransition{
 			State:         payload.State,
-			ResultCode:    payload.ResultCode,
+			ResultCode:    payload.Code,
 			Message:       payload.Message,
 			ActualVersion: payload.ActualVersion,
 		},
