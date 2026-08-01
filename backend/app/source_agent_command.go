@@ -871,7 +871,7 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	if colon <= 0 {
 		return "", false
 	}
-	if slashOffset > colon+2 && sourceAgentCommandURIContextClosed(token[colon+3:slashOffset]) {
+	if slashOffset > colon+2 && sourceAgentCommandURIContextTerminated(token[colon+3:slashOffset]) {
 		return "", false
 	}
 	schemeStart := colon - 1
@@ -891,17 +891,30 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	return token[schemeStart:colon], true
 }
 
-func sourceAgentCommandURIContextClosed(value string) bool {
+func sourceAgentCommandURIContextTerminated(value string) bool {
 	for _, character := range value {
-		if unicode.Is(unicode.Pe, character) || unicode.Is(unicode.Pf, character) {
+		if unicode.IsSpace(character) || unicode.Is(unicode.Pe, character) || unicode.Is(unicode.Pf, character) {
 			return true
 		}
 		switch character {
 		case '>', '"', '\'', '`':
 			return true
 		}
+		if !isSourceAgentCommandRawURIIRIRune(character) {
+			return true
+		}
 	}
 	return false
+}
+
+func isSourceAgentCommandRawURIIRIRune(character rune) bool {
+	if character > unicode.MaxASCII {
+		return unicode.IsLetter(character) || unicode.IsNumber(character) || unicode.IsMark(character)
+	}
+	if isASCIILetter(byte(character)) || character >= '0' && character <= '9' {
+		return true
+	}
+	return strings.ContainsRune("-._~:/?#[]@!$&'()*+,;=%", character)
 }
 
 func sourceAgentCommandWhitespaceTokenBounds(value string, index int) (int, int) {
