@@ -27,16 +27,17 @@ import (
 var buildRevision = "development"
 
 type kBaseServerConfig struct {
-	Addr                string
-	Root                string
-	ExportPath          string
-	WebDir              string
-	AuthToken           string
-	AgentPublisherToken string
-	SourceAgentToken    string
-	Session             sessionServerConfig
-	RetrySigningKey     []byte
-	RetrySigningErr     error
+	Addr                    string
+	Root                    string
+	ExportPath              string
+	WebDir                  string
+	AuthToken               string
+	AgentPublisherToken     string
+	SourceAgentToken        string
+	SourceAgentArtifactRoot string
+	Session                 sessionServerConfig
+	RetrySigningKey         []byte
+	RetrySigningErr         error
 }
 
 type startupSecretSet struct {
@@ -91,16 +92,17 @@ func runCommandWithServerRunner(
 	sessionConfig.BrowserProxySecret = defaultBrowserSessionSecret()
 	retrySigningKey, retrySigningErr := evidenceAuditRetrySigningKey()
 	config := kBaseServerConfig{
-		Addr:                *addr,
-		Root:                *root,
-		ExportPath:          *exportPath,
-		WebDir:              *webDir,
-		AuthToken:           *authToken,
-		AgentPublisherToken: *agentPublisherToken,
-		SourceAgentToken:    *sourceAgentToken,
-		Session:             sessionConfig,
-		RetrySigningKey:     retrySigningKey,
-		RetrySigningErr:     retrySigningErr,
+		Addr:                    *addr,
+		Root:                    *root,
+		ExportPath:              *exportPath,
+		WebDir:                  *webDir,
+		AuthToken:               *authToken,
+		AgentPublisherToken:     *agentPublisherToken,
+		SourceAgentToken:        *sourceAgentToken,
+		SourceAgentArtifactRoot: defaultSourceAgentArtifactRoot(),
+		Session:                 sessionConfig,
+		RetrySigningKey:         retrySigningKey,
+		RetrySigningErr:         retrySigningErr,
 	}
 	if !*checkConfig {
 		return runServer(config)
@@ -164,6 +166,11 @@ func preflightKBaseServer(config kBaseServerConfig) (kBaseServerConfig, *http.Se
 			config.Session.BrowserProxySecret,
 		); err != nil {
 			return kBaseServerConfig{}, nil, err
+		}
+	}
+	if config.SourceAgentArtifactRoot != "" {
+		if _, err := app.NewSourceAgentArtifactCatalog(config.SourceAgentArtifactRoot); err != nil {
+			return kBaseServerConfig{}, nil, errors.New("invalid source agent artifact catalog configuration")
 		}
 	}
 	server, err := newKBaseHTTPServer(config.Addr, nil)
@@ -233,6 +240,13 @@ func serveKBaseServer(
 		config.RetrySigningKey = nil
 	}
 	proofroomDelivery, proofroomUnavailableReason := newProofroomDeliveryRuntime()
+	var sourceArtifacts *app.SourceAgentArtifactCatalog
+	if config.SourceAgentArtifactRoot != "" {
+		sourceArtifacts, err = app.NewSourceAgentArtifactCatalog(config.SourceAgentArtifactRoot)
+		if err != nil {
+			return errors.New("initialize source agent artifact catalog failed")
+		}
+	}
 
 	handlerConfig := app.KBaseHTTPConfig{
 		Store:                  bookStore,
@@ -245,6 +259,7 @@ func serveKBaseServer(
 		WCPlus:                 app.NewWCPlusSourceService(app.WCPlusSourceConfigFromEnv()),
 		SourceSync:             sourceSync,
 		SourceAgentToken:       config.SourceAgentToken,
+		SourceArtifacts:        sourceArtifacts,
 		ReverificationCooldown: knowledgeReverificationCooldown(),
 		AuditCoordinator:       auditRuntime.Coordinator,
 		AuditUnavailableReason: auditRuntime.UnavailableReason,
@@ -271,6 +286,11 @@ func serveKBaseServer(
 		log.Printf("source agent API disabled until KBASE_SOURCE_AGENT_TOKEN is configured")
 	} else {
 		log.Printf("source agent API enabled")
+	}
+	if sourceArtifacts == nil {
+		log.Printf("source agent artifact catalog disabled until KBASE_SOURCE_AGENT_ARTIFACT_ROOT is configured")
+	} else {
+		log.Printf("source agent artifact catalog enabled")
 	}
 	if strings.TrimSpace(config.AgentPublisherToken) == "" {
 		log.Printf("agent package publisher API disabled until KBASE_AGENT_PUBLISHER_TOKEN is configured")
@@ -434,6 +454,10 @@ func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherTo
 
 func defaultAgentPublisherToken() string {
 	return strings.TrimSpace(os.Getenv("KBASE_AGENT_PUBLISHER_TOKEN"))
+}
+
+func defaultSourceAgentArtifactRoot() string {
+	return strings.TrimSpace(os.Getenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT"))
 }
 
 func defaultBrowserSessionSecret() string {

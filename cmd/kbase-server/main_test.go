@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -43,6 +44,7 @@ func configureValidCheckConfigEnvironment(t *testing.T, dbPath string) map[strin
 	}
 	t.Setenv("KBASE_BROWSER_SESSION_DB_PATH", dbPath)
 	t.Setenv("KBASE_PUBLIC_ORIGIN", "https://kbase.example.test")
+	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", "")
 	for _, key := range []string{
 		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
 		"KBASE_HTTP_READ_TIMEOUT_SECONDS",
@@ -53,6 +55,59 @@ func configureValidCheckConfigEnvironment(t *testing.T, dbPath string) map[strin
 		t.Setenv(key, "")
 	}
 	return secrets
+}
+
+func TestSourceAgentArtifactRootUsesOnlyExplicitEnvironment(t *testing.T) {
+	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", "")
+	if got := defaultSourceAgentArtifactRoot(); got != "" {
+		t.Fatalf("defaultSourceAgentArtifactRoot() = %q, want disabled", got)
+	}
+	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", "  relative-artifact-root  ")
+	if got := defaultSourceAgentArtifactRoot(); got != "relative-artifact-root" {
+		t.Fatalf("defaultSourceAgentArtifactRoot() = %q", got)
+	}
+}
+
+func TestRunCommandPassesSourceAgentArtifactRootWithoutPrintingIt(t *testing.T) {
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	artifactRoot := filepath.Join(t.TempDir(), "private-artifacts")
+	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", artifactRoot)
+	var stdout bytes.Buffer
+	var captured kBaseServerConfig
+	err := runCommandWithServerRunner(nil, &stdout, func(config kBaseServerConfig) error {
+		captured = config
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured.SourceAgentArtifactRoot != artifactRoot {
+		t.Fatalf("SourceAgentArtifactRoot = %q", captured.SourceAgentArtifactRoot)
+	}
+	if strings.Contains(stdout.String(), artifactRoot) {
+		t.Fatalf("stdout leaked artifact root: %s", stdout.String())
+	}
+}
+
+func TestCheckConfigRejectsUnsafeSourceAgentArtifactRootWithoutLeakingIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows V1 artifact catalog intentionally fails closed")
+	}
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	realRoot := t.TempDir()
+	linkRoot := filepath.Join(t.TempDir(), "private-artifact-link")
+	if err := os.Symlink(realRoot, linkRoot); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", linkRoot)
+	var stdout bytes.Buffer
+	err := runCommand([]string{"--check-config", "--addr", "127.0.0.1:8719"}, &stdout)
+	if err == nil {
+		t.Fatal("check-config accepted symlink artifact root")
+	}
+	if strings.Contains(err.Error(), linkRoot) || strings.Contains(stdout.String(), linkRoot) {
+		t.Fatalf("artifact root leaked: error=%v stdout=%q", err, stdout.String())
+	}
 }
 
 func TestCheckConfigEmitsStableJSON(t *testing.T) {

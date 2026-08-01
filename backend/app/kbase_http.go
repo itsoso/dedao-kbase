@@ -38,6 +38,7 @@ type KBaseHTTPConfig struct {
 	SourceIngest            *SourceIngestService
 	SourceAgentToken        string
 	SourceAgentMaxBodyBytes int64
+	SourceArtifacts         *SourceAgentArtifactCatalog
 	SourceAssets            *SourceAssetStore
 	AnalysisGenerator       BookAnalysisGenerator
 	ChatClient              BookKnowledgeLLMClient
@@ -87,6 +88,7 @@ type kbaseHTTPHandler struct {
 	sourceIngest            *SourceIngestService
 	sourceAgentToken        string
 	sourceAgentMaxBodyBytes int64
+	sourceArtifacts         *SourceAgentArtifactCatalog
 	sourceAssets            *SourceAssetStore
 	analysisGenerator       BookAnalysisGenerator
 	chatClient              BookKnowledgeLLMClient
@@ -211,6 +213,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceIngest:            sourceIngest,
 		sourceAgentToken:        sourceAgentToken,
 		sourceAgentMaxBodyBytes: maxBodyBytes,
+		sourceArtifacts:         cfg.SourceArtifacts,
 		sourceAssets:            assets,
 		analysisGenerator:       analysisGenerator,
 		chatClient:              cfg.ChatClient,
@@ -3502,7 +3505,8 @@ func (h *kbaseHTTPHandler) handleWCPlusTaskControl(w http.ResponseWriter, r *htt
 }
 
 func isSourceSyncAdminPath(path string) bool {
-	return path == "/api/source-agents" ||
+	return path == "/api/source-agent-artifacts" ||
+		path == "/api/source-agents" ||
 		strings.HasPrefix(path, "/api/source-agents/") ||
 		path == "/api/source-subscriptions" ||
 		strings.HasPrefix(path, "/api/source-subscriptions/") ||
@@ -3511,6 +3515,10 @@ func isSourceSyncAdminPath(path string) bool {
 }
 
 func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/source-agent/artifacts/") {
+		h.handleSourceAgentArtifactDownload(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -3621,6 +3629,12 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 		writeHTTPError(w, http.StatusBadRequest, "invalid command report state")
 		return
 	}
+	if payload.State == SourceAgentCommandInstalling {
+		if _, _, err := h.validateSourceAgentArtifactCommand(commandID, payload.AgentID, SourceAgentCommandVerified); err != nil {
+			h.writeSourceAgentArtifactWorkerError(w, err)
+			return
+		}
+	}
 	command, err := h.sourceSync.TransitionSourceAgentCommand(
 		commandID,
 		payload.AgentID,
@@ -3637,6 +3651,156 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"command": command})
+}
+
+func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWriter, r *http.Request) {
+	artifactID, ok, invalid := parseSourceAgentArtifactDownloadPath(r)
+	if invalid {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
+		return
+	}
+	if !ok {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if h.sourceArtifacts == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "source agent artifact download unavailable")
+		return
+	}
+	if r.ContentLength != 0 {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
+		return
+	}
+	query := r.URL.Query()
+	if len(query) != 2 || len(query["agent_id"]) != 1 || len(query["command_id"]) != 1 {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
+		return
+	}
+	rawAgentID := query.Get("agent_id")
+	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", rawAgentID, true)
+	if err != nil || agentID != rawAgentID {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
+		return
+	}
+	rawCommandID := query.Get("command_id")
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", rawCommandID, true)
+	if err != nil || commandID != rawCommandID {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact download request")
+		return
+	}
+	command, agent, err := h.validateSourceAgentArtifactCommand(commandID, agentID,
+		SourceAgentCommandClaimed, SourceAgentCommandDownloading)
+	if err != nil {
+		h.writeSourceAgentArtifactWorkerError(w, err)
+		return
+	}
+	if command.UpgradeSpec == nil || command.UpgradeSpec.ArtifactID != artifactID {
+		h.writeSourceAgentArtifactWorkerError(w, ErrSourceAgentCommandTarget)
+		return
+	}
+	metadata, data, err := h.sourceArtifacts.ReadForRollout(artifactID, sourceAgentArtifactTargetFromAgent(agent))
+	if err != nil {
+		h.writeSourceAgentArtifactWorkerError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
+	w.Header().Set("X-Source-Agent-Artifact-SHA256", metadata.SHA256)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+func parseSourceAgentArtifactDownloadPath(r *http.Request) (string, bool, bool) {
+	const prefix = "/api/source-agent/artifacts/"
+	rawPath := r.URL.EscapedPath()
+	if !strings.HasPrefix(rawPath, prefix) {
+		return "", false, false
+	}
+	parts := strings.Split(strings.TrimPrefix(rawPath, prefix), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] != "download" {
+		return "", false, false
+	}
+	rawArtifactID, err := url.PathUnescape(parts[0])
+	if err != nil {
+		return "", false, true
+	}
+	artifactID, err := normalizeSourceAgentCommandIdentifier("artifact_id", rawArtifactID, true)
+	if err != nil || artifactID != rawArtifactID {
+		return "", false, true
+	}
+	return artifactID, true, false
+}
+
+func (h *kbaseHTTPHandler) validateSourceAgentArtifactCommand(commandID, agentID string, allowedStates ...string) (SourceAgentCommand, SourceAgent, error) {
+	if h.sourceArtifacts == nil {
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentArtifactCatalogInvalid
+	}
+	command, err := h.sourceSync.GetSourceAgentCommand(commandID)
+	if err != nil {
+		return SourceAgentCommand{}, SourceAgent{}, err
+	}
+	if command.TargetAgentID != agentID {
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandTarget
+	}
+	if !isTerminalSourceAgentCommandState(command.State) && sourceAgentCommandIsExpired(command, h.sourceSync.now().UTC()) {
+		_, expireErr := h.sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+		if expireErr != nil {
+			return SourceAgentCommand{}, SourceAgent{}, expireErr
+		}
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandExpired
+	}
+	if command.Type != SourceAgentCommandUpgrade || command.UpgradeSpec == nil {
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandType
+	}
+	stateAllowed := false
+	for _, allowed := range allowedStates {
+		if command.State == allowed {
+			stateAllowed = true
+			break
+		}
+	}
+	if !stateAllowed {
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandInvalidState
+	}
+	if command.ClaimOwner == "" || command.ClaimOwner != agentID {
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandClaimOwner
+	}
+	agent, err := h.sourceSync.GetSourceAgent(agentID)
+	if err != nil {
+		return SourceAgentCommand{}, SourceAgent{}, err
+	}
+	if command.ExpectedCurrentVersion == "" || command.ExpectedCurrentVersion != agent.Version {
+		return SourceAgentCommand{}, SourceAgent{}, ErrSourceAgentCommandVersionConflict
+	}
+	if _, _, err := h.sourceArtifacts.ReadForRollout(command.UpgradeSpec.ArtifactID, sourceAgentArtifactTargetFromAgent(agent)); err != nil {
+		return SourceAgentCommand{}, SourceAgent{}, err
+	}
+	return command, agent, nil
+}
+
+func sourceAgentArtifactTargetFromAgent(agent SourceAgent) SourceAgentArtifactTarget {
+	return SourceAgentArtifactTarget{
+		WorkerType: agent.WorkerType, Platform: agent.Platform, Architecture: agent.Architecture,
+		CurrentVersion: agent.Version,
+	}
+}
+
+func (h *kbaseHTTPHandler) writeSourceAgentArtifactWorkerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrSourceAgentCommandNotFound), errors.Is(err, ErrSourceAgentNotFound),
+		errors.Is(err, ErrSourceAgentArtifactNotFound):
+		writeHTTPError(w, http.StatusNotFound, "source agent artifact unavailable")
+	case errors.Is(err, ErrSourceAgentCommandTarget), errors.Is(err, ErrSourceAgentCommandClaimOwner),
+		errors.Is(err, ErrSourceAgentCommandType), errors.Is(err, ErrSourceAgentArtifactIncompatible):
+		writeHTTPError(w, http.StatusForbidden, "source agent artifact is not available to this worker")
+	case errors.Is(err, ErrSourceAgentCommandInvalidState), errors.Is(err, ErrSourceAgentCommandExpired),
+		errors.Is(err, ErrSourceAgentCommandVersionConflict),
+		errors.Is(err, ErrSourceAgentArtifactNotAllowed), errors.Is(err, ErrSourceAgentArtifactIntegrity):
+		writeHTTPError(w, http.StatusConflict, "source agent artifact unavailable")
+	default:
+		writeHTTPError(w, http.StatusServiceUnavailable, "source agent artifact unavailable")
+	}
 }
 
 func parseSourceAgentCommandWorkerPath(r *http.Request) (string, string, bool, bool) {
@@ -3797,6 +3961,8 @@ func (h *kbaseHTTPHandler) handleSourceSyncAdmin(w http.ResponseWriter, r *http.
 		return
 	}
 	switch {
+	case r.URL.Path == "/api/source-agent-artifacts":
+		h.handleSourceAgentArtifactMetadata(w, r)
 	case r.URL.Path == "/api/source-agents":
 		if r.Method != http.MethodGet {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -3830,6 +3996,49 @@ func (h *kbaseHTTPHandler) handleSourceSyncAdmin(w http.ResponseWriter, r *http.
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceAgentArtifactMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if h.sourceArtifacts == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "source agent artifact catalog unavailable")
+		return
+	}
+	limit, ok := parseSourceAgentArtifactListLimit(w, r)
+	if !ok {
+		return
+	}
+	artifacts, err := h.sourceArtifacts.List(limit)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "source agent artifact catalog unavailable")
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"artifacts": artifacts})
+}
+
+func parseSourceAgentArtifactListLimit(w http.ResponseWriter, r *http.Request) (int, bool) {
+	query := r.URL.Query()
+	if len(query) == 0 {
+		return 0, true
+	}
+	values, exists := query["limit"]
+	if len(query) != 1 || !exists || len(values) != 1 {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact list request")
+		return 0, false
+	}
+	limit, err := strconv.Atoi(strings.TrimSpace(values[0]))
+	if err != nil || limit < 0 {
+		writeHTTPError(w, http.StatusBadRequest, "invalid artifact list request")
+		return 0, false
+	}
+	if limit > sourceAgentArtifactListMax {
+		limit = sourceAgentArtifactListMax
+	}
+	return limit, true
 }
 
 func (h *kbaseHTTPHandler) handleSourceAgentManagement(w http.ResponseWriter, r *http.Request) {
@@ -3916,6 +4125,27 @@ func (h *kbaseHTTPHandler) handleSourceAgentManagementCommands(w http.ResponseWr
 				writeHTTPError(w, http.StatusForbidden, "browser management session required")
 				return
 			}
+			if h.sourceArtifacts == nil {
+				writeHTTPError(w, http.StatusConflict, "source agent artifact unavailable")
+				return
+			}
+			_, _, spec, err := normalizeSourceAgentCommandCreate(SourceAgentCommandCreate{
+				TargetAgentID: agentID, Type: payload.Type, IdempotencyKey: payload.IdempotencyKey,
+				Payload: payload.Payload, ExpiresAt: payload.ExpiresAt,
+			}, h.sourceSync.now().UTC())
+			if err != nil || spec == nil {
+				h.writeSourceAgentManagementError(w, err)
+				return
+			}
+			agent, err := h.sourceSync.GetSourceAgent(agentID)
+			if err != nil {
+				h.writeSourceAgentManagementError(w, err)
+				return
+			}
+			if _, _, err := h.sourceArtifacts.ReadForRollout(spec.ArtifactID, sourceAgentArtifactTargetFromAgent(agent)); err != nil {
+				h.writeSourceAgentManagementError(w, err)
+				return
+			}
 		}
 		command, err := h.sourceSync.CreateSourceAgentCommand(SourceAgentCommandCreate{
 			TargetAgentID:  agentID,
@@ -3987,7 +4217,10 @@ func (h *kbaseHTTPHandler) writeSourceAgentManagementError(w http.ResponseWriter
 		writeHTTPError(w, http.StatusNotFound, "source agent command not found")
 	case errors.Is(err, ErrSourceAgentCommandVersionConflict),
 		errors.Is(err, ErrSourceAgentCommandIdempotencyConflict),
-		errors.Is(err, ErrSourceAgentCommandActiveUpgrade):
+		errors.Is(err, ErrSourceAgentCommandActiveUpgrade),
+		errors.Is(err, ErrSourceAgentArtifactNotFound), errors.Is(err, ErrSourceAgentArtifactNotAllowed),
+		errors.Is(err, ErrSourceAgentArtifactIncompatible), errors.Is(err, ErrSourceAgentArtifactIntegrity),
+		errors.Is(err, ErrSourceAgentArtifactCatalogInvalid):
 		writeHTTPError(w, http.StatusConflict, "source agent command conflict")
 	case errors.Is(err, ErrSourceAgentDesiredState), errors.Is(err, ErrSourceAgentCommandType),
 		isSourceAgentCommandInputError(err):
