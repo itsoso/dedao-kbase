@@ -863,16 +863,30 @@ func sourceAgentCommandURISchemeForTokenSlash(value string, index int) (string, 
 	tokenStart, tokenEnd := sourceAgentCommandWhitespaceTokenBounds(value, index)
 	token := value[tokenStart:tokenEnd]
 	slashOffset := index - tokenStart
-	colon := strings.Index(token, "://")
-	if colon <= 0 || colon+1 > slashOffset || !isASCIILetter(token[0]) {
+	searchEnd := slashOffset + 1
+	if searchEnd < len(token) && token[searchEnd] == '/' {
+		searchEnd++
+	}
+	colon := strings.LastIndex(token[:searchEnd], "://")
+	if colon <= 0 {
 		return "", false
 	}
-	for position := 1; position < colon; position++ {
-		if !isSourceAgentCommandURISchemeCharacter(token[position]) {
-			return "", false
-		}
+	if slashOffset > colon+2 && sourceAgentCommandURIContextClosed(token[colon+3:slashOffset]) {
+		return "", false
 	}
-	return token[:colon], true
+	schemeStart := colon - 1
+	for schemeStart >= 0 && isSourceAgentCommandURISchemeCharacter(token[schemeStart]) {
+		schemeStart--
+	}
+	schemeStart++
+	if schemeStart >= colon || !isASCIILetter(token[schemeStart]) {
+		return "", false
+	}
+	return token[schemeStart:colon], true
+}
+
+func sourceAgentCommandURIContextClosed(value string) bool {
+	return strings.ContainsAny(value, ")]}>\"'`")
 }
 
 func sourceAgentCommandWhitespaceTokenBounds(value string, index int) (int, int) {
