@@ -108,3 +108,100 @@ func TestSourceAgentCapabilityCode(t *testing.T) {
 		t.Fatal("accepted unknown diagnostic code")
 	}
 }
+
+func TestSourceAgentWCPlusAuthority(t *testing.T) {
+	store, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	t.Run("modern typed heartbeat does not invent wcplus", func(t *testing.T) {
+		agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+			AgentID:      "wechat-worker-typed",
+			WorkerType:   "wechat-worker",
+			Capabilities: []string{"wechat"},
+			CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: true, Version: "1.0.0"},
+			},
+			WCPlusHealthy: true,
+			WCPlusVersion: "legacy-conflict",
+			LastError:     "legacy conflict",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := agent.CapabilityHealth["wcplus"]; exists {
+			t.Fatalf("modern heartbeat invented wcplus: %#v", agent)
+		}
+		if agent.WCPlusHealthy || agent.WCPlusVersion != "" || agent.LastError != "" {
+			t.Fatalf("legacy fields conflict with typed capabilities: %#v", agent)
+		}
+	})
+
+	t.Run("modern empty health does not invent wcplus", func(t *testing.T) {
+		agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+			AgentID:      "wechat-worker-empty",
+			WorkerType:   "wechat-worker",
+			Capabilities: []string{"wechat"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := agent.CapabilityHealth["wcplus"]; exists {
+			t.Fatalf("modern empty heartbeat invented wcplus: %#v", agent)
+		}
+	})
+
+	t.Run("typed wcplus mirrors into legacy fields", func(t *testing.T) {
+		input := SourceAgentHeartbeat{
+			AgentID:      "wcplus-worker",
+			WorkerType:   "source-worker",
+			Capabilities: []string{"wcplus"},
+			CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wcplus": {
+					Healthy:   false,
+					Code:      "vendor_blocked",
+					Version:   "typed-2.0.0",
+					LastError: "typed failure",
+				},
+			},
+			WCPlusHealthy: true,
+			WCPlusVersion: "legacy-1.0.0",
+			LastError:     "legacy failure",
+		}
+		agent, err := store.HeartbeatAgent(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		persisted, err := store.getAgent(input.AgentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, got := range []SourceAgent{agent, persisted} {
+			health := got.CapabilityHealth["wcplus"]
+			if health.Healthy || health.Code != "vendor_blocked" || health.Version != "typed-2.0.0" || health.LastError != "typed failure" {
+				t.Fatalf("typed wcplus changed: %#v", got)
+			}
+			if got.WCPlusHealthy || got.WCPlusVersion != health.Version || got.LastError != health.LastError {
+				t.Fatalf("legacy fields do not mirror typed wcplus: %#v", got)
+			}
+		}
+	})
+
+	t.Run("legacy wcplus only heartbeat still maps", func(t *testing.T) {
+		agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+			AgentID:       "legacy-wcplus-worker",
+			WCPlusHealthy: true,
+			WCPlusVersion: "4.2.0",
+			LastError:     "legacy diagnostic",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		health, exists := agent.CapabilityHealth["wcplus"]
+		if !exists || !health.Healthy || health.Version != "4.2.0" || health.LastError != "legacy diagnostic" {
+			t.Fatalf("legacy wcplus did not map: %#v", agent)
+		}
+	})
+}

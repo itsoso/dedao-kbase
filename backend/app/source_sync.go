@@ -382,6 +382,12 @@ func ensureSourceSyncColumn(db *sql.DB, table, column, definition string) error 
 }
 
 func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (SourceAgent, error) {
+	legacyProtocol := strings.TrimSpace(heartbeat.WorkerType) == ""
+	if !legacyProtocol || len(heartbeat.CapabilityHealth) > 0 {
+		heartbeat.WCPlusHealthy = false
+		heartbeat.WCPlusVersion = ""
+		heartbeat.LastError = ""
+	}
 	var err error
 	heartbeat, err = normalizeSourceAgentHeartbeat(heartbeat)
 	if err != nil {
@@ -392,7 +398,11 @@ func (s *SourceSyncStore) HeartbeatAgent(heartbeat SourceAgentHeartbeat) (Source
 	if err != nil {
 		return SourceAgent{}, err
 	}
-	if len(heartbeat.CapabilityHealth) == 0 {
+	if wcplus, ok := heartbeat.CapabilityHealth["wcplus"]; ok {
+		heartbeat.WCPlusHealthy = wcplus.Healthy
+		heartbeat.WCPlusVersion = wcplus.Version
+		heartbeat.LastError = wcplus.LastError
+	} else if legacyProtocol && len(heartbeat.CapabilityHealth) == 0 {
 		heartbeat.CapabilityHealth = map[string]SourceCapabilityHealth{"wcplus": {
 			Healthy: heartbeat.WCPlusHealthy, Version: heartbeat.WCPlusVersion, LastError: trimSourceDiagnostic(heartbeat.LastError),
 		}}
