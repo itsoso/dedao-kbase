@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -189,5 +190,175 @@ func TestSourceAgentClientAuthCheckDoesNotLeaseWork(t *testing.T) {
 	}
 	if err := client.CheckAuth(context.Background()); err != nil {
 		t.Fatalf("CheckAuth() error = %v", err)
+	}
+}
+
+func TestSourceAgentClientCommands(t *testing.T) {
+	t.Run("claim and report use scoped command contracts", func(t *testing.T) {
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			if got := r.Header.Get("Authorization"); got != "Bearer agent-secret" {
+				t.Fatalf("Authorization = %q", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			switch calls {
+			case 1:
+				if r.Method != http.MethodPost || r.URL.EscapedPath() != "/api/source-agent/commands/claim" {
+					t.Fatalf("claim request = %s %s", r.Method, r.URL.EscapedPath())
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(payload, map[string]any{"agent_id": "agent-a"}) {
+					t.Fatalf("claim payload = %#v", payload)
+				}
+				fmt.Fprint(w, `{"command":{"id":"cmd-1","target_agent_id":"agent-a","type":"upgrade","state":"claimed"}}`)
+			case 2:
+				if r.URL.EscapedPath() != "/api/source-agent/commands/cmd-1/progress" {
+					t.Fatalf("progress path = %q", r.URL.EscapedPath())
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatal(err)
+				}
+				want := map[string]any{"agent_id": "agent-a", "state": SourceAgentCommandDownloading, "message": "downloading"}
+				if !reflect.DeepEqual(payload, want) {
+					t.Fatalf("progress payload = %#v, want %#v", payload, want)
+				}
+				fmt.Fprint(w, `{"command":{"id":"cmd-1","target_agent_id":"agent-a","type":"upgrade","state":"downloading"}}`)
+			case 3:
+				if r.URL.EscapedPath() != "/api/source-agent/commands/cmd%2Fwith%20space/complete" {
+					t.Fatalf("complete path = %q", r.URL.EscapedPath())
+				}
+				var payload map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Fatal(err)
+				}
+				want := map[string]any{
+					"agent_id":       "agent-a",
+					"state":          SourceAgentCommandSucceeded,
+					"result_code":    SourceAgentCommandCodeUpgradeComplete,
+					"message":        "installed",
+					"actual_version": "2.0.0",
+				}
+				if !reflect.DeepEqual(payload, want) {
+					t.Fatalf("complete payload = %#v, want %#v", payload, want)
+				}
+				fmt.Fprint(w, `{"command":{"id":"cmd/with space","target_agent_id":"agent-a","type":"upgrade","state":"succeeded","actual_version":"2.0.0"}}`)
+			case 4:
+				fmt.Fprint(w, `{"command":null}`)
+			default:
+				t.Fatalf("unexpected request %d: %s %s", calls, r.Method, r.URL.EscapedPath())
+			}
+		}))
+		defer server.Close()
+
+		client, err := NewSourceAgentClient(SourceAgentConfig{
+			RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+			StateDir: t.TempDir(), HTTPClient: server.Client(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := client.ClaimCommand(context.Background())
+		if err != nil || claimed == nil || claimed.ID != "cmd-1" || claimed.State != SourceAgentCommandClaimed {
+			t.Fatalf("ClaimCommand() = %#v, %v", claimed, err)
+		}
+		progress, err := client.ReportCommand(context.Background(), "cmd-1", SourceAgentCommandDownloading, "", "downloading", "")
+		if err != nil || progress.State != SourceAgentCommandDownloading {
+			t.Fatalf("progress = %#v, %v", progress, err)
+		}
+		completed, err := client.ReportCommand(
+			context.Background(), "cmd/with space", SourceAgentCommandSucceeded,
+			SourceAgentCommandCodeUpgradeComplete, "installed", "2.0.0",
+		)
+		if err != nil || completed.State != SourceAgentCommandSucceeded || completed.ActualVersion != "2.0.0" {
+			t.Fatalf("complete = %#v, %v", completed, err)
+		}
+		empty, err := client.ClaimCommand(context.Background())
+		if err != nil || empty != nil {
+			t.Fatalf("empty ClaimCommand() = %#v, %v", empty, err)
+		}
+	})
+
+	t.Run("http errors never expose response bodies", func(t *testing.T) {
+		privatePath := "/" + "Users/example/private-agent"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusConflict)
+			fmt.Fprintf(w, `{"error":"secret-token %s spec_json"}`, privatePath)
+		}))
+		defer server.Close()
+		client, err := NewSourceAgentClient(SourceAgentConfig{
+			RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+			StateDir: t.TempDir(), HTTPClient: server.Client(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = client.ClaimCommand(context.Background())
+		var httpErr *SourceAgentHTTPError
+		if !errors.As(err, &httpErr) || httpErr.Method != http.MethodPost ||
+			httpErr.Path != "/api/source-agent/commands/claim" || httpErr.StatusCode != http.StatusConflict {
+			t.Fatalf("ClaimCommand() error = %#v", err)
+		}
+		for _, secret := range []string{"secret-token", privatePath, "spec_json"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("HTTP error leaked %q: %v", secret, err)
+			}
+		}
+	})
+
+	t.Run("rejects command ID path segments without sending", func(t *testing.T) {
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			fmt.Fprint(w, `{"command":{"id":"unexpected"}}`)
+		}))
+		defer server.Close()
+		client, err := NewSourceAgentClient(SourceAgentConfig{
+			RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+			StateDir: t.TempDir(), HTTPClient: server.Client(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.ReportCommand(
+			context.Background(), "..", SourceAgentCommandFailed,
+			SourceAgentCommandCodeUpgradeFailed, "failed", "",
+		); err == nil {
+			t.Fatal("ReportCommand accepted a dot-segment command ID")
+		}
+		if calls != 0 {
+			t.Fatalf("ReportCommand sent %d requests for a dot-segment command ID", calls)
+		}
+	})
+
+	for _, test := range []struct {
+		name string
+		body string
+	}{
+		{name: "malformed", body: `{"command":`},
+		{name: "trailing", body: `{"command":null}{"secret":"trailing"}`},
+		{name: "oversized", body: `{"command":null,"padding":"` + strings.Repeat("x", (2<<20)+1) + `"}`},
+	} {
+		t.Run("rejects "+test.name+" responses", func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, test.body)
+			}))
+			defer server.Close()
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+				StateDir: t.TempDir(), HTTPClient: server.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.ClaimCommand(context.Background()); err == nil {
+				t.Fatalf("accepted %s response", test.name)
+			}
+		})
 	}
 }

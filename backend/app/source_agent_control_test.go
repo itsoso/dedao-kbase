@@ -1,10 +1,27 @@
 package app
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestSourceAgentGetNormalizesAndMapsNotFound(t *testing.T) {
+	store, _ := newSourceAgentCommandTestStore(t)
+	registerSourceAgentCommandTestAgent(t, store, "agent-detail", "1.0.0")
+
+	agent, err := store.GetSourceAgent(" agent-detail ")
+	if err != nil || agent.AgentID != "agent-detail" {
+		t.Fatalf("GetSourceAgent() = %#v, %v", agent, err)
+	}
+	if _, err := store.GetSourceAgent("missing-agent"); !errors.Is(err, ErrSourceAgentNotFound) {
+		t.Fatalf("unknown GetSourceAgent() error = %v", err)
+	}
+	if _, err := store.GetSourceAgent("../agent"); err == nil {
+		t.Fatal("GetSourceAgent accepted invalid agent ID")
+	}
+}
 
 func TestSourceAgentObservedStateTruthTable(t *testing.T) {
 	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)

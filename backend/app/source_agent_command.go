@@ -56,6 +56,8 @@ const (
 	sourceAgentCommandPayloadMaxBytes = 2048
 	sourceAgentCommandMaxTTL          = 7 * 24 * time.Hour
 	sourceAgentCommandTimestampLayout = "2006-01-02T15:04:05.000000000Z"
+	sourceAgentCommandListDefault     = 50
+	sourceAgentCommandListMax         = 100
 )
 
 var (
@@ -316,6 +318,43 @@ func (s *SourceSyncStore) GetSourceAgentCommand(commandID string) (SourceAgentCo
 		return SourceAgentCommand{}, ErrSourceAgentCommandNotFound
 	}
 	return command, err
+}
+
+func (s *SourceSyncStore) ListSourceAgentCommands(agentID string, limit int) ([]SourceAgentCommand, error) {
+	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.GetSourceAgent(agentID); err != nil {
+		return nil, err
+	}
+	if limit < 0 {
+		return nil, fmt.Errorf("limit must be non-negative")
+	}
+	if limit == 0 {
+		limit = sourceAgentCommandListDefault
+	}
+	if limit > sourceAgentCommandListMax {
+		limit = sourceAgentCommandListMax
+	}
+	rows, err := s.db.Query(sourceAgentCommandSelect+`
+		WHERE target_agent_id = ?
+		ORDER BY created_at DESC, command_id DESC
+		LIMIT ?
+	`, agentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commands := make([]SourceAgentCommand, 0)
+	for rows.Next() {
+		command, err := scanSourceAgentCommand(rows)
+		if err != nil {
+			return nil, err
+		}
+		commands = append(commands, command)
+	}
+	return commands, rows.Err()
 }
 
 func (s *SourceSyncStore) ListSourceAgentCommandEvents(commandID string) ([]SourceAgentCommandEvent, error) {
@@ -750,6 +789,9 @@ func normalizeSourceAgentCommandIdentifier(field, value string, required bool) (
 	if err != nil {
 		return "", err
 	}
+	if value == "." || value == ".." {
+		return "", fmt.Errorf("%s contains invalid path segments", field)
+	}
 	if required && value == "" {
 		return "", fmt.Errorf("%s is required", field)
 	}
@@ -1103,6 +1145,19 @@ func isTerminalSourceAgentCommandState(state string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func sourceAgentCommandWorkerReportAction(state string) (string, bool) {
+	switch state {
+	case SourceAgentCommandDownloading, SourceAgentCommandVerified,
+		SourceAgentCommandInstalling, SourceAgentCommandRestarting,
+		SourceAgentCommandVerifying, SourceAgentCommandRollback:
+		return "progress", true
+	case SourceAgentCommandSucceeded, SourceAgentCommandFailed, SourceAgentCommandRolledBack:
+		return "complete", true
+	default:
+		return "", false
 	}
 }
 

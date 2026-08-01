@@ -1988,6 +1988,259 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
+	handler, sourceSync, _, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+
+	detail := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a", "admin-secret")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"agent_id":"agent-a"`) ||
+		!strings.Contains(detail.Body.String(), `"desired_state":"active"`) {
+		t.Fatalf("agent detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	for _, desired := range []string{SourceAgentDesiredPaused, SourceAgentDesiredActive} {
+		response := requestJSONKBase(
+			handler, http.MethodPost, "/api/source-agents/agent-a/desired-state", "admin-secret",
+			`{"desired_state":"`+desired+`"}`,
+		)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"desired_state":"`+desired+`"`) {
+			t.Fatalf("set desired state %q status=%d body=%s", desired, response.Code, response.Body.String())
+		}
+	}
+	agent, err := sourceSync.GetSourceAgent(" agent-a ")
+	if err != nil || agent.DesiredState != SourceAgentDesiredActive {
+		t.Fatalf("GetSourceAgent() = %#v, %v", agent, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{name: "unknown field", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"paused","extra":"private"}`, want: http.StatusBadRequest},
+		{name: "trailing JSON", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"paused"}{"extra":true}`, want: http.StatusBadRequest},
+		{name: "invalid state", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"reboot"}`, want: http.StatusBadRequest},
+		{name: "unknown agent", method: http.MethodGet, path: "/api/source-agents/missing-agent", want: http.StatusNotFound},
+		{name: "invalid escaped agent", method: http.MethodGet, path: "/api/source-agents/%2E%2E", want: http.StatusBadRequest},
+		{name: "detail method", method: http.MethodDelete, path: "/api/source-agents/agent-a", want: http.StatusMethodNotAllowed},
+		{name: "unknown action", method: http.MethodPost, path: "/api/source-agents/agent-a/reboot", body: `{}`, want: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var response *httptest.ResponseRecorder
+			if test.body == "" {
+				response = requestKBase(handler, test.method, test.path, "admin-secret")
+			} else {
+				response = requestJSONKBase(handler, test.method, test.path, "admin-secret", test.body)
+			}
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+			}
+			for _, secret := range []string{"private", "reboot", "../", sourceSync.DBPath()} {
+				if secret != "" && strings.Contains(response.Body.String(), secret) {
+					t.Fatalf("error response leaked %q: %s", secret, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
+	t.Run("management command API", func(t *testing.T) {
+		handler, _, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+		expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
+		diagnoseBody := `{"type":"diagnose","idempotency_key":"diag-1","expires_at":"` + expiresAt + `"}`
+		diagnose := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", diagnoseBody)
+		if diagnose.Code != http.StatusCreated || !strings.Contains(diagnose.Body.String(), `"type":"diagnose"`) ||
+			!strings.Contains(diagnose.Body.String(), `"target_agent_id":"agent-a"`) {
+			t.Fatalf("diagnose status=%d body=%s", diagnose.Code, diagnose.Body.String())
+		}
+
+		upgradeBody := `{"type":"upgrade","idempotency_key":"upgrade-1","payload":{"artifact_id":"artifact-2","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`
+		bearerUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", upgradeBody)
+		if bearerUpgrade.Code != http.StatusForbidden || bearerUpgrade.Body.String() != "{\"error\":\"browser management session required\"}\n" {
+			t.Fatalf("Bearer upgrade status=%d body=%s", bearerUpgrade.Code, bearerUpgrade.Body.String())
+		}
+
+		credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Upgrade Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, upgradeBody)
+		missingCSRFResponse := httptest.NewRecorder()
+		handler.ServeHTTP(missingCSRFResponse, missingCSRF)
+		if missingCSRFResponse.Code != http.StatusForbidden {
+			t.Fatalf("Cookie upgrade without CSRF status=%d body=%s", missingCSRFResponse.Code, missingCSRFResponse.Body.String())
+		}
+
+		clock.Advance(time.Second)
+		validUpgrade := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, upgradeBody)
+		addKBaseBrowserSessionSecurityHeaders(validUpgrade, credentials.CSRFToken)
+		validUpgradeResponse := httptest.NewRecorder()
+		handler.ServeHTTP(validUpgradeResponse, validUpgrade)
+		if validUpgradeResponse.Code != http.StatusCreated || !strings.Contains(validUpgradeResponse.Body.String(), `"artifact_id":"artifact-2"`) {
+			t.Fatalf("Cookie upgrade status=%d body=%s", validUpgradeResponse.Code, validUpgradeResponse.Body.String())
+		}
+
+		list := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a/commands?limit=1", "admin-secret")
+		var listPayload struct {
+			Commands []SourceAgentCommand `json:"commands"`
+		}
+		if list.Code != http.StatusOK || json.Unmarshal(list.Body.Bytes(), &listPayload) != nil ||
+			len(listPayload.Commands) != 1 || listPayload.Commands[0].Type != SourceAgentCommandUpgrade {
+			t.Fatalf("command list status=%d body=%s", list.Code, list.Body.String())
+		}
+
+		for _, test := range []struct {
+			name       string
+			agentID    string
+			body       string
+			cookieAuth bool
+			want       int
+			forbidden  []string
+		}{
+			{name: "unknown field", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"bad-field","expires_at":"` + expiresAt + `","secret_field":"private-value"}`, want: http.StatusBadRequest, forbidden: []string{"secret_field", "private-value"}},
+			{name: "target spoof", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"spoof","target_agent_id":"agent-b","expires_at":"` + expiresAt + `"}`, want: http.StatusBadRequest, forbidden: []string{"target_agent_id", "agent-b"}},
+			{name: "trailing JSON", agentID: "agent-a", body: diagnoseBody + `{"spec_json":"private"}`, want: http.StatusBadRequest, forbidden: []string{"spec_json", "private"}},
+			{name: "unknown type", agentID: "agent-a", body: `{"type":"shell","idempotency_key":"unknown-type","expires_at":"` + expiresAt + `"}`, want: http.StatusBadRequest, forbidden: []string{"shell"}},
+			{name: "unknown agent", agentID: "missing-agent", body: diagnoseBody, want: http.StatusNotFound, forbidden: []string{"missing-agent"}},
+			{name: "stale version", agentID: "agent-b", cookieAuth: true, body: `{"type":"upgrade","idempotency_key":"stale","payload":{"artifact_id":"private-artifact","expected_current_version":"0.9.0"},"expires_at":"` + expiresAt + `"}`, want: http.StatusConflict, forbidden: []string{"private-artifact", "0.9.0", "1.0.0", "expected", "actual", "spec"}},
+			{name: "duplicate active upgrade", agentID: "agent-a", cookieAuth: true, body: `{"type":"upgrade","idempotency_key":"upgrade-2","payload":{"artifact_id":"artifact-3","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`, want: http.StatusConflict, forbidden: []string{"artifact-3", "expected", "spec"}},
+			{name: "idempotency conflict", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"diag-1","expires_at":"` + clock.Now().Add(2*time.Hour).Format(time.RFC3339Nano) + `"}`, want: http.StatusConflict, forbidden: []string{"diag-1", "expires_at"}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				path := "/api/source-agents/" + test.agentID + "/commands"
+				var response *httptest.ResponseRecorder
+				if test.cookieAuth {
+					request := newKBaseBrowserCookieRequest(http.MethodPost, path, credentials.Token, test.body)
+					addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+					response = httptest.NewRecorder()
+					handler.ServeHTTP(response, request)
+				} else {
+					response = requestJSONKBase(handler, http.MethodPost, path, "admin-secret", test.body)
+				}
+				if response.Code != test.want {
+					t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+				}
+				for _, forbidden := range append(test.forbidden, "/Users/", `C:\\Users\\`) {
+					if strings.Contains(response.Body.String(), forbidden) {
+						t.Fatalf("error response leaked %q: %s", forbidden, response.Body.String())
+					}
+				}
+			})
+		}
+
+		invalidID := requestKBase(handler, http.MethodGet, "/api/source-agents/%2E%2E/commands", "admin-secret")
+		if invalidID.Code != http.StatusBadRequest {
+			t.Fatalf("invalid escaped agent status=%d body=%s", invalidID.Code, invalidID.Body.String())
+		}
+		wrongMethod := requestKBase(handler, http.MethodDelete, "/api/source-agents/agent-a/commands", "admin-secret")
+		if wrongMethod.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("wrong command method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+		}
+	})
+
+	t.Run("worker command API", func(t *testing.T) {
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		diagnose := mustCreateSourceAgentDiagnoseCommand(t, sourceSync, clock, "agent-a", "worker-diagnose", time.Hour)
+		clock.Advance(time.Second)
+		upgrade := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "worker-upgrade")
+
+		claimNext := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a"}`)
+		if claimNext.Code != http.StatusOK || !strings.Contains(claimNext.Body.String(), `"id":"`+diagnose.ID+`"`) ||
+			!strings.Contains(claimNext.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("claim next status=%d body=%s", claimNext.Code, claimNext.Body.String())
+		}
+		claimByIDBody := `{"agent_id":"agent-a","command_id":"` + diagnose.ID + `"}`
+		claimByID := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", claimByIDBody)
+		if claimByID.Code != http.StatusOK || !strings.Contains(claimByID.Body.String(), `"id":"`+diagnose.ID+`"`) {
+			t.Fatalf("idempotent claim by id status=%d body=%s", claimByID.Code, claimByID.Body.String())
+		}
+
+		wrongTarget := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-b","command_id":"`+diagnose.ID+`"}`)
+		if wrongTarget.Code != http.StatusForbidden || strings.Contains(wrongTarget.Body.String(), diagnose.ID) || strings.Contains(wrongTarget.Body.String(), "agent-a") {
+			t.Fatalf("wrong target status=%d body=%s", wrongTarget.Code, wrongTarget.Body.String())
+		}
+		empty := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-b"}`)
+		if empty.Code != http.StatusOK || strings.TrimSpace(empty.Body.String()) != `{"command":null}` {
+			t.Fatalf("empty queue status=%d body=%s", empty.Code, empty.Body.String())
+		}
+
+		claimUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if claimUpgrade.Code != http.StatusOK {
+			t.Fatalf("claim upgrade status=%d body=%s", claimUpgrade.Code, claimUpgrade.Body.String())
+		}
+		commandPath := "/api/source-agent/commands/" + url.PathEscape(upgrade.ID)
+		progress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"downloading","message":"downloading"}`)
+		if progress.Code != http.StatusOK || !strings.Contains(progress.Body.String(), `"state":"downloading"`) {
+			t.Fatalf("download progress status=%d body=%s", progress.Code, progress.Body.String())
+		}
+		badComplete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", `{"agent_id":"agent-a","state":"downloading"}`)
+		if badComplete.Code != http.StatusBadRequest {
+			t.Fatalf("nonterminal complete status=%d body=%s", badComplete.Code, badComplete.Body.String())
+		}
+		for _, state := range []string{
+			SourceAgentCommandVerified,
+			SourceAgentCommandInstalling,
+			SourceAgentCommandRestarting,
+			SourceAgentCommandVerifying,
+		} {
+			response := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"`+state+`"}`)
+			if response.Code != http.StatusOK {
+				t.Fatalf("progress %s status=%d body=%s", state, response.Code, response.Body.String())
+			}
+		}
+		completionBody := `{"agent_id":"agent-a","state":"succeeded","result_code":"upgrade_complete","message":"installed","actual_version":"2.0.0"}`
+		complete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
+		if complete.Code != http.StatusOK || !strings.Contains(complete.Body.String(), `"state":"succeeded"`) {
+			t.Fatalf("complete status=%d body=%s", complete.Code, complete.Body.String())
+		}
+		duplicate := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
+		if duplicate.Code != http.StatusOK {
+			t.Fatalf("duplicate complete status=%d body=%s", duplicate.Code, duplicate.Body.String())
+		}
+		badProgress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", completionBody)
+		if badProgress.Code != http.StatusBadRequest {
+			t.Fatalf("terminal progress status=%d body=%s", badProgress.Code, badProgress.Body.String())
+		}
+
+		for _, test := range []struct {
+			name string
+			path string
+			body string
+		}{
+			{name: "claim unknown field", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a","target_agent_id":"agent-b"}`},
+			{name: "claim trailing", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a"}{"secret":"private"}`},
+			{name: "report unknown field", path: commandPath + "/complete", body: `{"agent_id":"agent-a","state":"succeeded","result_code":"upgrade_complete","actual_version":"2.0.0","spec_json":"private"}`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				response := requestJSONKBase(handler, http.MethodPost, test.path, "agent-secret", test.body)
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				for _, forbidden := range []string{"target_agent_id", "agent-b", "spec_json", "private"} {
+					if strings.Contains(response.Body.String(), forbidden) {
+						t.Fatalf("strict JSON error leaked %q: %s", forbidden, response.Body.String())
+					}
+				}
+			})
+		}
+
+		unknown := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/missing-command/complete", "agent-secret", `{"agent_id":"agent-a","state":"failed","result_code":"upgrade_failed"}`)
+		if unknown.Code != http.StatusNotFound {
+			t.Fatalf("unknown command status=%d body=%s", unknown.Code, unknown.Body.String())
+		}
+		adminOnWorker := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "admin-secret", `{"agent_id":"agent-a"}`)
+		if adminOnWorker.Code != http.StatusUnauthorized {
+			t.Fatalf("management Bearer on worker route status=%d body=%s", adminOnWorker.Code, adminOnWorker.Body.String())
+		}
+		workerOnManagement := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a", "agent-secret")
+		if workerOnManagement.Code != http.StatusUnauthorized {
+			t.Fatalf("worker Bearer on management route status=%d body=%s", workerOnManagement.Code, workerOnManagement.Body.String())
+		}
+	})
+}
+
 func TestKBaseHTTPHandlerSerializesCapabilityHealth(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)
@@ -5937,6 +6190,60 @@ func requestJSONKBase(handler http.Handler, method, path, token, body string) *h
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+func newKBaseSourceAgentCommandHTTPFixture(
+	t testing.TB,
+) (http.Handler, *SourceSyncStore, *sourceSyncTestClock, *BrowserSessionStore) {
+	t.Helper()
+	root := t.TempDir()
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
+	sourceSync, err := newSourceSyncStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sourceSync.Close(); err != nil {
+			t.Errorf("close source sync store: %v", err)
+		}
+	})
+	registerSourceAgentCommandTestAgent(t, sourceSync, "agent-a", "1.0.0")
+	registerSourceAgentCommandTestAgent(t, sourceSync, "agent-b", "1.0.0")
+
+	browserDirectory := t.TempDir()
+	if err := os.Chmod(browserDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	browserSessions, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(browserDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(880, 16)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := browserSessions.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(root),
+		AuthToken:        "admin-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "agent-secret",
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           browserSessions,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+	return handler, sourceSync, clock, browserSessions
 }
 
 type fakeDedaoLibrary struct{}

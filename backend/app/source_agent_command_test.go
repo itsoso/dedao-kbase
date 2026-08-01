@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -175,6 +176,53 @@ func TestSourceAgentCommandDiagnoseLifecycleAndClaimNext(t *testing.T) {
 	}
 	assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, command.ID),
 		SourceAgentCommandQueued, SourceAgentCommandClaimed, SourceAgentCommandSucceeded)
+}
+
+func TestSourceAgentCommandListIsTargetScopedOrderedAndBounded(t *testing.T) {
+	store, clock := newSourceAgentCommandTestStore(t)
+	registerSourceAgentCommandTestAgent(t, store, "agent-list", "1.0.0")
+	registerSourceAgentCommandTestAgent(t, store, "agent-other-list", "1.0.0")
+
+	created := make([]SourceAgentCommand, 0, 102)
+	for index := 0; index < 102; index++ {
+		command := mustCreateSourceAgentDiagnoseCommand(
+			t, store, clock, "agent-list", fmt.Sprintf("list-%03d", index), time.Hour,
+		)
+		created = append(created, command)
+		clock.Advance(time.Second)
+	}
+	other := mustCreateSourceAgentDiagnoseCommand(t, store, clock, "agent-other-list", "other-target", time.Hour)
+
+	latest, err := store.ListSourceAgentCommands(" agent-list ", 1)
+	if err != nil || len(latest) != 1 || latest[0].ID != created[len(created)-1].ID {
+		t.Fatalf("latest commands = %#v, %v", latest, err)
+	}
+	bounded, err := store.ListSourceAgentCommands("agent-list", 1000)
+	if err != nil || len(bounded) != 100 || bounded[0].ID != created[len(created)-1].ID {
+		t.Fatalf("bounded commands len=%d first=%#v err=%v", len(bounded), bounded[0], err)
+	}
+	for index := 1; index < len(bounded); index++ {
+		if bounded[index-1].CreatedAt < bounded[index].CreatedAt {
+			t.Fatalf("commands not descending at %d: %#v then %#v", index, bounded[index-1], bounded[index])
+		}
+	}
+	defaulted, err := store.ListSourceAgentCommands("agent-list", 0)
+	if err != nil || len(defaulted) == 0 || len(defaulted) > 100 {
+		t.Fatalf("default commands len=%d err=%v", len(defaulted), err)
+	}
+	encoded, err := json.Marshal(bounded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), other.ID) || strings.Contains(string(encoded), "spec_json") {
+		t.Fatalf("list leaked another target or raw spec: %s", encoded)
+	}
+	if _, err := store.ListSourceAgentCommands("missing-agent", 1); !errors.Is(err, ErrSourceAgentNotFound) {
+		t.Fatalf("unknown target error = %v", err)
+	}
+	if _, err := store.ListSourceAgentCommands("agent-list", -1); err == nil {
+		t.Fatal("negative list limit accepted")
+	}
 }
 
 func TestSourceAgentCommandRejectsInvalidCreation(t *testing.T) {

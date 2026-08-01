@@ -1,6 +1,8 @@
 package app
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -86,6 +88,18 @@ func (s *SourceSyncStore) SetAgentDesiredState(agentID, desired string) (SourceA
 		return SourceAgent{}, ErrSourceAgentNotFound
 	}
 	return s.getAgent(agentID)
+}
+
+func (s *SourceSyncStore) GetSourceAgent(agentID string) (SourceAgent, error) {
+	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
+	if err != nil {
+		return SourceAgent{}, err
+	}
+	agent, err := s.getAgent(agentID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SourceAgent{}, ErrSourceAgentNotFound
+	}
+	return agent, err
 }
 
 func normalizeSourceAgentHeartbeat(heartbeat SourceAgentHeartbeat) (SourceAgentHeartbeat, error) {

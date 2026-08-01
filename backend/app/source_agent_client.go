@@ -15,6 +15,7 @@ import (
 )
 
 const defaultWCPlusAgentBaseURL = "http://127.0.0.1:5001"
+const sourceAgentClientResponseMaxBytes int64 = 2 << 20
 
 type SourceAgentConfig struct {
 	RemoteURL     string
@@ -174,6 +175,58 @@ func (c *SourceAgentClient) CheckAuth(ctx context.Context) error {
 	return err
 }
 
+func (c *SourceAgentClient) ClaimCommand(ctx context.Context) (*SourceAgentCommand, error) {
+	payload := struct {
+		AgentID string `json:"agent_id"`
+	}{AgentID: c.agentID}
+	var response struct {
+		Command *SourceAgentCommand `json:"command"`
+	}
+	if err := c.doJSON(ctx, http.MethodPost, "/api/source-agent/commands/claim", payload, &response); err != nil {
+		return nil, err
+	}
+	return response.Command, nil
+}
+
+func (c *SourceAgentClient) ReportCommand(
+	ctx context.Context,
+	commandID, state, code, message, actualVersion string,
+) (SourceAgentCommand, error) {
+	commandID = strings.TrimSpace(commandID)
+	if commandID == "" {
+		return SourceAgentCommand{}, fmt.Errorf("command_id is required")
+	}
+	if commandID == "." || commandID == ".." {
+		return SourceAgentCommand{}, fmt.Errorf("command_id contains an invalid path segment")
+	}
+	state = strings.ToLower(strings.TrimSpace(state))
+	action, ok := sourceAgentCommandWorkerReportAction(state)
+	if !ok {
+		return SourceAgentCommand{}, fmt.Errorf("unsupported worker command state")
+	}
+	payload := struct {
+		AgentID       string `json:"agent_id"`
+		State         string `json:"state"`
+		ResultCode    string `json:"result_code,omitempty"`
+		Message       string `json:"message,omitempty"`
+		ActualVersion string `json:"actual_version,omitempty"`
+	}{
+		AgentID:       c.agentID,
+		State:         state,
+		ResultCode:    code,
+		Message:       message,
+		ActualVersion: actualVersion,
+	}
+	var response struct {
+		Command SourceAgentCommand `json:"command"`
+	}
+	requestPath := "/api/source-agent/commands/" + url.PathEscape(commandID) + "/" + action
+	if err := c.doJSON(ctx, http.MethodPost, requestPath, payload, &response); err != nil {
+		return SourceAgentCommand{}, err
+	}
+	return response.Command, nil
+}
+
 func (c *SourceAgentClient) UploadArticle(ctx context.Context, runID string, envelope SourceArticleEnvelope) (SourceIngestReceipt, error) {
 	payload := struct {
 		AgentID string `json:"agent_id"`
@@ -278,8 +331,10 @@ func (c *SourceAgentClient) doJSON(ctx context.Context, method, requestPath stri
 	if err != nil {
 		return err
 	}
-	endpoint := *c.baseURL
-	endpoint.Path = path.Join(strings.TrimSuffix(c.baseURL.Path, "/"), requestPath)
+	endpoint, err := c.endpointForRequestPath(requestPath)
+	if err != nil {
+		return err
+	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint.String(), bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -293,16 +348,41 @@ func (c *SourceAgentClient) doJSON(ctx context.Context, method, requestPath stri
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return &SourceAgentHTTPError{Method: method, Path: requestPath, StatusCode: resp.StatusCode}
 	}
 	if target == nil || resp.StatusCode == http.StatusNoContent {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		return nil
 	}
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, 2<<20))
+	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, sourceAgentClientResponseMaxBytes+1))
+	if err != nil {
+		return fmt.Errorf("read source agent response for %s %s failed", method, requestPath)
+	}
+	if int64(len(responseBody)) > sourceAgentClientResponseMaxBytes {
+		return fmt.Errorf(
+			"source agent response for %s %s exceeds %d bytes",
+			method, requestPath, sourceAgentClientResponseMaxBytes,
+		)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(responseBody))
 	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("decode source agent response for %s %s: %w", method, requestPath, err)
+		return fmt.Errorf("decode source agent response for %s %s failed", method, requestPath)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("source agent response for %s %s must contain one JSON value", method, requestPath)
 	}
 	return nil
+}
+
+func (c *SourceAgentClient) endpointForRequestPath(requestPath string) (url.URL, error) {
+	endpoint := *c.baseURL
+	rawPath := path.Join(strings.TrimSuffix(c.baseURL.EscapedPath(), "/"), requestPath)
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return url.URL{}, err
+	}
+	endpoint.Path = decodedPath
+	endpoint.RawPath = rawPath
+	return endpoint, nil
 }
