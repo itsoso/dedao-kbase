@@ -193,6 +193,7 @@ type sourceAgentRunnerHTTPHarness struct {
 	log             *sourceAgentRunnerCallLog
 	desiredState    string
 	heartbeatStatus int
+	leaseStatus     int
 	heartbeats      []SourceAgentHeartbeat
 	leaseRun        *SourceSyncRun
 	leaseCalls      int
@@ -226,9 +227,15 @@ func (h *sourceAgentRunnerHTTPHarness) handler(w http.ResponseWriter, r *http.Re
 		h.log.add("lease")
 		h.mu.Lock()
 		h.leaseCalls++
+		status := h.leaseStatus
 		run := h.leaseRun
 		h.leaseRun = nil
 		h.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			fmt.Fprint(w, `{"error":"lease rejected"}`)
+			return
+		}
 		if run == nil {
 			fmt.Fprint(w, `{"run":null}`)
 			return
@@ -1114,7 +1121,7 @@ func TestSourceAgentRunnerRejectsUnsafeCapabilityHealthBeforeNetwork(t *testing.
 		"https://private.example/release", "/private/worker/version", `C:\\Users\\operator\\worker.exe`,
 		"operator@example.com", " token ", "\t", ".", "..", strings.Repeat("v", sourceAgentVersionMaxRunes+1),
 		"credential_operator_example", "token-secret", "password", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature",
-		"1.2.3+secret", "1.2.3_cookie", "1.2", "1.2.3.4", "01.2.3", "1.02.3", "1.2.03",
+		"1.2.3+secret", "1.2.3_cookie", "1.2.3.4", "01.2.3", "1.02.3", "1.2.03",
 		"1.2.3-01", "1.2.3-", "1.2.3+", "1.2.3+build..7", "2", "DEV",
 	}
 	for index, privateValue := range privateValues {
@@ -1382,6 +1389,50 @@ func TestSourceAgentCommandRunnerRespectsPausedAndUnhealthyHeartbeat(t *testing.
 			}
 			if _, leases := harness.snapshot(); leases != 0 {
 				t.Fatalf("lease calls=%d", leases)
+			}
+		})
+	}
+}
+
+func TestSourceAgentRunnerErrorsNeverReportOK(t *testing.T) {
+	for _, name := range []string{"heartbeat", "claim", "report", "lease", "execute", "paused"} {
+		t.Run(name, func(t *testing.T) {
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log}
+			adapter := &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}
+			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
+			var diagnoser SourceAgentDiagnoser
+			wantError := true
+			switch name {
+			case "heartbeat":
+				harness.heartbeatStatus = http.StatusServiceUnavailable
+			case "claim":
+				commands.claimErr = errors.New("claim unavailable")
+			case "report":
+				commands.claims = []*SourceAgentCommand{{ID: "cmd-diagnose", TargetAgentID: "agent-a", Type: SourceAgentCommandDiagnose, State: SourceAgentCommandClaimed}}
+				commands.reportErrs = []error{errors.New("report unavailable")}
+				diagnoser = &fakeSourceAgentDiagnoser{log: log, report: SourceAgentDiagnosticReport{
+					State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticComplete,
+				}}
+			case "lease":
+				harness.leaseStatus = http.StatusServiceUnavailable
+			case "execute":
+				harness.leaseRun = &SourceSyncRun{ID: "run-active"}
+				adapter.err = &SourceAgentHTTPError{Method: http.MethodPost, Path: "/local", StatusCode: http.StatusServiceUnavailable}
+			case "paused":
+				harness.desiredState = SourceAgentDesiredPaused
+				wantError = false
+			}
+			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), adapter, commands, diagnoser, nil)
+			result, err := runner.RunOnce(context.Background())
+			if wantError && err == nil {
+				t.Fatal("RunOnce() error=nil")
+			}
+			if !wantError && err != nil {
+				t.Fatalf("paused RunOnce() error=%v", err)
+			}
+			if result.OK == wantError {
+				t.Fatalf("RunOnce() result=%#v error=%v", result, err)
 			}
 		})
 	}

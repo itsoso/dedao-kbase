@@ -756,6 +756,200 @@ func TestWCPlusExecuteOrdinaryTaskFailureDoesNotLatchVendorBlocked(t *testing.T)
 	}
 }
 
+func TestWCPlusEndpointFailuresLatchBoundedHealthAndStopNextLease(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mode       string
+		wantCode   string
+		privateRaw string
+	}{
+		{name: "HTTP 403", mode: "403", wantCode: "vendor_blocked", privateRaw: "private-forbidden-body"},
+		{name: "HTTP 429", mode: "429", wantCode: "vendor_blocked", privateRaw: "private-throttle-body"},
+		{name: "XProtect transport", mode: "xprotect", wantCode: "vendor_blocked", privateRaw: "XProtect private transport detail"},
+		{name: "vendor envelope", mode: "vendor-envelope", wantCode: "vendor_blocked", privateRaw: "not_max_version private envelope detail"},
+		{name: "HTTP 500", mode: "500", wantCode: "dependency_unavailable", privateRaw: "private-server-body"},
+		{name: "connection", mode: "connection", wantCode: "dependency_unavailable", privateRaw: "private dial failure"},
+		{name: "malformed API", mode: "malformed", wantCode: "dependency_unavailable", privateRaw: "private-malformed-api"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/" {
+					fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>`)
+					return
+				}
+				if r.URL.Path != "/api/report/gzh_articles" {
+					t.Fatalf("unexpected local path: %s", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				switch test.mode {
+				case "403":
+					http.Error(w, test.privateRaw, http.StatusForbidden)
+				case "429":
+					http.Error(w, test.privateRaw, http.StatusTooManyRequests)
+				case "vendor-envelope":
+					fmt.Fprintf(w, `{"success":false,"message":%q}`, test.privateRaw)
+				case "500":
+					http.Error(w, test.privateRaw, http.StatusInternalServerError)
+				case "malformed":
+					fmt.Fprint(w, test.privateRaw)
+				default:
+					t.Fatalf("unexpected response mode: %s", test.mode)
+				}
+			}))
+			defer local.Close()
+			localClient := local.Client()
+			if test.mode == "xprotect" || test.mode == "connection" {
+				baseTransport := localClient.Transport
+				localClient = &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					if request.URL.Path == "/api/report/gzh_articles" {
+						return nil, errors.New(test.privateRaw)
+					}
+					return baseTransport.RoundTrip(request)
+				})}
+			}
+
+			var remoteMu sync.Mutex
+			heartbeats := make([]SourceAgentHeartbeat, 0, 2)
+			leaseCalls := 0
+			failPayload := ""
+			remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/api/source-agent/heartbeat":
+					var heartbeat SourceAgentHeartbeat
+					if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+						t.Fatal(err)
+					}
+					remoteMu.Lock()
+					heartbeats = append(heartbeats, heartbeat)
+					remoteMu.Unlock()
+					fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+				case "/api/source-agent/commands/claim":
+					fmt.Fprint(w, `{"command":null}`)
+				case "/api/source-agent/lease":
+					remoteMu.Lock()
+					leaseCalls++
+					call := leaseCalls
+					remoteMu.Unlock()
+					if call == 1 {
+						fmt.Fprint(w, `{"run":{"id":"run-endpoint","status":"running","requested_operation":"existing_articles","subscription":{"id":"sub-1","source_type":"wcplus_wechat_article","source_account_key":"biz-med","source_account":"医学参考","operation":"existing_articles","enabled":true,"options":{"limit":10}}}}`)
+						return
+					}
+					fmt.Fprint(w, `{"run":null}`)
+				case "/api/source-agent/runs/run-endpoint/fail":
+					raw, err := io.ReadAll(r.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					remoteMu.Lock()
+					failPayload = string(raw)
+					remoteMu.Unlock()
+					fmt.Fprint(w, `{"run":{"id":"run-endpoint","status":"failed"}}`)
+				default:
+					t.Fatalf("unexpected remote path: %s", r.URL.Path)
+				}
+			}))
+			defer remote.Close()
+
+			adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
+				WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: local.URL, HTTPClient: localClient}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: remote.URL, AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(), HTTPClient: remote.Client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outbox, err := NewSourceAgentOutbox(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = outbox.Close() })
+			runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := runner.RunOnce(context.Background())
+			if err == nil || result.OK {
+				t.Fatalf("first endpoint cycle result=%#v error=%v", result, err)
+			}
+			if strings.Contains(err.Error(), test.privateRaw) {
+				t.Fatalf("public error leaked private detail: %v", err)
+			}
+			result, err = runner.RunOnce(context.Background())
+			if err != nil || result.OK {
+				t.Fatalf("second endpoint cycle result=%#v error=%v", result, err)
+			}
+			remoteMu.Lock()
+			gotHeartbeats := append([]SourceAgentHeartbeat(nil), heartbeats...)
+			gotLeaseCalls := leaseCalls
+			gotFailPayload := failPayload
+			remoteMu.Unlock()
+			if len(gotHeartbeats) != 2 || gotHeartbeats[1].CapabilityHealth["wcplus"].Code != test.wantCode || gotLeaseCalls != 1 {
+				t.Fatalf("heartbeats=%#v lease_calls=%d", gotHeartbeats, gotLeaseCalls)
+			}
+			encodedHeartbeat, err := json.Marshal(gotHeartbeats[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(encodedHeartbeat), test.privateRaw) || strings.Contains(gotFailPayload, test.privateRaw) {
+				t.Fatalf("private detail leaked heartbeat=%s fail=%s", encodedHeartbeat, gotFailPayload)
+			}
+		})
+	}
+}
+
+func TestWCPlusEndpointContextCancellationDoesNotLatch(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>`)
+			return
+		}
+		t.Fatalf("unexpected local path: %s", r.URL.Path)
+	}))
+	defer local.Close()
+	for _, test := range []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+		want    error
+	}{
+		{name: "canceled", context: func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, cancel
+		}, want: context.Canceled},
+		{name: "deadline", context: func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}, want: context.DeadlineExceeded},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
+				WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: local.URL, HTTPClient: local.Client()}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := test.context()
+			defer cancel()
+			_, err = adapter.Execute(ctx, SourceSyncRun{
+				ID: "run-" + test.name, RequestedOperation: "existing_articles",
+				Subscription: &SourceSubscription{SourceAccountKey: "biz-med", SourceAccount: "医学参考"},
+			}, newSourceAgentCommandTestOutbox(t))
+			if !errors.Is(err, test.want) {
+				t.Fatalf("Execute() error=%v", err)
+			}
+			health := adapter.Status(context.Background())
+			if !health.Healthy || health.Code != "" {
+				t.Fatalf("context cancellation latched health=%#v", health)
+			}
+		})
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

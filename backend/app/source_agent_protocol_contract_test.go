@@ -31,7 +31,7 @@ func newSourceAgentProtocolFixtures(t *testing.T) []sourceAgentProtocolFixture {
 		t.Fatal(err)
 	}
 	wcplusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>source-body-sentinel`)
+		fmt.Fprint(w, `<title>wcplusPro 9.483</title>source-body-sentinel`)
 	}))
 	t.Cleanup(wcplusServer.Close)
 	wcplus, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
@@ -82,6 +82,9 @@ func TestSourceAgentProtocolReportsStableBoundedMetadataWithoutPrivateState(t *t
 				len([]rune(health.LastError)) > sourceDiagnosticMaxRunes || len([]rune(health.RequiresAction)) > sourceDiagnosticMaxRunes {
 				t.Fatalf("capability health=%#v", heartbeat.CapabilityHealth)
 			}
+			if fixture.name == "wcplus" && health.Version != "9.483" {
+				t.Fatalf("WC Plus vendor version=%q", health.Version)
+			}
 			encoded, err := json.Marshal(heartbeat)
 			if err != nil {
 				t.Fatal(err)
@@ -96,6 +99,21 @@ func TestSourceAgentProtocolReportsStableBoundedMetadataWithoutPrivateState(t *t
 	}
 	if paths["wechat"] == "" || paths["wcplus"] == "" || paths["wechat"] == paths["wcplus"] || filepath.Dir(paths["wechat"]) == filepath.Dir(paths["wcplus"]) {
 		t.Fatalf("worker outbox paths are not independent: %#v", paths)
+	}
+}
+
+func TestSourceAgentProtocolAcceptsBoundedTwoSegmentVendorVersion(t *testing.T) {
+	for _, valid := range []string{"9.483", "1.2"} {
+		if !validSourceAgentCapabilityVersion(valid) {
+			t.Fatalf("bounded two-segment version %q was rejected", valid)
+		}
+	}
+	for _, invalid := range []string{
+		"09.483", "9.0483", "9.483-token", "9.483\n", "9." + strings.Repeat("1", sourceAgentVersionMaxRunes),
+	} {
+		if validSourceAgentCapabilityVersion(invalid) {
+			t.Fatalf("unsafe two-segment version %q was accepted", invalid)
+		}
 	}
 }
 

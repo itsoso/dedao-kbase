@@ -20,6 +20,12 @@ var (
 	ErrWCPlusTaskTimeout           = errors.New("wcplus task did not complete before polling stopped")
 )
 
+const (
+	wcplusCapabilityLatchNone uint32 = iota
+	wcplusCapabilityLatchDependencyUnavailable
+	wcplusCapabilityLatchVendorBlocked
+)
+
 type WCPlusAgentBlockedError struct {
 	Reason string
 }
@@ -40,7 +46,7 @@ type WCPlusSourceAdapter struct {
 	taskPollAttempts int
 	taskPollInterval time.Duration
 	onTaskProgress   func(WCPlusTask)
-	vendorBlocked    atomic.Bool
+	capabilityLatch  atomic.Uint32
 }
 
 func NewWCPlusSourceAdapter(config WCPlusSourceAdapterConfig) (*WCPlusSourceAdapter, error) {
@@ -66,8 +72,11 @@ func (a *WCPlusSourceAdapter) Operations() []string {
 }
 
 func (a *WCPlusSourceAdapter) Status(ctx context.Context) SourceCapabilityHealth {
-	if a.vendorBlocked.Load() {
+	switch a.capabilityLatch.Load() {
+	case wcplusCapabilityLatchVendorBlocked:
 		return wcplusVendorBlockedCapabilityHealth("")
+	case wcplusCapabilityLatchDependencyUnavailable:
+		return wcplusDependencyUnavailableCapabilityHealth("")
 	}
 	status, err := a.wcplus.Status(ctx)
 	return wcplusCapabilityHealth(status, err)
@@ -105,6 +114,10 @@ func wcplusCapabilityHealth(status *WCPlusStatus, statusErr error) SourceCapabil
 	if wcplusVendorBlocked(statusCode, detail) {
 		return wcplusVendorBlockedCapabilityHealth(version)
 	}
+	return wcplusDependencyUnavailableCapabilityHealth(version)
+}
+
+func wcplusDependencyUnavailableCapabilityHealth(version string) SourceCapabilityHealth {
 	return SourceCapabilityHealth{
 		Healthy: false, Code: "dependency_unavailable", Version: version,
 		LastError:      "The local WC Plus API is unavailable.",
@@ -140,10 +153,7 @@ func wcplusVendorBlockedCapabilityHealth(version string) SourceCapabilityHealth 
 
 func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (result SourceAdapterResult, err error) {
 	defer func() {
-		var blocked *WCPlusAgentBlockedError
-		if errors.As(err, &blocked) && wcplusVendorBlocked(0, blocked.Reason) {
-			a.vendorBlocked.Store(true)
-		}
+		a.latchExecutionError(err)
 	}()
 	if run.Subscription == nil {
 		return SourceAdapterResult{}, fmt.Errorf("subscription snapshot is required")
@@ -159,6 +169,37 @@ func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		return SourceAdapterResult{Cursor: strings.TrimSpace(run.Subscription.Cursor)}, nil
 	default:
 		return SourceAdapterResult{}, fmt.Errorf("unsupported source sync operation %q", run.RequestedOperation)
+	}
+}
+
+func (a *WCPlusSourceAdapter) latchExecutionError(err error) {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	var localAPIError *WCPlusLocalAPIError
+	if errors.As(err, &localAPIError) {
+		if wcplusVendorBlocked(localAPIError.StatusCode, localAPIError.classificationDetail) {
+			a.latchCapability(wcplusCapabilityLatchVendorBlocked)
+		} else {
+			a.latchCapability(wcplusCapabilityLatchDependencyUnavailable)
+		}
+		return
+	}
+	var blocked *WCPlusAgentBlockedError
+	if errors.As(err, &blocked) && wcplusVendorBlocked(0, blocked.Reason) {
+		a.latchCapability(wcplusCapabilityLatchVendorBlocked)
+	}
+}
+
+func (a *WCPlusSourceAdapter) latchCapability(next uint32) {
+	for {
+		current := a.capabilityLatch.Load()
+		if current == wcplusCapabilityLatchVendorBlocked || current == next {
+			return
+		}
+		if a.capabilityLatch.CompareAndSwap(current, next) {
+			return
+		}
 	}
 }
 

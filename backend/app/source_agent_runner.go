@@ -132,6 +132,7 @@ func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult
 	}()
 	result.OK = capabilityHealthy
 	if err != nil {
+		result.OK = false
 		return result, err
 	}
 	if run == nil {
@@ -365,7 +366,7 @@ func validSourceAgentCapabilityVersion(value string) bool {
 		core = coreAndPrerelease[:prereleaseStart]
 	}
 	parts := strings.Split(core, ".")
-	if len(parts) != 3 {
+	if len(parts) != 2 && len(parts) != 3 {
 		return false
 	}
 	for _, part := range parts {

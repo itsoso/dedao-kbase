@@ -142,7 +142,7 @@
     {
       "path": "/api/article/content",
       "file": "backend/app/wcplus_source.go",
-      "line": 348,
+      "line": 373,
       "authenticated": true
     },
     {
@@ -298,7 +298,7 @@
     {
       "path": "/api/gzh/list",
       "file": "backend/app/wcplus_source.go",
-      "line": 242,
+      "line": 267,
       "authenticated": true
     },
     {
@@ -502,7 +502,7 @@
     {
       "path": "/api/report/gzh_articles",
       "file": "backend/app/wcplus_source.go",
-      "line": 281,
+      "line": 306,
       "authenticated": true
     },
     {
@@ -514,7 +514,7 @@
     {
       "path": "/api/report/reading_data",
       "file": "backend/app/wcplus_agent.go",
-      "line": 459,
+      "line": 500,
       "authenticated": true
     },
     {
@@ -556,7 +556,7 @@
     {
       "path": "/api/search_gzh/search",
       "file": "backend/app/wcplus_source.go",
-      "line": 878,
+      "line": 903,
       "authenticated": true
     },
     {
@@ -700,7 +700,7 @@
     {
       "path": "/api/task/all",
       "file": "backend/app/wcplus_source.go",
-      "line": 515,
+      "line": 540,
       "authenticated": true
     },
     {
@@ -712,19 +712,19 @@
     {
       "path": "/api/task/control",
       "file": "backend/app/wcplus_agent.go",
-      "line": 509,
+      "line": 550,
       "authenticated": true
     },
     {
       "path": "/api/task/control",
       "file": "backend/app/wcplus_source.go",
-      "line": 553,
+      "line": 578,
       "authenticated": true
     },
     {
       "path": "/api/task/new",
       "file": "backend/app/wcplus_source.go",
-      "line": 538,
+      "line": 563,
       "authenticated": true
     },
     {
@@ -956,7 +956,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/wcplus_agent.go",
-      "line": 65
+      "line": 71
     },
     {
       "name": "existing_articles",
@@ -981,7 +981,7 @@
     {
       "name": "sync_content",
       "file": "backend/app/wcplus_agent.go",
-      "line": 65
+      "line": 71
     },
     {
       "name": "sync_content",
@@ -1803,142 +1803,147 @@
     {
       "name": "WCPlusAccount",
       "file": "backend/app/wcplus_source.go",
-      "line": 47
+      "line": 72
     },
     {
       "name": "WCPlusAccountList",
       "file": "backend/app/wcplus_source.go",
-      "line": 56
+      "line": 81
     },
     {
       "name": "WCPlusAgent",
       "file": "backend/app/wcplus_agent.go",
-      "line": 271
+      "line": 312
     },
     {
       "name": "WCPlusAgentBlockedError",
       "file": "backend/app/wcplus_agent.go",
-      "line": 23
+      "line": 29
     },
     {
       "name": "WCPlusAgentConfig",
       "file": "backend/app/wcplus_agent.go",
-      "line": 249
+      "line": 290
     },
     {
       "name": "WCPlusAgentCycleResult",
       "file": "backend/app/wcplus_agent.go",
-      "line": 261
+      "line": 302
     },
     {
       "name": "WCPlusArticle",
       "file": "backend/app/wcplus_source.go",
-      "line": 61
+      "line": 86
     },
     {
       "name": "WCPlusArticleContent",
       "file": "backend/app/wcplus_source.go",
-      "line": 77
+      "line": 102
     },
     {
       "name": "WCPlusArticleList",
       "file": "backend/app/wcplus_source.go",
-      "line": 71
+      "line": 96
     },
     {
       "name": "WCPlusArticleListOptions",
       "file": "backend/app/wcplus_source.go",
-      "line": 38
+      "line": 63
     },
     {
       "name": "WCPlusBatchImportItem",
       "file": "backend/app/wcplus_source.go",
-      "line": 192
+      "line": 217
     },
     {
       "name": "WCPlusBatchImportRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 178
+      "line": 203
     },
     {
       "name": "WCPlusBatchImportResult",
       "file": "backend/app/wcplus_source.go",
-      "line": 200
+      "line": 225
     },
     {
       "name": "WCPlusEnvCheck",
       "file": "backend/app/wcplus_source.go",
-      "line": 165
+      "line": 190
     },
     {
       "name": "WCPlusEnvCheckResult",
       "file": "backend/app/wcplus_source.go",
-      "line": 171
+      "line": 196
     },
     {
       "name": "WCPlusImportAccountRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 103
+      "line": 128
     },
     {
       "name": "WCPlusImportAccountResult",
       "file": "backend/app/wcplus_source.go",
-      "line": 110
+      "line": 135
     },
     {
       "name": "WCPlusImportArticleRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 86
+      "line": 111
     },
     {
       "name": "WCPlusListOptions",
       "file": "backend/app/wcplus_source.go",
-      "line": 30
+      "line": 55
+    },
+    {
+      "name": "WCPlusLocalAPIError",
+      "file": "backend/app/wcplus_source.go",
+      "line": 33
     },
     {
       "name": "WCPlusRawImportRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 93
+      "line": 118
     },
     {
       "name": "WCPlusSourceAdapter",
       "file": "backend/app/wcplus_agent.go",
-      "line": 38
+      "line": 44
     },
     {
       "name": "WCPlusSourceAdapterConfig",
       "file": "backend/app/wcplus_agent.go",
-      "line": 31
+      "line": 37
     },
     {
       "name": "WCPlusSourceConfig",
       "file": "backend/app/wcplus_source.go",
-      "line": 20
+      "line": 21
     },
     {
       "name": "WCPlusSourceService",
       "file": "backend/app/wcplus_source.go",
-      "line": 25
+      "line": 26
     },
     {
       "name": "WCPlusStatus",
       "file": "backend/app/wcplus_source.go",
-      "line": 156
+      "line": 181
     },
     {
       "name": "WCPlusTask",
       "file": "backend/app/wcplus_source.go",
-      "line": 116
+      "line": 141
     },
     {
       "name": "WCPlusTaskControlRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 151
+      "line": 176
     },
     {
       "name": "WCPlusTaskRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 132
+      "line": 157
     },
     {
       "name": "WeChatArticle",

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,63 @@ import (
 	"testing"
 	"time"
 )
+
+func TestWCPlusSourceLocalAPIErrorsAreBoundedTypedAndUnwrapCause(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		mode       string
+		statusCode int
+		privateRaw string
+		wantDetail string
+	}{
+		{name: "transport", mode: "transport", privateRaw: "XProtect private transport detail", wantDetail: "XProtect"},
+		{name: "HTTP status", mode: "status", statusCode: http.StatusForbidden, privateRaw: "private forbidden response", wantDetail: "403"},
+		{name: "rejected envelope", mode: "envelope", privateRaw: "not_max_version private envelope detail", wantDetail: "not_max_version"},
+		{name: "malformed response", mode: "malformed", privateRaw: "private-malformed-api", wantDetail: "invalid character"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var cause error
+			baseURL := "http://127.0.0.1:5001"
+			client := &http.Client{}
+			if test.mode == "transport" {
+				cause = errors.New(test.privateRaw)
+				client.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return nil, cause
+				})
+			} else {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					switch test.mode {
+					case "status":
+						http.Error(w, test.privateRaw, test.statusCode)
+					case "envelope":
+						fmt.Fprintf(w, `{"success":false,"message":%q}`, test.privateRaw)
+					case "malformed":
+						fmt.Fprint(w, test.privateRaw)
+					}
+				}))
+				defer server.Close()
+				baseURL = server.URL
+				client = server.Client()
+			}
+			service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: baseURL, HTTPClient: client})
+			_, err := service.ListAccounts(context.Background(), WCPlusListOptions{Num: 1})
+			var apiErr *WCPlusLocalAPIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("ListAccounts() error=%T %v", err, err)
+			}
+			if apiErr.StatusCode != test.statusCode || !strings.Contains(apiErr.classificationDetail, test.wantDetail) {
+				t.Fatalf("typed error status=%d detail=%q", apiErr.StatusCode, apiErr.classificationDetail)
+			}
+			if errors.Unwrap(apiErr) == nil || cause != nil && !errors.Is(err, cause) {
+				t.Fatalf("typed error did not unwrap cause: %v", err)
+			}
+			if err.Error() != "WC Plus local API request failed" || strings.Contains(err.Error(), test.privateRaw) {
+				t.Fatalf("public error=%q", err.Error())
+			}
+		})
+	}
+}
 
 func TestWCPlusSourceListsAccountsArticlesAndContent(t *testing.T) {
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
