@@ -890,23 +890,45 @@ and agent ID. Any config, Keychain, plist, binary, bootstrap, or health-check
 failure restores all non-secret files and both prior loaded states.
 
 All three actors share one fixed no-follow per-worker lifecycle advisory lock
-whose file is derived from the updater's pinned install directory. Lock order
-is always lifecycle lock, command/handoff store lock, transaction binary lock,
-then receipt/journal lock. Worker/bridge and updater never acquire these in the
-opposite order.
+whose file is derived from the updater's pinned install directory. The complete
+order is always per-worker lifecycle lock, the existing HOME-level global
+installer/Keychain lock when that actor needs it, command/handoff store lock,
+transaction binary lock, then receipt/journal lock. Every install, uninstall,
+recovery, Worker, and updater entry point follows that order; no path may first
+take the global lock and then wait for lifecycle. Worker/bridge and updater
+never acquire the later locks in the opposite order.
 
 The installer/uninstaller launches the staged fixed updater in a local
 lock-holder mode with only `--worker-type`; it derives the same lock, signals a
 fixed `locked` acknowledgement over a private installer-owned pipe, and holds
-the exclusive kernel lock until that pipe closes. No path or command is passed
-to the lock holder. The Worker/bridge holds a shared lock across the final
-maintenance check plus command checkpoint, partial-stage, handoff, and pending
+the exclusive kernel lock until an explicit completion protocol. While still
+holding the lock, the lock-holder itself creates and fsyncs the maintenance
+marker before ACK. The installer never creates or removes that marker. On
+successful transaction commit it sends a fixed commit byte; only then may the
+holder remove and fsync the marker and release the lock. EOF, installer crash,
+or any other message leaves the marker durable for recovery. No path or command
+is passed to the lock holder.
+
+The installer verifies the holder/pipe is still alive immediately before each
+irreversible file or launchd stage. If the holder dies after ACK, the durable
+marker continues to make Worker/helper fail closed; the installer stops, leaves
+its transaction journal, and a rerun recovers before a new holder may clear the
+marker. Tests SIGKILL the holder before ACK and after ACK but before the first
+file change.
+
+For a newly claimed or recovered command, the Runner's shared-lock critical
+section is exactly: acquire lifecycle, check maintenance, perform the bounded
+remote claim/recovery call, durably publish the local command checkpoint, then
+release. Thus installer exclusivity cannot interpose between server claim
+commit and the durable local checkpoint. Partial-stage, handoff, and pending
+publication each hold
+the same shared lock across their final maintenance recheck and atomic local
 publication. The updater holds a shared lock while opening/recovering an
 attempt and throughout replacement, ready wait, terminal reconciliation, and
 cleanup. A killed process releases the kernel lock automatically.
 
-Only while holding the exclusive lock does install/uninstall atomically publish
-the locally derived maintenance marker. The Runner treats that marker as a
+Only while holding the exclusive lock does the holder publish the locally
+derived maintenance marker. The Runner treats that marker as a
 hard gate: authenticated heartbeat may continue, but ordinary command claim,
 owned-command adoption, updater activation, and source lease may not begin.
 The installer then checks command checkpoints, partial stages, handoffs,
@@ -921,7 +943,10 @@ journal that a rerun must finish or roll back before clearing maintenance.
 Race tests force both interleavings: installer lock acquisition after the
 Worker's initial check but before pending publication, and Worker shared-lock
 acquisition after installer intent but before bootout. Exactly one side may
-commit; the other waits or refuses without partial publication.
+commit; the other waits or refuses without partial publication. Add same-Worker
+double-installer, install-vs-uninstall, and server-claim-committed-before-local-
+checkpoint interleavings; all must finish without deadlock under the frozen
+lock order.
 
 Shared-token publication preserves the previous Keychain value or prior
 absence until the entire install commits. Any failure restores that exact

@@ -299,7 +299,12 @@ kernel lifecycle lock derived from the pinned install directory. Installer and
 uninstaller hold it exclusively from maintenance publication through the file
 and loaded-job transaction; update publication/recovery holds it shared. This
 makes maintenance intent, command/handoff publication, and bootout mutually
-exclusive instead of relying on a check-then-act marker.
+exclusive instead of relying on a check-then-act marker. The exclusive
+lock-holder publishes and fsyncs the maintenance marker before acknowledging
+the installer, and removes it only after an explicit committed transaction;
+holder or installer failure leaves a durable fail-closed marker for recovery.
+All paths acquire the per-worker lifecycle lock before the shared global
+installer/Keychain lock or any command, binary, or journal lock.
 Uninstall first stops both jobs, is idempotently resumable after partial file
 deletion, preserves source state/outbox by default, and never deletes the
 shared token merely because one Worker is removed.
