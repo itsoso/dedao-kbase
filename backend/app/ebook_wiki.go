@@ -47,6 +47,11 @@ type ebookWikiCommandRunner interface {
 
 type osEbookWikiCommandRunner struct{}
 
+var downloadEbookForKnowledgeSync = func(ctx context.Context, id int, enid, outputDir string) (*EBookDownloadResult, error) {
+	download := EBookDownload{Ctx: ctx, DownloadType: 1, ID: id, EnID: enid, OutputDir: outputDir}
+	return download.DownloadWithResult()
+}
+
 func DefaultEbookWikiSyncConfig() EbookWikiSyncConfig {
 	cfg := EbookWikiSyncConfig{
 		RepoDir:      defaultWikiRepoDirFromEnv(),
@@ -91,6 +96,43 @@ func (r osEbookWikiCommandRunner) Run(ctx context.Context, cmd ebookWikiCommand)
 
 func SyncEbookToWiki(ctx context.Context, id int, enid string) (*EbookWikiSyncResult, error) {
 	return syncEbookToWikiWithConfig(ctx, id, enid, DefaultEbookWikiSyncConfig(), osEbookWikiCommandRunner{})
+}
+
+func SyncEbookToBookKnowledgeStore(
+	ctx context.Context,
+	id int,
+	enid string,
+	store *BookKnowledgeStore,
+	downloadRoot string,
+) (*EbookWikiSyncResult, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	if strings.TrimSpace(downloadRoot) == "" {
+		downloadRoot = DefaultDedaoDownloadRoot()
+	}
+	emitEbookWikiProgress(ctx, "正在下载电子书")
+	result, err := downloadEbookForKnowledgeSync(ctx, id, enid, downloadRoot)
+	if err != nil {
+		return nil, err
+	}
+	if result == nil || strings.TrimSpace(result.HTMLPath) == "" {
+		return nil, fmt.Errorf("电子书 HTML 路径为空: book_id=%d", id)
+	}
+	if _, err := os.Stat(result.HTMLPath); err != nil {
+		return nil, fmt.Errorf("电子书 HTML 文件不存在: %w", err)
+	}
+	emitEbookWikiProgress(ctx, "正在生成本地知识包")
+	knowledgePackage, err := BuildBookKnowledgeFromHTMLFile(BookKnowledgeBook{
+		BookID: strconv.Itoa(id), DedaoID: id, EnID: enid, Title: result.Title,
+	}, result.HTMLPath, store)
+	if err != nil {
+		return nil, err
+	}
+	return &EbookWikiSyncResult{
+		BookID: id, KnowledgeBookID: knowledgePackage.Book.BookID, Title: result.Title,
+		HTMLPath: result.HTMLPath, RepoDir: downloadRoot, BookKnowledgeRoot: store.Root(),
+	}, nil
 }
 
 func syncEbookToWikiWithConfig(

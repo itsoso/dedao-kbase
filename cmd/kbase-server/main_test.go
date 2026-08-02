@@ -24,6 +24,24 @@ func TestDefaultSystemKBExportPathUsesRepoDirEnv(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedBookKnowledgeJobs(t *testing.T) {
+	store := app.NewBookKnowledgeStore(t.TempDir())
+	job, err := store.CreateBookKnowledgeJob(app.BookKnowledgeJobRequest{
+		Type: app.BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 42, EbookEnID: "ebook-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := recoverInterruptedBookKnowledgeJobs(store)
+	if err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != app.BookKnowledgeJobStatusFailed {
+		t.Fatalf("job=%#v err=%v", loaded, err)
+	}
+}
+
 func TestDefaultSystemKBExportPathHasNoPrivateFallback(t *testing.T) {
 	t.Setenv("KBASE_SYSTEM_KB_EXPORT_PATH", "")
 	t.Setenv("DEDAO_KBASE_ROOT", "")

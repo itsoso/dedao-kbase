@@ -35,6 +35,11 @@ func main() {
 	}
 	defer sourceSync.Close()
 	bookStore := app.NewBookKnowledgeStore(*root)
+	if count, err := recoverInterruptedBookKnowledgeJobs(bookStore); err != nil {
+		log.Printf("failed to recover interrupted jobs: %v", err)
+	} else if count > 0 {
+		log.Printf("marked %d interrupted jobs as failed", count)
+	}
 	knowledgeCatalog, err := app.NewKnowledgeCatalogStore(*root, time.Now)
 	if err != nil {
 		log.Fatalf("initialize knowledge catalog: %v", err)
@@ -108,6 +113,13 @@ func main() {
 	if listenErr != nil && !errors.Is(listenErr, http.ErrServerClosed) {
 		log.Fatal(listenErr)
 	}
+}
+
+func recoverInterruptedBookKnowledgeJobs(store *app.BookKnowledgeStore) (int, error) {
+	if store == nil {
+		return 0, errors.New("book knowledge store is required")
+	}
+	return store.FailInterruptedBookKnowledgeJobs("interrupted by kbase-server restart")
 }
 
 func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherToken string) error {
