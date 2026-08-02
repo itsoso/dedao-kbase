@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -488,7 +489,7 @@ func (h *kbaseHTTPHandler) handleDedaoAuthQRCode(w http.ResponseWriter) {
 	setHTTPNoStore(w)
 	qr, err := h.dedaoAuth.NewQRCode()
 	if err != nil {
-		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		writeHTTPError(w, http.StatusBadGateway, "failed to create dedao login qrcode")
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, qr)
@@ -512,7 +513,7 @@ func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.R
 	}
 	result, err := h.dedaoAuth.CheckLogin(request.Token, request.QRCodeString)
 	if err != nil {
-		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao login")
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, result)
@@ -529,7 +530,7 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 		limit := parseBoundedInt(r.URL.Query().Get("limit"), 50, 1, 100)
 		jobs, err := h.store.ListBookKnowledgeJobs(limit)
 		if err != nil {
-			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			writeHTTPError(w, http.StatusInternalServerError, "failed to list jobs")
 			return
 		}
 		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
@@ -549,15 +550,20 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 		}
 		detail, err := h.dedaoEbooks.EbookDetail(normalized.EbookEnID)
 		if err != nil {
-			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
 			return
 		}
 		if detail == nil {
 			writeHTTPError(w, http.StatusNotFound, "ebook not found")
 			return
 		}
-		if detail.ID > 0 && detail.ID != normalized.EbookID {
-			writeHTTPError(w, http.StatusBadRequest, "ebook_id does not match ebook_enid")
+		detailEnID := strings.TrimSpace(detail.Enid)
+		if detail.ID <= 0 || detailEnID == "" {
+			writeHTTPError(w, http.StatusBadGateway, "unable to verify dedao ebook identity")
+			return
+		}
+		if detail.ID != normalized.EbookID || detailEnID != normalized.EbookEnID {
+			writeHTTPError(w, http.StatusBadRequest, "ebook identity does not match request")
 			return
 		}
 		if !detail.IsBuy && !detail.IsOnBookshelf {
@@ -566,10 +572,14 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 		}
 		job, err := h.store.CreateBookKnowledgeJob(normalized)
 		if err != nil {
-			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			writeHTTPError(w, http.StatusInternalServerError, "failed to create job")
 			return
 		}
-		go h.store.RunBookKnowledgeJob(job.ID)
+		go func() {
+			if err := h.store.RunBookKnowledgeJob(job.ID); err != nil {
+				log.Printf("book knowledge job %q failed to persist state", job.ID)
+			}
+		}()
 		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
 	default:
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -593,7 +603,7 @@ func (h *kbaseHTTPHandler) handleGetBookKnowledgeJob(w http.ResponseWriter, r *h
 	}
 	job, err := h.store.LoadBookKnowledgeJob(jobID)
 	if err != nil {
-		writeHTTPError(w, http.StatusNotFound, err.Error())
+		writeHTTPError(w, http.StatusNotFound, "job not found")
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
@@ -609,7 +619,7 @@ func (h *kbaseHTTPHandler) handleDedaoEbookSearch(w http.ResponseWriter, r *http
 	pageSize := parseBoundedInt(r.URL.Query().Get("page_size"), 30, 1, 100)
 	result, err := h.dedaoEbooks.SearchEbooks(query, page, pageSize)
 	if err != nil {
-		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		writeHTTPError(w, http.StatusBadGateway, "failed to search dedao ebooks")
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, result)
@@ -633,7 +643,7 @@ func (h *kbaseHTTPHandler) handleDedaoEbookBookshelf(w http.ResponseWriter, r *h
 	}
 	result, err := h.dedaoEbooks.AddEbookToBookshelf(enid)
 	if err != nil {
-		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		writeHTTPError(w, http.StatusBadGateway, "failed to add dedao ebook to bookshelf")
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, result)

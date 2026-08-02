@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,6 +102,31 @@ func TestBookKnowledgeJobTransitionsToSucceededAndFailed(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobRecoversExecutorPanic(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldRunner := runDedaoEbookDownloadJob
+	runDedaoEbookDownloadJob = func(context.Context, BookKnowledgeJob) (map[string]any, error) {
+		panic("malformed upstream ebook payload")
+	}
+	defer func() { runDedaoEbookDownloadJob = oldRunner }()
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 45, EbookEnID: "panic-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RunBookKnowledgeJob(job.ID)
+
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusFailed || loaded.FinishedAt == "" {
+		t.Fatalf("panic job = %#v, err=%v", loaded, err)
+	}
+	if loaded.Error != "job execution failed" {
+		t.Fatalf("panic error = %q, want sanitized failure", loaded.Error)
+	}
+}
+
 func TestBookKnowledgeJobPersistsRunningBeforeExecutorCompletes(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	oldRunner := runDedaoEbookDownloadJob
@@ -134,6 +160,32 @@ func TestBookKnowledgeJobPersistsRunningBeforeExecutorCompletes(t *testing.T) {
 	finished, err := store.LoadBookKnowledgeJob(job.ID)
 	if err != nil || finished.Status != BookKnowledgeJobStatusSucceeded {
 		t.Fatalf("finished job = %#v, err=%v", finished, err)
+	}
+}
+
+func TestBookKnowledgeJobSurfacesTerminalPersistenceFailure(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	oldRunner := runDedaoEbookDownloadJob
+	runDedaoEbookDownloadJob = func(context.Context, BookKnowledgeJob) (map[string]any, error) {
+		if err := os.RemoveAll(root); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(root, []byte("blocked"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return map[string]any{"ebook_id": 46}, nil
+	}
+	defer func() { runDedaoEbookDownloadJob = oldRunner }()
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 46, EbookEnID: "persist-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RunBookKnowledgeJob(job.ID); err == nil {
+		t.Fatal("terminal persistence failure was not returned")
 	}
 }
 

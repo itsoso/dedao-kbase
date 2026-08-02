@@ -54,6 +54,13 @@ type Progress struct {
 	ID      int    `json:"id"` // 课程 id
 }
 
+func emitEbookDownloadProgress(ctx context.Context, progress Progress) {
+	if ctx == nil || ctx.Value("events") == nil {
+		return
+	}
+	runtime.EventsEmit(ctx, "ebookDownload", progress)
+}
+
 func SetOutputDir(dir string) {
 	OutputDir = dir
 }
@@ -260,7 +267,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	var progress Progress
 	progress.Pct = 100
 	progress.Value = "正在生成" + dType[d.DownloadType] + "文件"
-	runtime.EventsEmit(d.Ctx, "ebookDownload", progress)
+	emitEbookDownloadProgress(d.Ctx, progress)
 	switch d.DownloadType {
 	case 1:
 		result.HTMLPath, err = ebookHTMLPath(outputDir, title)

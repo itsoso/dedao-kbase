@@ -1,12 +1,35 @@
 package app
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/yann0917/dedao-gui/backend/services"
 )
+
+func TestKBaseHTTPHandlerSanitizesDedaoAuthErrors(t *testing.T) {
+	auth := &fakeDedaoWebAuth{
+		qrError:    errors.New("private-cookie /srv/private/config.json"),
+		checkError: errors.New("access_token=/private/token"),
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "secret-token", DedaoAuth: auth,
+	})
+
+	qr := requestJSONKBase(handler, http.MethodPost, "/api/dedao/auth/qrcode", "secret-token", `{}`)
+	if qr.Code != http.StatusBadGateway || !strings.Contains(qr.Body.String(), "failed to create dedao login qrcode") {
+		t.Fatalf("qrcode error status=%d body=%s", qr.Code, qr.Body.String())
+	}
+	assertDedaoWebAuthResponseOmitsSecrets(t, qr.Body.String())
+
+	check := requestJSONKBase(handler, http.MethodPost, "/api/dedao/auth/check", "secret-token", `{"token":"short-lived","qr_code_string":"qr-code"}`)
+	if check.Code != http.StatusBadGateway || !strings.Contains(check.Body.String(), "failed to verify dedao login") {
+		t.Fatalf("check error status=%d body=%s", check.Code, check.Body.String())
+	}
+	assertDedaoWebAuthResponseOmitsSecrets(t, check.Body.String())
+}
 
 func TestKBaseHTTPHandlerServesDedaoSessionAndQRCode(t *testing.T) {
 	auth := &fakeDedaoWebAuth{
@@ -124,16 +147,18 @@ type fakeDedaoWebAuth struct {
 	check           DedaoLoginCheck
 	gotToken        string
 	gotQRCodeString string
+	qrError         error
+	checkError      error
 }
 
 func (f *fakeDedaoWebAuth) Session() DedaoSession { return f.session }
 
-func (f *fakeDedaoWebAuth) NewQRCode() (DedaoLoginQRCode, error) { return f.qr, nil }
+func (f *fakeDedaoWebAuth) NewQRCode() (DedaoLoginQRCode, error) { return f.qr, f.qrError }
 
 func (f *fakeDedaoWebAuth) CheckLogin(token, qrCodeString string) (DedaoLoginCheck, error) {
 	f.gotToken = token
 	f.gotQRCodeString = qrCodeString
-	return f.check, nil
+	return f.check, f.checkError
 }
 
 type fakeDedaoLoginService struct {

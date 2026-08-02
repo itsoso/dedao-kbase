@@ -3,7 +3,10 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -86,5 +89,65 @@ func TestKBaseHTTPHandlerRejectsUnownedDedaoEbookJob(t *testing.T) {
 	}
 	if jobs, _ := store.ListBookKnowledgeJobs(10); len(jobs) != 0 {
 		t.Fatalf("unowned request created jobs: %#v", jobs)
+	}
+}
+
+func TestKBaseHTTPHandlerRequiresExactDedaoEbookIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		detail     *services.EbookDetail
+		wantStatus int
+	}{
+		{name: "missing authoritative id", detail: &services.EbookDetail{Enid: "owned-enid", IsBuy: true}, wantStatus: http.StatusBadGateway},
+		{name: "mismatched authoritative enid", detail: &services.EbookDetail{ID: 42, Enid: "other-enid", IsBuy: true}, wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store: store, AuthToken: "secret-token", DedaoEbooks: &fakeDedaoEbookAcquisition{detail: test.detail},
+			})
+			resp := requestJSONKBase(handler, http.MethodPost, "/api/jobs", "secret-token", `{"type":"dedao_ebook_download","ebook_id":42,"ebook_enid":"owned-enid","download_type":1}`)
+			if resp.Code != test.wantStatus {
+				t.Fatalf("identity status=%d body=%s", resp.Code, resp.Body.String())
+			}
+			if jobs, _ := store.ListBookKnowledgeJobs(10); len(jobs) != 0 {
+				t.Fatalf("identity mismatch created jobs: %#v", jobs)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSanitizesDedaoJobErrors(t *testing.T) {
+	privateError := errors.New("private-cookie /srv/private/config.json")
+	detailFailure := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "secret-token",
+		DedaoEbooks: &fakeDedaoEbookAcquisition{detailError: privateError},
+	})
+	detailResp := requestJSONKBase(detailFailure, http.MethodPost, "/api/jobs", "secret-token", `{"type":"dedao_ebook_download","ebook_id":42,"ebook_enid":"owned-enid","download_type":1}`)
+	if detailResp.Code != http.StatusBadGateway || !strings.Contains(detailResp.Body.String(), "failed to verify dedao ebook ownership") {
+		t.Fatalf("detail error status=%d body=%s", detailResp.Code, detailResp.Body.String())
+	}
+	assertDedaoEbookResponseOmitsSecrets(t, detailResp.Body.String())
+
+	blockedRoot := filepath.Join(t.TempDir(), "blocked-root")
+	if err := os.WriteFile(blockedRoot, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	blockedStore := NewBookKnowledgeStore(blockedRoot)
+	blockedHandler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: blockedStore, AuthToken: "secret-token",
+		DedaoEbooks: &fakeDedaoEbookAcquisition{detail: &services.EbookDetail{ID: 42, Enid: "owned-enid", IsBuy: true}},
+	})
+	listResp := requestKBase(blockedHandler, http.MethodGet, "/api/jobs", "secret-token")
+	if listResp.Code != http.StatusInternalServerError || !strings.Contains(listResp.Body.String(), "failed to list jobs") || strings.Contains(listResp.Body.String(), blockedRoot) {
+		t.Fatalf("list error status=%d body=%s", listResp.Code, listResp.Body.String())
+	}
+	createResp := requestJSONKBase(blockedHandler, http.MethodPost, "/api/jobs", "secret-token", `{"type":"dedao_ebook_download","ebook_id":42,"ebook_enid":"owned-enid","download_type":1}`)
+	if createResp.Code != http.StatusInternalServerError || !strings.Contains(createResp.Body.String(), "failed to create job") || strings.Contains(createResp.Body.String(), blockedRoot) {
+		t.Fatalf("create error status=%d body=%s", createResp.Code, createResp.Body.String())
+	}
+	missingResp := requestKBase(blockedHandler, http.MethodGet, "/api/jobs/missing", "secret-token")
+	if missingResp.Code != http.StatusNotFound || strings.Contains(missingResp.Body.String(), blockedRoot) {
+		t.Fatalf("get error status=%d body=%s", missingResp.Code, missingResp.Body.String())
 	}
 }

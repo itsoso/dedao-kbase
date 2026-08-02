@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
@@ -9,6 +10,26 @@ import (
 
 	"github.com/yann0917/dedao-gui/backend/services"
 )
+
+func TestKBaseHTTPHandlerSanitizesDedaoEbookAcquisitionErrors(t *testing.T) {
+	privateError := errors.New("private-cookie /srv/private/config.json")
+	provider := &fakeDedaoEbookAcquisition{searchError: privateError, addError: privateError}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "secret-token", DedaoEbooks: provider,
+	})
+
+	search := requestKBase(handler, http.MethodGet, "/api/dedao/search/ebooks?q=test", "secret-token")
+	if search.Code != http.StatusBadGateway || !strings.Contains(search.Body.String(), "failed to search dedao ebooks") {
+		t.Fatalf("search error status=%d body=%s", search.Code, search.Body.String())
+	}
+	assertDedaoEbookResponseOmitsSecrets(t, search.Body.String())
+
+	bookshelf := requestKBase(handler, http.MethodPost, "/api/dedao/ebooks/test-enid/bookshelf", "secret-token")
+	if bookshelf.Code != http.StatusBadGateway || !strings.Contains(bookshelf.Body.String(), "failed to add dedao ebook to bookshelf") {
+		t.Fatalf("bookshelf error status=%d body=%s", bookshelf.Code, bookshelf.Body.String())
+	}
+	assertDedaoEbookResponseOmitsSecrets(t, bookshelf.Body.String())
+}
 
 func TestKBaseHTTPHandlerSearchesDedaoEbooks(t *testing.T) {
 	provider := &fakeDedaoEbookAcquisition{
@@ -50,6 +71,39 @@ func TestKBaseHTTPHandlerSearchesDedaoEbooks(t *testing.T) {
 	wrongMethod := requestKBase(handler, http.MethodPost, path, "secret-token")
 	if wrongMethod.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("search POST status = %d, want 405", wrongMethod.Code)
+	}
+}
+
+func TestDedaoSiteEbookSearchMappingStripsHighlightsAndSecrets(t *testing.T) {
+	got := dedaoEbookPageFromSiteSearch(&services.EbookSearchResult{
+		Page: 2, Size: 5, Total: 11, IsMore: 1,
+		List: []services.EbookSearchItem{{
+			Title: "行为<hl>金融</hl>学", Author: "示例作者", Content: "命中片段", Image: "https://example.test/search.jpg",
+			Detail: services.EbookSearchDetail{
+				ID: 32355, Enid: "site-ebook-enid", BookName: "行为<hl>金融</hl>学", BookAuthor: "示例作者",
+				BookIntro: "安全简介", Cover: "https://example.test/detail.jpg", CurrentPrice: "41.30",
+				CanTrialRead: true, IsBuy: true, ReadProgress: 17, ReadingTitle: "第 <hl>1</hl> 章",
+				ReadingWordToken: "must-not-leak",
+			},
+		}},
+	}, 2, 5)
+
+	if got.Page != 2 || got.PageSize != 5 || got.Total != 11 || got.TotalPages != 3 || got.IsMore != 1 {
+		t.Fatalf("pagination = %#v", got)
+	}
+	if len(got.Ebooks) != 1 {
+		t.Fatalf("ebooks = %#v", got.Ebooks)
+	}
+	ebook := got.Ebooks[0]
+	if ebook.ID != 32355 || ebook.Enid != "site-ebook-enid" || ebook.Title != "行为金融学" || ebook.LastRead != "第 1 章" {
+		t.Fatalf("mapped ebook = %#v", ebook)
+	}
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "must-not-leak") || strings.Contains(string(raw), "reading_word_token") || strings.Contains(string(raw), "<hl>") {
+		t.Fatalf("safe mapping leaked upstream-only fields: %s", raw)
 	}
 }
 
@@ -100,19 +154,22 @@ type fakeDedaoEbookAcquisition struct {
 	gotPageSize   int
 	gotAddedEnid  string
 	gotDetailEnid string
+	searchError   error
+	addError      error
+	detailError   error
 }
 
 func (f *fakeDedaoEbookAcquisition) SearchEbooks(query string, page, pageSize int) (DedaoEbookPage, error) {
 	f.gotQuery, f.gotPage, f.gotPageSize = query, page, pageSize
-	return f.searchPage, nil
+	return f.searchPage, f.searchError
 }
 
 func (f *fakeDedaoEbookAcquisition) AddEbookToBookshelf(enid string) (DedaoEbook, error) {
 	f.gotAddedEnid = enid
-	return f.added, nil
+	return f.added, f.addError
 }
 
 func (f *fakeDedaoEbookAcquisition) EbookDetail(enid string) (*services.EbookDetail, error) {
 	f.gotDetailEnid = enid
-	return f.detail, nil
+	return f.detail, f.detailError
 }
