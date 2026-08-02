@@ -27,17 +27,20 @@ const (
 	SourceAgentUpdateCodeRecoveryFailed           = "upgrade_recovery_failed"
 	SourceAgentUpdateCodeOutcomePersistenceFailed = "outcome_persistence_failed"
 
-	sourceAgentUpdateCodeInvalidRequest = "upgrade_request_invalid"
-	sourceAgentUpdateReceiptMaxBytes    = 8 << 10
-	sourceAgentUpdateDefaultTimeout     = 2 * time.Minute
-	sourceAgentUpdateDefaultPoll        = 100 * time.Millisecond
-	sourceAgentUpdateJournalFileName    = ".source-agent-update-journal.json"
-	sourceAgentUpdateJournalSchema      = "source-agent-update-journal.v1"
-	sourceAgentUpdateFaultAfterBackup   = "after_backup"
-	sourceAgentUpdateFaultAfterReplace  = "after_replace"
-	sourceAgentUpdateFaultAfterRestart  = "after_restart"
-	sourceAgentUpdateFaultAfterReady    = "after_ready"
-	sourceAgentUpdateFaultBeforeOutcome = "before_outcome"
+	sourceAgentUpdateCodeInvalidRequest            = "upgrade_request_invalid"
+	sourceAgentUpdateReceiptMaxBytes               = 8 << 10
+	sourceAgentUpdateDefaultTimeout                = 2 * time.Minute
+	sourceAgentUpdateDefaultPoll                   = 100 * time.Millisecond
+	sourceAgentUpdateJournalFileName               = ".source-agent-update-journal.json"
+	sourceAgentUpdateJournalSchema                 = "source-agent-update-journal.v1"
+	sourceAgentUpdateFaultAfterBackup              = "after_backup"
+	sourceAgentUpdateFaultAfterReplace             = "after_replace"
+	sourceAgentUpdateFaultAfterRestart             = "after_restart"
+	sourceAgentUpdateFaultAfterReady               = "after_ready"
+	sourceAgentUpdateFaultBeforeOutcome            = "before_outcome"
+	sourceAgentUpdateFaultPreReplaceAfterOutcome   = "pre_replace_after_outcome"
+	sourceAgentUpdateFaultAfterCleanupBackupRemove = "after_cleanup_backup_remove"
+	sourceAgentUpdateFaultAfterCleanupSync         = "after_cleanup_sync"
 )
 
 var (
@@ -620,6 +623,20 @@ func (u *SourceAgentUpdateTransaction) finishResult(started time.Time, request S
 }
 
 func (u *SourceAgentUpdateTransaction) failBeforeReplace(started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal, preparedPath, backupPath, code string) SourceAgentUpdateResult {
+	if journal.Stage == "backup_durable" && validSourceAgentBinaryIdentity(journal.Backup) {
+		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
+		persisted, durable := u.persistOutcome(result)
+		if !durable {
+			return persisted
+		}
+		if u.faultStage == sourceAgentUpdateFaultPreReplaceAfterOutcome {
+			return persisted
+		}
+		if err := u.finalizeDurableOutcome(journal); err != nil {
+			return persisted
+		}
+		return persisted
+	}
 	cleanupErr := u.cleanupBeforeReplace(journal, preparedPath, backupPath)
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
 	persisted, _ := u.persistOutcome(result)
@@ -710,6 +727,9 @@ func (u *SourceAgentUpdateTransaction) cleanupDurableAttempt(journal sourceAgent
 	if err := u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName())); err != nil {
 		return err
 	}
+	if u.faultStage == sourceAgentUpdateFaultAfterCleanupBackupRemove {
+		return errors.New("source agent update cleanup interrupted after backup removal")
+	}
 	if err := u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName())); err != nil {
 		return err
 	}
@@ -718,6 +738,9 @@ func (u *SourceAgentUpdateTransaction) cleanupDurableAttempt(journal sourceAgent
 	}
 	if err := u.fs.SyncDirectory(u.config.BackupRoot); err != nil {
 		return err
+	}
+	if u.faultStage == sourceAgentUpdateFaultAfterCleanupSync {
+		return errors.New("source agent update cleanup interrupted after directory sync")
 	}
 	return u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
 }

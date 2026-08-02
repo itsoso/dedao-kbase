@@ -1578,7 +1578,7 @@
     {
       "name": "SourceAgentBinaryIdentity",
       "file": "backend/app/source_agent_update.go",
-      "line": 131
+      "line": 134
     },
     {
       "name": "SourceAgentClient",
@@ -1643,17 +1643,17 @@
     {
       "name": "SourceAgentReadyChallenge",
       "file": "backend/app/source_agent_update.go",
-      "line": 162
+      "line": 165
     },
     {
       "name": "SourceAgentReadyExpectation",
       "file": "backend/app/source_agent_update.go",
-      "line": 136
+      "line": 139
     },
     {
       "name": "SourceAgentReadyReceipt",
       "file": "backend/app/source_agent_update.go",
-      "line": 147
+      "line": 150
     },
     {
       "name": "SourceAgentRunner",
@@ -1668,27 +1668,27 @@
     {
       "name": "SourceAgentUpdateConfig",
       "file": "backend/app/source_agent_update.go",
-      "line": 216
+      "line": 219
     },
     {
       "name": "SourceAgentUpdateGuardCheck",
       "file": "backend/app/source_agent_update.go",
-      "line": 89
+      "line": 92
     },
     {
       "name": "SourceAgentUpdateRequest",
       "file": "backend/app/source_agent_update.go",
-      "line": 55
+      "line": 58
     },
     {
       "name": "SourceAgentUpdateResult",
       "file": "backend/app/source_agent_update.go",
-      "line": 71
+      "line": 74
     },
     {
       "name": "SourceAgentUpdateTransaction",
       "file": "backend/app/source_agent_update.go",
-      "line": 236
+      "line": 239
     },
     {
       "name": "SourceAgentUpgradeResult",

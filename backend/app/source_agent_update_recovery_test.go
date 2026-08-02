@@ -270,6 +270,69 @@ func TestSourceAgentUpdateSuccessCleanupSyncFailureRemainsCleanupOnly(t *testing
 	}
 }
 
+func TestSourceAgentUpdatePreReplaceCrashWindowsReplayAsCleanupOnly(t *testing.T) {
+	for _, failure := range []string{"final_guard", "replace"} {
+		for _, fault := range []string{
+			sourceAgentUpdateFaultPreReplaceAfterOutcome,
+			sourceAgentUpdateFaultAfterCleanupBackupRemove,
+			sourceAgentUpdateFaultAfterCleanupSync,
+		} {
+			for _, retryKind := range []string{"same_command", "different_command"} {
+				t.Run(failure+"/"+fault+"/"+retryKind, func(t *testing.T) {
+					fixture := newSourceAgentUpdateFixture(t)
+					switch failure {
+					case "final_guard":
+						fixture.guard.failCall = 2
+					case "replace":
+						fixture.fs.fail = "replace"
+					}
+					fixture.transaction.faultStage = fault
+					first := fixture.transaction.Apply(context.Background(), fixture.request)
+					if first.Code != SourceAgentCommandCodeInstallFailed || !fixture.receipts.journalFound {
+						t.Fatalf("first=%#v journal=%v", first, fixture.receipts.journalFound)
+					}
+					assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
+
+					fixture.transaction.faultStage = ""
+					if retryKind == "different_command" {
+						fixture.fs.fail = ""
+						fixture.guard.failCall = fixture.guard.calls + 1
+					}
+					retry := fixture.request
+					if retryKind == "different_command" {
+						retry.CommandID = "command-2"
+						retry.TargetVersion = "3.0.0"
+					}
+					replayed := fixture.transaction.Apply(context.Background(), retry)
+					if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
+						t.Fatalf("pre-replace terminal was treated as recovery: %#v", replayed)
+					}
+					assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
+					if fixture.process.calls != 0 {
+						t.Fatalf("pre-replace replay restarted worker %d times", fixture.process.calls)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestSourceAgentUpdatePreReplaceOutcomePersistenceFailureRetainsRecoveryState(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.guard.failCall = 2
+	fixture.receipts.saveErr = errors.New("private outcome persistence path")
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Code != SourceAgentCommandCodeInstallFailed || result.PersistenceCode != SourceAgentUpdateCodeOutcomePersistenceFailed {
+		t.Fatalf("result=%#v", result)
+	}
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
+	if !fixture.receipts.journalFound || fixture.receipts.journal.Stage != "backup_durable" {
+		t.Fatalf("journal=%#v found=%v", fixture.receipts.journal, fixture.receipts.journalFound)
+	}
+}
+
 func TestSourceAgentUpdateCoreUsesFixedWorkerAllowlist(t *testing.T) {
 	fixture := newSourceAgentUpdateFixture(t)
 	config := fixture.transaction.config
