@@ -586,7 +586,7 @@
     {
       "path": "/api/source-agent/commands/",
       "file": "backend/app/source_agent_client.go",
-      "line": 253,
+      "line": 258,
       "authenticated": true
     },
     {
@@ -598,7 +598,7 @@
     {
       "path": "/api/source-agent/commands/claim",
       "file": "backend/app/source_agent_client.go",
-      "line": 201,
+      "line": 206,
       "authenticated": true
     },
     {
@@ -610,7 +610,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/source_agent_client.go",
-      "line": 163,
+      "line": 168,
       "authenticated": true
     },
     {
@@ -622,7 +622,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/source_agent_client.go",
-      "line": 183,
+      "line": 188,
       "authenticated": true
     },
     {
@@ -634,7 +634,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/source_agent_client.go",
-      "line": 304,
+      "line": 309,
       "authenticated": true
     },
     {
@@ -1583,7 +1583,7 @@
     {
       "name": "SourceAgentClient",
       "file": "backend/app/source_agent_client.go",
-      "line": 129
+      "line": 134
     },
     {
       "name": "SourceAgentCommand",
@@ -1623,7 +1623,7 @@
     {
       "name": "SourceAgentHTTPError",
       "file": "backend/app/source_agent_client.go",
-      "line": 115
+      "line": 120
     },
     {
       "name": "SourceAgentHeartbeat",
