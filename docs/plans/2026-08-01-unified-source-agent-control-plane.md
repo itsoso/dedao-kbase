@@ -682,11 +682,6 @@ git commit -m "feat(agent): add rollback-capable worker updater"
 - Modify: `scripts/build-wcplus-agent-macos.sh`
 - Modify: `scripts/install-source-agent-macos.sh`
 - Modify: `scripts/install-wcplus-agent-macos.sh`
-- Modify: `scripts/uninstall-source-agent-macos.sh`
-- Modify: `scripts/uninstall-wcplus-agent-macos.sh`
-- Modify: `scripts/lib/managed-worker-install.sh`
-- Modify: `scripts/lib/managed-worker-pair.sh`
-- Create: `scripts/source-agent-updater-launchd-smoke.sh`
 - Modify: `scripts/source-agent-packaging-smoke.sh`
 - Modify: `scripts/wcplus-agent-packaging-smoke.sh`
 
@@ -803,6 +798,8 @@ before the Web exposes an upgrade action.
 - Modify: `backend/app/source_agent_artifact.go`
 - Modify: `backend/app/source_agent_client.go`
 - Modify: `backend/app/source_agent_client_test.go`
+- Modify: `backend/app/source_agent_command.go`
+- Modify: `backend/app/source_agent_command_test.go`
 - Modify: `backend/app/source_agent_command_runner.go`
 - Modify: `backend/app/source_agent_command_runner_test.go`
 - Modify: `backend/app/source_agent_runner.go`
@@ -827,6 +824,11 @@ before the Web exposes an upgrade action.
 - Modify: `scripts/build-wcplus-agent-macos.sh`
 - Modify: `scripts/install-source-agent-macos.sh`
 - Modify: `scripts/install-wcplus-agent-macos.sh`
+- Modify: `scripts/uninstall-source-agent-macos.sh`
+- Modify: `scripts/uninstall-wcplus-agent-macos.sh`
+- Modify: `scripts/lib/managed-worker-install.sh`
+- Modify: `scripts/lib/managed-worker-pair.sh`
+- Create: `scripts/source-agent-updater-launchd-smoke.sh`
 - Modify: `scripts/source-agent-packaging-smoke.sh`
 - Modify: `scripts/wcplus-agent-packaging-smoke.sh`
 
@@ -886,12 +888,38 @@ current UID, exactly `0600`, strictly bounded, and normalizes only the KBase URL
 and agent ID. Any config, Keychain, plist, binary, bootstrap, or health-check
 failure restores all non-secret files and both prior loaded states.
 
+Before changing any file or loaded state, install and uninstall atomically
+publish a locally derived maintenance marker that the Worker bridge and helper
+both treat as deny. If an unacknowledged pending marker, journal, backup, or
+running transaction exists, they remove only their own maintenance marker and
+refuse without booting out either job. After the maintenance marker is durable
+and update state is empty, no new handoff may begin; the installer can safely
+bootout both jobs and enter its recoverable publication transaction. A crash
+leaves an installer journal that a rerun must finish or roll back before
+clearing maintenance. Tests race installation against handoff publication and
+every updater phase.
+
+Shared-token publication preserves the previous Keychain value or prior
+absence until the entire install commits. Any failure restores that exact
+state. If a shared token already exists, a per-worker installer accepts only
+the same value; coordinated token rotation remains a separate all-worker
+operation. Uninstalling one Worker never removes or changes the shared token.
+
 Both uninstallers first refuse an unresolved update attempt, then bootout the
 updater and Worker, remove both plists, the non-secret config, binaries, staged
 artifacts, acknowledged handoffs, and updater operational state. Source state
 and outbox remain preserved by default under the existing explicit purge flag.
 Uninstall never deletes an unacknowledged backup/journal; it reports the
-recovery action required instead.
+recovery action required instead. After both bootouts succeed, deletion is a
+forward-only idempotent transaction: partial deletion is recorded and a rerun
+continues it safely. If either bootout fails, no file is deleted and prior
+loaded states are restored. The two worker types must keep separate install
+directories, so uninstall cannot remove an updater binary used by the other
+Worker.
+
+Fault tests cover every config/plist/binary/bootstrap/Keychain boundary,
+maintenance-vs-upgrade races, unresolved-attempt refusal, partial-uninstall
+rerun, and proof that uninstalling either Worker preserves the shared token.
 
 **Step 2: Write the artifact, guard, and path-free handoff RED tests**
 
@@ -1002,7 +1030,12 @@ transition:
 | --- | --- | --- |
 | `claimed` | none | report `downloading` only |
 | `downloading` | exact staged identity plus durable handoff | `verified` |
+| `downloading` | retryable transport/server failure and no published handoff | wait and retry |
+| `downloading` | permanent metadata, compatibility, size, hash, or staging rejection | `failed` with bounded download/verification code |
 | `verified` | none | report `installing` only |
+| `verified` | handoff missing or fingerprint conflict | `failed` before starting updater |
+| `verified` | server permanently denies `installing` while the authoritative command remains owned and `verified` | replace pending progress with bounded `failed` report; never start updater |
+| `verified` | authoritative command is already terminal | reconcile the no-replacement terminal locally; never start updater |
 | `installing` | updater job durably requested, but no restart/terminal phase | wait |
 | `installing` | durable `restart_requested` phase | `restarting` |
 | `installing` | durable success outcome raced ahead of server progress | `restarting` |
@@ -1031,6 +1064,27 @@ idempotent cleanup, fsyncs it, and removes the pending marker last. If the
 server terminal state conflicts, rollback is requested instead. This ordering
 also makes an ambiguous terminal report recoverable after either process
 crashes.
+
+Worker progress responses distinguish a bounded permanent denial from a
+retryable network/server failure. A rejected `verified -> installing` request
+does not remain an endlessly retried progress report: the Runner first
+recovers authoritative command state, then queues the allowed `verified ->
+failed` transition only when the same owned command remains `verified` and
+rollout or catalog validation is a stable denial. If the server has already
+made it expired, canceled, or failed, the bridge follows the no-replacement
+terminal reconciliation row. Ownership/fingerprint anomalies block for
+operator repair. A transport error, timeout, or 5xx keeps the original pending
+report and does not manufacture a terminal result.
+
+Terminal reconciliation is finite:
+
+| Server terminal | Local evidence | Local resolution |
+| --- | --- | --- |
+| `succeeded` | matching success, replacement retained | terminal ack then cleanup |
+| `rolled_back` | matching restored outcome | terminal ack then cleanup |
+| `failed`, `expired`, or `canceled` | no replacement occurred | terminal ack then cleanup |
+| `failed`, `expired`, `canceled`, or fingerprint conflict | replacement occurred | durable rollback request; after restored outcome write `terminal_conflict_restored`, then cleanup without trying to mutate the immutable server terminal |
+| any terminal | rollback failed | retain marker, backup, journal, and diagnostics; block source work/install/uninstall pending explicit repair |
 
 **Step 5: Verify all RED layers before production changes**
 

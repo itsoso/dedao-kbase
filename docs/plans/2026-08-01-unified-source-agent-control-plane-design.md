@@ -252,6 +252,8 @@ updater beside each worker. Each Worker and updater is a separate LaunchAgent.
 The updater job is kept alive only while a locally derived durable pending
 marker exists, so it survives Worker restart and resumes after its own crash.
 The Worker never forks the updater into its own launchd process group.
+Starting the updater is replay-safe and never kills an already running helper;
+only the updater's fixed Worker-restart operation may use a replacing restart.
 
 The updater job accepts only a known worker type. It reads command identity and
 artifact metadata from a strict path-free local handoff, derives all executable
@@ -278,12 +280,23 @@ The updater:
 
 The transaction durably arms its ready challenge before restarting the Worker.
 After authenticated heartbeat, a restarted Worker resumes the same owned
-command before claiming unrelated work. Local success retains the old binary
-until the server accepts the matching terminal command report; a conflicting
-or expired server terminal state requests rollback instead. A server-authored,
+command before claiming unrelated work; an owned-command recovery query closes
+the window between the server committing the initial claim and the Worker
+persisting its local command checkpoint. Local success retains the old binary
+until the server accepts the matching terminal command report. A conflicting
+or expired server terminal state requests rollback; restored local safety may
+then be acknowledged without changing the immutable server terminal, while a
+rollback failure retains recovery state for explicit repair. A server-authored,
 command-bound guard rechecks claim ownership, exact catalog metadata, rollout
 permission, remaining command lifetime, and absence of an active source run
 both before preparation and immediately before replacement.
+
+Installation is one recoverable local transaction over the Worker/updater
+binary pair, both plists, protected per-worker config, shared-token Keychain
+state, and both loaded-job states. It refuses an unresolved update attempt.
+Uninstall first stops both jobs, is idempotently resumable after partial file
+deletion, preserves source state/outbox by default, and never deletes the
+shared token merely because one Worker is removed.
 
 Production Worker and updater binaries receive their revision only from the
 clean source HEAD at build time. Ready identity uses that compiled revision,

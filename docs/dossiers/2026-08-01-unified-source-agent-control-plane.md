@@ -15,9 +15,10 @@
 ## Outcome
 
 The approved design is frozen as the delivery baseline for a unified KBase
-control plane over independent source workers. Delivery has not started. Any
-change to the boundaries below must return to definition and update the design
-decision before implementation proceeds.
+control plane over independent source workers. Delivery is in progress at the
+Task 10A definition amendment described below. Any change to the boundaries
+below must return to definition and update the design decision before
+implementation proceeds.
 
 Architecture counts must be cited only from the generated system map described
 by `docs/system-map/INDEX.md`; route, command, operation, durable-object, or
