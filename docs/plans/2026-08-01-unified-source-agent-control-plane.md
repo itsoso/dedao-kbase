@@ -682,6 +682,11 @@ git commit -m "feat(agent): add rollback-capable worker updater"
 - Modify: `scripts/build-wcplus-agent-macos.sh`
 - Modify: `scripts/install-source-agent-macos.sh`
 - Modify: `scripts/install-wcplus-agent-macos.sh`
+- Modify: `scripts/uninstall-source-agent-macos.sh`
+- Modify: `scripts/uninstall-wcplus-agent-macos.sh`
+- Modify: `scripts/lib/managed-worker-install.sh`
+- Modify: `scripts/lib/managed-worker-pair.sh`
+- Create: `scripts/source-agent-updater-launchd-smoke.sh`
 - Modify: `scripts/source-agent-packaging-smoke.sh`
 - Modify: `scripts/wcplus-agent-packaging-smoke.sh`
 
@@ -838,8 +843,22 @@ life.executor.kbase.wcplus-agent  life.executor.kbase.wcplus-agent.updater
 The updater job is on-demand, has fixed arguments
 `source-agent-updater --run-pending --worker-type <known-worker>`, and is not a
 child of the Worker job. The Worker may only kickstart the corresponding fixed
-updater label. Do not set `AbandonProcessGroup`; the separate job is the
-survival boundary.
+updater label. Its plist uses `KeepAlive.PathState` on the locally derived
+durable pending marker. The marker is published before activation and remains
+until a matching server terminal state is acknowledged and local cleanup is
+durable. Therefore launchd restarts an updater killed before, during, or after
+replacement, including while no healthy Worker exists. Do not set
+`AbandonProcessGroup`; the separate job plus marker is the survival boundary.
+
+Expose two different fixed process operations. `StartUpdater` uses
+`launchctl kickstart` without `-k`; it is safe to replay and must not replace an
+already running updater PID. `RestartWorker` alone uses `kickstart -k` for its
+fixed Worker label. A crash before the helper creates its transaction journal
+is recovered because the pending marker remains and the relaunched helper
+reopens the same handoff. A crash after any journal phase uses the existing
+transaction recovery. The helper stays alive after a durable local outcome
+while it waits for a server-terminal acknowledgement instead of exiting into a
+KeepAlive restart loop.
 
 The installer writes one `0600` non-secret config beside the updater per
 worker type. It contains only the locally selected KBase base URL and agent ID.
@@ -852,10 +871,27 @@ in argv, plist environment, config, handoff, stdout, stderr, and logs.
 
 Add installer/CLI RED tests that prove the updater job remains independently
 supervised across a Worker restart, and add a macOS-only process-boundary smoke
-that kills/replaces the Worker fixture while the independently launched updater
-fixture persists and records its terminal outcome. The real production labels
-must not be mutated by the test; actual launchctl bootstrap/restart is verified
-later at G5 with the reviewed plists.
+that uses unique test labels and a temporary `PathState` marker, SIGKILLs the
+updater fixture before its journal and again mid-transaction, and proves
+launchd starts a new PID that reaches a durable terminal outcome. It also
+starts the same running job twice without changing its PID. The real production
+labels must not be mutated by the test; their actual bootstrap/restart is
+verified later at G5 with the reviewed plists.
+
+Extend the shared installer transaction rather than publishing the second
+plist ad hoc. One recoverable transaction covers the Worker/updater binary
+pair, Worker plist, updater plist, per-worker config, and both launchd loaded
+states. Config publication is atomic, fsynced, regular/no-follow, owned by the
+current UID, exactly `0600`, strictly bounded, and normalizes only the KBase URL
+and agent ID. Any config, Keychain, plist, binary, bootstrap, or health-check
+failure restores all non-secret files and both prior loaded states.
+
+Both uninstallers first refuse an unresolved update attempt, then bootout the
+updater and Worker, remove both plists, the non-secret config, binaries, staged
+artifacts, acknowledged handoffs, and updater operational state. Source state
+and outbox remain preserved by default under the existing explicit purge flag.
+Uninstall never deletes an unacknowledged backup/journal; it reports the
+recovery action required instead.
 
 **Step 2: Write the artifact, guard, and path-free handoff RED tests**
 
@@ -891,6 +927,14 @@ both `SourceAgentUpdateTransaction` checks, including the check after durable
 backup immediately before atomic replacement. An earlier progress report or a
 local cache is never an allow decision.
 
+The final guard also requires enough server-clock command lifetime for the
+fixed restart timeout, ready timeout, server reconciliation window, and a
+bounded safety margin. These timeouts are protocol constants, not remote or
+configurable handoff fields. Insufficient remaining lifetime denies before
+replacement. If the server nevertheless becomes expired, canceled, or
+conflicting after replacement, the local success backup is still retained and
+the bridge requests rollback before acknowledging or cleaning the attempt.
+
 **Step 3: Write restart, readiness, and command-recovery RED tests**
 
 Before invoking the fixed Worker restart, the transaction must durably advance
@@ -903,29 +947,49 @@ terminal outcome persistence.
 The Worker receives an exact build revision through linker injection. Add a
 local `build-info` command that reports bounded worker type, version, protocol,
 platform, architecture, and revision without loading credentials. Production
-packaging requires a clean exact 40- or 64-character lowercase revision and
-injects the same revision into the Worker and updater build. A new Worker may
-write ready only when its compiled identity, including revision, matches the
-armed challenge; it must never copy revision from the challenge into its own
-identity. Packaging smokes compare `build-info` with the artifact revision.
+packaging derives the revision only from `git rev-parse HEAD`, rejects any
+tracked, staged, or untracked source-tree change, and rejects any caller
+override even if it is valid hex. CI may verify its trusted commit SHA equals
+that derived HEAD but may not replace it. The build injects the same exact 40-
+or 64-character lowercase revision into the Worker and updater. Catalog
+preparation reads and verifies revision from the artifact's `build-info`; it is
+never hand-entered. A new Worker may write ready only when its compiled
+identity, including revision, matches the armed challenge; it must never copy
+revision from the challenge into its own identity. SHA-256 remains a byte
+integrity check and is not described as publisher identity or signing.
 
 After every authenticated heartbeat and before any ordinary claim or source
 lease, the Runner:
 
 1. idempotently writes one matching ready receipt if a local challenge exists;
-2. asks the bridge for a protected pending command ID;
-3. explicitly resumes that command through the existing command-ID claim
-   route;
-4. accepts only the same agent's active upgrade states and restores
-   `currentCommand` before doing any other work.
+2. asks the bridge for a protected pending command ID and, when present,
+   explicitly resumes it through the existing command-ID claim route;
+3. when no local ID exists, calls a Worker-authenticated recovery route that
+   returns at most the one non-terminal upgrade already owned by this agent,
+   closing the crash window after the server commits a claim but before the
+   HTTP response or local checkpoint;
+4. durably adopts the recovered or newly claimed command ID, type, artifact
+   ID, expected version, expiry, and fingerprint before any report or local
+   side effect; failure to publish this checkpoint stops the cycle;
+5. restores `currentCommand` before doing any other work.
 
 `ClaimCommand` continues to accept only newly claimed commands.
-`ResumeCommand` is a separate strict client method for `claimed`,
-`downloading`, `verified`, `installing`, `restarting`, `verifying`, or
-`rollback`. A terminal server command is reconciled with the matching durable
-local outcome, then the local handoff is acknowledged and cleaned before a
-later cycle can claim unrelated work. A missing, foreign, expired, or
-fingerprint-conflicting command fails closed and retains bounded diagnostics.
+`ResumeUpgradeCommand` is a separate strict client method. For execution it
+accepts only `claimed`, `downloading`, `verified`, `installing`, `restarting`,
+`verifying`, or `rollback`; it may also return the strict terminal upgrade
+states solely to `ReconcileUpgradeCommand`. A terminal state never re-executes
+a side effect. Matching server success/rolled-back/pre-replace-failure is
+acknowledged locally; a terminal expired, canceled, failed, or fingerprint
+conflict after replacement writes a durable rollback request while the backup
+is still retained. The independent helper restores the old binary and restarts
+it before the local attempt can be cleaned or unrelated work claimed.
+
+Immediately after any ordinary upgrade claim response, the Runner publishes
+the same protected checkpoint before it reports `downloading`. If it crashes
+between the server commit and response/checkpoint, the owned-command recovery
+route returns that exact active upgrade on the next authenticated cycle. A
+missing, foreign, ambiguous, or fingerprint-conflicting recovery fails closed
+with bounded diagnostics.
 
 **Step 4: Define deterministic local phase to server-state mapping**
 
@@ -941,12 +1005,14 @@ transition:
 | `verified` | none | report `installing` only |
 | `installing` | updater job durably requested, but no restart/terminal phase | wait |
 | `installing` | durable `restart_requested` phase | `restarting` |
-| `installing` | durable pre-restart failure or rolled-back outcome | `failed` or `rollback` |
+| `installing` | durable success outcome raced ahead of server progress | `restarting` |
+| `installing` | durable failure before any binary replacement | `failed` |
+| `installing` | replacement began and recovery is active, restored, or failed | `rollback` |
 | `restarting` | helper still waiting for ready/outcome | wait |
 | `restarting` | matching durable success outcome | `verifying` |
-| `restarting` | matching rollback outcome | `rollback` |
+| `restarting` | recovery is active, restored, or failed | `rollback` |
 | `verifying` | durable success, matching current binary identity, compiled identity, ready receipt, and authenticated heartbeat | `succeeded` |
-| `verifying` | matching rollback outcome | `rollback` |
+| `verifying` | recovery is active, restored, or failed | `rollback` |
 | `rollback` | durable restored outcome | `rolled_back` |
 | `rollback` | durable rollback failure | `failed` |
 
@@ -957,6 +1023,15 @@ nor skips rollback. Disabling rollout after claim, after download, after the
 `installing` report, or between the transaction's two guard calls leaves or
 restores the old binary.
 
+A durable success or restored outcome does not immediately delete its backup,
+journal, handoff, or pending marker. After the server accepts the matching
+terminal report, the authenticated Worker publishes a strict local terminal
+acknowledgement. The updater validates command ID and fingerprint, performs
+idempotent cleanup, fsyncs it, and removes the pending marker last. If the
+server terminal state conflicts, rollback is requested instead. This ordering
+also makes an ambiguous terminal report recoverable after either process
+crashes.
+
 **Step 5: Verify all RED layers before production changes**
 
 ```bash
@@ -965,6 +1040,7 @@ go test ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-u
   -run 'TestSourceAgent(UpdateBridge|ArtifactHandoff|UpdateGuard|ReadyAfterHeartbeat|ResumeUpgrade|UpdaterJob|RealWorkerUpgrade)' -count=1
 bash scripts/source-agent-packaging-smoke.sh
 bash scripts/wcplus-agent-packaging-smoke.sh
+bash scripts/source-agent-updater-launchd-smoke.sh
 ```
 
 Expected: FAIL because workers still use fail-closed stubs, there is no updater
@@ -980,7 +1056,8 @@ Use separate commits in this order:
 3. `restart_requested`, ready-after-authenticated-heartbeat, and command resume;
 4. independent updater LaunchAgents, protected config, Keychain loading, and
    deterministic phase mapping wired into both real Worker constructors;
-5. build revision injection, `build-info`, packaging/process-boundary smokes,
+5. atomic paired install/uninstall recovery for both jobs and local config;
+6. build revision injection, `build-info`, packaging/process-boundary smokes,
    and generated system map.
 
 Do not leave a hybrid commit in which the UI or real Worker claims upgrade
@@ -995,6 +1072,7 @@ go test -race ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-a
 bash scripts/source-agent-artifact-smoke.sh
 bash scripts/source-agent-packaging-smoke.sh
 bash scripts/wcplus-agent-packaging-smoke.sh
+bash scripts/source-agent-updater-launchd-smoke.sh
 bash scripts/system-map-smoke.sh
 bash scripts/privacy-smoke.sh
 git diff --check

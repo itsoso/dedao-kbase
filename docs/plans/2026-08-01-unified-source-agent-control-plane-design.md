@@ -4,6 +4,8 @@
 
 **Date:** 2026-08-01
 
+**Updater recovery amendment:** 2026-08-02
+
 **Decision:** Evolve the existing KBase source-agent control plane into one
 operator-controlled management layer. WeChat and WC Plus remain independent
 workers with isolated state and failure domains. The protocol is
@@ -246,7 +248,21 @@ variable, installation path, or arbitrary URL.
 ### macOS updater
 
 The first platform implementation installs a fixed-function, user-level
-updater beside each worker. The updater:
+updater beside each worker. Each Worker and updater is a separate LaunchAgent.
+The updater job is kept alive only while a locally derived durable pending
+marker exists, so it survives Worker restart and resumes after its own crash.
+The Worker never forks the updater into its own launchd process group.
+
+The updater job accepts only a known worker type. It reads command identity and
+artifact metadata from a strict path-free local handoff, derives all executable
+and state paths plus both LaunchAgent labels from its own installed identity,
+and reads the shared token directly from the fixed Keychain service/account.
+The local installer atomically publishes a protected non-secret KBase URL and
+agent-ID config; no remote payload, handoff, argv, plist environment, or log
+may carry a token or select a URL, path, label, executable, script, or
+environment override.
+
+The updater:
 
 1. accepts only a known worker type and command identity;
 2. verifies platform, architecture, version compatibility, size, and SHA-256;
@@ -259,6 +275,19 @@ updater beside each worker. The updater:
 8. confirms only after the new worker loads configuration and state and sends
    one authenticated heartbeat;
 9. restores the old binary and restarts it when verification fails or expires.
+
+The transaction durably arms its ready challenge before restarting the Worker.
+After authenticated heartbeat, a restarted Worker resumes the same owned
+command before claiming unrelated work. Local success retains the old binary
+until the server accepts the matching terminal command report; a conflicting
+or expired server terminal state requests rollback instead. A server-authored,
+command-bound guard rechecks claim ownership, exact catalog metadata, rollout
+permission, remaining command lifetime, and absence of an active source run
+both before preparation and immediately before replacement.
+
+Production Worker and updater binaries receive their revision only from the
+clean source HEAD at build time. Ready identity uses that compiled revision,
+not a value copied from the command, challenge, handoff, or catalog.
 
 The updater cannot execute arbitrary commands. Its first installation remains
 a local, explicit installer action so remote control cannot bootstrap a new

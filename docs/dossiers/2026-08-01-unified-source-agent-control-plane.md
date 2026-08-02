@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Definition complete; delivery not started
+**Status:** Delivery in progress; Task 10A updater recovery amendment under review
 
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
@@ -26,10 +26,30 @@ narrative documentation.
 
 ## Current Stage and Next Handoff
 
-Definition is complete and delivery has not started. The next task is Task 2:
-implement the Source Agent registry schema and persistence. The approved
-implementation plan above is the delivery sequence, while this dossier remains
-the handoff spine and Gate record for resuming work.
+Tasks 1 through 10 have been implemented and independently reviewed. Before
+Task 11 exposes an upgrade control, delivery returned to the definition loop
+because the real Workers still fail closed at the artifact-to-updater handoff.
+Task 10A in the approved implementation plan is now the active Gate. The Web
+overview remains blocked until that Gate passes implementation, recovery,
+security, and review checks.
+
+## 2026-08-02 Updater Recovery Definition Amendment
+
+The first Task 10A draft was rejected because a helper forked by a Worker may
+be killed with the Worker's launchd process group and because a restarted
+Runner cannot recover an in-memory active command. A second draft added an
+independent updater job but was rejected because it did not yet guarantee
+updater crash recovery, initial-claim recovery, deterministic terminal
+reconciliation, or atomic paired install/uninstall.
+
+The current amendment requires a separately supervised updater LaunchAgent per
+Worker, a durable `PathState` pending marker, restart-safe command recovery,
+pre-armed ready identity, a server-authored pre-replacement guard, clean-HEAD
+compiled revision identity, retained backup until server terminal
+acknowledgement, and recoverable publication of the binary pair, both plists,
+and protected local config. These changes refine the approved macOS updater;
+they do not add signing, remote paths, arbitrary execution, scheduled rollout,
+or per-agent authentication claims.
 
 ## Approved Constraints
 
