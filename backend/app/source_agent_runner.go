@@ -138,7 +138,11 @@ func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult
 		return result, nil
 	}
 	defer r.finishSourceRun()
-	return r.executeLeasedRun(ctx, *run, result)
+	result, err = r.executeLeasedRun(ctx, *run, result)
+	if err != nil {
+		result.OK = false
+	}
+	return result, err
 }
 
 func (r *SourceAgentRunner) acquireControl(ctx context.Context) error {

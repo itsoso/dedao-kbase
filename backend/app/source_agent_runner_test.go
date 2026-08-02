@@ -150,9 +150,12 @@ func TestSourceAgentRunnerPersistsAdapterFailureCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = runner.RunOnce(context.Background())
+	result, err := runner.RunOnce(context.Background())
 	if err == nil || !strings.Contains(err.Error(), cause.Error()) {
 		t.Fatalf("RunOnce() error=%v", err)
+	}
+	if result.OK {
+		t.Fatalf("RunOnce() result=%#v, want OK=false on execution error", result)
 	}
 	if failedCursor != "safe-cursor" {
 		t.Fatalf("failed cursor=%q", failedCursor)

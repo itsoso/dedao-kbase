@@ -576,6 +576,186 @@ func TestWCPlusBlockedCapabilitySharedRunnerLeasesNoWorkAndHasNoBusinessSuccess(
 	}
 }
 
+func TestWCPlusExecuteBlockerLatchesVendorBlockedAndStopsNextLease(t *testing.T) {
+	var localMu sync.Mutex
+	rootCalls := 0
+	taskCalls := 0
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			localMu.Lock()
+			rootCalls++
+			localMu.Unlock()
+			fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>`)
+		case "/api/report/gzh_articles":
+			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考","Img":"https://example.test/account.png"},"articles":[{"ID":"article-1","Title":"已有链接","URL":"https://mp.weixin.qq.com/s/article-1"}],"total":1}`)
+		case "/api/task/new":
+			localMu.Lock()
+			taskCalls++
+			localMu.Unlock()
+			fmt.Fprint(w, `{"task_id":0,"status":"ready"}`)
+		default:
+			t.Fatalf("unexpected local path: %s", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+
+	var remoteMu sync.Mutex
+	heartbeats := make([]SourceAgentHeartbeat, 0, 2)
+	leaseCalls := 0
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			var heartbeat SourceAgentHeartbeat
+			if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+				t.Fatal(err)
+			}
+			remoteMu.Lock()
+			heartbeats = append(heartbeats, heartbeat)
+			remoteMu.Unlock()
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+		case "/api/source-agent/commands/claim":
+			fmt.Fprint(w, `{"command":null}`)
+		case "/api/source-agent/lease":
+			remoteMu.Lock()
+			leaseCalls++
+			call := leaseCalls
+			remoteMu.Unlock()
+			if call == 1 {
+				fmt.Fprint(w, `{"run":{"id":"run-blocked","status":"running","requested_operation":"sync_links","subscription":{"id":"sub-1","source_type":"wcplus_wechat_article","source_account_key":"biz-med","source_account":"医学参考","operation":"sync_links","enabled":true,"options":{"limit":10}}}}`)
+				return
+			}
+			fmt.Fprint(w, `{"run":null}`)
+		case "/api/source-agent/runs/run-blocked/fail":
+			fmt.Fprint(w, `{"run":{"id":"run-blocked","status":"failed"}}`)
+		default:
+			t.Fatalf("unexpected remote path: %s", r.URL.Path)
+		}
+	}))
+	defer remote.Close()
+
+	service := NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: local.URL, HTTPClient: local.Client()})
+	adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{WCPlus: service})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: remote.URL, AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(), HTTPClient: remote.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := runner.RunOnce(context.Background())
+	var blocked *WCPlusAgentBlockedError
+	if !errors.As(err, &blocked) {
+		t.Fatalf("first blocked cycle error=%v", err)
+	}
+	if result.OK {
+		t.Errorf("first blocked cycle result=%#v, want OK=false", result)
+	}
+	health := adapter.Status(context.Background())
+	if health.Healthy || health.Code != "vendor_blocked" {
+		t.Errorf("latched health=%#v", health)
+	}
+	encodedHealth, err := json.Marshal(health)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, private := range []string{"task_id 0", "authorization or activation"} {
+		if strings.Contains(string(encodedHealth), private) {
+			t.Fatalf("latched health leaked %q: %s", private, encodedHealth)
+		}
+	}
+
+	result, err = runner.RunOnce(context.Background())
+	if err != nil || result.OK {
+		t.Errorf("second blocked cycle result=%#v error=%v", result, err)
+	}
+	remoteMu.Lock()
+	gotHeartbeats := append([]SourceAgentHeartbeat(nil), heartbeats...)
+	gotLeaseCalls := leaseCalls
+	remoteMu.Unlock()
+	if len(gotHeartbeats) != 2 || gotHeartbeats[1].CapabilityHealth["wcplus"].Code != "vendor_blocked" || gotLeaseCalls != 1 {
+		t.Fatalf("heartbeats=%#v lease_calls=%d", gotHeartbeats, gotLeaseCalls)
+	}
+	encodedHeartbeat, err := json.Marshal(gotHeartbeats[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encodedHeartbeat), "task_id 0") {
+		t.Fatalf("heartbeat leaked blocker reason: %s", encodedHeartbeat)
+	}
+	localMu.Lock()
+	gotRootCalls, gotTaskCalls := rootCalls, taskCalls
+	localMu.Unlock()
+	if gotRootCalls != 1 || gotTaskCalls != 1 {
+		t.Fatalf("root_calls=%d task_calls=%d", gotRootCalls, gotTaskCalls)
+	}
+}
+
+func TestWCPlusExecuteOrdinaryTaskFailureDoesNotLatchVendorBlocked(t *testing.T) {
+	for _, status := range []string{"failed", "canceled"} {
+		t.Run(status, func(t *testing.T) {
+			local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/":
+					fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>`)
+				case "/api/report/gzh_articles":
+					fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考"},"articles":[{"ID":"article-1","Title":"已有链接","URL":"https://mp.weixin.qq.com/s/article-1"}],"total":1}`)
+				case "/api/task/new":
+					fmt.Fprint(w, `{"task_id":"task-1","status":"ready"}`)
+				case "/api/task/control":
+					fmt.Fprint(w, `{"status":"ok"}`)
+				case "/api/task/all":
+					fmt.Fprintf(w, `{"tasks":[{"task_id":"task-1","status":%q,"message":"ordinary task outcome"}]}`, status)
+				default:
+					t.Fatalf("unexpected local path: %s", r.URL.Path)
+				}
+			}))
+			defer local.Close()
+
+			adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
+				WCPlus:           NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: local.URL, HTTPClient: local.Client()}),
+				TaskPollAttempts: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			outbox, err := NewSourceAgentOutbox(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = outbox.Close() })
+			run := SourceSyncRun{
+				ID: "run-ordinary-" + status, Status: SourceRunRunning, RequestedOperation: "sync_links",
+				Subscription: &SourceSubscription{SourceAccountKey: "biz-med", SourceAccount: "医学参考", Options: map[string]any{"limit": 10}},
+			}
+			_, err = adapter.Execute(context.Background(), run, outbox)
+			var blocked *WCPlusAgentBlockedError
+			if !errors.As(err, &blocked) {
+				t.Fatalf("Execute() error=%v", err)
+			}
+			health := adapter.Status(context.Background())
+			if !health.Healthy || health.Code == "vendor_blocked" {
+				t.Fatalf("ordinary %s latched health=%#v", status, health)
+			}
+		})
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

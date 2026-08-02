@@ -323,7 +323,7 @@ func TestWCPlusAgentRequiresKnownModeAndConfiguration(t *testing.T) {
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if err := runCLI(context.Background(), []string{"doctor"}, mapLookup(nil), &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "KBASE_REMOTE_URL") {
+	if err := runCLI(context.Background(), []string{"doctor"}, mapLookup(nil), &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "WCPLUS_AGENT_STATE_DIR") {
 		t.Fatalf("missing config error = %v", err)
 	}
 }
@@ -369,6 +369,19 @@ func TestWCPlusAgentCapabilityStateDirectoryPrefersWorkerSpecificPath(t *testing
 	}
 	if cfg.StateDir != "wcplus-state" {
 		t.Fatalf("state=%q", cfg.StateDir)
+	}
+}
+
+func TestWCPlusAgentCapabilityStateDirectoryRequiresWorkerSpecificPath(t *testing.T) {
+	env := testEnv{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_ID":  "wcplus-agent-a",
+		"SOURCE_AGENT_STATE_DIR": t.TempDir(),
+		"WCPLUSPRO_BASE_URL":     "http://127.0.0.1:5001",
+	}
+	_, err := loadWCPlusAgentConfigOnly(env.Lookup)
+	if err == nil || !strings.Contains(err.Error(), "WCPLUS_AGENT_STATE_DIR is required") {
+		t.Fatalf("generic-only state directory error=%v", err)
 	}
 }
 

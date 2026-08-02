@@ -514,7 +514,7 @@
     {
       "path": "/api/report/reading_data",
       "file": "backend/app/wcplus_agent.go",
-      "line": 442,
+      "line": 459,
       "authenticated": true
     },
     {
@@ -712,7 +712,7 @@
     {
       "path": "/api/task/control",
       "file": "backend/app/wcplus_agent.go",
-      "line": 492,
+      "line": 509,
       "authenticated": true
     },
     {
@@ -956,7 +956,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/wcplus_agent.go",
-      "line": 63
+      "line": 65
     },
     {
       "name": "existing_articles",
@@ -981,7 +981,7 @@
     {
       "name": "sync_content",
       "file": "backend/app/wcplus_agent.go",
-      "line": 63
+      "line": 65
     },
     {
       "name": "sync_content",
@@ -1813,22 +1813,22 @@
     {
       "name": "WCPlusAgent",
       "file": "backend/app/wcplus_agent.go",
-      "line": 254
+      "line": 271
     },
     {
       "name": "WCPlusAgentBlockedError",
       "file": "backend/app/wcplus_agent.go",
-      "line": 22
+      "line": 23
     },
     {
       "name": "WCPlusAgentConfig",
       "file": "backend/app/wcplus_agent.go",
-      "line": 232
+      "line": 249
     },
     {
       "name": "WCPlusAgentCycleResult",
       "file": "backend/app/wcplus_agent.go",
-      "line": 244
+      "line": 261
     },
     {
       "name": "WCPlusArticle",
@@ -1903,12 +1903,12 @@
     {
       "name": "WCPlusSourceAdapter",
       "file": "backend/app/wcplus_agent.go",
-      "line": 37
+      "line": 38
     },
     {
       "name": "WCPlusSourceAdapterConfig",
       "file": "backend/app/wcplus_agent.go",
-      "line": 30
+      "line": 31
     },
     {
       "name": "WCPlusSourceConfig",

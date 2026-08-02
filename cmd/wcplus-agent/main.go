@@ -121,7 +121,7 @@ func loadWCPlusAgentConfigOnly(lookup environmentLookup) (app.SourceAgentConfig,
 		WCPlusBaseURL: lookupValue(lookup, "WCPLUSPRO_BASE_URL"),
 	}
 	if config.StateDir == "" {
-		config.StateDir = lookupValue(lookup, "SOURCE_AGENT_STATE_DIR")
+		return app.SourceAgentConfig{}, fmt.Errorf("WCPLUS_AGENT_STATE_DIR is required")
 	}
 	if config.WCPlusBaseURL == "" {
 		config.WCPlusBaseURL = lookupValue(lookup, "WCPLUS_BASE_URL")

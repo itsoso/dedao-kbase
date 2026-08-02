@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,6 +40,7 @@ type WCPlusSourceAdapter struct {
 	taskPollAttempts int
 	taskPollInterval time.Duration
 	onTaskProgress   func(WCPlusTask)
+	vendorBlocked    atomic.Bool
 }
 
 func NewWCPlusSourceAdapter(config WCPlusSourceAdapterConfig) (*WCPlusSourceAdapter, error) {
@@ -64,6 +66,9 @@ func (a *WCPlusSourceAdapter) Operations() []string {
 }
 
 func (a *WCPlusSourceAdapter) Status(ctx context.Context) SourceCapabilityHealth {
+	if a.vendorBlocked.Load() {
+		return wcplusVendorBlockedCapabilityHealth("")
+	}
 	status, err := a.wcplus.Status(ctx)
 	return wcplusCapabilityHealth(status, err)
 }
@@ -97,28 +102,8 @@ func wcplusCapabilityHealth(status *WCPlusStatus, statusErr error) SourceCapabil
 	if statusErr != nil {
 		detail += " " + statusErr.Error()
 	}
-	detail = strings.ToLower(strings.TrimSpace(detail))
-	vendorBlocked := statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden ||
-		statusCode == http.StatusLocked || statusCode == http.StatusTooManyRequests ||
-		statusCode == http.StatusUnavailableForLegalReasons
-	if !vendorBlocked {
-		for _, marker := range []string{
-			"xprotect", "malware", "quarantine", "not_max_version", "unactivated", "not activated",
-			"license", "licence", "authorization", "activation", "vendor blocked", "throttl",
-			"too many requests", "parameter expired", "parameter_expired", "req_data expired",
-		} {
-			if strings.Contains(detail, marker) {
-				vendorBlocked = true
-				break
-			}
-		}
-	}
-	if vendorBlocked {
-		return SourceCapabilityHealth{
-			Healthy: false, Code: "vendor_blocked", Version: version,
-			LastError:      "WC Plus is blocked by the vendor or host security.",
-			RequiresAction: "Install and activate a vendor-supported WC Plus build.",
-		}
+	if wcplusVendorBlocked(statusCode, detail) {
+		return wcplusVendorBlockedCapabilityHealth(version)
 	}
 	return SourceCapabilityHealth{
 		Healthy: false, Code: "dependency_unavailable", Version: version,
@@ -127,7 +112,39 @@ func wcplusCapabilityHealth(status *WCPlusStatus, statusErr error) SourceCapabil
 	}
 }
 
-func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (SourceAdapterResult, error) {
+func wcplusVendorBlocked(statusCode int, detail string) bool {
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusLocked, http.StatusTooManyRequests, http.StatusUnavailableForLegalReasons:
+		return true
+	}
+	detail = strings.ToLower(strings.TrimSpace(detail))
+	for _, marker := range []string{
+		"xprotect", "malware", "quarantine", "not_max_version", "unactivated", "not activated",
+		"license", "licence", "authorization", "activation", "vendor blocked", "throttl",
+		"too many requests", "parameter expired", "parameter_expired", "req_data expired", "task_id 0",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func wcplusVendorBlockedCapabilityHealth(version string) SourceCapabilityHealth {
+	return SourceCapabilityHealth{
+		Healthy: false, Code: "vendor_blocked", Version: version,
+		LastError:      "WC Plus is blocked by the vendor or host security.",
+		RequiresAction: "Install and activate a vendor-supported WC Plus build.",
+	}
+}
+
+func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (result SourceAdapterResult, err error) {
+	defer func() {
+		var blocked *WCPlusAgentBlockedError
+		if errors.As(err, &blocked) && wcplusVendorBlocked(0, blocked.Reason) {
+			a.vendorBlocked.Store(true)
+		}
+	}()
 	if run.Subscription == nil {
 		return SourceAdapterResult{}, fmt.Errorf("subscription snapshot is required")
 	}
@@ -591,19 +608,14 @@ func sourceAgentRequestRetryable(err error) bool {
 
 func wcplusTaskBlockedReason(task WCPlusTask) string {
 	text := strings.ToLower(strings.TrimSpace(strings.Join([]string{task.Status, task.StatusError, task.Message}, " ")))
-	for _, marker := range []string{
-		"not_max_version", "unactivated", "not activated", "throttl", "too many requests",
-		"parameter expired", "parameter_expired", "request parameter expired", "req_data expired",
-	} {
-		if strings.Contains(text, marker) {
-			reason := strings.TrimSpace(task.StatusError + " " + task.Message)
-			if reason == "" {
-				reason = strings.TrimSpace(task.Status)
-			}
-			return reason
-		}
+	if !wcplusVendorBlocked(0, text) {
+		return ""
 	}
-	return ""
+	reason := strings.TrimSpace(task.StatusError + " " + task.Message)
+	if reason == "" {
+		reason = strings.TrimSpace(task.Status)
+	}
+	return reason
 }
 
 func wcplusArticleListFingerprint(list *WCPlusArticleList) string {
