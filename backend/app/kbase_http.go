@@ -673,7 +673,8 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		detail, err := h.dedaoEbooks.EbookDetail(normalized.EbookEnID)
+		jobService := getService()
+		detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, jobService, normalized.EbookEnID)
 		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
 			return
@@ -700,11 +701,11 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusInternalServerError, "failed to create job")
 			return
 		}
-		go func() {
-			if err := h.store.RunBookKnowledgeJob(job.ID); err != nil {
+		go func(service *services.Service) {
+			if err := h.store.RunBookKnowledgeJobWithService(job.ID, service); err != nil {
 				log.Printf("book knowledge job %q failed to persist state", job.ID)
 			}
-		}()
+		}(jobService)
 		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
 	default:
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")

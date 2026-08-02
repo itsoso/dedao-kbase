@@ -16,8 +16,6 @@ type DedaoEbook struct {
 	Icon          string `json:"icon,omitempty"`
 	Price         string `json:"price,omitempty"`
 	Progress      int    `json:"progress"`
-	PublishNum    int    `json:"publish_num,omitempty"`
-	LastRead      string `json:"last_read,omitempty"`
 	IsBuy         bool   `json:"is_buy"`
 	IsOnBookshelf bool   `json:"is_on_bookshelf"`
 	CanTrial      bool   `json:"can_trial_read,omitempty"`
@@ -36,6 +34,10 @@ type DedaoEbookAcquisitionService interface {
 	SearchEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
 	AddEbookToBookshelf(enid string) (DedaoEbook, error)
 	EbookDetail(enid string) (*services.EbookDetail, error)
+}
+
+type dedaoEbookServiceScopedDetail interface {
+	EbookDetailWithService(service *services.Service, enid string) (*services.EbookDetail, error)
 }
 
 type liveDedaoEbookAcquisitionService struct{}
@@ -83,6 +85,17 @@ func (liveDedaoEbookAcquisitionService) EbookDetail(enid string) (*services.Eboo
 	return EbookDetail(enid)
 }
 
+func (liveDedaoEbookAcquisitionService) EbookDetailWithService(service *services.Service, enid string) (*services.EbookDetail, error) {
+	return service.EbookDetail(enid)
+}
+
+func dedaoEbookDetailWithService(provider DedaoEbookAcquisitionService, service *services.Service, enid string) (*services.EbookDetail, error) {
+	if scoped, ok := provider.(dedaoEbookServiceScopedDetail); ok {
+		return scoped.EbookDetailWithService(service, enid)
+	}
+	return provider.EbookDetail(enid)
+}
+
 func dedaoEbookPageFromSiteSearch(result *services.EbookSearchResult, page, pageSize int) DedaoEbookPage {
 	if result == nil {
 		return DedaoEbookPage{Ebooks: []DedaoEbook{}, Page: page, PageSize: pageSize}
@@ -114,7 +127,6 @@ func dedaoEbookPageFromSiteSearch(result *services.EbookSearchResult, page, page
 			Icon:     firstNonEmptyEbookField(detail.Cover, item.Image, item.Extra.Image),
 			Price:    firstNonEmptyEbookField(detail.CurrentPrice, detail.Price, detail.OriginalPrice),
 			Progress: detail.ReadProgress,
-			LastRead: stripDedaoSearchHighlights(detail.ReadingTitle),
 			IsBuy:    detail.IsBuy,
 			CanTrial: detail.CanTrialRead,
 		})
@@ -134,7 +146,7 @@ func dedaoEbookFromServiceDetail(detail *services.EbookDetail) DedaoEbook {
 		Author: firstNonEmptyEbookField(detail.BookAuthor, strings.Join(detail.AuthorList, " / ")),
 		Intro:  firstNonEmptyEbookField(detail.BookIntro, detail.AuthorInfo, detail.OperatingTitle),
 		Icon:   detail.Cover, Price: firstNonEmptyEbookField(detail.CurrentPrice, detail.Price, detail.OriginalPrice),
-		PublishNum: detail.Count, IsBuy: detail.IsBuy, IsOnBookshelf: detail.IsOnBookshelf, CanTrial: detail.CanTrialRead,
+		IsBuy: detail.IsBuy, IsOnBookshelf: detail.IsOnBookshelf, CanTrial: detail.CanTrialRead,
 	}
 }
 

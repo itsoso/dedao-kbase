@@ -2357,14 +2357,19 @@ async function pollBookKnowledgeJob(jobID, enid, attempt = 0) {
 }
 
 async function loadDedaoEbookJobs() {
+  const restoredActiveJobs = [];
   try {
     const payload = await apiFetch("/api/jobs?limit=50");
     for (const job of Array.isArray(payload?.jobs) ? payload.jobs : []) {
       if (!["dedao_ebook_download", "dedao_ebook_sync_kbase"].includes(job?.type) || !job?.ebook_enid) continue;
       if (!dedaoEbookAcquisitionState.jobs[job.ebook_enid]) {
         dedaoEbookAcquisitionState.jobs[job.ebook_enid] = job;
+        if (job.id && ["queued", "running"].includes(String(job.status || "").toLowerCase())) {
+          restoredActiveJobs.push({ id: job.id, enid: job.ebook_enid });
+        }
       }
     }
+    await Promise.allSettled(restoredActiveJobs.map((job) => pollBookKnowledgeJob(job.id, job.enid)));
   } catch (error) {
     if (!dedaoEbookAcquisitionState.message) {
       dedaoEbookAcquisitionState.message = `任务状态暂不可用：${error instanceof Error ? error.message : String(error)}`;

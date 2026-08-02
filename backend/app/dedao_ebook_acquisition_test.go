@@ -95,14 +95,14 @@ func TestDedaoSiteEbookSearchMappingStripsHighlightsAndSecrets(t *testing.T) {
 		t.Fatalf("ebooks = %#v", got.Ebooks)
 	}
 	ebook := got.Ebooks[0]
-	if ebook.ID != 32355 || ebook.Enid != "site-ebook-enid" || ebook.Title != "行为金融学" || ebook.LastRead != "第 1 章" {
+	if ebook.ID != 32355 || ebook.Enid != "site-ebook-enid" || ebook.Title != "行为金融学" {
 		t.Fatalf("mapped ebook = %#v", ebook)
 	}
 	raw, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "must-not-leak") || strings.Contains(string(raw), "reading_word_token") || strings.Contains(string(raw), "<hl>") {
+	if strings.Contains(string(raw), "must-not-leak") || strings.Contains(string(raw), "reading_word_token") || strings.Contains(string(raw), "last_read") || strings.Contains(string(raw), "publish_num") || strings.Contains(string(raw), "<hl>") {
 		t.Fatalf("safe mapping leaked upstream-only fields: %s", raw)
 	}
 }
@@ -154,6 +154,7 @@ type fakeDedaoEbookAcquisition struct {
 	gotPageSize   int
 	gotAddedEnid  string
 	gotDetailEnid string
+	gotDetailSvc  *services.Service
 	searchError   error
 	addError      error
 	detailError   error
@@ -172,4 +173,9 @@ func (f *fakeDedaoEbookAcquisition) AddEbookToBookshelf(enid string) (DedaoEbook
 func (f *fakeDedaoEbookAcquisition) EbookDetail(enid string) (*services.EbookDetail, error) {
 	f.gotDetailEnid = enid
 	return f.detail, f.detailError
+}
+
+func (f *fakeDedaoEbookAcquisition) EbookDetailWithService(service *services.Service, enid string) (*services.EbookDetail, error) {
+	f.gotDetailSvc = service
+	return f.EbookDetail(enid)
 }

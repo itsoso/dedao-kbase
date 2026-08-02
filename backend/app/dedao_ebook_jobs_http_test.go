@@ -31,7 +31,10 @@ func TestKBaseHTTPHandlerAuthorizesOwnedDedaoEbookJobs(t *testing.T) {
 
 	oldRunner := runDedaoEbookDownloadJob
 	done := make(chan struct{})
-	runDedaoEbookDownloadJob = func(_ context.Context, job BookKnowledgeJob) (map[string]any, error) {
+	runDedaoEbookDownloadJob = func(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
+		if provider.gotDetailSvc == nil || dedaoServiceFromContext(ctx) != provider.gotDetailSvc {
+			t.Errorf("job service did not match ownership verification service")
+		}
 		close(done)
 		return map[string]any{"ebook_id": job.EbookID, "title": "测试书"}, nil
 	}
