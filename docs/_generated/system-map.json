@@ -1667,6 +1667,16 @@
       "line": 143
     },
     {
+      "name": "SourceAgentUpdateBridge",
+      "file": "backend/app/source_agent_update_bridge.go",
+      "line": 57
+    },
+    {
+      "name": "SourceAgentUpdateBridgeConfig",
+      "file": "backend/app/source_agent_update_bridge.go",
+      "line": 36
+    },
+    {
       "name": "SourceAgentUpdateConfig",
       "file": "backend/app/source_agent_update.go",
       "line": 258
