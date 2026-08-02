@@ -3,12 +3,71 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestWCPlusAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T) {
+	base := map[string]string{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_ID":  "wcplus-agent-a",
+		"WCPLUS_AGENT_STATE_DIR": "state",
+	}
+	t.Run("explicit non-empty environment wins", func(t *testing.T) {
+		values := testEnv{}
+		for key, value := range base {
+			values[key] = value
+		}
+		values["KBASE_SOURCE_AGENT_TOKEN"] = "env-token"
+		called := false
+		cfg, err := loadWCPlusAgentConfigWithTransportToken(context.Background(), values.Lookup, func(context.Context) (string, error) {
+			called = true
+			return "stored-token", nil
+		})
+		if err != nil || cfg.AgentToken != "env-token" || called {
+			t.Fatalf("token=%q loader_called=%t error=%v", cfg.AgentToken, called, err)
+		}
+	})
+	t.Run("missing environment loads shared token", func(t *testing.T) {
+		cfg, err := loadWCPlusAgentConfigWithTransportToken(context.Background(), testEnv(base).Lookup, func(context.Context) (string, error) {
+			return "stored-token", nil
+		})
+		if err != nil || cfg.AgentToken != "stored-token" {
+			t.Fatalf("token=%q error=%v", cfg.AgentToken, err)
+		}
+	})
+	for _, test := range []struct {
+		name   string
+		values map[string]string
+		loader func(context.Context) (string, error)
+	}{
+		{name: "blank environment", values: map[string]string{"KBASE_SOURCE_AGENT_TOKEN": "\t"}, loader: func(context.Context) (string, error) { return "fallback", nil }},
+		{name: "missing secret", loader: func(context.Context) (string, error) { return "", errors.New("raw /private/tmp token-sentinel") }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			values := testEnv{}
+			for key, value := range base {
+				values[key] = value
+			}
+			for key, value := range test.values {
+				values[key] = value
+			}
+			_, err := loadWCPlusAgentConfigWithTransportToken(context.Background(), values.Lookup, test.loader)
+			if err == nil {
+				t.Fatal("expected token error")
+			}
+			for _, forbidden := range []string{"fallback", "/private/tmp", "token-sentinel"} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("error leaked %q: %v", forbidden, err)
+				}
+			}
+		})
+	}
+}
 
 func TestWCPlusAgentDoctorChecksLocalAndRemoteWithoutLeasing(t *testing.T) {
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

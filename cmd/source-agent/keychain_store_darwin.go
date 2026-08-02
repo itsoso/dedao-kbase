@@ -16,10 +16,11 @@ import (
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 const (
-	sourceAgentKeychainService = "life.executor.kbase.source-agent"
+	sourceAgentKeychainService = sourceagentsecret.KeychainService
 	keychainMasterKeyName      = "_storage-key-v1"
 	keychainEnvelopePrefix     = "kbase:v1:"
 	keychainMasterKeySize      = 32

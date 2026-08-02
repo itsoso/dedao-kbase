@@ -5,36 +5,37 @@ umask 077
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-label="${WCPLUS_AGENT_LABEL:-life.executor.kbase.wcplus-agent}"
+home="${HOME:?HOME is required}"
+label="life.executor.kbase.wcplus-agent"
+worker_type="wcplus-worker"
+transport_token_service="life.executor.kbase.source-agent"
+transport_token_account="transport-token"
 binary_source="${WCPLUS_AGENT_BINARY_PATH:-$repo_root/build/bin/wcplus-agent}"
-install_dir="${WCPLUS_AGENT_INSTALL_DIR:-$HOME/Library/Application Support/dedao-kbase/bin}"
-plist_path="${WCPLUS_AGENT_PLIST_PATH:-$HOME/Library/LaunchAgents/$label.plist}"
+updater_source="${WCPLUS_AGENT_UPDATER_BINARY_PATH:-$repo_root/build/bin/source-agent-updater}"
+install_dir="${WCPLUS_AGENT_INSTALL_DIR:-$home/Library/Application Support/dedao-kbase/bin}"
+plist_path="${WCPLUS_AGENT_PLIST_PATH:-$home/Library/LaunchAgents/$label.plist}"
 state_dir="${WCPLUS_AGENT_STATE_DIR:-}"
-log_dir="${WCPLUS_AGENT_LOG_DIR:-$HOME/Library/Logs/dedao-kbase/wcplus-agent}"
+log_dir="${WCPLUS_AGENT_LOG_DIR:-$home/Library/Logs/dedao-kbase/wcplus-agent}"
 poll_seconds="${WCPLUS_AGENT_POLL_SECONDS:-15}"
 restart_seconds="${WCPLUS_AGENT_RESTART_SECONDS:-30}"
 wcplus_url="${WCPLUSPRO_BASE_URL:-${WCPLUS_BASE_URL:-http://127.0.0.1:5001}}"
 mode="install"
 
 usage() {
-  echo "usage: install-wcplus-agent-macos.sh [--check]" >&2
+  echo "usage: install-wcplus-agent-macos.sh [--check|--render-plist]" >&2
 }
 
 case "${1:-}" in
   "") ;;
   --check) mode="check" ;;
+  --render-plist) mode="render" ;;
   *)
     usage
     exit 2
     ;;
 esac
 
-required_names=(
-  KBASE_REMOTE_URL
-  KBASE_SOURCE_AGENT_ID
-  KBASE_SOURCE_AGENT_TOKEN
-  WCPLUS_AGENT_STATE_DIR
-)
+required_names=(KBASE_REMOTE_URL KBASE_SOURCE_AGENT_ID KBASE_SOURCE_AGENT_TOKEN WCPLUS_AGENT_STATE_DIR)
 missing_names=()
 for name in "${required_names[@]}"; do
   if [[ -z "${!name:-}" ]]; then
@@ -46,8 +47,14 @@ if [[ ${#missing_names[@]} -gt 0 ]]; then
   printf '  %s\n' "${missing_names[@]}" >&2
   exit 2
 fi
+if [[ -n "${KBASE_AUTH_TOKEN:-}" && "$KBASE_AUTH_TOKEN" == "$KBASE_SOURCE_AGENT_TOKEN" ]]; then
+  echo "admin and source-agent tokens must differ" >&2
+  exit 2
+fi
+transport_token="$KBASE_SOURCE_AGENT_TOKEN"
+unset KBASE_SOURCE_AGENT_TOKEN
 
-for command_name in grep install launchctl mktemp plutil sed; do
+for command_name in cat install launchctl mktemp mv plutil sed; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "missing required command: $command_name" >&2
     exit 1
@@ -61,7 +68,11 @@ if [[ ! -x "$binary_source" ]]; then
   echo "WCPLUS_AGENT_BINARY_PATH must point to an executable" >&2
   exit 2
 fi
-if ! printf '%s' "$KBASE_SOURCE_AGENT_TOKEN" | LC_ALL=C grep -Eq '^[!-~]+$'; then
+if [[ ! -x "$updater_source" ]]; then
+  echo "WCPLUS_AGENT_UPDATER_BINARY_PATH must point to an executable" >&2
+  exit 2
+fi
+if ! printf '%s' "$transport_token" | LC_ALL=C grep -Eq '^[!-~]+$'; then
   echo "KBASE_SOURCE_AGENT_TOKEN must contain printable ASCII without spaces" >&2
   exit 2
 fi
@@ -88,6 +99,11 @@ if [[ ! "$restart_seconds" =~ ^[0-9]+$ ]] || ((restart_seconds < 10 || restart_s
   exit 2
 fi
 
+if ! "$updater_source" --check --worker-type "$worker_type" >/dev/null 2>&1; then
+  echo "WC Plus updater preflight failed" >&2
+  exit 1
+fi
+
 xml_escape() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
@@ -95,18 +111,15 @@ xml_escape() {
 render_plist() {
   local destination="$1"
   local installed_binary="$2"
-  local resolved_state_dir="$3"
-  local resolved_log_dir="$4"
-  local label_xml binary_xml remote_xml agent_id_xml token_xml wcplus_xml state_xml stdout_xml stderr_xml
+  local label_xml binary_xml remote_xml agent_id_xml wcplus_xml state_xml stdout_xml stderr_xml
   label_xml="$(xml_escape "$label")"
   binary_xml="$(xml_escape "$installed_binary")"
   remote_xml="$(xml_escape "$KBASE_REMOTE_URL")"
   agent_id_xml="$(xml_escape "$KBASE_SOURCE_AGENT_ID")"
-  token_xml="$(xml_escape "$KBASE_SOURCE_AGENT_TOKEN")"
   wcplus_xml="$(xml_escape "$wcplus_url")"
-  state_xml="$(xml_escape "$resolved_state_dir")"
-  stdout_xml="$(xml_escape "$resolved_log_dir/stdout.log")"
-  stderr_xml="$(xml_escape "$resolved_log_dir/stderr.log")"
+  state_xml="$(xml_escape "$state_dir")"
+  stdout_xml="$(xml_escape "$log_dir/stdout.log")"
+  stderr_xml="$(xml_escape "$log_dir/stderr.log")"
   cat >"$destination" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -125,8 +138,6 @@ render_plist() {
     <string>$remote_xml</string>
     <key>KBASE_SOURCE_AGENT_ID</key>
     <string>$agent_id_xml</string>
-    <key>KBASE_SOURCE_AGENT_TOKEN</key>
-    <string>$token_xml</string>
     <key>WCPLUSPRO_BASE_URL</key>
     <string>$wcplus_xml</string>
     <key>WCPLUS_AGENT_STATE_DIR</key>
@@ -156,43 +167,69 @@ PLIST
 }
 
 tmp_plist="$(mktemp "${TMPDIR:-/tmp}/wcplus-agent.XXXXXX.plist")"
-tmp_binary=""
+worker_tmp=""
+updater_tmp=""
+plist_tmp=""
 cleanup() {
   rm -f "$tmp_plist"
-  if [[ -n "$tmp_binary" ]]; then
-    rm -f "$tmp_binary"
-  fi
+  [[ -z "$worker_tmp" ]] || rm -f "$worker_tmp"
+  [[ -z "$updater_tmp" ]] || rm -f "$updater_tmp"
+  [[ -z "$plist_tmp" ]] || rm -f "$plist_tmp"
 }
 trap cleanup EXIT
 
+if [[ "$mode" == "render" ]]; then
+  render_plist "$tmp_plist" "$binary_source"
+  cat "$tmp_plist"
+  exit 0
+fi
 if [[ "$mode" == "check" ]]; then
-  render_plist "$tmp_plist" "$binary_source" "$state_dir" "$log_dir"
+  render_plist "$tmp_plist" "$binary_source"
   echo "wcplus-agent installation configuration is valid"
   exit 0
 fi
 
 mkdir -p "$install_dir" "$state_dir" "$log_dir" "$(dirname "$plist_path")"
+chmod 0700 "$install_dir" "$state_dir" "$log_dir"
 binary_source="$(cd "$(dirname "$binary_source")" && pwd -P)/$(basename "$binary_source")"
+updater_source="$(cd "$(dirname "$updater_source")" && pwd -P)/$(basename "$updater_source")"
 install_dir="$(cd "$install_dir" && pwd -P)"
 state_dir="$(cd "$state_dir" && pwd -P)"
 log_dir="$(cd "$log_dir" && pwd -P)"
 plist_dir="$(cd "$(dirname "$plist_path")" && pwd -P)"
 plist_path="$plist_dir/$(basename "$plist_path")"
-installed_binary="$install_dir/wcplus-agent"
+installed_worker="$install_dir/wcplus-agent"
+installed_updater="$install_dir/source-agent-updater"
 
-render_plist "$tmp_plist" "$installed_binary" "$state_dir" "$log_dir"
-tmp_binary="$install_dir/.wcplus-agent.$$"
-install -m 0755 "$binary_source" "$tmp_binary"
-mv -f "$tmp_binary" "$installed_binary"
-tmp_binary=""
+worker_tmp="$install_dir/.wcplus-agent.$$"
+updater_tmp="$install_dir/.source-agent-updater.$$"
+install -m 0755 "$binary_source" "$worker_tmp"
+install -m 0755 "$updater_source" "$updater_tmp"
+mv -f "$worker_tmp" "$installed_worker"
+worker_tmp=""
+mv -f "$updater_tmp" "$installed_updater"
+updater_tmp=""
+if ! "$install_dir/source-agent-updater" --check --worker-type wcplus-worker >/dev/null 2>&1; then
+  echo "installed WC Plus updater preflight failed" >&2
+  exit 1
+fi
+
+if ! printf '%s\n%s\n' "$transport_token" "$transport_token" | \
+  /usr/bin/security add-generic-password -U -s "$transport_token_service" -a "$transport_token_account" -w >/dev/null 2>&1; then
+  echo "store source-agent transport token failed" >&2
+  exit 1
+fi
+
+render_plist "$tmp_plist" "$installed_worker"
+plist_tmp="$plist_path.tmp.$$"
+install -m 0600 "$tmp_plist" "$plist_tmp"
+mv -f "$plist_tmp" "$plist_path"
+plist_tmp=""
 
 domain="gui/$(id -u)"
 if launchctl print "$domain/$label" >/dev/null 2>&1; then
   launchctl bootout "$domain/$label"
 fi
-install -m 0600 "$tmp_plist" "$plist_path"
 launchctl bootstrap "$domain" "$plist_path"
 launchctl kickstart -k "$domain/$label"
-
 echo "wcplus-agent installed and started"
-echo "LaunchAgent label: $label"

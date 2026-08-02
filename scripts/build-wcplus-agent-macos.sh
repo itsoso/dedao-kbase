@@ -4,7 +4,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
-output_path="${WCPLUS_AGENT_BINARY_PATH:-$repo_root/build/bin/wcplus-agent}"
+worker_output="${WCPLUS_AGENT_BINARY_PATH:-$repo_root/build/bin/wcplus-agent}"
+updater_output="${WCPLUS_AGENT_UPDATER_BINARY_PATH:-$repo_root/build/bin/source-agent-updater}"
 
 usage() {
   echo "usage: build-wcplus-agent-macos.sh [--check]" >&2
@@ -42,8 +43,16 @@ case "${1:-}" in
 esac
 
 check_environment
+if [[ "$worker_output" == "$updater_output" ]]; then
+  echo "worker and updater output paths must differ" >&2
+  exit 2
+fi
 if [[ "$mode" == "check" ]]; then
-  echo "wcplus-agent build environment is ready"
+  case "$(uname -m)" in
+    arm64) check_arch="arm64" ;;
+    x86_64) check_arch="amd64" ;;
+  esac
+  echo "wcplus-agent build environment is ready for darwin/$check_arch"
   exit 0
 fi
 
@@ -52,19 +61,26 @@ case "$(uname -m)" in
   x86_64) goarch="amd64" ;;
 esac
 
-mkdir -p "$(dirname "$output_path")"
-tmp_output="${output_path}.tmp.$$"
-trap 'rm -f "$tmp_output"' EXIT
+mkdir -p "$(dirname "$worker_output")" "$(dirname "$updater_output")"
+worker_tmp="${worker_output}.tmp.$$"
+updater_tmp="${updater_output}.tmp.$$"
+cleanup() {
+  rm -f "$worker_tmp" "$updater_tmp"
+}
+trap cleanup EXIT
 
 (
   cd "$repo_root"
   CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" \
-    go build -trimpath -ldflags="-s -w" -o "$tmp_output" ./cmd/wcplus-agent
+    go build -trimpath -ldflags="-s -w" -o "$worker_tmp" ./cmd/wcplus-agent
+  CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" \
+    go build -trimpath -ldflags="-s -w" -o "$updater_tmp" ./cmd/source-agent-updater
 )
-chmod 0755 "$tmp_output"
-mv -f "$tmp_output" "$output_path"
+chmod 0755 "$worker_tmp" "$updater_tmp"
+mv -f "$worker_tmp" "$worker_output"
+mv -f "$updater_tmp" "$updater_output"
 trap - EXIT
 
-checksum="$(shasum -a 256 "$output_path" | awk '{print $1}')"
 echo "wcplus-agent built for darwin/$goarch"
-echo "sha256: $checksum"
+echo "wcplus-agent sha256: $(shasum -a 256 "$worker_output" | awk '{print $1}')"
+echo "source-agent-updater sha256: $(shasum -a 256 "$updater_output" | awk '{print $1}')"

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 type sourceEnvironmentLookup func(string) (string, bool)
@@ -25,14 +26,29 @@ func main() {
 	}
 }
 func loadSourceAgentConfig(lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
-	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
-	cfg := app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: value("KBASE_SOURCE_AGENT_TOKEN"), AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}
-	if cfg.AgentToken == "" && cfg.AgentID != "" {
-		if raw, err := newKeychainSecretStore(cfg.AgentID, nil).Load(context.Background(), "transport-token"); err == nil {
-			cfg.AgentToken = string(raw)
-		}
+	return loadSourceAgentConfigWithTransportToken(context.Background(), lookup, sourceagentsecret.LoadTransportToken)
+}
+
+func loadSourceAgentConfigWithTransportToken(ctx context.Context, lookup sourceEnvironmentLookup, loader sourceagentsecret.Loader) (app.SourceAgentConfig, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
 	}
-	return cfg.Normalized()
+	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
+	rawToken, provided := lookup("KBASE_SOURCE_AGENT_TOKEN")
+	validationToken := rawToken
+	if !provided {
+		validationToken = "pending-transport-token"
+	}
+	cfg, err := (app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: validationToken, AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}).Normalized()
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	token, err := sourceagentsecret.ResolveTransportToken(ctx, rawToken, provided, loader)
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	cfg.AgentToken = token
+	return cfg, nil
 }
 func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) error {
 	if len(args) != 1 {

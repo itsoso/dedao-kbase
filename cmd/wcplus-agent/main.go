@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 const wcplusAgentVersion = "0.1.0"
@@ -87,12 +88,21 @@ func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout
 }
 
 func loadWCPlusAgentConfig(lookup environmentLookup) (app.SourceAgentConfig, error) {
+	return loadWCPlusAgentConfigWithTransportToken(context.Background(), lookup, sourceagentsecret.LoadTransportToken)
+}
+
+func loadWCPlusAgentConfigWithTransportToken(ctx context.Context, lookup environmentLookup, loader sourceagentsecret.Loader) (app.SourceAgentConfig, error) {
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
+	rawToken, provided := lookup("KBASE_SOURCE_AGENT_TOKEN")
+	validationToken := rawToken
+	if !provided {
+		validationToken = "pending-transport-token"
+	}
 	config := app.SourceAgentConfig{
 		RemoteURL:     lookupValue(lookup, "KBASE_REMOTE_URL"),
-		AgentToken:    lookupValue(lookup, "KBASE_SOURCE_AGENT_TOKEN"),
+		AgentToken:    validationToken,
 		AgentID:       lookupValue(lookup, "KBASE_SOURCE_AGENT_ID"),
 		StateDir:      lookupValue(lookup, "SOURCE_AGENT_STATE_DIR"),
 		WCPlusBaseURL: lookupValue(lookup, "WCPLUSPRO_BASE_URL"),
@@ -107,6 +117,11 @@ func loadWCPlusAgentConfig(lookup environmentLookup) (app.SourceAgentConfig, err
 	if err != nil {
 		return app.SourceAgentConfig{}, err
 	}
+	token, err := sourceagentsecret.ResolveTransportToken(ctx, rawToken, provided, loader)
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	normalized.AgentToken = token
 	return normalized, nil
 }
 

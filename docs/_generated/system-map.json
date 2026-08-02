@@ -966,7 +966,7 @@
     {
       "name": "existing_articles",
       "file": "cmd/wcplus-agent/main.go",
-      "line": 22
+      "line": 23
     },
     {
       "name": "sync_articles",
@@ -996,7 +996,7 @@
     {
       "name": "sync_content",
       "file": "cmd/wcplus-agent/main.go",
-      "line": 23
+      "line": 24
     },
     {
       "name": "sync_media",
@@ -2073,7 +2073,7 @@
     {
       "name": "sourceAgentDoctorReport",
       "file": "cmd/source-agent/main.go",
-      "line": 112
+      "line": 128
     },
     {
       "name": "sourceAgentPendingCommandReport",
