@@ -141,10 +141,244 @@ a.button {
 .dedao-home,
 .dedao-courses,
 .dedao-course-detail,
-.dedao-ebook-detail {
+.dedao-ebook-detail,
+.dedao-login {
   width: min(100% - 48px, 1320px);
   margin: 0 auto;
   padding: 34px 0 56px;
+}
+
+.dedao-login {
+  display: grid;
+  grid-template-columns: minmax(0, 1.08fr) minmax(340px, 0.72fr);
+  gap: clamp(24px, 5vw, 72px);
+  align-items: center;
+  min-height: calc(100vh - 58px);
+}
+
+.dedao-login__intro {
+  padding: clamp(12px, 3vw, 44px);
+}
+
+.dedao-login__intro h1 {
+  max-width: 760px;
+  margin: 0;
+  font-family: "Songti SC", "STSong", serif;
+  font-size: clamp(46px, 7vw, 88px);
+  font-weight: 700;
+  letter-spacing: -0.055em;
+  line-height: 0.98;
+}
+
+.dedao-login__intro > p:not(.web-kicker) {
+  max-width: 680px;
+  margin: 28px 0 34px;
+  color: #71675a;
+  font-size: 17px;
+  line-height: 1.8;
+}
+
+.dedao-login__intro ol {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid rgba(141, 132, 117, 0.2);
+  border-radius: 12px;
+  background: rgba(141, 132, 117, 0.2);
+  list-style: none;
+}
+
+.dedao-login__intro li {
+  display: flex;
+  gap: 12px;
+  padding: 18px;
+  background: #fffdf8;
+}
+
+.dedao-login__intro li > span {
+  color: #ff6b00;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.dedao-login__intro li strong,
+.dedao-login__intro li small {
+  display: block;
+}
+
+.dedao-login__intro li small {
+  margin-top: 5px;
+  color: #8d8475;
+  line-height: 1.45;
+}
+
+.dedao-login__panel {
+  position: relative;
+  padding: clamp(24px, 4vw, 42px);
+  overflow: hidden;
+  border: 1px solid rgba(141, 132, 117, 0.22);
+  border-radius: 18px;
+  background:
+    linear-gradient(135deg, rgba(255, 107, 0, 0.06), transparent 45%),
+    #fffdf8;
+  box-shadow: 18px 22px 0 rgba(44, 122, 107, 0.1), 0 24px 70px rgba(61, 50, 32, 0.12);
+}
+
+.dedao-login__panel > header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.dedao-login__panel h2 {
+  margin: 3px 0 0;
+  font-family: "Songti SC", "STSong", serif;
+  font-size: clamp(28px, 4vw, 42px);
+}
+
+.dedao-login__seal {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  background: #ff6b00;
+  color: #fffdf8;
+  font-family: "Songti SC", serif;
+  font-size: 26px;
+  place-items: center;
+  transform: rotate(4deg);
+}
+
+.dedao-login__qr-frame {
+  position: relative;
+  display: grid;
+  width: min(280px, 100%);
+  aspect-ratio: 1;
+  margin: 34px auto 24px;
+  padding: 18px;
+  border: 1px solid rgba(141, 132, 117, 0.26);
+  background: #fff;
+  place-items: center;
+}
+
+.dedao-login__qr-frame::after {
+  position: absolute;
+  inset: 8px;
+  border: 1px solid rgba(255, 107, 0, 0.28);
+  content: "";
+  pointer-events: none;
+}
+
+.dedao-login__qr-frame.is-scanning::before {
+  position: absolute;
+  z-index: 1;
+  right: 18px;
+  left: 18px;
+  height: 2px;
+  background: #ff6b00;
+  box-shadow: 0 0 16px rgba(255, 107, 0, 0.72);
+  content: "";
+  animation: dedao-login-scan 2.2s ease-in-out infinite;
+}
+
+.dedao-login__qr-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.dedao-login__qr-placeholder {
+  display: grid;
+  grid-template-columns: repeat(2, 42px);
+  gap: 34px;
+  opacity: 0.18;
+}
+
+.dedao-login__qr-placeholder span {
+  width: 42px;
+  height: 42px;
+  border: 9px solid #24231f;
+}
+
+.dedao-login__qr-placeholder span:last-child {
+  grid-column: 2;
+}
+
+.dedao-login__status {
+  min-height: 48px;
+  margin: 0;
+  color: #6d6356;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.dedao-login__status.is-success {
+  color: var(--accent);
+  font-weight: 750;
+}
+
+.dedao-login__status.is-error,
+.dedao-login__status.is-expired {
+  color: #a1412d;
+}
+
+.dedao-login__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 18px;
+}
+
+.dedao-login__privacy {
+  display: block;
+  margin-top: 20px;
+  color: #9a9184;
+  font-size: 11px;
+  line-height: 1.6;
+  text-align: center;
+}
+
+.dedao-login__account {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 46px 0 34px;
+  padding: 22px;
+  border: 1px solid rgba(44, 122, 107, 0.2);
+  border-radius: 14px;
+  background: var(--accent-soft);
+}
+
+.dedao-login__account img,
+.dedao-login__account > span {
+  display: grid;
+  width: 54px;
+  height: 54px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  object-fit: cover;
+  place-items: center;
+}
+
+.dedao-login__account strong,
+.dedao-login__account small {
+  display: block;
+}
+
+.dedao-login__account small {
+  margin-top: 5px;
+  color: #65786f;
+}
+
+@keyframes dedao-login-scan {
+  0%, 100% { top: 24px; opacity: 0.35; }
+  50% { top: calc(100% - 26px); opacity: 1; }
 }
 
 .dedao-home__hero,
@@ -4010,9 +4244,23 @@ a.button {
   .dedao-home,
   .dedao-courses,
   .dedao-course-detail,
-  .dedao-ebook-detail {
+  .dedao-ebook-detail,
+  .dedao-login {
     width: min(100% - 20px, 100%);
     padding-top: 14px;
+  }
+
+  .dedao-login,
+  .dedao-login__intro ol {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dedao-login__intro {
+    padding: 18px 4px;
+  }
+
+  .dedao-login__intro h1 {
+    font-size: clamp(44px, 14vw, 70px);
   }
 
   .dedao-home__hero,
@@ -4279,6 +4527,10 @@ a.button {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .dedao-login__qr-frame.is-scanning::before {
+    animation: none;
+    top: 50%;
+  }
   .skeleton::after,
   .reader-loading__rail-top::after,
   .reader-loading__rail-item::after {
