@@ -373,6 +373,49 @@ if [[ $invalid_wcplus_status -eq 0 ]]; then
   exit 1
 fi
 
+bounded_fifo="$tmp_dir/wcplus-bounded-token.fifo"
+bounded_status_file="$tmp_dir/wcplus-bounded-token.status"
+bounded_sent_file="$tmp_dir/wcplus-bounded-token.sent"
+mkfifo "$bounded_fifo"
+(
+  set +e
+  env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+    KBASE_REMOTE_URL="https://kbase.example.invalid" \
+    KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
+    WCPLUS_AGENT_STATE_DIR="$tmp_dir/state" \
+    WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
+    WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
+    PROBE_CAPTURE="$tmp_dir/bounded-first-child" \
+    UPDATER_CAPTURE="$tmp_dir/bounded-updater-args" \
+    GREP_CALLED_MARKER="$tmp_dir/bounded-grep-called" \
+    "$install_script" --check <"$bounded_fifo" >/dev/null 2>&1
+  printf '%s\n' "$?" >"$bounded_status_file"
+) &
+bounded_reader_pid=$!
+(
+  printf '%01025d' 0
+  : >"$bounded_sent_file"
+  sleep 5
+) >"$bounded_fifo" &
+bounded_writer_pid=$!
+for ((attempt = 0; attempt < 100; attempt++)); do
+  [[ -e "$bounded_status_file" ]] && break
+  sleep 0.01
+done
+if [[ ! -e "$bounded_sent_file" || ! -e "$bounded_status_file" ]]; then
+  kill "$bounded_reader_pid" "$bounded_writer_pid" 2>/dev/null || true
+  wait "$bounded_reader_pid" "$bounded_writer_pid" 2>/dev/null || true
+  echo "WC Plus installer did not cap transport-token input consumption" >&2
+  exit 1
+fi
+bounded_status="$(<"$bounded_status_file")"
+kill "$bounded_writer_pid" 2>/dev/null || true
+wait "$bounded_reader_pid" "$bounded_writer_pid" 2>/dev/null || true
+if [[ "$bounded_status" == 0 ]]; then
+  echo "WC Plus installer accepted a bounded oversize transport token" >&2
+  exit 1
+fi
+
 oversize_token=""
 for ((index = 0; index < 1025; index++)); do oversize_token+="x"; done
 set +e

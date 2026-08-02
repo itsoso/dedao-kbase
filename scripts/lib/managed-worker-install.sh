@@ -29,6 +29,7 @@ MANAGED_WORKER_INSTALL_SERVICE_LOADED=0
 MANAGED_WORKER_INSTALL_KEYCHAIN_SERVICE="life.executor.kbase.source-agent"
 MANAGED_WORKER_INSTALL_KEYCHAIN_ACCOUNT="transport-token"
 MANAGED_WORKER_INSTALL_KEYCHAIN_BACKUP_ACCOUNT="transport-token-install-backup"
+unset MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE
 MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE=""
 
 _managed_worker_install_error() {
@@ -80,6 +81,7 @@ _managed_worker_install_valid_secret() {
 _managed_worker_install_read_keychain_value() {
   local account="$1" producer_pid read_status=0 producer_status=0 extra="" oversized=false
   local value_pipe="$MANAGED_WORKER_INSTALL_ROOT/.managed-worker-keychain-pipe.$$"
+  unset MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE
   MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE=""
   if [[ -L "$value_pipe" || (-e "$value_pipe" && ! -p "$value_pipe") ]]; then return 1; fi
   rm -f "$value_pipe" 2>/dev/null || return 1

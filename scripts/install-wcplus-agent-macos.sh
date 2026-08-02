@@ -47,7 +47,7 @@ if [[ ${#missing_names[@]} -gt 0 ]]; then
   exit 2
 fi
 transport_token=""
-if ! IFS= read -r transport_token; then
+if ! IFS= read -r -n 1025 transport_token; then
   echo "source-agent transport token is required on standard input" >&2
   exit 2
 fi

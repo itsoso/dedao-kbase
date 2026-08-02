@@ -198,6 +198,9 @@ fake_security="$tmp_dir/security"
 cat >"$fake_security" <<'SECURITY'
 #!/bin/bash
 set -euo pipefail
+if [[ -n "${SECURITY_ENV_CAPTURE:-}" && -n "${MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE+x}" ]]; then
+  printf 'present:%s\n' "$MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE" >>"$SECURITY_ENV_CAPTURE"
+fi
 operation="${1:?}"
 shift
 account=""
@@ -418,6 +421,26 @@ recover_or_fail() {
     exit 1
   fi
 }
+
+reset_transaction
+security_env_capture="$tmp_dir/security-env-capture"
+export SECURITY_ENV_CAPTURE="$security_env_capture"
+export MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE="caller-preexported-secret"
+set +e
+printf 'unused-token\n' | run_transaction begin-only >/dev/null 2>&1
+preexport_status=$?
+set -e
+unset SECURITY_ENV_CAPTURE MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE
+if [[ $preexport_status -ne 0 ]]; then
+  echo "managed install preexport regression fixture exited $preexport_status" >&2
+  exit 1
+fi
+if [[ -e "$security_env_capture" ]]; then
+  echo "managed install exposed Keychain scratch state to a security child environment" >&2
+  exit 1
+fi
+assert_old_transaction
+assert_transaction_clean
 
 reset_transaction
 set +e
