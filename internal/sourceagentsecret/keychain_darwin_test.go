@@ -21,3 +21,10 @@ func TestKeychainCommandKillsAndWaitsAfterBoundedOutput(t *testing.T) {
 		t.Fatalf("bounded command took %s", elapsed)
 	}
 }
+
+func TestKeychainCommandClassifiesMissingItem(t *testing.T) {
+	_, err := runKeychainCommand(context.Background(), "/bin/sh", []string{"-c", "exit 44"}, nil)
+	if !errors.Is(err, ErrTransportTokenNotFound) {
+		t.Fatalf("error=%v", err)
+	}
+}

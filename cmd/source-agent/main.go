@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
@@ -19,17 +21,26 @@ import (
 
 type sourceEnvironmentLookup func(string) (string, bool)
 
+var sourceAgentTransportTokenLoader = sourceagentsecret.LoadTransportToken
+var sourceAgentLegacyTransportTokenLoader = loadLegacySourceTransportToken
+
 func main() {
-	if err := runSourceAgentCLI(context.Background(), os.Args[1:], os.LookupEnv); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runSourceAgentCLI(ctx, os.Args[1:], os.LookupEnv); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
-func loadSourceAgentConfig(lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
-	return loadSourceAgentConfigWithTransportToken(context.Background(), lookup, sourceagentsecret.LoadTransportToken)
+func loadSourceAgentConfig(ctx context.Context, lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
+	return loadSourceAgentConfigWithTransportTokenFallback(ctx, lookup, sourceAgentTransportTokenLoader, sourceAgentLegacyTransportTokenLoader)
 }
 
 func loadSourceAgentConfigWithTransportToken(ctx context.Context, lookup sourceEnvironmentLookup, loader sourceagentsecret.Loader) (app.SourceAgentConfig, error) {
+	return loadSourceAgentConfigWithTransportTokenFallback(ctx, lookup, loader, nil)
+}
+
+func loadSourceAgentConfigWithTransportTokenFallback(ctx context.Context, lookup sourceEnvironmentLookup, loader sourceagentsecret.Loader, legacy sourceagentsecret.AgentLoader) (app.SourceAgentConfig, error) {
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
@@ -43,18 +54,26 @@ func loadSourceAgentConfigWithTransportToken(ctx context.Context, lookup sourceE
 	if err != nil {
 		return app.SourceAgentConfig{}, err
 	}
-	token, err := sourceagentsecret.ResolveTransportToken(ctx, rawToken, provided, loader)
+	token, err := sourceagentsecret.ResolveSourceTransportToken(ctx, rawToken, provided, cfg.AgentID, loader, legacy)
 	if err != nil {
 		return app.SourceAgentConfig{}, err
 	}
 	cfg.AgentToken = token
 	return cfg, nil
 }
+
+func loadLegacySourceTransportToken(ctx context.Context, agentID string) (string, error) {
+	value, err := newKeychainSecretStore(agentID, nil).Load(ctx, "transport-token")
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
 func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: source-agent doctor, once, run, or enroll")
 	}
-	cfg, err := loadSourceAgentConfig(lookup)
+	cfg, err := loadSourceAgentConfig(ctx, lookup)
 	if err != nil {
 		return err
 	}

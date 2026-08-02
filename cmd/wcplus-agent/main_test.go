@@ -9,6 +9,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 func TestWCPlusAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T) {
@@ -67,6 +70,33 @@ func TestWCPlusAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestWCPlusConfigLoaderStopsWhenContextIsCanceledWithoutLegacyFallback(t *testing.T) {
+	previous := wcplusTransportTokenLoader
+	defer func() { wcplusTransportTokenLoader = previous }()
+	loaderStopped := make(chan struct{})
+	wcplusTransportTokenLoader = func(ctx context.Context) (string, error) {
+		<-ctx.Done()
+		close(loaderStopped)
+		return "", ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	values := testEnv{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_ID":  "wcplus-agent-a",
+		"WCPLUS_AGENT_STATE_DIR": "state",
+	}
+	_, err := loadWCPlusAgentConfig(ctx, values.Lookup)
+	if !errors.Is(err, sourceagentsecret.ErrTransportTokenUnavailable) {
+		t.Fatalf("error=%v", err)
+	}
+	select {
+	case <-loaderStopped:
+	case <-time.After(time.Second):
+		t.Fatal("WC Plus loader did not observe context cancellation")
 	}
 }
 

@@ -28,6 +28,8 @@ var wcplusAgentCapabilities = []string{
 
 type environmentLookup func(string) (string, bool)
 
+var wcplusTransportTokenLoader = sourceagentsecret.LoadTransportToken
+
 type wcplusAgentRuntime struct {
 	client *app.SourceAgentClient
 	wcplus *app.WCPlusSourceService
@@ -47,7 +49,7 @@ func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout
 	if len(args) != 1 || (args[0] != "doctor" && args[0] != "once" && args[0] != "run") {
 		return fmt.Errorf("usage: wcplus-agent must be doctor, once, or run")
 	}
-	config, err := loadWCPlusAgentConfig(lookup)
+	config, err := loadWCPlusAgentConfig(ctx, lookup)
 	if err != nil {
 		return err
 	}
@@ -87,8 +89,8 @@ func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout
 	return nil
 }
 
-func loadWCPlusAgentConfig(lookup environmentLookup) (app.SourceAgentConfig, error) {
-	return loadWCPlusAgentConfigWithTransportToken(context.Background(), lookup, sourceagentsecret.LoadTransportToken)
+func loadWCPlusAgentConfig(ctx context.Context, lookup environmentLookup) (app.SourceAgentConfig, error) {
+	return loadWCPlusAgentConfigWithTransportToken(ctx, lookup, wcplusTransportTokenLoader)
 }
 
 func loadWCPlusAgentConfigWithTransportToken(ctx context.Context, lookup environmentLookup, loader sourceagentsecret.Loader) (app.SourceAgentConfig, error) {

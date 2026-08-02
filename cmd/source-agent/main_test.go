@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 func TestSourceAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T) {
@@ -73,6 +74,65 @@ func TestSourceAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T)
 	}
 }
 
+func TestSourceAgentConfigFallsBackToValidatedLegacyAccount(t *testing.T) {
+	values := map[string]string{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid/base",
+		"KBASE_SOURCE_AGENT_ID":  "source-agent-a",
+		"SOURCE_AGENT_STATE_DIR": "state",
+	}
+	legacyCalls := 0
+	cfg, err := loadSourceAgentConfigWithTransportTokenFallback(
+		context.Background(),
+		func(key string) (string, bool) { value, ok := values[key]; return value, ok },
+		func(context.Context) (string, error) { return "", sourceagentsecret.ErrTransportTokenNotFound },
+		func(_ context.Context, agentID string) (string, error) {
+			legacyCalls++
+			if agentID != "source-agent-a" {
+				t.Fatalf("agentID=%q", agentID)
+			}
+			return "legacy-token", nil
+		},
+	)
+	if err != nil || cfg.AgentToken != "legacy-token" || legacyCalls != 1 {
+		t.Fatalf("config=%#v legacy_calls=%d error=%v", cfg, legacyCalls, err)
+	}
+}
+
+func TestSourceAgentConfigLoaderStopsWhenContextIsCanceled(t *testing.T) {
+	previousFixed := sourceAgentTransportTokenLoader
+	previousLegacy := sourceAgentLegacyTransportTokenLoader
+	defer func() {
+		sourceAgentTransportTokenLoader = previousFixed
+		sourceAgentLegacyTransportTokenLoader = previousLegacy
+	}()
+	loaderStopped := make(chan struct{})
+	sourceAgentTransportTokenLoader = func(ctx context.Context) (string, error) {
+		<-ctx.Done()
+		close(loaderStopped)
+		return "", ctx.Err()
+	}
+	sourceAgentLegacyTransportTokenLoader = func(context.Context, string) (string, error) {
+		t.Fatal("legacy loader must not run for a canceled fixed loader")
+		return "", nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	values := map[string]string{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_ID":  "source-agent-a",
+		"SOURCE_AGENT_STATE_DIR": "state",
+	}
+	_, err := loadSourceAgentConfig(ctx, func(key string) (string, bool) { value, ok := values[key]; return value, ok })
+	if !errors.Is(err, sourceagentsecret.ErrTransportTokenUnavailable) {
+		t.Fatalf("error=%v", err)
+	}
+	select {
+	case <-loaderStopped:
+	case <-time.After(time.Second):
+		t.Fatal("fixed loader did not observe context cancellation")
+	}
+}
+
 type fakeSourceAgentCycleRunner struct {
 	calls  int
 	errors []error
@@ -96,7 +156,7 @@ func (r *fakeSourceAgentCycleRunner) RunOnce(context.Context) (app.SourceAgentCy
 
 func TestSourceAgentCLIConfigPrefersGenericStateDirectory(t *testing.T) {
 	values := map[string]string{"KBASE_REMOTE_URL": "https://kbase.example.invalid", "KBASE_SOURCE_AGENT_TOKEN": "agent-value", "KBASE_SOURCE_AGENT_ID": "agent-a", "SOURCE_AGENT_STATE_DIR": "state"}
-	cfg, err := loadSourceAgentConfig(func(key string) (string, bool) { v, ok := values[key]; return v, ok })
+	cfg, err := loadSourceAgentConfig(context.Background(), func(key string) (string, bool) { v, ok := values[key]; return v, ok })
 	if err != nil {
 		t.Fatal(err)
 	}

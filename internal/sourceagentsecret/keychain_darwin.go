@@ -5,6 +5,7 @@ package sourceagentsecret
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os/exec"
 )
@@ -20,6 +21,9 @@ func loadTransportToken(ctx context.Context, runner keychainCommandRunner) (stri
 		"-w",
 	}, nil)
 	if err != nil {
+		if errors.Is(err, ErrTransportTokenNotFound) {
+			return "", ErrTransportTokenNotFound
+		}
 		return "", ErrTransportTokenUnavailable
 	}
 	if len(output) > MaxTransportTokenBytes+2 {
@@ -52,6 +56,10 @@ func runKeychainCommand(ctx context.Context, path string, args []string, input [
 		return nil, ErrTransportTokenUnavailable
 	}
 	if err := command.Wait(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 44 {
+			return nil, ErrTransportTokenNotFound
+		}
 		return nil, ErrTransportTokenUnavailable
 	}
 	return output, nil

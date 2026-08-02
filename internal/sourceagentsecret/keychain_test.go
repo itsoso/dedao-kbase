@@ -34,6 +34,85 @@ func TestResolveTransportTokenLoadsFixedPlatformSecretWhenEnvironmentMissing(t *
 	}
 }
 
+func TestResolveSourceTransportTokenUsesLegacyOnlyWhenFixedAccountIsMissing(t *testing.T) {
+	legacyCalls := 0
+	token, err := ResolveSourceTransportToken(
+		context.Background(),
+		"",
+		false,
+		"source-agent-a",
+		func(context.Context) (string, error) { return "", ErrTransportTokenNotFound },
+		func(_ context.Context, agentID string) (string, error) {
+			legacyCalls++
+			if agentID != "source-agent-a" {
+				t.Fatalf("agentID=%q", agentID)
+			}
+			return "legacy-token", nil
+		},
+	)
+	if err != nil || token != "legacy-token" || legacyCalls != 1 {
+		t.Fatalf("token=%q legacy_calls=%d error=%v", token, legacyCalls, err)
+	}
+}
+
+func TestResolveSourceTransportTokenDoesNotFallbackForInvalidFixedValue(t *testing.T) {
+	legacyCalled := false
+	_, err := ResolveSourceTransportToken(
+		context.Background(),
+		"",
+		false,
+		"source-agent-a",
+		func(context.Context) (string, error) { return "corrupt fixed value", nil },
+		func(context.Context, string) (string, error) {
+			legacyCalled = true
+			return "legacy-token", nil
+		},
+	)
+	if !errors.Is(err, ErrTransportTokenUnavailable) || legacyCalled {
+		t.Fatalf("legacy_called=%t error=%v", legacyCalled, err)
+	}
+}
+
+func TestResolveSourceTransportTokenValidatesLegacyOutputAndAgentIDWithoutLeaks(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		agentID  string
+		legacy   AgentLoader
+		wantCall bool
+	}{
+		{name: "invalid agent id", agentID: "bad\nagent", legacy: func(context.Context, string) (string, error) { return "legacy-token", nil }},
+		{name: "oversize legacy", agentID: "agent-a", wantCall: true, legacy: func(context.Context, string) (string, error) {
+			return strings.Repeat("x", MaxTransportTokenBytes+1), nil
+		}},
+		{name: "raw legacy error", agentID: "agent-a", wantCall: true, legacy: func(context.Context, string) (string, error) {
+			return "", errors.New("raw /Users/private legacy-token-sentinel")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			_, err := ResolveSourceTransportToken(
+				context.Background(),
+				"",
+				false,
+				test.agentID,
+				func(context.Context) (string, error) { return "", ErrTransportTokenNotFound },
+				func(ctx context.Context, agentID string) (string, error) {
+					called = true
+					return test.legacy(ctx, agentID)
+				},
+			)
+			if !errors.Is(err, ErrTransportTokenUnavailable) || called != test.wantCall {
+				t.Fatalf("called=%t error=%v", called, err)
+			}
+			for _, forbidden := range []string{"/Users/", "legacy-token-sentinel", strings.Repeat("x", 32)} {
+				if strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("error leaked %q: %v", forbidden, err)
+				}
+			}
+		})
+	}
+}
+
 func TestResolveTransportTokenFailsClosedWithoutLeakingInputOrRawErrors(t *testing.T) {
 	tests := []struct {
 		name     string
