@@ -50,6 +50,11 @@ func (c SourceAgentConfig) Normalized() (SourceAgentConfig, error) {
 	if c.AgentID == "" {
 		return c, fmt.Errorf("KBASE_SOURCE_AGENT_ID is required")
 	}
+	normalizedAgentID, err := normalizeSourceAgentName("KBASE_SOURCE_AGENT_ID", c.AgentID, sourceAgentIDMaxRunes, false)
+	if err != nil {
+		return c, err
+	}
+	c.AgentID = normalizedAgentID
 	if c.StateDir == "" {
 		return c, fmt.Errorf("SOURCE_AGENT_STATE_DIR is required")
 	}

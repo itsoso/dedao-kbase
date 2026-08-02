@@ -14,6 +14,12 @@ import (
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
+type wcplusAgentTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (transport wcplusAgentTestRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
+
 func TestWCPlusAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T) {
 	base := map[string]string{
 		"KBASE_REMOTE_URL":       "https://kbase.example.invalid",
@@ -256,6 +262,58 @@ func TestWCPlusAgentCheckConfigDoesNotLoadSecretsOrContactServices(t *testing.T)
 	}, &stdout, &stderr)
 	if err != nil || loaderCalled || tokenLookupCalled || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("loader_called=%t token_lookup_called=%t stdout=%q stderr=%q error=%v", loaderCalled, tokenLookupCalled, stdout.String(), stderr.String(), err)
+	}
+}
+
+func TestWCPlusAgentCheckConfigRejectsInvalidAgentIDOffline(t *testing.T) {
+	previous := wcplusTransportTokenLoader
+	defer func() { wcplusTransportTokenLoader = previous }()
+	previousTransport := http.DefaultTransport
+	defer func() { http.DefaultTransport = previousTransport }()
+
+	for _, test := range []struct {
+		name    string
+		agentID string
+		want    string
+	}{
+		{name: "invalid character", agentID: "wcplus/agent", want: "invalid characters"},
+		{name: "too long", agentID: strings.Repeat("a", 129), want: "exceeds 128"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			networkCalled := false
+			http.DefaultTransport = wcplusAgentTestRoundTripper(func(*http.Request) (*http.Response, error) {
+				networkCalled = true
+				return nil, errors.New("network access is forbidden during check-config")
+			})
+			loaderCalled := false
+			wcplusTransportTokenLoader = func(context.Context) (string, error) {
+				loaderCalled = true
+				return "stored-token", nil
+			}
+			env := testEnv{
+				"KBASE_REMOTE_URL":       "http://127.0.0.1:1",
+				"KBASE_SOURCE_AGENT_ID":  test.agentID,
+				"WCPLUS_AGENT_STATE_DIR": t.TempDir(),
+				"WCPLUSPRO_BASE_URL":     "http://127.0.0.1:5001",
+			}
+			var stdout, stderr strings.Builder
+			tokenLookupCalled := false
+			err := runCLI(context.Background(), []string{"check-config"}, func(key string) (string, bool) {
+				if key == "KBASE_SOURCE_AGENT_TOKEN" {
+					tokenLookupCalled = true
+				}
+				return env.Lookup(key)
+			}, &stdout, &stderr)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Errorf("check-config error = %v, want %q", err, test.want)
+			}
+			if loaderCalled || tokenLookupCalled || stdout.Len() != 0 || stderr.Len() != 0 {
+				t.Errorf("loader_called=%t token_lookup_called=%t stdout=%q stderr=%q", loaderCalled, tokenLookupCalled, stdout.String(), stderr.String())
+			}
+			if networkCalled {
+				t.Error("check-config contacted the configured remote service")
+			}
+		})
 	}
 }
 

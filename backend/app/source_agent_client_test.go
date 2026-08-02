@@ -32,6 +32,8 @@ func TestSourceAgentConfigValidation(t *testing.T) {
 		{name: "insecure remote", mutate: func(cfg *SourceAgentConfig) { cfg.RemoteURL = "http://kbase.example.invalid" }, want: "HTTPS"},
 		{name: "remote credentials", mutate: func(cfg *SourceAgentConfig) { cfg.RemoteURL = "https://user:pass@kbase.example.invalid" }, want: "credentials"},
 		{name: "unicode token", mutate: func(cfg *SourceAgentConfig) { cfg.AgentToken = "agent-密钥" }, want: "ASCII"},
+		{name: "agent ID invalid character", mutate: func(cfg *SourceAgentConfig) { cfg.AgentID = "agent/a" }, want: "invalid characters"},
+		{name: "agent ID too long", mutate: func(cfg *SourceAgentConfig) { cfg.AgentID = strings.Repeat("a", 129) }, want: "exceeds 128"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

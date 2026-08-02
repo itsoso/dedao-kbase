@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,12 @@ import (
 	"github.com/yann0917/dedao-gui/backend/app"
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
+
+type sourceAgentTestRoundTripper func(*http.Request) (*http.Response, error)
+
+func (transport sourceAgentTestRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return transport(request)
+}
 
 func TestSourceAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T) {
 	base := map[string]string{
@@ -211,6 +218,66 @@ func TestSourceAgentCheckConfigDoesNotLoadSecretsOrCreateVendorClients(t *testin
 	})
 	if err != nil || loaderCalled || tokenLookupCalled {
 		t.Fatalf("loader_called=%t token_lookup_called=%t error=%v", loaderCalled, tokenLookupCalled, err)
+	}
+}
+
+func TestSourceAgentCheckConfigRejectsInvalidAgentIDOffline(t *testing.T) {
+	previousFixed := sourceAgentTransportTokenLoader
+	previousLegacy := sourceAgentLegacyTransportTokenLoader
+	defer func() {
+		sourceAgentTransportTokenLoader = previousFixed
+		sourceAgentLegacyTransportTokenLoader = previousLegacy
+	}()
+	previousTransport := http.DefaultTransport
+	defer func() { http.DefaultTransport = previousTransport }()
+
+	for _, test := range []struct {
+		name    string
+		agentID string
+		want    string
+	}{
+		{name: "invalid character", agentID: "source/agent", want: "invalid characters"},
+		{name: "too long", agentID: strings.Repeat("a", 129), want: "exceeds 128"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			networkCalled := false
+			http.DefaultTransport = sourceAgentTestRoundTripper(func(*http.Request) (*http.Response, error) {
+				networkCalled = true
+				return nil, errors.New("network access is forbidden during check-config")
+			})
+			loaderCalled := false
+			sourceAgentTransportTokenLoader = func(context.Context) (string, error) {
+				loaderCalled = true
+				return "stored-token", nil
+			}
+			sourceAgentLegacyTransportTokenLoader = func(context.Context, string) (string, error) {
+				loaderCalled = true
+				return "legacy-token", nil
+			}
+			values := map[string]string{
+				"KBASE_REMOTE_URL":         "http://127.0.0.1:1",
+				"KBASE_SOURCE_AGENT_ID":    test.agentID,
+				"SOURCE_AGENT_STATE_DIR":   t.TempDir(),
+				"SOURCE_AGENT_ENROLL_ADDR": "127.0.0.1:8765",
+			}
+			tokenLookupCalled := false
+			err := runSourceAgentCLI(context.Background(), []string{"check-config"}, func(key string) (string, bool) {
+				if key == "KBASE_SOURCE_AGENT_TOKEN" {
+					tokenLookupCalled = true
+				}
+				value, ok := values[key]
+				return value, ok
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Errorf("check-config error = %v, want %q", err, test.want)
+			}
+			if loaderCalled || tokenLookupCalled {
+				t.Errorf("loader_called=%t token_lookup_called=%t", loaderCalled, tokenLookupCalled)
+			}
+			if networkCalled {
+				t.Error("check-config contacted the configured remote service")
+			}
+		})
 	}
 }
 
