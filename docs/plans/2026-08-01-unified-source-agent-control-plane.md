@@ -784,23 +784,28 @@ git add backend/app/wechat_agent.go backend/app/wechat_agent_test.go backend/app
 git commit -m "feat(agent): align WeChat and WC Plus worker control"
 ```
 
-### Task 10A: Wire command-bound artifact delivery to the fixed local updater
+### Task 10A: Wire command-bound artifacts through an independent local updater
 
 **Why this correction exists:** Task 10 deliberately left both production
-workers fail-closed because the command contains only an artifact ID and the
-expected current version. The existing artifact download route, staging
-filesystem, ready-receipt store, and `SourceAgentUpdateTransaction` are each
-safe in isolation, but no trusted local bridge connects them. This task must
-finish before the Web exposes an upgrade action; a clickable control backed by
-the fail-closed placeholder is not an acceptable delivered capability.
+workers fail-closed because the safe pieces were not connected. The first
+Task 10A draft was rejected at plan review: a helper forked by the Worker is in
+the Worker's launchd process group and may be killed by `kickstart -k`, while a
+restarted Runner loses its in-memory command. The accepted implementation must
+therefore use a separately supervised updater job and durable command recovery
+before the Web exposes an upgrade action.
 
 **Files:**
+- Modify: `backend/app/source_agent_artifact.go`
 - Modify: `backend/app/source_agent_client.go`
 - Modify: `backend/app/source_agent_client_test.go`
+- Modify: `backend/app/source_agent_command_runner.go`
+- Modify: `backend/app/source_agent_command_runner_test.go`
+- Modify: `backend/app/source_agent_runner.go`
+- Modify: `backend/app/source_agent_runner_test.go`
+- Modify: `backend/app/source_agent_update.go`
+- Modify: `backend/app/source_agent_update_test.go`
 - Create: `backend/app/source_agent_update_bridge.go`
 - Create: `backend/app/source_agent_update_bridge_test.go`
-- Modify: `backend/app/source_agent_runner.go`
-- Modify: `backend/app/source_agent_command_runner_test.go`
 - Modify: `backend/app/kbase_http.go`
 - Modify: `backend/app/kbase_http_test.go`
 - Modify: `cmd/source-agent/main.go`
@@ -811,96 +816,182 @@ the fail-closed placeholder is not an acceptable delivered capability.
 - Modify: `cmd/source-agent-updater/main_test.go`
 - Modify: `cmd/source-agent-updater/platform_darwin.go`
 - Modify: `cmd/source-agent-updater/platform_other.go`
+- Create: `internal/sourceagentupdate/config.go`
+- Create: `internal/sourceagentupdate/config_test.go`
+- Modify: `scripts/build-source-agent-macos.sh`
+- Modify: `scripts/build-wcplus-agent-macos.sh`
+- Modify: `scripts/install-source-agent-macos.sh`
+- Modify: `scripts/install-wcplus-agent-macos.sh`
 - Modify: `scripts/source-agent-packaging-smoke.sh`
 - Modify: `scripts/wcplus-agent-packaging-smoke.sh`
 
-**Step 1: Write the real handoff contract RED tests**
+**Step 1: Freeze the independent-process and local-config boundary in RED**
+
+Both installers must create two separately loaded LaunchAgents per Worker:
+
+```text
+worker job                         updater job
+life.executor.kbase.source-agent  life.executor.kbase.source-agent.updater
+life.executor.kbase.wcplus-agent  life.executor.kbase.wcplus-agent.updater
+```
+
+The updater job is on-demand, has fixed arguments
+`source-agent-updater --run-pending --worker-type <known-worker>`, and is not a
+child of the Worker job. The Worker may only kickstart the corresponding fixed
+updater label. Do not set `AbandonProcessGroup`; the separate job is the
+survival boundary.
+
+The installer writes one `0600` non-secret config beside the updater per
+worker type. It contains only the locally selected KBase base URL and agent ID.
+The helper derives its own install directory, worker executable basename,
+staging/handoff/receipt roots, and both fixed LaunchAgent labels from its own
+executable plus worker type. It loads the shared token directly from the fixed
+Keychain service/account. Token, URL, agent ID, paths, labels, and environment
+overrides are forbidden in the command and handoff; the token is also forbidden
+in argv, plist environment, config, handoff, stdout, stderr, and logs.
+
+Add installer/CLI RED tests that prove the updater job remains independently
+supervised across a Worker restart, and add a macOS-only process-boundary smoke
+that kills/replaces the Worker fixture while the independently launched updater
+fixture persists and records its terminal outcome. The real production labels
+must not be mutated by the test; actual launchctl bootstrap/restart is verified
+later at G5 with the reviewed plists.
+
+**Step 2: Write the artifact, guard, and path-free handoff RED tests**
 
 Cover the full production path, not a fake `SourceAgentUpdater`:
 
-- the authenticated, command-bound download returns artifact metadata from the
-  server-side catalog snapshot together with the exact bytes;
-- the worker rejects missing, duplicate, malformed, incompatible, oversized,
-  or command-mismatched metadata before writing a staged executable;
-- staging uses a fixed private directory on the executable filesystem, does
-  not follow symlinks, has a bounded byte count, fsyncs the completed file, and
-  verifies SHA-256 before publishing a local handoff;
-- the local handoff is keyed by the bounded command ID and contains only
-  catalog metadata plus locally derived fixed paths; no remote URL, shell,
-  script, environment, label, updater path, executable path, or state path is
-  accepted from the command or response;
-- `source-agent-updater --apply` accepts only a known worker type and command
-  ID, derives its install directory from its own executable, reads the
-  protected local handoff, invokes `SourceAgentUpdateTransaction`, and writes a
-  bounded durable outcome;
-- after restart, the worker writes the matching ready receipt only after an
-  authenticated heartbeat and only when command, attempt nonce, worker type,
-  version, platform, architecture, protocol, and revision all match;
-- downloading, verified, installing, restarting, verifying, rollback, success,
-  and rolled-back command reports are resumable without repeating download,
-  replacement, or rollback side effects;
-- disabling rollout after download, after claim, or after the server accepts
-  the `installing` transition still stops local binary mutation;
-- helper crash, restart failure, ready timeout, wrong receipt, hash drift, and
-  outcome persistence failure all fail or roll back truthfully.
+- the authenticated, command-bound download returns artifact ID, version,
+  worker type, platform, architecture, protocol, revision, channel, size, and
+  SHA-256 from the exact catalog snapshot that streams the bytes;
+- each metadata header is strict and single-valued; missing, duplicate,
+  malformed, incompatible, oversized, stale-command, or runtime-mismatched
+  metadata is rejected before a staged file is published;
+- staging uses a private directory beneath the updater's own executable
+  directory, proves the same device as the Worker executable, never follows a
+  symlink or directory replacement, bounds the copy, verifies size/SHA-256,
+  fsyncs the file and directory, and atomically publishes it;
+- the strict handoff contains metadata, a fixed staged basename, and a request
+  fingerprint only. It contains no path, URL, token, command line, script,
+  environment, LaunchAgent label, source body, cookie, or credential;
+- a retry reuses only a fully matching staged identity and handoff; any
+  conflict fails closed;
+- only the fixed Worker basename may be replaced. An artifact can never target
+  the updater, the other Worker, state/outbox files, configuration, or a plist.
 
-**Step 2: Verify RED against both real worker constructors**
+Add `POST /api/source-agent/commands/{command_id}/guard` and client RED tests.
+The Worker-token-authenticated request is bound to the configured agent and
+must include artifact ID, current/target version, revision, channel, size,
+SHA-256, worker type, platform, architecture, and protocol. The server re-reads
+the command, claim owner, agent, active source run, and current catalog entry on
+every call. It allows only the matching active `installing` command with no
+source run and `allowed_for_rollout=true`; network/auth failure, catalog drift,
+field mismatch, or any other state denies. This production guard is used by
+both `SourceAgentUpdateTransaction` checks, including the check after durable
+backup immediately before atomic replacement. An earlier progress report or a
+local cache is never an allow decision.
+
+**Step 3: Write restart, readiness, and command-recovery RED tests**
+
+Before invoking the fixed Worker restart, the transaction must durably advance
+to a new `restart_requested` phase containing the attempt nonce and expected
+runtime identity. `ReadyChallenge` accepts that phase, so the new Worker cannot
+win a race against an unarmed challenge. The independent helper survives the
+Worker restart, waits for the receipt, and owns timeout, rollback, restart, and
+terminal outcome persistence.
+
+The Worker receives an exact build revision through linker injection. Add a
+local `build-info` command that reports bounded worker type, version, protocol,
+platform, architecture, and revision without loading credentials. Production
+packaging requires a clean exact 40- or 64-character lowercase revision and
+injects the same revision into the Worker and updater build. A new Worker may
+write ready only when its compiled identity, including revision, matches the
+armed challenge; it must never copy revision from the challenge into its own
+identity. Packaging smokes compare `build-info` with the artifact revision.
+
+After every authenticated heartbeat and before any ordinary claim or source
+lease, the Runner:
+
+1. idempotently writes one matching ready receipt if a local challenge exists;
+2. asks the bridge for a protected pending command ID;
+3. explicitly resumes that command through the existing command-ID claim
+   route;
+4. accepts only the same agent's active upgrade states and restores
+   `currentCommand` before doing any other work.
+
+`ClaimCommand` continues to accept only newly claimed commands.
+`ResumeCommand` is a separate strict client method for `claimed`,
+`downloading`, `verified`, `installing`, `restarting`, `verifying`, or
+`rollback`. A terminal server command is reconciled with the matching durable
+local outcome, then the local handoff is acknowledged and cleaned before a
+later cycle can claim unrelated work. A missing, foreign, expired, or
+fingerprint-conflicting command fails closed and retains bounded diagnostics.
+
+**Step 4: Define deterministic local phase to server-state mapping**
+
+The updater bridge may return an explicit bounded `waiting` result that causes
+no server transition; waiting is not failure and never advances state based on
+process exit or `busy`. Every other cycle reports at most one allowed
+transition:
+
+| Server state | Required local evidence | Result |
+| --- | --- | --- |
+| `claimed` | none | report `downloading` only |
+| `downloading` | exact staged identity plus durable handoff | `verified` |
+| `verified` | none | report `installing` only |
+| `installing` | updater job durably requested, but no restart/terminal phase | wait |
+| `installing` | durable `restart_requested` phase | `restarting` |
+| `installing` | durable pre-restart failure or rolled-back outcome | `failed` or `rollback` |
+| `restarting` | helper still waiting for ready/outcome | wait |
+| `restarting` | matching durable success outcome | `verifying` |
+| `restarting` | matching rollback outcome | `rollback` |
+| `verifying` | durable success, matching current binary identity, compiled identity, ready receipt, and authenticated heartbeat | `succeeded` |
+| `verifying` | matching rollback outcome | `rollback` |
+| `rollback` | durable restored outcome | `rolled_back` |
+| `rollback` | durable rollback failure | `failed` |
+
+Publishing the handoff and requesting the updater job are separately durable
+and idempotent. Tests must crash after every local side effect and before/after
+every server report, then prove that retry neither repeats download/replacement
+nor skips rollback. Disabling rollout after claim, after download, after the
+`installing` report, or between the transaction's two guard calls leaves or
+restores the old binary.
+
+**Step 5: Verify all RED layers before production changes**
 
 ```bash
 go test ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater \
-  -run 'TestSourceAgent(UpdateBridge|ArtifactHandoff|ReadyAfterHeartbeat|UpdaterApply|RealWorkerUpgrade)' -count=1
+  ./internal/sourceagentupdate \
+  -run 'TestSourceAgent(UpdateBridge|ArtifactHandoff|UpdateGuard|ReadyAfterHeartbeat|ResumeUpgrade|UpdaterJob|RealWorkerUpgrade)' -count=1
+bash scripts/source-agent-packaging-smoke.sh
+bash scripts/wcplus-agent-packaging-smoke.sh
 ```
 
-Expected: FAIL because the workers still install fail-closed updater stubs and
-the updater CLI only supports `--check`.
+Expected: FAIL because workers still use fail-closed stubs, there is no updater
+job/config, no strict download/guard client, no durable resume hook, and the
+ready challenge is armed too late.
 
-**Step 3: Bind catalog metadata to the download snapshot**
+**Step 6: Implement in reviewable commits**
 
-Return the selected artifact's bounded version, worker type, platform,
-architecture, protocol version, revision, channel, size, and SHA-256 from the
-same server-side snapshot used to stream bytes. The client must parse these as
-strict single-valued response headers and compare them with its compiled
-runtime identity and the claimed command. It must never infer trusted metadata
-from the command payload or a filename.
+Use separate commits in this order:
 
-Add a worker-authenticated, command-bound update-guard check for
-`SourceAgentUpdateTransaction`. Immediately before local mutation it must
-re-read command ownership/state and the catalog entry, then require the exact
-worker, version, revision, channel, compatibility, and `allowed_for_rollout`
-state. The earlier `installing` progress report and any local cache are not a
-substitute for this guard.
+1. snapshot-bound metadata plus the exact production guard endpoint/client;
+2. no-follow same-filesystem staging and strict path-free handoff;
+3. `restart_requested`, ready-after-authenticated-heartbeat, and command resume;
+4. independent updater LaunchAgents, protected config, Keychain loading, and
+   deterministic phase mapping wired into both real Worker constructors;
+5. build revision injection, `build-info`, packaging/process-boundary smokes,
+   and generated system map.
 
-**Step 4: Implement the private same-filesystem stage and handoff**
-
-Derive the updater path, current worker executable, staging root, and handoff
-root exclusively from local installation/runtime configuration. Download to a
-new no-follow file, bound the copy, verify size and SHA-256, sync it, then
-atomically publish a strict local handoff. A retry for the same command must
-reuse only a fully matching staged identity; conflict fails closed.
-
-**Step 5: Extend the fixed-function updater CLI**
-
-Keep `--check`. Add only `--apply --worker-type <known-worker> --command-id
-<bounded-id>`. The helper derives all paths and the fixed LaunchAgent label
-locally; it cannot accept a URL, shell command, script, environment override,
-label, install path, state path, or executable path. It loads the handoff,
-constructs `SourceAgentUpdateRequest`, and executes the existing rollback-safe
-transaction. Non-macOS builds return the typed unsupported-platform result.
-
-**Step 6: Wire resumable command stages and authenticated readiness**
-
-Replace both fail-closed updater stubs with the shared bridge while retaining
-separate worker state, staging, outcomes, and LaunchAgent identities. Before
-claiming the next command, a successfully authenticated heartbeat may satisfy
-one matching local ready challenge. Map the durable local transaction stage or
-outcome to exactly one allowed server command transition per cycle; never
-report success based only on helper process exit.
+Do not leave a hybrid commit in which the UI or real Worker claims upgrade
+support while the independent helper, guard, resume, or ready path is absent.
+Until the final wiring commit, the production constructors remain fail-closed.
 
 **Step 7: Run security, recovery, packaging, and race gates**
 
 ```bash
-go test ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater -count=1
-go test -race ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater -count=1
+go test ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater ./internal/sourceagentupdate -count=1
+go test -race ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater ./internal/sourceagentupdate -count=1
 bash scripts/source-agent-artifact-smoke.sh
 bash scripts/source-agent-packaging-smoke.sh
 bash scripts/wcplus-agent-packaging-smoke.sh
@@ -909,14 +1000,15 @@ bash scripts/privacy-smoke.sh
 git diff --check
 ```
 
-Expected: PASS. Scans must confirm that no signing mechanism was introduced
-and no command/response field can select a URL, path, script, environment, or
-LaunchAgent label.
+Expected: PASS. Scans must confirm there is no signing mechanism; no remote
+field selects a URL, path, script, environment, executable, updater, or label;
+no secret enters plist/config/argv/logs; and both independent workers recover
+the same command without leasing source work during the upgrade.
 
-**Step 8: Commit**
+**Step 8: Commit and review**
 
-Stage only the bridge, worker, updater, tests, packaging smoke changes, and the
-regenerated system map. Commit as:
+Stage only Task 10A files and the regenerated system map. Require fresh spec,
+security, and code-quality review before Task 11. The final wiring commit is:
 
 ```bash
 git commit -m "feat(agent): connect constrained worker upgrades"
