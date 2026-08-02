@@ -1363,17 +1363,22 @@ func TestSourceAgentCommandRunnerRespectsPausedAndUnhealthyHeartbeat(t *testing.
 		name    string
 		desired string
 		health  SourceCapabilityHealth
+		wantOK  bool
 	}{
-		{name: "paused", desired: SourceAgentDesiredPaused, health: SourceCapabilityHealth{Healthy: true}},
-		{name: "unhealthy", desired: SourceAgentDesiredActive, health: SourceCapabilityHealth{Healthy: false, Code: "login_required"}},
+		{name: "paused", desired: SourceAgentDesiredPaused, health: SourceCapabilityHealth{Healthy: true}, wantOK: true},
+		{name: "unhealthy", desired: SourceAgentDesiredActive, health: SourceCapabilityHealth{Healthy: false, Code: "login_required"}, wantOK: false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			log := &sourceAgentRunnerCallLog{}
 			harness := &sourceAgentRunnerHTTPHarness{log: log, desiredState: test.desired}
 			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
 			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: test.health}, commands, nil, nil)
-			if _, err := runner.RunOnce(context.Background()); err != nil {
+			result, err := runner.RunOnce(context.Background())
+			if err != nil {
 				t.Fatal(err)
+			}
+			if result.OK != test.wantOK {
+				t.Fatalf("result.OK=%t want %t", result.OK, test.wantOK)
 			}
 			if _, leases := harness.snapshot(); leases != 0 {
 				t.Fatalf("lease calls=%d", leases)

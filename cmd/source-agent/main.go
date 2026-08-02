@@ -22,6 +22,12 @@ import (
 
 type sourceEnvironmentLookup func(string) (string, bool)
 
+const (
+	sourceAgentWorkerType      = "wechat-worker"
+	sourceAgentVersion         = "0.1.0"
+	sourceAgentProtocolVersion = "2026-08-01"
+)
+
 var sourceAgentTransportTokenLoader = sourceagentsecret.LoadTransportToken
 var sourceAgentLegacyTransportTokenLoader = loadLegacySourceTransportToken
 
@@ -137,7 +143,7 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	if err != nil {
 		return err
 	}
-	runner, err := app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter, Version: "0.1.0"})
+	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter)
 	if err != nil {
 		return err
 	}
@@ -153,6 +159,25 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	}, func(cycleErr error) {
 		fmt.Fprintf(os.Stderr, "source-agent cycle failed: %v\n", cycleErr)
 	})
+}
+
+func newWeChatSourceAgentRunner(client *app.SourceAgentClient, outbox *app.SourceAgentOutbox, adapter *app.WeChatSourceAdapter) (*app.SourceAgentRunner, error) {
+	return app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
+		Client: client, Outbox: outbox, Adapter: adapter, Diagnoser: adapter,
+		Updater: &sourceAgentFailClosedUpdater{}, WorkerType: sourceAgentWorkerType,
+		Version: sourceAgentVersion, ProtocolVersion: sourceAgentProtocolVersion,
+	})
+}
+
+// There is no trusted remote-to-local artifact metadata bridge yet. Keep
+// upgrade commands fail-closed instead of claiming an installation that did not run.
+type sourceAgentFailClosedUpdater struct{}
+
+func (*sourceAgentFailClosedUpdater) Upgrade(context.Context, app.SourceAgentCommand) app.SourceAgentUpgradeResult {
+	return app.SourceAgentUpgradeResult{
+		State: app.SourceAgentCommandFailed, Code: app.SourceAgentCommandCodeUpgradeFailed,
+		Message: "The local updater handoff is unavailable.",
+	}
 }
 
 type sourceAgentCycleRunner interface {

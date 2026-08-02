@@ -157,6 +157,9 @@ func TestWCPlusAgentOnceHeartbeatsFlushesAndPolls(t *testing.T) {
 		case "/api/source-agent/heartbeat":
 			calls = append(calls, "heartbeat")
 			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","wcplus_healthy":true}}`)
+		case "/api/source-agent/commands/claim":
+			calls = append(calls, "command")
+			fmt.Fprint(w, `{"command":null}`)
 		case "/api/source-agent/lease":
 			calls = append(calls, "lease")
 			fmt.Fprint(w, `{"run":null}`)
@@ -171,8 +174,92 @@ func TestWCPlusAgentOnceHeartbeatsFlushesAndPolls(t *testing.T) {
 	if err := runCLI(context.Background(), []string{"once"}, env.Lookup, &stdout, &stderr); err != nil {
 		t.Fatalf("runCLI once: %v, stderr=%s", err, stderr.String())
 	}
-	if strings.Join(calls, ",") != "heartbeat,lease" {
+	if strings.Join(calls, ",") != "heartbeat,command,lease" {
 		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func TestWCPlusAgentCapabilityRuntimeUsesSharedControlRunner(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>`)
+	}))
+	defer local.Close()
+	var calls []string
+	var heartbeat struct {
+		WorkerType      string         `json:"worker_type"`
+		Platform        string         `json:"platform"`
+		Architecture    string         `json:"architecture"`
+		Version         string         `json:"version"`
+		ProtocolVersion string         `json:"protocol_version"`
+		Health          map[string]any `json:"capability_health"`
+	}
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			calls = append(calls, "heartbeat")
+			if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+		case "/api/source-agent/commands/claim":
+			calls = append(calls, "command")
+			fmt.Fprint(w, `{"command":null}`)
+		case "/api/source-agent/lease":
+			calls = append(calls, "lease")
+			fmt.Fprint(w, `{"run":null}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer remote.Close()
+	env := wcplusAgentTestEnv(remote.URL, local.URL, t.TempDir())
+	var stdout, stderr strings.Builder
+	if err := runCLI(context.Background(), []string{"once"}, env.Lookup, &stdout, &stderr); err != nil {
+		t.Fatalf("runCLI once: %v, stderr=%s", err, stderr.String())
+	}
+	if strings.Join(calls, ",") != "heartbeat,command,lease" {
+		t.Fatalf("calls=%#v", calls)
+	}
+	if heartbeat.WorkerType != "wcplus-worker" || heartbeat.Platform == "" || heartbeat.Architecture == "" ||
+		heartbeat.Version != "0.1.0" || heartbeat.ProtocolVersion != "2026-08-01" || heartbeat.Health["wcplus"] == nil {
+		t.Fatalf("heartbeat=%#v", heartbeat)
+	}
+}
+
+func TestWCPlusAgentBlockedCapabilityOnceDoesNotReportSuccess(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "vendor blocked", http.StatusForbidden)
+	}))
+	defer local.Close()
+	var calls []string
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			calls = append(calls, "heartbeat")
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+		case "/api/source-agent/commands/claim":
+			calls = append(calls, "command")
+			fmt.Fprint(w, `{"command":null}`)
+		case "/api/source-agent/lease":
+			t.Fatal("blocked capability must not lease source work")
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer remote.Close()
+
+	env := wcplusAgentTestEnv(remote.URL, local.URL, t.TempDir())
+	var stdout, stderr strings.Builder
+	if err := runCLI(context.Background(), []string{"once"}, env.Lookup, &stdout, &stderr); err != nil {
+		t.Fatalf("runCLI once: %v, stderr=%s", err, stderr.String())
+	}
+	if strings.Join(calls, ",") != "heartbeat,command" {
+		t.Fatalf("calls=%#v", calls)
+	}
+	if !strings.Contains(stdout.String(), `"ok":false`) || strings.Contains(stdout.String(), `"status":"succeeded"`) {
+		t.Fatalf("once output=%s", stdout.String())
 	}
 }
 
@@ -198,6 +285,9 @@ func TestWCPlusAgentOnceExecutesLeasedArticleRun(t *testing.T) {
 		case r.URL.Path == "/api/source-agent/heartbeat":
 			calls = append(calls, "heartbeat")
 			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","wcplus_healthy":true}}`)
+		case r.URL.Path == "/api/source-agent/commands/claim":
+			calls = append(calls, "command")
+			fmt.Fprint(w, `{"command":null}`)
 		case r.URL.Path == "/api/source-agent/lease":
 			calls = append(calls, "lease")
 			fmt.Fprint(w, `{"run":{"id":"run-1","status":"running","requested_operation":"existing_articles","subscription":{"id":"sub-1","source_type":"wcplus_wechat_article","source_account_key":"biz-med","source_account":"医学参考","operation":"existing_articles","enabled":true,"options":{"limit":10}}}}`)
@@ -218,7 +308,7 @@ func TestWCPlusAgentOnceExecutesLeasedArticleRun(t *testing.T) {
 	if err := runCLI(context.Background(), []string{"once"}, env.Lookup, &stdout, &stderr); err != nil {
 		t.Fatalf("runCLI once: %v, stderr=%s", err, stderr.String())
 	}
-	if strings.Join(calls, ",") != "heartbeat,lease,item,complete" {
+	if strings.Join(calls, ",") != "heartbeat,command,lease,item,complete" {
 		t.Fatalf("calls = %#v", calls)
 	}
 	if !strings.Contains(stdout.String(), `"status":"succeeded"`) {
@@ -262,6 +352,23 @@ func TestWCPlusAgentCheckConfigDoesNotLoadSecretsOrContactServices(t *testing.T)
 	}, &stdout, &stderr)
 	if err != nil || loaderCalled || tokenLookupCalled || stdout.Len() != 0 || stderr.Len() != 0 {
 		t.Fatalf("loader_called=%t token_lookup_called=%t stdout=%q stderr=%q error=%v", loaderCalled, tokenLookupCalled, stdout.String(), stderr.String(), err)
+	}
+}
+
+func TestWCPlusAgentCapabilityStateDirectoryPrefersWorkerSpecificPath(t *testing.T) {
+	env := testEnv{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_ID":  "wcplus-agent-a",
+		"SOURCE_AGENT_STATE_DIR": "wechat-state",
+		"WCPLUS_AGENT_STATE_DIR": "wcplus-state",
+		"WCPLUSPRO_BASE_URL":     "http://127.0.0.1:5001",
+	}
+	cfg, err := loadWCPlusAgentConfigOnly(env.Lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateDir != "wcplus-state" {
+		t.Fatalf("state=%q", cfg.StateDir)
 	}
 }
 

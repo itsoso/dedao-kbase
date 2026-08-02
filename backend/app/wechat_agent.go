@@ -57,9 +57,27 @@ func (a *WeChatSourceAdapter) Operations() []string {
 func (a *WeChatSourceAdapter) Status(ctx context.Context) SourceCapabilityHealth {
 	session, err := a.sessions.Session(ctx)
 	if err != nil || session.Validate(time.Now()) != nil {
-		return SourceCapabilityHealth{Healthy: false, RequiresAction: "login", LastError: "wechat MP login is required"}
+		return SourceCapabilityHealth{
+			Healthy: false, Code: "login_required",
+			RequiresAction: "Complete WeChat enrollment on this worker.",
+			LastError:      "WeChat login is required.",
+		}
 	}
 	return SourceCapabilityHealth{Healthy: true, Version: "1"}
+}
+
+func (a *WeChatSourceAdapter) Diagnose(ctx context.Context) SourceAgentDiagnosticReport {
+	health := a.Status(ctx)
+	if health.Healthy {
+		return SourceAgentDiagnosticReport{
+			State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticComplete,
+			Message: "WeChat capability is available.",
+		}
+	}
+	return SourceAgentDiagnosticReport{
+		State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeDiagnosticFailed,
+		Message: "WeChat capability requires operator action.",
+	}
 }
 func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (SourceAdapterResult, error) {
 	if run.Subscription == nil {

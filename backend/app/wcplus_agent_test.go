@@ -456,6 +456,132 @@ func TestWCPlusAgentRejectsUnverifiedAndBlockedTasksWithoutRetry(t *testing.T) {
 	}
 }
 
+func TestWCPlusVendorFailureCapabilityUsesStableBlockedCode(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		transport  error
+	}{
+		{name: "local authorization", statusCode: http.StatusForbidden},
+		{name: "host security", transport: errors.New("XProtect blocked the vendor executable")},
+		{name: "vendor activation", transport: errors.New("wcplus vendor is unactivated")},
+		{name: "vendor version", transport: errors.New("not_max_version")},
+		{name: "request throttled", statusCode: http.StatusTooManyRequests},
+		{name: "parameter expired", transport: errors.New("request parameter expired")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				if test.transport != nil {
+					return nil, test.transport
+				}
+				return &http.Response{
+					StatusCode: test.statusCode,
+					Status:     http.StatusText(test.statusCode),
+					Body:       io.NopCloser(strings.NewReader("vendor response body sentinel")),
+					Header:     make(http.Header),
+				}, nil
+			})}
+			adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
+				WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: "http://127.0.0.1:5001", HTTPClient: client}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			health := adapter.Status(context.Background())
+			if health.Healthy || health.Code != "vendor_blocked" || health.RequiresAction == "" {
+				t.Fatalf("health=%#v", health)
+			}
+			encoded, err := json.Marshal(health)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, private := range []string{"XProtect blocked", "unactivated", "vendor response body sentinel", "127.0.0.1"} {
+				if strings.Contains(string(encoded), private) {
+					t.Fatalf("capability leaked %q: %s", private, encoded)
+				}
+			}
+		})
+	}
+}
+
+func TestWCPlusDependencyFailureCapabilityUsesStableUnavailableCode(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial tcp 127.0.0.1:5001: connection refused")
+	})}
+	adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
+		WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: "http://127.0.0.1:5001", HTTPClient: client}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := adapter.Status(context.Background())
+	if health.Healthy || health.Code != "dependency_unavailable" || health.RequiresAction == "" {
+		t.Fatalf("health=%#v", health)
+	}
+}
+
+func TestWCPlusBlockedCapabilitySharedRunnerLeasesNoWorkAndHasNoBusinessSuccess(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		transport  error
+		wantCode   string
+	}{
+		{name: "vendor blocked", statusCode: http.StatusForbidden, wantCode: "vendor_blocked"},
+		{name: "dependency unavailable", transport: errors.New("dial tcp: connection refused"), wantCode: "dependency_unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				if test.transport != nil {
+					return nil, test.transport
+				}
+				return &http.Response{
+					StatusCode: test.statusCode,
+					Status:     http.StatusText(test.statusCode),
+					Body:       io.NopCloser(strings.NewReader("blocked")),
+					Header:     make(http.Header),
+				}, nil
+			})}
+			adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
+				WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: "http://127.0.0.1:5001", HTTPClient: client}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log}
+			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
+			fixture := sourceAgentProtocolFixture{
+				name: "wcplus", workerType: "wcplus-worker", capabilityName: "wcplus", adapter: adapter,
+			}
+			runner := newSourceAgentProtocolRunner(t, harness, newSourceAgentCommandTestOutbox(t), fixture, commands)
+			result, err := runner.RunOnce(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			heartbeats, leases := harness.snapshot()
+			if len(heartbeats) != 1 || leases != 0 {
+				t.Fatalf("heartbeats=%#v leases=%d", heartbeats, leases)
+			}
+			health := heartbeats[0].CapabilityHealth["wcplus"]
+			if health.Healthy || health.Code != test.wantCode {
+				t.Fatalf("health=%#v", health)
+			}
+			if result.OK || result.RunID != "" || result.Status != "" || result.Uploaded != 0 || result.OutboxRemaining != 0 {
+				t.Fatalf("blocked cycle result=%#v", result)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
 type wcplusAgentServerHarness struct {
 	Books     *BookKnowledgeStore
 	Sync      *SourceSyncStore

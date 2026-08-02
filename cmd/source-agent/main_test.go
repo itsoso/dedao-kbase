@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,6 +15,60 @@ import (
 	"github.com/yann0917/dedao-gui/backend/app"
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
+
+func TestSourceAgentProtocolCLIUsesSharedControlRunner(t *testing.T) {
+	var calls []string
+	var heartbeat app.SourceAgentHeartbeat
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			calls = append(calls, "heartbeat")
+			if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprint(w, `{"agent":{"agent_id":"source-agent-a","desired_state":"active"}}`)
+		case "/api/source-agent/commands/claim":
+			calls = append(calls, "command")
+			fmt.Fprint(w, `{"command":null}`)
+		case "/api/source-agent/lease":
+			calls = append(calls, "lease")
+			fmt.Fprint(w, `{"run":null}`)
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer remote.Close()
+	client, err := app.NewSourceAgentClient(app.SourceAgentConfig{
+		RemoteURL: remote.URL, AgentToken: "agent-secret", AgentID: "source-agent-a", StateDir: t.TempDir(), HTTPClient: remote.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := app.NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	adapter, err := app.NewWeChatSourceAdapter(app.WeChatSourceAdapterConfig{Sessions: fakeSessionHealthProviderForCLI{session: app.WeChatMPSession{Token: "session-secret"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(calls, ",") != "heartbeat,command,lease" {
+		t.Fatalf("calls=%#v", calls)
+	}
+	if heartbeat.WorkerType != "wechat-worker" || heartbeat.Platform != runtime.GOOS || heartbeat.Architecture != runtime.GOARCH ||
+		heartbeat.Version != "0.1.0" || heartbeat.ProtocolVersion != "2026-08-01" {
+		t.Fatalf("heartbeat=%#v", heartbeat)
+	}
+}
 
 type sourceAgentTestRoundTripper func(*http.Request) (*http.Response, error)
 
@@ -168,6 +225,23 @@ func TestSourceAgentCLIConfigPrefersGenericStateDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.StateDir != "state" {
+		t.Fatalf("state=%q", cfg.StateDir)
+	}
+}
+
+func TestSourceAgentProtocolCLIStateDirectoryDoesNotUseWCPlusDirectory(t *testing.T) {
+	values := map[string]string{
+		"KBASE_REMOTE_URL":         "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_ID":    "source-agent-a",
+		"SOURCE_AGENT_STATE_DIR":   "wechat-state",
+		"WCPLUS_AGENT_STATE_DIR":   "wcplus-state",
+		"KBASE_SOURCE_AGENT_TOKEN": "agent-value",
+	}
+	cfg, err := loadSourceAgentConfigOnly(func(key string) (string, bool) { value, ok := values[key]; return value, ok })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StateDir != "wechat-state" {
 		t.Fatalf("state=%q", cfg.StateDir)
 	}
 }

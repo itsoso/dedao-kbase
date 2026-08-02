@@ -122,14 +122,15 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 }
 
 func (r *SourceAgentRunner) RunOnce(ctx context.Context) (SourceAgentCycleResult, error) {
-	result := SourceAgentCycleResult{OK: true}
+	result := SourceAgentCycleResult{}
 	if err := r.acquireControl(ctx); err != nil {
 		return result, err
 	}
-	run, err := func() (*SourceSyncRun, error) {
+	run, capabilityHealthy, err := func() (*SourceSyncRun, bool, error) {
 		defer r.releaseControl()
 		return r.beginCycle(ctx)
 	}()
+	result.OK = capabilityHealthy
 	if err != nil {
 		return result, err
 	}
@@ -153,43 +154,43 @@ func (r *SourceAgentRunner) releaseControl() {
 	r.controlGate <- struct{}{}
 }
 
-func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, error) {
+func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, bool, error) {
 	health, heartbeat, err := r.collectHeartbeat(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	agent, err := r.client.Heartbeat(ctx, heartbeat)
 	if err != nil {
-		return nil, fmt.Errorf("send source-agent heartbeat: %w", err)
+		return nil, health.Healthy, fmt.Errorf("send source-agent heartbeat: %w", err)
 	}
 	if r.clearExpiredCurrentCommand("") {
-		return nil, nil
+		return nil, health.Healthy, nil
 	}
 
 	if r.hasCurrentCommand() {
 		if r.hasPendingCommandReports() {
-			return nil, r.reportPendingCommand(ctx)
+			return nil, health.Healthy, r.reportPendingCommand(ctx)
 		}
 		command, sourceRunActive := r.currentCommandSnapshot()
 		if command.Type == SourceAgentCommandUpgrade && sourceRunActive {
-			return nil, nil
+			return nil, health.Healthy, nil
 		}
-		return nil, r.executeCurrentCommand(ctx, command)
+		return nil, health.Healthy, r.executeCurrentCommand(ctx, command)
 	}
 
 	command, err := r.commandClient.ClaimCommand(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("claim source-agent command: %w", err)
+		return nil, health.Healthy, fmt.Errorf("claim source-agent command: %w", err)
 	}
 	if command != nil {
 		r.setCurrentCommand(*command)
 		if r.clearExpiredCurrentCommand(command.ID) {
-			return nil, nil
+			return nil, health.Healthy, nil
 		}
 		if command.Type == SourceAgentCommandUpgrade && r.isSourceRunActive() {
-			return nil, nil
+			return nil, health.Healthy, nil
 		}
-		return nil, r.executeCurrentCommand(ctx, *command)
+		return nil, health.Healthy, r.executeCurrentCommand(ctx, *command)
 	}
 
 	desiredState := strings.TrimSpace(agent.DesiredState)
@@ -197,16 +198,16 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, err
 		desiredState = SourceAgentDesiredActive
 	}
 	if !health.Healthy || desiredState != SourceAgentDesiredActive || r.isSourceRunActive() || r.isUpgradeActive() {
-		return nil, nil
+		return nil, health.Healthy, nil
 	}
 	run, err := r.client.Lease(ctx, r.adapter.Operations(), r.leaseDuration)
 	if err != nil {
-		return nil, fmt.Errorf("lease source sync run: %w", err)
+		return nil, health.Healthy, fmt.Errorf("lease source sync run: %w", err)
 	}
 	if run != nil {
 		r.startSourceRun(run.ID)
 	}
-	return run, nil
+	return run, health.Healthy, nil
 }
 
 func (r *SourceAgentRunner) executeLeasedRun(ctx context.Context, run SourceSyncRun, result SourceAgentCycleResult) (SourceAgentCycleResult, error) {

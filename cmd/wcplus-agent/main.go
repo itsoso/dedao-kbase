@@ -19,21 +19,16 @@ import (
 
 const wcplusAgentVersion = "0.1.0"
 
-var wcplusAgentCapabilities = []string{
-	"existing_articles",
-	"sync_content",
-	"sync_links",
-	"sync_reading_data",
-}
-
 type environmentLookup func(string) (string, bool)
 
 var wcplusTransportTokenLoader = sourceagentsecret.LoadTransportToken
 
 type wcplusAgentRuntime struct {
-	client *app.SourceAgentClient
-	wcplus *app.WCPlusSourceService
-	agent  *app.WCPlusAgent
+	client  *app.SourceAgentClient
+	wcplus  *app.WCPlusSourceService
+	adapter *app.WCPlusSourceAdapter
+	runner  *app.SourceAgentRunner
+	outbox  *app.SourceAgentOutbox
 }
 
 func main() {
@@ -122,11 +117,11 @@ func loadWCPlusAgentConfigOnly(lookup environmentLookup) (app.SourceAgentConfig,
 		RemoteURL:     lookupValue(lookup, "KBASE_REMOTE_URL"),
 		AgentToken:    "pending-transport-token",
 		AgentID:       lookupValue(lookup, "KBASE_SOURCE_AGENT_ID"),
-		StateDir:      lookupValue(lookup, "SOURCE_AGENT_STATE_DIR"),
+		StateDir:      lookupValue(lookup, "WCPLUS_AGENT_STATE_DIR"),
 		WCPlusBaseURL: lookupValue(lookup, "WCPLUSPRO_BASE_URL"),
 	}
 	if config.StateDir == "" {
-		config.StateDir = lookupValue(lookup, "WCPLUS_AGENT_STATE_DIR")
+		config.StateDir = lookupValue(lookup, "SOURCE_AGENT_STATE_DIR")
 	}
 	if config.WCPlusBaseURL == "" {
 		config.WCPlusBaseURL = lookupValue(lookup, "WCPLUS_BASE_URL")
@@ -155,15 +150,20 @@ func newWCPlusAgentRuntime(config app.SourceAgentConfig, withOutbox bool) (*wcpl
 		if outboxErr != nil {
 			return nil, outboxErr
 		}
-		runtime.agent, err = app.NewWCPlusAgent(app.WCPlusAgentConfig{
-			Client:           client,
+		runtime.adapter, err = app.NewWCPlusSourceAdapter(app.WCPlusSourceAdapterConfig{
 			WCPlus:           runtime.wcplus,
-			Outbox:           outbox,
-			Version:          wcplusAgentVersion,
-			Capabilities:     wcplusAgentCapabilities,
-			LeaseDuration:    2 * time.Minute,
 			TaskPollAttempts: 30,
 			TaskPollInterval: 2 * time.Second,
+		})
+		if err != nil {
+			_ = outbox.Close()
+			return nil, err
+		}
+		runtime.outbox = outbox
+		runtime.runner, err = app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
+			Client: client, Outbox: outbox, Adapter: runtime.adapter, Diagnoser: runtime.adapter,
+			Updater: &wcplusAgentFailClosedUpdater{}, WorkerType: "wcplus-worker",
+			Version: wcplusAgentVersion, ProtocolVersion: "2026-08-01", LeaseDuration: 2 * time.Minute,
 		})
 		if err != nil {
 			_ = outbox.Close()
@@ -174,8 +174,8 @@ func newWCPlusAgentRuntime(config app.SourceAgentConfig, withOutbox bool) (*wcpl
 }
 
 func (r *wcplusAgentRuntime) close() {
-	if r != nil && r.agent != nil {
-		_ = r.agent.Close()
+	if r != nil && r.outbox != nil {
+		_ = r.outbox.Close()
 	}
 }
 
@@ -202,11 +202,22 @@ func (r *wcplusAgentRuntime) doctor(ctx context.Context, output io.Writer) error
 	})
 }
 
-func (r *wcplusAgentRuntime) once(ctx context.Context) (app.WCPlusAgentCycleResult, error) {
-	if r.agent == nil {
-		return app.WCPlusAgentCycleResult{}, fmt.Errorf("WC Plus agent executor is not configured")
+func (r *wcplusAgentRuntime) once(ctx context.Context) (app.SourceAgentCycleResult, error) {
+	if r.runner == nil {
+		return app.SourceAgentCycleResult{}, fmt.Errorf("WC Plus agent executor is not configured")
 	}
-	return r.agent.RunOnce(ctx)
+	return r.runner.RunOnce(ctx)
+}
+
+// Do not infer trusted artifact metadata from a remote command. Until the fixed
+// local updater handoff is wired, upgrades fail closed.
+type wcplusAgentFailClosedUpdater struct{}
+
+func (*wcplusAgentFailClosedUpdater) Upgrade(context.Context, app.SourceAgentCommand) app.SourceAgentUpgradeResult {
+	return app.SourceAgentUpgradeResult{
+		State: app.SourceAgentCommandFailed, Code: app.SourceAgentCommandCodeUpgradeFailed,
+		Message: "The local updater handoff is unavailable.",
+	}
 }
 
 func lookupValue(lookup environmentLookup, key string) string {

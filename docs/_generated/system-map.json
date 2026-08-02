@@ -514,7 +514,7 @@
     {
       "path": "/api/report/reading_data",
       "file": "backend/app/wcplus_agent.go",
-      "line": 302,
+      "line": 442,
       "authenticated": true
     },
     {
@@ -658,7 +658,7 @@
     {
       "path": "/api/source-assets/",
       "file": "backend/app/wechat_agent.go",
-      "line": 248,
+      "line": 266,
       "authenticated": true
     },
     {
@@ -712,7 +712,7 @@
     {
       "path": "/api/task/control",
       "file": "backend/app/wcplus_agent.go",
-      "line": 352,
+      "line": 492,
       "authenticated": true
     },
     {
@@ -956,17 +956,12 @@
     {
       "name": "existing_articles",
       "file": "backend/app/wcplus_agent.go",
-      "line": 188
+      "line": 63
     },
     {
       "name": "existing_articles",
       "file": "cmd/system-map/main.go",
       "line": 212
-    },
-    {
-      "name": "existing_articles",
-      "file": "cmd/wcplus-agent/main.go",
-      "line": 23
     },
     {
       "name": "sync_articles",
@@ -986,17 +981,12 @@
     {
       "name": "sync_content",
       "file": "backend/app/wcplus_agent.go",
-      "line": 188
+      "line": 63
     },
     {
       "name": "sync_content",
       "file": "cmd/system-map/main.go",
       "line": 212
-    },
-    {
-      "name": "sync_content",
-      "file": "cmd/wcplus-agent/main.go",
-      "line": 24
     },
     {
       "name": "sync_media",
@@ -1823,7 +1813,7 @@
     {
       "name": "WCPlusAgent",
       "file": "backend/app/wcplus_agent.go",
-      "line": 52
+      "line": 254
     },
     {
       "name": "WCPlusAgentBlockedError",
@@ -1833,12 +1823,12 @@
     {
       "name": "WCPlusAgentConfig",
       "file": "backend/app/wcplus_agent.go",
-      "line": 30
+      "line": 232
     },
     {
       "name": "WCPlusAgentCycleResult",
       "file": "backend/app/wcplus_agent.go",
-      "line": 42
+      "line": 244
     },
     {
       "name": "WCPlusArticle",
@@ -1909,6 +1899,16 @@
       "name": "WCPlusRawImportRequest",
       "file": "backend/app/wcplus_source.go",
       "line": 93
+    },
+    {
+      "name": "WCPlusSourceAdapter",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 37
+    },
+    {
+      "name": "WCPlusSourceAdapterConfig",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 30
     },
     {
       "name": "WCPlusSourceConfig",
@@ -2073,7 +2073,7 @@
     {
       "name": "sourceAgentDoctorReport",
       "file": "cmd/source-agent/main.go",
-      "line": 166
+      "line": 191
     },
     {
       "name": "sourceAgentPendingCommandReport",
