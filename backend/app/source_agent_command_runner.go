@@ -56,45 +56,52 @@ func sourceAgentDiagnosticCommandReports(report SourceAgentDiagnosticReport) []s
 	}}
 }
 
-func sourceAgentUpgradeCommandReports(result SourceAgentUpgradeResult) []sourceAgentPendingCommandReport {
+func sourceAgentUpgradeCommandReport(command SourceAgentCommand, result SourceAgentUpgradeResult) sourceAgentPendingCommandReport {
 	transition := SourceAgentCommandTransition{
 		State: result.State, ResultCode: result.Code, ActualVersion: result.ActualVersion,
 	}
 	normalized, err := normalizeSourceAgentCommandTransition(transition)
-	terminalState := result.State == SourceAgentCommandSucceeded || result.State == SourceAgentCommandFailed || result.State == SourceAgentCommandRolledBack
-	if !terminalState || err != nil || validateSourceAgentCommandTerminalResult(SourceAgentCommandUpgrade, normalized) != nil {
-		normalized = SourceAgentCommandTransition{
-			State: SourceAgentCommandFailed, ResultCode: SourceAgentCommandCodeUpgradeFailed,
-			Message: "Upgrade result was invalid.",
+	if err == nil && sourceAgentCommandTransitionAllowed(SourceAgentCommandUpgrade, command.State, normalized.State) &&
+		validateSourceAgentCommandTerminalResult(SourceAgentCommandUpgrade, normalized) == nil {
+		if isTerminalSourceAgentCommandState(normalized.State) {
+			normalized.Message = sourceAgentUpgradeResultMessage(normalized.ResultCode)
 		}
-	} else {
-		normalized.Message = sourceAgentUpgradeResultMessage(normalized.ResultCode)
+		return sourceAgentPendingReport(normalized)
 	}
+	return sourceAgentInvalidUpgradeReport(command.State)
+}
 
-	switch normalized.State {
-	case SourceAgentCommandSucceeded:
-		return append(sourceAgentUpgradeProgressReports(
-			SourceAgentCommandVerified,
-			SourceAgentCommandInstalling,
-			SourceAgentCommandRestarting,
-			SourceAgentCommandVerifying,
-		), sourceAgentPendingReport(normalized))
-	case SourceAgentCommandRolledBack:
-		return append(sourceAgentUpgradeProgressReports(
-			SourceAgentCommandVerified,
-			SourceAgentCommandInstalling,
-			SourceAgentCommandRollback,
-		), sourceAgentPendingReport(normalized))
-	default:
-		return []sourceAgentPendingCommandReport{sourceAgentPendingReport(normalized)}
+func sourceAgentInvalidUpgradeReport(commandState string) sourceAgentPendingCommandReport {
+	if commandState == SourceAgentCommandRestarting || commandState == SourceAgentCommandVerifying {
+		return sourceAgentPendingCommandReport{state: SourceAgentCommandRollback}
+	}
+	if sourceAgentCommandTransitionAllowed(SourceAgentCommandUpgrade, commandState, SourceAgentCommandFailed) {
+		return sourceAgentPendingCommandReport{
+			state: SourceAgentCommandFailed, code: SourceAgentCommandCodeUpgradeFailed,
+			message: "Upgrade result was invalid.",
+		}
+	}
+	return sourceAgentPendingCommandReport{
+		state: SourceAgentCommandFailed, code: SourceAgentCommandCodeUpgradeFailed,
+		message: "Upgrade state was invalid.",
 	}
 }
 
-func sourceAgentDiagnosticResultMessage(state string) string {
-	if state == SourceAgentCommandSucceeded {
-		return "Diagnostics completed."
+func sourceAgentUpgradeUnavailableReport(commandState string) sourceAgentPendingCommandReport {
+	if commandState == SourceAgentCommandRestarting || commandState == SourceAgentCommandVerifying {
+		return sourceAgentPendingCommandReport{state: SourceAgentCommandRollback}
 	}
-	return "Diagnostics failed."
+	return sourceAgentPendingCommandReport{
+		state: SourceAgentCommandFailed, code: SourceAgentCommandCodeUpgradeFailed,
+		message: "Upgrade is unavailable.",
+	}
+}
+
+func sourceAgentUpgradeReportForState(command SourceAgentCommand, updater SourceAgentUpdater, ctx context.Context) sourceAgentPendingCommandReport {
+	if updater == nil {
+		return sourceAgentUpgradeUnavailableReport(command.State)
+	}
+	return sourceAgentUpgradeCommandReport(command, updater.Upgrade(ctx, command))
 }
 
 func sourceAgentUpgradeResultMessage(code string) string {
@@ -118,12 +125,38 @@ func sourceAgentUpgradeResultMessage(code string) string {
 	}
 }
 
-func sourceAgentUpgradeProgressReports(states ...string) []sourceAgentPendingCommandReport {
-	reports := make([]sourceAgentPendingCommandReport, len(states))
-	for index, state := range states {
-		reports[index] = sourceAgentPendingCommandReport{state: state}
+func sourceAgentDiagnosticResultMessage(state string) string {
+	if state == SourceAgentCommandSucceeded {
+		return "Diagnostics completed."
 	}
-	return reports
+	return "Diagnostics failed."
+}
+
+// Each upgrade cycle performs at most one local stage and reports exactly one
+// durable transition. The next stage starts only after that report succeeds.
+func (r *SourceAgentRunner) executeUpgradeCommand(ctx context.Context, command SourceAgentCommand) error {
+	if !validSourceAgentUpgradeHandoff(command) {
+		r.setPendingCommandReports([]sourceAgentPendingCommandReport{sourceAgentInvalidUpgradeReport(command.State)})
+		return r.reportPendingCommand(ctx)
+	}
+
+	var report sourceAgentPendingCommandReport
+	switch command.State {
+	case SourceAgentCommandClaimed:
+		report = sourceAgentPendingCommandReport{state: SourceAgentCommandDownloading}
+	case SourceAgentCommandDownloading, SourceAgentCommandInstalling,
+		SourceAgentCommandRestarting, SourceAgentCommandVerifying, SourceAgentCommandRollback:
+		report = sourceAgentUpgradeReportForState(command, r.updater, ctx)
+	case SourceAgentCommandVerified:
+		report = sourceAgentPendingCommandReport{state: SourceAgentCommandInstalling}
+	default:
+		return fmt.Errorf("upgrade command state is not executable")
+	}
+	r.setPendingCommandReports([]sourceAgentPendingCommandReport{report})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.reportPendingCommand(ctx)
 }
 
 func sourceAgentPendingReport(transition SourceAgentCommandTransition) sourceAgentPendingCommandReport {
@@ -145,22 +178,7 @@ func (r *SourceAgentRunner) executeCurrentCommand(ctx context.Context, command S
 		}
 		r.setPendingCommandReports(sourceAgentDiagnosticCommandReports(report))
 	case SourceAgentCommandUpgrade:
-		if r.updater == nil || !validSourceAgentUpgradeHandoff(command) {
-			r.setPendingCommandReports([]sourceAgentPendingCommandReport{{
-				state: SourceAgentCommandFailed, code: SourceAgentCommandCodeUpgradeFailed,
-				message: "Upgrade is unavailable.",
-			}})
-			return r.reportPendingCommand(ctx)
-		}
-		if command.State == SourceAgentCommandClaimed {
-			r.setPendingCommandReports([]sourceAgentPendingCommandReport{{state: SourceAgentCommandDownloading}})
-			return r.reportPendingCommand(ctx)
-		}
-		if command.State != SourceAgentCommandDownloading {
-			return fmt.Errorf("upgrade command is not ready for updater handoff")
-		}
-		result := r.updater.Upgrade(ctx, command)
-		r.setPendingCommandReports(sourceAgentUpgradeCommandReports(result))
+		return r.executeUpgradeCommand(ctx, command)
 	default:
 		return fmt.Errorf("unsupported claimed source-agent command")
 	}
@@ -186,17 +204,16 @@ func validSourceAgentUpgradeHandoff(command SourceAgentCommand) bool {
 }
 
 func (r *SourceAgentRunner) reportPendingCommand(ctx context.Context) error {
-	for {
-		command, report, ok := r.nextPendingCommandReport()
-		if !ok {
-			return nil
-		}
-		updated, err := r.commandClient.ReportCommand(
-			ctx, command.ID, report.state, report.code, report.message, report.actualVersion,
-		)
-		if err != nil {
-			return fmt.Errorf("report source-agent command: %w", err)
-		}
-		r.commandReportSucceeded(updated)
+	command, report, ok := r.nextPendingCommandReport()
+	if !ok {
+		return nil
 	}
+	updated, err := r.commandClient.ReportCommand(
+		ctx, command.ID, report.state, report.code, report.message, report.actualVersion,
+	)
+	if err != nil {
+		return fmt.Errorf("report source-agent command: %w", err)
+	}
+	r.commandReportSucceeded(updated)
+	return nil
 }

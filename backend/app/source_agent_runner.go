@@ -14,6 +14,8 @@ import (
 const defaultSourceAgentLeaseDuration = 90 * time.Minute
 const defaultSourceAgentProtocolVersion = "2026-08-01"
 
+var errInvalidSourceAgentCapabilityHealth = errors.New("invalid source agent capability health")
+
 type SourceAgentRunnerConfig struct {
 	Client          *SourceAgentClient
 	CommandClient   SourceAgentCommandClient
@@ -282,6 +284,10 @@ func (r *SourceAgentRunner) collectHeartbeat(ctx context.Context) (SourceCapabil
 	if err := ctx.Err(); err != nil {
 		return SourceCapabilityHealth{}, SourceAgentHeartbeat{}, err
 	}
+	health.Code = strings.ToLower(strings.TrimSpace(health.Code))
+	if _, allowed := allowedSourceCapabilityCodes[health.Code]; !allowed || !validSourceAgentCapabilityVersion(health.Version) {
+		return SourceCapabilityHealth{}, SourceAgentHeartbeat{}, errInvalidSourceAgentCapabilityHealth
+	}
 	if strings.TrimSpace(health.LastError) != "" {
 		health.LastError = "Capability check failed."
 	}
@@ -290,7 +296,7 @@ func (r *SourceAgentRunner) collectHeartbeat(ctx context.Context) (SourceCapabil
 	}
 	normalizedHealth, err := normalizeSourceCapabilityHealth(map[string]SourceCapabilityHealth{capabilityName: health})
 	if err != nil {
-		return SourceCapabilityHealth{}, SourceAgentHeartbeat{}, fmt.Errorf("collect source agent capability health: %w", err)
+		return SourceCapabilityHealth{}, SourceAgentHeartbeat{}, errInvalidSourceAgentCapabilityHealth
 	}
 	health = normalizedHealth[capabilityName]
 	pending, err := r.outbox.CountPending()
@@ -309,6 +315,25 @@ func (r *SourceAgentRunner) collectHeartbeat(ctx context.Context) (SourceCapabil
 		CurrentRunID: currentRunID, CurrentCommandID: currentCommandID,
 		OutboxPending: pending, DeadLetterCount: deadLetters, LastSuccessAt: lastSuccessAt,
 	}, nil
+}
+
+func validSourceAgentCapabilityVersion(value string) bool {
+	if value == "" {
+		return true
+	}
+	if strings.TrimSpace(value) != value || len(value) > sourceAgentVersionMaxRunes || value == "." || value == ".." {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' || character == '.' || character == '_' ||
+			character == '+' || character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (r *SourceAgentRunner) heartbeatStateSnapshot() (string, string, string) {

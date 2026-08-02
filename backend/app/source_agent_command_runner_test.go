@@ -45,6 +45,7 @@ type fakeSourceAgentCommandClient struct {
 	claims      []*SourceAgentCommand
 	claimErr    error
 	reportErrs  []error
+	applyOnErr  []bool
 	claimCalls  int
 	reportCalls []sourceAgentCommandReportCall
 	current     SourceAgentCommand
@@ -99,6 +100,19 @@ func (c *fakeSourceAgentCommandClient) ReportCommand(_ context.Context, commandI
 		err := c.reportErrs[0]
 		c.reportErrs = c.reportErrs[1:]
 		if err != nil {
+			apply := false
+			if len(c.applyOnErr) > 0 {
+				apply = c.applyOnErr[0]
+			}
+			if len(c.applyOnErr) > 0 {
+				c.applyOnErr = c.applyOnErr[1:]
+			}
+			if apply {
+				c.current.State = state
+				c.current.ResultCode = code
+				c.current.Message = message
+				c.current.ActualVersion = actualVersion
+			}
 			return SourceAgentCommand{}, err
 		}
 	}
@@ -131,20 +145,40 @@ func (d *fakeSourceAgentDiagnoser) Diagnose(context.Context) SourceAgentDiagnost
 }
 
 type fakeSourceAgentUpdater struct {
-	log     *sourceAgentRunnerCallLog
-	result  SourceAgentUpgradeResult
-	calls   atomic.Int32
-	overlap atomic.Bool
-	runBusy *atomic.Bool
+	log       *sourceAgentRunnerCallLog
+	result    SourceAgentUpgradeResult
+	results   map[string]SourceAgentUpgradeResult
+	calls     atomic.Int32
+	overlap   atomic.Bool
+	runBusy   *atomic.Bool
+	afterCall func()
+	mu        sync.Mutex
+	states    []string
 }
 
-func (u *fakeSourceAgentUpdater) Upgrade(context.Context, SourceAgentCommand) SourceAgentUpgradeResult {
+func (u *fakeSourceAgentUpdater) Upgrade(_ context.Context, command SourceAgentCommand) SourceAgentUpgradeResult {
 	u.log.add("upgrade")
 	u.calls.Add(1)
+	u.mu.Lock()
+	u.states = append(u.states, command.State)
+	result, ok := u.results[command.State]
+	u.mu.Unlock()
 	if u.runBusy != nil && u.runBusy.Load() {
 		u.overlap.Store(true)
 	}
+	if u.afterCall != nil {
+		u.afterCall()
+	}
+	if ok {
+		return result
+	}
 	return u.result
+}
+
+func (u *fakeSourceAgentUpdater) stateCalls() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.states...)
 }
 
 type sourceAgentRunnerHTTPHarness struct {
@@ -335,10 +369,10 @@ func TestSourceAgentCommandRunnerMapsUpgradeResultsToLegalTransitions(t *testing
 		wantMessage string
 	}{
 		{
-			name:        "success",
-			result:      SourceAgentUpgradeResult{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, Message: "cookie=secret article body excerpt", ActualVersion: "2.0.0"},
-			wantStates:  []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting, SourceAgentCommandVerifying, SourceAgentCommandSucceeded},
-			wantMessage: "Upgrade completed.",
+			name:        "verified",
+			result:      SourceAgentUpgradeResult{State: SourceAgentCommandVerified, Message: "cookie=secret article body excerpt"},
+			wantStates:  []string{SourceAgentCommandDownloading, SourceAgentCommandVerified},
+			wantMessage: "",
 		},
 		{
 			name:        "failure",
@@ -480,14 +514,14 @@ func TestSourceAgentCommandRunnerBoundsInvalidDiagnosticAndUpgradeResults(t *tes
 	if len(diagnostic) != 1 || diagnostic[0].state != SourceAgentCommandSucceeded || diagnostic[0].code != SourceAgentCommandCodeDiagnosticComplete || diagnostic[0].message != "Diagnostics completed." {
 		t.Fatalf("diagnostic reports=%#v", diagnostic)
 	}
-	upgrade := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{
+	upgrade := sourceAgentUpgradeCommandReport(SourceAgentCommand{State: SourceAgentCommandDownloading}, SourceAgentUpgradeResult{
 		State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete,
 		Message: privateMessage, ActualVersion: strings.Repeat("v", sourceAgentVersionMaxRunes+1),
 	})
-	if len(upgrade) != 1 || upgrade[0].state != SourceAgentCommandFailed || upgrade[0].code != SourceAgentCommandCodeUpgradeFailed {
-		t.Fatalf("upgrade reports=%#v", upgrade)
+	if upgrade.state != SourceAgentCommandFailed || upgrade.code != SourceAgentCommandCodeUpgradeFailed {
+		t.Fatalf("upgrade report=%#v", upgrade)
 	}
-	for _, report := range append(diagnostic, upgrade...) {
+	for _, report := range append(diagnostic, upgrade) {
 		if strings.Contains(report.message, "invalid.example") || strings.Contains(report.message, "/private/source-state") || len([]rune(report.message)) > sourceAgentCommandMessageMaxRunes {
 			t.Fatalf("unbounded or private command report=%#v", report)
 		}
@@ -510,15 +544,17 @@ func TestSourceAgentCommandRunnerUsesStableUpgradeMessages(t *testing.T) {
 		{state: SourceAgentCommandRolledBack, code: SourceAgentCommandCodeRollbackComplete, message: "Upgrade rolled back."},
 		{state: SourceAgentCommandFailed, code: SourceAgentCommandCodeRollbackFailed, message: "Upgrade rollback failed."},
 	} {
-		reports := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{
+		commandState := SourceAgentCommandDownloading
+		if test.state == SourceAgentCommandSucceeded {
+			commandState = SourceAgentCommandVerifying
+		} else if test.state == SourceAgentCommandRolledBack {
+			commandState = SourceAgentCommandRollback
+		}
+		report := sourceAgentUpgradeCommandReport(SourceAgentCommand{State: commandState}, SourceAgentUpgradeResult{
 			State: test.state, Code: test.code, Message: "cookie=secret article body excerpt raw error", ActualVersion: test.version,
 		})
-		if len(reports) == 0 {
-			t.Fatalf("state=%q code=%q produced no reports", test.state, test.code)
-		}
-		terminal := reports[len(reports)-1]
-		if terminal.state != test.state || terminal.code != test.code || terminal.message != test.message {
-			t.Fatalf("state=%q code=%q terminal=%#v", test.state, test.code, terminal)
+		if report.state != test.state || report.code != test.code || report.message != test.message {
+			t.Fatalf("state=%q code=%q report=%#v", test.state, test.code, report)
 		}
 	}
 }
@@ -584,13 +620,13 @@ func TestSourceAgentCommandRunnerRejectsNonTerminalComponentResultsAndClearsComm
 		})
 	}
 
-	for _, state := range []string{"", SourceAgentCommandVerified, SourceAgentCommandInstalling, "unknown"} {
+	for _, state := range []string{"", SourceAgentCommandInstalling, "unknown"} {
 		diagnostic := sourceAgentDiagnosticCommandReports(SourceAgentDiagnosticReport{State: state})
 		if len(diagnostic) != 1 || diagnostic[0].state != SourceAgentCommandFailed || diagnostic[0].code != SourceAgentCommandCodeDiagnosticFailed {
 			t.Fatalf("diagnostic state %q reports=%#v", state, diagnostic)
 		}
-		upgrade := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{State: state})
-		if len(upgrade) != 1 || upgrade[0].state != SourceAgentCommandFailed || upgrade[0].code != SourceAgentCommandCodeUpgradeFailed {
+		upgrade := sourceAgentUpgradeCommandReport(SourceAgentCommand{State: SourceAgentCommandDownloading}, SourceAgentUpgradeResult{State: state})
+		if upgrade.state != SourceAgentCommandFailed || upgrade.code != SourceAgentCommandCodeUpgradeFailed {
 			t.Fatalf("upgrade state %q reports=%#v", state, upgrade)
 		}
 	}
@@ -600,11 +636,336 @@ func TestSourceAgentCommandRunnerRejectsNonTerminalComponentResultsAndClearsComm
 	if len(mismatchedDiagnostic) != 1 || mismatchedDiagnostic[0].state != SourceAgentCommandFailed || mismatchedDiagnostic[0].code != SourceAgentCommandCodeDiagnosticFailed || mismatchedDiagnostic[0].message != "Diagnostic result was invalid." {
 		t.Fatalf("mismatched diagnostic reports=%#v", mismatchedDiagnostic)
 	}
-	mismatchedUpgrade := sourceAgentUpgradeCommandReports(SourceAgentUpgradeResult{
+	mismatchedUpgrade := sourceAgentUpgradeCommandReport(SourceAgentCommand{State: SourceAgentCommandDownloading}, SourceAgentUpgradeResult{
 		State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeRollbackComplete, ActualVersion: "2.0.0",
 	})
-	if len(mismatchedUpgrade) != 1 || mismatchedUpgrade[0].state != SourceAgentCommandFailed || mismatchedUpgrade[0].code != SourceAgentCommandCodeUpgradeFailed || mismatchedUpgrade[0].message != "Upgrade result was invalid." {
+	if mismatchedUpgrade.state != SourceAgentCommandFailed || mismatchedUpgrade.code != SourceAgentCommandCodeUpgradeFailed || mismatchedUpgrade.message != "Upgrade result was invalid." {
 		t.Fatalf("mismatched upgrade reports=%#v", mismatchedUpgrade)
+	}
+}
+
+func TestSourceAgentCommandRunnerAdvancesUpgradeOneDurableStagePerCycle(t *testing.T) {
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{{
+		ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		State:       SourceAgentCommandClaimed,
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+	}}}
+	updater := &fakeSourceAgentUpdater{log: log, results: map[string]SourceAgentUpgradeResult{
+		SourceAgentCommandDownloading: {State: SourceAgentCommandVerified},
+		SourceAgentCommandInstalling:  {State: SourceAgentCommandRestarting},
+		SourceAgentCommandRestarting:  {State: SourceAgentCommandVerifying},
+		SourceAgentCommandVerifying: {
+			State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete,
+			ActualVersion: "2.0.0",
+		},
+	}}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+
+	wantReports := []string{
+		SourceAgentCommandDownloading,
+		SourceAgentCommandVerified,
+		SourceAgentCommandInstalling,
+		SourceAgentCommandRestarting,
+		SourceAgentCommandVerifying,
+		SourceAgentCommandSucceeded,
+	}
+	for cycle, wantState := range wantReports {
+		beforeCalls := updater.calls.Load()
+		if _, err := runner.RunOnce(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle+1, err)
+		}
+		_, reports := commands.counts()
+		if len(reports) != cycle+1 || reports[cycle].State != wantState {
+			t.Fatalf("cycle %d reports=%#v, want one new %q report", cycle+1, reports, wantState)
+		}
+		wantUpdaterDelta := int32(1)
+		if wantState == SourceAgentCommandDownloading || wantState == SourceAgentCommandInstalling {
+			wantUpdaterDelta = 0
+		}
+		if delta := updater.calls.Load() - beforeCalls; delta != wantUpdaterDelta {
+			t.Fatalf("cycle %d updater delta=%d, want %d", cycle+1, delta, wantUpdaterDelta)
+		}
+	}
+	if got := strings.Join(updater.stateCalls(), ","); got != "downloading,installing,restarting,verifying" {
+		t.Fatalf("updater command states=%q", got)
+	}
+}
+
+func sourceAgentUpgradeTestResult(state string) SourceAgentUpgradeResult {
+	result := SourceAgentUpgradeResult{State: state, Message: "private local updater detail"}
+	switch state {
+	case SourceAgentCommandSucceeded:
+		result.Code = SourceAgentCommandCodeUpgradeComplete
+		result.ActualVersion = "2.0.0"
+	case SourceAgentCommandFailed:
+		result.Code = SourceAgentCommandCodeUpgradeFailed
+	case SourceAgentCommandRolledBack:
+		result.Code = SourceAgentCommandCodeRollbackComplete
+	}
+	return result
+}
+
+func TestSourceAgentCommandRunnerUpgradeStageResultMatrix(t *testing.T) {
+	allResults := []string{
+		"", "unknown", SourceAgentCommandDownloading, SourceAgentCommandVerified,
+		SourceAgentCommandInstalling, SourceAgentCommandRestarting, SourceAgentCommandVerifying,
+		SourceAgentCommandRollback, SourceAgentCommandSucceeded, SourceAgentCommandFailed,
+		SourceAgentCommandRolledBack,
+	}
+	allowed := map[string]map[string]bool{
+		SourceAgentCommandDownloading: {
+			SourceAgentCommandVerified: true, SourceAgentCommandFailed: true,
+		},
+		SourceAgentCommandInstalling: {
+			SourceAgentCommandRestarting: true, SourceAgentCommandRollback: true, SourceAgentCommandFailed: true,
+		},
+		SourceAgentCommandRestarting: {
+			SourceAgentCommandVerifying: true, SourceAgentCommandRollback: true,
+		},
+		SourceAgentCommandVerifying: {
+			SourceAgentCommandSucceeded: true, SourceAgentCommandRollback: true,
+		},
+		SourceAgentCommandRollback: {
+			SourceAgentCommandRolledBack: true, SourceAgentCommandFailed: true,
+		},
+	}
+	for from, allowedResults := range allowed {
+		for _, resultState := range allResults {
+			t.Run(from+"_to_"+resultState, func(t *testing.T) {
+				report := sourceAgentUpgradeCommandReport(
+					SourceAgentCommand{State: from}, sourceAgentUpgradeTestResult(resultState),
+				)
+				if allowedResults[resultState] {
+					if report.state != resultState {
+						t.Fatalf("report=%#v, want state %q", report, resultState)
+					}
+					return
+				}
+				wantState := SourceAgentCommandFailed
+				wantCode := SourceAgentCommandCodeUpgradeFailed
+				if from == SourceAgentCommandRestarting || from == SourceAgentCommandVerifying {
+					wantState = SourceAgentCommandRollback
+					wantCode = ""
+				}
+				if report.state != wantState || report.code != wantCode || report.actualVersion != "" {
+					t.Fatalf("report=%#v, want state=%q code=%q", report, wantState, wantCode)
+				}
+			})
+		}
+	}
+}
+
+func TestSourceAgentCommandRunnerRetriesEveryUpgradeReportWithoutRepeatingStage(t *testing.T) {
+	tests := []struct {
+		from       string
+		result     SourceAgentUpgradeResult
+		wantReport string
+		wantCalls  int32
+	}{
+		{from: SourceAgentCommandClaimed, wantReport: SourceAgentCommandDownloading},
+		{from: SourceAgentCommandDownloading, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerified}, wantReport: SourceAgentCommandVerified, wantCalls: 1},
+		{from: SourceAgentCommandVerified, wantReport: SourceAgentCommandInstalling},
+		{from: SourceAgentCommandInstalling, result: SourceAgentUpgradeResult{State: SourceAgentCommandRestarting}, wantReport: SourceAgentCommandRestarting, wantCalls: 1},
+		{from: SourceAgentCommandRestarting, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerifying}, wantReport: SourceAgentCommandVerifying, wantCalls: 1},
+		{from: SourceAgentCommandVerifying, result: SourceAgentUpgradeResult{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, ActualVersion: "2.0.0"}, wantReport: SourceAgentCommandSucceeded, wantCalls: 1},
+		{from: SourceAgentCommandRollback, result: SourceAgentUpgradeResult{State: SourceAgentCommandRolledBack, Code: SourceAgentCommandCodeRollbackComplete}, wantReport: SourceAgentCommandRolledBack, wantCalls: 1},
+	}
+	for _, test := range tests {
+		for _, mode := range []struct {
+			name      string
+			ambiguous bool
+		}{{name: "rejected"}, {name: "ambiguous", ambiguous: true}} {
+			t.Run(test.from+"_"+mode.name, func(t *testing.T) {
+				log := &sourceAgentRunnerCallLog{}
+				harness := &sourceAgentRunnerHTTPHarness{log: log}
+				commands := &fakeSourceAgentCommandClient{
+					log: log,
+					claims: []*SourceAgentCommand{{
+						ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+						State: test.from, UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+					}},
+					reportErrs: []error{errors.New("report result unavailable"), nil},
+					applyOnErr: []bool{mode.ambiguous},
+				}
+				updater := &fakeSourceAgentUpdater{log: log, result: test.result}
+				runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+
+				if _, err := runner.RunOnce(context.Background()); err == nil {
+					t.Fatal("first RunOnce() succeeded after report error")
+				}
+				if updater.calls.Load() != test.wantCalls {
+					t.Fatalf("updater calls after first cycle=%d, want %d", updater.calls.Load(), test.wantCalls)
+				}
+				if _, err := runner.RunOnce(context.Background()); err != nil {
+					t.Fatalf("report retry: %v", err)
+				}
+				if updater.calls.Load() != test.wantCalls {
+					t.Fatalf("report retry repeated updater: calls=%d, want %d", updater.calls.Load(), test.wantCalls)
+				}
+				claims, reports := commands.counts()
+				if claims != 1 || len(reports) != 2 || reports[0] != reports[1] || reports[0].State != test.wantReport {
+					t.Fatalf("claims=%d reports=%#v", claims, reports)
+				}
+			})
+		}
+	}
+}
+
+func TestSourceAgentCommandRunnerDoesNotInstallWhenInstallingReportIsRejected(t *testing.T) {
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &fakeSourceAgentCommandClient{
+		log: log,
+		claims: []*SourceAgentCommand{{
+			ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+			State: SourceAgentCommandVerified, UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+		}},
+		reportErrs: []error{errors.New("rollout disabled"), errors.New("rollout disabled")},
+	}
+	updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandRestarting}}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+
+	for cycle := 0; cycle < 2; cycle++ {
+		if _, err := runner.RunOnce(context.Background()); err == nil {
+			t.Fatalf("cycle %d succeeded while installing report was rejected", cycle+1)
+		}
+	}
+	if states := updater.stateCalls(); len(states) != 0 {
+		t.Fatalf("updater received installing before durable acknowledgement: %v", states)
+	}
+	_, reports := commands.counts()
+	if len(reports) != 2 || reports[0].State != SourceAgentCommandInstalling || reports[1] != reports[0] {
+		t.Fatalf("reports=%#v", reports)
+	}
+}
+
+func TestSourceAgentCommandRunnerRetriesReportAfterUpdaterContextCancellation(t *testing.T) {
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{{
+		ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		State:       SourceAgentCommandDownloading,
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	updater := &fakeSourceAgentUpdater{
+		log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerified}, afterCall: cancel,
+	}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+
+	if _, err := runner.RunOnce(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first RunOnce() error=%v, want context.Canceled", err)
+	}
+	if _, reports := commands.counts(); len(reports) != 0 {
+		t.Fatalf("reports with canceled context=%#v", reports)
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("report retry: %v", err)
+	}
+	if updater.calls.Load() != 1 {
+		t.Fatalf("updater repeated after context cancellation: %d", updater.calls.Load())
+	}
+	_, reports := commands.counts()
+	if len(reports) != 1 || reports[0].State != SourceAgentCommandVerified {
+		t.Fatalf("reports=%#v", reports)
+	}
+}
+
+func TestSourceAgentCommandRunnerCompletesRollbackOneStagePerCycle(t *testing.T) {
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{{
+		ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		State:       SourceAgentCommandInstalling,
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+	}}}
+	updater := &fakeSourceAgentUpdater{log: log, results: map[string]SourceAgentUpgradeResult{
+		SourceAgentCommandInstalling: {State: SourceAgentCommandRollback},
+		SourceAgentCommandRollback:   {State: SourceAgentCommandRolledBack, Code: SourceAgentCommandCodeRollbackComplete},
+	}}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, reports := commands.counts()
+	if len(reports) != 2 || reports[0].State != SourceAgentCommandRollback || reports[1].State != SourceAgentCommandRolledBack {
+		t.Fatalf("reports=%#v", reports)
+	}
+	if got := strings.Join(updater.stateCalls(), ","); got != "installing,rollback" {
+		t.Fatalf("updater states=%q", got)
+	}
+}
+
+func TestSourceAgentRunnerRejectsUnsafeCapabilityHealthBeforeNetwork(t *testing.T) {
+	privateValues := []string{
+		"https://private.example/release", "/private/worker/version", `C:\\Users\\operator\\worker.exe`,
+		"operator@example.com", " token ", "\t", ".", "..", strings.Repeat("v", sourceAgentVersionMaxRunes+1),
+	}
+	for index, privateValue := range privateValues {
+		t.Run(fmt.Sprintf("version_%d", index), func(t *testing.T) {
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log}
+			commands := &fakeSourceAgentCommandClient{log: log}
+			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{
+				Healthy: true, Version: privateValue,
+			}}, commands, nil, nil)
+
+			_, err := runner.RunOnce(context.Background())
+			if err == nil || err.Error() != "invalid source agent capability health" {
+				t.Fatalf("RunOnce() error=%q", err)
+			}
+			if strings.Contains(err.Error(), privateValue) {
+				t.Fatalf("error leaked invalid version: %q", err)
+			}
+			if calls := log.snapshot(); len(calls) != 0 {
+				t.Fatalf("network calls=%v", calls)
+			}
+		})
+	}
+
+	t.Run("unsupported code", func(t *testing.T) {
+		privateCode := "credential_operator_example"
+		log := &sourceAgentRunnerCallLog{}
+		harness := &sourceAgentRunnerHTTPHarness{log: log}
+		commands := &fakeSourceAgentCommandClient{log: log}
+		runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{
+			Healthy: false, Code: privateCode, Version: "dev",
+		}}, commands, nil, nil)
+
+		_, err := runner.RunOnce(context.Background())
+		if err == nil || err.Error() != "invalid source agent capability health" || strings.Contains(err.Error(), privateCode) {
+			t.Fatalf("RunOnce() error=%q", err)
+		}
+		if calls := log.snapshot(); len(calls) != 0 {
+			t.Fatalf("network calls=%v", calls)
+		}
+	})
+}
+
+func TestSourceAgentRunnerAcceptsExactCapabilityVersions(t *testing.T) {
+	for _, version := range []string{"", "dev", "1.2.3-beta+1", "BUILD_2026.08-rc+7"} {
+		t.Run("version_"+version, func(t *testing.T) {
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log, desiredState: SourceAgentDesiredPaused}
+			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
+			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{
+				Healthy: true, Version: version,
+			}}, commands, nil, nil)
+
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			heartbeats, _ := harness.snapshot()
+			if len(heartbeats) != 1 || heartbeats[0].CapabilityHealth["fake"].Version != version {
+				t.Fatalf("heartbeats=%#v", heartbeats)
+			}
+		})
 	}
 }
 
@@ -707,7 +1068,14 @@ func TestSourceAgentCommandRunnerKeepsClaimedUpgradeWaitingForActiveRun(t *testi
 		{ID: "cmd-upgrade", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade, State: SourceAgentCommandClaimed, UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"}},
 	}}
 	adapter := &blockingSourceAgentAdapter{started: make(chan struct{}), release: make(chan struct{})}
-	updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, Message: "Upgrade completed.", ActualVersion: "2.0.0"}, runBusy: &adapter.busy}
+	updater := &fakeSourceAgentUpdater{log: log, results: map[string]SourceAgentUpgradeResult{
+		SourceAgentCommandDownloading: {State: SourceAgentCommandVerified},
+		SourceAgentCommandInstalling:  {State: SourceAgentCommandRestarting},
+		SourceAgentCommandRestarting:  {State: SourceAgentCommandVerifying},
+		SourceAgentCommandVerifying: {
+			State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, ActualVersion: "2.0.0",
+		},
+	}, runBusy: &adapter.busy}
 	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), adapter, commands, nil, updater)
 
 	runDone := make(chan error, 1)
@@ -764,6 +1132,14 @@ func TestSourceAgentCommandRunnerKeepsClaimedUpgradeWaitingForActiveRun(t *testi
 		t.Fatalf("apply waiting upgrade: %v", err)
 	}
 	if updater.calls.Load() != 1 || updater.overlap.Load() {
+		t.Fatalf("download stage calls=%d overlap=%t", updater.calls.Load(), updater.overlap.Load())
+	}
+	for cycle := 0; cycle < 4; cycle++ {
+		if _, err := runner.RunOnce(context.Background()); err != nil {
+			t.Fatalf("remaining upgrade cycle %d: %v", cycle+1, err)
+		}
+	}
+	if updater.calls.Load() != 4 || updater.overlap.Load() {
 		t.Fatalf("updater calls=%d overlap=%t", updater.calls.Load(), updater.overlap.Load())
 	}
 	_, reports = commands.counts()

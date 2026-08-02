@@ -1604,7 +1604,7 @@
     {
       "name": "SourceAgentCycleResult",
       "file": "backend/app/source_agent_runner.go",
-      "line": 60
+      "line": 62
     },
     {
       "name": "SourceAgentDiagnosticReport",
@@ -1634,12 +1634,12 @@
     {
       "name": "SourceAgentRunner",
       "file": "backend/app/source_agent_runner.go",
-      "line": 32
+      "line": 34
     },
     {
       "name": "SourceAgentRunnerConfig",
       "file": "backend/app/source_agent_runner.go",
-      "line": 17
+      "line": 19
     },
     {
       "name": "SourceAgentUpgradeResult",
