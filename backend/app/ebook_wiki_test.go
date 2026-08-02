@@ -37,6 +37,12 @@ func TestSyncEbookToBookKnowledgeStoreDownloadsAndIngestsLocally(t *testing.T) {
 	if err != nil || len(pkg.Chunks) == 0 {
 		t.Fatalf("knowledge package = %#v, err=%v", pkg, err)
 	}
+	if pkg.Book.SourceHTML != "dedao://ebook/ebook-enid" {
+		t.Fatalf("knowledge source = %q, want stable Dedao URI", pkg.Book.SourceHTML)
+	}
+	if strings.Contains(pkg.Book.SourceHTML, downloadRoot) || len(pkg.Citations) == 0 || pkg.Citations[0].SourceHTML != pkg.Book.SourceHTML {
+		t.Fatalf("knowledge package leaked download path or lost source binding: book=%#v citations=%#v", pkg.Book, pkg.Citations)
+	}
 }
 
 func TestEbookHTMLPath(t *testing.T) {

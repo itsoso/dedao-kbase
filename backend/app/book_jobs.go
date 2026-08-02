@@ -183,7 +183,7 @@ func (s *BookKnowledgeStore) FailInterruptedBookKnowledgeJobs(reason string) (in
 	return count, nil
 }
 
-func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) {
+func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) error {
 	job, err := s.updateBookKnowledgeJob(jobID, func(job BookKnowledgeJob) BookKnowledgeJob {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		job.Status, job.StartedAt, job.UpdatedAt = BookKnowledgeJobStatusRunning, now, now
@@ -191,10 +191,10 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) {
 		return job
 	})
 	if err != nil {
-		return
+		return err
 	}
-	result, runErr := s.executeBookKnowledgeJob(job)
-	_, _ = s.updateBookKnowledgeJob(job.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+	result, runErr := s.executeBookKnowledgeJobSafely(job)
+	_, err = s.updateBookKnowledgeJob(job.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		job.UpdatedAt, job.FinishedAt = now, now
 		if runErr != nil {
@@ -208,6 +208,17 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) {
 		job.Logs = append(job.Logs, "succeeded")
 		return job
 	})
+	return err
+}
+
+func (s *BookKnowledgeStore) executeBookKnowledgeJobSafely(job BookKnowledgeJob) (result map[string]any, err error) {
+	defer func() {
+		if recover() != nil {
+			result = nil
+			err = fmt.Errorf("job executor panic")
+		}
+	}()
+	return s.executeBookKnowledgeJob(job)
 }
 
 func (s *BookKnowledgeStore) executeBookKnowledgeJob(job BookKnowledgeJob) (map[string]any, error) {

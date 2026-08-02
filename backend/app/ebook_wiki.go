@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,6 +126,7 @@ func SyncEbookToBookKnowledgeStore(
 	emitEbookWikiProgress(ctx, "正在生成本地知识包")
 	knowledgePackage, err := BuildBookKnowledgeFromHTMLFile(BookKnowledgeBook{
 		BookID: strconv.Itoa(id), DedaoID: id, EnID: enid, Title: result.Title,
+		SourceHTML: "dedao://ebook/" + url.PathEscape(enid),
 	}, result.HTMLPath, store)
 	if err != nil {
 		return nil, err

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"github.com/yann0917/dedao-gui/backend/services"
 	"github.com/yann0917/dedao-gui/backend/utils"
 )
@@ -62,6 +61,12 @@ func EbookPage(ctx context.Context, enID string) (info *services.EbookInfo, svgC
 	}
 	wgp := utils.NewWaitGroupPool(5)
 	total, curr := len(info.BookInfo.Orders), 0
+	type pageResult struct {
+		index   int
+		content *utils.SvgContent
+		err     error
+	}
+	results := make(chan pageResult, total)
 	var chapterMap sync.Map
 	for _, ebookToc := range info.BookInfo.Toc {
 		key := ebookToc.Href
@@ -82,29 +87,60 @@ func EbookPage(ctx context.Context, enID string) (info *services.EbookInfo, svgC
 			progress.Value = value.(utils.EbookToc).Text
 			chapterMap.Delete(order.ChapterID)
 		}
-		runtime.EventsEmit(ctx, "ebookDownload", progress)
+		emitEbookDownloadProgress(ctx, progress)
 		wgp.Add()
 		go func(i int, order services.EbookOrders) {
-			defer func() {
-				wgp.Done()
-			}()
+			defer wgp.Done()
 			index, count, offset := 0, 20, 0
-			svgList, err1 := generateEbookPages(order.ChapterID, token.Token, index, count, offset)
-			if err1 != nil {
-				err = err1
+			svgList, fetchErr := runEbookPageFetch(func() ([]string, error) {
+				return generateEbookPages(order.ChapterID, token.Token, index, count, offset)
+			})
+			if fetchErr != nil {
+				results <- pageResult{index: i, err: fetchErr}
 				return
 			}
-
-			svgContent = append(svgContent, &utils.SvgContent{
+			results <- pageResult{index: i, content: &utils.SvgContent{
 				Contents:   svgList,
 				ChapterID:  order.ChapterID,
 				PathInEpub: order.PathInEpub,
 				OrderIndex: i,
-			})
+			}}
 		}(i, order)
 	}
 	wgp.Wait()
+	close(results)
+	ordered := make([]*utils.SvgContent, total)
+	for result := range results {
+		if result.err != nil {
+			if err == nil {
+				err = result.err
+			}
+			continue
+		}
+		ordered[result.index] = result.content
+	}
+	if err != nil {
+		return
+	}
+	for _, content := range ordered {
+		if content != nil {
+			svgContent = append(svgContent, content)
+		}
+	}
 	return
+}
+
+func runEbookPageFetch(fetch func() ([]string, error)) (pages []string, err error) {
+	defer func() {
+		if recover() != nil {
+			pages = nil
+			err = fmt.Errorf("ebook page fetch failed")
+		}
+	}()
+	if fetch == nil {
+		return nil, fmt.Errorf("ebook page fetch is required")
+	}
+	return fetch()
 }
 
 func generateEbookPages(chapterID, token string, index, count, offset int) (svgList []string, err error) {
@@ -115,7 +151,10 @@ func generateEbookPages(chapterID, token string, index, count, offset int) (svgL
 	}
 
 	for _, item := range pageList.Pages {
-		desContents := DecryptAES(item.Svg)
+		desContents, decryptErr := decryptEbookPage(item.Svg)
+		if decryptErr != nil {
+			return nil, fmt.Errorf("decrypt ebook page: %w", decryptErr)
+		}
 		svgList = append(svgList, desContents)
 	}
 	// fmt.Printf("IsEnd:%#v\n", pageList.IsEnd)
@@ -137,17 +176,20 @@ func generateEbookPages(chapterID, token string, index, count, offset int) (svgL
 
 // PKCS7Unpad 实现PKCS7去填充
 func PKCS7Unpad(data []byte) []byte {
-	length := len(data)
-	unpadding := int(data[length-1])
-	return data[:(length - unpadding)]
+	result, _ := pkcs7Unpad(data, aes.BlockSize)
+	return result
 }
 
 // DecryptAES 实现AES - CBC解密
 func DecryptAES(contents string) string {
+	result, _ := decryptEbookPage(contents)
+	return result
+}
+
+func decryptEbookPage(contents string) (string, error) {
 	ciphertext, err := base64.StdEncoding.DecodeString(contents)
 	if err != nil {
-		fmt.Println("Base64解码错误:", err)
-		return ""
+		return "", fmt.Errorf("invalid base64 ciphertext")
 	}
 
 	key := []byte("3e4r06tjkpjcevlbslr3d96gdb5ahbmo")
@@ -155,14 +197,36 @@ func DecryptAES(contents string) string {
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("initialize ebook cipher: %w", err)
 	}
 
 	blockSize := block.BlockSize()
+	if len(ciphertext) == 0 || len(ciphertext)%blockSize != 0 {
+		return "", fmt.Errorf("invalid ciphertext length")
+	}
 	mode := cipher.NewCBCDecrypter(block, iv[:blockSize])
 	plaintext := make([]byte, len(ciphertext))
 	mode.CryptBlocks(plaintext, ciphertext)
 
-	plaintext = PKCS7Unpad(plaintext)
-	return string(plaintext)
+	plaintext, err = pkcs7Unpad(plaintext, blockSize)
+	if err != nil {
+		return "", err
+	}
+	return string(plaintext), nil
+}
+
+func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
+	if len(data) == 0 || blockSize <= 0 || len(data)%blockSize != 0 {
+		return nil, fmt.Errorf("invalid padded plaintext length")
+	}
+	padding := int(data[len(data)-1])
+	if padding == 0 || padding > blockSize || padding > len(data) {
+		return nil, fmt.Errorf("invalid ebook page padding")
+	}
+	for _, value := range data[len(data)-padding:] {
+		if int(value) != padding {
+			return nil, fmt.Errorf("invalid ebook page padding")
+		}
+	}
+	return data[:len(data)-padding], nil
 }
