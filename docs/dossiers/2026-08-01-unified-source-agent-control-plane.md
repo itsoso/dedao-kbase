@@ -48,7 +48,9 @@ Worker, a durable `PathState` pending marker, restart-safe command recovery,
 pre-armed ready identity, a server-authored pre-replacement guard, clean-HEAD
 compiled revision identity, retained backup until server terminal
 acknowledgement, and recoverable publication of the binary pair, both plists,
-and protected local config. These changes refine the approved macOS updater;
+and protected local config. A shared per-worker kernel lifecycle lock makes
+maintenance and update publication mutually exclusive across all three local
+processes. These changes refine the approved macOS updater;
 they do not add signing, remote paths, arbitrary execution, scheduled rollout,
 or per-agent authentication claims.
 

@@ -294,6 +294,12 @@ both before preparation and immediately before replacement.
 Installation is one recoverable local transaction over the Worker/updater
 binary pair, both plists, protected per-worker config, shared-token Keychain
 state, and both loaded-job states. It refuses an unresolved update attempt.
+Installer, Worker bridge, and updater coordinate through one fixed per-worker
+kernel lifecycle lock derived from the pinned install directory. Installer and
+uninstaller hold it exclusively from maintenance publication through the file
+and loaded-job transaction; update publication/recovery holds it shared. This
+makes maintenance intent, command/handoff publication, and bootout mutually
+exclusive instead of relying on a check-then-act marker.
 Uninstall first stops both jobs, is idempotently resumable after partial file
 deletion, preserves source state/outbox by default, and never deletes the
 shared token merely because one Worker is removed.

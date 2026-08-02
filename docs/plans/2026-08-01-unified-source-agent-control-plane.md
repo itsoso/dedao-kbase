@@ -831,6 +831,7 @@ before the Web exposes an upgrade action.
 - Create: `scripts/source-agent-updater-launchd-smoke.sh`
 - Modify: `scripts/source-agent-packaging-smoke.sh`
 - Modify: `scripts/wcplus-agent-packaging-smoke.sh`
+- Regenerate: `docs/_generated/system-map.json`
 
 **Step 1: Freeze the independent-process and local-config boundary in RED**
 
@@ -888,16 +889,39 @@ current UID, exactly `0600`, strictly bounded, and normalizes only the KBase URL
 and agent ID. Any config, Keychain, plist, binary, bootstrap, or health-check
 failure restores all non-secret files and both prior loaded states.
 
-Before changing any file or loaded state, install and uninstall atomically
-publish a locally derived maintenance marker that the Worker bridge and helper
-both treat as deny. If an unacknowledged pending marker, journal, backup, or
-running transaction exists, they remove only their own maintenance marker and
-refuse without booting out either job. After the maintenance marker is durable
-and update state is empty, no new handoff may begin; the installer can safely
-bootout both jobs and enter its recoverable publication transaction. A crash
-leaves an installer journal that a rerun must finish or roll back before
-clearing maintenance. Tests race installation against handoff publication and
-every updater phase.
+All three actors share one fixed no-follow per-worker lifecycle advisory lock
+whose file is derived from the updater's pinned install directory. Lock order
+is always lifecycle lock, command/handoff store lock, transaction binary lock,
+then receipt/journal lock. Worker/bridge and updater never acquire these in the
+opposite order.
+
+The installer/uninstaller launches the staged fixed updater in a local
+lock-holder mode with only `--worker-type`; it derives the same lock, signals a
+fixed `locked` acknowledgement over a private installer-owned pipe, and holds
+the exclusive kernel lock until that pipe closes. No path or command is passed
+to the lock holder. The Worker/bridge holds a shared lock across the final
+maintenance check plus command checkpoint, partial-stage, handoff, and pending
+publication. The updater holds a shared lock while opening/recovering an
+attempt and throughout replacement, ready wait, terminal reconciliation, and
+cleanup. A killed process releases the kernel lock automatically.
+
+Only while holding the exclusive lock does install/uninstall atomically publish
+the locally derived maintenance marker. The Runner treats that marker as a
+hard gate: authenticated heartbeat may continue, but ordinary command claim,
+owned-command adoption, updater activation, and source lease may not begin.
+The installer then checks command checkpoints, partial stages, handoffs,
+pending marker, journal, backup, ready/terminal acknowledgement or rollback
+request, and helper transaction state. Any non-empty state removes only the
+installer's maintenance marker, restores its prior loaded-state observation,
+releases the lock, and refuses without booting out either job. With the
+exclusive lock still held, an empty check cannot race a new update and both
+jobs can be booted out before publication begins. A crash leaves an installer
+journal that a rerun must finish or roll back before clearing maintenance.
+
+Race tests force both interleavings: installer lock acquisition after the
+Worker's initial check but before pending publication, and Worker shared-lock
+acquisition after installer intent but before bootout. Exactly one side may
+commit; the other waits or refuses without partial publication.
 
 Shared-token publication preserves the previous Keychain value or prior
 absence until the entire install commits. Any failure restores that exact
@@ -981,7 +1005,9 @@ override even if it is valid hex. CI may verify its trusted commit SHA equals
 that derived HEAD but may not replace it. The build injects the same exact 40-
 or 64-character lowercase revision into the Worker and updater. Catalog
 preparation reads and verifies revision from the artifact's `build-info`; it is
-never hand-entered. A new Worker may write ready only when its compiled
+never hand-entered. This execution happens only in the controlled offline
+packaging/promotion workflow; the long-running KBase catalog loader never
+executes an artifact binary. A new Worker may write ready only when its compiled
 identity, including revision, matches the armed challenge; it must never copy
 revision from the challenge into its own identity. SHA-256 remains a byte
 integrity check and is not described as publisher identity or signing.
@@ -1037,7 +1063,7 @@ transition:
 | `verified` | server permanently denies `installing` while the authoritative command remains owned and `verified` | replace pending progress with bounded `failed` report; never start updater |
 | `verified` | authoritative command is already terminal | reconcile the no-replacement terminal locally; never start updater |
 | `installing` | updater job durably requested, but no restart/terminal phase | wait |
-| `installing` | durable `restart_requested` phase | `restarting` |
+| `installing` | durable `restart_requested` or any later normal non-terminal `restarted`/`ready` phase | `restarting` |
 | `installing` | durable success outcome raced ahead of server progress | `restarting` |
 | `installing` | durable failure before any binary replacement | `failed` |
 | `installing` | replacement began and recovery is active, restored, or failed | `rollback` |
@@ -1055,6 +1081,11 @@ every server report, then prove that retry neither repeats download/replacement
 nor skips rollback. Disabling rollout after claim, after download, after the
 `installing` report, or between the transaction's two guard calls leaves or
 restores the old binary.
+
+The phase tests pause and crash at `restart_requested`, `restarted`, and
+`ready`, with the server still at `installing`, and require the same single
+`restarting` transition. A helper that persists success before Runner recovery
+uses the separate success-raced-ahead row.
 
 A durable success or restored outcome does not immediately delete its backup,
 journal, handoff, or pending marker. After the server accepts the matching
