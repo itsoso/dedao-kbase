@@ -153,6 +153,9 @@ func (r *SourceAgentRunner) executeUpgradeCommand(ctx context.Context, command S
 		return fmt.Errorf("upgrade command state is not executable")
 	}
 	r.setPendingCommandReports([]sourceAgentPendingCommandReport{report})
+	if r.clearExpiredCurrentCommand(command.ID) {
+		return nil
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -204,6 +207,9 @@ func validSourceAgentUpgradeHandoff(command SourceAgentCommand) bool {
 }
 
 func (r *SourceAgentRunner) reportPendingCommand(ctx context.Context) error {
+	if r.clearExpiredCurrentCommand("") {
+		return nil
+	}
 	command, report, ok := r.nextPendingCommandReport()
 	if !ok {
 		return nil
@@ -212,6 +218,9 @@ func (r *SourceAgentRunner) reportPendingCommand(ctx context.Context) error {
 		ctx, command.ID, report.state, report.code, report.message, report.actualVersion,
 	)
 	if err != nil {
+		if r.clearExpiredCurrentCommand(command.ID) {
+			return nil
+		}
 		return fmt.Errorf("report source-agent command: %w", err)
 	}
 	r.commandReportSucceeded(updated)

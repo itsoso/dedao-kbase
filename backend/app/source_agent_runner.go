@@ -44,6 +44,7 @@ type SourceAgentRunner struct {
 	version         string
 	protocolVersion string
 	leaseDuration   time.Duration
+	now             func() time.Time
 
 	controlGate chan struct{}
 	stateMu     sync.Mutex
@@ -114,7 +115,7 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 		adapter: config.Adapter, diagnoser: config.Diagnoser, updater: config.Updater,
 		workerType: workerType, platform: platform, architecture: architecture,
 		version: version, protocolVersion: protocolVersion, leaseDuration: config.LeaseDuration,
-		controlGate: make(chan struct{}, 1),
+		now: time.Now, controlGate: make(chan struct{}, 1),
 	}
 	runner.controlGate <- struct{}{}
 	return runner, nil
@@ -161,6 +162,9 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, err
 	if err != nil {
 		return nil, fmt.Errorf("send source-agent heartbeat: %w", err)
 	}
+	if r.clearExpiredCurrentCommand("") {
+		return nil, nil
+	}
 
 	if r.hasCurrentCommand() {
 		if r.hasPendingCommandReports() {
@@ -179,6 +183,9 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, err
 	}
 	if command != nil {
 		r.setCurrentCommand(*command)
+		if r.clearExpiredCurrentCommand(command.ID) {
+			return nil, nil
+		}
 		if command.Type == SourceAgentCommandUpgrade && r.isSourceRunActive() {
 			return nil, nil
 		}
@@ -321,17 +328,82 @@ func validSourceAgentCapabilityVersion(value string) bool {
 	if value == "" {
 		return true
 	}
-	if strings.TrimSpace(value) != value || len(value) > sourceAgentVersionMaxRunes || value == "." || value == ".." {
+	if strings.TrimSpace(value) != value || len(value) > sourceAgentVersionMaxRunes {
+		return false
+	}
+	lowerValue := strings.ToLower(value)
+	for _, marker := range []string{
+		"token", "secret", "password", "credential", "cookie", "session", "bearer", "authorization", "auth",
+	} {
+		if strings.Contains(lowerValue, marker) {
+			return false
+		}
+	}
+	if value == "1" || value == "dev" {
+		return true
+	}
+	if strings.HasPrefix(value, "v") {
+		value = value[1:]
+	}
+	coreAndPrerelease := value
+	if buildStart := strings.IndexByte(value, '+'); buildStart >= 0 {
+		if strings.IndexByte(value[buildStart+1:], '+') >= 0 || !validSourceAgentVersionIdentifiers(value[buildStart+1:], false) {
+			return false
+		}
+		coreAndPrerelease = value[:buildStart]
+	}
+	core := coreAndPrerelease
+	if prereleaseStart := strings.IndexByte(coreAndPrerelease, '-'); prereleaseStart >= 0 {
+		if !validSourceAgentVersionIdentifiers(coreAndPrerelease[prereleaseStart+1:], true) {
+			return false
+		}
+		core = coreAndPrerelease[:prereleaseStart]
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if !validSourceAgentVersionNumber(part) {
+			return false
+		}
+	}
+	return true
+}
+
+func validSourceAgentVersionIdentifiers(value string, rejectNumericLeadingZero bool) bool {
+	identifiers := strings.Split(value, ".")
+	for _, identifier := range identifiers {
+		if identifier == "" {
+			return false
+		}
+		numeric := true
+		for index := 0; index < len(identifier); index++ {
+			character := identifier[index]
+			if character >= '0' && character <= '9' {
+				continue
+			}
+			numeric = false
+			if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character == '-' {
+				continue
+			}
+			return false
+		}
+		if rejectNumericLeadingZero && numeric && len(identifier) > 1 && identifier[0] == '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func validSourceAgentVersionNumber(value string) bool {
+	if value == "" || len(value) > 1 && value[0] == '0' {
 		return false
 	}
 	for index := 0; index < len(value); index++ {
-		character := value[index]
-		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
-			character >= '0' && character <= '9' || character == '.' || character == '_' ||
-			character == '+' || character == '-' {
-			continue
+		if value[index] < '0' || value[index] > '9' {
+			return false
 		}
-		return false
 	}
 	return true
 }
@@ -379,6 +451,20 @@ func (r *SourceAgentRunner) setPendingCommandReports(reports []sourceAgentPendin
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
 	r.state.pendingReports = append([]sourceAgentPendingCommandReport(nil), reports...)
+}
+
+func (r *SourceAgentRunner) clearExpiredCurrentCommand(commandID string) bool {
+	now := r.now().UTC()
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	if r.state.currentCommand == nil || commandID != "" && r.state.currentCommand.ID != commandID ||
+		!sourceAgentCommandIsExpired(*r.state.currentCommand, now) {
+		return false
+	}
+	r.state.currentCommand = nil
+	r.state.pendingReports = nil
+	r.state.upgradeActive = false
+	return true
 }
 
 func (r *SourceAgentRunner) nextPendingCommandReport() (SourceAgentCommand, sourceAgentPendingCommandReport, bool) {

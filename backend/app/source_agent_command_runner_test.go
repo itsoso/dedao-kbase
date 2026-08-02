@@ -46,6 +46,7 @@ type fakeSourceAgentCommandClient struct {
 	claimErr    error
 	reportErrs  []error
 	applyOnErr  []bool
+	afterReport func()
 	claimCalls  int
 	reportCalls []sourceAgentCommandReportCall
 	current     SourceAgentCommand
@@ -86,6 +87,9 @@ func (c *fakeSourceAgentCommandClient) ClaimCommand(context.Context) (*SourceAge
 		return nil, nil
 	}
 	copy := *command
+	if copy.ExpiresAt == "" {
+		copy.ExpiresAt = "2999-01-01T00:00:00Z"
+	}
 	c.current = copy
 	return &copy, nil
 }
@@ -96,6 +100,9 @@ func (c *fakeSourceAgentCommandClient) ReportCommand(_ context.Context, commandI
 	defer c.mu.Unlock()
 	call := sourceAgentCommandReportCall{CommandID: commandID, State: state, Code: code, Message: message, ActualVersion: actualVersion}
 	c.reportCalls = append(c.reportCalls, call)
+	if c.afterReport != nil {
+		c.afterReport()
+	}
 	if len(c.reportErrs) > 0 {
 		err := c.reportErrs[0]
 		c.reportErrs = c.reportErrs[1:]
@@ -902,10 +909,213 @@ func TestSourceAgentCommandRunnerCompletesRollbackOneStagePerCycle(t *testing.T)
 	}
 }
 
+func sourceAgentExpiringUpgradeCommand(state string, expiresAt time.Time) SourceAgentCommand {
+	return SourceAgentCommand{
+		ID: "cmd-expiring", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		State: state, ExpiresAt: expiresAt.UTC().Format(time.RFC3339Nano),
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+	}
+}
+
+func assertSourceAgentCommandCleared(t *testing.T, runner *SourceAgentRunner) {
+	t.Helper()
+	if runner.hasCurrentCommand() || runner.hasPendingCommandReports() || runner.isUpgradeActive() {
+		t.Fatal("runner retained an expired command")
+	}
+}
+
+func TestSourceAgentCommandRunnerClearsExpiredCurrentStagesBeforeWork(t *testing.T) {
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for _, state := range []string{
+		SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling,
+	} {
+		t.Run(state, func(t *testing.T) {
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log}
+			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
+			updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeUpgradeFailed}}
+			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+			runner.now = func() time.Time { return base }
+			runner.setCurrentCommand(sourceAgentExpiringUpgradeCommand(state, base.Add(-time.Second)))
+
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			assertSourceAgentCommandCleared(t, runner)
+			if updater.calls.Load() != 0 {
+				t.Fatalf("expired %s invoked updater %d times", state, updater.calls.Load())
+			}
+			if _, reports := commands.counts(); len(reports) != 0 {
+				t.Fatalf("expired %s reports=%#v", state, reports)
+			}
+			if _, leases := harness.snapshot(); leases != 0 {
+				t.Fatalf("expired %s leased in cleanup cycle", state)
+			}
+
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatalf("recovery cycle: %v", err)
+			}
+			if _, leases := harness.snapshot(); leases != 1 {
+				t.Fatalf("recovery lease calls=%d", leases)
+			}
+		})
+	}
+}
+
+func TestSourceAgentCommandRunnerClearsExpiredOrMalformedNewClaims(t *testing.T) {
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	for _, expiresAt := range []string{base.Add(-time.Second).Format(time.RFC3339Nano), "malformed-private-expiry"} {
+		t.Run(expiresAt, func(t *testing.T) {
+			log := &sourceAgentRunnerCallLog{}
+			harness := &sourceAgentRunnerHTTPHarness{log: log}
+			command := sourceAgentExpiringUpgradeCommand(SourceAgentCommandDownloading, base.Add(time.Minute))
+			command.ExpiresAt = expiresAt
+			commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{&command, nil}}
+			updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerified}}
+			runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+			runner.now = func() time.Time { return base }
+
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			assertSourceAgentCommandCleared(t, runner)
+			if updater.calls.Load() != 0 {
+				t.Fatalf("invalid claim invoked updater %d times", updater.calls.Load())
+			}
+			if _, err := runner.RunOnce(context.Background()); err != nil {
+				t.Fatalf("recovery cycle: %v", err)
+			}
+			if _, leases := harness.snapshot(); leases != 1 {
+				t.Fatalf("recovery lease calls=%d", leases)
+			}
+		})
+	}
+}
+
+func TestSourceAgentCommandRunnerClearsExpiredUpgradeWaitingForActiveRun(t *testing.T) {
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &fakeSourceAgentCommandClient{log: log}
+	updater := &fakeSourceAgentUpdater{log: log}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+	runner.now = func() time.Time { return base }
+	runner.startSourceRun("run-active")
+	runner.setCurrentCommand(sourceAgentExpiringUpgradeCommand(SourceAgentCommandClaimed, base.Add(-time.Second)))
+
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertSourceAgentCommandCleared(t, runner)
+	if updater.calls.Load() != 0 {
+		t.Fatalf("expired waiting command invoked updater %d times", updater.calls.Load())
+	}
+	if _, reports := commands.counts(); len(reports) != 0 {
+		t.Fatalf("expired waiting command reports=%#v", reports)
+	}
+}
+
+func TestSourceAgentCommandRunnerClearsWhenUpdaterFinishesAfterExpiry(t *testing.T) {
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	now := base
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
+	updater := &fakeSourceAgentUpdater{
+		log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandRestarting},
+		afterCall: func() { now = base.Add(2 * time.Minute) },
+	}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+	runner.now = func() time.Time { return now }
+	runner.setCurrentCommand(sourceAgentExpiringUpgradeCommand(SourceAgentCommandInstalling, base.Add(time.Minute)))
+
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertSourceAgentCommandCleared(t, runner)
+	if updater.calls.Load() != 1 {
+		t.Fatalf("updater calls=%d", updater.calls.Load())
+	}
+	if _, reports := commands.counts(); len(reports) != 0 {
+		t.Fatalf("expired updater result was reported: %#v", reports)
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if updater.calls.Load() != 1 {
+		t.Fatalf("updater repeated after expiry: %d", updater.calls.Load())
+	}
+	if _, leases := harness.snapshot(); leases != 1 {
+		t.Fatalf("recovery lease calls=%d", leases)
+	}
+}
+
+func TestSourceAgentCommandRunnerConvergesWhenReportErrorCrossesExpiry(t *testing.T) {
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	now := base
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	command := sourceAgentExpiringUpgradeCommand(SourceAgentCommandDownloading, base.Add(time.Minute))
+	commands := &fakeSourceAgentCommandClient{
+		log: log, claims: []*SourceAgentCommand{&command, nil},
+		reportErrs: []error{errors.New("ambiguous report result")}, applyOnErr: []bool{true},
+		afterReport: func() { now = base.Add(2 * time.Minute) },
+	}
+	updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerified}}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+	runner.now = func() time.Time { return now }
+
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatalf("expired ambiguous report did not converge: %v", err)
+	}
+	assertSourceAgentCommandCleared(t, runner)
+	if updater.calls.Load() != 1 {
+		t.Fatalf("updater calls=%d", updater.calls.Load())
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if updater.calls.Load() != 1 {
+		t.Fatalf("updater repeated after ambiguous expiry: %d", updater.calls.Load())
+	}
+	if _, leases := harness.snapshot(); leases != 1 {
+		t.Fatalf("recovery lease calls=%d", leases)
+	}
+}
+
+func TestSourceAgentCommandRunnerKeepsUnexpiredReportErrorPending(t *testing.T) {
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	log := &sourceAgentRunnerCallLog{}
+	harness := &sourceAgentRunnerHTTPHarness{log: log}
+	command := sourceAgentExpiringUpgradeCommand(SourceAgentCommandDownloading, base.Add(time.Minute))
+	commands := &fakeSourceAgentCommandClient{
+		log: log, claims: []*SourceAgentCommand{&command},
+		reportErrs: []error{errors.New("conflict"), errors.New("conflict")},
+	}
+	updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerified}}
+	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
+	runner.now = func() time.Time { return base }
+
+	for cycle := 0; cycle < 2; cycle++ {
+		if _, err := runner.RunOnce(context.Background()); err == nil {
+			t.Fatalf("cycle %d succeeded after unexpired report conflict", cycle+1)
+		}
+	}
+	if !runner.hasCurrentCommand() || !runner.hasPendingCommandReports() || !runner.isUpgradeActive() {
+		t.Fatal("unexpired report error did not remain pending")
+	}
+	if updater.calls.Load() != 1 {
+		t.Fatalf("pending report repeated updater: %d", updater.calls.Load())
+	}
+}
+
 func TestSourceAgentRunnerRejectsUnsafeCapabilityHealthBeforeNetwork(t *testing.T) {
 	privateValues := []string{
 		"https://private.example/release", "/private/worker/version", `C:\\Users\\operator\\worker.exe`,
 		"operator@example.com", " token ", "\t", ".", "..", strings.Repeat("v", sourceAgentVersionMaxRunes+1),
+		"credential_operator_example", "token-secret", "password", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature",
+		"1.2.3+secret", "1.2.3_cookie", "1.2", "1.2.3.4", "01.2.3", "1.02.3", "1.2.03",
+		"1.2.3-01", "1.2.3-", "1.2.3+", "1.2.3+build..7", "2", "DEV",
 	}
 	for index, privateValue := range privateValues {
 		t.Run(fmt.Sprintf("version_%d", index), func(t *testing.T) {
@@ -949,7 +1159,7 @@ func TestSourceAgentRunnerRejectsUnsafeCapabilityHealthBeforeNetwork(t *testing.
 }
 
 func TestSourceAgentRunnerAcceptsExactCapabilityVersions(t *testing.T) {
-	for _, version := range []string{"", "dev", "1.2.3-beta+1", "BUILD_2026.08-rc+7"} {
+	for _, version := range []string{"", "1", "dev", "1.2.3", "v1.2.3", "1.2.3-beta.1+build-7"} {
 		t.Run("version_"+version, func(t *testing.T) {
 			log := &sourceAgentRunnerCallLog{}
 			harness := &sourceAgentRunnerHTTPHarness{log: log, desiredState: SourceAgentDesiredPaused}
@@ -1188,7 +1398,7 @@ func TestSourceAgentRunnerHeartbeatIncludesBoundedLocalMetadataAndCounts(t *test
 	}
 	commands := &fakeSourceAgentCommandClient{log: log, claims: []*SourceAgentCommand{nil}}
 	adapter := &fakeSourceAdapter{status: SourceCapabilityHealth{
-		Healthy: false, Code: "dependency_unavailable", Version: "adapter-2",
+		Healthy: false, Code: "dependency_unavailable", Version: "2.0.0",
 		LastError:      "cookie=secret raw local capability error",
 		RequiresAction: "article body excerpt requires local operator action",
 	}}
@@ -1207,7 +1417,7 @@ func TestSourceAgentRunnerHeartbeatIncludesBoundedLocalMetadataAndCounts(t *test
 	}
 	capabilityHealth := heartbeat.CapabilityHealth["fake"]
 	if heartbeat.OutboxPending != 1 || heartbeat.DeadLetterCount != 1 || len(heartbeat.Capabilities) != 1 ||
-		capabilityHealth.Healthy || capabilityHealth.Code != "dependency_unavailable" || capabilityHealth.Version != "adapter-2" ||
+		capabilityHealth.Healthy || capabilityHealth.Code != "dependency_unavailable" || capabilityHealth.Version != "2.0.0" ||
 		capabilityHealth.LastError != "Capability check failed." || capabilityHealth.RequiresAction != "Operator action is required." {
 		t.Fatalf("health metadata=%#v", heartbeat)
 	}
