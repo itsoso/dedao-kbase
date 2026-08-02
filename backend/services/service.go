@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/mitchellh/mapstructure"
@@ -52,7 +53,10 @@ func (r respC) String() string {
 
 // Service dedao service
 type Service struct {
-	client *resty.Client
+	client           *resty.Client
+	loginMu          sync.Mutex
+	csrfToken        string
+	bootstrapCookies []string
 }
 
 // CookieOptions dedao cookie options
@@ -154,7 +158,15 @@ func NewService(co *CookieOptions) *Service {
 	if co.CsrfToken != "" {
 		client.SetHeaderVerbatim("Xi-Csrf-Token", co.CsrfToken)
 	}
-	return &Service{client: client}
+	return &Service{client: client, csrfToken: co.CsrfToken}
+}
+
+// BootstrapCookies returns an isolated copy of cookies established while this
+// service bootstrapped a QR login flow.
+func (s *Service) BootstrapCookies() []string {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	return append([]string(nil), s.bootstrapCookies...)
 }
 
 func (r *Response) isSuccess() bool {

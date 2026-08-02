@@ -204,6 +204,11 @@ func serveKBaseServer(
 		}
 	}()
 	bookStore := app.NewBookKnowledgeStore(config.Root)
+	if count, err := recoverInterruptedBookKnowledgeJobs(bookStore); err != nil {
+		log.Printf("failed to recover interrupted jobs: %v", err)
+	} else if count > 0 {
+		log.Printf("marked %d interrupted jobs as failed", count)
+	}
 	knowledgeCatalog, err := app.NewKnowledgeCatalogStore(config.Root, time.Now)
 	if err != nil {
 		return fmt.Errorf("initialize knowledge catalog: %w", err)
@@ -414,6 +419,13 @@ func newEvidenceAuditServerRuntime(
 		return evidenceAuditServerRuntime{UnavailableReason: "evidence audit coordinator startup failed: " + err.Error()}
 	}
 	return evidenceAuditServerRuntime{Coordinator: coordinator}
+}
+
+func recoverInterruptedBookKnowledgeJobs(store *app.BookKnowledgeStore) (int, error) {
+	if store == nil {
+		return 0, errors.New("book knowledge store is required")
+	}
+	return store.FailInterruptedBookKnowledgeJobs("interrupted by kbase-server restart")
 }
 
 func validateKBaseTokenSeparation(adminToken, sourceAgentToken, agentPublisherToken string) error {

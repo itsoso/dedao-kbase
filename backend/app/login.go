@@ -11,10 +11,23 @@ import (
 
 // LoginByCookie login by cookie
 func LoginByCookie(cookie string) (user *services.User, err error) {
+	return LoginByCookieWithBootstrap(cookie, nil)
+}
+
+// LoginByCookieWithBootstrap completes login with cookies captured by the same
+// QR login service that created and checked the code.
+func LoginByCookieWithBootstrap(cookie string, bootstrapCookies []string) (user *services.User, err error) {
 	var u config.Dedao
-	if len(services.SetCookie) > 0 {
-		cookie += "; " + strings.Join(services.SetCookie, "; ")
+	cookieParts := make([]string, 0, 1+len(bootstrapCookies))
+	if cookie = strings.TrimSpace(cookie); cookie != "" {
+		cookieParts = append(cookieParts, cookie)
 	}
+	for _, bootstrapCookie := range bootstrapCookies {
+		if bootstrapCookie = strings.TrimSpace(bootstrapCookie); bootstrapCookie != "" {
+			cookieParts = append(cookieParts, bootstrapCookie)
+		}
+	}
+	cookie = strings.Join(cookieParts, "; ")
 	err = services.ParseCookies(cookie, &u.CookieOptions)
 	if err != nil {
 		return
@@ -32,12 +45,13 @@ func LoginByCookie(cookie string) (user *services.User, err error) {
 
 // CheckLogin 需要开启定时器轮询是否扫码登录
 func CheckLogin(token, qrCode string) (user *services.User, err error) {
-	check, cookie, err := getService().CheckLogin(token, qrCode)
+	service := getService()
+	check, cookie, err := service.CheckLogin(token, qrCode)
 	if err != nil {
 		return
 	}
 	if check.Data.Status == 1 {
-		user, err = LoginByCookie(cookie)
+		user, err = LoginByCookieWithBootstrap(cookie, service.BootstrapCookies())
 		if err != nil {
 			return
 		}

@@ -107,6 +107,7 @@ KBASE_EMBEDDING_MODEL="replace-with-approved-embedding-model" \
 KBASE_EMBEDDING_VERSION="replace-with-pinned-model-version" \
 KBASE_EMBEDDING_API_KEY="replace-with-embedding-secret" \
 KBASE_BOOK_KNOWLEDGE_ROOT="/opt/dedao-kbase/book_knowledge" \
+DEDAO_DOWNLOAD_ROOT="/opt/dedao-kbase/downloads" \
 KBASE_SYSTEM_KB_EXPORT_PATH="/opt/dedao-kbase/artifacts/system_kb_export.json" \
 KBASE_REVERIFICATION_TICK_SECONDS="30" \
 KBASE_REVERIFICATION_COOLDOWN_SECONDS="300" \
@@ -275,6 +276,9 @@ sudo systemctl show "${KBASE_SERVICE_NAME:?}" \
 即时恢复，但不提供 artifact 身份认证、部署锁、持久事务、fsync 切换或断电
 恢复。禁止并发部署；进程被强制终止或主机在切换窗口断电时，必须从
 `KBASE_BACKUP_DIR` 手工恢复两个目标。
+`DEDAO_DOWNLOAD_ROOT` 是可选的服务端电子书下载目录。未配置时，服务优先使用 `DEDAO_KBASE_ROOT/downloads`；若只配置了 `DEDAO_BOOK_KNOWLEDGE_ROOT` 或 `KBASE_BOOK_KNOWLEDGE_ROOT`，则使用知识库根目录同级的 `downloads`。下载目录仅在服务端使用，任务 API 不返回绝对路径。
+
+Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的书架”和“全站搜索”间切换，加入书架后创建“仅下载”或“下载并入知识库”任务。扫码入口为 `/sources/dedao/login`，登录 Cookie 保留在服务端，浏览器只持有短期二维码字段和安全会话摘要。
 
 对外域名建议由 Nginx/Caddy/Cloudflare Tunnel 终止 TLS 后反代到本地端口：
 
