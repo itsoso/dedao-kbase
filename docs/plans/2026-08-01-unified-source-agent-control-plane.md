@@ -904,17 +904,29 @@ fixed `locked` acknowledgement over a private installer-owned pipe, and holds
 the exclusive kernel lock until an explicit completion protocol. While still
 holding the lock, the lock-holder itself creates and fsyncs the maintenance
 marker before ACK. The installer never creates or removes that marker. On
-successful transaction commit it sends a fixed commit byte; only then may the
-holder remove and fsync the marker and release the lock. EOF, installer crash,
-or any other message leaves the marker durable for recovery. No path or command
-is passed to the lock holder.
+successful transaction commit it sends a fixed commit byte. Apart from the
+strict pre-mutation abort below, only commit lets the holder remove and fsync
+the marker and release the lock. EOF, installer crash, or any other message
+leaves the marker durable for recovery. No path or command is passed to the
+lock holder.
+
+The private protocol has exactly three bounded messages:
+`abort-before-mutation`, `begin-mutation`, and `commit`. In its initial phase,
+the holder accepts `abort-before-mutation` only before any installer journal,
+bootout, backup, or target-file change; it removes and fsyncs its own marker,
+then releases the lock so an existing upgrade can continue. For an empty-state
+install, the installer sends `begin-mutation`; the holder durably records that
+phase and ACKs it, after which abort is rejected and only a recovered successful
+`commit` may remove the marker. A rerun must finish or roll back the installer
+journal before sending commit.
 
 The installer verifies the holder/pipe is still alive immediately before each
 irreversible file or launchd stage. If the holder dies after ACK, the durable
 marker continues to make Worker/helper fail closed; the installer stops, leaves
 its transaction journal, and a rerun recovers before a new holder may clear the
-marker. Tests SIGKILL the holder before ACK and after ACK but before the first
-file change.
+marker. Tests SIGKILL the holder before ACK, after ACK but before the first file
+change, after commit but before marker deletion, and after marker deletion and
+fsync but before lock release/confirmation.
 
 For a newly claimed or recovered command, the Runner's shared-lock critical
 section is exactly: acquire lifecycle, check maintenance, perform the bounded
@@ -933,9 +945,12 @@ hard gate: authenticated heartbeat may continue, but ordinary command claim,
 owned-command adoption, updater activation, and source lease may not begin.
 The installer then checks command checkpoints, partial stages, handoffs,
 pending marker, journal, backup, ready/terminal acknowledgement or rollback
-request, and helper transaction state. Any non-empty state removes only the
-installer's maintenance marker, restores its prior loaded-state observation,
-releases the lock, and refuses without booting out either job. With the
+request, and helper transaction state. Any non-empty state uses
+`abort-before-mutation`; only the holder removes its maintenance marker before
+the installer restores its prior loaded-state observation, releases the lock,
+and refuses without booting out either job. A dormant command checkpoint or
+pending marker with no active shared-lock holder must take this path; after the
+refusal, launchd/Worker resumes the original upgrade. With the
 exclusive lock still held, an empty check cannot race a new update and both
 jobs can be booted out before publication begins. A crash leaves an installer
 journal that a rerun must finish or roll back before clearing maintenance.
@@ -946,7 +961,13 @@ acquisition after installer intent but before bootout. Exactly one side may
 commit; the other waits or refuses without partial publication. Add same-Worker
 double-installer, install-vs-uninstall, and server-claim-committed-before-local-
 checkpoint interleavings; all must finish without deadlock under the frozen
-lock order.
+lock order. Include dormant checkpoint/pending refusal and continuation.
+
+The lifecycle lock file has a stable inode for the lifetime of the installed
+Worker/updater pair. Install, cleanup, and uninstall do not unlink or recreate
+it while any local actor may exist. Every open pins the directory, refuses
+symlinks, and validates regular file type, current UID ownership, and exact
+private mode before locking.
 
 Shared-token publication preserves the previous Keychain value or prior
 absence until the entire install commits. Any failure restores that exact

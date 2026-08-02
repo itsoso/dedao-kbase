@@ -305,6 +305,10 @@ the installer, and removes it only after an explicit committed transaction;
 holder or installer failure leaves a durable fail-closed marker for recovery.
 All paths acquire the per-worker lifecycle lock before the shared global
 installer/Keychain lock or any command, binary, or journal lock.
+A fixed pre-mutation abort is the only other cleanup path: when the exclusive
+holder discovers an existing update before any installer journal, bootout, or
+file change, the holder removes its own marker so that update can resume. Once
+mutation begins, abort cannot clear maintenance.
 Uninstall first stops both jobs, is idempotently resumable after partial file
 deletion, preserves source state/outbox by default, and never deletes the
 shared token merely because one Worker is removed.
