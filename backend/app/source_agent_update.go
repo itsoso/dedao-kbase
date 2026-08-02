@@ -433,6 +433,10 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 			if !sourceAgentUpdateOutcomeMatchesJournal(terminal, journal) {
 				return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
 			}
+			confirmed, publication := u.confirmOutcome(terminal)
+			if publication != sourceAgentUpdateOutcomeDurable {
+				return confirmed
+			}
 			var cleanupErr error
 			if sourceAgentUpdateTerminalNeedsRecovery(terminal, journal) {
 				cleanupErr = u.recoverDurableTerminal(ctx, journal)
@@ -449,7 +453,8 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		}
 	}
 	if outcomeFound {
-		return previous
+		confirmed, _ := u.confirmOutcome(previous)
+		return confirmed
 	}
 	if journalFound {
 		if recovered, done := u.recoverInterrupted(ctx, started, request, journal); done {
@@ -721,6 +726,18 @@ func (u *SourceAgentUpdateTransaction) persistOutcome(result SourceAgentUpdateRe
 			result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
 			return result, publication
 		}
+	}
+	return result, sourceAgentUpdateOutcomeDurable
+}
+
+func (u *SourceAgentUpdateTransaction) confirmOutcome(result SourceAgentUpdateResult) (SourceAgentUpdateResult, sourceAgentUpdateOutcomePublication) {
+	if err := u.receipts.SaveOutcome(result); err != nil {
+		publication := sourceAgentUpdateOutcomeNotPublished
+		if u.outcomeWasPublished(result, err) {
+			publication = sourceAgentUpdateOutcomePublished
+		}
+		result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
+		return result, publication
 	}
 	return result, sourceAgentUpdateOutcomeDurable
 }

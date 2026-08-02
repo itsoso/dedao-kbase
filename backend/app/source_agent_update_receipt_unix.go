@@ -15,7 +15,8 @@ import (
 )
 
 type unixSourceAgentUpdateDirectory struct {
-	fd int
+	fd     int
+	syncFD func(int) error
 }
 
 func openSourceAgentUpdateDirectory(root string) (sourceAgentUpdateDirectory, error) {
@@ -28,7 +29,7 @@ func openSourceAgentUpdateDirectory(root string) (sourceAgentUpdateDirectory, er
 		unix.Close(fd)
 		return nil, errSourceAgentUpdateStorageUnavailable
 	}
-	return &unixSourceAgentUpdateDirectory{fd: fd}, nil
+	return &unixSourceAgentUpdateDirectory{fd: fd, syncFD: unix.Fsync}, nil
 }
 
 func (d *unixSourceAgentUpdateDirectory) acquire(ctx context.Context) (func(), error) {
@@ -171,7 +172,7 @@ func (d *unixSourceAgentUpdateDirectory) remove(name string) error {
 }
 
 func (d *unixSourceAgentUpdateDirectory) sync() error {
-	if err := unix.Fsync(d.fd); err != nil && !errors.Is(err, unix.EINVAL) {
+	if err := d.syncFD(d.fd); err != nil && !errors.Is(err, unix.EINVAL) {
 		return errSourceAgentUpdateStorageUnavailable
 	}
 	return nil

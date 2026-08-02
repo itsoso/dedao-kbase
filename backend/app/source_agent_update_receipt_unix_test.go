@@ -245,6 +245,52 @@ func TestSourceAgentUpdateExecutableFIFOIsRejectedWithoutBlocking(t *testing.T) 
 	}
 }
 
+func TestSourceAgentUpdateRealPublishedOutcomeMustBeFsyncConfirmedBeforeCleanup(t *testing.T) {
+	fixture := newDurableSourceAgentUpdateFixture(t, "")
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	identity, err := fixture.transaction.fs.BackupExecutable(fixture.executable, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := fixture.transaction.newJournal(fixture.request, strings.Repeat("b", 64), "ready")
+	journal.Backup = identity
+	if err := fixture.store.saveJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	newBinary := []byte("#!/bin/sh\necho new\n")
+	if err := os.WriteFile(fixture.executable, newBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	terminal := fixture.transaction.finishResult(time.Now(), fixture.request, SourceAgentUpdateOutcomeSucceeded, SourceAgentCommandCodeUpgradeComplete, false)
+	terminal.RuntimeVersion = fixture.request.TargetVersion
+	directory := fixture.store.directory.(*unixSourceAgentUpdateDirectory)
+	directory.syncFD = func(int) error { return errors.New("injected receipt directory fsync failure") }
+	if err := fixture.store.SaveOutcome(terminal); !isSourceAgentUpdatePublishedError(err) {
+		t.Fatalf("SaveOutcome() error=%v", err)
+	}
+
+	unknown := fixture.transaction.Apply(context.Background(), fixture.request)
+	if unknown != withSourceAgentPersistenceFailure(terminal) {
+		t.Fatalf("unknown=%#v", unknown)
+	}
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if _, found, err := fixture.store.loadJournal(); err != nil || !found {
+		t.Fatalf("journal found=%v err=%v", found, err)
+	}
+
+	directory.syncFD = unix.Fsync
+	durable := fixture.transaction.Apply(context.Background(), fixture.request)
+	if durable != terminal {
+		t.Fatalf("durable=%#v", durable)
+	}
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup remains after durable confirmation: %v", err)
+	}
+	if _, found, err := fixture.store.loadJournal(); err != nil || found {
+		t.Fatalf("journal found=%v err=%v", found, err)
+	}
+}
+
 func sourceAgentUpdateTestReadyReceipt() SourceAgentReadyReceipt {
 	return SourceAgentReadyReceipt{
 		CommandID: "command-1", AttemptNonce: strings.Repeat("a", 64),

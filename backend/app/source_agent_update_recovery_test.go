@@ -368,11 +368,13 @@ func TestSourceAgentUpdateRejectsImpossibleDurableTerminalCombination(t *testing
 type publishedErrorSourceAgentUpdateReceipts struct {
 	*fakeSourceAgentUpdateReceipts
 	publishErrors bool
+	saveCalls     int
 }
 
 func (r *publishedErrorSourceAgentUpdateReceipts) SaveOutcome(result SourceAgentUpdateResult) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.saveCalls++
 	if r.loaded && r.load != result {
 		return errors.New("immutable outcome conflict")
 	}
@@ -397,16 +399,90 @@ func TestSourceAgentUpdatePublishedOutcomeErrorNeverRollsBack(t *testing.T) {
 		t.Fatal("ambiguous outcome publication discarded recovery journal")
 	}
 
-	receipts.publishErrors = false
 	retry, err := NewSourceAgentUpdateTransaction(fixture.transaction.config)
 	if err != nil {
 		t.Fatal(err)
 	}
+	stillUnknown := retry.Apply(context.Background(), fixture.request)
+	if stillUnknown.Outcome != SourceAgentUpdateOutcomeSucceeded ||
+		stillUnknown.PersistenceCode != SourceAgentUpdateCodeOutcomePersistenceFailed {
+		t.Fatalf("stillUnknown=%#v", stillUnknown)
+	}
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if !fixture.receipts.journalFound {
+		t.Fatal("replay cleaned recovery material before outcome fsync confirmation")
+	}
+
+	receipts.publishErrors = false
 	replayed := retry.Apply(context.Background(), fixture.request)
 	if replayed.Outcome != SourceAgentUpdateOutcomeSucceeded || fixture.process.calls != 1 {
 		t.Fatalf("replayed=%#v process=%d", replayed, fixture.process.calls)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) || fixture.receipts.journalFound {
+		t.Fatalf("durable replay did not clean backup/journal: backupErr=%v journal=%v", err, fixture.receipts.journalFound)
+	}
+}
+
+func TestSourceAgentUpdateEveryTerminalReplayConfirmsOutcomeBeforeMutation(t *testing.T) {
+	terminals := []struct {
+		name     string
+		stage    string
+		outcome  string
+		code     string
+		restored bool
+		target   bool
+	}{
+		{name: "succeeded", stage: "ready", outcome: SourceAgentUpdateOutcomeSucceeded, code: SourceAgentCommandCodeUpgradeComplete, target: true},
+		{name: "rolled_back", stage: "rollback_restored", outcome: SourceAgentUpdateOutcomeRolledBack, code: SourceAgentCommandCodeRollbackComplete, restored: true},
+		{name: "failed", stage: "backup_durable", outcome: SourceAgentUpdateOutcomeFailed, code: SourceAgentCommandCodeInstallFailed},
+		{name: "rollback_failed", stage: "rollback_restored", outcome: SourceAgentUpdateOutcomeFailed, code: SourceAgentCommandCodeRollbackFailed, restored: true},
+	}
+	for _, terminalCase := range terminals {
+		for _, requestKind := range []string{"same_command", "different_command"} {
+			t.Run(terminalCase.name+"/"+requestKind, func(t *testing.T) {
+				fixture := newSourceAgentUpdateFixture(t)
+				backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+				identity, err := fixture.fs.BackupExecutable(fixture.executable, backup)
+				if err != nil {
+					t.Fatal(err)
+				}
+				journal := fixture.transaction.newJournal(fixture.request, strings.Repeat("a", sha256.Size*2), terminalCase.stage)
+				journal.Backup = identity
+				terminal := fixture.transaction.finishResult(time.Now(), fixture.request, terminalCase.outcome, terminalCase.code, terminalCase.restored)
+				if terminalCase.target {
+					terminal.RuntimeVersion = fixture.request.TargetVersion
+				}
+				fixture.receipts.journal, fixture.receipts.journalFound = journal, true
+				fixture.receipts.load, fixture.receipts.loaded = terminal, true
+				receipts := &publishedErrorSourceAgentUpdateReceipts{
+					fakeSourceAgentUpdateReceipts: fixture.receipts,
+					publishErrors:                 true,
+				}
+				fixture.transaction.receipts = receipts
+				request := fixture.request
+				if requestKind == "different_command" {
+					request.CommandID = "command-2"
+					request.TargetVersion = "3.0.0"
+				}
+
+				result := fixture.transaction.Apply(context.Background(), request)
+				if result != withSourceAgentPersistenceFailure(terminal) || receipts.saveCalls != 1 {
+					t.Fatalf("result=%#v terminal=%#v saveCalls=%d", result, terminal, receipts.saveCalls)
+				}
+				assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+				if !fixture.receipts.journalFound || fixture.process.calls != 0 {
+					t.Fatalf("journal=%v process=%d", fixture.receipts.journalFound, fixture.process.calls)
+				}
+			})
+		}
+	}
+}
+
+func withSourceAgentPersistenceFailure(result SourceAgentUpdateResult) SourceAgentUpdateResult {
+	result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
+	return result
 }
 
 func TestSourceAgentUpdatePublishedSuccessWithCorruptJournalNeverRollsBack(t *testing.T) {
