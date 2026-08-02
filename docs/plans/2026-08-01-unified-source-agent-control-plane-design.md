@@ -309,6 +309,8 @@ A fixed pre-mutation abort is the only other cleanup path: when the exclusive
 holder discovers an existing update before any installer journal, bootout, or
 file change, the holder removes its own marker so that update can resume. Once
 mutation begins, abort cannot clear maintenance.
+The installer journal is durable before the holder records begin-mutation;
+missing journal after a durable begin phase is fail-closed recovery state.
 Uninstall first stops both jobs, is idempotently resumable after partial file
 deletion, preserves source state/outbox by default, and never deletes the
 shared token merely because one Worker is removed.

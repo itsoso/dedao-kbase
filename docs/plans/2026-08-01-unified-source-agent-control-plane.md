@@ -920,6 +920,14 @@ phase and ACKs it, after which abort is rejected and only a recovered successful
 `commit` may remove the marker. A rerun must finish or roll back the installer
 journal before sending commit.
 
+The installer fsyncs its bounded `prepared` journal before it sends
+`begin-mutation`; target files and loaded state are still untouched at that
+point. A durable begin phase without the matching journal is an impossible
+state that remains fail closed for explicit repair. If a holder dies before
+its first ACK and no installer journal exists, a new holder may acquire the
+exclusive lock, validate the stale initial marker generation, and execute the
+same safe pre-mutation abort. Tests cover both recovery cases.
+
 The installer verifies the holder/pipe is still alive immediately before each
 irreversible file or launchd stage. If the holder dies after ACK, the durable
 marker continues to make Worker/helper fail closed; the installer stops, leaves
