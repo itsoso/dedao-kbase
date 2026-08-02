@@ -18,6 +18,10 @@
       "path": "cmd/source-agent/main.go"
     },
     {
+      "name": "source-agent-updater",
+      "path": "cmd/source-agent-updater/main.go"
+    },
+    {
       "name": "system-map",
       "path": "cmd/system-map/main.go"
     },
@@ -1632,6 +1636,16 @@
       "line": 24
     },
     {
+      "name": "SourceAgentReadyExpectation",
+      "file": "backend/app/source_agent_update.go",
+      "line": 117
+    },
+    {
+      "name": "SourceAgentReadyReceipt",
+      "file": "backend/app/source_agent_update.go",
+      "line": 127
+    },
+    {
       "name": "SourceAgentRunner",
       "file": "backend/app/source_agent_runner.go",
       "line": 34
@@ -1640,6 +1654,31 @@
       "name": "SourceAgentRunnerConfig",
       "file": "backend/app/source_agent_runner.go",
       "line": 19
+    },
+    {
+      "name": "SourceAgentUpdateConfig",
+      "file": "backend/app/source_agent_update.go",
+      "line": 149
+    },
+    {
+      "name": "SourceAgentUpdateGuardCheck",
+      "file": "backend/app/source_agent_update.go",
+      "line": 77
+    },
+    {
+      "name": "SourceAgentUpdateRequest",
+      "file": "backend/app/source_agent_update.go",
+      "line": 44
+    },
+    {
+      "name": "SourceAgentUpdateResult",
+      "file": "backend/app/source_agent_update.go",
+      "line": 60
+    },
+    {
+      "name": "SourceAgentUpdateTransaction",
+      "file": "backend/app/source_agent_update.go",
+      "line": 169
     },
     {
       "name": "SourceAgentUpgradeResult",
