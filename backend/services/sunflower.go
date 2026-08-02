@@ -64,6 +64,59 @@ type SearchTot struct {
 	RecommendMap []Recommend `json:"recommend_map"`
 }
 
+type EbookSearchResult struct {
+	Page      int               `json:"page"`
+	Size      int               `json:"size"`
+	IsMore    int               `json:"is_more"`
+	Type      int               `json:"type"`
+	RequestID string            `json:"request_id"`
+	Total     int               `json:"total"`
+	List      []EbookSearchItem `json:"list"`
+}
+
+type EbookSearchItem struct {
+	ID      int               `json:"id"`
+	Type    int               `json:"type"`
+	TName   string            `json:"tname"`
+	Title   string            `json:"title"`
+	Author  string            `json:"author"`
+	Content string            `json:"content"`
+	Image   string            `json:"image"`
+	Detail  EbookSearchDetail `json:"detail"`
+	Extra   EbookSearchExtra  `json:"extra"`
+	UserRel int               `json:"user_rel"`
+	LogID   string            `json:"log_id"`
+	LogType string            `json:"log_type"`
+}
+
+type EbookSearchDetail struct {
+	ID               int      `json:"id"`
+	Enid             string   `json:"enid"`
+	Author           string   `json:"author"`
+	BookAuthor       string   `json:"book_author"`
+	BookName         string   `json:"book_name"`
+	BookIntro        string   `json:"book_intro"`
+	Cover            string   `json:"cover"`
+	Price            string   `json:"price"`
+	CurrentPrice     string   `json:"current_price"`
+	OriginalPrice    string   `json:"original_price"`
+	CanTrialRead     bool     `json:"can_trial_read"`
+	IsBuy            bool     `json:"is_buy"`
+	ReadProgress     int      `json:"read_progress"`
+	ReadingTitle     string   `json:"reading_title"`
+	ReadingWordToken string   `json:"reading_word_token"`
+	AuthorList       []string `json:"author_list"`
+	BWordcount       int      `json:"b_wordcount"`
+}
+
+type EbookSearchExtra struct {
+	Image          string `json:"image"`
+	Press          string `json:"press"`
+	ChapterID      string `json:"chapterid"`
+	ChapterName    string `json:"chaptername"`
+	RecommendScore string `json:"recommend_score"`
+}
+
 type Navigation struct {
 	Enid         string  `json:"enid"`
 	Id           int     `json:"id"`
@@ -347,6 +400,19 @@ func (s *Service) GetHomeInitialState() (state HomeInitState, err error) {
 // SearchHot 搜索框热门搜索
 func (s *Service) SearchHot() (list *SearchTot, err error) {
 	body, err := s.reqSearchHot()
+	if err != nil {
+		return
+	}
+	defer body.Close()
+	if err = handleJSONParse(body, &list); err != nil {
+		return
+	}
+	return
+}
+
+// SearchEbooks searches dedao.cn ebook results across the full site.
+func (s *Service) SearchEbooks(query string, page, size int) (list *EbookSearchResult, err error) {
+	body, err := s.reqSearchEbooks(query, page, size, "")
 	if err != nil {
 		return
 	}

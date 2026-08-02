@@ -43,6 +43,7 @@ type KBaseHTTPConfig struct {
 	ChatClient              BookKnowledgeLLMClient
 	DedaoLibrary            DedaoLibraryService
 	DedaoAuth               DedaoAuthProvider
+	DedaoEbooks             DedaoEbookAcquisitionService
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
 	AgentTools              []string
@@ -93,6 +94,7 @@ type kbaseHTTPHandler struct {
 	chatClient              BookKnowledgeLLMClient
 	dedaoLibrary            DedaoLibraryService
 	dedaoAuth               DedaoAuthProvider
+	dedaoEbooks             DedaoEbookAcquisitionService
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
 	agentTools              []string
@@ -217,6 +219,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		chatClient:              cfg.ChatClient,
 		dedaoLibrary:            dedaoLibrary,
 		dedaoAuth:               defaultDedaoAuthProvider(cfg.DedaoAuth),
+		dedaoEbooks:             defaultDedaoEbookAcquisitionService(cfg.DedaoEbooks),
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
 		agentTools:              agentTools,
@@ -496,6 +499,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleDedaoAuthCheck(w, r)
 		return
 	}
+	if r.URL.Path == "/api/dedao/search/ebooks" {
+		h.handleDedaoEbookSearch(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/dedao/ebooks/") && strings.HasSuffix(r.URL.Path, "/bookshelf") {
+		h.handleDedaoEbookBookshelf(w, r)
+		return
+	}
 	if r.URL.Path == "/api/dedao/library" {
 		h.handleDedaoLibrary(w, r)
 		return
@@ -626,6 +637,46 @@ func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.R
 func setHTTPNoStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbookSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	page := parseBoundedInt(r.URL.Query().Get("page"), 1, 1, 10000)
+	pageSize := parseBoundedInt(r.URL.Query().Get("page_size"), 30, 1, 100)
+	result, err := h.dedaoEbooks.SearchEbooks(query, page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbookBookshelf(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	const prefix = "/api/dedao/ebooks/"
+	middle := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), "/bookshelf")
+	if middle == "" || strings.Contains(middle, "/") {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	enid, err := url.PathUnescape(middle)
+	if err != nil || strings.TrimSpace(enid) == "" || strings.Contains(enid, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "invalid ebook enid")
+		return
+	}
+	result, err := h.dedaoEbooks.AddEbookToBookshelf(enid)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeFeed(w http.ResponseWriter, r *http.Request) {
