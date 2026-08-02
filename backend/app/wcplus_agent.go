@@ -153,7 +153,7 @@ func wcplusVendorBlockedCapabilityHealth(version string) SourceCapabilityHealth 
 
 func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (result SourceAdapterResult, err error) {
 	defer func() {
-		a.latchExecutionError(err)
+		a.latchExecutionError(ctx, err)
 	}()
 	if run.Subscription == nil {
 		return SourceAdapterResult{}, fmt.Errorf("subscription snapshot is required")
@@ -172,8 +172,8 @@ func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 	}
 }
 
-func (a *WCPlusSourceAdapter) latchExecutionError(err error) {
-	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+func (a *WCPlusSourceAdapter) latchExecutionError(ctx context.Context, err error) {
+	if err == nil || ctx.Err() != nil {
 		return
 	}
 	var localAPIError *WCPlusLocalAPIError
@@ -241,6 +241,10 @@ func (a *WCPlusSourceAdapter) executeArticleRun(ctx context.Context, run SourceS
 	failedIndexes := make([]int, 0)
 	for _, article := range list.Articles {
 		content, contentErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, article)
+		var localAPIError *WCPlusLocalAPIError
+		if errors.As(contentErr, &localAPIError) {
+			return SourceAdapterResult{}, contentErr
+		}
 		results = append(results, articleResult{article: article, content: content, err: contentErr})
 		if contentErr != nil {
 			failedIndexes = append(failedIndexes, len(results)-1)
@@ -256,6 +260,10 @@ func (a *WCPlusSourceAdapter) executeArticleRun(ctx context.Context, run SourceS
 		}
 		for _, index := range failedIndexes {
 			content, contentErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, results[index].article)
+			var localAPIError *WCPlusLocalAPIError
+			if errors.As(contentErr, &localAPIError) {
+				return SourceAdapterResult{}, contentErr
+			}
 			results[index].content = content
 			results[index].err = contentErr
 		}
@@ -591,7 +599,7 @@ func (a *WCPlusAgent) waitForTask(
 				return nil
 			}
 			if verifyErr != nil && attempt == a.taskPollAttempts-1 {
-				return fmt.Errorf("%w: %v", ErrWCPlusTaskOutcomeUnverified, verifyErr)
+				return fmt.Errorf("%w: %w", ErrWCPlusTaskOutcomeUnverified, verifyErr)
 			}
 		}
 		if attempt < a.taskPollAttempts-1 {

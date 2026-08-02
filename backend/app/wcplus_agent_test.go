@@ -374,13 +374,9 @@ func TestWCPlusAgentMarksRunPartialWhenOneArticleFails(t *testing.T) {
 		case "/api/report/gzh_articles":
 			fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考"},"articles":[
 				{"ID":"article-good","Title":"有效文章","URL":"https://mp.weixin.qq.com/s/article-good"},
-				{"ID":"article-bad","Title":"失败文章","URL":"https://mp.weixin.qq.com/s/article-bad"}
+				{"Title":"缺少定位信息的条目"}
 			],"total":2}`)
 		case "/api/article/content":
-			if r.URL.Query().Get("id") == "article-bad" {
-				writeHTTPError(w, http.StatusBadGateway, "local content unavailable")
-				return
-			}
 			fmt.Fprint(w, `{"ID":"article-good","Title":"有效文章","Nickname":"医学参考","URL":"https://mp.weixin.qq.com/s/article-good","Content":"这是一篇正文完整的文章，其他文章失败时仍然应被可靠导入，并让整次运行呈现 partial。"}`)
 		default:
 			t.Fatalf("unexpected local path: %s", r.URL.Path)
@@ -770,30 +766,61 @@ func TestWCPlusEndpointFailuresLatchBoundedHealthAndStopNextLease(t *testing.T) 
 		{name: "HTTP 500", mode: "500", wantCode: "dependency_unavailable", privateRaw: "private-server-body"},
 		{name: "connection", mode: "connection", wantCode: "dependency_unavailable", privateRaw: "private dial failure"},
 		{name: "malformed API", mode: "malformed", wantCode: "dependency_unavailable", privateRaw: "private-malformed-api"},
+		{name: "client timeout", mode: "timeout", wantCode: "dependency_unavailable", privateRaw: "Client.Timeout exceeded"},
+		{name: "content HTTP 403", mode: "content-403", wantCode: "vendor_blocked", privateRaw: "private content forbidden"},
+		{name: "content HTTP 500", mode: "content-500", wantCode: "dependency_unavailable", privateRaw: "private content unavailable"},
+		{name: "verify HTTP 403", mode: "verify-403", wantCode: "vendor_blocked", privateRaw: "private verify forbidden"},
+		{name: "verify HTTP 500", mode: "verify-500", wantCode: "dependency_unavailable", privateRaw: "private verify unavailable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			var localMu sync.Mutex
+			listCalls := 0
 			local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/" {
+				switch r.URL.Path {
+				case "/":
 					fmt.Fprint(w, `<title>wcplusPro 2.3.4</title>`)
-					return
-				}
-				if r.URL.Path != "/api/report/gzh_articles" {
-					t.Fatalf("unexpected local path: %s", r.URL.Path)
-				}
-				w.Header().Set("Content-Type", "application/json")
-				switch test.mode {
-				case "403":
-					http.Error(w, test.privateRaw, http.StatusForbidden)
-				case "429":
-					http.Error(w, test.privateRaw, http.StatusTooManyRequests)
-				case "vendor-envelope":
-					fmt.Fprintf(w, `{"success":false,"message":%q}`, test.privateRaw)
-				case "500":
-					http.Error(w, test.privateRaw, http.StatusInternalServerError)
-				case "malformed":
-					fmt.Fprint(w, test.privateRaw)
+				case "/api/report/gzh_articles":
+					localMu.Lock()
+					listCalls++
+					call := listCalls
+					localMu.Unlock()
+					w.Header().Set("Content-Type", "application/json")
+					if strings.HasPrefix(test.mode, "content-") || strings.HasPrefix(test.mode, "verify-") && call == 1 {
+						fmt.Fprint(w, `{"gzh":{"Biz":"biz-med","Nickname":"医学参考"},"articles":[{"ID":"article-1","Title":"已有链接","URL":"https://mp.weixin.qq.com/s/article-1"}],"total":1}`)
+						return
+					}
+					switch test.mode {
+					case "403", "verify-403":
+						http.Error(w, test.privateRaw, http.StatusForbidden)
+					case "429":
+						http.Error(w, test.privateRaw, http.StatusTooManyRequests)
+					case "vendor-envelope":
+						fmt.Fprintf(w, `{"success":false,"message":%q}`, test.privateRaw)
+					case "500", "verify-500":
+						http.Error(w, test.privateRaw, http.StatusInternalServerError)
+					case "malformed":
+						fmt.Fprint(w, test.privateRaw)
+					case "timeout":
+						<-r.Context().Done()
+					default:
+						t.Fatalf("unexpected response mode: %s", test.mode)
+					}
+				case "/api/article/content":
+					if test.mode == "content-403" {
+						http.Error(w, test.privateRaw, http.StatusForbidden)
+					} else if test.mode == "content-500" {
+						http.Error(w, test.privateRaw, http.StatusInternalServerError)
+					} else {
+						t.Fatalf("unexpected content mode: %s", test.mode)
+					}
+				case "/api/task/new":
+					fmt.Fprint(w, `{"task_id":"task-verify","status":"ready"}`)
+				case "/api/task/control":
+					fmt.Fprint(w, `{"status":"ok"}`)
+				case "/api/task/all":
+					fmt.Fprint(w, `{"tasks":[]}`)
 				default:
-					t.Fatalf("unexpected response mode: %s", test.mode)
+					t.Fatalf("unexpected local path: %s", r.URL.Path)
 				}
 			}))
 			defer local.Close()
@@ -806,6 +833,8 @@ func TestWCPlusEndpointFailuresLatchBoundedHealthAndStopNextLease(t *testing.T) 
 					}
 					return baseTransport.RoundTrip(request)
 				})}
+			} else if test.mode == "timeout" {
+				localClient.Timeout = 20 * time.Millisecond
 			}
 
 			var remoteMu sync.Mutex
@@ -832,10 +861,18 @@ func TestWCPlusEndpointFailuresLatchBoundedHealthAndStopNextLease(t *testing.T) 
 					call := leaseCalls
 					remoteMu.Unlock()
 					if call == 1 {
-						fmt.Fprint(w, `{"run":{"id":"run-endpoint","status":"running","requested_operation":"existing_articles","subscription":{"id":"sub-1","source_type":"wcplus_wechat_article","source_account_key":"biz-med","source_account":"医学参考","operation":"existing_articles","enabled":true,"options":{"limit":10}}}}`)
+						operation := "existing_articles"
+						if strings.HasPrefix(test.mode, "verify-") {
+							operation = "sync_links"
+						}
+						fmt.Fprintf(w, `{"run":{"id":"run-endpoint","status":"running","requested_operation":%q,"subscription":{"id":"sub-1","source_type":"wcplus_wechat_article","source_account_key":"biz-med","source_account":"医学参考","operation":%q,"enabled":true,"options":{"limit":10}}}}`, operation, operation)
 						return
 					}
 					fmt.Fprint(w, `{"run":null}`)
+				case "/api/source-agent/runs/run-endpoint/items":
+					fmt.Fprint(w, `{"item":{"source_item_key":"article-1","outcome":"failed"}}`)
+				case "/api/source-agent/runs/run-endpoint/complete":
+					fmt.Fprint(w, `{"run":{"id":"run-endpoint","status":"partial"}}`)
 				case "/api/source-agent/runs/run-endpoint/fail":
 					raw, err := io.ReadAll(r.Body)
 					if err != nil {
@@ -852,7 +889,7 @@ func TestWCPlusEndpointFailuresLatchBoundedHealthAndStopNextLease(t *testing.T) 
 			defer remote.Close()
 
 			adapter, err := NewWCPlusSourceAdapter(WCPlusSourceAdapterConfig{
-				WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: local.URL, HTTPClient: localClient}),
+				WCPlus: NewWCPlusSourceService(WCPlusSourceConfig{BaseURL: local.URL, HTTPClient: localClient}), TaskPollAttempts: 1,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -873,14 +910,18 @@ func TestWCPlusEndpointFailuresLatchBoundedHealthAndStopNextLease(t *testing.T) 
 				t.Fatal(err)
 			}
 
-			result, err := runner.RunOnce(context.Background())
+			parentCtx := context.Background()
+			result, err := runner.RunOnce(parentCtx)
 			if err == nil || result.OK {
 				t.Fatalf("first endpoint cycle result=%#v error=%v", result, err)
+			}
+			if parentCtx.Err() != nil {
+				t.Fatalf("parent context changed: %v", parentCtx.Err())
 			}
 			if strings.Contains(err.Error(), test.privateRaw) {
 				t.Fatalf("public error leaked private detail: %v", err)
 			}
-			result, err = runner.RunOnce(context.Background())
+			result, err = runner.RunOnce(parentCtx)
 			if err != nil || result.OK {
 				t.Fatalf("second endpoint cycle result=%#v error=%v", result, err)
 			}
