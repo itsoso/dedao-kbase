@@ -104,7 +104,9 @@ assert_new_pair() {
 }
 
 assert_clean() {
-  if compgen -G "$pair_dir/.source-agent.pair-*" >/dev/null; then
+  if compgen -G "$pair_dir/.source-agent.pair-*" >/dev/null ||
+    compgen -G "$pair_dir/.source-agent-updater.pair-lock-ready.*" >/dev/null ||
+    compgen -G "$pair_dir/.source-agent-updater.pair-lock-release.*" >/dev/null; then
     echo "managed pair transaction left debris" >&2
     find "$pair_dir" -maxdepth 1 -name '.source-agent.pair-*' -print >&2
     exit 1
@@ -115,6 +117,150 @@ publish_and_commit() {
   managed_worker_pair_publish "$worker_new" "$updater_new" "$worker" "$updater"
   managed_worker_pair_commit
 }
+
+reset_pair
+_managed_worker_pair_set_paths "$worker" "$updater"
+printf '  999999  \n' >"$MANAGED_WORKER_PAIR_LOCK"
+if ! _managed_worker_pair_reclaim_stale_lock || [[ ! -f "$MANAGED_WORKER_PAIR_LOCK" ]]; then
+  echo "managed pair could not acquire an unlocked advisory lock with malformed old contents" >&2
+  exit 1
+fi
+"$REAL_RM" -f "$MANAGED_WORKER_PAIR_LOCK"
+printf '999999\n' >"$MANAGED_WORKER_PAIR_LOCK"
+if ! _managed_worker_pair_reclaim_stale_lock || [[ ! -f "$MANAGED_WORKER_PAIR_LOCK" ]]; then
+  echo "managed pair could not acquire an unlocked advisory lock" >&2
+  exit 1
+fi
+"$REAL_RM" -f "$MANAGED_WORKER_PAIR_LOCK"
+
+PAIR_LOCK="$MANAGED_WORKER_PAIR_LOCK" PAIR_LOCK_READY="$tmp_dir/pair-lock-ready" /bin/bash -c '
+  exec 7>>"$PAIR_LOCK"
+  /usr/bin/lockf -s -t 0 7
+  : >"$PAIR_LOCK_READY"
+  sleep 5
+' &
+live_pair_lock_pid=$!
+for ((attempt = 0; attempt < 100; attempt++)); do
+  [[ -e "$tmp_dir/pair-lock-ready" ]] && break
+  sleep 0.01
+done
+if _managed_worker_pair_reclaim_stale_lock || [[ ! -f "$MANAGED_WORKER_PAIR_LOCK" ]]; then
+  kill "$live_pair_lock_pid" 2>/dev/null || true
+  echo "managed pair reclaimed a live owner" >&2
+  exit 1
+fi
+kill "$live_pair_lock_pid"
+wait "$live_pair_lock_pid" 2>/dev/null || true
+"$REAL_RM" -f "$MANAGED_WORKER_PAIR_LOCK"
+
+printf 'stale\n' >"$pair_dir/.source-agent-updater.pair-lock-ready.999999"
+printf 'stale\n' >"$pair_dir/.source-agent-updater.pair-lock-release.999999"
+if ! _managed_worker_pair_try_acquire_lock ||
+  [[ -e "$pair_dir/.source-agent-updater.pair-lock-ready.999999" || -e "$pair_dir/.source-agent-updater.pair-lock-release.999999" ]]; then
+  echo "managed pair did not clean power-loss lock-helper markers" >&2
+  exit 1
+fi
+_managed_worker_pair_release_lock
+
+ln -s "$tmp_dir/lock-target" "$pair_dir/.source-agent-updater.pair-lock-ready.999998"
+if _managed_worker_pair_try_acquire_lock || [[ ! -L "$pair_dir/.source-agent-updater.pair-lock-ready.999998" ]]; then
+  echo "managed pair did not fail closed on a symlink lock-helper marker" >&2
+  exit 1
+fi
+"$REAL_RM" -f "$pair_dir/.source-agent-updater.pair-lock-ready.999998"
+
+_managed_worker_pair_try_acquire_lock
+kill -TERM "$MANAGED_WORKER_PAIR_LOCK_HELPER_PID"
+sleep 0.1
+if /usr/bin/lockf -s -t 0 -k "$MANAGED_WORKER_PAIR_LOCK" /usr/bin/true; then
+  echo "managed pair helper released the lock on a cooperative group signal" >&2
+  exit 1
+fi
+_managed_worker_pair_release_lock
+
+pair_acquire_script="$tmp_dir/pair-acquire.sh"
+cat >"$pair_acquire_script" <<'PAIR_ACQUIRE'
+#!/bin/bash
+set -euo pipefail
+source "${PAIR_LIBRARY:?}"
+_managed_worker_pair_set_paths "${WORKER_DEST:?}" "${UPDATER_DEST:?}"
+if _managed_worker_pair_try_acquire_lock; then
+  printf '%s\n' "$$" >>"${WINNERS:?}"
+  sleep 1
+  _managed_worker_pair_release_lock
+fi
+PAIR_ACQUIRE
+chmod 0755 "$pair_acquire_script"
+pair_winners="$tmp_dir/pair-winners"
+printf '999999\n' >"$MANAGED_WORKER_PAIR_LOCK"
+PAIR_LIBRARY="$library" WORKER_DEST="$worker" UPDATER_DEST="$updater" WINNERS="$pair_winners" "$pair_acquire_script" &
+first_pair_pid=$!
+PAIR_LIBRARY="$library" WORKER_DEST="$worker" UPDATER_DEST="$updater" WINNERS="$pair_winners" "$pair_acquire_script" &
+second_pair_pid=$!
+wait "$first_pair_pid"
+wait "$second_pair_pid"
+pair_winner_count="$(wc -l <"$pair_winners")"
+pair_winner_count="${pair_winner_count//[[:space:]]/}"
+if [[ "$pair_winner_count" != 1 ]]; then
+  echo "managed pair atomic lock admitted $pair_winner_count simultaneous owners" >&2
+  exit 1
+fi
+
+pair_inherit_script="$tmp_dir/pair-inherit.sh"
+cat >"$pair_inherit_script" <<'PAIR_INHERIT'
+#!/bin/bash
+set -euo pipefail
+source "${PAIR_LIBRARY:?}"
+_managed_worker_pair_set_paths "${WORKER_DEST:?}" "${UPDATER_DEST:?}"
+_managed_worker_pair_try_acquire_lock
+sleep 5 &
+printf '%s\n' "$!" >"${CHILD_PID_FILE:?}"
+: >"${READY_FILE:?}"
+wait
+PAIR_INHERIT
+chmod 0755 "$pair_inherit_script"
+pair_supervisor_script="$tmp_dir/pair-supervisor.sh"
+cat >"$pair_supervisor_script" <<'PAIR_SUPERVISOR'
+#!/bin/bash
+set -euo pipefail
+"${OWNER_SCRIPT:?}" &
+owner_pid=$!
+printf '%s\n' "$owner_pid" >"${OWNER_PID_FILE:?}"
+while [[ ! -e "${READY_FILE:?}" ]]; do sleep 0.01; done
+: >"${SUPERVISOR_STOPPING:?}"
+kill -STOP $$
+wait "$owner_pid"
+PAIR_SUPERVISOR
+chmod 0755 "$pair_supervisor_script"
+PAIR_LIBRARY="$library" WORKER_DEST="$worker" UPDATER_DEST="$updater" \
+  CHILD_PID_FILE="$tmp_dir/pair-inherited-child" READY_FILE="$tmp_dir/pair-inherit-ready" \
+  OWNER_SCRIPT="$pair_inherit_script" OWNER_PID_FILE="$tmp_dir/pair-owner-pid" \
+  SUPERVISOR_STOPPING="$tmp_dir/pair-supervisor-stopping" "$pair_supervisor_script" &
+pair_lock_supervisor=$!
+for ((attempt = 0; attempt < 100; attempt++)); do
+  [[ -e "$tmp_dir/pair-supervisor-stopping" ]] && break
+  sleep 0.01
+done
+sleep 0.1
+pair_lock_parent="$(<"$tmp_dir/pair-owner-pid")"
+pair_inherited_child="$(<"$tmp_dir/pair-inherited-child")"
+kill -KILL "$pair_lock_parent"
+pair_reacquired=false
+for ((attempt = 0; attempt < 100; attempt++)); do
+  if _managed_worker_pair_try_acquire_lock; then pair_reacquired=true; break; fi
+  sleep 0.01
+done
+if [[ "$pair_reacquired" != true ]]; then
+  kill "$pair_inherited_child" 2>/dev/null || true
+  kill -CONT "$pair_lock_supervisor" 2>/dev/null || true
+  wait "$pair_lock_supervisor" 2>/dev/null || true
+  echo "managed pair child inherited the lock after owner SIGKILL" >&2
+  exit 1
+fi
+_managed_worker_pair_release_lock
+kill -CONT "$pair_lock_supervisor" 2>/dev/null || true
+wait "$pair_lock_supervisor" 2>/dev/null || true
+kill "$pair_inherited_child" 2>/dev/null || true
 
 reset_pair
 publish_and_commit
@@ -313,6 +459,20 @@ if [[ $kill_status -eq 0 ]]; then
 fi
 managed_worker_pair_recover "$worker" "$updater"
 assert_old_pair
+assert_clean
+
+reset_pair
+set +e
+PAIR_LIBRARY="$library" WORKER_NEW="$worker_new" UPDATER_NEW="$updater_new" WORKER_DEST="$worker" UPDATER_DEST="$updater" \
+  "$kill_script" >/dev/null 2>&1
+kill_status=$?
+set -e
+if [[ $kill_status -eq 0 ]]; then
+  echo "managed pair forward-commit SIGKILL fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+managed_worker_pair_finish_commit "$worker" "$updater"
+assert_new_pair
 assert_clean
 
 reset_pair

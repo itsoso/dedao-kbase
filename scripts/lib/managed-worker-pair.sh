@@ -14,6 +14,9 @@ MANAGED_WORKER_PAIR_JOURNAL_TMP=""
 MANAGED_WORKER_PAIR_WORKER_BACKUP=""
 MANAGED_WORKER_PAIR_UPDATER_BACKUP=""
 MANAGED_WORKER_PAIR_LOCK=""
+MANAGED_WORKER_PAIR_LOCK_HELPER_PID=""
+MANAGED_WORKER_PAIR_LOCK_READY=""
+MANAGED_WORKER_PAIR_LOCK_RELEASE=""
 MANAGED_WORKER_PAIR_PHASE=""
 MANAGED_WORKER_PAIR_WORKER_OLD=0
 MANAGED_WORKER_PAIR_UPDATER_OLD=0
@@ -80,6 +83,8 @@ _managed_worker_pair_set_paths() {
   MANAGED_WORKER_PAIR_WORKER_BACKUP="$worker_directory/.${worker_basename}.pair-worker-old"
   MANAGED_WORKER_PAIR_UPDATER_BACKUP="$worker_directory/.${worker_basename}.pair-updater-old"
   MANAGED_WORKER_PAIR_LOCK="$worker_directory/.source-agent-updater.pair-lock"
+  MANAGED_WORKER_PAIR_LOCK_READY="$worker_directory/.source-agent-updater.pair-lock-ready.$$"
+  MANAGED_WORKER_PAIR_LOCK_RELEASE="$worker_directory/.source-agent-updater.pair-lock-release.$$"
 }
 
 _managed_worker_pair_validate_destination() {
@@ -107,48 +112,108 @@ _managed_worker_pair_validate_sources() {
 }
 
 _managed_worker_pair_acquire_lock() {
-  local attempt=0 owner="" owner_size=""
+  local attempt=0
   while ((attempt < 3)); do
-    if mkdir "$MANAGED_WORKER_PAIR_LOCK" 2>/dev/null; then
-      if ! printf '%s\n' "$$" >"$MANAGED_WORKER_PAIR_LOCK/pid"; then
-        rmdir "$MANAGED_WORKER_PAIR_LOCK" 2>/dev/null || true
+    if _managed_worker_pair_try_acquire_lock; then return 0; fi
+    if [[ -L "$MANAGED_WORKER_PAIR_LOCK" || (-e "$MANAGED_WORKER_PAIR_LOCK" && ! -f "$MANAGED_WORKER_PAIR_LOCK") ]]; then return 1; fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  printf '%s\n' "managed worker pair transaction is busy" >&2
+  return 1
+}
+
+_managed_worker_pair_cleanup_lock_markers() {
+  local marker suffix
+  for marker in \
+    "$MANAGED_WORKER_PAIR_DIRECTORY"/.source-agent-updater.pair-lock-ready.* \
+    "$MANAGED_WORKER_PAIR_DIRECTORY"/.source-agent-updater.pair-lock-release.*; do
+    if [[ ! -e "$marker" && ! -L "$marker" ]]; then continue; fi
+    suffix="${marker##*.}"
+    if [[ ! "$suffix" =~ ^[0123456789]+$ || -L "$marker" || ! -f "$marker" ]]; then return 1; fi
+    rm -f "$marker" 2>/dev/null || return 1
+  done
+}
+
+_managed_worker_pair_write_lock_release() {
+  if [[ -L "$MANAGED_WORKER_PAIR_LOCK_RELEASE" ||
+    (-e "$MANAGED_WORKER_PAIR_LOCK_RELEASE" && ! -f "$MANAGED_WORKER_PAIR_LOCK_RELEASE") ]]; then return 1; fi
+  (umask 077; set -o noclobber; printf 'release\n' >"$MANAGED_WORKER_PAIR_LOCK_RELEASE") 2>/dev/null
+}
+
+_managed_worker_pair_try_acquire_lock() {
+  local attempt=0 helper_pid
+  if [[ ! -x /usr/bin/perl ]]; then
+    printf '%s\n' "managed worker lock helper requires /usr/bin/perl" >&2
+    return 1
+  fi
+  if [[ "$MANAGED_WORKER_PAIR_LOCK_HELD" == true || -n "$MANAGED_WORKER_PAIR_LOCK_HELPER_PID" ]]; then return 1; fi
+  if [[ -L "$MANAGED_WORKER_PAIR_LOCK" || (-e "$MANAGED_WORKER_PAIR_LOCK" && ! -f "$MANAGED_WORKER_PAIR_LOCK") ]]; then return 1; fi
+  rm -f "$MANAGED_WORKER_PAIR_LOCK_READY" "$MANAGED_WORKER_PAIR_LOCK_RELEASE" 2>/dev/null || return 1
+  /usr/bin/env -i /usr/bin/perl -MFcntl=:DEFAULT,:flock -e '
+    use strict;
+    use warnings;
+    my ($lock, $ready, $release, $owner) = @ARGV;
+    exit 64 unless defined($owner) && $owner =~ /\A[0-9]+\z/;
+    $SIG{HUP} = "IGNORE";
+    $SIG{INT} = "IGNORE";
+    $SIG{TERM} = "IGNORE";
+    umask 0077;
+    sysopen(my $lock_fh, $lock, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600) or exit 74;
+    flock($lock_fh, LOCK_EX | LOCK_NB) or exit 75;
+    END { unlink($ready); unlink($release); }
+    sysopen(my $ready_fh, $ready, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or exit 73;
+    close($ready_fh) or exit 74;
+    while (getppid() == $owner && kill(0, $owner) && !lstat($release)) {
+      select(undef, undef, undef, 0.05);
+    }
+  ' "$MANAGED_WORKER_PAIR_LOCK" "$MANAGED_WORKER_PAIR_LOCK_READY" "$MANAGED_WORKER_PAIR_LOCK_RELEASE" "$$" &
+  helper_pid=$!
+  MANAGED_WORKER_PAIR_LOCK_HELPER_PID="$helper_pid"
+  while ((attempt < 100)); do
+    if [[ -f "$MANAGED_WORKER_PAIR_LOCK_READY" && ! -L "$MANAGED_WORKER_PAIR_LOCK_READY" ]]; then
+      if ! rm -f "$MANAGED_WORKER_PAIR_LOCK_READY" 2>/dev/null || ! _managed_worker_pair_cleanup_lock_markers; then
+        _managed_worker_pair_write_lock_release || true
+        wait "$helper_pid" 2>/dev/null || true
+        MANAGED_WORKER_PAIR_LOCK_HELPER_PID=""
         return 1
       fi
       MANAGED_WORKER_PAIR_LOCK_HELD=true
       return 0
     fi
-    owner=""
-    if [[ -f "$MANAGED_WORKER_PAIR_LOCK/pid" && ! -L "$MANAGED_WORKER_PAIR_LOCK/pid" ]]; then
-      owner_size="$(wc -c <"$MANAGED_WORKER_PAIR_LOCK/pid" 2>/dev/null)" || owner_size=""
-      owner_size="${owner_size//[[:space:]]/}"
-      if [[ "$owner_size" =~ ^[0123456789]+$ ]] && ((owner_size <= 32)); then
-        IFS= read -r owner <"$MANAGED_WORKER_PAIR_LOCK/pid" || owner=""
-      fi
-    fi
-    if [[ "$owner" =~ ^[0123456789]+$ ]] && kill -0 "$owner" 2>/dev/null; then
-      printf '%s\n' "managed worker pair transaction is busy" >&2
+    if ! kill -0 "$helper_pid" 2>/dev/null; then
+      wait "$helper_pid" 2>/dev/null || true
+      rm -f "$MANAGED_WORKER_PAIR_LOCK_READY" "$MANAGED_WORKER_PAIR_LOCK_RELEASE" 2>/dev/null || true
+      MANAGED_WORKER_PAIR_LOCK_HELPER_PID=""
       return 1
     fi
-    if ! rm -f "$MANAGED_WORKER_PAIR_LOCK/pid" 2>/dev/null || ! rmdir "$MANAGED_WORKER_PAIR_LOCK" 2>/dev/null; then
-      return 1
-    fi
+    /bin/sleep 0.01
     attempt=$((attempt + 1))
   done
+  _managed_worker_pair_write_lock_release || true
+  wait "$helper_pid" 2>/dev/null || true
+  rm -f "$MANAGED_WORKER_PAIR_LOCK_READY" "$MANAGED_WORKER_PAIR_LOCK_RELEASE" 2>/dev/null || true
+  MANAGED_WORKER_PAIR_LOCK_HELPER_PID=""
   return 1
+}
+
+_managed_worker_pair_reclaim_stale_lock() {
+  if ! _managed_worker_pair_try_acquire_lock; then return 1; fi
+  _managed_worker_pair_release_lock
 }
 
 _managed_worker_pair_release_lock() {
   local status=0
-  if [[ "$MANAGED_WORKER_PAIR_LOCK_HELD" != true ]]; then
-    return 0
-  fi
-  if ! rm -f "$MANAGED_WORKER_PAIR_LOCK/pid" 2>/dev/null; then
+  if [[ "$MANAGED_WORKER_PAIR_LOCK_HELD" != true ]]; then return 0; fi
+  if [[ -z "$MANAGED_WORKER_PAIR_LOCK_HELPER_PID" ]] ||
+    ! _managed_worker_pair_write_lock_release; then
     status=1
+  else
+    wait "$MANAGED_WORKER_PAIR_LOCK_HELPER_PID" 2>/dev/null || status=1
   fi
-  if ! rmdir "$MANAGED_WORKER_PAIR_LOCK" 2>/dev/null; then
-    status=1
-  fi
+  rm -f "$MANAGED_WORKER_PAIR_LOCK_READY" "$MANAGED_WORKER_PAIR_LOCK_RELEASE" 2>/dev/null || status=1
   MANAGED_WORKER_PAIR_LOCK_HELD=false
+  MANAGED_WORKER_PAIR_LOCK_HELPER_PID=""
   return "$status"
 }
 
@@ -321,6 +386,36 @@ managed_worker_pair_recover() {
     return 1
   fi
   if ! _managed_worker_pair_recover_locked; then status=1; fi
+  if ! _managed_worker_pair_release_lock; then status=1; fi
+  if [[ $status -ne 0 ]]; then
+    _managed_worker_pair_error
+    return 1
+  fi
+}
+
+# Finish a pair forward after a containing install transaction has durably
+# crossed its commit point. Callers must not use this for ordinary recovery.
+managed_worker_pair_finish_commit() {
+  local worker="$1" updater="$2" status=0
+  if ! _managed_worker_pair_set_paths "$worker" "$updater" || ! _managed_worker_pair_validate_destination || ! _managed_worker_pair_acquire_lock; then
+    _managed_worker_pair_error
+    return 1
+  fi
+  if [[ ! -e "$MANAGED_WORKER_PAIR_JOURNAL" && ! -L "$MANAGED_WORKER_PAIR_JOURNAL" ]]; then
+    if [[ ! -f "$worker" || -L "$worker" || ! -f "$updater" || -L "$updater" ]]; then status=1; fi
+  elif ! _managed_worker_pair_read_journal; then
+    status=1
+  else
+    case "$MANAGED_WORKER_PAIR_PHASE" in
+      published)
+        if ! _managed_worker_pair_write_journal committing || ! _managed_worker_pair_finish_commit_locked; then status=1; fi
+        ;;
+      committing)
+        if ! _managed_worker_pair_finish_commit_locked; then status=1; fi
+        ;;
+      *) status=1 ;;
+    esac
+  fi
   if ! _managed_worker_pair_release_lock; then status=1; fi
   if [[ $status -ne 0 ]]; then
     _managed_worker_pair_error

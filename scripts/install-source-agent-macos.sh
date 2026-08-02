@@ -1,4 +1,4 @@
-#!/usr/bin/env -S -u BASH_ENV -u ENV -u SHELLOPTS /bin/bash
+#!/usr/bin/env -S -u BASH_ENV -u ENV -u SHELLOPTS /bin/bash -p
 set +x
 set -euo pipefail
 set +a
@@ -7,6 +7,8 @@ IFS=$' \t\n'
 unset CDPATH
 LC_ALL=C
 export LC_ALL
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
 
 if [[ -n "${KBASE_SOURCE_AGENT_TOKEN+x}" ]]; then
   echo "KBASE_SOURCE_AGENT_TOKEN environment input is not supported; provide the token on standard input" >&2
@@ -58,8 +60,11 @@ unset admin_token
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 pair_library="$script_dir/lib/managed-worker-pair.sh"
+install_library="$script_dir/lib/managed-worker-install.sh"
 # shellcheck source=scripts/lib/managed-worker-pair.sh
 source "$pair_library"
+# shellcheck source=scripts/lib/managed-worker-install.sh
+source "$install_library"
 home="${HOME:?HOME is required}"
 label="life.executor.kbase.source-agent"
 worker_type="wechat-worker"
@@ -183,13 +188,17 @@ PLIST
   plutil -lint "$destination" >/dev/null
 }
 
-tmp_plist="$(mktemp "${TMPDIR:-/tmp}/source-agent.XXXXXX.plist")"
+tmp_plist="$(mktemp "${TMPDIR:-/tmp}/source-agent.plist.XXXXXX")"
 worker_tmp=""
 updater_tmp=""
 plist_tmp=""
 cleanup() {
   local status=$?
-  if [[ "$MANAGED_WORKER_PAIR_ACTIVE" == true ]] && ! managed_worker_pair_rollback; then status=1; fi
+  if [[ "$MANAGED_WORKER_INSTALL_ACTIVE" == true ]]; then
+    if ! managed_worker_install_rollback; then status=1; fi
+  elif [[ "$MANAGED_WORKER_PAIR_ACTIVE" == true ]] && ! managed_worker_pair_rollback; then
+    status=1
+  fi
   rm -f "$tmp_plist" || status=1
   [[ -z "$worker_tmp" ]] || rm -f "$worker_tmp" || status=1
   [[ -z "$updater_tmp" ]] || rm -f "$updater_tmp" || status=1
@@ -223,33 +232,41 @@ plist_dir="$(cd "$(dirname "$plist_path")" && pwd -P)"
 plist_path="$plist_dir/$(basename "$plist_path")"
 installed_worker="$install_dir/source-agent"
 installed_updater="$install_dir/source-agent-updater"
+domain="gui/$(id -u)"
 
 worker_tmp="$install_dir/.source-agent.$$"
 updater_tmp="$install_dir/.source-agent-updater.$$"
 install -m 0755 "$binary_source" "$worker_tmp"
 install -m 0755 "$updater_source" "$updater_tmp"
+if ! managed_worker_install_begin "$home" source-agent "$installed_worker" "$installed_updater" "$plist_path" "$domain" "$label"; then
+  echo "source-agent installation transaction initialization failed" >&2
+  exit 1
+fi
 if ! managed_worker_pair_publish "$worker_tmp" "$updater_tmp" "$installed_worker" "$installed_updater"; then
   echo "source-agent artifact installation failed" >&2
   exit 1
 fi
 worker_tmp=""
 updater_tmp=""
+if ! managed_worker_install_mark published; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
 if ! "$install_dir/source-agent-updater" --check --worker-type wechat-worker >/dev/null 2>&1; then
   echo "installed source-agent updater preflight failed" >&2
   exit 1
 fi
 
+if ! managed_worker_install_mark keychain; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
 if ! printf '%s\n%s\n' "$transport_token" "$transport_token" | \
   /usr/bin/security add-generic-password -U -s "$transport_token_service" -a "$transport_token_account" -w >/dev/null 2>&1; then
   echo "store source-agent transport token failed" >&2
   exit 1
 fi
-
-render_plist "$tmp_plist" "$installed_worker"
-plist_tmp="$plist_path.tmp.$$"
-install -m 0600 "$tmp_plist" "$plist_tmp"
-mv -f "$plist_tmp" "$plist_path"
-plist_tmp=""
+unset transport_token
 
 env -u KBASE_SOURCE_AGENT_TOKEN \
   KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
@@ -257,14 +274,28 @@ env -u KBASE_SOURCE_AGENT_TOKEN \
   SOURCE_AGENT_STATE_DIR="$state_dir" \
   "$installed_worker" doctor >/dev/null
 
-domain="gui/$(id -u)"
-if launchctl print "$domain/$label" >/dev/null 2>&1; then
+render_plist "$tmp_plist" "$installed_worker"
+plist_tmp="$plist_path.tmp.$$"
+install -m 0600 "$tmp_plist" "$plist_tmp"
+if ! managed_worker_install_mark plist; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+mv -f "$plist_tmp" "$plist_path"
+plist_tmp=""
+
+if ! managed_worker_install_mark launching; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+if [[ "$MANAGED_WORKER_INSTALL_SERVICE_LOADED" == 1 ]]; then
   launchctl bootout "$domain/$label"
 fi
 launchctl bootstrap "$domain" "$plist_path"
 launchctl kickstart -k "$domain/$label"
-if ! managed_worker_pair_commit; then
-  echo "source-agent artifact commit failed" >&2
+launchctl print "$domain/$label" >/dev/null
+if ! managed_worker_install_commit; then
+  echo "source-agent installation commit failed" >&2
   exit 1
 fi
 echo "source-agent installed and started; open http://$enroll_addr to scan-login"
