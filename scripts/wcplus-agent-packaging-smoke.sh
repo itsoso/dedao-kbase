@@ -13,7 +13,6 @@ trap 'rm -rf "$tmp_dir"' EXIT
 for script in "$build_script" "$install_script" "$uninstall_script"; do
   bash -n "$script"
 done
-grep -Fxq '#!/bin/bash' "$install_script"
 
 grep -Fq -- '--render-plist' "$install_script"
 bash "$build_script" --check >/dev/null
@@ -138,30 +137,45 @@ mkdir -p "$tmp_dir/home" "$tmp_dir/bin" "$tmp_dir/probe-bin"
 cat >"$tmp_dir/probe-bin/dirname" <<'PROBE'
 #!/bin/bash
 set -euo pipefail
-if [[ -n "${KBASE_SOURCE_AGENT_TOKEN+x}" || -n "${transport_token+x}" ]]; then
-  printf 'leaked\n' >"${PROBE_CAPTURE:?}"
-  exit 91
-fi
+for name in KBASE_SOURCE_AGENT_TOKEN transport_token KBASE_AUTH_TOKEN admin_token BASH_ENV ENV; do
+  if [[ -n "${!name+x}" ]]; then
+    printf 'leaked:%s\n' "$name" >"${PROBE_CAPTURE:?}"
+    exit 91
+  fi
+done
+[[ "$-" != *x* ]]
 printf 'clean\n' >"${PROBE_CAPTURE:?}"
 exec /usr/bin/dirname "$@"
 PROBE
+cat >"$tmp_dir/probe-bin/grep" <<'PROBE_GREP'
+#!/bin/bash
+set -euo pipefail
+: >"${GREP_CALLED_MARKER:?}"
+exit 92
+PROBE_GREP
 printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp_dir/bin/wcplus-agent"
 cat >"$tmp_dir/bin/source-agent-updater" <<'UPDATER'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ -z "${KBASE_SOURCE_AGENT_TOKEN+x}" ]]
-[[ -z "${transport_token+x}" ]]
+for name in KBASE_SOURCE_AGENT_TOKEN transport_token KBASE_AUTH_TOKEN admin_token BASH_ENV ENV; do
+  [[ -z "${!name+x}" ]]
+done
+[[ "$-" != *x* ]]
 printf '%s\n' "$*" >"${UPDATER_CAPTURE:?}"
 [[ "$*" == "--check --worker-type wcplus-worker" ]]
 UPDATER
-chmod 0755 "$tmp_dir/probe-bin/dirname" "$tmp_dir/bin/wcplus-agent" "$tmp_dir/bin/source-agent-updater"
+cat >"$tmp_dir/hostile-startup.sh" <<'HOSTILE_STARTUP'
+#!/bin/bash
+: >"${HOSTILE_STARTUP_MARKER:?}"
+HOSTILE_STARTUP
+chmod 0755 "$tmp_dir/probe-bin/dirname" "$tmp_dir/probe-bin/grep" "$tmp_dir/bin/wcplus-agent" "$tmp_dir/bin/source-agent-updater"
 
 set +e
 missing_output="$({
   env -i PATH="$PATH" HOME="$tmp_dir/home" \
     WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
     WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
-    bash "$install_script" --check
+    "$install_script" --check </dev/null
 } 2>&1)"
 missing_status=$?
 set -e
@@ -169,20 +183,51 @@ if [[ $missing_status -eq 0 ]]; then
   echo "install self-check unexpectedly accepted missing configuration" >&2
   exit 1
 fi
-for name in KBASE_REMOTE_URL KBASE_SOURCE_AGENT_ID KBASE_SOURCE_AGENT_TOKEN WCPLUS_AGENT_STATE_DIR; do
+for name in KBASE_REMOTE_URL KBASE_SOURCE_AGENT_ID WCPLUS_AGENT_STATE_DIR; do
   if ! grep -Fq "$name" <<<"$missing_output"; then
     echo "install self-check did not report $name" >&2
     exit 1
   fi
 done
+if grep -Fq 'KBASE_SOURCE_AGENT_TOKEN' <<<"$missing_output"; then
+  echo "install self-check still requires KBASE_SOURCE_AGENT_TOKEN from the environment" >&2
+  exit 1
+fi
 
 token_sentinel='agent<&>secret-sentinel'
-plist_fixture="$tmp_dir/wcplus-agent.plist"
+set +e
 env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
-  transport_token="preexisting-export" \
   KBASE_REMOTE_URL="https://kbase.example.invalid" \
   KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
   KBASE_SOURCE_AGENT_TOKEN="$token_sentinel" \
+  WCPLUS_AGENT_STATE_DIR="$tmp_dir/state" \
+  WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
+  WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
+  PROBE_CAPTURE="$tmp_dir/env-token-first-child" \
+  UPDATER_CAPTURE="$tmp_dir/env-token-updater-args" \
+  GREP_CALLED_MARKER="$tmp_dir/env-token-grep-called" \
+  "$install_script" --check </dev/null >"$tmp_dir/env-token.stdout" 2>"$tmp_dir/env-token.stderr"
+env_token_status=$?
+set -e
+if [[ $env_token_status -eq 0 ]]; then
+  echo "WC Plus installer accepted KBASE_SOURCE_AGENT_TOKEN from the environment" >&2
+  exit 1
+fi
+if grep -Fq "$token_sentinel" "$tmp_dir/env-token.stdout" "$tmp_dir/env-token.stderr"; then
+  echo "WC Plus installer leaked the rejected environment token" >&2
+  exit 1
+fi
+
+plist_fixture="$tmp_dir/wcplus-agent.plist"
+printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+  transport_token="preexisting-export" \
+  admin_token="preexisting-admin-export" \
+  KBASE_AUTH_TOKEN="different-admin-token" \
+  BASH_ENV="$tmp_dir/hostile-startup.sh" \
+  ENV="$tmp_dir/hostile-startup.sh" \
+  SHELLOPTS="xtrace" \
+  KBASE_REMOTE_URL="https://kbase.example.invalid" \
+  KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
   WCPLUSPRO_BASE_URL="http://127.0.0.1:5001" \
   WCPLUS_AGENT_STATE_DIR="$tmp_dir/state" \
   WCPLUS_AGENT_LOG_DIR="$tmp_dir/logs" \
@@ -190,10 +235,20 @@ env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
   WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
   PROBE_CAPTURE="$tmp_dir/first-child" \
   UPDATER_CAPTURE="$tmp_dir/updater-args" \
-  bash "$install_script" --render-plist >"$plist_fixture"
+  GREP_CALLED_MARKER="$tmp_dir/grep-called" \
+  HOSTILE_STARTUP_MARKER="$tmp_dir/hostile-startup-called" \
+  "$install_script" --render-plist >"$plist_fixture" 2>"$tmp_dir/render.stderr"
 
 plutil -lint "$plist_fixture" >/dev/null
 grep -Fxq 'clean' "$tmp_dir/first-child"
+if [[ -e "$tmp_dir/hostile-startup-called" || -e "$tmp_dir/grep-called" ]]; then
+  echo "WC Plus installer executed hostile startup code or sent its token to grep" >&2
+  exit 1
+fi
+if grep -Fq "$token_sentinel" "$tmp_dir/render.stderr"; then
+  echo "WC Plus installer leaked its stdin token through xtrace" >&2
+  exit 1
+fi
 if grep -Fq 'KBASE_SOURCE_AGENT_TOKEN' "$plist_fixture" || grep -Fq "$token_sentinel" "$plist_fixture"; then
   echo "WC Plus LaunchAgent plist contains the transport token" >&2
   exit 1
@@ -211,16 +266,16 @@ grep -Fxq -- '--check --worker-type wcplus-worker' "$tmp_dir/updater-args"
 oversize_token=""
 for ((index = 0; index < 1025; index++)); do oversize_token+="x"; done
 set +e
-env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+printf '%s\n' "$oversize_token" | env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
   KBASE_REMOTE_URL="https://kbase.example.invalid" \
   KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
-  KBASE_SOURCE_AGENT_TOKEN="$oversize_token" \
   WCPLUS_AGENT_STATE_DIR="$tmp_dir/state" \
   WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
   WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
   PROBE_CAPTURE="$tmp_dir/oversize-first-child" \
   UPDATER_CAPTURE="$tmp_dir/oversize-updater-args" \
-  bash "$install_script" --check >/dev/null 2>&1
+  GREP_CALLED_MARKER="$tmp_dir/oversize-grep-called" \
+  "$install_script" --check >/dev/null 2>&1
 oversize_status=$?
 set -e
 if [[ $oversize_status -eq 0 ]]; then
@@ -247,11 +302,10 @@ printf 'old-updater' >"$installed_updater"
 printf 'old-plist' >"$installed_plist"
 rm -f "$tmp_dir/install-second-publish-failed" "$tmp_dir/launchctl-called"
 set +e
-env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
   transport_token="preexisting-export" \
   KBASE_REMOTE_URL="https://kbase.example.invalid" \
   KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
-  KBASE_SOURCE_AGENT_TOKEN="$token_sentinel" \
   WCPLUSPRO_BASE_URL="http://127.0.0.1:5001" \
   WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
   WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
@@ -264,7 +318,8 @@ env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
   LAUNCHCTL_MARKER="$tmp_dir/launchctl-called" \
   PROBE_CAPTURE="$tmp_dir/install-first-child" \
   UPDATER_CAPTURE="$tmp_dir/install-updater-args" \
-  bash "$install_script" >/dev/null 2>&1
+  GREP_CALLED_MARKER="$tmp_dir/install-grep-called" \
+  "$install_script" >/dev/null 2>&1
 install_status=$?
 set -e
 if [[ $install_status -eq 0 || "$(<"$installed_worker")" != "old-worker" || "$(<"$installed_updater")" != "old-updater" ]]; then
@@ -301,7 +356,7 @@ fi
 grep -Fq 'source-agent-updater' "$install_script"
 grep -Fq 'transport-token' "$install_script"
 grep -Fq 'life.executor.kbase.source-agent' "$install_script"
-grep -Fq 'unset KBASE_SOURCE_AGENT_TOKEN' "$install_script"
+grep -Fq 'unset KBASE_AUTH_TOKEN KBASE_SOURCE_AGENT_TOKEN' "$install_script"
 grep -Fq ' -w' "$install_script"
 grep -Fq '/usr/bin/security add-generic-password -U -s "$transport_token_service" -a "$transport_token_account" -w' "$install_script"
 if grep -Fq -- '-w "$KBASE_SOURCE_AGENT_TOKEN"' "$install_script" || grep -Fq -- '-w "$transport_token"' "$install_script"; then
@@ -314,6 +369,7 @@ grep -Fq 'chmod 0700' "$install_script"
 grep -Fq 'source-agent-updater" --check --worker-type wcplus-worker' "$install_script"
 grep -Fq -- '--delete-state' "$uninstall_script"
 grep -Fq 'State preserved' "$uninstall_script"
+grep -Fxq '#!/usr/bin/env -S -u BASH_ENV -u ENV -u SHELLOPTS /bin/bash' "$install_script"
 
 if [[ "$repo_root" == "$tmp_dir" ]]; then
   echo "invalid repository root" >&2

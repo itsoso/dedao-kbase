@@ -1,8 +1,20 @@
-#!/bin/bash
-
+#!/usr/bin/env -S -u BASH_ENV -u ENV -u SHELLOPTS /bin/bash
+set +x
 set -euo pipefail
 set +a
 umask 077
+IFS=$' \t\n'
+unset CDPATH
+LC_ALL=C
+export LC_ALL
+
+if [[ -n "${KBASE_SOURCE_AGENT_TOKEN+x}" ]]; then
+  echo "KBASE_SOURCE_AGENT_TOKEN environment input is not supported; provide the token on standard input" >&2
+  exit 2
+fi
+unset transport_token admin_token source_agent_token
+admin_token="${KBASE_AUTH_TOKEN-}"
+unset KBASE_AUTH_TOKEN KBASE_SOURCE_AGENT_TOKEN BASH_ENV ENV
 
 mode="install"
 
@@ -20,7 +32,7 @@ case "${1:-}" in
     ;;
 esac
 
-required_names=(KBASE_REMOTE_URL KBASE_SOURCE_AGENT_ID KBASE_SOURCE_AGENT_TOKEN WCPLUS_AGENT_STATE_DIR)
+required_names=(KBASE_REMOTE_URL KBASE_SOURCE_AGENT_ID WCPLUS_AGENT_STATE_DIR)
 missing_names=()
 for name in "${required_names[@]}"; do
   if [[ -z "${!name:-}" ]]; then
@@ -32,13 +44,16 @@ if [[ ${#missing_names[@]} -gt 0 ]]; then
   printf '  %s\n' "${missing_names[@]}" >&2
   exit 2
 fi
-if [[ -n "${KBASE_AUTH_TOKEN:-}" && "$KBASE_AUTH_TOKEN" == "$KBASE_SOURCE_AGENT_TOKEN" ]]; then
+transport_token=""
+if ! IFS= read -r transport_token; then
+  echo "source-agent transport token is required on standard input" >&2
+  exit 2
+fi
+if [[ -n "$admin_token" && "$admin_token" == "$transport_token" ]]; then
   echo "admin and source-agent tokens must differ" >&2
   exit 2
 fi
-unset transport_token
-transport_token="$KBASE_SOURCE_AGENT_TOKEN"
-unset KBASE_SOURCE_AGENT_TOKEN
+unset admin_token
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
@@ -76,10 +91,22 @@ if [[ ! -x "$updater_source" ]]; then
   echo "WCPLUS_AGENT_UPDATER_BINARY_PATH must point to an executable" >&2
   exit 2
 fi
-if ((${#transport_token} > max_transport_token_bytes)) || ! printf '%s' "$transport_token" | LC_ALL=C grep -Eq '^[!-~]+$'; then
+token_valid=true
+if ((${#transport_token} == 0 || ${#transport_token} > max_transport_token_bytes)); then
+  token_valid=false
+else
+  for ((index = 0; index < ${#transport_token}; index++)); do
+    case "${transport_token:index:1}" in
+      [[:graph:]]) ;;
+      *) token_valid=false; break ;;
+    esac
+  done
+fi
+if [[ "$token_valid" != true ]]; then
   echo "KBASE_SOURCE_AGENT_TOKEN must contain printable ASCII without spaces" >&2
   exit 2
 fi
+unset token_valid index
 case "$KBASE_REMOTE_URL" in
   https://* | http://127.0.0.1 | http://127.0.0.1:* | http://localhost | http://localhost:* | http://\[::1\] | http://\[::1\]:*) ;;
   *)
