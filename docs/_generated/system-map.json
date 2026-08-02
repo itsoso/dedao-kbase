@@ -586,7 +586,7 @@
     {
       "path": "/api/source-agent/commands/",
       "file": "backend/app/source_agent_client.go",
-      "line": 238,
+      "line": 253,
       "authenticated": true
     },
     {
@@ -598,7 +598,7 @@
     {
       "path": "/api/source-agent/commands/claim",
       "file": "backend/app/source_agent_client.go",
-      "line": 186,
+      "line": 201,
       "authenticated": true
     },
     {
@@ -610,7 +610,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/source_agent_client.go",
-      "line": 148,
+      "line": 163,
       "authenticated": true
     },
     {
@@ -622,7 +622,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/source_agent_client.go",
-      "line": 168,
+      "line": 183,
       "authenticated": true
     },
     {
@@ -634,7 +634,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/source_agent_client.go",
-      "line": 289,
+      "line": 304,
       "authenticated": true
     },
     {
@@ -1583,7 +1583,7 @@
     {
       "name": "SourceAgentClient",
       "file": "backend/app/source_agent_client.go",
-      "line": 114
+      "line": 129
     },
     {
       "name": "SourceAgentCommand",
@@ -1623,7 +1623,7 @@
     {
       "name": "SourceAgentHTTPError",
       "file": "backend/app/source_agent_client.go",
-      "line": 100
+      "line": 115
     },
     {
       "name": "SourceAgentHeartbeat",
@@ -2073,7 +2073,7 @@
     {
       "name": "sourceAgentDoctorReport",
       "file": "cmd/source-agent/main.go",
-      "line": 128
+      "line": 166
     },
     {
       "name": "sourceAgentPendingCommandReport",

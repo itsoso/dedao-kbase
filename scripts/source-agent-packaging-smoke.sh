@@ -10,7 +10,7 @@ uninstall_script="$script_dir/uninstall-source-agent-macos.sh"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/source-agent-packaging.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-for script in "$build_script" "$install_script" "$uninstall_script"; do
+for script in "$build_script" "$install_script" "$uninstall_script" "$script_dir/lib/managed-worker-pair.sh"; do
   bash -n "$script"
 done
 
@@ -66,7 +66,7 @@ run_fixture_build() {
 
 assert_no_publish_debris() {
   local directory="$1"
-  if compgen -G "$directory/*.tmp.*" >/dev/null || compgen -G "$directory/*.backup.*" >/dev/null; then
+  if compgen -G "$directory/*.tmp.*" >/dev/null || compgen -G "$directory/*.backup.*" >/dev/null || compgen -G "$directory/.*.pair-*" >/dev/null; then
     echo "build publication left temporary or backup files" >&2
     exit 1
   fi
@@ -372,7 +372,7 @@ if compgen -G "$install_dir/*.tmp.*" >/dev/null || compgen -G "$install_dir/*.ba
   echo "failed install publication left temporary or backup files" >&2
   exit 1
 fi
-publish_line="$(grep -n 'publish_artifact_pair .*installed_worker.*installed_updater' "$install_script" | cut -d: -f1)"
+publish_line="$(grep -n 'managed_worker_pair_publish .*installed_worker.*installed_updater' "$install_script" | cut -d: -f1)"
 security_line="$(grep -n '/usr/bin/security add-generic-password' "$install_script" | cut -d: -f1)"
 if [[ -z "$publish_line" || -z "$security_line" ]] || ((publish_line >= security_line)); then
   echo "artifact pair must publish before Keychain mutation" >&2
@@ -387,6 +387,8 @@ if grep -Eq 'codesign .*updater' "$build_script"; then
   exit 1
 fi
 grep -Fq 'source-agent-updater' "$install_script"
+grep -Fq 'lib/managed-worker-pair.sh' "$build_script"
+grep -Fq 'lib/managed-worker-pair.sh' "$install_script"
 grep -Fq 'transport-token' "$install_script"
 grep -Fq 'life.executor.kbase.source-agent' "$install_script"
 grep -Fq 'unset KBASE_AUTH_TOKEN KBASE_SOURCE_AGENT_TOKEN' "$install_script"
