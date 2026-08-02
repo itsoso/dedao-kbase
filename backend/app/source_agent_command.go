@@ -325,16 +325,34 @@ func (s *SourceSyncStore) sourceAgentHasActiveRun(agentID string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	var active int
-	err = s.db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM source_sync_runs
-			WHERE lease_owner = ? AND status IN (?, ?)
-				AND lease_expires_at != ''
-				AND julianday(lease_expires_at) > julianday(?)
-		)
-	`, agentID, SourceRunLeased, SourceRunRunning, s.timestamp()).Scan(&active)
-	return active == 1, err
+	rows, err := s.db.Query(`
+		SELECT lease_expires_at FROM source_sync_runs
+		WHERE lease_owner = ? AND status IN (?, ?)
+	`, agentID, SourceRunLeased, SourceRunRunning)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	active := false
+	now := s.now().UTC()
+	for rows.Next() {
+		var leaseExpiresAt string
+		if err := rows.Scan(&leaseExpiresAt); err != nil {
+			return false, err
+		}
+		expiresAt, err := time.Parse(time.RFC3339Nano, leaseExpiresAt)
+		if err != nil || expiresAt.UTC().Format(time.RFC3339Nano) != leaseExpiresAt {
+			return false, fmt.Errorf("source sync run has invalid lease expiry")
+		}
+		if expiresAt.After(now) {
+			active = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return active, nil
 }
 
 func (s *SourceSyncStore) ListSourceAgentCommands(agentID string, limit int) ([]SourceAgentCommand, error) {

@@ -605,6 +605,115 @@ func TestSourceAgentArtifactHandoffClientRequiresStrictSnapshotMetadata(t *testi
 	}
 }
 
+func TestSourceAgentArtifactHandoffClientBoundsTransportFailures(t *testing.T) {
+	command := SourceAgentCommand{
+		ID: "command-1", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		State: SourceAgentCommandDownloading, ExpectedCurrentVersion: "1.0.0",
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-1", ExpectedCurrentVersion: "1.0.0"},
+	}
+	target := SourceAgentArtifactTarget{
+		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64", CurrentVersion: "1.0.0",
+	}
+
+	for _, test := range []struct {
+		name          string
+		ctx           func() context.Context
+		client        func() *http.Client
+		wantContext   error
+		privateDetail string
+	}{
+		{
+			name: "dial failure",
+			ctx:  context.Background,
+			client: func() *http.Client {
+				return &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(*http.Request) (*http.Response, error) {
+					return nil, errors.New("private dial detail")
+				})}
+			},
+			privateDetail: "private dial detail",
+		},
+		{
+			name: "connection reset",
+			ctx:  context.Background,
+			client: func() *http.Client {
+				return &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(*http.Request) (*http.Response, error) {
+					return nil, errors.New("private connection reset detail")
+				})}
+			},
+			privateDetail: "private connection reset detail",
+		},
+		{
+			name: "client timeout with healthy parent",
+			ctx:  context.Background,
+			client: func() *http.Client {
+				return &http.Client{
+					Timeout: 5 * time.Millisecond,
+					Transport: sourceAgentClientRoundTripperForTest(func(request *http.Request) (*http.Response, error) {
+						<-request.Context().Done()
+						return nil, request.Context().Err()
+					}),
+				}
+			},
+		},
+		{
+			name: "parent cancellation",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			client: func() *http.Client {
+				return &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(request *http.Request) (*http.Response, error) {
+					return nil, request.Context().Err()
+				})}
+			},
+			wantContext: context.Canceled,
+		},
+		{
+			name: "parent deadline",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			client: func() *http.Client {
+				return &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(request *http.Request) (*http.Response, error) {
+					return nil, request.Context().Err()
+				})}
+			},
+			wantContext: context.DeadlineExceeded,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret", AgentID: "agent-a",
+				StateDir: t.TempDir(), HTTPClient: test.client(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata, body, err := client.DownloadArtifact(test.ctx(), command, target, "2026-08-01")
+			if err == nil || body != nil || metadata != (SourceAgentArtifactPublic{}) {
+				t.Fatalf("metadata=%#v body=%T err=%v, want transport rejection", metadata, body, err)
+			}
+			if test.wantContext != nil {
+				if err != test.wantContext || sourceAgentRequestRetryable(err) {
+					t.Fatalf("error=%T %v retryable=%t, want exact context error %v", err, err, sourceAgentRequestRetryable(err), test.wantContext)
+				}
+			} else {
+				var transportError *SourceAgentTransportError
+				if !errors.As(err, &transportError) || !sourceAgentRequestRetryable(err) {
+					t.Fatalf("error=%T %v retryable=%t, want bounded retryable transport error", err, err, sourceAgentRequestRetryable(err))
+				}
+			}
+			if strings.Contains(err.Error(), "kbase.example.invalid") ||
+				test.privateDetail != "" && strings.Contains(err.Error(), test.privateDetail) {
+				t.Fatalf("artifact transport error leaked URL/private detail: %v", err)
+			}
+		})
+	}
+}
+
 func TestSourceAgentUpdateGuardClientSendsExactFieldsAndClassifiesDenials(t *testing.T) {
 	newClient := func(t *testing.T, handler http.Handler) *SourceAgentClient {
 		t.Helper()
@@ -674,11 +783,99 @@ func TestSourceAgentUpdateGuardClientSendsExactFieldsAndClassifiesDenials(t *tes
 		}
 	})
 
+	t.Run("rejects redirect without following it", func(t *testing.T) {
+		redirectTargetCalls := 0
+		redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			redirectTargetCalls++
+			http.Error(w, "private redirect target detail", http.StatusOK)
+		}))
+		defer redirectTarget.Close()
+		client := newClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, redirectTarget.URL, http.StatusFound)
+		}))
+		err := client.Check(context.Background(), exactCheck(t))
+		if err == nil || sourceAgentRequestRetryable(err) {
+			t.Fatalf("error=%v retryable=%t, want permanent redirect denial", err, sourceAgentRequestRetryable(err))
+		}
+		if redirectTargetCalls != 0 || strings.Contains(err.Error(), "private redirect target detail") {
+			t.Fatalf("redirect followed or private body leaked: calls=%d err=%v", redirectTargetCalls, err)
+		}
+	})
+
+	t.Run("rejects nonempty 204 body", func(t *testing.T) {
+		client, err := NewSourceAgentClient(SourceAgentConfig{
+			RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret", AgentID: "agent-a",
+			StateDir: t.TempDir(), HTTPClient: &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusNoContent,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("private guard detail")),
+					Request:    request,
+				}, nil
+			})},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = client.Check(context.Background(), exactCheck(t))
+		if err == nil || sourceAgentRequestRetryable(err) || strings.Contains(err.Error(), "private guard detail") {
+			t.Fatalf("error=%v retryable=%t, want permanent empty-body denial", err, sourceAgentRequestRetryable(err))
+		}
+	})
+
+	for _, test := range []struct {
+		name             string
+		contentLength    int64
+		transferEncoding []string
+		transferHeader   string
+		contentEncoding  string
+		uncompressed     bool
+	}{
+		{name: "declared content length", contentLength: 1},
+		{name: "transfer encoding", transferEncoding: []string{"chunked"}},
+		{name: "transfer encoding header", transferHeader: "chunked"},
+		{name: "content encoding", contentEncoding: "gzip"},
+		{name: "automatic content decoding", uncompressed: true},
+	} {
+		t.Run("rejects 204 "+test.name, func(t *testing.T) {
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret", AgentID: "agent-a",
+				StateDir: t.TempDir(), HTTPClient: &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(request *http.Request) (*http.Response, error) {
+					header := make(http.Header)
+					if test.contentEncoding != "" {
+						header.Set("Content-Encoding", test.contentEncoding)
+					}
+					if test.transferHeader != "" {
+						header.Set("Transfer-Encoding", test.transferHeader)
+					}
+					return &http.Response{
+						StatusCode:       http.StatusNoContent,
+						Header:           header,
+						Body:             io.NopCloser(strings.NewReader("")),
+						ContentLength:    test.contentLength,
+						TransferEncoding: test.transferEncoding,
+						Uncompressed:     test.uncompressed,
+						Request:          request,
+					}, nil
+				})},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = client.Check(context.Background(), exactCheck(t))
+			if err == nil || sourceAgentRequestRetryable(err) {
+				t.Fatalf("error=%v retryable=%t, want permanent response semantics denial", err, sourceAgentRequestRetryable(err))
+			}
+		})
+	}
+
 	for _, test := range []struct {
 		name      string
 		status    int
 		retryable bool
 	}{
+		{name: "permanent plain success denial", status: http.StatusOK},
+		{name: "permanent partial content denial", status: http.StatusPartialContent},
 		{name: "permanent conflict denial", status: http.StatusConflict},
 		{name: "permanent auth denial", status: http.StatusUnauthorized},
 		{name: "retryable timeout", status: http.StatusRequestTimeout, retryable: true},

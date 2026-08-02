@@ -580,7 +580,7 @@
     {
       "path": "/api/source-agent/artifacts/",
       "file": "backend/app/source_agent_client.go",
-      "line": 328,
+      "line": 327,
       "authenticated": true
     },
     {
@@ -592,7 +592,7 @@
     {
       "path": "/api/source-agent/commands/",
       "file": "backend/app/source_agent_client.go",
-      "line": 287,
+      "line": 286,
       "authenticated": true
     },
     {
@@ -604,7 +604,7 @@
     {
       "path": "/api/source-agent/commands/claim",
       "file": "backend/app/source_agent_client.go",
-      "line": 235,
+      "line": 234,
       "authenticated": true
     },
     {
@@ -616,7 +616,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/source_agent_client.go",
-      "line": 197,
+      "line": 196,
       "authenticated": true
     },
     {
@@ -628,7 +628,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/source_agent_client.go",
-      "line": 217,
+      "line": 216,
       "authenticated": true
     },
     {
@@ -640,7 +640,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/source_agent_client.go",
-      "line": 535,
+      "line": 563,
       "authenticated": true
     },
     {
@@ -1579,7 +1579,7 @@
     {
       "name": "SourceAgentClient",
       "file": "backend/app/source_agent_client.go",
-      "line": 163
+      "line": 162
     },
     {
       "name": "SourceAgentCommand",
@@ -1604,7 +1604,7 @@
     {
       "name": "SourceAgentConfig",
       "file": "backend/app/source_agent_client.go",
-      "line": 39
+      "line": 38
     },
     {
       "name": "SourceAgentCycleResult",
@@ -1619,7 +1619,7 @@
     {
       "name": "SourceAgentHTTPError",
       "file": "backend/app/source_agent_client.go",
-      "line": 138
+      "line": 137
     },
     {
       "name": "SourceAgentHeartbeat",
@@ -1664,7 +1664,7 @@
     {
       "name": "SourceAgentTransportError",
       "file": "backend/app/source_agent_client.go",
-      "line": 144
+      "line": 143
     },
     {
       "name": "SourceAgentUpdateConfig",

@@ -2626,6 +2626,11 @@ func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact
 		}
 		return string(body)
 	}
+	emptyLease := ""
+	malformedLease := "not-a-time"
+	nonCanonicalLease := "2026-08-01T13:00:00.000000000Z"
+	offsetLease := "2026-08-01T09:00:00-04:00"
+	expiredLease := "2026-08-01T11:59:59Z"
 
 	t.Run("allows exact owned installing command with no run and sufficient TTL", func(t *testing.T) {
 		fixture := newFixture(t, SourceAgentCommandInstalling, time.Hour)
@@ -2643,6 +2648,7 @@ func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact
 		mutate    func(map[string]any)
 		disable   bool
 		activeRun bool
+		lease     *string
 		want      int
 	}{
 		{name: "requires worker authentication", state: SourceAgentCommandInstalling, ttl: time.Hour, want: http.StatusUnauthorized},
@@ -2650,6 +2656,11 @@ func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact
 		{name: "requires installing state", state: SourceAgentCommandVerified, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
 		{name: "rejects restarting state", state: SourceAgentCommandRestarting, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
 		{name: "requires no active source run", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, want: http.StatusConflict},
+		{name: "allows a valid expired source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &expiredLease, want: http.StatusNoContent},
+		{name: "fails closed on empty source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &emptyLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on malformed source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &malformedLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on noncanonical source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &nonCanonicalLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on non-UTC source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &offsetLease, want: http.StatusServiceUnavailable},
 		{name: "requires allowed rollout", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, disable: true, want: http.StatusConflict},
 		{name: "requires restart ready reconcile safety TTL", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Minute, want: http.StatusConflict},
 		{name: "requires artifact ID", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["artifact_id"] = "artifact-2" }, want: http.StatusConflict},
@@ -2688,6 +2699,11 @@ func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact
 				}
 				if _, err := fixture.sourceSync.StartRun(run.ID, "agent-a"); err != nil {
 					t.Fatal(err)
+				}
+				if test.lease != nil {
+					if _, err := fixture.sourceSync.db.Exec(`UPDATE source_sync_runs SET lease_expires_at = ? WHERE id = ?`, *test.lease, run.ID); err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			fields := validFields()

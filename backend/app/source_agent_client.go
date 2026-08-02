@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -345,7 +344,10 @@ func (c *SourceAgentClient) DownloadArtifact(
 	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := requestClient.Do(req)
 	if err != nil {
-		return SourceAgentArtifactPublic{}, nil, err
+		if contextErr := ctx.Err(); contextErr != nil {
+			return SourceAgentArtifactPublic{}, nil, contextErr
+		}
+		return SourceAgentArtifactPublic{}, nil, &SourceAgentTransportError{Method: http.MethodGet, Path: requestPath}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
@@ -462,18 +464,44 @@ func (c *SourceAgentClient) Check(ctx context.Context, check SourceAgentUpdateGu
 		ProtocolVersion: check.ProtocolVersion,
 	}
 	requestPath := "/api/source-agent/commands/" + url.PathEscape(check.CommandID) + "/guard"
-	err := c.doJSON(ctx, http.MethodPost, requestPath, payload, nil)
-	if err == nil {
-		return nil
-	}
-	var httpError *SourceAgentHTTPError
-	if errors.As(err, &httpError) {
+	body, err := json.Marshal(payload)
+	if err != nil {
 		return err
 	}
-	if contextErr := ctx.Err(); contextErr != nil {
-		return contextErr
+	endpoint, err := c.endpointForRequestPath(requestPath)
+	if err != nil {
+		return err
 	}
-	return &SourceAgentTransportError{Method: http.MethodPost, Path: requestPath}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	requestClient := *c.client
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := requestClient.Do(req)
+	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
+		return &SourceAgentTransportError{Method: http.MethodPost, Path: requestPath}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		return &SourceAgentHTTPError{Method: http.MethodPost, Path: requestPath, StatusCode: resp.StatusCode}
+	}
+	if resp.ContentLength != 0 || len(resp.TransferEncoding) != 0 || resp.Uncompressed ||
+		len(resp.Header.Values("Transfer-Encoding")) != 0 || len(resp.Header.Values("Content-Encoding")) != 0 {
+		return fmt.Errorf("invalid source agent update guard response")
+	}
+	var probe [1]byte
+	read, readErr := io.ReadFull(resp.Body, probe[:])
+	if read != 0 || readErr != io.EOF {
+		return fmt.Errorf("invalid source agent update guard response")
+	}
+	return nil
 }
 
 func validSourceAgentUpdateGuardCheck(check SourceAgentUpdateGuardCheck) bool {
