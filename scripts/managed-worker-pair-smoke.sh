@@ -104,11 +104,14 @@ assert_new_pair() {
 }
 
 assert_clean() {
-  if compgen -G "$pair_dir/.source-agent.pair-*" >/dev/null ||
+  if [[ -e "$pair_dir/.source-agent-updater.pair-journal" || -e "$pair_dir/.source-agent-updater.pair-journal.tmp" ||
+    -e "$pair_dir/.source-agent-updater.pair-worker-old" || -e "$pair_dir/.source-agent-updater.pair-updater-old" ]] ||
+    compgen -G "$pair_dir/.source-agent.pair-*" >/dev/null ||
+    compgen -G "$pair_dir/.wcplus-agent.pair-*" >/dev/null ||
     compgen -G "$pair_dir/.source-agent-updater.pair-lock-ready.*" >/dev/null ||
     compgen -G "$pair_dir/.source-agent-updater.pair-lock-release.*" >/dev/null; then
     echo "managed pair transaction left debris" >&2
-    find "$pair_dir" -maxdepth 1 -name '.source-agent.pair-*' -print >&2
+    find "$pair_dir" -maxdepth 1 -name '*.pair-*' -print >&2
     exit 1
   fi
 }
@@ -369,8 +372,9 @@ assert_clean
 
 reset_pair
 managed_worker_pair_publish "$worker_new" "$updater_new" "$worker" "$updater"
-journal="$pair_dir/.source-agent.pair-journal"
-if grep -Fq 'new-worker-secret-sentinel' "$journal" || grep -Eq '(^|=)(command|path)=' "$journal"; then
+journal="$pair_dir/.source-agent-updater.pair-journal"
+if grep -Fq 'new-worker-secret-sentinel' "$journal" || grep -Eq '(^|=)(command|path)=' "$journal" ||
+  ! grep -Eq '^worker=source-agent$' "$journal" || [[ "$(wc -l <"$journal")" -ne 9 ]]; then
   echo "managed pair journal contains secret data or executable input" >&2
   exit 1
 fi
@@ -385,7 +389,7 @@ assert_clean
 
 reset_pair
 managed_worker_pair_publish "$worker_new" "$updater_new" "$worker" "$updater"
-export FAIL_RM_MATCH='.source-agent.pair-worker-old'
+export FAIL_RM_MATCH='.source-agent-updater.pair-worker-old'
 if managed_worker_pair_commit; then
   echo "managed pair ignored commit removal failure" >&2
   exit 1
@@ -396,7 +400,7 @@ assert_new_pair
 assert_clean
 
 reset_pair
-printf 'version=1\nphase=prepared\n%s\n' "$(printf 'x%.0s' {1..2048})" >"$journal"
+printf 'version=2\nphase=prepared\n%s\n' "$(printf 'x%.0s' {1..2048})" >"$journal"
 if managed_worker_pair_recover "$worker" "$updater"; then
   echo "managed pair accepted an oversized journal" >&2
   exit 1
@@ -474,6 +478,59 @@ fi
 managed_worker_pair_finish_commit "$worker" "$updater"
 assert_new_pair
 assert_clean
+
+reset_pair
+cross_worker_failed=false
+wcplus_worker="$pair_dir/wcplus-agent"
+printf 'old-wcplus-worker' >"$wcplus_worker"
+printf 'source-worker-v1' >"$worker_new"
+printf 'shared-updater-v1' >"$updater_new"
+set +e
+PAIR_LIBRARY="$library" WORKER_NEW="$worker_new" UPDATER_NEW="$updater_new" WORKER_DEST="$worker" UPDATER_DEST="$updater" \
+  "$kill_script" >/dev/null 2>&1
+cross_kill_status=$?
+set -e
+if [[ $cross_kill_status -eq 0 ]]; then
+  echo "managed pair source cross-worker SIGKILL fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+wcplus_new="$pair_dir/.wcplus-agent.cross-new"
+updater_cross_new="$pair_dir/.source-agent-updater.cross-new"
+printf 'wcplus-worker-v1' >"$wcplus_new"
+printf 'shared-updater-v2' >"$updater_cross_new"
+managed_worker_pair_publish "$wcplus_new" "$updater_cross_new" "$wcplus_worker" "$updater"
+managed_worker_pair_commit
+managed_worker_pair_recover "$worker" "$updater"
+if [[ "$(<"$worker")" != old-worker || "$(<"$wcplus_worker")" != wcplus-worker-v1 || "$(<"$updater")" != shared-updater-v2 ]]; then
+  echo "managed pair delayed source recovery clobbered a committed WC Plus updater" >&2
+  cross_worker_failed=true
+fi
+assert_clean
+
+reset_pair
+printf 'old-wcplus-worker' >"$wcplus_worker"
+printf 'wcplus-worker-v1' >"$wcplus_new"
+printf 'shared-updater-v1' >"$updater_cross_new"
+set +e
+PAIR_LIBRARY="$library" WORKER_NEW="$wcplus_new" UPDATER_NEW="$updater_cross_new" WORKER_DEST="$wcplus_worker" UPDATER_DEST="$updater" \
+  "$kill_script" >/dev/null 2>&1
+cross_kill_status=$?
+set -e
+if [[ $cross_kill_status -eq 0 ]]; then
+  echo "managed pair WC Plus cross-worker SIGKILL fixture unexpectedly succeeded" >&2
+  exit 1
+fi
+printf 'source-worker-v1' >"$worker_new"
+printf 'shared-updater-v2' >"$updater_new"
+managed_worker_pair_publish "$worker_new" "$updater_new" "$worker" "$updater"
+managed_worker_pair_commit
+managed_worker_pair_recover "$wcplus_worker" "$updater"
+if [[ "$(<"$worker")" != source-worker-v1 || "$(<"$wcplus_worker")" != old-wcplus-worker || "$(<"$updater")" != shared-updater-v2 ]]; then
+  echo "managed pair delayed WC Plus recovery clobbered a committed source updater" >&2
+  cross_worker_failed=true
+fi
+assert_clean
+if [[ "$cross_worker_failed" == true ]]; then exit 1; fi
 
 reset_pair
 hold_script="$tmp_dir/hold.sh"

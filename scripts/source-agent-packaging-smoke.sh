@@ -77,8 +77,8 @@ run_fixture_build() {
 assert_no_publish_debris() {
   local directory="$1"
   if compgen -G "$directory/*.tmp.*" >/dev/null || compgen -G "$directory/*.backup.*" >/dev/null ||
-    [[ -e "$directory/.source-agent.pair-journal" || -e "$directory/.source-agent.pair-journal.tmp" ||
-      -e "$directory/.source-agent.pair-worker-old" || -e "$directory/.source-agent.pair-updater-old" ]]; then
+    [[ -e "$directory/.source-agent-updater.pair-journal" || -e "$directory/.source-agent-updater.pair-journal.tmp" ||
+      -e "$directory/.source-agent-updater.pair-worker-old" || -e "$directory/.source-agent-updater.pair-updater-old" ]]; then
     echo "build publication left temporary or backup files" >&2
     exit 1
   fi
@@ -537,8 +537,8 @@ if [[ "$(<"$installed_plist")" != "old-plist" || -e "$tmp_dir/launchctl-called" 
   exit 1
 fi
 if compgen -G "$install_dir/*.tmp.*" >/dev/null || compgen -G "$install_dir/*.backup.*" >/dev/null ||
-  [[ -e "$install_dir/.source-agent.pair-journal" || -e "$install_dir/.source-agent.pair-journal.tmp" ||
-    -e "$install_dir/.source-agent.pair-worker-old" || -e "$install_dir/.source-agent.pair-updater-old" ]]; then
+  [[ -e "$install_dir/.source-agent-updater.pair-journal" || -e "$install_dir/.source-agent-updater.pair-journal.tmp" ||
+    -e "$install_dir/.source-agent-updater.pair-worker-old" || -e "$install_dir/.source-agent-updater.pair-updater-old" ]]; then
   echo "failed install publication left temporary or backup files" >&2
   exit 1
 fi
@@ -657,10 +657,10 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
     [[ -e "$tmp_dir/home/Library/Application Support/KBase/.managed-worker-install-journal" ||
     -e "$tmp_dir/home/Library/Application Support/KBase/.managed-worker-install-journal.tmp" ||
     -e "$tmp_dir/home/Library/Application Support/KBase/.managed-worker-install-plist-old" ||
-    -e "$install_dir/.source-agent.pair-journal" ||
-    -e "$install_dir/.source-agent.pair-journal.tmp" ||
-    -e "$install_dir/.source-agent.pair-worker-old" ||
-    -e "$install_dir/.source-agent.pair-updater-old" ]]; then
+    -e "$install_dir/.source-agent-updater.pair-journal" ||
+    -e "$install_dir/.source-agent-updater.pair-journal.tmp" ||
+    -e "$install_dir/.source-agent-updater.pair-worker-old" ||
+    -e "$install_dir/.source-agent-updater.pair-updater-old" ]]; then
     echo "source-agent $failure_boundary fault left transaction state" >&2
     exit 1
   fi

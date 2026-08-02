@@ -18,6 +18,7 @@ MANAGED_WORKER_PAIR_LOCK_HELPER_PID=""
 MANAGED_WORKER_PAIR_LOCK_READY=""
 MANAGED_WORKER_PAIR_LOCK_RELEASE=""
 MANAGED_WORKER_PAIR_PHASE=""
+MANAGED_WORKER_PAIR_WORKER_NAME=""
 MANAGED_WORKER_PAIR_WORKER_OLD=0
 MANAGED_WORKER_PAIR_UPDATER_OLD=0
 MANAGED_WORKER_PAIR_WORKER_NEW_HASH=""
@@ -31,6 +32,10 @@ _managed_worker_pair_error() {
 
 _managed_worker_pair_valid_hash() {
   [[ "$1" =~ ^[0123456789abcdef]{64}$ ]]
+}
+
+_managed_worker_pair_valid_worker_name() {
+  [[ "$1" == source-agent || "$1" == wcplus-agent ]]
 }
 
 _managed_worker_pair_hash() {
@@ -67,21 +72,19 @@ _managed_worker_pair_set_paths() {
   if [[ "$worker_directory" != "$updater_directory" || ! -d "$worker_directory" ]]; then
     return 1
   fi
-  case "$worker_basename" in
-    source-agent | wcplus-agent) ;;
-    *) return 1 ;;
-  esac
+  _managed_worker_pair_valid_worker_name "$worker_basename" || return 1
   if [[ "$updater_basename" != "source-agent-updater" || "$worker" == "$updater" ]]; then
     return 1
   fi
 
   MANAGED_WORKER_PAIR_DIRECTORY="$worker_directory"
+  MANAGED_WORKER_PAIR_WORKER_NAME="$worker_basename"
   MANAGED_WORKER_PAIR_WORKER="$worker"
   MANAGED_WORKER_PAIR_UPDATER="$updater"
-  MANAGED_WORKER_PAIR_JOURNAL="$worker_directory/.${worker_basename}.pair-journal"
-  MANAGED_WORKER_PAIR_JOURNAL_TMP="$worker_directory/.${worker_basename}.pair-journal.tmp"
-  MANAGED_WORKER_PAIR_WORKER_BACKUP="$worker_directory/.${worker_basename}.pair-worker-old"
-  MANAGED_WORKER_PAIR_UPDATER_BACKUP="$worker_directory/.${worker_basename}.pair-updater-old"
+  MANAGED_WORKER_PAIR_JOURNAL="$worker_directory/.source-agent-updater.pair-journal"
+  MANAGED_WORKER_PAIR_JOURNAL_TMP="$worker_directory/.source-agent-updater.pair-journal.tmp"
+  MANAGED_WORKER_PAIR_WORKER_BACKUP="$worker_directory/.source-agent-updater.pair-worker-old"
+  MANAGED_WORKER_PAIR_UPDATER_BACKUP="$worker_directory/.source-agent-updater.pair-updater-old"
   MANAGED_WORKER_PAIR_LOCK="$worker_directory/.source-agent-updater.pair-lock"
   MANAGED_WORKER_PAIR_LOCK_READY="$worker_directory/.source-agent-updater.pair-lock-ready.$$"
   MANAGED_WORKER_PAIR_LOCK_RELEASE="$worker_directory/.source-agent-updater.pair-lock-release.$$"
@@ -219,9 +222,11 @@ _managed_worker_pair_release_lock() {
 
 _managed_worker_pair_write_journal() {
   local phase="$1"
+  _managed_worker_pair_valid_worker_name "$MANAGED_WORKER_PAIR_WORKER_NAME" || return 1
   if ! printf '%s\n' \
-    'version=1' \
+    'version=2' \
     "phase=$phase" \
+    "worker=$MANAGED_WORKER_PAIR_WORKER_NAME" \
     "worker_old=$MANAGED_WORKER_PAIR_WORKER_OLD" \
     "updater_old=$MANAGED_WORKER_PAIR_UPDATER_OLD" \
     "worker_new_hash=$MANAGED_WORKER_PAIR_WORKER_NEW_HASH" \
@@ -249,6 +254,7 @@ _managed_worker_pair_read_journal() {
     fi
   fi
   MANAGED_WORKER_PAIR_PHASE=""
+  MANAGED_WORKER_PAIR_WORKER_NAME=""
   MANAGED_WORKER_PAIR_WORKER_OLD=""
   MANAGED_WORKER_PAIR_UPDATER_OLD=""
   MANAGED_WORKER_PAIR_WORKER_NEW_HASH=""
@@ -261,19 +267,21 @@ _managed_worker_pair_read_journal() {
     value="${line#*=}"
     if [[ "$key" == "$line" ]]; then return 1; fi
     case "$line_number:$key" in
-      1:version) [[ "$value" == 1 ]] || return 1 ;;
+      1:version) [[ "$value" == 2 ]] || return 1 ;;
       2:phase) MANAGED_WORKER_PAIR_PHASE="$value" ;;
-      3:worker_old) MANAGED_WORKER_PAIR_WORKER_OLD="$value" ;;
-      4:updater_old) MANAGED_WORKER_PAIR_UPDATER_OLD="$value" ;;
-      5:worker_new_hash) MANAGED_WORKER_PAIR_WORKER_NEW_HASH="$value" ;;
-      6:updater_new_hash) MANAGED_WORKER_PAIR_UPDATER_NEW_HASH="$value" ;;
-      7:worker_old_hash) MANAGED_WORKER_PAIR_WORKER_OLD_HASH="$value" ;;
-      8:updater_old_hash) MANAGED_WORKER_PAIR_UPDATER_OLD_HASH="$value" ;;
+      3:worker) MANAGED_WORKER_PAIR_WORKER_NAME="$value" ;;
+      4:worker_old) MANAGED_WORKER_PAIR_WORKER_OLD="$value" ;;
+      5:updater_old) MANAGED_WORKER_PAIR_UPDATER_OLD="$value" ;;
+      6:worker_new_hash) MANAGED_WORKER_PAIR_WORKER_NEW_HASH="$value" ;;
+      7:updater_new_hash) MANAGED_WORKER_PAIR_UPDATER_NEW_HASH="$value" ;;
+      8:worker_old_hash) MANAGED_WORKER_PAIR_WORKER_OLD_HASH="$value" ;;
+      9:updater_old_hash) MANAGED_WORKER_PAIR_UPDATER_OLD_HASH="$value" ;;
       *) return 1 ;;
     esac
   done <"$MANAGED_WORKER_PAIR_JOURNAL"
-  if [[ $line_number -ne 8 ]] ||
+  if [[ $line_number -ne 9 ]] ||
     [[ "$MANAGED_WORKER_PAIR_PHASE" != prepared && "$MANAGED_WORKER_PAIR_PHASE" != published && "$MANAGED_WORKER_PAIR_PHASE" != committing ]] ||
+    ! _managed_worker_pair_valid_worker_name "$MANAGED_WORKER_PAIR_WORKER_NAME" ||
     [[ "$MANAGED_WORKER_PAIR_WORKER_OLD" != 0 && "$MANAGED_WORKER_PAIR_WORKER_OLD" != 1 ]] ||
     [[ "$MANAGED_WORKER_PAIR_UPDATER_OLD" != 0 && "$MANAGED_WORKER_PAIR_UPDATER_OLD" != 1 ]] ||
     ! _managed_worker_pair_valid_hash "$MANAGED_WORKER_PAIR_WORKER_NEW_HASH" ||
@@ -290,6 +298,8 @@ _managed_worker_pair_read_journal() {
   elif [[ "$MANAGED_WORKER_PAIR_UPDATER_OLD_HASH" != - ]]; then
     return 1
   fi
+  MANAGED_WORKER_PAIR_WORKER="$MANAGED_WORKER_PAIR_DIRECTORY/$MANAGED_WORKER_PAIR_WORKER_NAME"
+  _managed_worker_pair_validate_destination
 }
 
 _managed_worker_pair_remove_transaction_files() {
@@ -396,14 +406,17 @@ managed_worker_pair_recover() {
 # Finish a pair forward after a containing install transaction has durably
 # crossed its commit point. Callers must not use this for ordinary recovery.
 managed_worker_pair_finish_commit() {
-  local worker="$1" updater="$2" status=0
+  local worker="$1" updater="$2" requested_worker_name status=0
   if ! _managed_worker_pair_set_paths "$worker" "$updater" || ! _managed_worker_pair_validate_destination || ! _managed_worker_pair_acquire_lock; then
     _managed_worker_pair_error
     return 1
   fi
+  requested_worker_name="$MANAGED_WORKER_PAIR_WORKER_NAME"
   if [[ ! -e "$MANAGED_WORKER_PAIR_JOURNAL" && ! -L "$MANAGED_WORKER_PAIR_JOURNAL" ]]; then
     if [[ ! -f "$worker" || -L "$worker" || ! -f "$updater" || -L "$updater" ]]; then status=1; fi
   elif ! _managed_worker_pair_read_journal; then
+    status=1
+  elif [[ "$MANAGED_WORKER_PAIR_WORKER_NAME" != "$requested_worker_name" ]]; then
     status=1
   else
     case "$MANAGED_WORKER_PAIR_PHASE" in
@@ -436,6 +449,13 @@ managed_worker_pair_publish() {
     return 1
   fi
   if ! _managed_worker_pair_recover_locked || ! _managed_worker_pair_validate_destination; then
+    _managed_worker_pair_release_lock || true
+    _managed_worker_pair_error
+    return 1
+  fi
+  if ! _managed_worker_pair_set_paths "$worker" "$updater" ||
+    ! _managed_worker_pair_validate_sources "$worker_source" "$updater_source" ||
+    ! _managed_worker_pair_validate_destination; then
     _managed_worker_pair_release_lock || true
     _managed_worker_pair_error
     return 1
