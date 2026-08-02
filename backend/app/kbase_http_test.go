@@ -2425,6 +2425,283 @@ func TestKBaseHTTPHandlerSourceAgentArtifactDownloadIsCommandBound(t *testing.T)
 	}
 }
 
+func TestSourceAgentArtifactHandoffDownloadIncludesCommandBoundCatalogSnapshot(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-handoff-snapshot")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	response := requestKBase(handler, http.MethodGet, path, "agent-secret")
+	if response.Code != http.StatusOK || response.Body.String() != "artifact-worker-bytes" {
+		t.Fatalf("download status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	wantHeaders := map[string]string{
+		"X-Source-Agent-Command-ID":                claimed.ID,
+		"X-Source-Agent-Artifact-ID":               "artifact-worker",
+		"X-Source-Agent-Artifact-Version":          "2.0.0",
+		"X-Source-Agent-Artifact-Worker-Type":      "wechat-worker",
+		"X-Source-Agent-Artifact-Platform":         "darwin",
+		"X-Source-Agent-Artifact-Architecture":     "arm64",
+		"X-Source-Agent-Artifact-Protocol-Version": "2026-08-01",
+		"X-Source-Agent-Artifact-Revision":         sourceAgentArtifactTestRevision,
+		"X-Source-Agent-Artifact-Channel":          "staging",
+		"X-Source-Agent-Artifact-Size":             strconv.Itoa(len("artifact-worker-bytes")),
+		"X-Source-Agent-Artifact-SHA256":           sha256HexForTest([]byte("artifact-worker-bytes")),
+	}
+	for name, want := range wantHeaders {
+		t.Run(name, func(t *testing.T) {
+			values := response.Header().Values(name)
+			if len(values) != 1 || values[0] != want {
+				t.Fatalf("%s=%q, want one value %q", name, values, want)
+			}
+		})
+	}
+}
+
+func TestSourceAgentArtifactHandoffCatalogReloadCannotMixSnapshotMetadataAndBytes(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	concrete := handler.(*kbaseHTTPHandler)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-snapshot-reload")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	release := make(chan struct{})
+	writer := &snapshotBindingSourceAgentArtifactWriter{
+		header: make(http.Header), entered: make(chan struct{}), release: release,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		request.Header.Set("Authorization", "Bearer agent-secret")
+		handler.ServeHTTP(writer, request)
+	}()
+	select {
+	case <-writer.entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("download did not bind its snapshot before response")
+	}
+
+	artifacts, err := concrete.sourceArtifacts.load()
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	replacementBytes := []byte("replacement artifact bytes")
+	found := false
+	for index := range artifacts {
+		if artifacts[index].ID != "artifact-worker" {
+			continue
+		}
+		found = true
+		artifacts[index].Version = "3.0.0"
+		artifacts[index].Revision = strings.Repeat("b", 40)
+		artifacts[index].Channel = "production"
+		artifacts[index].Size = int64(len(replacementBytes))
+		artifacts[index].SHA256 = sha256HexForTest(replacementBytes)
+		artifactPath := filepath.Join(concrete.sourceArtifacts.root, filepath.FromSlash(artifacts[index].StorageKey))
+		if err := os.WriteFile(artifactPath, replacementBytes, 0o600); err != nil {
+			close(release)
+			t.Fatal(err)
+		}
+	}
+	if !found {
+		close(release)
+		t.Fatal("artifact-worker was not found")
+	}
+	writeSourceAgentArtifactCatalog(t, concrete.sourceArtifacts.root, artifacts)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot download did not finish")
+	}
+
+	if writer.status != http.StatusOK || writer.body.String() != "artifact-worker-bytes" {
+		t.Fatalf("status=%d body=%q", writer.status, writer.body.String())
+	}
+	for name, want := range map[string]string{
+		sourceAgentHeaderArtifactVersion:  "2.0.0",
+		sourceAgentHeaderArtifactRevision: sourceAgentArtifactTestRevision,
+		sourceAgentHeaderArtifactChannel:  "staging",
+		sourceAgentHeaderArtifactSize:     strconv.Itoa(len("artifact-worker-bytes")),
+		sourceAgentHeaderArtifactSHA256:   sha256HexForTest([]byte("artifact-worker-bytes")),
+	} {
+		if values := writer.header.Values(name); len(values) != 1 || values[0] != want {
+			t.Fatalf("%s=%q want one value %q", name, values, want)
+		}
+	}
+}
+
+type snapshotBindingSourceAgentArtifactWriter struct {
+	header      http.Header
+	status      int
+	body        bytes.Buffer
+	entered     chan struct{}
+	release     <-chan struct{}
+	wroteHeader sync.Once
+}
+
+func (w *snapshotBindingSourceAgentArtifactWriter) Header() http.Header { return w.header }
+
+func (w *snapshotBindingSourceAgentArtifactWriter) WriteHeader(status int) {
+	w.status = status
+	w.wroteHeader.Do(func() { close(w.entered) })
+}
+
+func (w *snapshotBindingSourceAgentArtifactWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	<-w.release
+	return w.body.Write(data)
+}
+
+func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact(t *testing.T) {
+	type guardFixture struct {
+		handler      http.Handler
+		sourceSync   *SourceSyncStore
+		clock        *sourceSyncTestClock
+		command      SourceAgentCommand
+		artifactRoot string
+	}
+	newFixture := func(t *testing.T, state string, ttl time.Duration) guardFixture {
+		t.Helper()
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		command, err := sourceSync.CreateSourceAgentCommand(SourceAgentCommandCreate{
+			TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade, IdempotencyKey: "artifact-guard-" + state,
+			Payload:   json.RawMessage(`{"artifact_id":"artifact-worker","expected_current_version":"1.0.0"}`),
+			ExpiresAt: clock.Now().Add(ttl).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandPath := "/api/source-agent/commands/" + url.PathEscape(claimed.ID) + "/progress"
+		for _, next := range []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting} {
+			got := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-a","state":"`+next+`"}`)
+			if got.Code != http.StatusOK {
+				t.Fatalf("progress %s status=%d body=%s", next, got.Code, got.Body.String())
+			}
+			if next == state {
+				break
+			}
+		}
+		stored, err := sourceSync.GetSourceAgentCommand(claimed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return guardFixture{
+			handler: handler, sourceSync: sourceSync, clock: clock, command: stored,
+			artifactRoot: sourceAgentArtifactRootFromHandlerForTest(t, handler),
+		}
+	}
+	requestGuard := func(t *testing.T, fixture guardFixture, token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		path := "/api/source-agent/commands/" + url.PathEscape(fixture.command.ID) + "/guard"
+		return requestJSONKBase(fixture.handler, http.MethodPost, path, token, body)
+	}
+	validFields := func() map[string]any {
+		return map[string]any{
+			"agent_id": "agent-a", "artifact_id": "artifact-worker",
+			"current_version": "1.0.0", "target_version": "2.0.0",
+			"revision": sourceAgentArtifactTestRevision, "channel": "staging",
+			"size": int64(len("artifact-worker-bytes")), "sha256": sha256HexForTest([]byte("artifact-worker-bytes")),
+			"worker_type": "wechat-worker", "platform": "darwin", "architecture": "arm64",
+			"protocol_version": "2026-08-01",
+		}
+	}
+	bodyFor := func(t *testing.T, fields map[string]any) string {
+		t.Helper()
+		body, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+
+	t.Run("allows exact owned installing command with no run and sufficient TTL", func(t *testing.T) {
+		fixture := newFixture(t, SourceAgentCommandInstalling, time.Hour)
+		response := requestGuard(t, fixture, "agent-secret", bodyFor(t, validFields()))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("guard status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		state     string
+		token     string
+		ttl       time.Duration
+		mutate    func(map[string]any)
+		disable   bool
+		activeRun bool
+		want      int
+	}{
+		{name: "requires worker authentication", state: SourceAgentCommandInstalling, ttl: time.Hour, want: http.StatusUnauthorized},
+		{name: "requires claimed owner", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["agent_id"] = "agent-b" }, want: http.StatusForbidden},
+		{name: "requires installing state", state: SourceAgentCommandVerified, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
+		{name: "rejects restarting state", state: SourceAgentCommandRestarting, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
+		{name: "requires no active source run", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, want: http.StatusConflict},
+		{name: "requires allowed rollout", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, disable: true, want: http.StatusConflict},
+		{name: "requires restart ready reconcile safety TTL", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Minute, want: http.StatusConflict},
+		{name: "requires artifact ID", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["artifact_id"] = "artifact-2" }, want: http.StatusConflict},
+		{name: "requires current version", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["current_version"] = "1.0.1" }, want: http.StatusConflict},
+		{name: "requires target version", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["target_version"] = "2.0.1" }, want: http.StatusConflict},
+		{name: "requires revision", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["revision"] = strings.Repeat("b", 40) }, want: http.StatusConflict},
+		{name: "requires channel", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["channel"] = "production" }, want: http.StatusConflict},
+		{name: "requires size", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["size"] = int64(len("artifact-worker-bytes") + 1) }, want: http.StatusConflict},
+		{name: "requires SHA-256", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["sha256"] = strings.Repeat("0", 64) }, want: http.StatusConflict},
+		{name: "requires worker type", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["worker_type"] = "wcplus-worker" }, want: http.StatusConflict},
+		{name: "requires platform", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["platform"] = "linux" }, want: http.StatusConflict},
+		{name: "requires architecture", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["architecture"] = "amd64" }, want: http.StatusConflict},
+		{name: "requires protocol", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["protocol_version"] = "2026-07-01" }, want: http.StatusConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, test.state, test.ttl)
+			if test.disable {
+				setSourceAgentArtifactRolloutForTest(t, fixture.artifactRoot, "artifact-worker", false)
+			}
+			if test.activeRun {
+				subscription, err := fixture.sourceSync.CreateSubscription(SourceSubscriptionInput{
+					SourceType: "wechat_mp_article", SourceAccountKey: "guard-active-run",
+					SourceAccount: "Guard Active Run", AgentID: "agent-a",
+					Operation: "sync_articles", Enabled: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				run, err := fixture.sourceSync.CreateRun(subscription.ID, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				leased, err := fixture.sourceSync.LeaseNextRun("agent-a", []string{"sync_articles"}, time.Minute)
+				if err != nil || leased == nil || leased.ID != run.ID {
+					t.Fatalf("leased=%#v err=%v", leased, err)
+				}
+				if _, err := fixture.sourceSync.StartRun(run.ID, "agent-a"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fields := validFields()
+			if test.mutate != nil {
+				test.mutate(fields)
+			}
+			response := requestGuard(t, fixture, test.token, bodyFor(t, fields))
+			if response.Code != test.want {
+				t.Fatalf("guard status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+			}
+		})
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentArtifactDownloadBoundsConcurrentResponses(t *testing.T) {
 	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
 	concrete := handler.(*kbaseHTTPHandler)

@@ -651,8 +651,8 @@ func (a *WCPlusAgent) flushRunOutbox(ctx context.Context, runID string) (int, st
 }
 
 func sourceAgentRequestRetryable(err error) bool {
-	var httpErr *SourceAgentHTTPError
-	return errors.As(err, &httpErr) && httpErr.Retryable()
+	var retryable interface{ Retryable() bool }
+	return errors.As(err, &retryable) && retryable.Retryable()
 }
 
 func wcplusTaskBlockedReason(task WCPlusTask) string {

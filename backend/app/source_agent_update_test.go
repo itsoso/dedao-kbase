@@ -20,16 +20,24 @@ type fakeSourceAgentUpdateGuard struct {
 	mu       sync.Mutex
 	calls    int
 	failCall int
+	checks   []SourceAgentUpdateGuardCheck
 }
 
-func (g *fakeSourceAgentUpdateGuard) Check(context.Context, SourceAgentUpdateGuardCheck) error {
+func (g *fakeSourceAgentUpdateGuard) Check(_ context.Context, check SourceAgentUpdateGuardCheck) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.calls++
+	g.checks = append(g.checks, check)
 	if g.calls == g.failCall {
 		return errors.New("private guard detail")
 	}
 	return nil
+}
+
+func (g *fakeSourceAgentUpdateGuard) snapshotChecks() []SourceAgentUpdateGuardCheck {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]SourceAgentUpdateGuardCheck(nil), g.checks...)
 }
 
 type fakeSourceAgentUpdateProcess struct {
@@ -323,7 +331,7 @@ func newSourceAgentUpdateFixture(t *testing.T) sourceAgentUpdateFixture {
 		t.Fatalf("NewSourceAgentUpdateTransaction() error = %v", err)
 	}
 	request := SourceAgentUpdateRequest{
-		CommandID: "command-1", WorkerType: "wechat-worker", CurrentVersion: "1.0.0",
+		CommandID: "command-1", ArtifactID: "artifact-1", WorkerType: "wechat-worker", CurrentVersion: "1.0.0",
 		TargetVersion: "2.0.0", ExpectedSHA256: fmt.Sprintf("%x", digest),
 		ExpectedSize: int64(len(newBinary)), StagedBinary: staged,
 		Platform: runtime.GOOS, Architecture: runtime.GOARCH, ProtocolVersion: "2026-08-01",
@@ -341,6 +349,9 @@ func TestSourceAgentUpdateRejectsInvalidRequestWithoutChangingExecutable(t *test
 		name   string
 		mutate func(*SourceAgentUpdateRequest)
 	}{
+		{name: "missing artifact", mutate: func(r *SourceAgentUpdateRequest) { r.ArtifactID = "" }},
+		{name: "noncanonical artifact", mutate: func(r *SourceAgentUpdateRequest) { r.ArtifactID = " artifact-1 " }},
+		{name: "artifact path segment", mutate: func(r *SourceAgentUpdateRequest) { r.ArtifactID = ".." }},
 		{name: "wrong current version", mutate: func(r *SourceAgentUpdateRequest) { r.CurrentVersion = "0.9.0" }},
 		{name: "non upgrade target", mutate: func(r *SourceAgentUpdateRequest) { r.TargetVersion = "1.0.0" }},
 		{name: "wrong worker", mutate: func(r *SourceAgentUpdateRequest) { r.WorkerType = "wcplus-worker" }},
@@ -517,7 +528,34 @@ func TestSourceAgentUpdateGuardChecksBeforeMutationAndImmediatelyBeforeApply(t *
 			if fixture.process.calls != 0 {
 				t.Fatalf("process calls=%d", fixture.process.calls)
 			}
+			checks := fixture.guard.snapshotChecks()
+			if len(checks) != failCall {
+				t.Fatalf("guard checks=%#v", checks)
+			}
+			want := SourceAgentUpdateGuardCheck{
+				CommandID: fixture.request.CommandID, ArtifactID: fixture.request.ArtifactID,
+				WorkerType: fixture.request.WorkerType, CurrentVersion: fixture.request.CurrentVersion,
+				Version: fixture.request.TargetVersion, Revision: fixture.request.Revision, Channel: fixture.request.Channel,
+				Size: fixture.request.ExpectedSize, SHA256: fixture.request.ExpectedSHA256,
+				Platform: fixture.request.Platform, Architecture: fixture.request.Architecture,
+				ProtocolVersion: fixture.request.ProtocolVersion,
+			}
+			for index, check := range checks {
+				if check != want {
+					t.Fatalf("guard check %d=%#v want=%#v", index+1, check, want)
+				}
+			}
 		})
+	}
+}
+
+func TestSourceAgentUpdateRequestFingerprintBindsArtifactID(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	original := sourceAgentUpdateRequestFingerprint(fixture.request)
+	changed := fixture.request
+	changed.ArtifactID = "artifact-2"
+	if sourceAgentUpdateRequestFingerprint(changed) == original {
+		t.Fatal("request fingerprint did not bind artifact_id")
 	}
 }
 

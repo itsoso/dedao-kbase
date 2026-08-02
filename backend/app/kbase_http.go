@@ -23,6 +23,11 @@ import (
 	"github.com/yann0917/dedao-gui/backend/services"
 )
 
+const (
+	sourceAgentUpdateGuardReconciliationWindow = 30 * time.Second
+	sourceAgentUpdateGuardSafetyMargin         = 30 * time.Second
+)
+
 type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
 	AuthToken               string
@@ -3609,7 +3614,15 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 		writeHTTPError(w, http.StatusBadRequest, "invalid command id")
 		return
 	}
-	if !ok || action != "progress" && action != "complete" {
+	if !ok {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if action == "guard" {
+		h.handleSourceAgentUpdateGuard(w, r, commandID)
+		return
+	}
+	if action != "progress" && action != "complete" {
 		writeHTTPError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -3651,6 +3664,75 @@ func (h *kbaseHTTPHandler) handleSourceAgentCommandReport(w http.ResponseWriter,
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"command": command})
+}
+
+func (h *kbaseHTTPHandler) handleSourceAgentUpdateGuard(w http.ResponseWriter, r *http.Request, commandID string) {
+	var payload struct {
+		AgentID         string `json:"agent_id"`
+		ArtifactID      string `json:"artifact_id"`
+		CurrentVersion  string `json:"current_version"`
+		TargetVersion   string `json:"target_version"`
+		Revision        string `json:"revision"`
+		Channel         string `json:"channel"`
+		Size            int64  `json:"size"`
+		SHA256          string `json:"sha256"`
+		WorkerType      string `json:"worker_type"`
+		Platform        string `json:"platform"`
+		Architecture    string `json:"architecture"`
+		ProtocolVersion string `json:"protocol_version"`
+	}
+	if !decodeStrictLimitedHTTPJSON(w, r, h.sourceAgentMaxBodyBytes, &payload) {
+		return
+	}
+	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", payload.AgentID, true)
+	check := SourceAgentUpdateGuardCheck{
+		CommandID: commandID, ArtifactID: payload.ArtifactID, WorkerType: payload.WorkerType,
+		CurrentVersion: payload.CurrentVersion, Version: payload.TargetVersion,
+		Revision: payload.Revision, Channel: payload.Channel, Size: payload.Size, SHA256: payload.SHA256,
+		Platform: payload.Platform, Architecture: payload.Architecture, ProtocolVersion: payload.ProtocolVersion,
+	}
+	if err != nil || agentID != payload.AgentID || !validSourceAgentUpdateGuardCheck(check) {
+		writeHTTPError(w, http.StatusBadRequest, "invalid source agent update guard request")
+		return
+	}
+	command, agent, selection, err := h.validateSourceAgentArtifactCommand(
+		commandID, agentID, SourceAgentCommandInstalling,
+	)
+	if err != nil {
+		h.writeSourceAgentArtifactWorkerError(w, err)
+		return
+	}
+	metadata := selection.artifact.public()
+	if command.UpgradeSpec == nil || command.UpgradeSpec.ArtifactID != payload.ArtifactID ||
+		command.UpgradeSpec.ExpectedCurrentVersion != payload.CurrentVersion ||
+		agent.Version != payload.CurrentVersion || agent.WorkerType != payload.WorkerType ||
+		agent.Platform != payload.Platform || agent.Architecture != payload.Architecture ||
+		agent.ProtocolVersion != payload.ProtocolVersion ||
+		metadata.ID != payload.ArtifactID || metadata.Version != payload.TargetVersion ||
+		metadata.Revision != payload.Revision || metadata.Channel != payload.Channel ||
+		metadata.Size != payload.Size || metadata.SHA256 != payload.SHA256 ||
+		metadata.WorkerType != payload.WorkerType || metadata.Platform != payload.Platform ||
+		metadata.Architecture != payload.Architecture || metadata.ProtocolVersion != payload.ProtocolVersion {
+		writeHTTPError(w, http.StatusConflict, "source agent update guard denied")
+		return
+	}
+	activeRun, err := h.sourceSync.sourceAgentHasActiveRun(agentID)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "source agent update guard unavailable")
+		return
+	}
+	if activeRun {
+		writeHTTPError(w, http.StatusConflict, "source agent update guard denied")
+		return
+	}
+	expiresAt, err := time.Parse(time.RFC3339Nano, command.ExpiresAt)
+	minimumRemaining := sourceAgentUpdateDefaultRestartTimeout + sourceAgentUpdateDefaultTimeout +
+		sourceAgentUpdateGuardReconciliationWindow + sourceAgentUpdateGuardSafetyMargin
+	if err != nil || expiresAt.Sub(h.sourceSync.now().UTC()) < minimumRemaining {
+		writeHTTPError(w, http.StatusConflict, "source agent update guard denied")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWriter, r *http.Request) {
@@ -3720,7 +3802,17 @@ func (h *kbaseHTTPHandler) handleSourceAgentArtifactDownload(w http.ResponseWrit
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "private, no-store")
 	w.Header().Set("Content-Length", strconv.FormatInt(metadata.Size, 10))
-	w.Header().Set("X-Source-Agent-Artifact-SHA256", metadata.SHA256)
+	w.Header().Set(sourceAgentHeaderCommandID, command.ID)
+	w.Header().Set(sourceAgentHeaderArtifactID, metadata.ID)
+	w.Header().Set(sourceAgentHeaderArtifactVersion, metadata.Version)
+	w.Header().Set(sourceAgentHeaderArtifactWorkerType, metadata.WorkerType)
+	w.Header().Set(sourceAgentHeaderArtifactPlatform, metadata.Platform)
+	w.Header().Set(sourceAgentHeaderArtifactArch, metadata.Architecture)
+	w.Header().Set(sourceAgentHeaderArtifactProtocol, metadata.ProtocolVersion)
+	w.Header().Set(sourceAgentHeaderArtifactRevision, metadata.Revision)
+	w.Header().Set(sourceAgentHeaderArtifactChannel, metadata.Channel)
+	w.Header().Set(sourceAgentHeaderArtifactSize, strconv.FormatInt(metadata.Size, 10))
+	w.Header().Set(sourceAgentHeaderArtifactSHA256, metadata.SHA256)
 	w.WriteHeader(http.StatusOK)
 	written, err := copySourceAgentArtifactWithContext(r.Context(), w, snapshot.file)
 	if err != nil || written != metadata.Size {

@@ -84,6 +84,7 @@ func isSourceAgentUpdatePublishedError(err error) bool {
 // never accepted directly from a SourceAgentCommand or another remote payload.
 type SourceAgentUpdateRequest struct {
 	CommandID      string
+	ArtifactID     string
 	WorkerType     string
 	CurrentVersion string
 	TargetVersion  string
@@ -117,11 +118,18 @@ type SourceAgentUpdateResult struct {
 }
 
 type SourceAgentUpdateGuardCheck struct {
-	CommandID  string
-	WorkerType string
-	Version    string
-	Revision   string
-	Channel    string
+	CommandID       string
+	ArtifactID      string
+	WorkerType      string
+	CurrentVersion  string
+	Version         string
+	Revision        string
+	Channel         string
+	Size            int64
+	SHA256          string
+	Platform        string
+	Architecture    string
+	ProtocolVersion string
 }
 
 type SourceAgentUpdateGuard interface {
@@ -486,8 +494,12 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false)
 	}
 	guardCheck := SourceAgentUpdateGuardCheck{
-		CommandID: request.CommandID, WorkerType: request.WorkerType,
+		CommandID: request.CommandID, ArtifactID: request.ArtifactID,
+		WorkerType: request.WorkerType, CurrentVersion: request.CurrentVersion,
 		Version: request.TargetVersion, Revision: request.Revision, Channel: request.Channel,
+		Size: request.ExpectedSize, SHA256: request.ExpectedSHA256,
+		Platform: request.Platform, Architecture: request.Architecture,
+		ProtocolVersion: request.ProtocolVersion,
 	}
 	if ctx.Err() != nil {
 		return u.failBeforeReplace(started, request, journal, "", "", SourceAgentUpdateCodeCanceled)
@@ -900,7 +912,9 @@ func (u *SourceAgentUpdateTransaction) advanceJournal(journal sourceAgentUpdateJ
 
 func (u *SourceAgentUpdateTransaction) validateRequest(request SourceAgentUpdateRequest) string {
 	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", request.CommandID, true)
-	if err != nil || commandID != request.CommandID || request.WorkerType != u.config.WorkerType ||
+	artifactID, artifactErr := normalizeSourceAgentCommandIdentifier("artifact_id", request.ArtifactID, true)
+	if err != nil || commandID != request.CommandID || artifactErr != nil || artifactID != request.ArtifactID ||
+		artifactID == "." || artifactID == ".." || request.WorkerType != u.config.WorkerType ||
 		request.Platform != u.config.Platform || request.Architecture != u.config.Architecture ||
 		request.ProtocolVersion != u.config.ProtocolVersion || !isExactSourceAgentProtocolVersion(request.ProtocolVersion) ||
 		request.CurrentVersion != u.config.CurrentVersion || !isSourceAgentArtifactVersion(request.CurrentVersion) ||
@@ -987,10 +1001,11 @@ func sourceAgentUpdateTerminalNeedsRecovery(result SourceAgentUpdateResult, jour
 }
 
 // The local staged path is intentionally excluded: the artifact identity is
-// the verified revision, target, byte size, and SHA-256, not a mutable path.
+// the catalog ID, verified revision, target, byte size, and SHA-256, not a
+// mutable path.
 func sourceAgentUpdateRequestFingerprint(request SourceAgentUpdateRequest) string {
-	canonical := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
-		request.CommandID, request.WorkerType, request.CurrentVersion, request.TargetVersion,
+	canonical := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%s\x00%s\x00%s\x00%s\x00%s",
+		request.CommandID, request.ArtifactID, request.WorkerType, request.CurrentVersion, request.TargetVersion,
 		request.ExpectedSHA256, request.ExpectedSize, request.Platform, request.Architecture,
 		request.ProtocolVersion, request.Revision, request.Channel)
 	digest := sha256.Sum256([]byte(canonical))

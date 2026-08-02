@@ -3,13 +3,16 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,6 +20,21 @@ import (
 const defaultWCPlusAgentBaseURL = "http://127.0.0.1:5001"
 const sourceAgentClientResponseMaxBytes int64 = 2 << 20
 const invalidSourceAgentCommandResponse = "invalid source agent command response"
+const invalidSourceAgentArtifactResponse = "invalid source agent artifact response"
+
+const (
+	sourceAgentHeaderCommandID          = "X-Source-Agent-Command-ID"
+	sourceAgentHeaderArtifactID         = "X-Source-Agent-Artifact-ID"
+	sourceAgentHeaderArtifactVersion    = "X-Source-Agent-Artifact-Version"
+	sourceAgentHeaderArtifactWorkerType = "X-Source-Agent-Artifact-Worker-Type"
+	sourceAgentHeaderArtifactPlatform   = "X-Source-Agent-Artifact-Platform"
+	sourceAgentHeaderArtifactArch       = "X-Source-Agent-Artifact-Architecture"
+	sourceAgentHeaderArtifactProtocol   = "X-Source-Agent-Artifact-Protocol-Version"
+	sourceAgentHeaderArtifactRevision   = "X-Source-Agent-Artifact-Revision"
+	sourceAgentHeaderArtifactChannel    = "X-Source-Agent-Artifact-Channel"
+	sourceAgentHeaderArtifactSize       = "X-Source-Agent-Artifact-Size"
+	sourceAgentHeaderArtifactSHA256     = "X-Source-Agent-Artifact-SHA256"
+)
 
 type SourceAgentConfig struct {
 	RemoteURL     string
@@ -122,6 +140,17 @@ type SourceAgentHTTPError struct {
 	Path       string
 	StatusCode int
 }
+
+type SourceAgentTransportError struct {
+	Method string
+	Path   string
+}
+
+func (e *SourceAgentTransportError) Error() string {
+	return fmt.Sprintf("source agent request %s %s failed", e.Method, e.Path)
+}
+
+func (e *SourceAgentTransportError) Retryable() bool { return e != nil }
 
 func (e *SourceAgentHTTPError) Error() string {
 	return fmt.Sprintf("source agent request %s %s failed with HTTP %d", e.Method, e.Path, e.StatusCode)
@@ -267,6 +296,203 @@ func (c *SourceAgentClient) ReportCommand(
 		return SourceAgentCommand{}, fmt.Errorf(invalidSourceAgentCommandResponse)
 	}
 	return *command, nil
+}
+
+func (c *SourceAgentClient) DownloadArtifact(
+	ctx context.Context,
+	command SourceAgentCommand,
+	target SourceAgentArtifactTarget,
+	protocolVersion string,
+) (SourceAgentArtifactPublic, io.ReadCloser, error) {
+	if command.Type != SourceAgentCommandUpgrade || command.UpgradeSpec == nil || command.TargetAgentID != c.agentID ||
+		(command.State != SourceAgentCommandClaimed && command.State != SourceAgentCommandDownloading) ||
+		!validSourceAgentUpgradeHandoff(command) {
+		return SourceAgentArtifactPublic{}, nil, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", command.ID, true)
+	if err != nil || commandID != command.ID {
+		return SourceAgentArtifactPublic{}, nil, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+	artifactID, err := normalizeSourceAgentCommandIdentifier("artifact_id", command.UpgradeSpec.ArtifactID, true)
+	if err != nil || artifactID != command.UpgradeSpec.ArtifactID ||
+		target.CurrentVersion != command.UpgradeSpec.ExpectedCurrentVersion ||
+		target.CurrentVersion != command.ExpectedCurrentVersion ||
+		!isExactSourceAgentArtifactName("worker_type", target.WorkerType) ||
+		!isExactSourceAgentArtifactName("platform", target.Platform) ||
+		!isExactSourceAgentArtifactName("architecture", target.Architecture) ||
+		!isSourceAgentArtifactVersion(target.CurrentVersion) ||
+		!isExactSourceAgentProtocolVersion(protocolVersion) {
+		return SourceAgentArtifactPublic{}, nil, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+
+	requestPath := "/api/source-agent/artifacts/" + url.PathEscape(artifactID) + "/download"
+	endpoint, err := c.endpointForRequestPath(requestPath)
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	query := endpoint.Query()
+	query.Set("agent_id", c.agentID)
+	query.Set("command_id", commandID)
+	endpoint.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	requestClient := *c.client
+	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := requestClient.Do(req)
+	if err != nil {
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_ = resp.Body.Close()
+		return SourceAgentArtifactPublic{}, nil, &SourceAgentHTTPError{Method: http.MethodGet, Path: requestPath, StatusCode: resp.StatusCode}
+	}
+	metadata, err := parseSourceAgentArtifactResponse(resp, commandID, artifactID, target, protocolVersion)
+	if err != nil {
+		_ = resp.Body.Close()
+		return SourceAgentArtifactPublic{}, nil, err
+	}
+	return metadata, &sourceAgentBoundedArtifactBody{
+		Reader: io.LimitReader(resp.Body, metadata.Size+1),
+		Closer: resp.Body,
+	}, nil
+}
+
+type sourceAgentBoundedArtifactBody struct {
+	io.Reader
+	io.Closer
+}
+
+func parseSourceAgentArtifactResponse(
+	response *http.Response,
+	commandID, artifactID string,
+	target SourceAgentArtifactTarget,
+	protocolVersion string,
+) (SourceAgentArtifactPublic, error) {
+	if response == nil || response.Body == nil || response.Uncompressed || response.ContentLength <= 0 ||
+		response.Header.Get("Content-Encoding") != "" {
+		return SourceAgentArtifactPublic{}, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+	contentType, ok := exactSourceAgentResponseHeader(response.Header, "Content-Type")
+	if !ok || contentType != "application/octet-stream" {
+		return SourceAgentArtifactPublic{}, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+	for _, forbidden := range []string{
+		"X-Source-Agent-Artifact-URL", "X-Source-Agent-Path", "X-Source-Agent-Updater-Path",
+		"X-Source-Agent-Executable-Path", "X-Source-Agent-State-Path", "X-Source-Agent-Command-Line",
+		"X-Source-Agent-Shell", "X-Source-Agent-Script", "X-Source-Agent-Environment",
+		"X-Source-Agent-LaunchAgent-Label", "X-Source-Agent-Token",
+	} {
+		if len(response.Header.Values(forbidden)) != 0 {
+			return SourceAgentArtifactPublic{}, fmt.Errorf(invalidSourceAgentArtifactResponse)
+		}
+	}
+	values := make(map[string]string, 11)
+	for _, name := range []string{
+		sourceAgentHeaderCommandID, sourceAgentHeaderArtifactID, sourceAgentHeaderArtifactVersion,
+		sourceAgentHeaderArtifactWorkerType, sourceAgentHeaderArtifactPlatform, sourceAgentHeaderArtifactArch,
+		sourceAgentHeaderArtifactProtocol, sourceAgentHeaderArtifactRevision, sourceAgentHeaderArtifactChannel,
+		sourceAgentHeaderArtifactSize, sourceAgentHeaderArtifactSHA256,
+	} {
+		value, exact := exactSourceAgentResponseHeader(response.Header, name)
+		if !exact {
+			return SourceAgentArtifactPublic{}, fmt.Errorf(invalidSourceAgentArtifactResponse)
+		}
+		values[name] = value
+	}
+	size, err := strconv.ParseInt(values[sourceAgentHeaderArtifactSize], 10, 64)
+	if err != nil || strconv.FormatInt(size, 10) != values[sourceAgentHeaderArtifactSize] ||
+		size <= 0 || size > sourceAgentArtifactMaxBytes || response.ContentLength != size {
+		return SourceAgentArtifactPublic{}, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+	metadata := SourceAgentArtifactPublic{
+		ID: values[sourceAgentHeaderArtifactID], WorkerType: values[sourceAgentHeaderArtifactWorkerType],
+		Platform: values[sourceAgentHeaderArtifactPlatform], Architecture: values[sourceAgentHeaderArtifactArch],
+		Revision: values[sourceAgentHeaderArtifactRevision], Version: values[sourceAgentHeaderArtifactVersion],
+		ProtocolVersion: values[sourceAgentHeaderArtifactProtocol], Channel: values[sourceAgentHeaderArtifactChannel],
+		Size: size, SHA256: values[sourceAgentHeaderArtifactSHA256],
+	}
+	if values[sourceAgentHeaderCommandID] != commandID || metadata.ID != artifactID ||
+		!isExactSourceAgentArtifactName("artifact_id", metadata.ID) || metadata.ID == "." || metadata.ID == ".." ||
+		metadata.WorkerType != target.WorkerType || metadata.Platform != target.Platform || metadata.Architecture != target.Architecture ||
+		metadata.ProtocolVersion != protocolVersion || !isSourceAgentArtifactVersion(metadata.Version) ||
+		compareSourceAgentArtifactVersions(target.CurrentVersion, metadata.Version) >= 0 ||
+		(!isExactLowerHex(metadata.Revision, 40) && !isExactLowerHex(metadata.Revision, 64)) ||
+		(metadata.Channel != "staging" && metadata.Channel != "production") ||
+		!isExactLowerHex(metadata.SHA256, sha256.Size*2) {
+		return SourceAgentArtifactPublic{}, fmt.Errorf(invalidSourceAgentArtifactResponse)
+	}
+	return metadata, nil
+}
+
+func exactSourceAgentResponseHeader(header http.Header, name string) (string, bool) {
+	values := header.Values(name)
+	if len(values) != 1 || values[0] == "" || values[0] != strings.TrimSpace(values[0]) {
+		return "", false
+	}
+	return values[0], true
+}
+
+func (c *SourceAgentClient) Check(ctx context.Context, check SourceAgentUpdateGuardCheck) error {
+	if !validSourceAgentUpdateGuardCheck(check) {
+		return fmt.Errorf("invalid source agent update guard request")
+	}
+	payload := struct {
+		AgentID         string `json:"agent_id"`
+		ArtifactID      string `json:"artifact_id"`
+		CurrentVersion  string `json:"current_version"`
+		TargetVersion   string `json:"target_version"`
+		Revision        string `json:"revision"`
+		Channel         string `json:"channel"`
+		Size            int64  `json:"size"`
+		SHA256          string `json:"sha256"`
+		WorkerType      string `json:"worker_type"`
+		Platform        string `json:"platform"`
+		Architecture    string `json:"architecture"`
+		ProtocolVersion string `json:"protocol_version"`
+	}{
+		AgentID: c.agentID, ArtifactID: check.ArtifactID,
+		CurrentVersion: check.CurrentVersion, TargetVersion: check.Version,
+		Revision: check.Revision, Channel: check.Channel, Size: check.Size, SHA256: check.SHA256,
+		WorkerType: check.WorkerType, Platform: check.Platform, Architecture: check.Architecture,
+		ProtocolVersion: check.ProtocolVersion,
+	}
+	requestPath := "/api/source-agent/commands/" + url.PathEscape(check.CommandID) + "/guard"
+	err := c.doJSON(ctx, http.MethodPost, requestPath, payload, nil)
+	if err == nil {
+		return nil
+	}
+	var httpError *SourceAgentHTTPError
+	if errors.As(err, &httpError) {
+		return err
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	return &SourceAgentTransportError{Method: http.MethodPost, Path: requestPath}
+}
+
+func validSourceAgentUpdateGuardCheck(check SourceAgentUpdateGuardCheck) bool {
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", check.CommandID, true)
+	if err != nil || commandID != check.CommandID {
+		return false
+	}
+	artifactID, err := normalizeSourceAgentCommandIdentifier("artifact_id", check.ArtifactID, true)
+	return err == nil && artifactID == check.ArtifactID &&
+		isAllowedSourceAgentUpdateWorkerType(check.WorkerType) &&
+		isSourceAgentArtifactVersion(check.CurrentVersion) && isSourceAgentArtifactVersion(check.Version) &&
+		compareSourceAgentArtifactVersions(check.CurrentVersion, check.Version) < 0 &&
+		(isExactLowerHex(check.Revision, 40) || isExactLowerHex(check.Revision, 64)) &&
+		(check.Channel == "staging" || check.Channel == "production") &&
+		check.Size > 0 && check.Size <= sourceAgentArtifactMaxBytes &&
+		isExactLowerHex(check.SHA256, sha256.Size*2) &&
+		isExactSourceAgentArtifactName("platform", check.Platform) &&
+		isExactSourceAgentArtifactName("architecture", check.Architecture) &&
+		isExactSourceAgentProtocolVersion(check.ProtocolVersion)
 }
 
 func decodeSourceAgentCommandResponse(raw json.RawMessage, allowNull bool) (*SourceAgentCommand, error) {

@@ -738,7 +738,7 @@ func newDurableSourceAgentUpdateFixture(t *testing.T, faultStage string) durable
 	}
 	digest := sha256.Sum256(newBinary)
 	request := SourceAgentUpdateRequest{
-		CommandID: "command-1", WorkerType: "wechat-worker", CurrentVersion: "1.0.0", TargetVersion: "2.0.0",
+		CommandID: "command-1", ArtifactID: "artifact-1", WorkerType: "wechat-worker", CurrentVersion: "1.0.0", TargetVersion: "2.0.0",
 		ExpectedSHA256: fmt.Sprintf("%x", digest), ExpectedSize: int64(len(newBinary)), StagedBinary: staged,
 		Platform: runtime.GOOS, Architecture: runtime.GOARCH, ProtocolVersion: "2026-08-01",
 		Revision: sourceAgentUpdateTestRevision, Channel: "staging",

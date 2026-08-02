@@ -320,6 +320,23 @@ func (s *SourceSyncStore) GetSourceAgentCommand(commandID string) (SourceAgentCo
 	return command, err
 }
 
+func (s *SourceSyncStore) sourceAgentHasActiveRun(agentID string) (bool, error) {
+	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
+	if err != nil {
+		return false, err
+	}
+	var active int
+	err = s.db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM source_sync_runs
+			WHERE lease_owner = ? AND status IN (?, ?)
+				AND lease_expires_at != ''
+				AND julianday(lease_expires_at) > julianday(?)
+		)
+	`, agentID, SourceRunLeased, SourceRunRunning, s.timestamp()).Scan(&active)
+	return active == 1, err
+}
+
 func (s *SourceSyncStore) ListSourceAgentCommands(agentID string, limit int) ([]SourceAgentCommand, error) {
 	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
 	if err != nil {
