@@ -36,6 +36,7 @@ if [[ -n "${KBASE_AUTH_TOKEN:-}" && "$KBASE_AUTH_TOKEN" == "$KBASE_SOURCE_AGENT_
   echo "admin and source-agent tokens must differ" >&2
   exit 2
 fi
+unset transport_token
 transport_token="$KBASE_SOURCE_AGENT_TOKEN"
 unset KBASE_SOURCE_AGENT_TOKEN
 

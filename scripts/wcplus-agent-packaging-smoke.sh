@@ -138,7 +138,7 @@ mkdir -p "$tmp_dir/home" "$tmp_dir/bin" "$tmp_dir/probe-bin"
 cat >"$tmp_dir/probe-bin/dirname" <<'PROBE'
 #!/bin/bash
 set -euo pipefail
-if [[ -n "${KBASE_SOURCE_AGENT_TOKEN+x}" ]]; then
+if [[ -n "${KBASE_SOURCE_AGENT_TOKEN+x}" || -n "${transport_token+x}" ]]; then
   printf 'leaked\n' >"${PROBE_CAPTURE:?}"
   exit 91
 fi
@@ -150,6 +150,7 @@ cat >"$tmp_dir/bin/source-agent-updater" <<'UPDATER'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ -z "${KBASE_SOURCE_AGENT_TOKEN+x}" ]]
+[[ -z "${transport_token+x}" ]]
 printf '%s\n' "$*" >"${UPDATER_CAPTURE:?}"
 [[ "$*" == "--check --worker-type wcplus-worker" ]]
 UPDATER
@@ -178,6 +179,7 @@ done
 token_sentinel='agent<&>secret-sentinel'
 plist_fixture="$tmp_dir/wcplus-agent.plist"
 env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+  transport_token="preexisting-export" \
   KBASE_REMOTE_URL="https://kbase.example.invalid" \
   KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
   KBASE_SOURCE_AGENT_TOKEN="$token_sentinel" \
@@ -246,6 +248,7 @@ printf 'old-plist' >"$installed_plist"
 rm -f "$tmp_dir/install-second-publish-failed" "$tmp_dir/launchctl-called"
 set +e
 env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+  transport_token="preexisting-export" \
   KBASE_REMOTE_URL="https://kbase.example.invalid" \
   KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
   KBASE_SOURCE_AGENT_TOKEN="$token_sentinel" \
