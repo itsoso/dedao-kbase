@@ -287,7 +287,10 @@ _managed_worker_install_delete_keychain_account() {
 }
 
 _managed_worker_install_write_keychain_value() {
-  local account="$1" value="$2"
+  local account="$1"
+  local value
+  declare +x value
+  value="$2"
   _managed_worker_install_valid_secret "$value" || return 1
   printf '%s\n%s\n' "$value" "$value" | _managed_worker_install_security add-generic-password -U \
     -s "$MANAGED_WORKER_INSTALL_KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1

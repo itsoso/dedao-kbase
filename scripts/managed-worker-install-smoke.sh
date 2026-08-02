@@ -201,6 +201,9 @@ set -euo pipefail
 if [[ -n "${SECURITY_ENV_CAPTURE:-}" && -n "${MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE+x}" ]]; then
   printf 'present:%s\n' "$MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE" >>"$SECURITY_ENV_CAPTURE"
 fi
+if [[ -n "${SECURITY_ENV_CAPTURE:-}" && -n "${value+x}" ]]; then
+  printf 'value-present:%s\n' "$value" >>"$SECURITY_ENV_CAPTURE"
+fi
 operation="${1:?}"
 shift
 account=""
@@ -328,6 +331,9 @@ case "${MODE:?}" in
     begin_transaction
     managed_worker_install_rollback
     ;;
+  direct-write)
+    _managed_worker_install_write_keychain_value transport-token old-keychain-token
+    ;;
   recover)
     begin_transaction
     managed_worker_install_rollback
@@ -441,6 +447,24 @@ if [[ -e "$security_env_capture" ]]; then
 fi
 assert_old_transaction
 assert_transaction_clean
+
+reset_transaction
+security_env_capture="$tmp_dir/security-value-env-capture"
+export SECURITY_ENV_CAPTURE="$security_env_capture"
+export value="caller-preexported-value"
+set +e
+run_transaction direct-write >/dev/null 2>&1
+preexport_value_status=$?
+set -e
+unset SECURITY_ENV_CAPTURE value
+if [[ $preexport_value_status -ne 0 ]]; then
+  echo "managed install preexported value regression fixture exited $preexport_value_status" >&2
+  exit 1
+fi
+if [[ ! -f "$security_env_capture" || "$(<"$security_env_capture")" != "value-present:caller-preexported-value" ]]; then
+  echo "managed install exposed a local Keychain secret through an inherited export attribute" >&2
+  exit 1
+fi
 
 reset_transaction
 set +e
