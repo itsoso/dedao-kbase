@@ -325,21 +325,36 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		if !sourceAgentUpdateOutcomeMatches(previous, request) {
 			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, sourceAgentUpdateCodeInvalidRequest, false)
 		}
-		if journalErr != nil || (journalFound && !sourceAgentUpdateJournalMatches(journal, request)) {
-			return u.recoverUnboundBackup(ctx, started, request)
-		}
-		if journalFound && previous.Outcome != SourceAgentUpdateOutcomeSucceeded && !previous.BinaryRestored {
-			if recovered, done := u.recoverInterrupted(ctx, started, request, journal); done {
-				return recovered
-			}
-		}
-		if journalFound {
-			u.cleanupDurableAttempt(journal)
-		}
-		return previous
 	}
 	if journalErr != nil {
 		return u.recoverUnboundBackup(ctx, started, request)
+	}
+	if journalFound {
+		terminal, terminalFound, terminalErr := u.loadJournalOutcome(journal, previous, outcomeFound, request.CommandID)
+		if terminalErr != nil {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+		}
+		if terminalFound {
+			if !sourceAgentUpdateOutcomeMatchesJournal(terminal, journal) {
+				return u.recoverUnboundBackup(ctx, started, request)
+			}
+			var cleanupErr error
+			if sourceAgentUpdateTerminalNeedsRecovery(terminal, journal) {
+				cleanupErr = u.recoverDurableTerminal(ctx, journal)
+			} else {
+				cleanupErr = u.cleanupDurableAttempt(journal)
+			}
+			if sourceAgentUpdateJournalMatches(journal, request) {
+				return terminal
+			}
+			if cleanupErr != nil {
+				return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+			}
+			journalFound = false
+		}
+	}
+	if outcomeFound {
+		return previous
 	}
 	if journalFound {
 		if recovered, done := u.recoverInterrupted(ctx, started, request, journal); done {
@@ -491,8 +506,50 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		_ = persisted
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
-	u.cleanupDurableAttempt(journal)
+	if err := u.finalizeDurableOutcome(journal); err != nil {
+		return succeeded
+	}
 	return succeeded
+}
+
+func (u *SourceAgentUpdateTransaction) loadJournalOutcome(
+	journal sourceAgentUpdateJournal,
+	current SourceAgentUpdateResult,
+	currentFound bool,
+	currentCommandID string,
+) (SourceAgentUpdateResult, bool, error) {
+	if currentFound && journal.CommandID == currentCommandID {
+		return current, true, nil
+	}
+	return u.receipts.LoadOutcome(journal.CommandID)
+}
+
+func (u *SourceAgentUpdateTransaction) recoverDurableTerminal(ctx context.Context, journal sourceAgentUpdateJournal) error {
+	backupPath := filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName())
+	backupExists, err := u.fs.RegularFileExists(backupPath)
+	if err != nil || !backupExists {
+		return errors.New("durable updater recovery backup is unavailable")
+	}
+	if !validSourceAgentBinaryIdentity(journal.Backup) {
+		journal.Backup, err = u.fs.RegularFileIdentity(backupPath)
+		if err != nil {
+			return err
+		}
+	}
+	if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, journal.AttemptNonce, journal.Backup); err != nil {
+		return err
+	}
+	if err := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable)); err != nil {
+		return err
+	}
+	if err := u.process.Restart(context.WithoutCancel(ctx)); err != nil {
+		return err
+	}
+	journal = u.advanceJournal(journal, "terminal_cleanup")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return err
+	}
+	return u.cleanupDurableAttempt(journal)
 }
 
 func (u *SourceAgentUpdateTransaction) recoverUnboundBackup(ctx context.Context, started time.Time, request SourceAgentUpdateRequest) SourceAgentUpdateResult {
@@ -528,16 +585,15 @@ func (u *SourceAgentUpdateTransaction) rollback(
 	restartErr := u.process.Restart(ctx)
 	if syncErr != nil || journalErr != nil || restartErr != nil {
 		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, true)
-		persisted, durable := u.persistOutcome(result)
-		if durable {
-			u.cleanupDurableAttempt(journal)
-		}
+		persisted, _ := u.persistOutcome(result)
 		return persisted
 	}
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
 	persisted, durable := u.persistOutcome(result)
 	if durable {
-		u.cleanupDurableAttempt(journal)
+		if err := u.finalizeDurableOutcome(journal); err != nil {
+			return persisted
+		}
 	}
 	return persisted
 }
@@ -564,18 +620,33 @@ func (u *SourceAgentUpdateTransaction) finishResult(started time.Time, request S
 }
 
 func (u *SourceAgentUpdateTransaction) failBeforeReplace(started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal, preparedPath, backupPath, code string) SourceAgentUpdateResult {
-	if preparedPath != "" {
-		_ = u.fs.Remove(preparedPath)
-	}
-	if backupPath != "" {
-		_ = u.fs.Remove(backupPath)
-	}
-	_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName()))
-	_ = u.fs.SyncDirectory(u.config.BackupRoot)
-	_ = u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
+	cleanupErr := u.cleanupBeforeReplace(journal, preparedPath, backupPath)
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
 	persisted, _ := u.persistOutcome(result)
+	if cleanupErr != nil {
+		return persisted
+	}
 	return persisted
+}
+
+func (u *SourceAgentUpdateTransaction) cleanupBeforeReplace(journal sourceAgentUpdateJournal, preparedPath, backupPath string) error {
+	if preparedPath != "" {
+		if err := u.fs.Remove(preparedPath); err != nil {
+			return err
+		}
+	}
+	if backupPath != "" {
+		if err := u.fs.Remove(backupPath); err != nil {
+			return err
+		}
+	}
+	if err := u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName())); err != nil {
+		return err
+	}
+	if err := u.fs.SyncDirectory(u.config.BackupRoot); err != nil {
+		return err
+	}
+	return u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
 }
 
 func (u *SourceAgentUpdateTransaction) recoverInterrupted(ctx context.Context, started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal) (SourceAgentUpdateResult, bool) {
@@ -620,17 +691,35 @@ func (u *SourceAgentUpdateTransaction) recoverInterrupted(ctx context.Context, s
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
 	persisted, durable := u.persistOutcome(result)
 	if durable {
-		u.cleanupDurableAttempt(journal)
+		if err := u.finalizeDurableOutcome(journal); err != nil {
+			return persisted, true
+		}
 	}
 	return persisted, true
 }
 
-func (u *SourceAgentUpdateTransaction) cleanupDurableAttempt(journal sourceAgentUpdateJournal) {
-	_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName()))
-	_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName()))
-	_ = u.fs.Remove(sourceAgentUpdatePreparedPath(u.config.CurrentExecutable, journal.AttemptNonce))
-	_ = u.fs.SyncDirectory(u.config.BackupRoot)
-	_ = u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
+func (u *SourceAgentUpdateTransaction) finalizeDurableOutcome(journal sourceAgentUpdateJournal) error {
+	journal = u.advanceJournal(journal, "terminal_cleanup")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return err
+	}
+	return u.cleanupDurableAttempt(journal)
+}
+
+func (u *SourceAgentUpdateTransaction) cleanupDurableAttempt(journal sourceAgentUpdateJournal) error {
+	if err := u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName())); err != nil {
+		return err
+	}
+	if err := u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName())); err != nil {
+		return err
+	}
+	if err := u.fs.Remove(sourceAgentUpdatePreparedPath(u.config.CurrentExecutable, journal.AttemptNonce)); err != nil {
+		return err
+	}
+	if err := u.fs.SyncDirectory(u.config.BackupRoot); err != nil {
+		return err
+	}
+	return u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
 }
 
 func (u *SourceAgentUpdateTransaction) newJournal(request SourceAgentUpdateRequest, nonce, stage string) sourceAgentUpdateJournal {
@@ -686,6 +775,20 @@ func sourceAgentUpdateOutcomeMatches(result SourceAgentUpdateResult, request Sou
 			result.Outcome == SourceAgentUpdateOutcomeFailed)
 }
 
+func sourceAgentUpdateOutcomeMatchesJournal(result SourceAgentUpdateResult, journal sourceAgentUpdateJournal) bool {
+	return validSourceAgentUpdateResult(result) && validSourceAgentUpdateJournal(journal) &&
+		result.CommandID == journal.CommandID && result.RequestFingerprint == journal.RequestFingerprint &&
+		result.WorkerType == journal.WorkerType && result.Platform == journal.Platform &&
+		result.Architecture == journal.Architecture && result.Channel == journal.Channel &&
+		result.ProtocolVersion == journal.ProtocolVersion && result.Revision == journal.Revision &&
+		(result.RuntimeVersion == journal.CurrentVersion || result.RuntimeVersion == journal.TargetVersion)
+}
+
+func sourceAgentUpdateTerminalNeedsRecovery(result SourceAgentUpdateResult, journal sourceAgentUpdateJournal) bool {
+	return result.Outcome == SourceAgentUpdateOutcomeFailed && result.Code == SourceAgentCommandCodeRollbackFailed &&
+		journal.Stage != "terminal_cleanup"
+}
+
 // The local staged path is intentionally excluded: the artifact identity is
 // the verified revision, target, byte size, and SHA-256, not a mutable path.
 func sourceAgentUpdateRequestFingerprint(request SourceAgentUpdateRequest) string {
@@ -734,7 +837,8 @@ func validSourceAgentUpdateJournal(journal sourceAgentUpdateJournal) bool {
 		return false
 	}
 	allowedStages := map[string]struct{}{
-		"started": {}, "backup_durable": {}, "replaced": {}, "restarted": {}, "ready": {}, "rollback_restored": {},
+		"started": {}, "backup_durable": {}, "replaced": {}, "restarted": {}, "ready": {},
+		"rollback_restored": {}, "terminal_cleanup": {},
 	}
 	if _, ok := allowedStages[journal.Stage]; !ok {
 		return false

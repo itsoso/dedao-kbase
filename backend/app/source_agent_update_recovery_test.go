@@ -157,6 +157,119 @@ func TestSourceAgentUpdateRecoveryCleansIncompleteBackupPublish(t *testing.T) {
 	}
 }
 
+func TestSourceAgentUpdateSuccessCleanupFailureCannotBecomeOrphanRollback(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.fs.backupRemoveFailures = 1
+	first := fixture.transaction.Apply(context.Background(), fixture.request)
+	if first.Outcome != SourceAgentUpdateOutcomeSucceeded {
+		t.Fatalf("first=%#v", first)
+	}
+	if !fixture.receipts.journalFound {
+		t.Fatal("cleanup failure cleared the journal")
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+
+	next := fixture.request
+	next.CommandID = "command-2"
+	next.TargetVersion = "3.0.0"
+	fixture.guard.failCall = fixture.guard.calls + 1
+	replayed := fixture.transaction.Apply(context.Background(), next)
+	if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("cleanup-only state was treated as recovery: %#v", replayed)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+	if fixture.process.calls != 1 {
+		t.Fatalf("unexpected old-version restart count=%d", fixture.process.calls)
+	}
+}
+
+func TestSourceAgentUpdateRollbackSyncFailureRetainsRecoveryStateUntilReplay(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.receipts.waitErr = ErrSourceAgentReadyTimeout
+	fixture.fs.dirSyncFrom = 4
+	first := fixture.transaction.Apply(context.Background(), fixture.request)
+	if first.Code != SourceAgentCommandCodeRollbackFailed || !first.BinaryRestored {
+		t.Fatalf("first=%#v", first)
+	}
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if !fixture.receipts.journalFound {
+		t.Fatal("rollback sync failure cleared the journal")
+	}
+
+	fixture.fs.dirSyncFrom = 0
+	fixture.receipts.waitErr = nil
+	retry, err := NewSourceAgentUpdateTransaction(fixture.transaction.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := retry.Apply(context.Background(), fixture.request)
+	if recovered != first {
+		t.Fatalf("terminal outcome changed: recovered=%#v first=%#v", recovered, first)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup remains after successful recovery replay: %v", err)
+	}
+	if fixture.receipts.journalFound {
+		t.Fatal("journal remains after successful recovery replay")
+	}
+}
+
+func TestSourceAgentUpdateJournalClearFailureRemainsCleanupOnly(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.receipts.clearErr = errors.New("private journal cleanup path")
+	first := fixture.transaction.Apply(context.Background(), fixture.request)
+	if first.Outcome != SourceAgentUpdateOutcomeSucceeded || !fixture.receipts.journalFound {
+		t.Fatalf("first=%#v journal=%v", first, fixture.receipts.journalFound)
+	}
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup should already be durably removed: %v", err)
+	}
+
+	fixture.receipts.clearErr = nil
+	next := fixture.request
+	next.CommandID = "command-2"
+	next.TargetVersion = "3.0.0"
+	fixture.guard.failCall = fixture.guard.calls + 1
+	replayed := fixture.transaction.Apply(context.Background(), next)
+	if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("cleanup-only journal was treated as recovery: %#v", replayed)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+	if fixture.process.calls != 1 || fixture.receipts.journalFound {
+		t.Fatalf("process=%d journal=%v", fixture.process.calls, fixture.receipts.journalFound)
+	}
+}
+
+func TestSourceAgentUpdateSuccessCleanupSyncFailureRemainsCleanupOnly(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.fs.dirSyncFrom = 4
+	first := fixture.transaction.Apply(context.Background(), fixture.request)
+	if first.Outcome != SourceAgentUpdateOutcomeSucceeded || !fixture.receipts.journalFound {
+		t.Fatalf("first=%#v journal=%v", first, fixture.receipts.journalFound)
+	}
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup should be removed before cleanup fsync: %v", err)
+	}
+
+	fixture.fs.dirSyncFrom = 0
+	next := fixture.request
+	next.CommandID = "command-2"
+	next.TargetVersion = "3.0.0"
+	fixture.guard.failCall = fixture.guard.calls + 1
+	replayed := fixture.transaction.Apply(context.Background(), next)
+	if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("cleanup-only fsync retry was treated as recovery: %#v", replayed)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+	if fixture.process.calls != 1 || fixture.receipts.journalFound {
+		t.Fatalf("process=%d journal=%v", fixture.process.calls, fixture.receipts.journalFound)
+	}
+}
+
 func TestSourceAgentUpdateCoreUsesFixedWorkerAllowlist(t *testing.T) {
 	fixture := newSourceAgentUpdateFixture(t)
 	config := fixture.transaction.config

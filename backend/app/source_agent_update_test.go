@@ -65,6 +65,7 @@ type fakeSourceAgentUpdateReceipts struct {
 	journal      sourceAgentUpdateJournal
 	journalFound bool
 	journalErr   error
+	clearErr     error
 }
 
 func (r *fakeSourceAgentUpdateReceipts) loadJournal() (sourceAgentUpdateJournal, bool, error) {
@@ -86,6 +87,9 @@ func (r *fakeSourceAgentUpdateReceipts) saveJournal(journal sourceAgentUpdateJou
 func (r *fakeSourceAgentUpdateReceipts) clearJournal(commandID, attemptNonce string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.clearErr != nil {
+		return r.clearErr
+	}
 	if r.journalErr != nil {
 		return r.journalErr
 	}
@@ -110,10 +114,10 @@ func (r *fakeSourceAgentUpdateReceipts) Acquire(_ context.Context, _ string) (fu
 	}, nil
 }
 
-func (r *fakeSourceAgentUpdateReceipts) LoadOutcome(string) (SourceAgentUpdateResult, bool, error) {
+func (r *fakeSourceAgentUpdateReceipts) LoadOutcome(commandID string) (SourceAgentUpdateResult, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.load, r.loaded, nil
+	return r.load, r.loaded && r.load.CommandID == commandID, nil
 }
 
 func (r *fakeSourceAgentUpdateReceipts) SaveOutcome(result SourceAgentUpdateResult) error {
@@ -148,13 +152,15 @@ func (r *fakeSourceAgentUpdateReceipts) WaitReady(ctx context.Context, _ SourceA
 
 type failingSourceAgentUpdateFS struct {
 	SourceAgentUpdateFileSystem
-	fail         string
-	dirSyncNth   int
-	dirSync      int
-	mutatePath   string
-	mutateData   []byte
-	afterReplace func()
-	afterBackup  func()
+	fail                 string
+	dirSyncNth           int
+	dirSync              int
+	mutatePath           string
+	mutateData           []byte
+	afterReplace         func()
+	afterBackup          func()
+	dirSyncFrom          int
+	backupRemoveFailures int
 }
 
 func (f *failingSourceAgentUpdateFS) OpenStaged(root, path string) (SourceAgentUpdateStagedFile, error) {
@@ -216,10 +222,21 @@ func (f *failingSourceAgentUpdateFS) RestoreExecutable(backup, executable, nonce
 
 func (f *failingSourceAgentUpdateFS) SyncDirectory(path string) error {
 	f.dirSync++
+	if f.dirSyncFrom > 0 && f.dirSync >= f.dirSyncFrom {
+		return errors.New("private persistent directory path")
+	}
 	if f.fail == "dir_sync" && f.dirSync == f.dirSyncNth {
 		return errors.New("private directory path")
 	}
 	return f.SourceAgentUpdateFileSystem.SyncDirectory(path)
+}
+
+func (f *failingSourceAgentUpdateFS) Remove(path string) error {
+	if filepath.Base(path) == sourceAgentUpdateBackupName() && f.backupRemoveFailures > 0 {
+		f.backupRemoveFailures--
+		return errors.New("private backup cleanup path")
+	}
+	return f.SourceAgentUpdateFileSystem.Remove(path)
 }
 
 type failingPreparedSourceAgentFile struct {
