@@ -47,6 +47,7 @@ const guardedBrowserResponses = new WeakMap();
 
 const ROUTES = Object.freeze({
   dedaoHome: "/sources/dedao/home",
+  dedaoLogin: "/sources/dedao/login",
   dedaoCourses: "/sources/dedao/courses",
   dedaoEbooks: "/sources/dedao/ebooks",
   dedaoAudio: "/sources/dedao/audio",
@@ -141,6 +142,15 @@ const jobCenterState = {
   loading: "",
   message: "",
   lastUpdated: "",
+};
+
+const dedaoLoginState = {
+  session: null,
+  qrCode: null,
+  phase: "idle",
+  message: "",
+  pollingTimer: null,
+  expiresAt: 0,
 };
 
 const dedaoLibraryState = {
@@ -1487,6 +1497,7 @@ function renderShell(content, current = "") {
         <a class="${current === "operations" ? "active" : ""}" href="${escapeAttribute(ROUTES.operations)}">Operations</a>
         <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
         <a class="web-nav__session ${current === "session" ? "active" : ""}" ${current === "session" ? 'aria-current="page"' : ""} href="${escapeAttribute(ROUTES.sessionSettings)}">会话</a>
+        <a class="web-nav__account ${current === "login" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoLogin)}">${escapeHTML(dedaoLoginState.session?.active_user?.name || "登录得到")}</a>
       </nav>
     </header>
     ${content}
@@ -1773,6 +1784,7 @@ function renderDedaoHome() {
             <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoEbooks)}">查看得到电子书</a>
             <a class="button button-ghost" href="${escapeAttribute(ROUTES.knowledgePackages)}">打开书籍知识库</a>
             <a class="button button-ghost" href="/wechat-source">微信采集</a>
+            <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoLogin)}">扫码登录得到</a>
           </div>
         </div>
         <div class="dedao-home__panel">
@@ -1811,6 +1823,180 @@ function renderDedaoHome() {
 
 function renderHome() {
   renderDedaoHome();
+}
+
+function dedaoLoginStatusCopy() {
+  if (dedaoLoginState.session?.logged_in) {
+    return `已登录：${dedaoLoginState.session.active_user?.name || "得到用户"}`;
+  }
+  return ({
+    loading: "正在确认当前登录状态…",
+    creating: "正在生成一次性二维码…",
+    scanning: "请使用得到 App 扫码，扫码完成后保持本页打开。",
+    success: "登录成功，书架和订阅内容已刷新。",
+    expired: "二维码已过期，请重新生成。",
+    error: dedaoLoginState.message || "登录检查失败，请重新生成二维码。",
+  })[dedaoLoginState.phase] || "登录凭证只保存在服务端，本页不会保存得到 Cookie。";
+}
+
+function renderDedaoLogin() {
+  const session = dedaoLoginState.session || {};
+  const user = session.active_user || {};
+  const qr = dedaoLoginState.qrCode;
+  const busy = dedaoLoginState.phase === "loading" || dedaoLoginState.phase === "creating";
+  const scanning = dedaoLoginState.phase === "scanning";
+  renderShell(`
+    <main class="dedao-login">
+      <section class="dedao-login__intro">
+        <p class="web-kicker">Dedao account</p>
+        <h1>把书架重新接回你的知识工作台</h1>
+        <p>扫码后即可搜索得到全站电子书、选择书籍并在服务器本地下载，或直接沉淀为可检索的知识包。</p>
+        <ol>
+          <li><span>01</span><div><strong>扫码</strong><small>得到 App 确认登录</small></div></li>
+          <li><span>02</span><div><strong>选书</strong><small>书架与全站搜索并列使用</small></div></li>
+          <li><span>03</span><div><strong>入库</strong><small>下载后直接生成知识包</small></div></li>
+        </ol>
+      </section>
+      <section class="dedao-login__panel" aria-labelledby="dedao-login-title">
+        <header>
+          <div>
+            <p class="web-kicker">Secure session</p>
+            <h2 id="dedao-login-title">扫码登录得到</h2>
+          </div>
+          <span class="dedao-login__seal" aria-hidden="true">得</span>
+        </header>
+        ${session.logged_in ? `
+          <div class="dedao-login__account">
+            ${user.avatar ? `<img src="${escapeAttribute(user.avatar)}" alt="">` : '<span aria-hidden="true">✓</span>'}
+            <div><strong>${escapeHTML(user.name || "得到用户")}</strong><small>当前服务端会话有效</small></div>
+          </div>
+        ` : `
+          <div class="dedao-login__qr-frame ${scanning ? "is-scanning" : ""}">
+            ${qr?.qr_code ? `<img src="${escapeAttribute(qr.qr_code)}" alt="得到登录二维码">` : '<div class="dedao-login__qr-placeholder" aria-hidden="true"><span></span><span></span><span></span></div>'}
+          </div>
+        `}
+        <p class="dedao-login__status is-${escapeAttribute(dedaoLoginState.phase)}" role="status" aria-live="polite">${escapeHTML(dedaoLoginStatusCopy())}</p>
+        ${dedaoLoginState.message && dedaoLoginState.phase !== "error" ? `<p class="web-status">${escapeHTML(dedaoLoginState.message)}</p>` : ""}
+        <div class="dedao-login__actions">
+          ${session.logged_in
+            ? `<a class="button button-primary" href="${escapeAttribute(ROUTES.dedaoEbooks)}">进入电子书</a>`
+            : `<button class="button button-primary" type="button" data-action="create-dedao-qrcode" ${busy ? "disabled" : ""}>${qr ? "重新生成二维码" : "生成登录二维码"}</button>`}
+          <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoHome)}">返回首页</a>
+        </div>
+        <small class="dedao-login__privacy">二维码字段仅存在当前页面内存中；Cookie、Token 和本地路径不会返回浏览器。</small>
+      </section>
+    </main>
+  `, "login");
+  app.querySelector("[data-action='create-dedao-qrcode']")?.addEventListener("click", createDedaoLoginQRCode);
+}
+
+function stopDedaoLoginPolling() {
+  if (dedaoLoginState.pollingTimer !== null) {
+    window.clearTimeout(dedaoLoginState.pollingTimer);
+    dedaoLoginState.pollingTimer = null;
+  }
+}
+
+async function loadDedaoSession() {
+  dedaoLoginState.phase = "loading";
+  dedaoLoginState.message = "";
+  renderDedaoLogin();
+  try {
+    dedaoLoginState.session = await apiFetch("/api/dedao/session");
+    dedaoLoginState.phase = dedaoLoginState.session?.logged_in ? "success" : "idle";
+  } catch (error) {
+    dedaoLoginState.phase = "error";
+    dedaoLoginState.message = error instanceof Error ? error.message : String(error);
+  }
+  renderDedaoLogin();
+}
+
+async function refreshDedaoContentAfterLogin() {
+  const requests = [
+    apiFetch("/api/dedao/home?page_size=4"),
+    ...["bauhinia", "ebook", "odob"].map((category) => apiFetch(`/api/dedao/library?${new URLSearchParams({ category, order: "study", page: "1", page_size: "15" }).toString()}`)),
+  ];
+  const [home, ...libraries] = await Promise.allSettled(requests);
+  if (home.status === "fulfilled") {
+    dedaoLibraryState.home = home.value;
+  }
+  ["bauhinia", "ebook", "odob"].forEach((category, index) => {
+    const result = libraries[index];
+    if (result?.status !== "fulfilled") return;
+    const state = dedaoLibraryState.pages[category];
+    state.items = Array.isArray(result.value?.list) ? result.value.list : [];
+    state.isMore = Number(result.value?.is_more || 0);
+  });
+}
+
+async function createDedaoLoginQRCode() {
+  stopDedaoLoginPolling();
+  dedaoLoginState.phase = "creating";
+  dedaoLoginState.message = "";
+  dedaoLoginState.qrCode = null;
+  renderDedaoLogin();
+  try {
+    dedaoLoginState.qrCode = await apiFetch("/api/dedao/auth/qrcode", { method: "POST", body: "{}" });
+    dedaoLoginState.expiresAt = Date.now() + 5 * 60 * 1000;
+    dedaoLoginState.phase = "scanning";
+    renderDedaoLogin();
+    startDedaoLoginPolling();
+  } catch (error) {
+    dedaoLoginState.phase = "error";
+    dedaoLoginState.message = error instanceof Error ? error.message : String(error);
+    renderDedaoLogin();
+  }
+}
+
+function startDedaoLoginPolling() {
+  stopDedaoLoginPolling();
+  const poll = async () => {
+    if (getRoutePathname() !== ROUTES.dedaoLogin || !dedaoLoginState.qrCode) {
+      stopDedaoLoginPolling();
+      return;
+    }
+    if (Date.now() >= dedaoLoginState.expiresAt) {
+      dedaoLoginState.phase = "expired";
+      stopDedaoLoginPolling();
+      renderDedaoLogin();
+      return;
+    }
+    try {
+      const result = await apiFetch("/api/dedao/auth/check", {
+        method: "POST",
+        body: JSON.stringify({
+          token: dedaoLoginState.qrCode.token,
+          qr_code_string: dedaoLoginState.qrCode.qr_code_string,
+        }),
+      });
+      if (result?.status === 1 || result?.session?.logged_in) {
+        dedaoLoginState.session = result.session || { logged_in: true, active_user: result.user || null };
+        dedaoLoginState.phase = "success";
+        dedaoLoginState.qrCode = null;
+        stopDedaoLoginPolling();
+        await refreshDedaoContentAfterLogin();
+        renderDedaoLogin();
+        return;
+      }
+      if (result?.expired || result?.status === 2) {
+        dedaoLoginState.phase = "expired";
+        stopDedaoLoginPolling();
+        renderDedaoLogin();
+        return;
+      }
+      dedaoLoginState.pollingTimer = window.setTimeout(poll, 2000);
+    } catch (error) {
+      dedaoLoginState.phase = "error";
+      dedaoLoginState.message = error instanceof Error ? error.message : String(error);
+      stopDedaoLoginPolling();
+      renderDedaoLogin();
+    }
+  };
+  dedaoLoginState.pollingTimer = window.setTimeout(poll, 2000);
+}
+
+if (typeof window.addEventListener === "function") {
+  window.addEventListener("beforeunload", stopDedaoLoginPolling);
 }
 
 const dedaoLibraryConfig = {
@@ -8537,6 +8723,11 @@ async function boot() {
     bookAgentLoadSequence += 1;
     proofroomOperationSequence += 1;
     evidenceAuditState.routeAuditID = "";
+  }
+  if (routePathname === ROUTES.dedaoLogin) {
+    renderDedaoLogin();
+    await loadDedaoSession();
+    return;
   }
   if (window.location.pathname === "/" || routePathname === ROUTES.dedaoHome) {
     renderDedaoHome();
