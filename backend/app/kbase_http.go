@@ -42,6 +42,7 @@ type KBaseHTTPConfig struct {
 	AnalysisGenerator       BookAnalysisGenerator
 	ChatClient              BookKnowledgeLLMClient
 	DedaoLibrary            DedaoLibraryService
+	DedaoAuth               DedaoAuthProvider
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
 	AgentTools              []string
@@ -91,6 +92,7 @@ type kbaseHTTPHandler struct {
 	analysisGenerator       BookAnalysisGenerator
 	chatClient              BookKnowledgeLLMClient
 	dedaoLibrary            DedaoLibraryService
+	dedaoAuth               DedaoAuthProvider
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
 	agentTools              []string
@@ -214,6 +216,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		analysisGenerator:       analysisGenerator,
 		chatClient:              cfg.ChatClient,
 		dedaoLibrary:            dedaoLibrary,
+		dedaoAuth:               defaultDedaoAuthProvider(cfg.DedaoAuth),
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
 		agentTools:              agentTools,
@@ -469,6 +472,30 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleContextChat(w, r)
 		return
 	}
+	if r.URL.Path == "/api/dedao/session" {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleDedaoSession(w)
+		return
+	}
+	if r.URL.Path == "/api/dedao/auth/qrcode" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleDedaoAuthQRCode(w)
+		return
+	}
+	if r.URL.Path == "/api/dedao/auth/check" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleDedaoAuthCheck(w, r)
+		return
+	}
 	if r.URL.Path == "/api/dedao/library" {
 		h.handleDedaoLibrary(w, r)
 		return
@@ -556,6 +583,49 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (h *kbaseHTTPHandler) handleDedaoSession(w http.ResponseWriter) {
+	writeHTTPJSON(w, http.StatusOK, h.dedaoAuth.Session())
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAuthQRCode(w http.ResponseWriter) {
+	qr, err := h.dedaoAuth.NewQRCode()
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	setHTTPNoStore(w)
+	writeHTTPJSON(w, http.StatusOK, qr)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var request DedaoLoginCheckRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	request.Token = strings.TrimSpace(request.Token)
+	request.QRCodeString = strings.TrimSpace(request.QRCodeString)
+	if request.Token == "" || request.QRCodeString == "" {
+		writeHTTPError(w, http.StatusBadRequest, "token and qr_code_string are required")
+		return
+	}
+	result, err := h.dedaoAuth.CheckLogin(request.Token, request.QRCodeString)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	setHTTPNoStore(w)
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func setHTTPNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeFeed(w http.ResponseWriter, r *http.Request) {
