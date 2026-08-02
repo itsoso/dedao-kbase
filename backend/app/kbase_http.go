@@ -475,6 +475,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleContextChat(w, r)
 		return
 	}
+	if r.URL.Path == "/api/jobs" {
+		h.handleBookKnowledgeJobs(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/jobs/") {
+		h.handleGetBookKnowledgeJob(w, r)
+		return
+	}
 	if r.URL.Path == "/api/dedao/session" {
 		if r.Method != http.MethodGet {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -637,6 +645,82 @@ func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.R
 func setHTTPNoStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
+}
+
+func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := parseBoundedInt(r.URL.Query().Get("limit"), 50, 1, 100)
+		jobs, err := h.store.ListBookKnowledgeJobs(limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	case http.MethodPost:
+		defer r.Body.Close()
+		var request BookKnowledgeJobRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		normalized, err := normalizeBookKnowledgeJobRequest(request)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		detail, err := h.dedaoEbooks.EbookDetail(normalized.EbookEnID)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if detail == nil {
+			writeHTTPError(w, http.StatusNotFound, "ebook not found")
+			return
+		}
+		if detail.ID > 0 && detail.ID != normalized.EbookID {
+			writeHTTPError(w, http.StatusBadRequest, "ebook_id does not match ebook_enid")
+			return
+		}
+		if !detail.IsBuy && !detail.IsOnBookshelf {
+			writeHTTPError(w, http.StatusForbidden, "ebook is not owned or on the active bookshelf")
+			return
+		}
+		job, err := h.store.CreateBookKnowledgeJob(normalized)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		go h.store.RunBookKnowledgeJob(job.ID)
+		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	default:
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleGetBookKnowledgeJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	rawID := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	if rawID == "" || strings.Contains(rawID, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+	jobID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(jobID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+	job, err := h.store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
 func (h *kbaseHTTPHandler) handleDedaoEbookSearch(w http.ResponseWriter, r *http.Request) {
