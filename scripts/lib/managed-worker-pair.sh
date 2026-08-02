@@ -79,7 +79,7 @@ _managed_worker_pair_set_paths() {
   MANAGED_WORKER_PAIR_JOURNAL_TMP="$worker_directory/.${worker_basename}.pair-journal.tmp"
   MANAGED_WORKER_PAIR_WORKER_BACKUP="$worker_directory/.${worker_basename}.pair-worker-old"
   MANAGED_WORKER_PAIR_UPDATER_BACKUP="$worker_directory/.${worker_basename}.pair-updater-old"
-  MANAGED_WORKER_PAIR_LOCK="$worker_directory/.${worker_basename}.pair-lock"
+  MANAGED_WORKER_PAIR_LOCK="$worker_directory/.source-agent-updater.pair-lock"
 }
 
 _managed_worker_pair_validate_destination() {

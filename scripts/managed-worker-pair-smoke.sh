@@ -347,6 +347,17 @@ if managed_worker_pair_publish "$pair_dir/.source-agent.second" "$pair_dir/.sour
   echo "managed pair lock admitted a concurrent publisher" >&2
   exit 1
 fi
+printf 'old-wcplus-worker' >"$pair_dir/wcplus-agent"
+printf 'second-wcplus-worker' >"$pair_dir/.wcplus-agent.second"
+printf 'second-shared-updater' >"$pair_dir/.source-agent-updater.wcplus-second"
+if managed_worker_pair_publish \
+  "$pair_dir/.wcplus-agent.second" \
+  "$pair_dir/.source-agent-updater.wcplus-second" \
+  "$pair_dir/wcplus-agent" \
+  "$updater"; then
+  echo "managed pair updater lock admitted a concurrent cross-worker publisher" >&2
+  exit 1
+fi
 kill -TERM "$hold_pid"
 set +e
 wait "$hold_pid"
