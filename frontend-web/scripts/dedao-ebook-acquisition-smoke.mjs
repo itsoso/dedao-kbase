@@ -14,6 +14,7 @@ for (const marker of [
   "/api/dedao/auth/qrcode",
   "/api/dedao/auth/check",
   "扫码登录得到",
+  "重新扫码登录",
   "renderDedaoLogin",
   "loadDedaoSession",
   "createDedaoLoginQRCode",
@@ -29,16 +30,22 @@ for (const marker of [
   "我的书架",
   "全站搜索",
   "仅下载",
+  "下载格式",
+  "data-dedao-download-type",
+  "PDF",
+  "EPUB",
   "下载并入知识库",
   "renderDedaoEbookAcquisition",
   "searchDedaoEbooks",
   "addDedaoEbookToBookshelf",
   "createDedaoEbookJob",
   "pollBookKnowledgeJob",
+  "loadDedaoEbookJobs",
   "normalizeDedaoEbook",
   "jobActive",
   "任务进行中",
   "Promise.allSettled",
+  "loadDedaoHomeSession",
 ]) {
   assert.ok(js.includes(marker), `app.js should include login marker ${marker}`);
 }
@@ -52,6 +59,7 @@ for (const className of [
   ".dedao-ebook-acquisition__tabs",
   ".dedao-ebook-acquisition__search",
   ".dedao-ebook-card__actions",
+  ".dedao-ebook-card__format",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
@@ -60,8 +68,9 @@ assert.ok(css.includes("@media (max-width: 760px)"), "login UI should have a res
 assert.ok(css.includes("@media (prefers-reduced-motion: reduce)"), "login UI should respect reduced motion");
 assert.ok(html.includes("20260802-dedao-acquisition"), "login release should use a fresh browser cache version");
 
-const loginSuccessIndex = js.indexOf('dedaoLoginState.phase === "success"');
-const loggedInSessionIndex = js.indexOf("dedaoLoginState.session?.logged_in");
+const loginStatusSource = js.match(/function dedaoLoginStatusCopy\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
+const loginSuccessIndex = loginStatusSource.indexOf('dedaoLoginState.phase === "success"');
+const loggedInSessionIndex = loginStatusSource.indexOf("dedaoLoginState.session?.logged_in");
 assert.ok(loginSuccessIndex >= 0, "login status copy should handle terminal success explicitly");
 assert.ok(
   loginSuccessIndex < loggedInSessionIndex,
