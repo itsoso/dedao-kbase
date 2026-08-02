@@ -839,7 +839,8 @@ Cover the full production path, not a fake `SourceAgentUpdater`:
 - downloading, verified, installing, restarting, verifying, rollback, success,
   and rolled-back command reports are resumable without repeating download,
   replacement, or rollback side effects;
-- disabling rollout after download or after claim stops installation;
+- disabling rollout after download, after claim, or after the server accepts
+  the `installing` transition still stops local binary mutation;
 - helper crash, restart failure, ready timeout, wrong receipt, hash drift, and
   outcome persistence failure all fail or roll back truthfully.
 
@@ -861,6 +862,13 @@ same server-side snapshot used to stream bytes. The client must parse these as
 strict single-valued response headers and compare them with its compiled
 runtime identity and the claimed command. It must never infer trusted metadata
 from the command payload or a filename.
+
+Add a worker-authenticated, command-bound update-guard check for
+`SourceAgentUpdateTransaction`. Immediately before local mutation it must
+re-read command ownership/state and the catalog entry, then require the exact
+worker, version, revision, channel, compatibility, and `allowed_for_rollout`
+state. The earlier `installing` progress report and any local cache are not a
+substitute for this guard.
 
 **Step 4: Implement the private same-filesystem stage and handoff**
 
