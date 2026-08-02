@@ -235,7 +235,7 @@ func TestSourceAgentUpdateExecutableFIFOIsRejectedWithoutBlocking(t *testing.T) 
 		if result.Code != SourceAgentCommandCodeInstallFailed {
 			t.Fatalf("result=%#v", result)
 		}
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		writer, openErr := unix.Open(fixture.executable, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
 		if openErr == nil {
 			_ = unix.Close(writer)

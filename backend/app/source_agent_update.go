@@ -965,7 +965,7 @@ func validSourceAgentUpdateTerminalCombination(result SourceAgentUpdateResult, j
 		case SourceAgentCommandCodeVerificationFailed, SourceAgentCommandCodeInstallFailed, SourceAgentUpdateCodeCanceled:
 			return !result.BinaryRestored && sourceAgentUpdateJournalStageIs(journal.Stage, "started", "backup_durable", "terminal_cleanup")
 		case SourceAgentCommandCodeRollbackFailed:
-			return sourceAgentUpdateJournalStageIs(journal.Stage,
+			return (journal.Stage != "rollback_restored" || result.BinaryRestored) && sourceAgentUpdateJournalStageIs(journal.Stage,
 				"backup_durable", "replaced", "restarted", "ready", "rollback_restored", "terminal_cleanup")
 		}
 	}

@@ -365,6 +365,91 @@ func TestSourceAgentUpdateRejectsImpossibleDurableTerminalCombination(t *testing
 	}
 }
 
+func TestSourceAgentUpdateRejectsRollbackRestoredWithoutBinaryRestored(t *testing.T) {
+	fixture := newDurableSourceAgentUpdateFixture(t, "")
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	identity, err := fixture.transaction.fs.BackupExecutable(fixture.executable, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := fixture.transaction.newJournal(fixture.request, strings.Repeat("9", sha256.Size*2), "rollback_restored")
+	journal.Backup = identity
+	if err := fixture.store.saveJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	impossible := fixture.transaction.finishResult(time.Now(), fixture.request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, false)
+	if err := fixture.store.SaveOutcome(impossible); err != nil {
+		t.Fatal(err)
+	}
+
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Code != SourceAgentUpdateCodeRecoveryFailed || result.BinaryRestored {
+		t.Fatalf("result=%#v", result)
+	}
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if _, found, err := fixture.store.loadJournal(); err != nil || !found {
+		t.Fatalf("journal found=%v err=%v", found, err)
+	}
+	if fixture.process.calls != 0 {
+		t.Fatalf("impossible state triggered recovery restart: %d", fixture.process.calls)
+	}
+}
+
+func TestSourceAgentUpdateTerminalCombinationRejectsInvalidMatrix(t *testing.T) {
+	baseJournal := sourceAgentUpdateJournal{Stage: "ready", CurrentVersion: "1.0.0", TargetVersion: "2.0.0"}
+	baseResult := SourceAgentUpdateResult{
+		Outcome: SourceAgentUpdateOutcomeSucceeded, Code: SourceAgentCommandCodeUpgradeComplete,
+		RuntimeVersion: "2.0.0",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*SourceAgentUpdateResult, *sourceAgentUpdateJournal)
+	}{
+		{name: "success wrong stage", mutate: func(_ *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) { journal.Stage = "replaced" }},
+		{name: "success wrong code", mutate: func(result *SourceAgentUpdateResult, _ *sourceAgentUpdateJournal) {
+			result.Code = SourceAgentCommandCodeInstallFailed
+		}},
+		{name: "success wrong runtime", mutate: func(result *SourceAgentUpdateResult, _ *sourceAgentUpdateJournal) { result.RuntimeVersion = "1.0.0" }},
+		{name: "success restored", mutate: func(result *SourceAgentUpdateResult, _ *sourceAgentUpdateJournal) { result.BinaryRestored = true }},
+		{name: "rolled back wrong stage", mutate: func(result *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) {
+			result.Outcome, result.Code, result.RuntimeVersion, result.BinaryRestored = SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, "1.0.0", true
+			journal.Stage = "ready"
+		}},
+		{name: "rolled back not restored", mutate: func(result *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) {
+			result.Outcome, result.Code, result.RuntimeVersion = SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, "1.0.0"
+			journal.Stage = "rollback_restored"
+		}},
+		{name: "failed wrong runtime", mutate: func(result *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) {
+			result.Outcome, result.Code = SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed
+			journal.Stage = "backup_durable"
+		}},
+		{name: "failed wrong stage", mutate: func(result *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) {
+			result.Outcome, result.Code, result.RuntimeVersion = SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, "1.0.0"
+			journal.Stage = "replaced"
+		}},
+		{name: "failed restored", mutate: func(result *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) {
+			result.Outcome, result.Code, result.RuntimeVersion, result.BinaryRestored = SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, "1.0.0", true
+			journal.Stage = "backup_durable"
+		}},
+		{name: "rollback failed stage says restored", mutate: func(result *SourceAgentUpdateResult, journal *sourceAgentUpdateJournal) {
+			result.Outcome, result.Code, result.RuntimeVersion = SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, "1.0.0"
+			journal.Stage = "rollback_restored"
+		}},
+		{name: "persistence marker stored", mutate: func(result *SourceAgentUpdateResult, _ *sourceAgentUpdateJournal) {
+			result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, journal := baseResult, baseJournal
+			test.mutate(&result, &journal)
+			if validSourceAgentUpdateTerminalCombination(result, journal) {
+				t.Fatalf("accepted result=%#v journal=%#v", result, journal)
+			}
+		})
+	}
+}
+
 type publishedErrorSourceAgentUpdateReceipts struct {
 	*fakeSourceAgentUpdateReceipts
 	publishErrors bool
