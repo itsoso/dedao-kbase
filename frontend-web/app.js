@@ -803,6 +803,9 @@ function renderHome() {
 }
 
 function dedaoLoginStatusCopy() {
+  if (dedaoLoginState.phase === "success") {
+    return "登录成功，书架和订阅内容已刷新。";
+  }
   if (dedaoLoginState.session?.logged_in) {
     return `已登录：${dedaoLoginState.session.active_user?.name || "得到用户"}`;
   }
@@ -810,7 +813,6 @@ function dedaoLoginStatusCopy() {
     loading: "正在确认当前登录状态…",
     creating: "正在生成一次性二维码…",
     scanning: "请使用得到 App 扫码，扫码完成后保持本页打开。",
-    success: "登录成功，书架和订阅内容已刷新。",
     expired: "二维码已过期，请重新生成。",
     error: dedaoLoginState.message || "登录检查失败，请重新生成二维码。",
   })[dedaoLoginState.phase] || "登录凭证只保存在服务端，本页不会保存得到 Cookie。";
