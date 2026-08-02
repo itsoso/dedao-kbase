@@ -724,6 +724,27 @@ a.button {
   gap: 8px;
 }
 
+.dedao-ebook-card__format {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid rgba(141, 132, 117, 0.25);
+  border-radius: 8px;
+  color: #756c5f;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.dedao-ebook-card__format select {
+  min-width: 68px;
+  padding: 7px 4px;
+  border: 0;
+  background: transparent;
+  color: #2f2a24;
+  font: inherit;
+}
+
 .dedao-ebook-card__disabled-reason {
   display: block;
   margin-top: 10px;

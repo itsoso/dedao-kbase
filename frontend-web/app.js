@@ -742,6 +742,10 @@ function renderShell(content, current = "") {
 }
 
 function renderDedaoHome() {
+  const activeDedaoUser = dedaoLoginState.session?.active_user;
+  const accountAction = dedaoLoginState.session?.logged_in
+    ? `<a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoEbooks)}">${escapeHTML(activeDedaoUser?.name || "得到用户")} · 浏览电子书</a>`
+    : `<a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoLogin)}">扫码登录得到</a>`;
   const sections = dedaoLibraryState.home ? `
     <section class="dedao-home__library" aria-label="得到订阅内容">
       ${renderDedaoHomeSection("订阅课程", dedaoLibraryState.home.courses?.list, ROUTES.dedaoCourses)}
@@ -761,7 +765,7 @@ function renderDedaoHome() {
             <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoEbooks)}">查看得到电子书</a>
             <a class="button button-ghost" href="${escapeAttribute(ROUTES.knowledgePackages)}">打开书籍知识库</a>
             <a class="button button-ghost" href="/wechat-source">微信采集</a>
-            <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoLogin)}">扫码登录得到</a>
+            ${accountAction}
           </div>
         </div>
         <div class="dedao-home__panel">
@@ -806,16 +810,20 @@ function dedaoLoginStatusCopy() {
   if (dedaoLoginState.phase === "success") {
     return "登录成功，书架和订阅内容已刷新。";
   }
-  if (dedaoLoginState.session?.logged_in) {
-    return `已登录：${dedaoLoginState.session.active_user?.name || "得到用户"}`;
-  }
-  return ({
+  const phaseCopy = ({
     loading: "正在确认当前登录状态…",
     creating: "正在生成一次性二维码…",
     scanning: "请使用得到 App 扫码，扫码完成后保持本页打开。",
     expired: "二维码已过期，请重新生成。",
     error: dedaoLoginState.message || "登录检查失败，请重新生成二维码。",
-  })[dedaoLoginState.phase] || "登录凭证只保存在服务端，本页不会保存得到 Cookie。";
+  })[dedaoLoginState.phase];
+  if (phaseCopy) {
+    return phaseCopy;
+  }
+  if (dedaoLoginState.session?.logged_in) {
+    return `已登录：${dedaoLoginState.session.active_user?.name || "得到用户"}`;
+  }
+  return "登录凭证只保存在服务端，本页不会保存得到 Cookie。";
 }
 
 function renderDedaoLogin() {
@@ -824,6 +832,7 @@ function renderDedaoLogin() {
   const qr = dedaoLoginState.qrCode;
   const busy = dedaoLoginState.phase === "loading" || dedaoLoginState.phase === "creating";
   const scanning = dedaoLoginState.phase === "scanning";
+  const authenticating = busy || scanning || Boolean(qr);
   renderShell(`
     <main class="dedao-login">
       <section class="dedao-login__intro">
@@ -844,10 +853,10 @@ function renderDedaoLogin() {
           </div>
           <span class="dedao-login__seal" aria-hidden="true">得</span>
         </header>
-        ${session.logged_in ? `
+        ${session.logged_in && !authenticating ? `
           <div class="dedao-login__account">
             ${user.avatar ? `<img src="${escapeAttribute(user.avatar)}" alt="">` : '<span aria-hidden="true">✓</span>'}
-            <div><strong>${escapeHTML(user.name || "得到用户")}</strong><small>当前服务端会话有效</small></div>
+            <div><strong>${escapeHTML(user.name || "得到用户")}</strong><small>当前服务端已保存此账号</small></div>
           </div>
         ` : `
           <div class="dedao-login__qr-frame ${scanning ? "is-scanning" : ""}">
@@ -857,8 +866,8 @@ function renderDedaoLogin() {
         <p class="dedao-login__status is-${escapeAttribute(dedaoLoginState.phase)}" role="status" aria-live="polite">${escapeHTML(dedaoLoginStatusCopy())}</p>
         ${dedaoLoginState.message && dedaoLoginState.phase !== "error" ? `<p class="web-status">${escapeHTML(dedaoLoginState.message)}</p>` : ""}
         <div class="dedao-login__actions">
-          ${session.logged_in
-            ? `<a class="button button-primary" href="${escapeAttribute(ROUTES.dedaoEbooks)}">进入电子书</a>`
+          ${session.logged_in && !authenticating
+            ? `<a class="button button-primary" href="${escapeAttribute(ROUTES.dedaoEbooks)}">进入电子书</a><button class="button button-ghost" type="button" data-action="create-dedao-qrcode">重新扫码登录</button>`
             : `<button class="button button-primary" type="button" data-action="create-dedao-qrcode" ${busy ? "disabled" : ""}>${qr ? "重新生成二维码" : "生成登录二维码"}</button>`}
           <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoHome)}">返回首页</a>
         </div>
@@ -882,7 +891,7 @@ async function loadDedaoSession() {
   renderDedaoLogin();
   try {
     dedaoLoginState.session = await apiFetch("/api/dedao/session");
-    dedaoLoginState.phase = dedaoLoginState.session?.logged_in ? "success" : "idle";
+    dedaoLoginState.phase = "idle";
   } catch (error) {
     dedaoLoginState.phase = "error";
     dedaoLoginState.message = error instanceof Error ? error.message : String(error);
@@ -1119,6 +1128,7 @@ function renderDedaoEbookCard(book) {
       <div class="dedao-ebook-card__actions">
         ${book.enid ? `<a class="button button-ghost" href="${escapeAttribute(buildDedaoEbookURL(book.enid))}">详情</a>` : ""}
         ${isSite && !owned ? `<button class="button button-ghost" type="button" data-action="add-dedao-ebook-bookshelf" data-enid="${escapeAttribute(book.enid)}" ${!book.enid || adding ? "disabled" : ""}>${adding ? "加入中" : "加入书架"}</button>` : ""}
+        <label class="dedao-ebook-card__format"><span>下载格式</span><select data-dedao-download-type data-enid="${escapeAttribute(book.enid)}" ${eligibility || downloading || syncing || jobActive ? "disabled" : ""}><option value="1">HTML</option><option value="2">PDF</option><option value="3">EPUB</option></select></label>
         <button class="button button-ghost" type="button" data-action="create-dedao-ebook-job" data-job-type="dedao_ebook_download" data-enid="${escapeAttribute(book.enid)}" data-id="${escapeAttribute(book.id)}" ${eligibility || downloading || syncing || jobActive ? "disabled" : ""}>${downloading ? "提交中" : (jobActive ? "任务进行中" : "仅下载")}</button>
         <button class="button button-primary" type="button" data-action="create-dedao-ebook-job" data-job-type="dedao_ebook_sync_kbase" data-enid="${escapeAttribute(book.enid)}" data-id="${escapeAttribute(book.id)}" ${eligibility || downloading || syncing || jobActive ? "disabled" : ""}>${syncing ? "提交中" : (jobActive ? "任务进行中" : "下载并入知识库")}</button>
       </div>
@@ -1195,9 +1205,16 @@ function renderDedaoEbookAcquisition() {
     searchDedaoEbooks();
   }));
   app.querySelectorAll("[data-action='add-dedao-ebook-bookshelf']").forEach((button) => button.addEventListener("click", () => addDedaoEbookToBookshelf(button.dataset.enid)));
-  app.querySelectorAll("[data-action='create-dedao-ebook-job']").forEach((button) => button.addEventListener("click", () => createDedaoEbookJob({
-    id: Number(button.dataset.id || 0), enid: button.dataset.enid || "", type: button.dataset.jobType || "",
-  })));
+  app.querySelectorAll("[data-action='create-dedao-ebook-job']").forEach((button) => button.addEventListener("click", () => {
+    const type = button.dataset.jobType || "";
+    const format = button.closest(".dedao-ebook-card")?.querySelector("[data-dedao-download-type]");
+    createDedaoEbookJob({
+      id: Number(button.dataset.id || 0),
+      enid: button.dataset.enid || "",
+      type,
+      downloadType: type === "dedao_ebook_download" ? Number(format?.value || 1) : 1,
+    });
+  }));
 }
 
 function setDedaoEbookSource(source) {
@@ -1256,16 +1273,17 @@ async function addDedaoEbookToBookshelf(enid) {
   }
 }
 
-async function createDedaoEbookJob({ id, enid, type }) {
+async function createDedaoEbookJob({ id, enid, type, downloadType = 1 }) {
   const key = `${type}:${enid}`;
-  if (!id || !enid || !["dedao_ebook_download", "dedao_ebook_sync_kbase"].includes(type) || dedaoEbookAcquisitionState.submitting.has(key)) return;
+  const normalizedDownloadType = type === "dedao_ebook_download" ? Number(downloadType) : 1;
+  if (!id || !enid || !["dedao_ebook_download", "dedao_ebook_sync_kbase"].includes(type) || ![1, 2, 3].includes(normalizedDownloadType) || dedaoEbookAcquisitionState.submitting.has(key)) return;
   dedaoEbookAcquisitionState.submitting.add(key);
   dedaoEbookAcquisitionState.message = type === "dedao_ebook_sync_kbase" ? "正在创建下载并入库任务…" : "正在创建下载任务…";
   renderDedaoEbookAcquisition();
   try {
     const payload = await apiFetch("/api/jobs", {
       method: "POST",
-      body: JSON.stringify({ type, ebook_id: id, ebook_enid: enid, download_type: 1 }),
+      body: JSON.stringify({ type, ebook_id: id, ebook_enid: enid, download_type: normalizedDownloadType }),
     });
     if (!payload?.job?.id) throw new Error("任务响应缺少 job id");
     dedaoEbookAcquisitionState.jobs[enid] = payload.job;
@@ -1296,6 +1314,25 @@ async function pollBookKnowledgeJob(jobID, enid, attempt = 0) {
     window.setTimeout(() => pollBookKnowledgeJob(jobID, enid, attempt + 1), 1500);
   } catch (error) {
     dedaoEbookAcquisitionState.message = error instanceof Error ? error.message : String(error);
+    renderDedaoEbookAcquisition();
+  }
+}
+
+async function loadDedaoEbookJobs() {
+  try {
+    const payload = await apiFetch("/api/jobs?limit=50");
+    for (const job of Array.isArray(payload?.jobs) ? payload.jobs : []) {
+      if (!["dedao_ebook_download", "dedao_ebook_sync_kbase"].includes(job?.type) || !job?.ebook_enid) continue;
+      if (!dedaoEbookAcquisitionState.jobs[job.ebook_enid]) {
+        dedaoEbookAcquisitionState.jobs[job.ebook_enid] = job;
+      }
+    }
+  } catch (error) {
+    if (!dedaoEbookAcquisitionState.message) {
+      dedaoEbookAcquisitionState.message = `任务状态暂不可用：${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+  if (getRoutePathname() === ROUTES.dedaoEbooks) {
     renderDedaoEbookAcquisition();
   }
 }
@@ -1429,14 +1466,28 @@ async function loadDedaoHome() {
   dedaoLibraryState.homeLoading = "loading";
   dedaoLibraryState.homeMessage = "";
   renderDedaoHome();
-  try {
-    dedaoLibraryState.home = await apiFetch("/api/dedao/home?page_size=4");
-  } catch (error) {
-    dedaoLibraryState.homeMessage = error instanceof Error ? error.message : String(error);
-  } finally {
-    dedaoLibraryState.homeLoading = "";
-    renderDedaoHome();
+  const [home, session] = await Promise.allSettled([
+    apiFetch("/api/dedao/home?page_size=4"),
+    loadDedaoHomeSession(),
+  ]);
+  if (home.status === "fulfilled") {
+    dedaoLibraryState.home = home.value;
+  } else {
+    dedaoLibraryState.homeMessage = home.reason instanceof Error ? home.reason.message : String(home.reason);
   }
+  if (session.status === "rejected" && !dedaoLibraryState.homeMessage) {
+    dedaoLibraryState.homeMessage = "得到登录状态暂不可用，内容仍可继续浏览。";
+  }
+  dedaoLibraryState.homeLoading = "";
+  renderDedaoHome();
+}
+
+async function loadDedaoHomeSession() {
+  dedaoLoginState.session = await apiFetch("/api/dedao/session");
+  if (dedaoLoginState.phase !== "success") {
+    dedaoLoginState.phase = "idle";
+  }
+  return dedaoLoginState.session;
 }
 
 async function loadDedaoCourses() {
@@ -6338,7 +6389,7 @@ async function boot() {
   }
   if (routePathname === ROUTES.dedaoEbooks) {
     renderDedaoEbooks();
-    await loadDedaoLibrary("ebook");
+    await Promise.allSettled([loadDedaoLibrary("ebook"), loadDedaoEbookJobs()]);
     return;
   }
   if (routePathname.startsWith(`${ROUTES.dedaoAudio}/`)) {
