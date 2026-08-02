@@ -83,7 +83,7 @@ func newSourceAgentUpdateBridgeStorage(updaterExecutable, workerType string) (so
 	storage.workerDevice = uint64(workerStat.Dev)
 	var installStat unix.Stat_t
 	if err := unix.Fstat(parentFD, &installStat); err != nil || installStat.Mode&unix.S_IFMT != unix.S_IFDIR ||
-		installStat.Mode&0o777 != 0o700 || installStat.Uid != uint32(unix.Geteuid()) ||
+		!darwinSourceAgentModeIsExact(installStat.Mode, 0o700) || installStat.Uid != uint32(unix.Geteuid()) ||
 		uint64(installStat.Dev) != storage.workerDevice {
 		return nil, fmt.Errorf("validate private install directory: %w", errSourceAgentUpdateBridgeUnavailable)
 	}
@@ -211,16 +211,20 @@ func (s *darwinSourceAgentUpdateBridgeStorage) Stage(
 	if err != nil {
 		return errSourceAgentUpdateBridgeUnavailable
 	}
+	file := os.NewFile(uintptr(fd), "source-agent-staged-artifact")
+	if file == nil {
+		_ = unix.Close(fd)
+		_ = s.unlinkat(s.stagingFD, temporary, 0)
+		return errSourceAgentUpdateBridgeUnavailable
+	}
+	fd = -1
 	defer func() {
-		if fd >= 0 {
-			_ = unix.Close(fd)
+		if file != nil {
+			_ = file.Close()
 		}
 		_ = s.unlinkat(s.stagingFD, temporary, 0)
 	}()
-	file := os.NewFile(uintptr(fd), "source-agent-staged-artifact")
-	if file == nil {
-		return errSourceAgentUpdateBridgeUnavailable
-	}
+	ownedFD := int(file.Fd())
 	hasher := sha256.New()
 	written, copyErr := io.Copy(
 		io.MultiWriter(file, hasher),
@@ -236,20 +240,20 @@ func (s *darwinSourceAgentUpdateBridgeStorage) Stage(
 		return errSourceAgentUpdateHandoffConflict
 	}
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || uint64(stat.Dev) != s.workerDevice || stat.Size != expectedSize {
+	if err := unix.Fstat(ownedFD, &stat); err != nil || uint64(stat.Dev) != s.workerDevice || stat.Size != expectedSize {
 		return errSourceAgentUpdateBridgeUnavailable
 	}
-	if err := unix.Fchmod(fd, 0o755); err != nil || file.Sync() != nil {
+	if err := unix.Fchmod(ownedFD, 0o755); err != nil || file.Sync() != nil {
 		return errSourceAgentUpdateBridgeUnavailable
 	}
 	var readyStat unix.Stat_t
-	if err := unix.Fstat(fd, &readyStat); err != nil || readyStat.Mode&unix.S_IFMT != unix.S_IFREG ||
-		readyStat.Mode&0o777 != 0o755 || readyStat.Uid != uint32(unix.Geteuid()) ||
+	if err := unix.Fstat(ownedFD, &readyStat); err != nil || readyStat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		!darwinSourceAgentModeIsExact(readyStat.Mode, 0o755) || readyStat.Uid != uint32(unix.Geteuid()) ||
 		uint64(readyStat.Dev) != s.workerDevice || readyStat.Size != expectedSize {
 		return errSourceAgentUpdateBridgeUnavailable
 	}
 	closeErr := file.Close()
-	fd = -1
+	file = nil
 	if closeErr != nil {
 		return errSourceAgentUpdateBridgeUnavailable
 	}
@@ -348,7 +352,7 @@ func (s *darwinSourceAgentUpdateBridgeStorage) PublishHandoff(payload []byte) er
 	}
 	var readyStat unix.Stat_t
 	if err := unix.Fstat(fd, &readyStat); err != nil || readyStat.Mode&unix.S_IFMT != unix.S_IFREG ||
-		readyStat.Mode&0o777 != 0o600 || readyStat.Uid != uint32(unix.Geteuid()) ||
+		!darwinSourceAgentModeIsExact(readyStat.Mode, 0o600) || readyStat.Uid != uint32(unix.Geteuid()) ||
 		uint64(readyStat.Dev) != s.workerDevice || readyStat.Size != int64(len(payload)) {
 		return errSourceAgentUpdateBridgeUnavailable
 	}
@@ -406,7 +410,7 @@ func (s *darwinSourceAgentUpdateBridgeStorage) validatePinned() error {
 	}
 	var installStat unix.Stat_t
 	if unix.Fstat(s.parentFD, &installStat) != nil || darwinSourceAgentIdentity(installStat) != s.installIdentity ||
-		installStat.Mode&unix.S_IFMT != unix.S_IFDIR || installStat.Mode&0o777 != 0o700 ||
+		installStat.Mode&unix.S_IFMT != unix.S_IFDIR || !darwinSourceAgentModeIsExact(installStat.Mode, 0o700) ||
 		installStat.Uid != uint32(unix.Geteuid()) || uint64(installStat.Dev) != s.workerDevice {
 		return errSourceAgentUpdateHandoffConflict
 	}
@@ -449,7 +453,7 @@ func (s *darwinSourceAgentUpdateBridgeStorage) removePending(
 	}
 	modeAllowed := false
 	for _, allowedMode := range allowedModes {
-		if entry.Mode&0o777 == allowedMode {
+		if darwinSourceAgentModeIsExact(entry.Mode, allowedMode) {
 			modeAllowed = true
 			break
 		}
@@ -465,7 +469,8 @@ func (s *darwinSourceAgentUpdateBridgeStorage) removePending(
 	statErr := unix.Fstat(fd, &pinned)
 	closeErr := unix.Close(fd)
 	if statErr != nil || closeErr != nil || pinned.Mode&unix.S_IFMT != unix.S_IFREG ||
-		pinned.Dev != entry.Dev || pinned.Ino != entry.Ino || pinned.Uid != entry.Uid || pinned.Size != entry.Size {
+		pinned.Mode != entry.Mode || pinned.Dev != entry.Dev || pinned.Ino != entry.Ino ||
+		pinned.Uid != entry.Uid || pinned.Size != entry.Size {
 		return errSourceAgentUpdateHandoffConflict
 	}
 	if err := s.unlinkat(directoryFD, name, 0); err != nil {
@@ -557,7 +562,7 @@ func openDarwinSourceAgentInstalledExecutable(parentFD int, name string) (unix.S
 	defer unix.Close(fd)
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
-		stat.Uid != uint32(unix.Geteuid()) || stat.Mode&0o777 != 0o755 || stat.Size <= 0 {
+		stat.Uid != uint32(unix.Geteuid()) || !darwinSourceAgentModeIsExact(stat.Mode, 0o755) || stat.Size <= 0 {
 		return unix.Stat_t{}, errSourceAgentUpdateBridgeUnavailable
 	}
 	return stat, nil
@@ -583,7 +588,7 @@ func openDarwinSourceAgentPrivateChildDirectory(
 	}
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR ||
-		stat.Mode&0o777 != 0o700 || stat.Uid != uint32(unix.Geteuid()) || uint64(stat.Dev) != device {
+		!darwinSourceAgentModeIsExact(stat.Mode, 0o700) || stat.Uid != uint32(unix.Geteuid()) || uint64(stat.Dev) != device {
 		_ = unix.Close(fd)
 		return -1, darwinSourceAgentUpdateEntryIdentity{}, errSourceAgentUpdateBridgeUnavailable
 	}
@@ -608,7 +613,12 @@ func darwinSourceAgentEntryMatches(
 		uint64(stat.Dev) != device || stat.Uid != uint32(unix.Geteuid()) {
 		return false
 	}
-	return mode == 0 || stat.Mode&0o777 == mode
+	return darwinSourceAgentModeIsExact(stat.Mode, mode)
+}
+
+func darwinSourceAgentModeIsExact(mode uint16, expected uint16) bool {
+	const permissionAndSpecialMask = uint16(0o777 | unix.S_ISUID | unix.S_ISGID | unix.S_ISVTX)
+	return mode&permissionAndSpecialMask == expected
 }
 
 func darwinSourceAgentPendingEntryMatches(directoryFD int, name string, expected unix.Stat_t) bool {
@@ -630,7 +640,7 @@ func createDarwinSourceAgentBridgePending(directoryFD int, name string) (int, er
 	}
 	var stat unix.Stat_t
 	if unix.Fstat(fd, &stat) != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Size != 0 ||
-		stat.Uid != uint32(unix.Geteuid()) || stat.Mode&0o777 != 0o600 {
+		stat.Uid != uint32(unix.Geteuid()) || !darwinSourceAgentModeIsExact(stat.Mode, 0o600) {
 		_ = unix.Close(fd)
 		_ = unix.Unlinkat(directoryFD, name, 0)
 		return -1, errSourceAgentUpdateBridgeUnavailable
@@ -664,7 +674,7 @@ func readDarwinSourceAgentFixedFile(
 	defer file.Close()
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
-		stat.Mode&0o777 != mode || stat.Uid != uint32(unix.Geteuid()) || uint64(stat.Dev) != device ||
+		!darwinSourceAgentModeIsExact(stat.Mode, mode) || stat.Uid != uint32(unix.Geteuid()) || uint64(stat.Dev) != device ||
 		stat.Size <= 0 || stat.Size > maximum || uint64(stat.Dev) != uint64(entry.Dev) || uint64(stat.Ino) != uint64(entry.Ino) {
 		return nil, true, errSourceAgentUpdateHandoffConflict
 	}
@@ -725,7 +735,7 @@ func verifyDarwinSourceAgentStagedFile(
 	defer file.Close()
 	var before unix.Stat_t
 	if err := unix.Fstat(fd, &before); err != nil || before.Mode&unix.S_IFMT != unix.S_IFREG ||
-		before.Mode&0o777 != 0o755 || before.Uid != uint32(unix.Geteuid()) || uint64(before.Dev) != device ||
+		!darwinSourceAgentModeIsExact(before.Mode, 0o755) || before.Uid != uint32(unix.Geteuid()) || uint64(before.Dev) != device ||
 		before.Size != expectedSize || uint64(before.Dev) != uint64(entry.Dev) || uint64(before.Ino) != uint64(entry.Ino) {
 		return true, errSourceAgentUpdateHandoffConflict
 	}

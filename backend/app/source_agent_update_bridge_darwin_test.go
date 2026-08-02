@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -1019,6 +1021,168 @@ func TestSourceAgentUpdateBridgeRejectsPendingReplacementAtPublish(t *testing.T)
 			}
 		})
 	}
+}
+
+func TestSourceAgentUpdateBridgeStageDoesNotLetFinalizerCloseReusedFD(t *testing.T) {
+	fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+	fixture.downloader.mu.Lock()
+	fixture.downloader.body = fixture.artifact[:len(fixture.artifact)-1]
+	fixture.downloader.mu.Unlock()
+	bridge := fixture.open(t)
+
+	gcPercent := debug.SetGCPercent(-1)
+	gcRestored := false
+	defer func() {
+		if !gcRestored {
+			debug.SetGCPercent(gcPercent)
+		}
+	}()
+	candidateFD, err := unix.Open(fixture.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Close(candidateFD); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bridge.Prepare(context.Background(), fixture.command); err == nil {
+		t.Fatal("Prepare() accepted a truncated artifact")
+	}
+	probeFD, err := unix.Open(fixture.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(probeFD)
+	if probeFD != candidateFD {
+		t.Fatalf("test setup did not reuse staged fd: probe=%d candidate=%d", probeFD, candidateFD)
+	}
+	if err := unix.Flock(probeFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	debug.SetGCPercent(gcPercent)
+	gcRestored = true
+	for attempt := 0; attempt < 10; attempt++ {
+		runtime.GC()
+		runtime.Gosched()
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(probeFD, &stat); err != nil {
+		t.Fatalf("probe fd was closed by a stale os.File finalizer: %v", err)
+	}
+	if err := unix.Flock(probeFD, unix.LOCK_UN); err != nil {
+		t.Fatalf("probe lock was invalidated by a stale os.File finalizer: %v", err)
+	}
+}
+
+func TestSourceAgentUpdateBridgeRejectsSpecialPermissionBits(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *sourceAgentUpdateBridgeFixtureForTest) bool
+	}{
+		{name: "install root sticky", mutate: func(t *testing.T, fixture *sourceAgentUpdateBridgeFixtureForTest) bool {
+			return sourceAgentUpdateSetSpecialModeForTest(t, fixture.root, 0o1700)
+		}},
+		{name: "install root setgid", mutate: func(t *testing.T, fixture *sourceAgentUpdateBridgeFixtureForTest) bool {
+			return sourceAgentUpdateSetSpecialModeForTest(t, fixture.root, 0o2700)
+		}},
+		{name: "worker setuid", mutate: func(t *testing.T, fixture *sourceAgentUpdateBridgeFixtureForTest) bool {
+			worker, _ := sourceAgentUpdateWorkerBasename(fixture.workerType)
+			return sourceAgentUpdateSetSpecialModeForTest(t, filepath.Join(fixture.root, worker), 0o4755)
+		}},
+		{name: "updater setgid", mutate: func(t *testing.T, fixture *sourceAgentUpdateBridgeFixtureForTest) bool {
+			return sourceAgentUpdateSetSpecialModeForTest(t, fixture.updater, 0o2755)
+		}},
+		{name: "staging directory sticky", mutate: func(t *testing.T, fixture *sourceAgentUpdateBridgeFixtureForTest) bool {
+			if err := os.Mkdir(filepath.Join(fixture.root, sourceAgentUpdateStagingDirectoryName), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return sourceAgentUpdateSetSpecialModeForTest(
+				t, filepath.Join(fixture.root, sourceAgentUpdateStagingDirectoryName), 0o1700,
+			)
+		}},
+		{name: "handoff directory setgid", mutate: func(t *testing.T, fixture *sourceAgentUpdateBridgeFixtureForTest) bool {
+			if err := os.Mkdir(filepath.Join(fixture.root, sourceAgentUpdateHandoffDirectoryName), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return sourceAgentUpdateSetSpecialModeForTest(
+				t, filepath.Join(fixture.root, sourceAgentUpdateHandoffDirectoryName), 0o2700,
+			)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+			if !test.mutate(t, fixture) {
+				t.Skip("filesystem did not preserve requested special permission bit")
+			}
+			if bridge, err := NewSourceAgentUpdateBridge(fixture.config()); err == nil {
+				_ = bridge.Close()
+				t.Fatal("constructor accepted special permission bits")
+			}
+		})
+	}
+
+	for _, target := range []string{"staged pending setuid", "handoff pending setgid", "staged fixed setuid", "handoff fixed setgid"} {
+		t.Run(target, func(t *testing.T) {
+			fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+			first := fixture.open(t)
+			if strings.Contains(target, "fixed") {
+				if _, err := first.Prepare(context.Background(), fixture.command); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := first.Close(); err != nil {
+				t.Fatal(err)
+			}
+			path := fixture.stagedPath()
+			mode := uint32(0o4755)
+			if target == "staged pending setuid" {
+				path = filepath.Join(fixture.root, sourceAgentUpdateStagingDirectoryName, sourceAgentUpdateStagedPendingName)
+				mode = 0o4600
+				if err := os.WriteFile(path, []byte("pending"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if target == "handoff pending setgid" {
+				path = filepath.Join(fixture.root, sourceAgentUpdateHandoffDirectoryName, sourceAgentUpdateHandoffPendingName)
+				mode = 0o2600
+				if err := os.WriteFile(path, []byte("pending"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if target == "handoff fixed setgid" {
+				path = fixture.handoffPath()
+				mode = 0o2600
+			}
+			if !sourceAgentUpdateSetSpecialModeForTest(t, path, mode) {
+				t.Skip("filesystem did not preserve requested special permission bit")
+			}
+			second, err := NewSourceAgentUpdateBridge(fixture.config())
+			if strings.Contains(target, "pending") {
+				if err == nil {
+					_ = second.Close()
+					t.Fatal("constructor accepted a special-mode pending file")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer second.Close()
+			if _, err := second.Prepare(context.Background(), fixture.command); err == nil {
+				t.Fatal("Prepare() accepted a special-mode fixed file")
+			}
+		})
+	}
+}
+
+func sourceAgentUpdateSetSpecialModeForTest(t *testing.T, path string, mode uint32) bool {
+	t.Helper()
+	if err := unix.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		t.Fatal(err)
+	}
+	return stat.Mode&uint16(unix.S_ISUID|unix.S_ISGID|unix.S_ISVTX) != 0
 }
 
 type sourceAgentUpdateFailingReaderForTest struct {
