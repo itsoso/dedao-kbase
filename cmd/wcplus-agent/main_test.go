@@ -46,6 +46,7 @@ func TestWCPlusAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T)
 		loader func(context.Context) (string, error)
 	}{
 		{name: "blank environment", values: map[string]string{"KBASE_SOURCE_AGENT_TOKEN": "\t"}, loader: func(context.Context) (string, error) { return "fallback", nil }},
+		{name: "oversize environment", values: map[string]string{"KBASE_SOURCE_AGENT_TOKEN": strings.Repeat("x", 1025)}, loader: func(context.Context) (string, error) { return "fallback", nil }},
 		{name: "missing secret", loader: func(context.Context) (string, error) { return "", errors.New("raw /private/tmp token-sentinel") }},
 	} {
 		t.Run(test.name, func(t *testing.T) {

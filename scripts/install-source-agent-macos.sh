@@ -1,22 +1,9 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
+set +a
 umask 077
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$script_dir/.." && pwd)"
-home="${HOME:?HOME is required}"
-label="life.executor.kbase.source-agent"
-worker_type="wechat-worker"
-transport_token_service="life.executor.kbase.source-agent"
-transport_token_account="transport-token"
-binary_source="${SOURCE_AGENT_BINARY_PATH:-$repo_root/build/bin/source-agent}"
-updater_source="${SOURCE_AGENT_UPDATER_BINARY_PATH:-$repo_root/build/bin/source-agent-updater}"
-install_dir="${SOURCE_AGENT_INSTALL_DIR:-$home/Library/Application Support/KBase/bin}"
-state_dir="${SOURCE_AGENT_STATE_DIR:-$home/Library/Application Support/KBase/source-agent}"
-log_dir="${SOURCE_AGENT_LOG_DIR:-$state_dir/logs}"
-plist_path="${SOURCE_AGENT_PLIST_PATH:-$home/Library/LaunchAgents/$label.plist}"
-enroll_addr="${SOURCE_AGENT_ENROLL_ADDR:-127.0.0.1:8765}"
 mode="install"
 
 usage() {
@@ -52,6 +39,22 @@ fi
 transport_token="$KBASE_SOURCE_AGENT_TOKEN"
 unset KBASE_SOURCE_AGENT_TOKEN
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+home="${HOME:?HOME is required}"
+label="life.executor.kbase.source-agent"
+worker_type="wechat-worker"
+transport_token_service="life.executor.kbase.source-agent"
+transport_token_account="transport-token"
+max_transport_token_bytes=1024
+binary_source="${SOURCE_AGENT_BINARY_PATH:-$repo_root/build/bin/source-agent}"
+updater_source="${SOURCE_AGENT_UPDATER_BINARY_PATH:-$repo_root/build/bin/source-agent-updater}"
+install_dir="${SOURCE_AGENT_INSTALL_DIR:-$home/Library/Application Support/KBase/bin}"
+state_dir="${SOURCE_AGENT_STATE_DIR:-$home/Library/Application Support/KBase/source-agent}"
+log_dir="${SOURCE_AGENT_LOG_DIR:-$state_dir/logs}"
+plist_path="${SOURCE_AGENT_PLIST_PATH:-$home/Library/LaunchAgents/$label.plist}"
+enroll_addr="${SOURCE_AGENT_ENROLL_ADDR:-127.0.0.1:8765}"
+
 for command_name in cat install launchctl mktemp mv plutil sed; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     echo "missing required command: $command_name" >&2
@@ -70,7 +73,7 @@ if [[ ! -x "$updater_source" ]]; then
   echo "SOURCE_AGENT_UPDATER_BINARY_PATH must point to an executable" >&2
   exit 2
 fi
-if ! printf '%s' "$transport_token" | LC_ALL=C grep -Eq '^[!-~]+$'; then
+if ((${#transport_token} > max_transport_token_bytes)) || ! printf '%s' "$transport_token" | LC_ALL=C grep -Eq '^[!-~]+$'; then
   echo "KBASE_SOURCE_AGENT_TOKEN must contain printable ASCII without spaces" >&2
   exit 2
 fi
@@ -166,6 +169,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
+publish_artifact_pair() {
+  local worker_source="$1" updater_source="$2" worker_destination="$3" updater_destination="$4"
+  local worker_backup="${worker_destination}.backup.$$" updater_backup="${updater_destination}.backup.$$"
+  local worker_backed_up=false updater_backed_up=false worker_published=false updater_published=false
+  local rollback_failed=false destination
+
+  for destination in "$worker_destination" "$updater_destination"; do
+    if [[ -L "$destination" || (-e "$destination" && ! -f "$destination") ]]; then
+      echo "artifact destination must be a regular file" >&2
+      return 1
+    fi
+  done
+  if [[ -e "$worker_backup" || -L "$worker_backup" || -e "$updater_backup" || -L "$updater_backup" ]]; then
+    echo "artifact publication backup already exists" >&2
+    return 1
+  fi
+  if [[ -e "$worker_destination" ]]; then
+    if ! mv -f "$worker_destination" "$worker_backup"; then return 1; fi
+    worker_backed_up=true
+  fi
+  if [[ -e "$updater_destination" ]]; then
+    if ! mv -f "$updater_destination" "$updater_backup"; then
+      if [[ "$worker_backed_up" == true ]] && ! mv -f "$worker_backup" "$worker_destination"; then rollback_failed=true; fi
+      [[ "$rollback_failed" == false ]] || echo "artifact publication rollback failed" >&2
+      return 1
+    fi
+    updater_backed_up=true
+  fi
+  if mv -f "$worker_source" "$worker_destination"; then
+    worker_published=true
+    if mv -f "$updater_source" "$updater_destination"; then updater_published=true; fi
+  fi
+  if [[ "$worker_published" == true && "$updater_published" == true ]]; then
+    rm -f "$worker_backup" "$updater_backup"
+    return 0
+  fi
+
+  if [[ "$worker_published" == true ]] && ! rm -f "$worker_destination"; then rollback_failed=true; fi
+  if [[ "$updater_published" == true ]] && ! rm -f "$updater_destination"; then rollback_failed=true; fi
+  if [[ "$worker_backed_up" == true ]] && ! mv -f "$worker_backup" "$worker_destination"; then rollback_failed=true; fi
+  if [[ "$updater_backed_up" == true ]] && ! mv -f "$updater_backup" "$updater_destination"; then rollback_failed=true; fi
+  if [[ "$rollback_failed" == true ]]; then echo "artifact publication rollback failed" >&2; fi
+  return 1
+}
+
 if [[ "$mode" == "render" ]]; then
   render_plist "$tmp_plist" "$binary_source"
   cat "$tmp_plist"
@@ -193,9 +241,11 @@ worker_tmp="$install_dir/.source-agent.$$"
 updater_tmp="$install_dir/.source-agent-updater.$$"
 install -m 0755 "$binary_source" "$worker_tmp"
 install -m 0755 "$updater_source" "$updater_tmp"
-mv -f "$worker_tmp" "$installed_worker"
+if ! publish_artifact_pair "$worker_tmp" "$updater_tmp" "$installed_worker" "$installed_updater"; then
+  echo "source-agent artifact installation failed" >&2
+  exit 1
+fi
 worker_tmp=""
-mv -f "$updater_tmp" "$installed_updater"
 updater_tmp=""
 if ! "$install_dir/source-agent-updater" --check --worker-type wechat-worker >/dev/null 2>&1; then
   echo "installed source-agent updater preflight failed" >&2

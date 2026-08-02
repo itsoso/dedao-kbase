@@ -43,18 +43,71 @@ if [[ "$worker_output" == "$updater_output" ]]; then
   echo "worker and updater output paths must differ" >&2
   exit 2
 fi
+worker_parent="$(dirname "$worker_output")"
+updater_parent="$(dirname "$updater_output")"
+if [[ "$worker_parent" != "$updater_parent" ]]; then
+  echo "worker and updater outputs must share one directory" >&2
+  exit 2
+fi
 if [[ "$mode" == "check" ]]; then
   echo "source-agent build environment is ready for darwin/$goarch"
   exit 0
 fi
 
-mkdir -p "$(dirname "$worker_output")" "$(dirname "$updater_output")"
+mkdir -p "$worker_parent"
 worker_tmp="${worker_output}.tmp.$$"
 updater_tmp="${updater_output}.tmp.$$"
 cleanup() {
   rm -f "$worker_tmp" "$updater_tmp"
 }
 trap cleanup EXIT
+
+publish_artifact_pair() {
+  local worker_source="$1" updater_source="$2" worker_destination="$3" updater_destination="$4"
+  local worker_backup="${worker_destination}.backup.$$" updater_backup="${updater_destination}.backup.$$"
+  local worker_backed_up=false updater_backed_up=false worker_published=false updater_published=false
+  local rollback_failed=false destination
+
+  for destination in "$worker_destination" "$updater_destination"; do
+    if [[ -L "$destination" || (-e "$destination" && ! -f "$destination") ]]; then
+      echo "artifact destination must be a regular file" >&2
+      return 1
+    fi
+  done
+  if [[ -e "$worker_backup" || -L "$worker_backup" || -e "$updater_backup" || -L "$updater_backup" ]]; then
+    echo "artifact publication backup already exists" >&2
+    return 1
+  fi
+  if [[ -e "$worker_destination" ]]; then
+    if ! mv -f "$worker_destination" "$worker_backup"; then return 1; fi
+    worker_backed_up=true
+  fi
+  if [[ -e "$updater_destination" ]]; then
+    if ! mv -f "$updater_destination" "$updater_backup"; then
+      if [[ "$worker_backed_up" == true ]] && ! mv -f "$worker_backup" "$worker_destination"; then rollback_failed=true; fi
+      [[ "$rollback_failed" == false ]] || echo "artifact publication rollback failed" >&2
+      return 1
+    fi
+    updater_backed_up=true
+  fi
+  if mv -f "$worker_source" "$worker_destination"; then
+    worker_published=true
+    if mv -f "$updater_source" "$updater_destination"; then
+      updater_published=true
+    fi
+  fi
+  if [[ "$worker_published" == true && "$updater_published" == true ]]; then
+    rm -f "$worker_backup" "$updater_backup"
+    return 0
+  fi
+
+  if [[ "$worker_published" == true ]] && ! rm -f "$worker_destination"; then rollback_failed=true; fi
+  if [[ "$updater_published" == true ]] && ! rm -f "$updater_destination"; then rollback_failed=true; fi
+  if [[ "$worker_backed_up" == true ]] && ! mv -f "$worker_backup" "$worker_destination"; then rollback_failed=true; fi
+  if [[ "$updater_backed_up" == true ]] && ! mv -f "$updater_backup" "$updater_destination"; then rollback_failed=true; fi
+  if [[ "$rollback_failed" == true ]]; then echo "artifact publication rollback failed" >&2; fi
+  return 1
+}
 
 (
   cd "$repo_root"
@@ -64,11 +117,10 @@ trap cleanup EXIT
     go build -trimpath -ldflags="-s -w" -o "$updater_tmp" ./cmd/source-agent-updater
 )
 chmod 0755 "$worker_tmp" "$updater_tmp"
-if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  codesign --force --options runtime --sign "$CODESIGN_IDENTITY" "$worker_tmp"
+if ! publish_artifact_pair "$worker_tmp" "$updater_tmp" "$worker_output" "$updater_output"; then
+  echo "source-agent artifact publication failed" >&2
+  exit 1
 fi
-mv -f "$worker_tmp" "$worker_output"
-mv -f "$updater_tmp" "$updater_output"
 trap - EXIT
 
 echo "source-agent built for darwin/$goarch"

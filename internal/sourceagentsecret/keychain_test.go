@@ -44,6 +44,8 @@ func TestResolveTransportTokenFailsClosedWithoutLeakingInputOrRawErrors(t *testi
 		{name: "explicit empty", value: "", provided: true, loader: func(context.Context) (string, error) { return "fallback", nil }},
 		{name: "explicit whitespace", value: "  ", provided: true, loader: func(context.Context) (string, error) { return "fallback", nil }},
 		{name: "stored whitespace", loader: func(context.Context) (string, error) { return "\t", nil }},
+		{name: "explicit oversize", value: strings.Repeat("x", MaxTransportTokenBytes+1), provided: true, loader: func(context.Context) (string, error) { return "fallback", nil }},
+		{name: "stored oversize", loader: func(context.Context) (string, error) { return strings.Repeat("x", MaxTransportTokenBytes+1), nil }},
 		{name: "stored missing", loader: func(context.Context) (string, error) { return "", ErrTransportTokenUnavailable }},
 		{name: "unsupported", loader: func(context.Context) (string, error) { return "", ErrUnsupportedPlatform }},
 		{name: "raw loader error", loader: func(context.Context) (string, error) { return "", errors.New("raw /Users/private token-sentinel") }},
@@ -96,5 +98,17 @@ func TestKeychainTransportTokenUsesFixedServiceAndAccountWithoutSecretArguments(
 	}
 	if len(input) != 0 || strings.Contains(strings.Join(args, " "), token) {
 		t.Fatalf("secret reached command input or arguments: args=%q input=%q", args, input)
+	}
+}
+
+func TestKeychainTransportTokenRejectsOversizeRunnerOutput(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin Keychain runner")
+	}
+	_, err := loadTransportToken(context.Background(), func(context.Context, string, []string, []byte) ([]byte, error) {
+		return []byte(strings.Repeat("x", MaxTransportTokenBytes+1) + "\n"), nil
+	})
+	if !errors.Is(err, ErrTransportTokenUnavailable) {
+		t.Fatalf("error=%v", err)
 	}
 }

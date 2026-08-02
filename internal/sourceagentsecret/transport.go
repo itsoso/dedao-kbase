@@ -6,8 +6,9 @@ import (
 )
 
 const (
-	KeychainService       = "life.executor.kbase.source-agent"
-	TransportTokenAccount = "transport-token"
+	KeychainService        = "life.executor.kbase.source-agent"
+	TransportTokenAccount  = "transport-token"
+	MaxTransportTokenBytes = 1024
 )
 
 var (
@@ -41,7 +42,7 @@ func ResolveTransportToken(ctx context.Context, value string, provided bool, loa
 }
 
 func validTransportToken(value string) bool {
-	if value == "" {
+	if value == "" || len(value) > MaxTransportTokenBytes {
 		return false
 	}
 	for index := 0; index < len(value); index++ {
