@@ -480,20 +480,22 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *kbaseHTTPHandler) handleDedaoSession(w http.ResponseWriter) {
+	setHTTPNoStore(w)
 	writeHTTPJSON(w, http.StatusOK, h.dedaoAuth.Session())
 }
 
 func (h *kbaseHTTPHandler) handleDedaoAuthQRCode(w http.ResponseWriter) {
+	setHTTPNoStore(w)
 	qr, err := h.dedaoAuth.NewQRCode()
 	if err != nil {
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	setHTTPNoStore(w)
 	writeHTTPJSON(w, http.StatusOK, qr)
 }
 
 func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.Request) {
+	setHTTPNoStore(w)
 	defer r.Body.Close()
 	var request DedaoLoginCheckRequest
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
@@ -513,7 +515,6 @@ func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.R
 		writeHTTPError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	setHTTPNoStore(w)
 	writeHTTPJSON(w, http.StatusOK, result)
 }
 

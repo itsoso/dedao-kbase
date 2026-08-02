@@ -45,6 +45,9 @@ func TestKBaseHTTPHandlerServesDedaoSessionAndQRCode(t *testing.T) {
 	if session.Code != http.StatusOK || !strings.Contains(session.Body.String(), `"logged_in":true`) || !strings.Contains(session.Body.String(), `"name":"测试用户"`) {
 		t.Fatalf("session status=%d body=%s", session.Code, session.Body.String())
 	}
+	if !strings.Contains(session.Header().Get("Cache-Control"), "no-store") || session.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("session cache headers = %#v", session.Header())
+	}
 	assertDedaoWebAuthResponseOmitsSecrets(t, session.Body.String())
 
 	qr := requestJSONKBase(handler, http.MethodPost, "/api/dedao/auth/qrcode", "secret-token", `{}`)
