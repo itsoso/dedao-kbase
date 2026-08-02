@@ -176,6 +176,75 @@ func TestSourceAgentUpdateReceiptStoreRequiresProtectedRealDirectory(t *testing.
 	}
 }
 
+func TestSourceAgentUpdateInstallLockSurvivesReceiptRootReplacement(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	config := fixture.transaction.config
+	config.FileSystem = nil
+	config.Receipts = nil
+	first, err := NewSourceAgentUpdateTransaction(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	receiptRoot := config.ReceiptRoot
+	oldRoot := receiptRoot + ".old"
+	if err := os.Rename(receiptRoot, oldRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(receiptRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewSourceAgentUpdateTransaction(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	release, err := first.fs.Acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if _, err := second.fs.Acquire(context.Background()); !errors.Is(err, ErrSourceAgentUpdateBusy) {
+		t.Fatalf("second install lock error=%v", err)
+	}
+}
+
+func TestSourceAgentUpdateExecutableFIFOIsRejectedWithoutBlocking(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	config := fixture.transaction.config
+	config.FileSystem = nil
+	config.Receipts = nil
+	transaction, err := NewSourceAgentUpdateTransaction(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = transaction.Close() })
+	if err := os.Remove(fixture.executable); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(fixture.executable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	resultChannel := make(chan SourceAgentUpdateResult, 1)
+	go func() { resultChannel <- transaction.Apply(context.Background(), fixture.request) }()
+	select {
+	case result := <-resultChannel:
+		if result.Code != SourceAgentCommandCodeInstallFailed {
+			t.Fatalf("result=%#v", result)
+		}
+	case <-time.After(150 * time.Millisecond):
+		writer, openErr := unix.Open(fixture.executable, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if openErr == nil {
+			_ = unix.Close(writer)
+		}
+		<-resultChannel
+		t.Fatal("FIFO executable open blocked updater")
+	}
+}
+
 func sourceAgentUpdateTestReadyReceipt() SourceAgentReadyReceipt {
 	return SourceAgentReadyReceipt{
 		CommandID: "command-1", AttemptNonce: strings.Repeat("a", 64),

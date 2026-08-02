@@ -95,12 +95,13 @@ func (d *unixSourceAgentUpdateDirectory) writeImmutable(name string, payload []b
 		if readErr != nil || !bytes.Equal(existing, payload) {
 			return errors.New("source agent update state conflicts")
 		}
-		return d.sync()
+		if syncErr := d.sync(); syncErr != nil {
+			return newSourceAgentUpdatePublishedError(syncErr)
+		}
+		return nil
 	}
 	if err := d.sync(); err != nil {
-		_ = unix.Unlinkat(d.fd, name, 0)
-		_ = d.sync()
-		return err
+		return newSourceAgentUpdatePublishedError(err)
 	}
 	return nil
 }

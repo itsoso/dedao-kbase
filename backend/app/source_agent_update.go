@@ -12,7 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 )
 
@@ -26,11 +26,14 @@ const (
 	SourceAgentUpdateCodeInterrupted              = "upgrade_interrupted"
 	SourceAgentUpdateCodeRecoveryFailed           = "upgrade_recovery_failed"
 	SourceAgentUpdateCodeOutcomePersistenceFailed = "outcome_persistence_failed"
+	SourceAgentUpdateCodeClosed                   = "upgrade_closed"
 
 	sourceAgentUpdateCodeInvalidRequest            = "upgrade_request_invalid"
 	sourceAgentUpdateReceiptMaxBytes               = 8 << 10
 	sourceAgentUpdateDefaultTimeout                = 2 * time.Minute
 	sourceAgentUpdateDefaultPoll                   = 100 * time.Millisecond
+	sourceAgentUpdateDefaultRestartTimeout         = 30 * time.Second
+	sourceAgentUpdateMaximumRestartTimeout         = 2 * time.Minute
 	sourceAgentUpdateJournalFileName               = ".source-agent-update-journal.json"
 	sourceAgentUpdateJournalSchema                 = "source-agent-update-journal.v1"
 	sourceAgentUpdateFaultAfterBackup              = "after_backup"
@@ -51,6 +54,30 @@ var (
 	errSourceAgentUpdateStorageUnavailable = errors.New("source agent update storage unavailable")
 	errSourceAgentUpdateUnsupportedStorage = errors.New("source agent update storage unsupported")
 )
+
+type sourceAgentUpdateOutcomePublication uint8
+
+const (
+	sourceAgentUpdateOutcomeNotPublished sourceAgentUpdateOutcomePublication = iota
+	sourceAgentUpdateOutcomePublished
+	sourceAgentUpdateOutcomeDurable
+)
+
+type sourceAgentUpdatePublishedError struct {
+	cause error
+}
+
+func (e *sourceAgentUpdatePublishedError) Error() string { return e.cause.Error() }
+func (e *sourceAgentUpdatePublishedError) Unwrap() error { return e.cause }
+
+func newSourceAgentUpdatePublishedError(err error) error {
+	return &sourceAgentUpdatePublishedError{cause: err}
+}
+
+func isSourceAgentUpdatePublishedError(err error) bool {
+	var published *sourceAgentUpdatePublishedError
+	return errors.As(err, &published)
+}
 
 // SourceAgentUpdateRequest contains only locally resolved artifact metadata.
 // StagedBinary is resolved beneath the constructor's fixed staging root; it is
@@ -120,6 +147,7 @@ type SourceAgentUpdatePreparedFile interface {
 }
 
 type SourceAgentUpdateFileSystem interface {
+	Acquire(context.Context) (func(), error)
 	OpenStaged(string, string) (SourceAgentUpdateStagedFile, error)
 	CreatePrepared(string, string) (SourceAgentUpdatePreparedFile, error)
 	BackupExecutable(string, string) (SourceAgentBinaryIdentity, error)
@@ -129,11 +157,14 @@ type SourceAgentUpdateFileSystem interface {
 	RegularFileIdentity(string) (SourceAgentBinaryIdentity, error)
 	SyncDirectory(string) error
 	Remove(string) error
+	Close() error
 }
 
 type SourceAgentBinaryIdentity struct {
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"`
+	Device uint64 `json:"device"`
+	Inode  uint64 `json:"inode"`
 }
 
 type SourceAgentReadyExpectation struct {
@@ -229,6 +260,7 @@ type SourceAgentUpdateConfig struct {
 	ReceiptRoot       string
 
 	ReadyTimeout   time.Duration
+	RestartTimeout time.Duration
 	FileSystem     SourceAgentUpdateFileSystem
 	ProcessControl SourceAgentUpdateProcessControl
 	Guard          SourceAgentUpdateGuard
@@ -244,6 +276,10 @@ type SourceAgentUpdateTransaction struct {
 	receipts   SourceAgentUpdateReceiptStore
 	clock      SourceAgentUpdateClock
 	faultStage string
+	lifecycle  sync.RWMutex
+	closed     bool
+	ownedFS    bool
+	ownedStore bool
 }
 
 type realSourceAgentUpdateClock struct{}
@@ -275,17 +311,34 @@ func NewSourceAgentUpdateTransaction(config SourceAgentUpdateConfig) (*SourceAge
 	if config.ReadyTimeout > 10*time.Minute {
 		return nil, errors.New("source agent update ready timeout is too large")
 	}
+	if config.RestartTimeout <= 0 {
+		config.RestartTimeout = sourceAgentUpdateDefaultRestartTimeout
+	}
+	if config.RestartTimeout > sourceAgentUpdateMaximumRestartTimeout {
+		return nil, errors.New("source agent update restart timeout is too large")
+	}
 	fs := config.FileSystem
+	ownedFS := false
 	if fs == nil {
-		fs = NewOSSourceAgentUpdateFileSystem()
+		var err error
+		fs, err = NewOSSourceAgentUpdateFileSystem(config.CurrentExecutable)
+		if err != nil {
+			return nil, err
+		}
+		ownedFS = true
 	}
 	receipts := config.Receipts
+	ownedStore := false
 	if receipts == nil {
 		var err error
 		receipts, err = NewFileSourceAgentUpdateReceiptStore(config.ReceiptRoot, sourceAgentUpdateDefaultPoll)
 		if err != nil {
+			if ownedFS {
+				_ = fs.Close()
+			}
 			return nil, err
 		}
+		ownedStore = true
 	}
 	clock := config.Clock
 	if clock == nil {
@@ -293,8 +346,39 @@ func NewSourceAgentUpdateTransaction(config SourceAgentUpdateConfig) (*SourceAge
 	}
 	return &SourceAgentUpdateTransaction{
 		config: config, fs: fs, process: config.ProcessControl, guard: config.Guard,
-		receipts: receipts, clock: clock,
+		receipts: receipts, clock: clock, ownedFS: ownedFS, ownedStore: ownedStore,
 	}, nil
+}
+
+func (u *SourceAgentUpdateTransaction) Close() error {
+	u.lifecycle.Lock()
+	defer u.lifecycle.Unlock()
+	if u.closed {
+		return nil
+	}
+	u.closed = true
+	var closeErrors []error
+	if u.ownedStore {
+		if closer, ok := u.receipts.(interface{ Close() error }); ok {
+			closeErrors = append(closeErrors, closer.Close())
+		}
+	}
+	if u.ownedFS {
+		closeErrors = append(closeErrors, u.fs.Close())
+	}
+	return errors.Join(closeErrors...)
+}
+
+func (u *SourceAgentUpdateTransaction) restart(ctx context.Context, ignoreCancellation bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ignoreCancellation {
+		ctx = context.WithoutCancel(ctx)
+	}
+	restartCtx, cancel := context.WithTimeout(ctx, u.config.RestartTimeout)
+	defer cancel()
+	return u.process.Restart(restartCtx)
 }
 
 func isAllowedSourceAgentUpdateWorkerType(workerType string) bool {
@@ -302,14 +386,19 @@ func isAllowedSourceAgentUpdateWorkerType(workerType string) bool {
 }
 
 func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request SourceAgentUpdateRequest) SourceAgentUpdateResult {
+	u.lifecycle.RLock()
+	defer u.lifecycle.RUnlock()
 	started := u.clock.Now()
+	if u.closed {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeClosed, false)
+	}
 	if code := u.validateRequest(request); code != "" {
 		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
 	}
 	if ctx.Err() != nil {
 		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false)
 	}
-	release, err := u.receipts.Acquire(ctx, request.CommandID)
+	release, err := u.fs.Acquire(ctx)
 	if err != nil {
 		code := SourceAgentUpdateCodeBusy
 		if ctx.Err() != nil {
@@ -330,6 +419,9 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		}
 	}
 	if journalErr != nil {
+		if outcomeFound {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+		}
 		return u.recoverUnboundBackup(ctx, started, request)
 	}
 	if journalFound {
@@ -339,7 +431,7 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		}
 		if terminalFound {
 			if !sourceAgentUpdateOutcomeMatchesJournal(terminal, journal) {
-				return u.recoverUnboundBackup(ctx, started, request)
+				return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
 			}
 			var cleanupErr error
 			if sourceAgentUpdateTerminalNeedsRecovery(terminal, journal) {
@@ -371,8 +463,12 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, "orphan", SourceAgentBinaryIdentity{}); err != nil {
 			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
 		}
-		_ = u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
-		_ = u.process.Restart(context.WithoutCancel(ctx))
+		if err := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable)); err != nil {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+		}
+		if err := u.restart(ctx, true); err != nil {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+		}
 		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, true)
 	}
 
@@ -459,6 +555,10 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 	if ctx.Err() != nil {
 		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentUpdateCodeCanceled)
 	}
+	currentIdentity, err := u.fs.RegularFileIdentity(u.config.CurrentExecutable)
+	if err != nil || currentIdentity != journal.Backup {
+		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentCommandCodeInstallFailed)
+	}
 	if err := u.fs.ReplaceExecutable(preparedPath, u.config.CurrentExecutable); err != nil {
 		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentCommandCodeInstallFailed)
 	}
@@ -475,7 +575,7 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 	if ctx.Err() != nil {
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
-	if err := u.process.Restart(ctx); err != nil {
+	if err := u.restart(ctx, false); err != nil {
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
 	if u.faultStage == sourceAgentUpdateFaultAfterRestart {
@@ -505,14 +605,17 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 	}
 	succeeded := u.finishResult(started, request, SourceAgentUpdateOutcomeSucceeded, SourceAgentCommandCodeUpgradeComplete, false)
 	succeeded.RuntimeVersion = request.TargetVersion
-	if persisted, durable := u.persistOutcome(succeeded); !durable {
-		_ = persisted
+	persisted, publication := u.persistOutcome(succeeded)
+	if publication == sourceAgentUpdateOutcomeNotPublished {
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
-	if err := u.finalizeDurableOutcome(journal); err != nil {
-		return succeeded
+	if publication == sourceAgentUpdateOutcomePublished {
+		return persisted
 	}
-	return succeeded
+	if err := u.finalizeDurableOutcome(journal); err != nil {
+		return persisted
+	}
+	return persisted
 }
 
 func (u *SourceAgentUpdateTransaction) loadJournalOutcome(
@@ -545,7 +648,7 @@ func (u *SourceAgentUpdateTransaction) recoverDurableTerminal(ctx context.Contex
 	if err := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable)); err != nil {
 		return err
 	}
-	if err := u.process.Restart(context.WithoutCancel(ctx)); err != nil {
+	if err := u.restart(ctx, true); err != nil {
 		return err
 	}
 	journal = u.advanceJournal(journal, "terminal_cleanup")
@@ -564,10 +667,13 @@ func (u *SourceAgentUpdateTransaction) recoverUnboundBackup(ctx context.Context,
 	if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, "recovery", SourceAgentBinaryIdentity{}); err != nil {
 		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
 	}
-	restored := true
-	_ = u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
-	_ = u.process.Restart(context.WithoutCancel(ctx))
-	return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, restored)
+	if err := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable)); err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+	}
+	if err := u.restart(ctx, true); err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+	}
+	return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, true)
 }
 
 func (u *SourceAgentUpdateTransaction) rollback(
@@ -585,15 +691,15 @@ func (u *SourceAgentUpdateTransaction) rollback(
 	syncErr := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
 	journal = u.advanceJournal(journal, "rollback_restored")
 	journalErr := u.receipts.saveJournal(journal)
-	restartErr := u.process.Restart(ctx)
+	restartErr := u.restart(ctx, true)
 	if syncErr != nil || journalErr != nil || restartErr != nil {
 		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, true)
 		persisted, _ := u.persistOutcome(result)
 		return persisted
 	}
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
-	persisted, durable := u.persistOutcome(result)
-	if durable {
+	persisted, publication := u.persistOutcome(result)
+	if publication == sourceAgentUpdateOutcomeDurable {
 		if err := u.finalizeDurableOutcome(journal); err != nil {
 			return persisted
 		}
@@ -601,14 +707,27 @@ func (u *SourceAgentUpdateTransaction) rollback(
 	return persisted
 }
 
-func (u *SourceAgentUpdateTransaction) persistOutcome(result SourceAgentUpdateResult) (SourceAgentUpdateResult, bool) {
+func (u *SourceAgentUpdateTransaction) persistOutcome(result SourceAgentUpdateResult) (SourceAgentUpdateResult, sourceAgentUpdateOutcomePublication) {
 	if err := u.receipts.SaveOutcome(result); err != nil {
-		if retryErr := u.receipts.SaveOutcome(result); retryErr != nil {
+		if u.outcomeWasPublished(result, err) {
 			result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
-			return result, false
+			return result, sourceAgentUpdateOutcomePublished
+		}
+		if retryErr := u.receipts.SaveOutcome(result); retryErr != nil {
+			publication := sourceAgentUpdateOutcomeNotPublished
+			if u.outcomeWasPublished(result, retryErr) {
+				publication = sourceAgentUpdateOutcomePublished
+			}
+			result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
+			return result, publication
 		}
 	}
-	return result, true
+	return result, sourceAgentUpdateOutcomeDurable
+}
+
+func (u *SourceAgentUpdateTransaction) outcomeWasPublished(result SourceAgentUpdateResult, saveErr error) bool {
+	stored, found, loadErr := u.receipts.LoadOutcome(result.CommandID)
+	return (loadErr == nil && found && stored == result) || isSourceAgentUpdatePublishedError(saveErr)
 }
 
 func (u *SourceAgentUpdateTransaction) finishResult(started time.Time, request SourceAgentUpdateRequest, outcome, code string, restored bool) SourceAgentUpdateResult {
@@ -625,8 +744,8 @@ func (u *SourceAgentUpdateTransaction) finishResult(started time.Time, request S
 func (u *SourceAgentUpdateTransaction) failBeforeReplace(started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal, preparedPath, backupPath, code string) SourceAgentUpdateResult {
 	if journal.Stage == "backup_durable" && validSourceAgentBinaryIdentity(journal.Backup) {
 		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
-		persisted, durable := u.persistOutcome(result)
-		if !durable {
+		persisted, publication := u.persistOutcome(result)
+		if publication != sourceAgentUpdateOutcomeDurable {
 			return persisted
 		}
 		if u.faultStage == sourceAgentUpdateFaultPreReplaceAfterOutcome {
@@ -697,7 +816,7 @@ func (u *SourceAgentUpdateTransaction) recoverInterrupted(ctx context.Context, s
 		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false), true
 	}
 	syncErr := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
-	restartErr := u.process.Restart(context.WithoutCancel(ctx))
+	restartErr := u.restart(ctx, true)
 	journal = u.advanceJournal(journal, "rollback_restored")
 	journalErr := u.receipts.saveJournal(journal)
 	if syncErr != nil || restartErr != nil || journalErr != nil {
@@ -706,8 +825,8 @@ func (u *SourceAgentUpdateTransaction) recoverInterrupted(ctx context.Context, s
 		return persisted, true
 	}
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
-	persisted, durable := u.persistOutcome(result)
-	if durable {
+	persisted, publication := u.persistOutcome(result)
+	if publication == sourceAgentUpdateOutcomeDurable {
 		if err := u.finalizeDurableOutcome(journal); err != nil {
 			return persisted, true
 		}
@@ -789,13 +908,16 @@ func (u *SourceAgentUpdateTransaction) baseResult(request SourceAgentUpdateReque
 }
 
 func sourceAgentUpdateOutcomeMatches(result SourceAgentUpdateResult, request SourceAgentUpdateRequest) bool {
-	return result.CommandID == request.CommandID && result.Platform == request.Platform &&
-		result.WorkerType == request.WorkerType && result.Architecture == request.Architecture && result.Channel == request.Channel &&
-		result.ProtocolVersion == request.ProtocolVersion && result.Revision == request.Revision &&
-		result.RequestFingerprint == sourceAgentUpdateRequestFingerprint(request) &&
-		(result.RuntimeVersion == request.TargetVersion || result.RuntimeVersion == request.CurrentVersion) &&
-		(result.Outcome == SourceAgentUpdateOutcomeSucceeded || result.Outcome == SourceAgentUpdateOutcomeRolledBack ||
-			result.Outcome == SourceAgentUpdateOutcomeFailed)
+	if !validSourceAgentUpdateResult(result) || result.CommandID != request.CommandID || result.Platform != request.Platform ||
+		result.WorkerType != request.WorkerType || result.Architecture != request.Architecture || result.Channel != request.Channel ||
+		result.ProtocolVersion != request.ProtocolVersion || result.Revision != request.Revision ||
+		result.RequestFingerprint != sourceAgentUpdateRequestFingerprint(request) {
+		return false
+	}
+	if result.Outcome == SourceAgentUpdateOutcomeSucceeded {
+		return result.RuntimeVersion == request.TargetVersion
+	}
+	return result.RuntimeVersion == request.CurrentVersion
 }
 
 func sourceAgentUpdateOutcomeMatchesJournal(result SourceAgentUpdateResult, journal sourceAgentUpdateJournal) bool {
@@ -804,7 +926,42 @@ func sourceAgentUpdateOutcomeMatchesJournal(result SourceAgentUpdateResult, jour
 		result.WorkerType == journal.WorkerType && result.Platform == journal.Platform &&
 		result.Architecture == journal.Architecture && result.Channel == journal.Channel &&
 		result.ProtocolVersion == journal.ProtocolVersion && result.Revision == journal.Revision &&
-		(result.RuntimeVersion == journal.CurrentVersion || result.RuntimeVersion == journal.TargetVersion)
+		validSourceAgentUpdateTerminalCombination(result, journal)
+}
+
+func validSourceAgentUpdateTerminalCombination(result SourceAgentUpdateResult, journal sourceAgentUpdateJournal) bool {
+	if result.PersistenceCode != "" {
+		return false
+	}
+	switch result.Outcome {
+	case SourceAgentUpdateOutcomeSucceeded:
+		return result.Code == SourceAgentCommandCodeUpgradeComplete && !result.BinaryRestored &&
+			result.RuntimeVersion == journal.TargetVersion && sourceAgentUpdateJournalStageIs(journal.Stage, "ready", "terminal_cleanup")
+	case SourceAgentUpdateOutcomeRolledBack:
+		return result.Code == SourceAgentCommandCodeRollbackComplete && result.BinaryRestored &&
+			result.RuntimeVersion == journal.CurrentVersion && sourceAgentUpdateJournalStageIs(journal.Stage, "rollback_restored", "terminal_cleanup")
+	case SourceAgentUpdateOutcomeFailed:
+		if result.RuntimeVersion != journal.CurrentVersion {
+			return false
+		}
+		switch result.Code {
+		case SourceAgentCommandCodeVerificationFailed, SourceAgentCommandCodeInstallFailed, SourceAgentUpdateCodeCanceled:
+			return !result.BinaryRestored && sourceAgentUpdateJournalStageIs(journal.Stage, "started", "backup_durable", "terminal_cleanup")
+		case SourceAgentCommandCodeRollbackFailed:
+			return sourceAgentUpdateJournalStageIs(journal.Stage,
+				"backup_durable", "replaced", "restarted", "ready", "rollback_restored", "terminal_cleanup")
+		}
+	}
+	return false
+}
+
+func sourceAgentUpdateJournalStageIs(stage string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if stage == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func sourceAgentUpdateTerminalNeedsRecovery(result SourceAgentUpdateResult, journal sourceAgentUpdateJournal) bool {
@@ -873,7 +1030,8 @@ func validSourceAgentUpdateJournal(journal sourceAgentUpdateJournal) bool {
 }
 
 func validSourceAgentBinaryIdentity(identity SourceAgentBinaryIdentity) bool {
-	return identity.Size > 0 && identity.Size <= sourceAgentArtifactMaxBytes && isExactLowerHex(identity.SHA256, sha256.Size*2)
+	return identity.Size > 0 && identity.Size <= sourceAgentArtifactMaxBytes &&
+		isExactLowerHex(identity.SHA256, sha256.Size*2) && identity.Device > 0 && identity.Inode > 0
 }
 
 func sourceAgentUpdatePublicMessage(code string) string {
@@ -896,6 +1054,8 @@ func sourceAgentUpdatePublicMessage(code string) string {
 		return "Upgrade was interrupted and requires local recovery."
 	case SourceAgentUpdateCodeRecoveryFailed:
 		return "Upgrade recovery requires operator attention."
+	case SourceAgentUpdateCodeClosed:
+		return "Upgrade transaction is closed."
 	case sourceAgentUpdateCodeInvalidRequest:
 		return "Upgrade request is invalid."
 	default:
@@ -933,13 +1093,7 @@ func sourceAgentUpdatePreparedPath(executable, nonce string) string {
 	return filepath.Join(filepath.Dir(executable), ".source-agent-prepared-"+nonce)
 }
 
-type osSourceAgentUpdateFileSystem struct{}
-
-func NewOSSourceAgentUpdateFileSystem() SourceAgentUpdateFileSystem {
-	return osSourceAgentUpdateFileSystem{}
-}
-
-func (osSourceAgentUpdateFileSystem) OpenStaged(root, path string) (SourceAgentUpdateStagedFile, error) {
+func openSourceAgentUpdateStagedFile(root, path string) (SourceAgentUpdateStagedFile, error) {
 	if !isSourceAgentUpdateChildPath(root, path) {
 		return nil, errors.New("staged binary is outside the fixed staging root")
 	}
@@ -955,197 +1109,6 @@ func (osSourceAgentUpdateFileSystem) OpenStaged(root, path string) (SourceAgentU
 	if err != nil || !info.Mode().IsRegular() {
 		file.Close()
 		return nil, errors.New("staged binary is not a regular no-follow file")
-	}
-	return file, nil
-}
-
-func (osSourceAgentUpdateFileSystem) CreatePrepared(executable, nonce string) (SourceAgentUpdatePreparedFile, error) {
-	if !isExactLowerHex(nonce, sha256.Size*2) {
-		return nil, errors.New("invalid local update attempt")
-	}
-	path := sourceAgentUpdatePreparedPath(executable, nonce)
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	if err := file.Chmod(0o600); err != nil {
-		file.Close()
-		os.Remove(file.Name())
-		return nil, err
-	}
-	return file, nil
-}
-
-func (osSourceAgentUpdateFileSystem) BackupExecutable(executable, backup string) (SourceAgentBinaryIdentity, error) {
-	if filepath.Dir(executable) != filepath.Dir(backup) {
-		return SourceAgentBinaryIdentity{}, errors.New("backup must share the executable directory")
-	}
-	source, err := openRegularSourceAgentUpdateFile(executable)
-	if err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	defer source.Close()
-	pending := filepath.Join(filepath.Dir(backup), sourceAgentUpdateBackupPendingName())
-	target, err := os.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	ok := false
-	defer func() {
-		target.Close()
-		if !ok {
-			os.Remove(pending)
-		}
-	}()
-	hasher := sha256.New()
-	written, err := io.Copy(io.MultiWriter(target, hasher), io.LimitReader(source, sourceAgentArtifactMaxBytes+1))
-	if err != nil || written <= 0 || written > sourceAgentArtifactMaxBytes {
-		return SourceAgentBinaryIdentity{}, errors.New("backup copy failed")
-	}
-	if err := target.Chmod(0o755); err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	if err := target.Sync(); err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	if err := target.Close(); err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	if err := os.Link(pending, backup); err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	if err := os.Remove(pending); err != nil {
-		_ = os.Remove(backup)
-		return SourceAgentBinaryIdentity{}, err
-	}
-	ok = true
-	return SourceAgentBinaryIdentity{Size: written, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))}, nil
-}
-
-func (osSourceAgentUpdateFileSystem) ReplaceExecutable(prepared, executable string) error {
-	if filepath.Dir(prepared) != filepath.Dir(executable) {
-		return errors.New("prepared executable must be on the same filesystem")
-	}
-	return os.Rename(prepared, executable)
-}
-
-func (osSourceAgentUpdateFileSystem) RestoreExecutable(backup, executable, nonce string, expected SourceAgentBinaryIdentity) error {
-	if filepath.Dir(backup) != filepath.Dir(executable) {
-		return errors.New("backup must share the executable directory")
-	}
-	source, err := openRegularSourceAgentUpdateFile(backup)
-	if err != nil {
-		return err
-	}
-	defer source.Close()
-	restoreSuffix := nonce
-	if !isExactLowerHex(restoreSuffix, sha256.Size*2) {
-		restoreSuffix = "recovery"
-	}
-	target, err := os.CreateTemp(filepath.Dir(executable), ".source-agent-restore-"+restoreSuffix+"-*")
-	if err != nil {
-		return err
-	}
-	targetPath := target.Name()
-	ok := false
-	defer func() {
-		target.Close()
-		if !ok {
-			os.Remove(targetPath)
-		}
-	}()
-	if err := target.Chmod(0o600); err != nil {
-		return err
-	}
-	hasher := sha256.New()
-	written, err := io.Copy(io.MultiWriter(target, hasher), io.LimitReader(source, sourceAgentArtifactMaxBytes+1))
-	if err != nil || written <= 0 || written > sourceAgentArtifactMaxBytes {
-		return errors.New("restore copy failed")
-	}
-	actual := SourceAgentBinaryIdentity{Size: written, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))}
-	if validSourceAgentBinaryIdentity(expected) && actual != expected {
-		return errors.New("backup integrity check failed")
-	}
-	if err := target.Chmod(0o755); err != nil {
-		return err
-	}
-	if err := target.Sync(); err != nil {
-		return err
-	}
-	if err := target.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(targetPath, executable); err != nil {
-		return err
-	}
-	ok = true
-	return nil
-}
-
-func (osSourceAgentUpdateFileSystem) RegularFileExists(path string) (bool, error) {
-	info, err := os.Lstat(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return false, errors.New("update recovery file is not regular")
-	}
-	return true, nil
-}
-
-func (osSourceAgentUpdateFileSystem) RegularFileIdentity(path string) (SourceAgentBinaryIdentity, error) {
-	file, err := openRegularSourceAgentUpdateFile(path)
-	if err != nil {
-		return SourceAgentBinaryIdentity{}, err
-	}
-	defer file.Close()
-	hasher := sha256.New()
-	size, err := io.Copy(hasher, io.LimitReader(file, sourceAgentArtifactMaxBytes+1))
-	if err != nil || size <= 0 || size > sourceAgentArtifactMaxBytes {
-		return SourceAgentBinaryIdentity{}, errors.New("source agent update file identity is invalid")
-	}
-	return SourceAgentBinaryIdentity{Size: size, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))}, nil
-}
-
-func (osSourceAgentUpdateFileSystem) SyncDirectory(path string) error {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	if err := directory.Sync(); err != nil && !errors.Is(err, syscall.EINVAL) {
-		return err
-	}
-	return nil
-}
-
-func (osSourceAgentUpdateFileSystem) Remove(path string) error {
-	err := os.Remove(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-func openRegularSourceAgentUpdateFile(path string) (*os.File, error) {
-	before, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
-		return nil, errors.New("file is not a regular no-follow file")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	after, err := file.Stat()
-	if err != nil || !after.Mode().IsRegular() || !os.SameFile(before, after) {
-		file.Close()
-		return nil, errors.New("file changed while opening")
 	}
 	return file, nil
 }
@@ -1375,7 +1338,23 @@ func validSourceAgentUpdateResult(value SourceAgentUpdateResult) bool {
 		SourceAgentUpdateCodeCanceled: {}, SourceAgentUpdateCodeRecoveryFailed: {}, sourceAgentUpdateCodeInvalidRequest: {},
 	}
 	_, ok := allowedCodes[value.Code]
-	return ok && (value.PersistenceCode == "" || value.PersistenceCode == SourceAgentUpdateCodeOutcomePersistenceFailed)
+	if !ok || value.PersistenceCode != "" {
+		return false
+	}
+	switch value.Outcome {
+	case SourceAgentUpdateOutcomeSucceeded:
+		return value.Code == SourceAgentCommandCodeUpgradeComplete && !value.BinaryRestored
+	case SourceAgentUpdateOutcomeRolledBack:
+		return value.Code == SourceAgentCommandCodeRollbackComplete && value.BinaryRestored
+	case SourceAgentUpdateOutcomeFailed:
+		switch value.Code {
+		case SourceAgentCommandCodeVerificationFailed, SourceAgentCommandCodeInstallFailed, SourceAgentUpdateCodeCanceled:
+			return !value.BinaryRestored
+		case SourceAgentCommandCodeRollbackFailed:
+			return true
+		}
+	}
+	return false
 }
 
 func marshalSourceAgentUpdateJSON(value any) ([]byte, error) {

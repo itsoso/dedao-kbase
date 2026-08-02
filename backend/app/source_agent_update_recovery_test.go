@@ -333,6 +333,195 @@ func TestSourceAgentUpdatePreReplaceOutcomePersistenceFailureRetainsRecoveryStat
 	}
 }
 
+func TestSourceAgentUpdateRejectsImpossibleDurableTerminalCombination(t *testing.T) {
+	fixture := newDurableSourceAgentUpdateFixture(t, "")
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	identity, err := fixture.transaction.fs.BackupExecutable(fixture.executable, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.transaction.fs.SyncDirectory(filepath.Dir(fixture.executable)); err != nil {
+		t.Fatal(err)
+	}
+	journal := fixture.transaction.newJournal(fixture.request, strings.Repeat("e", sha256.Size*2), "backup_durable")
+	journal.Backup = identity
+	if err := fixture.store.saveJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	impossible := fixture.transaction.finishResult(time.Now(), fixture.request, SourceAgentUpdateOutcomeSucceeded, SourceAgentCommandCodeUpgradeComplete, false)
+	impossible.RuntimeVersion = fixture.request.TargetVersion
+	if err := fixture.store.SaveOutcome(impossible); err != nil {
+		t.Fatal(err)
+	}
+
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Code != SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("result=%#v", result)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if _, found, err := fixture.store.loadJournal(); err != nil || !found {
+		t.Fatalf("journal found=%v err=%v", found, err)
+	}
+}
+
+type publishedErrorSourceAgentUpdateReceipts struct {
+	*fakeSourceAgentUpdateReceipts
+	publishErrors bool
+}
+
+func (r *publishedErrorSourceAgentUpdateReceipts) SaveOutcome(result SourceAgentUpdateResult) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.loaded && r.load != result {
+		return errors.New("immutable outcome conflict")
+	}
+	r.load, r.loaded = result, true
+	if r.publishErrors {
+		return errors.New("published but fsync status unavailable")
+	}
+	return nil
+}
+
+func TestSourceAgentUpdatePublishedOutcomeErrorNeverRollsBack(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	receipts := &publishedErrorSourceAgentUpdateReceipts{fakeSourceAgentUpdateReceipts: fixture.receipts, publishErrors: true}
+	fixture.transaction.receipts = receipts
+	fixture.transaction.config.Receipts = receipts
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Outcome != SourceAgentUpdateOutcomeSucceeded || result.PersistenceCode != SourceAgentUpdateCodeOutcomePersistenceFailed {
+		t.Fatalf("result=%#v", result)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+	if !fixture.receipts.journalFound {
+		t.Fatal("ambiguous outcome publication discarded recovery journal")
+	}
+
+	receipts.publishErrors = false
+	retry, err := NewSourceAgentUpdateTransaction(fixture.transaction.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed := retry.Apply(context.Background(), fixture.request)
+	if replayed.Outcome != SourceAgentUpdateOutcomeSucceeded || fixture.process.calls != 1 {
+		t.Fatalf("replayed=%#v process=%d", replayed, fixture.process.calls)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
+}
+
+func TestSourceAgentUpdatePublishedSuccessWithCorruptJournalNeverRollsBack(t *testing.T) {
+	fixture := newDurableSourceAgentUpdateFixture(t, "")
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	identity, err := fixture.transaction.fs.BackupExecutable(fixture.executable, backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := fixture.transaction.newJournal(fixture.request, strings.Repeat("f", sha256.Size*2), "ready")
+	journal.Backup = identity
+	if err := fixture.store.saveJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	newBinary := []byte("#!/bin/sh\necho new\n")
+	if err := os.WriteFile(fixture.executable, newBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	succeeded := fixture.transaction.finishResult(time.Now(), fixture.request, SourceAgentUpdateOutcomeSucceeded, SourceAgentCommandCodeUpgradeComplete, false)
+	succeeded.RuntimeVersion = fixture.request.TargetVersion
+	if err := fixture.store.SaveOutcome(succeeded); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.directory.writeAtomic(sourceAgentUpdateJournalFileName, []byte("not-json")); err != nil {
+		t.Fatal(err)
+	}
+
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Code != SourceAgentUpdateCodeRecoveryFailed || result.BinaryRestored {
+		t.Fatalf("result=%#v", result)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, newBinary)
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if fixture.process.calls != 0 {
+		t.Fatalf("process calls=%d", fixture.process.calls)
+	}
+}
+
+func TestSourceAgentUpdateRevalidatesCurrentBinaryImmediatelyBeforeReplace(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	replacement := []byte("#!/bin/sh\necho externally-replaced\n")
+	fixture.fs.afterBackup = func() {
+		if err := os.WriteFile(fixture.executable, replacement, 0o755); err != nil {
+			t.Errorf("replace current executable: %v", err)
+		}
+	}
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Outcome != SourceAgentUpdateOutcomeFailed || result.Code != SourceAgentCommandCodeInstallFailed {
+		t.Fatalf("result=%#v", result)
+	}
+	assertSourceAgentExecutable(t, fixture.executable, replacement)
+	if fixture.process.calls != 0 {
+		t.Fatalf("process calls=%d", fixture.process.calls)
+	}
+}
+
+func TestSourceAgentUpdateRestartIsBounded(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.transaction.config.RestartTimeout = 20 * time.Millisecond
+	fixture.process.blockUntilDone = true
+	started := time.Now()
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("restart path was not bounded: %s", elapsed)
+	}
+	if result.Code != SourceAgentCommandCodeRollbackFailed {
+		t.Fatalf("result=%#v", result)
+	}
+}
+
+func TestSourceAgentUpdateOrphanRecoveryReportsRestartFailure(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	if _, err := fixture.fs.BackupExecutable(fixture.executable, backup); err != nil {
+		t.Fatal(err)
+	}
+	fixture.process.failCall = 1
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Code != SourceAgentUpdateCodeRecoveryFailed || result.BinaryRestored {
+		t.Fatalf("result=%#v", result)
+	}
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+}
+
+func TestSourceAgentUpdateTransactionCloseOwnershipAndIdempotency(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	if err := fixture.transaction.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.transaction.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.receipts.closeCalls != 0 {
+		t.Fatalf("injected receipt store closed %d times", fixture.receipts.closeCalls)
+	}
+	closed := fixture.transaction.Apply(context.Background(), fixture.request)
+	if closed.Code != SourceAgentUpdateCodeClosed {
+		t.Fatalf("closed apply=%#v", closed)
+	}
+
+	ownedConfig := fixture.transaction.config
+	ownedConfig.FileSystem = nil
+	ownedConfig.Receipts = nil
+	owned, err := NewSourceAgentUpdateTransaction(ownedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owned.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := owned.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSourceAgentUpdateCoreUsesFixedWorkerAllowlist(t *testing.T) {
 	fixture := newSourceAgentUpdateFixture(t)
 	config := fixture.transaction.config

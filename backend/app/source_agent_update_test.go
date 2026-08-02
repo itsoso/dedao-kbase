@@ -37,12 +37,20 @@ type fakeSourceAgentUpdateProcess struct {
 	calls          int
 	failCall       int
 	rejectCanceled bool
+	blockUntilDone bool
 }
 
 func (p *fakeSourceAgentUpdateProcess) Restart(ctx context.Context) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.calls++
+	blockUntilDone := p.blockUntilDone
+	p.mu.Unlock()
+	if blockUntilDone {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.rejectCanceled && ctx.Err() != nil {
 		return errors.New("private canceled context detail")
 	}
@@ -66,6 +74,14 @@ type fakeSourceAgentUpdateReceipts struct {
 	journalFound bool
 	journalErr   error
 	clearErr     error
+	closeCalls   int
+}
+
+func (r *fakeSourceAgentUpdateReceipts) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.closeCalls++
+	return nil
 }
 
 func (r *fakeSourceAgentUpdateReceipts) loadJournal() (sourceAgentUpdateJournal, bool, error) {
@@ -289,7 +305,12 @@ func newSourceAgentUpdateFixture(t *testing.T) sourceAgentUpdateFixture {
 	guard := &fakeSourceAgentUpdateGuard{}
 	process := &fakeSourceAgentUpdateProcess{}
 	receipts := &fakeSourceAgentUpdateReceipts{}
-	fs := &failingSourceAgentUpdateFS{SourceAgentUpdateFileSystem: NewOSSourceAgentUpdateFileSystem()}
+	baseFS, err := NewOSSourceAgentUpdateFileSystem(executable)
+	if err != nil {
+		t.Fatalf("NewOSSourceAgentUpdateFileSystem() error = %v", err)
+	}
+	t.Cleanup(func() { _ = baseFS.Close() })
+	fs := &failingSourceAgentUpdateFS{SourceAgentUpdateFileSystem: baseFS}
 	config := SourceAgentUpdateConfig{
 		WorkerType: "wechat-worker", Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 		CurrentVersion: "1.0.0", ProtocolVersion: "2026-08-01",
@@ -519,7 +540,7 @@ func TestSourceAgentUpdateSuccessIsIdempotentAndConcurrentRequestIsBusy(t *testi
 	}
 
 	busy := newSourceAgentUpdateFixture(t)
-	release, err := busy.receipts.Acquire(context.Background(), "other-command")
+	release, err := busy.fs.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -695,7 +716,9 @@ func seedSourceAgentReadyJournal(t *testing.T, store *FileSourceAgentUpdateRecei
 		WorkerType: receipt.WorkerType, CurrentVersion: "1.0.0", TargetVersion: receipt.Version,
 		Platform: receipt.Platform, Architecture: receipt.Architecture, ProtocolVersion: receipt.ProtocolVersion,
 		Revision: receipt.Revision, Channel: "staging", Stage: "restarted",
-		Backup:    SourceAgentBinaryIdentity{Size: 1, SHA256: strings.Repeat("c", sha256.Size*2)},
+		Backup: SourceAgentBinaryIdentity{
+			Size: 1, SHA256: strings.Repeat("c", sha256.Size*2), Device: 1, Inode: 1,
+		},
 		StartedAt: now, UpdatedAt: now,
 	}
 	if err := store.saveJournal(journal); err != nil {
