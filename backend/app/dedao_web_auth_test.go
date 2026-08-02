@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/yann0917/dedao-gui/backend/services"
@@ -108,7 +109,7 @@ func TestLiveDedaoAuthProviderUsesDedicatedLoginService(t *testing.T) {
 		},
 		check: &services.CheckLoginResp{},
 	}
-	provider := liveDedaoAuthProvider{newLoginService: func() dedaoLoginService {
+	provider := &liveDedaoAuthProvider{newLoginService: func() dedaoLoginService {
 		loginService.factoryCalls++
 		return loginService
 	}}
@@ -127,9 +128,72 @@ func TestLiveDedaoAuthProviderUsesDedicatedLoginService(t *testing.T) {
 	if _, err := provider.CheckLogin("login-token", "qr-string"); err != nil {
 		t.Fatalf("CheckLogin returned error: %v", err)
 	}
-	if loginService.factoryCalls != 2 || loginService.checkCalls != 1 {
+	if loginService.factoryCalls != 1 || loginService.checkCalls != 1 {
 		t.Fatalf("check calls = factory %d check %d", loginService.factoryCalls, loginService.checkCalls)
 	}
+}
+
+func TestLiveDedaoAuthProviderKeepsConcurrentQRCodeFlowsIsolated(t *testing.T) {
+	success := func() *services.CheckLoginResp {
+		result := &services.CheckLoginResp{}
+		result.Data.Status = 1
+		return result
+	}
+	loginServices := []*fakeDedaoLoginService{
+		{token: "token-one", qr: dedaoTestQRCode("qr-one"), check: success(), cookie: "session=one", bootstrapCookies: []string{"csrfToken=csrf-one; Path=/"}},
+		{token: "token-two", qr: dedaoTestQRCode("qr-two"), check: success(), cookie: "session=two", bootstrapCookies: []string{"csrfToken=csrf-two; Path=/"}},
+	}
+	factoryIndex := 0
+	completed := make(map[string]string)
+	var completedMu sync.Mutex
+	provider := &liveDedaoAuthProvider{
+		newLoginService: func() dedaoLoginService {
+			service := loginServices[factoryIndex]
+			factoryIndex++
+			return service
+		},
+		loginByCookie: func(cookie string, bootstrapCookies []string) (*services.User, error) {
+			completedMu.Lock()
+			completed[cookie] = strings.Join(bootstrapCookies, "; ")
+			completedMu.Unlock()
+			return &services.User{UIDHazy: cookie}, nil
+		},
+	}
+
+	qrOne, err := provider.NewQRCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	qrTwo, err := provider.NewQRCode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for _, qr := range []DedaoLoginQRCode{qrOne, qrTwo} {
+		qr := qr
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, checkErr := provider.CheckLogin(qr.Token, qr.QRCodeString); checkErr != nil {
+				t.Errorf("check %s: %v", qr.Token, checkErr)
+			}
+		}()
+	}
+	wg.Wait()
+
+	completedMu.Lock()
+	defer completedMu.Unlock()
+	if completed["session=one"] != "csrfToken=csrf-one; Path=/" || completed["session=two"] != "csrfToken=csrf-two; Path=/" {
+		t.Fatalf("completed login cookies crossed flows: %#v", completed)
+	}
+}
+
+func dedaoTestQRCode(qrCodeString string) *services.QrCodeResp {
+	result := &services.QrCodeResp{}
+	result.Data.QrCode = "image-" + qrCodeString
+	result.Data.QrCodeString = qrCodeString
+	return result
 }
 
 func assertDedaoWebAuthResponseOmitsSecrets(t *testing.T, body string) {
@@ -169,6 +233,8 @@ type fakeDedaoLoginService struct {
 	accessTokenCalls int
 	qrCalls          int
 	checkCalls       int
+	cookie           string
+	bootstrapCookies []string
 }
 
 func (f *fakeDedaoLoginService) LoginAccessToken() (string, error) {
@@ -183,5 +249,9 @@ func (f *fakeDedaoLoginService) GetQrcode(string) (*services.QrCodeResp, error) 
 
 func (f *fakeDedaoLoginService) CheckLogin(string, string) (*services.CheckLoginResp, string, error) {
 	f.checkCalls++
-	return f.check, "", nil
+	return f.check, f.cookie, nil
+}
+
+func (f *fakeDedaoLoginService) BootstrapCookies() []string {
+	return append([]string(nil), f.bootstrapCookies...)
 }

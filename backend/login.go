@@ -32,7 +32,6 @@ func (a *App) GetQrcode() (qrCode QrCodeResp, err error) {
 	}
 	if token == `{"message":"invalid csrf token"}` {
 		app.Logout()
-		services.CsrfToken = ""
 		_, _ = Instance.GetHomeInitialState()
 		token, err = Instance.LoginAccessToken()
 		if err != nil {
@@ -59,7 +58,7 @@ func (a *App) CheckLogin(token, qrCodeString string) (result LoginResult, err er
 	result.Cookie = cookie
 	if check != nil {
 		if check.Data.Status == 1 {
-			result.User, err = app.LoginByCookie(cookie)
+			result.User, err = app.LoginByCookieWithBootstrap(cookie, Instance.BootstrapCookies())
 			if err != nil {
 				return
 			}

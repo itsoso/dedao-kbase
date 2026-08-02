@@ -360,23 +360,24 @@ type HomeInitState struct {
 	Uid      string   `json:"uid"`
 }
 
-var (
-	CsrfToken = ""
-	SetCookie []string
-)
-
 func (s *Service) GetHomeInitialState() (state HomeInitState, err error) {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	return s.getHomeInitialStateLocked()
+}
+
+func (s *Service) getHomeInitialStateLocked() (state HomeInitState, err error) {
 	resp, err := s.client.R().Get("")
 	if err != nil {
 		return
 	}
 	if resp.IsSuccess() {
-		SetCookie = resp.Header().Values("Set-Cookie")
-		cookies := strings.Split(strings.Join(SetCookie, "; "), "; ")
-		for _, v := range cookies {
-			item := strings.Split(v, "=")
-			if len(item) > 1 && item[0] == "csrfToken" {
-				CsrfToken = item[1]
+		s.bootstrapCookies = append([]string(nil), resp.Header().Values("Set-Cookie")...)
+		for _, cookieHeader := range s.bootstrapCookies {
+			cookiePair := strings.SplitN(cookieHeader, ";", 2)[0]
+			item := strings.SplitN(cookiePair, "=", 2)
+			if len(item) > 1 && strings.TrimSpace(item[0]) == "csrfToken" {
+				s.csrfToken = strings.TrimSpace(item[1])
 			}
 		}
 		// 匹配 <script> window.__INITIAL_STATE__=

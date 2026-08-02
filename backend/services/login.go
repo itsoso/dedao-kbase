@@ -25,21 +25,23 @@ type loginAccessTokenError struct {
 
 // LoginAccessToken get login access token
 func (s *Service) LoginAccessToken() (token string, err error) {
-	if CsrfToken == "" {
-		if _, err = s.GetHomeInitialState(); err != nil {
+	s.loginMu.Lock()
+	defer s.loginMu.Unlock()
+	if s.csrfToken == "" {
+		if _, err = s.getHomeInitialStateLocked(); err != nil {
 			return
 		}
 	}
-	token, err = s.reqGetLoginAccessToken(CsrfToken)
+	token, err = s.reqGetLoginAccessToken(s.csrfToken)
 	if err != nil {
 		return
 	}
 	if loginAccessTokenNeedsCSRFRefresh(token) {
-		CsrfToken = ""
-		if _, err = s.GetHomeInitialState(); err != nil {
+		s.csrfToken = ""
+		if _, err = s.getHomeInitialStateLocked(); err != nil {
 			return
 		}
-		token, err = s.reqGetLoginAccessToken(CsrfToken)
+		token, err = s.reqGetLoginAccessToken(s.csrfToken)
 		if err != nil {
 			return
 		}
