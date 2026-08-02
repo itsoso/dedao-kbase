@@ -153,6 +153,21 @@ const dedaoLoginState = {
   expiresAt: 0,
 };
 
+const dedaoEbookAcquisitionState = {
+  source: "shelf",
+  query: "",
+  page: 1,
+  pageSize: 15,
+  siteItems: [],
+  siteTotal: 0,
+  siteIsMore: 0,
+  hasSearched: false,
+  loading: "",
+  message: "",
+  submitting: new Set(),
+  jobs: {},
+};
+
 const dedaoLibraryState = {
   home: null,
   homeLoading: "",
@@ -2064,11 +2079,261 @@ function renderDedaoCourses() {
 }
 
 function renderDedaoEbooks() {
-  renderDedaoLibrary("ebook");
+  renderDedaoEbookAcquisition();
 }
 
 function renderDedaoOdob() {
   renderDedaoLibrary("odob");
+}
+
+function normalizeDedaoEbook(item, source = "shelf") {
+  const value = item || {};
+  const id = Number(value.id || value.class_id || 0);
+  return {
+    id: Number.isInteger(id) && id > 0 ? id : 0,
+    enid: dedaoProductEnID(value),
+    title: String(value.title || value.name || "未命名电子书").trim(),
+    author: String(value.author || value.book_author || "").trim(),
+    intro: String(value.intro || value.book_intro || "").trim(),
+    icon: String(value.icon || value.cover || "").trim(),
+    price: String(value.price || value.current_price || "").trim(),
+    progress: Number(value.progress || value.read_progress || 0),
+    isBuy: Boolean(value.is_buy),
+    isOnBookshelf: Boolean(value.is_on_bookshelf) || source === "shelf",
+    canTrial: Boolean(value.can_trial_read),
+    source,
+  };
+}
+
+function dedaoEbookJobKey(type, book) {
+  return `${type}:${book.enid}`;
+}
+
+function dedaoEbookEligibility(book) {
+  if (!book.id || !book.enid) return "书籍标识不完整，暂不能下载。";
+  if (!book.isBuy && !book.isOnBookshelf) return "请先加入书架，再创建下载任务。";
+  return "";
+}
+
+function renderDedaoEbookJobStatus(book) {
+  const job = dedaoEbookAcquisitionState.jobs[book.enid];
+  if (!job) return "";
+  const knowledgeBookID = job.result?.knowledge_book_id || "";
+  return `
+    <div class="dedao-ebook-card__job ${escapeAttribute(jobStatusClass(job.status))}" role="status">
+      <span>${escapeHTML(jobStatusLabel(job.status))}</span>
+      ${job.error ? `<small>${escapeHTML(job.error)}</small>` : ""}
+      ${knowledgeBookID ? `<a href="${escapeAttribute(buildKnowledgePackageURL(knowledgeBookID))}">打开知识包</a>` : ""}
+    </div>
+  `;
+}
+
+function renderDedaoEbookCard(book) {
+  const eligibility = dedaoEbookEligibility(book);
+  const isSite = book.source === "site";
+  const currentJob = dedaoEbookAcquisitionState.jobs[book.enid];
+  const jobActive = ["queued", "running"].includes(String(currentJob?.status || "").toLowerCase());
+  const adding = dedaoEbookAcquisitionState.submitting.has(dedaoEbookJobKey("bookshelf", book));
+  const downloading = dedaoEbookAcquisitionState.submitting.has(dedaoEbookJobKey("dedao_ebook_download", book));
+  const syncing = dedaoEbookAcquisitionState.submitting.has(dedaoEbookJobKey("dedao_ebook_sync_kbase", book));
+  const owned = book.isBuy || book.isOnBookshelf;
+  return `
+    <article class="dedao-course-card dedao-ebook-card">
+      <div class="dedao-course-card__top">
+        ${book.icon ? `<img src="${escapeAttribute(book.icon)}" alt="">` : '<div class="dedao-ebook-card__cover-placeholder">BOOK</div>'}
+        <div>
+          <p class="web-kicker">${isSite ? "全站电子书" : "我的书架"}</p>
+          <h2>${escapeHTML(book.title)}</h2>
+          <p>${escapeHTML(book.author || book.intro || "得到电子书")}</p>
+        </div>
+      </div>
+      <div class="dedao-ebook-card__meta">
+        <span>${owned ? "可处理" : (book.canTrial ? "可试读" : "未在书架")}</span>
+        ${book.price ? `<span>¥ ${escapeHTML(book.price)}</span>` : ""}
+        ${book.progress > 0 ? `<span>已读 ${escapeHTML(book.progress)}%</span>` : ""}
+      </div>
+      <div class="dedao-ebook-card__actions">
+        ${book.enid ? `<a class="button button-ghost" href="${escapeAttribute(buildDedaoEbookURL(book.enid))}">详情</a>` : ""}
+        ${isSite && !owned ? `<button class="button button-ghost" type="button" data-action="add-dedao-ebook-bookshelf" data-enid="${escapeAttribute(book.enid)}" ${!book.enid || adding ? "disabled" : ""}>${adding ? "加入中" : "加入书架"}</button>` : ""}
+        <button class="button button-ghost" type="button" data-action="create-dedao-ebook-job" data-job-type="dedao_ebook_download" data-enid="${escapeAttribute(book.enid)}" data-id="${escapeAttribute(book.id)}" ${eligibility || downloading || syncing || jobActive ? "disabled" : ""}>${downloading ? "提交中" : (jobActive ? "任务进行中" : "仅下载")}</button>
+        <button class="button button-primary" type="button" data-action="create-dedao-ebook-job" data-job-type="dedao_ebook_sync_kbase" data-enid="${escapeAttribute(book.enid)}" data-id="${escapeAttribute(book.id)}" ${eligibility || downloading || syncing || jobActive ? "disabled" : ""}>${syncing ? "提交中" : (jobActive ? "任务进行中" : "下载并入知识库")}</button>
+      </div>
+      ${eligibility ? `<small class="dedao-ebook-card__disabled-reason">${escapeHTML(eligibility)}</small>` : ""}
+      ${renderDedaoEbookJobStatus(book)}
+    </article>
+  `;
+}
+
+function renderDedaoEbookAcquisition() {
+  const state = dedaoEbookAcquisitionState;
+  const shelfState = dedaoLibraryState.pages.ebook;
+  const items = state.source === "site"
+    ? state.siteItems.map((item) => normalizeDedaoEbook(item, "site"))
+    : shelfState.items.map((item) => normalizeDedaoEbook(item, "shelf"));
+  const message = state.source === "site" ? state.message : shelfState.message;
+  const loading = state.source === "site" ? state.loading : shelfState.loading;
+  const empty = state.source === "site"
+    ? (state.hasSearched ? "没有找到匹配的电子书，换一个关键词试试。" : "输入书名或作者，从得到全站查找电子书。")
+    : dedaoLibraryConfig.ebook.empty;
+  const cards = items.map(renderDedaoEbookCard).join("");
+  renderShell(`
+    <main class="dedao-courses dedao-ebook-acquisition">
+      <section class="dedao-courses__header dedao-ebook-acquisition__header">
+        <div>
+          <p class="web-kicker">得到电子书</p>
+          <h1>从找到一本书，到拥有一份可检索知识</h1>
+          <p>书架内容可以直接处理；全站结果需先确认已购买或加入书架。下载文件保存在服务器本地，浏览器只显示任务状态。</p>
+        </div>
+        <div class="dedao-courses__actions">
+          <a class="button button-ghost" href="${escapeAttribute(ROUTES.dedaoLogin)}">登录状态</a>
+          <a class="button button-ghost" href="${escapeAttribute(ROUTES.jobs)}">任务中心</a>
+        </div>
+      </section>
+      <section class="dedao-ebook-acquisition__controls">
+        <div class="dedao-ebook-acquisition__tabs" role="tablist" aria-label="电子书来源">
+          <button type="button" role="tab" aria-selected="${state.source === "shelf"}" class="${state.source === "shelf" ? "is-active" : ""}" data-ebook-source="shelf">我的书架</button>
+          <button type="button" role="tab" aria-selected="${state.source === "site"}" class="${state.source === "site" ? "is-active" : ""}" data-ebook-source="site">全站搜索</button>
+        </div>
+        ${state.source === "site" ? `
+          <form class="dedao-ebook-acquisition__search" data-dedao-ebook-search>
+            <label><span>书名或作者</span><input name="query" value="${escapeAttribute(state.query)}" placeholder="例如：行为金融学" autocomplete="off"></label>
+            <button class="button button-primary" type="submit" ${loading ? "disabled" : ""}>${loading ? "搜索中" : "搜索"}</button>
+          </form>
+        ` : `
+          <button class="button button-ghost" type="button" data-action="reload-dedao-ebooks" ${loading ? "disabled" : ""}>${loading ? "刷新中" : "刷新书架"}</button>
+        `}
+      </section>
+      ${message ? `<p class="web-status">${escapeHTML(message)}</p>` : ""}
+      <section class="dedao-courses__grid dedao-ebook-acquisition__grid">
+        ${cards || `<div class="dedao-courses__empty"><h2>${escapeHTML(empty)}</h2><p>登录失效时可先回到登录页重新扫码；已入库内容不受影响。</p></div>`}
+      </section>
+      ${state.source === "site" && state.hasSearched ? `
+        <nav class="dedao-ebook-acquisition__pager" aria-label="搜索分页">
+          <button class="button button-ghost" type="button" data-search-page="${state.page - 1}" ${state.page <= 1 || loading ? "disabled" : ""}>上一页</button>
+          <span>第 ${state.page} 页${state.siteTotal ? ` · 共 ${state.siteTotal} 本` : ""}</span>
+          <button class="button button-ghost" type="button" data-search-page="${state.page + 1}" ${!state.siteIsMore || loading ? "disabled" : ""}>下一页</button>
+        </nav>
+      ` : ""}
+    </main>
+  `, "ebook");
+
+  app.querySelectorAll("[data-ebook-source]").forEach((button) => button.addEventListener("click", () => setDedaoEbookSource(button.dataset.ebookSource)));
+  app.querySelector("[data-dedao-ebook-search]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    state.query = String(data.get("query") || "").trim();
+    state.page = 1;
+    searchDedaoEbooks();
+  });
+  app.querySelector("[data-action='reload-dedao-ebooks']")?.addEventListener("click", () => loadDedaoLibrary("ebook"));
+  app.querySelectorAll("[data-search-page]").forEach((button) => button.addEventListener("click", () => {
+    state.page = Number(button.dataset.searchPage || 1);
+    searchDedaoEbooks();
+  }));
+  app.querySelectorAll("[data-action='add-dedao-ebook-bookshelf']").forEach((button) => button.addEventListener("click", () => addDedaoEbookToBookshelf(button.dataset.enid)));
+  app.querySelectorAll("[data-action='create-dedao-ebook-job']").forEach((button) => button.addEventListener("click", () => createDedaoEbookJob({
+    id: Number(button.dataset.id || 0), enid: button.dataset.enid || "", type: button.dataset.jobType || "",
+  })));
+}
+
+function setDedaoEbookSource(source) {
+  dedaoEbookAcquisitionState.source = source === "site" ? "site" : "shelf";
+  dedaoEbookAcquisitionState.message = "";
+  renderDedaoEbookAcquisition();
+  if (dedaoEbookAcquisitionState.source === "shelf" && dedaoLibraryState.pages.ebook.items.length === 0) {
+    loadDedaoLibrary("ebook");
+  }
+}
+
+async function searchDedaoEbooks() {
+  const state = dedaoEbookAcquisitionState;
+  if (!state.query) {
+    state.message = "请输入书名或作者。";
+    renderDedaoEbookAcquisition();
+    return;
+  }
+  state.loading = "searching";
+  state.message = "";
+  renderDedaoEbookAcquisition();
+  try {
+    const query = new URLSearchParams({ q: state.query, page: String(state.page), page_size: String(state.pageSize) });
+    const payload = await apiFetch(`/api/dedao/search/ebooks?${query.toString()}`);
+    state.siteItems = Array.isArray(payload?.ebooks) ? payload.ebooks : [];
+    state.siteTotal = Number(payload?.total || 0);
+    state.siteIsMore = Number(payload?.is_more || 0);
+    state.hasSearched = true;
+    state.message = state.siteItems.length ? `找到 ${state.siteTotal || state.siteItems.length} 本相关电子书。` : "没有找到匹配结果。";
+  } catch (error) {
+    state.message = `搜索失败，已保留当前结果：${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    state.loading = "";
+    renderDedaoEbookAcquisition();
+  }
+}
+
+async function addDedaoEbookToBookshelf(enid) {
+  const book = normalizeDedaoEbook(dedaoEbookAcquisitionState.siteItems.find((item) => dedaoProductEnID(item) === enid), "site");
+  const key = dedaoEbookJobKey("bookshelf", book);
+  if (!enid || dedaoEbookAcquisitionState.submitting.has(key)) return;
+  dedaoEbookAcquisitionState.submitting.add(key);
+  dedaoEbookAcquisitionState.message = "正在加入书架…";
+  renderDedaoEbookAcquisition();
+  try {
+    const updated = await apiFetch(`/api/dedao/ebooks/${encodeURIComponent(enid)}/bookshelf`, { method: "POST", body: "{}" });
+    dedaoEbookAcquisitionState.siteItems = dedaoEbookAcquisitionState.siteItems.map((item) => dedaoProductEnID(item) === enid
+      ? { ...item, ...updated, is_on_bookshelf: true }
+      : item);
+    dedaoEbookAcquisitionState.message = "已加入书架，现在可以下载或入库。";
+  } catch (error) {
+    dedaoEbookAcquisitionState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoEbookAcquisitionState.submitting.delete(key);
+    renderDedaoEbookAcquisition();
+  }
+}
+
+async function createDedaoEbookJob({ id, enid, type }) {
+  const key = `${type}:${enid}`;
+  if (!id || !enid || !["dedao_ebook_download", "dedao_ebook_sync_kbase"].includes(type) || dedaoEbookAcquisitionState.submitting.has(key)) return;
+  dedaoEbookAcquisitionState.submitting.add(key);
+  dedaoEbookAcquisitionState.message = type === "dedao_ebook_sync_kbase" ? "正在创建下载并入库任务…" : "正在创建下载任务…";
+  renderDedaoEbookAcquisition();
+  try {
+    const payload = await apiFetch("/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ type, ebook_id: id, ebook_enid: enid, download_type: 1 }),
+    });
+    if (!payload?.job?.id) throw new Error("任务响应缺少 job id");
+    dedaoEbookAcquisitionState.jobs[enid] = payload.job;
+    dedaoEbookAcquisitionState.message = "任务已提交，可留在本页查看进度。";
+    pollBookKnowledgeJob(payload.job.id, enid);
+  } catch (error) {
+    dedaoEbookAcquisitionState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    dedaoEbookAcquisitionState.submitting.delete(key);
+    renderDedaoEbookAcquisition();
+  }
+}
+
+async function pollBookKnowledgeJob(jobID, enid, attempt = 0) {
+  if (!jobID || !enid || !getRoutePathname().startsWith(ROUTES.dedaoEbooks)) return;
+  try {
+    const payload = await apiFetch(`/api/jobs/${encodeURIComponent(jobID)}`);
+    const job = payload?.job || null;
+    if (!job) throw new Error("任务不存在");
+    dedaoEbookAcquisitionState.jobs[enid] = job;
+    renderDedaoEbookAcquisition();
+    if (["succeeded", "failed"].includes(job.status)) return;
+    if (attempt >= 240) {
+      dedaoEbookAcquisitionState.message = "任务仍在后台运行，请到任务中心继续查看。";
+      renderDedaoEbookAcquisition();
+      return;
+    }
+    window.setTimeout(() => pollBookKnowledgeJob(jobID, enid, attempt + 1), 1500);
+  } catch (error) {
+    dedaoEbookAcquisitionState.message = error instanceof Error ? error.message : String(error);
+    renderDedaoEbookAcquisition();
+  }
 }
 
 function renderDedaoAudioDetail(route = getDedaoAudioRoute()) {
@@ -2219,7 +2484,7 @@ async function loadDedaoLibrary(category) {
   const state = dedaoLibraryState.pages[category] || dedaoLibraryState.pages.bauhinia;
   state.loading = "loading";
   state.message = "";
-  renderDedaoLibrary(category);
+  if (category === "ebook") renderDedaoEbookAcquisition(); else renderDedaoLibrary(category);
   try {
     const query = new URLSearchParams({
       category,
@@ -2235,7 +2500,7 @@ async function loadDedaoLibrary(category) {
     state.message = error instanceof Error ? error.message : String(error);
   } finally {
     state.loading = "";
-    renderDedaoLibrary(category);
+    if (category === "ebook") renderDedaoEbookAcquisition(); else renderDedaoLibrary(category);
   }
 }
 
@@ -2684,6 +2949,21 @@ function jobStatusClass(status) {
 }
 
 function normalizeJobTask(task, source = "wcplus") {
+  if (source === "kbase") {
+    const knowledgeBookID = task?.result?.knowledge_book_id || "";
+    return {
+      id: String(task?.id || ""),
+      source: "KBase",
+      title: task?.result?.title || `电子书 ${task?.ebook_id || ""}`.trim(),
+      operation: task?.type === "dedao_ebook_sync_kbase" ? "下载并入知识库" : "电子书下载",
+      status: task?.status || "unknown",
+      progress: task?.status === "running" ? "服务器本地处理中" : "",
+      error: task?.error || "",
+      updatedAt: task?.updated_at || task?.created_at || "",
+      sourceURL: knowledgeBookID ? buildKnowledgePackageURL(knowledgeBookID) : ROUTES.dedaoEbooks,
+      raw: task || {},
+    };
+  }
   const taskID = String(task?.task_id || task?.id || task?.biz || task?.nickname || "").trim();
   const progress = [];
   if (task?.article_total) {
@@ -2738,7 +3018,7 @@ function renderJobCenter() {
         <div>
           <p class="web-kicker">Jobs</p>
           <h1>任务中心</h1>
-          <p>统一查看采集、下载、入库、分析和供给任务。当前已接入 WC Plus 下载任务。</p>
+          <p>统一查看采集、下载、入库、分析和供给任务。得到电子书与 WC Plus 独立加载，单个来源故障不会遮蔽其他任务。</p>
         </div>
         <button class="button button-primary" type="button" data-action="reload-job-center" ${jobCenterState.loading ? "disabled" : ""}>
           ${jobCenterState.loading ? "加载中" : "刷新任务"}
@@ -2760,13 +3040,24 @@ async function loadJobCenter() {
   jobCenterState.message = "";
   renderJobCenter();
   try {
-    const payload = await apiFetch("/api/wcplus/task/all");
-    const wcplusTasks = Array.isArray(payload.tasks) ? payload.tasks.map((task) => normalizeJobTask(task, "wcplus")) : [];
-    jobCenterState.tasks = wcplusTasks;
+    const [wcplusResult, kbaseResult] = await Promise.allSettled([
+      apiFetch("/api/wcplus/task/all"),
+      apiFetch("/api/jobs?limit=50"),
+    ]);
+    const wcplusTasks = wcplusResult.status === "fulfilled" && Array.isArray(wcplusResult.value?.tasks)
+      ? wcplusResult.value.tasks.map((task) => normalizeJobTask(task, "wcplus"))
+      : [];
+    const kbaseTasks = kbaseResult.status === "fulfilled" && Array.isArray(kbaseResult.value?.jobs)
+      ? kbaseResult.value.jobs.map((task) => normalizeJobTask(task, "kbase"))
+      : [];
+    jobCenterState.tasks = [...kbaseTasks, ...wcplusTasks];
     jobCenterState.lastUpdated = new Date().toLocaleString("zh-CN");
-    jobCenterState.message = wcplusTasks.length ? `已加载 ${wcplusTasks.length} 个任务。` : "暂无 WC Plus 任务。";
-  } catch (error) {
-    jobCenterState.message = jobCenterErrorMessage(error);
+    const errors = [];
+    if (wcplusResult.status === "rejected") errors.push(jobCenterErrorMessage(wcplusResult.reason));
+    if (kbaseResult.status === "rejected") errors.push(`KBase 任务加载失败：${kbaseResult.reason instanceof Error ? kbaseResult.reason.message : String(kbaseResult.reason)}`);
+    jobCenterState.message = errors.length
+      ? `${jobCenterState.tasks.length ? `已加载 ${jobCenterState.tasks.length} 个任务。` : ""}${errors.join(" ")}`
+      : `已加载 ${jobCenterState.tasks.length} 个任务。`;
   } finally {
     jobCenterState.loading = "";
     renderJobCenter();

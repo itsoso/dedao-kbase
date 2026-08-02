@@ -21,6 +21,24 @@ for (const marker of [
   "stopDedaoLoginPolling",
   "routePathname === ROUTES.dedaoLogin",
   'window.addEventListener("beforeunload", stopDedaoLoginPolling)',
+  "/api/dedao/search/ebooks",
+  "/bookshelf",
+  "/api/jobs",
+  "dedao_ebook_download",
+  "dedao_ebook_sync_kbase",
+  "我的书架",
+  "全站搜索",
+  "仅下载",
+  "下载并入知识库",
+  "renderDedaoEbookAcquisition",
+  "searchDedaoEbooks",
+  "addDedaoEbookToBookshelf",
+  "createDedaoEbookJob",
+  "pollBookKnowledgeJob",
+  "normalizeDedaoEbook",
+  "jobActive",
+  "任务进行中",
+  "Promise.allSettled",
 ]) {
   assert.ok(js.includes(marker), `app.js should include login marker ${marker}`);
 }
@@ -30,6 +48,10 @@ for (const className of [
   ".dedao-login__panel",
   ".dedao-login__qr-frame",
   ".dedao-login__status",
+  ".dedao-ebook-acquisition",
+  ".dedao-ebook-acquisition__tabs",
+  ".dedao-ebook-acquisition__search",
+  ".dedao-ebook-card__actions",
 ]) {
   assert.ok(css.includes(className), `styles.css should include ${className}`);
 }
