@@ -53,14 +53,47 @@ func (p *fakeSourceAgentUpdateProcess) Restart(ctx context.Context) error {
 }
 
 type fakeSourceAgentUpdateReceipts struct {
-	mu        sync.Mutex
-	locked    bool
-	load      SourceAgentUpdateResult
-	loaded    bool
-	saved     []SourceAgentUpdateResult
-	waitErr   error
-	waitStart chan struct{}
-	waitBlock chan struct{}
+	mu           sync.Mutex
+	locked       bool
+	load         SourceAgentUpdateResult
+	loaded       bool
+	saved        []SourceAgentUpdateResult
+	waitErr      error
+	saveErr      error
+	waitStart    chan struct{}
+	waitBlock    chan struct{}
+	journal      sourceAgentUpdateJournal
+	journalFound bool
+	journalErr   error
+}
+
+func (r *fakeSourceAgentUpdateReceipts) loadJournal() (sourceAgentUpdateJournal, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.journal, r.journalFound, r.journalErr
+}
+
+func (r *fakeSourceAgentUpdateReceipts) saveJournal(journal sourceAgentUpdateJournal) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.journalErr != nil {
+		return r.journalErr
+	}
+	r.journal, r.journalFound = journal, true
+	return nil
+}
+
+func (r *fakeSourceAgentUpdateReceipts) clearJournal(commandID, attemptNonce string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.journalErr != nil {
+		return r.journalErr
+	}
+	if r.journalFound && (r.journal.CommandID != commandID || r.journal.AttemptNonce != attemptNonce) {
+		return errors.New("journal changed")
+	}
+	r.journal, r.journalFound = sourceAgentUpdateJournal{}, false
+	return nil
 }
 
 func (r *fakeSourceAgentUpdateReceipts) Acquire(_ context.Context, _ string) (func(), error) {
@@ -86,6 +119,9 @@ func (r *fakeSourceAgentUpdateReceipts) LoadOutcome(string) (SourceAgentUpdateRe
 func (r *fakeSourceAgentUpdateReceipts) SaveOutcome(result SourceAgentUpdateResult) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.saveErr != nil {
+		return r.saveErr
+	}
 	r.saved = append(r.saved, result)
 	r.load, r.loaded = result, true
 	return nil
@@ -118,6 +154,7 @@ type failingSourceAgentUpdateFS struct {
 	mutatePath   string
 	mutateData   []byte
 	afterReplace func()
+	afterBackup  func()
 }
 
 func (f *failingSourceAgentUpdateFS) OpenStaged(root, path string) (SourceAgentUpdateStagedFile, error) {
@@ -134,11 +171,11 @@ func (f *failingSourceAgentUpdateFS) OpenStaged(root, path string) (SourceAgentU
 	return file, err
 }
 
-func (f *failingSourceAgentUpdateFS) CreatePrepared(path string) (SourceAgentUpdatePreparedFile, error) {
+func (f *failingSourceAgentUpdateFS) CreatePrepared(path, nonce string) (SourceAgentUpdatePreparedFile, error) {
 	if f.fail == "create_prepared" {
 		return nil, errors.New("private prepared detail")
 	}
-	file, err := f.SourceAgentUpdateFileSystem.CreatePrepared(path)
+	file, err := f.SourceAgentUpdateFileSystem.CreatePrepared(path, nonce)
 	if err != nil {
 		return nil, err
 	}
@@ -148,11 +185,15 @@ func (f *failingSourceAgentUpdateFS) CreatePrepared(path string) (SourceAgentUpd
 	return file, nil
 }
 
-func (f *failingSourceAgentUpdateFS) BackupExecutable(executable, backup string) error {
+func (f *failingSourceAgentUpdateFS) BackupExecutable(executable, backup string) (SourceAgentBinaryIdentity, error) {
 	if f.fail == "backup" {
-		return errors.New("private backup path")
+		return SourceAgentBinaryIdentity{}, errors.New("private backup path")
 	}
-	return f.SourceAgentUpdateFileSystem.BackupExecutable(executable, backup)
+	identity, err := f.SourceAgentUpdateFileSystem.BackupExecutable(executable, backup)
+	if err == nil && f.afterBackup != nil {
+		f.afterBackup()
+	}
+	return identity, err
 }
 
 func (f *failingSourceAgentUpdateFS) ReplaceExecutable(prepared, executable string) error {
@@ -166,11 +207,11 @@ func (f *failingSourceAgentUpdateFS) ReplaceExecutable(prepared, executable stri
 	return err
 }
 
-func (f *failingSourceAgentUpdateFS) RestoreExecutable(backup, executable string) error {
+func (f *failingSourceAgentUpdateFS) RestoreExecutable(backup, executable, nonce string, expected SourceAgentBinaryIdentity) error {
 	if f.fail == "restore" {
 		return errors.New("private restore path")
 	}
-	return f.SourceAgentUpdateFileSystem.RestoreExecutable(backup, executable)
+	return f.SourceAgentUpdateFileSystem.RestoreExecutable(backup, executable, nonce, expected)
 }
 
 func (f *failingSourceAgentUpdateFS) SyncDirectory(path string) error {
@@ -421,7 +462,7 @@ func TestSourceAgentUpdateRetainsBackupWhenRestoreCannotComplete(t *testing.T) {
 	if result.Outcome != SourceAgentUpdateOutcomeFailed || result.Code != SourceAgentCommandCodeRollbackFailed || result.BinaryRestored {
 		t.Fatalf("result=%#v", result)
 	}
-	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName(fixture.request.CommandID))
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
 	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
 }
 
@@ -516,20 +557,24 @@ func TestSourceAgentUpdateCancellationBoundaries(t *testing.T) {
 
 func TestSourceAgentUpdateReadyReceiptIsStrictBoundedAndIdentityBound(t *testing.T) {
 	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	store, err := NewFileSourceAgentUpdateReceiptStore(root, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
 	receipt := SourceAgentReadyReceipt{
-		CommandID: "command-1", WorkerType: "wechat-worker", Version: "2.0.0",
+		CommandID: "command-1", AttemptNonce: strings.Repeat("a", sha256.Size*2), WorkerType: "wechat-worker", Version: "2.0.0",
 		Platform: runtime.GOOS, Architecture: runtime.GOARCH, ProtocolVersion: "2026-08-01",
 		Revision: sourceAgentUpdateTestRevision, HeartbeatAuthenticated: true,
 	}
+	seedSourceAgentReadyJournal(t, store, receipt)
 	if err := store.WriteReady(receipt); err != nil {
 		t.Fatal(err)
 	}
 	expectation := SourceAgentReadyExpectation{
-		CommandID: receipt.CommandID, WorkerType: receipt.WorkerType, Version: receipt.Version,
+		CommandID: receipt.CommandID, AttemptNonce: receipt.AttemptNonce, WorkerType: receipt.WorkerType, Version: receipt.Version,
 		Platform: receipt.Platform, Architecture: receipt.Architecture,
 		ProtocolVersion: receipt.ProtocolVersion, Revision: receipt.Revision,
 	}
@@ -543,15 +588,15 @@ func TestSourceAgentUpdateReadyReceiptIsStrictBoundedAndIdentityBound(t *testing
 	}
 	wrong = expectation
 	wrong.Version = "2.0.1"
-	if err := store.WaitReady(context.Background(), wrong, 2*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyMismatch) {
+	if err := store.WaitReady(context.Background(), wrong, 50*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyMismatch) {
 		t.Fatalf("wrong version error=%v", err)
 	}
 
-	path := store.readyPath(receipt.CommandID)
+	path := store.readyPath(receipt.CommandID, receipt.AttemptNonce)
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WaitReady(context.Background(), expectation, 2*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyInvalid) {
+	if err := store.WaitReady(context.Background(), expectation, 50*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyInvalid) {
 		t.Fatalf("mode error=%v", err)
 	}
 	if err := os.Remove(path); err != nil {
@@ -560,7 +605,7 @@ func TestSourceAgentUpdateReadyReceiptIsStrictBoundedAndIdentityBound(t *testing
 	if err := os.Symlink(filepath.Join(root, "missing"), path); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WaitReady(context.Background(), expectation, 2*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyInvalid) {
+	if err := store.WaitReady(context.Background(), expectation, 50*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyInvalid) {
 		t.Fatalf("symlink error=%v", err)
 	}
 }
@@ -569,19 +614,22 @@ func TestSourceAgentUpdateReadyReceiptRejectsUnknownTrailingOversizedAndConflict
 	newStore := func(t *testing.T) (*FileSourceAgentUpdateReceiptStore, SourceAgentReadyReceipt) {
 		t.Helper()
 		root := t.TempDir()
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
 		store, err := NewFileSourceAgentUpdateReceiptStore(root, time.Millisecond)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return store, SourceAgentReadyReceipt{
-			CommandID: "command-1", WorkerType: "wechat-worker", Version: "2.0.0",
+			CommandID: "command-1", AttemptNonce: strings.Repeat("a", sha256.Size*2), WorkerType: "wechat-worker", Version: "2.0.0",
 			Platform: runtime.GOOS, Architecture: runtime.GOARCH, ProtocolVersion: "2026-08-01",
 			Revision: sourceAgentUpdateTestRevision, HeartbeatAuthenticated: true,
 		}
 	}
 	expectation := func(receipt SourceAgentReadyReceipt) SourceAgentReadyExpectation {
 		return SourceAgentReadyExpectation{
-			CommandID: receipt.CommandID, WorkerType: receipt.WorkerType, Version: receipt.Version,
+			CommandID: receipt.CommandID, AttemptNonce: receipt.AttemptNonce, WorkerType: receipt.WorkerType, Version: receipt.Version,
 			Platform: receipt.Platform, Architecture: receipt.Architecture,
 			ProtocolVersion: receipt.ProtocolVersion, Revision: receipt.Revision,
 		}
@@ -596,16 +644,18 @@ func TestSourceAgentUpdateReadyReceiptRejectsUnknownTrailingOversizedAndConflict
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store, receipt := newStore(t)
-			if err := os.WriteFile(store.readyPath(receipt.CommandID), []byte(test.raw), 0o600); err != nil {
+			seedSourceAgentReadyJournal(t, store, receipt)
+			if err := os.WriteFile(store.readyPath(receipt.CommandID, receipt.AttemptNonce), []byte(test.raw), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.WaitReady(context.Background(), expectation(receipt), 2*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyInvalid) {
+			if err := store.WaitReady(context.Background(), expectation(receipt), 50*time.Millisecond); !errors.Is(err, ErrSourceAgentReadyInvalid) {
 				t.Fatalf("error=%v", err)
 			}
 		})
 	}
 
 	store, receipt := newStore(t)
+	seedSourceAgentReadyJournal(t, store, receipt)
 	if err := store.WriteReady(receipt); err != nil {
 		t.Fatal(err)
 	}
@@ -614,8 +664,25 @@ func TestSourceAgentUpdateReadyReceiptRejectsUnknownTrailingOversizedAndConflict
 	if err := store.WriteReady(conflict); err == nil {
 		t.Fatal("conflicting ready receipt should not overwrite the original")
 	}
-	if err := store.WaitReady(context.Background(), expectation(receipt), 2*time.Millisecond); err != nil {
+	if err := store.WaitReady(context.Background(), expectation(receipt), 50*time.Millisecond); err != nil {
 		t.Fatalf("original receipt changed: %v", err)
+	}
+}
+
+func seedSourceAgentReadyJournal(t *testing.T, store *FileSourceAgentUpdateReceiptStore, receipt SourceAgentReadyReceipt) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	journal := sourceAgentUpdateJournal{
+		SchemaVersion: sourceAgentUpdateJournalSchema, CommandID: receipt.CommandID,
+		AttemptNonce: receipt.AttemptNonce, RequestFingerprint: strings.Repeat("b", sha256.Size*2),
+		WorkerType: receipt.WorkerType, CurrentVersion: "1.0.0", TargetVersion: receipt.Version,
+		Platform: receipt.Platform, Architecture: receipt.Architecture, ProtocolVersion: receipt.ProtocolVersion,
+		Revision: receipt.Revision, Channel: "staging", Stage: "restarted",
+		Backup:    SourceAgentBinaryIdentity{Size: 1, SHA256: strings.Repeat("c", sha256.Size*2)},
+		StartedAt: now, UpdatedAt: now,
+	}
+	if err := store.saveJournal(journal); err != nil {
+		t.Fatal(err)
 	}
 }
 

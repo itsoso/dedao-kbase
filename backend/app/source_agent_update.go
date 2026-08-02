@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -13,8 +14,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	"github.com/gofrs/flock"
 )
 
 const (
@@ -22,20 +21,32 @@ const (
 	SourceAgentUpdateOutcomeRolledBack = "rolled_back"
 	SourceAgentUpdateOutcomeFailed     = "failed"
 
-	SourceAgentUpdateCodeBusy     = "upgrade_busy"
-	SourceAgentUpdateCodeCanceled = "upgrade_canceled"
+	SourceAgentUpdateCodeBusy                     = "upgrade_busy"
+	SourceAgentUpdateCodeCanceled                 = "upgrade_canceled"
+	SourceAgentUpdateCodeInterrupted              = "upgrade_interrupted"
+	SourceAgentUpdateCodeRecoveryFailed           = "upgrade_recovery_failed"
+	SourceAgentUpdateCodeOutcomePersistenceFailed = "outcome_persistence_failed"
 
 	sourceAgentUpdateCodeInvalidRequest = "upgrade_request_invalid"
 	sourceAgentUpdateReceiptMaxBytes    = 8 << 10
 	sourceAgentUpdateDefaultTimeout     = 2 * time.Minute
 	sourceAgentUpdateDefaultPoll        = 100 * time.Millisecond
+	sourceAgentUpdateJournalFileName    = ".source-agent-update-journal.json"
+	sourceAgentUpdateJournalSchema      = "source-agent-update-journal.v1"
+	sourceAgentUpdateFaultAfterBackup   = "after_backup"
+	sourceAgentUpdateFaultAfterReplace  = "after_replace"
+	sourceAgentUpdateFaultAfterRestart  = "after_restart"
+	sourceAgentUpdateFaultAfterReady    = "after_ready"
+	sourceAgentUpdateFaultBeforeOutcome = "before_outcome"
 )
 
 var (
-	ErrSourceAgentUpdateBusy    = errors.New("source agent update is busy")
-	ErrSourceAgentReadyTimeout  = errors.New("source agent ready receipt timed out")
-	ErrSourceAgentReadyMismatch = errors.New("source agent ready receipt does not match")
-	ErrSourceAgentReadyInvalid  = errors.New("source agent ready receipt is invalid")
+	ErrSourceAgentUpdateBusy               = errors.New("source agent update is busy")
+	ErrSourceAgentReadyTimeout             = errors.New("source agent ready receipt timed out")
+	ErrSourceAgentReadyMismatch            = errors.New("source agent ready receipt does not match")
+	ErrSourceAgentReadyInvalid             = errors.New("source agent ready receipt is invalid")
+	errSourceAgentUpdateStorageUnavailable = errors.New("source agent update storage unavailable")
+	errSourceAgentUpdateUnsupportedStorage = errors.New("source agent update storage unsupported")
 )
 
 // SourceAgentUpdateRequest contains only locally resolved artifact metadata.
@@ -72,6 +83,7 @@ type SourceAgentUpdateResult struct {
 	Message            string `json:"message"`
 	DurationMillis     int64  `json:"duration_ms"`
 	BinaryRestored     bool   `json:"binary_restored,omitempty"`
+	PersistenceCode    string `json:"persistence_code,omitempty"`
 }
 
 type SourceAgentUpdateGuardCheck struct {
@@ -106,16 +118,24 @@ type SourceAgentUpdatePreparedFile interface {
 
 type SourceAgentUpdateFileSystem interface {
 	OpenStaged(string, string) (SourceAgentUpdateStagedFile, error)
-	CreatePrepared(string) (SourceAgentUpdatePreparedFile, error)
-	BackupExecutable(string, string) error
+	CreatePrepared(string, string) (SourceAgentUpdatePreparedFile, error)
+	BackupExecutable(string, string) (SourceAgentBinaryIdentity, error)
 	ReplaceExecutable(string, string) error
-	RestoreExecutable(string, string) error
+	RestoreExecutable(string, string, string, SourceAgentBinaryIdentity) error
+	RegularFileExists(string) (bool, error)
+	RegularFileIdentity(string) (SourceAgentBinaryIdentity, error)
 	SyncDirectory(string) error
 	Remove(string) error
 }
 
+type SourceAgentBinaryIdentity struct {
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
 type SourceAgentReadyExpectation struct {
 	CommandID       string
+	AttemptNonce    string
 	WorkerType      string
 	Version         string
 	Platform        string
@@ -126,6 +146,7 @@ type SourceAgentReadyExpectation struct {
 
 type SourceAgentReadyReceipt struct {
 	CommandID              string `json:"command_id"`
+	AttemptNonce           string `json:"attempt_nonce"`
 	WorkerType             string `json:"worker_type"`
 	Version                string `json:"version"`
 	Platform               string `json:"platform"`
@@ -135,11 +156,57 @@ type SourceAgentReadyReceipt struct {
 	HeartbeatAuthenticated bool   `json:"heartbeat_authenticated"`
 }
 
+// SourceAgentReadyChallenge is the only attempt API needed by Task 10. A
+// worker reads it locally after restart and may write the matching receipt
+// only after its authenticated heartbeat succeeds.
+type SourceAgentReadyChallenge struct {
+	CommandID       string `json:"command_id"`
+	AttemptNonce    string `json:"attempt_nonce"`
+	WorkerType      string `json:"worker_type"`
+	Version         string `json:"version"`
+	Platform        string `json:"platform"`
+	Architecture    string `json:"architecture"`
+	ProtocolVersion string `json:"protocol_version"`
+	Revision        string `json:"revision"`
+}
+
+type sourceAgentUpdateJournal struct {
+	SchemaVersion      string                    `json:"schema_version"`
+	CommandID          string                    `json:"command_id"`
+	AttemptNonce       string                    `json:"attempt_nonce"`
+	RequestFingerprint string                    `json:"request_fingerprint"`
+	WorkerType         string                    `json:"worker_type"`
+	CurrentVersion     string                    `json:"current_version"`
+	TargetVersion      string                    `json:"target_version"`
+	Platform           string                    `json:"platform"`
+	Architecture       string                    `json:"architecture"`
+	ProtocolVersion    string                    `json:"protocol_version"`
+	Revision           string                    `json:"revision"`
+	Channel            string                    `json:"channel"`
+	Stage              string                    `json:"stage"`
+	Backup             SourceAgentBinaryIdentity `json:"backup"`
+	StartedAt          string                    `json:"started_at"`
+	UpdatedAt          string                    `json:"updated_at"`
+}
+
 type SourceAgentUpdateReceiptStore interface {
 	Acquire(context.Context, string) (func(), error)
 	LoadOutcome(string) (SourceAgentUpdateResult, bool, error)
 	SaveOutcome(SourceAgentUpdateResult) error
 	WaitReady(context.Context, SourceAgentReadyExpectation, time.Duration) error
+	loadJournal() (sourceAgentUpdateJournal, bool, error)
+	saveJournal(sourceAgentUpdateJournal) error
+	clearJournal(string, string) error
+}
+
+type sourceAgentUpdateDirectory interface {
+	acquire(context.Context) (func(), error)
+	read(string, int64) ([]byte, error)
+	writeImmutable(string, []byte) error
+	writeAtomic(string, []byte) error
+	remove(string) error
+	sync() error
+	close() error
 }
 
 type SourceAgentUpdateClock interface {
@@ -167,12 +234,13 @@ type SourceAgentUpdateConfig struct {
 }
 
 type SourceAgentUpdateTransaction struct {
-	config   SourceAgentUpdateConfig
-	fs       SourceAgentUpdateFileSystem
-	process  SourceAgentUpdateProcessControl
-	guard    SourceAgentUpdateGuard
-	receipts SourceAgentUpdateReceiptStore
-	clock    SourceAgentUpdateClock
+	config     SourceAgentUpdateConfig
+	fs         SourceAgentUpdateFileSystem
+	process    SourceAgentUpdateProcessControl
+	guard      SourceAgentUpdateGuard
+	receipts   SourceAgentUpdateReceiptStore
+	clock      SourceAgentUpdateClock
+	faultStage string
 }
 
 type realSourceAgentUpdateClock struct{}
@@ -180,7 +248,7 @@ type realSourceAgentUpdateClock struct{}
 func (realSourceAgentUpdateClock) Now() time.Time { return time.Now() }
 
 func NewSourceAgentUpdateTransaction(config SourceAgentUpdateConfig) (*SourceAgentUpdateTransaction, error) {
-	if !isExactSourceAgentArtifactName("worker_type", config.WorkerType) ||
+	if !isAllowedSourceAgentUpdateWorkerType(config.WorkerType) ||
 		!isExactSourceAgentArtifactName("platform", config.Platform) ||
 		!isExactSourceAgentArtifactName("architecture", config.Architecture) ||
 		!isSourceAgentArtifactVersion(config.CurrentVersion) ||
@@ -226,27 +294,17 @@ func NewSourceAgentUpdateTransaction(config SourceAgentUpdateConfig) (*SourceAge
 	}, nil
 }
 
+func isAllowedSourceAgentUpdateWorkerType(workerType string) bool {
+	return workerType == "wechat-worker" || workerType == "wcplus-worker"
+}
+
 func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request SourceAgentUpdateRequest) SourceAgentUpdateResult {
 	started := u.clock.Now()
-	result := u.baseResult(request)
-	finish := func(outcome, code string, restored bool) SourceAgentUpdateResult {
-		result.Outcome = outcome
-		result.Code = code
-		result.Message = sourceAgentUpdatePublicMessage(code)
-		result.BinaryRestored = restored
-		duration := u.clock.Now().Sub(started)
-		if duration < 0 {
-			duration = 0
-		}
-		result.DurationMillis = duration.Milliseconds()
-		return result
-	}
-
 	if code := u.validateRequest(request); code != "" {
-		return finish(SourceAgentUpdateOutcomeFailed, code, false)
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
 	}
 	if ctx.Err() != nil {
-		return finish(SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false)
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false)
 	}
 	release, err := u.receipts.Acquire(ctx, request.CommandID)
 	if err != nil {
@@ -254,171 +312,342 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		if ctx.Err() != nil {
 			code = SourceAgentUpdateCodeCanceled
 		}
-		return finish(SourceAgentUpdateOutcomeFailed, code, false)
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
 	}
 	defer release()
 
-	if previous, ok, loadErr := u.receipts.LoadOutcome(request.CommandID); loadErr == nil && ok {
-		if sourceAgentUpdateOutcomeMatches(previous, request) {
-			return previous
+	journal, journalFound, journalErr := u.receipts.loadJournal()
+	previous, outcomeFound, outcomeErr := u.receipts.LoadOutcome(request.CommandID)
+	if outcomeErr != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+	}
+	if outcomeFound {
+		if !sourceAgentUpdateOutcomeMatches(previous, request) {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, sourceAgentUpdateCodeInvalidRequest, false)
 		}
-		return finish(SourceAgentUpdateOutcomeFailed, sourceAgentUpdateCodeInvalidRequest, false)
-	} else if loadErr != nil {
-		return finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false)
+		if journalErr != nil || (journalFound && !sourceAgentUpdateJournalMatches(journal, request)) {
+			return u.recoverUnboundBackup(ctx, started, request)
+		}
+		if journalFound && previous.Outcome != SourceAgentUpdateOutcomeSucceeded && !previous.BinaryRestored {
+			if recovered, done := u.recoverInterrupted(ctx, started, request, journal); done {
+				return recovered
+			}
+		}
+		if journalFound {
+			u.cleanupDurableAttempt(journal)
+		}
+		return previous
+	}
+	if journalErr != nil {
+		return u.recoverUnboundBackup(ctx, started, request)
+	}
+	if journalFound {
+		if recovered, done := u.recoverInterrupted(ctx, started, request, journal); done {
+			return recovered
+		}
+	}
+	backupPath := filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName())
+	if backupExists, existsErr := u.fs.RegularFileExists(backupPath); existsErr != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+	} else if backupExists {
+		if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, "orphan", SourceAgentBinaryIdentity{}); err != nil {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+		}
+		_ = u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
+		_ = u.process.Restart(context.WithoutCancel(ctx))
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, true)
 	}
 
+	nonce, err := newSourceAgentUpdateAttemptNonce()
+	if err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false)
+	}
+	journal = u.newJournal(request, nonce, "started")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false)
+	}
 	guardCheck := SourceAgentUpdateGuardCheck{
 		CommandID: request.CommandID, WorkerType: request.WorkerType,
 		Version: request.TargetVersion, Revision: request.Revision, Channel: request.Channel,
 	}
 	if ctx.Err() != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false))
+		return u.failBeforeReplace(started, request, journal, "", "", SourceAgentUpdateCodeCanceled)
 	}
-	// This guard is deliberately before the first prepared/backup mutation.
 	if err := u.guard.Check(ctx, guardCheck); err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, "", "", SourceAgentCommandCodeInstallFailed)
 	}
 
 	staged, err := u.fs.OpenStaged(u.config.StagingRoot, request.StagedBinary)
 	if err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeVerificationFailed, false))
+		return u.failBeforeReplace(started, request, journal, "", "", SourceAgentCommandCodeVerificationFailed)
 	}
-	defer staged.Close()
 	info, err := staged.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Size() != request.ExpectedSize {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeVerificationFailed, false))
+		_ = staged.Close()
+		return u.failBeforeReplace(started, request, journal, "", "", SourceAgentCommandCodeVerificationFailed)
 	}
 
-	prepared, err := u.fs.CreatePrepared(u.config.CurrentExecutable)
+	prepared, err := u.fs.CreatePrepared(u.config.CurrentExecutable, nonce)
 	if err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		_ = staged.Close()
+		return u.failBeforeReplace(started, request, journal, "", "", SourceAgentCommandCodeInstallFailed)
 	}
 	preparedPath := prepared.Name()
-	preparedClosed := false
-	defer func() {
-		if !preparedClosed {
-			_ = prepared.Close()
-		}
-		_ = u.fs.Remove(preparedPath)
-	}()
-
 	hasher := sha256.New()
 	written, copyErr := io.Copy(io.MultiWriter(prepared, hasher), io.LimitReader(staged, sourceAgentArtifactMaxBytes+1))
 	closeStagedErr := staged.Close()
 	if copyErr != nil || closeStagedErr != nil || written != request.ExpectedSize ||
 		fmt.Sprintf("%x", hasher.Sum(nil)) != request.ExpectedSHA256 {
 		_ = prepared.Close()
-		preparedClosed = true
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeVerificationFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentCommandCodeVerificationFailed)
 	}
 	if err := prepared.Chmod(0o755); err != nil {
 		_ = prepared.Close()
-		preparedClosed = true
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentCommandCodeInstallFailed)
 	}
 	if err := prepared.Sync(); err != nil {
 		_ = prepared.Close()
-		preparedClosed = true
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentCommandCodeInstallFailed)
 	}
 	if err := prepared.Close(); err != nil {
-		preparedClosed = true
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentCommandCodeInstallFailed)
 	}
-	preparedClosed = true
 	if err := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable)); err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
-	}
-
-	if ctx.Err() != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false))
-	}
-	// The second guard is adjacent to backup/replace so idle and rollout state
-	// cannot be checked only at download time.
-	if err := u.guard.Check(ctx, guardCheck); err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentCommandCodeInstallFailed)
 	}
 	if ctx.Err() != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentUpdateCodeCanceled)
 	}
-
-	backupPath := filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName(request.CommandID))
-	if err := u.fs.BackupExecutable(u.config.CurrentExecutable, backupPath); err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+	backupIdentity, err := u.fs.BackupExecutable(u.config.CurrentExecutable, backupPath)
+	if err != nil {
+		return u.failBeforeReplace(started, request, journal, preparedPath, "", SourceAgentCommandCodeInstallFailed)
 	}
 	if err := u.fs.SyncDirectory(u.config.BackupRoot); err != nil {
-		_ = u.fs.Remove(backupPath)
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentCommandCodeInstallFailed)
+	}
+	if u.faultStage == sourceAgentUpdateFaultAfterBackup {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeInterrupted, false)
+	}
+	journal.Backup = backupIdentity
+	journal = u.advanceJournal(journal, "backup_durable")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentCommandCodeInstallFailed)
+	}
+	// The final rollout/idle guard is deliberately after the durable backup and
+	// immediately before the atomic rename.
+	if err := u.guard.Check(ctx, guardCheck); err != nil {
+		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentCommandCodeInstallFailed)
 	}
 	if ctx.Err() != nil {
-		_ = u.fs.Remove(backupPath)
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeCanceled, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentUpdateCodeCanceled)
 	}
 	if err := u.fs.ReplaceExecutable(preparedPath, u.config.CurrentExecutable); err != nil {
-		_ = u.fs.Remove(backupPath)
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeInstallFailed, false))
+		return u.failBeforeReplace(started, request, journal, preparedPath, backupPath, SourceAgentCommandCodeInstallFailed)
 	}
 	if err := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable)); err != nil {
-		return u.rollback(context.WithoutCancel(ctx), backupPath, request, finish)
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
-
+	if u.faultStage == sourceAgentUpdateFaultAfterReplace {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeInterrupted, false)
+	}
+	journal = u.advanceJournal(journal, "replaced")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
+	}
 	if ctx.Err() != nil {
-		return u.rollback(context.WithoutCancel(ctx), backupPath, request, finish)
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
 	if err := u.process.Restart(ctx); err != nil {
-		return u.rollback(context.WithoutCancel(ctx), backupPath, request, finish)
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
+	}
+	if u.faultStage == sourceAgentUpdateFaultAfterRestart {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeInterrupted, false)
+	}
+	journal = u.advanceJournal(journal, "restarted")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
 	expectation := SourceAgentReadyExpectation{
-		CommandID: request.CommandID, WorkerType: request.WorkerType, Version: request.TargetVersion,
+		CommandID: request.CommandID, AttemptNonce: nonce, WorkerType: request.WorkerType, Version: request.TargetVersion,
 		Platform: request.Platform, Architecture: request.Architecture,
 		ProtocolVersion: request.ProtocolVersion, Revision: request.Revision,
 	}
 	if err := u.receipts.WaitReady(ctx, expectation, u.config.ReadyTimeout); err != nil {
-		return u.rollback(context.WithoutCancel(ctx), backupPath, request, finish)
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
-
-	result.RuntimeVersion = request.TargetVersion
-	succeeded := finish(SourceAgentUpdateOutcomeSucceeded, SourceAgentCommandCodeUpgradeComplete, false)
-	if err := u.receipts.SaveOutcome(succeeded); err != nil {
-		return u.rollback(context.WithoutCancel(ctx), backupPath, request, finish)
+	if u.faultStage == sourceAgentUpdateFaultAfterReady {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeInterrupted, false)
 	}
-	_ = u.fs.Remove(backupPath)
-	_ = u.fs.SyncDirectory(u.config.BackupRoot)
+	journal = u.advanceJournal(journal, "ready")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
+	}
+	if u.faultStage == sourceAgentUpdateFaultBeforeOutcome {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeInterrupted, false)
+	}
+	succeeded := u.finishResult(started, request, SourceAgentUpdateOutcomeSucceeded, SourceAgentCommandCodeUpgradeComplete, false)
+	succeeded.RuntimeVersion = request.TargetVersion
+	if persisted, durable := u.persistOutcome(succeeded); !durable {
+		_ = persisted
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
+	}
+	u.cleanupDurableAttempt(journal)
 	return succeeded
+}
+
+func (u *SourceAgentUpdateTransaction) recoverUnboundBackup(ctx context.Context, started time.Time, request SourceAgentUpdateRequest) SourceAgentUpdateResult {
+	backupPath := filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName())
+	backupExists, err := u.fs.RegularFileExists(backupPath)
+	if err != nil || !backupExists {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+	}
+	if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, "recovery", SourceAgentBinaryIdentity{}); err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
+	}
+	restored := true
+	_ = u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
+	_ = u.process.Restart(context.WithoutCancel(ctx))
+	return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, restored)
 }
 
 func (u *SourceAgentUpdateTransaction) rollback(
 	ctx context.Context,
+	started time.Time,
 	backupPath string,
 	request SourceAgentUpdateRequest,
-	finish func(string, string, bool) SourceAgentUpdateResult,
+	journal sourceAgentUpdateJournal,
 ) SourceAgentUpdateResult {
-	if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable); err != nil {
-		return u.saveOutcome(finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, false))
+	if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, journal.AttemptNonce, journal.Backup); err != nil {
+		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, false)
+		persisted, _ := u.persistOutcome(result)
+		return persisted
 	}
 	syncErr := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
+	journal = u.advanceJournal(journal, "rollback_restored")
+	journalErr := u.receipts.saveJournal(journal)
 	restartErr := u.process.Restart(ctx)
-	if syncErr == nil {
-		_ = u.fs.Remove(backupPath)
-		_ = u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
+	if syncErr != nil || journalErr != nil || restartErr != nil {
+		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, true)
+		persisted, durable := u.persistOutcome(result)
+		if durable {
+			u.cleanupDurableAttempt(journal)
+		}
+		return persisted
 	}
-	if syncErr != nil || restartErr != nil {
-		result := finish(SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, true)
-		result.RuntimeVersion = request.CurrentVersion
-		return u.saveOutcome(result)
+	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
+	persisted, durable := u.persistOutcome(result)
+	if durable {
+		u.cleanupDurableAttempt(journal)
 	}
-	result := finish(SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
-	result.RuntimeVersion = request.CurrentVersion
-	return u.saveOutcome(result)
+	return persisted
 }
 
-func (u *SourceAgentUpdateTransaction) saveOutcome(result SourceAgentUpdateResult) SourceAgentUpdateResult {
+func (u *SourceAgentUpdateTransaction) persistOutcome(result SourceAgentUpdateResult) (SourceAgentUpdateResult, bool) {
 	if err := u.receipts.SaveOutcome(result); err != nil {
-		result.Outcome = SourceAgentUpdateOutcomeFailed
-		result.Code = SourceAgentCommandCodeInstallFailed
-		result.Message = sourceAgentUpdatePublicMessage(result.Code)
+		if retryErr := u.receipts.SaveOutcome(result); retryErr != nil {
+			result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
+			return result, false
+		}
 	}
+	return result, true
+}
+
+func (u *SourceAgentUpdateTransaction) finishResult(started time.Time, request SourceAgentUpdateRequest, outcome, code string, restored bool) SourceAgentUpdateResult {
+	result := u.baseResult(request)
+	result.Outcome, result.Code, result.Message, result.BinaryRestored = outcome, code, sourceAgentUpdatePublicMessage(code), restored
+	duration := u.clock.Now().Sub(started)
+	if duration < 0 {
+		duration = 0
+	}
+	result.DurationMillis = duration.Milliseconds()
 	return result
+}
+
+func (u *SourceAgentUpdateTransaction) failBeforeReplace(started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal, preparedPath, backupPath, code string) SourceAgentUpdateResult {
+	if preparedPath != "" {
+		_ = u.fs.Remove(preparedPath)
+	}
+	if backupPath != "" {
+		_ = u.fs.Remove(backupPath)
+	}
+	_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName()))
+	_ = u.fs.SyncDirectory(u.config.BackupRoot)
+	_ = u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
+	result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
+	persisted, _ := u.persistOutcome(result)
+	return persisted
+}
+
+func (u *SourceAgentUpdateTransaction) recoverInterrupted(ctx context.Context, started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal) (SourceAgentUpdateResult, bool) {
+	if !sourceAgentUpdateJournalMatches(journal, request) {
+		return u.recoverUnboundBackup(ctx, started, request), true
+	}
+	backupPath := filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName())
+	backupExists, err := u.fs.RegularFileExists(backupPath)
+	if err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false), true
+	}
+	if !backupExists {
+		if journal.Stage == "started" {
+			_ = u.fs.Remove(sourceAgentUpdatePreparedPath(u.config.CurrentExecutable, journal.AttemptNonce))
+			_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName()))
+			_ = u.fs.SyncDirectory(u.config.BackupRoot)
+			if err := u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce); err == nil {
+				return SourceAgentUpdateResult{}, false
+			}
+		}
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false), true
+	}
+	if !validSourceAgentBinaryIdentity(journal.Backup) {
+		identity, identityErr := u.fs.RegularFileIdentity(backupPath)
+		if identityErr != nil {
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false), true
+		}
+		journal.Backup = identity
+	}
+	if err := u.fs.RestoreExecutable(backupPath, u.config.CurrentExecutable, journal.AttemptNonce, journal.Backup); err != nil {
+		return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false), true
+	}
+	syncErr := u.fs.SyncDirectory(filepath.Dir(u.config.CurrentExecutable))
+	restartErr := u.process.Restart(context.WithoutCancel(ctx))
+	journal = u.advanceJournal(journal, "rollback_restored")
+	journalErr := u.receipts.saveJournal(journal)
+	if syncErr != nil || restartErr != nil || journalErr != nil {
+		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentCommandCodeRollbackFailed, true)
+		persisted, _ := u.persistOutcome(result)
+		return persisted, true
+	}
+	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
+	persisted, durable := u.persistOutcome(result)
+	if durable {
+		u.cleanupDurableAttempt(journal)
+	}
+	return persisted, true
+}
+
+func (u *SourceAgentUpdateTransaction) cleanupDurableAttempt(journal sourceAgentUpdateJournal) {
+	_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupName()))
+	_ = u.fs.Remove(filepath.Join(u.config.BackupRoot, sourceAgentUpdateBackupPendingName()))
+	_ = u.fs.Remove(sourceAgentUpdatePreparedPath(u.config.CurrentExecutable, journal.AttemptNonce))
+	_ = u.fs.SyncDirectory(u.config.BackupRoot)
+	_ = u.receipts.clearJournal(journal.CommandID, journal.AttemptNonce)
+}
+
+func (u *SourceAgentUpdateTransaction) newJournal(request SourceAgentUpdateRequest, nonce, stage string) sourceAgentUpdateJournal {
+	now := u.clock.Now().UTC().Format(time.RFC3339Nano)
+	return sourceAgentUpdateJournal{
+		SchemaVersion: sourceAgentUpdateJournalSchema, CommandID: request.CommandID,
+		AttemptNonce: nonce, RequestFingerprint: sourceAgentUpdateRequestFingerprint(request),
+		WorkerType: request.WorkerType, CurrentVersion: request.CurrentVersion, TargetVersion: request.TargetVersion,
+		Platform: request.Platform, Architecture: request.Architecture, ProtocolVersion: request.ProtocolVersion,
+		Revision: request.Revision, Channel: request.Channel, Stage: stage, StartedAt: now, UpdatedAt: now,
+	}
+}
+
+func (u *SourceAgentUpdateTransaction) advanceJournal(journal sourceAgentUpdateJournal, stage string) sourceAgentUpdateJournal {
+	journal.Stage = stage
+	journal.UpdatedAt = u.clock.Now().UTC().Format(time.RFC3339Nano)
+	return journal
 }
 
 func (u *SourceAgentUpdateTransaction) validateRequest(request SourceAgentUpdateRequest) string {
@@ -468,6 +697,58 @@ func sourceAgentUpdateRequestFingerprint(request SourceAgentUpdateRequest) strin
 	return fmt.Sprintf("%x", digest)
 }
 
+func newSourceAgentUpdateAttemptNonce() (string, error) {
+	var nonce [32]byte
+	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", nonce), nil
+}
+
+func sourceAgentUpdateJournalMatches(journal sourceAgentUpdateJournal, request SourceAgentUpdateRequest) bool {
+	return validSourceAgentUpdateJournal(journal) && journal.CommandID == request.CommandID &&
+		journal.RequestFingerprint == sourceAgentUpdateRequestFingerprint(request)
+}
+
+func validSourceAgentUpdateJournal(journal sourceAgentUpdateJournal) bool {
+	if journal.SchemaVersion != sourceAgentUpdateJournalSchema ||
+		!isExactLowerHex(journal.AttemptNonce, sha256.Size*2) ||
+		!isExactLowerHex(journal.RequestFingerprint, sha256.Size*2) ||
+		!isAllowedSourceAgentUpdateWorkerType(journal.WorkerType) ||
+		!isSourceAgentArtifactVersion(journal.CurrentVersion) || !isSourceAgentArtifactVersion(journal.TargetVersion) ||
+		compareSourceAgentArtifactVersions(journal.CurrentVersion, journal.TargetVersion) >= 0 ||
+		!isExactSourceAgentArtifactName("platform", journal.Platform) ||
+		!isExactSourceAgentArtifactName("architecture", journal.Architecture) ||
+		!isExactSourceAgentProtocolVersion(journal.ProtocolVersion) ||
+		(!isExactLowerHex(journal.Revision, 40) && !isExactLowerHex(journal.Revision, 64)) ||
+		(journal.Channel != "staging" && journal.Channel != "production") {
+		return false
+	}
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", journal.CommandID, true)
+	if err != nil || commandID != journal.CommandID {
+		return false
+	}
+	started, startErr := time.Parse(time.RFC3339Nano, journal.StartedAt)
+	updated, updateErr := time.Parse(time.RFC3339Nano, journal.UpdatedAt)
+	if startErr != nil || updateErr != nil || updated.Before(started) {
+		return false
+	}
+	allowedStages := map[string]struct{}{
+		"started": {}, "backup_durable": {}, "replaced": {}, "restarted": {}, "ready": {}, "rollback_restored": {},
+	}
+	if _, ok := allowedStages[journal.Stage]; !ok {
+		return false
+	}
+	if journal.Stage != "started" && (!validSourceAgentBinaryIdentity(journal.Backup)) {
+		return false
+	}
+	return true
+}
+
+func validSourceAgentBinaryIdentity(identity SourceAgentBinaryIdentity) bool {
+	return identity.Size > 0 && identity.Size <= sourceAgentArtifactMaxBytes && isExactLowerHex(identity.SHA256, sha256.Size*2)
+}
+
 func sourceAgentUpdatePublicMessage(code string) string {
 	switch code {
 	case SourceAgentCommandCodeUpgradeComplete:
@@ -484,6 +765,10 @@ func sourceAgentUpdatePublicMessage(code string) string {
 		return "Another upgrade is active."
 	case SourceAgentUpdateCodeCanceled:
 		return "Upgrade was canceled before installation."
+	case SourceAgentUpdateCodeInterrupted:
+		return "Upgrade was interrupted and requires local recovery."
+	case SourceAgentUpdateCodeRecoveryFailed:
+		return "Upgrade recovery requires operator attention."
 	case sourceAgentUpdateCodeInvalidRequest:
 		return "Upgrade request is invalid."
 	default:
@@ -509,9 +794,16 @@ func isSourceAgentUpdateChildPath(root, child string) bool {
 		!strings.HasPrefix(relative, ".."+string(os.PathSeparator)) && !filepath.IsAbs(relative)
 }
 
-func sourceAgentUpdateBackupName(commandID string) string {
-	digest := sha256.Sum256([]byte(commandID))
-	return fmt.Sprintf(".source-agent-backup-%x", digest[:16])
+func sourceAgentUpdateBackupName() string {
+	return ".source-agent-backup"
+}
+
+func sourceAgentUpdateBackupPendingName() string {
+	return ".source-agent-backup.pending"
+}
+
+func sourceAgentUpdatePreparedPath(executable, nonce string) string {
+	return filepath.Join(filepath.Dir(executable), ".source-agent-prepared-"+nonce)
 }
 
 type osSourceAgentUpdateFileSystem struct{}
@@ -540,8 +832,12 @@ func (osSourceAgentUpdateFileSystem) OpenStaged(root, path string) (SourceAgentU
 	return file, nil
 }
 
-func (osSourceAgentUpdateFileSystem) CreatePrepared(executable string) (SourceAgentUpdatePreparedFile, error) {
-	file, err := os.CreateTemp(filepath.Dir(executable), ".source-agent-prepared-*")
+func (osSourceAgentUpdateFileSystem) CreatePrepared(executable, nonce string) (SourceAgentUpdatePreparedFile, error) {
+	if !isExactLowerHex(nonce, sha256.Size*2) {
+		return nil, errors.New("invalid local update attempt")
+	}
+	path := sourceAgentUpdatePreparedPath(executable, nonce)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -553,41 +849,50 @@ func (osSourceAgentUpdateFileSystem) CreatePrepared(executable string) (SourceAg
 	return file, nil
 }
 
-func (osSourceAgentUpdateFileSystem) BackupExecutable(executable, backup string) error {
+func (osSourceAgentUpdateFileSystem) BackupExecutable(executable, backup string) (SourceAgentBinaryIdentity, error) {
 	if filepath.Dir(executable) != filepath.Dir(backup) {
-		return errors.New("backup must share the executable directory")
+		return SourceAgentBinaryIdentity{}, errors.New("backup must share the executable directory")
 	}
 	source, err := openRegularSourceAgentUpdateFile(executable)
 	if err != nil {
-		return err
+		return SourceAgentBinaryIdentity{}, err
 	}
 	defer source.Close()
-	target, err := os.OpenFile(backup, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	pending := filepath.Join(filepath.Dir(backup), sourceAgentUpdateBackupPendingName())
+	target, err := os.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return err
+		return SourceAgentBinaryIdentity{}, err
 	}
 	ok := false
 	defer func() {
 		target.Close()
 		if !ok {
-			os.Remove(backup)
+			os.Remove(pending)
 		}
 	}()
-	written, err := io.Copy(target, io.LimitReader(source, sourceAgentArtifactMaxBytes+1))
+	hasher := sha256.New()
+	written, err := io.Copy(io.MultiWriter(target, hasher), io.LimitReader(source, sourceAgentArtifactMaxBytes+1))
 	if err != nil || written <= 0 || written > sourceAgentArtifactMaxBytes {
-		return errors.New("backup copy failed")
+		return SourceAgentBinaryIdentity{}, errors.New("backup copy failed")
 	}
 	if err := target.Chmod(0o755); err != nil {
-		return err
+		return SourceAgentBinaryIdentity{}, err
 	}
 	if err := target.Sync(); err != nil {
-		return err
+		return SourceAgentBinaryIdentity{}, err
 	}
 	if err := target.Close(); err != nil {
-		return err
+		return SourceAgentBinaryIdentity{}, err
+	}
+	if err := os.Link(pending, backup); err != nil {
+		return SourceAgentBinaryIdentity{}, err
+	}
+	if err := os.Remove(pending); err != nil {
+		_ = os.Remove(backup)
+		return SourceAgentBinaryIdentity{}, err
 	}
 	ok = true
-	return nil
+	return SourceAgentBinaryIdentity{Size: written, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))}, nil
 }
 
 func (osSourceAgentUpdateFileSystem) ReplaceExecutable(prepared, executable string) error {
@@ -597,7 +902,7 @@ func (osSourceAgentUpdateFileSystem) ReplaceExecutable(prepared, executable stri
 	return os.Rename(prepared, executable)
 }
 
-func (osSourceAgentUpdateFileSystem) RestoreExecutable(backup, executable string) error {
+func (osSourceAgentUpdateFileSystem) RestoreExecutable(backup, executable, nonce string, expected SourceAgentBinaryIdentity) error {
 	if filepath.Dir(backup) != filepath.Dir(executable) {
 		return errors.New("backup must share the executable directory")
 	}
@@ -606,7 +911,11 @@ func (osSourceAgentUpdateFileSystem) RestoreExecutable(backup, executable string
 		return err
 	}
 	defer source.Close()
-	target, err := os.CreateTemp(filepath.Dir(executable), ".source-agent-restore-*")
+	restoreSuffix := nonce
+	if !isExactLowerHex(restoreSuffix, sha256.Size*2) {
+		restoreSuffix = "recovery"
+	}
+	target, err := os.CreateTemp(filepath.Dir(executable), ".source-agent-restore-"+restoreSuffix+"-*")
 	if err != nil {
 		return err
 	}
@@ -621,9 +930,14 @@ func (osSourceAgentUpdateFileSystem) RestoreExecutable(backup, executable string
 	if err := target.Chmod(0o600); err != nil {
 		return err
 	}
-	written, err := io.Copy(target, io.LimitReader(source, sourceAgentArtifactMaxBytes+1))
+	hasher := sha256.New()
+	written, err := io.Copy(io.MultiWriter(target, hasher), io.LimitReader(source, sourceAgentArtifactMaxBytes+1))
 	if err != nil || written <= 0 || written > sourceAgentArtifactMaxBytes {
 		return errors.New("restore copy failed")
+	}
+	actual := SourceAgentBinaryIdentity{Size: written, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))}
+	if validSourceAgentBinaryIdentity(expected) && actual != expected {
+		return errors.New("backup integrity check failed")
 	}
 	if err := target.Chmod(0o755); err != nil {
 		return err
@@ -639,6 +953,34 @@ func (osSourceAgentUpdateFileSystem) RestoreExecutable(backup, executable string
 	}
 	ok = true
 	return nil
+}
+
+func (osSourceAgentUpdateFileSystem) RegularFileExists(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return false, errors.New("update recovery file is not regular")
+	}
+	return true, nil
+}
+
+func (osSourceAgentUpdateFileSystem) RegularFileIdentity(path string) (SourceAgentBinaryIdentity, error) {
+	file, err := openRegularSourceAgentUpdateFile(path)
+	if err != nil {
+		return SourceAgentBinaryIdentity{}, err
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	size, err := io.Copy(hasher, io.LimitReader(file, sourceAgentArtifactMaxBytes+1))
+	if err != nil || size <= 0 || size > sourceAgentArtifactMaxBytes {
+		return SourceAgentBinaryIdentity{}, errors.New("source agent update file identity is invalid")
+	}
+	return SourceAgentBinaryIdentity{Size: size, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))}, nil
 }
 
 func (osSourceAgentUpdateFileSystem) SyncDirectory(path string) error {
@@ -683,6 +1025,7 @@ func openRegularSourceAgentUpdateFile(path string) (*os.File, error) {
 
 type FileSourceAgentUpdateReceiptStore struct {
 	root         string
+	directory    sourceAgentUpdateDirectory
 	pollInterval time.Duration
 }
 
@@ -690,64 +1033,91 @@ func NewFileSourceAgentUpdateReceiptStore(root string, pollInterval time.Duratio
 	if !isCleanAbsoluteSourceAgentUpdatePath(root) {
 		return nil, errors.New("source agent receipt root must be a fixed absolute path")
 	}
-	info, err := os.Lstat(root)
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+	directory, err := openSourceAgentUpdateDirectory(root)
+	if err != nil {
 		return nil, errors.New("source agent receipt root is unavailable")
 	}
 	if pollInterval <= 0 {
 		pollInterval = sourceAgentUpdateDefaultPoll
 	}
-	return &FileSourceAgentUpdateReceiptStore{root: root, pollInterval: pollInterval}, nil
+	return &FileSourceAgentUpdateReceiptStore{root: root, directory: directory, pollInterval: pollInterval}, nil
 }
 
 func (s *FileSourceAgentUpdateReceiptStore) Acquire(ctx context.Context, _ string) (func(), error) {
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	lock := flock.New(filepath.Join(s.root, ".source-agent-update.lock"))
-	locked, err := lock.TryLock()
-	if err != nil {
-		return nil, ErrSourceAgentUpdateBusy
-	}
-	if !locked {
-		return nil, ErrSourceAgentUpdateBusy
-	}
-	return func() { _ = lock.Unlock() }, nil
+	return s.directory.acquire(ctx)
 }
 
-func (s *FileSourceAgentUpdateReceiptStore) readyPath(commandID string) string {
-	return filepath.Join(s.root, sourceAgentUpdateReceiptName("ready", commandID))
+func (s *FileSourceAgentUpdateReceiptStore) Close() error {
+	return s.directory.close()
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) readyPath(commandID, attemptNonce string) string {
+	return filepath.Join(s.root, sourceAgentUpdateReceiptName("ready", commandID, attemptNonce))
 }
 
 func (s *FileSourceAgentUpdateReceiptStore) outcomePath(commandID string) string {
-	return filepath.Join(s.root, sourceAgentUpdateReceiptName("outcome", commandID))
+	return filepath.Join(s.root, sourceAgentUpdateReceiptName("outcome", commandID, ""))
 }
 
-func sourceAgentUpdateReceiptName(kind, commandID string) string {
-	digest := sha256.Sum256([]byte(commandID))
+func sourceAgentUpdateReceiptName(kind, commandID, attemptNonce string) string {
+	digest := sha256.Sum256([]byte(commandID + "\x00" + attemptNonce))
 	return fmt.Sprintf("%s-%x.json", kind, digest[:16])
+}
+
+func validSourceAgentUpdateLocalName(name string) bool {
+	return name != "" && name != "." && name != ".." && filepath.Base(name) == name &&
+		!strings.ContainsAny(name, "/\\\x00")
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) ReadyChallenge(commandID string) (SourceAgentReadyChallenge, error) {
+	journal, found, err := s.loadJournal()
+	if err != nil || !found || journal.CommandID != commandID ||
+		(journal.Stage != "restarted" && journal.Stage != "ready") {
+		return SourceAgentReadyChallenge{}, ErrSourceAgentReadyInvalid
+	}
+	return SourceAgentReadyChallenge{
+		CommandID: journal.CommandID, AttemptNonce: journal.AttemptNonce,
+		WorkerType: journal.WorkerType, Version: journal.TargetVersion,
+		Platform: journal.Platform, Architecture: journal.Architecture,
+		ProtocolVersion: journal.ProtocolVersion, Revision: journal.Revision,
+	}, nil
 }
 
 func (s *FileSourceAgentUpdateReceiptStore) WriteReady(receipt SourceAgentReadyReceipt) error {
 	if !validSourceAgentReadyReceipt(receipt) {
 		return ErrSourceAgentReadyInvalid
 	}
-	return writeStrictSourceAgentUpdateJSON(s.root, s.readyPath(receipt.CommandID), receipt)
+	challenge, err := s.ReadyChallenge(receipt.CommandID)
+	if err != nil || challenge.AttemptNonce != receipt.AttemptNonce || challenge.WorkerType != receipt.WorkerType ||
+		challenge.Version != receipt.Version || challenge.Platform != receipt.Platform ||
+		challenge.Architecture != receipt.Architecture || challenge.ProtocolVersion != receipt.ProtocolVersion ||
+		challenge.Revision != receipt.Revision {
+		return ErrSourceAgentReadyMismatch
+	}
+	payload, err := marshalSourceAgentUpdateJSON(receipt)
+	if err != nil {
+		return ErrSourceAgentReadyInvalid
+	}
+	return s.directory.writeImmutable(sourceAgentUpdateReceiptName("ready", receipt.CommandID, receipt.AttemptNonce), payload)
 }
 
 func (s *FileSourceAgentUpdateReceiptStore) WaitReady(ctx context.Context, expected SourceAgentReadyExpectation, timeout time.Duration) error {
 	if !validSourceAgentReadyExpectation(expected) || timeout <= 0 {
 		return ErrSourceAgentReadyInvalid
 	}
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	ticker := time.NewTicker(s.pollInterval)
-	defer ticker.Stop()
+	deadline := time.Now().Add(timeout)
+	name := sourceAgentUpdateReceiptName("ready", expected.CommandID, expected.AttemptNonce)
 	for {
+		if !time.Now().Before(deadline) {
+			return ErrSourceAgentReadyTimeout
+		}
 		var receipt SourceAgentReadyReceipt
-		err := readStrictSourceAgentUpdateJSON(s.readyPath(expected.CommandID), &receipt)
+		payload, err := s.directory.read(name, sourceAgentUpdateReceiptMaxBytes)
 		if err == nil {
-			if !validSourceAgentReadyReceipt(receipt) {
+			if !time.Now().Before(deadline) || decodeStrictSourceAgentUpdateJSON(payload, &receipt) != nil || !validSourceAgentReadyReceipt(receipt) {
+				if !time.Now().Before(deadline) {
+					return ErrSourceAgentReadyTimeout
+				}
 				return ErrSourceAgentReadyInvalid
 			}
 			if !sourceAgentReadyReceiptMatches(receipt, expected) {
@@ -758,12 +1128,8 @@ func (s *FileSourceAgentUpdateReceiptStore) WaitReady(ctx context.Context, expec
 		if !errors.Is(err, os.ErrNotExist) {
 			return ErrSourceAgentReadyInvalid
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return ErrSourceAgentReadyTimeout
-		case <-ticker.C:
+		if err := waitSourceAgentUpdatePoll(ctx, time.Until(deadline), s.pollInterval); err != nil {
+			return err
 		}
 	}
 }
@@ -772,10 +1138,12 @@ func (s *FileSourceAgentUpdateReceiptStore) LoadOutcome(commandID string) (Sourc
 	if normalized, err := normalizeSourceAgentCommandIdentifier("command_id", commandID, true); err != nil || normalized != commandID {
 		return SourceAgentUpdateResult{}, false, errors.New("invalid source agent update command")
 	}
-	var result SourceAgentUpdateResult
-	if err := readStrictSourceAgentUpdateJSON(s.outcomePath(commandID), &result); errors.Is(err, os.ErrNotExist) {
+	payload, err := s.directory.read(sourceAgentUpdateReceiptName("outcome", commandID, ""), sourceAgentUpdateReceiptMaxBytes)
+	if errors.Is(err, os.ErrNotExist) {
 		return SourceAgentUpdateResult{}, false, nil
-	} else if err != nil || !validSourceAgentUpdateResult(result) {
+	}
+	var result SourceAgentUpdateResult
+	if err != nil || decodeStrictSourceAgentUpdateJSON(payload, &result) != nil || !validSourceAgentUpdateResult(result) {
 		return SourceAgentUpdateResult{}, false, errors.New("invalid source agent update outcome")
 	}
 	return result, true, nil
@@ -785,12 +1153,57 @@ func (s *FileSourceAgentUpdateReceiptStore) SaveOutcome(result SourceAgentUpdate
 	if !validSourceAgentUpdateResult(result) {
 		return errors.New("invalid source agent update outcome")
 	}
-	return writeStrictSourceAgentUpdateJSON(s.root, s.outcomePath(result.CommandID), result)
+	payload, err := marshalSourceAgentUpdateJSON(result)
+	if err != nil {
+		return err
+	}
+	return s.directory.writeImmutable(sourceAgentUpdateReceiptName("outcome", result.CommandID, ""), payload)
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) loadJournal() (sourceAgentUpdateJournal, bool, error) {
+	payload, err := s.directory.read(sourceAgentUpdateJournalFileName, sourceAgentUpdateReceiptMaxBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		return sourceAgentUpdateJournal{}, false, nil
+	}
+	var journal sourceAgentUpdateJournal
+	if err != nil || decodeStrictSourceAgentUpdateJSON(payload, &journal) != nil || !validSourceAgentUpdateJournal(journal) {
+		return sourceAgentUpdateJournal{}, true, errors.New("source agent update journal is invalid")
+	}
+	return journal, true, nil
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) saveJournal(journal sourceAgentUpdateJournal) error {
+	if !validSourceAgentUpdateJournal(journal) {
+		return errors.New("source agent update journal is invalid")
+	}
+	payload, err := marshalSourceAgentUpdateJSON(journal)
+	if err != nil {
+		return err
+	}
+	return s.directory.writeAtomic(sourceAgentUpdateJournalFileName, payload)
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) clearJournal(commandID, attemptNonce string) error {
+	journal, found, err := s.loadJournal()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if journal.CommandID != commandID || journal.AttemptNonce != attemptNonce {
+		return errors.New("source agent update journal changed")
+	}
+	if err := s.directory.remove(sourceAgentUpdateReceiptName("ready", commandID, attemptNonce)); err != nil {
+		return err
+	}
+	return s.directory.remove(sourceAgentUpdateJournalFileName)
 }
 
 func validSourceAgentReadyExpectation(value SourceAgentReadyExpectation) bool {
 	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", value.CommandID, true)
-	return err == nil && commandID == value.CommandID && isExactSourceAgentArtifactName("worker_type", value.WorkerType) &&
+	return err == nil && commandID == value.CommandID && isExactLowerHex(value.AttemptNonce, sha256.Size*2) &&
+		isAllowedSourceAgentUpdateWorkerType(value.WorkerType) &&
 		isSourceAgentArtifactVersion(value.Version) && isExactSourceAgentArtifactName("platform", value.Platform) &&
 		isExactSourceAgentArtifactName("architecture", value.Architecture) && isExactSourceAgentProtocolVersion(value.ProtocolVersion) &&
 		(isExactLowerHex(value.Revision, 40) || isExactLowerHex(value.Revision, 64))
@@ -798,14 +1211,14 @@ func validSourceAgentReadyExpectation(value SourceAgentReadyExpectation) bool {
 
 func validSourceAgentReadyReceipt(value SourceAgentReadyReceipt) bool {
 	return value.HeartbeatAuthenticated && validSourceAgentReadyExpectation(SourceAgentReadyExpectation{
-		CommandID: value.CommandID, WorkerType: value.WorkerType, Version: value.Version,
+		CommandID: value.CommandID, AttemptNonce: value.AttemptNonce, WorkerType: value.WorkerType, Version: value.Version,
 		Platform: value.Platform, Architecture: value.Architecture,
 		ProtocolVersion: value.ProtocolVersion, Revision: value.Revision,
 	})
 }
 
 func sourceAgentReadyReceiptMatches(receipt SourceAgentReadyReceipt, expected SourceAgentReadyExpectation) bool {
-	return receipt.CommandID == expected.CommandID && receipt.WorkerType == expected.WorkerType &&
+	return receipt.CommandID == expected.CommandID && receipt.AttemptNonce == expected.AttemptNonce && receipt.WorkerType == expected.WorkerType &&
 		receipt.Version == expected.Version && receipt.Platform == expected.Platform &&
 		receipt.Architecture == expected.Architecture && receipt.ProtocolVersion == expected.ProtocolVersion &&
 		receipt.Revision == expected.Revision && receipt.HeartbeatAuthenticated
@@ -814,7 +1227,7 @@ func sourceAgentReadyReceiptMatches(receipt SourceAgentReadyReceipt, expected So
 func validSourceAgentUpdateResult(value SourceAgentUpdateResult) bool {
 	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", value.CommandID, true)
 	if err != nil || commandID != value.CommandID || !isExactSourceAgentArtifactName("platform", value.Platform) ||
-		!isExactSourceAgentArtifactName("worker_type", value.WorkerType) ||
+		!isAllowedSourceAgentUpdateWorkerType(value.WorkerType) ||
 		!isExactSourceAgentArtifactName("architecture", value.Architecture) || !isExactSourceAgentProtocolVersion(value.ProtocolVersion) ||
 		!isSourceAgentArtifactVersion(value.RuntimeVersion) ||
 		!isExactLowerHex(value.RequestFingerprint, sha256.Size*2) ||
@@ -832,93 +1245,49 @@ func validSourceAgentUpdateResult(value SourceAgentUpdateResult) bool {
 		SourceAgentCommandCodeUpgradeComplete: {}, SourceAgentCommandCodeVerificationFailed: {},
 		SourceAgentCommandCodeInstallFailed: {}, SourceAgentCommandCodeRestartFailed: {},
 		SourceAgentCommandCodeRollbackComplete: {}, SourceAgentCommandCodeRollbackFailed: {},
-		SourceAgentUpdateCodeCanceled: {}, sourceAgentUpdateCodeInvalidRequest: {},
+		SourceAgentUpdateCodeCanceled: {}, SourceAgentUpdateCodeRecoveryFailed: {}, sourceAgentUpdateCodeInvalidRequest: {},
 	}
 	_, ok := allowedCodes[value.Code]
-	return ok
+	return ok && (value.PersistenceCode == "" || value.PersistenceCode == SourceAgentUpdateCodeOutcomePersistenceFailed)
 }
 
-func writeStrictSourceAgentUpdateJSON(root, target string, value any) error {
+func marshalSourceAgentUpdateJSON(value any) ([]byte, error) {
 	payload, err := json.Marshal(value)
 	if err != nil || len(payload) > sourceAgentUpdateReceiptMaxBytes {
-		return errors.New("source agent update receipt is invalid")
+		return nil, errors.New("source agent update state is invalid")
 	}
-	payload = append(payload, '\n')
-	temporary, err := os.CreateTemp(root, ".source-agent-receipt-*")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer func() {
-		temporary.Close()
-		os.Remove(temporaryPath)
-	}()
-	if err := temporary.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := temporary.Write(payload); err != nil {
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Link(temporaryPath, target); err != nil {
-		if !errors.Is(err, os.ErrExist) {
-			return err
-		}
-		existing, readErr := readStrictSourceAgentUpdatePayload(target)
-		if readErr != nil || !bytes.Equal(existing, payload) {
-			return errors.New("source agent update receipt conflicts with an existing receipt")
-		}
-		return nil
-	}
-	if err := (osSourceAgentUpdateFileSystem{}).SyncDirectory(root); err != nil {
-		_ = os.Remove(target)
-		_ = (osSourceAgentUpdateFileSystem{}).SyncDirectory(root)
-		return err
-	}
-	return nil
+	return append(payload, '\n'), nil
 }
 
-func readStrictSourceAgentUpdatePayload(path string) ([]byte, error) {
-	file, err := openRegularSourceAgentUpdateFile(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || info.Mode().Perm() != 0o600 || info.Size() <= 0 || info.Size() > sourceAgentUpdateReceiptMaxBytes {
-		return nil, errors.New("source agent update receipt is invalid")
-	}
-	payload, err := io.ReadAll(io.LimitReader(file, sourceAgentUpdateReceiptMaxBytes+1))
-	if err != nil || len(payload) > sourceAgentUpdateReceiptMaxBytes {
-		return nil, errors.New("source agent update receipt is invalid")
-	}
-	return payload, nil
-}
-
-func readStrictSourceAgentUpdateJSON(path string, target any) error {
-	payload, err := readStrictSourceAgentUpdatePayload(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return os.ErrNotExist
-		}
-		return err
-	}
+func decodeStrictSourceAgentUpdateJSON(payload []byte, target any) error {
 	if rejectDuplicateJSONFields(payload) != nil {
-		return errors.New("source agent update receipt is invalid")
+		return errors.New("source agent update state is invalid")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		return errors.New("source agent update receipt is invalid")
+		return errors.New("source agent update state is invalid")
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return errors.New("source agent update receipt is invalid")
+		return errors.New("source agent update state is invalid")
 	}
 	return nil
+}
+
+func waitSourceAgentUpdatePoll(ctx context.Context, remaining, poll time.Duration) error {
+	if remaining <= 0 {
+		return ErrSourceAgentReadyTimeout
+	}
+	if poll > remaining {
+		poll = remaining
+	}
+	timer := time.NewTimer(poll)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
