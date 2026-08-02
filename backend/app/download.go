@@ -34,6 +34,7 @@ type OdobDownload struct {
 
 type EBookDownload struct {
 	Ctx          context.Context
+	Service      *services.Service
 	DownloadType int // 1:html, 2:PDF文档, 3:epub
 	ID           int
 	EnID         string
@@ -231,7 +232,11 @@ func (d *EBookDownload) Download() error {
 }
 
 func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
-	detail, err := EbookDetail(d.EnID)
+	service := d.Service
+	if service == nil {
+		service = dedaoServiceFromContext(d.Ctx)
+	}
+	detail, err := service.EbookDetail(d.EnID)
 	if err != nil {
 		return nil, err
 	}
@@ -244,7 +249,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	}
 
 	title += "_" + detail.BookAuthor
-	info, svgContent, err := EbookPage(d.Ctx, detail.Enid)
+	info, svgContent, err := ebookPageWithService(d.Ctx, service, detail.Enid)
 	if err != nil {
 		return nil, err
 	}

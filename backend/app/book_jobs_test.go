@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 func TestBookKnowledgeJobPersistsValidDedaoEbookRequests(t *testing.T) {
@@ -124,6 +126,29 @@ func TestBookKnowledgeJobRecoversExecutorPanic(t *testing.T) {
 	}
 	if loaded.Error != "job execution failed" {
 		t.Fatalf("panic error = %q, want sanitized failure", loaded.Error)
+	}
+}
+
+func TestBookKnowledgeJobUsesCapturedDedaoService(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	snapshot := &services.Service{}
+	oldRunner := runDedaoEbookDownloadJob
+	runDedaoEbookDownloadJob = func(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
+		if got := dedaoServiceFromContext(ctx); got != snapshot {
+			t.Fatalf("job service = %p, want captured %p", got, snapshot)
+		}
+		return map[string]any{"ebook_id": job.EbookID}, nil
+	}
+	defer func() { runDedaoEbookDownloadJob = oldRunner }()
+
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 47, EbookEnID: "snapshot-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RunBookKnowledgeJobWithService(job.ID, snapshot); err != nil {
+		t.Fatal(err)
 	}
 }
 

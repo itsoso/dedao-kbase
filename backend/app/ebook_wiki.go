@@ -49,7 +49,7 @@ type ebookWikiCommandRunner interface {
 type osEbookWikiCommandRunner struct{}
 
 var downloadEbookForKnowledgeSync = func(ctx context.Context, id int, enid, outputDir string) (*EBookDownloadResult, error) {
-	download := EBookDownload{Ctx: ctx, DownloadType: 1, ID: id, EnID: enid, OutputDir: outputDir}
+	download := EBookDownload{Ctx: ctx, Service: dedaoServiceFromContext(ctx), DownloadType: 1, ID: id, EnID: enid, OutputDir: outputDir}
 	return download.DownloadWithResult()
 }
 

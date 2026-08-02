@@ -49,13 +49,17 @@ func EbookInfo(enID string) (info *services.EbookInfo, err error) {
 }
 
 func EbookPage(ctx context.Context, enID string) (info *services.EbookInfo, svgContent utils.SvgContents, err error) {
-	token, err1 := getService().EbookReadToken(enID)
+	return ebookPageWithService(ctx, dedaoServiceFromContext(ctx), enID)
+}
+
+func ebookPageWithService(ctx context.Context, service *services.Service, enID string) (info *services.EbookInfo, svgContent utils.SvgContents, err error) {
+	token, err1 := service.EbookReadToken(enID)
 	if err1 != nil {
 		err = err1
 		return
 	}
 
-	info, err = getService().EbookInfo(token.Token)
+	info, err = service.EbookInfo(token.Token)
 	if err != nil {
 		return
 	}
@@ -93,7 +97,7 @@ func EbookPage(ctx context.Context, enID string) (info *services.EbookInfo, svgC
 			defer wgp.Done()
 			index, count, offset := 0, 20, 0
 			svgList, fetchErr := runEbookPageFetch(func() ([]string, error) {
-				return generateEbookPages(order.ChapterID, token.Token, index, count, offset)
+				return generateEbookPagesWithService(service, order.ChapterID, token.Token, index, count, offset)
 			})
 			if fetchErr != nil {
 				results <- pageResult{index: i, err: fetchErr}
@@ -144,8 +148,12 @@ func runEbookPageFetch(fetch func() ([]string, error)) (pages []string, err erro
 }
 
 func generateEbookPages(chapterID, token string, index, count, offset int) (svgList []string, err error) {
+	return generateEbookPagesWithService(getService(), chapterID, token, index, count, offset)
+}
+
+func generateEbookPagesWithService(service *services.Service, chapterID, token string, index, count, offset int) (svgList []string, err error) {
 	fmt.Printf("chapterID:%#v\n", chapterID)
-	pageList, err := getService().EbookPages(chapterID, token, index, count, offset)
+	pageList, err := service.EbookPages(chapterID, token, index, count, offset)
 	if err != nil {
 		return
 	}
@@ -161,7 +169,7 @@ func generateEbookPages(chapterID, token string, index, count, offset int) (svgL
 	if !pageList.IsEnd {
 		index = count
 		count += 20
-		list, err1 := generateEbookPages(chapterID, token, index, count, offset)
+		list, err1 := generateEbookPagesWithService(service, chapterID, token, index, count, offset)
 		if err1 != nil {
 			err = err1
 			return

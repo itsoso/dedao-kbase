@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 const (
@@ -66,6 +68,27 @@ var (
 	runDedaoEbookDownloadJob  = executeDedaoEbookDownloadJob
 	runDedaoEbookSyncKBaseJob = executeDedaoEbookSyncKBaseJob
 )
+
+type dedaoServiceContextKey struct{}
+
+func contextWithDedaoService(ctx context.Context, service *services.Service) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if service == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, dedaoServiceContextKey{}, service)
+}
+
+func dedaoServiceFromContext(ctx context.Context) *services.Service {
+	if ctx != nil {
+		if service, ok := ctx.Value(dedaoServiceContextKey{}).(*services.Service); ok && service != nil {
+			return service
+		}
+	}
+	return getService()
+}
 
 func (s *BookKnowledgeStore) JobsPath() string {
 	return filepath.Join(s.root, bookKnowledgeJobsFileName)
@@ -184,6 +207,10 @@ func (s *BookKnowledgeStore) FailInterruptedBookKnowledgeJobs(reason string) (in
 }
 
 func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) error {
+	return s.RunBookKnowledgeJobWithService(jobID, getService())
+}
+
+func (s *BookKnowledgeStore) RunBookKnowledgeJobWithService(jobID string, service *services.Service) error {
 	job, err := s.updateBookKnowledgeJob(jobID, func(job BookKnowledgeJob) BookKnowledgeJob {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		job.Status, job.StartedAt, job.UpdatedAt = BookKnowledgeJobStatusRunning, now, now
@@ -193,7 +220,8 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) error {
 	if err != nil {
 		return err
 	}
-	result, runErr := s.executeBookKnowledgeJobSafely(job)
+	ctx := contextWithDedaoService(context.Background(), service)
+	result, runErr := s.executeBookKnowledgeJobSafely(ctx, job)
 	_, err = s.updateBookKnowledgeJob(job.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
 		now := time.Now().UTC().Format(time.RFC3339Nano)
 		job.UpdatedAt, job.FinishedAt = now, now
@@ -211,22 +239,22 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) error {
 	return err
 }
 
-func (s *BookKnowledgeStore) executeBookKnowledgeJobSafely(job BookKnowledgeJob) (result map[string]any, err error) {
+func (s *BookKnowledgeStore) executeBookKnowledgeJobSafely(ctx context.Context, job BookKnowledgeJob) (result map[string]any, err error) {
 	defer func() {
 		if recover() != nil {
 			result = nil
 			err = fmt.Errorf("job executor panic")
 		}
 	}()
-	return s.executeBookKnowledgeJob(job)
+	return s.executeBookKnowledgeJob(ctx, job)
 }
 
-func (s *BookKnowledgeStore) executeBookKnowledgeJob(job BookKnowledgeJob) (map[string]any, error) {
+func (s *BookKnowledgeStore) executeBookKnowledgeJob(ctx context.Context, job BookKnowledgeJob) (map[string]any, error) {
 	switch job.Type {
 	case BookKnowledgeJobTypeDedaoEbookDownload:
-		return runDedaoEbookDownloadJob(context.Background(), job)
+		return runDedaoEbookDownloadJob(ctx, job)
 	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
-		return runDedaoEbookSyncKBaseJob(context.Background(), s, job)
+		return runDedaoEbookSyncKBaseJob(ctx, s, job)
 	default:
 		return nil, fmt.Errorf("unsupported job type: %s", job.Type)
 	}

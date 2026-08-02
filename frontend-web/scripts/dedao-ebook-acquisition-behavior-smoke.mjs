@@ -70,6 +70,9 @@ context.fetch = async (url, options = {}) => {
   if (url === "/api/jobs?limit=50") {
     return jsonResponse({ jobs: [{ id: "persisted-job", type: "dedao_ebook_download", status: "running", ebook_enid: "restored-enid" }] });
   }
+  if (url === "/api/jobs/persisted-job") {
+    return jsonResponse({ job: { id: "persisted-job", type: "dedao_ebook_download", status: "succeeded", ebook_enid: "restored-enid" } });
+  }
   if (String(url).startsWith("/api/dedao/search/ebooks")) {
     return jsonResponse({ error: "temporary upstream failure" }, 503);
   }
@@ -118,8 +121,9 @@ await dedao.searchDedaoEbooks();
 assert.equal(dedao.dedaoEbookAcquisitionState.siteItems, retained, "failed search should retain current results");
 
 dedao.dedaoEbookAcquisitionState.jobs = {};
+context.window.location.pathname = "/sources/dedao/ebooks";
 await dedao.loadDedaoEbookJobs();
-assert.equal(dedao.dedaoEbookAcquisitionState.jobs["restored-enid"].status, "running", "refresh should restore persisted job state");
+assert.equal(dedao.dedaoEbookAcquisitionState.jobs["restored-enid"].status, "succeeded", "restored active jobs should resume polling to a terminal state");
 
 dedao.dedaoLoginState.session = { logged_in: true, active_user: { name: "旧账号" } };
 dedao.dedaoLoginState.phase = "idle";
