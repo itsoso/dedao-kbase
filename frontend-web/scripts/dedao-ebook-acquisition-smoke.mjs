@@ -60,4 +60,12 @@ assert.ok(css.includes("@media (max-width: 760px)"), "login UI should have a res
 assert.ok(css.includes("@media (prefers-reduced-motion: reduce)"), "login UI should respect reduced motion");
 assert.ok(html.includes("20260802-dedao-acquisition"), "login release should use a fresh browser cache version");
 
+const loginSuccessIndex = js.indexOf('dedaoLoginState.phase === "success"');
+const loggedInSessionIndex = js.indexOf("dedaoLoginState.session?.logged_in");
+assert.ok(loginSuccessIndex >= 0, "login status copy should handle terminal success explicitly");
+assert.ok(
+  loginSuccessIndex < loggedInSessionIndex,
+  "terminal login success copy should take precedence over the generic session copy",
+);
+
 console.log("dedao ebook acquisition smoke passed");
