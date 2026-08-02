@@ -784,6 +784,136 @@ git add backend/app/wechat_agent.go backend/app/wechat_agent_test.go backend/app
 git commit -m "feat(agent): align WeChat and WC Plus worker control"
 ```
 
+### Task 10A: Wire command-bound artifact delivery to the fixed local updater
+
+**Why this correction exists:** Task 10 deliberately left both production
+workers fail-closed because the command contains only an artifact ID and the
+expected current version. The existing artifact download route, staging
+filesystem, ready-receipt store, and `SourceAgentUpdateTransaction` are each
+safe in isolation, but no trusted local bridge connects them. This task must
+finish before the Web exposes an upgrade action; a clickable control backed by
+the fail-closed placeholder is not an acceptable delivered capability.
+
+**Files:**
+- Modify: `backend/app/source_agent_client.go`
+- Modify: `backend/app/source_agent_client_test.go`
+- Create: `backend/app/source_agent_update_bridge.go`
+- Create: `backend/app/source_agent_update_bridge_test.go`
+- Modify: `backend/app/source_agent_runner.go`
+- Modify: `backend/app/source_agent_command_runner_test.go`
+- Modify: `backend/app/kbase_http.go`
+- Modify: `backend/app/kbase_http_test.go`
+- Modify: `cmd/source-agent/main.go`
+- Modify: `cmd/source-agent/main_test.go`
+- Modify: `cmd/wcplus-agent/main.go`
+- Modify: `cmd/wcplus-agent/main_test.go`
+- Modify: `cmd/source-agent-updater/main.go`
+- Modify: `cmd/source-agent-updater/main_test.go`
+- Modify: `cmd/source-agent-updater/platform_darwin.go`
+- Modify: `cmd/source-agent-updater/platform_other.go`
+- Modify: `scripts/source-agent-packaging-smoke.sh`
+- Modify: `scripts/wcplus-agent-packaging-smoke.sh`
+
+**Step 1: Write the real handoff contract RED tests**
+
+Cover the full production path, not a fake `SourceAgentUpdater`:
+
+- the authenticated, command-bound download returns artifact metadata from the
+  server-side catalog snapshot together with the exact bytes;
+- the worker rejects missing, duplicate, malformed, incompatible, oversized,
+  or command-mismatched metadata before writing a staged executable;
+- staging uses a fixed private directory on the executable filesystem, does
+  not follow symlinks, has a bounded byte count, fsyncs the completed file, and
+  verifies SHA-256 before publishing a local handoff;
+- the local handoff is keyed by the bounded command ID and contains only
+  catalog metadata plus locally derived fixed paths; no remote URL, shell,
+  script, environment, label, updater path, executable path, or state path is
+  accepted from the command or response;
+- `source-agent-updater --apply` accepts only a known worker type and command
+  ID, derives its install directory from its own executable, reads the
+  protected local handoff, invokes `SourceAgentUpdateTransaction`, and writes a
+  bounded durable outcome;
+- after restart, the worker writes the matching ready receipt only after an
+  authenticated heartbeat and only when command, attempt nonce, worker type,
+  version, platform, architecture, protocol, and revision all match;
+- downloading, verified, installing, restarting, verifying, rollback, success,
+  and rolled-back command reports are resumable without repeating download,
+  replacement, or rollback side effects;
+- disabling rollout after download or after claim stops installation;
+- helper crash, restart failure, ready timeout, wrong receipt, hash drift, and
+  outcome persistence failure all fail or roll back truthfully.
+
+**Step 2: Verify RED against both real worker constructors**
+
+```bash
+go test ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater \
+  -run 'TestSourceAgent(UpdateBridge|ArtifactHandoff|ReadyAfterHeartbeat|UpdaterApply|RealWorkerUpgrade)' -count=1
+```
+
+Expected: FAIL because the workers still install fail-closed updater stubs and
+the updater CLI only supports `--check`.
+
+**Step 3: Bind catalog metadata to the download snapshot**
+
+Return the selected artifact's bounded version, worker type, platform,
+architecture, protocol version, revision, channel, size, and SHA-256 from the
+same server-side snapshot used to stream bytes. The client must parse these as
+strict single-valued response headers and compare them with its compiled
+runtime identity and the claimed command. It must never infer trusted metadata
+from the command payload or a filename.
+
+**Step 4: Implement the private same-filesystem stage and handoff**
+
+Derive the updater path, current worker executable, staging root, and handoff
+root exclusively from local installation/runtime configuration. Download to a
+new no-follow file, bound the copy, verify size and SHA-256, sync it, then
+atomically publish a strict local handoff. A retry for the same command must
+reuse only a fully matching staged identity; conflict fails closed.
+
+**Step 5: Extend the fixed-function updater CLI**
+
+Keep `--check`. Add only `--apply --worker-type <known-worker> --command-id
+<bounded-id>`. The helper derives all paths and the fixed LaunchAgent label
+locally; it cannot accept a URL, shell command, script, environment override,
+label, install path, state path, or executable path. It loads the handoff,
+constructs `SourceAgentUpdateRequest`, and executes the existing rollback-safe
+transaction. Non-macOS builds return the typed unsupported-platform result.
+
+**Step 6: Wire resumable command stages and authenticated readiness**
+
+Replace both fail-closed updater stubs with the shared bridge while retaining
+separate worker state, staging, outcomes, and LaunchAgent identities. Before
+claiming the next command, a successfully authenticated heartbeat may satisfy
+one matching local ready challenge. Map the durable local transaction stage or
+outcome to exactly one allowed server command transition per cycle; never
+report success based only on helper process exit.
+
+**Step 7: Run security, recovery, packaging, and race gates**
+
+```bash
+go test ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater -count=1
+go test -race ./backend/app ./cmd/source-agent ./cmd/wcplus-agent ./cmd/source-agent-updater -count=1
+bash scripts/source-agent-artifact-smoke.sh
+bash scripts/source-agent-packaging-smoke.sh
+bash scripts/wcplus-agent-packaging-smoke.sh
+bash scripts/system-map-smoke.sh
+bash scripts/privacy-smoke.sh
+git diff --check
+```
+
+Expected: PASS. Scans must confirm that no signing mechanism was introduced
+and no command/response field can select a URL, path, script, environment, or
+LaunchAgent label.
+
+**Step 8: Commit**
+
+Stage only the bridge, worker, updater, tests, packaging smoke changes, and the
+regenerated system map. Commit as:
+
+```bash
+git commit -m "feat(agent): connect constrained worker upgrades"
+```
+
 ### Task 11: Add the unified `/sources/agents` overview
 
 **Files:**
