@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -44,21 +45,28 @@ func loadSourceAgentConfigWithTransportTokenFallback(ctx context.Context, lookup
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
-	rawToken, provided := lookup("KBASE_SOURCE_AGENT_TOKEN")
-	validationToken := rawToken
-	if !provided {
-		validationToken = "pending-transport-token"
-	}
-	cfg, err := (app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: validationToken, AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}).Normalized()
+	cfg, err := loadSourceAgentConfigOnly(lookup)
 	if err != nil {
 		return app.SourceAgentConfig{}, err
 	}
+	rawToken, provided := lookup("KBASE_SOURCE_AGENT_TOKEN")
 	token, err := sourceagentsecret.ResolveSourceTransportToken(ctx, rawToken, provided, cfg.AgentID, loader, legacy)
 	if err != nil {
 		return app.SourceAgentConfig{}, err
 	}
 	cfg.AgentToken = token
+	return cfg, nil
+}
+
+func loadSourceAgentConfigOnly(lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
+	cfg, err := (app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: "pending-transport-token", AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}).Normalized()
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
 	return cfg, nil
 }
 
@@ -71,7 +79,18 @@ func loadLegacySourceTransportToken(ctx context.Context, agentID string) (string
 }
 func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: source-agent doctor, once, run, or enroll")
+		return fmt.Errorf("usage: source-agent check-config, doctor, once, run, or enroll")
+	}
+	if args[0] == "check-config" {
+		if _, err := loadSourceAgentConfigOnly(lookup); err != nil {
+			return err
+		}
+		value := ""
+		if lookup != nil {
+			value, _ = lookup("SOURCE_AGENT_ENROLL_ADDR")
+		}
+		_, err := normalizeEnrollmentAddress(value)
+		return err
 	}
 	cfg, err := loadSourceAgentConfig(ctx, lookup)
 	if err != nil {
@@ -252,11 +271,29 @@ func normalizeEnrollmentAddress(value string) (string, error) {
 	if value == "" {
 		value = "127.0.0.1:8765"
 	}
-	host, _, err := net.SplitHostPort(value)
-	if err != nil || !isLoopbackHost(host) {
+	host, portValue, err := net.SplitHostPort(value)
+	if err != nil || !isExactEnrollmentLoopbackHost(host) || !decimalPort(portValue) {
 		return "", fmt.Errorf("SOURCE_AGENT_ENROLL_ADDR must bind loopback")
 	}
 	return value, nil
+}
+
+func isExactEnrollmentLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func decimalPort(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	port, err := strconv.Atoi(value)
+	return err == nil && port >= 1 && port <= 65535
 }
 func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, store app.SourceSecretStore) error {
 	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }

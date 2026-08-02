@@ -58,6 +58,52 @@ func TestSourceAgentConfigValidation(t *testing.T) {
 	}
 }
 
+func TestSourceAgentConfigStrictURLsPreserveBasePaths(t *testing.T) {
+	valid := SourceAgentConfig{
+		RemoteURL:     "https://kbase.example.invalid/tenant/root/",
+		AgentToken:    "agent-secret",
+		AgentID:       "agent-a",
+		StateDir:      t.TempDir(),
+		WCPlusBaseURL: "http://127.0.0.1:5001/api/",
+	}
+	normalized, err := valid.Normalized()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.RemoteURL != "https://kbase.example.invalid/tenant/root" || normalized.WCPlusBaseURL != "http://127.0.0.1:5001/api" {
+		t.Fatalf("normalized URLs = %q, %q", normalized.RemoteURL, normalized.WCPlusBaseURL)
+	}
+
+	for _, test := range []struct {
+		name   string
+		remote string
+		wcplus string
+	}{
+		{name: "remote query", remote: "https://kbase.example.invalid/base?admin=1"},
+		{name: "remote fragment", remote: "https://kbase.example.invalid/base#fragment"},
+		{name: "remote empty host", remote: "https:///base"},
+		{name: "remote opaque", remote: "https:kbase.example.invalid/base"},
+		{name: "wcplus userinfo", wcplus: "http://user:pass@127.0.0.1:5001"},
+		{name: "wcplus query", wcplus: "http://127.0.0.1:5001/?debug=1"},
+		{name: "wcplus fragment", wcplus: "http://127.0.0.1:5001/#fragment"},
+		{name: "wcplus non-exact loopback", wcplus: "http://127.0.0.2:5001"},
+		{name: "wcplus opaque", wcplus: "http:127.0.0.1:5001"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := valid
+			if test.remote != "" {
+				config.RemoteURL = test.remote
+			}
+			if test.wcplus != "" {
+				config.WCPlusBaseURL = test.wcplus
+			}
+			if err := config.Validate(); err == nil {
+				t.Fatal("invalid URL was accepted")
+			}
+		})
+	}
+}
+
 func TestSourceAgentClientSendsScopedHeartbeatAndLease(t *testing.T) {
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

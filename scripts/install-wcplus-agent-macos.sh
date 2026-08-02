@@ -107,26 +107,21 @@ if [[ "$token_valid" != true ]]; then
   exit 2
 fi
 unset token_valid index
-case "$KBASE_REMOTE_URL" in
-  https://* | http://127.0.0.1 | http://127.0.0.1:* | http://localhost | http://localhost:* | http://\[::1\] | http://\[::1\]:*) ;;
-  *)
-    echo "KBASE_REMOTE_URL must use HTTPS unless it targets loopback" >&2
-    exit 2
-    ;;
-esac
-case "$wcplus_url" in
-  http://127.0.0.1 | http://127.0.0.1:* | http://localhost | http://localhost:* | http://\[::1\] | http://\[::1\]:* | https://127.0.0.1 | https://127.0.0.1:* | https://localhost | https://localhost:* | https://\[::1\] | https://\[::1\]:*) ;;
-  *)
-    echo "WCPLUSPRO_BASE_URL must target loopback" >&2
-    exit 2
-    ;;
-esac
 if [[ ! "$poll_seconds" =~ ^[0-9]+$ ]] || ((poll_seconds < 1 || poll_seconds > 300)); then
   echo "WCPLUS_AGENT_POLL_SECONDS must be between 1 and 300" >&2
   exit 2
 fi
 if [[ ! "$restart_seconds" =~ ^[0-9]+$ ]] || ((restart_seconds < 10 || restart_seconds > 300)); then
   echo "WCPLUS_AGENT_RESTART_SECONDS must be between 10 and 300" >&2
+  exit 2
+fi
+
+if ! KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
+  KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
+  WCPLUSPRO_BASE_URL="$wcplus_url" \
+  WCPLUS_AGENT_STATE_DIR="$state_dir" \
+  "$binary_source" check-config >/dev/null 2>&1; then
+  echo "WC Plus configuration preflight failed" >&2
   exit 2
 fi
 

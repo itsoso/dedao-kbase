@@ -46,8 +46,12 @@ func main() {
 }
 
 func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout, stderr io.Writer) error {
-	if len(args) != 1 || (args[0] != "doctor" && args[0] != "once" && args[0] != "run") {
-		return fmt.Errorf("usage: wcplus-agent must be doctor, once, or run")
+	if len(args) != 1 || (args[0] != "check-config" && args[0] != "doctor" && args[0] != "once" && args[0] != "run") {
+		return fmt.Errorf("usage: wcplus-agent must be check-config, doctor, once, or run")
+	}
+	if args[0] == "check-config" {
+		_, err := loadWCPlusAgentConfigOnly(lookup)
+		return err
 	}
 	config, err := loadWCPlusAgentConfig(ctx, lookup)
 	if err != nil {
@@ -97,14 +101,26 @@ func loadWCPlusAgentConfigWithTransportToken(ctx context.Context, lookup environ
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
+	normalized, err := loadWCPlusAgentConfigOnly(lookup)
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
 	rawToken, provided := lookup("KBASE_SOURCE_AGENT_TOKEN")
-	validationToken := rawToken
-	if !provided {
-		validationToken = "pending-transport-token"
+	token, err := sourceagentsecret.ResolveTransportToken(ctx, rawToken, provided, loader)
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	normalized.AgentToken = token
+	return normalized, nil
+}
+
+func loadWCPlusAgentConfigOnly(lookup environmentLookup) (app.SourceAgentConfig, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
 	}
 	config := app.SourceAgentConfig{
 		RemoteURL:     lookupValue(lookup, "KBASE_REMOTE_URL"),
-		AgentToken:    validationToken,
+		AgentToken:    "pending-transport-token",
 		AgentID:       lookupValue(lookup, "KBASE_SOURCE_AGENT_ID"),
 		StateDir:      lookupValue(lookup, "SOURCE_AGENT_STATE_DIR"),
 		WCPlusBaseURL: lookupValue(lookup, "WCPLUSPRO_BASE_URL"),
@@ -119,11 +135,6 @@ func loadWCPlusAgentConfigWithTransportToken(ctx context.Context, lookup environ
 	if err != nil {
 		return app.SourceAgentConfig{}, err
 	}
-	token, err := sourceagentsecret.ResolveTransportToken(ctx, rawToken, provided, loader)
-	if err != nil {
-		return app.SourceAgentConfig{}, err
-	}
-	normalized.AgentToken = token
 	return normalized, nil
 }
 

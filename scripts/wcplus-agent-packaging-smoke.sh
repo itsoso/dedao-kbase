@@ -153,7 +153,21 @@ set -euo pipefail
 : >"${GREP_CALLED_MARKER:?}"
 exit 92
 PROBE_GREP
-printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp_dir/bin/wcplus-agent"
+cat >"$tmp_dir/bin/wcplus-agent" <<'WORKER'
+#!/bin/bash
+set -euo pipefail
+for name in KBASE_SOURCE_AGENT_TOKEN transport_token KBASE_AUTH_TOKEN admin_token; do
+  [[ -z "${!name+x}" ]]
+done
+[[ "$*" == "check-config" ]]
+case "${KBASE_REMOTE_URL:?}" in
+  *\?* | *\#* | *://*@* | https:///*) exit 65 ;;
+esac
+case "${WCPLUSPRO_BASE_URL:-${WCPLUS_BASE_URL:-http://127.0.0.1:5001}}" in
+  *\?* | *\#* | *://*@*) exit 66 ;;
+esac
+printf '%s\n' "$*" >"${WORKER_CAPTURE:?}"
+WORKER
 cat >"$tmp_dir/bin/source-agent-updater" <<'UPDATER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -234,6 +248,7 @@ printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$
   WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
   WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
   PROBE_CAPTURE="$tmp_dir/first-child" \
+  WORKER_CAPTURE="$tmp_dir/worker-args" \
   UPDATER_CAPTURE="$tmp_dir/updater-args" \
   GREP_CALLED_MARKER="$tmp_dir/grep-called" \
   HOSTILE_STARTUP_MARKER="$tmp_dir/hostile-startup-called" \
@@ -262,6 +277,53 @@ grep -Fq "$tmp_dir/bin/wcplus-agent" "$plist_fixture"
 grep -Fq "$tmp_dir/state" "$plist_fixture"
 grep -Fq "$tmp_dir/logs" "$plist_fixture"
 grep -Fxq -- '--check --worker-type wcplus-worker' "$tmp_dir/updater-args"
+grep -Fxq -- 'check-config' "$tmp_dir/worker-args"
+
+for invalid_remote in \
+  'https://user@kbase.example.invalid' \
+  'https://kbase.example.invalid/base?debug=1' \
+  'https://kbase.example.invalid/base#fragment' \
+  'https:///missing-host'; do
+  set +e
+  printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+    KBASE_REMOTE_URL="$invalid_remote" \
+    KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
+    WCPLUSPRO_BASE_URL="http://127.0.0.1:5001" \
+    WCPLUS_AGENT_STATE_DIR="$tmp_dir/state" \
+    WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
+    WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
+    PROBE_CAPTURE="$tmp_dir/invalid-first-child" \
+    WORKER_CAPTURE="$tmp_dir/invalid-worker-args" \
+    UPDATER_CAPTURE="$tmp_dir/invalid-updater-args" \
+    GREP_CALLED_MARKER="$tmp_dir/invalid-grep-called" \
+    "$install_script" --check >/dev/null 2>&1
+  invalid_status=$?
+  set -e
+  if [[ $invalid_status -eq 0 ]]; then
+    echo "WC Plus installer accepted invalid remote URL" >&2
+    exit 1
+  fi
+done
+
+set +e
+printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+  KBASE_REMOTE_URL="https://kbase.example.invalid/base" \
+  KBASE_SOURCE_AGENT_ID="wcplus-agent-1" \
+  WCPLUSPRO_BASE_URL="http://127.0.0.1:5001/?debug=1" \
+  WCPLUS_AGENT_STATE_DIR="$tmp_dir/state" \
+  WCPLUS_AGENT_BINARY_PATH="$tmp_dir/bin/wcplus-agent" \
+  WCPLUS_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
+  PROBE_CAPTURE="$tmp_dir/invalid-wcplus-first-child" \
+  WORKER_CAPTURE="$tmp_dir/invalid-wcplus-worker-args" \
+  UPDATER_CAPTURE="$tmp_dir/invalid-wcplus-updater-args" \
+  GREP_CALLED_MARKER="$tmp_dir/invalid-wcplus-grep-called" \
+  "$install_script" --check >/dev/null 2>&1
+invalid_wcplus_status=$?
+set -e
+if [[ $invalid_wcplus_status -eq 0 ]]; then
+  echo "WC Plus installer accepted invalid local URL" >&2
+  exit 1
+fi
 
 oversize_token=""
 for ((index = 0; index < 1025; index++)); do oversize_token+="x"; done
@@ -317,6 +379,7 @@ printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe
   FAIL_PUBLISH_MARKER="$tmp_dir/install-second-publish-failed" \
   LAUNCHCTL_MARKER="$tmp_dir/launchctl-called" \
   PROBE_CAPTURE="$tmp_dir/install-first-child" \
+  WORKER_CAPTURE="$tmp_dir/install-worker-args" \
   UPDATER_CAPTURE="$tmp_dir/install-updater-args" \
   GREP_CALLED_MARKER="$tmp_dir/install-grep-called" \
   "$install_script" >/dev/null 2>&1

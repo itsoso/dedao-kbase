@@ -232,6 +232,33 @@ func TestWCPlusAgentRequiresKnownModeAndConfiguration(t *testing.T) {
 	}
 }
 
+func TestWCPlusAgentCheckConfigDoesNotLoadSecretsOrContactServices(t *testing.T) {
+	previous := wcplusTransportTokenLoader
+	defer func() { wcplusTransportTokenLoader = previous }()
+	loaderCalled := false
+	wcplusTransportTokenLoader = func(context.Context) (string, error) {
+		loaderCalled = true
+		return "stored-token", nil
+	}
+	env := testEnv{
+		"KBASE_REMOTE_URL":       "https://kbase.example.invalid/base",
+		"KBASE_SOURCE_AGENT_ID":  "wcplus-agent-a",
+		"WCPLUS_AGENT_STATE_DIR": t.TempDir(),
+		"WCPLUSPRO_BASE_URL":     "http://127.0.0.1:5001/api",
+	}
+	var stdout, stderr strings.Builder
+	tokenLookupCalled := false
+	err := runCLI(context.Background(), []string{"check-config"}, func(key string) (string, bool) {
+		if key == "KBASE_SOURCE_AGENT_TOKEN" {
+			tokenLookupCalled = true
+		}
+		return env.Lookup(key)
+	}, &stdout, &stderr)
+	if err != nil || loaderCalled || tokenLookupCalled || stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("loader_called=%t token_lookup_called=%t stdout=%q stderr=%q error=%v", loaderCalled, tokenLookupCalled, stdout.String(), stderr.String(), err)
+	}
+}
+
 type testEnv map[string]string
 
 func (e testEnv) Lookup(key string) (string, bool) {

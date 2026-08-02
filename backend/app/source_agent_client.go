@@ -53,12 +53,13 @@ func (c SourceAgentConfig) Normalized() (SourceAgentConfig, error) {
 	if c.StateDir == "" {
 		return c, fmt.Errorf("SOURCE_AGENT_STATE_DIR is required")
 	}
-	remote, err := url.Parse(c.RemoteURL)
-	if err != nil || remote.Hostname() == "" || (remote.Scheme != "http" && remote.Scheme != "https") {
-		return c, fmt.Errorf("KBASE_REMOTE_URL must be an absolute HTTP(S) URL")
-	}
-	if remote.User != nil {
+	remoteCandidate, parseErr := url.Parse(c.RemoteURL)
+	if parseErr == nil && remoteCandidate.User != nil {
 		return c, fmt.Errorf("KBASE_REMOTE_URL must not contain credentials")
+	}
+	remote, err := parseSourceAgentBaseURL(c.RemoteURL)
+	if err != nil {
+		return c, fmt.Errorf("KBASE_REMOTE_URL must be an absolute HTTP(S) URL")
 	}
 	if remote.Scheme != "https" && !isLoopbackSourceAgentHost(remote.Hostname()) {
 		return c, fmt.Errorf("KBASE_REMOTE_URL must use HTTPS unless it targets loopback")
@@ -66,14 +67,23 @@ func (c SourceAgentConfig) Normalized() (SourceAgentConfig, error) {
 	if c.WCPlusBaseURL == "" {
 		c.WCPlusBaseURL = defaultWCPlusAgentBaseURL
 	}
-	wcplusURL, err := url.Parse(c.WCPlusBaseURL)
-	if err != nil || wcplusURL.Hostname() == "" || (wcplusURL.Scheme != "http" && wcplusURL.Scheme != "https") {
+	wcplusURL, err := parseSourceAgentBaseURL(c.WCPlusBaseURL)
+	if err != nil {
 		return c, fmt.Errorf("WCPLUS_BASE_URL must be an absolute HTTP(S) URL")
 	}
-	if !isLoopbackSourceAgentHost(wcplusURL.Hostname()) {
+	if !isExactLoopbackSourceAgentHost(wcplusURL.Hostname()) {
 		return c, fmt.Errorf("WCPLUS_BASE_URL must target loopback")
 	}
 	return c, nil
+}
+
+func parseSourceAgentBaseURL(value string) (*url.URL, error) {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Hostname() == "" || parsed.Opaque != "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return nil, fmt.Errorf("invalid base URL")
+	}
+	return parsed, nil
 }
 
 func isSafeSourceAgentToken(token string) bool {
@@ -95,6 +105,11 @@ func isLoopbackSourceAgentHost(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func isExactLoopbackSourceAgentHost(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 type SourceAgentHTTPError struct {

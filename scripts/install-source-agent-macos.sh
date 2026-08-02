@@ -105,20 +105,15 @@ if [[ "$token_valid" != true ]]; then
   exit 2
 fi
 unset token_valid index
-case "$KBASE_REMOTE_URL" in
-  https://* | http://127.0.0.1 | http://127.0.0.1:* | http://localhost | http://localhost:* | http://\[::1\] | http://\[::1\]:*) ;;
-  *)
-    echo "KBASE_REMOTE_URL must use HTTPS unless it targets loopback" >&2
-    exit 2
-    ;;
-esac
-case "$enroll_addr" in
-  127.0.0.1:* | localhost:* | \[::1\]:*) ;;
-  *)
-    echo "SOURCE_AGENT_ENROLL_ADDR must bind loopback" >&2
-    exit 2
-    ;;
-esac
+
+if ! KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
+  KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
+  SOURCE_AGENT_STATE_DIR="$state_dir" \
+  SOURCE_AGENT_ENROLL_ADDR="$enroll_addr" \
+  "$binary_source" check-config >/dev/null 2>&1; then
+  echo "source-agent configuration preflight failed" >&2
+  exit 2
+fi
 
 if ! "$updater_source" --check --worker-type "$worker_type" >/dev/null 2>&1; then
   echo "source-agent updater preflight failed" >&2

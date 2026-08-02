@@ -166,13 +166,51 @@ func TestSourceAgentCLIConfigPrefersGenericStateDirectory(t *testing.T) {
 }
 
 func TestSourceAgentEnrollmentAddressIsLoopbackOnly(t *testing.T) {
-	for _, value := range []string{"127.0.0.1:8765", "localhost:9000"} {
+	for _, value := range []string{"127.0.0.1:8765", "localhost:9000", "[::1]:65535"} {
 		if _, err := normalizeEnrollmentAddress(value); err != nil {
 			t.Fatalf("%s: %v", value, err)
 		}
 	}
-	if _, err := normalizeEnrollmentAddress("0.0.0.0:8765"); err == nil {
-		t.Fatal("accepted wildcard enrollment address")
+	for _, value := range []string{"0.0.0.0:8765", "127.0.0.2:8765", "localhost:http", "localhost:0", "localhost:65536", "localhost:"} {
+		if _, err := normalizeEnrollmentAddress(value); err == nil {
+			t.Fatalf("accepted invalid enrollment address %q", value)
+		}
+	}
+}
+
+func TestSourceAgentCheckConfigDoesNotLoadSecretsOrCreateVendorClients(t *testing.T) {
+	previousFixed := sourceAgentTransportTokenLoader
+	previousLegacy := sourceAgentLegacyTransportTokenLoader
+	defer func() {
+		sourceAgentTransportTokenLoader = previousFixed
+		sourceAgentLegacyTransportTokenLoader = previousLegacy
+	}()
+	loaderCalled := false
+	sourceAgentTransportTokenLoader = func(context.Context) (string, error) {
+		loaderCalled = true
+		return "stored-token", nil
+	}
+	sourceAgentLegacyTransportTokenLoader = func(context.Context, string) (string, error) {
+		loaderCalled = true
+		return "legacy-token", nil
+	}
+	values := map[string]string{
+		"KBASE_REMOTE_URL":         "https://kbase.example.invalid/base",
+		"KBASE_SOURCE_AGENT_ID":    "source-agent-a",
+		"SOURCE_AGENT_STATE_DIR":   t.TempDir(),
+		"SOURCE_AGENT_ENROLL_ADDR": "127.0.0.1:8765",
+		"WECHAT_MP_BASE_URL":       "https://blocked-vendor.example.invalid",
+	}
+	tokenLookupCalled := false
+	err := runSourceAgentCLI(context.Background(), []string{"check-config"}, func(key string) (string, bool) {
+		if key == "KBASE_SOURCE_AGENT_TOKEN" {
+			tokenLookupCalled = true
+		}
+		value, ok := values[key]
+		return value, ok
+	})
+	if err != nil || loaderCalled || tokenLookupCalled {
+		t.Fatalf("loader_called=%t token_lookup_called=%t error=%v", loaderCalled, tokenLookupCalled, err)
 	}
 }
 
