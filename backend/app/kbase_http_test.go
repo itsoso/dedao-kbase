@@ -2181,6 +2181,18 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		if claimUpgrade.Code != http.StatusOK {
 			t.Fatalf("claim upgrade status=%d body=%s", claimUpgrade.Code, claimUpgrade.Body.String())
 		}
+		recoverOwned := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a"}`)
+		if recoverOwned.Code != http.StatusOK || !strings.Contains(recoverOwned.Body.String(), `"id":"`+upgrade.ID+`"`) {
+			t.Fatalf("recover owned status=%d body=%s", recoverOwned.Code, recoverOwned.Body.String())
+		}
+		resumeExact := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if resumeExact.Code != http.StatusOK || !strings.Contains(resumeExact.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("resume exact status=%d body=%s", resumeExact.Code, resumeExact.Body.String())
+		}
+		foreignResume := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-b","command_id":"`+upgrade.ID+`"}`)
+		if foreignResume.Code != http.StatusForbidden || strings.Contains(foreignResume.Body.String(), upgrade.ID) {
+			t.Fatalf("foreign resume status=%d body=%s", foreignResume.Code, foreignResume.Body.String())
+		}
 		commandPath := "/api/source-agent/commands/" + url.PathEscape(upgrade.ID)
 		progress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"downloading","message":"downloading"}`)
 		if progress.Code != http.StatusOK || !strings.Contains(progress.Body.String(), `"state":"downloading"`) {
@@ -2214,6 +2226,14 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		if badProgress.Code != http.StatusBadRequest {
 			t.Fatalf("terminal progress status=%d body=%s", badProgress.Code, badProgress.Body.String())
 		}
+		terminalResume := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if terminalResume.Code != http.StatusOK || !strings.Contains(terminalResume.Body.String(), `"state":"succeeded"`) {
+			t.Fatalf("terminal resume status=%d body=%s", terminalResume.Code, terminalResume.Body.String())
+		}
+		noActiveUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a"}`)
+		if noActiveUpgrade.Code != http.StatusOK || strings.TrimSpace(noActiveUpgrade.Body.String()) != `{"command":null}` {
+			t.Fatalf("terminal command recovered as active: status=%d body=%s", noActiveUpgrade.Code, noActiveUpgrade.Body.String())
+		}
 
 		for _, test := range []struct {
 			name string
@@ -2222,6 +2242,7 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		}{
 			{name: "claim unknown field", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a","target_agent_id":"agent-b"}`},
 			{name: "claim trailing", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a"}{"secret":"private"}`},
+			{name: "recover unknown field", path: "/api/source-agent/commands/recover", body: `{"agent_id":"agent-a","owner":"private"}`},
 			{name: "report unknown field", path: commandPath + "/complete", body: `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","actual_version":"2.0.0","spec_json":"private"}`},
 		} {
 			t.Run(test.name, func(t *testing.T) {

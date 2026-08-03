@@ -40,9 +40,11 @@ func TestSourceAgentUpdateRecoversEveryInterruptedPostBackupStage(t *testing.T) 
 				t.Fatalf("recovered=%#v", recovered)
 			}
 			assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
-			if _, found, err := fixture.store.loadJournal(); err != nil || found {
-				t.Fatalf("journal remains found=%v err=%v", found, err)
+			journal, found, err := fixture.store.loadJournal()
+			if err != nil || !found || journal.Stage != "rollback_restored" {
+				t.Fatalf("retained journal=%#v found=%v err=%v", journal, found, err)
 			}
+			assertSourceAgentExecutable(t, filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName()), fixture.oldBinary)
 		})
 	}
 }
@@ -86,8 +88,11 @@ func TestSourceAgentUpdateFinalGuardRunsAfterDurableBackup(t *testing.T) {
 		t.Fatalf("result=%#v guard=%d process=%d", result, fixture.guard.calls, fixture.process.calls)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
-	if _, err := os.Stat(filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup was not cleaned after guard rejection: %v", err)
+	if _, err := os.Stat(filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())); err != nil {
+		t.Fatalf("backup was removed before server terminal observation: %v", err)
+	}
+	if !fixture.receipts.journalFound || fixture.receipts.journal.Stage != "backup_durable" {
+		t.Fatalf("pre-replace terminal journal=%#v found=%t", fixture.receipts.journal, fixture.receipts.journalFound)
 	}
 }
 
@@ -157,7 +162,38 @@ func TestSourceAgentUpdateRecoveryCleansIncompleteBackupPublish(t *testing.T) {
 	}
 }
 
-func TestSourceAgentUpdateSuccessCleanupFailureCannotBecomeOrphanRollback(t *testing.T) {
+func TestSourceAgentUpdateTerminalReplayRetainsPostReplaceRecoveryMaterial(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	first := fixture.transaction.Apply(context.Background(), fixture.request)
+	if first.Outcome != SourceAgentUpdateOutcomeSucceeded {
+		t.Fatalf("first=%#v", first)
+	}
+	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if !fixture.receipts.journalFound {
+		t.Fatal("successful update cleared journal before server terminal acknowledgement")
+	}
+
+	replayed := fixture.transaction.Apply(context.Background(), fixture.request)
+	if replayed != first || fixture.process.calls != 1 {
+		t.Fatalf("replayed=%#v process=%d", replayed, fixture.process.calls)
+	}
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+	if !fixture.receipts.journalFound {
+		t.Fatal("terminal replay cleared recovery material without server acknowledgement")
+	}
+
+	other := fixture.request
+	other.CommandID = "command-other"
+	other.TargetVersion = "3.0.0"
+	blocked := fixture.transaction.Apply(context.Background(), other)
+	if blocked.Code != SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("different update was not blocked by unacknowledged terminal: %#v", blocked)
+	}
+	assertSourceAgentExecutable(t, backup, fixture.oldBinary)
+}
+
+func TestSourceAgentUpdateUnacknowledgedSuccessBlocksNextUpdate(t *testing.T) {
 	fixture := newSourceAgentUpdateFixture(t)
 	fixture.fs.backupRemoveFailures = 1
 	first := fixture.transaction.Apply(context.Background(), fixture.request)
@@ -174,12 +210,13 @@ func TestSourceAgentUpdateSuccessCleanupFailureCannotBecomeOrphanRollback(t *tes
 	next.TargetVersion = "3.0.0"
 	fixture.guard.failCall = fixture.guard.calls + 1
 	replayed := fixture.transaction.Apply(context.Background(), next)
-	if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
-		t.Fatalf("cleanup-only state was treated as recovery: %#v", replayed)
+	if replayed.Code != SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("unacknowledged success did not block next update: %#v", replayed)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
-	if fixture.process.calls != 1 {
-		t.Fatalf("unexpected old-version restart count=%d", fixture.process.calls)
+	assertSourceAgentExecutable(t, filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName()), fixture.oldBinary)
+	if fixture.process.calls != 1 || !fixture.receipts.journalFound {
+		t.Fatalf("process=%d journal=%v", fixture.process.calls, fixture.receipts.journalFound)
 	}
 }
 
@@ -208,15 +245,15 @@ func TestSourceAgentUpdateRollbackSyncFailureRetainsRecoveryStateUntilReplay(t *
 		t.Fatalf("terminal outcome changed: recovered=%#v first=%#v", recovered, first)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup remains after successful recovery replay: %v", err)
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("backup was removed before terminal acknowledgement: %v", err)
 	}
-	if fixture.receipts.journalFound {
-		t.Fatal("journal remains after successful recovery replay")
+	if !fixture.receipts.journalFound {
+		t.Fatal("journal was removed before terminal acknowledgement")
 	}
 }
 
-func TestSourceAgentUpdateJournalClearFailureRemainsCleanupOnly(t *testing.T) {
+func TestSourceAgentUpdateDoesNotAttemptJournalClearBeforeTerminalAck(t *testing.T) {
 	fixture := newSourceAgentUpdateFixture(t)
 	fixture.receipts.clearErr = errors.New("private journal cleanup path")
 	first := fixture.transaction.Apply(context.Background(), fixture.request)
@@ -224,8 +261,8 @@ func TestSourceAgentUpdateJournalClearFailureRemainsCleanupOnly(t *testing.T) {
 		t.Fatalf("first=%#v journal=%v", first, fixture.receipts.journalFound)
 	}
 	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup should already be durably removed: %v", err)
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("backup should remain before acknowledgement: %v", err)
 	}
 
 	fixture.receipts.clearErr = nil
@@ -234,16 +271,16 @@ func TestSourceAgentUpdateJournalClearFailureRemainsCleanupOnly(t *testing.T) {
 	next.TargetVersion = "3.0.0"
 	fixture.guard.failCall = fixture.guard.calls + 1
 	replayed := fixture.transaction.Apply(context.Background(), next)
-	if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
-		t.Fatalf("cleanup-only journal was treated as recovery: %#v", replayed)
+	if replayed.Code != SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("unacknowledged journal did not block next update: %#v", replayed)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
-	if fixture.process.calls != 1 || fixture.receipts.journalFound {
+	if fixture.process.calls != 1 || !fixture.receipts.journalFound {
 		t.Fatalf("process=%d journal=%v", fixture.process.calls, fixture.receipts.journalFound)
 	}
 }
 
-func TestSourceAgentUpdateSuccessCleanupSyncFailureRemainsCleanupOnly(t *testing.T) {
+func TestSourceAgentUpdateDoesNotAttemptCleanupSyncBeforeTerminalAck(t *testing.T) {
 	fixture := newSourceAgentUpdateFixture(t)
 	fixture.fs.dirSyncFrom = 4
 	first := fixture.transaction.Apply(context.Background(), fixture.request)
@@ -251,8 +288,8 @@ func TestSourceAgentUpdateSuccessCleanupSyncFailureRemainsCleanupOnly(t *testing
 		t.Fatalf("first=%#v journal=%v", first, fixture.receipts.journalFound)
 	}
 	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup should be removed before cleanup fsync: %v", err)
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("backup should remain before acknowledgement: %v", err)
 	}
 
 	fixture.fs.dirSyncFrom = 0
@@ -261,11 +298,11 @@ func TestSourceAgentUpdateSuccessCleanupSyncFailureRemainsCleanupOnly(t *testing
 	next.TargetVersion = "3.0.0"
 	fixture.guard.failCall = fixture.guard.calls + 1
 	replayed := fixture.transaction.Apply(context.Background(), next)
-	if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
-		t.Fatalf("cleanup-only fsync retry was treated as recovery: %#v", replayed)
+	if replayed.Code != SourceAgentUpdateCodeRecoveryFailed {
+		t.Fatalf("unacknowledged terminal did not block next update: %#v", replayed)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
-	if fixture.process.calls != 1 || fixture.receipts.journalFound {
+	if fixture.process.calls != 1 || !fixture.receipts.journalFound {
 		t.Fatalf("process=%d journal=%v", fixture.process.calls, fixture.receipts.journalFound)
 	}
 }
@@ -304,12 +341,18 @@ func TestSourceAgentUpdatePreReplaceCrashWindowsReplayAsCleanupOnly(t *testing.T
 						retry.TargetVersion = "3.0.0"
 					}
 					replayed := fixture.transaction.Apply(context.Background(), retry)
-					if replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
-						t.Fatalf("pre-replace terminal was treated as recovery: %#v", replayed)
+					if retryKind == "same_command" && replayed.Code == SourceAgentUpdateCodeRecoveryFailed {
+						t.Fatalf("same pre-replace terminal was not replayed: %#v", replayed)
+					}
+					if retryKind == "different_command" && replayed.Code != SourceAgentUpdateCodeRecoveryFailed {
+						t.Fatalf("different command bypassed unacknowledged terminal: %#v", replayed)
 					}
 					assertSourceAgentExecutable(t, fixture.executable, fixture.oldBinary)
 					if fixture.process.calls != 0 {
 						t.Fatalf("pre-replace replay restarted worker %d times", fixture.process.calls)
+					}
+					if !fixture.receipts.journalFound {
+						t.Fatal("pre-replace terminal journal was cleared before acknowledgement")
 					}
 				})
 			}
@@ -505,8 +548,8 @@ func TestSourceAgentUpdatePublishedOutcomeErrorNeverRollsBack(t *testing.T) {
 		t.Fatalf("replayed=%#v process=%d", replayed, fixture.process.calls)
 	}
 	assertSourceAgentExecutable(t, fixture.executable, fixture.newBinary)
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) || fixture.receipts.journalFound {
-		t.Fatalf("durable replay did not clean backup/journal: backupErr=%v journal=%v", err, fixture.receipts.journalFound)
+	if _, err := os.Stat(backup); err != nil || !fixture.receipts.journalFound {
+		t.Fatalf("durable replay cleared unacknowledged backup/journal: backupErr=%v journal=%v", err, fixture.receipts.journalFound)
 	}
 }
 

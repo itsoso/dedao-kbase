@@ -36,6 +36,10 @@ const (
 	sourceAgentUpdateMaximumRestartTimeout         = 2 * time.Minute
 	sourceAgentUpdateJournalFileName               = ".source-agent-update-journal.json"
 	sourceAgentUpdateJournalSchema                 = "source-agent-update-journal.v1"
+	sourceAgentUpgradeCheckpointFileName           = ".source-agent-upgrade-command.json"
+	sourceAgentUpgradeCheckpointSchema             = "source-agent-upgrade-command.v1"
+	sourceAgentUpgradeTerminalObservationFileName  = ".source-agent-upgrade-terminal-observation.json"
+	sourceAgentUpgradeTerminalObservationSchema    = "source-agent-upgrade-terminal-observation.v1"
 	sourceAgentUpdateFaultAfterBackup              = "after_backup"
 	sourceAgentUpdateFaultAfterReplace             = "after_replace"
 	sourceAgentUpdateFaultAfterRestart             = "after_restart"
@@ -47,12 +51,14 @@ const (
 )
 
 var (
-	ErrSourceAgentUpdateBusy               = errors.New("source agent update is busy")
-	ErrSourceAgentReadyTimeout             = errors.New("source agent ready receipt timed out")
-	ErrSourceAgentReadyMismatch            = errors.New("source agent ready receipt does not match")
-	ErrSourceAgentReadyInvalid             = errors.New("source agent ready receipt is invalid")
-	errSourceAgentUpdateStorageUnavailable = errors.New("source agent update storage unavailable")
-	errSourceAgentUpdateUnsupportedStorage = errors.New("source agent update storage unsupported")
+	ErrSourceAgentUpdateBusy                = errors.New("source agent update is busy")
+	ErrSourceAgentReadyTimeout              = errors.New("source agent ready receipt timed out")
+	ErrSourceAgentReadyMismatch             = errors.New("source agent ready receipt does not match")
+	ErrSourceAgentReadyInvalid              = errors.New("source agent ready receipt is invalid")
+	ErrSourceAgentUpgradeCheckpointInvalid  = errors.New("source agent upgrade checkpoint is invalid")
+	ErrSourceAgentUpgradeCheckpointConflict = errors.New("source agent upgrade checkpoint conflicts")
+	errSourceAgentUpdateStorageUnavailable  = errors.New("source agent update storage unavailable")
+	errSourceAgentUpdateUnsupportedStorage  = errors.New("source agent update storage unsupported")
 )
 
 type sourceAgentUpdateOutcomePublication uint8
@@ -196,6 +202,35 @@ type SourceAgentReadyReceipt struct {
 	ProtocolVersion        string `json:"protocol_version"`
 	Revision               string `json:"revision"`
 	HeartbeatAuthenticated bool   `json:"heartbeat_authenticated"`
+}
+
+type SourceAgentRuntimeIdentity struct {
+	WorkerType      string `json:"worker_type"`
+	Version         string `json:"version"`
+	Platform        string `json:"platform"`
+	Architecture    string `json:"architecture"`
+	ProtocolVersion string `json:"protocol_version"`
+	Revision        string `json:"revision"`
+}
+
+type SourceAgentUpgradeCommandCheckpoint struct {
+	SchemaVersion string             `json:"schema_version"`
+	AgentID       string             `json:"agent_id"`
+	ClaimOwner    string             `json:"claim_owner"`
+	Fingerprint   string             `json:"fingerprint"`
+	Command       SourceAgentCommand `json:"command"`
+}
+
+// SourceAgentUpgradeTerminalObservation records the authoritative server
+// terminal without authorizing cleanup. The independent updater must classify
+// it against local journal/outcome evidence before choosing ack or rollback.
+type SourceAgentUpgradeTerminalObservation struct {
+	SchemaVersion string `json:"schema_version"`
+	CommandID     string `json:"command_id"`
+	Fingerprint   string `json:"fingerprint"`
+	State         string `json:"state"`
+	ResultCode    string `json:"result_code"`
+	ActualVersion string `json:"actual_version,omitempty"`
 }
 
 // SourceAgentReadyChallenge is the only attempt API needed by Task 10. A
@@ -445,19 +480,10 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 			if publication != sourceAgentUpdateOutcomeDurable {
 				return confirmed
 			}
-			var cleanupErr error
-			if sourceAgentUpdateTerminalNeedsRecovery(terminal, journal) {
-				cleanupErr = u.recoverDurableTerminal(ctx, journal)
-			} else {
-				cleanupErr = u.cleanupDurableAttempt(journal)
-			}
 			if sourceAgentUpdateJournalMatches(journal, request) {
-				return terminal
+				return confirmed
 			}
-			if cleanupErr != nil {
-				return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
-			}
-			journalFound = false
+			return u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, SourceAgentUpdateCodeRecoveryFailed, false)
 		}
 	}
 	if outcomeFound {
@@ -592,6 +618,13 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 	if ctx.Err() != nil {
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
+	// Arm the exact challenge durably before asking the process supervisor to
+	// restart the Worker. The replacement must never be able to race ahead of
+	// an unpersisted nonce or runtime identity.
+	journal = u.advanceJournal(journal, "restart_requested")
+	if err := u.receipts.saveJournal(journal); err != nil {
+		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
+	}
 	if err := u.restart(ctx, false); err != nil {
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
@@ -627,9 +660,6 @@ func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request Source
 		return u.rollback(context.WithoutCancel(ctx), started, backupPath, request, journal)
 	}
 	if publication == sourceAgentUpdateOutcomePublished {
-		return persisted
-	}
-	if err := u.finalizeDurableOutcome(journal); err != nil {
 		return persisted
 	}
 	return persisted
@@ -716,12 +746,7 @@ func (u *SourceAgentUpdateTransaction) rollback(
 	}
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
 	persisted, publication := u.persistOutcome(result)
-	if publication == sourceAgentUpdateOutcomeDurable {
-		if err := u.finalizeDurableOutcome(journal); err != nil {
-			return persisted
-		}
-	}
-	return persisted
+	return sourceAgentUpdateRetainedTerminal(persisted, publication)
 }
 
 func (u *SourceAgentUpdateTransaction) persistOutcome(result SourceAgentUpdateResult) (SourceAgentUpdateResult, sourceAgentUpdateOutcomePublication) {
@@ -770,28 +795,16 @@ func (u *SourceAgentUpdateTransaction) finishResult(started time.Time, request S
 	return result
 }
 
-func (u *SourceAgentUpdateTransaction) failBeforeReplace(started time.Time, request SourceAgentUpdateRequest, journal sourceAgentUpdateJournal, preparedPath, backupPath, code string) SourceAgentUpdateResult {
-	if journal.Stage == "backup_durable" && validSourceAgentBinaryIdentity(journal.Backup) {
-		result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
-		persisted, publication := u.persistOutcome(result)
-		if publication != sourceAgentUpdateOutcomeDurable {
-			return persisted
-		}
-		if u.faultStage == sourceAgentUpdateFaultPreReplaceAfterOutcome {
-			return persisted
-		}
-		if err := u.finalizeDurableOutcome(journal); err != nil {
-			return persisted
-		}
-		return persisted
-	}
-	cleanupErr := u.cleanupBeforeReplace(journal, preparedPath, backupPath)
+func (u *SourceAgentUpdateTransaction) failBeforeReplace(
+	started time.Time,
+	request SourceAgentUpdateRequest,
+	_ sourceAgentUpdateJournal,
+	_, _ string,
+	code string,
+) SourceAgentUpdateResult {
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeFailed, code, false)
-	persisted, _ := u.persistOutcome(result)
-	if cleanupErr != nil {
-		return persisted
-	}
-	return persisted
+	persisted, publication := u.persistOutcome(result)
+	return sourceAgentUpdateRetainedTerminal(persisted, publication)
 }
 
 func (u *SourceAgentUpdateTransaction) cleanupBeforeReplace(journal sourceAgentUpdateJournal, preparedPath, backupPath string) error {
@@ -855,12 +868,20 @@ func (u *SourceAgentUpdateTransaction) recoverInterrupted(ctx context.Context, s
 	}
 	result := u.finishResult(started, request, SourceAgentUpdateOutcomeRolledBack, SourceAgentCommandCodeRollbackComplete, true)
 	persisted, publication := u.persistOutcome(result)
-	if publication == sourceAgentUpdateOutcomeDurable {
-		if err := u.finalizeDurableOutcome(journal); err != nil {
-			return persisted, true
-		}
+	return sourceAgentUpdateRetainedTerminal(persisted, publication), true
+}
+
+func sourceAgentUpdateRetainedTerminal(
+	result SourceAgentUpdateResult,
+	publication sourceAgentUpdateOutcomePublication,
+) SourceAgentUpdateResult {
+	switch publication {
+	case sourceAgentUpdateOutcomeNotPublished, sourceAgentUpdateOutcomePublished, sourceAgentUpdateOutcomeDurable:
+		return result
+	default:
+		result.PersistenceCode = SourceAgentUpdateCodeOutcomePersistenceFailed
+		return result
 	}
-	return persisted, true
 }
 
 func (u *SourceAgentUpdateTransaction) finalizeDurableOutcome(journal sourceAgentUpdateJournal) error {
@@ -1049,7 +1070,7 @@ func validSourceAgentUpdateJournal(journal sourceAgentUpdateJournal) bool {
 		return false
 	}
 	allowedStages := map[string]struct{}{
-		"started": {}, "backup_durable": {}, "replaced": {}, "restarted": {}, "ready": {},
+		"started": {}, "backup_durable": {}, "replaced": {}, "restart_requested": {}, "restarted": {}, "ready": {},
 		"rollback_restored": {}, "terminal_cleanup": {},
 	}
 	if _, ok := allowedStages[journal.Stage]; !ok {
@@ -1194,7 +1215,7 @@ func validSourceAgentUpdateLocalName(name string) bool {
 func (s *FileSourceAgentUpdateReceiptStore) ReadyChallenge(commandID string) (SourceAgentReadyChallenge, error) {
 	journal, found, err := s.loadJournal()
 	if err != nil || !found || journal.CommandID != commandID ||
-		(journal.Stage != "restarted" && journal.Stage != "ready") {
+		(journal.Stage != "restart_requested" && journal.Stage != "restarted" && journal.Stage != "ready") {
 		return SourceAgentReadyChallenge{}, ErrSourceAgentReadyInvalid
 	}
 	return SourceAgentReadyChallenge{
@@ -1203,6 +1224,219 @@ func (s *FileSourceAgentUpdateReceiptStore) ReadyChallenge(commandID string) (So
 		Platform: journal.Platform, Architecture: journal.Architecture,
 		ProtocolVersion: journal.ProtocolVersion, Revision: journal.Revision,
 	}, nil
+}
+
+// PublishAuthenticatedReady is called only after the Runner's authenticated
+// heartbeat succeeds. Runtime identity is supplied by the running binary; the
+// challenge contributes only the command and nonce that bind the receipt.
+func (s *FileSourceAgentUpdateReceiptStore) PublishAuthenticatedReady(
+	ctx context.Context,
+	identity SourceAgentRuntimeIdentity,
+) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	journal, found, err := s.loadJournal()
+	if err != nil {
+		return false, ErrSourceAgentReadyInvalid
+	}
+	if !found || !sourceAgentUpdateJournalStageIs(journal.Stage, "restart_requested", "restarted", "ready") {
+		return false, nil
+	}
+	receipt := SourceAgentReadyReceipt{
+		CommandID: journal.CommandID, AttemptNonce: journal.AttemptNonce,
+		WorkerType: identity.WorkerType, Version: identity.Version,
+		Platform: identity.Platform, Architecture: identity.Architecture,
+		ProtocolVersion: identity.ProtocolVersion, Revision: identity.Revision,
+		HeartbeatAuthenticated: true,
+	}
+	expected := SourceAgentReadyExpectation{
+		CommandID: journal.CommandID, AttemptNonce: journal.AttemptNonce,
+		WorkerType: journal.WorkerType, Version: journal.TargetVersion,
+		Platform: journal.Platform, Architecture: journal.Architecture,
+		ProtocolVersion: journal.ProtocolVersion, Revision: journal.Revision,
+	}
+	if !validSourceAgentReadyReceipt(receipt) || !sourceAgentReadyReceiptMatches(receipt, expected) {
+		return false, ErrSourceAgentReadyMismatch
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if err := s.WriteReady(receipt); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) LoadUpgradeCommandCheckpoint() (SourceAgentUpgradeCommandCheckpoint, bool, error) {
+	payload, err := s.directory.read(sourceAgentUpgradeCheckpointFileName, sourceAgentUpdateReceiptMaxBytes)
+	if errors.Is(err, os.ErrNotExist) {
+		return SourceAgentUpgradeCommandCheckpoint{}, false, nil
+	}
+	var checkpoint SourceAgentUpgradeCommandCheckpoint
+	if err != nil || decodeStrictSourceAgentUpdateJSON(payload, &checkpoint) != nil ||
+		!validSourceAgentUpgradeCommandCheckpoint(checkpoint) {
+		return SourceAgentUpgradeCommandCheckpoint{}, true, ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	return checkpoint, true, nil
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) SaveUpgradeCommandCheckpoint(ctx context.Context, command SourceAgentCommand) error {
+	checkpoint := SourceAgentUpgradeCommandCheckpoint{
+		SchemaVersion: sourceAgentUpgradeCheckpointSchema,
+		AgentID:       command.TargetAgentID,
+		ClaimOwner:    command.ClaimOwner,
+		Fingerprint:   sourceAgentUpgradeCommandFingerprint(command),
+		Command:       command,
+	}
+	if !validSourceAgentUpgradeCommandCheckpoint(checkpoint) {
+		return ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	release, err := s.directory.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	existing, found, err := s.LoadUpgradeCommandCheckpoint()
+	if err != nil {
+		return err
+	}
+	if found && (existing.Command.ID != checkpoint.Command.ID || existing.Fingerprint != checkpoint.Fingerprint ||
+		existing.AgentID != checkpoint.AgentID || existing.ClaimOwner != checkpoint.ClaimOwner) {
+		return ErrSourceAgentUpgradeCheckpointConflict
+	}
+	payload, err := marshalSourceAgentUpdateJSON(checkpoint)
+	if err != nil {
+		return ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	if err := s.directory.writeAtomic(sourceAgentUpgradeCheckpointFileName, payload); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) ClearUpgradeCommandCheckpoint(
+	ctx context.Context,
+	commandID, fingerprint string,
+) error {
+	release, err := s.directory.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	checkpoint, found, err := s.LoadUpgradeCommandCheckpoint()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	if checkpoint.Command.ID != commandID || checkpoint.Fingerprint != fingerprint {
+		return ErrSourceAgentUpgradeCheckpointConflict
+	}
+	return s.directory.remove(sourceAgentUpgradeCheckpointFileName)
+}
+
+func (s *FileSourceAgentUpdateReceiptStore) RecordServerTerminalObservation(
+	ctx context.Context,
+	command SourceAgentCommand,
+) error {
+	if !isTerminalSourceAgentCommandState(command.State) ||
+		!validSourceAgentUpgradeRecoveryResponse(command, command.TargetAgentID, true) {
+		return ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	release, err := s.directory.acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	checkpoint, found, err := s.LoadUpgradeCommandCheckpoint()
+	if err != nil {
+		return err
+	}
+	fingerprint := sourceAgentUpgradeCommandFingerprint(command)
+	if !found || checkpoint.Command.ID != command.ID || checkpoint.AgentID != command.TargetAgentID ||
+		checkpoint.ClaimOwner != command.ClaimOwner || checkpoint.Fingerprint != fingerprint {
+		return ErrSourceAgentUpgradeCheckpointConflict
+	}
+	observation := SourceAgentUpgradeTerminalObservation{
+		SchemaVersion: sourceAgentUpgradeTerminalObservationSchema,
+		CommandID:     command.ID, Fingerprint: fingerprint, State: command.State,
+		ResultCode: command.ResultCode, ActualVersion: command.ActualVersion,
+	}
+	if !validSourceAgentUpgradeTerminalObservation(observation) {
+		return ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	payload, err := marshalSourceAgentUpdateJSON(observation)
+	if err != nil {
+		return ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	return s.directory.writeImmutable(sourceAgentUpgradeTerminalObservationFileName, payload)
+}
+
+func sourceAgentUpgradeCommandFingerprint(command SourceAgentCommand) string {
+	if command.UpgradeSpec == nil {
+		return ""
+	}
+	canonical := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s",
+		command.ID, command.TargetAgentID, command.Type, command.UpgradeSpec.ArtifactID,
+		command.UpgradeSpec.ExpectedCurrentVersion, command.IdempotencyKey,
+		command.ExpectedCurrentVersion, command.ClaimOwner, command.CreatedAt,
+		command.ClaimedAt, command.ExpiresAt)
+	digest := sha256.Sum256([]byte(canonical))
+	return fmt.Sprintf("%x", digest)
+}
+
+func validSourceAgentUpgradeCommandCheckpoint(checkpoint SourceAgentUpgradeCommandCheckpoint) bool {
+	command := checkpoint.Command
+	if checkpoint.SchemaVersion != sourceAgentUpgradeCheckpointSchema ||
+		checkpoint.AgentID != command.TargetAgentID || checkpoint.ClaimOwner != command.ClaimOwner ||
+		!isExactLowerHex(checkpoint.Fingerprint, sha256.Size*2) ||
+		checkpoint.Fingerprint != sourceAgentUpgradeCommandFingerprint(command) ||
+		!validSourceAgentUpgradeRecoveryResponse(command, checkpoint.AgentID, true) {
+		return false
+	}
+	idempotency, err := normalizeSourceAgentCommandIdentifier("idempotency_key", command.IdempotencyKey, true)
+	if err != nil || idempotency != command.IdempotencyKey {
+		return false
+	}
+	for _, value := range []string{command.CreatedAt, command.UpdatedAt, command.ClaimedAt, command.ExpiresAt} {
+		parsed, err := time.Parse(sourceAgentCommandTimestampLayout, value)
+		if err != nil || formatSourceAgentCommandTime(parsed) != value {
+			return false
+		}
+	}
+	if command.CompletedAt != "" {
+		parsed, err := time.Parse(sourceAgentCommandTimestampLayout, command.CompletedAt)
+		if err != nil || formatSourceAgentCommandTime(parsed) != command.CompletedAt {
+			return false
+		}
+	}
+	return true
+}
+
+func validSourceAgentUpgradeTerminalObservation(value SourceAgentUpgradeTerminalObservation) bool {
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", value.CommandID, true)
+	if value.SchemaVersion != sourceAgentUpgradeTerminalObservationSchema || err != nil || commandID != value.CommandID ||
+		!isExactLowerHex(value.Fingerprint, sha256.Size*2) || !isTerminalSourceAgentCommandState(value.State) {
+		return false
+	}
+	if value.ActualVersion != "" {
+		version, err := normalizeSourceAgentVersion("actual_version", value.ActualVersion)
+		if err != nil || version != value.ActualVersion {
+			return false
+		}
+	}
+	switch value.State {
+	case SourceAgentCommandCanceled:
+		return value.ResultCode == SourceAgentCommandCodeCanceled && value.ActualVersion == ""
+	case SourceAgentCommandExpired:
+		return value.ResultCode == SourceAgentCommandCodeExpired && value.ActualVersion == ""
+	default:
+		return validateSourceAgentCommandTerminalResult(SourceAgentCommandUpgrade, SourceAgentCommandTransition{
+			State: value.State, ResultCode: value.ResultCode, ActualVersion: value.ActualVersion,
+		}) == nil
+	}
 }
 
 func (s *FileSourceAgentUpdateReceiptStore) WriteReady(receipt SourceAgentReadyReceipt) error {

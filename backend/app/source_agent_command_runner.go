@@ -10,6 +10,18 @@ type SourceAgentCommandClient interface {
 	ReportCommand(context.Context, string, string, string, string, string) (SourceAgentCommand, error)
 }
 
+type SourceAgentUpgradeRecoveryClient interface {
+	ResumeUpgradeCommand(context.Context, string) (*SourceAgentCommand, error)
+	RecoverOwnedUpgrade(context.Context) (*SourceAgentCommand, error)
+}
+
+type SourceAgentProtectedUpgradeState interface {
+	PublishAuthenticatedReady(context.Context, SourceAgentRuntimeIdentity) (bool, error)
+	LoadUpgradeCommandCheckpoint() (SourceAgentUpgradeCommandCheckpoint, bool, error)
+	SaveUpgradeCommandCheckpoint(context.Context, SourceAgentCommand) error
+	RecordServerTerminalObservation(context.Context, SourceAgentCommand) error
+}
+
 type SourceAgentDiagnoser interface {
 	Diagnose(context.Context) SourceAgentDiagnosticReport
 }
@@ -222,6 +234,20 @@ func (r *SourceAgentRunner) reportPendingCommand(ctx context.Context) error {
 			return nil
 		}
 		return fmt.Errorf("report source-agent command: %w", err)
+	}
+	if r.upgradeState != nil && command.Type == SourceAgentCommandUpgrade {
+		if sourceAgentUpgradeCommandFingerprint(updated) != sourceAgentUpgradeCommandFingerprint(command) ||
+			!validSourceAgentUpgradeRecoveryResponse(updated, command.TargetAgentID, true) {
+			return ErrSourceAgentUpgradeCheckpointConflict
+		}
+		if isTerminalSourceAgentCommandState(updated.State) {
+			r.clearRecoveredTerminalCommand(updated.ID)
+			if err := r.upgradeState.RecordServerTerminalObservation(ctx, updated); err != nil {
+				return fmt.Errorf("record terminal source-agent upgrade: %w", err)
+			}
+		} else if err := r.upgradeState.SaveUpgradeCommandCheckpoint(ctx, updated); err != nil {
+			return fmt.Errorf("persist source-agent upgrade checkpoint: %w", err)
+		}
 	}
 	r.commandReportSucceeded(updated)
 	return nil

@@ -136,6 +136,47 @@ func TestSourceAgentCommandUpgradeLifecycle(t *testing.T) {
 	}
 }
 
+func TestSourceAgentCommandRecoveryIsOwnedExactAndTerminalAware(t *testing.T) {
+	store, clock := newSourceAgentCommandTestStore(t)
+	registerSourceAgentCommandTestAgent(t, store, "agent-recovery", "1.0.0")
+	registerSourceAgentCommandTestAgent(t, store, "agent-other", "1.0.0")
+
+	created := mustCreateSourceAgentUpgradeCommand(
+		t, store, clock, "agent-recovery", "artifact-recovery", "recover-once",
+	)
+	claimed, err := store.ClaimSourceAgentCommand(created.ID, "agent-recovery", "agent-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := store.RecoverOwnedSourceAgentUpgrade("agent-recovery", "agent-recovery")
+	if err != nil || recovered == nil || !reflect.DeepEqual(*recovered, claimed) {
+		t.Fatalf("RecoverOwnedSourceAgentUpgrade() = %#v, %v", recovered, err)
+	}
+	resumed, err := store.ResumeOwnedSourceAgentUpgrade(created.ID, "agent-recovery", "agent-recovery")
+	if err != nil || !reflect.DeepEqual(resumed, claimed) {
+		t.Fatalf("ResumeOwnedSourceAgentUpgrade() = %#v, %v", resumed, err)
+	}
+	if _, err := store.ResumeOwnedSourceAgentUpgrade(created.ID, "agent-other", "agent-other"); !errors.Is(err, ErrSourceAgentCommandTarget) {
+		t.Fatalf("foreign resume error = %v", err)
+	}
+	if _, err := store.ResumeOwnedSourceAgentUpgrade(created.ID, "agent-recovery", "other-owner"); !errors.Is(err, ErrSourceAgentCommandClaimOwner) {
+		t.Fatalf("wrong owner resume error = %v", err)
+	}
+
+	terminal := completeSourceAgentUpgradeCommand(
+		t, store, created.ID, "agent-recovery", "agent-recovery", "2.0.0",
+	)
+	resumed, err = store.ResumeOwnedSourceAgentUpgrade(created.ID, "agent-recovery", "agent-recovery")
+	if err != nil || !reflect.DeepEqual(resumed, terminal) {
+		t.Fatalf("terminal resume = %#v, %v", resumed, err)
+	}
+	recovered, err = store.RecoverOwnedSourceAgentUpgrade("agent-recovery", "agent-recovery")
+	if err != nil || recovered != nil {
+		t.Fatalf("terminal command was recovered as active: %#v, %v", recovered, err)
+	}
+}
+
 func TestSourceAgentCommandDiagnoseLifecycleAndClaimNext(t *testing.T) {
 	store, clock := newSourceAgentCommandTestStore(t)
 	registerSourceAgentCommandTestAgent(t, store, "agent-diagnose", "1.0.0")

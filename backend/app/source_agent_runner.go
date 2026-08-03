@@ -17,34 +17,40 @@ const defaultSourceAgentProtocolVersion = "2026-08-01"
 var errInvalidSourceAgentCapabilityHealth = errors.New("invalid source agent capability health")
 
 type SourceAgentRunnerConfig struct {
-	Client          *SourceAgentClient
-	CommandClient   SourceAgentCommandClient
-	Outbox          *SourceAgentOutbox
-	Adapter         SourceAdapter
-	Diagnoser       SourceAgentDiagnoser
-	Updater         SourceAgentUpdater
-	WorkerType      string
-	Platform        string
-	Architecture    string
-	Version         string
-	ProtocolVersion string
-	LeaseDuration   time.Duration
+	Client                *SourceAgentClient
+	CommandClient         SourceAgentCommandClient
+	UpgradeRecoveryClient SourceAgentUpgradeRecoveryClient
+	UpgradeState          SourceAgentProtectedUpgradeState
+	Outbox                *SourceAgentOutbox
+	Adapter               SourceAdapter
+	Diagnoser             SourceAgentDiagnoser
+	Updater               SourceAgentUpdater
+	WorkerType            string
+	Platform              string
+	Architecture          string
+	Version               string
+	ProtocolVersion       string
+	Revision              string
+	LeaseDuration         time.Duration
 }
 
 type SourceAgentRunner struct {
-	client          *SourceAgentClient
-	commandClient   SourceAgentCommandClient
-	outbox          *SourceAgentOutbox
-	adapter         SourceAdapter
-	diagnoser       SourceAgentDiagnoser
-	updater         SourceAgentUpdater
-	workerType      string
-	platform        string
-	architecture    string
-	version         string
-	protocolVersion string
-	leaseDuration   time.Duration
-	now             func() time.Time
+	client                *SourceAgentClient
+	commandClient         SourceAgentCommandClient
+	upgradeRecoveryClient SourceAgentUpgradeRecoveryClient
+	upgradeState          SourceAgentProtectedUpgradeState
+	outbox                *SourceAgentOutbox
+	adapter               SourceAdapter
+	diagnoser             SourceAgentDiagnoser
+	updater               SourceAgentUpdater
+	workerType            string
+	platform              string
+	architecture          string
+	version               string
+	protocolVersion       string
+	revision              string
+	leaseDuration         time.Duration
+	now                   func() time.Time
 
 	controlGate chan struct{}
 	stateMu     sync.Mutex
@@ -74,6 +80,14 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 	}
 	if config.CommandClient == nil {
 		config.CommandClient = config.Client
+	}
+	if config.UpgradeState != nil && config.UpgradeRecoveryClient == nil {
+		if recovery, ok := config.CommandClient.(SourceAgentUpgradeRecoveryClient); ok {
+			config.UpgradeRecoveryClient = recovery
+		}
+	}
+	if (config.UpgradeState == nil) != (config.UpgradeRecoveryClient == nil) {
+		return nil, fmt.Errorf("source agent protected upgrade state and recovery client must be configured together")
 	}
 	if config.LeaseDuration <= 0 {
 		config.LeaseDuration = defaultSourceAgentLeaseDuration
@@ -110,11 +124,17 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 	if err != nil || protocolVersion == "" {
 		return nil, fmt.Errorf("invalid source agent protocol_version")
 	}
+	revision := strings.TrimSpace(config.Revision)
+	if config.UpgradeState != nil && !isExactLowerHex(revision, 40) && !isExactLowerHex(revision, 64) {
+		return nil, fmt.Errorf("invalid source agent build revision")
+	}
 	runner := &SourceAgentRunner{
-		client: config.Client, commandClient: config.CommandClient, outbox: config.Outbox,
+		client: config.Client, commandClient: config.CommandClient,
+		upgradeRecoveryClient: config.UpgradeRecoveryClient, upgradeState: config.UpgradeState,
+		outbox:  config.Outbox,
 		adapter: config.Adapter, diagnoser: config.Diagnoser, updater: config.Updater,
 		workerType: workerType, platform: platform, architecture: architecture,
-		version: version, protocolVersion: protocolVersion, leaseDuration: config.LeaseDuration,
+		version: version, protocolVersion: protocolVersion, revision: revision, leaseDuration: config.LeaseDuration,
 		now: time.Now, controlGate: make(chan struct{}, 1),
 	}
 	runner.controlGate <- struct{}{}
@@ -168,6 +188,15 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 	if err != nil {
 		return nil, health.Healthy, fmt.Errorf("send source-agent heartbeat: %w", err)
 	}
+	if r.upgradeState != nil {
+		handled, err := r.restoreProtectedUpgrade(ctx)
+		if err != nil {
+			return nil, health.Healthy, err
+		}
+		if handled && !r.hasCurrentCommand() {
+			return nil, health.Healthy, nil
+		}
+	}
 	if r.clearExpiredCurrentCommand("") {
 		return nil, health.Healthy, nil
 	}
@@ -188,6 +217,14 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 		return nil, health.Healthy, fmt.Errorf("claim source-agent command: %w", err)
 	}
 	if command != nil {
+		if command.Type == SourceAgentCommandUpgrade && r.upgradeState != nil {
+			if !validSourceAgentUpgradeRecoveryResponse(*command, r.client.agentID, false) {
+				return nil, health.Healthy, ErrSourceAgentUpgradeCheckpointInvalid
+			}
+			if err := r.upgradeState.SaveUpgradeCommandCheckpoint(ctx, *command); err != nil {
+				return nil, health.Healthy, fmt.Errorf("persist source-agent upgrade checkpoint: %w", err)
+			}
+		}
 		r.setCurrentCommand(*command)
 		if r.clearExpiredCurrentCommand(command.ID) {
 			return nil, health.Healthy, nil
@@ -213,6 +250,68 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 		r.startSourceRun(run.ID)
 	}
 	return run, health.Healthy, nil
+}
+
+func (r *SourceAgentRunner) restoreProtectedUpgrade(ctx context.Context) (bool, error) {
+	identity := SourceAgentRuntimeIdentity{
+		WorkerType: r.workerType, Version: r.version, Platform: r.platform,
+		Architecture: r.architecture, ProtocolVersion: r.protocolVersion, Revision: r.revision,
+	}
+	if _, err := r.upgradeState.PublishAuthenticatedReady(ctx, identity); err != nil {
+		return false, fmt.Errorf("publish source-agent ready receipt: %w", err)
+	}
+	checkpoint, found, err := r.upgradeState.LoadUpgradeCommandCheckpoint()
+	if err != nil {
+		return false, fmt.Errorf("load source-agent upgrade checkpoint: %w", err)
+	}
+	if found {
+		command, err := r.upgradeRecoveryClient.ResumeUpgradeCommand(ctx, checkpoint.Command.ID)
+		if err != nil {
+			return false, fmt.Errorf("resume source-agent upgrade: %w", err)
+		}
+		if command == nil || sourceAgentUpgradeCommandFingerprint(*command) != checkpoint.Fingerprint ||
+			!validSourceAgentUpgradeRecoveryResponse(*command, checkpoint.AgentID, true) {
+			return false, ErrSourceAgentUpgradeCheckpointConflict
+		}
+		if isTerminalSourceAgentCommandState(command.State) {
+			r.clearRecoveredTerminalCommand(command.ID)
+			if err := r.upgradeState.RecordServerTerminalObservation(ctx, *command); err != nil {
+				return false, fmt.Errorf("record terminal source-agent upgrade: %w", err)
+			}
+			return true, nil
+		}
+		if err := r.upgradeState.SaveUpgradeCommandCheckpoint(ctx, *command); err != nil {
+			return false, fmt.Errorf("persist resumed source-agent upgrade checkpoint: %w", err)
+		}
+		r.setCurrentCommand(*command)
+		return true, nil
+	}
+	command, err := r.upgradeRecoveryClient.RecoverOwnedUpgrade(ctx)
+	if err != nil {
+		return false, fmt.Errorf("recover owned source-agent upgrade: %w", err)
+	}
+	if command == nil {
+		return false, nil
+	}
+	if !validSourceAgentUpgradeRecoveryResponse(*command, r.client.agentID, false) {
+		return false, ErrSourceAgentUpgradeCheckpointInvalid
+	}
+	if err := r.upgradeState.SaveUpgradeCommandCheckpoint(ctx, *command); err != nil {
+		return false, fmt.Errorf("adopt source-agent upgrade checkpoint: %w", err)
+	}
+	r.setCurrentCommand(*command)
+	return true, nil
+}
+
+func (r *SourceAgentRunner) clearRecoveredTerminalCommand(commandID string) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	if r.state.currentCommand == nil || r.state.currentCommand.ID != commandID {
+		return
+	}
+	r.state.currentCommand = nil
+	r.state.pendingReports = nil
+	r.state.upgradeActive = false
 }
 
 func (r *SourceAgentRunner) executeLeasedRun(ctx context.Context, run SourceSyncRun, result SourceAgentCycleResult) (SourceAgentCycleResult, error) {

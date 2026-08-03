@@ -71,6 +71,7 @@ var (
 	ErrSourceAgentCommandInvalidState        = errors.New("source agent command state transition is invalid")
 	ErrSourceAgentCommandResultConflict      = errors.New("source agent command durable result conflicts")
 	ErrSourceAgentCommandExpired             = errors.New("source agent command expired")
+	ErrSourceAgentCommandRecoveryAmbiguous   = errors.New("source agent upgrade recovery is ambiguous")
 )
 
 var sourceAgentCommandResultCodes = map[string]struct{}{
@@ -536,6 +537,135 @@ func (s *SourceSyncStore) ClaimSourceAgentCommand(commandID, agentID, claimOwner
 		return SourceAgentCommand{}, err
 	}
 	return s.GetSourceAgentCommand(command.ID)
+}
+
+// ResumeOwnedSourceAgentUpgrade returns the exact upgrade already owned by the
+// caller. Terminal commands are returned for reconciliation only; queued work
+// is never adopted through this recovery surface.
+func (s *SourceSyncStore) ResumeOwnedSourceAgentUpgrade(commandID, agentID, claimOwner string) (SourceAgentCommand, error) {
+	operationNow := s.now().UTC()
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", commandID, true)
+	if err != nil {
+		return SourceAgentCommand{}, err
+	}
+	agentID, err = normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
+	if err != nil {
+		return SourceAgentCommand{}, err
+	}
+	claimOwner, err = normalizeSourceAgentCommandIdentifier("claim_owner", claimOwner, true)
+	if err != nil {
+		return SourceAgentCommand{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return SourceAgentCommand{}, err
+	}
+	defer tx.Rollback()
+	command, err := scanSourceAgentCommand(tx.QueryRow(sourceAgentCommandSelect+` WHERE command_id = ?`, commandID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return SourceAgentCommand{}, ErrSourceAgentCommandNotFound
+	}
+	if err != nil {
+		return SourceAgentCommand{}, err
+	}
+	if command.TargetAgentID != agentID {
+		return SourceAgentCommand{}, ErrSourceAgentCommandTarget
+	}
+	if command.Type != SourceAgentCommandUpgrade || command.UpgradeSpec == nil {
+		return SourceAgentCommand{}, ErrSourceAgentCommandType
+	}
+	if command.State == SourceAgentCommandQueued {
+		return SourceAgentCommand{}, ErrSourceAgentCommandInvalidState
+	}
+	if command.ClaimOwner == "" || command.ClaimOwner != claimOwner {
+		return SourceAgentCommand{}, ErrSourceAgentCommandClaimOwner
+	}
+	if !isTerminalSourceAgentCommandState(command.State) && sourceAgentCommandIsExpired(command, operationNow) {
+		now := formatSourceAgentCommandTime(operationNow)
+		if err := expireSourceAgentCommandTx(tx, command, now); err != nil {
+			return SourceAgentCommand{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return SourceAgentCommand{}, err
+		}
+		return s.GetSourceAgentCommand(command.ID)
+	}
+	if err := tx.Commit(); err != nil {
+		return SourceAgentCommand{}, err
+	}
+	return command, nil
+}
+
+// RecoverOwnedSourceAgentUpgrade closes the claim-commit/response crash
+// window. It returns at most one active upgrade and fails closed if durable
+// state violates the one-upgrade or ownership invariants.
+func (s *SourceSyncStore) RecoverOwnedSourceAgentUpgrade(agentID, claimOwner string) (*SourceAgentCommand, error) {
+	operationNow := s.now().UTC()
+	agentID, err := normalizeSourceAgentCommandIdentifier("agent_id", agentID, true)
+	if err != nil {
+		return nil, err
+	}
+	claimOwner, err = normalizeSourceAgentCommandIdentifier("claim_owner", claimOwner, true)
+	if err != nil {
+		return nil, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRow(`SELECT 1 FROM source_agents WHERE agent_id = ?`, agentID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrSourceAgentNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	if err := expireDueSourceAgentCommandsTx(tx, agentID, formatSourceAgentCommandTime(operationNow)); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(sourceAgentCommandSelect+`
+		WHERE target_agent_id = ? AND command_type = ? AND state IN (?, ?, ?, ?, ?, ?, ?, ?)
+		ORDER BY created_at, command_id
+		LIMIT 2
+	`, agentID, SourceAgentCommandUpgrade,
+		SourceAgentCommandQueued, SourceAgentCommandClaimed, SourceAgentCommandDownloading,
+		SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting,
+		SourceAgentCommandVerifying, SourceAgentCommandRollback)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	commands := make([]SourceAgentCommand, 0, 2)
+	for rows.Next() {
+		command, scanErr := scanSourceAgentCommand(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		commands = append(commands, command)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(commands) > 1 {
+		return nil, ErrSourceAgentCommandRecoveryAmbiguous
+	}
+	if len(commands) == 0 || commands[0].State == SourceAgentCommandQueued {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	command := commands[0]
+	if command.ClaimOwner == "" || command.ClaimOwner != claimOwner {
+		return nil, ErrSourceAgentCommandClaimOwner
+	}
+	if command.UpgradeSpec == nil {
+		return nil, ErrSourceAgentCommandType
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &command, nil
 }
 
 func (s *SourceSyncStore) TransitionSourceAgentCommand(commandID, agentID, claimOwner string, input SourceAgentCommandTransition) (SourceAgentCommand, error) {

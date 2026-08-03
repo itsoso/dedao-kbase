@@ -22,6 +22,315 @@ type fakeSourceAdapter struct {
 	enqueue *SourceArticleEnvelope
 }
 
+type sourceAgentRunnerProtectedStateFake struct {
+	calls      *[]string
+	checkpoint SourceAgentUpgradeCommandCheckpoint
+	found      bool
+	readyErr   error
+	saveErr    error
+	ackErr     error
+	identity   SourceAgentRuntimeIdentity
+}
+
+func (s *sourceAgentRunnerProtectedStateFake) PublishAuthenticatedReady(_ context.Context, identity SourceAgentRuntimeIdentity) (bool, error) {
+	*s.calls = append(*s.calls, "ready")
+	s.identity = identity
+	return s.readyErr == nil, s.readyErr
+}
+
+func (s *sourceAgentRunnerProtectedStateFake) LoadUpgradeCommandCheckpoint() (SourceAgentUpgradeCommandCheckpoint, bool, error) {
+	*s.calls = append(*s.calls, "load")
+	return s.checkpoint, s.found, nil
+}
+
+func (s *sourceAgentRunnerProtectedStateFake) SaveUpgradeCommandCheckpoint(_ context.Context, command SourceAgentCommand) error {
+	*s.calls = append(*s.calls, "save")
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	s.checkpoint = SourceAgentUpgradeCommandCheckpoint{
+		SchemaVersion: sourceAgentUpgradeCheckpointSchema, AgentID: command.TargetAgentID,
+		ClaimOwner: command.ClaimOwner, Fingerprint: sourceAgentUpgradeCommandFingerprint(command), Command: command,
+	}
+	s.found = true
+	return nil
+}
+
+func (s *sourceAgentRunnerProtectedStateFake) RecordServerTerminalObservation(_ context.Context, command SourceAgentCommand) error {
+	*s.calls = append(*s.calls, "observe")
+	return s.ackErr
+}
+
+type sourceAgentRunnerRecoveryClientFake struct {
+	calls     *[]string
+	claimed   *SourceAgentCommand
+	recovered *SourceAgentCommand
+	resumed   *SourceAgentCommand
+	reportErr error
+}
+
+func (c *sourceAgentRunnerRecoveryClientFake) ClaimCommand(context.Context) (*SourceAgentCommand, error) {
+	*c.calls = append(*c.calls, "claim")
+	return c.claimed, nil
+}
+
+func TestSourceAgentRunnerDoesNotExecuteClaimedUpgradeBeforeCheckpoint(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, "heartbeat")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	command := sourceAgentRunnerRecoveryCommand(SourceAgentCommandClaimed)
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls, claimed: &command}
+	protected := &sourceAgentRunnerProtectedStateFake{
+		calls: &calls, saveErr: errors.New("checkpoint unavailable"),
+	}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, CommandClient: recovery, UpgradeRecoveryClient: recovery,
+		UpgradeState: protected, Outbox: outbox,
+		Adapter:    &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}},
+		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01", Revision: sourceAgentUpdateTestRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.RunOnce(context.Background()); err == nil || !strings.Contains(err.Error(), "checkpoint") {
+		t.Fatalf("RunOnce() error=%v", err)
+	}
+	if got, want := strings.Join(calls, ","), "heartbeat,ready,load,recover,claim,save"; got != want {
+		t.Fatalf("calls=%s, want %s", got, want)
+	}
+	if runner.hasCurrentCommand() {
+		t.Fatal("upgrade became current before durable checkpoint")
+	}
+}
+
+func (c *sourceAgentRunnerRecoveryClientFake) ReportCommand(
+	_ context.Context,
+	_ string,
+	state, code, message, actualVersion string,
+) (SourceAgentCommand, error) {
+	*c.calls = append(*c.calls, "report")
+	if c.reportErr != nil {
+		return SourceAgentCommand{}, c.reportErr
+	}
+	command := *c.recovered
+	if c.resumed != nil {
+		command = *c.resumed
+	}
+	command.State, command.ResultCode, command.Message, command.ActualVersion = state, code, message, actualVersion
+	command.UpdatedAt = "2026-08-01T12:00:02.000000000Z"
+	return command, nil
+}
+
+func (c *sourceAgentRunnerRecoveryClientFake) ResumeUpgradeCommand(_ context.Context, _ string) (*SourceAgentCommand, error) {
+	*c.calls = append(*c.calls, "resume")
+	return c.resumed, nil
+}
+
+func (c *sourceAgentRunnerRecoveryClientFake) RecoverOwnedUpgrade(context.Context) (*SourceAgentCommand, error) {
+	*c.calls = append(*c.calls, "recover")
+	return c.recovered, nil
+}
+
+func sourceAgentRunnerRecoveryCommand(state string) SourceAgentCommand {
+	command := SourceAgentCommand{
+		ID: "command-recovery", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-2", ExpectedCurrentVersion: "1.0.0"},
+		State:       state, IdempotencyKey: "upgrade-recovery", ExpectedCurrentVersion: "1.0.0",
+		ClaimOwner: "agent-a", CreatedAt: "2026-08-01T12:00:00.000000000Z",
+		UpdatedAt: "2026-08-01T12:00:01.000000000Z", ClaimedAt: "2026-08-01T12:00:01.000000000Z",
+		ExpiresAt: formatSourceAgentCommandTime(time.Now().UTC().Add(time.Hour)),
+	}
+	if isTerminalSourceAgentCommandState(state) {
+		command.CompletedAt = "2026-08-01T12:00:03.000000000Z"
+	}
+	return command
+}
+
+func TestSourceAgentRunnerRecoversUpgradeBeforeClaimOrLease(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			calls = append(calls, "heartbeat")
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+		default:
+			calls = append(calls, "unexpected:"+r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	command := sourceAgentRunnerRecoveryCommand(SourceAgentCommandClaimed)
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls, recovered: &command}
+	protected := &sourceAgentRunnerProtectedStateFake{calls: &calls}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, CommandClient: recovery, UpgradeRecoveryClient: recovery,
+		UpgradeState: protected, Outbox: outbox,
+		Adapter:    &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}},
+		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01", Revision: sourceAgentUpdateTestRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(calls, ","), "heartbeat,ready,load,recover,save,report,save"; got != want {
+		t.Fatalf("calls=%s, want %s", got, want)
+	}
+	current, _ := runner.currentCommandSnapshot()
+	if current.ID != command.ID || current.State != SourceAgentCommandDownloading {
+		t.Fatalf("current command=%#v", current)
+	}
+	if protected.identity.Revision != sourceAgentUpdateTestRevision {
+		t.Fatalf("ready identity=%#v", protected.identity)
+	}
+}
+
+func TestSourceAgentRunnerRejectsForeignRecoveredUpgrade(t *testing.T) {
+	var calls []string
+	command := sourceAgentRunnerRecoveryCommand(SourceAgentCommandClaimed)
+	command.TargetAgentID = "agent-b"
+	command.ClaimOwner = "agent-b"
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls, recovered: &command}
+	protected := &sourceAgentRunnerProtectedStateFake{calls: &calls}
+	runner := &SourceAgentRunner{
+		client: &SourceAgentClient{agentID: "agent-a"}, upgradeRecoveryClient: recovery,
+		upgradeState: protected, workerType: "wechat-worker", platform: "darwin",
+		architecture: "arm64", version: "1.0.0", protocolVersion: "2026-08-01",
+		revision: sourceAgentUpdateTestRevision,
+	}
+	if _, err := runner.restoreProtectedUpgrade(context.Background()); !errors.Is(err, ErrSourceAgentUpgradeCheckpointInvalid) {
+		t.Fatalf("restoreProtectedUpgrade() error=%v", err)
+	}
+	if got, want := strings.Join(calls, ","), "ready,load,recover"; got != want {
+		t.Fatalf("calls=%s, want %s", got, want)
+	}
+}
+
+func TestSourceAgentRunnerDoesNotPublishReadyBeforeAuthenticatedHeartbeat(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, "heartbeat")
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls}
+	protected := &sourceAgentRunnerProtectedStateFake{calls: &calls}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, CommandClient: recovery, UpgradeRecoveryClient: recovery,
+		UpgradeState: protected, Outbox: outbox, Adapter: &fakeSourceAdapter{},
+		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01", Revision: sourceAgentUpdateTestRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.RunOnce(context.Background()); err == nil {
+		t.Fatal("RunOnce succeeded after rejected heartbeat")
+	}
+	if got := strings.Join(calls, ","); got != "heartbeat" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestSourceAgentRunnerReconcilesTerminalUpgradeWithoutExecutingIt(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, "heartbeat")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	active := sourceAgentRunnerRecoveryCommand(SourceAgentCommandVerifying)
+	terminal := active
+	terminal.State = SourceAgentCommandSucceeded
+	terminal.ResultCode = SourceAgentCommandCodeUpgradeComplete
+	terminal.ActualVersion = "2.0.0"
+	terminal.CompletedAt = "2026-08-01T12:00:03.000000000Z"
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls, resumed: &terminal}
+	protected := &sourceAgentRunnerProtectedStateFake{calls: &calls, found: true}
+	protected.checkpoint = SourceAgentUpgradeCommandCheckpoint{
+		SchemaVersion: sourceAgentUpgradeCheckpointSchema, AgentID: active.TargetAgentID,
+		ClaimOwner: active.ClaimOwner, Fingerprint: sourceAgentUpgradeCommandFingerprint(active), Command: active,
+	}
+	updater := &fakeSourceAgentUpdater{log: &sourceAgentRunnerCallLog{}}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, CommandClient: recovery, UpgradeRecoveryClient: recovery,
+		UpgradeState: protected, Outbox: outbox, Adapter: &fakeSourceAdapter{},
+		Updater:    updater,
+		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "2.0.0", ProtocolVersion: "2026-08-01", Revision: sourceAgentUpdateTestRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner.setCurrentCommand(active)
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(calls, ","), "heartbeat,ready,load,resume,observe"; got != want {
+		t.Fatalf("calls=%s, want %s", got, want)
+	}
+	if runner.hasCurrentCommand() || updater.calls.Load() != 0 {
+		t.Fatalf("terminal recovery left current=%t updater_calls=%d", runner.hasCurrentCommand(), updater.calls.Load())
+	}
+}
+
 func (a *fakeSourceAdapter) Name() string                                  { return "fake" }
 func (a *fakeSourceAdapter) Operations() []string                          { return []string{"sync_fake"} }
 func (a *fakeSourceAdapter) Status(context.Context) SourceCapabilityHealth { return a.status }

@@ -503,6 +503,102 @@ func TestSourceAgentClientCommands(t *testing.T) {
 	}
 }
 
+func TestSourceAgentClientRecoversOwnedUpgradeThroughSeparateContract(t *testing.T) {
+	const activeCommand = `{"id":"cmd-recover","target_agent_id":"agent-a","type":"upgrade","upgrade_spec":{"artifact_id":"artifact-2","expected_current_version":"1.0.0"},"state":"installing","idempotency_key":"recover-once","expected_current_version":"1.0.0","claim_owner":"agent-a","created_at":"2026-08-01T12:00:00.000000000Z","updated_at":"2026-08-01T12:00:01.000000000Z","claimed_at":"2026-08-01T12:00:01.000000000Z","expires_at":"2026-08-01T13:00:00.000000000Z"}`
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.EscapedPath() != "/api/source-agent/commands/recover" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.EscapedPath())
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer agent-secret" {
+			t.Fatalf("Authorization = %q", got)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch calls {
+		case 1:
+			want := map[string]any{"agent_id": "agent-a", "command_id": "cmd-recover"}
+			if !reflect.DeepEqual(payload, want) {
+				t.Fatalf("resume payload = %#v, want %#v", payload, want)
+			}
+			fmt.Fprintf(w, `{"command":%s}`, activeCommand)
+		case 2:
+			want := map[string]any{"agent_id": "agent-a"}
+			if !reflect.DeepEqual(payload, want) {
+				t.Fatalf("recovery payload = %#v, want %#v", payload, want)
+			}
+			fmt.Fprintf(w, `{"command":%s}`, activeCommand)
+		case 3:
+			fmt.Fprint(w, `{"command":null}`)
+		case 4:
+			fmt.Fprintf(w, `{"command":%s,"private_path":"/private/worker"}`, activeCommand)
+		default:
+			t.Fatalf("unexpected recovery call %d", calls)
+		}
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := client.ResumeUpgradeCommand(context.Background(), "cmd-recover")
+	if err != nil || resumed == nil || resumed.ID != "cmd-recover" || resumed.State != SourceAgentCommandInstalling {
+		t.Fatalf("ResumeUpgradeCommand() = %#v, %v", resumed, err)
+	}
+	recovered, err := client.RecoverOwnedUpgrade(context.Background())
+	if err != nil || recovered == nil || recovered.ID != "cmd-recover" {
+		t.Fatalf("RecoverOwnedUpgrade() = %#v, %v", recovered, err)
+	}
+	empty, err := client.RecoverOwnedUpgrade(context.Background())
+	if err != nil || empty != nil {
+		t.Fatalf("empty RecoverOwnedUpgrade() = %#v, %v", empty, err)
+	}
+	if leaked, err := client.RecoverOwnedUpgrade(context.Background()); err == nil || leaked != nil {
+		t.Fatalf("recovery accepted unknown response fields: %#v, %v", leaked, err)
+	}
+}
+
+func TestSourceAgentClientRecoveryPreservesExactContextError(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		context func() (context.Context, context.CancelFunc)
+	}{
+		{name: "canceled", context: func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			return ctx, func() {}
+		}},
+		{name: "deadline", context: func() (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := NewSourceAgentClient(SourceAgentConfig{
+				RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret",
+				AgentID: "agent-a", StateDir: t.TempDir(),
+				HTTPClient: &http.Client{Transport: sourceAgentClientRoundTripperForTest(func(request *http.Request) (*http.Response, error) {
+					return nil, fmt.Errorf("wrapped transport cancellation: %w", request.Context().Err())
+				})},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := test.context()
+			defer cancel()
+			if _, err := client.RecoverOwnedUpgrade(ctx); err != ctx.Err() {
+				t.Fatalf("RecoverOwnedUpgrade() error=%T %v, want exact %v", err, err, ctx.Err())
+			}
+		})
+	}
+}
+
 func TestSourceAgentArtifactHandoffClientRequiresStrictSnapshotMetadata(t *testing.T) {
 	artifactBytes := []byte("fixed worker artifact")
 	command := SourceAgentCommand{

@@ -25,7 +25,8 @@ func openSourceAgentUpdateDirectory(root string) (sourceAgentUpdateDirectory, er
 		return nil, errSourceAgentUpdateStorageUnavailable
 	}
 	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Mode&0o077 != 0 {
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR ||
+		stat.Mode&0o7777 != 0o700 || stat.Uid != uint32(unix.Geteuid()) {
 		unix.Close(fd)
 		return nil, errSourceAgentUpdateStorageUnavailable
 	}
@@ -69,7 +70,7 @@ func (d *unixSourceAgentUpdateDirectory) read(name string, maximum int64) ([]byt
 	defer file.Close()
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
-		stat.Mode&0o777 != 0o600 || stat.Size <= 0 || stat.Size > maximum {
+		stat.Mode&0o7777 != 0o600 || stat.Uid != uint32(unix.Geteuid()) || stat.Size <= 0 || stat.Size > maximum {
 		return nil, ErrSourceAgentReadyInvalid
 	}
 	payload, err := io.ReadAll(io.LimitReader(file, maximum+1))

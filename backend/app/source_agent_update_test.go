@@ -46,13 +46,18 @@ type fakeSourceAgentUpdateProcess struct {
 	failCall       int
 	rejectCanceled bool
 	blockUntilDone bool
+	beforeRestart  func()
 }
 
 func (p *fakeSourceAgentUpdateProcess) Restart(ctx context.Context) error {
 	p.mu.Lock()
 	p.calls++
 	blockUntilDone := p.blockUntilDone
+	beforeRestart := p.beforeRestart
 	p.mu.Unlock()
+	if beforeRestart != nil {
+		beforeRestart()
+	}
 	if blockUntilDone {
 		<-ctx.Done()
 		return ctx.Err()
@@ -66,6 +71,48 @@ func (p *fakeSourceAgentUpdateProcess) Restart(ctx context.Context) error {
 		return errors.New("private launch detail")
 	}
 	return nil
+}
+
+func TestSourceAgentUpdateArmsRestartChallengeDurablyBeforeRestart(t *testing.T) {
+	fixture := newSourceAgentUpdateFixture(t)
+	fixture.process.failCall = 1
+	restartCall := 0
+	fixture.process.beforeRestart = func() {
+		restartCall++
+		fixture.receipts.mu.Lock()
+		defer fixture.receipts.mu.Unlock()
+		journal := fixture.receipts.journal
+		if !fixture.receipts.journalFound {
+			t.Errorf("journal before restart=%#v found=%t", journal, fixture.receipts.journalFound)
+			return
+		}
+		if restartCall > 1 {
+			if journal.Stage != "rollback_restored" {
+				t.Errorf("journal before rollback restart=%#v", journal)
+			}
+			return
+		}
+		if journal.Stage != "restart_requested" {
+			t.Errorf("journal before first restart=%#v", journal)
+			return
+		}
+		if journal.CommandID != fixture.request.CommandID ||
+			journal.RequestFingerprint != sourceAgentUpdateRequestFingerprint(fixture.request) ||
+			journal.AttemptNonce == "" || journal.Revision != fixture.request.Revision {
+			t.Errorf("restart challenge lost immutable identity: %#v", journal)
+		}
+	}
+
+	result := fixture.transaction.Apply(context.Background(), fixture.request)
+	if result.Outcome != SourceAgentUpdateOutcomeRolledBack {
+		t.Fatalf("result=%#v", result)
+	}
+	fixture.receipts.mu.Lock()
+	journal, found := fixture.receipts.journal, fixture.receipts.journalFound
+	fixture.receipts.mu.Unlock()
+	if !found || journal.Stage != "rollback_restored" {
+		t.Fatalf("restart failure did not retain recoverable journal: %#v found=%t", journal, found)
+	}
 }
 
 type fakeSourceAgentUpdateReceipts struct {

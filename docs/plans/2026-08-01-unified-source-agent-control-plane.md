@@ -1199,6 +1199,19 @@ Use separate commits in this order:
 6. build revision injection, `build-info`, packaging/process-boundary smokes,
    and generated system map.
 
+Delivery checkpoint on 2026-08-02: commits 1 and 2 are complete and reviewed.
+Commit 3 now implements the durable `restart_requested` boundary, publishes
+ready only after an authenticated heartbeat from the compiled runtime
+identity, and restores an exact owned upgrade command from a protected local
+checkpoint before ordinary claim or source lease. A recovered terminal is
+persisted only as a neutral observation: it cannot authorize cleanup. Commit 4
+must bind that observation to local journal/outcome evidence and durably choose
+acknowledgement/cleanup or rollback as required by the phase tables above. Its
+commit-level specification and code-quality re-reviews are approved; the
+overall Task 10A Gates remain pending because commits 4 through 6 are not yet
+complete. Both production Worker constructors therefore remain fail-closed.
+Intermediate commits are not deployment candidates.
+
 Do not leave a hybrid commit in which the UI or real Worker claims upgrade
 support while the independent helper, guard, resume, or ready path is absent.
 Until the final wiring commit, the production constructors remain fail-closed.

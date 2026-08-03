@@ -7,12 +7,198 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestSourceAgentUpdateReceiptStorePublishesReadyFromCompiledIdentity(t *testing.T) {
+	newStore := func(t *testing.T) (*FileSourceAgentUpdateReceiptStore, SourceAgentReadyReceipt) {
+		t.Helper()
+		root := t.TempDir()
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		store, err := NewFileSourceAgentUpdateReceiptStore(root, time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		receipt := sourceAgentUpdateTestReadyReceipt()
+		seedSourceAgentReadyJournal(t, store, receipt)
+		journal, found, err := store.loadJournal()
+		if err != nil || !found {
+			t.Fatalf("load journal found=%t err=%v", found, err)
+		}
+		journal.Stage = "restart_requested"
+		if err := store.saveJournal(journal); err != nil {
+			t.Fatal(err)
+		}
+		return store, receipt
+	}
+	identityFor := func(receipt SourceAgentReadyReceipt) SourceAgentRuntimeIdentity {
+		return SourceAgentRuntimeIdentity{
+			WorkerType: receipt.WorkerType, Version: receipt.Version, Platform: receipt.Platform,
+			Architecture: receipt.Architecture, ProtocolVersion: receipt.ProtocolVersion, Revision: receipt.Revision,
+		}
+	}
+
+	store, receipt := newStore(t)
+	published, err := store.PublishAuthenticatedReady(context.Background(), identityFor(receipt))
+	if err != nil || !published {
+		t.Fatalf("PublishAuthenticatedReady() = %t, %v", published, err)
+	}
+	expected := SourceAgentReadyExpectation{
+		CommandID: receipt.CommandID, AttemptNonce: receipt.AttemptNonce, WorkerType: receipt.WorkerType,
+		Version: receipt.Version, Platform: receipt.Platform, Architecture: receipt.Architecture,
+		ProtocolVersion: receipt.ProtocolVersion, Revision: receipt.Revision,
+	}
+	if err := store.WaitReady(context.Background(), expected, 20*time.Millisecond); err != nil {
+		t.Fatalf("published ready receipt: %v", err)
+	}
+	if replayed, err := store.PublishAuthenticatedReady(context.Background(), identityFor(receipt)); err != nil || !replayed {
+		t.Fatalf("ready replay = %t, %v", replayed, err)
+	}
+
+	mismatchStore, mismatchReceipt := newStore(t)
+	mismatch := identityFor(mismatchReceipt)
+	mismatch.Revision = strings.Repeat("d", 40)
+	if published, err := mismatchStore.PublishAuthenticatedReady(context.Background(), mismatch); published ||
+		!errors.Is(err, ErrSourceAgentReadyMismatch) {
+		t.Fatalf("mismatched compiled identity = %t, %v", published, err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if published, err := mismatchStore.PublishAuthenticatedReady(canceled, identityFor(mismatchReceipt)); published ||
+		!errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled publish = %t, %v", published, err)
+	}
+}
+
+func TestSourceAgentUpdateReceiptStorePersistsProtectedUpgradeCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewFileSourceAgentUpdateReceiptStore(root, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	command := sourceAgentUpdateTestCheckpointCommand()
+	if err := store.SaveUpgradeCommandCheckpoint(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	loaded, found, err := store.LoadUpgradeCommandCheckpoint()
+	if err != nil || !found || !reflect.DeepEqual(loaded.Command, command) ||
+		loaded.Fingerprint != sourceAgentUpgradeCommandFingerprint(command) {
+		t.Fatalf("checkpoint=%#v found=%t err=%v", loaded, found, err)
+	}
+	info, err := os.Lstat(filepath.Join(root, sourceAgentUpgradeCheckpointFileName))
+	if err != nil || info.Mode().Perm() != 0o600 || !info.Mode().IsRegular() {
+		t.Fatalf("checkpoint mode=%v err=%v", info, err)
+	}
+
+	advanced := command
+	advanced.State = SourceAgentCommandInstalling
+	advanced.UpdatedAt = "2026-08-01T12:00:02.000000000Z"
+	if err := store.SaveUpgradeCommandCheckpoint(context.Background(), advanced); err != nil {
+		t.Fatalf("advance checkpoint: %v", err)
+	}
+	loaded, found, err = store.LoadUpgradeCommandCheckpoint()
+	if err != nil || !found || loaded.Command.State != SourceAgentCommandInstalling {
+		t.Fatalf("advanced checkpoint=%#v found=%t err=%v", loaded, found, err)
+	}
+
+	conflict := advanced
+	conflict.UpgradeSpec = &SourceAgentUpgradeSpec{ArtifactID: "artifact-other", ExpectedCurrentVersion: "1.0.0"}
+	if err := store.SaveUpgradeCommandCheckpoint(context.Background(), conflict); !errors.Is(err, ErrSourceAgentUpgradeCheckpointConflict) {
+		t.Fatalf("conflicting checkpoint error=%v", err)
+	}
+	if err := store.ClearUpgradeCommandCheckpoint(context.Background(), command.ID, strings.Repeat("f", 64)); !errors.Is(err, ErrSourceAgentUpgradeCheckpointConflict) {
+		t.Fatalf("wrong fingerprint clear error=%v", err)
+	}
+	if err := store.ClearUpgradeCommandCheckpoint(context.Background(), command.ID, loaded.Fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.LoadUpgradeCommandCheckpoint(); err != nil || found {
+		t.Fatalf("checkpoint remained found=%t err=%v", found, err)
+	}
+}
+
+func TestSourceAgentUpdateReceiptStoreRecordsStrictTerminalObservation(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewFileSourceAgentUpdateReceiptStore(root, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	active := sourceAgentUpdateTestCheckpointCommand()
+	if err := store.SaveUpgradeCommandCheckpoint(context.Background(), active); err != nil {
+		t.Fatal(err)
+	}
+	terminal := active
+	terminal.State = SourceAgentCommandSucceeded
+	terminal.ResultCode = SourceAgentCommandCodeUpgradeComplete
+	terminal.ActualVersion = "2.0.0"
+	terminal.UpdatedAt = "2026-08-01T12:00:03.000000000Z"
+	terminal.CompletedAt = terminal.UpdatedAt
+	if err := store.RecordServerTerminalObservation(context.Background(), terminal); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordServerTerminalObservation(context.Background(), terminal); err != nil {
+		t.Fatalf("terminal observation replay: %v", err)
+	}
+	payload, err := store.directory.read(sourceAgentUpgradeTerminalObservationFileName, sourceAgentUpdateReceiptMaxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observation SourceAgentUpgradeTerminalObservation
+	if decodeStrictSourceAgentUpdateJSON(payload, &observation) != nil ||
+		observation.CommandID != terminal.ID || observation.State != SourceAgentCommandSucceeded ||
+		observation.Fingerprint != sourceAgentUpgradeCommandFingerprint(terminal) {
+		t.Fatalf("terminal observation=%#v payload=%s", observation, payload)
+	}
+	for _, forbidden := range []string{"token", "cookie", "/Users/", "script", "environment"} {
+		if strings.Contains(strings.ToLower(string(payload)), strings.ToLower(forbidden)) {
+			t.Fatalf("terminal observation leaked %q: %s", forbidden, payload)
+		}
+	}
+	conflict := terminal
+	conflict.UpgradeSpec = &SourceAgentUpgradeSpec{ArtifactID: "artifact-other", ExpectedCurrentVersion: "1.0.0"}
+	if err := store.RecordServerTerminalObservation(context.Background(), conflict); !errors.Is(err, ErrSourceAgentUpgradeCheckpointConflict) {
+		t.Fatalf("conflicting terminal observation error=%v", err)
+	}
+	if _, found, err := store.LoadUpgradeCommandCheckpoint(); err != nil || !found {
+		t.Fatalf("terminal acknowledgement cleared checkpoint found=%t err=%v", found, err)
+	}
+	invalidObservation := SourceAgentUpgradeTerminalObservation{
+		SchemaVersion: sourceAgentUpgradeTerminalObservationSchema, CommandID: terminal.ID,
+		Fingerprint: sourceAgentUpgradeCommandFingerprint(terminal), State: SourceAgentCommandSucceeded,
+		ResultCode: SourceAgentCommandCodeCanceled, ActualVersion: terminal.ActualVersion,
+	}
+	if validSourceAgentUpgradeTerminalObservation(invalidObservation) {
+		t.Fatal("terminal observation accepted a result code from another state")
+	}
+}
+
+func sourceAgentUpdateTestCheckpointCommand() SourceAgentCommand {
+	return SourceAgentCommand{
+		ID: "command-checkpoint", TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade,
+		UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "artifact-2", ExpectedCurrentVersion: "1.0.0"},
+		State:       SourceAgentCommandClaimed, IdempotencyKey: "upgrade-checkpoint",
+		ExpectedCurrentVersion: "1.0.0", ClaimOwner: "agent-a",
+		CreatedAt: "2026-08-01T12:00:00.000000000Z", UpdatedAt: "2026-08-01T12:00:01.000000000Z",
+		ClaimedAt: "2026-08-01T12:00:01.000000000Z", ExpiresAt: "2026-08-01T13:00:00.000000000Z",
+	}
+}
 
 func TestSourceAgentUpdateReceiptStorePinsRootDirectory(t *testing.T) {
 	parent := t.TempDir()
@@ -163,6 +349,16 @@ func TestSourceAgentUpdateReceiptStoreRequiresProtectedRealDirectory(t *testing.
 	if _, err := NewFileSourceAgentUpdateReceiptStore(unsafe, time.Millisecond); err == nil {
 		t.Fatal("group/world accessible receipt root should fail")
 	}
+	special := filepath.Join(parent, "special")
+	if err := os.Mkdir(special, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(special, os.ModeSticky|0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFileSourceAgentUpdateReceiptStore(special, time.Millisecond); err == nil {
+		t.Fatal("receipt root with special permission bits should fail")
+	}
 	realRoot := filepath.Join(parent, "real")
 	if err := os.Mkdir(realRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -173,6 +369,28 @@ func TestSourceAgentUpdateReceiptStoreRequiresProtectedRealDirectory(t *testing.
 	}
 	if _, err := NewFileSourceAgentUpdateReceiptStore(linked, time.Millisecond); err == nil {
 		t.Fatal("symlink receipt root should fail")
+	}
+}
+
+func TestSourceAgentUpgradeCheckpointRejectsSpecialPermissionBits(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewFileSourceAgentUpdateReceiptStore(root, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if err := store.SaveUpgradeCommandCheckpoint(context.Background(), sourceAgentUpdateTestCheckpointCommand()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, sourceAgentUpgradeCheckpointFileName)
+	if err := unix.Chmod(path, 0o1600); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.LoadUpgradeCommandCheckpoint(); err == nil || !found {
+		t.Fatalf("special-bit checkpoint found=%t err=%v", found, err)
 	}
 }
 
@@ -245,7 +463,7 @@ func TestSourceAgentUpdateExecutableFIFOIsRejectedWithoutBlocking(t *testing.T) 
 	}
 }
 
-func TestSourceAgentUpdateRealPublishedOutcomeMustBeFsyncConfirmedBeforeCleanup(t *testing.T) {
+func TestSourceAgentUpdateRealPublishedOutcomeRetainsRecoveryMaterialAfterFsync(t *testing.T) {
 	fixture := newDurableSourceAgentUpdateFixture(t, "")
 	backup := filepath.Join(filepath.Dir(fixture.executable), sourceAgentUpdateBackupName())
 	identity, err := fixture.transaction.fs.BackupExecutable(fixture.executable, backup)
@@ -283,10 +501,10 @@ func TestSourceAgentUpdateRealPublishedOutcomeMustBeFsyncConfirmedBeforeCleanup(
 	if durable != terminal {
 		t.Fatalf("durable=%#v", durable)
 	}
-	if _, err := os.Stat(backup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup remains after durable confirmation: %v", err)
+	if _, err := os.Stat(backup); err != nil {
+		t.Fatalf("backup was removed before terminal acknowledgement: %v", err)
 	}
-	if _, found, err := fixture.store.loadJournal(); err != nil || found {
+	if _, found, err := fixture.store.loadJournal(); err != nil || !found {
 		t.Fatalf("journal found=%v err=%v", found, err)
 	}
 }

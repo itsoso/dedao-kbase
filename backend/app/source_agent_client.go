@@ -251,6 +251,123 @@ func (c *SourceAgentClient) ClaimCommand(ctx context.Context) (*SourceAgentComma
 	return command, nil
 }
 
+func (c *SourceAgentClient) ResumeUpgradeCommand(ctx context.Context, commandID string) (*SourceAgentCommand, error) {
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", commandID, true)
+	if err != nil {
+		return nil, err
+	}
+	command, err := c.recoverUpgradeCommand(ctx, commandID)
+	if err != nil {
+		return nil, err
+	}
+	if command == nil || command.ID != commandID || !validSourceAgentUpgradeRecoveryResponse(*command, c.agentID, true) {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	return command, nil
+}
+
+func (c *SourceAgentClient) RecoverOwnedUpgrade(ctx context.Context) (*SourceAgentCommand, error) {
+	command, err := c.recoverUpgradeCommand(ctx, "")
+	if err != nil || command == nil {
+		return command, err
+	}
+	if !validSourceAgentUpgradeRecoveryResponse(*command, c.agentID, false) {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	return command, nil
+}
+
+func (c *SourceAgentClient) recoverUpgradeCommand(ctx context.Context, commandID string) (*SourceAgentCommand, error) {
+	payload := struct {
+		AgentID   string `json:"agent_id"`
+		CommandID string `json:"command_id,omitempty"`
+	}{AgentID: c.agentID, CommandID: commandID}
+	var responsePayload json.RawMessage
+	if err := c.doJSON(ctx, http.MethodPost, "/api/source-agent/commands/recover", payload, &responsePayload); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	var response struct {
+		Command json.RawMessage `json:"command"`
+	}
+	if decodeStrictSourceAgentUpdateJSON(responsePayload, &response) != nil {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	trimmed := bytes.TrimSpace(response.Command)
+	if bytes.Equal(trimmed, []byte("null")) {
+		if commandID == "" {
+			return nil, nil
+		}
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	var command SourceAgentCommand
+	if len(trimmed) == 0 || decodeStrictSourceAgentUpdateJSON(trimmed, &command) != nil {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	return &command, nil
+}
+
+func validSourceAgentUpgradeRecoveryResponse(command SourceAgentCommand, agentID string, allowTerminal bool) bool {
+	commandID, err := normalizeSourceAgentCommandIdentifier("command_id", command.ID, true)
+	owner, ownerErr := normalizeSourceAgentCommandIdentifier("claim_owner", command.ClaimOwner, true)
+	if err != nil || commandID != command.ID || ownerErr != nil || owner != command.ClaimOwner || owner != agentID ||
+		!validSourceAgentCommandResponseDomain(command, agentID) || command.Type != SourceAgentCommandUpgrade ||
+		!validSourceAgentUpgradeHandoff(command) {
+		return false
+	}
+	idempotency, err := normalizeSourceAgentCommandIdentifier("idempotency_key", command.IdempotencyKey, true)
+	if err != nil || idempotency != command.IdempotencyKey {
+		return false
+	}
+	for _, value := range []string{command.CreatedAt, command.UpdatedAt, command.ClaimedAt, command.ExpiresAt} {
+		parsed, err := time.Parse(sourceAgentCommandTimestampLayout, value)
+		if err != nil || formatSourceAgentCommandTime(parsed) != value {
+			return false
+		}
+	}
+	if command.CompletedAt != "" {
+		parsed, err := time.Parse(sourceAgentCommandTimestampLayout, command.CompletedAt)
+		if err != nil || formatSourceAgentCommandTime(parsed) != command.CompletedAt {
+			return false
+		}
+	}
+	message, err := normalizeSourceAgentCommandMessage(command.Message)
+	if err != nil || message != command.Message {
+		return false
+	}
+	if command.ActualVersion != "" {
+		actualVersion, err := normalizeSourceAgentVersion("actual_version", command.ActualVersion)
+		if err != nil || actualVersion != command.ActualVersion {
+			return false
+		}
+	}
+	switch command.State {
+	case SourceAgentCommandClaimed, SourceAgentCommandDownloading, SourceAgentCommandVerified,
+		SourceAgentCommandInstalling, SourceAgentCommandRestarting, SourceAgentCommandVerifying,
+		SourceAgentCommandRollback:
+		return command.ResultCode == "" && command.ActualVersion == "" && command.CompletedAt == ""
+	case SourceAgentCommandSucceeded, SourceAgentCommandFailed, SourceAgentCommandCanceled,
+		SourceAgentCommandExpired, SourceAgentCommandRolledBack:
+		if !allowTerminal || command.CompletedAt == "" {
+			return false
+		}
+		if command.State == SourceAgentCommandCanceled {
+			return command.ResultCode == SourceAgentCommandCodeCanceled && command.ActualVersion == ""
+		}
+		if command.State == SourceAgentCommandExpired {
+			return command.ResultCode == SourceAgentCommandCodeExpired && command.ActualVersion == ""
+		}
+		return validateSourceAgentCommandTerminalResult(command.Type, SourceAgentCommandTransition{
+			State: command.State, ResultCode: command.ResultCode, Message: command.Message,
+			ActualVersion: command.ActualVersion,
+		}) == nil
+	default:
+		return false
+	}
+}
+
 func (c *SourceAgentClient) ReportCommand(
 	ctx context.Context,
 	commandID, state, code, message, actualVersion string,

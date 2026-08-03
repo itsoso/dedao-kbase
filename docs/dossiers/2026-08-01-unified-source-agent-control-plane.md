@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Delivery in progress; Task 10A updater recovery amendment under review
+**Status:** Delivery in progress; Task 10A commit 3 reviewed, commit 4 next
 
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
@@ -97,6 +97,83 @@ or per-agent authentication claims.
   evidence, not independent publisher identity, so upgrades may never be
   silent, scheduled, or broadcast.
 
+## 2026-08-02 Task 10A Commit 3 Checkpoint
+
+The third reviewable Task 10A slice is implemented locally. The update
+transaction durably arms `restart_requested` before restarting a Worker, and a
+new Worker can publish ready only after its authenticated heartbeat using its
+compiled runtime identity. The server exposes a strict Worker-authenticated
+recovery contract for either the exact protected command ID or the single
+active upgrade already owned by that Worker. The Runner performs this recovery
+before ordinary claim or source lease, durably checkpoints the immutable
+command fingerprint before any report or upgrade side effect, and reconciles a
+terminal command by first clearing any stale in-memory execution state and
+then writing a strict, neutral local terminal observation without re-executing
+it. That observation is not a cleanup acknowledgement and carries no cleanup
+or rollback action.
+
+All local terminal outcomes, including failures before binary replacement,
+now retain the backup, partial stage, and recovery journal. In commit 4 the
+independent updater must bind the neutral server observation to local
+journal/outcome evidence and durably choose either acknowledgement/cleanup or
+rollback; the observation by itself can never authorize cleanup. Different
+commands remain blocked while retained recovery material exists. Production
+WeChat and WC Plus constructors still use their fail-closed updater
+implementations. This intermediate branch is not deployable until protected
+state, recovery, and phase mapping are wired into both constructors in commit
+4; this slice does not claim production upgrade availability and does not add
+a signing mechanism.
+
+The first commit-level review rejected the candidate because a recovered terminal could
+leave a stale in-memory command executable, pre-replacement durable failures
+could clean recovery material before server reconciliation, cancellation was
+returned through a transport wrapper, and the terminal record was named like
+a cleanup acknowledgement. Remediation now clears matching in-memory command
+and pending state before recording the terminal, preserves exact `ctx.Err()`,
+retains every durable terminal attempt, and names the persisted record as a
+neutral observation. Fresh independent specification and code-quality
+re-reviews approved the remediated slice with no blocking findings.
+
+Provisional G3 evidence for this slice:
+
+```text
+go test ./backend/app -run 'TestSourceAgent(CommandRecovery|ClientRecoversOwnedUpgrade|WorkerCommandRecovery|Runner.*Upgrade|RunnerDoesNotPublishReady|Update)' -count=1
+PASS
+
+go test ./backend/app -count=1
+PASS
+
+go test ./... -count=1
+PASS
+
+go test -race ./backend/app -count=1
+PASS
+
+go test -race ./backend/app -run 'TestSourceAgent(CommandRecovery|ClientRecovery|ClientRecoversOwnedUpgrade|WorkerCommandRecovery|Runner.*Upgrade|RunnerDoesNotPublishReady|Update)' -count=1
+PASS after review remediation
+
+go vet ./...
+PASS
+
+bash scripts/source-agent-artifact-smoke.sh
+bash scripts/source-agent-packaging-smoke.sh
+bash scripts/wcplus-agent-packaging-smoke.sh
+PASS
+
+bash scripts/system-map-smoke.sh
+PASS
+
+git diff --check
+PASS
+```
+
+The recovery route change is reflected in the generated system map. Commit 3
+passed its commit-level specification and code-quality re-reviews. Overall G4
+remains pending until Task 10A commits 4 through 6 pass their required reviews.
+The updater LaunchAgent smoke is not yet available because independent job
+wiring belongs to commit 4; it is a remaining Task 10A Gate, not evidence for
+this slice.
+
 ## Gate Decisions
 
 ### G1 - Admission
@@ -138,13 +215,19 @@ completed production support.
 
 **Decision: PENDING**
 
-Delivery and test evidence have not started.
+Tasks 1 through 10 passed their earlier task-level checks. Task 10A commit 3
+has the provisional focused and full backend evidence recorded above, but the
+Task 10A release Gate remains pending until commits 4 through 6 and the full
+security, recovery, packaging, and race matrix pass.
 
 ### G4 - Review
 
 **Decision: PENDING**
 
-Implementation review has not started.
+Task 10A commit 3 passed fresh independent specification and code-quality
+re-review after its rejected findings were remediated. Overall G4 remains
+pending for commits 4 through 6. No Task 11 work may start while those Task 10A
+slices remain incomplete.
 
 ### G5 - Deployment Health
 

@@ -3531,6 +3531,8 @@ func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Requ
 	switch r.URL.Path {
 	case "/api/source-agent/commands/claim":
 		h.handleSourceAgentCommandClaim(w, r)
+	case "/api/source-agent/commands/recover":
+		h.handleSourceAgentCommandRecovery(w, r)
 	case "/api/source-agent/heartbeat":
 		var payload SourceAgentHeartbeat
 		if !h.decodeSourceAgentJSON(w, r, &payload) {
@@ -3579,6 +3581,33 @@ func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Requ
 		}
 		h.handleSourceAgentRun(w, r)
 	}
+}
+
+func (h *kbaseHTTPHandler) handleSourceAgentCommandRecovery(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		AgentID   string `json:"agent_id"`
+		CommandID string `json:"command_id,omitempty"`
+	}
+	if !decodeStrictLimitedHTTPJSON(w, r, h.sourceAgentMaxBodyBytes, &payload) {
+		return
+	}
+	var command *SourceAgentCommand
+	if strings.TrimSpace(payload.CommandID) == "" {
+		recovered, err := h.sourceSync.RecoverOwnedSourceAgentUpgrade(payload.AgentID, payload.AgentID)
+		if err != nil {
+			h.writeSourceAgentCommandWorkerError(w, err)
+			return
+		}
+		command = recovered
+	} else {
+		resumed, err := h.sourceSync.ResumeOwnedSourceAgentUpgrade(payload.CommandID, payload.AgentID, payload.AgentID)
+		if err != nil {
+			h.writeSourceAgentCommandWorkerError(w, err)
+			return
+		}
+		command = &resumed
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"command": command})
 }
 
 func (h *kbaseHTTPHandler) handleSourceAgentCommandClaim(w http.ResponseWriter, r *http.Request) {
@@ -3942,7 +3971,8 @@ func (h *kbaseHTTPHandler) writeSourceAgentCommandWorkerError(w http.ResponseWri
 		writeHTTPError(w, http.StatusForbidden, "source agent command is not available to this worker")
 	case errors.Is(err, ErrSourceAgentCommandInvalidState),
 		errors.Is(err, ErrSourceAgentCommandResultConflict),
-		errors.Is(err, ErrSourceAgentCommandExpired):
+		errors.Is(err, ErrSourceAgentCommandExpired),
+		errors.Is(err, ErrSourceAgentCommandRecoveryAmbiguous):
 		writeHTTPError(w, http.StatusConflict, "source agent command conflict")
 	case errors.Is(err, ErrSourceAgentCommandType):
 		writeHTTPError(w, http.StatusBadRequest, "invalid source agent command")
