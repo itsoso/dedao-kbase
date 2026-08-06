@@ -20,6 +20,11 @@ type SourceAgentProtectedUpgradeState interface {
 	LoadUpgradeCommandCheckpoint() (SourceAgentUpgradeCommandCheckpoint, bool, error)
 	SaveUpgradeCommandCheckpoint(context.Context, SourceAgentCommand) error
 	RecordServerTerminalObservation(context.Context, SourceAgentCommand) error
+	RecordAuthenticatedUpgradeConflict(context.Context, string, string) error
+}
+
+type SourceAgentLifecycleState interface {
+	WithSourceAgentLifecycle(context.Context, func() error) error
 }
 
 type SourceAgentDiagnoser interface {
@@ -41,6 +46,7 @@ type SourceAgentUpgradeResult struct {
 	Code          string `json:"code"`
 	Message       string `json:"message,omitempty"`
 	ActualVersion string `json:"actual_version,omitempty"`
+	Waiting       bool   `json:"-"`
 }
 
 type sourceAgentPendingCommandReport struct {
@@ -109,11 +115,19 @@ func sourceAgentUpgradeUnavailableReport(commandState string) sourceAgentPending
 	}
 }
 
-func sourceAgentUpgradeReportForState(command SourceAgentCommand, updater SourceAgentUpdater, ctx context.Context) sourceAgentPendingCommandReport {
+func sourceAgentUpgradeReportForState(
+	command SourceAgentCommand,
+	updater SourceAgentUpdater,
+	ctx context.Context,
+) (sourceAgentPendingCommandReport, bool) {
 	if updater == nil {
-		return sourceAgentUpgradeUnavailableReport(command.State)
+		return sourceAgentUpgradeUnavailableReport(command.State), false
 	}
-	return sourceAgentUpgradeCommandReport(command, updater.Upgrade(ctx, command))
+	result := updater.Upgrade(ctx, command)
+	if result.Waiting {
+		return sourceAgentPendingCommandReport{}, true
+	}
+	return sourceAgentUpgradeCommandReport(command, result), false
 }
 
 func sourceAgentUpgradeResultMessage(code string) string {
@@ -156,11 +170,13 @@ func (r *SourceAgentRunner) executeUpgradeCommand(ctx context.Context, command S
 	switch command.State {
 	case SourceAgentCommandClaimed:
 		report = sourceAgentPendingCommandReport{state: SourceAgentCommandDownloading}
-	case SourceAgentCommandDownloading, SourceAgentCommandInstalling,
+	case SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling,
 		SourceAgentCommandRestarting, SourceAgentCommandVerifying, SourceAgentCommandRollback:
-		report = sourceAgentUpgradeReportForState(command, r.updater, ctx)
-	case SourceAgentCommandVerified:
-		report = sourceAgentPendingCommandReport{state: SourceAgentCommandInstalling}
+		var waiting bool
+		report, waiting = sourceAgentUpgradeReportForState(command, r.updater, ctx)
+		if waiting {
+			return nil
+		}
 	default:
 		return fmt.Errorf("upgrade command state is not executable")
 	}
@@ -236,8 +252,14 @@ func (r *SourceAgentRunner) reportPendingCommand(ctx context.Context) error {
 		return fmt.Errorf("report source-agent command: %w", err)
 	}
 	if r.upgradeState != nil && command.Type == SourceAgentCommandUpgrade {
-		if sourceAgentUpgradeCommandFingerprint(updated) != sourceAgentUpgradeCommandFingerprint(command) ||
-			!validSourceAgentUpgradeRecoveryResponse(updated, command.TargetAgentID, true) {
+		if !validSourceAgentUpgradeRecoveryResponse(updated, command.TargetAgentID, true) {
+			return ErrSourceAgentUpgradeCheckpointConflict
+		}
+		localFingerprint := sourceAgentUpgradeCommandFingerprint(command)
+		if sourceAgentUpgradeCommandFingerprint(updated) != localFingerprint {
+			if err := r.upgradeState.RecordAuthenticatedUpgradeConflict(ctx, command.ID, localFingerprint); err != nil {
+				return fmt.Errorf("record source-agent upgrade conflict: %w", err)
+			}
 			return ErrSourceAgentUpgradeCheckpointConflict
 		}
 		if isTerminalSourceAgentCommandState(updated.State) {

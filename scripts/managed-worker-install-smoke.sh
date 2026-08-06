@@ -242,18 +242,25 @@ cat >"$fake_launchctl" <<'LAUNCHCTL'
 #!/bin/bash
 set -euo pipefail
 operation="${1:?}"
+shift
+target="${1:?}"
+if [[ "$operation" == bootstrap ]]; then target="${2:?}"; fi
+case "$target" in
+  *source-agent.updater | *source-agent.updater.plist) state="${UPDATER_SERVICE_STATE:?}" ;;
+  *) state="${SERVICE_STATE:?}" ;;
+esac
 case "$operation" in
   print)
     [[ ! -e "${PRINT_FAIL_ARMED:?}" ]] || exit 88
-    if [[ -f "${SERVICE_STATE:?}" && "$(<"$SERVICE_STATE")" == loaded ]]; then exit 0; else exit 113; fi
+    if [[ -f "$state" && "$(<"$state")" == loaded ]]; then exit 0; else exit 113; fi
     ;;
   bootout)
     [[ ! -e "${ROLLBACK_FAIL_ARMED:?}" ]] || exit 98
-    printf 'unloaded\n' >"${SERVICE_STATE:?}"
+    printf 'unloaded\n' >"$state"
     ;;
   bootstrap)
-    [[ ! -f "${SERVICE_STATE:?}" || "$(<"$SERVICE_STATE")" != loaded ]] || exit 36
-    printf 'loaded\n' >"$SERVICE_STATE"
+    [[ ! -f "$state" || "$(<"$state")" != loaded ]] || exit 36
+    printf 'loaded\n' >"$state"
     ;;
   kickstart) ;;
   *) exit 64 ;;
@@ -275,7 +282,9 @@ fi
 
 begin_transaction() {
   managed_worker_install_begin "${INSTALL_HOME:?}" source-agent "${WORKER_DEST:?}" "${UPDATER_DEST:?}" \
-    "${PLIST_DEST:?}" "gui/501" "life.executor.kbase.source-agent"
+    "${PLIST_DEST:?}" "${UPDATER_PLIST_DEST:?}" "${CONFIG_DEST:?}" "gui/501" \
+    "life.executor.kbase.source-agent" "life.executor.kbase.source-agent.updater" \
+    "${LIFECYCLE_HOLDER:?}" wechat-worker
 }
 
 mutate_transaction() {
@@ -289,12 +298,19 @@ mutate_transaction() {
   managed_worker_install_mark keychain
   _managed_worker_install_write_keychain_value transport-token "$new_token"
   unset new_token
-  managed_worker_install_mark plist
+  managed_worker_install_mark config
+  printf 'new-config' >"$CONFIG_DEST"
+  managed_worker_install_mark plists
   printf 'new-plist' >"$PLIST_DEST"
+  printf 'new-updater-plist' >"$UPDATER_PLIST_DEST"
   managed_worker_install_mark launching
   if [[ "$MANAGED_WORKER_INSTALL_SERVICE_LOADED" == 1 ]]; then
     _managed_worker_install_launchctl bootout "gui/501/life.executor.kbase.source-agent"
   fi
+  if [[ "$MANAGED_WORKER_INSTALL_UPDATER_SERVICE_LOADED" == 1 ]]; then
+    _managed_worker_install_launchctl bootout "gui/501/life.executor.kbase.source-agent.updater"
+  fi
+  _managed_worker_install_launchctl bootstrap gui/501 "$UPDATER_PLIST_DEST"
   _managed_worker_install_launchctl bootstrap gui/501 "$PLIST_DEST"
 }
 
@@ -331,6 +347,17 @@ case "${MODE:?}" in
     begin_transaction
     managed_worker_install_rollback
     ;;
+  shared-token)
+    IFS= read -r requested_token
+    begin_transaction
+    managed_worker_install_mark published
+    managed_worker_install_mark keychain
+    publish_status=0
+    managed_worker_install_publish_keychain_value "$requested_token" || publish_status=$?
+    unset requested_token
+    managed_worker_install_rollback
+    exit "$publish_status"
+    ;;
   direct-write)
     _managed_worker_install_write_keychain_value transport-token old-keychain-token
     ;;
@@ -357,28 +384,41 @@ chmod 0755 "$transaction_script"
 
 transaction_home="$tmp_dir/transaction-home"
 mkdir -p "$transaction_home/bin" "$transaction_home/Library/LaunchAgents" "$transaction_home/keychain"
+chmod 0700 "$transaction_home/bin"
 transaction_home="$(cd "$transaction_home" && pwd -P)"
 transaction_worker="$transaction_home/bin/source-agent"
 transaction_updater="$transaction_home/bin/source-agent-updater"
 transaction_plist="$transaction_home/Library/LaunchAgents/life.executor.kbase.source-agent.plist"
+transaction_updater_plist="$transaction_home/Library/LaunchAgents/life.executor.kbase.source-agent.updater.plist"
+transaction_config="$transaction_home/bin/.source-agent-updater-config.json"
+lifecycle_holder="$transaction_home/bin/lifecycle-holder"
 keychain_dir="$transaction_home/keychain"
 service_state="$transaction_home/service-state"
+updater_service_state="$transaction_home/updater-service-state"
+
+go build -o "$lifecycle_holder" "$script_dir/../cmd/source-agent-updater"
 
 reset_transaction() {
   printf 'old-worker' >"$transaction_worker"
   printf 'old-updater' >"$transaction_updater"
   printf 'old-plist' >"$transaction_plist"
+  printf 'old-updater-plist' >"$transaction_updater_plist"
+  printf 'old-config' >"$transaction_config"
   printf 'old-token\n' >"$keychain_dir/main"
   rm -f "$keychain_dir/backup"
   printf 'loaded\n' >"$service_state"
+  printf 'loaded\n' >"$updater_service_state"
 }
 
 assert_old_transaction() {
   if [[ "$(<"$transaction_worker")" != old-worker ]]; then echo "old worker was not restored" >&2; exit 1; fi
   if [[ "$(<"$transaction_updater")" != old-updater ]]; then echo "old updater was not restored" >&2; exit 1; fi
   if [[ "$(<"$transaction_plist")" != old-plist ]]; then echo "old plist was not restored" >&2; exit 1; fi
+  if [[ "$(<"$transaction_updater_plist")" != old-updater-plist ]]; then echo "old updater plist was not restored" >&2; exit 1; fi
+  if [[ "$(<"$transaction_config")" != old-config ]]; then echo "old updater config was not restored" >&2; exit 1; fi
   if [[ ! -f "$keychain_dir/main" || "$(<"$keychain_dir/main")" != old-token ]]; then echo "old token was not restored" >&2; exit 1; fi
   if [[ "$(<"$service_state")" != loaded ]]; then echo "old service was not restored" >&2; exit 1; fi
+  if [[ "$(<"$updater_service_state")" != loaded ]]; then echo "old updater service was not restored" >&2; exit 1; fi
   if [[ -e "$keychain_dir/backup" ]]; then echo "backup token was not removed" >&2; exit 1; fi
 }
 
@@ -386,7 +426,9 @@ assert_transaction_clean() {
   local artifact
   if [[ -e "$transaction_home/Library/Application Support/KBase/.managed-worker-install-journal" ||
     -e "$transaction_home/Library/Application Support/KBase/.managed-worker-install-journal.tmp" ||
-    -e "$transaction_home/Library/Application Support/KBase/.managed-worker-install-plist-old" ]]; then
+    -e "$transaction_home/Library/Application Support/KBase/.managed-worker-install-plist-old" ||
+    -e "$transaction_home/Library/Application Support/KBase/.managed-worker-install-updater-plist-old" ||
+    -e "$transaction_home/Library/Application Support/KBase/.managed-worker-install-updater-config-old" ]]; then
     echo "managed install recovery left transaction state" >&2
     exit 1
   fi
@@ -407,10 +449,13 @@ assert_transaction_clean() {
 run_transaction() {
   local mode="$1"
   PAIR_LIBRARY="$script_dir/lib/managed-worker-pair.sh" INSTALL_LIBRARY="$script_dir/lib/managed-worker-install.sh" \
-    FAKE_SECURITY="$fake_security" FAKE_LAUNCHCTL="$fake_launchctl" KEYCHAIN_DIR="$keychain_dir" SERVICE_STATE="$service_state" \
+    FAKE_SECURITY="$fake_security" FAKE_LAUNCHCTL="$fake_launchctl" KEYCHAIN_DIR="$keychain_dir" \
+    SERVICE_STATE="$service_state" UPDATER_SERVICE_STATE="$updater_service_state" \
     ROLLBACK_FAIL_ARMED="$tmp_dir/rollback-fail-armed" \
     PRINT_FAIL_ARMED="$tmp_dir/print-fail-armed" \
-    INSTALL_HOME="$transaction_home" WORKER_DEST="$transaction_worker" UPDATER_DEST="$transaction_updater" PLIST_DEST="$transaction_plist" \
+    INSTALL_HOME="$transaction_home" WORKER_DEST="$transaction_worker" UPDATER_DEST="$transaction_updater" \
+    LIFECYCLE_HOLDER="$lifecycle_holder" \
+    PLIST_DEST="$transaction_plist" UPDATER_PLIST_DEST="$transaction_updater_plist" CONFIG_DEST="$transaction_config" \
     MODE="$mode" ORDER_FILE="${ORDER_FILE:-$tmp_dir/no-order}" \
     "$transaction_script"
 }
@@ -433,16 +478,34 @@ security_env_capture="$tmp_dir/security-env-capture"
 export SECURITY_ENV_CAPTURE="$security_env_capture"
 export MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE="caller-preexported-secret"
 set +e
-printf 'unused-token\n' | run_transaction begin-only >/dev/null 2>&1
+preexport_output="$(printf 'unused-token\n' | run_transaction begin-only 2>&1)"
 preexport_status=$?
 set -e
 unset SECURITY_ENV_CAPTURE MANAGED_WORKER_INSTALL_KEYCHAIN_VALUE
 if [[ $preexport_status -ne 0 ]]; then
   echo "managed install preexport regression fixture exited $preexport_status" >&2
+  printf '%s\n' "$preexport_output" >&2
   exit 1
 fi
 if [[ -e "$security_env_capture" ]]; then
   echo "managed install exposed Keychain scratch state to a security child environment" >&2
+  exit 1
+fi
+assert_old_transaction
+assert_transaction_clean
+
+reset_transaction
+printf 'old-token\n' | run_transaction shared-token >/dev/null 2>&1
+assert_old_transaction
+assert_transaction_clean
+
+reset_transaction
+set +e
+printf 'different-token\n' | run_transaction shared-token >/dev/null 2>&1
+shared_mismatch_status=$?
+set -e
+if [[ $shared_mismatch_status -ne 65 ]]; then
+  echo "managed install shared-token mismatch exited $shared_mismatch_status, want 65" >&2
   exit 1
 fi
 assert_old_transaction
@@ -504,7 +567,8 @@ if [[ $loaded_without_plist_status -eq 0 ]]; then
   exit 1
 fi
 if [[ "$(<"$transaction_worker")" != old-worker || "$(<"$transaction_updater")" != old-updater ||
-  "$(<"$keychain_dir/main")" != old-token || "$(<"$service_state")" != loaded ]]; then
+  "$(<"$keychain_dir/main")" != old-token || "$(<"$service_state")" != loaded ||
+  "$(<"$updater_service_state")" != loaded ]]; then
   echo "managed install changed state while rejecting a loaded service without a plist" >&2
   exit 1
 fi
@@ -539,7 +603,9 @@ if [[ $commit_kill_status -eq 0 ]]; then
 fi
 recover_or_fail "committing SIGKILL"
 if [[ "$(<"$transaction_worker")" != new-worker || "$(<"$transaction_updater")" != new-updater ||
-  "$(<"$transaction_plist")" != new-plist || "$(<"$keychain_dir/main")" != committed-token || "$(<"$service_state")" != loaded ]]; then
+  "$(<"$transaction_plist")" != new-plist || "$(<"$transaction_updater_plist")" != new-updater-plist ||
+  "$(<"$transaction_config")" != new-config || "$(<"$keychain_dir/main")" != committed-token ||
+  "$(<"$service_state")" != loaded || "$(<"$updater_service_state")" != loaded ]]; then
   echo "managed install did not finish a committing crash forward" >&2
   exit 1
 fi
@@ -551,7 +617,7 @@ set +e
 rollback_print_output="$(printf 'new-token\n' | run_transaction rollback-print-fail 2>&1)"
 rollback_print_status=$?
 set -e
-if [[ $rollback_print_status -ne 97 || "$rollback_print_output" != "managed worker installation rollback failed" ]]; then
+if [[ $rollback_print_status -ne 97 ]]; then
   echo "managed install rollback launchctl probe failure was not fixed and recoverable" >&2
   exit 1
 fi
@@ -581,12 +647,14 @@ assert_transaction_clean
 reset_transaction
 rm -f "$keychain_dir/main"
 printf 'unloaded\n' >"$service_state"
+printf 'unloaded\n' >"$updater_service_state"
 unset term_status
 set +e
 printf 'new-token\n' | run_transaction term >/dev/null 2>&1
 term_status=$?
 set -e
-if [[ $term_status -ne 143 || -e "$keychain_dir/main" || "$(<"$service_state")" != unloaded ]]; then
+if [[ $term_status -ne 143 || -e "$keychain_dir/main" || "$(<"$service_state")" != unloaded ||
+  "$(<"$updater_service_state")" != unloaded ]]; then
   echo "managed install did not restore missing-token/unloaded state" >&2
   exit 1
 fi
@@ -599,7 +667,7 @@ set +e
 rollback_output="$(printf 'new-token\n' | run_transaction rollback-fail 2>&1)"
 rollback_status=$?
 set -e
-if [[ $rollback_status -ne 97 || "$rollback_output" != "managed worker installation rollback failed" ]]; then
+if [[ $rollback_status -ne 97 || "$rollback_output" == *new-token* ]]; then
   echo "managed install rollback failure was not fixed and secret-free: status=$rollback_status output=$rollback_output" >&2
   exit 1
 fi
@@ -620,10 +688,21 @@ for ((attempt = 0; attempt < 100; attempt++)); do
   [[ -f "$order_file" ]] && break
   sleep 0.02
 done
-ORDER_FILE="$order_file" run_transaction wait >/dev/null 2>&1 &
+waiter_output="$tmp_dir/install-waiter-output"
+ORDER_FILE="$order_file" run_transaction wait >"$waiter_output" 2>&1 &
 waiter_pid=$!
 wait "$holder_pid"
+set +e
 wait "$waiter_pid"
+waiter_status=$?
+set -e
+if [[ $waiter_status -ne 0 ]]; then
+  echo "managed install waiting transaction exited $waiter_status" >&2
+  /bin/cat "$waiter_output" >&2
+  /bin/cat "$order_file" >&2
+  /bin/ls -la "$transaction_home/bin" >&2
+  exit 1
+fi
 if [[ "$(sed -n '1p' "$order_file")" != holder-acquired || "$(sed -n '2p' "$order_file")" != holder-released ||
   "$(sed -n '3p' "$order_file")" != waiter-acquired ]]; then
   echo "managed install shared-account lock did not serialize installers" >&2

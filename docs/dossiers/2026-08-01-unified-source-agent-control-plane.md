@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Delivery in progress; Task 10A commit 3 reviewed, commit 4 next
+**Status:** Task 10A release candidate approved; v0.2.0 publication in progress
 
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
@@ -213,27 +213,32 @@ completed production support.
 
 ### G3 - Test
 
-**Decision: PENDING**
+**Decision: PASS**
 
-Tasks 1 through 10 passed their earlier task-level checks. Task 10A commit 3
-has the provisional focused and full backend evidence recorded above, but the
-Task 10A release Gate remains pending until commits 4 through 6 and the full
-security, recovery, packaging, and race matrix pass.
+The final Task 10A candidate passed the full Go suite and race suite, Go vet,
+module verification, frontend build and smoke checks, generated system-map
+check, privacy check, both Worker packaging checks, real-updater managed
+install/uninstall recovery checks, and the independent updater launchd crash
+check. The lifecycle protocol tests use the compiled updater with a real
+kernel lock and cover process death after durable `begin-mutation`.
 
 ### G4 - Review
 
-**Decision: PENDING**
+**Decision: PASS**
 
-Task 10A commit 3 passed fresh independent specification and code-quality
-re-review after its rejected findings were remediated. Overall G4 remains
-pending for commits 4 through 6. No Task 11 work may start while those Task 10A
-slices remain incomplete.
+Independent review rejected earlier candidates for lock ownership, stale
+marker truncation, unbounded lock acquisition, and fixture-only crash
+coverage. The final re-review confirmed that the fixed updater owns the lock
+and marker, preserves prior durable phases, uses non-blocking flock with a
+bounded installer deadline, cleans the marker before journal evidence, and is
+exercised as a real child process. No Critical or Important finding remains.
 
 ### G5 - Deployment Health
 
 **Decision: PENDING**
 
-No candidate has been deployed.
+The v0.2.0 binaries are approved for publication but have not yet been
+installed on production machines.
 
 ### G6 - Online Verification
 

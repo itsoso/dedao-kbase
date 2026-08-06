@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -15,6 +18,39 @@ import (
 	"github.com/yann0917/dedao-gui/backend/app"
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
+
+func TestSourceAgentBuildInfoIsCredentialFreeAndReportsCompiledIdentity(t *testing.T) {
+	var output bytes.Buffer
+	if err := writeSourceAgentBuildInfo(&output); err != nil {
+		t.Fatal(err)
+	}
+	var info struct {
+		WorkerType      string `json:"worker_type"`
+		Version         string `json:"version"`
+		ProtocolVersion string `json:"protocol_version"`
+		Platform        string `json:"platform"`
+		Architecture    string `json:"architecture"`
+		Revision        string `json:"revision"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.WorkerType != sourceAgentWorkerType || info.Version != sourceAgentVersion ||
+		info.ProtocolVersion != sourceAgentProtocolVersion || info.Platform != runtime.GOOS ||
+		info.Architecture != runtime.GOARCH || info.Revision != sourceAgentRevision {
+		t.Fatalf("build info=%#v", info)
+	}
+	lookupCalled := false
+	if err := runSourceAgentCLI(context.Background(), []string{"build-info"}, func(string) (string, bool) {
+		lookupCalled = true
+		return "", false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if lookupCalled {
+		t.Fatal("build-info loaded environment configuration")
+	}
+}
 
 func TestSourceAgentProtocolCLIUsesSharedControlRunner(t *testing.T) {
 	var calls []string
@@ -54,7 +90,7 @@ func TestSourceAgentProtocolCLIUsesSharedControlRunner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter)
+	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter, &sourceAgentFailClosedUpdater{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,8 +101,47 @@ func TestSourceAgentProtocolCLIUsesSharedControlRunner(t *testing.T) {
 		t.Fatalf("calls=%#v", calls)
 	}
 	if heartbeat.WorkerType != "wechat-worker" || heartbeat.Platform != runtime.GOOS || heartbeat.Architecture != runtime.GOARCH ||
-		heartbeat.Version != "0.1.0" || heartbeat.ProtocolVersion != "2026-08-01" {
+		heartbeat.Version != sourceAgentVersion || heartbeat.ProtocolVersion != "2026-08-01" {
 		t.Fatalf("heartbeat=%#v", heartbeat)
+	}
+}
+
+type sourceAgentCLIUpdaterActivator struct{}
+
+func (sourceAgentCLIUpdaterActivator) StartUpdater(context.Context) error { return nil }
+
+func TestSourceAgentCLIConstructsRealWorkerUpgradeBridge(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installRoot := filepath.Join(root, "installed")
+	if err := os.Mkdir(installRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	worker := filepath.Join(installRoot, "source-agent")
+	updater := filepath.Join(installRoot, "source-agent-updater")
+	for _, path := range []string{worker, updater} {
+		if err := os.WriteFile(path, []byte("fixture"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := app.NewSourceAgentClient(app.SourceAgentConfig{
+		RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret",
+		AgentID: "source-agent-a", StateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := newWeChatWorkerUpgradeBridge(client, worker, sourceAgentCLIUpdaterActivator{})
+	if err != nil {
+		t.Fatalf("newWeChatWorkerUpgradeBridge() error = %v", err)
+	}
+	if bridge == nil {
+		t.Fatal("real worker upgrade bridge is nil")
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

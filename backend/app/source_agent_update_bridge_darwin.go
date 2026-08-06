@@ -12,30 +12,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
 
 type darwinSourceAgentUpdateBridgeStorage struct {
-	installRoot      string
-	parentFD         int
-	pathPins         []darwinSourceAgentUpdatePathPin
-	stagingFD        int
-	handoffFD        int
-	workerName       string
-	workerIdentity   darwinSourceAgentUpdateEntryIdentity
-	updaterIdentity  darwinSourceAgentUpdateEntryIdentity
-	stagingIdentity  darwinSourceAgentUpdateEntryIdentity
-	handoffIdentity  darwinSourceAgentUpdateEntryIdentity
-	workerDevice     uint64
-	installIdentity  darwinSourceAgentUpdateEntryIdentity
-	syncFD           func(int) error
-	linkat           func(int, string, int, string, int) error
-	unlinkat         func(int, string, int) error
-	readFixedFile    func(int, string, uint16, int64, uint64, func(int)) ([]byte, bool, error)
-	afterFixedRead   func(string, int)
-	verifyStagedFile func(int, string, int64, string, uint64, func(int)) (bool, error)
-	afterStagedRead  func(string, int)
+	installRoot       string
+	parentFD          int
+	pathPins          []darwinSourceAgentUpdatePathPin
+	stagingFD         int
+	handoffFD         int
+	workerName        string
+	workerIdentity    darwinSourceAgentUpdateEntryIdentity
+	updaterIdentity   darwinSourceAgentUpdateEntryIdentity
+	stagingIdentity   darwinSourceAgentUpdateEntryIdentity
+	handoffIdentity   darwinSourceAgentUpdateEntryIdentity
+	workerDevice      uint64
+	installIdentity   darwinSourceAgentUpdateEntryIdentity
+	lifecycleIdentity darwinSourceAgentUpdateEntryIdentity
+	syncFD            func(int) error
+	linkat            func(int, string, int, string, int) error
+	unlinkat          func(int, string, int) error
+	readFixedFile     func(int, string, uint16, int64, uint64, func(int)) ([]byte, bool, error)
+	afterFixedRead    func(string, int)
+	verifyStagedFile  func(int, string, int64, string, uint64, func(int)) (bool, error)
+	afterStagedRead   func(string, int)
 }
 
 type darwinSourceAgentUpdateEntryIdentity struct {
@@ -88,7 +90,15 @@ func newSourceAgentUpdateBridgeStorage(updaterExecutable, workerType string) (so
 		return nil, fmt.Errorf("validate private install directory: %w", errSourceAgentUpdateBridgeUnavailable)
 	}
 	storage.installIdentity = darwinSourceAgentIdentity(installStat)
+	lifecycleStat, err := openDarwinSourceAgentLifecycleFile(parentFD, storage.workerDevice)
+	if err != nil {
+		return nil, fmt.Errorf("open fixed lifecycle lock: %w", err)
+	}
+	storage.lifecycleIdentity = darwinSourceAgentIdentity(lifecycleStat)
 	if err := unix.Flock(parentFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, ErrSourceAgentUpdateBusy
+		}
 		return nil, fmt.Errorf("lock private install directory: %w", errSourceAgentUpdateBridgeUnavailable)
 	}
 	locked := true
@@ -130,6 +140,70 @@ func newSourceAgentUpdateBridgeStorage(updaterExecutable, workerType string) (so
 	return storage, nil
 }
 
+func (s *darwinSourceAgentUpdateBridgeStorage) AcquireLifecycleShared() (func() error, error) {
+	if s.validatePinned() != nil {
+		return nil, errSourceAgentUpdateHandoffConflict
+	}
+	fd, err := unix.Openat(
+		s.parentFD,
+		sourceAgentUpdateLifecycleFileName,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK,
+		0,
+	)
+	if err != nil {
+		return nil, errSourceAgentUpdateBridgeUnavailable
+	}
+	closeFD := true
+	defer func() {
+		if closeFD {
+			_ = unix.Close(fd)
+		}
+	}()
+	var lockStat unix.Stat_t
+	if err := unix.Fstat(fd, &lockStat); err != nil ||
+		darwinSourceAgentIdentity(lockStat) != s.lifecycleIdentity ||
+		lockStat.Mode&unix.S_IFMT != unix.S_IFREG || !darwinSourceAgentModeIsExact(lockStat.Mode, 0o600) ||
+		lockStat.Uid != uint32(unix.Geteuid()) || uint64(lockStat.Dev) != s.workerDevice {
+		return nil, errSourceAgentUpdateHandoffConflict
+	}
+	if err := unix.Flock(fd, unix.LOCK_SH|unix.LOCK_NB); err != nil {
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, ErrSourceAgentUpdateBusy
+		}
+		return nil, errSourceAgentUpdateBridgeUnavailable
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_ = unix.Flock(fd, unix.LOCK_UN)
+		}
+	}()
+	var marker unix.Stat_t
+	if err := unix.Fstatat(s.parentFD, sourceAgentUpdateMaintenanceFileName, &marker, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+		return nil, ErrSourceAgentUpdateBusy
+	} else if !errors.Is(err, unix.ENOENT) {
+		return nil, errSourceAgentUpdateBridgeUnavailable
+	}
+	if s.validatePinned() != nil {
+		return nil, errSourceAgentUpdateHandoffConflict
+	}
+	closeFD = false
+	locked = false
+	var once sync.Once
+	var releaseErr error
+	return func() error {
+		once.Do(func() {
+			if err := unix.Flock(fd, unix.LOCK_UN); err != nil {
+				releaseErr = errSourceAgentUpdateBridgeUnavailable
+			}
+			if err := unix.Close(fd); err != nil && releaseErr == nil {
+				releaseErr = errSourceAgentUpdateBridgeUnavailable
+			}
+		})
+		return releaseErr
+	}, nil
+}
+
 func (s *darwinSourceAgentUpdateBridgeStorage) Lock() error {
 	if s.validatePinned() != nil || unix.Flock(s.parentFD, unix.LOCK_EX|unix.LOCK_NB) != nil {
 		return errSourceAgentUpdateBridgeUnavailable
@@ -150,6 +224,19 @@ func (s *darwinSourceAgentUpdateBridgeStorage) Unlock() error {
 
 func (s *darwinSourceAgentUpdateBridgeStorage) StagedPath() string {
 	return filepath.Join(s.installRoot, sourceAgentUpdateStagingDirectoryName, sourceAgentUpdateStagedBasename)
+}
+
+func (s *darwinSourceAgentUpdateBridgeStorage) RemoveStaged() error {
+	if s.validatePinned() != nil {
+		return errSourceAgentUpdateHandoffConflict
+	}
+	if err := s.unlinkat(s.stagingFD, sourceAgentUpdateStagedBasename, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return errSourceAgentUpdateBridgeUnavailable
+	}
+	if err := s.syncDirectory(s.stagingFD); err != nil || s.validatePinned() != nil {
+		return errSourceAgentUpdateBridgeUnavailable
+	}
+	return nil
 }
 
 func (s *darwinSourceAgentUpdateBridgeStorage) LoadHandoff() ([]byte, bool, error) {
@@ -421,11 +508,37 @@ func (s *darwinSourceAgentUpdateBridgeStorage) validatePinned() error {
 	}
 	if !darwinSourceAgentEntryMatches(s.parentFD, s.workerName, s.workerIdentity, unix.S_IFREG, 0o755, s.workerDevice) ||
 		!darwinSourceAgentEntryMatches(s.parentFD, sourceAgentUpdateUpdaterBasename, s.updaterIdentity, unix.S_IFREG, 0o755, s.workerDevice) ||
+		!darwinSourceAgentEntryMatches(s.parentFD, sourceAgentUpdateLifecycleFileName, s.lifecycleIdentity, unix.S_IFREG, 0o600, s.workerDevice) ||
 		!darwinSourceAgentEntryMatches(s.parentFD, sourceAgentUpdateStagingDirectoryName, s.stagingIdentity, unix.S_IFDIR, 0o700, s.workerDevice) ||
 		!darwinSourceAgentEntryMatches(s.parentFD, sourceAgentUpdateHandoffDirectoryName, s.handoffIdentity, unix.S_IFDIR, 0o700, s.workerDevice) {
 		return errSourceAgentUpdateHandoffConflict
 	}
 	return nil
+}
+
+func openDarwinSourceAgentLifecycleFile(parentFD int, device uint64) (unix.Stat_t, error) {
+	fd, err := unix.Openat(
+		parentFD,
+		sourceAgentUpdateLifecycleFileName,
+		unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_CREAT,
+		0o600,
+	)
+	if err != nil {
+		return unix.Stat_t{}, errSourceAgentUpdateBridgeUnavailable
+	}
+	var stat unix.Stat_t
+	statErr := unix.Fstat(fd, &stat)
+	syncErr := unix.Fsync(fd)
+	closeErr := unix.Close(fd)
+	if statErr != nil || syncErr != nil || closeErr != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		!darwinSourceAgentModeIsExact(stat.Mode, 0o600) || stat.Uid != uint32(unix.Geteuid()) ||
+		uint64(stat.Dev) != device {
+		return unix.Stat_t{}, errSourceAgentUpdateHandoffConflict
+	}
+	if err := unix.Fsync(parentFD); err != nil {
+		return unix.Stat_t{}, errSourceAgentUpdateBridgeUnavailable
+	}
+	return stat, nil
 }
 
 func (s *darwinSourceAgentUpdateBridgeStorage) syncDirectory(fd int) error {

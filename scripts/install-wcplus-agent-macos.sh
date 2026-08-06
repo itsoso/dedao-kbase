@@ -21,13 +21,14 @@ unset KBASE_AUTH_TOKEN KBASE_SOURCE_AGENT_TOKEN BASH_ENV ENV
 mode="install"
 
 usage() {
-  echo "usage: install-wcplus-agent-macos.sh [--check|--render-plist]" >&2
+  echo "usage: install-wcplus-agent-macos.sh [--check|--render-plist|--render-updater-plist]" >&2
 }
 
 case "${1:-}" in
   "") ;;
   --check) mode="check" ;;
   --render-plist) mode="render" ;;
+  --render-updater-plist) mode="render-updater" ;;
   *)
     usage
     exit 2
@@ -67,6 +68,7 @@ source "$pair_library"
 source "$install_library"
 home="${HOME:?HOME is required}"
 label="life.executor.kbase.wcplus-agent"
+updater_label="life.executor.kbase.wcplus-agent.updater"
 worker_type="wcplus-worker"
 transport_token_service="life.executor.kbase.source-agent"
 transport_token_account="transport-token"
@@ -75,6 +77,7 @@ binary_source="${WCPLUS_AGENT_BINARY_PATH:-$repo_root/build/bin/wcplus-agent}"
 updater_source="${WCPLUS_AGENT_UPDATER_BINARY_PATH:-$repo_root/build/bin/source-agent-updater}"
 install_dir="${WCPLUS_AGENT_INSTALL_DIR:-$home/Library/Application Support/dedao-kbase/bin}"
 plist_path="${WCPLUS_AGENT_PLIST_PATH:-$home/Library/LaunchAgents/$label.plist}"
+updater_plist_path="${WCPLUS_AGENT_UPDATER_PLIST_PATH:-$home/Library/LaunchAgents/$updater_label.plist}"
 state_dir="${WCPLUS_AGENT_STATE_DIR:-}"
 log_dir="${WCPLUS_AGENT_LOG_DIR:-$home/Library/Logs/dedao-kbase/wcplus-agent}"
 poll_seconds="${WCPLUS_AGENT_POLL_SECONDS:-15}"
@@ -200,10 +203,55 @@ PLIST
   plutil -lint "$destination" >/dev/null
 }
 
+render_updater_plist() {
+  local destination="$1"
+  local installed_updater="$2"
+  local updater_parent pending_marker updater_label_xml updater_xml pending_marker_xml
+  updater_parent="$(/usr/bin/dirname "$installed_updater")"
+  pending_marker="$updater_parent/.source-agent-handoff/updater.pending"
+  updater_label_xml="$(xml_escape "$updater_label")"
+  updater_xml="$(xml_escape "$installed_updater")"
+  pending_marker_xml="$(xml_escape "$pending_marker")"
+  cat >"$destination" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$updater_label_xml</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$updater_xml</string>
+    <string>--run-pending</string>
+    <string>--worker-type</string>
+    <string>$worker_type</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict>
+      <key>$pending_marker_xml</key>
+      <true/>
+    </dict>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "$destination" >/dev/null
+}
+
 tmp_plist="$(mktemp "${TMPDIR:-/tmp}/wcplus-agent.plist.XXXXXX")"
+tmp_updater_plist="$(mktemp "${TMPDIR:-/tmp}/wcplus-agent-updater.plist.XXXXXX")"
 worker_tmp=""
 updater_tmp=""
 plist_tmp=""
+updater_plist_tmp=""
 cleanup() {
   local status=$?
   if [[ "$MANAGED_WORKER_INSTALL_ACTIVE" == true ]]; then
@@ -212,9 +260,11 @@ cleanup() {
     status=1
   fi
   rm -f "$tmp_plist" || status=1
+  rm -f "$tmp_updater_plist" || status=1
   [[ -z "$worker_tmp" ]] || rm -f "$worker_tmp" || status=1
   [[ -z "$updater_tmp" ]] || rm -f "$updater_tmp" || status=1
   [[ -z "$plist_tmp" ]] || rm -f "$plist_tmp" || status=1
+  [[ -z "$updater_plist_tmp" ]] || rm -f "$updater_plist_tmp" || status=1
   return "$status"
 }
 trap cleanup EXIT
@@ -227,14 +277,22 @@ if [[ "$mode" == "render" ]]; then
   cat "$tmp_plist"
   exit 0
 fi
+if [[ "$mode" == "render-updater" ]]; then
+  render_updater_plist "$tmp_updater_plist" "$updater_source"
+  cat "$tmp_updater_plist"
+  exit 0
+fi
 if [[ "$mode" == "check" ]]; then
   render_plist "$tmp_plist" "$binary_source"
+  render_updater_plist "$tmp_updater_plist" "$updater_source"
   echo "wcplus-agent installation configuration is valid"
   exit 0
 fi
 
-mkdir -p "$install_dir" "$state_dir" "$log_dir" "$(dirname "$plist_path")"
-chmod 0700 "$install_dir" "$state_dir" "$log_dir"
+mkdir -p "$install_dir" "$state_dir" "$log_dir" "$(dirname "$plist_path")" \
+  "$install_dir/.source-agent-staging" "$install_dir/.source-agent-handoff"
+chmod 0700 "$install_dir" "$state_dir" "$log_dir" \
+  "$install_dir/.source-agent-staging" "$install_dir/.source-agent-handoff"
 binary_source="$(cd "$(dirname "$binary_source")" && pwd -P)/$(basename "$binary_source")"
 updater_source="$(cd "$(dirname "$updater_source")" && pwd -P)/$(basename "$updater_source")"
 install_dir="$(cd "$install_dir" && pwd -P)"
@@ -242,19 +300,28 @@ state_dir="$(cd "$state_dir" && pwd -P)"
 log_dir="$(cd "$log_dir" && pwd -P)"
 plist_dir="$(cd "$(dirname "$plist_path")" && pwd -P)"
 plist_path="$plist_dir/$(basename "$plist_path")"
+updater_plist_path="$plist_dir/$(basename "$updater_plist_path")"
 installed_worker="$install_dir/wcplus-agent"
 installed_updater="$install_dir/source-agent-updater"
+updater_config="$install_dir/.source-agent-updater-config.json"
 domain="gui/$(id -u)"
 
 worker_tmp="$install_dir/.wcplus-agent.$$"
 updater_tmp="$install_dir/.source-agent-updater.$$"
 install -m 0755 "$binary_source" "$worker_tmp"
 install -m 0755 "$updater_source" "$updater_tmp"
-if ! managed_worker_install_begin "$home" wcplus-agent "$installed_worker" "$installed_updater" "$plist_path" "$domain" "$label"; then
+if ! managed_worker_install_begin "$home" wcplus-agent "$installed_worker" "$installed_updater" \
+  "$plist_path" "$updater_plist_path" "$updater_config" "$domain" "$label" "$updater_label" "$updater_tmp" "$worker_type"; then
   echo "WC Plus installation transaction initialization failed" >&2
   exit 1
 fi
-if ! managed_worker_pair_publish "$worker_tmp" "$updater_tmp" "$installed_worker" "$installed_updater"; then
+if [[ -f "$updater_config" && -x "$installed_updater" ]] &&
+  ! "$installed_updater" --check-uninstall --worker-type "$worker_type" >/dev/null 2>&1; then
+  echo "WC Plus has unresolved update state; installation refused" >&2
+  exit 1
+fi
+if ! managed_worker_lifecycle_assert_alive ||
+  ! managed_worker_pair_publish "$worker_tmp" "$updater_tmp" "$installed_worker" "$installed_updater"; then
   echo "WC Plus artifact installation failed" >&2
   exit 1
 fi
@@ -273,12 +340,23 @@ if ! managed_worker_install_mark keychain; then
   echo "WC Plus installation transaction update failed" >&2
   exit 1
 fi
-if ! printf '%s\n%s\n' "$transport_token" "$transport_token" | \
-  /usr/bin/security add-generic-password -U -s "$transport_token_service" -a "$transport_token_account" -w >/dev/null 2>&1; then
+if ! managed_worker_install_publish_keychain_value "$transport_token"; then
   echo "store source-agent transport token failed" >&2
   exit 1
 fi
 unset transport_token
+
+if ! managed_worker_install_mark config; then
+  echo "WC Plus installation transaction update failed" >&2
+  exit 1
+fi
+if ! env -u KBASE_SOURCE_AGENT_TOKEN \
+  KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
+  KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
+  "$installed_updater" --install-config --worker-type "$worker_type" >/dev/null 2>&1; then
+  echo "WC Plus updater configuration installation failed" >&2
+  exit 1
+fi
 
 if ! KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
   KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
@@ -290,14 +368,20 @@ if ! KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
 fi
 
 render_plist "$tmp_plist" "$installed_worker"
+render_updater_plist "$tmp_updater_plist" "$installed_updater"
 plist_tmp="$plist_path.tmp.$$"
+updater_plist_tmp="$updater_plist_path.tmp.$$"
 install -m 0600 "$tmp_plist" "$plist_tmp"
-if ! managed_worker_install_mark plist; then
+install -m 0600 "$tmp_updater_plist" "$updater_plist_tmp"
+if ! managed_worker_install_mark plists; then
   echo "WC Plus installation transaction update failed" >&2
   exit 1
 fi
 mv -f "$plist_tmp" "$plist_path"
 plist_tmp=""
+mv -f "$updater_plist_tmp" "$updater_plist_path"
+updater_plist_tmp=""
+sync
 
 if ! managed_worker_install_mark launching; then
   echo "WC Plus installation transaction update failed" >&2
@@ -306,8 +390,13 @@ fi
 if [[ "$MANAGED_WORKER_INSTALL_SERVICE_LOADED" == 1 ]]; then
   launchctl bootout "$domain/$label"
 fi
+if [[ "$MANAGED_WORKER_INSTALL_UPDATER_SERVICE_LOADED" == 1 ]]; then
+  launchctl bootout "$domain/$updater_label"
+fi
+launchctl bootstrap "$domain" "$updater_plist_path"
 launchctl bootstrap "$domain" "$plist_path"
 launchctl kickstart -k "$domain/$label"
+launchctl print "$domain/$updater_label" >/dev/null
 launchctl print "$domain/$label" >/dev/null
 if ! managed_worker_install_commit; then
   echo "WC Plus installation commit failed" >&2

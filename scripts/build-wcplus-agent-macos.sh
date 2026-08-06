@@ -20,7 +20,7 @@ check_environment() {
     return 1
   fi
   local command_name
-  for command_name in cp go mkdir mv rm rmdir shasum sync wc; do
+  for command_name in cp git go grep mkdir mv rm rmdir shasum sync wc; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       echo "missing required command: $command_name" >&2
       return 1
@@ -50,6 +50,11 @@ if [[ "$worker_output" == "$updater_output" ]]; then
   echo "worker and updater output paths must differ" >&2
   exit 2
 fi
+if [[ -n "${WCPLUS_AGENT_REVISION+x}" || -n "${WCPLUS_AGENT_BUILD_REVISION+x}" ||
+  -n "${SOURCE_AGENT_UPDATER_REVISION+x}" ]]; then
+  echo "caller-supplied build revision is not supported" >&2
+  exit 2
+fi
 worker_parent="$(dirname "$worker_output")"
 updater_parent="$(dirname "$updater_output")"
 if [[ "$worker_parent" != "$updater_parent" ]]; then
@@ -63,6 +68,18 @@ if [[ "$mode" == "check" ]]; then
   esac
   echo "wcplus-agent build environment is ready for darwin/$check_arch"
   exit 0
+fi
+
+revision="$(cd "$repo_root" && git rev-parse --verify HEAD)"
+if [[ ! "$revision" =~ ^[0123456789abcdef]{40}$ && ! "$revision" =~ ^[0123456789abcdef]{64}$ ]]; then
+  echo "repository HEAD revision is invalid" >&2
+  exit 1
+fi
+if ! (cd "$repo_root" && git diff --quiet --no-ext-diff) ||
+  ! (cd "$repo_root" && git diff --cached --quiet --no-ext-diff) ||
+  [[ -n "$(cd "$repo_root" && git ls-files --others --exclude-standard)" ]]; then
+  echo "WC Plus release build requires a clean repository" >&2
+  exit 1
 fi
 
 case "$(uname -m)" in
@@ -87,11 +104,22 @@ trap 'exit 143' TERM
 (
   cd "$repo_root"
   CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" \
-    go build -trimpath -ldflags="-s -w" -o "$worker_tmp" ./cmd/wcplus-agent
+    go build -trimpath -ldflags="-s -w -X main.wcplusAgentRevision=$revision" -o "$worker_tmp" ./cmd/wcplus-agent
   CGO_ENABLED=1 GOOS=darwin GOARCH="$goarch" \
-    go build -trimpath -ldflags="-s -w" -o "$updater_tmp" ./cmd/source-agent-updater
+    go build -trimpath -ldflags="-s -w -X main.sourceAgentUpdaterRevision=$revision" -o "$updater_tmp" ./cmd/source-agent-updater
 )
 chmod 0755 "$worker_tmp" "$updater_tmp"
+worker_info="$("$worker_tmp" build-info)"
+updater_info="$("$updater_tmp" --build-info --worker-type wcplus-worker)"
+if ((${#worker_info} > 4096 || ${#updater_info} > 4096)) ||
+  ! grep -Fq '"worker_type":"wcplus-worker"' <<<"$worker_info" ||
+  ! grep -Fq "\"revision\":\"$revision\"" <<<"$worker_info" ||
+  ! grep -Fq '"worker_type":"wcplus-worker"' <<<"$updater_info" ||
+  ! grep -Fq "\"revision\":\"$revision\"" <<<"$updater_info"; then
+  echo "WC Plus build identity verification failed" >&2
+  exit 1
+fi
+unset worker_info updater_info
 if ! managed_worker_pair_publish "$worker_tmp" "$updater_tmp" "$worker_output" "$updater_output"; then
   echo "WC Plus artifact publication failed" >&2
   exit 1

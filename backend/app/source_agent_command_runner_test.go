@@ -668,6 +668,7 @@ func TestSourceAgentCommandRunnerAdvancesUpgradeOneDurableStagePerCycle(t *testi
 	}}}
 	updater := &fakeSourceAgentUpdater{log: log, results: map[string]SourceAgentUpgradeResult{
 		SourceAgentCommandDownloading: {State: SourceAgentCommandVerified},
+		SourceAgentCommandVerified:    {State: SourceAgentCommandInstalling},
 		SourceAgentCommandInstalling:  {State: SourceAgentCommandRestarting},
 		SourceAgentCommandRestarting:  {State: SourceAgentCommandVerifying},
 		SourceAgentCommandVerifying: {
@@ -695,14 +696,14 @@ func TestSourceAgentCommandRunnerAdvancesUpgradeOneDurableStagePerCycle(t *testi
 			t.Fatalf("cycle %d reports=%#v, want one new %q report", cycle+1, reports, wantState)
 		}
 		wantUpdaterDelta := int32(1)
-		if wantState == SourceAgentCommandDownloading || wantState == SourceAgentCommandInstalling {
+		if wantState == SourceAgentCommandDownloading {
 			wantUpdaterDelta = 0
 		}
 		if delta := updater.calls.Load() - beforeCalls; delta != wantUpdaterDelta {
 			t.Fatalf("cycle %d updater delta=%d, want %d", cycle+1, delta, wantUpdaterDelta)
 		}
 	}
-	if got := strings.Join(updater.stateCalls(), ","); got != "downloading,installing,restarting,verifying" {
+	if got := strings.Join(updater.stateCalls(), ","); got != "downloading,verified,installing,restarting,verifying" {
 		t.Fatalf("updater command states=%q", got)
 	}
 }
@@ -780,7 +781,7 @@ func TestSourceAgentCommandRunnerRetriesEveryUpgradeReportWithoutRepeatingStage(
 	}{
 		{from: SourceAgentCommandClaimed, wantReport: SourceAgentCommandDownloading},
 		{from: SourceAgentCommandDownloading, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerified}, wantReport: SourceAgentCommandVerified, wantCalls: 1},
-		{from: SourceAgentCommandVerified, wantReport: SourceAgentCommandInstalling},
+		{from: SourceAgentCommandVerified, result: SourceAgentUpgradeResult{State: SourceAgentCommandInstalling}, wantReport: SourceAgentCommandInstalling, wantCalls: 1},
 		{from: SourceAgentCommandInstalling, result: SourceAgentUpgradeResult{State: SourceAgentCommandRestarting}, wantReport: SourceAgentCommandRestarting, wantCalls: 1},
 		{from: SourceAgentCommandRestarting, result: SourceAgentUpgradeResult{State: SourceAgentCommandVerifying}, wantReport: SourceAgentCommandVerifying, wantCalls: 1},
 		{from: SourceAgentCommandVerifying, result: SourceAgentUpgradeResult{State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeUpgradeComplete, ActualVersion: "2.0.0"}, wantReport: SourceAgentCommandSucceeded, wantCalls: 1},
@@ -838,7 +839,7 @@ func TestSourceAgentCommandRunnerDoesNotInstallWhenInstallingReportIsRejected(t 
 		}},
 		reportErrs: []error{errors.New("rollout disabled"), errors.New("rollout disabled")},
 	}
-	updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandRestarting}}
+	updater := &fakeSourceAgentUpdater{log: log, result: SourceAgentUpgradeResult{State: SourceAgentCommandInstalling}}
 	runner := newSourceAgentCommandTestRunner(t, harness, newSourceAgentCommandTestOutbox(t), &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}}, commands, nil, updater)
 
 	for cycle := 0; cycle < 2; cycle++ {
@@ -846,8 +847,8 @@ func TestSourceAgentCommandRunnerDoesNotInstallWhenInstallingReportIsRejected(t 
 			t.Fatalf("cycle %d succeeded while installing report was rejected", cycle+1)
 		}
 	}
-	if states := updater.stateCalls(); len(states) != 0 {
-		t.Fatalf("updater received installing before durable acknowledgement: %v", states)
+	if states := updater.stateCalls(); len(states) != 1 || states[0] != SourceAgentCommandVerified {
+		t.Fatalf("updater advanced beyond handoff verification before durable acknowledgement: %v", states)
 	}
 	_, reports := commands.counts()
 	if len(reports) != 2 || reports[0].State != SourceAgentCommandInstalling || reports[1] != reports[0] {
@@ -1287,6 +1288,7 @@ func TestSourceAgentCommandRunnerKeepsClaimedUpgradeWaitingForActiveRun(t *testi
 	adapter := &blockingSourceAgentAdapter{started: make(chan struct{}), release: make(chan struct{})}
 	updater := &fakeSourceAgentUpdater{log: log, results: map[string]SourceAgentUpgradeResult{
 		SourceAgentCommandDownloading: {State: SourceAgentCommandVerified},
+		SourceAgentCommandVerified:    {State: SourceAgentCommandInstalling},
 		SourceAgentCommandInstalling:  {State: SourceAgentCommandRestarting},
 		SourceAgentCommandRestarting:  {State: SourceAgentCommandVerifying},
 		SourceAgentCommandVerifying: {
@@ -1356,7 +1358,7 @@ func TestSourceAgentCommandRunnerKeepsClaimedUpgradeWaitingForActiveRun(t *testi
 			t.Fatalf("remaining upgrade cycle %d: %v", cycle+1, err)
 		}
 	}
-	if updater.calls.Load() != 4 || updater.overlap.Load() {
+	if updater.calls.Load() != 5 || updater.overlap.Load() {
 		t.Fatalf("updater calls=%d overlap=%t", updater.calls.Load(), updater.overlap.Load())
 	}
 	_, reports = commands.counts()

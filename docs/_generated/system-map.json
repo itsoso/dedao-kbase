@@ -1626,7 +1626,7 @@
     {
       "name": "SourceAgentDiagnosticReport",
       "file": "backend/app/source_agent_command_runner.go",
-      "line": 33
+      "line": 38
     },
     {
       "name": "SourceAgentHTTPError",
@@ -1647,6 +1647,16 @@
       "name": "SourceAgentOutboxItem",
       "file": "backend/app/source_agent_outbox.go",
       "line": 24
+    },
+    {
+      "name": "SourceAgentPendingUpdate",
+      "file": "backend/app/source_agent_update_pending.go",
+      "line": 17
+    },
+    {
+      "name": "SourceAgentPendingUpdateRunnerConfig",
+      "file": "backend/app/source_agent_update_pending_runner.go",
+      "line": 10
     },
     {
       "name": "SourceAgentReadyChallenge",
@@ -1686,12 +1696,12 @@
     {
       "name": "SourceAgentUpdateBridge",
       "file": "backend/app/source_agent_update_bridge.go",
-      "line": 57
+      "line": 63
     },
     {
       "name": "SourceAgentUpdateBridgeConfig",
       "file": "backend/app/source_agent_update_bridge.go",
-      "line": 36
+      "line": 38
     },
     {
       "name": "SourceAgentUpdateConfig",
@@ -1724,9 +1734,14 @@
       "line": 216
     },
     {
+      "name": "SourceAgentUpgradeConflict",
+      "file": "backend/app/source_agent_update_conflict.go",
+      "line": 18
+    },
+    {
       "name": "SourceAgentUpgradeResult",
       "file": "backend/app/source_agent_command_runner.go",
-      "line": 39
+      "line": 44
     },
     {
       "name": "SourceAgentUpgradeSpec",
@@ -1737,6 +1752,11 @@
       "name": "SourceAgentUpgradeTerminalObservation",
       "file": "backend/app/source_agent_update.go",
       "line": 227
+    },
+    {
+      "name": "SourceAgentUpgradeTerminalResolution",
+      "file": "backend/app/source_agent_update_terminal.go",
+      "line": 30
     },
     {
       "name": "SourceArticleEnvelope",
@@ -2126,12 +2146,12 @@
     {
       "name": "sourceAgentDoctorReport",
       "file": "cmd/source-agent/main.go",
-      "line": 191
+      "line": 266
     },
     {
       "name": "sourceAgentPendingCommandReport",
       "file": "backend/app/source_agent_command_runner.go",
-      "line": 46
+      "line": 52
     },
     {
       "name": "timedReleaseRecord",

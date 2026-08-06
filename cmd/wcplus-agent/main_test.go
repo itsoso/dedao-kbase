@@ -1,23 +1,89 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/yann0917/dedao-gui/backend/app"
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
+
+func TestMain(m *testing.M) {
+	previous := wcplusAgentUpgradeFactory
+	wcplusAgentUpgradeFactory = func(*app.SourceAgentClient) (wcplusWorkerUpgradeRuntime, error) {
+		return wcplusWorkerUpgradeRuntime{updater: &wcplusAgentFailClosedUpdater{}}, nil
+	}
+	code := m.Run()
+	wcplusAgentUpgradeFactory = previous
+	os.Exit(code)
+}
 
 type wcplusAgentTestRoundTripper func(*http.Request) (*http.Response, error)
 
 func (transport wcplusAgentTestRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
 	return transport(request)
+}
+
+type wcplusAgentCLIUpdaterActivator struct{}
+
+func (wcplusAgentCLIUpdaterActivator) StartUpdater(context.Context) error { return nil }
+
+type wcplusAgentCloseErrorForTest struct{ err error }
+
+func (c wcplusAgentCloseErrorForTest) Close() error { return c.err }
+
+func TestWCPlusAgentRuntimeReturnsUpgradeCloseError(t *testing.T) {
+	want := errors.New("close failed")
+	runtime := &wcplusAgentRuntime{upgrade: wcplusAgentCloseErrorForTest{err: want}}
+	if err := runtime.close(); !errors.Is(err, want) {
+		t.Fatalf("close() error=%v", err)
+	}
+}
+
+func TestWCPlusAgentConstructsRealWorkerUpgradeBridge(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installRoot := filepath.Join(root, "installed")
+	if err := os.Mkdir(installRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	worker := filepath.Join(installRoot, "wcplus-agent")
+	updater := filepath.Join(installRoot, "source-agent-updater")
+	for _, path := range []string{worker, updater} {
+		if err := os.WriteFile(path, []byte("fixture"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := app.NewSourceAgentClient(app.SourceAgentConfig{
+		RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret",
+		AgentID: "wcplus-agent-a", StateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := newWCPlusWorkerUpgradeBridge(client, worker, wcplusAgentCLIUpdaterActivator{})
+	if err != nil {
+		t.Fatalf("newWCPlusWorkerUpgradeBridge() error = %v", err)
+	}
+	if bridge == nil {
+		t.Fatal("real WC Plus worker upgrade bridge is nil")
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWCPlusAgentCLITransportTokenPrecedenceAndFailClosedErrors(t *testing.T) {
@@ -222,7 +288,7 @@ func TestWCPlusAgentCapabilityRuntimeUsesSharedControlRunner(t *testing.T) {
 		t.Fatalf("calls=%#v", calls)
 	}
 	if heartbeat.WorkerType != "wcplus-worker" || heartbeat.Platform == "" || heartbeat.Architecture == "" ||
-		heartbeat.Version != "0.1.0" || heartbeat.ProtocolVersion != "2026-08-01" || heartbeat.Health["wcplus"] == nil {
+		heartbeat.Version != wcplusAgentVersion || heartbeat.ProtocolVersion != "2026-08-01" || heartbeat.Health["wcplus"] == nil {
 		t.Fatalf("heartbeat=%#v", heartbeat)
 	}
 }
@@ -325,6 +391,40 @@ func TestWCPlusAgentRequiresKnownModeAndConfiguration(t *testing.T) {
 	stderr.Reset()
 	if err := runCLI(context.Background(), []string{"doctor"}, mapLookup(nil), &stdout, &stderr); err == nil || !strings.Contains(err.Error(), "WCPLUS_AGENT_STATE_DIR") {
 		t.Fatalf("missing config error = %v", err)
+	}
+}
+
+func TestWCPlusAgentBuildInfoIsCredentialFreeAndReportsCompiledIdentity(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	lookupCalled := false
+	err := runCLI(context.Background(), []string{"build-info"}, func(string) (string, bool) {
+		lookupCalled = true
+		return "", false
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookupCalled {
+		t.Fatal("build-info loaded environment configuration")
+	}
+	var info struct {
+		WorkerType      string `json:"worker_type"`
+		Version         string `json:"version"`
+		ProtocolVersion string `json:"protocol_version"`
+		Platform        string `json:"platform"`
+		Architecture    string `json:"architecture"`
+		Revision        string `json:"revision"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &info); err != nil {
+		t.Fatal(err)
+	}
+	if info.WorkerType != "wcplus-worker" || info.Version != wcplusAgentVersion ||
+		info.ProtocolVersion != "2026-08-01" || info.Platform != runtime.GOOS ||
+		info.Architecture != runtime.GOARCH || info.Revision != wcplusAgentRevision {
+		t.Fatalf("build info=%#v", info)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr=%q", stderr.String())
 	}
 }
 

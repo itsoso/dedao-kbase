@@ -46,11 +46,24 @@ if [[ -n "${GO_CALLED_MARKER:-}" ]]; then
   : >"$GO_CALLED_MARKER"
 fi
 case "$all_args" in
-  *./cmd/source-agent-updater*) printf 'new-updater' >"$output" ;;
-  *./cmd/source-agent*) printf 'new-worker' >"$output" ;;
+  *./cmd/source-agent-updater* | *./cmd/source-agent*)
+    cat >"$output" <<'BUILT'
+#!/bin/bash
+printf '%s\n' '{"worker_type":"wechat-worker","version":"0.2.0","protocol_version":"2026-08-01","platform":"darwin","architecture":"arm64","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+BUILT
+    ;;
   *) exit 64 ;;
 esac
 FAKE_GO
+cat >"$tmp_dir/build-bin/git" <<'FAKE_GIT'
+#!/bin/bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
+  diff | ls-files) exit 0 ;;
+  *) exit 64 ;;
+esac
+FAKE_GIT
 cat >"$tmp_dir/build-bin/mv" <<'FAKE_MV'
 #!/bin/bash
 set -euo pipefail
@@ -62,7 +75,7 @@ if [[ -n "${FAIL_PUBLISH_DEST:-}" && "$destination" == "$FAIL_PUBLISH_DEST" && !
 fi
 exec /bin/mv "$@"
 FAKE_MV
-chmod 0755 "$tmp_dir/build-bin/go" "$tmp_dir/build-bin/mv"
+chmod 0755 "$tmp_dir/build-bin/git" "$tmp_dir/build-bin/go" "$tmp_dir/build-bin/mv"
 
 run_fixture_build() {
   env PATH="$tmp_dir/build-bin:$PATH" \
@@ -140,7 +153,8 @@ if [[ $different_status -eq 0 || -e "$tmp_dir/go-called" || "$(<"$different_work
 fi
 
 run_fixture_build "$worker_output" "$updater_output"
-if [[ "$(<"$worker_output")" != "new-worker" || "$(<"$updater_output")" != "new-updater" ]]; then
+if ! grep -Fq '"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$worker_output" ||
+  ! grep -Fq '"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$updater_output"; then
   echo "successful build did not publish the new artifact pair" >&2
   exit 1
 fi
@@ -192,12 +206,35 @@ WORKER
 cat >"$tmp_dir/bin/source-agent-updater" <<'UPDATER'
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 for name in KBASE_SOURCE_AGENT_TOKEN transport_token KBASE_AUTH_TOKEN admin_token BASH_ENV ENV; do
   [[ -z "${!name+x}" ]]
 done
 [[ "$-" != *x* ]]
 printf '%s\n' "$*" >"${UPDATER_CAPTURE:?}"
-[[ "$*" == "--check --worker-type wechat-worker" ]]
+case "$*" in
+  "--hold-lifecycle-lock --worker-type wechat-worker")
+    marker="$(/usr/bin/dirname "$0")/.managed-worker-maintenance"
+    if [[ -f "$marker" ]]; then phase="$(<"$marker")"; else phase=initial; printf 'initial\n' >"$marker"; fi
+    printf 'locked\n'
+    while IFS= read -r message; do
+      case "$message" in
+        abort-before-mutation) [[ "$phase" == initial ]]; rm -f "$marker"; printf 'aborted\n'; exit 0 ;;
+        begin-mutation) [[ "$phase" == initial ]]; phase=begin-mutation; printf 'begin-mutation\n' >"$marker"; printf 'begun\n' ;;
+        commit) [[ "$phase" == begin-mutation ]]; rm -f "$marker"; printf 'committed\n'; exit 0 ;;
+        *) exit 64 ;;
+      esac
+    done
+    exit 1 ;;
+  "--check --worker-type wechat-worker" | "--check-uninstall --worker-type wechat-worker") ;;
+  "--install-config --worker-type wechat-worker")
+    [[ "${KBASE_REMOTE_URL:?}" == "https://kbase.example.invalid" ]]
+    [[ "${KBASE_SOURCE_AGENT_ID:?}" == "source-agent-1" ]]
+    printf '{"schema":"source-agent-updater-config.v1"}\n' >"$(/usr/bin/dirname "$0")/.source-agent-updater-config.json"
+    chmod 0600 "$(/usr/bin/dirname "$0")/.source-agent-updater-config.json"
+    ;;
+  *) exit 64 ;;
+esac
 if [[ -n "${UPDATER_CALL_COUNT:-}" ]]; then
   updater_calls=0
   [[ ! -f "$UPDATER_CALL_COUNT" ]] || read -r updater_calls <"$UPDATER_CALL_COUNT"
@@ -302,6 +339,48 @@ grep -Fq "$tmp_dir/state" "$plist_fixture"
 grep -Fq "$tmp_dir/logs" "$plist_fixture"
 grep -Fxq -- '--check --worker-type wechat-worker' "$tmp_dir/updater-args"
 grep -Fxq -- 'check-config' "$tmp_dir/worker-args"
+if grep -Fq 'life.executor.kbase.source-agent.updater' "$plist_fixture" || grep -Fq -- '--run-pending' "$plist_fixture"; then
+  echo "source-agent worker plist contains updater job configuration" >&2
+  exit 1
+fi
+
+updater_plist_fixture="$tmp_dir/source-agent-updater.plist"
+printf '%s\n' "$token_sentinel" | env -i PATH="$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+  KBASE_REMOTE_URL="https://kbase.example.invalid" \
+  KBASE_SOURCE_AGENT_ID="source-agent-1" \
+  SOURCE_AGENT_BINARY_PATH="$tmp_dir/bin/source-agent" \
+  SOURCE_AGENT_UPDATER_BINARY_PATH="$tmp_dir/bin/source-agent-updater" \
+  SOURCE_AGENT_STATE_DIR="$tmp_dir/state" \
+  SOURCE_AGENT_LOG_DIR="$tmp_dir/logs" \
+  PROBE_CAPTURE="$tmp_dir/updater-plist-first-child" \
+  WORKER_CAPTURE="$tmp_dir/updater-plist-worker-args" \
+  UPDATER_CAPTURE="$tmp_dir/updater-plist-updater-args" \
+  GREP_CALLED_MARKER="$tmp_dir/updater-plist-grep-called" \
+  "$install_script" --render-updater-plist >"$updater_plist_fixture" 2>"$tmp_dir/updater-render.stderr"
+
+plutil -lint "$updater_plist_fixture" >/dev/null
+updater_marker="$tmp_dir/bin/.source-agent-handoff/updater.pending"
+if [[ "$(/usr/libexec/PlistBuddy -c 'Print :Label' "$updater_plist_fixture")" != "life.executor.kbase.source-agent.updater" ||
+  "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$updater_plist_fixture")" != "$tmp_dir/bin/source-agent-updater" ||
+  "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$updater_plist_fixture")" != "--run-pending" ||
+  "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$updater_plist_fixture")" != "--worker-type" ||
+  "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$updater_plist_fixture")" != "wechat-worker" ||
+  "$(/usr/libexec/PlistBuddy -c 'Print :KeepAlive:PathState:'"$updater_marker" "$updater_plist_fixture")" != "true" ||
+  "$(/usr/libexec/PlistBuddy -c 'Print :RunAtLoad' "$updater_plist_fixture")" != "false" ]]; then
+  echo "source-agent updater plist does not have the fixed independent job contract" >&2
+  exit 1
+fi
+if /usr/libexec/PlistBuddy -c 'Print :ProgramArguments:4' "$updater_plist_fixture" >/dev/null 2>&1; then
+  echo "source-agent updater plist contains extra program arguments" >&2
+  exit 1
+fi
+if grep -Fq 'KBASE_SOURCE_AGENT_TOKEN' "$updater_plist_fixture" ||
+  grep -Fq "$token_sentinel" "$updater_plist_fixture" ||
+  grep -Fq 'EnvironmentVariables' "$updater_plist_fixture" ||
+  grep -Fq 'AbandonProcessGroup' "$updater_plist_fixture"; then
+  echo "source-agent updater plist contains forbidden secret, environment, or process-group configuration" >&2
+  exit 1
+fi
 
 for invalid_remote in \
   'https://user@kbase.example.invalid' \
@@ -416,14 +495,20 @@ cat >"$tmp_dir/build-bin/launchctl" <<'FAKE_LAUNCHCTL'
 #!/bin/bash
 set -euo pipefail
 operation="${1:?}"
-state_file="${LAUNCHCTL_STATE:?}"
+shift
+target="${1:?}"
+if [[ "$operation" == bootstrap ]]; then target="${2:?}"; fi
+case "$target" in
+  *source-agent.updater*) state_file="${UPDATER_LAUNCHCTL_STATE:-${LAUNCHCTL_STATE:?}}" ;;
+  *) state_file="${LAUNCHCTL_STATE:?}" ;;
+esac
 failure_marker="${LAUNCHCTL_FAILURE_MARKER:-$state_file.no-failure}"
 if [[ "$operation" == print ]]; then
   print_count=0
   [[ ! -f "${LAUNCHCTL_PRINT_COUNT:?}" ]] || read -r print_count <"$LAUNCHCTL_PRINT_COUNT"
   print_count=$((print_count + 1))
   printf '%s\n' "$print_count" >"$LAUNCHCTL_PRINT_COUNT"
-  if [[ "${FAIL_LAUNCHCTL_OPERATION:-}" == final-print && $print_count -eq 2 && ! -e "$failure_marker" ]]; then
+  if [[ "${FAIL_LAUNCHCTL_OPERATION:-}" == final-print && $print_count -eq 4 && ! -e "$failure_marker" ]]; then
     : >"$failure_marker"
     exit 95
   fi
@@ -502,6 +587,8 @@ mkdir -p "$install_dir" "$(dirname "$installed_plist")"
 canonical_install_dir="$(cd "$install_dir" && pwd -P)"
 installed_worker="$canonical_install_dir/source-agent"
 installed_updater="$canonical_install_dir/source-agent-updater"
+installed_updater_plist="$tmp_dir/home/LaunchAgents/life.executor.kbase.source-agent.updater.plist"
+installed_config="$canonical_install_dir/.source-agent-updater-config.json"
 printf 'old-worker' >"$installed_worker"
 printf 'old-updater' >"$installed_updater"
 printf 'old-plist' >"$installed_plist"
@@ -585,8 +672,11 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
   printf 'old-worker' >"$installed_worker"
   printf 'old-updater' >"$installed_updater"
   printf 'old-plist' >"$installed_plist"
+  printf 'old-updater-plist' >"$installed_updater_plist"
+  printf 'old-config' >"$installed_config"
   printf 'old-fixed-token\n' >"$tmp_dir/home/keychain/main"
   printf 'loaded\n' >"$tmp_dir/service-state"
+  printf 'loaded\n' >"$tmp_dir/updater-service-state"
   rm -f \
     "$tmp_dir/home/keychain/backup" \
     "$tmp_dir/security-failure" \
@@ -600,14 +690,19 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
   fail_validation=false
   fail_plist_destination=""
   fail_launchctl=""
+  token_input="old-fixed-token"
   case "$failure_boundary" in
-    keychain) fail_security=true ;;
+    keychain)
+      fail_security=true
+      token_input="new-fixed-token"
+      rm -f "$tmp_dir/home/keychain/main"
+      ;;
     validation) fail_validation=true ;;
     plist) fail_plist_destination="$installed_plist" ;;
     bootout | bootstrap | kickstart | final-print) fail_launchctl="$failure_boundary" ;;
   esac
   set +e
-  printf '%s\n' 'new-fixed-token' | env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
+  printf '%s\n' "$token_input" | env -i PATH="$tmp_dir/build-bin:$tmp_dir/probe-bin:$PATH" HOME="$tmp_dir/home" \
     KBASE_REMOTE_URL="https://kbase.example.invalid" \
     KBASE_SOURCE_AGENT_ID="source-agent-1" \
     SOURCE_AGENT_BINARY_PATH="$tmp_dir/bin/source-agent" \
@@ -616,6 +711,7 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
     SOURCE_AGENT_STATE_DIR="$tmp_dir/install state" \
     SOURCE_AGENT_LOG_DIR="$tmp_dir/install logs" \
     SOURCE_AGENT_PLIST_PATH="$installed_plist" \
+    SOURCE_AGENT_UPDATER_PLIST_PATH="$installed_updater_plist" \
     KEYCHAIN_DIR="$tmp_dir/home/keychain" \
     FAIL_SECURITY_MAIN_ADD="$fail_security" \
     SECURITY_FAILURE_MARKER="$tmp_dir/security-failure" \
@@ -627,6 +723,7 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
     FAIL_LAUNCHCTL_OPERATION="$fail_launchctl" \
     LAUNCHCTL_FAILURE_MARKER="$tmp_dir/launchctl-failure" \
     LAUNCHCTL_STATE="$tmp_dir/service-state" \
+    UPDATER_LAUNCHCTL_STATE="$tmp_dir/updater-service-state" \
     LAUNCHCTL_PRINT_COUNT="$tmp_dir/launchctl-print-count" \
     LAUNCHCTL_MARKER="$tmp_dir/launchctl-called" \
     PROBE_CAPTURE="$tmp_dir/matrix-first-child" \
@@ -640,16 +737,23 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
     echo "source-agent $failure_boundary fault unexpectedly succeeded" >&2
     exit 1
   fi
-  if [[ "$(<"$installed_worker")" != old-worker || "$(<"$installed_updater")" != old-updater || "$(<"$installed_plist")" != old-plist ]]; then
+  if [[ "$(<"$installed_worker")" != old-worker || "$(<"$installed_updater")" != old-updater ||
+    "$(<"$installed_plist")" != old-plist || "$(<"$installed_updater_plist")" != old-updater-plist ||
+    "$(<"$installed_config")" != old-config ]]; then
     echo "source-agent $failure_boundary fault did not restore old files" >&2
     exit 1
   fi
-  if [[ "$(<"$tmp_dir/home/keychain/main")" != old-fixed-token || -e "$tmp_dir/home/keychain/backup" ]]; then
+  if [[ "$failure_boundary" == keychain ]]; then
+    if [[ -e "$tmp_dir/home/keychain/main" || -e "$tmp_dir/home/keychain/backup" ]]; then
+      echo "source-agent keychain fault did not restore prior absence" >&2
+      exit 1
+    fi
+  elif [[ "$(<"$tmp_dir/home/keychain/main")" != old-fixed-token || -e "$tmp_dir/home/keychain/backup" ]]; then
     echo "source-agent $failure_boundary fault did not restore the old Keychain account" >&2
     exit 1
   fi
-  if [[ "$(<"$tmp_dir/service-state")" != loaded ]]; then
-    echo "source-agent $failure_boundary fault did not restart the old service" >&2
+  if [[ "$(<"$tmp_dir/service-state")" != loaded || "$(<"$tmp_dir/updater-service-state")" != loaded ]]; then
+    echo "source-agent $failure_boundary fault did not restart both old services" >&2
     exit 1
   fi
   if compgen -G "$tmp_dir/home/Library/Application Support/KBase/.managed-worker-install.lock-ready.*" >/dev/null ||
@@ -672,7 +776,7 @@ for failure_boundary in keychain validation plist bootout bootstrap kickstart fi
 done
 
 publish_line="$(grep -n 'managed_worker_pair_publish .*installed_worker.*installed_updater' "$install_script" | cut -d: -f1)"
-security_line="$(grep -n '/usr/bin/security add-generic-password' "$install_script" | cut -d: -f1)"
+security_line="$(grep -n 'managed_worker_install_publish_keychain_value' "$install_script" | cut -d: -f1)"
 if [[ -z "$publish_line" || -z "$security_line" ]] || ((publish_line >= security_line)); then
   echo "artifact pair must publish before Keychain mutation" >&2
   exit 1
@@ -691,8 +795,7 @@ grep -Fq 'lib/managed-worker-pair.sh' "$install_script"
 grep -Fq 'transport-token' "$install_script"
 grep -Fq 'life.executor.kbase.source-agent' "$install_script"
 grep -Fq 'unset KBASE_AUTH_TOKEN KBASE_SOURCE_AGENT_TOKEN' "$install_script"
-grep -Fq ' -w' "$install_script"
-grep -Fq '/usr/bin/security add-generic-password -U -s "$transport_token_service" -a "$transport_token_account" -w' "$install_script"
+grep -Fq 'managed_worker_install_publish_keychain_value "$transport_token"' "$install_script"
 if grep -Fq -- '-w "$KBASE_SOURCE_AGENT_TOKEN"' "$install_script" || grep -Fq -- '-w "$transport_token"' "$install_script"; then
   echo "security command must not receive the transport token in argv" >&2
   exit 1

@@ -12,8 +12,9 @@ import (
 const sourceAgentLaunchctlPath = "/bin/launchctl"
 
 type sourceAgentDarwinProcessControl struct {
-	target string
-	runner sourceAgentLaunchctlRunner
+	workerTarget  string
+	updaterTarget string
+	runner        sourceAgentLaunchctlRunner
 }
 
 type sourceAgentOSLaunchctlRunner struct{}
@@ -29,8 +30,8 @@ func (sourceAgentOSLaunchctlRunner) Run(ctx context.Context, path string, args .
 }
 
 func newSourceAgentPlatformProcessControl(config sourceAgentPlatformProcessConfig) (sourceAgentProcessControl, error) {
-	expectedLabel, ok := sourceAgentLaunchAgentLabel(config.WorkerType)
-	if !ok || config.Label != expectedLabel || config.Domain != "gui" || config.UID < 0 {
+	labels, ok := sourceAgentLaunchAgentLabels(config.WorkerType)
+	if !ok || config.UID < 0 {
 		return nil, errors.New("invalid fixed launch agent identity")
 	}
 	runner := config.Runner
@@ -38,13 +39,21 @@ func newSourceAgentPlatformProcessControl(config sourceAgentPlatformProcessConfi
 		runner = sourceAgentOSLaunchctlRunner{}
 	}
 	return &sourceAgentDarwinProcessControl{
-		target: "gui/" + strconv.Itoa(config.UID) + "/" + config.Label,
-		runner: runner,
+		workerTarget:  "gui/" + strconv.Itoa(config.UID) + "/" + labels.Worker,
+		updaterTarget: "gui/" + strconv.Itoa(config.UID) + "/" + labels.Updater,
+		runner:        runner,
 	}, nil
 }
 
-func (p *sourceAgentDarwinProcessControl) Restart(ctx context.Context) error {
-	if err := p.runner.Run(ctx, sourceAgentLaunchctlPath, "kickstart", "-k", p.target); err != nil {
+func (p *sourceAgentDarwinProcessControl) StartUpdater(ctx context.Context) error {
+	if err := p.runner.Run(ctx, sourceAgentLaunchctlPath, "kickstart", p.updaterTarget); err != nil {
+		return errors.New("launch agent start failed")
+	}
+	return nil
+}
+
+func (p *sourceAgentDarwinProcessControl) RestartWorker(ctx context.Context) error {
+	if err := p.runner.Run(ctx, sourceAgentLaunchctlPath, "kickstart", "-k", p.workerTarget); err != nil {
 		return errors.New("launch agent restart failed")
 	}
 	return nil

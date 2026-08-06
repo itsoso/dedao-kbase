@@ -23,13 +23,32 @@ type fakeSourceAdapter struct {
 }
 
 type sourceAgentRunnerProtectedStateFake struct {
-	calls      *[]string
-	checkpoint SourceAgentUpgradeCommandCheckpoint
-	found      bool
-	readyErr   error
-	saveErr    error
-	ackErr     error
-	identity   SourceAgentRuntimeIdentity
+	calls               *[]string
+	checkpoint          SourceAgentUpgradeCommandCheckpoint
+	found               bool
+	readyErr            error
+	saveErr             error
+	ackErr              error
+	conflictErr         error
+	identity            SourceAgentRuntimeIdentity
+	conflictID          string
+	conflictFingerprint string
+}
+
+type sourceAgentRunnerMaintenanceStateFake struct {
+	*sourceAgentRunnerProtectedStateFake
+	blocked bool
+}
+
+func (s *sourceAgentRunnerMaintenanceStateFake) WithSourceAgentLifecycle(
+	_ context.Context,
+	operation func() error,
+) error {
+	*s.calls = append(*s.calls, "lifecycle")
+	if s.blocked {
+		return ErrSourceAgentUpdateBusy
+	}
+	return operation()
 }
 
 func (s *sourceAgentRunnerProtectedStateFake) PublishAuthenticatedReady(_ context.Context, identity SourceAgentRuntimeIdentity) (bool, error) {
@@ -59,6 +78,15 @@ func (s *sourceAgentRunnerProtectedStateFake) SaveUpgradeCommandCheckpoint(_ con
 func (s *sourceAgentRunnerProtectedStateFake) RecordServerTerminalObservation(_ context.Context, command SourceAgentCommand) error {
 	*s.calls = append(*s.calls, "observe")
 	return s.ackErr
+}
+
+func (s *sourceAgentRunnerProtectedStateFake) RecordAuthenticatedUpgradeConflict(
+	_ context.Context,
+	commandID, fingerprint string,
+) error {
+	*s.calls = append(*s.calls, "conflict")
+	s.conflictID, s.conflictFingerprint = commandID, fingerprint
+	return s.conflictErr
 }
 
 type sourceAgentRunnerRecoveryClientFake struct {
@@ -238,6 +266,36 @@ func TestSourceAgentRunnerRejectsForeignRecoveredUpgrade(t *testing.T) {
 	}
 }
 
+func TestSourceAgentRunnerRecordsOnlyLocalIdentityForAuthenticatedRecoveryConflict(t *testing.T) {
+	var calls []string
+	active := sourceAgentRunnerRecoveryCommand(SourceAgentCommandVerifying)
+	conflicting := active
+	conflicting.UpgradeSpec = &SourceAgentUpgradeSpec{
+		ArtifactID: "artifact-conflict", ExpectedCurrentVersion: active.UpgradeSpec.ExpectedCurrentVersion,
+	}
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls, resumed: &conflicting}
+	protected := &sourceAgentRunnerProtectedStateFake{calls: &calls, found: true}
+	protected.checkpoint = SourceAgentUpgradeCommandCheckpoint{
+		SchemaVersion: sourceAgentUpgradeCheckpointSchema, AgentID: active.TargetAgentID,
+		ClaimOwner: active.ClaimOwner, Fingerprint: sourceAgentUpgradeCommandFingerprint(active), Command: active,
+	}
+	runner := &SourceAgentRunner{
+		client: &SourceAgentClient{agentID: "agent-a"}, upgradeRecoveryClient: recovery,
+		upgradeState: protected, workerType: "wechat-worker", platform: "darwin",
+		architecture: "arm64", version: "2.0.0", protocolVersion: "2026-08-01",
+		revision: sourceAgentUpdateTestRevision,
+	}
+	if _, err := runner.restoreProtectedUpgrade(context.Background()); !errors.Is(err, ErrSourceAgentUpgradeCheckpointConflict) {
+		t.Fatalf("restoreProtectedUpgrade() error=%v", err)
+	}
+	if got, want := strings.Join(calls, ","), "ready,load,resume,conflict"; got != want {
+		t.Fatalf("calls=%s want=%s", got, want)
+	}
+	if protected.conflictID != active.ID || protected.conflictFingerprint != sourceAgentUpgradeCommandFingerprint(active) {
+		t.Fatalf("conflict id=%q fingerprint=%q", protected.conflictID, protected.conflictFingerprint)
+	}
+}
+
 func TestSourceAgentRunnerDoesNotPublishReadyBeforeAuthenticatedHeartbeat(t *testing.T) {
 	var calls []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -273,6 +331,49 @@ func TestSourceAgentRunnerDoesNotPublishReadyBeforeAuthenticatedHeartbeat(t *tes
 	}
 	if got := strings.Join(calls, ","); got != "heartbeat" {
 		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestSourceAgentRunnerMaintenanceAllowsHeartbeatAndReadyButBlocksControlWork(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, "heartbeat")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(), HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = outbox.Close() })
+	recovery := &sourceAgentRunnerRecoveryClientFake{calls: &calls}
+	protected := &sourceAgentRunnerMaintenanceStateFake{
+		sourceAgentRunnerProtectedStateFake: &sourceAgentRunnerProtectedStateFake{calls: &calls},
+		blocked:                             true,
+	}
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, CommandClient: recovery, UpgradeRecoveryClient: recovery,
+		UpgradeState: protected, Outbox: outbox,
+		Adapter:    &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}},
+		WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01", Revision: sourceAgentUpdateTestRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(calls, ","), "heartbeat,ready,lifecycle"; got != want {
+		t.Fatalf("calls=%s, want %s", got, want)
 	}
 }
 

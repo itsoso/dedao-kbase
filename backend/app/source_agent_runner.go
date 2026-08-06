@@ -191,6 +191,9 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 	if r.upgradeState != nil {
 		handled, err := r.restoreProtectedUpgrade(ctx)
 		if err != nil {
+			if errors.Is(err, ErrSourceAgentUpdateBusy) {
+				return nil, health.Healthy, nil
+			}
 			return nil, health.Healthy, err
 		}
 		if handled && !r.hasCurrentCommand() {
@@ -212,19 +215,30 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 		return nil, health.Healthy, r.executeCurrentCommand(ctx, command)
 	}
 
-	command, err := r.commandClient.ClaimCommand(ctx)
-	if err != nil {
-		return nil, health.Healthy, fmt.Errorf("claim source-agent command: %w", err)
-	}
-	if command != nil {
-		if command.Type == SourceAgentCommandUpgrade && r.upgradeState != nil {
+	var command *SourceAgentCommand
+	err = r.withSourceAgentLifecycle(ctx, func() error {
+		var claimErr error
+		command, claimErr = r.commandClient.ClaimCommand(ctx)
+		if claimErr != nil {
+			return fmt.Errorf("claim source-agent command: %w", claimErr)
+		}
+		if command != nil && command.Type == SourceAgentCommandUpgrade && r.upgradeState != nil {
 			if !validSourceAgentUpgradeRecoveryResponse(*command, r.client.agentID, false) {
-				return nil, health.Healthy, ErrSourceAgentUpgradeCheckpointInvalid
+				return ErrSourceAgentUpgradeCheckpointInvalid
 			}
 			if err := r.upgradeState.SaveUpgradeCommandCheckpoint(ctx, *command); err != nil {
-				return nil, health.Healthy, fmt.Errorf("persist source-agent upgrade checkpoint: %w", err)
+				return fmt.Errorf("persist source-agent upgrade checkpoint: %w", err)
 			}
 		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrSourceAgentUpdateBusy) {
+			return nil, health.Healthy, nil
+		}
+		return nil, health.Healthy, err
+	}
+	if command != nil {
 		r.setCurrentCommand(*command)
 		if r.clearExpiredCurrentCommand(command.ID) {
 			return nil, health.Healthy, nil
@@ -242,14 +256,33 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 	if !health.Healthy || desiredState != SourceAgentDesiredActive || r.isSourceRunActive() || r.isUpgradeActive() {
 		return nil, health.Healthy, nil
 	}
-	run, err := r.client.Lease(ctx, r.adapter.Operations(), r.leaseDuration)
+	var run *SourceSyncRun
+	err = r.withSourceAgentLifecycle(ctx, func() error {
+		var leaseErr error
+		run, leaseErr = r.client.Lease(ctx, r.adapter.Operations(), r.leaseDuration)
+		if leaseErr != nil {
+			return fmt.Errorf("lease source sync run: %w", leaseErr)
+		}
+		if run != nil {
+			r.startSourceRun(run.ID)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, health.Healthy, fmt.Errorf("lease source sync run: %w", err)
-	}
-	if run != nil {
-		r.startSourceRun(run.ID)
+		if errors.Is(err, ErrSourceAgentUpdateBusy) {
+			return nil, health.Healthy, nil
+		}
+		return nil, health.Healthy, err
 	}
 	return run, health.Healthy, nil
+}
+
+func (r *SourceAgentRunner) withSourceAgentLifecycle(ctx context.Context, operation func() error) error {
+	guard, ok := r.upgradeState.(SourceAgentLifecycleState)
+	if !ok {
+		return operation()
+	}
+	return guard.WithSourceAgentLifecycle(ctx, operation)
 }
 
 func (r *SourceAgentRunner) restoreProtectedUpgrade(ctx context.Context) (bool, error) {
@@ -260,6 +293,16 @@ func (r *SourceAgentRunner) restoreProtectedUpgrade(ctx context.Context) (bool, 
 	if _, err := r.upgradeState.PublishAuthenticatedReady(ctx, identity); err != nil {
 		return false, fmt.Errorf("publish source-agent ready receipt: %w", err)
 	}
+	var handled bool
+	err := r.withSourceAgentLifecycle(ctx, func() error {
+		var restoreErr error
+		handled, restoreErr = r.restoreProtectedUpgradeLocked(ctx)
+		return restoreErr
+	})
+	return handled, err
+}
+
+func (r *SourceAgentRunner) restoreProtectedUpgradeLocked(ctx context.Context) (bool, error) {
 	checkpoint, found, err := r.upgradeState.LoadUpgradeCommandCheckpoint()
 	if err != nil {
 		return false, fmt.Errorf("load source-agent upgrade checkpoint: %w", err)
@@ -269,8 +312,15 @@ func (r *SourceAgentRunner) restoreProtectedUpgrade(ctx context.Context) (bool, 
 		if err != nil {
 			return false, fmt.Errorf("resume source-agent upgrade: %w", err)
 		}
-		if command == nil || sourceAgentUpgradeCommandFingerprint(*command) != checkpoint.Fingerprint ||
-			!validSourceAgentUpgradeRecoveryResponse(*command, checkpoint.AgentID, true) {
+		if command == nil || !validSourceAgentUpgradeRecoveryResponse(*command, checkpoint.AgentID, true) {
+			return false, ErrSourceAgentUpgradeCheckpointConflict
+		}
+		if sourceAgentUpgradeCommandFingerprint(*command) != checkpoint.Fingerprint {
+			if err := r.upgradeState.RecordAuthenticatedUpgradeConflict(
+				ctx, checkpoint.Command.ID, checkpoint.Fingerprint,
+			); err != nil {
+				return false, fmt.Errorf("record source-agent upgrade conflict: %w", err)
+			}
 			return false, ErrSourceAgentUpgradeCheckpointConflict
 		}
 		if isTerminalSourceAgentCommandState(command.State) {

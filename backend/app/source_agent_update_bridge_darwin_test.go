@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -147,6 +148,274 @@ func TestSourceAgentUpdateBridgeStagesExactRequestAndPathFreeHandoff(t *testing.
 		if strings.Contains(strings.ToLower(string(handoffPayload)), strings.ToLower(forbidden)) {
 			t.Fatalf("handoff leaked forbidden value %q: %s", forbidden, handoffPayload)
 		}
+	}
+}
+
+func TestSourceAgentUpdateBridgeCleansTerminalUpgradeThatNeverStartedUpdater(t *testing.T) {
+	t.Run("failed after prepare", func(t *testing.T) {
+		fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+		bridge := fixture.open(t)
+		command := sourceAgentUpdateNoAttemptCommandForTest(fixture)
+		if err := bridge.SaveUpgradeCommandCheckpoint(context.Background(), command); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := bridge.Prepare(context.Background(), command); err != nil {
+			t.Fatal(err)
+		}
+		terminal := sourceAgentUpdateTerminalCommandForTest(
+			command, SourceAgentCommandFailed, SourceAgentCommandCodeDownloadFailed, "",
+		)
+		if err := bridge.RecordServerTerminalObservation(context.Background(), terminal); err != nil {
+			t.Fatalf("RecordServerTerminalObservation() error=%v", err)
+		}
+		assertSourceAgentNoAttemptStateCleaned(t, bridge, fixture)
+	})
+
+	t.Run("canceled before prepare", func(t *testing.T) {
+		fixture := newSourceAgentUpdateBridgeFixture(t, "wcplus-worker")
+		bridge := fixture.open(t)
+		command := sourceAgentUpdateNoAttemptCommandForTest(fixture)
+		if err := bridge.SaveUpgradeCommandCheckpoint(context.Background(), command); err != nil {
+			t.Fatal(err)
+		}
+		terminal := sourceAgentUpdateTerminalCommandForTest(
+			command, SourceAgentCommandCanceled, SourceAgentCommandCodeCanceled, "",
+		)
+		if err := bridge.RecordServerTerminalObservation(context.Background(), terminal); err != nil {
+			t.Fatalf("RecordServerTerminalObservation() error=%v", err)
+		}
+		assertSourceAgentNoAttemptStateCleaned(t, bridge, fixture)
+	})
+}
+
+func TestSourceAgentUpdateBridgeRefusesNoAttemptCleanupWithAmbiguousEvidence(t *testing.T) {
+	t.Run("pending updater", func(t *testing.T) {
+		fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+		bridge := fixture.open(t)
+		command := sourceAgentUpdateNoAttemptCommandForTest(fixture)
+		if err := bridge.SaveUpgradeCommandCheckpoint(context.Background(), command); err != nil {
+			t.Fatal(err)
+		}
+		request, err := bridge.Prepare(context.Background(), command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := bridge.receipts.PublishPending(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		terminal := sourceAgentUpdateTerminalCommandForTest(
+			command, SourceAgentCommandCanceled, SourceAgentCommandCodeCanceled, "",
+		)
+		if err := bridge.RecordServerTerminalObservation(context.Background(), terminal); !errors.Is(err, ErrSourceAgentUpgradeTerminalResolutionInvalid) {
+			t.Fatalf("RecordServerTerminalObservation() error=%v", err)
+		}
+		for _, path := range []string{fixture.stagedPath(), fixture.handoffPath()} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("recovery evidence %q was removed: %v", path, err)
+			}
+		}
+		if _, found, err := bridge.receipts.LoadPending(); err != nil || !found {
+			t.Fatalf("pending found=%t error=%v", found, err)
+		}
+		if _, found, err := bridge.LoadUpgradeCommandCheckpoint(); err != nil || !found {
+			t.Fatalf("checkpoint found=%t error=%v", found, err)
+		}
+	})
+
+	t.Run("server success without local outcome", func(t *testing.T) {
+		fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+		bridge := fixture.open(t)
+		command := sourceAgentUpdateNoAttemptCommandForTest(fixture)
+		if err := bridge.SaveUpgradeCommandCheckpoint(context.Background(), command); err != nil {
+			t.Fatal(err)
+		}
+		terminal := sourceAgentUpdateTerminalCommandForTest(
+			command, SourceAgentCommandSucceeded, SourceAgentCommandCodeUpgradeComplete, "2.0.0",
+		)
+		if err := bridge.RecordServerTerminalObservation(context.Background(), terminal); !errors.Is(err, ErrSourceAgentUpgradeTerminalResolutionInvalid) {
+			t.Fatalf("RecordServerTerminalObservation() error=%v", err)
+		}
+		if _, found, err := bridge.LoadUpgradeCommandCheckpoint(); err != nil || !found {
+			t.Fatalf("checkpoint found=%t error=%v", found, err)
+		}
+	})
+}
+
+type sourceAgentBlockingUpdaterActivatorForTest struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a *sourceAgentBlockingUpdaterActivatorForTest) StartUpdater(ctx context.Context) error {
+	close(a.started)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-a.release:
+		return nil
+	}
+}
+
+func TestSourceAgentUpdateBridgeSerializesPendingPublicationAgainstTerminalCleanup(t *testing.T) {
+	fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+	activator := &sourceAgentBlockingUpdaterActivatorForTest{
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	config := fixture.config()
+	config.Revision = sourceAgentArtifactTestRevision
+	config.Activator = activator
+	bridge, err := NewSourceAgentUpdateBridge(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bridge.Close() })
+	command := sourceAgentUpdateNoAttemptCommandForTest(fixture)
+	if _, err := bridge.Prepare(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	command.State = SourceAgentCommandInstalling
+	if err := bridge.SaveUpgradeCommandCheckpoint(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	upgradeDone := make(chan SourceAgentUpgradeResult, 1)
+	go func() { upgradeDone <- bridge.Upgrade(context.Background(), command) }()
+	select {
+	case <-activator.started:
+	case <-time.After(time.Second):
+		t.Fatal("updater activation did not start")
+	}
+	terminal := sourceAgentUpdateTerminalCommandForTest(
+		command, SourceAgentCommandCanceled, SourceAgentCommandCodeCanceled, "",
+	)
+	terminalDone := make(chan error, 1)
+	go func() { terminalDone <- bridge.RecordServerTerminalObservation(context.Background(), terminal) }()
+	select {
+	case err := <-terminalDone:
+		t.Fatalf("terminal cleanup raced pending activation: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(activator.release)
+	select {
+	case result := <-upgradeDone:
+		if !result.Waiting {
+			t.Fatalf("upgrade result=%#v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upgrade did not finish")
+	}
+	select {
+	case err := <-terminalDone:
+		if !errors.Is(err, ErrSourceAgentUpgradeTerminalResolutionInvalid) {
+			t.Fatalf("terminal error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal reconciliation did not resume")
+	}
+	if _, err := os.Lstat(fixture.stagedPath()); err != nil {
+		t.Fatalf("staged artifact was removed: %v", err)
+	}
+}
+
+func TestSourceAgentUpdateBridgePublishesReadyWhileUpdaterOwnsInstallLock(t *testing.T) {
+	fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+	first := fixture.open(t)
+	request, err := first.Prepare(context.Background(), fixture.command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal := sourceAgentUpdateJournal{
+		SchemaVersion: sourceAgentUpdateJournalSchema, CommandID: request.CommandID,
+		AttemptNonce: strings.Repeat("b", 64), RequestFingerprint: sourceAgentUpdateRequestFingerprint(request),
+		WorkerType: request.WorkerType, CurrentVersion: request.CurrentVersion, TargetVersion: request.TargetVersion,
+		Platform: request.Platform, Architecture: request.Architecture, ProtocolVersion: request.ProtocolVersion,
+		Revision: request.Revision, Channel: request.Channel, Stage: "restart_requested",
+		Backup:    SourceAgentBinaryIdentity{Size: 64, SHA256: strings.Repeat("c", 64), Device: 1, Inode: 1},
+		StartedAt: "2026-08-01T12:00:01.000000000Z", UpdatedAt: "2026-08-01T12:00:01.000000000Z",
+	}
+	if err := first.receipts.saveJournal(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	lockFD, err := unix.Open(fixture.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(lockFD)
+	if err := unix.Flock(lockFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, err := NewSourceAgentUpdateBridge(fixture.config())
+	if err != nil {
+		t.Fatalf("restarted worker bridge blocked by updater lock: %v", err)
+	}
+	defer restarted.Close()
+	published, err := restarted.PublishAuthenticatedReady(context.Background(), SourceAgentRuntimeIdentity{
+		WorkerType: request.WorkerType, Version: request.TargetVersion,
+		Platform: request.Platform, Architecture: request.Architecture,
+		ProtocolVersion: request.ProtocolVersion, Revision: request.Revision,
+	})
+	if err != nil || !published {
+		t.Fatalf("ready published=%t error=%v", published, err)
+	}
+	active := fixture.command
+	active.State = SourceAgentCommandRestarting
+	if result := restarted.Upgrade(context.Background(), active); !result.Waiting {
+		t.Fatalf("locked full bridge result=%#v", result)
+	}
+	if err := unix.Flock(lockFD, unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if result := restarted.Upgrade(context.Background(), active); !result.Waiting {
+		t.Fatalf("unlocked full bridge result=%#v", result)
+	}
+	if restarted.storage == nil {
+		t.Fatal("full bridge did not initialize after updater released install lock")
+	}
+}
+
+func sourceAgentUpdateNoAttemptCommandForTest(fixture *sourceAgentUpdateBridgeFixtureForTest) SourceAgentCommand {
+	command := sourceAgentTerminalResolutionCommand()
+	command.ID = fixture.command.ID
+	command.State = SourceAgentCommandDownloading
+	command.UpgradeSpec.ArtifactID = fixture.downloader.metadata.ID
+	return command
+}
+
+func sourceAgentUpdateTerminalCommandForTest(command SourceAgentCommand, state, code, actualVersion string) SourceAgentCommand {
+	command.State = state
+	command.ResultCode = code
+	command.ActualVersion = actualVersion
+	command.UpdatedAt = "2026-08-01T12:00:03.000000000Z"
+	command.CompletedAt = command.UpdatedAt
+	return command
+}
+
+func assertSourceAgentNoAttemptStateCleaned(
+	t *testing.T,
+	bridge *SourceAgentUpdateBridge,
+	fixture *sourceAgentUpdateBridgeFixtureForTest,
+) {
+	t.Helper()
+	if _, found, err := bridge.LoadUpgradeCommandCheckpoint(); err != nil || found {
+		t.Fatalf("checkpoint found=%t error=%v", found, err)
+	}
+	for _, path := range []string{
+		fixture.stagedPath(),
+		fixture.handoffPath(),
+		filepath.Join(fixture.root, sourceAgentUpdateHandoffDirectoryName, sourceAgentUpgradeTerminalObservationFileName),
+		filepath.Join(fixture.root, sourceAgentUpdateHandoffDirectoryName, sourceAgentUpgradeNoAttemptCleanupFileName),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("no-attempt evidence %q survives cleanup: %v", path, err)
+		}
+	}
+	workerName, _ := sourceAgentUpdateWorkerBasename(fixture.workerType)
+	worker, err := os.ReadFile(filepath.Join(fixture.root, workerName))
+	if err != nil || string(worker) != "current worker binary" {
+		t.Fatalf("worker changed during no-attempt cleanup: %q error=%v", worker, err)
 	}
 }
 
@@ -717,7 +986,11 @@ func TestSourceAgentUpdateBridgeUsesBoundedPrepareLockAndCleansOrphans(t *testin
 			target SourceAgentArtifactTarget,
 			protocol string,
 		) (SourceAgentArtifactPublic, io.ReadCloser, error) {
-			probeFD, err := unix.Open(fixture.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+			probeFD, err := unix.Open(
+				filepath.Join(fixture.root, sourceAgentUpdateLifecycleFileName),
+				unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+				0,
+			)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -735,7 +1008,11 @@ func TestSourceAgentUpdateBridgeUsesBoundedPrepareLockAndCleansOrphans(t *testin
 		if !lockObserved {
 			t.Fatal("Prepare did not hold the lifecycle lock during download/publish")
 		}
-		probeFD, err := unix.Open(fixture.root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+		probeFD, err := unix.Open(
+			filepath.Join(fixture.root, sourceAgentUpdateLifecycleFileName),
+			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+			0,
+		)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1363,6 +1640,27 @@ func sourceAgentUpdateBridgeInstallFixture(t *testing.T, workerType string) (str
 		}
 	}
 	return root, filepath.Join(root, sourceAgentUpdateUpdaterBasename)
+}
+
+func TestSourceAgentUpdateBridgeLifecycleRefusesMaintenanceMarker(t *testing.T) {
+	fixture := newSourceAgentUpdateBridgeFixture(t, "wechat-worker")
+	bridge := fixture.open(t)
+	t.Cleanup(func() { _ = bridge.Close() })
+	marker := filepath.Join(fixture.root, sourceAgentUpdateMaintenanceFileName)
+	if err := os.WriteFile(marker, []byte("maintenance\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := bridge.WithSourceAgentLifecycle(context.Background(), func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, ErrSourceAgentUpdateBusy) {
+		t.Fatalf("WithSourceAgentLifecycle() error=%v", err)
+	}
+	if called {
+		t.Fatal("maintenance-blocked lifecycle operation ran")
+	}
 }
 
 var _ SourceAgentArtifactDownloader = (*SourceAgentClient)(nil)

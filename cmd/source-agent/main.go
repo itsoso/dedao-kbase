@@ -5,12 +5,16 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,12 +28,13 @@ type sourceEnvironmentLookup func(string) (string, bool)
 
 const (
 	sourceAgentWorkerType      = "wechat-worker"
-	sourceAgentVersion         = "0.1.0"
+	sourceAgentVersion         = "0.2.0"
 	sourceAgentProtocolVersion = "2026-08-01"
 )
 
 var sourceAgentTransportTokenLoader = sourceagentsecret.LoadTransportToken
 var sourceAgentLegacyTransportTokenLoader = loadLegacySourceTransportToken
+var sourceAgentRevision = "0000000000000000000000000000000000000000"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -83,9 +88,12 @@ func loadLegacySourceTransportToken(ctx context.Context, agentID string) (string
 	}
 	return string(value), nil
 }
-func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) error {
+func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) (returnErr error) {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: source-agent check-config, doctor, once, run, or enroll")
+		return fmt.Errorf("usage: source-agent build-info, check-config, doctor, once, run, or enroll")
+	}
+	if args[0] == "build-info" {
+		return writeSourceAgentBuildInfo(os.Stdout)
 	}
 	if args[0] == "check-config" {
 		if _, err := loadSourceAgentConfigOnly(lookup); err != nil {
@@ -115,7 +123,7 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	if err != nil {
 		return err
 	}
-	defer outbox.Close()
+	defer func() { returnErr = errors.Join(returnErr, outbox.Close()) }()
 	if args[0] == "doctor" {
 		report, doctorErr := inspectSourceAgent(ctx, client, sessions)
 		if doctorErr != nil {
@@ -143,7 +151,12 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	if err != nil {
 		return err
 	}
-	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter)
+	upgradeBridge, err := newWeChatProductionUpgradeBridge(client)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, upgradeBridge.Close()) }()
+	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter, upgradeBridge, upgradeBridge)
 	if err != nil {
 		return err
 	}
@@ -161,16 +174,78 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	})
 }
 
-func newWeChatSourceAgentRunner(client *app.SourceAgentClient, outbox *app.SourceAgentOutbox, adapter *app.WeChatSourceAdapter) (*app.SourceAgentRunner, error) {
-	return app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
-		Client: client, Outbox: outbox, Adapter: adapter, Diagnoser: adapter,
-		Updater: &sourceAgentFailClosedUpdater{}, WorkerType: sourceAgentWorkerType,
-		Version: sourceAgentVersion, ProtocolVersion: sourceAgentProtocolVersion,
+func writeSourceAgentBuildInfo(output io.Writer) error {
+	if output == nil || !validSourceAgentCompiledRevision(sourceAgentRevision) {
+		return errors.New("source-agent build identity is invalid")
+	}
+	return json.NewEncoder(output).Encode(map[string]string{
+		"worker_type": sourceAgentWorkerType, "version": sourceAgentVersion,
+		"protocol_version": sourceAgentProtocolVersion, "platform": runtime.GOOS,
+		"architecture": runtime.GOARCH, "revision": sourceAgentRevision,
 	})
 }
 
-// There is no trusted remote-to-local artifact metadata bridge yet. Keep
-// upgrade commands fail-closed instead of claiming an installation that did not run.
+func validSourceAgentCompiledRevision(value string) bool {
+	if (len(value) != 40 && len(value) != 64) || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func newWeChatSourceAgentRunner(
+	client *app.SourceAgentClient,
+	outbox *app.SourceAgentOutbox,
+	adapter *app.WeChatSourceAdapter,
+	updater app.SourceAgentUpdater,
+	upgradeState app.SourceAgentProtectedUpgradeState,
+) (*app.SourceAgentRunner, error) {
+	revision := ""
+	if upgradeState != nil {
+		revision = sourceAgentRevision
+	}
+	return app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
+		Client: client, Outbox: outbox, Adapter: adapter, Diagnoser: adapter,
+		Updater: updater, UpgradeState: upgradeState, WorkerType: sourceAgentWorkerType,
+		Version: sourceAgentVersion, ProtocolVersion: sourceAgentProtocolVersion,
+		Revision: revision,
+	})
+}
+
+func newWeChatProductionUpgradeBridge(client *app.SourceAgentClient) (*app.SourceAgentUpdateBridge, error) {
+	workerExecutable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve source-agent executable: %w", err)
+	}
+	workerExecutable, err = filepath.EvalSymlinks(filepath.Clean(workerExecutable))
+	if err != nil || filepath.Base(workerExecutable) != "source-agent" {
+		return nil, fmt.Errorf("source-agent must run from its fixed installed executable")
+	}
+	activator, err := app.NewSourceAgentUpdaterActivator(sourceAgentWorkerType, os.Getuid(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return newWeChatWorkerUpgradeBridge(client, workerExecutable, activator)
+}
+
+func newWeChatWorkerUpgradeBridge(
+	client *app.SourceAgentClient,
+	workerExecutable string,
+	activator app.SourceAgentUpdaterActivator,
+) (*app.SourceAgentUpdateBridge, error) {
+	if client == nil || filepath.Base(workerExecutable) != "source-agent" {
+		return nil, fmt.Errorf("invalid fixed source-agent upgrade runtime")
+	}
+	return app.NewSourceAgentUpdateBridge(app.SourceAgentUpdateBridgeConfig{
+		Downloader: client, UpdaterExecutable: filepath.Join(filepath.Dir(workerExecutable), "source-agent-updater"),
+		WorkerType: sourceAgentWorkerType, CurrentVersion: sourceAgentVersion,
+		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		ProtocolVersion: sourceAgentProtocolVersion, Revision: sourceAgentRevision,
+		Activator: activator,
+	})
+}
+
+// Retained only for narrow tests that intentionally omit an installed updater.
 type sourceAgentFailClosedUpdater struct{}
 
 func (*sourceAgentFailClosedUpdater) Upgrade(context.Context, app.SourceAgentCommand) app.SourceAgentUpgradeResult {

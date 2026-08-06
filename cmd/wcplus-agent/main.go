@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,11 +21,20 @@ import (
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
-const wcplusAgentVersion = "0.1.0"
+const wcplusAgentVersion = "0.2.0"
+
+var wcplusAgentRevision = "0000000000000000000000000000000000000000"
 
 type environmentLookup func(string) (string, bool)
 
 var wcplusTransportTokenLoader = sourceagentsecret.LoadTransportToken
+var wcplusAgentUpgradeFactory = newWCPlusProductionUpgradeRuntime
+
+type wcplusWorkerUpgradeRuntime struct {
+	updater app.SourceAgentUpdater
+	state   app.SourceAgentProtectedUpgradeState
+	closer  interface{ Close() error }
+}
 
 type wcplusAgentRuntime struct {
 	client  *app.SourceAgentClient
@@ -29,6 +42,7 @@ type wcplusAgentRuntime struct {
 	adapter *app.WCPlusSourceAdapter
 	runner  *app.SourceAgentRunner
 	outbox  *app.SourceAgentOutbox
+	upgrade interface{ Close() error }
 }
 
 func main() {
@@ -40,9 +54,12 @@ func main() {
 	}
 }
 
-func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout, stderr io.Writer) error {
-	if len(args) != 1 || (args[0] != "check-config" && args[0] != "doctor" && args[0] != "once" && args[0] != "run") {
-		return fmt.Errorf("usage: wcplus-agent must be check-config, doctor, once, or run")
+func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout, stderr io.Writer) (returnErr error) {
+	if len(args) != 1 || (args[0] != "build-info" && args[0] != "check-config" && args[0] != "doctor" && args[0] != "once" && args[0] != "run") {
+		return fmt.Errorf("usage: wcplus-agent must be build-info, check-config, doctor, once, or run")
+	}
+	if args[0] == "build-info" {
+		return writeWCPlusAgentBuildInfo(stdout)
 	}
 	if args[0] == "check-config" {
 		_, err := loadWCPlusAgentConfigOnly(lookup)
@@ -56,7 +73,7 @@ func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout
 	if err != nil {
 		return err
 	}
-	defer runtime.close()
+	defer func() { returnErr = errors.Join(returnErr, runtime.close()) }()
 
 	switch args[0] {
 	case "doctor":
@@ -86,6 +103,25 @@ func runCLI(ctx context.Context, args []string, lookup environmentLookup, stdout
 		}
 	}
 	return nil
+}
+
+func writeWCPlusAgentBuildInfo(output io.Writer) error {
+	if output == nil || !validWCPlusAgentCompiledRevision(wcplusAgentRevision) {
+		return errors.New("WC Plus agent build identity is invalid")
+	}
+	return json.NewEncoder(output).Encode(map[string]string{
+		"worker_type": "wcplus-worker", "version": wcplusAgentVersion,
+		"protocol_version": "2026-08-01", "platform": runtime.GOOS,
+		"architecture": runtime.GOARCH, "revision": wcplusAgentRevision,
+	})
+}
+
+func validWCPlusAgentCompiledRevision(value string) bool {
+	if (len(value) != 40 && len(value) != 64) || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func loadWCPlusAgentConfig(ctx context.Context, lookup environmentLookup) (app.SourceAgentConfig, error) {
@@ -156,27 +192,47 @@ func newWCPlusAgentRuntime(config app.SourceAgentConfig, withOutbox bool) (*wcpl
 			TaskPollInterval: 2 * time.Second,
 		})
 		if err != nil {
-			_ = outbox.Close()
-			return nil, err
+			return nil, errors.Join(err, outbox.Close())
 		}
 		runtime.outbox = outbox
+		upgrade, upgradeErr := wcplusAgentUpgradeFactory(client)
+		if upgradeErr != nil {
+			return nil, errors.Join(upgradeErr, outbox.Close())
+		}
+		runtime.upgrade = upgrade.closer
+		revision := ""
+		if upgrade.state != nil {
+			revision = wcplusAgentRevision
+		}
 		runtime.runner, err = app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
 			Client: client, Outbox: outbox, Adapter: runtime.adapter, Diagnoser: runtime.adapter,
-			Updater: &wcplusAgentFailClosedUpdater{}, WorkerType: "wcplus-worker",
-			Version: wcplusAgentVersion, ProtocolVersion: "2026-08-01", LeaseDuration: 2 * time.Minute,
+			Updater: upgrade.updater, UpgradeState: upgrade.state, WorkerType: "wcplus-worker",
+			Version: wcplusAgentVersion, ProtocolVersion: "2026-08-01", Revision: revision,
+			LeaseDuration: 2 * time.Minute,
 		})
 		if err != nil {
-			_ = outbox.Close()
-			return nil, err
+			var closeErr error
+			if runtime.upgrade != nil {
+				closeErr = runtime.upgrade.Close()
+			}
+			return nil, errors.Join(err, closeErr, outbox.Close())
 		}
 	}
 	return runtime, nil
 }
 
-func (r *wcplusAgentRuntime) close() {
-	if r != nil && r.outbox != nil {
-		_ = r.outbox.Close()
+func (r *wcplusAgentRuntime) close() error {
+	if r == nil {
+		return nil
 	}
+	var closeErrors []error
+	if r != nil && r.outbox != nil {
+		closeErrors = append(closeErrors, r.outbox.Close())
+	}
+	if r != nil && r.upgrade != nil {
+		closeErrors = append(closeErrors, r.upgrade.Close())
+	}
+	return errors.Join(closeErrors...)
 }
 
 func (r *wcplusAgentRuntime) doctor(ctx context.Context, output io.Writer) error {
@@ -209,8 +265,44 @@ func (r *wcplusAgentRuntime) once(ctx context.Context) (app.SourceAgentCycleResu
 	return r.runner.RunOnce(ctx)
 }
 
-// Do not infer trusted artifact metadata from a remote command. Until the fixed
-// local updater handoff is wired, upgrades fail closed.
+func newWCPlusProductionUpgradeRuntime(client *app.SourceAgentClient) (wcplusWorkerUpgradeRuntime, error) {
+	workerExecutable, err := os.Executable()
+	if err != nil {
+		return wcplusWorkerUpgradeRuntime{}, fmt.Errorf("resolve WC Plus agent executable: %w", err)
+	}
+	workerExecutable, err = filepath.EvalSymlinks(filepath.Clean(workerExecutable))
+	if err != nil || filepath.Base(workerExecutable) != "wcplus-agent" {
+		return wcplusWorkerUpgradeRuntime{}, fmt.Errorf("WC Plus agent must run from its fixed installed executable")
+	}
+	activator, err := app.NewSourceAgentUpdaterActivator("wcplus-worker", os.Getuid(), nil)
+	if err != nil {
+		return wcplusWorkerUpgradeRuntime{}, err
+	}
+	bridge, err := newWCPlusWorkerUpgradeBridge(client, workerExecutable, activator)
+	if err != nil {
+		return wcplusWorkerUpgradeRuntime{}, err
+	}
+	return wcplusWorkerUpgradeRuntime{updater: bridge, state: bridge, closer: bridge}, nil
+}
+
+func newWCPlusWorkerUpgradeBridge(
+	client *app.SourceAgentClient,
+	workerExecutable string,
+	activator app.SourceAgentUpdaterActivator,
+) (*app.SourceAgentUpdateBridge, error) {
+	if client == nil || filepath.Base(workerExecutable) != "wcplus-agent" {
+		return nil, fmt.Errorf("invalid fixed WC Plus upgrade runtime")
+	}
+	return app.NewSourceAgentUpdateBridge(app.SourceAgentUpdateBridgeConfig{
+		Downloader: client, UpdaterExecutable: filepath.Join(filepath.Dir(workerExecutable), "source-agent-updater"),
+		WorkerType: "wcplus-worker", CurrentVersion: wcplusAgentVersion,
+		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		ProtocolVersion: "2026-08-01", Revision: wcplusAgentRevision,
+		Activator: activator,
+	})
+}
+
+// Retained only for narrow tests that intentionally omit an installed updater.
 type wcplusAgentFailClosedUpdater struct{}
 
 func (*wcplusAgentFailClosedUpdater) Upgrade(context.Context, app.SourceAgentCommand) app.SourceAgentUpgradeResult {
