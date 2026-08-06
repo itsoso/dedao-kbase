@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -48,6 +49,8 @@ type KBaseHTTPConfig struct {
 	AnalysisGenerator       BookAnalysisGenerator
 	ChatClient              BookKnowledgeLLMClient
 	DedaoLibrary            DedaoLibraryService
+	DedaoAuth               DedaoAuthProvider
+	DedaoEbooks             DedaoEbookAcquisitionService
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
 	AgentTools              []string
@@ -98,6 +101,8 @@ type kbaseHTTPHandler struct {
 	analysisGenerator       BookAnalysisGenerator
 	chatClient              BookKnowledgeLLMClient
 	dedaoLibrary            DedaoLibraryService
+	dedaoAuth               DedaoAuthProvider
+	dedaoEbooks             DedaoEbookAcquisitionService
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
 	agentTools              []string
@@ -223,6 +228,8 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		analysisGenerator:       analysisGenerator,
 		chatClient:              cfg.ChatClient,
 		dedaoLibrary:            dedaoLibrary,
+		dedaoAuth:               defaultDedaoAuthProvider(cfg.DedaoAuth),
+		dedaoEbooks:             defaultDedaoEbookAcquisitionService(cfg.DedaoEbooks),
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
 		agentTools:              agentTools,
@@ -478,6 +485,46 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleContextChat(w, r)
 		return
 	}
+	if r.URL.Path == "/api/jobs" {
+		h.handleBookKnowledgeJobs(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/jobs/") {
+		h.handleGetBookKnowledgeJob(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/session" {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleDedaoSession(w)
+		return
+	}
+	if r.URL.Path == "/api/dedao/auth/qrcode" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleDedaoAuthQRCode(w)
+		return
+	}
+	if r.URL.Path == "/api/dedao/auth/check" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		h.handleDedaoAuthCheck(w, r)
+		return
+	}
+	if r.URL.Path == "/api/dedao/search/ebooks" {
+		h.handleDedaoEbookSearch(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/dedao/ebooks/") && strings.HasSuffix(r.URL.Path, "/bookshelf") {
+		h.handleDedaoEbookBookshelf(w, r)
+		return
+	}
 	if r.URL.Path == "/api/dedao/library" {
 		h.handleDedaoLibrary(w, r)
 		return
@@ -565,6 +612,176 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeHTTPError(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (h *kbaseHTTPHandler) handleDedaoSession(w http.ResponseWriter) {
+	setHTTPNoStore(w)
+	writeHTTPJSON(w, http.StatusOK, h.dedaoAuth.Session())
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAuthQRCode(w http.ResponseWriter) {
+	setHTTPNoStore(w)
+	qr, err := h.dedaoAuth.NewQRCode()
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, "failed to create dedao login qrcode")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, qr)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoAuthCheck(w http.ResponseWriter, r *http.Request) {
+	setHTTPNoStore(w)
+	defer r.Body.Close()
+	var request DedaoLoginCheckRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	request.Token = strings.TrimSpace(request.Token)
+	request.QRCodeString = strings.TrimSpace(request.QRCodeString)
+	if request.Token == "" || request.QRCodeString == "" {
+		writeHTTPError(w, http.StatusBadRequest, "token and qr_code_string are required")
+		return
+	}
+	result, err := h.dedaoAuth.CheckLogin(request.Token, request.QRCodeString)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao login")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func setHTTPNoStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+}
+
+func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		limit := parseBoundedInt(r.URL.Query().Get("limit"), 50, 1, 100)
+		jobs, err := h.store.ListBookKnowledgeJobs(limit)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, "failed to list jobs")
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+	case http.MethodPost:
+		defer r.Body.Close()
+		var request BookKnowledgeJobRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&request); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		normalized, err := normalizeBookKnowledgeJobRequest(request)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		jobService := getService()
+		detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, jobService, normalized.EbookEnID)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
+			return
+		}
+		if detail == nil {
+			writeHTTPError(w, http.StatusNotFound, "ebook not found")
+			return
+		}
+		detailEnID := strings.TrimSpace(detail.Enid)
+		if detail.ID <= 0 || detailEnID == "" {
+			writeHTTPError(w, http.StatusBadGateway, "unable to verify dedao ebook identity")
+			return
+		}
+		if detail.ID != normalized.EbookID || detailEnID != normalized.EbookEnID {
+			writeHTTPError(w, http.StatusBadRequest, "ebook identity does not match request")
+			return
+		}
+		if !detail.IsBuy && !detail.IsOnBookshelf {
+			writeHTTPError(w, http.StatusForbidden, "ebook is not owned or on the active bookshelf")
+			return
+		}
+		job, err := h.store.CreateBookKnowledgeJob(normalized)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, "failed to create job")
+			return
+		}
+		go func(service *services.Service) {
+			if err := h.store.RunBookKnowledgeJobWithService(job.ID, service); err != nil {
+				log.Printf("book knowledge job %q failed to persist state", job.ID)
+			}
+		}(jobService)
+		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
+	default:
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleGetBookKnowledgeJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	rawID := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
+	if rawID == "" || strings.Contains(rawID, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+	jobID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(jobID) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
+		return
+	}
+	job, err := h.store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		writeHTTPError(w, http.StatusNotFound, "job not found")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbookSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	page := parseBoundedInt(r.URL.Query().Get("page"), 1, 1, 10000)
+	pageSize := parseBoundedInt(r.URL.Query().Get("page_size"), 30, 1, 100)
+	result, err := h.dedaoEbooks.SearchEbooks(query, page, pageSize)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, "failed to search dedao ebooks")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleDedaoEbookBookshelf(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	const prefix = "/api/dedao/ebooks/"
+	middle := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, prefix), "/bookshelf")
+	if middle == "" || strings.Contains(middle, "/") {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	enid, err := url.PathUnescape(middle)
+	if err != nil || strings.TrimSpace(enid) == "" || strings.Contains(enid, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "invalid ebook enid")
+		return
+	}
+	result, err := h.dedaoEbooks.AddEbookToBookshelf(enid)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, "failed to add dedao ebook to bookshelf")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeFeed(w http.ResponseWriter, r *http.Request) {

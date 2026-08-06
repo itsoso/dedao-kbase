@@ -30,7 +30,9 @@ func BuildBookKnowledgeFromHTMLFile(book BookKnowledgeBook, htmlPath string, sto
 	if err != nil {
 		return nil, err
 	}
-	book.SourceHTML = htmlPath
+	if strings.TrimSpace(book.SourceHTML) == "" {
+		book.SourceHTML = htmlPath
+	}
 	pkg, err := ExtractBookKnowledgeFromHTML(book, string(content))
 	if err != nil {
 		return nil, err

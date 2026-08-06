@@ -3,10 +3,47 @@ package app
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestSyncEbookToBookKnowledgeStoreDownloadsAndIngestsLocally(t *testing.T) {
+	downloadRoot := t.TempDir()
+	store := NewBookKnowledgeStore(t.TempDir())
+	htmlPath := filepath.Join(downloadRoot, "book.html")
+	if err := os.WriteFile(htmlPath, []byte(`<html><body><h1>第一章</h1><p>可检索的正文。</p></body></html>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDownload := downloadEbookForKnowledgeSync
+	downloadEbookForKnowledgeSync = func(_ context.Context, id int, enid, root string) (*EBookDownloadResult, error) {
+		if id != 42 || enid != "ebook-enid" || root != downloadRoot {
+			t.Fatalf("download args id=%d enid=%q root=%q", id, enid, root)
+		}
+		return &EBookDownloadResult{BookID: id, Title: "测试电子书", HTMLPath: htmlPath}, nil
+	}
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+
+	result, err := SyncEbookToBookKnowledgeStore(context.Background(), 42, "ebook-enid", store, downloadRoot)
+	if err != nil {
+		t.Fatalf("SyncEbookToBookKnowledgeStore: %v", err)
+	}
+	if result.KnowledgeBookID != "42" || result.Title != "测试电子书" {
+		t.Fatalf("result = %#v", result)
+	}
+	pkg, err := store.LoadPackage("42")
+	if err != nil || len(pkg.Chunks) == 0 {
+		t.Fatalf("knowledge package = %#v, err=%v", pkg, err)
+	}
+	if pkg.Book.SourceHTML != "dedao://ebook/ebook-enid" {
+		t.Fatalf("knowledge source = %q, want stable Dedao URI", pkg.Book.SourceHTML)
+	}
+	if strings.Contains(pkg.Book.SourceHTML, downloadRoot) || len(pkg.Citations) == 0 || pkg.Citations[0].SourceHTML != pkg.Book.SourceHTML {
+		t.Fatalf("knowledge package leaked download path or lost source binding: book=%#v citations=%#v", pkg.Book, pkg.Citations)
+	}
+}
 
 func TestEbookHTMLPath(t *testing.T) {
 	got, err := ebookHTMLPath("/tmp/down-dedao", "123_测试: 电子书_作者")

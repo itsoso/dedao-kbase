@@ -470,6 +470,21 @@ func (s *Service) reqSearchHot() (io.ReadCloser, error) {
 	return handleHTTPResponse(resp, err)
 }
 
+// reqSearchEbooks searches the full Dedao ebook catalog.
+func (s *Service) reqSearchEbooks(query string, page, size int, requestID string) (io.ReadCloser, error) {
+	resp, err := s.client.R().
+		SetBody(map[string]interface{}{
+			"content":    query,
+			"hl_num":     3,
+			"page":       page,
+			"request_id": requestID,
+			"size":       size,
+			"type":       2,
+		}).
+		Post("/api/search/v2/pc/searchebookchapter")
+	return handleHTTPResponse(resp, err)
+}
+
 // reqSunflowerLabelList index label list
 // nType 2-好看又好查的电子书, 4-精选课程
 func (s *Service) reqSunflowerLabelList(nType int) (io.ReadCloser, error) {

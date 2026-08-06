@@ -167,6 +167,7 @@ assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"),
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
 assert.ok(html.includes("20260724-evidence-audit-focus"), "evidence audit workspace release should use a fresh browser cache version");
+assert.ok(html.includes("20260802-dedao-acquisition"), "Dedao acquisition release should use a fresh browser cache version");
 assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
 assert.ok(js.includes('"/course": ROUTES.dedaoCourses'), "legacy course alias should be preserved");
 assert.ok(js.includes('"/ebook": ROUTES.dedaoEbooks'), "legacy ebook alias should be preserved");

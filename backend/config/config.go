@@ -46,6 +46,7 @@ type ConfigsData struct {
 	configFilePath string
 	configFile     *os.File
 	fileMu         sync.Mutex
+	accountMu      sync.RWMutex
 	service        *services.Service
 }
 
@@ -116,14 +117,18 @@ func (c *ConfigsData) Save() error {
 	if err != nil {
 		return err
 	}
+	c.accountMu.RLock()
+	activeUID := c.AcitveUID
+	users := append(DedaoUsers(nil), c.Users...)
+	c.accountMu.RUnlock()
 
 	c.fileMu.Lock()
 	defer c.fileMu.Unlock()
 
 	// 保存配置的数据
 	conf := configJSONExport{
-		AcitveUID: c.AcitveUID,
-		Users:     c.Users,
+		AcitveUID: activeUID,
+		Users:     users,
 	}
 
 	data, err := jsoniter.MarshalIndent(conf, "", " ")
@@ -243,7 +248,12 @@ func GetConfigDir() string {
 
 // ActiveUserService user
 func (c *ConfigsData) ActiveUserService() *services.Service {
+	c.accountMu.Lock()
+	defer c.accountMu.Unlock()
 	if c.service == nil {
+		if c.activeUser == nil {
+			c.activeUser = new(Dedao)
+		}
 		c.service = c.activeUser.New()
 	}
 	return c.service
@@ -257,8 +267,6 @@ func (c *ConfigsData) SetUser(u *Dedao) (*Dedao, *services.User, error) {
 		return nil, nil, err
 	}
 
-	c.DeleteUser(&User{UIDHazy: user.UIDHazy})
-
 	dedao := &Dedao{
 		User: User{
 			UIDHazy: user.UIDHazy,
@@ -267,13 +275,22 @@ func (c *ConfigsData) SetUser(u *Dedao) (*Dedao, *services.User, error) {
 		},
 		CookieOptions: u.CookieOptions,
 	}
+	c.accountMu.Lock()
+	c.deleteUserLocked(&User{UIDHazy: user.UIDHazy})
 	c.Users = append(c.Users, dedao)
-	c.setActiveUser(dedao)
+	c.setActiveUserLocked(dedao)
+	c.accountMu.Unlock()
 	return dedao, user, nil
 }
 
 // DeleteUser delete
 func (c *ConfigsData) DeleteUser(u *User) {
+	c.accountMu.Lock()
+	defer c.accountMu.Unlock()
+	c.deleteUserLocked(u)
+}
+
+func (c *ConfigsData) deleteUserLocked(u *User) {
 	for k, user := range c.Users {
 		if user.UIDHazy == u.UIDHazy {
 			c.Users = append(c.Users[:k], c.Users[k+1:]...)
@@ -284,27 +301,40 @@ func (c *ConfigsData) DeleteUser(u *User) {
 
 // ActiveUser active user
 func (c *ConfigsData) ActiveUser() *Dedao {
+	c.accountMu.RLock()
+	defer c.accountMu.RUnlock()
 	return c.activeUser
 }
 
 func (c *ConfigsData) setActiveUser(u *Dedao) {
+	c.accountMu.Lock()
+	defer c.accountMu.Unlock()
+	c.setActiveUserLocked(u)
+}
+
+func (c *ConfigsData) setActiveUserLocked(u *Dedao) {
 	c.AcitveUID = u.UIDHazy
 	c.activeUser = u
+	c.service = nil
 }
 
 // LoginUserCount 登录用户数量
 func (c *ConfigsData) LoginUserCount() int {
+	c.accountMu.RLock()
+	defer c.accountMu.RUnlock()
 	return len(c.Users)
 }
 
 // SwitchUser switch user
 func (c *ConfigsData) SwitchUser(u *User) error {
+	c.accountMu.Lock()
 	for _, user := range c.Users {
 		if user.UIDHazy == u.UIDHazy {
-			c.setActiveUser(user)
-			err := c.Save()
-			return err
+			c.setActiveUserLocked(user)
+			c.accountMu.Unlock()
+			return c.Save()
 		}
 	}
+	c.accountMu.Unlock()
 	return errors.New("用户不存在")
 }

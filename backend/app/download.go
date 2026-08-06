@@ -34,6 +34,7 @@ type OdobDownload struct {
 
 type EBookDownload struct {
 	Ctx          context.Context
+	Service      *services.Service
 	DownloadType int // 1:html, 2:PDF文档, 3:epub
 	ID           int
 	EnID         string
@@ -52,6 +53,13 @@ type Progress struct {
 	Pct     int    `json:"pct"`
 	Value   string `json:"value"`
 	ID      int    `json:"id"` // 课程 id
+}
+
+func emitEbookDownloadProgress(ctx context.Context, progress Progress) {
+	if ctx == nil || ctx.Value("events") == nil {
+		return
+	}
+	runtime.EventsEmit(ctx, "ebookDownload", progress)
 }
 
 func SetOutputDir(dir string) {
@@ -224,7 +232,11 @@ func (d *EBookDownload) Download() error {
 }
 
 func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
-	detail, err := EbookDetail(d.EnID)
+	service := d.Service
+	if service == nil {
+		service = dedaoServiceFromContext(d.Ctx)
+	}
+	detail, err := service.EbookDetail(d.EnID)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +249,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	}
 
 	title += "_" + detail.BookAuthor
-	info, svgContent, err := EbookPage(d.Ctx, detail.Enid)
+	info, svgContent, err := ebookPageWithService(d.Ctx, service, detail.Enid)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +272,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	var progress Progress
 	progress.Pct = 100
 	progress.Value = "正在生成" + dType[d.DownloadType] + "文件"
-	runtime.EventsEmit(d.Ctx, "ebookDownload", progress)
+	emitEbookDownloadProgress(d.Ctx, progress)
 	switch d.DownloadType {
 	case 1:
 		result.HTMLPath, err = ebookHTMLPath(outputDir, title)
