@@ -21,9 +21,52 @@ for (const marker of [
   "createSourceAgentUpgrade",
   "confirmSourceAgentUpgrade",
   "bindSourceAgentManagementEvents",
+  "getSourceAgentDetailID",
+  "sourceAgentDetailState",
+  "renderSourceAgentDetail",
+  "loadSourceAgentDetail",
+  "sourceAgentDetailSequence",
+  "sourceAgentRedactedDiagnostics",
 ]) {
   assert.ok(js.includes(marker), `app.js should include ${marker}`);
 }
+
+for (const marker of [
+  'startsWith(`${ROUTES.sourceAgents}/`)',
+  "decodeURIComponent",
+  "encodeURIComponent(sourceAgentDetailState.agentID)",
+  'apiFetch("/api/source-subscriptions")',
+  'apiFetch("/api/source-sync/runs?limit=200")',
+  "/api/source-sync/runs/${encodeURIComponent(run.id)}",
+]) {
+  assert.ok(js.includes(marker), `detail route should include ${marker}`);
+}
+
+for (const label of [
+  "Agent 详情",
+  "返回 Agent 总览",
+  "绑定订阅",
+  "最近运行",
+  "命令时间线",
+  "Outbox 统计",
+  "脱敏诊断",
+  "未找到该 Agent",
+]) {
+  assert.ok(js.includes(label), `detail route should render ${label}`);
+}
+
+for (const className of [
+  ".source-agent-detail",
+  ".source-agent-detail__hero",
+  ".source-agent-detail__grid",
+  ".source-agent-detail__timeline",
+]) {
+  assert.ok(css.includes(className), `styles.css should include ${className}`);
+}
+
+assert.ok(js.includes("agent_id=${encodeURIComponent"), "source workspaces should preserve the stable Agent deep link");
+assert.ok(js.includes("返回 Agent 详情"), "source-specific workspaces should link back to the Agent detail");
+assert.doesNotMatch(js, /transport[_ -]?token|authorization.*diagnostic/i, "diagnostics must not render credentials");
 
 for (const endpoint of [
   'apiFetch("/api/source-agents")',
