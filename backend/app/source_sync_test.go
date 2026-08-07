@@ -2,6 +2,7 @@ package app
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -424,7 +425,9 @@ func TestSourceLeaseRejectsPausedAgent(t *testing.T) {
 	}
 	defer store.Close()
 
-	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{AgentID: "agent-pause"}); err != nil {
+	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-pause", Capabilities: []string{"sync_content"},
+	}); err != nil {
 		t.Fatalf("register agent: %v", err)
 	}
 	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
@@ -525,6 +528,101 @@ func TestSourceLeaseRejectsPausedAgent(t *testing.T) {
 	}
 	if current.Status != SourceRunQueued || current.LeaseOwner != "" {
 		t.Fatalf("unregistered lease changed queued run: %#v", current)
+	}
+}
+
+func TestSourceLeaseUsesRegisteredHealthyCapabilities(t *testing.T) {
+	store, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	heartbeat := SourceAgentHeartbeat{
+		AgentID:      "agent-capability-bound",
+		WorkerType:   "wechat-worker",
+		Capabilities: []string{"sync_content"},
+		CapabilityHealth: map[string]SourceCapabilityHealth{
+			"wechat": {Healthy: true},
+		},
+	}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+	subscription, err := store.CreateSubscription(SourceSubscriptionInput{
+		SourceType:       "wechat_article",
+		SourceAccountKey: "capability-bound",
+		SourceAccount:    "Capability Bound",
+		AgentID:          heartbeat.AgentID,
+		Operation:        "existing_articles",
+		Enabled:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.CreateRun(subscription.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	leased, err := store.LeaseNextRun(heartbeat.AgentID, []string{"existing_articles"}, time.Minute)
+	if err != nil || leased != nil {
+		t.Fatalf("unregistered capability lease=%#v, err=%v", leased, err)
+	}
+
+	heartbeat.Capabilities = []string{"existing_articles"}
+	heartbeat.CapabilityHealth = map[string]SourceCapabilityHealth{}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatalf("report empty health: %v", err)
+	}
+	leased, err = store.LeaseNextRun(heartbeat.AgentID, []string{"existing_articles"}, time.Minute)
+	if err != nil || leased != nil {
+		t.Fatalf("empty-health capability lease=%#v, err=%v", leased, err)
+	}
+
+	heartbeat.CapabilityHealth["wechat"] = SourceCapabilityHealth{Healthy: false, Code: "login_required"}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatalf("report unhealthy agent: %v", err)
+	}
+	leased, err = store.LeaseNextRun(heartbeat.AgentID, []string{"existing_articles"}, time.Minute)
+	if err != nil || leased != nil {
+		t.Fatalf("unhealthy capability lease=%#v, err=%v", leased, err)
+	}
+
+	heartbeat.CapabilityHealth["wechat"] = SourceCapabilityHealth{Healthy: true}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatalf("report healthy agent: %v", err)
+	}
+	snapshot, err := store.getAgent(heartbeat.AgentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotCapabilities, err := json.Marshal(snapshot.Capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotHealth, err := json.Marshal(snapshot.CapabilityHealth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat.Capabilities = []string{"sync_content"}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatalf("change registered capabilities: %v", err)
+	}
+	leased, err = store.claimNextRunWithAgentSnapshot(
+		heartbeat.AgentID, []string{"existing_articles"}, time.Minute,
+		string(snapshotCapabilities), string(snapshotHealth),
+	)
+	if err != nil || leased != nil {
+		t.Fatalf("stale capability snapshot lease=%#v, err=%v", leased, err)
+	}
+	heartbeat.Capabilities = []string{"existing_articles"}
+	if _, err := store.HeartbeatAgent(heartbeat); err != nil {
+		t.Fatalf("restore registered capabilities: %v", err)
+	}
+	leased, err = store.LeaseNextRun(heartbeat.AgentID, []string{"existing_articles", "sync_content"}, time.Minute)
+	if err != nil || leased == nil || leased.ID != run.ID {
+		t.Fatalf("registered healthy lease=%#v, err=%v", leased, err)
 	}
 }
 
@@ -688,6 +786,7 @@ func TestSourceSyncStoreBoundsRunFailureText(t *testing.T) {
 	}
 	agent, err := store.HeartbeatAgent(SourceAgentHeartbeat{
 		AgentID:       "agent-a",
+		Capabilities:  []string{"sync_content"},
 		WCPlusHealthy: false,
 		LastError:     strings.Repeat("错", 10000),
 	})
@@ -834,7 +933,12 @@ func (c *sourceSyncTestClock) Advance(duration time.Duration) {
 
 func registerSourceLeaseAgent(t testing.TB, store *SourceSyncStore, agentID string) {
 	t.Helper()
-	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{AgentID: agentID}); err != nil {
+	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: agentID,
+		Capabilities: []string{
+			"existing_articles", "sync_articles", "sync_content",
+		},
+	}); err != nil {
 		t.Fatalf("register lease agent %q: %v", agentID, err)
 	}
 }

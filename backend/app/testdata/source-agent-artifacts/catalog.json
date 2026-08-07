@@ -1,0 +1,21 @@
+{
+  "artifacts": [
+    {
+      "id": "fixture-wechat-2",
+      "worker_type": "wechat-worker",
+      "platform": "darwin",
+      "architecture": "arm64",
+      "revision": "0123456789abcdef0123456789abcdef01234567",
+      "version": "2.0.0",
+      "protocol_version": "2026-08-01",
+      "minimum_version": "1.0.0",
+      "channel": "staging",
+      "release_notes": "Sanitized integration fixture.",
+      "size": 18,
+      "sha256": "b781fb5d8acb3529152231ee8d9932ffc074dbdbe9521ca869cd258ebe1671ec",
+      "storage_key": "artifacts/fixture-worker",
+      "build_gate": "passed",
+      "allowed_for_rollout": true
+    }
+  ]
+}

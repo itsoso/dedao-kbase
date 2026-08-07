@@ -305,13 +305,15 @@ Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的�
 
 ### 微信/WC Plus 来源工作台
 
-在线 Web UI 新增 `/wechat-source` 和 `/wcplus-source`。`/wcplus-source` 是来源控制面，可查看本地 Agent 心跳、WC Plus 健康状态、订阅和同步运行；旧的直连代理工具收在“本地 API 诊断”中。浏览器不会直接访问本机 WC Plus 端口。
+在线 Web UI 的统一入口是 `/sources/agents`：总览按在线、需处理、离线、暂停和升级中分组，展示两个独立 Worker 的版本、协议、能力健康、心跳、当前运行/命令以及 outbox/dead-letter 计数。`/sources/agents/{agent_id}` 提供稳定详情页和命令时间线，并分别深链到 `/wechat-source` 与 `/wcplus-source`。旧的直连代理工具收在“本地 API 诊断”中；浏览器不会直接访问本机 WC Plus 端口。
 
 桌面版 `/wcplus-source` 默认也使用同源 `/api/*`。如果 Wails 桌面壳没有和 kbase HTTP 服务同源运行，在页面顶部的 `KBase API Base URL` 填入 kbase 地址，例如 `http://127.0.0.1:8719`，并确保本机已写入 `KBASE_AUTH_TOKEN` 对应的 Bearer token。kbase 只允许 Wails/localhost/127.0.0.1 这类桌面来源跨域调用 `/api/*`，不会对任意网页开放 CORS。
 
 推荐使用“本地 Agent + 在线 KBase 控制面”：`wcplus-agent` 只访问本机 loopback WC Plus API，并通过出站 HTTPS 租用同步任务、上传文章和回报计数。不要把 WC Plus 的 loopback API 通过公网隧道暴露，也不要把微信 cookie 或 WC Plus 请求参数上传到 KBase。
 
-在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`，并使用另一个独立的 `KBASE_AGENT_PUBLISHER_TOKEN` 保护 Agent Package 发布。三个 token 必须彼此不同，并使用不含空格的可打印 ASCII 字符。Proofroom、Health 等只读消费者只能获得 `KBASE_AUTH_TOKEN`，不能获得发布 token。
+在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`，并使用另一个独立的 `KBASE_AGENT_PUBLISHER_TOKEN` 保护 Agent Package 发布。三个 token 必须彼此不同，并使用不含空格的可打印 ASCII 字符。Proofroom、Health 等只读消费者只能获得 `KBASE_AUTH_TOKEN`，不能获得发布 token。两个 Worker 继续共享 source-agent token，因此 `agent_id` 只是运行标识而不是独立安全身份；任一 Worker 泄露都必须轮换服务端和全部 Worker 的共享 token。
+
+第一版仅交付 macOS 用户级 LaunchAgent；Windows/Linux 目前只有协议预留，不应标记为已支持。微信与 WC Plus Worker、updater、状态、日志和 outbox 相互独立。本机密钥由安装器写入 macOS Keychain，不写进 plist、配置文件、命令行或日志。来源任务默认为人工触发，禁止定时、静默、批量或广播升级。
 
 本机 Agent 配置契约：
 
@@ -344,6 +346,10 @@ bash scripts/uninstall-wcplus-agent-macos.sh --delete-state --delete-logs
 ```
 
 使用删除参数时，状态和日志目录必须通过对应环境变量提供绝对路径；这是防止从错误工作目录删除相对路径的保护措施。
+
+受限升级只允许管理员在已登录的浏览器会话中，从服务端私有 catalog 选择与 Worker 类型、macOS 架构、当前版本和协议兼容且 `allowed_for_rollout=true` 的产物。catalog 根通过 `KBASE_SOURCE_AGENT_ARTIFACT_ROOT` 配置；每个条目必须绑定精确 revision、byte size、SHA-256 和已通过的 build gate。promotion 复制已经验证的同一字节，不重新构建。updater 不能接收 URL、路径、shell、脚本、环境变量或 LaunchAgent label；替换后若 ready receipt 或认证心跳失败，会从本机备份自动回滚。这里不使用外部 artifact 签名，因此 SHA-256 只证明字节一致性，不能把升级扩展成无人值守机制。
+
+WC Plus 的首版验收是分层的：夹具同步、恢复和升级链路必须通过；合法的生产依赖不可用时，Worker 必须报告 `vendor_blocked`、不领取任务且不能声称成功。这种诚实阻断是预期状态，不得通过绕过授权或平台安全来消除。
 
 Agent 优先读取 `WCPLUSPRO_BASE_URL`，也兼容 `WCPLUS_BASE_URL`。WC Plus 9.483 实测使用 `http://127.0.0.1:5002`，旧版和旧文档可能使用 `5001`；请以 WC Plus 当前界面或启动日志显示的端口为准。两者都未设置时，Agent 为兼容旧版仍回退到 `http://127.0.0.1:5001`。出于安全边界，Agent 会拒绝非 loopback WC Plus 地址。
 

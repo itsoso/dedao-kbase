@@ -1,0 +1,17 @@
+{
+  "agent_id": "fixture-wcplus-worker",
+  "worker_type": "wcplus-worker",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "version": "1.0.0",
+  "protocol_version": "2026-08-01",
+  "capabilities": ["wcplus"],
+  "capability_health": {
+    "wcplus": {
+      "healthy": false,
+      "code": "vendor_blocked",
+      "version": "fixture-1",
+      "requires_action": "Install a supported vendor dependency."
+    }
+  }
+}

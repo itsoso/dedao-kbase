@@ -7,8 +7,11 @@ delivery receipts.
 
 Current product areas:
 
-- **Sources:** Dedao, WeChat, and WC Plus ingestion surfaces, including local
-  source-agent lease and heartbeat APIs.
+- **Sources:** Dedao, WeChat, and WC Plus ingestion surfaces, including a
+  unified operator overview and stable worker details over independent local
+  workers. The shared protocol covers heartbeat, desired state, bounded
+  commands, leases, outbox truth, and constrained artifact upgrades; macOS is
+  the only installed-worker platform delivered in the first release.
 - **Book Knowledge:** package extraction, search, TokenPlan study prompts,
   structured analysis, quality checks, NotebookLM export, and MCP surfaces.
 - **Release Governance:** explicit publish, feedback, reverification, and
