@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Tasks 1-13 implemented; Task 14 documentation in progress; G4-G6 pending final candidate
+**Status:** Tasks 1-15 implemented and reviewed; Task 16 G5/G6 rollout pending
 
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
@@ -31,9 +31,10 @@ Tasks 1 through 10A are implemented, reviewed, released as v0.2.0, and installed
 locally as two independent macOS Workers with separately supervised updaters.
 Tasks 11 and 12 add the unified `/sources/agents` overview and stable Worker
 details; Task 13 adds a deterministic two-Worker integration Gate to normal CI.
-Those Web and integration changes are not yet merged or deployed. Task 14 is
-the current handoff; Task 15 must independently review the complete candidate
-before a clean-main deployment and layered G5/G6 verification in Task 16.
+Those Web and integration changes are not yet merged or deployed. Task 14
+synchronized operator documentation and the generated system map. Task 15
+completed independent review and candidate verification; the next handoff is
+the clean-main deployment and layered G5/G6 verification in Task 16.
 
 ## 2026-08-07 Tasks 11-13 Checkpoint
 
@@ -77,6 +78,47 @@ rolled back and the bounded readiness retry succeeded. This is baseline health
 evidence only: Tasks 11-14 are not in that revision, the production artifact
 catalog is still disabled, and the complete feature therefore does not pass
 G5 or G6 yet.
+
+## 2026-08-07 Task 15 Review Checkpoint
+
+Independent review covered the four required risk areas. It found no arbitrary
+execution, updater concurrency/rollback, credential/content privacy, or WC Plus
+truthfulness blocker. The first review classified cross-Worker impersonation
+under the shared token as High; the final review corrected that classification:
+the Worker class is intentionally mutually trusted under the owner-approved,
+frozen shared-token design. This remains a documented residual risk and token
+rotation blast radius, not an implementation deviation or a claim of
+per-Worker identity.
+
+The review also found a genuine Medium lease-authority gap: a Worker could ask
+for an operation it had not registered, an empty health table could pass, and
+a heartbeat could change capability/health between precheck and claim. The
+remediation was developed RED/GREEN. Lease requests are now intersected with
+the registered capability set, non-legacy Workers require non-empty healthy
+capability state, and the exact capability/health JSON snapshot is rechecked
+inside the final atomic SQL claim. The targeted final re-review found no
+Critical, High, or Medium blocker.
+
+Candidate verification evidence:
+
+```text
+npm --prefix frontend ci --registry=https://registry.npmjs.org --no-audit
+npm --prefix frontend run build
+go mod verify
+go vet ./...
+go test ./... -count=1
+bash scripts/source-agent-control-plane-smoke.sh
+bash scripts/source-agent-artifact-smoke.sh
+bash scripts/source-agent-packaging-smoke.sh
+bash scripts/wcplus-agent-packaging-smoke.sh
+bash scripts/system-map-smoke.sh
+bash scripts/privacy-smoke.sh
+all frontend/scripts/*-smoke.mjs
+node --check frontend-web/app.js
+all frontend-web/scripts/*smoke*.mjs
+git diff --check
+PASS
+```
 
 ## 2026-08-02 Updater Recovery Definition Amendment
 
@@ -268,16 +310,16 @@ kernel lock and cover process death after durable `begin-mutation`.
 
 ### G4 - Review
 
-**Decision: PENDING FOR COMPLETE CANDIDATE**
+**Decision: PASS**
 
 Independent review rejected earlier candidates for lock ownership, stale
 marker truncation, unbounded lock acquisition, and fixture-only crash
 coverage. The final re-review confirmed that the fixed updater owns the lock
 and marker, preserves prior durable phases, uses non-blocking flock with a
 bounded installer deadline, cleans the marker before journal evidence, and is
-exercised as a real child process. No Critical or Important finding remains in
-Task 10A. Tasks 11-14 still require the four-area independent review and exact
-clean-candidate verification defined by Task 15.
+exercised as a real child process. Task 15 then reviewed the complete candidate,
+rejected the initial lease-authority gap, and approved its atomic snapshot
+remediation. No Critical, High, or Medium finding remains.
 
 ### G5 - Deployment Health
 
