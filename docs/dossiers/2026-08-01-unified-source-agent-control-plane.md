@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Task 10A release candidate approved; v0.2.0 publication in progress
+**Status:** Tasks 1-13 implemented; Task 14 documentation in progress; G4-G6 pending final candidate
 
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
@@ -27,12 +27,56 @@ narrative documentation.
 
 ## Current Stage and Next Handoff
 
-Tasks 1 through 10 have been implemented and independently reviewed. Before
-Task 11 exposes an upgrade control, delivery returned to the definition loop
-because the real Workers still fail closed at the artifact-to-updater handoff.
-Task 10A in the approved implementation plan is now the active Gate. The Web
-overview remains blocked until that Gate passes implementation, recovery,
-security, and review checks.
+Tasks 1 through 10A are implemented, reviewed, released as v0.2.0, and installed
+locally as two independent macOS Workers with separately supervised updaters.
+Tasks 11 and 12 add the unified `/sources/agents` overview and stable Worker
+details; Task 13 adds a deterministic two-Worker integration Gate to normal CI.
+Those Web and integration changes are not yet merged or deployed. Task 14 is
+the current handoff; Task 15 must independently review the complete candidate
+before a clean-main deployment and layered G5/G6 verification in Task 16.
+
+## 2026-08-07 Tasks 11-13 Checkpoint
+
+The overview exposes the approved manual controls without adding arbitrary
+URLs, scripts, environment fields, bulk actions, silent rollout, or scheduling.
+The detail route validates and binds `agent_id`, protects against stale
+responses, keeps source credentials out of the page, and links each Worker to
+its source-owned workspace. Artifact and command panel failures remain
+independent so one unavailable surface does not erase the other state.
+
+The integration smoke starts a loopback KBase server with generated temporary
+credentials, loads sanitized WeChat and WC Plus heartbeat fixtures, and proves
+independent registration, targeted pause isolation, bounded diagnosis,
+truthful `vendor_blocked`, artifact catalog loading, same-byte SHA-256
+promotion, rollout kill-switch behavior, command-bound download checks, and
+updater recovery coverage. It was first RED because the fixtures were absent,
+then GREEN after the deterministic fixtures and CI step were added.
+
+Checkpoint evidence:
+
+```text
+node --check frontend-web/app.js
+node frontend-web/scripts/source-agent-control-plane-smoke.mjs
+node frontend-web/scripts/web-navigation-url-smoke.mjs
+node frontend-web/scripts/wechat-source-ui-smoke.mjs
+node frontend-web/scripts/wcplus-source-ui-smoke.mjs
+PASS
+
+bash scripts/source-agent-control-plane-smoke.sh
+PASS
+
+bash scripts/privacy-smoke.sh
+git diff --check
+PASS
+```
+
+Production KBase was separately reconciled to clean `main` revision
+`f4c6a079a7eb43a19fb0844fd6ec46c251514ae7`; service health, public static
+routes, and anonymous API rejection passed after a startup-race attempt safely
+rolled back and the bounded readiness retry succeeded. This is baseline health
+evidence only: Tasks 11-14 are not in that revision, the production artifact
+catalog is still disabled, and the complete feature therefore does not pass
+G5 or G6 yet.
 
 ## 2026-08-02 Updater Recovery Definition Amendment
 
@@ -224,24 +268,29 @@ kernel lock and cover process death after durable `begin-mutation`.
 
 ### G4 - Review
 
-**Decision: PASS**
+**Decision: PENDING FOR COMPLETE CANDIDATE**
 
 Independent review rejected earlier candidates for lock ownership, stale
 marker truncation, unbounded lock acquisition, and fixture-only crash
 coverage. The final re-review confirmed that the fixed updater owns the lock
 and marker, preserves prior durable phases, uses non-blocking flock with a
 bounded installer deadline, cleans the marker before journal evidence, and is
-exercised as a real child process. No Critical or Important finding remains.
+exercised as a real child process. No Critical or Important finding remains in
+Task 10A. Tasks 11-14 still require the four-area independent review and exact
+clean-candidate verification defined by Task 15.
 
 ### G5 - Deployment Health
 
-**Decision: PENDING**
+**Decision: PENDING FOR COMPLETE CANDIDATE**
 
-The v0.2.0 binaries are approved for publication but have not yet been
-installed on production machines.
+v0.2.0 was published and both macOS Workers/updaters were installed locally.
+The baseline KBase server is healthy on clean main, but the unified Web UI,
+integration Gate, and production artifact catalog are not deployed together.
 
 ### G6 - Online Verification
 
 **Decision: PENDING**
 
-No production verification has been performed.
+No complete two-Worker production acceptance or real version-changing upgrade
+has been performed. The feature must not claim G6 until Task 16 satisfies the
+layered acceptance list below.
