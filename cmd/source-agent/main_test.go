@@ -111,6 +111,9 @@ type sourceAgentCLIUpdaterActivator struct{}
 func (sourceAgentCLIUpdaterActivator) StartUpdater(context.Context) error { return nil }
 
 func TestSourceAgentCLIConstructsRealWorkerUpgradeBridge(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin worker upgrade bridge")
+	}
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)

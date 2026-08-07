@@ -489,6 +489,9 @@ func TestSourceAgentUpdaterProcessErrorsDoNotLeakRunnerDetails(t *testing.T) {
 }
 
 func TestSourceAgentUpdaterLifecycleHolderProtocol(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin lifecycle holder")
+	}
 	directory := t.TempDir()
 	var output bytes.Buffer
 	err := runSourceAgentLifecycleHolder(context.Background(), directory, strings.NewReader("begin-mutation\ncommit\n"), &output)
@@ -504,6 +507,9 @@ func TestSourceAgentUpdaterLifecycleHolderProtocol(t *testing.T) {
 }
 
 func TestSourceAgentUpdaterLifecycleHolderLeavesMarkerOnEOF(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin lifecycle holder")
+	}
 	directory := t.TempDir()
 	var output bytes.Buffer
 	err := runSourceAgentLifecycleHolder(context.Background(), directory, strings.NewReader("begin-mutation\n"), &output)
@@ -520,6 +526,9 @@ func TestSourceAgentUpdaterLifecycleHolderLeavesMarkerOnEOF(t *testing.T) {
 }
 
 func TestSourceAgentUpdaterLifecycleHolderCanAbortBeforeMutation(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin lifecycle holder")
+	}
 	directory := t.TempDir()
 	var output bytes.Buffer
 	if err := runSourceAgentLifecycleHolder(context.Background(), directory, strings.NewReader("abort-before-mutation\n"), &output); err != nil {
@@ -531,6 +540,9 @@ func TestSourceAgentUpdaterLifecycleHolderCanAbortBeforeMutation(t *testing.T) {
 }
 
 func TestSourceAgentUpdaterLifecycleHolderPreservesBegunMarker(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin lifecycle holder")
+	}
 	directory := t.TempDir()
 	marker := filepath.Join(directory, ".managed-worker-maintenance")
 	if err := os.WriteFile(marker, []byte("begin-mutation\n"), 0o600); err != nil {

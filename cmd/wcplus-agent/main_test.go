@@ -52,6 +52,9 @@ func TestWCPlusAgentRuntimeReturnsUpgradeCloseError(t *testing.T) {
 }
 
 func TestWCPlusAgentConstructsRealWorkerUpgradeBridge(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin worker upgrade bridge")
+	}
 	root, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
