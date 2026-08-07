@@ -7032,6 +7032,10 @@ func newKBaseSourceAgentCommandHTTPFixture(
 		if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
 			AgentID: agentID, WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
 			Version: "1.0.0", ProtocolVersion: "2026-08-01",
+			Capabilities: []string{"sync_articles"},
+			CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: true},
+			},
 		}); err != nil {
 			t.Fatal(err)
 		}

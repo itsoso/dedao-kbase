@@ -756,8 +756,8 @@ func (s *SourceSyncStore) LeaseNextRun(agentID string, capabilities []string, le
 	if agentID == "" {
 		return nil, fmt.Errorf("agent_id is required")
 	}
-	capabilities = normalizeSourceCapabilities(capabilities)
-	if len(capabilities) == 0 {
+	requestedCapabilities := normalizeSourceCapabilities(capabilities)
+	if len(requestedCapabilities) == 0 {
 		return nil, nil
 	}
 	agent, err := s.getAgent(agentID)
@@ -770,16 +770,59 @@ func (s *SourceSyncStore) LeaseNextRun(agentID string, capabilities []string, le
 	if agent.DesiredState != SourceAgentDesiredActive {
 		return nil, nil
 	}
+	registeredCapabilities := make(map[string]struct{}, len(agent.Capabilities))
+	for _, capability := range agent.Capabilities {
+		registeredCapabilities[capability] = struct{}{}
+	}
+	capabilities = make([]string, 0, len(requestedCapabilities))
+	for _, capability := range requestedCapabilities {
+		if _, registered := registeredCapabilities[capability]; registered {
+			capabilities = append(capabilities, capability)
+		}
+	}
+	if len(capabilities) == 0 {
+		return nil, nil
+	}
+	if agent.WorkerType != "legacy" {
+		if len(agent.CapabilityHealth) == 0 {
+			return nil, nil
+		}
+		for _, health := range agent.CapabilityHealth {
+			if !health.Healthy {
+				return nil, nil
+			}
+		}
+	}
 	if leaseDuration <= 0 {
 		leaseDuration = 2 * time.Minute
 	}
 	if _, err := s.RequeueExpiredRuns(); err != nil {
 		return nil, err
 	}
-	return s.claimNextRun(agentID, capabilities, leaseDuration)
+	capabilitiesJSON, err := json.Marshal(agent.Capabilities)
+	if err != nil {
+		return nil, err
+	}
+	capabilityHealthJSON, err := json.Marshal(agent.CapabilityHealth)
+	if err != nil {
+		return nil, err
+	}
+	return s.claimNextRunWithAgentSnapshot(
+		agentID, capabilities, leaseDuration, string(capabilitiesJSON), string(capabilityHealthJSON),
+	)
 }
 
 func (s *SourceSyncStore) claimNextRun(agentID string, capabilities []string, leaseDuration time.Duration) (*SourceSyncRun, error) {
+	return s.claimNextRunWithAgentSnapshot(agentID, capabilities, leaseDuration, "", "")
+}
+
+func (s *SourceSyncStore) claimNextRunWithAgentSnapshot(
+	agentID string,
+	capabilities []string,
+	leaseDuration time.Duration,
+	expectedCapabilitiesJSON string,
+	expectedCapabilityHealthJSON string,
+) (*SourceSyncRun, error) {
 	placeholders := make([]string, len(capabilities))
 	now := s.now().UTC()
 	args := make([]any, 0, len(capabilities)+9)
@@ -796,6 +839,11 @@ func (s *SourceSyncStore) claimNextRun(agentID string, capabilities []string, le
 		args = append(args, capability)
 	}
 	args = append(args, SourceRunQueued, agentID, SourceAgentDesiredActive)
+	agentSnapshotPredicate := ""
+	if expectedCapabilitiesJSON != "" && expectedCapabilityHealthJSON != "" {
+		agentSnapshotPredicate = " AND capabilities_json = ? AND capability_health_json = ?"
+		args = append(args, expectedCapabilitiesJSON, expectedCapabilityHealthJSON)
+	}
 	query := `
 		UPDATE source_sync_runs
 		SET status = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ?
@@ -809,7 +857,7 @@ func (s *SourceSyncStore) claimNextRun(agentID string, capabilities []string, le
 		AND status = ?
 		AND EXISTS (
 			SELECT 1 FROM source_agents
-			WHERE agent_id = ? AND desired_state = ?
+			WHERE agent_id = ? AND desired_state = ?` + agentSnapshotPredicate + `
 		)
 		RETURNING id
 	`
