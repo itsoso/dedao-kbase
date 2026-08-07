@@ -5,40 +5,108 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 type sourceEnvironmentLookup func(string) (string, bool)
 
+const (
+	sourceAgentWorkerType      = "wechat-worker"
+	sourceAgentVersion         = "0.2.0"
+	sourceAgentProtocolVersion = "2026-08-01"
+)
+
+var sourceAgentTransportTokenLoader = sourceagentsecret.LoadTransportToken
+var sourceAgentLegacyTransportTokenLoader = loadLegacySourceTransportToken
+var sourceAgentRevision = "0000000000000000000000000000000000000000"
+
 func main() {
-	if err := runSourceAgentCLI(context.Background(), os.Args[1:], os.LookupEnv); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runSourceAgentCLI(ctx, os.Args[1:], os.LookupEnv); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
-func loadSourceAgentConfig(lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
-	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
-	cfg := app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: value("KBASE_SOURCE_AGENT_TOKEN"), AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}
-	if cfg.AgentToken == "" && cfg.AgentID != "" {
-		if raw, err := newKeychainSecretStore(cfg.AgentID, nil).Load(context.Background(), "transport-token"); err == nil {
-			cfg.AgentToken = string(raw)
-		}
-	}
-	return cfg.Normalized()
+func loadSourceAgentConfig(ctx context.Context, lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
+	return loadSourceAgentConfigWithTransportTokenFallback(ctx, lookup, sourceAgentTransportTokenLoader, sourceAgentLegacyTransportTokenLoader)
 }
-func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: source-agent doctor, once, run, or enroll")
+
+func loadSourceAgentConfigWithTransportToken(ctx context.Context, lookup sourceEnvironmentLookup, loader sourceagentsecret.Loader) (app.SourceAgentConfig, error) {
+	return loadSourceAgentConfigWithTransportTokenFallback(ctx, lookup, loader, nil)
+}
+
+func loadSourceAgentConfigWithTransportTokenFallback(ctx context.Context, lookup sourceEnvironmentLookup, loader sourceagentsecret.Loader, legacy sourceagentsecret.AgentLoader) (app.SourceAgentConfig, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
 	}
-	cfg, err := loadSourceAgentConfig(lookup)
+	cfg, err := loadSourceAgentConfigOnly(lookup)
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	rawToken, provided := lookup("KBASE_SOURCE_AGENT_TOKEN")
+	token, err := sourceagentsecret.ResolveSourceTransportToken(ctx, rawToken, provided, cfg.AgentID, loader, legacy)
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	cfg.AgentToken = token
+	return cfg, nil
+}
+
+func loadSourceAgentConfigOnly(lookup sourceEnvironmentLookup) (app.SourceAgentConfig, error) {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }
+	cfg, err := (app.SourceAgentConfig{RemoteURL: value("KBASE_REMOTE_URL"), AgentToken: "pending-transport-token", AgentID: value("KBASE_SOURCE_AGENT_ID"), StateDir: value("SOURCE_AGENT_STATE_DIR")}).Normalized()
+	if err != nil {
+		return app.SourceAgentConfig{}, err
+	}
+	return cfg, nil
+}
+
+func loadLegacySourceTransportToken(ctx context.Context, agentID string) (string, error) {
+	value, err := newKeychainSecretStore(agentID, nil).Load(ctx, "transport-token")
+	if err != nil {
+		return "", err
+	}
+	return string(value), nil
+}
+func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironmentLookup) (returnErr error) {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: source-agent build-info, check-config, doctor, once, run, or enroll")
+	}
+	if args[0] == "build-info" {
+		return writeSourceAgentBuildInfo(os.Stdout)
+	}
+	if args[0] == "check-config" {
+		if _, err := loadSourceAgentConfigOnly(lookup); err != nil {
+			return err
+		}
+		value := ""
+		if lookup != nil {
+			value, _ = lookup("SOURCE_AGENT_ENROLL_ADDR")
+		}
+		_, err := normalizeEnrollmentAddress(value)
+		return err
+	}
+	cfg, err := loadSourceAgentConfig(ctx, lookup)
 	if err != nil {
 		return err
 	}
@@ -55,7 +123,7 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	if err != nil {
 		return err
 	}
-	defer outbox.Close()
+	defer func() { returnErr = errors.Join(returnErr, outbox.Close()) }()
 	if args[0] == "doctor" {
 		report, doctorErr := inspectSourceAgent(ctx, client, sessions)
 		if doctorErr != nil {
@@ -83,7 +151,12 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	if err != nil {
 		return err
 	}
-	runner, err := app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{Client: client, Outbox: outbox, Adapter: adapter, Version: "0.1.0"})
+	upgradeBridge, err := newWeChatProductionUpgradeBridge(client)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, upgradeBridge.Close()) }()
+	runner, err := newWeChatSourceAgentRunner(client, outbox, adapter, upgradeBridge, upgradeBridge)
 	if err != nil {
 		return err
 	}
@@ -99,6 +172,87 @@ func runSourceAgentCLI(ctx context.Context, args []string, lookup sourceEnvironm
 	}, func(cycleErr error) {
 		fmt.Fprintf(os.Stderr, "source-agent cycle failed: %v\n", cycleErr)
 	})
+}
+
+func writeSourceAgentBuildInfo(output io.Writer) error {
+	if output == nil || !validSourceAgentCompiledRevision(sourceAgentRevision) {
+		return errors.New("source-agent build identity is invalid")
+	}
+	return json.NewEncoder(output).Encode(map[string]string{
+		"worker_type": sourceAgentWorkerType, "version": sourceAgentVersion,
+		"protocol_version": sourceAgentProtocolVersion, "platform": runtime.GOOS,
+		"architecture": runtime.GOARCH, "revision": sourceAgentRevision,
+	})
+}
+
+func validSourceAgentCompiledRevision(value string) bool {
+	if (len(value) != 40 && len(value) != 64) || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func newWeChatSourceAgentRunner(
+	client *app.SourceAgentClient,
+	outbox *app.SourceAgentOutbox,
+	adapter *app.WeChatSourceAdapter,
+	updater app.SourceAgentUpdater,
+	upgradeState app.SourceAgentProtectedUpgradeState,
+) (*app.SourceAgentRunner, error) {
+	revision := ""
+	if upgradeState != nil {
+		revision = sourceAgentRevision
+	}
+	return app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
+		Client: client, Outbox: outbox, Adapter: adapter, Diagnoser: adapter,
+		Updater: updater, UpgradeState: upgradeState, WorkerType: sourceAgentWorkerType,
+		Version: sourceAgentVersion, ProtocolVersion: sourceAgentProtocolVersion,
+		Revision: revision,
+	})
+}
+
+func newWeChatProductionUpgradeBridge(client *app.SourceAgentClient) (*app.SourceAgentUpdateBridge, error) {
+	workerExecutable, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("resolve source-agent executable: %w", err)
+	}
+	workerExecutable, err = filepath.EvalSymlinks(filepath.Clean(workerExecutable))
+	if err != nil || filepath.Base(workerExecutable) != "source-agent" {
+		return nil, fmt.Errorf("source-agent must run from its fixed installed executable")
+	}
+	activator, err := app.NewSourceAgentUpdaterActivator(sourceAgentWorkerType, os.Getuid(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return newWeChatWorkerUpgradeBridge(client, workerExecutable, activator)
+}
+
+func newWeChatWorkerUpgradeBridge(
+	client *app.SourceAgentClient,
+	workerExecutable string,
+	activator app.SourceAgentUpdaterActivator,
+) (*app.SourceAgentUpdateBridge, error) {
+	if client == nil || filepath.Base(workerExecutable) != "source-agent" {
+		return nil, fmt.Errorf("invalid fixed source-agent upgrade runtime")
+	}
+	return app.NewSourceAgentUpdateBridge(app.SourceAgentUpdateBridgeConfig{
+		Downloader: client, UpdaterExecutable: filepath.Join(filepath.Dir(workerExecutable), "source-agent-updater"),
+		WorkerType: sourceAgentWorkerType, CurrentVersion: sourceAgentVersion,
+		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		ProtocolVersion: sourceAgentProtocolVersion, Revision: sourceAgentRevision,
+		Activator: activator,
+	})
+}
+
+// Retained only for narrow tests that intentionally omit an installed updater.
+type sourceAgentFailClosedUpdater struct{}
+
+func (*sourceAgentFailClosedUpdater) Upgrade(context.Context, app.SourceAgentCommand) app.SourceAgentUpgradeResult {
+	return app.SourceAgentUpgradeResult{
+		State: app.SourceAgentCommandFailed, Code: app.SourceAgentCommandCodeUpgradeFailed,
+		Message: "The local updater handoff is unavailable.",
+	}
 }
 
 type sourceAgentCycleRunner interface {
@@ -217,11 +371,29 @@ func normalizeEnrollmentAddress(value string) (string, error) {
 	if value == "" {
 		value = "127.0.0.1:8765"
 	}
-	host, _, err := net.SplitHostPort(value)
-	if err != nil || !isLoopbackHost(host) {
+	host, portValue, err := net.SplitHostPort(value)
+	if err != nil || !isExactEnrollmentLoopbackHost(host) || !decimalPort(portValue) {
 		return "", fmt.Errorf("SOURCE_AGENT_ENROLL_ADDR must bind loopback")
 	}
 	return value, nil
+}
+
+func isExactEnrollmentLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func decimalPort(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return false
+		}
+	}
+	port, err := strconv.Atoi(value)
+	return err == nil && port >= 1 && port <= 65535
 }
 func runEnrollmentServer(ctx context.Context, lookup sourceEnvironmentLookup, store app.SourceSecretStore) error {
 	value := func(key string) string { v, _ := lookup(key); return strings.TrimSpace(v) }

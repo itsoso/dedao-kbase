@@ -134,6 +134,19 @@ func TestKeychainSecretLoadsLegacyPlaintext(t *testing.T) {
 	}
 }
 
+func TestLegacyKeychainCommandBoundsOutputAndStopsProducer(t *testing.T) {
+	started := time.Now()
+	_, err := runKeychainCommand(context.Background(), "/bin/sh", []string{
+		"-c", "head -c 131072 /dev/zero; sleep 2",
+	}, nil)
+	if err == nil {
+		t.Fatal("oversize keychain output was accepted")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("bounded keychain command took %s", elapsed)
+	}
+}
+
 func TestKeychainSecretRejectsLineBreaks(t *testing.T) {
 	runner := &fakeSecurityRunner{}
 	store := newKeychainSecretStore("agent-a", runner.run)

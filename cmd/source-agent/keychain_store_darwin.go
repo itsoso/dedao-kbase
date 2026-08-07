@@ -16,13 +16,15 @@ import (
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 const (
-	sourceAgentKeychainService = "life.executor.kbase.source-agent"
+	sourceAgentKeychainService = sourceagentsecret.KeychainService
 	keychainMasterKeyName      = "_storage-key-v1"
 	keychainEnvelopePrefix     = "kbase:v1:"
 	keychainMasterKeySize      = 32
+	keychainCommandMaxOutput   = 64 << 10
 )
 
 type keychainCommandRunner func(context.Context, string, []string, []byte) ([]byte, error)
@@ -220,7 +222,27 @@ func openKeychainEnvelope(masterKey []byte, account string, envelope []byte) ([]
 func runKeychainCommand(ctx context.Context, path string, args []string, input []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Stdin = bytes.NewReader(input)
-	return cmd.Output()
+	cmd.Stderr = io.Discard
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	output, readErr := io.ReadAll(io.LimitReader(stdout, keychainCommandMaxOutput+1))
+	if readErr != nil || len(output) > keychainCommandMaxOutput {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, fmt.Errorf("keychain command output exceeded limit")
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
+	return output, nil
 }
 
 const keychainPromptExpectScript = `

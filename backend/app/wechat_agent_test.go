@@ -59,7 +59,7 @@ func TestWeChatAgentReportsLoginRequiredWithoutSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	health := adapter.Status(context.Background())
-	if health.Healthy || health.RequiresAction != "login" {
+	if health.Healthy || health.Code != "login_required" || health.RequiresAction == "" {
 		t.Fatalf("health=%#v", health)
 	}
 	if adapter.Name() != "wechat_mp" {
@@ -67,7 +67,7 @@ func TestWeChatAgentReportsLoginRequiredWithoutSession(t *testing.T) {
 	}
 }
 
-func TestWeChatAgentReportsLoginRequiredForExpiredSession(t *testing.T) {
+func TestWeChatExpiredSessionCapabilityReportsStableLoginRequiredCode(t *testing.T) {
 	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: fakeSessionHealthProvider{session: WeChatMPSession{
 		Token:          "expired-token",
 		ObservedExpiry: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
@@ -76,7 +76,7 @@ func TestWeChatAgentReportsLoginRequiredForExpiredSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	health := adapter.Status(context.Background())
-	if health.Healthy || health.RequiresAction != "login" {
+	if health.Healthy || health.Code != "login_required" || health.RequiresAction == "" {
 		t.Fatalf("health=%#v", health)
 	}
 }

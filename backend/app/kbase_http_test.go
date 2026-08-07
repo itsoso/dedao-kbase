@@ -1042,6 +1042,7 @@ func TestKBaseHTTPHandlerProofroomDeliveryErrorsAreStable(t *testing.T) {
 			}
 		})
 	}
+
 }
 
 func TestKBaseHTTPHandlerProofroomUnknownRequiresExplicitCoordination(t *testing.T) {
@@ -1988,6 +1989,1079 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
+	handler, sourceSync, _, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+
+	detail := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a", "admin-secret")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"agent_id":"agent-a"`) ||
+		!strings.Contains(detail.Body.String(), `"desired_state":"active"`) {
+		t.Fatalf("agent detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	for _, desired := range []string{SourceAgentDesiredPaused, SourceAgentDesiredActive} {
+		response := requestJSONKBase(
+			handler, http.MethodPost, "/api/source-agents/agent-a/desired-state", "admin-secret",
+			`{"desired_state":"`+desired+`"}`,
+		)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"desired_state":"`+desired+`"`) {
+			t.Fatalf("set desired state %q status=%d body=%s", desired, response.Code, response.Body.String())
+		}
+	}
+	agent, err := sourceSync.GetSourceAgent(" agent-a ")
+	if err != nil || agent.DesiredState != SourceAgentDesiredActive {
+		t.Fatalf("GetSourceAgent() = %#v, %v", agent, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{name: "unknown field", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"paused","extra":"private"}`, want: http.StatusBadRequest},
+		{name: "trailing JSON", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"paused"}{"extra":true}`, want: http.StatusBadRequest},
+		{name: "invalid state", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"reboot"}`, want: http.StatusBadRequest},
+		{name: "unknown agent", method: http.MethodGet, path: "/api/source-agents/missing-agent", want: http.StatusNotFound},
+		{name: "invalid escaped agent", method: http.MethodGet, path: "/api/source-agents/%2E%2E", want: http.StatusBadRequest},
+		{name: "detail method", method: http.MethodDelete, path: "/api/source-agents/agent-a", want: http.StatusMethodNotAllowed},
+		{name: "unknown action", method: http.MethodPost, path: "/api/source-agents/agent-a/reboot", body: `{}`, want: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var response *httptest.ResponseRecorder
+			if test.body == "" {
+				response = requestKBase(handler, test.method, test.path, "admin-secret")
+			} else {
+				response = requestJSONKBase(handler, test.method, test.path, "admin-secret", test.body)
+			}
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+			}
+			for _, secret := range []string{"private", "reboot", "../", sourceSync.DBPath()} {
+				if secret != "" && strings.Contains(response.Body.String(), secret) {
+					t.Fatalf("error response leaked %q: %s", secret, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
+	t.Run("management command API", func(t *testing.T) {
+		handler, _, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+		expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
+		diagnoseBody := `{"type":"diagnose","idempotency_key":"diag-1","expires_at":"` + expiresAt + `"}`
+		diagnose := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", diagnoseBody)
+		if diagnose.Code != http.StatusCreated || !strings.Contains(diagnose.Body.String(), `"type":"diagnose"`) ||
+			!strings.Contains(diagnose.Body.String(), `"target_agent_id":"agent-a"`) {
+			t.Fatalf("diagnose status=%d body=%s", diagnose.Code, diagnose.Body.String())
+		}
+
+		upgradeBody := `{"type":"upgrade","idempotency_key":"upgrade-1","payload":{"artifact_id":"artifact-2","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`
+		bearerUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", upgradeBody)
+		if bearerUpgrade.Code != http.StatusForbidden || bearerUpgrade.Body.String() != "{\"error\":\"browser management session required\"}\n" {
+			t.Fatalf("Bearer upgrade status=%d body=%s", bearerUpgrade.Code, bearerUpgrade.Body.String())
+		}
+
+		credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Upgrade Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, upgradeBody)
+		missingCSRFResponse := httptest.NewRecorder()
+		handler.ServeHTTP(missingCSRFResponse, missingCSRF)
+		if missingCSRFResponse.Code != http.StatusForbidden {
+			t.Fatalf("Cookie upgrade without CSRF status=%d body=%s", missingCSRFResponse.Code, missingCSRFResponse.Body.String())
+		}
+
+		clock.Advance(time.Second)
+		validUpgrade := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, upgradeBody)
+		addKBaseBrowserSessionSecurityHeaders(validUpgrade, credentials.CSRFToken)
+		validUpgradeResponse := httptest.NewRecorder()
+		handler.ServeHTTP(validUpgradeResponse, validUpgrade)
+		if validUpgradeResponse.Code != http.StatusCreated || !strings.Contains(validUpgradeResponse.Body.String(), `"artifact_id":"artifact-2"`) {
+			t.Fatalf("Cookie upgrade status=%d body=%s", validUpgradeResponse.Code, validUpgradeResponse.Body.String())
+		}
+
+		list := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a/commands?limit=1", "admin-secret")
+		var listPayload struct {
+			Commands []SourceAgentCommand `json:"commands"`
+		}
+		if list.Code != http.StatusOK || json.Unmarshal(list.Body.Bytes(), &listPayload) != nil ||
+			len(listPayload.Commands) != 1 || listPayload.Commands[0].Type != SourceAgentCommandUpgrade {
+			t.Fatalf("command list status=%d body=%s", list.Code, list.Body.String())
+		}
+
+		for _, test := range []struct {
+			name       string
+			agentID    string
+			body       string
+			cookieAuth bool
+			want       int
+			forbidden  []string
+		}{
+			{name: "unknown field", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"bad-field","expires_at":"` + expiresAt + `","secret_field":"private-value"}`, want: http.StatusBadRequest, forbidden: []string{"secret_field", "private-value"}},
+			{name: "target spoof", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"spoof","target_agent_id":"agent-b","expires_at":"` + expiresAt + `"}`, want: http.StatusBadRequest, forbidden: []string{"target_agent_id", "agent-b"}},
+			{name: "trailing JSON", agentID: "agent-a", body: diagnoseBody + `{"spec_json":"private"}`, want: http.StatusBadRequest, forbidden: []string{"spec_json", "private"}},
+			{name: "unknown type", agentID: "agent-a", body: `{"type":"shell","idempotency_key":"unknown-type","expires_at":"` + expiresAt + `"}`, want: http.StatusBadRequest, forbidden: []string{"shell"}},
+			{name: "unknown agent", agentID: "missing-agent", body: diagnoseBody, want: http.StatusNotFound, forbidden: []string{"missing-agent"}},
+			{name: "stale version", agentID: "agent-b", cookieAuth: true, body: `{"type":"upgrade","idempotency_key":"stale","payload":{"artifact_id":"private-artifact","expected_current_version":"0.9.0"},"expires_at":"` + expiresAt + `"}`, want: http.StatusConflict, forbidden: []string{"private-artifact", "0.9.0", "1.0.0", "expected", "actual", "spec"}},
+			{name: "duplicate active upgrade", agentID: "agent-a", cookieAuth: true, body: `{"type":"upgrade","idempotency_key":"upgrade-2","payload":{"artifact_id":"artifact-3","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`, want: http.StatusConflict, forbidden: []string{"artifact-3", "expected", "spec"}},
+			{name: "idempotency conflict", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"diag-1","expires_at":"` + clock.Now().Add(2*time.Hour).Format(time.RFC3339Nano) + `"}`, want: http.StatusConflict, forbidden: []string{"diag-1", "expires_at"}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				path := "/api/source-agents/" + test.agentID + "/commands"
+				var response *httptest.ResponseRecorder
+				if test.cookieAuth {
+					request := newKBaseBrowserCookieRequest(http.MethodPost, path, credentials.Token, test.body)
+					addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+					response = httptest.NewRecorder()
+					handler.ServeHTTP(response, request)
+				} else {
+					response = requestJSONKBase(handler, http.MethodPost, path, "admin-secret", test.body)
+				}
+				if response.Code != test.want {
+					t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+				}
+				for _, forbidden := range append(test.forbidden, "/Users/", `C:\\Users\\`) {
+					if strings.Contains(response.Body.String(), forbidden) {
+						t.Fatalf("error response leaked %q: %s", forbidden, response.Body.String())
+					}
+				}
+			})
+		}
+
+		invalidID := requestKBase(handler, http.MethodGet, "/api/source-agents/%2E%2E/commands", "admin-secret")
+		if invalidID.Code != http.StatusBadRequest {
+			t.Fatalf("invalid escaped agent status=%d body=%s", invalidID.Code, invalidID.Body.String())
+		}
+		wrongMethod := requestKBase(handler, http.MethodDelete, "/api/source-agents/agent-a/commands", "admin-secret")
+		if wrongMethod.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("wrong command method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+		}
+	})
+
+	t.Run("worker command API", func(t *testing.T) {
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		diagnose := mustCreateSourceAgentDiagnoseCommand(t, sourceSync, clock, "agent-a", "worker-diagnose", time.Hour)
+		clock.Advance(time.Second)
+		upgrade := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "worker-upgrade")
+
+		claimNext := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a"}`)
+		if claimNext.Code != http.StatusOK || !strings.Contains(claimNext.Body.String(), `"id":"`+diagnose.ID+`"`) ||
+			!strings.Contains(claimNext.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("claim next status=%d body=%s", claimNext.Code, claimNext.Body.String())
+		}
+		claimByIDBody := `{"agent_id":"agent-a","command_id":"` + diagnose.ID + `"}`
+		claimByID := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", claimByIDBody)
+		if claimByID.Code != http.StatusOK || !strings.Contains(claimByID.Body.String(), `"id":"`+diagnose.ID+`"`) {
+			t.Fatalf("idempotent claim by id status=%d body=%s", claimByID.Code, claimByID.Body.String())
+		}
+
+		wrongTarget := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-b","command_id":"`+diagnose.ID+`"}`)
+		if wrongTarget.Code != http.StatusForbidden || strings.Contains(wrongTarget.Body.String(), diagnose.ID) || strings.Contains(wrongTarget.Body.String(), "agent-a") {
+			t.Fatalf("wrong target status=%d body=%s", wrongTarget.Code, wrongTarget.Body.String())
+		}
+		empty := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-b"}`)
+		if empty.Code != http.StatusOK || strings.TrimSpace(empty.Body.String()) != `{"command":null}` {
+			t.Fatalf("empty queue status=%d body=%s", empty.Code, empty.Body.String())
+		}
+		legacyResultCode := requestJSONKBase(
+			handler,
+			http.MethodPost,
+			"/api/source-agent/commands/"+url.PathEscape(diagnose.ID)+"/complete",
+			"agent-secret",
+			`{"agent_id":"agent-a","state":"succeeded","result_code":"diagnostic_complete"}`,
+		)
+		if legacyResultCode.Code != http.StatusBadRequest {
+			t.Fatalf("legacy result_code status=%d body=%s", legacyResultCode.Code, legacyResultCode.Body.String())
+		}
+
+		claimUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if claimUpgrade.Code != http.StatusOK {
+			t.Fatalf("claim upgrade status=%d body=%s", claimUpgrade.Code, claimUpgrade.Body.String())
+		}
+		recoverOwned := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a"}`)
+		if recoverOwned.Code != http.StatusOK || !strings.Contains(recoverOwned.Body.String(), `"id":"`+upgrade.ID+`"`) {
+			t.Fatalf("recover owned status=%d body=%s", recoverOwned.Code, recoverOwned.Body.String())
+		}
+		resumeExact := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if resumeExact.Code != http.StatusOK || !strings.Contains(resumeExact.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("resume exact status=%d body=%s", resumeExact.Code, resumeExact.Body.String())
+		}
+		foreignResume := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-b","command_id":"`+upgrade.ID+`"}`)
+		if foreignResume.Code != http.StatusForbidden || strings.Contains(foreignResume.Body.String(), upgrade.ID) {
+			t.Fatalf("foreign resume status=%d body=%s", foreignResume.Code, foreignResume.Body.String())
+		}
+		commandPath := "/api/source-agent/commands/" + url.PathEscape(upgrade.ID)
+		progress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"downloading","message":"downloading"}`)
+		if progress.Code != http.StatusOK || !strings.Contains(progress.Body.String(), `"state":"downloading"`) {
+			t.Fatalf("download progress status=%d body=%s", progress.Code, progress.Body.String())
+		}
+		badComplete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", `{"agent_id":"agent-a","state":"downloading"}`)
+		if badComplete.Code != http.StatusBadRequest {
+			t.Fatalf("nonterminal complete status=%d body=%s", badComplete.Code, badComplete.Body.String())
+		}
+		for _, state := range []string{
+			SourceAgentCommandVerified,
+			SourceAgentCommandInstalling,
+			SourceAgentCommandRestarting,
+			SourceAgentCommandVerifying,
+		} {
+			response := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"`+state+`"}`)
+			if response.Code != http.StatusOK {
+				t.Fatalf("progress %s status=%d body=%s", state, response.Code, response.Body.String())
+			}
+		}
+		completionBody := `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","message":"installed","actual_version":"2.0.0"}`
+		complete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
+		if complete.Code != http.StatusOK || !strings.Contains(complete.Body.String(), `"state":"succeeded"`) {
+			t.Fatalf("complete status=%d body=%s", complete.Code, complete.Body.String())
+		}
+		duplicate := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
+		if duplicate.Code != http.StatusOK {
+			t.Fatalf("duplicate complete status=%d body=%s", duplicate.Code, duplicate.Body.String())
+		}
+		badProgress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", completionBody)
+		if badProgress.Code != http.StatusBadRequest {
+			t.Fatalf("terminal progress status=%d body=%s", badProgress.Code, badProgress.Body.String())
+		}
+		terminalResume := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if terminalResume.Code != http.StatusOK || !strings.Contains(terminalResume.Body.String(), `"state":"succeeded"`) {
+			t.Fatalf("terminal resume status=%d body=%s", terminalResume.Code, terminalResume.Body.String())
+		}
+		noActiveUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a"}`)
+		if noActiveUpgrade.Code != http.StatusOK || strings.TrimSpace(noActiveUpgrade.Body.String()) != `{"command":null}` {
+			t.Fatalf("terminal command recovered as active: status=%d body=%s", noActiveUpgrade.Code, noActiveUpgrade.Body.String())
+		}
+
+		for _, test := range []struct {
+			name string
+			path string
+			body string
+		}{
+			{name: "claim unknown field", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a","target_agent_id":"agent-b"}`},
+			{name: "claim trailing", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a"}{"secret":"private"}`},
+			{name: "recover unknown field", path: "/api/source-agent/commands/recover", body: `{"agent_id":"agent-a","owner":"private"}`},
+			{name: "report unknown field", path: commandPath + "/complete", body: `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","actual_version":"2.0.0","spec_json":"private"}`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				response := requestJSONKBase(handler, http.MethodPost, test.path, "agent-secret", test.body)
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				for _, forbidden := range []string{"target_agent_id", "agent-b", "spec_json", "private"} {
+					if strings.Contains(response.Body.String(), forbidden) {
+						t.Fatalf("strict JSON error leaked %q: %s", forbidden, response.Body.String())
+					}
+				}
+			})
+		}
+
+		unknown := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/missing-command/complete", "agent-secret", `{"agent_id":"agent-a","state":"failed","code":"upgrade_failed"}`)
+		if unknown.Code != http.StatusNotFound {
+			t.Fatalf("unknown command status=%d body=%s", unknown.Code, unknown.Body.String())
+		}
+		adminOnWorker := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "admin-secret", `{"agent_id":"agent-a"}`)
+		if adminOnWorker.Code != http.StatusUnauthorized {
+			t.Fatalf("management Bearer on worker route status=%d body=%s", adminOnWorker.Code, adminOnWorker.Body.String())
+		}
+		workerOnManagement := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a", "agent-secret")
+		if workerOnManagement.Code != http.StatusUnauthorized {
+			t.Fatalf("worker Bearer on management route status=%d body=%s", workerOnManagement.Code, workerOnManagement.Body.String())
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactMetadata(t *testing.T) {
+	handler, _, _, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+
+	response := requestKBase(handler, http.MethodGet, "/api/source-agent-artifacts?limit=2", "admin-secret")
+	if response.Code != http.StatusOK {
+		t.Fatalf("Bearer metadata status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Artifacts []SourceAgentArtifactPublic `json:"artifacts"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Artifacts) != 2 || payload.Artifacts[0].ID >= payload.Artifacts[1].ID {
+		t.Fatalf("artifact metadata = %#v", payload.Artifacts)
+	}
+	for _, forbidden := range []string{"storage_key", "artifacts/", "catalog.json"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("metadata leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+
+	credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Artifact Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookieRequest := newKBaseBrowserCookieRequest(http.MethodGet, "/api/source-agent-artifacts?limit=1", credentials.Token, "")
+	cookieResponse := httptest.NewRecorder()
+	handler.ServeHTTP(cookieResponse, cookieRequest)
+	if cookieResponse.Code != http.StatusOK {
+		t.Fatalf("Cookie metadata status=%d body=%s", cookieResponse.Code, cookieResponse.Body.String())
+	}
+
+	for _, test := range []struct {
+		name  string
+		path  string
+		token string
+		want  int
+	}{
+		{name: "anonymous", path: "/api/source-agent-artifacts", want: http.StatusUnauthorized},
+		{name: "worker token", path: "/api/source-agent-artifacts", token: "agent-secret", want: http.StatusUnauthorized},
+		{name: "duplicate limit", path: "/api/source-agent-artifacts?limit=1&limit=2", token: "admin-secret", want: http.StatusBadRequest},
+		{name: "unknown query", path: "/api/source-agent-artifacts?root=private", token: "admin-secret", want: http.StatusBadRequest},
+		{name: "negative limit", path: "/api/source-agent-artifacts?limit=-1", token: "admin-secret", want: http.StatusBadRequest},
+		{name: "wrong method", path: "/api/source-agent-artifacts", token: "admin-secret", want: http.StatusMethodNotAllowed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			method := http.MethodGet
+			if test.name == "wrong method" {
+				method = http.MethodPost
+			}
+			got := requestKBase(handler, method, test.path, test.token)
+			if got.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", got.Code, got.Body.String(), test.want)
+			}
+			for _, forbidden := range []string{"private", "root", "storage_key", "catalog.json"} {
+				if strings.Contains(got.Body.String(), forbidden) {
+					t.Fatalf("error leaked %q: %s", forbidden, got.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadIsCommandBound(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-download")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	response := requestKBase(handler, http.MethodGet, path, "agent-secret")
+	if response.Code != http.StatusOK || response.Body.String() != "artifact-worker-bytes" {
+		t.Fatalf("download status=%d body=%q", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("Cache-Control=%q", got)
+	}
+	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len("artifact-worker-bytes")) {
+		t.Fatalf("Content-Length=%q", got)
+	}
+	if got := response.Header().Get("X-Source-Agent-Artifact-SHA256"); got != sha256HexForTest([]byte("artifact-worker-bytes")) {
+		t.Fatalf("artifact SHA header=%q", got)
+	}
+
+	diagnose := mustCreateSourceAgentDiagnoseCommand(t, sourceSync, clock, "agent-a", "artifact-diagnose", time.Hour)
+	if _, err := sourceSync.ClaimSourceAgentCommand(diagnose.ID, "agent-a", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	queued := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-b", "artifact-worker", "artifact-queued")
+	for _, test := range []struct {
+		name      string
+		path      string
+		token     string
+		want      int
+		forbidden []string
+	}{
+		{name: "anonymous", path: path, want: http.StatusUnauthorized},
+		{name: "admin token", path: path, token: "admin-secret", want: http.StatusUnauthorized},
+		{name: "wrong target", path: strings.Replace(path, "agent_id=agent-a", "agent_id=agent-b", 1), token: "agent-secret", want: http.StatusForbidden, forbidden: []string{claimed.ID, "agent-a"}},
+		{name: "wrong artifact", path: strings.Replace(path, "artifacts/artifact-worker", "artifacts/artifact-2", 1), token: "agent-secret", want: http.StatusForbidden, forbidden: []string{claimed.ID, "artifact-worker"}},
+		{name: "queued", path: "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-b&command_id=" + url.QueryEscape(queued.ID), token: "agent-secret", want: http.StatusConflict, forbidden: []string{queued.ID}},
+		{name: "diagnose", path: "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(diagnose.ID), token: "agent-secret", want: http.StatusForbidden, forbidden: []string{diagnose.ID}},
+		{name: "duplicate agent", path: path + "&agent_id=agent-a", token: "agent-secret", want: http.StatusBadRequest},
+		{name: "unknown query", path: path + "&storage_key=private", token: "agent-secret", want: http.StatusBadRequest, forbidden: []string{"private", "storage_key"}},
+		{name: "traversal artifact", path: "/api/source-agent/artifacts/%2E%2E/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID), token: "agent-secret", want: http.StatusBadRequest},
+		{name: "noncanonical artifact", path: "/api/source-agent/artifacts/%20artifact-worker%20/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID), token: "agent-secret", want: http.StatusBadRequest},
+		{name: "noncanonical agent", path: strings.Replace(path, "agent_id=agent-a", "agent_id=%20agent-a%20", 1), token: "agent-secret", want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := requestKBase(handler, http.MethodGet, test.path, test.token)
+			if got.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", got.Code, got.Body.String(), test.want)
+			}
+			for _, forbidden := range append(test.forbidden, "catalog.json", "artifacts/") {
+				if strings.Contains(got.Body.String(), forbidden) {
+					t.Fatalf("error leaked %q: %s", forbidden, got.Body.String())
+				}
+			}
+		})
+	}
+
+	completed := completeSourceAgentUpgradeCommand(t, sourceSync, claimed.ID, "agent-a", "agent-a", "2.0.0")
+	terminalPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(completed.ID)
+	terminal := requestKBase(handler, http.MethodGet, terminalPath, "agent-secret")
+	if terminal.Code != http.StatusConflict || strings.Contains(terminal.Body.String(), completed.ID) {
+		t.Fatalf("terminal download status=%d body=%s", terminal.Code, terminal.Body.String())
+	}
+
+	if _, err := sourceSync.ClaimSourceAgentCommand(queued.ID, "agent-b", "agent-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-b", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "amd64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	incompatiblePath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-b&command_id=" + url.QueryEscape(queued.ID)
+	incompatible := requestKBase(handler, http.MethodGet, incompatiblePath, "agent-secret")
+	if incompatible.Code != http.StatusForbidden || strings.Contains(incompatible.Body.String(), queued.ID) {
+		t.Fatalf("incompatible registry target status=%d body=%s", incompatible.Code, incompatible.Body.String())
+	}
+
+	expiring := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-expired")
+	if _, err := sourceSync.ClaimSourceAgentCommand(expiring.ID, "agent-a", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Hour)
+	expiredPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(expiring.ID)
+	expired := requestKBase(handler, http.MethodGet, expiredPath, "agent-secret")
+	if expired.Code != http.StatusConflict || strings.Contains(expired.Body.String(), expiring.ID) {
+		t.Fatalf("expired download status=%d body=%s", expired.Code, expired.Body.String())
+	}
+
+	stale := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-stale-version")
+	if _, err := sourceSync.ClaimSourceAgentCommand(stale.ID, "agent-a", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-a", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.1.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stalePath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(stale.ID)
+	staleResponse := requestKBase(handler, http.MethodGet, stalePath, "agent-secret")
+	if staleResponse.Code != http.StatusConflict || strings.Contains(staleResponse.Body.String(), stale.ID) || strings.Contains(staleResponse.Body.String(), "1.0.0") {
+		t.Fatalf("stale-version download status=%d body=%s", staleResponse.Code, staleResponse.Body.String())
+	}
+}
+
+func TestSourceAgentArtifactHandoffDownloadIncludesCommandBoundCatalogSnapshot(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-handoff-snapshot")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	response := requestKBase(handler, http.MethodGet, path, "agent-secret")
+	if response.Code != http.StatusOK || response.Body.String() != "artifact-worker-bytes" {
+		t.Fatalf("download status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	wantHeaders := map[string]string{
+		"X-Source-Agent-Command-ID":                claimed.ID,
+		"X-Source-Agent-Artifact-ID":               "artifact-worker",
+		"X-Source-Agent-Artifact-Version":          "2.0.0",
+		"X-Source-Agent-Artifact-Worker-Type":      "wechat-worker",
+		"X-Source-Agent-Artifact-Platform":         "darwin",
+		"X-Source-Agent-Artifact-Architecture":     "arm64",
+		"X-Source-Agent-Artifact-Protocol-Version": "2026-08-01",
+		"X-Source-Agent-Artifact-Revision":         sourceAgentArtifactTestRevision,
+		"X-Source-Agent-Artifact-Channel":          "staging",
+		"X-Source-Agent-Artifact-Size":             strconv.Itoa(len("artifact-worker-bytes")),
+		"X-Source-Agent-Artifact-SHA256":           sha256HexForTest([]byte("artifact-worker-bytes")),
+	}
+	for name, want := range wantHeaders {
+		t.Run(name, func(t *testing.T) {
+			values := response.Header().Values(name)
+			if len(values) != 1 || values[0] != want {
+				t.Fatalf("%s=%q, want one value %q", name, values, want)
+			}
+		})
+	}
+}
+
+func TestSourceAgentArtifactHandoffCatalogReloadCannotMixSnapshotMetadataAndBytes(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	concrete := handler.(*kbaseHTTPHandler)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-snapshot-reload")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	release := make(chan struct{})
+	writer := &snapshotBindingSourceAgentArtifactWriter{
+		header: make(http.Header), entered: make(chan struct{}), release: release,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		request.Header.Set("Authorization", "Bearer agent-secret")
+		handler.ServeHTTP(writer, request)
+	}()
+	select {
+	case <-writer.entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("download did not bind its snapshot before response")
+	}
+
+	artifacts, err := concrete.sourceArtifacts.load()
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	replacementBytes := []byte("replacement artifact bytes")
+	found := false
+	for index := range artifacts {
+		if artifacts[index].ID != "artifact-worker" {
+			continue
+		}
+		found = true
+		artifacts[index].Version = "3.0.0"
+		artifacts[index].Revision = strings.Repeat("b", 40)
+		artifacts[index].Channel = "production"
+		artifacts[index].Size = int64(len(replacementBytes))
+		artifacts[index].SHA256 = sha256HexForTest(replacementBytes)
+		artifactPath := filepath.Join(concrete.sourceArtifacts.root, filepath.FromSlash(artifacts[index].StorageKey))
+		if err := os.WriteFile(artifactPath, replacementBytes, 0o600); err != nil {
+			close(release)
+			t.Fatal(err)
+		}
+	}
+	if !found {
+		close(release)
+		t.Fatal("artifact-worker was not found")
+	}
+	writeSourceAgentArtifactCatalog(t, concrete.sourceArtifacts.root, artifacts)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot download did not finish")
+	}
+
+	if writer.status != http.StatusOK || writer.body.String() != "artifact-worker-bytes" {
+		t.Fatalf("status=%d body=%q", writer.status, writer.body.String())
+	}
+	for name, want := range map[string]string{
+		sourceAgentHeaderArtifactVersion:  "2.0.0",
+		sourceAgentHeaderArtifactRevision: sourceAgentArtifactTestRevision,
+		sourceAgentHeaderArtifactChannel:  "staging",
+		sourceAgentHeaderArtifactSize:     strconv.Itoa(len("artifact-worker-bytes")),
+		sourceAgentHeaderArtifactSHA256:   sha256HexForTest([]byte("artifact-worker-bytes")),
+	} {
+		if values := writer.header.Values(name); len(values) != 1 || values[0] != want {
+			t.Fatalf("%s=%q want one value %q", name, values, want)
+		}
+	}
+}
+
+type snapshotBindingSourceAgentArtifactWriter struct {
+	header      http.Header
+	status      int
+	body        bytes.Buffer
+	entered     chan struct{}
+	release     <-chan struct{}
+	wroteHeader sync.Once
+}
+
+func (w *snapshotBindingSourceAgentArtifactWriter) Header() http.Header { return w.header }
+
+func (w *snapshotBindingSourceAgentArtifactWriter) WriteHeader(status int) {
+	w.status = status
+	w.wroteHeader.Do(func() { close(w.entered) })
+}
+
+func (w *snapshotBindingSourceAgentArtifactWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	<-w.release
+	return w.body.Write(data)
+}
+
+func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact(t *testing.T) {
+	type guardFixture struct {
+		handler      http.Handler
+		sourceSync   *SourceSyncStore
+		clock        *sourceSyncTestClock
+		command      SourceAgentCommand
+		artifactRoot string
+	}
+	newFixture := func(t *testing.T, state string, ttl time.Duration) guardFixture {
+		t.Helper()
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		command, err := sourceSync.CreateSourceAgentCommand(SourceAgentCommandCreate{
+			TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade, IdempotencyKey: "artifact-guard-" + state,
+			Payload:   json.RawMessage(`{"artifact_id":"artifact-worker","expected_current_version":"1.0.0"}`),
+			ExpiresAt: clock.Now().Add(ttl).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandPath := "/api/source-agent/commands/" + url.PathEscape(claimed.ID) + "/progress"
+		for _, next := range []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting} {
+			got := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-a","state":"`+next+`"}`)
+			if got.Code != http.StatusOK {
+				t.Fatalf("progress %s status=%d body=%s", next, got.Code, got.Body.String())
+			}
+			if next == state {
+				break
+			}
+		}
+		stored, err := sourceSync.GetSourceAgentCommand(claimed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return guardFixture{
+			handler: handler, sourceSync: sourceSync, clock: clock, command: stored,
+			artifactRoot: sourceAgentArtifactRootFromHandlerForTest(t, handler),
+		}
+	}
+	requestGuard := func(t *testing.T, fixture guardFixture, token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		path := "/api/source-agent/commands/" + url.PathEscape(fixture.command.ID) + "/guard"
+		return requestJSONKBase(fixture.handler, http.MethodPost, path, token, body)
+	}
+	validFields := func() map[string]any {
+		return map[string]any{
+			"agent_id": "agent-a", "artifact_id": "artifact-worker",
+			"current_version": "1.0.0", "target_version": "2.0.0",
+			"revision": sourceAgentArtifactTestRevision, "channel": "staging",
+			"size": int64(len("artifact-worker-bytes")), "sha256": sha256HexForTest([]byte("artifact-worker-bytes")),
+			"worker_type": "wechat-worker", "platform": "darwin", "architecture": "arm64",
+			"protocol_version": "2026-08-01",
+		}
+	}
+	bodyFor := func(t *testing.T, fields map[string]any) string {
+		t.Helper()
+		body, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	emptyLease := ""
+	malformedLease := "not-a-time"
+	nonCanonicalLease := "2026-08-01T13:00:00.000000000Z"
+	offsetLease := "2026-08-01T09:00:00-04:00"
+	expiredLease := "2026-08-01T11:59:59Z"
+
+	t.Run("allows exact owned installing command with no run and sufficient TTL", func(t *testing.T) {
+		fixture := newFixture(t, SourceAgentCommandInstalling, time.Hour)
+		response := requestGuard(t, fixture, "agent-secret", bodyFor(t, validFields()))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("guard status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		state     string
+		token     string
+		ttl       time.Duration
+		mutate    func(map[string]any)
+		disable   bool
+		activeRun bool
+		lease     *string
+		want      int
+	}{
+		{name: "requires worker authentication", state: SourceAgentCommandInstalling, ttl: time.Hour, want: http.StatusUnauthorized},
+		{name: "requires claimed owner", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["agent_id"] = "agent-b" }, want: http.StatusForbidden},
+		{name: "requires installing state", state: SourceAgentCommandVerified, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
+		{name: "rejects restarting state", state: SourceAgentCommandRestarting, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
+		{name: "requires no active source run", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, want: http.StatusConflict},
+		{name: "allows a valid expired source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &expiredLease, want: http.StatusNoContent},
+		{name: "fails closed on empty source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &emptyLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on malformed source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &malformedLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on noncanonical source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &nonCanonicalLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on non-UTC source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &offsetLease, want: http.StatusServiceUnavailable},
+		{name: "requires allowed rollout", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, disable: true, want: http.StatusConflict},
+		{name: "requires restart ready reconcile safety TTL", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Minute, want: http.StatusConflict},
+		{name: "requires artifact ID", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["artifact_id"] = "artifact-2" }, want: http.StatusConflict},
+		{name: "requires current version", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["current_version"] = "1.0.1" }, want: http.StatusConflict},
+		{name: "requires target version", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["target_version"] = "2.0.1" }, want: http.StatusConflict},
+		{name: "requires revision", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["revision"] = strings.Repeat("b", 40) }, want: http.StatusConflict},
+		{name: "requires channel", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["channel"] = "production" }, want: http.StatusConflict},
+		{name: "requires size", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["size"] = int64(len("artifact-worker-bytes") + 1) }, want: http.StatusConflict},
+		{name: "requires SHA-256", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["sha256"] = strings.Repeat("0", 64) }, want: http.StatusConflict},
+		{name: "requires worker type", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["worker_type"] = "wcplus-worker" }, want: http.StatusConflict},
+		{name: "requires platform", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["platform"] = "linux" }, want: http.StatusConflict},
+		{name: "requires architecture", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["architecture"] = "amd64" }, want: http.StatusConflict},
+		{name: "requires protocol", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["protocol_version"] = "2026-07-01" }, want: http.StatusConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, test.state, test.ttl)
+			if test.disable {
+				setSourceAgentArtifactRolloutForTest(t, fixture.artifactRoot, "artifact-worker", false)
+			}
+			if test.activeRun {
+				subscription, err := fixture.sourceSync.CreateSubscription(SourceSubscriptionInput{
+					SourceType: "wechat_mp_article", SourceAccountKey: "guard-active-run",
+					SourceAccount: "Guard Active Run", AgentID: "agent-a",
+					Operation: "sync_articles", Enabled: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				run, err := fixture.sourceSync.CreateRun(subscription.ID, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				leased, err := fixture.sourceSync.LeaseNextRun("agent-a", []string{"sync_articles"}, time.Minute)
+				if err != nil || leased == nil || leased.ID != run.ID {
+					t.Fatalf("leased=%#v err=%v", leased, err)
+				}
+				if _, err := fixture.sourceSync.StartRun(run.ID, "agent-a"); err != nil {
+					t.Fatal(err)
+				}
+				if test.lease != nil {
+					if _, err := fixture.sourceSync.db.Exec(`UPDATE source_sync_runs SET lease_expires_at = ? WHERE id = ?`, *test.lease, run.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			fields := validFields()
+			if test.mutate != nil {
+				test.mutate(fields)
+			}
+			response := requestGuard(t, fixture, test.token, bodyFor(t, fields))
+			if response.Code != test.want {
+				t.Fatalf("guard status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadBoundsConcurrentResponses(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	concrete := handler.(*kbaseHTTPHandler)
+	snapshotTempDir := t.TempDir()
+	concrete.sourceArtifacts.snapshotTempDir = snapshotTempDir
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentIDs := []string{"agent-a", "agent-b", "agent-c"}
+	paths := make([]string, 0, 3)
+	for index, agentID := range agentIDs {
+		command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, agentID, "artifact-worker", fmt.Sprintf("artifact-bounded-%d", index))
+		claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, "/api/source-agent/artifacts/artifact-worker/download?agent_id="+url.QueryEscape(agentID)+"&command_id="+url.QueryEscape(claimed.ID))
+	}
+
+	release := make(chan struct{})
+	start := func(path string) (<-chan struct{}, context.CancelFunc, <-chan struct{}) {
+		ctx, cancel := context.WithCancel(context.Background())
+		entered := make(chan struct{})
+		done := make(chan struct{})
+		writer := &blockingSourceAgentArtifactResponseWriter{
+			header:  make(http.Header),
+			ctx:     ctx,
+			entered: entered,
+			release: release,
+		}
+		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer agent-secret")
+		go func() {
+			defer close(done)
+			handler.ServeHTTP(writer, request)
+		}()
+		return entered, cancel, done
+	}
+
+	firstEntered, cancelFirst, firstDone := start(paths[0])
+	secondEntered, cancelSecond, secondDone := start(paths[1])
+	defer cancelFirst()
+	defer cancelSecond()
+	for index, entered := range []<-chan struct{}{firstEntered, secondEntered} {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatalf("download %d did not enter response", index+1)
+		}
+	}
+
+	thirdEntered, cancelThird, thirdDone := start(paths[2])
+	unexpectedThird := false
+	select {
+	case <-thirdEntered:
+		unexpectedThird = true
+	case <-time.After(time.Second):
+	}
+	cancelThird()
+	select {
+	case <-thirdDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled third download did not return promptly")
+	}
+
+	retryEntered, cancelRetry, retryDone := start(paths[2])
+	defer cancelRetry()
+	unexpectedRetry := false
+	select {
+	case <-retryEntered:
+		unexpectedRetry = true
+	case <-time.After(time.Second):
+	}
+	cancelFirst()
+	select {
+	case <-retryEntered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("active download cancellation did not release a snapshot slot")
+	}
+	cancelRetry()
+	select {
+	case <-retryDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled active retry did not return promptly")
+	}
+	close(release)
+	for index, done := range []<-chan struct{}{firstDone, secondDone} {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("download %d did not finish after release", index+1)
+		}
+	}
+	if unexpectedThird {
+		t.Fatal("third concurrent download entered the response before a slot was released")
+	}
+	if unexpectedRetry {
+		t.Fatal("retried third download entered the response before active cancellation released a slot")
+	}
+	if entries, err := os.ReadDir(snapshotTempDir); err != nil || len(entries) != 0 {
+		t.Fatalf("snapshot temp entries after cancellation = %#v, %v", entries, err)
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadRevalidatesAfterQueue(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *kbaseHTTPHandler, *SourceSyncStore)
+	}{
+		{
+			name: "rollout disabled",
+			mutate: func(t *testing.T, handler *kbaseHTTPHandler, _ *SourceSyncStore) {
+				setSourceAgentArtifactRolloutForTest(t, handler.sourceArtifacts.root, "artifact-worker", false)
+			},
+		},
+		{
+			name: "registry version changed",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, sourceSync *SourceSyncStore) {
+				if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+					AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+					Version: "1.1.0", ProtocolVersion: "2026-08-01",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+			concrete := handler.(*kbaseHTTPHandler)
+			if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+				AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+				Version: "1.0.0", ProtocolVersion: "2026-08-01",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			leaseObserved := make(chan struct{}, 3)
+			concrete.sourceArtifacts.snapshotLeaseObserver = func() { leaseObserved <- struct{}{} }
+
+			agentIDs := []string{"agent-a", "agent-b", "agent-c"}
+			paths := make([]string, 0, len(agentIDs))
+			for index, agentID := range agentIDs {
+				command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, agentID, "artifact-worker", fmt.Sprintf("artifact-revalidate-%d", index))
+				claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				paths = append(paths, "/api/source-agent/artifacts/artifact-worker/download?agent_id="+url.QueryEscape(agentID)+"&command_id="+url.QueryEscape(claimed.ID))
+			}
+
+			release := make(chan struct{})
+			startBlocking := func(path string) (<-chan struct{}, context.CancelFunc, <-chan struct{}) {
+				ctx, cancel := context.WithCancel(context.Background())
+				entered := make(chan struct{})
+				done := make(chan struct{})
+				writer := &blockingSourceAgentArtifactResponseWriter{
+					header: make(http.Header), ctx: ctx, entered: entered, release: release,
+				}
+				request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+				request.Header.Set("Authorization", "Bearer agent-secret")
+				go func() {
+					defer close(done)
+					handler.ServeHTTP(writer, request)
+				}()
+				return entered, cancel, done
+			}
+			firstEntered, cancelFirst, firstDone := startBlocking(paths[0])
+			secondEntered, cancelSecond, secondDone := startBlocking(paths[1])
+			for _, entered := range []<-chan struct{}{firstEntered, secondEntered} {
+				select {
+				case <-entered:
+				case <-time.After(2 * time.Second):
+					cancelFirst()
+					cancelSecond()
+					t.Fatal("blocking download did not enter response")
+				}
+			}
+			for index := 0; index < 2; index++ {
+				select {
+				case <-leaseObserved:
+				case <-time.After(time.Second):
+					cancelFirst()
+					cancelSecond()
+					t.Fatal("blocking download lease was not observed")
+				}
+			}
+
+			thirdCtx, cancelThird := context.WithCancel(context.Background())
+			thirdResponse := httptest.NewRecorder()
+			thirdRequest := httptest.NewRequest(http.MethodGet, paths[2], nil).WithContext(thirdCtx)
+			thirdRequest.Header.Set("Authorization", "Bearer agent-secret")
+			thirdDone := make(chan struct{})
+			go func() {
+				defer close(thirdDone)
+				handler.ServeHTTP(thirdResponse, thirdRequest)
+			}()
+			select {
+			case <-leaseObserved:
+			case <-time.After(time.Second):
+				cancelFirst()
+				cancelSecond()
+				cancelThird()
+				t.Fatal("queued download lease attempt was not observed")
+			}
+
+			test.mutate(t, concrete, sourceSync)
+			cancelFirst()
+			select {
+			case <-thirdDone:
+			case <-time.After(2 * time.Second):
+				cancelSecond()
+				cancelThird()
+				t.Fatal("queued download did not finish after a slot was released")
+			}
+			cancelSecond()
+			cancelThird()
+			for _, done := range []<-chan struct{}{firstDone, secondDone} {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("blocking download did not stop after cancellation")
+				}
+			}
+			if thirdResponse.Code != http.StatusConflict {
+				t.Fatalf("queued download status=%d body=%q, want conflict", thirdResponse.Code, thirdResponse.Body.String())
+			}
+			for _, forbidden := range []string{"artifact-worker-bytes", "artifact-worker", concrete.sourceArtifacts.root, "catalog.json", "storage_key"} {
+				if strings.Contains(thirdResponse.Body.String(), forbidden) {
+					t.Fatalf("queued download error leaked %q: %s", forbidden, thirdResponse.Body.String())
+				}
+			}
+		})
+	}
+}
+
+type blockingSourceAgentArtifactResponseWriter struct {
+	header      http.Header
+	ctx         context.Context
+	entered     chan<- struct{}
+	release     <-chan struct{}
+	wroteHeader sync.Once
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) WriteHeader(_ int) {
+	w.wroteHeader.Do(func() { close(w.entered) })
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	select {
+	case <-w.release:
+		return len(data), nil
+	case <-w.ctx.Done():
+		return 0, w.ctx.Err()
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactRolloutGate(t *testing.T) {
+	handler, sourceSync, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+	credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Artifact Rollout Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	body := `{"type":"upgrade","idempotency_key":"disabled-artifact","payload":{"artifact_id":"artifact-2","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`
+
+	artifactRoot := sourceAgentArtifactRootFromHandlerForTest(t, handler)
+	setSourceAgentArtifactRolloutForTest(t, artifactRoot, "artifact-2", false)
+	request := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+	addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || strings.Contains(response.Body.String(), "artifact-2") || strings.Contains(response.Body.String(), artifactRoot) {
+		t.Fatalf("disabled create status=%d body=%s", response.Code, response.Body.String())
+	}
+	commands, err := sourceSync.ListSourceAgentCommands("agent-a", 0)
+	if err != nil || len(commands) != 0 {
+		t.Fatalf("disabled rollout created commands=%#v err=%v", commands, err)
+	}
+
+	setSourceAgentArtifactRolloutForTest(t, artifactRoot, "artifact-2", true)
+	request = newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+	addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("enabled create status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-b", "artifact-worker", "install-gate")
+	if _, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-b", "agent-b"); err != nil {
+		t.Fatal(err)
+	}
+	commandPath := "/api/source-agent/commands/" + url.PathEscape(command.ID) + "/progress"
+	for _, state := range []string{SourceAgentCommandDownloading, SourceAgentCommandVerified} {
+		got := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-b","state":"`+state+`"}`)
+		if got.Code != http.StatusOK {
+			t.Fatalf("progress %s status=%d body=%s", state, got.Code, got.Body.String())
+		}
+	}
+	setSourceAgentArtifactRolloutForTest(t, artifactRoot, "artifact-worker", false)
+	install := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-b","state":"installing"}`)
+	if install.Code != http.StatusConflict || strings.Contains(install.Body.String(), artifactRoot) || strings.Contains(install.Body.String(), "artifact-worker") {
+		t.Fatalf("disabled install status=%d body=%s", install.Code, install.Body.String())
+	}
+	stored, err := sourceSync.GetSourceAgentCommand(command.ID)
+	if err != nil || stored.State != SourceAgentCommandVerified {
+		t.Fatalf("disabled install command=%#v err=%v", stored, err)
+	}
+}
+
 func TestKBaseHTTPHandlerSerializesCapabilityHealth(t *testing.T) {
 	root := t.TempDir()
 	sourceSync, err := NewSourceSyncStore(root)
@@ -2149,6 +3223,7 @@ func TestKBaseHTTPHandlerPersistsFailureCheckpointCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sourceSync.Close()
+	registerSourceLeaseAgent(t, sourceSync, "agent-a")
 	subscription, err := sourceSync.CreateSubscription(SourceSubscriptionInput{
 		SourceType:       "wechat_mp_article",
 		SourceAccountKey: "account-key",
@@ -5936,6 +7011,118 @@ func requestJSONKBase(handler http.Handler, method, path, token, body string) *h
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+func newKBaseSourceAgentCommandHTTPFixture(
+	t testing.TB,
+) (http.Handler, *SourceSyncStore, *sourceSyncTestClock, *BrowserSessionStore) {
+	t.Helper()
+	root := t.TempDir()
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
+	sourceSync, err := newSourceSyncStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sourceSync.Close(); err != nil {
+			t.Errorf("close source sync store: %v", err)
+		}
+	})
+	for _, agentID := range []string{"agent-a", "agent-b"} {
+		if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+			AgentID: agentID, WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+			Version: "1.0.0", ProtocolVersion: "2026-08-01",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	artifactRoot := t.TempDir()
+	artifactFiles := map[string][]byte{
+		"artifact-2":       []byte("artifact-2-bytes"),
+		"artifact-3":       []byte("artifact-3-bytes"),
+		"private-artifact": []byte("private-artifact-bytes"),
+		"artifact-worker":  []byte("artifact-worker-bytes"),
+	}
+	artifacts := make([]SourceAgentArtifact, 0, len(artifactFiles))
+	files := make(map[string][]byte, len(artifactFiles))
+	for id, data := range artifactFiles {
+		storageKey := "artifacts/" + id
+		artifacts = append(artifacts, validSourceAgentArtifactForTest(id, storageKey, data))
+		files[storageKey] = data
+	}
+	writeSourceAgentArtifactFixture(t, artifactRoot, artifacts, files)
+	artifactCatalog, err := NewSourceAgentArtifactCatalog(artifactRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	browserDirectory := t.TempDir()
+	if err := os.Chmod(browserDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	browserSessions, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(browserDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(880, 16)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := browserSessions.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(root),
+		AuthToken:        "admin-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "agent-secret",
+		SourceArtifacts:  artifactCatalog,
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           browserSessions,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+	return handler, sourceSync, clock, browserSessions
+}
+
+func sourceAgentArtifactRootFromHandlerForTest(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	concrete, ok := handler.(*kbaseHTTPHandler)
+	if !ok || concrete.sourceArtifacts == nil {
+		t.Fatal("handler has no source artifact catalog")
+	}
+	return concrete.sourceArtifacts.root
+}
+
+func setSourceAgentArtifactRolloutForTest(t *testing.T, root, artifactID string, allowed bool) {
+	t.Helper()
+	catalog, err := NewSourceAgentArtifactCatalog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := catalog.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for index := range artifacts {
+		if artifacts[index].ID == artifactID {
+			artifacts[index].AllowedForRollout = allowed
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("artifact %q not found", artifactID)
+	}
+	writeSourceAgentArtifactCatalog(t, root, artifacts)
 }
 
 type fakeDedaoLibrary struct{}

@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +26,30 @@ type WCPlusSourceConfig struct {
 type WCPlusSourceService struct {
 	client  *http.Client
 	baseURL string
+}
+
+const wcplusLocalAPIClassificationDetailMaxRunes = 1024
+
+type WCPlusLocalAPIError struct {
+	StatusCode           int
+	classificationDetail string
+	cause                error
+}
+
+func (e *WCPlusLocalAPIError) Error() string {
+	return "WC Plus local API request failed"
+}
+
+func (e *WCPlusLocalAPIError) Unwrap() error {
+	return e.cause
+}
+
+func newWCPlusLocalAPIError(statusCode int, detail string, cause error) *WCPlusLocalAPIError {
+	detailRunes := []rune(strings.TrimSpace(detail))
+	if len(detailRunes) > wcplusLocalAPIClassificationDetailMaxRunes {
+		detailRunes = detailRunes[:wcplusLocalAPIClassificationDetailMaxRunes]
+	}
+	return &WCPlusLocalAPIError{StatusCode: statusCode, classificationDetail: string(detailRunes), cause: cause}
 }
 
 type WCPlusListOptions struct {
@@ -1149,11 +1174,12 @@ func (s *WCPlusSourceService) do(req *http.Request, target any) error {
 	req.Header.Set("Accept", "application/json")
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return err
+		return newWCPlusLocalAPIError(0, err.Error(), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("wcplus request failed: %s", resp.Status)
+		cause := fmt.Errorf("WC Plus local API returned HTTP %d", resp.StatusCode)
+		return newWCPlusLocalAPIError(resp.StatusCode, resp.Status, cause)
 	}
 	var raw json.RawMessage
 	var envelope struct {
@@ -1164,21 +1190,31 @@ func (s *WCPlusSourceService) do(req *http.Request, target any) error {
 		Data    json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		return err
+		return newWCPlusLocalAPIError(0, err.Error(), err)
 	}
-	if err := json.Unmarshal(raw, &envelope); err == nil && envelope.Data != nil {
+	if err := json.Unmarshal(raw, &envelope); err == nil {
 		if envelope.Success != nil && !*envelope.Success {
+			detail := ""
 			if strings.TrimSpace(envelope.Message) != "" {
-				return fmt.Errorf("wcplus rejected request: %s", envelope.Message)
+				detail = envelope.Message
+			} else if strings.TrimSpace(envelope.Error) != "" {
+				detail = envelope.Error
+			} else {
+				detail = fmt.Sprintf("code=%d", envelope.Code)
 			}
-			if strings.TrimSpace(envelope.Error) != "" {
-				return fmt.Errorf("wcplus rejected request: %s", envelope.Error)
-			}
-			return fmt.Errorf("wcplus rejected request: code=%d", envelope.Code)
+			return newWCPlusLocalAPIError(0, detail, errors.New("WC Plus local API rejected request"))
 		}
-		return json.Unmarshal(envelope.Data, target)
+		if envelope.Data != nil {
+			if err := json.Unmarshal(envelope.Data, target); err != nil {
+				return newWCPlusLocalAPIError(0, err.Error(), err)
+			}
+			return nil
+		}
 	}
-	return json.Unmarshal(raw, target)
+	if err := json.Unmarshal(raw, target); err != nil {
+		return newWCPlusLocalAPIError(0, err.Error(), err)
+	}
+	return nil
 }
 
 func setOptionalQuery(values url.Values, key string, value string) {

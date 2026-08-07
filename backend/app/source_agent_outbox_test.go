@@ -127,6 +127,49 @@ func TestSourceAgentOutboxRejectsUnnormalizedArticle(t *testing.T) {
 	}
 }
 
+func TestSourceAgentOutboxCountsDoNotDecodeEnvelopeBodies(t *testing.T) {
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatalf("new outbox: %v", err)
+	}
+	defer outbox.Close()
+
+	now := time.Now().UTC()
+	for _, state := range []string{SourceOutboxPending, SourceOutboxDead} {
+		_, err := outbox.db.Exec(`
+			INSERT INTO source_agent_outbox (
+				id, run_id, idempotency_key, envelope_json, state, attempt_count,
+				next_attempt_at, next_attempt_at_ns, last_error,
+				created_at, created_at_ns, updated_at, updated_at_ns
+			) VALUES (?, ?, ?, ?, ?, 0, ?, ?, '', ?, ?, ?, ?)
+		`, "item-"+state, "run-counts", "idem-"+state, "not-json", state,
+			now.Format(time.RFC3339Nano), now.UnixNano(), now.Format(time.RFC3339Nano), now.UnixNano(),
+			now.Format(time.RFC3339Nano), now.UnixNano())
+		if err != nil {
+			t.Fatalf("insert malformed %s envelope: %v", state, err)
+		}
+	}
+
+	pending, err := outbox.CountPending()
+	if err != nil || pending != 1 {
+		t.Fatalf("CountPending() = %d, %v; want 1, nil", pending, err)
+	}
+	dead, err := outbox.CountDeadLetters()
+	if err != nil || dead != 1 {
+		t.Fatalf("CountDeadLetters() = %d, %v; want 1, nil", dead, err)
+	}
+
+	if err := outbox.Close(); err != nil {
+		t.Fatalf("close outbox: %v", err)
+	}
+	if _, err := outbox.CountPending(); err == nil {
+		t.Fatal("CountPending() succeeded after close")
+	}
+	if _, err := outbox.CountDeadLetters(); err == nil {
+		t.Fatal("CountDeadLetters() succeeded after close")
+	}
+}
+
 func sourceAgentOutboxEnvelope(idempotencyKey, itemID, title string) SourceArticleEnvelope {
 	return SourceArticleEnvelope{
 		IdempotencyKey:  idempotencyKey,

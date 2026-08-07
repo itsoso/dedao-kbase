@@ -364,6 +364,7 @@ func createSourceIngestSubscription(t *testing.T, store *SourceSyncStore) Source
 
 func createRunningSourceIngestRun(t *testing.T, store *SourceSyncStore, subscriptionID, agentID string) SourceSyncRun {
 	t.Helper()
+	registerSourceLeaseAgent(t, store, agentID)
 	run, err := store.CreateRun(subscriptionID, "sync_content")
 	if err != nil {
 		t.Fatalf("create run: %v", err)

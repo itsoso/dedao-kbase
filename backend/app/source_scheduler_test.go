@@ -171,6 +171,7 @@ func createSchedulerTestSubscription(t *testing.T, store *SourceSyncStore, key, 
 
 func createSchedulerFailedRun(t *testing.T, store *SourceSyncStore, agentID, reason string) SourceSyncRun {
 	t.Helper()
+	registerSourceLeaseAgent(t, store, agentID)
 	runs, err := store.ListRuns(100)
 	if err != nil {
 		t.Fatalf("list runs before failure: %v", err)

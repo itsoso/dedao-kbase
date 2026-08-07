@@ -1,53 +1,390 @@
-#!/bin/bash
+#!/usr/bin/env -S -u BASH_ENV -u ENV -u SHELLOPTS /bin/bash -p
+set +x
 set -euo pipefail
-: "${KBASE_REMOTE_URL:?KBASE_REMOTE_URL is required}"
-: "${KBASE_SOURCE_AGENT_ID:?KBASE_SOURCE_AGENT_ID is required}"
-: "${KBASE_SOURCE_AGENT_TOKEN:?KBASE_SOURCE_AGENT_TOKEN is required}"
-if [[ -n "${KBASE_AUTH_TOKEN:-}" && "$KBASE_AUTH_TOKEN" == "$KBASE_SOURCE_AGENT_TOKEN" ]]; then
-  echo "admin and source-agent tokens must differ" >&2; exit 1
+set +a
+umask 077
+IFS=$' \t\n'
+unset CDPATH
+LC_ALL=C
+export LC_ALL
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+if [[ -n "${KBASE_SOURCE_AGENT_TOKEN+x}" ]]; then
+  echo "KBASE_SOURCE_AGENT_TOKEN environment input is not supported; provide the token on standard input" >&2
+  exit 2
 fi
+unset transport_token admin_token source_agent_token
+admin_token="${KBASE_AUTH_TOKEN-}"
+unset KBASE_AUTH_TOKEN KBASE_SOURCE_AGENT_TOKEN BASH_ENV ENV
+
+mode="install"
+
+usage() {
+  echo "usage: install-source-agent-macos.sh [--check|--render-plist|--render-updater-plist]" >&2
+}
+
+case "${1:-}" in
+  "") ;;
+  --check) mode="check" ;;
+  --render-plist) mode="render" ;;
+  --render-updater-plist) mode="render-updater" ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+required_names=(KBASE_REMOTE_URL KBASE_SOURCE_AGENT_ID)
+missing_names=()
+for name in "${required_names[@]}"; do
+  if [[ -z "${!name:-}" ]]; then
+    missing_names+=("$name")
+  fi
+done
+if [[ ${#missing_names[@]} -gt 0 ]]; then
+  echo "missing required environment variables:" >&2
+  printf '  %s\n' "${missing_names[@]}" >&2
+  exit 2
+fi
+transport_token=""
+if ! IFS= read -r -n 1025 transport_token; then
+  echo "source-agent transport token is required on standard input" >&2
+  exit 2
+fi
+if [[ -n "$admin_token" && "$admin_token" == "$transport_token" ]]; then
+  echo "admin and source-agent tokens must differ" >&2
+  exit 2
+fi
+unset admin_token
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/.." && pwd)"
+pair_library="$script_dir/lib/managed-worker-pair.sh"
+install_library="$script_dir/lib/managed-worker-install.sh"
+# shellcheck source=scripts/lib/managed-worker-pair.sh
+source "$pair_library"
+# shellcheck source=scripts/lib/managed-worker-install.sh
+source "$install_library"
 home="${HOME:?HOME is required}"
 label="life.executor.kbase.source-agent"
-bin_dir="$home/Library/Application Support/KBase/bin"
+updater_label="life.executor.kbase.source-agent.updater"
+worker_type="wechat-worker"
+transport_token_service="life.executor.kbase.source-agent"
+transport_token_account="transport-token"
+max_transport_token_bytes=1024
+binary_source="${SOURCE_AGENT_BINARY_PATH:-$repo_root/build/bin/source-agent}"
+updater_source="${SOURCE_AGENT_UPDATER_BINARY_PATH:-$repo_root/build/bin/source-agent-updater}"
+install_dir="${SOURCE_AGENT_INSTALL_DIR:-$home/Library/Application Support/KBase/bin}"
 state_dir="${SOURCE_AGENT_STATE_DIR:-$home/Library/Application Support/KBase/source-agent}"
+log_dir="${SOURCE_AGENT_LOG_DIR:-$state_dir/logs}"
+plist_path="${SOURCE_AGENT_PLIST_PATH:-$home/Library/LaunchAgents/$label.plist}"
+updater_plist_path="${SOURCE_AGENT_UPDATER_PLIST_PATH:-$home/Library/LaunchAgents/$updater_label.plist}"
 enroll_addr="${SOURCE_AGENT_ENROLL_ADDR:-127.0.0.1:8765}"
-log_dir="$state_dir/logs"
-plist="$home/Library/LaunchAgents/$label.plist"
-mkdir -p "$bin_dir" "$state_dir" "$log_dir" "$(dirname "$plist")"
-chmod 700 "$state_dir" "$log_dir"
-SOURCE_AGENT_OUTPUT="$bin_dir/source-agent" "$(dirname "$0")/build-source-agent-macos.sh" >/dev/null
-chmod 755 "$bin_dir/source-agent"
-printf '%s\n%s\n' "$KBASE_SOURCE_AGENT_TOKEN" "$KBASE_SOURCE_AGENT_TOKEN" | /usr/bin/security add-generic-password -U -s "$label" -a "$KBASE_SOURCE_AGENT_ID:transport-token" -w
 
-temp_plist="$plist.tmp.$$"
-trap 'rm -f "$temp_plist"' EXIT
-/usr/bin/plutil -create xml1 "$temp_plist"
-/usr/bin/plutil -insert Label -string "$label" "$temp_plist"
-/usr/bin/plutil -insert ProgramArguments -array "$temp_plist"
-/usr/bin/plutil -insert ProgramArguments.0 -string "$bin_dir/source-agent" "$temp_plist"
-/usr/bin/plutil -insert ProgramArguments.1 -string run "$temp_plist"
-/usr/bin/plutil -insert EnvironmentVariables -dictionary "$temp_plist"
-/usr/bin/plutil -insert EnvironmentVariables.KBASE_REMOTE_URL -string "$KBASE_REMOTE_URL" "$temp_plist"
-/usr/bin/plutil -insert EnvironmentVariables.KBASE_SOURCE_AGENT_ID -string "$KBASE_SOURCE_AGENT_ID" "$temp_plist"
-/usr/bin/plutil -insert EnvironmentVariables.SOURCE_AGENT_STATE_DIR -string "$state_dir" "$temp_plist"
-/usr/bin/plutil -insert EnvironmentVariables.SOURCE_AGENT_ENROLL_ADDR -string "$enroll_addr" "$temp_plist"
-/usr/bin/plutil -insert RunAtLoad -bool true "$temp_plist"
-/usr/bin/plutil -insert KeepAlive -bool true "$temp_plist"
-/usr/bin/plutil -insert ProcessType -string Background "$temp_plist"
-/usr/bin/plutil -insert ThrottleInterval -integer 15 "$temp_plist"
-/usr/bin/plutil -insert StandardOutPath -string "$log_dir/stdout.log" "$temp_plist"
-/usr/bin/plutil -insert StandardErrorPath -string "$log_dir/stderr.log" "$temp_plist"
-mv "$temp_plist" "$plist"
-chmod 600 "$plist"
+for command_name in cat cp install launchctl mktemp mv plutil rm rmdir sed shasum sync wc; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    echo "missing required command: $command_name" >&2
+    exit 1
+  fi
+done
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "source-agent installation requires macOS" >&2
+  exit 1
+fi
+if [[ ! -x "$binary_source" ]]; then
+  echo "SOURCE_AGENT_BINARY_PATH must point to an executable" >&2
+  exit 2
+fi
+if [[ ! -x "$updater_source" ]]; then
+  echo "SOURCE_AGENT_UPDATER_BINARY_PATH must point to an executable" >&2
+  exit 2
+fi
+token_valid=true
+if ((${#transport_token} == 0 || ${#transport_token} > max_transport_token_bytes)); then
+  token_valid=false
+else
+  for ((index = 0; index < ${#transport_token}; index++)); do
+    case "${transport_token:index:1}" in
+      [[:graph:]]) ;;
+      *) token_valid=false; break ;;
+    esac
+  done
+fi
+if [[ "$token_valid" != true ]]; then
+  echo "KBASE_SOURCE_AGENT_TOKEN must contain printable ASCII without spaces" >&2
+  exit 2
+fi
+unset token_valid index
+
+if ! KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
+  KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
+  SOURCE_AGENT_STATE_DIR="$state_dir" \
+  SOURCE_AGENT_ENROLL_ADDR="$enroll_addr" \
+  "$binary_source" check-config >/dev/null 2>&1; then
+  echo "source-agent configuration preflight failed" >&2
+  exit 2
+fi
+
+if ! "$updater_source" --check --worker-type "$worker_type" >/dev/null 2>&1; then
+  echo "source-agent updater preflight failed" >&2
+  exit 1
+fi
+
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+render_plist() {
+  local destination="$1"
+  local installed_binary="$2"
+  local label_xml binary_xml remote_xml agent_id_xml state_xml enroll_xml stdout_xml stderr_xml
+  label_xml="$(xml_escape "$label")"
+  binary_xml="$(xml_escape "$installed_binary")"
+  remote_xml="$(xml_escape "$KBASE_REMOTE_URL")"
+  agent_id_xml="$(xml_escape "$KBASE_SOURCE_AGENT_ID")"
+  state_xml="$(xml_escape "$state_dir")"
+  enroll_xml="$(xml_escape "$enroll_addr")"
+  stdout_xml="$(xml_escape "$log_dir/stdout.log")"
+  stderr_xml="$(xml_escape "$log_dir/stderr.log")"
+  cat >"$destination" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label_xml</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$binary_xml</string>
+    <string>run</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>KBASE_REMOTE_URL</key>
+    <string>$remote_xml</string>
+    <key>KBASE_SOURCE_AGENT_ID</key>
+    <string>$agent_id_xml</string>
+    <key>SOURCE_AGENT_STATE_DIR</key>
+    <string>$state_xml</string>
+    <key>SOURCE_AGENT_ENROLL_ADDR</key>
+    <string>$enroll_xml</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$stdout_xml</string>
+  <key>StandardErrorPath</key>
+  <string>$stderr_xml</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "$destination" >/dev/null
+}
+
+render_updater_plist() {
+  local destination="$1"
+  local installed_updater="$2"
+  local updater_parent pending_marker updater_label_xml updater_xml pending_marker_xml
+  updater_parent="$(/usr/bin/dirname "$installed_updater")"
+  pending_marker="$updater_parent/.source-agent-handoff/updater.pending"
+  updater_label_xml="$(xml_escape "$updater_label")"
+  updater_xml="$(xml_escape "$installed_updater")"
+  pending_marker_xml="$(xml_escape "$pending_marker")"
+  cat >"$destination" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$updater_label_xml</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$updater_xml</string>
+    <string>--run-pending</string>
+    <string>--worker-type</string>
+    <string>$worker_type</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict>
+      <key>$pending_marker_xml</key>
+      <true/>
+    </dict>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>
+PLIST
+  plutil -lint "$destination" >/dev/null
+}
+
+tmp_plist="$(mktemp "${TMPDIR:-/tmp}/source-agent.plist.XXXXXX")"
+tmp_updater_plist="$(mktemp "${TMPDIR:-/tmp}/source-agent-updater.plist.XXXXXX")"
+worker_tmp=""
+updater_tmp=""
+plist_tmp=""
+updater_plist_tmp=""
+cleanup() {
+  local status=$?
+  if [[ "$MANAGED_WORKER_INSTALL_ACTIVE" == true ]]; then
+    if ! managed_worker_install_rollback; then status=1; fi
+  elif [[ "$MANAGED_WORKER_PAIR_ACTIVE" == true ]] && ! managed_worker_pair_rollback; then
+    status=1
+  fi
+  rm -f "$tmp_plist" || status=1
+  rm -f "$tmp_updater_plist" || status=1
+  [[ -z "$worker_tmp" ]] || rm -f "$worker_tmp" || status=1
+  [[ -z "$updater_tmp" ]] || rm -f "$updater_tmp" || status=1
+  [[ -z "$plist_tmp" ]] || rm -f "$plist_tmp" || status=1
+  [[ -z "$updater_plist_tmp" ]] || rm -f "$updater_plist_tmp" || status=1
+  return "$status"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+if [[ "$mode" == "render" ]]; then
+  render_plist "$tmp_plist" "$binary_source"
+  cat "$tmp_plist"
+  exit 0
+fi
+if [[ "$mode" == "render-updater" ]]; then
+  render_updater_plist "$tmp_updater_plist" "$updater_source"
+  cat "$tmp_updater_plist"
+  exit 0
+fi
+if [[ "$mode" == "check" ]]; then
+  render_plist "$tmp_plist" "$binary_source"
+  render_updater_plist "$tmp_updater_plist" "$updater_source"
+  echo "source-agent installation configuration is valid"
+  exit 0
+fi
+
+mkdir -p "$install_dir" "$state_dir" "$log_dir" "$(dirname "$plist_path")" \
+  "$install_dir/.source-agent-staging" "$install_dir/.source-agent-handoff"
+chmod 0700 "$install_dir" "$state_dir" "$log_dir" \
+  "$install_dir/.source-agent-staging" "$install_dir/.source-agent-handoff"
+binary_source="$(cd "$(dirname "$binary_source")" && pwd -P)/$(basename "$binary_source")"
+updater_source="$(cd "$(dirname "$updater_source")" && pwd -P)/$(basename "$updater_source")"
+install_dir="$(cd "$install_dir" && pwd -P)"
+state_dir="$(cd "$state_dir" && pwd -P)"
+log_dir="$(cd "$log_dir" && pwd -P)"
+plist_dir="$(cd "$(dirname "$plist_path")" && pwd -P)"
+plist_path="$plist_dir/$(basename "$plist_path")"
+updater_plist_path="$plist_dir/$(basename "$updater_plist_path")"
+installed_worker="$install_dir/source-agent"
+installed_updater="$install_dir/source-agent-updater"
+updater_config="$install_dir/.source-agent-updater-config.json"
+domain="gui/$(id -u)"
+
+worker_tmp="$install_dir/.source-agent.$$"
+updater_tmp="$install_dir/.source-agent-updater.$$"
+install -m 0755 "$binary_source" "$worker_tmp"
+install -m 0755 "$updater_source" "$updater_tmp"
+if ! managed_worker_install_begin "$home" source-agent "$installed_worker" "$installed_updater" \
+  "$plist_path" "$updater_plist_path" "$updater_config" "$domain" "$label" "$updater_label" "$updater_tmp" "$worker_type"; then
+  echo "source-agent installation transaction initialization failed" >&2
+  exit 1
+fi
+if [[ -f "$updater_config" && -x "$installed_updater" ]] &&
+  ! "$installed_updater" --check-uninstall --worker-type "$worker_type" >/dev/null 2>&1; then
+  echo "source-agent has unresolved update state; installation refused" >&2
+  exit 1
+fi
+if ! managed_worker_lifecycle_assert_alive ||
+  ! managed_worker_pair_publish "$worker_tmp" "$updater_tmp" "$installed_worker" "$installed_updater"; then
+  echo "source-agent artifact installation failed" >&2
+  exit 1
+fi
+worker_tmp=""
+updater_tmp=""
+if ! managed_worker_install_mark published; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+if ! "$install_dir/source-agent-updater" --check --worker-type wechat-worker >/dev/null 2>&1; then
+  echo "installed source-agent updater preflight failed" >&2
+  exit 1
+fi
+
+if ! managed_worker_install_mark keychain; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+if ! managed_worker_install_publish_keychain_value "$transport_token"; then
+  echo "store source-agent transport token failed" >&2
+  exit 1
+fi
+unset transport_token
+
+if ! managed_worker_install_mark config; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+if ! env -u KBASE_SOURCE_AGENT_TOKEN \
+  KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
+  KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
+  "$installed_updater" --install-config --worker-type "$worker_type" >/dev/null 2>&1; then
+  echo "source-agent updater configuration installation failed" >&2
+  exit 1
+fi
 
 env -u KBASE_SOURCE_AGENT_TOKEN \
   KBASE_REMOTE_URL="$KBASE_REMOTE_URL" \
   KBASE_SOURCE_AGENT_ID="$KBASE_SOURCE_AGENT_ID" \
   SOURCE_AGENT_STATE_DIR="$state_dir" \
-  "$bin_dir/source-agent" doctor >/dev/null
+  "$installed_worker" doctor >/dev/null
 
-domain="gui/$(id -u)"
-launchctl bootout "$domain/$label" 2>/dev/null || true
-launchctl bootstrap "$domain" "$plist"
+render_plist "$tmp_plist" "$installed_worker"
+render_updater_plist "$tmp_updater_plist" "$installed_updater"
+plist_tmp="$plist_path.tmp.$$"
+updater_plist_tmp="$updater_plist_path.tmp.$$"
+install -m 0600 "$tmp_plist" "$plist_tmp"
+install -m 0600 "$tmp_updater_plist" "$updater_plist_tmp"
+if ! managed_worker_install_mark plists; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+mv -f "$plist_tmp" "$plist_path"
+plist_tmp=""
+mv -f "$updater_plist_tmp" "$updater_plist_path"
+updater_plist_tmp=""
+sync
+
+if ! managed_worker_install_mark launching; then
+  echo "source-agent installation transaction update failed" >&2
+  exit 1
+fi
+if [[ "$MANAGED_WORKER_INSTALL_SERVICE_LOADED" == 1 ]]; then
+  launchctl bootout "$domain/$label"
+fi
+if [[ "$MANAGED_WORKER_INSTALL_UPDATER_SERVICE_LOADED" == 1 ]]; then
+  launchctl bootout "$domain/$updater_label"
+fi
+launchctl bootstrap "$domain" "$updater_plist_path"
+launchctl bootstrap "$domain" "$plist_path"
 launchctl kickstart -k "$domain/$label"
-echo "installed and started; open http://$enroll_addr to scan-login"
+launchctl print "$domain/$updater_label" >/dev/null
+launchctl print "$domain/$label" >/dev/null
+if ! managed_worker_install_commit; then
+  echo "source-agent installation commit failed" >&2
+  exit 1
+fi
+echo "source-agent installed and started; open http://$enroll_addr to scan-login"
