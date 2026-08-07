@@ -102,6 +102,9 @@ jobs:
       - name: Verify direct-deployment contract
         run: bash scripts/kbase-direct-deployment-smoke.sh
 
+      - name: Verify source Agent control plane
+        run: bash scripts/source-agent-control-plane-smoke.sh
+
       - name: Verify privacy and generated system map
         run: |
           bash scripts/privacy-smoke.sh

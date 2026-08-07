@@ -1,0 +1,15 @@
+{
+  "agent_id": "fixture-wechat-worker",
+  "worker_type": "wechat-worker",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "version": "1.0.0",
+  "protocol_version": "2026-08-01",
+  "capabilities": ["wechat"],
+  "capability_health": {
+    "wechat": {
+      "healthy": true,
+      "version": "fixture-1"
+    }
+  }
+}
