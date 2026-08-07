@@ -6866,3 +6866,238 @@ body.has-proofroom-modal {
     animation: none;
   }
 }
+
+.source-agents {
+  width: min(1480px, calc(100% - 40px));
+  margin: 0 auto;
+  padding: 42px 0 72px;
+}
+
+.source-agents__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 24px;
+}
+
+.source-agents__header h1 {
+  margin: 4px 0 8px;
+  font-size: clamp(32px, 5vw, 58px);
+  letter-spacing: -0.045em;
+}
+
+.source-agents__header > div:last-child {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.source-agents__summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 32px;
+}
+
+.source-agents__summary-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 20px;
+  border: 1px solid var(--ink-faint);
+  border-radius: 18px;
+  background: var(--paper);
+}
+
+.source-agents__summary-item strong {
+  font-size: 30px;
+}
+
+.source-agents__summary-item span,
+.source-agent-card__status {
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.source-agents__group {
+  margin-top: 28px;
+}
+
+.source-agents__group > h2 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  font-size: 20px;
+}
+
+.source-agents__group > h2 span {
+  min-width: 28px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--paper-muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+.source-agents__list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.source-agent-card {
+  padding: 22px;
+  border: 1px solid var(--ink-faint);
+  border-radius: 22px;
+  background: var(--paper);
+  box-shadow: var(--shadow);
+}
+
+.source-agent-card.is-attention,
+.source-agent-card.is-offline {
+  border-color: #c77b6c;
+}
+
+.source-agent-card__header,
+.source-agent-card__header > div,
+.source-agent-card__actions,
+.source-agent-card__upgrade {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.source-agent-card__header {
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.source-agent-card__header > div {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.source-agent-card__title {
+  color: #24231f;
+  font-size: 18px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.source-agent-card__header > div > span {
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: var(--paper-muted);
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.source-agent-card__facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 20px;
+  margin: 0;
+}
+
+.source-agent-card__facts div {
+  min-width: 0;
+}
+
+.source-agent-card__facts dt,
+.source-agent-card__health h3,
+.source-agent-card__upgrade label > span {
+  margin: 0 0 3px;
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.source-agent-card__facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.source-agent-card__health {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--ink-faint);
+}
+
+.source-agent-card__health > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 5px 0;
+  font-size: 13px;
+}
+
+.source-agent-card__health > div span {
+  color: var(--ink-soft);
+  text-align: right;
+}
+
+.source-agent-card__error {
+  color: #a43f32;
+  overflow-wrap: anywhere;
+}
+
+.source-agent-card__upgrade {
+  align-items: end;
+  margin-top: 18px;
+}
+
+.source-agent-card__upgrade label {
+  display: grid;
+  flex: 1;
+}
+
+.source-agent-card__upgrade select {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--ink-faint);
+  border-radius: 12px;
+  background: var(--paper);
+  color: #24231f;
+  padding: 0 12px;
+}
+
+.source-agent-card__actions {
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+@media (max-width: 840px) {
+  .source-agents {
+    width: min(100% - 24px, 720px);
+    padding-top: 24px;
+  }
+
+  .source-agents__header,
+  .source-agents__header > div:last-child {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .source-agents__summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .source-agents__summary-item.is-attention {
+    order: -2;
+  }
+
+  .source-agents__summary-item.is-upgrading {
+    order: -1;
+  }
+
+  .source-agents__list,
+  .source-agent-card__facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

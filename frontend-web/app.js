@@ -51,6 +51,7 @@ const ROUTES = Object.freeze({
   dedaoCourses: "/sources/dedao/courses",
   dedaoEbooks: "/sources/dedao/ebooks",
   dedaoAudio: "/sources/dedao/audio",
+  sourceAgents: "/sources/agents",
   bookReader: "/read/books",
   knowledgePackages: "/knowledge/packages",
   agentPackages: "/agent-packages",
@@ -220,6 +221,15 @@ const sourceControlState = {
   },
 };
 
+const sourceAgentManagementState = {
+  agents: [],
+  artifacts: [],
+  commandsByAgent: {},
+  loading: "",
+  message: "",
+  pendingAgentID: "",
+};
+
 const knowledgeState = {
   books: [],
   selectedBook: null,
@@ -344,6 +354,8 @@ function knowledgeReviewReasonLabel(reason) {
 let isWCPlusBootstrapped = false;
 let sourceControlPollTimer = null;
 let sourceControlLoadSequence = 0;
+let sourceAgentManagementPollTimer = null;
+let sourceAgentManagementSequence = 0;
 let knowledgeReviewPollTimer = null;
 let knowledgeReviewLoadSequence = 0;
 let knowledgeAgentLoadSequence = 0;
@@ -1506,6 +1518,7 @@ function renderShell(content, current = "") {
         <a class="${current === "ebook" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoEbooks)}">电子书</a>
         <a class="${current === "odob" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoAudio)}">听书</a>
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
+        <a class="${current === "source-agents" ? "active" : ""}" href="/sources/agents">Agent 管理</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
         <a class="${current === "agents" ? "active" : ""}" href="${escapeAttribute(ROUTES.agentPackages)}">Book Agents</a>
@@ -5837,6 +5850,282 @@ function renderWCPlusPage() {
   bindWCPlusEvents();
 }
 
+function sourceAgentManagementStatus(agent, commands = []) {
+  const activeUpgrade = commands.some((command) => command.type === "upgrade" && !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(command.state));
+  if (activeUpgrade || agent.current_command_id) {
+    return "upgrading";
+  }
+  if (agent.desired_state === "paused") {
+    return "paused";
+  }
+  if (!sourceAgentIsOnline(agent)) {
+    return "offline";
+  }
+  const health = Object.values(agent.capability_health || {});
+  if (health.some((item) => !item?.healthy || item?.code || item?.requires_action)) {
+    return "attention";
+  }
+  return "online";
+}
+
+function sourceAgentManagementStatusLabel(status) {
+  return ({
+    online: "在线",
+    attention: "需处理",
+    offline: "离线",
+    paused: "已暂停",
+    upgrading: "升级中",
+  })[status] || "未知";
+}
+
+function sourceAgentManagementGroups() {
+  const groups = { online: [], attention: [], offline: [], paused: [], upgrading: [] };
+  for (const agent of sourceAgentManagementState.agents) {
+    const commands = sourceAgentManagementState.commandsByAgent[agent.agent_id] || [];
+    groups[sourceAgentManagementStatus(agent, commands)].push(agent);
+  }
+  return groups;
+}
+
+function renderSourceAgentStatusSummary() {
+  const groups = sourceAgentManagementGroups();
+  return `
+    <section class="source-agents__summary" aria-label="Agent 状态汇总">
+      ${["online", "attention", "offline", "paused", "upgrading"].map((status) => `
+        <div class="source-agents__summary-item is-${status}">
+          <strong>${groups[status].length}</strong>
+          <span>${sourceAgentManagementStatusLabel(status)}</span>
+        </div>
+      `).join("")}
+    </section>
+  `;
+}
+
+function sourceAgentCompatibleArtifacts(agent) {
+  return sourceAgentManagementState.artifacts.filter((artifact) => (
+    artifact.allowed_for_rollout &&
+    artifact.worker_type === agent.worker_type &&
+    artifact.platform === agent.platform &&
+    artifact.architecture === agent.architecture &&
+    artifact.version !== agent.version
+  ));
+}
+
+function sourceAgentWorkspace(agent) {
+  return agent.worker_type === "wcplus-worker"
+    ? { href: "/wcplus-source", label: "WC Plus 工作台" }
+    : { href: "/wechat-source", label: "微信工作台" };
+}
+
+function renderSourceAgentManagementCard(agent) {
+  const commands = sourceAgentManagementState.commandsByAgent[agent.agent_id] || [];
+  const latestCommand = commands[0] || null;
+  const status = sourceAgentManagementStatus(agent, commands);
+  const healthEntries = Object.entries(agent.capability_health || {});
+  const artifacts = sourceAgentCompatibleArtifacts(agent);
+  const workspace = sourceAgentWorkspace(agent);
+  const pending = sourceAgentManagementState.pendingAgentID === agent.agent_id;
+  return `
+    <article class="source-agent-card is-${status}">
+      <header class="source-agent-card__header">
+        <div>
+          <a class="source-agent-card__title" href="${escapeAttribute(`${ROUTES.sourceAgents}/${encodeURIComponent(agent.agent_id)}`)}">${escapeHTML(agent.agent_id)}</a>
+          <span>${escapeHTML(agent.worker_type || "legacy")}</span>
+        </div>
+        <span class="source-agent-card__status">${sourceAgentManagementStatusLabel(status)}</span>
+      </header>
+      <dl class="source-agent-card__facts">
+        <div><dt>平台 / 架构</dt><dd>${escapeHTML(agent.platform || "-")} / ${escapeHTML(agent.architecture || "-")}</dd></div>
+        <div><dt>版本 / 协议</dt><dd>${escapeHTML(agent.version || "-")} / ${escapeHTML(agent.protocol_version || "-")}</dd></div>
+        <div><dt>最后心跳</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_heartbeat_at))}</dd></div>
+        <div><dt>最后成功</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_success_at))}</dd></div>
+        <div><dt>当前运行</dt><dd>${escapeHTML(agent.current_run_id || "-")}</dd></div>
+        <div><dt>当前命令</dt><dd>${escapeHTML(agent.current_command_id || latestCommand?.state || "-")}</dd></div>
+        <div><dt>Outbox / Dead letter</dt><dd>${Number(agent.outbox_pending || 0)} / ${Number(agent.dead_letter_count || 0)}</dd></div>
+      </dl>
+      <section class="source-agent-card__health" aria-label="能力健康">
+        <h3>能力健康</h3>
+        ${healthEntries.length ? healthEntries.map(([name, health]) => `
+          <div>
+            <strong>${escapeHTML(name)}</strong>
+            <span>${health?.healthy ? "可用" : "不可用"}${health?.code ? ` · ${escapeHTML(health.code)}` : ""}${health?.requires_action ? ` · ${escapeHTML(health.requires_action)}` : ""}</span>
+          </div>
+        `).join("") : '<p class="web-muted">无能力上报</p>'}
+      </section>
+      ${agent.last_error ? `<p class="source-agent-card__error">${escapeHTML(agent.last_error)}</p>` : ""}
+      <div class="source-agent-card__upgrade">
+        <label>
+          <span>选择已批准版本</span>
+          <select data-source-agent-artifact="${escapeAttribute(agent.agent_id)}" ${pending || artifacts.length === 0 ? "disabled" : ""}>
+            <option value="">${artifacts.length ? "选择版本" : "暂无兼容版本"}</option>
+            ${artifacts.map((artifact) => `<option value="${escapeAttribute(artifact.id)}">${escapeHTML(artifact.version)} · ${escapeHTML(artifact.channel)}</option>`).join("")}
+          </select>
+        </label>
+        <button class="button button-ghost" type="button" data-source-agent-upgrade="${escapeAttribute(agent.agent_id)}" ${pending || artifacts.length === 0 ? "disabled" : ""}>升级</button>
+      </div>
+      <div class="source-agent-card__actions">
+        ${agent.desired_state === "paused"
+          ? `<button class="button button-ghost" type="button" data-source-agent-resume="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>恢复</button>`
+          : `<button class="button button-ghost" type="button" data-source-agent-pause="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>暂停</button>`}
+        <button class="button button-ghost" type="button" data-source-agent-diagnose="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>诊断</button>
+        <a class="button button-ghost" href="${workspace.href}?agent_id=${encodeURIComponent(agent.agent_id)}">${workspace.label}</a>
+      </div>
+    </article>
+  `;
+}
+
+function renderSourceAgentOverview() {
+  const groups = sourceAgentManagementGroups();
+  const order = ["attention", "upgrading", "offline", "paused", "online"];
+  const status = sourceAgentManagementState.loading
+    ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.loading)}</div>`
+    : (sourceAgentManagementState.message ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.message)}</div>` : "");
+  renderShell(`
+    <main class="source-agents">
+      <header class="source-agents__header">
+        <div><p class="web-kicker">Source Workers</p><h1>Agent 管理</h1><p class="web-muted">统一控制面，Worker 独立运行；升级只允许选择已批准产物。</p></div>
+        <div>${status}<button id="source-agent-management-refresh" class="button button-ghost" type="button">刷新</button></div>
+      </header>
+      ${renderSourceAgentStatusSummary()}
+      <div class="source-agents__groups">
+        ${order.map((group) => groups[group].length ? `
+          <section class="source-agents__group is-${group}">
+            <h2>${sourceAgentManagementStatusLabel(group)} <span>${groups[group].length}</span></h2>
+            <div class="source-agents__list">${groups[group].map(renderSourceAgentManagementCard).join("")}</div>
+          </section>
+        ` : "").join("") || '<p class="web-muted">尚未收到 Agent 心跳。</p>'}
+      </div>
+    </main>
+  `, "source-agents");
+  bindSourceAgentManagementEvents();
+}
+
+async function loadSourceAgentManagement({ silent = false } = {}) {
+  const sequence = ++sourceAgentManagementSequence;
+  if (!silent) {
+    sourceAgentManagementState.loading = "正在加载 Agent 状态";
+    sourceAgentManagementState.message = "";
+    renderSourceAgentOverview();
+  }
+  try {
+    const agentPayload = await apiFetch("/api/source-agents");
+    if (sequence !== sourceAgentManagementSequence) return;
+    const agents = Array.isArray(agentPayload.agents) ? agentPayload.agents : [];
+    const [artifactResult, ...commandResults] = await Promise.allSettled([
+      apiFetch("/api/source-agent-artifacts?limit=100"),
+      ...agents.map((agent) => apiFetch(`/api/source-agents/${encodeURIComponent(agent.agent_id)}/commands?limit=10`)),
+    ]);
+    if (sequence !== sourceAgentManagementSequence) return;
+    sourceAgentManagementState.agents = agents;
+    sourceAgentManagementState.artifacts = artifactResult.status === "fulfilled" && Array.isArray(artifactResult.value.artifacts) ? artifactResult.value.artifacts : [];
+    sourceAgentManagementState.commandsByAgent = Object.fromEntries(agents.map((agent, index) => {
+      const result = commandResults[index];
+      return [agent.agent_id, result?.status === "fulfilled" && Array.isArray(result.value.commands) ? result.value.commands : []];
+    }));
+    sourceAgentManagementState.message = `${agents.length} 个 Agent · ${sourceAgentManagementState.artifacts.length} 个可见产物`;
+  } catch (error) {
+    if (sequence === sourceAgentManagementSequence) {
+      sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (sequence === sourceAgentManagementSequence) {
+      sourceAgentManagementState.loading = "";
+      renderSourceAgentOverview();
+      scheduleSourceAgentManagementPoll();
+    }
+  }
+}
+
+function scheduleSourceAgentManagementPoll() {
+  if (sourceAgentManagementPollTimer) {
+    clearTimeout(sourceAgentManagementPollTimer);
+    sourceAgentManagementPollTimer = null;
+  }
+  if (!getRoutePathname().startsWith(ROUTES.sourceAgents)) return;
+  const hasActiveCommand = Object.values(sourceAgentManagementState.commandsByAgent).flat().some((command) => !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(command.state));
+  if (!hasActiveCommand && !sourceAgentManagementState.pendingAgentID) return;
+  sourceAgentManagementPollTimer = setTimeout(() => {
+    sourceAgentManagementPollTimer = null;
+    loadSourceAgentManagement({ silent: true });
+  }, 5000);
+}
+
+function sourceAgentCommandEnvelope(type, payload) {
+  const nonce = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    type,
+    idempotency_key: `web-${type}-${nonce}`,
+    ...(payload ? { payload } : {}),
+    expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  };
+}
+
+async function runSourceAgentManagementAction(agentID, operation) {
+  sourceAgentManagementState.pendingAgentID = agentID;
+  sourceAgentManagementState.message = "正在提交操作";
+  renderSourceAgentOverview();
+  try {
+    await operation();
+    sourceAgentManagementState.message = "操作已提交，正在刷新权威状态";
+  } catch (error) {
+    sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceAgentManagementState.pendingAgentID = "";
+    await loadSourceAgentManagement();
+  }
+}
+
+function setSourceAgentDesiredState(agentID, desiredState) {
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/desired-state`, {
+    method: "POST",
+    body: JSON.stringify({ desired_state: desiredState }),
+  }));
+}
+
+function createSourceAgentDiagnostic(agentID) {
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/commands`, {
+    method: "POST",
+    body: JSON.stringify(sourceAgentCommandEnvelope("diagnose")),
+  }));
+}
+
+function confirmSourceAgentUpgrade(agent, artifact) {
+  return window.confirm(`确认升级 ${agent.agent_id}\n当前版本：${agent.version || "-"}\n目标版本：${artifact.version}`);
+}
+
+function createSourceAgentUpgrade(agentID, artifactID) {
+  const agent = sourceAgentManagementState.agents.find((item) => item.agent_id === agentID);
+  const artifact = sourceAgentManagementState.artifacts.find((item) => item.id === artifactID);
+  if (!agent || !artifact || !confirmSourceAgentUpgrade(agent, artifact)) return Promise.resolve();
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/commands`, {
+    method: "POST",
+    body: JSON.stringify(sourceAgentCommandEnvelope("upgrade", {
+      artifact_id: artifact.id,
+      expected_current_version: agent.version,
+    })),
+  }));
+}
+
+function bindSourceAgentManagementEvents() {
+  document.querySelector("#source-agent-management-refresh")?.addEventListener("click", () => loadSourceAgentManagement());
+  for (const button of document.querySelectorAll("[data-source-agent-pause]")) {
+    button.addEventListener("click", () => setSourceAgentDesiredState(button.getAttribute("data-source-agent-pause"), "paused"));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-resume]")) {
+    button.addEventListener("click", () => setSourceAgentDesiredState(button.getAttribute("data-source-agent-resume"), "active"));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-diagnose]")) {
+    button.addEventListener("click", () => createSourceAgentDiagnostic(button.getAttribute("data-source-agent-diagnose")));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-upgrade]")) {
+    button.addEventListener("click", () => {
+      const agentID = button.getAttribute("data-source-agent-upgrade");
+      const select = document.querySelector(`[data-source-agent-artifact="${CSS.escape(agentID)}"]`);
+      if (select?.value) createSourceAgentUpgrade(agentID, select.value);
+    });
+  }
+}
+
 function renderSourceControlPlane() {
   const status = sourceControlState.loading
     ? `<div class="web-status">处理中：${escapeHTML(sourceControlState.loading)}</div>`
@@ -9059,6 +9348,11 @@ function formatArticleTime(value) {
 async function boot() {
   bookKnowledgeLoadSequence += 1;
   const routePathname = getRoutePathname();
+  if (!routePathname.startsWith(ROUTES.sourceAgents) && sourceAgentManagementPollTimer) {
+    clearTimeout(sourceAgentManagementPollTimer);
+    sourceAgentManagementPollTimer = null;
+    sourceAgentManagementSequence += 1;
+  }
   const isBookAgentRoute = (
     routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
     routePathname === ROUTES.agents || routePathname.startsWith(`${ROUTES.agents}/`) ||
@@ -9096,6 +9390,11 @@ async function boot() {
   if (routePathname === ROUTES.operations) {
     renderKnowledgeOperationsConsole();
     await loadKnowledgeOperationsConsole();
+    return;
+  }
+  if (routePathname === ROUTES.sourceAgents) {
+    renderSourceAgentOverview();
+    await loadSourceAgentManagement();
     return;
   }
   const dedaoCourseEnID = getDedaoCourseDetailEnID();
