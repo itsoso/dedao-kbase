@@ -565,8 +565,8 @@ func validateAgentPackageReleases(
 		if err != nil {
 			return nil, fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
 		}
-		sourceType := strings.TrimSpace(release.Book.SourceType)
-		if sourceType == "" {
+		sourceType, sourceTypeErr := controlledAgentSourceType(release.Book)
+		if sourceTypeErr != nil {
 			return nil, fmt.Errorf("release %q source type is required", ref.ReleaseID)
 		}
 		if !allowedSources[sourceType] {

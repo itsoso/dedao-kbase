@@ -7,9 +7,68 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
+
+func TestBookKnowledgeContentHashIsStableAndTracksDurableContent(t *testing.T) {
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.ContentHash = ""
+	pkg.Book.CreatedAt = "2026-01-01T00:00:00Z"
+	pkg.Book.UpdatedAt = "2026-01-01T00:00:00Z"
+
+	first, err := BookKnowledgeContentHash(pkg)
+	if err != nil {
+		t.Fatalf("BookKnowledgeContentHash returned error: %v", err)
+	}
+	if !strings.HasPrefix(first, "sha256:") || len(first) != len("sha256:")+64 {
+		t.Fatalf("content hash = %q", first)
+	}
+
+	reordered := pkg
+	reordered.Book.CreatedAt = "2027-02-02T00:00:00Z"
+	reordered.Book.UpdatedAt = "2027-02-02T00:00:00Z"
+	slices.Reverse(reordered.Chapters)
+	slices.Reverse(reordered.Chunks)
+	slices.Reverse(reordered.Claims)
+	slices.Reverse(reordered.Citations)
+	second, err := BookKnowledgeContentHash(reordered)
+	if err != nil {
+		t.Fatalf("BookKnowledgeContentHash reordered returned error: %v", err)
+	}
+	if second != first {
+		t.Fatalf("stable hash changed: first=%s second=%s", first, second)
+	}
+
+	changed := pkg
+	changed.Chunks = append([]BookKnowledgeChunk(nil), pkg.Chunks...)
+	changed.Chunks[0].Text += " changed"
+	third, err := BookKnowledgeContentHash(changed)
+	if err != nil {
+		t.Fatalf("BookKnowledgeContentHash changed returned error: %v", err)
+	}
+	if third == first {
+		t.Fatal("durable content change did not change hash")
+	}
+}
+
+func TestSavePackageAssignsMissingContentHash(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.ContentHash = ""
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	loaded, err := store.LoadPackage(pkg.Book.BookID)
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if !strings.HasPrefix(loaded.Book.ContentHash, "sha256:") {
+		t.Fatalf("content hash = %q", loaded.Book.ContentHash)
+	}
+}
 
 func TestBookKnowledgeStorePaths(t *testing.T) {
 	root := t.TempDir()

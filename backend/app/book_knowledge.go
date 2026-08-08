@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -89,6 +90,48 @@ type BookKnowledgePackage struct {
 	Chunks    []BookKnowledgeChunk    `json:"chunks"`
 	Claims    []BookKnowledgeClaim    `json:"claims"`
 	Citations []BookKnowledgeCitation `json:"citations"`
+}
+
+func BookKnowledgeContentHash(pkg BookKnowledgePackage) (string, error) {
+	book := pkg.Book
+	book.ContentHash = ""
+	book.CreatedAt = ""
+	book.UpdatedAt = ""
+	book.Status = ""
+
+	chapters := append([]BookKnowledgeChapter(nil), pkg.Chapters...)
+	for index := range chapters {
+		chapters[index].ChunkIDs = append([]string(nil), chapters[index].ChunkIDs...)
+		sort.Strings(chapters[index].ChunkIDs)
+	}
+	sort.Slice(chapters, func(i, j int) bool { return chapters[i].ChapterID < chapters[j].ChapterID })
+
+	chunks := append([]BookKnowledgeChunk(nil), pkg.Chunks...)
+	sort.Slice(chunks, func(i, j int) bool { return chunks[i].ChunkID < chunks[j].ChunkID })
+
+	claims := append([]BookKnowledgeClaim(nil), pkg.Claims...)
+	for index := range claims {
+		claims[index].Citations = append([]string(nil), claims[index].Citations...)
+		sort.Strings(claims[index].Citations)
+	}
+	sort.Slice(claims, func(i, j int) bool { return claims[i].ClaimID < claims[j].ClaimID })
+
+	citations := append([]BookKnowledgeCitation(nil), pkg.Citations...)
+	sort.Slice(citations, func(i, j int) bool { return citations[i].CitationID < citations[j].CitationID })
+
+	canonical := struct {
+		Book      BookKnowledgeBook       `json:"book"`
+		Chapters  []BookKnowledgeChapter  `json:"chapters"`
+		Chunks    []BookKnowledgeChunk    `json:"chunks"`
+		Claims    []BookKnowledgeClaim    `json:"claims"`
+		Citations []BookKnowledgeCitation `json:"citations"`
+	}{book, chapters, chunks, claims, citations}
+	payload, err := json.Marshal(canonical)
+	if err != nil {
+		return "", fmt.Errorf("encode canonical book knowledge: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("sha256:%x", digest), nil
 }
 
 type BookKnowledgeManifest struct {
@@ -184,6 +227,13 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 	if strings.TrimSpace(pkg.Book.Extractor) == "" {
 		pkg.Book.Extractor = defaultBookKnowledgeExtractor
 	}
+	if strings.TrimSpace(pkg.Book.ContentHash) == "" {
+		contentHash, err := BookKnowledgeContentHash(pkg)
+		if err != nil {
+			return err
+		}
+		pkg.Book.ContentHash = contentHash
+	}
 	bookJSON, err := encodeJSONFile(pkg.Book)
 	if err != nil {
 		return err
@@ -225,6 +275,30 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 		return err
 	}
 	return s.upsertManifestBook(pkg.Book)
+}
+
+func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookKnowledgePackage, error) {
+	pkg, err := s.LoadPackage(bookID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(pkg.Book.ContentHash) != "" {
+		return nil, fmt.Errorf("book already has content hash")
+	}
+	contentHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range []string{s.BookAnalysisManifestPath(bookID), s.BookQualityReportPath(bookID)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("invalidate derived book artifact: %w", err)
+		}
+	}
+	pkg.Book.ContentHash = contentHash
+	if err := s.SavePackage(*pkg); err != nil {
+		return nil, err
+	}
+	return pkg, nil
 }
 
 func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, error) {

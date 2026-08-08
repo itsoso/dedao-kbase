@@ -337,6 +337,18 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	r = requestWithKBaseAuth(r, auth)
+	if strings.HasPrefix(r.URL.Path, "/api/controlled-agent/") {
+		if h.agentPublisherToken == "" {
+			writeHTTPError(w, http.StatusServiceUnavailable, "controlled Agent publisher is not configured")
+			return
+		}
+		if auth.Method != kbaseAuthMethodCookie {
+			writeHTTPError(w, http.StatusUnauthorized, "controlled Agent requires an authorized browser session")
+			return
+		}
+		h.handleControlledAgentWorkflow(w, r)
+		return
+	}
 	if isSourceSyncAdminPath(r.URL.Path) {
 		h.handleSourceSyncAdmin(w, r)
 		return
@@ -367,6 +379,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if bookID, ok := bookNestedPathID(r.URL.Path, "publish"); ok {
 		h.handleBookPublish(w, r, bookID)
+		return
+	}
+	if bookID, ok := bookNestedPathID(r.URL.Path, "repair-content-hash"); ok {
+		h.handleBookContentHashRepair(w, r, bookID)
 		return
 	}
 	if releaseID, ok := knowledgeReleaseFeedbackPathID(r.URL.Path); ok {
@@ -1455,6 +1471,40 @@ func (h *kbaseHTTPHandler) handleBookPublish(w http.ResponseWriter, r *http.Requ
 	writeHTTPJSON(w, http.StatusOK, release)
 }
 
+func (h *kbaseHTTPHandler) handleBookContentHashRepair(w http.ResponseWriter, r *http.Request, bookID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var request struct {
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !request.Confirm {
+		writeHTTPError(w, http.StatusBadRequest, "explicit confirmation is required")
+		return
+	}
+	pkg, err := h.store.RepairMissingBookContentHash(bookID)
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "book not found") {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "already has content hash") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"book_id": pkg.Book.BookID, "content_hash": pkg.Book.ContentHash, "repaired": true,
+	})
+}
+
 func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1527,6 +1577,98 @@ type AgentPackagePublishRequest struct {
 type AgentPackageEvaluationRequest struct {
 	Package AgentPackage         `json:"package"`
 	Suite   AgentEvaluationSuite `json:"suite"`
+}
+
+type ControlledAgentWorkflowRequest struct {
+	Draft          ControlledAgentDraftRequest `json:"draft"`
+	IdempotencyKey string                      `json:"idempotency_key,omitempty"`
+	Confirm        bool                        `json:"confirm,omitempty"`
+}
+
+func (h *kbaseHTTPHandler) handleControlledAgentWorkflow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var request ControlledAgentWorkflowRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	draft, err := BuildControlledAgentPackageDraft(h.store, request.Draft, h.agentTools)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	switch r.URL.Path {
+	case "/api/controlled-agent/draft":
+		writeHTTPJSON(w, http.StatusOK, draft)
+	case "/api/controlled-agent/evaluate":
+		report, created, err := h.evaluateControlledAgentDraft(*draft)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "draft": draft, "evaluation": report})
+	case "/api/controlled-agent/publish":
+		if !request.Confirm {
+			writeHTTPError(w, http.StatusBadRequest, "explicit confirmation is required")
+			return
+		}
+		if strings.TrimSpace(request.IdempotencyKey) == "" {
+			writeHTTPError(w, http.StatusBadRequest, "idempotency_key is required")
+			return
+		}
+		report, _, err := h.evaluateControlledAgentDraft(*draft)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !report.Passed {
+			writeHTTPError(w, http.StatusConflict, "controlled Agent evaluation did not pass")
+			return
+		}
+		published, created, err := PublishAgentPackage(h.store, draft.Package, request.IdempotencyKey, h.agentTools, time.Now())
+		if err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "evaluation": report, "package": published})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "controlled Agent operation not found")
+	}
+}
+
+func (h *kbaseHTTPHandler) evaluateControlledAgentDraft(draft ControlledAgentDraft) (*AgentEvaluationReport, bool, error) {
+	if existing, err := h.store.LoadAgentPackageEvaluation(draft.Package.ContentHash); err == nil {
+		storedSuite, suiteErr := h.store.LoadAgentPackageEvaluationSuite(draft.Package.ContentHash)
+		if suiteErr != nil {
+			return nil, false, suiteErr
+		}
+		if !reflect.DeepEqual(*storedSuite, draft.Suite) {
+			return nil, false, fmt.Errorf("agent package evaluation suite is immutable for this content hash")
+		}
+		return existing, false, nil
+	} else if !os.IsNotExist(err) {
+		return nil, false, err
+	}
+	report, err := EvaluateAgentPackageDeterministically(h.store, draft.Package, draft.Suite, time.Now())
+	if err != nil {
+		return nil, false, err
+	}
+	if err := h.store.SaveAgentPackageEvaluation(draft.Package, draft.Suite, report); err != nil {
+		return nil, false, err
+	}
+	return &report, true, nil
 }
 
 type AgentPackageTrustedEvaluationSuiteRequest struct {

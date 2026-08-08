@@ -212,6 +212,22 @@ assert.ok(selectKnowledgeBookSource.includes("++bookKnowledgeDetailSequence"), "
 assert.ok(selectKnowledgeBookSource.includes("sequence !== bookKnowledgeDetailSequence"), "stale book detail responses should be discarded");
 assert.ok(selectKnowledgeBookSource.includes("knowledgeState.selectedBook?.book_id !== book.book_id"), "book detail writes should remain scoped to the selected book");
 
+for (const marker of [
+  "controlledAgentWizard",
+  "Book Agent 向导",
+  "选择 Release",
+  "配置只读策略",
+  "评测并发布",
+  "/api/controlled-agent/draft",
+  "/api/controlled-agent/evaluate",
+  "/api/controlled-agent/publish",
+  "data-controlled-agent-step",
+  "controlled-agent-confirm-publish",
+]) {
+  assert.ok(js.includes(marker), `controlled Book Agent wizard should include ${marker}`);
+}
+assert.ok(css.includes(".controlled-agent-wizard"), "styles.css should style the controlled Book Agent wizard");
+
 for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]) {
   assert.ok(
     js.includes(`renderBookAgentCapability("${capability}"`),
@@ -254,6 +270,11 @@ for (const marker of [
   "质量规则",
   "重新入队",
   "确认发布",
+  "修复内容版本",
+  "首次发布知识 Release",
+  "repairBookContentHash",
+  "/repair-content-hash",
+  "canInitialPublish",
   "renderKnowledgeSupplyStatus",
   "供应链状态",
   "renderKnowledgePipelineDashboard",

@@ -334,6 +334,53 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
+func TestKBaseHTTPHandlerControlledAgentRequiresCookieSessionAndBuildsDraft(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path: filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		TTL:  24 * time.Hour, RenewalInterval: time.Hour, MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sessionStore.Close() })
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Controlled Agent Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrfToken, _, err := sessionStore.IssueCSRF(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-token", AgentPublisherToken: "publisher-token",
+		BrowserSessionSecret: "browser-secret",
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store: sessionStore, PublicOrigin: testBrowserSessionOrigin,
+			TTL: 24 * time.Hour, RenewalInterval: time.Hour, MaxActive: 10,
+		},
+	})
+	requestBody := `{"draft":{"release_id":"release-1","package_id":"controlled-agent","version":"1.0.0"}}`
+
+	bearer := requestJSONKBase(handler, http.MethodPost, "/api/controlled-agent/draft", "consumer-token", requestBody)
+	if bearer.Code != http.StatusUnauthorized {
+		t.Fatalf("bearer controlled draft status=%d body=%s", bearer.Code, bearer.Body.String())
+	}
+
+	request := newKBaseBrowserCookieRequest(http.MethodPost, "/api/controlled-agent/draft", credentials.Token, requestBody)
+	addKBaseBrowserSessionSecurityHeaders(request, csrfToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("cookie controlled draft status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerAgentCompilationUsesReadOnlyAPIAuthAndReturnsCandidates(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	primary := agentCompilerTestRelease(
