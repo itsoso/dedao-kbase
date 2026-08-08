@@ -122,12 +122,13 @@ PASS
 ## 2026-08-08 Task 16 Rollout Checkpoint
 
 The clean-main KBase control plane was deployed at revision
-`890c515ae22c9bcf8e49f755b29d9c6f6add13a1`. The first v0.2.1 upgrade attempt
-failed closed before replacement because the previously deployed control plane
-lacked the upgrade-recovery endpoint. After the control plane was reconciled,
-a second attempt exposed a separate bounded transport issue: the shared
-30-second HTTP client timed out while downloading the macOS artifact. Both
-failures remained terminal and left the installed v0.2.0 Worker unchanged.
+`86288a2ebb423f21810acf614b9555dae8e126dc`; the v0.2.2 Workers were built from
+revision `890c515ae22c9bcf8e49f755b29d9c6f6add13a1`. The first v0.2.1 upgrade
+attempt failed closed before replacement because the previously deployed
+control plane lacked the upgrade-recovery endpoint. After the control plane was
+reconciled, a second attempt exposed a separate bounded transport issue: the
+shared 30-second HTTP client timed out while downloading the macOS artifact.
+Both failures remained terminal and left the installed v0.2.0 Worker unchanged.
 
 The transport remediation kept ordinary API calls at 30 seconds and gave only
 artifact downloads an independent five-minute bound. It did not change shared
