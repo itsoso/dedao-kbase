@@ -21,7 +21,7 @@ import (
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
-const wcplusAgentVersion = "0.2.1"
+const wcplusAgentVersion = "0.2.2"
 
 var wcplusAgentRevision = "0000000000000000000000000000000000000000"
 

@@ -810,6 +810,28 @@ func TestSourceAgentArtifactHandoffClientBoundsTransportFailures(t *testing.T) {
 	}
 }
 
+func TestSourceAgentClientUsesIndependentBoundedArtifactTimeout(t *testing.T) {
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: "https://kbase.example.invalid", AgentToken: "agent-secret", AgentID: "agent-a",
+		StateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.client.Timeout != 30*time.Second {
+		t.Fatalf("api timeout=%s want=30s", client.client.Timeout)
+	}
+	if client.artifactClient == client.client {
+		t.Fatal("artifact downloads must not reuse the short API client")
+	}
+	if client.artifactClient.Timeout != 5*time.Minute {
+		t.Fatalf("artifact timeout=%s want=5m", client.artifactClient.Timeout)
+	}
+	if client.artifactClient.Transport != client.client.Transport {
+		t.Fatal("artifact client must preserve the API transport policy")
+	}
+}
+
 func TestSourceAgentUpdateGuardClientSendsExactFieldsAndClassifiesDenials(t *testing.T) {
 	newClient := func(t *testing.T, handler http.Handler) *SourceAgentClient {
 		t.Helper()

@@ -628,7 +628,7 @@
     {
       "path": "/api/source-agent/artifacts/",
       "file": "backend/app/source_agent_client.go",
-      "line": 444,
+      "line": 448,
       "authenticated": true
     },
     {
@@ -640,7 +640,7 @@
     {
       "path": "/api/source-agent/commands/",
       "file": "backend/app/source_agent_client.go",
-      "line": 403,
+      "line": 407,
       "authenticated": true
     },
     {
@@ -652,7 +652,7 @@
     {
       "path": "/api/source-agent/commands/claim",
       "file": "backend/app/source_agent_client.go",
-      "line": 234,
+      "line": 238,
       "authenticated": true
     },
     {
@@ -664,7 +664,7 @@
     {
       "path": "/api/source-agent/commands/recover",
       "file": "backend/app/source_agent_client.go",
-      "line": 286,
+      "line": 290,
       "authenticated": true
     },
     {
@@ -676,7 +676,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/source_agent_client.go",
-      "line": 196,
+      "line": 200,
       "authenticated": true
     },
     {
@@ -688,7 +688,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/source_agent_client.go",
-      "line": 216,
+      "line": 220,
       "authenticated": true
     },
     {
@@ -700,7 +700,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/source_agent_client.go",
-      "line": 680,
+      "line": 684,
       "authenticated": true
     },
     {

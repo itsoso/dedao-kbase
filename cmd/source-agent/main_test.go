@@ -20,8 +20,8 @@ import (
 )
 
 func TestSourceAgentReleaseVersion(t *testing.T) {
-	if sourceAgentVersion != "0.2.1" {
-		t.Fatalf("sourceAgentVersion=%q, want 0.2.1", sourceAgentVersion)
+	if sourceAgentVersion != "0.2.2" {
+		t.Fatalf("sourceAgentVersion=%q, want 0.2.2", sourceAgentVersion)
 	}
 }
 

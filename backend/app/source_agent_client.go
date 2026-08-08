@@ -160,10 +160,11 @@ func (e *SourceAgentHTTPError) Retryable() bool {
 }
 
 type SourceAgentClient struct {
-	baseURL *url.URL
-	token   string
-	agentID string
-	client  *http.Client
+	baseURL        *url.URL
+	token          string
+	agentID        string
+	client         *http.Client
+	artifactClient *http.Client
 }
 
 func NewSourceAgentClient(config SourceAgentConfig) (*SourceAgentClient, error) {
@@ -176,14 +177,17 @@ func NewSourceAgentClient(config SourceAgentConfig) (*SourceAgentClient, error) 
 		return nil, err
 	}
 	client := normalized.HTTPClient
+	artifactClient := client
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
+		artifactClient = &http.Client{Timeout: 5 * time.Minute, Transport: client.Transport}
 	}
 	return &SourceAgentClient{
-		baseURL: baseURL,
-		token:   normalized.AgentToken,
-		agentID: normalized.AgentID,
-		client:  client,
+		baseURL:        baseURL,
+		token:          normalized.AgentToken,
+		agentID:        normalized.AgentID,
+		client:         client,
+		artifactClient: artifactClient,
 	}, nil
 }
 
@@ -457,7 +461,7 @@ func (c *SourceAgentClient) DownloadArtifact(
 	req.Header.Set("Accept", "application/octet-stream")
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("Authorization", "Bearer "+c.token)
-	requestClient := *c.client
+	requestClient := *c.artifactClient
 	requestClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := requestClient.Do(req)
 	if err != nil {
