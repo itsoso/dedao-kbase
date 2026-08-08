@@ -124,6 +124,26 @@ Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的�
 - `GET /api/knowledge/impact`、`GET /api/knowledge/gaps`：查看导入回执、pipeline 阶段和隐私安全 gap 聚合。
 - `POST /api/agent-packages/evaluate`：使用独立 publisher token 执行并保存不可变的黄金集评估；`vector`/`hybrid` 包要求显式配置获授权的语义嵌入服务。
 - `POST /api/agent-packages/publish`：仅接受独立的 `KBASE_AGENT_PUBLISHER_TOKEN`；普通 API/consumer token 不能发布 Agent Package。
+- `POST /api/books/{book_id}/repair-content-hash`：仅修复旧的空内容哈希，并使旧分析与质量报告失效；需要 `{"confirm":true}`。
+- `POST /api/controlled-agent/draft|evaluate|publish`：浏览器中的三步受控 Agent 向导。请求必须同时通过共享 API token 和反向代理注入的可信浏览器会话标记；最终发布仍要求服务端已配置独立 publisher token。
+
+受控 Agent 路径不能接受客户端自行提交的浏览器会话标记。反向代理必须先清空该请求头，只在经过 Basic Auth 的精确路径中重新注入：
+
+```nginx
+location ^~ /api/controlled-agent/ {
+    auth_basic "dedao-kbase";
+    auth_basic_user_file /etc/nginx/dedao-kbase.htpasswd;
+    proxy_set_header X-KBase-Browser-Session 1;
+    proxy_pass http://127.0.0.1:8719;
+}
+
+location /api/ {
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_pass http://127.0.0.1:8719;
+}
+```
+
+不要把 `X-KBase-Browser-Session: 1` 配置到整个 `/api/`，也不要把 publisher token 写入前端、浏览器存储或代理配置。
 
 机器可读契约和 consumer 接入说明见 `contracts/*.schema.json` 与 `docs/contracts/knowledge-supply-v1.md`。
 
