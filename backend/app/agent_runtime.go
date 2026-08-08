@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -297,7 +298,7 @@ func chatFinalizedAgentPackageWithClient(
 	if question == "" {
 		return nil, fmt.Errorf("question is required")
 	}
-	search, err := searchAgentPackageEvidence(store, pkg, question, pkg.RetrievalPolicy.MaxContextChunks)
+	search, err := searchAgentPackageChatEvidence(store, pkg, question)
 	if err != nil {
 		return nil, err
 	}
@@ -394,6 +395,110 @@ func chatFinalizedAgentPackageWithClient(
 	}
 	response.TraceID = traceID
 	return response, nil
+}
+
+func searchAgentPackageChatEvidence(
+	store *BookKnowledgeStore,
+	pkg AgentPackage,
+	question string,
+) (*AgentPackageSearchResponse, error) {
+	search, err := searchAgentPackageEvidence(store, pkg, question, pkg.RetrievalPolicy.MaxContextChunks)
+	if err != nil || len(search.Results) > 0 || strings.TrimSpace(pkg.RetrievalPolicy.Strategy) != "lexical" {
+		return search, err
+	}
+	terms := agentChatFallbackSearchTerms(question)
+	if len(terms) == 0 {
+		return search, nil
+	}
+	fallback, err := searchAgentPackageEvidence(
+		store, pkg, strings.Join(terms, " "), pkg.RetrievalPolicy.MaxContextChunks,
+	)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]AgentPackageEvidence, 0, len(fallback.Results))
+	for _, result := range fallback.Results {
+		if agentChatFallbackEvidenceMatches(result.Statement, terms) {
+			filtered = append(filtered, result)
+		}
+	}
+	fallback.Results = filtered
+	return fallback, nil
+}
+
+func agentChatFallbackSearchTerms(question string) []string {
+	if strings.IndexFunc(question, func(r rune) bool { return unicode.Is(unicode.Han, r) }) < 0 {
+		return nil
+	}
+	normalized := strings.ToLower(strings.TrimSpace(question))
+	for _, phrase := range []string{
+		"这本书", "为什么", "如何", "怎么", "怎样", "什么", "哪些", "哪个", "是否", "多少", "哪里", "何时", "中的",
+		"请问", "一下", "请", "的", "是", "以", "为", "中", "呢", "吗",
+	} {
+		normalized = strings.ReplaceAll(normalized, phrase, " ")
+	}
+	const maxTerms = 64
+	terms := make([]string, 0, 16)
+	seen := make(map[string]bool)
+	appendTerm := func(term string) {
+		term = strings.TrimSpace(term)
+		if term == "" || seen[term] || len(terms) >= maxTerms {
+			return
+		}
+		seen[term] = true
+		terms = append(terms, term)
+	}
+	var word []rune
+	var han []rune
+	flushWord := func() {
+		if len(word) >= 2 {
+			appendTerm(string(word))
+		}
+		word = word[:0]
+	}
+	flushHan := func() {
+		for index := 0; index+1 < len(han) && len(terms) < maxTerms; index++ {
+			appendTerm(string(han[index : index+2]))
+		}
+		han = han[:0]
+	}
+	for _, r := range []rune(normalized) {
+		switch {
+		case unicode.Is(unicode.Han, r):
+			flushWord()
+			han = append(han, r)
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			flushHan()
+			word = append(word, r)
+		default:
+			flushWord()
+			flushHan()
+		}
+		if len(terms) >= maxTerms {
+			break
+		}
+	}
+	flushWord()
+	flushHan()
+	return terms
+}
+
+func agentChatFallbackEvidenceMatches(statement string, terms []string) bool {
+	requiredMatches := 2
+	if len(terms) == 1 {
+		requiredMatches = 1
+	}
+	haystack := strings.ToLower(statement)
+	matches := 0
+	for _, term := range terms {
+		if strings.Contains(haystack, term) {
+			matches++
+			if matches >= requiredMatches {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func maybeSaveAgentRuntimeTrace(

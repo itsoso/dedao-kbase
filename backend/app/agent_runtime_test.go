@@ -290,6 +290,72 @@ func TestAgentPackageRuntimeChatUsesPinnedEvidencePolicyAndCitations(t *testing.
 	}
 }
 
+func TestAgentPackageRuntimeChatRetrievesChineseNaturalLanguageQuestion(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.ContentHash = "sha256:" + strings.Repeat("1", 64)
+	release.Analysis.Claims[0].Statement = "Synthetic grounded statement. NLP领域的注意力研究以Transformer为分水岭，此前主要使用RNN架构，此后转向Transformer架构。"
+	release.Analysis.Claims[0].Scope = []string{"grounded"}
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg := agentToolPolicyTestPackage()
+	pkg.RetrievalPolicy.Strategy = "lexical"
+	pkg.Releases[0].ContentHash = release.ContentHash
+	pkg, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	if _, _, err := PublishAgentPackage(store, pkg, "runtime-package", AgentReadOnlyToolIDs(), testAgentPackageTime()); err != nil {
+		t.Fatal(err)
+	}
+	direct, err := searchAgentPackageEvidence(store, pkg, "nlp", pkg.RetrievalPolicy.MaxContextChunks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(direct.Results) != 1 {
+		t.Fatalf("direct Chinese claim retrieval = %#v", direct.Results)
+	}
+	retrieval, err := searchAgentPackageChatEvidence(store, pkg, "NLP领域的注意力研究以什么为分水岭？")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retrieval.Results) != 1 || retrieval.Results[0].ClaimID != "claim-1" {
+		t.Fatalf("Chinese natural-language retrieval = %#v terms=%#v", retrieval.Results, agentChatFallbackSearchTerms("NLP领域的注意力研究以什么为分水岭？"))
+	}
+	client := &fakeBookKnowledgeLLMClient{answer: "以 Transformer 为分水岭。[citation:citation-1]"}
+	response, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Question: "NLP领域的注意力研究以什么为分水岭？",
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != AgentTraceOutcomeCompleted || len(response.Evidence) != 1 ||
+		response.Evidence[0].ClaimID != "claim-1" || len(response.Citations) != 1 || len(client.messages) == 0 {
+		t.Fatalf("Chinese natural-language chat response = %#v messages=%#v", response, client.messages)
+	}
+}
+
+func TestAgentPackageRuntimeChatChineseFallbackKeepsUnrelatedQuestionsClosed(t *testing.T) {
+	store, pkg := agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
+		pkg.RetrievalPolicy.Strategy = "lexical"
+	})
+	client := &fakeBookKnowledgeLLMClient{answer: "must not be called"}
+	response, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Question: "这本书的作者喜欢什么颜色？",
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != AgentTraceOutcomeAbstained || response.AbstentionReason != "insufficient_evidence" || len(client.messages) != 0 {
+		t.Fatalf("unrelated Chinese chat response = %#v messages=%#v", response, client.messages)
+	}
+}
+
 func TestAgentPackageRuntimeAbstainsForMissingOrUnknownAnswerCitations(t *testing.T) {
 	for _, answer := range []string{
 		"Ungrounded answer without a citation marker",
