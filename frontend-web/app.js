@@ -2126,9 +2126,15 @@ function renderKnowledgeReview() {
   const rules = Array.isArray(quality.rules) ? quality.rules : [];
   const triggers = Array.isArray(task?.trigger_outcomes) ? task.trigger_outcomes : [];
   const canRetry = task?.status === "failed";
-  const canPublish = task?.status === "candidate_ready"
-    && task.quality_decision === "pass"
+  const canInitialPublish = !release.release_id
+    && Boolean(quality.content_hash)
     && quality.decision === "pass";
+  const canPublish = canInitialPublish || (task?.status === "candidate_ready"
+    && task.quality_decision === "pass"
+    && quality.decision === "pass");
+  const needsContentHashRepair = !release.release_id
+    && knowledgeState.selectedBook
+    && !String(knowledgeState.selectedBook.content_hash || "").trim();
   const busy = Boolean(knowledgeState.reviewOperation);
   const summary = knowledgeState.reviewLoading
     || knowledgeState.reviewError
@@ -2188,8 +2194,9 @@ function renderKnowledgeReview() {
           </section>
           <div class="knowledge-review__actions">
             <span>${escapeHTML(knowledgeState.reviewOperation || task?.error_code || (assessment.reverify_required ? "等待人工处理" : "当前发布状态稳定"))}</span>
+            ${needsContentHashRepair ? `<button id="knowledge-review-repair" class="button button-ghost" type="button" ${busy ? "disabled" : ""}>修复内容版本</button>` : ""}
             ${canRetry ? `<button id="knowledge-review-retry" class="button button-ghost" type="button" ${busy ? "disabled" : ""}>重新入队</button>` : ""}
-            ${canPublish ? `<button id="knowledge-review-publish" class="button button-primary" type="button" ${busy ? "disabled" : ""}>确认发布</button>` : ""}
+            ${canPublish ? `<button id="knowledge-review-publish" class="button button-primary" type="button" ${busy ? "disabled" : ""}>${canInitialPublish ? "首次发布知识 Release" : "确认发布"}</button>` : ""}
           </div>
         </div>
       ` : ""}
@@ -3129,7 +3136,10 @@ async function publishKnowledgeCandidate() {
   if (!bookID || knowledgeState.reviewOperation) {
     return;
   }
-  if (!window.confirm("确认发布当前通过质量校验的复核候选？发布后将生成新的不可变 release。")) {
+  const firstRelease = !knowledgeState.selectedRelease?.release_id;
+  if (!window.confirm(firstRelease
+    ? "确认首次发布当前通过质量校验的知识包？发布后将生成不可变 release。"
+    : "确认发布当前通过质量校验的复核候选？发布后将生成新的不可变 release。")) {
     return;
   }
   knowledgeState.reviewOperation = "正在发布候选";
@@ -3150,6 +3160,29 @@ async function publishKnowledgeCandidate() {
       knowledgeState.reviewOperation = "";
       renderBookKnowledge();
     }
+  }
+}
+
+async function repairBookContentHash() {
+  const bookID = knowledgeState.selectedBook?.book_id || "";
+  if (!bookID || knowledgeState.reviewOperation) return;
+  if (!window.confirm("确认修复这个旧知识包的内容版本？旧的分析与质量报告将失效，需要重新生成。")) return;
+  knowledgeState.reviewOperation = "正在修复内容版本";
+  knowledgeState.reviewError = "";
+  renderBookKnowledge();
+  try {
+    const result = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/repair-content-hash`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true }),
+    });
+    knowledgeState.selectedBook = { ...knowledgeState.selectedBook, content_hash: result.content_hash || "" };
+    knowledgeState.analysisManifest = null;
+    await loadKnowledgeReview(bookID, { silent: true, renderResult: false });
+  } catch (error) {
+    knowledgeState.reviewError = error instanceof Error ? error.message : String(error);
+  } finally {
+    knowledgeState.reviewOperation = "";
+    renderBookKnowledge();
   }
 }
 
@@ -5868,6 +5901,9 @@ function bindBookKnowledgeEvents() {
   document.querySelector("#knowledge-review-retry")?.addEventListener("click", async () => {
     await retryKnowledgeReverification();
   });
+  document.querySelector("#knowledge-review-repair")?.addEventListener("click", async () => {
+    await repairBookContentHash();
+  });
   document.querySelector("#knowledge-review-publish")?.addEventListener("click", async () => {
     await publishKnowledgeCandidate();
   });
@@ -6218,6 +6254,7 @@ async function generateKnowledgeAnalysisManifest() {
         max_context_chars: 16000,
       }),
     });
+    await loadKnowledgeReview(bookID, { silent: true, renderResult: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await loadKnowledgeAnalysisManifest(bookID);
