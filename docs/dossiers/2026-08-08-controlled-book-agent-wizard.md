@@ -190,5 +190,46 @@ Decision: PASS locally.
   `health.executor.life.conf` is enabled from both `conf.d` and
   `sites-enabled`, while `langbridge-proxy.conf` also declares the same IP
   listener. Those files are explicitly out of scope and were not modified.
-- G4 decision: PASS. The next deployment health check and fresh online
-  acceptance are recorded only after their respective gates complete.
+- G4 decision: PASS.
+
+### Deployment health gate (G5)
+
+Decision: PASS.
+
+- Canonical `main` and the release branch both contain deployed code revision
+  `4bf6a6f7c151633a123feea143465fb2110356ee`.
+- The exact Git archive hash was
+  `7c900954e0d8d5330f88e4507d5df1063b0c25bc8b13554cfbd1ae2c6c3e4ea4`.
+  Linux repeated the frontend build and bundle gate, `go vet ./...`, and
+  `go test ./... -timeout=300s`; the backend package completed in 70.027
+  seconds.
+- The final CGO server hash is
+  `b6ecf55718854ebd574db32f1d6d23261ab2d07897cef2556d5b268b369ddbe6`.
+  The rollback batch is `direct-4bf6a6f-20260808T153532Z`.
+- A candidate with an incorrect embedded full revision reported
+  `development`; the health gate rejected it and restored the previous binary
+  before the corrected candidate was built. The final service reports the
+  exact revision above, remains active/running with `ExecMainStatus=0` and
+  `NRestarts=0`, and emitted no warning-or-higher log entry after deployment.
+- Static Web assets were not replaced during the runtime-only correction, and
+  no proxy or Nginx file was changed.
+
+### Fresh online acceptance gate (G6)
+
+Decision: PASS after one failed acceptance loop and correction.
+
+- The pilot ebook page resolves Knowledge Package `128942` and published Agent
+  Package `attention-mechanism-research-assistant` version `1.0.1`; its package,
+  Agent, and `/sources/agents` routes load without browser console errors.
+- Grounded search for `Transformer 分水岭` returns the pinned `claim-6` and its
+  citation identity.
+- Initial acceptance exposed that lexical retrieval treated an unspaced
+  Chinese natural-language question as one term. Search succeeded, but chat
+  abstained before the model call. The runtime now uses a bounded Han-bigram
+  fallback only when the original lexical chat search is empty; at least two
+  evidence-statement terms must match, and citation and abstention checks remain
+  unchanged.
+- The previously failing question now answers that Transformer is the dividing
+  line, with citation `128942-citation-ffa7c6d2697326e0`. The unrelated question
+  about the author's favorite color still returns `insufficient_evidence`
+  without entering the model path.
