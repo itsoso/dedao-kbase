@@ -61,6 +61,26 @@ func TestBuildControlledAgentPackageDraftRejectsUnpublishedRelease(t *testing.T)
 	}
 }
 
+func TestBuildControlledAgentPackageDraftResolvesChapterCitation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Analysis.Claims[0].CitationIDs = []string{"chapter-1"}
+	release.Citations[0].ChapterID = "chapter-1"
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+
+	draft, err := BuildControlledAgentPackageDraft(store, ControlledAgentDraftRequest{
+		ReleaseID: "release-1", PackageID: "chapter-citation-agent", Version: "1.0.0",
+	}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatalf("BuildControlledAgentPackageDraft returned error: %v", err)
+	}
+	if got := draft.Suite.Cases[0].ExpectedIDs; len(got) != 1 || got[0] != "chunk-1" {
+		t.Fatalf("resolved retrieval citation = %#v", got)
+	}
+}
+
 func equalStringSlices(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

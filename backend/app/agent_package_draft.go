@@ -49,7 +49,11 @@ func BuildControlledAgentPackageDraft(store *BookKnowledgeStore, request Control
 		citationByID[citationID] = citation
 		citationIDs = append(citationIDs, citationID)
 	}
-	primaryCitation, ok := citationByID[strings.TrimSpace(claim.CitationIDs[0])]
+	resolvedClaimCitations := resolveAgentClaimCitationIDs(release.Citations, claim.CitationIDs)
+	if len(resolvedClaimCitations) == 0 {
+		return nil, fmt.Errorf("published release claim citation does not resolve to a chunk")
+	}
+	primaryCitation, ok := citationByID[resolvedClaimCitations[0]]
 	if !ok || strings.TrimSpace(primaryCitation.ChunkID) == "" {
 		return nil, fmt.Errorf("published release claim citation does not resolve to a chunk")
 	}

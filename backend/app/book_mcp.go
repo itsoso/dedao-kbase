@@ -233,6 +233,7 @@ func filterAgentScopedSearchResults(results []AgentScopedSearchResult, allowed m
 func resolveAgentClaimCitationIDs(citations []BookKnowledgeCitation, references []string) []string {
 	byCitationID := make(map[string]string, len(citations))
 	byChunkID := make(map[string][]string, len(citations))
+	byChapterID := make(map[string][]string, len(citations))
 	for _, citation := range citations {
 		citationID := strings.TrimSpace(citation.CitationID)
 		if citationID == "" {
@@ -241,6 +242,9 @@ func resolveAgentClaimCitationIDs(citations []BookKnowledgeCitation, references 
 		byCitationID[citationID] = citationID
 		if chunkID := strings.TrimSpace(citation.ChunkID); chunkID != "" {
 			byChunkID[chunkID] = append(byChunkID[chunkID], citationID)
+		}
+		if chapterID := strings.TrimSpace(citation.ChapterID); chapterID != "" {
+			byChapterID[chapterID] = append(byChapterID[chapterID], citationID)
 		}
 	}
 	resolved := make([]string, 0, len(references))
@@ -258,6 +262,12 @@ func resolveAgentClaimCitationIDs(citations []BookKnowledgeCitation, references 
 			continue
 		}
 		if citationIDs := byChunkID[reference]; len(citationIDs) > 0 {
+			for _, citationID := range citationIDs {
+				appendID(citationID)
+			}
+			continue
+		}
+		if citationIDs := byChapterID[reference]; len(citationIDs) > 0 {
 			for _, citationID := range citationIDs {
 				appendID(citationID)
 			}
