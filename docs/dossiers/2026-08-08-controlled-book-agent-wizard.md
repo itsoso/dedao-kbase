@@ -233,3 +233,88 @@ Decision: PASS after one failed acceptance loop and correction.
   line, with citation `128942-citation-ffa7c6d2697326e0`. The unrelated question
   about the author's favorite color still returns `insufficient_evidence`
   without entering the model path.
+
+## Agent Package reliability follow-up (2026-08-08)
+
+### Scope and implementation
+
+- Grounded search and grounded conversation now share the same bounded Chinese
+  natural-language lexical fallback. The published Package and immutable
+  version `1.0.1` were not changed.
+- Model deadline expiry maps to HTTP 504 with the stable public message
+  `agent model timed out; please retry`; the provider endpoint and raw Go error
+  no longer enter the HTTP response.
+- Search and conversation use one route-scoped action sequence. Submit controls
+  disable during a request, local live regions distinguish progress, zero
+  results, completion, abstention, and errors, and a late response cannot render
+  after the user changes Agent view, Package, or version.
+- The ten evaluation metrics use an auto-fitting grid instead of one rigid flex
+  row. The Web shell now carries an inline SVG favicon and versioned static asset
+  URLs. Proxy, Nginx, authentication, and publication policy were unchanged.
+- MetaMask, `ObjectMultiplex`, and listener warnings from the original screenshot
+  were not present in the application browser log and have no source match in
+  the repository. They remain classified as injected browser-extension output.
+
+### Test and review gates (G3-G4)
+
+Decision: PASS.
+
+- RED tests reproduced all three repository defects: natural Chinese search
+  returned no evidence, model timeout returned raw HTTP 500 details, and the Web
+  shell lacked the new responsive/action contracts.
+- Focused runtime and HTTP tests, their race-enabled variants, JavaScript syntax,
+  all production Web smoke checks, all desktop frontend smoke checks, Vite build,
+  `go vet ./...`, and `go test ./... -timeout=300s -count=1` passed locally.
+- One unrelated 40ms evidence-audit lease test failed while Go tests and vet ran
+  concurrently; ten isolated repetitions passed and the complete suite passed
+  when rerun without competing compiler load. No unrelated timing code changed.
+- The generated system map was refreshed for line-number drift. Its drift check,
+  privacy smoke, and `git diff --check` passed.
+- Review confirmed the fallback remains lexical-only and empty-result-only,
+  retains the multi-term filter, preserves requested result limits, and does not
+  weaken release pinning, citations, abstention, or evaluation policy.
+
+### Deployment health gate (G5)
+
+Decision: PASS.
+
+- Code revision `ee20b3c14b45128f658f699fa6c4e7a8e714e079` was pushed to the
+  release branch and canonical `main`. Its Git archive SHA-256 is
+  `a8def9eceb1a1e3ed602aa496ceb569389f2f7b88cef4e584324b8ee2fce1082`.
+- The first server build attempt stopped before deployment because the service
+  account's default npm cache contained root-owned files. A build-scoped cache
+  avoided changing shared ownership. A later `proxy.golang.org` timeout and the
+  service account's unwritable default Go cache were likewise resolved with
+  build-scoped Go caches and a checksum-verified module proxy. No failed attempt
+  changed the running service.
+- Linux repeated dependency installation (zero vulnerabilities), frontend build,
+  all frontend and Web smoke checks, module verification, vet, and the complete
+  Go suite. The backend package completed in 70.153 seconds.
+- The deployed CGO binary SHA-256 is
+  `758bdfabbef247c88fae7880d67afff5388efa4f6dbfb78c69ae17b9c6778b97`.
+  Binary and static Web rollback assets are stored in batch
+  `direct-ee20b3c-20260808T162423Z`.
+- Loopback and public health report the exact code revision. The service is
+  active with `ExecMainStatus=0`, `NRestarts=0`, and no warning-or-higher journal
+  entry since deployment. No Nginx file was changed.
+
+### Fresh online acceptance gate (G6)
+
+Decision: PASS.
+
+- The authenticated production Package page loaded version `1.0.1`, its fixed
+  release, all ten evaluation metrics, tools, and evidence ledger.
+- `注意力机制的演化` returned five fixed-scope evidence items; the existing
+  exact query `Transformer 分水岭` still returned only `claim-6` with citation
+  `128942-citation-ffa7c6d2697326e0`.
+- `这本书的作者喜欢什么颜色？` returned an explicit zero-result state with no
+  evidence card.
+- The production browser's 1280-pixel viewport reported zero document overflow,
+  and the ten metrics wrapped into two rows. Source smoke enforces the
+  auto-fitting grid plus the 760-pixel single-column breakpoint.
+- During a real relevant chat request, the form reported busy, its submit button
+  was disabled, and its local status announced evidence-based generation. The
+  upstream call timed out; the final page showed only the stable retry message,
+  restored the button, and rendered no raw provider URL.
+- Application browser logs were empty, including no favicon 404. Extension-only
+  MetaMask and multiplex warnings were not reproduced.
