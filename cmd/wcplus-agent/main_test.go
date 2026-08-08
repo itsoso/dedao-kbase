@@ -20,8 +20,8 @@ import (
 )
 
 func TestWCPlusAgentReleaseVersion(t *testing.T) {
-	if wcplusAgentVersion != "0.2.1" {
-		t.Fatalf("wcplusAgentVersion=%q, want 0.2.1", wcplusAgentVersion)
+	if wcplusAgentVersion != "0.2.2" {
+		t.Fatalf("wcplusAgentVersion=%q, want 0.2.2", wcplusAgentVersion)
 	}
 }
 

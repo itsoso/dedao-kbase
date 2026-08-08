@@ -28,7 +28,7 @@ type sourceEnvironmentLookup func(string) (string, bool)
 
 const (
 	sourceAgentWorkerType      = "wechat-worker"
-	sourceAgentVersion         = "0.2.1"
+	sourceAgentVersion         = "0.2.2"
 	sourceAgentProtocolVersion = "2026-08-01"
 )
 
