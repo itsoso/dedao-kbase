@@ -374,8 +374,8 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 		if err != nil {
 			return fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
 		}
-		sourceType := strings.TrimSpace(release.Book.SourceType)
-		if sourceType == "" {
+		sourceType, sourceTypeErr := controlledAgentSourceType(release.Book)
+		if sourceTypeErr != nil {
 			return fmt.Errorf("release %q source type is required", ref.ReleaseID)
 		}
 		if !allowedSources[sourceType] {

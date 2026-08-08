@@ -81,6 +81,26 @@ func TestBuildControlledAgentPackageDraftResolvesChapterCitation(t *testing.T) {
 	}
 }
 
+func TestBuildControlledAgentPackageDraftInfersLegacyDedaoSourceType(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.Book.SourceType = ""
+	release.Book.EnID = "legacy-dedao-enid"
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+
+	draft, err := BuildControlledAgentPackageDraft(store, ControlledAgentDraftRequest{
+		ReleaseID: "release-1", PackageID: "legacy-dedao-agent", Version: "1.0.0",
+	}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatalf("BuildControlledAgentPackageDraft returned error: %v", err)
+	}
+	if got := draft.Package.RetrievalPolicy.AllowedSourceTypes; len(got) != 1 || got[0] != "dedao_ebook" {
+		t.Fatalf("allowed source types = %#v", got)
+	}
+}
+
 func equalStringSlices(left, right []string) bool {
 	if len(left) != len(right) {
 		return false

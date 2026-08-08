@@ -87,6 +87,10 @@ func BuildControlledAgentPackageDraft(store *BookKnowledgeStore, request Control
 	if usagePolicy == "" {
 		usagePolicy = BookUsageStandard
 	}
+	sourceType, err := controlledAgentSourceType(release.Book)
+	if err != nil {
+		return nil, err
+	}
 	pkg := AgentPackage{
 		SchemaVersion:  AgentPackageSchemaVersion,
 		PackageID:      packageID,
@@ -96,7 +100,7 @@ func BuildControlledAgentPackageDraft(store *BookKnowledgeStore, request Control
 			ReleaseID: release.ReleaseID, ContentHash: release.ContentHash, CitationIDs: uniqueTrimmedStrings(citationIDs),
 		}},
 		RetrievalPolicy: AgentPackageRetrievalPolicy{
-			Strategy: "lexical", AllowedSourceTypes: []string{release.Book.SourceType}, RequireCitations: true, MaxContextChunks: maxContextChunks,
+			Strategy: "lexical", AllowedSourceTypes: []string{sourceType}, RequireCitations: true, MaxContextChunks: maxContextChunks,
 		},
 		ModelPolicy: AgentPackageModelPolicy{
 			PreferredCapability: capability, Fallbacks: []string{"qwen-plus"}, MaxCostUSD: maxCostUSD, TimeoutMS: timeoutMS,
@@ -127,6 +131,16 @@ func BuildControlledAgentPackageDraft(store *BookKnowledgeStore, request Control
 		return nil, err
 	}
 	return &ControlledAgentDraft{Package: pkg, Suite: suite}, nil
+}
+
+func controlledAgentSourceType(book BookKnowledgeBook) (string, error) {
+	if sourceType := strings.TrimSpace(book.SourceType); sourceType != "" {
+		return sourceType, nil
+	}
+	if book.DedaoID > 0 || strings.TrimSpace(book.EnID) != "" || strings.HasPrefix(strings.TrimSpace(book.SourceHTML), "dedao://ebook/") {
+		return "dedao_ebook", nil
+	}
+	return "", fmt.Errorf("published release book source_type is required")
 }
 
 func controlledAgentReadOnlyTools(knownTools []string) []AgentPackageToolRule {
