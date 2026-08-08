@@ -19,6 +19,12 @@ import (
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
+func TestSourceAgentReleaseVersion(t *testing.T) {
+	if sourceAgentVersion != "0.2.1" {
+		t.Fatalf("sourceAgentVersion=%q, want 0.2.1", sourceAgentVersion)
+	}
+}
+
 func TestSourceAgentBuildInfoIsCredentialFreeAndReportsCompiledIdentity(t *testing.T) {
 	var output bytes.Buffer
 	if err := writeSourceAgentBuildInfo(&output); err != nil {

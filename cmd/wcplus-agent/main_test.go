@@ -19,6 +19,12 @@ import (
 	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
+func TestWCPlusAgentReleaseVersion(t *testing.T) {
+	if wcplusAgentVersion != "0.2.1" {
+		t.Fatalf("wcplusAgentVersion=%q, want 0.2.1", wcplusAgentVersion)
+	}
+}
+
 func TestMain(m *testing.M) {
 	previous := wcplusAgentUpgradeFactory
 	wcplusAgentUpgradeFactory = func(*app.SourceAgentClient) (wcplusWorkerUpgradeRuntime, error) {
