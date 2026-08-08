@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-01
 
-**Status:** Tasks 1-15 implemented and reviewed; Task 16 G5/G6 rollout pending
+**Status:** Tasks 1-16 deployed; G5 passed and G6 remains pending on source readiness
 
 **Frozen design baseline:**
 `docs/plans/2026-08-01-unified-source-agent-control-plane-design.md`
@@ -27,14 +27,13 @@ narrative documentation.
 
 ## Current Stage and Next Handoff
 
-Tasks 1 through 10A are implemented, reviewed, released as v0.2.0, and installed
-locally as two independent macOS Workers with separately supervised updaters.
-Tasks 11 and 12 add the unified `/sources/agents` overview and stable Worker
-details; Task 13 adds a deterministic two-Worker integration Gate to normal CI.
-Those Web and integration changes are not yet merged or deployed. Task 14
-synchronized operator documentation and the generated system map. Task 15
-completed independent review and candidate verification; the next handoff is
-the clean-main deployment and layered G5/G6 verification in Task 16.
+Tasks 1 through 15 are implemented, reviewed, and deployed. Task 16 deployed
+the unified `/sources/agents` control plane, enabled the production artifact
+catalog, and completed real browser-controlled upgrades of both independently
+supervised macOS Workers to v0.2.2. Deployment health passes. Online source
+verification remains pending because the WeChat Worker truthfully reports
+`login_required` and the WC Plus Worker truthfully reports
+`dependency_unavailable`; neither Worker holds a command or queued outbox item.
 
 ## 2026-08-07 Tasks 11-13 Checkpoint
 
@@ -119,6 +118,36 @@ all frontend-web/scripts/*smoke*.mjs
 git diff --check
 PASS
 ```
+
+## 2026-08-08 Task 16 Rollout Checkpoint
+
+The clean-main KBase control plane was deployed at revision
+`890c515ae22c9bcf8e49f755b29d9c6f6add13a1`. The first v0.2.1 upgrade attempt
+failed closed before replacement because the previously deployed control plane
+lacked the upgrade-recovery endpoint. After the control plane was reconciled,
+a second attempt exposed a separate bounded transport issue: the shared
+30-second HTTP client timed out while downloading the macOS artifact. Both
+failures remained terminal and left the installed v0.2.0 Worker unchanged.
+
+The transport remediation kept ordinary API calls at 30 seconds and gave only
+artifact downloads an independent five-minute bound. It did not change shared
+Token authentication, browser Cookie/CSRF authorization, command binding,
+platform/protocol/current-version guards, redirect rejection, SHA-256 checks,
+or the approved no-signature design. The immutable remediation release was
+published as v0.2.2 for both Worker types; v0.2.1 remains retained but is no
+longer allowed for rollout.
+
+Both real browser-controlled upgrades then completed with
+`upgrade_complete`, exact v0.2.2 runtime identity, expected production
+SHA-256, clean updater handoff directories, running launchd services, and no
+pending command, outbox, or dead-letter item. Focused isolated rollback and
+pending-updater tests passed without corrupting a production binary.
+
+Post-upgrade capability health remained truthful: WeChat reports
+`login_required`, and WC Plus reports `dependency_unavailable`. Therefore the
+version-changing upgrade acceptance is complete, but bounded source collection,
+unchanged rerun skipping, and interruption/resume evidence remain open and G6
+must remain pending.
 
 ## 2026-08-02 Updater Recovery Definition Amendment
 
@@ -323,16 +352,21 @@ remediation. No Critical, High, or Medium finding remains.
 
 ### G5 - Deployment Health
 
-**Decision: PENDING FOR COMPLETE CANDIDATE**
+**Decision: PASS**
 
-v0.2.0 was published and both macOS Workers/updaters were installed locally.
-The baseline KBase server is healthy on clean main, but the unified Web UI,
-integration Gate, and production artifact catalog are not deployed together.
+The unified Web UI, integration Gate, production artifact catalog, control
+plane, and both macOS Workers are deployed together. Public and loopback health,
+revision identity, authenticated catalog access, anonymous rejection, service
+restart health, artifact hashes, updater cleanup, and post-upgrade heartbeats
+passed. A scoped server backup and the prior artifact catalog remain available
+for rollback.
 
 ### G6 - Online Verification
 
-**Decision: PENDING**
+**Decision: PENDING ON SOURCE READINESS**
 
-No complete two-Worker production acceptance or real version-changing upgrade
-has been performed. The feature must not claim G6 until Task 16 satisfies the
-layered acceptance list below.
+Both real version-changing upgrades passed, including independent targeting and
+exact-version verification. Complete online acceptance is still blocked at the
+source layer: WeChat requires login and WC Plus requires its vendor dependency.
+The feature must not claim G6 until bounded collection, unchanged rerun skip,
+and interruption/resume behavior are demonstrated with healthy sources.
