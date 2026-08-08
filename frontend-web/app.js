@@ -209,6 +209,22 @@ const knowledgeState = {
   reviewLoading: "",
   reviewError: "",
   reviewOperation: "",
+  controlledAgentWizard: {
+    step: 1,
+    draft: null,
+    evaluation: null,
+    published: null,
+    loading: "",
+    error: "",
+    form: {
+      packageID: "",
+      version: "1.0.0",
+      preferredCapability: "reasoning",
+      maxContextChunks: 12,
+      maxCostUSD: 0.25,
+      timeoutMS: 30000,
+    },
+  },
   pipelineDashboard: null,
   pipelineLoading: "",
   pipelineError: "",
@@ -2257,6 +2273,89 @@ function renderKnowledgeReviewCockpit() {
   `;
 }
 
+function controlledAgentRequest(confirm = false) {
+  const wizard = knowledgeState.controlledAgentWizard;
+  const release = knowledgeState.selectedRelease || {};
+  const bookID = knowledgeState.selectedBook?.book_id || "book";
+  const packageID = String(wizard.form.packageID || `book-${bookID}-agent`).trim();
+  return {
+    draft: {
+      release_id: release.release_id || "",
+      package_id: packageID,
+      version: String(wizard.form.version || "1.0.0").trim(),
+      preferred_capability: String(wizard.form.preferredCapability || "reasoning").trim(),
+      max_context_chunks: Number(wizard.form.maxContextChunks || 12),
+      max_cost_usd: Number(wizard.form.maxCostUSD || 0.25),
+      timeout_ms: Number(wizard.form.timeoutMS || 30000),
+    },
+    idempotency_key: `controlled:${release.release_id || bookID}:${packageID}:${wizard.form.version || "1.0.0"}`,
+    confirm,
+  };
+}
+
+function renderControlledAgentWizard() {
+  const wizard = knowledgeState.controlledAgentWizard;
+  const release = knowledgeState.selectedRelease;
+  if (!release?.release_id) {
+    return `
+      <section class="controlled-agent-wizard" id="knowledge-agent" aria-label="Book Agent 向导">
+        <p class="web-kicker">Agent Supply</p>
+        <h3>Book Agent 向导</h3>
+        <p class="web-muted">先完成质量校验并发布知识 Release，才能创建受控 Agent。</p>
+      </section>
+    `;
+  }
+  const evaluation = wizard.evaluation || {};
+  const metrics = Object.entries(evaluation.metrics || {}).map(([name, score]) => (
+    `<div><span>${escapeHTML(name)}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>`
+  )).join("");
+  const published = wizard.published?.package || null;
+  return `
+    <section class="controlled-agent-wizard" id="knowledge-agent" aria-label="Book Agent 向导">
+      <div class="controlled-agent-wizard__head">
+        <div><p class="web-kicker">Agent Supply</p><h3>Book Agent 向导</h3></div>
+        <span>${escapeHTML(wizard.loading || wizard.error || (published ? "已发布" : `第 ${wizard.step} 步`))}</span>
+      </div>
+      <ol class="controlled-agent-wizard__steps">
+        <li class="${wizard.step >= 1 ? "is-active" : ""}"><span>1</span><strong>选择 Release</strong></li>
+        <li class="${wizard.step >= 2 ? "is-active" : ""}"><span>2</span><strong>配置只读策略</strong></li>
+        <li class="${wizard.step >= 3 ? "is-active" : ""}"><span>3</span><strong>评测并发布</strong></li>
+      </ol>
+      ${wizard.error ? `<p class="knowledge-review__error">${escapeHTML(wizard.error)}</p>` : ""}
+      ${wizard.step === 1 ? `
+        <div class="controlled-agent-wizard__panel">
+          <dl><div><dt>Release</dt><dd>${escapeHTML(release.release_id)}</dd></div><div><dt>内容版本</dt><dd>${escapeHTML(knowledgeHash(release.content_hash))}</dd></div></dl>
+          <button class="button button-primary" type="button" data-controlled-agent-step="2">使用此 Release</button>
+        </div>
+      ` : ""}
+      ${wizard.step === 2 ? `
+        <form id="controlled-agent-draft-form" class="controlled-agent-wizard__form">
+          <label><span>Agent ID</span><input name="packageID" value="${escapeAttribute(wizard.form.packageID || `book-${knowledgeState.selectedBook?.book_id || "knowledge"}-agent`)}" required pattern="[A-Za-z0-9._-]+"></label>
+          <label><span>版本</span><input name="version" value="${escapeAttribute(wizard.form.version)}" required></label>
+          <label><span>模型能力</span><input name="preferredCapability" value="${escapeAttribute(wizard.form.preferredCapability)}" required></label>
+          <label><span>最多上下文块</span><input name="maxContextChunks" type="number" min="1" max="50" value="${escapeAttribute(wizard.form.maxContextChunks)}"></label>
+          <label><span>单次成本上限（USD）</span><input name="maxCostUSD" type="number" min="0.01" step="0.01" value="${escapeAttribute(wizard.form.maxCostUSD)}"></label>
+          <label><span>超时（毫秒）</span><input name="timeoutMS" type="number" min="1000" value="${escapeAttribute(wizard.form.timeoutMS)}"></label>
+          <p class="web-muted">固定使用词法检索、强制引用、只读工具，以及 reader/search/grounded_chat/evidence 能力。</p>
+          <div><button class="button button-ghost" type="button" data-controlled-agent-step="1">上一步</button><button class="button button-primary" type="submit">生成并检查草稿</button></div>
+        </form>
+      ` : ""}
+      ${wizard.step === 3 ? `
+        <div class="controlled-agent-wizard__panel">
+          <dl><div><dt>Agent</dt><dd>${escapeHTML(wizard.draft?.package?.package_id || "-")}</dd></div><div><dt>包版本</dt><dd>${escapeHTML(wizard.draft?.package?.version || "-")}</dd></div><div><dt>包哈希</dt><dd>${escapeHTML(knowledgeHash(wizard.draft?.package?.content_hash))}</dd></div></dl>
+          ${metrics ? `<div class="controlled-agent-wizard__metrics">${metrics}</div>` : `<p class="web-muted">先运行十项确定性评测；全部通过后才允许发布。</p>`}
+          <div class="controlled-agent-wizard__actions">
+            <button class="button button-ghost" type="button" data-controlled-agent-step="2">修改配置</button>
+            <button id="controlled-agent-evaluate" class="button button-ghost" type="button" ${wizard.loading ? "disabled" : ""}>运行评测</button>
+            <button id="controlled-agent-confirm-publish" class="button button-primary" type="button" ${!evaluation.passed || wizard.loading ? "disabled" : ""}>确认发布 Agent</button>
+          </div>
+          ${published ? `<p><a class="button button-primary" href="${escapeAttribute(buildAgentURL(published.package_id, published.version))}">打开 Agent</a> <a class="button button-ghost" href="${escapeAttribute(buildBookAppURL(published.package_id, published.version))}">打开 Book App</a></p>` : ""}
+        </div>
+      ` : ""}
+    </section>
+  `;
+}
+
 function renderKnowledgeSupplyStatus(cockpit) {
   const impact = cockpit?.impact || {};
   const rebuildActions = impact.rebuild_actions || {};
@@ -2508,6 +2607,7 @@ function renderBookKnowledge() {
                 </article>
               ` : ""}
             </section>
+            ${renderControlledAgentWizard()}
           ` : "<p class=\"web-muted\">请选择书籍或导入新来源。</p>"}
         </section>
       </div>
@@ -2981,6 +3081,75 @@ function resetKnowledgeReview() {
   knowledgeState.reviewLoading = "";
   knowledgeState.reviewError = "";
   knowledgeState.reviewOperation = "";
+  knowledgeState.controlledAgentWizard = {
+    step: 1, draft: null, evaluation: null, published: null, loading: "", error: "",
+    form: { packageID: "", version: "1.0.0", preferredCapability: "reasoning", maxContextChunks: 12, maxCostUSD: 0.25, timeoutMS: 30000 },
+  };
+}
+
+function setControlledAgentStep(step) {
+  knowledgeState.controlledAgentWizard.step = Math.max(1, Math.min(3, Number(step || 1)));
+  knowledgeState.controlledAgentWizard.error = "";
+  renderBookKnowledge();
+}
+
+async function previewControlledAgentDraft(form) {
+  const wizard = knowledgeState.controlledAgentWizard;
+  wizard.form = {
+    packageID: String(form.get("packageID") || "").trim(),
+    version: String(form.get("version") || "1.0.0").trim(),
+    preferredCapability: String(form.get("preferredCapability") || "reasoning").trim(),
+    maxContextChunks: Number(form.get("maxContextChunks") || 12),
+    maxCostUSD: Number(form.get("maxCostUSD") || 0.25),
+    timeoutMS: Number(form.get("timeoutMS") || 30000),
+  };
+  wizard.loading = "正在生成受控草稿";
+  wizard.error = "";
+  renderBookKnowledge();
+  try {
+    wizard.draft = await apiFetch("/api/controlled-agent/draft", { method: "POST", body: JSON.stringify(controlledAgentRequest(false)) });
+    wizard.evaluation = null;
+    wizard.published = null;
+    wizard.step = 3;
+  } catch (error) {
+    wizard.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    wizard.loading = "";
+    renderBookKnowledge();
+  }
+}
+
+async function evaluateControlledAgent() {
+  const wizard = knowledgeState.controlledAgentWizard;
+  wizard.loading = "正在运行十项评测";
+  wizard.error = "";
+  renderBookKnowledge();
+  try {
+    const result = await apiFetch("/api/controlled-agent/evaluate", { method: "POST", body: JSON.stringify(controlledAgentRequest(false)) });
+    wizard.draft = result.draft || wizard.draft;
+    wizard.evaluation = result.evaluation || null;
+  } catch (error) {
+    wizard.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    wizard.loading = "";
+    renderBookKnowledge();
+  }
+}
+
+async function publishControlledAgent() {
+  const wizard = knowledgeState.controlledAgentWizard;
+  if (!wizard.evaluation?.passed || !window.confirm("确认发布这个已通过评测的只读 Agent？发布后版本不可变。")) return;
+  wizard.loading = "正在发布 Agent";
+  wizard.error = "";
+  renderBookKnowledge();
+  try {
+    wizard.published = await apiFetch("/api/controlled-agent/publish", { method: "POST", body: JSON.stringify(controlledAgentRequest(true)) });
+  } catch (error) {
+    wizard.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    wizard.loading = "";
+    renderBookKnowledge();
+  }
 }
 
 async function loadKnowledgeReleaseRecords(bookID) {
@@ -5906,6 +6075,19 @@ function bindBookKnowledgeEvents() {
   });
   document.querySelector("#knowledge-review-publish")?.addEventListener("click", async () => {
     await publishKnowledgeCandidate();
+  });
+  for (const button of document.querySelectorAll("[data-controlled-agent-step]")) {
+    button.addEventListener("click", () => setControlledAgentStep(button.getAttribute("data-controlled-agent-step")));
+  }
+  document.querySelector("#controlled-agent-draft-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    await previewControlledAgentDraft(new FormData(event.currentTarget));
+  });
+  document.querySelector("#controlled-agent-evaluate")?.addEventListener("click", async () => {
+    await evaluateControlledAgent();
+  });
+  document.querySelector("#controlled-agent-confirm-publish")?.addEventListener("click", async () => {
+    await publishControlledAgent();
   });
   for (const button of document.querySelectorAll("[data-book-index]")) {
     button.addEventListener("click", async () => {

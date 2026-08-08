@@ -201,6 +201,22 @@ for (const marker of [
 }
 assert.ok(css.includes(".knowledge-web__manifest"), "styles.css should style the durable analysis manifest");
 
+for (const marker of [
+  "controlledAgentWizard",
+  "Book Agent 向导",
+  "选择 Release",
+  "配置只读策略",
+  "评测并发布",
+  "/api/controlled-agent/draft",
+  "/api/controlled-agent/evaluate",
+  "/api/controlled-agent/publish",
+  "data-controlled-agent-step",
+  "controlled-agent-confirm-publish",
+]) {
+  assert.ok(js.includes(marker), `controlled Book Agent wizard should include ${marker}`);
+}
+assert.ok(css.includes(".controlled-agent-wizard"), "styles.css should style the controlled Book Agent wizard");
+
 for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]) {
   assert.ok(
     js.includes(`renderBookAgentCapability("${capability}"`),
