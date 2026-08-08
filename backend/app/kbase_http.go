@@ -2709,6 +2709,10 @@ func (h *kbaseHTTPHandler) writeAgentPackageRuntimeError(w http.ResponseWriter, 
 		writeHTTPError(w, http.StatusNotFound, "agent package not found")
 		return
 	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeHTTPError(w, http.StatusGatewayTimeout, "agent model timed out; please retry")
+		return
+	}
 	message := err.Error()
 	for _, inputError := range []string{
 		"is required", "must be positive", "max_context_chunks", "is not declared",

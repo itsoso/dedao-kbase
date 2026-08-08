@@ -301,6 +301,9 @@ const bookAgentState = {
   results: [],
   question: "",
   answer: null,
+  searchStatus: "",
+  chatStatus: "",
+  activeAction: "",
   loading: "",
   message: "",
 };
@@ -384,6 +387,7 @@ let evidenceAuditPollTimer = null;
 let evidenceAuditLoadSequence = 0;
 let evidenceAuditWorkspaceSequence = 0;
 let bookAgentLoadSequence = 0;
+let bookAgentActionSequence = 0;
 let agentCompilerRequestSequence = 0;
 let proofroomOperationSequence = 0;
 let dedaoEbookDetailLoadSequence = 0;
@@ -1523,6 +1527,19 @@ function getBookAgentRoute() {
     }
   }
   return null;
+}
+
+function isBookAgentActionCurrent(sequence, actionRoute) {
+  const currentRoute = getBookAgentRoute();
+  const currentPackage = bookAgentState.package || {};
+  if (sequence !== bookAgentActionSequence || !currentRoute) {
+    return false;
+  }
+  return currentRoute.view === actionRoute.view &&
+    currentRoute.packageID === actionRoute.packageID &&
+    (!currentRoute.version || currentRoute.version === actionRoute.version) &&
+    currentPackage.package_id === actionRoute.packageID &&
+    currentPackage.version === actionRoute.version;
 }
 
 async function fetchBook(bookID) {
@@ -4719,8 +4736,9 @@ function renderEvidenceAuditTools(pkg, release, bookID, searchRows) {
         ${renderBookAgentCapability("search", `
           <section class="book-agent__capability book-agent__search" data-capability="search">
             <div class="book-agent__section-head"><div><span>02</span><h2>包内检索 Grounded Search</h2></div><p>结果保持 Claim、Chunk 与 Release 身份。</p></div>
-            <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="检索当前知识包" aria-label="检索当前知识包"><button class="button button-primary" type="submit">检索</button></form>
-            <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
+            <form id="book-agent-search-form" aria-busy="${bookAgentState.activeAction === "search" ? "true" : "false"}"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="检索当前知识包" aria-label="检索当前知识包"><button class="button button-primary" type="submit" ${bookAgentState.activeAction ? "disabled" : ""}>检索</button></form>
+            ${bookAgentState.searchStatus ? `<p class="book-agent__runtime-status" role="status">${escapeHTML(bookAgentState.searchStatus)}</p>` : ""}
+            <div class="book-agent__search-results">${searchRows || (!bookAgentState.searchStatus ? `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>` : "")}</div>
           </section>
         `, Boolean(pkg.package_id && pkg.version))}
       </div>
@@ -4732,7 +4750,8 @@ function renderGroundedConversation(pkg) {
   return renderBookAgentCapability("grounded_chat", `
     <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
       <div class="book-agent__section-head"><div><span>03</span><h2>循证对话 Grounded Conversation</h2></div><p>回答必须经过 Package 的引用与拒答边界。</p></div>
-      <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="基于当前知识包提问" aria-label="基于当前知识包提问">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">基于证据提问</button></form>
+      <form id="book-agent-chat-form" aria-busy="${bookAgentState.activeAction === "chat" ? "true" : "false"}"><textarea name="question" rows="4" placeholder="基于当前知识包提问" aria-label="基于当前知识包提问">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit" ${bookAgentState.activeAction ? "disabled" : ""}>基于证据提问</button></form>
+      ${bookAgentState.chatStatus ? `<p class="book-agent__runtime-status" role="status">${escapeHTML(bookAgentState.chatStatus)}</p>` : ""}
       ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
       ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>已拒答</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "证据不足")}</p></article>` : ""}
     </section>
@@ -4822,8 +4841,9 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
         ${renderBookAgentCapability("search", `
           <section class="book-agent__capability book-agent__search" data-capability="search">
             <div class="book-agent__section-head"><div><span>02</span><h2>Grounded search</h2></div><p>结果保持 claim、chunk 与 release 身份。</p></div>
-            <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="Search this package"><button class="button button-primary" type="submit">Search</button></form>
-            <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
+            <form id="book-agent-search-form" aria-busy="${bookAgentState.activeAction === "search" ? "true" : "false"}"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="Search this package"><button class="button button-primary" type="submit" ${bookAgentState.activeAction ? "disabled" : ""}>Search</button></form>
+            ${bookAgentState.searchStatus ? `<p class="book-agent__runtime-status" role="status">${escapeHTML(bookAgentState.searchStatus)}</p>` : ""}
+            <div class="book-agent__search-results">${searchRows || (!bookAgentState.searchStatus ? `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>` : "")}</div>
           </section>
         `, Boolean(pkg.package_id && pkg.version))}
           ${renderEvidenceAuditWorkspace(route, pkg)}
@@ -5321,7 +5341,13 @@ async function deliverEvidenceAuditToProofroom(route) {
 async function loadBookAgentPlatform(route) {
   cancelEvidenceAuditPoll();
   const sequence = ++bookAgentLoadSequence;
+  bookAgentActionSequence += 1;
   bookAgentState.route = route;
+  bookAgentState.results = [];
+  bookAgentState.answer = null;
+  bookAgentState.searchStatus = "";
+  bookAgentState.chatStatus = "";
+  bookAgentState.activeAction = "";
   bookAgentState.loading = "Loading Agent Packages";
   bookAgentState.message = "";
   renderBookAgentPlatform(route);
@@ -5401,47 +5427,85 @@ async function loadBookAgentPlatform(route) {
 
 async function searchBookAgentPackage(route) {
   const pkg = bookAgentState.package || {};
+  if (bookAgentState.activeAction) {
+    return;
+  }
   if (!bookAgentState.query || !pkg.package_id || !pkg.version) {
     bookAgentState.results = [];
+    bookAgentState.searchStatus = "请输入要检索的内容。";
     renderBookAgentPlatform(route);
     return;
   }
-  bookAgentState.loading = "Searching pinned evidence";
+  const sequence = ++bookAgentActionSequence;
+  const actionRoute = { view: route.view, packageID: pkg.package_id, version: pkg.version };
+  bookAgentState.activeAction = "search";
+  bookAgentState.searchStatus = "正在检索固定证据…";
+  bookAgentState.results = [];
   renderBookAgentPlatform(route);
   try {
     const maxContextChunks = Math.max(1, Number(pkg.retrieval_policy?.max_context_chunks || 20));
     const query = new URLSearchParams({ version: pkg.version, q: bookAgentState.query, limit: String(Math.min(20, maxContextChunks)) });
     const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/search?${query.toString()}`);
+    if (!isBookAgentActionCurrent(sequence, actionRoute)) {
+      return;
+    }
     bookAgentState.results = Array.isArray(payload.results) ? payload.results : [];
-    bookAgentState.message = `${bookAgentState.results.length} evidence results`;
+    bookAgentState.searchStatus = bookAgentState.results.length
+      ? `找到 ${bookAgentState.results.length} 条固定证据。`
+      : "未找到与当前问题匹配的固定证据。";
   } catch (error) {
-    bookAgentState.message = error instanceof Error ? error.message : String(error);
+    if (!isBookAgentActionCurrent(sequence, actionRoute)) {
+      return;
+    }
+    bookAgentState.searchStatus = error instanceof Error ? error.message : String(error);
   } finally {
-    bookAgentState.loading = "";
-    renderBookAgentPlatform(route);
+    if (isBookAgentActionCurrent(sequence, actionRoute)) {
+      bookAgentState.activeAction = "";
+      renderBookAgentPlatform(route);
+    }
   }
 }
 
 async function chatWithBookAgentPackage(route) {
   const pkg = bookAgentState.package || {};
-  if (!bookAgentState.question || !pkg.package_id || !pkg.version) {
+  if (bookAgentState.activeAction) {
     return;
   }
-  bookAgentState.loading = "Reasoning over pinned evidence";
+  if (!bookAgentState.question || !pkg.package_id || !pkg.version) {
+    bookAgentState.chatStatus = "请输入要咨询的问题。";
+    renderBookAgentPlatform(route);
+    return;
+  }
+  const sequence = ++bookAgentActionSequence;
+  const actionRoute = { view: route.view, packageID: pkg.package_id, version: pkg.version };
+  bookAgentState.activeAction = "chat";
+  bookAgentState.chatStatus = "正在基于固定证据生成回答…";
+  bookAgentState.answer = null;
   renderBookAgentPlatform(route);
   try {
-    bookAgentState.answer = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/chat?version=${encodeURIComponent(pkg.version)}`, {
+    const answer = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/chat?version=${encodeURIComponent(pkg.version)}`, {
       method: "POST",
       body: JSON.stringify({
         question: bookAgentState.question,
       }),
     });
-    bookAgentState.message = "Grounded response complete";
+    if (!isBookAgentActionCurrent(sequence, actionRoute)) {
+      return;
+    }
+    bookAgentState.answer = answer;
+    bookAgentState.chatStatus = answer?.outcome === "abstained"
+      ? "当前固定证据不足，Agent 已拒答。"
+      : "循证回答已完成。";
   } catch (error) {
-    bookAgentState.message = error instanceof Error ? error.message : String(error);
+    if (!isBookAgentActionCurrent(sequence, actionRoute)) {
+      return;
+    }
+    bookAgentState.chatStatus = error instanceof Error ? error.message : String(error);
   } finally {
-    bookAgentState.loading = "";
-    renderBookAgentPlatform(route);
+    if (isBookAgentActionCurrent(sequence, actionRoute)) {
+      bookAgentState.activeAction = "";
+      renderBookAgentPlatform(route);
+    }
   }
 }
 
@@ -9814,6 +9878,8 @@ async function boot() {
     evidenceAuditLoadSequence += 1;
     evidenceAuditWorkspaceSequence += 1;
     bookAgentLoadSequence += 1;
+    bookAgentActionSequence += 1;
+    bookAgentState.activeAction = "";
     proofroomOperationSequence += 1;
     evidenceAuditState.routeAuditID = "";
   }

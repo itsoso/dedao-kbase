@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -29,6 +30,38 @@ func TestAgentPackageRuntimeSearchesEveryPinnedRelease(t *testing.T) {
 		if result.ClaimID == "" || len(result.CitationIDs) == 0 || result.ReleaseID == "" {
 			t.Fatalf("search result lost evidence identity: %#v", result)
 		}
+	}
+}
+
+func TestAgentPackageRuntimeSearchRetrievesChineseNaturalLanguageQuery(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := agentPackageTestRelease()
+	release.ContentHash = "sha256:" + strings.Repeat("1", 64)
+	release.Analysis.Claims[0].Statement = "Synthetic grounded statement. 注意力机制从早期的序列模型逐步发展为 Transformer 架构。"
+	if err := store.saveKnowledgeRelease(release); err != nil {
+		t.Fatal(err)
+	}
+	pkg := agentToolPolicyTestPackage()
+	pkg.RetrievalPolicy.Strategy = "lexical"
+	pkg.Releases[0].ContentHash = release.ContentHash
+	pkg, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, store, pkg)
+	if _, _, err := PublishAgentPackage(store, pkg, "runtime-package", AgentReadOnlyToolIDs(), testAgentPackageTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := SearchAgentPackage(store, AgentPackageSearchRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Query: "注意力机制的演化",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 1 || response.Results[0].ClaimID != "claim-1" {
+		t.Fatalf("natural Chinese search response = %#v", response)
 	}
 }
 
@@ -318,12 +351,14 @@ func TestAgentPackageRuntimeChatRetrievesChineseNaturalLanguageQuestion(t *testi
 	if len(direct.Results) != 1 {
 		t.Fatalf("direct Chinese claim retrieval = %#v", direct.Results)
 	}
-	retrieval, err := searchAgentPackageChatEvidence(store, pkg, "NLP领域的注意力研究以什么为分水岭？")
+	retrieval, err := searchAgentPackageNaturalLanguageEvidence(
+		store, pkg, "NLP领域的注意力研究以什么为分水岭？", pkg.RetrievalPolicy.MaxContextChunks,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(retrieval.Results) != 1 || retrieval.Results[0].ClaimID != "claim-1" {
-		t.Fatalf("Chinese natural-language retrieval = %#v terms=%#v", retrieval.Results, agentChatFallbackSearchTerms("NLP领域的注意力研究以什么为分水岭？"))
+		t.Fatalf("Chinese natural-language retrieval = %#v terms=%#v", retrieval.Results, agentNaturalLanguageFallbackSearchTerms("NLP领域的注意力研究以什么为分水岭？"))
 	}
 	client := &fakeBookKnowledgeLLMClient{answer: "以 Transformer 为分水岭。[citation:citation-1]"}
 	response, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
@@ -538,6 +573,33 @@ func TestKBaseHTTPHandlerRunsVersionedAgentPackage(t *testing.T) {
 		"/api/agent-packages/"+pkg.PackageID+"/search?q=grounded", "consumer-token")
 	if unversioned.Code != http.StatusBadRequest {
 		t.Fatalf("unversioned package search status=%d body=%s", unversioned.Code, unversioned.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerSanitizesAgentChatTimeout(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store, pkg := agentRuntimeTestStore(t)
+	client := &fakeBookKnowledgeLLMClient{
+		err: fmt.Errorf("Post %q: %w", "https://provider.invalid/chat/completions", context.DeadlineExceeded),
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-token", ChatClient: client,
+	})
+
+	chat := requestJSONKBase(handler, http.MethodPost,
+		"/api/agent-packages/"+pkg.PackageID+"/chat?version="+pkg.Version,
+		"consumer-token", `{"question":"What is grounded?"}`)
+	if chat.Code != http.StatusGatewayTimeout {
+		t.Fatalf("timeout status=%d body=%s", chat.Code, chat.Body.String())
+	}
+	body := chat.Body.String()
+	if !strings.Contains(body, "agent model timed out; please retry") {
+		t.Fatalf("timeout body=%s", body)
+	}
+	for _, privateDetail := range []string{"provider.invalid", "context deadline exceeded"} {
+		if strings.Contains(body, privateDetail) {
+			t.Fatalf("timeout body leaked %q: %s", privateDetail, body)
+		}
 	}
 }
 

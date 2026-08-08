@@ -166,6 +166,8 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
+assert.ok(html.includes('rel="icon"'), "index.html should declare an application favicon");
+assert.ok(html.includes("data:image/svg+xml"), "the favicon should be inline and avoid a missing /favicon.ico request");
 assert.ok(html.includes("20260724-evidence-audit-focus"), "evidence audit workspace release should use a fresh browser cache version");
 assert.ok(html.includes("20260802-dedao-acquisition"), "Dedao acquisition release should use a fresh browser cache version");
 assert.ok(js.includes('"/home": ROUTES.dedaoHome'), "legacy home alias should be preserved");
@@ -238,6 +240,9 @@ assert.ok(js.includes("ui_manifest?.capabilities"), "Book App capabilities shoul
 assert.ok(js.includes("功能已声明，但运行时尚未接通"), "declared unavailable capabilities should explain runtime status");
 assert.ok(js.includes("Evaluation passed"), "Book App should expose evaluation status");
 assert.ok(css.includes("@media (max-width: 760px)"), "Book App should include a narrow mobile layout");
+const metricStripSource = css.match(/\.book-agent__manifest \.book-agent__metric-strip \{([\s\S]*?)\n\}/)?.[1] || "";
+assert.ok(metricStripSource.includes("display: grid"), "Agent metrics should use a wrapping grid instead of one rigid flex row");
+assert.ok(metricStripSource.includes("auto-fit"), "Agent metrics should adapt their column count to the viewport");
 
 const packageSearchSource = js.match(/async function searchBookAgentPackage\(route\) \{([\s\S]*?)\n\}/)?.[1] || "";
 const packageChatSource = js.match(/async function chatWithBookAgentPackage\(route\) \{([\s\S]*?)\n\}/)?.[1] || "";
@@ -249,6 +254,51 @@ assert.ok(packageChatSource.includes("version=${encodeURIComponent(pkg.version)}
 assert.ok(!packageChatSource.includes("/api/book-chat"), "Book App chat must not fall back to the generic single-book endpoint");
 assert.ok(js.includes("renderBookAgentAnswerCitations"), "Book App should render citation identities returned by package chat");
 assert.ok(js.includes("result.release_id"), "Book App search should render release identity across multi-release packages");
+for (const marker of [
+  "bookAgentActionSequence",
+  "isBookAgentActionCurrent",
+  "searchStatus",
+  "chatStatus",
+  "activeAction",
+  'aria-busy="${bookAgentState.activeAction',
+  'bookAgentState.activeAction ? "disabled"',
+]) {
+  assert.ok(js.includes(marker), `Book App runtime actions should include ${marker}`);
+}
+assert.ok(
+  packageSearchSource.includes("isBookAgentActionCurrent"),
+  "a late search response must not update a different Agent route",
+);
+assert.ok(
+  packageChatSource.includes("isBookAgentActionCurrent"),
+  "a late chat response must not update a different Agent route",
+);
+assert.ok(
+  packageSearchSource.includes("bookAgentState.activeAction"),
+  "search should reject duplicate runtime submissions",
+);
+assert.ok(
+  packageChatSource.includes("bookAgentState.activeAction"),
+  "chat should reject duplicate runtime submissions",
+);
+const actionGuardSource = js.match(/function isBookAgentActionCurrent\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(actionGuardSource, "app.js should define a route-aware Agent action guard");
+let activeAgentRoute = { view: "agent", packageID: "agent-1", version: "1.0.1" };
+const isBookAgentActionCurrent = new Function(
+  "getBookAgentRoute",
+  "bookAgentState",
+  `${actionGuardSource}; let bookAgentActionSequence = 7; return isBookAgentActionCurrent;`,
+)(
+  () => activeAgentRoute,
+  { package: { package_id: "agent-1", version: "1.0.1" } },
+);
+const actionRoute = { view: "agent", packageID: "agent-1", version: "1.0.1" };
+assert.equal(isBookAgentActionCurrent(7, actionRoute), true, "the current Agent action should remain active");
+assert.equal(isBookAgentActionCurrent(6, actionRoute), false, "a superseded Agent action should be stale");
+activeAgentRoute = { view: "package", packageID: "agent-1", version: "1.0.1" };
+assert.equal(isBookAgentActionCurrent(7, actionRoute), false, "switching Agent views should invalidate the action");
+activeAgentRoute = { view: "agent", packageID: "agent-2", version: "1.0.1" };
+assert.equal(isBookAgentActionCurrent(7, actionRoute), false, "switching Agent packages should invalidate the action");
 
 for (const marker of [
   "ebookAgentReleases",

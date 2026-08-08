@@ -66,7 +66,7 @@ func SearchAgentPackage(store *BookKnowledgeStore, request AgentPackageSearchReq
 	if err != nil {
 		return nil, err
 	}
-	return searchAgentPackageEvidence(store, *pkg, request.Query, request.Limit)
+	return searchAgentPackageNaturalLanguageEvidence(store, *pkg, request.Query, request.Limit)
 }
 
 func searchAgentPackageEvidence(
@@ -298,7 +298,9 @@ func chatFinalizedAgentPackageWithClient(
 	if question == "" {
 		return nil, fmt.Errorf("question is required")
 	}
-	search, err := searchAgentPackageChatEvidence(store, pkg, question)
+	search, err := searchAgentPackageNaturalLanguageEvidence(
+		store, pkg, question, pkg.RetrievalPolicy.MaxContextChunks,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -397,28 +399,29 @@ func chatFinalizedAgentPackageWithClient(
 	return response, nil
 }
 
-func searchAgentPackageChatEvidence(
+func searchAgentPackageNaturalLanguageEvidence(
 	store *BookKnowledgeStore,
 	pkg AgentPackage,
-	question string,
+	query string,
+	requestedLimit int,
 ) (*AgentPackageSearchResponse, error) {
-	search, err := searchAgentPackageEvidence(store, pkg, question, pkg.RetrievalPolicy.MaxContextChunks)
+	search, err := searchAgentPackageEvidence(store, pkg, query, requestedLimit)
 	if err != nil || len(search.Results) > 0 || strings.TrimSpace(pkg.RetrievalPolicy.Strategy) != "lexical" {
 		return search, err
 	}
-	terms := agentChatFallbackSearchTerms(question)
+	terms := agentNaturalLanguageFallbackSearchTerms(query)
 	if len(terms) == 0 {
 		return search, nil
 	}
 	fallback, err := searchAgentPackageEvidence(
-		store, pkg, strings.Join(terms, " "), pkg.RetrievalPolicy.MaxContextChunks,
+		store, pkg, strings.Join(terms, " "), requestedLimit,
 	)
 	if err != nil {
 		return nil, err
 	}
 	filtered := make([]AgentPackageEvidence, 0, len(fallback.Results))
 	for _, result := range fallback.Results {
-		if agentChatFallbackEvidenceMatches(result.Statement, terms) {
+		if agentNaturalLanguageFallbackEvidenceMatches(result.Statement, terms) {
 			filtered = append(filtered, result)
 		}
 	}
@@ -426,11 +429,11 @@ func searchAgentPackageChatEvidence(
 	return fallback, nil
 }
 
-func agentChatFallbackSearchTerms(question string) []string {
-	if strings.IndexFunc(question, func(r rune) bool { return unicode.Is(unicode.Han, r) }) < 0 {
+func agentNaturalLanguageFallbackSearchTerms(query string) []string {
+	if strings.IndexFunc(query, func(r rune) bool { return unicode.Is(unicode.Han, r) }) < 0 {
 		return nil
 	}
-	normalized := strings.ToLower(strings.TrimSpace(question))
+	normalized := strings.ToLower(strings.TrimSpace(query))
 	for _, phrase := range []string{
 		"这本书", "为什么", "如何", "怎么", "怎样", "什么", "哪些", "哪个", "是否", "多少", "哪里", "何时", "中的",
 		"请问", "一下", "请", "的", "是", "以", "为", "中", "呢", "吗",
@@ -483,7 +486,7 @@ func agentChatFallbackSearchTerms(question string) []string {
 	return terms
 }
 
-func agentChatFallbackEvidenceMatches(statement string, terms []string) bool {
+func agentNaturalLanguageFallbackEvidenceMatches(statement string, terms []string) bool {
 	requiredMatches := 2
 	if len(terms) == 1 {
 		requiredMatches = 1
