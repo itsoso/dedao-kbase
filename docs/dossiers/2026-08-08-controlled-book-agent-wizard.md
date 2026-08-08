@@ -2,8 +2,9 @@
 
 ## Status
 
-Implementation complete; full verification, deployment, and production
-acceptance pending.
+Delivered and verified in production. The pilot knowledge release and controlled
+Book Agent `attention-mechanism-research-assistant` version `1.0.1` are
+published.
 
 ## Requirement
 
@@ -66,7 +67,9 @@ Decision: PASS with explicit proxy requirement.
 
 ## Test Gate (G3)
 
-Pending full-suite verification. Focused RED/GREEN evidence:
+Decision: PASS.
+
+Focused RED/GREEN and full-suite evidence:
 
 - canonical content-hash tests;
 - missing-hash persistence and legacy repair tests;
@@ -75,32 +78,62 @@ Pending full-suite verification. Focused RED/GREEN evidence:
 - controlled browser-session, evaluation, confirmation, publication, and
   credential non-disclosure HTTP tests;
 - three-step wizard Web smoke checks.
+- regression coverage for legacy chapter-level citations and missing Dedao
+  `source_type` metadata;
+- `go test ./...`, Web smoke, generated system-map drift check, privacy smoke,
+  and `git diff --check` all passed locally; the Linux release source also
+  passed `go test ./... -timeout=180s` before every production binary build.
 
 ## Review Gate (G4)
 
-Pending final diff and privacy review.
+Decision: PASS.
+
+- The final diff preserves server-side publisher authority and requires both
+  ordinary API authorization and a constant-time verified proxy secret for the
+  controlled workflow.
+- The general API proxy clears client-provided browser markers; the dedicated
+  controlled route overwrites the marker only after Basic Auth.
+- Privacy smoke passed and no token, cookie, downloaded book content, or
+  machine-specific deployment value was committed.
 
 ## Deployment Health Gate (G5)
 
-Pending deployment. Required checks:
+Decision: PASS.
 
-- clean verified build artifact;
-- active service with zero new restarts;
-- public health success;
-- general API requests cannot forge the trusted browser marker;
-- Basic-Auth browser path can use the controlled workflow.
+- The release branch was pushed as `codex/controlled-book-agent-wizard`.
+- Linux built the CGO-enabled server from the exact source archive after the
+  complete server-side test suite passed.
+- The binary, static Web directory, and Nginx include were backed up before
+  replacement. Nginx configuration validation passed before reload.
+- The final service is active with `ExecMainStatus=0` and `NRestarts=0`; local
+  and public health probes both return the expected service payload.
+- An unauthenticated public controlled-workflow request with a forged browser
+  marker returns HTTP 401.
 
 ## Online Verification Gate (G6)
 
-Pending. Acceptance sequence for the pilot book:
+Decision: PASS.
 
-1. repair the empty content identity;
-2. regenerate analysis and obtain a passing quality report;
-3. publish one immutable Knowledge Release;
-4. generate and evaluate the controlled Agent draft;
-5. explicitly publish the Agent Package;
-6. verify grounded search/chat citations and Book App links;
-7. verify no response or stored browser state exposes publisher authority.
+1. Repaired the pilot book's empty content identity and invalidated stale
+   derived artifacts.
+2. Regenerated analysis with `qwen3.7-max`: seven structured claims; all six
+   quality rules passed, including content-version and citation integrity.
+3. Published immutable Knowledge Release
+   `release-aaa4382d565653804812170c15e37295c053c19e592df934b9aa687bc7564e31`.
+4. Production acceptance exposed and then fixed two legacy compatibility gaps:
+   chapter-level analysis references now resolve to release citations, and
+   missing source metadata is inferred only when durable Dedao ebook identity
+   is present.
+5. The first immutable Agent version exposed an unavailable legacy model and
+   was retained for audit. Version `1.0.1` pins the production-verified
+   `qwen3.7-max`, passed all ten deterministic metrics, and was explicitly
+   published.
+6. Runtime search returned one matching claim with two citations. A grounded
+   chat completed with one evidence item, two resolved citations, a non-empty
+   answer, and a persisted trace ID. An unrelated/insufficient query abstained
+   without calling the model.
+7. No response exposed publisher authority; the final service remained active
+   with zero restarts and no new fatal/error log entries.
 
 No Gate may advance with a failed quality, evaluation, privacy, deployment, or
 online acceptance check.
