@@ -227,7 +227,7 @@ const router = createRouter({
                     name: "login",
                     component: () => import("../views/Login.vue"),
                     meta: {
-                        name: "登录",icon:"promotion"
+                        name: "登录",icon:"Promotion"
                     },
                 },
                 {
@@ -243,7 +243,7 @@ const router = createRouter({
                     name: "switch",
                     component: () => import("../views/Home.vue"),
                     meta: {
-                        name: "切换账号",icon:"switchButton"
+                        name: "切换账号",icon:"SwitchButton"
                     },
                 },
             ],

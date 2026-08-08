@@ -3,7 +3,23 @@ import { createPinia } from "pinia";
 import piniaPluginPersistedstate from 'pinia-plugin-persistedstate'
 import App from './App.vue'
 import router from "./router";
-import * as ElementPlusIconsVue from '@element-plus/icons-vue'
+import {
+  Avatar,
+  Collection,
+  Compass,
+  Connection,
+  Headset,
+  HotWater,
+  House,
+  Management,
+  Notebook,
+  Plus,
+  Promotion,
+  Reading,
+  Setting,
+  SwitchButton,
+  User,
+} from '@element-plus/icons-vue'
 import { useRouter } from 'vue-router'
 
 import hljs from 'highlight.js';
@@ -24,7 +40,25 @@ app.directive('highlight', function (el) {
   })
 })
 
-for (const [key, component] of Object.entries(ElementPlusIconsVue)) {
+const elementPlusIcons = {
+  Avatar,
+  Collection,
+  Compass,
+  Connection,
+  Headset,
+  HotWater,
+  House,
+  Management,
+  Notebook,
+  Plus,
+  Promotion,
+  Reading,
+  Setting,
+  SwitchButton,
+  User,
+}
+
+for (const [key, component] of Object.entries(elementPlusIcons)) {
   app.component(key, component)
 }
 app.config.errorHandler = (err, vm, info) => {
@@ -45,4 +79,3 @@ app.config.warnHandler = function(msg, vm, trace) {
 }
 
 app.mount('#app')
-
