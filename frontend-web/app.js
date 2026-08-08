@@ -193,6 +193,10 @@ const dedaoLibraryState = {
   courseArticleAnalysisKey: "",
   ebookDetail: null,
   ebookPackage: null,
+  ebookAgentReleases: [],
+  ebookAgentPackage: null,
+  ebookAgentStatusLoading: "",
+  ebookAgentStatusError: "",
   ebookDetailLoading: "",
   ebookDetailMessage: "",
   audioDetail: null,
@@ -382,6 +386,7 @@ let evidenceAuditWorkspaceSequence = 0;
 let bookAgentLoadSequence = 0;
 let agentCompilerRequestSequence = 0;
 let proofroomOperationSequence = 0;
+let dedaoEbookDetailLoadSequence = 0;
 let bookKnowledgeLoadSequence = 0;
 let bookKnowledgeDetailSequence = 0;
 let proofroomPreviousFocus = null;
@@ -2633,6 +2638,28 @@ function findKnowledgePackageForEbook(item, books) {
   }) || null;
 }
 
+function findPublishedAgentPackageForReleases(releases, packages) {
+  const releaseIDs = new Set((Array.isArray(releases) ? releases : [])
+    .map((release) => String(release?.release_id || "").trim())
+    .filter(Boolean));
+  if (!releaseIDs.size) {
+    return null;
+  }
+  const matching = (Array.isArray(packages) ? packages : []).filter((pkg) => (
+    pkg?.lifecycle_state === "published"
+    && Array.isArray(pkg.releases)
+    && pkg.releases.some((release) => releaseIDs.has(String(release?.release_id || "").trim()))
+  ));
+  matching.sort((left, right) => {
+    const published = String(right?.published_at || "").localeCompare(String(left?.published_at || ""));
+    if (published !== 0) {
+      return published;
+    }
+    return String(right?.version || "").localeCompare(String(left?.version || ""), undefined, { numeric: true });
+  });
+  return matching[0] || null;
+}
+
 function renderDedaoEbookDetail(route) {
   const item = dedaoLibraryState.ebookDetail;
   const pkg = dedaoLibraryState.ebookPackage;
@@ -2643,6 +2670,38 @@ function renderDedaoEbookDetail(route) {
   const packageID = String(pkg?.book_id || "").trim();
   const packageURL = packageID ? buildKnowledgePackageURL(packageID) : `${ROUTES.knowledgePackages}?query=${encodeURIComponent(title || sourceID || sourceEnID)}`;
   const readerURL = packageID ? buildBookReaderURL(packageID) : "";
+  const ebookAgentPackage = dedaoLibraryState.ebookAgentPackage;
+  const agentPackageURL = ebookAgentPackage
+    ? buildAgentPackageURL(ebookAgentPackage.package_id, ebookAgentPackage.version)
+    : "";
+  const agentURL = ebookAgentPackage
+    ? buildAgentURL(ebookAgentPackage.package_id, ebookAgentPackage.version)
+    : "";
+  let agentLifecycleClass = "is-pending";
+  let agentLifecycleLabel = "需先生成知识包";
+  let agentLifecycleDetail = "生成知识包后才能检查 Release 与 Agent 状态";
+  if (dedaoLibraryState.ebookAgentStatusLoading) {
+    agentLifecycleLabel = "正在读取 Agent 状态";
+    agentLifecycleDetail = dedaoLibraryState.ebookAgentStatusLoading;
+  } else if (ebookAgentPackage) {
+    agentLifecycleClass = "is-ready";
+    agentLifecycleLabel = "Agent Package 已可用";
+    agentLifecycleDetail = `${ebookAgentPackage.package_id} · ${ebookAgentPackage.version}`;
+    if (dedaoLibraryState.ebookAgentStatusError) {
+      agentLifecycleDetail += ` · 部分 Agent 状态读取失败：${dedaoLibraryState.ebookAgentStatusError}`;
+    }
+  } else if (dedaoLibraryState.ebookAgentStatusError) {
+    agentLifecycleClass = "is-failed";
+    agentLifecycleLabel = "Agent 状态读取失败";
+    agentLifecycleDetail = dedaoLibraryState.ebookAgentStatusError;
+  } else if (dedaoLibraryState.ebookAgentReleases.length) {
+    agentLifecycleLabel = "待创建 Agent";
+    agentLifecycleDetail = "知识 Release 已发布，可进入受控向导";
+  } else if (packageID) {
+    agentLifecycleClass = "is-blocked";
+    agentLifecycleLabel = "需先发布知识 Release";
+    agentLifecycleDetail = "完成基线分析、质量校验和知识 Release 发布";
+  }
 
   renderShell(`
     <main class="dedao-ebook-detail">
@@ -2687,7 +2746,7 @@ function renderDedaoEbookDetail(route) {
           <ol>
             <li class="is-ready"><span>1</span><div><strong>来源书</strong><small>元数据已连接，可稳定传播</small></div><b>已就绪</b></li>
             <li class="${packageID ? "is-ready" : "is-pending"}"><span>2</span><div><strong>知识包</strong><small>章节、chunks、claims 与引用</small></div><b>${packageID ? "已生成" : "待生成"}</b></li>
-            <li class="is-pending"><span>3</span><div><strong>书籍 Agent</strong><small>绑定知识包、模型策略和评测</small></div><b>待接入</b></li>
+            <li class="${agentLifecycleClass}"><span>3</span><div><strong>书籍 Agent</strong><small>${escapeHTML(agentLifecycleDetail)}</small>${ebookAgentPackage ? `<small><a href="${escapeAttribute(agentPackageURL)}">打开 Agent Package</a> · <a href="${escapeAttribute(agentURL)}">运行 Agent</a></small>` : (dedaoLibraryState.ebookAgentReleases.length ? `<small><a href="${escapeAttribute(`${packageURL}#knowledge-agent`)}">打开 Book Agent 向导</a></small>` : "")}</div><b>${escapeHTML(agentLifecycleLabel)}</b></li>
             <li class="is-pending"><span>4</span><div><strong>独立应用</strong><small>基于同一 Agent 的专属学习软件</small></div><b>待发布</b></li>
           </ol>
         </div>
@@ -2697,8 +2756,13 @@ function renderDedaoEbookDetail(route) {
 }
 
 async function loadDedaoEbookDetail(route) {
+  const sequence = ++dedaoEbookDetailLoadSequence;
   dedaoLibraryState.ebookDetail = null;
   dedaoLibraryState.ebookPackage = null;
+  dedaoLibraryState.ebookAgentReleases = [];
+  dedaoLibraryState.ebookAgentPackage = null;
+  dedaoLibraryState.ebookAgentStatusLoading = "";
+  dedaoLibraryState.ebookAgentStatusError = "";
   dedaoLibraryState.ebookDetailLoading = "loading";
   dedaoLibraryState.ebookDetailMessage = "";
   renderDedaoEbookDetail(route);
@@ -2712,6 +2776,9 @@ async function loadDedaoEbookDetail(route) {
         page_size: "100",
       });
       const payload = await apiFetch(`/api/dedao/library?${query.toString()}`);
+      if (sequence !== dedaoEbookDetailLoadSequence) {
+        return;
+      }
       const items = Array.isArray(payload?.list) ? payload.list : [];
       matched = items.find((item) => dedaoProductEnID(item) === route.enid || dedaoProductID(item, "ebook") === route.enid) || null;
       if (!Number(payload?.is_more)) {
@@ -2723,13 +2790,48 @@ async function loadDedaoEbookDetail(route) {
     }
     dedaoLibraryState.ebookDetail = matched;
     const booksPayload = await apiFetch("/api/books");
+    if (sequence !== dedaoEbookDetailLoadSequence) {
+      return;
+    }
     const books = Array.isArray(booksPayload?.books) ? booksPayload.books : (Array.isArray(booksPayload) ? booksPayload : []);
     dedaoLibraryState.ebookPackage = findKnowledgePackageForEbook(matched, books);
+    const packageID = String(dedaoLibraryState.ebookPackage?.book_id || "").trim();
+    if (packageID) {
+      dedaoLibraryState.ebookAgentStatusLoading = "正在读取已发布 Release 与 Agent Package";
+      renderDedaoEbookDetail(route);
+      try {
+        const [releases, records] = await Promise.all([
+          loadKnowledgeReleaseRecords(packageID),
+          loadKnowledgeAgentPackageRecords(),
+        ]);
+        const { packages, errors } = await loadKnowledgeAgentPackageDetails(records);
+        if (sequence !== dedaoEbookDetailLoadSequence) {
+          return;
+        }
+        dedaoLibraryState.ebookAgentReleases = releases;
+        dedaoLibraryState.ebookAgentPackage = findPublishedAgentPackageForReleases(releases, packages);
+        dedaoLibraryState.ebookAgentStatusError = errors.length
+          ? `${errors.length} 个 Agent Package 详情加载失败：${errors[0]}`
+          : "";
+      } catch (error) {
+        if (sequence === dedaoEbookDetailLoadSequence) {
+          dedaoLibraryState.ebookAgentStatusError = error instanceof Error ? error.message : String(error);
+        }
+      } finally {
+        if (sequence === dedaoEbookDetailLoadSequence) {
+          dedaoLibraryState.ebookAgentStatusLoading = "";
+        }
+      }
+    }
   } catch (error) {
-    dedaoLibraryState.ebookDetailMessage = error instanceof Error ? error.message : String(error);
+    if (sequence === dedaoEbookDetailLoadSequence) {
+      dedaoLibraryState.ebookDetailMessage = error instanceof Error ? error.message : String(error);
+    }
   } finally {
-    dedaoLibraryState.ebookDetailLoading = "";
-    renderDedaoEbookDetail(route);
+    if (sequence === dedaoEbookDetailLoadSequence) {
+      dedaoLibraryState.ebookDetailLoading = "";
+      renderDedaoEbookDetail(route);
+    }
   }
 }
 
@@ -3187,11 +3289,10 @@ function knowledgePackageAgentMatch() {
   if (!releaseID) {
     return null;
   }
-  return (knowledgeState.agentPackages || []).find((pkg) => (
-    pkg.lifecycle_state === "published"
-    && Array.isArray(pkg.releases)
-    && pkg.releases.some((release) => release.release_id === releaseID)
-  )) || null;
+  return findPublishedAgentPackageForReleases(
+    [{ release_id: releaseID }],
+    knowledgeState.agentPackages,
+  );
 }
 
 function knowledgePackageLifecycle() {

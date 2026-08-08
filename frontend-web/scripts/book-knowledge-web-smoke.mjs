@@ -251,6 +251,45 @@ assert.ok(js.includes("renderBookAgentAnswerCitations"), "Book App should render
 assert.ok(js.includes("result.release_id"), "Book App search should render release identity across multi-release packages");
 
 for (const marker of [
+  "ebookAgentReleases",
+  "ebookAgentPackage",
+  "ebookAgentStatusError",
+  "findPublishedAgentPackageForReleases",
+  "Agent Package 已可用",
+  "待创建 Agent",
+  "需先发布知识 Release",
+  "Agent 状态读取失败",
+  "buildAgentPackageURL(ebookAgentPackage.package_id, ebookAgentPackage.version)",
+  "buildAgentURL(ebookAgentPackage.package_id, ebookAgentPackage.version)",
+]) {
+  assert.ok(js.includes(marker), `Dedao ebook Agent lifecycle should include ${marker}`);
+}
+assert.ok(
+  !/<li class="is-pending"><span>3<\/span><div><strong>书籍 Agent<\/strong>[\s\S]{0,180}<b>待接入<\/b><\/li>/.test(js),
+  "Dedao ebook detail must not hard-code every Agent lifecycle as pending",
+);
+const ebookAgentMatcherSource = js.match(/function findPublishedAgentPackageForReleases\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(ebookAgentMatcherSource, "app.js should define the shared ebook Agent Package matcher");
+const findPublishedAgentPackageForReleases = new Function(
+  `${ebookAgentMatcherSource}; return findPublishedAgentPackageForReleases;`,
+)();
+const matchingAgent = findPublishedAgentPackageForReleases(
+  [{ release_id: "release-book" }],
+  [
+    { package_id: "agent", version: "1.0.0", lifecycle_state: "published", published_at: "2026-08-01T00:00:00Z", releases: [{ release_id: "release-book" }] },
+    { package_id: "agent", version: "1.0.1", lifecycle_state: "published", published_at: "2026-08-02T00:00:00Z", releases: [{ release_id: "release-book" }] },
+    { package_id: "draft", version: "9.0.0", lifecycle_state: "draft", published_at: "2026-08-03T00:00:00Z", releases: [{ release_id: "release-book" }] },
+    { package_id: "other", version: "2.0.0", lifecycle_state: "published", published_at: "2026-08-04T00:00:00Z", releases: [{ release_id: "release-other" }] },
+  ],
+);
+assert.equal(matchingAgent?.version, "1.0.1", "ebook Agent matcher should prefer the newest published package pinning this book");
+assert.equal(
+  findPublishedAgentPackageForReleases([{ release_id: "release-book" }], []),
+  null,
+  "ebook Agent matcher should return null when no package pins this book",
+);
+
+for (const marker of [
   "resetKnowledgeReview",
   "loadKnowledgeReview",
   "scheduleKnowledgeReviewPoll",
