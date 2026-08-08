@@ -200,6 +200,56 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
+func TestKBaseHTTPHandlerControlledAgentRequiresBrowserSessionAndPublishes(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-token", AgentPublisherToken: "publisher-token",
+	})
+	request := ControlledAgentWorkflowRequest{
+		Draft: ControlledAgentDraftRequest{
+			ReleaseID: "release-1", PackageID: "controlled-agent", Version: "1.0.0",
+			PreferredCapability: "reasoning", MaxContextChunks: 12, MaxCostUSD: 0.2, TimeoutMS: 30000,
+		},
+		IdempotencyKey: "controlled:release-1:1.0.0",
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	missingBrowser := requestJSONKBase(handler, http.MethodPost, "/api/controlled-agent/draft", "consumer-token", string(body))
+	if missingBrowser.Code != http.StatusUnauthorized {
+		t.Fatalf("missing browser session status=%d body=%s", missingBrowser.Code, missingBrowser.Body.String())
+	}
+	draft := requestJSONKBaseBrowser(handler, http.MethodPost, "/api/controlled-agent/draft", "consumer-token", string(body))
+	if draft.Code != http.StatusOK || !strings.Contains(draft.Body.String(), `"package_id":"controlled-agent"`) || strings.Contains(strings.ToLower(draft.Body.String()), "publisher-token") {
+		t.Fatalf("draft status=%d body=%s", draft.Code, draft.Body.String())
+	}
+	evaluated := requestJSONKBaseBrowser(handler, http.MethodPost, "/api/controlled-agent/evaluate", "consumer-token", string(body))
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("evaluate status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	unconfirmed := requestJSONKBaseBrowser(handler, http.MethodPost, "/api/controlled-agent/publish", "consumer-token", string(body))
+	if unconfirmed.Code != http.StatusBadRequest || !strings.Contains(unconfirmed.Body.String(), "explicit confirmation") {
+		t.Fatalf("unconfirmed status=%d body=%s", unconfirmed.Code, unconfirmed.Body.String())
+	}
+	request.Confirm = true
+	body, _ = json.Marshal(request)
+	published := requestJSONKBaseBrowser(handler, http.MethodPost, "/api/controlled-agent/publish", "consumer-token", string(body))
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"lifecycle_state":"published"`) || strings.Contains(strings.ToLower(published.Body.String()), "publisher-token") {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerControlledAgentRequiresPublisherConfiguration(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-token"})
+	response := requestJSONKBaseBrowser(handler, http.MethodPost, "/api/controlled-agent/draft", "consumer-token", `{}`)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "publisher") {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store:        NewBookKnowledgeStore(t.TempDir()),
@@ -1747,6 +1797,18 @@ func requestKBase(handler http.Handler, method, path, token string) *httptest.Re
 func requestJSONKBase(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func requestJSONKBaseBrowser(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-KBase-Browser-Session", "1")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
