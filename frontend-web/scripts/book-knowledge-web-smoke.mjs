@@ -289,6 +289,91 @@ assert.equal(
   "ebook Agent matcher should return null when no package pins this book",
 );
 
+const ebookKnowledgeMatcherSource = js.match(/function findKnowledgePackageForEbook\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(ebookKnowledgeMatcherSource, "app.js should define the ebook knowledge-package matcher");
+const findKnowledgePackageForEbook = new Function(
+  "dedaoProductID",
+  "dedaoProductEnID",
+  `${ebookKnowledgeMatcherSource}; return findKnowledgePackageForEbook;`,
+)(
+  (item) => String(item?.sourceID || ""),
+  (item) => String(item?.sourceEnID || ""),
+);
+const sameTitleWrongBook = { book_id: "wrong", title: "同名书" };
+const strongIDBook = { book_id: "right", dedao_id: "source-1", title: "另一标题" };
+assert.equal(
+  findKnowledgePackageForEbook(
+    { sourceID: "source-1", title: "同名书" },
+    [sameTitleWrongBook, strongIDBook],
+  )?.book_id,
+  "right",
+  "ebook knowledge matching should prefer a durable source ID over title order",
+);
+assert.equal(
+  findKnowledgePackageForEbook({ sourceID: "missing", title: "同名书" }, [sameTitleWrongBook]),
+  null,
+  "ebook knowledge matching must not fall back to title when a strong ID is available",
+);
+assert.equal(
+  findKnowledgePackageForEbook(
+    { sourceID: "source-1", sourceEnID: "enid-2", title: "同名书" },
+    [strongIDBook, { book_id: "conflict", enid: "enid-2", title: "同名书" }],
+  ),
+  null,
+  "conflicting strong ebook identifiers should fail closed",
+);
+assert.equal(
+  findKnowledgePackageForEbook(
+    { sourceID: "source-1", sourceEnID: "enid-2", title: "同名书" },
+    [{ book_id: "internally-conflicted", dedao_id: "source-1", enid: "enid-1", title: "同名书" }],
+  ),
+  null,
+  "one candidate with a matching ID but conflicting enid should fail closed",
+);
+assert.equal(
+  findKnowledgePackageForEbook({ title: "唯一书" }, [{ book_id: "unique", title: "唯一书" }])?.book_id,
+  "unique",
+  "title fallback should remain available when the source has no strong identifier",
+);
+assert.equal(
+  findKnowledgePackageForEbook(
+    { title: "重复书" },
+    [{ book_id: "first", title: "重复书" }, { book_id: "second", title: "重复书" }],
+  ),
+  null,
+  "ambiguous title fallback should fail closed",
+);
+
+const ebookLoadCurrentSource = js.match(/function isDedaoEbookDetailLoadCurrent\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(ebookLoadCurrentSource, "app.js should define a route-aware ebook load guard");
+let activeEbookRoute = { enid: "ebook-1" };
+const isDedaoEbookDetailLoadCurrent = new Function(
+  "getDedaoEbookRoute",
+  `${ebookLoadCurrentSource}; let dedaoEbookDetailLoadSequence = 7; return isDedaoEbookDetailLoadCurrent;`,
+)(() => activeEbookRoute);
+assert.equal(
+  isDedaoEbookDetailLoadCurrent(7, { enid: "ebook-1" }),
+  true,
+  "the active ebook request should remain current",
+);
+activeEbookRoute = null;
+assert.equal(
+  isDedaoEbookDetailLoadCurrent(7, { enid: "ebook-1" }),
+  false,
+  "an ebook request should become stale after navigating to a non-ebook route",
+);
+activeEbookRoute = { enid: "ebook-2" };
+assert.equal(
+  isDedaoEbookDetailLoadCurrent(7, { enid: "ebook-1" }),
+  false,
+  "an ebook request should become stale after navigating to another ebook",
+);
+const bootSource = js.slice(js.indexOf("async function boot()"), js.indexOf('window.addEventListener?.("popstate"'));
+assert.ok(
+  bootSource.includes("dedaoEbookDetailLoadSequence += 1"),
+  "route navigation should invalidate a pending ebook detail request",
+);
+
 for (const marker of [
   "resetKnowledgeReview",
   "loadKnowledgeReview",

@@ -2625,17 +2625,22 @@ function findKnowledgePackageForEbook(item, books) {
   const sourceID = dedaoProductID(item || {}, "ebook");
   const sourceEnID = dedaoProductEnID(item || {});
   const title = String(item?.title || "").trim();
-  return (Array.isArray(books) ? books : []).find((book) => {
+  const candidates = Array.isArray(books) ? books : [];
+  const strongMatches = candidates.filter((book) => {
     const dedaoID = String(book?.dedao_id || "").trim();
     const bookEnID = String(book?.enid || "").trim();
     const sourceKey = String(book?.source_key || "").trim();
-    const bookTitle = String(book?.title || "").trim();
-    return Boolean(
-      (sourceID && dedaoID === sourceID)
-      || (sourceEnID && (bookEnID === sourceEnID || sourceKey === sourceEnID))
-      || (title && bookTitle === title),
-    );
-  }) || null;
+    const matchesID = Boolean(sourceID && dedaoID === sourceID);
+    const matchesEnID = Boolean(sourceEnID && (bookEnID === sourceEnID || sourceKey === sourceEnID));
+    const conflictsID = Boolean(sourceID && dedaoID && dedaoID !== sourceID);
+    const conflictsEnID = Boolean(sourceEnID && (bookEnID || sourceKey) && !matchesEnID);
+    return (matchesID || matchesEnID) && !conflictsID && !conflictsEnID;
+  });
+  if (sourceID || sourceEnID) {
+    return strongMatches.length === 1 ? strongMatches[0] : null;
+  }
+  const titleMatches = candidates.filter((book) => title && String(book?.title || "").trim() === title);
+  return titleMatches.length === 1 ? titleMatches[0] : null;
 }
 
 function findPublishedAgentPackageForReleases(releases, packages) {
@@ -2658,6 +2663,15 @@ function findPublishedAgentPackageForReleases(releases, packages) {
     return String(right?.version || "").localeCompare(String(left?.version || ""), undefined, { numeric: true });
   });
   return matching[0] || null;
+}
+
+function isDedaoEbookDetailLoadCurrent(sequence, route) {
+  const currentRoute = getDedaoEbookRoute();
+  return Boolean(
+    sequence === dedaoEbookDetailLoadSequence
+    && route?.enid
+    && currentRoute?.enid === route.enid,
+  );
 }
 
 function renderDedaoEbookDetail(route) {
@@ -2776,7 +2790,7 @@ async function loadDedaoEbookDetail(route) {
         page_size: "100",
       });
       const payload = await apiFetch(`/api/dedao/library?${query.toString()}`);
-      if (sequence !== dedaoEbookDetailLoadSequence) {
+      if (!isDedaoEbookDetailLoadCurrent(sequence, route)) {
         return;
       }
       const items = Array.isArray(payload?.list) ? payload.list : [];
@@ -2790,13 +2804,16 @@ async function loadDedaoEbookDetail(route) {
     }
     dedaoLibraryState.ebookDetail = matched;
     const booksPayload = await apiFetch("/api/books");
-    if (sequence !== dedaoEbookDetailLoadSequence) {
+    if (!isDedaoEbookDetailLoadCurrent(sequence, route)) {
       return;
     }
     const books = Array.isArray(booksPayload?.books) ? booksPayload.books : (Array.isArray(booksPayload) ? booksPayload : []);
     dedaoLibraryState.ebookPackage = findKnowledgePackageForEbook(matched, books);
     const packageID = String(dedaoLibraryState.ebookPackage?.book_id || "").trim();
     if (packageID) {
+      if (!isDedaoEbookDetailLoadCurrent(sequence, route)) {
+        return;
+      }
       dedaoLibraryState.ebookAgentStatusLoading = "正在读取已发布 Release 与 Agent Package";
       renderDedaoEbookDetail(route);
       try {
@@ -2805,7 +2822,7 @@ async function loadDedaoEbookDetail(route) {
           loadKnowledgeAgentPackageRecords(),
         ]);
         const { packages, errors } = await loadKnowledgeAgentPackageDetails(records);
-        if (sequence !== dedaoEbookDetailLoadSequence) {
+        if (!isDedaoEbookDetailLoadCurrent(sequence, route)) {
           return;
         }
         dedaoLibraryState.ebookAgentReleases = releases;
@@ -2814,21 +2831,21 @@ async function loadDedaoEbookDetail(route) {
           ? `${errors.length} 个 Agent Package 详情加载失败：${errors[0]}`
           : "";
       } catch (error) {
-        if (sequence === dedaoEbookDetailLoadSequence) {
+        if (isDedaoEbookDetailLoadCurrent(sequence, route)) {
           dedaoLibraryState.ebookAgentStatusError = error instanceof Error ? error.message : String(error);
         }
       } finally {
-        if (sequence === dedaoEbookDetailLoadSequence) {
+        if (isDedaoEbookDetailLoadCurrent(sequence, route)) {
           dedaoLibraryState.ebookAgentStatusLoading = "";
         }
       }
     }
   } catch (error) {
-    if (sequence === dedaoEbookDetailLoadSequence) {
+    if (isDedaoEbookDetailLoadCurrent(sequence, route)) {
       dedaoLibraryState.ebookDetailMessage = error instanceof Error ? error.message : String(error);
     }
   } finally {
-    if (sequence === dedaoEbookDetailLoadSequence) {
+    if (isDedaoEbookDetailLoadCurrent(sequence, route)) {
       dedaoLibraryState.ebookDetailLoading = "";
       renderDedaoEbookDetail(route);
     }
@@ -9776,6 +9793,7 @@ function formatArticleTime(value) {
 
 async function boot() {
   bookKnowledgeLoadSequence += 1;
+  dedaoEbookDetailLoadSequence += 1;
   const routePathname = getRoutePathname();
   if (!routePathname.startsWith(ROUTES.sourceAgents)) {
     if (sourceAgentManagementPollTimer) {
