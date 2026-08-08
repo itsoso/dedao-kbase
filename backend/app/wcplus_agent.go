@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -19,12 +20,279 @@ var (
 	ErrWCPlusTaskTimeout           = errors.New("wcplus task did not complete before polling stopped")
 )
 
+const (
+	wcplusCapabilityLatchNone uint32 = iota
+	wcplusCapabilityLatchDependencyUnavailable
+	wcplusCapabilityLatchVendorBlocked
+)
+
 type WCPlusAgentBlockedError struct {
 	Reason string
 }
 
 func (e *WCPlusAgentBlockedError) Error() string {
 	return "wcplus operation blocked: " + strings.TrimSpace(e.Reason)
+}
+
+type WCPlusSourceAdapterConfig struct {
+	WCPlus           *WCPlusSourceService
+	TaskPollAttempts int
+	TaskPollInterval time.Duration
+	OnTaskProgress   func(WCPlusTask)
+}
+
+type WCPlusSourceAdapter struct {
+	wcplus           *WCPlusSourceService
+	taskPollAttempts int
+	taskPollInterval time.Duration
+	onTaskProgress   func(WCPlusTask)
+	capabilityLatch  atomic.Uint32
+}
+
+func NewWCPlusSourceAdapter(config WCPlusSourceAdapterConfig) (*WCPlusSourceAdapter, error) {
+	if config.WCPlus == nil {
+		return nil, fmt.Errorf("WC Plus source service is required")
+	}
+	if config.TaskPollAttempts <= 0 {
+		config.TaskPollAttempts = 30
+	}
+	if config.TaskPollInterval <= 0 {
+		config.TaskPollInterval = 2 * time.Second
+	}
+	return &WCPlusSourceAdapter{
+		wcplus: config.WCPlus, taskPollAttempts: config.TaskPollAttempts,
+		taskPollInterval: config.TaskPollInterval, onTaskProgress: config.OnTaskProgress,
+	}, nil
+}
+
+func (a *WCPlusSourceAdapter) Name() string { return "wcplus" }
+
+func (a *WCPlusSourceAdapter) Operations() []string {
+	return []string{"existing_articles", "sync_content", "sync_links", "sync_reading_data"}
+}
+
+func (a *WCPlusSourceAdapter) Status(ctx context.Context) SourceCapabilityHealth {
+	switch a.capabilityLatch.Load() {
+	case wcplusCapabilityLatchVendorBlocked:
+		return wcplusVendorBlockedCapabilityHealth("")
+	case wcplusCapabilityLatchDependencyUnavailable:
+		return wcplusDependencyUnavailableCapabilityHealth("")
+	}
+	status, err := a.wcplus.Status(ctx)
+	return wcplusCapabilityHealth(status, err)
+}
+
+func (a *WCPlusSourceAdapter) Diagnose(ctx context.Context) SourceAgentDiagnosticReport {
+	health := a.Status(ctx)
+	if health.Healthy {
+		return SourceAgentDiagnosticReport{
+			State: SourceAgentCommandSucceeded, Code: SourceAgentCommandCodeDiagnosticComplete,
+			Message: "WC Plus capability is available.",
+		}
+	}
+	return SourceAgentDiagnosticReport{
+		State: SourceAgentCommandFailed, Code: SourceAgentCommandCodeDiagnosticFailed,
+		Message: "WC Plus capability requires operator action.",
+	}
+}
+
+func wcplusCapabilityHealth(status *WCPlusStatus, statusErr error) SourceCapabilityHealth {
+	if statusErr == nil && status != nil && status.OK {
+		return SourceCapabilityHealth{Healthy: true, Version: strings.TrimSpace(status.Version)}
+	}
+	statusCode := 0
+	detail := ""
+	version := ""
+	if status != nil {
+		statusCode = status.StatusCode
+		detail = status.Message
+		version = strings.TrimSpace(status.Version)
+	}
+	if statusErr != nil {
+		detail += " " + statusErr.Error()
+	}
+	if wcplusVendorBlocked(statusCode, detail) {
+		return wcplusVendorBlockedCapabilityHealth(version)
+	}
+	return wcplusDependencyUnavailableCapabilityHealth(version)
+}
+
+func wcplusDependencyUnavailableCapabilityHealth(version string) SourceCapabilityHealth {
+	return SourceCapabilityHealth{
+		Healthy: false, Code: "dependency_unavailable", Version: version,
+		LastError:      "The local WC Plus API is unavailable.",
+		RequiresAction: "Start the configured loopback WC Plus service.",
+	}
+}
+
+func wcplusVendorBlocked(statusCode int, detail string) bool {
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusLocked, http.StatusTooManyRequests, http.StatusUnavailableForLegalReasons:
+		return true
+	}
+	detail = strings.ToLower(strings.TrimSpace(detail))
+	for _, marker := range []string{
+		"xprotect", "malware", "quarantine", "not_max_version", "unactivated", "not activated",
+		"license", "licence", "authorization", "activation", "vendor blocked", "throttl",
+		"too many requests", "parameter expired", "parameter_expired", "req_data expired", "task_id 0",
+	} {
+		if strings.Contains(detail, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func wcplusVendorBlockedCapabilityHealth(version string) SourceCapabilityHealth {
+	return SourceCapabilityHealth{
+		Healthy: false, Code: "vendor_blocked", Version: version,
+		LastError:      "WC Plus is blocked by the vendor or host security.",
+		RequiresAction: "Install and activate a vendor-supported WC Plus build.",
+	}
+}
+
+func (a *WCPlusSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (result SourceAdapterResult, err error) {
+	defer func() {
+		a.latchExecutionError(ctx, err)
+	}()
+	if run.Subscription == nil {
+		return SourceAdapterResult{}, fmt.Errorf("subscription snapshot is required")
+	}
+	switch run.RequestedOperation {
+	case "existing_articles", "sync_links", "sync_content":
+		return a.executeArticleRun(ctx, run, sink)
+	case "sync_reading_data":
+		executor := a.taskExecutor()
+		if err := executor.executeReadingDataRun(ctx, run); err != nil {
+			return SourceAdapterResult{}, err
+		}
+		return SourceAdapterResult{Cursor: strings.TrimSpace(run.Subscription.Cursor)}, nil
+	default:
+		return SourceAdapterResult{}, fmt.Errorf("unsupported source sync operation %q", run.RequestedOperation)
+	}
+}
+
+func (a *WCPlusSourceAdapter) latchExecutionError(ctx context.Context, err error) {
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	var localAPIError *WCPlusLocalAPIError
+	if errors.As(err, &localAPIError) {
+		if wcplusVendorBlocked(localAPIError.StatusCode, localAPIError.classificationDetail) {
+			a.latchCapability(wcplusCapabilityLatchVendorBlocked)
+		} else {
+			a.latchCapability(wcplusCapabilityLatchDependencyUnavailable)
+		}
+		return
+	}
+	var blocked *WCPlusAgentBlockedError
+	if errors.As(err, &blocked) && wcplusVendorBlocked(0, blocked.Reason) {
+		a.latchCapability(wcplusCapabilityLatchVendorBlocked)
+	}
+}
+
+func (a *WCPlusSourceAdapter) latchCapability(next uint32) {
+	for {
+		current := a.capabilityLatch.Load()
+		if current == wcplusCapabilityLatchVendorBlocked || current == next {
+			return
+		}
+		if a.capabilityLatch.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+func (a *WCPlusSourceAdapter) executeArticleRun(ctx context.Context, run SourceSyncRun, sink SourceEnvelopeSink) (SourceAdapterResult, error) {
+	subscription := run.Subscription
+	limit := sourceAgentOptionInt(subscription.Options, "limit", 20, 100)
+	list, err := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
+		Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: limit,
+	})
+	if err != nil {
+		return SourceAdapterResult{}, err
+	}
+	needsLinkTask := run.RequestedOperation == "sync_links" ||
+		(run.RequestedOperation == "sync_content" && len(list.Articles) == 0)
+	if needsLinkTask {
+		beforeFingerprint := wcplusArticleListFingerprint(list)
+		if err := a.taskExecutor().runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "gzh_article_link", limit, func(ctx context.Context) (bool, error) {
+			verified, verifyErr := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
+				Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: 1,
+			})
+			return verifyErr == nil && len(verified.Articles) > 0 && wcplusArticleListFingerprint(verified) != beforeFingerprint, verifyErr
+		}); err != nil {
+			return SourceAdapterResult{}, err
+		}
+		list, err = a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
+			Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: limit,
+		})
+		if err != nil {
+			return SourceAdapterResult{}, err
+		}
+	}
+
+	type articleResult struct {
+		article WCPlusArticle
+		content *WCPlusArticleContent
+		err     error
+	}
+	results := make([]articleResult, 0, len(list.Articles))
+	failedIndexes := make([]int, 0)
+	for _, article := range list.Articles {
+		content, contentErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, article)
+		var localAPIError *WCPlusLocalAPIError
+		if errors.As(contentErr, &localAPIError) {
+			return SourceAdapterResult{}, contentErr
+		}
+		results = append(results, articleResult{article: article, content: content, err: contentErr})
+		if contentErr != nil {
+			failedIndexes = append(failedIndexes, len(results)-1)
+		}
+	}
+	if run.RequestedOperation == "sync_content" && len(failedIndexes) > 0 {
+		sample := results[failedIndexes[0]].article
+		if err := a.taskExecutor().runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "article", limit, func(ctx context.Context) (bool, error) {
+			content, verifyErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, sample)
+			return verifyErr == nil && content != nil && strings.TrimSpace(content.Content) != "", verifyErr
+		}); err != nil {
+			return SourceAdapterResult{}, err
+		}
+		for _, index := range failedIndexes {
+			content, contentErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, results[index].article)
+			var localAPIError *WCPlusLocalAPIError
+			if errors.As(contentErr, &localAPIError) {
+				return SourceAdapterResult{}, contentErr
+			}
+			results[index].content = content
+			results[index].err = contentErr
+		}
+	}
+
+	result := SourceAdapterResult{Cursor: strings.TrimSpace(subscription.Cursor)}
+	for _, articleResult := range results {
+		itemKey := wcplusAgentSourceItemKey(articleResult.article)
+		if articleResult.err != nil {
+			result.Failures = append(result.Failures, SourceAdapterItemFailure{
+				SourceItemKey: itemKey, IdempotencyKey: wcplusAgentIdempotencyKey(run.ID, itemKey, "failure"),
+				Error: articleResult.err.Error(),
+			})
+			continue
+		}
+		envelope := wcplusAgentArticleEnvelope(run.ID, *subscription, articleResult.article, *articleResult.content)
+		if _, err := sink.Enqueue(run.ID, envelope); err != nil {
+			return result, err
+		}
+		result.Cursor = laterWCPlusAgentCursor(result.Cursor, wcplusAgentCursorForEnvelope(envelope))
+	}
+	return result, nil
+}
+
+func (a *WCPlusSourceAdapter) taskExecutor() *WCPlusAgent {
+	return &WCPlusAgent{
+		wcplus: a.wcplus, taskPollAttempts: a.taskPollAttempts,
+		taskPollInterval: a.taskPollInterval, onTaskProgress: a.onTaskProgress,
+	}
 }
 
 type WCPlusAgentConfig struct {
@@ -195,83 +463,21 @@ func (a *WCPlusAgent) executeRun(ctx context.Context, run SourceSyncRun) (int, s
 }
 
 func (a *WCPlusAgent) executeArticleRun(ctx context.Context, run SourceSyncRun) (int, string, error) {
-	subscription := run.Subscription
-	limit := sourceAgentOptionInt(subscription.Options, "limit", 20, 100)
-	list, err := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
-		Biz:      subscription.SourceAccountKey,
-		Nickname: subscription.SourceAccount,
-		Num:      limit,
-	})
+	adapter := &WCPlusSourceAdapter{
+		wcplus: a.wcplus, taskPollAttempts: a.taskPollAttempts,
+		taskPollInterval: a.taskPollInterval, onTaskProgress: a.onTaskProgress,
+	}
+	result, err := adapter.executeArticleRun(ctx, run, a.outbox)
 	if err != nil {
-		return 0, "", err
+		return 0, result.Cursor, err
 	}
-	needsLinkTask := run.RequestedOperation == "sync_links" ||
-		(run.RequestedOperation == "sync_content" && len(list.Articles) == 0)
-	if needsLinkTask {
-		beforeFingerprint := wcplusArticleListFingerprint(list)
-		if err := a.runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "gzh_article_link", limit, func(ctx context.Context) (bool, error) {
-			verified, err := a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
-				Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: 1,
-			})
-			return err == nil && len(verified.Articles) > 0 && wcplusArticleListFingerprint(verified) != beforeFingerprint, err
-		}); err != nil {
-			return 0, "", err
-		}
-		list, err = a.wcplus.ListAccountArticles(ctx, WCPlusArticleListOptions{
-			Biz: subscription.SourceAccountKey, Nickname: subscription.SourceAccount, Num: limit,
-		})
-		if err != nil {
-			return 0, "", err
+	for _, failure := range result.Failures {
+		if _, err := a.client.ReportItemFailure(ctx, run.ID, failure.SourceItemKey, failure.IdempotencyKey, failure.Error); err != nil {
+			return 0, result.Cursor, fmt.Errorf("report source item failure: %w", err)
 		}
 	}
-	if len(list.Articles) == 0 {
-		return 0, "", nil
-	}
-
-	type articleResult struct {
-		article WCPlusArticle
-		content *WCPlusArticleContent
-		err     error
-	}
-	results := make([]articleResult, 0, len(list.Articles))
-	failedIndexes := make([]int, 0)
-	for _, article := range list.Articles {
-		content, contentErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, article)
-		results = append(results, articleResult{article: article, content: content, err: contentErr})
-		if contentErr != nil {
-			failedIndexes = append(failedIndexes, len(results)-1)
-		}
-	}
-	if run.RequestedOperation == "sync_content" && len(failedIndexes) > 0 {
-		sample := results[failedIndexes[0]].article
-		if err := a.runAccountTask(ctx, run.ID, *subscription, list.Account.ImageURL, "article", limit, func(ctx context.Context) (bool, error) {
-			content, verifyErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, sample)
-			return verifyErr == nil && content != nil && strings.TrimSpace(content.Content) != "", verifyErr
-		}); err != nil {
-			return 0, "", err
-		}
-		for _, index := range failedIndexes {
-			content, contentErr := a.wcplus.getListedArticleContent(ctx, subscription.SourceAccount, results[index].article)
-			results[index].content = content
-			results[index].err = contentErr
-		}
-	}
-
-	for _, articleResult := range results {
-		itemKey := wcplusAgentSourceItemKey(articleResult.article)
-		if articleResult.err != nil {
-			idempotencyKey := wcplusAgentIdempotencyKey(run.ID, itemKey, "failure")
-			if _, err := a.client.ReportItemFailure(ctx, run.ID, itemKey, idempotencyKey, articleResult.err.Error()); err != nil {
-				return 0, "", fmt.Errorf("report source item failure: %w", err)
-			}
-			continue
-		}
-		envelope := wcplusAgentArticleEnvelope(run.ID, *subscription, articleResult.article, *articleResult.content)
-		if _, err := a.outbox.Enqueue(run.ID, envelope); err != nil {
-			return 0, "", fmt.Errorf("enqueue source article: %w", err)
-		}
-	}
-	return a.flushRunOutbox(ctx, run.ID)
+	uploaded, cursor, err := a.flushRunOutbox(ctx, run.ID)
+	return uploaded, laterWCPlusAgentCursor(result.Cursor, cursor), err
 }
 
 func (a *WCPlusAgent) executeReadingDataRun(ctx context.Context, run SourceSyncRun) error {
@@ -393,7 +599,7 @@ func (a *WCPlusAgent) waitForTask(
 				return nil
 			}
 			if verifyErr != nil && attempt == a.taskPollAttempts-1 {
-				return fmt.Errorf("%w: %v", ErrWCPlusTaskOutcomeUnverified, verifyErr)
+				return fmt.Errorf("%w: %w", ErrWCPlusTaskOutcomeUnverified, verifyErr)
 			}
 		}
 		if attempt < a.taskPollAttempts-1 {
@@ -445,25 +651,20 @@ func (a *WCPlusAgent) flushRunOutbox(ctx context.Context, runID string) (int, st
 }
 
 func sourceAgentRequestRetryable(err error) bool {
-	var httpErr *SourceAgentHTTPError
-	return errors.As(err, &httpErr) && httpErr.Retryable()
+	var retryable interface{ Retryable() bool }
+	return errors.As(err, &retryable) && retryable.Retryable()
 }
 
 func wcplusTaskBlockedReason(task WCPlusTask) string {
 	text := strings.ToLower(strings.TrimSpace(strings.Join([]string{task.Status, task.StatusError, task.Message}, " ")))
-	for _, marker := range []string{
-		"not_max_version", "unactivated", "not activated", "throttl", "too many requests",
-		"parameter expired", "parameter_expired", "request parameter expired", "req_data expired",
-	} {
-		if strings.Contains(text, marker) {
-			reason := strings.TrimSpace(task.StatusError + " " + task.Message)
-			if reason == "" {
-				reason = strings.TrimSpace(task.Status)
-			}
-			return reason
-		}
+	if !wcplusVendorBlocked(0, text) {
+		return ""
 	}
-	return ""
+	reason := strings.TrimSpace(task.StatusError + " " + task.Message)
+	if reason == "" {
+		reason = strings.TrimSpace(task.Status)
+	}
+	return reason
 }
 
 func wcplusArticleListFingerprint(list *WCPlusArticleList) string {

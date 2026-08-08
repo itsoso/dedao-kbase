@@ -1,0 +1,989 @@
+package app
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
+
+const (
+	KnowledgeReleaseAssemblySchemaVersion = "knowledge_release_assembly.v1"
+	KnowledgeAssemblyAlgorithmVersion     = "deterministic-claim-assembly.v1"
+
+	KnowledgeAssemblyPolarityPositive = "positive"
+	KnowledgeAssemblyPolarityNegative = "negative"
+
+	KnowledgeAssemblyStatusPotentialConflict    = "potential_conflict"
+	KnowledgeAssemblyStatusCorroborated         = "corroborated"
+	KnowledgeAssemblyStatusSinglePublication    = "single_publication"
+	KnowledgeAssemblyStatusInsufficientIdentity = "insufficient_identity"
+
+	knowledgeAssemblyDefaultLimit  = 100
+	knowledgeAssemblyMaxLimit      = 500
+	knowledgeAssemblyMaxQueryRunes = 256
+	knowledgeAssemblyMaxScope      = 17
+
+	knowledgeAssemblyMaxClaimsPerCluster    = 128
+	knowledgeAssemblyMaxStatementRunes      = 4096
+	knowledgeAssemblyMaxCitationIDsPerClaim = 128
+	knowledgeAssemblyMaxConflictsPerCluster = 256
+)
+
+type KnowledgeReleaseAssemblyQuery struct {
+	Limit      int
+	Query      string
+	ReleaseIDs []string
+}
+
+type KnowledgeReleaseAssembly struct {
+	SchemaVersion    string                            `json:"schema_version"`
+	AlgorithmVersion string                            `json:"algorithm_version"`
+	AssemblyID       string                            `json:"assembly_id"`
+	ReleaseIDs       []string                          `json:"release_ids"`
+	Summary          KnowledgeReleaseAssemblySummary   `json:"summary"`
+	Clusters         []KnowledgeReleaseAssemblyCluster `json:"clusters"`
+	ReturnedClusters int                               `json:"returned_clusters"`
+	HasMore          bool                              `json:"has_more"`
+}
+
+type KnowledgeReleaseAssemblySummary struct {
+	ReleaseCount              int `json:"release_count"`
+	ClaimCount                int `json:"claim_count"`
+	ClusterCount              int `json:"cluster_count"`
+	MatchedClusterCount       int `json:"matched_cluster_count"`
+	CorroboratedClusters      int `json:"corroborated_clusters"`
+	PotentialConflictClusters int `json:"potential_conflict_clusters"`
+	SinglePublicationClusters int `json:"single_publication_clusters"`
+	InsufficientIdentity      int `json:"insufficient_identity_clusters"`
+}
+
+type KnowledgeReleaseAssemblyCluster struct {
+	ClusterID                   string                                      `json:"cluster_id"`
+	NormalizedAssertion         string                                      `json:"normalized_assertion"`
+	Status                      string                                      `json:"status"`
+	PublicationCount            int                                         `json:"publication_count"`
+	IndependentPublicationCount int                                         `json:"independent_publication_count"`
+	Claims                      []KnowledgeReleaseAssemblyClaimRef          `json:"claims"`
+	PotentialConflicts          []KnowledgeReleaseAssemblyPotentialConflict `json:"potential_conflicts,omitempty"`
+}
+
+type KnowledgeReleaseAssemblyClaimRef struct {
+	ReleaseID                      string   `json:"release_id"`
+	BookID                         string   `json:"book_id"`
+	ClaimID                        string   `json:"claim_id"`
+	Statement                      string   `json:"statement"`
+	Polarity                       string   `json:"polarity"`
+	CitationIDs                    []string `json:"citation_ids"`
+	PublicationIdentity            string   `json:"publication_identity"`
+	PublicationIdentityBasis       string   `json:"publication_identity_basis"`
+	IndependentPublicationEligible bool     `json:"independent_publication_eligible"`
+}
+
+type KnowledgeReleaseAssemblyPotentialConflict struct {
+	ConflictID        string `json:"conflict_id"`
+	PositiveReleaseID string `json:"positive_release_id"`
+	PositiveClaimID   string `json:"positive_claim_id"`
+	NegativeReleaseID string `json:"negative_release_id"`
+	NegativeClaimID   string `json:"negative_claim_id"`
+	ReviewRequired    bool   `json:"review_required"`
+}
+
+func BuildKnowledgeReleaseAssembly(
+	store *BookKnowledgeStore,
+	query KnowledgeReleaseAssemblyQuery,
+) (*KnowledgeReleaseAssembly, error) {
+	if store == nil {
+		store = DefaultBookKnowledgeStore()
+	}
+	if query.Limit <= 0 {
+		query.Limit = knowledgeAssemblyDefaultLimit
+	}
+	if query.Limit > knowledgeAssemblyMaxLimit {
+		return nil, fmt.Errorf("limit must be between 1 and %d", knowledgeAssemblyMaxLimit)
+	}
+	query.Query = strings.TrimSpace(query.Query)
+	if utf8.RuneCountInString(query.Query) > knowledgeAssemblyMaxQueryRunes {
+		return nil, fmt.Errorf("query must not exceed %d characters", knowledgeAssemblyMaxQueryRunes)
+	}
+	if len(query.ReleaseIDs) > knowledgeAssemblyMaxScope {
+		return nil, fmt.Errorf(
+			"release_ids must not exceed %d items",
+			knowledgeAssemblyMaxScope,
+		)
+	}
+	scopedReleaseIDs := make(map[string]struct{}, len(query.ReleaseIDs))
+	for index, releaseID := range query.ReleaseIDs {
+		if releaseID != strings.TrimSpace(releaseID) || releaseID == "" {
+			return nil, fmt.Errorf("release_ids[%d] must use canonical form", index)
+		}
+		if _, duplicate := scopedReleaseIDs[releaseID]; duplicate {
+			return nil, fmt.Errorf("release_ids contains duplicate %q", boundedEvidenceID(releaseID))
+		}
+		scopedReleaseIDs[releaseID] = struct{}{}
+	}
+
+	manifest, err := store.loadKnowledgeReleaseManifest()
+	if err != nil {
+		return nil, err
+	}
+	records, err := latestKnowledgeAssemblyReleaseRecords(manifest.Releases)
+	if err != nil {
+		return nil, err
+	}
+	if len(scopedReleaseIDs) > 0 {
+		filtered := make([]KnowledgeReleaseRecord, 0, len(scopedReleaseIDs))
+		for _, record := range records {
+			if _, selected := scopedReleaseIDs[record.ReleaseID]; selected {
+				filtered = append(filtered, record)
+				delete(scopedReleaseIDs, record.ReleaseID)
+			}
+		}
+		if len(scopedReleaseIDs) > 0 {
+			return nil, fmt.Errorf("one or more scoped releases are not latest")
+		}
+		records = filtered
+	}
+	releases := make([]KnowledgeRelease, 0, len(records))
+	releaseIDs := make([]string, 0, len(records))
+	for _, record := range records {
+		release, err := store.LoadKnowledgeRelease(record.ReleaseID)
+		if err != nil {
+			return nil, fmt.Errorf("load selected release %q: %w", boundedEvidenceID(record.ReleaseID), err)
+		}
+		if release.Analysis != nil {
+			for _, claim := range release.Analysis.Claims {
+				if len(claim.CitationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+					return nil, fmt.Errorf(
+						"claim %q citation_ids exceeds %d items",
+						boundedEvidenceID(claim.ID),
+						knowledgeAssemblyMaxCitationIDsPerClaim,
+					)
+				}
+			}
+		}
+		adaptKnowledgeAssemblyReleaseForRead(release)
+		releasePayload, err := json.Marshal(release)
+		if err != nil {
+			return nil, fmt.Errorf("encode selected release %q: %w", boundedEvidenceID(record.ReleaseID), err)
+		}
+		if err := ValidateKnowledgeReleaseContract(releasePayload); err != nil {
+			return nil, fmt.Errorf("selected release %q is invalid: %w", boundedEvidenceID(record.ReleaseID), err)
+		}
+		if release.BookID != record.BookID || release.ContentHash != record.ContentHash ||
+			release.CreatedAt != record.CreatedAt {
+			return nil, fmt.Errorf("selected release %q does not match its manifest record", boundedEvidenceID(record.ReleaseID))
+		}
+		if err := validateKnowledgeAssemblyReleaseEvidence(*release); err != nil {
+			return nil, fmt.Errorf("selected release %q is invalid: %w", boundedEvidenceID(record.ReleaseID), err)
+		}
+		releases = append(releases, *release)
+		releaseIDs = append(releaseIDs, release.ReleaseID)
+	}
+	sort.Strings(releaseIDs)
+	sort.Slice(releases, func(i, j int) bool {
+		return releases[i].ReleaseID < releases[j].ReleaseID
+	})
+
+	clusterMap := make(map[string]*KnowledgeReleaseAssemblyCluster)
+	claimCount := 0
+	for _, release := range releases {
+		publication := canonicalKnowledgeAssemblyPublicationIdentity(release.Book)
+		for _, claim := range release.Analysis.Claims {
+			statement := strings.TrimSpace(claim.Statement)
+			if utf8.RuneCountInString(statement) > knowledgeAssemblyMaxStatementRunes {
+				return nil, fmt.Errorf(
+					"claim %q statement exceeds %d characters",
+					boundedEvidenceID(claim.ID),
+					knowledgeAssemblyMaxStatementRunes,
+				)
+			}
+			if len(claim.CitationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+				return nil, fmt.Errorf(
+					"claim %q citation_ids exceeds %d items",
+					boundedEvidenceID(claim.ID),
+					knowledgeAssemblyMaxCitationIDsPerClaim,
+				)
+			}
+			citationIDs := uniqueSortedStrings(claim.CitationIDs)
+			normalized := normalizeKnowledgeAssemblyClaim(statement)
+			if strings.TrimSpace(claim.ID) == "" || normalized == "" || len(claim.CitationIDs) == 0 {
+				return nil, fmt.Errorf(
+					"selected release %q contains an incomplete analysis claim",
+					boundedEvidenceID(release.ReleaseID),
+				)
+			}
+			base, polarity := splitKnowledgeAssemblyClaimPolarity(normalized)
+			if base == "" {
+				return nil, fmt.Errorf(
+					"selected release %q contains a claim without a stable assertion",
+					boundedEvidenceID(release.ReleaseID),
+				)
+			}
+			clusterID := knowledgeAssemblyHashID("cluster", base)
+			cluster := clusterMap[clusterID]
+			if cluster == nil {
+				cluster = &KnowledgeReleaseAssemblyCluster{
+					ClusterID:           clusterID,
+					NormalizedAssertion: base,
+					Claims:              []KnowledgeReleaseAssemblyClaimRef{},
+					PotentialConflicts:  []KnowledgeReleaseAssemblyPotentialConflict{},
+				}
+				clusterMap[clusterID] = cluster
+			}
+			if len(cluster.Claims) >= knowledgeAssemblyMaxClaimsPerCluster {
+				return nil, fmt.Errorf(
+					"cluster %q claims exceeds %d items",
+					boundedEvidenceID(clusterID),
+					knowledgeAssemblyMaxClaimsPerCluster,
+				)
+			}
+			cluster.Claims = append(cluster.Claims, KnowledgeReleaseAssemblyClaimRef{
+				ReleaseID:                      release.ReleaseID,
+				BookID:                         release.BookID,
+				ClaimID:                        claim.ID,
+				Statement:                      statement,
+				Polarity:                       polarity,
+				CitationIDs:                    citationIDs,
+				PublicationIdentity:            publication.Key,
+				PublicationIdentityBasis:       publication.Basis,
+				IndependentPublicationEligible: publication.IndependentSourceEligible,
+			})
+			claimCount++
+		}
+	}
+
+	allClusters := make([]KnowledgeReleaseAssemblyCluster, 0, len(clusterMap))
+	summary := KnowledgeReleaseAssemblySummary{
+		ReleaseCount: len(releases),
+		ClaimCount:   claimCount,
+		ClusterCount: len(clusterMap),
+	}
+	for _, cluster := range clusterMap {
+		if err := finalizeKnowledgeAssemblyCluster(cluster); err != nil {
+			return nil, err
+		}
+		switch cluster.Status {
+		case KnowledgeAssemblyStatusPotentialConflict:
+			summary.PotentialConflictClusters++
+		case KnowledgeAssemblyStatusCorroborated:
+			summary.CorroboratedClusters++
+		case KnowledgeAssemblyStatusSinglePublication:
+			summary.SinglePublicationClusters++
+		default:
+			summary.InsufficientIdentity++
+		}
+		allClusters = append(allClusters, *cluster)
+	}
+	sort.Slice(allClusters, func(i, j int) bool {
+		if allClusters[i].NormalizedAssertion != allClusters[j].NormalizedAssertion {
+			return allClusters[i].NormalizedAssertion < allClusters[j].NormalizedAssertion
+		}
+		return allClusters[i].ClusterID < allClusters[j].ClusterID
+	})
+
+	assemblyID, err := knowledgeReleaseAssemblyID(releaseIDs, allClusters)
+	if err != nil {
+		return nil, err
+	}
+	filtered := filterKnowledgeAssemblyClusters(allClusters, query.Query)
+	summary.MatchedClusterCount = len(filtered)
+	hasMore := len(filtered) > query.Limit
+	if hasMore {
+		filtered = filtered[:query.Limit]
+	}
+	result := &KnowledgeReleaseAssembly{
+		SchemaVersion:    KnowledgeReleaseAssemblySchemaVersion,
+		AlgorithmVersion: KnowledgeAssemblyAlgorithmVersion,
+		AssemblyID:       assemblyID,
+		ReleaseIDs:       releaseIDs,
+		Summary:          summary,
+		Clusters:         append([]KnowledgeReleaseAssemblyCluster(nil), filtered...),
+		ReturnedClusters: len(filtered),
+		HasMore:          hasMore,
+	}
+	if err := ValidateKnowledgeReleaseAssembly(*result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func adaptKnowledgeAssemblyReleaseForRead(release *KnowledgeRelease) {
+	if release == nil {
+		return
+	}
+	if release.SchemaVersion == "" && release.Version == knowledgeReleaseVersion {
+		release.SchemaVersion = KnowledgeReleaseSchemaVersion
+	}
+	if release.Analysis == nil {
+		return
+	}
+	for index := range release.Analysis.Claims {
+		release.Analysis.Claims[index].CitationIDs = resolveAgentClaimCitationIDs(
+			release.Citations,
+			release.Analysis.Claims[index].CitationIDs,
+		)
+	}
+}
+
+func validateKnowledgeAssemblyReleaseEvidence(release KnowledgeRelease) error {
+	citations := make(map[string]struct{}, len(release.Citations))
+	for index, citation := range release.Citations {
+		citationID := strings.TrimSpace(citation.CitationID)
+		if citationID == "" {
+			return fmt.Errorf("citations[%d].citation_id is required", index)
+		}
+		if citation.BookID != "" && citation.BookID != release.BookID {
+			return fmt.Errorf("citation %q belongs to a different book", boundedEvidenceID(citationID))
+		}
+		if _, duplicate := citations[citationID]; duplicate {
+			return fmt.Errorf("citation_id %q is duplicated", boundedEvidenceID(citationID))
+		}
+		citations[citationID] = struct{}{}
+	}
+	for _, claim := range release.Analysis.Claims {
+		for _, citationID := range claim.CitationIDs {
+			citationID = strings.TrimSpace(citationID)
+			if _, exists := citations[citationID]; !exists {
+				return fmt.Errorf(
+					"claim %q references unknown citation %q",
+					boundedEvidenceID(claim.ID),
+					boundedEvidenceID(citationID),
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func canonicalKnowledgeAssemblyPublicationIdentity(book BookKnowledgeBook) KnowledgePublicationIdentity {
+	if account := strings.TrimSpace(book.SourceAccount); account != "" {
+		return KnowledgePublicationIdentity{
+			Key:                       "account:" + opaqueKnowledgeAssemblyIdentityComponent(account),
+			Basis:                     "source_account",
+			IndependentSourceEligible: true,
+		}
+	}
+	if parsed, err := url.Parse(strings.TrimSpace(book.SourceHTML)); err == nil &&
+		(parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Hostname() != "" {
+		return KnowledgePublicationIdentity{
+			Key:                       "host:" + opaqueKnowledgeAssemblyIdentityComponent(parsed.Hostname()),
+			Basis:                     "source_host",
+			IndependentSourceEligible: true,
+		}
+	}
+	if author := strings.TrimSpace(book.Author); author != "" && authoredKnowledgeSourceType(book.SourceType) {
+		return KnowledgePublicationIdentity{
+			Key:                       "author:" + opaqueKnowledgeAssemblyIdentityComponent(author),
+			Basis:                     "source_author",
+			IndependentSourceEligible: true,
+		}
+	}
+	sourceType := strings.TrimSpace(firstNonEmpty(book.SourceType, "unknown"))
+	if item := strings.TrimSpace(firstNonEmpty(book.SourceKey, book.EnID)); item != "" {
+		return KnowledgePublicationIdentity{
+			Key:                       "item:" + opaqueKnowledgeAssemblyIdentityComponent(sourceType+"\x00"+item),
+			Basis:                     "source_item",
+			IndependentSourceEligible: false,
+		}
+	}
+	return KnowledgePublicationIdentity{
+		Key:                       "book:" + opaqueKnowledgeAssemblyIdentityComponent(firstNonEmpty(book.BookID, "unknown")),
+		Basis:                     "book_fallback",
+		IndependentSourceEligible: false,
+	}
+}
+
+func opaqueKnowledgeAssemblyIdentityComponent(value string) string {
+	value = strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+	sum := sha256.Sum256([]byte(value))
+	return "sha256-" + hex.EncodeToString(sum[:8])
+}
+
+func ValidateKnowledgeReleaseAssembly(assembly KnowledgeReleaseAssembly) error {
+	if assembly.SchemaVersion != KnowledgeReleaseAssemblySchemaVersion {
+		return fmt.Errorf("schema_version must be %q", KnowledgeReleaseAssemblySchemaVersion)
+	}
+	if assembly.AlgorithmVersion != KnowledgeAssemblyAlgorithmVersion {
+		return fmt.Errorf("algorithm_version must be %q", KnowledgeAssemblyAlgorithmVersion)
+	}
+	if strings.TrimSpace(assembly.AssemblyID) == "" {
+		return fmt.Errorf("assembly_id is required")
+	}
+	if assembly.ReturnedClusters != len(assembly.Clusters) ||
+		assembly.Summary.ReleaseCount != len(assembly.ReleaseIDs) ||
+		assembly.Summary.ClusterCount < len(assembly.Clusters) ||
+		assembly.Summary.MatchedClusterCount < len(assembly.Clusters) {
+		return fmt.Errorf("assembly summary is inconsistent")
+	}
+	if assembly.Summary.MatchedClusterCount > assembly.Summary.ClusterCount {
+		return fmt.Errorf("matched_cluster_count exceeds cluster_count")
+	}
+	if assembly.ReturnedClusters > assembly.Summary.MatchedClusterCount {
+		return fmt.Errorf("returned_clusters exceeds matched_cluster_count")
+	}
+	if assembly.HasMore != (assembly.Summary.MatchedClusterCount > assembly.ReturnedClusters) {
+		return fmt.Errorf("has_more is inconsistent")
+	}
+	summaryCategoryCount := assembly.Summary.CorroboratedClusters +
+		assembly.Summary.PotentialConflictClusters +
+		assembly.Summary.SinglePublicationClusters +
+		assembly.Summary.InsufficientIdentity
+	if summaryCategoryCount != assembly.Summary.ClusterCount {
+		return fmt.Errorf("summary category counts are inconsistent")
+	}
+	for name, value := range map[string]int{
+		"release_count":                  assembly.Summary.ReleaseCount,
+		"claim_count":                    assembly.Summary.ClaimCount,
+		"cluster_count":                  assembly.Summary.ClusterCount,
+		"matched_cluster_count":          assembly.Summary.MatchedClusterCount,
+		"corroborated_clusters":          assembly.Summary.CorroboratedClusters,
+		"potential_conflict_clusters":    assembly.Summary.PotentialConflictClusters,
+		"single_publication_clusters":    assembly.Summary.SinglePublicationClusters,
+		"insufficient_identity_clusters": assembly.Summary.InsufficientIdentity,
+	} {
+		if value < 0 {
+			return fmt.Errorf("summary.%s must not be negative", name)
+		}
+	}
+	seenReleases := make(map[string]struct{}, len(assembly.ReleaseIDs))
+	for _, releaseID := range assembly.ReleaseIDs {
+		if strings.TrimSpace(releaseID) == "" {
+			return fmt.Errorf("release_ids contains an empty value")
+		}
+		if _, duplicate := seenReleases[releaseID]; duplicate {
+			return fmt.Errorf("release_ids contains duplicate %q", boundedEvidenceID(releaseID))
+		}
+		seenReleases[releaseID] = struct{}{}
+	}
+	seenClusters := make(map[string]struct{}, len(assembly.Clusters))
+	seenClaims := make(map[string]struct{})
+	visibleClaimCount := 0
+	visibleCategoryCounts := map[string]int{
+		KnowledgeAssemblyStatusPotentialConflict:    0,
+		KnowledgeAssemblyStatusCorroborated:         0,
+		KnowledgeAssemblyStatusSinglePublication:    0,
+		KnowledgeAssemblyStatusInsufficientIdentity: 0,
+	}
+	for index, cluster := range assembly.Clusters {
+		if err := requireContractFields(map[string]string{
+			"cluster_id":           cluster.ClusterID,
+			"normalized_assertion": cluster.NormalizedAssertion,
+			"status":               cluster.Status,
+		}); err != nil {
+			return fmt.Errorf("clusters[%d]: %w", index, err)
+		}
+		if _, duplicate := seenClusters[cluster.ClusterID]; duplicate {
+			return fmt.Errorf("clusters contains duplicate cluster_id %q", boundedEvidenceID(cluster.ClusterID))
+		}
+		seenClusters[cluster.ClusterID] = struct{}{}
+		expectedClusterID := knowledgeAssemblyHashID("cluster", cluster.NormalizedAssertion)
+		if cluster.ClusterID != expectedClusterID {
+			return fmt.Errorf("clusters[%d].cluster_id is inconsistent", index)
+		}
+		if utf8.RuneCountInString(cluster.NormalizedAssertion) > knowledgeAssemblyMaxStatementRunes {
+			return fmt.Errorf(
+				"clusters[%d].normalized_assertion exceeds %d characters",
+				index,
+				knowledgeAssemblyMaxStatementRunes,
+			)
+		}
+		if len(cluster.Claims) > knowledgeAssemblyMaxClaimsPerCluster {
+			return fmt.Errorf(
+				"clusters[%d].claims exceeds %d items",
+				index,
+				knowledgeAssemblyMaxClaimsPerCluster,
+			)
+		}
+		if len(cluster.PotentialConflicts) > knowledgeAssemblyMaxConflictsPerCluster {
+			return fmt.Errorf(
+				"clusters[%d].potential_conflicts exceeds %d items",
+				index,
+				knowledgeAssemblyMaxConflictsPerCluster,
+			)
+		}
+		switch cluster.Status {
+		case KnowledgeAssemblyStatusPotentialConflict,
+			KnowledgeAssemblyStatusCorroborated,
+			KnowledgeAssemblyStatusSinglePublication,
+			KnowledgeAssemblyStatusInsufficientIdentity:
+			visibleCategoryCounts[cluster.Status]++
+		default:
+			return fmt.Errorf("clusters[%d].status is invalid", index)
+		}
+		if len(cluster.Claims) == 0 {
+			return fmt.Errorf("clusters[%d].claims is required", index)
+		}
+		for claimIndex, claim := range cluster.Claims {
+			if err := requireContractFields(map[string]string{
+				"release_id":                 claim.ReleaseID,
+				"book_id":                    claim.BookID,
+				"claim_id":                   claim.ClaimID,
+				"statement":                  claim.Statement,
+				"polarity":                   claim.Polarity,
+				"publication_identity":       claim.PublicationIdentity,
+				"publication_identity_basis": claim.PublicationIdentityBasis,
+			}); err != nil {
+				return fmt.Errorf("clusters[%d].claims[%d]: %w", index, claimIndex, err)
+			}
+			if utf8.RuneCountInString(claim.Statement) > knowledgeAssemblyMaxStatementRunes {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].statement exceeds %d characters",
+					index,
+					claimIndex,
+					knowledgeAssemblyMaxStatementRunes,
+				)
+			}
+			if _, exists := seenReleases[claim.ReleaseID]; !exists {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d] has unknown release_id %q",
+					index,
+					claimIndex,
+					boundedEvidenceID(claim.ReleaseID),
+				)
+			}
+			claimKey := claim.ReleaseID + "\x00" + claim.ClaimID
+			if _, duplicate := seenClaims[claimKey]; duplicate {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d] contains duplicate claim %q",
+					index,
+					claimIndex,
+					boundedEvidenceID(claim.ClaimID),
+				)
+			}
+			seenClaims[claimKey] = struct{}{}
+			if claim.Polarity != KnowledgeAssemblyPolarityPositive &&
+				claim.Polarity != KnowledgeAssemblyPolarityNegative {
+				return fmt.Errorf("clusters[%d].claims[%d].polarity is invalid", index, claimIndex)
+			}
+			base, polarity := splitKnowledgeAssemblyClaimPolarity(
+				normalizeKnowledgeAssemblyClaim(claim.Statement),
+			)
+			if base != cluster.NormalizedAssertion {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].normalized_assertion is inconsistent",
+					index,
+					claimIndex,
+				)
+			}
+			if polarity != claim.Polarity {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].polarity is inconsistent",
+					index,
+					claimIndex,
+				)
+			}
+			if len(claim.CitationIDs) == 0 {
+				return fmt.Errorf("clusters[%d].claims[%d].citation_ids is required", index, claimIndex)
+			}
+			if len(claim.CitationIDs) > knowledgeAssemblyMaxCitationIDsPerClaim {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].citation_ids exceeds %d items",
+					index,
+					claimIndex,
+					knowledgeAssemblyMaxCitationIDsPerClaim,
+				)
+			}
+			seenCitationIDs := make(map[string]struct{}, len(claim.CitationIDs))
+			for citationIndex, citationID := range claim.CitationIDs {
+				citationID = strings.TrimSpace(citationID)
+				if citationID == "" {
+					return fmt.Errorf(
+						"clusters[%d].claims[%d].citation_ids[%d] is required",
+						index,
+						claimIndex,
+						citationIndex,
+					)
+				}
+				if _, duplicate := seenCitationIDs[citationID]; duplicate {
+					return fmt.Errorf(
+						"clusters[%d].claims[%d] contains duplicate citation_id %q",
+						index,
+						claimIndex,
+						boundedEvidenceID(citationID),
+					)
+				}
+				seenCitationIDs[citationID] = struct{}{}
+			}
+			expectedEligible, identityPrefix, validBasis := knowledgeAssemblyIdentityBasisPolicy(
+				claim.PublicationIdentityBasis,
+			)
+			if !validBasis {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].publication_identity_basis is invalid",
+					index,
+					claimIndex,
+				)
+			}
+			if claim.IndependentPublicationEligible != expectedEligible {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d] independent publication eligibility is inconsistent",
+					index,
+					claimIndex,
+				)
+			}
+			if !validOpaqueKnowledgeAssemblyPublicationIdentity(
+				claim.PublicationIdentity,
+				identityPrefix,
+			) {
+				return fmt.Errorf(
+					"clusters[%d].claims[%d].publication_identity is invalid",
+					index,
+					claimIndex,
+				)
+			}
+			visibleClaimCount++
+		}
+		derived := KnowledgeReleaseAssemblyCluster{
+			ClusterID:           cluster.ClusterID,
+			NormalizedAssertion: cluster.NormalizedAssertion,
+			Claims:              append([]KnowledgeReleaseAssemblyClaimRef(nil), cluster.Claims...),
+			PotentialConflicts:  []KnowledgeReleaseAssemblyPotentialConflict{},
+		}
+		if err := finalizeKnowledgeAssemblyCluster(&derived); err != nil {
+			return fmt.Errorf("clusters[%d]: %w", index, err)
+		}
+		if cluster.PublicationCount != derived.PublicationCount {
+			return fmt.Errorf("clusters[%d].publication_count is inconsistent", index)
+		}
+		if cluster.IndependentPublicationCount != derived.IndependentPublicationCount {
+			return fmt.Errorf("clusters[%d].independent_publication_count is inconsistent", index)
+		}
+		if cluster.Status != derived.Status {
+			return fmt.Errorf("clusters[%d].status is inconsistent", index)
+		}
+		if !knowledgeAssemblyPotentialConflictsEqual(
+			cluster.PotentialConflicts,
+			derived.PotentialConflicts,
+		) {
+			return fmt.Errorf("clusters[%d].potential_conflicts is inconsistent", index)
+		}
+	}
+	if visibleClaimCount > assembly.Summary.ClaimCount {
+		return fmt.Errorf("visible claim count exceeds summary.claim_count")
+	}
+	if len(assembly.Clusters) == assembly.Summary.ClusterCount &&
+		visibleClaimCount != assembly.Summary.ClaimCount {
+		return fmt.Errorf("summary.claim_count is inconsistent")
+	}
+	if visibleCategoryCounts[KnowledgeAssemblyStatusPotentialConflict] >
+		assembly.Summary.PotentialConflictClusters ||
+		visibleCategoryCounts[KnowledgeAssemblyStatusCorroborated] >
+			assembly.Summary.CorroboratedClusters ||
+		visibleCategoryCounts[KnowledgeAssemblyStatusSinglePublication] >
+			assembly.Summary.SinglePublicationClusters ||
+		visibleCategoryCounts[KnowledgeAssemblyStatusInsufficientIdentity] >
+			assembly.Summary.InsufficientIdentity {
+		return fmt.Errorf("visible cluster categories exceed summary category counts")
+	}
+	return nil
+}
+
+func knowledgeAssemblyIdentityBasisPolicy(basis string) (bool, string, bool) {
+	switch basis {
+	case "source_account":
+		return true, "account:", true
+	case "source_host":
+		return true, "host:", true
+	case "source_author":
+		return true, "author:", true
+	case "source_item":
+		return false, "item:", true
+	case "book_fallback":
+		return false, "book:", true
+	default:
+		return false, "", false
+	}
+}
+
+func validOpaqueKnowledgeAssemblyPublicationIdentity(value, prefix string) bool {
+	if !strings.HasPrefix(value, prefix+"sha256-") {
+		return false
+	}
+	digest := strings.TrimPrefix(value, prefix+"sha256-")
+	if len(digest) != 16 {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
+func knowledgeAssemblyPotentialConflictsEqual(
+	left []KnowledgeReleaseAssemblyPotentialConflict,
+	right []KnowledgeReleaseAssemblyPotentialConflict,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func ValidateKnowledgeReleaseAssemblyContract(raw []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, required := range []string{
+		"schema_version",
+		"algorithm_version",
+		"assembly_id",
+		"release_ids",
+		"summary",
+		"clusters",
+		"returned_clusters",
+		"has_more",
+	} {
+		if value, exists := fields[required]; !exists || len(value) == 0 || string(value) == "null" {
+			return fmt.Errorf("%s is required", required)
+		}
+	}
+	var assembly KnowledgeReleaseAssembly
+	if err := json.Unmarshal(raw, &assembly); err != nil {
+		return err
+	}
+	return ValidateKnowledgeReleaseAssembly(assembly)
+}
+
+func latestKnowledgeAssemblyReleaseRecords(
+	records []KnowledgeReleaseRecord,
+) ([]KnowledgeReleaseRecord, error) {
+	type timedReleaseRecord struct {
+		record    KnowledgeReleaseRecord
+		createdAt time.Time
+	}
+	latest := make(map[string]timedReleaseRecord)
+	for _, record := range records {
+		if err := requireContractFields(map[string]string{
+			"release_id": record.ReleaseID,
+			"book_id":    record.BookID,
+			"created_at": record.CreatedAt,
+		}); err != nil {
+			return nil, fmt.Errorf("release manifest record: %w", err)
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, record.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("release manifest record %q has invalid created_at", boundedEvidenceID(record.ReleaseID))
+		}
+		current, exists := latest[record.BookID]
+		if !exists || createdAt.After(current.createdAt) ||
+			(createdAt.Equal(current.createdAt) && record.ReleaseID > current.record.ReleaseID) {
+			latest[record.BookID] = timedReleaseRecord{
+				record:    record,
+				createdAt: createdAt,
+			}
+		}
+	}
+	result := make([]KnowledgeReleaseRecord, 0, len(latest))
+	for _, timedRecord := range latest {
+		result = append(result, timedRecord.record)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].ReleaseID < result[j].ReleaseID
+	})
+	return result, nil
+}
+
+func finalizeKnowledgeAssemblyCluster(cluster *KnowledgeReleaseAssemblyCluster) error {
+	sort.Slice(cluster.Claims, func(i, j int) bool {
+		if cluster.Claims[i].ReleaseID != cluster.Claims[j].ReleaseID {
+			return cluster.Claims[i].ReleaseID < cluster.Claims[j].ReleaseID
+		}
+		return cluster.Claims[i].ClaimID < cluster.Claims[j].ClaimID
+	})
+	publications := make(map[string]struct{})
+	independent := make(map[string]struct{})
+	positive := make([]KnowledgeReleaseAssemblyClaimRef, 0)
+	negative := make([]KnowledgeReleaseAssemblyClaimRef, 0)
+	for _, claim := range cluster.Claims {
+		publications[claim.PublicationIdentity] = struct{}{}
+		if claim.IndependentPublicationEligible {
+			independent[claim.PublicationIdentity] = struct{}{}
+		}
+		if claim.Polarity == KnowledgeAssemblyPolarityNegative {
+			negative = append(negative, claim)
+		} else {
+			positive = append(positive, claim)
+		}
+	}
+	cluster.PublicationCount = len(publications)
+	cluster.IndependentPublicationCount = len(independent)
+	for _, positiveClaim := range positive {
+		for _, negativeClaim := range negative {
+			if len(cluster.PotentialConflicts) >= knowledgeAssemblyMaxConflictsPerCluster {
+				return fmt.Errorf(
+					"cluster %q potential_conflicts exceeds %d items",
+					boundedEvidenceID(cluster.ClusterID),
+					knowledgeAssemblyMaxConflictsPerCluster,
+				)
+			}
+			seed := strings.Join([]string{
+				cluster.ClusterID,
+				positiveClaim.ReleaseID,
+				positiveClaim.ClaimID,
+				negativeClaim.ReleaseID,
+				negativeClaim.ClaimID,
+			}, "\x00")
+			cluster.PotentialConflicts = append(
+				cluster.PotentialConflicts,
+				KnowledgeReleaseAssemblyPotentialConflict{
+					ConflictID:        knowledgeAssemblyHashID("conflict", seed),
+					PositiveReleaseID: positiveClaim.ReleaseID,
+					PositiveClaimID:   positiveClaim.ClaimID,
+					NegativeReleaseID: negativeClaim.ReleaseID,
+					NegativeClaimID:   negativeClaim.ClaimID,
+					ReviewRequired:    true,
+				},
+			)
+		}
+	}
+	switch {
+	case len(cluster.PotentialConflicts) > 0:
+		cluster.Status = KnowledgeAssemblyStatusPotentialConflict
+	case cluster.IndependentPublicationCount >= 2:
+		cluster.Status = KnowledgeAssemblyStatusCorroborated
+	case cluster.IndependentPublicationCount == 1:
+		cluster.Status = KnowledgeAssemblyStatusSinglePublication
+	default:
+		cluster.Status = KnowledgeAssemblyStatusInsufficientIdentity
+	}
+	return nil
+}
+
+func normalizeKnowledgeAssemblyClaim(value string) string {
+	var builder strings.Builder
+	space := true
+	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			builder.WriteRune(r)
+			space = false
+			continue
+		}
+		if !space {
+			builder.WriteByte(' ')
+			space = true
+		}
+	}
+	return strings.Join(strings.Fields(builder.String()), " ")
+}
+
+func splitKnowledgeAssemblyClaimPolarity(normalized string) (string, string) {
+	normalized = normalizeKnowledgeAssemblyClaim(normalized)
+	englishMarkers := map[string]struct{}{"not": {}, "no": {}, "never": {}}
+	fields := strings.Fields(normalized)
+	for index, field := range fields {
+		if _, negative := englishMarkers[field]; !negative {
+			continue
+		}
+		fields = append(fields[:index], fields[index+1:]...)
+		return strings.Join(fields, " "), KnowledgeAssemblyPolarityNegative
+	}
+	for _, rewrite := range []struct {
+		marker      string
+		replacement string
+	}{
+		{marker: "不能够", replacement: "能够"},
+		{marker: "不可能", replacement: "可能"},
+		{marker: "不应该", replacement: "应该"},
+		{marker: "不支持", replacement: "支持"},
+		{marker: "不符合", replacement: "符合"},
+		{marker: "不存在", replacement: "存在"},
+		{marker: "并非"},
+		{marker: "未能", replacement: "能"},
+		{marker: "没有", replacement: "有"},
+		{marker: "无法"},
+		{marker: "不是", replacement: "是"},
+		{marker: "不能", replacement: "能"},
+		{marker: "不会", replacement: "会"},
+		{marker: "不应", replacement: "应"},
+		{marker: "不宜", replacement: "宜"},
+		{marker: "不可", replacement: "可"},
+	} {
+		if index := strings.Index(normalized, rewrite.marker); index >= 0 {
+			return normalizeKnowledgeAssemblyClaim(
+				normalized[:index] +
+					rewrite.replacement +
+					normalized[index+len(rewrite.marker):],
+			), KnowledgeAssemblyPolarityNegative
+		}
+	}
+	return normalized, KnowledgeAssemblyPolarityPositive
+}
+
+func filterKnowledgeAssemblyClusters(
+	clusters []KnowledgeReleaseAssemblyCluster,
+	query string,
+) []KnowledgeReleaseAssemblyCluster {
+	normalizedQuery := normalizeKnowledgeAssemblyClaim(query)
+	if normalizedQuery == "" {
+		return append([]KnowledgeReleaseAssemblyCluster(nil), clusters...)
+	}
+	result := make([]KnowledgeReleaseAssemblyCluster, 0)
+	for _, cluster := range clusters {
+		if strings.Contains(cluster.NormalizedAssertion, normalizedQuery) {
+			result = append(result, cluster)
+			continue
+		}
+		for _, claim := range cluster.Claims {
+			if strings.Contains(normalizeKnowledgeAssemblyClaim(claim.Statement), normalizedQuery) {
+				result = append(result, cluster)
+				break
+			}
+		}
+	}
+	return result
+}
+
+func knowledgeReleaseAssemblyID(
+	releaseIDs []string,
+	clusters []KnowledgeReleaseAssemblyCluster,
+) (string, error) {
+	seed := struct {
+		AlgorithmVersion string                            `json:"algorithm_version"`
+		ReleaseIDs       []string                          `json:"release_ids"`
+		Clusters         []KnowledgeReleaseAssemblyCluster `json:"clusters"`
+	}{
+		AlgorithmVersion: KnowledgeAssemblyAlgorithmVersion,
+		ReleaseIDs:       releaseIDs,
+		Clusters:         clusters,
+	}
+	payload, err := json.Marshal(seed)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(payload)
+	return "assembly-" + hex.EncodeToString(sum[:]), nil
+}
+
+func knowledgeAssemblyHashID(prefix, value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return prefix + "-" + hex.EncodeToString(sum[:12])
+}
+
+func uniqueSortedStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}

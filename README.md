@@ -83,11 +83,22 @@ flowchart LR
 
 ### kbase HTTP 服务
 
-本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。浏览器页面由 Nginx Basic Auth 保护；登录后 Web UI 会通过 `/browser/session-token` 自动换取同源 Bearer token 并写入浏览器本地存储。自动化客户端仍应直接使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`。
+本服务面向个人私有部署，API 路由必须配置 `KBASE_AUTH_TOKEN`。未配置 token 时，`/health` 仍可探活，但 `/api/*` 会拒绝访问。浏览器和自动化客户端使用两条独立认证链：
+
+- 浏览器只保存 30 天滑动续期的 `Secure; HttpOnly; SameSite=Strict` Cookie。Nginx 仅在 `/browser/session` 校验 Basic Auth，清除客户端 `Authorization` 后注入独立的回环代理密钥；API token 不进入响应体、HTML 或浏览器存储。
+- 自动化、Health、Proofroom 和其他机器客户端继续使用 `Authorization: Bearer <KBASE_AUTH_TOKEN>` 调用 `/api/*`，无需 Cookie、Basic 或 CSRF。
+
+Nginx 只允许 `/api/*` 和精确的 `/browser/session/migrate` 向后端保留客户端 `Authorization`。健康检查、公开元数据、静态壳与其他 fallback 路由、登录和 retired 路由都会显式清空 `Authorization`、`Proxy-Authorization` 与客户端提供的 `X-KBase-Browser-Session`；只有 Basic 验证成功的 `/browser/session` 会覆盖并注入真实回环代理密钥。
+
+旧版 Web UI 中已有的 Bearer token 只允许通过 `POST /browser/session/migrate` 迁移一次。该路由不受 Nginx Basic Auth 保护，由后端严格校验 Bearer、`Origin`、browser client ID 和 epoch；前端确认新 Cookie 会话后再删除旧 token。已退役的 `/browser/session-token` 始终返回 `410 Gone`。生产 Nginx 配置模板见 `deploy/nginx/kbase.executor.life.conf`。
 
 ```bash
 cd /opt/dedao-gui
 KBASE_AUTH_TOKEN="replace-with-long-secret" \
+KBASE_BROWSER_SESSION_SECRET="replace-with-separate-random-proxy-secret" \
+KBASE_BROWSER_SESSION_DB_PATH="${KBASE_STATE_DIR:?}/browser_sessions.sqlite3" \
+KBASE_PUBLIC_ORIGIN="https://kbase.example.invalid" \
+KBASE_SESSION_ADMIN_TOKEN="replace-with-separate-session-admin-secret" \
 KBASE_AGENT_PUBLISHER_TOKEN="replace-with-separate-publisher-secret" \
 KBASE_SOURCE_AGENT_TOKEN="replace-with-separate-agent-secret" \
 KBASE_EMBEDDING_BASE_URL="https://embedding-provider.example.invalid/v1" \
@@ -104,6 +115,167 @@ KBASE_REVERIFICATION_STALE_SECONDS="900" \
 go run ./cmd/kbase-server --addr 127.0.0.1:8719
 ```
 
+`KBASE_BROWSER_SESSION_DB_PATH` 必须指向服务账户可写的持久 SQLite 文件；`KBASE_PUBLIC_ORIGIN` 必须与浏览器看到的 HTTPS Origin 完全一致且不带路径或尾斜杠。`KBASE_BROWSER_SESSION_SECRET` 与 `KBASE_SESSION_ADMIN_TOKEN` 都使用 32-128 位 `A-Za-z0-9_-` 字符，并且必须与 API、publisher、source-agent 等所有 token 互不相同。代理密钥只在回环监听的后端与 Nginx 之间传递。部署时必须通过渲染器生成私有 location 配置，不要直接安装带占位符的模板：
+
+```bash
+sudo install -m 644 deploy/nginx/kbase.executor.life.conf \
+  /etc/nginx/conf.d/kbase.executor.life.conf
+sudo bash -c \
+  'set -a; . /etc/dedao-kbase/kbase.env; set +a; exec bash "$@"' \
+  bash deploy/nginx/render-kbase-config.sh \
+  deploy/nginx/kbase.locations.conf.template \
+  /etc/dedao-kbase/kbase.locations.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Linux 预发布环境可用真实 Nginx 和候选服务验证完整交换链：
+
+```bash
+KBASE_SERVER_BIN=/tmp/kbase-server \
+  bash deploy/nginx/browser-session-proxy-smoke.sh
+```
+
+浏览器会话管理使用独立的 admin token。优先从权限受限文件读取，不要把 token 写入命令历史：
+
+```bash
+KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
+  go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" list
+KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
+  go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" revoke "${SESSION_ID:?}"
+KBASE_SESSION_ADMIN_TOKEN_FILE="${SESSION_ADMIN_TOKEN_FILE:?}" \
+  go run ./cmd/kbase-session-admin --base-url "https://kbase.example.invalid" revoke-all --confirm
+```
+
+直接部署只替换后端二进制和 Web 静态文件，不改环境文件、会话数据库或
+Nginx 配置。需要变更这些配置时应使用独立维护窗口和独立备份，不能夹带在
+普通代码发布中。知识库产物、机器 Bearer token 和浏览器凭据不属于发布包。
+
+### KBase direct deployment
+
+KBase 使用干净 `main` revision 的直接部署流程，不生成发布签名、manifest
+或事务 journal。先在开发机固定 revision、创建 Git 归档并记录 SHA-256：
+
+```bash
+test -z "$(git -C "${KBASE_REPO_ROOT:?}" status --porcelain)"
+KBASE_REVISION="$(git -C "${KBASE_REPO_ROOT:?}" rev-parse main)"
+test "$KBASE_REVISION" = "$(git -C "${KBASE_REPO_ROOT:?}" rev-parse HEAD)"
+(
+  cd "${KBASE_REPO_ROOT:?}"
+  git archive \
+    --format=tar.gz \
+    --output="${KBASE_SOURCE_ARCHIVE:?}" \
+    "$KBASE_REVISION"
+)
+shasum -a 256 "${KBASE_SOURCE_ARCHIVE:?}"
+scp "${KBASE_SOURCE_ARCHIVE:?}" \
+  "${KBASE_DEPLOY_HOST:?}:${KBASE_REMOTE_ARCHIVE:?}"
+ssh "${KBASE_DEPLOY_HOST:?}" \
+  sha256sum "${KBASE_REMOTE_ARCHIVE:?}"
+```
+
+服务端必须把归档解压到新的私有目录，并由非 root 服务账号重复构建和测试。
+以下变量由受控部署 shell 显式传入，不要在仓库中写真实主机或凭据：
+
+```bash
+sudo install -d -m 0700 \
+  -o "${KBASE_SERVICE_USER:?}" \
+  -g "${KBASE_SERVICE_GROUP:?}" \
+  "${KBASE_REMOTE_SOURCE_DIR:?}"
+sudo tar -xzf "${KBASE_REMOTE_ARCHIVE:?}" \
+  -C "${KBASE_REMOTE_SOURCE_DIR:?}"
+sudo runuser --user "${KBASE_SERVICE_USER:?}" -- env \
+  HOME="${KBASE_SERVICE_HOME:?}" \
+  PATH="${KBASE_BUILD_PATH:?}" \
+  KBASE_REVISION="${KBASE_REVISION:?}" \
+  KBASE_REMOTE_SOURCE_DIR="${KBASE_REMOTE_SOURCE_DIR:?}" \
+  KBASE_CANDIDATE_BIN="${KBASE_CANDIDATE_BIN:?}" \
+  bash -Eeuo pipefail -c '
+    cd "$KBASE_REMOTE_SOURCE_DIR"
+    (cd frontend && npm ci && npm run build)
+    for smoke in frontend/scripts/*-smoke.mjs; do node "$smoke"; done
+    node --check frontend-web/app.js
+    for smoke in frontend-web/scripts/*smoke*.mjs; do node "$smoke"; done
+    go mod verify
+    go vet ./...
+    go test ./...
+    CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.buildRevision=${KBASE_REVISION}" \
+      -o "$KBASE_CANDIDATE_BIN" \
+      ./cmd/kbase-server
+  '
+sha256sum "${KBASE_CANDIDATE_BIN:?}"
+```
+
+生产切换前为二进制和 Web 目录创建同一批次的备份。备份和候选都验证完成
+后才安装错误 trap；替换、重启或 loopback 健康检查失败时，trap 会立即恢复
+同一批次的两个目标并以失败状态停止发布：
+
+```bash
+set -Eeuo pipefail
+test ! -e "${KBASE_BACKUP_DIR:?}"
+test ! -e "${KBASE_BINARY_CANDIDATE_TARGET:?}"
+test ! -e "${KBASE_WEB_CANDIDATE_TARGET:?}"
+test ! -e "${KBASE_WEB_PREVIOUS_TARGET:?}"
+test ! -e "${KBASE_FAILED_WEB_TARGET:?}"
+sudo install -d -o root -g root -m 0700 "${KBASE_BACKUP_DIR:?}"
+sudo install -o root -g root -m 0755 \
+  "${KBASE_BINARY_TARGET:?}" \
+  "${KBASE_BACKUP_DIR:?}/kbase-server"
+sudo cp -a \
+  "${KBASE_WEB_TARGET:?}" \
+  "${KBASE_BACKUP_DIR:?}/frontend-web"
+sudo install -o root -g root -m 0755 \
+  "${KBASE_CANDIDATE_BIN:?}" \
+  "${KBASE_BINARY_CANDIDATE_TARGET:?}"
+sudo cp -a \
+  "${KBASE_REMOTE_SOURCE_DIR:?}/frontend-web" \
+  "${KBASE_WEB_CANDIDATE_TARGET:?}"
+test -f "${KBASE_BACKUP_DIR:?}/kbase-server"
+test -d "${KBASE_BACKUP_DIR:?}/frontend-web"
+test -f "${KBASE_BINARY_CANDIDATE_TARGET:?}"
+test -d "${KBASE_WEB_CANDIDATE_TARGET:?}"
+
+rollback_direct_deployment() {
+  status=$?
+  trap - ERR
+  sudo install -o root -g root -m 0755 \
+    "${KBASE_BACKUP_DIR:?}/kbase-server" \
+    "${KBASE_BINARY_TARGET:?}"
+  if test -e "${KBASE_WEB_TARGET:?}"; then
+    sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
+  fi
+  sudo cp -a \
+    "${KBASE_BACKUP_DIR:?}/frontend-web" \
+    "${KBASE_WEB_TARGET:?}"
+  sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
+  curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
+  exit "$status"
+}
+
+trap rollback_direct_deployment ERR
+sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"
+sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_WEB_PREVIOUS_TARGET:?}"
+sudo mv "${KBASE_WEB_CANDIDATE_TARGET:?}" "${KBASE_WEB_TARGET:?}"
+sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
+curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
+trap - ERR
+```
+
+本地健康成功后，再检查公网 revision、静态路由、鉴权边界和服务日志：
+
+```bash
+curl --fail --silent --show-error "${KBASE_PUBLIC_HEALTH_URL:?}"
+sudo systemctl is-active "${KBASE_SERVICE_NAME:?}"
+sudo systemctl show "${KBASE_SERVICE_NAME:?}" \
+  -p ExecMainStatus \
+  -p NRestarts
+```
+
+该流程保留明确 revision、双端测试、SHA-256、范围化备份和检测到失败后的
+即时恢复，但不提供 artifact 身份认证、部署锁、持久事务、fsync 切换或断电
+恢复。禁止并发部署；进程被强制终止或主机在切换窗口断电时，必须从
+`KBASE_BACKUP_DIR` 手工恢复两个目标。
 `DEDAO_DOWNLOAD_ROOT` 是可选的服务端电子书下载目录。未配置时，服务优先使用 `DEDAO_KBASE_ROOT/downloads`；若只配置了 `DEDAO_BOOK_KNOWLEDGE_ROOT` 或 `KBASE_BOOK_KNOWLEDGE_ROOT`，则使用知识库根目录同级的 `downloads`。下载目录仅在服务端使用，任务 API 不返回绝对路径。
 
 Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的书架”和“全站搜索”间切换，加入书架后创建“仅下载”或“下载并入知识库”任务。扫码入口为 `/sources/dedao/login`，登录 Cookie 保留在服务端，浏览器只持有短期二维码字段和安全会话摘要。
@@ -122,6 +294,8 @@ Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的�
 - `POST /api/knowledge/releases/{release_id}/receipts`：下游导入后的幂等 delivery receipt。
 - `GET /api/knowledge/lineage/{object_id}`：查询 release 或 book 的来源、hash、artifact refs 和 citation IDs。
 - `GET /api/knowledge/impact`、`GET /api/knowledge/gaps`：查看导入回执、pipeline 阶段和隐私安全 gap 聚合。
+- `POST /api/agent-packages/compile`：使用普通已登录 Bearer 会话，从不可变 Release 只读生成 `dual`、`evidence` 或 `study` 候选包；不保存、不评测、不发布。
+- `GET /api/knowledge/releases?latest=true`：按书返回最新 Release，并按发布时间倒序分页，供 Agent Compiler 选择器使用。
 - `POST /api/agent-packages/evaluate`：使用独立 publisher token 执行并保存不可变的黄金集评估；`vector`/`hybrid` 包要求显式配置获授权的语义嵌入服务。
 - `POST /api/agent-packages/publish`：仅接受独立的 `KBASE_AGENT_PUBLISHER_TOKEN`；普通 API/consumer token 不能发布 Agent Package。
 
@@ -131,13 +305,15 @@ Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的�
 
 ### 微信/WC Plus 来源工作台
 
-在线 Web UI 新增 `/wechat-source` 和 `/wcplus-source`。`/wcplus-source` 是来源控制面，可查看本地 Agent 心跳、WC Plus 健康状态、订阅和同步运行；旧的直连代理工具收在“本地 API 诊断”中。浏览器不会直接访问本机 WC Plus 端口。
+在线 Web UI 的统一入口是 `/sources/agents`：总览按在线、需处理、离线、暂停和升级中分组，展示两个独立 Worker 的版本、协议、能力健康、心跳、当前运行/命令以及 outbox/dead-letter 计数。`/sources/agents/{agent_id}` 提供稳定详情页和命令时间线，并分别深链到 `/wechat-source` 与 `/wcplus-source`。旧的直连代理工具收在“本地 API 诊断”中；浏览器不会直接访问本机 WC Plus 端口。
 
 桌面版 `/wcplus-source` 默认也使用同源 `/api/*`。如果 Wails 桌面壳没有和 kbase HTTP 服务同源运行，在页面顶部的 `KBase API Base URL` 填入 kbase 地址，例如 `http://127.0.0.1:8719`，并确保本机已写入 `KBASE_AUTH_TOKEN` 对应的 Bearer token。kbase 只允许 Wails/localhost/127.0.0.1 这类桌面来源跨域调用 `/api/*`，不会对任意网页开放 CORS。
 
 推荐使用“本地 Agent + 在线 KBase 控制面”：`wcplus-agent` 只访问本机 loopback WC Plus API，并通过出站 HTTPS 租用同步任务、上传文章和回报计数。不要把 WC Plus 的 loopback API 通过公网隧道暴露，也不要把微信 cookie 或 WC Plus 请求参数上传到 KBase。
 
-在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`，并使用另一个独立的 `KBASE_AGENT_PUBLISHER_TOKEN` 保护 Agent Package 发布。三个 token 必须彼此不同，并使用不含空格的可打印 ASCII 字符。Proofroom、Health 等只读消费者只能获得 `KBASE_AUTH_TOKEN`，不能获得发布 token。
+在线服务使用独立的 `KBASE_SOURCE_AGENT_TOKEN` 保护 `/api/source-agent/*`，并使用另一个独立的 `KBASE_AGENT_PUBLISHER_TOKEN` 保护 Agent Package 发布。三个 token 必须彼此不同，并使用不含空格的可打印 ASCII 字符。Proofroom、Health 等只读消费者只能获得 `KBASE_AUTH_TOKEN`，不能获得发布 token。两个 Worker 继续共享 source-agent token，因此 `agent_id` 只是运行标识而不是独立安全身份；任一 Worker 泄露都必须轮换服务端和全部 Worker 的共享 token。
+
+第一版仅交付 macOS 用户级 LaunchAgent；Windows/Linux 目前只有协议预留，不应标记为已支持。微信与 WC Plus Worker、updater、状态、日志和 outbox 相互独立。本机密钥由安装器写入 macOS Keychain，不写进 plist、配置文件、命令行或日志。来源任务默认为人工触发，禁止定时、静默、批量或广播升级。
 
 本机 Agent 配置契约：
 
@@ -170,6 +346,10 @@ bash scripts/uninstall-wcplus-agent-macos.sh --delete-state --delete-logs
 ```
 
 使用删除参数时，状态和日志目录必须通过对应环境变量提供绝对路径；这是防止从错误工作目录删除相对路径的保护措施。
+
+受限升级只允许管理员在已登录的浏览器会话中，从服务端私有 catalog 选择与 Worker 类型、macOS 架构、当前版本和协议兼容且 `allowed_for_rollout=true` 的产物。catalog 根通过 `KBASE_SOURCE_AGENT_ARTIFACT_ROOT` 配置；每个条目必须绑定精确 revision、byte size、SHA-256 和已通过的 build gate。promotion 复制已经验证的同一字节，不重新构建。updater 不能接收 URL、路径、shell、脚本、环境变量或 LaunchAgent label；替换后若 ready receipt 或认证心跳失败，会从本机备份自动回滚。这里不使用外部 artifact 签名，因此 SHA-256 只证明字节一致性，不能把升级扩展成无人值守机制。
+
+WC Plus 的首版验收是分层的：夹具同步、恢复和升级链路必须通过；合法的生产依赖不可用时，Worker 必须报告 `vendor_blocked`、不领取任务且不能声称成功。这种诚实阻断是预期状态，不得通过绕过授权或平台安全来消除。
 
 Agent 优先读取 `WCPLUSPRO_BASE_URL`，也兼容 `WCPLUS_BASE_URL`。WC Plus 9.483 实测使用 `http://127.0.0.1:5002`，旧版和旧文档可能使用 `5001`；请以 WC Plus 当前界面或启动日志显示的端口为准。两者都未设置时，Agent 为兼容旧版仍回退到 `http://127.0.0.1:5001`。出于安全边界，Agent 会拒绝非 loopback WC Plus 地址。
 

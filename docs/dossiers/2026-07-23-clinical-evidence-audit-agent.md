@@ -1,0 +1,245 @@
+# Clinical Evidence Audit Agent Delivery Dossier
+
+## Status
+
+Implementation in progress on 2026-07-23.
+
+## Requirement
+
+Upgrade `book-agent-clinical-trials-truth` from a generic search/chat package
+into a clinical-trial evidence audit product. The Agent must treat the book as
+the primary thesis, compare its claims with pinned Dedao and WeChat knowledge
+releases, produce a structured and cited audit, and prepare a bounded
+Proofroom review task.
+
+## Approved Scope
+
+- Preserve versions `1.0.0` and `1.1.0` as immutable historical artifacts.
+- Publish the incompatible workflow and report contract as `2.0.0`.
+- Use KBase multi-source Releases; do not fetch mutable global content during
+  an audit.
+- Make structured evidence audit the primary product task and keep grounded
+  chat secondary.
+- Exclude diagnosis, treatment advice, write tools, and direct Health
+  consumption from this release.
+
+## Gate Decisions
+
+### G1 - Admission
+
+PASS. The current Agent is technically callable but does not yet satisfy the
+product goal of turning a book into a complete vertical evidence product. Its
+generic search/chat UI cannot express claim-level verdicts, conflict, evidence
+independence, or Proofroom review work.
+
+### G2 - Feasibility And Risk
+
+PASS with controls.
+
+- Existing immutable Knowledge Releases, Agent Packages, MCP tools, evaluation
+  reports, and Agent Traces provide the required foundation.
+- Multi-source runtime access remains restricted to Releases pinned at Package
+  publication.
+- The primary book cannot count as independent corroboration.
+- Evidence-backed verdicts fail closed when citations do not resolve.
+- Health remains isolated until a separate evidence-only medical review Gate.
+- Real source bodies, credentials, and private evaluation inputs stay outside
+  Git.
+
+### G3 - Tests
+
+PASS on 2026-07-24.
+
+- `go test ./... -count=1`
+- `go test -race ./backend/app ./cmd/kbase-server -count=1`
+- `go vet ./...`
+- `go mod verify`
+- `npm --prefix frontend run build`
+- every `frontend-web/scripts/*.mjs` smoke check
+- generated system-map drift check, privacy smoke, and `git diff --check`
+- Playwright at 1440x900 and 390x844, including REST route stability,
+  poll cancellation, responsive overflow, Proofroom modal close/Escape, and
+  focus restoration
+
+The production frontend build still reports the existing Vite large-chunk and
+dependency `eval` warnings. They are recorded as follow-up performance/security
+debt; the build exits successfully and this feature does not add either
+warning. The macOS race build also emits the existing linker
+`LC_DYSYMTAB` warning without a race report or test failure.
+
+### G4 - Review
+
+PASS on 2026-07-24.
+
+- The evidence-audit workspace, route isolation, publication identity, citation
+  inspection, Proofroom focus handling, and responsive layout were reviewed
+  independently after the final fixes.
+- The evaluation contracts, server-held gold binding, positive/conflict/
+  insufficiency coverage, legacy-v2 migration, and publish gate were reviewed
+  independently. No release blocker remains.
+
+### G5 - Deployment Health
+
+Pending implementation.
+
+### G6 - Online Verification
+
+Pending implementation and private production evaluation.
+
+## Design And Plan
+
+- `docs/plans/2026-07-23-clinical-evidence-audit-agent-design.md`
+- `docs/plans/2026-07-23-clinical-evidence-audit-agent.md`
+
+## Implementation Checkpoint
+
+### Task 1 - Agent Package v2 Evidence Policy
+
+Completed and independently reviewed. The immutable Package contract pins the
+primary and supporting Releases, verdict policy, freshness, evidence limits,
+and report schema.
+
+### Task 2 - Immutable Evidence Audit Store
+
+Completed and independently reviewed. Inputs and reports are
+content-addressed, terminal reports are immutable, cross-process writes are
+locked, and crash recovery uses bounded journals and last-known-good manifests.
+
+### Task 3 - Multi-source Evidence Audit Runner
+
+Completed and independently reviewed. The runner enforces Package-scoped
+retrieval, citation resolution, source independence, freshness, verdict and
+cost policy, deterministic medical abstention, model checkpoints, and durable
+Audit/Trace terminal coordination.
+
+### Task 4 - Durable Coordinator And HTTP API
+
+Completed, hardened, and verified.
+
+- The coordinator uses the persistent Audit store as the queue of record.
+  In-memory queues carry Audit IDs only; a worker atomically claims the
+  cross-process lease immediately before execution and starts heartbeats at
+  once. Competing instances may observe and enqueue the same durable task, but
+  non-owners emit a structured skip and never execute it. This prevents queued
+  work from holding an expiring lease or starving behind a long-running Audit.
+  Expired leases can still be claimed after a crashed worker, while a busy
+  execution lock never fails another owner's Audit.
+- Recovery scans use a bounded cursor page instead of reading all Audit
+  records each second. The cursor advances only through work successfully
+  processed by the local queue, so queue pressure cannot skip or starve later
+  records. Scan, claim, renew, release, and execution failures use bounded
+  exponential backoff with injectable jitter and structured metric/log events.
+- Authenticated asynchronous create, list, detail, and explicit manual retry
+  endpoints expose the workflow without automatically retrying failed Audits.
+- Every Audit API failure, including authentication, method errors, missing
+  Packages, and storage failures, returns a stable `{code,error}` response.
+  Full internal diagnostics go only to the injected server logger after
+  case-insensitive redaction of bearer/basic credentials, API keys, secrets,
+  passwords, sessions, CSRF values, and access/refresh tokens in JSON, query,
+  and header forms.
+- Retry authorization is derived from the authenticated actor and signed with
+  a server-side HMAC key. Bearer credentials and signing keys are not persisted.
+- Missing TokenPlan configuration leaves the service online but makes Audit
+  creation return a diagnostic service-unavailable response.
+- The HTTP server has fail-closed environment parsing and safe defaults for
+  header, read, write, and idle timeouts plus maximum header size.
+- Focused and race-enabled coordinator/API tests pass without data races.
+- The complete backend and server command suites, `go vet`, privacy and system
+  map smoke checks, diff checks, and Linux, Windows, and macOS compile checks
+  pass.
+
+### Task 5 - Proofroom Projection And Explicit Delivery
+
+Completed, hardened, and verified.
+
+- A versioned, bounded Proofroom projection is derived only from completed,
+  validated Audit reports. Raw source claims are replaced with stable
+  identities; evidence contains only KBase Release/claim/chunk/citation IDs.
+  All remaining free text is bounded, redacted for secrets and patient
+  identifiers, and carries an original hash plus redaction marker. The complete
+  Proofroom title and review-item contract is retained.
+- Preview uses a non-coordinating snapshot loader. It returns the deterministic
+  payload hash and a readable summary without mutating Audit state, writing
+  receipts, or contacting Proofroom.
+- Delivery is an authenticated, idempotent POST operation. Endpoint and token
+  are read only from server environment configuration; no request can override
+  them.
+- Receipts are immutable, content-addressed, `0600` files. Delivery states use
+  private, last-known-good backup recovery and bind the normalized scheme,
+  host, effective port, and path hash. Opaque global idempotency identities,
+  cross-process locking, bounded responses, and an explicit unknown-outcome
+  coordination state prevent automatic duplicate delivery. Operators can clear
+  only a confirmed non-delivery using the same endpoint, dedicated resolution
+  header, and original idempotency key.
+- Global unknown-outcome lookup treats the primary state and its `.bak`
+  last-known-good copy as one durable record. Missing or corrupt primaries are
+  recovered before a new idempotency key is considered, so every interrupted
+  publish phase remains blocked until an explicit same-endpoint coordination.
+- Every outbound free-text field carries an original identity hash and an
+  explicit redaction marker when modified. Credential forms, English and
+  Chinese patient identifiers, phone numbers, national IDs, and email
+  addresses are removed before projection. A residual high-risk detector fails
+  closed with the stable `privacy_blocked` response; blocked previews and
+  deliveries never contact Proofroom.
+- The endpoint-less coordination helper was removed. All coordination paths
+  now require and validate the same normalized HTTPS endpoint identity used by
+  the original delivery.
+- Only explicit accepted/delivered/succeeded business outcomes create receipts.
+  Transport errors, 408, 429, 5xx, invalid/truncated responses, and unknown
+  business states fail closed as `outcome_unknown`.
+- Production URL policy requires HTTPS, disallows userinfo/fragments, blocks
+  loopback/private IPs during validation and dialing, and disables redirects by
+  default. Local endpoints exist only behind the explicit test hook.
+- Proofroom receives KBase findings as review input and retains final
+  adjudication authority.
+- Focused and full race-enabled tests pass without data races. Complete backend
+  and server command suites, `go vet`, privacy and system-map smoke checks,
+  diff checks, and Linux, Windows, and macOS amd64/arm64 compile checks pass.
+
+### Task 6 - Evidence Audit Product Workspace
+
+Completed and independently reviewed.
+
+- Agent Package v2 opens a dedicated claim-level evidence audit workspace
+  instead of treating generic chat as the primary workflow.
+- Completed audits render verdicts, confidence, independent publication
+  evidence, freshness, conflicts, limitations, gaps, review actions, Trace
+  stages, token/cost use, and an explicit Proofroom preview.
+- Citation inspection exposes only bounded citation metadata and stable
+  Release/claim/chunk/citation identities. It does not return private source
+  paths, source bodies, prompts, cookies, or bearer tokens.
+- Audit, Package, and book-detail requests use route-scoped sequence guards so
+  late responses cannot overwrite the currently selected resource.
+- Proofroom is a real modal with background inertness, focus trapping, Escape
+  handling, scroll lock, and focus restoration to the rerendered preview
+  trigger.
+- Browser checks cover 1440x900 and 390x844 layouts, poll cancellation, stable
+  REST URLs, bearer-header-only authentication, desktop/mobile overflow, and
+  Proofroom focus restoration.
+
+### Task 7 - Trusted Evidence Audit Evaluation
+
+Completed and independently reviewed.
+
+- Six v2-only metrics now read completed Audits, immutable Agent Traces, pinned
+  Knowledge Releases, stored claims/citations, and the exact Proofroom
+  projection from the server store. Caller-supplied embedded audit results are
+  rejected.
+- Evaluation gold is installed through an administrator-only endpoint and
+  stored as an immutable `0600` trusted template bound to Package content hash
+  and suite version. Publisher credentials can bind only runtime `audit_id`
+  values and cannot change case behavior, expected claims, verdicts, or
+  conflict labels.
+- The trusted template hash is persisted in the evaluation report and
+  recomputed by the publication gate.
+- A passing v2 suite must cover a non-insufficient adjudication, a real
+  conflict, and safe insufficiency using three distinct audit runs. An
+  all-insufficient Agent cannot pass source-independence or the trusted-suite
+  coverage gate.
+- Existing pre-trust v2 evaluations have a bounded migration path: only an old
+  report without a trusted hash, an administrator-installed matching template,
+  and an exact stored-suite match may trigger server-side re-evaluation and
+  atomic report replacement. Trusted reports remain immutable.
+- JSON Schema and Go validation now agree for queued, running, failed, and
+  completed states. Explicit empty `claim_audits` arrays are legal only for
+  non-completed states; completed reports still require at least one claim.

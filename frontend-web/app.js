@@ -7,12 +7,51 @@ const tokenKeys = [
   "KBASE_AUTH_TOKEN",
 ];
 
+const browserClientIDKey = "kbase.browser-client-id";
+const browserClientIDHeader = "X-KBase-Browser-Client-ID";
+const browserEpochHeader = "X-KBase-Browser-Epoch";
+
+const browserSessionState = {
+  ready: false,
+  session: null,
+  csrfToken: "",
+  csrfExpiresAt: "",
+  clientID: "",
+  epoch: null,
+  loginPromise: null,
+  statusPromise: null,
+  familyPromise: null,
+  recoveryPromise: null,
+  migrationAttempted: false,
+  generation: 0,
+  invalidationGeneration: 0,
+  invalidationReason: "",
+  logoutGeneration: 0,
+  logoutPending: false,
+  operationControllers: new Set(),
+};
+
+const sessionSettingsState = {
+  status: "loading",
+  session: null,
+  message: "正在读取当前会话…",
+  sequence: 0,
+};
+
+const browserSessionSignalKey = "kbase.browser-session.signal";
+let browserSessionChannel = null;
+const browserSessionSeenSignalNonces = new Set();
+const browserSessionSeenSignalNonceLimit = 128;
+const browserSessionSignalListeners = new Set();
+const guardedBrowserResponses = new WeakMap();
+
 const ROUTES = Object.freeze({
   dedaoHome: "/sources/dedao/home",
   dedaoLogin: "/sources/dedao/login",
   dedaoCourses: "/sources/dedao/courses",
   dedaoEbooks: "/sources/dedao/ebooks",
   dedaoAudio: "/sources/dedao/audio",
+  sourceAgents: "/sources/agents",
   bookReader: "/read/books",
   knowledgePackages: "/knowledge/packages",
   agentPackages: "/agent-packages",
@@ -21,6 +60,7 @@ const ROUTES = Object.freeze({
   healthReleases: "/delivery/health/releases",
   operations: "/operations",
   jobs: "/jobs",
+  sessionSettings: "/settings/session",
 });
 
 const legacyRouteAliases = Object.freeze({
@@ -181,6 +221,27 @@ const sourceControlState = {
   },
 };
 
+const sourceAgentManagementState = {
+  agents: [],
+  artifacts: [],
+  commandsByAgent: {},
+  loading: "",
+  message: "",
+  pendingAgentID: "",
+};
+
+const sourceAgentDetailState = {
+  agentID: "",
+  agent: null,
+  subscriptions: [],
+  runs: [],
+  runDetails: {},
+  commands: [],
+  loading: "",
+  message: "",
+  notFound: false,
+};
+
 const knowledgeState = {
   books: [],
   selectedBook: null,
@@ -215,6 +276,10 @@ const knowledgeState = {
   pipelineAutomation: null,
   pipelineAutomationLoading: "",
   pipelineAutomationError: "",
+  agentPackages: [],
+  agentPackagesLoading: "",
+  agentPackagesError: "",
+  directoryCollapsed: false,
   loading: "",
   message: "",
 };
@@ -230,6 +295,36 @@ const bookAgentState = {
   answer: null,
   loading: "",
   message: "",
+};
+
+const agentCompilerState = {
+  mode: "dual",
+  releases: [],
+  primaryReleaseID: "",
+  supportingReleaseIDs: [],
+  version: "1.0.0",
+  result: null,
+  loading: "",
+  error: "",
+};
+
+const evidenceAuditState = {
+  audits: [],
+  audit: null,
+  routeAuditID: "",
+  subject: "",
+  scope: "",
+  selectedClaims: [],
+  loading: "",
+  error: "",
+  proofroomPreview: null,
+  proofroomStatus: "",
+  proofroomError: "",
+  deliveryReceipt: null,
+  proofroomDeliveryKey: "",
+  createIdempotencyKey: "",
+  createRequestFingerprint: "",
+  retryIdempotencyKey: "",
 };
 
 const knowledgeOperationsState = {
@@ -271,24 +366,23 @@ function knowledgeReviewReasonLabel(reason) {
 let isWCPlusBootstrapped = false;
 let sourceControlPollTimer = null;
 let sourceControlLoadSequence = 0;
+let sourceAgentManagementPollTimer = null;
+let sourceAgentManagementSequence = 0;
+let sourceAgentDetailSequence = 0;
 let knowledgeReviewPollTimer = null;
 let knowledgeReviewLoadSequence = 0;
-
-function getToken() {
-  for (const key of tokenKeys) {
-    const value = window.localStorage.getItem(key);
-    const clean = String(value || "").trim();
-    if (!clean) {
-      continue;
-    }
-    if (isSafeBearerToken(clean)) {
-      return clean;
-    }
-    console.warn("skip invalid kbase token", key);
-    window.localStorage.removeItem(key);
-  }
-  return "";
-}
+let knowledgeAgentLoadSequence = 0;
+let evidenceAuditPollTimer = null;
+let evidenceAuditLoadSequence = 0;
+let evidenceAuditWorkspaceSequence = 0;
+let bookAgentLoadSequence = 0;
+let agentCompilerRequestSequence = 0;
+let proofroomOperationSequence = 0;
+let bookKnowledgeLoadSequence = 0;
+let bookKnowledgeDetailSequence = 0;
+let proofroomPreviousFocus = null;
+let proofroomKeydownHandler = null;
+let proofroomReturnFocusSelector = "";
 
 function isSafeBearerToken(token) {
   const clean = String(token || "").trim();
@@ -298,74 +392,755 @@ function isSafeBearerToken(token) {
   return /^[\x21-\x7e]+$/.test(clean);
 }
 
-function clearStoredToken() {
-  for (const key of tokenKeys) {
-    window.localStorage.removeItem(key);
-  }
-}
-
-function storeToken(token) {
-  const clean = String(token || "").trim();
-  if (!isSafeBearerToken(clean)) {
-    clearStoredToken();
-    return "";
-  }
-  for (const key of tokenKeys) {
-    window.localStorage.setItem(key, clean);
-  }
-  return clean;
-}
-
-function setAuthorizationHeader(headers, token) {
-  const clean = String(token || "").trim();
-  if (!isSafeBearerToken(clean)) {
-    if (clean) {
-      clearStoredToken();
-      console.warn("skip invalid kbase token", "authorization");
+function browserTokenStores() {
+  const stores = [];
+  for (const property of ["localStorage", "sessionStorage"]) {
+    try {
+      const storage = window[property];
+      if (storage) {
+        stores.push(storage);
+      }
+    } catch {
+      // Storage property access itself may be blocked by browser privacy policy.
     }
-    return false;
   }
-  headers.set("Authorization", `Bearer ${clean}`);
-  return true;
+  return stores;
 }
 
-async function refreshBrowserSessionToken() {
-  const response = await fetch("/browser/session-token", {
-    headers: {
-      Accept: "application/json",
+function clearLegacyBrowserTokens() {
+  for (const storage of browserTokenStores()) {
+    for (const key of tokenKeys) {
+      try {
+        storage.removeItem(key);
+      } catch {
+        // Storage may be unavailable in privacy-restricted browser contexts.
+      }
+    }
+  }
+}
+
+function findLegacyBrowserToken() {
+  let legacyToken = "";
+  for (const storage of browserTokenStores()) {
+    for (const key of tokenKeys) {
+      let value = "";
+      try {
+        value = String(storage.getItem(key) || "").trim();
+      } catch {
+        value = "";
+      }
+      if (!legacyToken && isSafeBearerToken(value)) {
+        legacyToken = value;
+      }
+    }
+  }
+  return legacyToken;
+}
+
+function isValidBrowserClientID(value) {
+  return (
+    typeof value === "string" &&
+    value.length >= 16 &&
+    value.length <= 128 &&
+    /^[A-Za-z0-9_-]+$/.test(value)
+  );
+}
+
+function generateBrowserClientID() {
+  if (!globalThis.crypto || typeof globalThis.crypto.getRandomValues !== "function") {
+    const error = new Error("secure browser identity is unavailable");
+    error.status = 503;
+    throw error;
+  }
+  const bytes = new Uint8Array(24);
+  globalThis.crypto.getRandomValues(bytes);
+  return `client_${Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function persistBrowserClientID(clientID) {
+  if (!isValidBrowserClientID(clientID)) {
+    const error = new Error("invalid browser client id");
+    error.status = 503;
+    throw error;
+  }
+  try {
+    window.localStorage?.setItem(browserClientIDKey, clientID);
+  } catch {
+    // The in-memory identity still works when persistent storage is unavailable.
+  }
+  browserSessionState.clientID = clientID;
+  return clientID;
+}
+
+function getBrowserClientID() {
+  if (isValidBrowserClientID(browserSessionState.clientID)) {
+    return browserSessionState.clientID;
+  }
+  let stored = "";
+  try {
+    stored = String(window.localStorage?.getItem(browserClientIDKey) || "");
+  } catch {
+    stored = "";
+  }
+  return persistBrowserClientID(
+    isValidBrowserClientID(stored) ? stored : generateBrowserClientID(),
+  );
+}
+
+function parseBrowserEpoch(value) {
+  const epoch = typeof value === "number" ? value : Number(value);
+  if (!Number.isSafeInteger(epoch) || epoch <= 0 || String(epoch) !== String(value)) {
+    const error = new Error("invalid browser session epoch");
+    error.status = 503;
+    throw error;
+  }
+  return epoch;
+}
+
+function calibrateBrowserClientMetadata(payload) {
+  const clientID = String(payload?.client_id || "");
+  if (!isValidBrowserClientID(clientID)) {
+    const error = new Error("invalid browser client metadata");
+    error.status = 503;
+    throw error;
+  }
+  const epoch = parseBrowserEpoch(payload?.epoch);
+  persistBrowserClientID(clientID);
+  browserSessionState.epoch = epoch;
+  return { clientID, epoch };
+}
+
+function abortBrowserSessionOperations() {
+  for (const controller of browserSessionState.operationControllers) {
+    try {
+      controller.abort();
+    } catch {
+      // Generation checks still fence runtimes without abortable fetch.
+    }
+  }
+  browserSessionState.operationControllers.clear();
+}
+
+function resetBrowserSessionMemory(reason = "reset", logoutPending = false) {
+  abortBrowserSessionOperations();
+  browserSessionState.ready = false;
+  browserSessionState.session = null;
+  browserSessionState.csrfToken = "";
+  browserSessionState.csrfExpiresAt = "";
+  browserSessionState.epoch = null;
+  browserSessionState.loginPromise = null;
+  browserSessionState.statusPromise = null;
+  browserSessionState.familyPromise = null;
+  browserSessionState.recoveryPromise = null;
+  browserSessionState.generation += 1;
+  browserSessionState.invalidationGeneration += 1;
+  browserSessionState.invalidationReason = reason;
+  browserSessionState.logoutPending = logoutPending;
+  if (reason === "logout-start" || reason === "logout") {
+    browserSessionState.logoutGeneration = browserSessionState.invalidationGeneration;
+  }
+}
+
+function browserSessionStaleError() {
+  const error = new Error("browser session state changed");
+  error.code = "browser_session_stale";
+  return error;
+}
+
+function assertBrowserSessionGeneration(expectedGeneration) {
+  if (browserSessionState.generation === expectedGeneration) {
+    return;
+  }
+  throw browserSessionStaleError();
+}
+
+function browserSessionOperationController(externalSignal = null) {
+  if (typeof AbortController !== "function") {
+    return { signal: undefined, abort() {}, release() {} };
+  }
+  const controller = new AbortController();
+  let released = false;
+  const abortFromExternal = () => controller.abort();
+  if (externalSignal?.aborted) {
+    controller.abort();
+  } else {
+    externalSignal?.addEventListener?.("abort", abortFromExternal, { once: true });
+  }
+  const operation = {
+    signal: controller.signal,
+    abort() {
+      controller.abort();
+      operation.release();
     },
-    credentials: "same-origin",
-    cache: "no-store",
-  });
+    release() {
+      if (released) {
+        return;
+      }
+      released = true;
+      externalSignal?.removeEventListener?.("abort", abortFromExternal);
+      browserSessionState.operationControllers.delete(operation);
+    },
+  };
+  browserSessionState.operationControllers.add(operation);
+  return operation;
+}
+
+function browserSessionSignal(type) {
+  const message = {
+    type,
+    at: Date.now(),
+    nonce: Math.random().toString(36).slice(2),
+  };
+  try {
+    browserSessionChannel?.postMessage(message);
+  } catch {
+    // Other tabs will still receive the storage hint when available.
+  }
+  try {
+    window.localStorage?.setItem(browserSessionSignalKey, JSON.stringify(message));
+    window.localStorage?.removeItem(browserSessionSignalKey);
+  } catch {
+    // Cross-tab synchronization is best effort and carries no credentials.
+  }
+}
+
+function applyBrowserSessionSignal(message) {
+  if (
+    !message ||
+    !["login", "logout-start", "logout"].includes(message.type)
+  ) {
+    return;
+  }
+  const nonce = typeof message.nonce === "string" ? message.nonce : "";
+  if (nonce && nonce.length <= 256) {
+    if (browserSessionSeenSignalNonces.has(nonce)) {
+      return;
+    }
+    browserSessionSeenSignalNonces.add(nonce);
+    if (browserSessionSeenSignalNonces.size > browserSessionSeenSignalNonceLimit) {
+      const oldestNonce = browserSessionSeenSignalNonces.values().next().value;
+      browserSessionSeenSignalNonces.delete(oldestNonce);
+    }
+  }
+  resetBrowserSessionMemory(message.type, message.type === "logout-start");
+  for (const listener of browserSessionSignalListeners) {
+    listener(message.type);
+  }
+}
+
+if (typeof window.BroadcastChannel === "function") {
+  try {
+    browserSessionChannel = new window.BroadcastChannel("kbase-browser-session");
+    browserSessionChannel.onmessage = (event) => applyBrowserSessionSignal(event?.data);
+  } catch {
+    browserSessionChannel = null;
+  }
+}
+
+window.addEventListener?.("storage", (event) => {
+  if (event?.key !== browserSessionSignalKey || !event.newValue) {
+    return;
+  }
+  try {
+    applyBrowserSessionSignal(JSON.parse(event.newValue));
+  } catch {
+    // Ignore malformed cross-tab hints.
+  }
+});
+
+async function readBrowserResponse(response) {
   const text = await response.text();
   let payload = null;
   if (text) {
     try {
       payload = JSON.parse(text);
     } catch {
-      payload = null;
+      payload = text;
     }
   }
-  if (!response.ok) {
-    const message = payload && typeof payload === "object"
-      ? (payload.error || payload.message || JSON.stringify(payload))
-      : (text || `HTTP ${response.status}`);
-    throw new Error(message);
-  }
-  return storeToken(payload?.token || "");
+  return { text, payload };
 }
 
-async function ensureBrowserSessionToken() {
-  const existing = getToken();
-  if (existing) {
-    return existing;
+function browserResponseError(response, result) {
+  const message = typeof result.payload === "object" && result.payload
+    ? (result.payload.error || result.payload.message || JSON.stringify(result.payload))
+    : (result.payload || result.text || `HTTP ${response.status}`);
+  const error = new Error(message);
+  error.status = response.status;
+  error.payload = result.payload;
+  return error;
+}
+
+function handleBrowserEpochConflict(response, result) {
+  const error = browserResponseError(response, result);
+  resetBrowserSessionMemory("logout", false);
+  browserSessionSignal("logout");
+  throw error;
+}
+
+async function loadBrowserClientEpoch(expectedGeneration) {
+  if (browserSessionState.familyPromise) {
+    return browserSessionState.familyPromise;
+  }
+  const clientID = getBrowserClientID();
+  const operation = browserSessionOperationController();
+  const familyPromise = (async () => {
+    try {
+      const headers = new Headers({ Accept: "application/json" });
+      headers.set(browserClientIDHeader, clientID);
+      const response = await fetch("/browser/session", {
+        method: "GET",
+        headers,
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: operation.signal,
+      });
+      const result = await readBrowserResponse(response);
+      assertBrowserSessionGeneration(expectedGeneration);
+      if (!response.ok) {
+        throw browserResponseError(response, result);
+      }
+      return calibrateBrowserClientMetadata(result.payload);
+    } finally {
+      operation.release();
+    }
+  })();
+  browserSessionState.familyPromise = familyPromise;
+  try {
+    return await familyPromise;
+  } finally {
+    if (browserSessionState.familyPromise === familyPromise) {
+      browserSessionState.familyPromise = null;
+    }
+  }
+}
+
+function browserClientRequestHeaders(snapshot) {
+  const headers = new Headers({ Accept: "application/json" });
+  headers.set(browserClientIDHeader, snapshot.clientID);
+  headers.set(browserEpochHeader, String(snapshot.epoch));
+  return headers;
+}
+
+async function migrateLegacyBrowserSession(snapshot, expectedGeneration) {
+  if (browserSessionState.migrationAttempted) {
+    return "absent";
+  }
+  browserSessionState.migrationAttempted = true;
+  const legacyToken = findLegacyBrowserToken();
+  if (!legacyToken) {
+    return "absent";
+  }
+  const headers = browserClientRequestHeaders(snapshot);
+  headers.set("Authorization", `Bearer ${legacyToken}`);
+  const operation = browserSessionOperationController();
+  try {
+    const response = await fetch("/browser/session/migrate", {
+      method: "POST",
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: operation.signal,
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(expectedGeneration);
+    if (response.ok) {
+      return "migrated";
+    }
+    if (response.status === 401) {
+      clearLegacyBrowserTokens();
+      return "unauthorized";
+    }
+    if (response.status === 409) {
+      handleBrowserEpochConflict(response, result);
+    }
+    throw browserResponseError(response, result);
+  } finally {
+    operation.release();
+  }
+}
+
+async function requestBrowserSessionLogin(snapshot, expectedGeneration) {
+  const operation = browserSessionOperationController();
+  try {
+    const response = await fetch("/browser/session", {
+      method: "POST",
+      headers: browserClientRequestHeaders(snapshot),
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: operation.signal,
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(expectedGeneration);
+    if (response.status === 409) {
+      handleBrowserEpochConflict(response, result);
+    }
+    if (!response.ok) {
+      throw browserResponseError(response, result);
+    }
+    return result.payload;
+  } finally {
+    operation.release();
+  }
+}
+
+async function loadBrowserSession(expectedGeneration = browserSessionState.generation) {
+  if (browserSessionState.statusPromise) {
+    return browserSessionState.statusPromise;
+  }
+  const operation = browserSessionOperationController();
+  const statusPromise = (async () => {
+    try {
+      const response = await fetch("/api/browser/session", {
+        headers: { Accept: "application/json" },
+        credentials: "same-origin",
+        cache: "no-store",
+        signal: operation.signal,
+      });
+      const result = await readBrowserResponse(response);
+      assertBrowserSessionGeneration(expectedGeneration);
+      if (!response.ok) {
+        throw browserResponseError(response, result);
+      }
+      const session = result.payload?.session || null;
+      const csrfToken = String(result.payload?.csrf_token || "");
+      if (!session || !csrfToken) {
+        const error = new Error("invalid browser session response");
+        error.status = 503;
+        throw error;
+      }
+      calibrateBrowserClientMetadata(result.payload);
+      browserSessionState.ready = true;
+      browserSessionState.session = session;
+      browserSessionState.csrfToken = csrfToken;
+      browserSessionState.csrfExpiresAt = String(result.payload?.csrf_expires_at || "");
+      return session;
+    } finally {
+      operation.release();
+    }
+  })();
+  browserSessionState.statusPromise = statusPromise;
+  try {
+    return await statusPromise;
+  } finally {
+    if (browserSessionState.statusPromise === statusPromise) {
+      browserSessionState.statusPromise = null;
+    }
+  }
+}
+
+async function establishBrowserSession(expectedGeneration, skipStatus = false) {
+  if (!skipStatus) {
+    try {
+      return await loadBrowserSession(expectedGeneration);
+    } catch (error) {
+      if (error?.status !== 401) {
+        throw error;
+      }
+    }
+  }
+  assertBrowserSessionGeneration(expectedGeneration);
+  const snapshot = await loadBrowserClientEpoch(expectedGeneration);
+  assertBrowserSessionGeneration(expectedGeneration);
+  const migration = await migrateLegacyBrowserSession(snapshot, expectedGeneration);
+  assertBrowserSessionGeneration(expectedGeneration);
+  if (migration !== "migrated") {
+    await requestBrowserSessionLogin(snapshot, expectedGeneration);
+    assertBrowserSessionGeneration(expectedGeneration);
+  }
+  const session = await loadBrowserSession(expectedGeneration);
+  if (
+    migration === "migrated" &&
+    browserSessionState.clientID === snapshot.clientID &&
+    browserSessionState.epoch === snapshot.epoch
+  ) {
+    clearLegacyBrowserTokens();
+  }
+  browserSessionSignal("login");
+  return session;
+}
+
+async function ensureBrowserSession() {
+  if (browserSessionState.logoutPending) {
+    const error = new Error("browser logout is in progress");
+    error.code = "browser_session_logout_pending";
+    throw error;
+  }
+  if (browserSessionState.ready && browserSessionState.session && browserSessionState.csrfToken) {
+    return browserSessionState.session;
+  }
+  if (browserSessionState.recoveryPromise) {
+    return browserSessionState.recoveryPromise;
+  }
+  if (browserSessionState.loginPromise) {
+    return browserSessionState.loginPromise;
+  }
+  const requestGeneration = browserSessionState.generation;
+  const loginPromise = establishBrowserSession(requestGeneration, false);
+  browserSessionState.loginPromise = loginPromise;
+  try {
+    return await loginPromise;
+  } finally {
+    if (browserSessionState.loginPromise === loginPromise) {
+      browserSessionState.loginPromise = null;
+    }
+  }
+}
+
+async function recoverBrowserSession() {
+  if (browserSessionState.recoveryPromise) {
+    return browserSessionState.recoveryPromise;
+  }
+  resetBrowserSessionMemory("recovery", false);
+  const recoveryGeneration = browserSessionState.generation;
+  const recoveryPromise = establishBrowserSession(recoveryGeneration, true);
+  browserSessionState.recoveryPromise = recoveryPromise;
+  try {
+    return await recoveryPromise;
+  } finally {
+    if (browserSessionState.recoveryPromise === recoveryPromise) {
+      browserSessionState.recoveryPromise = null;
+    }
+  }
+}
+
+function isUnsafeBrowserMethod(method) {
+  return !["GET", "HEAD", "OPTIONS"].includes(String(method || "GET").toUpperCase());
+}
+
+function browserSessionCSRFNeedsRefresh() {
+  if (!browserSessionState.csrfToken) {
+    return true;
+  }
+  const expiresAt = Date.parse(browserSessionState.csrfExpiresAt);
+  return !Number.isFinite(expiresAt) || expiresAt <= Date.now() + 30_000;
+}
+
+function requireSameOriginBrowserRequest(path) {
+  if (
+    typeof path !== "string" ||
+    !path ||
+    path.startsWith("//")
+  ) {
+    const error = new Error("cross-origin browser request rejected");
+    error.code = "cross_origin_request";
+    throw error;
+  }
+  let requestURL = null;
+  try {
+    requestURL = new URL(path, window.location.origin);
+  } catch {
+    requestURL = null;
+  }
+  if (
+    !requestURL ||
+    requestURL.origin !== window.location.origin ||
+    requestURL.username ||
+    requestURL.password
+  ) {
+    const error = new Error("cross-origin browser request rejected");
+    error.code = "cross_origin_request";
+    throw error;
+  }
+  return requestURL.href;
+}
+
+function isBrowserResponseLifecycleCurrent(expectedGeneration, expectedLogoutGeneration) {
+  return (
+    browserSessionState.generation === expectedGeneration &&
+    browserSessionState.logoutGeneration === expectedLogoutGeneration &&
+    !browserSessionState.logoutPending
+  );
+}
+
+function assertBrowserResponseLifecycle(expectedGeneration, expectedLogoutGeneration) {
+  if (isBrowserResponseLifecycleCurrent(expectedGeneration, expectedLogoutGeneration)) {
+    return;
+  }
+  throw browserSessionStaleError();
+}
+
+function releaseBrowserSessionResponse(response, abort = false) {
+  const lifecycle = guardedBrowserResponses.get(response);
+  if (!lifecycle) {
+    return;
+  }
+  guardedBrowserResponses.delete(response);
+  if (abort) {
+    lifecycle.operation.abort();
+    return;
+  }
+  lifecycle.operation.release();
+}
+
+function assertBrowserSessionResponseCurrent(response) {
+  const lifecycle = guardedBrowserResponses.get(response);
+  if (!lifecycle) {
+    return;
+  }
+  assertBrowserResponseLifecycle(
+    lifecycle.expectedGeneration,
+    lifecycle.expectedLogoutGeneration,
+  );
+}
+
+function guardBrowserSessionResponse(
+  response,
+  operation,
+  expectedGeneration,
+  expectedLogoutGeneration,
+) {
+  const guardedBodyMethods = new Set([
+    "arrayBuffer",
+    "blob",
+    "bytes",
+    "formData",
+    "json",
+    "text",
+  ]);
+  let guardedResponse = null;
+  guardedResponse = new Proxy(response, {
+    get(target, property) {
+      const value = Reflect.get(target, property, target);
+      if (!guardedBodyMethods.has(property) || typeof value !== "function") {
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+      return async (...args) => {
+        try {
+          assertBrowserSessionResponseCurrent(guardedResponse);
+          const result = await value.apply(target, args);
+          assertBrowserSessionResponseCurrent(guardedResponse);
+          return result;
+        } catch (error) {
+          if (!isBrowserResponseLifecycleCurrent(expectedGeneration, expectedLogoutGeneration)) {
+            throw browserSessionStaleError();
+          }
+          throw error;
+        }
+      };
+    },
+  });
+  guardedBrowserResponses.set(guardedResponse, {
+    operation,
+    expectedGeneration,
+    expectedLogoutGeneration,
+  });
+  return guardedResponse;
+}
+
+function browserSessionFetch(path, options = {}, didRecover = false) {
+  const target = requireSameOriginBrowserRequest(path);
+  return performBrowserSessionFetch(target, options, didRecover);
+}
+
+async function performBrowserSessionFetch(target, options, didRecover) {
+  await ensureBrowserSession();
+  const headers = new Headers(options.headers || {});
+  headers.delete("Authorization");
+  const method = String(options.method || "GET").toUpperCase();
+  if (isUnsafeBrowserMethod(method)) {
+    if (browserSessionCSRFNeedsRefresh()) {
+      try {
+        await loadBrowserSession();
+      } catch (error) {
+        if (error?.status !== 401 || didRecover) {
+          throw error;
+        }
+        await recoverBrowserSession();
+        return browserSessionFetch(target, options, true);
+      }
+    }
+    headers.set("X-KBase-CSRF", browserSessionState.csrfToken);
+  }
+  const requestGeneration = browserSessionState.generation;
+  const requestLogoutGeneration = browserSessionState.logoutGeneration;
+  const operation = browserSessionOperationController(options.signal);
+  let response = null;
+  try {
+    response = await fetch(target, {
+      ...options,
+      method,
+      headers,
+      credentials: "same-origin",
+      signal: operation.signal,
+    });
+  } catch (error) {
+    operation.release();
+    if (!isBrowserResponseLifecycleCurrent(requestGeneration, requestLogoutGeneration)) {
+      throw browserSessionStaleError();
+    }
+    throw error;
+  }
+  if (response.status === 401 && !didRecover) {
+    operation.abort();
+    if (
+      browserSessionState.logoutPending ||
+      browserSessionState.logoutGeneration > requestLogoutGeneration
+    ) {
+      return response;
+    }
+    const activeRecovery = browserSessionState.recoveryPromise;
+    if (activeRecovery) {
+      await activeRecovery;
+    } else if (browserSessionState.generation === requestGeneration) {
+      await recoverBrowserSession();
+    } else {
+      await ensureBrowserSession();
+    }
+    return browserSessionFetch(target, options, true);
   }
   try {
-    return await refreshBrowserSessionToken();
+    assertBrowserResponseLifecycle(requestGeneration, requestLogoutGeneration);
   } catch (error) {
-    console.warn("Unable to load kbase browser session token", error);
-    return "";
+    operation.abort();
+    throw error;
   }
+  return guardBrowserSessionResponse(
+    response,
+    operation,
+    requestGeneration,
+    requestLogoutGeneration,
+  );
+}
+
+async function logoutBrowserSession() {
+  await ensureBrowserSession();
+  if (browserSessionCSRFNeedsRefresh()) {
+    await loadBrowserSession();
+  }
+  const csrfToken = browserSessionState.csrfToken;
+  resetBrowserSessionMemory("logout-start", true);
+  const logoutBarrierGeneration = browserSessionState.generation;
+  browserSessionSignal("logout-start");
+  const headers = new Headers({
+    Accept: "application/json",
+    "X-KBase-CSRF": csrfToken,
+  });
+  try {
+    const response = await fetch("/api/browser/session/logout", {
+      method: "POST",
+      headers,
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    const result = await readBrowserResponse(response);
+    assertBrowserSessionGeneration(logoutBarrierGeneration);
+    if (!response.ok) {
+      throw browserResponseError(response, result);
+    }
+  } catch (error) {
+    if (browserSessionState.generation !== logoutBarrierGeneration) {
+      throw browserSessionStaleError();
+    }
+    browserSessionState.logoutPending = false;
+    browserSessionState.invalidationReason = "logout-failed";
+    browserSessionSignal("login");
+    throw error;
+  }
+  assertBrowserSessionGeneration(logoutBarrierGeneration);
+  browserSessionState.logoutPending = false;
+  browserSessionState.invalidationReason = "logout";
+  browserSessionSignal("logout");
 }
 
 function escapeHTML(value) {
@@ -381,89 +1156,68 @@ function escapeAttribute(value) {
   return escapeHTML(value).replaceAll("\n", " ");
 }
 
-async function apiFetch(path, options = {}, didRefreshAuth = false) {
+async function apiFetch(path, options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set("Accept", "application/json");
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const token = getToken() || await ensureBrowserSessionToken();
-  if (token) {
-    setAuthorizationHeader(headers, token);
-  }
-
-  const response = await fetch(path, {
+  const response = await browserSessionFetch(path, {
     ...options,
     headers,
   });
-  const text = await response.text();
-  let payload = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = text;
+  try {
+    const result = await readBrowserResponse(response);
+    if (!response.ok) {
+      throw browserResponseError(response, result);
     }
+    assertBrowserSessionResponseCurrent(response);
+    return result.payload;
+  } finally {
+    releaseBrowserSessionResponse(response);
   }
-  if (!response.ok) {
-    if (response.status === 401 && !didRefreshAuth) {
-      try {
-        const refreshed = await refreshBrowserSessionToken();
-        if (refreshed) {
-          return apiFetch(path, options, true);
-        }
-      } catch (error) {
-        console.warn("Unable to refresh kbase browser session token", error);
-      }
-    }
-    const message = typeof payload === "object" && payload
-      ? (payload.error || payload.message || JSON.stringify(payload))
-      : (payload || `HTTP ${response.status}`);
-    const error = new Error(message);
-    error.status = response.status;
-    error.payload = payload;
-    throw error;
-  }
-  return payload;
 }
 
-async function apiDownload(path, options = {}, filename = "download.bin", didRefreshAuth = false) {
+async function apiDownload(path, options = {}, filename = "download.bin") {
   const headers = new Headers(options.headers || {});
-  const token = getToken() || await ensureBrowserSessionToken();
-  if (token) {
-    setAuthorizationHeader(headers, token);
-  }
   if (options.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(path, {
+  const response = await browserSessionFetch(path, {
     ...options,
     headers,
   });
-  if (!response.ok) {
-    if (response.status === 401 && !didRefreshAuth) {
+  let objectURL = "";
+  let link = null;
+  try {
+    if (!response.ok) {
+      const text = await response.text();
+      let payload = text;
       try {
-        const refreshed = await refreshBrowserSessionToken();
-        if (refreshed) {
-          return apiDownload(path, options, filename, true);
-        }
-      } catch (error) {
-        console.warn("Unable to refresh kbase browser session token", error);
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        // Keep the raw error body.
       }
+      throw browserResponseError(response, { text, payload });
     }
-    const text = await response.text();
-    throw new Error(text || `HTTP ${response.status}`);
+    const blob = await response.blob();
+    assertBrowserSessionResponseCurrent(response);
+    objectURL = URL.createObjectURL(blob);
+    link = document.createElement("a");
+    link.href = objectURL;
+    link.download = filename;
+    assertBrowserSessionResponseCurrent(response);
+    document.body.append(link);
+    assertBrowserSessionResponseCurrent(response);
+    link.click();
+    return blob.size;
+  } finally {
+    link?.remove();
+    if (objectURL) {
+      setTimeout(() => URL.revokeObjectURL(objectURL), 0);
+    }
+    releaseBrowserSessionResponse(response);
   }
-  const blob = await response.blob();
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  URL.revokeObjectURL(url);
-  return blob.size;
 }
 
 const readerRouteSuffixes = [
@@ -563,6 +1317,10 @@ function getKnowledgeBookID() {
   } catch {
     return raw;
   }
+}
+
+function isKnowledgePackageDetailRoute() {
+  return Boolean(getKnowledgeBookID());
 }
 
 function getDedaoCourseDetailEnID() {
@@ -690,7 +1448,51 @@ function buildBookAppURL(packageID, version = "") {
   return packageID ? `${ROUTES.bookApps}/${encodeURIComponent(packageID)}${query}` : ROUTES.bookApps;
 }
 
+function buildEvidenceAuditURL(packageID, auditID, version = "") {
+  if (!packageID || !auditID) {
+    return buildAgentURL(packageID, version);
+  }
+  const params = new URLSearchParams();
+  if (version) {
+    params.set("version", version);
+  }
+  const query = params.toString();
+  return `${ROUTES.agents}/${encodeURIComponent(packageID)}/audits/${encodeURIComponent(auditID)}${query ? `?${query}` : ""}`;
+}
+
+function getEvidenceAuditRoute() {
+  const pathname = getRoutePathname();
+  const prefix = `${ROUTES.agents}/`;
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const parts = pathname.slice(prefix.length).split("/").filter(Boolean);
+  if (parts.length !== 3 || parts[1] !== "audits") {
+    return null;
+  }
+  const params = new URLSearchParams(window.location.search);
+  try {
+    return {
+      view: "agent",
+      packageID: decodeURIComponent(parts[0]),
+      auditID: decodeURIComponent(parts[2]),
+      version: params.get("version") || "",
+    };
+  } catch {
+    return {
+      view: "agent",
+      packageID: parts[0],
+      auditID: parts[2],
+      version: params.get("version") || "",
+    };
+  }
+}
+
 function getBookAgentRoute() {
+  const auditRoute = getEvidenceAuditRoute();
+  if (auditRoute) {
+    return auditRoute;
+  }
   const pathname = getRoutePathname();
   const routes = [
     [ROUTES.agentPackages, "package"],
@@ -699,15 +1501,15 @@ function getBookAgentRoute() {
   ];
   for (const [base, view] of routes) {
     if (pathname === base) {
-      return { view, packageID: "", version: "" };
+      return { view, packageID: "", auditID: "", version: "" };
     }
     if (pathname.startsWith(`${base}/`)) {
       const raw = pathname.slice(base.length + 1).split("/")[0];
       const params = new URLSearchParams(window.location.search);
       try {
-        return { view, packageID: decodeURIComponent(raw), version: params.get("version") || "" };
+        return { view, packageID: decodeURIComponent(raw), auditID: "", version: params.get("version") || "" };
       } catch {
-        return { view, packageID: raw, version: params.get("version") || "" };
+        return { view, packageID: raw, auditID: "", version: params.get("version") || "" };
       }
     }
   }
@@ -729,16 +1531,278 @@ function renderShell(content, current = "") {
         <a class="${current === "ebook" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoEbooks)}">电子书</a>
         <a class="${current === "odob" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoAudio)}">听书</a>
         <a class="${current === "wechat" ? "active" : ""}" href="/wechat-source">微信采集</a>
+        <a class="${current === "source-agents" ? "active" : ""}" href="/sources/agents">Agent 管理</a>
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
         <a class="${current === "agents" ? "active" : ""}" href="${escapeAttribute(ROUTES.agentPackages)}">Book Agents</a>
         <a class="${current === "operations" ? "active" : ""}" href="${escapeAttribute(ROUTES.operations)}">Operations</a>
         <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
+        <a class="web-nav__session ${current === "session" ? "active" : ""}" ${current === "session" ? 'aria-current="page"' : ""} href="${escapeAttribute(ROUTES.sessionSettings)}">会话</a>
         <a class="web-nav__account ${current === "login" ? "active" : ""}" href="${escapeAttribute(ROUTES.dedaoLogin)}">${escapeHTML(dedaoLoginState.session?.active_user?.name || "登录得到")}</a>
       </nav>
     </header>
     ${content}
   `;
+}
+
+function formatSessionSettingsTime(value) {
+  if (!value) {
+    return "—";
+  }
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "—";
+  }
+  return parsed.toLocaleString("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    hour12: false,
+  });
+}
+
+function syncSessionSettingsAnnouncement() {
+  const announcer = document.querySelector("#session-settings-announcer");
+  if (!announcer) {
+    return;
+  }
+  const { status, session, message } = sessionSettingsState;
+  const stateMessages = {
+    loading: message || "正在读取当前会话",
+    revoked: "当前会话已退出",
+    unauthorized: "尚未登录",
+    forbidden: "无权访问当前会话",
+    unavailable: "会话服务暂不可用",
+  };
+  const isLoading = status === "loading";
+  if (isLoading) {
+    announcer.setAttribute("aria-busy", "true");
+  }
+  announcer.textContent = status === "active" && session
+    ? `当前会话已登录。当前设备：${session.device_label || "当前浏览器"}。`
+    : (stateMessages[status] || stateMessages.unavailable);
+  if (!isLoading) {
+    announcer.setAttribute("aria-busy", "false");
+  }
+}
+
+function isSessionSettingsRoute() {
+  return getRoutePathname() === ROUTES.sessionSettings;
+}
+
+function sessionSettingsErrorStatus(error) {
+  if (error?.status === 401) {
+    return "unauthorized";
+  }
+  if (error?.status === 403) {
+    return "forbidden";
+  }
+  return "unavailable";
+}
+
+function handleSessionSettingsSignal(type) {
+  if (!isSessionSettingsRoute()) {
+    return;
+  }
+  if (type === "logout-start" || type === "logout") {
+    sessionSettingsState.sequence += 1;
+    sessionSettingsState.status = "revoked";
+    sessionSettingsState.session = null;
+    sessionSettingsState.message = "";
+    renderSessionSettings();
+    return;
+  }
+  if (type === "login") {
+    loadSessionSettings();
+  }
+}
+
+browserSessionSignalListeners.add(handleSessionSettingsSignal);
+
+function renderSessionSettings() {
+  const { status, session, message } = sessionSettingsState;
+  let panelBody = "";
+  if (status === "active" && session) {
+    panelBody = `
+      <div class="session-settings__panel-head">
+        <div>
+          <p class="web-kicker">Current session</p>
+          <h2>当前会话</h2>
+        </div>
+        <span class="session-settings__signal is-active">已登录</span>
+      </div>
+      <dl class="session-settings__details">
+        <div>
+          <dt>当前设备</dt>
+          <dd>${escapeHTML(session.device_label || "当前浏览器")}</dd>
+        </div>
+        <div>
+          <dt>最近活跃</dt>
+          <dd><time datetime="${escapeAttribute(session.last_active_at || "")}">${escapeHTML(formatSessionSettingsTime(session.last_active_at))}</time></dd>
+        </div>
+        <div>
+          <dt>到期时间</dt>
+          <dd><time datetime="${escapeAttribute(session.expires_at || "")}">${escapeHTML(formatSessionSettingsTime(session.expires_at))}</time></dd>
+        </div>
+      </dl>
+      <div class="session-settings__actions">
+        <p>退出后，此浏览器需要重新登录才能访问私有内容。</p>
+        <button class="button button-primary" type="button" data-session-logout>退出登录</button>
+      </div>
+    `;
+  } else {
+    const states = {
+      loading: ["正在读取当前会话", message || "正在读取当前会话…", ""],
+      revoked: ["当前会话已退出", "此浏览器的会话已经失效。", "login"],
+      unauthorized: ["尚未登录", "登录后可查看并管理当前浏览器会话。", "login"],
+      forbidden: ["无权访问当前会话", "当前凭据不能读取此会话。", "retry"],
+      unavailable: ["会话服务暂不可用", "服务暂时无法响应，请稍后重试。", "retry"],
+    };
+    const [title, description, action] = states[status] || states.unavailable;
+    panelBody = `
+      <div class="session-settings__state is-${escapeAttribute(status)}">
+        <span class="session-settings__state-mark" aria-hidden="true"></span>
+        <div>
+          <p class="web-kicker">Current session</p>
+          <h2>${escapeHTML(title)}</h2>
+          <p>${escapeHTML(description)}</p>
+        </div>
+        ${action === "login" ? '<button class="button button-primary" type="button" data-session-login>登录</button>' : ""}
+        ${action === "retry" ? '<button class="button button-ghost" type="button" data-session-retry>重新检查</button>' : ""}
+      </div>
+    `;
+  }
+
+  renderShell(`
+    <main class="session-settings">
+      <section class="session-settings__band" aria-labelledby="session-settings-title">
+        <div>
+          <p class="web-kicker">Browser access</p>
+          <h1 id="session-settings-title">会话</h1>
+          <p>查看当前浏览器的登录状态和有效期，或从这台设备安全退出。</p>
+        </div>
+      </section>
+      <section class="session-settings__panel" aria-busy="${status === "loading" ? "true" : "false"}">
+        ${panelBody}
+      </section>
+    </main>
+  `, "session");
+  syncSessionSettingsAnnouncement();
+  bindSessionSettingsEvents();
+}
+
+async function loadSessionSettings() {
+  const sequence = sessionSettingsState.sequence + 1;
+  sessionSettingsState.sequence = sequence;
+  sessionSettingsState.status = "loading";
+  sessionSettingsState.session = null;
+  sessionSettingsState.message = "正在读取当前会话…";
+  renderSessionSettings();
+  try {
+    const session = await loadBrowserSession();
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    if (session?.revoked_at) {
+      sessionSettingsState.status = "revoked";
+      sessionSettingsState.session = null;
+    } else {
+      sessionSettingsState.status = "active";
+      sessionSettingsState.session = session;
+    }
+  } catch (error) {
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.session = null;
+    sessionSettingsState.status = sessionSettingsErrorStatus(error);
+  }
+  if (
+    sequence === sessionSettingsState.sequence &&
+    isSessionSettingsRoute()
+  ) {
+    renderSessionSettings();
+  }
+}
+
+async function logoutCurrentSession() {
+  const sequence = sessionSettingsState.sequence + 1;
+  sessionSettingsState.sequence = sequence;
+  sessionSettingsState.status = "loading";
+  sessionSettingsState.message = "正在退出当前会话…";
+  renderSessionSettings();
+  try {
+    await logoutBrowserSession();
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.status = "revoked";
+    sessionSettingsState.session = null;
+  } catch (error) {
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.session = null;
+    sessionSettingsState.status = sessionSettingsErrorStatus(error);
+  }
+  if (
+    sequence === sessionSettingsState.sequence &&
+    isSessionSettingsRoute()
+  ) {
+    renderSessionSettings();
+  }
+}
+
+async function loginCurrentSession() {
+  const sequence = sessionSettingsState.sequence + 1;
+  sessionSettingsState.sequence = sequence;
+  sessionSettingsState.status = "loading";
+  sessionSettingsState.session = null;
+  sessionSettingsState.message = "正在建立当前会话…";
+  renderSessionSettings();
+  try {
+    await ensureBrowserSession();
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    await loadSessionSettings();
+  } catch (error) {
+    if (
+      sequence !== sessionSettingsState.sequence ||
+      !isSessionSettingsRoute()
+    ) {
+      return;
+    }
+    sessionSettingsState.session = null;
+    sessionSettingsState.status = sessionSettingsErrorStatus(error);
+    renderSessionSettings();
+  }
+}
+
+function bindSessionSettingsEvents() {
+  app.querySelector("[data-session-logout]")?.addEventListener("click", () => {
+    return logoutCurrentSession();
+  });
+  app.querySelector("[data-session-retry]")?.addEventListener("click", () => {
+    return loadSessionSettings();
+  });
+  app.querySelector("[data-session-login]")?.addEventListener("click", () => {
+    return loginCurrentSession();
+  });
 }
 
 function renderDedaoHome() {
@@ -2112,6 +3176,73 @@ function knowledgeReviewStatusLabel(status) {
   })[status] || status || "未知";
 }
 
+function knowledgePackageAgentMatch() {
+  const releaseID = knowledgeState.selectedRelease?.release_id
+    || knowledgeState.releaseDetail?.release_id
+    || "";
+  if (!releaseID) {
+    return null;
+  }
+  return (knowledgeState.agentPackages || []).find((pkg) => (
+    pkg.lifecycle_state === "published"
+    && Array.isArray(pkg.releases)
+    && pkg.releases.some((release) => release.release_id === releaseID)
+  )) || null;
+}
+
+function knowledgePackageLifecycle() {
+  const pkg = knowledgeState.package || {};
+  const book = pkg.book || knowledgeState.selectedBook || {};
+  const task = knowledgeReviewLatestTask();
+  const reviewStatus = knowledgeReviewStatus();
+  const manifest = knowledgeState.analysisManifest || {};
+  const agentPackage = knowledgePackageAgentMatch();
+  const contentReady = Boolean(
+    book.book_id
+    && ((pkg.chapters || []).length || (pkg.claims || []).length || (pkg.chunks || []).length),
+  );
+  const analysisReady = manifest.status === "ready" && Boolean(manifest.answer);
+  const releaseReady = Boolean(knowledgeState.selectedRelease?.release_id);
+  const qualityFailed = task?.status === "failed"
+    || knowledgeState.qualityReport?.decision === "fail";
+
+  return [
+    {
+      key: "content",
+      label: "内容",
+      state: contentReady ? "ready" : "blocked",
+      detail: contentReady ? "已形成可检索知识包" : "等待章节、claims 或 chunks",
+      target: "#knowledge-overview",
+    },
+    {
+      key: "analysis",
+      label: "分析",
+      state: analysisReady ? "ready" : (manifest.status === "failed" ? "failed" : "pending"),
+      detail: analysisReady ? "基线分析已生成" : (manifest.error || "等待生成知识基线"),
+      target: "#knowledge-analysis",
+    },
+    {
+      key: "quality",
+      label: "质量与发布",
+      state: releaseReady ? "ready" : (qualityFailed ? "failed" : "pending"),
+      detail: releaseReady
+        ? `Release ${knowledgeHash(knowledgeState.selectedRelease.release_id)}`
+        : knowledgeReviewStatusLabel(reviewStatus),
+      target: "#knowledge-quality",
+    },
+    {
+      key: "agent",
+      label: "Agent",
+      state: agentPackage ? "ready" : (releaseReady ? "pending" : "blocked"),
+      detail: agentPackage
+        ? `${agentPackage.package_id} · ${agentPackage.version}`
+        : (releaseReady ? "等待 Agent Package 评测与发布" : "需先发布知识 Release"),
+      target: "#knowledge-agent",
+      href: agentPackage ? buildAgentPackageURL(agentPackage.package_id, agentPackage.version) : "",
+    },
+  ];
+}
+
 function knowledgeHash(value) {
   const clean = String(value || "").trim();
   return clean ? clean.slice(0, 12) : "-";
@@ -2353,7 +3484,18 @@ function knowledgePipelineActionLabel(action) {
   })[String(action || "")] || action || "未知";
 }
 
+function scrollKnowledgeHashTarget() {
+  const targetID = String(window.location.hash || "").replace(/^#/, "");
+  if (!["knowledge-overview", "knowledge-quality", "knowledge-evidence", "knowledge-analysis", "knowledge-agent"].includes(targetID)) {
+    return;
+  }
+  window.requestAnimationFrame?.(() => {
+    document.getElementById(targetID)?.scrollIntoView({ block: "start" });
+  });
+}
+
 function renderBookKnowledge() {
+  const isPackageDetail = isKnowledgePackageDetailRoute();
   const bookRows = knowledgeState.books.map((book, index) => {
     const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
     return `
@@ -2395,23 +3537,63 @@ function renderBookKnowledge() {
     failed: "需重试",
   };
   const manifestActionLabel = analysisManifest.answer ? "重新生成" : "生成基线分析";
-  const cockpitHTML = renderKnowledgeReviewCockpit();
-  const pipelineHTML = renderKnowledgePipelineDashboard();
+  const cockpitHTML = isPackageDetail ? "" : renderKnowledgeReviewCockpit();
+  const pipelineHTML = isPackageDetail ? "" : renderKnowledgePipelineDashboard();
+  const currentIndex = knowledgeState.books.findIndex((book) => book.book_id === currentBook.book_id);
+  const previousBook = currentIndex > 0 ? knowledgeState.books[currentIndex - 1] : null;
+  const nextBook = currentIndex >= 0 && currentIndex < knowledgeState.books.length - 1
+    ? knowledgeState.books[currentIndex + 1]
+    : null;
+  const lifecycle = isPackageDetail ? knowledgePackageLifecycle() : [];
+  const agentPackage = isPackageDetail ? knowledgePackageAgentMatch() : null;
+  const metadata = [
+    currentBook.source_type,
+    currentBook.extractor,
+    currentBook.updated_at ? `更新 ${formatSourceControlTime(currentBook.updated_at)}` : "",
+  ].filter(Boolean);
+  const lifecycleHTML = lifecycle.map((stage, index) => `
+    <a
+      class="knowledge-workspace__stage is-${escapeAttribute(stage.state)}"
+      href="${escapeAttribute(stage.href || stage.target)}"
+      ${stage.key === "quality" ? 'data-knowledge-lifecycle="quality"' : ""}
+    >
+      <span>${String(index + 1).padStart(2, "0")}</span>
+      <div>
+        <strong>${escapeHTML(stage.label)}</strong>
+        <small>${escapeHTML(stage.detail)}</small>
+      </div>
+    </a>
+  `).join("");
 
   renderShell(`
-    <main class="knowledge-web">
+    <main class="knowledge-web ${isPackageDetail ? "knowledge-web--detail" : "knowledge-web--index"} ${knowledgeState.directoryCollapsed ? "is-directory-collapsed" : ""}">
       <section class="knowledge-web__header">
         <div>
-          <p class="web-kicker">Book Knowledge</p>
-          <h1>书籍知识库</h1>
+          <p class="web-kicker">${isPackageDetail ? "Knowledge Package" : "Book Knowledge"}</p>
+          <h1>${isPackageDetail ? "知识包" : "书籍知识库"}</h1>
         </div>
-        <button id="knowledge-refresh" class="button button-ghost" type="button">刷新</button>
+        <div class="knowledge-web__header-actions">
+          <button id="knowledge-refresh" class="button button-ghost" type="button">刷新</button>
+        </div>
       </section>
       ${status}
+      ${isPackageDetail ? `
+        <nav class="knowledge-web__detail-toolbar" aria-label="知识包导航">
+          <a class="knowledge-web__detail-back" href="${escapeAttribute(ROUTES.knowledgePackages)}">← 返回全部知识包</a>
+          <span>${currentIndex >= 0 ? `${currentIndex + 1} / ${knowledgeState.books.length}` : "知识包详情"}</span>
+          <div>
+            <button id="knowledge-directory-toggle" class="button button-ghost" type="button" aria-expanded="${!knowledgeState.directoryCollapsed}">
+              ${knowledgeState.directoryCollapsed ? "展开目录" : "收起目录"}
+            </button>
+            ${previousBook ? `<a class="button button-ghost" href="${escapeAttribute(sourceKnowledgeURL(previousBook.book_id))}" title="${escapeAttribute(previousBook.title || "上一条")}">← 上一条</a>` : `<span class="button button-ghost is-disabled">← 上一条</span>`}
+            ${nextBook ? `<a class="button button-ghost" href="${escapeAttribute(sourceKnowledgeURL(nextBook.book_id))}" title="${escapeAttribute(nextBook.title || "下一条")}">下一条 →</a>` : `<span class="button button-ghost is-disabled">下一条 →</span>`}
+          </div>
+        </nav>
+      ` : ""}
       ${cockpitHTML}
       ${pipelineHTML}
 
-      <div class="knowledge-web__layout">
+      ${isPackageDetail ? `<div class="knowledge-web__layout">
         <aside class="knowledge-web__sidebar">
           <form id="knowledge-search-form" class="source-form">
             <label>
@@ -2427,20 +3609,35 @@ function renderBookKnowledge() {
 
         <section class="knowledge-web__main">
           ${currentBook.book_id ? `
-            <div class="knowledge-web__title-row">
-              <div>
-                <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
-                <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
+            <section id="knowledge-overview" class="knowledge-workspace__overview">
+              <div class="knowledge-web__title-row">
+                <div>
+                  <p class="web-kicker">${escapeHTML(currentBook.book_id)}</p>
+                  <h2>${escapeHTML(currentBook.title || currentBook.book_id)}</h2>
+                  ${metadata.length ? `<p class="knowledge-workspace__metadata">${metadata.map((item) => `<span>${escapeHTML(item)}</span>`).join("")}</p>` : ""}
+                </div>
+                <a class="button button-primary" href="${escapeAttribute(buildBookReaderURL(currentBook.book_id))}">阅读</a>
               </div>
-              <a class="button button-primary" href="${escapeAttribute(buildBookReaderURL(currentBook.book_id))}">阅读</a>
-            </div>
-            <div class="knowledge-web__stats">
-              <span>${(pkg.chapters || []).length} 章</span>
-              <span>${(pkg.claims || []).length} claims</span>
-              <span>${(pkg.chunks || []).length} chunks</span>
-            </div>
-            ${renderKnowledgeReview()}
-            <div class="knowledge-web__content">
+              <div class="knowledge-web__stats">
+                <span>${(pkg.chapters || []).length} 章</span>
+                <span>${(pkg.claims || []).length} claims</span>
+                <span>${(pkg.chunks || []).length} chunks</span>
+              </div>
+              <div class="knowledge-workspace__lifecycle" aria-label="知识包生命周期">
+                ${lifecycleHTML}
+              </div>
+            </section>
+            <nav class="knowledge-workspace__nav" aria-label="知识包工作区">
+              <a href="#knowledge-overview">概览</a>
+              <a href="#knowledge-quality">质量</a>
+              <a href="#knowledge-evidence">证据</a>
+              <a href="#knowledge-analysis">分析</a>
+              <a href="#knowledge-agent">Agent</a>
+            </nav>
+            <section id="knowledge-quality" class="knowledge-workspace__section">
+              ${renderKnowledgeReview()}
+            </section>
+            <div id="knowledge-evidence" class="knowledge-web__content knowledge-workspace__section">
               <section>
                 <p class="web-kicker">Chapters</p>
                 <ul>${chapterRows || "<li><span>暂无章节</span></li>"}</ul>
@@ -2450,6 +3647,7 @@ function renderBookKnowledge() {
                 ${resultRows || "<p class=\"web-muted\">输入关键词后查看检索结果。</p>"}
               </section>
             </div>
+            <section id="knowledge-analysis" class="knowledge-workspace__section knowledge-workspace__analysis">
             <section class="knowledge-web__manifest" aria-label="知识基线分析">
               <div class="knowledge-web__manifest-head">
                 <div>
@@ -2501,12 +3699,50 @@ function renderBookKnowledge() {
                 </article>
               ` : ""}
             </section>
+            </section>
+            <section id="knowledge-agent" class="knowledge-workspace__section knowledge-workspace__agent">
+              <div class="knowledge-workspace__agent-copy">
+                <p class="web-kicker">Agent Supply</p>
+                <h3>${agentPackage ? "Agent Package 已可用" : "供给到 Agent"}</h3>
+                <p>
+                  ${agentPackage
+                    ? `当前知识 Release 已固定到 ${escapeHTML(agentPackage.package_id)} ${escapeHTML(agentPackage.version)}，可进入受控检索、证据问答和工具调用。`
+                    : escapeHTML(knowledgeState.agentPackagesLoading || knowledgeState.agentPackagesError || (knowledgeState.selectedRelease
+                      ? "知识 Release 已发布，等待 Agent Package 完成策略配置、评测和独立发布。"
+                      : "先完成基线分析、质量校验和知识 Release 发布，才能生成可运行 Agent。"))}
+                </p>
+              </div>
+              <div class="knowledge-workspace__agent-actions">
+                ${agentPackage ? `
+                  <a class="button button-primary" href="${escapeAttribute(buildAgentPackageURL(agentPackage.package_id, agentPackage.version))}">打开 Agent Package</a>
+                  <a class="button button-ghost" href="${escapeAttribute(buildAgentURL(agentPackage.package_id, agentPackage.version))}">运行 Agent</a>
+                ` : `<a class="button button-ghost" href="${escapeAttribute(ROUTES.agentPackages)}">查看 Book Agents</a>`}
+              </div>
+            </section>
           ` : "<p class=\"web-muted\">请选择书籍或导入新来源。</p>"}
         </section>
-      </div>
+      </div>` : `
+        <section class="knowledge-web__catalog" aria-label="知识包目录">
+          <div class="knowledge-web__catalog-head">
+            <div>
+              <p class="web-kicker">Knowledge Catalog</p>
+              <h2>全部知识包</h2>
+              <p>选择一个知识包进入阅读、复核与大模型分析工作区。</p>
+            </div>
+            <form id="knowledge-search-form" class="knowledge-web__catalog-search">
+              <input name="query" value="${escapeAttribute(knowledgeState.query)}" placeholder="搜索标题、claims 或 chunks" aria-label="搜索知识包">
+              <button class="button button-primary" type="submit">搜索</button>
+            </form>
+          </div>
+          <div class="knowledge-web__books knowledge-web__catalog-grid">
+            ${bookRows || "<p class=\"web-muted\">暂无知识库条目，可先从微信来源导入。</p>"}
+          </div>
+        </section>
+      `}
     </main>
   `, "knowledge");
   bindBookKnowledgeEvents();
+  scrollKnowledgeHashTarget();
 }
 
 function hasBookAgentCapability(capability) {
@@ -2560,10 +3796,117 @@ function renderBookAgentPackageIndex(route) {
         <p>一个版本化知识包，三条稳定路径。Package 展示契约，Agent 展示运行边界，Book App 只呈现清单声明的能力。</p>
       </header>
       ${bookAgentState.message ? `<p class="web-status">${escapeHTML(bookAgentState.message)}</p>` : ""}
+      ${renderAgentCompiler()}
       <section class="book-agent__package-grid" aria-label="Published Agent Packages">
         ${rows || `<div class="book-agent__empty"><strong>尚无已发布 Agent Package</strong><p>先完成知识发布与评测；这里不会用示例内容伪造可运行产品。</p></div>`}
       </section>
     </main>
+  `;
+}
+
+function renderAgentCompiler() {
+  const releases = Array.isArray(agentCompilerState.releases) ? agentCompilerState.releases : [];
+  const selectedSupport = new Set(agentCompilerState.supportingReleaseIDs);
+  const releaseLabel = (release) => (
+    `${release.book_id || "book"} · ${release.release_id || "release"}`
+  );
+  const result = agentCompilerState.result;
+  const candidateRows = (result?.candidates || []).map((candidate) => {
+    const issues = Array.isArray(candidate.issues) ? candidate.issues : [];
+    const nextActions = Array.isArray(candidate.next_actions) ? candidate.next_actions : [];
+    return `
+      <article class="agent-compiler__candidate is-${escapeAttribute(candidate.status || "blocked")}">
+        <header>
+          <span>${escapeHTML(candidate.kind || "candidate")}</span>
+          <strong>${candidate.status === "ready" ? "已生成" : "被阻断"}</strong>
+        </header>
+        ${candidate.package ? `
+          <dl>
+            <div><dt>Package</dt><dd>${escapeHTML(candidate.package.package_id || "—")}</dd></div>
+            <div><dt>Version</dt><dd>${escapeHTML(candidate.package.version || "—")}</dd></div>
+            <div><dt>Hash</dt><dd><code>${escapeHTML(candidate.package.content_hash || "—")}</code></dd></div>
+          </dl>
+        ` : ""}
+        ${issues.length ? `
+          <ul class="agent-compiler__issues">
+            ${issues.map((issue) => `<li><code>${escapeHTML(issue.code || "blocked")}</code><span>${escapeHTML(issue.message || "")}</span></li>`).join("")}
+          </ul>
+        ` : ""}
+        ${nextActions.length ? `<p>下一步：${nextActions.map((action) => escapeHTML(action)).join(" · ")}</p>` : ""}
+      </article>
+    `;
+  }).join("");
+  return `
+    <section class="agent-compiler" aria-labelledby="agent-compiler-title">
+      <header>
+        <div>
+          <p class="web-kicker">Agent Compiler</p>
+          <h2 id="agent-compiler-title">从 Release 生成候选包</h2>
+        </div>
+        <p>只读编译，不保存草稿。候选包必须经过可信评测，才能进入既有发布流程。</p>
+      </header>
+      <div class="agent-compiler__mode" role="group" aria-label="编译模式">
+        ${[
+          ["dual", "双模板"],
+          ["evidence", "证据"],
+          ["study", "学习"],
+        ].map(([mode, label]) => `
+          <button
+            type="button"
+            class="${agentCompilerState.mode === mode ? "is-active" : ""}"
+            data-agent-compiler-mode="${mode}"
+            aria-pressed="${agentCompilerState.mode === mode ? "true" : "false"}"
+          >${label}</button>
+        `).join("")}
+      </div>
+      <form id="agent-compiler-form" class="agent-compiler__controls">
+        <label>
+          <span>主 Release</span>
+          <select name="primary_release_id" required ${releases.length ? "" : "disabled"}>
+            ${releases.map((release) => `
+              <option value="${escapeAttribute(release.release_id)}" ${release.release_id === agentCompilerState.primaryReleaseID ? "selected" : ""}>
+                ${escapeHTML(releaseLabel(release))}
+              </option>
+            `).join("")}
+          </select>
+        </label>
+        <label>
+          <span>版本</span>
+          <input name="version" value="${escapeAttribute(agentCompilerState.version)}" inputmode="text" pattern="[0-9]+\\.[0-9]+\\.[0-9]+(?:[+\\-][0-9A-Za-z.\\-]+)?" required>
+        </label>
+        ${agentCompilerState.mode === "study" ? `
+          <p class="agent-compiler__study-note">学习模式只绑定主 Release，不选择支持源。</p>
+        ` : `
+          <fieldset class="agent-compiler__release-list">
+            <legend>支持 Release <small>可留空，由 Assembly 自动选择相关独立来源</small></legend>
+            <div>
+              ${releases.filter((release) => release.release_id !== agentCompilerState.primaryReleaseID).map((release) => `
+                <label>
+                  <input
+                    type="checkbox"
+                    name="supporting_release_ids"
+                    value="${escapeAttribute(release.release_id)}"
+                    ${selectedSupport.has(release.release_id) ? "checked" : ""}
+                  >
+                  <span>${escapeHTML(releaseLabel(release))}</span>
+                </label>
+              `).join("") || `<p>当前没有其他可选 Release。</p>`}
+            </div>
+          </fieldset>
+        `}
+        <footer>
+          <span role="status">${escapeHTML(agentCompilerState.error || agentCompilerState.loading || `${releases.length} 个最新 Release 可用于编译`)}</span>
+          <button class="button button-primary" type="submit" ${!releases.length ? "disabled" : ""}>编译候选包</button>
+        </footer>
+      </form>
+      ${result ? `
+        <section class="agent-compiler__result" aria-live="polite">
+          <header><span>Compilation</span><strong>${escapeHTML(result.status || "blocked")}</strong><code>${escapeHTML(result.compilation_id || "")}</code></header>
+          <div>${candidateRows}</div>
+          <p>候选内容未持久化。下一步使用 <code>run_trusted_evaluation</code> 完成可信评测，再由 publisher API 发布。</p>
+        </section>
+      ` : ""}
+    </section>
   `;
 }
 
@@ -2622,9 +3965,592 @@ function renderBookAgentAnswerCitations(answer) {
   `;
 }
 
+function evidenceAuditPrimaryRelease() {
+  const roles = bookAgentState.package?.evidence_policy?.release_roles;
+  const primaryID = Array.isArray(roles)
+    ? roles.find((item) => item.role === "primary")?.release_id
+    : "";
+  return bookAgentState.releases.find((release) => release.release_id === primaryID) || null;
+}
+
+function evidenceAuditPrimaryClaims() {
+  const claims = evidenceAuditPrimaryRelease()?.analysis?.claims;
+  return Array.isArray(claims) ? claims : [];
+}
+
+function evidenceAuditErrorDetails(error) {
+  const nested = error?.payload?.error;
+  if (nested && typeof nested === "object") {
+    return {
+      code: String(nested.code || "audit_request_failed"),
+      message: String(nested.message || error.message || "证据审计请求失败"),
+    };
+  }
+  return {
+    code: String(error?.payload?.code || "audit_request_failed"),
+    message: String(error?.message || "证据审计请求失败"),
+  };
+}
+
+function evidenceAuditIdempotencyKey(prefix, identity = "") {
+  const random = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `${prefix}:${identity || "new"}:${random}`;
+}
+
+function evidenceAuditStatusLabel(status) {
+  return {
+    queued: "等待执行",
+    running: "审计中",
+    failed: "执行失败",
+    completed: "审计完成",
+  }[status] || status || "尚未开始";
+}
+
+function evidenceAuditVerdictLabel(verdict) {
+  return {
+    supported: "支持",
+    contradicted: "冲突",
+    mixed: "证据不一",
+    insufficient: "证据不足",
+    abstained: "暂不裁定",
+  }[verdict] || verdict || "未裁定";
+}
+
+function evidenceAuditFreshnessLabel(decision) {
+  return {
+    fresh: "时效合格",
+    stale: "已过时",
+    missing: "日期缺失",
+  }[decision] || decision || "未判定";
+}
+
+function evidenceAuditCitationURL(evidence) {
+  const release = bookAgentState.releases.find((item) => item.release_id === evidence.release_id);
+  const bookID = release?.book_id || release?.book?.book_id || "";
+  if (!bookID) {
+    return ROUTES.knowledgePackages;
+  }
+  const params = new URLSearchParams();
+  for (const [name, value] of [
+    ["release_id", evidence.release_id],
+    ["claim_id", evidence.claim_id],
+    ["chunk_id", evidence.chunk_id],
+    ["citation_id", evidence.citation_id],
+  ]) {
+    if (value) {
+      params.set(name, value);
+    }
+  }
+  const query = params.toString();
+  return `${buildKnowledgePackageURL(bookID)}${query ? `?${query}` : ""}#knowledge-evidence`;
+}
+
+function canRetryEvidenceAudit(audit) {
+  return audit?.status === "failed" &&
+    ["model_outcome_unknown", "requires_manual_retry"].includes(audit?.failure_code);
+}
+
+function renderEvidenceAuditComposer(pkg) {
+  if (pkg.schema_version !== "agent-package.v2") {
+    return `
+      <section class="book-agent__capability book-agent__unavailable">
+        <span class="book-agent__capability-index">evidence audit</span>
+        <div>
+          <strong>当前版本不提供证据审计</strong>
+          <p>此能力从 v2 package 开始，旧版本保持不可变，不显示可提交的审计表单。</p>
+        </div>
+      </section>
+    `;
+  }
+  const policy = pkg.evidence_policy || {};
+  const claims = evidenceAuditPrimaryClaims();
+  const maxClaims = Math.max(1, Number(policy.max_claims || 1));
+  const selected = new Set(evidenceAuditState.selectedClaims);
+  const atLimit = selected.size >= maxClaims;
+  return `
+    <section class="evidence-audit__composer" aria-labelledby="evidence-audit-composer-title">
+      <header class="evidence-audit__section-head">
+        <div>
+          <span>NEW AUDIT</span>
+          <h3 id="evidence-audit-composer-title">新建证据审计</h3>
+        </div>
+        <p>从主书 claim 出发，在固定支持来源中核验，不替代临床裁决。</p>
+      </header>
+      <div class="evidence-audit__policy" aria-label="审计策略摘要">
+        <div><span>来源独立性</span><strong>至少 ${Number(policy.minimum_independent_sources || 0)} 个独立来源</strong></div>
+        <div><span>证据时效</span><strong>${Number(policy.freshness_policy?.max_age_days || 0)} 天内${policy.freshness_policy?.require_publication_date ? " · 必须有日期" : ""}</strong></div>
+        <div><span>预算上限</span><strong>$${Number(pkg.model_policy?.max_cost_usd || 0).toFixed(2)} · ${Number(pkg.model_policy?.timeout_ms || 0) / 1000}s</strong></div>
+      </div>
+      <form id="evidence-audit-create-form" class="evidence-audit__form">
+        <label>
+          <span>审计主题</span>
+          <input name="subject" value="${escapeAttribute(evidenceAuditState.subject)}" maxlength="240" required placeholder="例如：关键临床试验结论复核">
+        </label>
+        <label>
+          <span>审计范围</span>
+          <textarea name="scope" rows="3" maxlength="1200" required placeholder="说明人群、干预、对照、结局或需要排除的范围">${escapeHTML(evidenceAuditState.scope)}</textarea>
+        </label>
+        <fieldset>
+          <legend>主书 claims <small>最多 ${maxClaims} 项 · 已选 ${selected.size}</small></legend>
+          <div class="evidence-audit__claim-picker">
+            ${claims.map((claim, index) => {
+              const id = String(claim.id || "");
+              const checked = selected.has(id);
+              return `
+                <label class="${checked ? "is-selected" : ""}">
+                  <input type="checkbox" name="selected_claims" value="${escapeAttribute(id)}" ${checked ? "checked" : ""} ${!checked && atLimit ? "disabled" : ""}>
+                  <span>${String(index + 1).padStart(2, "0")}</span>
+                  <strong>${escapeHTML(claim.statement || id)}</strong>
+                </label>
+              `;
+            }).join("") || `<p class="web-muted">主 release 暂无可选择的结构化 claims。</p>`}
+          </div>
+        </fieldset>
+        <footer>
+          <span aria-live="polite">${escapeHTML(evidenceAuditState.error || evidenceAuditState.loading || "审计创建后会生成稳定链接。")}</span>
+          <button class="button button-primary" type="submit" ${evidenceAuditState.loading || !claims.length || !selected.size ? "disabled" : ""}>创建审计</button>
+        </footer>
+      </form>
+    </section>
+  `;
+}
+
+function renderEvidenceAuditStatus(audit) {
+  if (!audit) {
+    return "";
+  }
+  const terminal = audit.status === "failed" || audit.status === "completed";
+  return `
+    <section class="evidence-audit__status is-${escapeAttribute(audit.status)}" aria-live="polite" aria-busy="${terminal ? "false" : "true"}">
+      <div>
+        <span>状态</span>
+        <strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong>
+      </div>
+      <div>
+        <span>审计 ID</span>
+        <code>${escapeHTML(audit.audit_id || "")}</code>
+      </div>
+      <div>
+        <span>尝试次数</span>
+        <strong>${Number(audit.attempt || 1)}</strong>
+      </div>
+      ${audit.status === "failed" ? `
+        <div class="evidence-audit__failure">
+          <span>${escapeHTML(audit.failure_code || "audit_failed")}</span>
+          <strong>${escapeHTML(audit.failure_summary || "审计未完成。")}</strong>
+        </div>
+        ${canRetryEvidenceAudit(audit) ? `<button class="button button-ghost" type="button" data-evidence-audit-retry>手动重试</button>` : ""}
+      ` : ""}
+    </section>
+  `;
+}
+
+function renderEvidenceAuditEvidenceRow(evidence, index) {
+  return `
+    <details class="evidence-audit__evidence-row">
+      <summary>
+        <span>${String(index + 1).padStart(2, "0")}</span>
+        <strong>${escapeHTML(evidence.publication_identity || evidence.source_type || "证据来源")}</strong>
+        <small>${escapeHTML(evidenceAuditFreshnessLabel(evidence.freshness_decision))}${evidence.conflict ? " · 存在冲突" : ""}</small>
+      </summary>
+      <dl>
+        <div><dt>Release</dt><dd>${escapeHTML(evidence.release_id || "—")}</dd></div>
+        <div><dt>来源 / 角色</dt><dd>${escapeHTML(evidence.source_type || "—")} · ${escapeHTML(evidence.role || "—")}</dd></div>
+        <div><dt>发布日期</dt><dd>${escapeHTML(evidence.published_at || "未提供")}</dd></div>
+        <div><dt>Claim / Chunk</dt><dd>${escapeHTML(evidence.claim_id || "—")} · ${escapeHTML(evidence.chunk_id || "—")}</dd></div>
+      </dl>
+      <a href="${escapeAttribute(evidenceAuditCitationURL(evidence))}">查看 KBase 引用 ${escapeHTML(evidence.citation_id || "")} →</a>
+    </details>
+  `;
+}
+
+function renderEvidenceAuditClaim(claim, index) {
+  const evidence = Array.isArray(claim.evidence_refs) ? claim.evidence_refs : [];
+  const confidence = Math.round(Number(claim.computed_confidence || 0) * 100);
+  const renderList = (items, empty) => (
+    Array.isArray(items) && items.length
+      ? `<ul>${items.map((item) => `<li>${renderSimpleMarkdown(item)}</li>`).join("")}</ul>`
+      : `<p>${escapeHTML(empty)}</p>`
+  );
+  return `
+    <article class="evidence-audit__claim">
+      <header>
+        <span>主张 CLAIM ${String(index + 1).padStart(2, "0")}</span>
+        <div class="evidence-audit__verdict is-${escapeAttribute(claim.verdict)}">${escapeHTML(evidenceAuditVerdictLabel(claim.verdict))}</div>
+        <strong>置信度 ${confidence}%</strong>
+      </header>
+      <div class="evidence-audit__claim-statement">${renderSimpleMarkdown(claim.normalized_statement || claim.source_claim || "")}</div>
+      <section>
+        <h4>证据卷宗 <span>${evidence.length}</span></h4>
+        <div>${evidence.map(renderEvidenceAuditEvidenceRow).join("") || `<p class="web-muted">没有满足策略的可引用证据。</p>`}</div>
+      </section>
+      <div class="evidence-audit__review-grid">
+        <section><h4>局限</h4>${renderList(claim.limitations, "未记录额外局限。")}</section>
+        <section><h4>知识缺口</h4>${renderList(claim.knowledge_gaps, "未记录额外缺口。")}</section>
+        <section><h4>复核行动</h4>${renderList(claim.review_actions, "无需额外行动。")}</section>
+      </div>
+    </article>
+  `;
+}
+
+function renderEvidenceAuditTrace(audit) {
+  const trace = audit.trace || {};
+  const observability = audit.observability || trace.observability || {};
+  const stages = Array.isArray(observability.stages) ? observability.stages : [];
+  const usage = observability.usage || {};
+  const started = Date.parse(audit.started_at || "");
+  const ended = Date.parse(audit.completed_at || audit.failed_at || "");
+  const duration = Number.isFinite(started) && Number.isFinite(ended) ? Math.max(0, ended - started) : 0;
+  return `
+    <section class="evidence-audit__trace" aria-labelledby="evidence-audit-trace-title">
+      <header><span>TRACE</span><h3 id="evidence-audit-trace-title">Trace 与用量</h3></header>
+      <dl>
+        <div><dt>Trace ID</dt><dd>${escapeHTML(audit.trace_id || "未生成")}</dd></div>
+        <div><dt>总耗时</dt><dd>${duration ? `${(duration / 1000).toFixed(1)}s` : "未提供"}</dd></div>
+        <div><dt>独立来源</dt><dd>${Number(observability.independent_publication_source_count || 0) || "未提供"}</dd></div>
+        <div><dt>引用解析率</dt><dd>${Number.isFinite(Number(observability.citation_resolution_rate)) ? `${Math.round(Number(observability.citation_resolution_rate) * 100)}%` : "未提供"}</dd></div>
+        <div><dt>Tokens</dt><dd>${Number(usage.total_tokens || 0) || "未提供"}</dd></div>
+        <div><dt>Cost</dt><dd>${Number.isFinite(Number(usage.cost_usd)) && usage.status !== "unknown" ? `$${Number(usage.cost_usd).toFixed(4)}` : "unknown"}</dd></div>
+      </dl>
+      ${stages.length ? `
+        <div class="evidence-audit__stages">
+          ${stages.map((stage) => `<div><span>${escapeHTML(stage.name || "stage")}</span><strong>${escapeHTML(stage.status || "—")}</strong><small>${Number(stage.duration_ms || 0)}ms</small></div>`).join("")}
+        </div>
+      ` : `<p class="web-muted">${escapeHTML(audit.trace_error || "当前 Trace 未包含阶段耗时明细。")}</p>`}
+    </section>
+  `;
+}
+
+function countProofroomRedactions(value) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  if (Array.isArray(value)) {
+    return value.reduce((total, item) => total + countProofroomRedactions(item), 0);
+  }
+  return (value.redacted === true ? 1 : 0) +
+    Object.values(value).reduce((total, item) => total + countProofroomRedactions(item), 0);
+}
+
+function renderProofroomSafeText(value, fallback = "—") {
+  const text = typeof value === "string" ? value : value?.text;
+  return escapeHTML(text || fallback);
+}
+
+function renderProofroomPreviewClaim(claim, index) {
+  const evidence = Array.isArray(claim?.evidence) ? claim.evidence : [];
+  const limitations = Array.isArray(claim?.limitations) ? claim.limitations : [];
+  const gaps = Array.isArray(claim?.knowledge_gaps) ? claim.knowledge_gaps : [];
+  const actions = Array.isArray(claim?.review_actions) ? claim.review_actions : [];
+  return `
+    <article class="evidence-audit__proofroom-claim">
+      <header>
+        <span>CLAIM ${String(index + 1).padStart(2, "0")}</span>
+        <strong>${escapeHTML(evidenceAuditVerdictLabel(claim?.verdict))}</strong>
+        <small>置信度 ${Math.round(Number(claim?.computed_confidence || 0) * 100)}%</small>
+      </header>
+      <p>${renderProofroomSafeText(claim?.normalized_statement, "未提供规范化主张")}</p>
+      <div>
+        <strong>将投递的引用</strong>
+        ${evidence.length ? `<ul>${evidence.map((item) => `
+          <li>
+            <code>${escapeHTML(item.citation_id || "citation")}</code>
+            <span>${escapeHTML(item.release_id || "release")} · ${escapeHTML(item.claim_id || "claim")} · ${escapeHTML(item.chunk_id || "chunk")}</span>
+            <small>${escapeHTML(item.role || "role")} · ${escapeHTML(item.source_type || "source")} · ${escapeHTML(evidenceAuditFreshnessLabel(item.freshness_decision))}${item.conflict ? " · 存在冲突" : ""}</small>
+          </li>
+        `).join("")}</ul>` : `<p>无引用。</p>`}
+      </div>
+      ${limitations.length ? `<div><strong>局限</strong><ul>${limitations.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+      ${gaps.length ? `<div><strong>知识缺口</strong><ul>${gaps.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+      ${actions.length ? `<div><strong>复核行动</strong><ul>${actions.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul></div>` : ""}
+    </article>
+  `;
+}
+
+function renderEvidenceAuditProofroom(audit) {
+  const preview = evidenceAuditState.proofroomPreview;
+  const delivery = evidenceAuditState.deliveryReceipt;
+  const previewClaims = Array.isArray(preview?.payload?.claims) ? preview.payload.claims : [];
+  const reviewItems = Array.isArray(preview?.payload?.proofroom?.review_items)
+    ? preview.payload.proofroom.review_items
+    : [];
+  const summaryLimitations = Array.isArray(preview?.payload?.summary?.limitations)
+    ? preview.payload.summary.limitations
+    : [];
+  return `
+    <section class="evidence-audit__proofroom" aria-labelledby="evidence-audit-proofroom-title">
+      <header>
+        <div><span>DOWNSTREAM REVIEW</span><h3 id="evidence-audit-proofroom-title">Proofroom</h3></div>
+        <button class="button button-ghost" type="button" data-proofroom-preview ${evidenceAuditState.proofroomStatus === "loading" ? "disabled" : ""}>Proofroom 预览</button>
+      </header>
+      ${preview ? `
+        <div class="evidence-audit__proofroom-overlay" role="dialog" aria-modal="true" aria-labelledby="proofroom-preview-title">
+        <div class="evidence-audit__proofroom-preview">
+          <header>
+            <div><span>投递前审阅</span><h4 id="proofroom-preview-title">Proofroom 实际投递内容</h4></div>
+            <button class="button button-ghost" type="button" data-proofroom-close aria-label="关闭 Proofroom 预览">关闭</button>
+          </header>
+          <dl>
+            <div><dt>Payload hash</dt><dd>${escapeHTML(preview.payload_hash || "—")}</dd></div>
+            <div><dt>DLP redactions</dt><dd>${countProofroomRedactions(preview.payload)}</dd></div>
+            <div><dt>Claims</dt><dd>${preview.payload?.claims?.length || 0}</dd></div>
+            <div><dt>裁决归属</dt><dd>${escapeHTML(preview.payload?.adjudication_authority || "proofroom")}</dd></div>
+          </dl>
+          <p>${escapeHTML(preview.summary || "投递前最小化预览已生成。")}</p>
+          <section class="evidence-audit__proofroom-payload" aria-label="Proofroom 实际投递内容">
+            <h4>${renderProofroomSafeText(preview.payload?.proofroom?.title, "Proofroom 复核任务")}</h4>
+            <section>
+              <strong>审计摘要</strong>
+              <p>${renderProofroomSafeText(preview.payload?.summary?.conclusion, "未提供摘要")}</p>
+              ${summaryLimitations.length ? `<ul>${summaryLimitations.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul>` : ""}
+            </section>
+            <div>${previewClaims.map(renderProofroomPreviewClaim).join("") || `<p>当前投影没有 claim。</p>`}</div>
+            ${reviewItems.length ? `
+              <aside>
+                <strong>Proofroom 复核清单</strong>
+                <ul>${reviewItems.map((item) => `<li>${renderProofroomSafeText(item)}</li>`).join("")}</ul>
+              </aside>
+            ` : ""}
+            <details>
+              <summary>核对完整结构化 Payload</summary>
+              <pre>${escapeHTML(JSON.stringify(preview.payload, null, 2))}</pre>
+            </details>
+          </section>
+          <button class="button button-primary" type="button" data-proofroom-deliver ${evidenceAuditState.proofroomStatus === "delivering" || ["delivered", "outcome_unknown"].includes(evidenceAuditState.proofroomStatus) ? "disabled" : ""}>发送到 Proofroom</button>
+        </div>
+        </div>
+      ` : `<p>仅在点击预览后读取最小化 payload；审计完成不会自动发送。</p>`}
+      <div class="evidence-audit__delivery is-${escapeAttribute(evidenceAuditState.proofroomStatus || "idle")}" aria-live="polite">
+        ${delivery ? `<strong>${escapeHTML(delivery.status || "delivered")}</strong><span>${escapeHTML(delivery.remote_receipt_id || delivery.receipt_hash || "")}</span>` : ""}
+        ${evidenceAuditState.proofroomStatus === "outcome_unknown" ? `<strong>unknown</strong><span>远端结果未知，需人工核对后再处理，系统不会自动重发。</span>` : ""}
+        ${evidenceAuditState.proofroomStatus === "rejected" ? `<strong>rejected</strong><span>${escapeHTML(evidenceAuditState.proofroomError)}</span>` : ""}
+        ${evidenceAuditState.proofroomError && !["outcome_unknown", "rejected"].includes(evidenceAuditState.proofroomStatus) ? `<span>${escapeHTML(evidenceAuditState.proofroomError)}</span>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function deactivateProofroomModal({ restoreFocus = false } = {}) {
+  if (proofroomKeydownHandler) {
+    document.removeEventListener("keydown", proofroomKeydownHandler);
+    proofroomKeydownHandler = null;
+  }
+  document.body?.classList?.remove("has-proofroom-modal");
+  app.inert = false;
+  document.body?.querySelector?.(":scope > .evidence-audit__proofroom-overlay")?.remove();
+  if (restoreFocus && proofroomPreviousFocus?.isConnected && typeof proofroomPreviousFocus.focus === "function") {
+    proofroomPreviousFocus.focus();
+  }
+  if (restoreFocus) {
+    proofroomPreviousFocus = null;
+    proofroomReturnFocusSelector = "";
+  }
+}
+
+function closeProofroomPreview(route) {
+  const returnFocusSelector = proofroomReturnFocusSelector;
+  deactivateProofroomModal();
+  evidenceAuditState.proofroomPreview = null;
+  evidenceAuditState.proofroomDeliveryKey = "";
+  evidenceAuditState.proofroomStatus = "";
+  evidenceAuditState.proofroomError = "";
+  renderBookAgentPlatform(route);
+  window.requestAnimationFrame?.(() => {
+    const target = returnFocusSelector ? document.querySelector(returnFocusSelector) : null;
+    if (target && typeof target.focus === "function") {
+      target.focus();
+    } else if (proofroomPreviousFocus?.isConnected && typeof proofroomPreviousFocus.focus === "function") {
+      proofroomPreviousFocus.focus();
+    }
+    proofroomPreviousFocus = null;
+    proofroomReturnFocusSelector = "";
+  });
+}
+
+function activateProofroomModal(route) {
+  const overlay = app.querySelector(".evidence-audit__proofroom-overlay");
+  if (!overlay) {
+    return;
+  }
+  deactivateProofroomModal();
+  proofroomPreviousFocus = proofroomPreviousFocus || document.activeElement;
+  document.body?.appendChild?.(overlay);
+  document.body?.classList?.add("has-proofroom-modal");
+  app.inert = true;
+  const dialog = overlay.querySelector('[role="dialog"], .evidence-audit__proofroom-preview') || overlay;
+  const focusableSelector = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  const focusable = () => Array.from(dialog.querySelectorAll(focusableSelector));
+  proofroomKeydownHandler = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeProofroomPreview(route);
+      return;
+    }
+    if (event.key !== "Tab") {
+      return;
+    }
+    const items = focusable();
+    if (!items.length) {
+      event.preventDefault();
+      dialog.focus();
+      return;
+    }
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  document.addEventListener("keydown", proofroomKeydownHandler);
+  const close = overlay.querySelector("[data-proofroom-close]");
+  (close || focusable()[0] || dialog).focus();
+}
+
+function renderEvidenceAuditReport(audit) {
+  const claims = Array.isArray(audit?.claim_audits) ? audit.claim_audits : [];
+  const counts = audit?.summary?.verdict_counts || {};
+  return `
+    <section class="evidence-audit__report" aria-labelledby="evidence-audit-report-title">
+      <header class="evidence-audit__report-head">
+        <div>
+          <span>证据审计 · ${escapeHTML(audit.schema_version || "evidence-audit.v1")}</span>
+          <h2 id="evidence-audit-report-title">审计结论</h2>
+          <div class="evidence-audit__conclusion">${renderSimpleMarkdown(audit.summary?.conclusion || "审计已完成。")}</div>
+        </div>
+        <div class="evidence-audit__verdict-totals">
+          ${Object.entries(counts).map(([verdict, count]) => `<div><strong>${Number(count || 0)}</strong><span>${escapeHTML(evidenceAuditVerdictLabel(verdict))}</span></div>`).join("") || `<div><strong>${claims.length}</strong><span>claims</span></div>`}
+        </div>
+      </header>
+      <div class="evidence-audit__report-body">
+        <div class="evidence-audit__claims">${claims.map(renderEvidenceAuditClaim).join("") || `<p class="web-muted">报告未返回 claim 审计结果。</p>`}</div>
+        <aside>
+          <section>
+            <h3>局限与缺口</h3>
+            ${Array.isArray(audit.summary?.limitations) && audit.summary.limitations.length
+              ? `<ul>${audit.summary.limitations.map((item) => `<li>${renderSimpleMarkdown(item)}</li>`).join("")}</ul>`
+              : `<p>未记录全局局限。</p>`}
+          </section>
+          ${renderEvidenceAuditTrace(audit)}
+          ${renderEvidenceAuditProofroom(audit)}
+        </aside>
+      </div>
+    </section>
+  `;
+}
+
+function renderEvidenceAuditHistory(pkg) {
+  if (!evidenceAuditState.audits.length || pkg.schema_version !== "agent-package.v2") {
+    return "";
+  }
+  return `
+    <nav class="evidence-audit__history" aria-label="最近证据审计">
+      <span>最近审计</span>
+      ${evidenceAuditState.audits.slice(0, 6).map((audit) => `
+        <a href="${escapeAttribute(buildEvidenceAuditURL(pkg.package_id, audit.audit_id, pkg.version))}">
+          <strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong>
+          <small>${escapeHTML(audit.audit_id)}</small>
+        </a>
+      `).join("")}
+    </nav>
+  `;
+}
+
+function renderEvidenceAuditWorkspace(route, pkg) {
+  if (route.view !== "agent") {
+    return "";
+  }
+  if (pkg.schema_version !== "agent-package.v2") {
+    return `
+      <section class="evidence-audit evidence-audit--unavailable" aria-label="证据审计版本说明">
+        ${renderEvidenceAuditComposer(pkg)}
+      </section>
+    `;
+  }
+  const audit = evidenceAuditState.audit;
+  return `
+    <section class="evidence-audit" aria-label="临床证据审计桌">
+      ${evidenceAuditState.error && !audit ? `<div class="evidence-audit__error" role="alert"><strong>无法载入审计</strong><span>${escapeHTML(evidenceAuditState.error)}</span></div>` : ""}
+      ${route.auditID ? `
+        ${evidenceAuditState.loading && !audit ? `<div class="evidence-audit__waiting" role="status"><span aria-hidden="true"></span><strong>正在载入</strong><p>读取固定审计报告与状态。</p></div>` : ""}
+        ${renderEvidenceAuditStatus(audit)}
+        ${evidenceAuditState.error && audit ? `<div class="evidence-audit__error" role="alert"><strong>请求未完成</strong><span>${escapeHTML(evidenceAuditState.error)}</span></div>` : ""}
+        ${audit?.status === "completed" ? renderEvidenceAuditReport(audit) : ""}
+        ${audit && ["queued", "running"].includes(audit.status) ? `<div class="evidence-audit__waiting"><span aria-hidden="true"></span><strong>${escapeHTML(evidenceAuditStatusLabel(audit.status))}</strong><p>只轮询当前审计；离开此链接或进入终态后自动停止。</p></div>` : ""}
+      ` : `
+        ${renderEvidenceAuditComposer(pkg)}
+        ${renderEvidenceAuditHistory(pkg)}
+      `}
+    </section>
+  `;
+}
+
+function renderEvidenceAuditContext(route, pkg, evaluation) {
+  const packageName = pkg.display_name || pkg.name || pkg.title || pkg.package_id;
+  const model = pkg.model_policy?.preferred_capability || pkg.model_policy?.model || "未指定";
+  const sourceCount = Array.isArray(pkg.releases) ? pkg.releases.length : 0;
+  const agentURL = buildAgentURL(pkg.package_id, pkg.version);
+  return `
+    <header class="evidence-audit__context" aria-label="审计包上下文">
+      <div class="evidence-audit__context-title">
+        <a href="${escapeAttribute(agentURL)}">← 返回 Agent</a>
+        <div><span>临床证据审计</span><h1>${escapeHTML(packageName)}</h1></div>
+      </div>
+      <dl>
+        <div><dt>版本</dt><dd>${escapeHTML(pkg.version || "—")}</dd></div>
+        <div><dt>模型</dt><dd>${escapeHTML(model)}</dd></div>
+        <div><dt>来源</dt><dd>${sourceCount}</dd></div>
+        <div class="${evaluation.passed ? "is-pass" : "is-hold"}"><dt>评测</dt><dd>${evaluation.passed ? "已通过" : "待通过"}</dd></div>
+      </dl>
+    </header>
+  `;
+}
+
+function renderEvidenceAuditTools(pkg, release, bookID, searchRows) {
+  return `
+    <details class="evidence-audit__tools">
+      <summary>
+        <span>包内工具</span>
+        <small>阅读器与固定范围检索</small>
+      </summary>
+      <div class="evidence-audit__tools-body">
+        ${renderBookAgentCapability("reader", `
+          <section class="book-agent__capability book-agent__reader" data-capability="reader">
+            <div class="book-agent__section-head"><div><span>01</span><h2>阅读器 Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
+            ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
+          </section>
+        `)}
+        ${renderBookAgentCapability("search", `
+          <section class="book-agent__capability book-agent__search" data-capability="search">
+            <div class="book-agent__section-head"><div><span>02</span><h2>包内检索 Grounded Search</h2></div><p>结果保持 Claim、Chunk 与 Release 身份。</p></div>
+            <form id="book-agent-search-form"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="检索当前知识包" aria-label="检索当前知识包"><button class="button button-primary" type="submit">检索</button></form>
+            <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
+          </section>
+        `, Boolean(pkg.package_id && pkg.version))}
+      </div>
+    </details>
+  `;
+}
+
+function renderGroundedConversation(pkg) {
+  return renderBookAgentCapability("grounded_chat", `
+    <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
+      <div class="book-agent__section-head"><div><span>03</span><h2>循证对话 Grounded Conversation</h2></div><p>回答必须经过 Package 的引用与拒答边界。</p></div>
+      <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="基于当前知识包提问" aria-label="基于当前知识包提问">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">基于证据提问</button></form>
+      ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
+      ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>已拒答</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "证据不足")}</p></article>` : ""}
+    </section>
+  `, Boolean(pkg.package_id && pkg.version));
+}
+
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
+  deactivateProofroomModal();
   if (!route.packageID || !bookAgentState.package) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
+    bindAgentCompilerEvents(route);
     return;
   }
   const pkg = bookAgentState.package;
@@ -2648,10 +4574,12 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
     <div><span>${escapeHTML(metric)}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
   `).join("");
   const runtimeStatus = bookAgentState.loading || bookAgentState.message;
+  const isEvidenceAuditRoute = route.view === "agent" && pkg.schema_version === "agent-package.v2";
 
   renderShell(`
-    <main class="book-agent book-agent--detail">
-      <header class="book-agent__hero">
+    <main class="book-agent book-agent--detail ${isEvidenceAuditRoute ? "book-agent--audit" : ""}">
+      ${isEvidenceAuditRoute ? renderEvidenceAuditContext(route, pkg, evaluation) : `
+        <header class="book-agent__hero">
         <div class="book-agent__hero-copy">
           <p class="web-kicker">${escapeHTML(viewLabel)}</p>
           <h1>${escapeHTML(pkg.package_id)}</h1>
@@ -2672,20 +4600,27 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <small>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "suite unavailable")}</small>
           </div>
         </aside>
-      </header>
+        </header>
+      `}
 
       ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
 
-      <section class="book-agent__manifest">
+      ${isEvidenceAuditRoute ? "" : `<section class="book-agent__manifest">
         <div><span>Package hash</span><code>${escapeHTML(pkg.content_hash)}</code></div>
         <div><span>Model route</span><strong>${escapeHTML(pkg.model_policy?.preferred_capability || "—")}</strong></div>
         <div><span>Retrieval</span><strong>${escapeHTML(pkg.retrieval_policy?.strategy || "—")}</strong></div>
         <div><span>Escalation</span><strong>${escapeHTML(pkg.safety_policy?.escalation_target || "—")}</strong></div>
         ${evaluationMetrics ? `<div class="book-agent__metric-strip">${evaluationMetrics}</div>` : ""}
-      </section>
+      </section>`}
 
       <section class="book-agent__capabilities" aria-label="Manifest capabilities">
-        ${renderBookAgentCapability("reader", `
+        ${isEvidenceAuditRoute ? `
+          ${renderEvidenceAuditWorkspace(route, pkg)}
+          ${renderEvidenceAuditTools(pkg, release, bookID, searchRows)}
+          ${renderGroundedConversation(pkg)}
+          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+        ` : `
+          ${renderBookAgentCapability("reader", `
           <section class="book-agent__capability book-agent__reader" data-capability="reader">
             <div class="book-agent__section-head"><div><span>01</span><h2>Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
             ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>Open the book</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
@@ -2698,21 +4633,66 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
             <div class="book-agent__search-results">${searchRows || `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>`}</div>
           </section>
         `, Boolean(pkg.package_id && pkg.version))}
-        ${renderBookAgentCapability("grounded_chat", `
-          <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
-            <div class="book-agent__section-head"><div><span>03</span><h2>Grounded conversation</h2></div><p>回答必须经过 package 的 citation 与 abstention 边界。</p></div>
-            <form id="book-agent-chat-form"><textarea name="question" rows="4" placeholder="Ask a question grounded in this package">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit">Ask with evidence</button></form>
-            ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
-            ${bookAgentState.answer?.outcome === "abstained" ? `<article class="book-agent__answer"><strong>Abstained</strong><p>${escapeHTML(bookAgentState.answer.abstention_reason || "insufficient_evidence")}</p></article>` : ""}
-          </section>
-        `, Boolean(pkg.package_id && pkg.version))}
-        ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
-        ${renderBookAgentCapability("quiz", "", false)}
-        ${renderBookAgentCapability("action_plan", "", false)}
+          ${renderEvidenceAuditWorkspace(route, pkg)}
+          ${renderGroundedConversation(pkg)}
+          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+          ${renderBookAgentCapability("quiz", "", false)}
+          ${renderBookAgentCapability("action_plan", "", false)}
+        `}
       </section>
     </main>
   `, "agents");
   bindBookAgentPlatformEvents(route);
+  if (evidenceAuditState.proofroomPreview) {
+    window.requestAnimationFrame?.(() => activateProofroomModal(route));
+  }
+}
+
+function bindAgentCompilerEvents(route) {
+  document.querySelectorAll("[data-agent-compiler-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const mode = String(button.dataset.agentCompilerMode || "");
+      if (!["dual", "evidence", "study"].includes(mode) || mode === agentCompilerState.mode) {
+        return;
+      }
+      agentCompilerState.mode = mode;
+      resetAgentCompilerResult();
+      if (mode === "study") {
+        agentCompilerState.supportingReleaseIDs = [];
+      }
+      renderBookAgentPlatform(route);
+    });
+  });
+  const form = document.querySelector("#agent-compiler-form");
+  form?.querySelector('[name="primary_release_id"]')?.addEventListener("change", (event) => {
+    agentCompilerState.primaryReleaseID = String(event.currentTarget.value || "");
+    agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
+      (releaseID) => releaseID !== agentCompilerState.primaryReleaseID,
+    );
+    resetAgentCompilerResult();
+    renderBookAgentPlatform(route);
+  });
+  form?.querySelector('[name="version"]')?.addEventListener("input", (event) => {
+    agentCompilerState.version = String(event.currentTarget.value || "");
+    resetAgentCompilerResult();
+  });
+  form?.querySelectorAll('[name="supporting_release_ids"]').forEach((input) => {
+    input.addEventListener("change", () => {
+      const data = new FormData(form);
+      agentCompilerState.supportingReleaseIDs = data.getAll("supporting_release_ids").map(String);
+      resetAgentCompilerResult();
+    });
+  });
+  form?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    agentCompilerState.primaryReleaseID = String(data.get("primary_release_id") || "").trim();
+    agentCompilerState.version = String(data.get("version") || "").trim();
+    agentCompilerState.supportingReleaseIDs = agentCompilerState.mode === "study"
+      ? []
+      : data.getAll("supporting_release_ids").map((value) => String(value).trim()).filter(Boolean);
+    await compileAgentPackages(route);
+  });
 }
 
 function bindBookAgentPlatformEvents(route) {
@@ -2728,31 +4708,501 @@ function bindBookAgentPlatformEvents(route) {
     bookAgentState.question = String(data.get("question") || "").trim();
     await chatWithBookAgentPackage(route);
   });
+  document.querySelector("#evidence-audit-create-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    evidenceAuditState.subject = String(data.get("subject") || "").trim();
+    evidenceAuditState.scope = String(data.get("scope") || "").trim();
+    evidenceAuditState.selectedClaims = data.getAll("selected_claims").map((value) => String(value));
+    await createEvidenceAudit(route);
+  });
+  document.querySelectorAll('#evidence-audit-create-form input[name="selected_claims"]').forEach((input) => {
+    input.addEventListener("change", (event) => {
+      const formData = new FormData(event.currentTarget.form);
+      const values = formData.getAll("selected_claims").map((value) => String(value));
+      const maxClaims = Math.max(1, Number(bookAgentState.package?.evidence_policy?.max_claims || 1));
+      evidenceAuditState.subject = String(formData.get("subject") || "").trim();
+      evidenceAuditState.scope = String(formData.get("scope") || "").trim();
+      evidenceAuditState.selectedClaims = values.slice(0, maxClaims);
+      renderBookAgentPlatform(route);
+    });
+  });
+  document.querySelector("[data-evidence-audit-retry]")?.addEventListener("click", () => retryEvidenceAudit(route));
+  document.querySelector("[data-proofroom-preview]")?.addEventListener("click", () => loadProofroomPreview(route));
+  document.querySelector("[data-proofroom-close]")?.addEventListener("click", () => closeProofroomPreview(route));
+  document.querySelector("[data-proofroom-deliver]")?.addEventListener("click", () => deliverEvidenceAuditToProofroom(route));
+}
+
+function resetAgentCompilerResult() {
+  agentCompilerRequestSequence += 1;
+  agentCompilerState.result = null;
+  agentCompilerState.loading = "";
+  agentCompilerState.error = "";
+  document.querySelector(".agent-compiler__result")?.remove();
+  const status = document.querySelector("#agent-compiler-form [role=status]");
+  if (status) {
+    status.textContent = `${agentCompilerState.releases.length} 个最新 Release 可用于编译`;
+  }
+}
+
+async function loadAgentCompilerReleases() {
+  const releases = [];
+  let after = "";
+  while (releases.length < 500) {
+    const query = new URLSearchParams({ latest: "true", limit: "200" });
+    if (after) {
+      query.set("after", after);
+    }
+    const payload = await apiFetch(`/api/knowledge/releases?${query.toString()}`);
+    const page = Array.isArray(payload.releases) ? payload.releases : [];
+    releases.push(...page);
+    const next = String(payload.next_cursor || "");
+    if (!page.length || page.length < 200 || !next || next === after) {
+      break;
+    }
+    after = next;
+  }
+  return releases.slice(0, 500);
+}
+
+async function compileAgentPackages(route) {
+  if (!agentCompilerState.primaryReleaseID || !agentCompilerState.version) {
+    return;
+  }
+  const sequence = ++agentCompilerRequestSequence;
+  agentCompilerState.loading = "正在构建 Release Assembly 与候选包";
+  agentCompilerState.error = "";
+  agentCompilerState.result = null;
+  renderBookAgentPlatform(route);
+  try {
+    const payload = {
+      schema_version: "agent-compilation-request.v1",
+      mode: agentCompilerState.mode,
+      primary_release_id: agentCompilerState.primaryReleaseID,
+      version: agentCompilerState.version,
+    };
+    if (agentCompilerState.mode !== "study" && agentCompilerState.supportingReleaseIDs.length) {
+      payload.supporting_release_ids = [...agentCompilerState.supportingReleaseIDs].sort();
+    }
+    const result = await apiFetch("/api/agent-packages/compile", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (sequence !== agentCompilerRequestSequence) {
+      return;
+    }
+    agentCompilerState.result = result;
+  } catch (error) {
+    if (sequence !== agentCompilerRequestSequence) {
+      return;
+    }
+    agentCompilerState.error = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (sequence === agentCompilerRequestSequence) {
+      agentCompilerState.loading = "";
+      renderBookAgentPlatform(route);
+    }
+  }
+}
+
+function resetEvidenceAuditState(auditID = "") {
+  cancelEvidenceAuditPoll();
+  evidenceAuditLoadSequence += 1;
+  proofroomOperationSequence += 1;
+  evidenceAuditState.audit = null;
+  evidenceAuditState.routeAuditID = auditID;
+  evidenceAuditState.loading = "";
+  evidenceAuditState.error = "";
+  evidenceAuditState.proofroomPreview = null;
+  evidenceAuditState.proofroomStatus = "";
+  evidenceAuditState.proofroomError = "";
+  evidenceAuditState.deliveryReceipt = null;
+  evidenceAuditState.proofroomDeliveryKey = "";
+  evidenceAuditState.retryIdempotencyKey = "";
+}
+
+function cancelEvidenceAuditPoll() {
+  if (evidenceAuditPollTimer) {
+    clearTimeout(evidenceAuditPollTimer);
+    evidenceAuditPollTimer = null;
+  }
+}
+
+function scheduleEvidenceAuditPoll(route) {
+  cancelEvidenceAuditPoll();
+  const auditID = String(route?.auditID || evidenceAuditState.audit?.audit_id || "");
+  const status = evidenceAuditState.audit?.status;
+  if (!auditID || !["queued", "running"].includes(status)) {
+    return;
+  }
+  evidenceAuditPollTimer = window.setTimeout(async () => {
+    if (evidenceAuditState.routeAuditID !== auditID || bookAgentState.route?.auditID !== auditID) {
+      cancelEvidenceAuditPoll();
+      return;
+    }
+    await loadEvidenceAudit({ ...route, auditID }, { silent: true });
+  }, 1800);
+}
+
+async function loadEvidenceAuditWorkspace(route) {
+  const sequence = ++evidenceAuditWorkspaceSequence;
+  const pkg = bookAgentState.package || {};
+  const packageID = String(pkg.package_id || "");
+  const version = String(pkg.version || "");
+  if (pkg.schema_version !== "agent-package.v2") {
+    resetEvidenceAuditState("");
+    evidenceAuditState.audits = [];
+    return;
+  }
+  if (route.auditID) {
+    resetEvidenceAuditState(route.auditID);
+    await loadEvidenceAudit(route);
+    return;
+  }
+  resetEvidenceAuditState("");
+  evidenceAuditState.audits = [];
+  const claims = evidenceAuditPrimaryClaims();
+  const maxClaims = Math.max(1, Number(pkg.evidence_policy?.max_claims || 1));
+  evidenceAuditState.selectedClaims = claims.slice(0, maxClaims).map((claim) => String(claim.id || "")).filter(Boolean);
+  evidenceAuditState.subject = evidenceAuditState.subject || `${evidenceAuditPrimaryRelease()?.book?.title || pkg.package_id} 临床证据复核`;
+  evidenceAuditState.scope = evidenceAuditState.scope || "核验主书关键临床结论，检查独立来源、证据时效、冲突与需要人工复核的知识缺口。";
+  try {
+    const params = new URLSearchParams({ version: pkg.version, limit: "10" });
+    const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/audits?${params.toString()}`);
+    if (
+      sequence !== evidenceAuditWorkspaceSequence ||
+      String(bookAgentState.package?.package_id || "") !== packageID ||
+      String(bookAgentState.package?.version || "") !== version
+    ) {
+      return;
+    }
+    evidenceAuditState.audits = Array.isArray(payload.audits) ? payload.audits : [];
+  } catch (error) {
+    if (sequence !== evidenceAuditWorkspaceSequence) {
+      return;
+    }
+    evidenceAuditState.error = evidenceAuditErrorDetails(error).message;
+  }
+}
+
+async function loadEvidenceAudit(route, { silent = false } = {}) {
+  const auditID = String(route?.auditID || "");
+  if (!auditID || evidenceAuditState.routeAuditID !== auditID) {
+    return;
+  }
+  const sequence = ++evidenceAuditLoadSequence;
+  if (!silent) {
+    evidenceAuditState.loading = "正在载入证据审计";
+    evidenceAuditState.error = "";
+    renderBookAgentPlatform(route);
+  }
+  try {
+    const audit = await apiFetch(`/api/agent-audits/${encodeURIComponent(route.auditID)}`);
+    const expectedPackageID = String(route.packageID || bookAgentState.package?.package_id || "");
+    const expectedVersion = String(route.version || bookAgentState.package?.version || "");
+    if (
+      String(audit?.audit_id || "") !== auditID ||
+      String(audit?.package?.package_id || "") !== expectedPackageID ||
+      (expectedVersion && String(audit?.package?.version || "") !== expectedVersion)
+    ) {
+      throw new Error("审计报告身份与当前 Package/version 不匹配，已拒绝展示。");
+    }
+    if (sequence !== evidenceAuditLoadSequence || evidenceAuditState.routeAuditID !== auditID) {
+      return;
+    }
+    if (audit.trace_id) {
+      try {
+        const trace = await apiFetch(`/api/agent-traces/${encodeURIComponent(audit.trace_id)}`);
+        if (
+          String(trace?.trace_id || "") !== String(audit.trace_id) ||
+          String(trace?.package?.package_id || "") !== expectedPackageID ||
+          (trace?.evidence_audit?.audit_id && String(trace.evidence_audit.audit_id) !== auditID)
+        ) {
+          throw new Error("Trace 身份与当前审计不匹配。");
+        }
+        audit.trace = trace;
+      } catch (traceError) {
+        audit.trace_error = traceError instanceof Error ? traceError.message : String(traceError);
+      }
+    }
+    if (sequence !== evidenceAuditLoadSequence || evidenceAuditState.routeAuditID !== auditID) {
+      return;
+    }
+    evidenceAuditState.audit = audit;
+    evidenceAuditState.error = "";
+  } catch (error) {
+    if (sequence !== evidenceAuditLoadSequence || evidenceAuditState.routeAuditID !== auditID) {
+      return;
+    }
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.error = `${details.code}: ${details.message}`;
+  } finally {
+    if (sequence === evidenceAuditLoadSequence && evidenceAuditState.routeAuditID === auditID) {
+      evidenceAuditState.loading = "";
+      renderBookAgentPlatform(route);
+      scheduleEvidenceAuditPoll(route);
+    }
+  }
+}
+
+async function createEvidenceAudit(route) {
+  const pkg = bookAgentState.package || {};
+  const maxClaims = Math.max(1, Number(pkg.evidence_policy?.max_claims || 1));
+  if (
+    pkg.schema_version !== "agent-package.v2" ||
+    !evidenceAuditState.subject ||
+    !evidenceAuditState.scope ||
+    !evidenceAuditState.selectedClaims.length ||
+    evidenceAuditState.selectedClaims.length > maxClaims
+  ) {
+    evidenceAuditState.error = "请填写主题、范围，并在策略上限内选择主书 claims。";
+    renderBookAgentPlatform(route);
+    return;
+  }
+  evidenceAuditState.loading = "正在创建审计";
+  evidenceAuditState.error = "";
+  renderBookAgentPlatform(route);
+  try {
+    const requestFingerprint = JSON.stringify({
+      package_id: pkg.package_id,
+      version: pkg.version,
+      subject: evidenceAuditState.subject,
+      scope: evidenceAuditState.scope,
+      selected_claims: evidenceAuditState.selectedClaims,
+    });
+    if (
+      evidenceAuditState.createRequestFingerprint !== requestFingerprint ||
+      !evidenceAuditState.createIdempotencyKey
+    ) {
+      evidenceAuditState.createRequestFingerprint = requestFingerprint;
+      evidenceAuditState.createIdempotencyKey = evidenceAuditIdempotencyKey("create", pkg.package_id);
+    }
+    const params = new URLSearchParams({ version: pkg.version });
+    const payload = await apiFetch(`/api/agent-packages/${encodeURIComponent(pkg.package_id)}/audits?${params.toString()}`, {
+      method: "POST",
+      body: JSON.stringify({
+        subject: evidenceAuditState.subject,
+        scope: evidenceAuditState.scope,
+        selected_claims: evidenceAuditState.selectedClaims,
+        idempotency_key: evidenceAuditState.createIdempotencyKey,
+      }),
+    });
+    const audit = payload.audit;
+    const nextRoute = { ...route, view: "agent", auditID: audit.audit_id, version: pkg.version };
+    const stableURL = buildEvidenceAuditURL(pkg.package_id, audit.audit_id, pkg.version);
+    window.history.replaceState({}, "", stableURL);
+    bookAgentState.route = nextRoute;
+    resetEvidenceAuditState(audit.audit_id);
+    evidenceAuditState.audit = audit;
+    renderBookAgentPlatform(nextRoute);
+    scheduleEvidenceAuditPoll(nextRoute);
+  } catch (error) {
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.error = `${details.code}: ${details.message}`;
+    evidenceAuditState.loading = "";
+    renderBookAgentPlatform(route);
+  }
+}
+
+async function retryEvidenceAudit(route) {
+  const audit = evidenceAuditState.audit;
+  if (!canRetryEvidenceAudit(audit)) {
+    return;
+  }
+  evidenceAuditState.loading = "正在提交重试";
+  evidenceAuditState.error = "";
+  renderBookAgentPlatform(route);
+  try {
+    evidenceAuditState.retryIdempotencyKey =
+      evidenceAuditState.retryIdempotencyKey || `retry:${audit.audit_id}:manual-v1`;
+    const payload = await apiFetch(`/api/agent-audits/${encodeURIComponent(audit.audit_id)}/retry`, {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": evidenceAuditState.retryIdempotencyKey,
+      },
+    });
+    const retry = payload.audit;
+    const nextRoute = { ...route, auditID: retry.audit_id };
+    window.history.replaceState({}, "", buildEvidenceAuditURL(retry.package?.package_id || route.packageID, retry.audit_id, retry.package?.version || route.version));
+    bookAgentState.route = nextRoute;
+    resetEvidenceAuditState(retry.audit_id);
+    evidenceAuditState.audit = retry;
+    renderBookAgentPlatform(nextRoute);
+    scheduleEvidenceAuditPoll(nextRoute);
+  } catch (error) {
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.error = `${details.code}: ${details.message}`;
+    evidenceAuditState.loading = "";
+    renderBookAgentPlatform(route);
+  }
+}
+
+async function loadProofroomPreview(route) {
+  const audit = evidenceAuditState.audit;
+  if (audit?.status !== "completed") {
+    return;
+  }
+  evidenceAuditState.proofroomStatus = "loading";
+  evidenceAuditState.proofroomError = "";
+  proofroomPreviousFocus = document.activeElement;
+  proofroomReturnFocusSelector = "[data-proofroom-preview]";
+  const operation = ++proofroomOperationSequence;
+  const auditID = audit.audit_id;
+  renderBookAgentPlatform(route);
+  try {
+    const preview = await apiFetch(`/api/agent-audits/${encodeURIComponent(auditID)}/proofroom`);
+    if (
+      operation !== proofroomOperationSequence ||
+      evidenceAuditState.audit?.audit_id !== auditID ||
+      bookAgentState.route?.auditID !== auditID
+    ) {
+      return;
+    }
+    evidenceAuditState.proofroomPreview = preview;
+    evidenceAuditState.proofroomDeliveryKey = `proofroom:${auditID}:${preview?.payload_hash || audit.output_hash || "projection"}`;
+    evidenceAuditState.proofroomStatus = "previewed";
+  } catch (error) {
+    if (operation !== proofroomOperationSequence || evidenceAuditState.audit?.audit_id !== auditID) {
+      return;
+    }
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.proofroomStatus = "error";
+    evidenceAuditState.proofroomError = `${details.code}: ${details.message}`;
+  } finally {
+    if (operation === proofroomOperationSequence && evidenceAuditState.audit?.audit_id === auditID) {
+      renderBookAgentPlatform(route);
+    }
+  }
+}
+
+async function deliverEvidenceAuditToProofroom(route) {
+  const audit = evidenceAuditState.audit;
+  if (audit?.status !== "completed" || !evidenceAuditState.proofroomPreview) {
+    return;
+  }
+  if (!window.confirm("确认发送到 Proofroom？该操作会创建可追溯投递回执，审计完成本身不会自动发送。")) {
+    return;
+  }
+  evidenceAuditState.proofroomStatus = "delivering";
+  evidenceAuditState.proofroomError = "";
+  const operation = ++proofroomOperationSequence;
+  const auditID = audit.audit_id;
+  renderBookAgentPlatform(route);
+  try {
+    const payload = await apiFetch(`/api/agent-audits/${encodeURIComponent(auditID)}/proofroom`, {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": evidenceAuditState.proofroomDeliveryKey ||
+          `proofroom:${auditID}:${evidenceAuditState.proofroomPreview.payload_hash || audit.output_hash || "projection"}`,
+      },
+    });
+    if (
+      operation !== proofroomOperationSequence ||
+      evidenceAuditState.audit?.audit_id !== auditID ||
+      bookAgentState.route?.auditID !== auditID
+    ) {
+      return;
+    }
+    evidenceAuditState.deliveryReceipt = payload.receipt || null;
+    evidenceAuditState.proofroomStatus = payload.receipt?.status || "delivered";
+  } catch (error) {
+    if (operation !== proofroomOperationSequence || evidenceAuditState.audit?.audit_id !== auditID) {
+      return;
+    }
+    const details = evidenceAuditErrorDetails(error);
+    evidenceAuditState.proofroomError = `${details.code}: ${details.message}`;
+    if (details.code === "proofroom_outcome_unknown") {
+      evidenceAuditState.proofroomStatus = "outcome_unknown";
+    } else if (details.code === "proofroom_remote_rejected") {
+      evidenceAuditState.proofroomStatus = "rejected";
+    } else {
+      evidenceAuditState.proofroomStatus = "error";
+    }
+  } finally {
+    if (operation === proofroomOperationSequence && evidenceAuditState.audit?.audit_id === auditID) {
+      renderBookAgentPlatform(route);
+    }
+  }
 }
 
 async function loadBookAgentPlatform(route) {
+  cancelEvidenceAuditPoll();
+  const sequence = ++bookAgentLoadSequence;
   bookAgentState.route = route;
   bookAgentState.loading = "Loading Agent Packages";
   bookAgentState.message = "";
   renderBookAgentPlatform(route);
   try {
     if (!route.packageID) {
-      const payload = await apiFetch("/api/agent-packages?limit=100");
+      resetAgentCompilerResult();
+      agentCompilerState.loading = "正在加载最新 Release";
+      renderBookAgentPlatform(route);
+      const [packagesResult, releasesResult] = await Promise.allSettled([
+        apiFetch("/api/agent-packages?limit=100"),
+        loadAgentCompilerReleases(),
+      ]);
+      if (sequence !== bookAgentLoadSequence) {
+        return;
+      }
+      if (releasesResult.status === "fulfilled") {
+        const releases = releasesResult.value;
+        agentCompilerState.releases = releases;
+        agentCompilerState.loading = "";
+        agentCompilerState.error = "";
+        if (!releases.some((release) => release.release_id === agentCompilerState.primaryReleaseID)) {
+          agentCompilerState.primaryReleaseID = releases[0]?.release_id || "";
+        }
+        const availableReleaseIDs = new Set(releases.map((release) => release.release_id));
+        agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
+          (releaseID) => availableReleaseIDs.has(releaseID) &&
+            releaseID !== agentCompilerState.primaryReleaseID,
+        );
+      } else {
+        agentCompilerState.releases = [];
+        agentCompilerState.primaryReleaseID = "";
+        agentCompilerState.supportingReleaseIDs = [];
+        agentCompilerState.loading = "";
+        agentCompilerState.error = `Release 列表加载失败：${
+          releasesResult.reason instanceof Error
+            ? releasesResult.reason.message
+            : String(releasesResult.reason)
+        }`;
+      }
+      if (packagesResult.status === "rejected") {
+        throw packagesResult.reason;
+      }
+      const payload = packagesResult.value;
       bookAgentState.packages = Array.isArray(payload.packages) ? payload.packages : [];
       bookAgentState.message = `${bookAgentState.packages.length} published packages`;
       return;
     }
     const query = route.version ? `?version=${encodeURIComponent(route.version)}` : "";
-    bookAgentState.package = await apiFetch(`/api/agent-packages/${encodeURIComponent(route.packageID)}${query}`);
-    bookAgentState.releases = await Promise.all((bookAgentState.package.releases || []).map((reference) => (
+    const pkg = await apiFetch(`/api/agent-packages/${encodeURIComponent(route.packageID)}${query}`);
+    if (sequence !== bookAgentLoadSequence) {
+      return;
+    }
+    bookAgentState.package = pkg;
+    const releases = await Promise.all((pkg.releases || []).map((reference) => (
       apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
     )));
+    if (sequence !== bookAgentLoadSequence) {
+      return;
+    }
+    bookAgentState.releases = releases;
+    if (route.view === "agent") {
+      await loadEvidenceAuditWorkspace(route);
+      if (sequence !== bookAgentLoadSequence) {
+        return;
+      }
+    }
     bookAgentState.message = "Package, releases, and evaluation loaded";
   } catch (error) {
     bookAgentState.message = error instanceof Error ? error.message : String(error);
   } finally {
-    bookAgentState.loading = "";
-    renderBookAgentPlatform(route);
+    if (sequence === bookAgentLoadSequence) {
+      bookAgentState.loading = "";
+      renderBookAgentPlatform(route);
+    }
   }
 }
 
@@ -2910,18 +5360,17 @@ async function loadPrivateSourceAssets(container = app) {
   if (!images.length) {
     return;
   }
-  const token = getToken() || await ensureBrowserSessionToken();
   await Promise.allSettled(images.map(async (image) => {
     const source = image.dataset.privateSrc || "";
     const figure = image.closest("figure");
     const status = figure?.querySelector(".reader-page__image-status");
+    let response = null;
+    let objectURL = "";
+    let committed = false;
     try {
       const headers = new Headers();
       headers.set("Accept", "image/*");
-      if (token) {
-        setAuthorizationHeader(headers, token);
-      }
-      const response = await fetch(source, {
+      response = await browserSessionFetch(source, {
         headers,
         credentials: "same-origin",
       });
@@ -2932,18 +5381,26 @@ async function loadPrivateSourceAssets(container = app) {
       if (!String(blob.type || "").startsWith("image/")) {
         throw new Error("invalid image response");
       }
-      const objectURL = URL.createObjectURL(blob);
+      assertBrowserSessionResponseCurrent(response);
+      objectURL = URL.createObjectURL(blob);
+      assertBrowserSessionResponseCurrent(response);
       readerAssetObjectURLs.push(objectURL);
       image.src = objectURL;
       image.removeAttribute("data-private-src");
       figure?.classList.remove("is-loading");
       status?.remove();
+      committed = true;
     } catch (error) {
       figure?.classList.remove("is-loading");
       figure?.classList.add("is-error");
       if (status) {
         status.textContent = `图片加载失败：${error instanceof Error ? error.message : String(error)}`;
       }
+    } finally {
+      if (objectURL && !committed) {
+        URL.revokeObjectURL(objectURL);
+      }
+      releaseBrowserSessionResponse(response);
     }
   }));
 }
@@ -2960,6 +5417,7 @@ function resetKnowledgeAnalysis(prompt = "") {
 
 function resetKnowledgeReview() {
   knowledgeReviewLoadSequence++;
+  knowledgeAgentLoadSequence++;
   if (knowledgeReviewPollTimer) {
     clearTimeout(knowledgeReviewPollTimer);
     knowledgeReviewPollTimer = null;
@@ -2974,6 +5432,88 @@ function resetKnowledgeReview() {
   knowledgeState.reviewLoading = "";
   knowledgeState.reviewError = "";
   knowledgeState.reviewOperation = "";
+  knowledgeState.agentPackages = [];
+  knowledgeState.agentPackagesLoading = "";
+  knowledgeState.agentPackagesError = "";
+}
+
+async function loadKnowledgeAgentPackageRecords() {
+  const packages = [];
+  let after = "";
+  for (let page = 0; page < 20; page++) {
+    const path = after
+      ? `/api/agent-packages?limit=200&after=${encodeURIComponent(after)}`
+      : "/api/agent-packages?limit=200";
+    const payload = await apiFetch(path);
+    const pagePackages = Array.isArray(payload.packages) ? payload.packages : [];
+    packages.push(...pagePackages);
+    if (pagePackages.length < 200 || !payload.next_cursor || payload.next_cursor === after) {
+      break;
+    }
+    after = payload.next_cursor;
+  }
+  return packages;
+}
+
+async function loadKnowledgeAgentPackageDetails(records) {
+  const publishedRecords = (records || []).filter((record) => (
+    record.lifecycle_state === "published"
+    && record.package_id
+    && record.version
+  ));
+  const packages = [];
+  const errors = [];
+  const concurrency = 8;
+  for (let offset = 0; offset < publishedRecords.length; offset += concurrency) {
+    const batch = publishedRecords.slice(offset, offset + concurrency);
+    const results = await Promise.allSettled(batch.map((record) => (
+      apiFetch(`/api/agent-packages/${encodeURIComponent(record.package_id)}?version=${encodeURIComponent(record.version)}`)
+    )));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        packages.push(result.value);
+        return;
+      }
+      const record = batch[index];
+      const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+      errors.push(`${record.package_id} ${record.version}: ${reason}`);
+    });
+  }
+  return { packages, errors };
+}
+
+async function loadKnowledgeAgentPackages(bookID, { silent = false, renderResult = true } = {}) {
+  const sequence = ++knowledgeAgentLoadSequence;
+  if (!silent) {
+    knowledgeState.agentPackagesLoading = "加载 Agent 供给状态";
+    knowledgeState.agentPackagesError = "";
+    if (renderResult) {
+      renderBookKnowledge();
+    }
+  }
+  try {
+    const records = await loadKnowledgeAgentPackageRecords();
+    const { packages, errors } = await loadKnowledgeAgentPackageDetails(records);
+    if (sequence !== knowledgeAgentLoadSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.agentPackages = packages;
+    knowledgeState.agentPackagesError = errors.length
+      ? `${errors.length} 个 Agent Package 详情加载失败：${errors[0]}`
+      : "";
+  } catch (error) {
+    if (sequence === knowledgeAgentLoadSequence) {
+      knowledgeState.agentPackages = [];
+      knowledgeState.agentPackagesError = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (sequence === knowledgeAgentLoadSequence) {
+      knowledgeState.agentPackagesLoading = "";
+      if (renderResult) {
+        renderBookKnowledge();
+      }
+    }
+  }
 }
 
 async function loadKnowledgeReleaseRecords(bookID) {
@@ -3069,12 +5609,12 @@ function scheduleKnowledgeReviewPoll() {
     knowledgeReviewPollTimer = null;
   }
   const task = knowledgeReviewLatestTask();
-  if (!window.location.pathname.startsWith("/book-knowledge") || !["queued", "running"].includes(task?.status)) {
+  if (!isKnowledgePackageDetailRoute() || !["queued", "running"].includes(task?.status)) {
     return;
   }
   knowledgeReviewPollTimer = setTimeout(() => {
     knowledgeReviewPollTimer = null;
-    if (!window.location.pathname.startsWith("/book-knowledge")) {
+    if (!isKnowledgePackageDetailRoute()) {
       return;
     }
     const bookID = knowledgeState.selectedBook?.book_id || "";
@@ -3093,7 +5633,7 @@ function setKnowledgeReviewOpen(open) {
     params.delete("review");
   }
   const query = params.toString();
-  window.history?.replaceState?.({}, "", `${window.location.pathname}${query ? `?${query}` : ""}`);
+  window.history?.replaceState?.({}, "", `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash || ""}`);
   renderBookKnowledge();
 }
 
@@ -3247,7 +5787,7 @@ function renderWeChatSource() {
           <p class="web-kicker">WeChat Source</p>
           <h1>微信公众号来源</h1>
         </div>
-        ${status}
+        <div>${sourceAgentReturnLink()}${status}</div>
       </section>
 
       <div class="wechat-source__layout">
@@ -3323,6 +5863,415 @@ function renderWCPlusPage() {
   bindWCPlusEvents();
 }
 
+function sourceAgentManagementStatus(agent, commands = []) {
+  const activeUpgrade = commands.some((command) => command.type === "upgrade" && !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(command.state));
+  if (activeUpgrade || agent.current_command_id) {
+    return "upgrading";
+  }
+  if (agent.desired_state === "paused") {
+    return "paused";
+  }
+  if (!sourceAgentIsOnline(agent)) {
+    return "offline";
+  }
+  const health = Object.values(agent.capability_health || {});
+  if (health.some((item) => !item?.healthy || item?.code || item?.requires_action)) {
+    return "attention";
+  }
+  return "online";
+}
+
+function sourceAgentManagementStatusLabel(status) {
+  return ({
+    online: "在线",
+    attention: "需处理",
+    offline: "离线",
+    paused: "已暂停",
+    upgrading: "升级中",
+  })[status] || "未知";
+}
+
+function sourceAgentManagementGroups() {
+  const groups = { online: [], attention: [], offline: [], paused: [], upgrading: [] };
+  for (const agent of sourceAgentManagementState.agents) {
+    const commands = sourceAgentManagementState.commandsByAgent[agent.agent_id] || [];
+    groups[sourceAgentManagementStatus(agent, commands)].push(agent);
+  }
+  return groups;
+}
+
+function renderSourceAgentStatusSummary() {
+  const groups = sourceAgentManagementGroups();
+  return `
+    <section class="source-agents__summary" aria-label="Agent 状态汇总">
+      ${["online", "attention", "offline", "paused", "upgrading"].map((status) => `
+        <div class="source-agents__summary-item is-${status}">
+          <strong>${groups[status].length}</strong>
+          <span>${sourceAgentManagementStatusLabel(status)}</span>
+        </div>
+      `).join("")}
+    </section>
+  `;
+}
+
+function sourceAgentCompatibleArtifacts(agent) {
+  return sourceAgentManagementState.artifacts.filter((artifact) => (
+    artifact.allowed_for_rollout &&
+    artifact.worker_type === agent.worker_type &&
+    artifact.platform === agent.platform &&
+    artifact.architecture === agent.architecture &&
+    artifact.version !== agent.version
+  ));
+}
+
+function sourceAgentWorkspace(agent) {
+  return agent.worker_type === "wcplus-worker"
+    ? { href: "/wcplus-source", label: "WC Plus 工作台" }
+    : { href: "/wechat-source", label: "微信工作台" };
+}
+
+function renderSourceAgentManagementCard(agent) {
+  const commands = sourceAgentManagementState.commandsByAgent[agent.agent_id] || [];
+  const latestCommand = commands[0] || null;
+  const status = sourceAgentManagementStatus(agent, commands);
+  const healthEntries = Object.entries(agent.capability_health || {});
+  const artifacts = sourceAgentCompatibleArtifacts(agent);
+  const workspace = sourceAgentWorkspace(agent);
+  const pending = sourceAgentManagementState.pendingAgentID === agent.agent_id;
+  return `
+    <article class="source-agent-card is-${status}">
+      <header class="source-agent-card__header">
+        <div>
+          <a class="source-agent-card__title" href="${escapeAttribute(`${ROUTES.sourceAgents}/${encodeURIComponent(agent.agent_id)}`)}">${escapeHTML(agent.agent_id)}</a>
+          <span>${escapeHTML(agent.worker_type || "legacy")}</span>
+        </div>
+        <span class="source-agent-card__status">${sourceAgentManagementStatusLabel(status)}</span>
+      </header>
+      <dl class="source-agent-card__facts">
+        <div><dt>平台 / 架构</dt><dd>${escapeHTML(agent.platform || "-")} / ${escapeHTML(agent.architecture || "-")}</dd></div>
+        <div><dt>版本 / 协议</dt><dd>${escapeHTML(agent.version || "-")} / ${escapeHTML(agent.protocol_version || "-")}</dd></div>
+        <div><dt>最后心跳</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_heartbeat_at))}</dd></div>
+        <div><dt>最后成功</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_success_at))}</dd></div>
+        <div><dt>当前运行</dt><dd>${escapeHTML(agent.current_run_id || "-")}</dd></div>
+        <div><dt>当前命令</dt><dd>${escapeHTML(agent.current_command_id || latestCommand?.state || "-")}</dd></div>
+        <div><dt>Outbox / Dead letter</dt><dd>${Number(agent.outbox_pending || 0)} / ${Number(agent.dead_letter_count || 0)}</dd></div>
+      </dl>
+      <section class="source-agent-card__health" aria-label="能力健康">
+        <h3>能力健康</h3>
+        ${healthEntries.length ? healthEntries.map(([name, health]) => `
+          <div>
+            <strong>${escapeHTML(name)}</strong>
+            <span>${health?.healthy ? "可用" : "不可用"}${health?.code ? ` · ${escapeHTML(health.code)}` : ""}${health?.requires_action ? ` · ${escapeHTML(health.requires_action)}` : ""}</span>
+          </div>
+        `).join("") : '<p class="web-muted">无能力上报</p>'}
+      </section>
+      ${agent.last_error ? `<p class="source-agent-card__error">${escapeHTML(agent.last_error)}</p>` : ""}
+      <div class="source-agent-card__upgrade">
+        <label>
+          <span>选择已批准版本</span>
+          <select data-source-agent-artifact="${escapeAttribute(agent.agent_id)}" ${pending || artifacts.length === 0 ? "disabled" : ""}>
+            <option value="">${artifacts.length ? "选择版本" : "暂无兼容版本"}</option>
+            ${artifacts.map((artifact) => `<option value="${escapeAttribute(artifact.id)}">${escapeHTML(artifact.version)} · ${escapeHTML(artifact.channel)}</option>`).join("")}
+          </select>
+        </label>
+        <button class="button button-ghost" type="button" data-source-agent-upgrade="${escapeAttribute(agent.agent_id)}" ${pending || artifacts.length === 0 ? "disabled" : ""}>升级</button>
+      </div>
+      <div class="source-agent-card__actions">
+        ${agent.desired_state === "paused"
+          ? `<button class="button button-ghost" type="button" data-source-agent-resume="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>恢复</button>`
+          : `<button class="button button-ghost" type="button" data-source-agent-pause="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>暂停</button>`}
+        <button class="button button-ghost" type="button" data-source-agent-diagnose="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>诊断</button>
+        <a class="button button-ghost" href="${workspace.href}?agent_id=${encodeURIComponent(agent.agent_id)}">${workspace.label}</a>
+      </div>
+    </article>
+  `;
+}
+
+function renderSourceAgentOverview() {
+  const groups = sourceAgentManagementGroups();
+  const order = ["attention", "upgrading", "offline", "paused", "online"];
+  const status = sourceAgentManagementState.loading
+    ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.loading)}</div>`
+    : (sourceAgentManagementState.message ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.message)}</div>` : "");
+  renderShell(`
+    <main class="source-agents">
+      <header class="source-agents__header">
+        <div><p class="web-kicker">Source Workers</p><h1>Agent 管理</h1><p class="web-muted">统一控制面，Worker 独立运行；升级只允许选择已批准产物。</p></div>
+        <div>${status}<button id="source-agent-management-refresh" class="button button-ghost" type="button">刷新</button></div>
+      </header>
+      ${renderSourceAgentStatusSummary()}
+      <div class="source-agents__groups">
+        ${order.map((group) => groups[group].length ? `
+          <section class="source-agents__group is-${group}">
+            <h2>${sourceAgentManagementStatusLabel(group)} <span>${groups[group].length}</span></h2>
+            <div class="source-agents__list">${groups[group].map(renderSourceAgentManagementCard).join("")}</div>
+          </section>
+        ` : "").join("") || '<p class="web-muted">尚未收到 Agent 心跳。</p>'}
+      </div>
+    </main>
+  `, "source-agents");
+  bindSourceAgentManagementEvents();
+}
+
+async function loadSourceAgentManagement({ silent = false } = {}) {
+  const sequence = ++sourceAgentManagementSequence;
+  if (!silent) {
+    sourceAgentManagementState.loading = "正在加载 Agent 状态";
+    sourceAgentManagementState.message = "";
+    renderSourceAgentOverview();
+  }
+  try {
+    const agentPayload = await apiFetch("/api/source-agents");
+    if (sequence !== sourceAgentManagementSequence) return;
+    const agents = Array.isArray(agentPayload.agents) ? agentPayload.agents : [];
+    const [artifactResult, ...commandResults] = await Promise.allSettled([
+      apiFetch("/api/source-agent-artifacts?limit=100"),
+      ...agents.map((agent) => apiFetch(`/api/source-agents/${encodeURIComponent(agent.agent_id)}/commands?limit=10`)),
+    ]);
+    if (sequence !== sourceAgentManagementSequence) return;
+    sourceAgentManagementState.agents = agents;
+    sourceAgentManagementState.artifacts = artifactResult.status === "fulfilled" && Array.isArray(artifactResult.value.artifacts) ? artifactResult.value.artifacts : [];
+    sourceAgentManagementState.commandsByAgent = Object.fromEntries(agents.map((agent, index) => {
+      const result = commandResults[index];
+      return [agent.agent_id, result?.status === "fulfilled" && Array.isArray(result.value.commands) ? result.value.commands : []];
+    }));
+    sourceAgentManagementState.message = `${agents.length} 个 Agent · ${sourceAgentManagementState.artifacts.length} 个可见产物`;
+  } catch (error) {
+    if (sequence === sourceAgentManagementSequence) {
+      sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
+    }
+  } finally {
+    if (sequence === sourceAgentManagementSequence) {
+      sourceAgentManagementState.loading = "";
+      renderSourceAgentOverview();
+      scheduleSourceAgentManagementPoll();
+    }
+  }
+}
+
+function scheduleSourceAgentManagementPoll() {
+  if (sourceAgentManagementPollTimer) {
+    clearTimeout(sourceAgentManagementPollTimer);
+    sourceAgentManagementPollTimer = null;
+  }
+  if (!getRoutePathname().startsWith(ROUTES.sourceAgents)) return;
+  const hasActiveCommand = Object.values(sourceAgentManagementState.commandsByAgent).flat().some((command) => !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(command.state));
+  if (!hasActiveCommand && !sourceAgentManagementState.pendingAgentID) return;
+  sourceAgentManagementPollTimer = setTimeout(() => {
+    sourceAgentManagementPollTimer = null;
+    loadSourceAgentManagement({ silent: true });
+  }, 5000);
+}
+
+function sourceAgentCommandEnvelope(type, payload) {
+  const nonce = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    type,
+    idempotency_key: `web-${type}-${nonce}`,
+    ...(payload ? { payload } : {}),
+    expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  };
+}
+
+async function runSourceAgentManagementAction(agentID, operation) {
+  sourceAgentManagementState.pendingAgentID = agentID;
+  sourceAgentManagementState.message = "正在提交操作";
+  renderSourceAgentOverview();
+  try {
+    await operation();
+    sourceAgentManagementState.message = "操作已提交，正在刷新权威状态";
+  } catch (error) {
+    sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    sourceAgentManagementState.pendingAgentID = "";
+    await loadSourceAgentManagement();
+  }
+}
+
+function setSourceAgentDesiredState(agentID, desiredState) {
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/desired-state`, {
+    method: "POST",
+    body: JSON.stringify({ desired_state: desiredState }),
+  }));
+}
+
+function createSourceAgentDiagnostic(agentID) {
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/commands`, {
+    method: "POST",
+    body: JSON.stringify(sourceAgentCommandEnvelope("diagnose")),
+  }));
+}
+
+function confirmSourceAgentUpgrade(agent, artifact) {
+  return window.confirm(`确认升级 ${agent.agent_id}\n当前版本：${agent.version || "-"}\n目标版本：${artifact.version}`);
+}
+
+function createSourceAgentUpgrade(agentID, artifactID) {
+  const agent = sourceAgentManagementState.agents.find((item) => item.agent_id === agentID);
+  const artifact = sourceAgentManagementState.artifacts.find((item) => item.id === artifactID);
+  if (!agent || !artifact || !confirmSourceAgentUpgrade(agent, artifact)) return Promise.resolve();
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/commands`, {
+    method: "POST",
+    body: JSON.stringify(sourceAgentCommandEnvelope("upgrade", {
+      artifact_id: artifact.id,
+      expected_current_version: agent.version,
+    })),
+  }));
+}
+
+function bindSourceAgentManagementEvents() {
+  document.querySelector("#source-agent-management-refresh")?.addEventListener("click", () => loadSourceAgentManagement());
+  for (const button of document.querySelectorAll("[data-source-agent-pause]")) {
+    button.addEventListener("click", () => setSourceAgentDesiredState(button.getAttribute("data-source-agent-pause"), "paused"));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-resume]")) {
+    button.addEventListener("click", () => setSourceAgentDesiredState(button.getAttribute("data-source-agent-resume"), "active"));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-diagnose]")) {
+    button.addEventListener("click", () => createSourceAgentDiagnostic(button.getAttribute("data-source-agent-diagnose")));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-upgrade]")) {
+    button.addEventListener("click", () => {
+      const agentID = button.getAttribute("data-source-agent-upgrade");
+      const select = document.querySelector(`[data-source-agent-artifact="${CSS.escape(agentID)}"]`);
+      if (select?.value) createSourceAgentUpgrade(agentID, select.value);
+    });
+  }
+}
+
+function getSourceAgentDetailID(pathname = getRoutePathname()) {
+  if (!pathname.startsWith(`${ROUTES.sourceAgents}/`)) return null;
+  const raw = pathname.slice(ROUTES.sourceAgents.length + 1);
+  if (!raw || raw.includes("/")) return "";
+  try {
+    const agentID = decodeURIComponent(raw);
+    return /^[A-Za-z0-9._-]{1,128}$/.test(agentID) ? agentID : "";
+  } catch {
+    return "";
+  }
+}
+
+function sourceAgentReturnLink() {
+  const agentID = String(new URLSearchParams(window.location.search).get("agent_id") || "").trim();
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(agentID)) return "";
+  return `<a class="button button-ghost" href="${escapeAttribute(`${ROUTES.sourceAgents}/${encodeURIComponent(agentID)}`)}">返回 Agent 详情</a>`;
+}
+
+function sourceAgentRedactedDiagnostics(agent) {
+  if (!agent) return [];
+  const diagnostics = Object.entries(agent.capability_health || {}).map(([capability, health]) => ({
+    capability,
+    healthy: Boolean(health?.healthy),
+    code: String(health?.code || ""),
+    requiresAction: String(health?.requires_action || ""),
+  }));
+  diagnostics.push({ capability: "outbox", healthy: Number(agent.dead_letter_count || 0) === 0, code: Number(agent.dead_letter_count || 0) ? "dead_letters_present" : "", requiresAction: "" });
+  return diagnostics;
+}
+
+function renderSourceAgentDetail() {
+  if (sourceAgentDetailState.notFound || !sourceAgentDetailState.agent) {
+    renderShell(`
+      <main class="source-agent-detail">
+        <a class="button button-ghost" href="${ROUTES.sourceAgents}">返回 Agent 总览</a>
+        <section class="source-agent-detail__empty">
+          <p class="web-kicker">Agent 详情</p>
+          <h1>${sourceAgentDetailState.loading ? "正在加载 Agent" : "未找到该 Agent"}</h1>
+          <p class="web-muted">${escapeHTML(sourceAgentDetailState.message || "该标识无效，或 Worker 尚未注册。")}</p>
+        </section>
+      </main>
+    `, "source-agents");
+    return;
+  }
+  const agent = sourceAgentDetailState.agent;
+  const workspace = sourceAgentWorkspace(agent);
+  const diagnostics = sourceAgentRedactedDiagnostics(agent);
+  const healthEntries = Object.entries(agent.capability_health || {});
+  renderShell(`
+    <main class="source-agent-detail">
+      <nav class="source-agent-detail__nav" aria-label="Agent 详情导航">
+        <a class="button button-ghost" href="${ROUTES.sourceAgents}">返回 Agent 总览</a>
+        <a class="button button-primary" href="${workspace.href}?agent_id=${encodeURIComponent(sourceAgentDetailState.agentID)}">${workspace.label}</a>
+      </nav>
+      <header class="source-agent-detail__hero">
+        <div><p class="web-kicker">Agent 详情</p><h1>${escapeHTML(agent.agent_id)}</h1><p>${escapeHTML(agent.worker_type)} · ${escapeHTML(agent.platform || "-")} / ${escapeHTML(agent.architecture || "-")}</p></div>
+        <div><strong>${escapeHTML(agent.version || "-")}</strong><span>协议 ${escapeHTML(agent.protocol_version || "-")}</span></div>
+      </header>
+      <section class="source-agent-detail__grid">
+        <article>
+          <h2>能力详情</h2>
+          ${healthEntries.length ? healthEntries.map(([name, health]) => `<dl><div><dt>${escapeHTML(name)}</dt><dd>${health?.healthy ? "可用" : "不可用"}</dd></div><div><dt>状态码</dt><dd>${escapeHTML(health?.code || "-")}</dd></div><div><dt>下一步</dt><dd>${escapeHTML(health?.requires_action || "-")}</dd></div></dl>`).join("") : '<p class="web-muted">无能力上报。</p>'}
+        </article>
+        <article>
+          <h2>Outbox 统计</h2>
+          <dl><div><dt>待上传</dt><dd>${Number(agent.outbox_pending || 0)}</dd></div><div><dt>Dead letter</dt><dd>${Number(agent.dead_letter_count || 0)}</dd></div><div><dt>最后成功</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_success_at))}</dd></div></dl>
+        </article>
+        <article>
+          <h2>绑定订阅</h2>
+          ${sourceAgentDetailState.subscriptions.length ? sourceAgentDetailState.subscriptions.map((subscription) => `<div class="source-agent-detail__row"><strong>${escapeHTML(subscription.source_account || subscription.source_account_key)}</strong><span>${escapeHTML(subscription.operation || "-")} · ${escapeHTML(formatSourceSchedule(subscription.schedule))}</span></div>`).join("") : '<p class="web-muted">没有绑定订阅。</p>'}
+        </article>
+        <article>
+          <h2>脱敏诊断</h2>
+          ${diagnostics.map((item) => `<div class="source-agent-detail__row"><strong>${escapeHTML(item.capability)}</strong><span>${item.healthy ? "正常" : "需处理"}${item.code ? ` · ${escapeHTML(item.code)}` : ""}${item.requiresAction ? ` · ${escapeHTML(item.requiresAction)}` : ""}</span></div>`).join("")}
+        </article>
+      </section>
+      <section class="source-agent-detail__history">
+        <article>
+          <h2>最近运行</h2>
+          ${sourceAgentDetailState.runs.length ? sourceAgentDetailState.runs.map((run) => {
+            const detail = sourceAgentDetailState.runDetails[run.id];
+            const items = Array.isArray(detail?.items) ? detail.items : [];
+            return `<div class="source-agent-detail__timeline"><time>${escapeHTML(formatSourceControlTime(run.created_at))}</time><div><strong>${escapeHTML(sourceRunStatusLabel(run.status))}</strong><span>${escapeHTML(run.requested_operation || "-")} · 新增 ${Number(run.new_count || 0)} / 更新 ${Number(run.updated_count || 0)} / 跳过 ${Number(run.skipped_count || 0)} / 失败 ${Number(run.failed_count || 0)} · 条目 ${items.length}</span></div></div>`;
+          }).join("") : '<p class="web-muted">暂无运行。</p>'}
+        </article>
+        <article>
+          <h2>命令时间线</h2>
+          ${sourceAgentDetailState.commands.length ? sourceAgentDetailState.commands.map((command) => `<div class="source-agent-detail__timeline"><time>${escapeHTML(formatSourceControlTime(command.created_at))}</time><div><strong>${escapeHTML(command.type)} · ${escapeHTML(command.state)}</strong><span>${escapeHTML(command.result_code || "等待结果")}${command.actual_version ? ` · ${escapeHTML(command.actual_version)}` : ""}</span></div></div>`).join("") : '<p class="web-muted">暂无命令。</p>'}
+        </article>
+      </section>
+    </main>
+  `, "source-agents");
+}
+
+async function loadSourceAgentDetail(agentID) {
+  const sequence = ++sourceAgentDetailSequence;
+  sourceAgentDetailState.agentID = agentID;
+  sourceAgentDetailState.agent = null;
+  sourceAgentDetailState.notFound = !agentID;
+  sourceAgentDetailState.loading = agentID ? "正在加载 Agent 详情" : "";
+  sourceAgentDetailState.message = "";
+  renderSourceAgentDetail();
+  if (!agentID) return;
+  try {
+    const [agentPayload, subscriptionResult, runResult, commandResult] = await Promise.all([
+      apiFetch(`/api/source-agents/${encodeURIComponent(sourceAgentDetailState.agentID)}`),
+      Promise.resolve(apiFetch("/api/source-subscriptions")).then((value) => ({ status: "fulfilled", value }), (reason) => ({ status: "rejected", reason })),
+      Promise.resolve(apiFetch("/api/source-sync/runs?limit=200")).then((value) => ({ status: "fulfilled", value }), (reason) => ({ status: "rejected", reason })),
+      Promise.resolve(apiFetch(`/api/source-agents/${encodeURIComponent(sourceAgentDetailState.agentID)}/commands?limit=100`)).then((value) => ({ status: "fulfilled", value }), (reason) => ({ status: "rejected", reason })),
+    ]);
+    if (sequence !== sourceAgentDetailSequence) return;
+    sourceAgentDetailState.agent = agentPayload.agent || null;
+    const subscriptions = subscriptionResult.status === "fulfilled" && Array.isArray(subscriptionResult.value.subscriptions) ? subscriptionResult.value.subscriptions : [];
+    const runs = runResult.status === "fulfilled" && Array.isArray(runResult.value.runs) ? runResult.value.runs : [];
+    sourceAgentDetailState.subscriptions = subscriptions.filter((subscription) => subscription.agent_id === agentID);
+    const subscriptionIDs = new Set(sourceAgentDetailState.subscriptions.map((subscription) => subscription.id));
+    sourceAgentDetailState.runs = runs.filter((run) => run.agent_id === agentID || subscriptionIDs.has(run.subscription_id)).slice(0, 20);
+    sourceAgentDetailState.commands = commandResult.status === "fulfilled" && Array.isArray(commandResult.value.commands) ? commandResult.value.commands : [];
+    const detailResults = await Promise.allSettled(sourceAgentDetailState.runs.slice(0, 5).map((run) => apiFetch(`/api/source-sync/runs/${encodeURIComponent(run.id)}`)));
+    if (sequence !== sourceAgentDetailSequence) return;
+    sourceAgentDetailState.runDetails = Object.fromEntries(sourceAgentDetailState.runs.slice(0, 5).map((run, index) => [run.id, detailResults[index]?.status === "fulfilled" ? detailResults[index].value : null]));
+  } catch (error) {
+    if (sequence !== sourceAgentDetailSequence) return;
+    sourceAgentDetailState.notFound = Number(error?.status || 0) === 404;
+    sourceAgentDetailState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (sequence === sourceAgentDetailSequence) {
+      sourceAgentDetailState.loading = "";
+      renderSourceAgentDetail();
+    }
+  }
+}
+
 function renderSourceControlPlane() {
   const status = sourceControlState.loading
     ? `<div class="web-status">处理中：${escapeHTML(sourceControlState.loading)}</div>`
@@ -3336,6 +6285,7 @@ function renderSourceControlPlane() {
       </div>
       <div class="source-control__header-actions">
         ${status}
+        ${sourceAgentReturnLink()}
         <a id="source-agent-enrollment-link" class="button button-primary" href="http://127.0.0.1:8765" target="_blank" rel="noreferrer">本地登录与公众号搜索</a>
         <button id="source-control-refresh" class="button button-ghost" type="button">刷新</button>
       </div>
@@ -3916,7 +6866,7 @@ async function createSourceSubscription() {
         agent_id: draft.sourceAgentID,
         schedule,
         operation: draft.sourceOperation,
-        options: { page_size: 10, max_items: 100, include_media: true, title_query: "" },
+        options: { page_size: 10, max_items: 500, include_media: true, title_query: "" },
         enabled: true,
       }),
     });
@@ -5793,6 +8743,19 @@ function bindBookKnowledgeEvents() {
   document.querySelector("#knowledge-refresh")?.addEventListener("click", () => {
     loadBookKnowledge();
   });
+  document.querySelector("#knowledge-directory-toggle")?.addEventListener("click", () => {
+    knowledgeState.directoryCollapsed = !knowledgeState.directoryCollapsed;
+    renderBookKnowledge();
+  });
+  document.querySelector("[data-knowledge-lifecycle='quality']")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    setKnowledgeReviewOpen(true);
+    window.requestAnimationFrame?.(() => {
+      document.querySelector("#knowledge-quality")?.scrollIntoView({ block: "start", behavior: "smooth" });
+      const params = new URLSearchParams(window.location.search);
+      window.history?.replaceState?.({}, "", `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}#knowledge-quality`);
+    });
+  });
   document.querySelector("#knowledge-cockpit-refresh")?.addEventListener("click", () => {
     loadKnowledgeReviewCockpit();
   });
@@ -5816,8 +8779,7 @@ function bindBookKnowledgeEvents() {
       if (!book) {
         return;
       }
-      window.history?.pushState?.({}, "", sourceKnowledgeURL(book.book_id));
-      await selectKnowledgeBook(book);
+      await navigateKnowledgeBook(book);
     });
   }
   for (const button of document.querySelectorAll("[data-cockpit-book-id]")) {
@@ -5827,9 +8789,7 @@ function bindBookKnowledgeEvents() {
       if (!book) {
         return;
       }
-      window.history?.pushState?.({}, "", `${sourceKnowledgeURL(book.book_id)}?review=1`);
-      await selectKnowledgeBook(book);
-      setKnowledgeReviewOpen(true);
+      await navigateKnowledgeBook(book, { review: true });
     });
   }
   document.querySelector("#knowledge-search-form")?.addEventListener("submit", async (event) => {
@@ -5876,8 +8836,7 @@ function bindBookKnowledgeEvents() {
       const index = Number(button.getAttribute("data-book-index") || "0");
       const book = knowledgeState.books[index] || null;
       if (book) {
-        window.history?.pushState?.({}, "", sourceKnowledgeURL(book.book_id));
-        await selectKnowledgeBook(book);
+        await navigateKnowledgeBook(book);
       }
     });
   }
@@ -5907,24 +8866,63 @@ function bindDedaoCourseArticleAnalysis(route) {
 }
 
 async function loadBookKnowledge() {
+  const sequence = ++bookKnowledgeLoadSequence;
   knowledgeState.loading = "加载书籍";
   knowledgeState.message = "";
   renderBookKnowledge();
   try {
-    await Promise.all([
-      loadKnowledgeReviewCockpit({ silent: true, renderResult: false }),
-      loadKnowledgePipelineDashboard({ silent: true, renderResult: false }),
-    ]);
+    if (!isKnowledgePackageDetailRoute()) {
+      await Promise.all([
+        loadKnowledgeReviewCockpit({ silent: true, renderResult: false }),
+        loadKnowledgePipelineDashboard({ silent: true, renderResult: false }),
+      ]);
+    }
     const payload = await apiFetch("/api/books");
+    if (sequence !== bookKnowledgeLoadSequence) {
+      return;
+    }
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
-    if (knowledgeState.books.length) {
+    if (knowledgeState.books.length && isKnowledgePackageDetailRoute()) {
       const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
       const preferredID = getKnowledgeBookID() || queryBookID || knowledgeState.selectedBook?.book_id || "";
       const preferred = preferredID
         ? knowledgeState.books.find((book) => book.book_id === preferredID)
         : null;
       await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
-    } else {
+      if (sequence !== bookKnowledgeLoadSequence) {
+        return;
+      }
+      const evidenceLocator = new URLSearchParams(window.location.search);
+      const citationID = evidenceLocator.get("citation_id") || "";
+      const evidenceQuery = citationID || evidenceLocator.get("chunk_id") || evidenceLocator.get("claim_id") || "";
+      if (citationID) {
+        const resolved = await apiFetch(
+          `/api/citations/${encodeURIComponent(citationID)}?book_id=${encodeURIComponent(knowledgeState.selectedBook.book_id)}`,
+        );
+        if (
+          sequence !== bookKnowledgeLoadSequence ||
+          String(knowledgeState.selectedBook?.book_id || "") !== String(preferred?.book_id || knowledgeState.books[0]?.book_id || "")
+        ) {
+          return;
+        }
+        const citation = resolved.citation || {};
+        knowledgeState.query = citationID;
+        knowledgeState.results = [{
+          kind: "citation",
+          id: citation.citation_id || citationID,
+          title: `引用 ${citation.citation_id || citationID}`,
+          snippet: [
+            ...(Array.isArray(resolved.claim_ids) ? resolved.claim_ids : []),
+            citation.chapter_id,
+            citation.chunk_id,
+          ].filter(Boolean).join(" · "),
+        }];
+        knowledgeState.message = "已精确定位审计引用。";
+      } else if (evidenceQuery) {
+        knowledgeState.query = evidenceQuery;
+        await searchBookKnowledge();
+      }
+    } else if (!knowledgeState.books.length) {
       knowledgeState.selectedBook = null;
       knowledgeState.package = null;
       knowledgeState.results = [];
@@ -5932,11 +8930,34 @@ async function loadBookKnowledge() {
     }
     knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
   } catch (error) {
+    if (sequence !== bookKnowledgeLoadSequence) {
+      return;
+    }
     knowledgeState.message = error instanceof Error ? error.message : String(error);
   } finally {
-    knowledgeState.loading = "";
-    renderBookKnowledge();
+    if (sequence === bookKnowledgeLoadSequence) {
+      knowledgeState.loading = "";
+      renderBookKnowledge();
+    }
   }
+}
+
+async function navigateKnowledgeBook(book, { review = false } = {}) {
+  if (!book?.book_id) {
+    return;
+  }
+  const target = `${sourceKnowledgeURL(book.book_id)}${review ? "?review=1" : ""}`;
+  window.history?.pushState?.({}, "", target);
+  await selectKnowledgeBook(book);
+  if (review) {
+    setKnowledgeReviewOpen(true);
+  }
+  window.requestAnimationFrame?.(() => {
+    document.querySelector(".knowledge-web__main")?.scrollIntoView({
+      block: "start",
+      behavior: "smooth",
+    });
+  });
 }
 
 async function loadKnowledgePipelineDashboard({ silent = false, renderResult = true } = {}) {
@@ -5989,6 +9010,8 @@ function renderKnowledgeOperationsConsole() {
   const dashboard = knowledgeOperationsState.console || {};
   const summary = dashboard.summary || {};
   const items = Array.isArray(dashboard.items) ? dashboard.items : [];
+  const healthReviewDiagnostics = dashboard.health_review_diagnostics || {};
+  const healthReviewQueue = Array.isArray(dashboard.health_review_queue) ? dashboard.health_review_queue : [];
   const status = knowledgeOperationsState.loading || knowledgeOperationsState.message || `${Number(summary.total || 0)} packages`;
   const replay = knowledgeOperationsState.replayResult;
   renderShell(`
@@ -6010,11 +9033,13 @@ function renderKnowledgeOperationsConsole() {
         ${renderKnowledgeOperationsMetric("Health 待审核", summary.health_ready_to_publish)}
         ${renderKnowledgeOperationsMetric("Health 已拉取", summary.health_published)}
       </section>
+      ${renderKnowledgeOperationsHealthReviewQueue(healthReviewQueue)}
+      ${renderKnowledgeOperationsHealthReviewDiagnostics(healthReviewDiagnostics)}
       <section class="knowledge-operations__panel" aria-label="Health Evidence Review Workspace">
         <div class="knowledge-operations__panel-head">
           <div>
             <p class="web-kicker">Health Evidence Review Workspace</p>
-            <h2>审核草稿和阻断原因</h2>
+            <h2>全部包状态和阻断原因</h2>
           </div>
           <small>serving_allowed 始终由 Health 审核系统决定；KBase 只显示证据元数据。</small>
         </div>
@@ -6039,6 +9064,115 @@ function renderKnowledgeOperationsConsole() {
 
 function renderKnowledgeOperationsMetric(label, value) {
   return `<div class="knowledge-operations__metric"><span>${escapeHTML(label)}</span><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function renderKnowledgeOperationsHealthReviewQueue(queue) {
+  return `
+    <section class="knowledge-operations__panel" aria-label="Health Evidence Review Queue">
+      <div class="knowledge-operations__panel-head">
+        <div>
+          <p class="web-kicker">Health Evidence Review Queue</p>
+          <h2>待审核优先级队列</h2>
+        </div>
+        <small>只读队列：不写入 Health 审核状态，也不推进 serving。</small>
+      </div>
+      <div class="knowledge-operations__queue">
+        ${queue.map(renderKnowledgeOperationsHealthReviewItem).join("") || `<p class="knowledge-operations__empty">暂无 Health 审核队列。</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function renderKnowledgeOperationsHealthReviewDiagnostics(diagnostics) {
+  const statusCounts = diagnostics.status_counts || {};
+  const blockers = Array.isArray(diagnostics.blockers) ? diagnostics.blockers : [];
+  const actions = Array.isArray(diagnostics.next_safe_actions) ? diagnostics.next_safe_actions : [];
+  const statusRows = Object.entries(statusCounts).map(([status, count]) => `
+    <span class="knowledge-operations__pill">${escapeHTML(status)}: ${Number(count || 0)}</span>
+  `).join("");
+  return `
+    <section class="knowledge-operations__panel" aria-label="Health Queue Diagnostics">
+      <div class="knowledge-operations__panel-head">
+        <div>
+          <p class="web-kicker">Health Queue Diagnostics</p>
+          <h2>为什么没有待审核项？</h2>
+        </div>
+        <small>只显示元数据诊断；这里不会执行发布、Health serving 或外部写入。</small>
+      </div>
+      <div class="knowledge-operations__diagnostics">
+        <article>
+          <strong>${escapeHTML(knowledgeOperationsDiagnosticReasonLabel(diagnostics.queue_empty_reason || "unknown"))}</strong>
+          <small>${escapeHTML(diagnostics.queue_empty_reason || "unknown")}</small>
+          <div class="knowledge-operations__pills">${statusRows || `<span class="knowledge-operations__pill">无 Health readiness 命中</span>`}</div>
+        </article>
+        <article>
+          <strong>安全下一步</strong>
+          ${actions.length ? actions.map((action) => `
+            <div class="knowledge-operations__diagnostic-action" data-knowledge-health-diagnostic-action="${escapeAttribute(action.action || "")}">
+              <span>${escapeHTML(action.label || action.action || "inspect_status")}</span>
+              <small>${escapeHTML(action.action || "inspect_status")}${action.count ? ` · ${Number(action.count)} 项` : ""}</small>
+            </div>
+          `).join("") : `<p class="knowledge-operations__empty">暂无建议动作。</p>`}
+        </article>
+        <article>
+          <strong>阻断分类</strong>
+          ${blockers.length ? blockers.map((blocker) => `
+            <div class="knowledge-operations__diagnostic-action">
+              <span>${escapeHTML(blocker.label || blocker.status || "blocked")}</span>
+              <small>${escapeHTML(blocker.safe_action || "inspect_status")} · ${Number(blocker.count || 0)} 项</small>
+            </div>
+          `).join("") : `<p class="knowledge-operations__empty">当前可见范围没有阻断分类。</p>`}
+        </article>
+      </div>
+    </section>
+  `;
+}
+
+function knowledgeOperationsDiagnosticReasonLabel(reason) {
+  switch (reason) {
+    case "queue_has_items":
+      return "队列已有可处理项";
+    case "no_operations_items":
+      return "当前没有 operations 数据";
+    case "no_health_readiness_items":
+      return "当前可见包没有 Health readiness 状态";
+    case "no_items_match_current_limit":
+      return "当前可见范围没有命中 Health 队列";
+    case "all_visible_items_need_upstream_work":
+      return "可见包需要先完成上游分析或质检";
+    case "all_visible_items_ready_or_imported":
+      return "可见包已准备好，下一步归 Health 审核侧";
+    default:
+      return "等待更多诊断数据";
+  }
+}
+
+function renderKnowledgeOperationsHealthReviewItem(item) {
+  const riskCounts = item.risk_counts || {};
+  const riskText = Object.entries(riskCounts).map(([risk, count]) => `${risk}:${count}`).join(" · ") || "无风险计数";
+  const reasons = Array.isArray(item.reasons) ? item.reasons : [];
+  return `
+    <article class="knowledge-operations__queue-item">
+      <div>
+        <span class="knowledge-operations__badge">${escapeHTML(item.priority_label || "monitor")}</span>
+        <strong>${escapeHTML(item.title || item.book_id || "未命名知识")}</strong>
+        <small>${escapeHTML(item.book_id || "")}${item.release_id ? ` · ${escapeHTML(knowledgeHash(item.release_id))}` : ""}</small>
+      </div>
+      <div>
+        <span>${escapeHTML(item.status || "unknown")}</span>
+        <small>priority ${Number(item.priority || 0)} · ${item.consumer_review_required ? "需要 Health 人工审核" : "KBase 侧准备中"}</small>
+      </div>
+      <div>
+        <span data-knowledge-health-review-action="${escapeAttribute(item.next_operator_action || "")}">${escapeHTML(item.next_operator_action || "inspect_status")}</span>
+        <small>serving_allowed=${item.serving_allowed ? "true" : "false"}</small>
+      </div>
+      <div>
+        <span>claims ${Number(item.claim_count || 0)} · citations ${Number(item.citation_count || 0)}</span>
+        <small>${escapeHTML(riskText)}</small>
+        ${reasons.length ? `<small>${escapeHTML(reasons.join(" / "))}</small>` : ""}
+      </div>
+    </article>
+  `;
 }
 
 function renderKnowledgeOperationsItem(item) {
@@ -6158,6 +9292,7 @@ async function loadKnowledgeReviewCockpit({ silent = false, renderResult = true 
 }
 
 async function selectKnowledgeBook(book, renderBefore = true) {
+  const sequence = ++bookKnowledgeDetailSequence;
   const previousID = knowledgeState.selectedBook?.book_id || "";
   knowledgeState.selectedBook = book;
   knowledgeState.package = null;
@@ -6171,26 +9306,42 @@ async function selectKnowledgeBook(book, renderBefore = true) {
     renderBookKnowledge();
   }
   try {
-    knowledgeState.package = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    const pkg = await apiFetch(`/api/books/${encodeURIComponent(book.book_id)}`);
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== book.book_id) {
+      return;
+    }
+    knowledgeState.package = pkg;
     await Promise.all([
-      loadKnowledgeAnalysisManifest(book.book_id),
+      loadKnowledgeAnalysisManifest(book.book_id, sequence),
       loadKnowledgeReview(book.book_id, { silent: true, renderResult: false }),
+      loadKnowledgeAgentPackages(book.book_id, { silent: true, renderResult: false }),
     ]);
   } catch (error) {
-    knowledgeState.message = error instanceof Error ? error.message : String(error);
+    if (sequence === bookKnowledgeDetailSequence && knowledgeState.selectedBook?.book_id === book.book_id) {
+      knowledgeState.message = error instanceof Error ? error.message : String(error);
+    }
   } finally {
-    knowledgeState.loading = "";
-    if (renderBefore) {
-      renderBookKnowledge();
+    if (sequence === bookKnowledgeDetailSequence && knowledgeState.selectedBook?.book_id === book.book_id) {
+      knowledgeState.loading = "";
+      if (renderBefore) {
+        renderBookKnowledge();
+      }
     }
   }
 }
 
-async function loadKnowledgeAnalysisManifest(bookID) {
+async function loadKnowledgeAnalysisManifest(bookID, sequence = bookKnowledgeDetailSequence) {
   knowledgeState.analysisManifestError = "";
   try {
-    knowledgeState.analysisManifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+    const manifest = await apiFetch(`/api/books/${encodeURIComponent(bookID)}/analysis`);
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
+    knowledgeState.analysisManifest = manifest;
   } catch (error) {
+    if (sequence !== bookKnowledgeDetailSequence || knowledgeState.selectedBook?.book_id !== bookID) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     if (message.includes("HTTP 404")) {
       knowledgeState.analysisManifest = null;
@@ -6342,7 +9493,30 @@ function formatArticleTime(value) {
 }
 
 async function boot() {
+  bookKnowledgeLoadSequence += 1;
   const routePathname = getRoutePathname();
+  if (!routePathname.startsWith(ROUTES.sourceAgents)) {
+    if (sourceAgentManagementPollTimer) {
+      clearTimeout(sourceAgentManagementPollTimer);
+      sourceAgentManagementPollTimer = null;
+    }
+    sourceAgentManagementSequence += 1;
+    sourceAgentDetailSequence += 1;
+  }
+  const isBookAgentRoute = (
+    routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
+    routePathname === ROUTES.agents || routePathname.startsWith(`${ROUTES.agents}/`) ||
+    routePathname === ROUTES.bookApps || routePathname.startsWith(`${ROUTES.bookApps}/`)
+  );
+  if (!isBookAgentRoute) {
+    deactivateProofroomModal({ restoreFocus: true });
+    cancelEvidenceAuditPoll();
+    evidenceAuditLoadSequence += 1;
+    evidenceAuditWorkspaceSequence += 1;
+    bookAgentLoadSequence += 1;
+    proofroomOperationSequence += 1;
+    evidenceAuditState.routeAuditID = "";
+  }
   if (routePathname === ROUTES.dedaoLogin) {
     renderDedaoLogin();
     await loadDedaoSession();
@@ -6353,6 +9527,11 @@ async function boot() {
     await loadDedaoHome();
     return;
   }
+  if (routePathname === ROUTES.sessionSettings) {
+    renderSessionSettings();
+    await loadSessionSettings();
+    return;
+  }
   if (routePathname === ROUTES.jobs || routePathname.startsWith(`${ROUTES.jobs}/`)) {
     renderJobCenter();
     await loadJobCenter();
@@ -6361,6 +9540,17 @@ async function boot() {
   if (routePathname === ROUTES.operations) {
     renderKnowledgeOperationsConsole();
     await loadKnowledgeOperationsConsole();
+    return;
+  }
+  const sourceAgentDetailID = getSourceAgentDetailID(routePathname);
+  if (sourceAgentDetailID !== null) {
+    renderSourceAgentDetail();
+    await loadSourceAgentDetail(sourceAgentDetailID);
+    return;
+  }
+  if (routePathname === ROUTES.sourceAgents) {
+    renderSourceAgentOverview();
+    await loadSourceAgentManagement();
     return;
   }
   const dedaoCourseEnID = getDedaoCourseDetailEnID();
@@ -6408,11 +9598,7 @@ async function boot() {
     await loadDedaoLibrary("odob");
     return;
   }
-  if (
-    routePathname === ROUTES.agentPackages || routePathname.startsWith(`${ROUTES.agentPackages}/`) ||
-    routePathname === ROUTES.agents || routePathname.startsWith(`${ROUTES.agents}/`) ||
-    routePathname === ROUTES.bookApps || routePathname.startsWith(`${ROUTES.bookApps}/`)
-  ) {
+  if (isBookAgentRoute) {
     const bookAgentRoute = getBookAgentRoute();
     renderBookAgentPlatform(bookAgentRoute);
     await loadBookAgentPlatform(bookAgentRoute);
@@ -6446,5 +9632,9 @@ async function boot() {
     renderError(error instanceof Error ? error.message : String(error));
   }
 }
+
+window.addEventListener?.("popstate", () => {
+  boot();
+});
 
 boot();

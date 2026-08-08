@@ -23,65 +23,20 @@ Package manifests contain prompt profile and output-schema identifiers, not
 private prompt bodies. They do not transfer downloaded source bodies,
 credentials, consumer user data, or consumer-owned review decisions.
 
-## Clinical Trial Audit
+An authenticated operator may compile deterministic candidates from immutable
+Release Assembly state:
 
-Clinical-trial evidence workflows exchange immutable audit requests and results
-using `contracts/clinical-trial-audit-v1.schema.json`. An input is one NCT ID,
-DOI, PMID, or bounded trial claim. Publishers normalize the identifier before
-computing `input_hash`, so equivalent forms reuse the same audit identity.
+```text
+POST /api/agent-packages/compile
+```
 
-Every source snapshot carries a canonical source ID, upstream version time,
-content hash, license scope, and deterministic fingerprint. Audit findings are
-typed as registered facts, publication claims, deterministic discrepancies,
-model interpretations, or unresolved conflicts. Each finding must resolve to
-one or more unique citation IDs, and each citation must resolve to a source
-fingerprint. Consumers must preserve confidence, limitations, and source
-fingerprints when importing an audit.
-
-The stable source fingerprint excludes retrieval time. A separate
-`provenance_digest` binds that fingerprint to canonical `retrieved_at` and,
-for ClinicalTrials.gov, the upstream `data_timestamp`. Durable storage keeps
-those values on both the snapshot and its evidence link and fails closed if
-either copy or the digest is altered.
-
-Audit runs use `clinical-trial-audit-run.v1` and advance through `queued`,
-`collecting`, `comparing`, `reasoning`, and `awaiting_review` before reaching
-`completed`, `failed`, or `abstained`. Completed and abstained runs include an
-audit; failed runs include an explicit error. These artifacts contain no source
-bodies, credentials, patient data, or private prompts. They are evidence-review
-inputs only and cannot enter a health serving index without downstream domain
-approval.
-
-The durable queue uses the separate internal schema
-`clinical-trial-audit-stored-run.v1`; it must be projected and validated before
-publication as `clinical-trial-audit-run.v1`. Package identity, idempotency,
-lease, attempt, and retry metadata are never part of the public run artifact.
-Failed public runs expose only the allowlisted failure code. Retryability is an
-internal policy with one legal value per code; permanent source failures cannot
-be replayed.
-
-ClinicalTrials.gov collection stores a bounded normalized evidence payload by
-`content_hash` in the same transaction as its source snapshot. Payloads are
-immutable and deduplicated, contain no raw upstream body, and can reconstruct
-the typed registry study after restart. Clinical audit v1 normalizes protocol,
-participant-flow, and outcome-measure modules. Its machine-readable coverage
-explicitly excludes baseline characteristics, adverse events, and more-info;
-consumers must preserve that limitation and must not describe v1 as complete
-ClinicalTrials.gov results coverage. The authoritative v1 limitation code is
-`results_modules_excluded_v1`; arbitrary limitation prose is invalid.
-
-Database schema v4 moves ClinicalTrials.gov `data_timestamp` out of the
-content-addressed evidence envelope and into snapshot/link provenance. Valid v3
-evidence rows are rewritten without changing `content_hash`. Rows that cannot
-be verified are retained with deterministic `evidence_v1_incompatible` state,
-and reads return a typed incompatibility error.
-
-The repository currently has no existing JSON Schema validator dependency.
-Public Go runs are therefore verified by strict projection, unknown-field
-rejection on round trip, and domain validation against the same state rules as
-the JSON Schema. Independent JSON Schema engine validation remains a release
-integration check rather than adding a heavyweight runtime dependency solely
-for tests.
+The request and response follow
+`contracts/agent-compilation-request-v1.schema.json` and
+`contracts/agent-compilation-v1.schema.json`. Compilation accepts only fixed
+`dual`, `evidence`, or `study` profiles. It is read-only: the response is a
+preview and does not persist, evaluate, trust, or publish a package. The route
+uses the normal authenticated API session so the Web workspace never receives
+the publisher credential.
 
 Before publication, a publisher submits the finalized package and its synthetic
 golden suite to:
@@ -91,7 +46,8 @@ POST /api/agent-packages/evaluate
 POST /api/agent-packages/publish
 ```
 
-Both routes require the dedicated Agent Package publisher token. Evaluation
+The evaluation and publication routes require the dedicated Agent Package
+publisher token. Evaluation
 executes the package retrieval and grounded-chat path, the proposed read-only
 tool policy, retrieval recall and precision, citations, faithfulness,
 abstention, task completion, observed latency, and bounded observed cost. The
@@ -167,6 +123,67 @@ GET /api/knowledge/gaps
 Impact aggregates release count, receipt dispositions, and pipeline stages.
 Gaps are fingerprinted aggregates only. Consumers should submit or sync gap
 fingerprints rather than raw user queries.
+
+## Evidence Readiness
+
+Operators and Agent builders can inspect evidence integrity before publication:
+
+```text
+GET /api/knowledge/readiness?limit={n}&book_id={optional}
+```
+
+The response follows `contracts/knowledge-readiness-v1.schema.json`. It reports
+pipeline state, canonical publication identity, claim coverage, reference
+resolution, explicit citation coverage, compatibility references, and bounded
+blocker/warning codes. It contains no source bodies, model prompts or answers,
+credentials, or local source paths.
+
+Publication identity is conservative. Account- and host-derived identities can
+participate in later source-independence checks; item and book fallbacks cannot.
+During the citation migration, direct chunk references remain resolvable but
+are reported as `legacy_direct_chunk_reference`.
+
+## Release Assembly
+
+Operators and Agent builders can inspect the deterministic latest-release
+snapshot through:
+
+```text
+GET /api/knowledge/assembly?limit={1..500}&query={optional}
+```
+
+The response follows
+`contracts/knowledge-release-assembly-v1.schema.json`. Exact normalized
+assertions are clustered across the newest immutable Release for each book.
+The projection counts canonical independent publications and labels explicit
+positive/negative pairs as `potential_conflict`; it does not issue an
+authoritative contradiction verdict. Semantic adjudication remains the
+responsibility of Evidence Audit.
+
+The assembly is content-addressed and read-only. It exposes stable release,
+book, claim, citation, and opaque publication identities, but never source
+bodies, local paths, source-account values, prompts, answers, credentials, or
+consumer data. Query filtering and result limits change only the returned
+cluster view; the assembly identity and aggregate summary describe the full
+selected snapshot.
+
+Assembly validation fails closed when a cluster exceeds 128 claims, a statement
+or normalized assertion exceeds 4,096 Unicode code points, a claim exceeds 128
+citation IDs, or a cluster exceeds 256 potential-conflict edges. The runtime
+also recomputes cluster identity, publication counts, status, and conflict
+edges, and verifies release, summary, and pagination relationships. It never
+silently truncates evidence within a cluster.
+
+Agent compilation uses a scoped Assembly containing at most the primary Release
+plus 16 selected supporting Releases. Evidence support must have a distinct,
+independently eligible publication identity and a shared normalized assertion
+or explicit polarity conflict with the primary. Automatic discovery examines at
+most the newest 500 latest Release records. Release IDs are bounded to 128
+Unicode code points. Compilation mode and overall status must agree with the
+candidate kinds and candidate statuses in both runtime validation and JSON
+Schema. The Web selector uses
+`GET /api/knowledge/releases?latest=true`, which returns one latest Release per
+book in newest-first order.
 
 ## Health Evidence Consumer
 

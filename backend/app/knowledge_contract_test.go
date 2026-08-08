@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,12 +97,128 @@ func TestKnowledgeContractHealthEvidenceRoundTrip(t *testing.T) {
 	}
 }
 
+func TestKnowledgeReadinessContractRoundTrip(t *testing.T) {
+	raw := []byte(`{
+		"schema_version":"knowledge_readiness.v1",
+		"summary":{
+			"total":1,
+			"ready":0,
+			"needs_analysis":1,
+			"needs_quality":0,
+			"ready_to_publish":0,
+			"published":0,
+			"blocked":0,
+			"analysis_claims":0,
+			"claims_with_evidence":0,
+			"claims_with_explicit_citation":0,
+			"evidence_references":0,
+			"resolved_references":0,
+			"claim_coverage":0,
+			"resolution_rate":0,
+			"explicit_citation_coverage":0
+		},
+		"items":[{
+			"book_id":"book-1",
+			"title":"Book",
+			"publication":{"key":"book:book-1","basis":"book_fallback","independent_source_eligible":false},
+			"stage":"normalized",
+			"next_action":"needs_analysis",
+			"analysis_claims":0,
+			"claims_with_evidence":0,
+			"claims_with_explicit_citation":0,
+			"evidence_references":0,
+			"resolved_references":0,
+			"explicit_citation_references":0,
+			"legacy_direct_chunk_references":0,
+			"claim_coverage":0,
+			"resolution_rate":0,
+			"explicit_citation_coverage":0,
+			"blocker_codes":[],
+			"warning_codes":["publication_identity_not_independent"]
+		}]
+	}`)
+	if err := ValidateKnowledgeReadinessContract(raw); err != nil {
+		t.Fatalf("ValidateKnowledgeReadinessContract() error = %v", err)
+	}
+	var missing map[string]any
+	if err := json.Unmarshal(raw, &missing); err != nil {
+		t.Fatal(err)
+	}
+	delete(missing, "summary")
+	invalid, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateKnowledgeReadinessContract(invalid); err == nil || !strings.Contains(err.Error(), "summary") {
+		t.Fatalf("missing summary error = %v", err)
+	}
+}
+
+func TestKnowledgeReleaseAssemblyContractRoundTrip(t *testing.T) {
+	raw := []byte(fmt.Sprintf(`{
+		"schema_version":"knowledge_release_assembly.v1",
+		"algorithm_version":"deterministic-claim-assembly.v1",
+		"assembly_id":"assembly-fixture",
+		"release_ids":["release-fixture"],
+		"summary":{
+			"release_count":1,
+			"claim_count":1,
+			"cluster_count":1,
+			"matched_cluster_count":1,
+			"corroborated_clusters":0,
+			"potential_conflict_clusters":0,
+			"single_publication_clusters":1,
+			"insufficient_identity_clusters":0
+		},
+		"clusters":[{
+			"cluster_id":%q,
+			"normalized_assertion":"assertion",
+			"status":"single_publication",
+			"publication_count":1,
+			"independent_publication_count":1,
+			"claims":[{
+				"release_id":"release-fixture",
+				"book_id":"book-fixture",
+				"claim_id":"claim-fixture",
+				"statement":"Assertion",
+				"polarity":"positive",
+				"citation_ids":["citation-fixture"],
+				"publication_identity":"account:sha256-0123456789abcdef",
+				"publication_identity_basis":"source_account",
+				"independent_publication_eligible":true
+			}]
+		}],
+		"returned_clusters":1,
+		"has_more":false
+	}`, knowledgeAssemblyHashID("cluster", "assertion")))
+	if err := ValidateKnowledgeReleaseAssemblyContract(raw); err != nil {
+		t.Fatalf("ValidateKnowledgeReleaseAssemblyContract() error = %v", err)
+	}
+	var missing map[string]any
+	if err := json.Unmarshal(raw, &missing); err != nil {
+		t.Fatal(err)
+	}
+	delete(missing, "assembly_id")
+	invalid, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateKnowledgeReleaseAssemblyContract(invalid); err == nil ||
+		!strings.Contains(err.Error(), "assembly_id") {
+		t.Fatalf("missing assembly_id error = %v", err)
+	}
+}
+
 func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 	for _, name := range []string{
 		"knowledge-release-v1.schema.json",
 		"knowledge-feed-v1.schema.json",
+		"knowledge-readiness-v1.schema.json",
+		"knowledge-release-assembly-v1.schema.json",
 		"delivery-receipt-v1.schema.json",
 		"health-evidence-v1.schema.json",
+		"agent-compilation-request-v1.schema.json",
+		"agent-compilation-v1.schema.json",
 	} {
 		raw, err := os.ReadFile(filepath.Join("..", "..", "contracts", name))
 		if err != nil {
@@ -114,6 +231,176 @@ func TestKnowledgeContractSchemaFilesArePresent(t *testing.T) {
 		required, ok := schema["required"].([]any)
 		if !ok || len(required) == 0 {
 			t.Fatalf("%s missing required fields", name)
+		}
+	}
+}
+
+func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
+	requestRaw, err := os.ReadFile(filepath.Join(
+		"..",
+		"..",
+		"contracts",
+		"agent-compilation-request-v1.schema.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requestSchema map[string]any
+	if err := json.Unmarshal(requestRaw, &requestSchema); err != nil {
+		t.Fatal(err)
+	}
+	requestProperties := requestSchema["properties"].(map[string]any)
+	if got := requestProperties["supporting_release_ids"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxSupportingReleases) {
+		t.Fatalf("supporting_release_ids maxItems = %#v", got)
+	}
+	if got := requestProperties["primary_release_id"].(map[string]any)["maxLength"]; got != float64(agentCompilationMaxReleaseIDRunes) {
+		t.Fatalf("primary_release_id maxLength = %#v", got)
+	}
+	requestSupportItems := requestProperties["supporting_release_ids"].(map[string]any)["items"].(map[string]any)
+	if got := requestSupportItems["maxLength"]; got != float64(agentCompilationMaxReleaseIDRunes) {
+		t.Fatalf("supporting release maxLength = %#v", got)
+	}
+
+	responseRaw, err := os.ReadFile(filepath.Join(
+		"..",
+		"..",
+		"contracts",
+		"agent-compilation-v1.schema.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var responseSchema map[string]any
+	if err := json.Unmarshal(responseRaw, &responseSchema); err != nil {
+		t.Fatal(err)
+	}
+	responseProperties := responseSchema["properties"].(map[string]any)
+	if got := responseProperties["candidates"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxCandidates) {
+		t.Fatalf("candidates maxItems = %#v", got)
+	}
+	if got := responseProperties["release_ids"].(map[string]any)["maxItems"]; got != float64(agentCompilationMaxSupportingReleases+1) {
+		t.Fatalf("release_ids maxItems = %#v", got)
+	}
+	if got := len(responseSchema["allOf"].([]any)); got != 6 {
+		t.Fatalf("response mode/status conditional contracts = %d", got)
+	}
+	defs := responseSchema["$defs"].(map[string]any)
+	issueProperties := defs["issue"].(map[string]any)["properties"].(map[string]any)
+	if got := issueProperties["message"].(map[string]any)["maxLength"]; got != float64(agentCompilationMaxIssueMessageRunes) {
+		t.Fatalf("issue message maxLength = %#v", got)
+	}
+	candidate := defs["candidate"].(map[string]any)
+	candidateProperties := candidate["properties"].(map[string]any)
+	if got := len(candidateProperties["package"].(map[string]any)["oneOf"].([]any)); got != 2 {
+		t.Fatalf("candidate package schema refs = %d", got)
+	}
+	if got := len(candidate["allOf"].([]any)); got != 4 {
+		t.Fatalf("candidate conditional contracts = %d", got)
+	}
+	nextActionItems := candidateProperties["next_actions"].(map[string]any)["items"].(map[string]any)
+	if got := nextActionItems["maxLength"]; got != float64(agentCompilationMaxNextActionRunes) {
+		t.Fatalf("next action maxLength = %#v", got)
+	}
+}
+
+func TestAgentCompilationSchemaRequiresPackageVersionForCandidateKind(t *testing.T) {
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := FinalizeAgentPackage(validAgentPackageV2())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilation := AgentCompilation{
+		SchemaVersion:   AgentCompilationSchemaVersion,
+		CompilerVersion: AgentCompilerVersion,
+		CompilationID:   "compilation-schema-fixture",
+		Mode:            AgentCompilationModeStudy,
+		AssemblyID:      "assembly-schema-fixture",
+		ReleaseIDs:      []string{"release-schema-fixture"},
+		Status:          AgentCompilationStatusReady,
+		Candidates: []AgentCompilationCandidate{{
+			Kind:        AgentCompilationCandidateStudy,
+			Status:      AgentCompilationCandidateReady,
+			Package:     &v1,
+			NextActions: []string{AgentCompilationNextActionEvaluate},
+		}},
+	}
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, true)
+
+	compilation.Candidates[0].Package = &v2
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+
+	compilation.Mode = AgentCompilationModeEvidence
+	compilation.Candidates[0].Kind = AgentCompilationCandidateEvidence
+	compilation.Candidates[0].Package = &v1
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+
+	compilation.Mode = AgentCompilationModeStudy
+	compilation.Candidates[0].Kind = AgentCompilationCandidateStudy
+	compilation.Candidates[0].Package = &v1
+	compilation.Status = AgentCompilationStatusBlocked
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+
+	compilation.Status = AgentCompilationStatusReady
+	compilation.Mode = AgentCompilationModeDual
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+}
+
+func TestKnowledgeReleaseAssemblySchemaCarriesHardLimits(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(
+		"..",
+		"..",
+		"contracts",
+		"knowledge-release-assembly-v1.schema.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatal(err)
+	}
+	defs := schema["$defs"].(map[string]any)
+	cluster := defs["cluster"].(map[string]any)
+	clusterProperties := cluster["properties"].(map[string]any)
+	claim := defs["claim"].(map[string]any)
+	claimProperties := claim["properties"].(map[string]any)
+	tests := []struct {
+		name string
+		got  any
+		want float64
+	}{
+		{
+			name: "claims maxItems",
+			got:  clusterProperties["claims"].(map[string]any)["maxItems"],
+			want: knowledgeAssemblyMaxClaimsPerCluster,
+		},
+		{
+			name: "normalized assertion maxLength",
+			got:  clusterProperties["normalized_assertion"].(map[string]any)["maxLength"],
+			want: knowledgeAssemblyMaxStatementRunes,
+		},
+		{
+			name: "potential conflicts maxItems",
+			got:  clusterProperties["potential_conflicts"].(map[string]any)["maxItems"],
+			want: knowledgeAssemblyMaxConflictsPerCluster,
+		},
+		{
+			name: "statement maxLength",
+			got:  claimProperties["statement"].(map[string]any)["maxLength"],
+			want: knowledgeAssemblyMaxStatementRunes,
+		},
+		{
+			name: "citation ids maxItems",
+			got:  claimProperties["citation_ids"].(map[string]any)["maxItems"],
+			want: knowledgeAssemblyMaxCitationIDsPerClaim,
+		},
+	}
+	for _, testCase := range tests {
+		if testCase.got != testCase.want {
+			t.Errorf("%s = %v, want %v", testCase.name, testCase.got, testCase.want)
 		}
 	}
 }

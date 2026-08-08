@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,7 +15,7 @@ import (
 
 const (
 	bookAnalysisVersion       = "1"
-	bookAnalysisPromptVersion = "structured-v1"
+	bookAnalysisPromptVersion = "structured-v2-citations"
 	bookAnalysisMaxTokens     = 4096
 
 	BookAnalysisPending = "pending"
@@ -204,9 +206,9 @@ func GenerateBookAnalysisManifestWithClient(
 	}
 
 	prompt := `请对当前文章做结构化分析。只输出一个 JSON 对象，不要输出解释文字或 Markdown 围栏。结构必须为：
-{"summary":"核心摘要","claims":[{"id":"claim-1","statement":"可验证结论","citation_ids":["来源 ID"],"confidence":0.0,"scope":["适用范围"],"risk_level":"low|medium|high"}],"risks":[{"id":"risk-1","description":"风险与局限","citation_ids":["来源 ID"],"severity":"low|medium|high"}],"actions":[{"id":"action-1","description":"阅读或验证行动","citation_ids":["来源 ID"],"kind":"read|verify|monitor"}]}
-每个事实性结论必须引用提供的来源 ID。区分原文事实与模型推理。actions 只能是阅读、核验或跟踪动作，不能给出个人医疗建议。`
-	contextText, stats, sources, err := buildBookChatContext(store, pkg, prompt, request.MaxContextChars)
+{"summary":"核心摘要","claims":[{"id":"claim-1","statement":"可验证结论","citation_ids":["citation ID"],"confidence":0.0,"scope":["适用范围"],"risk_level":"low|medium|high"}],"risks":[{"id":"risk-1","description":"风险与局限","citation_ids":["citation ID"],"severity":"low|medium|high"}],"actions":[{"id":"action-1","description":"阅读或验证行动","citation_ids":["citation ID"],"kind":"read|verify|monitor"}]}
+每个事实性结论必须引用上下文中 [citation:<id>] 提供的 citation ID。citation_ids 禁止填写 chunk、chapter、claim 或未提供的 ID。Legacy Chunk 只能帮助识别证据缺口，不能作为 citation_ids。区分原文事实与模型推理。actions 只能是阅读、核验或跟踪动作，不能给出个人医疗建议。`
+	contextText, stats, sources, err := buildBookAnalysisContext(store, pkg, prompt, request.MaxContextChars)
 	if err != nil {
 		return nil, err
 	}
@@ -236,11 +238,11 @@ func GenerateBookAnalysisManifestWithClient(
 	messages := []BookKnowledgeMessage{
 		{
 			Role:    "system",
-			Content: "你是 KBase 的知识生产分析器。只使用提供的文章知识包，产出可复核的结构化分析；不得补充知识包中不存在的事实；所有事实性结论都要引用来源 ID。",
+			Content: "你是 KBase 的知识生产分析器。只使用提供的文章知识包，产出可复核的结构化分析；不得补充知识包中不存在的事实；所有事实性结论都要引用显式 citation ID。",
 		},
 		{
 			Role:    "user",
-			Content: buildBookChatUserPrompt(pkg.Book, "analysis", prompt, contextText),
+			Content: buildBookAnalysisUserPrompt(pkg.Book, prompt, contextText),
 		},
 	}
 	answer, err := client.Chat(ctx, cfg, messages)
@@ -256,6 +258,15 @@ func GenerateBookAnalysisManifestWithClient(
 	}
 	structured, err := parseBookAnalysisPayload(answer)
 	if err != nil {
+		manifest.Status = BookAnalysisFailed
+		manifest.Error = trimRunes(err.Error(), 2000)
+		manifest.UpdatedAt = completedAt
+		if saveErr := store.SaveAnalysisManifest(manifest); saveErr != nil {
+			return nil, fmt.Errorf("%w (save failed analysis manifest: %v)", err, saveErr)
+		}
+		return nil, err
+	}
+	if err := validateGeneratedBookAnalysisCitationIDs(*pkg, sources, *structured); err != nil {
 		manifest.Status = BookAnalysisFailed
 		manifest.Error = trimRunes(err.Error(), 2000)
 		manifest.UpdatedAt = completedAt
@@ -299,6 +310,110 @@ func parseBookAnalysisPayload(answer string) (*BookAnalysisPayload, error) {
 		return nil, fmt.Errorf("structured analysis summary is required")
 	}
 	return &payload, nil
+}
+
+func validateGeneratedBookAnalysisCitationIDs(
+	pkg BookKnowledgePackage,
+	sources []BookKnowledgeChatSource,
+	payload BookAnalysisPayload,
+) error {
+	packageCitations := make(map[string]struct{}, len(pkg.Citations))
+	for _, citation := range pkg.Citations {
+		if id := strings.TrimSpace(citation.CitationID); id != "" {
+			packageCitations[id] = struct{}{}
+		}
+	}
+	allowed := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		if source.Kind != "citation" {
+			continue
+		}
+		id := strings.TrimSpace(source.ID)
+		if _, ok := packageCitations[id]; ok {
+			allowed[id] = struct{}{}
+		}
+	}
+	validate := func(kind string, index int, ids []string) error {
+		if len(ids) == 0 {
+			return fmt.Errorf("%s[%d].citation_ids requires at least one exposed citation", kind, index)
+		}
+		for _, rawID := range ids {
+			id := strings.TrimSpace(rawID)
+			if _, ok := allowed[id]; !ok {
+				return fmt.Errorf(
+					"%s[%d].citation_ids contains non-exposed package citation %q",
+					kind,
+					index,
+					opaqueBookAnalysisReferenceID(id),
+				)
+			}
+		}
+		return nil
+	}
+	for index, claim := range payload.Claims {
+		if err := validate("claims", index, claim.CitationIDs); err != nil {
+			return err
+		}
+	}
+	for index, risk := range payload.Risks {
+		if strings.TrimSpace(risk.ID) == "" {
+			return fmt.Errorf("risks[%d].id is required", index)
+		}
+		if strings.TrimSpace(risk.Description) == "" {
+			return fmt.Errorf("risks[%d].description is required", index)
+		}
+		if !validBookRiskLevel(risk.Severity) {
+			return fmt.Errorf("risks[%d].severity is invalid", index)
+		}
+		if err := validate("risks", index, risk.CitationIDs); err != nil {
+			return err
+		}
+	}
+	for index, action := range payload.Actions {
+		if strings.TrimSpace(action.ID) == "" {
+			return fmt.Errorf("actions[%d].id is required", index)
+		}
+		if strings.TrimSpace(action.Description) == "" {
+			return fmt.Errorf("actions[%d].description is required", index)
+		}
+		if !validBookAnalysisActionKind(action.Kind) {
+			return fmt.Errorf("actions[%d].kind is invalid", index)
+		}
+		if err := validate("actions", index, action.CitationIDs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func opaqueBookAnalysisReferenceID(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return "sha256-" + hex.EncodeToString(sum[:8])
+}
+
+func validBookAnalysisActionKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "read", "verify", "monitor":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildBookAnalysisUserPrompt(book BookKnowledgeBook, prompt, contextText string) string {
+	return fmt.Sprintf(`请基于下面的本地书籍证据生成结构化分析。
+
+书名: %s
+任务: %s
+
+要求:
+- 只允许引用上下文中 [citation:<id>] 明示的 citation ID。
+- 不得把 chunk、chapter、claim、Legacy Chunk 或其他 ID 写入 citation_ids。
+- 如果显式 citation 证据不足，减少结论并明确证据缺口。
+- 不要输出大段原文复刻。
+
+本地书籍证据上下文:
+%s`, book.Title, prompt, contextText)
 }
 
 func renderBookAnalysisMarkdown(payload BookAnalysisPayload) string {

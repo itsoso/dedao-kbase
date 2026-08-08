@@ -112,38 +112,51 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 	outcome := SourceItemNew
 	targetBookID := deterministicSourceBookID(normalized.SourceType, normalized.SourceItemID)
 	createdAt := ""
+	metadataOnly := false
+	var existingPackage *BookKnowledgePackage
 	if found {
 		targetBookID = document.TargetBookID
+		existing, loadErr := s.books.LoadPackage(targetBookID)
+		if loadErr != nil {
+			return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
+				fmt.Errorf("load existing source package: %w", loadErr))
+		}
+		existingPackage = existing
+		createdAt = existing.Book.CreatedAt
 		if document.ContentHash == contentHash {
-			outcome = SourceItemSkipped
+			if sourceArticleMetadataChanged(existing.Book, normalized) {
+				outcome = SourceItemUpdated
+				metadataOnly = true
+			} else {
+				outcome = SourceItemSkipped
+			}
 		} else {
 			outcome = SourceItemUpdated
-			existing, loadErr := s.books.LoadPackage(targetBookID)
-			if loadErr != nil {
-				return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
-					fmt.Errorf("load existing source package: %w", loadErr))
-			}
-			createdAt = existing.Book.CreatedAt
 		}
 	}
 
 	acceptedAt := s.now().UTC().Format(time.RFC3339Nano)
 	if outcome != SourceItemSkipped {
 		pkg := buildSourceArticlePackage(normalized, contentHash, targetBookID, createdAt, acceptedAt)
+		if metadataOnly {
+			pkg = updateSourceArticlePackageMetadata(*existingPackage, normalized, acceptedAt)
+		}
 		if err := s.books.SavePackage(pkg); err != nil {
 			return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
 				fmt.Errorf("save source article package: %w", err))
 		}
-		if err := s.books.SaveAnalysisManifest(BookAnalysisManifest{
-			Version:     bookAnalysisVersion,
-			BookID:      targetBookID,
-			ContentHash: contentHash,
-			Status:      BookAnalysisPending,
-			CreatedAt:   acceptedAt,
-			UpdatedAt:   acceptedAt,
-		}); err != nil {
-			return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
-				fmt.Errorf("save source analysis manifest: %w", err))
+		if !metadataOnly {
+			if err := s.books.SaveAnalysisManifest(BookAnalysisManifest{
+				Version:     bookAnalysisVersion,
+				BookID:      targetBookID,
+				ContentHash: contentHash,
+				Status:      BookAnalysisPending,
+				CreatedAt:   acceptedAt,
+				UpdatedAt:   acceptedAt,
+			}); err != nil {
+				return SourceIngestReceipt{}, s.recordFailure(runID, agentID, normalized,
+					fmt.Errorf("save source analysis manifest: %w", err))
+			}
 		}
 	}
 
@@ -158,6 +171,35 @@ func (s *SourceIngestService) IngestArticle(runID, agentID string, envelope Sour
 		return SourceIngestReceipt{}, err
 	}
 	return receipt, nil
+}
+
+func sourceArticleMetadataChanged(book BookKnowledgeBook, envelope SourceArticleEnvelope) bool {
+	return book.Title != envelope.Title ||
+		book.Author != envelope.Author ||
+		book.SourceHTML != envelope.SourceURL ||
+		book.SourceType != envelope.SourceType ||
+		book.SourceKey != envelope.SourceItemID ||
+		book.SourceAccount != envelope.SourceAccount ||
+		book.PublishedAt != envelope.PublishedAt
+}
+
+func updateSourceArticlePackageMetadata(pkg BookKnowledgePackage, envelope SourceArticleEnvelope, updatedAt string) BookKnowledgePackage {
+	pkg.Book.Title = envelope.Title
+	pkg.Book.Author = envelope.Author
+	pkg.Book.SourceHTML = envelope.SourceURL
+	pkg.Book.SourceType = envelope.SourceType
+	pkg.Book.SourceKey = envelope.SourceItemID
+	pkg.Book.SourceAccount = envelope.SourceAccount
+	pkg.Book.PublishedAt = envelope.PublishedAt
+	pkg.Book.UpdatedAt = updatedAt
+	for index := range pkg.Citations {
+		pkg.Citations[index].SourceHTML = envelope.SourceURL
+		pkg.Citations[index].SourceType = envelope.SourceType
+		pkg.Citations[index].SourceAccount = envelope.SourceAccount
+		pkg.Citations[index].SourceItemKey = envelope.SourceItemID
+		pkg.Citations[index].PublishedAt = envelope.PublishedAt
+	}
+	return pkg
 }
 
 func (s *SourceIngestService) recordKnowledgeCatalog(envelope SourceArticleEnvelope, receipt SourceIngestReceipt) error {

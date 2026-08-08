@@ -353,4 +353,3 @@ Expected: all checks pass and status contains no binaries, downloaded books, con
 **Step 5: Manual local-server verification**
 
 Use only test fixtures. Verify the home login CTA, login terminal states, shelf/site switch, eligible job creation, terminal task status, and successful knowledge-package link. Do not commit account details, QR data, personal downloads, or screenshots containing private information.
-

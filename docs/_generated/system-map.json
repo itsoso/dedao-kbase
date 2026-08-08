@@ -10,8 +10,16 @@
       "path": "cmd/kbase-server/main.go"
     },
     {
+      "name": "kbase-session-admin",
+      "path": "cmd/kbase-session-admin/main.go"
+    },
+    {
       "name": "source-agent",
       "path": "cmd/source-agent/main.go"
+    },
+    {
+      "name": "source-agent-updater",
+      "path": "cmd/source-agent-updater/main.go"
     },
     {
       "name": "system-map",
@@ -26,7 +34,7 @@
     {
       "path": "/api/",
       "file": "backend/app/kbase_http.go",
-      "line": 184,
+      "line": 277,
       "authenticated": true
     },
     {
@@ -36,99 +44,171 @@
       "authenticated": true
     },
     {
+      "path": "/api/admin/browser-sessions",
+      "file": "backend/app/kbase_http.go",
+      "line": 4898,
+      "authenticated": true
+    },
+    {
+      "path": "/api/admin/browser-sessions",
+      "file": "cmd/kbase-session-admin/main.go",
+      "line": 128,
+      "authenticated": true
+    },
+    {
+      "path": "/api/admin/browser-sessions/",
+      "file": "cmd/kbase-session-admin/main.go",
+      "line": 133,
+      "authenticated": true
+    },
+    {
+      "path": "/api/admin/browser-sessions/revoke-all",
+      "file": "cmd/kbase-session-admin/main.go",
+      "line": 138,
+      "authenticated": true
+    },
+    {
+      "path": "/api/agent-audits",
+      "file": "backend/app/kbase_http.go",
+      "line": 460,
+      "authenticated": true
+    },
+    {
+      "path": "/api/agent-audits/",
+      "file": "backend/app/kbase_http.go",
+      "line": 460,
+      "authenticated": true
+    },
+    {
       "path": "/api/agent-packages",
       "file": "backend/app/kbase_http.go",
-      "line": 332,
+      "line": 464,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/",
       "file": "backend/app/agent_package_store.go",
-      "line": 304,
+      "line": 485,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/",
       "file": "backend/app/kbase_http.go",
-      "line": 332,
+      "line": 464,
+      "authenticated": true
+    },
+    {
+      "path": "/api/agent-packages/compile",
+      "file": "backend/app/kbase_http.go",
+      "line": 2212,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/evaluate",
       "file": "backend/app/kbase_http.go",
-      "line": 214,
+      "line": 310,
       "authenticated": true
     },
     {
-      "path": "/api/agent-packages/publish",
-      "file": "backend/app/kbase_http.go",
-      "line": 214,
-      "authenticated": true
-    },
-    {
-      "path": "/api/article/all_articles",
-      "file": "backend/app/kbase_http.go",
-      "line": 459,
-      "authenticated": true
-    },
-    {
-      "path": "/api/article/all_articles/export_xlsx",
-      "file": "backend/app/kbase_http.go",
-      "line": 2280,
-      "authenticated": true
-    },
-    {
-      "path": "/api/article/content",
-      "file": "backend/app/wcplus_source.go",
-      "line": 348,
-      "authenticated": true
-    },
-    {
-      "path": "/api/article/export_text",
-      "file": "backend/app/kbase_http.go",
-      "line": 475,
-      "authenticated": true
-    },
-    {
-      "path": "/api/article/gzh",
-      "file": "backend/app/kbase_http.go",
-      "line": 469,
-      "authenticated": true
-    },
-    {
-      "path": "/api/article/search_title",
-      "file": "backend/app/kbase_http.go",
-      "line": 461,
-      "authenticated": true
-    },
-    {
-      "path": "/api/batch_task/create_task",
-      "file": "backend/app/kbase_http.go",
-      "line": 2213,
-      "authenticated": true
-    },
-    {
-      "path": "/api/batch_task/delete_task",
+      "path": "/api/agent-packages/evaluation-suites/trust",
       "file": "backend/app/kbase_http.go",
       "line": 2215,
       "authenticated": true
     },
     {
+      "path": "/api/agent-packages/publish",
+      "file": "backend/app/kbase_http.go",
+      "line": 309,
+      "authenticated": true
+    },
+    {
+      "path": "/api/agent-traces/",
+      "file": "backend/app/kbase_http.go",
+      "line": 456,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/all_articles",
+      "file": "backend/app/kbase_http.go",
+      "line": 593,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/all_articles/export_xlsx",
+      "file": "backend/app/kbase_http.go",
+      "line": 3642,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/content",
+      "file": "backend/app/wcplus_source.go",
+      "line": 373,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/export_text",
+      "file": "backend/app/kbase_http.go",
+      "line": 609,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/gzh",
+      "file": "backend/app/kbase_http.go",
+      "line": 603,
+      "authenticated": true
+    },
+    {
+      "path": "/api/article/search_title",
+      "file": "backend/app/kbase_http.go",
+      "line": 595,
+      "authenticated": true
+    },
+    {
+      "path": "/api/batch_task/create_task",
+      "file": "backend/app/kbase_http.go",
+      "line": 3575,
+      "authenticated": true
+    },
+    {
+      "path": "/api/batch_task/delete_task",
+      "file": "backend/app/kbase_http.go",
+      "line": 3577,
+      "authenticated": true
+    },
+    {
       "path": "/api/book-chat",
       "file": "backend/app/kbase_http.go",
-      "line": 340,
+      "line": 472,
       "authenticated": true
     },
     {
       "path": "/api/books",
       "file": "backend/app/kbase_http.go",
-      "line": 426,
+      "line": 558,
       "authenticated": true
     },
     {
       "path": "/api/books/",
       "file": "backend/app/kbase_http.go",
-      "line": 428,
+      "line": 562,
+      "authenticated": true
+    },
+    {
+      "path": "/api/browser/session",
+      "file": "backend/app/kbase_http.go",
+      "line": 5012,
+      "authenticated": true
+    },
+    {
+      "path": "/api/browser/session/logout",
+      "file": "backend/app/kbase_http.go",
+      "line": 5014,
+      "authenticated": true
+    },
+    {
+      "path": "/api/citations/",
+      "file": "backend/app/kbase_http.go",
+      "line": 560,
       "authenticated": true
     },
     {
@@ -140,121 +220,121 @@
     {
       "path": "/api/consumers/health/evidence/",
       "file": "backend/app/kbase_http.go",
-      "line": 1152,
+      "line": 1286,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/readiness",
       "file": "backend/app/kbase_http.go",
-      "line": 280,
+      "line": 392,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/readiness/analyze",
       "file": "backend/app/kbase_http.go",
-      "line": 284,
+      "line": 396,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/releases",
       "file": "backend/app/kbase_http.go",
-      "line": 276,
+      "line": 388,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/search",
       "file": "backend/app/kbase_http.go",
-      "line": 288,
+      "line": 400,
       "authenticated": true
     },
     {
       "path": "/api/context-chat",
       "file": "backend/app/kbase_http.go",
-      "line": 348,
+      "line": 480,
       "authenticated": true
     },
     {
       "path": "/api/dedao/article",
       "file": "backend/app/kbase_http.go",
-      "line": 412,
+      "line": 544,
       "authenticated": true
     },
     {
       "path": "/api/dedao/audio",
       "file": "backend/app/kbase_http.go",
-      "line": 416,
+      "line": 548,
       "authenticated": true
     },
     {
       "path": "/api/dedao/auth/check",
       "file": "backend/app/kbase_http.go",
-      "line": 380,
+      "line": 512,
       "authenticated": true
     },
     {
       "path": "/api/dedao/auth/qrcode",
       "file": "backend/app/kbase_http.go",
-      "line": 372,
+      "line": 504,
       "authenticated": true
     },
     {
       "path": "/api/dedao/course",
       "file": "backend/app/kbase_http.go",
-      "line": 404,
+      "line": 536,
       "authenticated": true
     },
     {
       "path": "/api/dedao/course/articles",
       "file": "backend/app/kbase_http.go",
-      "line": 408,
+      "line": 540,
       "authenticated": true
     },
     {
       "path": "/api/dedao/ebooks/",
       "file": "backend/app/kbase_http.go",
-      "line": 392,
+      "line": 524,
       "authenticated": true
     },
     {
       "path": "/api/dedao/home",
       "file": "backend/app/kbase_http.go",
-      "line": 400,
+      "line": 532,
       "authenticated": true
     },
     {
       "path": "/api/dedao/library",
       "file": "backend/app/kbase_http.go",
-      "line": 396,
+      "line": 528,
       "authenticated": true
     },
     {
       "path": "/api/dedao/search/ebooks",
       "file": "backend/app/kbase_http.go",
-      "line": 388,
+      "line": 520,
       "authenticated": true
     },
     {
       "path": "/api/dedao/session",
       "file": "backend/app/kbase_http.go",
-      "line": 364,
+      "line": 496,
       "authenticated": true
     },
     {
       "path": "/api/gzh/export_csv",
       "file": "backend/app/kbase_http.go",
-      "line": 477,
+      "line": 611,
       "authenticated": true
     },
     {
       "path": "/api/gzh/list",
       "file": "backend/app/wcplus_source.go",
-      "line": 242,
+      "line": 267,
       "authenticated": true
     },
     {
       "path": "/api/gzh/search",
       "file": "backend/app/kbase_http.go",
-      "line": 455,
+      "line": 589,
       "authenticated": true
     },
     {
@@ -272,73 +352,85 @@
     {
       "path": "/api/jobs",
       "file": "backend/app/kbase_http.go",
-      "line": 356,
+      "line": 488,
       "authenticated": true
     },
     {
       "path": "/api/jobs/",
       "file": "backend/app/kbase_http.go",
-      "line": 360,
+      "line": 492,
+      "authenticated": true
+    },
+    {
+      "path": "/api/knowledge/assembly",
+      "file": "backend/app/kbase_http.go",
+      "line": 440,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/feed",
       "file": "backend/app/kbase_http.go",
-      "line": 296,
+      "line": 408,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/gaps",
       "file": "backend/app/kbase_http.go",
-      "line": 308,
+      "line": 420,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/impact",
       "file": "backend/app/kbase_http.go",
-      "line": 304,
+      "line": 416,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/lineage/",
       "file": "backend/app/kbase_http.go",
-      "line": 300,
+      "line": 412,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/operations",
       "file": "backend/app/kbase_http.go",
-      "line": 316,
+      "line": 428,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/operations/replay",
       "file": "backend/app/kbase_http.go",
-      "line": 320,
+      "line": 432,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/pipeline",
       "file": "backend/app/kbase_http.go",
-      "line": 324,
+      "line": 444,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/pipeline/run",
       "file": "backend/app/kbase_http.go",
-      "line": 328,
+      "line": 448,
+      "authenticated": true
+    },
+    {
+      "path": "/api/knowledge/readiness",
+      "file": "backend/app/kbase_http.go",
+      "line": 436,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/releases",
       "file": "backend/app/kbase_http.go",
-      "line": 336,
+      "line": 468,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/releases/",
       "file": "backend/app/kbase_http.go",
-      "line": 336,
+      "line": 468,
       "authenticated": true
     },
     {
@@ -350,13 +442,13 @@
     {
       "path": "/api/knowledge/review",
       "file": "backend/app/kbase_http.go",
-      "line": 312,
+      "line": 424,
       "authenticated": true
     },
     {
       "path": "/api/like_article/get_all",
       "file": "backend/app/kbase_http.go",
-      "line": 471,
+      "line": 605,
       "authenticated": true
     },
     {
@@ -452,37 +544,37 @@
     {
       "path": "/api/report/gzh_articles",
       "file": "backend/app/wcplus_source.go",
-      "line": 281,
+      "line": 306,
       "authenticated": true
     },
     {
       "path": "/api/report/reading_data",
       "file": "backend/app/kbase_http.go",
-      "line": 465,
+      "line": 599,
       "authenticated": true
     },
     {
       "path": "/api/report/reading_data",
       "file": "backend/app/wcplus_agent.go",
-      "line": 302,
+      "line": 508,
       "authenticated": true
     },
     {
       "path": "/api/report/statistic_data",
       "file": "backend/app/kbase_http.go",
-      "line": 467,
+      "line": 601,
       "authenticated": true
     },
     {
       "path": "/api/req_data/get_gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 473,
+      "line": 607,
       "authenticated": true
     },
     {
       "path": "/api/search",
       "file": "backend/app/kbase_http.go",
-      "line": 430,
+      "line": 564,
       "authenticated": true
     },
     {
@@ -494,7 +586,7 @@
     {
       "path": "/api/search/search",
       "file": "backend/app/kbase_http.go",
-      "line": 463,
+      "line": 597,
       "authenticated": true
     },
     {
@@ -506,349 +598,397 @@
     {
       "path": "/api/search_gzh/search",
       "file": "backend/app/kbase_http.go",
-      "line": 457,
+      "line": 591,
       "authenticated": true
     },
     {
       "path": "/api/search_gzh/search",
       "file": "backend/app/wcplus_source.go",
-      "line": 878,
+      "line": 903,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent-artifacts",
+      "file": "backend/app/kbase_http.go",
+      "line": 3730,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/",
       "file": "backend/app/kbase_http.go",
-      "line": 203,
+      "line": 298,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/artifacts/",
+      "file": "backend/app/kbase_http.go",
+      "line": 3740,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/artifacts/",
+      "file": "backend/app/source_agent_client.go",
+      "line": 448,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/commands/",
+      "file": "backend/app/kbase_http.go",
+      "line": 3795,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/commands/",
+      "file": "backend/app/source_agent_client.go",
+      "line": 407,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/commands/claim",
+      "file": "backend/app/kbase_http.go",
+      "line": 3749,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/commands/claim",
+      "file": "backend/app/source_agent_client.go",
+      "line": 238,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/commands/recover",
+      "file": "backend/app/kbase_http.go",
+      "line": 3751,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agent/commands/recover",
+      "file": "backend/app/source_agent_client.go",
+      "line": 290,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/kbase_http.go",
-      "line": 2381,
+      "line": 3753,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/source_agent_client.go",
-      "line": 146,
+      "line": 200,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/kbase_http.go",
-      "line": 2392,
+      "line": 3764,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/source_agent_client.go",
-      "line": 166,
+      "line": 220,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 2428,
+      "line": 4204,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/source_agent_client.go",
-      "line": 185,
+      "line": 684,
       "authenticated": true
     },
     {
       "path": "/api/source-agents",
       "file": "backend/app/kbase_http.go",
-      "line": 2368,
+      "line": 3731,
+      "authenticated": true
+    },
+    {
+      "path": "/api/source-agents/",
+      "file": "backend/app/kbase_http.go",
+      "line": 3732,
       "authenticated": true
     },
     {
       "path": "/api/source-assets/",
       "file": "backend/app/kbase_http.go",
-      "line": 232,
+      "line": 344,
       "authenticated": true
     },
     {
       "path": "/api/source-assets/",
       "file": "backend/app/wechat_agent.go",
-      "line": 217,
+      "line": 266,
       "authenticated": true
     },
     {
       "path": "/api/source-subscriptions",
       "file": "backend/app/kbase_http.go",
-      "line": 2369,
+      "line": 3733,
       "authenticated": true
     },
     {
       "path": "/api/source-subscriptions/",
       "file": "backend/app/kbase_http.go",
-      "line": 2370,
+      "line": 3734,
       "authenticated": true
     },
     {
       "path": "/api/source-sync/runs",
       "file": "backend/app/kbase_http.go",
-      "line": 2371,
+      "line": 3735,
       "authenticated": true
     },
     {
       "path": "/api/source-sync/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 2372,
+      "line": 3736,
       "authenticated": true
     },
     {
       "path": "/api/system-kb/export",
       "file": "backend/app/kbase_http.go",
-      "line": 432,
+      "line": 566,
       "authenticated": true
     },
     {
       "path": "/api/system-kb/manifest",
       "file": "backend/app/kbase_http.go",
-      "line": 434,
+      "line": 568,
       "authenticated": true
     },
     {
       "path": "/api/task/all",
       "file": "backend/app/wcplus_source.go",
-      "line": 515,
+      "line": 540,
       "authenticated": true
     },
     {
       "path": "/api/task/control",
       "file": "backend/app/kbase_http.go",
-      "line": 2359,
+      "line": 3721,
       "authenticated": true
     },
     {
       "path": "/api/task/control",
       "file": "backend/app/wcplus_agent.go",
-      "line": 352,
+      "line": 558,
       "authenticated": true
     },
     {
       "path": "/api/task/control",
       "file": "backend/app/wcplus_source.go",
-      "line": 553,
+      "line": 578,
       "authenticated": true
     },
     {
       "path": "/api/task/new",
       "file": "backend/app/wcplus_source.go",
-      "line": 538,
-      "authenticated": true
-    },
-    {
-      "path": "/api/v2/studies/",
-      "file": "backend/app/clinical_trials_gov.go",
-      "line": 738,
-      "authenticated": true
-    },
-    {
-      "path": "/api/v2/version",
-      "file": "backend/app/clinical_trials_gov.go",
-      "line": 780,
+      "line": 563,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/",
       "file": "backend/app/kbase_http.go",
-      "line": 244,
+      "line": 356,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/all",
       "file": "backend/app/kbase_http.go",
-      "line": 458,
+      "line": 592,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/content",
       "file": "backend/app/kbase_http.go",
-      "line": 446,
+      "line": 580,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 468,
+      "line": 602,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/search-title",
       "file": "backend/app/kbase_http.go",
-      "line": 460,
+      "line": 594,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-import/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 2218,
+      "line": 3580,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-task/create",
       "file": "backend/app/kbase_http.go",
-      "line": 2212,
+      "line": 3574,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-task/delete",
       "file": "backend/app/kbase_http.go",
-      "line": 2214,
+      "line": 3576,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/env/check",
       "file": "backend/app/kbase_http.go",
-      "line": 452,
+      "line": 586,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/export/all-articles-xlsx",
       "file": "backend/app/kbase_http.go",
-      "line": 2216,
+      "line": 3578,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/export/gzh-csv",
       "file": "backend/app/kbase_http.go",
-      "line": 476,
+      "line": 610,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/export/text",
       "file": "backend/app/kbase_http.go",
-      "line": 474,
+      "line": 608,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/gzh/articles",
       "file": "backend/app/kbase_http.go",
-      "line": 444,
+      "line": 578,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/gzh/list",
       "file": "backend/app/kbase_http.go",
-      "line": 442,
+      "line": 576,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/gzh/search",
       "file": "backend/app/kbase_http.go",
-      "line": 454,
+      "line": 588,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/account",
       "file": "backend/app/kbase_http.go",
-      "line": 2206,
+      "line": 3568,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/article",
       "file": "backend/app/kbase_http.go",
-      "line": 2202,
+      "line": 3564,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/raw",
       "file": "backend/app/kbase_http.go",
-      "line": 2204,
+      "line": 3566,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/like-articles",
       "file": "backend/app/kbase_http.go",
-      "line": 470,
+      "line": 604,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/report/reading-data",
       "file": "backend/app/kbase_http.go",
-      "line": 464,
+      "line": 598,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/report/statistic-data",
       "file": "backend/app/kbase_http.go",
-      "line": 466,
+      "line": 600,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/request/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 472,
+      "line": 606,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/search",
       "file": "backend/app/kbase_http.go",
-      "line": 462,
+      "line": 596,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/search-gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 456,
+      "line": 590,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/status",
       "file": "backend/app/kbase_http.go",
-      "line": 450,
+      "line": 584,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/all",
       "file": "backend/app/kbase_http.go",
-      "line": 448,
+      "line": 582,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/control",
       "file": "backend/app/kbase_http.go",
-      "line": 2210,
+      "line": 3572,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/new",
       "file": "backend/app/kbase_http.go",
-      "line": 2208,
+      "line": 3570,
       "authenticated": true
     },
     {
       "path": "/api/wechat/article",
       "file": "backend/app/kbase_http.go",
-      "line": 436,
+      "line": 570,
       "authenticated": true
     },
     {
       "path": "/api/wechat/articles",
       "file": "backend/app/kbase_http.go",
-      "line": 440,
+      "line": 574,
       "authenticated": true
     },
     {
       "path": "/api/wechat/import",
       "file": "backend/app/kbase_http.go",
-      "line": 236,
+      "line": 348,
       "authenticated": true
     },
     {
       "path": "/api/wechat/search",
       "file": "backend/app/kbase_http.go",
-      "line": 438,
+      "line": 572,
       "authenticated": true
     },
     {
       "path": "/health",
       "file": "backend/app/kbase_http.go",
-      "line": 188,
+      "line": 281,
       "authenticated": false
     },
     {
@@ -862,7 +1002,7 @@
     {
       "name": "discover_articles",
       "file": "backend/app/source_sync.go",
-      "line": 606
+      "line": 676
     },
     {
       "name": "discover_articles",
@@ -877,12 +1017,12 @@
     {
       "name": "existing_articles",
       "file": "backend/app/source_sync.go",
-      "line": 593
+      "line": 663
     },
     {
       "name": "existing_articles",
       "file": "backend/app/wcplus_agent.go",
-      "line": 188
+      "line": 71
     },
     {
       "name": "existing_articles",
@@ -890,14 +1030,9 @@
       "line": 212
     },
     {
-      "name": "existing_articles",
-      "file": "cmd/wcplus-agent/main.go",
-      "line": 22
-    },
-    {
       "name": "sync_articles",
       "file": "backend/app/source_sync.go",
-      "line": 591
+      "line": 661
     },
     {
       "name": "sync_articles",
@@ -912,22 +1047,17 @@
     {
       "name": "sync_content",
       "file": "backend/app/wcplus_agent.go",
-      "line": 188
+      "line": 71
     },
     {
       "name": "sync_content",
       "file": "cmd/system-map/main.go",
       "line": 212
-    },
-    {
-      "name": "sync_content",
-      "file": "cmd/wcplus-agent/main.go",
-      "line": 23
     },
     {
       "name": "sync_media",
       "file": "backend/app/source_sync.go",
-      "line": 606
+      "line": 676
     },
     {
       "name": "sync_media",
@@ -944,42 +1074,42 @@
     {
       "name": "AgentEvaluationReport",
       "file": "backend/app/agent_package_evaluation.go",
-      "line": 47
+      "line": 55
     },
     {
       "name": "AgentPackage",
       "file": "backend/app/agent_package.go",
-      "line": 26
+      "line": 41
     },
     {
       "name": "AgentPackageIdempotencyRecord",
       "file": "backend/app/agent_package_store.go",
-      "line": 31
+      "line": 44
     },
     {
       "name": "AgentPackageManifest",
       "file": "backend/app/agent_package_store.go",
-      "line": 38
+      "line": 51
     },
     {
       "name": "AgentPackageRecord",
       "file": "backend/app/agent_package_store.go",
-      "line": 21
+      "line": 24
     },
     {
       "name": "AgentPackageUIManifest",
       "file": "backend/app/agent_package.go",
-      "line": 96
+      "line": 132
     },
     {
       "name": "AgentTraceOTLPEnvelope",
       "file": "backend/app/agent_trace.go",
-      "line": 460
+      "line": 1393
     },
     {
       "name": "BookAnalysisManifest",
       "file": "backend/app/book_analysis.go",
-      "line": 99
+      "line": 101
     },
     {
       "name": "BookKnowledgeBook",
@@ -1047,6 +1177,16 @@
       "line": 54
     },
     {
+      "name": "BookKnowledgeLLMResult",
+      "file": "backend/app/book_chat.go",
+      "line": 91
+    },
+    {
+      "name": "BookKnowledgeLLMUsage",
+      "file": "backend/app/book_chat.go",
+      "line": 84
+    },
+    {
       "name": "BookKnowledgeMCPResource",
       "file": "backend/app/book_mcp.go",
       "line": 17
@@ -1107,19 +1247,24 @@
       "line": 32
     },
     {
-      "name": "ClinicalTrialAuditRun",
-      "file": "backend/app/clinical_trial_audit.go",
-      "line": 91
-    },
-    {
-      "name": "ClinicalTrialAuditStoredRun",
-      "file": "backend/app/clinical_trial_audit_store.go",
-      "line": 64
-    },
-    {
       "name": "DownloadTask",
       "file": "backend/request/download.go",
       "line": 23
+    },
+    {
+      "name": "EvidenceAuditIdempotencyRecord",
+      "file": "backend/app/evidence_audit_store.go",
+      "line": 77
+    },
+    {
+      "name": "EvidenceAuditManifest",
+      "file": "backend/app/evidence_audit_store.go",
+      "line": 88
+    },
+    {
+      "name": "EvidenceAuditRecord",
+      "file": "backend/app/evidence_audit_store.go",
+      "line": 42
     },
     {
       "name": "HealthEvidencePackage",
@@ -1170,6 +1315,21 @@
       "name": "KnowledgeEvalSuite",
       "file": "backend/app/knowledge_eval.go",
       "line": 18
+    },
+    {
+      "name": "KnowledgeEvidenceClaimResult",
+      "file": "backend/app/knowledge_evidence.go",
+      "line": 35
+    },
+    {
+      "name": "KnowledgeEvidenceIssue",
+      "file": "backend/app/knowledge_evidence.go",
+      "line": 27
+    },
+    {
+      "name": "KnowledgeEvidenceReport",
+      "file": "backend/app/knowledge_evidence.go",
+      "line": 43
     },
     {
       "name": "KnowledgeFeedItem",
@@ -1229,37 +1389,57 @@
     {
       "name": "KnowledgeOperationsConsole",
       "file": "backend/app/knowledge_operations.go",
-      "line": 11
+      "line": 12
     },
     {
       "name": "KnowledgeOperationsFailureSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 54
+      "line": 93
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewDiagnosticAction",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 80
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewDiagnosticBlocker",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 86
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewDiagnostics",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 73
+    },
+    {
+      "name": "KnowledgeOperationsHealthReviewItem",
+      "file": "backend/app/knowledge_operations.go",
+      "line": 57
     },
     {
       "name": "KnowledgeOperationsHealthSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 44
+      "line": 47
     },
     {
       "name": "KnowledgeOperationsItem",
       "file": "backend/app/knowledge_operations.go",
-      "line": 29
+      "line": 32
     },
     {
       "name": "KnowledgeOperationsReplayRequest",
       "file": "backend/app/knowledge_operations.go",
-      "line": 61
+      "line": 100
     },
     {
       "name": "KnowledgeOperationsReplayResult",
       "file": "backend/app/knowledge_operations.go",
-      "line": 70
+      "line": 109
     },
     {
       "name": "KnowledgeOperationsSummary",
       "file": "backend/app/knowledge_operations.go",
-      "line": 17
+      "line": 20
     },
     {
       "name": "KnowledgePipelineAutomationRequest",
@@ -1297,6 +1477,26 @@
       "line": 21
     },
     {
+      "name": "KnowledgePublicationIdentity",
+      "file": "backend/app/knowledge_evidence.go",
+      "line": 21
+    },
+    {
+      "name": "KnowledgeReadiness",
+      "file": "backend/app/knowledge_readiness.go",
+      "line": 14
+    },
+    {
+      "name": "KnowledgeReadinessItem",
+      "file": "backend/app/knowledge_readiness.go",
+      "line": 38
+    },
+    {
+      "name": "KnowledgeReadinessSummary",
+      "file": "backend/app/knowledge_readiness.go",
+      "line": 20
+    },
+    {
       "name": "KnowledgeRebuildPlan",
       "file": "backend/app/knowledge_rebuild_plan.go",
       "line": 23
@@ -1315,6 +1515,36 @@
       "name": "KnowledgeRelease",
       "file": "backend/app/knowledge_release.go",
       "line": 24
+    },
+    {
+      "name": "KnowledgeReleaseAssembly",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 45
+    },
+    {
+      "name": "KnowledgeReleaseAssemblyClaimRef",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 77
+    },
+    {
+      "name": "KnowledgeReleaseAssemblyCluster",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 67
+    },
+    {
+      "name": "KnowledgeReleaseAssemblyPotentialConflict",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 89
+    },
+    {
+      "name": "KnowledgeReleaseAssemblyQuery",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 39
+    },
+    {
+      "name": "KnowledgeReleaseAssemblySummary",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 56
     },
     {
       "name": "KnowledgeReleaseManifest",
@@ -1389,32 +1619,82 @@
     {
       "name": "SourceAgent",
       "file": "backend/app/source_sync.go",
-      "line": 67
+      "line": 83
+    },
+    {
+      "name": "SourceAgentArtifact",
+      "file": "backend/app/source_agent_artifact.go",
+      "line": 37
+    },
+    {
+      "name": "SourceAgentArtifactCatalog",
+      "file": "backend/app/source_agent_artifact.go",
+      "line": 79
+    },
+    {
+      "name": "SourceAgentArtifactPublic",
+      "file": "backend/app/source_agent_artifact.go",
+      "line": 55
+    },
+    {
+      "name": "SourceAgentArtifactTarget",
+      "file": "backend/app/source_agent_artifact.go",
+      "line": 72
+    },
+    {
+      "name": "SourceAgentBinaryIdentity",
+      "file": "backend/app/source_agent_update.go",
+      "line": 177
     },
     {
       "name": "SourceAgentClient",
       "file": "backend/app/source_agent_client.go",
-      "line": 112
+      "line": 162
+    },
+    {
+      "name": "SourceAgentCommand",
+      "file": "backend/app/source_agent_command.go",
+      "line": 149
+    },
+    {
+      "name": "SourceAgentCommandCreate",
+      "file": "backend/app/source_agent_command.go",
+      "line": 134
+    },
+    {
+      "name": "SourceAgentCommandEvent",
+      "file": "backend/app/source_agent_command.go",
+      "line": 168
+    },
+    {
+      "name": "SourceAgentCommandTransition",
+      "file": "backend/app/source_agent_command.go",
+      "line": 142
     },
     {
       "name": "SourceAgentConfig",
       "file": "backend/app/source_agent_client.go",
-      "line": 19
+      "line": 38
     },
     {
       "name": "SourceAgentCycleResult",
       "file": "backend/app/source_agent_runner.go",
-      "line": 28
+      "line": 69
+    },
+    {
+      "name": "SourceAgentDiagnosticReport",
+      "file": "backend/app/source_agent_command_runner.go",
+      "line": 38
     },
     {
       "name": "SourceAgentHTTPError",
       "file": "backend/app/source_agent_client.go",
-      "line": 98
+      "line": 137
     },
     {
       "name": "SourceAgentHeartbeat",
       "file": "backend/app/source_sync.go",
-      "line": 50
+      "line": 54
     },
     {
       "name": "SourceAgentOutbox",
@@ -1427,14 +1707,114 @@
       "line": 24
     },
     {
+      "name": "SourceAgentPendingUpdate",
+      "file": "backend/app/source_agent_update_pending.go",
+      "line": 17
+    },
+    {
+      "name": "SourceAgentPendingUpdateRunnerConfig",
+      "file": "backend/app/source_agent_update_pending_runner.go",
+      "line": 10
+    },
+    {
+      "name": "SourceAgentReadyChallenge",
+      "file": "backend/app/source_agent_update.go",
+      "line": 239
+    },
+    {
+      "name": "SourceAgentReadyExpectation",
+      "file": "backend/app/source_agent_update.go",
+      "line": 184
+    },
+    {
+      "name": "SourceAgentReadyReceipt",
+      "file": "backend/app/source_agent_update.go",
+      "line": 195
+    },
+    {
       "name": "SourceAgentRunner",
       "file": "backend/app/source_agent_runner.go",
-      "line": 20
+      "line": 37
     },
     {
       "name": "SourceAgentRunnerConfig",
       "file": "backend/app/source_agent_runner.go",
-      "line": 12
+      "line": 19
+    },
+    {
+      "name": "SourceAgentRuntimeIdentity",
+      "file": "backend/app/source_agent_update.go",
+      "line": 207
+    },
+    {
+      "name": "SourceAgentTransportError",
+      "file": "backend/app/source_agent_client.go",
+      "line": 143
+    },
+    {
+      "name": "SourceAgentUpdateBridge",
+      "file": "backend/app/source_agent_update_bridge.go",
+      "line": 63
+    },
+    {
+      "name": "SourceAgentUpdateBridgeConfig",
+      "file": "backend/app/source_agent_update_bridge.go",
+      "line": 38
+    },
+    {
+      "name": "SourceAgentUpdateConfig",
+      "file": "backend/app/source_agent_update.go",
+      "line": 293
+    },
+    {
+      "name": "SourceAgentUpdateGuardCheck",
+      "file": "backend/app/source_agent_update.go",
+      "line": 126
+    },
+    {
+      "name": "SourceAgentUpdateRequest",
+      "file": "backend/app/source_agent_update.go",
+      "line": 91
+    },
+    {
+      "name": "SourceAgentUpdateResult",
+      "file": "backend/app/source_agent_update.go",
+      "line": 108
+    },
+    {
+      "name": "SourceAgentUpdateTransaction",
+      "file": "backend/app/source_agent_update.go",
+      "line": 314
+    },
+    {
+      "name": "SourceAgentUpgradeCommandCheckpoint",
+      "file": "backend/app/source_agent_update.go",
+      "line": 216
+    },
+    {
+      "name": "SourceAgentUpgradeConflict",
+      "file": "backend/app/source_agent_update_conflict.go",
+      "line": 18
+    },
+    {
+      "name": "SourceAgentUpgradeResult",
+      "file": "backend/app/source_agent_command_runner.go",
+      "line": 44
+    },
+    {
+      "name": "SourceAgentUpgradeSpec",
+      "file": "backend/app/source_agent_command.go",
+      "line": 129
+    },
+    {
+      "name": "SourceAgentUpgradeTerminalObservation",
+      "file": "backend/app/source_agent_update.go",
+      "line": 227
+    },
+    {
+      "name": "SourceAgentUpgradeTerminalResolution",
+      "file": "backend/app/source_agent_update_terminal.go",
+      "line": 30
     },
     {
       "name": "SourceArticleEnvelope",
@@ -1459,7 +1839,7 @@
     {
       "name": "SourceCapabilityHealth",
       "file": "backend/app/source_sync.go",
-      "line": 60
+      "line": 75
     },
     {
       "name": "SourceCheckpoint",
@@ -1519,162 +1899,177 @@
     {
       "name": "SourceSubscription",
       "file": "backend/app/source_sync.go",
-      "line": 92
+      "line": 120
     },
     {
       "name": "SourceSubscriptionInput",
       "file": "backend/app/source_sync.go",
-      "line": 80
+      "line": 108
     },
     {
       "name": "SourceSyncItem",
       "file": "backend/app/source_sync.go",
-      "line": 139
+      "line": 167
     },
     {
       "name": "SourceSyncItemInput",
       "file": "backend/app/source_sync.go",
-      "line": 130
+      "line": 158
     },
     {
       "name": "SourceSyncRun",
       "file": "backend/app/source_sync.go",
-      "line": 108
+      "line": 136
     },
     {
       "name": "SourceSyncStore",
       "file": "backend/app/source_sync.go",
-      "line": 152
+      "line": 180
     },
     {
       "name": "WCPlusAccount",
       "file": "backend/app/wcplus_source.go",
-      "line": 47
+      "line": 72
     },
     {
       "name": "WCPlusAccountList",
       "file": "backend/app/wcplus_source.go",
-      "line": 56
+      "line": 81
     },
     {
       "name": "WCPlusAgent",
       "file": "backend/app/wcplus_agent.go",
-      "line": 52
+      "line": 320
     },
     {
       "name": "WCPlusAgentBlockedError",
       "file": "backend/app/wcplus_agent.go",
-      "line": 22
+      "line": 29
     },
     {
       "name": "WCPlusAgentConfig",
       "file": "backend/app/wcplus_agent.go",
-      "line": 30
+      "line": 298
     },
     {
       "name": "WCPlusAgentCycleResult",
       "file": "backend/app/wcplus_agent.go",
-      "line": 42
+      "line": 310
     },
     {
       "name": "WCPlusArticle",
       "file": "backend/app/wcplus_source.go",
-      "line": 61
+      "line": 86
     },
     {
       "name": "WCPlusArticleContent",
       "file": "backend/app/wcplus_source.go",
-      "line": 77
+      "line": 102
     },
     {
       "name": "WCPlusArticleList",
       "file": "backend/app/wcplus_source.go",
-      "line": 71
+      "line": 96
     },
     {
       "name": "WCPlusArticleListOptions",
       "file": "backend/app/wcplus_source.go",
-      "line": 38
+      "line": 63
     },
     {
       "name": "WCPlusBatchImportItem",
       "file": "backend/app/wcplus_source.go",
-      "line": 192
+      "line": 217
     },
     {
       "name": "WCPlusBatchImportRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 178
+      "line": 203
     },
     {
       "name": "WCPlusBatchImportResult",
       "file": "backend/app/wcplus_source.go",
-      "line": 200
+      "line": 225
     },
     {
       "name": "WCPlusEnvCheck",
       "file": "backend/app/wcplus_source.go",
-      "line": 165
+      "line": 190
     },
     {
       "name": "WCPlusEnvCheckResult",
       "file": "backend/app/wcplus_source.go",
-      "line": 171
+      "line": 196
     },
     {
       "name": "WCPlusImportAccountRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 103
+      "line": 128
     },
     {
       "name": "WCPlusImportAccountResult",
       "file": "backend/app/wcplus_source.go",
-      "line": 110
+      "line": 135
     },
     {
       "name": "WCPlusImportArticleRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 86
+      "line": 111
     },
     {
       "name": "WCPlusListOptions",
       "file": "backend/app/wcplus_source.go",
-      "line": 30
+      "line": 55
+    },
+    {
+      "name": "WCPlusLocalAPIError",
+      "file": "backend/app/wcplus_source.go",
+      "line": 33
     },
     {
       "name": "WCPlusRawImportRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 93
+      "line": 118
+    },
+    {
+      "name": "WCPlusSourceAdapter",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 44
+    },
+    {
+      "name": "WCPlusSourceAdapterConfig",
+      "file": "backend/app/wcplus_agent.go",
+      "line": 37
     },
     {
       "name": "WCPlusSourceConfig",
       "file": "backend/app/wcplus_source.go",
-      "line": 20
+      "line": 21
     },
     {
       "name": "WCPlusSourceService",
       "file": "backend/app/wcplus_source.go",
-      "line": 25
+      "line": 26
     },
     {
       "name": "WCPlusStatus",
       "file": "backend/app/wcplus_source.go",
-      "line": 156
+      "line": 181
     },
     {
       "name": "WCPlusTask",
       "file": "backend/app/wcplus_source.go",
-      "line": 116
+      "line": 141
     },
     {
       "name": "WCPlusTaskControlRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 151
+      "line": 176
     },
     {
       "name": "WCPlusTaskRequest",
       "file": "backend/app/wcplus_source.go",
-      "line": 132
+      "line": 157
     },
     {
       "name": "WeChatArticle",
@@ -1684,32 +2079,32 @@
     {
       "name": "WeChatDiscoveredArticle",
       "file": "backend/app/wechat_discovery.go",
-      "line": 24
+      "line": 25
     },
     {
       "name": "WeChatDiscovery",
       "file": "backend/app/wechat_discovery.go",
-      "line": 38
+      "line": 39
     },
     {
       "name": "WeChatDiscoveryConfig",
       "file": "backend/app/wechat_discovery.go",
-      "line": 33
+      "line": 34
     },
     {
       "name": "WeChatDiscoveryCursor",
       "file": "backend/app/wechat_discovery.go",
-      "line": 19
+      "line": 20
     },
     {
       "name": "WeChatDiscoveryError",
       "file": "backend/app/wechat_discovery.go",
-      "line": 43
+      "line": 44
     },
     {
       "name": "WeChatDiscoveryPage",
       "file": "backend/app/wechat_discovery.go",
-      "line": 28
+      "line": 29
     },
     {
       "name": "WeChatMPCookie",
@@ -1797,14 +2192,9 @@
       "line": 37
     },
     {
-      "name": "clinicalTrialAuditIdempotencyRecord",
-      "file": "backend/app/clinical_trial_audit_store.go",
-      "line": 1706
-    },
-    {
-      "name": "clinicalTrialsGovVersion",
-      "file": "backend/app/clinical_trials_gov.go",
-      "line": 774
+      "name": "evidenceAuditPreparedRecord",
+      "file": "backend/app/evidence_audit_store.go",
+      "line": 95
     },
     {
       "name": "knowledgeSearchIndexRecord",
@@ -1814,7 +2204,17 @@
     {
       "name": "sourceAgentDoctorReport",
       "file": "cmd/source-agent/main.go",
-      "line": 112
+      "line": 266
+    },
+    {
+      "name": "sourceAgentPendingCommandReport",
+      "file": "backend/app/source_agent_command_runner.go",
+      "line": 52
+    },
+    {
+      "name": "timedReleaseRecord",
+      "file": "backend/app/knowledge_assembly.go",
+      "line": 761
     }
   ]
 }

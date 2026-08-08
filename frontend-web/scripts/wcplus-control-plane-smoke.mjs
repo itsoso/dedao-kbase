@@ -40,6 +40,7 @@ for (const endpoint of [
   'apiFetch("/api/source-sync/runs?limit=200")',
   "/api/source-subscriptions/${encodeURIComponent(subscription.id)}/enabled",
   "/api/source-subscriptions/${encodeURIComponent(subscriptionID)}/sync",
+  "max_items: 500",
   "/api/source-sync/runs/${encodeURIComponent(runID)}",
   "/api/source-sync/runs/${encodeURIComponent(runID)}/retry",
   "/api/source-sync/runs/${encodeURIComponent(runID)}/cancel",

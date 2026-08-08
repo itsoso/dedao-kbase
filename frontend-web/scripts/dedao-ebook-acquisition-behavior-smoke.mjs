@@ -23,6 +23,7 @@ const jsonResponse = (payload, status = 200) => new Response(JSON.stringify(payl
 });
 
 const context = {
+  AbortController,
   Blob,
   FormData,
   Headers,
@@ -47,12 +48,24 @@ const context = {
       removeItem(key) { storage.delete(key); },
       setItem(key, value) { storage.set(key, String(value)); },
     },
-    location: { pathname: "/unit-test", search: "", hash: "" },
+    location: { pathname: "/unit-test", search: "", hash: "", origin: "https://kbase.example" },
   },
 };
 
 context.fetch = async (url, options = {}) => {
-  if (url === "/api/jobs" && options.method === "POST") {
+  const requestURL = new URL(String(url), context.window.location.origin);
+  const requestPath = `${requestURL.pathname}${requestURL.search}`;
+  if (requestPath === "/api/browser/session") {
+    return jsonResponse({
+      session: { id: "session-fixture" },
+      csrf_token: "csrf-fixture",
+      csrf_expires_at: "2099-01-01T00:00:00Z",
+      client_id: "client_fixture_0123456789",
+      epoch: 1,
+    });
+  }
+  if (requestPath === "/api/jobs" && options.method === "POST") {
+    assert.equal(new Headers(options.headers).get("X-KBase-CSRF"), "csrf-fixture");
     const body = JSON.parse(String(options.body || "{}"));
     jobBodies.push(body);
     const response = jsonResponse({ job: { id: `job-${jobBodies.length}`, status: "queued", ebook_enid: body.ebook_enid } }, 202);
@@ -61,22 +74,22 @@ context.fetch = async (url, options = {}) => {
     }
     return response;
   }
-  if (url === "/api/dedao/home?page_size=4") {
+  if (requestPath === "/api/dedao/home?page_size=4") {
     return jsonResponse({ courses: { list: [] }, ebooks: { list: [] }, odob: { list: [] } });
   }
-  if (url === "/api/dedao/session") {
+  if (requestPath === "/api/dedao/session") {
     return jsonResponse({ logged_in: true, active_user: { uid_hazy: "safe-user", name: "测试用户" }, user_count: 1 });
   }
-  if (url === "/api/jobs?limit=50") {
+  if (requestPath === "/api/jobs?limit=50") {
     return jsonResponse({ jobs: [{ id: "persisted-job", type: "dedao_ebook_download", status: "running", ebook_enid: "restored-enid" }] });
   }
-  if (url === "/api/jobs/persisted-job") {
+  if (requestPath === "/api/jobs/persisted-job") {
     return jsonResponse({ job: { id: "persisted-job", type: "dedao_ebook_download", status: "succeeded", ebook_enid: "restored-enid" } });
   }
-  if (String(url).startsWith("/api/dedao/search/ebooks")) {
+  if (requestPath.startsWith("/api/dedao/search/ebooks")) {
     return jsonResponse({ error: "temporary upstream failure" }, 503);
   }
-  throw new Error(`unexpected fetch ${url}`);
+  throw new Error(`unexpected fetch ${requestURL.href}`);
 };
 
 vm.runInNewContext(`${source}\nglobalThis.__dedao = {

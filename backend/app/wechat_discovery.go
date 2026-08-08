@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -135,6 +136,9 @@ func (d *WeChatDiscovery) Discover(ctx context.Context, account string, cursor W
 			items = append(items, WeChatDiscoveredArticle{WeChatOfficialArticle: article, ArticleKey: key})
 		}
 	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return items[i].UpdateTime > items[j].UpdateTime
+	})
 	result.Articles = items
 	return result, nil
 }

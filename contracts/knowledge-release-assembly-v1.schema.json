@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/knowledge-release-assembly-v1.schema.json",
+  "title": "Knowledge Release Assembly v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "algorithm_version",
+    "assembly_id",
+    "release_ids",
+    "summary",
+    "clusters",
+    "returned_clusters",
+    "has_more"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "knowledge_release_assembly.v1"
+    },
+    "algorithm_version": {
+      "const": "deterministic-claim-assembly.v1"
+    },
+    "assembly_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "release_ids": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "clusters": {
+      "type": "array",
+      "maxItems": 500,
+      "items": {
+        "$ref": "#/$defs/cluster"
+      }
+    },
+    "returned_clusters": {
+      "$ref": "#/$defs/nonNegativeInteger"
+    },
+    "has_more": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "release_count",
+        "claim_count",
+        "cluster_count",
+        "matched_cluster_count",
+        "corroborated_clusters",
+        "potential_conflict_clusters",
+        "single_publication_clusters",
+        "insufficient_identity_clusters"
+      ],
+      "properties": {
+        "release_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "claim_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "cluster_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "matched_cluster_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "corroborated_clusters": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "potential_conflict_clusters": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "single_publication_clusters": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "insufficient_identity_clusters": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      }
+    },
+    "cluster": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "cluster_id",
+        "normalized_assertion",
+        "status",
+        "publication_count",
+        "independent_publication_count",
+        "claims"
+      ],
+      "properties": {
+        "cluster_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "normalized_assertion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "status": {
+          "enum": [
+            "potential_conflict",
+            "corroborated",
+            "single_publication",
+            "insufficient_identity"
+          ]
+        },
+        "publication_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "independent_publication_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "claims": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/claim"
+          }
+        },
+        "potential_conflicts": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/potentialConflict"
+          }
+        }
+      }
+    },
+    "claim": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "release_id",
+        "book_id",
+        "claim_id",
+        "statement",
+        "polarity",
+        "citation_ids",
+        "publication_identity",
+        "publication_identity_basis",
+        "independent_publication_eligible"
+      ],
+      "properties": {
+        "release_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "book_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "claim_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "polarity": {
+          "enum": [
+            "positive",
+            "negative"
+          ]
+        },
+        "citation_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "publication_identity": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "publication_identity_basis": {
+          "enum": [
+            "source_account",
+            "source_host",
+            "source_author",
+            "source_item",
+            "book_fallback"
+          ]
+        },
+        "independent_publication_eligible": {
+          "type": "boolean"
+        }
+      }
+    },
+    "potentialConflict": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "conflict_id",
+        "positive_release_id",
+        "positive_claim_id",
+        "negative_release_id",
+        "negative_claim_id",
+        "review_required"
+      ],
+      "properties": {
+        "conflict_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "positive_release_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "positive_claim_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "negative_release_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "negative_claim_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "review_required": {
+          "const": true
+        }
+      }
+    }
+  }
+}

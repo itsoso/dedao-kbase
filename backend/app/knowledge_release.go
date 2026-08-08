@@ -129,6 +129,14 @@ func PublishKnowledgeRelease(store *BookKnowledgeStore, bookID string) (*Knowled
 	if quality.AnalysisHash == "" || quality.AnalysisHash != analysisHash {
 		return nil, fmt.Errorf("knowledge release analysis hash is stale")
 	}
+	evidence := EvaluateKnowledgeEvidence(*pkg, analysis)
+	if evidence.HasBlockers() || evidence.ResolvedReferences == 0 {
+		codes := evidence.BlockerCodes()
+		if len(codes) == 0 {
+			codes = []string{"no_resolved_evidence"}
+		}
+		return nil, fmt.Errorf("knowledge release evidence gate failed: %s", strings.Join(codes, ","))
+	}
 	reverificationTask, err := store.ValidateKnowledgeReverificationPublication(bookID, analysisHash)
 	if err != nil {
 		return nil, err
@@ -388,6 +396,63 @@ func (s *BookKnowledgeStore) ListKnowledgeReleasesForBook(after string, limit in
 		end = len(releases)
 	}
 	return append([]KnowledgeReleaseRecord{}, releases[start:end]...), nil
+}
+
+func (s *BookKnowledgeStore) ListLatestKnowledgeReleasesForBook(
+	after string,
+	limit int,
+	bookID string,
+) ([]KnowledgeReleaseRecord, error) {
+	manifest, err := s.loadKnowledgeReleaseManifest()
+	if err != nil {
+		return nil, err
+	}
+	releases, err := latestKnowledgeAssemblyReleaseRecords(manifest.Releases)
+	if err != nil {
+		return nil, err
+	}
+	if bookID = strings.TrimSpace(bookID); bookID != "" {
+		filtered := make([]KnowledgeReleaseRecord, 0, 1)
+		for _, record := range releases {
+			if record.BookID == bookID {
+				filtered = append(filtered, record)
+			}
+		}
+		releases = filtered
+	}
+	sortKnowledgeReleaseRecordsNewestFirst(releases)
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	start := 0
+	if after = strings.TrimSpace(after); after != "" {
+		start = len(releases)
+		for index, record := range releases {
+			if record.ReleaseID == after {
+				start = index + 1
+				break
+			}
+		}
+	}
+	end := start + limit
+	if end > len(releases) {
+		end = len(releases)
+	}
+	return append([]KnowledgeReleaseRecord{}, releases[start:end]...), nil
+}
+
+func sortKnowledgeReleaseRecordsNewestFirst(releases []KnowledgeReleaseRecord) {
+	sort.Slice(releases, func(i, j int) bool {
+		left, leftErr := time.Parse(time.RFC3339Nano, releases[i].CreatedAt)
+		right, rightErr := time.Parse(time.RFC3339Nano, releases[j].CreatedAt)
+		if leftErr == nil && rightErr == nil && !left.Equal(right) {
+			return left.After(right)
+		}
+		if releases[i].CreatedAt != releases[j].CreatedAt {
+			return releases[i].CreatedAt > releases[j].CreatedAt
+		}
+		return releases[i].ReleaseID > releases[j].ReleaseID
+	})
 }
 
 func (s *BookKnowledgeStore) loadKnowledgeReleaseManifest() (*KnowledgeReleaseManifest, error) {

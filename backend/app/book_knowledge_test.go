@@ -164,6 +164,25 @@ func TestBookKnowledgeWritesPreserveExistingFilesOnEncodeFailure(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeListOrdersPublishedArticlesNewestFirst(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	for _, book := range []BookKnowledgeBook{
+		{BookID: "newer", Title: "Newer", SourceType: "wechat_mp_article", PublishedAt: "2026-07-20T08:00:00Z", UpdatedAt: "2026-07-20T09:00:00Z"},
+		{BookID: "older-imported-later", Title: "Older", SourceType: "wechat_mp_article", PublishedAt: "2026-07-01T08:00:00Z", UpdatedAt: "2026-07-21T09:00:00Z"},
+	} {
+		if err := store.SavePackage(BookKnowledgePackage{Book: book}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	books, err := store.ListBooks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != 2 || books[0].BookID != "newer" || books[1].BookID != "older-imported-later" {
+		t.Fatalf("books=%#v", books)
+	}
+}
+
 func TestBookKnowledgeStoreSerializesConcurrentManifestUpdates(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	const count = 40

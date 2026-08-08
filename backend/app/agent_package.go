@@ -13,14 +13,29 @@ import (
 var agentPackageIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 const (
-	AgentPackageSchemaVersion = "agent-package.v1"
-	AgentPackageDraft         = "draft"
-	AgentPackagePublished     = "published"
-	AgentPackageSuperseded    = "superseded"
+	AgentPackageSchemaVersionV1 = "agent-package.v1"
+	AgentPackageSchemaVersionV2 = "agent-package.v2"
+	AgentPackageSchemaVersion   = AgentPackageSchemaVersionV1
+	AgentPackageDraft           = "draft"
+	AgentPackagePublished       = "published"
+	AgentPackageSuperseded      = "superseded"
 
 	AgentToolAllow               = "allow"
 	AgentToolRequireConfirmation = "require_confirmation"
 	AgentToolBlock               = "block"
+
+	AgentEvidenceReleasePrimary    = "primary"
+	AgentEvidenceReleaseSupporting = "supporting"
+
+	AgentEvidenceVerdictSupported    = "supported"
+	AgentEvidenceVerdictContradicted = "contradicted"
+	AgentEvidenceVerdictMixed        = "mixed"
+	AgentEvidenceVerdictInsufficient = "insufficient"
+
+	AgentEvidenceReportSchemaV1 = "evidence-audit.v1"
+
+	agentEvidenceMaxClaims           = 8
+	agentEvidenceMaxEvidencePerClaim = 5
 )
 
 type AgentPackage struct {
@@ -37,6 +52,7 @@ type AgentPackage struct {
 	ToolPolicy       AgentPackageToolPolicy       `json:"tool_policy"`
 	SafetyPolicy     AgentPackageSafetyPolicy     `json:"safety_policy"`
 	EvaluationPolicy AgentPackageEvaluationPolicy `json:"evaluation_policy"`
+	EvidencePolicy   *AgentPackageEvidencePolicy  `json:"evidence_policy,omitempty"`
 	UIManifest       AgentPackageUIManifest       `json:"ui_manifest"`
 	CreatedAt        string                       `json:"created_at,omitempty"`
 	PublishedAt      string                       `json:"published_at,omitempty"`
@@ -93,6 +109,26 @@ type AgentPackageEvaluationPolicy struct {
 	MinimumScores map[string]float64 `json:"minimum_scores"`
 }
 
+type AgentPackageEvidencePolicy struct {
+	ReleaseRoles              []AgentPackageEvidenceReleaseRole   `json:"release_roles"`
+	MinimumIndependentSources int                                 `json:"minimum_independent_sources"`
+	MaxClaims                 int                                 `json:"max_claims"`
+	MaxEvidencePerClaim       int                                 `json:"max_evidence_per_claim"`
+	AllowedVerdicts           []string                            `json:"allowed_verdicts"`
+	FreshnessPolicy           AgentPackageEvidenceFreshnessPolicy `json:"freshness_policy"`
+	ReportSchema              string                              `json:"report_schema"`
+}
+
+type AgentPackageEvidenceReleaseRole struct {
+	ReleaseID string `json:"release_id"`
+	Role      string `json:"role"`
+}
+
+type AgentPackageEvidenceFreshnessPolicy struct {
+	MaxAgeDays             int  `json:"max_age_days"`
+	RequirePublicationDate bool `json:"require_publication_date"`
+}
+
 type AgentPackageUIManifest struct {
 	Capabilities []string `json:"capabilities"`
 }
@@ -120,8 +156,17 @@ func AgentPackageContentHash(pkg AgentPackage) (string, error) {
 }
 
 func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTools []string) error {
-	if pkg.SchemaVersion != AgentPackageSchemaVersion {
-		return fmt.Errorf("schema_version must be %q", AgentPackageSchemaVersion)
+	switch pkg.SchemaVersion {
+	case AgentPackageSchemaVersionV1:
+		if pkg.EvidencePolicy != nil {
+			return fmt.Errorf("schema_version v1 does not allow evidence_policy")
+		}
+	case AgentPackageSchemaVersionV2:
+		if pkg.EvidencePolicy == nil {
+			return fmt.Errorf("evidence_policy is required for schema_version %q", AgentPackageSchemaVersionV2)
+		}
+	default:
+		return fmt.Errorf("schema_version must be %q or %q", AgentPackageSchemaVersionV1, AgentPackageSchemaVersionV2)
 	}
 	if err := requireContractFields(map[string]string{
 		"package_id":                        pkg.PackageID,
@@ -167,13 +212,20 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	if err := validateAgentPackageSafety(pkg.SafetyPolicy); err != nil {
 		return err
 	}
-	if err := validateAgentPackageEvaluation(pkg.EvaluationPolicy); err != nil {
+	if err := validateAgentPackageEvaluation(pkg.SchemaVersion, pkg.EvaluationPolicy); err != nil {
 		return err
 	}
 	if err := validateAgentPackageUI(pkg.UIManifest); err != nil {
 		return err
 	}
-	return validateAgentPackageReleases(pkg, store)
+	validatedReleases, err := validateAgentPackageReleases(pkg, store)
+	if err != nil {
+		return err
+	}
+	if pkg.EvidencePolicy != nil {
+		return validateAgentPackageEvidence(*pkg.EvidencePolicy, pkg.Releases, validatedReleases)
+	}
+	return nil
 }
 
 func validateAgentPackageState(pkg AgentPackage) error {
@@ -292,7 +344,7 @@ func validateAgentPackageSafety(policy AgentPackageSafetyPolicy) error {
 	return nil
 }
 
-func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
+func validateAgentPackageEvaluation(schemaVersion string, policy AgentPackageEvaluationPolicy) error {
 	if strings.TrimSpace(policy.SuiteVersion) == "" {
 		return fmt.Errorf("evaluation_policy.suite_version is required")
 	}
@@ -307,6 +359,20 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 			return fmt.Errorf("required evaluation metric %q is missing", metric)
 		}
 	}
+	if schemaVersion == AgentPackageSchemaVersionV2 {
+		for _, metric := range []string{
+			"adjudication_consistency",
+			"source_independence",
+			"conflict_detection",
+			"report_citation_completeness",
+			"safe_insufficiency",
+			"proofroom_projection_completeness",
+		} {
+			if _, ok := policy.MinimumScores[metric]; !ok {
+				return fmt.Errorf("required evaluation metric %q is missing", metric)
+			}
+		}
+	}
 	for metric, threshold := range policy.MinimumScores {
 		if strings.TrimSpace(metric) == "" {
 			return fmt.Errorf("evaluation_policy.minimum_scores contains an empty metric")
@@ -319,6 +385,127 @@ func validateAgentPackageEvaluation(policy AgentPackageEvaluationPolicy) error {
 		}
 	}
 	return nil
+}
+
+func validateAgentPackageEvidence(
+	policy AgentPackageEvidencePolicy,
+	releases []AgentPackageReleaseRef,
+	validatedReleases map[string]*KnowledgeRelease,
+) error {
+	if len(policy.ReleaseRoles) == 0 {
+		return fmt.Errorf("evidence_policy.release_roles is required")
+	}
+	pinned := make(map[string]struct{}, len(releases))
+	for _, release := range releases {
+		releaseID := strings.TrimSpace(release.ReleaseID)
+		if releaseID != "" {
+			pinned[releaseID] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(policy.ReleaseRoles))
+	primaryCount := 0
+	supportingReleaseIDs := make([]string, 0, len(policy.ReleaseRoles))
+	for index, releaseRole := range policy.ReleaseRoles {
+		releaseID := strings.TrimSpace(releaseRole.ReleaseID)
+		if releaseID == "" {
+			return fmt.Errorf("evidence_policy.release_roles[%d].release_id is required", index)
+		}
+		if releaseRole.ReleaseID != releaseID {
+			return fmt.Errorf(
+				"evidence_policy.release_roles[%d].release_id must use canonical form without surrounding whitespace",
+				index,
+			)
+		}
+		if _, ok := pinned[releaseID]; !ok {
+			return fmt.Errorf("evidence_policy release %q must reference a pinned release", releaseID)
+		}
+		if _, ok := seen[releaseID]; ok {
+			return fmt.Errorf("duplicate evidence_policy release role for %q", releaseID)
+		}
+		seen[releaseID] = struct{}{}
+		switch releaseRole.Role {
+		case AgentEvidenceReleasePrimary:
+			primaryCount++
+		case AgentEvidenceReleaseSupporting:
+			supportingReleaseIDs = append(supportingReleaseIDs, releaseID)
+		default:
+			return fmt.Errorf("evidence_policy release %q has unsupported role %q", releaseID, releaseRole.Role)
+		}
+	}
+	for releaseID := range pinned {
+		if _, ok := seen[releaseID]; !ok {
+			return fmt.Errorf("pinned release %q requires exactly one evidence_policy role", releaseID)
+		}
+	}
+	if primaryCount != 1 {
+		return fmt.Errorf("evidence_policy requires exactly one primary release; got %d", primaryCount)
+	}
+	if policy.MinimumIndependentSources <= 0 {
+		return fmt.Errorf("evidence_policy.minimum_independent_sources must be positive")
+	}
+	independentSources, err := agentPackageIndependentSupportingSources(validatedReleases, supportingReleaseIDs)
+	if err != nil {
+		return err
+	}
+	if independentSources < policy.MinimumIndependentSources {
+		return fmt.Errorf(
+			"evidence_policy requires %d independent supporting sources; only %d stable source identities are assigned (primary releases do not count)",
+			policy.MinimumIndependentSources,
+			independentSources,
+		)
+	}
+	if policy.MaxClaims <= 0 || policy.MaxClaims > agentEvidenceMaxClaims {
+		return fmt.Errorf("evidence_policy.max_claims must be between 1 and %d", agentEvidenceMaxClaims)
+	}
+	if policy.MaxEvidencePerClaim <= 0 || policy.MaxEvidencePerClaim > agentEvidenceMaxEvidencePerClaim {
+		return fmt.Errorf(
+			"evidence_policy.max_evidence_per_claim must be between 1 and %d",
+			agentEvidenceMaxEvidencePerClaim,
+		)
+	}
+	if len(policy.AllowedVerdicts) == 0 {
+		return fmt.Errorf("evidence_policy.allowed_verdicts is required")
+	}
+	allowedVerdicts := map[string]struct{}{
+		AgentEvidenceVerdictSupported:    {},
+		AgentEvidenceVerdictContradicted: {},
+		AgentEvidenceVerdictMixed:        {},
+		AgentEvidenceVerdictInsufficient: {},
+	}
+	seenVerdicts := make(map[string]struct{}, len(policy.AllowedVerdicts))
+	for _, verdict := range policy.AllowedVerdicts {
+		verdict = strings.TrimSpace(verdict)
+		if _, ok := allowedVerdicts[verdict]; !ok {
+			return fmt.Errorf("evidence_policy has unsupported verdict %q", verdict)
+		}
+		if _, ok := seenVerdicts[verdict]; ok {
+			return fmt.Errorf("evidence_policy has duplicate verdict %q", verdict)
+		}
+		seenVerdicts[verdict] = struct{}{}
+	}
+	if policy.FreshnessPolicy.MaxAgeDays <= 0 {
+		return fmt.Errorf("evidence_policy.freshness_policy.max_age_days must be positive")
+	}
+	if policy.ReportSchema != AgentEvidenceReportSchemaV1 {
+		return fmt.Errorf("evidence_policy.report_schema must be %q", AgentEvidenceReportSchemaV1)
+	}
+	return nil
+}
+
+func agentPackageIndependentSupportingSources(
+	validatedReleases map[string]*KnowledgeRelease,
+	releaseIDs []string,
+) (int, error) {
+	identities := make(map[string]struct{}, len(releaseIDs))
+	for _, releaseID := range releaseIDs {
+		release, ok := validatedReleases[releaseID]
+		if !ok {
+			return 0, fmt.Errorf("supporting release %q was not present in the validated release snapshot", releaseID)
+		}
+		sourceType := strings.ToLower(strings.TrimSpace(release.Book.SourceType))
+		identities[sourceType] = struct{}{}
+	}
+	return len(identities), nil
 }
 
 func validateAgentPackageUI(manifest AgentPackageUIManifest) error {
@@ -337,13 +524,16 @@ func validateAgentPackageUI(manifest AgentPackageUIManifest) error {
 	return nil
 }
 
-func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) error {
+func validateAgentPackageReleases(
+	pkg AgentPackage,
+	store *BookKnowledgeStore,
+) (map[string]*KnowledgeRelease, error) {
 	if store == nil {
-		return fmt.Errorf("published release store is required")
+		return nil, fmt.Errorf("published release store is required")
 	}
 	manifest, err := store.loadKnowledgeReleaseManifest()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	published := make(map[string]KnowledgeReleaseRecord, len(manifest.Releases))
 	for _, record := range manifest.Releases {
@@ -352,65 +542,67 @@ func validateAgentPackageReleases(pkg AgentPackage, store *BookKnowledgeStore) e
 	allowedSources := stringSet(pkg.RetrievalPolicy.AllowedSourceTypes)
 	seen := make(map[string]struct{}, len(pkg.Releases))
 	citationReleases := make(map[string]string)
+	validated := make(map[string]*KnowledgeRelease, len(pkg.Releases))
 	for index, ref := range pkg.Releases {
 		if strings.TrimSpace(ref.ReleaseID) == "" {
-			return fmt.Errorf("releases[%d].release_id is required", index)
+			return nil, fmt.Errorf("releases[%d].release_id is required", index)
 		}
 		if strings.TrimSpace(ref.ContentHash) == "" {
-			return fmt.Errorf("releases[%d].content_hash is required for an immutable reference", index)
+			return nil, fmt.Errorf("releases[%d].content_hash is required for an immutable reference", index)
 		}
 		if _, ok := seen[ref.ReleaseID]; ok {
-			return fmt.Errorf("duplicate release reference %q", ref.ReleaseID)
+			return nil, fmt.Errorf("duplicate release reference %q", ref.ReleaseID)
 		}
 		seen[ref.ReleaseID] = struct{}{}
 		record, ok := published[ref.ReleaseID]
 		if !ok {
-			return fmt.Errorf("published release %q was not found", ref.ReleaseID)
+			return nil, fmt.Errorf("published release %q was not found", ref.ReleaseID)
 		}
 		if record.ContentHash != ref.ContentHash {
-			return fmt.Errorf("release %q content hash does not match pinned content hash", ref.ReleaseID)
+			return nil, fmt.Errorf("release %q content hash does not match pinned content hash", ref.ReleaseID)
 		}
 		release, err := store.LoadKnowledgeRelease(ref.ReleaseID)
 		if err != nil {
-			return fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
+			return nil, fmt.Errorf("load published release %q: %w", ref.ReleaseID, err)
 		}
 		sourceType := strings.TrimSpace(release.Book.SourceType)
 		if sourceType == "" {
-			return fmt.Errorf("release %q source type is required", ref.ReleaseID)
+			return nil, fmt.Errorf("release %q source type is required", ref.ReleaseID)
 		}
 		if !allowedSources[sourceType] {
-			return fmt.Errorf("release %q source type %q is outside retrieval policy", ref.ReleaseID, sourceType)
+			return nil, fmt.Errorf("release %q source type %q is outside retrieval policy", ref.ReleaseID, sourceType)
 		}
 		switch release.UsagePolicy {
 		case BookUsageStandard:
 		case BookUsageEvidenceOnly:
 			if pkg.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly {
-				return fmt.Errorf("release %q usage policy %q cannot be downgraded to package policy %q", ref.ReleaseID, release.UsagePolicy, pkg.SafetyPolicy.UsagePolicy)
+				return nil, fmt.Errorf("release %q usage policy %q cannot be downgraded to package policy %q", ref.ReleaseID, release.UsagePolicy, pkg.SafetyPolicy.UsagePolicy)
 			}
 		default:
-			return fmt.Errorf("release %q usage policy %q is unsupported", ref.ReleaseID, release.UsagePolicy)
+			return nil, fmt.Errorf("release %q usage policy %q is unsupported", ref.ReleaseID, release.UsagePolicy)
 		}
 		if pkg.RetrievalPolicy.RequireCitations && len(ref.CitationIDs) == 0 {
-			return fmt.Errorf("release %q citation_ids is required", ref.ReleaseID)
+			return nil, fmt.Errorf("release %q citation_ids is required", ref.ReleaseID)
 		}
 		availableCitations := make(map[string]struct{}, len(release.Citations))
 		for _, citation := range release.Citations {
 			if _, exists := availableCitations[citation.CitationID]; exists {
-				return fmt.Errorf("release %q contains duplicate citation %q", ref.ReleaseID, citation.CitationID)
+				return nil, fmt.Errorf("release %q contains duplicate citation %q", ref.ReleaseID, citation.CitationID)
 			}
 			availableCitations[citation.CitationID] = struct{}{}
 		}
 		for _, citationID := range uniqueTrimmedStrings(ref.CitationIDs) {
 			if _, ok := availableCitations[citationID]; !ok {
-				return fmt.Errorf("release %q citation %q cannot be resolved", ref.ReleaseID, citationID)
+				return nil, fmt.Errorf("release %q citation %q cannot be resolved", ref.ReleaseID, citationID)
 			}
 			if previousReleaseID, ok := citationReleases[citationID]; ok && previousReleaseID != ref.ReleaseID {
-				return fmt.Errorf("citation %q is ambiguous across multiple releases %q and %q", citationID, previousReleaseID, ref.ReleaseID)
+				return nil, fmt.Errorf("citation %q is ambiguous across multiple releases %q and %q", citationID, previousReleaseID, ref.ReleaseID)
 			}
 			citationReleases[citationID] = ref.ReleaseID
 		}
+		validated[ref.ReleaseID] = release
 	}
-	return nil
+	return validated, nil
 }
 
 func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {
@@ -444,6 +636,15 @@ func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {
 		return left < right
 	})
 	normalized.SafetyPolicy.AbstentionReasons = sortedUniqueStrings(normalized.SafetyPolicy.AbstentionReasons)
+	if normalized.EvidencePolicy != nil {
+		sort.Slice(normalized.EvidencePolicy.ReleaseRoles, func(i, j int) bool {
+			if normalized.EvidencePolicy.ReleaseRoles[i].ReleaseID == normalized.EvidencePolicy.ReleaseRoles[j].ReleaseID {
+				return normalized.EvidencePolicy.ReleaseRoles[i].Role < normalized.EvidencePolicy.ReleaseRoles[j].Role
+			}
+			return normalized.EvidencePolicy.ReleaseRoles[i].ReleaseID < normalized.EvidencePolicy.ReleaseRoles[j].ReleaseID
+		})
+		normalized.EvidencePolicy.AllowedVerdicts = sortedUniqueStrings(normalized.EvidencePolicy.AllowedVerdicts)
+	}
 	normalized.UIManifest.Capabilities = sortedUniqueStrings(normalized.UIManifest.Capabilities)
 	return normalized, nil
 }

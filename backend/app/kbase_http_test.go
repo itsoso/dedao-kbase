@@ -3,19 +3,73 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/services"
 )
+
+func TestKBaseHTTPHandlerHealthIncludesReleaseRevision(t *testing.T) {
+	tests := []struct {
+		name             string
+		releaseRevision  string
+		expectedRevision string
+	}{
+		{
+			name:             "configured revision",
+			releaseRevision:  "1234567890abcdef",
+			expectedRevision: "1234567890abcdef",
+		},
+		{
+			name:             "development default",
+			expectedRevision: "development",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store:           NewBookKnowledgeStore(t.TempDir()),
+				ReleaseRevision: tt.releaseRevision,
+			})
+
+			response := requestKBase(handler, http.MethodGet, "/health", "")
+			if response.Code != http.StatusOK {
+				t.Fatalf("health status=%d body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Cache-Control"); got != "no-store" {
+				t.Fatalf("health Cache-Control=%q, want no-store", got)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode health response: %v", err)
+			}
+			expected := map[string]any{
+				"ok":       true,
+				"service":  "dedao-kbase",
+				"revision": tt.expectedRevision,
+			}
+			if !reflect.DeepEqual(payload, expected) {
+				t.Fatalf("health response=%#v, want %#v", payload, expected)
+			}
+		})
+	}
+}
 
 func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
@@ -68,6 +122,69 @@ func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
 	}
 	if len(payload.Packages) != 0 {
 		t.Fatalf("empty package list = %#v", payload.Packages)
+	}
+}
+
+func TestKBaseHTTPHandlerServesAuthenticatedAgentTraceWithoutPrivateFields(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	trace := agentTraceTestTrace()
+	trace.PrivatePrompt = "must-not-leave-store"
+	trace.SourceBodies = []string{"private source body"}
+	trace.Credentials = "secret credential"
+	if err := store.SaveAgentTrace(trace); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+	path := "/api/agent-traces/" + url.PathEscape(trace.TraceID)
+
+	unauthorized := requestKBase(handler, http.MethodGet, path, "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized trace status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(handler, http.MethodGet, path, "consumer-token")
+	if response.Code != http.StatusOK {
+		t.Fatalf("trace status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"trace_id":"`+trace.TraceID+`"`) ||
+		strings.Contains(body, "must-not-leave-store") ||
+		strings.Contains(body, "private source body") ||
+		strings.Contains(body, "secret credential") {
+		t.Fatalf("trace response exposed invalid content: %s", body)
+	}
+}
+
+func TestKBaseHTTPHandlerResolvesCitationIdentityWithoutSourcePath(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     store,
+		AuthToken: "consumer-token",
+	})
+	response := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/citations/42-citation-1?book_id=42",
+		"consumer-token",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("citation status=%d body=%s", response.Code, response.Body.String())
+	}
+	body := response.Body.String()
+	if !strings.Contains(body, `"citation_id":"42-citation-1"`) ||
+		!strings.Contains(body, `"chunk_id":"42-chunk-1"`) ||
+		strings.Contains(body, "/tmp/book.html") ||
+		strings.Contains(body, "source_html") ||
+		strings.Contains(body, "source_account") ||
+		strings.Contains(body, "source_item_key") ||
+		strings.Contains(body, `"anchor"`) ||
+		strings.Contains(body, `"note"`) {
+		t.Fatalf("citation response is not a safe exact locator: %s", body)
 	}
 }
 
@@ -178,6 +295,23 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 			t.Fatalf("%s evaluation status=%d body=%s", name, response.Code, response.Body.String())
 		}
 	}
+	var forged map[string]any
+	if err := json.Unmarshal(payload, &forged); err != nil {
+		t.Fatal(err)
+	}
+	cases := forged["suite"].(map[string]any)["cases"].([]any)
+	cases[0].(map[string]any)["evidence_audit"] = map[string]any{"status": EvidenceAuditCompleted}
+	forgedPayload, err := json.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected := requestJSONKBase(
+		handler, http.MethodPost, "/api/agent-packages/evaluate",
+		"publisher-token", string(forgedPayload),
+	)
+	if rejected.Code != http.StatusBadRequest {
+		t.Fatalf("embedded evidence audit status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
 	evaluated := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(payload))
 	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"created":true`) ||
 		!strings.Contains(evaluated.Body.String(), `"passed":true`) {
@@ -197,6 +331,287 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishPayload))
 	if published.Code != http.StatusCreated {
 		t.Fatalf("publish evaluated package status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerAgentCompilationUsesReadOnlyAPIAuthAndReturnsCandidates(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-primary",
+		"book-primary",
+		"2026-07-26T10:00:00Z",
+		"单一来源结论",
+		"Publisher Primary",
+		"dedao_ebook",
+	)
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	payload, err := json.Marshal(AgentCompilationRequest{
+		SchemaVersion:    AgentCompilationRequestSchemaVersion,
+		Mode:             AgentCompilationModeDual,
+		PrimaryReleaseID: primary.ReleaseID,
+		Version:          "1.0.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/agent-packages/compile"
+	for name, token := range map[string]string{
+		"missing":   "",
+		"publisher": "publisher-token",
+		"wrong":     "wrong-token",
+	} {
+		response := requestJSONKBase(handler, http.MethodPost, path, token, string(payload))
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf(
+				"%s compilation status=%d body=%s",
+				name,
+				response.Code,
+				response.Body.String(),
+			)
+		}
+	}
+	response := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		path,
+		"consumer-token",
+		string(payload),
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("compilation status=%d body=%s", response.Code, response.Body.String())
+	}
+	var compilation AgentCompilation
+	if err := json.Unmarshal(response.Body.Bytes(), &compilation); err != nil {
+		t.Fatal(err)
+	}
+	if compilation.Status != AgentCompilationStatusPartial ||
+		len(compilation.Candidates) != 2 ||
+		compilation.Candidates[0].Status != AgentCompilationCandidateReady ||
+		compilation.Candidates[1].Status != AgentCompilationCandidateBlocked {
+		t.Fatalf("compilation response = %#v", compilation)
+	}
+
+	wrongMethod := requestKBase(handler, http.MethodGet, path, "consumer-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf(
+			"compilation wrong method status=%d body=%s",
+			wrongMethod.Code,
+			wrongMethod.Body.String(),
+		)
+	}
+}
+
+func TestKBaseHTTPHandlerAgentCompilationRejectsInvalidBodies(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	path := "/api/agent-packages/compile"
+	valid := `{
+		"schema_version":"agent-compilation-request.v1",
+		"mode":"study",
+		"primary_release_id":"release-primary",
+		"version":"1.0.0"
+	}`
+	for _, testCase := range []struct {
+		name string
+		body string
+	}{
+		{name: "invalid JSON", body: `{`},
+		{
+			name: "unknown field",
+			body: `{
+				"schema_version":"agent-compilation-request.v1",
+				"mode":"study",
+				"primary_release_id":"release-primary",
+				"version":"1.0.0",
+				"model":"caller-controlled"
+			}`,
+		},
+		{name: "trailing JSON", body: valid + `{}`},
+		{
+			name: "body too large",
+			body: `{"schema_version":"agent-compilation-request.v1","mode":"study","primary_release_id":"` +
+				strings.Repeat("x", 70<<10) +
+				`","version":"1.0.0"}`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := requestJSONKBase(
+				handler,
+				http.MethodPost,
+				path,
+				"consumer-token",
+				testCase.body,
+			)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf(
+					"status=%d body=%s",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerAgentCompilationHidesStoreFailures(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(root, []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               NewBookKnowledgeStore(root),
+		AuthToken:           "consumer-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	response := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/compile",
+		"consumer-token",
+		`{
+			"schema_version":"agent-compilation-request.v1",
+			"mode":"study",
+			"primary_release_id":"release-primary",
+			"version":"1.0.0"
+		}`,
+	)
+	if response.Code != http.StatusInternalServerError ||
+		!strings.Contains(response.Body.String(), "agent compilation unavailable") ||
+		strings.Contains(response.Body.String(), root) ||
+		strings.Contains(response.Body.String(), "not a directory") {
+		t.Fatalf(
+			"store failure status=%d body=%s",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+}
+
+func TestKBaseHTTPHandlerSeparatesTrustedGoldInstallationFromPublisherEvaluation(t *testing.T) {
+	store, pkg := evidenceAuditEvaluationStore(t)
+	supported := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictSupported, false, "http-trusted-supported")
+	conflicted := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictMixed, true, "http-trusted-conflicted")
+	insufficient := persistEvidenceAuditEvaluationReport(t, store, pkg, EvidenceAuditVerdictInsufficient, false, "http-trusted-insufficient")
+	submitted := evidenceAuditEvaluationSuite(pkg, supported, conflicted, insufficient)
+	trusted := submitted
+	trusted.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	for index := range trusted.Cases {
+		trusted.Cases[index].AuditID = ""
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               store,
+		AuthToken:           "admin-token",
+		AgentPublisherToken: "publisher-token",
+	})
+	trustPayload, err := json.Marshal(AgentPackageTrustedEvaluationSuiteRequest{
+		Package: pkg,
+		Suite:   trusted,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisherTrust := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluation-suites/trust",
+		"publisher-token",
+		string(trustPayload),
+	)
+	if publisherTrust.Code != http.StatusUnauthorized {
+		t.Fatalf("publisher installed trusted gold status=%d body=%s", publisherTrust.Code, publisherTrust.Body.String())
+	}
+	adminTrust := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluation-suites/trust",
+		"admin-token",
+		string(trustPayload),
+	)
+	if adminTrust.Code != http.StatusCreated || !strings.Contains(adminTrust.Body.String(), `"trusted":true`) {
+		t.Fatalf("admin trusted suite status=%d body=%s", adminTrust.Code, adminTrust.Body.String())
+	}
+
+	tampered := submitted
+	tampered.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	tampered.Cases[0].ExpectedClaims = append(
+		[]AgentEvaluationExpectedClaim(nil),
+		submitted.Cases[0].ExpectedClaims...,
+	)
+	tampered.Cases[0].ExpectedClaims[0].Verdict = EvidenceAuditVerdictContradicted
+	evaluatePayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: tampered})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluate",
+		"publisher-token",
+		string(evaluatePayload),
+	)
+	if evaluated.Code != http.StatusBadRequest || !strings.Contains(evaluated.Body.String(), "trusted evaluation suite") {
+		t.Fatalf("tampered publisher gold status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	if _, err := store.LoadAgentPackageEvaluation(pkg.ContentHash); !os.IsNotExist(err) {
+		t.Fatalf("tampered evaluation persisted sidecar: %v", err)
+	}
+
+	legacyReport, err := EvaluateAgentPackageDeterministically(
+		store,
+		pkg,
+		submitted,
+		testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySuitePayload, err := encodeJSONFile(submitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyReportPayload, err := encodeJSONFile(legacyReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(store.AgentPackageEvaluationDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(store.AgentPackageEvaluationSuitePath(pkg.ContentHash), legacySuitePayload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(store.AgentPackageEvaluationPath(pkg.ContentHash), legacyReportPayload); err != nil {
+		t.Fatal(err)
+	}
+	validPayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: submitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrated := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/agent-packages/evaluate",
+		"publisher-token",
+		string(validPayload),
+	)
+	if migrated.Code != http.StatusOK ||
+		!strings.Contains(migrated.Body.String(), `"migrated":true`) {
+		t.Fatalf("legacy trusted evaluation migration status=%d body=%s", migrated.Code, migrated.Body.String())
+	}
+	stored, err := store.LoadAgentPackageEvaluation(pkg.ContentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.TrustedSuiteHash == "" {
+		t.Fatal("legacy evaluation migration did not persist trusted_suite_hash")
 	}
 }
 
@@ -259,6 +674,622 @@ func TestKBaseHTTPHandlerServesDedaoSubscribedLibrary(t *testing.T) {
 	}
 }
 
+type recordingEvidenceAuditEnqueuer struct {
+	mu       sync.Mutex
+	auditIDs []string
+	err      error
+}
+
+func (e *recordingEvidenceAuditEnqueuer) Enqueue(auditID string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auditIDs = append(e.auditIDs, auditID)
+	return e.err
+}
+
+func TestKBaseHTTPHandlerCreatesListsAndLoadsEvidenceAuditsAsynchronously(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 2, 1)
+	queue := &recordingEvidenceAuditEnqueuer{}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditMaxBodyBytes: 4096, AuditRetrySigningKey: []byte("test-retry-signing-key-32-bytes!!"),
+	})
+	body := `{"subject":"Trial claim","scope":"Population evidence comparison","selected_claims":["Synthetic grounded statement"],"idempotency_key":"audit-http-1"}`
+	created := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version, "consumer-a", body)
+	if created.Code != http.StatusAccepted || !strings.Contains(created.Body.String(), `"status":"queued"`) {
+		t.Fatalf("create audit status=%d body=%s", created.Code, created.Body.String())
+	}
+	var createdPayload struct {
+		Created bool           `json:"created"`
+		Audit   *EvidenceAudit `json:"audit"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdPayload); err != nil || createdPayload.Audit == nil {
+		t.Fatalf("decode created audit: payload=%#v err=%v", createdPayload, err)
+	}
+	replayed := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version, "consumer-a", body)
+	if replayed.Code != http.StatusAccepted || !strings.Contains(replayed.Body.String(), `"created":false`) ||
+		!strings.Contains(replayed.Body.String(), createdPayload.Audit.AuditID) {
+		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	listed := requestKBase(handler, http.MethodGet, "/api/agent-audits?package_id="+pkg.PackageID+"&version="+pkg.Version, "consumer-a")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), createdPayload.Audit.AuditID) {
+		t.Fatalf("list status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	packageList := requestKBase(handler, http.MethodGet, "/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version, "consumer-a")
+	if packageList.Code != http.StatusOK || !strings.Contains(packageList.Body.String(), createdPayload.Audit.AuditID) {
+		t.Fatalf("package list status=%d body=%s", packageList.Code, packageList.Body.String())
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/agent-audits/"+createdPayload.Audit.AuditID, "consumer-a")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"selected_claims":["Synthetic grounded statement"]`) {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	otherBearer := requestKBase(handler, http.MethodGet, "/api/agent-audits/"+createdPayload.Audit.AuditID, "consumer-b")
+	if otherBearer.Code != http.StatusUnauthorized {
+		t.Fatalf("other bearer status=%d body=%s", otherBearer.Code, otherBearer.Body.String())
+	}
+	if len(queue.auditIDs) != 2 || queue.auditIDs[0] != createdPayload.Audit.AuditID {
+		t.Fatalf("enqueued audit IDs = %#v", queue.auditIDs)
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditValidationAndAvailabilityErrors(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	base := KBaseHTTPConfig{
+		Store: store, AuthToken: "secret-token", AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+		AuditMaxBodyBytes: 128,
+	}
+	handler := NewKBaseHTTPHandler(base)
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{name: "invalid json", method: http.MethodPost, path: path, body: `{`, status: http.StatusBadRequest},
+		{name: "missing version", method: http.MethodPost, path: "/api/agent-packages/" + pkg.PackageID + "/audits", body: `{}`, status: http.StatusBadRequest},
+		{name: "invalid version", method: http.MethodPost, path: "/api/agent-packages/" + pkg.PackageID + "/audits?version=bad%2Fversion", body: `{}`, status: http.StatusBadRequest},
+		{name: "missing package", method: http.MethodPost, path: "/api/agent-packages/missing/audits?version=2.0.0", body: `{"subject":"x","scope":"y","idempotency_key":"z"}`, status: http.StatusNotFound},
+		{name: "too many claims", method: http.MethodPost, path: path, body: `{"subject":"x","scope":"y","selected_claims":["Synthetic grounded statement","Primary claim two"],"idempotency_key":"too-many"}`, status: http.StatusUnprocessableEntity},
+		{name: "body too large", method: http.MethodPost, path: path, body: `{"subject":"` + strings.Repeat("x", 256) + `","scope":"y","idempotency_key":"large"}`, status: http.StatusRequestEntityTooLarge},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := requestJSONKBase(handler, test.method, test.path, "secret-token", test.body)
+			if response.Code != test.status {
+				t.Fatalf("status=%d want=%d body=%s", response.Code, test.status, response.Body.String())
+			}
+		})
+	}
+
+	unconfigured := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "secret-token", AuditUnavailableReason: "TokenPlan API key is not configured",
+	})
+	response := requestJSONKBase(unconfigured, http.MethodPost, path, "secret-token", `{"subject":"x","scope":"y","idempotency_key":"unavailable"}`)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"audit_service_unavailable"`) {
+		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
+	}
+	missingAudit := requestKBase(handler, http.MethodGet, "/api/agent-audits/missing-audit", "secret-token")
+	if missingAudit.Code != http.StatusNotFound {
+		t.Fatalf("missing audit status=%d body=%s", missingAudit.Code, missingAudit.Body.String())
+	}
+
+	v1Store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, v1Store)
+	v1, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, v1Store, v1)
+	publishedV1, _, err := PublishAgentPackage(
+		v1Store, v1, "publish-http-v1", AgentReadOnlyToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: v1Store, AuthToken: "secret-token", AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	v1Response := requestJSONKBase(
+		v1Handler, http.MethodPost,
+		"/api/agent-packages/"+publishedV1.PackageID+"/audits?version="+publishedV1.Version,
+		"secret-token", `{"subject":"x","scope":"y","idempotency_key":"v1"}`,
+	)
+	if v1Response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("v1 package status=%d body=%s", v1Response.Code, v1Response.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditIdempotencyConflictAndManualRetry(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	queue := &recordingEvidenceAuditEnqueuer{}
+	now := testAgentPackageTime().Add(4 * time.Hour)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditRetrySigningKey: []byte("test-retry-signing-key-32-bytes!!"),
+		AuditNow:             func() time.Time { return now },
+	})
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	first := requestJSONKBase(handler, http.MethodPost, path, "consumer-a", `{"subject":"one","scope":"Population evidence comparison","idempotency_key":"same-key"}`)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("create status=%d body=%s", first.Code, first.Body.String())
+	}
+	conflict := requestJSONKBase(handler, http.MethodPost, path, "consumer-a", `{"subject":"different","scope":"Population evidence comparison","idempotency_key":"same-key"}`)
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("idempotency conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+
+	var payload struct {
+		Audit EvidenceAudit `json:"audit"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := StartEvidenceAudit(store, payload.Audit.AuditID, "trace-http-retry", testAgentPackageTime().Add(5*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := FailEvidenceAudit(store, payload.Audit.AuditID, "model_outcome_unknown", "manual retry required", testAgentPackageTime().Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	now = testAgentPackageTime().Add(7 * time.Hour)
+	retryPath := "/api/agent-audits/" + payload.Audit.AuditID + "/retry"
+	retry := httptest.NewRequest(http.MethodPost, retryPath, nil)
+	retry.Header.Set("Authorization", "Bearer consumer-a")
+	retry.Header.Set("Idempotency-Key", "retry-http-1")
+	retryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(retryResponse, retry)
+	if retryResponse.Code != http.StatusAccepted || !strings.Contains(retryResponse.Body.String(), `"retry_of":"`+payload.Audit.AuditID+`"`) {
+		t.Fatalf("retry status=%d body=%s", retryResponse.Code, retryResponse.Body.String())
+	}
+	now = now.Add(20 * time.Minute)
+	replayed := httptest.NewRequest(http.MethodPost, retryPath, nil)
+	replayed.Header.Set("Authorization", "Bearer consumer-a")
+	replayed.Header.Set("Idempotency-Key", "retry-http-1")
+	replayedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayedResponse, replayed)
+	if replayedResponse.Code != http.StatusAccepted || !strings.Contains(replayedResponse.Body.String(), `"created":false`) {
+		t.Fatalf("retry replay status=%d body=%s", replayedResponse.Code, replayedResponse.Body.String())
+	}
+	second := httptest.NewRequest(http.MethodPost, retryPath, nil)
+	second.Header.Set("Authorization", "Bearer consumer-a")
+	second.Header.Set("Idempotency-Key", "retry-http-2")
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, second)
+	if secondResponse.Code != http.StatusConflict {
+		t.Fatalf("second active retry status=%d body=%s", secondResponse.Code, secondResponse.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomPreviewIsReadOnlyAndDeliveryIsExplicit(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(
+				http.StatusOK,
+				`{"receipt_id":"proofroom-http-1","status":"accepted"}`,
+			), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	preview := requestKBase(handler, http.MethodGet, path, "consumer-a")
+	if preview.Code != http.StatusOK ||
+		!strings.Contains(preview.Body.String(), `"payload_hash":"sha256:`) ||
+		!strings.Contains(preview.Body.String(), `"adjudication_authority":"proofroom"`) {
+		t.Fatalf("preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("preview called remote %d times", calls.Load())
+	}
+	if _, err := os.Stat(store.EvidenceAuditProofroomDir()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("preview wrote receipt state: %v", err)
+	}
+
+	missingKey := requestKBase(handler, http.MethodPost, path, "consumer-a")
+	if missingKey.Code != http.StatusBadRequest ||
+		!strings.Contains(missingKey.Body.String(), `"code":"proofroom_idempotency_key_required"`) {
+		t.Fatalf("missing key status=%d body=%s", missingKey.Code, missingKey.Body.String())
+	}
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	request.Header.Set("Idempotency-Key", "proofroom-http-key")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated ||
+		!strings.Contains(response.Body.String(), `"created":true`) ||
+		!strings.Contains(response.Body.String(), `"remote_receipt_id":"proofroom-http-1"`) {
+		t.Fatalf("delivery status=%d body=%s", response.Code, response.Body.String())
+	}
+	replay := httptest.NewRequest(http.MethodPost, path, nil)
+	replay.Header.Set("Authorization", "Bearer consumer-a")
+	replay.Header.Set("Idempotency-Key", "proofroom-http-key")
+	replayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusOK ||
+		!strings.Contains(replayResponse.Body.String(), `"created":false`) ||
+		calls.Load() != 1 {
+		t.Fatalf("replay status=%d calls=%d body=%s",
+			replayResponse.Code, calls.Load(), replayResponse.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomPrivacyBlockedDoesNotSend(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomReportTest(
+		t, t.TempDir(), validEvidenceAuditInput(), func(report *EvidenceAudit) {
+			report.Proofroom.Title = "token"
+		},
+	)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return proofroomJSONResponse(http.StatusOK, `{"receipt_id":"bad","status":"accepted"}`), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		request := httptest.NewRequest(method, path, nil)
+		request.Header.Set("Authorization", "Bearer consumer-a")
+		request.Header.Set("Idempotency-Key", "privacy-key")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusUnprocessableEntity ||
+			!strings.Contains(response.Body.String(), `"code":"privacy_blocked"`) {
+			t.Fatalf("%s status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("privacy-blocked projection reached remote: %d", calls.Load())
+	}
+}
+
+func TestKBaseHTTPHandlerProofroomDeliveryErrorsAreStable(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	unconfigured := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a",
+	})
+	request := httptest.NewRequest(http.MethodPost, path, nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	request.Header.Set("Idempotency-Key", "proofroom-key")
+	response := httptest.NewRecorder()
+	unconfigured.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"proofroom_unconfigured"`) {
+		t.Fatalf("unconfigured status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, test := range []struct {
+		name       string
+		client     ProofroomHTTPClient
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "remote rejection",
+			client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+				return proofroomJSONResponse(http.StatusUnprocessableEntity, `{"error":"rejected"}`), nil
+			}),
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "proofroom_remote_rejected",
+		},
+		{
+			name: "unknown transport outcome",
+			client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+				return nil, context.DeadlineExceeded
+			}),
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "proofroom_outcome_unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			testStore, testAudit := completedEvidenceAuditForProofroomTest(t)
+			service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+				Endpoint: "https://proofroom.example.test/deliver",
+				Token:    "remote-secret", Client: test.client,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store: testStore, AuthToken: "consumer-a", ProofroomDelivery: service,
+			})
+			testRequest := httptest.NewRequest(
+				http.MethodPost,
+				"/api/agent-audits/"+testAudit.AuditID+"/proofroom",
+				nil,
+			)
+			testRequest.Header.Set("Authorization", "Bearer consumer-a")
+			testRequest.Header.Set("Idempotency-Key", "proofroom-error-key")
+			testResponse := httptest.NewRecorder()
+			handler.ServeHTTP(testResponse, testRequest)
+			if testResponse.Code != test.wantStatus ||
+				!strings.Contains(testResponse.Body.String(), `"code":"`+test.wantCode+`"`) ||
+				strings.Contains(testResponse.Body.String(), "remote-secret") {
+				t.Fatalf("status=%d body=%s", testResponse.Code, testResponse.Body.String())
+			}
+			if test.name == "remote rejection" &&
+				!strings.Contains(testResponse.Body.String(), `"remote_status":422`) {
+				t.Fatalf("remote status is not visible: %s", testResponse.Body.String())
+			}
+			replay := httptest.NewRecorder()
+			handler.ServeHTTP(replay, testRequest.Clone(context.Background()))
+			if replay.Code != test.wantStatus ||
+				!strings.Contains(replay.Body.String(), `"code":"`+test.wantCode+`"`) {
+				t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+			}
+			if test.name == "remote rejection" &&
+				!strings.Contains(replay.Body.String(), `"remote_status":422`) {
+				t.Fatalf("replayed remote status is not visible: %s", replay.Body.String())
+			}
+		})
+	}
+
+}
+
+func TestKBaseHTTPHandlerProofroomUnknownRequiresExplicitCoordination(t *testing.T) {
+	store, audit := completedEvidenceAuditForProofroomTest(t)
+	var calls atomic.Int32
+	service, err := NewProofroomDeliveryService(ProofroomDeliveryConfig{
+		Endpoint: "https://proofroom.example.test/deliver",
+		Token:    "remote-secret",
+		Client: proofroomHTTPClientFunc(func(*http.Request) (*http.Response, error) {
+			if calls.Add(1) == 1 {
+				return nil, context.DeadlineExceeded
+			}
+			return proofroomJSONResponse(
+				http.StatusOK, `{"receipt_id":"coordinated","status":"accepted"}`,
+			), nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", ProofroomDelivery: service,
+	})
+	path := "/api/agent-audits/" + audit.AuditID + "/proofroom"
+	send := func(resolution string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, nil)
+		request.Header.Set("Authorization", "Bearer consumer-a")
+		request.Header.Set("Idempotency-Key", "coordinate-key")
+		if resolution != "" {
+			request.Header.Set("Proofroom-Delivery-Resolution", resolution)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if first := send(""); first.Code != http.StatusBadGateway ||
+		!strings.Contains(first.Body.String(), `"code":"proofroom_outcome_unknown"`) {
+		t.Fatalf("unknown status=%d body=%s", first.Code, first.Body.String())
+	}
+	if replay := send(""); replay.Code != http.StatusBadGateway || calls.Load() != 1 {
+		t.Fatalf("automatic replay status=%d calls=%d body=%s",
+			replay.Code, calls.Load(), replay.Body.String())
+	}
+	if coordinated := send(ProofroomCoordinationConfirmedNotDelivered); coordinated.Code != http.StatusOK ||
+		!strings.Contains(coordinated.Body.String(), `"coordinated":true`) {
+		t.Fatalf("coordination status=%d body=%s", coordinated.Code, coordinated.Body.String())
+	}
+	if delivered := send(""); delivered.Code != http.StatusCreated || calls.Load() != 2 {
+		t.Fatalf("post-coordinate status=%d calls=%d body=%s",
+			delivered.Code, calls.Load(), delivered.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerRejectsForgedAndExpiredRetryGrants(t *testing.T) {
+	now := testAgentPackageTime()
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditRetrySigningKey: []byte("test-retry-signing-key-32-bytes!!"),
+		AuditNow:             func() time.Time { return now },
+	}).(*kbaseHTTPHandler)
+	request := httptest.NewRequest(http.MethodPost, "/api/agent-audits/audit-1/retry", nil)
+	request.Header.Set("Authorization", "Bearer consumer-a")
+	valid := handler.issueEvidenceAuditRetryAuthorization(request, "audit-1", "retry-1", now)
+	if err := handler.validateEvidenceAuditRetryAuthorization(valid, now); err != nil {
+		t.Fatalf("valid authorization rejected: %v", err)
+	}
+	forged := valid
+	forged.Actor = evidenceAuditOpaqueIdentity("different-actor")
+	if err := handler.validateEvidenceAuditRetryAuthorization(forged, now); err == nil {
+		t.Fatal("forged authorization accepted")
+	}
+	expired := valid
+	expired.ExpiresAt = now.Add(-time.Second)
+	expired.Signature = handler.evidenceAuditRetryMAC(
+		"grant", expired.AuditID, expired.Actor, expired.Issuer, expired.Scope,
+		expired.ExpiresAt.Format(time.RFC3339Nano), expired.Nonce,
+	)
+	if err := handler.validateEvidenceAuditRetryAuthorization(expired, now); err == nil {
+		t.Fatal("expired authorization accepted")
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditErrorsAreStableAndDoNotLeakStorageDetails(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if err := os.MkdirAll(store.EvidenceAuditDir(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	privateDetail := store.EvidenceAuditManifestPath() + " bearer super-secret-token"
+	if err := os.WriteFile(store.EvidenceAuditManifestPath(), []byte("{"+privateDetail), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.EvidenceAuditManifestPath()+".bak", []byte("{broken-backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logs := make([]EvidenceAuditHTTPLogEvent, 0, 1)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a",
+		AuditLogger: func(event EvidenceAuditHTTPLogEvent) { logs = append(logs, event) },
+	})
+	response := requestKBase(handler, http.MethodGet, "/api/agent-audits", "consumer-a")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Code  string `json:"code"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error response: %v body=%s", err, response.Body.String())
+	}
+	if payload.Code != "audit_store_unavailable" || payload.Error != "evidence audit storage is unavailable" {
+		t.Fatalf("stable error payload = %+v", payload)
+	}
+	if strings.Contains(response.Body.String(), store.Root()) ||
+		strings.Contains(response.Body.String(), "super-secret-token") ||
+		strings.Contains(response.Body.String(), "invalid character") {
+		t.Fatalf("response leaked internal detail: %s", response.Body.String())
+	}
+	if len(logs) != 1 || logs[0].Code != payload.Code || logs[0].Operation != "list_audits" {
+		t.Fatalf("audit logs = %+v", logs)
+	}
+	if !strings.Contains(logs[0].Cause, "invalid character") {
+		t.Fatalf("logger did not receive complete storage diagnostic: %+v", logs[0])
+	}
+	if strings.Contains(logs[0].Cause, "super-secret-token") {
+		t.Fatalf("logger leaked token: %+v", logs[0])
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditQueueErrorUsesStableResponse(t *testing.T) {
+	store, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+	queue := &recordingEvidenceAuditEnqueuer{err: fmt.Errorf("%w: /private/path token=secret", ErrEvidenceAuditQueueFull)}
+	logs := make([]EvidenceAuditHTTPLogEvent, 0, 1)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-a", AuditCoordinator: queue,
+		AuditLogger: func(event EvidenceAuditHTTPLogEvent) { logs = append(logs, event) },
+	})
+	path := "/api/agent-packages/" + pkg.PackageID + "/audits?version=" + pkg.Version
+	response := requestJSONKBase(
+		handler, http.MethodPost, path, "consumer-a",
+		`{"subject":"Trial claim","scope":"Population evidence comparison","idempotency_key":"queue-error"}`,
+	)
+	if response.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(response.Body.String(), `"code":"audit_queue_full"`) ||
+		strings.Contains(response.Body.String(), "/private/path") {
+		t.Fatalf("queue error status=%d body=%s", response.Code, response.Body.String())
+	}
+	if len(logs) != 1 || logs[0].Code != "audit_queue_full" ||
+		strings.Contains(logs[0].Cause, "secret") {
+		t.Fatalf("queue logs = %+v", logs)
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditPackageMissingUsesStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	response := requestJSONKBase(
+		handler, http.MethodPost,
+		"/api/agent-packages/missing-package/audits?version=2.0.0",
+		"consumer-a",
+		`{"subject":"Trial claim","scope":"Population evidence comparison","idempotency_key":"missing-package"}`,
+	)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["code"] != "audit_package_not_found" ||
+		payload["error"] != "agent package not found" {
+		t.Fatalf("stable package error = %+v", payload)
+	}
+}
+
+func TestKBaseHTTPHandlerAllEvidenceAuditMethodErrorsUseStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	for _, path := range []string{
+		"/api/agent-audits",
+		"/api/agent-audits/audit-1",
+		"/api/agent-audits/audit-1/retry",
+		"/api/agent-audits/audit-1/proofroom",
+		"/api/agent-packages/pkg/audits?version=2.0.0",
+	} {
+		response := requestKBase(handler, http.MethodDelete, path, "consumer-a")
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d body=%s", path, response.Code, response.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("%s invalid JSON: %v", path, err)
+		}
+		if payload["code"] != "audit_method_not_allowed" ||
+			payload["error"] != "method not allowed" {
+			t.Fatalf("%s unstable method error = %+v", path, payload)
+		}
+	}
+}
+
+func TestKBaseHTTPHandlerEvidenceAuditAuthorizationErrorsUseStableResponse(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-a",
+		AuditCoordinator: &recordingEvidenceAuditEnqueuer{},
+	})
+	for _, token := range []string{"", "wrong-token"} {
+		response := requestKBase(handler, http.MethodGet, "/api/agent-audits", token)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("token=%q status=%d body=%s", token, response.Code, response.Body.String())
+		}
+		var payload map[string]string
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["code"] != "audit_unauthorized" ||
+			payload["error"] != "unauthorized" {
+			t.Fatalf("token=%q unstable auth error = %+v", token, payload)
+		}
+	}
+}
+
+func TestSanitizeEvidenceAuditHTTPLogCauseRedactsCommonCredentialForms(t *testing.T) {
+	secrets := []string{
+		"query-api-key", "json-apikey", "client-secret", "plain-secret",
+		"password-value", "passwd-value", "session-value", "csrf-value",
+		"access-value", "refresh-value", "bearer-value", "basic-value",
+	}
+	cause := `request failed?api_key=query-api-key ` +
+		`{"ApiKey":"json-apikey","client_secret":"client-secret","SECRET":"plain-secret",` +
+		`"password":"password-value","passwd":"passwd-value","session":"session-value",` +
+		`"csrf":"csrf-value","access_token":"access-value","refresh_token":"refresh-value"} ` +
+		`Authorization: Bearer bearer-value Proxy-Authorization: Basic basic-value`
+	sanitized := sanitizeEvidenceAuditHTTPLogCause(cause)
+	for _, secret := range secrets {
+		if strings.Contains(sanitized, secret) {
+			t.Fatalf("sanitized log leaked %q: %s", secret, sanitized)
+		}
+	}
+	if !strings.Contains(sanitized, "[redacted]") {
+		t.Fatalf("sanitized log omitted redaction marker: %s", sanitized)
+	}
+}
+
 func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	if err := store.SavePackage(sampleBookKnowledgePackageForExport()); err != nil {
@@ -272,6 +1303,36 @@ func TestKBaseHTTPHandlerBookChatAllowsPost(t *testing.T) {
 	resp := requestJSONKBase(handler, http.MethodPost, "/api/book-chat", "secret-token", `{}`)
 	if resp.Code == http.StatusMethodNotAllowed {
 		t.Fatalf("book chat POST returned 405; HTTP API should expose TokenPlan analysis: %s", resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerBookChatMissingBookDoesNotExposeFilesystemPath(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")
+	root := t.TempDir()
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:     NewBookKnowledgeStore(filepath.Join(root, "book_knowledge")),
+		AuthToken: "secret-token",
+	})
+
+	resp := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/book-chat",
+		"secret-token",
+		`{"book_id":"missing-prompts","mode":"chat","question":"ping"}`,
+	)
+	body := resp.Body.String()
+	if resp.Code != http.StatusNotFound {
+		t.Errorf("missing book chat status = %d, want 404, body=%s", resp.Code, body)
+	}
+	for _, leak := range []string{root, "manifest.json", "book_knowledge"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("missing book chat response leaked %q: %s", leak, body)
+		}
+	}
+	if !strings.Contains(body, "book not found") {
+		t.Errorf("missing book chat response should be actionable: %s", body)
 	}
 }
 
@@ -376,6 +1437,128 @@ func TestKBaseHTTPHandlerKnowledgePipeline(t *testing.T) {
 	}
 	if generatorCalls != 1 {
 		t.Fatalf("run called generator %d times, want 1", generatorCalls)
+	}
+}
+
+func TestKBaseHTTPHandlerKnowledgeReadiness(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.ContentHash = "readiness-hash"
+	pkg.Book.SourceHTML = "sensitive-local-path/downloaded.html"
+	pkg.Book.SourceAccount = "sensitive-local-path/account"
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/knowledge/readiness", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(handler, http.MethodGet, "/api/knowledge/readiness?limit=10&book_id=42", "secret-token")
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"schema_version":"knowledge_readiness.v1"`) ||
+		!strings.Contains(response.Body.String(), `"book_id":"42"`) ||
+		!strings.Contains(response.Body.String(), `"next_action":"needs_analysis"`) {
+		t.Fatalf("readiness status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, forbidden := range []string{"sensitive-local-path", "downloaded.html", `"source_account":`, `"prompt"`, `"answer"`} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("readiness leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+	invalidLimit := requestKBase(handler, http.MethodGet, "/api/knowledge/readiness?limit=501", "secret-token")
+	if invalidLimit.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status=%d body=%s", invalidLimit.Code, invalidLimit.Body.String())
+	}
+	wrongMethod := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/readiness", "secret-token", `{}`)
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerKnowledgeAssembly(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-assembly",
+		"book-assembly",
+		"2026-07-26T10:00:00Z",
+		"干预能改善结局",
+		"private publisher value",
+		"wechat_mp_article",
+	)
+	release.Book.SourceHTML = "local/private/source.html"
+	release.Analysis.Summary = "private summary sentinel"
+	saveKnowledgeAssemblyRelease(t, store, release)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	unauthorized := requestKBase(handler, http.MethodGet, "/api/knowledge/assembly", "")
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/knowledge/assembly?limit=1&query="+url.QueryEscape("改善结局"),
+		"secret-token",
+	)
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"schema_version":"knowledge_release_assembly.v1"`) ||
+		!strings.Contains(response.Body.String(), `"release_id":"release-assembly"`) ||
+		!strings.Contains(response.Body.String(), `"claim_id":"release-assembly-claim"`) {
+		t.Fatalf("assembly status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, forbidden := range []string{
+		"private publisher value",
+		"private summary sentinel",
+		"local/private",
+		`"source_account":`,
+		`"prompt"`,
+		`"answer"`,
+	} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("assembly leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+	for _, path := range []string{
+		"/api/knowledge/assembly?limit=501",
+		"/api/knowledge/assembly?limit=invalid",
+		"/api/knowledge/assembly?query=" + url.QueryEscape(strings.Repeat("界", 257)),
+	} {
+		invalid := requestKBase(handler, http.MethodGet, path, "secret-token")
+		if invalid.Code != http.StatusBadRequest {
+			t.Fatalf("invalid request %q status=%d body=%s", path, invalid.Code, invalid.Body.String())
+		}
+	}
+	wrongMethod := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/assembly", "secret-token", `{}`)
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerKnowledgeAssemblyRedactsInternalErrors(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	release := knowledgeAssemblyTestRelease(
+		"release-missing",
+		"book-missing",
+		"2026-07-26T10:00:00Z",
+		"缺失文件结论",
+		"Publisher",
+		"wechat_mp_article",
+	)
+	saveKnowledgeAssemblyRelease(t, store, release)
+	if err := os.Remove(store.KnowledgeReleasePath(release.ReleaseID)); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	response := requestKBase(handler, http.MethodGet, "/api/knowledge/assembly", "secret-token")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	if response.Body.String() != "{\"error\":\"knowledge assembly unavailable\"}\n" ||
+		strings.Contains(response.Body.String(), store.Root()) {
+		t.Fatalf("internal error was not redacted: %s", response.Body.String())
 	}
 }
 
@@ -609,6 +1792,58 @@ func TestKBaseHTTPHandlerKnowledgeReleasesFiltersBookBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerKnowledgeReleasesListsLatestPerBookNewestFirst(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	for _, release := range []KnowledgeRelease{
+		{
+			Version:   knowledgeReleaseVersion,
+			ReleaseID: "release-book-a-old",
+			BookID:    "book-a",
+			CreatedAt: "2026-07-14T12:00:00Z",
+		},
+		{
+			Version:   knowledgeReleaseVersion,
+			ReleaseID: "release-book-a-new",
+			BookID:    "book-a",
+			CreatedAt: "2026-07-14T12:02:00Z",
+		},
+		{
+			Version:   knowledgeReleaseVersion,
+			ReleaseID: "release-book-b-newest",
+			BookID:    "book-b",
+			CreatedAt: "2026-07-14T12:03:00Z",
+		},
+	} {
+		if err := store.saveKnowledgeRelease(release); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	first := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/knowledge/releases?latest=true&limit=1",
+		"secret-token",
+	)
+	if first.Code != http.StatusOK ||
+		!strings.Contains(first.Body.String(), `"release_id":"release-book-b-newest"`) ||
+		strings.Contains(first.Body.String(), `"release-book-a-old"`) {
+		t.Fatalf("latest release first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	second := requestKBase(
+		handler,
+		http.MethodGet,
+		"/api/knowledge/releases?latest=true&limit=1&after=release-book-b-newest",
+		"secret-token",
+	)
+	if second.Code != http.StatusOK ||
+		!strings.Contains(second.Body.String(), `"release_id":"release-book-a-new"`) ||
+		strings.Contains(second.Body.String(), `"release-book-a-old"`) {
+		t.Fatalf("latest release second page status=%d body=%s", second.Code, second.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeReviewCockpit(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(root)
@@ -724,7 +1959,7 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	browserReq.Header.Set("X-KBase-Browser-Session", "1")
 	browserResp := httptest.NewRecorder()
 	handler.ServeHTTP(browserResp, browserReq)
-	if browserResp.Code != http.StatusUnauthorized || strings.Contains(browserResp.Body.String(), "admin-secret") {
+	if browserResp.Code != http.StatusGone || strings.Contains(browserResp.Body.String(), "admin-secret") {
 		t.Fatalf("agent token exchanged for browser token: status=%d body=%s", browserResp.Code, browserResp.Body.String())
 	}
 
@@ -751,6 +1986,1079 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	resp = requestKBase(sharedToken, http.MethodGet, "/api/books", "shared-secret")
 	if resp.Code != http.StatusOK {
 		t.Fatalf("shared-token defense disabled admin API: status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
+	handler, sourceSync, _, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+
+	detail := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a", "admin-secret")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"agent_id":"agent-a"`) ||
+		!strings.Contains(detail.Body.String(), `"desired_state":"active"`) {
+		t.Fatalf("agent detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+
+	for _, desired := range []string{SourceAgentDesiredPaused, SourceAgentDesiredActive} {
+		response := requestJSONKBase(
+			handler, http.MethodPost, "/api/source-agents/agent-a/desired-state", "admin-secret",
+			`{"desired_state":"`+desired+`"}`,
+		)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"desired_state":"`+desired+`"`) {
+			t.Fatalf("set desired state %q status=%d body=%s", desired, response.Code, response.Body.String())
+		}
+	}
+	agent, err := sourceSync.GetSourceAgent(" agent-a ")
+	if err != nil || agent.DesiredState != SourceAgentDesiredActive {
+		t.Fatalf("GetSourceAgent() = %#v, %v", agent, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{name: "unknown field", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"paused","extra":"private"}`, want: http.StatusBadRequest},
+		{name: "trailing JSON", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"paused"}{"extra":true}`, want: http.StatusBadRequest},
+		{name: "invalid state", method: http.MethodPost, path: "/api/source-agents/agent-a/desired-state", body: `{"desired_state":"reboot"}`, want: http.StatusBadRequest},
+		{name: "unknown agent", method: http.MethodGet, path: "/api/source-agents/missing-agent", want: http.StatusNotFound},
+		{name: "invalid escaped agent", method: http.MethodGet, path: "/api/source-agents/%2E%2E", want: http.StatusBadRequest},
+		{name: "detail method", method: http.MethodDelete, path: "/api/source-agents/agent-a", want: http.StatusMethodNotAllowed},
+		{name: "unknown action", method: http.MethodPost, path: "/api/source-agents/agent-a/reboot", body: `{}`, want: http.StatusNotFound},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var response *httptest.ResponseRecorder
+			if test.body == "" {
+				response = requestKBase(handler, test.method, test.path, "admin-secret")
+			} else {
+				response = requestJSONKBase(handler, test.method, test.path, "admin-secret", test.body)
+			}
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+			}
+			for _, secret := range []string{"private", "reboot", "../", sourceSync.DBPath()} {
+				if secret != "" && strings.Contains(response.Body.String(), secret) {
+					t.Fatalf("error response leaked %q: %s", secret, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
+	t.Run("management command API", func(t *testing.T) {
+		handler, _, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+		expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
+		diagnoseBody := `{"type":"diagnose","idempotency_key":"diag-1","expires_at":"` + expiresAt + `"}`
+		diagnose := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", diagnoseBody)
+		if diagnose.Code != http.StatusCreated || !strings.Contains(diagnose.Body.String(), `"type":"diagnose"`) ||
+			!strings.Contains(diagnose.Body.String(), `"target_agent_id":"agent-a"`) {
+			t.Fatalf("diagnose status=%d body=%s", diagnose.Code, diagnose.Body.String())
+		}
+
+		upgradeBody := `{"type":"upgrade","idempotency_key":"upgrade-1","payload":{"artifact_id":"artifact-2","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`
+		bearerUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", upgradeBody)
+		if bearerUpgrade.Code != http.StatusForbidden || bearerUpgrade.Body.String() != "{\"error\":\"browser management session required\"}\n" {
+			t.Fatalf("Bearer upgrade status=%d body=%s", bearerUpgrade.Code, bearerUpgrade.Body.String())
+		}
+
+		credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Upgrade Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, upgradeBody)
+		missingCSRFResponse := httptest.NewRecorder()
+		handler.ServeHTTP(missingCSRFResponse, missingCSRF)
+		if missingCSRFResponse.Code != http.StatusForbidden {
+			t.Fatalf("Cookie upgrade without CSRF status=%d body=%s", missingCSRFResponse.Code, missingCSRFResponse.Body.String())
+		}
+
+		clock.Advance(time.Second)
+		validUpgrade := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, upgradeBody)
+		addKBaseBrowserSessionSecurityHeaders(validUpgrade, credentials.CSRFToken)
+		validUpgradeResponse := httptest.NewRecorder()
+		handler.ServeHTTP(validUpgradeResponse, validUpgrade)
+		if validUpgradeResponse.Code != http.StatusCreated || !strings.Contains(validUpgradeResponse.Body.String(), `"artifact_id":"artifact-2"`) {
+			t.Fatalf("Cookie upgrade status=%d body=%s", validUpgradeResponse.Code, validUpgradeResponse.Body.String())
+		}
+
+		list := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a/commands?limit=1", "admin-secret")
+		var listPayload struct {
+			Commands []SourceAgentCommand `json:"commands"`
+		}
+		if list.Code != http.StatusOK || json.Unmarshal(list.Body.Bytes(), &listPayload) != nil ||
+			len(listPayload.Commands) != 1 || listPayload.Commands[0].Type != SourceAgentCommandUpgrade {
+			t.Fatalf("command list status=%d body=%s", list.Code, list.Body.String())
+		}
+
+		for _, test := range []struct {
+			name       string
+			agentID    string
+			body       string
+			cookieAuth bool
+			want       int
+			forbidden  []string
+		}{
+			{name: "unknown field", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"bad-field","expires_at":"` + expiresAt + `","secret_field":"private-value"}`, want: http.StatusBadRequest, forbidden: []string{"secret_field", "private-value"}},
+			{name: "target spoof", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"spoof","target_agent_id":"agent-b","expires_at":"` + expiresAt + `"}`, want: http.StatusBadRequest, forbidden: []string{"target_agent_id", "agent-b"}},
+			{name: "trailing JSON", agentID: "agent-a", body: diagnoseBody + `{"spec_json":"private"}`, want: http.StatusBadRequest, forbidden: []string{"spec_json", "private"}},
+			{name: "unknown type", agentID: "agent-a", body: `{"type":"shell","idempotency_key":"unknown-type","expires_at":"` + expiresAt + `"}`, want: http.StatusBadRequest, forbidden: []string{"shell"}},
+			{name: "unknown agent", agentID: "missing-agent", body: diagnoseBody, want: http.StatusNotFound, forbidden: []string{"missing-agent"}},
+			{name: "stale version", agentID: "agent-b", cookieAuth: true, body: `{"type":"upgrade","idempotency_key":"stale","payload":{"artifact_id":"private-artifact","expected_current_version":"0.9.0"},"expires_at":"` + expiresAt + `"}`, want: http.StatusConflict, forbidden: []string{"private-artifact", "0.9.0", "1.0.0", "expected", "actual", "spec"}},
+			{name: "duplicate active upgrade", agentID: "agent-a", cookieAuth: true, body: `{"type":"upgrade","idempotency_key":"upgrade-2","payload":{"artifact_id":"artifact-3","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`, want: http.StatusConflict, forbidden: []string{"artifact-3", "expected", "spec"}},
+			{name: "idempotency conflict", agentID: "agent-a", body: `{"type":"diagnose","idempotency_key":"diag-1","expires_at":"` + clock.Now().Add(2*time.Hour).Format(time.RFC3339Nano) + `"}`, want: http.StatusConflict, forbidden: []string{"diag-1", "expires_at"}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				path := "/api/source-agents/" + test.agentID + "/commands"
+				var response *httptest.ResponseRecorder
+				if test.cookieAuth {
+					request := newKBaseBrowserCookieRequest(http.MethodPost, path, credentials.Token, test.body)
+					addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+					response = httptest.NewRecorder()
+					handler.ServeHTTP(response, request)
+				} else {
+					response = requestJSONKBase(handler, http.MethodPost, path, "admin-secret", test.body)
+				}
+				if response.Code != test.want {
+					t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+				}
+				for _, forbidden := range append(test.forbidden, "/Users/", `C:\\Users\\`) {
+					if strings.Contains(response.Body.String(), forbidden) {
+						t.Fatalf("error response leaked %q: %s", forbidden, response.Body.String())
+					}
+				}
+			})
+		}
+
+		invalidID := requestKBase(handler, http.MethodGet, "/api/source-agents/%2E%2E/commands", "admin-secret")
+		if invalidID.Code != http.StatusBadRequest {
+			t.Fatalf("invalid escaped agent status=%d body=%s", invalidID.Code, invalidID.Body.String())
+		}
+		wrongMethod := requestKBase(handler, http.MethodDelete, "/api/source-agents/agent-a/commands", "admin-secret")
+		if wrongMethod.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("wrong command method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+		}
+	})
+
+	t.Run("worker command API", func(t *testing.T) {
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		diagnose := mustCreateSourceAgentDiagnoseCommand(t, sourceSync, clock, "agent-a", "worker-diagnose", time.Hour)
+		clock.Advance(time.Second)
+		upgrade := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "worker-upgrade")
+
+		claimNext := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a"}`)
+		if claimNext.Code != http.StatusOK || !strings.Contains(claimNext.Body.String(), `"id":"`+diagnose.ID+`"`) ||
+			!strings.Contains(claimNext.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("claim next status=%d body=%s", claimNext.Code, claimNext.Body.String())
+		}
+		claimByIDBody := `{"agent_id":"agent-a","command_id":"` + diagnose.ID + `"}`
+		claimByID := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", claimByIDBody)
+		if claimByID.Code != http.StatusOK || !strings.Contains(claimByID.Body.String(), `"id":"`+diagnose.ID+`"`) {
+			t.Fatalf("idempotent claim by id status=%d body=%s", claimByID.Code, claimByID.Body.String())
+		}
+
+		wrongTarget := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-b","command_id":"`+diagnose.ID+`"}`)
+		if wrongTarget.Code != http.StatusForbidden || strings.Contains(wrongTarget.Body.String(), diagnose.ID) || strings.Contains(wrongTarget.Body.String(), "agent-a") {
+			t.Fatalf("wrong target status=%d body=%s", wrongTarget.Code, wrongTarget.Body.String())
+		}
+		empty := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-b"}`)
+		if empty.Code != http.StatusOK || strings.TrimSpace(empty.Body.String()) != `{"command":null}` {
+			t.Fatalf("empty queue status=%d body=%s", empty.Code, empty.Body.String())
+		}
+		legacyResultCode := requestJSONKBase(
+			handler,
+			http.MethodPost,
+			"/api/source-agent/commands/"+url.PathEscape(diagnose.ID)+"/complete",
+			"agent-secret",
+			`{"agent_id":"agent-a","state":"succeeded","result_code":"diagnostic_complete"}`,
+		)
+		if legacyResultCode.Code != http.StatusBadRequest {
+			t.Fatalf("legacy result_code status=%d body=%s", legacyResultCode.Code, legacyResultCode.Body.String())
+		}
+
+		claimUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if claimUpgrade.Code != http.StatusOK {
+			t.Fatalf("claim upgrade status=%d body=%s", claimUpgrade.Code, claimUpgrade.Body.String())
+		}
+		recoverOwned := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a"}`)
+		if recoverOwned.Code != http.StatusOK || !strings.Contains(recoverOwned.Body.String(), `"id":"`+upgrade.ID+`"`) {
+			t.Fatalf("recover owned status=%d body=%s", recoverOwned.Code, recoverOwned.Body.String())
+		}
+		resumeExact := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if resumeExact.Code != http.StatusOK || !strings.Contains(resumeExact.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("resume exact status=%d body=%s", resumeExact.Code, resumeExact.Body.String())
+		}
+		foreignResume := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-b","command_id":"`+upgrade.ID+`"}`)
+		if foreignResume.Code != http.StatusForbidden || strings.Contains(foreignResume.Body.String(), upgrade.ID) {
+			t.Fatalf("foreign resume status=%d body=%s", foreignResume.Code, foreignResume.Body.String())
+		}
+		commandPath := "/api/source-agent/commands/" + url.PathEscape(upgrade.ID)
+		progress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"downloading","message":"downloading"}`)
+		if progress.Code != http.StatusOK || !strings.Contains(progress.Body.String(), `"state":"downloading"`) {
+			t.Fatalf("download progress status=%d body=%s", progress.Code, progress.Body.String())
+		}
+		badComplete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", `{"agent_id":"agent-a","state":"downloading"}`)
+		if badComplete.Code != http.StatusBadRequest {
+			t.Fatalf("nonterminal complete status=%d body=%s", badComplete.Code, badComplete.Body.String())
+		}
+		for _, state := range []string{
+			SourceAgentCommandVerified,
+			SourceAgentCommandInstalling,
+			SourceAgentCommandRestarting,
+			SourceAgentCommandVerifying,
+		} {
+			response := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", `{"agent_id":"agent-a","state":"`+state+`"}`)
+			if response.Code != http.StatusOK {
+				t.Fatalf("progress %s status=%d body=%s", state, response.Code, response.Body.String())
+			}
+		}
+		completionBody := `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","message":"installed","actual_version":"2.0.0"}`
+		complete := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
+		if complete.Code != http.StatusOK || !strings.Contains(complete.Body.String(), `"state":"succeeded"`) {
+			t.Fatalf("complete status=%d body=%s", complete.Code, complete.Body.String())
+		}
+		duplicate := requestJSONKBase(handler, http.MethodPost, commandPath+"/complete", "agent-secret", completionBody)
+		if duplicate.Code != http.StatusOK {
+			t.Fatalf("duplicate complete status=%d body=%s", duplicate.Code, duplicate.Body.String())
+		}
+		badProgress := requestJSONKBase(handler, http.MethodPost, commandPath+"/progress", "agent-secret", completionBody)
+		if badProgress.Code != http.StatusBadRequest {
+			t.Fatalf("terminal progress status=%d body=%s", badProgress.Code, badProgress.Body.String())
+		}
+		terminalResume := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a","command_id":"`+upgrade.ID+`"}`)
+		if terminalResume.Code != http.StatusOK || !strings.Contains(terminalResume.Body.String(), `"state":"succeeded"`) {
+			t.Fatalf("terminal resume status=%d body=%s", terminalResume.Code, terminalResume.Body.String())
+		}
+		noActiveUpgrade := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/recover", "agent-secret", `{"agent_id":"agent-a"}`)
+		if noActiveUpgrade.Code != http.StatusOK || strings.TrimSpace(noActiveUpgrade.Body.String()) != `{"command":null}` {
+			t.Fatalf("terminal command recovered as active: status=%d body=%s", noActiveUpgrade.Code, noActiveUpgrade.Body.String())
+		}
+
+		for _, test := range []struct {
+			name string
+			path string
+			body string
+		}{
+			{name: "claim unknown field", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a","target_agent_id":"agent-b"}`},
+			{name: "claim trailing", path: "/api/source-agent/commands/claim", body: `{"agent_id":"agent-a"}{"secret":"private"}`},
+			{name: "recover unknown field", path: "/api/source-agent/commands/recover", body: `{"agent_id":"agent-a","owner":"private"}`},
+			{name: "report unknown field", path: commandPath + "/complete", body: `{"agent_id":"agent-a","state":"succeeded","code":"upgrade_complete","actual_version":"2.0.0","spec_json":"private"}`},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				response := requestJSONKBase(handler, http.MethodPost, test.path, "agent-secret", test.body)
+				if response.Code != http.StatusBadRequest {
+					t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+				}
+				for _, forbidden := range []string{"target_agent_id", "agent-b", "spec_json", "private"} {
+					if strings.Contains(response.Body.String(), forbidden) {
+						t.Fatalf("strict JSON error leaked %q: %s", forbidden, response.Body.String())
+					}
+				}
+			})
+		}
+
+		unknown := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/missing-command/complete", "agent-secret", `{"agent_id":"agent-a","state":"failed","code":"upgrade_failed"}`)
+		if unknown.Code != http.StatusNotFound {
+			t.Fatalf("unknown command status=%d body=%s", unknown.Code, unknown.Body.String())
+		}
+		adminOnWorker := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "admin-secret", `{"agent_id":"agent-a"}`)
+		if adminOnWorker.Code != http.StatusUnauthorized {
+			t.Fatalf("management Bearer on worker route status=%d body=%s", adminOnWorker.Code, adminOnWorker.Body.String())
+		}
+		workerOnManagement := requestKBase(handler, http.MethodGet, "/api/source-agents/agent-a", "agent-secret")
+		if workerOnManagement.Code != http.StatusUnauthorized {
+			t.Fatalf("worker Bearer on management route status=%d body=%s", workerOnManagement.Code, workerOnManagement.Body.String())
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactMetadata(t *testing.T) {
+	handler, _, _, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+
+	response := requestKBase(handler, http.MethodGet, "/api/source-agent-artifacts?limit=2", "admin-secret")
+	if response.Code != http.StatusOK {
+		t.Fatalf("Bearer metadata status=%d body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Artifacts []SourceAgentArtifactPublic `json:"artifacts"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Artifacts) != 2 || payload.Artifacts[0].ID >= payload.Artifacts[1].ID {
+		t.Fatalf("artifact metadata = %#v", payload.Artifacts)
+	}
+	for _, forbidden := range []string{"storage_key", "artifacts/", "catalog.json"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("metadata leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+
+	credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Artifact Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookieRequest := newKBaseBrowserCookieRequest(http.MethodGet, "/api/source-agent-artifacts?limit=1", credentials.Token, "")
+	cookieResponse := httptest.NewRecorder()
+	handler.ServeHTTP(cookieResponse, cookieRequest)
+	if cookieResponse.Code != http.StatusOK {
+		t.Fatalf("Cookie metadata status=%d body=%s", cookieResponse.Code, cookieResponse.Body.String())
+	}
+
+	for _, test := range []struct {
+		name  string
+		path  string
+		token string
+		want  int
+	}{
+		{name: "anonymous", path: "/api/source-agent-artifacts", want: http.StatusUnauthorized},
+		{name: "worker token", path: "/api/source-agent-artifacts", token: "agent-secret", want: http.StatusUnauthorized},
+		{name: "duplicate limit", path: "/api/source-agent-artifacts?limit=1&limit=2", token: "admin-secret", want: http.StatusBadRequest},
+		{name: "unknown query", path: "/api/source-agent-artifacts?root=private", token: "admin-secret", want: http.StatusBadRequest},
+		{name: "negative limit", path: "/api/source-agent-artifacts?limit=-1", token: "admin-secret", want: http.StatusBadRequest},
+		{name: "wrong method", path: "/api/source-agent-artifacts", token: "admin-secret", want: http.StatusMethodNotAllowed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			method := http.MethodGet
+			if test.name == "wrong method" {
+				method = http.MethodPost
+			}
+			got := requestKBase(handler, method, test.path, test.token)
+			if got.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", got.Code, got.Body.String(), test.want)
+			}
+			for _, forbidden := range []string{"private", "root", "storage_key", "catalog.json"} {
+				if strings.Contains(got.Body.String(), forbidden) {
+					t.Fatalf("error leaked %q: %s", forbidden, got.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadIsCommandBound(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-download")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	response := requestKBase(handler, http.MethodGet, path, "agent-secret")
+	if response.Code != http.StatusOK || response.Body.String() != "artifact-worker-bytes" {
+		t.Fatalf("download status=%d body=%q", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("Cache-Control=%q", got)
+	}
+	if got := response.Header().Get("Content-Length"); got != strconv.Itoa(len("artifact-worker-bytes")) {
+		t.Fatalf("Content-Length=%q", got)
+	}
+	if got := response.Header().Get("X-Source-Agent-Artifact-SHA256"); got != sha256HexForTest([]byte("artifact-worker-bytes")) {
+		t.Fatalf("artifact SHA header=%q", got)
+	}
+
+	diagnose := mustCreateSourceAgentDiagnoseCommand(t, sourceSync, clock, "agent-a", "artifact-diagnose", time.Hour)
+	if _, err := sourceSync.ClaimSourceAgentCommand(diagnose.ID, "agent-a", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	queued := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-b", "artifact-worker", "artifact-queued")
+	for _, test := range []struct {
+		name      string
+		path      string
+		token     string
+		want      int
+		forbidden []string
+	}{
+		{name: "anonymous", path: path, want: http.StatusUnauthorized},
+		{name: "admin token", path: path, token: "admin-secret", want: http.StatusUnauthorized},
+		{name: "wrong target", path: strings.Replace(path, "agent_id=agent-a", "agent_id=agent-b", 1), token: "agent-secret", want: http.StatusForbidden, forbidden: []string{claimed.ID, "agent-a"}},
+		{name: "wrong artifact", path: strings.Replace(path, "artifacts/artifact-worker", "artifacts/artifact-2", 1), token: "agent-secret", want: http.StatusForbidden, forbidden: []string{claimed.ID, "artifact-worker"}},
+		{name: "queued", path: "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-b&command_id=" + url.QueryEscape(queued.ID), token: "agent-secret", want: http.StatusConflict, forbidden: []string{queued.ID}},
+		{name: "diagnose", path: "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(diagnose.ID), token: "agent-secret", want: http.StatusForbidden, forbidden: []string{diagnose.ID}},
+		{name: "duplicate agent", path: path + "&agent_id=agent-a", token: "agent-secret", want: http.StatusBadRequest},
+		{name: "unknown query", path: path + "&storage_key=private", token: "agent-secret", want: http.StatusBadRequest, forbidden: []string{"private", "storage_key"}},
+		{name: "traversal artifact", path: "/api/source-agent/artifacts/%2E%2E/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID), token: "agent-secret", want: http.StatusBadRequest},
+		{name: "noncanonical artifact", path: "/api/source-agent/artifacts/%20artifact-worker%20/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID), token: "agent-secret", want: http.StatusBadRequest},
+		{name: "noncanonical agent", path: strings.Replace(path, "agent_id=agent-a", "agent_id=%20agent-a%20", 1), token: "agent-secret", want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := requestKBase(handler, http.MethodGet, test.path, test.token)
+			if got.Code != test.want {
+				t.Fatalf("status=%d body=%s, want %d", got.Code, got.Body.String(), test.want)
+			}
+			for _, forbidden := range append(test.forbidden, "catalog.json", "artifacts/") {
+				if strings.Contains(got.Body.String(), forbidden) {
+					t.Fatalf("error leaked %q: %s", forbidden, got.Body.String())
+				}
+			}
+		})
+	}
+
+	completed := completeSourceAgentUpgradeCommand(t, sourceSync, claimed.ID, "agent-a", "agent-a", "2.0.0")
+	terminalPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(completed.ID)
+	terminal := requestKBase(handler, http.MethodGet, terminalPath, "agent-secret")
+	if terminal.Code != http.StatusConflict || strings.Contains(terminal.Body.String(), completed.ID) {
+		t.Fatalf("terminal download status=%d body=%s", terminal.Code, terminal.Body.String())
+	}
+
+	if _, err := sourceSync.ClaimSourceAgentCommand(queued.ID, "agent-b", "agent-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-b", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "amd64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	incompatiblePath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-b&command_id=" + url.QueryEscape(queued.ID)
+	incompatible := requestKBase(handler, http.MethodGet, incompatiblePath, "agent-secret")
+	if incompatible.Code != http.StatusForbidden || strings.Contains(incompatible.Body.String(), queued.ID) {
+		t.Fatalf("incompatible registry target status=%d body=%s", incompatible.Code, incompatible.Body.String())
+	}
+
+	expiring := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-expired")
+	if _, err := sourceSync.ClaimSourceAgentCommand(expiring.ID, "agent-a", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Hour)
+	expiredPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(expiring.ID)
+	expired := requestKBase(handler, http.MethodGet, expiredPath, "agent-secret")
+	if expired.Code != http.StatusConflict || strings.Contains(expired.Body.String(), expiring.ID) {
+		t.Fatalf("expired download status=%d body=%s", expired.Code, expired.Body.String())
+	}
+
+	stale := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-stale-version")
+	if _, err := sourceSync.ClaimSourceAgentCommand(stale.ID, "agent-a", "agent-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-a", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.1.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stalePath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(stale.ID)
+	staleResponse := requestKBase(handler, http.MethodGet, stalePath, "agent-secret")
+	if staleResponse.Code != http.StatusConflict || strings.Contains(staleResponse.Body.String(), stale.ID) || strings.Contains(staleResponse.Body.String(), "1.0.0") {
+		t.Fatalf("stale-version download status=%d body=%s", staleResponse.Code, staleResponse.Body.String())
+	}
+}
+
+func TestSourceAgentArtifactHandoffDownloadIncludesCommandBoundCatalogSnapshot(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-handoff-snapshot")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	response := requestKBase(handler, http.MethodGet, path, "agent-secret")
+	if response.Code != http.StatusOK || response.Body.String() != "artifact-worker-bytes" {
+		t.Fatalf("download status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	wantHeaders := map[string]string{
+		"X-Source-Agent-Command-ID":                claimed.ID,
+		"X-Source-Agent-Artifact-ID":               "artifact-worker",
+		"X-Source-Agent-Artifact-Version":          "2.0.0",
+		"X-Source-Agent-Artifact-Worker-Type":      "wechat-worker",
+		"X-Source-Agent-Artifact-Platform":         "darwin",
+		"X-Source-Agent-Artifact-Architecture":     "arm64",
+		"X-Source-Agent-Artifact-Protocol-Version": "2026-08-01",
+		"X-Source-Agent-Artifact-Revision":         sourceAgentArtifactTestRevision,
+		"X-Source-Agent-Artifact-Channel":          "staging",
+		"X-Source-Agent-Artifact-Size":             strconv.Itoa(len("artifact-worker-bytes")),
+		"X-Source-Agent-Artifact-SHA256":           sha256HexForTest([]byte("artifact-worker-bytes")),
+	}
+	for name, want := range wantHeaders {
+		t.Run(name, func(t *testing.T) {
+			values := response.Header().Values(name)
+			if len(values) != 1 || values[0] != want {
+				t.Fatalf("%s=%q, want one value %q", name, values, want)
+			}
+		})
+	}
+}
+
+func TestSourceAgentArtifactHandoffCatalogReloadCannotMixSnapshotMetadataAndBytes(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	concrete := handler.(*kbaseHTTPHandler)
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-a", "artifact-worker", "artifact-snapshot-reload")
+	claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestPath := "/api/source-agent/artifacts/artifact-worker/download?agent_id=agent-a&command_id=" + url.QueryEscape(claimed.ID)
+	release := make(chan struct{})
+	writer := &snapshotBindingSourceAgentArtifactWriter{
+		header: make(http.Header), entered: make(chan struct{}), release: release,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+		request.Header.Set("Authorization", "Bearer agent-secret")
+		handler.ServeHTTP(writer, request)
+	}()
+	select {
+	case <-writer.entered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("download did not bind its snapshot before response")
+	}
+
+	artifacts, err := concrete.sourceArtifacts.load()
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	replacementBytes := []byte("replacement artifact bytes")
+	found := false
+	for index := range artifacts {
+		if artifacts[index].ID != "artifact-worker" {
+			continue
+		}
+		found = true
+		artifacts[index].Version = "3.0.0"
+		artifacts[index].Revision = strings.Repeat("b", 40)
+		artifacts[index].Channel = "production"
+		artifacts[index].Size = int64(len(replacementBytes))
+		artifacts[index].SHA256 = sha256HexForTest(replacementBytes)
+		artifactPath := filepath.Join(concrete.sourceArtifacts.root, filepath.FromSlash(artifacts[index].StorageKey))
+		if err := os.WriteFile(artifactPath, replacementBytes, 0o600); err != nil {
+			close(release)
+			t.Fatal(err)
+		}
+	}
+	if !found {
+		close(release)
+		t.Fatal("artifact-worker was not found")
+	}
+	writeSourceAgentArtifactCatalog(t, concrete.sourceArtifacts.root, artifacts)
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot download did not finish")
+	}
+
+	if writer.status != http.StatusOK || writer.body.String() != "artifact-worker-bytes" {
+		t.Fatalf("status=%d body=%q", writer.status, writer.body.String())
+	}
+	for name, want := range map[string]string{
+		sourceAgentHeaderArtifactVersion:  "2.0.0",
+		sourceAgentHeaderArtifactRevision: sourceAgentArtifactTestRevision,
+		sourceAgentHeaderArtifactChannel:  "staging",
+		sourceAgentHeaderArtifactSize:     strconv.Itoa(len("artifact-worker-bytes")),
+		sourceAgentHeaderArtifactSHA256:   sha256HexForTest([]byte("artifact-worker-bytes")),
+	} {
+		if values := writer.header.Values(name); len(values) != 1 || values[0] != want {
+			t.Fatalf("%s=%q want one value %q", name, values, want)
+		}
+	}
+}
+
+type snapshotBindingSourceAgentArtifactWriter struct {
+	header      http.Header
+	status      int
+	body        bytes.Buffer
+	entered     chan struct{}
+	release     <-chan struct{}
+	wroteHeader sync.Once
+}
+
+func (w *snapshotBindingSourceAgentArtifactWriter) Header() http.Header { return w.header }
+
+func (w *snapshotBindingSourceAgentArtifactWriter) WriteHeader(status int) {
+	w.status = status
+	w.wroteHeader.Do(func() { close(w.entered) })
+}
+
+func (w *snapshotBindingSourceAgentArtifactWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	<-w.release
+	return w.body.Write(data)
+}
+
+func TestSourceAgentUpdateGuardIsWorkerAuthenticatedCommandBoundAndSnapshotExact(t *testing.T) {
+	type guardFixture struct {
+		handler      http.Handler
+		sourceSync   *SourceSyncStore
+		clock        *sourceSyncTestClock
+		command      SourceAgentCommand
+		artifactRoot string
+	}
+	newFixture := func(t *testing.T, state string, ttl time.Duration) guardFixture {
+		t.Helper()
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		command, err := sourceSync.CreateSourceAgentCommand(SourceAgentCommandCreate{
+			TargetAgentID: "agent-a", Type: SourceAgentCommandUpgrade, IdempotencyKey: "artifact-guard-" + state,
+			Payload:   json.RawMessage(`{"artifact_id":"artifact-worker","expected_current_version":"1.0.0"}`),
+			ExpiresAt: clock.Now().Add(ttl).Format(time.RFC3339Nano),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-a", "agent-a")
+		if err != nil {
+			t.Fatal(err)
+		}
+		commandPath := "/api/source-agent/commands/" + url.PathEscape(claimed.ID) + "/progress"
+		for _, next := range []string{SourceAgentCommandDownloading, SourceAgentCommandVerified, SourceAgentCommandInstalling, SourceAgentCommandRestarting} {
+			got := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-a","state":"`+next+`"}`)
+			if got.Code != http.StatusOK {
+				t.Fatalf("progress %s status=%d body=%s", next, got.Code, got.Body.String())
+			}
+			if next == state {
+				break
+			}
+		}
+		stored, err := sourceSync.GetSourceAgentCommand(claimed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return guardFixture{
+			handler: handler, sourceSync: sourceSync, clock: clock, command: stored,
+			artifactRoot: sourceAgentArtifactRootFromHandlerForTest(t, handler),
+		}
+	}
+	requestGuard := func(t *testing.T, fixture guardFixture, token, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		path := "/api/source-agent/commands/" + url.PathEscape(fixture.command.ID) + "/guard"
+		return requestJSONKBase(fixture.handler, http.MethodPost, path, token, body)
+	}
+	validFields := func() map[string]any {
+		return map[string]any{
+			"agent_id": "agent-a", "artifact_id": "artifact-worker",
+			"current_version": "1.0.0", "target_version": "2.0.0",
+			"revision": sourceAgentArtifactTestRevision, "channel": "staging",
+			"size": int64(len("artifact-worker-bytes")), "sha256": sha256HexForTest([]byte("artifact-worker-bytes")),
+			"worker_type": "wechat-worker", "platform": "darwin", "architecture": "arm64",
+			"protocol_version": "2026-08-01",
+		}
+	}
+	bodyFor := func(t *testing.T, fields map[string]any) string {
+		t.Helper()
+		body, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	emptyLease := ""
+	malformedLease := "not-a-time"
+	nonCanonicalLease := "2026-08-01T13:00:00.000000000Z"
+	offsetLease := "2026-08-01T09:00:00-04:00"
+	expiredLease := "2026-08-01T11:59:59Z"
+
+	t.Run("allows exact owned installing command with no run and sufficient TTL", func(t *testing.T) {
+		fixture := newFixture(t, SourceAgentCommandInstalling, time.Hour)
+		response := requestGuard(t, fixture, "agent-secret", bodyFor(t, validFields()))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("guard status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	for _, test := range []struct {
+		name      string
+		state     string
+		token     string
+		ttl       time.Duration
+		mutate    func(map[string]any)
+		disable   bool
+		activeRun bool
+		lease     *string
+		want      int
+	}{
+		{name: "requires worker authentication", state: SourceAgentCommandInstalling, ttl: time.Hour, want: http.StatusUnauthorized},
+		{name: "requires claimed owner", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["agent_id"] = "agent-b" }, want: http.StatusForbidden},
+		{name: "requires installing state", state: SourceAgentCommandVerified, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
+		{name: "rejects restarting state", state: SourceAgentCommandRestarting, token: "agent-secret", ttl: time.Hour, want: http.StatusConflict},
+		{name: "requires no active source run", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, want: http.StatusConflict},
+		{name: "allows a valid expired source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &expiredLease, want: http.StatusNoContent},
+		{name: "fails closed on empty source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &emptyLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on malformed source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &malformedLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on noncanonical source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &nonCanonicalLease, want: http.StatusServiceUnavailable},
+		{name: "fails closed on non-UTC source lease", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, activeRun: true, lease: &offsetLease, want: http.StatusServiceUnavailable},
+		{name: "requires allowed rollout", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, disable: true, want: http.StatusConflict},
+		{name: "requires restart ready reconcile safety TTL", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Minute, want: http.StatusConflict},
+		{name: "requires artifact ID", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["artifact_id"] = "artifact-2" }, want: http.StatusConflict},
+		{name: "requires current version", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["current_version"] = "1.0.1" }, want: http.StatusConflict},
+		{name: "requires target version", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["target_version"] = "2.0.1" }, want: http.StatusConflict},
+		{name: "requires revision", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["revision"] = strings.Repeat("b", 40) }, want: http.StatusConflict},
+		{name: "requires channel", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["channel"] = "production" }, want: http.StatusConflict},
+		{name: "requires size", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["size"] = int64(len("artifact-worker-bytes") + 1) }, want: http.StatusConflict},
+		{name: "requires SHA-256", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["sha256"] = strings.Repeat("0", 64) }, want: http.StatusConflict},
+		{name: "requires worker type", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["worker_type"] = "wcplus-worker" }, want: http.StatusConflict},
+		{name: "requires platform", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["platform"] = "linux" }, want: http.StatusConflict},
+		{name: "requires architecture", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["architecture"] = "amd64" }, want: http.StatusConflict},
+		{name: "requires protocol", state: SourceAgentCommandInstalling, token: "agent-secret", ttl: time.Hour, mutate: func(fields map[string]any) { fields["protocol_version"] = "2026-07-01" }, want: http.StatusConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newFixture(t, test.state, test.ttl)
+			if test.disable {
+				setSourceAgentArtifactRolloutForTest(t, fixture.artifactRoot, "artifact-worker", false)
+			}
+			if test.activeRun {
+				subscription, err := fixture.sourceSync.CreateSubscription(SourceSubscriptionInput{
+					SourceType: "wechat_mp_article", SourceAccountKey: "guard-active-run",
+					SourceAccount: "Guard Active Run", AgentID: "agent-a",
+					Operation: "sync_articles", Enabled: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				run, err := fixture.sourceSync.CreateRun(subscription.ID, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				leased, err := fixture.sourceSync.LeaseNextRun("agent-a", []string{"sync_articles"}, time.Minute)
+				if err != nil || leased == nil || leased.ID != run.ID {
+					t.Fatalf("leased=%#v err=%v", leased, err)
+				}
+				if _, err := fixture.sourceSync.StartRun(run.ID, "agent-a"); err != nil {
+					t.Fatal(err)
+				}
+				if test.lease != nil {
+					if _, err := fixture.sourceSync.db.Exec(`UPDATE source_sync_runs SET lease_expires_at = ? WHERE id = ?`, *test.lease, run.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			fields := validFields()
+			if test.mutate != nil {
+				test.mutate(fields)
+			}
+			response := requestGuard(t, fixture, test.token, bodyFor(t, fields))
+			if response.Code != test.want {
+				t.Fatalf("guard status=%d body=%s, want %d", response.Code, response.Body.String(), test.want)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadBoundsConcurrentResponses(t *testing.T) {
+	handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+	concrete := handler.(*kbaseHTTPHandler)
+	snapshotTempDir := t.TempDir()
+	concrete.sourceArtifacts.snapshotTempDir = snapshotTempDir
+	if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+		Version: "1.0.0", ProtocolVersion: "2026-08-01",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agentIDs := []string{"agent-a", "agent-b", "agent-c"}
+	paths := make([]string, 0, 3)
+	for index, agentID := range agentIDs {
+		command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, agentID, "artifact-worker", fmt.Sprintf("artifact-bounded-%d", index))
+		claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, "/api/source-agent/artifacts/artifact-worker/download?agent_id="+url.QueryEscape(agentID)+"&command_id="+url.QueryEscape(claimed.ID))
+	}
+
+	release := make(chan struct{})
+	start := func(path string) (<-chan struct{}, context.CancelFunc, <-chan struct{}) {
+		ctx, cancel := context.WithCancel(context.Background())
+		entered := make(chan struct{})
+		done := make(chan struct{})
+		writer := &blockingSourceAgentArtifactResponseWriter{
+			header:  make(http.Header),
+			ctx:     ctx,
+			entered: entered,
+			release: release,
+		}
+		request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+		request.Header.Set("Authorization", "Bearer agent-secret")
+		go func() {
+			defer close(done)
+			handler.ServeHTTP(writer, request)
+		}()
+		return entered, cancel, done
+	}
+
+	firstEntered, cancelFirst, firstDone := start(paths[0])
+	secondEntered, cancelSecond, secondDone := start(paths[1])
+	defer cancelFirst()
+	defer cancelSecond()
+	for index, entered := range []<-chan struct{}{firstEntered, secondEntered} {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatalf("download %d did not enter response", index+1)
+		}
+	}
+
+	thirdEntered, cancelThird, thirdDone := start(paths[2])
+	unexpectedThird := false
+	select {
+	case <-thirdEntered:
+		unexpectedThird = true
+	case <-time.After(time.Second):
+	}
+	cancelThird()
+	select {
+	case <-thirdDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled third download did not return promptly")
+	}
+
+	retryEntered, cancelRetry, retryDone := start(paths[2])
+	defer cancelRetry()
+	unexpectedRetry := false
+	select {
+	case <-retryEntered:
+		unexpectedRetry = true
+	case <-time.After(time.Second):
+	}
+	cancelFirst()
+	select {
+	case <-retryEntered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("active download cancellation did not release a snapshot slot")
+	}
+	cancelRetry()
+	select {
+	case <-retryDone:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("canceled active retry did not return promptly")
+	}
+	close(release)
+	for index, done := range []<-chan struct{}{firstDone, secondDone} {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("download %d did not finish after release", index+1)
+		}
+	}
+	if unexpectedThird {
+		t.Fatal("third concurrent download entered the response before a slot was released")
+	}
+	if unexpectedRetry {
+		t.Fatal("retried third download entered the response before active cancellation released a slot")
+	}
+	if entries, err := os.ReadDir(snapshotTempDir); err != nil || len(entries) != 0 {
+		t.Fatalf("snapshot temp entries after cancellation = %#v, %v", entries, err)
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactDownloadRevalidatesAfterQueue(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *kbaseHTTPHandler, *SourceSyncStore)
+	}{
+		{
+			name: "rollout disabled",
+			mutate: func(t *testing.T, handler *kbaseHTTPHandler, _ *SourceSyncStore) {
+				setSourceAgentArtifactRolloutForTest(t, handler.sourceArtifacts.root, "artifact-worker", false)
+			},
+		},
+		{
+			name: "registry version changed",
+			mutate: func(t *testing.T, _ *kbaseHTTPHandler, sourceSync *SourceSyncStore) {
+				if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+					AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+					Version: "1.1.0", ProtocolVersion: "2026-08-01",
+				}); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+			concrete := handler.(*kbaseHTTPHandler)
+			if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+				AgentID: "agent-c", WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+				Version: "1.0.0", ProtocolVersion: "2026-08-01",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			leaseObserved := make(chan struct{}, 3)
+			concrete.sourceArtifacts.snapshotLeaseObserver = func() { leaseObserved <- struct{}{} }
+
+			agentIDs := []string{"agent-a", "agent-b", "agent-c"}
+			paths := make([]string, 0, len(agentIDs))
+			for index, agentID := range agentIDs {
+				command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, agentID, "artifact-worker", fmt.Sprintf("artifact-revalidate-%d", index))
+				claimed, err := sourceSync.ClaimSourceAgentCommand(command.ID, agentID, agentID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				paths = append(paths, "/api/source-agent/artifacts/artifact-worker/download?agent_id="+url.QueryEscape(agentID)+"&command_id="+url.QueryEscape(claimed.ID))
+			}
+
+			release := make(chan struct{})
+			startBlocking := func(path string) (<-chan struct{}, context.CancelFunc, <-chan struct{}) {
+				ctx, cancel := context.WithCancel(context.Background())
+				entered := make(chan struct{})
+				done := make(chan struct{})
+				writer := &blockingSourceAgentArtifactResponseWriter{
+					header: make(http.Header), ctx: ctx, entered: entered, release: release,
+				}
+				request := httptest.NewRequest(http.MethodGet, path, nil).WithContext(ctx)
+				request.Header.Set("Authorization", "Bearer agent-secret")
+				go func() {
+					defer close(done)
+					handler.ServeHTTP(writer, request)
+				}()
+				return entered, cancel, done
+			}
+			firstEntered, cancelFirst, firstDone := startBlocking(paths[0])
+			secondEntered, cancelSecond, secondDone := startBlocking(paths[1])
+			for _, entered := range []<-chan struct{}{firstEntered, secondEntered} {
+				select {
+				case <-entered:
+				case <-time.After(2 * time.Second):
+					cancelFirst()
+					cancelSecond()
+					t.Fatal("blocking download did not enter response")
+				}
+			}
+			for index := 0; index < 2; index++ {
+				select {
+				case <-leaseObserved:
+				case <-time.After(time.Second):
+					cancelFirst()
+					cancelSecond()
+					t.Fatal("blocking download lease was not observed")
+				}
+			}
+
+			thirdCtx, cancelThird := context.WithCancel(context.Background())
+			thirdResponse := httptest.NewRecorder()
+			thirdRequest := httptest.NewRequest(http.MethodGet, paths[2], nil).WithContext(thirdCtx)
+			thirdRequest.Header.Set("Authorization", "Bearer agent-secret")
+			thirdDone := make(chan struct{})
+			go func() {
+				defer close(thirdDone)
+				handler.ServeHTTP(thirdResponse, thirdRequest)
+			}()
+			select {
+			case <-leaseObserved:
+			case <-time.After(time.Second):
+				cancelFirst()
+				cancelSecond()
+				cancelThird()
+				t.Fatal("queued download lease attempt was not observed")
+			}
+
+			test.mutate(t, concrete, sourceSync)
+			cancelFirst()
+			select {
+			case <-thirdDone:
+			case <-time.After(2 * time.Second):
+				cancelSecond()
+				cancelThird()
+				t.Fatal("queued download did not finish after a slot was released")
+			}
+			cancelSecond()
+			cancelThird()
+			for _, done := range []<-chan struct{}{firstDone, secondDone} {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("blocking download did not stop after cancellation")
+				}
+			}
+			if thirdResponse.Code != http.StatusConflict {
+				t.Fatalf("queued download status=%d body=%q, want conflict", thirdResponse.Code, thirdResponse.Body.String())
+			}
+			for _, forbidden := range []string{"artifact-worker-bytes", "artifact-worker", concrete.sourceArtifacts.root, "catalog.json", "storage_key"} {
+				if strings.Contains(thirdResponse.Body.String(), forbidden) {
+					t.Fatalf("queued download error leaked %q: %s", forbidden, thirdResponse.Body.String())
+				}
+			}
+		})
+	}
+}
+
+type blockingSourceAgentArtifactResponseWriter struct {
+	header      http.Header
+	ctx         context.Context
+	entered     chan<- struct{}
+	release     <-chan struct{}
+	wroteHeader sync.Once
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) WriteHeader(_ int) {
+	w.wroteHeader.Do(func() { close(w.entered) })
+}
+
+func (w *blockingSourceAgentArtifactResponseWriter) Write(data []byte) (int, error) {
+	w.WriteHeader(http.StatusOK)
+	select {
+	case <-w.release:
+		return len(data), nil
+	case <-w.ctx.Done():
+		return 0, w.ctx.Err()
+	}
+}
+
+func TestKBaseHTTPHandlerSourceAgentArtifactRolloutGate(t *testing.T) {
+	handler, sourceSync, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
+	credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Artifact Rollout Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	body := `{"type":"upgrade","idempotency_key":"disabled-artifact","payload":{"artifact_id":"artifact-2","expected_current_version":"1.0.0"},"expires_at":"` + expiresAt + `"}`
+
+	artifactRoot := sourceAgentArtifactRootFromHandlerForTest(t, handler)
+	setSourceAgentArtifactRolloutForTest(t, artifactRoot, "artifact-2", false)
+	request := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+	addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusConflict || strings.Contains(response.Body.String(), "artifact-2") || strings.Contains(response.Body.String(), artifactRoot) {
+		t.Fatalf("disabled create status=%d body=%s", response.Code, response.Body.String())
+	}
+	commands, err := sourceSync.ListSourceAgentCommands("agent-a", 0)
+	if err != nil || len(commands) != 0 {
+		t.Fatalf("disabled rollout created commands=%#v err=%v", commands, err)
+	}
+
+	setSourceAgentArtifactRolloutForTest(t, artifactRoot, "artifact-2", true)
+	request = newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+	addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("enabled create status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	command := mustCreateSourceAgentUpgradeCommand(t, sourceSync, clock, "agent-b", "artifact-worker", "install-gate")
+	if _, err := sourceSync.ClaimSourceAgentCommand(command.ID, "agent-b", "agent-b"); err != nil {
+		t.Fatal(err)
+	}
+	commandPath := "/api/source-agent/commands/" + url.PathEscape(command.ID) + "/progress"
+	for _, state := range []string{SourceAgentCommandDownloading, SourceAgentCommandVerified} {
+		got := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-b","state":"`+state+`"}`)
+		if got.Code != http.StatusOK {
+			t.Fatalf("progress %s status=%d body=%s", state, got.Code, got.Body.String())
+		}
+	}
+	setSourceAgentArtifactRolloutForTest(t, artifactRoot, "artifact-worker", false)
+	install := requestJSONKBase(handler, http.MethodPost, commandPath, "agent-secret", `{"agent_id":"agent-b","state":"installing"}`)
+	if install.Code != http.StatusConflict || strings.Contains(install.Body.String(), artifactRoot) || strings.Contains(install.Body.String(), "artifact-worker") {
+		t.Fatalf("disabled install status=%d body=%s", install.Code, install.Body.String())
+	}
+	stored, err := sourceSync.GetSourceAgentCommand(command.ID)
+	if err != nil || stored.State != SourceAgentCommandVerified {
+		t.Fatalf("disabled install command=%#v err=%v", stored, err)
 	}
 }
 
@@ -915,6 +3223,7 @@ func TestKBaseHTTPHandlerPersistsFailureCheckpointCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sourceSync.Close()
+	registerSourceLeaseAgent(t, sourceSync, "agent-a")
 	subscription, err := sourceSync.CreateSubscription(SourceSubscriptionInput{
 		SourceType:       "wechat_mp_article",
 		SourceAccountKey: "account-key",
@@ -1006,34 +3315,3023 @@ func TestKBaseHTTPHandlerSetsSubscriptionEnabledWithoutReplacingCursor(t *testin
 	}
 }
 
-func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
-	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store:     NewBookKnowledgeStore(t.TempDir()),
-		AuthToken: "secret-token",
+const (
+	testKBaseAuthToken           = "kbase-api-token-must-not-leak"
+	testBrowserSessionSecret     = "browser-proxy-secret-0123456789abcdef"
+	testBrowserSessionOrigin     = "https://kbase.example"
+	testBrowserSessionCookieTTL  = 30 * 24 * time.Hour
+	testBrowserSessionAdminToken = "session-admin-token-0123456789abcdef"
+)
+
+func TestKBaseHTTPHandlerSessionAdmin(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+
+	t.Run("dedicated bearer only", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 501)
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Safari / macOS"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/admin/browser-sessions"
+		for name, request := range map[string]*http.Request{
+			"missing":          httptest.NewRequest(http.MethodGet, path, nil),
+			"main bearer":      adminSessionRequest(http.MethodGet, path, testKBaseAuthToken),
+			"source bearer":    adminSessionRequest(http.MethodGet, path, "dedicated-source-agent-token"),
+			"publisher bearer": adminSessionRequest(http.MethodGet, path, "dedicated-publisher-token"),
+			"malformed":        adminSessionRequest(http.MethodGet, path, "wrong"),
+			"browser cookie": func() *http.Request {
+				request := httptest.NewRequest(http.MethodGet, path, nil)
+				request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: credentials.Token})
+				return request
+			}(),
+			"duplicate": func() *http.Request {
+				request := adminSessionRequest(http.MethodGet, path, testBrowserSessionAdminToken)
+				request.Header.Add("Authorization", "Bearer "+testBrowserSessionAdminToken)
+				return request
+			}(),
+		} {
+			t.Run(name, func(t *testing.T) {
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				if response.Code != http.StatusUnauthorized ||
+					response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+					t.Fatalf("status=%d body=%q", response.Code, response.Body.String())
+				}
+				if response.Header().Get("Set-Cookie") != "" {
+					t.Fatalf("admin rejection mutated browser Cookie: %q", response.Header().Get("Set-Cookie"))
+				}
+			})
+		}
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	resp := httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusUnauthorized {
-		t.Fatalf("status without trusted header = %d, want 401", resp.Code)
+	t.Run("configuration and methods fail closed", func(t *testing.T) {
+		handler, _ := newKBaseSessionAdminHTTPTestHandler(t, clock, 502)
+		for _, test := range []struct {
+			method string
+			path   string
+			allow  string
+		}{
+			{http.MethodPost, "/api/admin/browser-sessions", http.MethodGet},
+			{http.MethodGet, "/api/admin/browser-sessions/session_id", http.MethodDelete},
+			{http.MethodGet, "/api/admin/browser-sessions/revoke-all", http.MethodPost},
+		} {
+			response := serveAdminSessionRequest(handler, test.method, test.path, testBrowserSessionAdminToken)
+			if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != test.allow {
+				t.Fatalf("%s %s status=%d Allow=%q body=%s",
+					test.method, test.path, response.Code, response.Header().Get("Allow"), response.Body.String())
+			}
+		}
+		preflight := adminSessionRequest(
+			http.MethodOptions,
+			"/api/admin/browser-sessions",
+			testBrowserSessionAdminToken,
+		)
+		preflight.Header.Set("Origin", "http://127.0.0.1:5173")
+		preflightResponse := httptest.NewRecorder()
+		handler.ServeHTTP(preflightResponse, preflight)
+		if preflightResponse.Code != http.StatusMethodNotAllowed ||
+			preflightResponse.Header().Get("Allow") != http.MethodGet {
+			t.Fatalf("OPTIONS status=%d Allow=%q body=%s",
+				preflightResponse.Code,
+				preflightResponse.Header().Get("Allow"),
+				preflightResponse.Body.String())
+		}
+
+		missingAdmin := NewKBaseHTTPHandler(KBaseHTTPConfig{
+			Store: NewBookKnowledgeStore(t.TempDir()),
+			BrowserSessions: BrowserSessionHTTPConfig{
+				Store:        newBrowserSessionStoreForAdminTest(t, clock, 503),
+				PublicOrigin: testBrowserSessionOrigin,
+			},
+		})
+		response := serveAdminSessionRequest(
+			missingAdmin, http.MethodGet, "/api/admin/browser-sessions", testBrowserSessionAdminToken,
+		)
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("missing admin status=%d body=%q", response.Code, response.Body.String())
+		}
+
+		missingStore := NewKBaseHTTPHandler(KBaseHTTPConfig{
+			Store: NewBookKnowledgeStore(t.TempDir()),
+			BrowserSessions: BrowserSessionHTTPConfig{
+				AdminToken:   testBrowserSessionAdminToken,
+				PublicOrigin: testBrowserSessionOrigin,
+			},
+		})
+		response = serveAdminSessionRequest(
+			missingStore, http.MethodGet, "/api/admin/browser-sessions", testBrowserSessionAdminToken,
+		)
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("missing store status=%d body=%q", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("list exposes bounded public metadata only", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 504)
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{
+			DeviceLabel: "Chrome / Linux",
+			UserAgent:   "private-user-agent-must-not-leak",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := adminSessionRequest(
+			http.MethodGet, "/api/admin/browser-sessions", testBrowserSessionAdminToken,
+		)
+		request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: credentials.Token})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionNoStore(t, response)
+		if response.Header().Get("Set-Cookie") != "" {
+			t.Fatalf("admin list mutated browser Cookie: %q", response.Header().Get("Set-Cookie"))
+		}
+		body := strings.ToLower(response.Body.String())
+		for _, privateValue := range []string{
+			credentials.Token,
+			credentials.CSRFToken,
+			"private-user-agent-must-not-leak",
+			"token_hash",
+			"csrf_hash",
+			"user_agent",
+			"cookie",
+			"client_id",
+			"issued_epoch",
+		} {
+			if strings.Contains(body, strings.ToLower(privateValue)) {
+				t.Fatalf("admin list exposed private value %q: %s", privateValue, response.Body.String())
+			}
+		}
+		var payload struct {
+			Sessions []BrowserSession `json:"sessions"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if len(payload.Sessions) != 1 || payload.Sessions[0].ID != credentials.Session.ID {
+			t.Fatalf("sessions=%#v", payload.Sessions)
+		}
+	})
+
+	t.Run("revoke one is immediate and idempotent", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 505)
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Firefox / Linux"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := "/api/admin/browser-sessions/" + url.PathEscape(credentials.Session.ID)
+		for attempt := 0; attempt < 2; attempt++ {
+			response := serveAdminSessionRequest(
+				handler, http.MethodDelete, path, testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+				t.Fatalf("attempt %d status=%d body=%q", attempt, response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+			if response.Header().Get("Set-Cookie") != "" {
+				t.Fatalf("admin revoke mutated browser Cookie: %q", response.Header().Get("Set-Cookie"))
+			}
+		}
+
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("revoked session next request status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("revoke all is counted idempotently and preserves machine bearer", func(t *testing.T) {
+		handler, sessionStore := newKBaseSessionAdminHTTPTestHandler(t, clock, 506)
+		for _, label := range []string{"Chrome / macOS", "Safari / iOS"} {
+			if _, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: label}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for attempt, want := range []int64{2, 0} {
+			response := serveAdminSessionRequest(
+				handler,
+				http.MethodPost,
+				"/api/admin/browser-sessions/revoke-all",
+				testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusOK {
+				t.Fatalf("attempt %d status=%d body=%s", attempt, response.Code, response.Body.String())
+			}
+			var payload map[string]int64
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if len(payload) != 1 || payload["revoked_count"] != want {
+				t.Fatalf("attempt %d payload=%#v", attempt, payload)
+			}
+		}
+		response := requestKBase(handler, http.MethodGet, "/api/books", testKBaseAuthToken)
+		if response.Code != http.StatusOK {
+			t.Fatalf("machine bearer status=%d body=%s", response.Code, response.Body.String())
+		}
+	})
+
+	t.Run("invalid revoke paths are rejected", func(t *testing.T) {
+		handler, _ := newKBaseSessionAdminHTTPTestHandler(t, clock, 507)
+		for _, path := range []string{
+			"/api/admin/browser-sessions/",
+			"/api/admin/browser-sessions/session_a/nested",
+			"/api/admin/browser-sessions/session_a?session_id=session_b",
+			"/api/admin/browser-sessions/%2F",
+			"/api/admin/browser-sessions/%00",
+		} {
+			response := serveAdminSessionRequest(
+				handler, http.MethodDelete, path, testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusBadRequest && response.Code != http.StatusNotFound {
+				t.Fatalf("path %q status=%d body=%s", path, response.Code, response.Body.String())
+			}
+		}
+	})
+
+	t.Run("store failures are generic", func(t *testing.T) {
+		for index, request := range []struct {
+			method string
+			path   string
+		}{
+			{http.MethodGet, "/api/admin/browser-sessions"},
+			{http.MethodDelete, "/api/admin/browser-sessions/session_missing"},
+			{http.MethodPost, "/api/admin/browser-sessions/revoke-all"},
+		} {
+			sessionStore := newBrowserSessionStoreForAdminTest(t, clock, 508+index)
+			handler := newKBaseSessionAdminHTTPTestHandlerForStore(t, sessionStore)
+			if err := sessionStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			response := serveAdminSessionRequest(
+				handler, request.method, request.path, testBrowserSessionAdminToken,
+			)
+			if response.Code != http.StatusServiceUnavailable ||
+				response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+				t.Fatalf("%s %s closed store status=%d body=%q",
+					request.method, request.path, response.Code, response.Body.String())
+			}
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerBrowserSessionMethodRulesAndAuthorizationRejection(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
 	}
-	if strings.Contains(resp.Body.String(), "secret-token") {
-		t.Fatalf("untrusted response leaked token: %s", resp.Body.String())
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 401)
+
+	for _, method := range []string{
+		http.MethodHead,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions,
+	} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "/browser/session", nil)
+			request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405; body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Allow"); got != http.MethodGet+", "+http.MethodPost {
+				t.Fatalf("Allow = %q, want GET, POST", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	req.Header.Set("X-KBase-Browser-Session", "1")
-	resp = httptest.NewRecorder()
-	handler.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status with trusted header = %d, body=%s", resp.Code, resp.Body.String())
+	for _, authorization := range []string{"", " ", "Basic forwarded", "Bearer forwarded"} {
+		t.Run("authorization_"+fmt.Sprintf("%q", authorization), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+			request.Header.Set("Authorization", authorization)
+			request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
 	}
-	if !strings.Contains(resp.Body.String(), `"token":"secret-token"`) {
-		t.Fatalf("trusted response missing token: %s", resp.Body.String())
+	assertKBaseBrowserSessionCount(t, sessionStore, 0)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionProxyConstantTimeBoundaryAndCookieContract(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
 	}
-	if got := resp.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 402)
+
+	rejectedSecrets := []struct {
+		name   string
+		values []string
+	}{
+		{name: "missing"},
+		{name: "short_prefix", values: []string{strings.TrimSuffix(testBrowserSessionSecret, "f")}},
+		{name: "long_suffix", values: []string{testBrowserSessionSecret + "x"}},
+		{name: "leading_space", values: []string{" " + testBrowserSessionSecret}},
+		{name: "trailing_space", values: []string{testBrowserSessionSecret + " "}},
+		{name: "oversized", values: []string{strings.Repeat("x", 1024)}},
+		{name: "duplicate", values: []string{testBrowserSessionSecret, testBrowserSessionSecret}},
+	}
+	for _, testCase := range rejectedSecrets {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+			for _, value := range testCase.values {
+				request.Header.Add("X-KBase-Browser-Session", value)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401; body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 0)
+
+	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
+	request.Header.Set(
+		"User-Agent",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionPublicResponse(t, response, "Chrome on macOS")
+	cookie := requireKBaseBrowserSessionCookie(t, response)
+	if cookie.Value == "" || cookie.Value == testKBaseAuthToken || cookie.Value == testBrowserSessionSecret {
+		t.Fatalf("session Cookie value is invalid or reused a configured secret")
+	}
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("session Cookie flags = Secure:%t HttpOnly:%t SameSite:%v", cookie.Secure, cookie.HttpOnly, cookie.SameSite)
+	}
+	if cookie.Path != "/" || cookie.Domain != "" {
+		t.Fatalf("session Cookie scope = Path:%q Domain:%q", cookie.Path, cookie.Domain)
+	}
+	if cookie.MaxAge != int(testBrowserSessionCookieTTL/time.Second) {
+		t.Fatalf("session Cookie MaxAge = %d, want %d", cookie.MaxAge, int(testBrowserSessionCookieTTL/time.Second))
+	}
+	if want := clock.Now().Add(testBrowserSessionCookieTTL); !cookie.Expires.Equal(want) {
+		t.Fatalf("session Cookie Expires = %s, want %s", cookie.Expires, want)
+	}
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionCookieUsesConfiguredTTL(t *testing.T) {
+	const configuredTTL = 2*time.Hour + 30*time.Second
+	newClock := func() *browserSessionTestClock {
+		return &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+	}
+
+	t.Run("login", func(t *testing.T) {
+		clock := newClock()
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+			t,
+			clock,
+			409,
+			configuredTTL,
+		)
+		request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+		request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+		addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("login status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(t, response, configuredTTL, clock.Now().Add(configuredTTL))
+	})
+
+	t.Run("bearer_migration", func(t *testing.T) {
+		clock := newClock()
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+			t,
+			clock,
+			410,
+			configuredTTL,
+		)
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+		addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("migration status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(t, response, configuredTTL, clock.Now().Add(configuredTTL))
+	})
+
+	t.Run("lifecycle_renewal", func(t *testing.T) {
+		clock := newClock()
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+			t,
+			clock,
+			411,
+			configuredTTL,
+		)
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Renewed Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Minute)
+
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		request.AddCookie(&http.Cookie{
+			Name:  "__Host-kbase_session",
+			Value: credentials.Token,
+		})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusOK {
+			t.Fatalf("renewal status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(t, response, configuredTTL, clock.Now().Add(configuredTTL))
+	})
+}
+
+func TestKBaseHTTPHandlerBrowserSessionUnavailableIsGeneric(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            testKBaseAuthToken,
+		BrowserSessionSecret: testBrowserSessionSecret,
+		BrowserSessions: BrowserSessionHTTPConfig{
+			PublicOrigin: testBrowserSessionOrigin,
+		},
+	})
+	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+		t.Fatalf("unavailable response = status %d body %q", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionStoreConflictsAreGenericServiceUnavailable(t *testing.T) {
+	t.Run("create_credential_collision", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+		sessionDirectory := t.TempDir()
+		if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		credentialPair := deterministicBrowserSessionBytes(412, 1)
+		repeatedCredentials := append(append([]byte(nil), credentialPair...), credentialPair...)
+		sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+			Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+			Now:             clock.Now,
+			Random:          bytes.NewReader(repeatedCredentials),
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := sessionStore.Close(); err != nil {
+				t.Errorf("close browser session store: %v", err)
+			}
+		})
+		if _, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Existing Browser"}); err != nil {
+			t.Fatal(err)
+		}
+		handler := newKBaseBrowserSessionHTTPTestHandlerForStore(
+			t,
+			sessionStore,
+			testBrowserSessionCookieTTL,
+		)
+
+		request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+		request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+		addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionGenericServiceUnavailable(t, response)
+		assertKBaseBrowserSessionCount(t, sessionStore, 1)
+	})
+
+	t.Run("authenticate_renewal_collision", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 413)
+		credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Renewal Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sessionStore.db.Exec(`
+			CREATE TRIGGER force_browser_session_renewal_conflict
+			BEFORE UPDATE OF last_active_at ON browser_sessions
+			BEGIN
+				SELECT RAISE(ABORT, 'forced renewal conflict');
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		clock.Advance(5 * time.Minute)
+
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		request.AddCookie(&http.Cookie{
+			Name:  "__Host-kbase_session",
+			Value: credentials.Token,
+		})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionGenericServiceUnavailable(t, response)
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("conflicted renewal changed Cookie: %q", got)
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerBrowserSessionDeviceLabelPrivacyAndBounds(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 403)
+	const maxBoundedUserAgentBytes = 512
+	rawUserAgent := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/126.0.0.0 " +
+		strings.Repeat("x", maxBoundedUserAgentBytes) +
+		" private-device-name raw-user-agent-tail"
+
+	request := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+	addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
+	request.Header.Set("User-Agent", rawUserAgent)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionPublicResponse(t, response, "Edge on Windows")
+	body := response.Body.String()
+	for _, privateValue := range []string{"126.0.0.0", "private-device-name", "raw-user-agent-tail", rawUserAgent} {
+		if strings.Contains(body, privateValue) {
+			t.Fatalf("public response exposed User-Agent detail %q: %s", privateValue, body)
+		}
+	}
+
+	sessions, err := sessionStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].DeviceLabel != "Edge on Windows" ||
+		len(sessions[0].DeviceLabel) > 64 {
+		t.Fatalf("stored public device metadata = %#v", sessions)
+	}
+	var storedUserAgentHash []byte
+	if err := sessionStore.db.QueryRow(
+		`SELECT user_agent_hash FROM browser_sessions WHERE id = ?`,
+		sessions[0].ID,
+	).Scan(&storedUserAgentHash); err != nil {
+		t.Fatal(err)
+	}
+	wantHash := sha256.Sum256([]byte(rawUserAgent[:maxBoundedUserAgentBytes]))
+	if !bytes.Equal(storedUserAgentHash, wantHash[:]) {
+		t.Fatalf("stored User-Agent hash was not computed from the bounded header")
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationMethodAndExactOriginRules(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 404)
+
+	for _, method := range []string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions,
+	} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "/browser/session/migrate", nil)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405; body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Get("Allow"); got != http.MethodPost {
+				t.Fatalf("Allow = %q, want POST", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+
+	for _, origin := range []string{
+		"",
+		"http://kbase.example",
+		testBrowserSessionOrigin + "/",
+		"https://KBASE.example",
+		" " + testBrowserSessionOrigin,
+		testBrowserSessionOrigin + " ",
+		strings.Repeat("x", 4096),
+	} {
+		t.Run("origin_"+fmt.Sprintf("%q", origin), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+			if origin != "" {
+				request.Header.Set("Origin", origin)
+			}
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden ||
+				response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+				t.Fatalf("origin %q response = status %d body %q", origin, response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+
+	duplicateOrigin := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	duplicateOrigin.Header.Add("Origin", testBrowserSessionOrigin)
+	duplicateOrigin.Header.Add("Origin", testBrowserSessionOrigin)
+	duplicateOrigin.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	duplicateResponse := httptest.NewRecorder()
+	handler.ServeHTTP(duplicateResponse, duplicateOrigin)
+	if duplicateResponse.Code != http.StatusForbidden {
+		t.Fatalf("duplicate Origin status = %d, want 403", duplicateResponse.Code)
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 0)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationValidCookieIsIdempotent(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 405)
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{
+		DeviceLabel: "Existing Browser",
+		UserAgent:   "existing-agent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	migrate := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer intentionally-invalid-token")
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		request.AddCookie(&http.Cookie{
+			Name:  "__Host-kbase_session",
+			Value: credentials.Token,
+		})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	response := migrate()
+	if response.Code != http.StatusOK {
+		t.Fatalf("idempotent migration status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionResponseID(t, response, credentials.Session.ID)
+	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("migration refreshed Cookie inside lifecycle window: %q", got)
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+
+	clock.Advance(5 * time.Minute)
+	renewed := migrate()
+	if renewed.Code != http.StatusOK {
+		t.Fatalf("renewed migration status = %d, body=%s", renewed.Code, renewed.Body.String())
+	}
+	assertKBaseBrowserSessionResponseID(t, renewed, credentials.Session.ID)
+	refreshedCookie := requireKBaseBrowserSessionCookie(t, renewed)
+	if want := clock.Now().Add(testBrowserSessionCookieTTL); !refreshedCookie.Expires.Equal(want) {
+		t.Fatalf("refreshed Cookie Expires = %s, want %s", refreshedCookie.Expires, want)
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationValidBearerCreatesSession(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 406)
+	request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	request.Header.Set("Origin", testBrowserSessionOrigin)
+	request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	addKBaseBrowserSessionClientHeaders(t, request, sessionStore, "")
+	request.Header.Set(
+		"User-Agent",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) Version/17.5 Mobile/15E148 Safari/604.1",
+	)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("migration status = %d, want 200; body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionPublicResponse(t, response, "Safari on iOS")
+	requireKBaseBrowserSessionCookie(t, response)
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationInvalidCredentialsAreIndistinguishable(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 407)
+	revoked, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Revoked Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessionStore.RevokeByToken(revoked.Token, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	testCases := []struct {
+		name          string
+		authorization string
+		cookieToken   string
+		wantClear     bool
+	}{
+		{name: "missing"},
+		{name: "invalid_bearer", authorization: "Bearer invalid-token"},
+		{name: "unknown_cookie", cookieToken: "unknown-session-token", wantClear: true},
+		{name: "revoked_cookie", cookieToken: revoked.Token, wantClear: true},
+		{
+			name:          "revoked_cookie_and_invalid_bearer",
+			authorization: "Bearer invalid-token",
+			cookieToken:   revoked.Token,
+			wantClear:     true,
+		},
+	}
+	var wantStatus int
+	var wantBody string
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			addKBaseBrowserSessionHeadersForCredentials(request, revoked)
+			if testCase.authorization != "" {
+				request.Header.Set("Authorization", testCase.authorization)
+			}
+			if testCase.cookieToken != "" {
+				request.AddCookie(&http.Cookie{
+					Name:  "__Host-kbase_session",
+					Value: testCase.cookieToken,
+				})
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if index == 0 {
+				wantStatus = response.Code
+				wantBody = response.Body.String()
+			}
+			if response.Code != wantStatus || response.Body.String() != wantBody {
+				t.Fatalf(
+					"response = status %d body %q, want status %d body %q",
+					response.Code,
+					response.Body.String(),
+					wantStatus,
+					wantBody,
+				)
+			}
+			if response.Code != http.StatusUnauthorized ||
+				response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+				t.Fatalf("generic credential response = status %d body %q", response.Code, response.Body.String())
+			}
+			if testCase.wantClear {
+				cookie := requireKBaseBrowserSessionCookie(t, response)
+				if cookie.Value != "" || cookie.MaxAge >= 0 || !cookie.Expires.Before(clock.Now()) {
+					t.Fatalf("cleared Cookie = %#v", cookie)
+				}
+				if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode ||
+					cookie.Path != "/" || cookie.Domain != "" {
+					t.Fatalf("cleared Cookie flags/scope = %#v", cookie)
+				}
+			} else if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("credential response unexpectedly changed Cookie: %q", got)
+			}
+			assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+		})
+	}
+	assertKBaseBrowserSessionCount(t, sessionStore, 1)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationCredentialInvalidCookieBearerFallback(t *testing.T) {
+	testCases := []struct {
+		name          string
+		prepareCookie func(
+			*testing.T,
+			*BrowserSessionStore,
+			*browserSessionTestClock,
+		) (string, BrowserClientFamily)
+	}{
+		{
+			name: "unknown cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				_ *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				family, err := store.AcquireClientEpoch("browser_client_unknown_fallback")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return "unknown-session-token", family
+			},
+		},
+		{
+			name: "revoked cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				_ *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+					ClientID: "browser_client_revoked_fallback",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.RevokeByToken(credentials.Token, "test"); err != nil {
+					t.Fatal(err)
+				}
+				return credentials.Token, BrowserClientFamily{
+					ClientID: credentials.Session.ClientID,
+					Epoch:    credentials.Session.IssuedEpoch,
+				}
+			},
+		},
+		{
+			name: "expired cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				clock *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+					ClientID: "browser_client_expired_fallback",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				clock.Advance(testBrowserSessionCookieTTL + time.Second)
+				return credentials.Token, BrowserClientFamily{
+					ClientID: credentials.Session.ClientID,
+					Epoch:    credentials.Session.IssuedEpoch,
+				}
+			},
+		},
+		{
+			name: "other family cookie",
+			prepareCookie: func(
+				t *testing.T,
+				store *BrowserSessionStore,
+				_ *browserSessionTestClock,
+			) (string, BrowserClientFamily) {
+				credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+					ClientID: "browser_client_mismatch_source",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				requested, err := store.AcquireClientEpoch("browser_client_mismatch_target")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return credentials.Token, requested
+			},
+		},
+	}
+
+	for index, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+			}
+			handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 700+index)
+			oldToken, family := testCase.prepareCookie(t, store, clock)
+
+			request := newKBaseBrowserCookieRequest(
+				http.MethodPost,
+				"/browser/session/migrate",
+				oldToken,
+				"",
+			)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			request.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+			request.Header.Set(
+				browserSessionEpochHeaderName,
+				strconv.FormatInt(family.Epoch, 10),
+			)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusOK {
+				t.Fatalf(
+					"Bearer fallback migration = %d body=%s, want 200",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			replacement := requireKBaseBrowserSessionCookie(t, response)
+			if replacement.Value == "" || replacement.Value == oldToken {
+				t.Fatalf("replacement Cookie = %#v, want a new credential", replacement)
+			}
+			session, err := store.Authenticate(replacement.Value)
+			if err != nil {
+				t.Fatalf("replacement Cookie authentication = %v", err)
+			}
+			if session.ClientID != family.ClientID || session.IssuedEpoch != family.Epoch {
+				t.Fatalf(
+					"replacement session family = (%q, %d), want (%q, %d)",
+					session.ClientID,
+					session.IssuedEpoch,
+					family.ClientID,
+					family.Epoch,
+				)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationCredentialInvalidCookiePrecedence(t *testing.T) {
+	t.Run("invalid Bearer clears invalid Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 30, 0, 0, time.UTC),
+		}
+		handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 703)
+		family, err := store.AcquireClientEpoch("browser_client_invalid_fallback")
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			"unknown-session-token",
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer invalid-token")
+		request.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+		request.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch, 10))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+	})
+
+	t.Run("invalid Bearer clears other family Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 40, 0, 0, time.UTC),
+		}
+		handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 705)
+		credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+			ClientID: "browser_client_mismatch_invalid_source",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		requested, err := store.AcquireClientEpoch("browser_client_mismatch_invalid_target")
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			credentials.Token,
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer invalid-token")
+		request.Header.Set(browserSessionClientIDHeaderName, requested.ClientID)
+		request.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(requested.Epoch, 10))
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+	})
+
+	t.Run("stale epoch beats valid Bearer and Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 45, 0, 0, time.UTC),
+		}
+		handler, store := newKBaseBrowserSessionHTTPTestHandler(t, clock, 704)
+		credentials, err := createBrowserSessionForTest(store, BrowserSessionCreate{
+			ClientID: "browser_client_stale_fallback",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.RevokeAll("admin"); err != nil {
+			t.Fatal(err)
+		}
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			credentials.Token,
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusConflict {
+			t.Fatalf("stale migration = %d body=%s, want 409", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserClientMetadata(
+			t,
+			response,
+			credentials.Session.ClientID,
+			credentials.Session.IssuedEpoch+1,
+		)
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("stale migration set Cookie: %#v", got)
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationUnavailableDoesNotClearCookie(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 408)
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Unavailable Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sessionStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	request.Header.Set("Origin", testBrowserSessionOrigin)
+	addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+	request.AddCookie(&http.Cookie{
+		Name:  "__Host-kbase_session",
+		Value: credentials.Token,
+	})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+		t.Fatalf("unavailable migration response = status %d body %q", response.Code, response.Body.String())
+	}
+	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("store-unavailable migration changed Cookie: %q", got)
+	}
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+}
+
+func TestKBaseHTTPHandlerBrowserLegacyTokenRetired(t *testing.T) {
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            testKBaseAuthToken,
+		BrowserSessionSecret: testBrowserSessionSecret,
+	})
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "/browser/session-token", nil)
+			request.Header.Set("Authorization", "Bearer forwarded-token")
+			request.Header.Set("X-KBase-Browser-Session", testBrowserSessionSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusGone {
+				t.Fatalf("status = %d, want 410; body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+			if method == http.MethodGet {
+				guidance := strings.ToLower(response.Body.String())
+				if !strings.Contains(guidance, "/browser/session") ||
+					!strings.Contains(guidance, "migrat") {
+					t.Fatalf("retirement guidance is not actionable: %s", response.Body.String())
+				}
+			} else if response.Body.Len() != 0 {
+				t.Fatalf("HEAD response body = %q, want empty", response.Body.String())
+			}
+			assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+		})
+	}
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
+		request := httptest.NewRequest(method, "/browser/session-token", nil)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("%s status = %d, want 405", method, response.Code)
+		}
+		assertKBaseBrowserSessionNoStore(t, response)
+		assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+	}
+}
+
+func TestKBaseHTTPHandlerCookieAuth(t *testing.T) {
+	t.Run("reads general and audit APIs and renews only on interval", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 12, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 414)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Cookie Browser")
+
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if response.Code != http.StatusOK {
+			t.Fatalf("Cookie read status = %d, body=%s", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("Cookie read inside renewal interval reissued Cookie: %q", got)
+		}
+
+		auditResponse := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/agent-audits", credentials.Token, "",
+		)
+		if auditResponse.Code != http.StatusOK ||
+			!strings.Contains(auditResponse.Body.String(), `"audits":[]`) {
+			t.Fatalf("Cookie audit read status = %d, body=%s", auditResponse.Code, auditResponse.Body.String())
+		}
+
+		clock.Advance(5 * time.Minute)
+		staticResponse := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/", credentials.Token, "",
+		)
+		if got := staticResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("static request authenticated or renewed Cookie: %q", got)
+		}
+
+		renewed := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if renewed.Code != http.StatusOK {
+			t.Fatalf("renewed Cookie read status = %d, body=%s", renewed.Code, renewed.Body.String())
+		}
+		assertKBaseBrowserSessionCookieTTL(
+			t,
+			renewed,
+			testBrowserSessionCookieTTL,
+			clock.Now().Add(testBrowserSessionCookieTTL),
+		)
+
+		coalesced := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if got := coalesced.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("coalesced Cookie read reissued Cookie: %q", got)
+		}
+	})
+
+	t.Run("dedicated Bearer routes reject Cookie without renewing it", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 13, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 415)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Ordinary Browser")
+		sourceSync, err := NewSourceSyncStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		concrete := handler.(*kbaseHTTPHandler)
+		concrete.sourceSync = sourceSync
+		concrete.sourceAgentToken = "dedicated-source-agent-token"
+		concrete.agentPublisherToken = "dedicated-publisher-token"
+		clock.Advance(5 * time.Minute)
+
+		sourceResponse := requestKBaseWithBrowserCookie(
+			handler,
+			http.MethodPost,
+			"/api/source-agent/heartbeat",
+			credentials.Token,
+			`{"agent_id":"browser","version":"1","capabilities":[],"wcplus_healthy":true}`,
+		)
+		if sourceResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("Cookie source-agent status = %d, body=%s", sourceResponse.Code, sourceResponse.Body.String())
+		}
+		if got := sourceResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("source-agent route renewed browser Cookie: %q", got)
+		}
+
+		publisherResponse := requestKBaseWithBrowserCookie(
+			handler,
+			http.MethodPost,
+			"/api/agent-packages/publish",
+			credentials.Token,
+			`{}`,
+		)
+		if publisherResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("Cookie publisher status = %d, body=%s", publisherResponse.Code, publisherResponse.Body.String())
+		}
+		if got := publisherResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("publisher route renewed browser Cookie: %q", got)
+		}
+
+		generalResponse := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if generalResponse.Code != http.StatusOK {
+			t.Fatalf("Cookie general read status = %d, body=%s", generalResponse.Code, generalResponse.Body.String())
+		}
+		requireKBaseBrowserSessionCookie(t, generalResponse)
+	})
+
+	t.Run("expired revoked and missing sessions clear Cookie with 401", func(t *testing.T) {
+		t.Run("expired", func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 14, 0, 0, 0, time.UTC),
+			}
+			handler, sessionStore := newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+				t, clock, 416, 10*time.Minute,
+			)
+			credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Expired Browser")
+			clock.Advance(10 * time.Minute)
+
+			response := requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/books", credentials.Token, "",
+			)
+			assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+		})
+
+		t.Run("revoked", func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 15, 0, 0, 0, time.UTC),
+			}
+			handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 417)
+			credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Revoked Browser")
+			if err := sessionStore.RevokeByToken(credentials.Token, "test"); err != nil {
+				t.Fatal(err)
+			}
+
+			response := requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/books", credentials.Token, "",
+			)
+			assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+		})
+
+		t.Run("missing", func(t *testing.T) {
+			clock := &browserSessionTestClock{
+				now: time.Date(2026, time.July, 28, 16, 0, 0, 0, time.UTC),
+			}
+			handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 418)
+			response := requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/books", "missing-session-token", "",
+			)
+			assertKBaseBrowserSessionUnauthorizedAndCleared(t, response, clock.Now())
+		})
+	})
+
+	t.Run("store unavailable is generic 503 and preserves Cookie", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 17, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 419)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Unavailable Browser")
+		if err := sessionStore.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/books", credentials.Token, "",
+		)
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("unavailable Cookie auth = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("unavailable Cookie auth changed Cookie: %q", got)
+		}
+	})
+
+	t.Run("audit auth failures keep stable envelope", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 18, 0, 0, 0, time.UTC),
+		}
+		handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 420)
+		response := requestKBaseWithBrowserCookie(
+			handler, http.MethodGet, "/api/agent-audits", "missing-session-token", "",
+		)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("audit Cookie auth status = %d, body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseEvidenceAuditErrorEnvelope(t, response, "audit_unauthorized", "unauthorized")
+		requireKBaseBrowserSessionCookie(t, response)
+	})
+}
+
+func TestKBaseHTTPHandlerCSRF(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 19, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 421)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "CSRF Browser")
+	csrfToken, _ := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+
+	var mutationCalls atomic.Int32
+	concrete := handler.(*kbaseHTTPHandler)
+	concrete.auditCoordinator = &recordingEvidenceAuditEnqueuer{}
+	concrete.analysisGenerator = func(
+		_ context.Context,
+		_ *BookKnowledgeStore,
+		request BookAnalysisGenerateRequest,
+	) (*BookAnalysisManifest, error) {
+		mutationCalls.Add(1)
+		return &BookAnalysisManifest{
+			Version: "1", BookID: request.BookID, Status: BookAnalysisReady, Answer: "analysis",
+		}, nil
+	}
+
+	type headerValues struct {
+		origin    []string
+		fetchSite []string
+		csrf      []string
+	}
+	validHeaders := headerValues{
+		origin:    []string{testBrowserSessionOrigin},
+		fetchSite: []string{"same-origin"},
+		csrf:      []string{csrfToken},
+	}
+	testCases := []struct {
+		name    string
+		headers headerValues
+	}{
+		{name: "missing_origin", headers: headerValues{fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "duplicate_origin", headers: headerValues{origin: []string{testBrowserSessionOrigin, testBrowserSessionOrigin}, fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "wrong_origin", headers: headerValues{origin: []string{"https://other.example"}, fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "oversized_origin", headers: headerValues{origin: []string{strings.Repeat("x", 4096)}, fetchSite: validHeaders.fetchSite, csrf: validHeaders.csrf}},
+		{name: "missing_fetch_site", headers: headerValues{origin: validHeaders.origin, csrf: validHeaders.csrf}},
+		{name: "duplicate_fetch_site", headers: headerValues{origin: validHeaders.origin, fetchSite: []string{"same-origin", "same-origin"}, csrf: validHeaders.csrf}},
+		{name: "wrong_fetch_site", headers: headerValues{origin: validHeaders.origin, fetchSite: []string{"cross-site"}, csrf: validHeaders.csrf}},
+		{name: "oversized_fetch_site", headers: headerValues{origin: validHeaders.origin, fetchSite: []string{strings.Repeat("x", 512)}, csrf: validHeaders.csrf}},
+		{name: "missing_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite}},
+		{name: "duplicate_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite, csrf: []string{csrfToken, csrfToken}}},
+		{name: "wrong_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite, csrf: []string{"wrong-csrf-token"}}},
+		{name: "oversized_csrf", headers: headerValues{origin: validHeaders.origin, fetchSite: validHeaders.fetchSite, csrf: []string{strings.Repeat("x", 1024)}}},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := newKBaseBrowserCookieRequest(
+				http.MethodPost,
+				"/api/books/source-article-1/analysis",
+				credentials.Token,
+				`{"model":"Qwen-3.7-Max"}`,
+			)
+			addKBaseHeaderValues(request, "Origin", testCase.headers.origin)
+			addKBaseHeaderValues(request, "Sec-Fetch-Site", testCase.headers.fetchSite)
+			addKBaseHeaderValues(request, "X-KBase-CSRF", testCase.headers.csrf)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden ||
+				response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+				t.Fatalf("CSRF rejection = status %d body %q", response.Code, response.Body.String())
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("CSRF rejection changed Cookie: %q", got)
+			}
+		})
+	}
+	if got := mutationCalls.Load(); got != 0 {
+		t.Fatalf("rejected CSRF requests reached mutation handler %d times", got)
+	}
+
+	for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		t.Run(method+"_requires_CSRF", func(t *testing.T) {
+			request := newKBaseBrowserCookieRequest(
+				method, "/api/books", credentials.Token, "",
+			)
+			request.Header.Set("Origin", testBrowserSessionOrigin)
+			request.Header.Set("Sec-Fetch-Site", "same-origin")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if response.Code != http.StatusForbidden ||
+				response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+				t.Fatalf("%s without CSRF = status %d body %q", method, response.Code, response.Body.String())
+			}
+		})
+	}
+
+	validRequest := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/books/source-article-1/analysis",
+		credentials.Token,
+		`{"model":"Qwen-3.7-Max"}`,
+	)
+	addKBaseBrowserSessionSecurityHeaders(validRequest, csrfToken)
+	validResponse := httptest.NewRecorder()
+	handler.ServeHTTP(validResponse, validRequest)
+	if validResponse.Code != http.StatusOK || mutationCalls.Load() != 1 {
+		t.Fatalf("valid Cookie write = status %d calls %d body=%s", validResponse.Code, mutationCalls.Load(), validResponse.Body.String())
+	}
+
+	auditForbidden := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/agent-packages/package-1/audits?version=1.0.0",
+		credentials.Token,
+		`{}`,
+	)
+	auditForbidden.Header.Set("Origin", testBrowserSessionOrigin)
+	auditForbidden.Header.Set("Sec-Fetch-Site", "same-origin")
+	auditForbiddenResponse := httptest.NewRecorder()
+	handler.ServeHTTP(auditForbiddenResponse, auditForbidden)
+	if auditForbiddenResponse.Code != http.StatusForbidden {
+		t.Fatalf("audit CSRF status = %d, body=%s", auditForbiddenResponse.Code, auditForbiddenResponse.Body.String())
+	}
+	assertKBaseEvidenceAuditErrorEnvelope(t, auditForbiddenResponse, "audit_forbidden", "forbidden")
+
+	auditValid := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/agent-packages/package-1/audits?version=1.0.0",
+		credentials.Token,
+		`{}`,
+	)
+	addKBaseBrowserSessionSecurityHeaders(auditValid, csrfToken)
+	auditValidResponse := httptest.NewRecorder()
+	handler.ServeHTTP(auditValidResponse, auditValid)
+	if auditValidResponse.Code != http.StatusBadRequest {
+		t.Fatalf("valid audit CSRF status = %d, body=%s", auditValidResponse.Code, auditValidResponse.Body.String())
+	}
+	assertKBaseEvidenceAuditErrorEnvelope(
+		t, auditValidResponse, "audit_request_invalid", "idempotency_key is required",
+	)
+
+	t.Run("rejected request at renewal boundary does not renew", func(t *testing.T) {
+		rejectionClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 19, 20, 0, 0, time.UTC),
+		}
+		rejectionHandler, rejectionStore := newKBaseBrowserSessionHTTPTestHandler(
+			t, rejectionClock, 428,
+		)
+		rejectionCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, rejectionStore, "Rejected Write Browser",
+		)
+		createdLastActiveAt := rejectionCredentials.Session.LastActiveAt
+		createdExpiresAt := rejectionCredentials.Session.ExpiresAt
+		rejectionClock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/books/source-article-1/analysis",
+			rejectionCredentials.Token,
+			`{"model":"Qwen-3.7-Max"}`,
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		request.Header.Set("Sec-Fetch-Site", "same-origin")
+		response := httptest.NewRecorder()
+		rejectionHandler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusForbidden ||
+			response.Body.String() != "{\"error\":\"forbidden\"}\n" {
+			t.Fatalf("boundary rejection = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("boundary rejection renewed Cookie: %q", got)
+		}
+		assertBrowserSessionStoredActivity(
+			t,
+			rejectionStore.db,
+			rejectionCredentials.Session.ID,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
+	})
+
+	t.Run("renewal boundary revocation replaces renewal with one clear Cookie", func(t *testing.T) {
+		raceClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 19, 30, 0, 0, time.UTC),
+		}
+		raceHandler, raceStore := newKBaseBrowserSessionHTTPTestHandler(t, raceClock, 426)
+		raceCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, raceStore, "Renewal Race Browser",
+		)
+		if _, err := raceStore.db.Exec(`
+			CREATE TRIGGER revoke_after_browser_session_renewal
+			AFTER UPDATE OF last_active_at ON browser_sessions
+			BEGIN
+				UPDATE browser_sessions
+				SET revoked_at = NEW.last_active_at, revoke_reason = 'concurrent revoke'
+				WHERE id = NEW.id;
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		raceClock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/books/source-article-1/analysis",
+			raceCredentials.Token,
+			`{"model":"Qwen-3.7-Max"}`,
+		)
+		addKBaseBrowserSessionSecurityHeaders(request, raceCredentials.CSRFToken)
+		response := httptest.NewRecorder()
+		raceHandler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusUnauthorized ||
+			response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+			t.Fatalf("renewal race response = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 1 {
+			t.Fatalf("renewal race Set-Cookie headers = %q, want one clear Cookie", got)
+		}
+		if strings.Contains(response.Header().Get("Set-Cookie"), raceCredentials.Token) {
+			t.Fatalf("renewal race response retained renewed credential: %q", response.Header().Values("Set-Cookie"))
+		}
+		assertKBaseBrowserSessionClearedCookie(t, response, raceClock.Now())
+		if _, err := raceStore.Authenticate(raceCredentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("renewal race auth error = %v, want persisted revocation", err)
+		}
+	})
+
+	t.Run("renewal boundary store failure returns 503 without changing Cookie", func(t *testing.T) {
+		failureClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 19, 40, 0, 0, time.UTC),
+		}
+		failureHandler, failureStore := newKBaseBrowserSessionHTTPTestHandler(
+			t, failureClock, 430,
+		)
+		failureCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, failureStore, "Renewal Failure Browser",
+		)
+		createdLastActiveAt := failureCredentials.Session.LastActiveAt
+		createdExpiresAt := failureCredentials.Session.ExpiresAt
+		if _, err := failureStore.db.Exec(`
+			CREATE TRIGGER fail_browser_session_renewal
+			BEFORE UPDATE OF last_active_at ON browser_sessions
+			BEGIN
+				SELECT RAISE(FAIL, 'forced renewal failure');
+			END
+		`); err != nil {
+			t.Fatal(err)
+		}
+		failureClock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/books/source-article-1/analysis",
+			failureCredentials.Token,
+			`{"model":"Qwen-3.7-Max"}`,
+		)
+		addKBaseBrowserSessionSecurityHeaders(request, failureCredentials.CSRFToken)
+		response := httptest.NewRecorder()
+		failureHandler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusServiceUnavailable ||
+			response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+			t.Fatalf("renewal failure = status %d body %q", response.Code, response.Body.String())
+		}
+		if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("renewal failure changed Cookie: %q", got)
+		}
+		assertBrowserSessionStoredActivity(
+			t,
+			failureStore.db,
+			failureCredentials.Session.ID,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
+	})
+
+	t.Run("audit retry actor uses Cookie session context", func(t *testing.T) {
+		retryStore, pkg := evidenceAuditRunnerTestStore(t, 1, 1)
+		retryClock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 20, 0, 0, 0, time.UTC),
+		}
+		retryHandler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, retryClock, 427)
+		retryCredentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, sessionStore, "Audit Retry Browser",
+		)
+		csrfToken, _ := loadKBaseBrowserSessionCSRF(
+			t, retryHandler, retryCredentials.Token,
+		)
+		auditNow := testAgentPackageTime().Add(4 * time.Hour)
+		concrete := retryHandler.(*kbaseHTTPHandler)
+		concrete.store = retryStore
+		concrete.auditCoordinator = &recordingEvidenceAuditEnqueuer{}
+		concrete.auditRetrySigningKey = []byte("test-retry-signing-key-32-bytes!!")
+		concrete.auditNow = func() time.Time { return auditNow }
+
+		createRequest := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/agent-packages/"+pkg.PackageID+"/audits?version="+pkg.Version,
+			retryCredentials.Token,
+			`{"subject":"one","scope":"Population evidence comparison","idempotency_key":"cookie-create"}`,
+		)
+		addKBaseBrowserSessionSecurityHeaders(createRequest, csrfToken)
+		createResponse := httptest.NewRecorder()
+		retryHandler.ServeHTTP(createResponse, createRequest)
+		if createResponse.Code != http.StatusAccepted {
+			t.Fatalf("Cookie audit create = status %d body=%s", createResponse.Code, createResponse.Body.String())
+		}
+		var createPayload struct {
+			Audit EvidenceAudit `json:"audit"`
+		}
+		if err := json.Unmarshal(createResponse.Body.Bytes(), &createPayload); err != nil {
+			t.Fatal(err)
+		}
+		auditID := createPayload.Audit.AuditID
+		if _, err := StartEvidenceAudit(
+			retryStore, auditID, "trace-cookie-retry",
+			testAgentPackageTime().Add(5*time.Hour),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := FailEvidenceAudit(
+			retryStore, auditID, "model_outcome_unknown", "manual retry required",
+			testAgentPackageTime().Add(6*time.Hour),
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		auditNow = testAgentPackageTime().Add(7 * time.Hour)
+		retryRequest := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/api/agent-audits/"+auditID+"/retry",
+			retryCredentials.Token,
+			"",
+		)
+		retryRequest.Header.Set("Idempotency-Key", "cookie-retry-1")
+		addKBaseBrowserSessionSecurityHeaders(retryRequest, csrfToken)
+		retryResponse := httptest.NewRecorder()
+		retryHandler.ServeHTTP(retryResponse, retryRequest)
+		if retryResponse.Code != http.StatusAccepted {
+			t.Fatalf("Cookie audit retry = status %d body=%s", retryResponse.Code, retryResponse.Body.String())
+		}
+		var retryPayload struct {
+			Audit EvidenceAudit `json:"audit"`
+		}
+		if err := json.Unmarshal(retryResponse.Body.Bytes(), &retryPayload); err != nil {
+			t.Fatal(err)
+		}
+		actor := evidenceAuditOpaqueIdentity(
+			"session-actor\x00" + retryCredentials.Session.ID,
+		)
+		wantIdentity := evidenceAuditOpaqueIdentity(
+			"manual-retry\x00" + auditID + "\x00" +
+				actor + "\x00kbase-http\x00" + EvidenceAuditRetryScope +
+				"\x00cookie-retry-1",
+		)
+		if retryPayload.Audit.RequestIdentity != wantIdentity {
+			t.Fatalf(
+				"Cookie retry request identity = %q, want session-context identity %q",
+				retryPayload.Audit.RequestIdentity,
+				wantIdentity,
+			)
+		}
+	})
+}
+
+func TestKBaseHTTPHandlerBrowserSessionStatus(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 20, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 422)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Status Browser")
+
+	firstToken, firstExpiry := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+	if err := sessionStore.ValidateCSRF(credentials.Session.ID, firstToken); err != nil {
+		t.Fatalf("first status CSRF did not validate: %v", err)
+	}
+	secondToken, secondExpiry := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+	if firstToken != secondToken {
+		t.Fatal("same-window status changed CSRF token")
+	}
+	if !firstExpiry.Equal(secondExpiry) || !secondExpiry.Equal(clock.Now().Add(15*time.Minute)) {
+		t.Fatalf("CSRF expiries = %s and %s, want %s", firstExpiry, secondExpiry, clock.Now().Add(15*time.Minute))
+	}
+	if err := sessionStore.ValidateCSRF(credentials.Session.ID, secondToken); err != nil {
+		t.Fatalf("second status CSRF did not validate: %v", err)
+	}
+
+	type statusResult struct {
+		response *httptest.ResponseRecorder
+	}
+	const tabCount = 8
+	start := make(chan struct{})
+	results := make(chan statusResult, tabCount)
+	var wait sync.WaitGroup
+	for index := 0; index < tabCount; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			results <- statusResult{response: requestKBaseWithBrowserCookie(
+				handler, http.MethodGet, "/api/browser/session", credentials.Token, "",
+			)}
+		}()
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	for result := range results {
+		if result.response.Code != http.StatusOK {
+			t.Fatalf(
+				"concurrent status = %d body=%s",
+				result.response.Code,
+				result.response.Body.String(),
+			)
+		}
+		assertKBaseBrowserClientMetadata(
+			t,
+			result.response,
+			credentials.Session.ClientID,
+			credentials.Session.IssuedEpoch,
+		)
+		assertKBaseBrowserClientMetadataIsTopLevelOnly(t, result.response)
+		token, expiresAt := decodeKBaseBrowserSessionCSRFResponse(
+			t, result.response, credentials.Token,
+		)
+		if token != firstToken || !expiresAt.Equal(firstExpiry) {
+			t.Fatalf(
+				"concurrent status CSRF = (%q, %s), want (%q, %s)",
+				token,
+				expiresAt,
+				firstToken,
+				firstExpiry,
+			)
+		}
+	}
+
+	clock.Advance(browserSessionCSRFTTL)
+	rotatedResponse := requestKBaseWithBrowserCookie(
+		handler, http.MethodGet, "/api/browser/session", credentials.Token, "",
+	)
+	if rotatedResponse.Code != http.StatusOK {
+		t.Fatalf("post-expiry status = %d body=%s", rotatedResponse.Code, rotatedResponse.Body.String())
+	}
+	requireKBaseBrowserSessionCookie(t, rotatedResponse)
+	rotatedToken, rotatedExpiry := decodeKBaseBrowserSessionCSRFResponse(
+		t, rotatedResponse, credentials.Token,
+	)
+	if rotatedToken == firstToken ||
+		!rotatedExpiry.Equal(clock.Now().Add(browserSessionCSRFTTL)) {
+		t.Fatalf(
+			"post-expiry status CSRF = (%q, %s), previous token %q",
+			rotatedToken,
+			rotatedExpiry,
+			firstToken,
+		)
+	}
+	stableRotatedToken, stableRotatedExpiry := loadKBaseBrowserSessionCSRF(
+		t, handler, credentials.Token,
+	)
+	if stableRotatedToken != rotatedToken || !stableRotatedExpiry.Equal(rotatedExpiry) {
+		t.Fatalf(
+			"post-expiry same-window CSRF = (%q, %s), want (%q, %s)",
+			stableRotatedToken,
+			stableRotatedExpiry,
+			rotatedToken,
+			rotatedExpiry,
+		)
+	}
+
+	for _, testCase := range []struct {
+		name       string
+		withCookie bool
+	}{
+		{name: "Bearer only"},
+		{name: "Bearer and Cookie", withCookie: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodGet, "/api/browser/session", nil)
+			request.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+			if testCase.withCookie {
+				request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: credentials.Token})
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("Bearer status endpoint = %d, body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("Bearer status endpoint changed Cookie: %q", got)
+			}
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserLogout(t *testing.T) {
+	t.Run("requires Cookie CSRF revokes then clears and retry is stable", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 21, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 423)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Logout Browser")
+		csrfToken, _ := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+
+		forbidden := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		forbidden.Header.Set("Origin", testBrowserSessionOrigin)
+		forbidden.Header.Set("Sec-Fetch-Site", "same-origin")
+		forbiddenResponse := httptest.NewRecorder()
+		handler.ServeHTTP(forbiddenResponse, forbidden)
+		if forbiddenResponse.Code != http.StatusForbidden {
+			t.Fatalf("logout without CSRF = %d, body=%s", forbiddenResponse.Code, forbiddenResponse.Body.String())
+		}
+		if got := forbiddenResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+			t.Fatalf("forbidden logout cleared Cookie: %q", got)
+		}
+		if _, err := sessionStore.AuthenticateAndRenew(credentials.Token); err != nil {
+			t.Fatalf("forbidden logout revoked session: %v", err)
+		}
+
+		logout := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		addKBaseBrowserSessionSecurityHeaders(logout, csrfToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, logout)
+		if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+			t.Fatalf("logout response = status %d body %q", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionNoStore(t, response)
+		assertKBaseBrowserSessionClearedCookie(t, response, clock.Now())
+		if _, err := sessionStore.AuthenticateAndRenew(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("logout auth error = %v, want revoked before Cookie clear", err)
+		}
+
+		retry := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		addKBaseBrowserSessionSecurityHeaders(retry, csrfToken)
+		retryResponse := httptest.NewRecorder()
+		handler.ServeHTTP(retryResponse, retry)
+		assertKBaseBrowserSessionUnauthorizedAndCleared(t, retryResponse, clock.Now())
+	})
+
+	t.Run("concurrent requests have idempotent terminal state", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 22, 0, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 424)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Concurrent Logout Browser")
+		csrfToken, _ := loadKBaseBrowserSessionCSRF(t, handler, credentials.Token)
+
+		const requestCount = 8
+		start := make(chan struct{})
+		responses := make(chan *httptest.ResponseRecorder, requestCount)
+		var wait sync.WaitGroup
+		for index := 0; index < requestCount; index++ {
+			wait.Add(1)
+			go func() {
+				defer wait.Done()
+				<-start
+				request := newKBaseBrowserCookieRequest(
+					http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+				)
+				addKBaseBrowserSessionSecurityHeaders(request, csrfToken)
+				response := httptest.NewRecorder()
+				handler.ServeHTTP(response, request)
+				responses <- response
+			}()
+		}
+		close(start)
+		wait.Wait()
+		close(responses)
+
+		successes := 0
+		for response := range responses {
+			switch response.Code {
+			case http.StatusNoContent:
+				successes++
+			case http.StatusUnauthorized:
+				if response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+					t.Fatalf("concurrent unauthorized body = %q", response.Body.String())
+				}
+			default:
+				t.Fatalf("concurrent logout status = %d, body=%s", response.Code, response.Body.String())
+			}
+			assertKBaseBrowserSessionClearedCookie(t, response, clock.Now())
+		}
+		if successes == 0 {
+			t.Fatal("concurrent logout had no successful revocation")
+		}
+		if _, err := sessionStore.AuthenticateAndRenew(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("concurrent logout terminal auth error = %v, want revoked", err)
+		}
+	})
+
+	t.Run("renewal boundary logout revokes without renewing activity", func(t *testing.T) {
+		clock := &browserSessionTestClock{
+			now: time.Date(2026, time.July, 28, 22, 30, 0, 0, time.UTC),
+		}
+		handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 429)
+		credentials := createKBaseBrowserSessionHTTPTestCredentials(
+			t, sessionStore, "Boundary Logout Browser",
+		)
+		createdLastActiveAt := credentials.Session.LastActiveAt
+		createdExpiresAt := credentials.Session.ExpiresAt
+		clock.Advance(5 * time.Minute)
+
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/browser/session/logout", credentials.Token, "",
+		)
+		addKBaseBrowserSessionSecurityHeaders(request, credentials.CSRFToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("boundary logout = status %d body=%s", response.Code, response.Body.String())
+		}
+		assertKBaseBrowserSessionClearedCookie(t, response, clock.Now())
+		assertBrowserSessionStoredActivity(
+			t,
+			sessionStore.db,
+			credentials.Session.ID,
+			createdLastActiveAt,
+			createdExpiresAt,
+		)
+	})
+}
+
+func TestKBaseHTTPHandlerBrowserSessionClientEpochPreconditions(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 45, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 611)
+	const clientID = "browser_client_http_01"
+
+	acquire := httptest.NewRequest(http.MethodGet, "/browser/session", nil)
+	acquire.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	acquire.Header.Set(browserSessionClientIDHeaderName, clientID)
+	acquireResponse := httptest.NewRecorder()
+	handler.ServeHTTP(acquireResponse, acquire)
+	if acquireResponse.Code != http.StatusOK {
+		t.Fatalf("client epoch GET = %d body=%s", acquireResponse.Code, acquireResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, acquireResponse, clientID, 1)
+	if got := acquireResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("client epoch GET set Cookie: %#v", got)
+	}
+
+	missing := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	missing.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusPreconditionRequired {
+		t.Fatalf("login without client precondition = %d, want 428", missingResponse.Code)
+	}
+	if got := missingResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("login without client precondition set Cookie: %#v", got)
+	}
+
+	login := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	login.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	login.Header.Set(browserSessionClientIDHeaderName, clientID)
+	login.Header.Set(browserSessionEpochHeaderName, "1")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, login)
+	if loginResponse.Code != http.StatusOK {
+		t.Fatalf("epoch login = %d body=%s", loginResponse.Code, loginResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, loginResponse, clientID, 1)
+	assertKBaseBrowserClientMetadataIsTopLevelOnly(t, loginResponse)
+	requireKBaseBrowserSessionCookie(t, loginResponse)
+
+	if _, err := sessionStore.RevokeAll("admin"); err != nil {
+		t.Fatal(err)
+	}
+	stale := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	stale.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	stale.Header.Set(browserSessionClientIDHeaderName, clientID)
+	stale.Header.Set(browserSessionEpochHeaderName, "1")
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf("stale epoch login = %d body=%s, want 409", staleResponse.Code, staleResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, staleResponse, clientID, 2)
+	if got := staleResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("stale epoch login set Cookie: %#v", got)
+	}
+
+	fresh := httptest.NewRequest(http.MethodPost, "/browser/session", nil)
+	fresh.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+	fresh.Header.Set(browserSessionClientIDHeaderName, clientID)
+	fresh.Header.Set(browserSessionEpochHeaderName, "2")
+	freshResponse := httptest.NewRecorder()
+	handler.ServeHTTP(freshResponse, fresh)
+	if freshResponse.Code != http.StatusOK {
+		t.Fatalf("fresh epoch login = %d body=%s", freshResponse.Code, freshResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, freshResponse, clientID, 2)
+	requireKBaseBrowserSessionCookie(t, freshResponse)
+}
+
+func TestKBaseHTTPHandlerBrowserSessionClientEpochValidation(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 50, 0, 0, time.UTC),
+	}
+	handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 612)
+
+	tests := []struct {
+		name       string
+		method     string
+		clientIDs  []string
+		epochs     []string
+		wantStatus int
+	}{
+		{name: "missing client", method: http.MethodGet, wantStatus: http.StatusPreconditionRequired},
+		{name: "duplicate client", method: http.MethodGet, clientIDs: []string{"browser_client_valid_01", "browser_client_valid_01"}, wantStatus: http.StatusBadRequest},
+		{name: "short client", method: http.MethodGet, clientIDs: []string{"too-short"}, wantStatus: http.StatusBadRequest},
+		{name: "oversized client", method: http.MethodGet, clientIDs: []string{strings.Repeat("a", maxBrowserSessionClientIDBytes+1)}, wantStatus: http.StatusBadRequest},
+		{name: "non ascii client", method: http.MethodGet, clientIDs: []string{"browser_client_浏览器_01"}, wantStatus: http.StatusBadRequest},
+		{name: "invalid client punctuation", method: http.MethodGet, clientIDs: []string{"browser.client.valid.01"}, wantStatus: http.StatusBadRequest},
+		{name: "epoch on GET", method: http.MethodGet, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"1"}, wantStatus: http.StatusBadRequest},
+		{name: "missing epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, wantStatus: http.StatusPreconditionRequired},
+		{name: "duplicate epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"1", "1"}, wantStatus: http.StatusBadRequest},
+		{name: "zero epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"0"}, wantStatus: http.StatusBadRequest},
+		{name: "signed epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"+1"}, wantStatus: http.StatusBadRequest},
+		{name: "leading zero epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"01"}, wantStatus: http.StatusBadRequest},
+		{name: "non ascii epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{"１"}, wantStatus: http.StatusBadRequest},
+		{name: "oversized epoch", method: http.MethodPost, clientIDs: []string{"browser_client_valid_01"}, epochs: []string{strings.Repeat("9", maxBrowserSessionEpochBytes+1)}, wantStatus: http.StatusBadRequest},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(testCase.method, "/browser/session", nil)
+			request.Header.Set(browserSessionProxyHeaderName, testBrowserSessionSecret)
+			for _, value := range testCase.clientIDs {
+				request.Header.Add(browserSessionClientIDHeaderName, value)
+			}
+			for _, value := range testCase.epochs {
+				request.Header.Add(browserSessionEpochHeaderName, value)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != testCase.wantStatus {
+				t.Fatalf("status = %d body=%s, want %d", response.Code, response.Body.String(), testCase.wantStatus)
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("invalid precondition set Cookie: %#v", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserSessionUninitializedClientIsPreconditionRequired(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 52, 0, 0, time.UTC),
+	}
+	handler, _ := newKBaseBrowserSessionHTTPTestHandler(t, clock, 617)
+	const clientID = "browser_client_http_uninitialized"
+
+	testCases := []struct {
+		name    string
+		path    string
+		headers map[string]string
+	}{
+		{
+			name: "login",
+			path: "/browser/session",
+			headers: map[string]string{
+				browserSessionProxyHeaderName: testBrowserSessionSecret,
+			},
+		},
+		{
+			name: "Bearer migration",
+			path: "/browser/session/migrate",
+			headers: map[string]string{
+				"Origin":        testBrowserSessionOrigin,
+				"Authorization": "Bearer " + testKBaseAuthToken,
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, testCase.path, nil)
+			for name, value := range testCase.headers {
+				request.Header.Set(name, value)
+			}
+			request.Header.Set(browserSessionClientIDHeaderName, clientID)
+			request.Header.Set(browserSessionEpochHeaderName, "1")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusPreconditionRequired ||
+				response.Body.String() != "{\"error\":\"browser client is not initialized\"}\n" {
+				t.Fatalf(
+					"uninitialized response = %d body=%q, want 428",
+					response.Code,
+					response.Body.String(),
+				)
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("uninitialized response set Cookie: %#v", got)
+			}
+			assertKBaseBrowserSessionNoStore(t, response)
+		})
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationStaleEpochDoesNotSetCookie(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 55, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 613)
+	missing := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	missing.Header.Set("Origin", testBrowserSessionOrigin)
+	missing.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missing)
+	if missingResponse.Code != http.StatusPreconditionRequired {
+		t.Fatalf("migration without client precondition = %d, want 428", missingResponse.Code)
+	}
+	if got := missingResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("migration without client precondition set Cookie: %#v", got)
+	}
+
+	family, err := sessionStore.AcquireClientEpoch("browser_client_migrate_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.RevokeAll("admin"); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	stale.Header.Set("Origin", testBrowserSessionOrigin)
+	stale.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	stale.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+	stale.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch, 10))
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf("stale migration = %d body=%s, want 409", staleResponse.Code, staleResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, staleResponse, family.ClientID, family.Epoch+1)
+	if got := staleResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("stale migration set Cookie: %#v", got)
+	}
+
+	fresh := httptest.NewRequest(http.MethodPost, "/browser/session/migrate", nil)
+	fresh.Header.Set("Origin", testBrowserSessionOrigin)
+	fresh.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	fresh.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+	fresh.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch+1, 10))
+	freshResponse := httptest.NewRecorder()
+	handler.ServeHTTP(freshResponse, fresh)
+	if freshResponse.Code != http.StatusOK {
+		t.Fatalf("fresh migration = %d body=%s", freshResponse.Code, freshResponse.Body.String())
+	}
+	assertKBaseBrowserClientMetadata(t, freshResponse, family.ClientID, family.Epoch+1)
+	requireKBaseBrowserSessionCookie(t, freshResponse)
+}
+
+func TestKBaseHTTPHandlerBrowserMigrationExpectedAuthLinearizesWithFence(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 22, 58, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 615)
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{
+		ClientID: "browser_client_migrate_linear",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenceStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            sessionStore.DBPath(),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(616, 64)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fenceStore.Close()
+	clock.Advance(5 * time.Minute)
+
+	insideAuth := make(chan struct{})
+	releaseAuth := make(chan struct{})
+	sessionStore.expectedAuthBeforeCommit = func() {
+		close(insideAuth)
+		<-releaseAuth
+	}
+	migrateResponse := httptest.NewRecorder()
+	migrateDone := make(chan struct{})
+	go func() {
+		defer close(migrateDone)
+		request := newKBaseBrowserCookieRequest(
+			http.MethodPost,
+			"/browser/session/migrate",
+			credentials.Token,
+			"",
+		)
+		request.Header.Set("Origin", testBrowserSessionOrigin)
+		addKBaseBrowserSessionHeadersForCredentials(request, credentials)
+		handler.ServeHTTP(migrateResponse, request)
+	}()
+	<-insideAuth
+
+	fenceStarted := make(chan struct{})
+	fenceResult := make(chan error, 1)
+	go func() {
+		close(fenceStarted)
+		_, err := fenceStore.FenceClientBySession(credentials.Session.ID, "logout")
+		fenceResult <- err
+	}()
+	<-fenceStarted
+	close(releaseAuth)
+	<-migrateDone
+	if migrateResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"auth-first migration = %d body=%s, want 200",
+			migrateResponse.Code,
+			migrateResponse.Body.String(),
+		)
+	}
+	requireKBaseBrowserSessionCookie(t, migrateResponse)
+	if err := <-fenceResult; err != nil {
+		t.Fatalf("concurrent fence error = %v", err)
+	}
+	if _, err := sessionStore.Authenticate(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+		t.Fatalf("auth-first response credential = %v, want revoked after fence", err)
+	}
+	sessionStore.expectedAuthBeforeCommit = nil
+
+	stale := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/browser/session/migrate",
+		credentials.Token,
+		"",
+	)
+	stale.Header.Set("Origin", testBrowserSessionOrigin)
+	addKBaseBrowserSessionHeadersForCredentials(stale, credentials)
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != http.StatusConflict {
+		t.Fatalf(
+			"fence-first migration = %d body=%s, want 409",
+			staleResponse.Code,
+			staleResponse.Body.String(),
+		)
+	}
+	if got := staleResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("fence-first migration set Cookie: %#v", got)
+	}
+}
+
+func TestKBaseHTTPHandlerBrowserLogoutFencesFamilyAndAllowsNewEpoch(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 23, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 614)
+	family, err := sessionStore.AcquireClientEpoch("browser_client_logout_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: family.ClientID, ExpectedEpoch: family.Epoch, DeviceLabel: "First tab",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: family.ClientID, ExpectedEpoch: family.Epoch, DeviceLabel: "Second tab",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherFamily, err := sessionStore.AcquireClientEpoch("browser_client_other_01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: otherFamily.ClientID, ExpectedEpoch: otherFamily.Epoch, DeviceLabel: "Other device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrfToken, _, err := sessionStore.IssueCSRF(first.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logout := newKBaseBrowserCookieRequest(
+		http.MethodPost, "/api/browser/session/logout", first.Token, "",
+	)
+	addKBaseBrowserSessionSecurityHeaders(logout, csrfToken)
+	logoutResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logoutResponse, logout)
+	if logoutResponse.Code != http.StatusNoContent {
+		t.Fatalf("family logout = %d body=%s", logoutResponse.Code, logoutResponse.Body.String())
+	}
+	for _, credentials := range []BrowserSessionCredentials{first, second} {
+		if _, err := sessionStore.Authenticate(credentials.Token); !errors.Is(err, ErrBrowserSessionRevoked) {
+			t.Fatalf("same-family session after logout = %v, want revoked", err)
+		}
+	}
+	if _, err := sessionStore.Authenticate(other.Token); err != nil {
+		t.Fatalf("different-family session after logout = %v, want active", err)
+	}
+
+	next, err := sessionStore.ReadClientEpoch(family.ClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := sessionStore.Create(BrowserSessionCreate{
+		ClientID: next.ClientID, ExpectedEpoch: next.Epoch, DeviceLabel: "New login",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionStore.Authenticate(fresh.Token); err != nil {
+		t.Fatalf("new-epoch session = %v, want active", err)
+	}
+}
+
+func TestKBaseHTTPHandlerBearerCompatibility(t *testing.T) {
+	clock := &browserSessionTestClock{
+		now: time.Date(2026, time.July, 28, 23, 0, 0, 0, time.UTC),
+	}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 425)
+	credentials := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Bearer Compatibility Browser")
+	concrete := handler.(*kbaseHTTPHandler)
+	var mutationCalls atomic.Int32
+	concrete.analysisGenerator = func(
+		_ context.Context,
+		_ *BookKnowledgeStore,
+		request BookAnalysisGenerateRequest,
+	) (*BookAnalysisManifest, error) {
+		mutationCalls.Add(1)
+		return &BookAnalysisManifest{
+			Version: "1", BookID: request.BookID, Status: BookAnalysisReady, Answer: "analysis",
+		}, nil
+	}
+
+	read := requestKBase(handler, http.MethodGet, "/api/books", testKBaseAuthToken)
+	if read.Code != http.StatusOK {
+		t.Fatalf("Bearer read status = %d, body=%s", read.Code, read.Body.String())
+	}
+	write := requestJSONKBase(
+		handler,
+		http.MethodPost,
+		"/api/books/source-article-1/analysis",
+		testKBaseAuthToken,
+		`{"model":"Qwen-3.7-Max"}`,
+	)
+	if write.Code != http.StatusOK || mutationCalls.Load() != 1 {
+		t.Fatalf("Bearer unsafe write = status %d calls %d body=%s", write.Code, mutationCalls.Load(), write.Body.String())
+	}
+
+	sourceSync, err := NewSourceSyncStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	concrete.sourceSync = sourceSync
+	concrete.sourceAgentToken = "dedicated-source-agent-token"
+	concrete.agentPublisherToken = "dedicated-publisher-token"
+	clock.Advance(5 * time.Minute)
+
+	sourceRequest := newKBaseBrowserCookieRequest(
+		http.MethodPost,
+		"/api/source-agent/heartbeat",
+		credentials.Token,
+		`{"agent_id":"agent-a","version":"1.0.0","capabilities":["sync_content"],"wcplus_healthy":true}`,
+	)
+	sourceRequest.Header.Set("Authorization", "Bearer dedicated-source-agent-token")
+	sourceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(sourceResponse, sourceRequest)
+	if sourceResponse.Code != http.StatusOK {
+		t.Fatalf("dedicated source Bearer status = %d, body=%s", sourceResponse.Code, sourceResponse.Body.String())
+	}
+	if got := sourceResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("dedicated source Bearer renewed browser Cookie: %q", got)
+	}
+
+	publisherRequest := newKBaseBrowserCookieRequest(
+		http.MethodPost, "/api/agent-packages/publish", credentials.Token, `{}`,
+	)
+	publisherRequest.Header.Set("Authorization", "Bearer dedicated-publisher-token")
+	publisherResponse := httptest.NewRecorder()
+	handler.ServeHTTP(publisherResponse, publisherRequest)
+	if publisherResponse.Code != http.StatusBadRequest {
+		t.Fatalf("dedicated publisher Bearer status = %d, body=%s", publisherResponse.Code, publisherResponse.Body.String())
+	}
+	if got := publisherResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("dedicated publisher Bearer renewed browser Cookie: %q", got)
+	}
+
+	t.Run("duplicate Authorization headers are rejected at every Bearer boundary", func(t *testing.T) {
+		general := httptest.NewRequest(http.MethodGet, "/api/books", nil)
+		general.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		general.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		generalResponse := httptest.NewRecorder()
+		handler.ServeHTTP(generalResponse, general)
+		if generalResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate general Bearer = %d body=%s", generalResponse.Code, generalResponse.Body.String())
+		}
+
+		audit := httptest.NewRequest(http.MethodGet, "/api/agent-audits", nil)
+		audit.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		audit.Header.Add("Authorization", "Bearer "+testKBaseAuthToken)
+		auditResponse := httptest.NewRecorder()
+		handler.ServeHTTP(auditResponse, audit)
+		if auditResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate audit Bearer = %d body=%s", auditResponse.Code, auditResponse.Body.String())
+		}
+		assertKBaseEvidenceAuditErrorEnvelope(
+			t, auditResponse, "audit_unauthorized", "unauthorized",
+		)
+
+		source := httptest.NewRequest(
+			http.MethodPost,
+			"/api/source-agent/heartbeat",
+			strings.NewReader(`{"agent_id":"agent-a","version":"1.0.0","capabilities":[],"wcplus_healthy":true}`),
+		)
+		source.Header.Add("Authorization", "Bearer dedicated-source-agent-token")
+		source.Header.Add("Authorization", "Bearer dedicated-source-agent-token")
+		sourceResponse := httptest.NewRecorder()
+		handler.ServeHTTP(sourceResponse, source)
+		if sourceResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate source Bearer = %d body=%s", sourceResponse.Code, sourceResponse.Body.String())
+		}
+
+		publisher := httptest.NewRequest(
+			http.MethodPost, "/api/agent-packages/publish", strings.NewReader(`{}`),
+		)
+		publisher.Header.Add("Authorization", "Bearer dedicated-publisher-token")
+		publisher.Header.Add("Authorization", "Bearer dedicated-publisher-token")
+		publisherResponse := httptest.NewRecorder()
+		handler.ServeHTTP(publisherResponse, publisher)
+		if publisherResponse.Code != http.StatusUnauthorized {
+			t.Fatalf("duplicate publisher Bearer = %d body=%s", publisherResponse.Code, publisherResponse.Body.String())
+		}
+	})
+
+	for _, authorization := range []string{"", "Basic invalid", "Bearer wrong-token"} {
+		t.Run("explicit Authorization "+fmt.Sprintf("%q", authorization), func(t *testing.T) {
+			request := newKBaseBrowserCookieRequest(
+				http.MethodGet, "/api/books", credentials.Token, "",
+			)
+			request.Header["Authorization"] = []string{authorization}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("ambiguous auth status = %d, body=%s", response.Code, response.Body.String())
+			}
+			if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+				t.Fatalf("invalid explicit Bearer changed valid Cookie: %q", got)
+			}
+		})
+	}
+
+	bearerWins := newKBaseBrowserCookieRequest(
+		http.MethodGet, "/api/books", "invalid-cookie-token", "",
+	)
+	bearerWins.Header.Set("Authorization", "Bearer "+testKBaseAuthToken)
+	bearerWinsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(bearerWinsResponse, bearerWins)
+	if bearerWinsResponse.Code != http.StatusOK {
+		t.Fatalf("valid Bearer with invalid Cookie status = %d, body=%s", bearerWinsResponse.Code, bearerWinsResponse.Body.String())
+	}
+	if got := bearerWinsResponse.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("valid Bearer inspected invalid Cookie: %q", got)
+	}
+}
+
+func assertKBaseBrowserClientMetadata(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantClientID string,
+	wantEpoch int64,
+) {
+	t.Helper()
+	var body struct {
+		ClientID string `json:"client_id"`
+		Epoch    int64  `json:"epoch"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode browser client metadata: %v body=%s", err, response.Body.String())
+	}
+	if body.ClientID != wantClientID || body.Epoch != wantEpoch {
+		t.Fatalf(
+			"browser client metadata = (%q, %d), want (%q, %d)",
+			body.ClientID,
+			body.Epoch,
+			wantClientID,
+			wantEpoch,
+		)
+	}
+}
+
+func assertKBaseBrowserClientMetadataIsTopLevelOnly(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode browser session response: %v", err)
+	}
+	session, ok := body["session"].(map[string]any)
+	if !ok {
+		t.Fatalf("browser session response has no public session object: %#v", body)
+	}
+	for _, field := range []string{"client_id", "issued_epoch"} {
+		if _, exists := session[field]; exists {
+			t.Fatalf("browser session nested public metadata exposed %q", field)
+		}
+	}
+	if _, ok := body["client_id"].(string); !ok {
+		t.Fatal("browser session response missing top-level client_id")
+	}
+	if _, ok := body["epoch"].(float64); !ok {
+		t.Fatal("browser session response missing top-level epoch")
+	}
+}
+
+func addKBaseBrowserSessionClientHeaders(
+	t *testing.T,
+	request *http.Request,
+	sessionStore *BrowserSessionStore,
+	clientID string,
+) BrowserClientFamily {
+	t.Helper()
+	if clientID == "" {
+		clientID = fmt.Sprintf(
+			"http_client_%016x",
+			browserSessionTestClientSequence.Add(1),
+		)
+	}
+	family, err := sessionStore.AcquireClientEpoch(clientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set(browserSessionClientIDHeaderName, family.ClientID)
+	request.Header.Set(browserSessionEpochHeaderName, strconv.FormatInt(family.Epoch, 10))
+	return family
+}
+
+func addKBaseBrowserSessionHeadersForCredentials(
+	request *http.Request,
+	credentials BrowserSessionCredentials,
+) {
+	request.Header.Set(browserSessionClientIDHeaderName, credentials.Session.ClientID)
+	request.Header.Set(
+		browserSessionEpochHeaderName,
+		strconv.FormatInt(credentials.Session.IssuedEpoch, 10),
+	)
+}
+
+func createKBaseBrowserSessionHTTPTestCredentials(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+	deviceLabel string,
+) BrowserSessionCredentials {
+	t.Helper()
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: deviceLabel})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return credentials
+}
+
+func newKBaseBrowserCookieRequest(
+	method, path, token, body string,
+) *http.Request {
+	var request *http.Request
+	if body == "" {
+		request = httptest.NewRequest(method, path, nil)
+	} else {
+		request = httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if token != "" {
+		request.AddCookie(&http.Cookie{Name: browserSessionCookieName, Value: token})
+	}
+	return request
+}
+
+func requestKBaseWithBrowserCookie(
+	handler http.Handler,
+	method, path, token, body string,
+) *httptest.ResponseRecorder {
+	request := newKBaseBrowserCookieRequest(method, path, token, body)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func addKBaseHeaderValues(request *http.Request, name string, values []string) {
+	for _, value := range values {
+		request.Header.Add(name, value)
+	}
+}
+
+func addKBaseBrowserSessionSecurityHeaders(request *http.Request, csrfToken string) {
+	request.Header.Set("Origin", testBrowserSessionOrigin)
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	request.Header.Set("X-KBase-CSRF", csrfToken)
+}
+
+func loadKBaseBrowserSessionCSRF(
+	t *testing.T,
+	handler http.Handler,
+	sessionToken string,
+) (string, time.Time) {
+	t.Helper()
+	response := requestKBaseWithBrowserCookie(
+		handler, http.MethodGet, "/api/browser/session", sessionToken, "",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("browser session status = %d, body=%s", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	if got := response.Header().Values("Set-Cookie"); len(got) != 0 {
+		t.Fatalf("status inside renewal interval reissued Cookie: %q", got)
+	}
+	return decodeKBaseBrowserSessionCSRFResponse(t, response, sessionToken)
+}
+
+func decodeKBaseBrowserSessionCSRFResponse(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	sessionToken string,
+) (string, time.Time) {
+	t.Helper()
+	var payload struct {
+		Session       BrowserSession `json:"session"`
+		CSRFToken     string         `json:"csrf_token"`
+		CSRFExpiresAt time.Time      `json:"csrf_expires_at"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode browser session status: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Session.ID == "" || payload.CSRFToken == "" || payload.CSRFExpiresAt.IsZero() {
+		t.Fatalf("browser session status payload = %#v", payload)
+	}
+	body := strings.ToLower(response.Body.String())
+	for _, privateValue := range []string{
+		sessionToken,
+		`"token_hash"`,
+		`"csrf_hash"`,
+		`"user_agent"`,
+		`"hash"`,
+		`"revoke_reason"`,
+	} {
+		if strings.Contains(body, strings.ToLower(privateValue)) {
+			t.Fatalf("browser session status exposed private value %q: %s", privateValue, response.Body.String())
+		}
+	}
+	return payload.CSRFToken, payload.CSRFExpiresAt
+}
+
+func assertKBaseBrowserSessionUnauthorizedAndCleared(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	now time.Time,
+) {
+	t.Helper()
+	if response.Code != http.StatusUnauthorized ||
+		response.Body.String() != "{\"error\":\"unauthorized\"}\n" {
+		t.Fatalf("Cookie auth response = status %d body %q", response.Code, response.Body.String())
+	}
+	assertKBaseBrowserSessionClearedCookie(t, response, now)
+}
+
+func assertKBaseBrowserSessionClearedCookie(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	now time.Time,
+) {
+	t.Helper()
+	cookie := requireKBaseBrowserSessionCookie(t, response)
+	if cookie.Value != "" || cookie.MaxAge >= 0 || !cookie.Expires.Before(now) {
+		t.Fatalf("cleared Cookie = %#v", cookie)
+	}
+	if !cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode ||
+		cookie.Path != "/" || cookie.Domain != "" {
+		t.Fatalf("cleared Cookie flags/scope = %#v", cookie)
+	}
+}
+
+func assertKBaseEvidenceAuditErrorEnvelope(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantCode, wantError string,
+) {
+	t.Helper()
+	var payload map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode audit error envelope: %v; body=%s", err, response.Body.String())
+	}
+	if len(payload) != 2 || payload["code"] != wantCode || payload["error"] != wantError {
+		t.Fatalf("audit error envelope = %#v, want code %q error %q", payload, wantCode, wantError)
+	}
+}
+
+func newKBaseBrowserSessionHTTPTestHandler(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+) (http.Handler, *BrowserSessionStore) {
+	t.Helper()
+	return newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+		t,
+		clock,
+		randomSeed,
+		testBrowserSessionCookieTTL,
+	)
+}
+
+func newKBaseBrowserSessionHTTPTestHandlerWithTTL(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+	ttl time.Duration,
+) (http.Handler, *BrowserSessionStore) {
+	t.Helper()
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(randomSeed, 32)),
+		TTL:             ttl,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sessionStore.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	return newKBaseBrowserSessionHTTPTestHandlerForStore(t, sessionStore, ttl), sessionStore
+}
+
+func newKBaseBrowserSessionHTTPTestHandlerForStore(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+	ttl time.Duration,
+) http.Handler {
+	t.Helper()
+	return NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            testKBaseAuthToken,
+		BrowserSessionSecret: testBrowserSessionSecret,
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           sessionStore,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             ttl,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+}
+
+func newKBaseSessionAdminHTTPTestHandler(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+) (http.Handler, *BrowserSessionStore) {
+	t.Helper()
+	sessionStore := newBrowserSessionStoreForAdminTest(t, clock, randomSeed)
+	return newKBaseSessionAdminHTTPTestHandlerForStore(t, sessionStore), sessionStore
+}
+
+func newBrowserSessionStoreForAdminTest(
+	t *testing.T,
+	clock *browserSessionTestClock,
+	randomSeed int,
+) *BrowserSessionStore {
+	t.Helper()
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(randomSeed, 32)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sessionStore.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	return sessionStore
+}
+
+func newKBaseSessionAdminHTTPTestHandlerForStore(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+) http.Handler {
+	t.Helper()
+	return NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:               NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:           testKBaseAuthToken,
+		SourceAgentToken:    "dedicated-source-agent-token",
+		AgentPublisherToken: "dedicated-publisher-token",
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           sessionStore,
+			AdminToken:      testBrowserSessionAdminToken,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+}
+
+func adminSessionRequest(method, path, token string) *http.Request {
+	request := httptest.NewRequest(method, path, nil)
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	return request
+}
+
+func serveAdminSessionRequest(
+	handler http.Handler,
+	method, path, token string,
+) *httptest.ResponseRecorder {
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, adminSessionRequest(method, path, token))
+	return response
+}
+
+func assertKBaseBrowserSessionNoStore(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
 		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+func assertKBaseBrowserSessionCookieTTL(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantTTL time.Duration,
+	wantExpires time.Time,
+) {
+	t.Helper()
+	cookie := requireKBaseBrowserSessionCookie(t, response)
+	if cookie.MaxAge != int(wantTTL/time.Second) {
+		t.Fatalf("session Cookie MaxAge = %d, want %d", cookie.MaxAge, int(wantTTL/time.Second))
+	}
+	if !cookie.Expires.Equal(wantExpires) {
+		t.Fatalf("session Cookie Expires = %s, want %s", cookie.Expires, wantExpires)
+	}
+}
+
+func assertKBaseBrowserSessionGenericServiceUnavailable(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	if response.Code != http.StatusServiceUnavailable ||
+		response.Body.String() != "{\"error\":\"service unavailable\"}\n" {
+		t.Fatalf("store conflict response = status %d body %q", response.Code, response.Body.String())
+	}
+	if strings.Contains(strings.ToLower(response.Body.String()), "conflict") {
+		t.Fatalf("store conflict response exposed internal state: %s", response.Body.String())
+	}
+	assertKBaseBrowserSessionNoStore(t, response)
+	assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(t, response)
+}
+
+func assertKBaseBrowserSessionPublicResponse(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantDeviceLabel string,
+) {
+	t.Helper()
+	var payload struct {
+		Session BrowserSession `json:"session"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode browser session response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Session.ID == "" || payload.Session.DeviceLabel != wantDeviceLabel {
+		t.Fatalf("public session metadata = %#v, want device label %q", payload.Session, wantDeviceLabel)
+	}
+	lowerBody := strings.ToLower(response.Body.String())
+	for _, privateField := range []string{`"token"`, `"csrf`, `"user_agent"`, `"hash"`} {
+		if strings.Contains(lowerBody, privateField) {
+			t.Fatalf("browser session response contains private field %q: %s", privateField, response.Body.String())
+		}
+	}
+}
+
+func assertKBaseBrowserSessionResponseID(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+	wantID string,
+) {
+	t.Helper()
+	var payload struct {
+		Session BrowserSession `json:"session"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode browser session response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Session.ID != wantID {
+		t.Fatalf("session ID = %q, want %q", payload.Session.ID, wantID)
+	}
+}
+
+func requireKBaseBrowserSessionCookie(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) *http.Cookie {
+	t.Helper()
+	var sessionCookies []*http.Cookie
+	for _, cookie := range response.Result().Cookies() {
+		if cookie.Name == "__Host-kbase_session" {
+			sessionCookies = append(sessionCookies, cookie)
+		}
+	}
+	if len(sessionCookies) != 1 {
+		t.Fatalf("session Cookies = %#v, want exactly one", sessionCookies)
+	}
+	return sessionCookies[0]
+}
+
+func assertKBaseBrowserSessionDoesNotLeakConfiguredSecrets(
+	t *testing.T,
+	response *httptest.ResponseRecorder,
+) {
+	t.Helper()
+	headers := fmt.Sprint(response.Header())
+	for _, secret := range []string{testKBaseAuthToken, testBrowserSessionSecret} {
+		if strings.Contains(response.Body.String(), secret) || strings.Contains(headers, secret) {
+			t.Fatalf("response leaked configured secret: status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+		}
+	}
+}
+
+func assertKBaseBrowserSessionCount(
+	t *testing.T,
+	sessionStore *BrowserSessionStore,
+	want int,
+) {
+	t.Helper()
+	sessions, err := sessionStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != want {
+		t.Fatalf("browser session count = %d, want %d", len(sessions), want)
 	}
 }
 
@@ -1713,6 +7011,122 @@ func requestJSONKBase(handler http.Handler, method, path, token, body string) *h
 	resp := httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	return resp
+}
+
+func newKBaseSourceAgentCommandHTTPFixture(
+	t testing.TB,
+) (http.Handler, *SourceSyncStore, *sourceSyncTestClock, *BrowserSessionStore) {
+	t.Helper()
+	root := t.TempDir()
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC))
+	sourceSync, err := newSourceSyncStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := sourceSync.Close(); err != nil {
+			t.Errorf("close source sync store: %v", err)
+		}
+	})
+	for _, agentID := range []string{"agent-a", "agent-b"} {
+		if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+			AgentID: agentID, WorkerType: "wechat-worker", Platform: "darwin", Architecture: "arm64",
+			Version: "1.0.0", ProtocolVersion: "2026-08-01",
+			Capabilities: []string{"sync_articles"},
+			CapabilityHealth: map[string]SourceCapabilityHealth{
+				"wechat": {Healthy: true},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	artifactRoot := t.TempDir()
+	artifactFiles := map[string][]byte{
+		"artifact-2":       []byte("artifact-2-bytes"),
+		"artifact-3":       []byte("artifact-3-bytes"),
+		"private-artifact": []byte("private-artifact-bytes"),
+		"artifact-worker":  []byte("artifact-worker-bytes"),
+	}
+	artifacts := make([]SourceAgentArtifact, 0, len(artifactFiles))
+	files := make(map[string][]byte, len(artifactFiles))
+	for id, data := range artifactFiles {
+		storageKey := "artifacts/" + id
+		artifacts = append(artifacts, validSourceAgentArtifactForTest(id, storageKey, data))
+		files[storageKey] = data
+	}
+	writeSourceAgentArtifactFixture(t, artifactRoot, artifacts, files)
+	artifactCatalog, err := NewSourceAgentArtifactCatalog(artifactRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	browserDirectory := t.TempDir()
+	if err := os.Chmod(browserDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	browserSessions, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path:            filepath.Join(browserDirectory, "browser-sessions.sqlite3"),
+		Now:             clock.Now,
+		Random:          bytes.NewReader(deterministicBrowserSessionBytes(880, 16)),
+		TTL:             testBrowserSessionCookieTTL,
+		RenewalInterval: 5 * time.Minute,
+		MaxActive:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := browserSessions.Close(); err != nil {
+			t.Errorf("close browser session store: %v", err)
+		}
+	})
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store:            NewBookKnowledgeStore(root),
+		AuthToken:        "admin-secret",
+		SourceSync:       sourceSync,
+		SourceAgentToken: "agent-secret",
+		SourceArtifacts:  artifactCatalog,
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store:           browserSessions,
+			PublicOrigin:    testBrowserSessionOrigin,
+			TTL:             testBrowserSessionCookieTTL,
+			RenewalInterval: 5 * time.Minute,
+			MaxActive:       10,
+		},
+	})
+	return handler, sourceSync, clock, browserSessions
+}
+
+func sourceAgentArtifactRootFromHandlerForTest(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	concrete, ok := handler.(*kbaseHTTPHandler)
+	if !ok || concrete.sourceArtifacts == nil {
+		t.Fatal("handler has no source artifact catalog")
+	}
+	return concrete.sourceArtifacts.root
+}
+
+func setSourceAgentArtifactRolloutForTest(t *testing.T, root, artifactID string, allowed bool) {
+	t.Helper()
+	catalog, err := NewSourceAgentArtifactCatalog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := catalog.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for index := range artifacts {
+		if artifacts[index].ID == artifactID {
+			artifacts[index].AllowedForRollout = allowed
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("artifact %q not found", artifactID)
+	}
+	writeSourceAgentArtifactCatalog(t, root, artifacts)
 }
 
 type fakeDedaoLibrary struct{}

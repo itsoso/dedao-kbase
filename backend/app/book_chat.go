@@ -81,6 +81,22 @@ type BookKnowledgeLLMClient interface {
 	Chat(context.Context, BookTokenPlanConfig, []BookKnowledgeMessage) (string, error)
 }
 
+type BookKnowledgeLLMUsage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CostUSD          *float64
+}
+
+type BookKnowledgeLLMResult struct {
+	Content string
+	Usage   *BookKnowledgeLLMUsage
+}
+
+type BookKnowledgeLLMClientWithResult interface {
+	ChatWithResult(context.Context, BookTokenPlanConfig, []BookKnowledgeMessage) (BookKnowledgeLLMResult, error)
+}
+
 type TokenPlanChatClient struct {
 	httpClient *http.Client
 }
@@ -309,8 +325,13 @@ func NewTokenPlanChatClient(httpClient *http.Client) *TokenPlanChatClient {
 }
 
 func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig, messages []BookKnowledgeMessage) (string, error) {
+	result, err := c.ChatWithResult(ctx, cfg, messages)
+	return result.Content, err
+}
+
+func (c *TokenPlanChatClient) ChatWithResult(ctx context.Context, cfg BookTokenPlanConfig, messages []BookKnowledgeMessage) (BookKnowledgeLLMResult, error) {
 	if strings.TrimSpace(cfg.APIKey) == "" {
-		return "", fmt.Errorf("TOKENPLAN_API_KEY 未配置")
+		return BookKnowledgeLLMResult{}, fmt.Errorf("TOKENPLAN_API_KEY 未配置")
 	}
 	if strings.TrimSpace(cfg.BaseURL) == "" {
 		cfg.BaseURL = defaultTokenPlanBaseURL
@@ -334,27 +355,27 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	url := strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("TokenPlan 调用失败: status=%d body=%s", resp.StatusCode, trimRunes(string(respBody), 600))
+		return BookKnowledgeLLMResult{}, fmt.Errorf("TokenPlan 调用失败: status=%d body=%s", resp.StatusCode, trimRunes(string(respBody), 600))
 	}
 	var parsed struct {
 		Choices []struct {
@@ -362,14 +383,32 @@ func (c *TokenPlanChatClient) Chat(ctx context.Context, cfg BookTokenPlanConfig,
 				Content string `json:"content"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *struct {
+			PromptTokens     int      `json:"prompt_tokens"`
+			CompletionTokens int      `json:"completion_tokens"`
+			TotalTokens      int      `json:"total_tokens"`
+			Cost             *float64 `json:"cost"`
+			CostUSD          *float64 `json:"cost_usd"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return "", err
+		return BookKnowledgeLLMResult{}, err
 	}
 	if len(parsed.Choices) == 0 || strings.TrimSpace(parsed.Choices[0].Message.Content) == "" {
-		return "", fmt.Errorf("TokenPlan 响应为空")
+		return BookKnowledgeLLMResult{}, fmt.Errorf("TokenPlan 响应为空")
 	}
-	return parsed.Choices[0].Message.Content, nil
+	result := BookKnowledgeLLMResult{Content: parsed.Choices[0].Message.Content}
+	if parsed.Usage != nil {
+		cost := parsed.Usage.CostUSD
+		if cost == nil {
+			cost = parsed.Usage.Cost
+		}
+		result.Usage = &BookKnowledgeLLMUsage{
+			PromptTokens: parsed.Usage.PromptTokens, CompletionTokens: parsed.Usage.CompletionTokens,
+			TotalTokens: parsed.Usage.TotalTokens, CostUSD: cost,
+		}
+	}
+	return result, nil
 }
 
 func normalizeBookTokenPlanModel(model string) string {
@@ -404,6 +443,25 @@ func buildBookChatContext(
 	question string,
 	maxChars int,
 ) (string, BookKnowledgeChatContextStats, []BookKnowledgeChatSource, error) {
+	return buildBookKnowledgeContext(store, pkg, question, maxChars, false)
+}
+
+func buildBookAnalysisContext(
+	store *BookKnowledgeStore,
+	pkg *BookKnowledgePackage,
+	question string,
+	maxChars int,
+) (string, BookKnowledgeChatContextStats, []BookKnowledgeChatSource, error) {
+	return buildBookKnowledgeContext(store, pkg, question, maxChars, true)
+}
+
+func buildBookKnowledgeContext(
+	store *BookKnowledgeStore,
+	pkg *BookKnowledgePackage,
+	question string,
+	maxChars int,
+	citationNative bool,
+) (string, BookKnowledgeChatContextStats, []BookKnowledgeChatSource, error) {
 	var builder strings.Builder
 	stats := BookKnowledgeChatContextStats{}
 	sources := make([]BookKnowledgeChatSource, 0)
@@ -421,42 +479,101 @@ func buildBookChatContext(
 	}
 
 	appendSection("## 书籍\n" + pkg.Book.Title + "\nbook_id: " + pkg.Book.BookID)
-	for _, chapter := range pkg.Chapters {
-		if !appendSection(fmt.Sprintf("## 章节 [%s]\n%s\n%s", chapter.ChapterID, chapter.Title, chapter.Summary)) {
-			break
+	if !citationNative {
+		for _, chapter := range pkg.Chapters {
+			if !appendSection(fmt.Sprintf("## 章节 [%s]\n%s\n%s", chapter.ChapterID, chapter.Title, chapter.Summary)) {
+				break
+			}
+			stats.Chapters++
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "chapter",
+				ID:        chapter.ChapterID,
+				Title:     chapter.Title,
+				ChapterID: chapter.ChapterID,
+			})
 		}
-		stats.Chapters++
-		sources = append(sources, BookKnowledgeChatSource{
-			Kind:      "chapter",
-			ID:        chapter.ChapterID,
-			Title:     chapter.Title,
-			ChapterID: chapter.ChapterID,
-		})
-	}
-	for _, claim := range pkg.Claims {
-		if !appendSection(fmt.Sprintf("## Claim [%s]\n标题: %s\n内容: %s\n状态: %s", claim.ClaimID, claim.Title, claim.Summary, claim.ReviewStatus)) {
-			break
+		for _, claim := range pkg.Claims {
+			if !appendSection(fmt.Sprintf("## Claim [%s]\n标题: %s\n内容: %s\n状态: %s", claim.ClaimID, claim.Title, claim.Summary, claim.ReviewStatus)) {
+				break
+			}
+			stats.Claims++
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "claim",
+				ID:        claim.ClaimID,
+				Title:     claim.Title,
+				ChapterID: claim.ChapterID,
+			})
 		}
-		stats.Claims++
-		sources = append(sources, BookKnowledgeChatSource{
-			Kind:      "claim",
-			ID:        claim.ClaimID,
-			Title:     claim.Title,
-			ChapterID: claim.ChapterID,
-		})
 	}
 
+	citationsByChunk := make(map[string][]BookKnowledgeCitation)
+	if citationNative {
+		for _, citation := range pkg.Citations {
+			chunkID := strings.TrimSpace(citation.ChunkID)
+			if chunkID == "" || strings.TrimSpace(citation.CitationID) == "" {
+				continue
+			}
+			citationsByChunk[chunkID] = append(citationsByChunk[chunkID], citation)
+		}
+		for chunkID := range citationsByChunk {
+			sort.Slice(citationsByChunk[chunkID], func(i, j int) bool {
+				return citationsByChunk[chunkID][i].CitationID < citationsByChunk[chunkID][j].CitationID
+			})
+		}
+	}
 	chunks := selectBookChatChunks(store, pkg, question)
 	for _, chunk := range chunks {
-		if !appendSection(fmt.Sprintf("## Chunk [%s]\nchapter_id: %s\n%s", chunk.ChunkID, chunk.ChapterID, chunk.Text)) {
+		if !citationNative {
+			if !appendSection(fmt.Sprintf("## Chunk [%s]\nchapter_id: %s\n%s", chunk.ChunkID, chunk.ChapterID, chunk.Text)) {
+				break
+			}
+			stats.Chunks++
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "chunk",
+				ID:        chunk.ChunkID,
+				ChapterID: chunk.ChapterID,
+			})
+			continue
+		}
+		citations := citationsByChunk[chunk.ChunkID]
+		if len(citations) == 0 {
+			if !appendSection(fmt.Sprintf(
+				"## Legacy Chunk [chunk:%s]\nchapter_id: %s\ncitation_status: unavailable\ncontent_status: omitted",
+				chunk.ChunkID,
+				chunk.ChapterID,
+			)) {
+				break
+			}
+			stats.Chunks++
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "legacy_chunk",
+				ID:        chunk.ChunkID,
+				ChapterID: chunk.ChapterID,
+			})
+			continue
+		}
+		markers := make([]string, 0, len(citations))
+		for _, citation := range citations {
+			markers = append(markers, "citation:"+citation.CitationID)
+		}
+		if !appendSection(fmt.Sprintf(
+			"## Evidence [%s]\nchunk_id: %s\nchapter_id: %s\n%s",
+			strings.Join(markers, ", "),
+			chunk.ChunkID,
+			chunk.ChapterID,
+			chunk.Text,
+		)) {
 			break
 		}
 		stats.Chunks++
-		sources = append(sources, BookKnowledgeChatSource{
-			Kind:      "chunk",
-			ID:        chunk.ChunkID,
-			ChapterID: chunk.ChapterID,
-		})
+		for _, citation := range citations {
+			sources = append(sources, BookKnowledgeChatSource{
+				Kind:      "citation",
+				ID:        citation.CitationID,
+				Title:     citation.Anchor,
+				ChapterID: citation.ChapterID,
+			})
+		}
 	}
 	stats.Chars = len([]rune(builder.String()))
 	return strings.TrimSpace(builder.String()), stats, dedupeBookChatSources(sources), nil

@@ -13,29 +13,40 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/yann0917/dedao-gui/backend/app"
+	"github.com/yann0917/dedao-gui/internal/sourceagentsecret"
 )
 
 const (
-	sourceAgentKeychainService = "life.executor.kbase.source-agent"
+	sourceAgentKeychainService = sourceagentsecret.KeychainService
 	keychainMasterKeyName      = "_storage-key-v1"
 	keychainEnvelopePrefix     = "kbase:v1:"
 	keychainMasterKeySize      = 32
+	keychainCommandMaxOutput   = 64 << 10
 )
 
 type keychainCommandRunner func(context.Context, string, []string, []byte) ([]byte, error)
 type keychainSecretStore struct {
 	agentID string
 	run     keychainCommandRunner
+	prompt  keychainCommandRunner
 	random  io.Reader
 }
 
 func newKeychainSecretStore(agentID string, runner keychainCommandRunner) app.SourceSecretStore {
+	promptRunner := runner
 	if runner == nil {
 		runner = runKeychainCommand
+		promptRunner = runKeychainPromptCommand
 	}
-	return &keychainSecretStore{agentID: strings.TrimSpace(agentID), run: runner, random: rand.Reader}
+	return &keychainSecretStore{
+		agentID: strings.TrimSpace(agentID),
+		run:     runner,
+		prompt:  promptRunner,
+		random:  rand.Reader,
+	}
 }
 
 func (s *keychainSecretStore) account(key string) (string, error) {
@@ -143,7 +154,7 @@ func (s *keychainSecretStore) masterKey(ctx context.Context) ([]byte, error) {
 	promptInput = append(promptInput, '\n')
 	promptInput = append(promptInput, encoded...)
 	promptInput = append(promptInput, '\n')
-	_, addErr := s.run(ctx, "/usr/bin/security", []string{
+	_, addErr := s.prompt(ctx, "/usr/bin/security", []string{
 		"add-generic-password",
 		"-s", sourceAgentKeychainService,
 		"-a", account,
@@ -211,5 +222,106 @@ func openKeychainEnvelope(masterKey []byte, account string, envelope []byte) ([]
 func runKeychainCommand(ctx context.Context, path string, args []string, input []byte) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Stdin = bytes.NewReader(input)
+	cmd.Stderr = io.Discard
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	output, readErr := io.ReadAll(io.LimitReader(stdout, keychainCommandMaxOutput+1))
+	if readErr != nil || len(output) > keychainCommandMaxOutput {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, fmt.Errorf("keychain command output exceeded limit")
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+const keychainPromptExpectScript = `
+log_user 0
+set timeout 10
+fconfigure stdin -translation lf -encoding utf-8
+
+if {
+    [gets stdin service] < 0 ||
+    [gets stdin account] < 0 ||
+    [gets stdin first] < 0 ||
+    [gets stdin second] < 0 ||
+    $service eq "" ||
+    $account eq "" ||
+    $first eq "" ||
+    $first ne $second
+} {
+    exit 64
+}
+
+spawn -noecho /usr/bin/security add-generic-password -s $service -a $account -w
+expect {
+    -re {password data for new item:[[:space:]]*$} {
+        send -- "$first\r"
+    }
+    timeout {
+        exit 124
+    }
+    eof {
+        set result [wait]
+        exit [lindex $result 3]
+    }
+}
+expect {
+    -re {retype password for new item:[[:space:]]*$} {
+        send -- "$second\r"
+    }
+    timeout {
+        exit 124
+    }
+    eof {
+        set result [wait]
+        exit [lindex $result 3]
+    }
+}
+expect {
+    eof {
+        set result [wait]
+        exit [lindex $result 3]
+    }
+    timeout {
+        exit 124
+    }
+}
+`
+
+func runKeychainPromptCommand(ctx context.Context, path string, args []string, input []byte) ([]byte, error) {
+	if path != "/usr/bin/security" ||
+		len(args) != 6 ||
+		args[0] != "add-generic-password" ||
+		args[1] != "-s" ||
+		args[2] != sourceAgentKeychainService ||
+		args[3] != "-a" ||
+		args[4] == "" ||
+		strings.ContainsAny(args[4], "\r\n") ||
+		args[5] != "-w" {
+		return nil, fmt.Errorf("unsupported keychain prompt command")
+	}
+	promptCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	promptInput := make([]byte, 0, len(sourceAgentKeychainService)+len(args[4])+len(input)+2)
+	promptInput = append(promptInput, sourceAgentKeychainService...)
+	promptInput = append(promptInput, '\n')
+	promptInput = append(promptInput, args[4]...)
+	promptInput = append(promptInput, '\n')
+	promptInput = append(promptInput, input...)
+
+	cmd := exec.CommandContext(promptCtx, "/usr/bin/expect", "-c", keychainPromptExpectScript)
+	cmd.Stdin = bytes.NewReader(promptInput)
 	return cmd.Output()
 }

@@ -18,12 +18,14 @@ func TestKeychainSecretRoundTripsLargeValue(t *testing.T) {
 	store := newKeychainSecretStore(agentID, nil)
 	defer func() { _ = store.Delete(context.Background(), "large-secret") }()
 	defer func() { _ = store.Delete(context.Background(), keychainMasterKeyName) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	secret := bytes.Repeat([]byte("0123456789abcdef"), 256)
-	if err := store.Save(context.Background(), "large-secret", secret); err != nil {
+	if err := store.Save(ctx, "large-secret", secret); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := store.Load(context.Background(), "large-secret")
+	loaded, err := store.Load(ctx, "large-secret")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,6 +131,19 @@ func TestKeychainSecretLoadsLegacyPlaintext(t *testing.T) {
 	value, err := store.Load(context.Background(), "transport-token")
 	if err != nil || string(value) != "legacy-token" {
 		t.Fatalf("value=%q error=%v", value, err)
+	}
+}
+
+func TestLegacyKeychainCommandBoundsOutputAndStopsProducer(t *testing.T) {
+	started := time.Now()
+	_, err := runKeychainCommand(context.Background(), "/bin/sh", []string{
+		"-c", "head -c 131072 /dev/zero; sleep 2",
+	}, nil)
+	if err == nil {
+		t.Fatal("oversize keychain output was accepted")
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("bounded keychain command took %s", elapsed)
 	}
 }
 

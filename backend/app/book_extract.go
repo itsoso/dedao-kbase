@@ -1,6 +1,8 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"regexp"
@@ -133,6 +135,7 @@ type bookKnowledgePackageBuilder struct {
 	currentText   []string
 	chapterNumber int
 	chunkNumber   int
+	citationIDs   map[string]int
 }
 
 func (b *bookKnowledgePackageBuilder) startChapter(title string) {
@@ -168,6 +171,7 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 	}
 	chapterText := strings.Join(paragraphs, "\n\n")
 	parts := splitBookKnowledgeText(chapterText, bookKnowledgeMaxChunkRunes)
+	chapterCitationIDs := make([]string, 0, len(parts))
 	for _, part := range parts {
 		b.chunkNumber++
 		chunkID := b.book.BookID + "-chunk-" + strconv.Itoa(b.chunkNumber)
@@ -181,21 +185,26 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 		}
 		b.chunks = append(b.chunks, chunk)
 		b.current.ChunkIDs = append(b.current.ChunkIDs, chunkID)
+		citationID := b.nextChunkCitationID(part)
+		b.citations = append(b.citations, BookKnowledgeCitation{
+			CitationID:    citationID,
+			BookID:        b.book.BookID,
+			ChapterID:     b.current.ChapterID,
+			ChunkID:       chunkID,
+			SourceHTML:    b.book.SourceHTML,
+			Anchor:        b.current.Title,
+			Note:          "自动提取，待人工复核",
+			SourceType:    b.book.SourceType,
+			SourceAccount: b.book.SourceAccount,
+			SourceItemKey: b.book.SourceKey,
+			PublishedAt:   b.book.PublishedAt,
+		})
+		chapterCitationIDs = append(chapterCitationIDs, citationID)
 	}
 
 	summary := trimRunes(chapterText, 240)
 	b.current.Summary = summary
-	if len(b.current.ChunkIDs) > 0 {
-		citationID := b.book.BookID + "-citation-" + strconv.Itoa(len(b.citations)+1)
-		b.citations = append(b.citations, BookKnowledgeCitation{
-			CitationID: citationID,
-			BookID:     b.book.BookID,
-			ChapterID:  b.current.ChapterID,
-			ChunkID:    b.current.ChunkIDs[0],
-			SourceHTML: b.book.SourceHTML,
-			Anchor:     b.current.Title,
-			Note:       "自动提取，待人工复核",
-		})
+	if len(chapterCitationIDs) > 0 {
 		b.claims = append(b.claims, BookKnowledgeClaim{
 			ClaimID:       b.book.BookID + "-claim-" + strconv.Itoa(len(b.claims)+1),
 			BookID:        b.book.BookID,
@@ -206,10 +215,23 @@ func (b *bookKnowledgePackageBuilder) flushCurrentChapter() {
 			EvidenceLevel: "D",
 			Confidence:    0.4,
 			ReviewStatus:  "draft",
-			Citations:     []string{citationID},
+			Citations:     chapterCitationIDs,
 		})
 	}
 	b.currentText = nil
+}
+
+func (b *bookKnowledgePackageBuilder) nextChunkCitationID(text string) string {
+	sum := sha256.Sum256([]byte(b.book.BookID + "\x00" + b.current.Title + "\x00" + text))
+	base := b.book.BookID + "-citation-" + hex.EncodeToString(sum[:8])
+	if b.citationIDs == nil {
+		b.citationIDs = make(map[string]int)
+	}
+	b.citationIDs[base]++
+	if b.citationIDs[base] == 1 {
+		return base
+	}
+	return base + "-" + strconv.Itoa(b.citationIDs[base])
 }
 
 func (b *bookKnowledgePackageBuilder) build() *BookKnowledgePackage {

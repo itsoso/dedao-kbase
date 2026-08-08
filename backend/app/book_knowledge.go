@@ -275,12 +275,29 @@ func (s *BookKnowledgeStore) ListBooks() ([]BookKnowledgeBook, error) {
 	}
 	books := append([]BookKnowledgeBook(nil), manifest.Books...)
 	sort.SliceStable(books, func(i, j int) bool {
-		if books[i].UpdatedAt != books[j].UpdatedAt {
-			return books[i].UpdatedAt > books[j].UpdatedAt
+		left := bookKnowledgeListTimestamp(books[i])
+		right := bookKnowledgeListTimestamp(books[j])
+		if !left.Equal(right) {
+			return left.After(right)
 		}
 		return books[i].BookID < books[j].BookID
 	})
 	return books, nil
+}
+
+func bookKnowledgeListTimestamp(book BookKnowledgeBook) time.Time {
+	candidates := []string{book.UpdatedAt, book.CreatedAt}
+	if book.SourceType == "wechat_mp_article" {
+		candidates = append([]string{book.PublishedAt}, candidates...)
+	}
+	for _, candidate := range candidates {
+		for _, layout := range []string{time.RFC3339Nano, "2006-01-02 15:04:05", "2006-01-02"} {
+			if parsed, err := time.Parse(layout, strings.TrimSpace(candidate)); err == nil {
+				return parsed
+			}
+		}
+	}
+	return time.Time{}
 }
 
 func (s *BookKnowledgeStore) Search(query BookKnowledgeSearchQuery) ([]BookKnowledgeSearchResult, error) {

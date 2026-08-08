@@ -122,6 +122,176 @@ func TestAgentTraceRejectsIncompleteOrUnsafeRuntimeRecords(t *testing.T) {
 	}
 }
 
+func TestAgentTraceEvidenceAuditPersistsOnlyBoundedIdentity(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	trace := agentTraceTestTrace()
+	trace.EvidenceAudit = &AgentTraceEvidenceAuditRef{
+		AuditID:   "audit-test",
+		InputHash: "sha256:" + strings.Repeat("7", 64),
+	}
+	trace.Observability = validEvidenceAuditTraceObservability()
+	trace.PrivatePrompt = "private-evidence-audit-prompt"
+	trace.SourceBodies = []string{"private-evidence-body"}
+	if err := store.SaveAgentTrace(trace); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(store.AgentTracePath(trace.TraceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(payload), `"audit_id": "audit-test"`) ||
+		strings.Contains(string(payload), "private-evidence-audit-prompt") ||
+		strings.Contains(string(payload), "private-evidence-body") {
+		t.Fatalf("evidence audit trace payload = %s", payload)
+	}
+	loaded, err := store.LoadAgentTrace(trace.TraceID)
+	if err != nil || loaded.EvidenceAudit == nil || loaded.EvidenceAudit.AuditID != "audit-test" {
+		t.Fatalf("loaded evidence audit trace = %#v err=%v", loaded, err)
+	}
+}
+
+func TestEvidenceAuditTraceRejectsUnboundedOrPrivateObservability(t *testing.T) {
+	trace := agentTraceTestTrace()
+	trace.EvidenceAudit = &AgentTraceEvidenceAuditRef{
+		AuditID: "audit-observability", InputHash: "sha256:" + strings.Repeat("7", 64),
+	}
+	trace.Observability = &AgentTraceObservability{
+		Stages: []AgentTraceStage{{
+			Name: "package_validation", Status: "completed", DurationMS: 1,
+		}},
+		CitationResolutionRate:            1,
+		IndependentPublicationSourceCount: 1,
+		Usage:                             AgentTraceUsage{Status: "unknown"},
+	}
+	trace.Observability.AbstentionReason = strings.Repeat("private-prompt-marker", 100)
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "abstention_reason") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.AbstentionReason = ""
+	trace.Observability.Stages = make([]AgentTraceStage, 20)
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "stages") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.Stages = []AgentTraceStage{{
+		Name: "package_validation", Status: "completed", DurationMS: 1,
+	}}
+	trace.Observability.Usage = AgentTraceUsage{
+		Status: "reported", PromptTokens: -1, CompletionTokens: 1, TotalTokens: 0,
+	}
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.Usage = AgentTraceUsage{
+		Status: "reported", PromptTokens: 5_000_001, CompletionTokens: 1,
+		TotalTokens: 5_000_002, CostStatus: "unknown",
+	}
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+	trace.Observability.Usage = AgentTraceUsage{Status: "unknown"}
+	trace.Observability.AbstentionReason = "private prompt marker"
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "abstention_reason") {
+		t.Fatalf("ValidateAgentTrace error = %v", err)
+	}
+}
+
+func TestEvidenceAuditTraceTerminalStrictlyBindsAuditReportAndTraceIdentity(t *testing.T) {
+	trace := agentTraceTestTrace()
+	inputHash := "sha256:" + strings.Repeat("9", 64)
+	trace.EvidenceAudit = &AgentTraceEvidenceAuditRef{AuditID: "audit-strict-binding", InputHash: inputHash}
+	trace.Observability = validEvidenceAuditTraceObservability()
+	trace.Retrievals[0].EvidenceID = "release-1:claim-1:citation-1"
+	trace.Final.Citations[0].EvidenceID = trace.Retrievals[0].EvidenceID
+	report := EvidenceAudit{
+		AuditID:   "audit-strict-binding",
+		InputHash: inputHash,
+		Package: EvidenceAuditPackageRef{
+			PackageID: trace.Package.PackageID, Version: trace.Package.Version,
+			ContentHash: trace.Package.ContentHash,
+		},
+		TraceID: trace.TraceID,
+		ClaimAudits: []EvidenceAuditClaim{{
+			SourceClaim: "claim", NormalizedStatement: "claim",
+			Verdict: EvidenceAuditVerdictSupported,
+			Evidence: []EvidenceAuditEvidenceRef{{
+				ReleaseID: "release-1", ClaimID: "claim-1", CitationID: "citation-1",
+			}},
+		}},
+		Summary: EvidenceAuditSummary{Conclusion: "bounded"},
+		Proofroom: EvidenceAuditProofroomProjection{
+			SchemaVersion: "proofroom-evidence-task.v1", Title: "review",
+		},
+	}
+	fingerprint, err := evidenceAuditReportFingerprint(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace.Final.ResponseFingerprint = fingerprint
+	terminal := evidenceAuditTraceTerminal{
+		Version: evidenceAuditTraceTerminalVersion, AuditID: report.AuditID,
+		InputHash: inputHash, TraceID: trace.TraceID, ReportFingerprint: fingerprint,
+		Report: &report, Trace: trace,
+	}
+	if err := validateEvidenceAuditTraceTerminal(terminal); err != nil {
+		t.Fatalf("valid terminal rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*evidenceAuditTraceTerminal)
+	}{
+		{
+			name: "report input hash",
+			mutate: func(value *evidenceAuditTraceTerminal) {
+				value.Report.InputHash = "sha256:" + strings.Repeat("7", 64)
+			},
+		},
+		{
+			name: "report package",
+			mutate: func(value *evidenceAuditTraceTerminal) {
+				value.Report.Package.PackageID = "other-package"
+			},
+		},
+		{
+			name: "trace audit",
+			mutate: func(value *evidenceAuditTraceTerminal) {
+				value.Trace.EvidenceAudit.AuditID = "other-audit"
+			},
+		},
+		{
+			name: "trace final citations",
+			mutate: func(value *evidenceAuditTraceTerminal) {
+				value.Trace.Final.Citations[0].EvidenceID = "release-1:other-claim:citation-1"
+				value.Trace.Retrievals[0].EvidenceID = value.Trace.Final.Citations[0].EvidenceID
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := terminal
+			reportCopy := *terminal.Report
+			changed.Report = &reportCopy
+			traceCopy := terminal.Trace
+			auditRefCopy := *terminal.Trace.EvidenceAudit
+			traceCopy.EvidenceAudit = &auditRefCopy
+			changed.Trace = traceCopy
+			tt.mutate(&changed)
+			if err := validateEvidenceAuditTraceTerminal(changed); err == nil {
+				t.Fatal("mutated terminal unexpectedly validated")
+			}
+		})
+	}
+}
+
+func validEvidenceAuditTraceObservability() *AgentTraceObservability {
+	return &AgentTraceObservability{
+		Stages: []AgentTraceStage{{
+			Name: "package_validation", Status: "completed", DurationMS: 1,
+		}},
+		CitationResolutionRate: 1,
+		Usage:                  AgentTraceUsage{Status: "unknown"},
+	}
+}
+
 func TestReplayAgentTraceIsDeterministicOverStoredEvidenceAndMockResults(t *testing.T) {
 	trace := agentTraceTestTrace()
 	fixture := AgentReplayFixture{

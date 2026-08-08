@@ -160,6 +160,9 @@ func EvaluateBookAnalysisQuality(store *BookKnowledgeStore, bookID string) (*Boo
 	addRule("claim_citations", claimsHaveCitations, false, "every claim must cite at least one source ID")
 	addRule("citation_integrity", citationsValid, false, "every cited source ID must belong to the current package")
 	addRule("claim_metadata", claimMetadataValid, false, "claim ids, statements, confidence, and risk levels must be valid")
+	evidence := EvaluateKnowledgeEvidence(*pkg, manifest)
+	addRule("evidence_structure", !evidence.HasStructuralBlockers(), true, "package evidence identities and edges must be internally consistent")
+	addRule("evidence_reference_resolution", !evidence.HasBlockers(), false, "every analysis claim evidence reference must resolve in the current package")
 
 	if err := store.SaveBookQualityReport(report); err != nil {
 		return nil, err

@@ -1,0 +1,107 @@
+location = /health {
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_no_cache 1;
+    add_header Cache-Control "no-store" always;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Authorization "";
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_set_header Connection "";
+}
+
+location = /.well-known/dedao-kbase-skills.json {
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Authorization "";
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_set_header Connection "";
+}
+
+location = /browser/session {
+    auth_basic "dedao-kbase";
+    auth_basic_user_file __KBASE_BASIC_AUTH_FILE__;
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Authorization "";
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "__KBASE_BROWSER_SESSION_SECRET__";
+    proxy_set_header Connection "";
+}
+
+location = /browser/session/migrate {
+    auth_basic off;
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_set_header Connection "";
+}
+
+location = /browser/session-token {
+    auth_basic off;
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Authorization "";
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_set_header Connection "";
+}
+
+location /api/ {
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_set_header Connection "";
+
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 120s;
+    proxy_read_timeout 120s;
+    proxy_buffering off;
+}
+
+location / {
+    proxy_pass http://__KBASE_BACKEND_ADDR__;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Authorization "";
+    proxy_set_header Proxy-Authorization "";
+    proxy_set_header X-KBase-Browser-Session "";
+    proxy_set_header Connection "";
+    proxy_buffering off;
+}
