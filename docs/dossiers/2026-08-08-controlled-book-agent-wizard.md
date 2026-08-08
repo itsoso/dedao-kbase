@@ -177,10 +177,18 @@ Decision: PASS locally.
 
 ### Review and deployment notes
 
+- G4 independent review initially rejected the branch for a stale ebook-route
+  response race and unsafe title fallback in source-to-knowledge matching.
+  Navigation now invalidates pending ebook loads, every delayed state write and
+  render is route guarded, strong source identifiers cannot fall back to title,
+  and ambiguous or internally conflicting identities fail closed. Regression
+  smoke checks cover route exit/switch, same-title books, conflicting IDs, and
+  duplicate-title fallback. Re-review found no remaining Critical or Important
+  issue and approved the branch for merge.
 - The repository-owned changes do not alter proxy or Nginx behavior.
 - The existing duplicate-listener warning originates outside this repository:
   `health.executor.life.conf` is enabled from both `conf.d` and
   `sites-enabled`, while `langbridge-proxy.conf` also declares the same IP
   listener. Those files are explicitly out of scope and were not modified.
-- G4 review, the next deployment health check, and fresh online acceptance are
-  recorded only after their respective gates complete.
+- G4 decision: PASS. The next deployment health check and fresh online
+  acceptance are recorded only after their respective gates complete.
