@@ -133,7 +133,8 @@ Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的�
 location ^~ /api/controlled-agent/ {
     auth_basic "dedao-kbase";
     auth_basic_user_file /etc/nginx/dedao-kbase.htpasswd;
-    proxy_set_header X-KBase-Browser-Session 1;
+    # Must exactly match KBASE_BROWSER_SESSION_SECRET and remain server-side.
+    proxy_set_header X-KBase-Browser-Session "replace-with-separate-browser-session-secret";
     proxy_pass http://127.0.0.1:8719;
 }
 
@@ -143,7 +144,7 @@ location /api/ {
 }
 ```
 
-不要把 `X-KBase-Browser-Session: 1` 配置到整个 `/api/`，也不要把 publisher token 写入前端、浏览器存储或代理配置。
+不要把可信浏览器会话标记配置到整个 `/api/`，也不要把 publisher token 或浏览器会话密钥写入前端和浏览器存储。`KBASE_BROWSER_SESSION_SECRET` 必须与 consumer、source-agent、publisher token 分离，并只存在于服务环境和反向代理配置中。
 
 机器可读契约和 consumer 接入说明见 `contracts/*.schema.json` 与 `docs/contracts/knowledge-supply-v1.md`。
 

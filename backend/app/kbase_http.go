@@ -23,6 +23,7 @@ type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
 	AuthToken               string
 	AgentPublisherToken     string
+	BrowserSessionSecret    string
 	SystemKBExportPath      string
 	StaticDir               string
 	WeChat                  *WeChatSourceService
@@ -57,6 +58,7 @@ type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
 	authToken               string
 	agentPublisherToken     string
+	browserSessionSecret    string
 	systemKBExportPath      string
 	staticDir               string
 	wechat                  *WeChatSourceService
@@ -93,6 +95,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	}
 	authToken := strings.TrimSpace(cfg.AuthToken)
 	agentPublisherToken := strings.TrimSpace(cfg.AgentPublisherToken)
+	browserSessionSecret := strings.TrimSpace(cfg.BrowserSessionSecret)
 	sourceAgentToken := strings.TrimSpace(cfg.SourceAgentToken)
 	if agentPublisherToken != "" && agentPublisherToken == authToken {
 		agentPublisherToken = ""
@@ -102,6 +105,9 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	}
 	if authToken != "" && sourceAgentToken == authToken {
 		sourceAgentToken = ""
+	}
+	if browserSessionSecret == authToken || browserSessionSecret == agentPublisherToken || browserSessionSecret == sourceAgentToken {
+		browserSessionSecret = ""
 	}
 	assets := cfg.SourceAssets
 	if assets == nil {
@@ -134,6 +140,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		store:                   store,
 		authToken:               authToken,
 		agentPublisherToken:     agentPublisherToken,
+		browserSessionSecret:    browserSessionSecret,
 		systemKBExportPath:      strings.TrimSpace(cfg.SystemKBExportPath),
 		staticDir:               strings.TrimSpace(cfg.StaticDir),
 		wechat:                  cfg.WeChat,
@@ -230,7 +237,7 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !h.authorize(w, r) {
 			return
 		}
-		if strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session")) != "1" {
+		if !h.hasTrustedBrowserSession(r) {
 			writeHTTPError(w, http.StatusUnauthorized, "controlled Agent requires an authorized browser session")
 			return
 		}
@@ -1995,6 +2002,14 @@ func (h *kbaseHTTPHandler) authorize(w http.ResponseWriter, r *http.Request) boo
 	return authorizeBearerToken(w, r, h.authToken)
 }
 
+func (h *kbaseHTTPHandler) hasTrustedBrowserSession(r *http.Request) bool {
+	if r == nil || h.browserSessionSecret == "" {
+		return false
+	}
+	provided := strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session"))
+	return subtle.ConstantTimeCompare([]byte(provided), []byte(h.browserSessionSecret)) == 1
+}
+
 func authorizeBearerToken(w http.ResponseWriter, r *http.Request, expected string) bool {
 	value := strings.TrimSpace(r.Header.Get("Authorization"))
 	token := strings.TrimSpace(strings.TrimPrefix(value, "Bearer "))
@@ -2020,7 +2035,7 @@ func (h *kbaseHTTPHandler) handleBrowserSessionToken(w http.ResponseWriter, r *h
 		writeHTTPError(w, http.StatusUnauthorized, "kbase auth token is not configured")
 		return
 	}
-	if strings.TrimSpace(r.Header.Get("X-KBase-Browser-Session")) != "1" {
+	if !h.hasTrustedBrowserSession(r) {
 		writeHTTPError(w, http.StatusUnauthorized, "browser session is not authorized")
 		return
 	}

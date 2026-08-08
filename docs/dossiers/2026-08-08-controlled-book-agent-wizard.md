@@ -31,8 +31,8 @@ Decision: PASS with explicit proxy requirement.
 - A legacy Dedao fallback package can contain complete retrieval objects while
   lacking `content_hash`; this deterministically blocks quality publication.
 - The controlled browser routes require both normal API authorization and a
-  trusted proxy-injected browser marker. The proxy must clear client-supplied
-  markers on general API routes.
+  constant-time verified proxy marker matching `KBASE_BROWSER_SESSION_SECRET`.
+  The proxy must clear client-supplied markers on general API routes.
 
 ## Implementation
 

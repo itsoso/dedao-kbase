@@ -24,6 +24,7 @@ func main() {
 	webDir := flag.String("web-dir", defaultWebDir(), "static web UI directory")
 	authToken := flag.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
 	agentPublisherToken := flag.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
+	browserSessionSecret := flag.String("browser-session-secret", os.Getenv("KBASE_BROWSER_SESSION_SECRET"), "trusted reverse-proxy browser session marker")
 	sourceAgentToken := flag.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
 	flag.Parse()
 	if err := validateKBaseTokenSeparation(*authToken, *sourceAgentToken, *agentPublisherToken); err != nil {
@@ -50,6 +51,7 @@ func main() {
 		Store:                  bookStore,
 		AuthToken:              *authToken,
 		AgentPublisherToken:    *agentPublisherToken,
+		BrowserSessionSecret:   *browserSessionSecret,
 		SystemKBExportPath:     *exportPath,
 		StaticDir:              *webDir,
 		WeChat:                 app.NewWeChatSourceService(app.WeChatSourceConfigFromEnv()),
@@ -77,6 +79,9 @@ func main() {
 		log.Printf("agent package publisher API disabled until KBASE_AGENT_PUBLISHER_TOKEN is configured")
 	} else {
 		log.Printf("agent package publisher API enabled with a dedicated token")
+	}
+	if strings.TrimSpace(*browserSessionSecret) == "" {
+		log.Printf("browser session token exchange and controlled Agent workflow disabled until KBASE_BROWSER_SESSION_SECRET is configured")
 	}
 	if strings.TrimSpace(os.Getenv("WECHAT_MP_TOKEN")) == "" || strings.TrimSpace(os.Getenv("WECHAT_MP_COOKIE")) == "" {
 		log.Printf("wechat source: official account search/list disabled until WECHAT_MP_TOKEN and WECHAT_MP_COOKIE are configured")

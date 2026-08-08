@@ -204,7 +204,7 @@ func TestKBaseHTTPHandlerControlledAgentRequiresBrowserSessionAndPublishes(t *te
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store: store, AuthToken: "consumer-token", AgentPublisherToken: "publisher-token",
+		Store: store, AuthToken: "consumer-token", AgentPublisherToken: "publisher-token", BrowserSessionSecret: "browser-secret",
 	})
 	request := ControlledAgentWorkflowRequest{
 		Draft: ControlledAgentDraftRequest{
@@ -243,7 +243,7 @@ func TestKBaseHTTPHandlerControlledAgentRequiresBrowserSessionAndPublishes(t *te
 }
 
 func TestKBaseHTTPHandlerControlledAgentRequiresPublisherConfiguration(t *testing.T) {
-	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-token"})
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "consumer-token", BrowserSessionSecret: "browser-secret"})
 	response := requestJSONKBaseBrowser(handler, http.MethodPost, "/api/controlled-agent/draft", "consumer-token", `{}`)
 	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "publisher") {
 		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
@@ -1098,8 +1098,9 @@ func TestKBaseHTTPHandlerSetsSubscriptionEnabledWithoutReplacingCursor(t *testin
 
 func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store:     NewBookKnowledgeStore(t.TempDir()),
-		AuthToken: "secret-token",
+		Store:                NewBookKnowledgeStore(t.TempDir()),
+		AuthToken:            "secret-token",
+		BrowserSessionSecret: "browser-secret",
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
@@ -1113,7 +1114,7 @@ func TestKBaseHTTPHandlerBrowserSessionTokenRequiresTrustedHeader(t *testing.T) 
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/browser/session-token", nil)
-	req.Header.Set("X-KBase-Browser-Session", "1")
+	req.Header.Set("X-KBase-Browser-Session", "browser-secret")
 	resp = httptest.NewRecorder()
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -1808,7 +1809,7 @@ func requestJSONKBase(handler http.Handler, method, path, token, body string) *h
 func requestJSONKBaseBrowser(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-KBase-Browser-Session", "1")
+	req.Header.Set("X-KBase-Browser-Session", "browser-secret")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
