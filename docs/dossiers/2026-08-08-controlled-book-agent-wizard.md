@@ -137,3 +137,50 @@ Decision: PASS.
 
 No Gate may advance with a failed quality, evaluation, privacy, deployment, or
 online acceptance check.
+
+## Post-deployment hardening follow-up (2026-08-08)
+
+### Scope and implementation
+
+- The Dedao ebook detail page now derives its Agent lifecycle from published
+  Knowledge Releases and published Agent Packages. It distinguishes loading,
+  available, ready-to-create, blocked, and lookup-failure states instead of
+  presenting every matched book as pending.
+- The desktop frontend moved to Vue 3.5, Vue Router 5, Pinia 4, Element Plus
+  2.14, Vite 8, and their coordinated stable plugins. TypeScript remains on
+  5.9 because TypeScript 7 no longer exposes `lib/tsc`, which vue-tsc 3 still
+  requires.
+- The build-only Node.js engine range is `^22.18.0 || >=24.11.0`, inherited
+  from Vue Router 5's Babel 8 dependency. The deployed Go service and static
+  Web assets do not require Node.js at runtime.
+- Route and template icons use a bounded Element Plus registry. The globally
+  loaded but unused Volcengine player SDK and stylesheet were removed from the
+  HTML entry; their source files remain available for a future page-local
+  integration.
+
+### Test Gate (G3)
+
+Decision: PASS locally.
+
+- A clean npm install, vue-tsc check, Vite production build, all desktop
+  frontend smoke checks, JavaScript syntax check, and all production Web smoke
+  checks exited successfully.
+- Both production-only and full npm audits reported zero vulnerabilities.
+- The built JavaScript entry is 981,505 bytes, 82.2 percent below the
+  5,499,050-byte baseline and below the 2,000,000-byte gate.
+- `wails build --clean`, `go vet ./...`, and `go test ./... -timeout=300s`
+  exited successfully. The slowest package, `backend/app`, completed in
+  123.591 seconds.
+- The generated system-map drift check, privacy smoke, and whitespace check
+  passed after discarding Wails 2.9.1 binding regeneration noise. The tracked
+  frontend package checksum was refreshed to match the upgraded manifest.
+
+### Review and deployment notes
+
+- The repository-owned changes do not alter proxy or Nginx behavior.
+- The existing duplicate-listener warning originates outside this repository:
+  `health.executor.life.conf` is enabled from both `conf.d` and
+  `sites-enabled`, while `langbridge-proxy.conf` also declares the same IP
+  listener. Those files are explicitly out of scope and were not modified.
+- G4 review, the next deployment health check, and fresh online acceptance are
+  recorded only after their respective gates complete.
