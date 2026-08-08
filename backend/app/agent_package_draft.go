@@ -103,7 +103,7 @@ func BuildControlledAgentPackageDraft(store *BookKnowledgeStore, request Control
 			Strategy: "lexical", AllowedSourceTypes: []string{sourceType}, RequireCitations: true, MaxContextChunks: maxContextChunks,
 		},
 		ModelPolicy: AgentPackageModelPolicy{
-			PreferredCapability: capability, Fallbacks: []string{"qwen-plus"}, MaxCostUSD: maxCostUSD, TimeoutMS: timeoutMS,
+			PreferredCapability: capability, Fallbacks: []string{"qwen3.7-max"}, MaxCostUSD: maxCostUSD, TimeoutMS: timeoutMS,
 		},
 		PromptProfiles: []AgentPackagePromptProfile{{ProfileID: "grounded-answer.v1", OutputSchema: "grounded-answer.v1"}},
 		ToolPolicy:     AgentPackageToolPolicy{Tools: tools},

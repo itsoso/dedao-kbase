@@ -32,6 +32,9 @@ func TestBuildControlledAgentPackageDraftPinsReleaseAndPassesContract(t *testing
 	if draft.Package.RetrievalPolicy.Strategy != "lexical" || !draft.Package.RetrievalPolicy.RequireCitations {
 		t.Fatalf("retrieval policy = %#v", draft.Package.RetrievalPolicy)
 	}
+	if got := draft.Package.ModelPolicy.Fallbacks; len(got) != 1 || got[0] != "qwen3.7-max" {
+		t.Fatalf("model fallbacks = %#v", got)
+	}
 	wantCapabilities := []string{"reader", "search", "grounded_chat", "evidence"}
 	if !equalStringSlices(draft.Package.UIManifest.Capabilities, wantCapabilities) {
 		t.Fatalf("capabilities = %#v", draft.Package.UIManifest.Capabilities)
