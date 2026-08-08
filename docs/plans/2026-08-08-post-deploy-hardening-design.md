@@ -22,8 +22,9 @@ not mutate non-KBase server configuration.
   revertible commits.
 - Upgrade the coordinated frontend stack to its current stable major versions,
   rather than applying only patch-level security updates.
-- Require Node.js 20.19 or newer. CI remains on Node.js 22; the current Linux
-  build host already satisfies the requirement.
+- Require Node.js `^22.18.0 || >=24.11.0`, the strictest engine range in the
+  coordinated dependency graph. This is a build-only requirement; the shipped
+  application remains Go plus static assets and does not need Node.js at runtime.
 - Reuse the existing knowledge-release and Agent Package APIs. Do not add a new
   backend route solely for the ebook lifecycle display.
 - Measure the upgraded build before introducing manual vendor chunks. Remove
@@ -57,7 +58,8 @@ The target set, based on stable registry tags on 2026-08-08, is:
 
 - Vue 3.5, Vue Router 5, Pinia 4, and pinia-plugin-persistedstate 4;
 - Vite 8 and `@vitejs/plugin-vue` 6;
-- TypeScript 7 and vue-tsc 3;
+- TypeScript 5.9 and vue-tsc 3. TypeScript 7 is the registry latest, but is not
+  yet compatible with vue-tsc 3 because it no longer exports `lib/tsc`;
 - Element Plus 2.14 and `@element-plus/icons-vue` 2.3;
 - current stable releases of the existing Vite plugins, Sass, Marked,
   Highlight.js, and Video.js.

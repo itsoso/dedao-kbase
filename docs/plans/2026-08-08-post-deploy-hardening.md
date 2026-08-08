@@ -73,10 +73,11 @@ fix(web): synchronize ebook agent lifecycle
 
 **Step 1: Write the failing toolchain contract smoke**
 
-Create a Node smoke that reads `package.json` and requires Node `>=20.19.0`,
-Vue 3.5, Vue Router 5, Pinia 4, Vite 8, TypeScript 7, vue-tsc 3, and their
-coordinated current plugins. It must also reject the deprecated Volar packages
-present in the old lockfile.
+Create a Node smoke that reads `package.json` and requires the strictest Node
+engine range in the dependency graph, Vue 3.5, Vue Router 5, Pinia 4, Vite 8,
+the newest TypeScript version supported by vue-tsc 3, and their coordinated
+current plugins. It must also reject the deprecated Volar packages present in
+the old lockfile.
 
 **Step 2: Run the smoke and verify RED**
 
