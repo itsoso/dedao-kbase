@@ -227,6 +227,13 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 	if strings.TrimSpace(pkg.Book.Extractor) == "" {
 		pkg.Book.Extractor = defaultBookKnowledgeExtractor
 	}
+	if strings.TrimSpace(pkg.Book.ContentHash) == "" {
+		contentHash, err := BookKnowledgeContentHash(pkg)
+		if err != nil {
+			return err
+		}
+		pkg.Book.ContentHash = contentHash
+	}
 	bookJSON, err := encodeJSONFile(pkg.Book)
 	if err != nil {
 		return err
@@ -268,6 +275,30 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 		return err
 	}
 	return s.upsertManifestBook(pkg.Book)
+}
+
+func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookKnowledgePackage, error) {
+	pkg, err := s.LoadPackage(bookID)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(pkg.Book.ContentHash) != "" {
+		return nil, fmt.Errorf("book already has content hash")
+	}
+	contentHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range []string{s.BookAnalysisManifestPath(bookID), s.BookQualityReportPath(bookID)} {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("invalidate derived book artifact: %w", err)
+		}
+	}
+	pkg.Book.ContentHash = contentHash
+	if err := s.SavePackage(*pkg); err != nil {
+		return nil, err
+	}
+	return pkg, nil
 }
 
 func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, error) {

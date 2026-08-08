@@ -257,6 +257,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleBookPublish(w, r, bookID)
 		return
 	}
+	if bookID, ok := bookNestedPathID(r.URL.Path, "repair-content-hash"); ok {
+		h.handleBookContentHashRepair(w, r, bookID)
+		return
+	}
 	if releaseID, ok := knowledgeReleaseFeedbackPathID(r.URL.Path); ok {
 		h.handleKnowledgeFeedback(w, r, releaseID)
 		return
@@ -1319,6 +1323,40 @@ func (h *kbaseHTTPHandler) handleBookPublish(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, release)
+}
+
+func (h *kbaseHTTPHandler) handleBookContentHashRepair(w http.ResponseWriter, r *http.Request, bookID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var request struct {
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4<<10)).Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if !request.Confirm {
+		writeHTTPError(w, http.StatusBadRequest, "explicit confirmation is required")
+		return
+	}
+	pkg, err := h.store.RepairMissingBookContentHash(bookID)
+	if err != nil {
+		if os.IsNotExist(err) || strings.Contains(err.Error(), "book not found") {
+			writeHTTPError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if strings.Contains(err.Error(), "already has content hash") {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"book_id": pkg.Book.BookID, "content_hash": pkg.Book.ContentHash, "repaired": true,
+	})
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *http.Request) {

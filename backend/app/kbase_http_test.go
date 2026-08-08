@@ -466,6 +466,46 @@ func TestKBaseHTTPHandlerKnowledgeQualityAndRelease(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerRepairsLegacyMissingContentHash(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.ContentHash = "legacy-placeholder"
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	pkg.Book.ContentHash = ""
+	bookJSON, err := encodeJSONFile(pkg.Book)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(store.BookManifestPath(pkg.Book.BookID), bookJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveAnalysisManifest(BookAnalysisManifest{BookID: pkg.Book.BookID, Status: BookAnalysisReady, ContentHash: ""}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveBookQualityReport(BookQualityReport{BookID: pkg.Book.BookID, Decision: BookQualityReject}); err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	response := requestJSONKBase(handler, http.MethodPost, "/api/books/"+pkg.Book.BookID+"/repair-content-hash", "secret-token", `{"confirm":true}`)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"repaired":true`) || !strings.Contains(response.Body.String(), `"content_hash":"sha256:`) {
+		t.Fatalf("repair status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, err := store.LoadAnalysisManifest(pkg.Book.BookID); !os.IsNotExist(err) {
+		t.Fatalf("analysis artifact was not invalidated: %v", err)
+	}
+	if _, err := store.LoadBookQualityReport(pkg.Book.BookID); !os.IsNotExist(err) {
+		t.Fatalf("quality artifact was not invalidated: %v", err)
+	}
+
+	replay := requestJSONKBase(handler, http.MethodPost, "/api/books/"+pkg.Book.BookID+"/repair-content-hash", "secret-token", `{"confirm":true}`)
+	if replay.Code != http.StatusConflict || !strings.Contains(replay.Body.String(), "already has content hash") {
+		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerKnowledgeReleaseRejectsQuarantinedAnalysis(t *testing.T) {
 	store := qualityTestStore(t)
 	manifest, _ := store.LoadAnalysisManifest("42")

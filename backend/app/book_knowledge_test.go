@@ -54,6 +54,22 @@ func TestBookKnowledgeContentHashIsStableAndTracksDurableContent(t *testing.T) {
 	}
 }
 
+func TestSavePackageAssignsMissingContentHash(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.ContentHash = ""
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatalf("SavePackage returned error: %v", err)
+	}
+	loaded, err := store.LoadPackage(pkg.Book.BookID)
+	if err != nil {
+		t.Fatalf("LoadPackage returned error: %v", err)
+	}
+	if !strings.HasPrefix(loaded.Book.ContentHash, "sha256:") {
+		t.Fatalf("content hash = %q", loaded.Book.ContentHash)
+	}
+}
+
 func TestBookKnowledgeStorePaths(t *testing.T) {
 	root := t.TempDir()
 	store := NewBookKnowledgeStore(root)
