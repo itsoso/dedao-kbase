@@ -7930,6 +7930,15 @@ body.has-proofroom-modal {
   .agent-console__technical > dl > div {
     border-right: 0;
   }
+
+  .job-center__toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .job-center__toolbar > .button {
+    width: 100%;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

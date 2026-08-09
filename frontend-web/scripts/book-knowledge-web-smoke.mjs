@@ -269,6 +269,14 @@ for (const marker of [
 }
 assert.ok(html.includes("20260809-book-job-recovery"), "book job recovery should bust cached app assets");
 assert.doesNotMatch(js, />\s*job execution failed\s*</i, "job center must not render raw worker failure copy");
+const mobileJobStart = css.lastIndexOf("@media (max-width: 760px)");
+const mobileJobEnd = css.indexOf("@media (prefers-reduced-motion: reduce)", mobileJobStart);
+const mobileJobSource = mobileJobStart >= 0 ? css.slice(mobileJobStart, mobileJobEnd >= 0 ? mobileJobEnd : undefined) : "";
+const mobileJobToolbar = mobileJobSource.match(/\.job-center__toolbar\s*\{([\s\S]*?)\}/)?.[1] || "";
+const mobileJobRefresh = mobileJobSource.match(/\.job-center__toolbar\s*>\s*\.button\s*\{([\s\S]*?)\}/)?.[1] || "";
+assert.ok(mobileJobToolbar.includes("flex-direction: column"), "mobile job toolbar should stack its copy and action");
+assert.ok(mobileJobToolbar.includes("align-items: stretch"), "mobile job toolbar should give its action readable width");
+assert.ok(mobileJobRefresh.includes("width: 100%"), "mobile refresh action should fill the toolbar width");
 
 for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]) {
   assert.ok(
