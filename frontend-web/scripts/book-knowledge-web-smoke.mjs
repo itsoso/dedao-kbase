@@ -238,7 +238,27 @@ for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz
 }
 assert.ok(js.includes("ui_manifest?.capabilities"), "Book App capabilities should come from ui_manifest");
 assert.ok(js.includes("功能已声明，但运行时尚未接通"), "declared unavailable capabilities should explain runtime status");
-assert.ok(js.includes("Evaluation passed"), "Book App should expose evaluation status");
+for (const marker of [
+  "renderAgentPackageContract",
+  "renderAgentReadingApp",
+  "包契约总览",
+  "阅读研究台",
+  "推理模型",
+  "关键词检索",
+  "人工复核",
+]) {
+  assert.ok(js.includes(marker), `Chinese Agent pages should include ${marker}`);
+}
+for (const staleLabel of [
+  "PACKAGE CONTRACT",
+  "SHARED BOOK APP",
+  ">Reader<",
+  ">Grounded search<",
+  ">Open the book<",
+  "Evaluation passed",
+]) {
+  assert.ok(!js.includes(staleLabel), `Chinese Agent pages should remove ${staleLabel}`);
+}
 assert.ok(css.includes("@media (max-width: 760px)"), "Book App should include a narrow mobile layout");
 const metricStripSource = css.match(/\.book-agent__manifest \.book-agent__metric-strip \{([\s\S]*?)\n\}/)?.[1] || "";
 assert.ok(metricStripSource.includes("display: grid"), "Agent metrics should use a wrapping grid instead of one rigid flex row");
