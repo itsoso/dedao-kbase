@@ -6,18 +6,18 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 	"github.com/yann0917/dedao-gui/backend/services"
 )
 
@@ -39,9 +39,32 @@ const (
 	BookKnowledgeJobStatusInterrupted BookKnowledgeJobStatus = "interrupted"
 )
 
-const BookKnowledgeJobFailureWorkerInterrupted = "worker_interrupted"
+const (
+	BookKnowledgeJobFailureAuthenticationRequired = "authentication_required"
+	BookKnowledgeJobFailureDownloadFailed         = "download_failed"
+	BookKnowledgeJobFailureKnowledgeBuildFailed   = "knowledge_build_failed"
+	BookKnowledgeJobFailureWorkerInterrupted      = "worker_interrupted"
+	BookKnowledgeJobFailureSourceChanged          = "source_changed"
+	BookKnowledgeJobFailureUnknownFailure         = "unknown_failure"
+)
 
 const bookKnowledgeJobInterruptedMessage = "job execution interrupted"
+
+var (
+	ErrBookKnowledgeJobConflict     = errors.New("book knowledge job conflict")
+	ErrBookKnowledgeJobLeaseLost    = errors.New("book knowledge job lease lost")
+	ErrBookKnowledgeJobInvalidState = errors.New("book knowledge job invalid state")
+	ErrBookKnowledgeJobNotFound     = errors.New("job not found")
+)
+
+var bookKnowledgeJobFailureMessages = map[string]string{
+	BookKnowledgeJobFailureAuthenticationRequired: "登录已失效，请重新登录",
+	BookKnowledgeJobFailureDownloadFailed:         "电子书下载失败，可以重新执行",
+	BookKnowledgeJobFailureKnowledgeBuildFailed:   "下载完成，但知识包生成失败",
+	BookKnowledgeJobFailureWorkerInterrupted:      "Worker 升级或异常退出，任务已中断",
+	BookKnowledgeJobFailureSourceChanged:          "任务参数或书籍权限已经变化",
+	BookKnowledgeJobFailureUnknownFailure:         "任务执行失败，请查看诊断并重试",
+}
 
 const (
 	legacyBookKnowledgeJobPathBoundaryDelimiters = "\"'`()[]{}=,:;<>"
@@ -84,8 +107,6 @@ type BookKnowledgeJobRequest struct {
 type bookKnowledgeJobsFile struct {
 	Jobs []BookKnowledgeJob `json:"jobs"`
 }
-
-var bookKnowledgeJobsMu sync.Mutex
 
 var (
 	runDedaoEbookDownloadJob  = executeDedaoEbookDownloadJob
@@ -146,8 +167,6 @@ func (s *BookKnowledgeStore) CreateBookKnowledgeJob(request BookKnowledgeJobRequ
 		Logs: []string{"queued"}, Stage: "queued", CreatedAt: now, UpdatedAt: now,
 	}
 
-	bookKnowledgeJobsMu.Lock()
-	defer bookKnowledgeJobsMu.Unlock()
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
 		return BookKnowledgeJob{}, err
@@ -178,8 +197,6 @@ func (s *BookKnowledgeStore) ListBookKnowledgeJobs(limit int) ([]BookKnowledgeJo
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	bookKnowledgeJobsMu.Lock()
-	defer bookKnowledgeJobsMu.Unlock()
 	db, err := s.openBookJobsDB()
 	if err != nil {
 		return nil, err
@@ -212,8 +229,6 @@ func (s *BookKnowledgeStore) LoadBookKnowledgeJob(jobID string) (BookKnowledgeJo
 	if jobID == "" {
 		return BookKnowledgeJob{}, fmt.Errorf("job_id is required")
 	}
-	bookKnowledgeJobsMu.Lock()
-	defer bookKnowledgeJobsMu.Unlock()
 	db, err := s.openBookJobsDB()
 	if err != nil {
 		return BookKnowledgeJob{}, err
@@ -221,9 +236,422 @@ func (s *BookKnowledgeStore) LoadBookKnowledgeJob(jobID string) (BookKnowledgeJo
 	defer db.Close()
 	job, err := scanBookKnowledgeJob(db.QueryRow(bookKnowledgeJobSelect+` WHERE job_id = ?`, jobID))
 	if err == sql.ErrNoRows {
-		return BookKnowledgeJob{}, fmt.Errorf("job not found")
+		return BookKnowledgeJob{}, ErrBookKnowledgeJobNotFound
 	}
 	return job, err
+}
+
+func (s *BookKnowledgeStore) ClaimNextBookKnowledgeJob(workerID string, lease time.Duration) (*BookKnowledgeJob, error) {
+	if s == nil {
+		s = DefaultBookKnowledgeStore()
+	}
+	if strings.TrimSpace(workerID) == "" {
+		return nil, fmt.Errorf("%w: worker_id is required", ErrBookKnowledgeJobInvalidState)
+	}
+	if lease <= 0 {
+		return nil, fmt.Errorf("%w: lease must be positive", ErrBookKnowledgeJobInvalidState)
+	}
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	job, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+
+		` WHERE status = ? ORDER BY created_at ASC, job_id ASC LIMIT 1`, BookKnowledgeJobStatusQueued))
+	if err == sql.ErrNoRows {
+		tx.Rollback()
+		return nil, nil
+	}
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	now := time.Now().UTC()
+	timestamp := now.Format(time.RFC3339Nano)
+	job.Status = BookKnowledgeJobStatusRunning
+	job.Stage = defaultBookKnowledgeJobStage(job.Status)
+	job.Error = ""
+	job.FailureCode = ""
+	job.Result = nil
+	job.LeaseOwner = workerID
+	job.LeaseExpiresAt = now.Add(lease).Format(time.RFC3339Nano)
+	job.StartedAt = timestamp
+	job.FinishedAt = ""
+	job.UpdatedAt = timestamp
+	job.Logs = append(job.Logs, "running")
+	if err := updateBookKnowledgeJobRowFromStatus(tx, job, BookKnowledgeJobStatusQueued); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("%w: claim job %q", ErrBookKnowledgeJobConflict, job.ID)
+	}
+	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+func (s *BookKnowledgeStore) RenewBookKnowledgeJobLease(jobID, workerID string, lease time.Duration) (BookKnowledgeJob, error) {
+	if lease <= 0 {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: lease must be positive", ErrBookKnowledgeJobInvalidState)
+	}
+	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+		currentExpiry, err := time.Parse(time.RFC3339Nano, job.LeaseExpiresAt)
+		if err != nil {
+			return fmt.Errorf("%w: invalid current lease", ErrBookKnowledgeJobLeaseLost)
+		}
+		newExpiry := now.Add(lease)
+		if !newExpiry.After(currentExpiry) {
+			return fmt.Errorf("%w: renewal must extend lease", ErrBookKnowledgeJobInvalidState)
+		}
+		job.LeaseExpiresAt = newExpiry.Format(time.RFC3339Nano)
+		job.UpdatedAt = now.Format(time.RFC3339Nano)
+		job.Logs = append(job.Logs, "lease renewed")
+		return nil
+	})
+}
+
+func (s *BookKnowledgeStore) UpdateBookKnowledgeJobStage(jobID, workerID, stage string) (BookKnowledgeJob, error) {
+	stage = strings.TrimSpace(stage)
+	if stage != "downloading" && stage != "building_knowledge" {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: unsupported job stage %q", ErrBookKnowledgeJobInvalidState, stage)
+	}
+	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+		job.Stage = stage
+		job.UpdatedAt = now.Format(time.RFC3339Nano)
+		job.Logs = append(job.Logs, stage)
+		return nil
+	})
+}
+
+func (s *BookKnowledgeStore) CompleteBookKnowledgeJob(jobID, workerID string, result map[string]any) (BookKnowledgeJob, error) {
+	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+		timestamp := now.Format(time.RFC3339Nano)
+		job.Status = BookKnowledgeJobStatusSucceeded
+		job.Stage = "completed"
+		job.Result = safeBookKnowledgeJobResult(result)
+		job.Error = ""
+		job.FailureCode = ""
+		job.LeaseOwner = ""
+		job.LeaseExpiresAt = ""
+		job.FinishedAt = timestamp
+		job.UpdatedAt = timestamp
+		job.Logs = append(job.Logs, "succeeded")
+		return nil
+	})
+}
+
+func (s *BookKnowledgeStore) FailBookKnowledgeJob(jobID, workerID, code string) (BookKnowledgeJob, error) {
+	code = strings.TrimSpace(code)
+	message, ok := bookKnowledgeJobFailureMessages[code]
+	if !ok {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: unsupported failure code %q", ErrBookKnowledgeJobInvalidState, code)
+	}
+	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+		timestamp := now.Format(time.RFC3339Nano)
+		job.Status = BookKnowledgeJobStatusFailed
+		job.Stage = "failed"
+		job.Result = nil
+		job.FailureCode = code
+		job.Error = message
+		job.LeaseOwner = ""
+		job.LeaseExpiresAt = ""
+		job.FinishedAt = timestamp
+		job.UpdatedAt = timestamp
+		job.Logs = append(job.Logs, "failed")
+		return nil
+	})
+}
+
+func (s *BookKnowledgeStore) InterruptBookKnowledgeJob(jobID, workerID string) (BookKnowledgeJob, error) {
+	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+		interruptBookKnowledgeJob(job, now)
+		return nil
+	})
+}
+
+func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobs() (int, error) {
+	if s == nil {
+		s = DefaultBookKnowledgeStore()
+	}
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	rows, err := tx.Query(bookKnowledgeJobSelect+` WHERE status = ? ORDER BY created_at ASC, job_id ASC`, BookKnowledgeJobStatusRunning)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	jobs := make([]BookKnowledgeJob, 0)
+	for rows.Next() {
+		job, scanErr := scanBookKnowledgeJob(rows)
+		if scanErr != nil {
+			rows.Close()
+			tx.Rollback()
+			return 0, scanErr
+		}
+		jobs = append(jobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		tx.Rollback()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	now := time.Now().UTC()
+	count := 0
+	for _, job := range jobs {
+		expiry, parseErr := time.Parse(time.RFC3339Nano, job.LeaseExpiresAt)
+		if job.LeaseExpiresAt != "" && parseErr == nil && expiry.After(now) {
+			continue
+		}
+		interruptBookKnowledgeJob(&job, now)
+		if err := updateBookKnowledgeJobRowFromStatus(tx, job, BookKnowledgeJobStatusRunning); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		count++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *BookKnowledgeStore) RetryBookKnowledgeJob(jobID string) (BookKnowledgeJob, error) {
+	if s == nil {
+		s = DefaultBookKnowledgeStore()
+	}
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job_id is required", ErrBookKnowledgeJobInvalidState)
+	}
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	original, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+` WHERE job_id = ?`, jobID))
+	if err == sql.ErrNoRows {
+		tx.Rollback()
+		return BookKnowledgeJob{}, ErrBookKnowledgeJobNotFound
+	}
+	if err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if original.Status != BookKnowledgeJobStatusFailed && original.Status != BookKnowledgeJobStatusInterrupted {
+		tx.Rollback()
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q cannot retry from status %s", ErrBookKnowledgeJobInvalidState, original.ID, original.Status)
+	}
+	var activeRetryID string
+	err = tx.QueryRow(`
+		SELECT job_id FROM book_jobs
+		WHERE retry_of = ? AND status IN (?, ?)
+		ORDER BY created_at ASC, job_id ASC LIMIT 1`,
+		original.ID, BookKnowledgeJobStatusQueued, BookKnowledgeJobStatusRunning,
+	).Scan(&activeRetryID)
+	if err == nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, fmt.Errorf("%w: active retry %q already exists", ErrBookKnowledgeJobConflict, activeRetryID)
+	}
+	if err != sql.ErrNoRows {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	retry := BookKnowledgeJob{
+		ID: newBookKnowledgeJobID(), Type: original.Type, Status: BookKnowledgeJobStatusQueued,
+		EbookID: original.EbookID, EbookEnID: original.EbookEnID, DownloadType: original.DownloadType,
+		RetryOf: original.ID, Stage: "queued", Logs: []string{"queued"}, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := insertBookKnowledgeJob(tx, retry, false); err != nil {
+		tx.Rollback()
+		if isBookKnowledgeJobSQLiteConstraint(err) {
+			return BookKnowledgeJob{}, fmt.Errorf("%w: active retry already exists", ErrBookKnowledgeJobConflict)
+		}
+		return BookKnowledgeJob{}, err
+	}
+	if err := appendBookKnowledgeJobEvent(tx, retry); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		if isBookKnowledgeJobSQLiteConstraint(err) {
+			return BookKnowledgeJob{}, fmt.Errorf("%w: active retry already exists", ErrBookKnowledgeJobConflict)
+		}
+		return BookKnowledgeJob{}, err
+	}
+	return retry, nil
+}
+
+func (s *BookKnowledgeStore) ExportLegacyBookKnowledgeJobs(path string) error {
+	if s == nil {
+		s = DefaultBookKnowledgeStore()
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("export path is required")
+	}
+	db, err := s.openBookJobsDB()
+	if err != nil {
+		return err
+	}
+	rows, err := db.Query(bookKnowledgeJobSelect + ` ORDER BY created_at ASC, job_id ASC`)
+	if err != nil {
+		db.Close()
+		return err
+	}
+	legacy := bookKnowledgeJobsFile{Jobs: make([]BookKnowledgeJob, 0)}
+	for rows.Next() {
+		job, scanErr := scanBookKnowledgeJob(rows)
+		if scanErr != nil {
+			rows.Close()
+			db.Close()
+			return scanErr
+		}
+		legacy.Jobs = append(legacy.Jobs, legacyBookKnowledgeJobForExport(job))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		db.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		db.Close()
+		return err
+	}
+	if err := db.Close(); err != nil {
+		return err
+	}
+	payload, err := json.MarshalIndent(legacy, "", "  ")
+	if err != nil {
+		return err
+	}
+	payload = append(payload, '\n')
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(directory, ".book-jobs-export-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			temporary.Close()
+			os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	committed = true
+	directoryHandle, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	defer directoryHandle.Close()
+	return directoryHandle.Sync()
+}
+
+func (s *BookKnowledgeStore) updateOwnedRunningBookKnowledgeJob(
+	jobID string,
+	workerID string,
+	mutate func(*BookKnowledgeJob, time.Time) error,
+) (BookKnowledgeJob, error) {
+	if s == nil {
+		s = DefaultBookKnowledgeStore()
+	}
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job_id is required", ErrBookKnowledgeJobInvalidState)
+	}
+	if strings.TrimSpace(workerID) == "" {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: worker_id is required", ErrBookKnowledgeJobInvalidState)
+	}
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	job, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+` WHERE job_id = ?`, jobID))
+	if err == sql.ErrNoRows {
+		tx.Rollback()
+		return BookKnowledgeJob{}, ErrBookKnowledgeJobNotFound
+	}
+	if err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if job.Status != BookKnowledgeJobStatusRunning {
+		tx.Rollback()
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q is %s", ErrBookKnowledgeJobInvalidState, job.ID, job.Status)
+	}
+	now := time.Now().UTC()
+	expiry, err := time.Parse(time.RFC3339Nano, job.LeaseExpiresAt)
+	if job.LeaseOwner != workerID || err != nil || !expiry.After(now) {
+		tx.Rollback()
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q is not leased by worker", ErrBookKnowledgeJobLeaseLost, job.ID)
+	}
+	original := job
+	if err := mutate(&job, now); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := updateOwnedBookKnowledgeJobRow(tx, job, original); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	return job, nil
 }
 
 func (s *BookKnowledgeStore) FailInterruptedBookKnowledgeJobs(reason string) (int, error) {
@@ -235,8 +663,6 @@ func (s *BookKnowledgeStore) FailInterruptedBookKnowledgeJobs(reason string) (in
 		reason = "interrupted"
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	bookKnowledgeJobsMu.Lock()
-	defer bookKnowledgeJobsMu.Unlock()
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
 		return 0, err
@@ -322,8 +748,6 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJobWithService(jobID string, servic
 }
 
 func (s *BookKnowledgeStore) startBookKnowledgeJob(jobID string) (BookKnowledgeJob, error) {
-	bookKnowledgeJobsMu.Lock()
-	defer bookKnowledgeJobsMu.Unlock()
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
 		return BookKnowledgeJob{}, err
@@ -398,8 +822,6 @@ func (s *BookKnowledgeStore) executeBookKnowledgeJob(ctx context.Context, job Bo
 }
 
 func (s *BookKnowledgeStore) updateBookKnowledgeJob(jobID string, mutate func(BookKnowledgeJob) BookKnowledgeJob) (BookKnowledgeJob, error) {
-	bookKnowledgeJobsMu.Lock()
-	defer bookKnowledgeJobsMu.Unlock()
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
 		return BookKnowledgeJob{}, err
@@ -516,6 +938,9 @@ const bookKnowledgeJobsSchema = `
 	);
 	CREATE INDEX IF NOT EXISTS idx_book_jobs_created
 		ON book_jobs(created_at DESC, job_id DESC);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_book_jobs_one_active_retry
+		ON book_jobs(retry_of)
+		WHERE retry_of IS NOT NULL AND retry_of <> '' AND status IN ('queued', 'running');
 	CREATE TABLE IF NOT EXISTS book_job_events (
 		event_id INTEGER PRIMARY KEY AUTOINCREMENT,
 		job_id TEXT NOT NULL,
@@ -658,6 +1083,56 @@ func updateBookKnowledgeJobRowFromStatus(tx *sql.Tx, job BookKnowledgeJob, expec
 		return fmt.Errorf("job not found")
 	}
 	return nil
+}
+
+func updateOwnedBookKnowledgeJobRow(tx *sql.Tx, job, original BookKnowledgeJob) error {
+	resultJSON, logsJSON, err := marshalBookKnowledgeJobJSON(job)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(`
+		UPDATE book_jobs SET
+			job_type = ?, status = ?, ebook_id = ?, ebook_enid = ?, download_type = ?,
+			result_json = ?, logs_json = ?, retry_of = NULLIF(?, ''), stage = ?, failure_code = ?,
+			lease_owner = ?, lease_expires_at = ?, failure_message = ?, created_at = ?,
+			updated_at = ?, started_at = ?, finished_at = ?
+		WHERE job_id = ? AND status = ? AND lease_owner = ? AND lease_expires_at = ?`,
+		job.Type, job.Status, job.EbookID, job.EbookEnID, job.DownloadType,
+		resultJSON, logsJSON, job.RetryOf, bookKnowledgeJobStage(job), job.FailureCode,
+		job.LeaseOwner, job.LeaseExpiresAt, job.Error, job.CreatedAt, job.UpdatedAt,
+		job.StartedAt, job.FinishedAt, job.ID, BookKnowledgeJobStatusRunning,
+		original.LeaseOwner, original.LeaseExpiresAt,
+	)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("%w: job %q lease changed", ErrBookKnowledgeJobLeaseLost, job.ID)
+	}
+	return nil
+}
+
+func interruptBookKnowledgeJob(job *BookKnowledgeJob, now time.Time) {
+	timestamp := now.UTC().Format(time.RFC3339Nano)
+	job.Status = BookKnowledgeJobStatusInterrupted
+	job.Stage = "interrupted"
+	job.Result = nil
+	job.FailureCode = BookKnowledgeJobFailureWorkerInterrupted
+	job.Error = bookKnowledgeJobFailureMessages[BookKnowledgeJobFailureWorkerInterrupted]
+	job.LeaseOwner = ""
+	job.LeaseExpiresAt = ""
+	job.FinishedAt = timestamp
+	job.UpdatedAt = timestamp
+	job.Logs = append(job.Logs, "interrupted")
+}
+
+func isBookKnowledgeJobSQLiteConstraint(err error) bool {
+	var sqliteErr sqlite3.Error
+	return errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrConstraint
 }
 
 func appendBookKnowledgeJobEvent(tx *sql.Tx, job BookKnowledgeJob) error {
@@ -803,6 +1278,40 @@ func normalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) BookKnowledgeJob {
 	}
 	job.Error = ""
 	return job
+}
+
+func legacyBookKnowledgeJobForExport(job BookKnowledgeJob) BookKnowledgeJob {
+	legacyStatus := job.Status
+	logs := safeLegacyBookKnowledgeJobLogs(job.Status, job.Logs)
+	errorMessage := ""
+	if job.Status == BookKnowledgeJobStatusInterrupted {
+		legacyStatus = BookKnowledgeJobStatusFailed
+		errorMessage = bookKnowledgeJobInterruptedMessage
+		legacyLogs := make([]string, 0, len(logs)+1)
+		for _, entry := range logs {
+			if entry != "interrupted" && entry != "failed" && entry != "failed: interrupted" {
+				legacyLogs = append(legacyLogs, entry)
+			}
+		}
+		logs = append(legacyLogs, "failed: interrupted")
+	} else if job.Status == BookKnowledgeJobStatusFailed {
+		errorMessage = sanitizeBookKnowledgeJobError(job.Error)
+	}
+	return BookKnowledgeJob{
+		ID:           job.ID,
+		Type:         job.Type,
+		Status:       legacyStatus,
+		EbookID:      job.EbookID,
+		EbookEnID:    job.EbookEnID,
+		DownloadType: job.DownloadType,
+		Result:       safeLegacyBookKnowledgeJobResult(job, job.Result),
+		Error:        errorMessage,
+		Logs:         logs,
+		CreatedAt:    job.CreatedAt,
+		UpdatedAt:    job.UpdatedAt,
+		StartedAt:    job.StartedAt,
+		FinishedAt:   job.FinishedAt,
+	}
 }
 
 func legacyBookKnowledgeJobWasInterrupted(job BookKnowledgeJob) bool {

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -499,6 +500,15 @@ func TestBookKnowledgeJobsSQLiteSchema(t *testing.T) {
 			t.Fatalf("table %q count = %d, want 1", table, count)
 		}
 	}
+	var activeRetryIndexSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_book_jobs_one_active_retry'`).Scan(&activeRetryIndexSQL); err != nil {
+		t.Fatalf("read active retry index: %v", err)
+	}
+	for _, clause := range []string{"UNIQUE INDEX", "retry_of", "status IN ('queued', 'running')"} {
+		if !strings.Contains(activeRetryIndexSQL, clause) {
+			t.Fatalf("active retry index = %q, want clause %q", activeRetryIndexSQL, clause)
+		}
+	}
 	var marker string
 	if err := db.QueryRow(`SELECT value FROM book_job_meta WHERE key = ?`, bookKnowledgeLegacyJobsImportedV1).Scan(&marker); err != nil {
 		t.Fatalf("read migration marker: %v", err)
@@ -973,6 +983,723 @@ func TestBookKnowledgeStoreFailsInterruptedQueuedAndRunningJobs(t *testing.T) {
 			t.Fatalf("recovered job = %#v, err=%v", job, loadErr)
 		}
 	}
+}
+
+func TestBookKnowledgeJobConcurrentClaim(t *testing.T) {
+	root := t.TempDir()
+	firstStore := NewBookKnowledgeStore(root)
+	secondStore := NewBookKnowledgeStore(root)
+	created, err := firstStore.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 101, EbookEnID: "claim-once", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.updateBookKnowledgeJob(created.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.Stage = "failed"
+		job.FailureCode = BookKnowledgeJobFailureUnknownFailure
+		job.Error = "old safe failure"
+		job.Result = map[string]any{"ebook_id": created.EbookID}
+		job.LeaseOwner = "old-worker"
+		job.LeaseExpiresAt = "2026-08-09T00:00:00Z"
+		job.FinishedAt = "2026-08-09T00:00:00Z"
+		return job
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	claims := make(chan *BookKnowledgeJob, 2)
+	errorsFound := make(chan error, 2)
+	claim := func(store *BookKnowledgeStore, workerID string) {
+		<-start
+		job, claimErr := store.ClaimNextBookKnowledgeJob(workerID, time.Minute)
+		claims <- job
+		errorsFound <- claimErr
+	}
+	go claim(firstStore, "worker-one")
+	go claim(secondStore, "worker-two")
+	close(start)
+
+	winners := make([]BookKnowledgeJob, 0, 1)
+	for index := 0; index < 2; index++ {
+		if claimErr := <-errorsFound; claimErr != nil {
+			t.Fatalf("claim error: %v", claimErr)
+		}
+		if claimed := <-claims; claimed != nil {
+			winners = append(winners, *claimed)
+		}
+	}
+	if len(winners) != 1 || winners[0].ID != created.ID {
+		t.Fatalf("winners = %#v, want exactly %q", winners, created.ID)
+	}
+	if winners[0].Status != BookKnowledgeJobStatusRunning || winners[0].LeaseOwner == "" || winners[0].LeaseExpiresAt == "" {
+		t.Fatalf("claimed job = %#v", winners[0])
+	}
+	if winners[0].Stage != "running" || winners[0].FailureCode != "" || winners[0].Error != "" ||
+		winners[0].Result != nil || winners[0].FinishedAt != "" || winners[0].LeaseOwner == "old-worker" {
+		t.Fatalf("claim retained stale state: %#v", winners[0])
+	}
+	if next, nextErr := firstStore.ClaimNextBookKnowledgeJob("worker-three", time.Minute); nextErr != nil || next != nil {
+		t.Fatalf("empty claim = %#v, err=%v", next, nextErr)
+	}
+	second, err := firstStore.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 116, EbookEnID: "second-claim", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next, nextErr := secondStore.ClaimNextBookKnowledgeJob("worker-three", time.Minute); nextErr != nil || next == nil || next.ID != second.ID {
+		t.Fatalf("second claim = %#v, err=%v", next, nextErr)
+	}
+}
+
+func TestBookKnowledgeJobLeaseOwner(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 102, EbookEnID: "lease-owner", DownloadType: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	initialEvents := countBookKnowledgeJobEvents(t, store, job.ID)
+	for _, test := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "empty worker", run: func() error {
+			_, claimErr := store.ClaimNextBookKnowledgeJob("", time.Minute)
+			return claimErr
+		}},
+		{name: "zero lease", run: func() error {
+			_, claimErr := store.ClaimNextBookKnowledgeJob("worker-owner", 0)
+			return claimErr
+		}},
+		{name: "negative lease", run: func() error {
+			_, claimErr := store.ClaimNextBookKnowledgeJob("worker-owner", -time.Second)
+			return claimErr
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.run(); err == nil {
+				t.Fatal("invalid claim succeeded")
+			}
+		})
+	}
+	if got := countBookKnowledgeJobEvents(t, store, job.ID); got != initialEvents {
+		t.Fatalf("events after invalid claims = %d, want %d", got, initialEvents)
+	}
+
+	claimed, err := store.ClaimNextBookKnowledgeJob("worker-owner", 2*time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("claimed = %#v, err=%v", claimed, err)
+	}
+	claimedExpiry, err := time.Parse(time.RFC3339Nano, claimed.LeaseExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedEvents := countBookKnowledgeJobEvents(t, store, job.ID)
+
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.RenewBookKnowledgeJobLease(job.ID, "wrong-worker", time.Minute)
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.UpdateBookKnowledgeJobStage(job.ID, "wrong-worker", "downloading")
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.CompleteBookKnowledgeJob(job.ID, "wrong-worker", map[string]any{"ebook_id": job.EbookID})
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.FailBookKnowledgeJob(job.ID, "wrong-worker", BookKnowledgeJobFailureDownloadFailed)
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.InterruptBookKnowledgeJob(job.ID, "wrong-worker")
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.CompleteBookKnowledgeJob(job.ID, "", map[string]any{"ebook_id": job.EbookID})
+		return operationErr
+	}, ErrBookKnowledgeJobInvalidState)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.UpdateBookKnowledgeJobStage(job.ID, "worker-owner", "arbitrary")
+		return operationErr
+	}, ErrBookKnowledgeJobInvalidState)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.FailBookKnowledgeJob(job.ID, "worker-owner", "private /path failure")
+		return operationErr
+	}, ErrBookKnowledgeJobInvalidState)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, ownedEvents, func() error {
+		_, operationErr := store.RenewBookKnowledgeJobLease(job.ID, "worker-owner", 0)
+		return operationErr
+	}, ErrBookKnowledgeJobInvalidState)
+
+	renewed, err := store.RenewBookKnowledgeJobLease(job.ID, "worker-owner", 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewedExpiry, err := time.Parse(time.RFC3339Nano, renewed.LeaseExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !renewedExpiry.After(claimedExpiry) {
+		t.Fatalf("renewed expiry %s did not extend %s", renewedExpiry, claimedExpiry)
+	}
+	renewedEvents := countBookKnowledgeJobEvents(t, store, job.ID)
+	assertRejectedWithoutBookJobMutation(t, store, job.ID, renewedEvents, func() error {
+		_, operationErr := store.RenewBookKnowledgeJobLease(job.ID, "worker-owner", time.Second)
+		return operationErr
+	}, ErrBookKnowledgeJobInvalidState)
+
+	downloading, err := store.UpdateBookKnowledgeJobStage(job.ID, "worker-owner", "downloading")
+	if err != nil || downloading.Stage != "downloading" || downloading.Status != BookKnowledgeJobStatusRunning {
+		t.Fatalf("downloading = %#v, err=%v", downloading, err)
+	}
+	building, err := store.UpdateBookKnowledgeJobStage(job.ID, "worker-owner", "building_knowledge")
+	if err != nil || building.Stage != "building_knowledge" {
+		t.Fatalf("building = %#v, err=%v", building, err)
+	}
+
+	completed, err := store.CompleteBookKnowledgeJob(job.ID, "worker-owner", map[string]any{
+		"ebook_id": job.EbookID, "title": "安全标题", "path": "/private/export", "token": "secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != BookKnowledgeJobStatusSucceeded || completed.Stage != "completed" || completed.FinishedAt == "" ||
+		completed.LeaseOwner != "" || completed.LeaseExpiresAt != "" || completed.Error != "" || completed.FailureCode != "" {
+		t.Fatalf("completed job = %#v", completed)
+	}
+	if _, ok := completed.Result["path"]; ok {
+		t.Fatalf("completed result leaked path: %#v", completed.Result)
+	}
+	if _, ok := completed.Result["token"]; ok {
+		t.Fatalf("completed result leaked token: %#v", completed.Result)
+	}
+	if _, err := store.FailBookKnowledgeJob(job.ID, "worker-owner", "download_failed"); !errors.Is(err, ErrBookKnowledgeJobInvalidState) {
+		t.Fatalf("terminal fail error = %v", err)
+	}
+
+	failedSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 103, EbookEnID: "structured-failure", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("worker-owner", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	failed, err := store.FailBookKnowledgeJob(failedSource.ID, "worker-owner", "download_failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != BookKnowledgeJobStatusFailed || failed.Stage != "failed" || failed.FailureCode != "download_failed" ||
+		failed.Error != "电子书下载失败，可以重新执行" || failed.Result != nil || failed.LeaseOwner != "" {
+		t.Fatalf("failed job = %#v", failed)
+	}
+
+	interruptedSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 104, EbookEnID: "explicit-interrupt", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("worker-owner", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := store.InterruptBookKnowledgeJob(interruptedSource.ID, "worker-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interrupted.Status != BookKnowledgeJobStatusInterrupted || interrupted.Stage != "interrupted" ||
+		interrupted.FailureCode != BookKnowledgeJobFailureWorkerInterrupted || interrupted.Error != "Worker 升级或异常退出，任务已中断" {
+		t.Fatalf("interrupted job = %#v", interrupted)
+	}
+
+	exactOwnerSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 114, EbookEnID: "exact-owner", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("worker-exact ", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	exactOwnerEvents := countBookKnowledgeJobEvents(t, store, exactOwnerSource.ID)
+	assertRejectedWithoutBookJobMutation(t, store, exactOwnerSource.ID, exactOwnerEvents, func() error {
+		_, operationErr := store.UpdateBookKnowledgeJobStage(exactOwnerSource.ID, "worker-exact", "downloading")
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	if _, err := store.InterruptBookKnowledgeJob(exactOwnerSource.ID, "worker-exact "); err != nil {
+		t.Fatalf("exact lease owner rejected: %v", err)
+	}
+}
+
+func TestBookKnowledgeJobLeaseExpiry(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	expired, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 105, EbookEnID: "expired", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 106, EbookEnID: "still-queued", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("expired-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, expired.ID, time.Now().UTC().Add(-time.Minute))
+	withoutLease, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 115, EbookEnID: "missing-lease", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateBookKnowledgeJob(withoutLease.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.Status = BookKnowledgeJobStatusRunning
+		job.LeaseOwner = ""
+		job.LeaseExpiresAt = ""
+		return job
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	eventsBefore := countBookKnowledgeJobEvents(t, store, expired.ID)
+	assertRejectedWithoutBookJobMutation(t, store, expired.ID, eventsBefore, func() error {
+		_, operationErr := store.RenewBookKnowledgeJobLease(expired.ID, "expired-worker", time.Minute)
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, expired.ID, eventsBefore, func() error {
+		_, operationErr := store.UpdateBookKnowledgeJobStage(expired.ID, "expired-worker", "downloading")
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, expired.ID, eventsBefore, func() error {
+		_, operationErr := store.CompleteBookKnowledgeJob(expired.ID, "expired-worker", map[string]any{"ebook_id": expired.EbookID})
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+	assertRejectedWithoutBookJobMutation(t, store, expired.ID, eventsBefore, func() error {
+		_, operationErr := store.FailBookKnowledgeJob(expired.ID, "expired-worker", "unknown_failure")
+		return operationErr
+	}, ErrBookKnowledgeJobLeaseLost)
+
+	count, err := store.ReconcileExpiredBookKnowledgeJobs()
+	if err != nil || count != 2 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	loadedExpired, err := store.LoadBookKnowledgeJob(expired.ID)
+	if err != nil || loadedExpired.Status != BookKnowledgeJobStatusInterrupted ||
+		loadedExpired.FailureCode != BookKnowledgeJobFailureWorkerInterrupted || loadedExpired.LeaseOwner != "" || loadedExpired.Result != nil {
+		t.Fatalf("expired job = %#v, err=%v", loadedExpired, err)
+	}
+	loadedQueued, err := store.LoadBookKnowledgeJob(queued.ID)
+	if err != nil || loadedQueued.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("queued job = %#v, err=%v", loadedQueued, err)
+	}
+	loadedWithoutLease, err := store.LoadBookKnowledgeJob(withoutLease.ID)
+	if err != nil || loadedWithoutLease.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("missing lease job = %#v, err=%v", loadedWithoutLease, err)
+	}
+	if repeated, err := store.ReconcileExpiredBookKnowledgeJobs(); err != nil || repeated != 0 {
+		t.Fatalf("repeated reconcile count=%d err=%v", repeated, err)
+	}
+}
+
+func TestBookKnowledgeJobStructuredFailureCodes(t *testing.T) {
+	for code, wantMessage := range map[string]string{
+		BookKnowledgeJobFailureAuthenticationRequired: "登录已失效，请重新登录",
+		BookKnowledgeJobFailureDownloadFailed:         "电子书下载失败，可以重新执行",
+		BookKnowledgeJobFailureKnowledgeBuildFailed:   "下载完成，但知识包生成失败",
+		BookKnowledgeJobFailureWorkerInterrupted:      "Worker 升级或异常退出，任务已中断",
+		BookKnowledgeJobFailureSourceChanged:          "任务参数或书籍权限已经变化",
+		BookKnowledgeJobFailureUnknownFailure:         "任务执行失败，请查看诊断并重试",
+	} {
+		t.Run(code, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			created, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+				Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 120, EbookEnID: code, DownloadType: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ClaimNextBookKnowledgeJob("failure-worker", time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			failed, err := store.FailBookKnowledgeJob(created.ID, "failure-worker", code)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if failed.Status != BookKnowledgeJobStatusFailed || failed.FailureCode != code || failed.Error != wantMessage {
+				t.Fatalf("failed = %#v", failed)
+			}
+			var eventMessage string
+			db, err := store.openBookJobsDB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = db.QueryRow(`SELECT message FROM book_job_events WHERE job_id = ? ORDER BY event_id DESC LIMIT 1`, created.ID).Scan(&eventMessage)
+			db.Close()
+			if err != nil || eventMessage != wantMessage {
+				t.Fatalf("event message = %q, err=%v", eventMessage, err)
+			}
+		})
+	}
+}
+
+func TestBookKnowledgeJobQueuedRecovery(t *testing.T) {
+	root := t.TempDir()
+	firstStore := NewBookKnowledgeStore(root)
+	created, err := firstStore.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 107, EbookEnID: "recover-queued", DownloadType: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := NewBookKnowledgeStore(root)
+	claimed, err := reopened.ClaimNextBookKnowledgeJob("replacement-worker", time.Minute)
+	if err != nil || claimed == nil || claimed.ID != created.ID || claimed.Status != BookKnowledgeJobStatusRunning {
+		t.Fatalf("claimed = %#v, err=%v", claimed, err)
+	}
+}
+
+func TestBookKnowledgeJobRetry(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	failedOriginal, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 108, EbookEnID: "retry-failed", DownloadType: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("retry-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	failedOriginal, err = store.FailBookKnowledgeJob(failedOriginal.ID, "retry-worker", "knowledge_build_failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalEvents := countBookKnowledgeJobEvents(t, store, failedOriginal.ID)
+
+	retry, err := store.RetryBookKnowledgeJob(failedOriginal.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retry.ID == failedOriginal.ID || retry.RetryOf != failedOriginal.ID || retry.Status != BookKnowledgeJobStatusQueued || retry.Stage != "queued" ||
+		retry.Type != failedOriginal.Type || retry.EbookID != failedOriginal.EbookID || retry.EbookEnID != failedOriginal.EbookEnID || retry.DownloadType != failedOriginal.DownloadType {
+		t.Fatalf("retry = %#v, original = %#v", retry, failedOriginal)
+	}
+	unchanged, err := store.LoadBookKnowledgeJob(failedOriginal.ID)
+	if err != nil || !reflect.DeepEqual(unchanged, failedOriginal) || countBookKnowledgeJobEvents(t, store, failedOriginal.ID) != originalEvents {
+		t.Fatalf("original changed: %#v, err=%v", unchanged, err)
+	}
+
+	if _, err := store.ClaimNextBookKnowledgeJob("retry-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FailBookKnowledgeJob(retry.ID, "retry-worker", "unknown_failure"); err != nil {
+		t.Fatal(err)
+	}
+	secondRetry, err := store.RetryBookKnowledgeJob(failedOriginal.ID)
+	if err != nil || secondRetry.ID == retry.ID || secondRetry.RetryOf != failedOriginal.ID {
+		t.Fatalf("second retry = %#v, err=%v", secondRetry, err)
+	}
+
+	for _, status := range []BookKnowledgeJobStatus{BookKnowledgeJobStatusQueued, BookKnowledgeJobStatusRunning, BookKnowledgeJobStatusSucceeded} {
+		t.Run("reject_"+string(status), func(t *testing.T) {
+			candidate, createErr := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+				Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 200 + int(status[0]), EbookEnID: "reject-" + string(status), DownloadType: 1,
+			})
+			if createErr != nil {
+				t.Fatal(createErr)
+			}
+			if _, updateErr := store.updateBookKnowledgeJob(candidate.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+				job.Status = status
+				return job
+			}); updateErr != nil {
+				t.Fatal(updateErr)
+			}
+			if _, retryErr := store.RetryBookKnowledgeJob(candidate.ID); !errors.Is(retryErr, ErrBookKnowledgeJobInvalidState) {
+				t.Fatalf("retry %s error = %v", status, retryErr)
+			}
+		})
+	}
+}
+
+func TestBookKnowledgeJobRetryRejectsActiveDuplicate(t *testing.T) {
+	root := t.TempDir()
+	firstStore := NewBookKnowledgeStore(root)
+	secondStore := NewBookKnowledgeStore(root)
+	original, err := firstStore.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 109, EbookEnID: "duplicate-retry", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.ClaimNextBookKnowledgeJob("retry-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.FailBookKnowledgeJob(original.ID, "retry-worker", "download_failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var successful atomic.Int32
+	var wait sync.WaitGroup
+	for _, store := range []*BookKnowledgeStore{firstStore, secondStore} {
+		wait.Add(1)
+		go func(store *BookKnowledgeStore) {
+			defer wait.Done()
+			<-start
+			if _, retryErr := store.RetryBookKnowledgeJob(original.ID); retryErr != nil {
+				results <- retryErr
+				return
+			}
+			successful.Add(1)
+			results <- nil
+		}(store)
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	conflicts := 0
+	for retryErr := range results {
+		if retryErr == nil {
+			continue
+		}
+		if !errors.Is(retryErr, ErrBookKnowledgeJobConflict) {
+			t.Fatalf("duplicate retry error = %v", retryErr)
+		}
+		conflicts++
+	}
+	if successful.Load() != 1 || conflicts != 1 {
+		t.Fatalf("successful=%d conflicts=%d", successful.Load(), conflicts)
+	}
+	if _, err := firstStore.RetryBookKnowledgeJob(original.ID); !errors.Is(err, ErrBookKnowledgeJobConflict) {
+		t.Fatalf("sequential duplicate retry error = %v", err)
+	}
+}
+
+func TestBookKnowledgeJobExportLegacy(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	failedSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 110, EbookEnID: "legacy-failed", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("export-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FailBookKnowledgeJob(failedSource.ID, "export-worker", "authentication_required"); err != nil {
+		t.Fatal(err)
+	}
+	interruptedSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 111, EbookEnID: "legacy-interrupted", DownloadType: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("export-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InterruptBookKnowledgeJob(interruptedSource.ID, "export-worker"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.updateBookKnowledgeJob(interruptedSource.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.RetryOf = failedSource.ID
+		return job
+	}); err != nil {
+		t.Fatal(err)
+	}
+	succeededSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 112, EbookEnID: "legacy-succeeded", DownloadType: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("export-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteBookKnowledgeJob(succeededSource.ID, "export-worker", map[string]any{
+		"ebook_id": succeededSource.EbookID,
+		"title":    "/private/downloaded-title",
+		"path":     "/private/downloaded-book",
+		"token":    "token=private-placeholder",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runningSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 113, EbookEnID: "legacy-running", DownloadType: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("private-worker-token", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	exportRoot := t.TempDir()
+	exportPath := filepath.Join(exportRoot, "nested", "jobs.json")
+	if err := store.ExportLegacyBookKnowledgeJobs(exportPath); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(exportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("export permissions = %#o", info.Mode().Perm())
+	}
+	payload, err := os.ReadFile(exportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"retry_of", "stage", "failure_code", "lease_owner", "lease_expires_at", "private-worker-token", "/private/", "token="} {
+		if strings.Contains(string(payload), forbidden) {
+			t.Fatalf("legacy export contains %q: %s", forbidden, payload)
+		}
+	}
+	legacy, err := readLegacyBookKnowledgeJobs(exportPath)
+	if err != nil || len(legacy.Jobs) != 4 {
+		t.Fatalf("legacy jobs = %#v, err=%v", legacy.Jobs, err)
+	}
+	if legacy.Jobs[0].ID != failedSource.ID || legacy.Jobs[1].ID != interruptedSource.ID ||
+		legacy.Jobs[2].ID != succeededSource.ID || legacy.Jobs[3].ID != runningSource.ID {
+		t.Fatalf("legacy order = %#v", legacy.Jobs)
+	}
+	byID := make(map[string]BookKnowledgeJob, len(legacy.Jobs))
+	for _, job := range legacy.Jobs {
+		byID[job.ID] = job
+	}
+	interrupted := byID[interruptedSource.ID]
+	if interrupted.Status != BookKnowledgeJobStatusFailed || interrupted.Error != bookKnowledgeJobInterruptedMessage ||
+		len(interrupted.Logs) == 0 || interrupted.Logs[len(interrupted.Logs)-1] != "failed: interrupted" {
+		t.Fatalf("legacy interrupted = %#v", interrupted)
+	}
+	running := byID[runningSource.ID]
+	if running.Status != BookKnowledgeJobStatusRunning || running.LeaseOwner != "" || running.LeaseExpiresAt != "" {
+		t.Fatalf("legacy running = %#v", running)
+	}
+	failed := byID[failedSource.ID]
+	if failed.Error != "job execution failed" {
+		t.Fatalf("legacy failure error = %q", failed.Error)
+	}
+	succeeded := byID[succeededSource.ID]
+	if _, ok := succeeded.Result["title"]; ok {
+		t.Fatalf("legacy result leaked sensitive title: %#v", succeeded.Result)
+	}
+	if _, ok := succeeded.Result["path"]; ok {
+		t.Fatalf("legacy result leaked path: %#v", succeeded.Result)
+	}
+	if got := succeeded.Result["ebook_id"]; got == nil {
+		t.Fatalf("legacy result removed safe id: %#v", succeeded.Result)
+	}
+
+	reimportStore := NewBookKnowledgeStore(filepath.Join(exportRoot, "reimport"))
+	if err := os.MkdirAll(filepath.Dir(reimportStore.LegacyJobsPath()), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reimportStore.LegacyJobsPath(), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reimported, err := reimportStore.ListBookKnowledgeJobs(10)
+	if err != nil || len(reimported) != 4 {
+		t.Fatalf("reimported = %#v, err=%v", reimported, err)
+	}
+	if got := findBookKnowledgeJobByID(t, reimported, interruptedSource.ID); got.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("reimported interrupted = %#v", got)
+	}
+
+	if err := store.ExportLegacyBookKnowledgeJobs(""); err == nil {
+		t.Fatal("empty export path succeeded")
+	}
+	failingTarget := filepath.Join(exportRoot, "existing-directory")
+	if err := os.Mkdir(failingTarget, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExportLegacyBookKnowledgeJobs(failingTarget); err == nil {
+		t.Fatal("export over directory succeeded")
+	}
+	if info, err := os.Stat(failingTarget); err != nil || !info.IsDir() {
+		t.Fatalf("failed export replaced target: info=%#v err=%v", info, err)
+	}
+	temps, err := filepath.Glob(filepath.Join(exportRoot, ".book-jobs-export-*"))
+	if err != nil || len(temps) != 0 {
+		t.Fatalf("temporary exports = %#v, err=%v", temps, err)
+	}
+}
+
+func countBookKnowledgeJobEvents(t *testing.T, store *BookKnowledgeStore, jobID string) int {
+	t.Helper()
+	db, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM book_job_events WHERE job_id = ?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func assertRejectedWithoutBookJobMutation(
+	t *testing.T,
+	store *BookKnowledgeStore,
+	jobID string,
+	wantEvents int,
+	operation func() error,
+	wantError error,
+) {
+	t.Helper()
+	before, err := store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := operation(); !errors.Is(err, wantError) {
+		t.Fatalf("operation error = %v, want errors.Is(%v)", err, wantError)
+	}
+	after, err := store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("job changed\nbefore: %#v\nafter:  %#v", before, after)
+	}
+	if got := countBookKnowledgeJobEvents(t, store, jobID); got != wantEvents {
+		t.Fatalf("events = %d, want %d", got, wantEvents)
+	}
+}
+
+func setBookKnowledgeJobLeaseExpiry(t *testing.T, store *BookKnowledgeStore, jobID string, expiry time.Time) {
+	t.Helper()
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE book_jobs SET lease_expires_at = ? WHERE job_id = ?`, expiry.UTC().Format(time.RFC3339Nano), jobID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func findBookKnowledgeJobByID(t *testing.T, jobs []BookKnowledgeJob, jobID string) BookKnowledgeJob {
+	t.Helper()
+	for _, job := range jobs {
+		if job.ID == jobID {
+			return job
+		}
+	}
+	t.Fatalf("job %q not found in %#v", jobID, jobs)
+	return BookKnowledgeJob{}
 }
 
 func TestDefaultDedaoDownloadRootUsesExplicitAndKBaseRoots(t *testing.T) {
