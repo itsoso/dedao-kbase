@@ -4128,7 +4128,7 @@ function renderBookAgentEvidence() {
       <article class="book-agent__release">
         <header>
           <div>
-            <span>Release ${escapeHTML(release.version || "—")}</span>
+            <span>发布版本 ${escapeHTML(release.version || "—")}</span>
             <strong>${escapeHTML(release.book?.title || release.book_id || release.release_id)}</strong>
           </div>
           <code>${escapeHTML(String(release.content_hash || "").slice(0, 18))}</code>
@@ -4140,7 +4140,7 @@ function renderBookAgentEvidence() {
               <p>${escapeHTML(claim.statement || "")}</p>
               <small>${(claim.citation_ids || []).map((id) => escapeHTML(id)).join(" · ") || "无引用 ID"}</small>
             </div>
-          `).join("") || `<p class="web-muted">此 release 暂无结构化 claims。</p>`}
+          `).join("") || `<p class="web-muted">此发布版本暂无结构化结论。</p>`}
         </div>
         <footer>${claims.length} 条结论 · ${citations.length} 条引用 · ${escapeHTML(release.usage_policy || "策略未提供")}</footer>
       </article>
@@ -4149,10 +4149,10 @@ function renderBookAgentEvidence() {
   return `
     <section class="book-agent__capability book-agent__evidence" data-capability="evidence">
       <div class="book-agent__section-head">
-        <div><span>04</span><h2>证据账本 Evidence Ledger</h2></div>
-        <p>固定 release、claim 与 citation 身份；不展示下载源正文。</p>
+        <div><span>04</span><h2>版本证据账本</h2></div>
+        <p>固定 Release、Claim 与 Citation 身份；不展示下载源正文。</p>
       </div>
-      ${releaseRows || `<p class="web-muted">正在等待 release 证据。</p>`}
+      ${releaseRows || `<p class="web-muted">正在等待发布版本证据。</p>`}
     </section>
   `;
 }
@@ -4749,7 +4749,7 @@ function renderEvidenceAuditTools(pkg, release, bookID, searchRows) {
 function renderGroundedConversation(pkg) {
   return renderBookAgentCapability("grounded_chat", `
     <section class="book-agent__capability book-agent__chat" data-capability="grounded_chat">
-      <div class="book-agent__section-head"><div><span>03</span><h2>循证对话 Grounded Conversation</h2></div><p>回答必须经过 Package 的引用与拒答边界。</p></div>
+      <div class="book-agent__section-head"><div><span>03</span><h2>循证对话</h2></div><p>回答必须经过知识包的引用与拒答边界。</p></div>
       <form id="book-agent-chat-form" aria-busy="${bookAgentState.activeAction === "chat" ? "true" : "false"}"><textarea name="question" rows="4" placeholder="基于当前知识包提问" aria-label="基于当前知识包提问">${escapeHTML(bookAgentState.question)}</textarea><button class="button button-primary" type="submit" ${bookAgentState.activeAction ? "disabled" : ""}>基于证据提问</button></form>
       ${bookAgentState.chatStatus ? `<p class="book-agent__runtime-status" role="status">${escapeHTML(bookAgentState.chatStatus)}</p>` : ""}
       ${bookAgentState.answer?.answer ? `<article class="book-agent__answer">${renderSimpleMarkdown(bookAgentState.answer.answer)}${renderBookAgentAnswerCitations(bookAgentState.answer)}</article>` : ""}
@@ -4782,6 +4782,53 @@ function agentEvaluationMetricLabel(metric) {
   })[metric] || metric;
 }
 
+function agentBookDisplayTitle(bookTitle, fallback = "知识阅读应用") {
+  return String(bookTitle || "").trim().replace(/^\d+[_\-\s]+/, "") || fallback;
+}
+
+function agentPolicyValueLabel(value) {
+  return ({
+    reasoning: "推理模型",
+    lexical: "关键词检索",
+    human_review: "人工复核",
+    standard: "标准使用策略",
+  })[value] || value || "未指定";
+}
+
+function renderAgentPageNavigation(pkg, activeView) {
+  return `
+    <nav class="book-agent__route-switch" aria-label="Agent 页面">
+      <a class="${activeView === "package" ? "active" : ""}" href="${escapeAttribute(buildAgentPackageURL(pkg.package_id, pkg.version))}" ${activeView === "package" ? 'aria-current="page"' : ""}>包契约</a>
+      <a class="${activeView === "agent" ? "active" : ""}" href="${escapeAttribute(buildAgentURL(pkg.package_id, pkg.version))}" ${activeView === "agent" ? 'aria-current="page"' : ""}>Agent 控制台</a>
+      <a class="${activeView === "app" ? "active" : ""}" href="${escapeAttribute(buildBookAppURL(pkg.package_id, pkg.version))}" ${activeView === "app" ? 'aria-current="page"' : ""}>阅读应用</a>
+    </nav>
+  `;
+}
+
+function renderAgentEvaluationMetrics(evaluation) {
+  return Object.entries(evaluation.metrics || {}).map(([metric, score]) => `
+    <div><span>${escapeHTML(agentEvaluationMetricLabel(metric))}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
+  `).join("");
+}
+
+function renderAgentTechnicalCredentials(pkg, release, evaluation) {
+  return `
+    <details class="agent-page-technical">
+      <summary><span>技术身份与版本凭据</span><small>用于审计与故障排查</small></summary>
+      <dl>
+        <div><dt>Agent ID</dt><dd><code>${escapeHTML(pkg.package_id || "—")}</code></dd></div>
+        <div><dt>Package 哈希</dt><dd><code>${escapeHTML(pkg.content_hash || "—")}</code></dd></div>
+        <div><dt>Release 身份</dt><dd><code>${escapeHTML(release.release_id || "—")}</code></dd></div>
+        <div><dt>内容哈希</dt><dd><code>${escapeHTML(release.content_hash || "—")}</code></dd></div>
+        <div><dt>评测套件</dt><dd><code>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "未提供")}</code></dd></div>
+        <div><dt>模型路由原值</dt><dd><code>${escapeHTML(pkg.model_policy?.preferred_capability || "—")}</code></dd></div>
+        <div><dt>检索策略原值</dt><dd><code>${escapeHTML(pkg.retrieval_policy?.strategy || "—")}</code></dd></div>
+        <div><dt>升级策略原值</dt><dd><code>${escapeHTML(pkg.safety_policy?.escalation_target || "—")}</code></dd></div>
+      </dl>
+    </details>
+  `;
+}
+
 function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation, runtimeStatus) {
   const displayName = agentConsoleDisplayName(release.book?.title);
   const evaluationPassed = Boolean(evaluation.passed);
@@ -4800,11 +4847,7 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
           <p class="web-kicker">受控知识 Agent</p>
           <h1 id="agent-console-title">${escapeHTML(displayName)}</h1>
           <p class="agent-console__id"><span>Agent ID</span><code>${escapeHTML(pkg.package_id)}</code></p>
-          <nav class="book-agent__route-switch" aria-label="Agent 页面">
-            <a href="${escapeAttribute(buildAgentPackageURL(pkg.package_id, pkg.version))}">包契约</a>
-            <a class="active" href="${escapeAttribute(buildAgentURL(pkg.package_id, pkg.version))}" aria-current="page">Agent 控制台</a>
-            <a href="${escapeAttribute(buildBookAppURL(pkg.package_id, pkg.version))}">阅读应用</a>
-          </nav>
+          ${renderAgentPageNavigation(pkg, "agent")}
         </div>
         <dl class="agent-console__run-summary">
           <div class="is-ready"><dt>运行状态</dt><dd>${evaluationPassed ? "运行就绪" : "限制运行"}</dd></div>
@@ -4841,10 +4884,10 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
         <aside class="agent-console__status-rail" aria-label="Agent 状态与策略">
           <header><span>运行配置</span><strong>证据与运行边界</strong></header>
           <dl class="agent-console__policy-list">
-            <div><dt>模型路由</dt><dd>${escapeHTML(pkg.model_policy?.preferred_capability || "未指定")}</dd></div>
-            <div><dt>检索方式</dt><dd>${escapeHTML(pkg.retrieval_policy?.strategy || "未指定")}</dd></div>
-            <div><dt>人工升级</dt><dd>${escapeHTML(pkg.safety_policy?.escalation_target || "未指定")}</dd></div>
-            <div><dt>使用策略</dt><dd>${escapeHTML(pkg.safety_policy?.usage_policy || "未指定")}</dd></div>
+            <div><dt>模型路由</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.model_policy?.preferred_capability))}</dd></div>
+            <div><dt>检索方式</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.retrieval_policy?.strategy))}</dd></div>
+            <div><dt>人工升级</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.safety_policy?.escalation_target))}</dd></div>
+            <div><dt>使用策略</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.safety_policy?.usage_policy))}</dd></div>
           </dl>
           <section class="agent-console__boundary">
             <span>证据边界</span>
@@ -4866,7 +4909,7 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
       <details class="agent-console__technical">
         <summary><span>技术身份与版本凭据</span><small>用于审计与故障排查</small></summary>
         <dl>
-          <div><dt>Package hash</dt><dd><code>${escapeHTML(pkg.content_hash || "—")}</code></dd></div>
+          <div><dt>Package 哈希</dt><dd><code>${escapeHTML(pkg.content_hash || "—")}</code></dd></div>
           <div><dt>评测套件</dt><dd>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "未提供")}</dd></div>
           <div><dt>Release 身份</dt><dd><code>${escapeHTML(release.release_id || "—")}</code></dd></div>
           <div><dt>内容版本</dt><dd><code>${escapeHTML(release.content_hash || "—")}</code></dd></div>
@@ -4876,6 +4919,133 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
           ${renderBookAgentCapability("action_plan", "", false)}
         </div>
       </details>
+    </section>
+  `;
+}
+
+function renderAgentPackageContract(pkg, release, evaluation, runtimeStatus) {
+  const displayName = agentConsoleDisplayName(release.book?.title);
+  const evaluationPassed = Boolean(evaluation.passed);
+  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const evaluationMetrics = renderAgentEvaluationMetrics(evaluation);
+  const citationBoundary = pkg.retrieval_policy?.require_citations
+    ? "所有回答必须绑定固定知识包中的引用。"
+    : "引用要求遵循当前知识包策略。";
+  const abstentionBoundary = pkg.safety_policy?.require_abstention
+    ? "证据不足或问题超出范围时必须拒答。"
+    : "拒答行为遵循当前知识包策略。";
+
+  return `
+    <section class="package-contract" aria-labelledby="package-contract-title">
+      <header class="package-contract__hero">
+        <div class="package-contract__identity">
+          <p class="web-kicker">受控知识包</p>
+          <h1 id="package-contract-title">${escapeHTML(displayName)}</h1>
+          <p>包契约总览 · 版本、边界与可信评测</p>
+          ${renderAgentPageNavigation(pkg, "package")}
+        </div>
+        <dl class="package-contract__summary">
+          <div><dt>当前版本</dt><dd>${escapeHTML(pkg.version || "—")}</dd></div>
+          <div><dt>固定 Release</dt><dd>${releaseCount}</dd></div>
+          <div><dt>使用策略</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.safety_policy?.usage_policy))}</dd></div>
+          <div class="${evaluationPassed ? "is-pass" : "is-hold"}"><dt>可信评测</dt><dd>${evaluationPassed ? "评测通过" : "评测待通过"}</dd></div>
+        </dl>
+      </header>
+
+      ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
+
+      <div class="package-contract__body">
+        <section class="package-contract__policy" aria-labelledby="package-policy-title">
+          <header><span>运行边界</span><h2 id="package-policy-title">这个 Agent 如何使用知识</h2></header>
+          <dl>
+            <div><dt>模型路由</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.model_policy?.preferred_capability))}</dd></div>
+            <div><dt>检索方式</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.retrieval_policy?.strategy))}</dd></div>
+            <div><dt>人工升级</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.safety_policy?.escalation_target))}</dd></div>
+            <div><dt>成本上限</dt><dd>${Number(pkg.model_policy?.max_cost_usd || 0) > 0 ? `$${Number(pkg.model_policy.max_cost_usd).toFixed(2)}` : "未设置"}</dd></div>
+          </dl>
+          <div class="package-contract__boundaries">
+            <article><span>引用边界</span><p>${escapeHTML(citationBoundary)}</p></article>
+            <article><span>拒答边界</span><p>${escapeHTML(abstentionBoundary)}</p></article>
+          </div>
+        </section>
+
+        <aside class="package-contract__evaluation" aria-label="可信评测指标">
+          <header><span>可信评测</span><strong>${evaluationPassed ? "所有发布闸门已通过" : "当前版本限制运行"}</strong></header>
+          ${evaluationMetrics ? `<div class="package-contract__metric-grid">${evaluationMetrics}</div>` : `<p class="web-muted">当前版本未提供评测指标。</p>`}
+        </aside>
+      </div>
+
+      ${renderAgentTechnicalCredentials(pkg, release, evaluation)}
+    </section>
+  `;
+}
+
+function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, runtimeStatus) {
+  const bookTitle = agentBookDisplayTitle(release.book?.title, agentConsoleDisplayName(release.book?.title));
+  const evaluationPassed = Boolean(evaluation.passed);
+  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const evidenceBoundary = pkg.retrieval_policy?.require_citations
+    ? "回答必须绑定当前固定版本的引用；证据不足时主动拒答。"
+    : "回答遵循当前知识包的证据与拒答策略。";
+
+  return `
+    <section class="reading-app" aria-labelledby="reading-app-title">
+      <header class="reading-app__hero">
+        <div class="reading-app__identity">
+          <p class="web-kicker">阅读研究台</p>
+          <h1 id="reading-app-title">${escapeHTML(bookTitle)}</h1>
+          <p>围绕当前固定知识版本阅读、检索并进行循证对话。</p>
+          ${renderAgentPageNavigation(pkg, "app")}
+        </div>
+        <dl class="reading-app__summary">
+          <div><dt>当前版本</dt><dd>${escapeHTML(pkg.version || "—")}</dd></div>
+          <div><dt>固定 Release</dt><dd>${releaseCount}</dd></div>
+          <div><dt>检索方式</dt><dd>${escapeHTML(agentPolicyValueLabel(pkg.retrieval_policy?.strategy))}</dd></div>
+          <div class="${evaluationPassed ? "is-pass" : "is-hold"}"><dt>运行状态</dt><dd>${evaluationPassed ? "可用" : "受限"}</dd></div>
+        </dl>
+      </header>
+
+      ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
+
+      <div class="reading-app__body">
+        <section class="reading-app__workspace" aria-label="阅读应用主要工作区">
+          ${renderBookAgentCapability("reader", `
+            <section class="book-agent__capability book-agent__reader" data-capability="reader">
+              <div class="book-agent__section-head"><div><span>01</span><h2>版本化阅读</h2></div><p>打开当前 Agent 固定的书籍版本。</p></div>
+              ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(bookTitle)}</strong><small>进入阅读器 →</small></a>` : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
+            </section>
+          `)}
+          ${renderBookAgentCapability("search", `
+            <section class="book-agent__capability book-agent__search" data-capability="search">
+              <div class="book-agent__section-head"><div><span>02</span><h2>包内检索</h2></div><p>结果保留 Claim、Chunk、Citation 与 Release 身份。</p></div>
+              <form id="book-agent-search-form" aria-busy="${bookAgentState.activeAction === "search" ? "true" : "false"}">
+                <input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="输入关键词，检索当前知识包" aria-label="检索当前知识包">
+                <button class="button button-primary" type="submit" ${bookAgentState.activeAction ? "disabled" : ""}>开始检索</button>
+              </form>
+              ${bookAgentState.searchStatus ? `<p class="book-agent__runtime-status" role="status">${escapeHTML(bookAgentState.searchStatus)}</p>` : ""}
+              <div class="book-agent__search-results">${searchRows || (!bookAgentState.searchStatus ? `<p class="web-muted">输入关键词后，这里会显示带引用身份的证据。</p>` : "")}</div>
+            </section>
+          `, Boolean(pkg.package_id && pkg.version))}
+          ${renderGroundedConversation(pkg)}
+        </section>
+
+        <aside class="reading-app__rail" aria-label="阅读版本与证据边界">
+          <header><span>当前阅读范围</span><strong>固定版本 · 可追溯</strong></header>
+          <dl>
+            <div><dt>知识版本</dt><dd>${escapeHTML(pkg.version || "—")}</dd></div>
+            <div><dt>可信评测</dt><dd>${evaluationPassed ? "评测通过" : "评测待通过"}</dd></div>
+            <div><dt>引用要求</dt><dd>${pkg.retrieval_policy?.require_citations ? "必须引用" : "按策略引用"}</dd></div>
+            <div><dt>超出范围</dt><dd>${pkg.safety_policy?.require_abstention ? "必须拒答" : "按策略处理"}</dd></div>
+          </dl>
+          <section><span>证据边界</span><p>${escapeHTML(evidenceBoundary)}</p></section>
+        </aside>
+      </div>
+
+      <section class="reading-app__evidence" aria-label="版本证据账本">
+        ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
+      </section>
+
+      ${renderAgentTechnicalCredentials(pkg, release, evaluation)}
     </section>
   `;
 }
@@ -4891,24 +5061,14 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
   const evaluation = pkg.evaluation || {};
   const release = bookAgentState.releases[0] || {};
   const bookID = release.book_id || release.book?.book_id || "";
-  const viewLabels = {
-    package: ["Package contract", "版本、边界与评测证据"],
-    agent: ["Agent console", "受策略约束的检索、模型与工具入口"],
-    app: ["Shared Book App", "由 ui_manifest 生成的阅读与证据空间"],
-  };
-  const [viewLabel, viewDescription] = viewLabels[route.view] || viewLabels.app;
   const searchRows = bookAgentState.results.map((result) => `
     <article>
       <span>${escapeHTML(result.release_id || "release")} · ${escapeHTML(result.claim_id || "claim")}</span>
-      <strong>${escapeHTML((result.citation_ids || []).join(" · ") || "No citation IDs")}</strong>
+      <strong>${escapeHTML((result.citation_ids || []).join(" · ") || "无引用 ID")}</strong>
       <p>${escapeHTML(result.statement || "")}</p>
     </article>
   `).join("");
-  const evaluationMetrics = Object.entries(evaluation.metrics || {}).map(([metric, score]) => `
-    <div><span>${escapeHTML(metric)}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
-  `).join("");
   const runtimeStatus = bookAgentState.loading || bookAgentState.message;
-  const isEvidenceAuditRoute = route.view === "agent" && pkg.schema_version === "agent-package.v2";
   const isAgentConsoleRoute = route.view === "agent" && pkg.schema_version !== "agent-package.v2";
 
   if (isAgentConsoleRoute) {
@@ -4921,70 +5081,34 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
     return;
   }
 
+  if (route.view === "package") {
+    renderShell(`
+      <main class="book-agent book-agent--detail book-agent--package-contract">
+        ${renderAgentPackageContract(pkg, release, evaluation, runtimeStatus)}
+      </main>
+    `, "agents");
+    bindBookAgentPlatformEvents(route);
+    return;
+  }
+
+  if (route.view === "app") {
+    renderShell(`
+      <main class="book-agent book-agent--detail book-agent--reading-app">
+        ${renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, runtimeStatus)}
+      </main>
+    `, "agents");
+    bindBookAgentPlatformEvents(route);
+    return;
+  }
+
   renderShell(`
-    <main class="book-agent book-agent--detail ${isEvidenceAuditRoute ? "book-agent--audit" : ""}">
-      ${isEvidenceAuditRoute ? renderEvidenceAuditContext(route, pkg, evaluation) : `
-        <header class="book-agent__hero">
-        <div class="book-agent__hero-copy">
-          <p class="web-kicker">${escapeHTML(viewLabel)}</p>
-          <h1>${escapeHTML(pkg.package_id)}</h1>
-          <p>${escapeHTML(viewDescription)}</p>
-          <div class="book-agent__route-switch" aria-label="Package routes">
-            <a class="${route.view === "package" ? "active" : ""}" href="${escapeAttribute(buildAgentPackageURL(pkg.package_id, pkg.version))}">Package</a>
-            <a class="${route.view === "agent" ? "active" : ""}" href="${escapeAttribute(buildAgentURL(pkg.package_id, pkg.version))}">Agent</a>
-            <a class="${route.view === "app" ? "active" : ""}" href="${escapeAttribute(buildBookAppURL(pkg.package_id, pkg.version))}">Book App</a>
-          </div>
-        </div>
-        <aside class="book-agent__hero-ledger">
-          <div><span>VERSION</span><strong>${escapeHTML(pkg.version)}</strong></div>
-          <div><span>RELEASES</span><strong>${pkg.releases?.length || 0}</strong></div>
-          <div><span>POLICY</span><strong>${escapeHTML(pkg.safety_policy?.usage_policy || "unknown")}</strong></div>
-          <div class="book-agent__evaluation ${evaluation.passed ? "is-pass" : "is-hold"}">
-            <span>EVALUATION</span>
-            <strong>${evaluation.passed ? "Evaluation passed" : "Evaluation hold"}</strong>
-            <small>${escapeHTML(evaluation.suite_version || pkg.evaluation_policy?.suite_version || "suite unavailable")}</small>
-          </div>
-        </aside>
-        </header>
-      `}
-
-      ${runtimeStatus ? `<p class="web-status">${escapeHTML(runtimeStatus)}</p>` : ""}
-
-      ${isEvidenceAuditRoute ? "" : `<section class="book-agent__manifest">
-        <div><span>Package hash</span><code>${escapeHTML(pkg.content_hash)}</code></div>
-        <div><span>Model route</span><strong>${escapeHTML(pkg.model_policy?.preferred_capability || "—")}</strong></div>
-        <div><span>Retrieval</span><strong>${escapeHTML(pkg.retrieval_policy?.strategy || "—")}</strong></div>
-        <div><span>Escalation</span><strong>${escapeHTML(pkg.safety_policy?.escalation_target || "—")}</strong></div>
-        ${evaluationMetrics ? `<div class="book-agent__metric-strip">${evaluationMetrics}</div>` : ""}
-      </section>`}
-
+    <main class="book-agent book-agent--detail book-agent--audit">
+      ${renderEvidenceAuditContext(route, pkg, evaluation)}
       <section class="book-agent__capabilities" aria-label="Manifest capabilities">
-        ${isEvidenceAuditRoute ? `
-          ${renderEvidenceAuditWorkspace(route, pkg)}
-          ${renderEvidenceAuditTools(pkg, release, bookID, searchRows)}
-          ${renderGroundedConversation(pkg)}
-          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
-        ` : `
-          ${renderBookAgentCapability("reader", `
-          <section class="book-agent__capability book-agent__reader" data-capability="reader">
-            <div class="book-agent__section-head"><div><span>01</span><h2>Reader</h2></div><p>回到固定 source version 的阅读面。</p></div>
-            ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>Open the book</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>版本化阅读入口 →</small></a>` : `<div class="book-agent__unavailable"><strong>功能已声明，但运行时尚未接通</strong><p>Release 尚未提供可解析的 book_id。</p></div>`}
-          </section>
-        `)}
-        ${renderBookAgentCapability("search", `
-          <section class="book-agent__capability book-agent__search" data-capability="search">
-            <div class="book-agent__section-head"><div><span>02</span><h2>Grounded search</h2></div><p>结果保持 claim、chunk 与 release 身份。</p></div>
-            <form id="book-agent-search-form" aria-busy="${bookAgentState.activeAction === "search" ? "true" : "false"}"><input name="query" value="${escapeAttribute(bookAgentState.query)}" placeholder="Search this package"><button class="button button-primary" type="submit" ${bookAgentState.activeAction ? "disabled" : ""}>Search</button></form>
-            ${bookAgentState.searchStatus ? `<p class="book-agent__runtime-status" role="status">${escapeHTML(bookAgentState.searchStatus)}</p>` : ""}
-            <div class="book-agent__search-results">${searchRows || (!bookAgentState.searchStatus ? `<p class="web-muted">输入关键词以检索此包固定的知识范围。</p>` : "")}</div>
-          </section>
-        `, Boolean(pkg.package_id && pkg.version))}
-          ${renderEvidenceAuditWorkspace(route, pkg)}
-          ${renderGroundedConversation(pkg)}
-          ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
-          ${renderBookAgentCapability("quiz", "", false)}
-          ${renderBookAgentCapability("action_plan", "", false)}
-        `}
+        ${renderEvidenceAuditWorkspace(route, pkg)}
+        ${renderEvidenceAuditTools(pkg, release, bookID, searchRows)}
+        ${renderGroundedConversation(pkg)}
+        ${renderBookAgentCapability("evidence", renderBookAgentEvidence())}
       </section>
     </main>
   `, "agents");
