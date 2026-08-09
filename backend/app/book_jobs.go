@@ -111,8 +111,9 @@ type bookKnowledgeJobsFile struct {
 }
 
 var (
-	runDedaoEbookDownloadJob  = executeDedaoEbookDownloadJob
-	runDedaoEbookSyncKBaseJob = executeDedaoEbookSyncKBaseJob
+	runDedaoEbookDownloadJob            = executeDedaoEbookDownloadJob
+	runDedaoEbookSyncKBaseJob           = executeDedaoEbookSyncKBaseJob
+	runDedaoEbookSyncKBaseJobWithStages = executeDedaoEbookSyncKBaseJobWithStages
 )
 
 type dedaoServiceContextKey struct{}
@@ -1663,10 +1664,29 @@ func executeDedaoEbookSyncKBaseJob(ctx context.Context, store *BookKnowledgeStor
 	if err != nil {
 		return nil, err
 	}
+	return dedaoEbookSyncKBaseJobResult(job, result), nil
+}
+
+func executeDedaoEbookSyncKBaseJobWithStages(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	job BookKnowledgeJob,
+	setStage func(string) error,
+) (map[string]any, error) {
+	result, err := syncEbookToBookKnowledgeStoreWithStages(
+		ctx, job.EbookID, job.EbookEnID, store, DefaultDedaoDownloadRoot(), setStage,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return dedaoEbookSyncKBaseJobResult(job, result), nil
+}
+
+func dedaoEbookSyncKBaseJobResult(job BookKnowledgeJob, result *EbookWikiSyncResult) map[string]any {
 	return map[string]any{
 		"ebook_id": job.EbookID, "ebook_enid": job.EbookEnID, "download_type": 1,
 		"knowledge_book_id": result.KnowledgeBookID, "title": result.Title,
-	}, nil
+	}
 }
 
 func safeBookKnowledgeJobResult(result map[string]any) map[string]any {

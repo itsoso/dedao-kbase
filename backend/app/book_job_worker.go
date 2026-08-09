@@ -284,13 +284,7 @@ func (w *BookJobWorker) executeDefault(ctx context.Context, job BookKnowledgeJob
 		}
 		return runDedaoEbookDownloadJob(ctx, job)
 	case BookKnowledgeJobTypeDedaoEbookSyncKBase:
-		if err := setStage("downloading"); err != nil {
-			return nil, err
-		}
-		if err := setStage("building_knowledge"); err != nil {
-			return nil, err
-		}
-		return runDedaoEbookSyncKBaseJob(ctx, w.store, job)
+		return runDedaoEbookSyncKBaseJobWithStages(ctx, w.store, job, setStage)
 	default:
 		return nil, NewBookJobExecutionFailure(BookKnowledgeJobFailureUnknownFailure, errors.New("unsupported book job type"))
 	}

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -312,15 +314,21 @@ func TestBookJobWorkerRunPollsAndExitsCleanlyOnCancel(t *testing.T) {
 
 func TestBookJobWorkerDefaultExecutorEmitsExpectedStages(t *testing.T) {
 	previousDownload := runDedaoEbookDownloadJob
-	previousSync := runDedaoEbookSyncKBaseJob
+	previousSync := runDedaoEbookSyncKBaseJobWithStages
 	defer func() {
 		runDedaoEbookDownloadJob = previousDownload
-		runDedaoEbookSyncKBaseJob = previousSync
+		runDedaoEbookSyncKBaseJobWithStages = previousSync
 	}()
 	runDedaoEbookDownloadJob = func(context.Context, BookKnowledgeJob) (map[string]any, error) {
 		return map[string]any{"ebook_id": 270}, nil
 	}
-	runDedaoEbookSyncKBaseJob = func(context.Context, *BookKnowledgeStore, BookKnowledgeJob) (map[string]any, error) {
+	runDedaoEbookSyncKBaseJobWithStages = func(_ context.Context, _ *BookKnowledgeStore, _ BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
+		if err := setStage("downloading"); err != nil {
+			return nil, err
+		}
+		if err := setStage("building_knowledge"); err != nil {
+			return nil, err
+		}
 		return map[string]any{"ebook_id": 271}, nil
 	}
 	for _, test := range []struct {
@@ -339,6 +347,53 @@ func TestBookJobWorkerDefaultExecutorEmitsExpectedStages(t *testing.T) {
 		}
 		assertWorkerEventStages(t, store, job.ID, test.stages)
 	}
+}
+
+func TestBookJobWorkerSyncDownloadFailureStaysInDownloadingStage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 272)
+	oldDownload := downloadEbookForKnowledgeSync
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+	stageDuringDownload := ""
+	downloadEbookForKnowledgeSync = func(context.Context, int, string, string) (*EBookDownloadResult, error) {
+		loaded, err := store.LoadBookKnowledgeJob(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stageDuringDownload = loaded.Stage
+		return nil, errors.New("raw download failure /private/token-secret")
+	}
+	worker := newWorkerForTest(t, store, nil)
+	if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	if stageDuringDownload != "downloading" {
+		t.Fatalf("stage during download=%q want=downloading", stageDuringDownload)
+	}
+	assertWorkerFailedSafely(t, store, job.ID, BookKnowledgeJobFailureDownloadFailed)
+}
+
+func TestBookJobWorkerSyncBuildFailureUsesKnowledgeFailureCode(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 273)
+	downloadRoot := t.TempDir()
+	htmlPath := filepath.Join(downloadRoot, "book.html")
+	if err := os.WriteFile(htmlPath, []byte(`<html><body><p>构建失败正文。</p></body></html>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDownload := downloadEbookForKnowledgeSync
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+	downloadEbookForKnowledgeSync = func(context.Context, int, string, string) (*EBookDownloadResult, error) {
+		return &EBookDownloadResult{BookID: job.EbookID, Title: "构建失败", HTMLPath: htmlPath}, nil
+	}
+	if err := os.WriteFile(filepath.Join(store.Root(), "books"), []byte("block knowledge directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	worker := newWorkerForTest(t, store, nil)
+	if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	assertWorkerFailedSafely(t, store, job.ID, BookKnowledgeJobFailureKnowledgeBuildFailed)
 }
 
 func createWorkerTestJob(t *testing.T, store *BookKnowledgeStore, jobType string, ebookID int) BookKnowledgeJob {

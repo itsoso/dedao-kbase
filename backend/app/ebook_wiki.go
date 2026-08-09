@@ -106,11 +106,27 @@ func SyncEbookToBookKnowledgeStore(
 	store *BookKnowledgeStore,
 	downloadRoot string,
 ) (*EbookWikiSyncResult, error) {
+	return syncEbookToBookKnowledgeStoreWithStages(ctx, id, enid, store, downloadRoot, nil)
+}
+
+func syncEbookToBookKnowledgeStoreWithStages(
+	ctx context.Context,
+	id int,
+	enid string,
+	store *BookKnowledgeStore,
+	downloadRoot string,
+	setStage func(string) error,
+) (*EbookWikiSyncResult, error) {
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
 	if strings.TrimSpace(downloadRoot) == "" {
 		downloadRoot = DefaultDedaoDownloadRoot()
+	}
+	if setStage != nil {
+		if err := setStage("downloading"); err != nil {
+			return nil, err
+		}
 	}
 	emitEbookWikiProgress(ctx, "正在下载电子书")
 	result, err := downloadEbookForKnowledgeSync(ctx, id, enid, downloadRoot)
@@ -122,6 +138,11 @@ func SyncEbookToBookKnowledgeStore(
 	}
 	if _, err := os.Stat(result.HTMLPath); err != nil {
 		return nil, fmt.Errorf("电子书 HTML 文件不存在: %w", err)
+	}
+	if setStage != nil {
+		if err := setStage("building_knowledge"); err != nil {
+			return nil, err
+		}
 	}
 	emitEbookWikiProgress(ctx, "正在生成本地知识包")
 	knowledgePackage, err := BuildBookKnowledgeFromHTMLFile(BookKnowledgeBook{

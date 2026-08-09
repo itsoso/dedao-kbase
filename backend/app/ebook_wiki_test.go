@@ -45,6 +45,92 @@ func TestSyncEbookToBookKnowledgeStoreDownloadsAndIngestsLocally(t *testing.T) {
 	}
 }
 
+func TestSyncEbookToBookKnowledgeStoreWithStagesTracksRealExecutionBoundaries(t *testing.T) {
+	downloadRoot := t.TempDir()
+	store := NewBookKnowledgeStore(t.TempDir())
+	htmlPath := filepath.Join(downloadRoot, "book.html")
+	if err := os.WriteFile(htmlPath, []byte(`<html><body><h1>第一章</h1><p>阶段测试正文。</p></body></html>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDownload := downloadEbookForKnowledgeSync
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+	var currentStage string
+	downloadEbookForKnowledgeSync = func(context.Context, int, string, string) (*EBookDownloadResult, error) {
+		if currentStage != "downloading" {
+			t.Fatalf("stage during download=%q want=downloading", currentStage)
+		}
+		return &EBookDownloadResult{BookID: 43, Title: "阶段测试", HTMLPath: htmlPath}, nil
+	}
+	var stages []string
+	result, err := syncEbookToBookKnowledgeStoreWithStages(
+		context.Background(), 43, "stage-enid", store, downloadRoot,
+		func(stage string) error {
+			currentStage = stage
+			stages = append(stages, stage)
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.KnowledgeBookID != "43" || strings.Join(stages, ",") != "downloading,building_knowledge" {
+		t.Fatalf("result=%#v stages=%v", result, stages)
+	}
+}
+
+func TestSyncEbookToBookKnowledgeStoreWithStagesStopsWhenDownloadingStageFails(t *testing.T) {
+	oldDownload := downloadEbookForKnowledgeSync
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+	downloadCalled := false
+	downloadEbookForKnowledgeSync = func(context.Context, int, string, string) (*EBookDownloadResult, error) {
+		downloadCalled = true
+		return nil, nil
+	}
+	want := errors.New("stage unavailable")
+	_, err := syncEbookToBookKnowledgeStoreWithStages(
+		context.Background(), 44, "stage-download-fail", NewBookKnowledgeStore(t.TempDir()), t.TempDir(),
+		func(stage string) error {
+			if stage != "downloading" {
+				t.Fatalf("stage=%q want=downloading", stage)
+			}
+			return want
+		},
+	)
+	if !errors.Is(err, want) || downloadCalled {
+		t.Fatalf("error=%v downloadCalled=%t", err, downloadCalled)
+	}
+}
+
+func TestSyncEbookToBookKnowledgeStoreWithStagesStopsBeforeBuildWhenBuildingStageFails(t *testing.T) {
+	downloadRoot := t.TempDir()
+	store := NewBookKnowledgeStore(t.TempDir())
+	htmlPath := filepath.Join(downloadRoot, "book.html")
+	if err := os.WriteFile(htmlPath, []byte(`<html><body><p>不应生成知识包。</p></body></html>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDownload := downloadEbookForKnowledgeSync
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+	downloadEbookForKnowledgeSync = func(context.Context, int, string, string) (*EBookDownloadResult, error) {
+		return &EBookDownloadResult{BookID: 45, Title: "阶段中止", HTMLPath: htmlPath}, nil
+	}
+	want := errors.New("building stage unavailable")
+	_, err := syncEbookToBookKnowledgeStoreWithStages(
+		context.Background(), 45, "stage-build-fail", store, downloadRoot,
+		func(stage string) error {
+			if stage == "building_knowledge" {
+				return want
+			}
+			return nil
+		},
+	)
+	if !errors.Is(err, want) {
+		t.Fatalf("error=%v want=%v", err, want)
+	}
+	if _, err := store.LoadPackage("45"); err == nil {
+		t.Fatal("knowledge package was built after building stage failure")
+	}
+}
+
 func TestEbookHTMLPath(t *testing.T) {
 	got, err := ebookHTMLPath("/tmp/down-dedao", "123_测试: 电子书_作者")
 	if err != nil {
