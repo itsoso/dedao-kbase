@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1054,6 +1055,47 @@ func TestBookKnowledgeJobConcurrentClaim(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobConcurrentClaimDoesNotMaskDatabaseFailure(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	created, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 117, EbookEnID: "claim-trigger", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := countBookKnowledgeJobEvents(t, store, created.ID)
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TRIGGER reject_book_job_claim
+		BEFORE UPDATE OF status ON book_jobs
+		WHEN OLD.status = 'queued' AND NEW.status = 'running'
+		BEGIN
+			SELECT RAISE(ABORT, 'claim update blocked');
+		END`)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := store.ClaimNextBookKnowledgeJob("trigger-worker", time.Minute)
+	if err == nil || claimed != nil {
+		t.Fatalf("claim = %#v, err=%v", claimed, err)
+	}
+	if errors.Is(err, ErrBookKnowledgeJobConflict) {
+		t.Fatalf("database failure was reported as conflict: %v", err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(created.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("job = %#v, err=%v", loaded, loadErr)
+	}
+	if got := countBookKnowledgeJobEvents(t, store, created.ID); got != eventsBefore {
+		t.Fatalf("events = %d, want %d", got, eventsBefore)
+	}
+}
+
 func TestBookKnowledgeJobLeaseOwner(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
@@ -1487,6 +1529,56 @@ func TestBookKnowledgeJobRetryRejectsActiveDuplicate(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobRetryDoesNotMaskConstraintFailure(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	original, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 118, EbookEnID: "retry-trigger", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("retry-trigger-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	original, err = store.FailBookKnowledgeJob(original.ID, "retry-trigger-worker", BookKnowledgeJobFailureUnknownFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := countBookKnowledgeJobEvents(t, store, original.ID)
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`
+		CREATE TRIGGER reject_book_job_retry
+		BEFORE INSERT ON book_jobs
+		WHEN NEW.retry_of IS NOT NULL
+		BEGIN
+			SELECT RAISE(ABORT, 'retry insert blocked');
+		END`)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.RetryBookKnowledgeJob(original.ID); err == nil {
+		t.Fatal("retry succeeded despite trigger")
+	} else if errors.Is(err, ErrBookKnowledgeJobConflict) {
+		t.Fatalf("constraint failure was reported as conflict: %v", err)
+	}
+	unchanged, err := store.LoadBookKnowledgeJob(original.ID)
+	if err != nil || !reflect.DeepEqual(unchanged, original) {
+		t.Fatalf("original = %#v, err=%v", unchanged, err)
+	}
+	if got := countBookKnowledgeJobEvents(t, store, original.ID); got != eventsBefore {
+		t.Fatalf("events = %d, want %d", got, eventsBefore)
+	}
+	jobs, err := store.ListBookKnowledgeJobs(10)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("jobs = %#v, err=%v", jobs, err)
+	}
+}
+
 func TestBookKnowledgeJobExportLegacy(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	failedSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
@@ -1634,6 +1726,106 @@ func TestBookKnowledgeJobExportLegacy(t *testing.T) {
 	temps, err := filepath.Glob(filepath.Join(exportRoot, ".book-jobs-export-*"))
 	if err != nil || len(temps) != 0 {
 		t.Fatalf("temporary exports = %#v, err=%v", temps, err)
+	}
+}
+
+func TestBookKnowledgeJobExportLegacyDirectorySyncPlatformContract(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if err := syncBookKnowledgeJobExportDirectory(missing, "windows"); err != nil {
+		t.Fatalf("windows directory sync = %v", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := syncBookKnowledgeJobExportDirectory(t.TempDir(), runtime.GOOS); err != nil {
+			t.Fatalf("%s directory sync = %v", runtime.GOOS, err)
+		}
+		if err := syncBookKnowledgeJobExportDirectory(missing, runtime.GOOS); err == nil {
+			t.Fatalf("%s missing directory sync succeeded", runtime.GOOS)
+		}
+	}
+}
+
+func TestBookKnowledgeJobExportLegacyRejectsDatabasePaths(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path func(*testing.T, *BookKnowledgeStore) string
+	}{
+		{name: "database", path: func(_ *testing.T, store *BookKnowledgeStore) string {
+			return store.BookJobsDBPath()
+		}},
+		{name: "relative equivalent", path: func(t *testing.T, store *BookKnowledgeStore) string {
+			workingDirectory, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			relative, err := filepath.Rel(workingDirectory, store.BookJobsDBPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return relative
+		}},
+		{name: "wal sidecar", path: func(_ *testing.T, store *BookKnowledgeStore) string {
+			return store.BookJobsDBPath() + "-wal"
+		}},
+		{name: "shm sidecar", path: func(_ *testing.T, store *BookKnowledgeStore) string {
+			return store.BookJobsDBPath() + "-shm"
+		}},
+		{name: "parent symlink", path: func(t *testing.T, store *BookKnowledgeStore) string {
+			alias := filepath.Join(t.TempDir(), "store-alias")
+			if err := os.Symlink(filepath.Dir(store.BookJobsDBPath()), alias); err != nil {
+				t.Skipf("symlink unsupported: %v", err)
+			}
+			return filepath.Join(alias, filepath.Base(store.BookJobsDBPath()))
+		}},
+		{name: "hardlink", path: func(t *testing.T, store *BookKnowledgeStore) string {
+			hardlink := filepath.Join(t.TempDir(), "book-jobs-hardlink.sqlite3")
+			if err := os.Link(store.BookJobsDBPath(), hardlink); err != nil {
+				t.Skipf("hardlink unsupported: %v", err)
+			}
+			return hardlink
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, created := newBookKnowledgeJobExportTestStore(t)
+			assertBookKnowledgeJobExportPathRejected(t, store, created.ID, test.path(t, store))
+		})
+	}
+
+	t.Run("legacy rollback path allowed", func(t *testing.T) {
+		store, created := newBookKnowledgeJobExportTestStore(t)
+		if err := store.ExportLegacyBookKnowledgeJobs(store.LegacyJobsPath()); err != nil {
+			t.Fatalf("legacy rollback path rejected: %v", err)
+		}
+		legacy, err := readLegacyBookKnowledgeJobs(store.LegacyJobsPath())
+		if err != nil || len(legacy.Jobs) != 1 || legacy.Jobs[0].ID != created.ID {
+			t.Fatalf("legacy jobs = %#v, err=%v", legacy.Jobs, err)
+		}
+	})
+}
+
+func newBookKnowledgeJobExportTestStore(t *testing.T) (*BookKnowledgeStore, BookKnowledgeJob) {
+	t.Helper()
+	store := NewBookKnowledgeStore(t.TempDir())
+	created, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 119, EbookEnID: "protected-export", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, created
+}
+
+func assertBookKnowledgeJobExportPathRejected(t *testing.T, store *BookKnowledgeStore, jobID, path string) {
+	t.Helper()
+	if err := store.ExportLegacyBookKnowledgeJobs(path); !errors.Is(err, ErrBookKnowledgeJobInvalidState) {
+		t.Fatalf("export %q error = %v", path, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(jobID)
+	if err != nil || loaded.ID != jobID {
+		t.Fatalf("loaded = %#v, err=%v", loaded, err)
+	}
+	jobs, err := store.ListBookKnowledgeJobs(10)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != jobID {
+		t.Fatalf("jobs = %#v, err=%v", jobs, err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -55,6 +56,7 @@ var (
 	ErrBookKnowledgeJobLeaseLost    = errors.New("book knowledge job lease lost")
 	ErrBookKnowledgeJobInvalidState = errors.New("book knowledge job invalid state")
 	ErrBookKnowledgeJobNotFound     = errors.New("job not found")
+	errBookKnowledgeJobCASConflict  = errors.New("book knowledge job compare-and-swap conflict")
 )
 
 var bookKnowledgeJobFailureMessages = map[string]string{
@@ -285,7 +287,10 @@ func (s *BookKnowledgeStore) ClaimNextBookKnowledgeJob(workerID string, lease ti
 	job.Logs = append(job.Logs, "running")
 	if err := updateBookKnowledgeJobRowFromStatus(tx, job, BookKnowledgeJobStatusQueued); err != nil {
 		tx.Rollback()
-		return nil, fmt.Errorf("%w: claim job %q", ErrBookKnowledgeJobConflict, job.ID)
+		if errors.Is(err, errBookKnowledgeJobCASConflict) {
+			return nil, fmt.Errorf("%w: claim job %q", ErrBookKnowledgeJobConflict, job.ID)
+		}
+		return nil, err
 	}
 	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
 		tx.Rollback()
@@ -489,8 +494,9 @@ func (s *BookKnowledgeStore) RetryBookKnowledgeJob(jobID string) (BookKnowledgeJ
 		RetryOf: original.ID, Stage: "queued", Logs: []string{"queued"}, CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := insertBookKnowledgeJob(tx, retry, false); err != nil {
+		activeRetryConflict := isBookKnowledgeJobActiveRetryConstraint(tx, original.ID, err)
 		tx.Rollback()
-		if isBookKnowledgeJobSQLiteConstraint(err) {
+		if activeRetryConflict {
 			return BookKnowledgeJob{}, fmt.Errorf("%w: active retry already exists", ErrBookKnowledgeJobConflict)
 		}
 		return BookKnowledgeJob{}, err
@@ -500,9 +506,6 @@ func (s *BookKnowledgeStore) RetryBookKnowledgeJob(jobID string) (BookKnowledgeJ
 		return BookKnowledgeJob{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		if isBookKnowledgeJobSQLiteConstraint(err) {
-			return BookKnowledgeJob{}, fmt.Errorf("%w: active retry already exists", ErrBookKnowledgeJobConflict)
-		}
 		return BookKnowledgeJob{}, err
 	}
 	return retry, nil
@@ -518,6 +521,10 @@ func (s *BookKnowledgeStore) ExportLegacyBookKnowledgeJobs(path string) error {
 	}
 	db, err := s.openBookJobsDB()
 	if err != nil {
+		return err
+	}
+	if err := validateBookKnowledgeJobExportPath(path, s.BookJobsDBPath()); err != nil {
+		db.Close()
 		return err
 	}
 	rows, err := db.Query(bookKnowledgeJobSelect + ` ORDER BY created_at ASC, job_id ASC`)
@@ -584,12 +591,83 @@ func (s *BookKnowledgeStore) ExportLegacyBookKnowledgeJobs(path string) error {
 		return err
 	}
 	committed = true
+	return syncBookKnowledgeJobExportDirectory(directory, runtime.GOOS)
+}
+
+func syncBookKnowledgeJobExportDirectory(directory, goos string) error {
+	if goos == "windows" {
+		return nil
+	}
 	directoryHandle, err := os.Open(directory)
 	if err != nil {
 		return err
 	}
 	defer directoryHandle.Close()
 	return directoryHandle.Sync()
+}
+
+func validateBookKnowledgeJobExportPath(exportPath, databasePath string) error {
+	resolvedExport, err := resolveBookKnowledgeJobPath(exportPath)
+	if err != nil {
+		return err
+	}
+	exportInfo, exportInfoErr := os.Stat(exportPath)
+	if exportInfoErr != nil && !os.IsNotExist(exportInfoErr) {
+		return exportInfoErr
+	}
+	for _, protectedPath := range []string{databasePath, databasePath + "-wal", databasePath + "-shm"} {
+		resolvedProtected, err := resolveBookKnowledgeJobPath(protectedPath)
+		if err != nil {
+			return err
+		}
+		if bookKnowledgeJobPathsEqual(resolvedExport, resolvedProtected) {
+			return fmt.Errorf("%w: export target overlaps book jobs database", ErrBookKnowledgeJobInvalidState)
+		}
+		protectedInfo, protectedInfoErr := os.Stat(protectedPath)
+		if protectedInfoErr != nil && !os.IsNotExist(protectedInfoErr) {
+			return protectedInfoErr
+		}
+		if exportInfoErr == nil && protectedInfoErr == nil && os.SameFile(exportInfo, protectedInfo) {
+			return fmt.Errorf("%w: export target overlaps book jobs database", ErrBookKnowledgeJobInvalidState)
+		}
+	}
+	return nil
+}
+
+func resolveBookKnowledgeJobPath(path string) (string, error) {
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	current := absolute
+	missing := make([]string, 0)
+	for {
+		if _, err := os.Lstat(current); err == nil {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return "", err
+			}
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return absolute, nil
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func bookKnowledgeJobPathsEqual(first, second string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(first, second)
+	}
+	return first == second
 }
 
 func (s *BookKnowledgeStore) updateOwnedRunningBookKnowledgeJob(
@@ -1078,7 +1156,7 @@ func updateBookKnowledgeJobRowFromStatus(tx *sql.Tx, job BookKnowledgeJob, expec
 	}
 	if rows != 1 {
 		if expectedStatus != "" {
-			return fmt.Errorf("job %q cannot run from status other than %s", job.ID, expectedStatus)
+			return fmt.Errorf("%w: job %q changed from status %s", errBookKnowledgeJobCASConflict, job.ID, expectedStatus)
 		}
 		return fmt.Errorf("job not found")
 	}
@@ -1130,9 +1208,19 @@ func interruptBookKnowledgeJob(job *BookKnowledgeJob, now time.Time) {
 	job.Logs = append(job.Logs, "interrupted")
 }
 
-func isBookKnowledgeJobSQLiteConstraint(err error) bool {
+func isBookKnowledgeJobActiveRetryConstraint(tx *sql.Tx, parentJobID string, err error) bool {
 	var sqliteErr sqlite3.Error
-	return errors.As(err, &sqliteErr) && sqliteErr.Code == sqlite3.ErrConstraint
+	if !errors.As(err, &sqliteErr) || sqliteErr.ExtendedCode != sqlite3.ErrConstraintUnique {
+		return false
+	}
+	var activeRetryID string
+	err = tx.QueryRow(`
+		SELECT job_id FROM book_jobs
+		WHERE retry_of = ? AND status IN (?, ?)
+		ORDER BY created_at ASC, job_id ASC LIMIT 1`,
+		parentJobID, BookKnowledgeJobStatusQueued, BookKnowledgeJobStatusRunning,
+	).Scan(&activeRetryID)
+	return err == nil && activeRetryID != ""
 }
 
 func appendBookKnowledgeJobEvent(tx *sql.Tx, job BookKnowledgeJob) error {
