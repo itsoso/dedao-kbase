@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -87,6 +89,8 @@ func TestBookKnowledgeJobsLegacyInterruptedClassificationIsExact(t *testing.T) {
 func TestBookKnowledgeJobsMigrationSanitizesLegacyData(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	privatePath := "/srv/private/legacy-download"
+	privateWindowsPath := `C:\Users\example\private\book`
+	privateUNCPath := `\\private-server\books\legacy`
 	privateToken := "token=legacy-placeholder"
 	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{
 		{
@@ -101,9 +105,11 @@ func TestBookKnowledgeJobsMigrationSanitizesLegacyData(t *testing.T) {
 		{
 			ID: "job-private-failed", Type: BookKnowledgeJobTypeDedaoEbookDownload,
 			Status: BookKnowledgeJobStatusFailed, EbookID: 43, EbookEnID: "private-failed", DownloadType: 2,
-			Error: privatePath + " " + privateToken, Logs: []string{privateToken},
+			Error: privatePath + " " + privateToken,
+			Logs:  []string{"queued", "running", "downloaded from " + privateWindowsPath, privateToken, "failed"},
 			Result: map[string]any{
-				"ebook_id": 43, "title": privateToken, "private_path": privatePath,
+				"ebook_id": 43, "title": "downloaded from " + privateWindowsPath,
+				"knowledge_book_id": "copied from " + privateUNCPath, "private_path": privatePath,
 			},
 			CreatedAt: "2026-08-09T00:02:00Z", UpdatedAt: "2026-08-09T00:03:00Z",
 		},
@@ -129,6 +135,12 @@ func TestBookKnowledgeJobsMigrationSanitizesLegacyData(t *testing.T) {
 		if title, ok := job.Result["title"].(string); ok && title != "" {
 			t.Fatalf("sensitive title retained: %#v", job.Result)
 		}
+		if job.ID == "job-private-failed" {
+			wantLogs := []string{"queued", "running", "failed"}
+			if !reflect.DeepEqual(job.Logs, wantLogs) {
+				t.Fatalf("failed logs = %#v, want %#v", job.Logs, wantLogs)
+			}
+		}
 	}
 
 	db, err := sql.Open("sqlite3", store.BookJobsDBPath())
@@ -149,7 +161,7 @@ func TestBookKnowledgeJobsMigrationSanitizesLegacyData(t *testing.T) {
 		if err := rows.Scan(&persisted); err != nil {
 			t.Fatal(err)
 		}
-		for _, forbidden := range []string{privatePath, privateToken} {
+		for _, forbidden := range []string{privatePath, privateWindowsPath, privateUNCPath, privateToken} {
 			if strings.Contains(persisted, forbidden) {
 				t.Fatalf("persisted legacy secret %q in %q", forbidden, persisted)
 			}
@@ -157,6 +169,137 @@ func TestBookKnowledgeJobsMigrationSanitizesLegacyData(t *testing.T) {
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestBookKnowledgeJobsMigrationPreservesSafeLegacyResultAndLogs(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	slashTitle := "输入/输出"
+	backslashTitle := `输入\输出`
+	longTitle := strings.Repeat("长标题", 240)
+	privateLog := "downloaded from /Volumes/private/books/legacy"
+	tokenLog := "token=legacy-placeholder"
+	unknownLog := "download finished for a private book"
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{
+		{
+			ID: "job-safe-slash", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+			Status: BookKnowledgeJobStatusSucceeded, EbookID: 61, EbookEnID: "random-enid-61", DownloadType: 1,
+			Result:    map[string]any{"ebook_id": 61, "ebook_enid": "random-enid-61", "title": slashTitle},
+			Logs:      []string{"queued", "running", privateLog, "succeeded"},
+			CreatedAt: "2026-08-09T00:00:00Z", UpdatedAt: "2026-08-09T00:01:00Z",
+		},
+		{
+			ID: "job-safe-long", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+			Status: BookKnowledgeJobStatusSucceeded, EbookID: 62, EbookEnID: "random-enid-62", DownloadType: 2,
+			Result: map[string]any{
+				"ebook_id": 62, "title": longTitle, "knowledge_book_id": "knowledge-book-62",
+			},
+			Logs:      []string{"queued", tokenLog, unknownLog, "running", "succeeded"},
+			CreatedAt: "2026-08-09T00:02:00Z", UpdatedAt: "2026-08-09T00:03:00Z",
+		},
+		{
+			ID: "job-safe-backslash", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+			Status: BookKnowledgeJobStatusSucceeded, EbookID: 63, EbookEnID: "random-enid-63", DownloadType: 3,
+			Result:    map[string]any{"ebook_id": 63, "title": backslashTitle},
+			Logs:      []string{"queued", "running", "succeeded", privateLog},
+			CreatedAt: "2026-08-09T00:04:00Z", UpdatedAt: "2026-08-09T00:05:00Z",
+		},
+	})
+
+	jobs, err := store.ListBookKnowledgeJobs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]BookKnowledgeJob, len(jobs))
+	for _, job := range jobs {
+		byID[job.ID] = job
+	}
+	if got := byID["job-safe-slash"].Result["title"]; got != slashTitle {
+		t.Fatalf("slash title = %#v, want %q", got, slashTitle)
+	}
+	if got := byID["job-safe-slash"].Result["ebook_enid"]; got != "random-enid-61" {
+		t.Fatalf("ebook_enid = %#v", got)
+	}
+	if got := byID["job-safe-long"].Result["title"]; got != longTitle {
+		t.Fatalf("long title length = %d, want %d", len(fmt.Sprint(got)), len(longTitle))
+	}
+	if got := byID["job-safe-long"].Result["knowledge_book_id"]; got != "knowledge-book-62" {
+		t.Fatalf("knowledge_book_id = %#v", got)
+	}
+	if got := byID["job-safe-backslash"].Result["title"]; got != backslashTitle {
+		t.Fatalf("backslash title = %#v, want %q", got, backslashTitle)
+	}
+	wantLogs := []string{"queued", "running", "succeeded"}
+	for _, jobID := range []string{"job-safe-slash", "job-safe-long", "job-safe-backslash"} {
+		if got := byID[jobID].Logs; !reflect.DeepEqual(got, wantLogs) {
+			t.Fatalf("%s logs = %#v, want %#v", jobID, got, wantLogs)
+		}
+	}
+
+	db, err := sql.Open("sqlite3", store.BookJobsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`
+		SELECT logs_json || ' ' || result_json FROM book_jobs
+		UNION ALL
+		SELECT message FROM book_job_events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var persisted string
+		if err := rows.Scan(&persisted); err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{privateLog, tokenLog, unknownLog} {
+			if strings.Contains(persisted, forbidden) {
+				t.Fatalf("persisted sensitive log %q in %q", forbidden, persisted)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBookKnowledgeJobsMigrationPreservesSafeInterruptedHistory(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{
+		{
+			ID: "job-interrupted-history", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+			Status: BookKnowledgeJobStatusFailed, EbookID: 64, EbookEnID: "random-enid-64", DownloadType: 1,
+			Error:     "interrupted by server restart",
+			Logs:      []string{"queued", "running", "failed"},
+			CreatedAt: "2026-08-09T00:06:00Z", UpdatedAt: "2026-08-09T00:07:00Z",
+		},
+	})
+
+	jobs, err := store.ListBookKnowledgeJobs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+	wantLogs := []string{"queued", "running", "interrupted"}
+	if !reflect.DeepEqual(jobs[0].Logs, wantLogs) {
+		t.Fatalf("logs = %#v, want %#v", jobs[0].Logs, wantLogs)
+	}
+
+	db, err := sql.Open("sqlite3", store.BookJobsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var message string
+	if err := db.QueryRow(`SELECT message FROM book_job_events WHERE job_id = ?`, jobs[0].ID).Scan(&message); err != nil {
+		t.Fatal(err)
+	}
+	if message != bookKnowledgeJobInterruptedMessage {
+		t.Fatalf("event message = %q, want %q", message, bookKnowledgeJobInterruptedMessage)
 	}
 }
 

@@ -785,17 +785,16 @@ func normalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) BookKnowledgeJob {
 		job.Stage = defaultBookKnowledgeJobStage(job.Status)
 		job.FailureCode = BookKnowledgeJobFailureWorkerInterrupted
 		job.Error = bookKnowledgeJobInterruptedMessage
-		job.Logs = []string{"interrupted"}
+		job.Logs = safeLegacyBookKnowledgeJobLogs(job.Status, job.Logs)
 		return job
 	}
+	job.Logs = safeLegacyBookKnowledgeJobLogs(job.Status, job.Logs)
 	job.FailureCode = ""
 	if job.Status == BookKnowledgeJobStatusFailed {
 		job.Error = sanitizeBookKnowledgeJobError(job.Error)
-		job.Logs = []string{"failed"}
 		return job
 	}
 	job.Error = ""
-	job.Logs = []string{string(job.Status)}
 	return job
 }
 
@@ -851,18 +850,98 @@ func legacyBookKnowledgeJobResultNumber(value any) bool {
 
 func legacyBookKnowledgeJobResultTextIsSafe(value string) bool {
 	value = strings.TrimSpace(value)
-	if value == "" || len(value) > 512 || filepath.IsAbs(value) || strings.ContainsAny(value, `/\`) {
+	if value == "" {
 		return false
 	}
+	return !legacyBookKnowledgeJobTextContainsSensitiveData(value)
+}
+
+func safeLegacyBookKnowledgeJobLogs(status BookKnowledgeJobStatus, logs []string) []string {
+	safe := make([]string, 0, len(logs))
+	for _, entry := range logs {
+		var normalized string
+		switch strings.ToLower(strings.TrimSpace(entry)) {
+		case "queued":
+			normalized = "queued"
+		case "running":
+			normalized = "running"
+		case "succeeded":
+			normalized = "succeeded"
+		case "failed":
+			normalized = "failed"
+		case "failed: interrupted", "interrupted":
+			normalized = "interrupted"
+		default:
+			continue
+		}
+		if status == BookKnowledgeJobStatusInterrupted && normalized == "failed" {
+			normalized = "interrupted"
+		}
+		safe = append(safe, normalized)
+	}
+	if len(safe) == 0 {
+		return []string{string(status)}
+	}
+	if status == BookKnowledgeJobStatusInterrupted && safe[len(safe)-1] != "interrupted" {
+		safe = append(safe, "interrupted")
+	}
+	return safe
+}
+
+func legacyBookKnowledgeJobTextContainsSensitiveData(value string) bool {
+	value = strings.TrimSpace(value)
 	lower := strings.ToLower(value)
+	if strings.HasPrefix(value, "/") || legacyBookKnowledgeJobWindowsAbsolutePath(value) || legacyBookKnowledgeJobUNCPath(value) {
+		return true
+	}
 	for _, marker := range []string{
-		"token=", "access_token=", "secret=", "api_key=", "apikey=", "cookie=", "authorization:", "bearer ",
+		"/users/", "/home/", "/root/", "/volumes/", "/var/folders/", "/private/var/",
+		"/applications/", "/library/", "/etc/", "/opt/", "/srv/", "/tmp/", "/usr/",
 	} {
 		if strings.Contains(lower, marker) {
-			return false
+			return true
 		}
 	}
-	return true
+	for _, marker := range []string{
+		"token=", "access_token=", "secret=", "api_key=", "apikey=", "cookie=", "authorization:", "bearer ",
+		"-----begin private key-----", "-----begin rsa private key-----", "-----begin ec private key-----",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	if strings.Contains(lower, "-----begin ") && strings.Contains(lower, " private key-----") {
+		return true
+	}
+	return false
+}
+
+func legacyBookKnowledgeJobWindowsAbsolutePath(value string) bool {
+	for index := 0; index+2 < len(value); index++ {
+		letter := value[index]
+		if ((letter >= 'a' && letter <= 'z') || (letter >= 'A' && letter <= 'Z')) &&
+			value[index+1] == ':' && (value[index+2] == '\\' || value[index+2] == '/') {
+			return true
+		}
+	}
+	return false
+
+}
+
+func legacyBookKnowledgeJobUNCPath(value string) bool {
+	for start := 0; start < len(value); {
+		offset := strings.Index(value[start:], `\\`)
+		if offset < 0 {
+			return false
+		}
+		remainder := value[start+offset+2:]
+		serverEnd := strings.IndexByte(remainder, '\\')
+		if serverEnd > 0 && serverEnd+1 < len(remainder) && remainder[serverEnd+1] != '\\' && !strings.ContainsAny(remainder[:serverEnd], " \t\r\n") {
+			return true
+		}
+		start += offset + 2
+	}
+	return false
 }
 
 func bookKnowledgeJobStage(job BookKnowledgeJob) string {
