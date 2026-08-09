@@ -752,3 +752,275 @@ func TestBookJobWorkerLeaseLossCancelsBlockingEbookGeneratorAndReturns(t *testin
 		t.Fatalf("blocked generator published final file: %v", err)
 	}
 }
+
+func TestBookJobWorkerReconcileCompletesVerifiedPackageAfterLeaseLossPastPublishFence(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 285)
+	store.afterPackagePublishGate = func() {
+		db, err := store.openBookJobsWriteDB()
+		if err != nil {
+			t.Errorf("open jobs database: %v", err)
+			return
+		}
+		defer db.Close()
+		if _, err := db.Exec(`UPDATE book_jobs SET lease_owner = ?, lease_expires_at = ? WHERE job_id = ?`,
+			"replacement-worker", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), job.ID); err != nil {
+			t.Errorf("replace lease owner: %v", err)
+		}
+	}
+	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		pkg := sampleBookKnowledgePackageForExport()
+		pkg.Book.BookID = "285"
+		pkg.Book.DedaoID = claimed.EbookID
+		pkg.Book.EnID = claimed.EbookEnID
+		pkg.Book.Title = "Recovered Commit"
+		pkg.Book.ContentHash = ""
+		if err := store.SavePackageContext(ctx, pkg); err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"ebook_id": claimed.EbookID, "ebook_enid": claimed.EbookEnID,
+			"download_type": 1, "knowledge_book_id": pkg.Book.BookID, "title": pkg.Book.Title,
+		}, nil
+	})
+	processed, runErr := worker.RunOnce(context.Background())
+	if !processed || !errors.Is(runErr, ErrBookJobWorkerInfrastructure) {
+		t.Fatalf("RunOnce processed=%t err=%v, want completion CAS infrastructure failure", processed, runErr)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusRunning {
+		t.Fatalf("job before reconcile=%#v err=%v", loaded, err)
+	}
+	count, err := store.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	loaded, err = store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusSucceeded || loaded.Stage != "completed" {
+		t.Fatalf("recovered job=%#v err=%v", loaded, err)
+	}
+	if len(loaded.Result) != 5 || loaded.Result["knowledge_book_id"] != "285" || loaded.Result["title"] != "Recovered Commit" {
+		t.Fatalf("safe recovered result=%#v", loaded.Result)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+}
+
+func TestReconcileCommitIntentWithoutFullyPublishedPackageInterruptsJob(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 286)
+	claimed, err := store.ClaimNextBookKnowledgeJob("intent-worker", time.Second)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "286"
+	pkg.Book.DedaoID = job.EbookID
+	pkg.Book.EnID = job.EbookEnID
+	pkg.Book.ContentHash = ""
+	hash, err := BookKnowledgeContentHash(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.fenceBookKnowledgeJobPackageCommit(
+		job.ID, "intent-worker", pkg.Book.BookID, hash, bookJobWorkerCommitLeaseWindow,
+	); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`UPDATE book_jobs SET lease_expires_at = ? WHERE job_id = ?`,
+		time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), job.ID)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := store.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("intent-only job=%#v err=%v", loaded, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+}
+
+func TestReconcileRejectsCommitReceiptWhenPublishedPackageVerificationFails(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *BookKnowledgeStore, BookKnowledgePackage)
+	}{
+		{
+			name: "root manifest missing",
+			mutate: func(t *testing.T, store *BookKnowledgeStore, _ BookKnowledgePackage) {
+				t.Helper()
+				if err := os.Remove(store.ManifestPath()); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "durable content hash mismatch",
+			mutate: func(t *testing.T, store *BookKnowledgeStore, pkg BookKnowledgePackage) {
+				t.Helper()
+				pkg.Chunks[0].Text += " tampered"
+				if err := writeJSONLFile(store.BookJSONLPath(pkg.Book.BookID, "chunks"), pkg.Chunks); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 289)
+			claimed, err := store.ClaimNextBookKnowledgeJob("verification-worker", time.Second)
+			if err != nil || claimed == nil || claimed.ID != job.ID {
+				t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+			}
+			pkg := sampleBookKnowledgePackageForExport()
+			pkg.Book.BookID = "289"
+			pkg.Book.DedaoID = job.EbookID
+			pkg.Book.EnID = job.EbookEnID
+			pkg.Book.ContentHash = ""
+			if err := store.SavePackage(pkg); err != nil {
+				t.Fatal(err)
+			}
+			published, err := store.LoadPackage(pkg.Book.BookID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.fenceBookKnowledgeJobPackageCommit(
+				job.ID, "verification-worker", published.Book.BookID, published.Book.ContentHash, bookJobWorkerCommitLeaseWindow,
+			); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, store, *published)
+			db, err := store.openBookJobsWriteDB()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = db.Exec(`UPDATE book_jobs SET lease_expires_at = ? WHERE job_id = ?`,
+				time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), job.ID)
+			db.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			count, err := store.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+			if err != nil || count != 1 {
+				t.Fatalf("reconcile count=%d err=%v", count, err)
+			}
+			loaded, err := store.LoadBookKnowledgeJob(job.ID)
+			if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+				t.Fatalf("unverified job=%#v err=%v", loaded, err)
+			}
+		})
+	}
+}
+
+func TestBookJobWorkerDiscardsCommitReceiptWhenPackagePublishRollsBack(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 287)
+	store.afterPackageBookInstall = func() error { return errors.New("injected package publish failure") }
+	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		pkg := sampleBookKnowledgePackageForExport()
+		pkg.Book.BookID = "287"
+		pkg.Book.DedaoID = claimed.EbookID
+		pkg.Book.EnID = claimed.EbookEnID
+		pkg.Book.ContentHash = ""
+		return nil, store.SavePackageContext(ctx, pkg)
+	})
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusFailed {
+		t.Fatalf("failed job=%#v err=%v", loaded, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+}
+
+func TestBookJobWorkerCompletesFencedPackageAndDeletesReceipt(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 288)
+	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		pkg := sampleBookKnowledgePackageForExport()
+		pkg.Book.BookID = "288"
+		pkg.Book.DedaoID = claimed.EbookID
+		pkg.Book.EnID = claimed.EbookEnID
+		pkg.Book.Title = "Normal Commit"
+		pkg.Book.ContentHash = ""
+		if err := store.SavePackageContext(ctx, pkg); err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"ebook_id": claimed.EbookID, "ebook_enid": claimed.EbookEnID,
+			"download_type": 1, "knowledge_book_id": pkg.Book.BookID, "title": pkg.Book.Title,
+		}, nil
+	})
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("completed job=%#v err=%v", loaded, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+}
+
+func TestBookKnowledgeJobRenewalRetainsLongerCommitFenceLease(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 290)
+	claimed, err := store.ClaimNextBookKnowledgeJob("short-lease-worker", 2*time.Second)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "290"
+	pkg.Book.DedaoID = job.EbookID
+	pkg.Book.EnID = job.EbookEnID
+	hash, err := BookKnowledgeContentHash(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fenced, err := store.fenceBookKnowledgeJobPackageCommit(
+		job.ID, "short-lease-worker", pkg.Book.BookID, hash, bookJobWorkerCommitLeaseWindow,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fencedExpiry, err := time.Parse(time.RFC3339Nano, fenced.LeaseExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	renewed, err := store.RenewBookKnowledgeJobLease(job.ID, "short-lease-worker", 2*time.Second)
+	if err != nil {
+		t.Fatalf("short heartbeat after commit fence: %v", err)
+	}
+	renewedExpiry, err := time.Parse(time.RFC3339Nano, renewed.LeaseExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renewedExpiry.Before(fencedExpiry) {
+		t.Fatalf("heartbeat shortened fenced lease from %s to %s", fencedExpiry, renewedExpiry)
+	}
+}
+
+func assertBookJobCommitReceiptCount(t *testing.T, store *BookKnowledgeStore, jobID string, want int) {
+	t.Helper()
+	db, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM book_job_commits WHERE job_id = ?`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != want {
+		t.Fatalf("commit receipt count=%d want=%d", count, want)
+	}
+}

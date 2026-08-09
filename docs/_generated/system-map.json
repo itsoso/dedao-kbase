@@ -1154,12 +1154,12 @@
     {
       "name": "BookKnowledgeBook",
       "file": "backend/app/book_knowledge.go",
-      "line": 27
+      "line": 31
     },
     {
       "name": "BookKnowledgeChapter",
       "file": "backend/app/book_knowledge.go",
-      "line": 45
+      "line": 49
     },
     {
       "name": "BookKnowledgeChatContextStats",
@@ -1189,17 +1189,17 @@
     {
       "name": "BookKnowledgeChunk",
       "file": "backend/app/book_knowledge.go",
-      "line": 54
+      "line": 58
     },
     {
       "name": "BookKnowledgeCitation",
       "file": "backend/app/book_knowledge.go",
-      "line": 76
+      "line": 80
     },
     {
       "name": "BookKnowledgeClaim",
       "file": "backend/app/book_knowledge.go",
-      "line": 63
+      "line": 67
     },
     {
       "name": "BookKnowledgeExportResult",
@@ -1209,12 +1209,12 @@
     {
       "name": "BookKnowledgeJob",
       "file": "backend/app/book_jobs.go",
-      "line": 81
+      "line": 82
     },
     {
       "name": "BookKnowledgeJobRequest",
       "file": "backend/app/book_jobs.go",
-      "line": 102
+      "line": 103
     },
     {
       "name": "BookKnowledgeLLMResult",
@@ -1244,7 +1244,7 @@
     {
       "name": "BookKnowledgeManifest",
       "file": "backend/app/book_knowledge.go",
-      "line": 140
+      "line": 144
     },
     {
       "name": "BookKnowledgeMessage",
@@ -1259,7 +1259,7 @@
     {
       "name": "BookKnowledgePackage",
       "file": "backend/app/book_knowledge.go",
-      "line": 90
+      "line": 94
     },
     {
       "name": "BookKnowledgePrompt",
@@ -1269,17 +1269,17 @@
     {
       "name": "BookKnowledgeSearchQuery",
       "file": "backend/app/book_knowledge.go",
-      "line": 146
+      "line": 150
     },
     {
       "name": "BookKnowledgeSearchResult",
       "file": "backend/app/book_knowledge.go",
-      "line": 152
+      "line": 156
     },
     {
       "name": "BookKnowledgeStore",
       "file": "backend/app/book_knowledge.go",
-      "line": 164
+      "line": 168
     },
     {
       "name": "BookQualityReport",

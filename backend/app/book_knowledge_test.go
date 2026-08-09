@@ -1,12 +1,14 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -15,6 +17,8 @@ import (
 	"testing"
 	"time"
 )
+
+const bookKnowledgeRootLockHelperEnv = "DEDAO_TEST_BOOK_PACKAGE_LOCK_HELPER"
 
 func TestBookKnowledgeContentHashIsStableAndTracksDurableContent(t *testing.T) {
 	pkg := sampleBookKnowledgePackageForExport()
@@ -172,6 +176,308 @@ func TestSavePackageContextPreservesDerivedBookArtifacts(t *testing.T) {
 	data, err := os.ReadFile(derivedPath)
 	if err != nil || string(data) != "derived" {
 		t.Fatalf("derived artifact=%q err=%v", data, err)
+	}
+}
+
+func TestSavePackageContextSerializesIndependentStoresWithoutLosingManifestBooks(t *testing.T) {
+	root := t.TempDir()
+	storeA := NewBookKnowledgeStore(root)
+	storeB := NewBookKnowledgeStore(root)
+	pkgA := sampleBookKnowledgePackageForExport()
+	pkgA.Book.BookID = "concurrent-a"
+	pkgA.Book.Title = "Concurrent A"
+	pkgA.Book.ContentHash = ""
+	pkgB := sampleBookKnowledgePackageForExport()
+	pkgB.Book.BookID = "concurrent-b"
+	pkgB.Book.Title = "Concurrent B"
+	pkgB.Book.ContentHash = ""
+
+	aReadManifest := make(chan struct{})
+	releaseA := make(chan struct{})
+	bAttemptedLock := make(chan struct{})
+	storeA.afterPackageManifestRead = func() {
+		close(aReadManifest)
+		<-releaseA
+	}
+	storeB.beforePackageRootLock = func() { close(bAttemptedLock) }
+
+	aDone := make(chan error, 1)
+	bDone := make(chan error, 1)
+	go func() { aDone <- storeA.SavePackageContext(context.Background(), pkgA) }()
+	<-aReadManifest
+	go func() { bDone <- storeB.SavePackageContext(context.Background(), pkgB) }()
+	<-bAttemptedLock
+	close(releaseA)
+	if err := <-aDone; err != nil {
+		t.Fatalf("store A SavePackageContext: %v", err)
+	}
+	if err := <-bDone; err != nil {
+		t.Fatalf("store B SavePackageContext: %v", err)
+	}
+
+	books, err := NewBookKnowledgeStore(root).ListBooks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(books) != 2 || books[0].BookID != "concurrent-a" || books[1].BookID != "concurrent-b" {
+		t.Fatalf("manifest books=%#v, want both concurrent packages", books)
+	}
+	for _, bookID := range []string{"concurrent-a", "concurrent-b"} {
+		if _, err := NewBookKnowledgeStore(root).LoadPackage(bookID); err != nil {
+			t.Fatalf("LoadPackage(%q): %v", bookID, err)
+		}
+	}
+}
+
+func TestSavePackageContextRollbackCannotDeleteIndependentStoreCommit(t *testing.T) {
+	root := t.TempDir()
+	initialStore := NewBookKnowledgeStore(root)
+	initial := sampleBookKnowledgePackageForExport()
+	initial.Book.BookID = "shared-book"
+	initial.Book.Title = "Initial"
+	initial.Book.ContentHash = ""
+	if err := initialStore.SavePackage(initial); err != nil {
+		t.Fatal(err)
+	}
+
+	storeA := NewBookKnowledgeStore(root)
+	storeB := NewBookKnowledgeStore(root)
+	pkgA := initial
+	pkgA.Book.Title = "Failed A"
+	pkgA.Book.ContentHash = ""
+	pkgB := initial
+	pkgB.Book.Title = "Committed B"
+	pkgB.Book.ContentHash = ""
+
+	aInstalled := make(chan struct{})
+	releaseAFailure := make(chan struct{})
+	bAttemptedLock := make(chan struct{})
+	storeA.afterPackageBookInstall = func() error {
+		close(aInstalled)
+		<-releaseAFailure
+		return errors.New("injected manifest publish failure")
+	}
+	storeB.beforePackageRootLock = func() { close(bAttemptedLock) }
+	aDone := make(chan error, 1)
+	bDone := make(chan error, 1)
+	go func() { aDone <- storeA.SavePackageContext(context.Background(), pkgA) }()
+	<-aInstalled
+	go func() { bDone <- storeB.SavePackageContext(context.Background(), pkgB) }()
+	<-bAttemptedLock
+	close(releaseAFailure)
+	if err := <-aDone; err == nil || !strings.Contains(err.Error(), "injected manifest publish failure") {
+		t.Fatalf("store A error=%v", err)
+	}
+	if err := <-bDone; err != nil {
+		t.Fatalf("store B SavePackageContext: %v", err)
+	}
+	loaded, err := NewBookKnowledgeStore(root).LoadPackage("shared-book")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Book.Title != "Committed B" {
+		t.Fatalf("final title=%q, want independent store commit", loaded.Book.Title)
+	}
+}
+
+func TestSavePackageContextRootLockWaitHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	storeA := NewBookKnowledgeStore(root)
+	storeB := NewBookKnowledgeStore(root)
+	pkgA := sampleBookKnowledgePackageForExport()
+	pkgA.Book.BookID = "lock-holder"
+	pkgA.Book.ContentHash = ""
+	pkgB := sampleBookKnowledgePackageForExport()
+	pkgB.Book.BookID = "lock-waiter"
+	pkgB.Book.ContentHash = ""
+
+	aAtGate := make(chan struct{})
+	releaseA := make(chan struct{})
+	bAttemptedLock := make(chan struct{})
+	storeA.beforePackagePublish = func() {
+		close(aAtGate)
+		<-releaseA
+	}
+	storeB.beforePackageRootLock = func() { close(bAttemptedLock) }
+	aDone := make(chan error, 1)
+	go func() { aDone <- storeA.SavePackageContext(context.Background(), pkgA) }()
+	<-aAtGate
+	ctx, cancel := context.WithCancel(context.Background())
+	bDone := make(chan error, 1)
+	go func() { bDone <- storeB.SavePackageContext(ctx, pkgB) }()
+	<-bAttemptedLock
+	cancel()
+	select {
+	case err := <-bDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiting SavePackageContext error=%v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting SavePackageContext did not stop after cancellation")
+	}
+	close(releaseA)
+	if err := <-aDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewBookKnowledgeStore(root).LoadPackage("lock-waiter"); !os.IsNotExist(err) {
+		t.Fatalf("canceled waiter package error=%v, want not exist", err)
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("root mode=%v, want 0700", rootInfo.Mode().Perm())
+	}
+	lockInfo, err := os.Stat(filepath.Join(root, bookKnowledgeRootLockFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("lock mode=%v, want 0600", lockInfo.Mode().Perm())
+	}
+}
+
+func TestBookKnowledgeRootLockCancellationAcrossProcesses(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	rootLock, err := store.acquireBookKnowledgeRootLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootLock.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBookKnowledgeRootLockSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(), bookKnowledgeRootLockHelperEnv+"="+root)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil && cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForSubprocessLine(t, lines, "package-lock-attempted")
+	if _, err := stdin.Write([]byte("cancel\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	waitForSubprocessLine(t, lines, "package-lock-canceled")
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("lock helper: %v", err)
+	}
+}
+
+func TestBookKnowledgeReaderWaitsForWholePackagePublishAcrossStores(t *testing.T) {
+	root := t.TempDir()
+	writer := NewBookKnowledgeStore(root)
+	reader := NewBookKnowledgeStore(root)
+	initial := sampleBookKnowledgePackageForExport()
+	initial.Book.BookID = "reader-snapshot"
+	initial.Book.Title = "Initial Snapshot"
+	initial.Book.ContentHash = ""
+	initial.Chunks[0].Text = "old-snapshot-marker"
+	if err := writer.SavePackage(initial); err != nil {
+		t.Fatal(err)
+	}
+	updated := initial
+	updated.Book.Title = "Updated Snapshot"
+	updated.Book.ContentHash = ""
+	updated.Chunks = append([]BookKnowledgeChunk(nil), initial.Chunks...)
+	updated.Chunks[0].Text = "new-snapshot-marker"
+
+	bookInstalled := make(chan struct{})
+	releasePublish := make(chan struct{})
+	readerAttempted := make(chan struct{})
+	writer.afterPackageBookInstall = func() error {
+		close(bookInstalled)
+		<-releasePublish
+		return nil
+	}
+	reader.beforePackageRootReadLock = func() { close(readerAttempted) }
+	writeDone := make(chan error, 1)
+	go func() { writeDone <- writer.SavePackageContext(context.Background(), updated) }()
+	<-bookInstalled
+	type searchResult struct {
+		results []BookKnowledgeSearchResult
+		err     error
+	}
+	readDone := make(chan searchResult, 1)
+	go func() {
+		results, err := reader.Search(BookKnowledgeSearchQuery{Query: "new-snapshot-marker"})
+		readDone <- searchResult{results: results, err: err}
+	}()
+	<-readerAttempted
+	close(releasePublish)
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	read := <-readDone
+	if read.err != nil {
+		t.Fatal(read.err)
+	}
+	if len(read.results) != 1 || read.results[0].BookTitle != "Updated Snapshot" ||
+		!strings.Contains(read.results[0].Snippet, "new-snapshot-marker") {
+		t.Fatalf("reader observed mixed package/catalog snapshot: %#v", read.results)
+	}
+}
+
+func TestBookKnowledgeRootLockSubprocessHelper(t *testing.T) {
+	root := os.Getenv(bookKnowledgeRootLockHelperEnv)
+	if root == "" {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		cancel()
+	}()
+	store := NewBookKnowledgeStore(root)
+	store.beforePackageRootLock = func() { fmt.Println("package-lock-attempted") }
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "subprocess-waiter"
+	pkg.Book.ContentHash = ""
+	if err := store.SavePackageContext(ctx, pkg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SavePackageContext error=%v, want context canceled", err)
+	}
+	fmt.Println("package-lock-canceled")
+}
+
+func waitForSubprocessLine(t *testing.T, lines <-chan string, want string) {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("subprocess output ended before %q", want)
+			}
+			if strings.Contains(line, want) {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("subprocess did not report %q", want)
+		}
 	}
 }
 

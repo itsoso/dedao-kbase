@@ -17,11 +17,15 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/gofrs/flock"
 )
 
 const (
 	bookKnowledgeVersion          = "1"
 	defaultBookKnowledgeExtractor = "dedao-gui-fallback"
+	bookKnowledgeRootLockFileName = ".package.lock"
+	bookKnowledgeRootLockRetry    = 10 * time.Millisecond
 )
 
 type BookKnowledgeBook struct {
@@ -162,11 +166,37 @@ type BookKnowledgeSearchResult struct {
 }
 
 type BookKnowledgeStore struct {
-	root                    string
-	mu                      sync.RWMutex
-	agentSemanticEmbedder   AgentSemanticEmbedder
-	beforePackagePublish    func()
-	afterPackagePublishGate func()
+	root                      string
+	mu                        sync.RWMutex
+	agentSemanticEmbedder     AgentSemanticEmbedder
+	beforePackageRootLock     func()
+	beforePackageRootReadLock func()
+	afterPackageManifestRead  func()
+	beforePackagePublish      func()
+	afterPackagePublishGate   func()
+	afterPackageBookInstall   func() error
+}
+
+type bookKnowledgePackageCommitFence struct {
+	prepare func(context.Context, BookKnowledgePackage) error
+	discard func(BookKnowledgePackage) error
+}
+
+type bookKnowledgePackageCommitFenceContextKey struct{}
+
+func contextWithBookKnowledgePackageCommitFence(
+	ctx context.Context,
+	fence bookKnowledgePackageCommitFence,
+) context.Context {
+	return context.WithValue(ctx, bookKnowledgePackageCommitFenceContextKey{}, fence)
+}
+
+func bookKnowledgePackageCommitFenceFromContext(ctx context.Context) (bookKnowledgePackageCommitFence, bool) {
+	if ctx == nil {
+		return bookKnowledgePackageCommitFence{}, false
+	}
+	fence, ok := ctx.Value(bookKnowledgePackageCommitFenceContextKey{}).(bookKnowledgePackageCommitFence)
+	return fence, ok && fence.prepare != nil
 }
 
 func (s *BookKnowledgeStore) SetAgentSemanticEmbedder(embedder AgentSemanticEmbedder) {
@@ -229,6 +259,11 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	rootLock, err := s.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer rootLock.Close()
 
 	if strings.TrimSpace(pkg.Book.BookID) == "" {
 		return fmt.Errorf("book knowledge package missing book_id")
@@ -273,15 +308,15 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 	if err != nil {
 		return err
 	}
+	if s.afterPackageManifestRead != nil {
+		s.afterPackageManifestRead()
+	}
 	manifest = upsertBookKnowledgeManifest(manifest, pkg.Book)
 	manifestJSON, err := encodeJSONFile(manifest)
 	if err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(s.root, os.ModePerm); err != nil {
 		return err
 	}
 	stagingRoot, err := os.MkdirTemp(s.root, ".book-package-")
@@ -324,10 +359,83 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	fence, hasFence := bookKnowledgePackageCommitFenceFromContext(ctx)
+	if hasFence {
+		if err := fence.prepare(ctx, pkg); err != nil {
+			return err
+		}
+	}
 	if s.afterPackagePublishGate != nil {
 		s.afterPackagePublishGate()
 	}
-	return publishBookKnowledgePackage(stagedBookDir, s.BookDir(pkg.Book.BookID), stagedManifest, s.ManifestPath())
+	publishErr := publishBookKnowledgePackage(
+		stagedBookDir, s.BookDir(pkg.Book.BookID), stagedManifest, s.ManifestPath(), s.afterPackageBookInstall,
+	)
+	if publishErr != nil && hasFence && fence.discard != nil {
+		if discardErr := fence.discard(pkg); discardErr != nil {
+			return errors.Join(publishErr, fmt.Errorf("discard package commit receipt: %w", discardErr))
+		}
+	}
+	return publishErr
+}
+
+func (s *BookKnowledgeStore) acquireBookKnowledgeRootLock(ctx context.Context) (*flock.Flock, error) {
+	return s.acquireBookKnowledgeRootFileLock(ctx, false)
+}
+
+func (s *BookKnowledgeStore) acquireBookKnowledgeRootReadLock(ctx context.Context) (*flock.Flock, error) {
+	return s.acquireBookKnowledgeRootFileLock(ctx, true)
+}
+
+func (s *BookKnowledgeStore) acquireBookKnowledgeRootFileLock(ctx context.Context, shared bool) (*flock.Flock, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ensureBookKnowledgePrivateRoot(s.root); err != nil {
+		return nil, err
+	}
+	if shared && s.beforePackageRootReadLock != nil {
+		s.beforePackageRootReadLock()
+	} else if !shared && s.beforePackageRootLock != nil {
+		s.beforePackageRootLock()
+	}
+	fileLock := flock.New(filepath.Join(s.root, bookKnowledgeRootLockFileName))
+	var locked bool
+	var err error
+	if shared {
+		locked, err = fileLock.TryRLockContext(ctx, bookKnowledgeRootLockRetry)
+	} else {
+		locked, err = fileLock.TryLockContext(ctx, bookKnowledgeRootLockRetry)
+	}
+	if err != nil || !locked {
+		_ = fileLock.Close()
+		if err != nil {
+			return nil, err
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, errors.New("book knowledge root lock was not acquired")
+	}
+	if err := os.Chmod(filepath.Join(s.root, bookKnowledgeRootLockFileName), 0o600); err != nil {
+		_ = fileLock.Close()
+		return nil, err
+	}
+	return fileLock, nil
+}
+
+func ensureBookKnowledgePrivateRoot(root string) error {
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("book knowledge root is not a directory: %s", root)
+	}
+	return os.Chmod(root, 0o700)
 }
 
 func copyBookKnowledgeDirectoryContext(ctx context.Context, source, target string) error {
@@ -417,7 +525,10 @@ func copyBookKnowledgeFileContext(ctx context.Context, source, target string, mo
 	return nil
 }
 
-func publishBookKnowledgePackage(stagedBookDir, bookDir, stagedManifest, manifestPath string) error {
+func publishBookKnowledgePackage(
+	stagedBookDir, bookDir, stagedManifest, manifestPath string,
+	afterBookInstall func() error,
+) error {
 	if err := os.MkdirAll(filepath.Dir(bookDir), os.ModePerm); err != nil {
 		return err
 	}
@@ -443,6 +554,11 @@ func publishBookKnowledgePackage(stagedBookDir, bookDir, stagedManifest, manifes
 	}
 	if err := os.Rename(stagedBookDir, bookDir); err != nil {
 		return rollback(err)
+	}
+	if afterBookInstall != nil {
+		if err := afterBookInstall(); err != nil {
+			return rollback(err)
+		}
 	}
 	if err := replaceFileAtomically(stagedManifest, manifestPath); err != nil {
 		return rollback(err)
@@ -497,7 +613,15 @@ func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookK
 func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	rootLock, err := s.acquireBookKnowledgeRootReadLock(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	return s.loadPackageUnlocked(bookID)
+}
 
+func (s *BookKnowledgeStore) loadPackageUnlocked(bookID string) (*BookKnowledgePackage, error) {
 	bookID = sanitizeBookKnowledgeID(bookID)
 	if strings.TrimSpace(bookID) == "" {
 		return nil, fmt.Errorf("book_id is required")
@@ -535,7 +659,15 @@ func (s *BookKnowledgeStore) LoadPackage(bookID string) (*BookKnowledgePackage, 
 func (s *BookKnowledgeStore) ListBooks() ([]BookKnowledgeBook, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	rootLock, err := s.acquireBookKnowledgeRootReadLock(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	return s.listBooksUnlocked()
+}
 
+func (s *BookKnowledgeStore) listBooksUnlocked() ([]BookKnowledgeBook, error) {
 	manifest, err := s.loadManifest()
 	if err != nil {
 		return nil, err
@@ -577,7 +709,14 @@ func (s *BookKnowledgeStore) Search(query BookKnowledgeSearchQuery) ([]BookKnowl
 		limit = 20
 	}
 
-	books, err := s.ListBooks()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rootLock, err := s.acquireBookKnowledgeRootReadLock(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	books, err := s.listBooksUnlocked()
 	if err != nil {
 		return nil, err
 	}
@@ -586,7 +725,7 @@ func (s *BookKnowledgeStore) Search(query BookKnowledgeSearchQuery) ([]BookKnowl
 		if query.BookID != "" && book.BookID != query.BookID {
 			continue
 		}
-		pkg, err := s.LoadPackage(book.BookID)
+		pkg, err := s.loadPackageUnlocked(book.BookID)
 		if err != nil {
 			return nil, err
 		}
@@ -642,18 +781,6 @@ func (s *BookKnowledgeStore) Search(query BookKnowledgeSearchQuery) ([]BookKnowl
 		results = results[:limit]
 	}
 	return results, nil
-}
-
-func (s *BookKnowledgeStore) upsertManifestBook(book BookKnowledgeBook) error {
-	manifest, err := s.loadManifest()
-	if err != nil {
-		return err
-	}
-	manifest = upsertBookKnowledgeManifest(manifest, book)
-	if err := os.MkdirAll(s.root, os.ModePerm); err != nil {
-		return err
-	}
-	return writeJSONFile(s.ManifestPath(), manifest)
 }
 
 func upsertBookKnowledgeManifest(manifest BookKnowledgeManifest, book BookKnowledgeBook) BookKnowledgeManifest {

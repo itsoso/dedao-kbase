@@ -1191,11 +1191,17 @@ func TestBookKnowledgeJobLeaseOwner(t *testing.T) {
 	if !renewedExpiry.After(claimedExpiry) {
 		t.Fatalf("renewed expiry %s did not extend %s", renewedExpiry, claimedExpiry)
 	}
-	renewedEvents := countBookKnowledgeJobEvents(t, store, job.ID)
-	assertRejectedWithoutBookJobMutation(t, store, job.ID, renewedEvents, func() error {
-		_, operationErr := store.RenewBookKnowledgeJobLease(job.ID, "worker-owner", time.Second)
-		return operationErr
-	}, ErrBookKnowledgeJobInvalidState)
+	retained, err := store.RenewBookKnowledgeJobLease(job.ID, "worker-owner", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedExpiry, err := time.Parse(time.RFC3339Nano, retained.LeaseExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retainedExpiry.Before(renewedExpiry) {
+		t.Fatalf("short renewal reduced expiry from %s to %s", renewedExpiry, retainedExpiry)
+	}
 
 	downloading, err := store.UpdateBookKnowledgeJobStage(job.ID, "worker-owner", "downloading")
 	if err != nil || downloading.Stage != "downloading" || downloading.Status != BookKnowledgeJobStatusRunning {

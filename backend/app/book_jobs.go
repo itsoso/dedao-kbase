@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -108,6 +109,14 @@ type BookKnowledgeJobRequest struct {
 
 type bookKnowledgeJobsFile struct {
 	Jobs []BookKnowledgeJob `json:"jobs"`
+}
+
+type bookKnowledgeJobCommitReceipt struct {
+	JobID       string
+	WorkerID    string
+	BookID      string
+	ContentHash string
+	PreparedAt  string
 }
 
 var (
@@ -313,14 +322,98 @@ func (s *BookKnowledgeStore) RenewBookKnowledgeJobLease(jobID, workerID string, 
 			return fmt.Errorf("%w: invalid current lease", ErrBookKnowledgeJobLeaseLost)
 		}
 		newExpiry := now.Add(lease)
-		if !newExpiry.After(currentExpiry) {
-			return fmt.Errorf("%w: renewal must extend lease", ErrBookKnowledgeJobInvalidState)
+		if newExpiry.After(currentExpiry) {
+			job.LeaseExpiresAt = newExpiry.Format(time.RFC3339Nano)
 		}
-		job.LeaseExpiresAt = newExpiry.Format(time.RFC3339Nano)
 		job.UpdatedAt = now.Format(time.RFC3339Nano)
 		job.Logs = append(job.Logs, "lease renewed")
 		return nil
 	})
+}
+
+func (s *BookKnowledgeStore) fenceBookKnowledgeJobPackageCommit(
+	jobID, workerID, bookID, contentHash string,
+	minimumWindow time.Duration,
+) (BookKnowledgeJob, error) {
+	jobID = strings.TrimSpace(jobID)
+	workerID = strings.TrimSpace(workerID)
+	bookID = strings.TrimSpace(bookID)
+	contentHash = strings.TrimSpace(contentHash)
+	if jobID == "" || workerID == "" || bookID == "" || contentHash == "" || minimumWindow <= 0 {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: invalid package commit fence", ErrBookKnowledgeJobInvalidState)
+	}
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	job, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+` WHERE job_id = ?`, jobID))
+	if err == sql.ErrNoRows {
+		tx.Rollback()
+		return BookKnowledgeJob{}, ErrBookKnowledgeJobNotFound
+	}
+	if err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	now := time.Now().UTC()
+	expiry, parseErr := time.Parse(time.RFC3339Nano, job.LeaseExpiresAt)
+	if job.Status != BookKnowledgeJobStatusRunning || job.LeaseOwner != workerID || parseErr != nil || !expiry.After(now) {
+		tx.Rollback()
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q is not leased by worker", ErrBookKnowledgeJobLeaseLost, job.ID)
+	}
+	original := job
+	minimumExpiry := now.Add(minimumWindow)
+	if minimumExpiry.After(expiry) {
+		job.LeaseExpiresAt = minimumExpiry.Format(time.RFC3339Nano)
+	}
+	job.UpdatedAt = now.Format(time.RFC3339Nano)
+	job.Logs = append(job.Logs, "package commit fenced")
+	if err := updateOwnedBookKnowledgeJobRow(tx, job, original); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO book_job_commits(job_id, worker_id, book_id, content_hash, prepared_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(job_id) DO UPDATE SET
+			worker_id = excluded.worker_id,
+			book_id = excluded.book_id,
+			content_hash = excluded.content_hash,
+			prepared_at = excluded.prepared_at`,
+		job.ID, workerID, bookID, contentHash, now.Format(time.RFC3339Nano),
+	); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	return job, nil
+}
+
+func (s *BookKnowledgeStore) discardBookKnowledgeJobCommitReceipt(
+	jobID, workerID, bookID, contentHash string,
+) error {
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	_, err = db.Exec(`
+		DELETE FROM book_job_commits
+		WHERE job_id = ? AND worker_id = ? AND book_id = ? AND content_hash = ?`,
+		strings.TrimSpace(jobID), strings.TrimSpace(workerID), strings.TrimSpace(bookID), strings.TrimSpace(contentHash),
+	)
+	return err
 }
 
 func (s *BookKnowledgeStore) UpdateBookKnowledgeJobStage(jobID, workerID, stage string) (BookKnowledgeJob, error) {
@@ -337,7 +430,7 @@ func (s *BookKnowledgeStore) UpdateBookKnowledgeJobStage(jobID, workerID, stage 
 }
 
 func (s *BookKnowledgeStore) CompleteBookKnowledgeJob(jobID, workerID string, result map[string]any) (BookKnowledgeJob, error) {
-	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+	return s.updateOwnedRunningBookKnowledgeJobWithTx(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
 		timestamp := now.Format(time.RFC3339Nano)
 		job.Status = BookKnowledgeJobStatusSucceeded
 		job.Stage = "completed"
@@ -350,6 +443,9 @@ func (s *BookKnowledgeStore) CompleteBookKnowledgeJob(jobID, workerID string, re
 		job.UpdatedAt = timestamp
 		job.Logs = append(job.Logs, "succeeded")
 		return nil
+	}, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM book_job_commits WHERE job_id = ?`, strings.TrimSpace(jobID))
+		return err
 	})
 }
 
@@ -383,9 +479,23 @@ func (s *BookKnowledgeStore) InterruptBookKnowledgeJob(jobID, workerID string) (
 }
 
 func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobs() (int, error) {
+	return s.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+}
+
+func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobsContext(ctx context.Context) (int, error) {
 	if s == nil {
 		s = DefaultBookKnowledgeStore()
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rootLock, err := s.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer rootLock.Close()
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
 		return 0, err
@@ -426,10 +536,37 @@ func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobs() (int, error) {
 		if job.LeaseExpiresAt != "" && parseErr == nil && expiry.After(now) {
 			continue
 		}
-		interruptBookKnowledgeJob(&job, now)
+		receipt, hasReceipt, receiptErr := loadBookKnowledgeJobCommitReceipt(tx, job.ID)
+		if receiptErr != nil {
+			tx.Rollback()
+			return 0, receiptErr
+		}
+		verifiedResult := map[string]any(nil)
+		if hasReceipt {
+			var verified bool
+			verifiedResult, verified, receiptErr = s.verifyBookKnowledgeJobCommitReceipt(job, receipt)
+			if receiptErr != nil {
+				tx.Rollback()
+				return 0, receiptErr
+			}
+			if !verified {
+				verifiedResult = nil
+			}
+		}
+		if verifiedResult != nil {
+			completeRecoveredBookKnowledgeJob(&job, now, verifiedResult)
+		} else {
+			interruptBookKnowledgeJob(&job, now)
+		}
 		if err := updateBookKnowledgeJobRowFromStatus(tx, job, BookKnowledgeJobStatusRunning); err != nil {
 			tx.Rollback()
 			return 0, err
+		}
+		if hasReceipt {
+			if _, err := tx.Exec(`DELETE FROM book_job_commits WHERE job_id = ?`, job.ID); err != nil {
+				tx.Rollback()
+				return 0, err
+			}
 		}
 		if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
 			tx.Rollback()
@@ -441,6 +578,89 @@ func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobs() (int, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+func loadBookKnowledgeJobCommitReceipt(tx *sql.Tx, jobID string) (bookKnowledgeJobCommitReceipt, bool, error) {
+	var receipt bookKnowledgeJobCommitReceipt
+	err := tx.QueryRow(`
+		SELECT job_id, worker_id, book_id, content_hash, prepared_at
+		FROM book_job_commits WHERE job_id = ?`, strings.TrimSpace(jobID),
+	).Scan(&receipt.JobID, &receipt.WorkerID, &receipt.BookID, &receipt.ContentHash, &receipt.PreparedAt)
+	if err == sql.ErrNoRows {
+		return bookKnowledgeJobCommitReceipt{}, false, nil
+	}
+	if err != nil {
+		return bookKnowledgeJobCommitReceipt{}, false, err
+	}
+	return receipt, true, nil
+}
+
+func (s *BookKnowledgeStore) verifyBookKnowledgeJobCommitReceipt(
+	job BookKnowledgeJob,
+	receipt bookKnowledgeJobCommitReceipt,
+) (map[string]any, bool, error) {
+	if job.Type != BookKnowledgeJobTypeDedaoEbookSyncKBase || receipt.JobID != job.ID ||
+		strings.TrimSpace(receipt.WorkerID) == "" || receipt.BookID != strconv.Itoa(job.EbookID) ||
+		strings.TrimSpace(receipt.ContentHash) == "" {
+		return nil, false, nil
+	}
+	if _, err := time.Parse(time.RFC3339Nano, receipt.PreparedAt); err != nil {
+		return nil, false, nil
+	}
+	pkg, err := s.loadPackageUnlocked(receipt.BookID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if pkg.Book.BookID != receipt.BookID || pkg.Book.DedaoID != job.EbookID || pkg.Book.EnID != job.EbookEnID ||
+		pkg.Book.ContentHash != receipt.ContentHash {
+		return nil, false, nil
+	}
+	computedHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return nil, false, err
+	}
+	if computedHash != receipt.ContentHash {
+		return nil, false, nil
+	}
+	manifest, err := s.loadManifest()
+	if err != nil {
+		return nil, false, err
+	}
+	manifestMatches := false
+	for _, book := range manifest.Books {
+		if book.BookID == receipt.BookID && book.ContentHash == receipt.ContentHash &&
+			book.DedaoID == job.EbookID && book.EnID == job.EbookEnID {
+			manifestMatches = true
+			break
+		}
+	}
+	if !manifestMatches {
+		return nil, false, nil
+	}
+	return safeBookKnowledgeJobResult(map[string]any{
+		"ebook_id":          job.EbookID,
+		"ebook_enid":        job.EbookEnID,
+		"download_type":     1,
+		"knowledge_book_id": pkg.Book.BookID,
+		"title":             pkg.Book.Title,
+	}), true, nil
+}
+
+func completeRecoveredBookKnowledgeJob(job *BookKnowledgeJob, now time.Time, result map[string]any) {
+	timestamp := now.UTC().Format(time.RFC3339Nano)
+	job.Status = BookKnowledgeJobStatusSucceeded
+	job.Stage = "completed"
+	job.Result = safeBookKnowledgeJobResult(result)
+	job.Error = ""
+	job.FailureCode = ""
+	job.LeaseOwner = ""
+	job.LeaseExpiresAt = ""
+	job.FinishedAt = timestamp
+	job.UpdatedAt = timestamp
+	job.Logs = append(job.Logs, "succeeded: recovered committed package")
 }
 
 func (s *BookKnowledgeStore) RetryBookKnowledgeJob(jobID string) (BookKnowledgeJob, error) {
@@ -676,6 +896,15 @@ func (s *BookKnowledgeStore) updateOwnedRunningBookKnowledgeJob(
 	workerID string,
 	mutate func(*BookKnowledgeJob, time.Time) error,
 ) (BookKnowledgeJob, error) {
+	return s.updateOwnedRunningBookKnowledgeJobWithTx(jobID, workerID, mutate, nil)
+}
+
+func (s *BookKnowledgeStore) updateOwnedRunningBookKnowledgeJobWithTx(
+	jobID string,
+	workerID string,
+	mutate func(*BookKnowledgeJob, time.Time) error,
+	afterUpdate func(*sql.Tx) error,
+) (BookKnowledgeJob, error) {
 	if s == nil {
 		s = DefaultBookKnowledgeStore()
 	}
@@ -722,6 +951,12 @@ func (s *BookKnowledgeStore) updateOwnedRunningBookKnowledgeJob(
 	if err := updateOwnedBookKnowledgeJobRow(tx, job, original); err != nil {
 		tx.Rollback()
 		return BookKnowledgeJob{}, err
+	}
+	if afterUpdate != nil {
+		if err := afterUpdate(tx); err != nil {
+			tx.Rollback()
+			return BookKnowledgeJob{}, err
+		}
 	}
 	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
 		tx.Rollback()
@@ -950,7 +1185,7 @@ func (s *BookKnowledgeStore) openBookJobsDBWithTxLock(immediate bool) (*sql.DB, 
 	if s == nil {
 		s = DefaultBookKnowledgeStore()
 	}
-	if err := os.MkdirAll(s.root, 0o750); err != nil {
+	if err := ensureBookKnowledgePrivateRoot(s.root); err != nil {
 		return nil, err
 	}
 	db, err := sql.Open("sqlite3", bookKnowledgeJobsSQLiteDSN(s.BookJobsDBPath(), immediate))
@@ -1032,6 +1267,14 @@ const bookKnowledgeJobsSchema = `
 	);
 	CREATE INDEX IF NOT EXISTS idx_book_job_events_job
 		ON book_job_events(job_id, event_id);
+	CREATE TABLE IF NOT EXISTS book_job_commits (
+		job_id TEXT PRIMARY KEY,
+		worker_id TEXT NOT NULL,
+		book_id TEXT NOT NULL,
+		content_hash TEXT NOT NULL,
+		prepared_at TEXT NOT NULL,
+		FOREIGN KEY(job_id) REFERENCES book_jobs(job_id) ON DELETE CASCADE
+	);
 	CREATE TABLE IF NOT EXISTS book_job_meta (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL

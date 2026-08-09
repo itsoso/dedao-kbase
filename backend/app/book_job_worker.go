@@ -14,6 +14,8 @@ import (
 
 var ErrBookJobWorkerInfrastructure = errors.New("book job worker infrastructure failure")
 
+const bookJobWorkerCommitLeaseWindow = 30 * time.Second
+
 var bookJobWorkerIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
 
 type BookJobWorkerConfig struct {
@@ -117,7 +119,7 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		return false, nil
 	}
-	if _, err := w.store.ReconcileExpiredBookKnowledgeJobs(); err != nil {
+	if _, err := w.store.ReconcileExpiredBookKnowledgeJobsContext(ctx); err != nil {
 		return false, bookJobWorkerInfrastructureError("reconcile jobs")
 	}
 	if w.beforeClaim != nil {
@@ -181,6 +183,36 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	}
 	runCtx, cancel := context.WithCancel(parent)
 	defer cancel()
+	var leaseOperationMu sync.Mutex
+	renewOwnedLease := func() error {
+		leaseOperationMu.Lock()
+		defer leaseOperationMu.Unlock()
+		if w.renewLease != nil {
+			return w.renewLease(job)
+		}
+		_, err := w.store.RenewBookKnowledgeJobLease(job.ID, w.workerID, w.leaseDuration)
+		return err
+	}
+	if job.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
+		runCtx = contextWithBookKnowledgePackageCommitFence(runCtx, bookKnowledgePackageCommitFence{
+			prepare: func(ctx context.Context, pkg BookKnowledgePackage) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				leaseOperationMu.Lock()
+				defer leaseOperationMu.Unlock()
+				_, err := w.store.fenceBookKnowledgeJobPackageCommit(
+					job.ID, w.workerID, pkg.Book.BookID, pkg.Book.ContentHash, bookJobWorkerCommitLeaseWindow,
+				)
+				return err
+			},
+			discard: func(pkg BookKnowledgePackage) error {
+				return w.store.discardBookKnowledgeJobCommitReceipt(
+					job.ID, w.workerID, pkg.Book.BookID, pkg.Book.ContentHash,
+				)
+			},
+		})
+	}
 
 	stopRenew := make(chan struct{})
 	renewDone := make(chan struct{})
@@ -196,12 +228,7 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 			case <-runCtx.Done():
 				return
 			case <-ticker.C:
-				var err error
-				if w.renewLease != nil {
-					err = w.renewLease(job)
-				} else {
-					_, err = w.store.RenewBookKnowledgeJobLease(job.ID, w.workerID, w.leaseDuration)
-				}
+				err := renewOwnedLease()
 				if err != nil {
 					select {
 					case renewFailure <- bookJobWorkerInfrastructureError("renew lease"):
