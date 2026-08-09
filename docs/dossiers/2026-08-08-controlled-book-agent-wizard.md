@@ -392,3 +392,41 @@ Decision: PASS.
   every frontend/Web and repository shell smoke, `go vet ./...`, privacy and
   whitespace checks, and `go test ./... -timeout=300s -count=1` with
   `backend/app` completing in 99.600 seconds.
+
+### Final deployment health gate (G5)
+
+Decision: PASS.
+
+- Canonical `main` and the release branch contain deployed revision
+  `dc7f99232ebcea369e7e43a35989c13c43204d2b`. Its Git archive SHA-256 is
+  `715debc88ee785ed565750dbf351060eab4b5432ecf3383b0078ba77ad108c51`.
+- Linux reverified the archive, reported zero npm vulnerabilities, rebuilt the
+  frontend, passed every frontend and Web smoke, verified all Go modules,
+  passed vet and the complete Go suite, and then produced the CGO server.
+  `backend/app` completed in 73.256 seconds. The server's existing Node 20
+  emitted engine warnings during this extra build; the supported Node 22.23
+  build gate had already passed locally with identical output and bundle hash.
+- The final binary SHA-256 is
+  `a572497fa2e946a027d1ff0c15f4bcd3a7c8c4b257c1bc37257f0e33f33d10b7`.
+  Binary and static Web rollback assets are stored in batch
+  `direct-dc7f992-20260809T024125Z`.
+- Loopback and public health report the exact deployed revision. The service is
+  active/running with `ExecMainStatus=0`, `NRestarts=0`, and no warning-or-higher
+  journal entry since replacement. The Package page returns HTTP 200 and an
+  anonymous Package API request remains HTTP 401. No proxy or Nginx file was
+  changed.
+
+### Final online acceptance gate (G6)
+
+Decision: PASS.
+
+- The authenticated production Package page remained bound to immutable
+  version `1.0.1` and its passing evaluation.
+- `注意力机制的演化` entered the visible busy state with its submit control
+  disabled, then completed in 9.622 seconds with a non-empty answer and eleven
+  resolved citations from the fixed release scope.
+- `这本书的作者喜欢什么颜色？` returned `insufficient_evidence` in 0.384 seconds,
+  before the model-generation path.
+- The browser recorded no new warning or error during both checks. Public and
+  loopback health, installed binary hash, service state, restart count, and
+  deployment-window journal all remained clean after acceptance.
