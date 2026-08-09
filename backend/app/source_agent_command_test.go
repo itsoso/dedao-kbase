@@ -219,6 +219,106 @@ func TestSourceAgentCommandDiagnoseLifecycleAndClaimNext(t *testing.T) {
 		SourceAgentCommandQueued, SourceAgentCommandClaimed, SourceAgentCommandSucceeded)
 }
 
+func TestSourceAgentCommandRestartLifecycleAndRestrictions(t *testing.T) {
+	store, clock := newSourceAgentCommandTestStore(t)
+	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "agent-restart", WorkerType: "book-job-worker", Version: "1.2.3",
+		ProtocolVersion: "2026-08-01", Capabilities: []string{"book_jobs", "controlled_restart"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "agent-restart", Type: " restart ", IdempotencyKey: "restart-once",
+		ExpiresAt: clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Type != SourceAgentCommandRestart || created.State != SourceAgentCommandQueued || created.UpgradeSpec != nil {
+		t.Fatalf("created restart=%#v", created)
+	}
+	claimed, err := store.ClaimSourceAgentCommand(created.ID, "agent-restart", "book-worker")
+	if err != nil || claimed.State != SourceAgentCommandClaimed {
+		t.Fatalf("claim restart=%#v err=%v", claimed, err)
+	}
+	duplicate, err := store.ClaimSourceAgentCommand(created.ID, "agent-restart", "book-worker")
+	if err != nil || duplicate.State != SourceAgentCommandClaimed || duplicate.ClaimOwner != "book-worker" {
+		t.Fatalf("duplicate restart claim=%#v err=%v", duplicate, err)
+	}
+	if _, err := store.ClaimSourceAgentCommand(created.ID, "agent-restart", "other-worker"); !errors.Is(err, ErrSourceAgentCommandClaimOwner) {
+		t.Fatalf("other owner restart claim error=%v", err)
+	}
+	if _, err := store.TransitionSourceAgentCommand(created.ID, "agent-restart", "book-worker", SourceAgentCommandTransition{
+		State: SourceAgentCommandDownloading,
+	}); !errors.Is(err, ErrSourceAgentCommandInvalidState) {
+		t.Fatalf("restart progress transition error=%v", err)
+	}
+	completed, err := store.TransitionSourceAgentCommand(created.ID, "agent-restart", "book-worker", SourceAgentCommandTransition{
+		State: SourceAgentCommandSucceeded, ResultCode: SourceAgentCommandCodeRestartComplete,
+	})
+	if err != nil || completed.State != SourceAgentCommandSucceeded || completed.ResultCode != SourceAgentCommandCodeRestartComplete {
+		t.Fatalf("complete restart=%#v err=%v", completed, err)
+	}
+	assertSourceAgentCommandEventStates(t, mustListSourceAgentCommandEvents(t, store, created.ID),
+		SourceAgentCommandQueued, SourceAgentCommandClaimed, SourceAgentCommandSucceeded)
+
+	if _, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "agent-restart", Type: SourceAgentCommandRestart, IdempotencyKey: "restart-payload",
+		Payload: json.RawMessage(`{}`), ExpiresAt: clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	}); err == nil {
+		t.Fatal("restart payload was accepted")
+	}
+	registerSourceAgentCommandTestAgent(t, store, "agent-no-restart", "1.0.0")
+	if _, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "agent-no-restart", Type: SourceAgentCommandRestart, IdempotencyKey: "restart-no-capability",
+		ExpiresAt: clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	}); !errors.Is(err, ErrSourceAgentCommandCapability) {
+		t.Fatalf("missing capability error=%v", err)
+	}
+	if _, err := store.TransitionSourceAgentCommand(created.ID, "agent-restart", "book-worker", SourceAgentCommandTransition{
+		State: SourceAgentCommandFailed, ResultCode: SourceAgentCommandCodeRestartFailed,
+	}); !errors.Is(err, ErrSourceAgentCommandResultConflict) {
+		t.Fatalf("terminal conflict error=%v", err)
+	}
+	failed, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "agent-restart", Type: SourceAgentCommandRestart, IdempotencyKey: "restart-failed",
+		ExpiresAt: clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimSourceAgentCommand(failed.ID, "agent-restart", "book-worker"); err != nil {
+		t.Fatal(err)
+	}
+	failed, err = store.TransitionSourceAgentCommand(failed.ID, "agent-restart", "book-worker", SourceAgentCommandTransition{
+		State: SourceAgentCommandFailed, ResultCode: SourceAgentCommandCodeRestartFailed,
+	})
+	if err != nil || failed.State != SourceAgentCommandFailed {
+		t.Fatalf("failed restart=%#v err=%v", failed, err)
+	}
+	cancelRejected, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "agent-restart", Type: SourceAgentCommandRestart, IdempotencyKey: "restart-cancel",
+		ExpiresAt: clock.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CancelSourceAgentCommand(cancelRejected.ID, "operator canceled"); !errors.Is(err, ErrSourceAgentCommandInvalidState) {
+		t.Fatalf("restart cancellation error=%v", err)
+	}
+	expiring, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "agent-restart", Type: SourceAgentCommandRestart, IdempotencyKey: "restart-expired",
+		ExpiresAt: clock.Now().Add(time.Second).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(time.Second)
+	if _, err := store.ClaimSourceAgentCommand(expiring.ID, "agent-restart", "book-worker"); !errors.Is(err, ErrSourceAgentCommandExpired) {
+		t.Fatalf("expired restart claim error=%v", err)
+	}
+}
+
 func TestSourceAgentCommandListIsTargetScopedOrderedAndBounded(t *testing.T) {
 	store, clock := newSourceAgentCommandTestStore(t)
 	registerSourceAgentCommandTestAgent(t, store, "agent-list", "1.0.0")
@@ -1023,6 +1123,81 @@ func TestSourceAgentCommandMigrationIsDurableAndIdempotent(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("%s %s count = %d", object.kind, object.name, count)
 		}
+	}
+}
+
+func TestSourceAgentCommandMigrationAddsRestartAndPreservesRows(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{AgentID: "legacy-agent", Version: "1.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(root, sourceSyncDBName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{
+		`DROP TABLE source_agent_command_events`,
+		`DROP TABLE source_agent_commands`,
+		`CREATE TABLE source_agent_commands (
+			command_id TEXT PRIMARY KEY, target_agent_id TEXT NOT NULL,
+			command_type TEXT NOT NULL CHECK(command_type IN ('diagnose', 'upgrade')),
+			spec_json TEXT NOT NULL, state TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+			expected_current_version TEXT NOT NULL DEFAULT '', actual_version TEXT NOT NULL DEFAULT '',
+			result_code TEXT NOT NULL DEFAULT '', message_text TEXT NOT NULL DEFAULT '', claim_owner TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, claimed_at TEXT NOT NULL DEFAULT '',
+			completed_at TEXT NOT NULL DEFAULT '', expires_at TEXT NOT NULL,
+			FOREIGN KEY(target_agent_id) REFERENCES source_agents(agent_id))`,
+		`CREATE TABLE source_agent_command_events (
+			event_id INTEGER PRIMARY KEY AUTOINCREMENT, command_id TEXT NOT NULL, state TEXT NOT NULL,
+			result_code TEXT NOT NULL DEFAULT '', message_text TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			FOREIGN KEY(command_id) REFERENCES source_agent_commands(command_id) ON DELETE CASCADE)`,
+		`INSERT INTO source_agent_commands (command_id,target_agent_id,command_type,spec_json,state,idempotency_key,created_at,updated_at,expires_at)
+		 VALUES ('legacy-cmd','legacy-agent','diagnose','{}','queued','legacy-key','2026-08-01T00:00:00.000000000Z','2026-08-01T00:00:00.000000000Z','2026-08-02T00:00:00.000000000Z')`,
+		`INSERT INTO source_agent_command_events (command_id,state,created_at) VALUES ('legacy-cmd','queued','2026-08-01T00:00:00.000000000Z')`,
+	}
+	for _, statement := range statements {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = NewSourceSyncStore(root)
+	if err != nil {
+		t.Fatalf("reopen legacy command schema: %v", err)
+	}
+	defer store.Close()
+	legacy, err := store.GetSourceAgentCommand("legacy-cmd")
+	if err != nil || legacy.Type != SourceAgentCommandDiagnose || legacy.State != SourceAgentCommandQueued {
+		t.Fatalf("legacy command=%#v err=%v", legacy, err)
+	}
+	if events := mustListSourceAgentCommandEvents(t, store, "legacy-cmd"); len(events) != 1 || events[0].State != SourceAgentCommandQueued {
+		t.Fatalf("legacy events=%#v", events)
+	}
+	if _, err := store.HeartbeatAgent(SourceAgentHeartbeat{
+		AgentID: "legacy-agent", WorkerType: "book-job-worker", Version: "1.0.0",
+		ProtocolVersion: "2026-08-01", Capabilities: []string{"controlled_restart"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSourceAgentCommand(SourceAgentCommandCreate{
+		TargetAgentID: "legacy-agent", Type: SourceAgentCommandRestart, IdempotencyKey: "restart-after-migration",
+		ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatalf("create restart after migration: %v", err)
+	}
+	var violations string
+	if err := store.db.QueryRow(`PRAGMA foreign_key_check`).Scan(&violations); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("foreign key check violation=%q err=%v", violations, err)
 	}
 }
 

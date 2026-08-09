@@ -20,9 +20,10 @@ import (
 )
 
 const (
-	defaultBookJobLeaseSeconds = 60
-	defaultBookJobRenewSeconds = 20
-	defaultBookJobPollSeconds  = 2
+	defaultBookJobLeaseSeconds   = 60
+	defaultBookJobRenewSeconds   = 20
+	defaultBookJobPollSeconds    = 2
+	bookJobWorkerProtocolVersion = "2026-08-01"
 )
 
 var (
@@ -42,13 +43,17 @@ var bookJobWorkerRuntimeFactory = func(cfg app.BookJobWorkerConfig) (bookJobWork
 }
 
 var bookJobWorkerStoreFactory = app.NewBookKnowledgeStore
+var bookJobWorkerSourceAgentClientFactory = func(cfg app.SourceAgentConfig) (app.BookJobWorkerSourceAgentClient, error) {
+	return app.NewSourceAgentClient(cfg)
+}
 
 type bookJobWorkerParsedConfig struct {
-	root          string
-	workerID      string
-	leaseDuration time.Duration
-	renewInterval time.Duration
-	pollInterval  time.Duration
+	root              string
+	workerID          string
+	leaseDuration     time.Duration
+	renewInterval     time.Duration
+	pollInterval      time.Duration
+	sourceAgentConfig *app.SourceAgentConfig
 }
 
 func main() {
@@ -172,7 +177,10 @@ func runBookJobWorkerCLI(
 		if err != nil {
 			return err
 		}
-		cfg := parsed.workerConfig()
+		cfg, err := parsed.workerConfig()
+		if err != nil {
+			return errors.New("initialize book job worker control client")
+		}
 		worker, err := bookJobWorkerRuntimeFactory(cfg)
 		if err != nil || worker == nil {
 			return errors.New("initialize book job worker")
@@ -184,6 +192,9 @@ func runBookJobWorkerCLI(
 			return nil
 		}
 		processed, err := worker.RunOnce(ctx)
+		if errors.Is(err, app.ErrBookJobWorkerRestartRequested) {
+			err = nil
+		}
 		if err != nil {
 			return errors.New("book job worker cycle failed")
 		}
@@ -239,9 +250,28 @@ func parseBookJobWorkerConfig(getenv bookJobWorkerEnvironmentLookup) (bookJobWor
 	if renew >= lease {
 		return bookJobWorkerParsedConfig{}, errors.New("book job worker renew interval must be shorter than the lease")
 	}
+	remoteURL := lookupTrimmedBookJobWorkerEnvironment(getenv, "KBASE_REMOTE_URL")
+	agentToken := lookupTrimmedBookJobWorkerEnvironment(getenv, "KBASE_SOURCE_AGENT_TOKEN")
+	agentID := lookupTrimmedBookJobWorkerEnvironment(getenv, "KBASE_SOURCE_AGENT_ID")
+	var sourceAgentConfig *app.SourceAgentConfig
+	if remoteURL != "" || agentToken != "" || agentID != "" {
+		if remoteURL == "" || agentToken == "" {
+			return bookJobWorkerParsedConfig{}, errors.New("incomplete source agent control configuration")
+		}
+		if agentID == "" {
+			agentID = workerID
+		}
+		cfg := app.SourceAgentConfig{
+			RemoteURL: remoteURL, AgentToken: agentToken, AgentID: agentID, StateDir: root,
+		}
+		if err := cfg.Validate(); err != nil {
+			return bookJobWorkerParsedConfig{}, errors.New("invalid source agent control configuration")
+		}
+		sourceAgentConfig = &cfg
+	}
 	return bookJobWorkerParsedConfig{
 		root: root, workerID: workerID, leaseDuration: lease,
-		renewInterval: renew, pollInterval: poll,
+		renewInterval: renew, pollInterval: poll, sourceAgentConfig: sourceAgentConfig,
 	}, nil
 }
 
@@ -256,11 +286,22 @@ func bookJobWorkerRoot(getenv bookJobWorkerEnvironmentLookup) string {
 	return root
 }
 
-func (cfg bookJobWorkerParsedConfig) workerConfig() app.BookJobWorkerConfig {
-	return app.BookJobWorkerConfig{
+func (cfg bookJobWorkerParsedConfig) workerConfig() (app.BookJobWorkerConfig, error) {
+	workerConfig := app.BookJobWorkerConfig{
 		Store: bookJobWorkerStoreFactory(cfg.root), WorkerID: cfg.workerID,
 		LeaseDuration: cfg.leaseDuration, RenewInterval: cfg.renewInterval, PollInterval: cfg.pollInterval,
 	}
+	if cfg.sourceAgentConfig == nil {
+		return workerConfig, nil
+	}
+	client, err := bookJobWorkerSourceAgentClientFactory(*cfg.sourceAgentConfig)
+	if err != nil || client == nil {
+		return app.BookJobWorkerConfig{}, errors.New("initialize source agent client")
+	}
+	workerConfig.SourceAgentClient = client
+	workerConfig.Version = bookJobWorkerVersion
+	workerConfig.ProtocolVersion = bookJobWorkerProtocolVersion
+	return workerConfig, nil
 }
 
 func bookJobWorkerDuration(

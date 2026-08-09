@@ -4769,7 +4769,7 @@ func (h *kbaseHTTPHandler) handleSourceAgentManagementCommands(w http.ResponseWr
 			return
 		}
 		payload.Type = strings.ToLower(strings.TrimSpace(payload.Type))
-		if payload.Type != SourceAgentCommandDiagnose && payload.Type != SourceAgentCommandUpgrade {
+		if payload.Type != SourceAgentCommandDiagnose && payload.Type != SourceAgentCommandUpgrade && payload.Type != SourceAgentCommandRestart {
 			writeHTTPError(w, http.StatusBadRequest, "invalid source agent command type")
 			return
 		}
@@ -4872,6 +4872,7 @@ func (h *kbaseHTTPHandler) writeSourceAgentManagementError(w http.ResponseWriter
 	case errors.Is(err, ErrSourceAgentCommandVersionConflict),
 		errors.Is(err, ErrSourceAgentCommandIdempotencyConflict),
 		errors.Is(err, ErrSourceAgentCommandActiveUpgrade),
+		errors.Is(err, ErrSourceAgentCommandCapability),
 		errors.Is(err, ErrSourceAgentArtifactNotFound), errors.Is(err, ErrSourceAgentArtifactNotAllowed),
 		errors.Is(err, ErrSourceAgentArtifactIncompatible), errors.Is(err, ErrSourceAgentArtifactIntegrity),
 		errors.Is(err, ErrSourceAgentArtifactCatalogInvalid):

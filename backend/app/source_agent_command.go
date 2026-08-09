@@ -16,6 +16,7 @@ import (
 const (
 	SourceAgentCommandDiagnose = "diagnose"
 	SourceAgentCommandUpgrade  = "upgrade"
+	SourceAgentCommandRestart  = "restart"
 )
 
 const (
@@ -37,6 +38,7 @@ const (
 const (
 	SourceAgentCommandCodeDiagnosticComplete = "diagnostic_complete"
 	SourceAgentCommandCodeDiagnosticFailed   = "diagnostic_failed"
+	SourceAgentCommandCodeRestartComplete    = "restart_complete"
 	SourceAgentCommandCodeUpgradeComplete    = "upgrade_complete"
 	SourceAgentCommandCodeUpgradeFailed      = "upgrade_failed"
 	SourceAgentCommandCodeDownloadFailed     = "download_failed"
@@ -72,12 +74,14 @@ var (
 	ErrSourceAgentCommandResultConflict      = errors.New("source agent command durable result conflicts")
 	ErrSourceAgentCommandExpired             = errors.New("source agent command expired")
 	ErrSourceAgentCommandRecoveryAmbiguous   = errors.New("source agent upgrade recovery is ambiguous")
+	ErrSourceAgentCommandCapability          = errors.New("source agent does not support the requested command")
 )
 
 var sourceAgentCommandResultCodes = map[string]struct{}{
 	"":                                       {},
 	SourceAgentCommandCodeDiagnosticComplete: {},
 	SourceAgentCommandCodeDiagnosticFailed:   {},
+	SourceAgentCommandCodeRestartComplete:    {},
 	SourceAgentCommandCodeUpgradeComplete:    {},
 	SourceAgentCommandCodeUpgradeFailed:      {},
 	SourceAgentCommandCodeDownloadFailed:     {},
@@ -120,6 +124,15 @@ var sourceAgentUpgradeCommandTransitions = map[string]map[string]struct{}{
 var sourceAgentDiagnoseCommandTransitions = map[string]map[string]struct{}{
 	SourceAgentCommandQueued: {
 		SourceAgentCommandClaimed: {}, SourceAgentCommandCanceled: {}, SourceAgentCommandExpired: {},
+	},
+	SourceAgentCommandClaimed: {
+		SourceAgentCommandSucceeded: {}, SourceAgentCommandFailed: {}, SourceAgentCommandExpired: {},
+	},
+}
+
+var sourceAgentRestartCommandTransitions = map[string]map[string]struct{}{
+	SourceAgentCommandQueued: {
+		SourceAgentCommandClaimed: {}, SourceAgentCommandExpired: {},
 	},
 	SourceAgentCommandClaimed: {
 		SourceAgentCommandSucceeded: {}, SourceAgentCommandFailed: {}, SourceAgentCommandExpired: {},
@@ -180,26 +193,21 @@ func migrateSourceAgentCommandDB(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
+	var commandSchema string
+	err = tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'source_agent_commands'`).Scan(&commandSchema)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if _, err := tx.Exec(sourceAgentCommandsTableDDL("source_agent_commands")); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	case !strings.Contains(commandSchema, "'restart'"):
+		if err := rebuildSourceAgentCommandTablesTx(tx); err != nil {
+			return err
+		}
+	}
 	statements := []string{
-		`CREATE TABLE IF NOT EXISTS source_agent_commands (
-			command_id TEXT PRIMARY KEY,
-			target_agent_id TEXT NOT NULL,
-			command_type TEXT NOT NULL CHECK(command_type IN ('diagnose', 'upgrade')),
-			spec_json TEXT NOT NULL,
-			state TEXT NOT NULL,
-			idempotency_key TEXT NOT NULL,
-			expected_current_version TEXT NOT NULL DEFAULT '',
-			actual_version TEXT NOT NULL DEFAULT '',
-			result_code TEXT NOT NULL DEFAULT '',
-			message_text TEXT NOT NULL DEFAULT '',
-			claim_owner TEXT NOT NULL DEFAULT '',
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			claimed_at TEXT NOT NULL DEFAULT '',
-			completed_at TEXT NOT NULL DEFAULT '',
-			expires_at TEXT NOT NULL,
-			FOREIGN KEY(target_agent_id) REFERENCES source_agents(agent_id)
-		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_agent_commands_idempotency
 			ON source_agent_commands(target_agent_id, idempotency_key)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_source_agent_commands_one_active_upgrade
@@ -227,6 +235,85 @@ func migrateSourceAgentCommandDB(db *sql.DB) error {
 		}
 	}
 	return tx.Commit()
+}
+
+func sourceAgentCommandsTableDDL(name string) string {
+	return `CREATE TABLE ` + name + ` (
+			command_id TEXT PRIMARY KEY,
+			target_agent_id TEXT NOT NULL,
+			command_type TEXT NOT NULL CHECK(command_type IN ('diagnose', 'upgrade', 'restart')),
+			spec_json TEXT NOT NULL,
+			state TEXT NOT NULL,
+			idempotency_key TEXT NOT NULL,
+			expected_current_version TEXT NOT NULL DEFAULT '',
+			actual_version TEXT NOT NULL DEFAULT '',
+			result_code TEXT NOT NULL DEFAULT '',
+			message_text TEXT NOT NULL DEFAULT '',
+			claim_owner TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			claimed_at TEXT NOT NULL DEFAULT '',
+			completed_at TEXT NOT NULL DEFAULT '',
+			expires_at TEXT NOT NULL,
+			FOREIGN KEY(target_agent_id) REFERENCES source_agents(agent_id)
+		)`
+}
+
+func rebuildSourceAgentCommandTablesTx(tx *sql.Tx) error {
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS source_agent_command_events_new`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS source_agent_commands_new`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(sourceAgentCommandsTableDDL("source_agent_commands_new")); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO source_agent_commands_new (
+		command_id, target_agent_id, command_type, spec_json, state, idempotency_key,
+		expected_current_version, actual_version, result_code, message_text, claim_owner,
+		created_at, updated_at, claimed_at, completed_at, expires_at
+	) SELECT command_id, target_agent_id, command_type, spec_json, state, idempotency_key,
+		expected_current_version, actual_version, result_code, message_text, claim_owner,
+		created_at, updated_at, claimed_at, completed_at, expires_at FROM source_agent_commands`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE source_agent_command_events_new (
+		event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+		command_id TEXT NOT NULL,
+		state TEXT NOT NULL,
+		result_code TEXT NOT NULL DEFAULT '',
+		message_text TEXT NOT NULL DEFAULT '',
+		created_at TEXT NOT NULL,
+		FOREIGN KEY(command_id) REFERENCES source_agent_commands_new(command_id) ON DELETE CASCADE
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO source_agent_command_events_new
+		(event_id, command_id, state, result_code, message_text, created_at)
+		SELECT event_id, command_id, state, result_code, message_text, created_at
+		FROM source_agent_command_events`); err != nil {
+		return err
+	}
+	for _, statement := range []string{
+		`DROP TABLE source_agent_command_events`,
+		`DROP TABLE source_agent_commands`,
+		`ALTER TABLE source_agent_commands_new RENAME TO source_agent_commands`,
+		`ALTER TABLE source_agent_command_events_new RENAME TO source_agent_command_events`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
+		}
+	}
+	rows, err := tx.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		return fmt.Errorf("source agent command migration violates foreign keys")
+	}
+	return rows.Err()
 }
 
 func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreate) (SourceAgentCommand, error) {
@@ -269,11 +356,27 @@ func (s *SourceSyncStore) CreateSourceAgentCommand(input SourceAgentCommandCreat
 		return SourceAgentCommand{}, err
 	}
 
-	var agentVersion string
-	if err := tx.QueryRow(`SELECT version FROM source_agents WHERE agent_id = ?`, normalized.TargetAgentID).Scan(&agentVersion); errors.Is(err, sql.ErrNoRows) {
+	var agentVersion, capabilitiesJSON string
+	if err := tx.QueryRow(`SELECT version, capabilities_json FROM source_agents WHERE agent_id = ?`, normalized.TargetAgentID).Scan(&agentVersion, &capabilitiesJSON); errors.Is(err, sql.ErrNoRows) {
 		return SourceAgentCommand{}, ErrSourceAgentNotFound
 	} else if err != nil {
 		return SourceAgentCommand{}, err
+	}
+	if normalized.Type == SourceAgentCommandRestart {
+		var capabilities []string
+		if err := json.Unmarshal([]byte(capabilitiesJSON), &capabilities); err != nil {
+			return SourceAgentCommand{}, err
+		}
+		supported := false
+		for _, capability := range normalizeSourceCapabilities(capabilities) {
+			if capability == "controlled_restart" {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return SourceAgentCommand{}, ErrSourceAgentCommandCapability
+		}
 	}
 	expectedVersion := ""
 	if spec != nil {
@@ -870,7 +973,7 @@ func normalizeSourceAgentCommandCreate(input SourceAgentCommandCreate, now time.
 		return input, "", nil, err
 	}
 	input.Type = strings.ToLower(strings.TrimSpace(input.Type))
-	if input.Type != SourceAgentCommandDiagnose && input.Type != SourceAgentCommandUpgrade {
+	if input.Type != SourceAgentCommandDiagnose && input.Type != SourceAgentCommandUpgrade && input.Type != SourceAgentCommandRestart {
 		return input, "", nil, ErrSourceAgentCommandType
 	}
 	input.IdempotencyKey, err = normalizeSourceAgentCommandIdentifier("idempotency_key", input.IdempotencyKey, true)
@@ -885,9 +988,9 @@ func normalizeSourceAgentCommandCreate(input SourceAgentCommandCreate, now time.
 	if len(payload) > sourceAgentCommandPayloadMaxBytes {
 		return input, "", nil, fmt.Errorf("payload exceeds %d bytes", sourceAgentCommandPayloadMaxBytes)
 	}
-	if input.Type == SourceAgentCommandDiagnose {
+	if input.Type == SourceAgentCommandDiagnose || input.Type == SourceAgentCommandRestart {
 		if len(payload) != 0 {
-			return input, "", nil, fmt.Errorf("diagnose payload must be omitted")
+			return input, "", nil, fmt.Errorf("%s payload must be omitted", input.Type)
 		}
 		return input, `{}`, nil, nil
 	}
@@ -1153,8 +1256,8 @@ func validateSourceAgentCommandTerminalResult(commandType string, input SourceAg
 	if !sourceAgentCommandResultCodeMatches(commandType, input.State, input.ResultCode) {
 		return fmt.Errorf("result_code %q is invalid for %s command state %s", input.ResultCode, commandType, input.State)
 	}
-	if commandType == SourceAgentCommandDiagnose && input.ActualVersion != "" {
-		return fmt.Errorf("diagnose command does not accept actual_version")
+	if commandType != SourceAgentCommandUpgrade && input.ActualVersion != "" {
+		return fmt.Errorf("%s command does not accept actual_version", commandType)
 	}
 	if commandType == SourceAgentCommandUpgrade && input.State == SourceAgentCommandSucceeded && input.ActualVersion == "" {
 		return fmt.Errorf("actual_version is required for succeeded upgrade")
@@ -1175,6 +1278,16 @@ func sourceAgentCommandResultCodeMatches(commandType, state, code string) bool {
 			return code == SourceAgentCommandCodeDiagnosticComplete
 		case SourceAgentCommandFailed:
 			return code == SourceAgentCommandCodeDiagnosticFailed
+		default:
+			return false
+		}
+	}
+	if commandType == SourceAgentCommandRestart {
+		switch state {
+		case SourceAgentCommandSucceeded:
+			return code == SourceAgentCommandCodeRestartComplete
+		case SourceAgentCommandFailed:
+			return code == SourceAgentCommandCodeRestartFailed
 		default:
 			return false
 		}
@@ -1278,9 +1391,16 @@ func insertSourceAgentCommandEventTx(tx *sql.Tx, commandID, state, code, message
 }
 
 func sourceAgentCommandTransitionAllowed(commandType, from, to string) bool {
-	transitions := sourceAgentDiagnoseCommandTransitions
-	if commandType == SourceAgentCommandUpgrade {
+	var transitions map[string]map[string]struct{}
+	switch commandType {
+	case SourceAgentCommandDiagnose:
+		transitions = sourceAgentDiagnoseCommandTransitions
+	case SourceAgentCommandUpgrade:
 		transitions = sourceAgentUpgradeCommandTransitions
+	case SourceAgentCommandRestart:
+		transitions = sourceAgentRestartCommandTransitions
+	default:
+		return false
 	}
 	allowed, exists := transitions[from]
 	if !exists {

@@ -8,12 +8,65 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/yann0917/dedao-gui/backend/services"
 )
+
+type bookJobWorkerSourceClientForTest struct {
+	mu         sync.Mutex
+	heartbeats []SourceAgentHeartbeat
+	commands   []*SourceAgentCommand
+	reports    []SourceAgentCommandTransition
+	reportErr  error
+	claim      func(context.Context) (*SourceAgentCommand, error)
+	report     func(SourceAgentCommandTransition)
+}
+
+func (client *bookJobWorkerSourceClientForTest) Heartbeat(_ context.Context, heartbeat SourceAgentHeartbeat) (SourceAgent, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.heartbeats = append(client.heartbeats, heartbeat)
+	return SourceAgent{}, nil
+}
+
+func (client *bookJobWorkerSourceClientForTest) ClaimCommand(ctx context.Context) (*SourceAgentCommand, error) {
+	if client.claim != nil {
+		return client.claim(ctx)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.commands) == 0 {
+		return nil, nil
+	}
+	command := client.commands[0]
+	client.commands = client.commands[1:]
+	return command, nil
+}
+
+func (client *bookJobWorkerSourceClientForTest) ReportCommand(
+	_ context.Context, _ string, state, code, message, actualVersion string,
+) (SourceAgentCommand, error) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	client.reports = append(client.reports, SourceAgentCommandTransition{
+		State: state, ResultCode: code, Message: message, ActualVersion: actualVersion,
+	})
+	reported := client.reports[len(client.reports)-1]
+	reportHook := client.report
+	if client.reportErr != nil {
+		return SourceAgentCommand{}, client.reportErr
+	}
+	if reportHook != nil {
+		client.mu.Unlock()
+		reportHook(reported)
+		client.mu.Lock()
+	}
+	return SourceAgentCommand{State: state, ResultCode: code}, nil
+}
 
 func TestBookJobWorkerRejectsInvalidConfiguration(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
@@ -47,6 +100,399 @@ func TestBookJobWorkerRejectsInvalidConfiguration(t *testing.T) {
 	valid.WorkerID = " worker.safe_1:local "
 	if _, err := NewBookJobWorker(valid); err != nil {
 		t.Fatalf("safe worker id rejected: %v", err)
+	}
+}
+
+func TestBookJobWorkerHeartbeatReportsIdentityAndCurrentRun(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 190)
+	client := &bookJobWorkerSourceClientForTest{}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-heartbeat", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Second,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	if len(client.heartbeats) < 2 {
+		t.Fatalf("heartbeats=%#v", client.heartbeats)
+	}
+	active := client.heartbeats[1]
+	if active.WorkerType != "book-job-worker" || active.Version != "1.2.3" || active.ProtocolVersion != "2026-08-01" ||
+		strings.Join(active.Capabilities, ",") != "book_jobs,diagnose,controlled_restart" || active.CurrentRunID != job.ID {
+		t.Fatalf("active heartbeat=%#v", active)
+	}
+}
+
+func TestBookJobWorkerRestartInterruptsClaimedJobReportsSuccessAndStopsRun(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 191)
+	client := &bookJobWorkerSourceClientForTest{commands: []*SourceAgentCommand{{
+		ID: "restart-1", TargetAgentID: "book-agent", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed,
+	}}}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-restart", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+			t.Fatal("restart command executed book job")
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if !processed || !errors.Is(err, ErrBookJobWorkerRestartRequested) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("restart claimed an idle job=%#v err=%v", loaded, loadErr)
+	}
+	if len(client.reports) != 1 || client.reports[0].State != SourceAgentCommandSucceeded ||
+		client.reports[0].ResultCode != SourceAgentCommandCodeRestartComplete || client.reports[0].ActualVersion != "" {
+		t.Fatalf("restart reports=%#v", client.reports)
+	}
+	cleanClient := &bookJobWorkerSourceClientForTest{commands: []*SourceAgentCommand{{
+		ID: "restart-clean", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed,
+	}}}
+	cleanWorker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), WorkerID: "worker-clean-restart", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: cleanClient, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanWorker.Run(context.Background()); err != nil {
+		t.Fatalf("Run did not cleanly stop after restart: %v", err)
+	}
+}
+
+func TestBookJobWorkerRestartArrivesAfterExecutorStartedInterruptsClaimedJob(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 194)
+	started := make(chan struct{})
+	var claims atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{}
+	client.claim = func(context.Context) (*SourceAgentCommand, error) {
+		if claims.Add(1) == 1 {
+			return nil, nil
+		}
+		select {
+		case <-started:
+			return &SourceAgentCommand{ID: "restart-running", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed}, nil
+		default:
+			return nil, nil
+		}
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-running-restart", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, NewBookJobExecutionFailure(BookKnowledgeJobFailureWorkerInterrupted, ctx.Err())
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if !processed || !errors.Is(err, ErrBookJobWorkerRestartRequested) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("running restart job=%#v err=%v", loaded, loadErr)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.reports) != 1 || client.reports[0].ResultCode != SourceAgentCommandCodeRestartComplete {
+		t.Fatalf("restart reports=%#v", client.reports)
+	}
+}
+
+func TestBookJobWorkerDiagnoseDoesNotInterruptQueuedJob(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 195)
+	client := &bookJobWorkerSourceClientForTest{commands: []*SourceAgentCommand{{
+		ID: "diagnose-safe", Type: SourceAgentCommandDiagnose, State: SourceAgentCommandClaimed,
+	}}}
+	executed := false
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-diagnose", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Second,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+			executed = true
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed || !executed {
+		t.Fatalf("RunOnce processed=%t executed=%t err=%v", processed, executed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("diagnose job=%#v err=%v", loaded, loadErr)
+	}
+	if len(client.reports) != 1 || client.reports[0].State != SourceAgentCommandSucceeded ||
+		client.reports[0].ResultCode != SourceAgentCommandCodeDiagnosticComplete {
+		t.Fatalf("diagnose reports=%#v", client.reports)
+	}
+}
+
+func TestBookJobWorkerDiagnoseArrivesDuringExecutionWithoutInterruptingJob(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 198)
+	started := make(chan struct{})
+	diagnosed := make(chan struct{})
+	var claims atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{}
+	client.claim = func(context.Context) (*SourceAgentCommand, error) {
+		switch claims.Add(1) {
+		case 1:
+			return nil, nil
+		case 2:
+			<-started
+			return &SourceAgentCommand{ID: "diagnose-running", Type: SourceAgentCommandDiagnose, State: SourceAgentCommandClaimed}, nil
+		default:
+			return nil, nil
+		}
+	}
+	client.report = func(report SourceAgentCommandTransition) {
+		if report.ResultCode == SourceAgentCommandCodeDiagnosticComplete {
+			close(diagnosed)
+		}
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-running-diagnose", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			select {
+			case <-diagnosed:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("running diagnose job=%#v err=%v", loaded, loadErr)
+	}
+}
+
+func TestBookJobWorkerInvalidRestartDuringExecutionIsRejectedWithoutInterruptingJob(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 199)
+	started := make(chan struct{})
+	rejected := make(chan struct{})
+	var claims atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{}
+	client.claim = func(context.Context) (*SourceAgentCommand, error) {
+		switch claims.Add(1) {
+		case 1:
+			return nil, nil
+		case 2:
+			<-started
+			return &SourceAgentCommand{
+				ID: "restart-invalid", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed,
+				UpgradeSpec: &SourceAgentUpgradeSpec{ArtifactID: "not-allowed"},
+			}, nil
+		default:
+			return nil, nil
+		}
+	}
+	client.report = func(report SourceAgentCommandTransition) {
+		if report.ResultCode == SourceAgentCommandCodeRestartFailed {
+			close(rejected)
+		}
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-invalid-restart", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			select {
+			case <-rejected:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("invalid restart job=%#v err=%v", loaded, loadErr)
+	}
+}
+
+func TestBookJobWorkerRestartRejectsOtherCommandWithoutExecution(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 192)
+	client := &bookJobWorkerSourceClientForTest{commands: []*SourceAgentCommand{{
+		ID: "upgrade-unsupported", TargetAgentID: "book-agent", Type: SourceAgentCommandUpgrade, State: SourceAgentCommandClaimed,
+	}}}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-reject", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Second,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if !processed || err != nil {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("unsupported command affected job=%#v err=%v", loaded, loadErr)
+	}
+	if len(client.reports) != 1 || client.reports[0].State != SourceAgentCommandFailed ||
+		client.reports[0].ResultCode != SourceAgentCommandCodeUpgradeFailed {
+		t.Fatalf("rejection reports=%#v", client.reports)
+	}
+}
+
+func TestBookJobWorkerRestartReportFailureDoesNotExitCleanly(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 193)
+	client := &bookJobWorkerSourceClientForTest{
+		commands:  []*SourceAgentCommand{{ID: "restart-expired", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed}},
+		reportErr: &SourceAgentHTTPError{Method: "POST", Path: "/api/source-agent/commands/restart-expired/complete", StatusCode: 409},
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-report", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Second,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if !processed || err == nil || errors.Is(err, ErrBookJobWorkerRestartRequested) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+}
+
+func TestBookJobWorkerRunningRestartReportFailureStaysFailedAfterSafeInterrupt(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 196)
+	started := make(chan struct{})
+	var claims atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{reportErr: errors.New("report unavailable")}
+	client.claim = func(context.Context) (*SourceAgentCommand, error) {
+		if claims.Add(1) == 1 {
+			return nil, nil
+		}
+		<-started
+		return &SourceAgentCommand{ID: "restart-report-failure", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed}, nil
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-running-report-failure", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if !processed || err == nil || errors.Is(err, ErrBookJobWorkerRestartRequested) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("report failure job=%#v err=%v", loaded, loadErr)
+	}
+}
+
+func TestBookJobWorkerCancellationDuringControlPollInterruptsWithoutFalseRestart(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 197)
+	started := make(chan struct{})
+	client := &bookJobWorkerSourceClientForTest{}
+	client.claim = func(ctx context.Context) (*SourceAgentCommand, error) {
+		select {
+		case <-started:
+			<-ctx.Done()
+			return nil, ctx.Err()
+		default:
+			return nil, nil
+		}
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-control-cancel", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := worker.RunOnce(ctx)
+		done <- err
+	}()
+	<-started
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("cancellation returned error: %v", err)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("canceled job=%#v err=%v", loaded, loadErr)
+	}
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.reports) != 0 {
+		t.Fatalf("cancellation reported restart=%#v", client.reports)
 	}
 }
 

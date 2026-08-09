@@ -50,7 +50,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 5195,
+      "line": 5196,
       "authenticated": true
     },
     {
@@ -200,13 +200,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 5309,
+      "line": 5310,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 5311,
+      "line": 5312,
       "authenticated": true
     },
     {
@@ -656,7 +656,7 @@
     {
       "path": "/api/source-agent/artifacts/",
       "file": "backend/app/source_agent_client.go",
-      "line": 448,
+      "line": 449,
       "authenticated": true
     },
     {
@@ -668,7 +668,7 @@
     {
       "path": "/api/source-agent/commands/",
       "file": "backend/app/source_agent_client.go",
-      "line": 407,
+      "line": 408,
       "authenticated": true
     },
     {
@@ -680,7 +680,7 @@
     {
       "path": "/api/source-agent/commands/claim",
       "file": "backend/app/source_agent_client.go",
-      "line": 238,
+      "line": 239,
       "authenticated": true
     },
     {
@@ -692,7 +692,7 @@
     {
       "path": "/api/source-agent/commands/recover",
       "file": "backend/app/source_agent_client.go",
-      "line": 290,
+      "line": 291,
       "authenticated": true
     },
     {
@@ -704,7 +704,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/source_agent_client.go",
-      "line": 200,
+      "line": 201,
       "authenticated": true
     },
     {
@@ -716,7 +716,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/source_agent_client.go",
-      "line": 220,
+      "line": 221,
       "authenticated": true
     },
     {
@@ -728,7 +728,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/source_agent_client.go",
-      "line": 684,
+      "line": 691,
       "authenticated": true
     },
     {
@@ -1699,32 +1699,32 @@
     {
       "name": "SourceAgentClient",
       "file": "backend/app/source_agent_client.go",
-      "line": 162
+      "line": 163
     },
     {
       "name": "SourceAgentCommand",
       "file": "backend/app/source_agent_command.go",
-      "line": 149
+      "line": 162
     },
     {
       "name": "SourceAgentCommandCreate",
       "file": "backend/app/source_agent_command.go",
-      "line": 134
+      "line": 147
     },
     {
       "name": "SourceAgentCommandEvent",
       "file": "backend/app/source_agent_command.go",
-      "line": 168
+      "line": 181
     },
     {
       "name": "SourceAgentCommandTransition",
       "file": "backend/app/source_agent_command.go",
-      "line": 142
+      "line": 155
     },
     {
       "name": "SourceAgentConfig",
       "file": "backend/app/source_agent_client.go",
-      "line": 38
+      "line": 39
     },
     {
       "name": "SourceAgentCycleResult",
@@ -1739,7 +1739,7 @@
     {
       "name": "SourceAgentHTTPError",
       "file": "backend/app/source_agent_client.go",
-      "line": 137
+      "line": 138
     },
     {
       "name": "SourceAgentHeartbeat",
@@ -1799,7 +1799,7 @@
     {
       "name": "SourceAgentTransportError",
       "file": "backend/app/source_agent_client.go",
-      "line": 143
+      "line": 144
     },
     {
       "name": "SourceAgentUpdateBridge",
@@ -1854,7 +1854,7 @@
     {
       "name": "SourceAgentUpgradeSpec",
       "file": "backend/app/source_agent_command.go",
-      "line": 129
+      "line": 142
     },
     {
       "name": "SourceAgentUpgradeTerminalObservation",

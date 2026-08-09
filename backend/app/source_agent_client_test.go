@@ -259,6 +259,34 @@ func TestSourceAgentClientAuthCheckDoesNotLeaseWork(t *testing.T) {
 }
 
 func TestSourceAgentClientCommands(t *testing.T) {
+	t.Run("restart command is accepted only without payload", func(t *testing.T) {
+		responses := []string{
+			`{"command":{"id":"restart-1","target_agent_id":"agent-a","type":"restart","state":"claimed"}}`,
+			`{"command":{"id":"restart-2","target_agent_id":"agent-a","type":"restart","state":"claimed","payload":{"path":"private"}}}`,
+		}
+		calls := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, responses[calls])
+			calls++
+		}))
+		defer server.Close()
+		client, err := NewSourceAgentClient(SourceAgentConfig{
+			RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a",
+			StateDir: t.TempDir(), HTTPClient: server.Client(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		command, err := client.ClaimCommand(context.Background())
+		if err != nil || command == nil || command.Type != SourceAgentCommandRestart {
+			t.Fatalf("restart command=%#v err=%v", command, err)
+		}
+		if command, err = client.ClaimCommand(context.Background()); err == nil || command != nil {
+			t.Fatalf("payload-bearing restart=%#v err=%v", command, err)
+		}
+	})
+
 	t.Run("claim and report use scoped command contracts", func(t *testing.T) {
 		calls := 0
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

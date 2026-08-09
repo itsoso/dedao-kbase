@@ -211,6 +211,72 @@ func TestBookJobWorkerCLIOnceUsesRootPrecedenceAndSafeGeneratedWorkerID(t *testi
 	}
 }
 
+func TestBookJobWorkerCLIConfiguresSharedTokenSourceAgentControl(t *testing.T) {
+	previousRuntimeFactory := bookJobWorkerRuntimeFactory
+	previousClientFactory := bookJobWorkerSourceAgentClientFactory
+	defer func() {
+		bookJobWorkerRuntimeFactory = previousRuntimeFactory
+		bookJobWorkerSourceAgentClientFactory = previousClientFactory
+	}()
+	client := &app.SourceAgentClient{}
+	var sourceConfig app.SourceAgentConfig
+	bookJobWorkerSourceAgentClientFactory = func(cfg app.SourceAgentConfig) (app.BookJobWorkerSourceAgentClient, error) {
+		sourceConfig = cfg
+		return client, nil
+	}
+	var workerConfig app.BookJobWorkerConfig
+	bookJobWorkerRuntimeFactory = func(cfg app.BookJobWorkerConfig) (bookJobWorkerRuntime, error) {
+		workerConfig = cfg
+		return fakeBookJobWorkerRuntime{
+			once: func(context.Context) (bool, error) { return false, nil },
+			run:  func(context.Context) error { return nil },
+		}, nil
+	}
+	env := bookJobWorkerTestEnv{
+		"KBASE_BOOK_KNOWLEDGE_ROOT": t.TempDir(), "KBASE_BOOK_JOB_WORKER_ID": "worker-controlled",
+		"KBASE_REMOTE_URL": "https://kbase.example.invalid", "KBASE_SOURCE_AGENT_TOKEN": "shared-agent-token",
+		"KBASE_SOURCE_AGENT_ID": "book-worker-agent",
+	}
+	if err := runBookJobWorkerCLI(context.Background(), []string{"once"}, env.Lookup, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if sourceConfig.RemoteURL != "https://kbase.example.invalid" || sourceConfig.AgentToken != "shared-agent-token" || sourceConfig.AgentID != "book-worker-agent" {
+		t.Fatalf("source config=%#v", sourceConfig)
+	}
+	if workerConfig.SourceAgentClient != client || workerConfig.Version != bookJobWorkerVersion || workerConfig.ProtocolVersion != bookJobWorkerProtocolVersion {
+		t.Fatalf("worker source control config=%#v", workerConfig)
+	}
+	for _, partial := range []bookJobWorkerTestEnv{
+		{"KBASE_REMOTE_URL": "https://kbase.example.invalid"},
+		{"KBASE_SOURCE_AGENT_TOKEN": "shared-agent-token"},
+	} {
+		partial["KBASE_BOOK_JOB_WORKER_ID"] = "worker-partial"
+		if err := runBookJobWorkerCLI(context.Background(), []string{"check-config"}, partial.Lookup, &bytes.Buffer{}); err == nil {
+			t.Fatalf("partial source agent configuration accepted: %#v", partial)
+		}
+	}
+}
+
+func TestBookJobWorkerCLIOnceTreatsControlledRestartAsCleanExit(t *testing.T) {
+	previousFactory := bookJobWorkerRuntimeFactory
+	defer func() { bookJobWorkerRuntimeFactory = previousFactory }()
+	bookJobWorkerRuntimeFactory = func(app.BookJobWorkerConfig) (bookJobWorkerRuntime, error) {
+		return fakeBookJobWorkerRuntime{
+			once: func(context.Context) (bool, error) { return true, app.ErrBookJobWorkerRestartRequested },
+			run:  func(context.Context) error { return nil },
+		}, nil
+	}
+	var stdout bytes.Buffer
+	if err := runBookJobWorkerCLI(context.Background(), []string{"once"}, bookJobWorkerTestEnv{
+		"KBASE_BOOK_JOB_WORKER_ID": "worker-restart-clean",
+	}.Lookup, &stdout); err != nil {
+		t.Fatalf("controlled restart returned error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"processed":true`) {
+		t.Fatalf("controlled restart output=%q", stdout.String())
+	}
+}
+
 func TestBookJobWorkerCLIRunIsSilentAndCancellationIsGraceful(t *testing.T) {
 	previousFactory := bookJobWorkerRuntimeFactory
 	defer func() { bookJobWorkerRuntimeFactory = previousFactory }()

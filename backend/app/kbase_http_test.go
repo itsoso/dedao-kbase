@@ -2094,6 +2094,54 @@ func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
 }
 
 func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
+	t.Run("restricted restart end to end", func(t *testing.T) {
+		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
+			AgentID: "agent-a", WorkerType: "book-job-worker", Platform: "darwin", Architecture: "arm64",
+			Version: "1.0.0", ProtocolVersion: "2026-08-01",
+			Capabilities: []string{"book_jobs", "diagnose", "controlled_restart"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
+		body := `{"type":"restart","idempotency_key":"restart-http","expires_at":"` + expiresAt + `"}`
+		created := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", body)
+		var createdPayload struct {
+			Command SourceAgentCommand `json:"command"`
+		}
+		if created.Code != http.StatusCreated || json.Unmarshal(created.Body.Bytes(), &createdPayload) != nil ||
+			createdPayload.Command.Type != SourceAgentCommandRestart {
+			t.Fatalf("create restart status=%d body=%s", created.Code, created.Body.String())
+		}
+		claimed := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/commands/claim", "agent-secret", `{"agent_id":"agent-a"}`)
+		if claimed.Code != http.StatusOK || !strings.Contains(claimed.Body.String(), `"id":"`+createdPayload.Command.ID+`"`) ||
+			!strings.Contains(claimed.Body.String(), `"state":"claimed"`) {
+			t.Fatalf("claim restart status=%d body=%s", claimed.Code, claimed.Body.String())
+		}
+		completed := requestJSONKBase(
+			handler, http.MethodPost,
+			"/api/source-agent/commands/"+url.PathEscape(createdPayload.Command.ID)+"/complete", "agent-secret",
+			`{"agent_id":"agent-a","state":"succeeded","code":"restart_complete"}`,
+		)
+		if completed.Code != http.StatusOK || !strings.Contains(completed.Body.String(), `"result_code":"restart_complete"`) {
+			t.Fatalf("complete restart status=%d body=%s", completed.Code, completed.Body.String())
+		}
+		withPayload := requestJSONKBase(
+			handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret",
+			`{"type":"restart","idempotency_key":"restart-payload","payload":{},"expires_at":"`+expiresAt+`"}`,
+		)
+		if withPayload.Code != http.StatusBadRequest {
+			t.Fatalf("restart payload status=%d body=%s", withPayload.Code, withPayload.Body.String())
+		}
+		withoutCapability := requestJSONKBase(
+			handler, http.MethodPost, "/api/source-agents/agent-b/commands", "admin-secret",
+			`{"type":"restart","idempotency_key":"restart-no-capability","expires_at":"`+expiresAt+`"}`,
+		)
+		if withoutCapability.Code != http.StatusConflict {
+			t.Fatalf("restart without capability status=%d body=%s", withoutCapability.Code, withoutCapability.Body.String())
+		}
+	})
+
 	t.Run("management command API", func(t *testing.T) {
 		handler, _, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
 		expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)

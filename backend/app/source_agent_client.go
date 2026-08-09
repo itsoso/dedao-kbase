@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -656,7 +657,13 @@ func decodeSourceAgentCommandResponse(raw json.RawMessage, allowNull bool) (*Sou
 		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
 	}
 	var command SourceAgentCommand
-	if err := json.Unmarshal(trimmed, &command); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&command); err != nil {
+		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf(invalidSourceAgentCommandResponse)
 	}
 	return &command, nil
@@ -670,7 +677,7 @@ func validSourceAgentCommandResponseDomain(command SourceAgentCommand, expectedA
 	if !isSourceAgentCommandState(command.State) {
 		return false
 	}
-	return command.Type == SourceAgentCommandDiagnose || command.Type == SourceAgentCommandUpgrade
+	return command.Type == SourceAgentCommandDiagnose || command.Type == SourceAgentCommandUpgrade || command.Type == SourceAgentCommandRestart
 }
 
 func (c *SourceAgentClient) UploadArticle(ctx context.Context, runID string, envelope SourceArticleEnvelope) (SourceIngestReceipt, error) {
