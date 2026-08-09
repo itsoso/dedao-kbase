@@ -32,6 +32,8 @@ type BookJobWorker struct {
 	renewInterval time.Duration
 	pollInterval  time.Duration
 	execute       func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error)
+	beforeClaim   func()
+	renewLease    func(BookKnowledgeJob) error
 }
 
 type BookJobExecutionFailure struct {
@@ -118,6 +120,9 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 	if _, err := w.store.ReconcileExpiredBookKnowledgeJobs(); err != nil {
 		return false, bookJobWorkerInfrastructureError("reconcile jobs")
 	}
+	if w.beforeClaim != nil {
+		w.beforeClaim()
+	}
 	if ctx.Err() != nil {
 		return false, nil
 	}
@@ -191,7 +196,13 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 			case <-runCtx.Done():
 				return
 			case <-ticker.C:
-				if _, err := w.store.RenewBookKnowledgeJobLease(job.ID, w.workerID, w.leaseDuration); err != nil {
+				var err error
+				if w.renewLease != nil {
+					err = w.renewLease(job)
+				} else {
+					_, err = w.store.RenewBookKnowledgeJobLease(job.ID, w.workerID, w.leaseDuration)
+				}
+				if err != nil {
 					select {
 					case renewFailure <- bookJobWorkerInfrastructureError("renew lease"):
 					default:
@@ -236,9 +247,10 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	cancel()
 	<-renewDone
 
+	var renewErr error
 	select {
-	case renewErr := <-renewFailure:
-		return renewErr
+	case received := <-renewFailure:
+		renewErr = received
 	default:
 	}
 	stageMu.Lock()
@@ -249,27 +261,30 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 		return infraErr
 	}
 
+	if execution.err == nil {
+		if _, err := w.store.CompleteBookKnowledgeJob(job.ID, w.workerID, execution.result); err != nil {
+			return bookJobWorkerInfrastructureError("complete job")
+		}
+		return nil
+	}
+	if renewErr != nil {
+		return renewErr
+	}
 	if parent.Err() != nil {
 		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
 			return bookJobWorkerInfrastructureError("interrupt job")
 		}
 		return nil
 	}
-	if execution.err != nil {
-		code := bookJobWorkerFailureCode(execution.err, stage)
-		if code == BookKnowledgeJobFailureWorkerInterrupted {
-			if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
-				return bookJobWorkerInfrastructureError("interrupt job")
-			}
-			return nil
-		}
-		if _, err := w.store.FailBookKnowledgeJob(job.ID, w.workerID, code); err != nil {
-			return bookJobWorkerInfrastructureError("fail job")
+	code := bookJobWorkerFailureCode(execution.err, stage)
+	if code == BookKnowledgeJobFailureWorkerInterrupted {
+		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
+			return bookJobWorkerInfrastructureError("interrupt job")
 		}
 		return nil
 	}
-	if _, err := w.store.CompleteBookKnowledgeJob(job.ID, w.workerID, execution.result); err != nil {
-		return bookJobWorkerInfrastructureError("complete job")
+	if _, err := w.store.FailBookKnowledgeJob(job.ID, w.workerID, code); err != nil {
+		return bookJobWorkerInfrastructureError("fail job")
 	}
 	return nil
 }

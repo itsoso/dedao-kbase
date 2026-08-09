@@ -3,9 +3,12 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -159,9 +162,11 @@ type BookKnowledgeSearchResult struct {
 }
 
 type BookKnowledgeStore struct {
-	root                  string
-	mu                    sync.RWMutex
-	agentSemanticEmbedder AgentSemanticEmbedder
+	root                    string
+	mu                      sync.RWMutex
+	agentSemanticEmbedder   AgentSemanticEmbedder
+	beforePackagePublish    func()
+	afterPackagePublishGate func()
 }
 
 func (s *BookKnowledgeStore) SetAgentSemanticEmbedder(embedder AgentSemanticEmbedder) {
@@ -212,8 +217,18 @@ func (s *BookKnowledgeStore) BookJSONLPath(bookID, name string) string {
 }
 
 func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
+	return s.SavePackageContext(context.Background(), pkg)
+}
+
+func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKnowledgePackage) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if strings.TrimSpace(pkg.Book.BookID) == "" {
 		return fmt.Errorf("book knowledge package missing book_id")
@@ -254,27 +269,205 @@ func (s *BookKnowledgeStore) SavePackage(pkg BookKnowledgePackage) error {
 	if err != nil {
 		return err
 	}
+	manifest, err := s.loadManifest()
+	if err != nil {
+		return err
+	}
+	manifest = upsertBookKnowledgeManifest(manifest, pkg.Book)
+	manifestJSON, err := encodeJSONFile(manifest)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.root, os.ModePerm); err != nil {
+		return err
+	}
+	stagingRoot, err := os.MkdirTemp(s.root, ".book-package-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(stagingRoot)
+	stagedBookDir := filepath.Join(stagingRoot, "book")
+	if err := os.MkdirAll(stagedBookDir, os.ModePerm); err != nil {
+		return err
+	}
+	if err := copyBookKnowledgeDirectoryContext(ctx, s.BookDir(pkg.Book.BookID), stagedBookDir); err != nil {
+		return err
+	}
+	stagedFiles := []struct {
+		name string
+		data []byte
+	}{
+		{name: "chapters.jsonl", data: chaptersJSONL},
+		{name: "chunks.jsonl", data: chunksJSONL},
+		{name: "claims.jsonl", data: claimsJSONL},
+		{name: "citations.jsonl", data: citationsJSONL},
+		{name: "manifest.json", data: bookJSON},
+	}
+	for _, file := range stagedFiles {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := writeFileAtomically(filepath.Join(stagedBookDir, file.name), file.data); err != nil {
+			return err
+		}
+	}
+	stagedManifest := filepath.Join(stagingRoot, "manifest.json")
+	if err := writeFileAtomically(stagedManifest, manifestJSON); err != nil {
+		return err
+	}
+	if s.beforePackagePublish != nil {
+		s.beforePackagePublish()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.afterPackagePublishGate != nil {
+		s.afterPackagePublishGate()
+	}
+	return publishBookKnowledgePackage(stagedBookDir, s.BookDir(pkg.Book.BookID), stagedManifest, s.ManifestPath())
+}
 
-	bookDir := s.BookDir(pkg.Book.BookID)
-	if err := os.MkdirAll(bookDir, os.ModePerm); err != nil {
+func copyBookKnowledgeDirectoryContext(ctx context.Context, source, target string) error {
+	if _, err := os.Stat(source); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
-	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "chapters"), chaptersJSONL); err != nil {
+	return filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		destination := filepath.Join(target, relative)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.MkdirAll(destination, info.Mode().Perm())
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(linkTarget, destination)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("unsupported book artifact type: %s", relative)
+		}
+		if err := os.Link(path, destination); err == nil {
+			return nil
+		}
+		return copyBookKnowledgeFileContext(ctx, path, destination, info.Mode().Perm())
+	})
+}
+
+func copyBookKnowledgeFileContext(ctx context.Context, source, target string, mode os.FileMode) error {
+	input, err := os.Open(source)
+	if err != nil {
 		return err
 	}
-	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "chunks"), chunksJSONL); err != nil {
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
 		return err
 	}
-	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "claims"), claimsJSONL); err != nil {
+	closed := false
+	defer func() {
+		if !closed {
+			_ = output.Close()
+		}
+	}()
+	buffer := make([]byte, 128*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		read, readErr := input.Read(buffer)
+		if read > 0 {
+			if _, err := output.Write(buffer[:read]); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+	if err := output.Sync(); err != nil {
 		return err
 	}
-	if err := writeFileAtomically(s.BookJSONLPath(pkg.Book.BookID, "citations"), citationsJSONL); err != nil {
+	if err := output.Close(); err != nil {
 		return err
 	}
-	if err := writeFileAtomically(s.BookManifestPath(pkg.Book.BookID), bookJSON); err != nil {
+	closed = true
+	return nil
+}
+
+func publishBookKnowledgePackage(stagedBookDir, bookDir, stagedManifest, manifestPath string) error {
+	if err := os.MkdirAll(filepath.Dir(bookDir), os.ModePerm); err != nil {
 		return err
 	}
-	return s.upsertManifestBook(pkg.Book)
+	backupRoot, err := os.MkdirTemp(filepath.Dir(manifestPath), ".book-package-backup-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(backupRoot)
+	backupBookDir := filepath.Join(backupRoot, "book")
+	bookExisted, err := movePathToBackup(bookDir, backupBookDir)
+	if err != nil {
+		return err
+	}
+	rollback := func(publishErr error) error {
+		var rollbackErrors []error
+		if err := os.RemoveAll(bookDir); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("remove partial book package: %w", err))
+		}
+		if err := restorePathFromBackup(backupBookDir, bookDir, bookExisted); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore book package: %w", err))
+		}
+		return errors.Join(append([]error{publishErr}, rollbackErrors...)...)
+	}
+	if err := os.Rename(stagedBookDir, bookDir); err != nil {
+		return rollback(err)
+	}
+	if err := replaceFileAtomically(stagedManifest, manifestPath); err != nil {
+		return rollback(err)
+	}
+	return nil
+}
+
+func movePathToBackup(path, backupPath string) (bool, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.Rename(path, backupPath); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func restorePathFromBackup(backupPath, path string, existed bool) error {
+	if !existed {
+		return nil
+	}
+	return os.Rename(backupPath, path)
 }
 
 func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookKnowledgePackage, error) {
@@ -456,6 +649,14 @@ func (s *BookKnowledgeStore) upsertManifestBook(book BookKnowledgeBook) error {
 	if err != nil {
 		return err
 	}
+	manifest = upsertBookKnowledgeManifest(manifest, book)
+	if err := os.MkdirAll(s.root, os.ModePerm); err != nil {
+		return err
+	}
+	return writeJSONFile(s.ManifestPath(), manifest)
+}
+
+func upsertBookKnowledgeManifest(manifest BookKnowledgeManifest, book BookKnowledgeBook) BookKnowledgeManifest {
 	replaced := false
 	for i, existing := range manifest.Books {
 		if existing.BookID == book.BookID {
@@ -472,10 +673,7 @@ func (s *BookKnowledgeStore) upsertManifestBook(book BookKnowledgeBook) error {
 	sort.SliceStable(manifest.Books, func(i, j int) bool {
 		return manifest.Books[i].BookID < manifest.Books[j].BookID
 	})
-	if err := os.MkdirAll(s.root, os.ModePerm); err != nil {
-		return err
-	}
-	return writeJSONFile(s.ManifestPath(), manifest)
+	return manifest
 }
 
 func (s *BookKnowledgeStore) loadManifest() (BookKnowledgeManifest, error) {

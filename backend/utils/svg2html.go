@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"html"
 	"path/filepath"
@@ -84,12 +85,25 @@ var fnA, fnB = "", ""
 var tocLevel map[string]int
 
 func Svg2Html(outputDir, title string, svgContents []*SvgContent, toc []EbookToc) (err error) {
+	return Svg2HtmlContext(context.Background(), outputDir, title, svgContents, toc)
+}
+
+func Svg2HtmlContext(ctx context.Context, outputDir, title string, svgContents []*SvgContent, toc []EbookToc) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tocLevel = make(map[string]int, len(toc))
 	for _, ebookToc := range toc {
 		tocLevel[ebookToc.Text] = ebookToc.Level
 	}
-	result, err := AllInOneHtml(svgContents, toc)
+	result, err := AllInOneHtmlContext(ctx, svgContents, toc)
 	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	path, err := Mkdir(outputDir, "Ebook")
@@ -108,6 +122,16 @@ func Svg2Html(outputDir, title string, svgContents []*SvgContent, toc []EbookToc
 }
 
 func Svg2Pdf(outputDir, title string, svgContents []*SvgContent, toc []EbookToc) (err error) {
+	return Svg2PdfContext(context.Background(), outputDir, title, svgContents, toc)
+}
+
+func Svg2PdfContext(ctx context.Context, outputDir, title string, svgContents []*SvgContent, toc []EbookToc) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	path, err := Mkdir(outputDir, "Ebook")
 	if err != nil {
@@ -125,7 +149,10 @@ func Svg2Pdf(outputDir, title string, svgContents []*SvgContent, toc []EbookToc)
 		tocLevel[ebookToc.Text] = ebookToc.Level
 	}
 	for k, svgContent := range svgContents {
-		chapter, coverContent, err1 := OneByOneHtml(eBookTypePdf, k, svgContent, toc)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chapter, coverContent, err1 := OneByOneHtmlContext(ctx, eBookTypePdf, k, svgContent, toc)
 		if err1 != nil {
 			err = err1
 			return
@@ -138,7 +165,13 @@ func Svg2Pdf(outputDir, title string, svgContents []*SvgContent, toc []EbookToc)
 	}
 
 	// write cover into cover.html file
-	coverPath, _ := FilePath(filepath.Join(path, FileName("cover", "")), "html", false)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	coverPath, err := FilePath(filepath.Join(path, FileName("cover", "")), "html", false)
+	if err != nil {
+		return err
+	}
 	if err = WriteFileWithTrunc(coverPath, cover); err != nil {
 		return
 	}
@@ -148,11 +181,21 @@ func Svg2Pdf(outputDir, title string, svgContents []*SvgContent, toc []EbookToc)
 		PageSize:  "A4",
 		Toc:       true,
 	}
-	err = pdf.GenPdf(buf)
+	err = pdf.GenPdfContext(ctx, buf)
 	return
 }
 
 func Svg2Epub(outputDir, title string, svgContents []*SvgContent, opt EpubOptions) (err error) {
+	return Svg2EpubContext(context.Background(), outputDir, title, svgContents, opt)
+}
+
+func Svg2EpubContext(ctx context.Context, outputDir, title string, svgContents []*SvgContent, opt EpubOptions) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	var htmlAll []HtmlContent
 	cover := ""
 	tocLevel = make(map[string]int, len(opt.Toc))
@@ -166,7 +209,10 @@ func Svg2Epub(outputDir, title string, svgContents []*SvgContent, opt EpubOption
 		}
 	}
 	for k, svgContent := range svgContents {
-		chapter, coverUrl, err1 := OneByOneHtml(eBookTypeEpub, k, svgContent, opt.Toc)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chapter, coverUrl, err1 := OneByOneHtmlContext(ctx, eBookTypeEpub, k, svgContent, opt.Toc)
 		if err1 != nil {
 			err = err1
 			return
@@ -179,6 +225,9 @@ func Svg2Epub(outputDir, title string, svgContents []*SvgContent, opt EpubOption
 			ChapterID: svgContent.ChapterID,
 			Toc:       chapterToc[svgContent.ChapterID],
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	path, err := Mkdir(outputDir, "Ebook")
@@ -200,13 +249,21 @@ func Svg2Epub(outputDir, title string, svgContents []*SvgContent, opt EpubOption
 		EpubOptions: opt,
 	}
 
-	if coverByte, err := request.HTTPGet(cover); err == nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if coverByte, err := request.HTTPGetContext(ctx, cover); err == nil {
 		h2e.DefaultCover = coverByte
+	} else if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	h2e.HTML = htmlAll
 	h2e.Output = fileName
-	if err = h2e.Run(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err = h2e.RunContext(ctx); err != nil {
 		return err
 	}
 
@@ -231,10 +288,23 @@ func SaveFile(outputDir, title, ext, content string) (err error) {
 
 // AllInOneHtml generate ebook content all in one html file
 func AllInOneHtml(svgContents []*SvgContent, toc []EbookToc) (result string, err error) {
+	return AllInOneHtmlContext(context.Background(), svgContents, toc)
+}
+
+func AllInOneHtmlContext(ctx context.Context, svgContents []*SvgContent, toc []EbookToc) (result string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	result = GenHeadHtml()
 	fnA, fnB = ParseBookFnDelimiter(svgContents)
 	for k, svgContent := range svgContents {
-		chapter, _, err1 := OneByOneHtml(eBookTypeHtml, k, svgContent, toc)
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		chapter, _, err1 := OneByOneHtmlContext(ctx, eBookTypeHtml, k, svgContent, toc)
 		if err1 != nil {
 			err = err1
 			return
@@ -251,6 +321,16 @@ func AllInOneHtml(svgContents []*SvgContent, toc []EbookToc) (result string, err
 // OneByOneHtml one by one generate chapter html
 // eType: html/pdf/epub, index: []*SvgContent index, svgContent: one chapter content
 func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookToc) (result, cover string, err error) {
+	return OneByOneHtmlContext(context.Background(), eType, index, svgContent, toc)
+}
+
+func OneByOneHtmlContext(ctx context.Context, eType string, index int, svgContent *SvgContent, toc []EbookToc) (result, cover string, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
 	switch eType {
 	case eBookTypeHtml:
 		// 锚点目录
@@ -266,6 +346,9 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 	}
 
 	for _, content := range svgContent.Contents {
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
 		result += `
 <div id="` + svgContent.ChapterID + `">`
 		reader := strings.NewReader(content)
@@ -289,6 +372,9 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 		sort.Float64s(keys)
 
 		for _, v := range keys {
+			if err := ctx.Err(); err != nil {
+				return "", "", err
+			}
 			cont, id, contWOTag, firstX := "", "", "", 0.0
 			if lineContent[v][0].ID != "" {
 				id = lineContent[v][0].ID
@@ -298,6 +384,9 @@ func OneByOneHtml(eType string, index int, svgContent *SvgContent, toc []EbookTo
 			hasUncloseSpan := false
 
 			for i, item := range lineContent[v] {
+				if err := ctx.Err(); err != nil {
+					return "", "", err
+				}
 				// image class=epub-footnote 是注释图片
 				style := item.Style
 

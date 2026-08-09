@@ -1154,12 +1154,12 @@
     {
       "name": "BookKnowledgeBook",
       "file": "backend/app/book_knowledge.go",
-      "line": 24
+      "line": 27
     },
     {
       "name": "BookKnowledgeChapter",
       "file": "backend/app/book_knowledge.go",
-      "line": 42
+      "line": 45
     },
     {
       "name": "BookKnowledgeChatContextStats",
@@ -1189,17 +1189,17 @@
     {
       "name": "BookKnowledgeChunk",
       "file": "backend/app/book_knowledge.go",
-      "line": 51
+      "line": 54
     },
     {
       "name": "BookKnowledgeCitation",
       "file": "backend/app/book_knowledge.go",
-      "line": 73
+      "line": 76
     },
     {
       "name": "BookKnowledgeClaim",
       "file": "backend/app/book_knowledge.go",
-      "line": 60
+      "line": 63
     },
     {
       "name": "BookKnowledgeExportResult",
@@ -1244,7 +1244,7 @@
     {
       "name": "BookKnowledgeManifest",
       "file": "backend/app/book_knowledge.go",
-      "line": 137
+      "line": 140
     },
     {
       "name": "BookKnowledgeMessage",
@@ -1259,7 +1259,7 @@
     {
       "name": "BookKnowledgePackage",
       "file": "backend/app/book_knowledge.go",
-      "line": 87
+      "line": 90
     },
     {
       "name": "BookKnowledgePrompt",
@@ -1269,17 +1269,17 @@
     {
       "name": "BookKnowledgeSearchQuery",
       "file": "backend/app/book_knowledge.go",
-      "line": 143
+      "line": 146
     },
     {
       "name": "BookKnowledgeSearchResult",
       "file": "backend/app/book_knowledge.go",
-      "line": 149
+      "line": 152
     },
     {
       "name": "BookKnowledgeStore",
       "file": "backend/app/book_knowledge.go",
-      "line": 161
+      "line": 164
     },
     {
       "name": "BookQualityReport",

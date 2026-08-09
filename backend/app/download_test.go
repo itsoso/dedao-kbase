@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yann0917/dedao-gui/backend/services"
 	"github.com/yann0917/dedao-gui/backend/utils"
@@ -77,7 +78,7 @@ func TestEbookDownloadPropagatesContextThroughRealChainAndSkipsWriteAfterCancell
 	service := &cancelingEbookDownloadService{wantContext: ctx, cancel: cancel, cancelPages: true}
 	writeCalled := false
 	oldWriteHTML := writeEbookHTML
-	writeEbookHTML = func(string, string, []*utils.SvgContent, []utils.EbookToc) error {
+	writeEbookHTML = func(context.Context, string, string, []*utils.SvgContent, []utils.EbookToc) error {
 		writeCalled = true
 		return nil
 	}
@@ -108,7 +109,7 @@ func TestGenerateEbookFileAtomicallyDoesNotPublishCanceledOutput(t *testing.T) {
 		t.Run(extension, func(t *testing.T) {
 			outputDir := t.TempDir()
 			ctx, cancel := context.WithCancel(context.Background())
-			_, err := generateEbookFileAtomically(ctx, outputDir, "book", extension, func(stagingRoot string) error {
+			_, err := generateEbookFileAtomically(ctx, outputDir, "book", extension, func(_ context.Context, stagingRoot string) error {
 				stagedPath, err := ebookGeneratedFilePath(stagingRoot, "book", extension)
 				if err != nil {
 					return err
@@ -140,6 +141,65 @@ func TestGenerateEbookFileAtomicallyDoesNotPublishCanceledOutput(t *testing.T) {
 	}
 }
 
+func TestGenerateEbookFileAtomicallyReplacesExistingTarget(t *testing.T) {
+	outputDir := t.TempDir()
+	finalPath, err := ebookGeneratedFilePath(outputDir, "book", "html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(finalPath, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := generateEbookFileAtomically(context.Background(), outputDir, "book", "html", func(_ context.Context, stagingRoot string) error {
+		stagedPath, err := ebookGeneratedFilePath(stagingRoot, "book", "html")
+		if err != nil {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(stagedPath), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(stagedPath, []byte("new"), 0o600)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != finalPath {
+		t.Fatalf("published path=%q want=%q", got, finalPath)
+	}
+	data, err := os.ReadFile(finalPath)
+	if err != nil || string(data) != "new" {
+		t.Fatalf("replacement content=%q err=%v", data, err)
+	}
+}
+
+func TestGenerateEbookFileAtomicallyCancelsBlockingGenerator(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	outputDir := t.TempDir()
+	go func() {
+		_, err := generateEbookFileAtomically(ctx, outputDir, "book", "html", func(ctx context.Context, _ string) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocking generator error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocking generator did not stop after cancellation")
+	}
+}
+
 func TestEbookDownloadDoesNotPublishWhenEachGeneratorCancels(t *testing.T) {
 	oldHTML, oldPDF, oldEPUB := writeEbookHTML, writeEbookPDF, writeEbookEPUB
 	defer func() {
@@ -152,17 +212,17 @@ func TestEbookDownloadDoesNotPublishWhenEachGeneratorCancels(t *testing.T) {
 		installWriter func(context.CancelFunc)
 	}{
 		{name: "html", downloadType: 1, extension: "html", installWriter: func(cancel context.CancelFunc) {
-			writeEbookHTML = func(root, title string, _ []*utils.SvgContent, _ []utils.EbookToc) error {
+			writeEbookHTML = func(_ context.Context, root, title string, _ []*utils.SvgContent, _ []utils.EbookToc) error {
 				return writeCanceledEbookTestOutput(root, title, "html", cancel)
 			}
 		}},
 		{name: "pdf", downloadType: 2, extension: "pdf", installWriter: func(cancel context.CancelFunc) {
-			writeEbookPDF = func(root, title string, _ []*utils.SvgContent, _ []utils.EbookToc) error {
+			writeEbookPDF = func(_ context.Context, root, title string, _ []*utils.SvgContent, _ []utils.EbookToc) error {
 				return writeCanceledEbookTestOutput(root, title, "pdf", cancel)
 			}
 		}},
 		{name: "epub", downloadType: 3, extension: "epub", installWriter: func(cancel context.CancelFunc) {
-			writeEbookEPUB = func(root, title string, _ []*utils.SvgContent, _ utils.EpubOptions) error {
+			writeEbookEPUB = func(_ context.Context, root, title string, _ []*utils.SvgContent, _ utils.EpubOptions) error {
 				return writeCanceledEbookTestOutput(root, title, "epub", cancel)
 			}
 		}},

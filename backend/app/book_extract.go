@@ -57,7 +57,7 @@ func BuildBookKnowledgeFromHTMLFileContext(ctx context.Context, book BookKnowled
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := store.SavePackage(*pkg); err != nil {
+	if err := store.SavePackageContext(ctx, *pkg); err != nil {
 		return nil, err
 	}
 	return pkg, nil

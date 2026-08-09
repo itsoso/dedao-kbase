@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/url"
@@ -45,32 +46,55 @@ type HtmlToEpub struct {
 }
 
 func (h *HtmlToEpub) Run() (err error) {
+	return h.RunContext(context.Background())
+}
+
+func (h *HtmlToEpub) RunContext(ctx context.Context) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(h.HTML) == 0 {
 		return errors.New("no .html file given")
 	}
 	h.PTitle = make(map[int]string)
-	return h.run()
+	return h.runContext(ctx)
 }
 func (h *HtmlToEpub) run() (err error) {
+	return h.runContext(context.Background())
+}
+
+func (h *HtmlToEpub) runContext(ctx context.Context) (err error) {
 	err = h.genBook()
 	if err != nil {
 		return
 	}
 
 	for _, html := range h.HTML {
-		err = h.add(html)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err = h.addContext(ctx, html)
 		if err != nil {
 			err = fmt.Errorf("parse %#v failed: %s", html, err)
 			return
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err = h.book.Write(h.Output)
 	if err != nil {
 		return fmt.Errorf("cannot write output epub: %s", err)
 	}
 
-	return
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (h *HtmlToEpub) genBook() error {
@@ -109,13 +133,23 @@ func (h *HtmlToEpub) setCover() (err error) {
 }
 
 func (h *HtmlToEpub) add(html HtmlContent) (err error) {
+	return h.addContext(context.Background(), html)
+}
+
+func (h *HtmlToEpub) addContext(ctx context.Context, html HtmlContent) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	refs := make(map[string]string)
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html.Content))
 	if err != nil {
 		return
 	}
 
-	images := h.saveImages(doc)
+	images := h.saveImagesContext(ctx, doc)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	doc.Find("img").
 		Each(func(i int, img *goquery.Selection) {
 			h.changeRef(html.Content, img, refs, images)
@@ -141,10 +175,17 @@ func (h *HtmlToEpub) add(html HtmlContent) (err error) {
 }
 
 func (h *HtmlToEpub) saveImages(doc *goquery.Document) map[string]string {
+	return h.saveImagesContext(context.Background(), doc)
+}
+
+func (h *HtmlToEpub) saveImagesContext(ctx context.Context, doc *goquery.Document) map[string]string {
 	downloads := make(map[string]string)
 
 	tasks := request.NewDownloadTasks()
 	doc.Find("img").Each(func(i int, img *goquery.Selection) {
+		if ctx.Err() != nil {
+			return
+		}
 		src, _ := img.Attr("src")
 		if !strings.HasPrefix(src, "http") {
 			return
@@ -166,7 +207,7 @@ func (h *HtmlToEpub) saveImages(doc *goquery.Document) map[string]string {
 		tasks.Add(src, localFile)
 		downloads[src] = localFile
 	})
-	request.Batch(tasks, 3, time.Minute*2).ForEach(func(t *request.DownloadTask) {
+	request.BatchWithContext(ctx, tasks, 3, time.Minute*2).ForEach(func(t *request.DownloadTask) {
 		if t.Err != nil {
 			log.Printf("download %s fail: %s", t.Link, t.Err)
 		}

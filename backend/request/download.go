@@ -47,7 +47,11 @@ func DownloadWithContext(ctx context.Context, dl *DownloadTask) (err error) {
 }
 
 func Batch(tasks *DownloadTasks, concurrent int, eachTimeout time.Duration) *DownloadTasks {
-	return one.Batch(tasks, concurrent, eachTimeout)
+	return one.BatchWithContext(context.Background(), tasks, concurrent, eachTimeout)
+}
+
+func BatchWithContext(ctx context.Context, tasks *DownloadTasks, concurrent int, eachTimeout time.Duration) *DownloadTasks {
+	return one.BatchWithContext(ctx, tasks, concurrent, eachTimeout)
 }
 
 func (g *GetDownload) Download(task *DownloadTask, timeout time.Duration) (err error) {
@@ -126,15 +130,27 @@ func (g *GetDownload) DownloadWithContext(ctx context.Context, task *DownloadTas
 }
 
 func (g *GetDownload) Batch(tasks *DownloadTasks, concurrent int, eachTimeout time.Duration) *DownloadTasks {
+	return g.BatchWithContext(context.Background(), tasks, concurrent, eachTimeout)
+}
+
+func (g *GetDownload) BatchWithContext(ctx context.Context, tasks *DownloadTasks, concurrent int, eachTimeout time.Duration) *DownloadTasks {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var sema = semaphore.NewWeighted(int64(concurrent))
-	var grp errgroup.Group
+	grp, groupCtx := errgroup.WithContext(ctx)
 
 	tasks.ForEach(func(t *DownloadTask) {
-		_ = sema.Acquire(context.TODO(), 1)
+		if err := sema.Acquire(groupCtx, 1); err != nil {
+			t.Err = err
+			return
+		}
 		grp.Go(func() (err error) {
 			defer sema.Release(1)
-			t.Err = g.Download(t, eachTimeout)
-			return
+			taskCtx, cancel := context.WithTimeout(groupCtx, eachTimeout)
+			defer cancel()
+			t.Err = g.DownloadWithContext(taskCtx, t)
+			return nil
 		})
 	})
 

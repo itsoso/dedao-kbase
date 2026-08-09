@@ -2,7 +2,7 @@ package utils
 
 import (
 	"bytes"
-	"fmt"
+	"context"
 	"os"
 	"runtime"
 
@@ -17,8 +17,18 @@ type PdfOption struct {
 }
 
 func (p *PdfOption) GenPdf(buf *bytes.Buffer) (err error) {
+	return p.GenPdfContext(context.Background(), buf)
+}
+
+func (p *PdfOption) GenPdfContext(ctx context.Context, buf *bytes.Buffer) (err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	wkhtmltopdf.SetPath(WkToPdfDir)
-	pdfg, _ := wkhtmltopdf.NewPDFGenerator()
+	pdfg, err := wkhtmltopdf.NewPDFGenerator()
+	if err != nil {
+		return err
+	}
 	page := wkhtmltopdf.NewPageReader(buf)
 	page.FooterFontSize.Set(10)
 	page.FooterRight.Set("[page]")
@@ -55,10 +65,12 @@ func (p *PdfOption) GenPdf(buf *bytes.Buffer) (err error) {
 	pdfg.MarginBottom.Set(15)
 	pdfg.MarginLeft.Set(15)
 	pdfg.MarginRight.Set(15)
-	err = pdfg.Create()
+	err = pdfg.CreateContext(ctx)
 	if err != nil {
-		fmt.Printf("pdfg create err: %#v\n", err)
 		return
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	// Write buffer contents to file on disk

@@ -2,6 +2,8 @@ package app
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestBookKnowledgeContentHashIsStableAndTracksDurableContent(t *testing.T) {
@@ -67,6 +70,108 @@ func TestSavePackageAssignsMissingContentHash(t *testing.T) {
 	}
 	if !strings.HasPrefix(loaded.Book.ContentHash, "sha256:") {
 		t.Fatalf("content hash = %q", loaded.Book.ContentHash)
+	}
+}
+
+func TestSavePackageContextCancellationAtPublishGateLeavesNoPartialPackage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	ctx, cancel := context.WithCancel(context.Background())
+	reachedGate := make(chan struct{})
+	releaseGate := make(chan struct{})
+	store.beforePackagePublish = func() {
+		close(reachedGate)
+		<-releaseGate
+	}
+	done := make(chan error, 1)
+	go func() { done <- store.SavePackageContext(ctx, pkg) }()
+	select {
+	case <-reachedGate:
+	case <-time.After(2 * time.Second):
+		close(releaseGate)
+		t.Fatal("save did not reach package publish gate")
+	}
+	cancel()
+	close(releaseGate)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("SavePackageContext error=%v, want context canceled", err)
+	}
+	if _, err := os.Stat(store.ManifestPath()); !os.IsNotExist(err) {
+		t.Fatalf("root manifest was partially published: %v", err)
+	}
+	if _, err := os.Stat(store.BookDir(pkg.Book.BookID)); !os.IsNotExist(err) {
+		t.Fatalf("book directory was partially published: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(store.Root(), ".book-package-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("staging package leaked: %v, err=%v", matches, err)
+	}
+}
+
+func TestSavePackageContextCancellationAfterPublishGateCommitsWholePackage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	ctx, cancel := context.WithCancel(context.Background())
+	store.afterPackagePublishGate = cancel
+	if err := store.SavePackageContext(ctx, pkg); err != nil {
+		t.Fatalf("SavePackageContext after commit decision: %v", err)
+	}
+	loaded, err := store.LoadPackage(pkg.Book.BookID)
+	if err != nil {
+		t.Fatalf("committed package cannot be loaded: %v", err)
+	}
+	if loaded.Book.BookID != pkg.Book.BookID || len(loaded.Chunks) != len(pkg.Chunks) {
+		t.Fatalf("partial committed package: %#v", loaded)
+	}
+	books, err := store.ListBooks()
+	if err != nil || len(books) != 1 || books[0].BookID != pkg.Book.BookID {
+		t.Fatalf("root manifest did not commit with package: books=%#v err=%v", books, err)
+	}
+}
+
+func TestSavePackageContextCancellationPreservesExistingWholePackage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	original := sampleBookKnowledgePackageForExport()
+	if err := store.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	updated := original
+	updated.Book.Title = "replacement title"
+	updated.Book.ContentHash = ""
+	updated.Chunks = append([]BookKnowledgeChunk(nil), original.Chunks...)
+	updated.Chunks[0].Text = "replacement chunk"
+	ctx, cancel := context.WithCancel(context.Background())
+	store.beforePackagePublish = cancel
+	if err := store.SavePackageContext(ctx, updated); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SavePackageContext error=%v, want context canceled", err)
+	}
+	loaded, err := store.LoadPackage(original.Book.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Book.Title != original.Book.Title || loaded.Chunks[0].Text != original.Chunks[0].Text {
+		t.Fatalf("existing package was partially replaced: %#v", loaded)
+	}
+}
+
+func TestSavePackageContextPreservesDerivedBookArtifacts(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	pkg := sampleBookKnowledgePackageForExport()
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	derivedPath := filepath.Join(store.BookDir(pkg.Book.BookID), "quality_report.json")
+	if err := os.WriteFile(derivedPath, []byte("derived"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg.Book.Title = "updated"
+	pkg.Book.ContentHash = ""
+	if err := store.SavePackageContext(context.Background(), pkg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(derivedPath)
+	if err != nil || string(data) != "derived" {
+		t.Fatalf("derived artifact=%q err=%v", data, err)
 	}
 }
 

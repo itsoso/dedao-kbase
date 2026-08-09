@@ -51,9 +51,9 @@ type ebookDownloadService interface {
 }
 
 var (
-	writeEbookHTML = utils.Svg2Html
-	writeEbookPDF  = utils.Svg2Pdf
-	writeEbookEPUB = utils.Svg2Epub
+	writeEbookHTML = utils.Svg2HtmlContext
+	writeEbookPDF  = utils.Svg2PdfContext
+	writeEbookEPUB = utils.Svg2EpubContext
 )
 
 type EBookDownloadResult struct {
@@ -309,8 +309,8 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		result.HTMLPath, err = generateEbookFileAtomically(ctx, outputDir, title, "html", func(stagingRoot string) error {
-			return writeEbookHTML(stagingRoot, title, svgContent, info.BookInfo.Toc)
+		result.HTMLPath, err = generateEbookFileAtomically(ctx, outputDir, title, "html", func(generatorCtx context.Context, stagingRoot string) error {
+			return writeEbookHTML(generatorCtx, stagingRoot, title, svgContent, info.BookInfo.Toc)
 		})
 		if err != nil {
 			return nil, err
@@ -320,8 +320,8 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if _, err = generateEbookFileAtomically(ctx, outputDir, title, "pdf", func(stagingRoot string) error {
-			return writeEbookPDF(stagingRoot, title, svgContent, info.BookInfo.Toc)
+		if _, err = generateEbookFileAtomically(ctx, outputDir, title, "pdf", func(generatorCtx context.Context, stagingRoot string) error {
+			return writeEbookPDF(generatorCtx, stagingRoot, title, svgContent, info.BookInfo.Toc)
 		}); err != nil {
 			return nil, err
 		}
@@ -336,8 +336,8 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if _, err = generateEbookFileAtomically(ctx, outputDir, title, "epub", func(stagingRoot string) error {
-			return writeEbookEPUB(stagingRoot, title, svgContent, opts)
+		if _, err = generateEbookFileAtomically(ctx, outputDir, title, "epub", func(generatorCtx context.Context, stagingRoot string) error {
+			return writeEbookEPUB(generatorCtx, stagingRoot, title, svgContent, opts)
 		}); err != nil {
 			return nil, err
 		}
@@ -348,7 +348,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	return result, nil
 }
 
-func generateEbookFileAtomically(ctx context.Context, outputDir, title, extension string, generate func(string) error) (string, error) {
+func generateEbookFileAtomically(ctx context.Context, outputDir, title, extension string, generate func(context.Context, string) error) (string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -367,7 +367,7 @@ func generateEbookFileAtomically(ctx context.Context, outputDir, title, extensio
 		return "", err
 	}
 	defer os.RemoveAll(stagingRoot)
-	if err := generate(stagingRoot); err != nil {
+	if err := generate(ctx, stagingRoot); err != nil {
 		return "", err
 	}
 	if err := ctx.Err(); err != nil {
@@ -391,7 +391,7 @@ func generateEbookFileAtomically(ctx context.Context, outputDir, title, extensio
 	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(stagedPath, finalPath); err != nil {
+	if err := replaceFileAtomically(stagedPath, finalPath); err != nil {
 		return "", err
 	}
 	return finalPath, nil

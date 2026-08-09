@@ -2,6 +2,7 @@ package request
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -30,7 +31,14 @@ func NewClient(baseURL string) *resty.Client {
 
 // HTTPGet http get request
 func HTTPGet(url string) (body []byte, err error) {
-	r, err := resty.New().R().Get(url)
+	return HTTPGetContext(context.Background(), url)
+}
+
+func HTTPGetContext(ctx context.Context, url string) (body []byte, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r, err := resty.New().R().SetContext(ctx).Get(url)
 	if err != nil {
 		return
 	}

@@ -609,23 +609,18 @@ func TestBookJobWorkerRunDoesNotExecuteAfterCancellation(t *testing.T) {
 func TestBookJobWorkerCancellationBetweenReconcileAndClaimLeavesJobQueued(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 281)
-	blocker, err := store.openBookJobsWriteDB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer blocker.Close()
-	tx, err := blocker.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-
 	var calls atomic.Int32
 	worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
 		calls.Add(1)
 		return nil, nil
 	})
 	ctx, cancel := context.WithCancel(context.Background())
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	worker.beforeClaim = func() {
+		close(reached)
+		<-release
+	}
 	done := make(chan struct {
 		processed bool
 		err       error
@@ -637,11 +632,14 @@ func TestBookJobWorkerCancellationBetweenReconcileAndClaimLeavesJobQueued(t *tes
 			err       error
 		}{processed, runErr}
 	}()
-	time.Sleep(30 * time.Millisecond)
-	cancel()
-	if err := tx.Rollback(); err != nil {
-		t.Fatal(err)
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("worker did not reach pre-claim barrier")
 	}
+	cancel()
+	close(release)
 	result := <-done
 	if result.err != nil || result.processed {
 		t.Fatalf("RunOnce() processed=%t err=%v", result.processed, result.err)
@@ -652,5 +650,105 @@ func TestBookJobWorkerCancellationBetweenReconcileAndClaimLeavesJobQueued(t *tes
 	loaded, err := store.LoadBookKnowledgeJob(job.ID)
 	if err != nil || loaded.Status != BookKnowledgeJobStatusQueued {
 		t.Fatalf("job=%#v err=%v", loaded, err)
+	}
+}
+
+func TestBookJobWorkerSuccessfulCommitWinsConcurrentParentCancellation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 282)
+	ctx, cancel := context.WithCancel(context.Background())
+	worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+		cancel()
+		return map[string]any{"ebook_id": 282, "title": "committed"}, nil
+	})
+	processed, err := worker.RunOnce(ctx)
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusSucceeded || loaded.Result["title"] != "committed" {
+		t.Fatalf("successful committed job=%#v err=%v", loaded, err)
+	}
+}
+
+func TestBookJobWorkerCompletedPackageWinsConcurrentRenewFailureWhenLeaseStillOwned(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 283)
+	published := make(chan struct{})
+	worker := newWorkerWithDurationsForTest(t, store, time.Second, 10*time.Millisecond, time.Second,
+		func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			pkg := sampleBookKnowledgePackageForExport()
+			pkg.Book.BookID = "worker-published-package"
+			pkg.Book.Title = "Worker Published Package"
+			if err := store.SavePackageContext(ctx, pkg); err != nil {
+				return nil, err
+			}
+			close(published)
+			<-ctx.Done()
+			return map[string]any{"ebook_id": 283, "title": "committed"}, nil
+		})
+	worker.renewLease = func(BookKnowledgeJob) error {
+		<-published
+		return errors.New("injected renewal transport failure")
+	}
+	done := make(chan error, 1)
+	go func() { _, err := worker.RunOnce(context.Background()); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunOnce after committed package: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not finish after renewal canceled the executor")
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("completed job=%#v err=%v", loaded, err)
+	}
+	if _, err := store.LoadPackage("worker-published-package"); err != nil {
+		t.Fatalf("published package missing after successful terminal transition: %v", err)
+	}
+}
+
+func TestBookJobWorkerLeaseLossCancelsBlockingEbookGeneratorAndReturns(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 284)
+	started := make(chan struct{})
+	outputDir := t.TempDir()
+	worker := newWorkerWithDurationsForTest(t, store, time.Second, 10*time.Millisecond, time.Second,
+		func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			_, err := generateEbookFileAtomically(ctx, outputDir, "blocked", "html", func(ctx context.Context, _ string) error {
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			return nil, err
+		})
+	done := make(chan error, 1)
+	go func() { _, err := worker.RunOnce(context.Background()); done <- err }()
+	<-started
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`UPDATE book_jobs SET lease_owner = ? WHERE job_id = ?`, "replacement-worker", job.ID)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrBookJobWorkerInfrastructure) {
+			t.Fatalf("RunOnce error=%v, want infrastructure error", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not return after lease loss canceled blocking generator")
+	}
+	finalPath, err := ebookGeneratedFilePath(outputDir, "blocked", "html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+		t.Fatalf("blocked generator published final file: %v", err)
 	}
 }
