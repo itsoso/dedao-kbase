@@ -41,6 +41,21 @@ for (const marker of [
   "createDedaoEbookJob",
   "pollBookKnowledgeJob",
   "loadDedaoEbookJobs",
+  "bookJobStageLabel",
+  "bookJobFailureMessage",
+  "canRetryBookJob",
+  "retryBookJob",
+  "/api/jobs/${encodeURIComponent(jobID)}/retry",
+  "data-book-job-retry",
+  "已有重试任务正在排队或运行",
+  'dedaoEbookAcquisitionState.message = "重试任务已进入队列。"',
+  "任务已安全停止，可以从这里重新执行",
+  "原任务",
+  "排队等待",
+  "正在下载",
+  "正在生成知识库",
+  "等待人工恢复",
+  "已中断",
   "normalizeDedaoEbook",
   "jobActive",
   "任务进行中",
@@ -66,7 +81,10 @@ for (const className of [
 
 assert.ok(css.includes("@media (max-width: 760px)"), "login UI should have a responsive layout");
 assert.ok(css.includes("@media (prefers-reduced-motion: reduce)"), "login UI should respect reduced motion");
-assert.ok(html.includes("20260802-dedao-acquisition"), "login release should use a fresh browser cache version");
+assert.ok(html.includes("20260809-book-job-recovery"), "book job recovery release should use a fresh browser cache version");
+assert.ok(css.includes(".book-job-recovery"), "book job recovery should have a deliberate recovery layout");
+assert.ok(css.includes(".book-job-recovery__history"), "book job recovery should style retry lineage");
+assert.doesNotMatch(js, />\s*job execution failed\s*</i, "raw worker failures must not be product copy");
 
 const loginStatusSource = js.match(/function dedaoLoginStatusCopy\(\) \{([\s\S]*?)\n\}/)?.[1] || "";
 const loginSuccessIndex = loginStatusSource.indexOf('dedaoLoginState.phase === "success"');

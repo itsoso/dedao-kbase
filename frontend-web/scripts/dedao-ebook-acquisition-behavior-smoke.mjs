@@ -14,6 +14,7 @@ const app = {
   querySelectorAll() { return []; },
 };
 const jobBodies = [];
+const retryBodies = [];
 let fetchMode = "jobs";
 let releaseSlowJob;
 
@@ -74,6 +75,16 @@ context.fetch = async (url, options = {}) => {
     }
     return response;
   }
+  if (requestPath === "/api/jobs/failed-job/retry" && options.method === "POST") {
+    retryBodies.push(String(options.body || ""));
+    return jsonResponse({ job: { id: "retry-job", type: "dedao_ebook_download", status: "queued", stage: "queued", ebook_enid: "retry-enid", retry_of: "failed-job" } }, 202);
+  }
+  if (requestPath === "/api/jobs/duplicate-job/retry" && options.method === "POST") {
+    return jsonResponse({ error: "active retry already exists" }, 409);
+  }
+  if (requestPath === "/api/jobs/retry-job") {
+    return jsonResponse({ job: { id: "retry-job", type: "dedao_ebook_download", status: "interrupted", stage: "interrupted", ebook_enid: "retry-enid", retry_of: "failed-job", failure_code: "worker_interrupted" } });
+  }
   if (requestPath === "/api/dedao/home?page_size=4") {
     return jsonResponse({ courses: { list: [] }, ebooks: { list: [] }, odob: { list: [] } });
   }
@@ -102,6 +113,11 @@ vm.runInNewContext(`${source}\nglobalThis.__dedao = {
   renderDedaoEbookAcquisition,
   renderDedaoLogin,
   searchDedaoEbooks,
+  bookJobStageLabel,
+  bookJobFailureMessage,
+  canRetryBookJob,
+  retryBookJob,
+  jobCenterState,
 };`, context, { filename: "frontend-web/app.js" });
 
 const dedao = context.__dedao;
@@ -146,5 +162,25 @@ assert.match(app.innerHTML, /重新扫码登录/, "stored sessions should always
 await dedao.loadDedaoHome();
 assert.equal(dedao.dedaoLoginState.session.active_user.name, "测试用户");
 assert.match(app.innerHTML, /测试用户 · 浏览电子书/, "home should render the hydrated account state");
+
+assert.equal(dedao.bookJobStageLabel("building_knowledge"), "正在生成知识库");
+assert.equal(dedao.bookJobStageLabel("recovery_required"), "等待人工恢复");
+assert.equal(
+  dedao.bookJobFailureMessage({ status: "failed", error: "job execution failed" }),
+  "任务未完成，技术细节已隐藏；请查看诊断后重新执行。",
+  "raw worker errors should become safe product copy",
+);
+assert.equal(dedao.canRetryBookJob({ id: "failed", type: "dedao_ebook_download", status: "failed" }), true);
+assert.equal(dedao.canRetryBookJob({ id: "wc", source: "wcplus", status: "failed" }), false, "WC Plus jobs must not gain book retry controls");
+assert.equal(dedao.canRetryBookJob({ id: "queued", source: "KBase", status: "queued" }), false);
+
+context.window.location.pathname = "/sources/dedao/ebooks";
+await dedao.retryBookJob("failed-job", { enid: "retry-enid" });
+assert.deepEqual(retryBodies, ["{}"], "book retry should send an empty JSON body");
+assert.equal(dedao.dedaoEbookAcquisitionState.jobs["retry-enid"].id, "retry-job");
+assert.equal(dedao.dedaoEbookAcquisitionState.message, "重试任务已进入队列。", "ebook cards should confirm successful retry submission");
+
+await dedao.retryBookJob("duplicate-job", { enid: "retry-enid" });
+assert.equal(dedao.dedaoEbookAcquisitionState.message, "已有重试任务正在排队或运行", "duplicate retries should use precise conflict copy");
 
 console.log("dedao ebook acquisition behavior smoke passed");

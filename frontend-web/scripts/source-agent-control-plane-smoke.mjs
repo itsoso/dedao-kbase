@@ -19,6 +19,10 @@ for (const marker of [
   "setSourceAgentDesiredState",
   "createSourceAgentDiagnostic",
   "createSourceAgentUpgrade",
+  "isBookJobWorker",
+  "canRestartBookJobWorker",
+  "createSourceAgentRestart",
+  "confirmSourceAgentRestart",
   "confirmSourceAgentUpgrade",
   "bindSourceAgentManagementEvents",
   "getSourceAgentDetailID",
@@ -84,6 +88,7 @@ for (const label of [
   "离线",
   "已暂停",
   "升级中",
+  "操作中",
   "平台 / 架构",
   "版本 / 协议",
   "能力健康",
@@ -97,6 +102,11 @@ for (const label of [
   "选择已批准版本",
   "微信工作台",
   "WC Plus 工作台",
+  "书籍任务 Worker",
+  "人工控制 · 独立运行",
+  "当前任务",
+  "受限重启",
+  "任务中心",
 ]) {
   assert.ok(js.includes(label), `management surface should render ${label}`);
 }
@@ -107,6 +117,7 @@ for (const selector of [
   "data-source-agent-diagnose",
   "data-source-agent-upgrade",
   "data-source-agent-artifact",
+  "data-source-agent-restart",
 ]) {
   assert.ok(js.includes(selector), `management surface should include ${selector}`);
 }
@@ -124,6 +135,13 @@ for (const className of [
 
 assert.ok(js.includes('href="/sources/agents"'), "main navigation should link to the Agent overview");
 assert.ok(js.includes("window.confirm"), "upgrade should require explicit operator confirmation");
+assert.ok(js.includes('sourceAgentCommandEnvelope("restart")'), "restart commands should use the payload-free command envelope");
+assert.doesNotMatch(js, /sourceAgentCommandEnvelope\("restart",\s*\{/m, "restart commands must not carry a payload");
+assert.ok(js.includes('agent?.worker_type === "book-job-worker"'), "book presentation should be restricted to the book worker type");
+assert.ok(js.includes('capabilities.includes("controlled_restart")'), "book restart should require the controlled_restart capability");
+assert.ok(css.includes(".source-agent-card--book-worker"), "book worker should have distinct operational styling");
+assert.ok(js.includes('bookWorker ? "" :'), "book workers should not expose unsupported pause or resume controls");
+assert.ok(js.includes("commanding"), "non-upgrade commands should use an operation status rather than upgrading");
 assert.ok(js.includes("sourceAgentManagementSequence"), "stale management responses should be rejected");
 assert.ok(js.includes("clearTimeout(sourceAgentManagementPollTimer)"), "management polling should be bounded and replaceable");
 assert.ok(html.includes('name="color-scheme"'), "index should retain color scheme metadata");

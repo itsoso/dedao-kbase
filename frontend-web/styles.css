@@ -938,14 +938,46 @@ a.button {
 }
 
 .dedao-ebook-card__job {
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
   gap: 9px;
   margin-top: 14px;
   padding-top: 12px;
   border-top: 1px dashed rgba(141, 132, 117, 0.28);
   color: #756c5f;
   font-size: 12px;
+}
+
+.book-job-recovery__summary,
+.book-job-recovery__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.book-job-recovery__summary strong,
+.book-job-recovery__stage strong {
+  color: #264f45;
+  font-weight: 800;
+}
+
+.book-job-recovery__summary small {
+  flex-basis: 100%;
+  line-height: 1.55;
+}
+
+.book-job-recovery__actions {
+  justify-content: flex-end;
+}
+
+.book-job-recovery__history {
+  display: block;
+  margin-top: 7px;
+  color: #766d60;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .dedao-ebook-card__job.is-succeeded {
@@ -957,7 +989,6 @@ a.button {
 }
 
 .dedao-ebook-card__job a {
-  margin-left: auto;
   color: var(--accent);
   font-weight: 750;
 }
@@ -1311,6 +1342,21 @@ a.button {
   font-size: 13px;
 }
 
+.book-job-recovery__stage {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px !important;
+  padding-left: 10px;
+  border-left: 3px solid #2c7a6b;
+}
+
+.book-job-recovery__stage span {
+  color: #8d8475;
+  font-size: 11px;
+  font-weight: 800;
+}
+
 .job-card__source,
 .job-card__status {
   display: inline-flex;
@@ -1335,7 +1381,8 @@ a.button {
 }
 
 .job-card__status.is-failed,
-.job-card__status.is-error {
+.job-card__status.is-error,
+.job-card__status.is-interrupted {
   background: rgba(191, 72, 54, 0.12);
   color: #9a3324;
 }
@@ -7934,7 +7981,7 @@ body.has-proofroom-modal {
 
 .source-agents__summary {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 32px;
 }
@@ -7994,6 +8041,42 @@ body.has-proofroom-modal {
   border-radius: 22px;
   background: var(--paper);
   box-shadow: var(--shadow);
+}
+
+.source-agent-card--book-worker {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(44, 122, 107, 0.42);
+  background: linear-gradient(145deg, #fffdf8 0 72%, rgba(220, 238, 233, 0.7));
+}
+
+.source-agent-card--book-worker::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 5px;
+  background: #2c7a6b;
+  content: "";
+}
+
+.source-agent-card__operating-mode {
+  display: grid;
+  gap: 4px;
+  margin: -4px 0 18px;
+  padding: 12px 14px;
+  border: 1px solid rgba(44, 122, 107, 0.18);
+  border-radius: 12px;
+  background: rgba(220, 238, 233, 0.42);
+}
+
+.source-agent-card__operating-mode strong {
+  color: #275f4f;
+  font-size: 13px;
+}
+
+.source-agent-card__operating-mode span {
+  color: #66736d;
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .source-agent-card.is-attention,
@@ -8082,8 +8165,18 @@ body.has-proofroom-modal {
 }
 
 .source-agent-card__error {
+  display: grid;
+  gap: 4px;
   color: #a43f32;
   overflow-wrap: anywhere;
+}
+
+.source-agent-card__error strong {
+  font-size: 11px;
+}
+
+.source-agent-card__error span {
+  line-height: 1.55;
 }
 
 .source-agent-card__upgrade {
@@ -8135,9 +8228,32 @@ body.has-proofroom-modal {
     order: -1;
   }
 
+  .source-agents__summary-item.is-commanding {
+    order: -1;
+  }
+
   .source-agents__list,
   .source-agent-card__facts {
     grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 840px) {
+  .dedao-ebook-card__job,
+  .job-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .book-job-recovery__actions,
+  .job-card__meta {
+    align-items: stretch;
+    justify-content: flex-start;
+  }
+
+  .book-job-recovery__actions .button,
+  .job-card__meta .button,
+  .source-agent-card--book-worker .source-agent-card__actions .button {
+    width: 100%;
   }
 }
 

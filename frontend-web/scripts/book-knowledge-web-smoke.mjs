@@ -253,6 +253,23 @@ for (const marker of [
 }
 assert.ok(css.includes(".controlled-agent-wizard"), "styles.css should style the controlled Book Agent wizard");
 
+for (const marker of [
+  "interrupted: \"已中断\"",
+  "bookJobStageLabel",
+  "bookJobFailureMessage",
+  "canRetryBookJob",
+  "retryBookJob",
+  'task.source === "KBase"',
+  "data-book-job-retry",
+  "retry_of",
+  "原任务",
+  "已有重试任务正在排队或运行",
+]) {
+  assert.ok(js.includes(marker), `book job recovery should include ${marker}`);
+}
+assert.ok(html.includes("20260809-book-job-recovery"), "book job recovery should bust cached app assets");
+assert.doesNotMatch(js, />\s*job execution failed\s*</i, "job center must not render raw worker failure copy");
+
 for (const capability of ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan"]) {
   assert.ok(
     js.includes(`renderBookAgentCapability("${capability}"`),

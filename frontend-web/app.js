@@ -143,6 +143,7 @@ const jobCenterState = {
   loading: "",
   message: "",
   lastUpdated: "",
+  retrying: new Set(),
 };
 
 const dedaoLoginState = {
@@ -2187,11 +2188,20 @@ function renderDedaoEbookJobStatus(book) {
   const job = dedaoEbookAcquisitionState.jobs[book.enid];
   if (!job) return "";
   const knowledgeBookID = job.result?.knowledge_book_id || "";
+  const retrying = jobCenterState.retrying.has(String(job.id || ""));
+  const failure = bookJobFailureMessage(job);
   return `
-    <div class="dedao-ebook-card__job ${escapeAttribute(jobStatusClass(job.status))}" role="status">
-      <span>${escapeHTML(jobStatusLabel(job.status))}</span>
-      ${job.error ? `<small>${escapeHTML(job.error)}</small>` : ""}
-      ${knowledgeBookID ? `<a href="${escapeAttribute(buildKnowledgePackageURL(knowledgeBookID))}">打开知识包</a>` : ""}
+    <div class="dedao-ebook-card__job book-job-recovery ${escapeAttribute(jobStatusClass(job.status))}" role="status" aria-live="polite">
+      <div class="book-job-recovery__summary">
+        <span>${escapeHTML(jobStatusLabel(job.status))}</span>
+        <strong>${escapeHTML(bookJobStageLabel(job.stage || job.status))}</strong>
+        ${failure ? `<small>${escapeHTML(failure)}</small>` : ""}
+        ${job.retry_of ? `<small class="book-job-recovery__history">重试自原任务 ${escapeHTML(job.retry_of)}</small>` : ""}
+      </div>
+      <div class="book-job-recovery__actions">
+        ${knowledgeBookID ? `<a href="${escapeAttribute(buildKnowledgePackageURL(knowledgeBookID))}">打开知识包</a>` : ""}
+        ${canRetryBookJob(job) ? `<button class="button button-ghost" type="button" data-book-job-retry="${escapeAttribute(job.id)}" data-book-job-enid="${escapeAttribute(book.enid)}" ${retrying ? "disabled" : ""} aria-label="重新执行 ${escapeAttribute(book.title)} 的任务">${retrying ? "提交中" : "重新执行"}</button>` : ""}
+      </div>
     </div>
   `;
 }
@@ -2310,6 +2320,9 @@ function renderDedaoEbookAcquisition() {
       downloadType: type === "dedao_ebook_download" ? Number(format?.value || 1) : 1,
     });
   }));
+  app.querySelectorAll("[data-book-job-retry]").forEach((button) => button.addEventListener("click", () => {
+    retryBookJob(button.dataset.bookJobRetry, { enid: button.dataset.bookJobEnid || "" });
+  }));
 }
 
 function setDedaoEbookSource(source) {
@@ -2400,7 +2413,7 @@ async function pollBookKnowledgeJob(jobID, enid, attempt = 0) {
     if (!job) throw new Error("任务不存在");
     dedaoEbookAcquisitionState.jobs[enid] = job;
     renderDedaoEbookAcquisition();
-    if (["succeeded", "failed"].includes(job.status)) return;
+    if (["succeeded", "failed", "interrupted"].includes(job.status)) return;
     if (attempt >= 240) {
       dedaoEbookAcquisitionState.message = "任务仍在后台运行，请到任务中心继续查看。";
       renderDedaoEbookAcquisition();
@@ -3168,8 +3181,89 @@ function jobStatusLabel(status) {
     completed: "已完成",
     failed: "失败",
     error: "失败",
+    interrupted: "已中断",
     canceled: "已取消",
   })[String(status || "").toLowerCase()] || status || "未知";
+}
+
+function bookJobStageLabel(stage) {
+  return ({
+    queued: "排队等待",
+    running: "准备执行",
+    downloading: "正在下载",
+    building_knowledge: "正在生成知识库",
+    recovery_required: "等待人工恢复",
+    completed: "处理完成",
+    failed: "处理失败",
+    interrupted: "已安全中断",
+  })[String(stage || "").toLowerCase()] || "等待状态更新";
+}
+
+function bookJobFailureMessage(job) {
+  const code = String(job?.failure_code || "").toLowerCase();
+  const copy = {
+    authentication_required: "登录已失效，请重新登录后再执行。",
+    download_failed: "电子书下载未完成，可以从这里重新执行。",
+    knowledge_build_failed: "下载已经完成，但知识库生成未完成，可以重新执行。",
+    worker_interrupted: "任务已安全停止，可以从这里重新执行。",
+    source_changed: "书籍权限或任务参数已经变化，请确认后重新创建任务。",
+    unknown_failure: "任务未完成，请查看诊断后重新执行。",
+  }[code];
+  if (copy) return copy;
+  const raw = String(job?.failure_message || job?.error || "").trim();
+  if (!raw) {
+    return ["failed", "interrupted"].includes(String(job?.status || "").toLowerCase())
+      ? "任务未完成，请查看诊断后重新执行。"
+      : "";
+  }
+  if (/job execution failed|panic|stack trace|authorization|bearer|cookie|token|\/Users\/|\/home\//i.test(raw)) {
+    return "任务未完成，技术细节已隐藏；请查看诊断后重新执行。";
+  }
+  return raw;
+}
+
+function canRetryBookJob(job) {
+  const status = String(job?.status || "").toLowerCase();
+  const isKBase = job?.source === "KBase" || ["dedao_ebook_download", "dedao_ebook_sync_kbase"].includes(job?.type || job?.raw?.type);
+  return isKBase && ["failed", "interrupted"].includes(status) && Boolean(job?.id);
+}
+
+async function retryBookJob(jobID, { enid = "" } = {}) {
+  const id = String(jobID || "").trim();
+  if (!id || jobCenterState.retrying.has(id)) return null;
+  jobCenterState.retrying.add(id);
+  jobCenterState.message = "正在提交重试任务";
+  const onEbookPage = getRoutePathname().startsWith(ROUTES.dedaoEbooks);
+  if (onEbookPage) renderDedaoEbookAcquisition();
+  else if (getRoutePathname() === ROUTES.jobs) renderJobCenter();
+  try {
+    const payload = await apiFetch(`/api/jobs/${encodeURIComponent(jobID)}/retry`, {
+      method: "POST",
+      body: "{}",
+    });
+    const retry = payload?.job || null;
+    if (!retry?.id) throw new Error("重试响应缺少任务编号");
+    const ebookEnID = String(enid || retry.ebook_enid || "").trim();
+    if (ebookEnID) {
+      dedaoEbookAcquisitionState.jobs[ebookEnID] = retry;
+      dedaoEbookAcquisitionState.message = "重试任务已进入队列。";
+      pollBookKnowledgeJob(retry.id, ebookEnID);
+    }
+    jobCenterState.message = "重试任务已进入队列。";
+    if (getRoutePathname() === ROUTES.jobs) await loadJobCenter();
+    return retry;
+  } catch (error) {
+    const message = error?.status === 409
+      ? "已有重试任务正在排队或运行"
+      : (error instanceof Error ? error.message : String(error));
+    jobCenterState.message = message;
+    if (onEbookPage) dedaoEbookAcquisitionState.message = message;
+    return null;
+  } finally {
+    jobCenterState.retrying.delete(id);
+    if (onEbookPage) renderDedaoEbookAcquisition();
+    else if (getRoutePathname() === ROUTES.jobs && !jobCenterState.loading) renderJobCenter();
+  }
 }
 
 function jobStatusClass(status) {
@@ -3186,8 +3280,10 @@ function normalizeJobTask(task, source = "wcplus") {
       title: task?.result?.title || `电子书 ${task?.ebook_id || ""}`.trim(),
       operation: task?.type === "dedao_ebook_sync_kbase" ? "下载并入知识库" : "电子书下载",
       status: task?.status || "unknown",
-      progress: task?.status === "running" ? "服务器本地处理中" : "",
-      error: task?.error || "",
+      stage: task?.stage || task?.status || "unknown",
+      progress: task?.status === "running" ? "由独立 Worker 在服务器本地处理" : "",
+      error: bookJobFailureMessage(task),
+      retryOf: task?.retry_of || "",
       updatedAt: task?.updated_at || task?.created_at || "",
       sourceURL: knowledgeBookID ? buildKnowledgePackageURL(knowledgeBookID) : ROUTES.dedaoEbooks,
       raw: task || {},
@@ -3207,8 +3303,10 @@ function normalizeJobTask(task, source = "wcplus") {
     title: task?.nickname || task?.biz || taskID || "未命名任务",
     operation: task?.crawler_type || task?.operation || source,
     status: task?.status || "unknown",
+    stage: "",
     progress: progress.join(" · "),
     error: task?.status_error || task?.error || task?.message || "",
+    retryOf: "",
     updatedAt: task?.updated_at || task?.update_time || task?.created_at || "",
     sourceURL: "/wcplus-source",
     raw: task || {},
@@ -3225,21 +3323,36 @@ function jobCenterErrorMessage(error) {
 
 function renderJobCenter() {
   const tasks = Array.isArray(jobCenterState.tasks) ? jobCenterState.tasks : [];
-  const rows = tasks.map((task) => `
-    <article class="job-card ${escapeAttribute(jobStatusClass(task.status))}">
+  const retriesByOriginal = new Map();
+  for (const task of tasks) {
+    if (!task.retryOf) continue;
+    const retries = retriesByOriginal.get(task.retryOf) || [];
+    retries.push(task);
+    retriesByOriginal.set(task.retryOf, retries);
+  }
+  const rows = tasks.map((task) => {
+    const retries = retriesByOriginal.get(task.id) || [];
+    const retrying = jobCenterState.retrying.has(task.id);
+    return `
+    <article class="job-card book-job-recovery ${escapeAttribute(jobStatusClass(task.status))}">
       <div class="job-card__main">
         <span class="job-card__source">${escapeHTML(task.source)}</span>
         <h2>${escapeHTML(task.title)}</h2>
         <p>${escapeHTML([task.operation, task.progress].filter(Boolean).join(" · ") || "暂无进度")}</p>
+        ${task.source === "KBase" ? `<p class="book-job-recovery__stage"><span>当前阶段</span><strong>${escapeHTML(bookJobStageLabel(task.stage))}</strong></p>` : ""}
         ${task.error ? `<small class="job-card__error">${escapeHTML(task.error)}</small>` : ""}
+        ${task.retryOf ? `<small class="book-job-recovery__history">重试自原任务 ${escapeHTML(task.retryOf)}</small>` : ""}
+        ${retries.length ? `<small class="book-job-recovery__history">后续重试：${retries.map((retry) => `${escapeHTML(retry.id)}（${escapeHTML(jobStatusLabel(retry.status))}）`).join(" · ")}</small>` : ""}
       </div>
       <div class="job-card__meta">
         <span class="job-card__status ${escapeAttribute(jobStatusClass(task.status))}">${escapeHTML(jobStatusLabel(task.status))}</span>
         ${task.updatedAt ? `<small>${escapeHTML(task.updatedAt)}</small>` : ""}
         <a class="button button-ghost" href="${escapeAttribute(task.sourceURL)}">打开来源</a>
+        ${canRetryBookJob(task) ? `<button class="button button-primary" type="button" data-book-job-retry="${escapeAttribute(task.id)}" ${retrying ? "disabled" : ""} aria-label="重新执行任务 ${escapeAttribute(task.id)}">${retrying ? "提交中" : "重新执行"}</button>` : ""}
       </div>
     </article>
-  `).join("");
+  `;
+  }).join("");
 
   renderShell(`
     <main class="job-center">
@@ -3262,6 +3375,9 @@ function renderJobCenter() {
   `, "jobs");
 
   app.querySelector("[data-action='reload-job-center']")?.addEventListener("click", () => loadJobCenter());
+  app.querySelectorAll("[data-book-job-retry]").forEach((button) => button.addEventListener("click", () => {
+    retryBookJob(button.dataset.bookJobRetry);
+  }));
 }
 
 async function loadJobCenter() {
@@ -6480,10 +6596,13 @@ function renderWCPlusPage() {
 }
 
 function sourceAgentManagementStatus(agent, commands = []) {
-  const activeUpgrade = commands.some((command) => command.type === "upgrade" && !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(command.state));
-  if (activeUpgrade || agent.current_command_id) {
+  const terminalStates = ["succeeded", "failed", "canceled", "expired", "rolled_back"];
+  const activeUpgrade = commands.some((command) => command.type === "upgrade" && !terminalStates.includes(command.state));
+  const activeCommand = commands.some((command) => !terminalStates.includes(command.state));
+  if (activeUpgrade) {
     return "upgrading";
   }
+  if (activeCommand || agent.current_command_id) return "commanding";
   if (agent.desired_state === "paused") {
     return "paused";
   }
@@ -6504,11 +6623,12 @@ function sourceAgentManagementStatusLabel(status) {
     offline: "离线",
     paused: "已暂停",
     upgrading: "升级中",
+    commanding: "操作中",
   })[status] || "未知";
 }
 
 function sourceAgentManagementGroups() {
-  const groups = { online: [], attention: [], offline: [], paused: [], upgrading: [] };
+  const groups = { online: [], attention: [], offline: [], paused: [], upgrading: [], commanding: [] };
   for (const agent of sourceAgentManagementState.agents) {
     const commands = sourceAgentManagementState.commandsByAgent[agent.agent_id] || [];
     groups[sourceAgentManagementStatus(agent, commands)].push(agent);
@@ -6520,7 +6640,7 @@ function renderSourceAgentStatusSummary() {
   const groups = sourceAgentManagementGroups();
   return `
     <section class="source-agents__summary" aria-label="Agent 状态汇总">
-      ${["online", "attention", "offline", "paused", "upgrading"].map((status) => `
+      ${["online", "attention", "offline", "paused", "upgrading", "commanding"].map((status) => `
         <div class="source-agents__summary-item is-${status}">
           <strong>${groups[status].length}</strong>
           <span>${sourceAgentManagementStatusLabel(status)}</span>
@@ -6540,7 +6660,28 @@ function sourceAgentCompatibleArtifacts(agent) {
   ));
 }
 
+function isBookJobWorker(agent) {
+  return agent?.worker_type === "book-job-worker";
+}
+
+function canRestartBookJobWorker(agent) {
+  const capabilities = Array.isArray(agent?.capabilities) ? agent.capabilities : [];
+  return isBookJobWorker(agent) && capabilities.includes("controlled_restart");
+}
+
+function sourceAgentSafeError(value) {
+  const message = String(value || "").trim();
+  if (!message) return "";
+  if (/authorization|bearer|cookie|token|https?:\/\/|\/Users\/|\/home\//i.test(message)) {
+    return "Worker 报告异常，敏感技术细节已隐藏；请先运行诊断。";
+  }
+  return message;
+}
+
 function sourceAgentWorkspace(agent) {
+  if (agent.worker_type === "book-job-worker") {
+    return { href: ROUTES.jobs, label: "任务中心" };
+  }
   return agent.worker_type === "wcplus-worker"
     ? { href: "/wcplus-source", label: "WC Plus 工作台" }
     : { href: "/wechat-source", label: "微信工作台" };
@@ -6554,21 +6695,25 @@ function renderSourceAgentManagementCard(agent) {
   const artifacts = sourceAgentCompatibleArtifacts(agent);
   const workspace = sourceAgentWorkspace(agent);
   const pending = sourceAgentManagementState.pendingAgentID === agent.agent_id;
+  const bookWorker = isBookJobWorker(agent);
+  const canRestart = canRestartBookJobWorker(agent);
+  const safeLastError = sourceAgentSafeError(agent.last_error);
   return `
-    <article class="source-agent-card is-${status}">
+    <article class="source-agent-card ${bookWorker ? "source-agent-card--book-worker" : ""} is-${status}">
       <header class="source-agent-card__header">
         <div>
           <a class="source-agent-card__title" href="${escapeAttribute(`${ROUTES.sourceAgents}/${encodeURIComponent(agent.agent_id)}`)}">${escapeHTML(agent.agent_id)}</a>
-          <span>${escapeHTML(agent.worker_type || "legacy")}</span>
+          <span>${bookWorker ? "书籍任务 Worker" : escapeHTML(agent.worker_type || "legacy")}</span>
         </div>
         <span class="source-agent-card__status">${sourceAgentManagementStatusLabel(status)}</span>
       </header>
+      ${bookWorker ? `<p class="source-agent-card__operating-mode"><strong>人工控制 · 独立运行</strong><span>长任务由独立进程处理；受限重启会先安全中断当前任务。</span></p>` : ""}
       <dl class="source-agent-card__facts">
         <div><dt>平台 / 架构</dt><dd>${escapeHTML(agent.platform || "-")} / ${escapeHTML(agent.architecture || "-")}</dd></div>
         <div><dt>版本 / 协议</dt><dd>${escapeHTML(agent.version || "-")} / ${escapeHTML(agent.protocol_version || "-")}</dd></div>
         <div><dt>最后心跳</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_heartbeat_at))}</dd></div>
         <div><dt>最后成功</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_success_at))}</dd></div>
-        <div><dt>当前运行</dt><dd>${escapeHTML(agent.current_run_id || "-")}</dd></div>
+        <div><dt>${bookWorker ? "当前任务" : "当前运行"}</dt><dd>${escapeHTML(agent.current_run_id || "-")}</dd></div>
         <div><dt>当前命令</dt><dd>${escapeHTML(agent.current_command_id || latestCommand?.state || "-")}</dd></div>
         <div><dt>Outbox / Dead letter</dt><dd>${Number(agent.outbox_pending || 0)} / ${Number(agent.dead_letter_count || 0)}</dd></div>
       </dl>
@@ -6581,8 +6726,8 @@ function renderSourceAgentManagementCard(agent) {
           </div>
         `).join("") : '<p class="web-muted">无能力上报</p>'}
       </section>
-      ${agent.last_error ? `<p class="source-agent-card__error">${escapeHTML(agent.last_error)}</p>` : ""}
-      <div class="source-agent-card__upgrade">
+      ${safeLastError ? `<p class="source-agent-card__error"><strong>最近异常</strong><span>${escapeHTML(safeLastError)}</span></p>` : ""}
+      ${bookWorker ? "" : `<div class="source-agent-card__upgrade">
         <label>
           <span>选择已批准版本</span>
           <select data-source-agent-artifact="${escapeAttribute(agent.agent_id)}" ${pending || artifacts.length === 0 ? "disabled" : ""}>
@@ -6591,12 +6736,13 @@ function renderSourceAgentManagementCard(agent) {
           </select>
         </label>
         <button class="button button-ghost" type="button" data-source-agent-upgrade="${escapeAttribute(agent.agent_id)}" ${pending || artifacts.length === 0 ? "disabled" : ""}>升级</button>
-      </div>
+      </div>`}
       <div class="source-agent-card__actions">
-        ${agent.desired_state === "paused"
+        ${bookWorker ? "" : (agent.desired_state === "paused"
           ? `<button class="button button-ghost" type="button" data-source-agent-resume="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>恢复</button>`
-          : `<button class="button button-ghost" type="button" data-source-agent-pause="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>暂停</button>`}
+          : `<button class="button button-ghost" type="button" data-source-agent-pause="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>暂停</button>`)}
         <button class="button button-ghost" type="button" data-source-agent-diagnose="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>诊断</button>
+        ${canRestart ? `<button class="button button-primary" type="button" data-source-agent-restart="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""} aria-label="受限重启书籍任务 Worker ${escapeAttribute(agent.agent_id)}">受限重启</button>` : ""}
         <a class="button button-ghost" href="${workspace.href}?agent_id=${encodeURIComponent(agent.agent_id)}">${workspace.label}</a>
       </div>
     </article>
@@ -6605,7 +6751,7 @@ function renderSourceAgentManagementCard(agent) {
 
 function renderSourceAgentOverview() {
   const groups = sourceAgentManagementGroups();
-  const order = ["attention", "upgrading", "offline", "paused", "online"];
+  const order = ["attention", "commanding", "upgrading", "offline", "paused", "online"];
   const status = sourceAgentManagementState.loading
     ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.loading)}</div>`
     : (sourceAgentManagementState.message ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.message)}</div>` : "");
@@ -6718,6 +6864,19 @@ function createSourceAgentDiagnostic(agentID) {
   }));
 }
 
+function confirmSourceAgentRestart(agent) {
+  return window.confirm(`确认受限重启 ${agent.agent_id}？\n当前任务会先被安全标记为已中断，之后可在任务中心人工重试。`);
+}
+
+function createSourceAgentRestart(agentID) {
+  const agent = sourceAgentManagementState.agents.find((item) => item.agent_id === agentID);
+  if (!canRestartBookJobWorker(agent) || !confirmSourceAgentRestart(agent)) return Promise.resolve();
+  return runSourceAgentManagementAction(agentID, () => apiFetch(`/api/source-agents/${encodeURIComponent(agentID)}/commands`, {
+    method: "POST",
+    body: JSON.stringify(sourceAgentCommandEnvelope("restart")),
+  }));
+}
+
 function confirmSourceAgentUpgrade(agent, artifact) {
   return window.confirm(`确认升级 ${agent.agent_id}\n当前版本：${agent.version || "-"}\n目标版本：${artifact.version}`);
 }
@@ -6745,6 +6904,9 @@ function bindSourceAgentManagementEvents() {
   }
   for (const button of document.querySelectorAll("[data-source-agent-diagnose]")) {
     button.addEventListener("click", () => createSourceAgentDiagnostic(button.getAttribute("data-source-agent-diagnose")));
+  }
+  for (const button of document.querySelectorAll("[data-source-agent-restart]")) {
+    button.addEventListener("click", () => createSourceAgentRestart(button.getAttribute("data-source-agent-restart")));
   }
   for (const button of document.querySelectorAll("[data-source-agent-upgrade]")) {
     button.addEventListener("click", () => {
