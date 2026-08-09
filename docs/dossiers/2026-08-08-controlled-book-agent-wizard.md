@@ -358,3 +358,37 @@ Decision: PASS.
 - `go test ./... -timeout=300s -count=1` passed; `backend/app` completed in
   99.128 seconds. Privacy, generated system-map drift, and whitespace checks
   passed.
+
+### First deployment and failed online acceptance
+
+- Revision `5f5bec5357194046cd24ad131b3ae9444c819b1a` was built from an
+  archive with SHA-256
+  `c5a0375a9b8e2d0738ed230e6f7d79667f5fad8406299b93e445e6c15490489a`.
+  Linux repeated dependency audit, frontend build and smoke checks, module
+  verification, vet, and the complete Go suite; `backend/app` completed in
+  72.037 seconds.
+- The first candidate binary SHA-256 was
+  `7acd10b8d48870685da9cb535c982dcb3043e1ff32358d60018818b191b64be0`.
+  It deployed with rollback batch `direct-5f5bec5-20260809T022409Z`, exact
+  loopback revision, active service state, and zero restarts.
+- G6 then failed safely. `注意力机制的演化` no longer timed out and restored the
+  form after 12.332 seconds, but the runtime returned `citation_required`
+  instead of a grounded answer. The release loop returned to diagnosis rather
+  than weakening citation policy.
+- A privacy-bounded provider probe showed that Qwen grouped multiple retrieved
+  IDs as `[citation:id1, citation:id2]`, repeating the `citation:` prefix inside
+  the same brackets. The parser previously treated the whole comma-separated
+  payload as one unknown ID.
+
+### Grouped citation correction
+
+- The runtime now splits a grouped citation marker on commas, removes an
+  optional repeated `citation:` prefix, and validates every resulting ID
+  against retrieved evidence before accepting any of them.
+- A production-shaped grouped-citation test failed before the change and passed
+  afterward. A mixed valid/unknown group still causes complete abstention, and
+  focused race-enabled coverage passed.
+- The second complete local gate run passed: supported Node frontend build,
+  every frontend/Web and repository shell smoke, `go vet ./...`, privacy and
+  whitespace checks, and `go test ./... -timeout=300s -count=1` with
+  `backend/app` completing in 99.600 seconds.
