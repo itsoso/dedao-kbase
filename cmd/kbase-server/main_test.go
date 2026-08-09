@@ -236,21 +236,57 @@ func TestDefaultSystemKBExportPathUsesRepoDirEnv(t *testing.T) {
 	}
 }
 
-func TestRecoverInterruptedBookKnowledgeJobs(t *testing.T) {
+func TestInitializeBookKnowledgeJobsControlPlanePreservesQueuedAndRunning(t *testing.T) {
 	store := app.NewBookKnowledgeStore(t.TempDir())
-	job, err := store.CreateBookKnowledgeJob(app.BookKnowledgeJobRequest{
-		Type: app.BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 42, EbookEnID: "ebook-enid", DownloadType: 1,
+	runningSource, err := store.CreateBookKnowledgeJob(app.BookKnowledgeJobRequest{
+		Type: app.BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 42, EbookEnID: "running-enid", DownloadType: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	count, err := recoverInterruptedBookKnowledgeJobs(store)
-	if err != nil || count != 1 {
-		t.Fatalf("count=%d err=%v", count, err)
+	running, err := store.ClaimNextBookKnowledgeJob("control-plane-worker", time.Hour)
+	if err != nil || running == nil || running.ID != runningSource.ID {
+		t.Fatalf("running=%#v err=%v", running, err)
 	}
-	loaded, err := store.LoadBookKnowledgeJob(job.ID)
-	if err != nil || loaded.Status != app.BookKnowledgeJobStatusFailed {
-		t.Fatalf("job=%#v err=%v", loaded, err)
+	queued, err := store.CreateBookKnowledgeJob(app.BookKnowledgeJobRequest{
+		Type: app.BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 43, EbookEnID: "queued-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := initializeBookKnowledgeJobsControlPlane(store); err != nil {
+		t.Fatalf("initialize control plane: %v", err)
+	}
+	loadedQueued, err := store.LoadBookKnowledgeJob(queued.ID)
+	if err != nil || loadedQueued.Status != app.BookKnowledgeJobStatusQueued {
+		t.Fatalf("queued=%#v err=%v", loadedQueued, err)
+	}
+	loadedRunning, err := store.LoadBookKnowledgeJob(running.ID)
+	if err != nil || loadedRunning.Status != app.BookKnowledgeJobStatusRunning ||
+		loadedRunning.LeaseOwner != running.LeaseOwner || loadedRunning.LeaseExpiresAt != running.LeaseExpiresAt {
+		t.Fatalf("running changed: before=%#v after=%#v err=%v", running, loadedRunning, err)
+	}
+}
+
+func TestInitializeBookKnowledgeJobsControlPlaneCreatesStoreAndFailsFast(t *testing.T) {
+	root := t.TempDir()
+	store := app.NewBookKnowledgeStore(root)
+	if err := initializeBookKnowledgeJobsControlPlane(store); err != nil {
+		t.Fatalf("initialize new store: %v", err)
+	}
+	if _, err := os.Stat(store.BookJobsDBPath()); err != nil {
+		t.Fatalf("initialized database: %v", err)
+	}
+	if err := initializeBookKnowledgeJobsControlPlane(nil); err == nil {
+		t.Fatal("nil store initialization succeeded")
+	}
+	blockedRoot := filepath.Join(t.TempDir(), "blocked-root")
+	if err := os.WriteFile(blockedRoot, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := initializeBookKnowledgeJobsControlPlane(app.NewBookKnowledgeStore(blockedRoot)); err == nil {
+		t.Fatal("blocked root initialization succeeded")
 	}
 }
 

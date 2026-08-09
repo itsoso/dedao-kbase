@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -506,6 +505,15 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/jobs/") {
+		if jobID, ok := parseBookKnowledgeJobAction(r.URL.EscapedPath(), "retry"); ok {
+			h.handleRetryBookKnowledgeJob(w, r, jobID)
+			return
+		}
+		rawPath := strings.TrimPrefix(r.URL.EscapedPath(), "/api/jobs/")
+		if strings.Contains(rawPath, "/") {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
 		h.handleGetBookKnowledgeJob(w, r)
 		return
 	}
@@ -685,12 +693,8 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 		}
 		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
 	case http.MethodPost:
-		defer r.Body.Close()
 		var request BookKnowledgeJobRequest
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&request); err != nil {
-			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		if !decodeStrictLimitedHTTPJSON(w, r, 64<<10, &request) {
 			return
 		}
 		normalized, err := normalizeBookKnowledgeJobRequest(request)
@@ -698,8 +702,7 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		jobService := getService()
-		detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, jobService, normalized.EbookEnID)
+		detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, getService(), normalized.EbookEnID)
 		if err != nil {
 			writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
 			return
@@ -726,15 +729,85 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusInternalServerError, "failed to create job")
 			return
 		}
-		go func(service *services.Service) {
-			if err := h.store.RunBookKnowledgeJobWithService(job.ID, service); err != nil {
-				log.Printf("book knowledge job %q failed to persist state", job.ID)
-			}
-		}(jobService)
 		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
 	default:
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func parseBookKnowledgeJobAction(path, action string) (string, bool) {
+	const prefix = "/api/jobs/"
+	action = strings.TrimSpace(action)
+	suffix := "/" + action
+	if action == "" || !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		return "", false
+	}
+	jobID, err := url.PathUnescape(rawID)
+	if err != nil || strings.TrimSpace(jobID) == "" {
+		return "", false
+	}
+	return jobID, true
+}
+
+func (h *kbaseHTTPHandler) handleRetryBookKnowledgeJob(w http.ResponseWriter, r *http.Request, jobID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	original, err := h.store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		if errors.Is(err, ErrBookKnowledgeJobNotFound) {
+			writeHTTPError(w, http.StatusNotFound, "job not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, "failed to load job")
+		return
+	}
+	if original.Status != BookKnowledgeJobStatusFailed && original.Status != BookKnowledgeJobStatusInterrupted {
+		writeHTTPError(w, http.StatusConflict, "job is not eligible for retry")
+		return
+	}
+	detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, getService(), original.EbookEnID)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
+		return
+	}
+	if detail == nil {
+		writeHTTPError(w, http.StatusNotFound, "ebook not found")
+		return
+	}
+	detailEnID := strings.TrimSpace(detail.Enid)
+	if detail.ID <= 0 || detailEnID == "" {
+		writeHTTPError(w, http.StatusBadGateway, "unable to verify dedao ebook identity")
+		return
+	}
+	if detail.ID != original.EbookID || detailEnID != original.EbookEnID {
+		writeHTTPError(w, http.StatusConflict, "ebook identity no longer matches original job")
+		return
+	}
+	if !detail.IsBuy && !detail.IsOnBookshelf {
+		writeHTTPError(w, http.StatusForbidden, "ebook is not owned or on the active bookshelf")
+		return
+	}
+	retry, err := h.store.RetryBookKnowledgeJob(original.ID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrBookKnowledgeJobConflict):
+			writeHTTPError(w, http.StatusConflict, "an active retry is already queued or running")
+		case errors.Is(err, ErrBookKnowledgeJobInvalidState):
+			writeHTTPError(w, http.StatusConflict, "job is not eligible for retry")
+		case errors.Is(err, ErrBookKnowledgeJobNotFound):
+			writeHTTPError(w, http.StatusNotFound, "job not found")
+		default:
+			writeHTTPError(w, http.StatusInternalServerError, "failed to retry job")
+		}
+		return
+	}
+	writeHTTPJSON(w, http.StatusCreated, map[string]any{"job": retry})
 }
 
 func (h *kbaseHTTPHandler) handleGetBookKnowledgeJob(w http.ResponseWriter, r *http.Request) {
