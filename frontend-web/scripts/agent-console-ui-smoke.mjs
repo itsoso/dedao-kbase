@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
+const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 for (const marker of [
   "renderAgentConsole",
@@ -19,17 +20,27 @@ for (const marker of [
   "阅读应用",
   "技术身份与版本凭据",
   "证据与运行边界",
+  "Package、Release 与可信评测已载入",
 ]) {
   assert.ok(js.includes(marker), `Agent console should include ${marker}`);
 }
+assert.ok(!js.includes('bookAgentState.loading = "Loading Agent Packages"'), "Agent loading status should not fall back to English");
 
 const consoleSource = js.match(/function renderAgentConsole\([\s\S]*?\n\}/)?.[0] || "";
+const displayNameSource = js.match(/function agentConsoleDisplayName\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(displayNameSource.includes("split(/[：:]/)"), "long Chinese subtitles should not dominate the console title");
+assert.ok(displayNameSource.includes("知识研究助手"), "missing book titles should still receive a Chinese display name");
 assert.ok(consoleSource.includes("release.book?.title"), "console title should derive from the pinned Chinese book title");
 assert.ok(consoleSource.includes("pkg.package_id"), "console should retain the technical Agent ID");
 assert.ok(consoleSource.includes('id="book-agent-search-form"'), "console should preserve the search form contract");
 assert.ok(consoleSource.includes('id="book-agent-chat-form"') || consoleSource.includes("renderGroundedConversation"), "console should preserve grounded conversation");
 assert.ok(consoleSource.includes("<details"), "low-frequency technical identity should be collapsible");
 assert.ok(!consoleSource.includes("<details open"), "technical identity should be collapsed by default");
+
+const evidenceSource = js.match(/function renderBookAgentEvidence\([\s\S]*?\n\}/)?.[0] || "";
+for (const label of ["证据账本", "条结论", "条引用", "无引用 ID"]) {
+  assert.ok(evidenceSource.includes(label), `Agent evidence ledger should use Chinese-first copy for ${label}`);
+}
 
 const platformSource = js.match(/function renderBookAgentPlatform\([\s\S]*?\n\}\n\nfunction bindAgentCompilerEvents/)?.[0] || "";
 assert.ok(platformSource.includes('route.view === "agent"'), "platform should select the Agent-specific layout explicitly");
@@ -58,5 +69,6 @@ const mobileSource = mobileStart >= 0 ? css.slice(mobileStart, mobileEnd >= 0 ? 
 assert.ok(mobileSource.includes(".agent-console__workspace"), "console should define a mobile workspace layout");
 assert.ok(mobileSource.includes("grid-template-columns: minmax(0, 1fr)"), "mobile console should collapse to one column");
 assert.ok(css.includes("prefers-reduced-motion: reduce"), "console animation should respect reduced motion");
+assert.ok(html.includes("20260808-agent-console-zh"), "production should publish a fresh Agent console asset version");
 
 console.log("Agent console UI smoke passed");
