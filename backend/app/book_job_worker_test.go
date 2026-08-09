@@ -24,12 +24,19 @@ type bookJobWorkerSourceClientForTest struct {
 	reportErr  error
 	claim      func(context.Context) (*SourceAgentCommand, error)
 	report     func(SourceAgentCommandTransition)
+	heartbeat  func(context.Context, SourceAgentHeartbeat) error
 }
 
-func (client *bookJobWorkerSourceClientForTest) Heartbeat(_ context.Context, heartbeat SourceAgentHeartbeat) (SourceAgent, error) {
+func (client *bookJobWorkerSourceClientForTest) Heartbeat(ctx context.Context, heartbeat SourceAgentHeartbeat) (SourceAgent, error) {
 	client.mu.Lock()
-	defer client.mu.Unlock()
 	client.heartbeats = append(client.heartbeats, heartbeat)
+	hook := client.heartbeat
+	client.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, heartbeat); err != nil {
+			return SourceAgent{}, err
+		}
+	}
 	return SourceAgent{}, nil
 }
 
@@ -51,19 +58,18 @@ func (client *bookJobWorkerSourceClientForTest) ReportCommand(
 	_ context.Context, _ string, state, code, message, actualVersion string,
 ) (SourceAgentCommand, error) {
 	client.mu.Lock()
-	defer client.mu.Unlock()
 	client.reports = append(client.reports, SourceAgentCommandTransition{
 		State: state, ResultCode: code, Message: message, ActualVersion: actualVersion,
 	})
 	reported := client.reports[len(client.reports)-1]
 	reportHook := client.report
-	if client.reportErr != nil {
-		return SourceAgentCommand{}, client.reportErr
-	}
+	reportErr := client.reportErr
+	client.mu.Unlock()
 	if reportHook != nil {
-		client.mu.Unlock()
 		reportHook(reported)
-		client.mu.Lock()
+	}
+	if reportErr != nil {
+		return SourceAgentCommand{}, reportErr
 	}
 	return SourceAgentCommand{State: state, ResultCode: code}, nil
 }
@@ -493,6 +499,108 @@ func TestBookJobWorkerCancellationDuringControlPollInterruptsWithoutFalseRestart
 	defer client.mu.Unlock()
 	if len(client.reports) != 0 {
 		t.Fatalf("cancellation reported restart=%#v", client.reports)
+	}
+}
+
+func TestBookJobWorkerControlOutagesDuringExecutionDoNotInterruptBookJob(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*bookJobWorkerSourceClientForTest, <-chan struct{}, chan<- struct{})
+	}{
+		{
+			name: "heartbeat failure",
+			configure: func(client *bookJobWorkerSourceClientForTest, started <-chan struct{}, failed chan<- struct{}) {
+				var calls atomic.Int32
+				client.heartbeat = func(context.Context, SourceAgentHeartbeat) error {
+					if calls.Add(1) < 3 {
+						return nil
+					}
+					<-started
+					close(failed)
+					return errors.New("heartbeat unavailable")
+				}
+			},
+		},
+		{
+			name: "claim failure",
+			configure: func(client *bookJobWorkerSourceClientForTest, started <-chan struct{}, failed chan<- struct{}) {
+				var calls atomic.Int32
+				client.claim = func(context.Context) (*SourceAgentCommand, error) {
+					if calls.Add(1) == 1 {
+						return nil, nil
+					}
+					<-started
+					close(failed)
+					return nil, errors.New("claim unavailable")
+				}
+			},
+		},
+		{
+			name: "diagnose report failure",
+			configure: func(client *bookJobWorkerSourceClientForTest, started <-chan struct{}, failed chan<- struct{}) {
+				var calls atomic.Int32
+				client.claim = func(context.Context) (*SourceAgentCommand, error) {
+					if calls.Add(1) == 1 {
+						return nil, nil
+					}
+					<-started
+					return &SourceAgentCommand{ID: "diagnose-outage", Type: SourceAgentCommandDiagnose, State: SourceAgentCommandClaimed}, nil
+				}
+				client.reportErr = errors.New("report unavailable")
+				client.report = func(SourceAgentCommandTransition) { close(failed) }
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 200)
+			started := make(chan struct{})
+			controlFailed := make(chan struct{})
+			releaseExecution := make(chan struct{})
+			client := &bookJobWorkerSourceClientForTest{}
+			test.configure(client, started, controlFailed)
+			worker, err := NewBookJobWorker(BookJobWorkerConfig{
+				Store: store, WorkerID: "worker-control-outage", LeaseDuration: time.Second,
+				RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+				SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+				Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+					close(started)
+					select {
+					case <-releaseExecution:
+						return map[string]any{"ok": true}, nil
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					}
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, err := worker.RunOnce(context.Background())
+				done <- err
+			}()
+			select {
+			case <-controlFailed:
+			case <-time.After(time.Second):
+				t.Fatal("control failure was not observed")
+			}
+			time.Sleep(20 * time.Millisecond)
+			loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+			if loadErr != nil || loaded.Status != BookKnowledgeJobStatusRunning {
+				t.Fatalf("control outage interrupted job early=%#v err=%v", loaded, loadErr)
+			}
+			close(releaseExecution)
+			runErr := <-done
+			if !errors.Is(runErr, ErrBookJobWorkerInfrastructure) {
+				t.Fatalf("RunOnce control error=%v", runErr)
+			}
+			loaded, loadErr = store.LoadBookKnowledgeJob(job.ID)
+			if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+				t.Fatalf("control outage job=%#v err=%v", loaded, loadErr)
+			}
+		})
 	}
 }
 

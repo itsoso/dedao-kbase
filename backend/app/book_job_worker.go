@@ -424,14 +424,21 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	var execution bookJobWorkerExecutionResult
 	var requestedRestart *SourceAgentCommand
 	var controlErr error
-	select {
-	case execution = <-executionDone:
-	case requestedRestart = <-restartCommand:
-		cancel()
-		execution = <-executionDone
-	case controlErr = <-controlFailure:
-		cancel()
-		execution = <-executionDone
+	controlFailureChannel := (<-chan error)(controlFailure)
+	waitingForExecution := true
+	for waitingForExecution {
+		select {
+		case execution = <-executionDone:
+			waitingForExecution = false
+		case requestedRestart = <-restartCommand:
+			cancel()
+			execution = <-executionDone
+			waitingForExecution = false
+		case controlErr = <-controlFailureChannel:
+			// Control-plane outages are isolated from a running book job. Stop
+			// selecting this one-shot failure and let the owned job finish.
+			controlFailureChannel = nil
+		}
 	}
 	close(stopRenew)
 	close(controlStop)
@@ -464,13 +471,6 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 		}
 		return ErrBookJobWorkerRestartRequested
 	}
-	if controlErr != nil {
-		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
-			return bookJobWorkerInfrastructureError("interrupt job after control failure")
-		}
-		return controlErr
-	}
-
 	var renewErr error
 	select {
 	case received := <-renewFailure:
@@ -488,6 +488,9 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	if execution.err == nil {
 		if _, err := w.store.CompleteBookKnowledgeJob(job.ID, w.workerID, execution.result); err != nil {
 			return bookJobWorkerInfrastructureError("complete job")
+		}
+		if controlErr != nil {
+			return controlErr
 		}
 		return nil
 	}
