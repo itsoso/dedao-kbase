@@ -303,6 +303,28 @@ func TestBookKnowledgeJobsMigrationPreservesSafeInterruptedHistory(t *testing.T)
 	}
 }
 
+func TestBookKnowledgeJobsLegacySensitiveTextRecognizesUnixPathsAtBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "path at start", value: "/data/private/book", want: true},
+		{name: "path after whitespace", value: "downloaded from /mnt/private/book", want: true},
+		{name: "path after delimiter", value: "output=(/data/private/book)", want: true},
+		{name: "chinese slash", value: "输入/输出", want: false},
+		{name: "ascii slash", value: "A/B", want: false},
+		{name: "isolated slash", value: "/", want: false},
+		{name: "spaced isolated slash", value: "value / only", want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := legacyBookKnowledgeJobTextContainsSensitiveData(test.value); got != test.want {
+				t.Fatalf("sensitive = %t, want %t for %q", got, test.want, test.value)
+			}
+		})
+	}
+}
+
 func assertBookKnowledgeMigrationMarkerAbsent(t *testing.T, dbPath string) {
 	t.Helper()
 	db, err := sql.Open("sqlite3", dbPath)

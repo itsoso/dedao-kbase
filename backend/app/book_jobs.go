@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/yann0917/dedao-gui/backend/services"
@@ -40,6 +42,11 @@ const (
 const BookKnowledgeJobFailureWorkerInterrupted = "worker_interrupted"
 
 const bookKnowledgeJobInterruptedMessage = "job execution interrupted"
+
+const (
+	legacyBookKnowledgeJobPathBoundaryDelimiters = "\"'`()[]{}=,:;<>"
+	legacyBookKnowledgeJobPathTokenDelimiters    = "/\\\"'`()[]{}=,:;<>"
+)
 
 const (
 	BookKnowledgeJobTypeDedaoEbookDownload  = "dedao_ebook_download"
@@ -891,16 +898,8 @@ func safeLegacyBookKnowledgeJobLogs(status BookKnowledgeJobStatus, logs []string
 func legacyBookKnowledgeJobTextContainsSensitiveData(value string) bool {
 	value = strings.TrimSpace(value)
 	lower := strings.ToLower(value)
-	if strings.HasPrefix(value, "/") || legacyBookKnowledgeJobWindowsAbsolutePath(value) || legacyBookKnowledgeJobUNCPath(value) {
+	if legacyBookKnowledgeJobUnixAbsolutePath(value) || legacyBookKnowledgeJobWindowsAbsolutePath(value) || legacyBookKnowledgeJobUNCPath(value) {
 		return true
-	}
-	for _, marker := range []string{
-		"/users/", "/home/", "/root/", "/volumes/", "/var/folders/", "/private/var/",
-		"/applications/", "/library/", "/etc/", "/opt/", "/srv/", "/tmp/", "/usr/",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
 	}
 	for _, marker := range []string{
 		"token=", "access_token=", "secret=", "api_key=", "apikey=", "cookie=", "authorization:", "bearer ",
@@ -914,6 +913,27 @@ func legacyBookKnowledgeJobTextContainsSensitiveData(value string) bool {
 		return true
 	}
 	return false
+}
+
+func legacyBookKnowledgeJobUnixAbsolutePath(value string) bool {
+	for index := 0; index < len(value); index++ {
+		if value[index] != '/' || !legacyBookKnowledgeJobPathBoundary(value, index) || index+1 == len(value) {
+			continue
+		}
+		next, _ := utf8.DecodeRuneInString(value[index+1:])
+		if !unicode.IsSpace(next) && !strings.ContainsRune(legacyBookKnowledgeJobPathTokenDelimiters, next) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyBookKnowledgeJobPathBoundary(value string, index int) bool {
+	if index == 0 {
+		return true
+	}
+	previous, _ := utf8.DecodeLastRuneInString(value[:index])
+	return unicode.IsSpace(previous) || strings.ContainsRune(legacyBookKnowledgeJobPathBoundaryDelimiters, previous)
 }
 
 func legacyBookKnowledgeJobWindowsAbsolutePath(value string) bool {
