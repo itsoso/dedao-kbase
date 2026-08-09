@@ -1,6 +1,10 @@
 package services
 
-import "github.com/yann0917/dedao-gui/backend/utils"
+import (
+	"context"
+
+	"github.com/yann0917/dedao-gui/backend/utils"
+)
 
 // Catalog ebook catalog
 type Catalog struct {
@@ -183,8 +187,11 @@ type EbookShelfAddResp struct {
 
 // EbookDetail get ebook detail
 func (s *Service) EbookDetail(enid string) (detail *EbookDetail, err error) {
+	return s.EbookDetailContext(context.Background(), enid)
+}
 
-	body, err := s.reqEbookDetail(enid)
+func (s *Service) EbookDetailContext(ctx context.Context, enid string) (detail *EbookDetail, err error) {
+	body, err := s.reqEbookDetailContext(ctx, enid)
 	if err != nil {
 		return
 	}

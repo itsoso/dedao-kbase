@@ -50,6 +50,7 @@ type KBaseHTTPConfig struct {
 	DedaoLibrary            DedaoLibraryService
 	DedaoAuth               DedaoAuthProvider
 	DedaoEbooks             DedaoEbookAcquisitionService
+	DedaoEbookVerifyTimeout time.Duration
 	ReverificationNow       func() time.Time
 	ReverificationCooldown  time.Duration
 	AgentTools              []string
@@ -71,6 +72,26 @@ type EvidenceAuditEnqueuer interface {
 	Enqueue(string) error
 }
 type BookAnalysisGenerator func(context.Context, *BookKnowledgeStore, BookAnalysisGenerateRequest) (*BookAnalysisManifest, error)
+
+type bookKnowledgeJobHTTPView struct {
+	ID           string                 `json:"id"`
+	Type         string                 `json:"type"`
+	Status       BookKnowledgeJobStatus `json:"status"`
+	EbookID      int                    `json:"ebook_id"`
+	EbookEnID    string                 `json:"ebook_enid"`
+	DownloadType int                    `json:"download_type"`
+	Result       map[string]any         `json:"result,omitempty"`
+	Error        string                 `json:"error,omitempty"`
+	Logs         []string               `json:"logs,omitempty"`
+	RetryOf      string                 `json:"retry_of,omitempty"`
+	Stage        string                 `json:"stage,omitempty"`
+	FailureCode  string                 `json:"failure_code,omitempty"`
+	CreatedAt    string                 `json:"created_at"`
+	UpdatedAt    string                 `json:"updated_at"`
+	StartedAt    string                 `json:"started_at,omitempty"`
+	FinishedAt   string                 `json:"finished_at,omitempty"`
+}
+
 type DedaoLibraryService interface {
 	CourseList(category, order string, page, limit int) (*services.CourseList, error)
 	CourseInfo(enid string) (*services.CourseInfo, error)
@@ -102,6 +123,7 @@ type kbaseHTTPHandler struct {
 	dedaoLibrary            DedaoLibraryService
 	dedaoAuth               DedaoAuthProvider
 	dedaoEbooks             DedaoEbookAcquisitionService
+	dedaoEbookVerifyTimeout time.Duration
 	reverificationNow       func() time.Time
 	reverificationCooldown  time.Duration
 	agentTools              []string
@@ -119,6 +141,7 @@ const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
 const defaultSourceAgentCommandHTTPMaxBodyBytes int64 = 64 << 10
 const defaultEvidenceAuditMaxBodyBytes int64 = 64 << 10
 const defaultAgentCompilationMaxBodyBytes int64 = 64 << 10
+const defaultDedaoEbookVerificationTimeout = 15 * time.Second
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	store := cfg.Store
@@ -207,6 +230,10 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if auditLogger == nil {
 		auditLogger = func(EvidenceAuditHTTPLogEvent) {}
 	}
+	dedaoEbookVerifyTimeout := cfg.DedaoEbookVerifyTimeout
+	if dedaoEbookVerifyTimeout <= 0 {
+		dedaoEbookVerifyTimeout = defaultDedaoEbookVerificationTimeout
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		authToken:               authToken,
@@ -229,6 +256,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		dedaoLibrary:            dedaoLibrary,
 		dedaoAuth:               defaultDedaoAuthProvider(cfg.DedaoAuth),
 		dedaoEbooks:             defaultDedaoEbookAcquisitionService(cfg.DedaoEbooks),
+		dedaoEbookVerifyTimeout: dedaoEbookVerifyTimeout,
 		reverificationNow:       reverificationNow,
 		reverificationCooldown:  reverificationCooldown,
 		agentTools:              agentTools,
@@ -505,16 +533,19 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/jobs/") {
-		if jobID, ok := parseBookKnowledgeJobAction(r.URL.EscapedPath(), "retry"); ok {
-			h.handleRetryBookKnowledgeJob(w, r, jobID)
-			return
-		}
-		rawPath := strings.TrimPrefix(r.URL.EscapedPath(), "/api/jobs/")
-		if strings.Contains(rawPath, "/") {
+		jobID, action, ok := parseBookKnowledgeJobRoute(r.URL.EscapedPath())
+		if !ok {
 			writeHTTPError(w, http.StatusNotFound, "not found")
 			return
 		}
-		h.handleGetBookKnowledgeJob(w, r)
+		switch action {
+		case "":
+			h.handleGetBookKnowledgeJob(w, r, jobID)
+		case "retry":
+			h.handleRetryBookKnowledgeJob(w, r, jobID)
+		default:
+			writeHTTPError(w, http.StatusNotFound, "not found")
+		}
 		return
 	}
 	if r.URL.Path == "/api/dedao/session" {
@@ -691,7 +722,11 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusInternalServerError, "failed to list jobs")
 			return
 		}
-		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+		views := make([]bookKnowledgeJobHTTPView, 0, len(jobs))
+		for _, job := range jobs {
+			views = append(views, newBookKnowledgeJobHTTPView(job))
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"jobs": views})
 	case http.MethodPost:
 		var request BookKnowledgeJobRequest
 		if !decodeStrictLimitedHTTPJSON(w, r, 64<<10, &request) {
@@ -702,8 +737,12 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, getService(), normalized.EbookEnID)
+		detail, err := h.dedaoEbookDetailForJobVerification(r.Context(), normalized.EbookEnID)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				writeHTTPError(w, http.StatusGatewayTimeout, "dedao ebook verification timed out")
+				return
+			}
 			writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
 			return
 		}
@@ -729,28 +768,33 @@ func (h *kbaseHTTPHandler) handleBookKnowledgeJobs(w http.ResponseWriter, r *htt
 			writeHTTPError(w, http.StatusInternalServerError, "failed to create job")
 			return
 		}
-		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": job})
+		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"job": newBookKnowledgeJobHTTPView(job)})
 	default:
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
-func parseBookKnowledgeJobAction(path, action string) (string, bool) {
+func parseBookKnowledgeJobRoute(path string) (string, string, bool) {
 	const prefix = "/api/jobs/"
-	action = strings.TrimSpace(action)
-	suffix := "/" + action
-	if action == "" || !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
-		return "", false
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
 	}
-	rawID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
-	if rawID == "" || strings.Contains(rawID, "/") {
-		return "", false
+	parts := strings.Split(strings.TrimPrefix(path, prefix), "/")
+	if len(parts) < 1 || len(parts) > 2 || parts[0] == "" {
+		return "", "", false
 	}
-	jobID, err := url.PathUnescape(rawID)
-	if err != nil || strings.TrimSpace(jobID) == "" {
-		return "", false
+	jobID, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(jobID) == "" || strings.Contains(jobID, "/") {
+		return "", "", false
 	}
-	return jobID, true
+	action := ""
+	if len(parts) == 2 {
+		action = parts[1]
+		if action == "" {
+			return "", "", false
+		}
+	}
+	return jobID, action, true
 }
 
 func (h *kbaseHTTPHandler) handleRetryBookKnowledgeJob(w http.ResponseWriter, r *http.Request, jobID string) {
@@ -771,8 +815,12 @@ func (h *kbaseHTTPHandler) handleRetryBookKnowledgeJob(w http.ResponseWriter, r 
 		writeHTTPError(w, http.StatusConflict, "job is not eligible for retry")
 		return
 	}
-	detail, err := dedaoEbookDetailWithService(h.dedaoEbooks, getService(), original.EbookEnID)
+	detail, err := h.dedaoEbookDetailForJobVerification(r.Context(), original.EbookEnID)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeHTTPError(w, http.StatusGatewayTimeout, "dedao ebook verification timed out")
+			return
+		}
 		writeHTTPError(w, http.StatusBadGateway, "failed to verify dedao ebook ownership")
 		return
 	}
@@ -807,30 +855,60 @@ func (h *kbaseHTTPHandler) handleRetryBookKnowledgeJob(w http.ResponseWriter, r 
 		}
 		return
 	}
-	writeHTTPJSON(w, http.StatusCreated, map[string]any{"job": retry})
+	writeHTTPJSON(w, http.StatusCreated, map[string]any{"job": newBookKnowledgeJobHTTPView(retry)})
 }
 
-func (h *kbaseHTTPHandler) handleGetBookKnowledgeJob(w http.ResponseWriter, r *http.Request) {
+func (h *kbaseHTTPHandler) dedaoEbookDetailForJobVerification(ctx context.Context, enid string) (*services.EbookDetail, error) {
+	verificationCtx, cancel := context.WithTimeout(ctx, h.dedaoEbookVerifyTimeout)
+	defer cancel()
+	detail, err := dedaoEbookDetailWithServiceContext(verificationCtx, h.dedaoEbooks, getService(), enid)
+	if errors.Is(verificationCtx.Err(), context.DeadlineExceeded) {
+		return nil, context.DeadlineExceeded
+	}
+	return detail, err
+}
+
+func (h *kbaseHTTPHandler) handleGetBookKnowledgeJob(w http.ResponseWriter, r *http.Request, jobID string) {
 	if r.Method != http.MethodGet {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	rawID := strings.TrimPrefix(r.URL.Path, "/api/jobs/")
-	if rawID == "" || strings.Contains(rawID, "/") {
-		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
-		return
-	}
-	jobID, err := url.PathUnescape(rawID)
-	if err != nil || strings.TrimSpace(jobID) == "" {
-		writeHTTPError(w, http.StatusBadRequest, "job_id is required")
-		return
-	}
 	job, err := h.store.LoadBookKnowledgeJob(jobID)
 	if err != nil {
-		writeHTTPError(w, http.StatusNotFound, "job not found")
+		if errors.Is(err, ErrBookKnowledgeJobNotFound) {
+			writeHTTPError(w, http.StatusNotFound, "job not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, "failed to load job")
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"job": newBookKnowledgeJobHTTPView(job)})
+}
+
+func newBookKnowledgeJobHTTPView(job BookKnowledgeJob) bookKnowledgeJobHTTPView {
+	failureCode := ""
+	errorMessage := ""
+	switch job.Status {
+	case BookKnowledgeJobStatusInterrupted:
+		failureCode = BookKnowledgeJobFailureWorkerInterrupted
+		errorMessage = bookKnowledgeJobFailureMessages[failureCode]
+	case BookKnowledgeJobStatusFailed:
+		if message, ok := bookKnowledgeJobFailureMessages[job.FailureCode]; ok {
+			failureCode = job.FailureCode
+			errorMessage = message
+		} else {
+			errorMessage = sanitizeBookKnowledgeJobError(job.Error)
+		}
+	}
+	return bookKnowledgeJobHTTPView{
+		ID: job.ID, Type: job.Type, Status: job.Status,
+		EbookID: job.EbookID, EbookEnID: job.EbookEnID, DownloadType: job.DownloadType,
+		Result: safeLegacyBookKnowledgeJobResult(job, job.Result), Error: errorMessage,
+		Logs: safeLegacyBookKnowledgeJobLogs(job.Status, job.Logs), RetryOf: job.RetryOf,
+		Stage: bookKnowledgeJobStage(job), FailureCode: failureCode,
+		CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt,
+		StartedAt: job.StartedAt, FinishedAt: job.FinishedAt,
+	}
 }
 
 func (h *kbaseHTTPHandler) handleDedaoEbookSearch(w http.ResponseWriter, r *http.Request) {

@@ -2,10 +2,15 @@ package services
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 )
 
 var service *Service
@@ -133,6 +138,29 @@ func TestEbookDetail(t *testing.T) {
 		fmt.Printf("err:=%#v \n", err)
 	}
 	fmt.Printf("result:=%v \n", result)
+}
+
+func TestEbookDetailContextCancelsRequest(t *testing.T) {
+	requestCanceled := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		close(requestCanceled)
+	}))
+	defer server.Close()
+
+	contextService := NewService(&CookieOptions{})
+	contextService.client.SetBaseURL(server.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := contextService.EbookDetailContext(ctx, "ebook-enid")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("EbookDetailContext error=%v, want deadline exceeded", err)
+	}
+	select {
+	case <-requestCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("server request context was not canceled")
+	}
 }
 
 func TestEbookReadToken(t *testing.T) {

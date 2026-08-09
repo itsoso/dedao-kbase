@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -46,6 +47,12 @@ func TestKBaseHTTPHandlerBookJobQueuedOnly(t *testing.T) {
 	if provider.gotDetailEnid != "owned-enid" {
 		t.Fatalf("ownership detail enid = %q", provider.gotDetailEnid)
 	}
+	if provider.gotDetailCtx == nil {
+		t.Fatal("ownership detail did not receive request context")
+	}
+	if _, ok := provider.gotDetailCtx.Deadline(); !ok {
+		t.Fatal("ownership detail context has no verification deadline")
+	}
 	var payload struct {
 		Job BookKnowledgeJob `json:"job"`
 	}
@@ -54,6 +61,9 @@ func TestKBaseHTTPHandlerBookJobQueuedOnly(t *testing.T) {
 	}
 	if payload.Job.Status != BookKnowledgeJobStatusQueued || payload.Job.Stage != "queued" {
 		t.Fatalf("created job = %#v, want queued", payload.Job)
+	}
+	if strings.Contains(created.Body.String(), "lease_owner") || strings.Contains(created.Body.String(), "lease_expires_at") {
+		t.Fatalf("create response exposed lease fields: %s", created.Body.String())
 	}
 	time.Sleep(50 * time.Millisecond)
 	if got := runnerCalls.Load(); got != 0 {
@@ -72,6 +82,82 @@ func TestKBaseHTTPHandlerBookJobQueuedOnly(t *testing.T) {
 		if strings.Contains(get.Body.String(), forbidden) || strings.Contains(list.Body.String(), forbidden) {
 			t.Fatalf("job response leaked %q: get=%s list=%s", forbidden, get.Body.String(), list.Body.String())
 		}
+	}
+}
+
+func TestKBaseHTTPHandlerBookJobResponsesUseSafeViews(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	runningSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 41, EbookEnID: "running-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := store.ClaimNextBookKnowledgeJob("private-worker-owner", time.Hour)
+	if err != nil || running == nil || running.ID != runningSource.ID {
+		t.Fatalf("running=%#v err=%v", running, err)
+	}
+
+	safeSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 42, EbookEnID: "safe-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("safe-worker", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	safeSucceeded, err := store.CompleteBookKnowledgeJob(safeSource.ID, "safe-worker", map[string]any{
+		"ebook_id": safeSource.EbookID, "ebook_enid": safeSource.EbookEnID,
+		"download_type": safeSource.DownloadType, "knowledge_book_id": "book-42", "title": "安全标题",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unsafeSource, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 43, EbookEnID: "unsafe-enid", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("unsafe-worker", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	unsafeSucceeded, err := store.CompleteBookKnowledgeJob(unsafeSource.ID, "unsafe-worker", map[string]any{
+		"ebook_id": unsafeSource.EbookID, "ebook_enid": unsafeSource.EbookEnID,
+		"download_type": unsafeSource.DownloadType, "knowledge_book_id": "token=private-value", "title": "/srv/private/title",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	for _, response := range []*httptest.ResponseRecorder{
+		requestKBase(handler, http.MethodGet, "/api/jobs/"+running.ID, "secret-token"),
+		requestKBase(handler, http.MethodGet, "/api/jobs/"+safeSucceeded.ID, "secret-token"),
+		requestKBase(handler, http.MethodGet, "/api/jobs/"+unsafeSucceeded.ID, "secret-token"),
+		requestKBase(handler, http.MethodGet, "/api/jobs?limit=10", "secret-token"),
+	} {
+		if response.Code != http.StatusOK {
+			t.Fatalf("job view status=%d body=%s", response.Code, response.Body.String())
+		}
+		for _, forbidden := range []string{"lease_owner", "lease_expires_at", "private-worker-owner", "token=private-value", "/srv/private/title"} {
+			if strings.Contains(response.Body.String(), forbidden) {
+				t.Fatalf("job view leaked %q: %s", forbidden, response.Body.String())
+			}
+		}
+	}
+
+	safeGet := requestKBase(handler, http.MethodGet, "/api/jobs/"+safeSucceeded.ID, "secret-token")
+	for _, expected := range []string{`"ebook_id":42`, `"ebook_enid":"safe-enid"`, `"knowledge_book_id":"book-42"`, `"title":"安全标题"`} {
+		if !strings.Contains(safeGet.Body.String(), expected) {
+			t.Fatalf("safe job view missing %s: %s", expected, safeGet.Body.String())
+		}
+	}
+	unsafeGet := requestKBase(handler, http.MethodGet, "/api/jobs/"+unsafeSucceeded.ID, "secret-token")
+	if !strings.Contains(unsafeGet.Body.String(), `"ebook_id":43`) {
+		t.Fatalf("unsafe result filtering removed safe ID: %s", unsafeGet.Body.String())
 	}
 }
 
@@ -96,6 +182,62 @@ func TestKBaseHTTPHandlerBookJobQueuedOnlyRejectsTrailingJSON(t *testing.T) {
 	}
 	if jobs, err := store.ListBookKnowledgeJobs(10); err != nil || len(jobs) != 0 {
 		t.Fatalf("trailing JSON created jobs=%#v err=%v", jobs, err)
+	}
+}
+
+func TestKBaseHTTPHandlerBookJobVerificationTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		preparePath func(*testing.T, *BookKnowledgeStore) string
+	}{
+		{
+			name: "create",
+			preparePath: func(*testing.T, *BookKnowledgeStore) string {
+				return "/api/jobs"
+			},
+		},
+		{
+			name: "retry",
+			preparePath: func(t *testing.T, store *BookKnowledgeStore) string {
+				original := createBookKnowledgeJobInStatus(t, store, BookKnowledgeJobStatusFailed)
+				return "/api/jobs/" + original.ID + "/retry"
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			provider := &blockingDedaoEbookAcquisition{}
+			handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+				Store: store, AuthToken: "secret-token", DedaoEbooks: provider,
+				DedaoEbookVerifyTimeout: 20 * time.Millisecond,
+			})
+			path := test.preparePath(t, store)
+			beforeJobs, err := store.ListBookKnowledgeJobs(10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			var response *httptest.ResponseRecorder
+			if test.name == "create" {
+				response = requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{"type":"dedao_ebook_download","ebook_id":42,"ebook_enid":"ebook-enid","download_type":1}`)
+			} else {
+				response = requestKBase(handler, http.MethodPost, path, "secret-token")
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("verification timeout took %s", elapsed)
+			}
+			if response.Code != http.StatusGatewayTimeout || !strings.Contains(response.Body.String(), "dedao ebook verification timed out") {
+				t.Fatalf("verification timeout status=%d body=%s", response.Code, response.Body.String())
+			}
+			if got := provider.contextCalls.Load(); got != 1 {
+				t.Fatalf("context-aware detail calls=%d, want 1", got)
+			}
+			afterJobs, err := store.ListBookKnowledgeJobs(10)
+			if err != nil || len(afterJobs) != len(beforeJobs) {
+				t.Fatalf("verification timeout changed jobs: before=%#v after=%#v err=%v", beforeJobs, afterJobs, err)
+			}
+			assertDedaoEbookResponseOmitsSecrets(t, response.Body.String())
+		})
 	}
 }
 
@@ -133,8 +275,11 @@ func TestKBaseHTTPHandlerBookJobRetryAuthorizationAndEligibleStates(t *testing.T
 				payload.Job.Status != BookKnowledgeJobStatusQueued || payload.Job.LeaseOwner != "" || payload.Job.LeaseExpiresAt != "" {
 				t.Fatalf("retry job=%#v original=%#v", payload.Job, original)
 			}
-			if provider.gotDetailEnid != original.EbookEnID || provider.gotDetailSvc == nil {
-				t.Fatalf("authoritative detail call enid=%q service=%p", provider.gotDetailEnid, provider.gotDetailSvc)
+			if strings.Contains(response.Body.String(), "lease_owner") || strings.Contains(response.Body.String(), "lease_expires_at") {
+				t.Fatalf("retry response exposed lease fields: %s", response.Body.String())
+			}
+			if provider.gotDetailEnid != original.EbookEnID || provider.gotDetailSvc == nil || provider.gotDetailCtx == nil {
+				t.Fatalf("authoritative detail call enid=%q service=%p context=%v", provider.gotDetailEnid, provider.gotDetailSvc, provider.gotDetailCtx)
 			}
 			unchanged, err := store.LoadBookKnowledgeJob(original.ID)
 			if err != nil || !reflect.DeepEqual(unchanged, original) {
@@ -242,15 +387,15 @@ func TestKBaseHTTPHandlerBookJobRetryRejectsActiveDuplicateWithoutLeak(t *testin
 }
 
 func TestKBaseHTTPHandlerBookJobRetryRoutesAreExact(t *testing.T) {
-	if got, ok := parseBookKnowledgeJobAction("/api/jobs/job%2Fpart/retry", "retry"); !ok || got != "job/part" {
-		t.Fatalf("escaped parser result=(%q,%v)", got, ok)
-	}
 	for _, path := range []string{
-		"/api/jobs/job/part/retry", "/api/jobs/job/retry/extra", "/api/jobs//retry", "/api/jobs/job/unknown",
+		"/api/jobs/job%2Fpart", "/api/jobs/job%2Fpart/retry", "/api/jobs/job%zz", "/api/jobs//retry", "/api/jobs/job/",
 	} {
-		if got, ok := parseBookKnowledgeJobAction(path, "retry"); ok {
-			t.Fatalf("parseBookKnowledgeJobAction(%q)=(%q,true), want false", path, got)
+		if jobID, action, ok := parseBookKnowledgeJobRoute(path); ok {
+			t.Fatalf("parseBookKnowledgeJobRoute(%q)=(%q,%q,true), want false", path, jobID, action)
 		}
+	}
+	if jobID, action, ok := parseBookKnowledgeJobRoute("/api/jobs/job%252Fpart/retry"); !ok || jobID != "job%2Fpart" || action != "retry" {
+		t.Fatalf("double-encoded parser=(%q,%q,%v)", jobID, action, ok)
 	}
 
 	store := NewBookKnowledgeStore(t.TempDir())
@@ -261,6 +406,11 @@ func TestKBaseHTTPHandlerBookJobRetryRoutesAreExact(t *testing.T) {
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
 		Store: store, AuthToken: "secret-token", DedaoEbooks: provider,
 	})
+	escapedID := "%6A" + strings.TrimPrefix(original.ID, "j")
+	getEscaped := requestKBase(handler, http.MethodGet, "/api/jobs/"+escapedID, "secret-token")
+	if getEscaped.Code != http.StatusOK || !strings.Contains(getEscaped.Body.String(), original.ID) {
+		t.Fatalf("GET single-encoded id status=%d body=%s", getEscaped.Code, getEscaped.Body.String())
+	}
 	wrongMethod := requestKBase(handler, http.MethodGet, "/api/jobs/"+original.ID+"/retry", "secret-token")
 	if wrongMethod.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("GET retry status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
@@ -279,6 +429,33 @@ func TestKBaseHTTPHandlerBookJobRetryRoutesAreExact(t *testing.T) {
 	}
 	if provider.gotDetailEnid != "" {
 		t.Fatalf("invalid routes called provider with %q", provider.gotDetailEnid)
+	}
+	retryEscaped := requestKBase(handler, http.MethodPost, "/api/jobs/"+escapedID+"/retry", "secret-token")
+	if retryEscaped.Code != http.StatusCreated {
+		t.Fatalf("POST retry single-encoded id status=%d body=%s", retryEscaped.Code, retryEscaped.Body.String())
+	}
+	if provider.detailCalls != 1 {
+		t.Fatalf("valid retry detail calls=%d, want 1", provider.detailCalls)
+	}
+
+	doubleEncodedID := "%256A" + strings.TrimPrefix(original.ID, "j")
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/jobs/" + doubleEncodedID},
+		{method: http.MethodPost, path: "/api/jobs/" + doubleEncodedID + "/retry"},
+		{method: http.MethodGet, path: "/api/jobs/" + original.ID + "%2Fextra"},
+		{method: http.MethodPost, path: "/api/jobs/" + original.ID + "%2Fextra/retry"},
+		{method: http.MethodGet, path: "/api/jobs/" + original.ID + "/"},
+	} {
+		response := requestKBase(handler, test.method, test.path, "secret-token")
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("invalid encoded route %s %s status=%d body=%s", test.method, test.path, response.Code, response.Body.String())
+		}
+	}
+	if provider.detailCalls != 1 {
+		t.Fatalf("invalid encoded routes called provider: calls=%d", provider.detailCalls)
 	}
 }
 
@@ -317,6 +494,28 @@ func createBookKnowledgeJobInStatus(
 		t.Fatal(err)
 	}
 	return job
+}
+
+type blockingDedaoEbookAcquisition struct {
+	contextCalls atomic.Int32
+}
+
+func (*blockingDedaoEbookAcquisition) SearchEbooks(string, int, int) (DedaoEbookPage, error) {
+	return DedaoEbookPage{}, nil
+}
+
+func (*blockingDedaoEbookAcquisition) AddEbookToBookshelf(string) (DedaoEbook, error) {
+	return DedaoEbook{}, nil
+}
+
+func (provider *blockingDedaoEbookAcquisition) EbookDetailContext(ctx context.Context, _ string) (*services.EbookDetail, error) {
+	provider.contextCalls.Add(1)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (provider *blockingDedaoEbookAcquisition) EbookDetailWithServiceContext(ctx context.Context, _ *services.Service, enid string) (*services.EbookDetail, error) {
+	return provider.EbookDetailContext(ctx, enid)
 }
 
 func TestKBaseHTTPHandlerRejectsUnownedDedaoEbookJob(t *testing.T) {
@@ -388,7 +587,7 @@ func TestKBaseHTTPHandlerSanitizesDedaoJobErrors(t *testing.T) {
 		t.Fatalf("create error status=%d body=%s", createResp.Code, createResp.Body.String())
 	}
 	missingResp := requestKBase(blockedHandler, http.MethodGet, "/api/jobs/missing", "secret-token")
-	if missingResp.Code != http.StatusNotFound || strings.Contains(missingResp.Body.String(), blockedRoot) {
+	if missingResp.Code != http.StatusInternalServerError || !strings.Contains(missingResp.Body.String(), "failed to load job") || strings.Contains(missingResp.Body.String(), blockedRoot) {
 		t.Fatalf("get error status=%d body=%s", missingResp.Code, missingResp.Body.String())
 	}
 	retryResp := requestKBase(blockedHandler, http.MethodPost, "/api/jobs/missing/retry", "secret-token")

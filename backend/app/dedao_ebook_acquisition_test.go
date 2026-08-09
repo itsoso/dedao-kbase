@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -168,6 +169,8 @@ type fakeDedaoEbookAcquisition struct {
 	gotAddedEnid  string
 	gotDetailEnid string
 	gotDetailSvc  *services.Service
+	gotDetailCtx  context.Context
+	detailCalls   int
 	searchError   error
 	addError      error
 	detailError   error
@@ -183,12 +186,14 @@ func (f *fakeDedaoEbookAcquisition) AddEbookToBookshelf(enid string) (DedaoEbook
 	return f.added, f.addError
 }
 
-func (f *fakeDedaoEbookAcquisition) EbookDetail(enid string) (*services.EbookDetail, error) {
+func (f *fakeDedaoEbookAcquisition) EbookDetailContext(ctx context.Context, enid string) (*services.EbookDetail, error) {
+	f.gotDetailCtx = ctx
 	f.gotDetailEnid = enid
+	f.detailCalls++
 	return f.detail, f.detailError
 }
 
-func (f *fakeDedaoEbookAcquisition) EbookDetailWithService(service *services.Service, enid string) (*services.EbookDetail, error) {
+func (f *fakeDedaoEbookAcquisition) EbookDetailWithServiceContext(ctx context.Context, service *services.Service, enid string) (*services.EbookDetail, error) {
 	f.gotDetailSvc = service
-	return f.EbookDetail(enid)
+	return f.EbookDetailContext(ctx, enid)
 }

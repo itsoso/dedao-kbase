@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"strings"
 
@@ -33,11 +34,11 @@ type DedaoEbookPage struct {
 type DedaoEbookAcquisitionService interface {
 	SearchEbooks(query string, page, pageSize int) (DedaoEbookPage, error)
 	AddEbookToBookshelf(enid string) (DedaoEbook, error)
-	EbookDetail(enid string) (*services.EbookDetail, error)
+	EbookDetailContext(ctx context.Context, enid string) (*services.EbookDetail, error)
 }
 
 type dedaoEbookServiceScopedDetail interface {
-	EbookDetailWithService(service *services.Service, enid string) (*services.EbookDetail, error)
+	EbookDetailWithServiceContext(ctx context.Context, service *services.Service, enid string) (*services.EbookDetail, error)
 }
 
 type liveDedaoEbookAcquisitionService struct{}
@@ -81,19 +82,19 @@ func (liveDedaoEbookAcquisitionService) AddEbookToBookshelf(enid string) (DedaoE
 	return ebook, nil
 }
 
-func (liveDedaoEbookAcquisitionService) EbookDetail(enid string) (*services.EbookDetail, error) {
-	return EbookDetail(enid)
+func (liveDedaoEbookAcquisitionService) EbookDetailContext(ctx context.Context, enid string) (*services.EbookDetail, error) {
+	return getService().EbookDetailContext(ctx, enid)
 }
 
-func (liveDedaoEbookAcquisitionService) EbookDetailWithService(service *services.Service, enid string) (*services.EbookDetail, error) {
-	return service.EbookDetail(enid)
+func (liveDedaoEbookAcquisitionService) EbookDetailWithServiceContext(ctx context.Context, service *services.Service, enid string) (*services.EbookDetail, error) {
+	return service.EbookDetailContext(ctx, enid)
 }
 
-func dedaoEbookDetailWithService(provider DedaoEbookAcquisitionService, service *services.Service, enid string) (*services.EbookDetail, error) {
+func dedaoEbookDetailWithServiceContext(ctx context.Context, provider DedaoEbookAcquisitionService, service *services.Service, enid string) (*services.EbookDetail, error) {
 	if scoped, ok := provider.(dedaoEbookServiceScopedDetail); ok {
-		return scoped.EbookDetailWithService(service, enid)
+		return scoped.EbookDetailWithServiceContext(ctx, service, enid)
 	}
-	return provider.EbookDetail(enid)
+	return provider.EbookDetailContext(ctx, enid)
 }
 
 func dedaoEbookPageFromSiteSearch(result *services.EbookSearchResult, page, pageSize int) DedaoEbookPage {

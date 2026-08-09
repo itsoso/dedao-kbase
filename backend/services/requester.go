@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -221,9 +222,10 @@ func (s *Service) reqOdobShelfAdd(enIds []string) (io.ReadCloser, error) {
 	return handleHTTPResponse(resp, err)
 }
 
-// reqEbookDetail 请求电子书详情
-func (s *Service) reqEbookDetail(enid string) (io.ReadCloser, error) {
+// reqEbookDetailContext 请求电子书详情
+func (s *Service) reqEbookDetailContext(ctx context.Context, enid string) (io.ReadCloser, error) {
 	resp, err := s.client.R().
+		SetContext(ctx).
 		SetQueryParam("id", enid).
 		Get("/pc/ebook2/v1/pc/detail")
 

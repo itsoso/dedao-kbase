@@ -34,7 +34,7 @@
     {
       "path": "/api/",
       "file": "backend/app/kbase_http.go",
-      "line": 276,
+      "line": 304,
       "authenticated": true
     },
     {
@@ -46,7 +46,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 5117,
+      "line": 5195,
       "authenticated": true
     },
     {
@@ -70,19 +70,19 @@
     {
       "path": "/api/agent-audits",
       "file": "backend/app/kbase_http.go",
-      "line": 475,
+      "line": 503,
       "authenticated": true
     },
     {
       "path": "/api/agent-audits/",
       "file": "backend/app/kbase_http.go",
-      "line": 475,
+      "line": 503,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages",
       "file": "backend/app/kbase_http.go",
-      "line": 479,
+      "line": 507,
       "authenticated": true
     },
     {
@@ -94,49 +94,49 @@
     {
       "path": "/api/agent-packages/",
       "file": "backend/app/kbase_http.go",
-      "line": 479,
+      "line": 507,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/compile",
       "file": "backend/app/kbase_http.go",
-      "line": 2427,
+      "line": 2505,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/evaluate",
       "file": "backend/app/kbase_http.go",
-      "line": 309,
+      "line": 337,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/evaluation-suites/trust",
       "file": "backend/app/kbase_http.go",
-      "line": 2430,
+      "line": 2508,
       "authenticated": true
     },
     {
       "path": "/api/agent-packages/publish",
       "file": "backend/app/kbase_http.go",
-      "line": 308,
+      "line": 336,
       "authenticated": true
     },
     {
       "path": "/api/agent-traces/",
       "file": "backend/app/kbase_http.go",
-      "line": 471,
+      "line": 499,
       "authenticated": true
     },
     {
       "path": "/api/article/all_articles",
       "file": "backend/app/kbase_http.go",
-      "line": 617,
+      "line": 648,
       "authenticated": true
     },
     {
       "path": "/api/article/all_articles/export_xlsx",
       "file": "backend/app/kbase_http.go",
-      "line": 3861,
+      "line": 3939,
       "authenticated": true
     },
     {
@@ -148,67 +148,67 @@
     {
       "path": "/api/article/export_text",
       "file": "backend/app/kbase_http.go",
-      "line": 633,
+      "line": 664,
       "authenticated": true
     },
     {
       "path": "/api/article/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 627,
+      "line": 658,
       "authenticated": true
     },
     {
       "path": "/api/article/search_title",
       "file": "backend/app/kbase_http.go",
-      "line": 619,
+      "line": 650,
       "authenticated": true
     },
     {
       "path": "/api/batch_task/create_task",
       "file": "backend/app/kbase_http.go",
-      "line": 3794,
+      "line": 3872,
       "authenticated": true
     },
     {
       "path": "/api/batch_task/delete_task",
       "file": "backend/app/kbase_http.go",
-      "line": 3796,
+      "line": 3874,
       "authenticated": true
     },
     {
       "path": "/api/book-chat",
       "file": "backend/app/kbase_http.go",
-      "line": 487,
+      "line": 515,
       "authenticated": true
     },
     {
       "path": "/api/books",
       "file": "backend/app/kbase_http.go",
-      "line": 582,
+      "line": 613,
       "authenticated": true
     },
     {
       "path": "/api/books/",
       "file": "backend/app/kbase_http.go",
-      "line": 586,
+      "line": 617,
       "authenticated": true
     },
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 5231,
+      "line": 5309,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 5233,
+      "line": 5311,
       "authenticated": true
     },
     {
       "path": "/api/citations/",
       "file": "backend/app/kbase_http.go",
-      "line": 584,
+      "line": 615,
       "authenticated": true
     },
     {
@@ -220,133 +220,133 @@
     {
       "path": "/api/consumers/health/evidence/",
       "file": "backend/app/kbase_http.go",
-      "line": 1375,
+      "line": 1453,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/readiness",
       "file": "backend/app/kbase_http.go",
-      "line": 407,
+      "line": 435,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/readiness/analyze",
       "file": "backend/app/kbase_http.go",
-      "line": 411,
+      "line": 439,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/releases",
       "file": "backend/app/kbase_http.go",
-      "line": 403,
+      "line": 431,
       "authenticated": true
     },
     {
       "path": "/api/consumers/health/search",
       "file": "backend/app/kbase_http.go",
-      "line": 415,
+      "line": 443,
       "authenticated": true
     },
     {
       "path": "/api/context-chat",
       "file": "backend/app/kbase_http.go",
-      "line": 495,
+      "line": 523,
       "authenticated": true
     },
     {
       "path": "/api/controlled-agent/",
       "file": "backend/app/kbase_http.go",
-      "line": 339,
+      "line": 367,
       "authenticated": true
     },
     {
       "path": "/api/controlled-agent/draft",
       "file": "backend/app/kbase_http.go",
-      "line": 1678,
+      "line": 1756,
       "authenticated": true
     },
     {
       "path": "/api/controlled-agent/evaluate",
       "file": "backend/app/kbase_http.go",
-      "line": 1680,
+      "line": 1758,
       "authenticated": true
     },
     {
       "path": "/api/controlled-agent/publish",
       "file": "backend/app/kbase_http.go",
-      "line": 1691,
+      "line": 1769,
       "authenticated": true
     },
     {
       "path": "/api/dedao/article",
       "file": "backend/app/kbase_http.go",
-      "line": 568,
+      "line": 599,
       "authenticated": true
     },
     {
       "path": "/api/dedao/audio",
       "file": "backend/app/kbase_http.go",
-      "line": 572,
+      "line": 603,
       "authenticated": true
     },
     {
       "path": "/api/dedao/auth/check",
       "file": "backend/app/kbase_http.go",
-      "line": 536,
+      "line": 567,
       "authenticated": true
     },
     {
       "path": "/api/dedao/auth/qrcode",
       "file": "backend/app/kbase_http.go",
-      "line": 528,
+      "line": 559,
       "authenticated": true
     },
     {
       "path": "/api/dedao/course",
       "file": "backend/app/kbase_http.go",
-      "line": 560,
+      "line": 591,
       "authenticated": true
     },
     {
       "path": "/api/dedao/course/articles",
       "file": "backend/app/kbase_http.go",
-      "line": 564,
+      "line": 595,
       "authenticated": true
     },
     {
       "path": "/api/dedao/ebooks/",
       "file": "backend/app/kbase_http.go",
-      "line": 548,
+      "line": 579,
       "authenticated": true
     },
     {
       "path": "/api/dedao/home",
       "file": "backend/app/kbase_http.go",
-      "line": 556,
+      "line": 587,
       "authenticated": true
     },
     {
       "path": "/api/dedao/library",
       "file": "backend/app/kbase_http.go",
-      "line": 552,
+      "line": 583,
       "authenticated": true
     },
     {
       "path": "/api/dedao/search/ebooks",
       "file": "backend/app/kbase_http.go",
-      "line": 544,
+      "line": 575,
       "authenticated": true
     },
     {
       "path": "/api/dedao/session",
       "file": "backend/app/kbase_http.go",
-      "line": 520,
+      "line": 551,
       "authenticated": true
     },
     {
       "path": "/api/gzh/export_csv",
       "file": "backend/app/kbase_http.go",
-      "line": 635,
+      "line": 666,
       "authenticated": true
     },
     {
@@ -358,103 +358,103 @@
     {
       "path": "/api/gzh/search",
       "file": "backend/app/kbase_http.go",
-      "line": 613,
+      "line": 644,
       "authenticated": true
     },
     {
       "path": "/api/hades/v1/index/detail",
       "file": "backend/services/requester.go",
-      "line": 80,
+      "line": 81,
       "authenticated": true
     },
     {
       "path": "/api/hades/v1/product/list",
       "file": "backend/services/requester.go",
-      "line": 92,
+      "line": 93,
       "authenticated": true
     },
     {
       "path": "/api/jobs",
       "file": "backend/app/kbase_http.go",
-      "line": 503,
+      "line": 531,
       "authenticated": true
     },
     {
       "path": "/api/jobs/",
       "file": "backend/app/kbase_http.go",
-      "line": 507,
+      "line": 535,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/assembly",
       "file": "backend/app/kbase_http.go",
-      "line": 455,
+      "line": 483,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/feed",
       "file": "backend/app/kbase_http.go",
-      "line": 423,
+      "line": 451,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/gaps",
       "file": "backend/app/kbase_http.go",
-      "line": 435,
+      "line": 463,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/impact",
       "file": "backend/app/kbase_http.go",
-      "line": 431,
+      "line": 459,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/lineage/",
       "file": "backend/app/kbase_http.go",
-      "line": 427,
+      "line": 455,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/operations",
       "file": "backend/app/kbase_http.go",
-      "line": 443,
+      "line": 471,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/operations/replay",
       "file": "backend/app/kbase_http.go",
-      "line": 447,
+      "line": 475,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/pipeline",
       "file": "backend/app/kbase_http.go",
-      "line": 459,
+      "line": 487,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/pipeline/run",
       "file": "backend/app/kbase_http.go",
-      "line": 463,
+      "line": 491,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/readiness",
       "file": "backend/app/kbase_http.go",
-      "line": 451,
+      "line": 479,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/releases",
       "file": "backend/app/kbase_http.go",
-      "line": 483,
+      "line": 511,
       "authenticated": true
     },
     {
       "path": "/api/knowledge/releases/",
       "file": "backend/app/kbase_http.go",
-      "line": 483,
+      "line": 511,
       "authenticated": true
     },
     {
@@ -466,13 +466,13 @@
     {
       "path": "/api/knowledge/review",
       "file": "backend/app/kbase_http.go",
-      "line": 439,
+      "line": 467,
       "authenticated": true
     },
     {
       "path": "/api/like_article/get_all",
       "file": "backend/app/kbase_http.go",
-      "line": 629,
+      "line": 660,
       "authenticated": true
     },
     {
@@ -514,55 +514,55 @@
     {
       "path": "/api/pc/bauhinia/pc/class/purchase/article_list",
       "file": "backend/services/requester.go",
-      "line": 123,
+      "line": 124,
       "authenticated": true
     },
     {
       "path": "/api/pc/ddlive/v2/pc/home/live/list",
       "file": "backend/services/requester.go",
-      "line": 396,
+      "line": 398,
       "authenticated": true
     },
     {
       "path": "/api/pc/ddlive/v2/pc/home/live/tablist",
       "file": "backend/services/requester.go",
-      "line": 386,
+      "line": 388,
       "authenticated": true
     },
     {
       "path": "/api/pc/ddlive/v2/pc/live/check",
       "file": "backend/services/requester.go",
-      "line": 405,
+      "line": 407,
       "authenticated": true
     },
     {
       "path": "/api/pc/ebook2/v1/bookshelf/add",
       "file": "backend/services/requester.go",
-      "line": 310,
+      "line": 312,
       "authenticated": true
     },
     {
       "path": "/api/pc/ebook2/v1/pc/read/token",
       "file": "backend/services/requester.go",
-      "line": 239,
+      "line": 241,
       "authenticated": true
     },
     {
       "path": "/api/pc/ebook2/v1/vip/info",
       "file": "backend/services/requester.go",
-      "line": 285,
+      "line": 287,
       "authenticated": true
     },
     {
       "path": "/api/pc/hades/v1/product/remove",
       "file": "backend/services/requester.go",
-      "line": 322,
+      "line": 324,
       "authenticated": true
     },
     {
       "path": "/api/pc/user/info",
       "file": "backend/services/requester.go",
-      "line": 73,
+      "line": 74,
       "authenticated": true
     },
     {
@@ -574,7 +574,7 @@
     {
       "path": "/api/report/reading_data",
       "file": "backend/app/kbase_http.go",
-      "line": 623,
+      "line": 654,
       "authenticated": true
     },
     {
@@ -586,43 +586,43 @@
     {
       "path": "/api/report/statistic_data",
       "file": "backend/app/kbase_http.go",
-      "line": 625,
+      "line": 656,
       "authenticated": true
     },
     {
       "path": "/api/req_data/get_gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 631,
+      "line": 662,
       "authenticated": true
     },
     {
       "path": "/api/search",
       "file": "backend/app/kbase_http.go",
-      "line": 588,
+      "line": 619,
       "authenticated": true
     },
     {
       "path": "/api/search/pc/hot",
       "file": "backend/services/requester.go",
-      "line": 469,
+      "line": 471,
       "authenticated": true
     },
     {
       "path": "/api/search/search",
       "file": "backend/app/kbase_http.go",
-      "line": 621,
+      "line": 652,
       "authenticated": true
     },
     {
       "path": "/api/search/v2/pc/searchebookchapter",
       "file": "backend/services/requester.go",
-      "line": 484,
+      "line": 486,
       "authenticated": true
     },
     {
       "path": "/api/search_gzh/search",
       "file": "backend/app/kbase_http.go",
-      "line": 615,
+      "line": 646,
       "authenticated": true
     },
     {
@@ -634,19 +634,19 @@
     {
       "path": "/api/source-agent-artifacts",
       "file": "backend/app/kbase_http.go",
-      "line": 3949,
+      "line": 4027,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/",
       "file": "backend/app/kbase_http.go",
-      "line": 297,
+      "line": 325,
       "authenticated": true
     },
     {
       "path": "/api/source-agent/artifacts/",
       "file": "backend/app/kbase_http.go",
-      "line": 3959,
+      "line": 4037,
       "authenticated": true
     },
     {
@@ -658,7 +658,7 @@
     {
       "path": "/api/source-agent/commands/",
       "file": "backend/app/kbase_http.go",
-      "line": 4014,
+      "line": 4092,
       "authenticated": true
     },
     {
@@ -670,7 +670,7 @@
     {
       "path": "/api/source-agent/commands/claim",
       "file": "backend/app/kbase_http.go",
-      "line": 3968,
+      "line": 4046,
       "authenticated": true
     },
     {
@@ -682,7 +682,7 @@
     {
       "path": "/api/source-agent/commands/recover",
       "file": "backend/app/kbase_http.go",
-      "line": 3970,
+      "line": 4048,
       "authenticated": true
     },
     {
@@ -694,7 +694,7 @@
     {
       "path": "/api/source-agent/heartbeat",
       "file": "backend/app/kbase_http.go",
-      "line": 3972,
+      "line": 4050,
       "authenticated": true
     },
     {
@@ -706,7 +706,7 @@
     {
       "path": "/api/source-agent/lease",
       "file": "backend/app/kbase_http.go",
-      "line": 3983,
+      "line": 4061,
       "authenticated": true
     },
     {
@@ -718,7 +718,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 4423,
+      "line": 4501,
       "authenticated": true
     },
     {
@@ -730,19 +730,19 @@
     {
       "path": "/api/source-agents",
       "file": "backend/app/kbase_http.go",
-      "line": 3950,
+      "line": 4028,
       "authenticated": true
     },
     {
       "path": "/api/source-agents/",
       "file": "backend/app/kbase_http.go",
-      "line": 3951,
+      "line": 4029,
       "authenticated": true
     },
     {
       "path": "/api/source-assets/",
       "file": "backend/app/kbase_http.go",
-      "line": 355,
+      "line": 383,
       "authenticated": true
     },
     {
@@ -754,37 +754,37 @@
     {
       "path": "/api/source-subscriptions",
       "file": "backend/app/kbase_http.go",
-      "line": 3952,
+      "line": 4030,
       "authenticated": true
     },
     {
       "path": "/api/source-subscriptions/",
       "file": "backend/app/kbase_http.go",
-      "line": 3953,
+      "line": 4031,
       "authenticated": true
     },
     {
       "path": "/api/source-sync/runs",
       "file": "backend/app/kbase_http.go",
-      "line": 3954,
+      "line": 4032,
       "authenticated": true
     },
     {
       "path": "/api/source-sync/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 3955,
+      "line": 4033,
       "authenticated": true
     },
     {
       "path": "/api/system-kb/export",
       "file": "backend/app/kbase_http.go",
-      "line": 590,
+      "line": 621,
       "authenticated": true
     },
     {
       "path": "/api/system-kb/manifest",
       "file": "backend/app/kbase_http.go",
-      "line": 592,
+      "line": 623,
       "authenticated": true
     },
     {
@@ -796,7 +796,7 @@
     {
       "path": "/api/task/control",
       "file": "backend/app/kbase_http.go",
-      "line": 3940,
+      "line": 4018,
       "authenticated": true
     },
     {
@@ -832,199 +832,199 @@
     {
       "path": "/api/wcplus/",
       "file": "backend/app/kbase_http.go",
-      "line": 367,
+      "line": 395,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/all",
       "file": "backend/app/kbase_http.go",
-      "line": 616,
+      "line": 647,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/content",
       "file": "backend/app/kbase_http.go",
-      "line": 604,
+      "line": 635,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 626,
+      "line": 657,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/article/search-title",
       "file": "backend/app/kbase_http.go",
-      "line": 618,
+      "line": 649,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-import/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 3799,
+      "line": 3877,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-task/create",
       "file": "backend/app/kbase_http.go",
-      "line": 3793,
+      "line": 3871,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/batch-task/delete",
       "file": "backend/app/kbase_http.go",
-      "line": 3795,
+      "line": 3873,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/env/check",
       "file": "backend/app/kbase_http.go",
-      "line": 610,
+      "line": 641,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/export/all-articles-xlsx",
       "file": "backend/app/kbase_http.go",
-      "line": 3797,
+      "line": 3875,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/export/gzh-csv",
       "file": "backend/app/kbase_http.go",
-      "line": 634,
+      "line": 665,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/export/text",
       "file": "backend/app/kbase_http.go",
-      "line": 632,
+      "line": 663,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/gzh/articles",
       "file": "backend/app/kbase_http.go",
-      "line": 602,
+      "line": 633,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/gzh/list",
       "file": "backend/app/kbase_http.go",
-      "line": 600,
+      "line": 631,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/gzh/search",
       "file": "backend/app/kbase_http.go",
-      "line": 612,
+      "line": 643,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/account",
       "file": "backend/app/kbase_http.go",
-      "line": 3787,
+      "line": 3865,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/article",
       "file": "backend/app/kbase_http.go",
-      "line": 3783,
+      "line": 3861,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/import/raw",
       "file": "backend/app/kbase_http.go",
-      "line": 3785,
+      "line": 3863,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/like-articles",
       "file": "backend/app/kbase_http.go",
-      "line": 628,
+      "line": 659,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/report/reading-data",
       "file": "backend/app/kbase_http.go",
-      "line": 622,
+      "line": 653,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/report/statistic-data",
       "file": "backend/app/kbase_http.go",
-      "line": 624,
+      "line": 655,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/request/gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 630,
+      "line": 661,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/search",
       "file": "backend/app/kbase_http.go",
-      "line": 620,
+      "line": 651,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/search-gzh",
       "file": "backend/app/kbase_http.go",
-      "line": 614,
+      "line": 645,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/status",
       "file": "backend/app/kbase_http.go",
-      "line": 608,
+      "line": 639,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/all",
       "file": "backend/app/kbase_http.go",
-      "line": 606,
+      "line": 637,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/control",
       "file": "backend/app/kbase_http.go",
-      "line": 3791,
+      "line": 3869,
       "authenticated": true
     },
     {
       "path": "/api/wcplus/task/new",
       "file": "backend/app/kbase_http.go",
-      "line": 3789,
+      "line": 3867,
       "authenticated": true
     },
     {
       "path": "/api/wechat/article",
       "file": "backend/app/kbase_http.go",
-      "line": 594,
+      "line": 625,
       "authenticated": true
     },
     {
       "path": "/api/wechat/articles",
       "file": "backend/app/kbase_http.go",
-      "line": 598,
+      "line": 629,
       "authenticated": true
     },
     {
       "path": "/api/wechat/import",
       "file": "backend/app/kbase_http.go",
-      "line": 359,
+      "line": 387,
       "authenticated": true
     },
     {
       "path": "/api/wechat/search",
       "file": "backend/app/kbase_http.go",
-      "line": 596,
+      "line": 627,
       "authenticated": true
     },
     {
       "path": "/health",
       "file": "backend/app/kbase_http.go",
-      "line": 280,
+      "line": 308,
       "authenticated": false
     },
     {
