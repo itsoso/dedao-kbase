@@ -232,7 +232,7 @@ const sourceAgentManagementState = {
   commandsByAgent: {},
   loading: "",
   message: "",
-  pendingAgentID: "",
+  pendingAgentIDs: new Set(),
 };
 
 const sourceAgentDetailState = {
@@ -386,6 +386,7 @@ let sourceControlLoadSequence = 0;
 let sourceAgentManagementPollTimer = null;
 let sourceAgentManagementSequence = 0;
 let sourceAgentDetailSequence = 0;
+let jobCenterLoadSequence = 0;
 let knowledgeReviewPollTimer = null;
 let knowledgeReviewLoadSequence = 0;
 let knowledgeAgentLoadSequence = 0;
@@ -2282,7 +2283,7 @@ function renderDedaoEbookAcquisition() {
           <button class="button button-ghost" type="button" data-action="reload-dedao-ebooks" ${loading ? "disabled" : ""}>${loading ? "刷新中" : "刷新书架"}</button>
         `}
       </section>
-      ${message ? `<p class="web-status">${escapeHTML(message)}</p>` : ""}
+      ${message ? `<p class="web-status" role="status" aria-live="polite">${escapeHTML(message)}</p>` : ""}
       <section class="dedao-courses__grid dedao-ebook-acquisition__grid">
         ${cards || `<div class="dedao-courses__empty"><h2>${escapeHTML(empty)}</h2><p>登录失效时可先回到登录页重新扫码；已入库内容不受影响。</p></div>`}
       </section>
@@ -3201,25 +3202,17 @@ function bookJobStageLabel(stage) {
 
 function bookJobFailureMessage(job) {
   const code = String(job?.failure_code || "").toLowerCase();
-  const copy = {
-    authentication_required: "登录已失效，请重新登录后再执行。",
-    download_failed: "电子书下载未完成，可以从这里重新执行。",
-    knowledge_build_failed: "下载已经完成，但知识库生成未完成，可以重新执行。",
-    worker_interrupted: "任务已安全停止，可以从这里重新执行。",
-    source_changed: "书籍权限或任务参数已经变化，请确认后重新创建任务。",
-    unknown_failure: "任务未完成，请查看诊断后重新执行。",
-  }[code];
-  if (copy) return copy;
-  const raw = String(job?.failure_message || job?.error || "").trim();
-  if (!raw) {
-    return ["failed", "interrupted"].includes(String(job?.status || "").toLowerCase())
-      ? "任务未完成，请查看诊断后重新执行。"
-      : "";
+  switch (code) {
+    case "authentication_required": return "登录已失效，请重新登录后再执行。";
+    case "download_failed": return "电子书下载未完成，可以从这里重新执行。";
+    case "knowledge_build_failed": return "下载已经完成，但知识库生成未完成，可以重新执行。";
+    case "worker_interrupted": return "任务已安全停止，可以从这里重新执行。";
+    case "source_changed": return "书籍权限或任务参数已经变化，请确认后重新创建任务。";
+    case "unknown_failure": return "任务未完成，请查看诊断后重新执行。";
   }
-  if (/job execution failed|panic|stack trace|authorization|bearer|cookie|token|\/Users\/|\/home\//i.test(raw)) {
-    return "任务未完成，技术细节已隐藏；请查看诊断后重新执行。";
-  }
-  return raw;
+  return ["failed", "interrupted"].includes(String(job?.status || "").toLowerCase())
+    ? "任务未完成，请查看诊断后重新执行。"
+    : "";
 }
 
 function canRetryBookJob(job) {
@@ -3233,9 +3226,8 @@ async function retryBookJob(jobID, { enid = "" } = {}) {
   if (!id || jobCenterState.retrying.has(id)) return null;
   jobCenterState.retrying.add(id);
   jobCenterState.message = "正在提交重试任务";
-  const onEbookPage = getRoutePathname().startsWith(ROUTES.dedaoEbooks);
-  if (onEbookPage) renderDedaoEbookAcquisition();
-  else if (getRoutePathname() === ROUTES.jobs) renderJobCenter();
+  if (getRoutePathname().startsWith(ROUTES.dedaoEbooks)) renderDedaoEbookAcquisition();
+  else if (isJobCenterRoute()) renderJobCenter();
   try {
     const payload = await apiFetch(`/api/jobs/${encodeURIComponent(jobID)}/retry`, {
       method: "POST",
@@ -3250,19 +3242,19 @@ async function retryBookJob(jobID, { enid = "" } = {}) {
       pollBookKnowledgeJob(retry.id, ebookEnID);
     }
     jobCenterState.message = "重试任务已进入队列。";
-    if (getRoutePathname() === ROUTES.jobs) await loadJobCenter();
+    if (isJobCenterRoute()) await loadJobCenter();
     return retry;
   } catch (error) {
     const message = error?.status === 409
       ? "已有重试任务正在排队或运行"
       : (error instanceof Error ? error.message : String(error));
     jobCenterState.message = message;
-    if (onEbookPage) dedaoEbookAcquisitionState.message = message;
+    if (getRoutePathname().startsWith(ROUTES.dedaoEbooks)) dedaoEbookAcquisitionState.message = message;
     return null;
   } finally {
     jobCenterState.retrying.delete(id);
-    if (onEbookPage) renderDedaoEbookAcquisition();
-    else if (getRoutePathname() === ROUTES.jobs && !jobCenterState.loading) renderJobCenter();
+    if (getRoutePathname().startsWith(ROUTES.dedaoEbooks)) renderDedaoEbookAcquisition();
+    else if (isJobCenterRoute() && !jobCenterState.loading) renderJobCenter();
   }
 }
 
@@ -3321,8 +3313,14 @@ function jobCenterErrorMessage(error) {
   return message;
 }
 
+function isJobCenterRoute(pathname = getRoutePathname()) {
+  return pathname === ROUTES.jobs || pathname.startsWith(`${ROUTES.jobs}/`);
+}
+
 function renderJobCenter() {
+  if (!isJobCenterRoute()) return;
   const tasks = Array.isArray(jobCenterState.tasks) ? jobCenterState.tasks : [];
+  const asyncStatus = jobCenterState.loading || jobCenterState.message;
   const retriesByOriginal = new Map();
   for (const task of tasks) {
     if (!task.retryOf) continue;
@@ -3366,7 +3364,7 @@ function renderJobCenter() {
           ${jobCenterState.loading ? "加载中" : "刷新任务"}
         </button>
       </section>
-      ${jobCenterState.message ? `<p class="web-status">${escapeHTML(jobCenterState.message)}</p>` : ""}
+      ${asyncStatus ? `<p class="web-status" role="status" aria-live="polite">${escapeHTML(asyncStatus)}</p>` : ""}
       ${jobCenterState.lastUpdated ? `<p class="web-muted">最后更新：${escapeHTML(jobCenterState.lastUpdated)}</p>` : ""}
       <section class="job-center__grid">
         ${rows || "<p class=\"web-muted\">暂无任务。先从来源控制或得到内容页创建下载、同步或入库任务。</p>"}
@@ -3381,7 +3379,9 @@ function renderJobCenter() {
 }
 
 async function loadJobCenter() {
-  jobCenterState.loading = "loading";
+  if (!isJobCenterRoute()) return;
+  const sequence = ++jobCenterLoadSequence;
+  jobCenterState.loading = "正在加载任务";
   jobCenterState.message = "";
   renderJobCenter();
   try {
@@ -3389,6 +3389,7 @@ async function loadJobCenter() {
       apiFetch("/api/wcplus/task/all"),
       apiFetch("/api/jobs?limit=50"),
     ]);
+    if (sequence !== jobCenterLoadSequence || !isJobCenterRoute()) return;
     const wcplusTasks = wcplusResult.status === "fulfilled" && Array.isArray(wcplusResult.value?.tasks)
       ? wcplusResult.value.tasks.map((task) => normalizeJobTask(task, "wcplus"))
       : [];
@@ -3404,8 +3405,10 @@ async function loadJobCenter() {
       ? `${jobCenterState.tasks.length ? `已加载 ${jobCenterState.tasks.length} 个任务。` : ""}${errors.join(" ")}`
       : `已加载 ${jobCenterState.tasks.length} 个任务。`;
   } finally {
-    jobCenterState.loading = "";
-    renderJobCenter();
+    if (sequence === jobCenterLoadSequence && isJobCenterRoute()) {
+      jobCenterState.loading = "";
+      renderJobCenter();
+    }
   }
 }
 
@@ -6596,9 +6599,8 @@ function renderWCPlusPage() {
 }
 
 function sourceAgentManagementStatus(agent, commands = []) {
-  const terminalStates = ["succeeded", "failed", "canceled", "expired", "rolled_back"];
-  const activeUpgrade = commands.some((command) => command.type === "upgrade" && !terminalStates.includes(command.state));
-  const activeCommand = commands.some((command) => !terminalStates.includes(command.state));
+  const activeUpgrade = commands.some((command) => command.type === "upgrade" && sourceAgentCommandIsActive(command));
+  const activeCommand = commands.some(sourceAgentCommandIsActive);
   if (activeUpgrade) {
     return "upgrading";
   }
@@ -6614,6 +6616,18 @@ function sourceAgentManagementStatus(agent, commands = []) {
     return "attention";
   }
   return "online";
+}
+
+function sourceAgentCommandIsActive(command) {
+  return !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(String(command?.state || ""));
+}
+
+function sourceAgentManagementBusy(agentID) {
+  const id = String(agentID || "");
+  const agent = sourceAgentManagementState.agents.find((item) => item.agent_id === id);
+  return sourceAgentManagementState.pendingAgentIDs.has(id) ||
+    Boolean(agent?.current_command_id) ||
+    (sourceAgentManagementState.commandsByAgent[id] || []).some(sourceAgentCommandIsActive);
 }
 
 function sourceAgentManagementStatusLabel(status) {
@@ -6672,10 +6686,25 @@ function canRestartBookJobWorker(agent) {
 function sourceAgentSafeError(value) {
   const message = String(value || "").trim();
   if (!message) return "";
-  if (/authorization|bearer|cookie|token|https?:\/\/|\/Users\/|\/home\//i.test(message)) {
-    return "Worker 报告异常，敏感技术细节已隐藏；请先运行诊断。";
+  return "Worker 报告异常，详细信息已隐藏；请运行诊断并人工处理。";
+}
+
+function sourceAgentHealthCodeLabel(value) {
+  const code = String(value || "").trim();
+  if (!code) return "";
+  switch (code) {
+    case "login_required": return "需要重新登录";
+    case "vendor_blocked": return "上游服务已阻止";
+    case "dependency_unavailable": return "依赖服务不可用";
+    case "config_invalid": return "配置需要修正";
+    case "upgrade_required": return "需要升级 Worker";
+    case "throttled": return "请求受到限流";
+    default: return "需要人工处理";
   }
-  return message;
+}
+
+function sourceAgentRequiresActionLabel(value) {
+  return String(value || "").trim() ? "需要人工处理" : "";
 }
 
 function sourceAgentWorkspace(agent) {
@@ -6694,9 +6723,11 @@ function renderSourceAgentManagementCard(agent) {
   const healthEntries = Object.entries(agent.capability_health || {});
   const artifacts = sourceAgentCompatibleArtifacts(agent);
   const workspace = sourceAgentWorkspace(agent);
-  const pending = sourceAgentManagementState.pendingAgentID === agent.agent_id;
+  const pending = sourceAgentManagementBusy(agent.agent_id);
   const bookWorker = isBookJobWorker(agent);
   const canRestart = canRestartBookJobWorker(agent);
+  const capabilities = Array.isArray(agent.capabilities) ? agent.capabilities : [];
+  const canDiagnose = !bookWorker || capabilities.includes("diagnose");
   const safeLastError = sourceAgentSafeError(agent.last_error);
   return `
     <article class="source-agent-card ${bookWorker ? "source-agent-card--book-worker" : ""} is-${status}">
@@ -6722,7 +6753,7 @@ function renderSourceAgentManagementCard(agent) {
         ${healthEntries.length ? healthEntries.map(([name, health]) => `
           <div>
             <strong>${escapeHTML(name)}</strong>
-            <span>${health?.healthy ? "可用" : "不可用"}${health?.code ? ` · ${escapeHTML(health.code)}` : ""}${health?.requires_action ? ` · ${escapeHTML(health.requires_action)}` : ""}</span>
+            <span>${health?.healthy ? "可用" : "不可用"}${health?.code ? ` · ${escapeHTML(sourceAgentHealthCodeLabel(health.code))}` : ""}${health?.requires_action ? ` · ${escapeHTML(sourceAgentRequiresActionLabel(health.requires_action))}` : ""}</span>
           </div>
         `).join("") : '<p class="web-muted">无能力上报</p>'}
       </section>
@@ -6741,7 +6772,7 @@ function renderSourceAgentManagementCard(agent) {
         ${bookWorker ? "" : (agent.desired_state === "paused"
           ? `<button class="button button-ghost" type="button" data-source-agent-resume="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>恢复</button>`
           : `<button class="button button-ghost" type="button" data-source-agent-pause="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>暂停</button>`)}
-        <button class="button button-ghost" type="button" data-source-agent-diagnose="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>诊断</button>
+        ${canDiagnose ? `<button class="button button-ghost" type="button" data-source-agent-diagnose="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""}>诊断</button>` : ""}
         ${canRestart ? `<button class="button button-primary" type="button" data-source-agent-restart="${escapeAttribute(agent.agent_id)}" ${pending ? "disabled" : ""} aria-label="受限重启书籍任务 Worker ${escapeAttribute(agent.agent_id)}">受限重启</button>` : ""}
         <a class="button button-ghost" href="${workspace.href}?agent_id=${encodeURIComponent(agent.agent_id)}">${workspace.label}</a>
       </div>
@@ -6753,8 +6784,8 @@ function renderSourceAgentOverview() {
   const groups = sourceAgentManagementGroups();
   const order = ["attention", "commanding", "upgrading", "offline", "paused", "online"];
   const status = sourceAgentManagementState.loading
-    ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.loading)}</div>`
-    : (sourceAgentManagementState.message ? `<div class="web-status">${escapeHTML(sourceAgentManagementState.message)}</div>` : "");
+    ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.loading)}</div>`
+    : (sourceAgentManagementState.message ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.message)}</div>` : "");
   renderShell(`
     <main class="source-agents">
       <header class="source-agents__header">
@@ -6817,8 +6848,8 @@ function scheduleSourceAgentManagementPoll() {
     sourceAgentManagementPollTimer = null;
   }
   if (!getRoutePathname().startsWith(ROUTES.sourceAgents)) return;
-  const hasActiveCommand = Object.values(sourceAgentManagementState.commandsByAgent).flat().some((command) => !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(command.state));
-  if (!hasActiveCommand && !sourceAgentManagementState.pendingAgentID) return;
+  const hasActiveCommand = Object.values(sourceAgentManagementState.commandsByAgent).flat().some(sourceAgentCommandIsActive);
+  if (!hasActiveCommand && sourceAgentManagementState.pendingAgentIDs.size === 0) return;
   sourceAgentManagementPollTimer = setTimeout(() => {
     sourceAgentManagementPollTimer = null;
     loadSourceAgentManagement({ silent: true });
@@ -6836,7 +6867,9 @@ function sourceAgentCommandEnvelope(type, payload) {
 }
 
 async function runSourceAgentManagementAction(agentID, operation) {
-  sourceAgentManagementState.pendingAgentID = agentID;
+  const id = String(agentID || "").trim();
+  if (!id || sourceAgentManagementBusy(id)) return false;
+  sourceAgentManagementState.pendingAgentIDs.add(id);
   sourceAgentManagementState.message = "正在提交操作";
   renderSourceAgentOverview();
   try {
@@ -6845,9 +6878,17 @@ async function runSourceAgentManagementAction(agentID, operation) {
   } catch (error) {
     sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
   } finally {
-    sourceAgentManagementState.pendingAgentID = "";
-    await loadSourceAgentManagement();
+    try {
+      await loadSourceAgentManagement();
+    } finally {
+      sourceAgentManagementState.pendingAgentIDs.delete(id);
+      if (getRoutePathname().startsWith(ROUTES.sourceAgents)) {
+        renderSourceAgentOverview();
+        scheduleSourceAgentManagementPoll();
+      }
+    }
   }
+  return true;
 }
 
 function setSourceAgentDesiredState(agentID, desiredState) {
@@ -6940,10 +6981,10 @@ function sourceAgentRedactedDiagnostics(agent) {
   const diagnostics = Object.entries(agent.capability_health || {}).map(([capability, health]) => ({
     capability,
     healthy: Boolean(health?.healthy),
-    code: String(health?.code || ""),
-    requiresAction: String(health?.requires_action || ""),
+    code: sourceAgentHealthCodeLabel(health?.code),
+    requiresAction: sourceAgentRequiresActionLabel(health?.requires_action),
   }));
-  diagnostics.push({ capability: "outbox", healthy: Number(agent.dead_letter_count || 0) === 0, code: Number(agent.dead_letter_count || 0) ? "dead_letters_present" : "", requiresAction: "" });
+  diagnostics.push({ capability: "outbox", healthy: Number(agent.dead_letter_count || 0) === 0, code: Number(agent.dead_letter_count || 0) ? "需要人工处理" : "", requiresAction: "" });
   return diagnostics;
 }
 
@@ -6978,7 +7019,7 @@ function renderSourceAgentDetail() {
       <section class="source-agent-detail__grid">
         <article>
           <h2>能力详情</h2>
-          ${healthEntries.length ? healthEntries.map(([name, health]) => `<dl><div><dt>${escapeHTML(name)}</dt><dd>${health?.healthy ? "可用" : "不可用"}</dd></div><div><dt>状态码</dt><dd>${escapeHTML(health?.code || "-")}</dd></div><div><dt>下一步</dt><dd>${escapeHTML(health?.requires_action || "-")}</dd></div></dl>`).join("") : '<p class="web-muted">无能力上报。</p>'}
+          ${healthEntries.length ? healthEntries.map(([name, health]) => `<dl><div><dt>${escapeHTML(name)}</dt><dd>${health?.healthy ? "可用" : "不可用"}</dd></div><div><dt>状态</dt><dd>${escapeHTML(sourceAgentHealthCodeLabel(health?.code) || "-")}</dd></div><div><dt>下一步</dt><dd>${escapeHTML(sourceAgentRequiresActionLabel(health?.requires_action) || "-")}</dd></div></dl>`).join("") : '<p class="web-muted">无能力上报。</p>'}
         </article>
         <article>
           <h2>Outbox 统计</h2>
@@ -7088,7 +7129,7 @@ function renderSourceAgentList() {
       ? agent.capability_health
       : { wcplus: { healthy: Boolean(agent.wcplus_healthy), version: agent.wcplus_version || "", last_error: agent.last_error || "" } };
     const healthRows = Object.entries(capabilityHealth).map(([name, health]) => `
-      <div><dt>${escapeHTML(name)}</dt><dd class="${health?.healthy ? "is-ok" : "is-bad"}">${health?.healthy ? "可用" : "不可用"}${health?.version ? ` · ${escapeHTML(health.version)}` : ""}${health?.requires_action ? ` · ${escapeHTML(health.requires_action)}` : ""}</dd></div>
+      <div><dt>${escapeHTML(name)}</dt><dd class="${health?.healthy ? "is-ok" : "is-bad"}">${health?.healthy ? "可用" : "不可用"}${health?.version ? ` · ${escapeHTML(health.version)}` : ""}${health?.code ? ` · ${escapeHTML(sourceAgentHealthCodeLabel(health.code))}` : ""}${health?.requires_action ? ` · ${escapeHTML(sourceAgentRequiresActionLabel(health.requires_action))}` : ""}</dd></div>
     `).join("");
     return `
       <article class="source-control__agent ${online ? "is-online" : "is-offline"}">
@@ -7104,7 +7145,7 @@ function renderSourceAgentList() {
         <div class="source-control__capabilities">
           ${capabilities.map((capability) => `<span>${escapeHTML(capability)}</span>`).join("") || "<span>无能力上报</span>"}
         </div>
-        ${agent.last_error ? `<p class="source-control__error">${escapeHTML(agent.last_error)}</p>` : ""}
+        ${agent.last_error ? `<p class="source-control__error">${escapeHTML(sourceAgentSafeError(agent.last_error))}</p>` : ""}
       </article>
     `;
   }).join("");
@@ -10290,6 +10331,9 @@ async function boot() {
   bookKnowledgeLoadSequence += 1;
   dedaoEbookDetailLoadSequence += 1;
   const routePathname = getRoutePathname();
+  if (!isJobCenterRoute(routePathname)) {
+    jobCenterLoadSequence += 1;
+  }
   if (!routePathname.startsWith(ROUTES.sourceAgents)) {
     if (sourceAgentManagementPollTimer) {
       clearTimeout(sourceAgentManagementPollTimer);

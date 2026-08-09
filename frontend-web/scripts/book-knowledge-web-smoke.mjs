@@ -264,11 +264,14 @@ for (const marker of [
   "retry_of",
   "原任务",
   "已有重试任务正在排队或运行",
+  "jobCenterLoadSequence",
+  "isJobCenterRoute",
 ]) {
   assert.ok(js.includes(marker), `book job recovery should include ${marker}`);
 }
 assert.ok(html.includes("20260809-book-job-recovery"), "book job recovery should bust cached app assets");
 assert.doesNotMatch(js, />\s*job execution failed\s*</i, "job center must not render raw worker failure copy");
+assert.ok(js.includes('role="status" aria-live="polite"'), "job center async results should be announced accessibly");
 const mobileJobStart = css.lastIndexOf("@media (max-width: 760px)");
 const mobileJobEnd = css.indexOf("@media (prefers-reduced-motion: reduce)", mobileJobStart);
 const mobileJobSource = mobileJobStart >= 0 ? css.slice(mobileJobStart, mobileJobEnd >= 0 ? mobileJobEnd : undefined) : "";

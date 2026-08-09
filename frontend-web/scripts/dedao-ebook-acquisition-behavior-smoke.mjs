@@ -167,8 +167,18 @@ assert.equal(dedao.bookJobStageLabel("building_knowledge"), "正在生成知识�
 assert.equal(dedao.bookJobStageLabel("recovery_required"), "等待人工恢复");
 assert.equal(
   dedao.bookJobFailureMessage({ status: "failed", error: "job execution failed" }),
-  "任务未完成，技术细节已隐藏；请查看诊断后重新执行。",
+  "任务未完成，请查看诊断后重新执行。",
   "raw worker errors should become safe product copy",
+);
+assert.equal(
+  dedao.bookJobFailureMessage({ status: "failed", error: "/var/lib/private/api_key=do-not-render" }),
+  "任务未完成，请查看诊断后重新执行。",
+  "unknown KBase failures should use fail-closed product copy",
+);
+assert.equal(
+  dedao.bookJobFailureMessage({ status: "failed", failure_code: "constructor", error: "private" }),
+  "任务未完成，请查看诊断后重新执行。",
+  "prototype keys must not escape the failure-code allowlist",
 );
 assert.equal(dedao.canRetryBookJob({ id: "failed", type: "dedao_ebook_download", status: "failed" }), true);
 assert.equal(dedao.canRetryBookJob({ id: "wc", source: "wcplus", status: "failed" }), false, "WC Plus jobs must not gain book retry controls");
