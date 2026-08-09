@@ -321,6 +321,12 @@ func TestAgentPackageRuntimeChatUsesPinnedEvidencePolicyAndCitations(t *testing.
 	if strings.Contains(prompt, "private-source-marker") {
 		t.Fatalf("package prompt leaked source body/path marker: %s", prompt)
 	}
+	systemPrompt := client.messages[0].Content
+	for _, marker := range []string{"at most 3 short bullet points", "350 Chinese characters", "at most 3 citation IDs total", "finish every sentence"} {
+		if !strings.Contains(systemPrompt, marker) {
+			t.Fatalf("system prompt missing concise-answer constraint %q: %s", marker, systemPrompt)
+		}
+	}
 }
 
 func TestAgentPackageRuntimeDisablesThinkingForQwenHybridModel(t *testing.T) {

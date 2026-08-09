@@ -742,7 +742,7 @@ func buildAgentPackageMessages(
 	return []BookKnowledgeMessage{
 		{
 			Role: "system",
-			Content: fmt.Sprintf("You are executing immutable Agent Package %s version %s. Use only the pinned evidence below. Capability: %s. Usage policy: %s. Output schema: %s. Cite every factual claim as [citation:<id>]. If evidence is insufficient, abstain.",
+			Content: fmt.Sprintf("You are executing immutable Agent Package %s version %s. Use only the pinned evidence below. Capability: %s. Usage policy: %s. Output schema: %s. Cite every factual claim as [citation:<id>]. Answer concisely and completely: use at most 3 short bullet points, no more than 350 Chinese characters or 180 English words, and at most 3 citation IDs total. Use only the most directly relevant evidence, do not repeat the evidence ledger, and finish every sentence. If evidence is insufficient, abstain.",
 				pkg.PackageID, pkg.Version, pkg.ModelPolicy.PreferredCapability, pkg.SafetyPolicy.UsagePolicy, promptProfile.OutputSchema),
 		},
 		{Role: "user", Content: buildAgentPackagePrompt(question, evidence)},
