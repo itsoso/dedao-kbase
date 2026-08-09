@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -37,6 +38,8 @@ const (
 )
 
 const BookKnowledgeJobFailureWorkerInterrupted = "worker_interrupted"
+
+const bookKnowledgeJobInterruptedMessage = "job execution interrupted"
 
 const (
 	BookKnowledgeJobTypeDedaoEbookDownload  = "dedao_ebook_download"
@@ -288,12 +291,7 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJob(jobID string) error {
 }
 
 func (s *BookKnowledgeStore) RunBookKnowledgeJobWithService(jobID string, service *services.Service) error {
-	job, err := s.updateBookKnowledgeJob(jobID, func(job BookKnowledgeJob) BookKnowledgeJob {
-		now := time.Now().UTC().Format(time.RFC3339Nano)
-		job.Status, job.StartedAt, job.UpdatedAt = BookKnowledgeJobStatusRunning, now, now
-		job.Logs = append(job.Logs, "running")
-		return job
-	})
+	job, err := s.startBookKnowledgeJob(jobID)
 	if err != nil {
 		return err
 	}
@@ -314,6 +312,61 @@ func (s *BookKnowledgeStore) RunBookKnowledgeJobWithService(jobID string, servic
 		return job
 	})
 	return err
+}
+
+func (s *BookKnowledgeStore) startBookKnowledgeJob(jobID string) (BookKnowledgeJob, error) {
+	bookKnowledgeJobsMu.Lock()
+	defer bookKnowledgeJobsMu.Unlock()
+	db, err := s.openBookJobsWriteDB()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	job, err := startBookKnowledgeJobInTx(tx, jobID)
+	if err != nil {
+		tx.Rollback()
+		return BookKnowledgeJob{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	return job, nil
+}
+
+func startBookKnowledgeJobInTx(tx *sql.Tx, jobID string) (BookKnowledgeJob, error) {
+	job, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+` WHERE job_id = ?`, strings.TrimSpace(jobID)))
+	if err == sql.ErrNoRows {
+		return BookKnowledgeJob{}, fmt.Errorf("job not found")
+	}
+	if err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	if job.Status != BookKnowledgeJobStatusQueued {
+		return BookKnowledgeJob{}, fmt.Errorf("job %q cannot run from status %s", job.ID, job.Status)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	job.Status = BookKnowledgeJobStatusRunning
+	job.Stage = defaultBookKnowledgeJobStage(job.Status)
+	job.Error = ""
+	job.FailureCode = ""
+	job.Result = nil
+	job.LeaseOwner = ""
+	job.LeaseExpiresAt = ""
+	job.StartedAt = now
+	job.FinishedAt = ""
+	job.UpdatedAt = now
+	job.Logs = append(job.Logs, "running")
+	if err := updateBookKnowledgeJobRowFromStatus(tx, job, BookKnowledgeJobStatusQueued); err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
+		return BookKnowledgeJob{}, err
+	}
+	return job, nil
 }
 
 func (s *BookKnowledgeStore) executeBookKnowledgeJobSafely(ctx context.Context, job BookKnowledgeJob) (result map[string]any, err error) {
@@ -496,13 +549,21 @@ func (s *BookKnowledgeStore) migrateBookJobsDB(db *sql.DB) error {
 		return err
 	}
 
-	legacy := bookKnowledgeJobsFile{Jobs: []BookKnowledgeJob{}}
-	if err := readJSONFile(s.LegacyJobsPath(), &legacy); err != nil && !os.IsNotExist(err) {
+	legacy, err := readLegacyBookKnowledgeJobs(s.LegacyJobsPath())
+	if err != nil && !os.IsNotExist(err) {
 		tx.Rollback()
 		return fmt.Errorf("import legacy book jobs: %w", err)
 	}
-	for _, job := range legacy.Jobs {
-		job = normalizeLegacyBookKnowledgeJob(job)
+	jobs := make([]BookKnowledgeJob, len(legacy.Jobs))
+	for index, job := range legacy.Jobs {
+		normalized, err := validateAndNormalizeLegacyBookKnowledgeJob(job)
+		if err != nil {
+			tx.Rollback()
+			return fmt.Errorf("validate legacy book job %d: %w", index, err)
+		}
+		jobs[index] = normalized
+	}
+	for _, job := range jobs {
 		inserted, err := insertBookKnowledgeJob(tx, job, true)
 		if err != nil {
 			tx.Rollback()
@@ -550,22 +611,32 @@ func insertBookKnowledgeJob(tx *sql.Tx, job BookKnowledgeJob, ignoreConflict boo
 }
 
 func updateBookKnowledgeJobRow(tx *sql.Tx, job BookKnowledgeJob) error {
+	return updateBookKnowledgeJobRowFromStatus(tx, job, "")
+}
+
+func updateBookKnowledgeJobRowFromStatus(tx *sql.Tx, job BookKnowledgeJob, expectedStatus BookKnowledgeJobStatus) error {
 	resultJSON, logsJSON, err := marshalBookKnowledgeJobJSON(job)
 	if err != nil {
 		return err
 	}
-	result, err := tx.Exec(`
+	query := `
 		UPDATE book_jobs SET
 			job_type = ?, status = ?, ebook_id = ?, ebook_enid = ?, download_type = ?,
 			result_json = ?, logs_json = ?, retry_of = NULLIF(?, ''), stage = ?, failure_code = ?,
 			lease_owner = ?, lease_expires_at = ?, failure_message = ?, created_at = ?,
 			updated_at = ?, started_at = ?, finished_at = ?
-		WHERE job_id = ?`,
+		WHERE job_id = ?`
+	args := []any{
 		job.Type, job.Status, job.EbookID, job.EbookEnID, job.DownloadType,
 		resultJSON, logsJSON, job.RetryOf, bookKnowledgeJobStage(job), job.FailureCode,
 		job.LeaseOwner, job.LeaseExpiresAt, job.Error, job.CreatedAt, job.UpdatedAt,
 		job.StartedAt, job.FinishedAt, job.ID,
-	)
+	}
+	if expectedStatus != "" {
+		query += ` AND status = ?`
+		args = append(args, expectedStatus)
+	}
+	result, err := tx.Exec(query, args...)
 	if err != nil {
 		return err
 	}
@@ -574,6 +645,9 @@ func updateBookKnowledgeJobRow(tx *sql.Tx, job BookKnowledgeJob) error {
 		return err
 	}
 	if rows != 1 {
+		if expectedStatus != "" {
+			return fmt.Errorf("job %q cannot run from status other than %s", job.ID, expectedStatus)
+		}
 		return fmt.Errorf("job not found")
 	}
 	return nil
@@ -625,25 +699,170 @@ func marshalBookKnowledgeJobJSON(job BookKnowledgeJob) (string, string, error) {
 	return string(resultJSON), string(logsJSON), nil
 }
 
-func normalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) BookKnowledgeJob {
-	if job.Status == BookKnowledgeJobStatusFailed && legacyBookKnowledgeJobWasInterrupted(job) {
-		job.Status = BookKnowledgeJobStatusInterrupted
-		job.FailureCode = BookKnowledgeJobFailureWorkerInterrupted
+func readLegacyBookKnowledgeJobs(path string) (bookKnowledgeJobsFile, error) {
+	file := bookKnowledgeJobsFile{Jobs: []BookKnowledgeJob{}}
+	reader, err := os.Open(path)
+	if err != nil {
+		return file, err
 	}
-	job.Stage = bookKnowledgeJobStage(job)
+	defer reader.Close()
+	document := struct {
+		Jobs *[]BookKnowledgeJob `json:"jobs"`
+	}{}
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return file, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return file, fmt.Errorf("legacy jobs contains trailing JSON")
+		}
+		return file, fmt.Errorf("legacy jobs contains trailing data: %w", err)
+	}
+	if document.Jobs == nil {
+		return file, fmt.Errorf("legacy jobs array is required")
+	}
+	file.Jobs = *document.Jobs
+	return file, nil
+}
+
+func validateAndNormalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) (BookKnowledgeJob, error) {
+	if strings.TrimSpace(job.ID) == "" {
+		return job, fmt.Errorf("id is required")
+	}
+	switch job.Type {
+	case BookKnowledgeJobTypeDedaoEbookDownload, BookKnowledgeJobTypeDedaoEbookSyncKBase:
+	default:
+		return job, fmt.Errorf("unsupported job type: %s", job.Type)
+	}
+	switch job.Status {
+	case BookKnowledgeJobStatusQueued, BookKnowledgeJobStatusRunning, BookKnowledgeJobStatusSucceeded,
+		BookKnowledgeJobStatusFailed, BookKnowledgeJobStatusInterrupted:
+	default:
+		return job, fmt.Errorf("unsupported job status: %s", job.Status)
+	}
+	if job.EbookID <= 0 {
+		return job, fmt.Errorf("ebook_id is required")
+	}
+	if strings.TrimSpace(job.EbookEnID) == "" {
+		return job, fmt.Errorf("ebook_enid is required")
+	}
+	if job.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
+		job.DownloadType = 1
+	} else if job.DownloadType < 1 || job.DownloadType > 3 {
+		return job, fmt.Errorf("download_type must be 1, 2, or 3")
+	}
+	for name, value := range map[string]string{"created_at": job.CreatedAt, "updated_at": job.UpdatedAt} {
+		if strings.TrimSpace(value) == "" {
+			return job, fmt.Errorf("%s is required", name)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+			return job, fmt.Errorf("%s must be RFC3339: %w", name, err)
+		}
+	}
+	for name, value := range map[string]string{"started_at": job.StartedAt, "finished_at": job.FinishedAt} {
+		if strings.TrimSpace(value) == "" {
+			continue
+		}
+		if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+			return job, fmt.Errorf("%s must be RFC3339: %w", name, err)
+		}
+	}
+	return normalizeLegacyBookKnowledgeJob(job), nil
+}
+
+func normalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) BookKnowledgeJob {
+	interrupted := job.Status == BookKnowledgeJobStatusInterrupted ||
+		(job.Status == BookKnowledgeJobStatusFailed && legacyBookKnowledgeJobWasInterrupted(job))
+	job.Result = safeLegacyBookKnowledgeJobResult(job, job.Result)
+	job.LeaseOwner = ""
+	job.LeaseExpiresAt = ""
+	job.Stage = defaultBookKnowledgeJobStage(job.Status)
+	if interrupted {
+		job.Status = BookKnowledgeJobStatusInterrupted
+		job.Stage = defaultBookKnowledgeJobStage(job.Status)
+		job.FailureCode = BookKnowledgeJobFailureWorkerInterrupted
+		job.Error = bookKnowledgeJobInterruptedMessage
+		job.Logs = []string{"interrupted"}
+		return job
+	}
+	job.FailureCode = ""
+	if job.Status == BookKnowledgeJobStatusFailed {
+		job.Error = sanitizeBookKnowledgeJobError(job.Error)
+		job.Logs = []string{"failed"}
+		return job
+	}
+	job.Error = ""
+	job.Logs = []string{string(job.Status)}
 	return job
 }
 
 func legacyBookKnowledgeJobWasInterrupted(job BookKnowledgeJob) bool {
-	if strings.Contains(strings.ToLower(job.Error), "interrupted") {
+	switch strings.ToLower(strings.TrimSpace(job.Error)) {
+	case "interrupted", "interrupted by server restart", "interrupted by kbase-server restart":
 		return true
 	}
 	for _, entry := range job.Logs {
-		if strings.Contains(strings.ToLower(entry), "interrupted") {
+		if strings.ToLower(strings.TrimSpace(entry)) == "failed: interrupted" {
 			return true
 		}
 	}
 	return false
+}
+
+func safeLegacyBookKnowledgeJobResult(job BookKnowledgeJob, result map[string]any) map[string]any {
+	filtered := safeBookKnowledgeJobResult(result)
+	if len(filtered) == 0 {
+		return nil
+	}
+	safe := make(map[string]any, len(filtered))
+	for key, value := range filtered {
+		switch key {
+		case "ebook_id", "download_type":
+			if legacyBookKnowledgeJobResultNumber(value) {
+				safe[key] = value
+			}
+		case "ebook_enid":
+			if text, ok := value.(string); ok && text == job.EbookEnID && legacyBookKnowledgeJobResultTextIsSafe(text) {
+				safe[key] = text
+			}
+		case "knowledge_book_id", "title":
+			if text, ok := value.(string); ok && legacyBookKnowledgeJobResultTextIsSafe(text) {
+				safe[key] = text
+			}
+		}
+	}
+	if len(safe) == 0 {
+		return nil
+	}
+	return safe
+}
+
+func legacyBookKnowledgeJobResultNumber(value any) bool {
+	switch value.(type) {
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return true
+	default:
+		return false
+	}
+}
+
+func legacyBookKnowledgeJobResultTextIsSafe(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 512 || filepath.IsAbs(value) || strings.ContainsAny(value, `/\`) {
+		return false
+	}
+	lower := strings.ToLower(value)
+	for _, marker := range []string{
+		"token=", "access_token=", "secret=", "api_key=", "apikey=", "cookie=", "authorization:", "bearer ",
+	} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func bookKnowledgeJobStage(job BookKnowledgeJob) string {
