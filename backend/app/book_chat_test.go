@@ -119,6 +119,25 @@ func TestBookKnowledgeChatCanonicalizesQwenDisplayLabel(t *testing.T) {
 	}
 }
 
+func TestNormalizeBookTokenPlanLatestModels(t *testing.T) {
+	cases := map[string]string{
+		"Qwen-3.8-Max-Preview": "qwen3.8-max-preview",
+		"GLM-5.2":              "glm-5.2",
+		"DeepSeek V4 Pro":      "deepseek-v4-pro",
+		"DeepSeek V4 Flash":    "deepseek-v4-flash",
+		"Kimi K2.7 Code":       "kimi-k2.7-code",
+		"MiniMax M2.5":         "MiniMax-M2.5",
+	}
+
+	for input, want := range cases {
+		t.Run(input, func(t *testing.T) {
+			if got := normalizeBookTokenPlanModel(input); got != want {
+				t.Fatalf("normalizeBookTokenPlanModel(%q) = %q, want %q", input, got, want)
+			}
+		})
+	}
+}
+
 func TestContextKnowledgeChatBuildsGroundedPrompt(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "sk-test-token")
 	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://token-plan.example.test/compatible-mode/v1")

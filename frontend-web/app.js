@@ -354,8 +354,13 @@ const knowledgeAnalysisPrompts = [
 ];
 
 const knowledgeAnalysisModels = [
+  { id: "qwen3.8-max-preview", label: "Qwen-3.8-Max（预览版）" },
   { id: "qwen3.7-max", label: "Qwen-3.7-Max" },
   { id: "qwen3.7-plus", label: "Qwen-3.7-Plus" },
+  { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
+  { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash" },
+  { id: "kimi-k2.7-code", label: "Kimi K2.7 Code" },
+  { id: "glm-5.2", label: "GLM-5.2" },
   { id: "MiniMax-M2.5", label: "MiniMax-M2.5" },
 ];
 

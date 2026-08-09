@@ -415,10 +415,22 @@ func normalizeBookTokenPlanModel(model string) string {
 	clean := strings.TrimSpace(model)
 	compact := strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "").Replace(clean))
 	switch compact {
+	case "qwen3.8maxpreview":
+		return "qwen3.8-max-preview"
 	case "qwen3.7max":
 		return "qwen3.7-max"
 	case "qwen3.7plus":
 		return "qwen3.7-plus"
+	case "deepseekv4pro":
+		return "deepseek-v4-pro"
+	case "deepseekv4flash":
+		return "deepseek-v4-flash"
+	case "kimik2.7code":
+		return "kimi-k2.7-code"
+	case "glm5.2":
+		return "glm-5.2"
+	case "minimaxm2.5":
+		return "MiniMax-M2.5"
 	default:
 		return clean
 	}

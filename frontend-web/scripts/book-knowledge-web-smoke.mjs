@@ -166,6 +166,7 @@ for (const className of [
 assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"), "empty state should point users to source import");
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
+assert.ok(html.includes("20260809-tokenplan-models"), "latest TokenPlan models should use a fresh app.js cache version");
 assert.ok(html.includes('rel="icon"'), "index.html should declare an application favicon");
 assert.ok(html.includes("data:image/svg+xml"), "the favicon should be inline and avoid a missing /favicon.ico request");
 assert.ok(html.includes("20260724-evidence-audit-focus"), "evidence audit workspace release should use a fresh browser cache version");
@@ -193,7 +194,29 @@ assert.ok(js.includes("knowledge-web__analysis"), "single article knowledge page
 assert.ok(js.includes("分析当前文章"), "single article knowledge pages should include an article analysis action");
 assert.ok(js.includes("Qwen-3.7-Max"), "book knowledge analysis should default to Qwen-3.7-Max");
 assert.ok(js.includes('<option value="${escapeAttribute(model.id)}"'), "model options should send canonical API ids");
-assert.ok(js.includes('id: "qwen3.7-max", label: "Qwen-3.7-Max"'), "Qwen display label should map to the canonical TokenPlan id");
+for (const [id, label] of [
+  ["qwen3.8-max-preview", "Qwen-3.8-Max（预览版）"],
+  ["qwen3.7-max", "Qwen-3.7-Max"],
+  ["qwen3.7-plus", "Qwen-3.7-Plus"],
+  ["deepseek-v4-pro", "DeepSeek V4 Pro"],
+  ["deepseek-v4-flash", "DeepSeek V4 Flash"],
+  ["kimi-k2.7-code", "Kimi K2.7 Code"],
+  ["glm-5.2", "GLM-5.2"],
+  ["MiniMax-M2.5", "MiniMax-M2.5"],
+]) {
+  assert.ok(
+    js.includes(`id: "${id}", label: "${label}"`),
+    `${label} should map to canonical TokenPlan id ${id}`,
+  );
+}
+assert.ok(
+  js.includes('courseArticleAnalysisModel: "qwen3.7-max"'),
+  "course article analysis should keep Qwen-3.7-Max as the default",
+);
+assert.ok(
+  js.includes('analysisModel: "qwen3.7-max"'),
+  "book knowledge analysis should keep Qwen-3.7-Max as the default",
+);
 for (const marker of [
   "analysisManifest",
   "loadKnowledgeAnalysisManifest",
