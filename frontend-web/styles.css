@@ -5553,6 +5553,7 @@ a.button {
 .book-agent__search-results article strong,
 .book-agent__search-results article span {
   display: block;
+  overflow-wrap: anywhere;
 }
 
 .book-agent__search-results article p,

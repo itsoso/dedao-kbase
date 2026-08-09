@@ -68,6 +68,8 @@ const railSource = css.match(/\.agent-console__status-rail\s*\{([\s\S]*?)\}/)?.[
 assert.ok(railSource.includes("position: sticky"), "desktop status rail should remain visible while using the workspace");
 assert.ok(css.includes("grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr)"), "desktop console should use a bounded two-column layout");
 assert.ok(css.includes("overflow-wrap: anywhere"), "long technical values should never force page overflow");
+const searchIdentityStyle = css.match(/\.book-agent__search-results article strong,\s*\.book-agent__search-results article span\s*\{([\s\S]*?)\}/)?.[1] || "";
+assert.ok(searchIdentityStyle.includes("overflow-wrap: anywhere"), "long Release and Citation identities should wrap inside mobile search results");
 
 const mobileStart = css.lastIndexOf("@media (max-width: 760px)");
 const mobileEnd = css.indexOf("@media (prefers-reduced-motion: reduce)", mobileStart);
@@ -76,5 +78,6 @@ assert.ok(mobileSource.includes(".agent-console__workspace"), "console should de
 assert.ok(mobileSource.includes("grid-template-columns: minmax(0, 1fr)"), "mobile console should collapse to one column");
 assert.ok(css.includes("prefers-reduced-motion: reduce"), "console animation should respect reduced motion");
 assert.ok(html.includes("20260808-agent-console-zh"), "production should publish a fresh Agent console asset version");
+assert.ok(html.includes("20260808-agent-console-overflow"), "mobile overflow repair should publish a fresh stylesheet version");
 
 console.log("Agent console UI smoke passed");
