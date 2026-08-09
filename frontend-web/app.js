@@ -232,7 +232,9 @@ const sourceAgentManagementState = {
   commandsByAgent: {},
   loading: "",
   message: "",
+  actionMessage: "",
   pendingAgentIDs: new Set(),
+  authorityPendingAgentIDs: new Set(),
 };
 
 const sourceAgentDetailState = {
@@ -6601,10 +6603,12 @@ function renderWCPlusPage() {
 function sourceAgentManagementStatus(agent, commands = []) {
   const activeUpgrade = commands.some((command) => command.type === "upgrade" && sourceAgentCommandIsActive(command));
   const activeCommand = commands.some(sourceAgentCommandIsActive);
+  const managementBusy = sourceAgentManagementState.pendingAgentIDs.has(agent.agent_id)
+    || sourceAgentManagementState.authorityPendingAgentIDs.has(agent.agent_id);
   if (activeUpgrade) {
     return "upgrading";
   }
-  if (activeCommand || agent.current_command_id) return "commanding";
+  if (activeCommand || agent.current_command_id || managementBusy) return "commanding";
   if (agent.desired_state === "paused") {
     return "paused";
   }
@@ -6622,10 +6626,29 @@ function sourceAgentCommandIsActive(command) {
   return !["succeeded", "failed", "canceled", "expired", "rolled_back"].includes(String(command?.state || ""));
 }
 
+function sourceAgentCommandID(command) {
+  return String(command?.id || command?.command_id || "").trim();
+}
+
+function mergeSourceAgentCommands(current, authoritative) {
+  const fetched = Array.isArray(authoritative) ? authoritative : [];
+  const fetchedIDs = new Set(fetched.map(sourceAgentCommandID).filter(Boolean));
+  const localActive = (Array.isArray(current) ? current : []).filter((command) => {
+    const id = sourceAgentCommandID(command);
+    return id && sourceAgentCommandIsActive(command) && !fetchedIDs.has(id);
+  });
+  return [...localActive, ...fetched];
+}
+
+function isSourceAgentOverviewRoute(pathname = getRoutePathname()) {
+  return pathname === ROUTES.sourceAgents;
+}
+
 function sourceAgentManagementBusy(agentID) {
   const id = String(agentID || "");
   const agent = sourceAgentManagementState.agents.find((item) => item.agent_id === id);
   return sourceAgentManagementState.pendingAgentIDs.has(id) ||
+    sourceAgentManagementState.authorityPendingAgentIDs.has(id) ||
     Boolean(agent?.current_command_id) ||
     (sourceAgentManagementState.commandsByAgent[id] || []).some(sourceAgentCommandIsActive);
 }
@@ -6781,11 +6804,14 @@ function renderSourceAgentManagementCard(agent) {
 }
 
 function renderSourceAgentOverview() {
+  if (!isSourceAgentOverviewRoute()) return;
   const groups = sourceAgentManagementGroups();
   const order = ["attention", "commanding", "upgrading", "offline", "paused", "online"];
-  const status = sourceAgentManagementState.loading
-    ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.loading)}</div>`
-    : (sourceAgentManagementState.message ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.message)}</div>` : "");
+  const status = sourceAgentManagementState.actionMessage
+    ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.actionMessage)}</div>`
+    : (sourceAgentManagementState.loading
+      ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.loading)}</div>`
+      : (sourceAgentManagementState.message ? `<div class="web-status" role="status" aria-live="polite">${escapeHTML(sourceAgentManagementState.message)}</div>` : ""));
   renderShell(`
     <main class="source-agents">
       <header class="source-agents__header">
@@ -6806,8 +6832,11 @@ function renderSourceAgentOverview() {
   bindSourceAgentManagementEvents();
 }
 
-async function loadSourceAgentManagement({ silent = false } = {}) {
+async function loadSourceAgentManagement({ silent = false, preserveActionOutcome = false } = {}) {
+  if (!isSourceAgentOverviewRoute()) return false;
   const sequence = ++sourceAgentManagementSequence;
+  const authorityPendingAtStart = new Set(sourceAgentManagementState.authorityPendingAgentIDs);
+  if (!preserveActionOutcome) sourceAgentManagementState.actionMessage = "";
   if (!silent) {
     sourceAgentManagementState.loading = "正在加载 Agent 状态";
     sourceAgentManagementState.message = "";
@@ -6815,26 +6844,45 @@ async function loadSourceAgentManagement({ silent = false } = {}) {
   }
   try {
     const agentPayload = await apiFetch("/api/source-agents");
-    if (sequence !== sourceAgentManagementSequence) return;
+    if (sequence !== sourceAgentManagementSequence || !isSourceAgentOverviewRoute()) return false;
     const agents = Array.isArray(agentPayload.agents) ? agentPayload.agents : [];
     const [artifactResult, ...commandResults] = await Promise.allSettled([
       apiFetch("/api/source-agent-artifacts?limit=100"),
       ...agents.map((agent) => apiFetch(`/api/source-agents/${encodeURIComponent(agent.agent_id)}/commands?limit=10`)),
     ]);
-    if (sequence !== sourceAgentManagementSequence) return;
+    if (sequence !== sourceAgentManagementSequence || !isSourceAgentOverviewRoute()) return false;
+    if (commandResults.some((result) => result?.status !== "fulfilled")) {
+      throw new Error("Agent 命令状态暂时无法确认");
+    }
     sourceAgentManagementState.agents = agents;
     sourceAgentManagementState.artifacts = artifactResult.status === "fulfilled" && Array.isArray(artifactResult.value.artifacts) ? artifactResult.value.artifacts : [];
     sourceAgentManagementState.commandsByAgent = Object.fromEntries(agents.map((agent, index) => {
       const result = commandResults[index];
-      return [agent.agent_id, result?.status === "fulfilled" && Array.isArray(result.value.commands) ? result.value.commands : []];
+      const commands = result?.status === "fulfilled" && Array.isArray(result.value.commands) ? result.value.commands : [];
+      return [agent.agent_id, mergeSourceAgentCommands(sourceAgentManagementState.commandsByAgent[agent.agent_id], commands)];
     }));
     sourceAgentManagementState.message = `${agents.length} 个 Agent · ${sourceAgentManagementState.artifacts.length} 个可见产物`;
-  } catch (error) {
-    if (sequence === sourceAgentManagementSequence) {
-      sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
+    const loadedAgentIDs = new Set(agents.map((agent) => agent.agent_id));
+    for (const agentID of authorityPendingAtStart) {
+      if (loadedAgentIDs.has(agentID)) sourceAgentManagementState.authorityPendingAgentIDs.delete(agentID);
     }
+    if (preserveActionOutcome && [
+      "操作已提交，正在刷新权威状态",
+      "操作已提交，但权威状态暂未确认；系统将自动重试。",
+    ].includes(sourceAgentManagementState.actionMessage)) {
+      sourceAgentManagementState.actionMessage = "操作已提交，权威状态已刷新";
+    }
+    return true;
+  } catch (error) {
+    if (sequence === sourceAgentManagementSequence && isSourceAgentOverviewRoute()) {
+      sourceAgentManagementState.message = "Agent 状态刷新失败，请稍后重试。";
+      if (preserveActionOutcome && authorityPendingAtStart.size > 0) {
+        sourceAgentManagementState.actionMessage = "操作已提交，但权威状态暂未确认；系统将自动重试。";
+      }
+    }
+    return false;
   } finally {
-    if (sequence === sourceAgentManagementSequence) {
+    if (sequence === sourceAgentManagementSequence && isSourceAgentOverviewRoute()) {
       sourceAgentManagementState.loading = "";
       renderSourceAgentOverview();
       scheduleSourceAgentManagementPoll();
@@ -6847,12 +6895,12 @@ function scheduleSourceAgentManagementPoll() {
     clearTimeout(sourceAgentManagementPollTimer);
     sourceAgentManagementPollTimer = null;
   }
-  if (!getRoutePathname().startsWith(ROUTES.sourceAgents)) return;
+  if (!isSourceAgentOverviewRoute()) return;
   const hasActiveCommand = Object.values(sourceAgentManagementState.commandsByAgent).flat().some(sourceAgentCommandIsActive);
-  if (!hasActiveCommand && sourceAgentManagementState.pendingAgentIDs.size === 0) return;
+  if (!hasActiveCommand && sourceAgentManagementState.pendingAgentIDs.size === 0 && sourceAgentManagementState.authorityPendingAgentIDs.size === 0) return;
   sourceAgentManagementPollTimer = setTimeout(() => {
     sourceAgentManagementPollTimer = null;
-    loadSourceAgentManagement({ silent: true });
+    loadSourceAgentManagement({ silent: true, preserveActionOutcome: true });
   }, 5000);
 }
 
@@ -6870,25 +6918,31 @@ async function runSourceAgentManagementAction(agentID, operation) {
   const id = String(agentID || "").trim();
   if (!id || sourceAgentManagementBusy(id)) return false;
   sourceAgentManagementState.pendingAgentIDs.add(id);
-  sourceAgentManagementState.message = "正在提交操作";
+  sourceAgentManagementState.actionMessage = "正在提交操作";
   renderSourceAgentOverview();
   try {
-    await operation();
-    sourceAgentManagementState.message = "操作已提交，正在刷新权威状态";
-  } catch (error) {
-    sourceAgentManagementState.message = error instanceof Error ? error.message : String(error);
-  } finally {
-    try {
-      await loadSourceAgentManagement();
-    } finally {
-      sourceAgentManagementState.pendingAgentIDs.delete(id);
-      if (getRoutePathname().startsWith(ROUTES.sourceAgents)) {
-        renderSourceAgentOverview();
-        scheduleSourceAgentManagementPoll();
-      }
+    const payload = await operation();
+    const command = payload?.command;
+    if (command && sourceAgentCommandIsActive(command)) {
+      sourceAgentManagementState.commandsByAgent[id] = mergeSourceAgentCommands(
+        sourceAgentManagementState.commandsByAgent[id],
+        [command],
+      );
     }
+    sourceAgentManagementState.pendingAgentIDs.delete(id);
+    sourceAgentManagementState.authorityPendingAgentIDs.add(id);
+    sourceAgentManagementState.actionMessage = "操作已提交，正在刷新权威状态";
+    renderSourceAgentOverview();
+    if (!isSourceAgentOverviewRoute()) return true;
+    const loaded = await loadSourceAgentManagement({ preserveActionOutcome: true });
+    if (!loaded) scheduleSourceAgentManagementPoll();
+    return true;
+  } catch (error) {
+    sourceAgentManagementState.pendingAgentIDs.delete(id);
+    sourceAgentManagementState.actionMessage = "操作提交失败，请稍后重试或运行诊断。";
+    renderSourceAgentOverview();
+    return false;
   }
-  return true;
 }
 
 function setSourceAgentDesiredState(agentID, desiredState) {
@@ -10334,7 +10388,7 @@ async function boot() {
   if (!isJobCenterRoute(routePathname)) {
     jobCenterLoadSequence += 1;
   }
-  if (!routePathname.startsWith(ROUTES.sourceAgents)) {
+  if (!isSourceAgentOverviewRoute(routePathname)) {
     if (sourceAgentManagementPollTimer) {
       clearTimeout(sourceAgentManagementPollTimer);
       sourceAgentManagementPollTimer = null;

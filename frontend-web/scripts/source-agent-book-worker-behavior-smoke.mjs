@@ -34,7 +34,7 @@ const context = {
   },
 };
 
-vm.runInNewContext(`${source}\nglobalThis.__bookWorker = {
+vm.runInNewContext(`${source}\nglobalThis.__originalManagementLoader = loadSourceAgentManagement;\nglobalThis.__bookWorker = {
   isBookJobWorker,
   canRestartBookJobWorker,
   renderSourceAgentManagementCard,
@@ -42,6 +42,7 @@ vm.runInNewContext(`${source}\nglobalThis.__bookWorker = {
   sourceAgentManagementStatus,
   sourceAgentSafeError,
   sourceAgentManagementState,
+  loadSourceAgentManagement,
   sourceAgentDetailState,
   sourceControlState,
   sourceAgentHealthCodeLabel,
@@ -54,6 +55,7 @@ vm.runInNewContext(`${source}\nglobalThis.__bookWorker = {
   createSourceAgentRestart,
   setApi(value) { apiFetch = value; },
   setManagementLoader(value) { loadSourceAgentManagement = value; },
+  restoreManagementLoader() { loadSourceAgentManagement = globalThis.__originalManagementLoader; },
 };`, context, { filename: "frontend-web/app.js" });
 
 const ui = context.__bookWorker;
@@ -103,6 +105,9 @@ assert.doesNotMatch(rendered, /data-source-agent-restart/);
 
 assert.equal(ui.sourceAgentManagementStatus(restartable, [{ type: "restart", state: "claimed" }]), "commanding");
 assert.equal(ui.sourceAgentManagementStatus(wcplus, [{ type: "upgrade", state: "claimed" }]), "upgrading");
+ui.sourceAgentManagementState.authorityPendingAgentIDs.add(restartable.agent_id);
+assert.equal(ui.sourceAgentManagementStatus(restartable, []), "commanding", "awaiting-authority state should be visible as an active operation");
+ui.sourceAgentManagementState.authorityPendingAgentIDs.delete(restartable.agent_id);
 assert.equal(ui.sourceAgentSafeError("harmless-looking raw failure"), "Worker 报告异常，详细信息已隐藏；请运行诊断并人工处理。");
 for (const [code, label] of Object.entries({
   login_required: "需要重新登录",
@@ -155,6 +160,7 @@ assert.equal(ui.sourceAgentManagementState.pendingAgentIDs.has("agent-a"), false
 assert.equal(ui.sourceAgentManagementState.pendingAgentIDs.has("agent-b"), true, "A completion must not unlock B");
 releaseB();
 await actionB;
+ui.sourceAgentManagementState.authorityPendingAgentIDs.clear();
 
 let sameAgentRequests = 0;
 let releaseSame;
@@ -165,6 +171,7 @@ await ui.runSourceAgentManagementAction("agent-a", async () => { sameAgentReques
 assert.equal(sameAgentRequests, 1, "same-agent in-flight actions must be deduplicated");
 releaseSame();
 await firstSame;
+ui.sourceAgentManagementState.authorityPendingAgentIDs.clear();
 
 let releaseAuthority;
 const authorityWait = new Promise((resolve) => { releaseAuthority = resolve; });
@@ -175,6 +182,7 @@ assert.equal(ui.sourceAgentManagementState.pendingAgentIDs.has("agent-authority"
 releaseAuthority();
 await authorityAction;
 ui.setManagementLoader(async () => {});
+ui.sourceAgentManagementState.authorityPendingAgentIDs.clear();
 
 ui.sourceAgentManagementState.commandsByAgent[restartable.agent_id] = [{ type: "restart", state: "queued" }];
 let queuedRestartRequests = 0;
@@ -193,6 +201,76 @@ ui.setApi(async (requestPath) => {
 await ui.createSourceAgentRestart(restartable.agent_id);
 await ui.createSourceAgentRestart(restartable.agent_id);
 assert.equal(restartPostCount, 1, "a queued restart must block a second restart POST");
+
+ui.restoreManagementLoader();
+const authorityAgent = { ...restartable, agent_id: "authority-worker", current_command_id: "" };
+ui.sourceAgentManagementState.agents = [authorityAgent];
+ui.sourceAgentManagementState.commandsByAgent = { [authorityAgent.agent_id]: [] };
+ui.sourceAgentManagementState.pendingAgentIDs.clear();
+ui.sourceAgentManagementState.authorityPendingAgentIDs.clear();
+context.window.location.pathname = "/sources/agents";
+ui.setApi(async (requestPath, options = {}) => {
+  if (requestPath.endsWith("/commands") && options.method === "POST") {
+    return { command: { id: "restart-authority", type: "restart", state: "queued" } };
+  }
+  if (requestPath === "/api/source-agents") throw new Error("authority refresh unavailable /private/detail");
+  throw new Error(`unexpected request ${requestPath}`);
+});
+await ui.createSourceAgentRestart(authorityAgent.agent_id);
+assert.equal(ui.sourceAgentManagementState.pendingAgentIDs.has(authorityAgent.agent_id), false);
+assert.equal(ui.sourceAgentManagementState.authorityPendingAgentIDs.has(authorityAgent.agent_id), true, "failed authority refresh must preserve the awaiting-authority lock");
+assert.equal(ui.sourceAgentManagementBusy(authorityAgent.agent_id), true);
+assert.equal(ui.sourceAgentManagementState.commandsByAgent[authorityAgent.agent_id][0].id, "restart-authority", "POST command response should immediately become a local authoritative lock");
+assert.match(app.innerHTML, /data-source-agent-restart[^>]*disabled/);
+assert.match(app.innerHTML, /操作已提交，但权威状态暂未确认；系统将自动重试。/, "failed authority refresh should announce safe retry guidance");
+
+ui.setApi(async (requestPath) => {
+  if (requestPath === "/api/source-agents") return { agents: [authorityAgent] };
+  if (requestPath === "/api/source-agent-artifacts?limit=100") return { artifacts: [] };
+  if (requestPath.includes("/commands?limit=10")) return { commands: [{ id: "restart-authority", type: "restart", state: "claimed" }] };
+  throw new Error(`unexpected request ${requestPath}`);
+});
+assert.equal(await ui.loadSourceAgentManagement({ silent: true, preserveActionOutcome: true }), true);
+assert.equal(ui.sourceAgentManagementState.authorityPendingAgentIDs.has(authorityAgent.agent_id), false, "one successful authority refresh should clear its awaiting-authority lock");
+assert.equal(ui.sourceAgentManagementBusy(authorityAgent.agent_id), true, "the active authoritative command should keep controls locked");
+
+const navigationAgent = { ...restartable, agent_id: "navigation-worker", current_command_id: "" };
+ui.sourceAgentManagementState.agents = [navigationAgent];
+ui.sourceAgentManagementState.commandsByAgent = { [navigationAgent.agent_id]: [] };
+let releaseNavigationPost;
+const navigationPost = new Promise((resolve) => { releaseNavigationPost = resolve; });
+let navigationGETs = 0;
+ui.setApi(async (requestPath, options = {}) => {
+  if (requestPath.endsWith("/commands") && options.method === "POST") return navigationPost;
+  navigationGETs += 1;
+  throw new Error(`unexpected management load ${requestPath}`);
+});
+context.window.location.pathname = "/sources/agents";
+const navigatingAction = ui.createSourceAgentRestart(navigationAgent.agent_id);
+await Promise.resolve();
+context.window.location.pathname = "/jobs";
+app.innerHTML = "jobs-page-sentinel";
+releaseNavigationPost({ command: { id: "restart-navigation", type: "restart", state: "queued" } });
+await navigatingAction;
+assert.equal(app.innerHTML, "jobs-page-sentinel", "POST completion after navigation must not repaint the Agent page");
+assert.equal(navigationGETs, 0, "POST completion after navigation must not start a management load");
+
+const failingAgent = { ...restartable, agent_id: "failing-worker", current_command_id: "" };
+ui.sourceAgentManagementState.agents = [failingAgent];
+ui.sourceAgentManagementState.commandsByAgent = { [failingAgent.agent_id]: [] };
+ui.sourceAgentManagementState.pendingAgentIDs.clear();
+ui.sourceAgentManagementState.authorityPendingAgentIDs.clear();
+context.window.location.pathname = "/sources/agents";
+ui.setApi(async (requestPath, options = {}) => {
+  if (requestPath.endsWith("/commands") && options.method === "POST") throw new Error("private upstream failure /secret/key");
+  throw new Error(`unexpected request ${requestPath}`);
+});
+await ui.createSourceAgentRestart(failingAgent.agent_id);
+assert.equal(ui.sourceAgentManagementState.pendingAgentIDs.has(failingAgent.agent_id), false);
+assert.equal(ui.sourceAgentManagementState.authorityPendingAgentIDs.has(failingAgent.agent_id), false);
+const liveStatus = app.innerHTML.match(/role="status" aria-live="polite">([^<]+)/)?.[1] || "";
+assert.equal(liveStatus, "操作提交失败，请稍后重试或运行诊断。", "POST failure should remain visible as safe live status copy");
+assert.doesNotMatch(liveStatus, /个 Agent|private|secret/, "POST failure must not be replaced by the Agent count summary or raw error");
 
 ui.sourceAgentManagementState.loading = "正在加载 Agent 状态";
 ui.renderSourceAgentOverview();

@@ -147,6 +147,9 @@ assert.ok(js.includes('bookWorker ? "" :'), "book workers should not expose unsu
 assert.ok(js.includes("commanding"), "non-upgrade commands should use an operation status rather than upgrading");
 assert.ok(js.includes("sourceAgentManagementSequence"), "stale management responses should be rejected");
 assert.ok(js.includes("pendingAgentIDs: new Set()"), "management actions should keep per-agent pending state");
+assert.ok(js.includes("authorityPendingAgentIDs: new Set()"), "submitted commands should stay locked until an authoritative refresh succeeds");
+assert.ok(js.includes("preserveActionOutcome"), "authority refresh should preserve action outcome copy");
+assert.ok(js.includes("actionMessage"), "action outcome should remain separate from inventory summary copy");
 assert.ok(js.includes("pendingAgentIDs.size"), "management polling should observe every pending agent");
 assert.ok(js.includes('role="status" aria-live="polite"'), "management action results should be announced accessibly");
 assert.ok(js.includes("clearTimeout(sourceAgentManagementPollTimer)"), "management polling should be bounded and replaceable");
