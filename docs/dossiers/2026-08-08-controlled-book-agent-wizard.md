@@ -318,3 +318,43 @@ Decision: PASS.
   restored the button, and rendered no raw provider URL.
 - Application browser logs were empty, including no favicon 404. Extension-only
   MetaMask and multiplex warnings were not reproduced.
+
+## Qwen Agent latency follow-up (2026-08-08)
+
+### Root cause and implementation
+
+- Repeated production traces for the relevant grounded-chat path ended at the
+  Package's 30-second model deadline, while retrieval completed and a previous
+  five-evidence request completed in 6.52 seconds.
+- Production-to-provider probes ruled out DNS, TCP, TLS, authorization, and
+  ordinary provider availability: an authenticated minimal `qwen3.7-max`
+  request with thinking disabled completed in about 0.61 seconds.
+- The ordinary book-analysis path already applies the shared Qwen 3.7
+  structured-output policy, but Agent Package chat only selected the model and
+  left `enable_thinking` unset. The provider therefore used its default
+  thinking behavior, whose latency tail intermittently exceeded the Package
+  deadline.
+- Agent Package chat now reuses that existing policy after model selection.
+  `qwen3.7-max` receives explicit `enable_thinking=false`; non-Qwen models keep
+  the field unset. Package `1.0.1`, its 30-second deadline, model policy,
+  retrieval scope, citations, cost cap, and publication record are unchanged.
+- Retry, timeout extension, undeclared model fallback, proxy changes, and
+  Package republication remain out of scope.
+
+### Local test and review gates (G3-G4)
+
+Decision: PASS.
+
+- A RED test first demonstrated that the Qwen Agent path did not set the
+  thinking flag. The production fix is one policy call, covered by a
+  `qwen3.7-max` assertion and a non-Qwen boundary assertion.
+- Focused tests and their race-enabled variants passed.
+- The Node 22.23 toolchain completed the desktop frontend production build,
+  bundle-size gate, all desktop smoke checks, and all production Web smoke
+  checks. The built entry remained 981,505 bytes.
+- Every repository shell smoke check, including managed Worker transaction,
+  rollback, install, upgrade, and uninstall scenarios, completed with an
+  explicit zero exit status. `go vet ./...` passed.
+- `go test ./... -timeout=300s -count=1` passed; `backend/app` completed in
+  99.128 seconds. Privacy, generated system-map drift, and whitespace checks
+  passed.
