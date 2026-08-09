@@ -323,6 +323,38 @@ func TestAgentPackageRuntimeChatUsesPinnedEvidencePolicyAndCitations(t *testing.
 	}
 }
 
+func TestAgentPackageRuntimeDisablesThinkingForQwenHybridModel(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store, pkg := agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
+		pkg.ModelPolicy.Fallbacks = []string{"qwen3.7-max"}
+	})
+	client := &fakeBookKnowledgeLLMClient{answer: "Grounded answer [citation:citation-1]"}
+	if _, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, Question: "What is grounded?",
+	}, client); err != nil {
+		t.Fatal(err)
+	}
+	if client.cfg.EnableThinking == nil || *client.cfg.EnableThinking {
+		t.Fatalf("enable_thinking = %v, want explicit false", client.cfg.EnableThinking)
+	}
+}
+
+func TestAgentPackageRuntimeLeavesThinkingUnsetForNonQwenModel(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store, pkg := agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
+		pkg.ModelPolicy.Fallbacks = []string{"MiniMax-M2.5"}
+	})
+	client := &fakeBookKnowledgeLLMClient{answer: "Grounded answer [citation:citation-1]"}
+	if _, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, Question: "What is grounded?",
+	}, client); err != nil {
+		t.Fatal(err)
+	}
+	if client.cfg.EnableThinking != nil {
+		t.Fatalf("enable_thinking = %v, want unset", client.cfg.EnableThinking)
+	}
+}
+
 func TestAgentPackageRuntimeChatRetrievesChineseNaturalLanguageQuestion(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
 	store := NewBookKnowledgeStore(t.TempDir())

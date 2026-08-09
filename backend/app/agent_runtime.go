@@ -354,6 +354,7 @@ func chatFinalizedAgentPackageWithClient(
 		}
 	}
 	cfg.Model = normalizedModel
+	applyStructuredQwenThinkingPolicy(&cfg)
 	promptProfile := pkg.PromptProfiles[0]
 	messages := buildAgentPackageMessages(pkg, promptProfile, question, search.Results)
 	if err := applyAgentRuntimeCostBudget(&cfg, messages, pkg.ModelPolicy.MaxCostUSD); err != nil {
