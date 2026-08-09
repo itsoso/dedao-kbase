@@ -933,14 +933,19 @@ func legacyBookKnowledgeJobPathBoundary(value string, index int) bool {
 		return true
 	}
 	previous, _ := utf8.DecodeLastRuneInString(value[:index])
-	return unicode.IsSpace(previous) || strings.ContainsRune(legacyBookKnowledgeJobPathBoundaryDelimiters, previous)
+	if previous == '/' || previous == '\\' {
+		return false
+	}
+	return unicode.IsSpace(previous) || unicode.IsPunct(previous) ||
+		strings.ContainsRune(legacyBookKnowledgeJobPathBoundaryDelimiters, previous)
 }
 
 func legacyBookKnowledgeJobWindowsAbsolutePath(value string) bool {
 	for index := 0; index+2 < len(value); index++ {
 		letter := value[index]
 		if ((letter >= 'a' && letter <= 'z') || (letter >= 'A' && letter <= 'Z')) &&
-			value[index+1] == ':' && (value[index+2] == '\\' || value[index+2] == '/') {
+			value[index+1] == ':' && (value[index+2] == '\\' || value[index+2] == '/') &&
+			legacyBookKnowledgeJobPathBoundary(value, index) {
 			return true
 		}
 	}
