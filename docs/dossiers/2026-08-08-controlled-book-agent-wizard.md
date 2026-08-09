@@ -430,3 +430,40 @@ Decision: PASS.
 - The browser recorded no new warning or error during both checks. Public and
   loopback health, installed binary hash, service state, restart count, and
   deployment-window journal all remained clean after acceptance.
+
+### Complete-answer follow-up
+
+- Completion review found that the first accepted grounded answer ended midway
+  through a sentence. A privacy-bounded provider diagnostic had reported
+  `finish_reason=length`; the runtime's conservative immutable cost ceiling was
+  working as designed, but the prompt did not bound answer verbosity.
+- Without changing the Package, model, cost ceiling, timeout, evidence scope, or
+  citation checks, the runtime now requests at most three short bullet points,
+  350 Chinese characters or 180 English words, and three citation IDs. It also
+  instructs the model to use only directly relevant evidence and finish every
+  sentence.
+- The constraint test failed before the prompt change and passed afterward;
+  focused race coverage passed. The supported Node frontend build, every
+  frontend/Web smoke, vet, full Go suite, system-map, privacy, and whitespace
+  gates passed locally. `backend/app` completed in 98.601 seconds.
+
+### Final production correction
+
+Decision: G5 and G6 PASS.
+
+- Deployed revision `9ad6b0519e2e5a9b81a333cba2c6d3dd1ea3c359` has archive
+  SHA-256 `f6a9a5c04c7cd59379adf0cf3fbfa84938eafcf3f0d2ccc478e2919642ca60e0`
+  and binary SHA-256
+  `2eb3587c38966d476bd8be3c8a1b06c887c343300eef37234f96d7cea305566d`.
+- Linux repeated dependency audit, frontend build and smoke checks, module
+  verification, vet, and the complete Go suite; `backend/app` completed in
+  74.317 seconds. Rollback assets are in batch
+  `direct-9ad6b05-20260809T025557Z`.
+- The same production question completed in 3.142 seconds as three complete
+  short bullet points with exactly three resolved citations. No answer ended
+  mid-sentence. The unrelated question abstained in 0.490 seconds before model
+  generation, and the browser recorded no new warning or error.
+- Public and loopback health report the exact revision; the service remains
+  active/running with `ExecMainStatus=0`, `NRestarts=0`, and no warning-or-higher
+  journal entry since replacement. The Package page returns HTTP 200 and the
+  anonymous API boundary remains HTTP 401.
