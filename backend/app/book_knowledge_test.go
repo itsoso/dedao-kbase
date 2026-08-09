@@ -20,6 +20,10 @@ import (
 
 const bookKnowledgeRootLockHelperEnv = "DEDAO_TEST_BOOK_PACKAGE_LOCK_HELPER"
 const bookKnowledgeDerivedLockHelperEnv = "DEDAO_TEST_BOOK_DERIVED_LOCK_HELPER"
+const bookKnowledgePublishCrashHelperEnv = "DEDAO_TEST_BOOK_PUBLISH_CRASH_HELPER"
+const bookKnowledgePublishCrashJobEnv = "DEDAO_TEST_BOOK_PUBLISH_CRASH_JOB"
+const bookKnowledgePublishCrashWorkerEnv = "DEDAO_TEST_BOOK_PUBLISH_CRASH_WORKER"
+const bookKnowledgePublishCrashPhaseEnv = "DEDAO_TEST_BOOK_PUBLISH_CRASH_PHASE"
 
 func TestBookKnowledgeContentHashIsStableAndTracksDurableContent(t *testing.T) {
 	pkg := sampleBookKnowledgePackageForExport()
@@ -178,6 +182,610 @@ func TestSavePackageContextPreservesDerivedBookArtifacts(t *testing.T) {
 	if err != nil || string(data) != "derived" {
 		t.Fatalf("derived artifact=%q err=%v", data, err)
 	}
+}
+
+func TestRepairMissingBookContentHashCannotOverwriteConcurrentPackage(t *testing.T) {
+	root := t.TempDir()
+	legacyStore := NewBookKnowledgeStore(root)
+	legacy := sampleBookKnowledgePackageForExport()
+	legacy.Book.BookID = "repair-race"
+	legacy.Book.Title = "Legacy"
+	legacy.Book.ContentHash = ""
+	if err := legacyStore.SavePackage(legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacyPublished, err := legacyStore.LoadPackage(legacy.Book.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyPublished.Book.ContentHash = ""
+	if err := writeJSONFile(legacyStore.BookManifestPath(legacy.Book.BookID), legacyPublished.Book); err != nil {
+		t.Fatal(err)
+	}
+	rootManifest, err := legacyStore.loadManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootManifest.Books[0].ContentHash = ""
+	if err := writeJSONFile(legacyStore.ManifestPath(), rootManifest); err != nil {
+		t.Fatal(err)
+	}
+
+	repairStore := NewBookKnowledgeStore(root)
+	workerStore := NewBookKnowledgeStore(root)
+	repairWaitingForWriteLock := make(chan struct{})
+	releaseRepair := make(chan struct{})
+	repairStore.beforePackageRootLock = func() {
+		close(repairWaitingForWriteLock)
+		<-releaseRepair
+	}
+	repairDone := make(chan error, 1)
+	go func() {
+		_, repairErr := repairStore.RepairMissingBookContentHash(legacy.Book.BookID)
+		repairDone <- repairErr
+	}()
+	<-repairWaitingForWriteLock
+
+	updated := legacy
+	updated.Book.Title = "Concurrent New Package"
+	updated.Book.ContentHash = ""
+	updated.Chunks = append([]BookKnowledgeChunk(nil), legacy.Chunks...)
+	updated.Chunks[0].Text = "new worker content"
+	if err := workerStore.SavePackage(updated); err != nil {
+		t.Fatal(err)
+	}
+	published, err := workerStore.LoadPackage(updated.Book.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.SaveAnalysisManifest(BookAnalysisManifest{
+		BookID: updated.Book.BookID, ContentHash: published.Book.ContentHash, Status: BookAnalysisReady,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := workerStore.SaveBookQualityReport(BookQualityReport{
+		BookID: updated.Book.BookID, ContentHash: published.Book.ContentHash,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseRepair)
+	if err := <-repairDone; err == nil || !strings.Contains(err.Error(), "already has content hash") {
+		t.Fatalf("RepairMissingBookContentHash error=%v, want concurrent package rejection", err)
+	}
+
+	got, err := NewBookKnowledgeStore(root).LoadPackage(updated.Book.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Book.Title != updated.Book.Title || got.Chunks[0].Text != updated.Chunks[0].Text ||
+		got.Book.ContentHash != published.Book.ContentHash {
+		t.Fatalf("repair overwrote concurrent package: %#v", got)
+	}
+	if _, err := NewBookKnowledgeStore(root).LoadAnalysisManifest(updated.Book.BookID); err != nil {
+		t.Fatalf("repair removed concurrent analysis: %v", err)
+	}
+	if _, err := NewBookKnowledgeStore(root).LoadBookQualityReport(updated.Book.BookID); err != nil {
+		t.Fatalf("repair removed concurrent quality report: %v", err)
+	}
+}
+
+func TestReconcileCompletesFencedPublishKilledAfterBookInstall(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 293)
+	original := publishCrashTestPackage(job, "Original Package")
+	if err := store.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextBookKnowledgeJob("crash-worker", time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBookKnowledgePublishCrashSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		bookKnowledgePublishCrashHelperEnv+"="+root,
+		bookKnowledgePublishCrashJobEnv+"="+job.ID,
+		bookKnowledgePublishCrashWorkerEnv+"=crash-worker",
+		bookKnowledgePublishCrashPhaseEnv+"=book-installed",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForSubprocessLine(t, lines, "publish-book-installed")
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("crash helper exited successfully, want killed process")
+	}
+
+	installed, err := NewBookKnowledgeStore(root).LoadPackage("293")
+	if err != nil || installed.Book.Title != "Crash Replacement" {
+		t.Fatalf("installed package=%#v err=%v stderr=%s", installed, err, stderr.String())
+	}
+	books, err := NewBookKnowledgeStore(root).ListBooks()
+	if err != nil || len(books) != 1 || books[0].Title != original.Book.Title {
+		t.Fatalf("pre-recovery manifest books=%#v err=%v", books, err)
+	}
+	transactionMatches, err := filepath.Glob(filepath.Join(root, bookKnowledgePublishTransactionsDir, "*"))
+	if err != nil || len(transactionMatches) != 1 {
+		t.Fatalf("durable transaction matches=%v err=%v", transactionMatches, err)
+	}
+	transactionInfo, err := os.Stat(transactionMatches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transactionInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("transaction mode=%v, want 0700", transactionInfo.Mode().Perm())
+	}
+	journalInfo, err := os.Stat(filepath.Join(transactionMatches[0], bookKnowledgePublishJournalFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if journalInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("journal mode=%v, want 0600", journalInfo.Mode().Perm())
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+	count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	recovered, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || recovered.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("recovered job=%#v err=%v", recovered, err)
+	}
+	books, err = NewBookKnowledgeStore(root).ListBooks()
+	if err != nil || len(books) != 1 || books[0].Title != "Crash Replacement" {
+		t.Fatalf("repaired manifest books=%#v err=%v", books, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
+	count, err = NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 0 {
+		t.Fatalf("idempotent reconcile count=%d err=%v", count, err)
+	}
+}
+
+func TestReconcileRestoresOldPackageWhenKilledPublishCannotResume(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 294)
+	original := publishCrashTestPackage(job, "Original Before Backup Crash")
+	if err := store.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextBookKnowledgeJob("backup-crash-worker", time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBookKnowledgePublishCrashSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		bookKnowledgePublishCrashHelperEnv+"="+root,
+		bookKnowledgePublishCrashJobEnv+"="+job.ID,
+		bookKnowledgePublishCrashWorkerEnv+"=backup-crash-worker",
+		bookKnowledgePublishCrashPhaseEnv+"=book-backed-up",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForSubprocessLine(t, lines, "publish-book-backed-up")
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("backup crash helper exited successfully, want killed process")
+	}
+	if _, err := os.Stat(store.BookDir("294")); !os.IsNotExist(err) {
+		t.Fatalf("book directory after backup crash: %v, stderr=%s", err, stderr.String())
+	}
+	removeCrashPublishStagedBook(t, root, "Crash Replacement")
+
+	setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+	count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	recovered, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || recovered.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("recovered job=%#v err=%v", recovered, err)
+	}
+	got, err := NewBookKnowledgeStore(root).LoadPackage("294")
+	if err != nil || got.Book.Title != original.Book.Title {
+		t.Fatalf("restored original package=%#v err=%v", got, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
+}
+
+func TestPendingCrashedPublishRejectsSameBookSaveAndPreservesDifferentBook(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 295)
+	original := publishCrashTestPackage(job, "Original Before Superseding Save")
+	if err := store.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextBookKnowledgeJob("superseded-crash-worker", time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBookKnowledgePublishCrashSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		bookKnowledgePublishCrashHelperEnv+"="+root,
+		bookKnowledgePublishCrashJobEnv+"="+job.ID,
+		bookKnowledgePublishCrashWorkerEnv+"=superseded-crash-worker",
+		bookKnowledgePublishCrashPhaseEnv+"=book-backed-up",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForSubprocessLine(t, lines, "publish-book-backed-up")
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("superseded crash helper exited successfully, want killed process")
+	}
+
+	superseding := publishCrashTestPackage(job, "Superseding Package")
+	superseding.Chunks[0].Text = "superseding worker content"
+	if err := NewBookKnowledgeStore(root).SavePackage(superseding); err == nil ||
+		!strings.Contains(err.Error(), "pending book publish transaction") {
+		t.Fatalf("superseding SavePackage error=%v, want pending transaction rejection; stderr=%s", err, stderr.String())
+	}
+	different := sampleBookKnowledgePackageForExport()
+	different.Book.BookID = "different-during-crash"
+	different.Book.Title = "Different Book Preserved"
+	different.Book.ContentHash = ""
+	if err := NewBookKnowledgeStore(root).SavePackage(different); err != nil {
+		t.Fatalf("different-book SavePackage: %v", err)
+	}
+	differentPublished, err := NewBookKnowledgeStore(root).LoadPackage(different.Book.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+	count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	recovered, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || recovered.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("recovered job=%#v err=%v", recovered, err)
+	}
+	got, err := NewBookKnowledgeStore(root).LoadPackage("295")
+	if err != nil || got.Book.Title != "Crash Replacement" {
+		t.Fatalf("recovered crashed package=%#v err=%v", got, err)
+	}
+	books, err := NewBookKnowledgeStore(root).ListBooks()
+	if err != nil || len(books) != 2 {
+		t.Fatalf("root manifest books=%#v err=%v", books, err)
+	}
+	manifestHashes := map[string]string{}
+	for _, book := range books {
+		manifestHashes[book.BookID] = book.ContentHash
+	}
+	if manifestHashes["295"] != got.Book.ContentHash ||
+		manifestHashes[different.Book.BookID] != differentPublished.Book.ContentHash {
+		t.Fatalf("recovery replaced current root manifest: %#v", books)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
+}
+
+func TestCorruptPublishJournalBlocksPackageWritesWithoutDeletingEvidence(t *testing.T) {
+	root := t.TempDir()
+	transactionRoot := filepath.Join(root, bookKnowledgePublishTransactionsDir, "corrupt-transaction")
+	if err := os.MkdirAll(transactionRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := filepath.Join(transactionRoot, bookKnowledgePublishJournalFileName)
+	if err := os.WriteFile(journalPath, []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "blocked-by-corrupt-journal"
+	pkg.Book.ContentHash = ""
+	err := NewBookKnowledgeStore(root).SavePackage(pkg)
+	if err == nil || !strings.Contains(err.Error(), "corrupt book publish transaction") {
+		t.Fatalf("SavePackage error=%v, want corrupt transaction rejection", err)
+	}
+	data, readErr := os.ReadFile(journalPath)
+	if readErr != nil || string(data) != "{corrupt" {
+		t.Fatalf("corrupt journal evidence=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(NewBookKnowledgeStore(root).BookDir(pkg.Book.BookID)); !os.IsNotExist(statErr) {
+		t.Fatalf("blocked package path error=%v, want not exist", statErr)
+	}
+}
+
+func TestReconcileCleansExactPreparingTransactionWithoutChangingOldPackage(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 296)
+	original := publishCrashTestPackage(job, "Original Before Preparing Crash")
+	if err := store.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextBookKnowledgeJob("preparing-crash-worker", time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+	replacement := publishCrashTestPackage(job, "Preparing Replacement")
+	hash, err := BookKnowledgeContentHash(replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, nonce, err := store.fenceBookKnowledgeJobPackageCommit(
+		job.ID, "preparing-crash-worker", replacement.Book.BookID, hash, bookJobWorkerCommitLeaseWindow,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := bookKnowledgeJobCommitMarker{
+		Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: nonce,
+		BookID: replacement.Book.BookID, ContentHash: hash,
+	}
+	preparingRoot := bookKnowledgePublishTransactionPath(root, marker) + ".preparing"
+	if err := os.MkdirAll(preparingRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(preparingRoot, bookKnowledgePublishJournalFileName), []byte("{partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+	count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	recovered, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || recovered.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("preparing crash job=%#v err=%v", recovered, err)
+	}
+	got, err := NewBookKnowledgeStore(root).LoadPackage("296")
+	if err != nil || got.Book.Title != original.Book.Title {
+		t.Fatalf("original package=%#v err=%v", got, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
+}
+
+func TestReconcileRetainsAmbiguousPublishTransactionEvidence(t *testing.T) {
+	for index, stagedValid := range []bool{true, false} {
+		name := "staged_invalid"
+		if stagedValid {
+			name = "staged_valid"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			store := NewBookKnowledgeStore(root)
+			ebookID := 297 + index
+			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, ebookID)
+			original := publishCrashTestPackage(job, "Original Before Ambiguous State")
+			if err := store.SavePackage(original); err != nil {
+				t.Fatal(err)
+			}
+			workerID := fmt.Sprintf("ambiguous-worker-%d", index)
+			claimed, err := store.ClaimNextBookKnowledgeJob(workerID, time.Minute)
+			if err != nil || claimed == nil || claimed.ID != job.ID {
+				t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+			}
+			killBookKnowledgePublishHelper(t, root, job.ID, workerID, "book-backed-up", "publish-book-backed-up")
+			if !stagedValid {
+				removeCrashPublishStagedBook(t, root, "Crash Replacement")
+			}
+
+			externalRoot := t.TempDir()
+			externalStore := NewBookKnowledgeStore(externalRoot)
+			external := publishCrashTestPackage(job, "Externally Installed Package")
+			if err := externalStore.SavePackage(external); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(externalStore.BookDir(external.Book.BookID), store.BookDir(external.Book.BookID)); err != nil {
+				t.Fatal(err)
+			}
+			setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+			count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+			if err == nil || count != 0 || !strings.Contains(err.Error(), "ambiguous book publish transaction") {
+				t.Fatalf("reconcile count=%d err=%v, want retained ambiguous state", count, err)
+			}
+			running, err := store.LoadBookKnowledgeJob(job.ID)
+			if err != nil || running.Status != BookKnowledgeJobStatusRunning {
+				t.Fatalf("ambiguous job=%#v err=%v", running, err)
+			}
+			assertBookJobCommitReceiptCount(t, store, job.ID, 1)
+			matches, err := filepath.Glob(filepath.Join(root, bookKnowledgePublishTransactionsDir, "*", "backup-book"))
+			if err != nil || len(matches) != 1 {
+				t.Fatalf("retained backup matches=%v err=%v", matches, err)
+			}
+			got, err := NewBookKnowledgeStore(root).LoadPackage(external.Book.BookID)
+			if err != nil || got.Book.Title != external.Book.Title {
+				t.Fatalf("external package=%#v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestBookKnowledgePublishCrashSubprocessHelper(t *testing.T) {
+	root := os.Getenv(bookKnowledgePublishCrashHelperEnv)
+	if root == "" {
+		return
+	}
+	jobID := os.Getenv(bookKnowledgePublishCrashJobEnv)
+	workerID := os.Getenv(bookKnowledgePublishCrashWorkerEnv)
+	store := NewBookKnowledgeStore(root)
+	job, err := store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	switch os.Getenv(bookKnowledgePublishCrashPhaseEnv) {
+	case "book-backed-up":
+		store.afterPackageBookBackup = func() error {
+			fmt.Println("publish-book-backed-up")
+			_ = os.Stdout.Sync()
+			select {}
+		}
+	default:
+		store.afterPackageBookInstall = func() error {
+			fmt.Println("publish-book-installed")
+			_ = os.Stdout.Sync()
+			select {}
+		}
+	}
+	pkg := publishCrashTestPackage(job, "Crash Replacement")
+	ctx := contextWithBookKnowledgePackageCommitFence(context.Background(), bookKnowledgePackageCommitFence{
+		prepare: func(_ context.Context, candidate BookKnowledgePackage) (bookKnowledgeJobCommitMarker, error) {
+			_, nonce, fenceErr := store.fenceBookKnowledgeJobPackageCommit(
+				job.ID, workerID, candidate.Book.BookID, candidate.Book.ContentHash, bookJobWorkerCommitLeaseWindow,
+			)
+			return bookKnowledgeJobCommitMarker{
+				Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: nonce,
+				BookID: candidate.Book.BookID, ContentHash: candidate.Book.ContentHash,
+			}, fenceErr
+		},
+		discard: func(candidate BookKnowledgePackage, marker bookKnowledgeJobCommitMarker) error {
+			return store.discardBookKnowledgeJobCommitReceipt(
+				job.ID, workerID, candidate.Book.BookID, candidate.Book.ContentHash, marker.PublishNonce,
+			)
+		},
+	})
+	if err := store.SavePackageContext(ctx, pkg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func publishCrashTestPackage(job BookKnowledgeJob, title string) BookKnowledgePackage {
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = fmt.Sprintf("%d", job.EbookID)
+	pkg.Book.DedaoID = job.EbookID
+	pkg.Book.EnID = job.EbookEnID
+	pkg.Book.Title = title
+	pkg.Book.ContentHash = ""
+	pkg.Chunks = append([]BookKnowledgeChunk(nil), pkg.Chunks...)
+	pkg.Chunks[0].BookID = pkg.Book.BookID
+	pkg.Chunks[0].Text = title
+	return pkg
+}
+
+func killBookKnowledgePublishHelper(t *testing.T, root, jobID, workerID, phase, signal string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestBookKnowledgePublishCrashSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(),
+		bookKnowledgePublishCrashHelperEnv+"="+root,
+		bookKnowledgePublishCrashJobEnv+"="+jobID,
+		bookKnowledgePublishCrashWorkerEnv+"="+workerID,
+		bookKnowledgePublishCrashPhaseEnv+"="+phase,
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if cmd.Process != nil && cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForSubprocessLine(t, lines, signal)
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatalf("publish crash helper exited successfully, want killed process; stderr=%s", stderr.String())
+	}
+}
+
+func assertNoBookKnowledgePublishResidue(t *testing.T, root string) {
+	t.Helper()
+	for _, pattern := range []string{".book-package-*", ".book-publish-transactions/*"} {
+		matches, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil || len(matches) != 0 {
+			t.Fatalf("publish residue for %q: %v, err=%v", pattern, matches, err)
+		}
+	}
+}
+
+func removeCrashPublishStagedBook(t *testing.T, root, title string) {
+	t.Helper()
+	patterns := []string{".book-package-*", ".book-publish-transactions/*"}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range matches {
+			candidate := filepath.Join(match, "book")
+			var book BookKnowledgeBook
+			if err := readJSONFile(filepath.Join(candidate, "manifest.json"), &book); err != nil {
+				continue
+			}
+			if book.Title == title {
+				if err := os.RemoveAll(candidate); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+		}
+	}
+	t.Fatal("crashed publish staging book not found")
 }
 
 func TestSavePackageContextSerializesIndependentStoresWithoutLosingManifestBooks(t *testing.T) {

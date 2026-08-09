@@ -1011,7 +1011,8 @@ func TestReconcileRejectsCommitReceiptWhenPublishedPackageVerificationFails(t *t
 }
 
 func TestBookJobWorkerDiscardsCommitReceiptWhenPackagePublishRollsBack(t *testing.T) {
-	store := NewBookKnowledgeStore(t.TempDir())
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
 	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 287)
 	store.afterPackageBookInstall = func() error { return errors.New("injected package publish failure") }
 	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
@@ -1031,10 +1032,12 @@ func TestBookJobWorkerDiscardsCommitReceiptWhenPackagePublishRollsBack(t *testin
 		t.Fatalf("failed job=%#v err=%v", loaded, err)
 	}
 	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
 }
 
 func TestBookJobWorkerCompletesFencedPackageAndDeletesReceipt(t *testing.T) {
-	store := NewBookKnowledgeStore(t.TempDir())
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
 	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 288)
 	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
 		pkg := sampleBookKnowledgePackageForExport()
@@ -1060,6 +1063,76 @@ func TestBookJobWorkerCompletesFencedPackageAndDeletesReceipt(t *testing.T) {
 		t.Fatalf("completed job=%#v err=%v", loaded, err)
 	}
 	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
+}
+
+func TestCommittedTransactionResidueSelfCleansAfterCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 299)
+	cleanupCalls := 0
+	store.cleanupPackageTransaction = func(string) error {
+		cleanupCalls++
+		return errors.New("injected committed transaction cleanup failure")
+	}
+	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		pkg := publishCrashTestPackage(claimed, "Committed With Cleanup Residue")
+		if err := store.SavePackageContext(ctx, pkg); err != nil {
+			return nil, err
+		}
+		return map[string]any{
+			"ebook_id": claimed.EbookID, "ebook_enid": claimed.EbookEnID,
+			"download_type": 1, "knowledge_book_id": pkg.Book.BookID, "title": pkg.Book.Title,
+		}, nil
+	})
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed || cleanupCalls != 1 {
+		t.Fatalf("RunOnce processed=%t cleanupCalls=%d err=%v", processed, cleanupCalls, err)
+	}
+	completed, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || completed.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("completed job=%#v err=%v", completed, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	residue, err := filepath.Glob(filepath.Join(root, bookKnowledgePublishTransactionsDir, "*"))
+	if err != nil || len(residue) != 1 {
+		t.Fatalf("committed transaction residue=%v err=%v", residue, err)
+	}
+
+	store.cleanupPackageTransaction = nil
+	committedPackage, err := NewBookKnowledgeStore(root).LoadPackage("299")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.loadManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Books[0].Title = "Mismatched Metadata With Same Hash"
+	if err := writeJSONFile(store.ManifestPath(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	updated := publishCrashTestPackage(job, "Updated After Cleanup Residue")
+	if err := NewBookKnowledgeStore(root).SavePackage(updated); err == nil ||
+		!strings.Contains(err.Error(), "pending book publish transaction") {
+		t.Fatalf("SavePackage with mismatched manifest error=%v, want pending transaction", err)
+	}
+	residue, err = filepath.Glob(filepath.Join(root, bookKnowledgePublishTransactionsDir, "*"))
+	if err != nil || len(residue) != 1 {
+		t.Fatalf("metadata mismatch removed transaction residue=%v err=%v", residue, err)
+	}
+	manifest.Books[0] = committedPackage.Book
+	if err := writeJSONFile(store.ManifestPath(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewBookKnowledgeStore(root).SavePackage(updated); err != nil {
+		t.Fatalf("SavePackage after committed residue: %v", err)
+	}
+	got, err := NewBookKnowledgeStore(root).LoadPackage("299")
+	if err != nil || got.Book.Title != updated.Book.Title {
+		t.Fatalf("updated package=%#v err=%v", got, err)
+	}
+	assertNoBookKnowledgePublishResidue(t, root)
 }
 
 func TestBookKnowledgeJobRenewalRetainsLongerCommitFenceLease(t *testing.T) {

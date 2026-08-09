@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,9 +29,21 @@ const (
 	bookKnowledgeRootLockRetry           = 10 * time.Millisecond
 	bookKnowledgeJobCommitMarkerFileName = ".book-job-commit.json"
 	bookKnowledgeJobCommitMarkerVersion  = "1"
+	bookKnowledgePublishTransactionsDir  = ".book-publish-transactions"
+	bookKnowledgePublishJournalFileName  = "transaction.json"
+	bookKnowledgePublishJournalVersion   = "1"
+	bookKnowledgePublishPhasePreparing   = "preparing"
+	bookKnowledgePublishPhasePrepared    = "prepared"
+	bookKnowledgePublishPhaseBackedUp    = "book_backed_up"
+	bookKnowledgePublishPhaseInstalled   = "book_installed"
 )
 
-var errBookKnowledgeJobCommitMarkerInvalid = errors.New("invalid book job commit marker")
+var (
+	errBookKnowledgeJobCommitMarkerInvalid = errors.New("invalid book job commit marker")
+	errBookKnowledgePublishPending         = errors.New("pending book publish transaction")
+	errBookKnowledgePublishCorrupt         = errors.New("corrupt book publish transaction")
+	errBookKnowledgePublishAmbiguous       = errors.New("ambiguous book publish transaction")
+)
 
 type BookKnowledgeBook struct {
 	BookID        string `json:"book_id"`
@@ -178,7 +191,9 @@ type BookKnowledgeStore struct {
 	afterPackageManifestRead  func()
 	beforePackagePublish      func()
 	afterPackagePublishGate   func()
+	afterPackageBookBackup    func() error
 	afterPackageBookInstall   func() error
+	cleanupPackageTransaction func(string) error
 }
 
 type bookKnowledgePackageCommitFence struct {
@@ -192,6 +207,13 @@ type bookKnowledgeJobCommitMarker struct {
 	PublishNonce string `json:"publish_nonce"`
 	BookID       string `json:"book_id"`
 	ContentHash  string `json:"content_hash"`
+}
+
+type bookKnowledgePublishJournal struct {
+	Version     string                       `json:"version"`
+	Marker      bookKnowledgeJobCommitMarker `json:"marker"`
+	Phase       string                       `json:"phase"`
+	BookExisted bool                         `json:"book_existed"`
 }
 
 type bookKnowledgePackageCommitFenceContextKey struct{}
@@ -282,9 +304,15 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 		return err
 	}
 	defer rootLock.Close()
+	return s.savePackageContextUnlocked(ctx, pkg)
+}
 
+func (s *BookKnowledgeStore) savePackageContextUnlocked(ctx context.Context, pkg BookKnowledgePackage) (returnErr error) {
 	if strings.TrimSpace(pkg.Book.BookID) == "" {
 		return fmt.Errorf("book knowledge package missing book_id")
+	}
+	if err := rejectPendingBookKnowledgePublishTransaction(s.root, pkg.Book.BookID); err != nil {
+		return err
 	}
 	if strings.TrimSpace(pkg.Book.Title) == "" {
 		pkg.Book.Title = pkg.Book.BookID
@@ -337,11 +365,47 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	stagingRoot, err := os.MkdirTemp(s.root, ".book-package-")
+	fence, hasFence := bookKnowledgePackageCommitFenceFromContext(ctx)
+	var commitMarker bookKnowledgeJobCommitMarker
+	receiptActive := false
+	transactionCreated := false
+	if hasFence {
+		commitMarker, err = fence.prepare(ctx, pkg)
+		if err != nil {
+			return err
+		}
+		receiptActive = true
+		defer func() {
+			if !receiptActive {
+				return
+			}
+			if transactionCreated {
+				if cleanupErr := cleanupBookKnowledgePublishTransactionArtifacts(s.root, commitMarker); cleanupErr != nil {
+					returnErr = errors.Join(returnErr, fmt.Errorf("clean package publish transaction: %w", cleanupErr))
+					return
+				}
+			}
+			if fence.discard == nil {
+				return
+			}
+			if discardErr := fence.discard(pkg, commitMarker); discardErr != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("discard package commit receipt: %w", discardErr))
+			}
+		}()
+	}
+	var stagingRoot string
+	if hasFence {
+		stagingRoot, err = createBookKnowledgePublishTransaction(s.root, commitMarker)
+	} else {
+		stagingRoot, err = os.MkdirTemp(s.root, ".book-package-")
+	}
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(stagingRoot)
+	transactionCreated = hasFence
+	if !hasFence {
+		defer os.RemoveAll(stagingRoot)
+	}
 	stagedBookDir := filepath.Join(stagingRoot, "book")
 	if err := os.MkdirAll(stagedBookDir, os.ModePerm); err != nil {
 		return err
@@ -381,40 +445,54 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 	if err := writeFileAtomically(stagedManifest, manifestJSON); err != nil {
 		return err
 	}
+	if hasFence {
+		if err := writeBookKnowledgeJobCommitMarker(stagedBookDir, commitMarker); err != nil {
+			return err
+		}
+		journal := bookKnowledgePublishJournal{
+			Version: bookKnowledgePublishJournalVersion, Marker: commitMarker, Phase: bookKnowledgePublishPhasePrepared,
+		}
+		if err := writeBookKnowledgePublishJournal(stagingRoot, journal); err != nil {
+			return err
+		}
+	}
 	if s.beforePackagePublish != nil {
 		s.beforePackagePublish()
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	fence, hasFence := bookKnowledgePackageCommitFenceFromContext(ctx)
-	var commitMarker bookKnowledgeJobCommitMarker
-	if hasFence {
-		commitMarker, err = fence.prepare(ctx, pkg)
-		if err != nil {
-			return err
-		}
-		if err := writeBookKnowledgeJobCommitMarker(stagedBookDir, commitMarker); err != nil {
-			if fence.discard != nil {
-				if discardErr := fence.discard(pkg, commitMarker); discardErr != nil {
-					return errors.Join(err, fmt.Errorf("discard package commit receipt: %w", discardErr))
-				}
-			}
-			return err
-		}
-	}
 	if s.afterPackagePublishGate != nil {
 		s.afterPackagePublishGate()
 	}
-	publishErr := publishBookKnowledgePackage(
-		stagedBookDir, s.BookDir(pkg.Book.BookID), stagedManifest, s.ManifestPath(), s.afterPackageBookInstall,
-	)
-	if publishErr != nil && hasFence && fence.discard != nil {
-		if discardErr := fence.discard(pkg, commitMarker); discardErr != nil {
-			return errors.Join(publishErr, fmt.Errorf("discard package commit receipt: %w", discardErr))
+	var publishErr error
+	if hasFence {
+		publishErr = publishBookKnowledgePackageTransaction(
+			stagingRoot, s.BookDir(pkg.Book.BookID), s.ManifestPath(),
+			s.afterPackageBookBackup, s.afterPackageBookInstall,
+		)
+	} else {
+		publishErr = publishBookKnowledgePackage(
+			stagedBookDir, s.BookDir(pkg.Book.BookID), stagedManifest, s.ManifestPath(),
+			s.afterPackageBookBackup, s.afterPackageBookInstall,
+		)
+	}
+	if publishErr != nil {
+		return publishErr
+	}
+	receiptActive = false
+	if hasFence {
+		cleanup := cleanupBookKnowledgePublishTransaction
+		if s.cleanupPackageTransaction != nil {
+			cleanup = s.cleanupPackageTransaction
+		}
+		if err := cleanup(stagingRoot); err != nil {
+			// The package and root manifest are already committed. Keep the exact journal as the
+			// recovery handle; a later publisher verifies the complete final state before cleaning it.
+			return nil
 		}
 	}
-	return publishErr
+	return nil
 }
 
 func (s *BookKnowledgeStore) acquireBookKnowledgeRootLock(ctx context.Context) (*flock.Flock, error) {
@@ -481,10 +559,8 @@ func bookKnowledgeJobCommitMarkerPath(bookDir string) string {
 }
 
 func writeBookKnowledgeJobCommitMarker(bookDir string, marker bookKnowledgeJobCommitMarker) error {
-	if marker.Version != bookKnowledgeJobCommitMarkerVersion || strings.TrimSpace(marker.JobID) == "" ||
-		strings.TrimSpace(marker.PublishNonce) == "" || strings.TrimSpace(marker.BookID) == "" ||
-		strings.TrimSpace(marker.ContentHash) == "" {
-		return errBookKnowledgeJobCommitMarkerInvalid
+	if err := validateBookKnowledgeJobCommitMarker(marker); err != nil {
+		return err
 	}
 	payload, err := encodeJSONFile(marker)
 	if err != nil {
@@ -603,8 +679,451 @@ func copyBookKnowledgeFileContext(ctx context.Context, source, target string, mo
 	return nil
 }
 
+func bookKnowledgePublishTransactionPath(root string, marker bookKnowledgeJobCommitMarker) string {
+	digest := sha256.Sum256([]byte(marker.JobID + "\x00" + marker.PublishNonce))
+	return filepath.Join(root, bookKnowledgePublishTransactionsDir, hex.EncodeToString(digest[:]))
+}
+
+func bookKnowledgePublishTransactionPreparingPath(root string, marker bookKnowledgeJobCommitMarker) string {
+	return bookKnowledgePublishTransactionPath(root, marker) + ".preparing"
+}
+
+func createBookKnowledgePublishTransaction(root string, marker bookKnowledgeJobCommitMarker) (string, error) {
+	if err := validateBookKnowledgeJobCommitMarker(marker); err != nil {
+		return "", err
+	}
+	transactionsRoot := filepath.Join(root, bookKnowledgePublishTransactionsDir)
+	if err := os.MkdirAll(transactionsRoot, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(transactionsRoot, 0o700); err != nil {
+		return "", err
+	}
+	transactionRoot := bookKnowledgePublishTransactionPath(root, marker)
+	preparingRoot := bookKnowledgePublishTransactionPreparingPath(root, marker)
+	if err := os.Mkdir(preparingRoot, 0o700); err != nil {
+		return "", err
+	}
+	journal := bookKnowledgePublishJournal{
+		Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhasePreparing,
+	}
+	if err := writeBookKnowledgePublishJournal(preparingRoot, journal); err != nil {
+		_ = os.RemoveAll(preparingRoot)
+		return "", err
+	}
+	if err := os.Rename(preparingRoot, transactionRoot); err != nil {
+		_ = os.RemoveAll(preparingRoot)
+		return "", err
+	}
+	return transactionRoot, nil
+}
+
+func validateBookKnowledgeJobCommitMarker(marker bookKnowledgeJobCommitMarker) error {
+	if marker.Version != bookKnowledgeJobCommitMarkerVersion || strings.TrimSpace(marker.JobID) == "" ||
+		strings.TrimSpace(marker.PublishNonce) == "" || strings.TrimSpace(marker.BookID) == "" ||
+		strings.TrimSpace(marker.ContentHash) == "" {
+		return errBookKnowledgeJobCommitMarkerInvalid
+	}
+	return nil
+}
+
+func writeBookKnowledgePublishJournal(transactionRoot string, journal bookKnowledgePublishJournal) error {
+	if err := validateBookKnowledgePublishJournal(journal); err != nil {
+		return err
+	}
+	payload, err := encodeJSONFile(journal)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(transactionRoot, bookKnowledgePublishJournalFileName)
+	if err := writeFileAtomically(path, payload); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func readBookKnowledgePublishJournal(transactionRoot string) (bookKnowledgePublishJournal, error) {
+	var journal bookKnowledgePublishJournal
+	file, err := os.Open(filepath.Join(transactionRoot, bookKnowledgePublishJournalFileName))
+	if err != nil {
+		return journal, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&journal); err != nil {
+		return bookKnowledgePublishJournal{}, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return bookKnowledgePublishJournal{}, fmt.Errorf("invalid trailing book publish journal data")
+	}
+	if err := validateBookKnowledgePublishJournal(journal); err != nil {
+		return bookKnowledgePublishJournal{}, err
+	}
+	return journal, nil
+}
+
+func validateBookKnowledgePublishJournal(journal bookKnowledgePublishJournal) error {
+	if journal.Version != bookKnowledgePublishJournalVersion || validateBookKnowledgeJobCommitMarker(journal.Marker) != nil {
+		return fmt.Errorf("invalid book publish transaction journal")
+	}
+	switch journal.Phase {
+	case bookKnowledgePublishPhasePreparing, bookKnowledgePublishPhasePrepared,
+		bookKnowledgePublishPhaseBackedUp, bookKnowledgePublishPhaseInstalled:
+		return nil
+	default:
+		return fmt.Errorf("invalid book publish transaction phase %q", journal.Phase)
+	}
+}
+
+func rejectPendingBookKnowledgePublishTransaction(root, bookID string) error {
+	bookID = sanitizeBookKnowledgeID(bookID)
+	transactionsRoot := filepath.Join(root, bookKnowledgePublishTransactionsDir)
+	entries, err := os.ReadDir(transactionsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		journal, err := readBookKnowledgePublishJournal(filepath.Join(transactionsRoot, entry.Name()))
+		if err != nil {
+			return fmt.Errorf("%w: journal cannot be verified", errBookKnowledgePublishCorrupt)
+		}
+		transactionRoot := filepath.Join(transactionsRoot, entry.Name())
+		committed, err := verifyCommittedBookKnowledgePublishTransaction(root, journal)
+		if err != nil {
+			return fmt.Errorf("%w: committed state cannot be verified", errBookKnowledgePublishCorrupt)
+		}
+		if committed {
+			if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+				return fmt.Errorf("clean committed book publish transaction: %w", err)
+			}
+			continue
+		}
+		if sanitizeBookKnowledgeID(journal.Marker.BookID) == bookID {
+			return fmt.Errorf("%w for book %q", errBookKnowledgePublishPending, bookID)
+		}
+	}
+	return nil
+}
+
+func verifyCommittedBookKnowledgePublishTransaction(root string, journal bookKnowledgePublishJournal) (bool, error) {
+	bookDir := filepath.Join(root, "books", sanitizeBookKnowledgeID(journal.Marker.BookID))
+	marker, err := readBookKnowledgeJobCommitMarker(bookDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errBookKnowledgeJobCommitMarkerInvalid) {
+			return false, nil
+		}
+		return false, err
+	}
+	if marker != journal.Marker {
+		return false, nil
+	}
+	pkg, err := loadBookKnowledgePackageFromDirectory(bookDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if pkg.Book.BookID != marker.BookID || pkg.Book.ContentHash != marker.ContentHash {
+		return false, nil
+	}
+	computedHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return false, err
+	}
+	if computedHash != marker.ContentHash {
+		return false, nil
+	}
+	manifestStore := NewBookKnowledgeStore(root)
+	manifest, err := manifestStore.loadManifest()
+	if err != nil {
+		return false, err
+	}
+	for _, book := range manifest.Books {
+		if book == pkg.Book {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func publishBookKnowledgePackageTransaction(
+	transactionRoot, bookDir, manifestPath string,
+	afterBookBackup func() error,
+	afterBookInstall func() error,
+) error {
+	journal, err := readBookKnowledgePublishJournal(transactionRoot)
+	if err != nil {
+		return err
+	}
+	stagedBookDir := filepath.Join(transactionRoot, "book")
+	stagedManifest := filepath.Join(transactionRoot, "manifest.json")
+	backupBookDir := filepath.Join(transactionRoot, "backup-book")
+	if err := os.MkdirAll(filepath.Dir(bookDir), os.ModePerm); err != nil {
+		return err
+	}
+	bookExisted, err := movePathToBackup(bookDir, backupBookDir)
+	if err != nil {
+		return err
+	}
+	journal.BookExisted = bookExisted
+	journal.Phase = bookKnowledgePublishPhaseBackedUp
+	rollback := func(publishErr error) error {
+		var rollbackErrors []error
+		if err := os.RemoveAll(bookDir); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("remove partial book package: %w", err))
+		}
+		if err := restorePathFromBackup(backupBookDir, bookDir, bookExisted); err != nil {
+			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore book package: %w", err))
+		}
+		return errors.Join(append([]error{publishErr}, rollbackErrors...)...)
+	}
+	if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+		return rollback(err)
+	}
+	if afterBookBackup != nil {
+		if err := afterBookBackup(); err != nil {
+			return rollback(err)
+		}
+	}
+	if err := os.Rename(stagedBookDir, bookDir); err != nil {
+		return rollback(err)
+	}
+	journal.Phase = bookKnowledgePublishPhaseInstalled
+	if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+		return rollback(err)
+	}
+	if afterBookInstall != nil {
+		if err := afterBookInstall(); err != nil {
+			return rollback(err)
+		}
+	}
+	if err := replaceFileAtomically(stagedManifest, manifestPath); err != nil {
+		return rollback(err)
+	}
+	return nil
+}
+
+func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
+	job BookKnowledgeJob,
+	receipt bookKnowledgeJobCommitReceipt,
+) (bool, error) {
+	expectedMarker := bookKnowledgeJobCommitMarker{
+		Version: bookKnowledgeJobCommitMarkerVersion, JobID: receipt.JobID, PublishNonce: receipt.PublishNonce,
+		BookID: receipt.BookID, ContentHash: receipt.ContentHash,
+	}
+	transactionRoot := bookKnowledgePublishTransactionPath(s.root, expectedMarker)
+	journal, err := readBookKnowledgePublishJournal(transactionRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			preparingRoot := bookKnowledgePublishTransactionPreparingPath(s.root, expectedMarker)
+			preparingExists, statErr := pathExists(preparingRoot)
+			if statErr != nil {
+				return false, statErr
+			}
+			if preparingExists {
+				if err := cleanupBookKnowledgePublishTransaction(preparingRoot); err != nil {
+					return false, err
+				}
+			}
+			return false, nil
+		}
+		return false, err
+	}
+	if journal.Marker != expectedMarker {
+		return false, nil
+	}
+	finalBookDir := s.BookDir(receipt.BookID)
+	stagedBookDir := filepath.Join(transactionRoot, "book")
+	backupBookDir := filepath.Join(transactionRoot, "backup-book")
+	finalPackage, finalValid, err := verifyBookKnowledgePublishDirectory(finalBookDir, job, receipt)
+	if err != nil {
+		return false, err
+	}
+	if finalValid {
+		if err := s.repairBookKnowledgeRootManifest(*finalPackage); err != nil {
+			return false, err
+		}
+		if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	stagedPackage, stagedValid, err := verifyBookKnowledgePublishDirectory(stagedBookDir, job, receipt)
+	if err != nil {
+		return false, err
+	}
+	if stagedValid {
+		backupExists, err := pathExists(backupBookDir)
+		if err != nil {
+			return false, err
+		}
+		finalExists, err := pathExists(finalBookDir)
+		if err != nil {
+			return false, err
+		}
+		if finalExists {
+			if backupExists {
+				return false, fmt.Errorf("%w: current and backup packages both exist", errBookKnowledgePublishAmbiguous)
+			}
+			if err := os.Rename(finalBookDir, backupBookDir); err != nil {
+				return false, err
+			}
+			journal.BookExisted = true
+			journal.Phase = bookKnowledgePublishPhaseBackedUp
+			if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+				return false, err
+			}
+		} else if backupExists {
+			journal.BookExisted = true
+		}
+		if err := os.MkdirAll(filepath.Dir(finalBookDir), os.ModePerm); err != nil {
+			return false, err
+		}
+		if err := os.Rename(stagedBookDir, finalBookDir); err != nil {
+			return false, err
+		}
+		journal.Phase = bookKnowledgePublishPhaseInstalled
+		if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+			return false, err
+		}
+		if err := s.repairBookKnowledgeRootManifest(*stagedPackage); err != nil {
+			return false, err
+		}
+		if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	backupExists, err := pathExists(backupBookDir)
+	if err != nil {
+		return false, err
+	}
+	finalExists, err := pathExists(finalBookDir)
+	if err != nil {
+		return false, err
+	}
+	if backupExists && !finalExists {
+		if err := os.MkdirAll(filepath.Dir(finalBookDir), os.ModePerm); err != nil {
+			return false, err
+		}
+		if err := os.Rename(backupBookDir, finalBookDir); err != nil {
+			return false, err
+		}
+	} else if backupExists && finalExists {
+		marker, markerErr := readBookKnowledgeJobCommitMarker(finalBookDir)
+		if markerErr == nil && marker == expectedMarker {
+			if err := os.RemoveAll(finalBookDir); err != nil {
+				return false, err
+			}
+			if err := os.Rename(backupBookDir, finalBookDir); err != nil {
+				return false, err
+			}
+		} else {
+			return false, fmt.Errorf("%w: current package is not owned by the transaction", errBookKnowledgePublishAmbiguous)
+		}
+	}
+	if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func verifyBookKnowledgePublishDirectory(
+	bookDir string,
+	job BookKnowledgeJob,
+	receipt bookKnowledgeJobCommitReceipt,
+) (*BookKnowledgePackage, bool, error) {
+	marker, err := readBookKnowledgeJobCommitMarker(bookDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errBookKnowledgeJobCommitMarkerInvalid) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if marker.Version != bookKnowledgeJobCommitMarkerVersion || marker.JobID != receipt.JobID ||
+		marker.PublishNonce != receipt.PublishNonce || marker.BookID != receipt.BookID ||
+		marker.ContentHash != receipt.ContentHash {
+		return nil, false, nil
+	}
+	pkg, err := loadBookKnowledgePackageFromDirectory(bookDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if pkg.Book.BookID != receipt.BookID || pkg.Book.DedaoID != job.EbookID || pkg.Book.EnID != job.EbookEnID ||
+		pkg.Book.ContentHash != receipt.ContentHash {
+		return nil, false, nil
+	}
+	computedHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return nil, false, err
+	}
+	if computedHash != receipt.ContentHash {
+		return nil, false, nil
+	}
+	return pkg, true, nil
+}
+
+func (s *BookKnowledgeStore) repairBookKnowledgeRootManifest(pkg BookKnowledgePackage) error {
+	manifest, err := s.loadManifest()
+	if err != nil {
+		return err
+	}
+	manifest = upsertBookKnowledgeManifest(manifest, pkg.Book)
+	payload, err := encodeJSONFile(manifest)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(s.ManifestPath(), payload)
+}
+
+func cleanupBookKnowledgePublishTransaction(transactionRoot string) error {
+	if err := os.RemoveAll(transactionRoot); err != nil {
+		return err
+	}
+	_ = os.Remove(filepath.Dir(transactionRoot))
+	return nil
+}
+
+func cleanupBookKnowledgePublishTransactionArtifacts(root string, marker bookKnowledgeJobCommitMarker) error {
+	transactionRoot := bookKnowledgePublishTransactionPath(root, marker)
+	preparingRoot := bookKnowledgePublishTransactionPreparingPath(root, marker)
+	var cleanupErrors []error
+	for _, path := range []string{transactionRoot, preparingRoot} {
+		if err := os.RemoveAll(path); err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+		}
+	}
+	_ = os.Remove(filepath.Join(root, bookKnowledgePublishTransactionsDir))
+	return errors.Join(cleanupErrors...)
+}
+
+func pathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 func publishBookKnowledgePackage(
 	stagedBookDir, bookDir, stagedManifest, manifestPath string,
+	afterBookBackup func() error,
 	afterBookInstall func() error,
 ) error {
 	if err := os.MkdirAll(filepath.Dir(bookDir), os.ModePerm); err != nil {
@@ -629,6 +1148,11 @@ func publishBookKnowledgePackage(
 			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore book package: %w", err))
 		}
 		return errors.Join(append([]error{publishErr}, rollbackErrors...)...)
+	}
+	if afterBookBackup != nil {
+		if err := afterBookBackup(); err != nil {
+			return rollback(err)
+		}
 	}
 	if err := os.Rename(stagedBookDir, bookDir); err != nil {
 		return rollback(err)
@@ -665,7 +1189,17 @@ func restorePathFromBackup(backupPath, path string, existed bool) error {
 }
 
 func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookKnowledgePackage, error) {
-	pkg, err := s.LoadPackage(bookID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rootLock, err := s.acquireBookKnowledgeRootLock(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	if err := rejectPendingBookKnowledgePublishTransaction(s.root, bookID); err != nil {
+		return nil, err
+	}
+	pkg, err := s.loadPackageUnlocked(bookID)
 	if err != nil {
 		return nil, err
 	}
@@ -678,7 +1212,7 @@ func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookK
 	}
 	pkg.Book.ContentHash = contentHash
 	ctx := contextWithBookKnowledgeDerivedInvalidation(context.Background())
-	if err := s.SavePackageContext(ctx, *pkg); err != nil {
+	if err := s.savePackageContextUnlocked(ctx, *pkg); err != nil {
 		return nil, err
 	}
 	return pkg, nil
@@ -700,24 +1234,28 @@ func (s *BookKnowledgeStore) loadPackageUnlocked(bookID string) (*BookKnowledgeP
 	if strings.TrimSpace(bookID) == "" {
 		return nil, fmt.Errorf("book_id is required")
 	}
+	return loadBookKnowledgePackageFromDirectory(s.BookDir(bookID))
+}
+
+func loadBookKnowledgePackageFromDirectory(bookDir string) (*BookKnowledgePackage, error) {
 	var book BookKnowledgeBook
-	if err := readJSONFile(s.BookManifestPath(bookID), &book); err != nil {
+	if err := readJSONFile(filepath.Join(bookDir, "manifest.json"), &book); err != nil {
 		return nil, err
 	}
 
-	chapters, err := readJSONLFile[BookKnowledgeChapter](s.BookJSONLPath(bookID, "chapters"))
+	chapters, err := readJSONLFile[BookKnowledgeChapter](filepath.Join(bookDir, "chapters.jsonl"))
 	if err != nil {
 		return nil, err
 	}
-	chunks, err := readJSONLFile[BookKnowledgeChunk](s.BookJSONLPath(bookID, "chunks"))
+	chunks, err := readJSONLFile[BookKnowledgeChunk](filepath.Join(bookDir, "chunks.jsonl"))
 	if err != nil {
 		return nil, err
 	}
-	claims, err := readJSONLFile[BookKnowledgeClaim](s.BookJSONLPath(bookID, "claims"))
+	claims, err := readJSONLFile[BookKnowledgeClaim](filepath.Join(bookDir, "claims.jsonl"))
 	if err != nil {
 		return nil, err
 	}
-	citations, err := readJSONLFile[BookKnowledgeCitation](s.BookJSONLPath(bookID, "citations"))
+	citations, err := readJSONLFile[BookKnowledgeCitation](filepath.Join(bookDir, "citations.jsonl"))
 	if err != nil {
 		return nil, err
 	}

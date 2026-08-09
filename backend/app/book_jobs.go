@@ -617,6 +617,9 @@ func (s *BookKnowledgeStore) verifyBookKnowledgeJobCommitReceipt(
 	if _, err := time.Parse(time.RFC3339Nano, receipt.PreparedAt); err != nil {
 		return nil, false, nil
 	}
+	if _, err := s.recoverBookKnowledgePublishTransaction(job, receipt); err != nil {
+		return nil, false, err
+	}
 	marker, err := readBookKnowledgeJobCommitMarker(s.BookDir(receipt.BookID))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errBookKnowledgeJobCommitMarkerInvalid) {
