@@ -803,15 +803,21 @@ func selectAgentRuntimeCitations(answer string, available []AgentScopedCitation)
 		if end < 0 {
 			break
 		}
-		citationID := strings.TrimSpace(remaining[:end])
+		citationGroup := strings.TrimSpace(remaining[:end])
 		remaining = remaining[end+1:]
-		citation, ok := byID[citationID]
-		if !ok {
-			return nil, fmt.Errorf("answer citation %q is outside retrieved evidence", citationID)
-		}
-		if !seen[citationID] {
-			seen[citationID] = true
-			selected = append(selected, citation)
+		for _, item := range strings.Split(citationGroup, ",") {
+			citationID := strings.TrimSpace(item)
+			if len(citationID) >= len("citation:") && strings.EqualFold(citationID[:len("citation:")], "citation:") {
+				citationID = strings.TrimSpace(citationID[len("citation:"):])
+			}
+			citation, ok := byID[citationID]
+			if !ok {
+				return nil, fmt.Errorf("answer citation %q is outside retrieved evidence", citationID)
+			}
+			if !seen[citationID] {
+				seen[citationID] = true
+				selected = append(selected, citation)
+			}
 		}
 	}
 	if len(selected) == 0 {

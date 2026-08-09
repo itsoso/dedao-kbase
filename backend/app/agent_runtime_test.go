@@ -427,6 +427,7 @@ func TestAgentPackageRuntimeAbstainsForMissingOrUnknownAnswerCitations(t *testin
 	for _, answer := range []string{
 		"Ungrounded answer without a citation marker",
 		"Invented evidence [citation:not-pinned]",
+		"Partly invented evidence [citation:citation-1, citation:not-pinned]",
 	} {
 		t.Run(answer, func(t *testing.T) {
 			t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
@@ -467,6 +468,24 @@ func TestAgentPackageRuntimeReturnsOnlyCitationsUsedInAnswer(t *testing.T) {
 	trace, loadErr := store.LoadAgentTrace(response.TraceID)
 	if loadErr != nil || len(trace.Final.Citations) != 1 || trace.Final.Citations[0].CitationID != "citation-2" {
 		t.Fatalf("answer trace = %#v err=%v", trace, loadErr)
+	}
+}
+
+func TestAgentPackageRuntimeAcceptsGroupedGroundedCitations(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-test-key")
+	store, pkg := agentRuntimeTestStore(t)
+	client := &fakeBookKnowledgeLLMClient{
+		answer: "Grounded answer [citation:citation-1, citation:citation-2]",
+	}
+	response, err := ChatAgentPackageWithClient(context.Background(), store, AgentPackageChatRequest{
+		PackageID: pkg.PackageID, PackageVersion: pkg.Version, Question: "What is grounded?",
+	}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != AgentTraceOutcomeCompleted || len(response.Citations) != 2 ||
+		response.Citations[0].CitationID != "citation-1" || response.Citations[1].CitationID != "citation-2" {
+		t.Fatalf("grouped answer citations = %#v", response)
 	}
 }
 
