@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -93,6 +94,52 @@ func TestBookJobWorkerCLICheckConfigHasNoFilesystemSideEffects(t *testing.T) {
 	if stdout.String() != "{\"schema_version\":1,\"status\":\"ok\"}\n" {
 		t.Fatalf("check-config output=%q", stdout.String())
 	}
+}
+
+func TestBookJobWorkerReadOnlyCommandsDoNotInitializeDesktopConfig(t *testing.T) {
+	binPath := filepath.Join(t.TempDir(), "book-job-worker")
+	build := exec.Command("go", "build", "-o", binPath, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build real worker binary: %v: %s", err, output)
+	}
+	configRoot := filepath.Join(t.TempDir(), "missing-config")
+	bookRoot := filepath.Join(t.TempDir(), "missing-books")
+	env := appendEnvironmentWithout(os.Environ(),
+		"DEDAO_GO_CONFIG_DIR", "KBASE_BOOK_KNOWLEDGE_ROOT", "KBASE_BOOK_JOB_WORKER_ID",
+	)
+	env = append(env,
+		"DEDAO_GO_CONFIG_DIR="+configRoot,
+		"KBASE_BOOK_KNOWLEDGE_ROOT="+bookRoot,
+		"KBASE_BOOK_JOB_WORKER_ID=worker-read-only",
+	)
+	for _, command := range []string{"build-info", "check-config"} {
+		run := exec.Command(binPath, command)
+		run.Env = env
+		if output, err := run.CombinedOutput(); err != nil {
+			t.Fatalf("%s failed: %v: %s", command, err, output)
+		}
+		if _, err := os.Stat(configRoot); !os.IsNotExist(err) {
+			t.Fatalf("%s created desktop config directory: %v", command, err)
+		}
+		if _, err := os.Stat(bookRoot); !os.IsNotExist(err) {
+			t.Fatalf("%s created book root: %v", command, err)
+		}
+	}
+}
+
+func appendEnvironmentWithout(environment []string, keys ...string) []string {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		blocked[key] = struct{}{}
+	}
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		key, _, _ := strings.Cut(entry, "=")
+		if _, exists := blocked[key]; !exists {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func TestBookJobWorkerCLIRejectsInvalidEnvironmentWithoutLeakingValues(t *testing.T) {
@@ -195,6 +242,80 @@ func TestBookJobWorkerCLIRunIsSilentAndCancellationIsGraceful(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("run output=%q", stdout.String())
+	}
+}
+
+func TestBookJobWorkerCLIDoesNotHideRuntimeFailureAfterCancellation(t *testing.T) {
+	previousFactory := bookJobWorkerRuntimeFactory
+	defer func() { bookJobWorkerRuntimeFactory = previousFactory }()
+	bookJobWorkerRuntimeFactory = func(app.BookJobWorkerConfig) (bookJobWorkerRuntime, error) {
+		return fakeBookJobWorkerRuntime{
+			once: func(context.Context) (bool, error) { return false, nil },
+			run: func(ctx context.Context) error {
+				<-ctx.Done()
+				return errors.New("raw interrupt persistence failure /private/token-secret")
+			},
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runBookJobWorkerCLI(ctx, []string{"run"}, bookJobWorkerTestEnv{"KBASE_BOOK_JOB_WORKER_ID": "worker-run-error"}.Lookup, &bytes.Buffer{})
+	}()
+	cancel()
+	err := <-done
+	if err == nil || strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), "token-secret") {
+		t.Fatalf("unsafe or hidden runtime error=%v", err)
+	}
+}
+
+func TestBookJobWorkerCLIOnceDoesNotHideFailureAfterCancellation(t *testing.T) {
+	previousFactory := bookJobWorkerRuntimeFactory
+	defer func() { bookJobWorkerRuntimeFactory = previousFactory }()
+	bookJobWorkerRuntimeFactory = func(app.BookJobWorkerConfig) (bookJobWorkerRuntime, error) {
+		return fakeBookJobWorkerRuntime{
+			once: func(context.Context) (bool, error) {
+				return true, errors.New("raw interrupt persistence failure /private/token-secret")
+			},
+			run: func(context.Context) error { return nil },
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := runBookJobWorkerCLI(ctx, []string{"once"}, bookJobWorkerTestEnv{"KBASE_BOOK_JOB_WORKER_ID": "worker-once-error"}.Lookup, &bytes.Buffer{})
+	if err == nil || strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), "token-secret") {
+		t.Fatalf("unsafe or hidden once error=%v", err)
+	}
+}
+
+func TestBookJobWorkerSignalContextCancelsThenForcesExit(t *testing.T) {
+	signals := make(chan os.Signal, 2)
+	forced := make(chan int, 1)
+	ctx, stop := newBookJobWorkerSignalContext(context.Background(), signals, func(code int) {
+		forced <- code
+	})
+	defer stop()
+
+	signals <- os.Interrupt
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("first signal did not cancel context")
+	}
+	select {
+	case code := <-forced:
+		t.Fatalf("first signal forced exit with code %d", code)
+	default:
+	}
+
+	signals <- os.Interrupt
+	select {
+	case code := <-forced:
+		if code != 130 {
+			t.Fatalf("forced exit code=%d want=130", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second signal did not force exit")
 	}
 }
 

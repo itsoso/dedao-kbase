@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -39,7 +40,21 @@ type EBookDownload struct {
 	ID           int
 	EnID         string
 	OutputDir    string
+	ebookService ebookDownloadService
 }
+
+type ebookDownloadService interface {
+	EbookDetailContext(context.Context, string) (*services.EbookDetail, error)
+	EbookReadTokenContext(context.Context, string) (*services.Token, error)
+	EbookInfoContext(context.Context, string) (*services.EbookInfo, error)
+	EbookPagesContext(context.Context, string, string, int, int, int) (*services.EbookPage, error)
+}
+
+var (
+	writeEbookHTML = utils.Svg2Html
+	writeEbookPDF  = utils.Svg2Pdf
+	writeEbookEPUB = utils.Svg2Epub
+)
 
 type EBookDownloadResult struct {
 	BookID   int
@@ -232,12 +247,25 @@ func (d *EBookDownload) Download() error {
 }
 
 func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
-	service := d.Service
-	if service == nil {
-		service = dedaoServiceFromContext(d.Ctx)
+	ctx := d.Ctx
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	detail, err := service.EbookDetail(d.EnID)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var service ebookDownloadService = d.ebookService
+	if service == nil {
+		service = d.Service
+	}
+	if service == nil {
+		service = dedaoServiceFromContext(ctx)
+	}
+	detail, err := service.EbookDetailContext(ctx, d.EnID)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -249,7 +277,7 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	}
 
 	title += "_" + detail.BookAuthor
-	info, svgContent, err := ebookPageWithService(d.Ctx, service, detail.Enid)
+	info, svgContent, err := ebookPageWithService(ctx, service, detail.Enid)
 	if err != nil {
 		return nil, err
 	}
@@ -273,18 +301,28 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	progress.Pct = 100
 	progress.Value = "正在生成" + dType[d.DownloadType] + "文件"
 	emitEbookDownloadProgress(d.Ctx, progress)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	switch d.DownloadType {
 	case 1:
-		result.HTMLPath, err = ebookHTMLPath(outputDir, title)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if err = utils.Svg2Html(outputDir, title, svgContent, info.BookInfo.Toc); err != nil {
+		result.HTMLPath, err = generateEbookFileAtomically(ctx, outputDir, title, "html", func(stagingRoot string) error {
+			return writeEbookHTML(stagingRoot, title, svgContent, info.BookInfo.Toc)
+		})
+		if err != nil {
 			return nil, err
 		}
 
 	case 2:
-		if err = utils.Svg2Pdf(outputDir, title, svgContent, info.BookInfo.Toc); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, err = generateEbookFileAtomically(ctx, outputDir, title, "pdf", func(stagingRoot string) error {
+			return writeEbookPDF(stagingRoot, title, svgContent, info.BookInfo.Toc)
+		}); err != nil {
 			return nil, err
 		}
 
@@ -295,7 +333,12 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 		opts.Description = detail.BookIntro
 		opts.Toc = info.BookInfo.Toc
 
-		if err = utils.Svg2Epub(outputDir, title, svgContent, opts); err != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, err = generateEbookFileAtomically(ctx, outputDir, title, "epub", func(stagingRoot string) error {
+			return writeEbookEPUB(stagingRoot, title, svgContent, opts)
+		}); err != nil {
 			return nil, err
 		}
 
@@ -303,6 +346,66 @@ func (d *EBookDownload) DownloadWithResult() (*EBookDownloadResult, error) {
 	}
 
 	return result, nil
+}
+
+func generateEbookFileAtomically(ctx context.Context, outputDir, title, extension string, generate func(string) error) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if generate == nil {
+		return "", fmt.Errorf("ebook file generator is required")
+	}
+	outputDir = normalizeEbookOutputDir(outputDir)
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return "", err
+	}
+	stagingRoot, err := os.MkdirTemp(outputDir, ".dedao-ebook-staging-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(stagingRoot)
+	if err := generate(stagingRoot); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	stagedPath, err := ebookGeneratedFilePath(stagingRoot, title, extension)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(stagedPath); err != nil {
+		return "", err
+	}
+	finalDir, err := utils.Mkdir(outputDir, "Ebook")
+	if err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	finalPath, err := utils.FilePath(filepath.Join(finalDir, utils.FileName(title, "")), extension, false)
+	if err != nil {
+		return "", err
+	}
+	if err := os.Rename(stagedPath, finalPath); err != nil {
+		return "", err
+	}
+	return finalPath, nil
+}
+
+func normalizeEbookOutputDir(outputDir string) string {
+	if strings.TrimSpace(outputDir) == "" {
+		return "."
+	}
+	return outputDir
+}
+
+func ebookGeneratedFilePath(root, title, extension string) (string, error) {
+	return utils.FilePath(filepath.Join(root, "Ebook", utils.FileName(title, "")), extension, false)
 }
 
 // 生成下载数据

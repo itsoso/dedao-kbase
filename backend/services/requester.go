@@ -233,8 +233,9 @@ func (s *Service) reqEbookDetailContext(ctx context.Context, enid string) (io.Re
 }
 
 // reqEbookReadToken 请求电子书阅读 token
-func (s *Service) reqEbookReadToken(enid string) (io.ReadCloser, error) {
+func (s *Service) reqEbookReadTokenContext(ctx context.Context, enid string) (io.ReadCloser, error) {
 	resp, err := s.client.R().
+		SetContext(ctx).
 		SetBody(map[string]string{
 			"id": enid,
 		}).
@@ -243,16 +244,18 @@ func (s *Service) reqEbookReadToken(enid string) (io.ReadCloser, error) {
 }
 
 // reqEbookInfo 请求电子书 info
-func (s *Service) reqEbookInfo(token string) (io.ReadCloser, error) {
+func (s *Service) reqEbookInfoContext(ctx context.Context, token string) (io.ReadCloser, error) {
 	resp, err := s.client.R().
+		SetContext(ctx).
 		SetQueryParam("token", token).
 		Get("/ebk_web/v1/get_book_info")
 	return handleHTTPResponse(resp, err)
 }
 
 // reqEbookPages 获取页面详情
-func (s *Service) reqEbookPages(chapterID, token string, index, count, offset int) (io.ReadCloser, error) {
+func (s *Service) reqEbookPagesContext(ctx context.Context, chapterID, token string, index, count, offset int) (io.ReadCloser, error) {
 	resp, err := s.client.R().
+		SetContext(ctx).
 		SetBody(map[string]interface{}{
 			"chapter_id":  chapterID,
 			"count":       count,

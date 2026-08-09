@@ -3,7 +3,6 @@ package services
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -57,6 +56,33 @@ type Service struct {
 	loginMu          sync.Mutex
 	csrfToken        string
 	bootstrapCookies []string
+}
+
+type RemoteErrorKind string
+
+const (
+	RemoteErrorAuthentication RemoteErrorKind = "authentication_required"
+	RemoteErrorSourceChanged  RemoteErrorKind = "source_changed"
+	RemoteErrorUnavailable    RemoteErrorKind = "unavailable"
+)
+
+// RemoteError reports an upstream failure without retaining response bodies,
+// request URLs, cookies, or account-specific details in persisted errors.
+type RemoteError struct {
+	Kind        RemoteErrorKind
+	StatusCode  int
+	ServiceCode int
+}
+
+func (e *RemoteError) Error() string {
+	switch e.Kind {
+	case RemoteErrorAuthentication:
+		return "dedao authentication is required"
+	case RemoteErrorSourceChanged:
+		return "dedao ebook source is unavailable or changed"
+	default:
+		return "dedao service request failed"
+	}
 }
 
 // CookieOptions dedao cookie options
@@ -178,17 +204,16 @@ func handleHTTPResponse(resp *resty.Response, err error) (io.ReadCloser, error) 
 		return nil, err
 	}
 
-	if resp.StatusCode() == http.StatusNotFound {
-		return nil, errors.New("404 NotFound")
-	}
-	if resp.StatusCode() == http.StatusBadRequest {
-		return nil, errors.New("400 BadRequest")
-	}
-	if resp.StatusCode() == http.StatusUnauthorized {
-		return nil, errors.New("401 Unauthorized")
-	}
-	if resp.StatusCode() == 496 {
-		return nil, errors.New("496 NoCertificate")
+	statusCode := resp.StatusCode()
+	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
+		kind := RemoteErrorUnavailable
+		switch statusCode {
+		case http.StatusUnauthorized:
+			kind = RemoteErrorAuthentication
+		case http.StatusForbidden, http.StatusNotFound:
+			kind = RemoteErrorSourceChanged
+		}
+		return nil, &RemoteError{Kind: kind, StatusCode: statusCode}
 	}
 
 	data := resp.Body()
@@ -202,22 +227,46 @@ func handleJSONParse(reader io.Reader, v interface{}) error {
 
 	err := utils.UnmarshalReader(reader, &result)
 	if err != nil {
-		fmt.Printf("err1: %s \n", err.Error())
-		return err
+		return &RemoteError{Kind: RemoteErrorUnavailable}
 	}
 	// fmt.Printf("result.C:=%#v", result.C)
 	if !result.isSuccess() {
 		// 未登录或者登录凭证无效
-		err = errors.New("服务异常，请稍后重试。errMsg:" + result.H.E)
-		return err
+		return remoteErrorForServiceResponse(result.H.C, result.H.E)
 	}
 	err = utils.UnmarshalJSON(result.C, v)
 	if err != nil {
-		fmt.Printf("err2: %s", err.Error())
-		return err
+		return &RemoteError{Kind: RemoteErrorUnavailable, ServiceCode: result.H.C}
 	}
 
 	return nil
+}
+
+func remoteErrorForServiceResponse(code int, message string) error {
+	kind := RemoteErrorUnavailable
+	switch code {
+	case http.StatusUnauthorized:
+		kind = RemoteErrorAuthentication
+	case http.StatusForbidden, http.StatusNotFound:
+		kind = RemoteErrorSourceChanged
+	default:
+		normalized := strings.ToLower(message)
+		if containsAny(normalized, "unauthorized", "authentication", "credential", "login", "token", "expired", "未登录", "登录", "认证", "凭证") {
+			kind = RemoteErrorAuthentication
+		} else if containsAny(normalized, "not found", "forbidden", "permission", "identity mismatch", "source changed", "不存在", "无权限", "无权", "不匹配", "已下架") {
+			kind = RemoteErrorSourceChanged
+		}
+	}
+	return &RemoteError{Kind: kind, ServiceCode: code}
+}
+
+func containsAny(value string, candidates ...string) bool {
+	for _, candidate := range candidates {
+		if strings.Contains(value, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseCookies parse cookie string to cookie options

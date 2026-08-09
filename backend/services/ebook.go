@@ -204,7 +204,11 @@ func (s *Service) EbookDetailContext(ctx context.Context, enid string) (detail *
 
 // EbookReadToken get ebook read token
 func (s *Service) EbookReadToken(enid string) (t *Token, err error) {
-	body, err := s.reqEbookReadToken(enid)
+	return s.EbookReadTokenContext(context.Background(), enid)
+}
+
+func (s *Service) EbookReadTokenContext(ctx context.Context, enid string) (t *Token, err error) {
+	body, err := s.reqEbookReadTokenContext(ctx, enid)
 	if err != nil {
 		return
 	}
@@ -218,7 +222,11 @@ func (s *Service) EbookReadToken(enid string) (t *Token, err error) {
 // EbookInfo get ebook info
 // include book block, book TOC, epubPath etc
 func (s *Service) EbookInfo(token string) (info *EbookInfo, err error) {
-	body, err := s.reqEbookInfo(token)
+	return s.EbookInfoContext(context.Background(), token)
+}
+
+func (s *Service) EbookInfoContext(ctx context.Context, token string) (info *EbookInfo, err error) {
+	body, err := s.reqEbookInfoContext(ctx, token)
 	if err != nil {
 		return
 	}
@@ -230,7 +238,11 @@ func (s *Service) EbookInfo(token string) (info *EbookInfo, err error) {
 }
 
 func (s *Service) EbookPages(chapterID, token string, index, count, offset int) (pages *EbookPage, err error) {
-	body, err := s.reqEbookPages(chapterID, token, index, count, offset)
+	return s.EbookPagesContext(context.Background(), chapterID, token, index, count, offset)
+}
+
+func (s *Service) EbookPagesContext(ctx context.Context, chapterID, token string, index, count, offset int) (pages *EbookPage, err error) {
+	body, err := s.reqEbookPagesContext(ctx, chapterID, token, index, count, offset)
 	if err != nil {
 		return
 	}

@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 func TestBookJobWorkerRejectsInvalidConfiguration(t *testing.T) {
@@ -51,8 +53,17 @@ func TestBookJobWorkerRejectsInvalidConfiguration(t *testing.T) {
 func TestBookJobWorkerRunOnceClaimsOldestAndCompletesWithSafeStages(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	oldest := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 201)
-	time.Sleep(time.Millisecond)
 	newer := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 202)
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE book_jobs SET created_at = CASE job_id WHEN ? THEN ? WHEN ? THEN ? END WHERE job_id IN (?, ?)`,
+		oldest.ID, "2000-01-01T00:00:00Z", newer.ID, "2001-01-01T00:00:00Z", oldest.ID, newer.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
 
 	worker := newWorkerForTest(t, store, func(_ context.Context, job BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
 		if job.ID != oldest.ID {
@@ -94,7 +105,6 @@ func TestBookJobWorkerClassifiesFailuresWithoutPersistingRawErrors(t *testing.T)
 		BookKnowledgeJobFailureAuthenticationRequired,
 		BookKnowledgeJobFailureDownloadFailed,
 		BookKnowledgeJobFailureKnowledgeBuildFailed,
-		BookKnowledgeJobFailureWorkerInterrupted,
 		BookKnowledgeJobFailureSourceChanged,
 		BookKnowledgeJobFailureUnknownFailure,
 	}
@@ -131,6 +141,38 @@ func TestBookJobWorkerClassifiesFailuresWithoutPersistingRawErrors(t *testing.T)
 				}
 				return nil, errors.New("provider failed at /private/secret token=abc")
 			})
+			if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+			}
+			assertWorkerFailedSafely(t, store, job.ID, test.code)
+		})
+	}
+}
+
+func TestBookJobWorkerDefaultExecutionClassifiesRemoteFailures(t *testing.T) {
+	oldRunner := runDedaoEbookDownloadJob
+	defer func() { runDedaoEbookDownloadJob = oldRunner }()
+	for _, test := range []struct {
+		name string
+		kind services.RemoteErrorKind
+		code string
+	}{
+		{name: "authentication", kind: services.RemoteErrorAuthentication, code: BookKnowledgeJobFailureAuthenticationRequired},
+		{name: "source", kind: services.RemoteErrorSourceChanged, code: BookKnowledgeJobFailureSourceChanged},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 212)
+			runDedaoEbookDownloadJob = func(context.Context, BookKnowledgeJob) (map[string]any, error) {
+				return nil, &services.RemoteError{Kind: test.kind, StatusCode: 401}
+			}
+			worker, err := NewBookJobWorker(BookJobWorkerConfig{
+				Store: store, WorkerID: "worker-default", LeaseDuration: time.Second,
+				RenewInterval: 100 * time.Millisecond, PollInterval: time.Second,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
 			if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
 				t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
 			}
@@ -269,6 +311,39 @@ func TestBookJobWorkerCancellationInterruptsExactlyOnce(t *testing.T) {
 	loaded, err := store.LoadBookKnowledgeJob(job.ID)
 	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted || loaded.FailureCode != BookKnowledgeJobFailureWorkerInterrupted {
 		t.Fatalf("interrupted job=%#v err=%v", loaded, err)
+	}
+	if got := countWorkerTerminalEvents(t, store, job.ID); got != 1 {
+		t.Fatalf("terminal events=%d want=1", got)
+	}
+}
+
+func TestBookJobWorkerExecutorContextCanceledWithoutWorkerCancellationUsesStageFailure(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 251)
+	worker := newWorkerForTest(t, store, func(_ context.Context, _ BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
+		if err := setStage("downloading"); err != nil {
+			return nil, err
+		}
+		return nil, context.Canceled
+	})
+	if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	assertWorkerFailedSafely(t, store, job.ID, BookKnowledgeJobFailureDownloadFailed)
+}
+
+func TestBookJobWorkerTypedWorkerInterruptedUsesInterruptedStatus(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 252)
+	worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+		return nil, NewBookJobExecutionFailure(BookKnowledgeJobFailureWorkerInterrupted, errors.New("worker stopped"))
+	})
+	if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted || loaded.FailureCode != BookKnowledgeJobFailureWorkerInterrupted {
+		t.Fatalf("job=%#v err=%v", loaded, err)
 	}
 	if got := countWorkerTerminalEvents(t, store, job.ID); got != 1 {
 		t.Fatalf("terminal events=%d want=1", got)

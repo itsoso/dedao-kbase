@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yann0917/dedao-gui/backend/services"
 )
 
 var ErrBookJobWorkerInfrastructure = errors.New("book job worker infrastructure failure")
@@ -247,7 +249,7 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 		return infraErr
 	}
 
-	if parent.Err() != nil || errors.Is(execution.err, context.Canceled) || errors.Is(execution.err, context.DeadlineExceeded) {
+	if parent.Err() != nil {
 		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
 			return bookJobWorkerInfrastructureError("interrupt job")
 		}
@@ -255,6 +257,12 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	}
 	if execution.err != nil {
 		code := bookJobWorkerFailureCode(execution.err, stage)
+		if code == BookKnowledgeJobFailureWorkerInterrupted {
+			if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
+				return bookJobWorkerInfrastructureError("interrupt job")
+			}
+			return nil
+		}
 		if _, err := w.store.FailBookKnowledgeJob(job.ID, w.workerID, code); err != nil {
 			return bookJobWorkerInfrastructureError("fail job")
 		}
@@ -298,6 +306,15 @@ func bookJobWorkerFailureCode(err error, stage string) string {
 	var coded bookJobFailureCoder
 	if errors.As(err, &coded) && validBookJobFailureCode(coded.BookJobFailureCode()) {
 		return coded.BookJobFailureCode()
+	}
+	var remoteErr *services.RemoteError
+	if errors.As(err, &remoteErr) {
+		switch remoteErr.Kind {
+		case services.RemoteErrorAuthentication:
+			return BookKnowledgeJobFailureAuthenticationRequired
+		case services.RemoteErrorSourceChanged:
+			return BookKnowledgeJobFailureSourceChanged
+		}
 	}
 	switch stage {
 	case "downloading":

@@ -131,6 +131,37 @@ func TestSyncEbookToBookKnowledgeStoreWithStagesStopsBeforeBuildWhenBuildingStag
 	}
 }
 
+func TestSyncEbookToBookKnowledgeStoreDoesNotSaveAfterContextCancellation(t *testing.T) {
+	downloadRoot := t.TempDir()
+	store := NewBookKnowledgeStore(t.TempDir())
+	htmlPath := filepath.Join(downloadRoot, "book.html")
+	if err := os.WriteFile(htmlPath, []byte(`<html><body><p>不应保存。</p></body></html>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDownload := downloadEbookForKnowledgeSync
+	defer func() { downloadEbookForKnowledgeSync = oldDownload }()
+	downloadEbookForKnowledgeSync = func(context.Context, int, string, string) (*EBookDownloadResult, error) {
+		return &EBookDownloadResult{BookID: 46, Title: "取消构建", HTMLPath: htmlPath}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	_, err := syncEbookToBookKnowledgeStoreWithStages(
+		ctx, 46, "cancel-build", store, downloadRoot,
+		func(stage string) error {
+			if stage == "building_knowledge" {
+				cancel()
+			}
+			return nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context canceled", err)
+	}
+	if _, err := store.LoadPackage("46"); err == nil {
+		t.Fatal("knowledge package was saved after cancellation")
+	}
+}
+
 func TestEbookHTMLPath(t *testing.T) {
 	got, err := ebookHTMLPath("/tmp/down-dedao", "123_测试: 电子书_作者")
 	if err != nil {

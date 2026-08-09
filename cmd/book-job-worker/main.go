@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,12 +52,61 @@ type bookJobWorkerParsedConfig struct {
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	ctx, stopContext := newBookJobWorkerSignalContext(context.Background(), signals, os.Exit)
 	code := runBookJobWorkerMain(ctx, os.Args[1:], os.LookupEnv, os.Stdout, os.Stderr)
-	stop()
+	signal.Stop(signals)
+	stopContext()
 	if code != 0 {
 		os.Exit(code)
 	}
+}
+
+func newBookJobWorkerSignalContext(
+	parent context.Context,
+	signals <-chan os.Signal,
+	forceExit func(int),
+) (context.Context, func()) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			cancel()
+		})
+	}
+	go func() {
+		seen := 0
+		for {
+			select {
+			case <-done:
+				return
+			case received, ok := <-signals:
+				if !ok {
+					return
+				}
+				seen++
+				if seen == 1 {
+					cancel()
+					continue
+				}
+				if forceExit != nil {
+					code := 1
+					if value, ok := received.(syscall.Signal); ok {
+						code = 128 + int(value)
+					}
+					forceExit(code)
+				}
+				return
+			}
+		}
+	}()
+	return ctx, stop
 }
 
 func runBookJobWorkerMain(
@@ -129,18 +179,12 @@ func runBookJobWorkerCLI(
 		}
 		if args[0] == "run" {
 			if err := worker.Run(ctx); err != nil {
-				if ctx != nil && ctx.Err() != nil {
-					return nil
-				}
 				return errors.New("book job worker runtime failed")
 			}
 			return nil
 		}
 		processed, err := worker.RunOnce(ctx)
 		if err != nil {
-			if ctx != nil && ctx.Err() != nil {
-				return nil
-			}
 			return errors.New("book job worker cycle failed")
 		}
 		return json.NewEncoder(stdout).Encode(struct {

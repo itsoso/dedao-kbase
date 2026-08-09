@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -23,11 +24,24 @@ type extractedBookBlock struct {
 }
 
 func BuildBookKnowledgeFromHTMLFile(book BookKnowledgeBook, htmlPath string, store *BookKnowledgeStore) (*BookKnowledgePackage, error) {
+	return BuildBookKnowledgeFromHTMLFileContext(context.Background(), book, htmlPath, store)
+}
+
+func BuildBookKnowledgeFromHTMLFileContext(ctx context.Context, book BookKnowledgeBook, htmlPath string, store *BookKnowledgeStore) (*BookKnowledgePackage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(htmlPath) == "" {
 		return nil, fmt.Errorf("html path is required")
 	}
 	content, err := os.ReadFile(htmlPath)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if strings.TrimSpace(book.SourceHTML) == "" {
@@ -39,6 +53,9 @@ func BuildBookKnowledgeFromHTMLFile(book BookKnowledgeBook, htmlPath string, sto
 	}
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := store.SavePackage(*pkg); err != nil {
 		return nil, err

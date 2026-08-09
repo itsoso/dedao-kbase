@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -160,6 +161,90 @@ func TestEbookDetailContextCancelsRequest(t *testing.T) {
 	case <-requestCanceled:
 	case <-time.After(time.Second):
 		t.Fatal("server request context was not canceled")
+	}
+}
+
+func TestEbookRequestContextMethodsCancelInFlightRequests(t *testing.T) {
+	tests := []struct {
+		name string
+		call func(context.Context, *Service) error
+	}{
+		{name: "detail", call: func(ctx context.Context, service *Service) error {
+			_, err := service.EbookDetailContext(ctx, "ebook-enid")
+			return err
+		}},
+		{name: "read-token", call: func(ctx context.Context, service *Service) error {
+			_, err := service.EbookReadTokenContext(ctx, "ebook-enid")
+			return err
+		}},
+		{name: "info", call: func(ctx context.Context, service *Service) error {
+			_, err := service.EbookInfoContext(ctx, "read-token")
+			return err
+		}},
+		{name: "pages", call: func(ctx context.Context, service *Service) error {
+			_, err := service.EbookPagesContext(ctx, "chapter", "read-token", 0, 20, 0)
+			return err
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(started)
+				<-release
+			}))
+			defer func() {
+				close(release)
+				server.Close()
+			}()
+			contextService := NewService(&CookieOptions{})
+			contextService.client.SetBaseURL(server.URL)
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := make(chan error, 1)
+			go func() { errCh <- test.call(ctx, contextService) }()
+			<-started
+			cancel()
+			if err := <-errCh; !errors.Is(err, context.Canceled) {
+				t.Fatalf("request error=%v, want context canceled", err)
+			}
+		})
+	}
+}
+
+func TestEbookDetailReturnsSafeTypedRemoteErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		kind       RemoteErrorKind
+	}{
+		{name: "http unauthorized", statusCode: http.StatusUnauthorized, body: `private token=auth-secret`, kind: RemoteErrorAuthentication},
+		{name: "http forbidden", statusCode: http.StatusForbidden, body: `private account path`, kind: RemoteErrorSourceChanged},
+		{name: "http missing", statusCode: http.StatusNotFound, body: `private book identity`, kind: RemoteErrorSourceChanged},
+		{name: "http unavailable", statusCode: http.StatusInternalServerError, body: `private upstream trace`, kind: RemoteErrorUnavailable},
+		{name: "service auth", statusCode: http.StatusOK, body: `{"h":{"c":401,"e":"login invalid token=auth-secret"},"c":{}}`, kind: RemoteErrorAuthentication},
+		{name: "service expired credential", statusCode: http.StatusOK, body: `{"h":{"c":10000,"e":"credential expired private-token"},"c":{}}`, kind: RemoteErrorAuthentication},
+		{name: "service identity mismatch", statusCode: http.StatusOK, body: `{"h":{"c":10001,"e":"book identity mismatch private-id"},"c":{}}`, kind: RemoteErrorSourceChanged},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(test.statusCode)
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+			contextService := NewService(&CookieOptions{})
+			contextService.client.SetBaseURL(server.URL)
+			_, err := contextService.EbookDetailContext(context.Background(), "ebook-enid")
+			var remoteErr *RemoteError
+			if !errors.As(err, &remoteErr) || remoteErr.Kind != test.kind {
+				t.Fatalf("error=%#v, want RemoteError kind %q", err, test.kind)
+			}
+			if strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), "auth-secret") {
+				t.Fatalf("safe error leaked response body: %q", err)
+			}
+		})
 	}
 }
 

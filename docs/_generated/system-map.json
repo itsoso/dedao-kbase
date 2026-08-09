@@ -524,43 +524,43 @@
     {
       "path": "/api/pc/ddlive/v2/pc/home/live/list",
       "file": "backend/services/requester.go",
-      "line": 398,
+      "line": 401,
       "authenticated": true
     },
     {
       "path": "/api/pc/ddlive/v2/pc/home/live/tablist",
       "file": "backend/services/requester.go",
-      "line": 388,
+      "line": 391,
       "authenticated": true
     },
     {
       "path": "/api/pc/ddlive/v2/pc/live/check",
       "file": "backend/services/requester.go",
-      "line": 407,
+      "line": 410,
       "authenticated": true
     },
     {
       "path": "/api/pc/ebook2/v1/bookshelf/add",
       "file": "backend/services/requester.go",
-      "line": 312,
+      "line": 315,
       "authenticated": true
     },
     {
       "path": "/api/pc/ebook2/v1/pc/read/token",
       "file": "backend/services/requester.go",
-      "line": 241,
+      "line": 242,
       "authenticated": true
     },
     {
       "path": "/api/pc/ebook2/v1/vip/info",
       "file": "backend/services/requester.go",
-      "line": 287,
+      "line": 290,
       "authenticated": true
     },
     {
       "path": "/api/pc/hades/v1/product/remove",
       "file": "backend/services/requester.go",
-      "line": 324,
+      "line": 327,
       "authenticated": true
     },
     {
@@ -608,7 +608,7 @@
     {
       "path": "/api/search/pc/hot",
       "file": "backend/services/requester.go",
-      "line": 471,
+      "line": 474,
       "authenticated": true
     },
     {
@@ -620,7 +620,7 @@
     {
       "path": "/api/search/v2/pc/searchebookchapter",
       "file": "backend/services/requester.go",
-      "line": 486,
+      "line": 489,
       "authenticated": true
     },
     {

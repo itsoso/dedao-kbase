@@ -52,15 +52,27 @@ func EbookPage(ctx context.Context, enID string) (info *services.EbookInfo, svgC
 	return ebookPageWithService(ctx, dedaoServiceFromContext(ctx), enID)
 }
 
-func ebookPageWithService(ctx context.Context, service *services.Service, enID string) (info *services.EbookInfo, svgContent utils.SvgContents, err error) {
-	token, err1 := service.EbookReadToken(enID)
+func ebookPageWithService(ctx context.Context, service ebookDownloadService, enID string) (info *services.EbookInfo, svgContent utils.SvgContents, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err = ctx.Err(); err != nil {
+		return
+	}
+	token, err1 := service.EbookReadTokenContext(ctx, enID)
 	if err1 != nil {
 		err = err1
 		return
 	}
 
-	info, err = service.EbookInfo(token.Token)
+	if err = ctx.Err(); err != nil {
+		return
+	}
+	info, err = service.EbookInfoContext(ctx, token.Token)
 	if err != nil {
+		return
+	}
+	if err = ctx.Err(); err != nil {
 		return
 	}
 	wgp := utils.NewWaitGroupPool(5)
@@ -81,6 +93,9 @@ func ebookPageWithService(ctx context.Context, service *services.Service, enID s
 		chapterMap.Store(key, ebookToc)
 	}
 	for i, order := range info.BookInfo.Orders {
+		if err = ctx.Err(); err != nil {
+			break
+		}
 		var progress Progress
 		progress.Total = total
 		curr++
@@ -97,7 +112,7 @@ func ebookPageWithService(ctx context.Context, service *services.Service, enID s
 			defer wgp.Done()
 			index, count, offset := 0, 20, 0
 			svgList, fetchErr := runEbookPageFetch(func() ([]string, error) {
-				return generateEbookPagesWithService(service, order.ChapterID, token.Token, index, count, offset)
+				return generateEbookPagesWithService(ctx, service, order.ChapterID, token.Token, index, count, offset)
 			})
 			if fetchErr != nil {
 				results <- pageResult{index: i, err: fetchErr}
@@ -113,6 +128,9 @@ func ebookPageWithService(ctx context.Context, service *services.Service, enID s
 	}
 	wgp.Wait()
 	close(results)
+	if err == nil {
+		err = ctx.Err()
+	}
 	ordered := make([]*utils.SvgContent, total)
 	for result := range results {
 		if result.err != nil {
@@ -148,17 +166,26 @@ func runEbookPageFetch(fetch func() ([]string, error)) (pages []string, err erro
 }
 
 func generateEbookPages(chapterID, token string, index, count, offset int) (svgList []string, err error) {
-	return generateEbookPagesWithService(getService(), chapterID, token, index, count, offset)
+	return generateEbookPagesWithService(context.Background(), getService(), chapterID, token, index, count, offset)
 }
 
-func generateEbookPagesWithService(service *services.Service, chapterID, token string, index, count, offset int) (svgList []string, err error) {
+func generateEbookPagesWithService(ctx context.Context, service ebookDownloadService, chapterID, token string, index, count, offset int) (svgList []string, err error) {
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 	fmt.Printf("chapterID:%#v\n", chapterID)
-	pageList, err := service.EbookPages(chapterID, token, index, count, offset)
+	pageList, err := service.EbookPagesContext(ctx, chapterID, token, index, count, offset)
 	if err != nil {
 		return
 	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	for _, item := range pageList.Pages {
+		if err = ctx.Err(); err != nil {
+			return nil, err
+		}
 		desContents, decryptErr := decryptEbookPage(item.Svg)
 		if decryptErr != nil {
 			return nil, fmt.Errorf("decrypt ebook page: %w", decryptErr)
@@ -169,7 +196,7 @@ func generateEbookPagesWithService(service *services.Service, chapterID, token s
 	if !pageList.IsEnd {
 		index = count
 		count += 20
-		list, err1 := generateEbookPagesWithService(service, chapterID, token, index, count, offset)
+		list, err1 := generateEbookPagesWithService(ctx, service, chapterID, token, index, count, offset)
 		if err1 != nil {
 			err = err1
 			return
