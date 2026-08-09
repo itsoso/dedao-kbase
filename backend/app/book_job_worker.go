@@ -180,13 +180,12 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 	if job != nil {
 		currentRunID = job.ID
 	}
+	var activeControlErr error
 	if err := w.heartbeat(ctx, currentRunID); err != nil {
-		if job != nil {
-			if _, interruptErr := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); interruptErr != nil {
-				return true, bookJobWorkerInfrastructureError("interrupt job after heartbeat failure")
-			}
+		if job == nil {
+			return processedControl, err
 		}
-		return job != nil, err
+		activeControlErr = err
 	}
 	if job == nil {
 		return processedControl, nil
@@ -197,7 +196,7 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		return true, nil
 	}
-	return true, w.executeClaimed(ctx, *job)
+	return true, w.executeClaimed(ctx, *job, activeControlErr)
 }
 
 func (w *BookJobWorker) Run(ctx context.Context) error {
@@ -309,7 +308,7 @@ type bookJobWorkerExecutionResult struct {
 	err    error
 }
 
-func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledgeJob) error {
+func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledgeJob, initialControlErr error) error {
 	if parent.Err() != nil {
 		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
 			return bookJobWorkerInfrastructureError("interrupt job")
@@ -423,7 +422,7 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 
 	var execution bookJobWorkerExecutionResult
 	var requestedRestart *SourceAgentCommand
-	var controlErr error
+	controlErr := initialControlErr
 	controlFailureChannel := (<-chan error)(controlFailure)
 	waitingForExecution := true
 	for waitingForExecution {

@@ -604,6 +604,67 @@ func TestBookJobWorkerControlOutagesDuringExecutionDoNotInterruptBookJob(t *test
 	}
 }
 
+func TestBookJobWorkerActiveHeartbeatFailureDoesNotInterruptClaimedJob(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 203)
+	activeHeartbeatFailed := make(chan struct{})
+	executorStarted := make(chan struct{})
+	releaseExecution := make(chan struct{})
+	var heartbeatCalls atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{}
+	client.heartbeat = func(context.Context, SourceAgentHeartbeat) error {
+		if heartbeatCalls.Add(1) == 2 {
+			close(activeHeartbeatFailed)
+			return errors.New("active heartbeat unavailable")
+		}
+		return nil
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-active-heartbeat", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(executorStarted)
+			select {
+			case <-releaseExecution:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := worker.RunOnce(context.Background())
+		done <- err
+	}()
+	select {
+	case <-activeHeartbeatFailed:
+	case <-time.After(time.Second):
+		t.Fatal("active heartbeat failure was not observed")
+	}
+	select {
+	case <-executorStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("active heartbeat failure prevented executor start")
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusRunning {
+		t.Fatalf("active heartbeat failure job=%#v err=%v", loaded, loadErr)
+	}
+	close(releaseExecution)
+	if err := <-done; !errors.Is(err, ErrBookJobWorkerInfrastructure) {
+		t.Fatalf("RunOnce error=%v", err)
+	}
+	loaded, loadErr = store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded {
+		t.Fatalf("completed job=%#v err=%v", loaded, loadErr)
+	}
+}
+
 func TestBookJobWorkerRunOnceClaimsOldestAndCompletesWithSafeStages(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	oldest := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 201)

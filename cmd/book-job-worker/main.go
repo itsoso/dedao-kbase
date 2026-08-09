@@ -225,6 +225,7 @@ func parseBookJobWorkerConfig(getenv bookJobWorkerEnvironmentLookup) (bookJobWor
 	}
 	root := bookJobWorkerRoot(getenv)
 	workerID := lookupTrimmedBookJobWorkerEnvironment(getenv, "KBASE_BOOK_JOB_WORKER_ID")
+	workerIDExplicit := workerID != ""
 	if workerID == "" {
 		var err error
 		workerID, err = newBookJobWorkerProcessID()
@@ -259,6 +260,9 @@ func parseBookJobWorkerConfig(getenv bookJobWorkerEnvironmentLookup) (bookJobWor
 			return bookJobWorkerParsedConfig{}, errors.New("incomplete source agent control configuration")
 		}
 		if agentID == "" {
+			if !workerIDExplicit {
+				return bookJobWorkerParsedConfig{}, errors.New("stable source agent identity is required")
+			}
 			agentID = workerID
 		}
 		cfg := app.SourceAgentConfig{

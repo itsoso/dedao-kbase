@@ -257,6 +257,44 @@ func TestBookJobWorkerCLIConfiguresSharedTokenSourceAgentControl(t *testing.T) {
 	}
 }
 
+func TestBookJobWorkerSourceAgentIdentityMustBeStableAcrossRestart(t *testing.T) {
+	base := bookJobWorkerTestEnv{
+		"KBASE_BOOK_KNOWLEDGE_ROOT": t.TempDir(),
+		"KBASE_REMOTE_URL":          "https://kbase.example.invalid",
+		"KBASE_SOURCE_AGENT_TOKEN":  "shared-agent-token",
+	}
+	if _, err := parseBookJobWorkerConfig(base.Lookup); err == nil {
+		t.Fatal("auto worker and implicit source agent identity were accepted")
+	}
+
+	explicitWorker := bookJobWorkerTestEnv{}
+	for key, value := range base {
+		explicitWorker[key] = value
+	}
+	explicitWorker["KBASE_BOOK_JOB_WORKER_ID"] = "stable-book-worker"
+	parsed, err := parseBookJobWorkerConfig(explicitWorker.Lookup)
+	if err != nil {
+		t.Fatalf("explicit worker identity rejected: %v", err)
+	}
+	if parsed.sourceAgentConfig == nil || parsed.sourceAgentConfig.AgentID != "stable-book-worker" || parsed.workerID != "stable-book-worker" {
+		t.Fatalf("inherited stable source identity=%#v worker=%q", parsed.sourceAgentConfig, parsed.workerID)
+	}
+
+	explicitSource := bookJobWorkerTestEnv{}
+	for key, value := range base {
+		explicitSource[key] = value
+	}
+	explicitSource["KBASE_SOURCE_AGENT_ID"] = "stable-source-agent"
+	parsed, err = parseBookJobWorkerConfig(explicitSource.Lookup)
+	if err != nil {
+		t.Fatalf("explicit source identity with auto process worker rejected: %v", err)
+	}
+	if parsed.sourceAgentConfig == nil || parsed.sourceAgentConfig.AgentID != "stable-source-agent" ||
+		parsed.workerID == "" || parsed.workerID == "stable-source-agent" {
+		t.Fatalf("source identity=%#v process worker=%q", parsed.sourceAgentConfig, parsed.workerID)
+	}
+}
+
 func TestBookJobWorkerCLIOnceTreatsControlledRestartAsCleanExit(t *testing.T) {
 	previousFactory := bookJobWorkerRuntimeFactory
 	defer func() { bookJobWorkerRuntimeFactory = previousFactory }()
