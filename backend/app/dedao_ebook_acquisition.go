@@ -142,7 +142,7 @@ func dedaoEbookFromServiceDetail(detail *services.EbookDetail) DedaoEbook {
 		return DedaoEbook{}
 	}
 	return DedaoEbook{
-		Enid: detail.Enid, ID: detail.ID, Title: detail.Title,
+		Enid: detail.Enid, ID: detail.ID, Title: firstNonEmptyEbookField(detail.Title, detail.OperatingTitle),
 		Author: firstNonEmptyEbookField(detail.BookAuthor, strings.Join(detail.AuthorList, " / ")),
 		Intro:  firstNonEmptyEbookField(detail.BookIntro, detail.AuthorInfo, detail.OperatingTitle),
 		Icon:   detail.Cover, Price: firstNonEmptyEbookField(detail.CurrentPrice, detail.Price, detail.OriginalPrice),

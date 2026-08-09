@@ -107,6 +107,19 @@ func TestDedaoSiteEbookSearchMappingStripsHighlightsAndSecrets(t *testing.T) {
 	}
 }
 
+func TestDedaoEbookDetailMappingFallsBackToOperatingTitle(t *testing.T) {
+	ebook := dedaoEbookFromServiceDetail(&services.EbookDetail{
+		ID:             32355,
+		Enid:           "site-ebook-enid",
+		OperatingTitle: "大模型导论",
+		BookAuthor:     "张成文",
+	})
+
+	if ebook.Title != "大模型导论" {
+		t.Fatalf("mapped title = %q, want operating title fallback", ebook.Title)
+	}
+}
+
 func TestKBaseHTTPHandlerAddsDedaoEbookToBookshelf(t *testing.T) {
 	provider := &fakeDedaoEbookAcquisition{
 		added: DedaoEbook{ID: 32355, Enid: "site-ebook-enid", Title: "陆蓉行为金融学讲义", IsBuy: true},
