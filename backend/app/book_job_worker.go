@@ -120,6 +120,9 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	if _, err := w.store.ReconcileExpiredBookKnowledgeJobsContext(ctx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			return false, nil
+		}
 		return false, bookJobWorkerInfrastructureError("reconcile jobs")
 	}
 	if w.beforeClaim != nil {
@@ -299,6 +302,12 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 			return bookJobWorkerInfrastructureError("complete job")
 		}
 		return nil
+	}
+	if errors.Is(execution.err, errBookKnowledgePublishRecoveryRequired) {
+		if _, err := w.store.markBookKnowledgeJobRecoveryRequired(job.ID, w.workerID); err != nil {
+			return bookJobWorkerInfrastructureError("mark package publish recovery required")
+		}
+		return bookJobWorkerInfrastructureError("package publish recovery required")
 	}
 	if renewErr != nil {
 		return renewErr

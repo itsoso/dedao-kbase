@@ -387,6 +387,42 @@ func TestBookJobWorkerRunPollsAndExitsCleanlyOnCancel(t *testing.T) {
 	}
 }
 
+func TestBookJobWorkerRunOnceTreatsReconcileCancellationAsCleanStop(t *testing.T) {
+	root := t.TempDir()
+	holder := NewBookKnowledgeStore(root)
+	rootLock, err := holder.acquireBookKnowledgeRootLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootLock.Close()
+	store := NewBookKnowledgeStore(root)
+	attempted := make(chan struct{})
+	store.beforePackageRootLock = func() { close(attempted) }
+	worker := newWorkerForTest(t, store, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		processed bool
+		err       error
+	}, 1)
+	go func() {
+		processed, runErr := worker.RunOnce(ctx)
+		done <- struct {
+			processed bool
+			err       error
+		}{processed: processed, err: runErr}
+	}()
+	<-attempted
+	cancel()
+	select {
+	case result := <-done:
+		if result.processed || result.err != nil {
+			t.Fatalf("RunOnce processed=%t err=%v, want clean canceled stop", result.processed, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RunOnce did not stop after reconcile cancellation")
+	}
+}
+
 func TestBookJobWorkerDefaultExecutorEmitsExpectedStages(t *testing.T) {
 	previousDownload := runDedaoEbookDownloadJob
 	previousSync := runDedaoEbookSyncKBaseJobWithStages
@@ -1132,6 +1168,71 @@ func TestCommittedTransactionResidueSelfCleansAfterCleanupFailure(t *testing.T) 
 	if err != nil || got.Book.Title != updated.Book.Title {
 		t.Fatalf("updated package=%#v err=%v", got, err)
 	}
+	assertNoBookKnowledgePublishResidue(t, root)
+}
+
+func TestBookJobWorkerRetainsTransactionWhenPublishRollbackCannotRestoreBackup(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 300)
+	original := publishCrashTestPackage(job, "Original Before Failed Rollback")
+	if err := store.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store.afterPackageBookInstall = func() error {
+		matches, err := filepath.Glob(filepath.Join(root, bookKnowledgePublishTransactionsDir, "*"))
+		if err != nil || len(matches) != 1 {
+			return fmt.Errorf("transaction matches=%v err=%v", matches, err)
+		}
+		if err := os.RemoveAll(filepath.Join(matches[0], "backup-book")); err != nil {
+			return err
+		}
+		cancel()
+		return errors.New("injected publish failure after deleting backup")
+	}
+	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		replacement := publishCrashTestPackage(claimed, "Replacement With Failed Rollback")
+		return nil, store.SavePackageContext(ctx, replacement)
+	})
+	processed, runErr := worker.RunOnce(ctx)
+	if !processed || !errors.Is(runErr, ErrBookJobWorkerInfrastructure) {
+		t.Fatalf("RunOnce processed=%t err=%v, want recovery-required infrastructure error", processed, runErr)
+	}
+	recoveryJob, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || recoveryJob.Status != BookKnowledgeJobStatusRunning || recoveryJob.Stage != "recovery_required" {
+		t.Fatalf("recovery-required job=%#v err=%v", recoveryJob, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 1)
+	transactions, err := filepath.Glob(filepath.Join(root, bookKnowledgePublishTransactionsDir, "*"))
+	if err != nil || len(transactions) != 1 {
+		t.Fatalf("retained transaction=%v err=%v", transactions, err)
+	}
+	if _, err := os.Stat(filepath.Join(transactions[0], bookKnowledgePublishJournalFileName)); err != nil {
+		t.Fatalf("retained journal: %v", err)
+	}
+
+	restoreStore := NewBookKnowledgeStore(t.TempDir())
+	if err := restoreStore.SavePackage(original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(restoreStore.BookDir(original.Book.BookID), filepath.Join(transactions[0], "backup-book")); err != nil {
+		t.Fatal(err)
+	}
+	count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	finalJob, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || finalJob.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("reconciled job=%#v err=%v", finalJob, err)
+	}
+	restored, err := NewBookKnowledgeStore(root).LoadPackage(original.Book.BookID)
+	if err != nil || restored.Book.Title != original.Book.Title {
+		t.Fatalf("restored package=%#v err=%v", restored, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
 	assertNoBookKnowledgePublishResidue(t, root)
 }
 

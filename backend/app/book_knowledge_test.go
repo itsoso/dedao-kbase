@@ -651,6 +651,193 @@ func TestReconcileRetainsAmbiguousPublishTransactionEvidence(t *testing.T) {
 	}
 }
 
+func TestReconcileRemovesOwnedDamagedFinalFromFirstPublish(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 301)
+	claimed, err := store.ClaimNextBookKnowledgeJob("damaged-first-publish-worker", time.Minute)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+	killBookKnowledgePublishHelper(
+		t, root, job.ID, "damaged-first-publish-worker", "book-installed", "publish-book-installed",
+	)
+	if err := os.Remove(store.BookJSONLPath("301", "chunks")); err != nil {
+		t.Fatal(err)
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+	count, err := NewBookKnowledgeStore(root).ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	recovered, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || recovered.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("damaged first publish job=%#v err=%v", recovered, err)
+	}
+	if _, err := os.Stat(store.BookDir("301")); !os.IsNotExist(err) {
+		t.Fatalf("owned damaged final error=%v, want removed", err)
+	}
+	books, err := store.ListBooks()
+	if err != nil || len(books) != 0 {
+		t.Fatalf("root manifest books=%#v err=%v, want no damaged publish", books, err)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	assertNoBookKnowledgePublishResidue(t, root)
+}
+
+func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
+	type expectedState struct {
+		recovered bool
+		errorIs   error
+		cleanup   bool
+		final     string
+	}
+	tests := []struct {
+		name     string
+		staged   string
+		final    string
+		backup   bool
+		expected expectedState
+	}{
+		{name: "staged valid final absent no backup", staged: "valid", expected: expectedState{recovered: true, cleanup: true, final: "new"}},
+		{name: "staged valid final absent backup", staged: "valid", backup: true, expected: expectedState{recovered: true, cleanup: true, final: "new"}},
+		{name: "staged valid final old no backup", staged: "valid", final: "unknown", expected: expectedState{recovered: true, cleanup: true, final: "new"}},
+		{name: "staged valid final unknown backup", staged: "valid", final: "unknown", backup: true, expected: expectedState{errorIs: errBookKnowledgePublishAmbiguous, final: "unknown"}},
+		{name: "staged invalid final valid no backup", staged: "invalid", final: "valid", expected: expectedState{recovered: true, cleanup: true, final: "new"}},
+		{name: "staged invalid final valid backup", staged: "invalid", final: "valid", backup: true, expected: expectedState{recovered: true, cleanup: true, final: "new"}},
+		{name: "staged invalid final owned invalid no backup", staged: "invalid", final: "owned_invalid", expected: expectedState{cleanup: true}},
+		{name: "staged invalid final owned invalid backup", staged: "invalid", final: "owned_invalid", backup: true, expected: expectedState{cleanup: true, final: "old"}},
+		{name: "staged invalid final unknown no backup", staged: "invalid", final: "unknown", expected: expectedState{errorIs: errBookKnowledgePublishAmbiguous, final: "unknown"}},
+		{name: "staged invalid final unknown backup", staged: "invalid", final: "unknown", backup: true, expected: expectedState{errorIs: errBookKnowledgePublishAmbiguous, final: "unknown"}},
+		{name: "staged invalid final absent no backup", staged: "invalid", expected: expectedState{errorIs: errBookKnowledgePublishRecoveryRequired}},
+		{name: "staged invalid final absent backup", staged: "invalid", backup: true, expected: expectedState{cleanup: true, final: "old"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := NewBookKnowledgeStore(root)
+			job := BookKnowledgeJob{ID: "matrix-job", Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 302, EbookEnID: "worker-302"}
+			newPackage := publishCrashTestPackage(job, "Matrix New Package")
+			hash, err := BookKnowledgeContentHash(newPackage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newPackage.Book.ContentHash = hash
+			marker := bookKnowledgeJobCommitMarker{
+				Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: strings.Repeat("a", 32),
+				BookID: newPackage.Book.BookID, ContentHash: hash,
+			}
+			receipt := bookKnowledgeJobCommitReceipt{
+				JobID: job.ID, WorkerID: "matrix-worker", BookID: marker.BookID,
+				ContentHash: marker.ContentHash, PublishNonce: marker.PublishNonce, PreparedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			transactionRoot, err := createBookKnowledgePublishTransaction(root, marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal := bookKnowledgePublishJournal{
+				Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhasePrepared,
+				BookExisted: test.backup,
+			}
+			if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+				t.Fatal(err)
+			}
+			if test.staged != "" {
+				writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "book"), newPackage, marker, test.staged == "invalid")
+			}
+			switch test.final {
+			case "valid":
+				writeBookKnowledgePublishStatePackage(t, store.BookDir(marker.BookID), newPackage, marker, false)
+			case "owned_invalid":
+				writeBookKnowledgePublishStatePackage(t, store.BookDir(marker.BookID), newPackage, marker, true)
+			case "unknown":
+				unknown := publishCrashTestPackage(job, "Matrix Unknown Package")
+				unknownHash, hashErr := BookKnowledgeContentHash(unknown)
+				if hashErr != nil {
+					t.Fatal(hashErr)
+				}
+				unknown.Book.ContentHash = unknownHash
+				writeBookKnowledgePublishStatePackage(t, store.BookDir(marker.BookID), unknown, bookKnowledgeJobCommitMarker{}, false)
+			}
+			if test.backup {
+				oldPackage := publishCrashTestPackage(job, "Matrix Old Package")
+				oldHash, hashErr := BookKnowledgeContentHash(oldPackage)
+				if hashErr != nil {
+					t.Fatal(hashErr)
+				}
+				oldPackage.Book.ContentHash = oldHash
+				writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "backup-book"), oldPackage, bookKnowledgeJobCommitMarker{}, false)
+			}
+
+			recovered, err := store.recoverBookKnowledgePublishTransaction(job, receipt)
+			if recovered != test.expected.recovered || !errors.Is(err, test.expected.errorIs) {
+				t.Fatalf("recover=%t err=%v, want recover=%t error=%v", recovered, err, test.expected.recovered, test.expected.errorIs)
+			}
+			_, statErr := os.Stat(transactionRoot)
+			if test.expected.cleanup && !os.IsNotExist(statErr) {
+				t.Fatalf("transaction cleanup error=%v, want removed", statErr)
+			}
+			if !test.expected.cleanup && statErr != nil {
+				t.Fatalf("retained transaction error=%v", statErr)
+			}
+			got, loadErr := store.LoadPackage(marker.BookID)
+			switch test.expected.final {
+			case "new":
+				if loadErr != nil || got.Book.Title != "Matrix New Package" {
+					t.Fatalf("new final=%#v err=%v", got, loadErr)
+				}
+			case "old":
+				if loadErr != nil || got.Book.Title != "Matrix Old Package" {
+					t.Fatalf("old final=%#v err=%v", got, loadErr)
+				}
+			case "unknown":
+				if loadErr != nil || got.Book.Title != "Matrix Unknown Package" {
+					t.Fatalf("unknown final=%#v err=%v", got, loadErr)
+				}
+			default:
+				if !os.IsNotExist(loadErr) {
+					t.Fatalf("absent final=%#v err=%v", got, loadErr)
+				}
+			}
+		})
+	}
+}
+
+func writeBookKnowledgePublishStatePackage(
+	t *testing.T,
+	bookDir string,
+	pkg BookKnowledgePackage,
+	marker bookKnowledgeJobCommitMarker,
+	damaged bool,
+) {
+	t.Helper()
+	if err := os.MkdirAll(bookDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONFile(filepath.Join(bookDir, "manifest.json"), pkg.Book); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONLFile(filepath.Join(bookDir, "chapters.jsonl"), pkg.Chapters); err != nil {
+		t.Fatal(err)
+	}
+	if !damaged {
+		if err := writeJSONLFile(filepath.Join(bookDir, "chunks.jsonl"), pkg.Chunks); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeJSONLFile(filepath.Join(bookDir, "claims.jsonl"), pkg.Claims); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONLFile(filepath.Join(bookDir, "citations.jsonl"), pkg.Citations); err != nil {
+		t.Fatal(err)
+	}
+	if marker.Version != "" {
+		if err := writeBookKnowledgeJobCommitMarker(bookDir, marker); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestBookKnowledgePublishCrashSubprocessHelper(t *testing.T) {
 	root := os.Getenv(bookKnowledgePublishCrashHelperEnv)
 	if root == "" {

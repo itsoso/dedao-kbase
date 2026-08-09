@@ -485,6 +485,16 @@ func (s *BookKnowledgeStore) InterruptBookKnowledgeJob(jobID, workerID string) (
 	})
 }
 
+func (s *BookKnowledgeStore) markBookKnowledgeJobRecoveryRequired(jobID, workerID string) (BookKnowledgeJob, error) {
+	return s.updateOwnedRunningBookKnowledgeJob(jobID, workerID, func(job *BookKnowledgeJob, now time.Time) error {
+		job.Stage = "recovery_required"
+		job.LeaseExpiresAt = now.Add(-time.Nanosecond).Format(time.RFC3339Nano)
+		job.UpdatedAt = now.Format(time.RFC3339Nano)
+		job.Logs = append(job.Logs, "recovery_required")
+		return nil
+	})
+}
+
 func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobs() (int, error) {
 	return s.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
 }

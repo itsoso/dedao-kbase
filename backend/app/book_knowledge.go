@@ -39,10 +39,11 @@ const (
 )
 
 var (
-	errBookKnowledgeJobCommitMarkerInvalid = errors.New("invalid book job commit marker")
-	errBookKnowledgePublishPending         = errors.New("pending book publish transaction")
-	errBookKnowledgePublishCorrupt         = errors.New("corrupt book publish transaction")
-	errBookKnowledgePublishAmbiguous       = errors.New("ambiguous book publish transaction")
+	errBookKnowledgeJobCommitMarkerInvalid  = errors.New("invalid book job commit marker")
+	errBookKnowledgePublishPending          = errors.New("pending book publish transaction")
+	errBookKnowledgePublishCorrupt          = errors.New("corrupt book publish transaction")
+	errBookKnowledgePublishAmbiguous        = errors.New("ambiguous book publish transaction")
+	errBookKnowledgePublishRecoveryRequired = errors.New("book publish transaction requires recovery")
 )
 
 type BookKnowledgeBook struct {
@@ -377,6 +378,9 @@ func (s *BookKnowledgeStore) savePackageContextUnlocked(ctx context.Context, pkg
 		receiptActive = true
 		defer func() {
 			if !receiptActive {
+				return
+			}
+			if errors.Is(returnErr, errBookKnowledgePublishRecoveryRequired) {
 				return
 			}
 			if transactionCreated {
@@ -884,7 +888,10 @@ func publishBookKnowledgePackageTransaction(
 		if err := restorePathFromBackup(backupBookDir, bookDir, bookExisted); err != nil {
 			rollbackErrors = append(rollbackErrors, fmt.Errorf("restore book package: %w", err))
 		}
-		return errors.Join(append([]error{publishErr}, rollbackErrors...)...)
+		if len(rollbackErrors) != 0 {
+			return errors.Join(append([]error{errBookKnowledgePublishRecoveryRequired, publishErr}, rollbackErrors...)...)
+		}
+		return publishErr
 	}
 	if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
 		return rollback(err)
@@ -1012,6 +1019,11 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 	if err != nil {
 		return false, err
 	}
+	finalOwned := false
+	if finalExists {
+		marker, markerErr := readBookKnowledgeJobCommitMarker(finalBookDir)
+		finalOwned = markerErr == nil && marker == expectedMarker
+	}
 	if backupExists && !finalExists {
 		if err := os.MkdirAll(filepath.Dir(finalBookDir), os.ModePerm); err != nil {
 			return false, err
@@ -1020,8 +1032,7 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 			return false, err
 		}
 	} else if backupExists && finalExists {
-		marker, markerErr := readBookKnowledgeJobCommitMarker(finalBookDir)
-		if markerErr == nil && marker == expectedMarker {
+		if finalOwned {
 			if err := os.RemoveAll(finalBookDir); err != nil {
 				return false, err
 			}
@@ -1031,6 +1042,18 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		} else {
 			return false, fmt.Errorf("%w: current package is not owned by the transaction", errBookKnowledgePublishAmbiguous)
 		}
+	} else if !backupExists && finalExists {
+		if !finalOwned {
+			return false, fmt.Errorf("%w: damaged current package is not owned by the transaction", errBookKnowledgePublishAmbiguous)
+		}
+		if err := os.RemoveAll(finalBookDir); err != nil {
+			return false, err
+		}
+		if err := s.removeBookKnowledgeRootManifestEntry(receipt.BookID, receipt.ContentHash); err != nil {
+			return false, err
+		}
+	} else {
+		return false, errBookKnowledgePublishRecoveryRequired
 	}
 	if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
 		return false, err
@@ -1082,6 +1105,26 @@ func (s *BookKnowledgeStore) repairBookKnowledgeRootManifest(pkg BookKnowledgePa
 		return err
 	}
 	manifest = upsertBookKnowledgeManifest(manifest, pkg.Book)
+	payload, err := encodeJSONFile(manifest)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomically(s.ManifestPath(), payload)
+}
+
+func (s *BookKnowledgeStore) removeBookKnowledgeRootManifestEntry(bookID, contentHash string) error {
+	manifest, err := s.loadManifest()
+	if err != nil {
+		return err
+	}
+	books := manifest.Books[:0]
+	for _, book := range manifest.Books {
+		if book.BookID == bookID && book.ContentHash == contentHash {
+			continue
+		}
+		books = append(books, book)
+	}
+	manifest.Books = books
 	payload, err := encodeJSONFile(manifest)
 	if err != nil {
 		return err
