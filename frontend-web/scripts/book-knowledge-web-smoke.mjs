@@ -260,6 +260,27 @@ for (const staleLabel of [
   assert.ok(!js.includes(staleLabel), `Chinese Agent pages should remove ${staleLabel}`);
 }
 assert.ok(css.includes("@media (max-width: 760px)"), "Book App should include a narrow mobile layout");
+for (const selector of [
+  ".package-contract__body",
+  ".reading-app__body",
+  ".reading-app__rail",
+  ".agent-page-technical code",
+]) {
+  assert.ok(css.includes(selector), `Chinese Agent page styles should include ${selector}`);
+}
+assert.ok(
+  css.includes("grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.65fr)"),
+  "Package contract should use a policy and evaluation split",
+);
+assert.ok(
+  css.includes("grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr)"),
+  "Reading App should use a workspace and status split",
+);
+const chineseAgentMobileSource = css.match(/@media \(max-width: 760px\) \{[\s\S]*?\.package-contract__body,[\s\S]*?\.reading-app__body \{([\s\S]*?)\n  \}/)?.[1] || "";
+assert.ok(
+  chineseAgentMobileSource.includes("grid-template-columns: minmax(0, 1fr)"),
+  "Package contract and Reading App should collapse to one mobile column",
+);
 const metricStripSource = css.match(/\.book-agent__manifest \.book-agent__metric-strip \{([\s\S]*?)\n\}/)?.[1] || "";
 assert.ok(metricStripSource.includes("display: grid"), "Agent metrics should use a wrapping grid instead of one rigid flex row");
 assert.ok(metricStripSource.includes("auto-fit"), "Agent metrics should adapt their column count to the viewport");
