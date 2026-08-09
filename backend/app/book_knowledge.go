@@ -1015,6 +1015,17 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 	if err != nil {
 		return false, err
 	}
+	var backupPackage *BookKnowledgePackage
+	if backupExists {
+		var backupValid bool
+		backupPackage, backupValid, err = verifyBookKnowledgeBackupDirectory(backupBookDir, receipt.BookID)
+		if err != nil {
+			return false, err
+		}
+		if !backupValid {
+			return false, errBookKnowledgePublishRecoveryRequired
+		}
+	}
 	finalExists, err := pathExists(finalBookDir)
 	if err != nil {
 		return false, err
@@ -1025,6 +1036,9 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		finalOwned = markerErr == nil && marker == expectedMarker
 	}
 	if backupExists && !finalExists {
+		if err := s.repairBookKnowledgeRootManifest(*backupPackage); err != nil {
+			return false, err
+		}
 		if err := os.MkdirAll(filepath.Dir(finalBookDir), os.ModePerm); err != nil {
 			return false, err
 		}
@@ -1033,6 +1047,9 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		}
 	} else if backupExists && finalExists {
 		if finalOwned {
+			if err := s.repairBookKnowledgeRootManifest(*backupPackage); err != nil {
+				return false, err
+			}
 			if err := os.RemoveAll(finalBookDir); err != nil {
 				return false, err
 			}
@@ -1094,6 +1111,27 @@ func verifyBookKnowledgePublishDirectory(
 		return nil, false, err
 	}
 	if computedHash != receipt.ContentHash {
+		return nil, false, nil
+	}
+	return pkg, true, nil
+}
+
+func verifyBookKnowledgeBackupDirectory(bookDir, bookID string) (*BookKnowledgePackage, bool, error) {
+	pkg, err := loadBookKnowledgePackageFromDirectory(bookDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if pkg.Book.BookID != bookID || strings.TrimSpace(pkg.Book.ContentHash) == "" {
+		return nil, false, nil
+	}
+	computedHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return nil, false, err
+	}
+	if computedHash != pkg.Book.ContentHash {
 		return nil, false, nil
 	}
 	return pkg, true, nil

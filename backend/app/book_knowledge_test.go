@@ -693,11 +693,12 @@ func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
 		final     string
 	}
 	tests := []struct {
-		name     string
-		staged   string
-		final    string
-		backup   bool
-		expected expectedState
+		name          string
+		staged        string
+		final         string
+		backup        bool
+		backupInvalid bool
+		expected      expectedState
 	}{
 		{name: "staged valid final absent no backup", staged: "valid", expected: expectedState{recovered: true, cleanup: true, final: "new"}},
 		{name: "staged valid final absent backup", staged: "valid", backup: true, expected: expectedState{recovered: true, cleanup: true, final: "new"}},
@@ -711,6 +712,7 @@ func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
 		{name: "staged invalid final unknown backup", staged: "invalid", final: "unknown", backup: true, expected: expectedState{errorIs: errBookKnowledgePublishAmbiguous, final: "unknown"}},
 		{name: "staged invalid final absent no backup", staged: "invalid", expected: expectedState{errorIs: errBookKnowledgePublishRecoveryRequired}},
 		{name: "staged invalid final absent backup", staged: "invalid", backup: true, expected: expectedState{cleanup: true, final: "old"}},
+		{name: "staged invalid final absent invalid backup", staged: "invalid", backup: true, backupInvalid: true, expected: expectedState{errorIs: errBookKnowledgePublishRecoveryRequired}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -723,6 +725,11 @@ func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
 				t.Fatal(err)
 			}
 			newPackage.Book.ContentHash = hash
+			if err := writeJSONFile(store.ManifestPath(), BookKnowledgeManifest{
+				Version: bookKnowledgeVersion, Books: []BookKnowledgeBook{newPackage.Book},
+			}); err != nil {
+				t.Fatal(err)
+			}
 			marker := bookKnowledgeJobCommitMarker{
 				Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: strings.Repeat("a", 32),
 				BookID: newPackage.Book.BookID, ContentHash: hash,
@@ -766,7 +773,9 @@ func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
 					t.Fatal(hashErr)
 				}
 				oldPackage.Book.ContentHash = oldHash
-				writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "backup-book"), oldPackage, bookKnowledgeJobCommitMarker{}, false)
+				writeBookKnowledgePublishStatePackage(
+					t, filepath.Join(transactionRoot, "backup-book"), oldPackage, bookKnowledgeJobCommitMarker{}, test.backupInvalid,
+				)
 			}
 
 			recovered, err := store.recoverBookKnowledgePublishTransaction(job, receipt)
@@ -797,6 +806,19 @@ func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
 			default:
 				if !os.IsNotExist(loadErr) {
 					t.Fatalf("absent final=%#v err=%v", got, loadErr)
+				}
+			}
+			if test.expected.cleanup {
+				manifest, manifestErr := store.loadManifest()
+				if manifestErr != nil {
+					t.Fatal(manifestErr)
+				}
+				if test.expected.final == "" {
+					if len(manifest.Books) != 0 {
+						t.Fatalf("cleaned absent final manifest=%#v, want empty", manifest.Books)
+					}
+				} else if loadErr != nil || len(manifest.Books) != 1 || manifest.Books[0] != got.Book {
+					t.Fatalf("converged manifest=%#v final=%#v err=%v", manifest.Books, got, loadErr)
 				}
 			}
 		})
