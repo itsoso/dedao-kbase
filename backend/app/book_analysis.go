@@ -127,9 +127,27 @@ func (s *BookKnowledgeStore) BookAnalysisManifestPath(bookID string) string {
 }
 
 func (s *BookKnowledgeStore) SaveAnalysisManifest(manifest BookAnalysisManifest) error {
+	return s.SaveAnalysisManifestContext(context.Background(), manifest)
+}
+
+func (s *BookKnowledgeStore) SaveAnalysisManifestContext(ctx context.Context, manifest BookAnalysisManifest) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer rootLock.Close()
+	return s.saveAnalysisManifestUnlocked(manifest)
+}
 
+func (s *BookKnowledgeStore) saveAnalysisManifestUnlocked(manifest BookAnalysisManifest) error {
 	manifest.BookID = sanitizeBookKnowledgeID(manifest.BookID)
 	if strings.TrimSpace(manifest.BookID) == "" {
 		return fmt.Errorf("analysis manifest missing book_id")
@@ -151,9 +169,27 @@ func (s *BookKnowledgeStore) SaveAnalysisManifest(manifest BookAnalysisManifest)
 }
 
 func (s *BookKnowledgeStore) LoadAnalysisManifest(bookID string) (*BookAnalysisManifest, error) {
+	return s.LoadAnalysisManifestContext(context.Background(), bookID)
+}
+
+func (s *BookKnowledgeStore) LoadAnalysisManifestContext(ctx context.Context, bookID string) (*BookAnalysisManifest, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootReadLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	return s.loadAnalysisManifestUnlocked(bookID)
+}
 
+func (s *BookKnowledgeStore) loadAnalysisManifestUnlocked(bookID string) (*BookAnalysisManifest, error) {
 	bookID = sanitizeBookKnowledgeID(bookID)
 	if strings.TrimSpace(bookID) == "" {
 		return nil, fmt.Errorf("book_id is required")
@@ -226,13 +262,13 @@ func GenerateBookAnalysisManifestWithClient(
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if previous, loadErr := store.LoadAnalysisManifest(pkg.Book.BookID); loadErr == nil {
+	if previous, loadErr := store.LoadAnalysisManifestContext(ctx, pkg.Book.BookID); loadErr == nil {
 		manifest.CreatedAt = firstNonEmpty(previous.CreatedAt, now)
 		manifest.Answer = previous.Answer
 		manifest.Payload = previous.Payload
 		manifest.CompletedAt = previous.CompletedAt
 	}
-	if err := store.SaveAnalysisManifest(manifest); err != nil {
+	if err := store.SaveAnalysisManifestContext(ctx, manifest); err != nil {
 		return nil, err
 	}
 	messages := []BookKnowledgeMessage{
@@ -251,7 +287,7 @@ func GenerateBookAnalysisManifestWithClient(
 		manifest.Status = BookAnalysisFailed
 		manifest.Error = trimRunes(err.Error(), 2000)
 		manifest.UpdatedAt = completedAt
-		if saveErr := store.SaveAnalysisManifest(manifest); saveErr != nil {
+		if saveErr := store.SaveAnalysisManifestContext(ctx, manifest); saveErr != nil {
 			return nil, fmt.Errorf("%w (save failed analysis manifest: %v)", err, saveErr)
 		}
 		return nil, err
@@ -261,7 +297,7 @@ func GenerateBookAnalysisManifestWithClient(
 		manifest.Status = BookAnalysisFailed
 		manifest.Error = trimRunes(err.Error(), 2000)
 		manifest.UpdatedAt = completedAt
-		if saveErr := store.SaveAnalysisManifest(manifest); saveErr != nil {
+		if saveErr := store.SaveAnalysisManifestContext(ctx, manifest); saveErr != nil {
 			return nil, fmt.Errorf("%w (save failed analysis manifest: %v)", err, saveErr)
 		}
 		return nil, err
@@ -270,7 +306,7 @@ func GenerateBookAnalysisManifestWithClient(
 		manifest.Status = BookAnalysisFailed
 		manifest.Error = trimRunes(err.Error(), 2000)
 		manifest.UpdatedAt = completedAt
-		if saveErr := store.SaveAnalysisManifest(manifest); saveErr != nil {
+		if saveErr := store.SaveAnalysisManifestContext(ctx, manifest); saveErr != nil {
 			return nil, fmt.Errorf("%w (save failed analysis manifest: %v)", err, saveErr)
 		}
 		return nil, err
@@ -281,7 +317,7 @@ func GenerateBookAnalysisManifestWithClient(
 	manifest.Error = ""
 	manifest.UpdatedAt = completedAt
 	manifest.CompletedAt = completedAt
-	if err := store.SaveAnalysisManifest(manifest); err != nil {
+	if err := store.SaveAnalysisManifestContext(ctx, manifest); err != nil {
 		return nil, err
 	}
 	if _, err := EvaluateBookAnalysisQuality(store, manifest.BookID); err != nil {

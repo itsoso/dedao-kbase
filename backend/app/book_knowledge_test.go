@@ -19,6 +19,7 @@ import (
 )
 
 const bookKnowledgeRootLockHelperEnv = "DEDAO_TEST_BOOK_PACKAGE_LOCK_HELPER"
+const bookKnowledgeDerivedLockHelperEnv = "DEDAO_TEST_BOOK_DERIVED_LOCK_HELPER"
 
 func TestBookKnowledgeContentHashIsStableAndTracksDurableContent(t *testing.T) {
 	pkg := sampleBookKnowledgePackageForExport()
@@ -440,6 +441,145 @@ func TestBookKnowledgeReaderWaitsForWholePackagePublishAcrossStores(t *testing.T
 	}
 }
 
+func TestDerivedArtifactWriteWaitsForPackageSwapAndIsNotLost(t *testing.T) {
+	root := t.TempDir()
+	packageStore := NewBookKnowledgeStore(root)
+	derivedStore := NewBookKnowledgeStore(root)
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "derived-write"
+	pkg.Book.ContentHash = ""
+	if err := packageStore.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	updated := pkg
+	updated.Book.Title = "Updated Package"
+	updated.Book.ContentHash = ""
+	packageAtGate := make(chan struct{})
+	releasePackage := make(chan struct{})
+	derivedAttempted := make(chan struct{})
+	packageStore.beforePackagePublish = func() {
+		close(packageAtGate)
+		<-releasePackage
+	}
+	derivedStore.beforePackageRootLock = func() { close(derivedAttempted) }
+	packageDone := make(chan error, 1)
+	go func() { packageDone <- packageStore.SavePackageContext(context.Background(), updated) }()
+	<-packageAtGate
+	derivedDone := make(chan error, 1)
+	go func() {
+		derivedDone <- derivedStore.SaveAnalysisManifestContext(context.Background(), BookAnalysisManifest{
+			BookID: pkg.Book.BookID, ContentHash: "derived-hash", Status: BookAnalysisReady,
+		})
+	}()
+	<-derivedAttempted
+	close(releasePackage)
+	if err := <-packageDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-derivedDone; err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := NewBookKnowledgeStore(root).LoadAnalysisManifest(pkg.Book.BookID)
+	if err != nil || manifest.ContentHash != "derived-hash" {
+		t.Fatalf("derived manifest=%#v err=%v", manifest, err)
+	}
+}
+
+func TestDerivedArtifactReadWaitsForWholePackageSnapshot(t *testing.T) {
+	root := t.TempDir()
+	packageStore := NewBookKnowledgeStore(root)
+	reader := NewBookKnowledgeStore(root)
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "derived-read"
+	pkg.Book.ContentHash = ""
+	if err := packageStore.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	if err := packageStore.SaveBookQualityReport(BookQualityReport{
+		BookID: pkg.Book.BookID, ContentHash: "before-swap", Decision: BookQualityPass,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated := pkg
+	updated.Book.Title = "Updated Package"
+	updated.Book.ContentHash = ""
+	bookInstalled := make(chan struct{})
+	releasePublish := make(chan struct{})
+	readerAttempted := make(chan struct{})
+	packageStore.afterPackageBookInstall = func() error {
+		close(bookInstalled)
+		<-releasePublish
+		return nil
+	}
+	reader.beforePackageRootReadLock = func() { close(readerAttempted) }
+	packageDone := make(chan error, 1)
+	go func() { packageDone <- packageStore.SavePackageContext(context.Background(), updated) }()
+	<-bookInstalled
+	type qualityResult struct {
+		report *BookQualityReport
+		err    error
+	}
+	readDone := make(chan qualityResult, 1)
+	go func() {
+		report, err := reader.LoadBookQualityReportContext(context.Background(), pkg.Book.BookID)
+		readDone <- qualityResult{report: report, err: err}
+	}()
+	<-readerAttempted
+	close(releasePublish)
+	if err := <-packageDone; err != nil {
+		t.Fatal(err)
+	}
+	read := <-readDone
+	if read.err != nil || read.report.ContentHash != "before-swap" {
+		t.Fatalf("derived read=%#v err=%v", read.report, read.err)
+	}
+}
+
+func TestDerivedArtifactLockWaitHonorsCancellation(t *testing.T) {
+	root := t.TempDir()
+	packageStore := NewBookKnowledgeStore(root)
+	derivedStore := NewBookKnowledgeStore(root)
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "derived-cancel"
+	pkg.Book.ContentHash = ""
+	if err := packageStore.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	packageAtGate := make(chan struct{})
+	releasePackage := make(chan struct{})
+	derivedAttempted := make(chan struct{})
+	packageStore.beforePackagePublish = func() {
+		close(packageAtGate)
+		<-releasePackage
+	}
+	derivedStore.beforePackageRootLock = func() { close(derivedAttempted) }
+	packageDone := make(chan error, 1)
+	go func() { packageDone <- packageStore.SavePackageContext(context.Background(), pkg) }()
+	<-packageAtGate
+	ctx, cancel := context.WithCancel(context.Background())
+	derivedDone := make(chan error, 1)
+	go func() {
+		derivedDone <- derivedStore.SaveAnalysisManifestContext(ctx, BookAnalysisManifest{BookID: pkg.Book.BookID})
+	}()
+	<-derivedAttempted
+	cancel()
+	select {
+	case err := <-derivedDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("derived write error=%v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("derived write did not stop after cancellation")
+	}
+	close(releasePackage)
+	if err := <-packageDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(packageStore.BookAnalysisManifestPath(pkg.Book.BookID)); !os.IsNotExist(err) {
+		t.Fatalf("canceled derived artifact error=%v, want not exist", err)
+	}
+}
+
 func TestBookKnowledgeRootLockSubprocessHelper(t *testing.T) {
 	root := os.Getenv(bookKnowledgeRootLockHelperEnv)
 	if root == "" {
@@ -460,6 +600,74 @@ func TestBookKnowledgeRootLockSubprocessHelper(t *testing.T) {
 		t.Fatalf("SavePackageContext error=%v, want context canceled", err)
 	}
 	fmt.Println("package-lock-canceled")
+}
+
+func TestDerivedArtifactLockCancellationAcrossProcesses(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	rootLock, err := store.acquireBookKnowledgeRootLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rootLock.Close()
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDerivedArtifactLockSubprocessHelper$", "-test.v")
+	cmd.Env = append(os.Environ(), bookKnowledgeDerivedLockHelperEnv+"="+root)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil && cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	lines := make(chan string, 8)
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+		close(lines)
+	}()
+	waitForSubprocessLine(t, lines, "derived-lock-attempted")
+	if _, err := stdin.Write([]byte("cancel\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	waitForSubprocessLine(t, lines, "derived-lock-canceled")
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("derived lock helper: %v", err)
+	}
+}
+
+func TestDerivedArtifactLockSubprocessHelper(t *testing.T) {
+	root := os.Getenv(bookKnowledgeDerivedLockHelperEnv)
+	if root == "" {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+		cancel()
+	}()
+	store := NewBookKnowledgeStore(root)
+	store.beforePackageRootLock = func() { fmt.Println("derived-lock-attempted") }
+	err := store.SaveAnalysisManifestContext(ctx, BookAnalysisManifest{BookID: "subprocess-derived"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SaveAnalysisManifestContext error=%v, want context canceled", err)
+	}
+	fmt.Println("derived-lock-canceled")
 }
 
 func waitForSubprocessLine(t *testing.T, lines <-chan string, want string) {

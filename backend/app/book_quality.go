@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -45,8 +46,27 @@ func (s *BookKnowledgeStore) BookQualityReportPath(bookID string) string {
 }
 
 func (s *BookKnowledgeStore) SaveBookQualityReport(report BookQualityReport) error {
+	return s.SaveBookQualityReportContext(context.Background(), report)
+}
+
+func (s *BookKnowledgeStore) SaveBookQualityReportContext(ctx context.Context, report BookQualityReport) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer rootLock.Close()
+	return s.saveBookQualityReportUnlocked(report)
+}
+
+func (s *BookKnowledgeStore) saveBookQualityReportUnlocked(report BookQualityReport) error {
 	report.BookID = sanitizeBookKnowledgeID(report.BookID)
 	if strings.TrimSpace(report.BookID) == "" {
 		return fmt.Errorf("quality report missing book_id")
@@ -65,8 +85,27 @@ func (s *BookKnowledgeStore) SaveBookQualityReport(report BookQualityReport) err
 }
 
 func (s *BookKnowledgeStore) LoadBookQualityReport(bookID string) (*BookQualityReport, error) {
+	return s.LoadBookQualityReportContext(context.Background(), bookID)
+}
+
+func (s *BookKnowledgeStore) LoadBookQualityReportContext(ctx context.Context, bookID string) (*BookQualityReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootReadLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	return s.loadBookQualityReportUnlocked(bookID)
+}
+
+func (s *BookKnowledgeStore) loadBookQualityReportUnlocked(bookID string) (*BookQualityReport, error) {
 	bookID = sanitizeBookKnowledgeID(bookID)
 	if strings.TrimSpace(bookID) == "" {
 		return nil, fmt.Errorf("book_id is required")

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"os"
@@ -47,9 +48,30 @@ func (s *BookKnowledgeStore) NotebookLMBridgePath(bookID string) string {
 }
 
 func (s *BookKnowledgeStore) LoadNotebookLMBridge(bookID string) (*BookKnowledgeNotebookLMBridge, error) {
+	return s.LoadNotebookLMBridgeContext(context.Background(), bookID)
+}
+
+func (s *BookKnowledgeStore) LoadNotebookLMBridgeContext(ctx context.Context, bookID string) (*BookKnowledgeNotebookLMBridge, error) {
 	if s == nil {
 		s = DefaultBookKnowledgeStore()
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootReadLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	return s.loadNotebookLMBridgeUnlocked(bookID)
+}
+
+func (s *BookKnowledgeStore) loadNotebookLMBridgeUnlocked(bookID string) (*BookKnowledgeNotebookLMBridge, error) {
 	bookID = sanitizeBookKnowledgeID(bookID)
 	if bookID == "" {
 		return nil, fmt.Errorf("book_id is required")
@@ -72,14 +94,34 @@ func (s *BookKnowledgeStore) LoadNotebookLMBridge(bookID string) (*BookKnowledge
 }
 
 func (s *BookKnowledgeStore) SaveNotebookLMLink(bookID, notebookURL string) (*BookKnowledgeNotebookLMBridge, error) {
+	return s.SaveNotebookLMLinkContext(context.Background(), bookID, notebookURL)
+}
+
+func (s *BookKnowledgeStore) SaveNotebookLMLinkContext(
+	ctx context.Context,
+	bookID, notebookURL string,
+) (*BookKnowledgeNotebookLMBridge, error) {
 	if s == nil {
 		s = DefaultBookKnowledgeStore()
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
 	bookID = sanitizeBookKnowledgeID(bookID)
 	if bookID == "" {
 		return nil, fmt.Errorf("book_id is required")
 	}
-	if _, err := s.LoadPackage(bookID); err != nil {
+	if _, err := s.loadPackageUnlocked(bookID); err != nil {
 		return nil, err
 	}
 	notebookURL = strings.TrimSpace(notebookURL)
@@ -88,19 +130,43 @@ func (s *BookKnowledgeStore) SaveNotebookLMLink(bookID, notebookURL string) (*Bo
 			return nil, err
 		}
 	}
-	bridge, err := s.LoadNotebookLMBridge(bookID)
+	bridge, err := s.loadNotebookLMBridgeUnlocked(bookID)
 	if err != nil {
 		return nil, err
 	}
 	bridge.NotebookURL = notebookURL
 	bridge.UpdatedAt = time.Now().Format(time.RFC3339)
-	if err := s.saveNotebookLMBridge(*bridge); err != nil {
+	if err := s.saveNotebookLMBridgeUnlocked(*bridge); err != nil {
 		return nil, err
 	}
 	return bridge, nil
 }
 
 func (s *BookKnowledgeStore) saveNotebookLMBridge(bridge BookKnowledgeNotebookLMBridge) error {
+	return s.saveNotebookLMBridgeContext(context.Background(), bridge)
+}
+
+func (s *BookKnowledgeStore) saveNotebookLMBridgeContext(
+	ctx context.Context,
+	bridge BookKnowledgeNotebookLMBridge,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rootLock, err := s.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer rootLock.Close()
+	return s.saveNotebookLMBridgeUnlocked(bridge)
+}
+
+func (s *BookKnowledgeStore) saveNotebookLMBridgeUnlocked(bridge BookKnowledgeNotebookLMBridge) error {
 	bridge.BookID = sanitizeBookKnowledgeID(bridge.BookID)
 	if bridge.BookID == "" {
 		return fmt.Errorf("book_id is required")

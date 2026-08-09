@@ -22,11 +22,15 @@ import (
 )
 
 const (
-	bookKnowledgeVersion          = "1"
-	defaultBookKnowledgeExtractor = "dedao-gui-fallback"
-	bookKnowledgeRootLockFileName = ".package.lock"
-	bookKnowledgeRootLockRetry    = 10 * time.Millisecond
+	bookKnowledgeVersion                 = "1"
+	defaultBookKnowledgeExtractor        = "dedao-gui-fallback"
+	bookKnowledgeRootLockFileName        = ".package.lock"
+	bookKnowledgeRootLockRetry           = 10 * time.Millisecond
+	bookKnowledgeJobCommitMarkerFileName = ".book-job-commit.json"
+	bookKnowledgeJobCommitMarkerVersion  = "1"
 )
+
+var errBookKnowledgeJobCommitMarkerInvalid = errors.New("invalid book job commit marker")
 
 type BookKnowledgeBook struct {
 	BookID        string `json:"book_id"`
@@ -178,11 +182,21 @@ type BookKnowledgeStore struct {
 }
 
 type bookKnowledgePackageCommitFence struct {
-	prepare func(context.Context, BookKnowledgePackage) error
-	discard func(BookKnowledgePackage) error
+	prepare func(context.Context, BookKnowledgePackage) (bookKnowledgeJobCommitMarker, error)
+	discard func(BookKnowledgePackage, bookKnowledgeJobCommitMarker) error
+}
+
+type bookKnowledgeJobCommitMarker struct {
+	Version      string `json:"version"`
+	JobID        string `json:"job_id"`
+	PublishNonce string `json:"publish_nonce"`
+	BookID       string `json:"book_id"`
+	ContentHash  string `json:"content_hash"`
 }
 
 type bookKnowledgePackageCommitFenceContextKey struct{}
+
+type bookKnowledgeInvalidateDerivedContextKey struct{}
 
 func contextWithBookKnowledgePackageCommitFence(
 	ctx context.Context,
@@ -197,6 +211,10 @@ func bookKnowledgePackageCommitFenceFromContext(ctx context.Context) (bookKnowle
 	}
 	fence, ok := ctx.Value(bookKnowledgePackageCommitFenceContextKey{}).(bookKnowledgePackageCommitFence)
 	return fence, ok && fence.prepare != nil
+}
+
+func contextWithBookKnowledgeDerivedInvalidation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, bookKnowledgeInvalidateDerivedContextKey{}, true)
 }
 
 func (s *BookKnowledgeStore) SetAgentSemanticEmbedder(embedder AgentSemanticEmbedder) {
@@ -331,6 +349,16 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 	if err := copyBookKnowledgeDirectoryContext(ctx, s.BookDir(pkg.Book.BookID), stagedBookDir); err != nil {
 		return err
 	}
+	if err := os.Remove(bookKnowledgeJobCommitMarkerPath(stagedBookDir)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if invalidate, _ := ctx.Value(bookKnowledgeInvalidateDerivedContextKey{}).(bool); invalidate {
+		for _, name := range []string{"analysis_manifest.json", "quality_report.json"} {
+			if err := os.Remove(filepath.Join(stagedBookDir, name)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
 	stagedFiles := []struct {
 		name string
 		data []byte
@@ -360,8 +388,18 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 		return err
 	}
 	fence, hasFence := bookKnowledgePackageCommitFenceFromContext(ctx)
+	var commitMarker bookKnowledgeJobCommitMarker
 	if hasFence {
-		if err := fence.prepare(ctx, pkg); err != nil {
+		commitMarker, err = fence.prepare(ctx, pkg)
+		if err != nil {
+			return err
+		}
+		if err := writeBookKnowledgeJobCommitMarker(stagedBookDir, commitMarker); err != nil {
+			if fence.discard != nil {
+				if discardErr := fence.discard(pkg, commitMarker); discardErr != nil {
+					return errors.Join(err, fmt.Errorf("discard package commit receipt: %w", discardErr))
+				}
+			}
 			return err
 		}
 	}
@@ -372,7 +410,7 @@ func (s *BookKnowledgeStore) SavePackageContext(ctx context.Context, pkg BookKno
 		stagedBookDir, s.BookDir(pkg.Book.BookID), stagedManifest, s.ManifestPath(), s.afterPackageBookInstall,
 	)
 	if publishErr != nil && hasFence && fence.discard != nil {
-		if discardErr := fence.discard(pkg); discardErr != nil {
+		if discardErr := fence.discard(pkg, commitMarker); discardErr != nil {
 			return errors.Join(publishErr, fmt.Errorf("discard package commit receipt: %w", discardErr))
 		}
 	}
@@ -436,6 +474,46 @@ func ensureBookKnowledgePrivateRoot(root string) error {
 		return fmt.Errorf("book knowledge root is not a directory: %s", root)
 	}
 	return os.Chmod(root, 0o700)
+}
+
+func bookKnowledgeJobCommitMarkerPath(bookDir string) string {
+	return filepath.Join(bookDir, bookKnowledgeJobCommitMarkerFileName)
+}
+
+func writeBookKnowledgeJobCommitMarker(bookDir string, marker bookKnowledgeJobCommitMarker) error {
+	if marker.Version != bookKnowledgeJobCommitMarkerVersion || strings.TrimSpace(marker.JobID) == "" ||
+		strings.TrimSpace(marker.PublishNonce) == "" || strings.TrimSpace(marker.BookID) == "" ||
+		strings.TrimSpace(marker.ContentHash) == "" {
+		return errBookKnowledgeJobCommitMarkerInvalid
+	}
+	payload, err := encodeJSONFile(marker)
+	if err != nil {
+		return err
+	}
+	path := bookKnowledgeJobCommitMarkerPath(bookDir)
+	if err := writeFileAtomically(path, payload); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func readBookKnowledgeJobCommitMarker(bookDir string) (bookKnowledgeJobCommitMarker, error) {
+	var marker bookKnowledgeJobCommitMarker
+	file, err := os.Open(bookKnowledgeJobCommitMarkerPath(bookDir))
+	if err != nil {
+		return marker, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&marker); err != nil {
+		return bookKnowledgeJobCommitMarker{}, fmt.Errorf("%w: %v", errBookKnowledgeJobCommitMarkerInvalid, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return bookKnowledgeJobCommitMarker{}, errBookKnowledgeJobCommitMarkerInvalid
+	}
+	return marker, nil
 }
 
 func copyBookKnowledgeDirectoryContext(ctx context.Context, source, target string) error {
@@ -598,13 +676,9 @@ func (s *BookKnowledgeStore) RepairMissingBookContentHash(bookID string) (*BookK
 	if err != nil {
 		return nil, err
 	}
-	for _, path := range []string{s.BookAnalysisManifestPath(bookID), s.BookQualityReportPath(bookID)} {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("invalidate derived book artifact: %w", err)
-		}
-	}
 	pkg.Book.ContentHash = contentHash
-	if err := s.SavePackage(*pkg); err != nil {
+	ctx := contextWithBookKnowledgeDerivedInvalidation(context.Background())
+	if err := s.SavePackageContext(ctx, *pkg); err != nil {
 		return nil, err
 	}
 	return pkg, nil

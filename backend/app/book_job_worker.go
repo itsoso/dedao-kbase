@@ -195,20 +195,26 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	}
 	if job.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
 		runCtx = contextWithBookKnowledgePackageCommitFence(runCtx, bookKnowledgePackageCommitFence{
-			prepare: func(ctx context.Context, pkg BookKnowledgePackage) error {
+			prepare: func(ctx context.Context, pkg BookKnowledgePackage) (bookKnowledgeJobCommitMarker, error) {
 				if err := ctx.Err(); err != nil {
-					return err
+					return bookKnowledgeJobCommitMarker{}, err
 				}
 				leaseOperationMu.Lock()
 				defer leaseOperationMu.Unlock()
-				_, err := w.store.fenceBookKnowledgeJobPackageCommit(
+				_, publishNonce, err := w.store.fenceBookKnowledgeJobPackageCommit(
 					job.ID, w.workerID, pkg.Book.BookID, pkg.Book.ContentHash, bookJobWorkerCommitLeaseWindow,
 				)
-				return err
+				if err != nil {
+					return bookKnowledgeJobCommitMarker{}, err
+				}
+				return bookKnowledgeJobCommitMarker{
+					Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: publishNonce,
+					BookID: pkg.Book.BookID, ContentHash: pkg.Book.ContentHash,
+				}, nil
 			},
-			discard: func(pkg BookKnowledgePackage) error {
+			discard: func(pkg BookKnowledgePackage, marker bookKnowledgeJobCommitMarker) error {
 				return w.store.discardBookKnowledgeJobCommitReceipt(
-					job.ID, w.workerID, pkg.Book.BookID, pkg.Book.ContentHash,
+					job.ID, w.workerID, pkg.Book.BookID, pkg.Book.ContentHash, marker.PublishNonce,
 				)
 			},
 		})

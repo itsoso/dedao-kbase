@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,10 +23,31 @@ type BookKnowledgeExportResult struct {
 }
 
 func ExportBookKnowledgePackage(store *BookKnowledgeStore, bookID, target string) (*BookKnowledgeExportResult, error) {
+	return ExportBookKnowledgePackageContext(context.Background(), store, bookID, target)
+}
+
+func ExportBookKnowledgePackageContext(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	bookID, target string,
+) (*BookKnowledgeExportResult, error) {
 	if store == nil {
 		store = DefaultBookKnowledgeStore()
 	}
-	pkg, err := store.LoadPackage(bookID)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	rootLock, err := store.acquireBookKnowledgeRootLock(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rootLock.Close()
+	pkg, err := store.loadPackageUnlocked(bookID)
 	if err != nil {
 		return nil, err
 	}

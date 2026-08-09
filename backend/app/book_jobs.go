@@ -112,11 +112,12 @@ type bookKnowledgeJobsFile struct {
 }
 
 type bookKnowledgeJobCommitReceipt struct {
-	JobID       string
-	WorkerID    string
-	BookID      string
-	ContentHash string
-	PreparedAt  string
+	JobID        string
+	WorkerID     string
+	BookID       string
+	ContentHash  string
+	PublishNonce string
+	PreparedAt   string
 }
 
 var (
@@ -334,37 +335,41 @@ func (s *BookKnowledgeStore) RenewBookKnowledgeJobLease(jobID, workerID string, 
 func (s *BookKnowledgeStore) fenceBookKnowledgeJobPackageCommit(
 	jobID, workerID, bookID, contentHash string,
 	minimumWindow time.Duration,
-) (BookKnowledgeJob, error) {
+) (BookKnowledgeJob, string, error) {
 	jobID = strings.TrimSpace(jobID)
 	workerID = strings.TrimSpace(workerID)
 	bookID = strings.TrimSpace(bookID)
 	contentHash = strings.TrimSpace(contentHash)
 	if jobID == "" || workerID == "" || bookID == "" || contentHash == "" || minimumWindow <= 0 {
-		return BookKnowledgeJob{}, fmt.Errorf("%w: invalid package commit fence", ErrBookKnowledgeJobInvalidState)
+		return BookKnowledgeJob{}, "", fmt.Errorf("%w: invalid package commit fence", ErrBookKnowledgeJobInvalidState)
+	}
+	publishNonce, err := newBookKnowledgeJobPublishNonce()
+	if err != nil {
+		return BookKnowledgeJob{}, "", err
 	}
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
 	defer db.Close()
 	tx, err := db.Begin()
 	if err != nil {
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
 	job, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+` WHERE job_id = ?`, jobID))
 	if err == sql.ErrNoRows {
 		tx.Rollback()
-		return BookKnowledgeJob{}, ErrBookKnowledgeJobNotFound
+		return BookKnowledgeJob{}, "", ErrBookKnowledgeJobNotFound
 	}
 	if err != nil {
 		tx.Rollback()
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
 	now := time.Now().UTC()
 	expiry, parseErr := time.Parse(time.RFC3339Nano, job.LeaseExpiresAt)
 	if job.Status != BookKnowledgeJobStatusRunning || job.LeaseOwner != workerID || parseErr != nil || !expiry.After(now) {
 		tx.Rollback()
-		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q is not leased by worker", ErrBookKnowledgeJobLeaseLost, job.ID)
+		return BookKnowledgeJob{}, "", fmt.Errorf("%w: job %q is not leased by worker", ErrBookKnowledgeJobLeaseLost, job.ID)
 	}
 	original := job
 	minimumExpiry := now.Add(minimumWindow)
@@ -375,33 +380,34 @@ func (s *BookKnowledgeStore) fenceBookKnowledgeJobPackageCommit(
 	job.Logs = append(job.Logs, "package commit fenced")
 	if err := updateOwnedBookKnowledgeJobRow(tx, job, original); err != nil {
 		tx.Rollback()
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
 	if _, err := tx.Exec(`
-		INSERT INTO book_job_commits(job_id, worker_id, book_id, content_hash, prepared_at)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO book_job_commits(job_id, worker_id, book_id, content_hash, publish_nonce, prepared_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(job_id) DO UPDATE SET
 			worker_id = excluded.worker_id,
 			book_id = excluded.book_id,
 			content_hash = excluded.content_hash,
+			publish_nonce = excluded.publish_nonce,
 			prepared_at = excluded.prepared_at`,
-		job.ID, workerID, bookID, contentHash, now.Format(time.RFC3339Nano),
+		job.ID, workerID, bookID, contentHash, publishNonce, now.Format(time.RFC3339Nano),
 	); err != nil {
 		tx.Rollback()
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
 	if err := appendBookKnowledgeJobEvent(tx, job); err != nil {
 		tx.Rollback()
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
 	if err := tx.Commit(); err != nil {
-		return BookKnowledgeJob{}, err
+		return BookKnowledgeJob{}, "", err
 	}
-	return job, nil
+	return job, publishNonce, nil
 }
 
 func (s *BookKnowledgeStore) discardBookKnowledgeJobCommitReceipt(
-	jobID, workerID, bookID, contentHash string,
+	jobID, workerID, bookID, contentHash, publishNonce string,
 ) error {
 	db, err := s.openBookJobsWriteDB()
 	if err != nil {
@@ -410,8 +416,9 @@ func (s *BookKnowledgeStore) discardBookKnowledgeJobCommitReceipt(
 	defer db.Close()
 	_, err = db.Exec(`
 		DELETE FROM book_job_commits
-		WHERE job_id = ? AND worker_id = ? AND book_id = ? AND content_hash = ?`,
-		strings.TrimSpace(jobID), strings.TrimSpace(workerID), strings.TrimSpace(bookID), strings.TrimSpace(contentHash),
+		WHERE job_id = ? AND worker_id = ? AND book_id = ? AND content_hash = ? AND publish_nonce = ?`,
+		strings.TrimSpace(jobID), strings.TrimSpace(workerID), strings.TrimSpace(bookID),
+		strings.TrimSpace(contentHash), strings.TrimSpace(publishNonce),
 	)
 	return err
 }
@@ -583,9 +590,12 @@ func (s *BookKnowledgeStore) ReconcileExpiredBookKnowledgeJobsContext(ctx contex
 func loadBookKnowledgeJobCommitReceipt(tx *sql.Tx, jobID string) (bookKnowledgeJobCommitReceipt, bool, error) {
 	var receipt bookKnowledgeJobCommitReceipt
 	err := tx.QueryRow(`
-		SELECT job_id, worker_id, book_id, content_hash, prepared_at
+		SELECT job_id, worker_id, book_id, content_hash, publish_nonce, prepared_at
 		FROM book_job_commits WHERE job_id = ?`, strings.TrimSpace(jobID),
-	).Scan(&receipt.JobID, &receipt.WorkerID, &receipt.BookID, &receipt.ContentHash, &receipt.PreparedAt)
+	).Scan(
+		&receipt.JobID, &receipt.WorkerID, &receipt.BookID, &receipt.ContentHash,
+		&receipt.PublishNonce, &receipt.PreparedAt,
+	)
 	if err == sql.ErrNoRows {
 		return bookKnowledgeJobCommitReceipt{}, false, nil
 	}
@@ -601,10 +611,22 @@ func (s *BookKnowledgeStore) verifyBookKnowledgeJobCommitReceipt(
 ) (map[string]any, bool, error) {
 	if job.Type != BookKnowledgeJobTypeDedaoEbookSyncKBase || receipt.JobID != job.ID ||
 		strings.TrimSpace(receipt.WorkerID) == "" || receipt.BookID != strconv.Itoa(job.EbookID) ||
-		strings.TrimSpace(receipt.ContentHash) == "" {
+		strings.TrimSpace(receipt.ContentHash) == "" || strings.TrimSpace(receipt.PublishNonce) == "" {
 		return nil, false, nil
 	}
 	if _, err := time.Parse(time.RFC3339Nano, receipt.PreparedAt); err != nil {
+		return nil, false, nil
+	}
+	marker, err := readBookKnowledgeJobCommitMarker(s.BookDir(receipt.BookID))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errBookKnowledgeJobCommitMarkerInvalid) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if marker.Version != bookKnowledgeJobCommitMarkerVersion || marker.JobID != receipt.JobID ||
+		marker.PublishNonce != receipt.PublishNonce || marker.BookID != receipt.BookID ||
+		marker.ContentHash != receipt.ContentHash {
 		return nil, false, nil
 	}
 	pkg, err := s.loadPackageUnlocked(receipt.BookID)
@@ -1272,6 +1294,7 @@ const bookKnowledgeJobsSchema = `
 		worker_id TEXT NOT NULL,
 		book_id TEXT NOT NULL,
 		content_hash TEXT NOT NULL,
+		publish_nonce TEXT NOT NULL DEFAULT '',
 		prepared_at TEXT NOT NULL,
 		FOREIGN KEY(job_id) REFERENCES book_jobs(job_id) ON DELETE CASCADE
 	);
@@ -1286,6 +1309,10 @@ func (s *BookKnowledgeStore) migrateBookJobsDB(db *sql.DB) error {
 		return err
 	}
 	if _, err := tx.Exec(bookKnowledgeJobsSchema); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := ensureBookKnowledgeJobCommitReceiptSchema(tx); err != nil {
 		tx.Rollback()
 		return err
 	}
@@ -1335,6 +1362,38 @@ func (s *BookKnowledgeStore) migrateBookJobsDB(db *sql.DB) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func ensureBookKnowledgeJobCommitReceiptSchema(tx *sql.Tx) error {
+	rows, err := tx.Query(`PRAGMA table_info(book_job_commits)`)
+	if err != nil {
+		return err
+	}
+	hasPublishNonce := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "publish_nonce" {
+			hasPublishNonce = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if hasPublishNonce {
+		return nil
+	}
+	_, err = tx.Exec(`ALTER TABLE book_job_commits ADD COLUMN publish_nonce TEXT NOT NULL DEFAULT ''`)
+	return err
 }
 
 func insertBookKnowledgeJob(tx *sql.Tx, job BookKnowledgeJob, ignoreConflict bool) (bool, error) {
@@ -1978,4 +2037,12 @@ func newBookKnowledgeJobID() string {
 	var randomBytes [6]byte
 	_, _ = rand.Read(randomBytes[:])
 	return "job_" + time.Now().UTC().Format("20060102T150405.000000000Z") + "_" + hex.EncodeToString(randomBytes[:])
+}
+
+func newBookKnowledgeJobPublishNonce() (string, error) {
+	var randomBytes [16]byte
+	if _, err := rand.Read(randomBytes[:]); err != nil {
+		return "", fmt.Errorf("generate package publish nonce: %w", err)
+	}
+	return hex.EncodeToString(randomBytes[:]), nil
 }

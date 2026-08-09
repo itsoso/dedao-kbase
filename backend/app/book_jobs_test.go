@@ -1401,6 +1401,63 @@ func TestBookKnowledgeJobStructuredFailureCodes(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobCommitReceiptMigrationAddsPublishNonce(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	db, err := sql.Open("sqlite3", store.BookJobsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE book_job_commits (
+			job_id TEXT PRIMARY KEY,
+			worker_id TEXT NOT NULL,
+			book_id TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
+			prepared_at TEXT NOT NULL
+		)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	rows, err := migrated.Query(`PRAGMA table_info(book_job_commits)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, columnType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			t.Fatal(err)
+		}
+		if name == "publish_nonce" {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("publish_nonce migration column missing")
+	}
+	reopened, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatalf("repeat migration: %v", err)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBookKnowledgeJobQueuedRecovery(t *testing.T) {
 	root := t.TempDir()
 	firstStore := NewBookKnowledgeStore(root)

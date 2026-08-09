@@ -1154,12 +1154,12 @@
     {
       "name": "BookKnowledgeBook",
       "file": "backend/app/book_knowledge.go",
-      "line": 31
+      "line": 35
     },
     {
       "name": "BookKnowledgeChapter",
       "file": "backend/app/book_knowledge.go",
-      "line": 49
+      "line": 53
     },
     {
       "name": "BookKnowledgeChatContextStats",
@@ -1189,22 +1189,22 @@
     {
       "name": "BookKnowledgeChunk",
       "file": "backend/app/book_knowledge.go",
-      "line": 58
+      "line": 62
     },
     {
       "name": "BookKnowledgeCitation",
       "file": "backend/app/book_knowledge.go",
-      "line": 80
+      "line": 84
     },
     {
       "name": "BookKnowledgeClaim",
       "file": "backend/app/book_knowledge.go",
-      "line": 67
+      "line": 71
     },
     {
       "name": "BookKnowledgeExportResult",
       "file": "backend/app/book_export.go",
-      "line": 17
+      "line": 18
     },
     {
       "name": "BookKnowledgeJob",
@@ -1244,7 +1244,7 @@
     {
       "name": "BookKnowledgeManifest",
       "file": "backend/app/book_knowledge.go",
-      "line": 144
+      "line": 148
     },
     {
       "name": "BookKnowledgeMessage",
@@ -1254,12 +1254,12 @@
     {
       "name": "BookKnowledgeNotebookLMBridge",
       "file": "backend/app/book_notebooklm.go",
-      "line": 16
+      "line": 17
     },
     {
       "name": "BookKnowledgePackage",
       "file": "backend/app/book_knowledge.go",
-      "line": 94
+      "line": 98
     },
     {
       "name": "BookKnowledgePrompt",
@@ -1269,22 +1269,22 @@
     {
       "name": "BookKnowledgeSearchQuery",
       "file": "backend/app/book_knowledge.go",
-      "line": 150
+      "line": 154
     },
     {
       "name": "BookKnowledgeSearchResult",
       "file": "backend/app/book_knowledge.go",
-      "line": 156
+      "line": 160
     },
     {
       "name": "BookKnowledgeStore",
       "file": "backend/app/book_knowledge.go",
-      "line": 168
+      "line": 172
     },
     {
       "name": "BookQualityReport",
       "file": "backend/app/book_quality.go",
-      "line": 32
+      "line": 33
     },
     {
       "name": "ClinicalTrialAuditRun",

@@ -791,6 +791,13 @@ func TestBookJobWorkerReconcileCompletesVerifiedPackageAfterLeaseLossPastPublish
 	if err != nil || loaded.Status != BookKnowledgeJobStatusRunning {
 		t.Fatalf("job before reconcile=%#v err=%v", loaded, err)
 	}
+	markerInfo, err := os.Stat(bookKnowledgeJobCommitMarkerPath(store.BookDir("285")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if markerInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("commit marker mode=%v, want 0600", markerInfo.Mode().Perm())
+	}
 	count, err := store.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
 	if err != nil || count != 1 {
 		t.Fatalf("reconcile count=%d err=%v", count, err)
@@ -821,7 +828,7 @@ func TestReconcileCommitIntentWithoutFullyPublishedPackageInterruptsJob(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.fenceBookKnowledgeJobPackageCommit(
+	if _, _, err := store.fenceBookKnowledgeJobPackageCommit(
 		job.ID, "intent-worker", pkg.Book.BookID, hash, bookJobWorkerCommitLeaseWindow,
 	); err != nil {
 		t.Fatal(err)
@@ -845,6 +852,90 @@ func TestReconcileCommitIntentWithoutFullyPublishedPackageInterruptsJob(t *testi
 		t.Fatalf("intent-only job=%#v err=%v", loaded, err)
 	}
 	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+}
+
+func TestReconcileCommitIntentCannotReuseSameHashPackageFromOlderPublish(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 291)
+	pkg := sampleBookKnowledgePackageForExport()
+	pkg.Book.BookID = "291"
+	pkg.Book.DedaoID = job.EbookID
+	pkg.Book.EnID = job.EbookEnID
+	pkg.Book.ContentHash = ""
+	if err := store.SavePackage(pkg); err != nil {
+		t.Fatal(err)
+	}
+	published, err := store.LoadPackage(pkg.Book.BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNextBookKnowledgeJob("same-hash-worker", time.Second)
+	if err != nil || claimed == nil || claimed.ID != job.ID {
+		t.Fatalf("ClaimNextBookKnowledgeJob=%#v err=%v", claimed, err)
+	}
+	if _, _, err := store.fenceBookKnowledgeJobPackageCommit(
+		job.ID, "same-hash-worker", published.Book.BookID, published.Book.ContentHash, bookJobWorkerCommitLeaseWindow,
+	); err != nil {
+		t.Fatal(err)
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, job.ID, time.Now().UTC().Add(-time.Minute))
+	count, err := store.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("same-hash intent-only job=%#v err=%v", loaded, err)
+	}
+}
+
+func TestReconcileRejectsTamperedPackageCommitMarker(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 292)
+	store.afterPackagePublishGate = func() {
+		db, err := store.openBookJobsWriteDB()
+		if err != nil {
+			t.Errorf("open jobs database: %v", err)
+			return
+		}
+		defer db.Close()
+		_, err = db.Exec(`UPDATE book_jobs SET lease_owner = ?, lease_expires_at = ? WHERE job_id = ?`,
+			"replacement-worker", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), job.ID)
+		if err != nil {
+			t.Errorf("replace lease owner: %v", err)
+		}
+	}
+	worker := newWorkerForTest(t, store, func(ctx context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		pkg := sampleBookKnowledgePackageForExport()
+		pkg.Book.BookID = "292"
+		pkg.Book.DedaoID = claimed.EbookID
+		pkg.Book.EnID = claimed.EbookEnID
+		pkg.Book.ContentHash = ""
+		if err := store.SavePackageContext(ctx, pkg); err != nil {
+			return nil, err
+		}
+		return map[string]any{"ebook_id": claimed.EbookID}, nil
+	})
+	processed, runErr := worker.RunOnce(context.Background())
+	if !processed || !errors.Is(runErr, ErrBookJobWorkerInfrastructure) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, runErr)
+	}
+	marker, err := readBookKnowledgeJobCommitMarker(store.BookDir("292"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker.PublishNonce = strings.Repeat("0", len(marker.PublishNonce))
+	if err := writeBookKnowledgeJobCommitMarker(store.BookDir("292"), marker); err != nil {
+		t.Fatal(err)
+	}
+	count, err := store.ReconcileExpiredBookKnowledgeJobsContext(context.Background())
+	if err != nil || count != 1 {
+		t.Fatalf("reconcile count=%d err=%v", count, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("tampered marker job=%#v err=%v", loaded, err)
+	}
 }
 
 func TestReconcileRejectsCommitReceiptWhenPublishedPackageVerificationFails(t *testing.T) {
@@ -891,7 +982,7 @@ func TestReconcileRejectsCommitReceiptWhenPublishedPackageVerificationFails(t *t
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.fenceBookKnowledgeJobPackageCommit(
+			if _, _, err := store.fenceBookKnowledgeJobPackageCommit(
 				job.ID, "verification-worker", published.Book.BookID, published.Book.ContentHash, bookJobWorkerCommitLeaseWindow,
 			); err != nil {
 				t.Fatal(err)
@@ -986,7 +1077,7 @@ func TestBookKnowledgeJobRenewalRetainsLongerCommitFenceLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fenced, err := store.fenceBookKnowledgeJobPackageCommit(
+	fenced, _, err := store.fenceBookKnowledgeJobPackageCommit(
 		job.ID, "short-lease-worker", pkg.Book.BookID, hash, bookJobWorkerCommitLeaseWindow,
 	)
 	if err != nil {
