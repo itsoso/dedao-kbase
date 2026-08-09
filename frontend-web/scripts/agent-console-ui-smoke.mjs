@@ -30,6 +30,12 @@ const consoleSource = js.match(/function renderAgentConsole\([\s\S]*?\n\}/)?.[0]
 const displayNameSource = js.match(/function agentConsoleDisplayName\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(displayNameSource.includes("split(/[：:]/)"), "long Chinese subtitles should not dominate the console title");
 assert.ok(displayNameSource.includes("知识研究助手"), "missing book titles should still receive a Chinese display name");
+const displayName = Function(`${displayNameSource}; return agentConsoleDisplayName;`)();
+assert.equal(
+  displayName("128942_人工智能注意力机制：体系、模型与算法剖析"),
+  "人工智能注意力机制研究助手",
+  "internal numeric book prefixes should not leak into the product title",
+);
 assert.ok(consoleSource.includes("release.book?.title"), "console title should derive from the pinned Chinese book title");
 assert.ok(consoleSource.includes("pkg.package_id"), "console should retain the technical Agent ID");
 assert.ok(consoleSource.includes('id="book-agent-search-form"'), "console should preserve the search form contract");

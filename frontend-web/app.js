@@ -4759,7 +4759,7 @@ function renderGroundedConversation(pkg) {
 }
 
 function agentConsoleDisplayName(bookTitle) {
-  const title = String(bookTitle || "").trim();
+  const title = String(bookTitle || "").trim().replace(/^\d+[_\-\s]+/, "");
   if (title) {
     const subject = title.split(/[：:]/)[0].trim();
     return subject.endsWith("研究助手") ? subject : `${subject}研究助手`;
