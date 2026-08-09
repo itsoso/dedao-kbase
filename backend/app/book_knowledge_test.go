@@ -825,6 +825,273 @@ func TestRecoverBookKnowledgePublishTransactionStateMatrix(t *testing.T) {
 	}
 }
 
+func TestRecoverBookKnowledgeBackupRestoreRetriesAfterCleanupFailure(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := BookKnowledgeJob{ID: "restore-retry-job", Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 303, EbookEnID: "worker-303"}
+	newPackage := publishCrashTestPackage(job, "Restore Retry New")
+	newHash, err := BookKnowledgeContentHash(newPackage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newPackage.Book.ContentHash = newHash
+	marker := bookKnowledgeJobCommitMarker{
+		Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: strings.Repeat("b", 32),
+		BookID: newPackage.Book.BookID, ContentHash: newHash,
+	}
+	receipt := bookKnowledgeJobCommitReceipt{
+		JobID: job.ID, WorkerID: "restore-retry-worker", BookID: marker.BookID,
+		ContentHash: marker.ContentHash, PublishNonce: marker.PublishNonce, PreparedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	transactionRoot, err := createBookKnowledgePublishTransaction(root, marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBookKnowledgePublishJournal(transactionRoot, bookKnowledgePublishJournal{
+		Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhaseInstalled, BookExisted: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "book"), newPackage, marker, true)
+	writeBookKnowledgePublishStatePackage(t, store.BookDir(marker.BookID), newPackage, marker, true)
+	oldPackage := publishCrashTestPackage(job, "Restore Retry Old")
+	oldHash, err := BookKnowledgeContentHash(oldPackage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPackage.Book.ContentHash = oldHash
+	writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "backup-book"), oldPackage, bookKnowledgeJobCommitMarker{}, false)
+	if err := writeJSONFile(store.ManifestPath(), BookKnowledgeManifest{Version: bookKnowledgeVersion, Books: []BookKnowledgeBook{newPackage.Book}}); err != nil {
+		t.Fatal(err)
+	}
+	store.cleanupPackageTransaction = func(string) error { return errors.New("injected recovery cleanup failure") }
+	recovered, err := store.recoverBookKnowledgePublishTransaction(job, receipt)
+	if recovered || err == nil || !strings.Contains(err.Error(), "injected recovery cleanup failure") {
+		t.Fatalf("first recover=%t err=%v", recovered, err)
+	}
+	journal, err := readBookKnowledgePublishJournal(transactionRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if journal.Phase != bookKnowledgePublishPhaseRestoringBackup || journal.RollbackBook == nil || *journal.RollbackBook != oldPackage.Book {
+		t.Fatalf("restore journal=%#v", journal)
+	}
+	journalInfo, err := os.Stat(filepath.Join(transactionRoot, bookKnowledgePublishJournalFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if journalInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("restore journal mode=%v", journalInfo.Mode().Perm())
+	}
+	restored, err := store.LoadPackage(marker.BookID)
+	if err != nil || restored.Book != oldPackage.Book {
+		t.Fatalf("first restored package=%#v err=%v", restored, err)
+	}
+	if err := writeJSONFile(store.ManifestPath(), BookKnowledgeManifest{
+		Version: bookKnowledgeVersion, Books: []BookKnowledgeBook{newPackage.Book},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	store.cleanupPackageTransaction = nil
+	recovered, err = store.recoverBookKnowledgePublishTransaction(job, receipt)
+	if recovered || err != nil {
+		t.Fatalf("second recover=%t err=%v", recovered, err)
+	}
+	if _, err := os.Stat(transactionRoot); !os.IsNotExist(err) {
+		t.Fatalf("transaction after retry error=%v", err)
+	}
+	manifest, err := store.loadManifest()
+	if err != nil || len(manifest.Books) != 1 || manifest.Books[0] != oldPackage.Book {
+		t.Fatalf("restored manifest=%#v err=%v", manifest.Books, err)
+	}
+}
+
+func TestRecoverOwnedDamagedFinalRetriesAfterManifestFailure(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	job := BookKnowledgeJob{ID: "discard-retry-job", Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 304, EbookEnID: "worker-304"}
+	pkg := publishCrashTestPackage(job, "Discard Retry Package")
+	hash, err := BookKnowledgeContentHash(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg.Book.ContentHash = hash
+	marker := bookKnowledgeJobCommitMarker{
+		Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: strings.Repeat("c", 32),
+		BookID: pkg.Book.BookID, ContentHash: hash,
+	}
+	receipt := bookKnowledgeJobCommitReceipt{
+		JobID: job.ID, WorkerID: "discard-retry-worker", BookID: marker.BookID,
+		ContentHash: marker.ContentHash, PublishNonce: marker.PublishNonce, PreparedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	transactionRoot, err := createBookKnowledgePublishTransaction(root, marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeBookKnowledgePublishJournal(transactionRoot, bookKnowledgePublishJournal{
+		Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhaseInstalled,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "book"), pkg, marker, true)
+	writeBookKnowledgePublishStatePackage(t, store.BookDir(marker.BookID), pkg, marker, true)
+	if err := os.WriteFile(store.ManifestPath(), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.recoverBookKnowledgePublishTransaction(job, receipt)
+	if recovered || err == nil {
+		t.Fatalf("first recover=%t err=%v, want manifest failure", recovered, err)
+	}
+	if _, err := os.Stat(store.BookDir(marker.BookID)); !os.IsNotExist(err) {
+		t.Fatalf("owned final after first recovery error=%v, want removed", err)
+	}
+	journal, err := readBookKnowledgePublishJournal(transactionRoot)
+	if err != nil || journal.Phase != bookKnowledgePublishPhaseDiscardingOwnedFinal {
+		t.Fatalf("discard journal=%#v err=%v", journal, err)
+	}
+	if err := writeJSONFile(store.ManifestPath(), BookKnowledgeManifest{Version: bookKnowledgeVersion, Books: []BookKnowledgeBook{pkg.Book}}); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err = store.recoverBookKnowledgePublishTransaction(job, receipt)
+	if recovered || err != nil {
+		t.Fatalf("second recover=%t err=%v", recovered, err)
+	}
+	if _, err := os.Stat(transactionRoot); !os.IsNotExist(err) {
+		t.Fatalf("discard transaction after retry error=%v", err)
+	}
+	manifest, err := store.loadManifest()
+	if err != nil || len(manifest.Books) != 0 {
+		t.Fatalf("discarded manifest=%#v err=%v", manifest.Books, err)
+	}
+}
+
+func TestBookKnowledgePublishJournalRecoveryPhaseValidationAndCompatibility(t *testing.T) {
+	root := t.TempDir()
+	marker := bookKnowledgeJobCommitMarker{
+		Version: bookKnowledgeJobCommitMarkerVersion, JobID: "journal-job", PublishNonce: strings.Repeat("d", 32),
+		BookID: "305", ContentHash: "sha256:" + strings.Repeat("e", 64),
+	}
+	transactionRoot := filepath.Join(root, "transaction")
+	if err := os.MkdirAll(transactionRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyPayload, err := encodeJSONFile(map[string]any{
+		"version": bookKnowledgePublishJournalVersion, "marker": marker,
+		"phase": bookKnowledgePublishPhasePrepared, "book_existed": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(transactionRoot, bookKnowledgePublishJournalFileName), legacyPayload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readBookKnowledgePublishJournal(transactionRoot); err != nil {
+		t.Fatalf("legacy journal: %v", err)
+	}
+	if err := writeBookKnowledgePublishJournal(transactionRoot, bookKnowledgePublishJournal{
+		Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhaseRestoringBackup,
+	}); err == nil {
+		t.Fatal("restoring_backup journal without rollback identity accepted")
+	}
+	wrongBook := BookKnowledgeBook{BookID: "wrong", ContentHash: marker.ContentHash}
+	if err := writeBookKnowledgePublishJournal(transactionRoot, bookKnowledgePublishJournal{
+		Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhaseRestoringBackup,
+		RollbackBook: &wrongBook,
+	}); err == nil {
+		t.Fatal("restoring_backup journal with mismatched rollback identity accepted")
+	}
+	rollbackBook := BookKnowledgeBook{BookID: marker.BookID, Title: "Rollback", ContentHash: marker.ContentHash}
+	journal := bookKnowledgePublishJournal{
+		Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: bookKnowledgePublishPhaseRestoringBackup,
+		RollbackBook: &rollbackBook,
+	}
+	if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := readBookKnowledgePublishJournal(transactionRoot)
+	if err != nil || loaded.RollbackBook == nil || *loaded.RollbackBook != rollbackBook {
+		t.Fatalf("strict recovery journal=%#v err=%v", loaded, err)
+	}
+	info, err := os.Stat(filepath.Join(transactionRoot, bookKnowledgePublishJournalFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("journal mode=%v", info.Mode().Perm())
+	}
+}
+
+func TestRecoveryMutationPhasesRejectUnknownFinal(t *testing.T) {
+	tests := []struct {
+		name  string
+		phase string
+	}{
+		{name: "restoring backup", phase: bookKnowledgePublishPhaseRestoringBackup},
+		{name: "discarding owned final", phase: bookKnowledgePublishPhaseDiscardingOwnedFinal},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			store := NewBookKnowledgeStore(root)
+			job := BookKnowledgeJob{ID: "unknown-final-job", Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 306, EbookEnID: "worker-306"}
+			newPackage := publishCrashTestPackage(job, "Unknown Final New")
+			newHash, err := BookKnowledgeContentHash(newPackage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			newPackage.Book.ContentHash = newHash
+			marker := bookKnowledgeJobCommitMarker{
+				Version: bookKnowledgeJobCommitMarkerVersion, JobID: job.ID, PublishNonce: strings.Repeat("f", 32),
+				BookID: newPackage.Book.BookID, ContentHash: newHash,
+			}
+			receipt := bookKnowledgeJobCommitReceipt{
+				JobID: job.ID, WorkerID: "unknown-final-worker", BookID: marker.BookID,
+				ContentHash: marker.ContentHash, PublishNonce: marker.PublishNonce, PreparedAt: time.Now().UTC().Format(time.RFC3339Nano),
+			}
+			transactionRoot, err := createBookKnowledgePublishTransaction(root, marker)
+			if err != nil {
+				t.Fatal(err)
+			}
+			journal := bookKnowledgePublishJournal{
+				Version: bookKnowledgePublishJournalVersion, Marker: marker, Phase: test.phase,
+			}
+			if test.phase == bookKnowledgePublishPhaseRestoringBackup {
+				oldPackage := publishCrashTestPackage(job, "Unknown Final Old")
+				oldHash, hashErr := BookKnowledgeContentHash(oldPackage)
+				if hashErr != nil {
+					t.Fatal(hashErr)
+				}
+				oldPackage.Book.ContentHash = oldHash
+				journal.RollbackBook = &oldPackage.Book
+				writeBookKnowledgePublishStatePackage(t, filepath.Join(transactionRoot, "backup-book"), oldPackage, bookKnowledgeJobCommitMarker{}, false)
+			}
+			if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+				t.Fatal(err)
+			}
+			unknownPackage := publishCrashTestPackage(job, "Unknown Final Package")
+			unknownHash, err := BookKnowledgeContentHash(unknownPackage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unknownPackage.Book.ContentHash = unknownHash
+			writeBookKnowledgePublishStatePackage(t, store.BookDir(marker.BookID), unknownPackage, bookKnowledgeJobCommitMarker{}, false)
+
+			recovered, err := store.recoverBookKnowledgePublishTransaction(job, receipt)
+			if recovered || !errors.Is(err, errBookKnowledgePublishAmbiguous) {
+				t.Fatalf("recover=%t err=%v, want ambiguous", recovered, err)
+			}
+			got, err := store.LoadPackage(marker.BookID)
+			if err != nil || got.Book != unknownPackage.Book {
+				t.Fatalf("unknown final=%#v err=%v", got, err)
+			}
+			if _, err := os.Stat(transactionRoot); err != nil {
+				t.Fatalf("retained transaction: %v", err)
+			}
+		})
+	}
+}
+
 func writeBookKnowledgePublishStatePackage(
 	t *testing.T,
 	bookDir string,

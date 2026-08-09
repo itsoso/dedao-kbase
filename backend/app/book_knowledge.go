@@ -23,19 +23,21 @@ import (
 )
 
 const (
-	bookKnowledgeVersion                 = "1"
-	defaultBookKnowledgeExtractor        = "dedao-gui-fallback"
-	bookKnowledgeRootLockFileName        = ".package.lock"
-	bookKnowledgeRootLockRetry           = 10 * time.Millisecond
-	bookKnowledgeJobCommitMarkerFileName = ".book-job-commit.json"
-	bookKnowledgeJobCommitMarkerVersion  = "1"
-	bookKnowledgePublishTransactionsDir  = ".book-publish-transactions"
-	bookKnowledgePublishJournalFileName  = "transaction.json"
-	bookKnowledgePublishJournalVersion   = "1"
-	bookKnowledgePublishPhasePreparing   = "preparing"
-	bookKnowledgePublishPhasePrepared    = "prepared"
-	bookKnowledgePublishPhaseBackedUp    = "book_backed_up"
-	bookKnowledgePublishPhaseInstalled   = "book_installed"
+	bookKnowledgeVersion                          = "1"
+	defaultBookKnowledgeExtractor                 = "dedao-gui-fallback"
+	bookKnowledgeRootLockFileName                 = ".package.lock"
+	bookKnowledgeRootLockRetry                    = 10 * time.Millisecond
+	bookKnowledgeJobCommitMarkerFileName          = ".book-job-commit.json"
+	bookKnowledgeJobCommitMarkerVersion           = "1"
+	bookKnowledgePublishTransactionsDir           = ".book-publish-transactions"
+	bookKnowledgePublishJournalFileName           = "transaction.json"
+	bookKnowledgePublishJournalVersion            = "1"
+	bookKnowledgePublishPhasePreparing            = "preparing"
+	bookKnowledgePublishPhasePrepared             = "prepared"
+	bookKnowledgePublishPhaseBackedUp             = "book_backed_up"
+	bookKnowledgePublishPhaseInstalled            = "book_installed"
+	bookKnowledgePublishPhaseRestoringBackup      = "restoring_backup"
+	bookKnowledgePublishPhaseDiscardingOwnedFinal = "discarding_owned_final"
 )
 
 var (
@@ -211,10 +213,11 @@ type bookKnowledgeJobCommitMarker struct {
 }
 
 type bookKnowledgePublishJournal struct {
-	Version     string                       `json:"version"`
-	Marker      bookKnowledgeJobCommitMarker `json:"marker"`
-	Phase       string                       `json:"phase"`
-	BookExisted bool                         `json:"book_existed"`
+	Version      string                       `json:"version"`
+	Marker       bookKnowledgeJobCommitMarker `json:"marker"`
+	Phase        string                       `json:"phase"`
+	BookExisted  bool                         `json:"book_existed"`
+	RollbackBook *BookKnowledgeBook           `json:"rollback_book,omitempty"`
 }
 
 type bookKnowledgePackageCommitFenceContextKey struct{}
@@ -775,6 +778,20 @@ func validateBookKnowledgePublishJournal(journal bookKnowledgePublishJournal) er
 	switch journal.Phase {
 	case bookKnowledgePublishPhasePreparing, bookKnowledgePublishPhasePrepared,
 		bookKnowledgePublishPhaseBackedUp, bookKnowledgePublishPhaseInstalled:
+		if journal.RollbackBook != nil {
+			return fmt.Errorf("unexpected rollback identity for book publish transaction phase %q", journal.Phase)
+		}
+		return nil
+	case bookKnowledgePublishPhaseRestoringBackup:
+		if journal.RollbackBook == nil || journal.RollbackBook.BookID != journal.Marker.BookID ||
+			strings.TrimSpace(journal.RollbackBook.ContentHash) == "" {
+			return fmt.Errorf("invalid rollback identity for book publish transaction")
+		}
+		return nil
+	case bookKnowledgePublishPhaseDiscardingOwnedFinal:
+		if journal.RollbackBook != nil {
+			return fmt.Errorf("unexpected rollback identity while discarding owned final")
+		}
 		return nil
 	default:
 		return fmt.Errorf("invalid book publish transaction phase %q", journal.Phase)
@@ -951,6 +968,12 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 	finalBookDir := s.BookDir(receipt.BookID)
 	stagedBookDir := filepath.Join(transactionRoot, "book")
 	backupBookDir := filepath.Join(transactionRoot, "backup-book")
+	switch journal.Phase {
+	case bookKnowledgePublishPhaseRestoringBackup:
+		return s.resumeBookKnowledgeBackupRestore(transactionRoot, journal)
+	case bookKnowledgePublishPhaseDiscardingOwnedFinal:
+		return s.resumeBookKnowledgeOwnedFinalDiscard(transactionRoot, journal)
+	}
 	finalPackage, finalValid, err := verifyBookKnowledgePublishDirectory(finalBookDir, job, receipt)
 	if err != nil {
 		return false, err
@@ -959,7 +982,7 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		if err := s.repairBookKnowledgeRootManifest(*finalPackage); err != nil {
 			return false, err
 		}
-		if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+		if err := s.cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -1005,7 +1028,7 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		if err := s.repairBookKnowledgeRootManifest(*stagedPackage); err != nil {
 			return false, err
 		}
-		if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+		if err := s.cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -1025,6 +1048,13 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		if !backupValid {
 			return false, errBookKnowledgePublishRecoveryRequired
 		}
+		rollbackBook := backupPackage.Book
+		journal.Phase = bookKnowledgePublishPhaseRestoringBackup
+		journal.RollbackBook = &rollbackBook
+		if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
+			return false, err
+		}
+		return s.resumeBookKnowledgeBackupRestore(transactionRoot, journal)
 	}
 	finalExists, err := pathExists(finalBookDir)
 	if err != nil {
@@ -1035,44 +1065,112 @@ func (s *BookKnowledgeStore) recoverBookKnowledgePublishTransaction(
 		marker, markerErr := readBookKnowledgeJobCommitMarker(finalBookDir)
 		finalOwned = markerErr == nil && marker == expectedMarker
 	}
-	if backupExists && !finalExists {
-		if err := s.repairBookKnowledgeRootManifest(*backupPackage); err != nil {
+	if !backupExists && finalExists {
+		if !finalOwned {
+			return false, fmt.Errorf("%w: damaged current package is not owned by the transaction", errBookKnowledgePublishAmbiguous)
+		}
+		journal.Phase = bookKnowledgePublishPhaseDiscardingOwnedFinal
+		journal.RollbackBook = nil
+		if err := writeBookKnowledgePublishJournal(transactionRoot, journal); err != nil {
 			return false, err
 		}
-		if err := os.MkdirAll(filepath.Dir(finalBookDir), os.ModePerm); err != nil {
+		return s.resumeBookKnowledgeOwnedFinalDiscard(transactionRoot, journal)
+	} else {
+		return false, errBookKnowledgePublishRecoveryRequired
+	}
+}
+
+func (s *BookKnowledgeStore) resumeBookKnowledgeBackupRestore(
+	transactionRoot string,
+	journal bookKnowledgePublishJournal,
+) (bool, error) {
+	if journal.Phase != bookKnowledgePublishPhaseRestoringBackup || journal.RollbackBook == nil {
+		return false, fmt.Errorf("invalid backup restore journal")
+	}
+	finalBookDir := s.BookDir(journal.Marker.BookID)
+	backupBookDir := filepath.Join(transactionRoot, "backup-book")
+	finalPackage, finalValid, err := verifyBookKnowledgeRollbackDirectory(finalBookDir, *journal.RollbackBook)
+	if err != nil {
+		return false, err
+	}
+	if finalValid {
+		if err := s.repairBookKnowledgeRootManifest(*finalPackage); err != nil {
 			return false, err
 		}
-		if err := os.Rename(backupBookDir, finalBookDir); err != nil {
+		if err := s.cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
 			return false, err
 		}
-	} else if backupExists && finalExists {
-		if finalOwned {
-			if err := s.repairBookKnowledgeRootManifest(*backupPackage); err != nil {
-				return false, err
-			}
-			if err := os.RemoveAll(finalBookDir); err != nil {
-				return false, err
-			}
-			if err := os.Rename(backupBookDir, finalBookDir); err != nil {
-				return false, err
-			}
-		} else {
+		return false, nil
+	}
+	backupPackage, backupValid, err := verifyBookKnowledgeRollbackDirectory(backupBookDir, *journal.RollbackBook)
+	if err != nil {
+		return false, err
+	}
+	if !backupValid {
+		finalExists, statErr := pathExists(finalBookDir)
+		if statErr != nil {
+			return false, statErr
+		}
+		if finalExists {
+			return false, fmt.Errorf("%w: rollback final does not match journal identity", errBookKnowledgePublishAmbiguous)
+		}
+		return false, errBookKnowledgePublishRecoveryRequired
+	}
+	finalExists, err := pathExists(finalBookDir)
+	if err != nil {
+		return false, err
+	}
+	if finalExists {
+		marker, markerErr := readBookKnowledgeJobCommitMarker(finalBookDir)
+		if markerErr != nil || marker != journal.Marker {
 			return false, fmt.Errorf("%w: current package is not owned by the transaction", errBookKnowledgePublishAmbiguous)
 		}
-	} else if !backupExists && finalExists {
-		if !finalOwned {
+	}
+	if err := s.repairBookKnowledgeRootManifest(*backupPackage); err != nil {
+		return false, err
+	}
+	if finalExists {
+		if err := os.RemoveAll(finalBookDir); err != nil {
+			return false, err
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(finalBookDir), os.ModePerm); err != nil {
+		return false, err
+	}
+	if err := os.Rename(backupBookDir, finalBookDir); err != nil {
+		return false, err
+	}
+	if err := s.cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+func (s *BookKnowledgeStore) resumeBookKnowledgeOwnedFinalDiscard(
+	transactionRoot string,
+	journal bookKnowledgePublishJournal,
+) (bool, error) {
+	if journal.Phase != bookKnowledgePublishPhaseDiscardingOwnedFinal || journal.RollbackBook != nil {
+		return false, fmt.Errorf("invalid owned final discard journal")
+	}
+	finalBookDir := s.BookDir(journal.Marker.BookID)
+	finalExists, err := pathExists(finalBookDir)
+	if err != nil {
+		return false, err
+	}
+	if finalExists {
+		marker, markerErr := readBookKnowledgeJobCommitMarker(finalBookDir)
+		if markerErr != nil || marker != journal.Marker {
 			return false, fmt.Errorf("%w: damaged current package is not owned by the transaction", errBookKnowledgePublishAmbiguous)
 		}
 		if err := os.RemoveAll(finalBookDir); err != nil {
 			return false, err
 		}
-		if err := s.removeBookKnowledgeRootManifestEntry(receipt.BookID, receipt.ContentHash); err != nil {
-			return false, err
-		}
-	} else {
-		return false, errBookKnowledgePublishRecoveryRequired
 	}
-	if err := cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
+	if err := s.removeBookKnowledgeRootManifestEntry(journal.Marker.BookID, journal.Marker.ContentHash); err != nil {
+		return false, err
+	}
+	if err := s.cleanupBookKnowledgePublishTransaction(transactionRoot); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -1137,6 +1235,30 @@ func verifyBookKnowledgeBackupDirectory(bookDir, bookID string) (*BookKnowledgeP
 	return pkg, true, nil
 }
 
+func verifyBookKnowledgeRollbackDirectory(
+	bookDir string,
+	expected BookKnowledgeBook,
+) (*BookKnowledgePackage, bool, error) {
+	pkg, err := loadBookKnowledgePackageFromDirectory(bookDir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if pkg.Book != expected || strings.TrimSpace(expected.ContentHash) == "" {
+		return nil, false, nil
+	}
+	computedHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		return nil, false, err
+	}
+	if computedHash != expected.ContentHash {
+		return nil, false, nil
+	}
+	return pkg, true, nil
+}
+
 func (s *BookKnowledgeStore) repairBookKnowledgeRootManifest(pkg BookKnowledgePackage) error {
 	manifest, err := s.loadManifest()
 	if err != nil {
@@ -1176,6 +1298,13 @@ func cleanupBookKnowledgePublishTransaction(transactionRoot string) error {
 	}
 	_ = os.Remove(filepath.Dir(transactionRoot))
 	return nil
+}
+
+func (s *BookKnowledgeStore) cleanupBookKnowledgePublishTransaction(transactionRoot string) error {
+	if s.cleanupPackageTransaction != nil {
+		return s.cleanupPackageTransaction(transactionRoot)
+	}
+	return cleanupBookKnowledgePublishTransaction(transactionRoot)
 }
 
 func cleanupBookKnowledgePublishTransactionArtifacts(root string, marker bookKnowledgeJobCommitMarker) error {
