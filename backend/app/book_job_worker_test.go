@@ -1,0 +1,526 @@
+package app
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func TestBookJobWorkerRejectsInvalidConfiguration(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	valid := BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-1", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Second,
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) { return nil, nil },
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*BookJobWorkerConfig)
+	}{
+		{name: "store", mutate: func(cfg *BookJobWorkerConfig) { cfg.Store = nil }},
+		{name: "blank worker", mutate: func(cfg *BookJobWorkerConfig) { cfg.WorkerID = "  " }},
+		{name: "unsafe worker", mutate: func(cfg *BookJobWorkerConfig) { cfg.WorkerID = "../worker" }},
+		{name: "token-like worker", mutate: func(cfg *BookJobWorkerConfig) { cfg.WorkerID = "sk-secret-token-value" }},
+		{name: "long worker", mutate: func(cfg *BookJobWorkerConfig) { cfg.WorkerID = strings.Repeat("w", 129) }},
+		{name: "lease", mutate: func(cfg *BookJobWorkerConfig) { cfg.LeaseDuration = 0 }},
+		{name: "renew", mutate: func(cfg *BookJobWorkerConfig) { cfg.RenewInterval = 0 }},
+		{name: "renew equals lease", mutate: func(cfg *BookJobWorkerConfig) { cfg.RenewInterval = cfg.LeaseDuration }},
+		{name: "poll", mutate: func(cfg *BookJobWorkerConfig) { cfg.PollInterval = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := valid
+			test.mutate(&cfg)
+			if _, err := NewBookJobWorker(cfg); err == nil {
+				t.Fatal("invalid configuration was accepted")
+			}
+		})
+	}
+	valid.WorkerID = " worker.safe_1:local "
+	if _, err := NewBookJobWorker(valid); err != nil {
+		t.Fatalf("safe worker id rejected: %v", err)
+	}
+}
+
+func TestBookJobWorkerRunOnceClaimsOldestAndCompletesWithSafeStages(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	oldest := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 201)
+	time.Sleep(time.Millisecond)
+	newer := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 202)
+
+	worker := newWorkerForTest(t, store, func(_ context.Context, job BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
+		if job.ID != oldest.ID {
+			t.Fatalf("claimed %q, want oldest %q", job.ID, oldest.ID)
+		}
+		if err := setStage("downloading"); err != nil {
+			return nil, err
+		}
+		return map[string]any{"ebook_id": job.EbookID, "title": "safe", "private_path": "/private/raw"}, nil
+	})
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(oldest.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusSucceeded || loaded.Stage != "completed" || loaded.Result["title"] != "safe" {
+		t.Fatalf("completed job=%#v err=%v", loaded, err)
+	}
+	if _, exists := loaded.Result["private_path"]; exists {
+		t.Fatalf("unsafe result persisted: %#v", loaded.Result)
+	}
+	queued, err := store.LoadBookKnowledgeJob(newer.ID)
+	if err != nil || queued.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("newer job=%#v err=%v", queued, err)
+	}
+	assertWorkerEventStages(t, store, oldest.ID, []string{"queued", "running", "downloading", "completed"})
+}
+
+func TestBookJobWorkerRunOnceReturnsFalseWithoutQueuedJob(t *testing.T) {
+	worker := newWorkerForTest(t, NewBookKnowledgeStore(t.TempDir()), nil)
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+}
+
+func TestBookJobWorkerClassifiesFailuresWithoutPersistingRawErrors(t *testing.T) {
+	codes := []string{
+		BookKnowledgeJobFailureAuthenticationRequired,
+		BookKnowledgeJobFailureDownloadFailed,
+		BookKnowledgeJobFailureKnowledgeBuildFailed,
+		BookKnowledgeJobFailureWorkerInterrupted,
+		BookKnowledgeJobFailureSourceChanged,
+		BookKnowledgeJobFailureUnknownFailure,
+	}
+	for _, code := range codes {
+		t.Run("typed_"+code, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 210)
+			worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+				return nil, NewBookJobExecutionFailure(code, errors.New("raw /private/secret token=abc"))
+			})
+			if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+			}
+			assertWorkerFailedSafely(t, store, job.ID, code)
+		})
+	}
+	for _, test := range []struct {
+		name  string
+		stage string
+		code  string
+	}{
+		{name: "download", stage: "downloading", code: BookKnowledgeJobFailureDownloadFailed},
+		{name: "knowledge", stage: "building_knowledge", code: BookKnowledgeJobFailureKnowledgeBuildFailed},
+		{name: "unknown", stage: "", code: BookKnowledgeJobFailureUnknownFailure},
+	} {
+		t.Run("default_"+test.name, func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 211)
+			worker := newWorkerForTest(t, store, func(_ context.Context, _ BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
+				if test.stage != "" {
+					if err := setStage(test.stage); err != nil {
+						return nil, err
+					}
+				}
+				return nil, errors.New("provider failed at /private/secret token=abc")
+			})
+			if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+				t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+			}
+			assertWorkerFailedSafely(t, store, job.ID, test.code)
+		})
+	}
+}
+
+func TestBookJobWorkerRecoversExecutorPanicAsSafeUnknownFailure(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 220)
+	worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+		panic("raw panic /private/secret token=abc")
+	})
+	if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	assertWorkerFailedSafely(t, store, job.ID, BookKnowledgeJobFailureUnknownFailure)
+}
+
+func TestBookJobWorkerRenewsLeaseAndStopsRenewingBeforeCompletion(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 230)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	worker := newWorkerWithDurationsForTest(t, store, 250*time.Millisecond, 25*time.Millisecond, 20*time.Millisecond,
+		func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			select {
+			case <-release:
+				return map[string]any{"ebook_id": 230}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+	done := make(chan error, 1)
+	go func() { _, err := worker.RunOnce(context.Background()); done <- err }()
+	<-started
+	waitForWorkerEventMessage(t, store, job.ID, "lease renewed")
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	events := countBookKnowledgeJobEvents(t, store, job.ID)
+	time.Sleep(75 * time.Millisecond)
+	if got := countBookKnowledgeJobEvents(t, store, job.ID); got != events {
+		t.Fatalf("renew loop continued after completion: events=%d want=%d", got, events)
+	}
+}
+
+func TestBookJobWorkerLeaseLossCancelsExecutorWithoutTerminalTransition(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 240)
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	worker := newWorkerWithDurationsForTest(t, store, time.Second, 20*time.Millisecond, 20*time.Millisecond,
+		func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			close(started)
+			<-ctx.Done()
+			close(canceled)
+			return nil, ctx.Err()
+		})
+	done := make(chan error, 1)
+	go func() { _, err := worker.RunOnce(context.Background()); done <- err }()
+	<-started
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`UPDATE book_jobs SET lease_owner = ? WHERE job_id = ?`, "stolen-worker", job.ID)
+	db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = <-done
+	if err == nil || strings.Contains(err.Error(), job.ID) || strings.Contains(err.Error(), "stolen-worker") {
+		t.Fatalf("unsafe or missing infrastructure error: %v", err)
+	}
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("executor did not observe cancellation")
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusRunning {
+		t.Fatalf("lease-lost job=%#v err=%v", loaded, err)
+	}
+	if got := countWorkerTerminalEvents(t, store, job.ID); got != 0 {
+		t.Fatalf("terminal events=%d want=0", got)
+	}
+}
+
+func TestBookJobWorkerStageFailureIsInfrastructureError(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 245)
+	worker := newWorkerForTest(t, store, func(ctx context.Context, _ BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
+		_ = setStage("unsafe-stage")
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	if processed, err := worker.RunOnce(context.Background()); !processed || err == nil || strings.Contains(err.Error(), "unsafe-stage") {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	if got := countWorkerTerminalEvents(t, store, job.ID); got != 0 {
+		t.Fatalf("terminal events=%d want=0", got)
+	}
+}
+
+func TestBookJobWorkerCancellationInterruptsExactlyOnce(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 250)
+	started := make(chan struct{})
+	worker := newWorkerForTest(t, store, func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		processed bool
+		err       error
+	}, 1)
+	go func() {
+		processed, err := worker.RunOnce(ctx)
+		done <- struct {
+			processed bool
+			err       error
+		}{processed, err}
+	}()
+	<-started
+	cancel()
+	result := <-done
+	if !result.processed || result.err != nil {
+		t.Fatalf("RunOnce() processed=%t err=%v", result.processed, result.err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted || loaded.FailureCode != BookKnowledgeJobFailureWorkerInterrupted {
+		t.Fatalf("interrupted job=%#v err=%v", loaded, err)
+	}
+	if got := countWorkerTerminalEvents(t, store, job.ID); got != 1 {
+		t.Fatalf("terminal events=%d want=1", got)
+	}
+}
+
+func TestBookJobWorkerReconcilesExpiredBeforeClaim(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	expired := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 260)
+	if _, err := store.ClaimNextBookKnowledgeJob("dead-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	setBookKnowledgeJobLeaseExpiry(t, store, expired.ID, time.Now().Add(-time.Second))
+	queued := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 261)
+	worker := newWorkerForTest(t, store, func(_ context.Context, job BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+		if job.ID != queued.ID {
+			t.Fatalf("claimed=%q want=%q", job.ID, queued.ID)
+		}
+		return map[string]any{"ebook_id": job.EbookID}, nil
+	})
+	if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+	}
+	loaded, err := store.LoadBookKnowledgeJob(expired.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusInterrupted {
+		t.Fatalf("expired job=%#v err=%v", loaded, err)
+	}
+}
+
+func TestBookJobWorkerRunPollsAndExitsCleanlyOnCancel(t *testing.T) {
+	worker := newWorkerWithDurationsForTest(t, NewBookKnowledgeStore(t.TempDir()), time.Second, 100*time.Millisecond, 30*time.Millisecond, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 85*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if err := worker.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if elapsed < 60*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("Run elapsed=%s, want polling wait without busy exit", elapsed)
+	}
+}
+
+func TestBookJobWorkerDefaultExecutorEmitsExpectedStages(t *testing.T) {
+	previousDownload := runDedaoEbookDownloadJob
+	previousSync := runDedaoEbookSyncKBaseJob
+	defer func() {
+		runDedaoEbookDownloadJob = previousDownload
+		runDedaoEbookSyncKBaseJob = previousSync
+	}()
+	runDedaoEbookDownloadJob = func(context.Context, BookKnowledgeJob) (map[string]any, error) {
+		return map[string]any{"ebook_id": 270}, nil
+	}
+	runDedaoEbookSyncKBaseJob = func(context.Context, *BookKnowledgeStore, BookKnowledgeJob) (map[string]any, error) {
+		return map[string]any{"ebook_id": 271}, nil
+	}
+	for _, test := range []struct {
+		jobType string
+		ebookID int
+		stages  []string
+	}{
+		{jobType: BookKnowledgeJobTypeDedaoEbookDownload, ebookID: 270, stages: []string{"queued", "running", "downloading", "completed"}},
+		{jobType: BookKnowledgeJobTypeDedaoEbookSyncKBase, ebookID: 271, stages: []string{"queued", "running", "downloading", "building_knowledge", "completed"}},
+	} {
+		store := NewBookKnowledgeStore(t.TempDir())
+		job := createWorkerTestJob(t, store, test.jobType, test.ebookID)
+		worker := newWorkerForTest(t, store, nil)
+		if processed, err := worker.RunOnce(context.Background()); err != nil || !processed {
+			t.Fatalf("RunOnce() processed=%t err=%v", processed, err)
+		}
+		assertWorkerEventStages(t, store, job.ID, test.stages)
+	}
+}
+
+func createWorkerTestJob(t *testing.T, store *BookKnowledgeStore, jobType string, ebookID int) BookKnowledgeJob {
+	t.Helper()
+	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: jobType, EbookID: ebookID, EbookEnID: fmt.Sprintf("worker-%d", ebookID), DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return job
+}
+
+func newWorkerForTest(t *testing.T, store *BookKnowledgeStore, execute func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error)) *BookJobWorker {
+	t.Helper()
+	return newWorkerWithDurationsForTest(t, store, time.Second, 100*time.Millisecond, 20*time.Millisecond, execute)
+}
+
+func newWorkerWithDurationsForTest(t *testing.T, store *BookKnowledgeStore, lease, renew, poll time.Duration, execute func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error)) *BookJobWorker {
+	t.Helper()
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "test-worker", LeaseDuration: lease,
+		RenewInterval: renew, PollInterval: poll, Execute: execute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return worker
+}
+
+func assertWorkerFailedSafely(t *testing.T, store *BookKnowledgeStore, jobID, code string) {
+	t.Helper()
+	job, err := store.LoadBookKnowledgeJob(jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMessage := bookKnowledgeJobFailureMessages[code]
+	if job.Status != BookKnowledgeJobStatusFailed || job.FailureCode != code || job.Error != wantMessage {
+		t.Fatalf("failed job=%#v", job)
+	}
+	serialized := fmt.Sprintf("%#v", job)
+	if strings.Contains(serialized, "/private/secret") || strings.Contains(serialized, "token=abc") {
+		t.Fatalf("raw failure persisted: %s", serialized)
+	}
+	db, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var message string
+	if err := db.QueryRow(`SELECT message FROM book_job_events WHERE job_id = ? ORDER BY event_id DESC LIMIT 1`, jobID).Scan(&message); err != nil {
+		t.Fatal(err)
+	}
+	if message != wantMessage {
+		t.Fatalf("event message=%q want=%q", message, wantMessage)
+	}
+}
+
+func assertWorkerEventStages(t *testing.T, store *BookKnowledgeStore, jobID string, want []string) {
+	t.Helper()
+	db, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT stage FROM book_job_events WHERE job_id = ? ORDER BY event_id`, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var stage string
+		if err := rows.Scan(&stage); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, stage)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("stages=%v want=%v", got, want)
+	}
+}
+
+func countWorkerTerminalEvents(t *testing.T, store *BookKnowledgeStore, jobID string) int {
+	t.Helper()
+	db, err := store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM book_job_events WHERE job_id = ? AND status IN (?, ?, ?)`,
+		jobID, BookKnowledgeJobStatusSucceeded, BookKnowledgeJobStatusFailed, BookKnowledgeJobStatusInterrupted).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func waitForWorkerEventMessage(t *testing.T, store *BookKnowledgeStore, jobID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		db, err := store.openBookJobsDB()
+		if err == nil {
+			var count int
+			err = db.QueryRow(`SELECT COUNT(*) FROM book_job_events WHERE job_id = ? AND message = ?`, jobID, want).Scan(&count)
+			db.Close()
+			if err == nil && count > 0 {
+				return
+			}
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for event %q", want)
+}
+
+func TestBookJobWorkerRunDoesNotExecuteAfterCancellation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 280)
+	var calls atomic.Int32
+	worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+		calls.Add(1)
+		return nil, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := worker.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("executor calls=%d want=0", calls.Load())
+	}
+}
+
+func TestBookJobWorkerCancellationBetweenReconcileAndClaimLeavesJobQueued(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 281)
+	blocker, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	tx, err := blocker.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+
+	var calls atomic.Int32
+	worker := newWorkerForTest(t, store, func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+		calls.Add(1)
+		return nil, nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct {
+		processed bool
+		err       error
+	}, 1)
+	go func() {
+		processed, runErr := worker.RunOnce(ctx)
+		done <- struct {
+			processed bool
+			err       error
+		}{processed, runErr}
+	}()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-done
+	if result.err != nil || result.processed {
+		t.Fatalf("RunOnce() processed=%t err=%v", result.processed, result.err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("executor calls=%d want=0", calls.Load())
+	}
+	loaded, err := store.LoadBookKnowledgeJob(job.ID)
+	if err != nil || loaded.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("job=%#v err=%v", loaded, err)
+	}
+}
