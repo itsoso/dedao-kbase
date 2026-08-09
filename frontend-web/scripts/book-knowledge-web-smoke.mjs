@@ -246,6 +246,7 @@ for (const marker of [
   "推理模型",
   "关键词检索",
   "人工复核",
+  'replaceAll("_", " · ")',
 ]) {
   assert.ok(js.includes(marker), `Chinese Agent pages should include ${marker}`);
 }
@@ -280,6 +281,11 @@ const chineseAgentMobileSource = css.match(/@media \(max-width: 760px\) \{[\s\S]
 assert.ok(
   chineseAgentMobileSource.includes("grid-template-columns: minmax(0, 1fr)"),
   "Package contract and Reading App should collapse to one mobile column",
+);
+const agentLongIdentitySource = css.match(/\.book-agent__answer-citations strong,[\s\S]*?\.book-agent__release > header code \{([\s\S]*?)\n\}/)?.[1] || "";
+assert.ok(
+  agentLongIdentitySource.includes("overflow-wrap: anywhere"),
+  "Agent answers and evidence should wrap long citation identities on mobile",
 );
 const metricStripSource = css.match(/\.book-agent__manifest \.book-agent__metric-strip \{([\s\S]*?)\n\}/)?.[1] || "";
 assert.ok(metricStripSource.includes("display: grid"), "Agent metrics should use a wrapping grid instead of one rigid flex row");

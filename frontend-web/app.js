@@ -4783,7 +4783,7 @@ function agentEvaluationMetricLabel(metric) {
 }
 
 function agentBookDisplayTitle(bookTitle, fallback = "知识阅读应用") {
-  return String(bookTitle || "").trim().replace(/^\d+[_\-\s]+/, "") || fallback;
+  return String(bookTitle || "").trim().replace(/^\d+[_\-\s]+/, "").replaceAll("_", " · ") || fallback;
 }
 
 function agentPolicyValueLabel(value) {
@@ -5069,6 +5069,7 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
     </article>
   `).join("");
   const runtimeStatus = bookAgentState.loading || bookAgentState.message;
+  const isEvidenceAuditRoute = route.view === "agent" && pkg.schema_version === "agent-package.v2";
   const isAgentConsoleRoute = route.view === "agent" && pkg.schema_version !== "agent-package.v2";
 
   if (isAgentConsoleRoute) {
@@ -5098,6 +5099,12 @@ function renderBookAgentPlatform(route = bookAgentState.route || { view: "packag
       </main>
     `, "agents");
     bindBookAgentPlatformEvents(route);
+    return;
+  }
+
+  if (!isEvidenceAuditRoute) {
+    renderShell(renderBookAgentPackageIndex(route), "agents");
+    bindAgentCompilerEvents(route);
     return;
   }
 

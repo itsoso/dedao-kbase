@@ -6006,6 +6006,14 @@ a.button {
   display: block;
 }
 
+.book-agent__answer-citations strong,
+.book-agent__answer-citations span,
+.book-agent__evidence-grid small,
+.book-agent__release > header code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .book-agent__answer-citations span {
   margin-top: 4px;
   color: var(--agent-lime);
