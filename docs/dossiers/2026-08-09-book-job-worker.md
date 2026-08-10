@@ -119,6 +119,14 @@
   独立评审 Ready。
 - 在提交 `35fbfb0` 上再次执行全量 Go、`go vet`、前端生产构建、全部 Web smoke、
   部署静态/完整行为 smoke、privacy/system-map 和空白/干净工作区检查，均退出 0。
+- 第二次切换前使用生产 `jobs.json` 私有副本做离线迁移/导出预演，发现真实
+  `notebooklm_export` 还使用 `ebook_id=0`、空 `ebook_enid` 和默认下载类型；因此
+  未进入切换窗口。修复只对未知只读终态放宽身份默认值，已知电子书任务仍严格校验。
+- 独立复核随后发现已知同步任务的负下载类型会在校验前被默认成 1；最终修复改为
+  先拒绝负值、仅把合法 0 默认成 1，并覆盖 succeeded、queued 与创建请求。生产精确
+  NotebookLM 形态、未知类型隐私过滤、二次打开/导出以及所有执行入口综合复核 Ready。
+- 在提交 `bdf0cb9` 上再次执行 `go test ./... -timeout=300s -count=1`、`go vet ./...`、
+  privacy/system-map、空白和干净工作区检查，均退出 0。
 
 ## Gate 记录
 
