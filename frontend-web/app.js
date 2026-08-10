@@ -3176,9 +3176,11 @@ function jobStatusLabel(status) {
   return ({
     queued: "排队中",
     pending: "等待中",
+    leased: "已分配",
     running: "运行中",
     processing: "处理中",
     ready: "已就绪",
+    partial: "部分完成",
     succeeded: "已完成",
     success: "已完成",
     completed: "已完成",
@@ -3265,7 +3267,7 @@ function jobStatusClass(status) {
   return `is-${value || "unknown"}`;
 }
 
-function normalizeJobTask(task, source = "wcplus") {
+function normalizeJobTask(task, source = "source-run", subscription = null) {
   if (source === "kbase") {
     const knowledgeBookID = task?.result?.knowledge_book_id || "";
     return {
@@ -3280,6 +3282,49 @@ function normalizeJobTask(task, source = "wcplus") {
       retryOf: task?.retry_of || "",
       updatedAt: task?.updated_at || task?.created_at || "",
       sourceURL: knowledgeBookID ? buildKnowledgePackageURL(knowledgeBookID) : ROUTES.dedaoEbooks,
+      raw: task || {},
+    };
+  }
+  if (source === "source-run") {
+    const sourceType = String(subscription?.source_type || "").trim().toLowerCase();
+    const isWCPlusSource = sourceType === "wcplus" || sourceType === "wcplus_wechat_article";
+    const isWeChatSource = sourceType === "wechat" || sourceType === "wechat_mp_article";
+    const sourceAccountKey = String(subscription?.source_account_key || "").trim();
+    const sourceParams = new URLSearchParams();
+    if (sourceAccountKey) sourceParams.set("source_account_key", sourceAccountKey);
+    if (subscription?.id) sourceParams.set("subscription_id", subscription.id);
+    if (task?.id) sourceParams.set("run_id", task.id);
+    const sourceQuery = sourceParams.toString();
+    const sourceURL = isWCPlusSource || isWeChatSource
+      ? `${isWCPlusSource ? "/wcplus-source" : "/wechat-source"}${sourceQuery ? `?${sourceQuery}` : ""}`
+      : ROUTES.sourceAgents;
+    const progress = [
+      ["新增", task?.new_count],
+      ["更新", task?.updated_count],
+      ["跳过", task?.skipped_count],
+      ["失败", task?.failed_count],
+    ].filter(([, count]) => Number(count) > 0).map(([label, count]) => `${label} ${count}`);
+    const operation = ({
+      existing_articles: "同步已有文章",
+      discover_articles: "发现文章",
+      sync_articles: "同步文章",
+      sync_media: "同步媒体",
+      sync_content: "同步正文",
+      sync_links: "同步链接",
+      sync_reading_data: "同步阅读数据",
+    })[task?.requested_operation || subscription?.operation] || task?.requested_operation || subscription?.operation || "来源同步";
+    return {
+      id: String(task?.id || ""),
+      source: isWCPlusSource ? "WC Plus" : (isWeChatSource ? "微信公众号" : "来源同步"),
+      title: subscription?.source_account || sourceAccountKey || task?.id || "未命名来源",
+      operation,
+      status: task?.status || "unknown",
+      stage: "",
+      progress: progress.join(" · "),
+      error: sourceAgentSafeError(task?.error),
+      retryOf: task?.retry_of || "",
+      updatedAt: task?.updated_at || task?.created_at || "",
+      sourceURL,
       raw: task || {},
     };
   }
@@ -3307,12 +3352,8 @@ function normalizeJobTask(task, source = "wcplus") {
   };
 }
 
-function jobCenterErrorMessage(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/connect: connection refused|dial tcp|127\.0\.0\.1|localhost/i.test(message)) {
-    return "WC Plus 服务暂不可用。请到来源控制页检查本地 Agent 或服务连接状态。";
-  }
-  return message;
+function jobCenterErrorText(error) {
+  return error && typeof error.message === "string" ? error.message : String(error);
 }
 
 function isJobCenterRoute(pathname = getRoutePathname()) {
@@ -3360,7 +3401,7 @@ function renderJobCenter() {
         <div>
           <p class="web-kicker">Jobs</p>
           <h1>任务中心</h1>
-          <p>统一查看采集、下载、入库、分析和供给任务。得到电子书与 WC Plus 独立加载，单个来源故障不会遮蔽其他任务。</p>
+          <p>统一查看采集、下载、入库、分析和供给任务。得到电子书与来源同步任务独立加载，单个来源故障不会遮蔽其他任务。</p>
         </div>
         <button class="button button-primary" type="button" data-action="reload-job-center" ${jobCenterState.loading ? "disabled" : ""}>
           ${jobCenterState.loading ? "加载中" : "刷新任务"}
@@ -3387,22 +3428,28 @@ async function loadJobCenter() {
   jobCenterState.message = "";
   renderJobCenter();
   try {
-    const [wcplusResult, kbaseResult] = await Promise.allSettled([
-      apiFetch("/api/wcplus/task/all"),
+    const [sourceRunResult, sourceSubscriptionResult, kbaseResult] = await Promise.allSettled([
+      apiFetch("/api/source-sync/runs?limit=50"),
+      apiFetch("/api/source-subscriptions"),
       apiFetch("/api/jobs?limit=50"),
     ]);
     if (sequence !== jobCenterLoadSequence || !isJobCenterRoute()) return;
-    const wcplusTasks = wcplusResult.status === "fulfilled" && Array.isArray(wcplusResult.value?.tasks)
-      ? wcplusResult.value.tasks.map((task) => normalizeJobTask(task, "wcplus"))
+    const subscriptions = sourceSubscriptionResult.status === "fulfilled" && Array.isArray(sourceSubscriptionResult.value?.subscriptions)
+      ? sourceSubscriptionResult.value.subscriptions
+      : [];
+    const subscriptionsByID = new Map(subscriptions.map((subscription) => [subscription.id, subscription]));
+    const sourceTasks = sourceRunResult.status === "fulfilled" && sourceSubscriptionResult.status === "fulfilled" && Array.isArray(sourceRunResult.value?.runs)
+      ? sourceRunResult.value.runs.map((task) => normalizeJobTask(task, "source-run", subscriptionsByID.get(task.subscription_id)))
       : [];
     const kbaseTasks = kbaseResult.status === "fulfilled" && Array.isArray(kbaseResult.value?.jobs)
       ? kbaseResult.value.jobs.map((task) => normalizeJobTask(task, "kbase"))
       : [];
-    jobCenterState.tasks = [...kbaseTasks, ...wcplusTasks];
+    jobCenterState.tasks = [...kbaseTasks, ...sourceTasks];
     jobCenterState.lastUpdated = new Date().toLocaleString("zh-CN");
     const errors = [];
-    if (wcplusResult.status === "rejected") errors.push(jobCenterErrorMessage(wcplusResult.reason));
-    if (kbaseResult.status === "rejected") errors.push(`KBase 任务加载失败：${kbaseResult.reason instanceof Error ? kbaseResult.reason.message : String(kbaseResult.reason)}`);
+    if (sourceRunResult.status === "rejected") errors.push(`来源同步任务加载失败：${jobCenterErrorText(sourceRunResult.reason)}`);
+    if (sourceSubscriptionResult.status === "rejected") errors.push(`来源订阅加载失败：${jobCenterErrorText(sourceSubscriptionResult.reason)}`);
+    if (kbaseResult.status === "rejected") errors.push(`KBase 任务加载失败：${jobCenterErrorText(kbaseResult.reason)}`);
     jobCenterState.message = errors.length
       ? `${jobCenterState.tasks.length ? `已加载 ${jobCenterState.tasks.length} 个任务。` : ""}${errors.join(" ")}`
       : `已加载 ${jobCenterState.tasks.length} 个任务。`;
@@ -7510,6 +7557,8 @@ function isSourceControlPath() {
 
 function sourceControlPrefillFromLocation() {
   const params = new URLSearchParams(window.location.search);
+  sourceControlState.selectedSubscriptionID = String(params.get("subscription_id") || "").trim();
+  sourceControlState.selectedRunID = String(params.get("run_id") || "").trim();
   const sourceAccountKey = String(params.get("source_account_key") || "").trim();
   if (!sourceAccountKey) {
     return;
@@ -7554,6 +7603,12 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
       sourceControlState.selectedSubscriptionID = sourceControlState.subscriptions[0]?.id || "";
       sourceControlState.selectedRunID = "";
       sourceControlState.runDetail = null;
+    } else if (sourceControlState.selectedRunID) {
+      const selectedRun = sourceControlState.runs.find((run) => run.id === sourceControlState.selectedRunID);
+      if (!selectedRun || selectedRun.subscription_id !== sourceControlState.selectedSubscriptionID) {
+        sourceControlState.selectedRunID = "";
+        sourceControlState.runDetail = null;
+      }
     }
     if (sourceControlState.selectedRunID) {
       try {

@@ -1375,6 +1375,7 @@ a.button {
 .job-card__status.is-running,
 .job-card__status.is-queued,
 .job-card__status.is-pending,
+.job-card__status.is-leased,
 .job-card__status.is-processing {
   background: rgba(255, 107, 0, 0.12);
   color: #b65300;
@@ -1382,6 +1383,7 @@ a.button {
 
 .job-card__status.is-failed,
 .job-card__status.is-error,
+.job-card__status.is-partial,
 .job-card__status.is-interrupted {
   background: rgba(191, 72, 54, 0.12);
   color: #9a3324;
