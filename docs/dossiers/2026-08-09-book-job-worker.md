@@ -82,6 +82,13 @@
 - 源码归档在解压前比较本地/远端 SHA-256，远端源码目录必须原先不存在；CI 不再
   静默忽略用户创建失败，并使用远端 URL、共享 Source Agent Token 和稳定 ID 执行
   Worker `check-config`。
+- Task 7 二次评审把替换窗口扩成逐阶段故障矩阵：server/Worker/Web/unit 各次移动
+  以及 unit 后 daemon-reload 都在首次安装和升级两种状态下触发真实回滚；候选
+  install/Web copy 的 trap 前失败也验证不会停止现有服务。
+- 回滚只在 Worker 已 enabled 时尝试 disable；unit 缺失且 systemd 清理链接后返回
+  非零时以 `is-enabled` 后置条件判定，既不吞掉未清理错误，也不因缺失 unit 中断。
+- README 的 sudo allowlist 和 export 集合由 smoke 与 cutover 必需变量机械比较；
+  行为 mock 会删除 allowlist 外的 `KBASE_*` 环境，验证没有透传完整 operator 环境。
 
 ## Gate 记录
 

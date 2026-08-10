@@ -100,6 +100,25 @@ if grep -Fq 'sudo --preserve-env \' "$README"; then
   fail "deployment may not preserve the complete operator environment"
 fi
 
+cutover_required="$({
+  sed -n '/^for variable in \\/,/^do$/p' "$CUTOVER_SCRIPT" |
+    grep -Eo 'KBASE_[A-Z0-9_]+'
+} | sort -u)"
+readme_allowlist="$({
+  grep -Eo 'sudo --preserve-env=[^[:space:]]+' "$README" |
+    head -n 1 |
+    cut -d= -f2- |
+    tr ',' '\n'
+} | sort -u)"
+readme_exports="$({
+  sed -n '/DEPLOY_EXPORTS_BEGIN/,/DEPLOY_EXPORTS_END/p' "$README" |
+    grep -Eo 'KBASE_[A-Z0-9_]+' || true
+} | sort -u)"
+[[ "$cutover_required" == "$readme_allowlist" ]] ||
+  fail "README sudo allowlist differs from cutover required variables"
+[[ "$cutover_required" == "$readme_exports" ]] ||
+  fail "README exports differ from cutover required variables"
+
 for required in \
   'sudo rm -f "${KBASE_WORKER_BINARY_TARGET:?}"' \
   'sudo rm -f "${KBASE_WORKER_UNIT_TARGET:?}"' \

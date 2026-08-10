@@ -12,12 +12,37 @@ log_action() {
   printf '\n' >>"${MOCK_ACTION_LOG:?}"
 }
 
+fail_once() {
+  local operation="$1"
+  local failure="${MOCK_SYSTEMCTL_STATE:?}/fail-${operation}-once"
+  if [[ -f "$failure" ]]; then
+    mv "$failure" "${failure}.used"
+    return 0
+  fi
+  return 1
+}
+
 case "$command_name" in
   sudo)
     log_action "$@"
+    preserve_list=""
     while [[ "${1:-}" == --preserve-env=* ]]; do
+      preserve_list="${1#--preserve-env=}"
       shift
     done
+    if [[ -n "$preserve_list" ]]; then
+      while IFS='=' read -r environment_name _; do
+        case "$environment_name" in
+          KBASE_*)
+            case ",${preserve_list}," in
+              *",${environment_name},"*) ;;
+              *) unset "$environment_name" ;;
+            esac
+            ;;
+        esac
+      done < <(env)
+      [[ -z "${KBASE_UNLISTED_SENTINEL:-}" ]] || exit 9
+    fi
     exec "$@"
     ;;
   systemctl)
@@ -26,6 +51,9 @@ case "$command_name" in
     service="${2:-}"
     case "$action" in
       daemon-reload)
+        if [[ -f "${KBASE_WORKER_UNIT_TARGET:?}" ]] && fail_once daemon-reload-after-unit; then
+          exit 1
+        fi
         exit 0
         ;;
       is-active)
@@ -44,9 +72,7 @@ case "$command_name" in
         rm -f "${MOCK_SYSTEMCTL_STATE:?}/${service}.active"
         ;;
       start|restart)
-        failure="${MOCK_SYSTEMCTL_STATE:?}/fail-${action}-${service}-once"
-        if [[ -f "$failure" ]]; then
-          mv "$failure" "${failure}.used"
+        if fail_once "${action}-${service}"; then
           exit 1
         fi
         if [[ "$service" == "${KBASE_WORKER_SERVICE_NAME:?}" ]] &&
@@ -62,6 +88,9 @@ case "$command_name" in
       disable)
         if [[ "$service" == "${KBASE_WORKER_SERVICE_NAME:?}" ]] &&
           [[ ! -f "${KBASE_WORKER_UNIT_TARGET:?}" ]]; then
+          rm -f \
+            "${MOCK_SYSTEMCTL_STATE:?}/${service}.enabled" \
+            "${MOCK_SYSTEMCTL_STATE:?}/${service}.wants-symlink"
           exit 5
         fi
         rm -f \
@@ -108,7 +137,52 @@ case "$command_name" in
           ;;
       esac
     done
+    argument_count="${#install_arguments[@]}"
+    if [[ "$argument_count" -ge 2 ]]; then
+      source_path="${install_arguments[$((argument_count - 2))]}"
+      target_path="${install_arguments[$((argument_count - 1))]}"
+      if [[ "$source_path" == "${KBASE_CANDIDATE_BIN:?}" ]] &&
+        [[ "$target_path" == "${KBASE_BINARY_CANDIDATE_TARGET:?}" ]] &&
+        fail_once stage-server-install; then
+        exit 1
+      fi
+      if [[ "$source_path" == "${KBASE_WORKER_CANDIDATE_BIN:?}" ]] &&
+        [[ "$target_path" == "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" ]] &&
+        fail_once stage-worker-install; then
+        exit 1
+      fi
+    fi
     exec /usr/bin/install "${install_arguments[@]}"
+    ;;
+  mv)
+    log_action "$@"
+    operation=""
+    if [[ "${1:-}" == "${KBASE_BINARY_CANDIDATE_TARGET:?}" && "${2:-}" == "${KBASE_BINARY_TARGET:?}" ]]; then
+      operation="server-move"
+    elif [[ "${1:-}" == "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" && "${2:-}" == "${KBASE_WORKER_BINARY_TARGET:?}" ]]; then
+      operation="worker-move"
+    elif [[ "${1:-}" == "${KBASE_WEB_TARGET:?}" && "${2:-}" == "${KBASE_WEB_PREVIOUS_TARGET:?}" ]]; then
+      operation="web-old-move"
+    elif [[ "${1:-}" == "${KBASE_WEB_CANDIDATE_TARGET:?}" && "${2:-}" == "${KBASE_WEB_TARGET:?}" ]]; then
+      operation="web-new-move"
+    elif [[ "${1:-}" == "${KBASE_WORKER_UNIT_CANDIDATE_TARGET:?}" && "${2:-}" == "${KBASE_WORKER_UNIT_TARGET:?}" ]]; then
+      operation="unit-move"
+    fi
+    if [[ -n "$operation" ]] && fail_once "$operation"; then
+      exit 1
+    fi
+    exec /bin/mv "$@"
+    ;;
+  cp)
+    log_action "$@"
+    source_path="${2:-}"
+    target_path="${3:-}"
+    if [[ "$source_path" == "${KBASE_WEB_CANDIDATE_SOURCE:?}" ]] &&
+      [[ "$target_path" == "${KBASE_WEB_CANDIDATE_TARGET:?}" ]] &&
+      fail_once stage-web-copy; then
+      exit 1
+    fi
+    exec /bin/cp "$@"
     ;;
   book-job-worker)
     log_action "$@"

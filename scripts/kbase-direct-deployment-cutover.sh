@@ -132,6 +132,19 @@ test "$(sha256sum "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" | awk '{print $1}'
 
 KBASE_LEGACY_JOBS_TEMP="${KBASE_LEGACY_JOBS_PATH:?}.rollback.$$"
 
+disable_worker_service() {
+  if ! sudo systemctl is-enabled --quiet "${KBASE_WORKER_SERVICE_NAME:?}"; then
+    return 0
+  fi
+  if sudo systemctl disable "${KBASE_WORKER_SERVICE_NAME:?}"; then
+    return 0
+  fi
+  if sudo systemctl is-enabled --quiet "${KBASE_WORKER_SERVICE_NAME:?}"; then
+    return 1
+  fi
+  return 0
+}
+
 rollback_direct_deployment() {
   local status=$?
   trap - ERR
@@ -152,7 +165,7 @@ rollback_direct_deployment() {
   fi
   sudo mv "${KBASE_LEGACY_JOBS_TEMP:?}" "${KBASE_LEGACY_JOBS_PATH:?}"
 
-  sudo systemctl disable "${KBASE_WORKER_SERVICE_NAME:?}"
+  disable_worker_service
   sudo install -o root -g root -m 0755 \
     "${KBASE_BACKUP_DIR:?}/kbase-server" \
     "${KBASE_BINARY_TARGET:?}"

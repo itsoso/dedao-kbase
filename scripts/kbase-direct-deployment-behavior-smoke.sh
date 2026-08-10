@@ -36,7 +36,7 @@ setup_case() {
     "${CASE_DIR}/downloads" \
     "${CASE_DIR}/staging"
   : >"${CASE_DIR}/actions.log"
-  for command in sudo systemctl runuser curl sqlite3 install; do
+  for command in sudo systemctl runuser curl sqlite3 install mv cp; do
     ln -s "$MOCK_COMMAND" "${CASE_DIR}/bin/${command}"
   done
   cp "$MOCK_COMMAND" "${CASE_DIR}/sources/book-job-worker"
@@ -55,6 +55,7 @@ run_cutover() {
     PATH="${CASE_DIR}/bin:${PATH}" \
     MOCK_ACTION_LOG="${CASE_DIR}/actions.log" \
     MOCK_SYSTEMCTL_STATE="${CASE_DIR}/state" \
+    KBASE_UNLISTED_SENTINEL="must-not-reach-cutover" \
     KBASE_BACKUP_DIR="${CASE_DIR}/backup" \
     KBASE_BINARY_TARGET="${CASE_DIR}/targets/kbase-server" \
     KBASE_WORKER_BINARY_TARGET="${CASE_DIR}/targets/book-job-worker" \
@@ -164,5 +165,83 @@ test -f "${CASE_DIR}/state/dedao-book-job-worker.service.enabled" ||
   fail "rollback did not restore enabled state"
 test -f "${CASE_DIR}/state/dedao-book-job-worker.service.active" ||
   fail "rollback did not restore active state"
+
+verify_fault_window() {
+  local mode="$1"
+  local fault="$2"
+
+  setup_case "${mode}-${fault}"
+  if [[ "$mode" == upgrade ]]; then
+    printf 'old-worker\n' >"${CASE_DIR}/targets/book-job-worker"
+    printf 'old-unit\n' >"${CASE_DIR}/targets/dedao-book-job-worker.service"
+    printf 'old-sqlite\n' >"${CASE_DIR}/knowledge/book_jobs.sqlite3"
+    printf '{"jobs":[{"id":"old"}]}\n' >"${CASE_DIR}/knowledge/jobs.json"
+    touch "${CASE_DIR}/state/dedao-book-job-worker.service.enabled"
+    touch "${CASE_DIR}/state/dedao-book-job-worker.service.active"
+  fi
+  touch "${CASE_DIR}/state/fail-${fault}-once"
+  if run_cutover; then
+    fail "${mode} ${fault} failure unexpectedly succeeded"
+  fi
+
+  assert_file_contains "${CASE_DIR}/targets/kbase-server" "old-server"
+  assert_file_contains "${CASE_DIR}/targets/frontend-web/version" "old-web"
+  assert_file_contains "${CASE_DIR}/downloads/sentinel" "download-sentinel"
+  assert_file_contains "${CASE_DIR}/knowledge/jobs.json" '"jobs":[]'
+  test -f "${CASE_DIR}/knowledge/book_jobs.sqlite3" || fail "${mode} ${fault} deleted SQLite"
+  test -f "${CASE_DIR}/state/dedao-kbase.service.active" || fail "${mode} ${fault} left KBase inactive"
+  if [[ "$mode" == upgrade ]]; then
+    assert_file_contains "${CASE_DIR}/targets/book-job-worker" "old-worker"
+    assert_file_contains "${CASE_DIR}/targets/dedao-book-job-worker.service" "old-unit"
+    test -f "${CASE_DIR}/state/dedao-book-job-worker.service.enabled" ||
+      fail "${mode} ${fault} did not restore enabled state"
+    test -f "${CASE_DIR}/state/dedao-book-job-worker.service.active" ||
+      fail "${mode} ${fault} did not restore active state"
+  else
+    assert_absent "${CASE_DIR}/targets/book-job-worker"
+    assert_absent "${CASE_DIR}/targets/dedao-book-job-worker.service"
+    assert_absent "${CASE_DIR}/state/dedao-book-job-worker.service.enabled"
+    assert_absent "${CASE_DIR}/state/dedao-book-job-worker.service.wants-symlink"
+  fi
+  export_line="$(grep -n 'book-job-worker export-legacy' "${CASE_DIR}/actions.log" | head -n 1 | cut -d: -f1)"
+  restore_line="$(grep -n "backup/kbase-server.*targets/kbase-server" "${CASE_DIR}/actions.log" | head -n 1 | cut -d: -f1)"
+  [[ -n "$export_line" && -n "$restore_line" && "$export_line" -lt "$restore_line" ]] ||
+    fail "${mode} ${fault} restored before legacy export"
+}
+
+for mode in first-install upgrade; do
+  for fault in server-move worker-move web-old-move web-new-move unit-move daemon-reload-after-unit; do
+    verify_fault_window "$mode" "$fault"
+  done
+done
+
+verify_pretrap_failure() {
+  local fault="$1"
+  setup_case "pretrap-${fault}"
+  touch "${CASE_DIR}/state/fail-${fault}-once"
+  if run_cutover; then
+    fail "pre-trap ${fault} failure unexpectedly succeeded"
+  fi
+  assert_file_contains "${CASE_DIR}/targets/kbase-server" "old-server"
+  assert_file_contains "${CASE_DIR}/targets/frontend-web/version" "old-web"
+  assert_absent "${CASE_DIR}/targets/book-job-worker"
+  assert_absent "${CASE_DIR}/targets/dedao-book-job-worker.service"
+  test -f "${CASE_DIR}/state/dedao-kbase.service.active" || fail "pre-trap ${fault} stopped KBase"
+}
+
+verify_pretrap_failure stage-server-install
+verify_pretrap_failure stage-worker-install
+verify_pretrap_failure stage-web-copy
+
+setup_case first-install-stale-enable-link
+touch "${CASE_DIR}/state/dedao-book-job-worker.service.enabled"
+touch "${CASE_DIR}/state/dedao-book-job-worker.service.wants-symlink"
+touch "${CASE_DIR}/state/fail-server-move-once"
+if run_cutover; then
+  fail "stale-enable-link failure unexpectedly succeeded"
+fi
+assert_absent "${CASE_DIR}/state/dedao-book-job-worker.service.enabled"
+assert_absent "${CASE_DIR}/state/dedao-book-job-worker.service.wants-symlink"
+test -f "${CASE_DIR}/state/dedao-kbase.service.active" || fail "stale enable cleanup left KBase inactive"
 
 printf 'kbase direct deployment behavior smoke passed\n'
