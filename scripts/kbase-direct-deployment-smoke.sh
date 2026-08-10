@@ -129,6 +129,19 @@ do
 done
 
 for required in \
+  'KBASE_LOOPBACK_READY_MAX_ATTEMPTS=30' \
+  'KBASE_LOOPBACK_READY_DELAY_SECONDS=1' \
+  'wait_for_kbase_readiness()' \
+  'attempt < KBASE_LOOPBACK_READY_MAX_ATTEMPTS' \
+  'sleep "$KBASE_LOOPBACK_READY_DELAY_SECONDS"'
+do
+  grep -Fq "$required" "$CUTOVER_SCRIPT" ||
+    fail "cutover script is missing bounded readiness retry: ${required}"
+done
+test "$(grep -Ec '^[[:space:]]*wait_for_kbase_readiness$' "$CUTOVER_SCRIPT")" -eq 2 ||
+  fail "bounded readiness retry must protect cutover and rollback"
+
+for required in \
   'sudo rm -f "${KBASE_WORKER_BINARY_TARGET:?}"' \
   'sudo rm -f "${KBASE_WORKER_UNIT_TARGET:?}"' \
   'book-job-worker.absent' \

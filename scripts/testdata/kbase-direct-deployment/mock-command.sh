@@ -113,6 +113,21 @@ case "$command_name" in
     ;;
   curl)
     log_action "$@"
+    if [[ -f "${MOCK_SYSTEMCTL_STATE:?}/curl-always-fail" ]]; then
+      exit 1
+    fi
+    remaining_path="${MOCK_SYSTEMCTL_STATE:?}/curl-failures-remaining"
+    if [[ -f "$remaining_path" ]]; then
+      remaining="$(cat "$remaining_path")"
+      if [[ "$remaining" -gt 0 ]]; then
+        printf '%s\n' "$((remaining - 1))" >"$remaining_path"
+        exit 1
+      fi
+    fi
+    exit 0
+    ;;
+  sleep)
+    log_action "$@"
     exit 0
     ;;
   sqlite3)

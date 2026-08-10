@@ -150,6 +150,22 @@ test "$(sha256sum "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" | awk '{print $1}'
   "${KBASE_WORKER_SHA256:?}"
 
 KBASE_LEGACY_JOBS_TEMP="${KBASE_LEGACY_JOBS_PATH:?}.rollback.$$"
+KBASE_LOOPBACK_READY_MAX_ATTEMPTS=30
+KBASE_LOOPBACK_READY_DELAY_SECONDS=1
+
+wait_for_kbase_readiness() {
+  local attempt
+  for ((attempt = 1; attempt <= KBASE_LOOPBACK_READY_MAX_ATTEMPTS; attempt++)); do
+    if curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"; then
+      return 0
+    fi
+    if ((attempt < KBASE_LOOPBACK_READY_MAX_ATTEMPTS)); then
+      sleep "$KBASE_LOOPBACK_READY_DELAY_SECONDS"
+    fi
+  done
+  printf 'kbase direct deployment cutover: loopback readiness timed out\n' >&2
+  return 1
+}
 
 disable_worker_service() {
   if ! sudo systemctl is-enabled --quiet "${KBASE_WORKER_SERVICE_NAME:?}"; then
@@ -216,7 +232,6 @@ rollback_direct_deployment() {
     fi
   fi
   sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
-  curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
   sudo systemctl is-active --quiet "${KBASE_SERVICE_NAME:?}"
   if sudo test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.active"; then
     sudo systemctl start "${KBASE_WORKER_SERVICE_NAME:?}"
@@ -225,6 +240,7 @@ rollback_direct_deployment() {
     sudo systemctl stop "${KBASE_WORKER_SERVICE_NAME:?}" ||
       sudo test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.absent"
   fi
+  wait_for_kbase_readiness
   exit "$status"
 }
 
@@ -241,7 +257,7 @@ sudo systemctl daemon-reload
 sudo systemctl start "${KBASE_SERVICE_NAME:?}"
 sudo systemctl enable "${KBASE_WORKER_SERVICE_NAME:?}"
 sudo systemctl start "${KBASE_WORKER_SERVICE_NAME:?}"
-curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
+wait_for_kbase_readiness
 sudo systemctl is-active --quiet "${KBASE_SERVICE_NAME:?}"
 sudo systemctl is-enabled --quiet "${KBASE_WORKER_SERVICE_NAME:?}"
 sudo systemctl is-active --quiet "${KBASE_WORKER_SERVICE_NAME:?}"

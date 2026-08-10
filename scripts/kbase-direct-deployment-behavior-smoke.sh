@@ -36,7 +36,7 @@ setup_case() {
     "${CASE_DIR}/downloads" \
     "${CASE_DIR}/staging"
   : >"${CASE_DIR}/actions.log"
-  for command in sudo systemctl runuser curl sqlite3 install mv cp; do
+  for command in sudo systemctl runuser curl sleep sqlite3 install mv cp; do
     ln -s "$MOCK_COMMAND" "${CASE_DIR}/bin/${command}"
   done
   cp "$MOCK_COMMAND" "${CASE_DIR}/sources/book-job-worker"
@@ -90,6 +90,41 @@ run_cutover() {
 setup_case canonical-book-jobs-path-success
 run_cutover
 assert_file_contains "${CASE_DIR}/targets/kbase-server" "new-server"
+
+setup_case delayed-loopback-readiness-success
+printf '2\n' >"${CASE_DIR}/state/curl-failures-remaining"
+run_cutover
+assert_file_contains "${CASE_DIR}/targets/kbase-server" "new-server"
+test "$(grep -c '^curl ' "${CASE_DIR}/actions.log")" -eq 3 ||
+  fail "delayed readiness did not retry curl exactly three times"
+test "$(grep -c '^sleep ' "${CASE_DIR}/actions.log")" -eq 2 ||
+  fail "delayed readiness did not wait between attempts"
+
+setup_case persistent-loopback-readiness-failure
+printf 'old-worker\n' >"${CASE_DIR}/targets/book-job-worker"
+printf 'old-unit\n' >"${CASE_DIR}/targets/dedao-book-job-worker.service"
+printf 'old-sqlite\n' >"${CASE_DIR}/knowledge/book_jobs.sqlite3"
+printf '{"jobs":[{"id":"old"}]}\n' >"${CASE_DIR}/knowledge/jobs.json"
+touch "${CASE_DIR}/state/dedao-book-job-worker.service.enabled"
+touch "${CASE_DIR}/state/dedao-book-job-worker.service.active"
+touch "${CASE_DIR}/state/curl-always-fail"
+if run_cutover; then
+  fail "persistent readiness failure unexpectedly succeeded"
+fi
+assert_file_contains "${CASE_DIR}/targets/kbase-server" "old-server"
+assert_file_contains "${CASE_DIR}/targets/book-job-worker" "old-worker"
+assert_file_contains "${CASE_DIR}/targets/dedao-book-job-worker.service" "old-unit"
+assert_file_contains "${CASE_DIR}/targets/frontend-web/version" "old-web"
+test -f "${CASE_DIR}/state/dedao-kbase.service.active" ||
+  fail "persistent readiness failure left KBase stopped after rollback"
+test -f "${CASE_DIR}/state/dedao-book-job-worker.service.enabled" ||
+  fail "persistent readiness failure did not restore Worker enablement"
+test -f "${CASE_DIR}/state/dedao-book-job-worker.service.active" ||
+  fail "persistent readiness failure did not restore active Worker"
+test "$(grep -c '^curl ' "${CASE_DIR}/actions.log")" -eq 60 ||
+  fail "persistent readiness retry was not bounded across cutover and rollback"
+test "$(grep -c '^sleep ' "${CASE_DIR}/actions.log")" -eq 58 ||
+  fail "persistent readiness retry did not use bounded waits"
 
 setup_case mismatched-book-jobs-path
 KBASE_BOOK_JOBS_DB_OVERRIDE="${CASE_DIR}/wrong-root/book_jobs.sqlite3"
