@@ -111,6 +111,66 @@ func TestBookKnowledgeJobsImportReadOnlyUnknownLegacyType(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobsImportIdentitylessNotebookLMExport(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	historical := BookKnowledgeJob{
+		ID: "legacy-notebooklm-identityless", Type: "notebooklm_export", Status: BookKnowledgeJobStatusSucceeded,
+		EbookID: 0, EbookEnID: "", DownloadType: 0,
+		Result: map[string]any{
+			"book_id": "private-book-id", "last_export_dir": "/private/notebooklm/export",
+			"last_export_files": []any{"/private/notebooklm/export/source.md"},
+			"notebook_url":      "https://notebooklm.google.com/notebook/private-id",
+			"updated_at":        "2026-07-01T00:01:00Z",
+		},
+		Logs:      []string{"queued", "running", "succeeded"},
+		CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+		StartedAt: "2026-07-01T00:00:10Z", FinishedAt: "2026-07-01T00:01:00Z",
+	}
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{historical})
+
+	for attempt, current := range []*BookKnowledgeStore{store, NewBookKnowledgeStore(root)} {
+		loaded, err := current.LoadBookKnowledgeJob(historical.ID)
+		if err != nil {
+			t.Fatalf("open %d: %v", attempt+1, err)
+		}
+		if loaded.Type != historical.Type || loaded.Status != BookKnowledgeJobStatusSucceeded ||
+			loaded.EbookID != 0 || loaded.EbookEnID != "" || loaded.DownloadType != 0 {
+			t.Fatalf("open %d job = %#v", attempt+1, loaded)
+		}
+		if len(loaded.Result) != 0 {
+			t.Fatalf("open %d retained legacy result = %#v", attempt+1, loaded.Result)
+		}
+	}
+
+	exportPath := filepath.Join(t.TempDir(), "jobs.json")
+	if err := store.ExportLegacyBookKnowledgeJobs(exportPath); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := readLegacyBookKnowledgeJobs(exportPath)
+	if err != nil || len(exported.Jobs) != 1 {
+		t.Fatalf("exported = %#v, err=%v", exported.Jobs, err)
+	}
+	got := exported.Jobs[0]
+	if got.Type != historical.Type || got.Status != historical.Status || got.EbookID != 0 || got.EbookEnID != "" ||
+		got.DownloadType != 0 || len(got.Result) != 0 {
+		t.Fatalf("exported identityless job = %#v", got)
+	}
+}
+
+func TestBookKnowledgeJobsKnownLegacyTypeStillRequiresEbookIdentity(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{
+		ID: "legacy-known-identityless", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+		Status: BookKnowledgeJobStatusSucceeded, EbookID: 0, EbookEnID: "", DownloadType: 1,
+		CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+	}})
+	if _, err := store.ListBookKnowledgeJobs(10); err == nil {
+		t.Fatal("known ebook job without identity was imported")
+	}
+	assertBookKnowledgeMigrationMarkerAbsent(t, store.BookJobsDBPath())
+}
+
 func TestBookKnowledgeJobsUnknownLegacyResultUsesStrictAllowlist(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{

@@ -1881,11 +1881,15 @@ func validateAndNormalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) (BookKnowl
 			return job, fmt.Errorf("unsupported active legacy job type %q with status %s", job.Type, job.Status)
 		}
 	}
-	if job.EbookID <= 0 {
-		return job, fmt.Errorf("ebook_id is required")
-	}
-	if strings.TrimSpace(job.EbookEnID) == "" {
-		return job, fmt.Errorf("ebook_enid is required")
+	if supportedType {
+		if job.EbookID <= 0 {
+			return job, fmt.Errorf("ebook_id is required")
+		}
+		if strings.TrimSpace(job.EbookEnID) == "" {
+			return job, fmt.Errorf("ebook_enid is required")
+		}
+	} else if job.EbookID < 0 || job.DownloadType < 0 {
+		return job, fmt.Errorf("read-only legacy job identity defaults cannot be negative")
 	}
 	if job.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
 		job.DownloadType = 1
