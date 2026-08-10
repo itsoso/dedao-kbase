@@ -2008,7 +2008,7 @@ func legacyBookKnowledgeJobWasInterrupted(job BookKnowledgeJob) bool {
 
 func safeLegacyBookKnowledgeJobResult(job BookKnowledgeJob, result map[string]any) map[string]any {
 	if !isSupportedBookKnowledgeJobType(job.Type) {
-		return safeReadOnlyLegacyBookKnowledgeJobResult(result)
+		return safeReadOnlyLegacyBookKnowledgeJobResult(job, result)
 	}
 	filtered := safeBookKnowledgeJobResult(result)
 	if len(filtered) == 0 {
@@ -2037,17 +2037,29 @@ func safeLegacyBookKnowledgeJobResult(job BookKnowledgeJob, result map[string]an
 	return safe
 }
 
-func safeReadOnlyLegacyBookKnowledgeJobResult(result map[string]any) map[string]any {
+func safeReadOnlyLegacyBookKnowledgeJobResult(job BookKnowledgeJob, result map[string]any) map[string]any {
 	if len(result) == 0 {
 		return nil
 	}
-	safe := make(map[string]any, len(result))
+	safe := make(map[string]any, 5)
 	for key, value := range result {
-		if !safeReadOnlyLegacyBookKnowledgeJobResultKey(key) {
-			continue
-		}
-		if filtered, ok := safeReadOnlyLegacyBookKnowledgeJobResultValue(value, 0); ok {
-			safe[key] = filtered
+		switch key {
+		case "ebook_id":
+			if integer, ok := legacyBookKnowledgeJobResultNonNegativeInteger(value); ok && integer == uint64(job.EbookID) {
+				safe[key] = value
+			}
+		case "source_count":
+			if _, ok := legacyBookKnowledgeJobResultNonNegativeInteger(value); ok {
+				safe[key] = value
+			}
+		case "ebook_enid":
+			if text, ok := value.(string); ok && text == job.EbookEnID && legacyBookKnowledgeJobResultTextIsSafe(text) {
+				safe[key] = text
+			}
+		case "title", "notebook_id":
+			if text, ok := value.(string); ok && legacyBookKnowledgeJobResultTextIsSafe(text) {
+				safe[key] = text
+			}
 		}
 	}
 	if len(safe) == 0 {
@@ -2056,63 +2068,13 @@ func safeReadOnlyLegacyBookKnowledgeJobResult(result map[string]any) map[string]
 	return safe
 }
 
-func safeReadOnlyLegacyBookKnowledgeJobResultKey(key string) bool {
-	key = strings.TrimSpace(key)
-	if key == "" || len(key) > 128 {
-		return false
+func legacyBookKnowledgeJobResultNonNegativeInteger(value any) (uint64, bool) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return 0, false
 	}
-	lower := strings.ToLower(key)
-	for _, marker := range []string{
-		"path", "token", "secret", "cookie", "authorization", "credential", "password", "api_key", "apikey",
-	} {
-		if strings.Contains(lower, marker) {
-			return false
-		}
-	}
-	for _, character := range key {
-		if unicode.IsControl(character) {
-			return false
-		}
-	}
-	return true
-}
-
-func safeReadOnlyLegacyBookKnowledgeJobResultValue(value any, depth int) (any, bool) {
-	if depth > 8 {
-		return nil, false
-	}
-	switch typed := value.(type) {
-	case nil:
-		return nil, true
-	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
-		return typed, true
-	case string:
-		if legacyBookKnowledgeJobResultTextIsSafe(typed) {
-			return typed, true
-		}
-		return nil, false
-	case []any:
-		filtered := make([]any, 0, len(typed))
-		for _, entry := range typed {
-			if safeEntry, ok := safeReadOnlyLegacyBookKnowledgeJobResultValue(entry, depth+1); ok {
-				filtered = append(filtered, safeEntry)
-			}
-		}
-		return filtered, true
-	case map[string]any:
-		filtered := make(map[string]any, len(typed))
-		for key, entry := range typed {
-			if !safeReadOnlyLegacyBookKnowledgeJobResultKey(key) {
-				continue
-			}
-			if safeEntry, ok := safeReadOnlyLegacyBookKnowledgeJobResultValue(entry, depth+1); ok {
-				filtered[key] = safeEntry
-			}
-		}
-		return filtered, true
-	default:
-		return nil, false
-	}
+	integer, err := strconv.ParseUint(string(encoded), 10, 64)
+	return integer, err == nil
 }
 
 func legacyBookKnowledgeJobResultNumber(value any) bool {

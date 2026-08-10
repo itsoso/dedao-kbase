@@ -111,6 +111,67 @@ func TestBookKnowledgeJobsImportReadOnlyUnknownLegacyType(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobsUnknownLegacyResultUsesStrictAllowlist(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{
+		ID: "legacy-private-result", Type: "notebooklm_export", Status: BookKnowledgeJobStatusSucceeded,
+		EbookID: 67933, EbookEnID: "legacy-private-result",
+		Result: map[string]any{
+			"ebook_id": 67933, "ebook_enid": "legacy-private-result", "title": "安全标题",
+			"notebook_id": "notebook-safe", "source_count": 3,
+			"session_id":   "session-private-value",
+			"download_url": "https://example.invalid/download?signature=private-value",
+			"headers":      map[string]any{"X-Api-Key": "private-api-key-value"},
+			"metadata":     map[string]any{"session_id": "nested-private-value"},
+		},
+		Logs:      []string{"queued", "running", "succeeded"},
+		CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+	}})
+
+	loaded, err := store.LoadBookKnowledgeJob("legacy-private-result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"ebook_id": float64(67933), "ebook_enid": "legacy-private-result", "title": "安全标题",
+		"notebook_id": "notebook-safe", "source_count": float64(3),
+	}
+	if !reflect.DeepEqual(loaded.Result, want) {
+		t.Fatalf("safe result = %#v, want %#v", loaded.Result, want)
+	}
+	db, err := sql.Open("sqlite3", store.BookJobsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted string
+	if err := db.QueryRow(`SELECT result_json FROM book_jobs WHERE job_id = ?`, loaded.ID).Scan(&persisted); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	exportPath := filepath.Join(t.TempDir(), "jobs.json")
+	if err := store.ExportLegacyBookKnowledgeJobs(exportPath); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := os.ReadFile(exportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"session_id", "session-private-value", "download_url", "signature=private-value",
+		"headers", "X-Api-Key", "private-api-key-value", "metadata", "nested-private-value",
+	} {
+		if strings.Contains(persisted, forbidden) {
+			t.Fatalf("sqlite result retained %q: %s", forbidden, persisted)
+		}
+		if strings.Contains(string(exported), forbidden) {
+			t.Fatalf("legacy export retained %q: %s", forbidden, exported)
+		}
+	}
+}
+
 func TestBookKnowledgeJobsUnknownLegacyTypeIsReadOnly(t *testing.T) {
 	for _, status := range []BookKnowledgeJobStatus{BookKnowledgeJobStatusFailed, BookKnowledgeJobStatusInterrupted} {
 		t.Run(string(status), func(t *testing.T) {
