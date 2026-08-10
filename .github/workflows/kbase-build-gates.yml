@@ -89,12 +89,48 @@ jobs:
             node "$smoke"
           done
 
-      - name: Build CGO server and test real Nginx proxy
+      - name: Build both services from one revision
         run: |
+          BUILD_REVISION="$(git rev-parse HEAD)"
           CGO_ENABLED=1 go build \
             -trimpath \
+            -ldflags "-X main.buildRevision=$BUILD_REVISION" \
             -o "$RUNNER_TEMP/kbase-server" \
             ./cmd/kbase-server
+          CGO_ENABLED=1 go build \
+            -trimpath \
+            -ldflags "-X main.bookJobWorkerVersion=ci -X main.bookJobWorkerRevision=$BUILD_REVISION" \
+            -o "$RUNNER_TEMP/book-job-worker" \
+            ./cmd/book-job-worker
+          sha256sum "$RUNNER_TEMP/kbase-server"
+          sha256sum "$RUNNER_TEMP/book-job-worker"
+          export PATH="$RUNNER_TEMP:$PATH"
+          book-job-worker build-info |
+            grep -Fq "\"revision\":\"$BUILD_REVISION\""
+          KBASE_BOOK_KNOWLEDGE_ROOT="$RUNNER_TEMP/book-knowledge" \
+            KBASE_BOOK_JOB_WORKER_ID=ci-book-worker \
+            book-job-worker check-config
+          go test ./cmd/book-job-worker ./cmd/kbase-server
+
+      - name: Verify book Worker service contract
+        run: |
+          sudo useradd --system --no-create-home dedao-kbase || true
+          sudo install -d /opt/dedao-kbase/bin /etc/dedao-kbase
+          sudo install -m 0755 "$RUNNER_TEMP/book-job-worker" \
+            /opt/dedao-kbase/bin/book-job-worker
+          sudo install -m 0600 /dev/null /etc/dedao-kbase/kbase.env
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=KBase CI dependency' \
+            '[Service]' \
+            'Type=oneshot' \
+            'ExecStart=/bin/true' \
+            'RemainAfterExit=yes' |
+            sudo tee /etc/systemd/system/dedao-kbase.service >/dev/null
+          systemd-analyze verify deploy/systemd/dedao-book-job-worker.service
+
+      - name: Test real Nginx proxy
+        run: |
           KBASE_SERVER_BIN="$RUNNER_TEMP/kbase-server" \
             NGINX_BIN="$(command -v nginx)" \
             bash deploy/nginx/browser-session-proxy-smoke.sh

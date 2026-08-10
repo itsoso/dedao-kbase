@@ -2,8 +2,8 @@
 
 ## 当前状态
 
-- 阶段：S3 规划
-- 状态：定义环已通过，等待实施计划确认后进入 S4/S5
+- 阶段：S5 实施
+- 状态：核心实现与双进程发布契约已完成，等待完整 G3/G4 与生产部署
 - 分支：`codex/book-job-worker`
 - 设计提交：`5dbb765`
 
@@ -56,6 +56,24 @@
 
 - 实施计划：[`../plans/2026-08-09-book-job-worker.md`](../plans/2026-08-09-book-job-worker.md)
 - 实现方式：隔离分支、TDD、逐任务提交。
+
+## S4/S5 分解与实施进展
+
+- 任务队列已迁移为 SQLite 单一事实源，并保留幂等旧 JSON 导入与兼容导出。
+- 独立 `book-job-worker` 已具备租约、续租、中断归类、人工重试和受控重启。
+- KBase 已收敛为认证控制面，不再在进程内执行书籍任务。
+- `/sources/agents` 和任务中心已提供 Worker 诊断、受控重启、阶段与重试历史。
+- 双进程发布契约已加入同 revision 构建、分别 SHA-256、Worker
+  `build-info`/`check-config`、SQLite 在线备份和旧 JSON 原子回滚导出。
+- Worker systemd unit 使用共享环境文件以及稳定 Agent/Worker ID；只通过
+  `Wants`/`After` 排序，不用 `Requires`，保证 KBase 单独重启不连带停止 Worker。
+- 一个备份批次覆盖 KBase/Worker 二进制、Web、SQLite、旧 JSON 和 Worker unit；
+  回滚先停止 Worker 与 KBase、冻结写入、导出兼容 JSON，再恢复旧服务文件。
+- 首次发布允许 Worker、unit、SQLite 和旧 JSON 不存在；备份批次记录
+  present/absent，回滚删除本次新增的 Worker/unit，但保留 SQLite 与下载内容。
+- Task 7 验证已通过：同 revision 双二进制真实构建与分立哈希、Worker
+  `build-info`/`check-config`、命令包测试、`go test ./...`、部署/system-map/privacy
+  smoke 和 diff whitespace 检查。
 
 ## Gate 记录
 

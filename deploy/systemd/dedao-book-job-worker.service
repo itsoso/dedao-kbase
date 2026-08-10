@@ -1,0 +1,20 @@
+[Unit]
+Description=KBase book job worker
+Wants=network-online.target
+Wants=dedao-kbase.service
+After=network-online.target dedao-kbase.service
+
+[Service]
+Type=simple
+User=dedao-kbase
+Group=dedao-kbase
+EnvironmentFile=/etc/dedao-kbase/kbase.env
+ExecStartPre=/opt/dedao-kbase/bin/book-job-worker check-config
+ExecStart=/opt/dedao-kbase/bin/book-job-worker run
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
