@@ -234,6 +234,25 @@ assert.equal(await ui.loadSourceAgentManagement({ silent: true, preserveActionOu
 assert.equal(ui.sourceAgentManagementState.authorityPendingAgentIDs.has(authorityAgent.agent_id), false, "one successful authority refresh should clear its awaiting-authority lock");
 assert.equal(ui.sourceAgentManagementBusy(authorityAgent.agent_id), true, "the active authoritative command should keep controls locked");
 
+const staleInjectedAgent = { ...restartable, agent_id: "stale-injected-worker", current_command_id: "" };
+ui.sourceAgentManagementState.agents = [staleInjectedAgent];
+ui.sourceAgentManagementState.commandsByAgent = {
+  [staleInjectedAgent.agent_id]: [{ id: "local-stale-command", type: "restart", state: "queued" }],
+};
+ui.sourceAgentManagementState.authorityPendingAgentIDs.add(staleInjectedAgent.agent_id);
+ui.setApi(async (requestPath) => {
+  if (requestPath === "/api/source-agents") return { agents: [staleInjectedAgent] };
+  if (requestPath === "/api/source-agent-artifacts?limit=100") return { artifacts: [] };
+  if (requestPath.includes("/commands?limit=10")) return { commands: [] };
+  throw new Error(`unexpected request ${requestPath}`);
+});
+assert.equal(await ui.loadSourceAgentManagement({ silent: true, preserveActionOutcome: true }), true);
+assert.equal(ui.sourceAgentManagementState.authorityPendingAgentIDs.has(staleInjectedAgent.agent_id), false, "successful authority refresh should release the awaiting-authority lock");
+assert.deepEqual(ui.sourceAgentManagementState.commandsByAgent[staleInjectedAgent.agent_id], [], "successful authority list should remove an injected command that is absent upstream");
+assert.equal(ui.sourceAgentManagementBusy(staleInjectedAgent.agent_id), false, "an absent injected command must not leave the agent permanently busy");
+ui.sourceAgentManagementState.agents = [{ ...staleInjectedAgent, current_command_id: "upstream-command" }];
+assert.equal(ui.sourceAgentManagementBusy(staleInjectedAgent.agent_id), true, "current_command_id should remain an independent authoritative lock");
+
 const navigationAgent = { ...restartable, agent_id: "navigation-worker", current_command_id: "" };
 ui.sourceAgentManagementState.agents = [navigationAgent];
 ui.sourceAgentManagementState.commandsByAgent = { [navigationAgent.agent_id]: [] };

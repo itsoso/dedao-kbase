@@ -6630,14 +6630,13 @@ function sourceAgentCommandID(command) {
   return String(command?.id || command?.command_id || "").trim();
 }
 
-function mergeSourceAgentCommands(current, authoritative) {
-  const fetched = Array.isArray(authoritative) ? authoritative : [];
-  const fetchedIDs = new Set(fetched.map(sourceAgentCommandID).filter(Boolean));
-  const localActive = (Array.isArray(current) ? current : []).filter((command) => {
-    const id = sourceAgentCommandID(command);
-    return id && sourceAgentCommandIsActive(command) && !fetchedIDs.has(id);
-  });
-  return [...localActive, ...fetched];
+function upsertSourceAgentCommand(current, command) {
+  const commands = Array.isArray(current) ? current : [];
+  const commandID = sourceAgentCommandID(command);
+  const remaining = commandID
+    ? commands.filter((item) => sourceAgentCommandID(item) !== commandID)
+    : commands;
+  return [command, ...remaining];
 }
 
 function isSourceAgentOverviewRoute(pathname = getRoutePathname()) {
@@ -6859,7 +6858,7 @@ async function loadSourceAgentManagement({ silent = false, preserveActionOutcome
     sourceAgentManagementState.commandsByAgent = Object.fromEntries(agents.map((agent, index) => {
       const result = commandResults[index];
       const commands = result?.status === "fulfilled" && Array.isArray(result.value.commands) ? result.value.commands : [];
-      return [agent.agent_id, mergeSourceAgentCommands(sourceAgentManagementState.commandsByAgent[agent.agent_id], commands)];
+      return [agent.agent_id, commands];
     }));
     sourceAgentManagementState.message = `${agents.length} 个 Agent · ${sourceAgentManagementState.artifacts.length} 个可见产物`;
     const loadedAgentIDs = new Set(agents.map((agent) => agent.agent_id));
@@ -6924,9 +6923,9 @@ async function runSourceAgentManagementAction(agentID, operation) {
     const payload = await operation();
     const command = payload?.command;
     if (command && sourceAgentCommandIsActive(command)) {
-      sourceAgentManagementState.commandsByAgent[id] = mergeSourceAgentCommands(
+      sourceAgentManagementState.commandsByAgent[id] = upsertSourceAgentCommand(
         sourceAgentManagementState.commandsByAgent[id],
-        [command],
+        command,
       );
     }
     sourceAgentManagementState.pendingAgentIDs.delete(id);
