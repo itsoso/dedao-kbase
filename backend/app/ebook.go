@@ -173,7 +173,6 @@ func generateEbookPagesWithService(ctx context.Context, service ebookDownloadSer
 	if err = ctx.Err(); err != nil {
 		return nil, err
 	}
-	fmt.Printf("chapterID:%#v\n", chapterID)
 	pageList, err := service.EbookPagesContext(ctx, chapterID, token, index, count, offset)
 	if err != nil {
 		return
@@ -192,7 +191,6 @@ func generateEbookPagesWithService(ctx context.Context, service ebookDownloadSer
 		}
 		svgList = append(svgList, desContents)
 	}
-	// fmt.Printf("IsEnd:%#v\n", pageList.IsEnd)
 	if !pageList.IsEnd {
 		index = count
 		count += 20

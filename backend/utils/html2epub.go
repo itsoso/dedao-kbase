@@ -78,7 +78,7 @@ func (h *HtmlToEpub) runContext(ctx context.Context) (err error) {
 		}
 		err = h.addContext(ctx, html)
 		if err != nil {
-			err = fmt.Errorf("parse %#v failed: %s", html, err)
+			err = errors.New("cannot add epub chapter")
 			return
 		}
 	}
@@ -88,7 +88,7 @@ func (h *HtmlToEpub) runContext(ctx context.Context) (err error) {
 	}
 	err = h.book.Write(h.Output)
 	if err != nil {
-		return fmt.Errorf("cannot write output epub: %s", err)
+		return errors.New("cannot write output epub")
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -108,11 +108,11 @@ func (h *HtmlToEpub) setCover() (err error) {
 	if h.Cover == "" {
 		temp, err := os.CreateTemp("", "html-to-epub")
 		if err != nil {
-			return fmt.Errorf("can't create tempfile: %s", err)
+			return errors.New("cannot prepare epub cover")
 		}
 		_, err = temp.Write(h.DefaultCover)
 		if err != nil {
-			return fmt.Errorf("can't write tempfile: %s", err)
+			return errors.New("cannot prepare epub cover")
 		}
 		_ = temp.Close()
 
@@ -121,11 +121,11 @@ func (h *HtmlToEpub) setCover() (err error) {
 
 	m, err := mimetype.DetectFile(h.Cover)
 	if err != nil {
-		return fmt.Errorf("can't detect cover mime type %s", err)
+		return errors.New("cannot detect epub cover type")
 	}
 	cover, err := h.book.AddImage(h.Cover, "cover"+m.Extension())
 	if err != nil {
-		return fmt.Errorf("can't add cover %s", err)
+		return errors.New("cannot add epub cover")
 	}
 	h.book.SetCover(cover, "")
 
@@ -143,7 +143,7 @@ func (h *HtmlToEpub) addContext(ctx context.Context, html HtmlContent) (err erro
 	refs := make(map[string]string)
 	doc, err := goquery.NewDocumentFromReader(strings.NewReader(html.Content))
 	if err != nil {
-		return
+		return errors.New("cannot parse epub chapter")
 	}
 
 	images := h.saveImagesContext(ctx, doc)
@@ -180,6 +180,7 @@ func (h *HtmlToEpub) saveImages(doc *goquery.Document) map[string]string {
 
 func (h *HtmlToEpub) saveImagesContext(ctx context.Context, doc *goquery.Document) map[string]string {
 	downloads := make(map[string]string)
+	parseFailures := 0
 
 	tasks := request.NewDownloadTasks()
 	doc.Find("img").Each(func(i int, img *goquery.Selection) {
@@ -198,7 +199,7 @@ func (h *HtmlToEpub) saveImagesContext(ctx context.Context, doc *goquery.Documen
 
 		uri, err := url.Parse(src)
 		if err != nil {
-			log.Printf("parse %s fail: %s", src, err)
+			parseFailures++
 			return
 		}
 		_ = os.MkdirAll(h.ImagesDir, 0766)
@@ -207,11 +208,18 @@ func (h *HtmlToEpub) saveImagesContext(ctx context.Context, doc *goquery.Documen
 		tasks.Add(src, localFile)
 		downloads[src] = localFile
 	})
+	if parseFailures > 0 {
+		log.Printf("epub image URL parse failed (count=%d)", parseFailures)
+	}
+	downloadFailures := 0
 	request.BatchWithContext(ctx, tasks, 3, time.Minute*2).ForEach(func(t *request.DownloadTask) {
 		if t.Err != nil {
-			log.Printf("download %s fail: %s", t.Link, t.Err)
+			downloadFailures++
 		}
 	})
+	if downloadFailures > 0 {
+		log.Printf("epub image download failed (count=%d)", downloadFailures)
+	}
 
 	return downloads
 }
@@ -225,9 +233,6 @@ func (h *HtmlToEpub) getFontURLs(html HtmlContent) (downloads map[string]string,
 	}
 
 	doc.Find("head>style").Each(func(i int, font *goquery.Selection) {
-		fmt.Printf("%#v\n", font.Text())
-		val, ok := font.Attr("font-family")
-		fmt.Printf("%#v, %#v\n", val, ok)
 		src, _ := font.Attr("url")
 		if !strings.HasPrefix(src, "http") {
 			return
@@ -240,7 +245,7 @@ func (h *HtmlToEpub) getFontURLs(html HtmlContent) (downloads map[string]string,
 
 		uri, err := url.Parse(src)
 		if err != nil {
-			log.Printf("parse %s fail: %s", src, err)
+			log.Printf("epub font URL parse failed")
 			return
 		}
 		_ = os.MkdirAll(h.FontsDir, 0766)
@@ -271,13 +276,13 @@ func (h *HtmlToEpub) changeRef(htmlFile string, img *goquery.Selection, refs, do
 	case strings.HasPrefix(src, "http"):
 		localFile, exist = downloads[src]
 		if !exist {
-			log.Printf("local file of %s not exist", src)
+			log.Printf("epub image download unavailable")
 			return
 		}
 	default:
 		fd, err := h.openLocalFile(htmlFile, src)
 		if err != nil {
-			log.Printf("local ref %s not found: %s", src, err)
+			log.Printf("epub local image unavailable")
 			return
 		}
 		_ = fd.Close()
@@ -288,11 +293,11 @@ func (h *HtmlToEpub) changeRef(htmlFile string, img *goquery.Selection, refs, do
 	fmime, err := mimetype.DetectFile(localFile)
 	{
 		if err != nil {
-			log.Printf("can't detect image mime of %s: %s", src, err)
+			log.Printf("epub image type detection failed")
 			return
 		}
 		if !strings.HasPrefix(fmime.String(), "image") {
-			log.Printf("mime of %s is %s instead of images", src, fmime.String())
+			log.Printf("epub image has unsupported type")
 			return
 		}
 	}
@@ -306,14 +311,14 @@ func (h *HtmlToEpub) changeRef(htmlFile string, img *goquery.Selection, refs, do
 		}
 		internalRef, err = h.book.AddImage(localFile, internalName)
 		if err != nil {
-			log.Printf("can't add image %s: %s", localFile, err)
+			log.Printf("epub image add failed")
 			return
 		}
 		refs[src] = internalRef
 	}
 
 	if h.Verbose {
-		log.Printf("replace %s as %s", src, localFile)
+		log.Printf("epub image reference replaced")
 	}
 
 	img.SetAttr("src", internalRef)

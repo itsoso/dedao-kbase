@@ -1,8 +1,10 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,6 +71,39 @@ func TestDecryptEbookPageRejectsMalformedPayload(t *testing.T) {
 	for _, payload := range []string{"", "not-base64", "YQ=="} {
 		if _, err := decryptEbookPage(payload); err == nil {
 			t.Fatalf("decryptEbookPage(%q) returned nil error", payload)
+		}
+	}
+}
+
+func TestGenerateEbookPagesDoesNotPrintChapterOrToken(t *testing.T) {
+	ctx := context.Background()
+	service := &cancelingEbookDownloadService{wantContext: ctx}
+	privateChapterID := "private-chapter-id"
+	privateToken := "private-read-token"
+	previousStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	defer func() { os.Stdout = previousStdout }()
+
+	if _, err := generateEbookPagesWithService(ctx, service, privateChapterID, privateToken, 0, 20, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if _, err := io.Copy(&output, reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{privateChapterID, privateToken} {
+		if strings.Contains(output.String(), forbidden) {
+			t.Fatalf("stdout exposes %q: %q", forbidden, output.String())
 		}
 	}
 }

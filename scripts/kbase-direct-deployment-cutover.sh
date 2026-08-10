@@ -41,6 +41,25 @@ do
   require_variable "$variable"
 done
 
+canonicalize_cutover_path() {
+  local path="$1"
+  local parent
+  if test -e "$path"; then
+    realpath "$path"
+    return
+  fi
+  parent="$(realpath "$(dirname -- "$path")")" ||
+    fail "database path parent cannot be resolved"
+  printf '%s/%s\n' "$parent" "$(basename -- "$path")"
+}
+
+book_jobs_db_canonical="$(canonicalize_cutover_path "${KBASE_BOOK_JOBS_DB:?}")"
+worker_book_jobs_db_canonical="$(
+  canonicalize_cutover_path "${KBASE_BOOK_KNOWLEDGE_ROOT:?}/book_jobs.sqlite3"
+)"
+[[ "$book_jobs_db_canonical" == "$worker_book_jobs_db_canonical" ]] ||
+  fail "KBASE_BOOK_JOBS_DB does not match the Worker database path"
+
 test ! -e "${KBASE_BACKUP_DIR:?}" || fail "backup directory already exists"
 test ! -e "${KBASE_BINARY_CANDIDATE_TARGET:?}" || fail "server staging target already exists"
 test ! -e "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" || fail "Worker staging target already exists"

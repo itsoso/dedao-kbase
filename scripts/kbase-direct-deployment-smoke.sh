@@ -120,6 +120,15 @@ readme_exports="$({
   fail "README exports differ from cutover required variables"
 
 for required in \
+  'canonicalize_cutover_path()' \
+  '${KBASE_BOOK_KNOWLEDGE_ROOT:?}/book_jobs.sqlite3' \
+  'KBASE_BOOK_JOBS_DB does not match the Worker database path'
+do
+  grep -Fq "$required" "$CUTOVER_SCRIPT" ||
+    fail "cutover script is missing database path guard: ${required}"
+done
+
+for required in \
   'sudo rm -f "${KBASE_WORKER_BINARY_TARGET:?}"' \
   'sudo rm -f "${KBASE_WORKER_UNIT_TARGET:?}"' \
   'book-job-worker.absent' \
@@ -151,6 +160,10 @@ line_of() {
 }
 
 trap_line="$(line_of "$CUTOVER_SCRIPT" 'trap rollback_direct_deployment ERR')"
+database_guard_line="$(line_of "$CUTOVER_SCRIPT" 'KBASE_BOOK_JOBS_DB does not match the Worker database path')"
+backup_line="$(line_of "$CUTOVER_SCRIPT" 'sudo install -d -o root -g root -m 0700 "${KBASE_BACKUP_DIR:?}"')"
+[[ "$database_guard_line" -lt "$backup_line" ]] ||
+  fail "database path guard must run before backup creation"
 replace_line="$(line_of "$CUTOVER_SCRIPT" 'sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"')"
 [[ "$trap_line" -lt "$replace_line" ]] ||
   fail "rollback trap must be installed before replacement"

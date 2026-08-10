@@ -48,6 +48,7 @@ setup_case() {
   printf 'old-web\n' >"${CASE_DIR}/targets/frontend-web/version"
   printf 'download-sentinel\n' >"${CASE_DIR}/downloads/sentinel"
   touch "${CASE_DIR}/state/dedao-kbase.service.active"
+  KBASE_BOOK_JOBS_DB_OVERRIDE=""
 }
 
 run_cutover() {
@@ -60,7 +61,7 @@ run_cutover() {
     KBASE_BINARY_TARGET="${CASE_DIR}/targets/kbase-server" \
     KBASE_WORKER_BINARY_TARGET="${CASE_DIR}/targets/book-job-worker" \
     KBASE_WEB_TARGET="${CASE_DIR}/targets/frontend-web" \
-    KBASE_BOOK_JOBS_DB="${CASE_DIR}/knowledge/book_jobs.sqlite3" \
+    KBASE_BOOK_JOBS_DB="${KBASE_BOOK_JOBS_DB_OVERRIDE:-${CASE_DIR}/knowledge/book_jobs.sqlite3}" \
     KBASE_LEGACY_JOBS_PATH="${CASE_DIR}/knowledge/jobs.json" \
     KBASE_WORKER_UNIT_TARGET="${CASE_DIR}/targets/dedao-book-job-worker.service" \
     KBASE_CANDIDATE_BIN="${CASE_DIR}/sources/kbase-server" \
@@ -85,6 +86,23 @@ run_cutover() {
 }
 
 [[ -x "$CUTOVER" ]] || fail "production cutover script is missing"
+
+setup_case canonical-book-jobs-path-success
+run_cutover
+assert_file_contains "${CASE_DIR}/targets/kbase-server" "new-server"
+
+setup_case mismatched-book-jobs-path
+KBASE_BOOK_JOBS_DB_OVERRIDE="${CASE_DIR}/wrong-root/book_jobs.sqlite3"
+mkdir -p "${CASE_DIR}/wrong-root"
+if run_cutover; then
+  fail "mismatched book jobs database unexpectedly passed cutover"
+fi
+assert_file_contains "${CASE_DIR}/targets/kbase-server" "old-server"
+assert_file_contains "${CASE_DIR}/targets/frontend-web/version" "old-web"
+assert_absent "${CASE_DIR}/backup"
+if grep -Eq '^(install|systemctl|sqlite3|mv|cp|runuser|curl) ' "${CASE_DIR}/actions.log"; then
+  fail "database path mismatch changed production state"
+fi
 
 setup_case first-install-success
 run_cutover
