@@ -2,8 +2,8 @@
 
 ## 当前状态
 
-- 阶段：S5 实施
-- 状态：核心实现与双进程发布契约已完成，等待完整 G3/G4 与生产部署
+- 阶段：S6 测试与评审完成
+- 状态：G3/G4 已通过，等待合并主干、生产部署和上线验证
 - 分支：`codex/book-job-worker`
 - 设计提交：`5dbb765`
 
@@ -89,6 +89,21 @@
   非零时以 `is-enabled` 后置条件判定，既不吞掉未清理错误，也不因缺失 unit 中断。
 - README 的 sudo allowlist 和 export 集合由 smoke 与 cutover 必需变量机械比较；
   行为 mock 会删除 allowlist 外的 `KBASE_*` 环境，验证没有透传完整 operator 环境。
+- G4 首轮评审发现并阻断 8 个问题：回滚后 legacy JSON 不会再次导入、重试链可绕过
+  直接父级唯一性、共享 Bearer 可触发重启、成功提交与重启竞态、电子书日志泄露、
+  496 错误分类、Worker 阶段/能力健康缺失，以及部署数据库路径可能错配。
+- 队列修复加入 legacy fingerprint 增量对账、较新 SQLite 状态与 commit receipt 保护、
+  `retry_root` 回填和链级唯一索引；独立评审通过回滚再升级、损坏 JSON、迁移、并发
+  和多代重试复核。
+- 控制面修复把重启限制为可信 Cookie 会话加同源 CSRF，执行成功先事务 Complete 并
+  清理 receipt 再响应重启；496 端到端映射 `authentication_required`，心跳新增当前
+  阶段和固定安全的能力健康文案。协议、迁移、API、UI 和竞态独立评审均通过。
+- 隐私与部署修复移除电子书链路中的签名 URL、Token、绝对路径、章节 ID 和原始错误；
+  cutover 在任何备份或服务变更前校验 Worker SQLite 规范路径。负例日志测试和完整
+  故障窗口行为 smoke 经独立评审通过。
+- 最终组合 G3 在提交 `ffe5e04` 上重新执行：`go test ./... -timeout=300s -count=1`、
+  `go vet ./...`、前端生产构建、全部 `frontend-web` smoke、部署静态/行为 smoke、
+  privacy/system-map smoke、`node --check` 和 `git diff --check` 均退出 0。
 
 ## Gate 记录
 
@@ -96,8 +111,8 @@
 |---|---|---|
 | G1 准入 | PASS | 生产中断任务与用户确认范围 |
 | G2 可行性/风险 | PASS | 设计评审与人工重试策略 |
-| G3 测试 | PENDING | 实现后填写完整门禁 |
-| G4 评审 | PENDING | 并发、认证、迁移和回滚独立评审 |
+| G3 测试 | PASS | 全量 Go/前端、静态分析、Web、部署、隐私与 system-map 门禁均通过 |
+| G4 评审 | PASS | 首轮 5 个 P1、3 个 P2 全部修复；队列、控制面、隐私/部署三组独立复核均 Ready |
 | G5 部署健康 | PENDING | 双服务健康、revision、日志和回滚点 |
 | G6 上线验证 | PENDING | 真实创建、KBase 重启、Worker 中断和重试 |
 
