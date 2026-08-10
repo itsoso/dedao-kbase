@@ -1888,8 +1888,11 @@ func validateAndNormalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) (BookKnowl
 		if strings.TrimSpace(job.EbookEnID) == "" {
 			return job, fmt.Errorf("ebook_enid is required")
 		}
-	} else if job.EbookID < 0 || job.DownloadType < 0 {
+	} else if job.EbookID < 0 {
 		return job, fmt.Errorf("read-only legacy job identity defaults cannot be negative")
+	}
+	if job.DownloadType < 0 {
+		return job, fmt.Errorf("download_type cannot be negative")
 	}
 	if job.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
 		job.DownloadType = 1
@@ -2271,6 +2274,9 @@ func normalizeBookKnowledgeJobRequest(request BookKnowledgeJobRequest) (BookKnow
 	}
 	if request.EbookEnID == "" {
 		return request, fmt.Errorf("ebook_enid is required")
+	}
+	if request.DownloadType < 0 {
+		return request, fmt.Errorf("download_type cannot be negative")
 	}
 	if request.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
 		request.DownloadType = 1

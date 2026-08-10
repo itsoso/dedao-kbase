@@ -171,6 +171,48 @@ func TestBookKnowledgeJobsKnownLegacyTypeStillRequiresEbookIdentity(t *testing.T
 	assertBookKnowledgeMigrationMarkerAbsent(t, store.BookJobsDBPath())
 }
 
+func TestBookKnowledgeJobsKnownSyncLegacyRejectsNegativeDownloadType(t *testing.T) {
+	for _, status := range []BookKnowledgeJobStatus{BookKnowledgeJobStatusSucceeded, BookKnowledgeJobStatusQueued} {
+		t.Run(string(status), func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{
+				ID: "legacy-sync-negative-" + string(status), Type: BookKnowledgeJobTypeDedaoEbookSyncKBase,
+				Status: status, EbookID: 67934, EbookEnID: "legacy-sync-negative", DownloadType: -1,
+				CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+			}})
+			if _, err := store.ListBookKnowledgeJobs(10); err == nil {
+				t.Fatal("known sync job with negative download_type was imported")
+			}
+			assertBookKnowledgeMigrationMarkerAbsent(t, store.BookJobsDBPath())
+		})
+	}
+}
+
+func TestBookKnowledgeJobsKnownSyncLegacyDefaultsZeroDownloadType(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{
+		ID: "legacy-sync-default", Type: BookKnowledgeJobTypeDedaoEbookSyncKBase,
+		Status: BookKnowledgeJobStatusSucceeded, EbookID: 67935, EbookEnID: "legacy-sync-default", DownloadType: 0,
+		CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+	}})
+	loaded, err := store.LoadBookKnowledgeJob("legacy-sync-default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.DownloadType != 1 {
+		t.Fatalf("download_type = %d, want 1", loaded.DownloadType)
+	}
+}
+
+func TestBookKnowledgeJobRequestSyncRejectsNegativeDownloadType(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	if _, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 67936, EbookEnID: "sync-request-negative", DownloadType: -1,
+	}); err == nil {
+		t.Fatal("sync request with negative download_type was accepted")
+	}
+}
+
 func TestBookKnowledgeJobsUnknownLegacyResultUsesStrictAllowlist(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{
