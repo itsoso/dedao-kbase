@@ -104,6 +104,21 @@
 - 最终组合 G3 在提交 `ffe5e04` 上重新执行：`go test ./... -timeout=300s -count=1`、
   `go vet ./...`、前端生产构建、全部 `frontend-web` smoke、部署静态/行为 smoke、
   privacy/system-map smoke、`node --check` 和 `git diff --check` 均退出 0。
+- 首次生产 G5 在替换后被拒绝：真实 `jobs.json` 含一个已成功的历史
+  `notebooklm_export` 任务，新迁移器把未知类型误判为非法；同时 cutover 在
+  `systemctl start` 后立即探活，没有等待端口就绪。自动回滚因同一 legacy 校验失败
+  停在安全恢复边界，随后人工从同批备份恢复旧 Server/Web、撤下首次安装的
+  Worker/unit、恢复原环境文件；旧 `jobs.json` 与备份哈希一致，公网和 loopback
+  均回到 `e19de867`。
+- G5 回流修复把未知历史类型限制为只读终态记录：不能领取、执行或重试，结果只保留
+  五个强类型安全字段；SQLite 与 legacy 导出双向测试会剔除 session、签名 URL、
+  Headers/API Key 和嵌套敏感数据。独立评审先 BLOCK 宽松过滤，再确认白名单修复
+  Ready。
+- cutover 增加最多 30 次、每次 1 秒的有界就绪检查，正常切换和回滚恢复共用；永久
+  失败场景验证先完整恢复旧 Server/Worker/unit/Web 及 enable/active 状态再退出。
+  独立评审 Ready。
+- 在提交 `35fbfb0` 上再次执行全量 Go、`go vet`、前端生产构建、全部 Web smoke、
+  部署静态/完整行为 smoke、privacy/system-map 和空白/干净工作区检查，均退出 0。
 
 ## Gate 记录
 
@@ -113,7 +128,7 @@
 | G2 可行性/风险 | PASS | 设计评审与人工重试策略 |
 | G3 测试 | PASS | 全量 Go/前端、静态分析、Web、部署、隐私与 system-map 门禁均通过 |
 | G4 评审 | PASS | 首轮 5 个 P1、3 个 P2 全部修复；队列、控制面、隐私/部署三组独立复核均 Ready |
-| G5 部署健康 | PENDING | 双服务健康、revision、日志和回滚点 |
+| G5 部署健康 | PENDING | 首次尝试已拒绝并恢复旧版；回流修复与全量门禁通过，等待第二次生产切换 |
 | G6 上线验证 | PENDING | 真实创建、KBase 重启、Worker 中断和重试 |
 
 ## 待沉淀
