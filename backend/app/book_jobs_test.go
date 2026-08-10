@@ -64,6 +64,132 @@ func TestBookKnowledgeJobsRejectInvalidLegacyJSONAtomically(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobsImportReadOnlyUnknownLegacyType(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	historical := BookKnowledgeJob{
+		ID: "legacy-notebooklm-export", Type: "notebooklm_export", Status: BookKnowledgeJobStatusSucceeded,
+		EbookID: 67929, EbookEnID: "legacy-notebooklm", DownloadType: 0,
+		Result: map[string]any{
+			"ebook_id": 67929, "ebook_enid": "legacy-notebooklm", "title": "历史 NotebookLM 导出",
+			"notebook_id": "notebook-legacy-1", "source_count": 12,
+		},
+		Logs:      []string{"queued", "running", "succeeded"},
+		CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+		StartedAt: "2026-07-01T00:00:10Z", FinishedAt: "2026-07-01T00:01:00Z",
+	}
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{historical})
+
+	jobs, err := store.ListBookKnowledgeJobs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+	got := jobs[0]
+	if got.Type != historical.Type || got.Status != historical.Status || got.DownloadType != historical.DownloadType ||
+		got.UpdatedAt != historical.UpdatedAt || !reflect.DeepEqual(got.Logs, historical.Logs) {
+		t.Fatalf("historical job changed: got %#v want %#v", got, historical)
+	}
+	for key, want := range historical.Result {
+		if fmt.Sprint(got.Result[key]) != fmt.Sprint(want) {
+			t.Fatalf("result[%q] = %#v, want %#v", key, got.Result[key], want)
+		}
+	}
+
+	exportPath := filepath.Join(t.TempDir(), "jobs.json")
+	if err := store.ExportLegacyBookKnowledgeJobs(exportPath); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := readLegacyBookKnowledgeJobs(exportPath)
+	if err != nil || len(exported.Jobs) != 1 {
+		t.Fatalf("exported = %#v, err=%v", exported.Jobs, err)
+	}
+	if exported.Jobs[0].Type != historical.Type || exported.Jobs[0].Status != historical.Status ||
+		!reflect.DeepEqual(exported.Jobs[0].Logs, historical.Logs) {
+		t.Fatalf("exported historical job = %#v", exported.Jobs[0])
+	}
+}
+
+func TestBookKnowledgeJobsUnknownLegacyTypeIsReadOnly(t *testing.T) {
+	for _, status := range []BookKnowledgeJobStatus{BookKnowledgeJobStatusFailed, BookKnowledgeJobStatusInterrupted} {
+		t.Run(string(status), func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			job := BookKnowledgeJob{
+				ID: "legacy-read-only-" + string(status), Type: "notebooklm_export", Status: status,
+				EbookID: 67930, EbookEnID: "legacy-read-only", Result: map[string]any{"ebook_id": 67930},
+				Error: "historical failure", Logs: []string{"queued", "running", string(status)},
+				CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+			}
+			writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{job})
+			loaded, err := store.LoadBookKnowledgeJob(job.ID)
+			if err != nil || loaded.Type != job.Type {
+				t.Fatalf("loaded = %#v, err=%v", loaded, err)
+			}
+			if _, err := store.RetryBookKnowledgeJob(job.ID); !errors.Is(err, ErrBookKnowledgeJobInvalidState) {
+				t.Fatalf("retry error = %v, want invalid state", err)
+			}
+			jobs, err := store.ListBookKnowledgeJobs(10)
+			if err != nil || len(jobs) != 1 {
+				t.Fatalf("jobs = %#v, err=%v", jobs, err)
+			}
+		})
+	}
+}
+
+func TestBookKnowledgeJobsRejectActiveUnknownLegacyType(t *testing.T) {
+	for _, status := range []BookKnowledgeJobStatus{BookKnowledgeJobStatusQueued, BookKnowledgeJobStatusRunning} {
+		t.Run(string(status), func(t *testing.T) {
+			store := NewBookKnowledgeStore(t.TempDir())
+			writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{{
+				ID: "legacy-active-" + string(status), Type: "notebooklm_export", Status: status,
+				EbookID: 67931, EbookEnID: "legacy-active", Logs: []string{string(status)},
+				CreatedAt: "2026-07-01T00:00:00Z", UpdatedAt: "2026-07-01T00:01:00Z",
+			}})
+			if _, err := store.ListBookKnowledgeJobs(10); err == nil {
+				t.Fatal("active unknown legacy type was imported")
+			}
+			assertBookKnowledgeMigrationMarkerAbsent(t, store.BookJobsDBPath())
+		})
+	}
+}
+
+func TestBookKnowledgeJobsNeverClaimOrRunUnknownType(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	created, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 67932, EbookEnID: "unknown-claim", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE book_jobs SET job_type = 'notebooklm_export' WHERE job_id = ?`, created.ID); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := store.ClaimNextBookKnowledgeJob("unknown-guard-worker", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil {
+		t.Fatalf("unknown job was claimed: %#v", claimed)
+	}
+	if err := store.RunBookKnowledgeJob(created.ID); !errors.Is(err, ErrBookKnowledgeJobInvalidState) {
+		t.Fatalf("run error = %v, want invalid state", err)
+	}
+	unchanged, err := store.LoadBookKnowledgeJob(created.ID)
+	if err != nil || unchanged.Status != BookKnowledgeJobStatusQueued || unchanged.Type != "notebooklm_export" {
+		t.Fatalf("unknown job changed: %#v, err=%v", unchanged, err)
+	}
+}
+
 func TestBookKnowledgeJobsLegacyInterruptedClassificationIsExact(t *testing.T) {
 	for _, test := range []struct {
 		name  string

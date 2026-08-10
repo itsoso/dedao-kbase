@@ -279,7 +279,9 @@ func (s *BookKnowledgeStore) ClaimNextBookKnowledgeJob(workerID string, lease ti
 		return nil, err
 	}
 	job, err := scanBookKnowledgeJob(tx.QueryRow(bookKnowledgeJobSelect+
-		` WHERE status = ? ORDER BY created_at ASC, job_id ASC LIMIT 1`, BookKnowledgeJobStatusQueued))
+		` WHERE status = ? AND job_type IN (?, ?)
+		  ORDER BY created_at ASC, job_id ASC LIMIT 1`,
+		BookKnowledgeJobStatusQueued, BookKnowledgeJobTypeDedaoEbookDownload, BookKnowledgeJobTypeDedaoEbookSyncKBase))
 	if err == sql.ErrNoRows {
 		tx.Rollback()
 		return nil, nil
@@ -729,6 +731,10 @@ func (s *BookKnowledgeStore) RetryBookKnowledgeJob(jobID string) (BookKnowledgeJ
 		tx.Rollback()
 		return BookKnowledgeJob{}, err
 	}
+	if !isSupportedBookKnowledgeJobType(original.Type) {
+		tx.Rollback()
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q has read-only legacy type %q", ErrBookKnowledgeJobInvalidState, original.ID, original.Type)
+	}
 	if original.Status != BookKnowledgeJobStatusFailed && original.Status != BookKnowledgeJobStatusInterrupted {
 		tx.Rollback()
 		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q cannot retry from status %s", ErrBookKnowledgeJobInvalidState, original.ID, original.Status)
@@ -1145,6 +1151,9 @@ func startBookKnowledgeJobInTx(tx *sql.Tx, jobID string) (BookKnowledgeJob, erro
 	}
 	if err != nil {
 		return BookKnowledgeJob{}, err
+	}
+	if !isSupportedBookKnowledgeJobType(job.Type) {
+		return BookKnowledgeJob{}, fmt.Errorf("%w: job %q has read-only legacy type %q", ErrBookKnowledgeJobInvalidState, job.ID, job.Type)
 	}
 	if job.Status != BookKnowledgeJobStatusQueued {
 		return BookKnowledgeJob{}, fmt.Errorf("job %q cannot run from status %s", job.ID, job.Status)
@@ -1857,16 +1866,20 @@ func validateAndNormalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) (BookKnowl
 	if strings.TrimSpace(job.ID) == "" {
 		return job, fmt.Errorf("id is required")
 	}
-	switch job.Type {
-	case BookKnowledgeJobTypeDedaoEbookDownload, BookKnowledgeJobTypeDedaoEbookSyncKBase:
-	default:
-		return job, fmt.Errorf("unsupported job type: %s", job.Type)
-	}
 	switch job.Status {
 	case BookKnowledgeJobStatusQueued, BookKnowledgeJobStatusRunning, BookKnowledgeJobStatusSucceeded,
 		BookKnowledgeJobStatusFailed, BookKnowledgeJobStatusInterrupted:
 	default:
 		return job, fmt.Errorf("unsupported job status: %s", job.Status)
+	}
+	supportedType := isSupportedBookKnowledgeJobType(job.Type)
+	if !supportedType {
+		if err := validateReadOnlyLegacyBookKnowledgeJobType(job.Type); err != nil {
+			return job, err
+		}
+		if job.Status == BookKnowledgeJobStatusQueued || job.Status == BookKnowledgeJobStatusRunning {
+			return job, fmt.Errorf("unsupported active legacy job type %q with status %s", job.Type, job.Status)
+		}
 	}
 	if job.EbookID <= 0 {
 		return job, fmt.Errorf("ebook_id is required")
@@ -1876,7 +1889,7 @@ func validateAndNormalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) (BookKnowl
 	}
 	if job.Type == BookKnowledgeJobTypeDedaoEbookSyncKBase {
 		job.DownloadType = 1
-	} else if job.DownloadType < 1 || job.DownloadType > 3 {
+	} else if supportedType && (job.DownloadType < 1 || job.DownloadType > 3) {
 		return job, fmt.Errorf("download_type must be 1, 2, or 3")
 	}
 	for name, value := range map[string]string{"created_at": job.CreatedAt, "updated_at": job.UpdatedAt} {
@@ -1896,6 +1909,29 @@ func validateAndNormalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) (BookKnowl
 		}
 	}
 	return normalizeLegacyBookKnowledgeJob(job), nil
+}
+
+func isSupportedBookKnowledgeJobType(jobType string) bool {
+	switch jobType {
+	case BookKnowledgeJobTypeDedaoEbookDownload, BookKnowledgeJobTypeDedaoEbookSyncKBase:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateReadOnlyLegacyBookKnowledgeJobType(jobType string) error {
+	if jobType == "" || strings.TrimSpace(jobType) != jobType || len(jobType) > 128 {
+		return fmt.Errorf("invalid read-only legacy job type %q", jobType)
+	}
+	for _, character := range jobType {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '_' || character == '-' || character == '.' {
+			continue
+		}
+		return fmt.Errorf("invalid read-only legacy job type %q", jobType)
+	}
+	return nil
 }
 
 func normalizeLegacyBookKnowledgeJob(job BookKnowledgeJob) BookKnowledgeJob {
@@ -1971,6 +2007,9 @@ func legacyBookKnowledgeJobWasInterrupted(job BookKnowledgeJob) bool {
 }
 
 func safeLegacyBookKnowledgeJobResult(job BookKnowledgeJob, result map[string]any) map[string]any {
+	if !isSupportedBookKnowledgeJobType(job.Type) {
+		return safeReadOnlyLegacyBookKnowledgeJobResult(result)
+	}
 	filtered := safeBookKnowledgeJobResult(result)
 	if len(filtered) == 0 {
 		return nil
@@ -1996,6 +2035,84 @@ func safeLegacyBookKnowledgeJobResult(job BookKnowledgeJob, result map[string]an
 		return nil
 	}
 	return safe
+}
+
+func safeReadOnlyLegacyBookKnowledgeJobResult(result map[string]any) map[string]any {
+	if len(result) == 0 {
+		return nil
+	}
+	safe := make(map[string]any, len(result))
+	for key, value := range result {
+		if !safeReadOnlyLegacyBookKnowledgeJobResultKey(key) {
+			continue
+		}
+		if filtered, ok := safeReadOnlyLegacyBookKnowledgeJobResultValue(value, 0); ok {
+			safe[key] = filtered
+		}
+	}
+	if len(safe) == 0 {
+		return nil
+	}
+	return safe
+}
+
+func safeReadOnlyLegacyBookKnowledgeJobResultKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" || len(key) > 128 {
+		return false
+	}
+	lower := strings.ToLower(key)
+	for _, marker := range []string{
+		"path", "token", "secret", "cookie", "authorization", "credential", "password", "api_key", "apikey",
+	} {
+		if strings.Contains(lower, marker) {
+			return false
+		}
+	}
+	for _, character := range key {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
+}
+
+func safeReadOnlyLegacyBookKnowledgeJobResultValue(value any, depth int) (any, bool) {
+	if depth > 8 {
+		return nil, false
+	}
+	switch typed := value.(type) {
+	case nil:
+		return nil, true
+	case bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64, json.Number:
+		return typed, true
+	case string:
+		if legacyBookKnowledgeJobResultTextIsSafe(typed) {
+			return typed, true
+		}
+		return nil, false
+	case []any:
+		filtered := make([]any, 0, len(typed))
+		for _, entry := range typed {
+			if safeEntry, ok := safeReadOnlyLegacyBookKnowledgeJobResultValue(entry, depth+1); ok {
+				filtered = append(filtered, safeEntry)
+			}
+		}
+		return filtered, true
+	case map[string]any:
+		filtered := make(map[string]any, len(typed))
+		for key, entry := range typed {
+			if !safeReadOnlyLegacyBookKnowledgeJobResultKey(key) {
+				continue
+			}
+			if safeEntry, ok := safeReadOnlyLegacyBookKnowledgeJobResultValue(entry, depth+1); ok {
+				filtered[key] = safeEntry
+			}
+		}
+		return filtered, true
+	default:
+		return nil, false
+	}
 }
 
 func legacyBookKnowledgeJobResultNumber(value any) bool {
