@@ -2,8 +2,8 @@
 
 ## 当前状态
 
-- 阶段：S6 测试与评审完成
-- 状态：G3/G4 已通过，等待合并主干、生产部署和上线验证
+- 阶段：S7 已上线
+- 状态：G1-G6 全部通过，生产运行 revision `51ecfd75f6a88b5da26bcc1c3b58b310e9c31367`
 - 分支：`codex/book-job-worker`
 - 设计提交：`5dbb765`
 
@@ -128,6 +128,48 @@
 - 在提交 `bdf0cb9` 上再次执行 `go test ./... -timeout=300s -count=1`、`go vet ./...`、
   privacy/system-map、空白和干净工作区检查，均退出 0。
 
+## G5 最终部署健康
+
+- 裁决：PASS。
+- 最终源码归档来自干净 canonical main，revision 为
+  `51ecfd75f6a88b5da26bcc1c3b58b310e9c31367`，本地与远端归档 SHA-256 均为
+  `5d43ec2452a5bda92898124b8842f1a958d3fab434dc51d05a163d194e783fe3`。
+- 服务器系统 Node 20 不满足锁文件要求，发布 Gate 在任何生产变更前失败；随后使用
+  Node 官方 SHA-256 清单验证的私有 Node 22.18.0 工具链，并在全新源码目录重新执行
+  前端构建、全部 smoke、Go module 校验、`go vet`、全量 Go 测试和双二进制构建。
+- Server 候选与安装 SHA-256 均为
+  `a664355527c172a8ca7f67c519bab1801633b3ec18b6a8bf462e58baff793c08`；Worker
+  候选与安装 SHA-256 均为
+  `ef832f101808a0afb7c3eb61005c30edf51687342d9cb1d62a46afe38df51727`。
+- 切换前生产数据离线预演成功导入并导出全部 75 条历史任务，类型/状态计数一致，
+  SQLite integrity check 通过；未知 NotebookLM 历史结果不保留旧路径或 URL 字段。
+- 最终权威回滚批次为
+  `/opt/dedao-kbase/backups/direct-51ecfd7-20260810T030330Z`，包含旧 Server/Web、
+  SQLite 一致性备份、legacy JSON、Worker/unit 首装 absent 标记和变更前环境文件。
+- 最终 cutover 未触发回滚；Server 与 Worker 均为 active/running、
+  `ExecMainStatus=0`。Server `NRestarts=0`；Worker 因 G6 主动执行两次受限重启，
+  `NRestarts=2` 且之后保持稳定。
+
+## G6 上线验证
+
+- 裁决：PASS。
+- 公网 `/health` 返回精确目标 revision；`/`、`/app.js`、`/sources/agents`、`/jobs`
+  和重试生成的知识包页面返回 200，匿名任务、Agent API 与 browser session 返回 401。
+- `/sources/agents` 显示 `book-job-worker-production` 在线，版本 `51ecfd7`，平台
+  Linux/amd64，`book_jobs` 能力可用，Outbox/Dead letter 均为 0，页面控制台无错误。
+- 单独重启 KBase 后 Worker PID、启动时间和 `NRestarts` 均未变化；新心跳继续到达，
+  证明两个进程没有 `Requires`/`PartOf` 式生命周期耦合。
+- 浏览器管理会话执行的两次受限重启命令均以 `restart_complete` 成功；普通 Bearer
+  对同一路径返回 403，没有创建命令。
+- 生产 SQLite 共 75 条迁移任务且无 queued/running 或 commit receipt。选择一条旧
+  `worker_interrupted` 入库任务执行人工重试后，新任务保留 `retry_of/retry_root`，
+  Worker 自动领取并在约 15 秒内进入 `succeeded/completed`；原任务仍为 interrupted，
+  新任务有 6 条状态事件、无 receipt 残留，知识包 `146506` 可访问。
+- `nginx -t` 通过；既有其他虚拟主机重复名称 warning 未影响 KBase。部署窗口日志中
+  panic/fatal/segmentation fault/failed-start 以及 Bearer、Cookie、签名参数匹配数均为 0。
+- 任务中心仍显示既有 WC Plus 本地 API 故障，Agent 管理页也将对应 macOS Worker
+  标为需处理；该独立来源问题未遮蔽 KBase 任务，且不属于本次书籍 Worker 发布。
+
 ## Gate 记录
 
 | Gate | 状态 | 证据 |
@@ -136,8 +178,8 @@
 | G2 可行性/风险 | PASS | 设计评审与人工重试策略 |
 | G3 测试 | PASS | 全量 Go/前端、静态分析、Web、部署、隐私与 system-map 门禁均通过 |
 | G4 评审 | PASS | 首轮 5 个 P1、3 个 P2 全部修复；队列、控制面、隐私/部署三组独立复核均 Ready |
-| G5 部署健康 | PENDING | 首次尝试已拒绝并恢复旧版；回流修复与全量门禁通过，等待第二次生产切换 |
-| G6 上线验证 | PENDING | 真实创建、KBase 重启、Worker 中断和重试 |
+| G5 部署健康 | PASS | 精确 revision、双哈希、同批备份、双服务健康与回滚边界验证通过 |
+| G6 上线验证 | PASS | UI/鉴权、进程解耦、受限重启、真实人工重试、数据与日志复核通过 |
 
 ## 待沉淀
 
