@@ -415,6 +415,192 @@ func TestBookKnowledgeJobsMigrateLegacyJSONOnce(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeJobsReconcileChangedLegacyAfterRollback(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	initial := BookKnowledgeJob{
+		ID: "job-before-rollback", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+		Status: BookKnowledgeJobStatusFailed, EbookID: 420, EbookEnID: "before-rollback", DownloadType: 1,
+		Error: "download failed", Logs: []string{"queued", "failed"},
+		CreatedAt: "2026-08-09T00:00:00Z", UpdatedAt: "2026-08-09T00:01:00Z",
+	}
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{initial})
+	if _, err := store.ListBookKnowledgeJobs(10); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExportLegacyBookKnowledgeJobs(store.LegacyJobsPath()); err != nil {
+		t.Fatal(err)
+	}
+	eventsAfterExport := countBookKnowledgeJobEvents(t, store, initial.ID)
+	if _, err := NewBookKnowledgeStore(root).ListBookKnowledgeJobs(10); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBookKnowledgeJobEvents(t, store, initial.ID); got != eventsAfterExport {
+		t.Fatalf("unchanged exported legacy added events: got %d want %d", got, eventsAfterExport)
+	}
+
+	updated := initial
+	updated.Status = BookKnowledgeJobStatusSucceeded
+	updated.Error = ""
+	updated.Logs = []string{"queued", "running", "succeeded"}
+	updated.Result = map[string]any{"ebook_id": 420, "ebook_enid": "before-rollback"}
+	updated.UpdatedAt = "2026-08-09T00:03:00Z"
+	updated.FinishedAt = updated.UpdatedAt
+	added := BookKnowledgeJob{
+		ID: "job-created-by-old-version", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+		Status: BookKnowledgeJobStatusQueued, EbookID: 421, EbookEnID: "created-by-old-version", DownloadType: 2,
+		Logs: []string{"queued"}, CreatedAt: "2026-08-09T00:04:00Z", UpdatedAt: "2026-08-09T00:04:00Z",
+	}
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{updated, added})
+
+	reconciled, err := NewBookKnowledgeStore(root).ListBookKnowledgeJobs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reconciled) != 2 {
+		t.Fatalf("reconciled jobs = %#v", reconciled)
+	}
+	if got := findBookKnowledgeJobByID(t, reconciled, updated.ID); got.Status != BookKnowledgeJobStatusSucceeded || got.UpdatedAt != updated.UpdatedAt {
+		t.Fatalf("updated legacy job = %#v", got)
+	}
+	if got := findBookKnowledgeJobByID(t, reconciled, added.ID); got.Status != BookKnowledgeJobStatusQueued {
+		t.Fatalf("added legacy job = %#v", got)
+	}
+	eventsAfterReconcile := countBookKnowledgeJobEvents(t, store, initial.ID)
+	if _, err := NewBookKnowledgeStore(root).ListBookKnowledgeJobs(10); err != nil {
+		t.Fatal(err)
+	}
+	if got := countBookKnowledgeJobEvents(t, store, initial.ID); got != eventsAfterReconcile {
+		t.Fatalf("repeated reconciliation added events: got %d want %d", got, eventsAfterReconcile)
+	}
+
+	if err := os.WriteFile(store.LegacyJobsPath(), []byte(`{"jobs":[`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewBookKnowledgeStore(root).ListBookKnowledgeJobs(10); err == nil {
+		t.Fatal("changed corrupt legacy file was silently ignored")
+	}
+}
+
+func TestBookKnowledgeJobsReconcileKeepsNewerSQLiteState(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	legacy := BookKnowledgeJob{
+		ID: "job-sqlite-newer", Type: BookKnowledgeJobTypeDedaoEbookDownload,
+		Status: BookKnowledgeJobStatusFailed, EbookID: 422, EbookEnID: "sqlite-newer", DownloadType: 1,
+		Error: "download failed", Logs: []string{"queued", "failed"},
+		CreatedAt: "2026-08-09T00:00:00Z", UpdatedAt: "2026-08-09T00:01:00Z",
+	}
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{legacy})
+	if _, err := store.ListBookKnowledgeJobs(10); err != nil {
+		t.Fatal(err)
+	}
+	newer, err := store.updateBookKnowledgeJob(legacy.ID, func(job BookKnowledgeJob) BookKnowledgeJob {
+		job.Status = BookKnowledgeJobStatusSucceeded
+		job.Result = map[string]any{"ebook_id": 422}
+		job.Error = ""
+		job.UpdatedAt = "2026-08-09T00:05:00Z"
+		job.FinishedAt = job.UpdatedAt
+		return job
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := legacy
+	older.UpdatedAt = "2026-08-09T00:04:00Z"
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), []BookKnowledgeJob{older})
+
+	got, err := NewBookKnowledgeStore(root).LoadBookKnowledgeJob(legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != newer.Status || got.UpdatedAt != newer.UpdatedAt || got.FinishedAt != newer.FinishedAt ||
+		fmt.Sprint(got.Result["ebook_id"]) != fmt.Sprint(newer.Result["ebook_id"]) {
+		t.Fatalf("newer sqlite state overwritten: got %#v want %#v", got, newer)
+	}
+}
+
+func TestBookKnowledgeJobsReconcilePreservesRetryLineageReceiptAndEvents(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	original, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookSyncKBase, EbookID: 423, EbookEnID: "lineage", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("lineage-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FailBookKnowledgeJob(original.ID, "lineage-worker", BookKnowledgeJobFailureKnowledgeBuildFailed); err != nil {
+		t.Fatal(err)
+	}
+	retry, err := store.RetryBookKnowledgeJob(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("lineage-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.openBookJobsWriteDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO book_job_commits(job_id, worker_id, book_id, content_hash, publish_nonce, prepared_at)
+		VALUES (?, ?, ?, ?, ?, ?)`, retry.ID, "lineage-worker", "423", strings.Repeat("a", 64), "nonce", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ExportLegacyBookKnowledgeJobs(store.LegacyJobsPath()); err != nil {
+		t.Fatal(err)
+	}
+	eventsBefore := countBookKnowledgeJobEvents(t, store, retry.ID)
+	legacyFile, err := readLegacyBookKnowledgeJobs(store.LegacyJobsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range legacyFile.Jobs {
+		if legacyFile.Jobs[index].ID == retry.ID {
+			legacyFile.Jobs[index].Status = BookKnowledgeJobStatusFailed
+			legacyFile.Jobs[index].Error = "knowledge build failed"
+			legacyFile.Jobs[index].Logs = []string{"queued", "running", "failed"}
+			legacyFile.Jobs[index].UpdatedAt = "2099-08-09T00:00:00Z"
+			legacyFile.Jobs[index].FinishedAt = legacyFile.Jobs[index].UpdatedAt
+		}
+	}
+	writeLegacyBookJobs(t, store.LegacyJobsPath(), legacyFile.Jobs)
+
+	reconciled, err := NewBookKnowledgeStore(root).LoadBookKnowledgeJob(retry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reconciled.RetryOf != original.ID || reconciled.RetryRoot != original.ID {
+		t.Fatalf("retry lineage lost: %#v", reconciled)
+	}
+	if reconciled.Status != BookKnowledgeJobStatusRunning {
+		t.Fatalf("job with commit receipt became terminal: %#v", reconciled)
+	}
+	db, err = store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var receipts int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM book_job_commits WHERE job_id = ?`, retry.ID).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if receipts != 1 {
+		t.Fatalf("commit receipt count = %d, want 1", receipts)
+	}
+	if got := countBookKnowledgeJobEvents(t, store, retry.ID); got != eventsBefore {
+		t.Fatalf("events = %d, want %d", got, eventsBefore)
+	}
+}
+
 func TestBookKnowledgeJobsReadModifyWriteUsesImmediateTransaction(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	job, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
@@ -1589,6 +1775,187 @@ func TestBookKnowledgeJobRetryRejectsActiveDuplicate(t *testing.T) {
 	}
 	if _, err := firstStore.RetryBookKnowledgeJob(original.ID); !errors.Is(err, ErrBookKnowledgeJobConflict) {
 		t.Fatalf("sequential duplicate retry error = %v", err)
+	}
+}
+
+func TestBookKnowledgeJobRetryRejectsActiveRetryAnywhereInChain(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	original, err := store.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 119, EbookEnID: "retry-chain", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("retry-chain-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FailBookKnowledgeJob(original.ID, "retry-chain-worker", BookKnowledgeJobFailureDownloadFailed); err != nil {
+		t.Fatal(err)
+	}
+	firstRetry, err := store.RetryBookKnowledgeJob(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNextBookKnowledgeJob("retry-chain-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FailBookKnowledgeJob(firstRetry.ID, "retry-chain-worker", BookKnowledgeJobFailureDownloadFailed); err != nil {
+		t.Fatal(err)
+	}
+	activeRetry, err := store.RetryBookKnowledgeJob(firstRetry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activeRetry.RetryOf != firstRetry.ID || activeRetry.RetryRoot != original.ID {
+		t.Fatalf("active retry lineage = %#v", activeRetry)
+	}
+	for _, jobID := range []string{original.ID, firstRetry.ID} {
+		if _, err := store.RetryBookKnowledgeJob(jobID); !errors.Is(err, ErrBookKnowledgeJobConflict) {
+			t.Fatalf("retry %q error = %v, want conflict", jobID, err)
+		}
+	}
+}
+
+func TestBookKnowledgeJobRetryChainConcurrentInsertHasSingleActiveRetry(t *testing.T) {
+	root := t.TempDir()
+	firstStore := NewBookKnowledgeStore(root)
+	secondStore := NewBookKnowledgeStore(root)
+	original, err := firstStore.CreateBookKnowledgeJob(BookKnowledgeJobRequest{
+		Type: BookKnowledgeJobTypeDedaoEbookDownload, EbookID: 120, EbookEnID: "retry-chain-concurrent", DownloadType: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.ClaimNextBookKnowledgeJob("retry-chain-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.FailBookKnowledgeJob(original.ID, "retry-chain-worker", BookKnowledgeJobFailureDownloadFailed); err != nil {
+		t.Fatal(err)
+	}
+	firstRetry, err := firstStore.RetryBookKnowledgeJob(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.ClaimNextBookKnowledgeJob("retry-chain-worker", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.FailBookKnowledgeJob(firstRetry.ID, "retry-chain-worker", BookKnowledgeJobFailureDownloadFailed); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var successful atomic.Int32
+	var wait sync.WaitGroup
+	for index, jobID := range []string{original.ID, firstRetry.ID} {
+		store := firstStore
+		if index == 1 {
+			store = secondStore
+		}
+		wait.Add(1)
+		go func(store *BookKnowledgeStore, jobID string) {
+			defer wait.Done()
+			<-start
+			if _, retryErr := store.RetryBookKnowledgeJob(jobID); retryErr != nil {
+				results <- retryErr
+				return
+			}
+			successful.Add(1)
+			results <- nil
+		}(store, jobID)
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	conflicts := 0
+	for retryErr := range results {
+		if retryErr == nil {
+			continue
+		}
+		if !errors.Is(retryErr, ErrBookKnowledgeJobConflict) {
+			t.Fatalf("retry error = %v", retryErr)
+		}
+		conflicts++
+	}
+	if successful.Load() != 1 || conflicts != 1 {
+		t.Fatalf("successful=%d conflicts=%d", successful.Load(), conflicts)
+	}
+}
+
+func TestBookKnowledgeJobRetryRootBackfillsOldSchema(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	if err := os.MkdirAll(filepath.Dir(store.BookJobsDBPath()), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", store.BookJobsDBPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldSchema := `
+		CREATE TABLE book_jobs (
+			job_id TEXT PRIMARY KEY, job_type TEXT NOT NULL, status TEXT NOT NULL,
+			ebook_id INTEGER NOT NULL, ebook_enid TEXT NOT NULL, download_type INTEGER NOT NULL,
+			result_json TEXT NOT NULL DEFAULT '{}', logs_json TEXT NOT NULL DEFAULT '[]',
+			retry_of TEXT DEFAULT NULL, stage TEXT NOT NULL DEFAULT 'queued', failure_code TEXT NOT NULL DEFAULT '',
+			lease_owner TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT '',
+			failure_message TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			started_at TEXT NOT NULL DEFAULT '', finished_at TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY(retry_of) REFERENCES book_jobs(job_id) DEFERRABLE INITIALLY DEFERRED
+		);
+		CREATE UNIQUE INDEX idx_book_jobs_one_active_retry ON book_jobs(retry_of)
+			WHERE retry_of IS NOT NULL AND retry_of <> '' AND status IN ('queued', 'running');
+		CREATE TABLE book_job_events (event_id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+			status TEXT NOT NULL, stage TEXT NOT NULL, code TEXT NOT NULL DEFAULT '', message TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES book_jobs(job_id) ON DELETE CASCADE);
+		CREATE TABLE book_job_commits (job_id TEXT PRIMARY KEY, worker_id TEXT NOT NULL, book_id TEXT NOT NULL,
+			content_hash TEXT NOT NULL, publish_nonce TEXT NOT NULL DEFAULT '', prepared_at TEXT NOT NULL,
+			FOREIGN KEY(job_id) REFERENCES book_jobs(job_id) ON DELETE CASCADE);
+		CREATE TABLE book_job_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+		INSERT INTO book_job_meta(key, value) VALUES ('legacy_jobs_imported_v1', '1');`
+	if _, err := db.Exec(oldSchema); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	insertOld := func(id, status, retryOf, at string) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO book_jobs(
+			job_id, job_type, status, ebook_id, ebook_enid, download_type, result_json, logs_json,
+			retry_of, stage, created_at, updated_at) VALUES (?, ?, ?, 121, ?, 1, '{}', '[]', NULLIF(?, ''), ?, ?, ?)`,
+			id, BookKnowledgeJobTypeDedaoEbookDownload, status, id, retryOf, defaultBookKnowledgeJobStage(BookKnowledgeJobStatus(status)), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertOld("old-root", string(BookKnowledgeJobStatusFailed), "", "2026-08-09T00:00:00Z")
+	insertOld("old-retry", string(BookKnowledgeJobStatusFailed), "old-root", "2026-08-09T00:01:00Z")
+	insertOld("old-active", string(BookKnowledgeJobStatusQueued), "old-retry", "2026-08-09T00:02:00Z")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err := store.ListBookKnowledgeJobs(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"old-root", "old-retry", "old-active"} {
+		if got := findBookKnowledgeJobByID(t, jobs, id); got.RetryRoot != "old-root" {
+			t.Fatalf("%s retry root = %q", id, got.RetryRoot)
+		}
+	}
+	if _, err := store.RetryBookKnowledgeJob("old-retry"); !errors.Is(err, ErrBookKnowledgeJobConflict) {
+		t.Fatalf("retry old chain error = %v", err)
+	}
+	db, err = store.openBookJobsDB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var indexSQL string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_book_jobs_one_active_retry'`).Scan(&indexSQL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(indexSQL, "retry_root") {
+		t.Fatalf("active retry index = %q", indexSQL)
 	}
 }
 
