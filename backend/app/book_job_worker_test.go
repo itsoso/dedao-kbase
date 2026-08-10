@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -133,8 +134,139 @@ func TestBookJobWorkerHeartbeatReportsIdentityAndCurrentRun(t *testing.T) {
 	}
 	active := client.heartbeats[1]
 	if active.WorkerType != "book-job-worker" || active.Version != "1.2.3" || active.ProtocolVersion != "2026-08-01" ||
-		strings.Join(active.Capabilities, ",") != "book_jobs,diagnose,controlled_restart" || active.CurrentRunID != job.ID {
+		strings.Join(active.Capabilities, ",") != "book_jobs,diagnose,controlled_restart" || active.CurrentRunID != job.ID ||
+		active.CurrentRunStage != "running" || !active.CapabilityHealth["book_jobs"].Healthy {
 		t.Fatalf("active heartbeat=%#v", active)
+	}
+}
+
+func TestBookJobWorkerLongRunningHeartbeatTracksSafeStage(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 198)
+	client := &bookJobWorkerSourceClientForTest{}
+	stageSet := make(chan struct{})
+	release := make(chan struct{})
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-stage-heartbeat", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(ctx context.Context, _ BookKnowledgeJob, setStage func(string) error) (map[string]any, error) {
+			if err := setStage("downloading"); err != nil {
+				return nil, err
+			}
+			close(stageSet)
+			select {
+			case <-release:
+				return map[string]any{"ok": true}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, runErr := worker.RunOnce(context.Background()); done <- runErr }()
+	<-stageSet
+	deadline := time.Now().Add(time.Second)
+	for {
+		client.mu.Lock()
+		heartbeats := append([]SourceAgentHeartbeat(nil), client.heartbeats...)
+		client.mu.Unlock()
+		found := false
+		for _, heartbeat := range heartbeats {
+			if heartbeat.CurrentRunID == job.ID && heartbeat.CurrentRunStage == "downloading" && heartbeat.CapabilityHealth["book_jobs"].Healthy {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stage heartbeat not observed: %#v", heartbeats)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBookJobWorkerHeartbeatReportsSafeRecentAuthenticationFailure(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 199)
+	client := &bookJobWorkerSourceClientForTest{}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-auth-heartbeat", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+			return nil, &services.RemoteError{Kind: services.RemoteErrorAuthentication, StatusCode: 496}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, runErr := worker.RunOnce(context.Background()); runErr != nil || !processed {
+		t.Fatalf("first RunOnce processed=%t err=%v", processed, runErr)
+	}
+	if processed, runErr := worker.RunOnce(context.Background()); runErr != nil || processed {
+		t.Fatalf("second RunOnce processed=%t err=%v", processed, runErr)
+	}
+	client.mu.Lock()
+	last := client.heartbeats[len(client.heartbeats)-1]
+	client.mu.Unlock()
+	health := last.CapabilityHealth["book_jobs"]
+	if health.Healthy || health.Code != "login_required" || health.RequiresAction != "login" ||
+		health.LastError != "需要重新登录或完成图形验证" {
+		t.Fatalf("safe auth health=%#v", health)
+	}
+	for _, forbidden := range []string{"496", "/private/", "token", "cookie"} {
+		if strings.Contains(strings.ToLower(health.LastError), strings.ToLower(forbidden)) {
+			t.Fatalf("health leaked %q: %#v", forbidden, health)
+		}
+	}
+}
+
+func TestBookJobWorkerHeartbeatNeverReportsRawExecutionError(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 204)
+	client := &bookJobWorkerSourceClientForTest{}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-safe-error-heartbeat", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(context.Context, BookKnowledgeJob, func(string) error) (map[string]any, error) {
+			return nil, errors.New("raw /private/account token=secret cookie=private")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if processed, runErr := worker.RunOnce(context.Background()); runErr != nil || !processed {
+		t.Fatalf("first RunOnce processed=%t err=%v", processed, runErr)
+	}
+	if processed, runErr := worker.RunOnce(context.Background()); runErr != nil || processed {
+		t.Fatalf("second RunOnce processed=%t err=%v", processed, runErr)
+	}
+	client.mu.Lock()
+	last := client.heartbeats[len(client.heartbeats)-1]
+	client.mu.Unlock()
+	health := last.CapabilityHealth["book_jobs"]
+	if health.Healthy || health.Code != "dependency_unavailable" || health.LastError != "最近任务执行失败" || health.RequiresAction != "" {
+		t.Fatalf("safe failure health=%#v", health)
+	}
+	serialized, err := json.Marshal(last)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"/private/", "account", "token", "secret", "cookie"} {
+		if strings.Contains(strings.ToLower(string(serialized)), forbidden) {
+			t.Fatalf("heartbeat leaked %q: %s", forbidden, serialized)
+		}
 	}
 }
 
@@ -181,6 +313,110 @@ func TestBookJobWorkerRestartInterruptsClaimedJobReportsSuccessAndStopsRun(t *te
 	}
 	if err := cleanWorker.Run(context.Background()); err != nil {
 		t.Fatalf("Run did not cleanly stop after restart: %v", err)
+	}
+}
+
+func TestBookJobWorkerSuccessfulExecutionWinsConcurrentRestartAndClearsCommitReceipt(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 192)
+	executionReturned := make(chan struct{})
+	var claimCalls atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{}
+	client.claim = func(context.Context) (*SourceAgentCommand, error) {
+		if claimCalls.Add(1) == 1 {
+			return nil, nil
+		}
+		<-executionReturned
+		return &SourceAgentCommand{ID: "restart-after-success", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed}, nil
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-success-restart", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(_ context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			if _, _, err := store.fenceBookKnowledgeJobPackageCommit(
+				claimed.ID, "worker-success-restart", "published-book", "published-hash", bookJobWorkerCommitLeaseWindow,
+			); err != nil {
+				return nil, err
+			}
+			close(executionReturned)
+			return map[string]any{"ebook_id": 192, "title": "published"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, runErr := worker.RunOnce(context.Background())
+	if !processed || !errors.Is(runErr, ErrBookJobWorkerRestartRequested) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, runErr)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusSucceeded || loaded.Result["title"] != "published" {
+		t.Fatalf("successful job=%#v err=%v", loaded, loadErr)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 0)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.reports) != 1 || client.reports[0].State != SourceAgentCommandSucceeded ||
+		client.reports[0].ResultCode != SourceAgentCommandCodeRestartComplete {
+		t.Fatalf("restart reports=%#v", client.reports)
+	}
+}
+
+func TestBookJobWorkerConcurrentRestartReportsFailureWhenSuccessfulExecutionCannotComplete(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookSyncKBase, 193)
+	executionReturned := make(chan struct{})
+	var claimCalls atomic.Int32
+	client := &bookJobWorkerSourceClientForTest{}
+	client.claim = func(context.Context) (*SourceAgentCommand, error) {
+		if claimCalls.Add(1) == 1 {
+			return nil, nil
+		}
+		<-executionReturned
+		return &SourceAgentCommand{ID: "restart-complete-failed", Type: SourceAgentCommandRestart, State: SourceAgentCommandClaimed}, nil
+	}
+	worker, err := NewBookJobWorker(BookJobWorkerConfig{
+		Store: store, WorkerID: "worker-complete-failed", LeaseDuration: time.Second,
+		RenewInterval: 100 * time.Millisecond, PollInterval: time.Millisecond,
+		SourceAgentClient: client, Version: "1.2.3", ProtocolVersion: "2026-08-01",
+		Execute: func(_ context.Context, claimed BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
+			if _, _, err := store.fenceBookKnowledgeJobPackageCommit(
+				claimed.ID, "worker-complete-failed", "published-book", "published-hash", bookJobWorkerCommitLeaseWindow,
+			); err != nil {
+				return nil, err
+			}
+			db, err := store.openBookJobsWriteDB()
+			if err != nil {
+				return nil, err
+			}
+			_, updateErr := db.Exec(`UPDATE book_jobs SET lease_owner = ? WHERE job_id = ?`, "replacement-worker", claimed.ID)
+			db.Close()
+			if updateErr != nil {
+				return nil, updateErr
+			}
+			close(executionReturned)
+			return map[string]any{"ebook_id": 193, "title": "published"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, runErr := worker.RunOnce(context.Background())
+	if !processed || !errors.Is(runErr, ErrBookJobWorkerInfrastructure) || errors.Is(runErr, ErrBookJobWorkerRestartRequested) {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, runErr)
+	}
+	loaded, loadErr := store.LoadBookKnowledgeJob(job.ID)
+	if loadErr != nil || loaded.Status != BookKnowledgeJobStatusRunning || loaded.LeaseOwner != "replacement-worker" {
+		t.Fatalf("job after failed completion=%#v err=%v", loaded, loadErr)
+	}
+	assertBookJobCommitReceiptCount(t, store, job.ID, 1)
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if len(client.reports) != 1 || client.reports[0].State != SourceAgentCommandFailed ||
+		client.reports[0].ResultCode != SourceAgentCommandCodeRestartFailed ||
+		client.reports[0].Message != "book job completion failed" {
+		t.Fatalf("restart reports=%#v", client.reports)
 	}
 }
 
@@ -768,18 +1004,20 @@ func TestBookJobWorkerDefaultExecutionClassifiesRemoteFailures(t *testing.T) {
 	oldRunner := runDedaoEbookDownloadJob
 	defer func() { runDedaoEbookDownloadJob = oldRunner }()
 	for _, test := range []struct {
-		name string
-		kind services.RemoteErrorKind
-		code string
+		name       string
+		kind       services.RemoteErrorKind
+		statusCode int
+		code       string
 	}{
-		{name: "authentication", kind: services.RemoteErrorAuthentication, code: BookKnowledgeJobFailureAuthenticationRequired},
-		{name: "source", kind: services.RemoteErrorSourceChanged, code: BookKnowledgeJobFailureSourceChanged},
+		{name: "authentication", kind: services.RemoteErrorAuthentication, statusCode: 401, code: BookKnowledgeJobFailureAuthenticationRequired},
+		{name: "no certificate", kind: services.RemoteErrorAuthentication, statusCode: 496, code: BookKnowledgeJobFailureAuthenticationRequired},
+		{name: "source", kind: services.RemoteErrorSourceChanged, statusCode: 404, code: BookKnowledgeJobFailureSourceChanged},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := NewBookKnowledgeStore(t.TempDir())
 			job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 212)
 			runDedaoEbookDownloadJob = func(context.Context, BookKnowledgeJob) (map[string]any, error) {
-				return nil, &services.RemoteError{Kind: test.kind, StatusCode: 401}
+				return nil, &services.RemoteError{Kind: test.kind, StatusCode: test.statusCode}
 			}
 			worker, err := NewBookJobWorker(BookJobWorkerConfig{
 				Store: store, WorkerID: "worker-default", LeaseDuration: time.Second,

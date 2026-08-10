@@ -6767,6 +6767,7 @@ function renderSourceAgentManagementCard(agent) {
         <div><dt>最后心跳</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_heartbeat_at))}</dd></div>
         <div><dt>最后成功</dt><dd>${escapeHTML(formatSourceControlTime(agent.last_success_at))}</dd></div>
         <div><dt>${bookWorker ? "当前任务" : "当前运行"}</dt><dd>${escapeHTML(agent.current_run_id || "-")}</dd></div>
+        ${bookWorker ? `<div><dt>当前阶段</dt><dd>${escapeHTML(bookJobStageLabel(agent.current_run_stage))}</dd></div>` : ""}
         <div><dt>当前命令</dt><dd>${escapeHTML(agent.current_command_id || latestCommand?.state || "-")}</dd></div>
         <div><dt>Outbox / Dead letter</dt><dd>${Number(agent.outbox_pending || 0)} / ${Number(agent.dead_letter_count || 0)}</dd></div>
       </dl>
@@ -6959,7 +6960,7 @@ function createSourceAgentDiagnostic(agentID) {
 }
 
 function confirmSourceAgentRestart(agent) {
-  return window.confirm(`确认受限重启 ${agent.agent_id}？\n当前任务会先被安全标记为已中断，之后可在任务中心人工重试。`);
+  return window.confirm(`确认受限重启 ${agent.agent_id}？\n进行中的任务会安全停止；若任务已完成，则会先确认成功结果再重启。`);
 }
 
 function createSourceAgentRestart(agentID) {

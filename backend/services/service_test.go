@@ -220,6 +220,7 @@ func TestEbookDetailReturnsSafeTypedRemoteErrors(t *testing.T) {
 		kind       RemoteErrorKind
 	}{
 		{name: "http unauthorized", statusCode: http.StatusUnauthorized, body: `private token=auth-secret`, kind: RemoteErrorAuthentication},
+		{name: "http no certificate", statusCode: 496, body: `private graphical verification path`, kind: RemoteErrorAuthentication},
 		{name: "http forbidden", statusCode: http.StatusForbidden, body: `private account path`, kind: RemoteErrorSourceChanged},
 		{name: "http missing", statusCode: http.StatusNotFound, body: `private book identity`, kind: RemoteErrorSourceChanged},
 		{name: "http unavailable", statusCode: http.StatusInternalServerError, body: `private upstream trace`, kind: RemoteErrorUnavailable},

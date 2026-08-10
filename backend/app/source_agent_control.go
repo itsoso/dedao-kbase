@@ -33,6 +33,11 @@ var allowedSourceCapabilityCodes = map[string]struct{}{
 	"upgrade_required": {}, "throttled": {},
 }
 
+var allowedSourceAgentRunStages = map[string]struct{}{
+	"": {}, "queued": {}, "running": {}, "downloading": {}, "building_knowledge": {},
+	"recovery_required": {}, "completed": {}, "failed": {}, "interrupted": {},
+}
+
 func DeriveSourceAgentObservedState(agent SourceAgent, now time.Time, freshness time.Duration, upgradeActive bool) string {
 	if upgradeActive {
 		return SourceAgentObservedUpgrading
@@ -133,6 +138,12 @@ func normalizeSourceAgentHeartbeat(heartbeat SourceAgentHeartbeat) (SourceAgentH
 	}
 	if heartbeat.CurrentRunID, err = normalizeSourceAgentName("current_run_id", heartbeat.CurrentRunID, sourceAgentIDMaxRunes, false); err != nil {
 		return heartbeat, err
+	}
+	if heartbeat.CurrentRunStage, err = normalizeSourceAgentName("current_run_stage", heartbeat.CurrentRunStage, sourceAgentRuntimeNameMaxRunes, true); err != nil {
+		return heartbeat, err
+	}
+	if _, allowed := allowedSourceAgentRunStages[heartbeat.CurrentRunStage]; !allowed {
+		return heartbeat, fmt.Errorf("unsupported current_run_stage")
 	}
 	if heartbeat.CurrentCommandID, err = normalizeSourceAgentName("current_command_id", heartbeat.CurrentCommandID, sourceAgentIDMaxRunes, false); err != nil {
 		return heartbeat, err

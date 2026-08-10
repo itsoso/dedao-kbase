@@ -124,6 +124,13 @@ func TestSourceAgentRegistryMigration(t *testing.T) {
 	if agent.DesiredState != SourceAgentDesiredActive || agent.CurrentRunID != "" || agent.CurrentCommandID != "" {
 		t.Fatalf("unsafe control defaults: %#v", agent)
 	}
+	if agent.CurrentRunStage != "" {
+		t.Fatalf("unsafe run stage default: %#v", agent)
+	}
+	var stageColumnCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('source_agents') WHERE name = 'current_run_stage'`).Scan(&stageColumnCount); err != nil || stageColumnCount != 1 {
+		t.Fatalf("current_run_stage count=%d err=%v", stageColumnCount, err)
+	}
 	if agent.OutboxPending != 0 || agent.DeadLetterCount != 0 || agent.LastSuccessAt != "" {
 		t.Fatalf("unsafe delivery defaults: %#v", agent)
 	}

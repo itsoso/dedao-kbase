@@ -50,6 +50,8 @@ type BookJobWorker struct {
 	protocolVersion   string
 	beforeClaim       func()
 	renewLease        func(BookKnowledgeJob) error
+	healthMu          sync.RWMutex
+	recentHealth      SourceCapabilityHealth
 }
 
 type BookJobExecutionFailure struct {
@@ -103,6 +105,7 @@ func NewBookJobWorker(cfg BookJobWorkerConfig) (*BookJobWorker, error) {
 		renewInterval: cfg.RenewInterval, pollInterval: cfg.PollInterval, execute: cfg.Execute,
 		sourceAgentClient: cfg.SourceAgentClient, version: strings.TrimSpace(cfg.Version),
 		protocolVersion: strings.TrimSpace(cfg.ProtocolVersion),
+		recentHealth:    SourceCapabilityHealth{Healthy: true},
 	}
 	if worker.execute == nil {
 		worker.execute = worker.executeDefault
@@ -139,7 +142,7 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 	if ctx.Err() != nil {
 		return false, nil
 	}
-	if err := w.heartbeat(ctx, ""); err != nil {
+	if err := w.heartbeat(ctx, "", ""); err != nil {
 		return false, err
 	}
 	processedControl := false
@@ -181,7 +184,11 @@ func (w *BookJobWorker) RunOnce(ctx context.Context) (bool, error) {
 		currentRunID = job.ID
 	}
 	var activeControlErr error
-	if err := w.heartbeat(ctx, currentRunID); err != nil {
+	currentRunStage := ""
+	if job != nil {
+		currentRunStage = strings.TrimSpace(job.Stage)
+	}
+	if err := w.heartbeat(ctx, currentRunID, currentRunStage); err != nil {
 		if job == nil {
 			return processedControl, err
 		}
@@ -227,19 +234,46 @@ func (w *BookJobWorker) Run(ctx context.Context) error {
 	}
 }
 
-func (w *BookJobWorker) heartbeat(ctx context.Context, currentRunID string) error {
+func (w *BookJobWorker) heartbeat(ctx context.Context, currentRunID, currentRunStage string) error {
 	if w.sourceAgentClient == nil {
 		return nil
 	}
 	_, err := w.sourceAgentClient.Heartbeat(ctx, SourceAgentHeartbeat{
 		WorkerType: "book-job-worker", Platform: runtime.GOOS, Architecture: runtime.GOARCH,
 		Version: w.version, ProtocolVersion: w.protocolVersion,
-		Capabilities: []string{"book_jobs", "diagnose", "controlled_restart"}, CurrentRunID: currentRunID,
+		Capabilities:     []string{"book_jobs", "diagnose", "controlled_restart"},
+		CapabilityHealth: map[string]SourceCapabilityHealth{"book_jobs": w.bookJobsCapabilityHealth()},
+		CurrentRunID:     currentRunID, CurrentRunStage: currentRunStage,
 	})
 	if err != nil {
 		return bookJobWorkerInfrastructureError("source agent heartbeat")
 	}
 	return nil
+}
+
+func (w *BookJobWorker) bookJobsCapabilityHealth() SourceCapabilityHealth {
+	w.healthMu.RLock()
+	defer w.healthMu.RUnlock()
+	return w.recentHealth
+}
+
+func (w *BookJobWorker) setBookJobsCapabilityHealth(health SourceCapabilityHealth) {
+	w.healthMu.Lock()
+	w.recentHealth = health
+	w.healthMu.Unlock()
+}
+
+func bookJobWorkerCapabilityHealthForFailure(code string) SourceCapabilityHealth {
+	switch code {
+	case BookKnowledgeJobFailureAuthenticationRequired:
+		return SourceCapabilityHealth{
+			Healthy: false, Code: "login_required", LastError: "需要重新登录或完成图形验证", RequiresAction: "login",
+		}
+	case BookKnowledgeJobFailureSourceChanged:
+		return SourceCapabilityHealth{Healthy: false, Code: "vendor_blocked", LastError: "来源内容不可用或已变化"}
+	default:
+		return SourceCapabilityHealth{Healthy: false, Code: "dependency_unavailable", LastError: "最近任务执行失败"}
+	}
 }
 
 func (w *BookJobWorker) claimSourceAgentCommand(ctx context.Context) (*SourceAgentCommand, error) {
@@ -417,7 +451,11 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 	if w.sourceAgentClient == nil {
 		close(controlDone)
 	} else {
-		go w.monitorSourceAgentCommands(runCtx, job.ID, controlStop, controlDone, restartCommand, controlFailure)
+		go w.monitorSourceAgentCommands(runCtx, job.ID, func() string {
+			stageMu.Lock()
+			defer stageMu.Unlock()
+			return lastStage
+		}, controlStop, controlDone, restartCommand, controlFailure)
 	}
 
 	var execution bookJobWorkerExecutionResult
@@ -457,6 +495,29 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 		}
 	}
 
+	if execution.err == nil {
+		if _, err := w.store.CompleteBookKnowledgeJob(job.ID, w.workerID, execution.result); err != nil {
+			if requestedRestart != nil {
+				_, _ = w.sourceAgentClient.ReportCommand(
+					parent, requestedRestart.ID, SourceAgentCommandFailed, SourceAgentCommandCodeRestartFailed,
+					"book job completion failed", "",
+				)
+			}
+			return bookJobWorkerInfrastructureError("complete job")
+		}
+		w.setBookJobsCapabilityHealth(SourceCapabilityHealth{Healthy: true})
+		if requestedRestart != nil {
+			if err := w.reportRestartSuccess(parent, requestedRestart.ID); err != nil {
+				return err
+			}
+			return ErrBookJobWorkerRestartRequested
+		}
+		if controlErr != nil {
+			return controlErr
+		}
+		return nil
+	}
+
 	if requestedRestart != nil {
 		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
 			_, _ = w.sourceAgentClient.ReportCommand(
@@ -484,15 +545,6 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 		return infraErr
 	}
 
-	if execution.err == nil {
-		if _, err := w.store.CompleteBookKnowledgeJob(job.ID, w.workerID, execution.result); err != nil {
-			return bookJobWorkerInfrastructureError("complete job")
-		}
-		if controlErr != nil {
-			return controlErr
-		}
-		return nil
-	}
 	if errors.Is(execution.err, errBookKnowledgePublishRecoveryRequired) {
 		if _, err := w.store.markBookKnowledgeJobRecoveryRequired(job.ID, w.workerID); err != nil {
 			return bookJobWorkerInfrastructureError("mark package publish recovery required")
@@ -509,6 +561,7 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 		return nil
 	}
 	code := bookJobWorkerFailureCode(execution.err, stage)
+	w.setBookJobsCapabilityHealth(bookJobWorkerCapabilityHealthForFailure(code))
 	if code == BookKnowledgeJobFailureWorkerInterrupted {
 		if _, err := w.store.InterruptBookKnowledgeJob(job.ID, w.workerID); err != nil {
 			return bookJobWorkerInfrastructureError("interrupt job")
@@ -524,6 +577,7 @@ func (w *BookJobWorker) executeClaimed(parent context.Context, job BookKnowledge
 func (w *BookJobWorker) monitorSourceAgentCommands(
 	ctx context.Context,
 	currentRunID string,
+	currentRunStage func() string,
 	stop <-chan struct{},
 	done chan<- struct{},
 	restart chan<- *SourceAgentCommand,
@@ -533,7 +587,11 @@ func (w *BookJobWorker) monitorSourceAgentCommands(
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 	for {
-		if err := w.heartbeat(ctx, currentRunID); err != nil {
+		stage := ""
+		if currentRunStage != nil {
+			stage = currentRunStage()
+		}
+		if err := w.heartbeat(ctx, currentRunID, stage); err != nil {
 			if ctx.Err() != nil {
 				return
 			}

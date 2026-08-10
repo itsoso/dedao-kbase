@@ -2095,7 +2095,7 @@ func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
 
 func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 	t.Run("restricted restart end to end", func(t *testing.T) {
-		handler, sourceSync, clock, _ := newKBaseSourceAgentCommandHTTPFixture(t)
+		handler, sourceSync, clock, browserSessions := newKBaseSourceAgentCommandHTTPFixture(t)
 		if _, err := sourceSync.HeartbeatAgent(SourceAgentHeartbeat{
 			AgentID: "agent-a", WorkerType: "book-job-worker", Platform: "darwin", Architecture: "arm64",
 			Version: "1.0.0", ProtocolVersion: "2026-08-01",
@@ -2105,7 +2105,24 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		}
 		expiresAt := clock.Now().Add(time.Hour).Format(time.RFC3339Nano)
 		body := `{"type":"restart","idempotency_key":"restart-http","expires_at":"` + expiresAt + `"}`
-		created := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", body)
+		bearerRestart := requestJSONKBase(handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret", body)
+		if bearerRestart.Code != http.StatusForbidden || bearerRestart.Body.String() != "{\"error\":\"browser management session required\"}\n" {
+			t.Fatalf("Bearer restart status=%d body=%s", bearerRestart.Code, bearerRestart.Body.String())
+		}
+		credentials, err := createBrowserSessionForTest(browserSessions, BrowserSessionCreate{DeviceLabel: "Restart Browser"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+		missingCSRFResponse := httptest.NewRecorder()
+		handler.ServeHTTP(missingCSRFResponse, missingCSRF)
+		if missingCSRFResponse.Code != http.StatusForbidden {
+			t.Fatalf("Cookie restart without CSRF status=%d body=%s", missingCSRFResponse.Code, missingCSRFResponse.Body.String())
+		}
+		createdRequest := newKBaseBrowserCookieRequest(http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token, body)
+		addKBaseBrowserSessionSecurityHeaders(createdRequest, credentials.CSRFToken)
+		created := httptest.NewRecorder()
+		handler.ServeHTTP(created, createdRequest)
 		var createdPayload struct {
 			Command SourceAgentCommand `json:"command"`
 		}
@@ -2126,17 +2143,23 @@ func TestKBaseHTTPHandlerSourceAgentCommands(t *testing.T) {
 		if completed.Code != http.StatusOK || !strings.Contains(completed.Body.String(), `"result_code":"restart_complete"`) {
 			t.Fatalf("complete restart status=%d body=%s", completed.Code, completed.Body.String())
 		}
-		withPayload := requestJSONKBase(
-			handler, http.MethodPost, "/api/source-agents/agent-a/commands", "admin-secret",
+		withPayloadRequest := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/source-agents/agent-a/commands", credentials.Token,
 			`{"type":"restart","idempotency_key":"restart-payload","payload":{},"expires_at":"`+expiresAt+`"}`,
 		)
+		addKBaseBrowserSessionSecurityHeaders(withPayloadRequest, credentials.CSRFToken)
+		withPayload := httptest.NewRecorder()
+		handler.ServeHTTP(withPayload, withPayloadRequest)
 		if withPayload.Code != http.StatusBadRequest {
 			t.Fatalf("restart payload status=%d body=%s", withPayload.Code, withPayload.Body.String())
 		}
-		withoutCapability := requestJSONKBase(
-			handler, http.MethodPost, "/api/source-agents/agent-b/commands", "admin-secret",
+		withoutCapabilityRequest := newKBaseBrowserCookieRequest(
+			http.MethodPost, "/api/source-agents/agent-b/commands", credentials.Token,
 			`{"type":"restart","idempotency_key":"restart-no-capability","expires_at":"`+expiresAt+`"}`,
 		)
+		addKBaseBrowserSessionSecurityHeaders(withoutCapabilityRequest, credentials.CSRFToken)
+		withoutCapability := httptest.NewRecorder()
+		handler.ServeHTTP(withoutCapability, withoutCapabilityRequest)
 		if withoutCapability.Code != http.StatusConflict {
 			t.Fatalf("restart without capability status=%d body=%s", withoutCapability.Code, withoutCapability.Body.String())
 		}
@@ -3164,12 +3187,13 @@ func TestKBaseHTTPHandlerSerializesCapabilityHealth(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", SourceSync: sourceSync, SourceAgentToken: "agent-secret"})
-	heartbeat := `{"agent_id":"agent-a","capability_health":{"wechat_mp":{"healthy":false,"requires_action":"login"},"wcplus":{"healthy":false}}}`
+	heartbeat := `{"agent_id":"agent-a","current_run_id":"job-42","current_run_stage":"building_knowledge","capability_health":{"wechat_mp":{"healthy":false,"requires_action":"login"},"wcplus":{"healthy":false}}}`
 	if resp := requestJSONKBase(handler, http.MethodPost, "/api/source-agent/heartbeat", "agent-secret", heartbeat); resp.Code != http.StatusOK {
 		t.Fatalf("heartbeat status=%d body=%s", resp.Code, resp.Body.String())
 	}
 	resp := requestKBase(handler, http.MethodGet, "/api/source-agents", "admin-secret")
-	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"capability_health":{"wcplus":{"healthy":false},"wechat_mp":{"healthy":false,"requires_action":"login"}}`) {
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"capability_health":{"wcplus":{"healthy":false},"wechat_mp":{"healthy":false,"requires_action":"login"}}`) ||
+		!strings.Contains(resp.Body.String(), `"current_run_id":"job-42","current_run_stage":"building_knowledge"`) {
 		t.Fatalf("agents capability response status=%d body=%s", resp.Code, resp.Body.String())
 	}
 }

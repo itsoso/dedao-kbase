@@ -208,7 +208,7 @@ func handleHTTPResponse(resp *resty.Response, err error) (io.ReadCloser, error) 
 	if statusCode < http.StatusOK || statusCode >= http.StatusMultipleChoices {
 		kind := RemoteErrorUnavailable
 		switch statusCode {
-		case http.StatusUnauthorized:
+		case http.StatusUnauthorized, 496: // non-standard No Certificate / interactive verification required
 			kind = RemoteErrorAuthentication
 		case http.StatusForbidden, http.StatusNotFound:
 			kind = RemoteErrorSourceChanged

@@ -201,6 +201,7 @@ func TestSourceAgentHeartbeatRuntimeMetadata(t *testing.T) {
 		ProtocolVersion:  " 2026-08-01 ",
 		Capabilities:     []string{"sync_content"},
 		CurrentRunID:     " run_123 ",
+		CurrentRunStage:  " building_knowledge ",
 		CurrentCommandID: " cmd_456 ",
 		OutboxPending:    3,
 		DeadLetterCount:  1,
@@ -215,7 +216,7 @@ func TestSourceAgentHeartbeatRuntimeMetadata(t *testing.T) {
 	if agent.Version != "2.4.1" || agent.ProtocolVersion != "2026-08-01" {
 		t.Fatalf("versions not normalized: %#v", agent)
 	}
-	if agent.CurrentRunID != "run_123" || agent.CurrentCommandID != "cmd_456" {
+	if agent.CurrentRunID != "run_123" || agent.CurrentRunStage != "building_knowledge" || agent.CurrentCommandID != "cmd_456" {
 		t.Fatalf("runtime ids not normalized: %#v", agent)
 	}
 	if agent.OutboxPending != 3 || agent.DeadLetterCount != 1 || agent.LastSuccessAt != "2026-08-01T18:15:16Z" {
@@ -246,6 +247,9 @@ func TestSourceAgentHeartbeatBounds(t *testing.T) {
 		{name: "protocol version too long", heartbeat: SourceAgentHeartbeat{AgentID: "worker", ProtocolVersion: strings.Repeat("p", 129)}},
 		{name: "agent id too long", heartbeat: SourceAgentHeartbeat{AgentID: strings.Repeat("a", 129)}},
 		{name: "run id too long", heartbeat: SourceAgentHeartbeat{AgentID: "worker", CurrentRunID: strings.Repeat("r", 129)}},
+		{name: "run stage too long", heartbeat: SourceAgentHeartbeat{AgentID: "worker", CurrentRunStage: strings.Repeat("s", 65)}},
+		{name: "invalid run stage", heartbeat: SourceAgentHeartbeat{AgentID: "worker", CurrentRunStage: "/private/task"}},
+		{name: "unknown run stage", heartbeat: SourceAgentHeartbeat{AgentID: "worker", CurrentRunStage: "raw_secret"}},
 		{name: "command id too long", heartbeat: SourceAgentHeartbeat{AgentID: "worker", CurrentCommandID: strings.Repeat("c", 129)}},
 		{name: "invalid success timestamp", heartbeat: SourceAgentHeartbeat{AgentID: "worker", LastSuccessAt: "yesterday"}},
 	}

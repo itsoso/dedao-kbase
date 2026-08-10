@@ -66,6 +66,7 @@ const bookWorker = {
   platform: "darwin",
   architecture: "arm64",
   current_run_id: "job-42",
+  current_run_stage: "building_knowledge",
   capability_health: {},
 };
 
@@ -76,6 +77,7 @@ assert.match(rendered, /书籍任务 Worker/);
 assert.match(rendered, /人工控制 · 独立运行/);
 assert.match(rendered, /当前任务/);
 assert.match(rendered, /job-42/);
+assert.match(rendered, /正在生成知识库/);
 assert.match(rendered, /任务中心/);
 assert.match(rendered, /data-source-agent-diagnose/);
 assert.doesNotMatch(rendered, /data-source-agent-(?:pause|resume|upgrade|artifact|restart)/, "book workers must not expose unsupported controls");

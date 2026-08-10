@@ -4773,12 +4773,14 @@ func (h *kbaseHTTPHandler) handleSourceAgentManagementCommands(w http.ResponseWr
 			writeHTTPError(w, http.StatusBadRequest, "invalid source agent command type")
 			return
 		}
-		if payload.Type == SourceAgentCommandUpgrade {
+		if payload.Type == SourceAgentCommandUpgrade || payload.Type == SourceAgentCommandRestart {
 			auth, ok := kbaseRequestAuthFromContext(r.Context())
 			if !ok || auth.Method != kbaseAuthMethodCookie {
 				writeHTTPError(w, http.StatusForbidden, "browser management session required")
 				return
 			}
+		}
+		if payload.Type == SourceAgentCommandUpgrade {
 			if h.sourceArtifacts == nil {
 				writeHTTPError(w, http.StatusConflict, "source agent artifact unavailable")
 				return

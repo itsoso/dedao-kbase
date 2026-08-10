@@ -50,7 +50,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 5196,
+      "line": 5198,
       "authenticated": true
     },
     {
@@ -200,13 +200,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 5310,
+      "line": 5312,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 5312,
+      "line": 5314,
       "authenticated": true
     },
     {
@@ -1042,7 +1042,7 @@
     {
       "name": "discover_articles",
       "file": "backend/app/source_sync.go",
-      "line": 676
+      "line": 680
     },
     {
       "name": "discover_articles",
@@ -1057,7 +1057,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/source_sync.go",
-      "line": 663
+      "line": 667
     },
     {
       "name": "existing_articles",
@@ -1072,7 +1072,7 @@
     {
       "name": "sync_articles",
       "file": "backend/app/source_sync.go",
-      "line": 661
+      "line": 665
     },
     {
       "name": "sync_articles",
@@ -1097,7 +1097,7 @@
     {
       "name": "sync_media",
       "file": "backend/app/source_sync.go",
-      "line": 676
+      "line": 680
     },
     {
       "name": "sync_media",
@@ -1209,12 +1209,12 @@
     {
       "name": "BookKnowledgeJob",
       "file": "backend/app/book_jobs.go",
-      "line": 82
+      "line": 85
     },
     {
       "name": "BookKnowledgeJobRequest",
       "file": "backend/app/book_jobs.go",
-      "line": 103
+      "line": 107
     },
     {
       "name": "BookKnowledgeLLMResult",
@@ -1669,7 +1669,7 @@
     {
       "name": "SourceAgent",
       "file": "backend/app/source_sync.go",
-      "line": 83
+      "line": 84
     },
     {
       "name": "SourceAgentArtifact",
@@ -1889,7 +1889,7 @@
     {
       "name": "SourceCapabilityHealth",
       "file": "backend/app/source_sync.go",
-      "line": 75
+      "line": 76
     },
     {
       "name": "SourceCheckpoint",
@@ -1949,32 +1949,32 @@
     {
       "name": "SourceSubscription",
       "file": "backend/app/source_sync.go",
-      "line": 120
+      "line": 122
     },
     {
       "name": "SourceSubscriptionInput",
       "file": "backend/app/source_sync.go",
-      "line": 108
+      "line": 110
     },
     {
       "name": "SourceSyncItem",
       "file": "backend/app/source_sync.go",
-      "line": 167
+      "line": 169
     },
     {
       "name": "SourceSyncItemInput",
       "file": "backend/app/source_sync.go",
-      "line": 158
+      "line": 160
     },
     {
       "name": "SourceSyncRun",
       "file": "backend/app/source_sync.go",
-      "line": 136
+      "line": 138
     },
     {
       "name": "SourceSyncStore",
       "file": "backend/app/source_sync.go",
-      "line": 180
+      "line": 182
     },
     {
       "name": "WCPlusAccount",
