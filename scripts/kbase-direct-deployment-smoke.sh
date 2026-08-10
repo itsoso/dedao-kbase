@@ -7,6 +7,8 @@ README="${ROOT}/README.md"
 BUILD_WORKFLOW="${ROOT}/.github/workflows/kbase-build-gates.yml"
 RELEASE_WORKFLOW="${ROOT}/.github/workflows/kbase-release-gates.yml"
 WORKER_SERVICE="${ROOT}/deploy/systemd/dedao-book-job-worker.service"
+CUTOVER_SCRIPT="${ROOT}/scripts/kbase-direct-deployment-cutover.sh"
+BEHAVIOR_SMOKE="${ROOT}/scripts/kbase-direct-deployment-behavior-smoke.sh"
 
 fail() {
   printf 'kbase-direct-deployment-smoke: %s\n' "$*" >&2
@@ -24,6 +26,10 @@ release_kit_files=("${ROOT}"/deploy/kbase/*)
   fail "normal build workflow is missing"
 [[ -f "$WORKER_SERVICE" ]] ||
   fail "book job worker systemd service is missing"
+[[ -x "$CUTOVER_SCRIPT" ]] ||
+  fail "production cutover script is missing or not executable"
+[[ -x "$BEHAVIOR_SMOKE" ]] ||
+  fail "deployment behavior smoke is missing or not executable"
 grep -Fq 'name: KBase Build Gates' "$BUILD_WORKFLOW" ||
   fail "normal build workflow has the wrong identity"
 
@@ -62,16 +68,17 @@ for required in \
   'git archive' \
   'sha256' \
   'KBASE_REVISION' \
+  'KBASE_SOURCE_SHA256=' \
+  'KBASE_REMOTE_SOURCE_SHA256=' \
+  'test "$KBASE_REMOTE_SOURCE_SHA256" = "$KBASE_SOURCE_SHA256"' \
+  'test ! -e "${KBASE_REMOTE_SOURCE_DIR:?}"' \
+  'sudo mkdir -m 0700 -- "${KBASE_REMOTE_SOURCE_DIR:?}"' \
   'runuser --user' \
   'go test ./...' \
   'go build' \
   'KBASE_BACKUP_DIR' \
-  'KBASE_WORKER_CANDIDATE_BIN' \
-  'KBASE_WORKER_BINARY_TARGET' \
-  'KBASE_WORKER_SERVICE_NAME' \
-  'KBASE_BOOK_JOBS_DB' \
-  'KBASE_LEGACY_JOBS_PATH' \
-  'KBASE_WORKER_UNIT_TARGET' \
+  'scripts/kbase-direct-deployment-cutover.sh' \
+  'sudo --preserve-env=KBASE_BACKUP_DIR' \
   'KBASE_SOURCE_AGENT_ID' \
   'KBASE_BOOK_JOB_WORKER_ID' \
   'book-job-worker build-info' \
@@ -79,21 +86,6 @@ for required in \
   './cmd/book-job-worker' \
   'main.bookJobWorkerVersion=${KBASE_VERSION}' \
   'main.bookJobWorkerRevision=${KBASE_REVISION}' \
-  'book_jobs.sqlite3' \
-  'jobs.json' \
-  'book-job-worker.present' \
-  'book-job-worker.absent' \
-  'book_jobs.sqlite3.present' \
-  'book_jobs.sqlite3.absent' \
-  'jobs.json.present' \
-  'jobs.json.absent' \
-  'dedao-book-job-worker.service.present' \
-  'dedao-book-job-worker.service.absent' \
-  'export-legacy --out' \
-  'rollback_direct_deployment()' \
-  'trap rollback_direct_deployment ERR' \
-  'trap - ERR' \
-  'systemctl restart' \
   'KBASE_LOOPBACK_HEALTH_URL' \
   'KBASE_PUBLIC_HEALTH_URL'
 do
@@ -101,16 +93,23 @@ do
     fail "README is missing direct-deployment contract: ${required}"
 done
 
+if grep -Eq 'sudo install (-[^ ]+ )*-d|sudo install -d' "$README"; then
+  fail "remote source directory may not be reused with install -d"
+fi
+if grep -Fq 'sudo --preserve-env \' "$README"; then
+  fail "deployment may not preserve the complete operator environment"
+fi
+
 for required in \
   'sudo rm -f "${KBASE_WORKER_BINARY_TARGET:?}"' \
   'sudo rm -f "${KBASE_WORKER_UNIT_TARGET:?}"' \
-  'test -f "${KBASE_BACKUP_DIR:?}/book-job-worker.absent"' \
-  'test -f "${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3.absent"' \
-  'test -f "${KBASE_BACKUP_DIR:?}/jobs.json.absent"' \
-  'test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.absent"'
+  'book-job-worker.absent' \
+  'book_jobs.sqlite3.absent' \
+  'jobs.json.absent' \
+  'dedao-book-job-worker.service.absent'
 do
-  grep -Fq "$required" "$README" ||
-    fail "README is missing first-rollout recovery: ${required}"
+  grep -Fq "$required" "$CUTOVER_SCRIPT" ||
+    fail "cutover script is missing first-rollout recovery: ${required}"
 done
 
 for required in \
@@ -124,23 +123,24 @@ do
 done
 
 line_of() {
-  local needle="$1"
+  local file="$1"
+  local needle="$2"
   local line
-  line="$(grep -nF "$needle" "$README" | head -n 1 | cut -d: -f1)"
-  [[ -n "$line" ]] || fail "README is missing ordered marker: ${needle}"
+  line="$(grep -nF "$needle" "$file" | head -n 1 | cut -d: -f1)"
+  [[ -n "$line" ]] || fail "deployment script is missing ordered marker: ${needle}"
   printf '%s\n' "$line"
 }
 
-trap_line="$(line_of 'trap rollback_direct_deployment ERR')"
-replace_line="$(line_of 'sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"')"
+trap_line="$(line_of "$CUTOVER_SCRIPT" 'trap rollback_direct_deployment ERR')"
+replace_line="$(line_of "$CUTOVER_SCRIPT" 'sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"')"
 [[ "$trap_line" -lt "$replace_line" ]] ||
   fail "rollback trap must be installed before replacement"
 
-stop_worker_line="$(line_of 'sudo systemctl stop "${KBASE_WORKER_SERVICE_NAME:?}"')"
-stop_server_line="$(line_of 'sudo systemctl stop "${KBASE_SERVICE_NAME:?}"')"
-export_legacy_line="$(line_of 'export-legacy --out "${KBASE_LEGACY_JOBS_TEMP:?}"')"
-restore_server_line="$(line_of '"${KBASE_BACKUP_DIR:?}/kbase-server" \')"
-restart_server_line="$(line_of 'sudo systemctl restart "${KBASE_SERVICE_NAME:?}"')"
+stop_worker_line="$(line_of "$CUTOVER_SCRIPT" 'sudo systemctl stop "${KBASE_WORKER_SERVICE_NAME:?}"')"
+stop_server_line="$(line_of "$CUTOVER_SCRIPT" 'sudo systemctl stop "${KBASE_SERVICE_NAME:?}"')"
+export_legacy_line="$(line_of "$CUTOVER_SCRIPT" 'export-legacy --out "${KBASE_LEGACY_JOBS_TEMP:?}"')"
+restore_server_line="$(line_of "$CUTOVER_SCRIPT" '"${KBASE_BACKUP_DIR:?}/kbase-server" \')"
+restart_server_line="$(line_of "$CUTOVER_SCRIPT" 'sudo systemctl restart "${KBASE_SERVICE_NAME:?}"')"
 [[ "$stop_worker_line" -lt "$export_legacy_line" ]] ||
   fail "rollback must stop Worker before legacy export"
 [[ "$stop_worker_line" -lt "$stop_server_line" ]] ||
@@ -165,11 +165,20 @@ for required in \
   './cmd/book-job-worker' \
   'book-job-worker build-info' \
   'book-job-worker check-config' \
-  'systemd-analyze verify deploy/systemd/dedao-book-job-worker.service'
+  'systemd-analyze verify deploy/systemd/dedao-book-job-worker.service' \
+  'bash scripts/kbase-direct-deployment-behavior-smoke.sh' \
+  'KBASE_REMOTE_URL=' \
+  'KBASE_SOURCE_AGENT_TOKEN=' \
+  'KBASE_SOURCE_AGENT_ID=' \
+  'if ! id -u dedao-kbase'
 do
   grep -Fq "$required" "$BUILD_WORKFLOW" ||
     fail "normal build workflow is missing gate: ${required}"
 done
+
+if grep -Fq 'useradd --system --no-create-home dedao-kbase || true' "$BUILD_WORKFLOW"; then
+  fail "CI hides service-user creation failures"
+fi
 
 if grep -Eq \
   'MANIFEST\.sig|release-signature|assemble-release|prepare-release|install-release' \

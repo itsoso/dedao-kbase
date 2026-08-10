@@ -109,12 +109,17 @@ jobs:
             grep -Fq "\"revision\":\"$BUILD_REVISION\""
           KBASE_BOOK_KNOWLEDGE_ROOT="$RUNNER_TEMP/book-knowledge" \
             KBASE_BOOK_JOB_WORKER_ID=ci-book-worker \
+            KBASE_REMOTE_URL=https://kbase.example.invalid \
+            KBASE_SOURCE_AGENT_TOKEN=ci-shared-source-agent-credential \
+            KBASE_SOURCE_AGENT_ID=ci-book-worker-agent \
             book-job-worker check-config
           go test ./cmd/book-job-worker ./cmd/kbase-server
 
       - name: Verify book Worker service contract
         run: |
-          sudo useradd --system --no-create-home dedao-kbase || true
+          if ! id -u dedao-kbase >/dev/null 2>&1; then
+            sudo useradd --system --no-create-home dedao-kbase
+          fi
           sudo install -d /opt/dedao-kbase/bin /etc/dedao-kbase
           sudo install -m 0755 "$RUNNER_TEMP/book-job-worker" \
             /opt/dedao-kbase/bin/book-job-worker
@@ -136,7 +141,9 @@ jobs:
             bash deploy/nginx/browser-session-proxy-smoke.sh
 
       - name: Verify direct-deployment contract
-        run: bash scripts/kbase-direct-deployment-smoke.sh
+        run: |
+          bash scripts/kbase-direct-deployment-smoke.sh
+          bash scripts/kbase-direct-deployment-behavior-smoke.sh
 
       - name: Verify source Agent control plane
         run: bash scripts/source-agent-control-plane-smoke.sh

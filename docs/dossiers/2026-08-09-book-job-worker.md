@@ -74,6 +74,14 @@
 - Task 7 验证已通过：同 revision 双二进制真实构建与分立哈希、Worker
   `build-info`/`check-config`、命令包测试、`go test ./...`、部署/system-map/privacy
   smoke 和 diff whitespace 检查。
+- Task 7 评审修复把切换/回滚抽成生产唯一脚本，并增加直接执行该脚本的行为
+  smoke；临时目录 mock 只替换 systemd、sudo、SQLite、健康检查等外部边界。
+- 行为 smoke 覆盖首次安装与升级成功、替换后故障、present/absent 恢复、旧 unit
+  的 enabled/active 与 disabled/inactive 恢复、导出顺序、SQLite/下载保留，以及
+  首装回滚无残留 systemd enable 链接。
+- 源码归档在解压前比较本地/远端 SHA-256，远端源码目录必须原先不存在；CI 不再
+  静默忽略用户创建失败，并使用远端 URL、共享 Source Agent Token 和稳定 ID 执行
+  Worker `check-config`。
 
 ## Gate 记录
 

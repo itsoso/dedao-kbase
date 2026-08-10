@@ -169,11 +169,13 @@ test "$KBASE_REVISION" = "$(git -C "${KBASE_REPO_ROOT:?}" rev-parse HEAD)"
     --output="${KBASE_SOURCE_ARCHIVE:?}" \
     "$KBASE_REVISION"
 )
-shasum -a 256 "${KBASE_SOURCE_ARCHIVE:?}"
+KBASE_SOURCE_SHA256="$(shasum -a 256 "${KBASE_SOURCE_ARCHIVE:?}" | awk '{print $1}')"
+test -n "$KBASE_SOURCE_SHA256"
 scp "${KBASE_SOURCE_ARCHIVE:?}" \
   "${KBASE_DEPLOY_HOST:?}:${KBASE_REMOTE_ARCHIVE:?}"
-ssh "${KBASE_DEPLOY_HOST:?}" \
-  sha256sum "${KBASE_REMOTE_ARCHIVE:?}"
+KBASE_REMOTE_SOURCE_SHA256="$(ssh "${KBASE_DEPLOY_HOST:?}" \
+  sha256sum "${KBASE_REMOTE_ARCHIVE:?}" | awk '{print $1}')"
+test "$KBASE_REMOTE_SOURCE_SHA256" = "$KBASE_SOURCE_SHA256"
 ```
 
 服务端必须把归档解压到新的私有目录，并由非 root 服务账号重复构建和测试。
@@ -190,9 +192,9 @@ KBASE_BOOK_JOB_WORKER_ID="book-job-worker-production"
 ```
 
 ```bash
-sudo install -d -m 0700 \
-  -o "${KBASE_SERVICE_USER:?}" \
-  -g "${KBASE_SERVICE_GROUP:?}" \
+test ! -e "${KBASE_REMOTE_SOURCE_DIR:?}"
+sudo mkdir -m 0700 -- "${KBASE_REMOTE_SOURCE_DIR:?}"
+sudo chown "${KBASE_SERVICE_USER:?}:${KBASE_SERVICE_GROUP:?}" \
   "${KBASE_REMOTE_SOURCE_DIR:?}"
 sudo tar -xzf "${KBASE_REMOTE_ARCHIVE:?}" \
   -C "${KBASE_REMOTE_SOURCE_DIR:?}"
@@ -245,154 +247,18 @@ backup，不复制可能仍有 WAL 的裸数据库。环境文件、SQLite 原�
 被替换或删除。备份与候选都验证完成后安装错误 trap，任何替换、启动或 loopback
 健康检查失败都会进入同一回滚函数：
 
+生产实际执行的切换与回滚只有一份实现：
+
 ```bash
-set -Eeuo pipefail
-test ! -e "${KBASE_BACKUP_DIR:?}"
-test ! -e "${KBASE_BINARY_CANDIDATE_TARGET:?}"
-test ! -e "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}"
-test ! -e "${KBASE_WEB_CANDIDATE_TARGET:?}"
-test ! -e "${KBASE_WEB_PREVIOUS_TARGET:?}"
-test ! -e "${KBASE_FAILED_WEB_TARGET:?}"
-sudo install -d -o root -g root -m 0700 "${KBASE_BACKUP_DIR:?}"
-sudo install -o root -g root -m 0755 \
-  "${KBASE_BINARY_TARGET:?}" \
-  "${KBASE_BACKUP_DIR:?}/kbase-server"
-if test -f "${KBASE_WORKER_BINARY_TARGET:?}"; then
-  sudo install -o root -g root -m 0755 \
-    "${KBASE_WORKER_BINARY_TARGET:?}" \
-    "${KBASE_BACKUP_DIR:?}/book-job-worker"
-  sudo touch "${KBASE_BACKUP_DIR:?}/book-job-worker.present"
-else
-  sudo touch "${KBASE_BACKUP_DIR:?}/book-job-worker.absent"
-fi
-sudo cp -a \
-  "${KBASE_WEB_TARGET:?}" \
-  "${KBASE_BACKUP_DIR:?}/frontend-web"
-if test -f "${KBASE_BOOK_JOBS_DB:?}"; then
-  sudo sqlite3 "${KBASE_BOOK_JOBS_DB:?}" \
-    ".backup '${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3'"
-  sudo chmod 0600 "${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3"
-  sudo touch "${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3.present"
-else
-  sudo touch "${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3.absent"
-fi
-if test -f "${KBASE_LEGACY_JOBS_PATH:?}"; then
-  sudo install -o root -g root -m 0600 \
-    "${KBASE_LEGACY_JOBS_PATH:?}" \
-    "${KBASE_BACKUP_DIR:?}/jobs.json"
-  sudo touch "${KBASE_BACKUP_DIR:?}/jobs.json.present"
-else
-  sudo touch "${KBASE_BACKUP_DIR:?}/jobs.json.absent"
-fi
-if test -f "${KBASE_WORKER_UNIT_TARGET:?}"; then
-  sudo install -o root -g root -m 0644 \
-    "${KBASE_WORKER_UNIT_TARGET:?}" \
-    "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service"
-  sudo touch "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.present"
-else
-  sudo touch "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.absent"
-fi
-sudo install -o root -g root -m 0755 \
-  "${KBASE_CANDIDATE_BIN:?}" \
-  "${KBASE_BINARY_CANDIDATE_TARGET:?}"
-sudo install -o root -g root -m 0755 \
-  "${KBASE_WORKER_CANDIDATE_BIN:?}" \
-  "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}"
-sudo cp -a \
-  "${KBASE_REMOTE_SOURCE_DIR:?}/frontend-web" \
-  "${KBASE_WEB_CANDIDATE_TARGET:?}"
-sudo install -o root -g root -m 0644 \
-  "${KBASE_REMOTE_SOURCE_DIR:?}/deploy/systemd/dedao-book-job-worker.service" \
-  "${KBASE_WORKER_UNIT_CANDIDATE_TARGET:?}"
-test -f "${KBASE_BACKUP_DIR:?}/kbase-server"
-test -d "${KBASE_BACKUP_DIR:?}/frontend-web"
-test -f "${KBASE_BACKUP_DIR:?}/book-job-worker.present" || \
-  test -f "${KBASE_BACKUP_DIR:?}/book-job-worker.absent"
-test -f "${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3.present" || \
-  test -f "${KBASE_BACKUP_DIR:?}/book_jobs.sqlite3.absent"
-test -f "${KBASE_BACKUP_DIR:?}/jobs.json.present" || \
-  test -f "${KBASE_BACKUP_DIR:?}/jobs.json.absent"
-test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.present" || \
-  test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.absent"
-test -f "${KBASE_BINARY_CANDIDATE_TARGET:?}"
-test -f "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}"
-test -d "${KBASE_WEB_CANDIDATE_TARGET:?}"
-test -f "${KBASE_WORKER_UNIT_CANDIDATE_TARGET:?}"
-test "$(sha256sum "${KBASE_BINARY_CANDIDATE_TARGET:?}" | awk '{print $1}')" = \
-  "${KBASE_SERVER_SHA256:?}"
-test "$(sha256sum "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" | awk '{print $1}')" = \
-  "${KBASE_WORKER_SHA256:?}"
-
-KBASE_LEGACY_JOBS_TEMP="${KBASE_LEGACY_JOBS_PATH:?}.rollback.$$"
-
-rollback_direct_deployment() {
-  status=$?
-  trap - ERR
-  sudo systemctl stop "${KBASE_WORKER_SERVICE_NAME:?}" || \
-    test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.absent"
-  sudo systemctl stop "${KBASE_SERVICE_NAME:?}"
-  sudo runuser --user "${KBASE_SERVICE_USER:?}" -- env \
-    KBASE_BOOK_KNOWLEDGE_ROOT="${KBASE_BOOK_KNOWLEDGE_ROOT:?}" \
-    "${KBASE_WORKER_CANDIDATE_BIN:?}" \
-    export-legacy --out "${KBASE_LEGACY_JOBS_TEMP:?}"
-  sudo mv "${KBASE_LEGACY_JOBS_TEMP:?}" "${KBASE_LEGACY_JOBS_PATH:?}"
-  sudo install -o root -g root -m 0755 \
-    "${KBASE_BACKUP_DIR:?}/kbase-server" \
-    "${KBASE_BINARY_TARGET:?}"
-  if test -f "${KBASE_BACKUP_DIR:?}/book-job-worker.present"; then
-    sudo install -o root -g root -m 0755 \
-      "${KBASE_BACKUP_DIR:?}/book-job-worker" \
-      "${KBASE_WORKER_BINARY_TARGET:?}"
-  else
-    sudo rm -f "${KBASE_WORKER_BINARY_TARGET:?}"
-  fi
-  if test -e "${KBASE_WEB_TARGET:?}"; then
-    sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_FAILED_WEB_TARGET:?}"
-  fi
-  sudo cp -a \
-    "${KBASE_BACKUP_DIR:?}/frontend-web" \
-    "${KBASE_WEB_TARGET:?}"
-  if test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.present"; then
-    sudo install -o root -g root -m 0644 \
-      "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service" \
-      "${KBASE_WORKER_UNIT_TARGET:?}"
-  else
-    sudo rm -f "${KBASE_WORKER_UNIT_TARGET:?}"
-  fi
-  sudo systemctl daemon-reload
-  sudo systemctl restart "${KBASE_SERVICE_NAME:?}"
-  curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
-  sudo systemctl is-active "${KBASE_SERVICE_NAME:?}"
-  if test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.present"; then
-    sudo systemctl restart "${KBASE_WORKER_SERVICE_NAME:?}"
-    sudo systemctl is-active "${KBASE_WORKER_SERVICE_NAME:?}"
-  fi
-  exit "$status"
-}
-
-trap rollback_direct_deployment ERR
-sudo systemctl stop "${KBASE_WORKER_SERVICE_NAME:?}" || \
-  test -f "${KBASE_BACKUP_DIR:?}/dedao-book-job-worker.service.absent"
-sudo systemctl stop "${KBASE_SERVICE_NAME:?}"
-sudo mv "${KBASE_BINARY_CANDIDATE_TARGET:?}" "${KBASE_BINARY_TARGET:?}"
-sudo mv "${KBASE_WORKER_BINARY_CANDIDATE_TARGET:?}" \
-  "${KBASE_WORKER_BINARY_TARGET:?}"
-sudo mv "${KBASE_WEB_TARGET:?}" "${KBASE_WEB_PREVIOUS_TARGET:?}"
-sudo mv "${KBASE_WEB_CANDIDATE_TARGET:?}" "${KBASE_WEB_TARGET:?}"
-sudo mv "${KBASE_WORKER_UNIT_CANDIDATE_TARGET:?}" \
-  "${KBASE_WORKER_UNIT_TARGET:?}"
-sudo systemctl daemon-reload
-sudo "${KBASE_WORKER_BINARY_TARGET:?}" build-info
-sudo bash -c \
-  'set -a; . /etc/dedao-kbase/kbase.env; set +a; exec runuser --user "$1" -- "$2" check-config' \
-  bash "${KBASE_SERVICE_USER:?}" "${KBASE_WORKER_BINARY_TARGET:?}"
-sudo systemctl start "${KBASE_SERVICE_NAME:?}"
-sudo systemctl start "${KBASE_WORKER_SERVICE_NAME:?}"
-curl --fail --silent --show-error "${KBASE_LOOPBACK_HEALTH_URL:?}"
-sudo systemctl is-active "${KBASE_SERVICE_NAME:?}"
-sudo systemctl is-active "${KBASE_WORKER_SERVICE_NAME:?}"
-trap - ERR
+sudo --preserve-env=KBASE_BACKUP_DIR,KBASE_BINARY_TARGET,KBASE_WORKER_BINARY_TARGET,KBASE_WEB_TARGET,KBASE_BOOK_JOBS_DB,KBASE_LEGACY_JOBS_PATH,KBASE_WORKER_UNIT_TARGET,KBASE_CANDIDATE_BIN,KBASE_WORKER_CANDIDATE_BIN,KBASE_WEB_CANDIDATE_SOURCE,KBASE_WORKER_UNIT_CANDIDATE_SOURCE,KBASE_BINARY_CANDIDATE_TARGET,KBASE_WORKER_BINARY_CANDIDATE_TARGET,KBASE_WEB_CANDIDATE_TARGET,KBASE_WEB_PREVIOUS_TARGET,KBASE_FAILED_WEB_TARGET,KBASE_WORKER_UNIT_CANDIDATE_TARGET,KBASE_SERVER_SHA256,KBASE_WORKER_SHA256,KBASE_SERVICE_NAME,KBASE_WORKER_SERVICE_NAME,KBASE_LOOPBACK_HEALTH_URL,KBASE_BOOK_KNOWLEDGE_ROOT,KBASE_SERVICE_USER \
+  bash "${KBASE_REMOTE_SOURCE_DIR:?}/scripts/kbase-direct-deployment-cutover.sh"
 ```
+
+调用前必须设置脚本声明的所有 `KBASE_*` 路径、服务名、候选 SHA-256，以及
+`KBASE_LOOPBACK_HEALTH_URL`；候选 Web 与 unit 来源均指向本次全新解压的源码
+目录。CI 的
+`kbase-direct-deployment-behavior-smoke.sh` 用隔离目录和外部命令 mock 直接执行
+同一份生产脚本，不在测试中复制切换逻辑。
 
 回滚顺序不可调整：先停止 Worker，再停止 KBase 以冻结新任务写入；随后用候选
 Worker 从仍保留的 SQLite 原库执行 `book-job-worker export-legacy --out`，并原子
