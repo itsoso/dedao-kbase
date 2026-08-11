@@ -386,6 +386,21 @@ func TestEvolutionEventTransitionContract(t *testing.T) {
 		name   string
 		mutate func(*EvolutionEvent)
 	}{
+		{name: "note with transition statuses", mutate: func(event *EvolutionEvent) {
+			event.EventType = "note"
+			event.FromStatus = EvolutionDetected
+			event.ToStatus = EvolutionTriaged
+		}},
+		{name: "created with transition statuses", mutate: func(event *EvolutionEvent) {
+			event.EventType = "created"
+			event.FromStatus = EvolutionDetected
+			event.ToStatus = EvolutionTriaged
+		}},
+		{name: "transition with initial statuses", mutate: func(event *EvolutionEvent) {
+			event.EventType = "transition"
+			event.FromStatus = ""
+			event.ToStatus = EvolutionDetected
+		}},
 		{name: "approval bypass", mutate: func(event *EvolutionEvent) {
 			event.FromStatus = EvolutionDetected
 			event.ToStatus = EvolutionPublishing

@@ -482,20 +482,21 @@ func (event EvolutionEvent) Validate() error {
 	if err := validateEvolutionCode("event_type", event.EventType); err != nil {
 		return err
 	}
-	switch {
-	case event.FromStatus == "" && event.ToStatus == "":
-		if event.EventType == "transition" || strings.TrimSpace(event.Message) == "" {
-			return fmt.Errorf("non-transition event requires a message event type and message")
+	switch event.EventType {
+	case "created":
+		if event.FromStatus != "" || event.ToStatus != EvolutionDetected {
+			return fmt.Errorf("created event must transition from empty status to %q", EvolutionDetected)
 		}
-	case event.FromStatus == "":
-		if event.ToStatus != EvolutionDetected {
-			return fmt.Errorf("initial event must transition to %q", EvolutionDetected)
+	case "transition":
+		if event.FromStatus == "" || event.ToStatus == "" {
+			return fmt.Errorf("transition event requires from_status and to_status")
 		}
-	case event.ToStatus == "":
-		return fmt.Errorf("transition event requires to_status")
-	default:
 		if err := ValidateEvolutionTransition(event.FromStatus, event.ToStatus); err != nil {
 			return err
+		}
+	default:
+		if event.FromStatus != "" || event.ToStatus != "" || strings.TrimSpace(event.Message) == "" {
+			return fmt.Errorf("message event requires empty statuses and a message")
 		}
 	}
 	if err := validateEvolutionCode("code", event.Code); err != nil {
