@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"time"
 	"unicode/utf8"
 )
 
@@ -51,6 +52,8 @@ type EvolutionSignal struct {
 
 type EvolutionRun struct {
 	RunID                  string             `json:"run_id"`
+	Attempt                int                `json:"attempt"`
+	RetryOfRunID           string             `json:"retry_of_run_id"`
 	RunType                EvolutionRunType   `json:"run_type"`
 	PackageID              string             `json:"package_id"`
 	BaselinePackageVersion string             `json:"baseline_package_version"`
@@ -164,6 +167,38 @@ func ValidateEvolutionTransition(from, to EvolutionRunStatus) error {
 	return nil
 }
 
+func NewEvolutionRetry(original EvolutionRun, newRunID string, now time.Time) (EvolutionRun, error) {
+	if newRunID == "" {
+		return EvolutionRun{}, fmt.Errorf("new run_id is required")
+	}
+	if newRunID == original.RunID {
+		return EvolutionRun{}, fmt.Errorf("retry run_id must differ from original run_id")
+	}
+	if !isEvolutionRetryableStatus(original.Status) {
+		return EvolutionRun{}, fmt.Errorf("evolution run status %q cannot be retried", original.Status)
+	}
+	previousAttempt := original.Attempt
+	if previousAttempt == 0 {
+		previousAttempt = 1
+	}
+	timestamp := now.UTC().Format(time.RFC3339Nano)
+	return EvolutionRun{
+		RunID:                  newRunID,
+		Attempt:                previousAttempt + 1,
+		RetryOfRunID:           original.RunID,
+		RunType:                original.RunType,
+		PackageID:              original.PackageID,
+		BaselinePackageVersion: original.BaselinePackageVersion,
+		BaselineReleaseIDs:     append([]string(nil), original.BaselineReleaseIDs...),
+		RiskLevel:              original.RiskLevel,
+		PriorityScore:          original.PriorityScore,
+		Status:                 EvolutionDetected,
+		TriggerSignalIDs:       append([]string(nil), original.TriggerSignalIDs...),
+		CreatedAt:              timestamp,
+		UpdatedAt:              timestamp,
+	}, nil
+}
+
 func (run EvolutionRun) Validate() error {
 	if !isKnownEvolutionRunType(run.RunType) {
 		return fmt.Errorf("unknown evolution run type %q", run.RunType)
@@ -225,6 +260,20 @@ func isKnownEvolutionRunType(runType EvolutionRunType) bool {
 
 func isEvolutionAbortStatus(status EvolutionRunStatus) bool {
 	return status == EvolutionBlocked || status == EvolutionFailed || status == EvolutionSuperseded
+}
+
+func isEvolutionRetryableStatus(status EvolutionRunStatus) bool {
+	switch status {
+	case EvolutionBlocked,
+		EvolutionRejected,
+		EvolutionFailed,
+		EvolutionCompleted,
+		EvolutionSuperseded,
+		EvolutionRolledBack:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateEvolutionText(field, value string, maxRunes int) error {
