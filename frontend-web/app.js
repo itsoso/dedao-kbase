@@ -3926,32 +3926,61 @@ function scrollKnowledgeHashTarget() {
   });
 }
 
+function knowledgeResourceIsActive(resource, type, resourceID, kind = "") {
+  if (!resource || resource.type !== type || resource.resourceID !== String(resourceID || "")) {
+    return false;
+  }
+  return type !== "result" || resource.kind === String(kind || "");
+}
+
+function scrollKnowledgeResourceTarget() {
+  const resource = knowledgeResourceFromLocation();
+  if (!resource || resource.type === "book") {
+    return;
+  }
+  window.requestAnimationFrame?.(() => {
+    document.querySelector(".knowledge-web__resource-link.active")?.scrollIntoView({ block: "center" });
+  });
+}
+
 function renderBookKnowledge() {
   const isPackageDetail = isKnowledgePackageDetailRoute();
+  const activeResource = knowledgeResourceFromLocation();
   const bookRows = knowledgeState.books.map((book, index) => {
     const active = book.book_id === knowledgeState.selectedBook?.book_id ? " active" : "";
     return `
-      <button class="knowledge-web__book${active}" type="button" data-book-index="${index}">
+      <a class="knowledge-web__book knowledge-web__resource-link${active}" href="${escapeAttribute(knowledgeBookPath(book.book_id))}" data-book-index="${index}">
         <strong>${escapeHTML(book.title || book.book_id)}</strong>
         <span>${escapeHTML([book.status || "draft", book.extractor || ""].filter(Boolean).join(" · "))}</span>
-      </button>
+      </a>
     `;
   }).join("");
   const pkg = knowledgeState.package || {};
   const currentBook = pkg.book || knowledgeState.selectedBook || {};
-  const resultRows = knowledgeState.results.map((result) => `
-    <article class="knowledge-web__result">
-      <div class="web-kicker">${escapeHTML(result.kind || "result")}</div>
-      <h3>${escapeHTML(result.title || result.id || "片段")}</h3>
+  const resultRows = knowledgeState.results.map((result, index) => {
+    const resultID = result.id || "";
+    const kind = result.kind || "result";
+    const active = knowledgeResourceIsActive(activeResource, "result", resultID, kind) ? " active" : "";
+    const body = `
+      <div class="web-kicker">${escapeHTML(kind)}</div>
+      <h3>${escapeHTML(result.title || resultID || "片段")}</h3>
       <p>${escapeHTML(result.snippet || "")}</p>
-    </article>
-  `).join("");
-  const chapterRows = (pkg.chapters || []).slice(0, 16).map((chapter) => `
-    <li>
-      <span>${escapeHTML(chapter.title || chapter.chapter_id)}</span>
+    `;
+    return resultID && currentBook.book_id
+      ? `<a class="knowledge-web__result knowledge-web__resource-link${active}" href="${escapeAttribute(knowledgeResultPath(currentBook.book_id, kind, resultID))}" data-result-index="${index}">${body}</a>`
+      : `<article class="knowledge-web__result">${body}</article>`;
+  }).join("");
+  const chapterRows = (pkg.chapters || []).slice(0, 16).map((chapter, index) => {
+    const chapterID = chapter.chapter_id || chapter.id || "";
+    const active = knowledgeResourceIsActive(activeResource, "chapter", chapterID) ? " active" : "";
+    const body = `
+      <span>${escapeHTML(chapter.title || chapterID || "未命名章节")}</span>
       <small>${escapeHTML(chapter.summary || "")}</small>
-    </li>
-  `).join("");
+    `;
+    return chapterID && currentBook.book_id
+      ? `<li><a class="knowledge-web__resource-link${active}" href="${escapeAttribute(knowledgeChapterPath(currentBook.book_id, chapterID))}" data-chapter-index="${index}">${body}</a></li>`
+      : `<li>${body}</li>`;
+  }).join("");
   const status = knowledgeState.loading
     ? `<div class="web-status">处理中：${escapeHTML(knowledgeState.loading)}</div>`
     : (knowledgeState.message ? `<div class="web-status">${escapeHTML(knowledgeState.message)}</div>` : "");
@@ -4175,6 +4204,7 @@ function renderBookKnowledge() {
   `, "knowledge");
   bindBookKnowledgeEvents();
   scrollKnowledgeHashTarget();
+  scrollKnowledgeResourceTarget();
 }
 
 function hasBookAgentCapability(capability) {
@@ -9825,12 +9855,20 @@ function bindBookKnowledgeEvents() {
     await publishControlledAgent();
   });
   for (const button of document.querySelectorAll("[data-book-index]")) {
-    button.addEventListener("click", async () => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
       const index = Number(button.getAttribute("data-book-index") || "0");
       const book = knowledgeState.books[index] || null;
       if (book) {
         await navigateKnowledgeBook(book);
       }
+    });
+  }
+  for (const link of document.querySelectorAll("[data-chapter-index], [data-result-index]")) {
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      pushKnowledgeRoute(link.getAttribute("href") || "");
+      renderBookKnowledge();
     });
   }
 }
@@ -9888,6 +9926,7 @@ async function loadBookKnowledge() {
       const evidenceLocator = new URLSearchParams(window.location.search);
       const citationID = evidenceLocator.get("citation_id") || "";
       const evidenceQuery = citationID || evidenceLocator.get("chunk_id") || evidenceLocator.get("claim_id") || "";
+      const routedResource = knowledgeResourceFromLocation();
       if (citationID) {
         const resolved = await apiFetch(
           `/api/citations/${encodeURIComponent(citationID)}?book_id=${encodeURIComponent(knowledgeState.selectedBook.book_id)}`,
@@ -9914,6 +9953,9 @@ async function loadBookKnowledge() {
       } else if (evidenceQuery) {
         knowledgeState.query = evidenceQuery;
         await searchBookKnowledge();
+      } else if (routedResource?.type === "result" && routedResource.resourceID) {
+        knowledgeState.query = routedResource.resourceID;
+        await searchBookKnowledge();
       }
     } else if (!knowledgeState.books.length) {
       knowledgeState.selectedBook = null;
@@ -9935,12 +9977,22 @@ async function loadBookKnowledge() {
   }
 }
 
+function pushKnowledgeRoute(target) {
+  if (!target) {
+    return;
+  }
+  const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (current !== target) {
+    window.history?.pushState?.({}, "", target);
+  }
+}
+
 async function navigateKnowledgeBook(book, { review = false } = {}) {
   if (!book?.book_id) {
     return;
   }
   const target = `${sourceKnowledgeURL(book.book_id)}${review ? "?review=1" : ""}`;
-  window.history?.pushState?.({}, "", target);
+  pushKnowledgeRoute(target);
   await selectKnowledgeBook(book);
   if (review) {
     setKnowledgeReviewOpen(true);

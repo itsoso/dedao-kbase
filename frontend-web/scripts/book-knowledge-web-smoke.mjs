@@ -135,6 +135,18 @@ for (const marker of [
   assert.ok(js.includes(marker), `knowledge deep-link contract should include ${marker}`);
 }
 
+for (const marker of [
+  "data-book-index",
+  "data-chapter-index",
+  "data-result-index",
+  "pushKnowledgeRoute",
+  "knowledgeResourceIsActive",
+]) {
+  assert.ok(js.includes(marker), `knowledge navigation should include ${marker}`);
+}
+assert.ok(css.includes(".knowledge-web__resource-link"), "knowledge resources should share link styling");
+assert.ok(css.includes(".knowledge-web__resource-link.active"), "the routed knowledge resource should be visibly active");
+
 for (const authMarker of [
   'credentials: "same-origin"',
   "response.status === 401",

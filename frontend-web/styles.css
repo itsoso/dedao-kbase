@@ -3166,6 +3166,22 @@ a.button {
   text-align: left;
 }
 
+.knowledge-web__resource-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.knowledge-web__resource-link:focus-visible {
+  outline: 2px solid rgba(255, 107, 0, 0.62);
+  outline-offset: 2px;
+}
+
+.knowledge-web__resource-link.active {
+  border-color: rgba(255, 107, 0, 0.48);
+  background: rgba(255, 107, 0, 0.08);
+  box-shadow: inset 3px 0 0 #ff6b00;
+}
+
 .knowledge-web__book:hover,
 .knowledge-web__book.active {
   border-color: rgba(255, 107, 0, 0.35);
@@ -3888,6 +3904,15 @@ a.button {
 .knowledge-web__content li {
   display: grid;
   gap: 4px;
+}
+
+.knowledge-web__content li > .knowledge-web__resource-link {
+  display: grid;
+  gap: 4px;
+  margin: -12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 12px;
 }
 
 .knowledge-web__content li span {
