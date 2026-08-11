@@ -24,6 +24,7 @@ const (
 	evolutionStoreSchemaVersion = 1
 	evolutionEventDefaultLimit  = 100
 	evolutionEventMaxLimit      = 500
+	evolutionDefaultBusyTimeout = 5 * time.Second
 )
 
 var (
@@ -65,15 +66,25 @@ type EvolutionControlStore struct {
 
 type evolutionStoreHooks struct {
 	beforeBeginTx         func() error
+	afterBeginTx          func() error
 	beforeEventInsert     func(EvolutionEvent) error
 	afterMigrationVersion func(int) error
 }
 
+type evolutionStoreOpenOptions struct {
+	hooks       evolutionStoreHooks
+	busyTimeout time.Duration
+}
+
 func OpenEvolutionControlStore(root string, now func() time.Time) (*EvolutionControlStore, error) {
-	return openEvolutionControlStore(root, now, evolutionStoreHooks{})
+	return openEvolutionControlStoreWithOptions(root, now, evolutionStoreOpenOptions{})
 }
 
 func openEvolutionControlStore(root string, now func() time.Time, hooks evolutionStoreHooks) (*EvolutionControlStore, error) {
+	return openEvolutionControlStoreWithOptions(root, now, evolutionStoreOpenOptions{hooks: hooks})
+}
+
+func openEvolutionControlStoreWithOptions(root string, now func() time.Time, options evolutionStoreOpenOptions) (*EvolutionControlStore, error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, fmt.Errorf("evolution control root is required")
@@ -88,7 +99,11 @@ func openEvolutionControlStore(root string, now func() time.Time, hooks evolutio
 	if err != nil {
 		return nil, fmt.Errorf("resolve evolution control database path: %w", err)
 	}
-	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(dbPath))
+	busyTimeout := options.busyTimeout
+	if busyTimeout <= 0 {
+		busyTimeout = evolutionDefaultBusyTimeout
+	}
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSNWithTimeout(dbPath, busyTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("open evolution control database: %w", err)
 	}
@@ -96,17 +111,21 @@ func openEvolutionControlStore(root string, now func() time.Time, hooks evolutio
 	// lock in the DSN provides the corresponding boundary across store instances.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if err := migrateEvolutionControlDB(db, hooks); err != nil {
+	if err := migrateEvolutionControlDB(db, options.hooks); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return &EvolutionControlStore{dbPath: dbPath, now: now, db: db, hooks: hooks}, nil
+	return &EvolutionControlStore{dbPath: dbPath, now: now, db: db, hooks: options.hooks}, nil
 }
 
 func evolutionSQLiteDSN(dbPath string) string {
+	return evolutionSQLiteDSNWithTimeout(dbPath, evolutionDefaultBusyTimeout)
+}
+
+func evolutionSQLiteDSNWithTimeout(dbPath string, busyTimeout time.Duration) string {
 	dsn := url.URL{Scheme: "file", Path: dbPath}
 	query := dsn.Query()
-	query.Set("_busy_timeout", "5000")
+	query.Set("_busy_timeout", strconv.FormatInt(busyTimeout.Milliseconds(), 10))
 	query.Set("_foreign_keys", "on")
 	query.Set("_txlock", "immediate")
 	dsn.RawQuery = query.Encode()
@@ -621,13 +640,23 @@ func (s *EvolutionControlStore) beginTx(ctx context.Context) (*sql.Tx, error) {
 			return nil, err
 		}
 	}
-	return s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if hook := s.hooks.afterBeginTx; hook != nil {
+		if err := hook(); err != nil {
+			_ = tx.Rollback()
+			return nil, err
+		}
+	}
+	return tx, nil
 }
 
 func wrapEvolutionSQLiteWriteError(operation string, err error) error {
 	var sqliteErr sqlite3.Error
 	if errors.As(err, &sqliteErr) && (sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked) {
-		return fmt.Errorf("%w: %s", ErrEvolutionWriteConflict, operation)
+		return fmt.Errorf("%w: %s: %w", ErrEvolutionWriteConflict, operation, err)
 	}
 	return fmt.Errorf("%s: %w", operation, err)
 }

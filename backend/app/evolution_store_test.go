@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mattn/go-sqlite3"
 )
 
 func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
@@ -584,6 +586,148 @@ func TestEvolutionStoreCrossStoreDifferentTransitionsDoNotLoseUpdate(t *testing.
 	}
 }
 
+func TestEvolutionStoreDeterministicCreateLockConflictAndReplay(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "deterministic create lock")
+	lockAcquired := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var releaseOnce sync.Once
+	storeA := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{
+		afterBeginTx: func() error {
+			close(lockAcquired)
+			select {
+			case <-releaseLock:
+				return nil
+			case <-time.After(5 * time.Second):
+				return errors.New("timed out waiting to release create lock")
+			}
+		},
+	})
+	storeB := openEvolutionTestStoreAtRootWithOptions(t, root, evolutionStoreOpenOptions{
+		busyTimeout: 50 * time.Millisecond,
+	})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseLock) }) })
+	input := validEvolutionRunInput("deterministic-create-lock")
+	type createResult struct {
+		run     *EvolutionRun
+		created bool
+		err     error
+	}
+	resultA := make(chan createResult, 1)
+	go func() {
+		run, created, err := storeA.CreateRun(input)
+		resultA <- createResult{run: run, created: created, err: err}
+	}()
+	waitEvolutionTestSignal(t, lockAcquired, "store A create lock")
+	if _, _, err := storeB.CreateRun(input); !errors.Is(err, ErrEvolutionWriteConflict) {
+		t.Fatalf("store B locked CreateRun error = %v", err)
+	}
+	releaseOnce.Do(func() { close(releaseLock) })
+	var first createResult
+	select {
+	case first = <-resultA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("store A CreateRun did not finish")
+	}
+	if first.err != nil || !first.created {
+		t.Fatalf("store A CreateRun = %#v, created %v, error %v", first.run, first.created, first.err)
+	}
+	replayed, created, err := storeB.CreateRun(input)
+	if err != nil || created || replayed.RunID != first.run.RunID {
+		t.Fatalf("store B replay = %#v, created %v, error %v", replayed, created, err)
+	}
+	conflicting := input
+	conflicting.RiskLevel = "p0"
+	if _, _, err := storeB.CreateRun(conflicting); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("store B conflicting replay error = %v", err)
+	}
+	assertEvolutionStoreRunEventCounts(t, storeB, 1, 1)
+}
+
+func TestEvolutionStoreDeterministicTransitionLockConflictAndRetry(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "deterministic transition lock")
+	seedStore := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{})
+	run := createEvolutionTestRun(t, seedStore, "deterministic-transition-lock")
+	lockAcquired := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var releaseOnce sync.Once
+	storeA := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{
+		afterBeginTx: func() error {
+			close(lockAcquired)
+			select {
+			case <-releaseLock:
+				return nil
+			case <-time.After(5 * time.Second):
+				return errors.New("timed out waiting to release transition lock")
+			}
+		},
+	})
+	storeB := openEvolutionTestStoreAtRootWithOptions(t, root, evolutionStoreOpenOptions{
+		busyTimeout: 50 * time.Millisecond,
+	})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseLock) }) })
+	resultA := make(chan error, 1)
+	transition := EvolutionTransitionInput{Actor: "operator", Code: "triaged"}
+	go func() {
+		_, err := storeA.TransitionRun(run.RunID, EvolutionTriaged, transition)
+		resultA <- err
+	}()
+	waitEvolutionTestSignal(t, lockAcquired, "store A transition lock")
+	if _, err := storeB.TransitionRun(run.RunID, EvolutionTriaged, transition); !errors.Is(err, ErrEvolutionWriteConflict) {
+		t.Fatalf("store B locked TransitionRun error = %v", err)
+	}
+	releaseOnce.Do(func() { close(releaseLock) })
+	select {
+	case err := <-resultA:
+		if err != nil {
+			t.Fatalf("store A TransitionRun: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("store A TransitionRun did not finish")
+	}
+	if _, err := storeB.TransitionRun(run.RunID, EvolutionTriaged, transition); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("store B transition retry error = %v", err)
+	}
+	loaded, err := storeB.LoadRun(run.RunID)
+	if err != nil || loaded.Status != EvolutionTriaged {
+		t.Fatalf("loaded run = %#v, %v", loaded, err)
+	}
+	events, err := storeB.ListEvents(run.RunID, "", 100)
+	if err != nil || len(events) != 2 || events[1].ToStatus != EvolutionTriaged {
+		t.Fatalf("events = %#v, %v", events, err)
+	}
+}
+
+func TestEvolutionStoreWriteConflictPreservesSQLiteCause(t *testing.T) {
+	tests := []struct {
+		name string
+		err  sqlite3.Error
+	}{
+		{name: "busy", err: sqlite3.Error{Code: sqlite3.ErrBusy, ExtendedCode: sqlite3.ErrBusyRecovery}},
+		{name: "locked", err: sqlite3.Error{Code: sqlite3.ErrLocked, ExtendedCode: sqlite3.ErrLockedSharedCache}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			wrapped := wrapEvolutionSQLiteWriteError("test write", test.err)
+			if !errors.Is(wrapped, ErrEvolutionWriteConflict) {
+				t.Fatalf("error = %v, want write conflict", wrapped)
+			}
+			var cause sqlite3.Error
+			if !errors.As(wrapped, &cause) || cause.Code != test.err.Code || cause.ExtendedCode != test.err.ExtendedCode {
+				t.Fatalf("SQLite cause = %#v, want %#v", cause, test.err)
+			}
+		})
+	}
+	constraint := sqlite3.Error{Code: sqlite3.ErrConstraint, ExtendedCode: sqlite3.ErrConstraintForeignKey}
+	wrapped := wrapEvolutionSQLiteWriteError("test constraint", constraint)
+	if errors.Is(wrapped, ErrEvolutionWriteConflict) {
+		t.Fatalf("constraint normalized as write conflict: %v", wrapped)
+	}
+	var cause sqlite3.Error
+	if !errors.As(wrapped, &cause) || cause.ExtendedCode != sqlite3.ErrConstraintForeignKey {
+		t.Fatalf("constraint cause not preserved: %#v", cause)
+	}
+}
+
 func TestEvolutionStoreRejectsFutureSchemaWithoutModification(t *testing.T) {
 	root := t.TempDir()
 	store := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{})
@@ -682,7 +826,12 @@ func newEvolutionTestStoreWithHooks(t *testing.T, hooks evolutionStoreHooks) *Ev
 
 func openEvolutionTestStoreAtRoot(t *testing.T, root string, hooks evolutionStoreHooks) *EvolutionControlStore {
 	t.Helper()
-	store, err := openEvolutionControlStore(root, fixedEvolutionStoreClock(), hooks)
+	return openEvolutionTestStoreAtRootWithOptions(t, root, evolutionStoreOpenOptions{hooks: hooks})
+}
+
+func openEvolutionTestStoreAtRootWithOptions(t *testing.T, root string, options evolutionStoreOpenOptions) *EvolutionControlStore {
+	t.Helper()
+	store, err := openEvolutionControlStoreWithOptions(root, fixedEvolutionStoreClock(), options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -692,6 +841,15 @@ func openEvolutionTestStoreAtRoot(t *testing.T, root string, hooks evolutionStor
 		}
 	})
 	return store
+}
+
+func waitEvolutionTestSignal(t *testing.T, signal <-chan struct{}, label string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", label)
+	}
 }
 
 func fixedEvolutionStoreClock() func() time.Time {
