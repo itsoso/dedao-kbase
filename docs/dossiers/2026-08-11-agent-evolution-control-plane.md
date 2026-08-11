@@ -2,7 +2,8 @@
 
 **日期：** 2026-08-11
 
-**状态：** 已通过 G1、G2；第一层最终复裁与浏览器复验完成，G3 及后续 Gate 待裁决
+**状态：** 第一层已通过 G1-G6，并以 revision
+`389c5afe9506fc67b2ad73b5e216fd50f2edfbf4` 上线；第二层尚未开始
 
 **交付分支：** `codex/agent-evolution-control-plane`
 
@@ -39,8 +40,8 @@ Agent 能力演化与知识供给演化。系统可自动发现问题、生成�
 | G2 可行性与风险压测 | PASS | History 排序说明与后端 `created_at` 分页契约一致，详情文案与可访问性标签按视图区分；自动化门禁和真实浏览器复验均通过。 |
 | G3 测试 | PASS | 第一层发布范围的前端构建、全部桌面/Web smoke、`go vet ./...`、`go test ./... -timeout=300s -count=1`、部署静态/行为 smoke、隐私、系统地图和差异检查全部通过；后续层仍须各自重新过 Gate。 |
 | G4 评审 | PASS | 第一层经历多轮独立规格与代码质量复审；终态统计、scope 串数据、History 语义、全局 cursor 顺序及纳秒精度问题均修复后，最终规格与质量裁决均为 PASS。 |
-| G5 部署健康 | PENDING | 尚未部署；不得以预期输出代替健康证据。 |
-| G6 上线验证 | PENDING | 尚未上线；等待真实浏览器与生产闭环验证。 |
+| G5 部署健康 | PASS | 从干净 `main` 精确归档 revision `389c5af`，由生产服务账号使用 Go 1.25.12 与 Node 22.18.0 重复构建并通过前后端测试；双二进制 revision、独立 SHA-256 和生产配置检查通过。原子切换完成，loopback 与公网健康检查均返回精确 revision；KBase 与 Worker 均为 active、退出码 0、重启计数 0，切换后五分钟内无 warning。 |
+| G6 上线验证 | PASS | 已登录应用内浏览器在 `https://kbase.executor.life/agent-packages` 完成 1280×720 真实巡检：中文标题、紧凑首屏、四个视图、候选创建对话框、历史/规则/Fleet 导航均通过，无横向溢出；匿名演化 API 返回 401，认证请求返回 200。 |
 
 ## 第一层验收记录
 
@@ -134,12 +135,27 @@ EVOLUTION_FIXTURE_PORT=8897 EVOLUTION_FIXTURE_DELAY_MS=4000 \
 `view=history&tab=audit`，详情 region 与 tablist 的可访问名称分别为“演化历史详情”“审计详情”；
 Inbox 保持“返回待办队列”“线上版本对比”“任务详情”，返回链接仍指向 Inbox 默认详情页签。
 
-第一层 G3/G4 已通过；G5/G6 仍等待实际部署和线上验证。后续候选生成、评测、审批发布
-和观察闭环各层仍须重新执行自己的 G1-G6，不得继承本层结论，也不得把本地 fixture 巡检
-当作上线证据。
+### 第一层生产发布记录
+
+- 发布 revision：`389c5afe9506fc67b2ad73b5e216fd50f2edfbf4`。
+- 生产服务账号完成 `npm ci`、前端构建、全部桌面/Web smoke、部署静态与行为 smoke、
+  隐私和系统地图检查、`go mod verify`、`go vet ./...`、
+  `go test ./... -timeout=300s -count=1`，随后从同一源码构建 KBase 与 Worker。
+- Worker `build-info` 与 KBase `/health` 均绑定精确 revision；双二进制安装后 SHA-256 与候选
+  分别一致，Worker `check-config` 与 KBase `--check-config` 使用生产配置通过。
+- 切换脚本在替换前创建范围化备份，并对现有 SQLite 使用在线一致性备份；切换成功，未触发
+  自动回滚。loopback 与公网 `/health` 均返回新 revision，两个 systemd 服务均为 running、
+  `ExecMainStatus=0`、`NRestarts=0`。
+- 匿名 `/api/evolution/overview` 返回 401，使用既有共享 Token 的认证请求返回 200；没有新增
+  请求签名、没有改 Token、环境文件、Nginx 或下载内容。
+- 线上 1280×720 巡检确认：页面标题为“Agent 演化中心”，不存在旧 `Agent Packages` 标题，
+  四个中文视图和候选创建对话框均可操作，页面宽度与视口一致、无横向溢出。
+
+第一层 G1-G6 已全部通过。后续候选生成、评测、审批发布和观察闭环各层仍须重新执行自己的
+G1-G6，不得继承本层结论，也不得把本地 fixture 巡检当作上线证据。
 
 ## 当前断点
 
-任务 6 已通过 G1-G4，等待分层部署与线上 G5/G6；任务 7 尚未开始。
+任务 6（第一层）已完成并通过 G1-G6；任务 7（第二层：双环候选与自动评测）尚未开始。
 后续实施必须按实施计划顺序推进，并把每层的真实测试、评审、部署和线上证据追加到本
 dossier；失败或阻断必须原样记录并回到上游修复。
