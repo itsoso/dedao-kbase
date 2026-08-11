@@ -35,6 +35,7 @@ func TestEvolutionSignalIdempotencyReplayAndConflict(t *testing.T) {
 		t.Fatalf("changed replay error = %v", err)
 	}
 	assertEvolutionSignalCounts(t, store, 1, 1, 1)
+	assertEvolutionObservationCount(t, store, 1)
 }
 
 func TestEvolutionSignalIdempotencyFingerprintCoversEveryPayloadField(t *testing.T) {
@@ -106,6 +107,29 @@ func TestEvolutionSignalDeduplicatedRequestKeepsItsOwnIdempotencyFingerprint(t *
 		t.Fatalf("deduplicated changed replay error = %v", err)
 	}
 	assertEvolutionSignalCounts(t, store, 1, 1, 2)
+	assertEvolutionObservationCount(t, store, 2)
+	var severity string
+	var observedValue float64
+	var evidenceJSON, observedAt string
+	if err := store.db.QueryRow(`
+		SELECT severity, observed_value, evidence_refs_json, observed_at
+		FROM evolution_signal_observations WHERE request_key_hash = ?
+	`, evolutionSignalRequestKeyHash(second.IdempotencyKey)).Scan(&severity, &observedValue, &evidenceJSON, &observedAt); err != nil {
+		t.Fatal(err)
+	}
+	if severity != second.Severity || observedValue != second.ObservedValue ||
+		!strings.Contains(evidenceJSON, second.EvidenceRefs[0]) || observedAt != second.ObservedAt.Format(time.RFC3339Nano) {
+		t.Fatalf("secondary observation lost audit fields: %q %v %q %q", severity, observedValue, evidenceJSON, observedAt)
+	}
+	events, err := store.ListEvents(run.RunID, "", 100)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events = %#v, %v", events, err)
+	}
+	for _, event := range events {
+		if len(event.ArtifactRefs) != 0 {
+			t.Fatalf("timeline leaked internal mapping refs: %#v", event.ArtifactRefs)
+		}
+	}
 }
 
 func TestEvolutionSignalCooldownAggregatesAndThenCreatesNewRun(t *testing.T) {
@@ -212,6 +236,53 @@ func TestEvolutionSignalCrossStoreReplayAndAggregationDoNotDuplicateRuns(t *test
 	assertEvolutionSignalCounts(t, stores[0], 1, 1, 3)
 }
 
+func TestEvolutionSignalDeterministicWriteConflictAndReplay(t *testing.T) {
+	root := t.TempDir()
+	lockAcquired := make(chan struct{})
+	releaseLock := make(chan struct{})
+	var releaseOnce sync.Once
+	storeA := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{
+		afterBeginTx: func() error {
+			close(lockAcquired)
+			select {
+			case <-releaseLock:
+				return nil
+			case <-time.After(5 * time.Second):
+				return errors.New("timed out waiting to release signal lock")
+			}
+		},
+	})
+	storeB := openEvolutionTestStoreAtRootWithOptions(t, root, evolutionStoreOpenOptions{busyTimeout: 50 * time.Millisecond})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseLock) }) })
+	input := validEvolutionSignalInput("deterministic-signal-lock")
+	type result struct {
+		signal  *EvolutionSignal
+		run     *EvolutionRun
+		created bool
+		err     error
+	}
+	resultA := make(chan result, 1)
+	go func() {
+		signal, run, created, err := storeA.IngestSignal(input)
+		resultA <- result{signal: signal, run: run, created: created, err: err}
+	}()
+	waitEvolutionTestSignal(t, lockAcquired, "store A signal lock")
+	if _, _, _, err := storeB.IngestSignal(input); !errors.Is(err, ErrEvolutionWriteConflict) {
+		t.Fatalf("store B locked IngestSignal error = %v", err)
+	}
+	releaseOnce.Do(func() { close(releaseLock) })
+	first := <-resultA
+	if first.err != nil || !first.created {
+		t.Fatalf("store A ingest = %#v", first)
+	}
+	replayedSignal, replayedRun, created, err := storeB.IngestSignal(input)
+	if err != nil || created || replayedSignal.SignalID != first.signal.SignalID || replayedRun.RunID != first.run.RunID {
+		t.Fatalf("post-lock replay = %#v, %#v, %v, %v", replayedSignal, replayedRun, created, err)
+	}
+	assertEvolutionSignalCounts(t, storeB, 1, 1, 1)
+	assertEvolutionObservationCount(t, storeB, 1)
+}
+
 func TestEvolutionSignalReplayAndAggregationSurviveStoreReopen(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
@@ -275,8 +346,9 @@ func TestEvolutionSignalEventFailureRollsBackSignalRunAndMapping(t *testing.T) {
 		t.Fatalf("ingest error = %v", err)
 	}
 	assertEvolutionSignalCounts(t, store, 0, 0, 0)
+	assertEvolutionObservationCount(t, store, 0)
 	var mappings int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_events WHERE event_id = ?`, evolutionSignalRequestEventID(input.IdempotencyKey)).Scan(&mappings); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_signal_observations WHERE request_key_hash = ?`, evolutionSignalRequestKeyHash(input.IdempotencyKey)).Scan(&mappings); err != nil {
 		t.Fatal(err)
 	}
 	if mappings != 0 {
@@ -343,11 +415,12 @@ func TestEvolutionSignalAggregationEventFailureRollsBackEveryMutation(t *testing
 		t.Fatalf("aggregate rollback changed run:\nafter:  %#v\nbefore: %#v", after, before)
 	}
 	assertEvolutionSignalCounts(t, reopened, 1, 1, 1)
+	assertEvolutionObservationCount(t, reopened, 1)
 	var signals, mappings int
 	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM evolution_signals WHERE idempotency_key = ?`, knowledge.IdempotencyKey).Scan(&signals); err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM evolution_events WHERE event_id = ?`, evolutionSignalRequestEventID(knowledge.IdempotencyKey)).Scan(&mappings); err != nil {
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM evolution_signal_observations WHERE request_key_hash = ?`, evolutionSignalRequestKeyHash(knowledge.IdempotencyKey)).Scan(&mappings); err != nil {
 		t.Fatal(err)
 	}
 	if signals != 0 || mappings != 0 {
@@ -421,6 +494,101 @@ func TestEvolutionSignalRelatedAgentAndKnowledgeBecomeCombined(t *testing.T) {
 	if got := fmt.Sprint(combined.BaselineReleaseIDs); got != fmt.Sprintf("[%s]", releaseID) {
 		t.Fatalf("release identity = %s", got)
 	}
+}
+
+func TestEvolutionSignalKnowledgeRunCombinesWhenRelatedAgentArrives(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
+	knowledge := validEvolutionKnowledgeSignalInput("reverse-combined-knowledge", testEvolutionReleaseID("7"), "reverse-agent")
+	knowledge.ObservedAt = now
+	knowledgeSignal, knowledgeRun, _, err := store.IngestSignal(knowledge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	agent := validEvolutionSignalInput("reverse-combined-agent")
+	agent.PackageID = knowledge.PackageID
+	agent.ObservedAt = now
+	agentSignal, combined, _, err := store.IngestSignal(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if combined.RunID != knowledgeRun.RunID || combined.RunType != EvolutionRunCombined {
+		t.Fatalf("reverse combined run = %#v, knowledge = %#v", combined, knowledgeRun)
+	}
+	if got := fmt.Sprint(combined.TriggerSignalIDs); got != fmt.Sprintf("[%s %s]", knowledgeSignal.SignalID, agentSignal.SignalID) {
+		t.Fatalf("reverse combined trigger IDs = %s", got)
+	}
+}
+
+func TestEvolutionSignalCooldownBoundaryIsInclusive(t *testing.T) {
+	base := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name        string
+		age         time.Duration
+		wantSameRun bool
+	}{
+		{name: "exact boundary", age: EvolutionSignalCooldown, wantSameRun: true},
+		{name: "one nanosecond after", age: EvolutionSignalCooldown + time.Nanosecond, wantSameRun: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := base
+			store := newEvolutionSignalTestStore(t, func() time.Time { return now })
+			first := validEvolutionSignalInput("boundary-first-" + test.name)
+			first.ObservedAt = now
+			_, firstRun, _, err := store.IngestSignal(first)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now = base.Add(test.age)
+			second := first
+			second.IdempotencyKey = testEvolutionRequestID("boundary-second-" + test.name)
+			second.ObservedAt = now
+			_, secondRun, _, err := store.IngestSignal(second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := firstRun.RunID == secondRun.RunID; got != test.wantSameRun {
+				t.Fatalf("same run = %v, want %v", got, test.wantSameRun)
+			}
+		})
+	}
+}
+
+func TestEvolutionSignalScopeAndReplayQueriesUseIndexes(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
+	target := validEvolutionSignalInput("indexed-target")
+	target.PackageID = "indexed-target-agent"
+	target.ObservedAt = now
+	_, targetRun, _, err := store.IngestSignal(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 128; index++ {
+		unrelated := validEvolutionSignalInput(fmt.Sprintf("indexed-unrelated-%03d", index))
+		unrelated.PackageID = fmt.Sprintf("unrelated-agent-%03d", index)
+		unrelated.ObservedAt = now
+		if _, _, _, err := store.IngestSignal(unrelated); err != nil {
+			t.Fatal(err)
+		}
+	}
+	related := target
+	related.IdempotencyKey = testEvolutionRequestID("indexed-target-related")
+	related.ObservedValue = 0.41
+	_, aggregated, _, err := store.IngestSignal(related)
+	if err != nil || aggregated.RunID != targetRun.RunID {
+		t.Fatalf("indexed aggregate = %#v, %v", aggregated, err)
+	}
+
+	assertEvolutionQueryPlanUses(t, store, "idx_evolution_run_scopes_lookup", `
+		SELECT r.run_id FROM evolution_run_scopes AS scope
+		JOIN evolution_runs AS r ON r.run_id = scope.run_id
+		WHERE scope.scope_type = 'package' AND scope.scope_id = ?
+	`, target.PackageID)
+	assertEvolutionQueryPlanUses(t, store, "idx_evolution_signal_observations_request", `
+		SELECT run_id FROM evolution_signal_observations WHERE request_key_hash = ?
+	`, evolutionSignalRequestKeyHash(related.IdempotencyKey))
 }
 
 func TestEvolutionSignalUnrelatedIdentitiesDoNotAggregateOrCombine(t *testing.T) {
@@ -660,16 +828,20 @@ func TestEvolutionOverviewGroupsFleetAndSortsOpenRuns(t *testing.T) {
 	if agentA.Current == nil || agentA.Current.Version != "1.1.0" {
 		t.Fatalf("current agent-a = %#v", agentA.Current)
 	}
-	if got := agentPackageVersions(agentA.History); fmt.Sprint(got) != "[1.2.0 1.0.0]" {
+	if got := agentPackageVersions(agentA.History); fmt.Sprint(got) != "[1.0.0]" {
 		t.Fatalf("history = %v", got)
 	}
 	if got := evolutionRunIDs(agentA.OpenRuns); fmt.Sprint(got) != "[run-c run-b]" {
 		t.Fatalf("agent-a runs = %v", got)
 	}
 
-	page, err := PaginateEvolutionRuns(overview.OpenRuns, "run-c", 1)
-	if err != nil || len(page.Runs) != 1 || page.Runs[0].RunID != "run-b" || page.NextCursor != "" {
-		t.Fatalf("page = %#v, %v", page, err)
+	page, err := PaginateEvolutionRuns(overview.OpenRuns, "", 2)
+	if err != nil || fmt.Sprint(evolutionRunIDs(page.Runs)) != "[run-a run-b]" || page.NextCursor == "" {
+		t.Fatalf("page 1 = %#v, %v", page, err)
+	}
+	next, err := PaginateEvolutionRuns(overview.OpenRuns, page.NextCursor, 2)
+	if err != nil || fmt.Sprint(evolutionRunIDs(next.Runs)) != "[run-c]" || next.NextCursor != "" {
+		t.Fatalf("page 2 = %#v, %v", next, err)
 	}
 }
 
@@ -685,6 +857,89 @@ func TestEvolutionOverviewUsesRunIDAsFinalStableTieBreak(t *testing.T) {
 	if got := fmt.Sprint(evolutionRunIDs(overview.OpenRuns)); got != "[run-a run-z]" {
 		t.Fatalf("tie order = %s", got)
 	}
+}
+
+func TestEvolutionOverviewSortsParsedTimesFiltersHistoryAndClonesRuntime(t *testing.T) {
+	runtimeV2 := &AgentPackageRuntimeDescriptor{SchemaVersion: "agent-package.v2", PackageID: "time-agent", Version: "2.0.0", TimeoutMS: 2000}
+	records := []AgentPackageRecord{
+		{PackageID: "time-agent", Version: "1.0.0", LifecycleState: AgentPackagePublished, PublishedAt: "2026-08-11T12:00:00+02:00"},
+		{PackageID: "time-agent", Version: "2.0.0", LifecycleState: AgentPackagePublished, PublishedAt: "2026-08-11T10:00:00.1Z", Runtime: runtimeV2},
+		{PackageID: "time-agent", Version: "0.9.0", LifecycleState: AgentPackageSuperseded, PublishedAt: "2026-08-11T09:59:59.999999999Z"},
+		{PackageID: "time-agent", Version: "3.0.0", LifecycleState: AgentPackageDraft},
+	}
+	runs := []EvolutionRun{
+		validOverviewRun("run-offset", "time-agent", 50, "2026-08-11T12:00:00+02:00", EvolutionDetected),
+		validOverviewRun("run-fraction", "time-agent", 50, "2026-08-11T10:00:00.1Z", EvolutionDetected),
+	}
+	overview, err := BuildEvolutionOverview(records, runs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fleet := overview.AgentFleet[0]
+	if fleet.Current == nil || fleet.Current.Version != "2.0.0" {
+		t.Fatalf("current by parsed time = %#v", fleet.Current)
+	}
+	if got := fmt.Sprint(agentPackageVersions(fleet.History)); got != "[0.9.0]" {
+		t.Fatalf("history states = %s", got)
+	}
+	if got := fmt.Sprint(evolutionRunIDs(overview.OpenRuns)); got != "[run-offset run-fraction]" {
+		t.Fatalf("run time order = %s", got)
+	}
+	runtimeV2.TimeoutMS = 9999
+	if fleet.Current.Runtime == nil || fleet.Current.Runtime.TimeoutMS != 2000 {
+		t.Fatalf("runtime pointer was not deep-cloned: %#v", fleet.Current.Runtime)
+	}
+
+	invalid := records[:1]
+	invalid[0].PublishedAt = "not-a-time"
+	if _, err := BuildEvolutionOverview(invalid, nil); err == nil {
+		t.Fatal("invalid non-empty published_at was accepted")
+	}
+}
+
+func TestEvolutionRunListUsesImmutableKeysetWhenPriorityChanges(t *testing.T) {
+	now := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
+	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
+	runs := make([]*EvolutionRun, 0, 3)
+	for index := 0; index < 3; index++ {
+		input := validEvolutionSignalInput(fmt.Sprintf("keyset-run-%d", index))
+		input.PackageID = fmt.Sprintf("keyset-agent-%d", index)
+		input.ObservedAt = now
+		_, run, _, err := store.IngestSignal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		runs = append(runs, run)
+		now = now.Add(time.Hour)
+	}
+	page1, err := store.ListEvolutionRuns("", 1)
+	if err != nil || len(page1.Runs) != 1 || page1.Runs[0].RunID != runs[2].RunID || page1.NextCursor == "" {
+		t.Fatalf("page 1 = %#v, %v", page1, err)
+	}
+	if _, err := store.db.Exec(`UPDATE evolution_runs SET priority_score = 1 WHERE run_id = ?`, runs[2].RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE evolution_runs SET priority_score = 100 WHERE run_id = ?`, runs[1].RunID); err != nil {
+		t.Fatal(err)
+	}
+	page2, err := store.ListEvolutionRuns(page1.NextCursor, 2)
+	if err != nil || fmt.Sprint(evolutionRunIDs(page2.Runs)) != fmt.Sprintf("[%s %s]", runs[1].RunID, runs[0].RunID) {
+		t.Fatalf("page 2 = %#v, %v", page2, err)
+	}
+	if _, err := store.ListEvolutionRuns("not-base64", 1); err == nil {
+		t.Fatal("malformed keyset cursor was accepted")
+	}
+	missingCursor, err := encodeEvolutionRunCursor(time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC).UnixNano(), "run-missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ListEvolutionRuns(missingCursor, 1); !errors.Is(err, ErrEvolutionRunCursorNotFound) {
+		t.Fatalf("missing keyset cursor error = %v", err)
+	}
+	assertEvolutionQueryPlanUses(t, store, "idx_evolution_runs_created_ns", `
+		SELECT run_id FROM evolution_runs
+		ORDER BY created_at_unix_nano DESC, run_id ASC LIMIT 2
+	`)
 }
 
 func validEvolutionSignalInput(key string) EvolutionSignalInput {
@@ -755,6 +1010,45 @@ func assertEvolutionSignalCounts(t *testing.T, store *EvolutionControlStore, wan
 		if got != want {
 			t.Fatalf("%s count = %d, want %d", table, got, want)
 		}
+	}
+}
+
+func assertEvolutionObservationCount(t *testing.T, store *EvolutionControlStore, want int) {
+	t.Helper()
+	var got int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_signal_observations`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("evolution_signal_observations count = %d, want %d", got, want)
+	}
+}
+
+func assertEvolutionQueryPlanUses(t *testing.T, store *EvolutionControlStore, indexName, query string, args ...any) {
+	t.Helper()
+	rows, err := store.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(details, "\n")
+	if !strings.Contains(joined, indexName) {
+		t.Fatalf("query plan did not use %s:\n%s", indexName, joined)
+	}
+	if strings.Contains(joined, "SCAN r") {
+		t.Fatalf("query plan scanned evolution_runs:\n%s", joined)
 	}
 }
 

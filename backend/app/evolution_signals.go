@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"sort"
 	"strings"
@@ -93,6 +95,11 @@ type EvolutionRunPage struct {
 	NextCursor string         `json:"next_cursor"`
 }
 
+type evolutionRunCursor struct {
+	CreatedAtUnixNano int64  `json:"created_at_unix_nano"`
+	RunID             string `json:"run_id"`
+}
+
 type EvolutionAgentFleetProjection struct {
 	PackageID string               `json:"package_id"`
 	Current   *AgentPackageRecord  `json:"current"`
@@ -112,6 +119,25 @@ type normalizedEvolutionSignalInput struct {
 	BaselineValue  float64  `json:"baseline_value"`
 	EvidenceRefs   []string `json:"evidence_refs"`
 	ObservedAt     string   `json:"observed_at"`
+}
+
+type EvolutionSignalObservation struct {
+	ObservationID  string   `json:"observation_id"`
+	RequestKeyHash string   `json:"request_key_hash"`
+	InputHash      string   `json:"input_hash"`
+	SignalID       string   `json:"signal_id"`
+	RunID          string   `json:"run_id"`
+	SignalType     string   `json:"signal_type"`
+	SourceType     string   `json:"source_type"`
+	SourceID       string   `json:"source_id"`
+	PackageID      string   `json:"package_id"`
+	ReleaseID      string   `json:"release_id"`
+	Severity       string   `json:"severity"`
+	ObservedValue  float64  `json:"observed_value"`
+	BaselineValue  float64  `json:"baseline_value"`
+	EvidenceRefs   []string `json:"evidence_refs"`
+	ObservedAt     string   `json:"observed_at"`
+	CreatedAt      string   `json:"created_at"`
 }
 
 // CalculateEvolutionPriority gives risk the strongest influence, followed by
@@ -164,35 +190,19 @@ func (s *EvolutionControlStore) IngestSignal(input EvolutionSignalInput) (*Evolu
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	replayed, err := loadEvolutionSignalByIdempotencyKey(tx, normalized.IdempotencyKey)
+	requestKeyHash := evolutionSignalRequestKeyHash(normalized.IdempotencyKey)
+	observation, err := loadEvolutionSignalObservationByRequestHashTx(tx, requestKeyHash)
 	if err == nil {
-		replayedInput, err := evolutionSignalInputFromStored(replayed, normalized.IdempotencyKey)
+		if observation.InputHash != fingerprint {
+			return nil, nil, false, ErrEvolutionIdempotencyConflict
+		}
+		replayed, err := loadEvolutionSignalByID(tx, observation.SignalID)
 		if err != nil {
 			return nil, nil, false, err
 		}
-		_, storedFingerprint, _, _, err := normalizeEvolutionSignalInput(replayedInput)
-		if err != nil {
-			return nil, nil, false, fmt.Errorf("normalize stored evolution signal: %w", err)
-		}
-		if storedFingerprint != fingerprint {
-			return nil, nil, false, ErrEvolutionIdempotencyConflict
-		}
-		run, err := loadEarliestEvolutionRunForSignalTx(tx, replayed.SignalID)
+		replayedRun, err := scanEvolutionRun(tx.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, observation.RunID))
 		if err != nil {
 			return nil, nil, false, err
-		}
-		if err := tx.Commit(); err != nil {
-			return nil, nil, false, wrapEvolutionSQLiteWriteError("commit evolution signal replay", err)
-		}
-		return cloneEvolutionSignal(replayed), cloneEvolutionRun(run), false, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, false, fmt.Errorf("find evolution signal replay: %w", err)
-	}
-	replayed, replayedRun, storedFingerprint, err := loadEvolutionSignalReplayEventTx(tx, normalized.IdempotencyKey)
-	if err == nil {
-		if storedFingerprint != fingerprint {
-			return nil, nil, false, ErrEvolutionIdempotencyConflict
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, nil, false, wrapEvolutionSQLiteWriteError("commit evolution signal replay", err)
@@ -200,7 +210,7 @@ func (s *EvolutionControlStore) IngestSignal(input EvolutionSignalInput) (*Evolu
 		return cloneEvolutionSignal(replayed), cloneEvolutionRun(replayedRun), false, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, false, fmt.Errorf("find evolution signal event replay: %w", err)
+		return nil, nil, false, fmt.Errorf("find evolution signal observation replay: %w", err)
 	}
 
 	signal, err := loadEvolutionSignalByDeduplicationKey(tx, deduplicationKey)
@@ -216,7 +226,7 @@ func (s *EvolutionControlStore) IngestSignal(input EvolutionSignalInput) (*Evolu
 			Severity: normalized.Severity, ObservedValue: normalized.ObservedValue, BaselineValue: normalized.BaselineValue,
 			DeduplicationKey: deduplicationKey, EvidenceRefs: append([]string{}, normalized.EvidenceRefs...), ObservedAt: normalized.ObservedAt,
 		}
-		if err := insertEvolutionSignalTx(tx, normalized.IdempotencyKey, signal, timestamp); err != nil {
+		if err := insertEvolutionSignalTx(tx, requestKeyHash, signal, timestamp); err != nil {
 			return nil, nil, false, err
 		}
 		created = true
@@ -229,11 +239,14 @@ func (s *EvolutionControlStore) IngestSignal(input EvolutionSignalInput) (*Evolu
 		return nil, nil, false, err
 	}
 	if run == nil {
-		run, err = s.createEvolutionRunForSignalTx(tx, normalized, runType, signal.SignalID, fingerprint, timestamp, now)
+		run, err = s.createEvolutionRunForSignalTx(tx, normalized, runType, signal.SignalID, timestamp, now)
 	} else {
-		run, err = s.aggregateEvolutionSignalTx(tx, run, normalized, runType, signal.SignalID, fingerprint, timestamp, now)
+		run, err = s.aggregateEvolutionSignalTx(tx, run, normalized, runType, signal.SignalID, timestamp, now)
 	}
 	if err != nil {
+		return nil, nil, false, err
+	}
+	if err := insertEvolutionSignalObservationTx(tx, normalized, requestKeyHash, fingerprint, signal.SignalID, run.RunID, timestamp); err != nil {
 		return nil, nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -279,9 +292,6 @@ func normalizeEvolutionSignalInput(input EvolutionSignalInput) (normalizedEvolut
 	}
 	if !isAllowedEvolutionSignalSeverity(normalized.Severity) {
 		return normalizedEvolutionSignalInput{}, "", "", "", fmt.Errorf("unsupported evolution severity %q", normalized.Severity)
-	}
-	if err := validateEvolutionIdentity("source_id", normalized.SourceID); err != nil {
-		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
 	if err := validateEvolutionIdentity("source_id", normalized.SourceID); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
@@ -344,12 +354,15 @@ func normalizeEvolutionSignalInput(input EvolutionSignalInput) (normalizedEvolut
 	return normalized, hex.EncodeToString(fingerprintDigest[:]), deduplicationKey, runType, nil
 }
 
-func (s *EvolutionControlStore) createEvolutionRunForSignalTx(tx *sql.Tx, input normalizedEvolutionSignalInput, runType EvolutionRunType, signalID, fingerprint, timestamp string, now time.Time) (*EvolutionRun, error) {
+func (s *EvolutionControlStore) createEvolutionRunForSignalTx(tx *sql.Tx, input normalizedEvolutionSignalInput, runType EvolutionRunType, signalID, timestamp string, now time.Time) (*EvolutionRun, error) {
 	runID, err := newEvolutionStoreID("run")
 	if err != nil {
 		return nil, err
 	}
-	eventID := evolutionSignalRequestEventID(input.IdempotencyKey)
+	eventID, err := newEvolutionStoreID("event")
+	if err != nil {
+		return nil, err
+	}
 	priority, err := evolutionSignalPriority(input, now, now)
 	if err != nil {
 		return nil, err
@@ -383,7 +396,7 @@ func (s *EvolutionControlStore) createEvolutionRunForSignalTx(tx *sql.Tx, input 
 	event := EvolutionEvent{
 		EventID: eventID, RunID: run.RunID, EventType: "created", Actor: "control-plane",
 		ToStatus: EvolutionDetected, Code: evolutionSignalReasonIngested,
-		ArtifactRefs: evolutionSignalReplayRefs(fingerprint, signalID), CreatedAt: timestamp,
+		ArtifactRefs: []string{}, CreatedAt: timestamp,
 	}
 	if err := s.insertEvolutionRunTx(tx, runInput.IdempotencyKey, inputHash, run, event); err != nil {
 		return nil, err
@@ -391,7 +404,7 @@ func (s *EvolutionControlStore) createEvolutionRunForSignalTx(tx *sql.Tx, input 
 	return run, nil
 }
 
-func (s *EvolutionControlStore) aggregateEvolutionSignalTx(tx *sql.Tx, run *EvolutionRun, input normalizedEvolutionSignalInput, incomingType EvolutionRunType, signalID, fingerprint, timestamp string, now time.Time) (*EvolutionRun, error) {
+func (s *EvolutionControlStore) aggregateEvolutionSignalTx(tx *sql.Tx, run *EvolutionRun, input normalizedEvolutionSignalInput, incomingType EvolutionRunType, signalID, timestamp string, now time.Time) (*EvolutionRun, error) {
 	createdAt, err := parseEvolutionTimestamp("created_at", run.CreatedAt)
 	if err != nil {
 		return nil, err
@@ -427,15 +440,23 @@ func (s *EvolutionControlStore) aggregateEvolutionSignalTx(tx *sql.Tx, run *Evol
 	}
 	if _, err := tx.Exec(`
 		UPDATE evolution_runs SET run_type = ?, baseline_release_ids_json = ?, risk_level = ?,
-			priority_score = ?, trigger_signal_ids_json = ?, updated_at = ? WHERE run_id = ?
-	`, run.RunType, string(baselineReleasesJSON), run.RiskLevel, run.PriorityScore, string(triggerSignalsJSON), run.UpdatedAt, run.RunID); err != nil {
+			priority_score = ?, trigger_signal_ids_json = ?, updated_at = ?, updated_at_unix_nano = ?
+		WHERE run_id = ?
+	`, run.RunType, string(baselineReleasesJSON), run.RiskLevel, run.PriorityScore,
+		string(triggerSignalsJSON), run.UpdatedAt, now.UnixNano(), run.RunID); err != nil {
 		return nil, fmt.Errorf("update aggregated evolution run: %w", err)
 	}
-	eventID := evolutionSignalRequestEventID(input.IdempotencyKey)
+	if err := insertEvolutionRunScopesTx(tx, run); err != nil {
+		return nil, err
+	}
+	eventID, err := newEvolutionStoreID("event")
+	if err != nil {
+		return nil, err
+	}
 	event := EvolutionEvent{
 		EventID: eventID, RunID: run.RunID, EventType: "signal_aggregated", Actor: "control-plane",
 		Code: evolutionSignalReasonAggregated, Message: "signal aggregated",
-		ArtifactRefs: evolutionSignalReplayRefs(fingerprint, signalID), CreatedAt: timestamp,
+		ArtifactRefs: []string{}, CreatedAt: timestamp,
 	}
 	if err := event.Validate(); err != nil {
 		return nil, err
@@ -456,54 +477,70 @@ func evolutionSignalPriority(input normalizedEvolutionSignalInput, waitingSince,
 }
 
 func findEvolutionRunForAggregationTx(tx *sql.Tx, input normalizedEvolutionSignalInput, runType EvolutionRunType, now time.Time) (*EvolutionRun, error) {
-	rows, err := tx.Query(evolutionRunSelect + ` ORDER BY updated_at DESC, run_id ASC`)
-	if err != nil {
-		return nil, fmt.Errorf("list evolution runs for signal aggregation: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		run, err := scanEvolutionRun(rows)
-		if err != nil {
-			return nil, err
+	cutoff := now.Add(-EvolutionSignalCooldown).UnixNano()
+	switch runType {
+	case EvolutionRunAgentPolicy:
+		if input.PackageID == "" {
+			return nil, nil
 		}
-		if isTerminalEvolutionRunStatus(run.Status) || !evolutionSignalScopeMatchesRun(input, runType, run) {
-			continue
+		return loadEvolutionRunByScopeTx(tx, "package", input.PackageID, cutoff, now.UnixNano(), "agent")
+	case EvolutionRunKnowledgeRelease:
+		if input.ReleaseID != "" {
+			run, err := loadEvolutionRunByScopeTx(tx, "release", input.ReleaseID, cutoff, now.UnixNano(), "knowledge")
+			if err != nil || run != nil {
+				return run, err
+			}
 		}
-		updatedAt, err := parseEvolutionTimestamp("updated_at", run.UpdatedAt)
-		if err != nil {
-			return nil, err
+		if input.PackageID != "" {
+			// A new Release can combine only with a pure Agent run carrying the same Package scope.
+			return loadEvolutionRunByScopeTx(tx, "package", input.PackageID, cutoff, now.UnixNano(), "pure_agent")
 		}
-		age := now.Sub(updatedAt)
-		if age >= 0 && age <= EvolutionSignalCooldown {
-			return run, nil
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate evolution runs for signal aggregation: %w", err)
 	}
 	return nil, nil
 }
 
-func evolutionSignalScopeMatchesRun(input normalizedEvolutionSignalInput, runType EvolutionRunType, run *EvolutionRun) bool {
-	samePackage := input.PackageID != "" && run.PackageID != "" && input.PackageID == run.PackageID
-	switch runType {
-	case EvolutionRunAgentPolicy:
-		switch run.RunType {
-		case EvolutionRunAgentPolicy, EvolutionRunCombined:
-			return samePackage
-		case EvolutionRunKnowledgeRelease:
-			// Cross-domain aggregation needs the explicit Package identity on both sides.
-			return samePackage
-		}
-	case EvolutionRunKnowledgeRelease:
-		if run.RunType == EvolutionRunAgentPolicy {
-			// A knowledge signal can promote an Agent run only with an explicit Package relation.
-			return samePackage
-		}
-		packageCompatible := input.PackageID == "" || run.PackageID == "" || samePackage
-		return packageCompatible && containsEvolutionReference(run.BaselineReleaseIDs, input.ReleaseID)
+const evolutionScopedRunSelect = `
+	SELECT r.run_id, r.attempt, r.retry_of_run_id, r.run_type, r.package_id,
+		r.baseline_package_version, r.baseline_release_ids_json, r.risk_level,
+		r.priority_score, r.status, r.trigger_signal_ids_json, r.current_candidate_id,
+		r.failure_code, r.failure_message, r.created_at, r.updated_at
+	FROM evolution_run_scopes AS scope
+	JOIN evolution_runs AS r ON r.run_id = scope.run_id`
+
+func loadEvolutionRunByScopeTx(tx *sql.Tx, scopeType, scopeID string, cutoffNS, nowNS int64, mode string) (*EvolutionRun, error) {
+	base := evolutionScopedRunSelect + `
+		WHERE scope.scope_type = ? AND scope.scope_id = ?
+			AND r.updated_at_unix_nano BETWEEN ? AND ?
+			AND r.status NOT IN (?, ?, ?, ?, ?, ?)`
+	args := []any{scopeType, scopeID, cutoffNS, nowNS,
+		EvolutionCompleted, EvolutionBlocked, EvolutionRejected,
+		EvolutionFailed, EvolutionSuperseded, EvolutionRolledBack}
+	switch mode {
+	case "agent":
+		base += ` AND r.run_type IN (?, ?, ?)
+			ORDER BY CASE r.run_type WHEN ? THEN 0 WHEN ? THEN 1 ELSE 2 END,
+				r.updated_at_unix_nano DESC, r.run_id ASC LIMIT 1`
+		args = append(args, EvolutionRunAgentPolicy, EvolutionRunCombined, EvolutionRunKnowledgeRelease,
+			EvolutionRunAgentPolicy, EvolutionRunCombined)
+	case "knowledge":
+		base += ` AND r.run_type IN (?, ?)
+			ORDER BY r.updated_at_unix_nano DESC, r.run_id ASC LIMIT 1`
+		args = append(args, EvolutionRunKnowledgeRelease, EvolutionRunCombined)
+	case "pure_agent":
+		base += ` AND r.run_type = ?
+			ORDER BY r.updated_at_unix_nano DESC, r.run_id ASC LIMIT 1`
+		args = append(args, EvolutionRunAgentPolicy)
+	default:
+		return nil, fmt.Errorf("unknown evolution scope query mode %q", mode)
 	}
-	return false
+	run, err := scanEvolutionRun(tx.QueryRow(base, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load evolution aggregation scope: %w", err)
+	}
+	return run, nil
 }
 
 func insertEvolutionSignalTx(tx *sql.Tx, idempotencyKey string, signal *EvolutionSignal, timestamp string) error {
@@ -530,52 +567,12 @@ const evolutionSignalSelect = `
 		severity, observed_value, baseline_value, deduplication_key, evidence_refs_json, observed_at
 	FROM evolution_signals`
 
-func loadEvolutionSignalByIdempotencyKey(tx *sql.Tx, key string) (*EvolutionSignal, error) {
-	return scanEvolutionSignal(tx.QueryRow(evolutionSignalSelect+` WHERE idempotency_key = ?`, key))
-}
-
 func loadEvolutionSignalByDeduplicationKey(tx *sql.Tx, key string) (*EvolutionSignal, error) {
 	return scanEvolutionSignal(tx.QueryRow(evolutionSignalSelect+` WHERE deduplication_key = ?`, key))
 }
 
 func loadEvolutionSignalByID(tx *sql.Tx, signalID string) (*EvolutionSignal, error) {
 	return scanEvolutionSignal(tx.QueryRow(evolutionSignalSelect+` WHERE signal_id = ?`, signalID))
-}
-
-func loadEvolutionSignalReplayEventTx(tx *sql.Tx, idempotencyKey string) (*EvolutionSignal, *EvolutionRun, string, error) {
-	event, err := scanEvolutionEvent(tx.QueryRow(`
-		SELECT event_id, run_id, event_type, actor, from_status, to_status, code,
-			message, artifact_refs_json, created_at
-		FROM evolution_events
-		WHERE event_id = ?
-	`, evolutionSignalRequestEventID(idempotencyKey)))
-	if err != nil {
-		return nil, nil, "", err
-	}
-	fingerprint, signalID := "", ""
-	for _, ref := range event.ArtifactRefs {
-		switch {
-		case strings.HasPrefix(ref, "input-sha256:"):
-			fingerprint = strings.TrimPrefix(ref, "input-sha256:")
-		case strings.HasPrefix(ref, "signal-id:"):
-			signalID = strings.TrimPrefix(ref, "signal-id:")
-		}
-	}
-	if fingerprint == "" || signalID == "" {
-		return nil, nil, "", fmt.Errorf("evolution signal replay event %q is incomplete", event.EventID)
-	}
-	signal, err := loadEvolutionSignalByID(tx, signalID)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	run, err := scanEvolutionRun(tx.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, event.RunID))
-	if err != nil {
-		return nil, nil, "", err
-	}
-	if !containsEvolutionReference(run.TriggerSignalIDs, signalID) {
-		return nil, nil, "", fmt.Errorf("evolution signal replay event %q does not match its run", event.EventID)
-	}
-	return signal, run, fingerprint, nil
 }
 
 func scanEvolutionSignal(scanner evolutionRowScanner) (*EvolutionSignal, error) {
@@ -600,38 +597,51 @@ func scanEvolutionSignal(scanner evolutionRowScanner) (*EvolutionSignal, error) 
 	return &signal, nil
 }
 
-func evolutionSignalInputFromStored(signal *EvolutionSignal, idempotencyKey string) (EvolutionSignalInput, error) {
-	observedAt, err := parseEvolutionTimestamp("observed_at", signal.ObservedAt)
+func insertEvolutionSignalObservationTx(tx *sql.Tx, input normalizedEvolutionSignalInput, requestKeyHash, inputHash, signalID, runID, timestamp string) error {
+	observationID, err := newEvolutionStoreID("observation")
 	if err != nil {
-		return EvolutionSignalInput{}, err
+		return err
 	}
-	return EvolutionSignalInput{
-		IdempotencyKey: idempotencyKey, SignalType: signal.SignalType, SourceType: signal.SourceType,
-		SourceID: signal.SourceID, PackageID: signal.PackageID, ReleaseID: signal.ReleaseID,
-		Severity: signal.Severity, ObservedValue: signal.ObservedValue, BaselineValue: signal.BaselineValue,
-		EvidenceRefs: append([]string{}, signal.EvidenceRefs...), ObservedAt: observedAt,
-	}, nil
+	evidenceJSON, err := json.Marshal(input.EvidenceRefs)
+	if err != nil {
+		return fmt.Errorf("encode evolution signal observation evidence: %w", err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_signal_observations (
+			observation_id, request_key_hash, input_hash, signal_id, run_id,
+			signal_type, source_type, source_id, package_id, release_id, severity,
+			observed_value, baseline_value, evidence_refs_json, observed_at, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, observationID, requestKeyHash, inputHash, signalID, runID, input.SignalType,
+		input.SourceType, input.SourceID, input.PackageID, input.ReleaseID, input.Severity,
+		input.ObservedValue, input.BaselineValue, string(evidenceJSON), input.ObservedAt, timestamp); err != nil {
+		return fmt.Errorf("insert evolution signal observation: %w", err)
+	}
+	return nil
 }
 
-func loadEarliestEvolutionRunForSignalTx(tx *sql.Tx, signalID string) (*EvolutionRun, error) {
-	rows, err := tx.Query(evolutionRunSelect + ` ORDER BY created_at ASC, run_id ASC`)
-	if err != nil {
+func loadEvolutionSignalObservationByRequestHashTx(tx *sql.Tx, requestKeyHash string) (*EvolutionSignalObservation, error) {
+	var observation EvolutionSignalObservation
+	var evidenceJSON string
+	if err := tx.QueryRow(`
+		SELECT observation_id, request_key_hash, input_hash, signal_id, run_id,
+			signal_type, source_type, source_id, package_id, release_id, severity,
+			observed_value, baseline_value, evidence_refs_json, observed_at, created_at
+		FROM evolution_signal_observations WHERE request_key_hash = ?
+	`, requestKeyHash).Scan(
+		&observation.ObservationID, &observation.RequestKeyHash, &observation.InputHash,
+		&observation.SignalID, &observation.RunID, &observation.SignalType,
+		&observation.SourceType, &observation.SourceID, &observation.PackageID,
+		&observation.ReleaseID, &observation.Severity, &observation.ObservedValue,
+		&observation.BaselineValue, &evidenceJSON, &observation.ObservedAt,
+		&observation.CreatedAt,
+	); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		run, err := scanEvolutionRun(rows)
-		if err != nil {
-			return nil, err
-		}
-		if containsEvolutionReference(run.TriggerSignalIDs, signalID) {
-			return run, nil
-		}
+	if err := json.Unmarshal([]byte(evidenceJSON), &observation.EvidenceRefs); err != nil {
+		return nil, fmt.Errorf("decode evolution signal observation evidence: %w", err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return nil, fmt.Errorf("signal %q has no evolution run", signalID)
+	return &observation, nil
 }
 
 func BuildEvolutionOverview(records []AgentPackageRecord, runs []EvolutionRun) (*EvolutionOverview, error) {
@@ -652,14 +662,22 @@ func BuildEvolutionOverview(records []AgentPackageRecord, runs []EvolutionRun) (
 			openRuns = append(openRuns, *run)
 		}
 	}
-	sortEvolutionRuns(openRuns)
+	if err := sortEvolutionRuns(openRuns); err != nil {
+		return nil, err
+	}
 	overview.OpenRuns = openRuns
 	overview.TotalOpenRuns = len(openRuns)
 
 	grouped := make(map[string][]AgentPackageRecord)
-	for _, record := range records {
+	for _, source := range records {
+		record := cloneAgentPackageRecord(source)
 		if err := validateEvolutionIdentity("package_id", record.PackageID); err != nil {
 			return nil, err
+		}
+		if record.PublishedAt != "" {
+			if _, err := parseEvolutionTimestamp("published_at", record.PublishedAt); err != nil {
+				return nil, fmt.Errorf("invalid agent package %q version %q: %w", record.PackageID, record.Version, err)
+			}
 		}
 		grouped[record.PackageID] = append(grouped[record.PackageID], record)
 	}
@@ -681,17 +699,19 @@ func BuildEvolutionOverview(records []AgentPackageRecord, runs []EvolutionRun) (
 			}
 		}
 		if currentIndex >= 0 {
-			current := packageRecords[currentIndex]
+			current := cloneAgentPackageRecord(packageRecords[currentIndex])
 			fleet.Current = &current
 		}
 		for index, record := range packageRecords {
-			if index != currentIndex {
-				fleet.History = append(fleet.History, record)
+			if index != currentIndex && record.LifecycleState == AgentPackageSuperseded {
+				fleet.History = append(fleet.History, cloneAgentPackageRecord(record))
 			}
 		}
 		sort.SliceStable(fleet.History, func(i, j int) bool {
-			if fleet.History[i].PublishedAt != fleet.History[j].PublishedAt {
-				return fleet.History[i].PublishedAt > fleet.History[j].PublishedAt
+			left, _ := parseOptionalEvolutionTimestamp(fleet.History[i].PublishedAt)
+			right, _ := parseOptionalEvolutionTimestamp(fleet.History[j].PublishedAt)
+			if !left.Equal(right) {
+				return left.After(right)
 			}
 			return fleet.History[i].Version > fleet.History[j].Version
 		})
@@ -714,11 +734,63 @@ func (s *EvolutionControlStore) EvolutionOverview(records []AgentPackageRecord) 
 }
 
 func (s *EvolutionControlStore) ListEvolutionRuns(after string, limit int) (*EvolutionRunPage, error) {
-	runs, err := s.listAllEvolutionRuns()
+	limit, err := normalizeEvolutionRunLimit(limit)
 	if err != nil {
 		return nil, err
 	}
-	return PaginateEvolutionRuns(runs, after, limit)
+	var cursor evolutionRunCursor
+	if after != "" {
+		cursor, err = decodeEvolutionRunCursor(after)
+		if err != nil {
+			return nil, err
+		}
+		var exists int
+		err = s.db.QueryRow(`SELECT 1 FROM evolution_runs WHERE run_id = ? AND created_at_unix_nano = ?`, cursor.RunID, cursor.CreatedAtUnixNano).Scan(&exists)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrEvolutionRunCursorNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("validate evolution run cursor: %w", err)
+		}
+	}
+	query := evolutionRunSelect
+	args := make([]any, 0, 4)
+	if after != "" {
+		query += ` WHERE created_at_unix_nano < ? OR (created_at_unix_nano = ? AND run_id > ?)`
+		args = append(args, cursor.CreatedAtUnixNano, cursor.CreatedAtUnixNano, cursor.RunID)
+	}
+	query += ` ORDER BY created_at_unix_nano DESC, run_id ASC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list evolution runs page: %w", err)
+	}
+	defer rows.Close()
+	runs := make([]EvolutionRun, 0, limit+1)
+	for rows.Next() {
+		run, err := scanEvolutionRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, *run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate evolution runs page: %w", err)
+	}
+	page := &EvolutionRunPage{Runs: runs}
+	if len(page.Runs) > limit {
+		page.Runs = page.Runs[:limit]
+		last := page.Runs[len(page.Runs)-1]
+		createdAt, err := parseEvolutionTimestamp("created_at", last.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		page.NextCursor, err = encodeEvolutionRunCursor(createdAt.UnixNano(), last.RunID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return page, nil
 }
 
 func (s *EvolutionControlStore) listAllEvolutionRuns() ([]EvolutionRun, error) {
@@ -738,35 +810,34 @@ func (s *EvolutionControlStore) listAllEvolutionRuns() ([]EvolutionRun, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate evolution runs: %w", err)
 	}
-	sortEvolutionRuns(runs)
+	if err := sortEvolutionRuns(runs); err != nil {
+		return nil, err
+	}
 	return runs, nil
 }
 
 func PaginateEvolutionRuns(runs []EvolutionRun, after string, limit int) (*EvolutionRunPage, error) {
-	if after != "" {
-		if err := validateEvolutionIdentity("after", after); err != nil {
-			return nil, err
-		}
-	}
-	if limit < 0 {
-		return nil, fmt.Errorf("run limit must not be negative")
-	}
-	if limit == 0 {
-		limit = evolutionRunPageDefaultLimit
-	}
-	if limit > evolutionRunPageMaxLimit {
-		return nil, fmt.Errorf("run limit exceeds %d", evolutionRunPageMaxLimit)
+	limit, err := normalizeEvolutionRunLimit(limit)
+	if err != nil {
+		return nil, err
 	}
 	ordered := make([]EvolutionRun, len(runs))
 	for index := range runs {
 		ordered[index] = *cloneEvolutionRun(&runs[index])
 	}
-	sortEvolutionRuns(ordered)
+	if err := sortEvolutionRunsByCreated(ordered); err != nil {
+		return nil, err
+	}
 	start := 0
 	if after != "" {
+		cursor, err := decodeEvolutionRunCursor(after)
+		if err != nil {
+			return nil, err
+		}
 		start = -1
 		for index := range ordered {
-			if ordered[index].RunID == after {
+			createdAt, _ := parseEvolutionTimestamp("created_at", ordered[index].CreatedAt)
+			if ordered[index].RunID == cursor.RunID && createdAt.UnixNano() == cursor.CreatedAtUnixNano {
 				start = index + 1
 				break
 			}
@@ -781,28 +852,126 @@ func PaginateEvolutionRuns(runs []EvolutionRun, after string, limit int) (*Evolu
 	}
 	page := &EvolutionRunPage{Runs: append([]EvolutionRun{}, ordered[start:end]...)}
 	if end < len(ordered) && end > start {
-		page.NextCursor = ordered[end-1].RunID
+		last := ordered[end-1]
+		createdAt, _ := parseEvolutionTimestamp("created_at", last.CreatedAt)
+		page.NextCursor, err = encodeEvolutionRunCursor(createdAt.UnixNano(), last.RunID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return page, nil
 }
 
-func sortEvolutionRuns(runs []EvolutionRun) {
+func normalizeEvolutionRunLimit(limit int) (int, error) {
+	if limit < 0 {
+		return 0, fmt.Errorf("run limit must not be negative")
+	}
+	if limit == 0 {
+		return evolutionRunPageDefaultLimit, nil
+	}
+	if limit > evolutionRunPageMaxLimit {
+		return 0, fmt.Errorf("run limit exceeds %d", evolutionRunPageMaxLimit)
+	}
+	return limit, nil
+}
+
+func encodeEvolutionRunCursor(createdAtUnixNano int64, runID string) (string, error) {
+	if err := validateEvolutionIdentity("run_id", runID); err != nil {
+		return "", err
+	}
+	payload, err := json.Marshal(evolutionRunCursor{CreatedAtUnixNano: createdAtUnixNano, RunID: runID})
+	if err != nil {
+		return "", fmt.Errorf("encode evolution run cursor: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+func decodeEvolutionRunCursor(value string) (evolutionRunCursor, error) {
+	payload, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return evolutionRunCursor{}, fmt.Errorf("decode evolution run cursor: %w", err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(payload)))
+	decoder.DisallowUnknownFields()
+	var cursor evolutionRunCursor
+	if err := decoder.Decode(&cursor); err != nil {
+		return evolutionRunCursor{}, fmt.Errorf("decode evolution run cursor: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return evolutionRunCursor{}, fmt.Errorf("decode evolution run cursor: trailing data")
+	}
+	if err := validateEvolutionIdentity("run_id", cursor.RunID); err != nil {
+		return evolutionRunCursor{}, err
+	}
+	return cursor, nil
+}
+
+func sortEvolutionRuns(runs []EvolutionRun) error {
+	times, err := evolutionRunCreatedTimes(runs)
+	if err != nil {
+		return err
+	}
 	sort.SliceStable(runs, func(i, j int) bool {
 		if runs[i].PriorityScore != runs[j].PriorityScore {
 			return runs[i].PriorityScore > runs[j].PriorityScore
 		}
-		if runs[i].CreatedAt != runs[j].CreatedAt {
-			return runs[i].CreatedAt < runs[j].CreatedAt
+		if !times[runs[i].RunID].Equal(times[runs[j].RunID]) {
+			return times[runs[i].RunID].Before(times[runs[j].RunID])
 		}
 		return runs[i].RunID < runs[j].RunID
 	})
+	return nil
+}
+
+func sortEvolutionRunsByCreated(runs []EvolutionRun) error {
+	times, err := evolutionRunCreatedTimes(runs)
+	if err != nil {
+		return err
+	}
+	sort.SliceStable(runs, func(i, j int) bool {
+		if !times[runs[i].RunID].Equal(times[runs[j].RunID]) {
+			return times[runs[i].RunID].After(times[runs[j].RunID])
+		}
+		return runs[i].RunID < runs[j].RunID
+	})
+	return nil
+}
+
+func evolutionRunCreatedTimes(runs []EvolutionRun) (map[string]time.Time, error) {
+	times := make(map[string]time.Time, len(runs))
+	for index := range runs {
+		createdAt, err := parseEvolutionTimestamp("created_at", runs[index].CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("invalid evolution run %q: %w", runs[index].RunID, err)
+		}
+		times[runs[index].RunID] = createdAt
+	}
+	return times, nil
 }
 
 func newerAgentPackageRecord(candidate, current AgentPackageRecord) bool {
-	if candidate.PublishedAt != current.PublishedAt {
-		return candidate.PublishedAt > current.PublishedAt
+	candidateTime, _ := parseOptionalEvolutionTimestamp(candidate.PublishedAt)
+	currentTime, _ := parseOptionalEvolutionTimestamp(current.PublishedAt)
+	if !candidateTime.Equal(currentTime) {
+		return candidateTime.After(currentTime)
 	}
 	return candidate.Version > current.Version
+}
+
+func parseOptionalEvolutionTimestamp(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, nil
+	}
+	return parseEvolutionTimestamp("published_at", value)
+}
+
+func cloneAgentPackageRecord(record AgentPackageRecord) AgentPackageRecord {
+	clone := record
+	if record.Runtime != nil {
+		runtime := *record.Runtime
+		clone.Runtime = &runtime
+	}
+	return clone
 }
 
 func isTerminalEvolutionRunStatus(status EvolutionRunStatus) bool {
@@ -1001,11 +1170,7 @@ func cloneEvolutionSignal(signal *EvolutionSignal) *EvolutionSignal {
 	return &cloned
 }
 
-func evolutionSignalReplayRefs(fingerprint, signalID string) []string {
-	return []string{"input-sha256:" + fingerprint, "signal-id:" + signalID}
-}
-
-func evolutionSignalRequestEventID(idempotencyKey string) string {
+func evolutionSignalRequestKeyHash(idempotencyKey string) string {
 	digest := sha256.Sum256([]byte(idempotencyKey))
-	return "event-signal-" + hex.EncodeToString(digest[:])
+	return "sha256:" + hex.EncodeToString(digest[:])
 }

@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -33,8 +35,10 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 		"evolution_meta",
 		"evolution_observations",
 		"evolution_outbox",
+		"evolution_run_scopes",
 		"evolution_runs",
 		"evolution_scorecards",
+		"evolution_signal_observations",
 		"evolution_signals",
 		"evolution_worker_leases",
 	}
@@ -59,10 +63,15 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 	}
 	wantIndexes := []string{
 		"idx_evolution_outbox_pending_delivery",
+		"idx_evolution_run_scopes_lookup",
+		"idx_evolution_runs_created",
+		"idx_evolution_runs_created_ns",
 		"idx_evolution_runs_package_updated",
 		"idx_evolution_runs_risk_updated",
 		"idx_evolution_runs_status_updated",
 		"idx_evolution_runs_updated",
+		"idx_evolution_runs_updated_ns",
+		"idx_evolution_signal_observations_request",
 	}
 	for _, index := range wantIndexes {
 		var count int
@@ -98,8 +107,165 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != "1" {
+	if version != "2" {
 		t.Fatalf("schema version = %q", version)
+	}
+}
+
+func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) {
+	root := t.TempDir()
+	dbPath := filepath.Join(root, evolutionControlDBName)
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE evolution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyEvolutionMigrationV1(tx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO evolution_meta(key, value) VALUES ('schema_version', '1')`); err != nil {
+		t.Fatal(err)
+	}
+	releaseID := "release-" + strings.Repeat("a", 64)
+	createdAt := "2026-08-11T12:00:00.123456789+02:00"
+	updatedAt := "2026-08-11T10:30:00.987654321Z"
+	requestKey := "11111111-1111-4111-8111-111111111111"
+	sourceID := "22222222-2222-4222-8222-222222222222"
+	observedAt, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyInput := EvolutionSignalInput{
+		IdempotencyKey: requestKey,
+		SignalType:     EvolutionSignalRegressionFailure,
+		SourceType:     EvolutionSignalSourceEvaluation,
+		SourceID:       sourceID,
+		PackageID:      "agent-v1",
+		Severity:       EvolutionSignalSeverityHigh,
+		ObservedValue:  0.4,
+		BaselineValue:  0.8,
+		EvidenceRefs:   []string{"evaluation:" + sourceID},
+		ObservedAt:     observedAt,
+	}
+	normalized, inputHash, deduplicationKey, _, err := normalizeEvolutionSignalInput(legacyInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestDigest := sha256.Sum256([]byte(requestKey))
+	requestDigestHex := hex.EncodeToString(requestDigest[:])
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_signals (
+			signal_id, idempotency_key, signal_type, source_type, source_id, package_id,
+			release_id, severity, observed_value, baseline_value, deduplication_key,
+			evidence_refs_json, observed_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, '', ?, 0.4, 0.8, ?, ?, ?, ?, ?)
+	`, "signal-v1", requestKey, EvolutionSignalRegressionFailure, EvolutionSignalSourceEvaluation,
+		sourceID, "agent-v1", EvolutionSignalSeverityHigh, deduplicationKey,
+		`["evaluation:`+sourceID+`"]`, normalized.ObservedAt, createdAt, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_runs (
+			run_id, idempotency_key, input_hash, attempt, retry_of_run_id, run_type,
+			package_id, baseline_package_version, baseline_release_ids_json, risk_level,
+			priority_score, status, trigger_signal_ids_json, current_candidate_id,
+			failure_code, failure_message, created_at, updated_at
+		) VALUES (?, ?, ?, 1, '', ?, ?, ?, ?, ?, 50, ?, '["signal-v1"]', '', '', '', ?, ?)
+	`, "run-v1", "request-v1", "input-v1", EvolutionRunCombined, "agent-v1", "1.0.0",
+		`["`+releaseID+`"]`, EvolutionSignalSeverityHigh, EvolutionDetected, createdAt, updatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_events (
+			event_id, run_id, event_type, actor, from_status, to_status, code,
+			message, artifact_refs_json, created_at
+		) VALUES (?, 'run-v1', 'created', 'control-plane', '', ?, 'signal_ingested', '', ?, ?)
+	`, "event-signal-"+requestDigestHex, EvolutionDetected,
+		`["input-sha256:`+inputHash+`","signal-id:signal-v1"]`, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	var version string
+	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "2" {
+		t.Fatalf("schema version = %q, %v", version, err)
+	}
+	wantCreated, _ := time.Parse(time.RFC3339Nano, createdAt)
+	wantUpdated, _ := time.Parse(time.RFC3339Nano, updatedAt)
+	var gotCreated, gotUpdated int64
+	if err := store.db.QueryRow(`SELECT created_at_unix_nano, updated_at_unix_nano FROM evolution_runs WHERE run_id = 'run-v1'`).Scan(&gotCreated, &gotUpdated); err != nil {
+		t.Fatal(err)
+	}
+	if gotCreated != wantCreated.UnixNano() || gotUpdated != wantUpdated.UnixNano() {
+		t.Fatalf("backfilled times = %d/%d, want %d/%d", gotCreated, gotUpdated, wantCreated.UnixNano(), wantUpdated.UnixNano())
+	}
+	rows, err := store.db.Query(`SELECT scope_type, scope_id FROM evolution_run_scopes WHERE run_id = 'run-v1' ORDER BY scope_type, scope_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var scopes []string
+	for rows.Next() {
+		var scopeType, scopeID string
+		if err := rows.Scan(&scopeType, &scopeID); err != nil {
+			t.Fatal(err)
+		}
+		scopes = append(scopes, scopeType+":"+scopeID)
+	}
+	if got, want := fmt.Sprint(scopes), fmt.Sprintf("[package:agent-v1 release:%s]", releaseID); got != want {
+		t.Fatalf("backfilled scopes = %s, want %s", got, want)
+	}
+	var gotRequestHash, gotInputHash, gotSignalID, gotRunID, gotEventRefs, gotSignalRequestKey string
+	if err := store.db.QueryRow(`
+		SELECT request_key_hash, input_hash, signal_id, run_id
+		FROM evolution_signal_observations
+	`).Scan(&gotRequestHash, &gotInputHash, &gotSignalID, &gotRunID); err != nil {
+		t.Fatal(err)
+	}
+	if gotRequestHash != "sha256:"+requestDigestHex || gotInputHash != inputHash || gotSignalID != "signal-v1" || gotRunID != "run-v1" {
+		t.Fatalf("migrated observation = %q/%q/%q/%q", gotRequestHash, gotInputHash, gotSignalID, gotRunID)
+	}
+	if err := store.db.QueryRow(`SELECT artifact_refs_json FROM evolution_events WHERE event_id = ?`, "event-signal-"+requestDigestHex).Scan(&gotEventRefs); err != nil {
+		t.Fatal(err)
+	}
+	if gotEventRefs != "[]" {
+		t.Fatalf("migrated event refs = %s", gotEventRefs)
+	}
+	if err := store.db.QueryRow(`SELECT idempotency_key FROM evolution_signals WHERE signal_id = 'signal-v1'`).Scan(&gotSignalRequestKey); err != nil {
+		t.Fatal(err)
+	}
+	if gotSignalRequestKey != evolutionSignalRequestKeyHash(requestKey) {
+		t.Fatalf("migrated signal request key = %q", gotSignalRequestKey)
+	}
+	replayedSignal, replayedRun, created, err := store.IngestSignal(legacyInput)
+	if err != nil || created || replayedSignal.SignalID != "signal-v1" || replayedRun.RunID != "run-v1" {
+		t.Fatalf("migrated replay = %#v/%#v, created %v, error %v", replayedSignal, replayedRun, created, err)
+	}
+	var observationCount, eventCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_signal_observations`).Scan(&observationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_events`).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if observationCount != 1 || eventCount != 1 {
+		t.Fatalf("migrated replay wrote observations/events = %d/%d", observationCount, eventCount)
 	}
 }
 
@@ -731,7 +897,7 @@ func TestEvolutionStoreWriteConflictPreservesSQLiteCause(t *testing.T) {
 func TestEvolutionStoreRejectsFutureSchemaWithoutModification(t *testing.T) {
 	root := t.TempDir()
 	store := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{})
-	if _, err := store.db.Exec(`UPDATE evolution_meta SET value = '2' WHERE key = 'schema_version'`); err != nil {
+	if _, err := store.db.Exec(`UPDATE evolution_meta SET value = '3' WHERE key = 'schema_version'`); err != nil {
 		t.Fatal(err)
 	}
 	var beforeObjects int
@@ -753,7 +919,7 @@ func TestEvolutionStoreRejectsFutureSchemaWithoutModification(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evolution_%'`).Scan(&afterObjects); err != nil {
 		t.Fatal(err)
 	}
-	if version != "2" || beforeObjects != afterObjects {
+	if version != "3" || beforeObjects != afterObjects {
 		t.Fatalf("future schema modified: version=%q objects=%d->%d", version, beforeObjects, afterObjects)
 	}
 }

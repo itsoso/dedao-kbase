@@ -21,7 +21,7 @@ import (
 
 const (
 	evolutionControlDBName      = "evolution_control.sqlite3"
-	evolutionStoreSchemaVersion = 1
+	evolutionStoreSchemaVersion = 2
 	evolutionEventDefaultLimit  = 100
 	evolutionEventMaxLimit      = 500
 	evolutionDefaultBusyTimeout = 5 * time.Second
@@ -168,6 +168,10 @@ func migrateEvolutionControlDB(db *sql.DB, hooks evolutionStoreHooks) error {
 		switch version {
 		case 1:
 			if err := applyEvolutionMigrationV1(tx); err != nil {
+				return err
+			}
+		case 2:
+			if err := applyEvolutionMigrationV2(tx); err != nil {
 				return err
 			}
 		default:
@@ -377,6 +381,218 @@ func applyEvolutionMigrationV1(tx *sql.Tx) error {
 	return nil
 }
 
+func applyEvolutionMigrationV2(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		ALTER TABLE evolution_runs ADD COLUMN created_at_unix_nano INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE evolution_runs ADD COLUMN updated_at_unix_nano INTEGER NOT NULL DEFAULT 0;
+
+		CREATE TABLE evolution_signal_observations (
+			observation_id TEXT PRIMARY KEY,
+			request_key_hash TEXT NOT NULL,
+			input_hash TEXT NOT NULL,
+			signal_id TEXT NOT NULL,
+			run_id TEXT NOT NULL,
+			signal_type TEXT NOT NULL,
+			source_type TEXT NOT NULL,
+			source_id TEXT NOT NULL,
+			package_id TEXT NOT NULL DEFAULT '',
+			release_id TEXT NOT NULL DEFAULT '',
+			severity TEXT NOT NULL,
+			observed_value REAL NOT NULL,
+			baseline_value REAL NOT NULL,
+			evidence_refs_json TEXT NOT NULL,
+			observed_at TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(signal_id) REFERENCES evolution_signals(signal_id),
+			FOREIGN KEY(run_id) REFERENCES evolution_runs(run_id)
+		);
+		CREATE UNIQUE INDEX idx_evolution_signal_observations_request
+			ON evolution_signal_observations(request_key_hash);
+		CREATE INDEX idx_evolution_signal_observations_signal_created
+			ON evolution_signal_observations(signal_id, created_at, observation_id);
+
+		CREATE TABLE evolution_run_scopes (
+			run_id TEXT NOT NULL,
+			scope_type TEXT NOT NULL,
+			scope_id TEXT NOT NULL,
+			PRIMARY KEY(run_id, scope_type, scope_id),
+			FOREIGN KEY(run_id) REFERENCES evolution_runs(run_id)
+		);
+		CREATE INDEX idx_evolution_run_scopes_lookup
+			ON evolution_run_scopes(scope_type, scope_id, run_id);
+		CREATE INDEX idx_evolution_runs_created
+			ON evolution_runs(created_at DESC, run_id ASC);
+		CREATE INDEX idx_evolution_runs_created_ns
+			ON evolution_runs(created_at_unix_nano DESC, run_id ASC);
+		CREATE INDEX idx_evolution_runs_updated_ns
+			ON evolution_runs(updated_at_unix_nano DESC, run_id ASC);
+	`); err != nil {
+		return fmt.Errorf("apply evolution schema version 2: %w", err)
+	}
+
+	type storedRunScope struct {
+		runID       string
+		packageID   string
+		releaseJSON string
+		createdAt   string
+		updatedAt   string
+	}
+	rows, err := tx.Query(`SELECT run_id, package_id, baseline_release_ids_json, created_at, updated_at FROM evolution_runs`)
+	if err != nil {
+		return fmt.Errorf("read v1 evolution runs for v2 backfill: %w", err)
+	}
+	stored := make([]storedRunScope, 0)
+	for rows.Next() {
+		var run storedRunScope
+		if err := rows.Scan(&run.runID, &run.packageID, &run.releaseJSON, &run.createdAt, &run.updatedAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan v1 evolution run for v2 backfill: %w", err)
+		}
+		stored = append(stored, run)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close v1 evolution run backfill rows: %w", err)
+	}
+	for _, storedRun := range stored {
+		createdAt, err := parseEvolutionTimestamp("created_at", storedRun.createdAt)
+		if err != nil {
+			return fmt.Errorf("backfill evolution run %q: %w", storedRun.runID, err)
+		}
+		updatedAt, err := parseEvolutionTimestamp("updated_at", storedRun.updatedAt)
+		if err != nil {
+			return fmt.Errorf("backfill evolution run %q: %w", storedRun.runID, err)
+		}
+		if _, err := tx.Exec(`UPDATE evolution_runs SET created_at_unix_nano = ?, updated_at_unix_nano = ? WHERE run_id = ?`, createdAt.UnixNano(), updatedAt.UnixNano(), storedRun.runID); err != nil {
+			return fmt.Errorf("backfill evolution run timestamp: %w", err)
+		}
+		if storedRun.packageID != "" {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO evolution_run_scopes(run_id, scope_type, scope_id) VALUES (?, 'package', ?)`, storedRun.runID, storedRun.packageID); err != nil {
+				return fmt.Errorf("backfill evolution package scope: %w", err)
+			}
+		}
+		var releaseIDs []string
+		if err := json.Unmarshal([]byte(storedRun.releaseJSON), &releaseIDs); err != nil {
+			return fmt.Errorf("decode v1 evolution release scopes: %w", err)
+		}
+		for _, releaseID := range releaseIDs {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO evolution_run_scopes(run_id, scope_type, scope_id) VALUES (?, 'release', ?)`, storedRun.runID, releaseID); err != nil {
+				return fmt.Errorf("backfill evolution release scope: %w", err)
+			}
+		}
+	}
+	if err := migrateEvolutionV1SignalObservationsTx(tx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func migrateEvolutionV1SignalObservationsTx(tx *sql.Tx) error {
+	type storedMappingEvent struct {
+		eventID      string
+		runID        string
+		artifactJSON string
+		createdAt    string
+	}
+	rows, err := tx.Query(`
+		SELECT event_id, run_id, artifact_refs_json, created_at
+		FROM evolution_events WHERE event_id LIKE 'event-signal-%'
+	`)
+	if err != nil {
+		return fmt.Errorf("read v1 evolution signal mappings: %w", err)
+	}
+	events := make([]storedMappingEvent, 0)
+	for rows.Next() {
+		var event storedMappingEvent
+		if err := rows.Scan(&event.eventID, &event.runID, &event.artifactJSON, &event.createdAt); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan v1 evolution signal mapping: %w", err)
+		}
+		events = append(events, event)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close v1 evolution signal mapping rows: %w", err)
+	}
+	for _, event := range events {
+		var refs []string
+		if err := json.Unmarshal([]byte(event.artifactJSON), &refs); err != nil {
+			return fmt.Errorf("decode v1 evolution signal mapping %q: %w", event.eventID, err)
+		}
+		inputHash, signalID := "", ""
+		publicRefs := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			switch {
+			case strings.HasPrefix(ref, "input-sha256:"):
+				inputHash = strings.TrimPrefix(ref, "input-sha256:")
+			case strings.HasPrefix(ref, "signal-id:"):
+				signalID = strings.TrimPrefix(ref, "signal-id:")
+			default:
+				publicRefs = append(publicRefs, ref)
+			}
+		}
+		requestDigest := strings.TrimPrefix(event.eventID, "event-signal-")
+		if len(requestDigest) != sha256.Size*2 || !isEvolutionLowerHex(requestDigest) ||
+			len(inputHash) != sha256.Size*2 || !isEvolutionLowerHex(inputHash) || signalID == "" {
+			return fmt.Errorf("v1 evolution signal mapping %q is incomplete", event.eventID)
+		}
+		var signalType, sourceType, sourceID, packageID, releaseID, severity string
+		var observedValue, baselineValue float64
+		var evidenceJSON, observedAt string
+		if err := tx.QueryRow(`
+			SELECT signal_type, source_type, source_id, package_id, release_id, severity,
+				observed_value, baseline_value, evidence_refs_json, observed_at
+			FROM evolution_signals WHERE signal_id = ?
+		`, signalID).Scan(
+			&signalType, &sourceType, &sourceID, &packageID, &releaseID, &severity,
+			&observedValue, &baselineValue, &evidenceJSON, &observedAt,
+		); err != nil {
+			return fmt.Errorf("load v1 evolution signal %q for observation migration: %w", signalID, err)
+		}
+		requestKeyHash := "sha256:" + requestDigest
+		if _, err := tx.Exec(`
+			INSERT INTO evolution_signal_observations (
+				observation_id, request_key_hash, input_hash, signal_id, run_id,
+				signal_type, source_type, source_id, package_id, release_id, severity,
+				observed_value, baseline_value, evidence_refs_json, observed_at, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, "observation-migrated-"+requestDigest, requestKeyHash, inputHash, signalID,
+			event.runID, signalType, sourceType, sourceID, packageID, releaseID, severity,
+			observedValue, baselineValue, evidenceJSON, observedAt, event.createdAt); err != nil {
+			return fmt.Errorf("migrate v1 evolution signal observation: %w", err)
+		}
+		publicRefsJSON, err := json.Marshal(publicRefs)
+		if err != nil {
+			return fmt.Errorf("encode migrated evolution event refs: %w", err)
+		}
+		if _, err := tx.Exec(`UPDATE evolution_events SET artifact_refs_json = ? WHERE event_id = ?`, string(publicRefsJSON), event.eventID); err != nil {
+			return fmt.Errorf("remove v1 internal evolution event refs: %w", err)
+		}
+	}
+
+	rows, err = tx.Query(`SELECT signal_id, idempotency_key FROM evolution_signals`)
+	if err != nil {
+		return fmt.Errorf("read v1 evolution signal request keys: %w", err)
+	}
+	type storedSignalKey struct{ signalID, requestKey string }
+	keys := make([]storedSignalKey, 0)
+	for rows.Next() {
+		var key storedSignalKey
+		if err := rows.Scan(&key.signalID, &key.requestKey); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan v1 evolution signal request key: %w", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close v1 evolution signal request key rows: %w", err)
+	}
+	for _, key := range keys {
+		if _, err := tx.Exec(`UPDATE evolution_signals SET idempotency_key = ? WHERE signal_id = ?`, evolutionSignalRequestKeyHash(key.requestKey), key.signalID); err != nil {
+			return fmt.Errorf("hash v1 evolution signal request key: %w", err)
+		}
+	}
+	return nil
+}
+
 // CreateRun returns created=false when the same idempotency key and immutable input already exist.
 func (s *EvolutionControlStore) CreateRun(input EvolutionRunInput) (*EvolutionRun, bool, error) {
 	normalized, inputHash, err := normalizeEvolutionRunInput(input)
@@ -461,20 +677,42 @@ func (s *EvolutionControlStore) insertEvolutionRunTx(tx *sql.Tx, idempotencyKey,
 	if err != nil {
 		return fmt.Errorf("encode trigger signal IDs: %w", err)
 	}
+	createdAt, err := parseEvolutionTimestamp("created_at", run.CreatedAt)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_runs (
 			run_id, idempotency_key, input_hash, attempt, retry_of_run_id, run_type,
 			package_id, baseline_package_version, baseline_release_ids_json, risk_level,
 			priority_score, status, trigger_signal_ids_json, current_candidate_id,
-			failure_code, failure_message, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			failure_code, failure_message, created_at, updated_at, created_at_unix_nano,
+			updated_at_unix_nano
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, run.RunID, idempotencyKey, inputHash, run.Attempt, run.RetryOfRunID, run.RunType,
 		run.PackageID, run.BaselinePackageVersion, string(baselineReleasesJSON), run.RiskLevel,
 		run.PriorityScore, run.Status, string(triggerSignalsJSON), run.CurrentCandidateID,
-		run.FailureCode, run.FailureMessage, run.CreatedAt, run.UpdatedAt); err != nil {
+		run.FailureCode, run.FailureMessage, run.CreatedAt, run.UpdatedAt, createdAt.UnixNano(), createdAt.UnixNano()); err != nil {
 		return fmt.Errorf("insert evolution run: %w", err)
 	}
+	if err := insertEvolutionRunScopesTx(tx, run); err != nil {
+		return err
+	}
 	return s.insertEventTx(tx, event)
+}
+
+func insertEvolutionRunScopesTx(tx *sql.Tx, run *EvolutionRun) error {
+	if run.PackageID != "" {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO evolution_run_scopes(run_id, scope_type, scope_id) VALUES (?, 'package', ?)`, run.RunID, run.PackageID); err != nil {
+			return fmt.Errorf("insert evolution package scope: %w", err)
+		}
+	}
+	for _, releaseID := range run.BaselineReleaseIDs {
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO evolution_run_scopes(run_id, scope_type, scope_id) VALUES (?, 'release', ?)`, run.RunID, releaseID); err != nil {
+			return fmt.Errorf("insert evolution release scope: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *EvolutionControlStore) LoadRun(runID string) (*EvolutionRun, error) {
@@ -537,7 +775,11 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 	if err := event.Validate(); err != nil {
 		return nil, fmt.Errorf("validate evolution transition event: %w", err)
 	}
-	result, err := tx.Exec(`UPDATE evolution_runs SET status = ?, updated_at = ? WHERE run_id = ? AND status = ?`, to, timestamp, run.RunID, from)
+	updatedAt, err := parseEvolutionTimestamp("updated_at", timestamp)
+	if err != nil {
+		return nil, err
+	}
+	result, err := tx.Exec(`UPDATE evolution_runs SET status = ?, updated_at = ?, updated_at_unix_nano = ? WHERE run_id = ? AND status = ?`, to, timestamp, updatedAt.UnixNano(), run.RunID, from)
 	if err != nil {
 		return nil, fmt.Errorf("update evolution run: %w", err)
 	}
