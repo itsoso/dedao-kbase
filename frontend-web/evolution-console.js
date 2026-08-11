@@ -15,6 +15,40 @@
   const validTypes = new Set(["agent_policy", "knowledge_release", "combined"]);
   const validTabs = new Set(["comparison", "evidence", "audit"]);
   const riskOrder = Object.freeze({ p0: 0, p1: 1, p2: 2, p3: 3 });
+  const riskAliases = Object.freeze({
+    p0: "p0", critical: "p0",
+    p1: "p1", high: "p1",
+    p2: "p2", medium: "p2",
+    p3: "p3", low: "p3",
+  });
+  const riskQueryAliases = Object.freeze({
+    p0: ["p0", "critical"],
+    p1: ["p1", "high"],
+    p2: ["p2", "medium"],
+    p3: ["p3", "low"],
+  });
+
+  function normalizeRisk(value) {
+    return riskAliases[String(value || "").trim().toLowerCase()] || "";
+  }
+
+  function riskLabel(value) {
+    return ({ p0: "P0 紧急", p1: "P1 高", p2: "P2 中", p3: "P3 低" })[normalizeRisk(value)] || "风险未知";
+  }
+
+  function expandRiskQuery(values) {
+    const expanded = [];
+    const seen = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+      const canonical = normalizeRisk(value);
+      for (const alias of riskQueryAliases[canonical] || []) {
+        if (seen.has(alias)) continue;
+        seen.add(alias);
+        expanded.push(alias);
+      }
+    }
+    return expanded;
+  }
 
   function parseRoute(input) {
     const url = new URL(String(input || "/agent-packages"), "https://kbase.invalid");
@@ -81,7 +115,7 @@
 
   function sortRuns(runs) {
     return Array.isArray(runs) ? [...runs].sort((left, right) => {
-      const riskDelta = (riskOrder[left?.risk_level] ?? 99) - (riskOrder[right?.risk_level] ?? 99);
+      const riskDelta = (riskOrder[normalizeRisk(left?.risk_level)] ?? 99) - (riskOrder[normalizeRisk(right?.risk_level)] ?? 99);
       if (riskDelta) return riskDelta;
       const priorityDelta = Number(right?.priority_score || 0) - Number(left?.priority_score || 0);
       if (priorityDelta) return priorityDelta;
@@ -106,8 +140,51 @@
       (!anchor.target || anchor.target === "_self");
   }
 
+  function activateDialog(dialog, fallbackBackground = []) {
+    if (!dialog) return "unavailable";
+    let mode = "native";
+    if (typeof dialog.showModal === "function") {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      mode = "fallback";
+      dialog.setAttribute?.("open", "");
+      dialog.setAttribute?.("role", "dialog");
+      dialog.setAttribute?.("aria-modal", "true");
+      for (const element of Array.isArray(fallbackBackground) ? fallbackBackground : []) {
+        if (element) element.inert = true;
+      }
+    }
+    dialog.setAttribute?.("data-evolution-modal-mode", mode);
+    dialog.querySelector?.("[data-evolution-drawer-close], button:not([disabled]), select:not([disabled]), input:not([disabled])")?.focus?.();
+    return mode;
+  }
+
+  function bindDialogDismiss(dialog, onDismiss) {
+    if (!dialog?.addEventListener || typeof onDismiss !== "function") return () => {};
+    let dismissed = false;
+    const dismiss = (event) => {
+      event?.preventDefault?.();
+      if (dismissed) return;
+      dismissed = true;
+      onDismiss();
+    };
+    const cancelHandler = (event) => dismiss(event);
+    const keydownHandler = (event) => {
+      if (event?.key === "Escape") dismiss(event);
+    };
+    dialog.addEventListener("cancel", cancelHandler);
+    dialog.addEventListener("keydown", keydownHandler);
+    return () => {
+      dialog.removeEventListener?.("cancel", cancelHandler);
+      dialog.removeEventListener?.("keydown", keydownHandler);
+    };
+  }
+
   globalObject.AgentEvolutionConsole = Object.freeze({
     routeDefaults,
+    normalizeRisk,
+    riskLabel,
+    expandRiskQuery,
     parseRoute,
     serializeRoute,
     groupPackages,
@@ -115,5 +192,7 @@
     sortRuns,
     scoreDelta,
     shouldHandleClick,
+    activateDialog,
+    bindDialogDismiss,
   });
 }(globalThis));

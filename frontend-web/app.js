@@ -4235,7 +4235,7 @@ function evolutionTypeLabel(type) {
 }
 
 function evolutionRiskLabel(risk) {
-  return ({ p0: "P0 紧急", p1: "P1 高", p2: "P2 中", p3: "P3 低" })[risk] || String(risk || "—").toUpperCase();
+  return AgentEvolutionConsole.riskLabel(risk);
 }
 
 function evolutionCompactID(value, limit = 28) {
@@ -4307,7 +4307,7 @@ function renderEvolutionQueue() {
     const href = evolutionRouteURL({ run: run.run_id, tab: "comparison" });
     return `
       <a class="evolution-run ${selected ? "is-selected" : ""}" href="${escapeAttribute(href)}" data-evolution-run-id="${escapeAttribute(run.run_id)}" ${selected ? 'aria-current="true"' : ""}>
-        <span class="evolution-run__risk is-${escapeAttribute(run.risk_level || "p3")}">${escapeHTML(evolutionRiskLabel(run.risk_level))}</span>
+        <span class="evolution-run__risk is-${escapeAttribute(AgentEvolutionConsole.normalizeRisk(run.risk_level) || "unknown")}">${escapeHTML(evolutionRiskLabel(run.risk_level))}</span>
         <span class="evolution-run__body">
           <strong title="${escapeAttribute(run.package_id || run.run_id)}">${escapeHTML(evolutionCompactID(run.package_id || run.run_id))}</strong>
           <small>${escapeHTML(evolutionTypeLabel(run.run_type))} · ${escapeHTML(evolutionStatusLabel(run.status))}</small>
@@ -4431,7 +4431,7 @@ function renderAgentEvolutionConsole() {
         </section>`}
         <section class="evolution-console__fleet" aria-labelledby="evolution-fleet-title"><header><div><span>${route.view === "history" ? "版本与演化记录" : "当前服务编队"}</span><h2 id="evolution-fleet-title">${route.view === "history" ? "演化历史" : "全部 Agent"}</h2></div><small>一行一个 Agent · 历史版本默认折叠</small></header>${renderEvolutionFleet()}</section>
       `}
-      ${route.drawer === "compiler" ? `<dialog class="evolution-console__drawer" aria-labelledby="agent-compiler-title" open><div class="evolution-console__drawer-head"><span>创建候选</span><button type="button" data-evolution-drawer-close aria-label="关闭创建候选面板">×</button></div>${renderAgentCompiler()}</dialog><div class="evolution-console__backdrop" aria-hidden="true"></div>` : ""}
+      ${route.drawer === "compiler" ? `<dialog class="evolution-console__drawer" aria-labelledby="agent-compiler-title"><div class="evolution-console__drawer-head"><span>创建候选</span><button type="button" data-evolution-drawer-close aria-label="关闭创建候选面板">×</button></div>${renderAgentCompiler()}</dialog><div class="evolution-console__backdrop" aria-hidden="true"></div>` : ""}
     </main>
   `;
 }
@@ -5602,16 +5602,16 @@ function bindAgentEvolutionEvents(route) {
   trigger?.addEventListener("click", () => pushEvolutionRoute({ drawer: "compiler" }));
   const drawer = document.querySelector(".evolution-console__drawer");
   if (drawer) {
-    if (typeof drawer.showModal === "function" && !drawer.open) drawer.showModal();
-    drawer.addEventListener("cancel", (event) => {
-      event.preventDefault();
+    const modalBackground = Array.from(document.querySelectorAll(
+      ".web-topbar, .evolution-console > :not(.evolution-console__drawer):not(.evolution-console__backdrop)",
+    ));
+    AgentEvolutionConsole.activateDialog(drawer, modalBackground);
+    const closeDrawer = () => {
       evolutionConsoleState.returnFocusToCompilerTrigger = true;
       pushEvolutionRoute({ drawer: "" });
-    });
-    document.querySelector("[data-evolution-drawer-close]")?.addEventListener("click", () => {
-      evolutionConsoleState.returnFocusToCompilerTrigger = true;
-      pushEvolutionRoute({ drawer: "" });
-    });
+    };
+    AgentEvolutionConsole.bindDialogDismiss(drawer, closeDrawer);
+    document.querySelector("[data-evolution-drawer-close]")?.addEventListener("click", closeDrawer);
     bindAgentCompilerEvents(route);
   }
   if (
@@ -6146,7 +6146,8 @@ async function loadAgentEvolutionConsole() {
   renderBookAgentPlatform({ view: "package", packageID: "" });
 
   const query = new URLSearchParams({ limit: "50" });
-  if (route.risk.length) query.set("risk", route.risk.join(","));
+  const expandedRisks = AgentEvolutionConsole.expandRiskQuery(route.risk);
+  if (expandedRisks.length) query.set("risk", expandedRisks.join(","));
   if (route.type) query.set("type", route.type);
   if (route.cursor) query.set("cursor", route.cursor);
   const requests = [
