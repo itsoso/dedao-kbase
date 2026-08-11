@@ -3,7 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { fixtureBrowserClientID, fixtureEvolutionOverview, isValidBrowserClientID } from "./agent-evolution-console-fixture.mjs";
+import {
+  fixtureBrowserClientID,
+  fixtureEvolutionOverview,
+  isValidBrowserClientID,
+  sortFixtureRunsAsBackend,
+} from "./agent-evolution-console-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helperPath = path.join(root, "evolution-console.js");
@@ -31,6 +36,23 @@ assert.equal(
   fixtureOverview.open_runs.some((run) => ["completed", "blocked", "rejected", "failed", "superseded", "rolled_back"].includes(run.status)),
   false,
   "production-like fixture open_runs must obey the backend non-terminal contract",
+);
+const nanoOrderedFixtureRuns = sortFixtureRunsAsBackend([
+  { run_id: "a", created_at: "2026-08-11T10:00:00.000000001Z" },
+  { run_id: "z", created_at: "2026-08-11T10:00:00.000000002Z" },
+]);
+assert.deepEqual(
+  Array.from(nanoOrderedFixtureRuns, (run) => run.run_id),
+  ["z", "a"],
+  "fixture API must model the backend RFC3339Nano created_at DESC order",
+);
+assert.deepEqual(
+  Array.from(sortFixtureRunsAsBackend([
+    { run_id: "z", created_at: "2026-08-11T10:00:00.000000001Z" },
+    { run_id: "a", created_at: "2026-08-11T10:00:00.000000001Z" },
+  ]), (run) => run.run_id),
+  ["a", "z"],
+  "fixture API must use run_id ASC to break an exact created_at tie",
 );
 
 const parsed = helpers.parseRoute("/agent-packages?view=inbox&risk=p0,p1&type=combined&run=run-123&tab=evidence&cursor=next-1&drawer=compiler");
@@ -128,11 +150,14 @@ const sorted = helpers.sortRuns([
 assert.deepEqual(Array.from(sorted, (run) => run.run_id), ["p0-low", "critical-signal", "p1-new", "p1-old", "p2-high", "p3-run"]);
 assert.ok(sorted.findIndex((run) => run.run_id === "critical-signal") < sorted.findIndex((run) => run.risk_level === "p3"));
 const historySorted = helpers.sortRunsForView([
-  { run_id: "history-b", risk_level: "p0", priority_score: 100, created_at: "2026-08-11T09:00:00Z", updated_at: "2026-08-11T12:00:00Z" },
-  { run_id: "history-z", risk_level: "p3", priority_score: 1, created_at: "2026-08-11T10:00:00Z", updated_at: "2026-08-11T08:00:00Z" },
-  { run_id: "history-a", risk_level: "p1", priority_score: 50, created_at: "2026-08-11T10:00:00Z", updated_at: "2026-08-11T11:00:00Z" },
+  { run_id: "history-z", risk_level: "p3", priority_score: 1, created_at: "2026-08-11T10:00:00.000000002Z" },
+  { run_id: "history-a", risk_level: "p0", priority_score: 100, created_at: "2026-08-11T10:00:00.000000001Z" },
 ], "history");
-assert.deepEqual(Array.from(historySorted, (run) => run.run_id), ["history-a", "history-z", "history-b"]);
+assert.deepEqual(
+  Array.from(historySorted, (run) => run.run_id),
+  ["history-z", "history-a"],
+  "history must preserve the backend RFC3339Nano cursor order instead of re-sorting at millisecond precision",
+);
 const historyPresentation = helpers.queuePresentation("history");
 assert.equal(historyPresentation.indexLabel, "01 / 按时间排序");
 assert.equal(historyPresentation.title, "演化历史");

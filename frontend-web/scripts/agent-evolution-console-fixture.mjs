@@ -16,12 +16,12 @@ export function isValidBrowserClientID(value) {
 }
 
 const runs = [
-  { run_id: "run-open-a", package_id: "attention-agent", run_type: "agent_policy", status: "awaiting_approval", risk_level: "critical", priority_score: 96, created_at: "2026-08-11T08:00:00Z", updated_at: now, trigger_signal_count: 4 },
-  { run_id: "run-blocked", package_id: "knowledge-agent", run_type: "knowledge_release", status: "blocked", risk_level: "high", priority_score: 83, created_at: "2026-08-11T08:30:00Z", updated_at: now, trigger_signal_count: 2 },
-  { run_id: "run-failed", package_id: "runtime-agent", run_type: "combined", status: "failed", risk_level: "p1", priority_score: 79, created_at: "2026-08-11T09:00:00Z", updated_at: now, trigger_signal_count: 3 },
-  { run_id: "run-open-b", package_id: "research-agent", run_type: "combined", status: "evaluating", risk_level: "medium", priority_score: 61, created_at: "2026-08-11T09:30:00Z", updated_at: now, trigger_signal_count: 1 },
-  { run_id: "run-completed", package_id: "attention-agent", run_type: "agent_policy", status: "completed", risk_level: "critical", priority_score: 40, created_at: "2026-08-11T10:00:00Z", updated_at: "2026-08-11T11:30:00Z", trigger_signal_count: 2 },
-  { run_id: "run-rejected", package_id: "knowledge-agent", run_type: "knowledge_release", status: "rejected", risk_level: "low", priority_score: 35, created_at: "2026-08-11T11:00:00Z", updated_at: "2026-08-11T09:00:00Z", trigger_signal_count: 1 },
+  { run_id: "run-open-a", package_id: "attention-agent", run_type: "agent_policy", status: "awaiting_approval", risk_level: "critical", priority_score: 96, created_at: "2026-08-11T08:00:00.000000000Z", updated_at: now, trigger_signal_count: 4 },
+  { run_id: "run-blocked", package_id: "knowledge-agent", run_type: "knowledge_release", status: "blocked", risk_level: "high", priority_score: 83, created_at: "2026-08-11T08:30:00.000000000Z", updated_at: now, trigger_signal_count: 2 },
+  { run_id: "run-failed", package_id: "runtime-agent", run_type: "combined", status: "failed", risk_level: "p1", priority_score: 79, created_at: "2026-08-11T09:00:00.000000000Z", updated_at: now, trigger_signal_count: 3 },
+  { run_id: "run-open-b", package_id: "research-agent", run_type: "combined", status: "evaluating", risk_level: "medium", priority_score: 61, created_at: "2026-08-11T09:30:00.000000000Z", updated_at: now, trigger_signal_count: 1 },
+  { run_id: "run-completed", package_id: "attention-agent", run_type: "agent_policy", status: "completed", risk_level: "critical", priority_score: 40, created_at: "2026-08-11T10:00:00.000000000Z", updated_at: "2026-08-11T11:30:00Z", trigger_signal_count: 2 },
+  { run_id: "run-rejected", package_id: "knowledge-agent", run_type: "knowledge_release", status: "rejected", risk_level: "low", priority_score: 35, created_at: "2026-08-11T11:00:00.000000000Z", updated_at: "2026-08-11T09:00:00Z", trigger_signal_count: 1 },
 ];
 const terminalStatuses = ["completed", "blocked", "rejected", "failed", "superseded", "rolled_back"];
 
@@ -41,6 +41,18 @@ export function fixtureEvolutionOverview() {
     open_runs: runs.filter((run) => !terminalStatuses.includes(run.status)),
     agent_fleet: fleet,
   };
+}
+
+export function sortFixtureRunsAsBackend(items) {
+  return [...items].sort((left, right) => {
+    const leftCreatedAt = String(left.created_at || "");
+    const rightCreatedAt = String(right.created_at || "");
+    if (leftCreatedAt !== rightCreatedAt) return leftCreatedAt < rightCreatedAt ? 1 : -1;
+    const leftRunID = String(left.run_id || "");
+    const rightRunID = String(right.run_id || "");
+    if (leftRunID === rightRunID) return 0;
+    return leftRunID < rightRunID ? -1 : 1;
+  });
 }
 
 const mimeTypes = {
@@ -85,11 +97,11 @@ async function serveAPI(request, response, url) {
     const statuses = new Set(String(url.searchParams.get("status") || "").split(",").filter(Boolean));
     const risks = new Set(String(url.searchParams.get("risk") || "").split(",").filter(Boolean));
     const types = new Set(String(url.searchParams.get("type") || "").split(",").filter(Boolean));
-    const filtered = runs.filter((run) => (
+    const filtered = sortFixtureRunsAsBackend(runs.filter((run) => (
       (!statuses.size || statuses.has(run.status)) &&
       (!risks.size || risks.has(run.risk_level)) &&
       (!types.size || types.has(run.run_type))
-    ));
+    )));
     json(response, { runs: filtered, next_cursor: "" });
     return true;
   }

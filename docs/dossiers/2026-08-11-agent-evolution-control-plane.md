@@ -112,9 +112,9 @@ EVOLUTION_FIXTURE_PORT=8897 EVOLUTION_FIXTURE_DELAY_MS=4000 \
 - production-like fixture 的 `open_runs` 只含 `run-open-a/awaiting_approval` 与
   `run-open-b/evaluating`，另显式返回 `failed=1/completed=1`；Inbox 仍通过独立任务查询显示
   需要人工处理的 `run-failed`，不混入 `run-completed`。
-- History 的序号、标题、排序提示、加载/错误/空态和详情提示均使用历史语义；当前页列表按
-  与后端游标契约一致的 `created_at` 倒序，再以 `run_id` 稳定打破平局，不宣称跨页按
-  `updated_at` 全局排序。
+- History 的序号、标题、排序提示、加载/错误/空态和详情提示均使用历史语义；页面不再本地
+  排序，完整保留 API 返回顺序，因此跨页严格遵循后端 `created_at DESC, run_id ASC` 的全局
+  cursor 顺序，不宣称按 `updated_at` 排序。
 - `beginEvolutionRouteState` 使用 view+risk+type+cursor scope key；scope 改变立即清空 runs 与
   next cursor，同一 scope 内切 run、详情 tab 或 drawer 保留当前列表。
 
@@ -127,8 +127,9 @@ EVOLUTION_FIXTURE_PORT=8897 EVOLUTION_FIXTURE_DELAY_MS=4000 \
   History 加载后改 P0，旧两行同样立即消失。
 - 同一 scope 内选择 `run-completed`、切换证据 tab 或打开 drawer，当前历史列表保持不变。
 
-最终复裁继续收紧两项可见契约：History 当前页按 `created_at` 稳定排序，fixture 使用与风险、
-`updated_at` 顺序相反的创建时间验证；详情返回文案、返回 tab、section 与 tablist 的可访问性
+最终复裁继续收紧两项可见契约：History 完整保留服务端顺序，fixture 按后端
+`created_at DESC, run_id ASC` 生成响应，并以同毫秒不同纳秒的 `[z,a]` 回归用例验证前端不会
+因 `Date.parse()` 丢失纳秒而重排；详情返回文案、返回 tab、section 与 tablist 的可访问性
 标签均由视图 helper 提供。最终浏览器复验确认 History 返回链接为“返回演化历史”，链接保留
 `view=history&tab=audit`，详情 region 与 tablist 的可访问名称分别为“演化历史详情”“审计详情”；
 Inbox 保持“返回待办队列”“线上版本对比”“任务详情”，返回链接仍指向 Inbox 默认详情页签。

@@ -307,11 +307,7 @@
 
   function sortRunsForView(runs, view) {
     if (view !== "history") return sortRuns(runs);
-    return Array.isArray(runs) ? [...runs].sort((left, right) => {
-      const timeDelta = Date.parse(right?.created_at || "") - Date.parse(left?.created_at || "");
-      if (Number.isFinite(timeDelta) && timeDelta !== 0) return timeDelta;
-      return String(left?.run_id || "").localeCompare(String(right?.run_id || ""));
-    }) : [];
+    return Array.isArray(runs) ? [...runs] : [];
   }
 
   function runTimestampForView(run, view) {
