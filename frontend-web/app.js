@@ -1274,6 +1274,9 @@ function resolveCanonicalRoute(pathname = window.location.pathname) {
     if (legacy === "/ebook" && pathname.startsWith(`${legacy}/`)) {
       return ROUTES.bookReader + pathname.slice(legacy.length);
     }
+    if (legacy === "/book-knowledge" && pathname.startsWith(`${legacy}/books/`)) {
+      return canonical + pathname.slice(`${legacy}/books`.length);
+    }
     if (pathname === legacy || pathname.startsWith(`${legacy}/`)) {
       return canonical + pathname.slice(legacy.length);
     }
@@ -1329,16 +1332,44 @@ function getDedaoAudioRoute() {
   }
 }
 
-function getKnowledgeBookID() {
-  const raw = getPathSegmentAfter(`${ROUTES.knowledgePackages}/`) || getPathSegmentAfter("/book-knowledge/");
-  if (!raw) {
-    return "";
-  }
+function decodeRouteSegment(value) {
   try {
-    return decodeURIComponent(raw);
+    return decodeURIComponent(value);
   } catch {
-    return raw;
+    return value;
   }
+}
+
+function knowledgeResourceFromLocation(pathname = getRoutePathname()) {
+  const canonicalPath = resolveCanonicalRoute(pathname);
+  const prefix = `${ROUTES.knowledgePackages}/`;
+  if (!canonicalPath.startsWith(prefix)) {
+    return null;
+  }
+  const parts = canonicalPath.slice(prefix.length).split("/").filter(Boolean);
+  const bookID = decodeRouteSegment(parts[0] || "");
+  if (!bookID) {
+    return null;
+  }
+  if (parts.length === 1) {
+    return { type: "book", bookID, resourceID: "", kind: "" };
+  }
+  if (parts.length === 3 && parts[1] === "chapters") {
+    return { type: "chapter", bookID, resourceID: decodeRouteSegment(parts[2]), kind: "chapter" };
+  }
+  if (parts.length === 4 && parts[1] === "results") {
+    return {
+      type: "result",
+      bookID,
+      resourceID: decodeRouteSegment(parts[3]),
+      kind: decodeRouteSegment(parts[2]),
+    };
+  }
+  return null;
+}
+
+function getKnowledgeBookID() {
+  return knowledgeResourceFromLocation()?.bookID || "";
 }
 
 function isKnowledgePackageDetailRoute() {
@@ -1448,8 +1479,26 @@ function buildBookReaderURL(packageID) {
   return packageID ? `${ROUTES.bookReader}/${encodeURIComponent(packageID)}` : "";
 }
 
-function buildKnowledgePackageURL(packageID) {
+function knowledgeBookPath(packageID) {
   return packageID ? `${ROUTES.knowledgePackages}/${encodeURIComponent(packageID)}` : ROUTES.knowledgePackages;
+}
+
+function knowledgeChapterPath(packageID, chapterID) {
+  if (!chapterID) {
+    return knowledgeBookPath(packageID);
+  }
+  return `${knowledgeBookPath(packageID)}/chapters/${encodeURIComponent(chapterID)}`;
+}
+
+function knowledgeResultPath(packageID, kind, resultID) {
+  if (!kind || !resultID) {
+    return knowledgeBookPath(packageID);
+  }
+  return `${knowledgeBookPath(packageID)}/results/${encodeURIComponent(kind)}/${encodeURIComponent(resultID)}`;
+}
+
+function buildKnowledgePackageURL(packageID) {
+  return knowledgeBookPath(packageID);
 }
 
 function buildAgentPackageURL(packageID, version = "") {

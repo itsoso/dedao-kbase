@@ -123,6 +123,18 @@ for (const marker of [
   assert.ok(js.includes(marker), `route contract should include ${marker}`);
 }
 
+for (const marker of [
+  "knowledgeBookPath",
+  "knowledgeChapterPath",
+  "knowledgeResultPath",
+  "knowledgeResourceFromLocation",
+  'parts[1] === "chapters"',
+  'parts[1] === "results"',
+  'legacy === "/book-knowledge" && pathname.startsWith(`${legacy}/books/`)',
+]) {
+  assert.ok(js.includes(marker), `knowledge deep-link contract should include ${marker}`);
+}
+
 for (const authMarker of [
   'credentials: "same-origin"',
   "response.status === 401",
