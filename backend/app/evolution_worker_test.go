@@ -181,8 +181,12 @@ func TestEvolutionWorkerRenewsRejectsStaleLeaseAndRecoversExpiredAttempt(t *test
 }
 
 func TestEvolutionWorkerFailureBackoffAndExhaustion(t *testing.T) {
+	root := t.TempDir()
 	clock := newEvolutionWorkerClock()
-	store := openEvolutionWorkerTestStore(t, clock)
+	store, err := OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
 	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 2)
 	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
@@ -199,8 +203,27 @@ func TestEvolutionWorkerFailureBackoffAndExhaustion(t *testing.T) {
 	if failureKey != firstFailure.FailureIdempotencyKey || failureHash != evolutionWorkerFailureHash(firstFailure) || failureWorker != firstFailure.WorkerID || failureLease != firstFailure.LeaseID || failureAttempt != firstFailure.Attempt {
 		t.Fatalf("stored work failure identity = %q/%q/%q/%q/%d", failureKey, failureHash, failureWorker, failureLease, failureAttempt)
 	}
+	firstJSON, err := json.Marshal(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if replayed, replayBlocked, err := store.FailEvolutionWork(firstFailure); err != nil || replayBlocked || replayed.Status != EvolutionWorkPending {
 		t.Fatalf("first failure replay = %#v blocked=%v err=%v", replayed, replayBlocked, err)
+	} else if replayJSON, marshalErr := json.Marshal(replayed); marshalErr != nil || string(replayJSON) != string(firstJSON) {
+		t.Fatalf("first failure replay JSON = %s, %v; want %s", replayJSON, marshalErr, firstJSON)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if replayed, replayBlocked, replayErr := store.FailEvolutionWork(firstFailure); replayErr != nil || replayBlocked {
+		t.Fatalf("reopen first failure replay = %#v blocked=%v err=%v", replayed, replayBlocked, replayErr)
+	} else if replayJSON, marshalErr := json.Marshal(replayed); marshalErr != nil || string(replayJSON) != string(firstJSON) {
+		t.Fatalf("reopen first failure replay JSON = %s, %v; want %s", replayJSON, marshalErr, firstJSON)
 	}
 	changedFailure := firstFailure
 	changedFailure.FailureCode = "different_failure"
@@ -317,6 +340,8 @@ func TestEvolutionWorkerNanosecondAvailabilityExpiryAndIndexes(t *testing.T) {
 		{name: "work expiry", sql: `EXPLAIN QUERY PLAN SELECT work_id FROM evolution_work_items WHERE status = 'leased' AND lease_expires_at_unix_nano <= 1 ORDER BY lease_expires_at_unix_nano, work_id`, index: "idx_evolution_work_lease_expiry"},
 		{name: "outbox claim", sql: `EXPLAIN QUERY PLAN SELECT outbox_id FROM evolution_outbox WHERE status = 'pending' AND available_at_unix_nano <= 1 ORDER BY available_at_unix_nano, created_at, outbox_id LIMIT 1`, index: "idx_evolution_outbox_pending_delivery"},
 		{name: "outbox expiry", sql: `EXPLAIN QUERY PLAN SELECT outbox_id FROM evolution_outbox WHERE status = 'leased' AND lease_expires_at_unix_nano <= 1 ORDER BY lease_expires_at_unix_nano, outbox_id`, index: "idx_evolution_outbox_lease_expiry"},
+		{name: "run unfinished work", sql: `EXPLAIN QUERY PLAN SELECT COUNT(*) FROM evolution_work_items WHERE run_id = 'run' AND status IN ('pending', 'leased')`, index: "idx_evolution_work_run_unfinished"},
+		{name: "run open outbox", sql: `EXPLAIN QUERY PLAN SELECT COUNT(*) FROM evolution_outbox WHERE run_id = 'run' AND status IN ('pending', 'leased')`, index: "idx_evolution_outbox_run_open"},
 	} {
 		t.Run(query.name, func(t *testing.T) {
 			rows, err := store.db.Query(query.sql)
@@ -712,6 +737,10 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 	if !deadLettered || dead.Status != EvolutionOutboxDeadLetter {
 		t.Fatalf("dead letter = %#v, %v", dead, deadLettered)
 	}
+	deadJSON, err := json.Marshal(dead)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var storedFailureKey, storedFailureHash, storedFailureWorker, storedFailureLease string
 	var storedFailureAttempt int
 	if err := store.db.QueryRow(`SELECT failure_idempotency_key, failure_hash, failure_worker_id, failure_lease_id, failure_attempt FROM evolution_outbox WHERE outbox_id = ?`, dead.OutboxID).Scan(&storedFailureKey, &storedFailureHash, &storedFailureWorker, &storedFailureLease, &storedFailureAttempt); err != nil {
@@ -727,11 +756,25 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 	deadReplay := EvolutionOutboxFailure{OutboxID: dead.OutboxID, WorkerID: "dispatcher-c", LeaseID: deadLetterLeaseID, Attempt: dead.Attempt, FailureIdempotencyKey: fmt.Sprintf("sha256:%s", evolutionWorkerPayloadHash(fmt.Sprintf("dead-%d", dead.Attempt))), FailureCode: "delivery_unavailable", FailureMessage: "bounded failure", RetryDelay: time.Second}
 	if replayed, replayDead, err := store.FailEvolutionOutbox(deadReplay); err != nil || !replayDead || replayed.Status != EvolutionOutboxDeadLetter {
 		t.Fatalf("deadletter replay = %#v, %v, %v", replayed, replayDead, err)
+	} else if replayJSON, marshalErr := json.Marshal(replayed); marshalErr != nil || string(replayJSON) != string(deadJSON) {
+		t.Fatalf("deadletter replay JSON = %s, %v; want %s", replayJSON, marshalErr, deadJSON)
 	}
 	changedDeadReplay := deadReplay
 	changedDeadReplay.FailureCode = "different_failure"
 	if _, _, err := store.FailEvolutionOutbox(changedDeadReplay); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
 		t.Fatalf("changed deadletter replay error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed, replayDead, replayErr := store.FailEvolutionOutbox(deadReplay); replayErr != nil || !replayDead {
+		t.Fatalf("reopen deadletter replay = %#v dead=%v err=%v", replayed, replayDead, replayErr)
+	} else if replayJSON, marshalErr := json.Marshal(replayed); marshalErr != nil || string(replayJSON) != string(deadJSON) {
+		t.Fatalf("reopen deadletter replay JSON = %s, %v; want %s", replayJSON, marshalErr, deadJSON)
 	}
 }
 
@@ -924,9 +967,45 @@ func TestEvolutionWorkerPendingOutboxPreventsTerminalRunTransition(t *testing.T)
 	}
 }
 
-func TestEvolutionWorkerLegacyTerminalPendingOutboxDeadLettersAndReportsConflict(t *testing.T) {
+func TestEvolutionWorkerPendingWorkAndTerminalRunGuards(t *testing.T) {
 	clock := newEvolutionWorkerClock()
 	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
+	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
+	beforeEvents, beforeOutbox := evolutionWorkerCounts(t, store, run.RunID)
+	if _, err := store.TransitionRun(run.RunID, EvolutionSuperseded, EvolutionTransitionInput{Actor: "operator", Code: "superseded"}); !errors.Is(err, ErrEvolutionPendingWork) {
+		t.Fatalf("terminal transition with leased work error = %v", err)
+	}
+	if _, err := store.db.Exec(`UPDATE evolution_runs SET status = 'superseded' WHERE run_id = ?`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueEvolutionWork(EvolutionWorkInput{IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID, Capability: EvolutionCapabilityAgent, ArtifactRef: "artifact:sha256:" + workerHex('b'), MaxAttempts: 3}); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("enqueue work on terminal run error = %v", err)
+	}
+	if _, _, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{IdempotencyKey: "33333333-3333-4333-8333-333333333333", RunID: run.RunID, Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('c'), MaxAttempts: 3}); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("enqueue outbox on terminal run error = %v", err)
+	}
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, Attempt: leased.Attempt, ResultIdempotencyKey: "44444444-4444-4444-8444-444444444444", ResultArtifactRef: "artifact:sha256:" + workerHex('d')}); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("complete work on legacy terminal run error = %v", err)
+	}
+	var status string
+	if err := store.db.QueryRow(`SELECT status FROM evolution_work_items WHERE work_id = ?`, work.WorkID).Scan(&status); err != nil || status != string(EvolutionWorkLeased) {
+		t.Fatalf("legacy terminal completion work status = %q, %v", status, err)
+	}
+	afterEvents, afterOutbox := evolutionWorkerCounts(t, store, run.RunID)
+	if afterEvents != beforeEvents || afterOutbox != beforeOutbox {
+		t.Fatalf("terminal guards changed event/outbox counts %d/%d -> %d/%d", beforeEvents, beforeOutbox, afterEvents, afterOutbox)
+	}
+}
+
+func TestEvolutionWorkerLegacyTerminalPendingOutboxDeadLettersAndReportsConflict(t *testing.T) {
+	root := t.TempDir()
+	clock := newEvolutionWorkerClock()
+	store, err := OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
 	message, created, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{
 		IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID,
@@ -943,13 +1022,23 @@ func TestEvolutionWorkerLegacyTerminalPendingOutboxDeadLettersAndReportsConflict
 	if _, err := store.db.Exec(`UPDATE evolution_runs SET status = 'superseded' WHERE run_id = ?`, run.RunID); err != nil {
 		t.Fatal(err)
 	}
-	failed, deadLetter, err := store.FailEvolutionOutbox(EvolutionOutboxFailure{
+	failure := EvolutionOutboxFailure{
 		OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID, Attempt: message.Attempt,
 		FailureIdempotencyKey: "33333333-3333-4333-8333-333333333333", FailureCode: "delivery_unavailable",
 		FailureMessage: "bounded failure", RetryDelay: time.Second,
-	})
+	}
+	failed, deadLetter, err := store.FailEvolutionOutbox(failure)
 	if !errors.Is(err, ErrEvolutionTransitionConflict) || !deadLetter || failed == nil || failed.Status != EvolutionOutboxDeadLetter {
 		t.Fatalf("legacy deadletter = %#v dead=%v err=%v", failed, deadLetter, err)
+	}
+	firstJSON, err := json.Marshal(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed, replayDead, replayErr := store.FailEvolutionOutbox(failure); !errors.Is(replayErr, ErrEvolutionTransitionConflict) || !replayDead {
+		t.Fatalf("same-process legacy replay = %#v dead=%v err=%v", replayed, replayDead, replayErr)
+	} else if replayJSON, marshalErr := json.Marshal(replayed); marshalErr != nil || string(replayJSON) != string(firstJSON) {
+		t.Fatalf("same-process legacy replay JSON = %s, %v; want %s", replayJSON, marshalErr, firstJSON)
 	}
 	var status string
 	if err := store.db.QueryRow(`SELECT status FROM evolution_outbox WHERE outbox_id = ?`, message.OutboxID).Scan(&status); err != nil || status != string(EvolutionOutboxDeadLetter) {
@@ -963,6 +1052,73 @@ func TestEvolutionWorkerLegacyTerminalPendingOutboxDeadLettersAndReportsConflict
 	if err != nil || events[len(events)-1].EventType != "worker_failure" || events[len(events)-1].Code != "outbox_delivery_exhausted" {
 		t.Fatalf("legacy conflict event = %#v, %v", events, err)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if replayed, replayDead, replayErr := store.FailEvolutionOutbox(failure); !errors.Is(replayErr, ErrEvolutionTransitionConflict) || !replayDead {
+		t.Fatalf("reopen legacy replay = %#v dead=%v err=%v", replayed, replayDead, replayErr)
+	} else if replayJSON, marshalErr := json.Marshal(replayed); marshalErr != nil || string(replayJSON) != string(firstJSON) {
+		t.Fatalf("reopen legacy replay JSON = %s, %v; want %s", replayJSON, marshalErr, firstJSON)
+	}
+}
+
+func TestEvolutionWorkerLegacyTerminalExhaustedWorkReplaysConflictAcrossReopen(t *testing.T) {
+	root := t.TempDir()
+	clock := newEvolutionWorkerClock()
+	store, err := OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 1)
+	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
+	if _, err := store.db.Exec(`UPDATE evolution_runs SET status = 'superseded' WHERE run_id = ?`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	failure := EvolutionWorkFailure{
+		WorkID: work.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, Attempt: leased.Attempt,
+		FailureIdempotencyKey: "22222222-2222-4222-8222-222222222222", FailureCode: "generation_failed",
+		FailureMessage: "bounded worker failure", RetryDelay: time.Second,
+	}
+	failed, blocked, err := store.FailEvolutionWork(failure)
+	if !errors.Is(err, ErrEvolutionTransitionConflict) || !blocked || failed == nil || failed.Status != EvolutionWorkBlocked {
+		t.Fatalf("legacy work failure = %#v blocked=%v err=%v", failed, blocked, err)
+	}
+	firstJSON, err := json.Marshal(failed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertReplay := func(label string) {
+		t.Helper()
+		replayed, replayBlocked, replayErr := store.FailEvolutionWork(failure)
+		if !errors.Is(replayErr, ErrEvolutionTransitionConflict) || !replayBlocked {
+			t.Fatalf("%s replay = %#v blocked=%v err=%v", label, replayed, replayBlocked, replayErr)
+		}
+		replayJSON, marshalErr := json.Marshal(replayed)
+		if marshalErr != nil || string(replayJSON) != string(firstJSON) {
+			t.Fatalf("%s replay JSON = %s, %v; want %s", label, replayJSON, marshalErr, firstJSON)
+		}
+	}
+	assertReplay("same-process")
+	changed := failure
+	changed.LeaseID = "lease-different"
+	if _, _, err := store.FailEvolutionWork(changed); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("legacy work changed identity error = %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	assertReplay("reopen")
 }
 
 type evolutionWorkerTestClock struct {

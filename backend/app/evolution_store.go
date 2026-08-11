@@ -35,6 +35,7 @@ var (
 	ErrEvolutionTransitionConflict   = errors.New("evolution run transition conflicts with current state")
 	ErrEvolutionWriteConflict        = errors.New("evolution store write lock unavailable")
 	ErrEvolutionPendingOutbox        = errors.New("evolution run has pending outbox delivery")
+	ErrEvolutionPendingWork          = errors.New("evolution run has unfinished work")
 )
 
 type EvolutionRunInput struct {
@@ -554,6 +555,9 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 		CREATE INDEX idx_evolution_work_lease_expiry
 			ON evolution_work_items(status, lease_expires_at_unix_nano, work_id)
 			WHERE status = 'leased';
+		CREATE INDEX idx_evolution_work_run_unfinished
+			ON evolution_work_items(run_id, status)
+			WHERE status IN ('pending', 'leased');
 		CREATE UNIQUE INDEX idx_evolution_work_result_idempotency
 			ON evolution_work_items(result_idempotency_key)
 			WHERE result_idempotency_key <> '';
@@ -630,6 +634,9 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 		CREATE INDEX idx_evolution_outbox_lease_expiry
 			ON evolution_outbox(status, lease_expires_at_unix_nano, outbox_id)
 			WHERE status = 'leased';
+		CREATE INDEX idx_evolution_outbox_run_open
+			ON evolution_outbox(run_id, status)
+			WHERE status IN ('pending', 'leased');
 		CREATE UNIQUE INDEX idx_evolution_outbox_receipt
 			ON evolution_outbox(receipt_id) WHERE receipt_id <> '';
 	`); err != nil {
@@ -967,6 +974,13 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 		}
 		if pending > 0 {
 			return nil, ErrEvolutionPendingOutbox
+		}
+		var unfinished int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM evolution_work_items WHERE run_id = ? AND status IN ('pending', 'leased')`, runID).Scan(&unfinished); err != nil {
+			return nil, fmt.Errorf("check unfinished evolution work: %w", err)
+		}
+		if unfinished > 0 {
+			return nil, ErrEvolutionPendingWork
 		}
 	}
 	from := run.Status

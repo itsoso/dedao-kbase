@@ -1131,11 +1131,15 @@ func TestEvolutionStoreMigratesV2WorkerSchemaAndReopensAtV3(t *testing.T) {
 			t.Fatalf("outbox column %q count = %d, %v", column, count, err)
 		}
 	}
-	for _, index := range []string{"idx_evolution_outbox_pending_delivery", "idx_evolution_outbox_lease_expiry", "idx_evolution_outbox_receipt"} {
+	for _, index := range []string{"idx_evolution_outbox_pending_delivery", "idx_evolution_outbox_lease_expiry", "idx_evolution_outbox_run_open", "idx_evolution_outbox_receipt"} {
 		var count int
 		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("outbox index %q count = %d, %v", index, count, err)
 		}
+	}
+	var workRunIndex int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_evolution_work_run_unfinished'`).Scan(&workRunIndex); err != nil || workRunIndex != 1 {
+		t.Fatalf("unfinished work run index count = %d, %v", workRunIndex, err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

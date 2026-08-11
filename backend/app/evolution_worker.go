@@ -107,6 +107,7 @@ type EvolutionWork struct {
 	LeaseExpiresAt        string                    `json:"lease_expires_at"`
 	ResultIdempotencyKey  string                    `json:"result_idempotency_key"`
 	ResultArtifactRef     string                    `json:"result_artifact_ref"`
+	FailureIdempotencyKey string                    `json:"failure_idempotency_key"`
 	FailureCode           string                    `json:"failure_code"`
 	FailureMessage        string                    `json:"failure_message"`
 	CreatedAt             string                    `json:"created_at"`
@@ -117,7 +118,6 @@ type EvolutionWork struct {
 	resultAttempt         int
 	availableAtUnixNano   int64
 	leaseExpiresUnixNano  int64
-	failureIdempotencyKey string
 	failureHash           string
 	failureWorkerID       string
 	failureLeaseID        string
@@ -170,6 +170,7 @@ type EvolutionOutboxMessage struct {
 	WorkerID              string                `json:"worker_id"`
 	LeaseExpiresAt        string                `json:"lease_expires_at"`
 	ReceiptID             string                `json:"receipt_id"`
+	FailureIdempotencyKey string                `json:"failure_idempotency_key"`
 	FailureCode           string                `json:"failure_code"`
 	FailureMessage        string                `json:"failure_message"`
 	DeliveredAt           string                `json:"delivered_at"`
@@ -178,7 +179,6 @@ type EvolutionOutboxMessage struct {
 	inputHash             string
 	availableAtUnixNano   int64
 	leaseExpiresUnixNano  int64
-	failureIdempotencyKey string
 	failureHash           string
 	failureWorkerID       string
 	failureLeaseID        string
@@ -225,6 +225,9 @@ func (s *EvolutionControlStore) EnqueueEvolutionWork(input EvolutionWorkInput) (
 		return nil, false, wrapEvolutionSQLiteWriteError("begin enqueue evolution work", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := rejectEvolutionTerminalRunTx(tx, normalized.RunID); err != nil {
+		return nil, false, err
+	}
 	existing, err := loadEvolutionWorkByIdempotencyKeyTx(tx, normalized.IdempotencyKey)
 	if err == nil {
 		if existing.inputHash != inputHash {
@@ -237,12 +240,6 @@ func (s *EvolutionControlStore) EnqueueEvolutionWork(input EvolutionWorkInput) (
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("find evolution work replay: %w", err)
-	}
-	var exists int
-	if err := tx.QueryRow(`SELECT 1 FROM evolution_runs WHERE run_id = ?`, normalized.RunID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		return nil, false, ErrEvolutionRunNotFound
-	} else if err != nil {
-		return nil, false, fmt.Errorf("find evolution work run: %w", err)
 	}
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_work_items (
@@ -401,6 +398,9 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 		}
 		return nil, false, ErrEvolutionIdempotencyConflict
 	}
+	if err := rejectEvolutionTerminalRunTx(tx, work.RunID); err != nil {
+		return nil, false, err
+	}
 	var existingResultWorkID string
 	if err := tx.QueryRow(`SELECT work_id FROM evolution_work_items WHERE result_idempotency_key = ?`, input.ResultIdempotencyKey).Scan(&existingResultWorkID); err == nil {
 		return nil, false, ErrEvolutionIdempotencyConflict
@@ -497,7 +497,7 @@ func (s *EvolutionControlStore) FailEvolutionWork(input EvolutionWorkFailure) (*
 	if err != nil {
 		return nil, false, normalizeEvolutionWorkLoadError(err)
 	}
-	if work.failureIdempotencyKey == input.FailureIdempotencyKey {
+	if work.FailureIdempotencyKey == input.FailureIdempotencyKey {
 		if work.failureHash != failureHash || work.failureWorkerID != input.WorkerID ||
 			work.failureLeaseID != input.LeaseID || work.failureAttempt != input.Attempt {
 			return nil, false, ErrEvolutionIdempotencyConflict
@@ -505,8 +505,15 @@ func (s *EvolutionControlStore) FailEvolutionWork(input EvolutionWorkFailure) (*
 		if work.Attempt != input.Attempt || (work.Status != EvolutionWorkPending && work.Status != EvolutionWorkBlocked) {
 			return nil, false, ErrEvolutionLeaseLost
 		}
+		legacyTerminalConflict, err := evolutionRunIsTerminalTx(tx, work.RunID)
+		if err != nil {
+			return nil, false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work failure replay", err)
+		}
+		if legacyTerminalConflict {
+			return work, work.Status == EvolutionWorkBlocked, ErrEvolutionTransitionConflict
 		}
 		return work, work.Status == EvolutionWorkBlocked, nil
 	}
@@ -542,10 +549,10 @@ func (s *EvolutionControlStore) FailEvolutionWork(input EvolutionWorkFailure) (*
 		work.Status, work.AvailableAt = EvolutionWorkPending, availableAt
 		work.availableAtUnixNano = availableNS
 	}
-	work.LeaseID, work.WorkerID, work.LeaseExpiresAt = "", "", ""
+	work.LeaseID, work.WorkerID, work.LeaseExpiresAt = input.LeaseID, input.WorkerID, ""
 	work.FailureCode, work.FailureMessage, work.UpdatedAt = input.FailureCode, input.FailureMessage, timestamp
 	work.leaseExpiresUnixNano = 0
-	work.failureIdempotencyKey, work.failureHash = input.FailureIdempotencyKey, failureHash
+	work.FailureIdempotencyKey, work.failureHash = input.FailureIdempotencyKey, failureHash
 	work.failureWorkerID, work.failureLeaseID, work.failureAttempt = input.WorkerID, input.LeaseID, input.Attempt
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work failure", err)
@@ -649,6 +656,9 @@ func (s *EvolutionControlStore) EnqueueEvolutionOutbox(input EvolutionOutboxInpu
 		return nil, false, wrapEvolutionSQLiteWriteError("begin enqueue evolution outbox", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := rejectEvolutionTerminalRunTx(tx, normalized.RunID); err != nil {
+		return nil, false, err
+	}
 	existing, err := loadEvolutionOutboxByIdempotencyKeyTx(tx, normalized.IdempotencyKey)
 	if err == nil {
 		if existing.inputHash != inputHash {
@@ -661,12 +671,6 @@ func (s *EvolutionControlStore) EnqueueEvolutionOutbox(input EvolutionOutboxInpu
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("find evolution outbox replay: %w", err)
-	}
-	var exists int
-	if err := tx.QueryRow(`SELECT 1 FROM evolution_runs WHERE run_id = ?`, normalized.RunID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		return nil, false, ErrEvolutionRunNotFound
-	} else if err != nil {
-		return nil, false, fmt.Errorf("find evolution outbox run: %w", err)
 	}
 	if hook := s.hooks.beforeOutboxInsert; hook != nil {
 		if err := hook(); err != nil {
@@ -825,7 +829,7 @@ func (s *EvolutionControlStore) FailEvolutionOutbox(input EvolutionOutboxFailure
 	if err != nil {
 		return nil, false, normalizeEvolutionOutboxLoadError(err)
 	}
-	if message.failureIdempotencyKey == input.FailureIdempotencyKey {
+	if message.FailureIdempotencyKey == input.FailureIdempotencyKey {
 		if message.failureHash != failureHash || message.failureWorkerID != input.WorkerID ||
 			message.failureLeaseID != input.LeaseID || message.failureAttempt != input.Attempt {
 			return nil, false, ErrEvolutionIdempotencyConflict
@@ -833,8 +837,15 @@ func (s *EvolutionControlStore) FailEvolutionOutbox(input EvolutionOutboxFailure
 		if message.Attempt != input.Attempt || (message.Status != EvolutionOutboxPending && message.Status != EvolutionOutboxDeadLetter) {
 			return nil, false, ErrEvolutionLeaseLost
 		}
+		legacyTerminalConflict, err := evolutionRunIsTerminalTx(tx, message.RunID)
+		if err != nil {
+			return nil, false, err
+		}
 		if err := tx.Commit(); err != nil {
 			return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox dead-letter replay", err)
+		}
+		if legacyTerminalConflict {
+			return message, message.Status == EvolutionOutboxDeadLetter, ErrEvolutionTransitionConflict
 		}
 		return message, message.Status == EvolutionOutboxDeadLetter, nil
 	}
@@ -870,10 +881,10 @@ func (s *EvolutionControlStore) FailEvolutionOutbox(input EvolutionOutboxFailure
 		message.Status, message.AvailableAt = EvolutionOutboxPending, availableAt
 		message.availableAtUnixNano = availableNS
 	}
-	message.LeaseID, message.WorkerID, message.LeaseExpiresAt = "", "", ""
+	message.LeaseID, message.WorkerID, message.LeaseExpiresAt = input.LeaseID, input.WorkerID, ""
 	message.FailureCode, message.FailureMessage, message.UpdatedAt = input.FailureCode, input.FailureMessage, timestamp
 	message.leaseExpiresUnixNano = 0
-	message.failureIdempotencyKey, message.failureHash = input.FailureIdempotencyKey, failureHash
+	message.FailureIdempotencyKey, message.failureHash = input.FailureIdempotencyKey, failureHash
 	message.failureWorkerID, message.failureLeaseID, message.failureAttempt = input.WorkerID, input.LeaseID, input.Attempt
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox failure", err)
@@ -1027,6 +1038,27 @@ func (s *EvolutionControlStore) blockEvolutionRunTx(tx *sql.Tx, runID, code, mes
 		return false, fmt.Errorf("validate evolution worker block event: %w", err)
 	}
 	return false, s.insertEventTx(tx, event)
+}
+
+func evolutionRunIsTerminalTx(tx *sql.Tx, runID string) (bool, error) {
+	var status EvolutionRunStatus
+	if err := tx.QueryRow(`SELECT status FROM evolution_runs WHERE run_id = ?`, runID).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return false, ErrEvolutionRunNotFound
+	} else if err != nil {
+		return false, fmt.Errorf("load evolution run status: %w", err)
+	}
+	return isEvolutionTerminalStatus(status), nil
+}
+
+func rejectEvolutionTerminalRunTx(tx *sql.Tx, runID string) error {
+	terminal, err := evolutionRunIsTerminalTx(tx, runID)
+	if err != nil {
+		return err
+	}
+	if terminal {
+		return ErrEvolutionTransitionConflict
+	}
+	return nil
 }
 
 func isEvolutionTerminalStatus(status EvolutionRunStatus) bool {
@@ -1323,7 +1355,7 @@ func scanEvolutionWork(scanner evolutionRowScanner) (*EvolutionWork, error) {
 		&work.Attempt, &work.MaxAttempts, &work.AvailableAt, &work.availableAtUnixNano,
 		&work.LeaseID, &work.WorkerID, &work.LeaseExpiresAt, &work.leaseExpiresUnixNano,
 		&work.ResultIdempotencyKey, &work.ResultArtifactRef, &work.FailureCode, &work.FailureMessage,
-		&work.failureIdempotencyKey, &work.failureHash, &work.failureWorkerID,
+		&work.FailureIdempotencyKey, &work.failureHash, &work.failureWorkerID,
 		&work.failureLeaseID, &work.failureAttempt, &work.CreatedAt, &work.UpdatedAt, &work.inputHash,
 		&work.resultWorkerID, &work.resultLeaseID, &work.resultAttempt,
 	); err != nil {
@@ -1333,7 +1365,7 @@ func scanEvolutionWork(scanner evolutionRowScanner) (*EvolutionWork, error) {
 		work.WorkerID = work.resultWorkerID
 		work.LeaseID = work.resultLeaseID
 		work.Attempt = work.resultAttempt
-	} else if work.Status == EvolutionWorkBlocked {
+	} else if work.FailureIdempotencyKey != "" && work.Status != EvolutionWorkLeased {
 		work.WorkerID = work.failureWorkerID
 		work.LeaseID = work.failureLeaseID
 		work.Attempt = work.failureAttempt
@@ -1371,7 +1403,7 @@ func scanEvolutionOutbox(scanner evolutionRowScanner) (*EvolutionOutboxMessage, 
 		&message.Attempt, &message.MaxAttempts, &message.AvailableAt, &message.availableAtUnixNano,
 		&message.LeaseID, &message.WorkerID, &message.LeaseExpiresAt, &message.leaseExpiresUnixNano,
 		&message.ReceiptID, &message.FailureCode, &message.FailureMessage,
-		&message.failureIdempotencyKey, &message.failureHash, &message.failureWorkerID,
+		&message.FailureIdempotencyKey, &message.failureHash, &message.failureWorkerID,
 		&message.failureLeaseID, &message.failureAttempt, &message.deliveryWorkerID,
 		&message.deliveryLeaseID, &message.deliveryAttempt, &message.DeliveredAt,
 		&message.CreatedAt, &message.UpdatedAt,
@@ -1381,7 +1413,7 @@ func scanEvolutionOutbox(scanner evolutionRowScanner) (*EvolutionOutboxMessage, 
 	}
 	if message.Status == EvolutionOutboxDelivered {
 		message.WorkerID, message.LeaseID, message.Attempt = message.deliveryWorkerID, message.deliveryLeaseID, message.deliveryAttempt
-	} else if message.Status == EvolutionOutboxDeadLetter {
+	} else if message.FailureIdempotencyKey != "" && message.Status != EvolutionOutboxLeased {
 		message.WorkerID, message.LeaseID, message.Attempt = message.failureWorkerID, message.failureLeaseID, message.failureAttempt
 	}
 	return &message, nil
