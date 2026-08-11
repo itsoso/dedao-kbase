@@ -36,6 +36,7 @@ for (const marker of [
   "importWCPlusAccount",
   "rememberWCPlusImportedBooks",
   "renderWCPlusImportedBooks",
+  "renderWCPlusBookLinks",
   "loadWCPlusTasks",
   "createWCPlusTask",
   "createWCPlusTaskForAccount",
@@ -55,6 +56,13 @@ for (const marker of [
 ]) {
   assert.ok(js.includes(marker), `app.js should include ${marker}`);
 }
+
+assert.ok(js.includes("knowledgeBookPath(id)"), "WC Plus imports should link to the canonical knowledge package");
+assert.doesNotMatch(
+  js,
+  /href="\/book-knowledge\?book_id=/,
+  "WC Plus imports should not emit the legacy catalog query link",
+);
 
 for (const endpoint of [
   "/api/wcplus/gzh/list",

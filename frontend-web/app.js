@@ -8148,7 +8148,7 @@ function renderWCPlusSource(showOwnStatus = true) {
   const rawImportedHTML = rawImportedBook
     ? `<div class="wcplus-source__imported">
         <strong>已导入：${escapeHTML(rawImportedBook.title || rawImportedBook.book_id || "WC Plus 文章")}</strong>
-        <a href="/book-knowledge" data-link>打开书籍知识库</a>
+        <div class="wcplus-source__row-actions">${renderWCPlusBookLinks(rawImportedBook)}</div>
       </div>`
     : "";
   const importedBooksHTML = renderWCPlusImportedBooks();
@@ -8522,8 +8522,7 @@ function renderWCPlusImportedBooks() {
         <strong>${escapeHTML(title)}</strong>
         <span>${escapeHTML(id)}</span>
         <div class="wcplus-source__row-actions">
-          ${id ? `<a class="button button-ghost" href="/book-knowledge?book_id=${encodeURIComponent(id)}" data-link>知识库</a>` : ""}
-          ${id ? `<a class="button button-ghost" href="${escapeAttribute(buildBookReaderURL(id))}" data-link>阅读</a>` : ""}
+          ${renderWCPlusBookLinks(book)}
         </div>
       </li>
     `;
@@ -8538,6 +8537,17 @@ function renderWCPlusImportedBooks() {
       </div>
       <ul>${rows}</ul>
     </section>
+  `;
+}
+
+function renderWCPlusBookLinks(book) {
+  const id = String(book?.book_id || "").trim();
+  if (!id) {
+    return "";
+  }
+  return `
+    <a class="button button-ghost" href="${escapeAttribute(knowledgeBookPath(id))}" data-link>知识库</a>
+    <a class="button button-ghost" href="${escapeAttribute(buildBookReaderURL(id))}" data-link>阅读</a>
   `;
 }
 
