@@ -283,15 +283,22 @@ func normalizeEvolutionSignalInput(input EvolutionSignalInput) (normalizedEvolut
 	if err := validateEvolutionIdentity("source_id", normalized.SourceID); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
-	for field, value := range map[string]string{"source_id": normalized.SourceID, "package_id": normalized.PackageID, "release_id": normalized.ReleaseID} {
-		if value != "" {
-			if err := validateEvolutionIdentity(field, value); err != nil {
+	for _, field := range []evolutionStringField{
+		{name: "source_id", value: normalized.SourceID},
+		{name: "package_id", value: normalized.PackageID},
+		{name: "release_id", value: normalized.ReleaseID},
+	} {
+		if field.value != "" {
+			if err := validateEvolutionIdentity(field.name, field.value); err != nil {
 				return normalizedEvolutionSignalInput{}, "", "", "", err
 			}
-			if err := rejectSensitiveEvolutionSignalToken(field, value); err != nil {
+			if err := rejectSensitiveEvolutionSignalToken(field.name, field.value); err != nil {
 				return normalizedEvolutionSignalInput{}, "", "", "", err
 			}
 		}
+	}
+	if err := validateEvolutionSignalSourceID(normalized.SourceType, normalized.SourceID, normalized.ReleaseID); err != nil {
+		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
 	if err := validateEvolutionNumber("observed_value", normalized.ObservedValue); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
@@ -299,7 +306,7 @@ func normalizeEvolutionSignalInput(input EvolutionSignalInput) (normalizedEvolut
 	if err := validateEvolutionNumber("baseline_value", normalized.BaselineValue); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
-	if err := validateEvolutionSignalEvidenceRefs(normalized.EvidenceRefs); err != nil {
+	if err := validateEvolutionSignalEvidenceRefs(normalized); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
 
@@ -345,10 +352,7 @@ func (s *EvolutionControlStore) createEvolutionRunForSignalTx(tx *sql.Tx, input 
 	if err != nil {
 		return nil, err
 	}
-	eventID, err := newEvolutionStoreID("event")
-	if err != nil {
-		return nil, err
-	}
+	eventID := evolutionSignalRequestEventID(input.IdempotencyKey)
 	priority, err := evolutionSignalPriority(input, now, now)
 	if err != nil {
 		return nil, err
@@ -382,7 +386,7 @@ func (s *EvolutionControlStore) createEvolutionRunForSignalTx(tx *sql.Tx, input 
 	event := EvolutionEvent{
 		EventID: eventID, RunID: run.RunID, EventType: "created", Actor: "control-plane",
 		ToStatus: EvolutionDetected, Code: evolutionSignalReasonIngested,
-		ArtifactRefs: evolutionSignalReplayRefs(input.IdempotencyKey, fingerprint, signalID), CreatedAt: timestamp,
+		ArtifactRefs: evolutionSignalReplayRefs(fingerprint, signalID), CreatedAt: timestamp,
 	}
 	if err := s.insertEvolutionRunTx(tx, runInput.IdempotencyKey, inputHash, run, event); err != nil {
 		return nil, err
@@ -430,14 +434,11 @@ func (s *EvolutionControlStore) aggregateEvolutionSignalTx(tx *sql.Tx, run *Evol
 	`, run.RunType, string(baselineReleasesJSON), run.RiskLevel, run.PriorityScore, string(triggerSignalsJSON), run.UpdatedAt, run.RunID); err != nil {
 		return nil, fmt.Errorf("update aggregated evolution run: %w", err)
 	}
-	eventID, err := newEvolutionStoreID("event")
-	if err != nil {
-		return nil, err
-	}
+	eventID := evolutionSignalRequestEventID(input.IdempotencyKey)
 	event := EvolutionEvent{
 		EventID: eventID, RunID: run.RunID, EventType: "signal_aggregated", Actor: "control-plane",
 		Code: evolutionSignalReasonAggregated, Message: "signal aggregated",
-		ArtifactRefs: evolutionSignalReplayRefs(input.IdempotencyKey, fingerprint, signalID), CreatedAt: timestamp,
+		ArtifactRefs: evolutionSignalReplayRefs(fingerprint, signalID), CreatedAt: timestamp,
 	}
 	if err := event.Validate(); err != nil {
 		return nil, err
@@ -487,11 +488,23 @@ func findEvolutionRunForAggregationTx(tx *sql.Tx, input normalizedEvolutionSigna
 }
 
 func evolutionSignalScopeMatchesRun(input normalizedEvolutionSignalInput, runType EvolutionRunType, run *EvolutionRun) bool {
-	if input.PackageID != "" {
-		return run.PackageID == input.PackageID
-	}
-	if runType == EvolutionRunKnowledgeRelease && input.ReleaseID != "" {
-		return containsEvolutionReference(run.BaselineReleaseIDs, input.ReleaseID)
+	samePackage := input.PackageID != "" && run.PackageID != "" && input.PackageID == run.PackageID
+	switch runType {
+	case EvolutionRunAgentPolicy:
+		switch run.RunType {
+		case EvolutionRunAgentPolicy, EvolutionRunCombined:
+			return samePackage
+		case EvolutionRunKnowledgeRelease:
+			// Cross-domain aggregation needs the explicit Package identity on both sides.
+			return samePackage
+		}
+	case EvolutionRunKnowledgeRelease:
+		if run.RunType == EvolutionRunAgentPolicy {
+			// A knowledge signal can promote an Agent run only with an explicit Package relation.
+			return samePackage
+		}
+		packageCompatible := input.PackageID == "" || run.PackageID == "" || samePackage
+		return packageCompatible && containsEvolutionReference(run.BaselineReleaseIDs, input.ReleaseID)
 	}
 	return false
 }
@@ -533,55 +546,39 @@ func loadEvolutionSignalByID(tx *sql.Tx, signalID string) (*EvolutionSignal, err
 }
 
 func loadEvolutionSignalReplayEventTx(tx *sql.Tx, idempotencyKey string) (*EvolutionSignal, *EvolutionRun, string, error) {
-	requestRef := evolutionSignalRequestRef(idempotencyKey)
-	rows, err := tx.Query(`
+	event, err := scanEvolutionEvent(tx.QueryRow(`
 		SELECT event_id, run_id, event_type, actor, from_status, to_status, code,
 			message, artifact_refs_json, created_at
 		FROM evolution_events
-		WHERE code IN (?, ?)
-		ORDER BY sequence ASC
-	`, evolutionSignalReasonIngested, evolutionSignalReasonAggregated)
+		WHERE event_id = ?
+	`, evolutionSignalRequestEventID(idempotencyKey)))
 	if err != nil {
 		return nil, nil, "", err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		event, err := scanEvolutionEvent(rows)
-		if err != nil {
-			return nil, nil, "", err
+	fingerprint, signalID := "", ""
+	for _, ref := range event.ArtifactRefs {
+		switch {
+		case strings.HasPrefix(ref, "input-sha256:"):
+			fingerprint = strings.TrimPrefix(ref, "input-sha256:")
+		case strings.HasPrefix(ref, "signal-id:"):
+			signalID = strings.TrimPrefix(ref, "signal-id:")
 		}
-		if !containsEvolutionReference(event.ArtifactRefs, requestRef) {
-			continue
-		}
-		fingerprint, signalID := "", ""
-		for _, ref := range event.ArtifactRefs {
-			switch {
-			case strings.HasPrefix(ref, "input:"):
-				fingerprint = strings.TrimPrefix(ref, "input:")
-			case strings.HasPrefix(ref, "signal-id:"):
-				signalID = strings.TrimPrefix(ref, "signal-id:")
-			}
-		}
-		if fingerprint == "" || signalID == "" {
-			return nil, nil, "", fmt.Errorf("evolution signal replay event %q is incomplete", event.EventID)
-		}
-		signal, err := loadEvolutionSignalByID(tx, signalID)
-		if err != nil {
-			return nil, nil, "", err
-		}
-		run, err := scanEvolutionRun(tx.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, event.RunID))
-		if err != nil {
-			return nil, nil, "", err
-		}
-		if !containsEvolutionReference(run.TriggerSignalIDs, signalID) {
-			return nil, nil, "", fmt.Errorf("evolution signal replay event %q does not match its run", event.EventID)
-		}
-		return signal, run, fingerprint, nil
 	}
-	if err := rows.Err(); err != nil {
+	if fingerprint == "" || signalID == "" {
+		return nil, nil, "", fmt.Errorf("evolution signal replay event %q is incomplete", event.EventID)
+	}
+	signal, err := loadEvolutionSignalByID(tx, signalID)
+	if err != nil {
 		return nil, nil, "", err
 	}
-	return nil, nil, "", sql.ErrNoRows
+	run, err := scanEvolutionRun(tx.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, event.RunID))
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if !containsEvolutionReference(run.TriggerSignalIDs, signalID) {
+		return nil, nil, "", fmt.Errorf("evolution signal replay event %q does not match its run", event.EventID)
+	}
+	return signal, run, fingerprint, nil
 }
 
 func scanEvolutionSignal(scanner evolutionRowScanner) (*EvolutionSignal, error) {
@@ -880,27 +877,59 @@ func evolutionSeverityRank(severity string) int {
 	}
 }
 
-func validateEvolutionSignalEvidenceRefs(refs []string) error {
+func validateEvolutionSignalSourceID(sourceType, sourceID, releaseID string) error {
+	switch sourceType {
+	case EvolutionSignalSourceRuntimeMetric:
+		if !isAllowedEvolutionMetricCode(sourceID) {
+			return fmt.Errorf("source_id is not an allowed metric code")
+		}
+	case EvolutionSignalSourceKnowledgeStore:
+		if releaseID == "" || sourceID != releaseID {
+			return fmt.Errorf("knowledge_store source_id must equal release_id")
+		}
+	case EvolutionSignalSourceEvaluation, EvolutionSignalSourceUserFeedback,
+		EvolutionSignalSourceOperator, EvolutionSignalSourceObservation,
+		EvolutionSignalSourceReverification:
+		if !isEvolutionOpaqueID(sourceID) {
+			return fmt.Errorf("source_id must be a canonical UUID or sha256 identity")
+		}
+	default:
+		return fmt.Errorf("unsupported evolution source_type %q", sourceType)
+	}
+	return nil
+}
+
+func validateEvolutionSignalEvidenceRefs(input normalizedEvolutionSignalInput) error {
+	refs := input.EvidenceRefs
 	if err := validateEvolutionReferences("evidence_refs", refs, true); err != nil {
 		return err
 	}
-	allowedPrefixes := []string{"metric:", "evaluation:", "feedback:", "release:", "trace:", "observation:", "audit:"}
 	for index, ref := range refs {
-		allowed := false
-		for _, prefix := range allowedPrefixes {
-			if strings.HasPrefix(ref, prefix) && len(ref) > len(prefix) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("evidence_refs[%d] has unsupported reference type", index)
-		}
 		if strings.Contains(ref, "?") || strings.Contains(ref, "//") {
 			return fmt.Errorf("evidence_refs[%d] must not contain paths or URL queries", index)
 		}
 		if err := rejectSensitiveEvolutionSignalToken(fmt.Sprintf("evidence_refs[%d]", index), ref); err != nil {
 			return err
+		}
+		kind, identity, found := strings.Cut(ref, ":")
+		if !found || identity == "" {
+			return fmt.Errorf("evidence_refs[%d] has unsupported reference syntax", index)
+		}
+		switch kind {
+		case "metric":
+			if !isAllowedEvolutionMetricCode(identity) {
+				return fmt.Errorf("evidence_refs[%d] is not an allowed metric", index)
+			}
+		case "evaluation", "feedback", "trace", "observation", "audit":
+			if !isEvolutionOpaqueID(identity) {
+				return fmt.Errorf("evidence_refs[%d] requires an opaque identity", index)
+			}
+		case "release":
+			if input.ReleaseID == "" || identity != input.ReleaseID {
+				return fmt.Errorf("evidence_refs[%d] must match release_id", index)
+			}
+		default:
+			return fmt.Errorf("evidence_refs[%d] has unsupported reference type", index)
 		}
 	}
 	return nil
@@ -914,12 +943,51 @@ func rejectSensitiveEvolutionSignalToken(field, value string) error {
 		strings.Contains(lower, "file:") || strings.Contains(lower, "://") {
 		return fmt.Errorf("%s must not contain an absolute filesystem path", field)
 	}
-	for _, marker := range []string{"token=", "cookie=", "password=", "secret=", "authorization:", "bearer="} {
-		if strings.Contains(lower, marker) {
+	var compactBuilder strings.Builder
+	compactBuilder.Grow(len(lower))
+	for _, character := range lower {
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			compactBuilder.WriteRune(character)
+		}
+	}
+	compact := compactBuilder.String()
+	for _, marker := range []string{"apikey", "accesstoken", "token", "bearer", "authorization", "password", "passwd", "privatekey", "session", "cookie", "secret"} {
+		if strings.Contains(compact, marker) {
 			return fmt.Errorf("%s contains sensitive material", field)
 		}
 	}
 	return nil
+}
+
+func isEvolutionOpaqueID(value string) bool {
+	if strings.HasPrefix(value, "sha256:") {
+		digest := strings.TrimPrefix(value, "sha256:")
+		return len(digest) == sha256.Size*2 && isEvolutionLowerHex(digest)
+	}
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	return isEvolutionLowerHex(strings.ReplaceAll(value, "-", ""))
+}
+
+func isEvolutionLowerHex(value string) bool {
+	for _, character := range value {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return value != ""
+}
+
+func isAllowedEvolutionMetricCode(code string) bool {
+	switch code {
+	case "task_completion_rate", "answer_failure_rate", "tool_failure_rate",
+		"latency_p95_ms", "cost_per_task", "citation_integrity_rate",
+		"release_age_days", "regression_pass_rate":
+		return true
+	default:
+		return false
+	}
 }
 
 func appendUniqueEvolutionReference(values []string, value string) []string {
@@ -944,11 +1012,11 @@ func cloneEvolutionSignal(signal *EvolutionSignal) *EvolutionSignal {
 	return &cloned
 }
 
-func evolutionSignalReplayRefs(idempotencyKey, fingerprint, signalID string) []string {
-	return []string{evolutionSignalRequestRef(idempotencyKey), "input:" + fingerprint, "signal-id:" + signalID}
+func evolutionSignalReplayRefs(fingerprint, signalID string) []string {
+	return []string{"input-sha256:" + fingerprint, "signal-id:" + signalID}
 }
 
-func evolutionSignalRequestRef(idempotencyKey string) string {
+func evolutionSignalRequestEventID(idempotencyKey string) string {
 	digest := sha256.Sum256([]byte(idempotencyKey))
-	return "request:" + hex.EncodeToString(digest[:])
+	return "event-signal-" + hex.EncodeToString(digest[:])
 }

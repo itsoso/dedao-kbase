@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -29,6 +30,51 @@ func TestEvolutionSignalIdempotencyReplayAndConflict(t *testing.T) {
 	changed.Severity = EvolutionSignalSeverityCritical
 	if _, _, _, err := store.IngestSignal(changed); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
 		t.Fatalf("changed replay error = %v", err)
+	}
+	assertEvolutionSignalCounts(t, store, 1, 1, 1)
+}
+
+func TestEvolutionSignalIdempotencyFingerprintCoversEveryPayloadField(t *testing.T) {
+	store := newEvolutionTestStore(t)
+	base := validEvolutionSignalInput("all-fields-conflict")
+	base.ReleaseID = "release-base"
+	base.EvidenceRefs = []string{"evaluation:" + testEvolutionOpaqueID("a"), "metric:regression_pass_rate"}
+	if _, _, _, err := store.IngestSignal(base); err != nil {
+		t.Fatal(err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*EvolutionSignalInput)
+	}{
+		{name: "signal type", mutate: func(input *EvolutionSignalInput) { input.SignalType = EvolutionSignalToolFailure }},
+		{name: "source type", mutate: func(input *EvolutionSignalInput) { input.SourceType = EvolutionSignalSourceObservation }},
+		{name: "source ID", mutate: func(input *EvolutionSignalInput) { input.SourceID = testEvolutionOpaqueID("b") }},
+		{name: "package ID", mutate: func(input *EvolutionSignalInput) { input.PackageID = "research-assistant-v2" }},
+		{name: "release ID", mutate: func(input *EvolutionSignalInput) { input.ReleaseID = "release-changed" }},
+		{name: "severity", mutate: func(input *EvolutionSignalInput) { input.Severity = EvolutionSignalSeverityCritical }},
+		{name: "observed value", mutate: func(input *EvolutionSignalInput) { input.ObservedValue = 0.41 }},
+		{name: "baseline value", mutate: func(input *EvolutionSignalInput) { input.BaselineValue = 0.81 }},
+		{name: "evidence refs", mutate: func(input *EvolutionSignalInput) {
+			input.EvidenceRefs = []string{"evaluation:" + testEvolutionOpaqueID("c")}
+		}},
+		{name: "observed at", mutate: func(input *EvolutionSignalInput) { input.ObservedAt = input.ObservedAt.Add(time.Second) }},
+	}
+	for _, mutation := range mutations {
+		t.Run(mutation.name, func(t *testing.T) {
+			changed := base
+			changed.EvidenceRefs = append([]string{}, base.EvidenceRefs...)
+			mutation.mutate(&changed)
+			if _, _, _, err := store.IngestSignal(changed); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+				t.Fatalf("changed payload error = %v", err)
+			}
+		})
+	}
+
+	equivalent := base
+	equivalent.EvidenceRefs = []string{base.EvidenceRefs[1], base.EvidenceRefs[0]}
+	if _, _, created, err := store.IngestSignal(equivalent); err != nil || created {
+		t.Fatalf("canonical evidence replay = %v, %v", created, err)
 	}
 	assertEvolutionSignalCounts(t, store, 1, 1, 1)
 }
@@ -163,6 +209,78 @@ func TestEvolutionSignalCrossStoreReplayAndAggregationDoNotDuplicateRuns(t *test
 	assertEvolutionSignalCounts(t, stores[0], 1, 1, 3)
 }
 
+func TestEvolutionSignalReplayAndAggregationSurviveStoreReopen(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store, err := OpenEvolutionControlStore(root, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := validEvolutionSignalInput("durable-first")
+	input.ObservedAt = now
+	signal, run, created, err := store.IngestSignal(input)
+	if err != nil || !created {
+		t.Fatalf("first ingest = %#v, %#v, %v, %v", signal, run, created, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenEvolutionControlStore(root, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedSignal, replayedRun, created, err := store.IngestSignal(input)
+	if err != nil || created || replayedSignal.SignalID != signal.SignalID || replayedRun.RunID != run.RunID {
+		t.Fatalf("reopen replay = %#v, %#v, %v, %v", replayedSignal, replayedRun, created, err)
+	}
+	assertEvolutionSignalCounts(t, store, 1, 1, 1)
+
+	now = now.Add(time.Hour)
+	related := input
+	related.IdempotencyKey = "durable-related"
+	related.ObservedAt = now
+	related.ObservedValue = 0.41
+	_, aggregatedRun, created, err := store.IngestSignal(related)
+	if err != nil || created || aggregatedRun.RunID != run.RunID {
+		t.Fatalf("reopen aggregate = %#v, %v, %v", aggregatedRun, created, err)
+	}
+	assertEvolutionSignalCounts(t, store, 1, 1, 2)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err = OpenEvolutionControlStore(root, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	_, durableRun, created, err := store.IngestSignal(related)
+	if err != nil || created || durableRun.RunID != run.RunID {
+		t.Fatalf("event replay after reopen = %#v, %v, %v", durableRun, created, err)
+	}
+	assertEvolutionSignalCounts(t, store, 1, 1, 2)
+}
+
+func TestEvolutionSignalEventFailureRollsBackSignalRunAndMapping(t *testing.T) {
+	injected := errors.New("event insert failed")
+	store := newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{
+		beforeEventInsert: func(EvolutionEvent) error { return injected },
+	})
+	input := validEvolutionSignalInput("atomic-signal")
+	if _, _, _, err := store.IngestSignal(input); !errors.Is(err, injected) {
+		t.Fatalf("ingest error = %v", err)
+	}
+	assertEvolutionSignalCounts(t, store, 0, 0, 0)
+	var mappings int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_events WHERE event_id = ?`, evolutionSignalRequestEventID(input.IdempotencyKey)).Scan(&mappings); err != nil {
+		t.Fatal(err)
+	}
+	if mappings != 0 {
+		t.Fatalf("idempotency mappings = %d", mappings)
+	}
+}
+
 func TestEvolutionSignalTerminalRunIsNotReopened(t *testing.T) {
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
@@ -206,7 +324,7 @@ func TestEvolutionSignalRelatedAgentAndKnowledgeBecomeCombined(t *testing.T) {
 		IdempotencyKey: "combined-knowledge",
 		SignalType:     EvolutionSignalReleaseStale,
 		SourceType:     EvolutionSignalSourceKnowledgeStore,
-		SourceID:       "freshness-check-v1",
+		SourceID:       "release-2026-08",
 		PackageID:      agent.PackageID,
 		ReleaseID:      "release-2026-08",
 		Severity:       EvolutionSignalSeverityHigh,
@@ -227,6 +345,43 @@ func TestEvolutionSignalRelatedAgentAndKnowledgeBecomeCombined(t *testing.T) {
 	}
 	if got := fmt.Sprint(combined.BaselineReleaseIDs); got != "[release-2026-08]" {
 		t.Fatalf("release identity = %s", got)
+	}
+}
+
+func TestEvolutionSignalUnrelatedIdentitiesDoNotAggregateOrCombine(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
+	firstAgent := validEvolutionSignalInput("identity-agent-a")
+	firstAgent.ObservedAt = now
+	_, agentRunA, _, err := store.IngestSignal(firstAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondAgent := firstAgent
+	secondAgent.IdempotencyKey = "identity-agent-b"
+	secondAgent.PackageID = "different-agent"
+	_, agentRunB, _, err := store.IngestSignal(secondAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agentRunA.RunID == agentRunB.RunID || agentRunB.RunType != EvolutionRunAgentPolicy {
+		t.Fatalf("different packages aggregated: %#v / %#v", agentRunA, agentRunB)
+	}
+
+	knowledgeA := validEvolutionKnowledgeSignalInput("identity-release-a", "release-a", "knowledge-agent")
+	knowledgeA.ObservedAt = now
+	_, knowledgeRunA, _, err := store.IngestSignal(knowledgeA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	knowledgeB := validEvolutionKnowledgeSignalInput("identity-release-b", "release-b", "knowledge-agent")
+	knowledgeB.ObservedAt = now
+	_, knowledgeRunB, _, err := store.IngestSignal(knowledgeB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if knowledgeRunA.RunID == knowledgeRunB.RunID || knowledgeRunB.RunType != EvolutionRunKnowledgeRelease {
+		t.Fatalf("different releases aggregated: %#v / %#v", knowledgeRunA, knowledgeRunB)
 	}
 }
 
@@ -257,6 +412,42 @@ func TestEvolutionSignalPriorityIsStableAndExplainable(t *testing.T) {
 	}
 }
 
+func TestEvolutionSignalPriorityRejectsInvalidBoundariesAndAcceptsEdges(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	invalid := []struct {
+		name  string
+		input EvolutionPriorityInput
+	}{
+		{name: "nan", input: EvolutionPriorityInput{Risk: math.NaN(), WaitingSince: now, Now: now}},
+		{name: "positive infinity", input: EvolutionPriorityInput{Impact: math.Inf(1), WaitingSince: now, Now: now}},
+		{name: "negative infinity", input: EvolutionPriorityInput{ExpectedBenefit: math.Inf(-1), WaitingSince: now, Now: now}},
+		{name: "negative risk", input: EvolutionPriorityInput{Risk: -0.01, WaitingSince: now, Now: now}},
+		{name: "risk over one", input: EvolutionPriorityInput{Risk: 1.01, WaitingSince: now, Now: now}},
+		{name: "negative impact", input: EvolutionPriorityInput{Impact: -0.01, WaitingSince: now, Now: now}},
+		{name: "impact over one", input: EvolutionPriorityInput{Impact: 1.01, WaitingSince: now, Now: now}},
+		{name: "negative benefit", input: EvolutionPriorityInput{ExpectedBenefit: -0.01, WaitingSince: now, Now: now}},
+		{name: "benefit over one", input: EvolutionPriorityInput{ExpectedBenefit: 1.01, WaitingSince: now, Now: now}},
+		{name: "future waiting", input: EvolutionPriorityInput{WaitingSince: now.Add(time.Second), Now: now}},
+		{name: "zero waiting since", input: EvolutionPriorityInput{Now: now}},
+		{name: "zero now", input: EvolutionPriorityInput{WaitingSince: now}},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := CalculateEvolutionPriority(test.input); err == nil {
+				t.Fatal("invalid priority was accepted")
+			}
+		})
+	}
+	if score, err := CalculateEvolutionPriority(EvolutionPriorityInput{
+		Risk: 1, Impact: 1, ExpectedBenefit: 1, WaitingSince: now.Add(-7 * 24 * time.Hour), Now: now,
+	}); err != nil || score != 100 {
+		t.Fatalf("upper boundary = %v, %v", score, err)
+	}
+	if score, err := CalculateEvolutionPriority(EvolutionPriorityInput{WaitingSince: now, Now: now}); err != nil || score != 0 {
+		t.Fatalf("lower boundary = %v, %v", score, err)
+	}
+}
+
 func TestEvolutionSignalRejectsUnboundedOrSensitiveInputs(t *testing.T) {
 	store := newEvolutionTestStore(t)
 	tests := []struct {
@@ -272,6 +463,18 @@ func TestEvolutionSignalRejectsUnboundedOrSensitiveInputs(t *testing.T) {
 		{name: "model output source", mutate: func(input *EvolutionSignalInput) { input.SourceType = "model_output" }},
 		{name: "unknown signal", mutate: func(input *EvolutionSignalInput) { input.SignalType = "arbitrary_prompt" }},
 		{name: "sensitive idempotency", mutate: func(input *EvolutionSignalInput) { input.IdempotencyKey = "token=private-value" }},
+		{name: "api key source", mutate: func(input *EvolutionSignalInput) { input.SourceID = "api_key=abc123" }},
+		{name: "private answer source", mutate: func(input *EvolutionSignalInput) { input.SourceID = "private_user_answer" }},
+		{name: "user answer source", mutate: func(input *EvolutionSignalInput) { input.SourceID = "user-answer" }},
+		{name: "feedback body evidence", mutate: func(input *EvolutionSignalInput) { input.EvidenceRefs = []string{"feedback:private_user_answer"} }},
+		{name: "api key trace evidence", mutate: func(input *EvolutionSignalInput) { input.EvidenceRefs = []string{"trace:api_key=abc123"} }},
+		{name: "arbitrary metric evidence", mutate: func(input *EvolutionSignalInput) { input.EvidenceRefs = []string{"metric:user_answer"} }},
+		{name: "release evidence mismatch", mutate: func(input *EvolutionSignalInput) {
+			input.ReleaseID = "release-a"
+			input.EvidenceRefs = []string{"release:release-b"}
+		}},
+		{name: "secret package identity", mutate: func(input *EvolutionSignalInput) { input.PackageID = "access-token-value" }},
+		{name: "secret release identity", mutate: func(input *EvolutionSignalInput) { input.ReleaseID = "session_cookie_value" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -283,6 +486,34 @@ func TestEvolutionSignalRejectsUnboundedOrSensitiveInputs(t *testing.T) {
 		})
 	}
 	assertEvolutionSignalCounts(t, store, 0, 0, 0)
+}
+
+func TestEvolutionSignalAcceptsStructuredSourceAndEvidenceReferences(t *testing.T) {
+	store := newEvolutionTestStore(t)
+	input := validEvolutionSignalInput("structured-evidence")
+	input.EvidenceRefs = []string{
+		"evaluation:" + testEvolutionOpaqueID("b"),
+		"feedback:123e4567-e89b-12d3-a456-426614174000",
+		"metric:regression_pass_rate",
+	}
+	if _, _, created, err := store.IngestSignal(input); err != nil || !created {
+		t.Fatalf("structured evidence = %v, %v", created, err)
+	}
+
+	knowledge := validEvolutionKnowledgeSignalInput("structured-release", "release-2026-08", "knowledge-agent")
+	if _, _, created, err := store.IngestSignal(knowledge); err != nil || !created {
+		t.Fatalf("related release evidence = %v, %v", created, err)
+	}
+
+	metric := validEvolutionSignalInput("structured-metric")
+	metric.SignalType = EvolutionSignalTaskCompletionDrop
+	metric.SourceType = EvolutionSignalSourceRuntimeMetric
+	metric.SourceID = "task_completion_rate"
+	metric.PackageID = "metric-agent"
+	metric.EvidenceRefs = []string{"metric:task_completion_rate"}
+	if _, _, created, err := store.IngestSignal(metric); err != nil || !created {
+		t.Fatalf("allowlisted metric = %v, %v", created, err)
+	}
 }
 
 func TestEvolutionOverviewGroupsFleetAndSortsOpenRuns(t *testing.T) {
@@ -326,19 +557,53 @@ func TestEvolutionOverviewGroupsFleetAndSortsOpenRuns(t *testing.T) {
 	}
 }
 
+func TestEvolutionOverviewUsesRunIDAsFinalStableTieBreak(t *testing.T) {
+	runs := []EvolutionRun{
+		validOverviewRun("run-z", "agent-a", 50, "2026-08-11T10:00:00Z", EvolutionDetected),
+		validOverviewRun("run-a", "agent-a", 50, "2026-08-11T10:00:00Z", EvolutionDetected),
+	}
+	overview, err := BuildEvolutionOverview(nil, runs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(evolutionRunIDs(overview.OpenRuns)); got != "[run-a run-z]" {
+		t.Fatalf("tie order = %s", got)
+	}
+}
+
 func validEvolutionSignalInput(key string) EvolutionSignalInput {
 	return EvolutionSignalInput{
 		IdempotencyKey: key,
 		SignalType:     EvolutionSignalRegressionFailure,
 		SourceType:     EvolutionSignalSourceEvaluation,
-		SourceID:       "regression-suite-v1",
+		SourceID:       testEvolutionOpaqueID("a"),
 		PackageID:      "research-assistant",
 		Severity:       EvolutionSignalSeverityHigh,
 		ObservedValue:  0.4,
 		BaselineValue:  0.8,
-		EvidenceRefs:   []string{"evaluation:suite-v1"},
+		EvidenceRefs:   []string{"evaluation:" + testEvolutionOpaqueID("a")},
 		ObservedAt:     time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC),
 	}
+}
+
+func validEvolutionKnowledgeSignalInput(key, releaseID, packageID string) EvolutionSignalInput {
+	return EvolutionSignalInput{
+		IdempotencyKey: key,
+		SignalType:     EvolutionSignalReleaseStale,
+		SourceType:     EvolutionSignalSourceKnowledgeStore,
+		SourceID:       releaseID,
+		PackageID:      packageID,
+		ReleaseID:      releaseID,
+		Severity:       EvolutionSignalSeverityHigh,
+		ObservedValue:  31,
+		BaselineValue:  30,
+		EvidenceRefs:   []string{"release:" + releaseID},
+		ObservedAt:     time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func testEvolutionOpaqueID(character string) string {
+	return "sha256:" + strings.Repeat(character, 64)
 }
 
 func newEvolutionSignalTestStore(t *testing.T, now func() time.Time) *EvolutionControlStore {
