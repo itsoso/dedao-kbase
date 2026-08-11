@@ -527,10 +527,17 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 			result_idempotency_key TEXT NOT NULL DEFAULT '',
 			result_hash TEXT NOT NULL DEFAULT '',
 			result_artifact_ref TEXT NOT NULL DEFAULT '',
+			result_worker_id TEXT NOT NULL DEFAULT '',
+			result_lease_id TEXT NOT NULL DEFAULT '',
+			result_attempt INTEGER NOT NULL DEFAULT 0 CHECK(result_attempt >= 0),
 			failure_code TEXT NOT NULL DEFAULT '',
 			failure_message TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
+			CHECK(status <> 'completed' OR (
+				result_idempotency_key <> '' AND result_artifact_ref <> '' AND
+				result_worker_id <> '' AND result_lease_id <> '' AND result_attempt = attempt
+			)),
 			FOREIGN KEY(run_id) REFERENCES evolution_runs(run_id)
 		);
 		CREATE INDEX idx_evolution_work_pending_capability

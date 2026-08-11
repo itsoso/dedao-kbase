@@ -34,6 +34,7 @@ const (
 	evolutionMaxLeaseDuration = 15 * time.Minute
 	evolutionMaxAttempts      = 10
 	evolutionMaxRetryDelay    = 24 * time.Hour
+	evolutionAvailableAtNow   = "server_now"
 )
 
 var (
@@ -75,6 +76,7 @@ type EvolutionWorkCompletion struct {
 	WorkID               string `json:"work_id"`
 	WorkerID             string `json:"worker_id"`
 	LeaseID              string `json:"lease_id"`
+	Attempt              int    `json:"attempt"`
 	ResultIdempotencyKey string `json:"result_idempotency_key"`
 	ResultArtifactRef    string `json:"result_artifact_ref"`
 }
@@ -107,6 +109,9 @@ type EvolutionWork struct {
 	CreatedAt            string                    `json:"created_at"`
 	UpdatedAt            string                    `json:"updated_at"`
 	inputHash            string
+	resultWorkerID       string
+	resultLeaseID        string
+	resultAttempt        int
 }
 
 type EvolutionOutboxLeaseInput struct {
@@ -334,7 +339,11 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 		return nil, false, normalizeEvolutionWorkLoadError(err)
 	}
 	if work.Status == EvolutionWorkCompleted {
-		if work.ResultIdempotencyKey == input.ResultIdempotencyKey && work.ResultArtifactRef == input.ResultArtifactRef {
+		if work.ResultIdempotencyKey == input.ResultIdempotencyKey &&
+			work.ResultArtifactRef == input.ResultArtifactRef &&
+			work.resultWorkerID == input.WorkerID &&
+			work.resultLeaseID == input.LeaseID &&
+			work.resultAttempt == input.Attempt {
 			if err := tx.Commit(); err != nil {
 				return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work result replay", err)
 			}
@@ -351,12 +360,17 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 	if err := validateActiveEvolutionWorkLease(work, input.WorkerID, input.LeaseID, now); err != nil {
 		return nil, false, err
 	}
+	if work.Attempt != input.Attempt {
+		return nil, false, ErrEvolutionLeaseLost
+	}
 	result, err := tx.Exec(`
 		UPDATE evolution_work_items SET status = 'completed', result_idempotency_key = ?,
-			result_hash = ?, result_artifact_ref = ?, lease_id = '', lease_owner = '',
+			result_hash = ?, result_artifact_ref = ?, result_worker_id = ?, result_lease_id = ?,
+			result_attempt = ?, lease_id = '', lease_owner = '',
 			lease_expires_at = '', updated_at = ?
 		WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?
-	`, input.ResultIdempotencyKey, resultHash, input.ResultArtifactRef, timestamp,
+	`, input.ResultIdempotencyKey, resultHash, input.ResultArtifactRef, input.WorkerID, input.LeaseID,
+		input.Attempt, timestamp,
 		input.WorkID, input.WorkerID, input.LeaseID, timestamp)
 	if err != nil {
 		return nil, false, fmt.Errorf("complete evolution work: %w", err)
@@ -404,7 +418,8 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 		return nil, false, fmt.Errorf("insert evolution worker result outbox: %w", err)
 	}
 	work.Status, work.ResultIdempotencyKey, work.ResultArtifactRef = EvolutionWorkCompleted, input.ResultIdempotencyKey, input.ResultArtifactRef
-	work.LeaseID, work.WorkerID, work.LeaseExpiresAt, work.UpdatedAt = "", "", "", timestamp
+	work.resultWorkerID, work.resultLeaseID, work.resultAttempt = input.WorkerID, input.LeaseID, input.Attempt
+	work.WorkerID, work.LeaseID, work.LeaseExpiresAt, work.UpdatedAt = input.WorkerID, input.LeaseID, "", timestamp
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work completion", err)
 	}
@@ -835,12 +850,29 @@ func normalizeEvolutionWorkInput(input EvolutionWorkInput, now time.Time) (Evolu
 	if input.MaxAttempts < 1 || input.MaxAttempts > evolutionMaxAttempts {
 		return EvolutionWorkInput{}, "", fmt.Errorf("max_attempts must be between 1 and %d", evolutionMaxAttempts)
 	}
+	semanticAvailableAt := evolutionAvailableAtNow
 	if input.AvailableAt.IsZero() {
 		input.AvailableAt = now
 	} else {
 		input.AvailableAt = input.AvailableAt.UTC()
+		semanticAvailableAt = input.AvailableAt.Format(time.RFC3339Nano)
 	}
-	payload, err := json.Marshal(input)
+	fingerprint := struct {
+		IdempotencyKey string                    `json:"idempotency_key"`
+		RunID          string                    `json:"run_id"`
+		Capability     EvolutionWorkerCapability `json:"capability"`
+		ArtifactRef    string                    `json:"artifact_ref"`
+		AvailableAt    string                    `json:"available_at"`
+		MaxAttempts    int                       `json:"max_attempts"`
+	}{
+		IdempotencyKey: input.IdempotencyKey,
+		RunID:          input.RunID,
+		Capability:     input.Capability,
+		ArtifactRef:    input.ArtifactRef,
+		AvailableAt:    semanticAvailableAt,
+		MaxAttempts:    input.MaxAttempts,
+	}
+	payload, err := json.Marshal(fingerprint)
 	if err != nil {
 		return EvolutionWorkInput{}, "", fmt.Errorf("encode evolution work input: %w", err)
 	}
@@ -863,12 +895,29 @@ func normalizeEvolutionOutboxInput(input EvolutionOutboxInput, now time.Time) (E
 	if input.MaxAttempts < 1 || input.MaxAttempts > evolutionMaxAttempts {
 		return EvolutionOutboxInput{}, "", fmt.Errorf("max_attempts must be between 1 and %d", evolutionMaxAttempts)
 	}
+	semanticAvailableAt := evolutionAvailableAtNow
 	if input.AvailableAt.IsZero() {
 		input.AvailableAt = now
 	} else {
 		input.AvailableAt = input.AvailableAt.UTC()
+		semanticAvailableAt = input.AvailableAt.Format(time.RFC3339Nano)
 	}
-	payload, err := json.Marshal(input)
+	fingerprint := struct {
+		IdempotencyKey string `json:"idempotency_key"`
+		RunID          string `json:"run_id"`
+		Topic          string `json:"topic"`
+		PayloadRef     string `json:"payload_ref"`
+		AvailableAt    string `json:"available_at"`
+		MaxAttempts    int    `json:"max_attempts"`
+	}{
+		IdempotencyKey: input.IdempotencyKey,
+		RunID:          input.RunID,
+		Topic:          input.Topic,
+		PayloadRef:     input.PayloadRef,
+		AvailableAt:    semanticAvailableAt,
+		MaxAttempts:    input.MaxAttempts,
+	}
+	payload, err := json.Marshal(fingerprint)
 	if err != nil {
 		return EvolutionOutboxInput{}, "", fmt.Errorf("encode evolution outbox input: %w", err)
 	}
@@ -923,6 +972,9 @@ func validateEvolutionWorkCompletion(input EvolutionWorkCompletion) error {
 	}
 	if !isEvolutionOpaqueID(input.ResultIdempotencyKey) {
 		return fmt.Errorf("result_idempotency_key must be a canonical UUID or sha256 identity")
+	}
+	if input.Attempt < 1 || input.Attempt > evolutionMaxAttempts {
+		return fmt.Errorf("attempt must be between 1 and %d", evolutionMaxAttempts)
 	}
 	return validateEvolutionWorkerArtifactRef("result_artifact_ref", input.ResultArtifactRef)
 }
@@ -1039,7 +1091,8 @@ func validateActiveEvolutionOutboxLease(message *EvolutionOutboxMessage, workerI
 const evolutionWorkSelect = `
 	SELECT work_id, run_id, capability, artifact_ref, status, attempt, max_attempts,
 		available_at, lease_id, lease_owner, lease_expires_at, result_idempotency_key,
-		result_artifact_ref, failure_code, failure_message, created_at, updated_at, input_hash
+		result_artifact_ref, failure_code, failure_message, created_at, updated_at, input_hash,
+		result_worker_id, result_lease_id, result_attempt
 	FROM evolution_work_items`
 
 func scanEvolutionWork(scanner evolutionRowScanner) (*EvolutionWork, error) {
@@ -1049,8 +1102,14 @@ func scanEvolutionWork(scanner evolutionRowScanner) (*EvolutionWork, error) {
 		&work.Attempt, &work.MaxAttempts, &work.AvailableAt, &work.LeaseID, &work.WorkerID,
 		&work.LeaseExpiresAt, &work.ResultIdempotencyKey, &work.ResultArtifactRef,
 		&work.FailureCode, &work.FailureMessage, &work.CreatedAt, &work.UpdatedAt, &work.inputHash,
+		&work.resultWorkerID, &work.resultLeaseID, &work.resultAttempt,
 	); err != nil {
 		return nil, err
+	}
+	if work.Status == EvolutionWorkCompleted {
+		work.WorkerID = work.resultWorkerID
+		work.LeaseID = work.resultLeaseID
+		work.Attempt = work.resultAttempt
 	}
 	return &work, nil
 }

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -153,7 +154,7 @@ func TestEvolutionWorkerRenewsRejectsStaleLeaseAndRecoversExpiredAttempt(t *test
 	if err != nil || !ok || second.Attempt != 2 || second.LeaseID == firstLeaseID {
 		t.Fatalf("second lease = %#v, %v, %v", second, ok, err)
 	}
-	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: firstLeaseID, ResultIdempotencyKey: "33333333-3333-4333-8333-333333333333", ResultArtifactRef: "artifact:sha256:" + workerHex('b')}); !errors.Is(err, ErrEvolutionLeaseLost) {
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: firstLeaseID, Attempt: 1, ResultIdempotencyKey: "33333333-3333-4333-8333-333333333333", ResultArtifactRef: "artifact:sha256:" + workerHex('b')}); !errors.Is(err, ErrEvolutionLeaseLost) {
 		t.Fatalf("stale completion error = %v", err)
 	}
 	clock.Advance(2 * time.Minute)
@@ -222,7 +223,7 @@ func TestEvolutionWorkerCompletionIsIdempotentAndAtomic(t *testing.T) {
 	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
 	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
 	completion := EvolutionWorkCompletion{
-		WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID,
+		WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, Attempt: leased.Attempt,
 		ResultIdempotencyKey: "33333333-3333-4333-8333-333333333333",
 		ResultArtifactRef:    "artifact:sha256:" + workerHex('b'),
 	}
@@ -255,7 +256,7 @@ func TestEvolutionWorkerCompletionIsIdempotentAndAtomic(t *testing.T) {
 	secondRun := createEvolutionWorkerTestRun(t, store, "77777777-7777-4777-8777-777777777777")
 	secondWork := enqueueEvolutionWorkerTestWork(t, store, secondRun.RunID, 3)
 	secondLease := leaseEvolutionWorkerTestWork(t, store, "worker-b")
-	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: secondWork.WorkID, WorkerID: "worker-b", LeaseID: secondLease.LeaseID, ResultIdempotencyKey: completion.ResultIdempotencyKey, ResultArtifactRef: completion.ResultArtifactRef}); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: secondWork.WorkID, WorkerID: "worker-b", LeaseID: secondLease.LeaseID, Attempt: secondLease.Attempt, ResultIdempotencyKey: completion.ResultIdempotencyKey, ResultArtifactRef: completion.ResultArtifactRef}); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
 		t.Fatalf("cross-work result replay error = %v", err)
 	}
 
@@ -264,7 +265,7 @@ func TestEvolutionWorkerCompletionIsIdempotentAndAtomic(t *testing.T) {
 	rollbackRun := createEvolutionWorkerTestRun(t, rollbackStore, "55555555-5555-4555-8555-555555555555")
 	rollbackWork := enqueueEvolutionWorkerTestWork(t, rollbackStore, rollbackRun.RunID, 3)
 	rollbackLease := leaseEvolutionWorkerTestWork(t, rollbackStore, "worker-a")
-	if _, _, err := rollbackStore.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: rollbackWork.WorkID, WorkerID: "worker-a", LeaseID: rollbackLease.LeaseID, ResultIdempotencyKey: "66666666-6666-4666-8666-666666666666", ResultArtifactRef: "artifact:sha256:" + workerHex('d')}); !errors.Is(err, injected) {
+	if _, _, err := rollbackStore.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: rollbackWork.WorkID, WorkerID: "worker-a", LeaseID: rollbackLease.LeaseID, Attempt: rollbackLease.Attempt, ResultIdempotencyKey: "66666666-6666-4666-8666-666666666666", ResultArtifactRef: "artifact:sha256:" + workerHex('d')}); !errors.Is(err, injected) {
 		t.Fatalf("atomic failure = %v", err)
 	}
 	var status string
@@ -273,6 +274,169 @@ func TestEvolutionWorkerCompletionIsIdempotentAndAtomic(t *testing.T) {
 	}
 	if events, outbox := evolutionWorkerCounts(t, rollbackStore, rollbackRun.RunID); events != 1 || outbox != 0 {
 		t.Fatalf("rollback counts events=%d outbox=%d", events, outbox)
+	}
+}
+
+func TestEvolutionWorkerCompletionPersistsResultLeaseIdentityAcrossReopen(t *testing.T) {
+	root := t.TempDir()
+	clock := newEvolutionWorkerClock()
+	store, err := OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
+	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
+	completion := EvolutionWorkCompletion{
+		WorkID: work.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, Attempt: leased.Attempt,
+		ResultIdempotencyKey: "22222222-2222-4222-8222-222222222222",
+		ResultArtifactRef:    "artifact:sha256:" + workerHex('b'),
+	}
+	completed, replay, err := store.CompleteEvolutionWork(completion)
+	if err != nil || replay {
+		t.Fatalf("complete = %#v replay=%v err=%v", completed, replay, err)
+	}
+	if completed.WorkerID != completion.WorkerID || completed.LeaseID != completion.LeaseID || completed.Attempt != completion.Attempt {
+		t.Fatalf("completion identity = worker=%q lease=%q attempt=%d", completed.WorkerID, completed.LeaseID, completed.Attempt)
+	}
+	encoded, err := json.Marshal(completed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var public map[string]any
+	if err := json.Unmarshal(encoded, &public); err != nil {
+		t.Fatal(err)
+	}
+	if public["worker_id"] != completion.WorkerID || public["lease_id"] != completion.LeaseID || public["attempt"] != float64(completion.Attempt) {
+		t.Fatalf("completion JSON = %s", encoded)
+	}
+	var storedWorker, storedLease, currentWorker, currentLease string
+	var storedAttempt int
+	if err := store.db.QueryRow(`SELECT result_worker_id, result_lease_id, result_attempt, lease_owner, lease_id FROM evolution_work_items WHERE work_id = ?`, work.WorkID).Scan(&storedWorker, &storedLease, &storedAttempt, &currentWorker, &currentLease); err != nil {
+		t.Fatal(err)
+	}
+	if storedWorker != completion.WorkerID || storedLease != completion.LeaseID || storedAttempt != completion.Attempt || currentWorker != "" || currentLease != "" {
+		t.Fatalf("stored result identity = %q/%q/%d current=%q/%q", storedWorker, storedLease, storedAttempt, currentWorker, currentLease)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	replayed, replay, err := store.CompleteEvolutionWork(completion)
+	if err != nil || !replay || replayed.WorkerID != completion.WorkerID || replayed.LeaseID != completion.LeaseID || replayed.Attempt != completion.Attempt {
+		t.Fatalf("reopen replay = %#v replay=%v err=%v", replayed, replay, err)
+	}
+	workerConflict := completion
+	workerConflict.WorkerID = "worker-b"
+	leaseConflict := completion
+	leaseConflict.LeaseID = "lease-stale"
+	attemptConflict := completion
+	attemptConflict.Attempt++
+	for _, test := range []struct {
+		name       string
+		completion EvolutionWorkCompletion
+	}{
+		{name: "worker", completion: workerConflict},
+		{name: "lease", completion: leaseConflict},
+		{name: "attempt", completion: attemptConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := store.CompleteEvolutionWork(test.completion); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+				t.Fatalf("identity conflict error = %v", err)
+			}
+		})
+	}
+}
+
+func TestEvolutionWorkerEmptyAvailableAtHasStableIdempotencyFingerprint(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	workInput := EvolutionWorkInput{
+		IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID,
+		Capability: EvolutionCapabilityAgent, ArtifactRef: "artifact:sha256:" + workerHex('a'), MaxAttempts: 3,
+	}
+	work, created, err := store.EnqueueEvolutionWork(workInput)
+	if err != nil || !created {
+		t.Fatalf("enqueue work = %#v created=%v err=%v", work, created, err)
+	}
+	clock.Advance(time.Hour)
+	replayedWork, created, err := store.EnqueueEvolutionWork(workInput)
+	if err != nil || created || replayedWork.WorkID != work.WorkID {
+		t.Fatalf("empty available work replay = %#v created=%v err=%v", replayedWork, created, err)
+	}
+	var workCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_work_items WHERE idempotency_key = ?`, workInput.IdempotencyKey).Scan(&workCount); err != nil || workCount != 1 {
+		t.Fatalf("empty available work replay count = %d, %v", workCount, err)
+	}
+	explicitWork := workInput
+	explicitWork.AvailableAt, err = time.Parse(time.RFC3339Nano, work.AvailableAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueEvolutionWork(explicitWork); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("empty to explicit work error = %v", err)
+	}
+
+	outboxInput := EvolutionOutboxInput{
+		IdempotencyKey: "33333333-3333-4333-8333-333333333333", RunID: run.RunID,
+		Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('b'), MaxAttempts: 3,
+	}
+	outbox, created, err := store.EnqueueEvolutionOutbox(outboxInput)
+	if err != nil || !created {
+		t.Fatalf("enqueue outbox = %#v created=%v err=%v", outbox, created, err)
+	}
+	clock.Advance(time.Hour)
+	replayedOutbox, created, err := store.EnqueueEvolutionOutbox(outboxInput)
+	if err != nil || created || replayedOutbox.OutboxID != outbox.OutboxID {
+		t.Fatalf("empty available outbox replay = %#v created=%v err=%v", replayedOutbox, created, err)
+	}
+	var outboxCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_outbox WHERE idempotency_key = ?`, outboxInput.IdempotencyKey).Scan(&outboxCount); err != nil || outboxCount != 1 {
+		t.Fatalf("empty available outbox replay count = %d, %v", outboxCount, err)
+	}
+	explicitOutbox := outboxInput
+	explicitOutbox.AvailableAt, err = time.Parse(time.RFC3339Nano, outbox.AvailableAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueEvolutionOutbox(explicitOutbox); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("empty to explicit outbox error = %v", err)
+	}
+
+	explicitWork.IdempotencyKey = "44444444-4444-4444-8444-444444444444"
+	explicitWork.AvailableAt = clock.Now().Add(time.Hour)
+	explicitCreated, created, err := store.EnqueueEvolutionWork(explicitWork)
+	if err != nil || !created {
+		t.Fatalf("explicit work = %#v created=%v err=%v", explicitCreated, created, err)
+	}
+	clock.Advance(time.Hour)
+	if replayed, created, err := store.EnqueueEvolutionWork(explicitWork); err != nil || created || replayed.WorkID != explicitCreated.WorkID {
+		t.Fatalf("explicit work replay = %#v created=%v err=%v", replayed, created, err)
+	}
+	changedExplicit := explicitWork
+	changedExplicit.AvailableAt = changedExplicit.AvailableAt.Add(time.Second)
+	if _, _, err := store.EnqueueEvolutionWork(changedExplicit); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("changed explicit work error = %v", err)
+	}
+	explicitOutbox.IdempotencyKey = "55555555-5555-4555-8555-555555555555"
+	explicitOutbox.AvailableAt = clock.Now().Add(time.Hour)
+	explicitOutboxCreated, created, err := store.EnqueueEvolutionOutbox(explicitOutbox)
+	if err != nil || !created {
+		t.Fatalf("explicit outbox = %#v created=%v err=%v", explicitOutboxCreated, created, err)
+	}
+	clock.Advance(time.Hour)
+	if replayed, created, err := store.EnqueueEvolutionOutbox(explicitOutbox); err != nil || created || replayed.OutboxID != explicitOutboxCreated.OutboxID {
+		t.Fatalf("explicit outbox replay = %#v created=%v err=%v", replayed, created, err)
+	}
+	changedExplicitOutbox := explicitOutbox
+	changedExplicitOutbox.AvailableAt = changedExplicitOutbox.AvailableAt.Add(time.Second)
+	if _, _, err := store.EnqueueEvolutionOutbox(changedExplicitOutbox); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("changed explicit outbox error = %v", err)
 	}
 }
 
@@ -286,7 +450,7 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
 	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
 	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
-	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, ResultIdempotencyKey: "22222222-2222-4222-8222-222222222222", ResultArtifactRef: "artifact:sha256:" + workerHex('b')}); err != nil {
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, Attempt: leased.Attempt, ResultIdempotencyKey: "22222222-2222-4222-8222-222222222222", ResultArtifactRef: "artifact:sha256:" + workerHex('b')}); err != nil {
 		t.Fatal(err)
 	}
 	message, ok, err := store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher-a", LeaseDuration: time.Minute})
@@ -326,7 +490,7 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 	secondRun := createEvolutionWorkerTestRun(t, store, "55555555-5555-4555-8555-555555555555")
 	secondWork := enqueueEvolutionWorkerTestWork(t, store, secondRun.RunID, 3)
 	secondLease := leaseEvolutionWorkerTestWork(t, store, "worker-c")
-	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: secondWork.WorkID, WorkerID: "worker-c", LeaseID: secondLease.LeaseID, ResultIdempotencyKey: "66666666-6666-4666-8666-666666666666", ResultArtifactRef: "artifact:sha256:" + workerHex('e')}); err != nil {
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: secondWork.WorkID, WorkerID: "worker-c", LeaseID: secondLease.LeaseID, Attempt: secondLease.Attempt, ResultIdempotencyKey: "66666666-6666-4666-8666-666666666666", ResultArtifactRef: "artifact:sha256:" + workerHex('e')}); err != nil {
 		t.Fatal(err)
 	}
 	dead, ok, err := store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher-c", LeaseDuration: time.Minute})
@@ -406,7 +570,7 @@ func TestEvolutionWorkerOutboxDeadLetterRollsBackRunEventAndMessage(t *testing.T
 	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
 	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
 	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
-	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, ResultIdempotencyKey: "22222222-2222-4222-8222-222222222222", ResultArtifactRef: "artifact:sha256:" + workerHex('f')}); err != nil {
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, Attempt: leased.Attempt, ResultIdempotencyKey: "22222222-2222-4222-8222-222222222222", ResultArtifactRef: "artifact:sha256:" + workerHex('f')}); err != nil {
 		t.Fatal(err)
 	}
 	message, ok, err := store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher", LeaseDuration: time.Minute})

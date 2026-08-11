@@ -1143,6 +1143,12 @@ func TestEvolutionStoreMigratesV2WorkerSchemaAndReopensAtV3(t *testing.T) {
 	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'evolution_work_items'`).Scan(&workTables); err != nil || workTables != 1 {
 		t.Fatalf("work table count = %d, %v", workTables, err)
 	}
+	for _, column := range []string{"result_worker_id", "result_lease_id", "result_attempt"} {
+		var count int
+		if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('evolution_work_items') WHERE name = ?`, column).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("work result column %q count = %d, %v", column, count, err)
+		}
+	}
 }
 
 func TestEvolutionStoreV3MigrationFailureRollsBackWholeVersion(t *testing.T) {
