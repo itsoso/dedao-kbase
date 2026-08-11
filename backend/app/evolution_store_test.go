@@ -1,8 +1,11 @@
 package app
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -182,7 +185,15 @@ func TestEvolutionStoreConcurrentCreateIsIdempotent(t *testing.T) {
 }
 
 func TestEvolutionStoreTransitionsRunAndEventAtomically(t *testing.T) {
-	store := newEvolutionTestStore(t)
+	injected := errors.New("event insert failed")
+	store := newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{
+		beforeEventInsert: func(event EvolutionEvent) error {
+			if event.ToStatus == EvolutionGenerating {
+				return injected
+			}
+			return nil
+		},
+	})
 	run := createEvolutionTestRun(t, store, "atomic-transition")
 	updated, err := store.TransitionRun(run.RunID, EvolutionTriaged, EvolutionTransitionInput{
 		Actor: "operator",
@@ -199,13 +210,6 @@ func TestEvolutionStoreTransitionsRunAndEventAtomically(t *testing.T) {
 		t.Fatalf("events = %#v", events)
 	}
 
-	injected := errors.New("event insert failed")
-	store.testHooks.beforeEventInsert = func(event EvolutionEvent) error {
-		if event.ToStatus == EvolutionGenerating {
-			return injected
-		}
-		return nil
-	}
 	if _, err := store.TransitionRun(run.RunID, EvolutionGenerating, EvolutionTransitionInput{
 		Actor: "operator",
 		Code:  "generate",
@@ -226,9 +230,10 @@ func TestEvolutionStoreTransitionsRunAndEventAtomically(t *testing.T) {
 }
 
 func TestEvolutionStoreRollsBackCreateWhenEventInsertFails(t *testing.T) {
-	store := newEvolutionTestStore(t)
 	injected := errors.New("event insert failed")
-	store.testHooks.beforeEventInsert = func(EvolutionEvent) error { return injected }
+	store := newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{
+		beforeEventInsert: func(EvolutionEvent) error { return injected },
+	})
 	if _, _, err := store.CreateRun(validEvolutionRunInput("failed-create")); !errors.Is(err, injected) {
 		t.Fatalf("CreateRun error = %v", err)
 	}
@@ -245,13 +250,15 @@ func TestEvolutionStoreRollsBackCreateWhenEventInsertFails(t *testing.T) {
 }
 
 func TestEvolutionStoreRejectsInvalidTransitionInputBeforeTransaction(t *testing.T) {
-	store := newEvolutionTestStore(t)
-	run := createEvolutionTestRun(t, store, "invalid-transition")
 	beginCalls := 0
-	store.testHooks.beforeBeginTx = func() error {
-		beginCalls++
-		return nil
-	}
+	store := newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{
+		beforeBeginTx: func() error {
+			beginCalls++
+			return nil
+		},
+	})
+	run := createEvolutionTestRun(t, store, "invalid-transition")
+	beginCalls = 0
 	tests := []struct {
 		name  string
 		to    EvolutionRunStatus
@@ -286,12 +293,13 @@ func TestEvolutionStoreRejectsInvalidTransitionInputBeforeTransaction(t *testing
 }
 
 func TestEvolutionStoreRejectsInvalidCreateInputBeforeTransaction(t *testing.T) {
-	store := newEvolutionTestStore(t)
 	beginCalls := 0
-	store.testHooks.beforeBeginTx = func() error {
-		beginCalls++
-		return nil
-	}
+	store := newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{
+		beforeBeginTx: func() error {
+			beginCalls++
+			return nil
+		},
+	})
 	tests := []struct {
 		name   string
 		mutate func(*EvolutionRunInput)
@@ -323,9 +331,10 @@ func TestEvolutionStoreRejectsInvalidCreateInputBeforeTransaction(t *testing.T) 
 }
 
 func TestEvolutionStoreReturnsBeforeBeginHookError(t *testing.T) {
-	store := newEvolutionTestStore(t)
 	injected := errors.New("before begin failed")
-	store.testHooks.beforeBeginTx = func() error { return injected }
+	store := newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{
+		beforeBeginTx: func() error { return injected },
+	})
 	if _, _, err := store.CreateRun(validEvolutionRunInput("before-begin-failure")); !errors.Is(err, injected) {
 		t.Fatalf("CreateRun error = %v, want %v", err, injected)
 	}
@@ -385,9 +394,295 @@ func TestEvolutionStoreListEventsUsesStableBoundedCursorPagination(t *testing.T)
 	}
 }
 
+func TestEvolutionStoreConnectionConfigurationSurvivesReconnect(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root with spaces # and %")
+	store := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{})
+	if _, err := os.Stat(filepath.Join(root, evolutionControlDBName)); err != nil {
+		t.Fatalf("encoded database path: %v", err)
+	}
+	if dsn := evolutionSQLiteDSN(store.dbPath); strings.Contains(dsn, " ") || strings.Contains(strings.TrimPrefix(dsn, "file:"), "#") {
+		t.Fatalf("database DSN is not URL encoded: %q", dsn)
+	}
+	store.db.SetMaxIdleConns(0)
+	for attempt := 1; attempt <= 2; attempt++ {
+		conn, err := store.db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var busyTimeout, foreignKeys int
+		if err := conn.QueryRowContext(context.Background(), `PRAGMA busy_timeout`).Scan(&busyTimeout); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		if err := conn.QueryRowContext(context.Background(), `PRAGMA foreign_keys`).Scan(&foreignKeys); err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if busyTimeout != 5000 || foreignKeys != 1 {
+			t.Fatalf("connection %d pragmas = busy_timeout %d, foreign_keys %d", attempt, busyTimeout, foreignKeys)
+		}
+	}
+	_, err := store.db.Exec(`
+		INSERT INTO evolution_candidates (
+			candidate_id, idempotency_key, run_id, candidate_type, content_hash,
+			artifact_ref, baseline_identity, change_summary, generator_version, created_at
+		) VALUES ('orphan', 'orphan', 'missing-run', 'agent', 'sha256:orphan',
+			'artifact:orphan', 'baseline:orphan', 'orphan', 'generator-1', '2026-08-11T18:00:00Z')
+	`)
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "foreign key") {
+		t.Fatalf("orphan candidate error = %v", err)
+	}
+}
+
+func TestEvolutionStoreCrossStoreCreateSameInputIsIdempotent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared evolution root")
+	stores := []*EvolutionControlStore{
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+	}
+	input := validEvolutionRunInput("cross-store-same")
+	start := make(chan struct{})
+	type result struct {
+		run     *EvolutionRun
+		created bool
+		err     error
+	}
+	results := make(chan result, len(stores))
+	for _, store := range stores {
+		go func(store *EvolutionControlStore) {
+			<-start
+			run, created, err := store.CreateRun(input)
+			results <- result{run: run, created: created, err: err}
+		}(store)
+	}
+	close(start)
+	first, second := <-results, <-results
+	for _, got := range []result{first, second} {
+		if got.err != nil {
+			t.Fatalf("CreateRun error = %v", got.err)
+		}
+	}
+	if first.created == second.created {
+		t.Fatalf("created flags = %v, %v; want exactly one true", first.created, second.created)
+	}
+	if first.run.RunID != second.run.RunID {
+		t.Fatalf("run IDs = %q, %q", first.run.RunID, second.run.RunID)
+	}
+	assertEvolutionStoreRunEventCounts(t, stores[0], 1, 1)
+}
+
+func TestEvolutionStoreCrossStoreCreateConflictingInputIsStable(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared conflict root")
+	stores := []*EvolutionControlStore{
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+	}
+	inputs := []EvolutionRunInput{
+		validEvolutionRunInput("cross-store-conflict"),
+		validEvolutionRunInput("cross-store-conflict"),
+	}
+	inputs[1].RiskLevel = "p0"
+	start := make(chan struct{})
+	errorsByCall := make(chan error, len(stores))
+	for index, store := range stores {
+		go func(store *EvolutionControlStore, input EvolutionRunInput) {
+			<-start
+			_, _, err := store.CreateRun(input)
+			errorsByCall <- err
+		}(store, inputs[index])
+	}
+	close(start)
+	err1, err2 := <-errorsByCall, <-errorsByCall
+	if (err1 == nil) == (err2 == nil) {
+		t.Fatalf("errors = %v, %v; want one success", err1, err2)
+	}
+	conflict := err1
+	if conflict == nil {
+		conflict = err2
+	}
+	if !errors.Is(conflict, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("conflict error = %v", conflict)
+	}
+	assertEvolutionStoreRunEventCounts(t, stores[0], 1, 1)
+}
+
+func TestEvolutionStoreCrossStoreSameTransitionHasStableConflict(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared transition root")
+	stores := []*EvolutionControlStore{
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+	}
+	run := createEvolutionTestRun(t, stores[0], "cross-store-transition")
+	start := make(chan struct{})
+	errorsByCall := make(chan error, len(stores))
+	for _, store := range stores {
+		go func(store *EvolutionControlStore) {
+			<-start
+			_, err := store.TransitionRun(run.RunID, EvolutionTriaged, EvolutionTransitionInput{Actor: "operator", Code: "triaged"})
+			errorsByCall <- err
+		}(store)
+	}
+	close(start)
+	err1, err2 := <-errorsByCall, <-errorsByCall
+	if (err1 == nil) == (err2 == nil) {
+		t.Fatalf("transition errors = %v, %v; want one success", err1, err2)
+	}
+	conflict := err1
+	if conflict == nil {
+		conflict = err2
+	}
+	if !errors.Is(conflict, ErrEvolutionTransitionConflict) {
+		t.Fatalf("transition conflict = %v", conflict)
+	}
+	loaded, err := stores[0].LoadRun(run.RunID)
+	if err != nil || loaded.Status != EvolutionTriaged {
+		t.Fatalf("loaded run = %#v, %v", loaded, err)
+	}
+	events, err := stores[0].ListEvents(run.RunID, "", 100)
+	if err != nil || len(events) != 2 {
+		t.Fatalf("events = %#v, %v", events, err)
+	}
+}
+
+func TestEvolutionStoreCrossStoreDifferentTransitionsDoNotLoseUpdate(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "shared different transitions")
+	stores := []*EvolutionControlStore{
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+		openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{}),
+	}
+	run := createEvolutionTestRun(t, stores[0], "cross-store-different-transition")
+	start := make(chan struct{})
+	errorsByCall := make(chan error, len(stores))
+	targets := []EvolutionRunStatus{EvolutionTriaged, EvolutionBlocked}
+	for index, store := range stores {
+		go func(store *EvolutionControlStore, target EvolutionRunStatus) {
+			<-start
+			_, err := store.TransitionRun(run.RunID, target, EvolutionTransitionInput{Actor: "operator", Code: string(target)})
+			errorsByCall <- err
+		}(store, targets[index])
+	}
+	close(start)
+	errs := []error{<-errorsByCall, <-errorsByCall}
+	successes := 0
+	for _, err := range errs {
+		if err == nil {
+			successes++
+		} else if !errors.Is(err, ErrEvolutionTransitionConflict) {
+			t.Fatalf("transition error = %v", err)
+		}
+	}
+	loaded, err := stores[0].LoadRun(run.RunID)
+	if err != nil || loaded.Status != EvolutionBlocked {
+		t.Fatalf("loaded run = %#v, %v", loaded, err)
+	}
+	events, err := stores[0].ListEvents(run.RunID, "", 100)
+	if err != nil || len(events) != successes+1 {
+		t.Fatalf("events = %#v, successes = %d, error = %v", events, successes, err)
+	}
+}
+
+func TestEvolutionStoreRejectsFutureSchemaWithoutModification(t *testing.T) {
+	root := t.TempDir()
+	store := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{})
+	if _, err := store.db.Exec(`UPDATE evolution_meta SET value = '2' WHERE key = 'schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	var beforeObjects int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evolution_%'`).Scan(&beforeObjects); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openEvolutionControlStore(root, fixedEvolutionStoreClock(), evolutionStoreHooks{})
+	if reopened != nil {
+		_ = reopened.Close()
+	}
+	if !errors.Is(err, ErrEvolutionUnsupportedDBVersion) {
+		t.Fatalf("future schema error = %v", err)
+	}
+	var version string
+	var afterObjects int
+	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evolution_%'`).Scan(&afterObjects); err != nil {
+		t.Fatal(err)
+	}
+	if version != "2" || beforeObjects != afterObjects {
+		t.Fatalf("future schema modified: version=%q objects=%d->%d", version, beforeObjects, afterObjects)
+	}
+}
+
+func TestEvolutionStoreMigrationFailureRollsBackWholeVersion(t *testing.T) {
+	root := t.TempDir()
+	injected := errors.New("migration v1 failed")
+	store, err := openEvolutionControlStore(root, fixedEvolutionStoreClock(), evolutionStoreHooks{
+		afterMigrationVersion: func(version int) error {
+			if version == 1 {
+				return injected
+			}
+			return nil
+		},
+	})
+	if store != nil {
+		_ = store.Close()
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("migration error = %v", err)
+	}
+	dbPath := filepath.Join(root, evolutionControlDBName)
+	if _, err := os.Stat(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var evolutionObjects int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evolution_%'`).Scan(&evolutionObjects); err != nil {
+		t.Fatal(err)
+	}
+	if evolutionObjects != 0 {
+		t.Fatalf("failed migration left %d evolution objects", evolutionObjects)
+	}
+	recovered, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if err != nil {
+		t.Fatalf("open after rolled back migration: %v", err)
+	}
+	if err := recovered.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertEvolutionStoreRunEventCounts(t *testing.T, store *EvolutionControlStore, wantRuns, wantEvents int) {
+	t.Helper()
+	var runs, events int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_runs`).Scan(&runs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_events`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if runs != wantRuns || events != wantEvents {
+		t.Fatalf("counts = runs %d, events %d; want %d, %d", runs, events, wantRuns, wantEvents)
+	}
+}
+
 func newEvolutionTestStore(t *testing.T) *EvolutionControlStore {
 	t.Helper()
-	store, err := OpenEvolutionControlStore(t.TempDir(), fixedEvolutionStoreClock())
+	return newEvolutionTestStoreWithHooks(t, evolutionStoreHooks{})
+}
+
+func newEvolutionTestStoreWithHooks(t *testing.T, hooks evolutionStoreHooks) *EvolutionControlStore {
+	t.Helper()
+	return openEvolutionTestStoreAtRoot(t, t.TempDir(), hooks)
+}
+
+func openEvolutionTestStoreAtRoot(t *testing.T, root string, hooks evolutionStoreHooks) *EvolutionControlStore {
+	t.Helper()
+	store, err := openEvolutionControlStore(root, fixedEvolutionStoreClock(), hooks)
 	if err != nil {
 		t.Fatal(err)
 	}

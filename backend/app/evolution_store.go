@@ -9,17 +9,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 const (
 	evolutionControlDBName      = "evolution_control.sqlite3"
-	evolutionStoreSchemaVersion = "1"
+	evolutionStoreSchemaVersion = 1
 	evolutionEventDefaultLimit  = 100
 	evolutionEventMaxLimit      = 500
 )
@@ -29,6 +31,8 @@ var (
 	ErrEvolutionIdempotencyConflict  = errors.New("evolution idempotency key conflicts with existing input")
 	ErrEvolutionEventCursorNotFound  = errors.New("evolution event cursor not found")
 	ErrEvolutionUnsupportedDBVersion = errors.New("unsupported evolution database schema version")
+	ErrEvolutionTransitionConflict   = errors.New("evolution run transition conflicts with current state")
+	ErrEvolutionWriteConflict        = errors.New("evolution store write lock unavailable")
 )
 
 type EvolutionRunInput struct {
@@ -53,18 +57,23 @@ type EvolutionTransitionInput struct {
 }
 
 type EvolutionControlStore struct {
-	dbPath    string
-	now       func() time.Time
-	db        *sql.DB
-	testHooks evolutionStoreTestHooks
+	dbPath string
+	now    func() time.Time
+	db     *sql.DB
+	hooks  evolutionStoreHooks
 }
 
-type evolutionStoreTestHooks struct {
-	beforeBeginTx     func() error
-	beforeEventInsert func(EvolutionEvent) error
+type evolutionStoreHooks struct {
+	beforeBeginTx         func() error
+	beforeEventInsert     func(EvolutionEvent) error
+	afterMigrationVersion func(int) error
 }
 
 func OpenEvolutionControlStore(root string, now func() time.Time) (*EvolutionControlStore, error) {
+	return openEvolutionControlStore(root, now, evolutionStoreHooks{})
+}
+
+func openEvolutionControlStore(root string, now func() time.Time, hooks evolutionStoreHooks) (*EvolutionControlStore, error) {
 	root = strings.TrimSpace(root)
 	if root == "" {
 		return nil, fmt.Errorf("evolution control root is required")
@@ -75,26 +84,33 @@ func OpenEvolutionControlStore(root string, now func() time.Time) (*EvolutionCon
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create evolution control root: %w", err)
 	}
-	dbPath := filepath.Join(root, evolutionControlDBName)
-	db, err := sql.Open("sqlite3", dbPath)
+	dbPath, err := filepath.Abs(filepath.Join(root, evolutionControlDBName))
+	if err != nil {
+		return nil, fmt.Errorf("resolve evolution control database path: %w", err)
+	}
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(dbPath))
 	if err != nil {
 		return nil, fmt.Errorf("open evolution control database: %w", err)
 	}
+	// One connection serializes mutations within a store. The immediate transaction
+	// lock in the DSN provides the corresponding boundary across store instances.
 	db.SetMaxOpenConns(1)
-	for _, pragma := range []string{
-		`PRAGMA busy_timeout = 5000`,
-		`PRAGMA foreign_keys = ON`,
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("configure evolution control database: %w", err)
-		}
-	}
-	if err := migrateEvolutionControlDB(db); err != nil {
+	db.SetMaxIdleConns(1)
+	if err := migrateEvolutionControlDB(db, hooks); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	return &EvolutionControlStore{dbPath: dbPath, now: now, db: db}, nil
+	return &EvolutionControlStore{dbPath: dbPath, now: now, db: db, hooks: hooks}, nil
+}
+
+func evolutionSQLiteDSN(dbPath string) string {
+	dsn := url.URL{Scheme: "file", Path: dbPath}
+	query := dsn.Query()
+	query.Set("_busy_timeout", "5000")
+	query.Set("_foreign_keys", "on")
+	query.Set("_txlock", "immediate")
+	dsn.RawQuery = query.Encode()
+	return dsn.String()
 }
 
 func (s *EvolutionControlStore) Close() error {
@@ -104,18 +120,60 @@ func (s *EvolutionControlStore) Close() error {
 	return s.db.Close()
 }
 
-func migrateEvolutionControlDB(db *sql.DB) error {
+func migrateEvolutionControlDB(db *sql.DB, hooks evolutionStoreHooks) error {
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
-		return fmt.Errorf("begin evolution control migration: %w", err)
+		return wrapEvolutionSQLiteWriteError("begin evolution control migration", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`
-		CREATE TABLE IF NOT EXISTS evolution_meta (
-			key TEXT PRIMARY KEY,
-			value TEXT NOT NULL
-		);
+	if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS evolution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		return fmt.Errorf("bootstrap evolution schema metadata: %w", err)
+	}
+	currentVersion := 0
+	var storedVersion string
+	err = tx.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&storedVersion)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return fmt.Errorf("read evolution schema version: %w", err)
+	default:
+		currentVersion, err = strconv.Atoi(storedVersion)
+		if err != nil || currentVersion < 0 {
+			return fmt.Errorf("%w: invalid version %q", ErrEvolutionUnsupportedDBVersion, storedVersion)
+		}
+	}
+	if currentVersion > evolutionStoreSchemaVersion {
+		return fmt.Errorf("%w: found %d, support through %d", ErrEvolutionUnsupportedDBVersion, currentVersion, evolutionStoreSchemaVersion)
+	}
+	for version := currentVersion + 1; version <= evolutionStoreSchemaVersion; version++ {
+		switch version {
+		case 1:
+			if err := applyEvolutionMigrationV1(tx); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("%w: no migration for version %d", ErrEvolutionUnsupportedDBVersion, version)
+		}
+		if hook := hooks.afterMigrationVersion; hook != nil {
+			if err := hook(version); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO evolution_meta(key, value) VALUES ('schema_version', ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		`, strconv.Itoa(version)); err != nil {
+			return fmt.Errorf("record evolution schema version %d: %w", version, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return wrapEvolutionSQLiteWriteError("commit evolution control migration", err)
+	}
+	return nil
+}
 
+func applyEvolutionMigrationV1(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
 		CREATE TABLE IF NOT EXISTS evolution_signals (
 			signal_id TEXT PRIMARY KEY,
 			idempotency_key TEXT NOT NULL UNIQUE,
@@ -295,23 +353,7 @@ func migrateEvolutionControlDB(db *sql.DB) error {
 			ON evolution_outbox(status, available_at, created_at)
 			WHERE status = 'pending';
 	`); err != nil {
-		return fmt.Errorf("migrate evolution control database: %w", err)
-	}
-
-	var version string
-	err = tx.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		if _, err := tx.Exec(`INSERT INTO evolution_meta(key, value) VALUES ('schema_version', ?)`, evolutionStoreSchemaVersion); err != nil {
-			return fmt.Errorf("record evolution schema version: %w", err)
-		}
-	case err != nil:
-		return fmt.Errorf("read evolution schema version: %w", err)
-	case version != evolutionStoreSchemaVersion:
-		return fmt.Errorf("%w: found %q, require %q", ErrEvolutionUnsupportedDBVersion, version, evolutionStoreSchemaVersion)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit evolution control migration: %w", err)
+		return fmt.Errorf("apply evolution schema version 1: %w", err)
 	}
 	return nil
 }
@@ -365,7 +407,7 @@ func (s *EvolutionControlStore) CreateRun(input EvolutionRunInput) (*EvolutionRu
 
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
-		return nil, false, fmt.Errorf("begin create evolution run: %w", err)
+		return nil, false, wrapEvolutionSQLiteWriteError("begin create evolution run", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -407,7 +449,7 @@ func (s *EvolutionControlStore) CreateRun(input EvolutionRunInput) (*EvolutionRu
 		return nil, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, false, fmt.Errorf("commit evolution run: %w", err)
+		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution run", err)
 	}
 	return cloneEvolutionRun(&run), true, nil
 }
@@ -438,7 +480,7 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
-		return nil, fmt.Errorf("begin evolution transition: %w", err)
+		return nil, wrapEvolutionSQLiteWriteError("begin evolution transition", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	run, err := scanEvolutionRun(tx.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, runID))
@@ -449,7 +491,7 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 		return nil, fmt.Errorf("load evolution run for transition: %w", err)
 	}
 	if err := ValidateEvolutionTransition(run.Status, to); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", ErrEvolutionTransitionConflict, err)
 	}
 	from := run.Status
 	run.Status = to
@@ -481,13 +523,13 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 		return nil, fmt.Errorf("check evolution run update: %w", err)
 	}
 	if rowsAffected != 1 {
-		return nil, fmt.Errorf("evolution run changed concurrently")
+		return nil, ErrEvolutionTransitionConflict
 	}
 	if err := s.insertEventTx(tx, event); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit evolution transition: %w", err)
+		return nil, wrapEvolutionSQLiteWriteError("commit evolution transition", err)
 	}
 	return cloneEvolutionRun(run), nil
 }
@@ -552,7 +594,7 @@ func (s *EvolutionControlStore) ListEvents(runID, after string, limit int) ([]Ev
 }
 
 func (s *EvolutionControlStore) insertEventTx(tx *sql.Tx, event EvolutionEvent) error {
-	if hook := s.testHooks.beforeEventInsert; hook != nil {
+	if hook := s.hooks.beforeEventInsert; hook != nil {
 		if err := hook(event); err != nil {
 			return err
 		}
@@ -574,12 +616,20 @@ func (s *EvolutionControlStore) insertEventTx(tx *sql.Tx, event EvolutionEvent) 
 }
 
 func (s *EvolutionControlStore) beginTx(ctx context.Context) (*sql.Tx, error) {
-	if hook := s.testHooks.beforeBeginTx; hook != nil {
+	if hook := s.hooks.beforeBeginTx; hook != nil {
 		if err := hook(); err != nil {
 			return nil, err
 		}
 	}
 	return s.db.BeginTx(ctx, nil)
+}
+
+func wrapEvolutionSQLiteWriteError(operation string, err error) error {
+	var sqliteErr sqlite3.Error
+	if errors.As(err, &sqliteErr) && (sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked) {
+		return fmt.Errorf("%w: %s", ErrEvolutionWriteConflict, operation)
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 func (s *EvolutionControlStore) timestamp() string {
