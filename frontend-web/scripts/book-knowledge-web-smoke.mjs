@@ -191,6 +191,7 @@ assert.ok(js.includes("暂无知识库条目，可先从微信来源导入。"),
 assert.ok(html.includes('/app.js?v='), "index.html should version app.js to avoid stale browser caches");
 assert.ok(html.includes('/styles.css?v='), "index.html should version styles.css to avoid stale browser caches");
 assert.ok(html.includes("20260809-tokenplan-models"), "latest TokenPlan models should use a fresh app.js cache version");
+assert.ok(html.includes("20260811-knowledge-deep-links"), "knowledge deep links should use a fresh static asset version");
 assert.ok(html.includes('rel="icon"'), "index.html should declare an application favicon");
 assert.ok(html.includes("data:image/svg+xml"), "the favicon should be inline and avoid a missing /favicon.ico request");
 assert.ok(html.includes("20260724-evidence-audit-focus"), "evidence audit workspace release should use a fresh browser cache version");
