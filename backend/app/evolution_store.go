@@ -69,6 +69,20 @@ type evolutionStoreHooks struct {
 	afterBeginTx          func() error
 	beforeEventInsert     func(EvolutionEvent) error
 	afterMigrationVersion func(int) error
+	wrapMigrationRows     func(string, evolutionMigrationRows) evolutionMigrationRows
+}
+
+const (
+	evolutionMigrationRowsRuns          = "v2_runs"
+	evolutionMigrationRowsMappingEvents = "v1_mapping_events"
+	evolutionMigrationRowsSignalKeys    = "v1_signal_keys"
+)
+
+type evolutionMigrationRows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+	Close() error
 }
 
 type evolutionStoreOpenOptions struct {
@@ -171,7 +185,7 @@ func migrateEvolutionControlDB(db *sql.DB, hooks evolutionStoreHooks) error {
 				return err
 			}
 		case 2:
-			if err := applyEvolutionMigrationV2(tx); err != nil {
+			if err := applyEvolutionMigrationV2(tx, hooks); err != nil {
 				return err
 			}
 		default:
@@ -381,7 +395,7 @@ func applyEvolutionMigrationV1(tx *sql.Tx) error {
 	return nil
 }
 
-func applyEvolutionMigrationV2(tx *sql.Tx) error {
+func applyEvolutionMigrationV2(tx *sql.Tx, hooks evolutionStoreHooks) error {
 	if _, err := tx.Exec(`
 		ALTER TABLE evolution_runs ADD COLUMN created_at_unix_nano INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE evolution_runs ADD COLUMN updated_at_unix_nano INTEGER NOT NULL DEFAULT 0;
@@ -392,16 +406,17 @@ func applyEvolutionMigrationV2(tx *sql.Tx) error {
 			input_hash TEXT NOT NULL,
 			signal_id TEXT NOT NULL,
 			run_id TEXT NOT NULL,
-			signal_type TEXT NOT NULL,
-			source_type TEXT NOT NULL,
-			source_id TEXT NOT NULL,
-			package_id TEXT NOT NULL DEFAULT '',
-			release_id TEXT NOT NULL DEFAULT '',
-			severity TEXT NOT NULL,
-			observed_value REAL NOT NULL,
-			baseline_value REAL NOT NULL,
-			evidence_refs_json TEXT NOT NULL,
-			observed_at TEXT NOT NULL,
+			payload_fidelity TEXT NOT NULL CHECK(payload_fidelity IN ('complete', 'legacy_hash_only')),
+			signal_type TEXT,
+			source_type TEXT,
+			source_id TEXT,
+			package_id TEXT,
+			release_id TEXT,
+			severity TEXT,
+			observed_value REAL,
+			baseline_value REAL,
+			evidence_refs_json TEXT,
+			observed_at TEXT,
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(signal_id) REFERENCES evolution_signals(signal_id),
 			FOREIGN KEY(run_id) REFERENCES evolution_runs(run_id)
@@ -441,17 +456,17 @@ func applyEvolutionMigrationV2(tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("read v1 evolution runs for v2 backfill: %w", err)
 	}
+	migrationRows := wrapEvolutionMigrationRows(hooks, evolutionMigrationRowsRuns, rows)
 	stored := make([]storedRunScope, 0)
-	for rows.Next() {
+	if err := consumeEvolutionMigrationRows(migrationRows, "v1 evolution runs for v2 backfill", func(rows evolutionMigrationRows) error {
 		var run storedRunScope
 		if err := rows.Scan(&run.runID, &run.packageID, &run.releaseJSON, &run.createdAt, &run.updatedAt); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan v1 evolution run for v2 backfill: %w", err)
+			return err
 		}
 		stored = append(stored, run)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close v1 evolution run backfill rows: %w", err)
+		return nil
+	}); err != nil {
+		return err
 	}
 	for _, storedRun := range stored {
 		createdAt, err := parseEvolutionTimestamp("created_at", storedRun.createdAt)
@@ -480,13 +495,13 @@ func applyEvolutionMigrationV2(tx *sql.Tx) error {
 			}
 		}
 	}
-	if err := migrateEvolutionV1SignalObservationsTx(tx); err != nil {
+	if err := migrateEvolutionV1SignalObservationsTx(tx, hooks); err != nil {
 		return err
 	}
 	return nil
 }
 
-func migrateEvolutionV1SignalObservationsTx(tx *sql.Tx) error {
+func migrateEvolutionV1SignalObservationsTx(tx *sql.Tx, hooks evolutionStoreHooks) error {
 	type storedMappingEvent struct {
 		eventID      string
 		runID        string
@@ -500,17 +515,17 @@ func migrateEvolutionV1SignalObservationsTx(tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("read v1 evolution signal mappings: %w", err)
 	}
+	migrationRows := wrapEvolutionMigrationRows(hooks, evolutionMigrationRowsMappingEvents, rows)
 	events := make([]storedMappingEvent, 0)
-	for rows.Next() {
+	if err := consumeEvolutionMigrationRows(migrationRows, "v1 evolution signal mappings", func(rows evolutionMigrationRows) error {
 		var event storedMappingEvent
 		if err := rows.Scan(&event.eventID, &event.runID, &event.artifactJSON, &event.createdAt); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan v1 evolution signal mapping: %w", err)
+			return err
 		}
 		events = append(events, event)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close v1 evolution signal mapping rows: %w", err)
+		return nil
+	}); err != nil {
+		return err
 	}
 	for _, event := range events {
 		var refs []string
@@ -534,29 +549,59 @@ func migrateEvolutionV1SignalObservationsTx(tx *sql.Tx) error {
 			len(inputHash) != sha256.Size*2 || !isEvolutionLowerHex(inputHash) || signalID == "" {
 			return fmt.Errorf("v1 evolution signal mapping %q is incomplete", event.eventID)
 		}
-		var signalType, sourceType, sourceID, packageID, releaseID, severity string
+		var legacyRequestKey, signalType, sourceType, sourceID, packageID, releaseID, severity string
 		var observedValue, baselineValue float64
 		var evidenceJSON, observedAt string
 		if err := tx.QueryRow(`
-			SELECT signal_type, source_type, source_id, package_id, release_id, severity,
+			SELECT idempotency_key, signal_type, source_type, source_id, package_id, release_id, severity,
 				observed_value, baseline_value, evidence_refs_json, observed_at
 			FROM evolution_signals WHERE signal_id = ?
 		`, signalID).Scan(
-			&signalType, &sourceType, &sourceID, &packageID, &releaseID, &severity,
+			&legacyRequestKey, &signalType, &sourceType, &sourceID, &packageID, &releaseID, &severity,
 			&observedValue, &baselineValue, &evidenceJSON, &observedAt,
 		); err != nil {
 			return fmt.Errorf("load v1 evolution signal %q for observation migration: %w", signalID, err)
 		}
 		requestKeyHash := "sha256:" + requestDigest
+		payloadFidelity := EvolutionObservationPayloadLegacyHashOnly
+		var signalTypeValue, sourceTypeValue, sourceIDValue, packageIDValue, releaseIDValue, severityValue any
+		var observedValueValue, baselineValueValue, evidenceJSONValue, observedAtValue any
+		if evolutionSignalRequestKeyHash(legacyRequestKey) == requestKeyHash {
+			var evidenceRefs []string
+			parsedObservedAt, parseErr := parseEvolutionTimestamp("observed_at", observedAt)
+			if err := json.Unmarshal([]byte(evidenceJSON), &evidenceRefs); err != nil {
+				return fmt.Errorf("decode v1 primary evolution signal evidence: %w", err)
+			}
+			if parseErr != nil {
+				return fmt.Errorf("parse v1 primary evolution signal observed_at: %w", parseErr)
+			}
+			_, reconstructedHash, _, _, normalizeErr := normalizeEvolutionSignalInput(EvolutionSignalInput{
+				IdempotencyKey: legacyRequestKey, SignalType: signalType, SourceType: sourceType,
+				SourceID: sourceID, PackageID: packageID, ReleaseID: releaseID, Severity: severity,
+				ObservedValue: observedValue, BaselineValue: baselineValue,
+				EvidenceRefs: evidenceRefs, ObservedAt: parsedObservedAt,
+			})
+			if normalizeErr != nil {
+				return fmt.Errorf("reconstruct v1 primary evolution signal observation: %w", normalizeErr)
+			}
+			if reconstructedHash == inputHash {
+				payloadFidelity = EvolutionObservationPayloadComplete
+				signalTypeValue, sourceTypeValue, sourceIDValue = signalType, sourceType, sourceID
+				packageIDValue, releaseIDValue, severityValue = packageID, releaseID, severity
+				observedValueValue, baselineValueValue = observedValue, baselineValue
+				evidenceJSONValue, observedAtValue = evidenceJSON, observedAt
+			}
+		}
 		if _, err := tx.Exec(`
 			INSERT INTO evolution_signal_observations (
 				observation_id, request_key_hash, input_hash, signal_id, run_id,
-				signal_type, source_type, source_id, package_id, release_id, severity,
+				payload_fidelity, signal_type, source_type, source_id, package_id, release_id, severity,
 				observed_value, baseline_value, evidence_refs_json, observed_at, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`, "observation-migrated-"+requestDigest, requestKeyHash, inputHash, signalID,
-			event.runID, signalType, sourceType, sourceID, packageID, releaseID, severity,
-			observedValue, baselineValue, evidenceJSON, observedAt, event.createdAt); err != nil {
+			event.runID, payloadFidelity, signalTypeValue, sourceTypeValue, sourceIDValue,
+			packageIDValue, releaseIDValue, severityValue, observedValueValue, baselineValueValue,
+			evidenceJSONValue, observedAtValue, event.createdAt); err != nil {
 			return fmt.Errorf("migrate v1 evolution signal observation: %w", err)
 		}
 		publicRefsJSON, err := json.Marshal(publicRefs)
@@ -572,23 +617,47 @@ func migrateEvolutionV1SignalObservationsTx(tx *sql.Tx) error {
 	if err != nil {
 		return fmt.Errorf("read v1 evolution signal request keys: %w", err)
 	}
+	migrationRows = wrapEvolutionMigrationRows(hooks, evolutionMigrationRowsSignalKeys, rows)
 	type storedSignalKey struct{ signalID, requestKey string }
 	keys := make([]storedSignalKey, 0)
-	for rows.Next() {
+	if err := consumeEvolutionMigrationRows(migrationRows, "v1 evolution signal request keys", func(rows evolutionMigrationRows) error {
 		var key storedSignalKey
 		if err := rows.Scan(&key.signalID, &key.requestKey); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan v1 evolution signal request key: %w", err)
+			return err
 		}
 		keys = append(keys, key)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("close v1 evolution signal request key rows: %w", err)
+		return nil
+	}); err != nil {
+		return err
 	}
 	for _, key := range keys {
 		if _, err := tx.Exec(`UPDATE evolution_signals SET idempotency_key = ? WHERE signal_id = ?`, evolutionSignalRequestKeyHash(key.requestKey), key.signalID); err != nil {
 			return fmt.Errorf("hash v1 evolution signal request key: %w", err)
 		}
+	}
+	return nil
+}
+
+func wrapEvolutionMigrationRows(hooks evolutionStoreHooks, stage string, rows evolutionMigrationRows) evolutionMigrationRows {
+	if hooks.wrapMigrationRows != nil {
+		return hooks.wrapMigrationRows(stage, rows)
+	}
+	return rows
+}
+
+func consumeEvolutionMigrationRows(rows evolutionMigrationRows, context string, scan func(evolutionMigrationRows) error) error {
+	for rows.Next() {
+		if err := scan(rows); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan %s: %w", context, err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate %s: %w", context, err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", context, err)
 	}
 	return nil
 }

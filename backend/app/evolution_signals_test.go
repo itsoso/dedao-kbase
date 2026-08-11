@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -108,16 +109,16 @@ func TestEvolutionSignalDeduplicatedRequestKeepsItsOwnIdempotencyFingerprint(t *
 	}
 	assertEvolutionSignalCounts(t, store, 1, 1, 2)
 	assertEvolutionObservationCount(t, store, 2)
-	var severity string
+	var payloadFidelity, severity string
 	var observedValue float64
 	var evidenceJSON, observedAt string
 	if err := store.db.QueryRow(`
-		SELECT severity, observed_value, evidence_refs_json, observed_at
+		SELECT payload_fidelity, severity, observed_value, evidence_refs_json, observed_at
 		FROM evolution_signal_observations WHERE request_key_hash = ?
-	`, evolutionSignalRequestKeyHash(second.IdempotencyKey)).Scan(&severity, &observedValue, &evidenceJSON, &observedAt); err != nil {
+	`, evolutionSignalRequestKeyHash(second.IdempotencyKey)).Scan(&payloadFidelity, &severity, &observedValue, &evidenceJSON, &observedAt); err != nil {
 		t.Fatal(err)
 	}
-	if severity != second.Severity || observedValue != second.ObservedValue ||
+	if payloadFidelity != EvolutionObservationPayloadComplete || severity != second.Severity || observedValue != second.ObservedValue ||
 		!strings.Contains(evidenceJSON, second.EvidenceRefs[0]) || observedAt != second.ObservedAt.Format(time.RFC3339Nano) {
 		t.Fatalf("secondary observation lost audit fields: %q %v %q %q", severity, observedValue, evidenceJSON, observedAt)
 	}
@@ -581,11 +582,13 @@ func TestEvolutionSignalScopeAndReplayQueriesUseIndexes(t *testing.T) {
 		t.Fatalf("indexed aggregate = %#v, %v", aggregated, err)
 	}
 
-	assertEvolutionQueryPlanUses(t, store, "idx_evolution_run_scopes_lookup", `
-		SELECT r.run_id FROM evolution_run_scopes AS scope
-		JOIN evolution_runs AS r ON r.run_id = scope.run_id
-		WHERE scope.scope_type = 'package' AND scope.scope_id = ?
-	`, target.PackageID)
+	scopeQuery, scopeArgs, err := buildEvolutionRunScopeQuery(
+		"package", target.PackageID, now.Add(-EvolutionSignalCooldown).UnixNano(), now.UnixNano(), "agent", target.PackageID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEvolutionQueryPlanUses(t, store, "idx_evolution_run_scopes_lookup", scopeQuery, scopeArgs...)
 	assertEvolutionQueryPlanUses(t, store, "idx_evolution_signal_observations_request", `
 		SELECT run_id FROM evolution_signal_observations WHERE request_key_hash = ?
 	`, evolutionSignalRequestKeyHash(related.IdempotencyKey))
@@ -626,6 +629,41 @@ func TestEvolutionSignalUnrelatedIdentitiesDoNotAggregateOrCombine(t *testing.T)
 	if knowledgeRunA.RunID == knowledgeRunB.RunID || knowledgeRunB.RunType != EvolutionRunKnowledgeRelease {
 		t.Fatalf("different releases aggregated: %#v / %#v", knowledgeRunA, knowledgeRunB)
 	}
+}
+
+func TestEvolutionSignalSameReleaseWithDifferentExplicitPackagesDoesNotAggregate(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
+	releaseID := testEvolutionReleaseID("9")
+	first := validEvolutionKnowledgeSignalInput("same-release-package-a", releaseID, "package-a")
+	first.ObservedAt = now
+	_, firstRun, _, err := store.IngestSignal(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	second := validEvolutionKnowledgeSignalInput("same-release-package-b", releaseID, "package-b")
+	second.ObservedAt = now
+	_, secondRun, _, err := store.IngestSignal(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstRun.RunID == secondRun.RunID || firstRun.RunType != EvolutionRunKnowledgeRelease || secondRun.RunType != EvolutionRunKnowledgeRelease {
+		t.Fatalf("different explicit packages shared release run: %#v / %#v", firstRun, secondRun)
+	}
+	for _, test := range []struct {
+		input EvolutionSignalInput
+		runID string
+	}{{first, firstRun.RunID}, {second, secondRun.RunID}} {
+		var gotRunID string
+		if err := store.db.QueryRow(`SELECT run_id FROM evolution_signal_observations WHERE request_key_hash = ?`, evolutionSignalRequestKeyHash(test.input.IdempotencyKey)).Scan(&gotRunID); err != nil {
+			t.Fatal(err)
+		}
+		if gotRunID != test.runID {
+			t.Fatalf("observation run = %q, want %q", gotRunID, test.runID)
+		}
+	}
+	assertEvolutionSignalCounts(t, store, 2, 2, 2)
 }
 
 func TestEvolutionSignalPriorityIsStableAndExplainable(t *testing.T) {
@@ -897,6 +935,24 @@ func TestEvolutionOverviewSortsParsedTimesFiltersHistoryAndClonesRuntime(t *test
 	}
 }
 
+func TestEvolutionOverviewRequiresPublishedTimesForDurableLifecycleStates(t *testing.T) {
+	for _, state := range []string{AgentPackagePublished, AgentPackageSuperseded} {
+		t.Run(state, func(t *testing.T) {
+			_, err := BuildEvolutionOverview([]AgentPackageRecord{{
+				PackageID: "missing-time-agent", Version: "1.0.0", LifecycleState: state,
+			}}, nil)
+			if err == nil || !strings.Contains(err.Error(), "published_at is required") {
+				t.Fatalf("empty published_at error = %v", err)
+			}
+		})
+	}
+	if _, err := BuildEvolutionOverview([]AgentPackageRecord{{
+		PackageID: "draft-agent", Version: "1.0.0", LifecycleState: AgentPackageDraft,
+	}}, nil); err != nil {
+		t.Fatalf("draft empty published_at: %v", err)
+	}
+}
+
 func TestEvolutionRunListUsesImmutableKeysetWhenPriorityChanges(t *testing.T) {
 	now := time.Date(2026, 8, 11, 10, 0, 0, 0, time.UTC)
 	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
@@ -940,6 +996,19 @@ func TestEvolutionRunListUsesImmutableKeysetWhenPriorityChanges(t *testing.T) {
 		SELECT run_id FROM evolution_runs
 		ORDER BY created_at_unix_nano DESC, run_id ASC LIMIT 2
 	`)
+}
+
+func TestEvolutionRunCursorRejectsOversizedInputAndPayload(t *testing.T) {
+	if _, err := decodeEvolutionRunCursor(strings.Repeat("A", 513)); err == nil || !strings.Contains(err.Error(), "cursor input exceeds") {
+		t.Fatalf("oversized encoded cursor error = %v", err)
+	}
+	decodedOversize := base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat(" ", 300)))
+	if len(decodedOversize) > 512 {
+		t.Fatalf("test payload encoded length = %d", len(decodedOversize))
+	}
+	if _, err := decodeEvolutionRunCursor(decodedOversize); err == nil || !strings.Contains(err.Error(), "cursor payload exceeds") {
+		t.Fatalf("oversized decoded cursor error = %v", err)
+	}
 }
 
 func validEvolutionSignalInput(key string) EvolutionSignalInput {

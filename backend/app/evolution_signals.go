@@ -56,6 +56,11 @@ const (
 	evolutionUnresolvedBaseline     = "unresolved"
 	evolutionRunPageDefaultLimit    = 50
 	evolutionRunPageMaxLimit        = 200
+	evolutionRunCursorMaxInputBytes = 512
+	evolutionRunCursorMaxPayload    = 256
+
+	EvolutionObservationPayloadComplete       = "complete"
+	EvolutionObservationPayloadLegacyHashOnly = "legacy_hash_only"
 )
 
 var ErrEvolutionRunCursorNotFound = errors.New("evolution run cursor not found")
@@ -122,22 +127,23 @@ type normalizedEvolutionSignalInput struct {
 }
 
 type EvolutionSignalObservation struct {
-	ObservationID  string   `json:"observation_id"`
-	RequestKeyHash string   `json:"request_key_hash"`
-	InputHash      string   `json:"input_hash"`
-	SignalID       string   `json:"signal_id"`
-	RunID          string   `json:"run_id"`
-	SignalType     string   `json:"signal_type"`
-	SourceType     string   `json:"source_type"`
-	SourceID       string   `json:"source_id"`
-	PackageID      string   `json:"package_id"`
-	ReleaseID      string   `json:"release_id"`
-	Severity       string   `json:"severity"`
-	ObservedValue  float64  `json:"observed_value"`
-	BaselineValue  float64  `json:"baseline_value"`
-	EvidenceRefs   []string `json:"evidence_refs"`
-	ObservedAt     string   `json:"observed_at"`
-	CreatedAt      string   `json:"created_at"`
+	ObservationID   string   `json:"observation_id"`
+	RequestKeyHash  string   `json:"request_key_hash"`
+	InputHash       string   `json:"input_hash"`
+	SignalID        string   `json:"signal_id"`
+	RunID           string   `json:"run_id"`
+	PayloadFidelity string   `json:"payload_fidelity"`
+	SignalType      *string  `json:"signal_type,omitempty"`
+	SourceType      *string  `json:"source_type,omitempty"`
+	SourceID        *string  `json:"source_id,omitempty"`
+	PackageID       *string  `json:"package_id,omitempty"`
+	ReleaseID       *string  `json:"release_id,omitempty"`
+	Severity        *string  `json:"severity,omitempty"`
+	ObservedValue   *float64 `json:"observed_value,omitempty"`
+	BaselineValue   *float64 `json:"baseline_value,omitempty"`
+	EvidenceRefs    []string `json:"evidence_refs,omitempty"`
+	ObservedAt      *string  `json:"observed_at,omitempty"`
+	CreatedAt       string   `json:"created_at"`
 }
 
 // CalculateEvolutionPriority gives risk the strongest influence, followed by
@@ -483,17 +489,17 @@ func findEvolutionRunForAggregationTx(tx *sql.Tx, input normalizedEvolutionSigna
 		if input.PackageID == "" {
 			return nil, nil
 		}
-		return loadEvolutionRunByScopeTx(tx, "package", input.PackageID, cutoff, now.UnixNano(), "agent")
+		return loadEvolutionRunByScopeTx(tx, "package", input.PackageID, cutoff, now.UnixNano(), "agent", input.PackageID)
 	case EvolutionRunKnowledgeRelease:
 		if input.ReleaseID != "" {
-			run, err := loadEvolutionRunByScopeTx(tx, "release", input.ReleaseID, cutoff, now.UnixNano(), "knowledge")
+			run, err := loadEvolutionRunByScopeTx(tx, "release", input.ReleaseID, cutoff, now.UnixNano(), "knowledge", input.PackageID)
 			if err != nil || run != nil {
 				return run, err
 			}
 		}
 		if input.PackageID != "" {
 			// A new Release can combine only with a pure Agent run carrying the same Package scope.
-			return loadEvolutionRunByScopeTx(tx, "package", input.PackageID, cutoff, now.UnixNano(), "pure_agent")
+			return loadEvolutionRunByScopeTx(tx, "package", input.PackageID, cutoff, now.UnixNano(), "pure_agent", input.PackageID)
 		}
 	}
 	return nil, nil
@@ -507,7 +513,7 @@ const evolutionScopedRunSelect = `
 	FROM evolution_run_scopes AS scope
 	JOIN evolution_runs AS r ON r.run_id = scope.run_id`
 
-func loadEvolutionRunByScopeTx(tx *sql.Tx, scopeType, scopeID string, cutoffNS, nowNS int64, mode string) (*EvolutionRun, error) {
+func buildEvolutionRunScopeQuery(scopeType, scopeID string, cutoffNS, nowNS int64, mode, packageID string) (string, []any, error) {
 	base := evolutionScopedRunSelect + `
 		WHERE scope.scope_type = ? AND scope.scope_id = ?
 			AND r.updated_at_unix_nano BETWEEN ? AND ?
@@ -524,16 +530,25 @@ func loadEvolutionRunByScopeTx(tx *sql.Tx, scopeType, scopeID string, cutoffNS, 
 			EvolutionRunAgentPolicy, EvolutionRunCombined)
 	case "knowledge":
 		base += ` AND r.run_type IN (?, ?)
+			AND (? = '' OR r.package_id = '' OR r.package_id = ?)
 			ORDER BY r.updated_at_unix_nano DESC, r.run_id ASC LIMIT 1`
-		args = append(args, EvolutionRunKnowledgeRelease, EvolutionRunCombined)
+		args = append(args, EvolutionRunKnowledgeRelease, EvolutionRunCombined, packageID, packageID)
 	case "pure_agent":
 		base += ` AND r.run_type = ?
 			ORDER BY r.updated_at_unix_nano DESC, r.run_id ASC LIMIT 1`
 		args = append(args, EvolutionRunAgentPolicy)
 	default:
-		return nil, fmt.Errorf("unknown evolution scope query mode %q", mode)
+		return "", nil, fmt.Errorf("unknown evolution scope query mode %q", mode)
 	}
-	run, err := scanEvolutionRun(tx.QueryRow(base, args...))
+	return base, args, nil
+}
+
+func loadEvolutionRunByScopeTx(tx *sql.Tx, scopeType, scopeID string, cutoffNS, nowNS int64, mode, packageID string) (*EvolutionRun, error) {
+	query, args, err := buildEvolutionRunScopeQuery(scopeType, scopeID, cutoffNS, nowNS, mode, packageID)
+	if err != nil {
+		return nil, err
+	}
+	run, err := scanEvolutionRun(tx.QueryRow(query, args...))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -609,10 +624,10 @@ func insertEvolutionSignalObservationTx(tx *sql.Tx, input normalizedEvolutionSig
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_signal_observations (
 			observation_id, request_key_hash, input_hash, signal_id, run_id,
-			signal_type, source_type, source_id, package_id, release_id, severity,
+			payload_fidelity, signal_type, source_type, source_id, package_id, release_id, severity,
 			observed_value, baseline_value, evidence_refs_json, observed_at, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, observationID, requestKeyHash, inputHash, signalID, runID, input.SignalType,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, observationID, requestKeyHash, inputHash, signalID, runID, EvolutionObservationPayloadComplete, input.SignalType,
 		input.SourceType, input.SourceID, input.PackageID, input.ReleaseID, input.Severity,
 		input.ObservedValue, input.BaselineValue, string(evidenceJSON), input.ObservedAt, timestamp); err != nil {
 		return fmt.Errorf("insert evolution signal observation: %w", err)
@@ -622,24 +637,51 @@ func insertEvolutionSignalObservationTx(tx *sql.Tx, input normalizedEvolutionSig
 
 func loadEvolutionSignalObservationByRequestHashTx(tx *sql.Tx, requestKeyHash string) (*EvolutionSignalObservation, error) {
 	var observation EvolutionSignalObservation
-	var evidenceJSON string
+	var signalType, sourceType, sourceID, packageID, releaseID, severity sql.NullString
+	var observedValue, baselineValue sql.NullFloat64
+	var evidenceJSON, observedAt sql.NullString
 	if err := tx.QueryRow(`
 		SELECT observation_id, request_key_hash, input_hash, signal_id, run_id,
-			signal_type, source_type, source_id, package_id, release_id, severity,
+			payload_fidelity, signal_type, source_type, source_id, package_id, release_id, severity,
 			observed_value, baseline_value, evidence_refs_json, observed_at, created_at
 		FROM evolution_signal_observations WHERE request_key_hash = ?
 	`, requestKeyHash).Scan(
 		&observation.ObservationID, &observation.RequestKeyHash, &observation.InputHash,
-		&observation.SignalID, &observation.RunID, &observation.SignalType,
-		&observation.SourceType, &observation.SourceID, &observation.PackageID,
-		&observation.ReleaseID, &observation.Severity, &observation.ObservedValue,
-		&observation.BaselineValue, &evidenceJSON, &observation.ObservedAt,
+		&observation.SignalID, &observation.RunID, &observation.PayloadFidelity,
+		&signalType, &sourceType, &sourceID, &packageID, &releaseID, &severity,
+		&observedValue, &baselineValue, &evidenceJSON, &observedAt,
 		&observation.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal([]byte(evidenceJSON), &observation.EvidenceRefs); err != nil {
-		return nil, fmt.Errorf("decode evolution signal observation evidence: %w", err)
+	switch observation.PayloadFidelity {
+	case EvolutionObservationPayloadComplete:
+		if !signalType.Valid || !sourceType.Valid || !sourceID.Valid || !packageID.Valid || !releaseID.Valid || !severity.Valid ||
+			!observedValue.Valid || !baselineValue.Valid || !evidenceJSON.Valid || !observedAt.Valid {
+			return nil, fmt.Errorf("complete evolution signal observation %q has null payload fields", observation.ObservationID)
+		}
+		observation.SignalType = &signalType.String
+		observation.SourceType = &sourceType.String
+		observation.SourceID = &sourceID.String
+		observation.PackageID = &packageID.String
+		observation.ReleaseID = &releaseID.String
+		observation.Severity = &severity.String
+		observation.ObservedValue = &observedValue.Float64
+		observation.BaselineValue = &baselineValue.Float64
+		observation.ObservedAt = &observedAt.String
+		if err := json.Unmarshal([]byte(evidenceJSON.String), &observation.EvidenceRefs); err != nil {
+			return nil, fmt.Errorf("decode evolution signal observation evidence: %w", err)
+		}
+		if observation.EvidenceRefs == nil {
+			observation.EvidenceRefs = []string{}
+		}
+	case EvolutionObservationPayloadLegacyHashOnly:
+		if signalType.Valid || sourceType.Valid || sourceID.Valid || packageID.Valid || releaseID.Valid || severity.Valid ||
+			observedValue.Valid || baselineValue.Valid || evidenceJSON.Valid || observedAt.Valid {
+			return nil, fmt.Errorf("legacy hash-only evolution signal observation %q contains fabricated payload", observation.ObservationID)
+		}
+	default:
+		return nil, fmt.Errorf("evolution signal observation %q has unknown payload fidelity %q", observation.ObservationID, observation.PayloadFidelity)
 	}
 	return &observation, nil
 }
@@ -673,6 +715,9 @@ func BuildEvolutionOverview(records []AgentPackageRecord, runs []EvolutionRun) (
 		record := cloneAgentPackageRecord(source)
 		if err := validateEvolutionIdentity("package_id", record.PackageID); err != nil {
 			return nil, err
+		}
+		if record.PublishedAt == "" && (record.LifecycleState == AgentPackagePublished || record.LifecycleState == AgentPackageSuperseded) {
+			return nil, fmt.Errorf("invalid agent package %q version %q: published_at is required for %s lifecycle", record.PackageID, record.Version, record.LifecycleState)
 		}
 		if record.PublishedAt != "" {
 			if _, err := parseEvolutionTimestamp("published_at", record.PublishedAt); err != nil {
@@ -887,9 +932,15 @@ func encodeEvolutionRunCursor(createdAtUnixNano int64, runID string) (string, er
 }
 
 func decodeEvolutionRunCursor(value string) (evolutionRunCursor, error) {
+	if len(value) > evolutionRunCursorMaxInputBytes {
+		return evolutionRunCursor{}, fmt.Errorf("evolution run cursor input exceeds %d bytes", evolutionRunCursorMaxInputBytes)
+	}
 	payload, err := base64.RawURLEncoding.DecodeString(value)
 	if err != nil {
 		return evolutionRunCursor{}, fmt.Errorf("decode evolution run cursor: %w", err)
+	}
+	if len(payload) > evolutionRunCursorMaxPayload {
+		return evolutionRunCursor{}, fmt.Errorf("evolution run cursor payload exceeds %d bytes", evolutionRunCursorMaxPayload)
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(payload)))
 	decoder.DisallowUnknownFields()

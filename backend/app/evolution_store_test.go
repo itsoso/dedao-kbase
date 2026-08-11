@@ -157,8 +157,20 @@ func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	secondaryInput := legacyInput
+	secondaryInput.IdempotencyKey = "33333333-3333-4333-8333-333333333333"
+	secondaryInput.SourceID = "44444444-4444-4444-8444-444444444444"
+	secondaryInput.Severity = EvolutionSignalSeverityCritical
+	secondaryInput.ObservedValue = 0.55
+	secondaryInput.EvidenceRefs = []string{"evaluation:" + secondaryInput.SourceID}
+	_, secondaryInputHash, _, _, err := normalizeEvolutionSignalInput(secondaryInput)
+	if err != nil {
+		t.Fatal(err)
+	}
 	requestDigest := sha256.Sum256([]byte(requestKey))
 	requestDigestHex := hex.EncodeToString(requestDigest[:])
+	secondaryRequestDigest := sha256.Sum256([]byte(secondaryInput.IdempotencyKey))
+	secondaryRequestDigestHex := hex.EncodeToString(secondaryRequestDigest[:])
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_signals (
 			signal_id, idempotency_key, signal_type, source_type, source_id, package_id,
@@ -188,6 +200,15 @@ func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) 
 		) VALUES (?, 'run-v1', 'created', 'control-plane', '', ?, 'signal_ingested', '', ?, ?)
 	`, "event-signal-"+requestDigestHex, EvolutionDetected,
 		`["input-sha256:`+inputHash+`","signal-id:signal-v1"]`, createdAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_events (
+			event_id, run_id, event_type, actor, from_status, to_status, code,
+			message, artifact_refs_json, created_at
+		) VALUES (?, 'run-v1', 'signal_aggregated', 'control-plane', '', '', 'signal_aggregated', '', ?, ?)
+	`, "event-signal-"+secondaryRequestDigestHex,
+		`["input-sha256:`+secondaryInputHash+`","signal-id:signal-v1"]`, updatedAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -231,22 +252,53 @@ func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) 
 	if got, want := fmt.Sprint(scopes), fmt.Sprintf("[package:agent-v1 release:%s]", releaseID); got != want {
 		t.Fatalf("backfilled scopes = %s, want %s", got, want)
 	}
-	var gotRequestHash, gotInputHash, gotSignalID, gotRunID, gotEventRefs, gotSignalRequestKey string
-	if err := store.db.QueryRow(`
-		SELECT request_key_hash, input_hash, signal_id, run_id
-		FROM evolution_signal_observations
-	`).Scan(&gotRequestHash, &gotInputHash, &gotSignalID, &gotRunID); err != nil {
+	readTx, err := store.db.Begin()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if gotRequestHash != "sha256:"+requestDigestHex || gotInputHash != inputHash || gotSignalID != "signal-v1" || gotRunID != "run-v1" {
-		t.Fatalf("migrated observation = %q/%q/%q/%q", gotRequestHash, gotInputHash, gotSignalID, gotRunID)
-	}
-	if err := store.db.QueryRow(`SELECT artifact_refs_json FROM evolution_events WHERE event_id = ?`, "event-signal-"+requestDigestHex).Scan(&gotEventRefs); err != nil {
+	primaryObservation, err := loadEvolutionSignalObservationByRequestHashTx(readTx, "sha256:"+requestDigestHex)
+	if err != nil {
+		_ = readTx.Rollback()
 		t.Fatal(err)
 	}
-	if gotEventRefs != "[]" {
-		t.Fatalf("migrated event refs = %s", gotEventRefs)
+	secondaryObservation, err := loadEvolutionSignalObservationByRequestHashTx(readTx, "sha256:"+secondaryRequestDigestHex)
+	_ = readTx.Rollback()
+	if err != nil {
+		t.Fatal(err)
 	}
+	if primaryObservation.PayloadFidelity != EvolutionObservationPayloadComplete ||
+		primaryObservation.InputHash != inputHash || primaryObservation.SignalID != "signal-v1" || primaryObservation.RunID != "run-v1" ||
+		primaryObservation.Severity == nil || *primaryObservation.Severity != legacyInput.Severity ||
+		primaryObservation.ObservedValue == nil || *primaryObservation.ObservedValue != legacyInput.ObservedValue {
+		t.Fatalf("primary migrated observation = %#v", primaryObservation)
+	}
+	if secondaryObservation.PayloadFidelity != EvolutionObservationPayloadLegacyHashOnly ||
+		secondaryObservation.InputHash != secondaryInputHash || secondaryObservation.SignalID != "signal-v1" || secondaryObservation.RunID != "run-v1" ||
+		secondaryObservation.SignalType != nil || secondaryObservation.SourceType != nil || secondaryObservation.SourceID != nil ||
+		secondaryObservation.PackageID != nil || secondaryObservation.ReleaseID != nil || secondaryObservation.Severity != nil ||
+		secondaryObservation.ObservedValue != nil || secondaryObservation.BaselineValue != nil || secondaryObservation.EvidenceRefs != nil || secondaryObservation.ObservedAt != nil {
+		t.Fatalf("secondary migrated observation fabricated payload: %#v", secondaryObservation)
+	}
+	rows, err = store.db.Query(`SELECT artifact_refs_json FROM evolution_events WHERE event_id IN (?, ?) ORDER BY event_id`,
+		"event-signal-"+requestDigestHex, "event-signal-"+secondaryRequestDigestHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var gotEventRefs string
+		if err := rows.Scan(&gotEventRefs); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if gotEventRefs != "[]" {
+			rows.Close()
+			t.Fatalf("migrated event refs = %s", gotEventRefs)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var gotSignalRequestKey string
 	if err := store.db.QueryRow(`SELECT idempotency_key FROM evolution_signals WHERE signal_id = 'signal-v1'`).Scan(&gotSignalRequestKey); err != nil {
 		t.Fatal(err)
 	}
@@ -257,6 +309,10 @@ func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) 
 	if err != nil || created || replayedSignal.SignalID != "signal-v1" || replayedRun.RunID != "run-v1" {
 		t.Fatalf("migrated replay = %#v/%#v, created %v, error %v", replayedSignal, replayedRun, created, err)
 	}
+	replayedSignal, replayedRun, created, err = store.IngestSignal(secondaryInput)
+	if err != nil || created || replayedSignal.SignalID != "signal-v1" || replayedRun.RunID != "run-v1" {
+		t.Fatalf("migrated secondary replay = %#v/%#v, created %v, error %v", replayedSignal, replayedRun, created, err)
+	}
 	var observationCount, eventCount int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_signal_observations`).Scan(&observationCount); err != nil {
 		t.Fatal(err)
@@ -264,8 +320,137 @@ func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) 
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_events`).Scan(&eventCount); err != nil {
 		t.Fatal(err)
 	}
-	if observationCount != 1 || eventCount != 1 {
+	if observationCount != 2 || eventCount != 2 {
 		t.Fatalf("migrated replay wrote observations/events = %d/%d", observationCount, eventCount)
+	}
+}
+
+func TestEvolutionStoreMigrationRowsErrorRollsBackVersion(t *testing.T) {
+	for _, stage := range []string{
+		evolutionMigrationRowsRuns,
+		evolutionMigrationRowsMappingEvents,
+		evolutionMigrationRowsSignalKeys,
+	} {
+		t.Run(stage, func(t *testing.T) {
+			root := t.TempDir()
+			seedEvolutionV1MigrationRows(t, root)
+			injected := fmt.Errorf("%s interrupted: %w", stage, errEvolutionTestRowsInterrupted)
+			wrapped := false
+			store, err := openEvolutionControlStoreWithOptions(root, fixedEvolutionStoreClock(), evolutionStoreOpenOptions{
+				hooks: evolutionStoreHooks{wrapMigrationRows: func(gotStage string, rows evolutionMigrationRows) evolutionMigrationRows {
+					if gotStage != stage {
+						return rows
+					}
+					wrapped = true
+					return &interruptingEvolutionMigrationRows{evolutionMigrationRows: rows, err: injected}
+				}},
+			})
+			if store != nil {
+				_ = store.Close()
+				t.Fatal("migration unexpectedly opened store")
+			}
+			if !wrapped || !errors.Is(err, errEvolutionTestRowsInterrupted) {
+				t.Fatalf("migration error = %v, wrapped %v", err, wrapped)
+			}
+
+			db, openErr := sql.Open("sqlite3", evolutionSQLiteDSN(filepath.Join(root, evolutionControlDBName)))
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer db.Close()
+			var version string
+			if err := db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "1" {
+				t.Fatalf("schema version after failed migration = %q, %v", version, err)
+			}
+			var v2Tables int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'evolution_signal_observations'`).Scan(&v2Tables); err != nil || v2Tables != 0 {
+				t.Fatalf("v2 table count after rollback = %d, %v", v2Tables, err)
+			}
+		})
+	}
+}
+
+var errEvolutionTestRowsInterrupted = errors.New("migration rows interrupted")
+
+type interruptingEvolutionMigrationRows struct {
+	evolutionMigrationRows
+	err       error
+	triggered bool
+}
+
+func (r *interruptingEvolutionMigrationRows) Next() bool {
+	if r.triggered || !r.evolutionMigrationRows.Next() {
+		return false
+	}
+	r.triggered = true
+	return false
+}
+
+func (r *interruptingEvolutionMigrationRows) Err() error {
+	if r.triggered {
+		return r.err
+	}
+	return r.evolutionMigrationRows.Err()
+}
+
+func seedEvolutionV1MigrationRows(t *testing.T, root string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(filepath.Join(root, evolutionControlDBName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE evolution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyEvolutionMigrationV1(tx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO evolution_meta(key, value) VALUES ('schema_version', '1')`); err != nil {
+		t.Fatal(err)
+	}
+	requestKey := "55555555-5555-4555-8555-555555555555"
+	mappingRequestKey := "77777777-7777-4777-8777-777777777777"
+	requestDigest := sha256.Sum256([]byte(mappingRequestKey))
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_signals (
+			signal_id, idempotency_key, signal_type, source_type, source_id, package_id,
+			release_id, severity, observed_value, baseline_value, deduplication_key,
+			evidence_refs_json, observed_at, created_at, updated_at
+		) VALUES ('signal-rows', ?, ?, ?, ?, 'rows-agent', '', ?, 0.4, 0.8, ?, '[]', ?, ?, ?)
+	`, requestKey, EvolutionSignalRegressionFailure, EvolutionSignalSourceEvaluation,
+		"66666666-6666-4666-8666-666666666666", EvolutionSignalSeverityHigh,
+		"signal:"+strings.Repeat("d", 64), "2026-08-11T10:00:00Z", "2026-08-11T10:00:00Z", "2026-08-11T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_runs (
+			run_id, idempotency_key, input_hash, attempt, retry_of_run_id, run_type,
+			package_id, baseline_package_version, baseline_release_ids_json, risk_level,
+			priority_score, status, trigger_signal_ids_json, current_candidate_id,
+			failure_code, failure_message, created_at, updated_at
+		) VALUES ('run-rows', 'request-rows', 'input-rows', 1, '', ?, 'rows-agent', '1.0.0', '[]', ?, 50, ?, '["signal-rows"]', '', '', '', ?, ?)
+	`, EvolutionRunAgentPolicy, EvolutionSignalSeverityHigh, EvolutionDetected, "2026-08-11T10:00:00Z", "2026-08-11T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO evolution_events (
+			event_id, run_id, event_type, actor, from_status, to_status, code,
+			message, artifact_refs_json, created_at
+		) VALUES (?, 'run-rows', 'created', 'control-plane', '', ?, 'signal_ingested', '', ?, ?)
+	`, "event-signal-"+hex.EncodeToString(requestDigest[:]), EvolutionDetected,
+		`["input-sha256:`+strings.Repeat("e", 64)+`","signal-id:signal-rows"]`, "2026-08-11T10:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
