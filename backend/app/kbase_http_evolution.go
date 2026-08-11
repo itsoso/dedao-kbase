@@ -203,7 +203,7 @@ func (h *kbaseHTTPHandler) handleEvolutionEvents(w http.ResponseWriter, r *http.
 		return
 	}
 	cursor := query.Get("cursor")
-	if cursor != "" && !isCanonicalEvolutionEventCursor(cursor) {
+	if cursor != "" && validateEvolutionIdentity("cursor", cursor) != nil {
 		writeHTTPError(w, http.StatusBadRequest, "invalid cursor")
 		return
 	}
@@ -256,22 +256,6 @@ func parseEvolutionHTTPLimit(raw string) (int, bool) {
 		return 0, false
 	}
 	return limit, true
-}
-
-func isCanonicalEvolutionEventCursor(cursor string) bool {
-	const prefix = "event-"
-	const hexLength = 32
-	if len(cursor) != len(prefix)+hexLength || !strings.HasPrefix(cursor, prefix) {
-		return false
-	}
-	for _, character := range cursor[len(prefix):] {
-		if character < '0' || character > '9' {
-			if character < 'a' || character > 'f' {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 func validateEvolutionHTTPQuery(query url.Values, allowed map[string]bool) bool {

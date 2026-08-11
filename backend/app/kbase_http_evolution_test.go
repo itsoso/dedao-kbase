@@ -225,13 +225,10 @@ func TestKBaseHTTPHandlerEvolutionEventsRejectMalformedCursors(t *testing.T) {
 	handler := newEvolutionHTTPTestHandler(books, evolution, true)
 
 	for name, cursor := range map[string]string{
-		"unsupported character": "event-invalid|cursor",
-		"unicode":               "事件游标",
-		"too long":              "event-" + strings.Repeat("a", EvolutionIdentityMaxRunes),
-		"wrong prefix":          "run-" + strings.Repeat("a", 32),
-		"wrong length":          "event-a",
-		"non hexadecimal":       "event-" + strings.Repeat("z", 32),
-		"uppercase hexadecimal": "event-" + strings.Repeat("A", 32),
+		"unsupported character":  "event-invalid|cursor",
+		"unicode":                "事件游标",
+		"surrounding whitespace": " event-" + strings.Repeat("a", 32),
+		"too long":               "event-" + strings.Repeat("a", EvolutionIdentityMaxRunes),
 	} {
 		t.Run(name, func(t *testing.T) {
 			path := "/api/evolution/runs/" + run.RunID + "/events?cursor=" + url.QueryEscape(cursor)
@@ -239,10 +236,72 @@ func TestKBaseHTTPHandlerEvolutionEventsRejectMalformedCursors(t *testing.T) {
 			if response.Code != http.StatusBadRequest {
 				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 			}
-			if !strings.Contains(response.Body.String(), "invalid cursor") {
-				t.Fatalf("unexpected cursor error: %s", response.Body.String())
+			if strings.Contains(response.Body.String(), "evolution data unavailable") {
+				t.Fatalf("cursor validation fell through to internal error: %s", response.Body.String())
 			}
 		})
+	}
+	empty := requestKBase(handler, http.MethodGet,
+		"/api/evolution/runs/"+run.RunID+"/events?cursor=", "consumer-token")
+	if empty.Code != http.StatusBadRequest {
+		t.Fatalf("empty cursor status=%d body=%s", empty.Code, empty.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerEvolutionEventsPageFromMigratedSignalCursor(t *testing.T) {
+	root := t.TempDir()
+	seedEvolutionV1MigrationRows(t, root)
+	evolution, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = evolution.Close() })
+	if _, err := evolution.TransitionRun("run-rows", EvolutionTriaged, EvolutionTransitionInput{
+		Actor: "worker", Code: "triaged", Message: "safe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	handler := newEvolutionHTTPTestHandler(NewBookKnowledgeStore(root), evolution, true)
+
+	first := requestKBase(handler, http.MethodGet,
+		"/api/evolution/runs/run-rows/events?limit=1", "consumer-token")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstPage evolutionEventHTTPPage
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage.Events) != 1 || !strings.HasPrefix(firstPage.NextCursor, "event-signal-") || firstPage.NextCursor != firstPage.Events[0].EventID {
+		t.Fatalf("first migrated page=%#v", firstPage)
+	}
+
+	second := requestKBase(handler, http.MethodGet,
+		"/api/evolution/runs/run-rows/events?limit=1&cursor="+url.QueryEscape(firstPage.NextCursor),
+		"consumer-token")
+	if second.Code != http.StatusOK {
+		t.Fatalf("second page status=%d body=%s", second.Code, second.Body.String())
+	}
+	var secondPage evolutionEventHTTPPage
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(secondPage.Events) != 1 || secondPage.Events[0].EventID == firstPage.Events[0].EventID {
+		t.Fatalf("second migrated page=%#v", secondPage)
+	}
+
+	final := requestKBase(handler, http.MethodGet,
+		"/api/evolution/runs/run-rows/events?limit=1&cursor="+url.QueryEscape(secondPage.Events[0].EventID),
+		"consumer-token")
+	if final.Code != http.StatusOK {
+		t.Fatalf("final page status=%d body=%s", final.Code, final.Body.String())
+	}
+	var finalPage evolutionEventHTTPPage
+	if err := json.Unmarshal(final.Body.Bytes(), &finalPage); err != nil {
+		t.Fatal(err)
+	}
+	if finalPage.Events == nil || len(finalPage.Events) != 0 || finalPage.NextCursor != "" {
+		t.Fatalf("final migrated page=%#v", finalPage)
 	}
 }
 
