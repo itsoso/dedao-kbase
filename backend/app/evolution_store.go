@@ -60,6 +60,7 @@ type EvolutionControlStore struct {
 }
 
 type evolutionStoreTestHooks struct {
+	beforeBeginTx     func() error
 	beforeEventInsert func(EvolutionEvent) error
 }
 
@@ -362,7 +363,7 @@ func (s *EvolutionControlStore) CreateRun(input EvolutionRunInput) (*EvolutionRu
 		return nil, false, fmt.Errorf("validate evolution created event: %w", err)
 	}
 
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, false, fmt.Errorf("begin create evolution run: %w", err)
 	}
@@ -435,7 +436,7 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 	}
 	timestamp := s.timestamp()
 
-	tx, err := s.db.BeginTx(context.Background(), nil)
+	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("begin evolution transition: %w", err)
 	}
@@ -570,6 +571,15 @@ func (s *EvolutionControlStore) insertEventTx(tx *sql.Tx, event EvolutionEvent) 
 		return fmt.Errorf("insert evolution event: %w", err)
 	}
 	return nil
+}
+
+func (s *EvolutionControlStore) beginTx(ctx context.Context) (*sql.Tx, error) {
+	if hook := s.testHooks.beforeBeginTx; hook != nil {
+		if err := hook(); err != nil {
+			return nil, err
+		}
+	}
+	return s.db.BeginTx(ctx, nil)
 }
 
 func (s *EvolutionControlStore) timestamp() string {

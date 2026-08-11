@@ -247,34 +247,97 @@ func TestEvolutionStoreRollsBackCreateWhenEventInsertFails(t *testing.T) {
 func TestEvolutionStoreRejectsInvalidTransitionInputBeforeTransaction(t *testing.T) {
 	store := newEvolutionTestStore(t)
 	run := createEvolutionTestRun(t, store, "invalid-transition")
-	hookCalls := 0
-	store.testHooks.beforeEventInsert = func(EvolutionEvent) error {
-		hookCalls++
+	beginCalls := 0
+	store.testHooks.beforeBeginTx = func() error {
+		beginCalls++
 		return nil
 	}
 	tests := []struct {
 		name  string
 		to    EvolutionRunStatus
 		input EvolutionTransitionInput
+		want  string
 	}{
-		{name: "unknown status", to: EvolutionRunStatus("invented"), input: EvolutionTransitionInput{Actor: "operator", Code: "triaged"}},
-		{name: "invalid actor", to: EvolutionTriaged, input: EvolutionTransitionInput{Actor: "bad actor", Code: "triaged"}},
-		{name: "invalid code", to: EvolutionTriaged, input: EvolutionTransitionInput{Actor: "operator", Code: "bad code"}},
-		{name: "long public message", to: EvolutionTriaged, input: EvolutionTransitionInput{Actor: "operator", Code: "triaged", Message: strings.Repeat("界", EvolutionEventMessageMaxRunes+1)}},
+		{name: "unknown status", to: EvolutionRunStatus("invented"), input: EvolutionTransitionInput{Actor: "operator", Code: "triaged"}, want: "unknown evolution run status"},
+		{name: "invalid actor", to: EvolutionTriaged, input: EvolutionTransitionInput{Actor: "bad actor", Code: "triaged"}, want: "actor contains unsupported characters"},
+		{name: "invalid code", to: EvolutionTriaged, input: EvolutionTransitionInput{Actor: "operator", Code: "bad code"}, want: "code contains unsupported characters"},
+		{name: "long public message", to: EvolutionTriaged, input: EvolutionTransitionInput{Actor: "operator", Code: "triaged", Message: strings.Repeat("界", EvolutionEventMessageMaxRunes+1)}, want: "message exceeds 512 characters"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := store.TransitionRun(run.RunID, test.to, test.input); err == nil {
-				t.Fatal("expected validation error")
+			if _, err := store.TransitionRun(run.RunID, test.to, test.input); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
 			}
 		})
 	}
-	if hookCalls != 0 {
-		t.Fatalf("event hook called %d times for pre-transaction validation failures", hookCalls)
+	if beginCalls != 0 {
+		t.Fatalf("begin hook called %d times for pre-transaction validation failures", beginCalls)
 	}
 	loaded, err := store.LoadRun(run.RunID)
 	if err != nil || loaded.Status != EvolutionDetected {
 		t.Fatalf("run changed = %#v, %v", loaded, err)
+	}
+	if _, err := store.TransitionRun(run.RunID, EvolutionTriaged, EvolutionTransitionInput{Actor: "operator", Code: "triaged"}); err != nil {
+		t.Fatalf("valid transition: %v", err)
+	}
+	if beginCalls != 1 {
+		t.Fatalf("begin hook calls after valid transition = %d, want 1", beginCalls)
+	}
+}
+
+func TestEvolutionStoreRejectsInvalidCreateInputBeforeTransaction(t *testing.T) {
+	store := newEvolutionTestStore(t)
+	beginCalls := 0
+	store.testHooks.beforeBeginTx = func() error {
+		beginCalls++
+		return nil
+	}
+	tests := []struct {
+		name   string
+		mutate func(*EvolutionRunInput)
+		want   string
+	}{
+		{name: "invalid run type", mutate: func(input *EvolutionRunInput) { input.RunType = EvolutionRunType("invented") }, want: "unknown evolution run type"},
+		{name: "invalid actor", mutate: func(input *EvolutionRunInput) { input.Actor = "bad actor" }, want: "actor contains unsupported characters"},
+		{name: "invalid code", mutate: func(input *EvolutionRunInput) { input.Code = "bad code" }, want: "code contains unsupported characters"},
+		{name: "long public message", mutate: func(input *EvolutionRunInput) { input.Message = strings.Repeat("界", EvolutionEventMessageMaxRunes+1) }, want: "message exceeds 512 characters"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := validEvolutionRunInput("invalid-create-" + strings.ReplaceAll(test.name, " ", "-"))
+			test.mutate(&input)
+			if _, _, err := store.CreateRun(input); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error = %v, want containing %q", err, test.want)
+			}
+		})
+	}
+	if beginCalls != 0 {
+		t.Fatalf("begin hook called %d times for invalid creates", beginCalls)
+	}
+	if _, created, err := store.CreateRun(validEvolutionRunInput("valid-create-after-validation")); err != nil || !created {
+		t.Fatalf("valid CreateRun = created %v, error %v", created, err)
+	}
+	if beginCalls != 1 {
+		t.Fatalf("begin hook calls after valid create = %d, want 1", beginCalls)
+	}
+}
+
+func TestEvolutionStoreReturnsBeforeBeginHookError(t *testing.T) {
+	store := newEvolutionTestStore(t)
+	injected := errors.New("before begin failed")
+	store.testHooks.beforeBeginTx = func() error { return injected }
+	if _, _, err := store.CreateRun(validEvolutionRunInput("before-begin-failure")); !errors.Is(err, injected) {
+		t.Fatalf("CreateRun error = %v, want %v", err, injected)
+	}
+	var runCount, eventCount int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_runs`).Scan(&runCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_events`).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if runCount != 0 || eventCount != 0 {
+		t.Fatalf("hook failure committed runs=%d events=%d", runCount, eventCount)
 	}
 }
 
