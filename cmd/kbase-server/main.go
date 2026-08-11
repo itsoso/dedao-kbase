@@ -75,10 +75,6 @@ func runCommandWithServerRunner(
 	stdout io.Writer,
 	runServer func(kBaseServerConfig) error,
 ) error {
-	evolutionEnabledDefault, err := evolutionEnabledFromEnvironment()
-	if err != nil {
-		return err
-	}
 	flags := flag.NewFlagSet("kbase-server", flag.ContinueOnError)
 	addr := flags.String("addr", envDefault("KBASE_HTTP_ADDR", "127.0.0.1:8719"), "HTTP listen address")
 	root := flags.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")
@@ -87,10 +83,23 @@ func runCommandWithServerRunner(
 	authToken := flags.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
 	agentPublisherToken := flags.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
 	sourceAgentToken := flags.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
-	evolutionEnabled := flags.Bool("evolution-enabled", evolutionEnabledDefault, "enable the Agent evolution control plane")
+	evolutionEnabled := flags.Bool("evolution-enabled", true, "enable the Agent evolution control plane")
 	checkConfig := flags.Bool("check-config", false, "validate server configuration without starting")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	evolutionFlagSet := false
+	flags.Visit(func(current *flag.Flag) {
+		if current.Name == "evolution-enabled" {
+			evolutionFlagSet = true
+		}
+	})
+	if !evolutionFlagSet {
+		enabled, err := evolutionEnabledFromEnvironment()
+		if err != nil {
+			return err
+		}
+		*evolutionEnabled = enabled
 	}
 
 	sessionConfig := defaultSessionServerConfig()

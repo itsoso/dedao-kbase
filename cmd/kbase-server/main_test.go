@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -83,6 +84,36 @@ func TestEvolutionEnabledEnvironmentDefaultsOnAndAcceptsExplicitOff(t *testing.T
 	t.Setenv("KBASE_EVOLUTION_ENABLED", "invalid")
 	if _, err := evolutionEnabledFromEnvironment(); err == nil || !strings.Contains(err.Error(), "KBASE_EVOLUTION_ENABLED") {
 		t.Fatalf("invalid evolution flag error = %v", err)
+	}
+}
+
+func TestRunCommandHelpIgnoresInvalidEvolutionEnvironment(t *testing.T) {
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "invalid")
+	if err := runCommandWithServerRunner([]string{"--help"}, &bytes.Buffer{}, func(kBaseServerConfig) error {
+		t.Fatal("help invoked server runner")
+		return nil
+	}); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("--help error = %v, want flag.ErrHelp", err)
+	}
+}
+
+func TestRunCommandExplicitEvolutionFlagOverridesInvalidEnvironment(t *testing.T) {
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "invalid")
+	for _, value := range []string{"true", "false"} {
+		t.Run(value, func(t *testing.T) {
+			var captured kBaseServerConfig
+			err := runCommandWithServerRunner([]string{"--evolution-enabled=" + value}, &bytes.Buffer{}, func(config kBaseServerConfig) error {
+				captured = config
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := captured.EvolutionEnabled, value == "true"; got != want {
+				t.Fatalf("EvolutionEnabled=%v, want %v", got, want)
+			}
+		})
 	}
 }
 

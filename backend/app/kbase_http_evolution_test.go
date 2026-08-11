@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -195,10 +196,53 @@ func TestKBaseHTTPHandlerEvolutionRunDetailAndEventsArePrivate(t *testing.T) {
 	if lastPage.Events == nil {
 		t.Fatal("events array is nil")
 	}
+	if len(lastPage.Events) != 1 {
+		t.Fatalf("last event page=%#v", lastPage)
+	}
+	empty := requestKBase(handler, http.MethodGet,
+		"/api/evolution/runs/"+run.RunID+"/events?limit=1&cursor="+url.QueryEscape(lastPage.Events[0].EventID),
+		"consumer-token")
+	if empty.Code != http.StatusOK {
+		t.Fatalf("empty events status=%d body=%s", empty.Code, empty.Body.String())
+	}
+	var emptyPage evolutionEventHTTPPage
+	if err := json.Unmarshal(empty.Body.Bytes(), &emptyPage); err != nil {
+		t.Fatal(err)
+	}
+	if emptyPage.Events == nil || len(emptyPage.Events) != 0 || emptyPage.NextCursor != "" {
+		t.Fatalf("exclusive cursor page=%#v", emptyPage)
+	}
 	for _, secret := range []string{"private database failure detail", "private-artifact-hash", evolution.dbPath} {
 		if strings.Contains(detail.Body.String(), secret) || strings.Contains(events.Body.String(), secret) || strings.Contains(last.Body.String(), secret) {
 			t.Fatalf("detail/events leaked %q", secret)
 		}
+	}
+}
+
+func TestKBaseHTTPHandlerEvolutionEventsRejectMalformedCursors(t *testing.T) {
+	books, evolution := newEvolutionHTTPTestStores(t)
+	run := createEvolutionTestRun(t, evolution, "cursor-validation-run")
+	handler := newEvolutionHTTPTestHandler(books, evolution, true)
+
+	for name, cursor := range map[string]string{
+		"unsupported character": "event-invalid|cursor",
+		"unicode":               "事件游标",
+		"too long":              "event-" + strings.Repeat("a", EvolutionIdentityMaxRunes),
+		"wrong prefix":          "run-" + strings.Repeat("a", 32),
+		"wrong length":          "event-a",
+		"non hexadecimal":       "event-" + strings.Repeat("z", 32),
+		"uppercase hexadecimal": "event-" + strings.Repeat("A", 32),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := "/api/evolution/runs/" + run.RunID + "/events?cursor=" + url.QueryEscape(cursor)
+			response := requestKBase(handler, http.MethodGet, path, "consumer-token")
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+			if !strings.Contains(response.Body.String(), "invalid cursor") {
+				t.Fatalf("unexpected cursor error: %s", response.Body.String())
+			}
+		})
 	}
 }
 
