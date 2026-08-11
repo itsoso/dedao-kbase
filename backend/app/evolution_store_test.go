@@ -40,6 +40,7 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 		"evolution_scorecards",
 		"evolution_signal_observations",
 		"evolution_signals",
+		"evolution_work_items",
 		"evolution_worker_leases",
 	}
 	rows, err := store.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'evolution_%' ORDER BY name`)
@@ -63,6 +64,7 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 	}
 	wantIndexes := []string{
 		"idx_evolution_outbox_pending_delivery",
+		"idx_evolution_outbox_lease_expiry",
 		"idx_evolution_run_scopes_lookup",
 		"idx_evolution_runs_created",
 		"idx_evolution_runs_created_ns",
@@ -72,6 +74,9 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 		"idx_evolution_runs_updated",
 		"idx_evolution_runs_updated_ns",
 		"idx_evolution_signal_observations_request",
+		"idx_evolution_work_pending_capability",
+		"idx_evolution_work_lease_expiry",
+		"idx_evolution_work_result_idempotency",
 	}
 	for _, index := range wantIndexes {
 		var count int
@@ -107,7 +112,7 @@ func TestEvolutionStoreCreatesSchemaAndPersistsAcrossReopen(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != "2" {
+	if version != "3" {
 		t.Fatalf("schema version = %q", version)
 	}
 }
@@ -224,7 +229,7 @@ func TestEvolutionStoreMigratesV1RunsIntoIndexedScopesAndTimeKeys(t *testing.T) 
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	var version string
-	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "2" {
+	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "3" {
 		t.Fatalf("schema version = %q, %v", version, err)
 	}
 	wantCreated, _ := time.Parse(time.RFC3339Nano, createdAt)
@@ -1082,7 +1087,7 @@ func TestEvolutionStoreWriteConflictPreservesSQLiteCause(t *testing.T) {
 func TestEvolutionStoreRejectsFutureSchemaWithoutModification(t *testing.T) {
 	root := t.TempDir()
 	store := openEvolutionTestStoreAtRoot(t, root, evolutionStoreHooks{})
-	if _, err := store.db.Exec(`UPDATE evolution_meta SET value = '3' WHERE key = 'schema_version'`); err != nil {
+	if _, err := store.db.Exec(`UPDATE evolution_meta SET value = '4' WHERE key = 'schema_version'`); err != nil {
 		t.Fatal(err)
 	}
 	var beforeObjects int
@@ -1104,8 +1109,105 @@ func TestEvolutionStoreRejectsFutureSchemaWithoutModification(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'evolution_%'`).Scan(&afterObjects); err != nil {
 		t.Fatal(err)
 	}
-	if version != "3" || beforeObjects != afterObjects {
+	if version != "4" || beforeObjects != afterObjects {
 		t.Fatalf("future schema modified: version=%q objects=%d->%d", version, beforeObjects, afterObjects)
+	}
+}
+
+func TestEvolutionStoreMigratesV2WorkerSchemaAndReopensAtV3(t *testing.T) {
+	root := t.TempDir()
+	seedEvolutionV2Schema(t, root)
+	store, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version string
+	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "3" {
+		t.Fatalf("schema version = %q, %v", version, err)
+	}
+	for _, column := range []string{"lease_id", "input_hash", "max_attempts", "failure_code", "failure_message", "receipt_id"} {
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('evolution_outbox') WHERE name = ?`, column).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("outbox column %q count = %d, %v", column, count, err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if err != nil {
+		t.Fatalf("repeat open at v3: %v", err)
+	}
+	defer reopened.Close()
+	var workTables int
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'evolution_work_items'`).Scan(&workTables); err != nil || workTables != 1 {
+		t.Fatalf("work table count = %d, %v", workTables, err)
+	}
+}
+
+func TestEvolutionStoreV3MigrationFailureRollsBackWholeVersion(t *testing.T) {
+	root := t.TempDir()
+	seedEvolutionV2Schema(t, root)
+	injected := errors.New("migration v3 failed")
+	store, err := openEvolutionControlStore(root, fixedEvolutionStoreClock(), evolutionStoreHooks{afterMigrationVersion: func(version int) error {
+		if version == 3 {
+			return injected
+		}
+		return nil
+	}})
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("failed v3 migration returned a store")
+	}
+	if !errors.Is(err, injected) {
+		t.Fatalf("migration error = %v", err)
+	}
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(filepath.Join(root, evolutionControlDBName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version string
+	if err := db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "2" {
+		t.Fatalf("schema version after rollback = %q, %v", version, err)
+	}
+	var workTables, receiptColumns int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'evolution_work_items'`).Scan(&workTables); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('evolution_outbox') WHERE name = 'receipt_id'`).Scan(&receiptColumns); err != nil {
+		t.Fatal(err)
+	}
+	if workTables != 0 || receiptColumns != 0 {
+		t.Fatalf("failed v3 migration leaked schema: work=%d receipt=%d", workTables, receiptColumns)
+	}
+}
+
+func seedEvolutionV2Schema(t *testing.T, root string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(filepath.Join(root, evolutionControlDBName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE evolution_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyEvolutionMigrationV1(tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyEvolutionMigrationV2(tx, evolutionStoreHooks{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO evolution_meta(key, value) VALUES ('schema_version', '2')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 }
 

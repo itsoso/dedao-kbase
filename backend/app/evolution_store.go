@@ -21,7 +21,7 @@ import (
 
 const (
 	evolutionControlDBName      = "evolution_control.sqlite3"
-	evolutionStoreSchemaVersion = 2
+	evolutionStoreSchemaVersion = 3
 	evolutionEventDefaultLimit  = 100
 	evolutionEventMaxLimit      = 500
 	evolutionDefaultBusyTimeout = 5 * time.Second
@@ -68,6 +68,7 @@ type evolutionStoreHooks struct {
 	beforeBeginTx         func() error
 	afterBeginTx          func() error
 	beforeEventInsert     func(EvolutionEvent) error
+	beforeOutboxInsert    func() error
 	afterMigrationVersion func(int) error
 	wrapMigrationRows     func(string, evolutionMigrationRows) evolutionMigrationRows
 }
@@ -186,6 +187,10 @@ func migrateEvolutionControlDB(db *sql.DB, hooks evolutionStoreHooks) error {
 			}
 		case 2:
 			if err := applyEvolutionMigrationV2(tx, hooks); err != nil {
+				return err
+			}
+		case 3:
+			if err := applyEvolutionMigrationV3(tx); err != nil {
 				return err
 			}
 		default:
@@ -497,6 +502,58 @@ func applyEvolutionMigrationV2(tx *sql.Tx, hooks evolutionStoreHooks) error {
 	}
 	if err := migrateEvolutionV1SignalObservationsTx(tx, hooks); err != nil {
 		return err
+	}
+	return nil
+}
+
+func applyEvolutionMigrationV3(tx *sql.Tx) error {
+	if _, err := tx.Exec(`
+		CREATE TABLE evolution_work_items (
+			work_id TEXT PRIMARY KEY,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			input_hash TEXT NOT NULL,
+			run_id TEXT NOT NULL,
+			capability TEXT NOT NULL CHECK(capability IN (
+				'knowledge_evolution', 'agent_evolution', 'evaluation', 'release', 'observation'
+			)),
+			artifact_ref TEXT NOT NULL,
+			status TEXT NOT NULL CHECK(status IN ('pending', 'leased', 'completed', 'blocked')),
+			attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
+			max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1),
+			available_at TEXT NOT NULL,
+			lease_id TEXT NOT NULL DEFAULT '',
+			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_expires_at TEXT NOT NULL DEFAULT '',
+			result_idempotency_key TEXT NOT NULL DEFAULT '',
+			result_hash TEXT NOT NULL DEFAULT '',
+			result_artifact_ref TEXT NOT NULL DEFAULT '',
+			failure_code TEXT NOT NULL DEFAULT '',
+			failure_message TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			FOREIGN KEY(run_id) REFERENCES evolution_runs(run_id)
+		);
+		CREATE INDEX idx_evolution_work_pending_capability
+			ON evolution_work_items(status, capability, available_at, created_at, work_id)
+			WHERE status = 'pending';
+		CREATE INDEX idx_evolution_work_lease_expiry
+			ON evolution_work_items(status, lease_expires_at, work_id)
+			WHERE status = 'leased';
+		CREATE UNIQUE INDEX idx_evolution_work_result_idempotency
+			ON evolution_work_items(result_idempotency_key)
+			WHERE result_idempotency_key <> '';
+
+		ALTER TABLE evolution_outbox ADD COLUMN lease_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN input_hash TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts >= 1);
+		ALTER TABLE evolution_outbox ADD COLUMN failure_code TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN failure_message TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN receipt_id TEXT NOT NULL DEFAULT '';
+		CREATE INDEX idx_evolution_outbox_lease_expiry
+			ON evolution_outbox(status, lease_expires_at, outbox_id)
+			WHERE status = 'leased';
+	`); err != nil {
+		return fmt.Errorf("apply evolution schema version 3: %w", err)
 	}
 	return nil
 }
