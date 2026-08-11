@@ -3,9 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import { loadAppSource } from "./load-app-source.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const source = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const source = loadAppSource(root);
 const authEnd = source.indexOf("\nconst readerRouteSuffixes");
 
 assert.ok(authEnd > 0, "app.js should expose its browser request helpers before reader routes");

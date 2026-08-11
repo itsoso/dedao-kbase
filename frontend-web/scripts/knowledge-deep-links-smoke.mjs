@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 
-import {
+await import("../knowledge-deep-links.js");
+
+const {
   knowledgeBookForRoute,
   knowledgeBookPath,
   knowledgeChapterPath,
@@ -10,8 +12,9 @@ import {
   knowledgeResultPath,
   knowledgeResultRouteID,
   knowledgeSearchIsCurrent,
+  knowledgeVisibleChapters,
   shouldHandleKnowledgeClick,
-} from "../knowledge-deep-links.mjs";
+} = globalThis.KnowledgeDeepLinks;
 
 assert.equal(knowledgeBookPath("book / 1"), "/knowledge/packages/book%20%2F%201");
 assert.equal(
@@ -74,5 +77,17 @@ assert.equal(knowledgeResourceTargetSelector({ type: "book" }), "");
 assert.equal(knowledgeSearchIsCurrent(4, 4, "book-1", "book-1"), true);
 assert.equal(knowledgeSearchIsCurrent(3, 4, "book-1", "book-1"), false);
 assert.equal(knowledgeSearchIsCurrent(4, 4, "book-1", "book-2"), false);
+
+const manyChapters = Array.from({ length: 20 }, (_, index) => ({
+  chapter_id: `chapter-${index + 1}`,
+  title: `第 ${index + 1} 章`,
+}));
+const visibleChapters = knowledgeVisibleChapters(
+  manyChapters,
+  { type: "chapter", resourceID: "chapter-17" },
+  16,
+);
+assert.equal(visibleChapters.length, 17);
+assert.equal(visibleChapters.at(-1)?.chapter_id, "chapter-17");
 
 console.log("knowledge deep links smoke passed");

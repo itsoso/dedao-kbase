@@ -1,3 +1,4 @@
+(() => {
 const knowledgePackagesPath = "/knowledge/packages";
 
 function decodeRouteSegment(value) {
@@ -8,17 +9,17 @@ function decodeRouteSegment(value) {
   }
 }
 
-export function knowledgeBookPath(bookID) {
+function knowledgeBookPath(bookID) {
   const id = String(bookID || "").trim();
   return id ? `${knowledgePackagesPath}/${encodeURIComponent(id)}` : knowledgePackagesPath;
 }
 
-export function knowledgeChapterPath(bookID, chapterID) {
+function knowledgeChapterPath(bookID, chapterID) {
   const id = String(chapterID || "").trim();
   return id ? `${knowledgeBookPath(bookID)}/chapters/${encodeURIComponent(id)}` : knowledgeBookPath(bookID);
 }
 
-export function knowledgeResultPath(bookID, kind, resultID) {
+function knowledgeResultPath(bookID, kind, resultID) {
   const cleanKind = String(kind || "").trim();
   const id = String(resultID || "").trim();
   return cleanKind && id
@@ -26,7 +27,7 @@ export function knowledgeResultPath(bookID, kind, resultID) {
     : knowledgeBookPath(bookID);
 }
 
-export function knowledgeResourceFromPath(pathname) {
+function knowledgeResourceFromPath(pathname) {
   const prefix = `${knowledgePackagesPath}/`;
   if (!String(pathname || "").startsWith(prefix)) {
     return null;
@@ -53,20 +54,20 @@ export function knowledgeResourceFromPath(pathname) {
   return null;
 }
 
-export function knowledgeBookForRoute(books, resource) {
+function knowledgeBookForRoute(books, resource) {
   const bookID = String(resource?.bookID || "").trim();
   return bookID
     ? (Array.isArray(books) ? books : []).find((book) => String(book?.book_id || "") === bookID) || null
     : null;
 }
 
-export function knowledgeResultRouteID(result) {
+function knowledgeResultRouteID(result) {
   return String(
     result?.id || result?.claim_id || result?.chunk_id || result?.citation_id || result?.chapter_id || "",
   ).trim();
 }
 
-export function knowledgeResultFromPackage(pkg, resource) {
+function knowledgeResultFromPackage(pkg, resource) {
   const kind = String(resource?.kind || "").trim();
   const resourceID = String(resource?.resourceID || "").trim();
   if (!resourceID) {
@@ -109,7 +110,27 @@ export function knowledgeResultFromPackage(pkg, resource) {
   return null;
 }
 
-export function shouldHandleKnowledgeClick(event) {
+function knowledgeVisibleChapters(chapters, resource, limit = 16) {
+  const allChapters = Array.isArray(chapters) ? chapters : [];
+  const normalizedLimit = Math.max(0, Number(limit) || 0);
+  const visibleChapters = allChapters.slice(0, normalizedLimit);
+  const resourceID = String(resource?.resourceID || "").trim();
+  if (resource?.type !== "chapter" || !resourceID) {
+    return visibleChapters;
+  }
+  const activeChapter = allChapters.find((chapter) => (
+    String(chapter?.chapter_id || chapter?.id || "") === resourceID
+  ));
+  const isAlreadyVisible = visibleChapters.some((chapter) => (
+    String(chapter?.chapter_id || chapter?.id || "") === resourceID
+  ));
+  if (activeChapter && !isAlreadyVisible) {
+    visibleChapters.push(activeChapter);
+  }
+  return visibleChapters;
+}
+
+function shouldHandleKnowledgeClick(event) {
   return event?.button === 0
     && !event.metaKey
     && !event.ctrlKey
@@ -117,7 +138,7 @@ export function shouldHandleKnowledgeClick(event) {
     && !event.altKey;
 }
 
-export function knowledgeResourceTargetSelector(resource) {
+function knowledgeResourceTargetSelector(resource) {
   if (resource?.type === "chapter") {
     return "[data-chapter-index].active";
   }
@@ -127,6 +148,21 @@ export function knowledgeResourceTargetSelector(resource) {
   return "";
 }
 
-export function knowledgeSearchIsCurrent(sequence, currentSequence, routeBookID, currentRouteBookID) {
+function knowledgeSearchIsCurrent(sequence, currentSequence, routeBookID, currentRouteBookID) {
   return sequence === currentSequence && String(routeBookID || "") === String(currentRouteBookID || "");
 }
+
+globalThis.KnowledgeDeepLinks = Object.freeze({
+  knowledgeBookForRoute,
+  knowledgeBookPath,
+  knowledgeChapterPath,
+  knowledgeResourceFromPath,
+  knowledgeResourceTargetSelector,
+  knowledgeResultFromPackage,
+  knowledgeResultPath,
+  knowledgeResultRouteID,
+  knowledgeSearchIsCurrent,
+  knowledgeVisibleChapters,
+  shouldHandleKnowledgeClick,
+});
+})();

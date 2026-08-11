@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
-const knowledgeRoutesJS = fs.readFileSync(path.join(root, "knowledge-deep-links.mjs"), "utf8");
+const knowledgeRoutesJS = fs.readFileSync(path.join(root, "knowledge-deep-links.js"), "utf8");
 const deepLinkJS = `${js}\n${knowledgeRoutesJS}`;
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
@@ -160,7 +160,8 @@ for (const marker of [
 ]) {
   assert.ok(deepLinkJS.includes(marker), `knowledge deep-link regression coverage should include ${marker}`);
 }
-assert.ok(js.includes('from "./knowledge-deep-links.mjs?v=20260811-knowledge-deep-links"'), "app.js should version the knowledge route module");
+assert.ok(js.includes("globalThis.KnowledgeDeepLinks"), "app.js should consume the shared knowledge route helpers");
+assert.ok(html.includes('/knowledge-deep-links.js?v=20260811-knowledge-deep-links'), "index.html should version the shared knowledge route helpers");
 for (const marker of [
   "knowledgeSearchSequence",
   "knowledgeSearchIsCurrent",

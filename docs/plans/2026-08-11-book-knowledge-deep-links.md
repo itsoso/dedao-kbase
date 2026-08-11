@@ -189,7 +189,7 @@ Stage only `frontend-web/index.html` and any still-uncommitted task files, then 
 ### Task 5: Resolve independent review findings
 
 **Files:**
-- Create: `frontend-web/knowledge-deep-links.mjs`
+- Create: `frontend-web/knowledge-deep-links.js`
 - Create: `frontend-web/scripts/knowledge-deep-links-smoke.mjs`
 - Modify: `frontend-web/app.js`
 - Modify: `frontend-web/scripts/book-knowledge-web-smoke.mjs`
@@ -222,3 +222,28 @@ Using a temporary local KBase server with generated non-private content, verify:
 **Step 5: Re-run release-level verification and request re-review**
 
 Run all three Web smoke tests, the frontend production build, `go test ./...`, system-map drift, privacy smoke, and `git diff --check`, then request independent review against the updated HEAD.
+
+### Task 6: Preserve legacy behavior tests and long-chapter deep links
+
+**Files:**
+- Modify: `frontend-web/knowledge-deep-links.js`
+- Modify: `frontend-web/app.js`
+- Modify: `frontend-web/index.html`
+- Create: `frontend-web/scripts/load-app-source.mjs`
+- Modify: the focused knowledge and VM behavior smoke tests
+
+**Step 1: Reproduce the second-review regressions**
+
+Run the existing VM behavior smoke tests and add a route fixture for chapter 17. Confirm that the static module import fails to parse in the VM harness and that the active chapter is absent from the 16-row directory.
+
+**Step 2: Use a shared classic helper script**
+
+Expose the pure deep-link functions through `globalThis.KnowledgeDeepLinks`, load that script before the application module, and let VM behavior tests prepend the same helper source. This keeps browser and test behavior on one implementation without duplicating route logic.
+
+**Step 3: Keep the active chapter visible**
+
+Add `knowledgeVisibleChapters()` so the directory remains bounded to 16 normal rows but appends the active route chapter when it falls outside that window.
+
+**Step 4: Re-run full verification and re-review**
+
+Run every `frontend-web/scripts/*smoke.mjs`, the production frontend build, all Go tests, system-map generation/drift checks, privacy smoke, `git diff --check`, and a local-browser runtime check before requesting another independent review.

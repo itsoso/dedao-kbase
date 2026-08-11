@@ -4,9 +4,10 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import { loadAppSource } from "./load-app-source.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const js = loadAppSource(root);
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 

@@ -1,4 +1,4 @@
-import {
+const {
   knowledgeBookForRoute,
   knowledgeBookPath,
   knowledgeChapterPath,
@@ -8,8 +8,9 @@ import {
   knowledgeResultPath,
   knowledgeResultRouteID,
   knowledgeSearchIsCurrent,
+  knowledgeVisibleChapters,
   shouldHandleKnowledgeClick,
-} from "./knowledge-deep-links.mjs?v=20260811-knowledge-deep-links";
+} = globalThis.KnowledgeDeepLinks;
 
 const app = document.querySelector("#app");
 let readerAssetObjectURLs = [];
@@ -3935,7 +3936,7 @@ function renderBookKnowledge() {
       ? `<a class="knowledge-web__result knowledge-web__resource-link${active}" href="${escapeAttribute(knowledgeResultPath(currentBook.book_id, kind, resultID))}" data-result-index="${index}">${body}</a>`
       : `<article class="knowledge-web__result">${body}</article>`;
   }).join("");
-  const chapterRows = (pkg.chapters || []).slice(0, 16).map((chapter, index) => {
+  const chapterRows = knowledgeVisibleChapters(pkg.chapters, activeResource, 16).map((chapter, index) => {
     const chapterID = chapter.chapter_id || chapter.id || "";
     const active = knowledgeResourceIsActive(activeResource, "chapter", chapterID) ? " active" : "";
     const body = `
