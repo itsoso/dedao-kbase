@@ -34,6 +34,7 @@ var (
 	ErrEvolutionUnsupportedDBVersion = errors.New("unsupported evolution database schema version")
 	ErrEvolutionTransitionConflict   = errors.New("evolution run transition conflicts with current state")
 	ErrEvolutionWriteConflict        = errors.New("evolution store write lock unavailable")
+	ErrEvolutionPendingOutbox        = errors.New("evolution run has pending outbox delivery")
 )
 
 type EvolutionRunInput struct {
@@ -521,9 +522,11 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 			attempt INTEGER NOT NULL DEFAULT 0 CHECK(attempt >= 0),
 			max_attempts INTEGER NOT NULL CHECK(max_attempts >= 1),
 			available_at TEXT NOT NULL,
+			available_at_unix_nano INTEGER NOT NULL,
 			lease_id TEXT NOT NULL DEFAULT '',
 			lease_owner TEXT NOT NULL DEFAULT '',
 			lease_expires_at TEXT NOT NULL DEFAULT '',
+			lease_expires_at_unix_nano INTEGER NOT NULL DEFAULT 0,
 			result_idempotency_key TEXT NOT NULL DEFAULT '',
 			result_hash TEXT NOT NULL DEFAULT '',
 			result_artifact_ref TEXT NOT NULL DEFAULT '',
@@ -532,6 +535,11 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 			result_attempt INTEGER NOT NULL DEFAULT 0 CHECK(result_attempt >= 0),
 			failure_code TEXT NOT NULL DEFAULT '',
 			failure_message TEXT NOT NULL DEFAULT '',
+			failure_idempotency_key TEXT NOT NULL DEFAULT '',
+			failure_hash TEXT NOT NULL DEFAULT '',
+			failure_worker_id TEXT NOT NULL DEFAULT '',
+			failure_lease_id TEXT NOT NULL DEFAULT '',
+			failure_attempt INTEGER NOT NULL DEFAULT 0 CHECK(failure_attempt >= 0),
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			CHECK(status <> 'completed' OR (
@@ -541,10 +549,10 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 			FOREIGN KEY(run_id) REFERENCES evolution_runs(run_id)
 		);
 		CREATE INDEX idx_evolution_work_pending_capability
-			ON evolution_work_items(status, capability, available_at, created_at, work_id)
+			ON evolution_work_items(status, capability, available_at_unix_nano, created_at, work_id)
 			WHERE status = 'pending';
 		CREATE INDEX idx_evolution_work_lease_expiry
-			ON evolution_work_items(status, lease_expires_at, work_id)
+			ON evolution_work_items(status, lease_expires_at_unix_nano, work_id)
 			WHERE status = 'leased';
 		CREATE UNIQUE INDEX idx_evolution_work_result_idempotency
 			ON evolution_work_items(result_idempotency_key)
@@ -552,15 +560,80 @@ func applyEvolutionMigrationV3(tx *sql.Tx) error {
 
 		ALTER TABLE evolution_outbox ADD COLUMN lease_id TEXT NOT NULL DEFAULT '';
 		ALTER TABLE evolution_outbox ADD COLUMN input_hash TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN available_at_unix_nano INTEGER NOT NULL DEFAULT 0;
+		ALTER TABLE evolution_outbox ADD COLUMN lease_expires_at_unix_nano INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE evolution_outbox ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3 CHECK(max_attempts >= 1);
 		ALTER TABLE evolution_outbox ADD COLUMN failure_code TEXT NOT NULL DEFAULT '';
 		ALTER TABLE evolution_outbox ADD COLUMN failure_message TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN failure_idempotency_key TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN failure_hash TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN failure_worker_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN failure_lease_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN failure_attempt INTEGER NOT NULL DEFAULT 0;
 		ALTER TABLE evolution_outbox ADD COLUMN receipt_id TEXT NOT NULL DEFAULT '';
-		CREATE INDEX idx_evolution_outbox_lease_expiry
-			ON evolution_outbox(status, lease_expires_at, outbox_id)
-			WHERE status = 'leased';
+		ALTER TABLE evolution_outbox ADD COLUMN delivery_worker_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN delivery_lease_id TEXT NOT NULL DEFAULT '';
+		ALTER TABLE evolution_outbox ADD COLUMN delivery_attempt INTEGER NOT NULL DEFAULT 0;
 	`); err != nil {
 		return fmt.Errorf("apply evolution schema version 3: %w", err)
+	}
+	rows, err := tx.Query(`SELECT outbox_id, available_at, lease_expires_at FROM evolution_outbox`)
+	if err != nil {
+		return fmt.Errorf("read v2 evolution outbox times for v3 backfill: %w", err)
+	}
+	type storedOutboxTime struct{ outboxID, availableAt, leaseExpiresAt string }
+	stored := make([]storedOutboxTime, 0)
+	for rows.Next() {
+		var item storedOutboxTime
+		if err := rows.Scan(&item.outboxID, &item.availableAt, &item.leaseExpiresAt); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan v2 evolution outbox times: %w", err)
+		}
+		stored = append(stored, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate v2 evolution outbox times: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close v2 evolution outbox times: %w", err)
+	}
+	for _, item := range stored {
+		availableAt, err := parseEvolutionTimestamp("available_at", item.availableAt)
+		if err != nil {
+			return fmt.Errorf("backfill evolution outbox %q: %w", item.outboxID, err)
+		}
+		availableAtNS, err := evolutionWorkerUnixNano(availableAt)
+		if err != nil {
+			return fmt.Errorf("backfill evolution outbox %q available_at: %w", item.outboxID, err)
+		}
+		leaseExpiresAtNS := int64(0)
+		if item.leaseExpiresAt != "" {
+			leaseExpiresAt, err := parseEvolutionTimestamp("lease_expires_at", item.leaseExpiresAt)
+			if err != nil {
+				return fmt.Errorf("backfill evolution outbox %q: %w", item.outboxID, err)
+			}
+			leaseExpiresAtNS, err = evolutionWorkerUnixNano(leaseExpiresAt)
+			if err != nil {
+				return fmt.Errorf("backfill evolution outbox %q lease_expires_at: %w", item.outboxID, err)
+			}
+		}
+		if _, err := tx.Exec(`UPDATE evolution_outbox SET available_at_unix_nano = ?, lease_expires_at_unix_nano = ? WHERE outbox_id = ?`, availableAtNS, leaseExpiresAtNS, item.outboxID); err != nil {
+			return fmt.Errorf("backfill evolution outbox integer times: %w", err)
+		}
+	}
+	if _, err := tx.Exec(`
+		DROP INDEX idx_evolution_outbox_pending_delivery;
+		CREATE INDEX idx_evolution_outbox_pending_delivery
+			ON evolution_outbox(status, available_at_unix_nano, created_at, outbox_id)
+			WHERE status = 'pending';
+		CREATE INDEX idx_evolution_outbox_lease_expiry
+			ON evolution_outbox(status, lease_expires_at_unix_nano, outbox_id)
+			WHERE status = 'leased';
+		CREATE UNIQUE INDEX idx_evolution_outbox_receipt
+			ON evolution_outbox(receipt_id) WHERE receipt_id <> '';
+	`); err != nil {
+		return fmt.Errorf("index evolution schema version 3: %w", err)
 	}
 	return nil
 }
@@ -887,6 +960,15 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 	if err := ValidateEvolutionTransition(run.Status, to); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrEvolutionTransitionConflict, err)
 	}
+	if evolutionTerminalRequiresOutboxDrain(to) {
+		var pending int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM evolution_outbox WHERE run_id = ? AND status IN ('pending', 'leased')`, runID).Scan(&pending); err != nil {
+			return nil, fmt.Errorf("check pending evolution outbox: %w", err)
+		}
+		if pending > 0 {
+			return nil, ErrEvolutionPendingOutbox
+		}
+	}
 	from := run.Status
 	run.Status = to
 	run.UpdatedAt = timestamp
@@ -930,6 +1012,15 @@ func (s *EvolutionControlStore) TransitionRun(runID string, to EvolutionRunStatu
 		return nil, wrapEvolutionSQLiteWriteError("commit evolution transition", err)
 	}
 	return cloneEvolutionRun(run), nil
+}
+
+func evolutionTerminalRequiresOutboxDrain(status EvolutionRunStatus) bool {
+	switch status {
+	case EvolutionCompleted, EvolutionRejected, EvolutionFailed, EvolutionSuperseded, EvolutionRolledBack:
+		return true
+	default:
+		return false
+	}
 }
 
 // ListEvents returns events after the exclusive event-ID cursor in insertion order.

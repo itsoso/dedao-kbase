@@ -1125,10 +1125,16 @@ func TestEvolutionStoreMigratesV2WorkerSchemaAndReopensAtV3(t *testing.T) {
 	if err := store.db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "3" {
 		t.Fatalf("schema version = %q, %v", version, err)
 	}
-	for _, column := range []string{"lease_id", "input_hash", "max_attempts", "failure_code", "failure_message", "receipt_id"} {
+	for _, column := range []string{"lease_id", "input_hash", "available_at_unix_nano", "lease_expires_at_unix_nano", "max_attempts", "failure_code", "failure_message", "failure_idempotency_key", "failure_hash", "failure_worker_id", "failure_lease_id", "failure_attempt", "receipt_id", "delivery_worker_id", "delivery_lease_id", "delivery_attempt"} {
 		var count int
 		if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('evolution_outbox') WHERE name = ?`, column).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("outbox column %q count = %d, %v", column, count, err)
+		}
+	}
+	for _, index := range []string{"idx_evolution_outbox_pending_delivery", "idx_evolution_outbox_lease_expiry", "idx_evolution_outbox_receipt"} {
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?`, index).Scan(&count); err != nil || count != 1 {
+			t.Fatalf("outbox index %q count = %d, %v", index, count, err)
 		}
 	}
 	if err := store.Close(); err != nil {
@@ -1148,6 +1154,56 @@ func TestEvolutionStoreMigratesV2WorkerSchemaAndReopensAtV3(t *testing.T) {
 		if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('evolution_work_items') WHERE name = ?`, column).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("work result column %q count = %d, %v", column, count, err)
 		}
+	}
+}
+
+func TestEvolutionStoreV3MigrationBackfillsOffsetOutboxTimesExactly(t *testing.T) {
+	root := t.TempDir()
+	seedEvolutionV2Schema(t, root)
+	availableAt := "2026-08-11T12:34:56.123456789+08:00"
+	leaseExpiresAt := "2026-08-11T04:35:01.000000001Z"
+	seedEvolutionV2Outbox(t, root, availableAt, leaseExpiresAt)
+
+	store, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var availableNS, leaseNS int64
+	if err := store.db.QueryRow(`SELECT available_at_unix_nano, lease_expires_at_unix_nano FROM evolution_outbox WHERE outbox_id = 'outbox-v2'`).Scan(&availableNS, &leaseNS); err != nil {
+		t.Fatal(err)
+	}
+	parsedAvailable, _ := time.Parse(time.RFC3339Nano, availableAt)
+	parsedLease, _ := time.Parse(time.RFC3339Nano, leaseExpiresAt)
+	if availableNS != parsedAvailable.UnixNano() || leaseNS != parsedLease.UnixNano() {
+		t.Fatalf("backfilled nanos = %d/%d, want %d/%d", availableNS, leaseNS, parsedAvailable.UnixNano(), parsedLease.UnixNano())
+	}
+}
+
+func TestEvolutionStoreV3MigrationInvalidOutboxTimeRollsBack(t *testing.T) {
+	root := t.TempDir()
+	seedEvolutionV2Schema(t, root)
+	seedEvolutionV2Outbox(t, root, "not-a-time", "")
+	store, err := OpenEvolutionControlStore(root, fixedEvolutionStoreClock())
+	if store != nil {
+		_ = store.Close()
+		t.Fatal("invalid migration unexpectedly opened store")
+	}
+	if err == nil || !strings.Contains(err.Error(), "available_at") {
+		t.Fatalf("migration error = %v", err)
+	}
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(filepath.Join(root, evolutionControlDBName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version string
+	if err := db.QueryRow(`SELECT value FROM evolution_meta WHERE key = 'schema_version'`).Scan(&version); err != nil || version != "2" {
+		t.Fatalf("schema version after invalid migration = %q, %v", version, err)
+	}
+	var v3Columns int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('evolution_outbox') WHERE name = 'available_at_unix_nano'`).Scan(&v3Columns); err != nil || v3Columns != 0 {
+		t.Fatalf("invalid migration leaked v3 columns = %d, %v", v3Columns, err)
 	}
 }
 
@@ -1213,6 +1269,30 @@ func seedEvolutionV2Schema(t *testing.T, root string) {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedEvolutionV2Outbox(t *testing.T, root, availableAt, leaseExpiresAt string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", evolutionSQLiteDSN(filepath.Join(root, evolutionControlDBName)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	timestamp := "2026-08-11T00:00:00Z"
+	if _, err := db.Exec(`INSERT INTO evolution_runs (
+		run_id, idempotency_key, input_hash, attempt, retry_of_run_id, run_type, package_id,
+		baseline_package_version, baseline_release_ids_json, risk_level, priority_score, status,
+		trigger_signal_ids_json, current_candidate_id, failure_code, failure_message, created_at,
+		updated_at, created_at_unix_nano, updated_at_unix_nano
+	) VALUES ('run-v2', 'request-v2', 'input-v2', 1, '', 'agent_update', '', '', '[]', 'low', 1, 'detected', '[]', '', '', '', ?, ?, ?, ?)`, timestamp, timestamp, int64(1786406400000000000), int64(1786406400000000000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO evolution_outbox (
+		outbox_id, idempotency_key, run_id, topic, payload_ref, status, attempt, available_at,
+		lease_owner, lease_expires_at, delivered_at, created_at, updated_at
+	) VALUES ('outbox-v2', 'outbox-request-v2', 'run-v2', 'evolution.work.completed', 'artifact:v2', 'pending', 0, ?, '', ?, '', ?, ?)`, availableAt, leaseExpiresAt, timestamp, timestamp); err != nil {
 		t.Fatal(err)
 	}
 }

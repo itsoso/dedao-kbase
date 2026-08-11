@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -82,36 +83,45 @@ type EvolutionWorkCompletion struct {
 }
 
 type EvolutionWorkFailure struct {
-	WorkID         string        `json:"work_id"`
-	WorkerID       string        `json:"worker_id"`
-	LeaseID        string        `json:"lease_id"`
-	FailureCode    string        `json:"failure_code"`
-	FailureMessage string        `json:"failure_message"`
-	RetryDelay     time.Duration `json:"retry_delay"`
+	WorkID                string        `json:"work_id"`
+	WorkerID              string        `json:"worker_id"`
+	LeaseID               string        `json:"lease_id"`
+	Attempt               int           `json:"attempt"`
+	FailureIdempotencyKey string        `json:"failure_idempotency_key"`
+	FailureCode           string        `json:"failure_code"`
+	FailureMessage        string        `json:"failure_message"`
+	RetryDelay            time.Duration `json:"retry_delay"`
 }
 
 type EvolutionWork struct {
-	WorkID               string                    `json:"work_id"`
-	RunID                string                    `json:"run_id"`
-	Capability           EvolutionWorkerCapability `json:"capability"`
-	ArtifactRef          string                    `json:"artifact_ref"`
-	Status               EvolutionWorkStatus       `json:"status"`
-	Attempt              int                       `json:"attempt"`
-	MaxAttempts          int                       `json:"max_attempts"`
-	AvailableAt          string                    `json:"available_at"`
-	LeaseID              string                    `json:"lease_id"`
-	WorkerID             string                    `json:"worker_id"`
-	LeaseExpiresAt       string                    `json:"lease_expires_at"`
-	ResultIdempotencyKey string                    `json:"result_idempotency_key"`
-	ResultArtifactRef    string                    `json:"result_artifact_ref"`
-	FailureCode          string                    `json:"failure_code"`
-	FailureMessage       string                    `json:"failure_message"`
-	CreatedAt            string                    `json:"created_at"`
-	UpdatedAt            string                    `json:"updated_at"`
-	inputHash            string
-	resultWorkerID       string
-	resultLeaseID        string
-	resultAttempt        int
+	WorkID                string                    `json:"work_id"`
+	RunID                 string                    `json:"run_id"`
+	Capability            EvolutionWorkerCapability `json:"capability"`
+	ArtifactRef           string                    `json:"artifact_ref"`
+	Status                EvolutionWorkStatus       `json:"status"`
+	Attempt               int                       `json:"attempt"`
+	MaxAttempts           int                       `json:"max_attempts"`
+	AvailableAt           string                    `json:"available_at"`
+	LeaseID               string                    `json:"lease_id"`
+	WorkerID              string                    `json:"worker_id"`
+	LeaseExpiresAt        string                    `json:"lease_expires_at"`
+	ResultIdempotencyKey  string                    `json:"result_idempotency_key"`
+	ResultArtifactRef     string                    `json:"result_artifact_ref"`
+	FailureCode           string                    `json:"failure_code"`
+	FailureMessage        string                    `json:"failure_message"`
+	CreatedAt             string                    `json:"created_at"`
+	UpdatedAt             string                    `json:"updated_at"`
+	inputHash             string
+	resultWorkerID        string
+	resultLeaseID         string
+	resultAttempt         int
+	availableAtUnixNano   int64
+	leaseExpiresUnixNano  int64
+	failureIdempotencyKey string
+	failureHash           string
+	failureWorkerID       string
+	failureLeaseID        string
+	failureAttempt        int
 }
 
 type EvolutionOutboxLeaseInput struct {
@@ -132,37 +142,50 @@ type EvolutionOutboxDelivery struct {
 	OutboxID  string `json:"outbox_id"`
 	WorkerID  string `json:"worker_id"`
 	LeaseID   string `json:"lease_id"`
+	Attempt   int    `json:"attempt"`
 	ReceiptID string `json:"receipt_id"`
 }
 
 type EvolutionOutboxFailure struct {
-	OutboxID       string        `json:"outbox_id"`
-	WorkerID       string        `json:"worker_id"`
-	LeaseID        string        `json:"lease_id"`
-	FailureCode    string        `json:"failure_code"`
-	FailureMessage string        `json:"failure_message"`
-	RetryDelay     time.Duration `json:"retry_delay"`
+	OutboxID              string        `json:"outbox_id"`
+	WorkerID              string        `json:"worker_id"`
+	LeaseID               string        `json:"lease_id"`
+	Attempt               int           `json:"attempt"`
+	FailureIdempotencyKey string        `json:"failure_idempotency_key"`
+	FailureCode           string        `json:"failure_code"`
+	FailureMessage        string        `json:"failure_message"`
+	RetryDelay            time.Duration `json:"retry_delay"`
 }
 
 type EvolutionOutboxMessage struct {
-	OutboxID       string                `json:"outbox_id"`
-	RunID          string                `json:"run_id"`
-	Topic          string                `json:"topic"`
-	PayloadRef     string                `json:"payload_ref"`
-	Status         EvolutionOutboxStatus `json:"status"`
-	Attempt        int                   `json:"attempt"`
-	MaxAttempts    int                   `json:"max_attempts"`
-	AvailableAt    string                `json:"available_at"`
-	LeaseID        string                `json:"lease_id"`
-	WorkerID       string                `json:"worker_id"`
-	LeaseExpiresAt string                `json:"lease_expires_at"`
-	ReceiptID      string                `json:"receipt_id"`
-	FailureCode    string                `json:"failure_code"`
-	FailureMessage string                `json:"failure_message"`
-	DeliveredAt    string                `json:"delivered_at"`
-	CreatedAt      string                `json:"created_at"`
-	UpdatedAt      string                `json:"updated_at"`
-	inputHash      string
+	OutboxID              string                `json:"outbox_id"`
+	RunID                 string                `json:"run_id"`
+	Topic                 string                `json:"topic"`
+	PayloadRef            string                `json:"payload_ref"`
+	Status                EvolutionOutboxStatus `json:"status"`
+	Attempt               int                   `json:"attempt"`
+	MaxAttempts           int                   `json:"max_attempts"`
+	AvailableAt           string                `json:"available_at"`
+	LeaseID               string                `json:"lease_id"`
+	WorkerID              string                `json:"worker_id"`
+	LeaseExpiresAt        string                `json:"lease_expires_at"`
+	ReceiptID             string                `json:"receipt_id"`
+	FailureCode           string                `json:"failure_code"`
+	FailureMessage        string                `json:"failure_message"`
+	DeliveredAt           string                `json:"delivered_at"`
+	CreatedAt             string                `json:"created_at"`
+	UpdatedAt             string                `json:"updated_at"`
+	inputHash             string
+	availableAtUnixNano   int64
+	leaseExpiresUnixNano  int64
+	failureIdempotencyKey string
+	failureHash           string
+	failureWorkerID       string
+	failureLeaseID        string
+	failureAttempt        int
+	deliveryWorkerID      string
+	deliveryLeaseID       string
+	deliveryAttempt       int
 }
 
 func isAllowedEvolutionWorkerCapability(capability EvolutionWorkerCapability) bool {
@@ -186,11 +209,16 @@ func (s *EvolutionControlStore) EnqueueEvolutionWork(input EvolutionWorkInput) (
 		return nil, false, err
 	}
 	timestamp := now.Format(time.RFC3339Nano)
+	availableAtNS, err := evolutionWorkerUnixNano(normalized.AvailableAt)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve evolution work available_at: %w", err)
+	}
 	work := &EvolutionWork{
 		WorkID: workID, RunID: normalized.RunID, Capability: normalized.Capability,
 		ArtifactRef: normalized.ArtifactRef, Status: EvolutionWorkPending,
 		MaxAttempts: normalized.MaxAttempts, AvailableAt: normalized.AvailableAt.UTC().Format(time.RFC3339Nano),
 		CreatedAt: timestamp, UpdatedAt: timestamp, inputHash: inputHash,
+		availableAtUnixNano: availableAtNS,
 	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
@@ -219,10 +247,10 @@ func (s *EvolutionControlStore) EnqueueEvolutionWork(input EvolutionWorkInput) (
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_work_items (
 			work_id, idempotency_key, input_hash, run_id, capability, artifact_ref, status,
-			attempt, max_attempts, available_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+			attempt, max_attempts, available_at, available_at_unix_nano, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
 	`, work.WorkID, normalized.IdempotencyKey, inputHash, work.RunID, work.Capability,
-		work.ArtifactRef, work.Status, work.MaxAttempts, work.AvailableAt, timestamp, timestamp); err != nil {
+		work.ArtifactRef, work.Status, work.MaxAttempts, work.AvailableAt, availableAtNS, timestamp, timestamp); err != nil {
 		return nil, false, fmt.Errorf("insert evolution work: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -241,10 +269,18 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 	}
 	now := s.now().UTC()
 	nowText := now.Format(time.RFC3339Nano)
-	expiresAt := now.Add(input.LeaseDuration).Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
+	expiresTime, expiresNS, err := evolutionWorkerAddDuration(now, input.LeaseDuration)
+	if err != nil {
+		return nil, false, err
+	}
+	expiresAt := expiresTime.Format(time.RFC3339Nano)
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(input.Capabilities)), ",")
 	arguments := make([]any, 0, len(input.Capabilities)+1)
-	arguments = append(arguments, nowText)
+	arguments = append(arguments, nowNS)
 	for _, capability := range input.Capabilities {
 		arguments = append(arguments, capability)
 	}
@@ -253,7 +289,7 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 		return nil, false, wrapEvolutionSQLiteWriteError("begin lease evolution work", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	query := evolutionWorkSelect + ` WHERE status = 'pending' AND available_at <= ? AND attempt < max_attempts AND capability IN (` + placeholders + `) ORDER BY available_at ASC, created_at ASC, work_id ASC LIMIT 1`
+	query := evolutionWorkSelect + ` WHERE status = 'pending' AND available_at_unix_nano <= ? AND attempt < max_attempts AND capability IN (` + placeholders + `) ORDER BY available_at_unix_nano ASC, created_at ASC, work_id ASC LIMIT 1`
 	work, err := scanEvolutionWork(tx.QueryRow(query, arguments...))
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
@@ -266,9 +302,9 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 	}
 	result, err := tx.Exec(`
 		UPDATE evolution_work_items SET status = 'leased', attempt = attempt + 1,
-			lease_id = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ?
-		WHERE work_id = ? AND status = 'pending' AND attempt = ? AND available_at <= ?
-	`, leaseID, input.WorkerID, expiresAt, nowText, work.WorkID, work.Attempt, nowText)
+			lease_id = ?, lease_owner = ?, lease_expires_at = ?, lease_expires_at_unix_nano = ?, updated_at = ?
+		WHERE work_id = ? AND status = 'pending' AND attempt = ? AND available_at_unix_nano <= ?
+	`, leaseID, input.WorkerID, expiresAt, expiresNS, nowText, work.WorkID, work.Attempt, nowNS)
 	if err != nil {
 		return nil, false, fmt.Errorf("claim evolution work: %w", err)
 	}
@@ -279,6 +315,7 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 	}
 	work.Status, work.Attempt = EvolutionWorkLeased, work.Attempt+1
 	work.LeaseID, work.WorkerID, work.LeaseExpiresAt = leaseID, input.WorkerID, expiresAt
+	work.leaseExpiresUnixNano = expiresNS
 	work.UpdatedAt = nowText
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work lease", err)
@@ -292,7 +329,15 @@ func (s *EvolutionControlStore) RenewEvolutionLease(input EvolutionWorkLeaseUpda
 	}
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
-	expiresAt := now.Add(input.LeaseDuration).Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, err
+	}
+	expiresTime, expiresNS, err := evolutionWorkerAddDuration(now, input.LeaseDuration)
+	if err != nil {
+		return nil, err
+	}
+	expiresAt := expiresTime.Format(time.RFC3339Nano)
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, wrapEvolutionSQLiteWriteError("begin renew evolution lease", err)
@@ -305,7 +350,7 @@ func (s *EvolutionControlStore) RenewEvolutionLease(input EvolutionWorkLeaseUpda
 	if err := validateActiveEvolutionWorkLease(work, input.WorkerID, input.LeaseID, now); err != nil {
 		return nil, err
 	}
-	result, err := tx.Exec(`UPDATE evolution_work_items SET lease_expires_at = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?`, expiresAt, timestamp, input.WorkID, input.WorkerID, input.LeaseID, timestamp)
+	result, err := tx.Exec(`UPDATE evolution_work_items SET lease_expires_at = ?, lease_expires_at_unix_nano = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`, expiresAt, expiresNS, timestamp, input.WorkID, input.WorkerID, input.LeaseID, nowNS)
 	if err != nil {
 		return nil, fmt.Errorf("renew evolution work lease: %w", err)
 	}
@@ -316,6 +361,7 @@ func (s *EvolutionControlStore) RenewEvolutionLease(input EvolutionWorkLeaseUpda
 		return nil, ErrEvolutionLeaseLost
 	}
 	work.LeaseExpiresAt, work.UpdatedAt = expiresAt, timestamp
+	work.leaseExpiresUnixNano = expiresNS
 	if err := tx.Commit(); err != nil {
 		return nil, wrapEvolutionSQLiteWriteError("commit evolution lease renewal", err)
 	}
@@ -329,6 +375,10 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 	resultHash := evolutionWorkerPayloadHash(input.ResultArtifactRef)
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("begin complete evolution work", err)
@@ -367,11 +417,11 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 		UPDATE evolution_work_items SET status = 'completed', result_idempotency_key = ?,
 			result_hash = ?, result_artifact_ref = ?, result_worker_id = ?, result_lease_id = ?,
 			result_attempt = ?, lease_id = '', lease_owner = '',
-			lease_expires_at = '', updated_at = ?
-		WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?
+			lease_expires_at = '', lease_expires_at_unix_nano = 0, updated_at = ?
+		WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?
 	`, input.ResultIdempotencyKey, resultHash, input.ResultArtifactRef, input.WorkerID, input.LeaseID,
 		input.Attempt, timestamp,
-		input.WorkID, input.WorkerID, input.LeaseID, timestamp)
+		input.WorkID, input.WorkerID, input.LeaseID, nowNS)
 	if err != nil {
 		return nil, false, fmt.Errorf("complete evolution work: %w", err)
 	}
@@ -412,14 +462,15 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_outbox (
 			outbox_id, idempotency_key, input_hash, run_id, topic, payload_ref, status, attempt,
-			available_at, max_attempts, created_at, updated_at
-		) VALUES (?, ?, ?, ?, 'evolution.work.completed', ?, 'pending', 0, ?, 3, ?, ?)
-	`, outboxID, outboxKey, outboxInputHash, work.RunID, input.ResultArtifactRef, timestamp, timestamp, timestamp); err != nil {
+			available_at, available_at_unix_nano, max_attempts, created_at, updated_at
+		) VALUES (?, ?, ?, ?, 'evolution.work.completed', ?, 'pending', 0, ?, ?, 3, ?, ?)
+	`, outboxID, outboxKey, outboxInputHash, work.RunID, input.ResultArtifactRef, timestamp, nowNS, timestamp, timestamp); err != nil {
 		return nil, false, fmt.Errorf("insert evolution worker result outbox: %w", err)
 	}
 	work.Status, work.ResultIdempotencyKey, work.ResultArtifactRef = EvolutionWorkCompleted, input.ResultIdempotencyKey, input.ResultArtifactRef
 	work.resultWorkerID, work.resultLeaseID, work.resultAttempt = input.WorkerID, input.LeaseID, input.Attempt
 	work.WorkerID, work.LeaseID, work.LeaseExpiresAt, work.UpdatedAt = input.WorkerID, input.LeaseID, "", timestamp
+	work.leaseExpiresUnixNano = 0
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work completion", err)
 	}
@@ -430,8 +481,13 @@ func (s *EvolutionControlStore) FailEvolutionWork(input EvolutionWorkFailure) (*
 	if err := validateEvolutionWorkFailure(input); err != nil {
 		return nil, false, err
 	}
+	failureHash := evolutionWorkerFailureHash(input)
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("begin fail evolution work", err)
@@ -441,35 +497,61 @@ func (s *EvolutionControlStore) FailEvolutionWork(input EvolutionWorkFailure) (*
 	if err != nil {
 		return nil, false, normalizeEvolutionWorkLoadError(err)
 	}
-	if work.Status == EvolutionWorkBlocked {
+	if work.failureIdempotencyKey == input.FailureIdempotencyKey {
+		if work.failureHash != failureHash || work.failureWorkerID != input.WorkerID ||
+			work.failureLeaseID != input.LeaseID || work.failureAttempt != input.Attempt {
+			return nil, false, ErrEvolutionIdempotencyConflict
+		}
+		if work.Attempt != input.Attempt || (work.Status != EvolutionWorkPending && work.Status != EvolutionWorkBlocked) {
+			return nil, false, ErrEvolutionLeaseLost
+		}
 		if err := tx.Commit(); err != nil {
 			return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work failure replay", err)
 		}
-		return work, true, nil
+		return work, work.Status == EvolutionWorkBlocked, nil
+	}
+	if work.Status == EvolutionWorkBlocked {
+		return nil, false, ErrEvolutionIdempotencyConflict
 	}
 	if err := validateActiveEvolutionWorkLease(work, input.WorkerID, input.LeaseID, now); err != nil {
 		return nil, false, err
 	}
+	if work.Attempt != input.Attempt {
+		return nil, false, ErrEvolutionLeaseLost
+	}
 	blocked := work.Attempt >= work.MaxAttempts
+	legacyTerminalConflict := false
 	if blocked {
-		if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'blocked', lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = ?, failure_message = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?`, input.FailureCode, input.FailureMessage, timestamp, input.WorkID, input.WorkerID, input.LeaseID, timestamp); err != nil {
+		if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'blocked', lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`, input.FailureCode, input.FailureMessage, input.FailureIdempotencyKey, failureHash, input.WorkerID, input.LeaseID, input.Attempt, timestamp, input.WorkID, input.WorkerID, input.LeaseID, nowNS); err != nil {
 			return nil, false, fmt.Errorf("block exhausted evolution work: %w", err)
 		}
-		if err := s.blockEvolutionRunTx(tx, work.RunID, "worker_attempts_exhausted", input.FailureMessage, timestamp); err != nil {
+		legacyTerminalConflict, err = s.blockEvolutionRunTx(tx, work.RunID, "worker_attempts_exhausted", input.FailureMessage, timestamp)
+		if err != nil {
 			return nil, false, err
 		}
 		work.Status = EvolutionWorkBlocked
 	} else {
-		availableAt := now.Add(input.RetryDelay).Format(time.RFC3339Nano)
-		if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'pending', available_at = ?, lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = ?, failure_message = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?`, availableAt, input.FailureCode, input.FailureMessage, timestamp, input.WorkID, input.WorkerID, input.LeaseID, timestamp); err != nil {
+		availableTime, availableNS, err := evolutionWorkerAddDuration(now, input.RetryDelay)
+		if err != nil {
+			return nil, false, err
+		}
+		availableAt := availableTime.Format(time.RFC3339Nano)
+		if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'pending', available_at = ?, available_at_unix_nano = ?, lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`, availableAt, availableNS, input.FailureCode, input.FailureMessage, input.FailureIdempotencyKey, failureHash, input.WorkerID, input.LeaseID, input.Attempt, timestamp, input.WorkID, input.WorkerID, input.LeaseID, nowNS); err != nil {
 			return nil, false, fmt.Errorf("retry failed evolution work: %w", err)
 		}
 		work.Status, work.AvailableAt = EvolutionWorkPending, availableAt
+		work.availableAtUnixNano = availableNS
 	}
 	work.LeaseID, work.WorkerID, work.LeaseExpiresAt = "", "", ""
 	work.FailureCode, work.FailureMessage, work.UpdatedAt = input.FailureCode, input.FailureMessage, timestamp
+	work.leaseExpiresUnixNano = 0
+	work.failureIdempotencyKey, work.failureHash = input.FailureIdempotencyKey, failureHash
+	work.failureWorkerID, work.failureLeaseID, work.failureAttempt = input.WorkerID, input.LeaseID, input.Attempt
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work failure", err)
+	}
+	if legacyTerminalConflict {
+		return work, blocked, ErrEvolutionTransitionConflict
 	}
 	return work, blocked, nil
 }
@@ -477,12 +559,16 @@ func (s *EvolutionControlStore) FailEvolutionWork(input EvolutionWorkFailure) (*
 func (s *EvolutionControlStore) RecoverExpiredEvolutionLeases() (int, error) {
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return 0, err
+	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return 0, wrapEvolutionSQLiteWriteError("begin recover evolution leases", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.Query(evolutionWorkSelect+` WHERE status = 'leased' AND lease_expires_at <= ? ORDER BY lease_expires_at, work_id`, timestamp)
+	rows, err := tx.Query(evolutionWorkSelect+` WHERE status = 'leased' AND lease_expires_at_unix_nano <= ? ORDER BY lease_expires_at_unix_nano, work_id`, nowNS)
 	if err != nil {
 		return 0, fmt.Errorf("list expired evolution work leases: %w", err)
 	}
@@ -503,16 +589,25 @@ func (s *EvolutionControlStore) RecoverExpiredEvolutionLeases() (int, error) {
 		return 0, fmt.Errorf("close expired evolution work rows: %w", err)
 	}
 	exhausted := false
+	legacyTerminalConflict := false
 	for _, work := range works {
+		failureKey := "sha256:" + evolutionWorkerPayloadHash(fmt.Sprintf("work-lease-expired:%s:%s:%d", work.WorkID, work.LeaseID, work.Attempt))
+		failureInput := EvolutionWorkFailure{WorkID: work.WorkID, WorkerID: work.WorkerID, LeaseID: work.LeaseID, Attempt: work.Attempt, FailureIdempotencyKey: failureKey, FailureCode: "lease_expired", FailureMessage: "worker lease expired before completion"}
+		failureHash := evolutionWorkerFailureHash(failureInput)
 		if work.Attempt >= work.MaxAttempts {
 			exhausted = true
-			if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'blocked', lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = 'worker_attempts_exhausted', failure_message = 'worker lease expired after the attempt budget was exhausted', updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_id = ?`, timestamp, work.WorkID, work.LeaseID); err != nil {
+			failureInput.FailureCode = "worker_attempts_exhausted"
+			failureInput.FailureMessage = "worker lease expired after the attempt budget was exhausted"
+			failureHash = evolutionWorkerFailureHash(failureInput)
+			if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'blocked', lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_id = ?`, failureInput.FailureCode, failureInput.FailureMessage, failureKey, failureHash, work.WorkerID, work.LeaseID, work.Attempt, timestamp, work.WorkID, work.LeaseID); err != nil {
 				return 0, fmt.Errorf("block expired evolution work: %w", err)
 			}
-			if err := s.blockEvolutionRunTx(tx, work.RunID, "worker_attempts_exhausted", "worker lease expired after the attempt budget was exhausted", timestamp); err != nil {
+			legacyConflict, err := s.blockEvolutionRunTx(tx, work.RunID, "worker_attempts_exhausted", "worker lease expired after the attempt budget was exhausted", timestamp)
+			if err != nil {
 				return 0, err
 			}
-		} else if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'pending', available_at = ?, lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = 'lease_expired', failure_message = 'worker lease expired before completion', updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_id = ?`, timestamp, timestamp, work.WorkID, work.LeaseID); err != nil {
+			legacyTerminalConflict = legacyTerminalConflict || legacyConflict
+		} else if _, err := tx.Exec(`UPDATE evolution_work_items SET status = 'pending', available_at = ?, available_at_unix_nano = ?, lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE work_id = ? AND status = 'leased' AND lease_id = ?`, timestamp, nowNS, failureInput.FailureCode, failureInput.FailureMessage, failureKey, failureHash, work.WorkerID, work.LeaseID, work.Attempt, timestamp, work.WorkID, work.LeaseID); err != nil {
 			return 0, fmt.Errorf("recover expired evolution work: %w", err)
 		}
 	}
@@ -520,6 +615,9 @@ func (s *EvolutionControlStore) RecoverExpiredEvolutionLeases() (int, error) {
 		return 0, wrapEvolutionSQLiteWriteError("commit evolution lease recovery", err)
 	}
 	if exhausted {
+		if legacyTerminalConflict {
+			return len(works), ErrEvolutionTransitionConflict
+		}
 		return len(works), ErrEvolutionAttemptExhausted
 	}
 	return len(works), nil
@@ -536,11 +634,15 @@ func (s *EvolutionControlStore) EnqueueEvolutionOutbox(input EvolutionOutboxInpu
 		return nil, false, err
 	}
 	timestamp := now.Format(time.RFC3339Nano)
+	availableAtNS, err := evolutionWorkerUnixNano(normalized.AvailableAt)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve evolution outbox available_at: %w", err)
+	}
 	message := &EvolutionOutboxMessage{
 		OutboxID: outboxID, RunID: normalized.RunID, Topic: normalized.Topic,
 		PayloadRef: normalized.PayloadRef, Status: EvolutionOutboxPending,
 		MaxAttempts: normalized.MaxAttempts, AvailableAt: normalized.AvailableAt.UTC().Format(time.RFC3339Nano),
-		CreatedAt: timestamp, UpdatedAt: timestamp, inputHash: inputHash,
+		CreatedAt: timestamp, UpdatedAt: timestamp, inputHash: inputHash, availableAtUnixNano: availableAtNS,
 	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
@@ -574,10 +676,10 @@ func (s *EvolutionControlStore) EnqueueEvolutionOutbox(input EvolutionOutboxInpu
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_outbox (
 			outbox_id, idempotency_key, input_hash, run_id, topic, payload_ref, status,
-			attempt, available_at, max_attempts, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+			attempt, available_at, available_at_unix_nano, max_attempts, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)
 	`, message.OutboxID, normalized.IdempotencyKey, inputHash, message.RunID, message.Topic,
-		message.PayloadRef, message.AvailableAt, message.MaxAttempts, timestamp, timestamp); err != nil {
+		message.PayloadRef, message.AvailableAt, availableAtNS, message.MaxAttempts, timestamp, timestamp); err != nil {
 		return nil, false, fmt.Errorf("insert evolution outbox: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -599,13 +701,21 @@ func (s *EvolutionControlStore) LeaseNextEvolutionOutbox(input EvolutionOutboxLe
 	}
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
-	expiresAt := now.Add(input.LeaseDuration).Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
+	expiresTime, expiresNS, err := evolutionWorkerAddDuration(now, input.LeaseDuration)
+	if err != nil {
+		return nil, false, err
+	}
+	expiresAt := expiresTime.Format(time.RFC3339Nano)
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("begin lease evolution outbox", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	message, err := scanEvolutionOutbox(tx.QueryRow(evolutionOutboxSelect+` WHERE status = 'pending' AND available_at <= ? AND attempt < max_attempts ORDER BY available_at, created_at, outbox_id LIMIT 1`, timestamp))
+	message, err := scanEvolutionOutbox(tx.QueryRow(evolutionOutboxSelect+` WHERE status = 'pending' AND available_at_unix_nano <= ? AND attempt < max_attempts ORDER BY available_at_unix_nano, created_at, outbox_id LIMIT 1`, nowNS))
 	if errors.Is(err, sql.ErrNoRows) {
 		if err := tx.Commit(); err != nil {
 			return nil, false, wrapEvolutionSQLiteWriteError("commit empty evolution outbox lease", err)
@@ -615,7 +725,7 @@ func (s *EvolutionControlStore) LeaseNextEvolutionOutbox(input EvolutionOutboxLe
 	if err != nil {
 		return nil, false, fmt.Errorf("select evolution outbox: %w", err)
 	}
-	result, err := tx.Exec(`UPDATE evolution_outbox SET status = 'leased', attempt = attempt + 1, lease_id = ?, lease_owner = ?, lease_expires_at = ?, updated_at = ? WHERE outbox_id = ? AND status = 'pending' AND attempt = ? AND available_at <= ?`, leaseID, input.WorkerID, expiresAt, timestamp, message.OutboxID, message.Attempt, timestamp)
+	result, err := tx.Exec(`UPDATE evolution_outbox SET status = 'leased', attempt = attempt + 1, lease_id = ?, lease_owner = ?, lease_expires_at = ?, lease_expires_at_unix_nano = ?, updated_at = ? WHERE outbox_id = ? AND status = 'pending' AND attempt = ? AND available_at_unix_nano <= ?`, leaseID, input.WorkerID, expiresAt, expiresNS, timestamp, message.OutboxID, message.Attempt, nowNS)
 	if err != nil {
 		return nil, false, fmt.Errorf("claim evolution outbox: %w", err)
 	}
@@ -627,6 +737,7 @@ func (s *EvolutionControlStore) LeaseNextEvolutionOutbox(input EvolutionOutboxLe
 	}
 	message.Status, message.Attempt = EvolutionOutboxLeased, message.Attempt+1
 	message.LeaseID, message.WorkerID, message.LeaseExpiresAt, message.UpdatedAt = leaseID, input.WorkerID, expiresAt, timestamp
+	message.leaseExpiresUnixNano = expiresNS
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox lease", err)
 	}
@@ -639,6 +750,10 @@ func (s *EvolutionControlStore) DeliverEvolutionOutbox(input EvolutionOutboxDeli
 	}
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("begin deliver evolution outbox", err)
@@ -649,7 +764,8 @@ func (s *EvolutionControlStore) DeliverEvolutionOutbox(input EvolutionOutboxDeli
 		return nil, false, normalizeEvolutionOutboxLoadError(err)
 	}
 	if message.Status == EvolutionOutboxDelivered {
-		if message.ReceiptID == input.ReceiptID {
+		if message.ReceiptID == input.ReceiptID && message.deliveryWorkerID == input.WorkerID &&
+			message.deliveryLeaseID == input.LeaseID && message.deliveryAttempt == input.Attempt {
 			if err := tx.Commit(); err != nil {
 				return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox receipt replay", err)
 			}
@@ -657,10 +773,19 @@ func (s *EvolutionControlStore) DeliverEvolutionOutbox(input EvolutionOutboxDeli
 		}
 		return nil, false, ErrEvolutionIdempotencyConflict
 	}
+	var receiptOutboxID string
+	if err := tx.QueryRow(`SELECT outbox_id FROM evolution_outbox WHERE receipt_id = ?`, input.ReceiptID).Scan(&receiptOutboxID); err == nil {
+		return nil, false, ErrEvolutionIdempotencyConflict
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("find evolution outbox receipt replay: %w", err)
+	}
 	if err := validateActiveEvolutionOutboxLease(message, input.WorkerID, input.LeaseID, now); err != nil {
 		return nil, false, err
 	}
-	result, err := tx.Exec(`UPDATE evolution_outbox SET status = 'delivered', receipt_id = ?, delivered_at = ?, lease_id = '', lease_owner = '', lease_expires_at = '', updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?`, input.ReceiptID, timestamp, timestamp, input.OutboxID, input.WorkerID, input.LeaseID, timestamp)
+	if message.Attempt != input.Attempt {
+		return nil, false, ErrEvolutionLeaseLost
+	}
+	result, err := tx.Exec(`UPDATE evolution_outbox SET status = 'delivered', receipt_id = ?, delivery_worker_id = ?, delivery_lease_id = ?, delivery_attempt = ?, delivered_at = ?, lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`, input.ReceiptID, input.WorkerID, input.LeaseID, input.Attempt, timestamp, timestamp, input.OutboxID, input.WorkerID, input.LeaseID, nowNS)
 	if err != nil {
 		return nil, false, fmt.Errorf("deliver evolution outbox: %w", err)
 	}
@@ -671,7 +796,9 @@ func (s *EvolutionControlStore) DeliverEvolutionOutbox(input EvolutionOutboxDeli
 		return nil, false, ErrEvolutionLeaseLost
 	}
 	message.Status, message.ReceiptID, message.DeliveredAt = EvolutionOutboxDelivered, input.ReceiptID, timestamp
-	message.LeaseID, message.WorkerID, message.LeaseExpiresAt, message.UpdatedAt = "", "", "", timestamp
+	message.deliveryWorkerID, message.deliveryLeaseID, message.deliveryAttempt = input.WorkerID, input.LeaseID, input.Attempt
+	message.LeaseID, message.WorkerID, message.LeaseExpiresAt, message.UpdatedAt = input.LeaseID, input.WorkerID, "", timestamp
+	message.leaseExpiresUnixNano = 0
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox delivery", err)
 	}
@@ -682,8 +809,13 @@ func (s *EvolutionControlStore) FailEvolutionOutbox(input EvolutionOutboxFailure
 	if err := validateEvolutionOutboxFailure(input); err != nil {
 		return nil, false, err
 	}
+	failureHash := evolutionOutboxFailureHash(input)
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("begin fail evolution outbox", err)
@@ -693,35 +825,61 @@ func (s *EvolutionControlStore) FailEvolutionOutbox(input EvolutionOutboxFailure
 	if err != nil {
 		return nil, false, normalizeEvolutionOutboxLoadError(err)
 	}
-	if message.Status == EvolutionOutboxDeadLetter {
+	if message.failureIdempotencyKey == input.FailureIdempotencyKey {
+		if message.failureHash != failureHash || message.failureWorkerID != input.WorkerID ||
+			message.failureLeaseID != input.LeaseID || message.failureAttempt != input.Attempt {
+			return nil, false, ErrEvolutionIdempotencyConflict
+		}
+		if message.Attempt != input.Attempt || (message.Status != EvolutionOutboxPending && message.Status != EvolutionOutboxDeadLetter) {
+			return nil, false, ErrEvolutionLeaseLost
+		}
 		if err := tx.Commit(); err != nil {
 			return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox dead-letter replay", err)
 		}
-		return message, true, nil
+		return message, message.Status == EvolutionOutboxDeadLetter, nil
+	}
+	if message.Status == EvolutionOutboxDeadLetter {
+		return nil, false, ErrEvolutionIdempotencyConflict
 	}
 	if err := validateActiveEvolutionOutboxLease(message, input.WorkerID, input.LeaseID, now); err != nil {
 		return nil, false, err
 	}
+	if message.Attempt != input.Attempt {
+		return nil, false, ErrEvolutionLeaseLost
+	}
 	deadLetter := message.Attempt >= message.MaxAttempts
+	legacyTerminalConflict := false
 	if deadLetter {
-		if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'dead_letter', lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = ?, failure_message = ?, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?`, input.FailureCode, input.FailureMessage, timestamp, input.OutboxID, input.WorkerID, input.LeaseID, timestamp); err != nil {
+		if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'dead_letter', lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`, input.FailureCode, input.FailureMessage, input.FailureIdempotencyKey, failureHash, input.WorkerID, input.LeaseID, input.Attempt, timestamp, input.OutboxID, input.WorkerID, input.LeaseID, nowNS); err != nil {
 			return nil, false, fmt.Errorf("dead-letter evolution outbox: %w", err)
 		}
-		if err := s.blockEvolutionRunTx(tx, message.RunID, "outbox_delivery_exhausted", input.FailureMessage, timestamp); err != nil {
+		legacyTerminalConflict, err = s.blockEvolutionRunTx(tx, message.RunID, "outbox_delivery_exhausted", input.FailureMessage, timestamp)
+		if err != nil {
 			return nil, false, err
 		}
 		message.Status = EvolutionOutboxDeadLetter
 	} else {
-		availableAt := now.Add(input.RetryDelay).Format(time.RFC3339Nano)
-		if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'pending', available_at = ?, lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = ?, failure_message = ?, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at > ?`, availableAt, input.FailureCode, input.FailureMessage, timestamp, input.OutboxID, input.WorkerID, input.LeaseID, timestamp); err != nil {
+		availableTime, availableNS, err := evolutionWorkerAddDuration(now, input.RetryDelay)
+		if err != nil {
+			return nil, false, err
+		}
+		availableAt := availableTime.Format(time.RFC3339Nano)
+		if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'pending', available_at = ?, available_at_unix_nano = ?, lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`, availableAt, availableNS, input.FailureCode, input.FailureMessage, input.FailureIdempotencyKey, failureHash, input.WorkerID, input.LeaseID, input.Attempt, timestamp, input.OutboxID, input.WorkerID, input.LeaseID, nowNS); err != nil {
 			return nil, false, fmt.Errorf("retry evolution outbox: %w", err)
 		}
 		message.Status, message.AvailableAt = EvolutionOutboxPending, availableAt
+		message.availableAtUnixNano = availableNS
 	}
 	message.LeaseID, message.WorkerID, message.LeaseExpiresAt = "", "", ""
 	message.FailureCode, message.FailureMessage, message.UpdatedAt = input.FailureCode, input.FailureMessage, timestamp
+	message.leaseExpiresUnixNano = 0
+	message.failureIdempotencyKey, message.failureHash = input.FailureIdempotencyKey, failureHash
+	message.failureWorkerID, message.failureLeaseID, message.failureAttempt = input.WorkerID, input.LeaseID, input.Attempt
 	if err := tx.Commit(); err != nil {
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution outbox failure", err)
+	}
+	if legacyTerminalConflict {
+		return message, deadLetter, ErrEvolutionTransitionConflict
 	}
 	return message, deadLetter, nil
 }
@@ -729,12 +887,16 @@ func (s *EvolutionControlStore) FailEvolutionOutbox(input EvolutionOutboxFailure
 func (s *EvolutionControlStore) RecoverExpiredEvolutionOutboxLeases() (int, error) {
 	now := s.now().UTC()
 	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return 0, err
+	}
 	tx, err := s.beginTx(context.Background())
 	if err != nil {
 		return 0, wrapEvolutionSQLiteWriteError("begin recover evolution outbox leases", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.Query(evolutionOutboxSelect+` WHERE status = 'leased' AND lease_expires_at <= ? ORDER BY lease_expires_at, outbox_id`, timestamp)
+	rows, err := tx.Query(evolutionOutboxSelect+` WHERE status = 'leased' AND lease_expires_at_unix_nano <= ? ORDER BY lease_expires_at_unix_nano, outbox_id`, nowNS)
 	if err != nil {
 		return 0, fmt.Errorf("list expired evolution outbox leases: %w", err)
 	}
@@ -755,16 +917,25 @@ func (s *EvolutionControlStore) RecoverExpiredEvolutionOutboxLeases() (int, erro
 		return 0, fmt.Errorf("close expired evolution outbox rows: %w", err)
 	}
 	exhausted := false
+	legacyTerminalConflict := false
 	for _, message := range messages {
+		failureKey := "sha256:" + evolutionWorkerPayloadHash(fmt.Sprintf("outbox-lease-expired:%s:%s:%d", message.OutboxID, message.LeaseID, message.Attempt))
+		failureInput := EvolutionOutboxFailure{OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID, Attempt: message.Attempt, FailureIdempotencyKey: failureKey, FailureCode: "lease_expired", FailureMessage: "outbox lease expired before delivery"}
+		failureHash := evolutionOutboxFailureHash(failureInput)
 		if message.Attempt >= message.MaxAttempts {
 			exhausted = true
-			if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'dead_letter', lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = 'outbox_delivery_exhausted', failure_message = 'outbox lease expired after the attempt budget was exhausted', updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_id = ?`, timestamp, message.OutboxID, message.LeaseID); err != nil {
+			failureInput.FailureCode = "outbox_delivery_exhausted"
+			failureInput.FailureMessage = "outbox lease expired after the attempt budget was exhausted"
+			failureHash = evolutionOutboxFailureHash(failureInput)
+			if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'dead_letter', lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_id = ?`, failureInput.FailureCode, failureInput.FailureMessage, failureKey, failureHash, message.WorkerID, message.LeaseID, message.Attempt, timestamp, message.OutboxID, message.LeaseID); err != nil {
 				return 0, fmt.Errorf("dead-letter expired evolution outbox: %w", err)
 			}
-			if err := s.blockEvolutionRunTx(tx, message.RunID, "outbox_delivery_exhausted", "outbox lease expired after the attempt budget was exhausted", timestamp); err != nil {
+			legacyConflict, err := s.blockEvolutionRunTx(tx, message.RunID, "outbox_delivery_exhausted", "outbox lease expired after the attempt budget was exhausted", timestamp)
+			if err != nil {
 				return 0, err
 			}
-		} else if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'pending', available_at = ?, lease_id = '', lease_owner = '', lease_expires_at = '', failure_code = 'lease_expired', failure_message = 'outbox lease expired before delivery', updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_id = ?`, timestamp, timestamp, message.OutboxID, message.LeaseID); err != nil {
+			legacyTerminalConflict = legacyTerminalConflict || legacyConflict
+		} else if _, err := tx.Exec(`UPDATE evolution_outbox SET status = 'pending', available_at = ?, available_at_unix_nano = ?, lease_id = '', lease_owner = '', lease_expires_at = '', lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?, failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ? WHERE outbox_id = ? AND status = 'leased' AND lease_id = ?`, timestamp, nowNS, failureInput.FailureCode, failureInput.FailureMessage, failureKey, failureHash, message.WorkerID, message.LeaseID, message.Attempt, timestamp, message.OutboxID, message.LeaseID); err != nil {
 			return 0, fmt.Errorf("recover expired evolution outbox: %w", err)
 		}
 	}
@@ -772,18 +943,21 @@ func (s *EvolutionControlStore) RecoverExpiredEvolutionOutboxLeases() (int, erro
 		return 0, wrapEvolutionSQLiteWriteError("commit evolution outbox lease recovery", err)
 	}
 	if exhausted {
+		if legacyTerminalConflict {
+			return len(messages), ErrEvolutionTransitionConflict
+		}
 		return len(messages), ErrEvolutionAttemptExhausted
 	}
 	return len(messages), nil
 }
 
-func (s *EvolutionControlStore) blockEvolutionRunTx(tx *sql.Tx, runID, code, message, timestamp string) error {
+func (s *EvolutionControlStore) blockEvolutionRunTx(tx *sql.Tx, runID, code, message, timestamp string) (bool, error) {
 	run, err := scanEvolutionRun(tx.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, runID))
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrEvolutionRunNotFound
+		return false, ErrEvolutionRunNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("load evolution run for worker block: %w", err)
+		return false, fmt.Errorf("load evolution run for worker block: %w", err)
 	}
 	if run.Status == EvolutionBlocked {
 		if strings.TrimSpace(message) == "" {
@@ -791,47 +965,77 @@ func (s *EvolutionControlStore) blockEvolutionRunTx(tx *sql.Tx, runID, code, mes
 		}
 		eventID, err := newEvolutionStoreID("event")
 		if err != nil {
-			return err
+			return false, err
 		}
 		event := EvolutionEvent{EventID: eventID, RunID: runID, EventType: "worker_failure", Actor: "control-plane", Code: code, Message: message, ArtifactRefs: []string{}, CreatedAt: timestamp}
 		if err := event.Validate(); err != nil {
-			return fmt.Errorf("validate evolution worker failure event: %w", err)
+			return false, fmt.Errorf("validate evolution worker failure event: %w", err)
 		}
-		return s.insertEventTx(tx, event)
+		return false, s.insertEventTx(tx, event)
 	}
 	if err := ValidateEvolutionTransition(run.Status, EvolutionBlocked); err != nil {
-		return fmt.Errorf("%w: %v", ErrEvolutionTransitionConflict, err)
+		if isEvolutionTerminalStatus(run.Status) {
+			eventID, idErr := newEvolutionStoreID("event")
+			if idErr != nil {
+				return false, idErr
+			}
+			if strings.TrimSpace(message) == "" {
+				message = "evolution delivery exhausted its retry budget"
+			}
+			event := EvolutionEvent{EventID: eventID, RunID: runID, EventType: "worker_failure", Actor: "control-plane", Code: code, Message: message, ArtifactRefs: []string{}, CreatedAt: timestamp}
+			if validateErr := event.Validate(); validateErr != nil {
+				return false, fmt.Errorf("validate legacy terminal evolution failure event: %w", validateErr)
+			}
+			if insertErr := s.insertEventTx(tx, event); insertErr != nil {
+				return false, insertErr
+			}
+			return true, nil
+		}
+		return false, fmt.Errorf("%w: %v", ErrEvolutionTransitionConflict, err)
 	}
 	if err := validateEvolutionCode("failure_code", code); err != nil {
-		return err
+		return false, err
 	}
 	if err := validateEvolutionText("failure_message", message, EvolutionFailureMessageMaxRunes); err != nil {
-		return err
+		return false, err
 	}
 	from := run.Status
 	updatedAt, err := time.Parse(time.RFC3339Nano, timestamp)
 	if err != nil {
-		return fmt.Errorf("parse evolution worker block timestamp: %w", err)
+		return false, fmt.Errorf("parse evolution worker block timestamp: %w", err)
 	}
-	result, err := tx.Exec(`UPDATE evolution_runs SET status = ?, failure_code = ?, failure_message = ?, updated_at = ?, updated_at_unix_nano = ? WHERE run_id = ? AND status = ?`, EvolutionBlocked, code, message, timestamp, updatedAt.UnixNano(), runID, from)
+	updatedAtNS, err := evolutionWorkerUnixNano(updatedAt)
 	if err != nil {
-		return fmt.Errorf("block evolution run: %w", err)
+		return false, err
+	}
+	result, err := tx.Exec(`UPDATE evolution_runs SET status = ?, failure_code = ?, failure_message = ?, updated_at = ?, updated_at_unix_nano = ? WHERE run_id = ? AND status = ?`, EvolutionBlocked, code, message, timestamp, updatedAtNS, runID, from)
+	if err != nil {
+		return false, fmt.Errorf("block evolution run: %w", err)
 	}
 	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
 		if err != nil {
-			return fmt.Errorf("check evolution run block: %w", err)
+			return false, fmt.Errorf("check evolution run block: %w", err)
 		}
-		return ErrEvolutionTransitionConflict
+		return false, ErrEvolutionTransitionConflict
 	}
 	eventID, err := newEvolutionStoreID("event")
 	if err != nil {
-		return err
+		return false, err
 	}
 	event := EvolutionEvent{EventID: eventID, RunID: runID, EventType: "transition", Actor: "control-plane", FromStatus: from, ToStatus: EvolutionBlocked, Code: code, Message: message, ArtifactRefs: []string{}, CreatedAt: timestamp}
 	if err := event.Validate(); err != nil {
-		return fmt.Errorf("validate evolution worker block event: %w", err)
+		return false, fmt.Errorf("validate evolution worker block event: %w", err)
 	}
-	return s.insertEventTx(tx, event)
+	return false, s.insertEventTx(tx, event)
+}
+
+func isEvolutionTerminalStatus(status EvolutionRunStatus) bool {
+	switch status {
+	case EvolutionCompleted, EvolutionRejected, EvolutionFailed, EvolutionSuperseded, EvolutionRolledBack:
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeEvolutionWorkInput(input EvolutionWorkInput, now time.Time) (EvolutionWorkInput, string, error) {
@@ -987,6 +1191,12 @@ func validateEvolutionWorkFailure(input EvolutionWorkFailure) error {
 	); err != nil {
 		return err
 	}
+	if input.Attempt < 1 || input.Attempt > evolutionMaxAttempts {
+		return fmt.Errorf("attempt must be between 1 and %d", evolutionMaxAttempts)
+	}
+	if !isEvolutionOpaqueID(input.FailureIdempotencyKey) {
+		return fmt.Errorf("failure_idempotency_key must be a canonical UUID or sha256 identity")
+	}
 	if err := validateEvolutionCode("failure_code", input.FailureCode); err != nil {
 		return err
 	}
@@ -1007,6 +1217,9 @@ func validateEvolutionOutboxDelivery(input EvolutionOutboxDelivery) error {
 	if !isEvolutionOpaqueID(input.ReceiptID) {
 		return fmt.Errorf("receipt_id must be a canonical UUID or sha256 identity")
 	}
+	if input.Attempt < 1 || input.Attempt > evolutionMaxAttempts {
+		return fmt.Errorf("attempt must be between 1 and %d", evolutionMaxAttempts)
+	}
 	return nil
 }
 
@@ -1017,6 +1230,12 @@ func validateEvolutionOutboxFailure(input EvolutionOutboxFailure) error {
 		evolutionStringField{name: "lease_id", value: input.LeaseID},
 	); err != nil {
 		return err
+	}
+	if input.Attempt < 1 || input.Attempt > evolutionMaxAttempts {
+		return fmt.Errorf("attempt must be between 1 and %d", evolutionMaxAttempts)
+	}
+	if !isEvolutionOpaqueID(input.FailureIdempotencyKey) {
+		return fmt.Errorf("failure_idempotency_key must be a canonical UUID or sha256 identity")
 	}
 	if err := validateEvolutionCode("failure_code", input.FailureCode); err != nil {
 		return err
@@ -1064,11 +1283,11 @@ func validateActiveEvolutionWorkLease(work *EvolutionWork, workerID, leaseID str
 	if work.Status != EvolutionWorkLeased || work.WorkerID != workerID || work.LeaseID != leaseID {
 		return ErrEvolutionLeaseLost
 	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, work.LeaseExpiresAt)
+	nowNS, err := evolutionWorkerUnixNano(now)
 	if err != nil {
-		return fmt.Errorf("parse evolution work lease expiry: %w", err)
+		return err
 	}
-	if !expiresAt.After(now) {
+	if work.leaseExpiresUnixNano <= nowNS {
 		return ErrEvolutionLeaseExpired
 	}
 	return nil
@@ -1078,11 +1297,11 @@ func validateActiveEvolutionOutboxLease(message *EvolutionOutboxMessage, workerI
 	if message.Status != EvolutionOutboxLeased || message.WorkerID != workerID || message.LeaseID != leaseID {
 		return ErrEvolutionLeaseLost
 	}
-	expiresAt, err := time.Parse(time.RFC3339Nano, message.LeaseExpiresAt)
+	nowNS, err := evolutionWorkerUnixNano(now)
 	if err != nil {
-		return fmt.Errorf("parse evolution outbox lease expiry: %w", err)
+		return err
 	}
-	if !expiresAt.After(now) {
+	if message.leaseExpiresUnixNano <= nowNS {
 		return ErrEvolutionLeaseExpired
 	}
 	return nil
@@ -1090,8 +1309,10 @@ func validateActiveEvolutionOutboxLease(message *EvolutionOutboxMessage, workerI
 
 const evolutionWorkSelect = `
 	SELECT work_id, run_id, capability, artifact_ref, status, attempt, max_attempts,
-		available_at, lease_id, lease_owner, lease_expires_at, result_idempotency_key,
-		result_artifact_ref, failure_code, failure_message, created_at, updated_at, input_hash,
+		available_at, available_at_unix_nano, lease_id, lease_owner, lease_expires_at,
+		lease_expires_at_unix_nano, result_idempotency_key, result_artifact_ref,
+		failure_code, failure_message, failure_idempotency_key, failure_hash,
+		failure_worker_id, failure_lease_id, failure_attempt, created_at, updated_at, input_hash,
 		result_worker_id, result_lease_id, result_attempt
 	FROM evolution_work_items`
 
@@ -1099,9 +1320,11 @@ func scanEvolutionWork(scanner evolutionRowScanner) (*EvolutionWork, error) {
 	var work EvolutionWork
 	if err := scanner.Scan(
 		&work.WorkID, &work.RunID, &work.Capability, &work.ArtifactRef, &work.Status,
-		&work.Attempt, &work.MaxAttempts, &work.AvailableAt, &work.LeaseID, &work.WorkerID,
-		&work.LeaseExpiresAt, &work.ResultIdempotencyKey, &work.ResultArtifactRef,
-		&work.FailureCode, &work.FailureMessage, &work.CreatedAt, &work.UpdatedAt, &work.inputHash,
+		&work.Attempt, &work.MaxAttempts, &work.AvailableAt, &work.availableAtUnixNano,
+		&work.LeaseID, &work.WorkerID, &work.LeaseExpiresAt, &work.leaseExpiresUnixNano,
+		&work.ResultIdempotencyKey, &work.ResultArtifactRef, &work.FailureCode, &work.FailureMessage,
+		&work.failureIdempotencyKey, &work.failureHash, &work.failureWorkerID,
+		&work.failureLeaseID, &work.failureAttempt, &work.CreatedAt, &work.UpdatedAt, &work.inputHash,
 		&work.resultWorkerID, &work.resultLeaseID, &work.resultAttempt,
 	); err != nil {
 		return nil, err
@@ -1110,6 +1333,10 @@ func scanEvolutionWork(scanner evolutionRowScanner) (*EvolutionWork, error) {
 		work.WorkerID = work.resultWorkerID
 		work.LeaseID = work.resultLeaseID
 		work.Attempt = work.resultAttempt
+	} else if work.Status == EvolutionWorkBlocked {
+		work.WorkerID = work.failureWorkerID
+		work.LeaseID = work.failureLeaseID
+		work.Attempt = work.failureAttempt
 	}
 	return &work, nil
 }
@@ -1131,20 +1358,31 @@ func normalizeEvolutionWorkLoadError(err error) error {
 
 const evolutionOutboxSelect = `
 	SELECT outbox_id, run_id, topic, payload_ref, status, attempt, max_attempts,
-		available_at, lease_id, lease_owner, lease_expires_at, receipt_id, failure_code,
-		failure_message, delivered_at, created_at, updated_at, input_hash
+		available_at, available_at_unix_nano, lease_id, lease_owner, lease_expires_at,
+		lease_expires_at_unix_nano, receipt_id, failure_code, failure_message,
+		failure_idempotency_key, failure_hash, failure_worker_id, failure_lease_id, failure_attempt,
+		delivery_worker_id, delivery_lease_id, delivery_attempt, delivered_at, created_at, updated_at, input_hash
 	FROM evolution_outbox`
 
 func scanEvolutionOutbox(scanner evolutionRowScanner) (*EvolutionOutboxMessage, error) {
 	var message EvolutionOutboxMessage
 	if err := scanner.Scan(
 		&message.OutboxID, &message.RunID, &message.Topic, &message.PayloadRef, &message.Status,
-		&message.Attempt, &message.MaxAttempts, &message.AvailableAt, &message.LeaseID,
-		&message.WorkerID, &message.LeaseExpiresAt, &message.ReceiptID, &message.FailureCode,
-		&message.FailureMessage, &message.DeliveredAt, &message.CreatedAt, &message.UpdatedAt,
+		&message.Attempt, &message.MaxAttempts, &message.AvailableAt, &message.availableAtUnixNano,
+		&message.LeaseID, &message.WorkerID, &message.LeaseExpiresAt, &message.leaseExpiresUnixNano,
+		&message.ReceiptID, &message.FailureCode, &message.FailureMessage,
+		&message.failureIdempotencyKey, &message.failureHash, &message.failureWorkerID,
+		&message.failureLeaseID, &message.failureAttempt, &message.deliveryWorkerID,
+		&message.deliveryLeaseID, &message.deliveryAttempt, &message.DeliveredAt,
+		&message.CreatedAt, &message.UpdatedAt,
 		&message.inputHash,
 	); err != nil {
 		return nil, err
+	}
+	if message.Status == EvolutionOutboxDelivered {
+		message.WorkerID, message.LeaseID, message.Attempt = message.deliveryWorkerID, message.deliveryLeaseID, message.deliveryAttempt
+	} else if message.Status == EvolutionOutboxDeadLetter {
+		message.WorkerID, message.LeaseID, message.Attempt = message.failureWorkerID, message.failureLeaseID, message.failureAttempt
 	}
 	return &message, nil
 }
@@ -1167,4 +1405,47 @@ func normalizeEvolutionOutboxLoadError(err error) error {
 func evolutionWorkerPayloadHash(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(digest[:])
+}
+
+func evolutionWorkerFailureHash(input EvolutionWorkFailure) string {
+	return evolutionCanonicalPayloadHash(input.WorkID, input.WorkerID, input.LeaseID,
+		strconv.Itoa(input.Attempt), input.FailureIdempotencyKey, input.FailureCode,
+		input.FailureMessage, strconv.FormatInt(int64(input.RetryDelay), 10))
+}
+
+func evolutionOutboxFailureHash(input EvolutionOutboxFailure) string {
+	return evolutionCanonicalPayloadHash(input.OutboxID, input.WorkerID, input.LeaseID,
+		strconv.Itoa(input.Attempt), input.FailureIdempotencyKey, input.FailureCode,
+		input.FailureMessage, strconv.FormatInt(int64(input.RetryDelay), 10))
+}
+
+func evolutionCanonicalPayloadHash(parts ...string) string {
+	var payload strings.Builder
+	for _, part := range parts {
+		payload.WriteString(strconv.Itoa(len(part)))
+		payload.WriteByte(':')
+		payload.WriteString(part)
+	}
+	return evolutionWorkerPayloadHash(payload.String())
+}
+
+func evolutionWorkerUnixNano(value time.Time) (int64, error) {
+	value = value.UTC()
+	unixNano := value.UnixNano()
+	if !time.Unix(0, unixNano).UTC().Equal(value) {
+		return 0, fmt.Errorf("timestamp %q is outside the safe nanosecond range", value.Format(time.RFC3339Nano))
+	}
+	return unixNano, nil
+}
+
+func evolutionWorkerAddDuration(now time.Time, duration time.Duration) (time.Time, int64, error) {
+	result := now.Add(duration).UTC()
+	if duration > 0 && !result.After(now) {
+		return time.Time{}, 0, fmt.Errorf("duration overflows timestamp")
+	}
+	unixNano, err := evolutionWorkerUnixNano(result)
+	if err != nil {
+		return time.Time{}, 0, err
+	}
+	return result, unixNano, nil
 }

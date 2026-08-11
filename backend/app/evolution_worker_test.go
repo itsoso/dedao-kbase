@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -67,6 +68,9 @@ func TestEvolutionWorkerClaimsAcrossStoresWithCapabilityFilteringAndFreshLeaseId
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	storeBStarted := make(chan struct{})
 	storeA, err := openEvolutionControlStore(root, clock.Now, evolutionStoreHooks{afterBeginTx: func() error {
 		close(entered)
 		<-release
@@ -76,7 +80,10 @@ func TestEvolutionWorkerClaimsAcrossStoresWithCapabilityFilteringAndFreshLeaseId
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = storeA.Close() })
-	storeB, err := OpenEvolutionControlStore(root, clock.Now)
+	storeB, err := openEvolutionControlStore(root, clock.Now, evolutionStoreHooks{beforeBeginTx: func() error {
+		close(storeBStarted)
+		return nil
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +113,12 @@ func TestEvolutionWorkerClaimsAcrossStoresWithCapabilityFilteringAndFreshLeaseId
 	claim(0, storeA)
 	<-entered
 	claim(1, storeB)
-	close(release)
+	select {
+	case <-storeBStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second store did not attempt its transaction")
+	}
+	releaseOnce.Do(func() { close(release) })
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -120,6 +132,7 @@ func TestEvolutionWorkerClaimsAcrossStoresWithCapabilityFilteringAndFreshLeaseId
 	if len(got) != 1 || got[0].Capability != EvolutionCapabilityAgent || got[0].Attempt != 1 || got[0].LeaseID == "" {
 		t.Fatalf("claims = %#v", got)
 	}
+	storeB.hooks.beforeBeginTx = nil
 	if other, ok, err := storeB.LeaseNextEvolutionWork(EvolutionWorkLeaseInput{WorkerID: "knowledge-worker", Capabilities: []EvolutionWorkerCapability{EvolutionCapabilityKnowledge}, LeaseDuration: time.Minute}); err != nil || !ok || other.Capability != EvolutionCapabilityKnowledge {
 		t.Fatalf("knowledge claim = %#v, %v, %v", other, ok, err)
 	}
@@ -173,22 +186,170 @@ func TestEvolutionWorkerFailureBackoffAndExhaustion(t *testing.T) {
 	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
 	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 2)
 	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
-	failed, blocked, err := store.FailEvolutionWork(EvolutionWorkFailure{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, FailureCode: "generation_failed", FailureMessage: "bounded worker failure", RetryDelay: time.Minute})
+	firstFailure := EvolutionWorkFailure{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: leased.LeaseID, Attempt: leased.Attempt, FailureIdempotencyKey: "11111111-2222-4222-8222-111111111111", FailureCode: "generation_failed", FailureMessage: "bounded worker failure", RetryDelay: time.Minute}
+	failed, blocked, err := store.FailEvolutionWork(firstFailure)
 	if err != nil || blocked || failed.Status != EvolutionWorkPending {
 		t.Fatalf("first failure = %#v blocked=%v err=%v", failed, blocked, err)
+	}
+	var failureKey, failureHash, failureWorker, failureLease string
+	var failureAttempt int
+	if err := store.db.QueryRow(`SELECT failure_idempotency_key, failure_hash, failure_worker_id, failure_lease_id, failure_attempt FROM evolution_work_items WHERE work_id = ?`, work.WorkID).Scan(&failureKey, &failureHash, &failureWorker, &failureLease, &failureAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if failureKey != firstFailure.FailureIdempotencyKey || failureHash != evolutionWorkerFailureHash(firstFailure) || failureWorker != firstFailure.WorkerID || failureLease != firstFailure.LeaseID || failureAttempt != firstFailure.Attempt {
+		t.Fatalf("stored work failure identity = %q/%q/%q/%q/%d", failureKey, failureHash, failureWorker, failureLease, failureAttempt)
+	}
+	if replayed, replayBlocked, err := store.FailEvolutionWork(firstFailure); err != nil || replayBlocked || replayed.Status != EvolutionWorkPending {
+		t.Fatalf("first failure replay = %#v blocked=%v err=%v", replayed, replayBlocked, err)
+	}
+	changedFailure := firstFailure
+	changedFailure.FailureCode = "different_failure"
+	if _, _, err := store.FailEvolutionWork(changedFailure); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("changed failure replay error = %v", err)
 	}
 	if _, ok, err := store.LeaseNextEvolutionWork(EvolutionWorkLeaseInput{WorkerID: "worker-b", Capabilities: []EvolutionWorkerCapability{EvolutionCapabilityAgent}, LeaseDuration: time.Minute}); err != nil || ok {
 		t.Fatalf("early retry lease ok=%v err=%v", ok, err)
 	}
 	clock.Advance(time.Minute)
 	leased = leaseEvolutionWorkerTestWork(t, store, "worker-b")
-	failed, blocked, err = store.FailEvolutionWork(EvolutionWorkFailure{WorkID: work.WorkID, WorkerID: "worker-b", LeaseID: leased.LeaseID, FailureCode: "generation_failed", FailureMessage: "bounded worker failure", RetryDelay: time.Minute})
+	if _, _, err := store.FailEvolutionWork(firstFailure); !errors.Is(err, ErrEvolutionLeaseLost) {
+		t.Fatalf("old failure after a new claim error = %v", err)
+	}
+	secondFailure := EvolutionWorkFailure{WorkID: work.WorkID, WorkerID: "worker-b", LeaseID: leased.LeaseID, Attempt: leased.Attempt, FailureIdempotencyKey: "11111111-3333-4333-8333-111111111111", FailureCode: "generation_failed", FailureMessage: "bounded worker failure", RetryDelay: time.Minute}
+	failed, blocked, err = store.FailEvolutionWork(secondFailure)
 	if err != nil || !blocked || failed.Status != EvolutionWorkBlocked {
 		t.Fatalf("exhausted failure = %#v blocked=%v err=%v", failed, blocked, err)
+	}
+	if replayed, replayBlocked, err := store.FailEvolutionWork(secondFailure); err != nil || !replayBlocked || replayed.Status != EvolutionWorkBlocked {
+		t.Fatalf("blocked failure replay = %#v blocked=%v err=%v", replayed, replayBlocked, err)
+	}
+	changedBlocked := secondFailure
+	changedBlocked.LeaseID = "lease-different"
+	if _, _, err := store.FailEvolutionWork(changedBlocked); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("changed blocked failure error = %v", err)
 	}
 	loaded, err := store.LoadRun(run.RunID)
 	if err != nil || loaded.Status != EvolutionBlocked {
 		t.Fatalf("blocked run = %#v, %v", loaded, err)
+	}
+}
+
+func TestEvolutionWorkerNanosecondAvailabilityExpiryAndIndexes(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	availableAt := clock.Now().Add(900 * time.Millisecond)
+	_, created, err := store.EnqueueEvolutionWork(EvolutionWorkInput{
+		IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID,
+		Capability: EvolutionCapabilityAgent, ArtifactRef: "artifact:sha256:" + workerHex('a'),
+		AvailableAt: availableAt, MaxAttempts: 3,
+	})
+	if err != nil || !created {
+		t.Fatalf("enqueue nanosecond work: created=%v err=%v", created, err)
+	}
+	claimInput := EvolutionWorkLeaseInput{WorkerID: "worker-a", Capabilities: []EvolutionWorkerCapability{EvolutionCapabilityAgent}, LeaseDuration: time.Second}
+	if _, ok, err := store.LeaseNextEvolutionWork(claimInput); err != nil || ok {
+		t.Fatalf("claimed before subsecond availability: ok=%v err=%v", ok, err)
+	}
+	clock.Advance(900*time.Millisecond - time.Nanosecond)
+	if _, ok, err := store.LeaseNextEvolutionWork(claimInput); err != nil || ok {
+		t.Fatalf("claimed one nanosecond early: ok=%v err=%v", ok, err)
+	}
+	clock.Advance(time.Nanosecond)
+	leased, ok, err := store.LeaseNextEvolutionWork(claimInput)
+	if err != nil || !ok {
+		t.Fatalf("claim at availability = %#v ok=%v err=%v", leased, ok, err)
+	}
+	clock.Advance(time.Second - time.Nanosecond)
+	if _, err := store.RenewEvolutionLease(EvolutionWorkLeaseUpdate{WorkID: leased.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, LeaseDuration: time.Second}); err != nil {
+		t.Fatalf("renew one nanosecond before expiry: %v", err)
+	}
+	clock.Advance(time.Second)
+	if _, err := store.RenewEvolutionLease(EvolutionWorkLeaseUpdate{WorkID: leased.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, LeaseDuration: time.Second}); !errors.Is(err, ErrEvolutionLeaseExpired) {
+		t.Fatalf("renew at exact expiry error = %v", err)
+	}
+
+	outboxAvailableAt := clock.Now().Add(900 * time.Millisecond)
+	if _, created, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{
+		IdempotencyKey: "33333333-3333-4333-8333-333333333333", RunID: run.RunID,
+		Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('b'), AvailableAt: outboxAvailableAt, MaxAttempts: 3,
+	}); err != nil || !created {
+		t.Fatalf("enqueue nanosecond outbox: created=%v err=%v", created, err)
+	}
+	outboxClaim := EvolutionOutboxLeaseInput{WorkerID: "dispatcher-a", LeaseDuration: time.Second}
+	if _, ok, err := store.LeaseNextEvolutionOutbox(outboxClaim); err != nil || ok {
+		t.Fatalf("claimed outbox before availability: ok=%v err=%v", ok, err)
+	}
+	clock.Advance(900*time.Millisecond - time.Nanosecond)
+	if _, ok, err := store.LeaseNextEvolutionOutbox(outboxClaim); err != nil || ok {
+		t.Fatalf("claimed outbox one nanosecond early: ok=%v err=%v", ok, err)
+	}
+	clock.Advance(time.Nanosecond)
+	message, ok, err := store.LeaseNextEvolutionOutbox(outboxClaim)
+	if err != nil || !ok {
+		t.Fatalf("claim outbox at availability = %#v ok=%v err=%v", message, ok, err)
+	}
+	clock.Advance(time.Second - time.Nanosecond)
+	if _, replay, err := store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID, Attempt: message.Attempt, ReceiptID: "55555555-5555-4555-8555-555555555555"}); err != nil || replay {
+		t.Fatalf("deliver one nanosecond before expiry: replay=%v err=%v", replay, err)
+	}
+	if _, created, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{
+		IdempotencyKey: "44444444-4444-4444-8444-444444444444", RunID: run.RunID,
+		Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('c'), MaxAttempts: 3,
+	}); err != nil || !created {
+		t.Fatalf("enqueue exact-expiry outbox: created=%v err=%v", created, err)
+	}
+	message, ok, err = store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher-b", LeaseDuration: time.Second})
+	if err != nil || !ok {
+		t.Fatalf("lease exact-expiry outbox = %#v ok=%v err=%v", message, ok, err)
+	}
+	clock.Advance(time.Second)
+	if _, _, err := store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID, Attempt: message.Attempt, ReceiptID: "66666666-6666-4666-8666-666666666666"}); !errors.Is(err, ErrEvolutionLeaseExpired) {
+		t.Fatalf("deliver at exact expiry error = %v", err)
+	}
+
+	for _, query := range []struct {
+		name  string
+		sql   string
+		index string
+	}{
+		{name: "work claim", sql: `EXPLAIN QUERY PLAN SELECT work_id FROM evolution_work_items WHERE status = 'pending' AND capability = 'agent_evolution' AND available_at_unix_nano <= 1 ORDER BY available_at_unix_nano, created_at, work_id LIMIT 1`, index: "idx_evolution_work_pending_capability"},
+		{name: "work expiry", sql: `EXPLAIN QUERY PLAN SELECT work_id FROM evolution_work_items WHERE status = 'leased' AND lease_expires_at_unix_nano <= 1 ORDER BY lease_expires_at_unix_nano, work_id`, index: "idx_evolution_work_lease_expiry"},
+		{name: "outbox claim", sql: `EXPLAIN QUERY PLAN SELECT outbox_id FROM evolution_outbox WHERE status = 'pending' AND available_at_unix_nano <= 1 ORDER BY available_at_unix_nano, created_at, outbox_id LIMIT 1`, index: "idx_evolution_outbox_pending_delivery"},
+		{name: "outbox expiry", sql: `EXPLAIN QUERY PLAN SELECT outbox_id FROM evolution_outbox WHERE status = 'leased' AND lease_expires_at_unix_nano <= 1 ORDER BY lease_expires_at_unix_nano, outbox_id`, index: "idx_evolution_outbox_lease_expiry"},
+	} {
+		t.Run(query.name, func(t *testing.T) {
+			rows, err := store.db.Query(query.sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var id, parent, unused int
+			var detail string
+			found := false
+			for rows.Next() {
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				found = found || strings.Contains(detail, query.index)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if !found {
+				t.Fatalf("query plan did not use %s", query.index)
+			}
+		})
+	}
+}
+
+func TestEvolutionWorkerRejectsUnsafeNanosecondTimes(t *testing.T) {
+	if _, err := evolutionWorkerUnixNano(time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)); err == nil {
+		t.Fatal("unsafe year was accepted as a nanosecond timestamp")
+	}
+	nearLimit := time.Unix(0, math.MaxInt64-5).UTC()
+	if _, _, err := evolutionWorkerAddDuration(nearLimit, 10*time.Nanosecond); err == nil {
+		t.Fatal("overflowing nanosecond duration was accepted")
 	}
 }
 
@@ -467,9 +628,18 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 		t.Fatalf("outbox re-lease = %#v, %v, %v", message, ok, err)
 	}
 	receipt := "33333333-3333-4333-8333-333333333333"
-	delivered, replay, err := store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: "dispatcher-b", LeaseID: message.LeaseID, ReceiptID: receipt})
+	delivery := EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: "dispatcher-b", LeaseID: message.LeaseID, Attempt: message.Attempt, ReceiptID: receipt}
+	delivered, replay, err := store.DeliverEvolutionOutbox(delivery)
 	if err != nil || replay || delivered.Status != EvolutionOutboxDelivered {
 		t.Fatalf("deliver = %#v, replay=%v err=%v", delivered, replay, err)
+	}
+	var deliveryWorker, deliveryLease string
+	var deliveryAttempt int
+	if err := store.db.QueryRow(`SELECT delivery_worker_id, delivery_lease_id, delivery_attempt FROM evolution_outbox WHERE outbox_id = ?`, message.OutboxID).Scan(&deliveryWorker, &deliveryLease, &deliveryAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if deliveryWorker != delivery.WorkerID || deliveryLease != delivery.LeaseID || deliveryAttempt != delivery.Attempt {
+		t.Fatalf("stored delivery identity = %q/%q/%d", deliveryWorker, deliveryLease, deliveryAttempt)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -479,12 +649,36 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	delivered, replay, err = store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: "dispatcher-b", LeaseID: message.LeaseID, ReceiptID: receipt})
+	delivered, replay, err = store.DeliverEvolutionOutbox(delivery)
 	if err != nil || !replay || delivered.ReceiptID != receipt {
 		t.Fatalf("persisted receipt replay = %#v, replay=%v err=%v", delivered, replay, err)
 	}
-	if _, _, err := store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: "dispatcher-b", LeaseID: message.LeaseID, ReceiptID: "44444444-4444-4444-8444-444444444444"}); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+	changedReceipt := delivery
+	changedReceipt.ReceiptID = "44444444-4444-4444-8444-444444444444"
+	if _, _, err := store.DeliverEvolutionOutbox(changedReceipt); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
 		t.Fatalf("different receipt error = %v", err)
+	}
+	for name, changed := range map[string]EvolutionOutboxDelivery{
+		"worker":  func() EvolutionOutboxDelivery { value := delivery; value.WorkerID = "dispatcher-x"; return value }(),
+		"lease":   func() EvolutionOutboxDelivery { value := delivery; value.LeaseID = "lease-x"; return value }(),
+		"attempt": func() EvolutionOutboxDelivery { value := delivery; value.Attempt++; return value }(),
+	} {
+		t.Run("delivery "+name, func(t *testing.T) {
+			if _, _, err := store.DeliverEvolutionOutbox(changed); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+				t.Fatalf("delivery identity conflict error = %v", err)
+			}
+		})
+	}
+	cross, created, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{IdempotencyKey: "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", RunID: run.RunID, Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('d'), MaxAttempts: 3})
+	if err != nil || !created {
+		t.Fatalf("cross receipt enqueue = %#v created=%v err=%v", cross, created, err)
+	}
+	cross, ok, err = store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher-cross", LeaseDuration: time.Minute})
+	if err != nil || !ok {
+		t.Fatalf("cross receipt lease = %#v ok=%v err=%v", cross, ok, err)
+	}
+	if _, _, err := store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: cross.OutboxID, WorkerID: cross.WorkerID, LeaseID: cross.LeaseID, Attempt: cross.Attempt, ReceiptID: receipt}); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("cross-message receipt reuse error = %v", err)
 	}
 
 	secondRun := createEvolutionWorkerTestRun(t, store, "55555555-5555-4555-8555-555555555555")
@@ -501,7 +695,8 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 	var deadLetterLeaseID string
 	for attempt := dead.Attempt; attempt <= dead.MaxAttempts; attempt++ {
 		deadLetterLeaseID = dead.LeaseID
-		dead, deadLettered, err = store.FailEvolutionOutbox(EvolutionOutboxFailure{OutboxID: dead.OutboxID, WorkerID: "dispatcher-c", LeaseID: dead.LeaseID, FailureCode: "delivery_unavailable", FailureMessage: "bounded failure", RetryDelay: time.Second})
+		failure := EvolutionOutboxFailure{OutboxID: dead.OutboxID, WorkerID: "dispatcher-c", LeaseID: dead.LeaseID, Attempt: dead.Attempt, FailureIdempotencyKey: fmt.Sprintf("sha256:%s", evolutionWorkerPayloadHash(fmt.Sprintf("dead-%d", dead.Attempt))), FailureCode: "delivery_unavailable", FailureMessage: "bounded failure", RetryDelay: time.Second}
+		dead, deadLettered, err = store.FailEvolutionOutbox(failure)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -517,12 +712,106 @@ func TestEvolutionWorkerOutboxReceiptPersistenceRecoveryAndDeadLetter(t *testing
 	if !deadLettered || dead.Status != EvolutionOutboxDeadLetter {
 		t.Fatalf("dead letter = %#v, %v", dead, deadLettered)
 	}
+	var storedFailureKey, storedFailureHash, storedFailureWorker, storedFailureLease string
+	var storedFailureAttempt int
+	if err := store.db.QueryRow(`SELECT failure_idempotency_key, failure_hash, failure_worker_id, failure_lease_id, failure_attempt FROM evolution_outbox WHERE outbox_id = ?`, dead.OutboxID).Scan(&storedFailureKey, &storedFailureHash, &storedFailureWorker, &storedFailureLease, &storedFailureAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if storedFailureKey == "" || storedFailureHash == "" || storedFailureWorker != "dispatcher-c" || storedFailureLease != deadLetterLeaseID || storedFailureAttempt != dead.Attempt {
+		t.Fatalf("stored outbox failure identity = %q/%q/%q/%q/%d", storedFailureKey, storedFailureHash, storedFailureWorker, storedFailureLease, storedFailureAttempt)
+	}
 	blocked, err := store.LoadRun(secondRun.RunID)
 	if err != nil || blocked.Status != EvolutionBlocked || blocked.FailureCode != "outbox_delivery_exhausted" || len([]rune(blocked.FailureMessage)) > EvolutionFailureMessageMaxRunes {
 		t.Fatalf("deadletter run = %#v, %v", blocked, err)
 	}
-	if replayed, replayDead, err := store.FailEvolutionOutbox(EvolutionOutboxFailure{OutboxID: dead.OutboxID, WorkerID: "dispatcher-c", LeaseID: deadLetterLeaseID, FailureCode: "delivery_unavailable", FailureMessage: "bounded failure", RetryDelay: time.Second}); err != nil || !replayDead || replayed.Status != EvolutionOutboxDeadLetter {
+	deadReplay := EvolutionOutboxFailure{OutboxID: dead.OutboxID, WorkerID: "dispatcher-c", LeaseID: deadLetterLeaseID, Attempt: dead.Attempt, FailureIdempotencyKey: fmt.Sprintf("sha256:%s", evolutionWorkerPayloadHash(fmt.Sprintf("dead-%d", dead.Attempt))), FailureCode: "delivery_unavailable", FailureMessage: "bounded failure", RetryDelay: time.Second}
+	if replayed, replayDead, err := store.FailEvolutionOutbox(deadReplay); err != nil || !replayDead || replayed.Status != EvolutionOutboxDeadLetter {
 		t.Fatalf("deadletter replay = %#v, %v, %v", replayed, replayDead, err)
+	}
+	changedDeadReplay := deadReplay
+	changedDeadReplay.FailureCode = "different_failure"
+	if _, _, err := store.FailEvolutionOutbox(changedDeadReplay); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("changed deadletter replay error = %v", err)
+	}
+}
+
+func TestEvolutionWorkerOutboxClaimsAcrossStoresDeterministically(t *testing.T) {
+	root := t.TempDir()
+	clock := newEvolutionWorkerClock()
+	seed, err := OpenEvolutionControlStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := createEvolutionWorkerTestRun(t, seed, "11111111-1111-4111-8111-111111111111")
+	if _, created, err := seed.EnqueueEvolutionOutbox(EvolutionOutboxInput{IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID, Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('a'), MaxAttempts: 3}); err != nil || !created {
+		t.Fatalf("seed outbox: created=%v err=%v", created, err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	secondStarted := make(chan struct{})
+	storeA, err := openEvolutionControlStore(root, clock.Now, evolutionStoreHooks{afterBeginTx: func() error {
+		close(locked)
+		<-release
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storeA.Close() })
+	storeB, err := openEvolutionControlStore(root, clock.Now, evolutionStoreHooks{beforeBeginTx: func() error {
+		close(secondStarted)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = storeB.Close() })
+	type claimResult struct {
+		message *EvolutionOutboxMessage
+		ok      bool
+		err     error
+	}
+	results := make(chan claimResult, 2)
+	go func() {
+		message, ok, err := storeA.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher-a", LeaseDuration: time.Minute})
+		results <- claimResult{message: message, ok: ok, err: err}
+	}()
+	select {
+	case <-locked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first outbox store did not acquire its transaction")
+	}
+	go func() {
+		message, ok, err := storeB.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher-b", LeaseDuration: time.Minute})
+		results <- claimResult{message: message, ok: ok, err: err}
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second outbox store did not attempt its transaction")
+	}
+	releaseOnce.Do(func() { close(release) })
+	claimed := 0
+	for index := 0; index < 2; index++ {
+		select {
+		case result := <-results:
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			if result.ok {
+				claimed++
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("outbox claim goroutine did not finish")
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("outbox claims = %d, want 1", claimed)
 	}
 }
 
@@ -580,7 +869,7 @@ func TestEvolutionWorkerOutboxDeadLetterRollsBackRunEventAndMessage(t *testing.T
 	if _, err := store.db.Exec(`UPDATE evolution_outbox SET max_attempts = 1 WHERE outbox_id = ?`, message.OutboxID); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.FailEvolutionOutbox(EvolutionOutboxFailure{OutboxID: message.OutboxID, WorkerID: "dispatcher", LeaseID: message.LeaseID, FailureCode: "delivery_unavailable", FailureMessage: "failure", RetryDelay: time.Second}); !errors.Is(err, injected) {
+	if _, _, err := store.FailEvolutionOutbox(EvolutionOutboxFailure{OutboxID: message.OutboxID, WorkerID: "dispatcher", LeaseID: message.LeaseID, Attempt: message.Attempt, FailureIdempotencyKey: "77777777-7777-4777-8777-777777777777", FailureCode: "delivery_unavailable", FailureMessage: "failure", RetryDelay: time.Second}); !errors.Is(err, injected) {
 		t.Fatalf("deadletter atomic error = %v", err)
 	}
 	loaded, err := store.LoadRun(run.RunID)
@@ -590,6 +879,89 @@ func TestEvolutionWorkerOutboxDeadLetterRollsBackRunEventAndMessage(t *testing.T
 	var status string
 	if err := store.db.QueryRow(`SELECT status FROM evolution_outbox WHERE outbox_id = ?`, message.OutboxID).Scan(&status); err != nil || status != string(EvolutionOutboxLeased) {
 		t.Fatalf("outbox after rollback = %q, %v", status, err)
+	}
+}
+
+func TestEvolutionWorkerPendingOutboxPreventsTerminalRunTransition(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	message, created, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID, Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('a'), MaxAttempts: 1})
+	if err != nil || !created {
+		t.Fatalf("enqueue = %#v created=%v err=%v", message, created, err)
+	}
+	beforeEvents, _ := evolutionWorkerCounts(t, store, run.RunID)
+	if _, err := store.TransitionRun(run.RunID, EvolutionSuperseded, EvolutionTransitionInput{Actor: "operator", Code: "superseded"}); !errors.Is(err, ErrEvolutionPendingOutbox) {
+		t.Fatalf("terminal transition error = %v", err)
+	}
+	loaded, err := store.LoadRun(run.RunID)
+	if err != nil || loaded.Status != EvolutionDetected {
+		t.Fatalf("run changed on protected transition = %#v, %v", loaded, err)
+	}
+	afterEvents, _ := evolutionWorkerCounts(t, store, run.RunID)
+	if afterEvents != beforeEvents {
+		t.Fatalf("protected transition wrote events %d -> %d", beforeEvents, afterEvents)
+	}
+	message, ok, err := store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher", LeaseDuration: time.Minute})
+	if err != nil || !ok {
+		t.Fatalf("lease = %#v ok=%v err=%v", message, ok, err)
+	}
+	failed, deadLetter, err := store.FailEvolutionOutbox(EvolutionOutboxFailure{
+		OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID,
+		Attempt: message.Attempt, FailureIdempotencyKey: "33333333-3333-4333-8333-333333333333",
+		FailureCode: "delivery_unavailable", FailureMessage: "bounded failure", RetryDelay: time.Second,
+	})
+	if err != nil || !deadLetter || failed.Status != EvolutionOutboxDeadLetter {
+		t.Fatalf("deadletter = %#v dead=%v err=%v", failed, deadLetter, err)
+	}
+	loaded, err = store.LoadRun(run.RunID)
+	if err != nil || loaded.Status != EvolutionBlocked {
+		t.Fatalf("deadletter did not block run = %#v, %v", loaded, err)
+	}
+	events, err := store.ListEvents(run.RunID, "", 100)
+	if err != nil || len(events) != beforeEvents+1 || events[len(events)-1].ToStatus != EvolutionBlocked {
+		t.Fatalf("deadletter events = %#v, %v", events, err)
+	}
+}
+
+func TestEvolutionWorkerLegacyTerminalPendingOutboxDeadLettersAndReportsConflict(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	message, created, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{
+		IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID,
+		Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('a'), MaxAttempts: 1,
+	})
+	if err != nil || !created {
+		t.Fatalf("enqueue = %#v created=%v err=%v", message, created, err)
+	}
+	message, ok, err := store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: "dispatcher", LeaseDuration: time.Minute})
+	if err != nil || !ok {
+		t.Fatalf("lease = %#v ok=%v err=%v", message, ok, err)
+	}
+	// Simulate a database created before terminal transitions were protected by pending outbox state.
+	if _, err := store.db.Exec(`UPDATE evolution_runs SET status = 'superseded' WHERE run_id = ?`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	failed, deadLetter, err := store.FailEvolutionOutbox(EvolutionOutboxFailure{
+		OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID, Attempt: message.Attempt,
+		FailureIdempotencyKey: "33333333-3333-4333-8333-333333333333", FailureCode: "delivery_unavailable",
+		FailureMessage: "bounded failure", RetryDelay: time.Second,
+	})
+	if !errors.Is(err, ErrEvolutionTransitionConflict) || !deadLetter || failed == nil || failed.Status != EvolutionOutboxDeadLetter {
+		t.Fatalf("legacy deadletter = %#v dead=%v err=%v", failed, deadLetter, err)
+	}
+	var status string
+	if err := store.db.QueryRow(`SELECT status FROM evolution_outbox WHERE outbox_id = ?`, message.OutboxID).Scan(&status); err != nil || status != string(EvolutionOutboxDeadLetter) {
+		t.Fatalf("persisted legacy deadletter status = %q, %v", status, err)
+	}
+	loaded, err := store.LoadRun(run.RunID)
+	if err != nil || loaded.Status != EvolutionSuperseded {
+		t.Fatalf("legacy terminal run changed = %#v, %v", loaded, err)
+	}
+	events, err := store.ListEvents(run.RunID, "", 100)
+	if err != nil || events[len(events)-1].EventType != "worker_failure" || events[len(events)-1].Code != "outbox_delivery_exhausted" {
+		t.Fatalf("legacy conflict event = %#v, %v", events, err)
 	}
 }
 
