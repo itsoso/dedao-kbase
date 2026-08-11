@@ -8457,6 +8457,7 @@ body.has-proofroom-modal {
 }
 
 .evolution-console__queue > header span,
+.evolution-console__queue > header small,
 .evolution-console__fleet > header span,
 .evolution-console__fleet > header small {
   color: var(--evolution-muted);

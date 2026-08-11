@@ -4263,25 +4263,13 @@ function evolutionUnavailableMessage(message) {
 
 function renderEvolutionStatusStrip() {
   const overview = evolutionConsoleState.overview || {};
-  const runs = Array.isArray(overview.open_runs) ? overview.open_runs : (
-    Array.isArray(evolutionConsoleState.runs) ? evolutionConsoleState.runs : []
-  );
-  const staleKnowledge = runs.filter((run) => (
-    ["knowledge_release", "combined"].includes(run.run_type) && ["detected", "triaged", "blocked"].includes(run.status)
-  )).length;
-  const failures = runs.filter((run) => run.status === "failed").length;
-  const completedToday = runs.filter((run) => {
-    if (run.status !== "completed") return false;
-    const date = new Date(run.updated_at || "");
-    const now = new Date();
-    return !Number.isNaN(date.getTime()) && date.toDateString() === now.toDateString();
-  }).length;
+  const status = AgentEvolutionConsole.overviewStatusMetrics(overview);
   const metrics = [
-    ["待审批", Number(overview.awaiting_approval || 0), "approval"],
-    ["已阻断", Number(overview.blocked || 0), "blocked"],
-    ["知识过期", staleKnowledge, "stale"],
-    ["运行异常", failures, "failed"],
-    ["今日完成", completedToday, "complete"],
+    ["待审批", status.awaitingApproval, "approval"],
+    ["已阻断", status.blocked, "blocked"],
+    ["知识过期", status.staleKnowledge, "stale"],
+    ["运行异常", status.failed, "failed"],
+    ["已完成", status.completed, "complete"],
   ];
   return `
     <dl class="evolution-console__status-strip" aria-label="演化态势">
@@ -4293,15 +4281,16 @@ function renderEvolutionStatusStrip() {
 }
 
 function renderEvolutionQueue() {
+  const presentation = AgentEvolutionConsole.queuePresentation(evolutionConsoleState.route.view);
   if (evolutionConsoleState.loading.runs && !evolutionConsoleState.runs.length) {
-    return `<div class="evolution-console__state" role="status">正在读取优先队列…</div>`;
+    return `<div class="evolution-console__state" role="status">${escapeHTML(presentation.loading)}</div>`;
   }
   if (evolutionConsoleState.errors.runs) {
-    return `<div class="evolution-console__state is-error" role="alert"><strong>待办队列不可用</strong><span>${escapeHTML(evolutionUnavailableMessage(evolutionConsoleState.errors.runs))}</span><button type="button" data-evolution-retry>重试</button></div>`;
+    return `<div class="evolution-console__state is-error" role="alert"><strong>${escapeHTML(presentation.errorTitle)}</strong><span>${escapeHTML(evolutionUnavailableMessage(evolutionConsoleState.errors.runs))}</span><button type="button" data-evolution-retry>重试</button></div>`;
   }
-  const runs = AgentEvolutionConsole.sortRuns(evolutionConsoleState.runs);
+  const runs = AgentEvolutionConsole.sortRunsForView(evolutionConsoleState.runs, evolutionConsoleState.route.view);
   if (!runs.length) {
-    return `<div class="evolution-console__state"><strong>当前没有演化待办</strong><span>控制面运行正常，新信号会自动进入这里。</span></div>`;
+    return `<div class="evolution-console__state"><strong>${escapeHTML(presentation.emptyTitle)}</strong><span>${escapeHTML(presentation.emptyBody)}</span></div>`;
   }
   const rows = runs.map((run) => {
     const selected = run.run_id === evolutionConsoleState.route.run;
@@ -4324,7 +4313,8 @@ function renderEvolutionQueue() {
 function renderEvolutionDetail() {
   const route = evolutionConsoleState.route;
   if (!route.run) {
-    return `<div class="evolution-console__detail-empty"><span>选择一项待办</span><strong>查看线上版本与演化上下文</strong><p>第一层仅提供只读态势，不会自动生成、审批或发布。</p></div>`;
+    const presentation = AgentEvolutionConsole.queuePresentation(route.view);
+    return `<div class="evolution-console__detail-empty"><span>${escapeHTML(presentation.detailPrompt)}</span><strong>查看线上版本与演化上下文</strong><p>第一层仅提供只读态势，不会自动生成、审批或发布。</p></div>`;
   }
   if (evolutionConsoleState.loading.detail && !evolutionConsoleState.selectedDetail) {
     return `<div class="evolution-console__state" role="status">正在读取任务详情…</div>`;
@@ -4406,6 +4396,7 @@ function renderEvolutionFleet() {
 
 function renderAgentEvolutionConsole() {
   const route = evolutionConsoleState.route;
+  const queuePresentation = AgentEvolutionConsole.queuePresentation(route.view);
   const tabs = [["inbox", "演化待办"], ["fleet", "全部 Agent"], ["history", "演化历史"], ["rules", "演化规则"]];
   const statusMessage = evolutionConsoleState.loading.overview || evolutionConsoleState.loading.runs || evolutionConsoleState.loading.detail
     ? "正在同步演化控制面"
@@ -4427,7 +4418,7 @@ function renderAgentEvolutionConsole() {
         <section class="evolution-console__rules"><header><span>演化规则</span><h2>自动发现，人工发布</h2></header><dl><div><dt>生成边界</dt><dd>候选不可扩大工具或数据权限。</dd></div><div><dt>评测门槛</dt><dd>安全、引用、隐私与回归是硬门槛。</dd></div><div><dt>发布控制</dt><dd>任何正式发布都需要有效人工批准。</dd></div></dl></section>
       ` : `
         ${route.view === "fleet" ? "" : `<section class="evolution-console__workspace">
-          <section class="evolution-console__queue" aria-labelledby="evolution-queue-title"><header><div><span>01 / 按风险排序</span><h2 id="evolution-queue-title">演化待办队列</h2></div><b>${evolutionConsoleState.runs.length}</b></header><div>${renderEvolutionQueue()}</div></section>
+          <section class="evolution-console__queue" aria-labelledby="evolution-queue-title"><header><div><span>${escapeHTML(queuePresentation.indexLabel)}</span><h2 id="evolution-queue-title">${escapeHTML(queuePresentation.title)}</h2><small>${escapeHTML(queuePresentation.sortHint)}</small></div><b>${evolutionConsoleState.runs.length}</b></header><div>${renderEvolutionQueue()}</div></section>
           <section class="evolution-console__detail" aria-labelledby="evolution-detail-title"><span class="visually-hidden" id="evolution-detail-title">线上版本对比</span>${renderEvolutionDetail()}</section>
         </section>`}
         <section class="evolution-console__fleet" aria-labelledby="evolution-fleet-title"><header><div><span>${route.view === "history" ? "版本与演化记录" : "当前服务编队"}</span><h2 id="evolution-fleet-title">${route.view === "history" ? "演化历史" : "全部 Agent"}</h2></div><small>一行一个 Agent · 历史版本默认折叠</small></header>${renderEvolutionFleet()}</section>

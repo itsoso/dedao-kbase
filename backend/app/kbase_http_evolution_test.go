@@ -52,6 +52,7 @@ func TestKBaseHTTPHandlerEvolutionOverviewIsDenseAndPrivate(t *testing.T) {
 	var payload struct {
 		OpenRuns   []evolutionRunHTTPView   `json:"open_runs"`
 		AgentFleet []evolutionAgentHTTPView `json:"agent_fleet"`
+		Failed     int                      `json:"failed"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
@@ -62,6 +63,9 @@ func TestKBaseHTTPHandlerEvolutionOverviewIsDenseAndPrivate(t *testing.T) {
 	if len(payload.AgentFleet) != 2 {
 		t.Fatalf("agent fleet len=%d, want one row for each of 2 Agents", len(payload.AgentFleet))
 	}
+	if payload.Failed != 1 {
+		t.Fatalf("failed=%d, want 1 authoritative terminal count", payload.Failed)
+	}
 	body := response.Body.String()
 	for _, secret := range []string{
 		"private-content-hash", "private-descriptor-hash", "private sqlite path",
@@ -70,6 +74,15 @@ func TestKBaseHTTPHandlerEvolutionOverviewIsDenseAndPrivate(t *testing.T) {
 		if strings.Contains(body, secret) {
 			t.Fatalf("overview leaked %q: %s", secret, body)
 		}
+	}
+}
+
+func TestEvolutionOverviewHTTPViewIncludesTerminalCounts(t *testing.T) {
+	view := newEvolutionOverviewHTTPView(&EvolutionOverview{
+		OpenRuns: []EvolutionRun{}, AgentFleet: []EvolutionAgentFleetProjection{}, Failed: 2, Completed: 3,
+	})
+	if view.Failed != 2 || view.Completed != 3 {
+		t.Fatalf("terminal counts = failed:%d completed:%d", view.Failed, view.Completed)
 	}
 }
 

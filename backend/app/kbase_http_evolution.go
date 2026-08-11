@@ -55,6 +55,8 @@ type evolutionOverviewHTTPView struct {
 	TotalOpenRuns    int                      `json:"total_open_runs"`
 	AwaitingApproval int                      `json:"awaiting_approval"`
 	Blocked          int                      `json:"blocked"`
+	Failed           int                      `json:"failed"`
+	Completed        int                      `json:"completed"`
 }
 
 type evolutionRunHTTPPage struct {
@@ -387,6 +389,7 @@ func newEvolutionOverviewHTTPView(source *EvolutionOverview) evolutionOverviewHT
 		OpenRuns:      make([]evolutionRunHTTPView, 0, len(source.OpenRuns)),
 		AgentFleet:    make([]evolutionAgentHTTPView, 0, len(source.AgentFleet)),
 		TotalOpenRuns: source.TotalOpenRuns, AwaitingApproval: source.AwaitingApproval, Blocked: source.Blocked,
+		Failed: source.Failed, Completed: source.Completed,
 	}
 	for _, run := range source.OpenRuns {
 		view.OpenRuns = append(view.OpenRuns, newEvolutionRunHTTPView(run))

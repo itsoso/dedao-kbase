@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { fixtureBrowserClientID, isValidBrowserClientID } from "./agent-evolution-console-fixture.mjs";
+import { fixtureBrowserClientID, fixtureEvolutionOverview, isValidBrowserClientID } from "./agent-evolution-console-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helperPath = path.join(root, "evolution-console.js");
@@ -24,6 +24,14 @@ const helpers = context.globalThis.AgentEvolutionConsole;
 assert.ok(helpers, "classic helper should expose globalThis.AgentEvolutionConsole");
 assert.equal(isValidBrowserClientID(fixtureBrowserClientID), true, "fixture fallback must satisfy production browser client ID constraints");
 assert.equal(fixtureBrowserClientID.length >= 16, true);
+const fixtureOverview = fixtureEvolutionOverview();
+assert.equal(fixtureOverview.failed, 1);
+assert.equal(fixtureOverview.completed, 1);
+assert.equal(
+  fixtureOverview.open_runs.some((run) => ["completed", "blocked", "rejected", "failed", "superseded", "rolled_back"].includes(run.status)),
+  false,
+  "production-like fixture open_runs must obey the backend non-terminal contract",
+);
 
 const parsed = helpers.parseRoute("/agent-packages?view=inbox&risk=p0,p1&type=combined&run=run-123&tab=evidence&cursor=next-1&drawer=compiler");
 assert.deepEqual(Array.from(parsed.risk), ["p0", "p1"]);
@@ -111,6 +119,29 @@ const sorted = helpers.sortRuns([
 ]);
 assert.deepEqual(Array.from(sorted, (run) => run.run_id), ["p0-low", "critical-signal", "p1-new", "p1-old", "p2-high", "p3-run"]);
 assert.ok(sorted.findIndex((run) => run.run_id === "critical-signal") < sorted.findIndex((run) => run.risk_level === "p3"));
+const historySorted = helpers.sortRunsForView([
+  { run_id: "history-b", risk_level: "p0", priority_score: 100, updated_at: "2026-08-11T09:00:00Z" },
+  { run_id: "history-z", risk_level: "p3", priority_score: 1, updated_at: "2026-08-11T10:00:00Z" },
+  { run_id: "history-a", risk_level: "p1", priority_score: 50, updated_at: "2026-08-11T10:00:00Z" },
+], "history");
+assert.deepEqual(Array.from(historySorted, (run) => run.run_id), ["history-a", "history-z", "history-b"]);
+const historyPresentation = helpers.queuePresentation("history");
+assert.equal(historyPresentation.indexLabel, "01 / 按时间排序");
+assert.equal(historyPresentation.title, "演化历史");
+assert.equal(historyPresentation.sortHint, "按更新时间倒序");
+assert.equal(historyPresentation.emptyTitle, "暂无演化历史");
+assert.equal(historyPresentation.detailPrompt, "选择一条历史记录");
+assert.equal(Object.values(historyPresentation).some((value) => String(value).includes("待办")), false);
+const statusMetrics = helpers.overviewStatusMetrics({
+  awaiting_approval: 2,
+  blocked: 3,
+  failed: 7,
+  completed: 9,
+  open_runs: [{ run_type: "knowledge_release", status: "detected" }],
+});
+assert.equal(statusMetrics.failed, 7, "terminal failure count must come from authoritative overview fields");
+assert.equal(statusMetrics.completed, 9, "completed count must not be inferred from open_runs");
+assert.equal(statusMetrics.staleKnowledge, 1);
 assert.equal(helpers.scoreDelta(82.4, 86.1), 3.7);
 assert.equal(helpers.scoreDelta(null, 86.1), null);
 
@@ -205,6 +236,8 @@ const detailA = deferred();
 const detailB = deferred();
 const detailState = {
   route: { run: "" },
+  runs: [],
+  nextCursor: "",
   selectedDetail: null,
   events: [],
   loading: { overview: false, runs: false, detail: false },
@@ -236,6 +269,34 @@ helpers.beginEvolutionRouteState(
 );
 assert.equal(detailState.selectedDetail.run.run_id, "run-b", "same-run tab changes should preserve detail");
 
+const scopeState = {
+  route: { ...helpers.routeDefaults, view: "inbox", risk: [], type: "", cursor: "" },
+  runs: [{ run_id: "inbox-old" }],
+  nextCursor: "inbox-page-2",
+  selectedDetail: null,
+  events: [],
+  loading: { overview: false, runs: false, detail: false },
+  errors: { overview: "", runs: "", detail: "", events: "" },
+};
+helpers.beginEvolutionRouteState(scopeState, { ...scopeState.route, view: "history", tab: "audit" }, { loadsRuns: true });
+assert.equal(scopeState.runs.length, 0, "inbox→history must clear the old list before the history request settles");
+assert.equal(scopeState.nextCursor, "");
+scopeState.runs = [{ run_id: "history-old" }];
+scopeState.nextCursor = "history-page-2";
+helpers.beginEvolutionRouteState(scopeState, { ...scopeState.route, risk: ["p0"] }, { loadsRuns: true });
+assert.equal(scopeState.runs.length, 0, "risk changes must clear stale scoped runs immediately");
+scopeState.runs = [{ run_id: "risk-scoped" }];
+helpers.beginEvolutionRouteState(scopeState, { ...scopeState.route, type: "combined" }, { loadsRuns: true });
+assert.equal(scopeState.runs.length, 0, "type changes must clear stale scoped runs immediately");
+scopeState.runs = [{ run_id: "type-scoped" }];
+helpers.beginEvolutionRouteState(scopeState, { ...scopeState.route, cursor: "page-2" }, { loadsRuns: true });
+assert.equal(scopeState.runs.length, 0, "cursor changes must clear the previous page immediately");
+scopeState.runs = [{ run_id: "history-current" }];
+helpers.beginEvolutionRouteState(scopeState, { ...scopeState.route, drawer: "compiler" }, { loadsRuns: true });
+assert.equal(scopeState.runs[0].run_id, "history-current", "drawer changes within one scope must preserve runs");
+helpers.beginEvolutionRouteState(scopeState, { ...scopeState.route, tab: "evidence" }, { loadsRuns: true });
+assert.equal(scopeState.runs[0].run_id, "history-current", "detail tab changes within one scope must preserve runs");
+
 const hangingPageRequest = deferred();
 const pageController = helpers.createLatestRequestController();
 const hangingLoad = pageController.run(() => hangingPageRequest.promise);
@@ -260,7 +321,6 @@ for (const marker of [
   "已阻断",
   "知识过期",
   "运行异常",
-  "演化待办队列",
   "线上版本对比",
   "全部 Agent",
   "演化历史",

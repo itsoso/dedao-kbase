@@ -100,6 +100,51 @@
     return patch;
   }
 
+  function runsScopeKey(route = {}) {
+    const risks = Array.isArray(route.risk)
+      ? route.risk.map(normalizeRisk).filter(Boolean).sort((left, right) => riskOrder[left] - riskOrder[right])
+      : [];
+    return [route.view || routeDefaults.view, risks.join(","), route.type || "", route.cursor || ""].join("|");
+  }
+
+  function queuePresentation(view) {
+    if (view === "history") {
+      return Object.freeze({
+        indexLabel: "01 / 按时间排序",
+        title: "演化历史",
+        sortHint: "按更新时间倒序",
+        loading: "正在读取演化历史…",
+        errorTitle: "演化历史不可用",
+        emptyTitle: "暂无演化历史",
+        emptyBody: "完成、拒绝、替代或回滚的任务会显示在这里。",
+        detailPrompt: "选择一条历史记录",
+      });
+    }
+    return Object.freeze({
+      indexLabel: "01 / 按风险排序",
+      title: "演化待办队列",
+      sortHint: "按风险与优先级排序",
+      loading: "正在读取优先队列…",
+      errorTitle: "待办队列不可用",
+      emptyTitle: "当前没有演化待办",
+      emptyBody: "控制面运行正常，新信号会自动进入这里。",
+      detailPrompt: "选择一项待办",
+    });
+  }
+
+  function overviewStatusMetrics(overview = {}) {
+    const openRuns = Array.isArray(overview.open_runs) ? overview.open_runs : [];
+    return Object.freeze({
+      awaitingApproval: Number(overview.awaiting_approval || 0),
+      blocked: Number(overview.blocked || 0),
+      staleKnowledge: openRuns.filter((run) => (
+        ["knowledge_release", "combined"].includes(run?.run_type) && ["detected", "triaged"].includes(run?.status)
+      )).length,
+      failed: Number(overview.failed || 0),
+      completed: Number(overview.completed || 0),
+    });
+  }
+
   function createLatestRequestController() {
     let nextToken = 0;
     let active = null;
@@ -148,12 +193,17 @@
   function beginEvolutionRouteState(state, route, { loadsRuns = true } = {}) {
     const previousRun = String(state?.route?.run || "");
     const nextRun = String(route?.run || "");
+    const scopeChanged = runsScopeKey(state?.route) !== runsScopeKey(route);
     state.route = route;
     state.loading = { overview: true, runs: Boolean(loadsRuns), detail: Boolean(nextRun) };
     state.errors = { overview: "", runs: "", detail: "", events: "" };
     if (previousRun !== nextRun) {
       state.selectedDetail = null;
       state.events = [];
+    }
+    if (scopeChanged) {
+      state.runs = [];
+      state.nextCursor = "";
     }
     return previousRun !== nextRun;
   }
@@ -240,6 +290,15 @@
     }) : [];
   }
 
+  function sortRunsForView(runs, view) {
+    if (view !== "history") return sortRuns(runs);
+    return Array.isArray(runs) ? [...runs].sort((left, right) => {
+      const timeDelta = Date.parse(right?.updated_at || "") - Date.parse(left?.updated_at || "");
+      if (Number.isFinite(timeDelta) && timeDelta !== 0) return timeDelta;
+      return String(left?.run_id || "").localeCompare(String(right?.run_id || ""));
+    }) : [];
+  }
+
   function scoreDelta(baseline, candidate) {
     if (baseline === null || baseline === undefined || candidate === null || candidate === undefined) return null;
     const left = Number(baseline);
@@ -305,6 +364,9 @@
     detailTabForView,
     routePatchForView,
     navigationPatchForDataset,
+    runsScopeKey,
+    queuePresentation,
+    overviewStatusMetrics,
     createLatestRequestController,
     beginEvolutionRouteState,
     restoreDismissedDialogFocus,
@@ -313,6 +375,7 @@
     groupPackages,
     selectCurrentPublished,
     sortRuns,
+    sortRunsForView,
     scoreDelta,
     shouldHandleClick,
     activateDialog,

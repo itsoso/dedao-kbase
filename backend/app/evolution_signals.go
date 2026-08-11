@@ -93,6 +93,8 @@ type EvolutionOverview struct {
 	TotalOpenRuns    int                             `json:"total_open_runs"`
 	AwaitingApproval int                             `json:"awaiting_approval"`
 	Blocked          int                             `json:"blocked"`
+	Failed           int                             `json:"failed"`
+	Completed        int                             `json:"completed"`
 }
 
 type EvolutionRunPage struct {
@@ -706,6 +708,10 @@ func BuildEvolutionOverview(records []AgentPackageRecord, runs []EvolutionRun) (
 			overview.AwaitingApproval++
 		case EvolutionBlocked:
 			overview.Blocked++
+		case EvolutionFailed:
+			overview.Failed++
+		case EvolutionCompleted:
+			overview.Completed++
 		}
 		if !isTerminalEvolutionRunStatus(run.Status) {
 			openRuns = append(openRuns, *run)

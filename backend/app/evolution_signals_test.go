@@ -851,6 +851,7 @@ func TestEvolutionOverviewGroupsFleetAndSortsOpenRuns(t *testing.T) {
 		validOverviewRun("run-c", "agent-a", 50, "2026-08-11T09:00:00Z", EvolutionTriaged),
 		validOverviewRun("run-a", "agent-b", 80, "2026-08-11T11:00:00Z", EvolutionDetected),
 		validOverviewRun("run-completed", "agent-a", 100, "2026-08-10T00:00:00Z", EvolutionCompleted),
+		validOverviewRun("run-failed", "agent-b", 90, "2026-08-10T01:00:00Z", EvolutionFailed),
 	}
 
 	overview, err := BuildEvolutionOverview(records, runs)
@@ -859,6 +860,9 @@ func TestEvolutionOverviewGroupsFleetAndSortsOpenRuns(t *testing.T) {
 	}
 	if got := evolutionRunIDs(overview.OpenRuns); fmt.Sprint(got) != "[run-a run-c run-b]" {
 		t.Fatalf("open run order = %v", got)
+	}
+	if overview.Failed != 1 || overview.Completed != 1 {
+		t.Fatalf("terminal overview counts = failed:%d completed:%d", overview.Failed, overview.Completed)
 	}
 	if len(overview.AgentFleet) != 2 || overview.AgentFleet[0].PackageID != "agent-a" {
 		t.Fatalf("fleet = %#v", overview.AgentFleet)

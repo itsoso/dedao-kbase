@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-11
 
-**状态：** 已通过 G1、G2；第一层质量修复与浏览器复验完成，G3 及后续 Gate 待裁决
+**状态：** 已通过 G1、G2；第一层累计质量复修与浏览器复验完成，G3 及后续 Gate 待裁决
 
 **交付分支：** `codex/agent-evolution-control-plane`
 
@@ -36,7 +36,7 @@ Agent 能力演化与知识供给演化。系统可自动发现问题、生成�
 | Gate | 状态 | 裁决依据 |
 |---|---|---|
 | G1 准入 | PASS | 目标、人工发布边界、双环范围、共享 Token 约束、四层验收和成功标准均已在批准设计中冻结。 |
-| G2 可行性与风险压测 | PASS | 待办/历史状态互斥查询、独立请求所有权、A→B 陈旧响应隔离、慢请求即时返焦和编译器关闭重开均有 deferred 自动化与真实浏览器证据。 |
+| G2 可行性与风险压测 | PASS | 异常/完成使用权威聚合，History 文案与时间排序独立，view/risk/type/cursor scope 变化立即清空旧列表；均有 Go、deferred smoke 和真实浏览器证据。 |
 | G3 测试 | PENDING | 第一层窄测、全量 Web smoke、`go test ./...`、前端构建、隐私与差异检查已通过；后续层测试尚未执行。 |
 | G4 评审 | PENDING | 等待逐任务规格评审、代码质量评审和最终架构评审。 |
 | G5 部署健康 | PENDING | 尚未部署；不得以预期输出代替健康证据。 |
@@ -105,11 +105,32 @@ EVOLUTION_FIXTURE_PORT=8897 EVOLUTION_FIXTURE_DELAY_MS=4000 \
   node frontend-web/scripts/agent-evolution-console-fixture.mjs
 ```
 
+累计范围复审随后发现的三项问题已经修复并复验：
+
+- `EvolutionOverview` 与只读 HTTP view 新增向后兼容的 `failed/completed` 权威总数，领域构建器
+  对全部任务计数；页面显示“运行异常”和“已完成”，不再从 `open_runs` 猜测终态。
+- production-like fixture 的 `open_runs` 只含 `run-open-a/awaiting_approval` 与
+  `run-open-b/evaluating`，另显式返回 `failed=1/completed=1`；Inbox 仍通过独立任务查询显示
+  需要人工处理的 `run-failed`，不混入 `run-completed`。
+- History 的序号、标题、排序提示、加载/错误/空态和详情提示均使用历史语义；列表按
+  `updated_at` 倒序，再以 `run_id` 稳定打破平局。
+- `beginEvolutionRouteState` 使用 view+risk+type+cursor scope key；scope 改变立即清空 runs 与
+  next cursor，同一 scope 内切 run、详情 tab 或 drawer 保留当前列表。
+
+最终 1280×720 CSS px、`devicePixelRatio=2` 浏览器复验确认：
+
+- 状态条显示“运行异常 1”“已完成 1”，overview 响应终态总数与严格非终态 `open_runs` 一致。
+- History 显示“01 / 按时间排序”“演化历史”“按更新时间倒序”，无待办文案；低风险但更新的
+  `run-rejected`（11:00）排在高风险但更早的 `run-completed`（10:00）之前。
+- 慢请求下从 Inbox 切 History 时旧开放、失败和终态行立即消失并显示“正在读取演化历史”；
+  History 加载后改 P0，旧两行同样立即消失。
+- 同一 scope 内选择 `run-completed`、切换证据 tab 或打开 drawer，当前历史列表保持不变。
+
 G3 仍等待项目级完整测试门禁，G4 仍等待独立规格与代码质量评审，G5/G6 仍等待实际
 部署和线上验证；不得把本地 fixture 巡检当作上线证据。
 
 ## 当前断点
 
-任务 6 质量修复与 G2 浏览器复验完成，等待独立代码质量复审；任务 7 尚未开始。
+任务 6 累计质量修复与 G2 浏览器复验完成，等待独立代码质量复审；任务 7 尚未开始。
 后续实施必须按实施计划顺序推进，并把每层的真实测试、评审、部署和线上证据追加到本
 dossier；失败或阻断必须原样记录并回到上游修复。

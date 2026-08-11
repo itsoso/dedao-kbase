@@ -20,16 +20,28 @@ const runs = [
   { run_id: "run-blocked", package_id: "knowledge-agent", run_type: "knowledge_release", status: "blocked", risk_level: "high", priority_score: 83, updated_at: now, trigger_signal_count: 2 },
   { run_id: "run-failed", package_id: "runtime-agent", run_type: "combined", status: "failed", risk_level: "p1", priority_score: 79, updated_at: now, trigger_signal_count: 3 },
   { run_id: "run-open-b", package_id: "research-agent", run_type: "combined", status: "evaluating", risk_level: "medium", priority_score: 61, updated_at: now, trigger_signal_count: 1 },
-  { run_id: "run-completed", package_id: "attention-agent", run_type: "agent_policy", status: "completed", risk_level: "low", priority_score: 40, updated_at: now, trigger_signal_count: 2 },
-  { run_id: "run-rejected", package_id: "knowledge-agent", run_type: "knowledge_release", status: "rejected", risk_level: "p2", priority_score: 35, updated_at: now, trigger_signal_count: 1 },
+  { run_id: "run-completed", package_id: "attention-agent", run_type: "agent_policy", status: "completed", risk_level: "critical", priority_score: 40, updated_at: "2026-08-11T10:00:00Z", trigger_signal_count: 2 },
+  { run_id: "run-rejected", package_id: "knowledge-agent", run_type: "knowledge_release", status: "rejected", risk_level: "low", priority_score: 35, updated_at: "2026-08-11T11:00:00Z", trigger_signal_count: 1 },
 ];
+const terminalStatuses = ["completed", "blocked", "rejected", "failed", "superseded", "rolled_back"];
 
 const fleet = ["attention-agent", "knowledge-agent", "runtime-agent", "research-agent"].map((packageID) => ({
   package_id: packageID,
   current: { package_id: packageID, version: "1.0.1", lifecycle_state: "published", published_at: now },
   history: [{ package_id: packageID, version: "1.0.1", lifecycle_state: "published", published_at: now }],
-  open_runs: runs.filter((run) => run.package_id === packageID && !["completed", "rejected", "superseded", "rolled_back"].includes(run.status)),
+  open_runs: runs.filter((run) => run.package_id === packageID && !terminalStatuses.includes(run.status)),
 }));
+
+export function fixtureEvolutionOverview() {
+  return {
+    awaiting_approval: 1,
+    blocked: 1,
+    failed: 1,
+    completed: 1,
+    open_runs: runs.filter((run) => !terminalStatuses.includes(run.status)),
+    agent_fleet: fleet,
+  };
+}
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -66,7 +78,7 @@ async function serveAPI(request, response, url) {
   }
   await wait();
   if (url.pathname === "/api/evolution/overview") {
-    json(response, { awaiting_approval: 1, blocked: 1, open_runs: runs.slice(0, 4), agent_fleet: fleet });
+    json(response, fixtureEvolutionOverview());
     return true;
   }
   if (url.pathname === "/api/evolution/runs") {
