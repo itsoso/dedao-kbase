@@ -349,6 +349,8 @@ const evolutionConsoleState = {
   compilerLoading: false,
   returnFocusToCompilerTrigger: false,
 };
+let evolutionPageRequestController = null;
+let evolutionCompilerRequestController = null;
 
 const evidenceAuditState = {
   audits: [],
@@ -426,7 +428,6 @@ let evidenceAuditWorkspaceSequence = 0;
 let bookAgentLoadSequence = 0;
 let bookAgentActionSequence = 0;
 let agentCompilerRequestSequence = 0;
-let evolutionLoadSequence = 0;
 let proofroomOperationSequence = 0;
 let dedaoEbookDetailLoadSequence = 0;
 let bookKnowledgeLoadSequence = 0;
@@ -4304,7 +4305,7 @@ function renderEvolutionQueue() {
   }
   const rows = runs.map((run) => {
     const selected = run.run_id === evolutionConsoleState.route.run;
-    const href = evolutionRouteURL({ run: run.run_id, tab: "comparison" });
+    const href = evolutionRouteURL({ run: run.run_id, tab: AgentEvolutionConsole.detailTabForView(evolutionConsoleState.route.view) });
     return `
       <a class="evolution-run ${selected ? "is-selected" : ""}" href="${escapeAttribute(href)}" data-evolution-run-id="${escapeAttribute(run.run_id)}" ${selected ? 'aria-current="true"' : ""}>
         <span class="evolution-run__risk is-${escapeAttribute(AgentEvolutionConsole.normalizeRisk(run.risk_level) || "unknown")}">${escapeHTML(evolutionRiskLabel(run.risk_level))}</span>
@@ -4419,7 +4420,7 @@ function renderAgentEvolutionConsole() {
           <button type="button" class="button button-primary" data-evolution-drawer="compiler">创建候选</button>
         </form>
       </header>
-      <nav class="evolution-console__views" aria-label="演化中心视图">${tabs.map(([value, label]) => `<a href="${escapeAttribute(evolutionRouteURL({ view: value, cursor: "", ...(["fleet", "rules"].includes(value) ? { run: "", tab: "comparison" } : {}), ...(value === "history" ? { tab: "audit" } : {}) }))}" data-evolution-view="${value}" class="${route.view === value ? "is-active" : ""}" ${route.view === value ? 'aria-current="page"' : ""}>${label}</a>`).join("")}</nav>
+      <nav class="evolution-console__views" aria-label="演化中心视图">${tabs.map(([value, label]) => `<a href="${escapeAttribute(evolutionRouteURL(AgentEvolutionConsole.routePatchForView(value)))}" data-evolution-view="${value}" class="${route.view === value ? "is-active" : ""}" ${route.view === value ? 'aria-current="page"' : ""}>${label}</a>`).join("")}</nav>
       <p class="visually-hidden" aria-live="polite" aria-atomic="true">${escapeHTML(statusMessage)}</p>
       ${renderEvolutionStatusStrip()}
       ${route.view === "rules" ? `
@@ -5559,8 +5560,21 @@ function pushEvolutionRoute(patch, { replace = false } = {}) {
   } else {
     window.history.pushState({}, "", href);
   }
-  evolutionConsoleState.route = AgentEvolutionConsole.parseRoute(href);
   return loadAgentEvolutionConsole();
+}
+
+function invalidateEvolutionConsoleRequests() {
+  evolutionPageRequestController?.cancel();
+  evolutionCompilerRequestController?.cancel();
+}
+
+function requireEvolutionRequestControllers() {
+  if (!AgentEvolutionConsole?.createLatestRequestController) {
+    throw new Error("Agent evolution request controller is unavailable");
+  }
+  evolutionPageRequestController ||= AgentEvolutionConsole.createLatestRequestController();
+  evolutionCompilerRequestController ||= AgentEvolutionConsole.createLatestRequestController();
+  return { page: evolutionPageRequestController, compiler: evolutionCompilerRequestController };
 }
 
 function bindAgentEvolutionEvents(route) {
@@ -5568,26 +5582,7 @@ function bindAgentEvolutionEvents(route) {
     anchor.addEventListener("click", (event) => {
       if (!AgentEvolutionConsole.shouldHandleClick(event, anchor)) return;
       event.preventDefault();
-      const patch = {};
-      if (anchor.dataset.evolutionRunId) {
-        patch.run = anchor.dataset.evolutionRunId;
-        patch.tab = "comparison";
-      }
-      if (anchor.dataset.evolutionView) {
-        patch.view = anchor.dataset.evolutionView;
-        patch.cursor = "";
-        if (["fleet", "rules"].includes(patch.view)) {
-          patch.run = "";
-          patch.tab = "comparison";
-        } else if (patch.view === "history") {
-          patch.tab = "audit";
-        }
-      }
-      if (anchor.dataset.evolutionDetailTab) patch.tab = anchor.dataset.evolutionDetailTab;
-      if (anchor.dataset.evolutionCursor) {
-        patch.cursor = anchor.dataset.evolutionCursor;
-        patch.run = "";
-      }
+      const patch = AgentEvolutionConsole.navigationPatchForDataset(anchor.dataset, evolutionConsoleState);
       pushEvolutionRoute(patch);
     });
   });
@@ -5614,15 +5609,16 @@ function bindAgentEvolutionEvents(route) {
     document.querySelector("[data-evolution-drawer-close]")?.addEventListener("click", closeDrawer);
     bindAgentCompilerEvents(route);
   }
-  if (
-    evolutionConsoleState.returnFocusToCompilerTrigger &&
-    !drawer &&
-    !evolutionConsoleState.loading.overview &&
-    !evolutionConsoleState.loading.runs &&
-    !evolutionConsoleState.loading.detail
-  ) {
+  if (AgentEvolutionConsole.restoreDismissedDialogFocus({
+    shouldRestore: evolutionConsoleState.returnFocusToCompilerTrigger,
+    dialog: drawer,
+    trigger,
+    schedule(callback) {
+      if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(callback);
+      else callback();
+    },
+  })) {
     evolutionConsoleState.returnFocusToCompilerTrigger = false;
-    window.requestAnimationFrame?.(() => document.querySelector('[data-evolution-drawer="compiler"]')?.focus());
   }
 }
 
@@ -5743,34 +5739,41 @@ async function loadAgentCompilerReleases() {
   return releases.slice(0, 500);
 }
 
-async function loadEvolutionCompilerReleases(sequence, route) {
-  if (route.drawer !== "compiler" || agentCompilerState.releases.length || evolutionConsoleState.compilerLoading) return;
-  evolutionConsoleState.compilerLoading = true;
-  agentCompilerState.loading = "正在加载最新 Release";
-  agentCompilerState.error = "";
-  renderBookAgentPlatform({ view: "package", packageID: "" });
-  try {
-    const releases = await loadAgentCompilerReleases();
-    if (sequence !== evolutionLoadSequence || evolutionConsoleState.route.drawer !== "compiler") return;
-    agentCompilerState.releases = releases;
-    if (!releases.some((release) => release.release_id === agentCompilerState.primaryReleaseID)) {
-      agentCompilerState.primaryReleaseID = releases[0]?.release_id || "";
-    }
-    const available = new Set(releases.map((release) => release.release_id));
-    agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
-      (releaseID) => available.has(releaseID) && releaseID !== agentCompilerState.primaryReleaseID,
-    );
-  } catch (error) {
-    if (sequence === evolutionLoadSequence) {
+async function loadEvolutionCompilerReleases(route) {
+  const { compiler } = requireEvolutionRequestControllers();
+  if (
+    route.drawer !== "compiler" ||
+    agentCompilerState.releases.length ||
+    compiler.isActive()
+  ) return;
+  await compiler.run(loadAgentCompilerReleases, {
+    onStart() {
+      evolutionConsoleState.compilerLoading = true;
+      agentCompilerState.loading = "正在加载最新 Release";
+      agentCompilerState.error = "";
+      renderBookAgentPlatform({ view: "package", packageID: "" });
+    },
+    onSuccess(releases) {
+      agentCompilerState.releases = releases;
+      if (!releases.some((release) => release.release_id === agentCompilerState.primaryReleaseID)) {
+        agentCompilerState.primaryReleaseID = releases[0]?.release_id || "";
+      }
+      const available = new Set(releases.map((release) => release.release_id));
+      agentCompilerState.supportingReleaseIDs = agentCompilerState.supportingReleaseIDs.filter(
+        (releaseID) => available.has(releaseID) && releaseID !== agentCompilerState.primaryReleaseID,
+      );
+    },
+    onError(error) {
       agentCompilerState.error = `Release 列表加载失败：${error instanceof Error ? error.message : String(error)}`;
-    }
-  } finally {
-    if (sequence === evolutionLoadSequence) {
+    },
+    onFinish() {
       evolutionConsoleState.compilerLoading = false;
       agentCompilerState.loading = "";
-      renderBookAgentPlatform({ view: "package", packageID: "" });
-    }
-  }
+      if (getRoutePathname() === ROUTES.agentPackages && evolutionConsoleState.route.drawer === "compiler") {
+        renderBookAgentPlatform({ view: "package", packageID: "" });
+      }
+    },
+  });
 }
 
 async function compileAgentPackages(route) {
@@ -6134,76 +6137,73 @@ async function deliverEvidenceAuditToProofroom(route) {
 }
 
 async function loadAgentEvolutionConsole() {
-  const sequence = ++evolutionLoadSequence;
+  const { page, compiler } = requireEvolutionRequestControllers();
   const route = AgentEvolutionConsole.parseRoute(window.location.href);
-  evolutionConsoleState.route = route;
-  evolutionConsoleState.loading = { overview: true, runs: true, detail: Boolean(route.run) };
-  evolutionConsoleState.errors = { overview: "", runs: "", detail: "", events: "" };
-  if (!route.run) {
-    evolutionConsoleState.selectedDetail = null;
-    evolutionConsoleState.events = [];
-  }
-  renderBookAgentPlatform({ view: "package", packageID: "" });
-
-  const query = new URLSearchParams({ limit: "50" });
-  const expandedRisks = AgentEvolutionConsole.expandRiskQuery(route.risk);
-  if (expandedRisks.length) query.set("risk", expandedRisks.join(","));
-  if (route.type) query.set("type", route.type);
-  if (route.cursor) query.set("cursor", route.cursor);
-  const requests = [
-    apiFetch("/api/evolution/overview"),
-    apiFetch(`/api/evolution/runs?${query.toString()}`),
-    route.run ? apiFetch(`/api/evolution/runs/${encodeURIComponent(route.run)}`) : Promise.resolve(null),
-    route.run ? apiFetch(`/api/evolution/runs/${encodeURIComponent(route.run)}/events?limit=50`) : Promise.resolve(null),
-  ];
-  const [overviewResult, runsResult, detailResult, eventsResult] = await Promise.allSettled(requests);
-  if (sequence !== evolutionLoadSequence) return;
-
-  evolutionConsoleState.loading = { overview: false, runs: false, detail: false };
-  if (overviewResult.status === "fulfilled") {
-    const overview = overviewResult.value || {};
-    evolutionConsoleState.overview = {
-      ...overview,
-      open_runs: Array.isArray(overview.open_runs) ? overview.open_runs : [],
-      agent_fleet: Array.isArray(overview.agent_fleet) ? overview.agent_fleet : [],
-    };
-  } else {
-    evolutionConsoleState.overview = null;
-    evolutionConsoleState.errors.overview = overviewResult.reason instanceof Error ? overviewResult.reason.message : String(overviewResult.reason);
-  }
-  if (runsResult.status === "fulfilled") {
-    evolutionConsoleState.runs = Array.isArray(runsResult.value?.runs) ? runsResult.value.runs : [];
-    evolutionConsoleState.nextCursor = String(runsResult.value?.next_cursor || "");
-  } else {
-    evolutionConsoleState.runs = [];
-    evolutionConsoleState.nextCursor = "";
-    evolutionConsoleState.errors.runs = runsResult.reason instanceof Error ? runsResult.reason.message : String(runsResult.reason);
-  }
-  if (route.run) {
-    if (detailResult.status === "fulfilled") {
-      evolutionConsoleState.selectedDetail = detailResult.value || null;
-    } else {
-      evolutionConsoleState.selectedDetail = null;
-      evolutionConsoleState.errors.detail = detailResult.reason instanceof Error ? detailResult.reason.message : String(detailResult.reason);
-    }
-    if (eventsResult.status === "fulfilled") {
-      evolutionConsoleState.events = Array.isArray(eventsResult.value?.events) ? eventsResult.value.events : [];
-    } else {
-      evolutionConsoleState.events = [];
-      evolutionConsoleState.errors.events = eventsResult.reason instanceof Error ? eventsResult.reason.message : String(eventsResult.reason);
-    }
-  }
-  bookAgentState.message = evolutionConsoleState.errors.overview && evolutionConsoleState.errors.runs
-    ? "演化控制面当前不可用"
-    : "演化态势已更新";
-  renderBookAgentPlatform({ view: "package", packageID: "" });
-  await loadEvolutionCompilerReleases(sequence, route);
+  const runsQuery = AgentEvolutionConsole.buildRunsQuery(route);
+  return page.run(async () => {
+    const requests = [
+      apiFetch("/api/evolution/overview"),
+      runsQuery ? apiFetch(`/api/evolution/runs?${runsQuery.toString()}`) : Promise.resolve({ runs: [], next_cursor: "" }),
+      route.run ? apiFetch(`/api/evolution/runs/${encodeURIComponent(route.run)}`) : Promise.resolve(null),
+      route.run ? apiFetch(`/api/evolution/runs/${encodeURIComponent(route.run)}/events?limit=50`) : Promise.resolve(null),
+    ];
+    return Promise.allSettled(requests);
+  }, {
+    onStart() {
+      AgentEvolutionConsole.beginEvolutionRouteState(evolutionConsoleState, route, { loadsRuns: Boolean(runsQuery) });
+      if (route.drawer !== "compiler") {
+        compiler.cancel();
+      }
+      renderBookAgentPlatform({ view: "package", packageID: "" });
+      if (route.drawer === "compiler") void loadEvolutionCompilerReleases(route);
+    },
+    onSuccess([overviewResult, runsResult, detailResult, eventsResult]) {
+      evolutionConsoleState.loading = { overview: false, runs: false, detail: false };
+      if (overviewResult.status === "fulfilled") {
+        const overview = overviewResult.value || {};
+        evolutionConsoleState.overview = {
+          ...overview,
+          open_runs: Array.isArray(overview.open_runs) ? overview.open_runs : [],
+          agent_fleet: Array.isArray(overview.agent_fleet) ? overview.agent_fleet : [],
+        };
+      } else {
+        evolutionConsoleState.overview = null;
+        evolutionConsoleState.errors.overview = overviewResult.reason instanceof Error ? overviewResult.reason.message : String(overviewResult.reason);
+      }
+      if (runsResult.status === "fulfilled") {
+        evolutionConsoleState.runs = Array.isArray(runsResult.value?.runs) ? runsResult.value.runs : [];
+        evolutionConsoleState.nextCursor = String(runsResult.value?.next_cursor || "");
+      } else {
+        evolutionConsoleState.runs = [];
+        evolutionConsoleState.nextCursor = "";
+        evolutionConsoleState.errors.runs = runsResult.reason instanceof Error ? runsResult.reason.message : String(runsResult.reason);
+      }
+      if (route.run) {
+        if (detailResult.status === "fulfilled") {
+          evolutionConsoleState.selectedDetail = detailResult.value || null;
+        } else {
+          evolutionConsoleState.selectedDetail = null;
+          evolutionConsoleState.errors.detail = detailResult.reason instanceof Error ? detailResult.reason.message : String(detailResult.reason);
+        }
+        if (eventsResult.status === "fulfilled") {
+          evolutionConsoleState.events = Array.isArray(eventsResult.value?.events) ? eventsResult.value.events : [];
+        } else {
+          evolutionConsoleState.events = [];
+          evolutionConsoleState.errors.events = eventsResult.reason instanceof Error ? eventsResult.reason.message : String(eventsResult.reason);
+        }
+      }
+      bookAgentState.message = evolutionConsoleState.errors.overview && evolutionConsoleState.errors.runs
+        ? "演化控制面当前不可用"
+        : "演化态势已更新";
+      renderBookAgentPlatform({ view: "package", packageID: "" });
+    },
+  });
 }
 
 async function loadBookAgentPlatform(route) {
   cancelEvidenceAuditPoll();
   if (route.packageID) {
-    evolutionLoadSequence += 1;
+    invalidateEvolutionConsoleRequests();
   }
   const sequence = ++bookAgentLoadSequence;
   bookAgentActionSequence += 1;
@@ -10928,7 +10928,7 @@ async function boot() {
     bookAgentState.activeAction = "";
     proofroomOperationSequence += 1;
     evidenceAuditState.routeAuditID = "";
-    evolutionLoadSequence += 1;
+    invalidateEvolutionConsoleRequests();
   }
   if (routePathname === ROUTES.dedaoLogin) {
     renderDedaoLogin();

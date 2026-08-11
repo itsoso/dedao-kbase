@@ -27,6 +27,11 @@
     p2: ["p2", "medium"],
     p3: ["p3", "low"],
   });
+  const inboxStatuses = Object.freeze([
+    "detected", "triaged", "generating", "evaluating", "awaiting_approval",
+    "approved", "publishing", "observing", "blocked", "failed",
+  ]);
+  const historyStatuses = Object.freeze(["completed", "rejected", "superseded", "rolled_back"]);
 
   function normalizeRisk(value) {
     return riskAliases[String(value || "").trim().toLowerCase()] || "";
@@ -48,6 +53,116 @@
       }
     }
     return expanded;
+  }
+
+  function runStatusesForView(view) {
+    if (view === "inbox") return [...inboxStatuses];
+    if (view === "history") return [...historyStatuses];
+    return [];
+  }
+
+  function buildRunsQuery(route = {}) {
+    const statuses = runStatusesForView(route.view);
+    if (!statuses.length) return null;
+    const query = new URLSearchParams({ limit: "50", status: statuses.join(",") });
+    const risks = expandRiskQuery(route.risk);
+    if (risks.length) query.set("risk", risks.join(","));
+    if (validTypes.has(route.type)) query.set("type", route.type);
+    if (route.cursor) query.set("cursor", String(route.cursor));
+    return query;
+  }
+
+  function detailTabForView(view) {
+    return view === "history" ? "audit" : "comparison";
+  }
+
+  function routePatchForView(view) {
+    const nextView = validViews.has(view) ? view : routeDefaults.view;
+    return { view: nextView, cursor: "", run: "", tab: detailTabForView(nextView) };
+  }
+
+  function navigationPatchForDataset(dataset = {}, state = {}) {
+    const patch = {};
+    if (dataset.evolutionRunId) {
+      patch.run = String(dataset.evolutionRunId);
+      patch.tab = detailTabForView(state?.route?.view);
+    }
+    if (dataset.evolutionView) {
+      Object.assign(patch, routePatchForView(String(dataset.evolutionView)));
+    }
+    if (validTabs.has(dataset.evolutionDetailTab)) {
+      patch.tab = dataset.evolutionDetailTab;
+    }
+    if (dataset.evolutionCursor) {
+      patch.cursor = String(dataset.evolutionCursor);
+      patch.run = "";
+    }
+    return patch;
+  }
+
+  function createLatestRequestController() {
+    let nextToken = 0;
+    let active = null;
+
+    function finish(token) {
+      if (active?.token !== token) return false;
+      const onFinish = active.onFinish;
+      active = null;
+      onFinish?.();
+      return true;
+    }
+
+    function cancel() {
+      if (!active) return false;
+      nextToken += 1;
+      return finish(active.token);
+    }
+
+    async function run(request, handlers = {}) {
+      cancel();
+      const token = ++nextToken;
+      active = { token, onFinish: handlers.onFinish };
+      handlers.onStart?.();
+      try {
+        const value = await request();
+        if (active?.token === token) handlers.onSuccess?.(value);
+        return value;
+      } catch (error) {
+        if (active?.token === token) {
+          if (typeof handlers.onError === "function") handlers.onError(error);
+          else throw error;
+        }
+        return undefined;
+      } finally {
+        finish(token);
+      }
+    }
+
+    return Object.freeze({
+      run,
+      cancel,
+      isActive() { return Boolean(active); },
+    });
+  }
+
+  function beginEvolutionRouteState(state, route, { loadsRuns = true } = {}) {
+    const previousRun = String(state?.route?.run || "");
+    const nextRun = String(route?.run || "");
+    state.route = route;
+    state.loading = { overview: true, runs: Boolean(loadsRuns), detail: Boolean(nextRun) };
+    state.errors = { overview: "", runs: "", detail: "", events: "" };
+    if (previousRun !== nextRun) {
+      state.selectedDetail = null;
+      state.events = [];
+    }
+    return previousRun !== nextRun;
+  }
+
+  function restoreDismissedDialogFocus({ shouldRestore, dialog, trigger, schedule } = {}) {
+    if (!shouldRestore || dialog || !trigger?.focus) return false;
+    const enqueue = typeof schedule === "function" ? schedule : (callback) => callback();
+    enqueue(() => trigger.focus());
+    return true;
   }
 
   function parseRoute(input) {
@@ -185,6 +300,14 @@
     normalizeRisk,
     riskLabel,
     expandRiskQuery,
+    runStatusesForView,
+    buildRunsQuery,
+    detailTabForView,
+    routePatchForView,
+    navigationPatchForDataset,
+    createLatestRequestController,
+    beginEvolutionRouteState,
+    restoreDismissedDialogFocus,
     parseRoute,
     serializeRoute,
     groupPackages,

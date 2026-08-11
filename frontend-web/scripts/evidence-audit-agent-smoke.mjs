@@ -42,7 +42,7 @@ const releaseSource = js.match(/async function loadAgentCompilerReleases\([\s\S]
 assert.ok(releaseSource.includes('latest: "true"'), "compiler should only browse the latest release per book");
 
 const evolutionLoaderSource = js.match(/async function loadEvolutionCompilerReleases\([\s\S]*?\n\}/)?.[0] || "";
-assert.ok(evolutionLoaderSource.includes("try"), "package listing should survive compiler release failures");
+assert.ok(evolutionLoaderSource.includes("onError(error)"), "package listing should survive compiler release failures");
 assert.ok(evolutionLoaderSource.includes("agentCompilerState.error"), "compiler release failures should remain isolated in the drawer");
 
 for (const className of [

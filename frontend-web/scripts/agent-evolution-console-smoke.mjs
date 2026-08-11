@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import { fixtureBrowserClientID, isValidBrowserClientID } from "./agent-evolution-console-fixture.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const helperPath = path.join(root, "evolution-console.js");
@@ -21,6 +22,8 @@ vm.runInNewContext(helperSource, context, { filename: helperPath });
 const helpers = context.globalThis.AgentEvolutionConsole;
 
 assert.ok(helpers, "classic helper should expose globalThis.AgentEvolutionConsole");
+assert.equal(isValidBrowserClientID(fixtureBrowserClientID), true, "fixture fallback must satisfy production browser client ID constraints");
+assert.equal(fixtureBrowserClientID.length >= 16, true);
 
 const parsed = helpers.parseRoute("/agent-packages?view=inbox&risk=p0,p1&type=combined&run=run-123&tab=evidence&cursor=next-1&drawer=compiler");
 assert.deepEqual(Array.from(parsed.risk), ["p0", "p1"]);
@@ -50,6 +53,43 @@ assert.equal(
   "p0,critical,p1,high",
   "URL p0,p1 should query both canonical and signal severity values in a fixed order",
 );
+
+const inboxQuery = helpers.buildRunsQuery({ ...parsed, view: "inbox" });
+assert.equal(
+  inboxQuery.get("status"),
+  "detected,triaged,generating,evaluating,awaiting_approval,approved,publishing,observing,blocked,failed",
+  "inbox must request only actionable and open statuses",
+);
+assert.equal(inboxQuery.get("risk"), "p0,critical,p1,high");
+assert.equal(inboxQuery.get("type"), "combined");
+assert.equal(inboxQuery.get("cursor"), "next-1");
+const historyQuery = helpers.buildRunsQuery({ ...parsed, view: "history" });
+assert.equal(historyQuery.get("status"), "completed,rejected,superseded,rolled_back");
+assert.equal(helpers.buildRunsQuery({ ...parsed, view: "fleet" }), null, "fleet should not consume run-list pagination");
+assert.equal(helpers.buildRunsQuery({ ...parsed, view: "rules" }), null, "rules should not request runs");
+assert.equal(helpers.detailTabForView("history"), "audit");
+assert.equal(helpers.detailTabForView("inbox"), "comparison");
+const historyRoutePatch = helpers.routePatchForView("history");
+assert.equal(historyRoutePatch.run, "", "switching views must not retain a run from a different status scope");
+assert.equal(historyRoutePatch.tab, "audit");
+assert.equal(historyRoutePatch.cursor, "");
+const historyRunPatch = helpers.navigationPatchForDataset(
+  { evolutionRunId: "run-completed" },
+  { route: { ...helpers.routeDefaults, view: "history" } },
+);
+assert.equal(historyRunPatch.run, "run-completed");
+assert.equal(historyRunPatch.tab, "audit", "history row interception must use evolution state, not the outer package route");
+const viewNavigationPatch = helpers.navigationPatchForDataset(
+  { evolutionView: "history" },
+  { route: { ...helpers.routeDefaults, view: "inbox", run: "run-open-a" } },
+);
+assert.equal(viewNavigationPatch.view, "history");
+assert.equal(viewNavigationPatch.run, "");
+assert.equal(viewNavigationPatch.tab, "audit");
+assert.equal(helpers.navigationPatchForDataset({ evolutionDetailTab: "evidence" }, { route: parsed }).tab, "evidence");
+const cursorPatch = helpers.navigationPatchForDataset({ evolutionCursor: "page-2" }, { route: parsed });
+assert.equal(cursorPatch.cursor, "page-2");
+assert.equal(cursorPatch.run, "");
 
 const grouped = helpers.groupPackages([
   { package_id: "agent-b", version: "1.0.0", lifecycle_state: "published", published_at: "2026-08-09T00:00:00Z" },
@@ -122,6 +162,98 @@ assert.equal(dismissCalls, 1, "native cancel after keydown should not dismiss tw
 unbindDismiss();
 assert.equal(dismissListeners.size, 0);
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+const compilerController = helpers.createLatestRequestController();
+const firstCompilerRequest = deferred();
+const secondCompilerRequest = deferred();
+const compilerState = { loading: false, data: [], error: "" };
+const compilerHandlers = {
+  onStart() { compilerState.loading = true; compilerState.error = ""; },
+  onSuccess(value) { compilerState.data = value; },
+  onError(error) { compilerState.error = error.message; },
+  onFinish() { compilerState.loading = false; },
+};
+const firstCompilerLoad = compilerController.run(() => firstCompilerRequest.promise, compilerHandlers);
+assert.equal(compilerState.loading, true);
+compilerController.cancel();
+assert.equal(compilerState.loading, false, "closing the compiler must clear its own loading immediately");
+const secondCompilerLoad = compilerController.run(() => secondCompilerRequest.promise, compilerHandlers);
+secondCompilerRequest.resolve(["release-new"]);
+await secondCompilerLoad;
+firstCompilerRequest.reject(new Error("stale failure"));
+await firstCompilerLoad;
+assert.deepEqual(compilerState.data, ["release-new"]);
+assert.equal(compilerState.error, "", "stale compiler requests cannot overwrite the latest result");
+assert.equal(compilerState.loading, false);
+await assert.rejects(
+  helpers.createLatestRequestController().run(() => Promise.reject(new Error("current failure"))),
+  /current failure/,
+  "an active request without an error handler must remain observable",
+);
+
+const detailController = helpers.createLatestRequestController();
+const detailA = deferred();
+const detailB = deferred();
+const detailState = {
+  route: { run: "" },
+  selectedDetail: null,
+  events: [],
+  loading: { overview: false, runs: false, detail: false },
+  errors: { overview: "", runs: "", detail: "", events: "" },
+};
+const loadDetail = (route, request) => detailController.run(() => request.promise, {
+  onStart() { helpers.beginEvolutionRouteState(detailState, route, { loadsRuns: true }); },
+  onSuccess(value) { detailState.selectedDetail = value; },
+  onFinish() { detailState.loading.detail = false; },
+});
+const loadA = loadDetail({ ...helpers.routeDefaults, run: "run-a" }, detailA);
+detailState.selectedDetail = { run: { run_id: "run-a", package_id: "agent-a" } };
+detailState.events = [{ event_id: "event-a" }];
+const loadB = loadDetail({ ...helpers.routeDefaults, run: "run-b" }, detailB);
+assert.equal(detailState.selectedDetail, null, "B loading state must not retain A detail");
+assert.equal(detailState.events.length, 0, "B loading state must not retain A events");
+assert.equal(detailState.loading.detail, true);
+detailB.resolve({ run: { run_id: "run-b", package_id: "agent-b" } });
+await loadB;
+detailA.resolve({ run: { run_id: "run-a", package_id: "agent-a-stale" } });
+await loadA;
+assert.equal(detailState.selectedDetail.run.run_id, "run-b", "late A response must not replace B");
+
+detailState.selectedDetail = { run: { run_id: "run-b" } };
+helpers.beginEvolutionRouteState(
+  detailState,
+  { ...helpers.routeDefaults, run: "run-b", tab: "audit" },
+  { loadsRuns: true },
+);
+assert.equal(detailState.selectedDetail.run.run_id, "run-b", "same-run tab changes should preserve detail");
+
+const hangingPageRequest = deferred();
+const pageController = helpers.createLatestRequestController();
+const hangingLoad = pageController.run(() => hangingPageRequest.promise);
+let triggerFocused = false;
+let restoreFlag = true;
+const restored = helpers.restoreDismissedDialogFocus({
+  shouldRestore: restoreFlag,
+  dialog: null,
+  trigger: { focus() { triggerFocused = true; } },
+  schedule(callback) { callback(); },
+});
+if (restored) restoreFlag = false;
+assert.equal(triggerFocused, true, "drawer dismissal must restore focus while page APIs are still pending");
+assert.equal(restoreFlag, false);
+pageController.cancel();
+hangingPageRequest.resolve(null);
+await hangingLoad;
+
 for (const marker of [
   "Agent 演化中心",
   "待审批",
@@ -144,7 +276,6 @@ for (const marker of [
   "evolutionConsoleState",
   "loadAgentEvolutionConsole",
   "renderAgentEvolutionConsole",
-  "evolutionLoadSequence",
   "/api/evolution/overview",
   "/api/evolution/runs?",
   "Promise.allSettled",
@@ -155,12 +286,7 @@ for (const marker of [
 ]) {
   assert.ok(appSource.includes(marker), `Agent evolution behavior should include ${marker}`);
 }
-assert.ok(appSource.includes("sequence !== evolutionLoadSequence"), "stale evolution responses must not replace newer route state");
-assert.ok(appSource.includes("AgentEvolutionConsole.expandRiskQuery(route.risk)"), "canonical URL risks should expand to legacy and signal aliases for API filtering");
-assert.ok(appSource.includes("AgentEvolutionConsole.normalizeRisk(run.risk_level)"), "response risk classes should use canonical levels");
 assert.ok(!appSource.includes('is-${escapeAttribute(run.risk_level'), "raw signal severities must not leak into risk CSS classes");
-const bookAgentLoader = appSource.match(/async function loadBookAgentPlatform\([\s\S]*?\n\}/)?.[0] || "";
-assert.ok(bookAgentLoader.includes("evolutionLoadSequence += 1"), "leaving the evolution index must invalidate in-flight responses");
 
 assert.ok(htmlSource.indexOf("/evolution-console.js") < htmlSource.indexOf("/app.js"), "helper should load before app.js");
 assert.ok(htmlSource.includes('<script src="/evolution-console.js?v='), "helper should be a classic versioned script");
@@ -171,8 +297,6 @@ assert.ok(indexRenderer.includes("renderAgentEvolutionConsole"), "package index 
 assert.ok(!indexRenderer.includes("${renderAgentCompiler()}"), "compiler must not remain permanently expanded");
 const evolutionRenderer = appSource.match(/function renderAgentEvolutionConsole\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(!evolutionRenderer.includes("aria-labelledby=\"agent-compiler-title\" open"), "compiler dialog must not be statically open");
-assert.ok(appSource.includes("AgentEvolutionConsole.activateDialog"), "compiler dialog should become modal only after rendering");
-assert.ok(appSource.includes("AgentEvolutionConsole.bindDialogDismiss"), "Escape and native cancel should share one guarded close path");
 
 for (const marker of [
   ".evolution-console",

@@ -2,7 +2,7 @@
 
 **日期：** 2026-08-11
 
-**状态：** 已通过 G1、G2；第一层实现与浏览器复验完成，G3 及后续 Gate 待裁决
+**状态：** 已通过 G1、G2；第一层质量修复与浏览器复验完成，G3 及后续 Gate 待裁决
 
 **交付分支：** `codex/agent-evolution-control-plane`
 
@@ -36,8 +36,8 @@ Agent 能力演化与知识供给演化。系统可自动发现问题、生成�
 | Gate | 状态 | 裁决依据 |
 |---|---|---|
 | G1 准入 | PASS | 目标、人工发布边界、双环范围、共享 Token 约束、四层验收和成功标准均已在批准设计中冻结。 |
-| G2 可行性与风险压测 | PASS | 风险等级已兼容两套命名并规范为 P0–P3；API 查询按固定顺序扩展别名。原生 modal、降级隔离、Esc、URL、返焦和表单保留均有自动化与真实浏览器证据。 |
-| G3 测试 | PENDING | 第一层相关窄测、全量 Web smoke、前端构建、隐私与差异检查已通过；仍等待项目级完整测试门禁和后续层测试。 |
+| G2 可行性与风险压测 | PASS | 待办/历史状态互斥查询、独立请求所有权、A→B 陈旧响应隔离、慢请求即时返焦和编译器关闭重开均有 deferred 自动化与真实浏览器证据。 |
+| G3 测试 | PENDING | 第一层窄测、全量 Web smoke、`go test ./...`、前端构建、隐私与差异检查已通过；后续层测试尚未执行。 |
 | G4 评审 | PENDING | 等待逐任务规格评审、代码质量评审和最终架构评审。 |
 | G5 部署健康 | PENDING | 尚未部署；不得以预期输出代替健康证据。 |
 | G6 上线验证 | PENDING | 尚未上线；等待真实浏览器与生产闭环验证。 |
@@ -61,7 +61,7 @@ Agent 能力演化与知识供给演化。系统可自动发现问题、生成�
 - 浏览器验证空队列、部分 API 503、编译对话框按需打开、关闭后焦点返回触发按钮，
   以及未提交版本字段在关闭后再次打开仍保留。
 
-规格评审指出的问题已经修复并重新验证：
+上一轮规格评审指出的问题已经修复并重新验证：
 
 - `critical/high/medium/low` 与 `p0/p1/p2/p3` 会先规范为 P0–P3，再参与排序、中文显示
   与 CSS；URL 保持规范值，API 查询按 `p0,critical,p1,high` 的固定顺序扩展别名。
@@ -72,11 +72,44 @@ Agent 能力演化与知识供给演化。系统可自动发现问题、生成�
   对话框同时满足 `open` 与 `:modal`，焦点位于弹窗内；输入版本 `1.2.3-qa` 后在文本框按
   Esc，会关闭弹窗、移除 `drawer` 参数并把焦点返回“创建候选”按钮，重新打开后输入值仍保留。
 
+后续质量评审发现的问题已经修复：
+
+- 待办查询只包含开放状态以及需要人工处理的 `blocked/failed`，历史查询只包含
+  `completed/rejected/superseded/rolled_back`；Fleet 与规则页不再消耗任务分页。
+- 全页与编译器 Release 使用独立 latest-request 控制器；关闭或替换请求会立即清除自己的
+  loading，旧请求不能覆盖新数据或错误。
+- A→B 时立即清空旧详情和事件并渲染加载态；同一任务只切详情 tab 时保留已有详情。
+- 抽屉关闭后的返焦不再等待 overview、runs、detail 或 Release 请求完成。
+- 查询分流、请求取消/替换、A→B、慢请求返焦和历史行 audit 路由均由可执行 helper 与
+  deferred promise 测试覆盖，不再依赖关键源码字符串断言。
+
+本轮真实浏览器复验还先后发现 fixture 默认 client ID 不符合生产长度约束，以及历史行
+点击拦截器误用外层 package 路由；两项均先补失败测试再修复。最终复验确认：
+
+- 普通 fixture 中，Inbox 在 P0/P1 + 联合演化筛选下只显示 `run-failed`，不含完成或拒绝项；
+  未筛选 History 精确显示 `run-completed` 与 `run-rejected`。
+- 点击 `run-completed` 后 URL 保持 `view=history&run=run-completed&tab=audit`，详情显示审计事件。
+- 慢请求 fixture 中从 A 快速切到 B，B 加载态不含 A 标题，完成后只显示 B。
+- API 仍在 pending 时关闭抽屉，弹窗和 `drawer` 参数立即消失，队列仍保持加载态，焦点立即
+  返回“创建候选”；Release 加载中关闭再打开不会永久转圈，并最终出现 `release-fixture`。
+- 首屏中文、紧凑双栏、状态条和历史表均完成视觉巡检；没有把本地巡检写成部署或上线证据。
+
+普通与慢请求场景均使用 1280×720 CSS px、`devicePixelRatio=2` 的应用内浏览器视口。
+
+复验入口与命令均在仓库内：
+
+```bash
+node frontend-web/scripts/agent-evolution-console-smoke.mjs
+EVOLUTION_FIXTURE_PORT=8898 node frontend-web/scripts/agent-evolution-console-fixture.mjs
+EVOLUTION_FIXTURE_PORT=8897 EVOLUTION_FIXTURE_DELAY_MS=4000 \
+  node frontend-web/scripts/agent-evolution-console-fixture.mjs
+```
+
 G3 仍等待项目级完整测试门禁，G4 仍等待独立规格与代码质量评审，G5/G6 仍等待实际
 部署和线上验证；不得把本地 fixture 巡检当作上线证据。
 
 ## 当前断点
 
-任务 6 的规格修复与 G2 复验完成，进入后续评审；任务 7 尚未开始。
+任务 6 质量修复与 G2 浏览器复验完成，等待独立代码质量复审；任务 7 尚未开始。
 后续实施必须按实施计划顺序推进，并把每层的真实测试、评审、部署和线上证据追加到本
 dossier；失败或阻断必须原样记录并回到上游修复。
