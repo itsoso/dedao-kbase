@@ -1,9 +1,12 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -37,7 +40,7 @@ func TestEvolutionSignalIdempotencyReplayAndConflict(t *testing.T) {
 func TestEvolutionSignalIdempotencyFingerprintCoversEveryPayloadField(t *testing.T) {
 	store := newEvolutionTestStore(t)
 	base := validEvolutionSignalInput("all-fields-conflict")
-	base.ReleaseID = "release-base"
+	base.ReleaseID = testEvolutionReleaseID("d")
 	base.EvidenceRefs = []string{"evaluation:" + testEvolutionOpaqueID("a"), "metric:regression_pass_rate"}
 	if _, _, _, err := store.IngestSignal(base); err != nil {
 		t.Fatal(err)
@@ -51,7 +54,7 @@ func TestEvolutionSignalIdempotencyFingerprintCoversEveryPayloadField(t *testing
 		{name: "source type", mutate: func(input *EvolutionSignalInput) { input.SourceType = EvolutionSignalSourceObservation }},
 		{name: "source ID", mutate: func(input *EvolutionSignalInput) { input.SourceID = testEvolutionOpaqueID("b") }},
 		{name: "package ID", mutate: func(input *EvolutionSignalInput) { input.PackageID = "research-assistant-v2" }},
-		{name: "release ID", mutate: func(input *EvolutionSignalInput) { input.ReleaseID = "release-changed" }},
+		{name: "release ID", mutate: func(input *EvolutionSignalInput) { input.ReleaseID = testEvolutionReleaseID("e") }},
 		{name: "severity", mutate: func(input *EvolutionSignalInput) { input.Severity = EvolutionSignalSeverityCritical }},
 		{name: "observed value", mutate: func(input *EvolutionSignalInput) { input.ObservedValue = 0.41 }},
 		{name: "baseline value", mutate: func(input *EvolutionSignalInput) { input.BaselineValue = 0.81 }},
@@ -87,7 +90,7 @@ func TestEvolutionSignalDeduplicatedRequestKeepsItsOwnIdempotencyFingerprint(t *
 		t.Fatal(err)
 	}
 	second := first
-	second.IdempotencyKey = "dedup-fingerprint-second"
+	second.IdempotencyKey = testEvolutionRequestID("dedup-fingerprint-second")
 	second.ObservedValue = 0.41
 	signal, aggregatedRun, created, err := store.IngestSignal(second)
 	if err != nil || created || aggregatedRun.RunID != run.RunID {
@@ -117,7 +120,7 @@ func TestEvolutionSignalCooldownAggregatesAndThenCreatesNewRun(t *testing.T) {
 
 	now = now.Add(time.Hour)
 	second := first
-	second.IdempotencyKey = "cooldown-second"
+	second.IdempotencyKey = testEvolutionRequestID("cooldown-second")
 	second.ObservedAt = now
 	second.ObservedValue = 0.42
 	aggregatedSignal, aggregatedRun, created, err := store.IngestSignal(second)
@@ -137,7 +140,7 @@ func TestEvolutionSignalCooldownAggregatesAndThenCreatesNewRun(t *testing.T) {
 
 	now = now.Add(EvolutionSignalCooldown + time.Nanosecond)
 	third := second
-	third.IdempotencyKey = "cooldown-third"
+	third.IdempotencyKey = testEvolutionRequestID("cooldown-third")
 	third.ObservedAt = now
 	_, nextRun, created, err := store.IngestSignal(third)
 	if err != nil || created {
@@ -193,7 +196,7 @@ func TestEvolutionSignalCrossStoreReplayAndAggregationDoNotDuplicateRuns(t *test
 		go func(index int, store *EvolutionControlStore) {
 			start.Wait()
 			related := input
-			related.IdempotencyKey = fmt.Sprintf("cross-store-aggregate-%d", index)
+			related.IdempotencyKey = testEvolutionRequestID(fmt.Sprintf("cross-store-aggregate-%d", index))
 			related.ObservedValue += float64(index+1) / 100
 			signal, run, created, err := store.IngestSignal(related)
 			aggregationResults <- result{signal: signal, run: run, created: created, err: err}
@@ -238,7 +241,7 @@ func TestEvolutionSignalReplayAndAggregationSurviveStoreReopen(t *testing.T) {
 
 	now = now.Add(time.Hour)
 	related := input
-	related.IdempotencyKey = "durable-related"
+	related.IdempotencyKey = testEvolutionRequestID("durable-related")
 	related.ObservedAt = now
 	related.ObservedValue = 0.41
 	_, aggregatedRun, created, err := store.IngestSignal(related)
@@ -281,6 +284,77 @@ func TestEvolutionSignalEventFailureRollsBackSignalRunAndMapping(t *testing.T) {
 	}
 }
 
+func TestEvolutionSignalAggregationEventFailureRollsBackEveryMutation(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
+	clock := func() time.Time { return now }
+	seedStore, err := OpenEvolutionControlStore(root, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := validEvolutionSignalInput("aggregate-rollback-agent")
+	agent.ObservedAt = now
+	_, originalRun, _, err := seedStore.IngestSignal(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := cloneEvolutionRun(originalRun)
+	if err := seedStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := errors.New("aggregate event insert failed")
+	seenEvent := make(chan EvolutionEvent, 1)
+	failingStore, err := openEvolutionControlStoreWithOptions(root, clock, evolutionStoreOpenOptions{
+		hooks: evolutionStoreHooks{
+			beforeEventInsert: func(event EvolutionEvent) error {
+				seenEvent <- event
+				return injected
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Minute)
+	knowledge := validEvolutionKnowledgeSignalInput("aggregate-rollback-knowledge", testEvolutionReleaseID("6"), agent.PackageID)
+	knowledge.ObservedAt = now
+	if _, _, _, err := failingStore.IngestSignal(knowledge); !errors.Is(err, injected) {
+		t.Fatalf("aggregate ingest error = %v", err)
+	}
+	event := <-seenEvent
+	if event.EventType != "signal_aggregated" || event.RunID != originalRun.RunID {
+		t.Fatalf("failure hook did not observe aggregate path: %#v", event)
+	}
+	if err := failingStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenEvolutionControlStore(root, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	after, err := reopened.LoadRun(originalRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("aggregate rollback changed run:\nafter:  %#v\nbefore: %#v", after, before)
+	}
+	assertEvolutionSignalCounts(t, reopened, 1, 1, 1)
+	var signals, mappings int
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM evolution_signals WHERE idempotency_key = ?`, knowledge.IdempotencyKey).Scan(&signals); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM evolution_events WHERE event_id = ?`, evolutionSignalRequestEventID(knowledge.IdempotencyKey)).Scan(&mappings); err != nil {
+		t.Fatal(err)
+	}
+	if signals != 0 || mappings != 0 {
+		t.Fatalf("rolled-back signal/mapping counts = %d/%d", signals, mappings)
+	}
+}
+
 func TestEvolutionSignalTerminalRunIsNotReopened(t *testing.T) {
 	now := time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC)
 	store := newEvolutionSignalTestStore(t, func() time.Time { return now })
@@ -295,7 +369,7 @@ func TestEvolutionSignalTerminalRunIsNotReopened(t *testing.T) {
 	}
 
 	now = now.Add(time.Minute)
-	input.IdempotencyKey = "terminal-second"
+	input.IdempotencyKey = testEvolutionRequestID("terminal-second")
 	input.ObservedAt = now
 	_, nextRun, _, err := store.IngestSignal(input)
 	if err != nil {
@@ -320,17 +394,18 @@ func TestEvolutionSignalRelatedAgentAndKnowledgeBecomeCombined(t *testing.T) {
 	}
 
 	now = now.Add(time.Minute)
+	releaseID := testEvolutionReleaseID("f")
 	knowledge := EvolutionSignalInput{
-		IdempotencyKey: "combined-knowledge",
+		IdempotencyKey: testEvolutionRequestID("combined-knowledge"),
 		SignalType:     EvolutionSignalReleaseStale,
 		SourceType:     EvolutionSignalSourceKnowledgeStore,
-		SourceID:       "release-2026-08",
+		SourceID:       releaseID,
 		PackageID:      agent.PackageID,
-		ReleaseID:      "release-2026-08",
+		ReleaseID:      releaseID,
 		Severity:       EvolutionSignalSeverityHigh,
 		ObservedValue:  31,
 		BaselineValue:  30,
-		EvidenceRefs:   []string{"release:release-2026-08"},
+		EvidenceRefs:   []string{"release:" + releaseID},
 		ObservedAt:     now,
 	}
 	knowledgeSignal, combined, created, err := store.IngestSignal(knowledge)
@@ -343,7 +418,7 @@ func TestEvolutionSignalRelatedAgentAndKnowledgeBecomeCombined(t *testing.T) {
 	if got, want := fmt.Sprint(combined.TriggerSignalIDs), fmt.Sprint([]string{agentSignal.SignalID, knowledgeSignal.SignalID}); got != want {
 		t.Fatalf("trigger IDs = %s, want %s", got, want)
 	}
-	if got := fmt.Sprint(combined.BaselineReleaseIDs); got != "[release-2026-08]" {
+	if got := fmt.Sprint(combined.BaselineReleaseIDs); got != fmt.Sprintf("[%s]", releaseID) {
 		t.Fatalf("release identity = %s", got)
 	}
 }
@@ -358,7 +433,7 @@ func TestEvolutionSignalUnrelatedIdentitiesDoNotAggregateOrCombine(t *testing.T)
 		t.Fatal(err)
 	}
 	secondAgent := firstAgent
-	secondAgent.IdempotencyKey = "identity-agent-b"
+	secondAgent.IdempotencyKey = testEvolutionRequestID("identity-agent-b")
 	secondAgent.PackageID = "different-agent"
 	_, agentRunB, _, err := store.IngestSignal(secondAgent)
 	if err != nil {
@@ -368,13 +443,13 @@ func TestEvolutionSignalUnrelatedIdentitiesDoNotAggregateOrCombine(t *testing.T)
 		t.Fatalf("different packages aggregated: %#v / %#v", agentRunA, agentRunB)
 	}
 
-	knowledgeA := validEvolutionKnowledgeSignalInput("identity-release-a", "release-a", "knowledge-agent")
+	knowledgeA := validEvolutionKnowledgeSignalInput("identity-release-a", testEvolutionReleaseID("1"), "knowledge-agent")
 	knowledgeA.ObservedAt = now
 	_, knowledgeRunA, _, err := store.IngestSignal(knowledgeA)
 	if err != nil {
 		t.Fatal(err)
 	}
-	knowledgeB := validEvolutionKnowledgeSignalInput("identity-release-b", "release-b", "knowledge-agent")
+	knowledgeB := validEvolutionKnowledgeSignalInput("identity-release-b", testEvolutionReleaseID("2"), "knowledge-agent")
 	knowledgeB.ObservedAt = now
 	_, knowledgeRunB, _, err := store.IngestSignal(knowledgeB)
 	if err != nil {
@@ -463,6 +538,7 @@ func TestEvolutionSignalRejectsUnboundedOrSensitiveInputs(t *testing.T) {
 		{name: "model output source", mutate: func(input *EvolutionSignalInput) { input.SourceType = "model_output" }},
 		{name: "unknown signal", mutate: func(input *EvolutionSignalInput) { input.SignalType = "arbitrary_prompt" }},
 		{name: "sensitive idempotency", mutate: func(input *EvolutionSignalInput) { input.IdempotencyKey = "token=private-value" }},
+		{name: "free form idempotency", mutate: func(input *EvolutionSignalInput) { input.IdempotencyKey = "request-one" }},
 		{name: "api key source", mutate: func(input *EvolutionSignalInput) { input.SourceID = "api_key=abc123" }},
 		{name: "private answer source", mutate: func(input *EvolutionSignalInput) { input.SourceID = "private_user_answer" }},
 		{name: "user answer source", mutate: func(input *EvolutionSignalInput) { input.SourceID = "user-answer" }},
@@ -470,10 +546,10 @@ func TestEvolutionSignalRejectsUnboundedOrSensitiveInputs(t *testing.T) {
 		{name: "api key trace evidence", mutate: func(input *EvolutionSignalInput) { input.EvidenceRefs = []string{"trace:api_key=abc123"} }},
 		{name: "arbitrary metric evidence", mutate: func(input *EvolutionSignalInput) { input.EvidenceRefs = []string{"metric:user_answer"} }},
 		{name: "release evidence mismatch", mutate: func(input *EvolutionSignalInput) {
-			input.ReleaseID = "release-a"
-			input.EvidenceRefs = []string{"release:release-b"}
+			input.ReleaseID = testEvolutionReleaseID("3")
+			input.EvidenceRefs = []string{"release:" + testEvolutionReleaseID("4")}
 		}},
-		{name: "secret package identity", mutate: func(input *EvolutionSignalInput) { input.PackageID = "access-token-value" }},
+		{name: "malformed package identity", mutate: func(input *EvolutionSignalInput) { input.PackageID = "api_key=abc123" }},
 		{name: "secret release identity", mutate: func(input *EvolutionSignalInput) { input.ReleaseID = "session_cookie_value" }},
 	}
 	for _, test := range tests {
@@ -488,6 +564,46 @@ func TestEvolutionSignalRejectsUnboundedOrSensitiveInputs(t *testing.T) {
 	assertEvolutionSignalCounts(t, store, 0, 0, 0)
 }
 
+func TestEvolutionSignalKnowledgeReleaseIdentityUsesProductionFormat(t *testing.T) {
+	validReleaseID := testEvolutionReleaseID("a")
+	valid := validEvolutionKnowledgeSignalInput("release-format-valid", validReleaseID, "knowledge-agent")
+	store := newEvolutionTestStore(t)
+	if _, _, created, err := store.IngestSignal(valid); err != nil || !created {
+		t.Fatalf("valid production release identity = %v, %v", created, err)
+	}
+
+	invalidReleaseIDs := []struct {
+		name      string
+		releaseID string
+	}{
+		{name: "matching private body", releaseID: "private_user_answer"},
+		{name: "uppercase digest", releaseID: "release-" + strings.Repeat("A", 64)},
+		{name: "short digest", releaseID: "release-abc123"},
+		{name: "non hex digest", releaseID: "release-" + strings.Repeat("g", 64)},
+	}
+	for _, test := range invalidReleaseIDs {
+		t.Run(test.name, func(t *testing.T) {
+			input := validEvolutionKnowledgeSignalInput("release-format-"+test.name, test.releaseID, "knowledge-agent")
+			if _, _, _, err := store.IngestSignal(input); err == nil {
+				t.Fatalf("invalid release identity %q was accepted", test.releaseID)
+			}
+		})
+	}
+}
+
+func TestEvolutionSignalAllowsHumanReadableDomainPackageIdentities(t *testing.T) {
+	store := newEvolutionTestStore(t)
+	for _, packageID := range []string{"token-economics-agent", "session-analysis-agent", "cookie-policy-research"} {
+		t.Run(packageID, func(t *testing.T) {
+			input := validEvolutionSignalInput("domain-package-" + packageID)
+			input.PackageID = packageID
+			if _, _, created, err := store.IngestSignal(input); err != nil || !created {
+				t.Fatalf("domain package identity = %v, %v", created, err)
+			}
+		})
+	}
+}
+
 func TestEvolutionSignalAcceptsStructuredSourceAndEvidenceReferences(t *testing.T) {
 	store := newEvolutionTestStore(t)
 	input := validEvolutionSignalInput("structured-evidence")
@@ -500,7 +616,7 @@ func TestEvolutionSignalAcceptsStructuredSourceAndEvidenceReferences(t *testing.
 		t.Fatalf("structured evidence = %v, %v", created, err)
 	}
 
-	knowledge := validEvolutionKnowledgeSignalInput("structured-release", "release-2026-08", "knowledge-agent")
+	knowledge := validEvolutionKnowledgeSignalInput("structured-release", testEvolutionReleaseID("5"), "knowledge-agent")
 	if _, _, created, err := store.IngestSignal(knowledge); err != nil || !created {
 		t.Fatalf("related release evidence = %v, %v", created, err)
 	}
@@ -573,7 +689,7 @@ func TestEvolutionOverviewUsesRunIDAsFinalStableTieBreak(t *testing.T) {
 
 func validEvolutionSignalInput(key string) EvolutionSignalInput {
 	return EvolutionSignalInput{
-		IdempotencyKey: key,
+		IdempotencyKey: testEvolutionRequestID(key),
 		SignalType:     EvolutionSignalRegressionFailure,
 		SourceType:     EvolutionSignalSourceEvaluation,
 		SourceID:       testEvolutionOpaqueID("a"),
@@ -588,7 +704,7 @@ func validEvolutionSignalInput(key string) EvolutionSignalInput {
 
 func validEvolutionKnowledgeSignalInput(key, releaseID, packageID string) EvolutionSignalInput {
 	return EvolutionSignalInput{
-		IdempotencyKey: key,
+		IdempotencyKey: testEvolutionRequestID(key),
 		SignalType:     EvolutionSignalReleaseStale,
 		SourceType:     EvolutionSignalSourceKnowledgeStore,
 		SourceID:       releaseID,
@@ -604,6 +720,15 @@ func validEvolutionKnowledgeSignalInput(key, releaseID, packageID string) Evolut
 
 func testEvolutionOpaqueID(character string) string {
 	return "sha256:" + strings.Repeat(character, 64)
+}
+
+func testEvolutionRequestID(label string) string {
+	digest := sha256.Sum256([]byte(label))
+	return "sha256:" + hex.EncodeToString(digest[:])
+}
+
+func testEvolutionReleaseID(character string) string {
+	return "release-" + strings.Repeat(character, 64)
 }
 
 func newEvolutionSignalTestStore(t *testing.T, now func() time.Time) *EvolutionControlStore {

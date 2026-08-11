@@ -268,8 +268,8 @@ func normalizeEvolutionSignalInput(input EvolutionSignalInput) (normalizedEvolut
 	if err := validateEvolutionReference("idempotency_key", normalized.IdempotencyKey); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
-	if err := rejectSensitiveEvolutionSignalToken("idempotency_key", normalized.IdempotencyKey); err != nil {
-		return normalizedEvolutionSignalInput{}, "", "", "", err
+	if !isEvolutionOpaqueID(normalized.IdempotencyKey) {
+		return normalizedEvolutionSignalInput{}, "", "", "", fmt.Errorf("idempotency_key must be a canonical UUID or sha256 identity")
 	}
 	if !isAllowedEvolutionSignalType(normalized.SignalType) {
 		return normalizedEvolutionSignalInput{}, "", "", "", fmt.Errorf("unsupported evolution signal_type %q", normalized.SignalType)
@@ -283,19 +283,16 @@ func normalizeEvolutionSignalInput(input EvolutionSignalInput) (normalizedEvolut
 	if err := validateEvolutionIdentity("source_id", normalized.SourceID); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
 	}
-	for _, field := range []evolutionStringField{
-		{name: "source_id", value: normalized.SourceID},
-		{name: "package_id", value: normalized.PackageID},
-		{name: "release_id", value: normalized.ReleaseID},
-	} {
-		if field.value != "" {
-			if err := validateEvolutionIdentity(field.name, field.value); err != nil {
-				return normalizedEvolutionSignalInput{}, "", "", "", err
-			}
-			if err := rejectSensitiveEvolutionSignalToken(field.name, field.value); err != nil {
-				return normalizedEvolutionSignalInput{}, "", "", "", err
-			}
+	if err := validateEvolutionIdentity("source_id", normalized.SourceID); err != nil {
+		return normalizedEvolutionSignalInput{}, "", "", "", err
+	}
+	if normalized.PackageID != "" {
+		if err := validateEvolutionPackageID(normalized.PackageID); err != nil {
+			return normalizedEvolutionSignalInput{}, "", "", "", err
 		}
+	}
+	if normalized.ReleaseID != "" && !isEvolutionKnowledgeReleaseID(normalized.ReleaseID) {
+		return normalizedEvolutionSignalInput{}, "", "", "", fmt.Errorf("release_id must use release-<64 lowercase hex> format")
 	}
 	if err := validateEvolutionSignalSourceID(normalized.SourceType, normalized.SourceID, normalized.ReleaseID); err != nil {
 		return normalizedEvolutionSignalInput{}, "", "", "", err
@@ -908,9 +905,6 @@ func validateEvolutionSignalEvidenceRefs(input normalizedEvolutionSignalInput) e
 		if strings.Contains(ref, "?") || strings.Contains(ref, "//") {
 			return fmt.Errorf("evidence_refs[%d] must not contain paths or URL queries", index)
 		}
-		if err := rejectSensitiveEvolutionSignalToken(fmt.Sprintf("evidence_refs[%d]", index), ref); err != nil {
-			return err
-		}
 		kind, identity, found := strings.Cut(ref, ":")
 		if !found || identity == "" {
 			return fmt.Errorf("evidence_refs[%d] has unsupported reference syntax", index)
@@ -925,35 +919,11 @@ func validateEvolutionSignalEvidenceRefs(input normalizedEvolutionSignalInput) e
 				return fmt.Errorf("evidence_refs[%d] requires an opaque identity", index)
 			}
 		case "release":
-			if input.ReleaseID == "" || identity != input.ReleaseID {
+			if input.ReleaseID == "" || !isEvolutionKnowledgeReleaseID(identity) || identity != input.ReleaseID {
 				return fmt.Errorf("evidence_refs[%d] must match release_id", index)
 			}
 		default:
 			return fmt.Errorf("evidence_refs[%d] has unsupported reference type", index)
-		}
-	}
-	return nil
-}
-
-func rejectSensitiveEvolutionSignalToken(field, value string) error {
-	lower := strings.ToLower(value)
-	windowsAbsolute := len(value) >= 3 && value[1] == ':' && value[2] == '/' &&
-		((value[0] >= 'a' && value[0] <= 'z') || (value[0] >= 'A' && value[0] <= 'Z'))
-	if strings.HasPrefix(value, "/") || strings.HasPrefix(value, "~/") || windowsAbsolute ||
-		strings.Contains(lower, "file:") || strings.Contains(lower, "://") {
-		return fmt.Errorf("%s must not contain an absolute filesystem path", field)
-	}
-	var compactBuilder strings.Builder
-	compactBuilder.Grow(len(lower))
-	for _, character := range lower {
-		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
-			compactBuilder.WriteRune(character)
-		}
-	}
-	compact := compactBuilder.String()
-	for _, marker := range []string{"apikey", "accesstoken", "token", "bearer", "authorization", "password", "passwd", "privatekey", "session", "cookie", "secret"} {
-		if strings.Contains(compact, marker) {
-			return fmt.Errorf("%s contains sensitive material", field)
 		}
 	}
 	return nil
@@ -968,6 +938,25 @@ func isEvolutionOpaqueID(value string) bool {
 		return false
 	}
 	return isEvolutionLowerHex(strings.ReplaceAll(value, "-", ""))
+}
+
+func validateEvolutionPackageID(packageID string) error {
+	if err := validateEvolutionIdentity("package_id", packageID); err != nil {
+		return err
+	}
+	if !agentPackageIDPattern.MatchString(packageID) {
+		return fmt.Errorf("package_id must contain only URL-safe letters, digits, dot, underscore, or hyphen")
+	}
+	return nil
+}
+
+func isEvolutionKnowledgeReleaseID(releaseID string) bool {
+	const prefix = "release-"
+	if !strings.HasPrefix(releaseID, prefix) {
+		return false
+	}
+	digest := strings.TrimPrefix(releaseID, prefix)
+	return len(digest) == sha256.Size*2 && isEvolutionLowerHex(digest)
 }
 
 func isEvolutionLowerHex(value string) bool {
