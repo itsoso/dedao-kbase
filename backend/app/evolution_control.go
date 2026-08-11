@@ -2,6 +2,8 @@ package app
 
 import (
 	"fmt"
+	"math"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -33,6 +35,11 @@ const (
 	EvolutionChangeSummaryMaxRunes  = 1_000
 	EvolutionApprovalNoteMaxRunes   = 1_000
 	EvolutionEventMessageMaxRunes   = 512
+	EvolutionIdentityMaxRunes       = 256
+	EvolutionCodeMaxRunes           = 64
+	EvolutionReferenceMaxRunes      = 512
+	EvolutionCollectionMaxItems     = 64
+	EvolutionMetricMaxItems         = 64
 )
 
 type EvolutionSignal struct {
@@ -102,6 +109,7 @@ type EvolutionApproval struct {
 	CandidateID          string `json:"candidate_id"`
 	CandidateContentHash string `json:"candidate_content_hash"`
 	BaselineIdentity     string `json:"baseline_identity"`
+	ScorecardID          string `json:"scorecard_id"`
 	Decision             string `json:"decision"`
 	ReasonCode           string `json:"reason_code"`
 	Note                 string `json:"note"`
@@ -126,6 +134,7 @@ type EvolutionEvent struct {
 	EventID      string             `json:"event_id"`
 	RunID        string             `json:"run_id"`
 	EventType    string             `json:"event_type"`
+	Actor        string             `json:"actor"`
 	FromStatus   EvolutionRunStatus `json:"from_status"`
 	ToStatus     EvolutionRunStatus `json:"to_status"`
 	Code         string             `json:"code"`
@@ -168,24 +177,46 @@ func ValidateEvolutionTransition(from, to EvolutionRunStatus) error {
 }
 
 func NewEvolutionRetry(original EvolutionRun, newRunID string, now time.Time) (EvolutionRun, error) {
-	if newRunID == "" {
+	originalRunID := strings.TrimSpace(original.RunID)
+	retryRunID := strings.TrimSpace(newRunID)
+	if originalRunID == "" {
+		return EvolutionRun{}, fmt.Errorf("original run_id is required")
+	}
+	if retryRunID == "" {
 		return EvolutionRun{}, fmt.Errorf("new run_id is required")
 	}
-	if newRunID == original.RunID {
+	if retryRunID == originalRunID {
 		return EvolutionRun{}, fmt.Errorf("retry run_id must differ from original run_id")
 	}
 	if !isEvolutionRetryableStatus(original.Status) {
 		return EvolutionRun{}, fmt.Errorf("evolution run status %q cannot be retried", original.Status)
 	}
+	if original.Attempt < 0 {
+		return EvolutionRun{}, fmt.Errorf("attempt cannot be negative")
+	}
+	if original.Attempt == int(^uint(0)>>1) {
+		return EvolutionRun{}, fmt.Errorf("attempt cannot be incremented")
+	}
+	if now.IsZero() {
+		return EvolutionRun{}, fmt.Errorf("retry time is required")
+	}
+
+	normalizedOriginal := original
+	normalizedOriginal.RunID = originalRunID
 	previousAttempt := original.Attempt
 	if previousAttempt == 0 {
+		// Records created before attempt tracking represent their first attempt.
 		previousAttempt = 1
+		normalizedOriginal.Attempt = 1
+	}
+	if err := normalizedOriginal.Validate(); err != nil {
+		return EvolutionRun{}, fmt.Errorf("original evolution run: %w", err)
 	}
 	timestamp := now.UTC().Format(time.RFC3339Nano)
-	return EvolutionRun{
-		RunID:                  newRunID,
+	retry := EvolutionRun{
+		RunID:                  retryRunID,
 		Attempt:                previousAttempt + 1,
-		RetryOfRunID:           original.RunID,
+		RetryOfRunID:           originalRunID,
 		RunType:                original.RunType,
 		PackageID:              original.PackageID,
 		BaselinePackageVersion: original.BaselinePackageVersion,
@@ -196,35 +227,272 @@ func NewEvolutionRetry(original EvolutionRun, newRunID string, now time.Time) (E
 		TriggerSignalIDs:       append([]string(nil), original.TriggerSignalIDs...),
 		CreatedAt:              timestamp,
 		UpdatedAt:              timestamp,
-	}, nil
+	}
+	if err := retry.Validate(); err != nil {
+		return EvolutionRun{}, fmt.Errorf("retry evolution run: %w", err)
+	}
+	return retry, nil
+}
+
+func (signal EvolutionSignal) Validate() error {
+	for field, value := range map[string]string{
+		"source_id":  signal.SourceID,
+		"package_id": signal.PackageID,
+		"release_id": signal.ReleaseID,
+	} {
+		if value != "" {
+			if err := validateEvolutionIdentity(field, value); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateEvolutionIdentity("signal_id", signal.SignalID); err != nil {
+		return err
+	}
+	if signal.SourceID == "" && signal.PackageID == "" && signal.ReleaseID == "" {
+		return fmt.Errorf("signal requires an affected identity")
+	}
+	for field, value := range map[string]string{
+		"signal_type": signal.SignalType,
+		"source_type": signal.SourceType,
+		"severity":    signal.Severity,
+	} {
+		if err := validateEvolutionCode(field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionReference("deduplication_key", signal.DeduplicationKey); err != nil {
+		return err
+	}
+	if err := validateEvolutionReferences("evidence_refs", signal.EvidenceRefs, true); err != nil {
+		return err
+	}
+	if err := validateEvolutionNumber("observed_value", signal.ObservedValue); err != nil {
+		return err
+	}
+	if err := validateEvolutionNumber("baseline_value", signal.BaselineValue); err != nil {
+		return err
+	}
+	return validateEvolutionTimestamp("observed_at", signal.ObservedAt)
 }
 
 func (run EvolutionRun) Validate() error {
+	if err := validateEvolutionIdentity("run_id", run.RunID); err != nil {
+		return err
+	}
+	if run.Attempt < 1 {
+		return fmt.Errorf("attempt must be at least 1")
+	}
+	if run.Attempt > 1 {
+		if err := validateEvolutionIdentity("retry_of_run_id", run.RetryOfRunID); err != nil {
+			return err
+		}
+	} else if run.RetryOfRunID != "" {
+		if err := validateEvolutionIdentity("retry_of_run_id", run.RetryOfRunID); err != nil {
+			return err
+		}
+	}
 	if !isKnownEvolutionRunType(run.RunType) {
 		return fmt.Errorf("unknown evolution run type %q", run.RunType)
+	}
+	if err := validateEvolutionRunScope(run); err != nil {
+		return err
+	}
+	if err := validateEvolutionCode("risk_level", run.RiskLevel); err != nil {
+		return err
+	}
+	if err := validateEvolutionNumber("priority_score", run.PriorityScore); err != nil {
+		return err
 	}
 	if !isKnownEvolutionRunStatus(run.Status) {
 		return fmt.Errorf("unknown evolution run status %q", run.Status)
 	}
-	return validateEvolutionText("failure_message", run.FailureMessage, EvolutionFailureMessageMaxRunes)
+	if err := validateEvolutionReferences("trigger_signal_ids", run.TriggerSignalIDs, true); err != nil {
+		return err
+	}
+	if run.CurrentCandidateID != "" {
+		if err := validateEvolutionIdentity("current_candidate_id", run.CurrentCandidateID); err != nil {
+			return err
+		}
+	}
+	if run.FailureCode != "" {
+		if err := validateEvolutionCode("failure_code", run.FailureCode); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionText("failure_message", run.FailureMessage, EvolutionFailureMessageMaxRunes); err != nil {
+		return err
+	}
+	if err := validateEvolutionTimestamp("created_at", run.CreatedAt); err != nil {
+		return err
+	}
+	return validateEvolutionTimestamp("updated_at", run.UpdatedAt)
 }
 
 func (candidate EvolutionCandidate) Validate() error {
-	return validateEvolutionText("change_summary", candidate.ChangeSummary, EvolutionChangeSummaryMaxRunes)
+	for field, value := range map[string]string{
+		"candidate_id":      candidate.CandidateID,
+		"run_id":            candidate.RunID,
+		"generator_version": candidate.GeneratorVersion,
+	} {
+		if err := validateEvolutionIdentity(field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionCode("candidate_type", candidate.CandidateType); err != nil {
+		return err
+	}
+	for field, value := range map[string]string{
+		"content_hash":      candidate.ContentHash,
+		"artifact_ref":      candidate.ArtifactRef,
+		"baseline_identity": candidate.BaselineIdentity,
+	} {
+		if err := validateEvolutionReference(field, value); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(candidate.ChangeSummary) == "" {
+		return fmt.Errorf("change_summary is required")
+	}
+	if err := validateEvolutionText("change_summary", candidate.ChangeSummary, EvolutionChangeSummaryMaxRunes); err != nil {
+		return err
+	}
+	return validateEvolutionTimestamp("created_at", candidate.CreatedAt)
+}
+
+func (scorecard EvolutionScorecard) Validate() error {
+	for field, value := range map[string]string{
+		"scorecard_id":   scorecard.ScorecardID,
+		"candidate_id":   scorecard.CandidateID,
+		"suite_version":  scorecard.SuiteVersion,
+		"scorer_version": scorecard.ScorerVersion,
+	} {
+		if err := validateEvolutionIdentity(field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionReference("baseline_identity", scorecard.BaselineIdentity); err != nil {
+		return err
+	}
+	if err := validateEvolutionCode("decision", scorecard.Decision); err != nil {
+		return err
+	}
+	if err := validateEvolutionHardGates(scorecard.HardGates); err != nil {
+		return err
+	}
+	if err := validateEvolutionMetrics("metrics", scorecard.Metrics, true); err != nil {
+		return err
+	}
+	for field, value := range map[string]float64{
+		"weighted_score": scorecard.WeightedScore,
+		"baseline_score": scorecard.BaselineScore,
+		"delta":          scorecard.Delta,
+	} {
+		if err := validateEvolutionNumber(field, value); err != nil {
+			return err
+		}
+	}
+	return validateEvolutionReferences("failure_case_refs", scorecard.FailureCaseRefs, false)
 }
 
 func (approval EvolutionApproval) Validate() error {
-	return validateEvolutionText("note", approval.Note, EvolutionApprovalNoteMaxRunes)
+	for field, value := range map[string]string{
+		"approval_id":  approval.ApprovalID,
+		"run_id":       approval.RunID,
+		"candidate_id": approval.CandidateID,
+		"scorecard_id": approval.ScorecardID,
+		"approved_by":  approval.ApprovedBy,
+	} {
+		if err := validateEvolutionIdentity(field, value); err != nil {
+			return err
+		}
+	}
+	for field, value := range map[string]string{
+		"candidate_content_hash": approval.CandidateContentHash,
+		"baseline_identity":      approval.BaselineIdentity,
+	} {
+		if err := validateEvolutionReference(field, value); err != nil {
+			return err
+		}
+	}
+	for field, value := range map[string]string{
+		"decision":    approval.Decision,
+		"reason_code": approval.ReasonCode,
+	} {
+		if err := validateEvolutionCode(field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionText("note", approval.Note, EvolutionApprovalNoteMaxRunes); err != nil {
+		return err
+	}
+	if err := validateEvolutionTimestamp("created_at", approval.CreatedAt); err != nil {
+		return err
+	}
+	return validateEvolutionTimestamp("expires_at", approval.ExpiresAt)
+}
+
+func (observation EvolutionObservation) Validate() error {
+	for field, value := range map[string]string{
+		"observation_id": observation.ObservationID,
+		"run_id":         observation.RunID,
+	} {
+		if err := validateEvolutionIdentity(field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionReference("published_identity", observation.PublishedIdentity); err != nil {
+		return err
+	}
+	if observation.RollbackIdentity != "" {
+		if err := validateEvolutionReference("rollback_identity", observation.RollbackIdentity); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionTimestamp("window_start", observation.WindowStart); err != nil {
+		return err
+	}
+	if err := validateEvolutionTimestamp("window_end", observation.WindowEnd); err != nil {
+		return err
+	}
+	if err := validateEvolutionMetrics("metrics", observation.Metrics, true); err != nil {
+		return err
+	}
+	if err := validateEvolutionReferences("hard_gate_incidents", observation.HardGateIncidents, false); err != nil {
+		return err
+	}
+	return validateEvolutionCode("outcome", observation.Outcome)
 }
 
 func (event EvolutionEvent) Validate() error {
+	for field, value := range map[string]string{
+		"event_id": event.EventID,
+		"run_id":   event.RunID,
+		"actor":    event.Actor,
+	} {
+		if err := validateEvolutionIdentity(field, value); err != nil {
+			return err
+		}
+	}
+	if err := validateEvolutionCode("event_type", event.EventType); err != nil {
+		return err
+	}
 	if event.FromStatus != "" && !isKnownEvolutionRunStatus(event.FromStatus) {
 		return fmt.Errorf("unknown evolution run status %q", event.FromStatus)
 	}
-	if event.ToStatus != "" && !isKnownEvolutionRunStatus(event.ToStatus) {
+	if !isKnownEvolutionRunStatus(event.ToStatus) {
 		return fmt.Errorf("unknown evolution run status %q", event.ToStatus)
 	}
-	return validateEvolutionText("message", event.Message, EvolutionEventMessageMaxRunes)
+	if err := validateEvolutionCode("code", event.Code); err != nil {
+		return err
+	}
+	if err := validateEvolutionText("message", event.Message, EvolutionEventMessageMaxRunes); err != nil {
+		return err
+	}
+	if err := validateEvolutionReferences("artifact_refs", event.ArtifactRefs, false); err != nil {
+		return err
+	}
+	return validateEvolutionTimestamp("created_at", event.CreatedAt)
 }
 
 func isKnownEvolutionRunStatus(status EvolutionRunStatus) bool {
@@ -276,7 +544,157 @@ func isEvolutionRetryableStatus(status EvolutionRunStatus) bool {
 	}
 }
 
+func validateEvolutionRunScope(run EvolutionRun) error {
+	validatePackage := func() error {
+		if err := validateEvolutionIdentity("package_id", run.PackageID); err != nil {
+			return err
+		}
+		return validateEvolutionIdentity("baseline_package_version", run.BaselinePackageVersion)
+	}
+	validateReleases := func(required bool) error {
+		return validateEvolutionReferences("baseline_release_ids", run.BaselineReleaseIDs, required)
+	}
+
+	switch run.RunType {
+	case EvolutionRunAgentPolicy:
+		if err := validatePackage(); err != nil {
+			return err
+		}
+		return validateReleases(false)
+	case EvolutionRunKnowledgeRelease:
+		if run.PackageID != "" {
+			if err := validateEvolutionIdentity("package_id", run.PackageID); err != nil {
+				return err
+			}
+		}
+		if run.BaselinePackageVersion != "" {
+			if err := validateEvolutionIdentity("baseline_package_version", run.BaselinePackageVersion); err != nil {
+				return err
+			}
+		}
+		return validateReleases(true)
+	case EvolutionRunCombined:
+		if err := validatePackage(); err != nil {
+			return err
+		}
+		return validateReleases(true)
+	default:
+		return fmt.Errorf("unknown evolution run type %q", run.RunType)
+	}
+}
+
+func validateEvolutionIdentity(field, value string) error {
+	return validateEvolutionToken(field, value, EvolutionIdentityMaxRunes)
+}
+
+func validateEvolutionCode(field, value string) error {
+	return validateEvolutionToken(field, value, EvolutionCodeMaxRunes)
+}
+
+func validateEvolutionReference(field, value string) error {
+	return validateEvolutionToken(field, value, EvolutionReferenceMaxRunes)
+}
+
+func validateEvolutionToken(field, value string, maxRunes int) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	if strings.TrimSpace(value) != value {
+		return fmt.Errorf("%s must not contain surrounding whitespace", field)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s must be valid UTF-8", field)
+	}
+	if utf8.RuneCountInString(value) > maxRunes {
+		return fmt.Errorf("%s exceeds %d characters", field, maxRunes)
+	}
+	for _, character := range value {
+		if !isEvolutionTokenCharacter(character) {
+			return fmt.Errorf("%s contains unsupported characters", field)
+		}
+	}
+	return nil
+}
+
+func isEvolutionTokenCharacter(character rune) bool {
+	if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character >= '0' && character <= '9' {
+		return true
+	}
+	switch character {
+	case '_', '-', '.', ':', '/', '@', '+', '#', '?', '=', '&', '%':
+		return true
+	default:
+		return false
+	}
+}
+
+func validateEvolutionReferences(field string, values []string, required bool) error {
+	if required && len(values) == 0 {
+		return fmt.Errorf("%s is required", field)
+	}
+	if len(values) > EvolutionCollectionMaxItems {
+		return fmt.Errorf("%s exceeds %d items", field, EvolutionCollectionMaxItems)
+	}
+	for index, value := range values {
+		if err := validateEvolutionReference(fmt.Sprintf("%s[%d]", field, index), value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvolutionHardGates(gates map[string]bool) error {
+	if len(gates) == 0 {
+		return fmt.Errorf("hard_gates is required")
+	}
+	if len(gates) > EvolutionMetricMaxItems {
+		return fmt.Errorf("hard_gates exceeds %d items", EvolutionMetricMaxItems)
+	}
+	for name := range gates {
+		if err := validateEvolutionCode("hard_gates key", name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvolutionMetrics(field string, metrics map[string]float64, required bool) error {
+	if required && len(metrics) == 0 {
+		return fmt.Errorf("%s is required", field)
+	}
+	if len(metrics) > EvolutionMetricMaxItems {
+		return fmt.Errorf("%s exceeds %d items", field, EvolutionMetricMaxItems)
+	}
+	for name, value := range metrics {
+		if err := validateEvolutionCode(field+" key", name); err != nil {
+			return err
+		}
+		if err := validateEvolutionNumber(field+" value", value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvolutionNumber(field string, value float64) error {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("%s must be finite", field)
+	}
+	return nil
+}
+
+func validateEvolutionTimestamp(field, value string) error {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.IsZero() {
+		return fmt.Errorf("%s must be a non-zero RFC3339 timestamp", field)
+	}
+	return nil
+}
+
 func validateEvolutionText(field, value string, maxRunes int) error {
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s must be valid UTF-8", field)
+	}
 	if utf8.RuneCountInString(value) > maxRunes {
 		return fmt.Errorf("%s exceeds %d characters", field, maxRunes)
 	}
