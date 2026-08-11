@@ -225,9 +225,6 @@ func (s *EvolutionControlStore) EnqueueEvolutionWork(input EvolutionWorkInput) (
 		return nil, false, wrapEvolutionSQLiteWriteError("begin enqueue evolution work", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := rejectEvolutionTerminalRunTx(tx, normalized.RunID); err != nil {
-		return nil, false, err
-	}
 	existing, err := loadEvolutionWorkByIdempotencyKeyTx(tx, normalized.IdempotencyKey)
 	if err == nil {
 		if existing.inputHash != inputHash {
@@ -240,6 +237,9 @@ func (s *EvolutionControlStore) EnqueueEvolutionWork(input EvolutionWorkInput) (
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("find evolution work replay: %w", err)
+	}
+	if err := rejectEvolutionClosedRunTx(tx, normalized.RunID); err != nil {
+		return nil, false, err
 	}
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_work_items (
@@ -398,7 +398,7 @@ func (s *EvolutionControlStore) CompleteEvolutionWork(input EvolutionWorkComplet
 		}
 		return nil, false, ErrEvolutionIdempotencyConflict
 	}
-	if err := rejectEvolutionTerminalRunTx(tx, work.RunID); err != nil {
+	if err := rejectEvolutionClosedRunTx(tx, work.RunID); err != nil {
 		return nil, false, err
 	}
 	var existingResultWorkID string
@@ -656,9 +656,6 @@ func (s *EvolutionControlStore) EnqueueEvolutionOutbox(input EvolutionOutboxInpu
 		return nil, false, wrapEvolutionSQLiteWriteError("begin enqueue evolution outbox", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := rejectEvolutionTerminalRunTx(tx, normalized.RunID); err != nil {
-		return nil, false, err
-	}
 	existing, err := loadEvolutionOutboxByIdempotencyKeyTx(tx, normalized.IdempotencyKey)
 	if err == nil {
 		if existing.inputHash != inputHash {
@@ -671,6 +668,9 @@ func (s *EvolutionControlStore) EnqueueEvolutionOutbox(input EvolutionOutboxInpu
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("find evolution outbox replay: %w", err)
+	}
+	if err := rejectEvolutionClosedRunTx(tx, normalized.RunID); err != nil {
+		return nil, false, err
 	}
 	if hook := s.hooks.beforeOutboxInsert; hook != nil {
 		if err := hook(); err != nil {
@@ -1040,22 +1040,30 @@ func (s *EvolutionControlStore) blockEvolutionRunTx(tx *sql.Tx, runID, code, mes
 	return false, s.insertEventTx(tx, event)
 }
 
-func evolutionRunIsTerminalTx(tx *sql.Tx, runID string) (bool, error) {
+func evolutionRunStatusTx(tx *sql.Tx, runID string) (EvolutionRunStatus, error) {
 	var status EvolutionRunStatus
 	if err := tx.QueryRow(`SELECT status FROM evolution_runs WHERE run_id = ?`, runID).Scan(&status); errors.Is(err, sql.ErrNoRows) {
-		return false, ErrEvolutionRunNotFound
+		return "", ErrEvolutionRunNotFound
 	} else if err != nil {
-		return false, fmt.Errorf("load evolution run status: %w", err)
+		return "", fmt.Errorf("load evolution run status: %w", err)
+	}
+	return status, nil
+}
+
+func evolutionRunIsTerminalTx(tx *sql.Tx, runID string) (bool, error) {
+	status, err := evolutionRunStatusTx(tx, runID)
+	if err != nil {
+		return false, err
 	}
 	return isEvolutionTerminalStatus(status), nil
 }
 
-func rejectEvolutionTerminalRunTx(tx *sql.Tx, runID string) error {
-	terminal, err := evolutionRunIsTerminalTx(tx, runID)
+func rejectEvolutionClosedRunTx(tx *sql.Tx, runID string) error {
+	status, err := evolutionRunStatusTx(tx, runID)
 	if err != nil {
 		return err
 	}
-	if terminal {
+	if status == EvolutionBlocked || isEvolutionTerminalStatus(status) {
 		return ErrEvolutionTransitionConflict
 	}
 	return nil

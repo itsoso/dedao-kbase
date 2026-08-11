@@ -999,6 +999,78 @@ func TestEvolutionWorkerPendingWorkAndTerminalRunGuards(t *testing.T) {
 	}
 }
 
+func TestEvolutionWorkerBlockedRunRejectsNewWorkOutboxAndActiveCompletion(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	work := enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
+	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
+	if _, err := store.db.Exec(`UPDATE evolution_runs SET status = 'blocked' WHERE run_id = ?`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueEvolutionWork(EvolutionWorkInput{IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID, Capability: EvolutionCapabilityAgent, ArtifactRef: "artifact:sha256:" + workerHex('b'), MaxAttempts: 3}); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("enqueue work on blocked run error = %v", err)
+	}
+	if _, _, err := store.EnqueueEvolutionOutbox(EvolutionOutboxInput{IdempotencyKey: "33333333-3333-4333-8333-333333333333", RunID: run.RunID, Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('c'), MaxAttempts: 3}); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("enqueue outbox on blocked run error = %v", err)
+	}
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, Attempt: leased.Attempt, ResultIdempotencyKey: "44444444-4444-4444-8444-444444444444", ResultArtifactRef: "artifact:sha256:" + workerHex('d')}); !errors.Is(err, ErrEvolutionTransitionConflict) {
+		t.Fatalf("complete work on blocked run error = %v", err)
+	}
+	var status string
+	if err := store.db.QueryRow(`SELECT status FROM evolution_work_items WHERE work_id = ?`, work.WorkID).Scan(&status); err != nil || status != string(EvolutionWorkLeased) {
+		t.Fatalf("blocked completion work status = %q, %v", status, err)
+	}
+}
+
+func TestEvolutionWorkerClosedRunAllowsExactEnqueueReplayOnly(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "11111111-1111-4111-8111-111111111111")
+	workInput := EvolutionWorkInput{IdempotencyKey: "22222222-2222-4222-8222-222222222222", RunID: run.RunID, Capability: EvolutionCapabilityAgent, ArtifactRef: "artifact:sha256:" + workerHex('a'), MaxAttempts: 3}
+	work, created, err := store.EnqueueEvolutionWork(workInput)
+	if err != nil || !created {
+		t.Fatalf("enqueue work = %#v created=%v err=%v", work, created, err)
+	}
+	leased := leaseEvolutionWorkerTestWork(t, store, "worker-a")
+	if _, _, err := store.CompleteEvolutionWork(EvolutionWorkCompletion{WorkID: work.WorkID, WorkerID: leased.WorkerID, LeaseID: leased.LeaseID, Attempt: leased.Attempt, ResultIdempotencyKey: "33333333-3333-4333-8333-333333333333", ResultArtifactRef: "artifact:sha256:" + workerHex('b')}); err != nil {
+		t.Fatal(err)
+	}
+	outboxInput := EvolutionOutboxInput{IdempotencyKey: "44444444-4444-4444-8444-444444444444", RunID: run.RunID, Topic: "evolution.work.completed", PayloadRef: "artifact:sha256:" + workerHex('c'), MaxAttempts: 3}
+	outbox, created, err := store.EnqueueEvolutionOutbox(outboxInput)
+	if err != nil || !created {
+		t.Fatalf("enqueue outbox = %#v created=%v err=%v", outbox, created, err)
+	}
+	for index := 0; index < 2; index++ {
+		message, ok, err := store.LeaseNextEvolutionOutbox(EvolutionOutboxLeaseInput{WorkerID: fmt.Sprintf("dispatcher-%d", index), LeaseDuration: time.Minute})
+		if err != nil || !ok {
+			t.Fatalf("lease outbox %d = %#v ok=%v err=%v", index, message, ok, err)
+		}
+		if _, _, err := store.DeliverEvolutionOutbox(EvolutionOutboxDelivery{OutboxID: message.OutboxID, WorkerID: message.WorkerID, LeaseID: message.LeaseID, Attempt: message.Attempt, ReceiptID: fmt.Sprintf("55555555-5555-4555-8555-%012d", index)}); err != nil {
+			t.Fatalf("deliver outbox %d: %v", index, err)
+		}
+	}
+	if _, err := store.TransitionRun(run.RunID, EvolutionSuperseded, EvolutionTransitionInput{Actor: "operator", Code: "superseded"}); err != nil {
+		t.Fatalf("close drained run: %v", err)
+	}
+	if replayed, replayCreated, err := store.EnqueueEvolutionWork(workInput); err != nil || replayCreated || replayed.WorkID != work.WorkID {
+		t.Fatalf("closed work replay = %#v created=%v err=%v", replayed, replayCreated, err)
+	}
+	changedWork := workInput
+	changedWork.ArtifactRef = "artifact:sha256:" + workerHex('d')
+	if _, _, err := store.EnqueueEvolutionWork(changedWork); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("closed changed work replay error = %v", err)
+	}
+	if replayed, replayCreated, err := store.EnqueueEvolutionOutbox(outboxInput); err != nil || replayCreated || replayed.OutboxID != outbox.OutboxID {
+		t.Fatalf("closed outbox replay = %#v created=%v err=%v", replayed, replayCreated, err)
+	}
+	changedOutbox := outboxInput
+	changedOutbox.PayloadRef = "artifact:sha256:" + workerHex('e')
+	if _, _, err := store.EnqueueEvolutionOutbox(changedOutbox); !errors.Is(err, ErrEvolutionIdempotencyConflict) {
+		t.Fatalf("closed changed outbox replay error = %v", err)
+	}
+}
+
 func TestEvolutionWorkerLegacyTerminalPendingOutboxDeadLettersAndReportsConflict(t *testing.T) {
 	root := t.TempDir()
 	clock := newEvolutionWorkerClock()
