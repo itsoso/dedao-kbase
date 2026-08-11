@@ -18,7 +18,7 @@ for (const marker of [
   'name="version"',
   '["dual", "evidence", "study"]',
   'data-agent-compiler-mode="${mode}"',
-  "run_trusted_evaluation",
+  "人工批准后使用受限发布流程",
   "可信评测",
 ]) {
   assert.ok(js.includes(marker), `Agent Compiler workspace should include ${marker}`);
@@ -41,9 +41,9 @@ assert.ok(js.includes('document.querySelector(".agent-compiler__result")?.remove
 const releaseSource = js.match(/async function loadAgentCompilerReleases\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(releaseSource.includes('latest: "true"'), "compiler should only browse the latest release per book");
 
-const platformLoaderSource = js.match(/async function loadBookAgentPlatform\([\s\S]*?\n\}/)?.[0] || "";
-assert.ok(platformLoaderSource.includes("Promise.allSettled"), "package listing should survive compiler release failures");
-assert.ok(platformLoaderSource.includes('releasesResult.status === "fulfilled"'), "compiler release failures should be isolated");
+const evolutionLoaderSource = js.match(/async function loadEvolutionCompilerReleases\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(evolutionLoaderSource.includes("try"), "package listing should survive compiler release failures");
+assert.ok(evolutionLoaderSource.includes("agentCompilerState.error"), "compiler release failures should remain isolated in the drawer");
 
 for (const className of [
   ".agent-compiler",

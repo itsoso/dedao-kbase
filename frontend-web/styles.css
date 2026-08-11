@@ -8274,6 +8274,885 @@ body.has-proofroom-modal {
   }
 }
 
+/* Agent evolution control room: dense, editorial, and deliberately operational. */
+.evolution-console {
+  --evolution-ink: #18211d;
+  --evolution-muted: #657069;
+  --evolution-paper: #f4f0e6;
+  --evolution-panel: #fffdf7;
+  --evolution-rule: rgba(24, 33, 29, 0.17);
+  --evolution-orange: #e85c19;
+  width: min(calc(100% - 36px), 1480px);
+  min-width: 0;
+  margin: 0 auto;
+  padding: 16px 0 56px;
+  color: var(--evolution-ink);
+  font-family: "PingFang SC", "Hiragino Sans GB", sans-serif;
+}
+
+.evolution-console *,
+.evolution-console *::before,
+.evolution-console *::after {
+  box-sizing: border-box;
+}
+
+.evolution-console__toolbar {
+  display: flex;
+  min-width: 0;
+  align-items: end;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 8px 2px 14px;
+  border-bottom: 2px solid var(--evolution-ink);
+}
+
+.evolution-console__toolbar h1,
+.evolution-console__toolbar p,
+.evolution-console__queue h2,
+.evolution-console__fleet h2,
+.evolution-console__rules h2 {
+  margin: 0;
+}
+
+.evolution-console__toolbar h1 {
+  margin-top: 3px;
+  font: 600 clamp(25px, 3vw, 38px)/1.05 "Songti SC", "Noto Serif CJK SC", Georgia, serif;
+  letter-spacing: -0.035em;
+}
+
+.evolution-console__filters {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+
+.evolution-console__filters label {
+  display: grid;
+  gap: 4px;
+  color: var(--evolution-muted);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.evolution-console__filters select {
+  min-width: 122px;
+  min-height: 36px;
+  padding: 0 30px 0 10px;
+  border: 1px solid var(--evolution-rule);
+  border-radius: 2px;
+  background: var(--evolution-panel);
+  color: var(--evolution-ink);
+  font: 650 12px/1 "PingFang SC", sans-serif;
+}
+
+.evolution-console__filters .button {
+  min-height: 36px;
+  border-radius: 2px;
+  background: var(--evolution-ink);
+  color: #fffdf7;
+}
+
+.evolution-console__filters .button:hover {
+  background: var(--evolution-orange);
+}
+
+.evolution-console__views {
+  display: flex;
+  gap: 0;
+  min-width: 0;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__views a {
+  flex: 0 0 auto;
+  padding: 10px 18px 9px;
+  border-right: 1px solid var(--evolution-rule);
+  color: var(--evolution-muted);
+  font-size: 12px;
+  font-weight: 720;
+  text-decoration: none;
+}
+
+.evolution-console__views a:hover,
+.evolution-console__views a.is-active {
+  background: var(--evolution-ink);
+  color: #fffdf7;
+}
+
+.evolution-console__status-strip {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  margin: 10px 0;
+  border: 1px solid var(--evolution-rule);
+  background: rgba(255, 253, 247, 0.7);
+}
+
+.evolution-console__status-strip > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 12px;
+  border-right: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__status-strip > div:last-child {
+  border-right: 0;
+}
+
+.evolution-console__status-strip dt,
+.evolution-console__status-strip dd {
+  margin: 0;
+}
+
+.evolution-console__status-strip dt {
+  overflow: hidden;
+  color: var(--evolution-muted);
+  font-size: 11px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evolution-console__status-strip dd {
+  font: 700 20px/1 Georgia, serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.evolution-console__status-strip .is-approval,
+.evolution-console__status-strip .is-blocked,
+.evolution-console__status-strip .is-failed {
+  box-shadow: inset 3px 0 var(--evolution-orange);
+}
+
+.evolution-console__workspace {
+  display: grid;
+  grid-template-columns: minmax(360px, 0.9fr) minmax(460px, 1.4fr);
+  min-height: 362px;
+  max-height: 440px;
+  border: 1px solid var(--evolution-rule);
+  background: var(--evolution-panel);
+}
+
+.evolution-console__queue,
+.evolution-console__detail {
+  min-width: 0;
+  min-height: 0;
+}
+
+.evolution-console__queue {
+  border-right: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__queue > header,
+.evolution-console__fleet > header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__queue > header span,
+.evolution-console__fleet > header span,
+.evolution-console__fleet > header small {
+  color: var(--evolution-muted);
+  font-size: 10px;
+  font-weight: 720;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.evolution-console__queue h2,
+.evolution-console__fleet h2 {
+  margin-top: 2px;
+  font: 600 19px/1.15 "Songti SC", "Noto Serif CJK SC", Georgia, serif;
+}
+
+.evolution-console__queue > header > b {
+  color: var(--evolution-orange);
+  font: 700 22px/1 Georgia, serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.evolution-console__queue > div {
+  max-height: 382px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.evolution-run {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--evolution-rule);
+  color: var(--evolution-ink);
+  text-decoration: none;
+}
+
+.evolution-run:hover,
+.evolution-run.is-selected {
+  background: #e9e5da;
+  box-shadow: inset 3px 0 var(--evolution-orange);
+}
+
+.evolution-run__risk {
+  padding: 5px 4px;
+  border: 1px solid var(--evolution-rule);
+  color: var(--evolution-muted);
+  font-size: 9px;
+  font-weight: 800;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.evolution-run__risk.is-p0,
+.evolution-run__risk.is-p1 {
+  border-color: rgba(232, 92, 25, 0.5);
+  color: #a4380a;
+}
+
+.evolution-run__body,
+.evolution-run__score,
+.evolution-console__fleet th,
+.evolution-console__fleet td {
+  min-width: 0;
+}
+
+.evolution-run__body,
+.evolution-run__score {
+  display: grid;
+  gap: 2px;
+}
+
+.evolution-run__body strong,
+.evolution-run__body small,
+.evolution-run__score small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evolution-run__body strong {
+  font-size: 13px;
+}
+
+.evolution-run__body small,
+.evolution-run__score small {
+  color: var(--evolution-muted);
+  font-size: 10px;
+}
+
+.evolution-run__score {
+  text-align: right;
+}
+
+.evolution-run__score b {
+  font: 700 15px/1 Georgia, serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.evolution-console__next {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 11px 12px;
+  color: var(--evolution-ink);
+  font-size: 11px;
+  font-weight: 760;
+  text-decoration: none;
+}
+
+.evolution-console__next:hover {
+  color: var(--evolution-orange);
+}
+
+.evolution-console__detail {
+  position: relative;
+  padding: 16px 18px;
+  overflow-y: auto;
+}
+
+.evolution-console__detail-back {
+  display: none;
+  margin-bottom: 12px;
+  color: var(--evolution-ink);
+  font-size: 12px;
+  font-weight: 720;
+  text-decoration: none;
+}
+
+.evolution-console__detail-empty,
+.evolution-console__state {
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  gap: 7px;
+  min-height: 210px;
+  padding: 20px;
+  color: var(--evolution-muted);
+}
+
+.evolution-console__detail-empty > span,
+.evolution-console__state > strong {
+  color: var(--evolution-orange);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.evolution-console__detail-empty > strong {
+  color: var(--evolution-ink);
+  font: 600 clamp(24px, 3vw, 40px)/1.08 "Songti SC", Georgia, serif;
+}
+
+.evolution-console__detail-empty p,
+.evolution-console__state span {
+  max-width: 48ch;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.evolution-console__state.is-error {
+  border-left: 3px solid var(--evolution-orange);
+}
+
+.evolution-console__state button {
+  padding: 7px 11px;
+  border: 1px solid var(--evolution-ink);
+  background: transparent;
+  color: var(--evolution-ink);
+  cursor: pointer;
+}
+
+.evolution-console__detail-head {
+  display: flex;
+  min-width: 0;
+  align-items: start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.evolution-console__detail-head > div {
+  min-width: 0;
+}
+
+.evolution-console__detail-head span {
+  color: var(--evolution-muted);
+  font-size: 10px;
+  font-weight: 720;
+}
+
+.evolution-console__detail-head h2 {
+  margin: 4px 0 0;
+  overflow: hidden;
+  font: 600 clamp(23px, 2.4vw, 34px)/1.1 "Songti SC", Georgia, serif;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evolution-console__status {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  border: 1px solid var(--evolution-rule);
+  color: var(--evolution-muted);
+  font-size: 10px;
+}
+
+.evolution-console__status.is-awaiting_approval,
+.evolution-console__status.is-blocked,
+.evolution-console__status.is-failed,
+.evolution-console__status.is-rolled_back {
+  border-color: var(--evolution-orange);
+  color: #9e360c;
+}
+
+.evolution-console__detail-tabs {
+  display: flex;
+  gap: 16px;
+  margin-top: 16px;
+  border-bottom: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__detail-tabs a {
+  padding: 8px 1px;
+  border-bottom: 2px solid transparent;
+  color: var(--evolution-muted);
+  font-size: 11px;
+  font-weight: 720;
+  text-decoration: none;
+}
+
+.evolution-console__detail-tabs a:hover,
+.evolution-console__detail-tabs a.is-active {
+  border-color: var(--evolution-orange);
+  color: var(--evolution-ink);
+}
+
+.evolution-console__comparison {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+  margin-top: 18px;
+}
+
+.evolution-console__comparison article {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  min-height: 104px;
+  align-content: center;
+  padding: 14px;
+  border: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__comparison article.is-candidate {
+  border-top: 3px solid var(--evolution-orange);
+}
+
+.evolution-console__comparison span,
+.evolution-console__comparison small,
+.evolution-console__detail-meta,
+.evolution-console__read-only p {
+  color: var(--evolution-muted);
+  font-size: 10px;
+}
+
+.evolution-console__comparison strong {
+  overflow-wrap: anywhere;
+  font: 600 20px/1.15 "Songti SC", Georgia, serif;
+}
+
+.evolution-console__read-only {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px dashed var(--evolution-rule);
+}
+
+.evolution-console__read-only p {
+  line-height: 1.7;
+}
+
+.evolution-console__events {
+  display: grid;
+  gap: 0;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.evolution-console__events li {
+  display: grid;
+  grid-template-columns: 90px 76px minmax(0, 1fr);
+  gap: 9px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--evolution-rule);
+  font-size: 10px;
+}
+
+.evolution-console__events time,
+.evolution-console__events span {
+  color: var(--evolution-muted);
+}
+
+.evolution-console__detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid var(--evolution-rule);
+  font-variant-numeric: tabular-nums;
+}
+
+.evolution-console__fleet {
+  min-width: 0;
+  margin-top: 12px;
+  border: 1px solid var(--evolution-rule);
+  background: rgba(255, 253, 247, 0.75);
+}
+
+.evolution-console__table-wrap {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.evolution-console__fleet table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.evolution-console__fleet th,
+.evolution-console__fleet td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--evolution-rule);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.evolution-console__fleet thead th {
+  color: var(--evolution-muted);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.evolution-console__fleet tbody th,
+.evolution-console__fleet tbody td:nth-child(2) {
+  display: table-cell;
+}
+
+.evolution-console__fleet tbody th strong,
+.evolution-console__fleet tbody th small,
+.evolution-console__fleet tbody td b,
+.evolution-console__fleet tbody td small {
+  display: block;
+}
+
+.evolution-console__fleet tbody th strong {
+  max-width: 42vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.evolution-console__fleet tbody th small,
+.evolution-console__fleet tbody td small,
+.evolution-console__fleet time {
+  color: var(--evolution-muted);
+  font-size: 9px;
+}
+
+.evolution-console__fleet nav {
+  display: flex;
+  justify-content: end;
+  gap: 7px;
+}
+
+.evolution-console__fleet nav a,
+.evolution-console__history-row details a {
+  color: var(--evolution-ink);
+  font-weight: 720;
+  text-decoration: none;
+}
+
+.evolution-console__fleet nav a:hover,
+.evolution-console__history-row details a:hover {
+  color: var(--evolution-orange);
+}
+
+.evolution-console__history-row td {
+  padding: 0 12px 5px;
+}
+
+.evolution-console__history-row summary {
+  padding: 6px 0;
+  color: var(--evolution-muted);
+  cursor: pointer;
+  font-size: 10px;
+}
+
+.evolution-console__history-row details > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 2px 0 9px;
+}
+
+.evolution-console__history-row details a {
+  display: flex;
+  gap: 7px;
+  padding: 5px 8px;
+  border: 1px solid var(--evolution-rule);
+  font-size: 10px;
+}
+
+.evolution-console__rules {
+  min-height: 360px;
+  padding: 32px;
+  border: 1px solid var(--evolution-rule);
+  background: var(--evolution-panel);
+}
+
+.evolution-console__rules header span {
+  color: var(--evolution-orange);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.evolution-console__rules h2 {
+  margin-top: 7px;
+  font: 600 clamp(28px, 4vw, 50px)/1 "Songti SC", Georgia, serif;
+}
+
+.evolution-console__rules dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 34px 0 0;
+  border: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__rules dl > div {
+  padding: 18px;
+  border-right: 1px solid var(--evolution-rule);
+}
+
+.evolution-console__rules dl > div:last-child {
+  border-right: 0;
+}
+
+.evolution-console__rules dt {
+  font-weight: 800;
+}
+
+.evolution-console__rules dd {
+  margin: 8px 0 0;
+  color: var(--evolution-muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.evolution-console__drawer {
+  width: min(680px, calc(100vw - 24px));
+  max-width: none;
+  max-height: calc(100vh - 24px);
+  margin: 12px 12px 12px auto;
+  padding: 0 24px 24px;
+  overflow-y: auto;
+  border: 1px solid var(--evolution-ink);
+  border-radius: 0;
+  background: var(--evolution-paper);
+  color: var(--evolution-ink);
+  box-shadow: -18px 0 60px rgba(24, 33, 29, 0.22);
+}
+
+.evolution-console__drawer::backdrop,
+.evolution-console__backdrop {
+  background: rgba(24, 33, 29, 0.38);
+}
+
+.evolution-console__backdrop {
+  position: fixed;
+  z-index: 20;
+  inset: 0;
+}
+
+.evolution-console__drawer {
+  z-index: 21;
+}
+
+.evolution-console__drawer-head {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--evolution-rule);
+  background: var(--evolution-paper);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.evolution-console__drawer-head button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--evolution-rule);
+  background: transparent;
+  color: var(--evolution-ink);
+  font-size: 22px;
+  cursor: pointer;
+}
+
+.evolution-console__drawer .agent-compiler {
+  margin: 0;
+  border-top: 0;
+  background: transparent;
+}
+
+.evolution-console__drawer .agent-compiler > header {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding-top: 20px;
+}
+
+.evolution-console :focus-visible {
+  outline: 3px solid var(--evolution-orange);
+  outline-offset: 2px;
+}
+
+@media (max-width: 860px) {
+  .evolution-console {
+    width: min(100% - 20px, 720px);
+    padding-top: 10px;
+  }
+
+  .evolution-console__toolbar,
+  .evolution-console__filters {
+    align-items: stretch;
+  }
+
+  .evolution-console__toolbar {
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .evolution-console__filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .evolution-console__filters select,
+  .evolution-console__filters .button {
+    width: 100%;
+  }
+
+  .evolution-console__filters .button {
+    grid-column: 1 / -1;
+  }
+
+  .evolution-console__status-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .evolution-console__status-strip > div {
+    border-bottom: 1px solid var(--evolution-rule);
+  }
+
+  .evolution-console__workspace {
+    display: block;
+    max-height: none;
+  }
+
+  .evolution-console__queue {
+    border-right: 0;
+  }
+
+  .evolution-console__queue > div,
+  .evolution-console__detail {
+    max-height: none;
+  }
+
+  .evolution-console.is-detail-open .evolution-console__queue {
+    display: none;
+  }
+
+  .evolution-console:not(.is-detail-open) .evolution-console__detail {
+    display: none;
+  }
+
+  .evolution-console__detail-back {
+    display: inline-block;
+  }
+
+  .evolution-console__fleet table {
+    min-width: 0;
+    table-layout: fixed;
+  }
+
+  .evolution-console__fleet thead th:first-child {
+    width: 52%;
+  }
+
+  .evolution-console__fleet thead th:nth-child(2) {
+    width: 20%;
+  }
+
+  .evolution-console__fleet thead th:last-child {
+    width: 28%;
+  }
+
+  .evolution-console__fleet thead th:nth-child(3),
+  .evolution-console__fleet thead th:nth-child(4),
+  .evolution-console__fleet tbody td:nth-child(3),
+  .evolution-console__fleet tbody td:nth-child(4) {
+    display: none;
+  }
+
+  .evolution-console__fleet th,
+  .evolution-console__fleet td {
+    padding-inline: 8px;
+  }
+
+  .evolution-console__fleet nav {
+    flex-wrap: wrap;
+  }
+
+  .evolution-console__rules {
+    padding: 20px;
+  }
+
+  .evolution-console__rules dl {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .evolution-console__rules dl > div {
+    border-right: 0;
+    border-bottom: 1px solid var(--evolution-rule);
+  }
+
+  .evolution-console__rules dl > div:last-child {
+    border-bottom: 0;
+  }
+}
+
+@media (max-width: 520px) {
+  .evolution-console__views a {
+    padding-inline: 12px;
+  }
+
+  .evolution-console__comparison {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .evolution-console__comparison > div {
+    transform: rotate(90deg);
+    text-align: center;
+  }
+
+  .evolution-console__detail-head h2 {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .evolution-run {
+    grid-template-columns: 50px minmax(0, 1fr);
+  }
+
+  .evolution-run__score {
+    display: none;
+  }
+
+  .evolution-console__drawer .agent-compiler__controls,
+  .evolution-console__drawer .agent-compiler__result > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .evolution-console *,
+  .evolution-console *::before,
+  .evolution-console *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 @media (max-width: 840px) {
   .dedao-ebook-card__job,
   .job-card {
