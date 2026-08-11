@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const css = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const js = fs.readFileSync(path.join(root, "app.js"), "utf8");
+const knowledgeRoutesJS = fs.readFileSync(path.join(root, "knowledge-deep-links.mjs"), "utf8");
+const deepLinkJS = `${js}\n${knowledgeRoutesJS}`;
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 
 for (const marker of [
@@ -132,7 +134,7 @@ for (const marker of [
   'parts[1] === "results"',
   'legacy === "/book-knowledge" && pathname.startsWith(`${legacy}/books/`)',
 ]) {
-  assert.ok(js.includes(marker), `knowledge deep-link contract should include ${marker}`);
+  assert.ok(deepLinkJS.includes(marker), `knowledge deep-link contract should include ${marker}`);
 }
 
 for (const marker of [
@@ -143,6 +145,29 @@ for (const marker of [
   "knowledgeResourceIsActive",
 ]) {
   assert.ok(js.includes(marker), `knowledge navigation should include ${marker}`);
+}
+for (const marker of [
+  "knowledgeResultRouteID",
+  "result?.claim_id",
+  "result?.chunk_id",
+  "result?.citation_id",
+  "knowledgeResultFromPackage",
+  "shouldHandleKnowledgeClick",
+  "event.metaKey",
+  "event.ctrlKey",
+  '"[data-chapter-index].active"',
+  '"[data-result-index].active"',
+]) {
+  assert.ok(deepLinkJS.includes(marker), `knowledge deep-link regression coverage should include ${marker}`);
+}
+assert.ok(js.includes('from "./knowledge-deep-links.mjs?v=20260811-knowledge-deep-links"'), "app.js should version the knowledge route module");
+for (const marker of [
+  "knowledgeSearchSequence",
+  "knowledgeSearchIsCurrent",
+  "knowledgeResultFromPackage(knowledgeState.package, routedResource)",
+  "未找到知识包",
+]) {
+  assert.ok(js.includes(marker), `knowledge route recovery should include ${marker}`);
 }
 assert.ok(css.includes(".knowledge-web__resource-link"), "knowledge resources should share link styling");
 assert.ok(css.includes(".knowledge-web__resource-link.active"), "the routed knowledge resource should be visibly active");

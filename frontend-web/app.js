@@ -1,3 +1,16 @@
+import {
+  knowledgeBookForRoute,
+  knowledgeBookPath,
+  knowledgeChapterPath,
+  knowledgeResourceFromPath,
+  knowledgeResourceTargetSelector,
+  knowledgeResultFromPackage,
+  knowledgeResultPath,
+  knowledgeResultRouteID,
+  knowledgeSearchIsCurrent,
+  shouldHandleKnowledgeClick,
+} from "./knowledge-deep-links.mjs?v=20260811-knowledge-deep-links";
+
 const app = document.querySelector("#app");
 let readerAssetObjectURLs = [];
 
@@ -402,6 +415,7 @@ let proofroomOperationSequence = 0;
 let dedaoEbookDetailLoadSequence = 0;
 let bookKnowledgeLoadSequence = 0;
 let bookKnowledgeDetailSequence = 0;
+let knowledgeSearchSequence = 0;
 let proofroomPreviousFocus = null;
 let proofroomKeydownHandler = null;
 let proofroomReturnFocusSelector = "";
@@ -1332,40 +1346,8 @@ function getDedaoAudioRoute() {
   }
 }
 
-function decodeRouteSegment(value) {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
 function knowledgeResourceFromLocation(pathname = getRoutePathname()) {
-  const canonicalPath = resolveCanonicalRoute(pathname);
-  const prefix = `${ROUTES.knowledgePackages}/`;
-  if (!canonicalPath.startsWith(prefix)) {
-    return null;
-  }
-  const parts = canonicalPath.slice(prefix.length).split("/").filter(Boolean);
-  const bookID = decodeRouteSegment(parts[0] || "");
-  if (!bookID) {
-    return null;
-  }
-  if (parts.length === 1) {
-    return { type: "book", bookID, resourceID: "", kind: "" };
-  }
-  if (parts.length === 3 && parts[1] === "chapters") {
-    return { type: "chapter", bookID, resourceID: decodeRouteSegment(parts[2]), kind: "chapter" };
-  }
-  if (parts.length === 4 && parts[1] === "results") {
-    return {
-      type: "result",
-      bookID,
-      resourceID: decodeRouteSegment(parts[3]),
-      kind: decodeRouteSegment(parts[2]),
-    };
-  }
-  return null;
+  return knowledgeResourceFromPath(resolveCanonicalRoute(pathname));
 }
 
 function getKnowledgeBookID() {
@@ -1477,24 +1459,6 @@ function buildDedaoAudioURL(enid, aliasID = "") {
 
 function buildBookReaderURL(packageID) {
   return packageID ? `${ROUTES.bookReader}/${encodeURIComponent(packageID)}` : "";
-}
-
-function knowledgeBookPath(packageID) {
-  return packageID ? `${ROUTES.knowledgePackages}/${encodeURIComponent(packageID)}` : ROUTES.knowledgePackages;
-}
-
-function knowledgeChapterPath(packageID, chapterID) {
-  if (!chapterID) {
-    return knowledgeBookPath(packageID);
-  }
-  return `${knowledgeBookPath(packageID)}/chapters/${encodeURIComponent(chapterID)}`;
-}
-
-function knowledgeResultPath(packageID, kind, resultID) {
-  if (!kind || !resultID) {
-    return knowledgeBookPath(packageID);
-  }
-  return `${knowledgeBookPath(packageID)}/results/${encodeURIComponent(kind)}/${encodeURIComponent(resultID)}`;
 }
 
 function buildKnowledgePackageURL(packageID) {
@@ -3935,11 +3899,12 @@ function knowledgeResourceIsActive(resource, type, resourceID, kind = "") {
 
 function scrollKnowledgeResourceTarget() {
   const resource = knowledgeResourceFromLocation();
-  if (!resource || resource.type === "book") {
+  const selector = knowledgeResourceTargetSelector(resource);
+  if (!selector) {
     return;
   }
   window.requestAnimationFrame?.(() => {
-    document.querySelector(".knowledge-web__resource-link.active")?.scrollIntoView({ block: "center" });
+    document.querySelector(selector)?.scrollIntoView({ block: "center" });
   });
 }
 
@@ -3958,7 +3923,7 @@ function renderBookKnowledge() {
   const pkg = knowledgeState.package || {};
   const currentBook = pkg.book || knowledgeState.selectedBook || {};
   const resultRows = knowledgeState.results.map((result, index) => {
-    const resultID = result.id || "";
+    const resultID = knowledgeResultRouteID(result);
     const kind = result.kind || "result";
     const active = knowledgeResourceIsActive(activeResource, "result", resultID, kind) ? " active" : "";
     const body = `
@@ -9866,6 +9831,9 @@ function bindBookKnowledgeEvents() {
   });
   for (const button of document.querySelectorAll("[data-book-index]")) {
     button.addEventListener("click", async (event) => {
+      if (!shouldHandleKnowledgeClick(event)) {
+        return;
+      }
       event.preventDefault();
       const index = Number(button.getAttribute("data-book-index") || "0");
       const book = knowledgeState.books[index] || null;
@@ -9876,6 +9844,9 @@ function bindBookKnowledgeEvents() {
   }
   for (const link of document.querySelectorAll("[data-chapter-index], [data-result-index]")) {
     link.addEventListener("click", (event) => {
+      if (!shouldHandleKnowledgeClick(event)) {
+        return;
+      }
       event.preventDefault();
       pushKnowledgeRoute(link.getAttribute("href") || "");
       renderBookKnowledge();
@@ -9908,6 +9879,7 @@ function bindDedaoCourseArticleAnalysis(route) {
 
 async function loadBookKnowledge() {
   const sequence = ++bookKnowledgeLoadSequence;
+  const routedResource = knowledgeResourceFromLocation();
   knowledgeState.loading = "加载书籍";
   knowledgeState.message = "";
   renderBookKnowledge();
@@ -9925,25 +9897,32 @@ async function loadBookKnowledge() {
     knowledgeState.books = Array.isArray(payload.books) ? payload.books : [];
     if (knowledgeState.books.length && isKnowledgePackageDetailRoute()) {
       const queryBookID = new URLSearchParams(window.location.search).get("book_id") || "";
-      const preferredID = getKnowledgeBookID() || queryBookID || knowledgeState.selectedBook?.book_id || "";
-      const preferred = preferredID
-        ? knowledgeState.books.find((book) => book.book_id === preferredID)
-        : null;
-      await selectKnowledgeBook(preferred || knowledgeState.books[0], false);
+      const preferredID = routedResource?.bookID || getKnowledgeBookID() || queryBookID || "";
+      const preferred = knowledgeBookForRoute(knowledgeState.books, { bookID: preferredID });
+      if (!preferred) {
+        bookKnowledgeDetailSequence += 1;
+        knowledgeSearchSequence += 1;
+        knowledgeState.selectedBook = null;
+        knowledgeState.package = null;
+        knowledgeState.results = [];
+        resetKnowledgeReview();
+        knowledgeState.message = `未找到知识包：${preferredID || "未知 ID"}`;
+        return;
+      }
+      await selectKnowledgeBook(preferred, false);
       if (sequence !== bookKnowledgeLoadSequence) {
         return;
       }
       const evidenceLocator = new URLSearchParams(window.location.search);
       const citationID = evidenceLocator.get("citation_id") || "";
       const evidenceQuery = citationID || evidenceLocator.get("chunk_id") || evidenceLocator.get("claim_id") || "";
-      const routedResource = knowledgeResourceFromLocation();
       if (citationID) {
         const resolved = await apiFetch(
           `/api/citations/${encodeURIComponent(citationID)}?book_id=${encodeURIComponent(knowledgeState.selectedBook.book_id)}`,
         );
         if (
           sequence !== bookKnowledgeLoadSequence ||
-          String(knowledgeState.selectedBook?.book_id || "") !== String(preferred?.book_id || knowledgeState.books[0]?.book_id || "")
+          String(knowledgeState.selectedBook?.book_id || "") !== String(preferred.book_id || "")
         ) {
           return;
         }
@@ -9963,9 +9942,20 @@ async function loadBookKnowledge() {
       } else if (evidenceQuery) {
         knowledgeState.query = evidenceQuery;
         await searchBookKnowledge();
+      } else if (routedResource?.type === "chapter" && routedResource.resourceID) {
+        const chapter = (knowledgeState.package?.chapters || []).find(
+          (item) => String(item.chapter_id || item.id || "") === routedResource.resourceID,
+        );
+        knowledgeState.message = chapter
+          ? `已定位章节：${chapter.title || routedResource.resourceID}`
+          : `未找到章节：${routedResource.resourceID}`;
       } else if (routedResource?.type === "result" && routedResource.resourceID) {
+        const routedResult = knowledgeResultFromPackage(knowledgeState.package, routedResource);
         knowledgeState.query = routedResource.resourceID;
-        await searchBookKnowledge();
+        knowledgeState.results = routedResult ? [routedResult] : [];
+        knowledgeState.message = routedResult
+          ? "已恢复知识检索结果。"
+          : `未找到知识资源：${routedResource.resourceID}`;
       }
     } else if (!knowledgeState.books.length) {
       knowledgeState.selectedBook = null;
@@ -9973,7 +9963,9 @@ async function loadBookKnowledge() {
       knowledgeState.results = [];
       resetKnowledgeReview();
     }
-    knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
+    if (!knowledgeState.message) {
+      knowledgeState.message = `已加载 ${knowledgeState.books.length} 本。`;
+    }
   } catch (error) {
     if (sequence !== bookKnowledgeLoadSequence) {
       return;
@@ -9993,6 +9985,8 @@ function pushKnowledgeRoute(target) {
   }
   const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   if (current !== target) {
+    knowledgeSearchSequence += 1;
+    knowledgeState.loading = "";
     window.history?.pushState?.({}, "", target);
   }
 }
@@ -10511,7 +10505,11 @@ async function runDedaoCourseArticleAnalysis(route) {
 }
 
 async function searchBookKnowledge() {
-  if (!knowledgeState.query) {
+  const sequence = ++knowledgeSearchSequence;
+  const queryText = String(knowledgeState.query || "").trim();
+  const routeBookID = getKnowledgeBookID();
+  const bookID = routeBookID && knowledgeState.selectedBook?.book_id === routeBookID ? routeBookID : "";
+  if (!queryText) {
     knowledgeState.results = [];
     renderBookKnowledge();
     return;
@@ -10521,18 +10519,25 @@ async function searchBookKnowledge() {
   renderBookKnowledge();
   try {
     const query = new URLSearchParams({
-      q: knowledgeState.query,
-      book_id: knowledgeState.selectedBook?.book_id || "",
+      q: queryText,
+      book_id: bookID,
       limit: "20",
     });
     const payload = await apiFetch(`/api/search?${query.toString()}`);
+    if (!knowledgeSearchIsCurrent(sequence, knowledgeSearchSequence, routeBookID, getKnowledgeBookID())) {
+      return;
+    }
     knowledgeState.results = Array.isArray(payload.results) ? payload.results : [];
     knowledgeState.message = `找到 ${knowledgeState.results.length} 条结果。`;
   } catch (error) {
-    knowledgeState.message = error instanceof Error ? error.message : String(error);
+    if (knowledgeSearchIsCurrent(sequence, knowledgeSearchSequence, routeBookID, getKnowledgeBookID())) {
+      knowledgeState.message = error instanceof Error ? error.message : String(error);
+    }
   } finally {
-    knowledgeState.loading = "";
-    renderBookKnowledge();
+    if (knowledgeSearchIsCurrent(sequence, knowledgeSearchSequence, routeBookID, getKnowledgeBookID())) {
+      knowledgeState.loading = "";
+      renderBookKnowledge();
+    }
   }
 }
 
@@ -10549,6 +10554,7 @@ function formatArticleTime(value) {
 
 async function boot() {
   bookKnowledgeLoadSequence += 1;
+  knowledgeSearchSequence += 1;
   dedaoEbookDetailLoadSequence += 1;
   const routePathname = getRoutePathname();
   if (!isJobCenterRoute(routePathname)) {

@@ -185,3 +185,40 @@ Expected: every command exits 0; status contains only the intended plan and Web 
 **Step 5: Commit the release marker**
 
 Stage only `frontend-web/index.html` and any still-uncommitted task files, then commit with `chore(web): version knowledge deep links`.
+
+### Task 5: Resolve independent review findings
+
+**Files:**
+- Create: `frontend-web/knowledge-deep-links.mjs`
+- Create: `frontend-web/scripts/knowledge-deep-links-smoke.mjs`
+- Modify: `frontend-web/app.js`
+- Modify: `frontend-web/scripts/book-knowledge-web-smoke.mjs`
+
+**Step 1: Reproduce the API-contract mismatch**
+
+Add executable fixtures proving that search results identify resources with `chunk_id`, `claim_id`, or `citation_id`, not only `id`, and that a resource can be restored exactly from an already loaded knowledge package.
+
+**Step 2: Verify RED**
+
+Run: `node frontend-web/scripts/knowledge-deep-links-smoke.mjs`
+
+Expected: FAIL because the testable route module does not exist.
+
+**Step 3: Implement testable route utilities and race guards**
+
+Extract pure URL, resource-ID, package lookup, modified-click, active-selector, exact-book selection, and search-currentness helpers. Use them from `app.js` so invalid book IDs remain explicit, result refreshes do not misuse full-text search, and stale requests cannot overwrite a newer route.
+
+**Step 4: Verify browser behavior**
+
+Using a temporary local KBase server with generated non-private content, verify:
+
+- chapter click, refresh, and active state;
+- real `chunk_id` search-result link generation;
+- result refresh and exact package restoration;
+- Back/Forward restoration;
+- invalid book IDs do not select the first book;
+- browser console has no warnings or errors.
+
+**Step 5: Re-run release-level verification and request re-review**
+
+Run all three Web smoke tests, the frontend production build, `go test ./...`, system-map drift, privacy smoke, and `git diff --check`, then request independent review against the updated HEAD.
