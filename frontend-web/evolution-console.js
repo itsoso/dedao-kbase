@@ -76,6 +76,21 @@
     return view === "history" ? "audit" : "comparison";
   }
 
+  function detailPresentation(view) {
+    if (view === "history") {
+      return Object.freeze({
+        backLabel: "返回演化历史",
+        sectionLabel: "演化历史详情",
+        tabsLabel: "审计详情",
+      });
+    }
+    return Object.freeze({
+      backLabel: "返回待办队列",
+      sectionLabel: "线上版本对比",
+      tabsLabel: "任务详情",
+    });
+  }
+
   function routePatchForView(view) {
     const nextView = validViews.has(view) ? view : routeDefaults.view;
     return { view: nextView, cursor: "", run: "", tab: detailTabForView(nextView) };
@@ -112,7 +127,7 @@
       return Object.freeze({
         indexLabel: "01 / 按时间排序",
         title: "演化历史",
-        sortHint: "按更新时间倒序",
+        sortHint: "按创建时间倒序",
         loading: "正在读取演化历史…",
         errorTitle: "演化历史不可用",
         emptyTitle: "暂无演化历史",
@@ -293,10 +308,14 @@
   function sortRunsForView(runs, view) {
     if (view !== "history") return sortRuns(runs);
     return Array.isArray(runs) ? [...runs].sort((left, right) => {
-      const timeDelta = Date.parse(right?.updated_at || "") - Date.parse(left?.updated_at || "");
+      const timeDelta = Date.parse(right?.created_at || "") - Date.parse(left?.created_at || "");
       if (Number.isFinite(timeDelta) && timeDelta !== 0) return timeDelta;
       return String(left?.run_id || "").localeCompare(String(right?.run_id || ""));
     }) : [];
+  }
+
+  function runTimestampForView(run, view) {
+    return view === "history" ? run?.created_at : run?.updated_at;
   }
 
   function scoreDelta(baseline, candidate) {
@@ -362,6 +381,7 @@
     runStatusesForView,
     buildRunsQuery,
     detailTabForView,
+    detailPresentation,
     routePatchForView,
     navigationPatchForDataset,
     runsScopeKey,
@@ -376,6 +396,7 @@
     selectCurrentPublished,
     sortRuns,
     sortRunsForView,
+    runTimestampForView,
     scoreDelta,
     shouldHandleClick,
     activateDialog,

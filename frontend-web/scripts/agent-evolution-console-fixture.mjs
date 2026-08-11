@@ -16,12 +16,12 @@ export function isValidBrowserClientID(value) {
 }
 
 const runs = [
-  { run_id: "run-open-a", package_id: "attention-agent", run_type: "agent_policy", status: "awaiting_approval", risk_level: "critical", priority_score: 96, updated_at: now, trigger_signal_count: 4 },
-  { run_id: "run-blocked", package_id: "knowledge-agent", run_type: "knowledge_release", status: "blocked", risk_level: "high", priority_score: 83, updated_at: now, trigger_signal_count: 2 },
-  { run_id: "run-failed", package_id: "runtime-agent", run_type: "combined", status: "failed", risk_level: "p1", priority_score: 79, updated_at: now, trigger_signal_count: 3 },
-  { run_id: "run-open-b", package_id: "research-agent", run_type: "combined", status: "evaluating", risk_level: "medium", priority_score: 61, updated_at: now, trigger_signal_count: 1 },
-  { run_id: "run-completed", package_id: "attention-agent", run_type: "agent_policy", status: "completed", risk_level: "critical", priority_score: 40, updated_at: "2026-08-11T10:00:00Z", trigger_signal_count: 2 },
-  { run_id: "run-rejected", package_id: "knowledge-agent", run_type: "knowledge_release", status: "rejected", risk_level: "low", priority_score: 35, updated_at: "2026-08-11T11:00:00Z", trigger_signal_count: 1 },
+  { run_id: "run-open-a", package_id: "attention-agent", run_type: "agent_policy", status: "awaiting_approval", risk_level: "critical", priority_score: 96, created_at: "2026-08-11T08:00:00Z", updated_at: now, trigger_signal_count: 4 },
+  { run_id: "run-blocked", package_id: "knowledge-agent", run_type: "knowledge_release", status: "blocked", risk_level: "high", priority_score: 83, created_at: "2026-08-11T08:30:00Z", updated_at: now, trigger_signal_count: 2 },
+  { run_id: "run-failed", package_id: "runtime-agent", run_type: "combined", status: "failed", risk_level: "p1", priority_score: 79, created_at: "2026-08-11T09:00:00Z", updated_at: now, trigger_signal_count: 3 },
+  { run_id: "run-open-b", package_id: "research-agent", run_type: "combined", status: "evaluating", risk_level: "medium", priority_score: 61, created_at: "2026-08-11T09:30:00Z", updated_at: now, trigger_signal_count: 1 },
+  { run_id: "run-completed", package_id: "attention-agent", run_type: "agent_policy", status: "completed", risk_level: "critical", priority_score: 40, created_at: "2026-08-11T10:00:00Z", updated_at: "2026-08-11T11:30:00Z", trigger_signal_count: 2 },
+  { run_id: "run-rejected", package_id: "knowledge-agent", run_type: "knowledge_release", status: "rejected", risk_level: "low", priority_score: 35, created_at: "2026-08-11T11:00:00Z", updated_at: "2026-08-11T09:00:00Z", trigger_signal_count: 1 },
 ];
 const terminalStatuses = ["completed", "blocked", "rejected", "failed", "superseded", "rolled_back"];
 

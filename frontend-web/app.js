@@ -4303,7 +4303,7 @@ function renderEvolutionQueue() {
           <small>${escapeHTML(evolutionTypeLabel(run.run_type))} · ${escapeHTML(evolutionStatusLabel(run.status))}</small>
           <small title="${escapeAttribute(run.run_id)}">任务 ${escapeHTML(evolutionCompactID(run.run_id, 24))}</small>
         </span>
-        <span class="evolution-run__score"><b>${Number(run.priority_score || 0).toFixed(1)}</b><small>${escapeHTML(evolutionTime(run.updated_at))}</small></span>
+        <span class="evolution-run__score"><b>${Number(run.priority_score || 0).toFixed(1)}</b><small>${escapeHTML(evolutionTime(AgentEvolutionConsole.runTimestampForView(run, evolutionConsoleState.route.view)))}</small></span>
       </a>
     `;
   }).join("");
@@ -4312,9 +4312,10 @@ function renderEvolutionQueue() {
 
 function renderEvolutionDetail() {
   const route = evolutionConsoleState.route;
+  const presentation = AgentEvolutionConsole.detailPresentation(route.view);
   if (!route.run) {
-    const presentation = AgentEvolutionConsole.queuePresentation(route.view);
-    return `<div class="evolution-console__detail-empty"><span>${escapeHTML(presentation.detailPrompt)}</span><strong>查看线上版本与演化上下文</strong><p>第一层仅提供只读态势，不会自动生成、审批或发布。</p></div>`;
+    const queuePresentation = AgentEvolutionConsole.queuePresentation(route.view);
+    return `<div class="evolution-console__detail-empty"><span>${escapeHTML(queuePresentation.detailPrompt)}</span><strong>查看线上版本与演化上下文</strong><p>第一层仅提供只读态势，不会自动生成、审批或发布。</p></div>`;
   }
   if (evolutionConsoleState.loading.detail && !evolutionConsoleState.selectedDetail) {
     return `<div class="evolution-console__state" role="status">正在读取任务详情…</div>`;
@@ -4345,12 +4346,12 @@ function renderEvolutionDetail() {
     </div>
   `;
   return `
-    <a class="evolution-console__detail-back" href="${escapeAttribute(evolutionRouteURL({ run: "", tab: "comparison" }))}">← 返回待办队列</a>
+    <a class="evolution-console__detail-back" href="${escapeAttribute(evolutionRouteURL({ run: "", tab: AgentEvolutionConsole.detailTabForView(route.view) }))}">← ${escapeHTML(presentation.backLabel)}</a>
     <header class="evolution-console__detail-head">
       <div><span>${escapeHTML(evolutionRiskLabel(run.risk_level))} · ${escapeHTML(evolutionTypeLabel(run.run_type))}</span><h2 title="${escapeAttribute(run.package_id || run.run_id)}">${escapeHTML(evolutionCompactID(run.package_id || run.run_id, 34))}</h2></div>
       <b class="evolution-console__status is-${escapeAttribute(run.status)}">${escapeHTML(evolutionStatusLabel(run.status))}</b>
     </header>
-    <nav class="evolution-console__detail-tabs" aria-label="任务详情">
+    <nav class="evolution-console__detail-tabs" aria-label="${escapeAttribute(presentation.tabsLabel)}">
       ${tabs.map(([value, label]) => `<a href="${escapeAttribute(evolutionRouteURL({ tab: value }))}" data-evolution-detail-tab="${value}" class="${route.tab === value ? "is-active" : ""}" ${route.tab === value ? 'aria-current="page"' : ""}>${label}</a>`).join("")}
     </nav>
     ${tabContent}
@@ -4397,6 +4398,7 @@ function renderEvolutionFleet() {
 function renderAgentEvolutionConsole() {
   const route = evolutionConsoleState.route;
   const queuePresentation = AgentEvolutionConsole.queuePresentation(route.view);
+  const detailPresentation = AgentEvolutionConsole.detailPresentation(route.view);
   const tabs = [["inbox", "演化待办"], ["fleet", "全部 Agent"], ["history", "演化历史"], ["rules", "演化规则"]];
   const statusMessage = evolutionConsoleState.loading.overview || evolutionConsoleState.loading.runs || evolutionConsoleState.loading.detail
     ? "正在同步演化控制面"
@@ -4419,7 +4421,7 @@ function renderAgentEvolutionConsole() {
       ` : `
         ${route.view === "fleet" ? "" : `<section class="evolution-console__workspace">
           <section class="evolution-console__queue" aria-labelledby="evolution-queue-title"><header><div><span>${escapeHTML(queuePresentation.indexLabel)}</span><h2 id="evolution-queue-title">${escapeHTML(queuePresentation.title)}</h2><small>${escapeHTML(queuePresentation.sortHint)}</small></div><b>${evolutionConsoleState.runs.length}</b></header><div>${renderEvolutionQueue()}</div></section>
-          <section class="evolution-console__detail" aria-labelledby="evolution-detail-title"><span class="visually-hidden" id="evolution-detail-title">线上版本对比</span>${renderEvolutionDetail()}</section>
+          <section class="evolution-console__detail" aria-label="${escapeAttribute(detailPresentation.sectionLabel)}">${renderEvolutionDetail()}</section>
         </section>`}
         <section class="evolution-console__fleet" aria-labelledby="evolution-fleet-title"><header><div><span>${route.view === "history" ? "版本与演化记录" : "当前服务编队"}</span><h2 id="evolution-fleet-title">${route.view === "history" ? "演化历史" : "全部 Agent"}</h2></div><small>一行一个 Agent · 历史版本默认折叠</small></header>${renderEvolutionFleet()}</section>
       `}

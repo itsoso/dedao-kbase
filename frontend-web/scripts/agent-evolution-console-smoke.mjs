@@ -77,6 +77,14 @@ assert.equal(helpers.buildRunsQuery({ ...parsed, view: "fleet" }), null, "fleet 
 assert.equal(helpers.buildRunsQuery({ ...parsed, view: "rules" }), null, "rules should not request runs");
 assert.equal(helpers.detailTabForView("history"), "audit");
 assert.equal(helpers.detailTabForView("inbox"), "comparison");
+assert.deepEqual(
+  { ...helpers.detailPresentation("history") },
+  { backLabel: "返回演化历史", sectionLabel: "演化历史详情", tabsLabel: "审计详情" },
+);
+assert.deepEqual(
+  { ...helpers.detailPresentation("inbox") },
+  { backLabel: "返回待办队列", sectionLabel: "线上版本对比", tabsLabel: "任务详情" },
+);
 const historyRoutePatch = helpers.routePatchForView("history");
 assert.equal(historyRoutePatch.run, "", "switching views must not retain a run from a different status scope");
 assert.equal(historyRoutePatch.tab, "audit");
@@ -120,18 +128,24 @@ const sorted = helpers.sortRuns([
 assert.deepEqual(Array.from(sorted, (run) => run.run_id), ["p0-low", "critical-signal", "p1-new", "p1-old", "p2-high", "p3-run"]);
 assert.ok(sorted.findIndex((run) => run.run_id === "critical-signal") < sorted.findIndex((run) => run.risk_level === "p3"));
 const historySorted = helpers.sortRunsForView([
-  { run_id: "history-b", risk_level: "p0", priority_score: 100, updated_at: "2026-08-11T09:00:00Z" },
-  { run_id: "history-z", risk_level: "p3", priority_score: 1, updated_at: "2026-08-11T10:00:00Z" },
-  { run_id: "history-a", risk_level: "p1", priority_score: 50, updated_at: "2026-08-11T10:00:00Z" },
+  { run_id: "history-b", risk_level: "p0", priority_score: 100, created_at: "2026-08-11T09:00:00Z", updated_at: "2026-08-11T12:00:00Z" },
+  { run_id: "history-z", risk_level: "p3", priority_score: 1, created_at: "2026-08-11T10:00:00Z", updated_at: "2026-08-11T08:00:00Z" },
+  { run_id: "history-a", risk_level: "p1", priority_score: 50, created_at: "2026-08-11T10:00:00Z", updated_at: "2026-08-11T11:00:00Z" },
 ], "history");
 assert.deepEqual(Array.from(historySorted, (run) => run.run_id), ["history-a", "history-z", "history-b"]);
 const historyPresentation = helpers.queuePresentation("history");
 assert.equal(historyPresentation.indexLabel, "01 / 按时间排序");
 assert.equal(historyPresentation.title, "演化历史");
-assert.equal(historyPresentation.sortHint, "按更新时间倒序");
+assert.equal(historyPresentation.sortHint, "按创建时间倒序");
 assert.equal(historyPresentation.emptyTitle, "暂无演化历史");
 assert.equal(historyPresentation.detailPrompt, "选择一条历史记录");
 assert.equal(Object.values(historyPresentation).some((value) => String(value).includes("待办")), false);
+assert.equal(
+  helpers.runTimestampForView({ created_at: "created", updated_at: "updated" }, "history"),
+  "created",
+  "history rows must show the timestamp used by the backend pagination order",
+);
+assert.equal(helpers.runTimestampForView({ created_at: "created", updated_at: "updated" }, "inbox"), "updated");
 const statusMetrics = helpers.overviewStatusMetrics({
   awaiting_approval: 2,
   blocked: 3,
@@ -347,6 +361,7 @@ for (const marker of [
   assert.ok(appSource.includes(marker), `Agent evolution behavior should include ${marker}`);
 }
 assert.ok(!appSource.includes('is-${escapeAttribute(run.risk_level'), "raw signal severities must not leak into risk CSS classes");
+assert.ok(appSource.includes("AgentEvolutionConsole.runTimestampForView(run, evolutionConsoleState.route.view)"), "queue rows must render their view-specific ordering timestamp");
 
 assert.ok(htmlSource.indexOf("/evolution-console.js") < htmlSource.indexOf("/app.js"), "helper should load before app.js");
 assert.ok(htmlSource.includes('<script src="/evolution-console.js?v='), "helper should be a classic versioned script");
@@ -357,6 +372,18 @@ assert.ok(indexRenderer.includes("renderAgentEvolutionConsole"), "package index 
 assert.ok(!indexRenderer.includes("${renderAgentCompiler()}"), "compiler must not remain permanently expanded");
 const evolutionRenderer = appSource.match(/function renderAgentEvolutionConsole\([\s\S]*?\n\}/)?.[0] || "";
 assert.ok(!evolutionRenderer.includes("aria-labelledby=\"agent-compiler-title\" open"), "compiler dialog must not be statically open");
+const detailRenderer = appSource.slice(
+  appSource.indexOf("function renderEvolutionDetail()"),
+  appSource.indexOf("function renderEvolutionFleet()"),
+);
+assert.ok(detailRenderer.includes("AgentEvolutionConsole.detailPresentation(route.view)"), "detail renderer must use view-specific presentation");
+assert.ok(detailRenderer.includes("AgentEvolutionConsole.detailTabForView(route.view)"), "detail back link must preserve the view's default tab");
+assert.ok(detailRenderer.includes("escapeHTML(presentation.backLabel)"), "detail back label must be rendered from the view presentation");
+assert.ok(detailRenderer.includes("escapeAttribute(presentation.tabsLabel)"), "detail tabs label must be rendered from the view presentation");
+assert.ok(!detailRenderer.includes("返回待办队列</a>"), "detail renderer must not hard-code the inbox back label");
+assert.ok(!detailRenderer.includes('aria-label="任务详情"'), "detail renderer must not hard-code the inbox tabs label");
+assert.ok(evolutionRenderer.includes('aria-label="${escapeAttribute(detailPresentation.sectionLabel)}"'), "detail section aria-label must be rendered from the view presentation");
+assert.ok(!evolutionRenderer.includes('aria-label="线上版本对比"'), "detail section must not hard-code the inbox title");
 
 for (const marker of [
   ".evolution-console",
