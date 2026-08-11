@@ -443,13 +443,23 @@ func (s *EvolutionControlStore) CreateRun(input EvolutionRunInput) (*EvolutionRu
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, fmt.Errorf("find evolution run replay: %w", err)
 	}
+	if err := s.insertEvolutionRunTx(tx, normalized.IdempotencyKey, inputHash, &run, event); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution run", err)
+	}
+	return cloneEvolutionRun(&run), true, nil
+}
+
+func (s *EvolutionControlStore) insertEvolutionRunTx(tx *sql.Tx, idempotencyKey, inputHash string, run *EvolutionRun, event EvolutionEvent) error {
 	baselineReleasesJSON, err := json.Marshal(run.BaselineReleaseIDs)
 	if err != nil {
-		return nil, false, fmt.Errorf("encode baseline release IDs: %w", err)
+		return fmt.Errorf("encode baseline release IDs: %w", err)
 	}
 	triggerSignalsJSON, err := json.Marshal(run.TriggerSignalIDs)
 	if err != nil {
-		return nil, false, fmt.Errorf("encode trigger signal IDs: %w", err)
+		return fmt.Errorf("encode trigger signal IDs: %w", err)
 	}
 	if _, err := tx.Exec(`
 		INSERT INTO evolution_runs (
@@ -458,19 +468,13 @@ func (s *EvolutionControlStore) CreateRun(input EvolutionRunInput) (*EvolutionRu
 			priority_score, status, trigger_signal_ids_json, current_candidate_id,
 			failure_code, failure_message, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, run.RunID, normalized.IdempotencyKey, inputHash, run.Attempt, run.RetryOfRunID, run.RunType,
+	`, run.RunID, idempotencyKey, inputHash, run.Attempt, run.RetryOfRunID, run.RunType,
 		run.PackageID, run.BaselinePackageVersion, string(baselineReleasesJSON), run.RiskLevel,
 		run.PriorityScore, run.Status, string(triggerSignalsJSON), run.CurrentCandidateID,
 		run.FailureCode, run.FailureMessage, run.CreatedAt, run.UpdatedAt); err != nil {
-		return nil, false, fmt.Errorf("insert evolution run: %w", err)
+		return fmt.Errorf("insert evolution run: %w", err)
 	}
-	if err := s.insertEventTx(tx, event); err != nil {
-		return nil, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution run", err)
-	}
-	return cloneEvolutionRun(&run), true, nil
+	return s.insertEventTx(tx, event)
 }
 
 func (s *EvolutionControlStore) LoadRun(runID string) (*EvolutionRun, error) {
