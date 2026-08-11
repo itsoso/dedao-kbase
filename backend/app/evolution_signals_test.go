@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -998,15 +999,50 @@ func TestEvolutionRunListUsesImmutableKeysetWhenPriorityChanges(t *testing.T) {
 	`)
 }
 
-func TestEvolutionRunCursorRejectsOversizedInputAndPayload(t *testing.T) {
-	if _, err := decodeEvolutionRunCursor(strings.Repeat("A", 513)); err == nil || !strings.Contains(err.Error(), "cursor input exceeds") {
-		t.Fatalf("oversized encoded cursor error = %v", err)
+func TestEvolutionRunCursorEncodeDecodeBoundaries(t *testing.T) {
+	timestamp := time.Date(2026, 8, 11, 10, 0, 0, 123, time.UTC).UnixNano()
+	normal, err := encodeEvolutionRunCursor(timestamp, "run-normal")
+	if err != nil {
+		t.Fatal(err)
 	}
-	decodedOversize := base64.RawURLEncoding.EncodeToString([]byte(strings.Repeat(" ", 300)))
-	if len(decodedOversize) > 512 {
-		t.Fatalf("test payload encoded length = %d", len(decodedOversize))
+	decoded, err := decodeEvolutionRunCursor(normal)
+	if err != nil || decoded.CreatedAtUnixNano != timestamp || decoded.RunID != "run-normal" {
+		t.Fatalf("normal round trip = %#v, %v", decoded, err)
 	}
-	if _, err := decodeEvolutionRunCursor(decodedOversize); err == nil || !strings.Contains(err.Error(), "cursor payload exceeds") {
+
+	nearLimitRunID := ""
+	for size := EvolutionIdentityMaxRunes; size > 0; size-- {
+		candidate := strings.Repeat("r", size)
+		payload, err := json.Marshal(evolutionRunCursor{CreatedAtUnixNano: timestamp, RunID: candidate})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(payload) <= evolutionRunCursorMaxPayload {
+			nearLimitRunID = candidate
+			if evolutionRunCursorMaxPayload-len(payload) > 1 {
+				t.Fatalf("near-limit payload length = %d", len(payload))
+			}
+			break
+		}
+	}
+	nearLimit, err := encodeEvolutionRunCursor(timestamp, nearLimitRunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err = decodeEvolutionRunCursor(nearLimit)
+	if err != nil || decoded.RunID != nearLimitRunID || decoded.CreatedAtUnixNano != timestamp {
+		t.Fatalf("near-limit round trip = %#v, %v", decoded, err)
+	}
+
+	oversizedRunID := strings.Repeat("r", EvolutionIdentityMaxRunes)
+	if _, err := encodeEvolutionRunCursor(timestamp, oversizedRunID); err == nil || !strings.Contains(err.Error(), "cursor payload exceeds") {
+		t.Fatalf("oversized encoded payload error = %v", err)
+	}
+	wantEncodedMax := base64.RawURLEncoding.EncodedLen(evolutionRunCursorMaxPayload)
+	if evolutionRunCursorMaxInputBytes != wantEncodedMax {
+		t.Fatalf("encoded cursor limit = %d, want derived %d", evolutionRunCursorMaxInputBytes, wantEncodedMax)
+	}
+	if _, err := decodeEvolutionRunCursor(strings.Repeat("A", wantEncodedMax+1)); err == nil || !strings.Contains(err.Error(), "cursor input exceeds") {
 		t.Fatalf("oversized decoded cursor error = %v", err)
 	}
 }

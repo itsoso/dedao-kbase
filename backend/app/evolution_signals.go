@@ -56,8 +56,8 @@ const (
 	evolutionUnresolvedBaseline     = "unresolved"
 	evolutionRunPageDefaultLimit    = 50
 	evolutionRunPageMaxLimit        = 200
-	evolutionRunCursorMaxInputBytes = 512
 	evolutionRunCursorMaxPayload    = 256
+	evolutionRunCursorMaxInputBytes = (evolutionRunCursorMaxPayload*8 + 5) / 6
 
 	EvolutionObservationPayloadComplete       = "complete"
 	EvolutionObservationPayloadLegacyHashOnly = "legacy_hash_only"
@@ -928,7 +928,14 @@ func encodeEvolutionRunCursor(createdAtUnixNano int64, runID string) (string, er
 	if err != nil {
 		return "", fmt.Errorf("encode evolution run cursor: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(payload), nil
+	if len(payload) > evolutionRunCursorMaxPayload {
+		return "", fmt.Errorf("evolution run cursor payload exceeds %d bytes", evolutionRunCursorMaxPayload)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	if len(encoded) > evolutionRunCursorMaxInputBytes {
+		return "", fmt.Errorf("evolution run cursor input exceeds %d bytes", evolutionRunCursorMaxInputBytes)
+	}
+	return encoded, nil
 }
 
 func decodeEvolutionRunCursor(value string) (evolutionRunCursor, error) {
