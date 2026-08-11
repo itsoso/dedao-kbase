@@ -31,22 +31,6 @@ func TestEvolutionRunTransitionContract(t *testing.T) {
 	}
 }
 
-func TestEvolutionTerminalAndSideStatesCannotResumeInPlace(t *testing.T) {
-	terminal := []EvolutionRunStatus{
-		EvolutionBlocked,
-		EvolutionRejected,
-		EvolutionFailed,
-		EvolutionCompleted,
-		EvolutionSuperseded,
-		EvolutionRolledBack,
-	}
-	for _, status := range terminal {
-		if err := ValidateEvolutionTransition(status, EvolutionTriaged); err == nil {
-			t.Fatalf("terminal run %s resumed in place", status)
-		}
-	}
-}
-
 func TestEvolutionRunTransitionRejectionMatrix(t *testing.T) {
 	known := []EvolutionRunStatus{
 		EvolutionDetected,
@@ -341,6 +325,22 @@ func TestEvolutionRunValidationRequiresScopeAndLineage(t *testing.T) {
 			run.RetryOfRunID = ""
 			return run
 		}()},
+		{name: "first attempt parent", run: func() EvolutionRun {
+			run := validEvolutionRun()
+			run.RetryOfRunID = "run-parent"
+			return run
+		}()},
+		{name: "retry self reference", run: func() EvolutionRun {
+			run := validEvolutionRun()
+			run.Attempt = 2
+			run.RetryOfRunID = run.RunID
+			return run
+		}()},
+		{name: "zero attempt", run: func() EvolutionRun {
+			run := validEvolutionRun()
+			run.Attempt = 0
+			return run
+		}()},
 		{name: "knowledge baseline", run: func() EvolutionRun {
 			run := validEvolutionRun()
 			run.RunType = EvolutionRunKnowledgeRelease
@@ -354,6 +354,145 @@ func TestEvolutionRunValidationRequiresScopeAndLineage(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if err := test.run.Validate(); err == nil {
 				t.Fatal("run without required scope or lineage accepted")
+			}
+		})
+	}
+}
+
+func TestEvolutionEventTransitionContract(t *testing.T) {
+	initial := validEvolutionEvent()
+	initial.EventType = "created"
+	initial.FromStatus = ""
+	initial.ToStatus = EvolutionDetected
+	if err := initial.Validate(); err != nil {
+		t.Fatalf("initial event: %v", err)
+	}
+
+	transition := validEvolutionEvent()
+	if err := transition.Validate(); err != nil {
+		t.Fatalf("transition event: %v", err)
+	}
+
+	note := validEvolutionEvent()
+	note.EventType = "note"
+	note.FromStatus = ""
+	note.ToStatus = ""
+	note.Message = "bounded operator note"
+	if err := note.Validate(); err != nil {
+		t.Fatalf("non-transition event: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*EvolutionEvent)
+	}{
+		{name: "approval bypass", mutate: func(event *EvolutionEvent) {
+			event.FromStatus = EvolutionDetected
+			event.ToStatus = EvolutionPublishing
+		}},
+		{name: "missing source", mutate: func(event *EvolutionEvent) {
+			event.FromStatus = ""
+			event.ToStatus = EvolutionTriaged
+		}},
+		{name: "missing target", mutate: func(event *EvolutionEvent) {
+			event.FromStatus = EvolutionDetected
+			event.ToStatus = ""
+		}},
+		{name: "self transition", mutate: func(event *EvolutionEvent) {
+			event.FromStatus = EvolutionDetected
+			event.ToStatus = EvolutionDetected
+		}},
+		{name: "empty non-transition message", mutate: func(event *EvolutionEvent) {
+			event.EventType = "note"
+			event.FromStatus = ""
+			event.ToStatus = ""
+			event.Message = ""
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			event := validEvolutionEvent()
+			test.mutate(&event)
+			if err := event.Validate(); err == nil {
+				t.Fatal("invalid event transition accepted")
+			}
+		})
+	}
+}
+
+func TestEvolutionRecordTimeOrdering(t *testing.T) {
+	runEqual := validEvolutionRun()
+	runEqual.UpdatedAt = runEqual.CreatedAt
+	if err := runEqual.Validate(); err != nil {
+		t.Fatalf("equal run timestamps: %v", err)
+	}
+
+	for _, test := range []struct {
+		name     string
+		validate func() error
+	}{
+		{name: "run reversed", validate: func() error {
+			record := validEvolutionRun()
+			record.CreatedAt = "2026-08-11T13:00:00Z"
+			record.UpdatedAt = "2026-08-11T12:00:00Z"
+			return record.Validate()
+		}},
+		{name: "approval equal", validate: func() error {
+			record := validEvolutionApproval()
+			record.ExpiresAt = record.CreatedAt
+			return record.Validate()
+		}},
+		{name: "approval reversed", validate: func() error {
+			record := validEvolutionApproval()
+			record.ExpiresAt = "2026-08-11T11:00:00Z"
+			return record.Validate()
+		}},
+		{name: "observation equal", validate: func() error {
+			record := validEvolutionObservation()
+			record.WindowEnd = record.WindowStart
+			return record.Validate()
+		}},
+		{name: "observation reversed", validate: func() error {
+			record := validEvolutionObservation()
+			record.WindowEnd = "2026-08-11T11:00:00Z"
+			return record.Validate()
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.validate(); err == nil {
+				t.Fatal("invalid time order accepted")
+			}
+		})
+	}
+}
+
+func TestEvolutionValidationErrorsAreStable(t *testing.T) {
+	approval := validEvolutionApproval()
+	approval.ApprovalID = ""
+	approval.RunID = ""
+
+	scorecard := validEvolutionScorecard()
+	scorecard.Metrics = map[string]float64{
+		"bad metric": math.NaN(),
+		"also bad":   math.Inf(1),
+	}
+
+	for _, record := range []struct {
+		name     string
+		validate func() error
+	}{
+		{name: "ordered fields", validate: approval.Validate},
+		{name: "ordered map keys", validate: scorecard.Validate},
+	} {
+		t.Run(record.name, func(t *testing.T) {
+			first := record.validate()
+			if first == nil {
+				t.Fatal("invalid record accepted")
+			}
+			for iteration := 0; iteration < 100; iteration++ {
+				next := record.validate()
+				if next == nil || next.Error() != first.Error() {
+					t.Fatalf("unstable error: first=%v next=%v", first, next)
+				}
 			}
 		})
 	}

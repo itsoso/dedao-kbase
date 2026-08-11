@@ -3,6 +3,7 @@ package app
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -235,13 +236,13 @@ func NewEvolutionRetry(original EvolutionRun, newRunID string, now time.Time) (E
 }
 
 func (signal EvolutionSignal) Validate() error {
-	for field, value := range map[string]string{
-		"source_id":  signal.SourceID,
-		"package_id": signal.PackageID,
-		"release_id": signal.ReleaseID,
+	for _, field := range []evolutionStringField{
+		{name: "source_id", value: signal.SourceID},
+		{name: "package_id", value: signal.PackageID},
+		{name: "release_id", value: signal.ReleaseID},
 	} {
-		if value != "" {
-			if err := validateEvolutionIdentity(field, value); err != nil {
+		if field.value != "" {
+			if err := validateEvolutionIdentity(field.name, field.value); err != nil {
 				return err
 			}
 		}
@@ -252,14 +253,12 @@ func (signal EvolutionSignal) Validate() error {
 	if signal.SourceID == "" && signal.PackageID == "" && signal.ReleaseID == "" {
 		return fmt.Errorf("signal requires an affected identity")
 	}
-	for field, value := range map[string]string{
-		"signal_type": signal.SignalType,
-		"source_type": signal.SourceType,
-		"severity":    signal.Severity,
-	} {
-		if err := validateEvolutionCode(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionCodeFields(
+		evolutionStringField{name: "signal_type", value: signal.SignalType},
+		evolutionStringField{name: "source_type", value: signal.SourceType},
+		evolutionStringField{name: "severity", value: signal.Severity},
+	); err != nil {
+		return err
 	}
 	if err := validateEvolutionReference("deduplication_key", signal.DeduplicationKey); err != nil {
 		return err
@@ -287,10 +286,11 @@ func (run EvolutionRun) Validate() error {
 		if err := validateEvolutionIdentity("retry_of_run_id", run.RetryOfRunID); err != nil {
 			return err
 		}
-	} else if run.RetryOfRunID != "" {
-		if err := validateEvolutionIdentity("retry_of_run_id", run.RetryOfRunID); err != nil {
-			return err
+		if run.RetryOfRunID == run.RunID {
+			return fmt.Errorf("retry_of_run_id must differ from run_id")
 		}
+	} else if run.RetryOfRunID != "" {
+		return fmt.Errorf("first attempt must not have retry_of_run_id")
 	}
 	if !isKnownEvolutionRunType(run.RunType) {
 		return fmt.Errorf("unknown evolution run type %q", run.RunType)
@@ -323,33 +323,37 @@ func (run EvolutionRun) Validate() error {
 	if err := validateEvolutionText("failure_message", run.FailureMessage, EvolutionFailureMessageMaxRunes); err != nil {
 		return err
 	}
-	if err := validateEvolutionTimestamp("created_at", run.CreatedAt); err != nil {
+	createdAt, err := parseEvolutionTimestamp("created_at", run.CreatedAt)
+	if err != nil {
 		return err
 	}
-	return validateEvolutionTimestamp("updated_at", run.UpdatedAt)
+	updatedAt, err := parseEvolutionTimestamp("updated_at", run.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	if updatedAt.Before(createdAt) {
+		return fmt.Errorf("updated_at must not be before created_at")
+	}
+	return nil
 }
 
 func (candidate EvolutionCandidate) Validate() error {
-	for field, value := range map[string]string{
-		"candidate_id":      candidate.CandidateID,
-		"run_id":            candidate.RunID,
-		"generator_version": candidate.GeneratorVersion,
-	} {
-		if err := validateEvolutionIdentity(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionIdentityFields(
+		evolutionStringField{name: "candidate_id", value: candidate.CandidateID},
+		evolutionStringField{name: "run_id", value: candidate.RunID},
+		evolutionStringField{name: "generator_version", value: candidate.GeneratorVersion},
+	); err != nil {
+		return err
 	}
 	if err := validateEvolutionCode("candidate_type", candidate.CandidateType); err != nil {
 		return err
 	}
-	for field, value := range map[string]string{
-		"content_hash":      candidate.ContentHash,
-		"artifact_ref":      candidate.ArtifactRef,
-		"baseline_identity": candidate.BaselineIdentity,
-	} {
-		if err := validateEvolutionReference(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionReferenceFields(
+		evolutionStringField{name: "content_hash", value: candidate.ContentHash},
+		evolutionStringField{name: "artifact_ref", value: candidate.ArtifactRef},
+		evolutionStringField{name: "baseline_identity", value: candidate.BaselineIdentity},
+	); err != nil {
+		return err
 	}
 	if strings.TrimSpace(candidate.ChangeSummary) == "" {
 		return fmt.Errorf("change_summary is required")
@@ -361,15 +365,13 @@ func (candidate EvolutionCandidate) Validate() error {
 }
 
 func (scorecard EvolutionScorecard) Validate() error {
-	for field, value := range map[string]string{
-		"scorecard_id":   scorecard.ScorecardID,
-		"candidate_id":   scorecard.CandidateID,
-		"suite_version":  scorecard.SuiteVersion,
-		"scorer_version": scorecard.ScorerVersion,
-	} {
-		if err := validateEvolutionIdentity(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionIdentityFields(
+		evolutionStringField{name: "scorecard_id", value: scorecard.ScorecardID},
+		evolutionStringField{name: "candidate_id", value: scorecard.CandidateID},
+		evolutionStringField{name: "suite_version", value: scorecard.SuiteVersion},
+		evolutionStringField{name: "scorer_version", value: scorecard.ScorerVersion},
+	); err != nil {
+		return err
 	}
 	if err := validateEvolutionReference("baseline_identity", scorecard.BaselineIdentity); err != nil {
 		return err
@@ -383,12 +385,12 @@ func (scorecard EvolutionScorecard) Validate() error {
 	if err := validateEvolutionMetrics("metrics", scorecard.Metrics, true); err != nil {
 		return err
 	}
-	for field, value := range map[string]float64{
-		"weighted_score": scorecard.WeightedScore,
-		"baseline_score": scorecard.BaselineScore,
-		"delta":          scorecard.Delta,
+	for _, field := range []evolutionNumberField{
+		{name: "weighted_score", value: scorecard.WeightedScore},
+		{name: "baseline_score", value: scorecard.BaselineScore},
+		{name: "delta", value: scorecard.Delta},
 	} {
-		if err := validateEvolutionNumber(field, value); err != nil {
+		if err := validateEvolutionNumber(field.name, field.value); err != nil {
 			return err
 		}
 	}
@@ -396,50 +398,50 @@ func (scorecard EvolutionScorecard) Validate() error {
 }
 
 func (approval EvolutionApproval) Validate() error {
-	for field, value := range map[string]string{
-		"approval_id":  approval.ApprovalID,
-		"run_id":       approval.RunID,
-		"candidate_id": approval.CandidateID,
-		"scorecard_id": approval.ScorecardID,
-		"approved_by":  approval.ApprovedBy,
-	} {
-		if err := validateEvolutionIdentity(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionIdentityFields(
+		evolutionStringField{name: "approval_id", value: approval.ApprovalID},
+		evolutionStringField{name: "run_id", value: approval.RunID},
+		evolutionStringField{name: "candidate_id", value: approval.CandidateID},
+		evolutionStringField{name: "scorecard_id", value: approval.ScorecardID},
+		evolutionStringField{name: "approved_by", value: approval.ApprovedBy},
+	); err != nil {
+		return err
 	}
-	for field, value := range map[string]string{
-		"candidate_content_hash": approval.CandidateContentHash,
-		"baseline_identity":      approval.BaselineIdentity,
-	} {
-		if err := validateEvolutionReference(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionReferenceFields(
+		evolutionStringField{name: "candidate_content_hash", value: approval.CandidateContentHash},
+		evolutionStringField{name: "baseline_identity", value: approval.BaselineIdentity},
+	); err != nil {
+		return err
 	}
-	for field, value := range map[string]string{
-		"decision":    approval.Decision,
-		"reason_code": approval.ReasonCode,
-	} {
-		if err := validateEvolutionCode(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionCodeFields(
+		evolutionStringField{name: "decision", value: approval.Decision},
+		evolutionStringField{name: "reason_code", value: approval.ReasonCode},
+	); err != nil {
+		return err
 	}
 	if err := validateEvolutionText("note", approval.Note, EvolutionApprovalNoteMaxRunes); err != nil {
 		return err
 	}
-	if err := validateEvolutionTimestamp("created_at", approval.CreatedAt); err != nil {
+	createdAt, err := parseEvolutionTimestamp("created_at", approval.CreatedAt)
+	if err != nil {
 		return err
 	}
-	return validateEvolutionTimestamp("expires_at", approval.ExpiresAt)
+	expiresAt, err := parseEvolutionTimestamp("expires_at", approval.ExpiresAt)
+	if err != nil {
+		return err
+	}
+	if !expiresAt.After(createdAt) {
+		return fmt.Errorf("expires_at must be after created_at")
+	}
+	return nil
 }
 
 func (observation EvolutionObservation) Validate() error {
-	for field, value := range map[string]string{
-		"observation_id": observation.ObservationID,
-		"run_id":         observation.RunID,
-	} {
-		if err := validateEvolutionIdentity(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionIdentityFields(
+		evolutionStringField{name: "observation_id", value: observation.ObservationID},
+		evolutionStringField{name: "run_id", value: observation.RunID},
+	); err != nil {
+		return err
 	}
 	if err := validateEvolutionReference("published_identity", observation.PublishedIdentity); err != nil {
 		return err
@@ -449,11 +451,16 @@ func (observation EvolutionObservation) Validate() error {
 			return err
 		}
 	}
-	if err := validateEvolutionTimestamp("window_start", observation.WindowStart); err != nil {
+	windowStart, err := parseEvolutionTimestamp("window_start", observation.WindowStart)
+	if err != nil {
 		return err
 	}
-	if err := validateEvolutionTimestamp("window_end", observation.WindowEnd); err != nil {
+	windowEnd, err := parseEvolutionTimestamp("window_end", observation.WindowEnd)
+	if err != nil {
 		return err
+	}
+	if !windowEnd.After(windowStart) {
+		return fmt.Errorf("window_end must be after window_start")
 	}
 	if err := validateEvolutionMetrics("metrics", observation.Metrics, true); err != nil {
 		return err
@@ -465,23 +472,31 @@ func (observation EvolutionObservation) Validate() error {
 }
 
 func (event EvolutionEvent) Validate() error {
-	for field, value := range map[string]string{
-		"event_id": event.EventID,
-		"run_id":   event.RunID,
-		"actor":    event.Actor,
-	} {
-		if err := validateEvolutionIdentity(field, value); err != nil {
-			return err
-		}
+	if err := validateEvolutionIdentityFields(
+		evolutionStringField{name: "event_id", value: event.EventID},
+		evolutionStringField{name: "run_id", value: event.RunID},
+		evolutionStringField{name: "actor", value: event.Actor},
+	); err != nil {
+		return err
 	}
 	if err := validateEvolutionCode("event_type", event.EventType); err != nil {
 		return err
 	}
-	if event.FromStatus != "" && !isKnownEvolutionRunStatus(event.FromStatus) {
-		return fmt.Errorf("unknown evolution run status %q", event.FromStatus)
-	}
-	if !isKnownEvolutionRunStatus(event.ToStatus) {
-		return fmt.Errorf("unknown evolution run status %q", event.ToStatus)
+	switch {
+	case event.FromStatus == "" && event.ToStatus == "":
+		if event.EventType == "transition" || strings.TrimSpace(event.Message) == "" {
+			return fmt.Errorf("non-transition event requires a message event type and message")
+		}
+	case event.FromStatus == "":
+		if event.ToStatus != EvolutionDetected {
+			return fmt.Errorf("initial event must transition to %q", EvolutionDetected)
+		}
+	case event.ToStatus == "":
+		return fmt.Errorf("transition event requires to_status")
+	default:
+		if err := ValidateEvolutionTransition(event.FromStatus, event.ToStatus); err != nil {
+			return err
+		}
 	}
 	if err := validateEvolutionCode("code", event.Code); err != nil {
 		return err
@@ -542,6 +557,43 @@ func isEvolutionRetryableStatus(status EvolutionRunStatus) bool {
 	default:
 		return false
 	}
+}
+
+type evolutionStringField struct {
+	name  string
+	value string
+}
+
+type evolutionNumberField struct {
+	name  string
+	value float64
+}
+
+func validateEvolutionIdentityFields(fields ...evolutionStringField) error {
+	for _, field := range fields {
+		if err := validateEvolutionIdentity(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvolutionCodeFields(fields ...evolutionStringField) error {
+	for _, field := range fields {
+		if err := validateEvolutionCode(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateEvolutionReferenceFields(fields ...evolutionStringField) error {
+	for _, field := range fields {
+		if err := validateEvolutionReference(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func validateEvolutionRunScope(run EvolutionRun) error {
@@ -650,7 +702,12 @@ func validateEvolutionHardGates(gates map[string]bool) error {
 	if len(gates) > EvolutionMetricMaxItems {
 		return fmt.Errorf("hard_gates exceeds %d items", EvolutionMetricMaxItems)
 	}
+	names := make([]string, 0, len(gates))
 	for name := range gates {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		if err := validateEvolutionCode("hard_gates key", name); err != nil {
 			return err
 		}
@@ -665,11 +722,16 @@ func validateEvolutionMetrics(field string, metrics map[string]float64, required
 	if len(metrics) > EvolutionMetricMaxItems {
 		return fmt.Errorf("%s exceeds %d items", field, EvolutionMetricMaxItems)
 	}
-	for name, value := range metrics {
+	names := make([]string, 0, len(metrics))
+	for name := range metrics {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		if err := validateEvolutionCode(field+" key", name); err != nil {
 			return err
 		}
-		if err := validateEvolutionNumber(field+" value", value); err != nil {
+		if err := validateEvolutionNumber(field+" value", metrics[name]); err != nil {
 			return err
 		}
 	}
@@ -684,11 +746,16 @@ func validateEvolutionNumber(field string, value float64) error {
 }
 
 func validateEvolutionTimestamp(field, value string) error {
+	_, err := parseEvolutionTimestamp(field, value)
+	return err
+}
+
+func parseEvolutionTimestamp(field, value string) (time.Time, error) {
 	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil || parsed.IsZero() {
-		return fmt.Errorf("%s must be a non-zero RFC3339 timestamp", field)
+		return time.Time{}, fmt.Errorf("%s must be a non-zero RFC3339 timestamp", field)
 	}
-	return nil
+	return parsed, nil
 }
 
 func validateEvolutionText(field, value string, maxRunes int) error {
