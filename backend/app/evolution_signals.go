@@ -100,6 +100,13 @@ type EvolutionRunPage struct {
 	NextCursor string         `json:"next_cursor"`
 }
 
+type EvolutionRunFilter struct {
+	Statuses   []EvolutionRunStatus
+	RiskLevels []string
+	RunTypes   []EvolutionRunType
+	PackageID  string
+}
+
 type evolutionRunCursor struct {
 	CreatedAtUnixNano int64  `json:"created_at_unix_nano"`
 	RunID             string `json:"run_id"`
@@ -771,7 +778,11 @@ func BuildEvolutionOverview(records []AgentPackageRecord, runs []EvolutionRun) (
 }
 
 func (s *EvolutionControlStore) EvolutionOverview(records []AgentPackageRecord) (*EvolutionOverview, error) {
-	runs, err := s.listAllEvolutionRuns()
+	return s.EvolutionOverviewContext(context.Background(), records)
+}
+
+func (s *EvolutionControlStore) EvolutionOverviewContext(ctx context.Context, records []AgentPackageRecord) (*EvolutionOverview, error) {
+	runs, err := s.listAllEvolutionRunsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -779,7 +790,18 @@ func (s *EvolutionControlStore) EvolutionOverview(records []AgentPackageRecord) 
 }
 
 func (s *EvolutionControlStore) ListEvolutionRuns(after string, limit int) (*EvolutionRunPage, error) {
+	return s.ListEvolutionRunsFiltered(context.Background(), EvolutionRunFilter{}, after, limit)
+}
+
+func (s *EvolutionControlStore) ListEvolutionRunsFiltered(ctx context.Context, filter EvolutionRunFilter, after string, limit int) (*EvolutionRunPage, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("evolution run query context is required")
+	}
 	limit, err := normalizeEvolutionRunLimit(limit)
+	if err != nil {
+		return nil, err
+	}
+	where, filterArgs, err := buildEvolutionRunFilter(filter)
 	if err != nil {
 		return nil, err
 	}
@@ -790,7 +812,11 @@ func (s *EvolutionControlStore) ListEvolutionRuns(after string, limit int) (*Evo
 			return nil, err
 		}
 		var exists int
-		err = s.db.QueryRow(`SELECT 1 FROM evolution_runs WHERE run_id = ? AND created_at_unix_nano = ?`, cursor.RunID, cursor.CreatedAtUnixNano).Scan(&exists)
+		cursorWhere := append([]string{}, where...)
+		cursorWhere = append(cursorWhere, "run_id = ?", "created_at_unix_nano = ?")
+		cursorArgs := append([]any{}, filterArgs...)
+		cursorArgs = append(cursorArgs, cursor.RunID, cursor.CreatedAtUnixNano)
+		err = s.db.QueryRowContext(ctx, `SELECT 1 FROM evolution_runs WHERE `+strings.Join(cursorWhere, " AND "), cursorArgs...).Scan(&exists)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrEvolutionRunCursorNotFound
 		}
@@ -799,14 +825,17 @@ func (s *EvolutionControlStore) ListEvolutionRuns(after string, limit int) (*Evo
 		}
 	}
 	query := evolutionRunSelect
-	args := make([]any, 0, 4)
+	args := append([]any{}, filterArgs...)
 	if after != "" {
-		query += ` WHERE created_at_unix_nano < ? OR (created_at_unix_nano = ? AND run_id > ?)`
+		where = append(where, `(created_at_unix_nano < ? OR (created_at_unix_nano = ? AND run_id > ?))`)
 		args = append(args, cursor.CreatedAtUnixNano, cursor.CreatedAtUnixNano, cursor.RunID)
+	}
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
 	query += ` ORDER BY created_at_unix_nano DESC, run_id ASC LIMIT ?`
 	args = append(args, limit+1)
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list evolution runs page: %w", err)
 	}
@@ -839,7 +868,14 @@ func (s *EvolutionControlStore) ListEvolutionRuns(after string, limit int) (*Evo
 }
 
 func (s *EvolutionControlStore) listAllEvolutionRuns() ([]EvolutionRun, error) {
-	rows, err := s.db.Query(evolutionRunSelect)
+	return s.listAllEvolutionRunsContext(context.Background())
+}
+
+func (s *EvolutionControlStore) listAllEvolutionRunsContext(ctx context.Context) ([]EvolutionRun, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("evolution run query context is required")
+	}
+	rows, err := s.db.QueryContext(ctx, evolutionRunSelect)
 	if err != nil {
 		return nil, fmt.Errorf("list evolution runs: %w", err)
 	}
@@ -859,6 +895,57 @@ func (s *EvolutionControlStore) listAllEvolutionRuns() ([]EvolutionRun, error) {
 		return nil, err
 	}
 	return runs, nil
+}
+
+func buildEvolutionRunFilter(filter EvolutionRunFilter) ([]string, []any, error) {
+	where := make([]string, 0, 4)
+	args := make([]any, 0, len(filter.Statuses)+len(filter.RiskLevels)+len(filter.RunTypes)+1)
+	appendValues := func(column string, values []any) {
+		placeholders := make([]string, len(values))
+		for index, value := range values {
+			placeholders[index] = "?"
+			args = append(args, value)
+		}
+		where = append(where, column+" IN ("+strings.Join(placeholders, ",")+")")
+	}
+	if len(filter.Statuses) > 0 {
+		values := make([]any, 0, len(filter.Statuses))
+		for _, status := range filter.Statuses {
+			if !isKnownEvolutionRunStatus(status) {
+				return nil, nil, fmt.Errorf("unknown evolution run status %q", status)
+			}
+			values = append(values, status)
+		}
+		appendValues("status", values)
+	}
+	if len(filter.RiskLevels) > 0 {
+		values := make([]any, 0, len(filter.RiskLevels))
+		for _, risk := range filter.RiskLevels {
+			if err := validateEvolutionCode("risk", risk); err != nil {
+				return nil, nil, err
+			}
+			values = append(values, risk)
+		}
+		appendValues("risk_level", values)
+	}
+	if len(filter.RunTypes) > 0 {
+		values := make([]any, 0, len(filter.RunTypes))
+		for _, runType := range filter.RunTypes {
+			if !isKnownEvolutionRunType(runType) {
+				return nil, nil, fmt.Errorf("unknown evolution run type %q", runType)
+			}
+			values = append(values, runType)
+		}
+		appendValues("run_type", values)
+	}
+	if filter.PackageID != "" {
+		if err := validateEvolutionIdentity("package", filter.PackageID); err != nil {
+			return nil, nil, err
+		}
+		where = append(where, "package_id = ?")
+		args = append(args, filter.PackageID)
+	}
+	return where, args, nil
 }
 
 func PaginateEvolutionRuns(runs []EvolutionRun, after string, limit int) (*EvolutionRunPage, error) {

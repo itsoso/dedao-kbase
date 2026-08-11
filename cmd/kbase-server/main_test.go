@@ -45,6 +45,7 @@ func configureValidCheckConfigEnvironment(t *testing.T, dbPath string) map[strin
 	t.Setenv("KBASE_BROWSER_SESSION_DB_PATH", dbPath)
 	t.Setenv("KBASE_PUBLIC_ORIGIN", "https://kbase.example.test")
 	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", "")
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "")
 	for _, key := range []string{
 		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",
 		"KBASE_HTTP_READ_TIMEOUT_SECONDS",
@@ -65,6 +66,63 @@ func TestSourceAgentArtifactRootUsesOnlyExplicitEnvironment(t *testing.T) {
 	t.Setenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT", "  relative-artifact-root  ")
 	if got := defaultSourceAgentArtifactRoot(); got != "relative-artifact-root" {
 		t.Fatalf("defaultSourceAgentArtifactRoot() = %q", got)
+	}
+}
+
+func TestEvolutionEnabledEnvironmentDefaultsOnAndAcceptsExplicitOff(t *testing.T) {
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "")
+	enabled, err := evolutionEnabledFromEnvironment()
+	if err != nil || !enabled {
+		t.Fatalf("unset evolution flag = %v, %v; want enabled", enabled, err)
+	}
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "0")
+	enabled, err = evolutionEnabledFromEnvironment()
+	if err != nil || enabled {
+		t.Fatalf("disabled evolution flag = %v, %v; want disabled", enabled, err)
+	}
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "invalid")
+	if _, err := evolutionEnabledFromEnvironment(); err == nil || !strings.Contains(err.Error(), "KBASE_EVOLUTION_ENABLED") {
+		t.Fatalf("invalid evolution flag error = %v", err)
+	}
+}
+
+func TestRunCommandPassesEvolutionFeatureFlag(t *testing.T) {
+	configureValidCheckConfigEnvironment(t, filepath.Join(t.TempDir(), "sessions.sqlite3"))
+	t.Setenv("KBASE_EVOLUTION_ENABLED", "0")
+	var captured kBaseServerConfig
+	if err := runCommandWithServerRunner(nil, &bytes.Buffer{}, func(config kBaseServerConfig) error {
+		captured = config
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if captured.EvolutionEnabled {
+		t.Fatal("explicitly disabled evolution control plane was enabled")
+	}
+}
+
+func TestOpenEvolutionControlStoreForServerSkipsDisabledStorage(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing-root")
+	store, err := openEvolutionControlStoreForServer(false, root)
+	if err != nil || store != nil {
+		t.Fatalf("disabled store = %#v, %v", store, err)
+	}
+	if _, statErr := os.Stat(root); !os.IsNotExist(statErr) {
+		t.Fatalf("disabled evolution runtime touched root: %v", statErr)
+	}
+
+	store, err = openEvolutionControlStoreForServer(true, root)
+	if err != nil || store == nil {
+		t.Fatalf("enabled store = %#v, %v", store, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "evolution_control.sqlite3")); err != nil {
+		t.Fatalf("evolution database was not derived from KBase root: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadRun("run-after-close"); err == nil {
+		t.Fatal("closed evolution store remained usable")
 	}
 }
 

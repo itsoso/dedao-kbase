@@ -929,10 +929,17 @@ func insertEvolutionRunScopesTx(tx *sql.Tx, run *EvolutionRun) error {
 }
 
 func (s *EvolutionControlStore) LoadRun(runID string) (*EvolutionRun, error) {
+	return s.LoadRunContext(context.Background(), runID)
+}
+
+func (s *EvolutionControlStore) LoadRunContext(ctx context.Context, runID string) (*EvolutionRun, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("evolution run query context is required")
+	}
 	if err := validateEvolutionIdentity("run_id", runID); err != nil {
 		return nil, err
 	}
-	run, err := scanEvolutionRun(s.db.QueryRow(evolutionRunSelect+` WHERE run_id = ?`, runID))
+	run, err := scanEvolutionRun(s.db.QueryRowContext(ctx, evolutionRunSelect+` WHERE run_id = ?`, runID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrEvolutionRunNotFound
 	}
@@ -1039,6 +1046,13 @@ func evolutionTerminalRequiresOutboxDrain(status EvolutionRunStatus) bool {
 
 // ListEvents returns events after the exclusive event-ID cursor in insertion order.
 func (s *EvolutionControlStore) ListEvents(runID, after string, limit int) ([]EvolutionEvent, error) {
+	return s.ListEventsContext(context.Background(), runID, after, limit)
+}
+
+func (s *EvolutionControlStore) ListEventsContext(ctx context.Context, runID, after string, limit int) ([]EvolutionEvent, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("evolution event query context is required")
+	}
 	if err := validateEvolutionIdentity("run_id", runID); err != nil {
 		return nil, err
 	}
@@ -1057,20 +1071,20 @@ func (s *EvolutionControlStore) ListEvents(runID, after string, limit int) ([]Ev
 		return nil, fmt.Errorf("event limit exceeds %d", evolutionEventMaxLimit)
 	}
 	var exists int
-	if err := s.db.QueryRow(`SELECT 1 FROM evolution_runs WHERE run_id = ?`, runID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM evolution_runs WHERE run_id = ?`, runID).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrEvolutionRunNotFound
 	} else if err != nil {
 		return nil, fmt.Errorf("find evolution run events: %w", err)
 	}
 	afterSequence := int64(0)
 	if after != "" {
-		if err := s.db.QueryRow(`SELECT sequence FROM evolution_events WHERE run_id = ? AND event_id = ?`, runID, after).Scan(&afterSequence); errors.Is(err, sql.ErrNoRows) {
+		if err := s.db.QueryRowContext(ctx, `SELECT sequence FROM evolution_events WHERE run_id = ? AND event_id = ?`, runID, after).Scan(&afterSequence); errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrEvolutionEventCursorNotFound
 		} else if err != nil {
 			return nil, fmt.Errorf("resolve evolution event cursor: %w", err)
 		}
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT event_id, run_id, event_type, actor, from_status, to_status, code,
 			message, artifact_refs_json, created_at
 		FROM evolution_events

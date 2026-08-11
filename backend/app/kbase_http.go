@@ -30,6 +30,8 @@ const (
 
 type KBaseHTTPConfig struct {
 	Store                   *BookKnowledgeStore
+	EvolutionStore          *EvolutionControlStore
+	EvolutionEnabled        bool
 	AuthToken               string
 	ReleaseRevision         string
 	BrowserSessionSecret    string
@@ -103,6 +105,8 @@ type DedaoLibraryService interface {
 
 type kbaseHTTPHandler struct {
 	store                   *BookKnowledgeStore
+	evolutionStore          *EvolutionControlStore
+	evolutionEnabled        bool
 	authToken               string
 	releaseRevision         string
 	browserSessionSecret    string
@@ -236,6 +240,8 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	}
 	return &kbaseHTTPHandler{
 		store:                   store,
+		evolutionStore:          cfg.EvolutionStore,
+		evolutionEnabled:        cfg.EvolutionEnabled,
 		authToken:               authToken,
 		releaseRevision:         releaseRevision,
 		browserSessionSecret:    browserSessionSecret,
@@ -364,6 +370,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	r = requestWithKBaseAuth(r, auth)
+	if isEvolutionAPIPath(r.URL.Path) {
+		h.handleEvolutionReadAPI(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/controlled-agent/") {
 		if h.agentPublisherToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "controlled Agent publisher is not configured")

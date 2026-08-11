@@ -35,6 +35,7 @@ type kBaseServerConfig struct {
 	AgentPublisherToken     string
 	SourceAgentToken        string
 	SourceAgentArtifactRoot string
+	EvolutionEnabled        bool
 	Session                 sessionServerConfig
 	RetrySigningKey         []byte
 	RetrySigningErr         error
@@ -74,6 +75,10 @@ func runCommandWithServerRunner(
 	stdout io.Writer,
 	runServer func(kBaseServerConfig) error,
 ) error {
+	evolutionEnabledDefault, err := evolutionEnabledFromEnvironment()
+	if err != nil {
+		return err
+	}
 	flags := flag.NewFlagSet("kbase-server", flag.ContinueOnError)
 	addr := flags.String("addr", envDefault("KBASE_HTTP_ADDR", "127.0.0.1:8719"), "HTTP listen address")
 	root := flags.String("root", envDefault("KBASE_BOOK_KNOWLEDGE_ROOT", app.DefaultBookKnowledgeRoot()), "book_knowledge root directory")
@@ -82,6 +87,7 @@ func runCommandWithServerRunner(
 	authToken := flags.String("auth-token", os.Getenv("KBASE_AUTH_TOKEN"), "bearer token for /api/* routes")
 	agentPublisherToken := flags.String("agent-publisher-token", defaultAgentPublisherToken(), "dedicated bearer token for Agent Package publication")
 	sourceAgentToken := flags.String("source-agent-token", defaultSourceAgentToken(), "bearer token for /api/source-agent/* routes")
+	evolutionEnabled := flags.Bool("evolution-enabled", evolutionEnabledDefault, "enable the Agent evolution control plane")
 	checkConfig := flags.Bool("check-config", false, "validate server configuration without starting")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -100,6 +106,7 @@ func runCommandWithServerRunner(
 		AgentPublisherToken:     *agentPublisherToken,
 		SourceAgentToken:        *sourceAgentToken,
 		SourceAgentArtifactRoot: defaultSourceAgentArtifactRoot(),
+		EvolutionEnabled:        *evolutionEnabled,
 		Session:                 sessionConfig,
 		RetrySigningKey:         retrySigningKey,
 		RetrySigningErr:         retrySigningErr,
@@ -214,6 +221,17 @@ func serveKBaseServer(
 	if err := initializeBookKnowledgeJobsControlPlane(bookStore); err != nil {
 		return fmt.Errorf("initialize book knowledge jobs: %w", err)
 	}
+	evolutionStore, err := openEvolutionControlStoreForServer(config.EvolutionEnabled, config.Root)
+	if err != nil {
+		return err
+	}
+	if evolutionStore != nil {
+		defer func() {
+			if err := evolutionStore.Close(); err != nil {
+				log.Printf("close evolution control store: %v", err)
+			}
+		}()
+	}
 	knowledgeCatalog, err := app.NewKnowledgeCatalogStore(config.Root, time.Now)
 	if err != nil {
 		return fmt.Errorf("initialize knowledge catalog: %w", err)
@@ -253,6 +271,8 @@ func serveKBaseServer(
 
 	handlerConfig := app.KBaseHTTPConfig{
 		Store:                  bookStore,
+		EvolutionStore:         evolutionStore,
+		EvolutionEnabled:       config.EvolutionEnabled,
 		AuthToken:              config.AuthToken,
 		ReleaseRevision:        buildRevision,
 		AgentPublisherToken:    config.AgentPublisherToken,
@@ -299,6 +319,11 @@ func serveKBaseServer(
 		log.Printf("agent package publisher API disabled until KBASE_AGENT_PUBLISHER_TOKEN is configured")
 	} else {
 		log.Printf("agent package publisher API enabled with a dedicated token")
+	}
+	if evolutionStore == nil {
+		log.Printf("Agent evolution control plane disabled")
+	} else {
+		log.Printf("Agent evolution control plane enabled")
 	}
 	if strings.TrimSpace(os.Getenv("WECHAT_MP_TOKEN")) == "" || strings.TrimSpace(os.Getenv("WECHAT_MP_COOKIE")) == "" {
 		log.Printf("wechat source: official account search/list disabled until WECHAT_MP_TOKEN and WECHAT_MP_COOKIE are configured")
@@ -469,6 +494,32 @@ func defaultAgentPublisherToken() string {
 
 func defaultSourceAgentArtifactRoot() string {
 	return strings.TrimSpace(os.Getenv("KBASE_SOURCE_AGENT_ARTIFACT_ROOT"))
+}
+
+func evolutionEnabledFromEnvironment() (bool, error) {
+	raw := strings.TrimSpace(os.Getenv("KBASE_EVOLUTION_ENABLED"))
+	if raw == "" {
+		return true, nil
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, errors.New("KBASE_EVOLUTION_ENABLED must be a boolean")
+	}
+}
+
+func openEvolutionControlStoreForServer(enabled bool, root string) (*app.EvolutionControlStore, error) {
+	if !enabled {
+		return nil, nil
+	}
+	store, err := app.OpenEvolutionControlStore(root, time.Now)
+	if err != nil {
+		return nil, fmt.Errorf("initialize evolution control store: %w", err)
+	}
+	return store, nil
 }
 
 func defaultBrowserSessionSecret() string {
