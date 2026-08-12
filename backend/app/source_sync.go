@@ -17,6 +17,7 @@ import (
 )
 
 const defaultWeChatSourceMaxItems = 500
+const defaultSourceThrottleCooldown = 15 * time.Minute
 
 const sourceSyncDBName = "source_sync.sqlite3"
 const sourceDiagnosticMaxRunes = 4000
@@ -29,6 +30,14 @@ const (
 	SourceRunPartial   = "partial"
 	SourceRunFailed    = "failed"
 	SourceRunCanceled  = "canceled"
+)
+
+const (
+	SourceRunFailureThrottled            = "throttled"
+	SourceRunFailureLoginRequired        = "login_required"
+	SourceRunFailureVerificationRequired = "verification_required"
+	SourceRunFailureForbidden            = "forbidden"
+	SourceRunFailurePermanent            = "permanent"
 )
 
 const (
@@ -151,6 +160,8 @@ type SourceSyncRun struct {
 	SkippedCount       int                 `json:"skipped_count"`
 	FailedCount        int                 `json:"failed_count"`
 	Error              string              `json:"error,omitempty"`
+	FailureCode        string              `json:"failure_code,omitempty"`
+	RetryAfter         string              `json:"retry_after,omitempty"`
 	CreatedAt          string              `json:"created_at"`
 	UpdatedAt          string              `json:"updated_at"`
 	StartedAt          string              `json:"started_at,omitempty"`
@@ -286,6 +297,8 @@ func migrateSourceSyncDB(db *sql.DB) error {
 			skipped_count INTEGER NOT NULL DEFAULT 0,
 			failed_count INTEGER NOT NULL DEFAULT 0,
 			error_text TEXT NOT NULL DEFAULT '',
+			failure_code TEXT NOT NULL DEFAULT '',
+			retry_after TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			started_at TEXT NOT NULL DEFAULT '',
@@ -360,6 +373,17 @@ func migrateSourceSyncDB(db *sql.DB) error {
 	}
 	for _, column := range columns {
 		if err := ensureSourceSyncColumn(db, "source_agents", column.name, column.definition); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct {
+		name       string
+		definition string
+	}{
+		{name: "failure_code", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "retry_after", definition: "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureSourceSyncColumn(db, "source_sync_runs", column.name, column.definition); err != nil {
 			return err
 		}
 	}
@@ -1041,11 +1065,12 @@ func (s *SourceSyncStore) FailRun(runID, agentID, message string, cursor ...stri
 	}
 	defer tx.Rollback()
 	now := s.timestamp()
+	failureCode, retryAfter := classifySourceRunFailure(message, s.now())
 	result, err := tx.Exec(`
-		UPDATE source_sync_runs SET status = ?, error_text = ?, lease_owner = '', lease_expires_at = '',
+		UPDATE source_sync_runs SET status = ?, error_text = ?, failure_code = ?, retry_after = ?, lease_owner = '', lease_expires_at = '',
 			finished_at = ?, updated_at = ?
 		WHERE id = ? AND status = ? AND lease_owner = ?
-	`, SourceRunFailed, trimSourceDiagnostic(message), now, now, run.ID, run.Status, strings.TrimSpace(agentID))
+	`, SourceRunFailed, trimSourceDiagnostic(message), failureCode, retryAfter, now, now, run.ID, run.Status, strings.TrimSpace(agentID))
 	if err != nil {
 		return SourceSyncRun{}, err
 	}
@@ -1169,7 +1194,7 @@ func (s *SourceSyncStore) ListRuns(limit int) ([]SourceSyncRun, error) {
 const sourceSyncRunSelect = `
 	SELECT id, subscription_id, agent_id, requested_operation, status, attempt, retry_of,
 		lease_owner, lease_expires_at, new_count, updated_count, skipped_count, failed_count,
-		error_text, created_at, updated_at, started_at, finished_at
+		error_text, failure_code, retry_after, created_at, updated_at, started_at, finished_at
 	FROM source_sync_runs`
 
 func scanSourceSyncRun(row sourceSyncScanner) (SourceSyncRun, error) {
@@ -1177,8 +1202,31 @@ func scanSourceSyncRun(row sourceSyncScanner) (SourceSyncRun, error) {
 	err := row.Scan(&run.ID, &run.SubscriptionID, &run.AgentID, &run.RequestedOperation,
 		&run.Status, &run.Attempt, &run.RetryOf, &run.LeaseOwner, &run.LeaseExpiresAt,
 		&run.NewCount, &run.UpdatedCount, &run.SkippedCount, &run.FailedCount, &run.Error,
-		&run.CreatedAt, &run.UpdatedAt, &run.StartedAt, &run.FinishedAt)
+		&run.FailureCode, &run.RetryAfter, &run.CreatedAt, &run.UpdatedAt, &run.StartedAt, &run.FinishedAt)
 	return run, err
+}
+
+func classifySourceRunFailure(message string, now time.Time) (string, string) {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	for _, marker := range []string{"throttl", "too many requests", "http 429"} {
+		if strings.Contains(normalized, marker) {
+			return SourceRunFailureThrottled, now.UTC().Add(defaultSourceThrottleCooldown).Format(time.RFC3339Nano)
+		}
+	}
+	for _, marker := range []string{"login_required", "unauthorized", "http 401", "parameter expired", "parameter_expired", "request parameter expired", "req_data expired"} {
+		if strings.Contains(normalized, marker) {
+			return SourceRunFailureLoginRequired, ""
+		}
+	}
+	if strings.Contains(normalized, "verification_required") {
+		return SourceRunFailureVerificationRequired, ""
+	}
+	for _, marker := range []string{"forbidden", "http 403", "unactivated", "not activated", "not_max_version", "license", "licence"} {
+		if strings.Contains(normalized, marker) {
+			return SourceRunFailureForbidden, ""
+		}
+	}
+	return "", ""
 }
 
 func (s *SourceSyncStore) ListRunItems(runID string) ([]SourceSyncItem, error) {

@@ -120,7 +120,7 @@ func (a *WeChatSourceAdapter) Execute(ctx context.Context, run SourceSyncRun, si
 		}
 		page, err := a.discovery.Discover(ctx, run.Subscription.SourceAccountKey, discoveryCursor, pageSize, titleQuery)
 		if err != nil {
-			return SourceAdapterResult{}, err
+			return weChatAdapterFailure(next, err)
 		}
 		items := page.Articles
 		if next.PublicationItemIndex == 0 && next.PendingFrontierKey == "" && len(items) > 0 {
