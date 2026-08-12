@@ -45,6 +45,15 @@ func TestIngestSourceArticleIsIdempotentAndUpdatesKnowledge(t *testing.T) {
 	if receipt.Outcome != SourceItemNew || receipt.TargetBookID == "" || receipt.ContentHash == "" {
 		t.Fatalf("unexpected new receipt: %#v", receipt)
 	}
+	catalog, err := NewKnowledgeCatalogStore(root, clock.Now)
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	records, err := catalog.ListCurrentContentVersionsBySourceAccount(envelope.SourceType, envelope.SourceAccountID, 10)
+	_ = catalog.Close()
+	if err != nil || len(records) != 1 || records[0].Version.TargetBookID != receipt.TargetBookID {
+		t.Fatalf("catalog account records = %#v, err=%v", records, err)
+	}
 
 	replayed, err := ingestor.IngestArticle(run.ID, "agent-a", envelope)
 	if err != nil {
