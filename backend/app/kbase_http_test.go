@@ -520,6 +520,73 @@ func TestKBaseHTTPHandlerControlledAgentRequiresCookieSessionAndBuildsDraft(t *t
 	}
 }
 
+func TestKBaseHTTPHandlerControlledCollectionAgentRequiresCookieAndExplicitPublish(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path: filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		TTL:  24 * time.Hour, RenewalInterval: time.Hour, MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sessionStore.Close() })
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Collection Agent Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrfToken, _, err := sessionStore.IssueCSRF(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-token", AgentPublisherToken: "publisher-token",
+		BrowserSessionSecret: "browser-secret",
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store: sessionStore, PublicOrigin: testBrowserSessionOrigin,
+			TTL: 24 * time.Hour, RenewalInterval: time.Hour, MaxActive: 10,
+		},
+	})
+	body := `{"draft":{"collection_release_id":"` + release.ReleaseID + `","package_id":"browser-collection-agent","version":"1.0.0"}}`
+
+	bearer := requestJSONKBase(handler, http.MethodPost, "/api/controlled-collection-agent/draft", "consumer-token", body)
+	if bearer.Code != http.StatusUnauthorized {
+		t.Fatalf("bearer collection draft status=%d body=%s", bearer.Code, bearer.Body.String())
+	}
+
+	request := func(path, body string) *httptest.ResponseRecorder {
+		req := newKBaseBrowserCookieRequest(http.MethodPost, path, credentials.Token, body)
+		addKBaseBrowserSessionSecurityHeaders(req, csrfToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	draft := request("/api/controlled-collection-agent/draft", body)
+	if draft.Code != http.StatusOK || !strings.Contains(draft.Body.String(), `"schema_version":"agent-package.v3"`) {
+		t.Fatalf("cookie collection draft status=%d body=%s", draft.Code, draft.Body.String())
+	}
+	if _, err := store.LoadAgentPackage("browser-collection-agent", "1.0.0"); err == nil {
+		t.Fatalf("draft must not publish package, err=%v", err)
+	}
+
+	evaluated := request("/api/controlled-collection-agent/evaluate", body)
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("collection evaluate status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	unconfirmed := request("/api/controlled-collection-agent/publish", body)
+	if unconfirmed.Code != http.StatusBadRequest {
+		t.Fatalf("unconfirmed collection publish status=%d body=%s", unconfirmed.Code, unconfirmed.Body.String())
+	}
+	publishBody := strings.TrimSuffix(body, "}") + `,"idempotency_key":"browser-collection-agent-1","confirm":true}`
+	published := request("/api/controlled-collection-agent/publish", publishBody)
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"schema_version":"agent-package.v3"`) {
+		t.Fatalf("collection publish status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerAgentCompilationUsesReadOnlyAPIAuthAndReturnsCandidates(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	primary := agentCompilerTestRelease(

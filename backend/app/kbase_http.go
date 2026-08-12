@@ -386,7 +386,8 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleEvolutionReadAPI(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/api/controlled-agent/") {
+	if strings.HasPrefix(r.URL.Path, "/api/controlled-agent/") ||
+		strings.HasPrefix(r.URL.Path, "/api/controlled-collection-agent/") {
 		if h.agentPublisherToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "controlled Agent publisher is not configured")
 			return
@@ -395,7 +396,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeHTTPError(w, http.StatusUnauthorized, "controlled Agent requires an authorized browser session")
 			return
 		}
-		h.handleControlledAgentWorkflow(w, r)
+		if strings.HasPrefix(r.URL.Path, "/api/controlled-collection-agent/") {
+			h.handleControlledCollectionAgentWorkflow(w, r)
+		} else {
+			h.handleControlledAgentWorkflow(w, r)
+		}
 		return
 	}
 	if isSourceSyncAdminPath(r.URL.Path) {
@@ -1929,6 +1934,89 @@ type ControlledAgentWorkflowRequest struct {
 	Confirm        bool                        `json:"confirm,omitempty"`
 }
 
+type ControlledCollectionAgentWorkflowRequest struct {
+	Draft          ControlledCollectionAgentDraftRequest `json:"draft"`
+	IdempotencyKey string                                `json:"idempotency_key,omitempty"`
+	Confirm        bool                                  `json:"confirm,omitempty"`
+}
+
+func (h *kbaseHTTPHandler) handleControlledCollectionAgentWorkflow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var request ControlledCollectionAgentWorkflowRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	draft, err := BuildControlledCollectionAgentDraftBundle(h.store, request.Draft, h.agentTools)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.store.SaveTrustedAgentEvaluationSuite(draft.Package, draft.Suite); err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "immutable") {
+			status = http.StatusConflict
+		}
+		writeHTTPError(w, status, err.Error())
+		return
+	}
+	switch r.URL.Path {
+	case "/api/controlled-collection-agent/draft":
+		writeHTTPJSON(w, http.StatusOK, draft)
+	case "/api/controlled-collection-agent/evaluate":
+		report, created, err := h.evaluateControlledAgentDraft(*draft)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "draft": draft, "evaluation": report})
+	case "/api/controlled-collection-agent/publish":
+		if !request.Confirm {
+			writeHTTPError(w, http.StatusBadRequest, "explicit confirmation is required")
+			return
+		}
+		if strings.TrimSpace(request.IdempotencyKey) == "" {
+			writeHTTPError(w, http.StatusBadRequest, "idempotency_key is required")
+			return
+		}
+		report, _, err := h.evaluateControlledAgentDraft(*draft)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !report.Passed {
+			writeHTTPError(w, http.StatusConflict, "controlled collection Agent evaluation did not pass")
+			return
+		}
+		published, created, err := PublishAgentPackage(h.store, draft.Package, request.IdempotencyKey, h.agentTools, time.Now())
+		if err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "evaluation": report, "package": published})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "controlled collection Agent operation not found")
+	}
+}
+
 func (h *kbaseHTTPHandler) handleControlledAgentWorkflow(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2005,7 +2093,13 @@ func (h *kbaseHTTPHandler) evaluateControlledAgentDraft(draft ControlledAgentDra
 	} else if !os.IsNotExist(err) {
 		return nil, false, err
 	}
-	report, err := EvaluateAgentPackageDeterministically(h.store, draft.Package, draft.Suite, time.Now())
+	report := AgentEvaluationReport{}
+	var err error
+	if agentPackageUsesTrustedEvaluation(draft.Package.SchemaVersion) {
+		_, report, err = EvaluateAgentPackageAgainstTrustedSuite(h.store, draft.Package, draft.Suite, time.Now())
+	} else {
+		report, err = EvaluateAgentPackageDeterministically(h.store, draft.Package, draft.Suite, time.Now())
+	}
 	if err != nil {
 		return nil, false, err
 	}
