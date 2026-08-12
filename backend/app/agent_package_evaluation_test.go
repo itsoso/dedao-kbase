@@ -391,6 +391,72 @@ func loadAgentEvaluationFixture(t *testing.T) AgentEvaluationSuite {
 	return suite
 }
 
+func TestAgentPackageCollectionEvaluationIsTrustedAndRequiredForPublication(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	bundle, err := BuildControlledCollectionAgentDraftBundle(store, ControlledCollectionAgentDraftRequest{
+		CollectionReleaseID: release.ReleaseID,
+	}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite); err != nil {
+		t.Fatal(err)
+	}
+	resolved, trustedHash, err := store.ResolveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite)
+	if err != nil || trustedHash == "" {
+		t.Fatalf("resolved=%#v hash=%q err=%v", resolved, trustedHash, err)
+	}
+	report, err := EvaluateAgentPackageDeterministically(store, bundle.Package, resolved, testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	report.TrustedSuiteHash = trustedHash
+	if !report.Passed {
+		t.Fatalf("report=%#v", report)
+	}
+	if _, _, err := PublishAgentPackage(store, bundle.Package, "collection-before-evaluation", AgentReadOnlyToolIDs(), testAgentPackageTime()); err == nil || !strings.Contains(err.Error(), "evaluation") {
+		t.Fatalf("publication without stored evaluation error=%v", err)
+	}
+	if err := store.SaveAgentPackageEvaluation(bundle.Package, resolved, report); err != nil {
+		t.Fatal(err)
+	}
+	if _, created, err := PublishAgentPackage(store, bundle.Package, "collection-after-evaluation", AgentReadOnlyToolIDs(), testAgentPackageTime()); err != nil || !created {
+		t.Fatalf("created=%v err=%v", created, err)
+	}
+}
+
+func TestAgentPackageCollectionEvaluationRejectsTamperedGoldAndStaleMember(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	bundle, err := BuildControlledCollectionAgentDraftBundle(store, ControlledCollectionAgentDraftRequest{
+		CollectionReleaseID: release.ReleaseID,
+	}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite); err != nil {
+		t.Fatal(err)
+	}
+	tampered := bundle.Suite
+	tampered.Cases = append([]AgentEvaluationCase(nil), bundle.Suite.Cases...)
+	tampered.Cases[0].ExpectedIDs = []string{"foreign-chunk"}
+	if _, _, err := store.ResolveTrustedAgentEvaluationSuite(bundle.Package, tampered); err == nil || !strings.Contains(err.Error(), "modifies trusted") {
+		t.Fatalf("tampered gold error=%v", err)
+	}
+
+	member, err := store.LoadPackage(release.Members[0].BookID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member.Chunks[0].Text += " stale"
+	member.Book.ContentHash = ""
+	if err := store.SavePackage(*member); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EvaluateAgentPackageDeterministically(store, bundle.Package, bundle.Suite, testAgentPackageTime()); err == nil || !strings.Contains(err.Error(), "content hash") {
+		t.Fatalf("stale member evaluation error=%v", err)
+	}
+}
+
 func savePassingAgentPackageTestEvaluation(t *testing.T, store *BookKnowledgeStore, pkg AgentPackage) {
 	t.Helper()
 	store.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})

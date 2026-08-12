@@ -190,6 +190,55 @@ func TestKBaseHTTPKnowledgeCollectionValidationAndQualityGate(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPCollectionAgentDraftEvaluateAndPublish(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "admin-token", AgentPublisherToken: "publisher-token",
+	})
+	draftResponse := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/collection-draft", "admin-token",
+		`{"collection_release_id":"`+release.ReleaseID+`","package_id":"fixture-collection-agent","version":"1.0.0"}`)
+	if draftResponse.Code != http.StatusCreated {
+		t.Fatalf("draft status=%d body=%s", draftResponse.Code, draftResponse.Body.String())
+	}
+	var bundle ControlledAgentDraft
+	if err := json.Unmarshal(draftResponse.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Package.SchemaVersion != AgentPackageSchemaVersionV3 || len(bundle.Suite.Cases) == 0 {
+		t.Fatalf("bundle=%#v", bundle)
+	}
+	evaluationBody, err := json.Marshal(AgentPackageEvaluationRequest{Package: bundle.Package, Suite: bundle.Suite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(evaluationBody))
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("evaluate status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	publishBody, err := json.Marshal(AgentPackagePublishRequest{IdempotencyKey: "fixture-collection-agent-1", Package: bundle.Package})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishBody))
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"schema_version":"agent-package.v3"`) {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
+func TestKBaseHTTPCollectionAgentDraftDoesNotPublishAutomatically(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "admin-token", AgentPublisherToken: "publisher-token"})
+	response := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/collection-draft", "admin-token",
+		`{"collection_release_id":"`+release.ReleaseID+`"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("draft status=%d body=%s", response.Code, response.Body.String())
+	}
+	packages, err := store.ListAgentPackages("", 10)
+	if err != nil || len(packages) != 0 {
+		t.Fatalf("draft auto-published packages=%#v err=%v", packages, err)
+	}
+}
+
 func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{

@@ -2694,13 +2694,47 @@ func sanitizeEvidenceAuditHTTPLogCause(value string) string {
 
 func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
 	const (
-		collectionPath = "/api/agent-packages"
-		compilePath    = "/api/agent-packages/compile"
-		evaluatePath   = "/api/agent-packages/evaluate"
-		publishPath    = "/api/agent-packages/publish"
-		trustSuitePath = "/api/agent-packages/evaluation-suites/trust"
-		detailPrefix   = "/api/agent-packages/"
+		collectionPath      = "/api/agent-packages"
+		compilePath         = "/api/agent-packages/compile"
+		collectionDraftPath = "/api/agent-packages/collection-draft"
+		evaluatePath        = "/api/agent-packages/evaluate"
+		publishPath         = "/api/agent-packages/publish"
+		trustSuitePath      = "/api/agent-packages/evaluation-suites/trust"
+		detailPrefix        = "/api/agent-packages/"
 	)
+	if r.URL.Path == collectionDraftPath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input ControlledCollectionAgentDraftRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, defaultAgentCompilationMaxBodyBytes))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		bundle, err := BuildControlledCollectionAgentDraftBundle(h.store, input, h.agentTools)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.store.SaveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite); err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "immutable") {
+				status = http.StatusConflict
+			}
+			writeHTTPError(w, status, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, bundle)
+		return
+	}
 	if r.URL.Path == compilePath {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2798,7 +2832,7 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		}
 		evaluationSuite := input.Suite
 		trustedSuiteHash := ""
-		if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+		if agentPackageUsesTrustedEvaluation(input.Package.SchemaVersion) {
 			var resolveErr error
 			evaluationSuite, trustedSuiteHash, resolveErr = h.store.ResolveTrustedAgentEvaluationSuite(
 				input.Package,
@@ -2819,7 +2853,7 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
 				return
 			}
-			if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+			if agentPackageUsesTrustedEvaluation(input.Package.SchemaVersion) {
 				if existing.TrustedSuiteHash == "" {
 					evaluatedAt, parseErr := time.Parse(time.RFC3339Nano, existing.EvaluatedAt)
 					if parseErr != nil {

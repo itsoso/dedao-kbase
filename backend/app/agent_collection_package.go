@@ -100,3 +100,89 @@ func BuildControlledCollectionAgentDraft(store *BookKnowledgeStore, request Cont
 	}
 	return &pkg, nil
 }
+
+func BuildControlledCollectionAgentDraftBundle(store *BookKnowledgeStore, request ControlledCollectionAgentDraftRequest, knownTools []string) (*ControlledAgentDraft, error) {
+	pkg, err := BuildControlledCollectionAgentDraft(store, request, knownTools)
+	if err != nil {
+		return nil, err
+	}
+	suite, err := buildControlledCollectionAgentEvaluationSuite(store, *pkg)
+	if err != nil {
+		return nil, err
+	}
+	return &ControlledAgentDraft{Package: *pkg, Suite: suite}, nil
+}
+
+func buildControlledCollectionAgentEvaluationSuite(store *BookKnowledgeStore, pkg AgentPackage) (AgentEvaluationSuite, error) {
+	release, err := loadPinnedAgentCollectionRelease(store, pkg)
+	if err != nil {
+		return AgentEvaluationSuite{}, err
+	}
+	if len(release.Members) == 0 {
+		return AgentEvaluationSuite{}, fmt.Errorf("collection release requires at least one member")
+	}
+	member := release.Members[0]
+	article, err := loadPinnedAgentCollectionMember(store, *release, member)
+	if err != nil {
+		return AgentEvaluationSuite{}, err
+	}
+	if len(article.Chunks) == 0 {
+		return AgentEvaluationSuite{}, fmt.Errorf("collection member requires at least one chunk")
+	}
+	chunk := article.Chunks[0]
+	allowed := stringBoolSet(member.CitationIDs...)
+	citationID := ""
+	for _, citation := range article.Citations {
+		if citation.ChunkID == chunk.ChunkID && allowed[citation.CitationID] {
+			citationID = citation.CitationID
+			break
+		}
+	}
+	if citationID == "" {
+		return AgentEvaluationSuite{}, fmt.Errorf("collection member chunk requires a pinned citation")
+	}
+	query := strings.TrimSpace(chunk.Text)
+	if query == "" {
+		return AgentEvaluationSuite{}, fmt.Errorf("collection member chunk text is required")
+	}
+	search, err := searchAgentPackageEvidence(store, pkg, query, pkg.RetrievalPolicy.MaxContextChunks)
+	if err != nil {
+		return AgentEvaluationSuite{}, err
+	}
+	citations, err := resolveAgentRuntimeCitations(store, search.Results)
+	if err != nil {
+		return AgentEvaluationSuite{}, err
+	}
+	expectedChunks := make([]string, 0, len(citations))
+	for _, citation := range citations {
+		if citation.ChunkID != "" {
+			expectedChunks = append(expectedChunks, citation.ChunkID)
+		}
+	}
+	expectedChunks = sortedUniqueStrings(expectedChunks)
+	if len(expectedChunks) == 0 {
+		return AgentEvaluationSuite{}, fmt.Errorf("collection evaluation probe resolved no chunks")
+	}
+	expectedValue := query
+	if runes := []rune(expectedValue); len(runes) > 180 {
+		expectedValue = string(runes[:180])
+	}
+	modelOutput := expectedValue + " [citation:" + citationID + "]"
+	arguments := map[string]string{
+		"package_id": pkg.PackageID, "package_version": pkg.Version,
+		"release_id": release.ReleaseID, "query": query,
+	}
+	cases := []AgentEvaluationCase{
+		{CaseID: "collection-retrieval", Metric: "retrieval", Input: query, ExpectedIDs: []string{chunk.ChunkID}},
+		{CaseID: "collection-retrieval-precision", Metric: "retrieval_precision", Input: query, ExpectedIDs: expectedChunks},
+		{CaseID: "collection-citations", Metric: "citations", Input: query, ExpectedIDs: []string{citationID}, ModelOutput: modelOutput},
+		{CaseID: "collection-faithfulness", Metric: "faithfulness", Input: query, ExpectedIDs: []string{chunk.ChunkID}, ExpectedValue: expectedValue, ModelOutput: modelOutput},
+		{CaseID: "collection-abstention", Metric: "abstention", Input: "__kbase_collection_outside_scope__", ExpectedValue: "insufficient_evidence"},
+		{CaseID: "collection-tool-choice", Metric: "tool_choice", Input: query, ExpectedValue: "book-mcp/agent.search", ProposedTool: "book-mcp/agent.search", ProposedArguments: arguments},
+		{CaseID: "collection-tool-arguments", Metric: "tool_arguments", Input: query, ProposedTool: "book-mcp/agent.search", ProposedArguments: arguments, ExpectedArguments: arguments},
+		{CaseID: "collection-task-completion", Metric: "task_completion", Input: query, ExpectedValue: expectedValue, ModelOutput: modelOutput},
+		{CaseID: "collection-latency", Metric: "latency", Input: query, ModelOutput: modelOutput, RecordedLatencyMS: 25, MaxLatencyMS: pkg.ModelPolicy.TimeoutMS},
+		{CaseID: "collection-cost", Metric: "cost", Input: query, ModelOutput: modelOutput, MaxCostUSD: pkg.ModelPolicy.MaxCostUSD},
+	}
+	return AgentEvaluationSuite{SchemaVersion: AgentEvaluationSchemaVersion, SuiteVersion: pkg.EvaluationPolicy.SuiteVersion, Cases: cases}, nil
+}
