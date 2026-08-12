@@ -100,6 +100,96 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPKnowledgeCollectionLifecycle(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	collectionBody := `{"collection_id":"wechat-account-fixture","title":"Fixture account knowledge","source_type":"wechat_mp_article","source_account_key":"account-a","source_account":"Fixture account","enabled":true}`
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/collections", "", collectionBody)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	created := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/collections", "secret-token", collectionBody)
+	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"collection_id":"wechat-account-fixture"`) {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	if strings.Contains(strings.ToLower(created.Body.String()), "cookie") || strings.Contains(strings.ToLower(created.Body.String()), "password") {
+		t.Fatalf("create leaked credentials: %s", created.Body.String())
+	}
+
+	saveCollectionArticleFixture(t, store, "book-a", "article-a", "Fixture account")
+	recordCollectionArticleFixture(t, store, "account-a", "Fixture account", "book-a", "article-a")
+	built := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/build", "secret-token")
+	if built.Code != http.StatusOK || !strings.Contains(built.Body.String(), `"status":"ready"`) || !strings.Contains(built.Body.String(), `"decision":"pass"`) {
+		t.Fatalf("build status=%d body=%s", built.Code, built.Body.String())
+	}
+	published := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/publish", "secret-token")
+	if published.Code != http.StatusCreated {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+	var release KnowledgeCollectionRelease
+	if err := json.Unmarshal(published.Body.Bytes(), &release); err != nil || release.ReleaseID == "" {
+		t.Fatalf("release=%#v err=%v", release, err)
+	}
+
+	listed := requestKBase(handler, http.MethodGet, "/api/knowledge/collections", "secret-token")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"collections":[`) {
+		t.Fatalf("list status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/knowledge/collections/wechat-account-fixture", "secret-token")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"candidate_hash"`) || !strings.Contains(detail.Body.String(), release.ReleaseID) {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	releaseDetail := requestKBase(handler, http.MethodGet, "/api/knowledge/collection-releases/"+release.ReleaseID, "secret-token")
+	if releaseDetail.Code != http.StatusOK || !strings.Contains(releaseDetail.Body.String(), `"book_id":"book-a"`) {
+		t.Fatalf("release detail status=%d body=%s", releaseDetail.Code, releaseDetail.Body.String())
+	}
+}
+
+func TestKBaseHTTPKnowledgeCollectionValidationAndQualityGate(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	oversized := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/collections", "secret-token", `{"collection_id":"too-large","title":"`+strings.Repeat("x", 20<<10)+`","source_type":"wechat_mp_article","source_account_key":"account-a","source_account":"Fixture","enabled":true}`)
+	if oversized.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d body=%s", oversized.Code, oversized.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodPut, "/api/knowledge/collections", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+	missing := requestKBase(handler, http.MethodGet, "/api/knowledge/collections/missing", "secret-token")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	saveCollectionFixture(t, store, "wechat-account-fixture", "account-a")
+	saveCollectionArticleFixture(t, store, "book-invalid", "article-invalid", "Fixture account")
+	recordCollectionArticleFixture(t, store, "account-a", "Fixture account", "book-invalid", "article-invalid")
+	invalid, err := store.LoadPackage("book-invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid.Citations = nil
+	invalid.Book.ContentHash = ""
+	if err := store.SavePackage(*invalid); err != nil {
+		t.Fatal(err)
+	}
+	built := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/build", "secret-token")
+	if built.Code != http.StatusOK || !strings.Contains(built.Body.String(), `"status":"blocked"`) {
+		t.Fatalf("blocked build status=%d body=%s", built.Code, built.Body.String())
+	}
+	publish := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/publish", "secret-token")
+	if publish.Code != http.StatusConflict {
+		t.Fatalf("quality gate status=%d body=%s", publish.Code, publish.Body.String())
+	}
+	buildWrongMethod := requestKBase(handler, http.MethodGet, "/api/knowledge/collections/wechat-account-fixture/build", "secret-token")
+	if buildWrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("build method status=%d body=%s", buildWrongMethod.Code, buildWrongMethod.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
