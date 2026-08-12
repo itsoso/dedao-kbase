@@ -60,6 +60,21 @@ func TestAgentTracePersistsVersionedRuntimeEvidenceWithoutPrivateInputs(t *testi
 	}
 }
 
+func TestAgentTraceCollectionRuntimeRequiresPinnedMemberProvenance(t *testing.T) {
+	trace := agentTraceTestTrace()
+	trace.Releases[0].CollectionID = "wechat-account-fixture"
+	trace.Retrievals[0].MemberBookID = "book-a"
+	trace.Retrievals[0].MemberContentHash = "sha256:" + strings.Repeat("a", 64)
+	trace.Retrievals[0].ChunkID = "book-a-chunk"
+	if err := ValidateAgentTrace(trace); err != nil {
+		t.Fatalf("valid collection trace: %v", err)
+	}
+	trace.Retrievals[0].MemberContentHash = ""
+	if err := ValidateAgentTrace(trace); err == nil || !strings.Contains(err.Error(), "member provenance") {
+		t.Fatalf("missing member hash error=%v", err)
+	}
+}
+
 func TestAgentTraceRejectsIncompleteOrUnsafeRuntimeRecords(t *testing.T) {
 	tests := []struct {
 		name    string

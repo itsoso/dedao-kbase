@@ -33,6 +33,139 @@ func TestAgentPackageRuntimeSearchesEveryPinnedRelease(t *testing.T) {
 	}
 }
 
+func TestAgentPackageCollectionRuntimeSearchesPinnedMembersGlobally(t *testing.T) {
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	response, err := searchAgentPackageEvidence(store, pkg, "shared insight", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 {
+		t.Fatalf("results=%#v", response.Results)
+	}
+	seenBooks := map[string]bool{}
+	for _, result := range response.Results {
+		seenBooks[result.MemberBookID] = true
+		if result.CollectionReleaseID != release.ReleaseID || result.ReleaseID != release.ReleaseID || result.MemberContentHash == "" || result.ChunkID == "" || len(result.CitationIDs) != 1 {
+			t.Fatalf("result=%#v", result)
+		}
+	}
+	if !seenBooks["book-a"] || !seenBooks["book-b"] || seenBooks["book-foreign"] {
+		t.Fatalf("member scope=%#v", seenBooks)
+	}
+	limited, err := searchAgentPackageEvidence(store, pkg, "shared insight", 1)
+	if err != nil || len(limited.Results) != 1 {
+		t.Fatalf("limited=%#v err=%v", limited, err)
+	}
+}
+
+func TestAgentPackageCollectionRuntimeRejectsStaleMemberAndForgedCitation(t *testing.T) {
+	store, pkg, _ := agentCollectionRuntimeFixture(t)
+	pkgA, err := store.LoadPackage("book-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkgA.Chunks[0].Text += " changed"
+	pkgA.Book.ContentHash = ""
+	if err := store.SavePackage(*pkgA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := searchAgentPackageEvidence(store, pkg, "shared", 2); err == nil || !strings.Contains(err.Error(), "content hash") {
+		t.Fatalf("stale member error=%v", err)
+	}
+
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	_, err = resolveAgentPackageReleaseCitation(store, pkg, release.ReleaseID, "book-a-chunk", "forged-citation")
+	if err == nil || !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("forged citation error=%v", err)
+	}
+}
+
+func TestAgentPackageCollectionRuntimeChatAbstainsAndTracesMemberProvenance(t *testing.T) {
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	abstained, err := chatFinalizedAgentPackageWithClient(
+		context.Background(), store, pkg, "unrelated astronomy question", &fakeBookKnowledgeLLMClient{answer: "must not run"},
+		&BookTokenPlanConfig{}, testAgentPackageTime(), false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if abstained.Outcome != AgentTraceOutcomeAbstained || abstained.AbstentionReason != "insufficient_evidence" {
+		t.Fatalf("abstained=%#v", abstained)
+	}
+
+	client := &fakeBookKnowledgeLLMClient{answer: "Combined answer [citation:book-a-citation] [citation:book-b-citation]"}
+	response, err := chatFinalizedAgentPackageWithClient(
+		context.Background(), store, pkg, "shared insight", client,
+		&BookTokenPlanConfig{}, testAgentPackageTime(), true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != AgentTraceOutcomeCompleted || len(response.Citations) != 2 || response.TraceID == "" {
+		t.Fatalf("response=%#v", response)
+	}
+	trace, err := store.LoadAgentTrace(response.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Releases) != 1 || trace.Releases[0].ReleaseID != release.ReleaseID || trace.Releases[0].CollectionID != release.CollectionID || len(trace.Retrievals) != 2 {
+		t.Fatalf("trace=%#v", trace)
+	}
+	for _, retrieval := range trace.Retrievals {
+		if retrieval.MemberBookID == "" || retrieval.MemberContentHash == "" || retrieval.ChunkID == "" {
+			t.Fatalf("retrieval=%#v", retrieval)
+		}
+	}
+}
+
+func TestAgentToolPolicyAllowsPinnedCollectionReleaseScope(t *testing.T) {
+	_, pkg, release := agentCollectionRuntimeFixture(t)
+	decision := EvaluateAgentToolCall(pkg, "book-mcp", "agent.search", map[string]any{
+		"package_id": pkg.PackageID, "package_version": pkg.Version,
+		"release_id": release.ReleaseID, "query": "shared insight",
+	})
+	if decision.Decision != AgentToolAllow {
+		t.Fatalf("decision=%#v", decision)
+	}
+}
+
+func agentCollectionRuntimeFixture(t *testing.T) (*BookKnowledgeStore, AgentPackage, *KnowledgeCollectionRelease) {
+	t.Helper()
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveCollectionFixture(t, store, "wechat-account-fixture", "account-a")
+	for _, fixture := range []struct {
+		bookID, itemID, accountKey, text string
+	}{
+		{"book-a", "article-a", "account-a", "shared insight from alpha article"},
+		{"book-b", "article-b", "account-a", "shared insight from beta article"},
+		{"book-foreign", "article-foreign", "account-b", "shared insight foreign secret"},
+	} {
+		saveCollectionArticleFixture(t, store, fixture.bookID, fixture.itemID, "Fixture account")
+		article, err := store.LoadPackage(fixture.bookID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		article.Chunks[0].Text = fixture.text
+		article.Book.ContentHash = ""
+		if err := store.SavePackage(*article); err != nil {
+			t.Fatal(err)
+		}
+		recordCollectionArticleFixture(t, store, fixture.accountKey, "Fixture account", fixture.bookID, fixture.itemID)
+	}
+	if _, err := store.BuildKnowledgeCollectionCandidate("wechat-account-fixture"); err != nil {
+		t.Fatal(err)
+	}
+	release, err := store.PublishKnowledgeCollection("wechat-account-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := BuildControlledCollectionAgentDraft(store, ControlledCollectionAgentDraftRequest{CollectionReleaseID: release.ReleaseID}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, *pkg, release
+}
+
 func TestAgentPackageRuntimeSearchRetrievesChineseNaturalLanguageQuery(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	release := agentPackageTestRelease()

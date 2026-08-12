@@ -25,11 +25,15 @@ type AgentPackageSearchRequest struct {
 }
 
 type AgentPackageEvidence struct {
-	ReleaseID   string   `json:"release_id"`
-	ClaimID     string   `json:"claim_id"`
-	Statement   string   `json:"statement"`
-	CitationIDs []string `json:"citation_ids"`
-	Score       float64  `json:"score"`
+	ReleaseID           string   `json:"release_id"`
+	CollectionReleaseID string   `json:"collection_release_id,omitempty"`
+	MemberBookID        string   `json:"member_book_id,omitempty"`
+	MemberContentHash   string   `json:"member_content_hash,omitempty"`
+	ChunkID             string   `json:"chunk_id,omitempty"`
+	ClaimID             string   `json:"claim_id"`
+	Statement           string   `json:"statement"`
+	CitationIDs         []string `json:"citation_ids"`
+	Score               float64  `json:"score"`
 }
 
 type AgentPackageSearchResponse struct {
@@ -87,14 +91,22 @@ func searchAgentPackageEvidence(
 		return nil, fmt.Errorf("limit exceeds retrieval_policy.max_context_chunks (%d)", pkg.RetrievalPolicy.MaxContextChunks)
 	}
 	results := make([]AgentPackageEvidence, 0)
-	for _, ref := range pkg.Releases {
-		releaseResults, searchErr := searchAgentPackageReleaseEvidence(
-			store, pkg, ref.ReleaseID, query, pkg.RetrievalPolicy.MaxContextChunks,
-		)
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		collectionResults, searchErr := searchAgentPackageCollectionEvidence(store, pkg, query, pkg.RetrievalPolicy.MaxContextChunks)
 		if searchErr != nil {
 			return nil, searchErr
 		}
-		results = append(results, releaseResults...)
+		results = append(results, collectionResults...)
+	} else {
+		for _, ref := range pkg.Releases {
+			releaseResults, searchErr := searchAgentPackageReleaseEvidence(
+				store, pkg, ref.ReleaseID, query, pkg.RetrievalPolicy.MaxContextChunks,
+			)
+			if searchErr != nil {
+				return nil, searchErr
+			}
+			results = append(results, releaseResults...)
+		}
 	}
 	sort.SliceStable(results, func(i, j int) bool {
 		if results[i].Score != results[j].Score {
@@ -102,6 +114,9 @@ func searchAgentPackageEvidence(
 		}
 		if results[i].ReleaseID != results[j].ReleaseID {
 			return results[i].ReleaseID < results[j].ReleaseID
+		}
+		if results[i].MemberBookID != results[j].MemberBookID {
+			return results[i].MemberBookID < results[j].MemberBookID
 		}
 		return results[i].ClaimID < results[j].ClaimID
 	})
@@ -112,6 +127,87 @@ func searchAgentPackageEvidence(
 		PackageID: pkg.PackageID, PackageVersion: pkg.Version, PackageHash: pkg.ContentHash,
 		RetrievalStrategy: pkg.RetrievalPolicy.Strategy, Results: results,
 	}, nil
+}
+
+func searchAgentPackageCollectionEvidence(store *BookKnowledgeStore, pkg AgentPackage, query string, limit int) ([]AgentPackageEvidence, error) {
+	release, err := loadPinnedAgentCollectionRelease(store, pkg)
+	if err != nil {
+		return nil, err
+	}
+	terms := splitSearchTerms(query)
+	if len(terms) == 0 {
+		return []AgentPackageEvidence{}, nil
+	}
+	results := make([]AgentPackageEvidence, 0)
+	for _, member := range release.Members {
+		article, err := loadPinnedAgentCollectionMember(store, *release, member)
+		if err != nil {
+			return nil, err
+		}
+		allowed := stringBoolSet(member.CitationIDs...)
+		citationsByChunk := make(map[string][]string)
+		for _, citation := range article.Citations {
+			if allowed[citation.CitationID] && citation.BookID == member.BookID && citation.ChunkID != "" {
+				citationsByChunk[citation.ChunkID] = append(citationsByChunk[citation.ChunkID], citation.CitationID)
+			}
+		}
+		for _, chunk := range article.Chunks {
+			score := searchScore(chunk.Text, terms)
+			citationIDs := sortedUniqueStrings(citationsByChunk[chunk.ChunkID])
+			if score <= 0 || (pkg.RetrievalPolicy.RequireCitations && len(citationIDs) == 0) {
+				continue
+			}
+			results = append(results, AgentPackageEvidence{
+				ReleaseID: release.ReleaseID, CollectionReleaseID: release.ReleaseID,
+				MemberBookID: member.BookID, MemberContentHash: member.ContentHash,
+				ChunkID: chunk.ChunkID, ClaimID: chunk.ChunkID, Statement: chunk.Text,
+				CitationIDs: citationIDs, Score: score,
+			})
+		}
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		if results[i].MemberBookID != results[j].MemberBookID {
+			return results[i].MemberBookID < results[j].MemberBookID
+		}
+		return results[i].ChunkID < results[j].ChunkID
+	})
+	if len(results) > limit {
+		results = results[:limit]
+	}
+	return results, nil
+}
+
+func loadPinnedAgentCollectionRelease(store *BookKnowledgeStore, pkg AgentPackage) (*KnowledgeCollectionRelease, error) {
+	if store == nil || len(pkg.CollectionReleases) != 1 {
+		return nil, fmt.Errorf("Agent Package must pin exactly one collection release")
+	}
+	ref := pkg.CollectionReleases[0]
+	release, err := store.LoadKnowledgeCollectionRelease(ref.ReleaseID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned collection release %q: %w", ref.ReleaseID, err)
+	}
+	if agentTraceReleaseContentHash(release.ContentHash) != agentTraceReleaseContentHash(ref.ContentHash) {
+		return nil, fmt.Errorf("pinned collection release %q content hash changed", ref.ReleaseID)
+	}
+	return release, nil
+}
+
+func loadPinnedAgentCollectionMember(store *BookKnowledgeStore, release KnowledgeCollectionRelease, member KnowledgeCollectionMember) (*BookKnowledgePackage, error) {
+	article, err := store.LoadPackage(member.BookID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned collection member %q: %w", member.BookID, err)
+	}
+	computedHash, err := BookKnowledgeContentHash(*article)
+	if err != nil || article.Book.ContentHash != member.ContentHash || computedHash != member.ContentHash {
+		return nil, fmt.Errorf("pinned collection member %q content hash changed", member.BookID)
+	}
+	if article.Book.SourceType != release.Definition.SourceType || article.Book.SourceKey != member.SourceItemKey {
+		return nil, fmt.Errorf("pinned collection member %q source identity changed", member.BookID)
+	}
+	return article, nil
 }
 
 func searchAgentPackageReleaseEvidence(
@@ -217,6 +313,9 @@ func resolveAgentPackageReleaseCitation(
 	pkg AgentPackage,
 	releaseID, claimID, citationID string,
 ) (AgentScopedCitation, error) {
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		return resolveAgentCollectionCitation(store, pkg, releaseID, claimID, citationID)
+	}
 	ref, err := agentPackagePinnedReleaseRef(pkg, releaseID)
 	if err != nil {
 		return AgentScopedCitation{}, err
@@ -268,6 +367,36 @@ func agentPackagePinnedReleaseRef(pkg AgentPackage, releaseID string) (AgentPack
 		}
 	}
 	return AgentPackageReleaseRef{}, fmt.Errorf("release %q is outside the pinned Agent Package", releaseID)
+}
+
+func resolveAgentCollectionCitation(store *BookKnowledgeStore, pkg AgentPackage, releaseID, chunkID, citationID string) (AgentScopedCitation, error) {
+	release, err := loadPinnedAgentCollectionRelease(store, pkg)
+	if err != nil {
+		return AgentScopedCitation{}, err
+	}
+	if release.ReleaseID != releaseID {
+		return AgentScopedCitation{}, fmt.Errorf("collection release %q is outside the pinned Agent Package", releaseID)
+	}
+	for _, member := range release.Members {
+		if !stringBoolSet(member.CitationIDs...)[citationID] {
+			continue
+		}
+		article, err := loadPinnedAgentCollectionMember(store, *release, member)
+		if err != nil {
+			return AgentScopedCitation{}, err
+		}
+		for _, citation := range article.Citations {
+			if citation.CitationID == citationID && (chunkID == "" || citation.ChunkID == chunkID) {
+				return AgentScopedCitation{
+					CitationID: citation.CitationID, BookID: citation.BookID,
+					ChapterID: citation.ChapterID, ChunkID: citation.ChunkID,
+					Anchor: citation.Anchor, Note: citation.Note,
+					SourceType: citation.SourceType, PublishedAt: citation.PublishedAt,
+				}, nil
+			}
+		}
+	}
+	return AgentScopedCitation{}, fmt.Errorf("citation %q is outside pinned collection release allowlist", citationID)
 }
 
 func ChatAgentPackageWithClient(
@@ -532,21 +661,33 @@ func saveAgentRuntimeTrace(
 	if err != nil {
 		return "", err
 	}
-	releases := make([]AgentTraceReleaseRef, 0, len(pkg.Releases))
-	for _, ref := range pkg.Releases {
-		release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
+	releases := make([]AgentTraceReleaseRef, 0, len(pkg.Releases)+len(pkg.CollectionReleases))
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		release, loadErr := loadPinnedAgentCollectionRelease(store, pkg)
 		if loadErr != nil {
 			return "", loadErr
 		}
 		releases = append(releases, AgentTraceReleaseRef{
-			ReleaseID: ref.ReleaseID, Version: release.Version,
-			ContentHash: agentTraceReleaseContentHash(ref.ContentHash),
+			ReleaseID: release.ReleaseID, Version: "1", ContentHash: agentTraceReleaseContentHash(release.ContentHash),
+			CollectionID: release.CollectionID,
 		})
+	} else {
+		for _, ref := range pkg.Releases {
+			release, loadErr := store.LoadKnowledgeRelease(ref.ReleaseID)
+			if loadErr != nil {
+				return "", loadErr
+			}
+			releases = append(releases, AgentTraceReleaseRef{
+				ReleaseID: ref.ReleaseID, Version: release.Version,
+				ContentHash: agentTraceReleaseContentHash(ref.ContentHash),
+			})
+		}
 	}
 	retrievals := make([]AgentTraceRetrieval, 0, len(evidence))
 	for index, item := range evidence {
 		retrievals = append(retrievals, AgentTraceRetrieval{
 			EvidenceID: agentRuntimeEvidenceID(item), ReleaseID: item.ReleaseID,
+			MemberBookID: item.MemberBookID, MemberContentHash: item.MemberContentHash, ChunkID: item.ChunkID,
 			Score: item.Score, Rank: index + 1,
 		})
 	}
@@ -589,6 +730,9 @@ func newAgentRuntimeTraceID() (string, error) {
 }
 
 func agentRuntimeEvidenceID(item AgentPackageEvidence) string {
+	if item.MemberBookID != "" {
+		return item.ReleaseID + ":" + item.MemberBookID + ":" + item.ChunkID
+	}
 	return item.ReleaseID + ":" + item.ClaimID
 }
 
@@ -750,6 +894,16 @@ func buildAgentPackageMessages(
 }
 
 func resolveAgentRuntimeCitations(store *BookKnowledgeStore, evidence []AgentPackageEvidence) ([]AgentScopedCitation, error) {
+	collectionEvidence := false
+	for _, item := range evidence {
+		if item.CollectionReleaseID != "" || item.MemberBookID != "" {
+			collectionEvidence = true
+			break
+		}
+	}
+	if collectionEvidence {
+		return resolveAgentCollectionRuntimeCitations(store, evidence)
+	}
 	wanted := make(map[string]map[string]bool)
 	for _, item := range evidence {
 		if wanted[item.ReleaseID] == nil {
@@ -774,6 +928,60 @@ func resolveAgentRuntimeCitations(store *BookKnowledgeStore, evidence []AgentPac
 					SourceType: citation.SourceType, PublishedAt: citation.PublishedAt,
 				})
 			}
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].BookID != result[j].BookID {
+			return result[i].BookID < result[j].BookID
+		}
+		return result[i].CitationID < result[j].CitationID
+	})
+	return result, nil
+}
+
+func resolveAgentCollectionRuntimeCitations(store *BookKnowledgeStore, evidence []AgentPackageEvidence) ([]AgentScopedCitation, error) {
+	result := make([]AgentScopedCitation, 0)
+	seen := make(map[string]bool)
+	for _, item := range evidence {
+		if item.CollectionReleaseID == "" || item.MemberBookID == "" || item.MemberContentHash == "" || item.ChunkID == "" {
+			return nil, fmt.Errorf("collection evidence member provenance is incomplete")
+		}
+		release, err := store.LoadKnowledgeCollectionRelease(item.CollectionReleaseID)
+		if err != nil {
+			return nil, err
+		}
+		var pinned *KnowledgeCollectionMember
+		for index := range release.Members {
+			member := &release.Members[index]
+			if member.BookID == item.MemberBookID && member.ContentHash == item.MemberContentHash {
+				pinned = member
+				break
+			}
+		}
+		if pinned == nil {
+			return nil, fmt.Errorf("collection evidence member is outside the pinned release")
+		}
+		article, err := loadPinnedAgentCollectionMember(store, *release, *pinned)
+		if err != nil {
+			return nil, err
+		}
+		allowed := stringBoolSet(pinned.CitationIDs...)
+		wanted := stringBoolSet(item.CitationIDs...)
+		for _, citation := range article.Citations {
+			if !wanted[citation.CitationID] || !allowed[citation.CitationID] || citation.ChunkID != item.ChunkID {
+				continue
+			}
+			key := citation.BookID + "\x00" + citation.CitationID
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			result = append(result, AgentScopedCitation{
+				CitationID: citation.CitationID, BookID: citation.BookID,
+				ChapterID: citation.ChapterID, ChunkID: citation.ChunkID,
+				Anchor: citation.Anchor, Note: citation.Note,
+				SourceType: citation.SourceType, PublishedAt: citation.PublishedAt,
+			})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
