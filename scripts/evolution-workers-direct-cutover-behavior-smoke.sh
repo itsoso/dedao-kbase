@@ -42,6 +42,7 @@ case "$action" in
   is-enabled)
     if [[ -f "${EVOLUTION_MOCK_STATE:?}/fail-is-enabled-${service}-always" ]]; then exit 2; fi
     if [[ -f "${EVOLUTION_MOCK_STATE:?}/${service}.enabled" ]]; then printf 'enabled\n'; exit 0; fi
+    if [[ -f "${EVOLUTION_MOCK_STATE:?}/empty-is-enabled-${service}" ]]; then exit 1; fi
     printf 'disabled\n'; exit 1
     ;;
   show)
@@ -147,6 +148,17 @@ for binary in agent-evolution-worker knowledge-evolution-worker evaluation-worke
   [[ -f "${CASE_DIR}/backup/${binary}.absent" ]] || fail "${binary} first-install state was not recorded"
 done
 assert_contains "${CASE_DIR}/targets/dedao-evolution-worker@.service" 'new-unit'
+
+setup_case first-install-empty-is-enabled
+for binary in agent-evolution-worker knowledge-evolution-worker evaluation-worker; do
+  touch "${CASE_DIR}/state/empty-is-enabled-dedao-evolution-worker@${binary}.service"
+done
+run_cutover
+for binary in agent-evolution-worker knowledge-evolution-worker evaluation-worker; do
+  service="dedao-evolution-worker@${binary}.service"
+  [[ -f "${CASE_DIR}/state/${service}.enabled" ]] || fail "${service} is not enabled after empty first-install state"
+  [[ -f "${CASE_DIR}/state/${service}.active" ]] || fail "${service} is not active after empty first-install state"
+done
 
 setup_case hash-mismatch
 KBASE_EVALUATION_SHA256_OVERRIDE="$(printf 'wrong-hash' | sha256sum | awk '{print $1}')"

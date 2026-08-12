@@ -67,6 +67,17 @@ service_enabled_state() {
   case "$output" in
     enabled|enabled-runtime|linked|linked-runtime) resolved_state=enabled ;;
     disabled|static|indirect|generated|transient|alias|masked|masked-runtime|not-found) resolved_state=disabled ;;
+    "")
+      if ((status == 1)); then
+        # systemd 249 can return exit 1 with no stdout for an instance whose
+        # template has not been installed yet. This is the expected state on
+        # the first deployment, and is equivalent to disabled.
+        resolved_state=disabled
+      else
+        printf 'evolution worker direct cutover: cannot determine enablement for %s (exit %d)\n' "$service" "$status" >&2
+        return 1
+      fi
+      ;;
     *) printf 'evolution worker direct cutover: cannot determine enablement for %s (exit %d)\n' "$service" "$status" >&2; return 1 ;;
   esac
   printf -v "$result_variable" '%s' "$resolved_state"
