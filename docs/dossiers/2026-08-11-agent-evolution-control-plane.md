@@ -2,10 +2,9 @@
 
 **日期：** 2026-08-11
 
-**状态：** 第一层已通过 G1-G6，并以 revision
-`389c5afe9506fc67b2ad73b5e216fd50f2edfbf4` 上线；第二层任务 7、8 已完成本地实现，
-G3 本地验证与应用层第四轮独立 G4 复审通过；发布面上一轮 G4 复审为 NO-GO，修复后正在
-重新复审并通过，G5-G6 尚未执行
+**状态：** 第一层与第二层均已通过 G1-G6；第二层以 revision
+`65b9af847aab645069bb85b2632d4b3e45b0fed5` 上线，Agent、Knowledge、Evaluation 三个
+独立 Worker 已同批启用，正式发布仍保持人工批准边界
 
 **交付分支：** 第一层 `codex/agent-evolution-control-plane`；第二层
 `codex/agent-evolution-layer-2`
@@ -41,10 +40,10 @@ Agent 能力演化与知识供给演化。系统可自动发现问题、生成�
 |---|---|---|
 | G1 准入 | PASS | 目标、人工发布边界、双环范围、共享 Token 约束、四层验收和成功标准均已在批准设计中冻结。 |
 | G2 可行性与风险压测 | PASS | History 排序说明与后端 `created_at` 分页契约一致，详情文案与可访问性标签按视图区分；自动化门禁和真实浏览器复验均通过。 |
-| G3 测试 | PASS | 第一层发布范围的前端构建、全部桌面/Web smoke、`go vet ./...`、`go test ./... -timeout=300s -count=1`、部署静态/行为 smoke、隐私、系统地图和差异检查全部通过；后续层仍须各自重新过 Gate。 |
-| G4 评审 | PASS | 第一层经历多轮独立规格与代码质量复审；终态统计、scope 串数据、History 语义、全局 cursor 顺序及纳秒精度问题均修复后，最终规格与质量裁决均为 PASS。 |
-| G5 部署健康 | PASS | 从干净 `main` 精确归档 revision `389c5af`，由生产服务账号使用 Go 1.25.12 与 Node 22.18.0 重复构建并通过前后端测试；双二进制 revision、独立 SHA-256 和生产配置检查通过。原子切换完成，loopback 与公网健康检查均返回精确 revision；KBase 与 Worker 均为 active、退出码 0、重启计数 0，切换后五分钟内无 warning。 |
-| G6 上线验证 | PASS | 已登录应用内浏览器在 `https://kbase.executor.life/agent-packages` 完成 1280×720 真实巡检：中文标题、紧凑首屏、四个视图、候选创建对话框、历史/规则/Fleet 导航均通过，无横向溢出；匿名演化 API 返回 401，认证请求返回 200。 |
+| G3 测试 | PASS | 两层各自通过前端构建、全部桌面/Web smoke、`go vet ./...`、`go test ./...`、部署静态/行为 smoke、隐私、系统地图和差异检查；第二层最终在开发机和生产构建机各完成一次全量 Go 测试。 |
+| G4 评审 | PASS | 第一层经历多轮规格与质量复审；第二层应用面第四轮、发布面第六轮独立复审最终均为 PASS / GO，所有 Critical、Important、Minor 已归零。 |
+| G5 部署健康 | PASS | 从干净 `main` 精确归档 revision `65b9af8`，生产服务账号使用 Node 22.18.0 与 Go 1.23.0 重复构建、测试并生成五个独立候选。首次三 Worker 切换因目标 systemd 对未安装实例返回空状态而被安全拦截，未替换文件；补回归和兼容修复后重新走完整门禁。最终 KBase、书籍 Worker 与三个演化 Worker 均为 active、退出码 0、重启计数 0，loopback 与公网健康返回精确 revision，部署后 warning 为 0。 |
+| G6 上线验证 | PASS | 匿名演化、Worker 与 Source Agent API 均返回 401，既有共享 Token 的认证请求返回 200；三个演化 Worker 均在 Agent 总览上报精确 revision 与健康能力。已登录应用内浏览器真实巡检 `/agent-packages` 和 `/sources/agents`：中文紧凑布局、态势、编队、在线状态与能力健康正常，浏览器控制台无 error/warning。 |
 
 ## 第一层验收记录
 
@@ -277,6 +276,33 @@ Bash 语法、完整切换/回滚行为 smoke、部署契约 smoke 和差异检�
 部署前 `check-live` 同时改为复用 systemd 的 `$(hostname)-<worker>` 稳定身份，不创建长期离线的
 临时 Agent 条目。第二层应用与发布面由此通过 G3-G4，可以进入干净主干集成与真实 G5；该
 裁决不表示已经部署或上线。
+
+### 第二层生产发布记录
+
+- 发布 revision：`65b9af847aab645069bb85b2632d4b3e45b0fed5`。
+- 干净 `main` 归档在本地与生产机的 SHA-256 一致；生产服务账号使用 Node 22.18.0 与
+  Go 1.23.0 完成依赖验证、前端构建、全部桌面/Web smoke、`go vet ./...` 和
+  `go test ./... -timeout=600s -count=1`，随后从同一源码构建五个候选程序。
+- 五个候选的独立 SHA-256、组件身份、精确 revision 和生产配置检查全部通过；三个演化
+  Worker 还在切换前使用既有共享 Token 执行真实 `check-live`，未引入请求签名或新 Token。
+- 第一次三 Worker 切换被 systemd 首次安装状态差异安全拦截：目标系统对尚未安装的模板实例
+  返回 exit 1 且 stdout 为空。脚本在任何替换前退出并清理临时备份，线上 KBase 与书籍 Worker
+  保持健康，未形成半部署。新增先红后绿的首次安装回归，只把该精确返回解释为 disabled，
+  其他查询错误仍失败；完整部署行为 smoke 与全量 Go 测试再次通过后提交修复。
+- 为保证运行程序与发布脚本属于同一 revision，修复提交后重新归档、服务器侧全量测试和构建，
+  再次执行 KBase/Web/书籍 Worker 原子切换，随后执行三个演化 Worker 的整组原子切换。两层
+  备份均创建成功，未触发回滚。
+- 最终五个 systemd 服务均为 active、`ExecMainStatus=0`、`NRestarts=0`；loopback 与公网
+  `/health` 均返回精确 revision，部署后五个服务的 warning 日志为 0。
+- 匿名 `/api/evolution/overview`、演化 Worker 与 Source Agent API 均返回 401；使用既有共享
+  Token 的认证请求返回 200。三个 Worker 在 Agent 总览中分别上报 Agent Evolution、Knowledge
+  Evolution 与 Evaluation 能力，均为健康、版本 `1.0.1`、revision 与发布提交一致。
+- 已登录应用内浏览器在线巡检确认：`/agent-packages` 为中文紧凑布局，态势条、待办双栏和
+  Agent 编队表正常；`/sources/agents` 显示三个新 Worker 在线、协议 `evolution-worker.v1`、
+  能力可用。两页浏览器控制台均无 error/warning。
+
+第二层由此通过 G5-G6。系统能够在人工分诊后生成 Agent/知识候选并独立评测，但不会自动审批
+或发布；第三层人工审批与受限发布仍需单独通过自己的 G1-G6。
 
 后续实施必须按实施计划顺序推进，并把每层的真实测试、评审、部署和线上证据追加到本
 dossier；失败或阻断必须原样记录并回到上游修复。
