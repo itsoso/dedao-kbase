@@ -328,6 +328,17 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveStatic(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/evolution/workers/") {
+		if h.sourceAgentToken == "" {
+			writeHTTPError(w, http.StatusServiceUnavailable, "evolution worker API is not configured")
+			return
+		}
+		if !authorizeBearerToken(w, r, h.sourceAgentToken) {
+			return
+		}
+		h.handleEvolutionWorkerAPI(w, r)
+		return
+	}
 	if strings.HasPrefix(r.URL.Path, "/api/source-agent/") {
 		if h.sourceSync == nil || h.sourceAgentToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "source agent API is not configured")

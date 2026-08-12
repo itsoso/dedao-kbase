@@ -320,6 +320,17 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 	return work, true, nil
 }
 
+func (s *EvolutionControlStore) LoadEvolutionWork(workID string) (*EvolutionWork, error) {
+	if err := validateEvolutionIdentity("work_id", workID); err != nil {
+		return nil, err
+	}
+	work, err := scanEvolutionWork(s.db.QueryRow(evolutionWorkSelect+` WHERE work_id = ?`, workID))
+	if err != nil {
+		return nil, normalizeEvolutionWorkLoadError(err)
+	}
+	return work, nil
+}
+
 func (s *EvolutionControlStore) RenewEvolutionLease(input EvolutionWorkLeaseUpdate) (*EvolutionWork, error) {
 	if err := validateEvolutionLeaseIdentity(input.WorkID, input.WorkerID, input.LeaseID, input.LeaseDuration); err != nil {
 		return nil, err

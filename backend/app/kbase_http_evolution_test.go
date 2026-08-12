@@ -33,6 +33,63 @@ func TestKBaseHTTPHandlerEvolutionReadAPIsRequireAuthentication(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPHandlerEvolutionWorkerLifecycleUsesSharedWorkerToken(t *testing.T) {
+	books, evolution := newEvolutionHTTPTestStores(t)
+	release := agentCompilerTestRelease("release-worker-primary", "book-worker-primary", "2026-08-11T10:00:00Z", "共同结论", "Publisher A", "dedao_ebook")
+	saveKnowledgeAssemblyRelease(t, books, release)
+	run := createGeneratingEvolutionRunForType(t, evolution, EvolutionRunAgentPolicy, "http-worker-run", "research-assistant", "1.0.1", []string{release.ReleaseID})
+	queued, _, err := evolution.EnqueueEvolutionWork(EvolutionWorkInput{
+		IdempotencyKey: "sha256:" + evolutionWorkerPayloadHash("http-worker-generation"),
+		RunID:          run.RunID, Capability: EvolutionCapabilityAgent,
+		ArtifactRef: "artifact:sha256:" + evolutionWorkerPayloadHash("http-worker-input"), MaxAttempts: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: books, AuthToken: "consumer-token", SourceAgentToken: "shared-worker-token",
+		EvolutionStore: evolution, EvolutionEnabled: true,
+	})
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/evolution/workers/lease", "consumer-token", `{"worker_id":"worker-a","capabilities":["agent_evolution"],"lease_seconds":60}`)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("consumer token status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	leaseResponse := requestJSONKBase(handler, http.MethodPost, "/api/evolution/workers/lease", "shared-worker-token", `{"worker_id":"worker-a","capabilities":["agent_evolution"],"lease_seconds":60}`)
+	if leaseResponse.Code != http.StatusOK {
+		t.Fatalf("lease status=%d body=%s", leaseResponse.Code, leaseResponse.Body.String())
+	}
+	var leasedPayload struct {
+		Work *EvolutionWork `json:"work"`
+	}
+	if err := json.Unmarshal(leaseResponse.Body.Bytes(), &leasedPayload); err != nil || leasedPayload.Work == nil || leasedPayload.Work.WorkID != queued.WorkID {
+		t.Fatalf("lease payload=%#v err=%v", leasedPayload, err)
+	}
+	work := leasedPayload.Work
+	identity, _ := json.Marshal(evolutionWorkerIdentityRequest{WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: work.LeaseID, Attempt: work.Attempt})
+	generateResponse := requestJSONKBase(handler, http.MethodPost, "/api/evolution/workers/generate", "shared-worker-token", string(identity))
+	if generateResponse.Code != http.StatusOK {
+		t.Fatalf("generate status=%d body=%s", generateResponse.Code, generateResponse.Body.String())
+	}
+	var generated EvolutionGenerationResult
+	if err := json.Unmarshal(generateResponse.Body.Bytes(), &generated); err != nil || generated.Candidate == nil {
+		t.Fatalf("generated=%#v err=%v", generated, err)
+	}
+	completion := EvolutionWorkCompletion{
+		WorkID: work.WorkID, WorkerID: "worker-a", LeaseID: work.LeaseID, Attempt: work.Attempt,
+		ResultIdempotencyKey: "sha256:" + evolutionWorkerPayloadHash("http-worker-result"), ResultArtifactRef: generated.Candidate.ArtifactRef,
+	}
+	completionJSON, _ := json.Marshal(completion)
+	completeResponse := requestJSONKBase(handler, http.MethodPost, "/api/evolution/workers/complete", "shared-worker-token", string(completionJSON))
+	if completeResponse.Code != http.StatusOK {
+		t.Fatalf("complete status=%d body=%s", completeResponse.Code, completeResponse.Body.String())
+	}
+	updated, err := evolution.LoadRun(run.RunID)
+	if err != nil || updated.Status != EvolutionEvaluating {
+		t.Fatalf("updated run=%#v err=%v", updated, err)
+	}
+}
+
 func TestKBaseHTTPHandlerEvolutionOverviewIsDenseAndPrivate(t *testing.T) {
 	books, evolution := newEvolutionHTTPTestStores(t)
 	seedEvolutionHTTPPackages(t, books)

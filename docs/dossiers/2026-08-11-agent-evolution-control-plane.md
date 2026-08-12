@@ -3,7 +3,8 @@
 **日期：** 2026-08-11
 
 **状态：** 第一层已通过 G1-G6，并以 revision
-`389c5afe9506fc67b2ad73b5e216fd50f2edfbf4` 上线；第二层尚未开始
+`389c5afe9506fc67b2ad73b5e216fd50f2edfbf4` 上线；第二层任务 7 已完成本地实现与聚焦验收，
+任务 8 和第二层 G3-G6 尚未完成
 
 **交付分支：** `codex/agent-evolution-control-plane`
 
@@ -156,6 +157,15 @@ G1-G6，不得继承本层结论，也不得把本地 fixture 巡检当作上线
 
 ## 当前断点
 
-任务 6（第一层）已完成并通过 G1-G6；任务 7（第二层：双环候选与自动评测）尚未开始。
+任务 6（第一层）已完成并通过 G1-G6。任务 7 已实现内容寻址、不可覆盖的候选存储，
+Agent/知识生成适配器，共享 Worker Token 下的租约、续租、生成、完成和失败 HTTP 协议，
+以及同批交付的 `agent-evolution-worker` 与 `knowledge-evolution-worker`；生成路径只把任务推进到
+`evaluating` 并排队评估，不调用 Agent Package 或 Knowledge Release 发布接口。
+
+任务 7 聚焦验收已通过：候选、生成、Worker 客户端与 Worker 生命周期后端测试通过，两个
+Worker 命令测试通过，系统地图重新生成且漂移检查通过，隐私 smoke 与 `git diff --check`
+通过。第二层还不能宣告通过：任务 8 的确定性评分卡、评估 Worker 和详情展示尚未实现，
+之后还必须执行第二层完整 G3-G6。
+
 后续实施必须按实施计划顺序推进，并把每层的真实测试、评审、部署和线上证据追加到本
 dossier；失败或阻断必须原样记录并回到上游修复。

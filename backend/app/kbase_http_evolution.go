@@ -8,7 +8,132 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
+
+func (h *kbaseHTTPHandler) handleEvolutionWorkerAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if !h.evolutionEnabled || h.evolutionStore == nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "evolution control plane is not configured")
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	switch r.URL.Path {
+	case "/api/evolution/workers/lease":
+		var payload evolutionWorkerLeaseRequest
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		work, _, err := h.evolutionStore.LeaseNextEvolutionWork(EvolutionWorkLeaseInput{
+			WorkerID: payload.WorkerID, Capabilities: payload.Capabilities,
+			LeaseDuration: time.Duration(payload.LeaseSeconds) * time.Second,
+		})
+		if err != nil {
+			h.writeEvolutionWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"work": work})
+	case "/api/evolution/workers/renew":
+		var payload evolutionWorkerRenewRequest
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		work, err := h.evolutionStore.RenewEvolutionLease(EvolutionWorkLeaseUpdate{
+			WorkID: payload.WorkID, WorkerID: payload.WorkerID, LeaseID: payload.LeaseID,
+			LeaseDuration: time.Duration(payload.LeaseSeconds) * time.Second,
+		})
+		if err != nil {
+			h.writeEvolutionWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"work": work})
+	case "/api/evolution/workers/generate":
+		h.handleEvolutionWorkerGeneration(w, r)
+	case "/api/evolution/workers/complete":
+		var payload EvolutionWorkCompletion
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		work, _, err := h.evolutionStore.CompleteEvolutionWork(payload)
+		if err != nil {
+			h.writeEvolutionWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"work": work})
+	case "/api/evolution/workers/fail":
+		var payload evolutionWorkerFailRequest
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		work, _, err := h.evolutionStore.FailEvolutionWork(EvolutionWorkFailure{
+			WorkID: payload.WorkID, WorkerID: payload.WorkerID, LeaseID: payload.LeaseID, Attempt: payload.Attempt,
+			FailureIdempotencyKey: payload.FailureIdempotencyKey, FailureCode: payload.FailureCode,
+			FailureMessage: payload.FailureMessage, RetryDelay: time.Duration(payload.RetrySeconds) * time.Second,
+		})
+		if err != nil {
+			h.writeEvolutionWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"work": work})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleEvolutionWorkerGeneration(w http.ResponseWriter, r *http.Request) {
+	var payload evolutionWorkerIdentityRequest
+	if !h.decodeSourceAgentJSON(w, r, &payload) {
+		return
+	}
+	work, err := h.evolutionStore.LoadEvolutionWork(payload.WorkID)
+	if err != nil {
+		h.writeEvolutionWorkerError(w, err)
+		return
+	}
+	if work.Attempt != payload.Attempt || validateActiveEvolutionWorkLease(work, payload.WorkerID, payload.LeaseID, h.evolutionStore.now().UTC()) != nil {
+		h.writeEvolutionWorkerError(w, ErrEvolutionLeaseLost)
+		return
+	}
+	version := "knowledge-evolution-worker.v1"
+	if work.Capability == EvolutionCapabilityAgent {
+		version = "agent-evolution-worker.v1"
+	}
+	service, err := NewEvolutionGenerationService(EvolutionGenerationConfig{
+		ControlStore: h.evolutionStore, KnowledgeStore: h.store, GeneratorVersion: version,
+	})
+	if err != nil {
+		h.writeEvolutionWorkerError(w, err)
+		return
+	}
+	result, err := service.Generate(r.Context(), *work)
+	if err != nil {
+		h.writeEvolutionWorkerError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) writeEvolutionWorkerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrEvolutionWorkNotFound), errors.Is(err, ErrEvolutionRunNotFound):
+		writeHTTPError(w, http.StatusNotFound, "evolution work was not found")
+	case errors.Is(err, ErrEvolutionLeaseLost), errors.Is(err, ErrEvolutionLeaseExpired), errors.Is(err, ErrEvolutionTransitionConflict), errors.Is(err, ErrEvolutionIdempotencyConflict):
+		writeHTTPError(w, http.StatusConflict, "evolution work conflicts with current state")
+	case errors.Is(err, ErrEvolutionCapabilityInvalid):
+		writeHTTPError(w, http.StatusBadRequest, "invalid evolution worker capability")
+	default:
+		var failure *EvolutionGenerationFailure
+		if errors.As(err, &failure) {
+			writeHTTPError(w, http.StatusUnprocessableEntity, failure.Message)
+			return
+		}
+		writeHTTPError(w, http.StatusBadRequest, "invalid evolution worker request")
+	}
+}
 
 const (
 	evolutionHTTPDefaultLimit = 50
