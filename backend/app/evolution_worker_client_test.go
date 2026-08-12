@@ -11,6 +11,7 @@ import (
 
 func TestEvolutionWorkerClientUsesSharedTokenForLifecycle(t *testing.T) {
 	var paths []string
+	var heartbeatHealth SourceCapabilityHealth
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer shared-worker-token" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -19,6 +20,17 @@ func TestEvolutionWorkerClientUsesSharedTokenForLifecycle(t *testing.T) {
 		paths = append(paths, r.URL.Path)
 		switch r.URL.Path {
 		case "/api/source-agent/heartbeat":
+			var heartbeat SourceAgentHeartbeat
+			if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+				http.Error(w, "invalid heartbeat", http.StatusBadRequest)
+				return
+			}
+			health, err := normalizeSourceCapabilityHealth(heartbeat.CapabilityHealth)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			heartbeatHealth = health[string(EvolutionCapabilityAgent)]
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"agent": SourceAgent{AgentID: "worker-a"}})
 		case "/api/evolution/workers/lease":
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"work": EvolutionWork{WorkID: "work-a", Status: EvolutionWorkLeased, Attempt: 1, WorkerID: "worker-a", LeaseID: "lease-a"}})
@@ -49,6 +61,9 @@ func TestEvolutionWorkerClientUsesSharedTokenForLifecycle(t *testing.T) {
 	ctx := context.Background()
 	if _, err := client.Heartbeat(ctx, EvolutionCapabilityAgent, "1.0.0", "revision-a"); err != nil {
 		t.Fatal(err)
+	}
+	if heartbeatHealth.Version != "1.0.0" || heartbeatHealth.Revision != "revision-a" || heartbeatHealth.Code != "" {
+		t.Fatalf("production heartbeat health=%#v", heartbeatHealth)
 	}
 	work, err := client.Lease(ctx, []EvolutionWorkerCapability{EvolutionCapabilityAgent}, time.Minute)
 	if err != nil || work == nil {

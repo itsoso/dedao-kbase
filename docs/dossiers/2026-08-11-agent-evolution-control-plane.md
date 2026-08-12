@@ -4,7 +4,8 @@
 
 **状态：** 第一层已通过 G1-G6，并以 revision
 `389c5afe9506fc67b2ad73b5e216fd50f2edfbf4` 上线；第二层任务 7、8 已完成本地实现，
-G3 本地验证与第四轮独立 G4 复审通过，G5-G6 尚未执行
+G3 本地验证与应用层第四轮独立 G4 复审通过；发布面上一轮 G4 复审为 NO-GO，修复后正在
+重新复审并通过，G5-G6 尚未执行
 
 **交付分支：** 第一层 `codex/agent-evolution-control-plane`；第二层
 `codex/agent-evolution-layer-2`
@@ -200,8 +201,11 @@ work 同事务回滚；重复人工调用返回同一任务。第三次独立 G4
 `-race` 测试通过；`go vet ./...`、`go mod verify`、`frontend` 的 `npm run build`、全部
 `frontend-web/scripts/*smoke*.mjs`、隐私 smoke 与 `git diff --check` 均通过。系统地图已重新
 生成且漂移检查通过。一次与其他重测试并行的全量运行曾触发既有 Evidence Audit 40ms 租约
-时序用例失败；该用例单独连续 20 次通过，停止并发后全量复跑通过，因此没有修改其生产代码
-或放宽断言。第二层仍不能宣告 G4/G5/G6 通过：必须取得新的独立复审裁决，并在干净主干上
+时序用例失败；初次单独连续 20 次通过，停止并发后全量复跑通过。G5 准备期间再次出现后，
+独立连续 50 次复现出 2 次失败，证明文件型 manifest 心跳偶尔超过测试专用的 40ms 租约。
+测试现改为 1s 租约/100ms 心跳并仍等待 1.5s，继续验证“排队任务等待超过一个租约仍不预领”；
+生产协调器未修改，断言未放宽，修后连续 10 次通过。第二层仍不能宣告 G4/G5/G6 通过：
+必须取得新的独立复审裁决，并在干净主干上
 完成部署健康与线上验证。
 
 第三次独立 G4 复审为 **NO-GO**：0 个 Critical、1 个 Important，另有 1 个 Minor。Important
@@ -217,6 +221,62 @@ Minor 指出多代评分卡相同 `created_at` 时“最新”查询缺少稳定
 前置阻断、组合候选双组件、不可变知识快照、事务化评估终结、租约恢复与 defer、HTTP 鉴权、
 共享 Token、无请求签名、无自动审批或发布旁路均未回归。第二层由此通过 G3-G4，可以进入
 干净主干集成与 G5-G6，但不得把本地验证视为已部署或已上线。
+
+G5 准备检查随后发现生产部署契约只安装 `book-job-worker`，尚未安装本层新增的 Agent、
+Knowledge 与 Evaluation Worker；此时直接部署会出现 API 已上线但演化任务无人消费的半交付，
+因此没有进入生产切换。实现层已补充一个 systemd 模板和三 Worker 范围化原子切换：三者共享
+既有 Worker Token，但使用独立进程与稳定 Worker ID；安装前分别校验 revision、配置与
+SHA-256，失败会恢复全部三者原有二进制、unit、enabled/active 状态，不改环境、数据库或知识
+制品。行为 smoke 覆盖首次安装、升级、哈希不符和第三个 Worker 启动失败时整组回滚。该新增
+发布面仍须重新通过全量验证与独立 G4 复审，之后才能进入真实 G5。
+
+首次发布面独立复审裁决为 **FAIL / NO-GO**：0 个 Critical、5 个 Important、1 个 Minor。
+问题包括旧 Worker 停止失败被忽略、错误 trap 安装晚于备份/暂存写入、只做瞬时 active 检查
+且未绑定 component/revision、systemctl 查询错误被误判为正常 inactive/disabled、README 未把
+三个 candidate 路径传入干净的服务账号环境，以及 unit 未校验 SHA-256。该裁决没有被带入提交
+或部署。
+
+这些问题已经回到实现层逐项修复：切换和回滚都严格验证 stop 结果；trap 在首次备份写入前
+生效，并区分暂存、停服、替换三个失败阶段；候选在任何写入前校验独立 SHA-256、精确 component
+和 revision，unit 同样校验源与 staged SHA；`check-live` 使用生产共享 Token 向 KBase 提交带
+capability/version/revision 的真实心跳，systemd 在每次启动前重复执行；启动后等待稳定窗口，
+要求三个实例持续 enabled/active 且 `NRestarts=0`；systemctl 的正常非零状态与 D-Bus/权限错误
+被严格区分。README 已显式传递 candidate 路径、unit SHA 与精确 revision。
+
+生产切换行为 smoke 直接执行同一脚本，现覆盖首次安装、升级、二进制哈希不符、组件互换、
+unit 哈希不符、systemctl 查询异常、第二个 candidate 暂存失败、第三个 Worker 启动失败、停服
+失败与稳定窗口掉线，并验证整组回滚及可重试清理。`check-live` 的成功与 401 失败均由真实
+`httptest` HTTP 往返覆盖。第二层全量 `go test ./... -timeout=600s -count=1` 再次通过
+（`backend/app` 126.917s）；前端构建、两套全部 smoke、`go vet ./...`、`go mod verify`、隐私、
+系统地图、部署静态/行为 smoke、YAML 解析和差异检查均通过。三个真实 Worker 二进制从相同
+测试 revision 构建，`build-info`、`check-config` 与独立 SHA-256 均通过。
+
+本轮全量测试首次运行暴露另一处既有 book-job Worker 测试使用 250ms 文件型 SQLite 租约的
+调度抖动：聚焦用例独立连续 100 次通过，但高负载全量运行中续租被拖过租约后失败。测试专用
+租约改为 5s、续租 100ms，并在完成后等待 350ms（超过三个续租周期），仍同时验证“确实续租”
+与“完成后停止续租”；生产 Worker 未修改。聚焦复验和第二次全量运行均通过。
+
+第五轮发布面独立复审仍裁决为 **FAIL / NO-GO**：0 个 Critical、2 个 Important、1 个 Minor。
+第一项指出真实非 development revision 被错误编码进 capability 的诊断 `code`，而服务端仅接受
+固定错误枚举，导致生产 `check-live` 必然 400；第二项指出 Bash 在 `func || handler` 条件上下文
+中禁用整个函数体的 `errexit`，回滚/恢复中间命令可能失败后继续并被后续成功掩盖；Minor 指出
+README 上线验证使用裸 Worker 名称，安装目录未必在 PATH。再次保持未提交、未部署。
+
+修复后，capability health 新增独立、受限校验并随既有 JSON 持久化的 `revision` 字段，诊断
+`code` 恢复为空枚举；真实 Evolution Worker 客户端通过完整 KBase HTTP handler 使用共享 Token
+提交 `version=1.0.1/revision=0123456789abcdef`，并从 Source Agent Store 读回相同值。回滚、状态
+恢复、暂存清理中的每个关键 stop/install/remove/daemon-reload/enable/start/state check 都显式
+`|| return 1`，不再依赖条件上下文中的 `errexit`；新增故障注入确认旧 evaluation 二进制恢复
+失败后不会继续 daemon-reload 或误报完整恢复。README 改用 `${KBASE_EVOLUTION_BINARY_DIR}` 下的
+绝对二进制路径并逐个精确比对 revision。上述修复正在进入第六轮独立复审，仍未进入 G5。
+
+第六轮发布面独立复审裁决为 **PASS / GO**：0 个 Critical、0 个 Important、0 个 Minor。
+复审重新执行真实 production revision 的共享 Token 心跳与持久化窄测、三个 Worker CLI 包、
+Bash 语法、完整切换/回滚行为 smoke、部署契约 smoke 和差异检查，确认 revision 字段契约、
+条件上下文中的显式错误传播、回滚 install 故障停止点、绝对路径 revision 验证均已闭合。
+部署前 `check-live` 同时改为复用 systemd 的 `$(hostname)-<worker>` 稳定身份，不创建长期离线的
+临时 Agent 条目。第二层应用与发布面由此通过 G3-G4，可以进入干净主干集成与真实 G5；该
+裁决不表示已经部署或上线。
 
 后续实施必须按实施计划顺序推进，并把每层的真实测试、评审、部署和线上证据追加到本
 dossier；失败或阻断必须原样记录并回到上游修复。

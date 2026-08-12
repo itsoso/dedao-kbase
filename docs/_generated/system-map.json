@@ -1180,7 +1180,7 @@
     {
       "name": "discover_articles",
       "file": "backend/app/source_sync.go",
-      "line": 680
+      "line": 681
     },
     {
       "name": "discover_articles",
@@ -1195,7 +1195,7 @@
     {
       "name": "existing_articles",
       "file": "backend/app/source_sync.go",
-      "line": 667
+      "line": 668
     },
     {
       "name": "existing_articles",
@@ -1210,7 +1210,7 @@
     {
       "name": "sync_articles",
       "file": "backend/app/source_sync.go",
-      "line": 665
+      "line": 666
     },
     {
       "name": "sync_articles",
@@ -1235,7 +1235,7 @@
     {
       "name": "sync_media",
       "file": "backend/app/source_sync.go",
-      "line": 680
+      "line": 681
     },
     {
       "name": "sync_media",
@@ -1812,7 +1812,7 @@
     {
       "name": "SourceAgent",
       "file": "backend/app/source_sync.go",
-      "line": 84
+      "line": 85
     },
     {
       "name": "SourceAgentArtifact",
@@ -2092,32 +2092,32 @@
     {
       "name": "SourceSubscription",
       "file": "backend/app/source_sync.go",
-      "line": 122
+      "line": 123
     },
     {
       "name": "SourceSubscriptionInput",
       "file": "backend/app/source_sync.go",
-      "line": 110
+      "line": 111
     },
     {
       "name": "SourceSyncItem",
       "file": "backend/app/source_sync.go",
-      "line": 169
+      "line": 170
     },
     {
       "name": "SourceSyncItemInput",
       "file": "backend/app/source_sync.go",
-      "line": 160
+      "line": 161
     },
     {
       "name": "SourceSyncRun",
       "file": "backend/app/source_sync.go",
-      "line": 138
+      "line": 139
     },
     {
       "name": "SourceSyncStore",
       "file": "backend/app/source_sync.go",
-      "line": 182
+      "line": 183
     },
     {
       "name": "WCPlusAccount",

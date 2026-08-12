@@ -230,6 +230,10 @@ func normalizeSourceCapabilityHealth(input map[string]SourceCapabilityHealth) (m
 		if err != nil {
 			return nil, err
 		}
+		health.Revision, err = normalizeSourceAgentVersion("capability revision", health.Revision)
+		if err != nil {
+			return nil, err
+		}
 		health.LastError = trimSourceDiagnostic(health.LastError)
 		health.RequiresAction = trimSourceDiagnostic(health.RequiresAction)
 		result[key] = health

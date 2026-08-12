@@ -81,7 +81,7 @@ func (client *EvolutionWorkerClient) Heartbeat(ctx context.Context, capability E
 	workerType := strings.ReplaceAll(string(capability), "_", "-") + "-worker"
 	health := SourceCapabilityHealth{Healthy: true, Version: strings.TrimSpace(version)}
 	if revision = strings.TrimSpace(revision); revision != "" && revision != "development" {
-		health.Code = "revision_" + boundedEvolutionWorkerRevision(revision)
+		health.Revision = revision
 	}
 	payload := SourceAgentHeartbeat{
 		AgentID: client.workerID, WorkerType: workerType, Version: strings.TrimSpace(version),
@@ -273,21 +273,4 @@ func durationSeconds(duration time.Duration) int {
 		return 0
 	}
 	return int(duration / time.Second)
-}
-
-func boundedEvolutionWorkerRevision(revision string) string {
-	revision = strings.ToLower(strings.TrimSpace(revision))
-	var result strings.Builder
-	for _, char := range revision {
-		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' || char == '-' {
-			result.WriteRune(char)
-		}
-		if result.Len() >= 32 {
-			break
-		}
-	}
-	if result.Len() == 0 {
-		return "unknown"
-	}
-	return result.String()
 }

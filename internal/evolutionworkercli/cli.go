@@ -41,7 +41,7 @@ func Run(ctx context.Context, args []string, getenv EnvironmentLookup, stdout io
 		stdout = io.Discard
 	}
 	if len(args) != 1 {
-		return errors.New("usage: evolution worker build-info|check-config|run")
+		return errors.New("usage: evolution worker build-info|check-config|check-live|run")
 	}
 	switch args[0] {
 	case "build-info":
@@ -64,6 +64,22 @@ func Run(ctx context.Context, args []string, getenv EnvironmentLookup, stdout io
 			SchemaVersion int    `json:"schema_version"`
 			Status        string `json:"status"`
 		}{1, "ok"})
+	case "check-live":
+		config, err := parseConfig(getenv)
+		if err != nil {
+			return err
+		}
+		client, err := app.NewEvolutionWorkerClient(config.client)
+		if err != nil {
+			return errors.New("invalid evolution worker control configuration")
+		}
+		if _, err := client.Heartbeat(ctx, metadata.Capability, metadata.Version, metadata.Revision); err != nil {
+			return errors.New("evolution worker liveness check failed")
+		}
+		return json.NewEncoder(stdout).Encode(struct {
+			SchemaVersion int    `json:"schema_version"`
+			Status        string `json:"status"`
+		}{1, "live"})
 	case "run":
 		config, err := parseConfig(getenv)
 		if err != nil {
@@ -75,7 +91,7 @@ func Run(ctx context.Context, args []string, getenv EnvironmentLookup, stdout io
 		}
 		return worker.Run(ctx)
 	default:
-		return errors.New("usage: evolution worker build-info|check-config|run")
+		return errors.New("usage: evolution worker build-info|check-config|check-live|run")
 	}
 }
 

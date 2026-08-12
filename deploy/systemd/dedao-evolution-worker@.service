@@ -1,0 +1,21 @@
+[Unit]
+Description=KBase %i evolution worker
+Wants=network-online.target
+Wants=dedao-kbase.service
+After=network-online.target dedao-kbase.service
+
+[Service]
+Type=simple
+User=dedao-kbase
+Group=dedao-kbase
+EnvironmentFile=/etc/dedao-kbase/kbase.env
+Environment=KBASE_EVOLUTION_WORKER_ID=%H-%i
+ExecStartPre=/opt/dedao-kbase/bin/%i check-live
+ExecStart=/opt/dedao-kbase/bin/%i run
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

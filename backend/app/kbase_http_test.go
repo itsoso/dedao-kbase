@@ -1992,6 +1992,26 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `"agent_id":"agent-a"`) {
 		t.Fatalf("agent heartbeat status = %d, body=%s", resp.Code, resp.Body.String())
 	}
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	evolutionClient, err := NewEvolutionWorkerClient(EvolutionWorkerClientConfig{
+		RemoteURL: server.URL, Token: "agent-secret", WorkerID: "agent-evolution-worker-production",
+		HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := evolutionClient.Heartbeat(context.Background(), EvolutionCapabilityAgent, "1.0.1", "0123456789abcdef"); err != nil {
+		t.Fatalf("production revision heartbeat: %v", err)
+	}
+	evolutionAgent, err := sourceSync.GetSourceAgent("agent-evolution-worker-production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	health := evolutionAgent.CapabilityHealth[string(EvolutionCapabilityAgent)]
+	if health.Version != "1.0.1" || health.Revision != "0123456789abcdef" || health.Code != "" {
+		t.Fatalf("persisted production health=%#v", health)
+	}
 
 	resp = requestKBase(handler, http.MethodGet, "/api/books", "agent-secret")
 	if resp.Code != http.StatusUnauthorized {

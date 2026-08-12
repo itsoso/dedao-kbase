@@ -206,6 +206,9 @@ sudo runuser --user "${KBASE_SERVICE_USER:?}" -- env \
   KBASE_REMOTE_SOURCE_DIR="${KBASE_REMOTE_SOURCE_DIR:?}" \
   KBASE_CANDIDATE_BIN="${KBASE_CANDIDATE_BIN:?}" \
   KBASE_WORKER_CANDIDATE_BIN="${KBASE_WORKER_CANDIDATE_BIN:?}" \
+  KBASE_AGENT_EVOLUTION_CANDIDATE_BIN="${KBASE_AGENT_EVOLUTION_CANDIDATE_BIN:?}" \
+  KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN="${KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN:?}" \
+  KBASE_EVALUATION_CANDIDATE_BIN="${KBASE_EVALUATION_CANDIDATE_BIN:?}" \
   bash -Eeuo pipefail -c '
     cd "$KBASE_REMOTE_SOURCE_DIR"
     (cd frontend && npm ci && npm run build)
@@ -223,6 +226,18 @@ sudo runuser --user "${KBASE_SERVICE_USER:?}" -- env \
       -ldflags "-X main.bookJobWorkerVersion=${KBASE_VERSION} -X main.bookJobWorkerRevision=${KBASE_REVISION}" \
       -o "$KBASE_WORKER_CANDIDATE_BIN" \
       ./cmd/book-job-worker
+    CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.agentEvolutionWorkerVersion=${KBASE_VERSION} -X main.agentEvolutionWorkerRevision=${KBASE_REVISION}" \
+      -o "$KBASE_AGENT_EVOLUTION_CANDIDATE_BIN" \
+      ./cmd/agent-evolution-worker
+    CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.knowledgeEvolutionWorkerVersion=${KBASE_VERSION} -X main.knowledgeEvolutionWorkerRevision=${KBASE_REVISION}" \
+      -o "$KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN" \
+      ./cmd/knowledge-evolution-worker
+    CGO_ENABLED=1 go build -trimpath \
+      -ldflags "-X main.evaluationWorkerVersion=${KBASE_VERSION} -X main.evaluationWorkerRevision=${KBASE_REVISION}" \
+      -o "$KBASE_EVALUATION_CANDIDATE_BIN" \
+      ./cmd/evaluation-worker
   '
 KBASE_SERVER_SHA256="$(sha256sum "${KBASE_CANDIDATE_BIN:?}" | awk '{print $1}')"
 KBASE_WORKER_SHA256="$(sha256sum "${KBASE_WORKER_CANDIDATE_BIN:?}" | awk '{print $1}')"
@@ -233,6 +248,15 @@ test "$("${KBASE_WORKER_CANDIDATE_BIN:?}" build-info | \
 sudo bash -c \
   'set -a; . /etc/dedao-kbase/kbase.env; set +a; exec runuser --user "$1" -- "$2" check-config' \
   bash "${KBASE_SERVICE_USER:?}" "${KBASE_WORKER_CANDIDATE_BIN:?}"
+
+KBASE_AGENT_EVOLUTION_SHA256="$(sha256sum "${KBASE_AGENT_EVOLUTION_CANDIDATE_BIN:?}" | awk '{print $1}')"
+KBASE_KNOWLEDGE_EVOLUTION_SHA256="$(sha256sum "${KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN:?}" | awk '{print $1}')"
+KBASE_EVALUATION_SHA256="$(sha256sum "${KBASE_EVALUATION_CANDIDATE_BIN:?}" | awk '{print $1}')"
+KBASE_EVOLUTION_UNIT_SHA256="$(sha256sum "${KBASE_EVOLUTION_UNIT_CANDIDATE_SOURCE:?}" | awk '{print $1}')"
+KBASE_EVOLUTION_REVISION="${KBASE_REVISION:?}"
+test "$("${KBASE_AGENT_EVOLUTION_CANDIDATE_BIN:?}" build-info | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')" = "${KBASE_REVISION:?}"
+test "$("${KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN:?}" build-info | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')" = "${KBASE_REVISION:?}"
+test "$("${KBASE_EVALUATION_CANDIDATE_BIN:?}" build-info | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')" = "${KBASE_REVISION:?}"
 ```
 
 `book-job-worker build-info` 必须返回预期 revision，`book-job-worker check-config`
@@ -316,6 +340,75 @@ Worker unit 只用 `Wants` 和 `After` 关联 `dedao-kbase.service`，禁止使�
 即时恢复，但不提供 artifact 身份认证、部署锁、持久事务、fsync 切换或断电恢复。
 禁止并发部署；进程被强制终止或主机在切换窗口断电时，必须从
 `KBASE_BACKUP_DIR` 手工恢复所有目标。
+
+### Evolution Worker direct deployment
+
+Agent、Knowledge 与 Evaluation 三个演化 Worker 使用同一 revision、同一既有
+`KBASE_SOURCE_AGENT_TOKEN`，但以三个独立 systemd 实例和稳定 Worker ID 运行。它们不使用
+请求签名，也没有审批或发布权限。先完成上述 KBase 切换，再在同一维护批次执行三 Worker
+原子切换；三者全部 active 前，G5 不得判定成功。
+
+候选二进制必须先使用生产环境分别执行 `check-live`，真实连接当前 KBase 并用共享 Token
+提交一次带 component、version 和 revision 的心跳；systemd 模板还会在每次启动前重复该检查。
+模板以主机名和实例名生成 `KBASE_EVOLUTION_WORKER_ID`，不会把私有身份写进仓库：
+
+```bash
+for worker_and_candidate in \
+  "agent-evolution-worker:${KBASE_AGENT_EVOLUTION_CANDIDATE_BIN:?}" \
+  "knowledge-evolution-worker:${KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN:?}" \
+  "evaluation-worker:${KBASE_EVALUATION_CANDIDATE_BIN:?}"
+do
+  worker="${worker_and_candidate%%:*}"
+  candidate="${worker_and_candidate#*:}"
+  worker_id="$(hostname)-${worker}"
+  sudo bash -c \
+    'set -a; . /etc/dedao-kbase/kbase.env; set +a; KBASE_EVOLUTION_WORKER_ID="$3" exec runuser --user "$1" -- "$2" check-live' \
+    bash "${KBASE_SERVICE_USER:?}" "$candidate" "$worker_id"
+done
+```
+
+生产切换使用单独的范围化备份目录；脚本记录每个二进制、unit 以及每个实例原有的
+enabled/active 状态。任何安装、daemon reload、配置检查或启动失败都会恢复整组三个 Worker，
+不会修改 KBase 数据库、知识制品、环境文件或 Web：
+
+```bash
+export \
+  KBASE_EVOLUTION_BACKUP_DIR \
+  KBASE_EVOLUTION_BINARY_DIR \
+  KBASE_EVOLUTION_UNIT_TARGET \
+  KBASE_EVOLUTION_UNIT_CANDIDATE_SOURCE \
+  KBASE_EVOLUTION_UNIT_SHA256 \
+  KBASE_EVOLUTION_REVISION \
+  KBASE_AGENT_EVOLUTION_CANDIDATE_BIN \
+  KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN \
+  KBASE_EVALUATION_CANDIDATE_BIN \
+  KBASE_AGENT_EVOLUTION_SHA256 \
+  KBASE_KNOWLEDGE_EVOLUTION_SHA256 \
+  KBASE_EVALUATION_SHA256
+sudo --preserve-env=KBASE_EVOLUTION_BACKUP_DIR,KBASE_EVOLUTION_BINARY_DIR,KBASE_EVOLUTION_UNIT_TARGET,KBASE_EVOLUTION_UNIT_CANDIDATE_SOURCE,KBASE_EVOLUTION_UNIT_SHA256,KBASE_EVOLUTION_REVISION,KBASE_AGENT_EVOLUTION_CANDIDATE_BIN,KBASE_KNOWLEDGE_EVOLUTION_CANDIDATE_BIN,KBASE_EVALUATION_CANDIDATE_BIN,KBASE_AGENT_EVOLUTION_SHA256,KBASE_KNOWLEDGE_EVOLUTION_SHA256,KBASE_EVALUATION_SHA256 \
+  bash "${KBASE_REMOTE_SOURCE_DIR:?}/scripts/evolution-workers-direct-cutover.sh"
+```
+
+上线后逐一确认服务状态、退出码、重启计数和 revision：
+
+```bash
+sudo systemctl is-active dedao-evolution-worker@agent-evolution-worker.service
+sudo systemctl is-active dedao-evolution-worker@knowledge-evolution-worker.service
+sudo systemctl is-active dedao-evolution-worker@evaluation-worker.service
+test "$("${KBASE_EVOLUTION_BINARY_DIR:?}/agent-evolution-worker" build-info | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')" = "${KBASE_EVOLUTION_REVISION:?}"
+test "$("${KBASE_EVOLUTION_BINARY_DIR:?}/knowledge-evolution-worker" build-info | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')" = "${KBASE_EVOLUTION_REVISION:?}"
+test "$("${KBASE_EVOLUTION_BINARY_DIR:?}/evaluation-worker" build-info | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')" = "${KBASE_EVOLUTION_REVISION:?}"
+sudo systemctl show \
+  dedao-evolution-worker@agent-evolution-worker.service \
+  dedao-evolution-worker@knowledge-evolution-worker.service \
+  dedao-evolution-worker@evaluation-worker.service \
+  -p ExecMainStatus -p NRestarts
+```
+
+`scripts/evolution-workers-direct-cutover-behavior-smoke.sh` 直接执行生产切换脚本，覆盖首次安装、
+升级、哈希不符和中途启动失败回滚；`scripts/evolution-workers-deployment-smoke.sh` 校验 CI、
+systemd 与文档契约。演化 Worker 回滚不回滚已经兼容上线的 KBase API；如果三 Worker 恢复后
+仍无法继续，发布保持 G5 失败，并按 KBase 备份批次执行人工回退。
 `DEDAO_DOWNLOAD_ROOT` 是可选的服务端电子书下载目录。未配置时，服务优先使用 `DEDAO_KBASE_ROOT/downloads`；若只配置了 `DEDAO_BOOK_KNOWLEDGE_ROOT` 或 `KBASE_BOOK_KNOWLEDGE_ROOT`，则使用知识库根目录同级的 `downloads`。下载目录仅在服务端使用，任务 API 不返回绝对路径。
 
 Web 端的得到电子书流程位于 `/sources/dedao/ebooks`：可在“我的书架”和“全站搜索”间切换，加入书架后创建“仅下载”或“下载并入知识库”任务。扫码入口为 `/sources/dedao/login`，登录 Cookie 保留在服务端，浏览器只持有短期二维码字段和安全会话摘要。

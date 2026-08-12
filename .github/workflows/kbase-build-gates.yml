@@ -102,8 +102,26 @@ jobs:
             -ldflags "-X main.bookJobWorkerVersion=ci -X main.bookJobWorkerRevision=$BUILD_REVISION" \
             -o "$RUNNER_TEMP/book-job-worker" \
             ./cmd/book-job-worker
+          CGO_ENABLED=1 go build \
+            -trimpath \
+            -ldflags "-X main.agentEvolutionWorkerVersion=ci -X main.agentEvolutionWorkerRevision=$BUILD_REVISION" \
+            -o "$RUNNER_TEMP/agent-evolution-worker" \
+            ./cmd/agent-evolution-worker
+          CGO_ENABLED=1 go build \
+            -trimpath \
+            -ldflags "-X main.knowledgeEvolutionWorkerVersion=ci -X main.knowledgeEvolutionWorkerRevision=$BUILD_REVISION" \
+            -o "$RUNNER_TEMP/knowledge-evolution-worker" \
+            ./cmd/knowledge-evolution-worker
+          CGO_ENABLED=1 go build \
+            -trimpath \
+            -ldflags "-X main.evaluationWorkerVersion=ci -X main.evaluationWorkerRevision=$BUILD_REVISION" \
+            -o "$RUNNER_TEMP/evaluation-worker" \
+            ./cmd/evaluation-worker
           sha256sum "$RUNNER_TEMP/kbase-server"
           sha256sum "$RUNNER_TEMP/book-job-worker"
+          sha256sum "$RUNNER_TEMP/agent-evolution-worker"
+          sha256sum "$RUNNER_TEMP/knowledge-evolution-worker"
+          sha256sum "$RUNNER_TEMP/evaluation-worker"
           export PATH="$RUNNER_TEMP:$PATH"
           book-job-worker build-info |
             grep -Fq "\"revision\":\"$BUILD_REVISION\""
@@ -113,7 +131,17 @@ jobs:
             KBASE_SOURCE_AGENT_TOKEN=ci-shared-source-agent-credential \
             KBASE_SOURCE_AGENT_ID=ci-book-worker-agent \
             book-job-worker check-config
-          go test ./cmd/book-job-worker ./cmd/kbase-server
+          for worker in agent-evolution-worker knowledge-evolution-worker evaluation-worker; do
+            "$worker" build-info | grep -Fq "\"revision\":\"$BUILD_REVISION\""
+            KBASE_REMOTE_URL=https://kbase.example.invalid \
+              KBASE_SOURCE_AGENT_TOKEN=ci-shared-source-agent-credential \
+              KBASE_EVOLUTION_WORKER_ID="ci-${worker}" \
+              "$worker" check-config
+          done
+          go test ./cmd/book-job-worker ./cmd/kbase-server \
+            ./cmd/agent-evolution-worker \
+            ./cmd/knowledge-evolution-worker \
+            ./cmd/evaluation-worker
 
       - name: Verify book Worker service contract
         run: |
@@ -123,6 +151,9 @@ jobs:
           sudo install -d /opt/dedao-kbase/bin /etc/dedao-kbase
           sudo install -m 0755 "$RUNNER_TEMP/book-job-worker" \
             /opt/dedao-kbase/bin/book-job-worker
+          for worker in agent-evolution-worker knowledge-evolution-worker evaluation-worker; do
+            sudo install -m 0755 "$RUNNER_TEMP/$worker" "/opt/dedao-kbase/bin/$worker"
+          done
           sudo install -m 0600 /dev/null /etc/dedao-kbase/kbase.env
           printf '%s\n' \
             '[Unit]' \
@@ -133,6 +164,8 @@ jobs:
             'RemainAfterExit=yes' |
             sudo tee /etc/systemd/system/dedao-kbase.service >/dev/null
           systemd-analyze verify deploy/systemd/dedao-book-job-worker.service
+          systemd-analyze verify \
+            deploy/systemd/dedao-evolution-worker@.service
 
       - name: Test real Nginx proxy
         run: |
@@ -143,6 +176,9 @@ jobs:
       - name: Verify direct-deployment contract
         run: |
           bash scripts/kbase-direct-deployment-smoke.sh
+          bash -n scripts/evolution-workers-direct-cutover.sh
+          bash scripts/evolution-workers-deployment-smoke.sh
+          bash scripts/evolution-workers-direct-cutover-behavior-smoke.sh
           bash scripts/kbase-direct-deployment-behavior-smoke.sh
 
       - name: Verify source Agent control plane

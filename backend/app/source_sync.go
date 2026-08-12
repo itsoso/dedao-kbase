@@ -77,6 +77,7 @@ type SourceCapabilityHealth struct {
 	Healthy        bool   `json:"healthy"`
 	Code           string `json:"code,omitempty"`
 	Version        string `json:"version,omitempty"`
+	Revision       string `json:"revision,omitempty"`
 	LastError      string `json:"last_error,omitempty"`
 	RequiresAction string `json:"requires_action,omitempty"`
 }

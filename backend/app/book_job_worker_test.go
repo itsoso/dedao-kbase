@@ -1051,7 +1051,10 @@ func TestBookJobWorkerRenewsLeaseAndStopsRenewingBeforeCompletion(t *testing.T) 
 	job := createWorkerTestJob(t, store, BookKnowledgeJobTypeDedaoEbookDownload, 230)
 	started := make(chan struct{})
 	release := make(chan struct{})
-	worker := newWorkerWithDurationsForTest(t, store, 250*time.Millisecond, 25*time.Millisecond, 20*time.Millisecond,
+	// Keep the lease comfortably above a loaded filesystem/SQLite scheduling
+	// interval. The test still observes a real renewal and then waits for more
+	// than three renewal intervals to prove that completion stops the loop.
+	worker := newWorkerWithDurationsForTest(t, store, 5*time.Second, 100*time.Millisecond, 20*time.Millisecond,
 		func(ctx context.Context, _ BookKnowledgeJob, _ func(string) error) (map[string]any, error) {
 			close(started)
 			select {
@@ -1070,7 +1073,7 @@ func TestBookJobWorkerRenewsLeaseAndStopsRenewingBeforeCompletion(t *testing.T) 
 		t.Fatal(err)
 	}
 	events := countBookKnowledgeJobEvents(t, store, job.ID)
-	time.Sleep(75 * time.Millisecond)
+	time.Sleep(350 * time.Millisecond)
 	if got := countBookKnowledgeJobEvents(t, store, job.ID); got != events {
 		t.Fatalf("renew loop continued after completion: events=%d want=%d", got, events)
 	}

@@ -238,8 +238,8 @@ func TestEvidenceAuditCoordinatorClaimsLeaseOnlyWhenWorkerStarts(t *testing.T) {
 	var calls atomic.Int32
 	coordinator, err := NewEvidenceAuditCoordinator(EvidenceAuditCoordinatorConfig{
 		Store: store, OwnerID: "worker-claim-owner", Workers: 1, QueueSize: 2,
-		PollInterval: time.Hour, LeaseDuration: 40 * time.Millisecond,
-		HeartbeatInterval: 10 * time.Millisecond,
+		PollInterval: time.Hour, LeaseDuration: time.Second,
+		HeartbeatInterval: 100 * time.Millisecond,
 		Run: func(ctx context.Context, _ *BookKnowledgeStore, auditID string, _ BookKnowledgeLLMClient, _ EvidenceAuditRunnerConfig) (*EvidenceAudit, error) {
 			switch calls.Add(1) {
 			case 1:
@@ -292,10 +292,13 @@ func TestEvidenceAuditCoordinatorClaimsLeaseOnlyWhenWorkerStarts(t *testing.T) {
 	}
 	select {
 	case <-firstStarted:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("first audit did not start")
 	}
-	time.Sleep(80 * time.Millisecond)
+	// Wait beyond one lease while heartbeats keep the active task alive. The
+	// filesystem-backed manifest can take tens of milliseconds per update, so
+	// sub-100ms leases turn scheduler jitter into an unrelated test failure.
+	time.Sleep(1500 * time.Millisecond)
 	queued, err := store.LoadEvidenceAuditRecord(audits[1].AuditID)
 	if err != nil {
 		t.Fatal(err)
@@ -306,7 +309,7 @@ func TestEvidenceAuditCoordinatorClaimsLeaseOnlyWhenWorkerStarts(t *testing.T) {
 	close(releaseFirst)
 	select {
 	case <-secondStarted:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("second audit starved after waiting longer than lease duration")
 	}
 }
