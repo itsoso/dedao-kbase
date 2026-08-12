@@ -14,6 +14,7 @@ type fakeEvolutionGenerationWorkerClient struct {
 	heartbeats    int
 	completedRefs []string
 	failedCodes   []string
+	deferredCodes []string
 }
 
 func (fake *fakeEvolutionGenerationWorkerClient) Heartbeat(context.Context, EvolutionWorkerCapability, string, string) (SourceAgent, error) {
@@ -39,6 +40,10 @@ func (fake *fakeEvolutionGenerationWorkerClient) Fail(_ context.Context, _ Evolu
 	fake.failedCodes = append(fake.failedCodes, code)
 	return &EvolutionWork{Status: EvolutionWorkPending}, nil
 }
+func (fake *fakeEvolutionGenerationWorkerClient) Defer(_ context.Context, _ EvolutionWork, code, _ string, _ time.Duration) (*EvolutionWork, error) {
+	fake.deferredCodes = append(fake.deferredCodes, code)
+	return &EvolutionWork{Status: EvolutionWorkPending}, nil
+}
 
 func TestEvolutionGenerationWorkerCompletesGeneratedCandidate(t *testing.T) {
 	fake := &fakeEvolutionGenerationWorkerClient{
@@ -55,6 +60,27 @@ func TestEvolutionGenerationWorkerCompletesGeneratedCandidate(t *testing.T) {
 	processed, err := worker.RunOnce(context.Background())
 	if err != nil || !processed || fake.heartbeats != 1 || len(fake.completedRefs) != 1 || len(fake.failedCodes) != 0 {
 		t.Fatalf("processed=%v err=%v heartbeat=%d complete=%v fail=%v", processed, err, fake.heartbeats, fake.completedRefs, fake.failedCodes)
+	}
+}
+
+func TestEvolutionGenerationWorkerDefersDependencyWaitWithoutFailure(t *testing.T) {
+	fake := &fakeEvolutionGenerationWorkerClient{
+		work: &EvolutionWork{WorkID: "work-a", Status: EvolutionWorkLeased, Attempt: 1},
+		result: &EvolutionGenerationResult{
+			Deferred: true, FailureCode: "knowledge_candidate_waiting",
+			FailureMessage: "candidate generation is waiting for reverification", RetrySeconds: 300,
+		},
+	}
+	worker, err := NewEvolutionGenerationWorker(EvolutionGenerationWorkerConfig{
+		Client: fake, Capability: EvolutionCapabilityKnowledge, Version: "1.0.0",
+		LeaseDuration: time.Minute, RenewInterval: 20 * time.Second, PollInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed || len(fake.deferredCodes) != 1 || fake.deferredCodes[0] != "knowledge_candidate_waiting" || len(fake.failedCodes) != 0 {
+		t.Fatalf("processed=%v err=%v defer=%v fail=%v", processed, err, fake.deferredCodes, fake.failedCodes)
 	}
 }
 

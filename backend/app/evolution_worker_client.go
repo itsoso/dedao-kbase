@@ -130,10 +130,19 @@ func (client *EvolutionWorkerClient) Generate(ctx context.Context, work Evolutio
 	return &response, nil
 }
 
+func (client *EvolutionWorkerClient) Evaluate(ctx context.Context, work EvolutionWork) (*EvolutionEvaluationResult, error) {
+	payload := evolutionWorkerIdentityRequest{WorkID: work.WorkID, WorkerID: client.workerID, LeaseID: work.LeaseID, Attempt: work.Attempt}
+	var response EvolutionEvaluationResult
+	if err := client.doJSON(ctx, "/api/evolution/workers/evaluate", payload, &response); err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
 func (client *EvolutionWorkerClient) Complete(ctx context.Context, work EvolutionWork, artifactRef string) (*EvolutionWork, error) {
 	payload := EvolutionWorkCompletion{
 		WorkID: work.WorkID, WorkerID: client.workerID, LeaseID: work.LeaseID, Attempt: work.Attempt,
-		ResultIdempotencyKey: "sha256:" + evolutionWorkerPayloadHash(strings.Join([]string{"complete", work.WorkID, fmt.Sprint(work.Attempt), artifactRef}, ":")),
+		ResultIdempotencyKey: evolutionWorkResultIdempotencyKey(work, artifactRef),
 		ResultArtifactRef:    artifactRef,
 	}
 	var response struct {
@@ -143,6 +152,10 @@ func (client *EvolutionWorkerClient) Complete(ctx context.Context, work Evolutio
 		return nil, err
 	}
 	return response.Work, nil
+}
+
+func evolutionWorkResultIdempotencyKey(work EvolutionWork, artifactRef string) string {
+	return "sha256:" + evolutionWorkerPayloadHash(strings.Join([]string{"complete", work.WorkID, fmt.Sprint(work.Attempt), artifactRef}, ":"))
 }
 
 func (client *EvolutionWorkerClient) Fail(ctx context.Context, work EvolutionWork, code, message string, retryDelay time.Duration) (*EvolutionWork, error) {
@@ -155,6 +168,21 @@ func (client *EvolutionWorkerClient) Fail(ctx context.Context, work EvolutionWor
 		Work *EvolutionWork `json:"work"`
 	}
 	if err := client.doJSON(ctx, "/api/evolution/workers/fail", payload, &response); err != nil {
+		return nil, err
+	}
+	return response.Work, nil
+}
+
+func (client *EvolutionWorkerClient) Defer(ctx context.Context, work EvolutionWork, code, message string, retryDelay time.Duration) (*EvolutionWork, error) {
+	payload := evolutionWorkerFailRequest{
+		WorkID: work.WorkID, WorkerID: client.workerID, LeaseID: work.LeaseID, Attempt: work.Attempt,
+		FailureIdempotencyKey: "sha256:" + evolutionWorkerPayloadHash(strings.Join([]string{"defer", work.WorkID, fmt.Sprint(work.Attempt), code}, ":")),
+		FailureCode:           code, FailureMessage: message, RetrySeconds: durationSeconds(retryDelay),
+	}
+	var response struct {
+		Work *EvolutionWork `json:"work"`
+	}
+	if err := client.doJSON(ctx, "/api/evolution/workers/defer", payload, &response); err != nil {
 		return nil, err
 	}
 	return response.Work, nil

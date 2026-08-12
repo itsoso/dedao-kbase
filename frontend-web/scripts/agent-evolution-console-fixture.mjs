@@ -55,6 +55,42 @@ export function sortFixtureRunsAsBackend(items) {
   });
 }
 
+function fixtureEvolutionDetail(run) {
+  if (!run || !["run-open-a", "run-blocked"].includes(run.run_id)) return run ? { run } : null;
+  const blocked = run.run_id === "run-blocked";
+  const baseline = 80;
+  const candidate = blocked ? 92 : 84;
+  const metrics = Object.fromEntries(["answer_quality", "evidence_quality", "task_completion", "reliability", "cost", "latency"].map((metric) => [metric, candidate]));
+  const baselineMetrics = Object.fromEntries(Object.keys(metrics).map((metric) => [metric, baseline]));
+  return {
+    run: { ...run, has_candidate: true },
+    candidate: {
+      candidate_id: `sha256:${"a".repeat(64)}`,
+      candidate_type: blocked ? "knowledge_release" : "agent_compilation",
+      artifact_ref: `candidate:sha256:${"b".repeat(64)}`,
+      change_summary: "Fixture 候选",
+      generator_version: "fixture-generator.v1",
+    },
+    scorecard: {
+      scorecard_id: `sha256:${"c".repeat(64)}`,
+      suite_version: "evolution-suite.v1",
+      suite_identity: `sha256:${"e".repeat(64)}`,
+      scorer_version: "evolution-scorer.v1",
+      weight_version: "evolution-weights.v1",
+      hard_gates: { privacy: true, citations: !blocked },
+      baseline_metrics: baselineMetrics,
+      candidate_metrics: metrics,
+      metric_weights: { answer_quality: .30, evidence_quality: .25, task_completion: .20, reliability: .10, cost: .10, latency: .05 },
+      component_contributions: blocked ? { knowledge: candidate - baseline } : { agent: candidate - baseline },
+      baseline_score: baseline,
+      weighted_score: candidate,
+      delta: candidate - baseline,
+      decision: blocked ? "blocked" : "awaiting_approval",
+      failure_case_refs: blocked ? [`artifact:sha256:${"d".repeat(64)}`] : [],
+    },
+  };
+}
+
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -114,7 +150,7 @@ async function serveAPI(request, response, url) {
   const runMatch = url.pathname.match(/^\/api\/evolution\/runs\/([^/]+)$/);
   if (runMatch) {
     const run = runs.find((item) => item.run_id === decodeURIComponent(runMatch[1]));
-    json(response, run ? { run } : { error: "not found" }, run ? 200 : 404);
+    json(response, fixtureEvolutionDetail(run) || { error: "not found" }, run ? 200 : 404);
     return true;
   }
   if (url.pathname === "/api/knowledge/releases") {

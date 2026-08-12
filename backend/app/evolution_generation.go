@@ -2,10 +2,12 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const evolutionEvaluationMaxAttempts = 3
@@ -27,14 +29,40 @@ type EvolutionGenerationService struct {
 type EvolutionGenerationResult struct {
 	Candidate      *EvolutionCandidate `json:"candidate"`
 	EvaluationWork *EvolutionWork      `json:"evaluation_work"`
+	Deferred       bool                `json:"deferred,omitempty"`
+	FailureCode    string              `json:"failure_code,omitempty"`
+	FailureMessage string              `json:"failure_message,omitempty"`
+	RetrySeconds   int                 `json:"retry_seconds,omitempty"`
 }
 
 // EvolutionGenerationFailure exposes only a bounded, stable code and message to
 // workers. Err is retained for server-side diagnosis and must not be serialized.
 type EvolutionGenerationFailure struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Err     error  `json:"-"`
+	Code       string        `json:"code"`
+	Message    string        `json:"message"`
+	RetryAfter time.Duration `json:"-"`
+	Err        error         `json:"-"`
+}
+
+const (
+	evolutionKnowledgeCandidateSchema = "evolution-knowledge-candidate.v1"
+	evolutionCombinedCandidateSchema  = "evolution-combined-candidate.v1"
+)
+
+// EvolutionKnowledgeCandidateArtifact freezes all mutable quality and feedback
+// inputs used by evaluation. Its identity is covered by the outer candidate hash.
+type EvolutionKnowledgeCandidateArtifact struct {
+	SchemaVersion      string                      `json:"schema_version"`
+	Task               KnowledgeReverificationTask `json:"task"`
+	BaselineQuality    BookQualityReport           `json:"baseline_quality"`
+	FeedbackAssessment KnowledgeFeedbackAssessment `json:"feedback_assessment"`
+	SnapshotIdentity   string                      `json:"snapshot_identity"`
+}
+
+type EvolutionCombinedCandidateArtifact struct {
+	SchemaVersion string                              `json:"schema_version"`
+	Agent         AgentCompilation                    `json:"agent"`
+	Knowledge     EvolutionKnowledgeCandidateArtifact `json:"knowledge"`
 }
 
 func (failure *EvolutionGenerationFailure) Error() string {
@@ -101,14 +129,28 @@ func (service *EvolutionGenerationService) Generate(ctx context.Context, work Ev
 	}
 
 	var input EvolutionCandidateInput
-	switch work.Capability {
-	case EvolutionCapabilityAgent:
+	switch run.RunType {
+	case EvolutionRunCombined:
+		if work.Capability != EvolutionCapabilityAgent {
+			return nil, generationFailure("combined_agent_worker_required", "combined candidate generation requires the agent worker", nil)
+		}
+		input, err = service.buildCombinedCandidate(*run, work)
+	case EvolutionRunAgentPolicy:
+		if work.Capability != EvolutionCapabilityAgent {
+			return nil, generationFailure("agent_worker_required", "agent candidate generation requires the agent worker", nil)
+		}
 		input, err = service.buildAgentCandidate(*run, work)
-	case EvolutionCapabilityKnowledge:
+	case EvolutionRunKnowledgeRelease:
+		if work.Capability != EvolutionCapabilityKnowledge {
+			return nil, generationFailure("knowledge_worker_required", "knowledge candidate generation requires the knowledge worker", nil)
+		}
 		input, err = service.buildKnowledgeCandidate(*run, work)
 	}
 	if err != nil {
 		return nil, err
+	}
+	if privacyPassed, _, _ := evaluateEvolutionCandidatePrivacy(input.Artifact); !privacyPassed {
+		return nil, generationFailure("candidate_privacy_failed", "candidate generation failed the privacy gate", nil)
 	}
 	candidate, _, err := service.control.SaveEvolutionCandidate(input)
 	if err != nil {
@@ -128,8 +170,21 @@ func (service *EvolutionGenerationService) Generate(ctx context.Context, work Ev
 }
 
 func (service *EvolutionGenerationService) buildAgentCandidate(run EvolutionRun, work EvolutionWork) (EvolutionCandidateInput, error) {
+	compilation, err := service.compileAgentCandidate(run)
+	if err != nil {
+		return EvolutionCandidateInput{}, err
+	}
+	return EvolutionCandidateInput{
+		IdempotencyKey: generationCandidateKey(work, compilation.CompilationID), RunID: run.RunID,
+		CandidateType: EvolutionCandidateAgentCompilation, BaselineIdentity: evolutionBaselineIdentity(run),
+		ChangeSummary: "已生成不可变 Agent 编译候选，等待确定性评估。", GeneratorVersion: service.generatorVersion,
+		Artifact: compilation,
+	}, nil
+}
+
+func (service *EvolutionGenerationService) compileAgentCandidate(run EvolutionRun) (*AgentCompilation, error) {
 	if len(run.BaselineReleaseIDs) == 0 {
-		return EvolutionCandidateInput{}, generationFailure("baseline_release_required", "candidate generation requires a baseline release", nil)
+		return nil, generationFailure("baseline_release_required", "candidate generation requires a baseline release", nil)
 	}
 	mode := AgentCompilationModeStudy
 	if run.RunType == EvolutionRunCombined {
@@ -143,13 +198,13 @@ func (service *EvolutionGenerationService) buildAgentCandidate(run EvolutionRun,
 	}
 	compilation, err := service.compileAgent(service.knowledge, request)
 	if err != nil {
-		return EvolutionCandidateInput{}, generationFailure("agent_compilation_failed", "candidate generation could not compile the agent", err)
+		return nil, generationFailure("agent_compilation_failed", "candidate generation could not compile the agent", err)
 	}
 	if compilation == nil {
-		return EvolutionCandidateInput{}, generationFailure("agent_compilation_failed", "candidate generation could not compile the agent", nil)
+		return nil, generationFailure("agent_compilation_failed", "candidate generation could not compile the agent", nil)
 	}
 	if err := ValidateAgentCompilation(*compilation); err != nil {
-		return EvolutionCandidateInput{}, generationFailure("agent_compilation_invalid", "candidate generation produced an invalid agent compilation", err)
+		return nil, generationFailure("agent_compilation_invalid", "candidate generation produced an invalid agent compilation", err)
 	}
 	if compilation.Status == AgentCompilationStatusBlocked {
 		code := "agent_compilation_blocked"
@@ -159,28 +214,66 @@ func (service *EvolutionGenerationService) buildAgentCandidate(run EvolutionRun,
 				break
 			}
 		}
-		return EvolutionCandidateInput{}, generationFailure(code, "candidate generation is blocked", nil)
+		return nil, generationFailure(code, "candidate generation is blocked", nil)
 	}
-	return EvolutionCandidateInput{
-		IdempotencyKey: generationCandidateKey(work, compilation.CompilationID), RunID: run.RunID,
-		CandidateType: EvolutionCandidateAgentCompilation, BaselineIdentity: evolutionBaselineIdentity(run),
-		ChangeSummary: "已生成不可变 Agent 编译候选，等待确定性评估。", GeneratorVersion: service.generatorVersion,
-		Artifact: compilation,
-	}, nil
+	return compilation, nil
 }
 
 func (service *EvolutionGenerationService) buildKnowledgeCandidate(run EvolutionRun, work EvolutionWork) (EvolutionCandidateInput, error) {
+	snapshot, err := service.buildKnowledgeSnapshot(run)
+	if err != nil {
+		return EvolutionCandidateInput{}, err
+	}
+	return EvolutionCandidateInput{
+		IdempotencyKey: generationCandidateKey(work, snapshot.SnapshotIdentity), RunID: run.RunID,
+		CandidateType: EvolutionCandidateKnowledgeRelease, BaselineIdentity: evolutionBaselineIdentity(run),
+		ChangeSummary: "已记录知识重验证候选，尚未发布新的知识版本。", GeneratorVersion: service.generatorVersion,
+		Artifact: snapshot,
+	}, nil
+}
+
+func (service *EvolutionGenerationService) buildCombinedCandidate(run EvolutionRun, work EvolutionWork) (EvolutionCandidateInput, error) {
+	compilation, err := service.compileAgentCandidate(run)
+	if err != nil {
+		return EvolutionCandidateInput{}, err
+	}
+	knowledge, err := service.buildKnowledgeSnapshot(run)
+	if err != nil {
+		return EvolutionCandidateInput{}, err
+	}
+	artifact := EvolutionCombinedCandidateArtifact{
+		SchemaVersion: evolutionCombinedCandidateSchema, Agent: *compilation, Knowledge: *knowledge,
+	}
+	return EvolutionCandidateInput{
+		IdempotencyKey: generationCandidateKey(work, compilation.CompilationID+":"+knowledge.SnapshotIdentity), RunID: run.RunID,
+		CandidateType: EvolutionCandidateCombined, BaselineIdentity: evolutionBaselineIdentity(run),
+		ChangeSummary: "已生成同时包含 Agent 与知识快照的不可变组合候选。", GeneratorVersion: service.generatorVersion,
+		Artifact: artifact,
+	}, nil
+}
+
+func (service *EvolutionGenerationService) buildKnowledgeSnapshot(run EvolutionRun) (*EvolutionKnowledgeCandidateArtifact, error) {
 	if len(run.BaselineReleaseIDs) == 0 {
-		return EvolutionCandidateInput{}, generationFailure("baseline_release_required", "candidate generation requires a baseline release", nil)
+		return nil, generationFailure("baseline_release_required", "candidate generation requires a baseline release", nil)
 	}
 	releaseID := run.BaselineReleaseIDs[0]
+	assessment, err := service.knowledge.AssessKnowledgeFeedback(releaseID)
+	if err != nil {
+		return nil, generationFailure("feedback_assessment_unavailable", "candidate generation could not assess knowledge feedback", err)
+	}
+	if !assessment.ReverifyRequired {
+		return nil, generationWaitingFailure("knowledge_candidate_waiting", "candidate generation is waiting for invalidating feedback")
+	}
+	if _, err := service.knowledge.EnqueueKnowledgeReverification(releaseID, *assessment, service.control.now().UTC(), 0); err != nil {
+		return nil, generationFailure("reverification_enqueue_failed", "candidate generation could not enqueue reverification", err)
+	}
 	tasks, err := service.knowledge.ListKnowledgeReverifications(releaseID)
 	if err != nil {
-		return EvolutionCandidateInput{}, generationFailure("reverification_unavailable", "candidate generation could not inspect reverification", err)
+		return nil, generationFailure("reverification_unavailable", "candidate generation could not inspect reverification", err)
 	}
 	var ready *KnowledgeReverificationTask
 	for index := range tasks {
-		if tasks[index].Status != KnowledgeReverificationCandidateReady {
+		if tasks[index].Status != KnowledgeReverificationCandidateReady || tasks[index].AssessmentFingerprint != assessment.ReverificationFingerprint {
 			continue
 		}
 		if ready == nil || tasks[index].CompletedAt > ready.CompletedAt {
@@ -189,14 +282,23 @@ func (service *EvolutionGenerationService) buildKnowledgeCandidate(run Evolution
 		}
 	}
 	if ready == nil {
-		return EvolutionCandidateInput{}, generationFailure("knowledge_candidate_not_ready", "candidate generation is waiting for reverification", nil)
+		return nil, generationWaitingFailure("knowledge_candidate_waiting", "candidate generation is waiting for reverification")
 	}
-	return EvolutionCandidateInput{
-		IdempotencyKey: generationCandidateKey(work, ready.TaskID), RunID: run.RunID,
-		CandidateType: EvolutionCandidateKnowledgeRelease, BaselineIdentity: evolutionBaselineIdentity(run),
-		ChangeSummary: "已记录知识重验证候选，尚未发布新的知识版本。", GeneratorVersion: service.generatorVersion,
-		Artifact: ready,
-	}, nil
+	release, err := service.knowledge.LoadKnowledgeRelease(releaseID)
+	if err != nil {
+		return nil, generationFailure("baseline_release_unavailable", "candidate generation could not load baseline knowledge", err)
+	}
+	snapshot := &EvolutionKnowledgeCandidateArtifact{
+		SchemaVersion: evolutionKnowledgeCandidateSchema, Task: *ready,
+		BaselineQuality: release.Quality, FeedbackAssessment: *assessment,
+	}
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		return nil, generationFailure("knowledge_snapshot_failed", "candidate generation could not freeze knowledge evidence", err)
+	}
+	digest := sha256.Sum256(payload)
+	snapshot.SnapshotIdentity = fmt.Sprintf("sha256:%x", digest[:])
+	return snapshot, nil
 }
 
 func (service *EvolutionGenerationService) enqueueEvaluation(candidate EvolutionCandidate) (*EvolutionWork, error) {
@@ -244,4 +346,10 @@ func generationFailure(code, message string, err error) error {
 		message = string([]rune(message)[:EvolutionFailureMessageMaxRunes])
 	}
 	return &EvolutionGenerationFailure{Code: code, Message: message, Err: err}
+}
+
+func generationWaitingFailure(code, message string) error {
+	failure := generationFailure(code, message, nil).(*EvolutionGenerationFailure)
+	failure.RetryAfter = 5 * time.Minute
+	return failure
 }

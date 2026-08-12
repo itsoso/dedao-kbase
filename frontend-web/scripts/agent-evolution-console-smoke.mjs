@@ -409,6 +409,12 @@ assert.ok(!detailRenderer.includes("返回待办队列</a>"), "detail renderer m
 assert.ok(!detailRenderer.includes('aria-label="任务详情"'), "detail renderer must not hard-code the inbox tabs label");
 assert.ok(evolutionRenderer.includes('aria-label="${escapeAttribute(detailPresentation.sectionLabel)}"'), "detail section aria-label must be rendered from the view presentation");
 assert.ok(!evolutionRenderer.includes('aria-label="线上版本对比"'), "detail section must not hard-code the inbox title");
+for (const label of ["确定性评分卡", "基线得分", "候选得分", "收益差值", "硬门检查", "组件贡献", "评测套件", "套件标识", "评分器版本", "制品标识", "自动停止原因"]) {
+  assert.ok(appSource.includes(label), `scorecard detail should include ${label}`);
+}
+for (const field of ["baseline_metrics", "candidate_metrics", "metric_weights", "component_contributions", "hard_gates", "failure_case_refs", "suite_version", "suite_identity", "scorer_version"]) {
+  assert.ok(appSource.includes(field), `scorecard detail should render ${field}`);
+}
 
 for (const marker of [
   ".evolution-console",

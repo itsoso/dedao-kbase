@@ -14,6 +14,10 @@
       "path": "cmd/book-mcp/main.go"
     },
     {
+      "name": "evaluation-worker",
+      "path": "cmd/evaluation-worker/main.go"
+    },
+    {
       "name": "kbase-server",
       "path": "cmd/kbase-server/main.go"
     },
@@ -358,31 +362,31 @@
     {
       "path": "/api/evolution",
       "file": "backend/app/kbase_http_evolution.go",
-      "line": 209,
+      "line": 270,
       "authenticated": true
     },
     {
       "path": "/api/evolution/",
       "file": "backend/app/kbase_http_evolution.go",
-      "line": 209,
+      "line": 270,
       "authenticated": true
     },
     {
       "path": "/api/evolution/overview",
       "file": "backend/app/kbase_http_evolution.go",
-      "line": 230,
+      "line": 313,
       "authenticated": true
     },
     {
       "path": "/api/evolution/runs",
       "file": "backend/app/kbase_http_evolution.go",
-      "line": 232,
+      "line": 315,
       "authenticated": true
     },
     {
       "path": "/api/evolution/runs/",
       "file": "backend/app/kbase_http_evolution.go",
-      "line": 358,
+      "line": 336,
       "authenticated": true
     },
     {
@@ -394,11 +398,35 @@
     {
       "path": "/api/evolution/workers/complete",
       "file": "backend/app/evolution_worker_client.go",
-      "line": 142,
+      "line": 151,
       "authenticated": true
     },
     {
       "path": "/api/evolution/workers/complete",
+      "file": "backend/app/kbase_http_evolution.go",
+      "line": 58,
+      "authenticated": true
+    },
+    {
+      "path": "/api/evolution/workers/defer",
+      "file": "backend/app/evolution_worker_client.go",
+      "line": 185,
+      "authenticated": true
+    },
+    {
+      "path": "/api/evolution/workers/defer",
+      "file": "backend/app/kbase_http_evolution.go",
+      "line": 84,
+      "authenticated": true
+    },
+    {
+      "path": "/api/evolution/workers/evaluate",
+      "file": "backend/app/evolution_worker_client.go",
+      "line": 136,
+      "authenticated": true
+    },
+    {
+      "path": "/api/evolution/workers/evaluate",
       "file": "backend/app/kbase_http_evolution.go",
       "line": 56,
       "authenticated": true
@@ -406,13 +434,13 @@
     {
       "path": "/api/evolution/workers/fail",
       "file": "backend/app/evolution_worker_client.go",
-      "line": 157,
+      "line": 170,
       "authenticated": true
     },
     {
       "path": "/api/evolution/workers/fail",
       "file": "backend/app/kbase_http_evolution.go",
-      "line": 67,
+      "line": 69,
       "authenticated": true
     },
     {
@@ -2370,6 +2398,11 @@
       "name": "evidenceAuditPreparedRecord",
       "file": "backend/app/evidence_audit_store.go",
       "line": 95
+    },
+    {
+      "name": "evolutionScorecardMetricsEnvelope",
+      "file": "backend/app/evolution_scorecard.go",
+      "line": 52
     },
     {
       "name": "knowledgeSearchIndexRecord",

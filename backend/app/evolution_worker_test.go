@@ -180,6 +180,32 @@ func TestEvolutionWorkerRenewsRejectsStaleLeaseAndRecoversExpiredAttempt(t *test
 	}
 }
 
+func TestEvolutionWorkerDeferralPreservesAttemptBudgetAndLeaseAutoRecovers(t *testing.T) {
+	clock := newEvolutionWorkerClock()
+	store := openEvolutionWorkerTestStore(t, clock)
+	run := createEvolutionWorkerTestRun(t, store, "defer-preserves-attempt")
+	enqueueEvolutionWorkerTestWork(t, store, run.RunID, 3)
+	first := leaseEvolutionWorkerTestWork(t, store, "worker-a")
+	deferred, replay, err := store.DeferEvolutionWork(EvolutionWorkDeferral{
+		WorkID: first.WorkID, WorkerID: first.WorkerID, LeaseID: first.LeaseID, Attempt: first.Attempt,
+		FailureIdempotencyKey: "sha256:" + evolutionWorkerPayloadHash("defer:"+first.WorkID),
+		FailureCode:           "knowledge_candidate_waiting", FailureMessage: "waiting for reverification", RetryDelay: 5 * time.Minute,
+	})
+	if err != nil || replay || deferred.Status != EvolutionWorkPending || deferred.Attempt != 0 {
+		t.Fatalf("defer = %#v, %v, %v", deferred, replay, err)
+	}
+	clock.Advance(5 * time.Minute)
+	second := leaseEvolutionWorkerTestWork(t, store, "worker-b")
+	if second.Attempt != 1 {
+		t.Fatalf("deferred work consumed attempt budget: %#v", second)
+	}
+	clock.Advance(2 * time.Minute)
+	third := leaseEvolutionWorkerTestWork(t, store, "worker-c")
+	if third.WorkID != second.WorkID || third.Attempt != 2 || third.WorkerID != "worker-c" {
+		t.Fatalf("lease did not auto-recover expired work: %#v", third)
+	}
+}
+
 func TestEvolutionWorkerFailureBackoffAndExhaustion(t *testing.T) {
 	root := t.TempDir()
 	clock := newEvolutionWorkerClock()

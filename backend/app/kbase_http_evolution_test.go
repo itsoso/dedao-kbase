@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -87,6 +88,42 @@ func TestKBaseHTTPHandlerEvolutionWorkerLifecycleUsesSharedWorkerToken(t *testin
 	updated, err := evolution.LoadRun(run.RunID)
 	if err != nil || updated.Status != EvolutionEvaluating {
 		t.Fatalf("updated run=%#v err=%v", updated, err)
+	}
+}
+
+func TestKBaseHTTPHandlerEvolutionTriageQueuesFirstGenerationWork(t *testing.T) {
+	books, evolution := newEvolutionHTTPTestStores(t)
+	saveAgentPackageTestRelease(t, books)
+	pkg, err := FinalizeAgentPackage(validAgentPackage())
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, books, pkg)
+	if _, _, err := PublishAgentPackage(books, pkg, "http-triage-baseline", AgentReadOnlyToolIDs(), time.Date(2026, 8, 11, 11, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatal(err)
+	}
+	signalInput := validEvolutionSignalInput("http-triage-entry")
+	signalInput.PackageID = pkg.PackageID
+	_, run, _, err := evolution.IngestSignal(signalInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newEvolutionHTTPTestHandler(books, evolution, true)
+	path := "/api/evolution/runs/" + url.PathEscape(run.RunID) + "/triage"
+	unauthorized := requestJSONKBase(handler, http.MethodPost, path, "", `{}`)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized triage status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	response := requestJSONKBase(handler, http.MethodPost, path, "consumer-token", `{}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("triage status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result EvolutionTriageResult
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.Run == nil || result.Work == nil {
+		t.Fatalf("triage response=%#v err=%v", result, err)
+	}
+	if result.Run.Status != EvolutionGenerating || result.Work.Capability != EvolutionCapabilityAgent || result.Work.Status != EvolutionWorkPending {
+		t.Fatalf("triage result=%#v", result)
 	}
 }
 
@@ -286,6 +323,38 @@ func TestKBaseHTTPHandlerEvolutionRunDetailAndEventsArePrivate(t *testing.T) {
 		if strings.Contains(detail.Body.String(), secret) || strings.Contains(events.Body.String(), secret) || strings.Contains(last.Body.String(), secret) {
 			t.Fatalf("detail/events leaked %q", secret)
 		}
+	}
+}
+
+func TestKBaseHTTPHandlerEvolutionRunDetailIncludesImmutableScorecard(t *testing.T) {
+	books := NewBookKnowledgeStore(t.TempDir())
+	control, work, candidate := evolutionEvaluationFixture(t, EvolutionRunAgentPolicy)
+	service, err := NewEvolutionEvaluationService(EvolutionEvaluationConfig{
+		ControlStore: control, KnowledgeStore: books, SuiteVersion: "evolution-suite.v1", ScorerVersion: "evolution-scorer.v1",
+		Evaluate: func(context.Context, EvolutionRun, EvolutionCandidate, []byte) (EvolutionEvaluationEvidence, error) {
+			return evolutionEvaluationEvidence(80, 84), nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Evaluate(context.Background(), *work); err != nil {
+		t.Fatal(err)
+	}
+	handler := newEvolutionHTTPTestHandler(books, control, true)
+	response := requestKBase(handler, http.MethodGet, "/api/evolution/runs/"+candidate.RunID, "consumer-token")
+	if response.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", response.Code, response.Body.String())
+	}
+	var detail evolutionRunDetailHTTPView
+	if err := json.Unmarshal(response.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Candidate == nil || detail.Scorecard == nil || detail.Scorecard.Delta != 4 || detail.Scorecard.MetricWeights["answer_quality"] != 0.30 {
+		t.Fatalf("detail = %#v", detail)
+	}
+	if strings.Contains(response.Body.String(), control.dbPath) {
+		t.Fatal("detail leaked control-plane path")
 	}
 }
 

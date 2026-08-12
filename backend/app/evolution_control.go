@@ -90,18 +90,24 @@ type EvolutionCandidate struct {
 }
 
 type EvolutionScorecard struct {
-	ScorecardID      string             `json:"scorecard_id"`
-	CandidateID      string             `json:"candidate_id"`
-	BaselineIdentity string             `json:"baseline_identity"`
-	SuiteVersion     string             `json:"suite_version"`
-	ScorerVersion    string             `json:"scorer_version"`
-	HardGates        map[string]bool    `json:"hard_gates"`
-	Metrics          map[string]float64 `json:"metrics"`
-	WeightedScore    float64            `json:"weighted_score"`
-	BaselineScore    float64            `json:"baseline_score"`
-	Delta            float64            `json:"delta"`
-	Decision         string             `json:"decision"`
-	FailureCaseRefs  []string           `json:"failure_case_refs"`
+	ScorecardID            string             `json:"scorecard_id"`
+	CandidateID            string             `json:"candidate_id"`
+	BaselineIdentity       string             `json:"baseline_identity"`
+	SuiteVersion           string             `json:"suite_version"`
+	ScorerVersion          string             `json:"scorer_version"`
+	WeightVersion          string             `json:"weight_version,omitempty"`
+	SuiteIdentity          string             `json:"suite_identity,omitempty"`
+	HardGates              map[string]bool    `json:"hard_gates"`
+	Metrics                map[string]float64 `json:"metrics"`
+	BaselineMetrics        map[string]float64 `json:"baseline_metrics,omitempty"`
+	CandidateMetrics       map[string]float64 `json:"candidate_metrics,omitempty"`
+	MetricWeights          map[string]float64 `json:"metric_weights,omitempty"`
+	ComponentContributions map[string]float64 `json:"component_contributions,omitempty"`
+	WeightedScore          float64            `json:"weighted_score"`
+	BaselineScore          float64            `json:"baseline_score"`
+	Delta                  float64            `json:"delta"`
+	Decision               string             `json:"decision"`
+	FailureCaseRefs        []string           `json:"failure_case_refs"`
 }
 
 type EvolutionApproval struct {
@@ -384,6 +390,32 @@ func (scorecard EvolutionScorecard) Validate() error {
 	}
 	if err := validateEvolutionMetrics("metrics", scorecard.Metrics, true); err != nil {
 		return err
+	}
+	for name, metrics := range map[string]map[string]float64{
+		"baseline_metrics":  scorecard.BaselineMetrics,
+		"candidate_metrics": scorecard.CandidateMetrics,
+		"metric_weights":    scorecard.MetricWeights,
+	} {
+		if len(metrics) > 0 {
+			if err := validateEvolutionMetrics(name, metrics, true); err != nil {
+				return err
+			}
+		}
+	}
+	if scorecard.WeightVersion != "" {
+		if err := validateEvolutionIdentity("weight_version", scorecard.WeightVersion); err != nil {
+			return err
+		}
+	}
+	if scorecard.SuiteIdentity != "" {
+		if err := validateEvolutionReference("suite_identity", scorecard.SuiteIdentity); err != nil {
+			return err
+		}
+	}
+	if len(scorecard.ComponentContributions) > 0 {
+		if err := validateEvolutionMetrics("component_contributions", scorecard.ComponentContributions, true); err != nil {
+			return err
+		}
 	}
 	for _, field := range []evolutionNumberField{
 		{name: "weighted_score", value: scorecard.WeightedScore},

@@ -192,6 +192,9 @@ func normalizeEvolutionCandidateInput(input EvolutionCandidateInput) (EvolutionC
 	if err := decoder.Decode(&canonical); err != nil {
 		return EvolutionCandidateInput{}, nil, "", fmt.Errorf("decode evolution candidate artifact: %w", err)
 	}
+	if privacyPassed, _, _ := evaluateEvolutionCandidatePrivacy(canonical); !privacyPassed {
+		return EvolutionCandidateInput{}, nil, "", fmt.Errorf("evolution candidate artifact failed privacy audit")
+	}
 	canonicalPayload, err := json.Marshal(canonical)
 	if err != nil {
 		return EvolutionCandidateInput{}, nil, "", fmt.Errorf("canonicalize evolution candidate artifact: %w", err)

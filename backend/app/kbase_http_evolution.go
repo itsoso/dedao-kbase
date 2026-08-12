@@ -53,6 +53,8 @@ func (h *kbaseHTTPHandler) handleEvolutionWorkerAPI(w http.ResponseWriter, r *ht
 		writeHTTPJSON(w, http.StatusOK, map[string]any{"work": work})
 	case "/api/evolution/workers/generate":
 		h.handleEvolutionWorkerGeneration(w, r)
+	case "/api/evolution/workers/evaluate":
+		h.handleEvolutionWorkerEvaluation(w, r)
 	case "/api/evolution/workers/complete":
 		var payload EvolutionWorkCompletion
 		if !h.decodeSourceAgentJSON(w, r, &payload) {
@@ -70,6 +72,21 @@ func (h *kbaseHTTPHandler) handleEvolutionWorkerAPI(w http.ResponseWriter, r *ht
 			return
 		}
 		work, _, err := h.evolutionStore.FailEvolutionWork(EvolutionWorkFailure{
+			WorkID: payload.WorkID, WorkerID: payload.WorkerID, LeaseID: payload.LeaseID, Attempt: payload.Attempt,
+			FailureIdempotencyKey: payload.FailureIdempotencyKey, FailureCode: payload.FailureCode,
+			FailureMessage: payload.FailureMessage, RetryDelay: time.Duration(payload.RetrySeconds) * time.Second,
+		})
+		if err != nil {
+			h.writeEvolutionWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"work": work})
+	case "/api/evolution/workers/defer":
+		var payload evolutionWorkerFailRequest
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		work, _, err := h.evolutionStore.DeferEvolutionWork(EvolutionWorkDeferral{
 			WorkID: payload.WorkID, WorkerID: payload.WorkerID, LeaseID: payload.LeaseID, Attempt: payload.Attempt,
 			FailureIdempotencyKey: payload.FailureIdempotencyKey, FailureCode: payload.FailureCode,
 			FailureMessage: payload.FailureMessage, RetryDelay: time.Duration(payload.RetrySeconds) * time.Second,
@@ -110,6 +127,44 @@ func (h *kbaseHTTPHandler) handleEvolutionWorkerGeneration(w http.ResponseWriter
 		return
 	}
 	result, err := service.Generate(r.Context(), *work)
+	if err != nil {
+		var failure *EvolutionGenerationFailure
+		if errors.As(err, &failure) && failure.RetryAfter > 0 {
+			writeHTTPJSON(w, http.StatusOK, EvolutionGenerationResult{
+				Deferred: true, FailureCode: failure.Code, FailureMessage: failure.Message,
+				RetrySeconds: durationSeconds(failure.RetryAfter),
+			})
+			return
+		}
+		h.writeEvolutionWorkerError(w, err)
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, result)
+}
+
+func (h *kbaseHTTPHandler) handleEvolutionWorkerEvaluation(w http.ResponseWriter, r *http.Request) {
+	var payload evolutionWorkerIdentityRequest
+	if !h.decodeSourceAgentJSON(w, r, &payload) {
+		return
+	}
+	work, err := h.evolutionStore.LoadEvolutionWork(payload.WorkID)
+	if err != nil {
+		h.writeEvolutionWorkerError(w, err)
+		return
+	}
+	if work.Attempt != payload.Attempt || validateActiveEvolutionWorkLease(work, payload.WorkerID, payload.LeaseID, h.evolutionStore.now().UTC()) != nil {
+		h.writeEvolutionWorkerError(w, ErrEvolutionLeaseLost)
+		return
+	}
+	service, err := NewEvolutionEvaluationService(EvolutionEvaluationConfig{
+		ControlStore: h.evolutionStore, KnowledgeStore: h.store,
+		SuiteVersion: "evolution-suite.v1", ScorerVersion: "evolution-scorer.v1",
+	})
+	if err != nil {
+		h.writeEvolutionWorkerError(w, err)
+		return
+	}
+	result, err := service.Evaluate(r.Context(), *work)
 	if err != nil {
 		h.writeEvolutionWorkerError(w, err)
 		return
@@ -205,6 +260,12 @@ type evolutionEventHTTPPage struct {
 	NextCursor string                   `json:"next_cursor"`
 }
 
+type evolutionRunDetailHTTPView struct {
+	Run       evolutionRunHTTPView `json:"run"`
+	Candidate *EvolutionCandidate  `json:"candidate,omitempty"`
+	Scorecard *EvolutionScorecard  `json:"scorecard,omitempty"`
+}
+
 func isEvolutionAPIPath(path string) bool {
 	return path == "/api/evolution" || strings.HasPrefix(path, "/api/evolution/")
 }
@@ -219,8 +280,30 @@ func (h *kbaseHTTPHandler) handleEvolutionReadAPI(w http.ResponseWriter, r *http
 		writeHTTPError(w, http.StatusServiceUnavailable, "evolution control plane is not configured")
 		return
 	}
+	if r.Method == http.MethodPost {
+		runID, ok, invalid := parseEvolutionTriageHTTPPath(r.URL.EscapedPath())
+		if invalid {
+			writeHTTPError(w, http.StatusBadRequest, "invalid evolution run_id")
+			return
+		}
+		if !ok || r.URL.RawQuery != "" {
+			writeHTTPError(w, http.StatusNotFound, "not found")
+			return
+		}
+		var payload struct{}
+		if !h.decodeSourceAgentJSON(w, r, &payload) {
+			return
+		}
+		result, err := TriageEvolutionRun(r.Context(), h.evolutionStore, h.store, runID)
+		if err != nil {
+			h.writeEvolutionReadError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, result)
+		return
+	}
 	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
@@ -247,6 +330,23 @@ func (h *kbaseHTTPHandler) handleEvolutionReadAPI(w http.ResponseWriter, r *http
 		}
 		h.handleEvolutionRun(w, r, runID)
 	}
+}
+
+func parseEvolutionTriageHTTPPath(escapedPath string) (runID string, ok, invalid bool) {
+	const prefix = "/api/evolution/runs/"
+	const suffix = "/triage"
+	if !strings.HasPrefix(escapedPath, prefix) || !strings.HasSuffix(escapedPath, suffix) {
+		return "", false, false
+	}
+	remainder := strings.TrimSuffix(strings.TrimPrefix(escapedPath, prefix), suffix)
+	if remainder == "" || strings.Contains(remainder, "/") {
+		return "", false, false
+	}
+	decoded, err := url.PathUnescape(remainder)
+	if err != nil || validateEvolutionHTTPIdentity("run_id", decoded) != nil {
+		return "", false, true
+	}
+	return decoded, true, false
 }
 
 func (h *kbaseHTTPHandler) handleEvolutionOverview(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +415,23 @@ func (h *kbaseHTTPHandler) handleEvolutionRun(w http.ResponseWriter, r *http.Req
 		h.writeEvolutionReadError(w, err)
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, map[string]any{"run": newEvolutionRunHTTPView(*run)})
+	detail := evolutionRunDetailHTTPView{Run: newEvolutionRunHTTPView(*run)}
+	if run.CurrentCandidateID != "" {
+		candidate, _, candidateErr := h.evolutionStore.LoadEvolutionCandidate(run.CurrentCandidateID)
+		if candidateErr != nil {
+			h.writeEvolutionReadError(w, candidateErr)
+			return
+		}
+		detail.Candidate = candidate
+		scorecard, scorecardErr := h.evolutionStore.LoadEvolutionScorecardForCandidate(candidate.CandidateID)
+		if scorecardErr == nil {
+			detail.Scorecard = scorecard
+		} else if !errors.Is(scorecardErr, ErrEvolutionScorecardNotFound) {
+			h.writeEvolutionReadError(w, scorecardErr)
+			return
+		}
+	}
+	writeHTTPJSON(w, http.StatusOK, detail)
 }
 
 func (h *kbaseHTTPHandler) handleEvolutionEvents(w http.ResponseWriter, r *http.Request, runID string) {

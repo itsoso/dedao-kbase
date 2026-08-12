@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -104,6 +105,35 @@ func TestEvolutionCandidateDetectsArtifactTampering(t *testing.T) {
 	}
 	if _, _, err := store.LoadEvolutionCandidate(candidate.CandidateID); !errors.Is(err, ErrEvolutionCandidateArtifactConflict) {
 		t.Fatalf("tampered artifact error = %v", err)
+	}
+}
+
+func TestEvolutionCandidatePrivacyFailureDoesNotPersistArtifactOrRow(t *testing.T) {
+	store := newEvolutionTestStore(t)
+	run := createGeneratingEvolutionCandidateRun(t, store, "candidate-privacy")
+	input := EvolutionCandidateInput{
+		IdempotencyKey:   "55555555-5555-4555-8555-555555555555",
+		RunID:            run.RunID,
+		CandidateType:    EvolutionCandidateAgentCompilation,
+		BaselineIdentity: "agent:v1@release:a",
+		ChangeSummary:    "Candidate must fail before persistence.",
+		GeneratorVersion: "agent-generator.v1",
+		Artifact:         map[string]any{"api_key": "private-candidate-value"},
+	}
+
+	if _, _, err := store.SaveEvolutionCandidate(input); err == nil {
+		t.Fatal("sensitive candidate was accepted")
+	}
+	var candidates int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM evolution_candidates`).Scan(&candidates); err != nil {
+		t.Fatal(err)
+	}
+	if candidates != 0 {
+		t.Fatalf("persisted candidates = %d", candidates)
+	}
+	artifactRoot := filepath.Join(filepath.Dir(store.dbPath), "evolution_artifacts")
+	if _, err := os.Stat(artifactRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("candidate artifact root exists after privacy failure: %v", err)
 	}
 }
 

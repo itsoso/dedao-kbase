@@ -26,9 +26,13 @@ func TestEvolutionWorkerClientUsesSharedTokenForLifecycle(t *testing.T) {
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"work": EvolutionWork{WorkID: "work-a", Status: EvolutionWorkLeased, Attempt: 1, WorkerID: "worker-a", LeaseID: "lease-a"}})
 		case "/api/evolution/workers/generate":
 			writeHTTPJSON(w, http.StatusOK, EvolutionGenerationResult{Candidate: &EvolutionCandidate{CandidateID: "candidate-a", ArtifactRef: "candidate:sha256:" + workerHex('a')}})
+		case "/api/evolution/workers/evaluate":
+			writeHTTPJSON(w, http.StatusOK, EvolutionEvaluationResult{Scorecard: &EvolutionScorecard{ScorecardID: "sha256:" + workerHex('b')}, RunStatus: EvolutionAwaitingApproval})
 		case "/api/evolution/workers/complete":
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"work": EvolutionWork{WorkID: "work-a", Status: EvolutionWorkCompleted}})
 		case "/api/evolution/workers/fail":
+			writeHTTPJSON(w, http.StatusOK, map[string]any{"work": EvolutionWork{WorkID: "work-a", Status: EvolutionWorkPending}})
+		case "/api/evolution/workers/defer":
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"work": EvolutionWork{WorkID: "work-a", Status: EvolutionWorkPending}})
 		default:
 			http.NotFound(w, r)
@@ -57,13 +61,20 @@ func TestEvolutionWorkerClientUsesSharedTokenForLifecycle(t *testing.T) {
 	if err != nil || generated.Candidate == nil {
 		t.Fatalf("generate = %#v, %v", generated, err)
 	}
+	evaluated, err := client.Evaluate(ctx, *work)
+	if err != nil || evaluated.Scorecard == nil {
+		t.Fatalf("evaluate = %#v, %v", evaluated, err)
+	}
 	if _, err := client.Complete(ctx, *work, generated.Candidate.ArtifactRef); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Fail(ctx, *work, "generation_failed", "candidate generation failed", time.Second); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/api/source-agent/heartbeat", "/api/evolution/workers/lease", "/api/evolution/workers/renew", "/api/evolution/workers/generate", "/api/evolution/workers/complete", "/api/evolution/workers/fail"}
+	if _, err := client.Defer(ctx, *work, "knowledge_candidate_waiting", "waiting", time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"/api/source-agent/heartbeat", "/api/evolution/workers/lease", "/api/evolution/workers/renew", "/api/evolution/workers/generate", "/api/evolution/workers/evaluate", "/api/evolution/workers/complete", "/api/evolution/workers/fail", "/api/evolution/workers/defer"}
 	if encoded, _ := json.Marshal(paths); string(encoded) != mustEvolutionWorkerJSON(t, want) {
 		t.Fatalf("paths = %v, want %v", paths, want)
 	}

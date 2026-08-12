@@ -79,15 +79,27 @@ func Run(ctx context.Context, args []string, getenv EnvironmentLookup, stdout io
 	}
 }
 
-func buildWorker(config parsedConfig, metadata Metadata) (*app.EvolutionGenerationWorker, error) {
+type workerRuntime interface {
+	Run(context.Context) error
+}
+
+func buildWorker(config parsedConfig, metadata Metadata) (workerRuntime, error) {
 	client, err := app.NewEvolutionWorkerClient(config.client)
 	if err != nil {
 		return nil, errors.New("invalid evolution worker control configuration")
 	}
-	worker, err := app.NewEvolutionGenerationWorker(app.EvolutionGenerationWorkerConfig{
-		Client: client, Capability: metadata.Capability, Version: metadata.Version, Revision: metadata.Revision,
-		LeaseDuration: config.leaseDuration, RenewInterval: config.renewInterval, PollInterval: config.pollInterval,
-	})
+	var worker workerRuntime
+	if metadata.Capability == app.EvolutionCapabilityEvaluation {
+		worker, err = app.NewEvolutionEvaluationWorker(app.EvolutionEvaluationWorkerConfig{
+			Client: client, Version: metadata.Version, Revision: metadata.Revision,
+			LeaseDuration: config.leaseDuration, RenewInterval: config.renewInterval, PollInterval: config.pollInterval,
+		})
+	} else {
+		worker, err = app.NewEvolutionGenerationWorker(app.EvolutionGenerationWorkerConfig{
+			Client: client, Capability: metadata.Capability, Version: metadata.Version, Revision: metadata.Revision,
+			LeaseDuration: config.leaseDuration, RenewInterval: config.renewInterval, PollInterval: config.pollInterval,
+		})
+	}
 	if err != nil {
 		return nil, errors.New("invalid evolution worker runtime configuration")
 	}

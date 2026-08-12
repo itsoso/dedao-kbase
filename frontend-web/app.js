@@ -4310,6 +4310,57 @@ function renderEvolutionQueue() {
   return `${rows}${evolutionConsoleState.nextCursor ? `<a class="evolution-console__next" href="${escapeAttribute(evolutionRouteURL({ cursor: evolutionConsoleState.nextCursor, run: "" }))}" data-evolution-cursor="${escapeAttribute(evolutionConsoleState.nextCursor)}">查看下一页 <span aria-hidden="true">→</span></a>` : ""}`;
 }
 
+function evolutionMetricLabel(metric) {
+  return ({
+    answer_quality: "回答质量",
+    evidence_quality: "证据质量",
+    task_completion: "任务完成",
+    reliability: "可靠性",
+    cost: "成本效率",
+    latency: "响应速度",
+  })[metric] || metric;
+}
+
+function evolutionScore(value, signed = false) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  const prefix = signed && number > 0 ? "+" : "";
+  return `${prefix}${number.toFixed(2)}`;
+}
+
+function renderEvolutionScorecard(detail) {
+  const scorecard = detail?.scorecard;
+  const candidate = detail?.candidate;
+  if (!scorecard) {
+    return `<div class="evolution-console__read-only"><strong>评分卡尚未生成</strong><p>候选完成确定性评测后，这里会显示基线、候选、收益差值与硬门结果。</p></div>`;
+  }
+  const baselineMetrics = scorecard.baseline_metrics || {};
+  const candidateMetrics = scorecard.candidate_metrics || scorecard.metrics || {};
+  const metricWeights = scorecard.metric_weights || {};
+  const metrics = Object.keys(metricWeights).length ? Object.keys(metricWeights) : Object.keys(candidateMetrics);
+  const gates = Object.entries(scorecard.hard_gates || {});
+  const contributions = Object.entries(scorecard.component_contributions || {});
+  const failures = Array.isArray(scorecard.failure_case_refs) ? scorecard.failure_case_refs : [];
+  const stopped = scorecard.decision !== "awaiting_approval";
+  return `
+    <section class="evolution-scorecard" aria-labelledby="evolution-scorecard-title">
+      <header><div><span>只读评测结果</span><h3 id="evolution-scorecard-title">确定性评分卡</h3></div><b class="${stopped ? "is-blocked" : "is-passed"}">${stopped ? "已自动停止" : "待人工审批"}</b></header>
+      <div class="evolution-scorecard__summary">
+        <article><span>基线得分</span><strong>${evolutionScore(scorecard.baseline_score)}</strong></article>
+        <article><span>候选得分</span><strong>${evolutionScore(scorecard.weighted_score)}</strong></article>
+        <article><span>收益差值</span><strong>${evolutionScore(scorecard.delta, true)}</strong></article>
+      </div>
+      ${stopped ? `<div class="evolution-scorecard__reason"><strong>自动停止原因</strong><span>${gates.some(([, passed]) => !passed) ? "至少一项硬门未通过，候选不能进入审批。" : "候选收益低于 3.00 分最低门槛。"}</span></div>` : ""}
+      <div class="evolution-scorecard__gates"><strong>硬门检查</strong>${gates.map(([gate, passed]) => `<span class="${passed ? "is-passed" : "is-blocked"}">${passed ? "通过" : "未通过"} · ${escapeHTML(gate)}</span>`).join("") || "<span>暂无硬门记录</span>"}</div>
+      ${contributions.length ? `<div class="evolution-scorecard__gates"><strong>组件贡献</strong>${contributions.map(([component, value]) => `<span>${escapeHTML(({ agent: "Agent", knowledge: "知识" })[component] || component)} · ${evolutionScore(value, true)}</span>`).join("")}</div>` : ""}
+      <div class="evolution-scorecard__table-wrap"><table><thead><tr><th>指标</th><th>基线</th><th>候选</th><th>差值</th><th>权重</th></tr></thead><tbody>
+        ${metrics.map((metric) => `<tr><th>${escapeHTML(evolutionMetricLabel(metric))}</th><td>${evolutionScore(baselineMetrics[metric])}</td><td>${evolutionScore(candidateMetrics[metric])}</td><td>${evolutionScore(Number(candidateMetrics[metric]) - Number(baselineMetrics[metric]), true)}</td><td>${Number.isFinite(Number(metricWeights[metric])) ? `${(Number(metricWeights[metric]) * 100).toFixed(0)}%` : "—"}</td></tr>`).join("")}
+      </tbody></table></div>
+      ${failures.length ? `<div class="evolution-scorecard__failures"><strong>失败用例</strong><span>${failures.length} 项；仅显示脱敏引用，不展示用户内容。</span></div>` : ""}
+      <dl class="evolution-scorecard__meta"><div><dt>评测套件</dt><dd>${escapeHTML(scorecard.suite_version || "—")}</dd></div><div><dt>套件标识</dt><dd title="${escapeAttribute(scorecard.suite_identity || "")}">${escapeHTML(evolutionCompactID(scorecard.suite_identity || "—", 30))}</dd></div><div><dt>评分器版本</dt><dd>${escapeHTML(scorecard.scorer_version || "—")}</dd></div><div><dt>权重版本</dt><dd>${escapeHTML(scorecard.weight_version || "—")}</dd></div><div><dt>制品标识</dt><dd title="${escapeAttribute(candidate?.artifact_ref || scorecard.scorecard_id || "")}">${escapeHTML(evolutionCompactID(candidate?.artifact_ref || scorecard.scorecard_id || "—", 30))}</dd></div></dl>
+    </section>`;
+}
+
 function renderEvolutionDetail() {
   const route = evolutionConsoleState.route;
   const presentation = AgentEvolutionConsole.detailPresentation(route.view);
@@ -4323,7 +4374,8 @@ function renderEvolutionDetail() {
   if (evolutionConsoleState.errors.detail) {
     return `<div class="evolution-console__state is-error" role="alert"><strong>任务详情不可用</strong><span>${escapeHTML(evolutionUnavailableMessage(evolutionConsoleState.errors.detail))}</span></div>`;
   }
-  const run = evolutionConsoleState.selectedDetail?.run || evolutionConsoleState.runs.find((item) => item.run_id === route.run);
+  const detail = evolutionConsoleState.selectedDetail || {};
+  const run = detail.run || evolutionConsoleState.runs.find((item) => item.run_id === route.run);
   if (!run) {
     return `<div class="evolution-console__state is-error"><strong>未找到该演化任务</strong><span>它可能已完成、被替代，或当前筛选条件已变化。</span></div>`;
   }
@@ -4337,12 +4389,12 @@ function renderEvolutionDetail() {
       ${(evolutionConsoleState.events || []).map((event) => `<li><time>${escapeHTML(evolutionTime(event.created_at))}</time><strong>${escapeHTML(evolutionStatusLabel(event.to_status))}</strong><span>${escapeHTML(event.code || event.event_type || "状态更新")}</span></li>`).join("") || "<li><span>暂无可展示的审计事件。</span></li>"}
     </ol>
   ` : route.tab === "evidence" ? `
-    <div class="evolution-console__read-only"><strong>证据将在候选评测后显示</strong><p>当前只展示脱敏运行元数据；制品正文与用户内容不会进入控制面。</p></div>
+    ${renderEvolutionScorecard(detail)}
   ` : `
     <div class="evolution-console__comparison">
       <article><span>当前线上</span><strong>${escapeHTML(current?.version || run.baseline_package_version || "暂无线上版本")}</strong><small>${escapeHTML(current?.lifecycle_state === "published" ? "稳定发布" : "未发布")}</small></article>
       <div aria-hidden="true">→</div>
-      <article class="is-candidate"><span>候选变更</span><strong>${run.has_candidate ? "候选已就绪" : "尚未生成"}</strong><small>发布前必须人工审批</small></article>
+      <article class="is-candidate"><span>候选变更</span><strong>${run.has_candidate ? "候选已就绪" : "尚未生成"}</strong><small>${detail.scorecard ? `评分 ${evolutionScore(detail.scorecard.weighted_score)} · 差值 ${evolutionScore(detail.scorecard.delta, true)}` : "发布前必须人工审批"}</small></article>
     </div>
   `;
   return `

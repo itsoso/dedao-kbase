@@ -15,6 +15,7 @@ type EvolutionGenerationWorkerClient interface {
 	Generate(context.Context, EvolutionWork) (*EvolutionGenerationResult, error)
 	Complete(context.Context, EvolutionWork, string) (*EvolutionWork, error)
 	Fail(context.Context, EvolutionWork, string, string, time.Duration) (*EvolutionWork, error)
+	Defer(context.Context, EvolutionWork, string, string, time.Duration) (*EvolutionWork, error)
 }
 
 type EvolutionGenerationWorkerConfig struct {
@@ -94,8 +95,20 @@ func (worker *EvolutionGenerationWorker) RunOnce(ctx context.Context) (bool, err
 	if renewErr != nil {
 		return true, renewErr
 	}
-	if generationErr != nil || result == nil || result.Candidate == nil {
+	if generationErr != nil || result == nil {
 		if _, err := worker.config.Client.Fail(ctx, *work, "generation_failed", "candidate generation failed", evolutionGenerationFailureRetryDelay); err != nil {
+			return true, fmt.Errorf("evolution worker failure report failed")
+		}
+		return true, nil
+	}
+	if result.Deferred {
+		if _, err := worker.config.Client.Defer(ctx, *work, result.FailureCode, result.FailureMessage, time.Duration(result.RetrySeconds)*time.Second); err != nil {
+			return true, fmt.Errorf("evolution worker deferral failed")
+		}
+		return true, nil
+	}
+	if result.Candidate == nil {
+		if _, err := worker.config.Client.Fail(ctx, *work, "generation_failed", "candidate generation returned no candidate", evolutionGenerationFailureRetryDelay); err != nil {
 			return true, fmt.Errorf("evolution worker failure report failed")
 		}
 		return true, nil

@@ -8706,6 +8706,36 @@ body.has-proofroom-modal {
   margin-top: 18px;
 }
 
+.evolution-scorecard { display: grid; gap: 14px; margin-top: 18px; }
+.evolution-scorecard > header { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+.evolution-scorecard > header span { color: var(--evolution-muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
+.evolution-scorecard > header h3 { margin: 2px 0 0; font-family: "Songti SC", Georgia, serif; font-size: 1.35rem; }
+.evolution-scorecard > header b, .evolution-scorecard__gates span { border: 1px solid var(--evolution-rule); border-radius: 999px; padding: 5px 9px; font-size: .75rem; }
+.evolution-scorecard .is-passed { color: #246b50; background: #edf7f2; border-color: #bcd9cb; }
+.evolution-scorecard .is-blocked { color: #984234; background: #fff1ed; border-color: #edc4ba; }
+.evolution-scorecard__summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--evolution-rule); }
+.evolution-scorecard__summary article { padding: 12px; border-right: 1px solid var(--evolution-rule); }
+.evolution-scorecard__summary article:last-child { border-right: 0; }
+.evolution-scorecard__summary span, .evolution-scorecard__meta dt { display: block; color: var(--evolution-muted); font-size: .72rem; }
+.evolution-scorecard__summary strong { display: block; margin-top: 4px; font: 600 1.35rem/1 "SFMono-Regular", Consolas, monospace; font-variant-numeric: tabular-nums; }
+.evolution-scorecard__reason { display: grid; gap: 3px; padding: 10px 12px; border-left: 3px solid #b8523e; background: #fff7f4; font-size: .82rem; }
+.evolution-scorecard__gates { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; font-size: .78rem; }
+.evolution-scorecard__table-wrap { overflow-x: auto; }
+.evolution-scorecard table { width: 100%; border-collapse: collapse; font-size: .78rem; font-variant-numeric: tabular-nums; }
+.evolution-scorecard th, .evolution-scorecard td { padding: 7px 8px; border-bottom: 1px solid var(--evolution-rule); text-align: right; white-space: nowrap; }
+.evolution-scorecard th:first-child { text-align: left; }
+.evolution-scorecard__failures { display: flex; justify-content: space-between; gap: 12px; font-size: .78rem; }
+.evolution-scorecard__meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; gap: 8px 16px; }
+.evolution-scorecard__meta div { min-width: 0; }
+.evolution-scorecard__meta dd { margin: 2px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: .75rem/1.3 "SFMono-Regular", Consolas, monospace; }
+
+@media (max-width: 720px) {
+  .evolution-scorecard__summary { grid-template-columns: 1fr; }
+  .evolution-scorecard__summary article { border-right: 0; border-bottom: 1px solid var(--evolution-rule); }
+  .evolution-scorecard__summary article:last-child { border-bottom: 0; }
+  .evolution-scorecard__meta { grid-template-columns: 1fr; }
+}
+
 .evolution-console__comparison article {
   display: grid;
   gap: 7px;

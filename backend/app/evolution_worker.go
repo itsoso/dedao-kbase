@@ -93,6 +93,8 @@ type EvolutionWorkFailure struct {
 	RetryDelay            time.Duration `json:"retry_delay"`
 }
 
+type EvolutionWorkDeferral = EvolutionWorkFailure
+
 type EvolutionWork struct {
 	WorkID                string                    `json:"work_id"`
 	RunID                 string                    `json:"run_id"`
@@ -260,16 +262,25 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 	if err := validateEvolutionWorkLeaseInput(input); err != nil {
 		return nil, false, err
 	}
-	leaseID, err := newEvolutionStoreID("lease")
-	if err != nil {
-		return nil, false, err
-	}
 	now := s.now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
 	nowNS, err := evolutionWorkerUnixNano(now)
 	if err != nil {
 		return nil, false, err
 	}
+	var expired int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM evolution_work_items WHERE status = 'leased' AND lease_expires_at_unix_nano <= ?`, nowNS).Scan(&expired); err != nil {
+		return nil, false, fmt.Errorf("check expired evolution leases: %w", err)
+	}
+	if expired > 0 {
+		if _, err := s.RecoverExpiredEvolutionLeases(); err != nil && !errors.Is(err, ErrEvolutionAttemptExhausted) && !errors.Is(err, ErrEvolutionTransitionConflict) {
+			return nil, false, err
+		}
+	}
+	leaseID, err := newEvolutionStoreID("lease")
+	if err != nil {
+		return nil, false, err
+	}
+	nowText := now.Format(time.RFC3339Nano)
 	expiresTime, expiresNS, err := evolutionWorkerAddDuration(now, input.LeaseDuration)
 	if err != nil {
 		return nil, false, err
@@ -318,6 +329,77 @@ func (s *EvolutionControlStore) LeaseNextEvolutionWork(input EvolutionWorkLeaseI
 		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work lease", err)
 	}
 	return work, true, nil
+}
+
+// DeferEvolutionWork releases a healthy lease without consuming an attempt.
+// It is reserved for explicit dependency waits, not processing failures.
+func (s *EvolutionControlStore) DeferEvolutionWork(input EvolutionWorkDeferral) (*EvolutionWork, bool, error) {
+	if err := validateEvolutionWorkFailure(input); err != nil {
+		return nil, false, err
+	}
+	if input.RetryDelay <= 0 {
+		return nil, false, fmt.Errorf("deferred evolution work requires a positive retry delay")
+	}
+	now := s.now().UTC()
+	timestamp := now.Format(time.RFC3339Nano)
+	nowNS, err := evolutionWorkerUnixNano(now)
+	if err != nil {
+		return nil, false, err
+	}
+	availableTime, availableNS, err := evolutionWorkerAddDuration(now, input.RetryDelay)
+	if err != nil {
+		return nil, false, err
+	}
+	tx, err := s.beginTx(context.Background())
+	if err != nil {
+		return nil, false, wrapEvolutionSQLiteWriteError("begin defer evolution work", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	work, err := loadEvolutionWorkTx(tx, input.WorkID)
+	if err != nil {
+		return nil, false, normalizeEvolutionWorkLoadError(err)
+	}
+	failureHash := evolutionWorkerFailureHash(input)
+	if work.Status == EvolutionWorkPending && work.FailureIdempotencyKey == input.FailureIdempotencyKey {
+		if work.failureHash != failureHash || work.failureWorkerID != input.WorkerID || work.failureLeaseID != input.LeaseID || work.failureAttempt != input.Attempt-1 {
+			return nil, false, ErrEvolutionIdempotencyConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work deferral replay", err)
+		}
+		return work, true, nil
+	}
+	if err := validateActiveEvolutionWorkLease(work, input.WorkerID, input.LeaseID, now); err != nil {
+		return nil, false, err
+	}
+	if work.Attempt != input.Attempt {
+		return nil, false, ErrEvolutionLeaseLost
+	}
+	result, err := tx.Exec(`UPDATE evolution_work_items SET status = 'pending', attempt = attempt - 1,
+		available_at = ?, available_at_unix_nano = ?, lease_id = '', lease_owner = '', lease_expires_at = '',
+		lease_expires_at_unix_nano = 0, failure_code = ?, failure_message = ?, failure_idempotency_key = ?,
+		failure_hash = ?, failure_worker_id = ?, failure_lease_id = ?, failure_attempt = ?, updated_at = ?
+		WHERE work_id = ? AND status = 'leased' AND lease_owner = ? AND lease_id = ? AND lease_expires_at_unix_nano > ?`,
+		availableTime.Format(time.RFC3339Nano), availableNS, input.FailureCode, input.FailureMessage,
+		input.FailureIdempotencyKey, failureHash, input.WorkerID, input.LeaseID, input.Attempt-1, timestamp,
+		input.WorkID, input.WorkerID, input.LeaseID, nowNS)
+	if err != nil {
+		return nil, false, fmt.Errorf("defer evolution work: %w", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, ErrEvolutionLeaseLost
+	}
+	work.Status, work.Attempt, work.AvailableAt = EvolutionWorkPending, work.Attempt-1, availableTime.Format(time.RFC3339Nano)
+	work.FailureCode, work.FailureMessage, work.FailureIdempotencyKey = input.FailureCode, input.FailureMessage, input.FailureIdempotencyKey
+	work.failureHash, work.failureWorkerID, work.failureLeaseID, work.failureAttempt = failureHash, input.WorkerID, input.LeaseID, input.Attempt-1
+	work.LeaseExpiresAt, work.leaseExpiresUnixNano, work.UpdatedAt = "", 0, timestamp
+	if err := tx.Commit(); err != nil {
+		return nil, false, wrapEvolutionSQLiteWriteError("commit evolution work deferral", err)
+	}
+	return work, false, nil
 }
 
 func (s *EvolutionControlStore) LoadEvolutionWork(workID string) (*EvolutionWork, error) {
