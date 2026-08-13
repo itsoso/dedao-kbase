@@ -8296,11 +8296,15 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
     renderWCPlusPage();
   }
   try {
+    const collectionRequest = apiFetch("/api/knowledge/collections").then(
+      (value) => ({ value, unavailable: false }),
+      () => ({ value: { collections: [] }, unavailable: true }),
+    );
     const [agentPayload, subscriptionPayload, runPayload, collectionPayload] = await Promise.all([
       apiFetch("/api/source-agents"),
       apiFetch("/api/source-subscriptions"),
       apiFetch("/api/source-sync/runs?limit=200"),
-      apiFetch("/api/knowledge/collections"),
+      collectionRequest,
     ]);
     if (sequence !== sourceControlLoadSequence) {
       return;
@@ -8308,7 +8312,7 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
     sourceControlState.agents = Array.isArray(agentPayload.agents) ? agentPayload.agents : [];
     sourceControlState.subscriptions = Array.isArray(subscriptionPayload.subscriptions) ? subscriptionPayload.subscriptions : [];
     sourceControlState.runs = Array.isArray(runPayload.runs) ? runPayload.runs : [];
-    sourceControlState.knowledgeCollections = Array.isArray(collectionPayload.collections) ? collectionPayload.collections : [];
+    sourceControlState.knowledgeCollections = Array.isArray(collectionPayload.value.collections) ? collectionPayload.value.collections : [];
     if (!sourceControlState.draft.sourceAgentID && sourceControlState.agents.length === 1) {
       sourceControlState.draft.sourceAgentID = sourceControlState.agents[0].agent_id || "";
     }
@@ -8336,7 +8340,7 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
       }
     }
     shouldRender = shouldRender || previousSignature !== sourceControlDataSignature();
-    sourceControlState.message = `${sourceControlState.agents.length} 个 Agent · ${sourceControlState.subscriptions.length} 个订阅 · ${sourceControlState.runs.length} 次运行`;
+    sourceControlState.message = `${sourceControlState.agents.length} 个 Agent · ${sourceControlState.subscriptions.length} 个订阅 · ${sourceControlState.runs.length} 次运行${collectionPayload.unavailable ? " · 集合列表暂不可用" : ""}`;
   } catch (error) {
     if (sequence === sourceControlLoadSequence) {
       sourceControlState.message = error instanceof Error ? error.message : String(error);

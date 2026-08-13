@@ -139,16 +139,23 @@ assert.match(styles, /\.job-card__status\.is-partial/);
 context.window.location.pathname = "/wcplus-source";
 jobs.sourceControlState.selectedSubscriptionID = "subscription-wcplus";
 jobs.sourceControlState.selectedRunID = "source-run-wechat";
+let collectionListRequested = false;
 jobs.setApi(async (requestPath) => {
   if (requestPath === "/api/source-agents") return { agents: [] };
   if (requestPath === "/api/source-subscriptions") return subscriptionPayload;
   if (requestPath === "/api/source-sync/runs?limit=200") return runPayload;
+  if (requestPath === "/api/knowledge/collections") {
+    collectionListRequested = true;
+    throw new Error("collections unavailable");
+  }
   if (requestPath === "/api/source-sync/runs/source-run-wechat") return { run: runPayload.runs[1], items: [] };
   throw new Error(`unexpected request ${requestPath}`);
 });
 await jobs.loadSourceControlPlane({ silent: true, renderResult: false });
+assert.equal(collectionListRequested, true, "source control should request account collections independently");
 assert.equal(jobs.sourceControlState.selectedSubscriptionID, "subscription-wcplus");
 assert.equal(jobs.sourceControlState.selectedRunID, "", "a deep-linked run from another subscription must be cleared");
+assert.match(jobs.sourceControlState.message, /集合列表暂不可用/, "collection failure should remain visible without hiding source runs");
 context.window.location.pathname = "/jobs";
 oldJobs.resolve({ jobs: [{ id: "old-job", type: "dedao_ebook_download", status: "failed", stage: "failed", ebook_id: 1 }] });
 await staleLoad;
