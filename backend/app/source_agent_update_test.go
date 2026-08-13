@@ -429,6 +429,19 @@ func TestSourceAgentUpdateRejectsInvalidRequestWithoutChangingExecutable(t *test
 	}
 }
 
+func TestSourceAgentUpdateSupportsOnlyFixedWorkerTypes(t *testing.T) {
+	for _, workerType := range []string{"wechat-worker", "wcplus-worker", "chatlog-worker"} {
+		if !isAllowedSourceAgentUpdateWorkerType(workerType) {
+			t.Fatalf("fixed worker type %q is not allowed", workerType)
+		}
+	}
+	for _, workerType := range []string{"", "chatlog-worker/other", "unknown"} {
+		if isAllowedSourceAgentUpdateWorkerType(workerType) {
+			t.Fatalf("variable worker type %q is allowed", workerType)
+		}
+	}
+}
+
 func TestSourceAgentUpdateRejectsStagedIntegrityAndFileType(t *testing.T) {
 	t.Run("size mismatch", func(t *testing.T) {
 		fixture := newSourceAgentUpdateFixture(t)

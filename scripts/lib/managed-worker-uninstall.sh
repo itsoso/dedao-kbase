@@ -44,6 +44,11 @@ _managed_worker_uninstall_validate() {
       expected_label=life.executor.kbase.wcplus-agent
       expected_updater_label=life.executor.kbase.wcplus-agent.updater
       ;;
+    chatlog-agent)
+      expected_worker=chatlog-agent
+      expected_label=life.executor.kbase.chatlog-agent
+      expected_updater_label=life.executor.kbase.chatlog-agent.updater
+      ;;
     *) return 1 ;;
   esac
   [[ "$MANAGED_WORKER_UNINSTALL_LABEL" == "$expected_label" &&

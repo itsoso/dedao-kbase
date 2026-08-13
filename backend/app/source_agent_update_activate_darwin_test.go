@@ -29,6 +29,7 @@ func TestSourceAgentUpdaterJobUsesFixedIndependentLaunchAgent(t *testing.T) {
 	}{
 		{workerType: "wechat-worker", label: "life.executor.kbase.source-agent.updater"},
 		{workerType: "wcplus-worker", label: "life.executor.kbase.wcplus-agent.updater"},
+		{workerType: "chatlog-worker", label: "life.executor.kbase.chatlog-agent.updater"},
 	}
 	for _, test := range tests {
 		t.Run(test.workerType, func(t *testing.T) {

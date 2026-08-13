@@ -4,14 +4,124 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/yann0917/dedao-gui/backend/app"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	previous := chatlogAgentUpgradeFactory
+	chatlogAgentUpgradeFactory = func(*app.SourceAgentClient) (chatlogWorkerUpgradeRuntime, error) {
+		return chatlogWorkerUpgradeRuntime{updater: &chatlogAgentFailClosedUpdater{}}, nil
+	}
+	code := m.Run()
+	chatlogAgentUpgradeFactory = previous
+	os.Exit(code)
+}
+
+type chatlogAgentTestActivator struct{}
+
+func (chatlogAgentTestActivator) StartUpdater(context.Context) error { return nil }
+
+func TestChatlogAgentConstructsRestrictedUpgradeBridge(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("darwin worker upgrade bridge")
+	}
+	temporaryRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(temporaryRoot, "installed")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	worker := filepath.Join(root, "chatlog-agent")
+	updater := filepath.Join(root, "source-agent-updater")
+	for _, path := range []string{worker, updater} {
+		if err := os.WriteFile(path, []byte("fixture"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, directory := range []string{".source-agent-staging", ".source-agent-handoff"} {
+		if err := os.Mkdir(filepath.Join(root, directory), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client, err := app.NewSourceAgentClient(app.SourceAgentConfig{
+		RemoteURL: "https://kbase.example.invalid", AgentToken: "shared-token",
+		AgentID: "chatlog-agent-a", StateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge, err := newChatlogWorkerUpgradeBridge(client, worker, chatlogAgentTestActivator{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bridge == nil {
+		t.Fatal("restricted upgrade bridge is nil")
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type chatlogControlRunnerFake struct {
+	result app.SourceAgentCycleResult
+	err    error
+	active bool
+}
+
+func (f chatlogControlRunnerFake) RunOnce(context.Context) (app.SourceAgentCycleResult, error) {
+	return f.result, f.err
+}
+
+func (f chatlogControlRunnerFake) ControlActive() bool { return f.active }
+
+func TestChatlogAgentDoesNotClaimResearchWhileControlCommandIsActive(t *testing.T) {
+	remoteCalls := 0
+	remote := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		remoteCalls++
+	}))
+	defer remote.Close()
+	research, err := app.NewResearchWorkerClient(app.ResearchWorkerClientConfig{
+		RemoteURL: remote.URL, Token: "shared-token", AgentID: "chatlog-agent-a",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &chatlogAgentRuntime{
+		control:        chatlogControlRunnerFake{result: app.SourceAgentCycleResult{OK: true}, active: true},
+		researchClient: research,
+	}
+	result, err := runtime.once(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.OK || !result.Heartbeat || remoteCalls != 0 {
+		t.Fatalf("result=%#v remoteCalls=%d", result, remoteCalls)
+	}
+}
+
+func TestChatlogAgentRuntimeCloseJoinsOwnedResources(t *testing.T) {
+	want := errors.New("close failed")
+	runtime := &chatlogAgentRuntime{upgrade: chatlogCloseError{err: want}}
+	if err := runtime.close(); !errors.Is(err, want) {
+		t.Fatalf("close() error=%v", err)
+	}
+}
+
+type chatlogCloseError struct{ err error }
+
+func (c chatlogCloseError) Close() error { return c.err }
 
 func TestChatlogAgentBuildInfoAndOfflineConfigValidation(t *testing.T) {
 	var stdout, stderr bytes.Buffer
@@ -80,6 +190,37 @@ func TestChatlogAgentDoctorChecksLocalReadAPIAndRemoteAuth(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), `"ok":true`) || strings.Contains(stdout.String(), "shared-token") || strings.Contains(stdout.String(), env["CHATLOG_AGENT_STATE_DIR"]) {
 		t.Fatalf("doctor output=%s", stdout.String())
+	}
+}
+
+func TestChatlogAgentDoctorDoesNotRequireInstalledUpdater(t *testing.T) {
+	previous := chatlogAgentUpgradeFactory
+	chatlogAgentUpgradeFactory = func(*app.SourceAgentClient) (chatlogWorkerUpgradeRuntime, error) {
+		return chatlogWorkerUpgradeRuntime{}, errors.New("updater should not be loaded")
+	}
+	defer func() { chatlogAgentUpgradeFactory = previous }()
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/session" {
+			t.Fatalf("local path=%s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer local.Close()
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/source-agent/lease" {
+			t.Fatalf("remote path=%s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"run":null}`))
+	}))
+	defer remote.Close()
+	var stdout, stderr bytes.Buffer
+	err := runChatlogAgentCLI(
+		context.Background(), []string{"doctor"},
+		chatlogAgentTestEnvironment(remote.URL, local.URL, t.TempDir()).lookup,
+		&stdout, &stderr,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -193,13 +334,17 @@ func TestChatlogAgentReportsDependencyUnavailableWithoutLeakingDetails(t *testin
 	local.Close()
 	var heartbeat map[string]any
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/source-agent/heartbeat" {
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"agent":{"agent_id":"chatlog-agent-a","desired_state":"active"}}`))
+		case "/api/source-agent/commands/claim":
+			_, _ = w.Write([]byte(`{"command":null}`))
+		default:
 			t.Fatalf("unexpected path=%s", r.URL.Path)
 		}
-		if err := json.NewDecoder(r.Body).Decode(&heartbeat); err != nil {
-			t.Fatal(err)
-		}
-		_, _ = w.Write([]byte(`{"agent":{"agent_id":"chatlog-agent-a","desired_state":"active"}}`))
 	}))
 	defer remote.Close()
 	var stdout, stderr bytes.Buffer

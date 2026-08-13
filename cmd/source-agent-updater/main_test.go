@@ -393,6 +393,7 @@ func TestSourceAgentUpdaterFixedLaunchAgentLabels(t *testing.T) {
 	}{
 		{"wechat-worker", "life.executor.kbase.source-agent", "life.executor.kbase.source-agent.updater"},
 		{"wcplus-worker", "life.executor.kbase.wcplus-agent", "life.executor.kbase.wcplus-agent.updater"},
+		{"chatlog-worker", "life.executor.kbase.chatlog-agent", "life.executor.kbase.chatlog-agent.updater"},
 	}
 	for _, tt := range tests {
 		labels, ok := sourceAgentLaunchAgentLabels(tt.workerType)
@@ -416,6 +417,7 @@ func TestSourceAgentUpdaterPlatformControlUsesSeparateFixedLaunchctlOperations(t
 	}{
 		{"wechat-worker", "gui/501/life.executor.kbase.source-agent", "gui/501/life.executor.kbase.source-agent.updater"},
 		{"wcplus-worker", "gui/501/life.executor.kbase.wcplus-agent", "gui/501/life.executor.kbase.wcplus-agent.updater"},
+		{"chatlog-worker", "gui/501/life.executor.kbase.chatlog-agent", "gui/501/life.executor.kbase.chatlog-agent.updater"},
 	}
 	for _, tt := range tests {
 		runner := &fakeSourceAgentLaunchctlRunner{}

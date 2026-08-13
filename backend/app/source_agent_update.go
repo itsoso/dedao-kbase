@@ -425,7 +425,7 @@ func (u *SourceAgentUpdateTransaction) restart(ctx context.Context, ignoreCancel
 }
 
 func isAllowedSourceAgentUpdateWorkerType(workerType string) bool {
-	return workerType == "wechat-worker" || workerType == "wcplus-worker"
+	return workerType == "wechat-worker" || workerType == "wcplus-worker" || workerType == "chatlog-worker"
 }
 
 func (u *SourceAgentUpdateTransaction) Apply(ctx context.Context, request SourceAgentUpdateRequest) SourceAgentUpdateResult {

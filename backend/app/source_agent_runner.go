@@ -32,6 +32,7 @@ type SourceAgentRunnerConfig struct {
 	ProtocolVersion       string
 	Revision              string
 	LeaseDuration         time.Duration
+	ControlOnly           bool
 }
 
 type SourceAgentRunner struct {
@@ -50,6 +51,7 @@ type SourceAgentRunner struct {
 	protocolVersion       string
 	revision              string
 	leaseDuration         time.Duration
+	controlOnly           bool
 	now                   func() time.Time
 
 	controlGate chan struct{}
@@ -72,6 +74,18 @@ type SourceAgentCycleResult struct {
 	Status          string `json:"status,omitempty"`
 	Uploaded        int    `json:"uploaded"`
 	OutboxRemaining int    `json:"outbox_remaining"`
+}
+
+// ControlActive reports only whether a claimed maintenance command is still
+// being processed. It intentionally exposes neither command payload nor local
+// update state.
+func (r *SourceAgentRunner) ControlActive() bool {
+	if r == nil {
+		return false
+	}
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	return r.state.currentCommand != nil
 }
 
 func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, error) {
@@ -135,7 +149,8 @@ func NewSourceAgentRunner(config SourceAgentRunnerConfig) (*SourceAgentRunner, e
 		adapter: config.Adapter, diagnoser: config.Diagnoser, updater: config.Updater,
 		workerType: workerType, platform: platform, architecture: architecture,
 		version: version, protocolVersion: protocolVersion, revision: revision, leaseDuration: config.LeaseDuration,
-		now: time.Now, controlGate: make(chan struct{}, 1),
+		controlOnly: config.ControlOnly,
+		now:         time.Now, controlGate: make(chan struct{}, 1),
 	}
 	runner.controlGate <- struct{}{}
 	return runner, nil
@@ -247,6 +262,9 @@ func (r *SourceAgentRunner) beginCycle(ctx context.Context) (*SourceSyncRun, boo
 			return nil, health.Healthy, nil
 		}
 		return nil, health.Healthy, r.executeCurrentCommand(ctx, *command)
+	}
+	if r.controlOnly {
+		return nil, health.Healthy, nil
 	}
 
 	desiredState := strings.TrimSpace(agent.DesiredState)

@@ -59,6 +59,8 @@ func sourceAgentUpdaterLaunchAgentLabel(workerType string) (string, bool) {
 		return "life.executor.kbase.source-agent.updater", true
 	case "wcplus-worker":
 		return "life.executor.kbase.wcplus-agent.updater", true
+	case "chatlog-worker":
+		return "life.executor.kbase.chatlog-agent.updater", true
 	default:
 		return "", false
 	}

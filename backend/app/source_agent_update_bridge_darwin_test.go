@@ -246,6 +246,12 @@ type sourceAgentBlockingUpdaterActivatorForTest struct {
 	release chan struct{}
 }
 
+type sourceAgentUpdaterActivatorFunctionForTest func(context.Context) error
+
+func (f sourceAgentUpdaterActivatorFunctionForTest) StartUpdater(ctx context.Context) error {
+	return f(ctx)
+}
+
 func (a *sourceAgentBlockingUpdaterActivatorForTest) StartUpdater(ctx context.Context) error {
 	close(a.started)
 	select {
@@ -1210,6 +1216,36 @@ func TestSourceAgentUpdateBridgeNeverTargetsArtifactNamedPaths(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSourceAgentUpdateWorkerBasenameUsesFixedCatalog(t *testing.T) {
+	tests := map[string]string{
+		"wechat-worker":  "source-agent",
+		"wcplus-worker":  "wcplus-agent",
+		"chatlog-worker": "chatlog-agent",
+	}
+	for workerType, want := range tests {
+		if got, ok := sourceAgentUpdateWorkerBasename(workerType); !ok || got != want {
+			t.Fatalf("worker type %q basename=%q ok=%v", workerType, got, ok)
+		}
+	}
+	if _, ok := sourceAgentUpdateWorkerBasename("unknown"); ok {
+		t.Fatal("unknown worker type has a basename")
+	}
+}
+
+func TestSourceAgentUpdateBridgeOpensForChatlogWorker(t *testing.T) {
+	fixture := newSourceAgentUpdateBridgeFixture(t, "chatlog-worker")
+	config := fixture.config()
+	config.Revision = strings.Repeat("0", 40)
+	config.Activator = sourceAgentUpdaterActivatorFunctionForTest(func(context.Context) error { return nil })
+	bridge, err := NewSourceAgentUpdateBridge(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bridge.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

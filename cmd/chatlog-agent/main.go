@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ const (
 
 var chatlogAgentRevision = "0000000000000000000000000000000000000000"
 var chatlogTransportTokenLoader = sourceagentsecret.LoadTransportToken
+var chatlogAgentUpgradeFactory = newChatlogProductionUpgradeRuntime
 
 type chatlogEnvironmentLookup func(string) (string, bool)
 
@@ -41,7 +43,21 @@ type chatlogAgentRuntime struct {
 	sourceClient   *app.SourceAgentClient
 	researchClient *app.ResearchWorkerClient
 	reader         *app.ChatlogHTTPReader
+	control        chatlogControlRunner
+	outbox         *app.SourceAgentOutbox
+	upgrade        interface{ Close() error }
 	agentID        string
+}
+
+type chatlogControlRunner interface {
+	RunOnce(context.Context) (app.SourceAgentCycleResult, error)
+	ControlActive() bool
+}
+
+type chatlogWorkerUpgradeRuntime struct {
+	updater app.SourceAgentUpdater
+	state   app.SourceAgentProtectedUpgradeState
+	closer  interface{ Close() error }
 }
 
 type chatlogAgentCycleResult struct {
@@ -62,7 +78,7 @@ func main() {
 	}
 }
 
-func runChatlogAgentCLI(ctx context.Context, args []string, lookup chatlogEnvironmentLookup, stdout, stderr io.Writer) error {
+func runChatlogAgentCLI(ctx context.Context, args []string, lookup chatlogEnvironmentLookup, stdout, stderr io.Writer) (returnErr error) {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: chatlog-agent build-info|check-config|doctor|once|run")
 	}
@@ -80,13 +96,18 @@ func runChatlogAgentCLI(ctx context.Context, args []string, lookup chatlogEnviro
 	if err != nil {
 		return err
 	}
+	if args[0] == "doctor" {
+		runtime, err := newChatlogAgentDoctorRuntime(config)
+		if err != nil {
+			return err
+		}
+		return runtime.doctor(ctx, stdout)
+	}
 	runtime, err := newChatlogAgentRuntime(config)
 	if err != nil {
 		return err
 	}
-	if args[0] == "doctor" {
-		return runtime.doctor(ctx, stdout)
-	}
+	defer func() { returnErr = errors.Join(returnErr, runtime.close()) }()
 	if args[0] == "once" {
 		result, err := runtime.once(ctx)
 		if err != nil {
@@ -110,6 +131,18 @@ func runChatlogAgentCLI(ctx context.Context, args []string, lookup chatlogEnviro
 		case <-timer.C:
 		}
 	}
+}
+
+func newChatlogAgentDoctorRuntime(config chatlogAgentConfig) (*chatlogAgentRuntime, error) {
+	sourceClient, err := app.NewSourceAgentClient(config.Source)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := app.NewChatlogHTTPReader(app.ChatlogHTTPConfig{BaseURL: config.ChatlogURL})
+	if err != nil {
+		return nil, err
+	}
+	return &chatlogAgentRuntime{sourceClient: sourceClient, reader: reader, agentID: config.Source.AgentID}, nil
 }
 
 func writeChatlogAgentBuildInfo(output io.Writer) error {
@@ -192,9 +225,51 @@ func newChatlogAgentRuntime(config chatlogAgentConfig) (*chatlogAgentRuntime, er
 	if err != nil {
 		return nil, err
 	}
+	outbox, err := app.NewSourceAgentOutbox(config.Source.StateDir)
+	if err != nil {
+		return nil, err
+	}
+	upgrade, err := chatlogAgentUpgradeFactory(sourceClient)
+	if err != nil {
+		return nil, errors.Join(err, outbox.Close())
+	}
+	adapter := &chatlogControlAdapter{reader: reader}
+	control, err := app.NewSourceAgentRunner(app.SourceAgentRunnerConfig{
+		Client: sourceClient, Outbox: outbox, Adapter: adapter, Diagnoser: adapter,
+		Updater: upgrade.updater, UpgradeState: upgrade.state, WorkerType: chatlogAgentWorkerType,
+		Version: chatlogAgentVersion, ProtocolVersion: chatlogAgentProtocolVersion,
+		Revision: chatlogAgentRevision, LeaseDuration: 2 * time.Minute, ControlOnly: true,
+	})
+	if err != nil {
+		return nil, errors.Join(err, upgrade.closer.Close(), outbox.Close())
+	}
 	return &chatlogAgentRuntime{
-		sourceClient: sourceClient, researchClient: researchClient, reader: reader, agentID: config.Source.AgentID,
+		sourceClient: sourceClient, researchClient: researchClient, reader: reader,
+		control: control, outbox: outbox, upgrade: upgrade.closer, agentID: config.Source.AgentID,
 	}, nil
+}
+
+type chatlogControlAdapter struct{ reader *app.ChatlogHTTPReader }
+
+func (*chatlogControlAdapter) Name() string         { return chatlogAgentCapability }
+func (*chatlogControlAdapter) Operations() []string { return []string{chatlogAgentCapability} }
+func (a *chatlogControlAdapter) Status(ctx context.Context) app.SourceCapabilityHealth {
+	if a == nil || a.reader == nil {
+		return app.SourceCapabilityHealth{Healthy: false, Code: "dependency_unavailable", Version: chatlogAgentVersion}
+	}
+	if _, err := a.reader.ListSessions(ctx, "", 1, 0); err != nil {
+		return app.SourceCapabilityHealth{Healthy: false, Code: "dependency_unavailable", Version: chatlogAgentVersion}
+	}
+	return app.SourceCapabilityHealth{Healthy: true, Version: chatlogAgentVersion}
+}
+func (a *chatlogControlAdapter) Diagnose(ctx context.Context) app.SourceAgentDiagnosticReport {
+	if a.Status(ctx).Healthy {
+		return app.SourceAgentDiagnosticReport{State: app.SourceAgentCommandSucceeded, Code: app.SourceAgentCommandCodeDiagnosticComplete}
+	}
+	return app.SourceAgentDiagnosticReport{State: app.SourceAgentCommandFailed, Code: app.SourceAgentCommandCodeDiagnosticFailed}
+}
+func (*chatlogControlAdapter) Execute(context.Context, app.SourceSyncRun, app.SourceEnvelopeSink) (app.SourceAdapterResult, error) {
+	return app.SourceAdapterResult{}, fmt.Errorf("chatlog read jobs use the research worker protocol")
 }
 
 func (r *chatlogAgentRuntime) doctor(ctx context.Context, output io.Writer) error {
@@ -210,28 +285,18 @@ func (r *chatlogAgentRuntime) doctor(ctx context.Context, output io.Writer) erro
 }
 
 func (r *chatlogAgentRuntime) once(ctx context.Context) (chatlogAgentCycleResult, error) {
-	healthy := true
-	healthCode := ""
-	if _, err := r.reader.ListSessions(ctx, "", 1, 0); err != nil {
-		healthy = false
-		healthCode = "dependency_unavailable"
+	if r.control == nil {
+		return chatlogAgentCycleResult{}, fmt.Errorf("chatlog control runner is not configured")
 	}
-	_, err := r.sourceClient.Heartbeat(ctx, app.SourceAgentHeartbeat{
-		AgentID: r.agentID, WorkerType: chatlogAgentWorkerType, Platform: runtime.GOOS, Architecture: runtime.GOARCH,
-		Version: chatlogAgentVersion, ProtocolVersion: chatlogAgentProtocolVersion,
-		Capabilities: []string{chatlogAgentCapability},
-		CapabilityHealth: map[string]app.SourceCapabilityHealth{
-			chatlogAgentCapability: {Healthy: healthy, Code: healthCode, Version: chatlogAgentVersion, Revision: chatlogAgentRevision},
-		},
-	})
+	controlResult, err := r.control.RunOnce(ctx)
 	if err != nil {
 		return chatlogAgentCycleResult{}, err
 	}
-	if !healthy {
-		return chatlogAgentCycleResult{OK: false, Heartbeat: true, Code: healthCode}, nil
+	if !controlResult.OK {
+		return chatlogAgentCycleResult{OK: false, Heartbeat: true, Code: "dependency_unavailable"}, nil
 	}
-	if err := r.processMaintenanceCommand(ctx); err != nil {
-		return chatlogAgentCycleResult{}, err
+	if r.control.ControlActive() {
+		return chatlogAgentCycleResult{OK: true, Heartbeat: true}, nil
 	}
 	job, err := r.researchClient.Claim(ctx, 2*time.Minute)
 	if err != nil {
@@ -257,25 +322,56 @@ func (r *chatlogAgentRuntime) once(ctx context.Context) (chatlogAgentCycleResult
 	}, nil
 }
 
-func (r *chatlogAgentRuntime) processMaintenanceCommand(ctx context.Context) error {
-	command, err := r.sourceClient.ClaimCommand(ctx)
-	if err != nil || command == nil {
-		return err
+func (r *chatlogAgentRuntime) close() error {
+	if r == nil {
+		return nil
 	}
-	switch command.Type {
-	case app.SourceAgentCommandDiagnose:
-		_, err = r.sourceClient.ReportCommand(ctx, command.ID, app.SourceAgentCommandSucceeded,
-			app.SourceAgentCommandCodeDiagnosticComplete, "Diagnostics completed.", "")
-	case app.SourceAgentCommandRestart:
-		_, err = r.sourceClient.ReportCommand(ctx, command.ID, app.SourceAgentCommandFailed,
-			app.SourceAgentCommandCodeRestartFailed, "Restart is unavailable.", "")
-	case app.SourceAgentCommandUpgrade:
-		_, err = r.sourceClient.ReportCommand(ctx, command.ID, app.SourceAgentCommandFailed,
-			app.SourceAgentCommandCodeUpgradeFailed, "Upgrade is unavailable.", "")
-	default:
-		return fmt.Errorf("unsupported maintenance command")
+	var closeErrors []error
+	if r.upgrade != nil {
+		closeErrors = append(closeErrors, r.upgrade.Close())
 	}
-	return err
+	if r.outbox != nil {
+		closeErrors = append(closeErrors, r.outbox.Close())
+	}
+	return errors.Join(closeErrors...)
+}
+
+func newChatlogProductionUpgradeRuntime(client *app.SourceAgentClient) (chatlogWorkerUpgradeRuntime, error) {
+	workerExecutable, err := os.Executable()
+	if err != nil {
+		return chatlogWorkerUpgradeRuntime{}, fmt.Errorf("resolve chatlog agent executable: %w", err)
+	}
+	workerExecutable, err = filepath.EvalSymlinks(filepath.Clean(workerExecutable))
+	if err != nil || filepath.Base(workerExecutable) != "chatlog-agent" {
+		return chatlogWorkerUpgradeRuntime{}, fmt.Errorf("chatlog agent must run from its fixed installed executable")
+	}
+	activator, err := app.NewSourceAgentUpdaterActivator(chatlogAgentWorkerType, os.Getuid(), nil)
+	if err != nil {
+		return chatlogWorkerUpgradeRuntime{}, err
+	}
+	bridge, err := newChatlogWorkerUpgradeBridge(client, workerExecutable, activator)
+	if err != nil {
+		return chatlogWorkerUpgradeRuntime{}, err
+	}
+	return chatlogWorkerUpgradeRuntime{updater: bridge, state: bridge, closer: bridge}, nil
+}
+
+func newChatlogWorkerUpgradeBridge(client *app.SourceAgentClient, workerExecutable string, activator app.SourceAgentUpdaterActivator) (*app.SourceAgentUpdateBridge, error) {
+	if client == nil || filepath.Base(workerExecutable) != "chatlog-agent" {
+		return nil, fmt.Errorf("invalid fixed Chatlog upgrade runtime")
+	}
+	return app.NewSourceAgentUpdateBridge(app.SourceAgentUpdateBridgeConfig{
+		Downloader: client, UpdaterExecutable: filepath.Join(filepath.Dir(workerExecutable), "source-agent-updater"),
+		WorkerType: chatlogAgentWorkerType, CurrentVersion: chatlogAgentVersion,
+		Platform: runtime.GOOS, Architecture: runtime.GOARCH,
+		ProtocolVersion: chatlogAgentProtocolVersion, Revision: chatlogAgentRevision, Activator: activator,
+	})
+}
+
+type chatlogAgentFailClosedUpdater struct{}
+
+func (*chatlogAgentFailClosedUpdater) Upgrade(context.Context, app.SourceAgentCommand) app.SourceAgentUpgradeResult {
+	return app.SourceAgentUpgradeResult{State: app.SourceAgentCommandFailed, Code: app.SourceAgentCommandCodeUpgradeFailed}
 }
 
 func (r *chatlogAgentRuntime) executeJob(ctx context.Context, job app.ResearchWorkerJob) (app.ResearchWorkerResult, error) {

@@ -510,6 +510,11 @@ _managed_worker_install_validate_loaded_state() {
       expected_label="life.executor.kbase.wcplus-agent"
       expected_updater_label="life.executor.kbase.wcplus-agent.updater"
       ;;
+    chatlog-agent)
+      expected_worker="chatlog-agent"
+      expected_label="life.executor.kbase.chatlog-agent"
+      expected_updater_label="life.executor.kbase.chatlog-agent.updater"
+      ;;
     *) return 1 ;;
   esac
   if [[ "$worker_basename" != "$expected_worker" || "$MANAGED_WORKER_INSTALL_LABEL" != "$expected_label" ||

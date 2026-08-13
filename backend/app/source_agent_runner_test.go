@@ -461,6 +461,58 @@ func TestSourceAgentRunnerUsesAdapterContract(t *testing.T) {
 	var _ SourceEnvelopeSink = (*SourceAgentOutbox)(nil)
 }
 
+func TestSourceAgentRunnerExposesOnlyWhetherControlIsActive(t *testing.T) {
+	runner := &SourceAgentRunner{}
+	if runner.ControlActive() {
+		t.Fatal("new runner reports active control")
+	}
+	runner.setCurrentCommand(SourceAgentCommand{ID: "command-1", Type: SourceAgentCommandUpgrade})
+	if !runner.ControlActive() {
+		t.Fatal("runner hid active control")
+	}
+}
+
+func TestSourceAgentRunnerControlOnlySkipsSourceLease(t *testing.T) {
+	leaseCalls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/source-agent/heartbeat":
+			fmt.Fprint(w, `{"agent":{"agent_id":"agent-a","desired_state":"active"}}`)
+		case "/api/source-agent/commands/claim":
+			fmt.Fprint(w, `{"command":null}`)
+		case "/api/source-agent/lease":
+			leaseCalls++
+			fmt.Fprint(w, `{"run":null}`)
+		default:
+			t.Fatalf("unexpected path=%s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := NewSourceAgentClient(SourceAgentConfig{
+		RemoteURL: server.URL, AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewSourceAgentOutbox(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outbox.Close()
+	runner, err := NewSourceAgentRunner(SourceAgentRunnerConfig{
+		Client: client, Outbox: outbox, Adapter: &fakeSourceAdapter{status: SourceCapabilityHealth{Healthy: true}},
+		Version: "1.0.0", ControlOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.RunOnce(context.Background())
+	if err != nil || !result.OK || leaseCalls != 0 {
+		t.Fatalf("result=%#v leaseCalls=%d err=%v", result, leaseCalls, err)
+	}
+}
+
 func TestSourceAgentRunnerDefaultsLocalRuntimeMetadataCompatibly(t *testing.T) {
 	client, err := NewSourceAgentClient(SourceAgentConfig{
 		RemoteURL: "http://127.0.0.1:1", AgentToken: "agent-secret", AgentID: "agent-a", StateDir: t.TempDir(),

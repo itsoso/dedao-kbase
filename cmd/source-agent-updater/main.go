@@ -235,6 +235,11 @@ func sourceAgentLaunchAgentLabels(workerType string) (sourceAgentLaunchAgentIden
 			Worker:  "life.executor.kbase.wcplus-agent",
 			Updater: "life.executor.kbase.wcplus-agent.updater",
 		}, true
+	case "chatlog-worker":
+		return sourceAgentLaunchAgentIdentity{
+			Worker:  "life.executor.kbase.chatlog-agent",
+			Updater: "life.executor.kbase.chatlog-agent.updater",
+		}, true
 	default:
 		return sourceAgentLaunchAgentIdentity{}, false
 	}

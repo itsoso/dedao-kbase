@@ -654,6 +654,8 @@ func sourceAgentUpdateWorkerBasename(workerType string) (string, bool) {
 		return "source-agent", true
 	case "wcplus-worker":
 		return "wcplus-agent", true
+	case "chatlog-worker":
+		return "chatlog-agent", true
 	default:
 		return "", false
 	}

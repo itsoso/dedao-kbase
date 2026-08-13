@@ -35,7 +35,7 @@ _managed_worker_pair_valid_hash() {
 }
 
 _managed_worker_pair_valid_worker_name() {
-  [[ "$1" == source-agent || "$1" == wcplus-agent ]]
+  [[ "$1" == source-agent || "$1" == wcplus-agent || "$1" == chatlog-agent ]]
 }
 
 _managed_worker_pair_hash() {
