@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+const controlledCollectionAgentDefaultMaxCostUSD = 3.0
+
 type ControlledCollectionAgentDraftRequest struct {
 	CollectionReleaseID string  `json:"collection_release_id"`
 	PackageID           string  `json:"package_id,omitempty"`
@@ -51,7 +53,11 @@ func BuildControlledCollectionAgentDraft(store *BookKnowledgeStore, request Cont
 	}
 	maxCostUSD := request.MaxCostUSD
 	if maxCostUSD <= 0 {
-		maxCostUSD = 0.25
+		// A collection query may include up to 12 article chunks. The runtime's
+		// deliberately conservative cost ceiling must cover that full bounded
+		// context plus output, otherwise trusted evaluation cannot make its first
+		// model call even though the real provider price is lower.
+		maxCostUSD = controlledCollectionAgentDefaultMaxCostUSD
 	}
 	timeoutMS := request.TimeoutMS
 	if timeoutMS <= 0 {

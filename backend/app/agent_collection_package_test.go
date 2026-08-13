@@ -89,6 +89,9 @@ func TestBuildControlledCollectionAgentDraftIsDeterministicAndReadOnly(t *testin
 	if first.SchemaVersion != AgentPackageSchemaVersionV3 || first.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly || len(first.CollectionReleases) != 1 {
 		t.Fatalf("draft=%#v", first)
 	}
+	if first.ModelPolicy.MaxCostUSD != 3.0 {
+		t.Fatalf("default collection evaluation budget = %v, want 3.0", first.ModelPolicy.MaxCostUSD)
+	}
 	for _, rule := range first.ToolPolicy.Tools {
 		if rule.Decision != AgentToolAllow || !stringSet(AgentReadOnlyToolIDs())[rule.MCPServer+"/"+rule.ToolName] {
 			t.Fatalf("non-read-only tool=%#v", rule)
