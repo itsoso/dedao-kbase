@@ -4624,6 +4624,31 @@ function renderAgentCompiler() {
 
 function renderBookAgentEvidence() {
   const releaseRows = bookAgentState.releases.map((release) => {
+    const members = Array.isArray(release.members) ? release.members : [];
+    if (members.length || release.schema_version === "knowledge_collection_release.v1") {
+      const citationCount = members.reduce((total, member) => total + (Array.isArray(member.citation_ids) ? member.citation_ids.length : 0), 0);
+      return `
+        <article class="book-agent__release">
+          <header>
+            <div>
+              <span>集合发布版本</span>
+              <strong>${escapeHTML(agentReleaseDisplayTitle(release))}</strong>
+            </div>
+            <code>${escapeHTML(String(release.content_hash || "").slice(0, 18))}</code>
+          </header>
+          <div class="book-agent__evidence-grid">
+            ${members.slice(0, 6).map((member) => `
+              <div>
+                <span>${escapeHTML(member.book_id || "article")}</span>
+                <p>${escapeHTML(member.published_at || "发布时间未提供")}</p>
+                <small>${(member.citation_ids || []).slice(0, 3).map((id) => escapeHTML(id)).join(" · ") || "无引用 ID"}</small>
+              </div>
+            `).join("") || `<p class="web-muted">此集合发布版本暂无成员文章。</p>`}
+          </div>
+          <footer>${members.length} 篇文章 · ${citationCount} 条引用 · ${escapeHTML(release.usage_policy || "策略未提供")}</footer>
+        </article>
+      `;
+    }
     const claims = Array.isArray(release.analysis?.claims) ? release.analysis.claims : [];
     const citations = Array.isArray(release.citations) ? release.citations : [];
     return `
@@ -5264,9 +5289,32 @@ function agentConsoleDisplayName(bookTitle) {
   const title = String(bookTitle || "").trim().replace(/^\d+[_\-\s]+/, "");
   if (title) {
     const subject = title.split(/[：:]/)[0].trim();
+    if (subject.includes("集合知识库")) {
+      return `${subject} Agent`;
+    }
     return subject.endsWith("研究助手") ? subject : `${subject}研究助手`;
   }
   return "知识研究助手";
+}
+
+function agentReleaseDisplayTitle(release) {
+  return String(
+    release?.definition?.title ||
+    release?.book?.title ||
+    release?.book_id ||
+    release?.collection_id ||
+    release?.release_id ||
+    "知识库",
+  ).trim();
+}
+
+function agentPinnedReleaseCount(pkg) {
+  const collectionReleases = Array.isArray(pkg?.collection_releases) ? pkg.collection_releases : [];
+  if (collectionReleases.length) {
+    return collectionReleases.length;
+  }
+  const releases = Array.isArray(pkg?.releases) ? pkg.releases : [];
+  return releases.length || bookAgentState.releases.length;
 }
 
 function agentEvaluationMetricLabel(metric) {
@@ -5332,9 +5380,10 @@ function renderAgentTechnicalCredentials(pkg, release, evaluation) {
 }
 
 function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation, runtimeStatus) {
-  const displayName = agentConsoleDisplayName(release.book?.title);
+  const displayName = agentConsoleDisplayName(agentReleaseDisplayTitle(release));
   const evaluationPassed = Boolean(evaluation.passed);
-  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const releaseCount = agentPinnedReleaseCount(pkg);
+  const isCollectionAgent = Array.isArray(pkg.collection_releases) && pkg.collection_releases.length > 0;
   const evaluationMetrics = Object.entries(evaluation.metrics || {}).map(([metric, score]) => `
     <div><span>${escapeHTML(agentEvaluationMetricLabel(metric))}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
   `).join("");
@@ -5365,8 +5414,12 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
         <section class="agent-console__workspace" aria-label="Agent 主要工作区">
           ${renderBookAgentCapability("reader", `
             <section class="book-agent__capability book-agent__reader agent-console__reader" data-capability="reader">
-              <div class="book-agent__section-head"><div><span>01</span><h2>版本化阅读</h2></div><p>打开此 Agent 固定的知识版本。</p></div>
-              ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>进入阅读器 →</small></a>` : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
+              <div class="book-agent__section-head"><div><span>01</span><h2>${isCollectionAgent ? "集合知识库" : "版本化阅读"}</h2></div><p>打开此 Agent 固定的知识版本。</p></div>
+              ${isCollectionAgent
+                ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildKnowledgeCollectionURL(release.collection_id))}"><span>打开集合知识库</span><strong>${escapeHTML(agentReleaseDisplayTitle(release))}</strong><small>${Array.isArray(release.members) ? release.members.length : 0} 篇文章 · 进入集合工作台 →</small></a>`
+                : bookID
+                  ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>进入阅读器 →</small></a>`
+                  : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
             </section>
           `)}
           ${renderBookAgentCapability("search", `
@@ -5426,9 +5479,9 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
 }
 
 function renderAgentPackageContract(pkg, release, evaluation, runtimeStatus) {
-  const displayName = agentConsoleDisplayName(release.book?.title);
+  const displayName = agentConsoleDisplayName(agentReleaseDisplayTitle(release));
   const evaluationPassed = Boolean(evaluation.passed);
-  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const releaseCount = agentPinnedReleaseCount(pkg);
   const evaluationMetrics = renderAgentEvaluationMetrics(evaluation);
   const citationBoundary = pkg.retrieval_policy?.require_citations
     ? "所有回答必须绑定固定知识包中的引用。"
@@ -5483,9 +5536,11 @@ function renderAgentPackageContract(pkg, release, evaluation, runtimeStatus) {
 }
 
 function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, runtimeStatus) {
-  const bookTitle = agentBookDisplayTitle(release.book?.title, agentConsoleDisplayName(release.book?.title));
+  const releaseTitle = agentReleaseDisplayTitle(release);
+  const bookTitle = agentBookDisplayTitle(releaseTitle, agentConsoleDisplayName(releaseTitle));
   const evaluationPassed = Boolean(evaluation.passed);
-  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const releaseCount = agentPinnedReleaseCount(pkg);
+  const isCollectionAgent = Array.isArray(pkg.collection_releases) && pkg.collection_releases.length > 0;
   const evidenceBoundary = pkg.retrieval_policy?.require_citations
     ? "回答必须绑定当前固定版本的引用；证据不足时主动拒答。"
     : "回答遵循当前知识包的证据与拒答策略。";
@@ -5513,8 +5568,12 @@ function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, run
         <section class="reading-app__workspace" aria-label="阅读应用主要工作区">
           ${renderBookAgentCapability("reader", `
             <section class="book-agent__capability book-agent__reader" data-capability="reader">
-              <div class="book-agent__section-head"><div><span>01</span><h2>版本化阅读</h2></div><p>打开当前 Agent 固定的书籍版本。</p></div>
-              ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(bookTitle)}</strong><small>进入阅读器 →</small></a>` : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
+              <div class="book-agent__section-head"><div><span>01</span><h2>${isCollectionAgent ? "集合知识库" : "版本化阅读"}</h2></div><p>打开当前 Agent 固定的知识版本。</p></div>
+              ${isCollectionAgent
+                ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildKnowledgeCollectionURL(release.collection_id))}"><span>打开集合知识库</span><strong>${escapeHTML(bookTitle)}</strong><small>${Array.isArray(release.members) ? release.members.length : 0} 篇文章 · 进入集合工作台 →</small></a>`
+                : bookID
+                  ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(bookTitle)}</strong><small>进入阅读器 →</small></a>`
+                  : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
             </section>
           `)}
           ${renderBookAgentCapability("search", `
@@ -6275,6 +6334,16 @@ async function loadAgentEvolutionConsole() {
   });
 }
 
+async function loadPinnedAgentReleases(pkg) {
+  const bookReleases = (pkg.releases || []).map((reference) => (
+    apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
+  ));
+  const collectionReleases = (pkg.collection_releases || []).map((reference) => (
+    apiFetch(`/api/knowledge/collection-releases/${encodeURIComponent(reference.release_id)}`)
+  ));
+  return Promise.all([...bookReleases, ...collectionReleases]);
+}
+
 async function loadBookAgentPlatform(route) {
   cancelEvidenceAuditPoll();
   if (route.packageID) {
@@ -6302,9 +6371,7 @@ async function loadBookAgentPlatform(route) {
       return;
     }
     bookAgentState.package = pkg;
-    const releases = await Promise.all((pkg.releases || []).map((reference) => (
-      apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
-    )));
+    const releases = await loadPinnedAgentReleases(pkg);
     if (sequence !== bookAgentLoadSequence) {
       return;
     }

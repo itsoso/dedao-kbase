@@ -20,9 +20,28 @@ for (const marker of [
   "createCollectionAgentDraft",
   "evaluateCollectionAgent",
   "publishCollectionAgent",
+  "loadPinnedAgentReleases",
+  "agentReleaseDisplayTitle",
+  "agentPinnedReleaseCount",
 ]) {
   assert.ok(js.includes(marker), `collection workspace should include ${marker}`);
 }
+
+const pinnedReleaseLoader = js.match(/async function loadPinnedAgentReleases\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(pinnedReleaseLoader.includes("pkg.collection_releases"), "v3 Agent detail must load collection release references");
+assert.ok(
+  pinnedReleaseLoader.includes("/api/knowledge/collection-releases/"),
+  "v3 Agent detail must resolve its immutable collection release",
+);
+
+const agentConsoleSource = js.match(/function renderAgentConsole\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(agentConsoleSource.includes("agentReleaseDisplayTitle(release)"), "collection Agent title should come from its release definition");
+assert.ok(agentConsoleSource.includes("agentPinnedReleaseCount(pkg)"), "collection Agent should report its pinned release count");
+assert.ok(agentConsoleSource.includes("buildKnowledgeCollectionURL"), "collection Agent should link back to the collection workspace");
+
+const evidenceLedgerSource = js.match(/function renderBookAgentEvidence\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(evidenceLedgerSource.includes("release.members"), "collection Agent evidence ledger should summarize pinned article members");
+assert.ok(evidenceLedgerSource.includes("篇文章"), "collection Agent evidence ledger should use collection-specific Chinese copy");
 
 for (const endpoint of [
   "/api/knowledge/collections",
@@ -91,5 +110,6 @@ assert.doesNotMatch(workspaceStyle, /min-height:\s*(?:[7-9]\d|\d{3,})vh/, "works
 assert.ok(css.includes("grid-template-columns: minmax(0, 1fr) minmax(300px, .42fr)"), "desktop workspace should use a dense split layout");
 assert.ok(css.includes("@media (max-width: 820px)"), "workspace should include a mobile layout");
 assert.ok(html.includes("20260812-wechat-collection-agent"), "production assets should receive a fresh collection workspace version");
+assert.ok(html.includes("20260813-collection-agent-detail"), "collection Agent detail repair must invalidate the production app cache");
 
 console.log("WeChat collection Agent workspace smoke passed");
