@@ -81,6 +81,8 @@ type ResearchRun struct {
 	Version          int64             `json:"version"`
 	CreatedAt        string            `json:"created_at"`
 	UpdatedAt        string            `json:"updated_at"`
+	LeaseOwner       string            `json:"-"`
+	LeaseExpiresAt   string            `json:"-"`
 }
 
 type ResearchScope struct {
