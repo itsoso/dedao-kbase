@@ -2,8 +2,8 @@
 
 ## Status
 
-- **Current stage:** S3 — implementation planning
-- **Delivery status:** approved design; implementation not started
+- **Current stage:** S5 — deployment pending
+- **Delivery status:** implementation and review passed; production rollout pending
 - **Last updated:** 2026-08-12
 
 ## S0 Intake
@@ -94,15 +94,60 @@ Implementation plan:
 
 - [`../plans/2026-08-12-wechat-account-collection-agent.md`](../plans/2026-08-12-wechat-account-collection-agent.md)
 
+## S4 Implementation and Verification
+
+The implementation now provides exact-account collection definitions,
+deterministic candidates and quality reports, immutable collection Releases,
+Agent Package v3 collection scope, pinned cross-article retrieval and citation
+resolution, trusted evaluation, and a Chinese operator workspace. Collection
+and Agent publication remain separate explicit browser-session actions.
+
+The source scheduler now persists typed upstream-throttle cooldowns and resumes
+only after the bounded retry time. Authentication, verification, forbidden,
+and permanent failures remain blocked. Cursor state is preserved across a
+throttled discovery failure.
+
+Fresh release-gate evidence on the final feature branch:
+
+```text
+go test ./... -count=1 -timeout=30m
+go vet ./...
+go test -race ./backend/app ./cmd/kbase-server ./cmd/source-agent -count=1 -timeout=30m
+cd frontend && npm run build
+all frontend/scripts/*-smoke.mjs
+node --check frontend-web/app.js
+all frontend-web/scripts/*smoke*.mjs
+bash scripts/kbase-direct-deployment-smoke.sh
+bash scripts/kbase-direct-deployment-behavior-smoke.sh
+bash scripts/evolution-workers-deployment-smoke.sh
+bash scripts/source-agent-control-plane-smoke.sh
+bash scripts/system-map-smoke.sh
+bash scripts/privacy-smoke.sh
+git diff --check
+PASS
+```
+
+The Vue build retained its existing large-chunk warning but exited successfully.
+The first full Web smoke run found that a collection-list failure could abort
+the existing source-control refresh before stale cross-subscription run state
+was cleared. A RED/GREEN regression now proves collection-list failure is
+isolated and visible while Agent, subscription, and run history remain usable.
+
+The review checked authentication and CSRF coverage, member-count bounds,
+source-account isolation, content and candidate hashes, citation allowlists,
+runtime provenance, medical `evidence_only`, explicit confirmation, and the
+absence of credentials or downloaded article bodies in Git. No unresolved
+Critical, High, or Medium release blocker remains.
+
 ## Gate Ledger
 
 | Gate | Status | Evidence | Next action |
 | --- | --- | --- | --- |
 | G1 Admission | PASS | User approved complete visible history, continued synchronization, and account collection Agent scope | Preserve approved slice |
 | G2 Feasibility/risk | PASS WITH CONSTRAINTS | Existing Worker, cursor, article packages, Releases, and Agent runtime are reusable; immutable collection design approved | Implement with TDD |
-| G3 Tests | PENDING | No implementation yet | Run focused tests, full Go tests, frontend build, smokes, privacy, and diff checks |
-| G4 Review | PENDING | Collection integrity, auth, privacy, medical boundary, and runtime scope require independent review | Review before deployment |
-| G5 Deploy health | PENDING | No release artifact yet | Deploy from clean reviewed branch with rollback point |
+| G3 Tests | PASS | Full Go tests, focused race tests, vet, Vue build, all Web smokes, deployment smokes, system-map, privacy, and whitespace checks passed | Preserve exact revision evidence |
+| G4 Review | PASS | Exact account scope, 500-member bound, hash/citation integrity, browser Cookie+CSRF publication, medical `evidence_only`, and no-content/no-secret Git boundary reviewed | Deploy only from clean reviewed revision |
+| G5 Deploy health | PENDING | Production remains on the previous healthy revision | Deploy from clean reviewed branch with rollback point |
 | G6 Production validation | PENDING | Existing runtime inventory is not a published collection Agent | Backfill, publish, ask real questions, and verify citations |
 
 ## Runtime Data Boundary
