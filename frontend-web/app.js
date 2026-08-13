@@ -5611,11 +5611,29 @@ function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, run
   `;
 }
 
+function renderBookAgentLoading(route) {
+  const pageLabel = ({ package: "Agent 包契约", agent: "Agent 控制台", app: "阅读应用" })[route.view] || "Agent";
+  return `
+    <main class="book-agent book-agent--detail">
+      <section class="web-panel" aria-live="polite" aria-busy="true">
+        <p class="web-kicker">${escapeHTML(pageLabel)}</p>
+        <h1>正在加载指定 Agent</h1>
+        <p class="web-muted">正在恢复安全会话并读取版本 ${escapeHTML(route.version || "最新版本")}，请稍候。</p>
+        <code>${escapeHTML(route.packageID)}</code>
+      </section>
+    </main>
+  `;
+}
+
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
   deactivateProofroomModal();
-  if (!route.packageID || !bookAgentState.package) {
+  if (!route.packageID) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
     bindAgentEvolutionEvents(route);
+    return;
+  }
+  if (!bookAgentState.package) {
+    renderShell(renderBookAgentLoading(route), "agents");
     return;
   }
   const pkg = bookAgentState.package;

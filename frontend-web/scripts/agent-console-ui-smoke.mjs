@@ -52,6 +52,14 @@ const platformSource = js.match(/function renderBookAgentPlatform\([\s\S]*?\n\}\
 assert.ok(platformSource.includes('route.view === "agent"'), "platform should select the Agent-specific layout explicitly");
 assert.ok(platformSource.includes('pkg.schema_version !== "agent-package.v2"'), "v2 evidence audit must keep its dedicated layout");
 assert.ok(platformSource.includes("renderAgentConsole"), "v1 Agent routes should render the new console");
+assert.ok(platformSource.includes("renderBookAgentLoading"), "an identified Agent route should render a dedicated loading state");
+assert.ok(
+  platformSource.indexOf("if (!route.packageID)") < platformSource.indexOf("if (!bookAgentState.package)"),
+  "the Agent index and identified-Agent loading states must stay separate",
+);
+const loadingSource = js.match(/function renderBookAgentLoading\([\s\S]*?\n\}/)?.[0] || "";
+assert.ok(loadingSource.includes("正在加载指定 Agent"), "cold Agent routes should explain that the selected Agent is loading");
+assert.ok(!loadingSource.includes("还没有已发布 Agent"), "cold Agent routes must not flash the empty evolution fleet");
 
 for (const className of [
   ".agent-console",
@@ -79,5 +87,6 @@ assert.ok(mobileSource.includes("grid-template-columns: minmax(0, 1fr)"), "mobil
 assert.ok(css.includes("prefers-reduced-motion: reduce"), "console animation should respect reduced motion");
 assert.ok(html.includes("20260808-agent-console-zh"), "production should publish a fresh Agent console asset version");
 assert.ok(html.includes("20260808-agent-console-overflow"), "mobile overflow repair should publish a fresh stylesheet version");
+assert.ok(html.includes("20260813-agent-detail-loading"), "cold Agent loading repair must invalidate the production app cache");
 
 console.log("Agent console UI smoke passed");
