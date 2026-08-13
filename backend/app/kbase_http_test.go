@@ -2056,6 +2056,83 @@ func TestKBaseHTTPHandlerSourceAgentAuthenticationIsolation(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPResearchWorkerAuthenticationAndValidation(t *testing.T) {
+	root := t.TempDir()
+	researchStore, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = researchStore.Close() })
+	run := createResearchRunForTest(t, researchStore, "research-worker-http")
+	job, _, err := researchStore.CreateWorkerJob(ResearchWorkerJobInput{
+		RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage,
+		Arguments: []byte(`{"message_ref":"message-1"}`), MaxAttempts: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret",
+		SourceAgentToken: "worker-secret", ResearchStore: researchStore,
+	})
+	claimBody := `{"agent_id":"chatlog-agent-a","lease_seconds":60}`
+	for _, token := range []string{"", "admin-secret"} {
+		response := requestJSONKBase(handler, http.MethodPost, "/api/research-worker/jobs/claim", token, claimBody)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("token=%q status=%d body=%s", token, response.Code, response.Body.String())
+		}
+	}
+	signatureRequest := httptest.NewRequest(http.MethodPost, "/api/research-worker/jobs/claim", strings.NewReader(claimBody))
+	signatureRequest.Header.Set("Content-Type", "application/json")
+	signatureRequest.Header.Set("X-Research-Signature", "not-an-auth-mechanism")
+	signatureResponse := httptest.NewRecorder()
+	handler.ServeHTTP(signatureResponse, signatureRequest)
+	if signatureResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("signature-only status=%d body=%s", signatureResponse.Code, signatureResponse.Body.String())
+	}
+
+	unknown := requestJSONKBase(handler, http.MethodPost, "/api/research-worker/jobs/claim", "worker-secret",
+		`{"agent_id":"chatlog-agent-a","lease_seconds":60,"unknown":"private"}`)
+	if unknown.Code != http.StatusBadRequest || strings.Contains(unknown.Body.String(), "private") {
+		t.Fatalf("unknown status=%d body=%s", unknown.Code, unknown.Body.String())
+	}
+	overLimit := requestJSONKBase(handler, http.MethodPost, "/api/research-worker/jobs/claim", "worker-secret",
+		`{"agent_id":"chatlog-agent-a","lease_seconds":3601}`)
+	if overLimit.Code != http.StatusBadRequest {
+		t.Fatalf("over-limit status=%d body=%s", overLimit.Code, overLimit.Body.String())
+	}
+	tooLarge := requestJSONKBase(handler, http.MethodPost, "/api/research-worker/jobs/claim", "worker-secret",
+		`{"agent_id":"`+strings.Repeat("x", int(defaultResearchWorkerHTTPMaxBodyBytes))+`"}`)
+	if tooLarge.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d body=%s", tooLarge.Code, tooLarge.Body.String())
+	}
+
+	claimed := requestJSONKBase(handler, http.MethodPost, "/api/research-worker/jobs/claim", "worker-secret", claimBody)
+	if claimed.Code != http.StatusOK || !strings.Contains(claimed.Body.String(), `"job_id":"`+job.JobID+`"`) {
+		t.Fatalf("claimed status=%d body=%s", claimed.Code, claimed.Body.String())
+	}
+	foreignComplete := requestJSONKBase(handler, http.MethodPost,
+		"/api/research-worker/jobs/"+url.PathEscape(job.JobID)+"/complete", "worker-secret",
+		`{"agent_id":"chatlog-agent-b","request_hash":"`+job.RequestHash+`","result":{"items":[]}}`)
+	if foreignComplete.Code != http.StatusForbidden {
+		t.Fatalf("foreign completion status=%d body=%s", foreignComplete.Code, foreignComplete.Body.String())
+	}
+	invalidTime := requestJSONKBase(handler, http.MethodPost,
+		"/api/research-worker/jobs/"+url.PathEscape(job.JobID)+"/complete", "worker-secret",
+		`{"agent_id":"chatlog-agent-a","request_hash":"`+job.RequestHash+`","result":{"items":[{"source_type":"chatlog_message","source_role":"direct_advice","occurred_at":"not-a-time","content":"bounded","locator":{"worker_id":"worker-fixture","conversation_ref":"conversation","message_ref":"message"},"privacy":"private","selected":true}]}}`)
+	if invalidTime.Code != http.StatusBadRequest {
+		t.Fatalf("invalid time status=%d body=%s", invalidTime.Code, invalidTime.Body.String())
+	}
+
+	disabled := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(t.TempDir()), AuthToken: "admin-secret", SourceAgentToken: "worker-secret",
+	})
+	unavailable := requestJSONKBase(disabled, http.MethodPost, "/api/research-worker/jobs/claim", "worker-secret", claimBody)
+	if unavailable.Code != http.StatusServiceUnavailable {
+		t.Fatalf("disabled status=%d body=%s", unavailable.Code, unavailable.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
 	handler, sourceSync, _, _ := newKBaseSourceAgentCommandHTTPFixture(t)
 

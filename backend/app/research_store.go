@@ -178,11 +178,14 @@ func migrateResearchStore(db *sql.DB) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS research_worker_jobs (
 			job_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
-			tool TEXT NOT NULL, arguments_json TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+			target_agent_id TEXT NOT NULL, tool TEXT NOT NULL, arguments_json TEXT NOT NULL, state TEXT NOT NULL,
+			attempt INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL,
 			lease_owner TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL,
-			created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+			result_fingerprint TEXT NOT NULL DEFAULT '', failure_code TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '',
+			UNIQUE (run_id, request_hash)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_research_worker_jobs_state_lease ON research_worker_jobs(state, lease_expires_at, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_worker_jobs_state_lease ON research_worker_jobs(target_agent_id, state, lease_expires_at, created_at)`,
 		`CREATE TABLE IF NOT EXISTS research_model_invocations (
 			invocation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
 			request_identity TEXT NOT NULL UNIQUE, model TEXT NOT NULL, purpose TEXT NOT NULL,
@@ -413,37 +416,9 @@ func (s *ResearchStore) RenewRunLease(runID, owner string, lease time.Duration) 
 }
 
 func (s *ResearchStore) StoreEvidenceBundle(runID string, expectedVersion int64, bundle ResearchEvidenceBundle) (*ResearchRun, error) {
-	searchedSources, err := normalizeResearchScopeSources(bundle.SearchedSources)
-	if err != nil {
+	if err := validateResearchEvidenceBundle(bundle); err != nil {
 		return nil, err
 	}
-	citedSources, err := normalizeResearchScopeSources(bundle.CitedSources)
-	if err != nil {
-		return nil, err
-	}
-	if len(bundle.Evidence) > researchEvidenceItemsMax {
-		return nil, fmt.Errorf("evidence bundle exceeds %d items", researchEvidenceItemsMax)
-	}
-	evidenceSources := make(map[string]bool, len(bundle.Evidence))
-	for _, evidence := range bundle.Evidence {
-		if err := validateNormalizedResearchEvidence(evidence); err != nil {
-			return nil, err
-		}
-		source, err := researchScopeSourceForEvidence(evidence.SourceType)
-		if err != nil {
-			return nil, err
-		}
-		evidenceSources[source] = true
-	}
-	if len(evidenceSources) != len(citedSources) {
-		return nil, fmt.Errorf("cited_sources must exactly match selected evidence sources")
-	}
-	for _, source := range citedSources {
-		if !evidenceSources[source] {
-			return nil, fmt.Errorf("cited source %q has no selected evidence", source)
-		}
-	}
-
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, err
@@ -457,23 +432,73 @@ func (s *ResearchStore) StoreEvidenceBundle(runID string, expectedVersion int64,
 		return nil, ErrResearchRunVersionConflict
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
+	if err := storeResearchEvidenceBundleTx(tx, run, bundle, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return run, nil
+}
+
+func validateResearchEvidenceBundle(bundle ResearchEvidenceBundle) error {
+	searchedSources, err := normalizeResearchScopeSources(bundle.SearchedSources)
+	if err != nil {
+		return err
+	}
+	citedSources, err := normalizeResearchScopeSources(bundle.CitedSources)
+	if err != nil {
+		return err
+	}
+	if len(searchedSources) != len(bundle.SearchedSources) || len(citedSources) != len(bundle.CitedSources) {
+		return fmt.Errorf("evidence scope sources must be normalized and unique")
+	}
+	if len(bundle.Evidence) > researchEvidenceItemsMax {
+		return fmt.Errorf("evidence bundle exceeds %d items", researchEvidenceItemsMax)
+	}
+	evidenceSources := make(map[string]bool, len(bundle.Evidence))
+	for _, evidence := range bundle.Evidence {
+		if err := validateNormalizedResearchEvidence(evidence); err != nil {
+			return err
+		}
+		source, err := researchScopeSourceForEvidence(evidence.SourceType)
+		if err != nil {
+			return err
+		}
+		evidenceSources[source] = true
+	}
+	if len(evidenceSources) != len(citedSources) {
+		return fmt.Errorf("cited_sources must exactly match selected evidence sources")
+	}
+	for _, source := range citedSources {
+		if !evidenceSources[source] {
+			return fmt.Errorf("cited source %q has no selected evidence", source)
+		}
+	}
+	return nil
+}
+
+func storeResearchEvidenceBundleTx(tx *sql.Tx, run *ResearchRun, bundle ResearchEvidenceBundle, now string) error {
+	if err := validateResearchEvidenceBundle(bundle); err != nil {
+		return err
+	}
 	for _, evidence := range bundle.Evidence {
 		var existingHash string
 		err := tx.QueryRow(`SELECT content_hash FROM research_evidence WHERE run_id = ? AND locator_hash = ? LIMIT 1`,
 			run.RunID, evidence.LocatorHash).Scan(&existingHash)
 		if err == nil && existingHash != evidence.ContentHash {
-			return nil, ErrResearchEvidenceSourceChanged
+			return ErrResearchEvidenceSourceChanged
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, err
+			return err
 		}
 		subjectIDs, err := json.Marshal(evidence.SubjectIdentityIDs)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		locator, err := json.Marshal(evidence.Locator)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO research_evidence (
 			evidence_id, run_id, source_type, source_role, author_identity_id, subject_identity_ids_json,
@@ -482,37 +507,34 @@ func (s *ResearchStore) StoreEvidenceBundle(runID string, expectedVersion int64,
 			evidence.EvidenceID, run.RunID, evidence.SourceType, evidence.SourceRole, evidence.AuthorIdentityID,
 			string(subjectIDs), evidence.OccurredAt, evidence.ContentExcerpt, string(locator), evidence.LocatorHash,
 			evidence.ContentHash, evidence.Privacy, 1, now); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	run.ActualScope.SearchedSources = mergeResearchScopeSources(run.ActualScope.SearchedSources, searchedSources)
-	run.ActualScope.CitedSources = mergeResearchScopeSources(run.ActualScope.CitedSources, citedSources)
+	run.ActualScope.SearchedSources = mergeResearchScopeSources(run.ActualScope.SearchedSources, bundle.SearchedSources)
+	run.ActualScope.CitedSources = mergeResearchScopeSources(run.ActualScope.CitedSources, bundle.CitedSources)
 	scopeJSON, err := json.Marshal(run.ActualScope)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	result, err := tx.Exec(`UPDATE research_runs SET actual_scope_json = ?, version = version + 1, updated_at = ?
-		WHERE run_id = ? AND version = ?`, string(scopeJSON), now, run.RunID, expectedVersion)
+		WHERE run_id = ? AND version = ?`, string(scopeJSON), now, run.RunID, run.Version)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	changed, err := result.RowsAffected()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if changed != 1 {
-		return nil, ErrResearchRunVersionConflict
+		return ErrResearchRunVersionConflict
 	}
 	if err := insertResearchEvent(tx, run.RunID, run.Status, run.Status,
 		ResearchTransition{Code: "evidence_stored", Actor: "orchestrator", Summary: fmt.Sprintf("stored %d selected evidence items", len(bundle.Evidence))}, now); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+		return err
 	}
 	run.Version++
 	run.UpdatedAt = now
-	return run, nil
+	return nil
 }
 
 func (s *ResearchStore) ListEvidence(runID string) ([]ResearchEvidence, error) {

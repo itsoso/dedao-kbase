@@ -65,7 +65,7 @@ func TestResearchEvidencePromotesOnlySelectedBoundedExcerptsAndDropsRawFields(t 
 		contactSentinel  = "FULL_CONTACT_SHOULD_NOT_ESCAPE"
 		cookieSentinel   = "COOKIE_SHOULD_NOT_ESCAPE"
 		bearerSentinel   = "Bearer TOKEN_SHOULD_NOT_ESCAPE"
-		pathSentinel     = "/Users/example/private/chat.db"
+		pathSentinel     = "/local/private/chat.db"
 		unselectedSecret = "UNSELECTED_LONG_MESSAGE_SHOULD_NOT_ESCAPE"
 	)
 	selected := researchEvidenceTestCandidate(strings.Repeat("证", researchEvidenceExcerptMaxRunes+50))

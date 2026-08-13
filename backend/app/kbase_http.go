@@ -45,6 +45,7 @@ type KBaseHTTPConfig struct {
 	SourceIngest            *SourceIngestService
 	SourceAgentToken        string
 	SourceAgentMaxBodyBytes int64
+	ResearchStore           *ResearchStore
 	SourceArtifacts         *SourceAgentArtifactCatalog
 	SourceAssets            *SourceAssetStore
 	AnalysisGenerator       BookAnalysisGenerator
@@ -120,6 +121,7 @@ type kbaseHTTPHandler struct {
 	sourceIngest            *SourceIngestService
 	sourceAgentToken        string
 	sourceAgentMaxBodyBytes int64
+	researchStore           *ResearchStore
 	sourceArtifacts         *SourceAgentArtifactCatalog
 	sourceAssets            *SourceAssetStore
 	analysisGenerator       BookAnalysisGenerator
@@ -143,6 +145,7 @@ type kbaseHTTPHandler struct {
 
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
 const defaultSourceAgentCommandHTTPMaxBodyBytes int64 = 64 << 10
+const defaultResearchWorkerHTTPMaxBodyBytes int64 = 128 << 10
 const defaultEvidenceAuditMaxBodyBytes int64 = 64 << 10
 const defaultAgentCompilationMaxBodyBytes int64 = 64 << 10
 const defaultDedaoEbookVerificationTimeout = 15 * time.Second
@@ -255,6 +258,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceIngest:            sourceIngest,
 		sourceAgentToken:        sourceAgentToken,
 		sourceAgentMaxBodyBytes: maxBodyBytes,
+		researchStore:           cfg.ResearchStore,
 		sourceArtifacts:         cfg.SourceArtifacts,
 		sourceAssets:            assets,
 		analysisGenerator:       analysisGenerator,
@@ -337,6 +341,17 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.handleEvolutionWorkerAPI(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/research-worker/") {
+		if h.researchStore == nil || h.sourceAgentToken == "" {
+			writeHTTPError(w, http.StatusServiceUnavailable, "research worker API is not configured")
+			return
+		}
+		if !authorizeBearerToken(w, r, h.sourceAgentToken) {
+			return
+		}
+		h.handleResearchWorker(w, r)
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/source-agent/") {
@@ -4115,6 +4130,117 @@ func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		h.handleSourceAgentRun(w, r)
+	}
+}
+
+func (h *kbaseHTTPHandler) handleResearchWorker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if r.URL.Path == "/api/research-worker/jobs/claim" {
+		var payload struct {
+			AgentID      string `json:"agent_id"`
+			LeaseSeconds int    `json:"lease_seconds"`
+		}
+		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
+			return
+		}
+		lease := time.Duration(payload.LeaseSeconds) * time.Second
+		job, err := h.researchStore.ClaimWorkerJob(payload.AgentID, lease)
+		if err != nil {
+			h.writeResearchWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+		return
+	}
+	jobID, action, ok := parseResearchWorkerJobAction(r.URL.Path)
+	if !ok {
+		writeHTTPError(w, http.StatusNotFound, "not found")
+		return
+	}
+	switch action {
+	case "renew":
+		var payload struct {
+			AgentID      string `json:"agent_id"`
+			LeaseSeconds int    `json:"lease_seconds"`
+		}
+		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
+			return
+		}
+		if err := h.researchStore.RenewWorkerJobLease(jobID, payload.AgentID, time.Duration(payload.LeaseSeconds)*time.Second); err != nil {
+			h.writeResearchWorkerError(w, err)
+			return
+		}
+		job, err := h.researchStore.LoadWorkerJob(jobID)
+		if err != nil {
+			h.writeResearchWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+	case "complete":
+		var payload struct {
+			AgentID     string               `json:"agent_id"`
+			RequestHash string               `json:"request_hash"`
+			Result      ResearchWorkerResult `json:"result"`
+		}
+		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
+			return
+		}
+		job, err := h.researchStore.CompleteWorkerJob(jobID, payload.AgentID, payload.RequestHash, payload.Result)
+		if err != nil {
+			h.writeResearchWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+	case "fail":
+		var payload struct {
+			AgentID     string `json:"agent_id"`
+			RequestHash string `json:"request_hash"`
+			Code        string `json:"code"`
+			Retryable   bool   `json:"retryable"`
+		}
+		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
+			return
+		}
+		job, err := h.researchStore.FailWorkerJob(jobID, payload.AgentID, payload.RequestHash, payload.Code, payload.Retryable)
+		if err != nil {
+			h.writeResearchWorkerError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"job": job})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "not found")
+	}
+}
+
+func parseResearchWorkerJobAction(requestPath string) (string, string, bool) {
+	const prefix = "/api/research-worker/jobs/"
+	if !strings.HasPrefix(requestPath, prefix) {
+		return "", "", false
+	}
+	parts := strings.Split(strings.Trim(strings.TrimPrefix(requestPath, prefix), "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	jobID, err := url.PathUnescape(parts[0])
+	if err != nil || strings.TrimSpace(jobID) != jobID || jobID == "." || jobID == ".." || strings.Contains(jobID, "/") {
+		return "", "", false
+	}
+	return jobID, parts[1], true
+}
+
+func (h *kbaseHTTPHandler) writeResearchWorkerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrResearchWorkerJobNotFound), errors.Is(err, ErrResearchRunNotFound):
+		writeHTTPError(w, http.StatusNotFound, "research worker job not found")
+	case errors.Is(err, ErrResearchWorkerLeaseOwner):
+		writeHTTPError(w, http.StatusForbidden, "research worker lease owner mismatch")
+	case errors.Is(err, ErrResearchWorkerStaleResult), errors.Is(err, ErrResearchWorkerTerminal):
+		writeHTTPError(w, http.StatusConflict, "research worker job state conflict")
+	default:
+		writeHTTPError(w, http.StatusBadRequest, "invalid research worker request")
 	}
 }
 
