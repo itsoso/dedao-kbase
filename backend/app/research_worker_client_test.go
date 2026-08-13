@@ -21,7 +21,7 @@ func TestResearchWorkerClientUsesSharedBearerTokenAndIdempotencyHeader(t *testin
 		case "/api/research-worker/jobs/claim":
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
 				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
-				Arguments: []byte(`{"message_ref":"message-1"}`), State: ResearchWorkerJobLeased, Attempt: 1,
+				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobLeased, Attempt: 1,
 				LeaseOwner: "agent-a", RequestHash: "sha256:request",
 			}})
 		case "/api/research-worker/jobs/job-1/renew":
@@ -30,7 +30,7 @@ func TestResearchWorkerClientUsesSharedBearerTokenAndIdempotencyHeader(t *testin
 			}
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
 				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
-				Arguments: []byte(`{"message_ref":"message-1"}`), State: ResearchWorkerJobLeased,
+				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobLeased,
 				Attempt: 1, LeaseOwner: "agent-a", RequestHash: "sha256:request",
 			}})
 		case "/api/research-worker/jobs/job-1/complete":
@@ -39,7 +39,7 @@ func TestResearchWorkerClientUsesSharedBearerTokenAndIdempotencyHeader(t *testin
 			}
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
 				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
-				Arguments: []byte(`{"message_ref":"message-1"}`), State: ResearchWorkerJobCompleted,
+				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobCompleted,
 				Attempt: 1, LeaseOwner: "agent-a", RequestHash: "sha256:request",
 				ResultFingerprint: "sha256:result",
 			}})
@@ -72,7 +72,7 @@ func TestResearchWorkerClientUsesSharedBearerTokenAndIdempotencyHeader(t *testin
 
 func TestResearchWorkerClientRejectsMalformedOrForeignResponses(t *testing.T) {
 	for _, response := range []string{
-		`{"job":{"job_id":"job-1","run_id":"run-1","target_agent_id":"agent-b","tool":"fetch_chat_message","arguments":{"message_ref":"message-1"},"state":"leased","attempt":1,"lease_owner":"agent-b","request_hash":"sha256:request"}}`,
+		`{"job":{"job_id":"job-1","run_id":"run-1","target_agent_id":"agent-b","tool":"fetch_chat_message","arguments":{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"},"state":"leased","attempt":1,"lease_owner":"agent-b","request_hash":"sha256:request"}}`,
 		`{"job":null,"unknown":"private"}`,
 		`{"job":`,
 	} {

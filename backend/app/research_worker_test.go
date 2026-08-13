@@ -14,11 +14,11 @@ func TestResearchWorkerJobAcceptsOnlyBoundedTypedTools(t *testing.T) {
 		name string
 		args string
 	}{
-		{ResearchWorkerToolSearchChatlog, `{"time_from":"2026-08-01T00:00:00Z","time_to":"2026-08-02T00:00:00Z","keyword":"term","limit":20,"offset":0}`},
-		{ResearchWorkerToolExpandChatContext, `{"message_ref":"message-1","before":5,"after":5}`},
+		{ResearchWorkerToolSearchChatlog, `{"time_from":"2026-08-01T00:00:00Z","time_to":"2026-08-02T00:00:00Z","talker_ref":"conversation-1","keyword":"term","limit":20,"offset":0}`},
+		{ResearchWorkerToolExpandChatContext, `{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13","before":5,"after":5}`},
 		{ResearchWorkerToolResolveChatIdentity, `{"identity_ref":"identity-1","conversation_ref":"conversation-1"}`},
 		{ResearchWorkerToolListIdentityConversations, `{"identity_ref":"identity-1","limit":20,"offset":0}`},
-		{ResearchWorkerToolFetchChatMessage, `{"message_ref":"message-1"}`},
+		{ResearchWorkerToolFetchChatMessage, `{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`},
 	}
 	for _, fixture := range tools {
 		job, created, err := store.CreateWorkerJob(ResearchWorkerJobInput{
@@ -41,7 +41,10 @@ func TestResearchWorkerJobAcceptsOnlyBoundedTypedTools(t *testing.T) {
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: "shell", Arguments: []byte(`{}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"time_from":"2026-08-02T00:00:00Z","time_to":"2026-08-01T00:00:00Z","limit":20}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"limit":501}`), MaxAttempts: 2},
-		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage, Arguments: []byte(`{"message_ref":"message-1","unknown":"private"}`), MaxAttempts: 2},
+		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"talker_ref":"conversation-1","keyword":"term","limit":20}`), MaxAttempts: 2},
+		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage, Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13","unknown":"private"}`), MaxAttempts: 2},
+		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage, Arguments: []byte(`{"message_ref":"message-1"}`), MaxAttempts: 2},
+		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolExpandChatContext, Arguments: []byte(`{"message_ref":"message-1","before":5,"after":5}`), MaxAttempts: 2},
 	} {
 		if _, _, err := store.CreateWorkerJob(invalid); err == nil {
 			t.Fatalf("invalid worker job accepted: %#v", invalid)
@@ -59,7 +62,7 @@ func TestResearchWorkerJobLeaseCompletionAndPrivacyProjection(t *testing.T) {
 	run := createResearchRunForTest(t, store, "worker-complete")
 	job, _, err := store.CreateWorkerJob(ResearchWorkerJobInput{
 		RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog,
-		Arguments: []byte(`{"keyword":"bounded","limit":10}`), MaxAttempts: 2,
+		Arguments: []byte(`{"time_from":"2026-08-13T00:00:00Z","time_to":"2026-08-13T23:59:59Z","talker_ref":"conversation-1","keyword":"bounded","limit":10}`), MaxAttempts: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +130,7 @@ func TestResearchWorkerJobRecoversExpiredLeaseWithinRetryBudget(t *testing.T) {
 	run := createResearchRunForTest(t, store, "worker-recovery")
 	job, _, err := store.CreateWorkerJob(ResearchWorkerJobInput{
 		RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage,
-		Arguments: []byte(`{"message_ref":"message-1"}`), MaxAttempts: 2,
+		Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), MaxAttempts: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +161,7 @@ func TestResearchWorkerJobFailureHonorsRetryBudget(t *testing.T) {
 	run := createResearchRunForTest(t, store, "worker-failure")
 	job, _, err := store.CreateWorkerJob(ResearchWorkerJobInput{
 		RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage,
-		Arguments: []byte(`{"message_ref":"message-1"}`), MaxAttempts: 2,
+		Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), MaxAttempts: 2,
 	})
 	if err != nil {
 		t.Fatal(err)

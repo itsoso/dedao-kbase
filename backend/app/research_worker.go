@@ -66,6 +66,41 @@ type ResearchWorkerJob struct {
 	CompletedAt       string          `json:"completed_at,omitempty"`
 }
 
+type ResearchWorkerSearchChatlogArgs struct {
+	TimeFrom  string `json:"time_from,omitempty"`
+	TimeTo    string `json:"time_to,omitempty"`
+	TalkerRef string `json:"talker_ref,omitempty"`
+	SenderRef string `json:"sender_ref,omitempty"`
+	Keyword   string `json:"keyword,omitempty"`
+	Limit     int    `json:"limit"`
+	Offset    int    `json:"offset,omitempty"`
+}
+
+type ResearchWorkerExpandChatContextArgs struct {
+	MessageRef      string `json:"message_ref"`
+	ConversationRef string `json:"conversation_ref"`
+	Time            string `json:"time"`
+	Before          int    `json:"before"`
+	After           int    `json:"after"`
+}
+
+type ResearchWorkerResolveChatIdentityArgs struct {
+	IdentityRef     string `json:"identity_ref"`
+	ConversationRef string `json:"conversation_ref,omitempty"`
+}
+
+type ResearchWorkerListIdentityConversationsArgs struct {
+	IdentityRef string `json:"identity_ref"`
+	Limit       int    `json:"limit"`
+	Offset      int    `json:"offset,omitempty"`
+}
+
+type ResearchWorkerFetchChatMessageArgs struct {
+	MessageRef      string `json:"message_ref"`
+	ConversationRef string `json:"conversation_ref"`
+	Time            string `json:"time"`
+}
+
 func (s *ResearchStore) CreateWorkerJob(input ResearchWorkerJobInput) (*ResearchWorkerJob, bool, error) {
 	runID := strings.TrimSpace(input.RunID)
 	if runID == "" {
@@ -443,36 +478,15 @@ func normalizeResearchWorkerArguments(tool string, raw json.RawMessage) (json.Ra
 	var target any
 	switch tool {
 	case ResearchWorkerToolSearchChatlog:
-		target = &struct {
-			TimeFrom  string `json:"time_from,omitempty"`
-			TimeTo    string `json:"time_to,omitempty"`
-			TalkerRef string `json:"talker_ref,omitempty"`
-			SenderRef string `json:"sender_ref,omitempty"`
-			Keyword   string `json:"keyword,omitempty"`
-			Limit     int    `json:"limit"`
-			Offset    int    `json:"offset,omitempty"`
-		}{}
+		target = &ResearchWorkerSearchChatlogArgs{}
 	case ResearchWorkerToolExpandChatContext:
-		target = &struct {
-			MessageRef string `json:"message_ref"`
-			Before     int    `json:"before"`
-			After      int    `json:"after"`
-		}{}
+		target = &ResearchWorkerExpandChatContextArgs{}
 	case ResearchWorkerToolResolveChatIdentity:
-		target = &struct {
-			IdentityRef     string `json:"identity_ref"`
-			ConversationRef string `json:"conversation_ref,omitempty"`
-		}{}
+		target = &ResearchWorkerResolveChatIdentityArgs{}
 	case ResearchWorkerToolListIdentityConversations:
-		target = &struct {
-			IdentityRef string `json:"identity_ref"`
-			Limit       int    `json:"limit"`
-			Offset      int    `json:"offset,omitempty"`
-		}{}
+		target = &ResearchWorkerListIdentityConversationsArgs{}
 	case ResearchWorkerToolFetchChatMessage:
-		target = &struct {
-			MessageRef string `json:"message_ref"`
-		}{}
+		target = &ResearchWorkerFetchChatMessageArgs{}
 	default:
 		return nil, fmt.Errorf("unsupported research worker tool")
 	}
@@ -498,41 +512,34 @@ func normalizeResearchWorkerArguments(tool string, raw json.RawMessage) (json.Ra
 func validateResearchWorkerArguments(tool string, encoded json.RawMessage) error {
 	switch tool {
 	case ResearchWorkerToolSearchChatlog:
-		var args struct {
-			TimeFrom  string `json:"time_from"`
-			TimeTo    string `json:"time_to"`
-			TalkerRef string `json:"talker_ref"`
-			SenderRef string `json:"sender_ref"`
-			Keyword   string `json:"keyword"`
-			Limit     int    `json:"limit"`
-			Offset    int    `json:"offset"`
-		}
+		var args ResearchWorkerSearchChatlogArgs
 		if err := json.Unmarshal(encoded, &args); err != nil {
 			return err
 		}
 		if args.Limit <= 0 || args.Limit > researchWorkerQueryLimitMax || args.Offset < 0 {
 			return fmt.Errorf("search limit must be between 1 and %d and offset must be non-negative", researchWorkerQueryLimitMax)
 		}
+		if strings.TrimSpace(args.TalkerRef) == "" {
+			return fmt.Errorf("talker_ref is required")
+		}
+		if strings.TrimSpace(args.TimeFrom) == "" || strings.TrimSpace(args.TimeTo) == "" {
+			return fmt.Errorf("time_from and time_to are required")
+		}
 		if err := validateResearchWorkerTimeRange(args.TimeFrom, args.TimeTo); err != nil {
 			return err
 		}
 	case ResearchWorkerToolExpandChatContext:
-		var args struct {
-			MessageRef string `json:"message_ref"`
-			Before     int    `json:"before"`
-			After      int    `json:"after"`
-		}
+		var args ResearchWorkerExpandChatContextArgs
 		if err := json.Unmarshal(encoded, &args); err != nil {
 			return err
 		}
-		if strings.TrimSpace(args.MessageRef) == "" || args.Before < 0 || args.After < 0 ||
+		if strings.TrimSpace(args.MessageRef) == "" || strings.TrimSpace(args.ConversationRef) == "" ||
+			!validResearchWorkerChatlogDate(args.Time) || args.Before < 0 || args.After < 0 ||
 			args.Before > researchWorkerContextWindowMax || args.After > researchWorkerContextWindowMax {
 			return fmt.Errorf("context arguments are outside supported bounds")
 		}
 	case ResearchWorkerToolResolveChatIdentity:
-		var args struct {
-			IdentityRef string `json:"identity_ref"`
-		}
+		var args ResearchWorkerResolveChatIdentityArgs
 		if err := json.Unmarshal(encoded, &args); err != nil {
 			return err
 		}
@@ -540,11 +547,7 @@ func validateResearchWorkerArguments(tool string, encoded json.RawMessage) error
 			return fmt.Errorf("identity_ref is required")
 		}
 	case ResearchWorkerToolListIdentityConversations:
-		var args struct {
-			IdentityRef string `json:"identity_ref"`
-			Limit       int    `json:"limit"`
-			Offset      int    `json:"offset"`
-		}
+		var args ResearchWorkerListIdentityConversationsArgs
 		if err := json.Unmarshal(encoded, &args); err != nil {
 			return err
 		}
@@ -552,17 +555,20 @@ func validateResearchWorkerArguments(tool string, encoded json.RawMessage) error
 			return fmt.Errorf("identity conversation query is outside supported bounds")
 		}
 	case ResearchWorkerToolFetchChatMessage:
-		var args struct {
-			MessageRef string `json:"message_ref"`
-		}
+		var args ResearchWorkerFetchChatMessageArgs
 		if err := json.Unmarshal(encoded, &args); err != nil {
 			return err
 		}
-		if strings.TrimSpace(args.MessageRef) == "" {
-			return fmt.Errorf("message_ref is required")
+		if strings.TrimSpace(args.MessageRef) == "" || strings.TrimSpace(args.ConversationRef) == "" || !validResearchWorkerChatlogDate(args.Time) {
+			return fmt.Errorf("message_ref, conversation_ref, and time are required")
 		}
 	}
 	return nil
+}
+
+func validResearchWorkerChatlogDate(value string) bool {
+	parsed, err := time.Parse("2006-01-02", strings.TrimSpace(value))
+	return err == nil && parsed.Format("2006-01-02") == strings.TrimSpace(value)
 }
 
 func validateResearchWorkerTimeRange(fromValue, toValue string) error {

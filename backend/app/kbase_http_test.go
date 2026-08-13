@@ -2066,7 +2066,7 @@ func TestKBaseHTTPResearchWorkerAuthenticationAndValidation(t *testing.T) {
 	run := createResearchRunForTest(t, researchStore, "research-worker-http")
 	job, _, err := researchStore.CreateWorkerJob(ResearchWorkerJobInput{
 		RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage,
-		Arguments: []byte(`{"message_ref":"message-1"}`), MaxAttempts: 2,
+		Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), MaxAttempts: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
