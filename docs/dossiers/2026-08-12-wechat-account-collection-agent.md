@@ -2,9 +2,9 @@
 
 ## Status
 
-- **Current stage:** S5 — deployment pending
-- **Delivery status:** implementation and review passed; production rollout pending
-- **Last updated:** 2026-08-12
+- **Current stage:** S6 — production validation complete
+- **Delivery status:** deployed, backfilled, published, and validated with a real cited question
+- **Last updated:** 2026-08-13
 
 ## S0 Intake
 
@@ -139,6 +139,67 @@ runtime provenance, medical `evidence_only`, explicit confirmation, and the
 absence of credentials or downloaded article bodies in Git. No unresolved
 Critical, High, or Medium release blocker remains.
 
+## S5 Deployment
+
+Production revision `55fa434a48ad6ff5c89dcc1995d5d3709d46a950` was built from a
+hash-verified Git archive by the non-root service account. The remote gate ran
+Node 22, the Vue production build, all frontend and Web smoke scripts, module
+verification, `go vet ./...`, and `go test ./... -count=1 -timeout=30m`; the
+longest backend package completed in 96.174 seconds. The dependency lockfiles
+were unchanged.
+
+The direct, unsigned deployment created scoped KBase and evolution Worker
+backups, then atomically switched KBase, Web, the book-job Worker, and the
+three evolution Workers to the same revision. Public and loopback health
+returned the exact revision. All five systemd services were active with
+`ExecMainStatus=0`, `NRestarts=0`, and no warning-or-higher log entries after
+cutover.
+
+## S6 Production Validation
+
+Production collection and Agent identities:
+
+- collection: `wechat-sub_6b6780d1c47c9d37`;
+- immutable collection Release:
+  `collection-release-6ff3776c11f58bde85b7d8f9`;
+- published Agent: `wechat-sub_6b6780d1c47c9d37-agent@1.0.0`;
+- published membership: 219 articles, 733 citations, zero candidate
+  exclusions;
+- policy: `evidence_only`, citations required, insufficient evidence must not
+  be converted into an unsupported recommendation.
+
+The production Agent detail was cold-loaded after deployment. During secure
+session recovery it now renders a route-scoped “正在加载指定 Agent” state rather
+than flashing the empty evolution console. It then showed the correct Chinese
+title, one pinned collection Release, 219 member articles, 733 citations, and
+the collection workspace link.
+
+The following real question was submitted through the production browser UI:
+
+> 如果我同事出现新冠连续三天Ct值都在降低，应该怎么办？
+
+The runtime completed the answer and cited exactly two collection citations:
+
+- `source-918b51f7c86dce60-citation-3`;
+- `source-d20a73c6dc410108-citation-3`.
+
+Both citation IDs were independently checked against the pinned immutable
+collection Release. The answer stated that the collection did not contain a
+specific response guideline, explained the limited meaning of a falling Ct
+value, and directed the user toward symptom-aware assessment through compliant
+medical channels. This is a valid safety-preserving result, but it also exposes
+a content-quality limitation: the current account corpus supports cautious
+evidence retrieval, not a complete clinical action protocol. Medical answers
+must remain advisory and require authoritative clinical or public-health
+guidance for action.
+
+The collection covers every canonical article package currently present in
+the production catalog. It is not proof that upstream-hidden, deleted, or newly
+published articles were obtained. Future discovery remains dependent on a
+healthy authorized local source session; the current local WeChat source
+capability requires operator re-login before another upstream backfill can be
+claimed complete.
+
 ## Gate Ledger
 
 | Gate | Status | Evidence | Next action |
@@ -147,8 +208,8 @@ Critical, High, or Medium release blocker remains.
 | G2 Feasibility/risk | PASS WITH CONSTRAINTS | Existing Worker, cursor, article packages, Releases, and Agent runtime are reusable; immutable collection design approved | Implement with TDD |
 | G3 Tests | PASS | Full Go tests, focused race tests, vet, Vue build, all Web smokes, deployment smokes, system-map, privacy, and whitespace checks passed | Preserve exact revision evidence |
 | G4 Review | PASS | Exact account scope, 500-member bound, hash/citation integrity, browser Cookie+CSRF publication, medical `evidence_only`, and no-content/no-secret Git boundary reviewed | Deploy only from clean reviewed revision |
-| G5 Deploy health | PENDING | Production remains on the previous healthy revision | Deploy from clean reviewed branch with rollback point |
-| G6 Production validation | PENDING | Existing runtime inventory is not a published collection Agent | Backfill, publish, ask real questions, and verify citations |
+| G5 Deploy health | PASS | Revision `55fa434a48ad6ff5c89dcc1995d5d3709d46a950`; public/loopback health exact; KBase plus four Workers active with status 0, zero restarts, no warning logs; scoped rollback backups retained | Keep rollback batches until the observation window closes |
+| G6 Production validation | PASS WITH CONTENT LIMITATION | Published 219-member/733-citation Release and Agent 1.0.0; cold-load UI verified; real Ct-value question completed with two citations proven to belong to the pinned Release | Add authoritative medical-source coverage before expecting a complete clinical action protocol; re-login the local source Worker before claiming new upstream history |
 
 ## Runtime Data Boundary
 
