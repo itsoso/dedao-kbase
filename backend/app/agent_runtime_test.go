@@ -80,6 +80,26 @@ func TestAgentPackageCollectionRuntimeRejectsStaleMemberAndForgedCitation(t *tes
 	}
 }
 
+func TestAgentPackageCollectionRuntimeAcceptsLegacyStoredSourceHash(t *testing.T) {
+	store, pkg, _ := agentCollectionRuntimeFixture(t)
+	article, err := store.LoadPackage("book-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	article.Book.ContentHash = strings.Repeat("b", 64)
+	if err := store.SavePackage(*article); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := searchAgentPackageEvidence(store, pkg, "shared insight", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 {
+		t.Fatalf("results=%#v", response.Results)
+	}
+}
+
 func TestAgentPackageCollectionRuntimeChatAbstainsAndTracesMemberProvenance(t *testing.T) {
 	store, pkg, release := agentCollectionRuntimeFixture(t)
 	abstained, err := chatFinalizedAgentPackageWithClient(

@@ -485,7 +485,7 @@ func knowledgeCollectionMemberFromPackage(definition KnowledgeCollectionDefiniti
 		return exclusion("package_scope_mismatch", "knowledge package source metadata does not match the catalog record")
 	}
 	computedHash, err := BookKnowledgeContentHash(pkg)
-	if err != nil || pkg.Book.ContentHash == "" || pkg.Book.ContentHash != record.Version.ContentHash || computedHash != pkg.Book.ContentHash {
+	if err != nil || !knowledgeCollectionContentVersionMatches(pkg, record.Version.ContentHash, computedHash) {
 		return exclusion("content_hash_mismatch", "knowledge package content does not match the current catalog version")
 	}
 	chapterIDs := make(map[string]bool, len(pkg.Chapters))
@@ -517,10 +517,41 @@ func knowledgeCollectionMemberFromPackage(definition KnowledgeCollectionDefiniti
 		return exclusion("missing_citations", "knowledge package has no usable citations")
 	}
 	return &KnowledgeCollectionMember{
-		BookID: pkg.Book.BookID, ContentHash: pkg.Book.ContentHash, SourceID: record.Source.SourceID,
+		BookID: pkg.Book.BookID, ContentHash: computedHash, SourceID: record.Source.SourceID,
 		SourceItemKey: record.Source.SourceItemKey, PublishedAt: pkg.Book.PublishedAt,
 		CitationIDs: sortedUniqueStrings(citationIDs),
 	}, nil
+}
+
+func knowledgeCollectionContentVersionMatches(pkg BookKnowledgePackage, catalogHash, artifactHash string) bool {
+	storedHash := strings.TrimSpace(pkg.Book.ContentHash)
+	catalogHash = strings.TrimSpace(catalogHash)
+	artifactHash = strings.TrimSpace(artifactHash)
+	if storedHash == "" || catalogHash == "" || artifactHash == "" {
+		return false
+	}
+	if storedHash == artifactHash && catalogHash == artifactHash {
+		return true
+	}
+	// Source ingest v1 stored the normalized source-text digest (64 hex
+	// characters) in both the package and catalog. Collection releases pin the
+	// canonical artifact digest instead, so later chunk changes remain
+	// detectable without rewriting existing packages or invalidating receipts.
+	return storedHash == catalogHash && isLegacySourceArticleContentHash(pkg.Book.SourceType, storedHash)
+}
+
+func isLegacySourceArticleContentHash(sourceType, value string) bool {
+	switch strings.TrimSpace(sourceType) {
+	case "wechat_mp_article", "wcplus_wechat_article":
+	default:
+		return false
+	}
+	value = strings.TrimSpace(value)
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func evaluateKnowledgeCollectionCandidate(definition KnowledgeCollectionDefinition, candidate KnowledgeCollectionCandidate) KnowledgeCollectionQualityReport {

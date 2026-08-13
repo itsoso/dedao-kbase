@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,6 +74,38 @@ func TestBuildKnowledgeCollectionCandidateUsesCatalogAccountIdentity(t *testing.
 	reloaded, err := store.LoadKnowledgeCollectionCandidate("wechat-account-fixture")
 	if err != nil || !reflect.DeepEqual(candidate, reloaded) {
 		t.Fatalf("reloaded candidate = %#v err=%v", reloaded, err)
+	}
+}
+
+func TestBuildKnowledgeCollectionCandidateAcceptsLegacySourceContentHashAndPinsArtifactHash(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveCollectionFixture(t, store, "wechat-account-fixture", "account-a")
+	saveCollectionArticleFixture(t, store, "book-legacy", "article-legacy", "Fixture account")
+
+	pkg, err := store.LoadPackage("book-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacySourceHash := strings.Repeat("a", 64)
+	pkg.Book.ContentHash = legacySourceHash
+	if err := store.SavePackage(*pkg); err != nil {
+		t.Fatal(err)
+	}
+	recordCollectionArticleFixture(t, store, "account-a", "Fixture account", "book-legacy", "article-legacy")
+
+	candidate, err := store.BuildKnowledgeCollectionCandidate("wechat-account-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArtifactHash, err := BookKnowledgeContentHash(*pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if candidate.Status != KnowledgeCollectionCandidateReady || candidate.MemberCount != 1 {
+		t.Fatalf("candidate = %#v", candidate)
+	}
+	if candidate.Members[0].ContentHash != wantArtifactHash || candidate.Members[0].ContentHash == legacySourceHash {
+		t.Fatalf("member content hash = %q, want artifact hash %q", candidate.Members[0].ContentHash, wantArtifactHash)
 	}
 }
 

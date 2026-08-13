@@ -201,7 +201,9 @@ func loadPinnedAgentCollectionMember(store *BookKnowledgeStore, release Knowledg
 		return nil, fmt.Errorf("load pinned collection member %q: %w", member.BookID, err)
 	}
 	computedHash, err := BookKnowledgeContentHash(*article)
-	if err != nil || article.Book.ContentHash != member.ContentHash || computedHash != member.ContentHash {
+	storedHash := strings.TrimSpace(article.Book.ContentHash)
+	if err != nil || computedHash != member.ContentHash ||
+		(storedHash != member.ContentHash && !isLegacySourceArticleContentHash(article.Book.SourceType, storedHash)) {
 		return nil, fmt.Errorf("pinned collection member %q content hash changed", member.BookID)
 	}
 	if article.Book.SourceType != release.Definition.SourceType || article.Book.SourceKey != member.SourceItemKey {
