@@ -1,0 +1,63 @@
+{
+  "identities": [
+    {
+      "identity_id": "person-alpha",
+      "display_name": "Shared Display",
+      "aliases": ["Alias Alpha", "Alias One"],
+      "account_id": "account-alpha",
+      "target_account_id": "account-alpha",
+      "confirmed_binding": true
+    },
+    {
+      "identity_id": "person-beta",
+      "display_name": "Shared Display",
+      "aliases": ["Alias Beta"],
+      "account_id": "",
+      "target_account_id": "account-alpha"
+    }
+  ],
+  "measurements": [24, 25, 18],
+  "claims": [
+    {
+      "claim_id": "advice-direct",
+      "kind": "direct_recommendation",
+      "topic": "synthetic-intervention",
+      "value": "option-a",
+      "timing": "morning",
+      "amount": "one-unit",
+      "evidence_ids": ["evidence-direct"]
+    },
+    {
+      "claim_id": "discussion-general",
+      "kind": "general_discussion",
+      "topic": "synthetic-intervention",
+      "value": "option-b",
+      "timing": "evening",
+      "amount": "two-units",
+      "evidence_ids": ["evidence-general"]
+    },
+    {
+      "claim_id": "advice-conflict",
+      "kind": "direct_recommendation",
+      "topic": "synthetic-intervention",
+      "value": "option-a",
+      "timing": "evening",
+      "amount": "two-units",
+      "evidence_ids": ["evidence-conflict"]
+    }
+  ],
+  "historical_case": {
+    "case_id": "case-historical",
+    "age": 51,
+    "stage_day": 9,
+    "symptoms": ["symptom-a"],
+    "recovery_status": "not_found"
+  },
+  "current_case": {
+    "case_id": "case-current",
+    "age": 29,
+    "stage_day": 3,
+    "symptoms": ["symptom-b", "symptom-c"],
+    "recovery_status": "unknown"
+  }
+}
