@@ -1204,6 +1204,106 @@ func TestEvidenceAuditServerLimitsUseBoundedEnvironmentValues(t *testing.T) {
 	}
 }
 
+func TestResearchServerConfigurationUsesStrictBoundedEnvironment(t *testing.T) {
+	t.Setenv("KBASE_RESEARCH_ENABLED", "true")
+	t.Setenv("KBASE_RESEARCH_WORKERS", "4")
+	t.Setenv("KBASE_RESEARCH_QUEUE_SIZE", "128")
+	t.Setenv("KBASE_RESEARCH_POLL_MILLISECONDS", "750")
+	t.Setenv("KBASE_RESEARCH_LEASE_SECONDS", "45")
+	t.Setenv("KBASE_RESEARCH_SHUTDOWN_SECONDS", "20")
+	t.Setenv("KBASE_RESEARCH_PLANNER_MODEL", "qwen-max")
+	t.Setenv("KBASE_RESEARCH_EXTRACTOR_MODEL", "qwen-plus")
+	t.Setenv("KBASE_RESEARCH_SYNTHESIZER_MODEL", "glm-5")
+	t.Setenv("KBASE_RESEARCH_VERIFIER_MODEL", "qwen-max")
+	t.Setenv("KBASE_RESEARCH_QUICK_MAX_ITERATIONS", "3")
+	t.Setenv("KBASE_RESEARCH_QUICK_MAX_EVIDENCE", "50")
+	t.Setenv("KBASE_RESEARCH_QUICK_MAX_QUOTED_CHARS", "12000")
+	t.Setenv("KBASE_RESEARCH_QUICK_MAX_MODEL_CALLS", "5")
+	t.Setenv("KBASE_RESEARCH_QUICK_MAX_COST_USD", "2.5")
+	t.Setenv("KBASE_RESEARCH_DEEP_MAX_ITERATIONS", "10")
+	t.Setenv("KBASE_RESEARCH_DEEP_MAX_EVIDENCE", "400")
+	t.Setenv("KBASE_RESEARCH_DEEP_MAX_QUOTED_CHARS", "100000")
+	t.Setenv("KBASE_RESEARCH_DEEP_MAX_MODEL_CALLS", "30")
+	t.Setenv("KBASE_RESEARCH_DEEP_MAX_COST_USD", "20")
+
+	config, err := researchServerConfigFromEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.Enabled || config.Workers != 4 || config.QueueSize != 128 ||
+		config.PollInterval != 750*time.Millisecond || config.LeaseDuration != 45*time.Second ||
+		config.ShutdownTimeout != 20*time.Second {
+		t.Fatalf("research runtime config = %+v", config)
+	}
+	if config.RoleModels[app.ResearchRolePlanner] != "qwen-max" ||
+		config.RoleModels[app.ResearchRoleExtractor] != "qwen-plus" ||
+		config.RoleModels[app.ResearchRoleSynthesizer] != "glm-5" ||
+		config.RoleModels[app.ResearchRoleVerifier] != "qwen-max" {
+		t.Fatalf("research role models = %#v", config.RoleModels)
+	}
+	if config.QuickBudget.MaxIterations != 3 || config.QuickBudget.MaxCostUSD != 2.5 ||
+		config.DeepBudget.MaxEvidenceItems != 400 || config.DeepBudget.MaxCostUSD != 20 {
+		t.Fatalf("research budgets = quick=%+v deep=%+v", config.QuickBudget, config.DeepBudget)
+	}
+
+	for _, test := range []struct{ key, value string }{
+		{key: "KBASE_RESEARCH_ENABLED", value: "maybe"},
+		{key: "KBASE_RESEARCH_WORKERS", value: "33"},
+		{key: "KBASE_RESEARCH_QUEUE_SIZE", value: "0"},
+		{key: "KBASE_RESEARCH_POLL_MILLISECONDS", value: "99"},
+		{key: "KBASE_RESEARCH_LEASE_SECONDS", value: "3601"},
+		{key: "KBASE_RESEARCH_QUICK_MAX_COST_USD", value: "private"},
+		{key: "KBASE_RESEARCH_QUICK_MAX_COST_USD", value: "NaN"},
+		{key: "KBASE_RESEARCH_DEEP_MAX_ITERATIONS", value: "21"},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			t.Setenv(test.key, test.value)
+			_, err := researchServerConfigFromEnvironment()
+			if err == nil || (test.value == "private" && strings.Contains(err.Error(), test.value)) {
+				t.Fatalf("invalid environment error = %v", err)
+			}
+		})
+	}
+}
+
+func TestResearchServerRuntimeStartsRecoversAndShutsDown(t *testing.T) {
+	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-research-key")
+	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://provider.invalid/v1")
+	config := defaultResearchServerConfig()
+	config.Enabled = true
+	config.Workers = 1
+	config.QueueSize = 4
+	config.PollInterval = 10 * time.Millisecond
+	root := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	runtime, err := newResearchServerRuntime(ctx, root, app.NewBookKnowledgeStore(root), config)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if runtime.Store == nil || runtime.Coordinator == nil {
+		cancel()
+		t.Fatalf("research runtime = %+v", runtime)
+	}
+	cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	if err := runtime.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fileRoot := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newResearchServerRuntime(context.Background(), fileRoot, app.NewBookKnowledgeStore(fileRoot), config); err == nil {
+		t.Fatal("research runtime accepted an invalid store root")
+	}
+}
+
 func TestKBaseHTTPServerUsesSafeTimeoutDefaults(t *testing.T) {
 	for _, key := range []string{
 		"KBASE_HTTP_READ_HEADER_TIMEOUT_SECONDS",

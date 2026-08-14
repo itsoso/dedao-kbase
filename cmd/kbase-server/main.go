@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -36,6 +37,7 @@ type kBaseServerConfig struct {
 	SourceAgentToken        string
 	SourceAgentArtifactRoot string
 	EvolutionEnabled        bool
+	Research                researchServerConfig
 	Session                 sessionServerConfig
 	RetrySigningKey         []byte
 	RetrySigningErr         error
@@ -101,6 +103,10 @@ func runCommandWithServerRunner(
 		}
 		*evolutionEnabled = enabled
 	}
+	researchConfig, err := researchServerConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
 
 	sessionConfig := defaultSessionServerConfig()
 	sessionConfig.ListenAddr = *addr
@@ -116,6 +122,7 @@ func runCommandWithServerRunner(
 		SourceAgentToken:        *sourceAgentToken,
 		SourceAgentArtifactRoot: defaultSourceAgentArtifactRoot(),
 		EvolutionEnabled:        *evolutionEnabled,
+		Research:                researchConfig,
 		Session:                 sessionConfig,
 		RetrySigningKey:         retrySigningKey,
 		RetrySigningErr:         retrySigningErr,
@@ -189,6 +196,12 @@ func preflightKBaseServer(config kBaseServerConfig) (kBaseServerConfig, *http.Se
 			return kBaseServerConfig{}, nil, errors.New("invalid source agent artifact catalog configuration")
 		}
 	}
+	if config.Research.Enabled {
+		modelConfig, err := app.LoadBookTokenPlanConfig()
+		if err != nil || strings.TrimSpace(modelConfig.APIKey) == "" {
+			return kBaseServerConfig{}, nil, errors.New("research requires DEDAO_TOKENPLAN_API_KEY")
+		}
+	}
 	server, err := newKBaseHTTPServer(config.Addr, nil)
 	if err != nil {
 		return kBaseServerConfig{}, nil, fmt.Errorf("invalid HTTP server configuration: %w", err)
@@ -252,6 +265,22 @@ func serveKBaseServer(
 	}()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	researchRuntime, err := newResearchServerRuntime(ctx, config.Root, bookStore, config.Research)
+	if err != nil {
+		return fmt.Errorf("initialize research runtime: %w", err)
+	}
+	if researchRuntime.Store != nil {
+		defer func() {
+			shutdownContext, cancel := context.WithTimeout(context.Background(), config.Research.ShutdownTimeout)
+			defer cancel()
+			if err := researchRuntime.Shutdown(shutdownContext); err != nil {
+				log.Printf("research coordinator shutdown failed: %v", err)
+			}
+			if err := researchRuntime.Close(); err != nil {
+				log.Printf("close research store: %v", err)
+			}
+		}()
+	}
 	auditRuntime := newEvidenceAuditServerRuntime(ctx, bookStore)
 	if auditRuntime.Coordinator != nil {
 		defer func() {
@@ -291,6 +320,9 @@ func serveKBaseServer(
 		WCPlus:                 app.NewWCPlusSourceService(app.WCPlusSourceConfigFromEnv()),
 		SourceSync:             sourceSync,
 		SourceAgentToken:       config.SourceAgentToken,
+		ResearchStore:          researchRuntime.Store,
+		ResearchQuickBudget:    config.Research.QuickBudget,
+		ResearchDeepBudget:     config.Research.DeepBudget,
 		SourceArtifacts:        sourceArtifacts,
 		ReverificationCooldown: knowledgeReverificationCooldown(),
 		AuditCoordinator:       auditRuntime.Coordinator,
@@ -333,6 +365,11 @@ func serveKBaseServer(
 		log.Printf("Agent evolution control plane disabled")
 	} else {
 		log.Printf("Agent evolution control plane enabled")
+	}
+	if researchRuntime.Store == nil {
+		log.Printf("research runtime disabled")
+	} else {
+		log.Printf("research runtime enabled: workers=%d queue=%d", config.Research.Workers, config.Research.QueueSize)
 	}
 	if strings.TrimSpace(os.Getenv("WECHAT_MP_TOKEN")) == "" || strings.TrimSpace(os.Getenv("WECHAT_MP_COOKIE")) == "" {
 		log.Printf("wechat source: official account search/list disabled until WECHAT_MP_TOKEN and WECHAT_MP_COOKIE are configured")
@@ -417,6 +454,218 @@ func serveHTTPServer(
 type evidenceAuditServerRuntime struct {
 	Coordinator       *app.EvidenceAuditCoordinator
 	UnavailableReason string
+}
+
+type researchServerConfig struct {
+	Enabled         bool
+	Workers         int
+	QueueSize       int
+	PollInterval    time.Duration
+	LeaseDuration   time.Duration
+	ShutdownTimeout time.Duration
+	RoleModels      map[app.ResearchModelRole]string
+	QuickBudget     app.ResearchBudget
+	DeepBudget      app.ResearchBudget
+}
+
+type researchServerRuntime struct {
+	Store       *app.ResearchStore
+	Coordinator *app.ResearchCoordinator
+}
+
+func (runtime researchServerRuntime) Shutdown(ctx context.Context) error {
+	if runtime.Coordinator == nil {
+		return nil
+	}
+	return runtime.Coordinator.Shutdown(ctx)
+}
+
+func (runtime researchServerRuntime) Close() error {
+	if runtime.Store == nil {
+		return nil
+	}
+	return runtime.Store.Close()
+}
+
+type researchRoleStageModel struct {
+	inner  app.ResearchStageModel
+	models map[app.ResearchModelRole]string
+}
+
+func (model researchRoleStageModel) Run(
+	ctx context.Context,
+	role app.ResearchModelRole,
+	config app.BookTokenPlanConfig,
+	messages []app.BookKnowledgeMessage,
+	output any,
+) (app.ResearchModelUsage, error) {
+	if roleModel := strings.TrimSpace(model.models[role]); roleModel != "" {
+		config.Model = roleModel
+	}
+	return model.inner.Run(ctx, role, config, messages, output)
+}
+
+func defaultResearchServerConfig() researchServerConfig {
+	return researchServerConfig{
+		Workers: 2, QueueSize: 64, PollInterval: time.Second, LeaseDuration: 30 * time.Second,
+		ShutdownTimeout: 10 * time.Second,
+		RoleModels: map[app.ResearchModelRole]string{
+			app.ResearchRolePlanner:     "qwen3.8-max-preview",
+			app.ResearchRoleExtractor:   "qwen3.7-plus",
+			app.ResearchRoleSynthesizer: "qwen3.8-max-preview",
+			app.ResearchRoleVerifier:    "qwen3.8-max-preview",
+		},
+		QuickBudget: app.ResearchBudget{
+			MaxIterations: 2, MaxEvidenceItems: 40, MaxQuotedChars: 12000, MaxModelCalls: 4, MaxCostUSD: 1,
+		},
+		DeepBudget: app.ResearchBudget{
+			MaxIterations: 8, MaxEvidenceItems: 300, MaxQuotedChars: 80000, MaxModelCalls: 24, MaxCostUSD: 10,
+		},
+	}
+}
+
+func researchServerConfigFromEnvironment() (researchServerConfig, error) {
+	config := defaultResearchServerConfig()
+	var err error
+	config.Enabled, err = strictBooleanEnvironment("KBASE_RESEARCH_ENABLED", false)
+	if err != nil {
+		return researchServerConfig{}, err
+	}
+	if config.Workers, err = strictIntegerEnvironment("KBASE_RESEARCH_WORKERS", config.Workers, 1, 32); err != nil {
+		return researchServerConfig{}, err
+	}
+	if config.QueueSize, err = strictIntegerEnvironment("KBASE_RESEARCH_QUEUE_SIZE", config.QueueSize, 1, 4096); err != nil {
+		return researchServerConfig{}, err
+	}
+	pollMilliseconds, err := strictIntegerEnvironment("KBASE_RESEARCH_POLL_MILLISECONDS", int(config.PollInterval/time.Millisecond), 100, 60000)
+	if err != nil {
+		return researchServerConfig{}, err
+	}
+	config.PollInterval = time.Duration(pollMilliseconds) * time.Millisecond
+	leaseSeconds, err := strictIntegerEnvironment("KBASE_RESEARCH_LEASE_SECONDS", int(config.LeaseDuration/time.Second), 5, 3600)
+	if err != nil {
+		return researchServerConfig{}, err
+	}
+	config.LeaseDuration = time.Duration(leaseSeconds) * time.Second
+	shutdownSeconds, err := strictIntegerEnvironment("KBASE_RESEARCH_SHUTDOWN_SECONDS", int(config.ShutdownTimeout/time.Second), 1, 60)
+	if err != nil {
+		return researchServerConfig{}, err
+	}
+	config.ShutdownTimeout = time.Duration(shutdownSeconds) * time.Second
+	for role, key := range map[app.ResearchModelRole]string{
+		app.ResearchRolePlanner:     "KBASE_RESEARCH_PLANNER_MODEL",
+		app.ResearchRoleExtractor:   "KBASE_RESEARCH_EXTRACTOR_MODEL",
+		app.ResearchRoleSynthesizer: "KBASE_RESEARCH_SYNTHESIZER_MODEL",
+		app.ResearchRoleVerifier:    "KBASE_RESEARCH_VERIFIER_MODEL",
+	} {
+		value := strings.TrimSpace(os.Getenv(key))
+		if value == "" {
+			continue
+		}
+		if len(value) > 128 || strings.ContainsAny(value, "\r\n\x00") {
+			return researchServerConfig{}, fmt.Errorf("%s must be a bounded model identifier", key)
+		}
+		config.RoleModels[role] = value
+	}
+	if err := loadResearchBudgetEnvironment("KBASE_RESEARCH_QUICK", &config.QuickBudget); err != nil {
+		return researchServerConfig{}, err
+	}
+	if err := loadResearchBudgetEnvironment("KBASE_RESEARCH_DEEP", &config.DeepBudget); err != nil {
+		return researchServerConfig{}, err
+	}
+	return config, nil
+}
+
+func loadResearchBudgetEnvironment(prefix string, budget *app.ResearchBudget) error {
+	var err error
+	if budget.MaxIterations, err = strictIntegerEnvironment(prefix+"_MAX_ITERATIONS", budget.MaxIterations, 1, 20); err != nil {
+		return err
+	}
+	if budget.MaxEvidenceItems, err = strictIntegerEnvironment(prefix+"_MAX_EVIDENCE", budget.MaxEvidenceItems, 1, 1000); err != nil {
+		return err
+	}
+	if budget.MaxQuotedChars, err = strictIntegerEnvironment(prefix+"_MAX_QUOTED_CHARS", budget.MaxQuotedChars, 1, 200000); err != nil {
+		return err
+	}
+	if budget.MaxModelCalls, err = strictIntegerEnvironment(prefix+"_MAX_MODEL_CALLS", budget.MaxModelCalls, 1, 100); err != nil {
+		return err
+	}
+	budget.MaxCostUSD, err = strictFloatEnvironment(prefix+"_MAX_COST_USD", budget.MaxCostUSD, 0.01, 100)
+	return err
+}
+
+func strictBooleanEnvironment(key string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean", key)
+	}
+}
+
+func strictFloatEnvironment(key string, fallback, minimum, maximum float64) (float64, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < minimum || value > maximum {
+		return 0, fmt.Errorf("%s must be a number between %.2f and %.2f", key, minimum, maximum)
+	}
+	return value, nil
+}
+
+func newResearchServerRuntime(
+	ctx context.Context,
+	root string,
+	knowledge *app.BookKnowledgeStore,
+	config researchServerConfig,
+) (researchServerRuntime, error) {
+	if !config.Enabled {
+		return researchServerRuntime{}, nil
+	}
+	store, err := app.OpenResearchStore(root, time.Now)
+	if err != nil {
+		return researchServerRuntime{}, err
+	}
+	fail := func(err error) (researchServerRuntime, error) {
+		_ = store.Close()
+		return researchServerRuntime{}, err
+	}
+	tools, err := app.NewResearchToolRegistry(knowledge, store)
+	if err != nil {
+		return fail(err)
+	}
+	modelConfig, err := app.LoadBookTokenPlanConfig()
+	if err != nil || strings.TrimSpace(modelConfig.APIKey) == "" {
+		return fail(errors.New("research requires DEDAO_TOKENPLAN_API_KEY"))
+	}
+	baseModel := app.NewResearchStageModel(app.NewTokenPlanChatClient(nil))
+	orchestrator, err := app.NewResearchOrchestrator(app.ResearchOrchestratorConfig{
+		KnowledgeStore: knowledge, ResearchStore: store, Tools: tools,
+		Model: researchRoleStageModel{inner: baseModel, models: config.RoleModels}, ModelConfig: modelConfig,
+		WorkerAgentID: "chatlog-agent",
+	})
+	if err != nil {
+		return fail(err)
+	}
+	coordinator, err := app.NewResearchCoordinator(app.ResearchCoordinatorConfig{
+		Store: store, Orchestrator: orchestrator, Workers: config.Workers, QueueSize: config.QueueSize,
+		PollInterval: config.PollInterval, LeaseDuration: config.LeaseDuration,
+	})
+	if err != nil {
+		return fail(err)
+	}
+	if err := coordinator.Start(ctx); err != nil {
+		return fail(err)
+	}
+	return researchServerRuntime{Store: store, Coordinator: coordinator}, nil
 }
 
 func newProofroomDeliveryRuntime() (*app.ProofroomDeliveryService, string) {

@@ -2133,6 +2133,184 @@ func TestKBaseHTTPResearchWorkerAuthenticationAndValidation(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing.T) {
+	root := t.TempDir()
+	researchStore, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = researchStore.Close() })
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", ResearchStore: researchStore,
+		ResearchQuickBudget: ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1},
+		ResearchDeepBudget:  ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 40000, MaxModelCalls: 12, MaxCostUSD: 8},
+	})
+
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(
+		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
+	))
+	createRequest.Header.Set("Content-Type", "application/json")
+	createRequest.Header.Set("Authorization", "Bearer admin-secret")
+	createRequest.Header.Set("Idempotency-Key", "research-http-one")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, createRequest)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		Created bool `json:"created"`
+		Run     struct {
+			RunID  string `json:"run_id"`
+			Mode   string `json:"mode"`
+			Status string `json:"status"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Created || payload.Run.RunID == "" || payload.Run.Mode != ResearchModeDeep || payload.Run.Status != string(ResearchPlanning) {
+		t.Fatalf("create payload=%#v", payload)
+	}
+	for _, private := range []string{"subject-private", `"subject_ids"`, `"lease_owner"`, `"summary"`, `"actor"`} {
+		if strings.Contains(created.Body.String(), private) {
+			t.Fatalf("create response exposed %q: %s", private, created.Body.String())
+		}
+	}
+
+	replayRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(
+		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
+	))
+	replayRequest.Header.Set("Content-Type", "application/json")
+	replayRequest.Header.Set("Authorization", "Bearer admin-secret")
+	replayRequest.Header.Set("Idempotency-Key", "research-http-one")
+	replayed := httptest.NewRecorder()
+	handler.ServeHTTP(replayed, replayRequest)
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) {
+		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+
+	detail := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID), "admin-secret")
+	if detail.Code != http.StatusAccepted || !strings.Contains(detail.Body.String(), `"run_id":"`+payload.Run.RunID+`"`) {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	events := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID)+"/events?after=0", "admin-secret")
+	if events.Code != http.StatusOK || !strings.Contains(events.Body.String(), `"code":"run_created"`) || strings.Contains(events.Body.String(), `"actor"`) || strings.Contains(events.Body.String(), `"summary"`) {
+		t.Fatalf("events status=%d body=%s", events.Code, events.Body.String())
+	}
+
+	if _, err := researchStore.db.Exec(`INSERT INTO research_identity_bindings
+		(binding_id, run_id, identity_id, source_type, source_identity_hash, confidence, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, "binding-one", payload.Run.RunID, "person-one", "chatlog", "private-hash", 0.7, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	confirmed := requestJSONKBase(handler, http.MethodPost,
+		"/api/research/runs/"+url.PathEscape(payload.Run.RunID)+"/identity-bindings/binding-one/confirm",
+		"admin-secret", `{}`)
+	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"confirmed":true`) || strings.Contains(confirmed.Body.String(), "private-hash") {
+		t.Fatalf("confirm status=%d body=%s", confirmed.Code, confirmed.Body.String())
+	}
+	canceled := requestJSONKBase(handler, http.MethodPost, "/api/research/runs/"+url.PathEscape(payload.Run.RunID)+"/cancel", "admin-secret", `{}`)
+	if canceled.Code != http.StatusAccepted || !strings.Contains(canceled.Body.String(), `"status":"canceled"`) {
+		t.Fatalf("cancel status=%d body=%s", canceled.Code, canceled.Body.String())
+	}
+	terminal := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID), "admin-secret")
+	if terminal.Code != http.StatusOK {
+		t.Fatalf("terminal detail status=%d body=%s", terminal.Code, terminal.Body.String())
+	}
+}
+
+func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
+	clock := &browserSessionTestClock{now: time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)}
+	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 903)
+	root := t.TempDir()
+	researchStore, err := OpenResearchStore(root, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = researchStore.Close() })
+	concrete := handler.(*kbaseHTTPHandler)
+	concrete.researchStore = researchStore
+	if err := migrateResearchHTTP(researchStore.db); err != nil {
+		t.Fatal(err)
+	}
+	concrete.researchQuickBudget = ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1}
+	concrete.researchDeepBudget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 40000, MaxModelCalls: 12, MaxCostUSD: 8}
+	first := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Research Browser One")
+	second := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Research Browser Two")
+	csrf, _ := loadKBaseBrowserSessionCSRF(t, handler, first.Token)
+	body := `{"mode":"quick","question":"只检索当前知识库"}`
+
+	missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", first.Token, body)
+	missingCSRF.Header.Set("Idempotency-Key", "cookie-run")
+	missingResponse := httptest.NewRecorder()
+	handler.ServeHTTP(missingResponse, missingCSRF)
+	if missingResponse.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF status=%d body=%s", missingResponse.Code, missingResponse.Body.String())
+	}
+
+	create := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", first.Token, body)
+	create.Header.Set("Idempotency-Key", "cookie-run")
+	addKBaseBrowserSessionSecurityHeaders(create, csrf)
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("cookie create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		Run struct {
+			RunID string `json:"run_id"`
+		} `json:"run"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	foreign := requestKBaseWithBrowserCookie(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID), second.Token, "")
+	if foreign.Code != http.StatusNotFound || foreign.Body.String() != "{\"error\":\"research_run_not_found\"}\n" {
+		t.Fatalf("foreign detail status=%d body=%s", foreign.Code, foreign.Body.String())
+	}
+}
+
+func TestKBaseHTTPResearchRunValidationAndMethods(t *testing.T) {
+	root := t.TempDir()
+	researchStore, err := OpenResearchStore(root, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = researchStore.Close() })
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", ResearchStore: researchStore})
+	for _, test := range []struct {
+		name, method, path, body, key string
+		want                          int
+	}{
+		{name: "missing idempotency", method: http.MethodPost, path: "/api/research/runs", body: `{"question":"one"}`, want: http.StatusBadRequest},
+		{name: "unknown field", method: http.MethodPost, path: "/api/research/runs", body: `{"question":"one","private":"secret"}`, key: "unknown", want: http.StatusBadRequest},
+		{name: "oversized", method: http.MethodPost, path: "/api/research/runs", body: `{"question":"` + strings.Repeat("x", int(defaultResearchRunHTTPMaxBodyBytes)) + `"}`, key: "large", want: http.StatusRequestEntityTooLarge},
+		{name: "collection method", method: http.MethodDelete, path: "/api/research/runs", want: http.StatusMethodNotAllowed},
+		{name: "bad cursor", method: http.MethodGet, path: "/api/research/runs/missing/events?after=private", want: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			req.Header.Set("Authorization", "Bearer admin-secret")
+			if test.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			if test.key != "" {
+				req.Header.Set("Idempotency-Key", test.key)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != test.want {
+				t.Fatalf("status=%d body=%s want=%d", response.Code, response.Body.String(), test.want)
+			}
+			for _, private := range []string{"secret", "private", researchStore.dbPath} {
+				if strings.Contains(response.Body.String(), private) {
+					t.Fatalf("error leaked %q: %s", private, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestKBaseHTTPHandlerSourceAgentControl(t *testing.T) {
 	handler, sourceSync, _, _ := newKBaseSourceAgentCommandHTTPFixture(t)
 

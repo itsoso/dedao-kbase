@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -46,6 +47,8 @@ type KBaseHTTPConfig struct {
 	SourceAgentToken        string
 	SourceAgentMaxBodyBytes int64
 	ResearchStore           *ResearchStore
+	ResearchQuickBudget     ResearchBudget
+	ResearchDeepBudget      ResearchBudget
 	SourceArtifacts         *SourceAgentArtifactCatalog
 	SourceAssets            *SourceAssetStore
 	AnalysisGenerator       BookAnalysisGenerator
@@ -122,6 +125,9 @@ type kbaseHTTPHandler struct {
 	sourceAgentToken        string
 	sourceAgentMaxBodyBytes int64
 	researchStore           *ResearchStore
+	researchQuickBudget     ResearchBudget
+	researchDeepBudget      ResearchBudget
+	researchHTTPInitErr     error
 	sourceArtifacts         *SourceAgentArtifactCatalog
 	sourceAssets            *SourceAssetStore
 	analysisGenerator       BookAnalysisGenerator
@@ -146,6 +152,7 @@ type kbaseHTTPHandler struct {
 const defaultSourceAgentMaxBodyBytes int64 = 8 << 20
 const defaultSourceAgentCommandHTTPMaxBodyBytes int64 = 64 << 10
 const defaultResearchWorkerHTTPMaxBodyBytes int64 = 128 << 10
+const defaultResearchRunHTTPMaxBodyBytes int64 = 64 << 10
 const defaultEvidenceAuditMaxBodyBytes int64 = 64 << 10
 const defaultAgentCompilationMaxBodyBytes int64 = 64 << 10
 const defaultDedaoEbookVerificationTimeout = 15 * time.Second
@@ -241,6 +248,18 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	if dedaoEbookVerifyTimeout <= 0 {
 		dedaoEbookVerifyTimeout = defaultDedaoEbookVerificationTimeout
 	}
+	researchQuickBudget := cfg.ResearchQuickBudget
+	if !validResearchHTTPBudget(researchQuickBudget) {
+		researchQuickBudget = ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 40, MaxQuotedChars: 12000, MaxModelCalls: 4, MaxCostUSD: 1}
+	}
+	researchDeepBudget := cfg.ResearchDeepBudget
+	if !validResearchHTTPBudget(researchDeepBudget) {
+		researchDeepBudget = ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 300, MaxQuotedChars: 80000, MaxModelCalls: 24, MaxCostUSD: 10}
+	}
+	var researchHTTPInitErr error
+	if cfg.ResearchStore != nil {
+		researchHTTPInitErr = migrateResearchHTTP(cfg.ResearchStore.db)
+	}
 	return &kbaseHTTPHandler{
 		store:                   store,
 		evolutionStore:          cfg.EvolutionStore,
@@ -259,6 +278,9 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 		sourceAgentToken:        sourceAgentToken,
 		sourceAgentMaxBodyBytes: maxBodyBytes,
 		researchStore:           cfg.ResearchStore,
+		researchQuickBudget:     researchQuickBudget,
+		researchDeepBudget:      researchDeepBudget,
+		researchHTTPInitErr:     researchHTTPInitErr,
 		sourceArtifacts:         cfg.SourceArtifacts,
 		sourceAssets:            assets,
 		analysisGenerator:       analysisGenerator,
@@ -396,6 +418,10 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	r = requestWithKBaseAuth(r, auth)
+	if r.URL.Path == "/api/research/runs" || strings.HasPrefix(r.URL.Path, "/api/research/runs/") {
+		h.handleResearchRuns(w, r)
+		return
+	}
 	if isEvolutionAPIPath(r.URL.Path) {
 		h.handleEvolutionReadAPI(w, r)
 		return
@@ -3103,7 +3129,7 @@ func (h *kbaseHTTPHandler) applyCORS(w http.ResponseWriter, r *http.Request) boo
 	w.Header().Add("Vary", "Origin")
 	w.Header().Set("Access-Control-Allow-Origin", origin)
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept")
+	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, Idempotency-Key, X-KBase-CSRF")
 	w.Header().Set("Access-Control-Max-Age", "600")
 	return true
 }
@@ -4131,6 +4157,386 @@ func (h *kbaseHTTPHandler) handleSourceAgent(w http.ResponseWriter, r *http.Requ
 		}
 		h.handleSourceAgentRun(w, r)
 	}
+}
+
+type researchRunHTTPFailure struct {
+	Code      string `json:"code"`
+	Retryable bool   `json:"retryable"`
+}
+
+type researchRunHTTPView struct {
+	SchemaVersion    string                  `json:"schema_version"`
+	RunID            string                  `json:"run_id"`
+	Mode             string                  `json:"mode"`
+	Question         string                  `json:"question"`
+	Status           ResearchRunStatus       `json:"status"`
+	PackageID        string                  `json:"package_id,omitempty"`
+	PackageVersion   string                  `json:"package_version,omitempty"`
+	RequestedSources []string                `json:"requested_sources"`
+	RouteReasons     []string                `json:"route_reasons,omitempty"`
+	ActualScope      ResearchScope           `json:"actual_scope"`
+	Budget           ResearchBudget          `json:"budget"`
+	WaitReason       string                  `json:"wait_reason,omitempty"`
+	Failure          *researchRunHTTPFailure `json:"failure,omitempty"`
+	Version          int64                   `json:"version"`
+	CreatedAt        string                  `json:"created_at"`
+	UpdatedAt        string                  `json:"updated_at"`
+}
+
+type researchEventHTTPView struct {
+	Sequence   int64             `json:"sequence"`
+	RunID      string            `json:"run_id"`
+	FromStatus ResearchRunStatus `json:"from_status,omitempty"`
+	ToStatus   ResearchRunStatus `json:"to_status"`
+	Code       string            `json:"code"`
+	CreatedAt  string            `json:"created_at"`
+}
+
+func validResearchHTTPBudget(budget ResearchBudget) bool {
+	return budget.MaxIterations > 0 && budget.MaxIterations <= researchBudgetMaxIterations &&
+		budget.MaxEvidenceItems > 0 && budget.MaxEvidenceItems <= researchBudgetMaxEvidence &&
+		budget.MaxQuotedChars > 0 && budget.MaxQuotedChars <= researchBudgetMaxQuotedChars &&
+		budget.MaxModelCalls > 0 && budget.MaxModelCalls <= researchBudgetMaxModelCalls &&
+		budget.MaxCostUSD > 0 && budget.MaxCostUSD <= researchBudgetMaxCostUSD
+}
+
+func migrateResearchHTTP(db *sql.DB) error {
+	if db == nil {
+		return errors.New("research store is unavailable")
+	}
+	for _, statement := range []string{
+		`CREATE TABLE IF NOT EXISTS research_http_owners (
+			run_id TEXT PRIMARY KEY REFERENCES research_runs(run_id) ON DELETE CASCADE,
+			owner_hash TEXT NOT NULL,
+			created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_http_owners_owner ON research_http_owners(owner_hash, run_id)`,
+		`CREATE TABLE IF NOT EXISTS research_identity_confirmations (
+			binding_id TEXT PRIMARY KEY REFERENCES research_identity_bindings(binding_id) ON DELETE CASCADE,
+			run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
+			confirmed_at TEXT NOT NULL
+		)`,
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *kbaseHTTPHandler) handleResearchRuns(w http.ResponseWriter, r *http.Request) {
+	if h.researchStore == nil || h.researchHTTPInitErr != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	auth, ok := kbaseRequestAuthFromContext(r.Context())
+	if !ok {
+		writeHTTPError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	ownerHash := researchHTTPOwnerHash(auth)
+	if r.URL.Path == "/api/research/runs" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		h.handleResearchRunCreate(w, r, ownerHash)
+		return
+	}
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/research/runs/"), "/")
+	if len(parts) == 0 || !validResearchHTTPID(parts[0]) {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_research_run_id")
+		return
+	}
+	runID := parts[0]
+	if len(parts) == 1 {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		h.handleResearchRunDetail(w, runID, ownerHash)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "events" {
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		h.handleResearchRunEvents(w, r, runID, ownerHash)
+		return
+	}
+	if len(parts) == 2 && parts[1] == "cancel" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		h.handleResearchRunCancel(w, r, runID, ownerHash)
+		return
+	}
+	if len(parts) == 4 && parts[1] == "identity-bindings" && parts[3] == "confirm" {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+			return
+		}
+		if !validResearchHTTPID(parts[2]) {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_identity_binding_id")
+			return
+		}
+		h.handleResearchIdentityConfirmation(w, r, runID, parts[2], ownerHash)
+		return
+	}
+	writeHTTPError(w, http.StatusNotFound, "research_route_not_found")
+}
+
+func researchHTTPOwnerHash(auth kbaseRequestAuth) string {
+	identity := "bearer:kbase"
+	if auth.Method == kbaseAuthMethodCookie {
+		identity = "session:" + auth.SessionID
+	}
+	digest := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(digest[:])
+}
+
+func validResearchHTTPID(value string) bool {
+	if value == "" || len(value) > 160 {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (h *kbaseHTTPHandler) handleResearchRunCreate(w http.ResponseWriter, r *http.Request, ownerHash string) {
+	idempotencyKey, ok := singleBoundedHeader(r, "Idempotency-Key", researchIdempotencyKeyMax)
+	if !ok || strings.TrimSpace(idempotencyKey) == "" {
+		writeHTTPError(w, http.StatusBadRequest, "idempotency_key_required")
+		return
+	}
+	var request ResearchRunRequest
+	if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchRunHTTPMaxBodyBytes, &request) {
+		return
+	}
+	mode, reasons, err := RouteResearchMode(request)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_research_request")
+		return
+	}
+	budget := h.researchQuickBudget
+	if mode == ResearchModeDeep {
+		budget = h.researchDeepBudget
+	}
+	keyDigest := sha256.Sum256([]byte(ownerHash + "\x00" + strings.TrimSpace(idempotencyKey)))
+	run, created, err := h.researchStore.CreateRun(ResearchRunInput{
+		IdempotencyKey: hex.EncodeToString(keyDigest[:]), Request: request, Mode: mode,
+		RouteReasons: reasons, Budget: budget,
+	})
+	if errors.Is(err, ErrResearchRunIdempotencyConflict) {
+		writeHTTPError(w, http.StatusConflict, "research_idempotency_conflict")
+		return
+	}
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	if _, err := h.researchStore.db.Exec(`INSERT OR IGNORE INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?)`,
+		run.RunID, ownerHash, h.researchStore.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if created {
+			_, _ = h.researchStore.db.Exec(`DELETE FROM research_runs WHERE run_id = ?`, run.RunID)
+		}
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	if !h.researchRunOwned(run.RunID, ownerHash) {
+		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeHTTPJSON(w, status, map[string]any{"created": created, "run": publicResearchRun(*run)})
+}
+
+func (h *kbaseHTTPHandler) handleResearchRunDetail(w http.ResponseWriter, runID, ownerHash string) {
+	if !h.researchRunOwned(runID, ownerHash) {
+		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+		return
+	}
+	run, err := h.researchStore.LoadRun(runID)
+	if err != nil {
+		h.writeResearchRunHTTPError(w, err)
+		return
+	}
+	status := http.StatusAccepted
+	if isTerminalResearchStatus(run.Status) {
+		status = http.StatusOK
+	}
+	writeHTTPJSON(w, status, map[string]any{"run": publicResearchRun(*run)})
+}
+
+func (h *kbaseHTTPHandler) handleResearchRunEvents(w http.ResponseWriter, r *http.Request, runID, ownerHash string) {
+	after := int64(0)
+	afterValues := r.URL.Query()["after"]
+	if len(afterValues) > 1 {
+		writeHTTPError(w, http.StatusBadRequest, "invalid_event_cursor")
+		return
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("after")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			writeHTTPError(w, http.StatusBadRequest, "invalid_event_cursor")
+			return
+		}
+		after = parsed
+	}
+	if !h.researchRunOwned(runID, ownerHash) {
+		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+		return
+	}
+	events, err := h.researchStore.ListEvents(runID, after, researchEventListDefault)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	views := make([]researchEventHTTPView, 0, len(events))
+	next := after
+	for _, event := range events {
+		views = append(views, researchEventHTTPView{
+			Sequence: event.Sequence, RunID: event.RunID, FromStatus: event.FromStatus,
+			ToStatus: event.ToStatus, Code: publicResearchCode(event.Code, "research_event"), CreatedAt: event.CreatedAt,
+		})
+		if event.Sequence > next {
+			next = event.Sequence
+		}
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"events": views, "next_sequence": next})
+}
+
+func (h *kbaseHTTPHandler) handleResearchRunCancel(w http.ResponseWriter, r *http.Request, runID, ownerHash string) {
+	if !decodeEmptyResearchHTTPBody(w, r) {
+		return
+	}
+	if !h.researchRunOwned(runID, ownerHash) {
+		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+		return
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		run, err := h.researchStore.LoadRun(runID)
+		if err != nil {
+			h.writeResearchRunHTTPError(w, err)
+			return
+		}
+		if isTerminalResearchStatus(run.Status) {
+			writeHTTPJSON(w, http.StatusOK, map[string]any{"run": publicResearchRun(*run)})
+			return
+		}
+		canceled, err := h.researchStore.TransitionRun(runID, run.Version, ResearchCanceled,
+			ResearchTransition{Code: "user_cancel", Actor: "research-http"})
+		if errors.Is(err, ErrResearchRunVersionConflict) {
+			continue
+		}
+		if err != nil {
+			h.writeResearchRunHTTPError(w, err)
+			return
+		}
+		writeHTTPJSON(w, http.StatusAccepted, map[string]any{"run": publicResearchRun(*canceled)})
+		return
+	}
+	writeHTTPError(w, http.StatusConflict, "research_run_version_conflict")
+}
+
+func (h *kbaseHTTPHandler) handleResearchIdentityConfirmation(w http.ResponseWriter, r *http.Request, runID, bindingID, ownerHash string) {
+	if !decodeEmptyResearchHTTPBody(w, r) {
+		return
+	}
+	if !h.researchRunOwned(runID, ownerHash) {
+		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+		return
+	}
+	var found string
+	err := h.researchStore.db.QueryRow(`SELECT binding_id FROM research_identity_bindings WHERE binding_id = ? AND run_id = ?`, bindingID, runID).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeHTTPError(w, http.StatusNotFound, "identity_binding_not_found")
+		return
+	}
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	_, err = h.researchStore.db.Exec(`INSERT INTO research_identity_confirmations(binding_id, run_id, confirmed_at)
+		VALUES (?, ?, ?) ON CONFLICT(binding_id) DO UPDATE SET confirmed_at = excluded.confirmed_at`,
+		bindingID, runID, h.researchStore.now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"binding_id": bindingID, "confirmed": true})
+}
+
+func (h *kbaseHTTPHandler) researchRunOwned(runID, ownerHash string) bool {
+	var count int
+	return h.researchStore.db.QueryRow(`SELECT COUNT(1) FROM research_http_owners WHERE run_id = ? AND owner_hash = ?`, runID, ownerHash).Scan(&count) == nil && count == 1
+}
+
+func (h *kbaseHTTPHandler) writeResearchRunHTTPError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrResearchRunNotFound):
+		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
+	case errors.Is(err, ErrResearchRunVersionConflict):
+		writeHTTPError(w, http.StatusConflict, "research_run_version_conflict")
+	default:
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+	}
+}
+
+func publicResearchRun(run ResearchRun) researchRunHTTPView {
+	view := researchRunHTTPView{
+		SchemaVersion: run.SchemaVersion, RunID: run.RunID, Mode: run.Mode, Question: run.Question,
+		Status: run.Status, PackageID: run.PackageID, PackageVersion: run.PackageVersion,
+		RequestedSources: append([]string(nil), run.RequestedSources...), RouteReasons: append([]string(nil), run.RouteReasons...),
+		ActualScope: publicResearchScope(run.ActualScope), Budget: run.Budget, WaitReason: run.WaitReason, Version: run.Version,
+		CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
+	}
+	if run.Failure != nil {
+		view.Failure = &researchRunHTTPFailure{Code: publicResearchCode(run.Failure.Code, "research_failed"), Retryable: run.Failure.Retryable}
+	}
+	return view
+}
+
+func publicResearchScope(scope ResearchScope) ResearchScope {
+	return ResearchScope{
+		TimeFrom: scope.TimeFrom, TimeTo: scope.TimeTo,
+		KnowledgeReleaseIDs: append([]string(nil), scope.KnowledgeReleaseIDs...),
+		SearchedSources:     append([]string(nil), scope.SearchedSources...),
+		CitedSources:        append([]string(nil), scope.CitedSources...),
+	}
+}
+
+func publicResearchCode(code, fallback string) string {
+	code = strings.TrimSpace(code)
+	if code == "" || len(code) > 64 {
+		return fallback
+	}
+	for _, character := range code {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' || character == '-' {
+			continue
+		}
+		return fallback
+	}
+	return code
+}
+
+func decodeEmptyResearchHTTPBody(w http.ResponseWriter, r *http.Request) bool {
+	if r.Body == nil || r.ContentLength == 0 {
+		return true
+	}
+	var payload struct{}
+	return decodeStrictLimitedHTTPJSON(w, r, 4<<10, &payload)
 }
 
 func (h *kbaseHTTPHandler) handleResearchWorker(w http.ResponseWriter, r *http.Request) {
