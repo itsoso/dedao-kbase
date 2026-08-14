@@ -411,6 +411,23 @@ func (c *TokenPlanChatClient) ChatWithResult(ctx context.Context, cfg BookTokenP
 	return result, nil
 }
 
+func decodeStrictBookJSON(content string, output any, maxBytes int64) error {
+	content = strings.TrimSpace(content)
+	if maxBytes <= 0 || int64(len(content)) > maxBytes || content == "" || strings.HasPrefix(content, "```") {
+		return fmt.Errorf("strict JSON response is empty, wrapped, or exceeds supported bounds")
+	}
+	decoder := json.NewDecoder(io.LimitReader(strings.NewReader(content), maxBytes+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(output); err != nil {
+		return fmt.Errorf("strict JSON response: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("strict JSON response contains trailing content")
+	}
+	return nil
+}
+
 func normalizeBookTokenPlanModel(model string) string {
 	clean := strings.TrimSpace(model)
 	compact := strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "").Replace(clean))

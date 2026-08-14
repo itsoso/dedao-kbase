@@ -219,6 +219,26 @@ func TestBookKnowledgeChatPersistsHistory(t *testing.T) {
 	}
 }
 
+func TestDecodeStrictBookJSONRejectsWrappingUnknownFieldsAndTrailingValues(t *testing.T) {
+	type payload struct {
+		Value string `json:"value"`
+	}
+	for _, input := range []string{
+		"```json\n{\"value\":\"ok\"}\n```",
+		`{"value":"ok","unknown":true}`,
+		`{"value":"ok"} {"value":"again"}`,
+	} {
+		var output payload
+		if err := decodeStrictBookJSON(input, &output, 1024); err == nil {
+			t.Fatalf("input unexpectedly accepted: %q", input)
+		}
+	}
+	var output payload
+	if err := decodeStrictBookJSON(`{"value":"ok"}`, &output, 1024); err != nil || output.Value != "ok" {
+		t.Fatalf("strict JSON output=%#v error=%v", output, err)
+	}
+}
+
 func TestTokenPlanChatClientUsesOpenAICompatibleRequest(t *testing.T) {
 	var gotPath, gotAuth, gotModel string
 	var gotEnableThinking *bool

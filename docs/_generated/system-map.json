@@ -1853,9 +1853,19 @@
       "line": 30
     },
     {
+      "name": "ResearchAnalysisRecord",
+      "file": "backend/app/research_analysis.go",
+      "line": 146
+    },
+    {
       "name": "ResearchRun",
       "file": "backend/app/research_run.go",
       "line": 66
+    },
+    {
+      "name": "ResearchToolAuditRecord",
+      "file": "backend/app/research_tools.go",
+      "line": 67
     },
     {
       "name": "SourceAdapterExecutionError",
