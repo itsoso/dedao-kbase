@@ -663,6 +663,20 @@ func loadRunnableAgentPackageContext(
 	return pkg, nil
 }
 
+func loadRunnableResearchAgentPackage(
+	ctx context.Context,
+	store *BookKnowledgeStore,
+	run ResearchRun,
+	packageID, version string,
+) (*AgentPackage, error) {
+	packageID = strings.TrimSpace(packageID)
+	version = strings.TrimSpace(version)
+	if packageID != strings.TrimSpace(run.PackageID) || version != strings.TrimSpace(run.PackageVersion) {
+		return nil, fmt.Errorf("research tool package scope does not match the run")
+	}
+	return loadRunnableAgentPackageContext(ctx, store, packageID, version, "search")
+}
+
 func agentPackageHasCapability(pkg AgentPackage, capability string) bool {
 	for _, declared := range pkg.UIManifest.Capabilities {
 		if strings.TrimSpace(declared) == capability {
