@@ -72,6 +72,7 @@ const ROUTES = Object.freeze({
   agentPackages: "/agent-packages",
   agents: "/agents",
   bookApps: "/book-apps",
+  research: "/research",
   healthReleases: "/delivery/health/releases",
   operations: "/operations",
   jobs: "/jobs",
@@ -336,6 +337,51 @@ const agentCompilerState = {
   loading: "",
   error: "",
 };
+
+const researchTerminalStatuses = new Set(["completed", "insufficient", "failed", "canceled"]);
+const researchRecentRunsKey = "kbase.research.recent-runs.v1";
+const researchState = {
+  draft: {
+    question: "",
+    mode: "auto",
+    sources: ["knowledge"],
+    packageID: "",
+    packageVersion: "",
+  },
+  recentRuns: [],
+  detail: null,
+  events: [],
+  nextSequence: 0,
+  activeTab: "evidence",
+  loading: { list: false, detail: false, events: false, create: false, cancel: false, identity: "" },
+  message: "",
+};
+let researchEventPollTimer = null;
+
+function createResearchLatestRequestController() {
+  let controller = null;
+  let sequence = 0;
+  return {
+    begin() {
+      controller?.abort();
+      controller = typeof AbortController === "function" ? new AbortController() : null;
+      sequence += 1;
+      return { sequence, signal: controller?.signal };
+    },
+    isCurrent(candidate) {
+      return candidate === sequence;
+    },
+    cancel() {
+      controller?.abort();
+      controller = null;
+      sequence += 1;
+    },
+  };
+}
+
+const researchListRequestController = createResearchLatestRequestController();
+const researchDetailRequestController = createResearchLatestRequestController();
+const researchEventsRequestController = createResearchLatestRequestController();
 
 const evolutionConsoleState = {
   route: { view: "inbox", risk: [], type: "", run: "", tab: "comparison", cursor: "", drawer: "" },
@@ -1568,6 +1614,34 @@ function getBookAgentRoute() {
   return null;
 }
 
+function getResearchRoute(pathname = getRoutePathname()) {
+  const params = new URLSearchParams(window.location.search);
+  if (pathname === ROUTES.research) {
+    return {
+      runID: "",
+      packageID: params.get("package_id") || "",
+      packageVersion: params.get("version") || "",
+    };
+  }
+  const prefix = `${ROUTES.research}/runs/`;
+  if (!pathname.startsWith(prefix)) {
+    return null;
+  }
+  const raw = pathname.slice(prefix.length).split("/")[0];
+  if (!raw) {
+    return null;
+  }
+  try {
+    return { runID: decodeURIComponent(raw), packageID: "", packageVersion: "" };
+  } catch {
+    return { runID: raw, packageID: "", packageVersion: "" };
+  }
+}
+
+function buildResearchRunURL(runID) {
+  return runID ? `${ROUTES.research}/runs/${encodeURIComponent(runID)}` : ROUTES.research;
+}
+
 function isBookAgentActionCurrent(sequence, actionRoute) {
   const currentRoute = getBookAgentRoute();
   const currentPackage = bookAgentState.package || {};
@@ -1600,6 +1674,7 @@ function renderShell(content, current = "") {
         <a class="${current === "import" ? "active" : ""}" href="/wechat-import">单篇导入</a>
         <a class="${current === "knowledge" ? "active" : ""}" href="${escapeAttribute(ROUTES.knowledgePackages)}">书籍知识库</a>
         <a class="${current === "agents" ? "active" : ""}" href="${escapeAttribute(ROUTES.agentPackages)}">Agent 演化</a>
+        <a class="${current === "research" ? "active" : ""}" href="${escapeAttribute(ROUTES.research)}">研究</a>
         <a class="${current === "operations" ? "active" : ""}" href="${escapeAttribute(ROUTES.operations)}">运行监控</a>
         <a class="${current === "jobs" ? "active" : ""}" href="${escapeAttribute(ROUTES.jobs)}">任务</a>
         <a class="web-nav__session ${current === "session" ? "active" : ""}" ${current === "session" ? 'aria-current="page"' : ""} href="${escapeAttribute(ROUTES.sessionSettings)}">会话</a>
@@ -5311,6 +5386,8 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
   const evidenceBoundary = pkg.retrieval_policy?.require_citations
     ? "所有回答必须绑定包内引用；证据不足时主动拒答。"
     : "回答遵循当前 Package 的证据与拒答策略。";
+  const capabilities = Array.isArray(pkg.ui_manifest?.capabilities) ? pkg.ui_manifest.capabilities : [];
+  const researchQuery = new URLSearchParams({ package_id: pkg.package_id || "", version: pkg.version || "" });
 
   return `
     <section class="agent-console" aria-labelledby="agent-console-title">
@@ -5351,6 +5428,12 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
             </section>
           `, Boolean(pkg.package_id && pkg.version))}
           ${renderGroundedConversation(pkg)}
+          ${capabilities.includes("deep_research") ? `
+            <section class="book-agent__capability agent-console__research-entry" data-capability="deep_research">
+              <div class="book-agent__section-head"><div><span>04</span><h2>深度研究</h2></div><p>跨知识库、历史研究与本地聊天记录建立可核验案卷。</p></div>
+              <a class="button button-primary" href="${escapeAttribute(`${ROUTES.research}?${researchQuery.toString()}`)}">进入研究工作台</a>
+            </section>
+          ` : ""}
         </section>
 
         <aside class="agent-console__status-rail" aria-label="Agent 状态与策略">
@@ -10931,6 +11014,259 @@ async function searchBookKnowledge() {
   }
 }
 
+const researchStages = [
+  ["planning", "规划范围"], ["retrieving", "检索证据"], ["resolving_identity", "核对身份"],
+  ["building_timeline", "重建时间线"], ["extracting_facts", "提取事实"],
+  ["detecting_conflicts", "识别冲突"], ["comparing_cases", "比较案例"],
+  ["synthesizing", "形成结论"], ["verifying", "核验引用"],
+];
+
+function researchStatusLabel(status) {
+  return ({ planning: "正在规划", retrieving: "正在检索", resolving_identity: "等待身份核对", building_timeline: "正在重建时间线", extracting_facts: "正在提取事实", detecting_conflicts: "正在识别冲突", comparing_cases: "正在比较案例", synthesizing: "正在形成结论", verifying: "正在核验", completed: "研究完成", insufficient: "证据不足", failed: "运行失败", canceled: "已取消" })[status] || "等待启动";
+}
+
+function researchEventLabel(code) {
+  return ({ run_created: "研究任务已创建", quick_retrieval_planned: "已采用快速检索范围", deep_evidence_retrieved: "深度证据检索完成", quick_evidence_retrieved: "快速证据检索完成", identity_resolved: "身份边界已确认", timeline_built: "时间线已建立", facts_extracted: "事实与主张已提取", conflicts_detected: "冲突检查完成", cases_compared: "案例差异已比较", conclusions_synthesized: "候选结论已形成", conclusions_verified: "结论与引用已核验", user_cancel: "用户取消运行" })[code] || "研究阶段已更新";
+}
+
+function researchFailurePresentation(failure) {
+  const code = String(failure?.code || "");
+  return ({ worker_offline: ["本地 Worker 未在线", "确认 macOS Worker 已启动并连接后，再新建一次研究。"], identity_ambiguous: ["身份仍有歧义", "在身份候选区确认正确对象；不要仅凭昵称推断。"], zero_hit: ["没有找到可用证据", "调整关键词、时间范围或增加一个允许的数据源。"], partial_evidence: ["只取得部分证据", "报告会保留缺口，不会把缺失部分补写成事实。"], budget_exhausted: ["研究预算已用完", "缩小问题范围，或新建深度研究并提高受控预算。"], citation_mismatch: ["引用核验未通过", "检查来源是否发生变化后重新运行。"], source_changed: ["来源内容已变化", "重新检索并生成新的可核验快照。"], model_timeout: ["模型调用超时", "稍后重试；已完成步骤不会被描述为最终结论。"] })[code] || ["研究未能完成", "查看阶段记录并缩小范围后重新发起。"];
+}
+
+function researchRecentRunIDs() {
+  try {
+    const parsed = JSON.parse(window.localStorage?.getItem(researchRecentRunsKey) || "[]");
+    return Array.isArray(parsed) ? parsed.filter((value) => typeof value === "string").slice(0, 12) : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberResearchRun(runID) {
+  const unique = [...new Set([String(runID || ""), ...researchRecentRunIDs()].filter(Boolean))].slice(0, 12);
+  try {
+    window.localStorage?.setItem(researchRecentRunsKey, JSON.stringify(unique));
+  } catch {
+    // Recent opaque run IDs are a convenience only.
+  }
+}
+
+function clearResearchRunDetail(nextRunID = "") {
+  researchDetailRequestController.cancel();
+  researchEventsRequestController.cancel();
+  if (researchEventPollTimer) clearTimeout(researchEventPollTimer);
+  researchEventPollTimer = null;
+  researchState.detail = nextRunID ? { run: { run_id: nextRunID } } : null;
+  researchState.events = [];
+  researchState.nextSequence = 0;
+  researchState.message = "";
+  researchState.loading.detail = false;
+  researchState.loading.events = false;
+}
+
+function researchScopeItems(values) {
+  const items = Array.isArray(values) ? values : [];
+  return items.length ? items.map((value) => `<li>${escapeHTML(value)}</li>`).join("") : "<li>尚无可核验记录</li>";
+}
+
+function renderResearchEvidence(items) {
+  if (!Array.isArray(items) || !items.length) return `<div class="research-empty"><strong>尚未返回证据卡</strong><p>只有被选入研究的最小摘录才会显示在这里。</p></div>`;
+  return items.map((item) => `<article class="research-evidence-card"><header><span>${escapeHTML(item.source_role || "背景证据")}</span><time>${escapeHTML(item.occurred_at || "时间未知")}</time></header><p>${escapeHTML(item.content_excerpt || "摘录不可用")}</p><footer><span>${escapeHTML(item.source_type || "未知来源")}</span><span>${item.locator_available ? "可重新核验" : "定位信息未公开"}</span></footer></article>`).join("");
+}
+
+function renderResearchTabPanel(detail, activeTab) {
+  const records = Array.isArray(detail?.analysis_records) ? detail.analysis_records : [];
+  if (activeTab === "timeline") {
+    const timeline = Array.isArray(detail?.timeline) ? detail.timeline : records.filter((item) => item.kind === "timeline_event");
+    return timeline.length ? `<ol class="research-timeline">${timeline.map((item) => `<li><time>${escapeHTML(item.occurred_at || item.attributes?.occurred_at || "时间待核")}</time><p>${escapeHTML(item.summary || "事件摘要")}</p></li>`).join("")}</ol>` : `<div class="research-empty"><strong>时间线尚未形成</strong><p>时间顺序只会来自已选证据，不会按模型猜测补齐。</p></div>`;
+  }
+  if (activeTab === "conflicts") {
+    const conflicts = Array.isArray(detail?.conflicts) ? detail.conflicts : records.filter((item) => item.kind === "conflict");
+    return conflicts.length ? `<div class="research-conflict-table" role="region" aria-label="冲突比较表">${conflicts.map((item) => `<article><strong>${escapeHTML(item.summary || "发现冲突")}</strong><p>${escapeHTML(item.resolution || "等待人工判断适用边界")}</p></article>`).join("")}</div>` : `<div class="research-empty"><strong>暂无已确认冲突</strong><p>“没有记录”不等于“来源完全一致”。</p></div>`;
+  }
+  if (activeTab === "report") {
+    const conclusions = Array.isArray(detail?.conclusions) ? detail.conclusions : [];
+    return conclusions.length ? `<div class="research-report">${conclusions.map((item) => `<article><p>${escapeHTML(item.text || item.conclusion_text || "")}</p><footer>置信度 ${Math.round(Number(item.confidence || 0) * 100)}% · ${Array.isArray(item.evidence_ids) ? item.evidence_ids.length : 0} 条证据</footer></article>`).join("")}</div>` : `<div class="research-empty"><strong>研究报告尚未通过核验</strong><p>只有完成引用核验的结论才会进入最终报告；证据不足会明确保留。</p></div>`;
+  }
+  return renderResearchEvidence(detail?.evidence);
+}
+
+function renderResearchWorkspace(route = getResearchRoute()) {
+  const detail = researchState.detail || {};
+  const run = detail.run || null;
+  const active = run && !researchTerminalStatuses.has(run.status);
+  const currentStage = Math.max(0, researchStages.findIndex(([status]) => status === run?.status));
+  const tabs = [["evidence", "证据"], ["timeline", "时间线"], ["conflicts", "冲突"], ["report", "研究报告"]];
+  const identities = Array.isArray(detail.identity_bindings) ? detail.identity_bindings : [];
+  const failure = run?.failure ? researchFailurePresentation(run.failure) : null;
+  const sourceChoices = [["knowledge", "知识库"], ["chatlog", "本地聊天记录"], ["prior_runs", "历史研究"]];
+  const modeChoices = [["quick", "快速检索"], ["auto", "自动判断"], ["deep", "深度研究"]];
+  renderShell(`<main class="research-workspace">
+    <header class="research-workspace__heading"><div><p class="web-kicker">RESEARCH DOSSIER / 研究案卷</p><h1>研究工作台</h1></div><p>围绕一个明确问题，记录检索范围、证据选择、身份边界与引用核验。</p></header>
+    <form class="research-launchpad" id="research-create-form" aria-label="发起研究">
+      <label class="research-launchpad__question"><span>研究问题</span><textarea name="question" rows="2" required placeholder="例如：比较当前建议与去年同类案例，有哪些适用差异？">${escapeHTML(researchState.draft.question)}</textarea></label>
+      <fieldset><legend>模式</legend>${modeChoices.map(([value, label]) => `<label><input type="radio" name="mode" value="${value}" ${researchState.draft.mode === value ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
+      <fieldset><legend>来源</legend>${sourceChoices.map(([value, label]) => `<label><input type="checkbox" name="sources" value="${value}" ${researchState.draft.sources.includes(value) ? "checked" : ""}><span>${label}</span></label>`).join("")}</fieldset>
+      <div class="research-launchpad__scope"><label><span>Agent Package</span><input name="package_id" value="${escapeAttribute(researchState.draft.packageID)}" placeholder="可选"></label><label><span>版本</span><input name="package_version" value="${escapeAttribute(researchState.draft.packageVersion)}" placeholder="可选"></label></div>
+      <button class="button button-primary" type="submit" ${researchState.loading.create ? "disabled" : ""}>${researchState.loading.create ? "正在创建…" : "开始研究"}</button>
+    </form>
+    ${researchState.message ? `<p class="research-workspace__message" aria-live="polite">${escapeHTML(researchState.message)}</p>` : `<p class="visually-hidden" aria-live="polite">研究工作台已就绪</p>`}
+    ${route?.runID ? `<section class="research-dossier" aria-label="研究运行详情">
+      <aside class="research-stage-rail" aria-label="研究阶段"><header><span>RUN</span><strong>${escapeHTML(researchStatusLabel(run?.status))}</strong></header><ol>${researchStages.map(([status, label], index) => `<li class="${run?.status === status ? "is-current" : index < currentStage || researchTerminalStatuses.has(run?.status) ? "is-done" : ""}"><span>${String(index + 1).padStart(2, "0")}</span><div><strong>${label}</strong><small>${run?.status === status ? "当前阶段" : index < currentStage ? "已完成" : "等待"}</small></div></li>`).join("")}</ol></aside>
+      <section class="research-dossier__center"><header class="research-run-header"><div><span>${escapeHTML(run?.mode === "deep" ? "深度研究" : "快速检索")}</span><h2>${escapeHTML(run?.question || "正在读取研究问题…")}</h2></div>${active ? `<button class="button button-ghost" data-research-cancel ${researchState.loading.cancel ? "disabled" : ""}>取消运行</button>` : `<a class="button button-ghost" href="${ROUTES.research}">新建研究</a>`}</header>
+        ${identities.length ? `<section class="research-identities"><header><span>身份边界</span><strong>需要人工确认</strong></header>${identities.map((item, index) => `<article><div><strong>候选 ${index + 1}</strong><span>${escapeHTML(item.source_type || "来源待核")} · 置信度 ${Math.round(Number(item.confidence || 0) * 100)}%</span></div><button class="button button-ghost" data-research-confirm-identity="${escapeAttribute(item.binding_id)}" ${item.confirmed ? "disabled" : ""}>${item.confirmed ? "已确认" : "确认身份"}</button></article>`).join("")}</section>` : ""}
+        ${failure ? `<section class="research-failure" role="alert"><span>${escapeHTML(run.failure.code || "failed")}</span><h3>${escapeHTML(failure[0])}</h3><p>${escapeHTML(failure[1])}</p><a class="button button-primary" href="${ROUTES.research}">调整范围并重试</a></section>` : ""}
+        <nav class="research-tablist" role="tablist" aria-label="研究案卷视图">${tabs.map(([value, label]) => `<button type="button" role="tab" aria-selected="${researchState.activeTab === value}" data-research-tab="${value}">${label}</button>`).join("")}</nav>
+        <section class="research-tabpanel" role="tabpanel">${renderResearchTabPanel(detail, researchState.activeTab)}</section></section>
+      <aside class="research-scope-ledger"><section><span>检索范围</span><ul>${researchScopeItems(run?.actual_scope?.searched_sources)}</ul></section><section><span>引用范围</span><ul>${researchScopeItems(run?.actual_scope?.cited_sources)}</ul></section><section class="research-event-ledger"><span>阶段记录</span>${researchState.events.length ? `<ol>${researchState.events.slice(-8).reverse().map((event) => `<li><time>${escapeHTML(event.created_at || "")}</time><p>${escapeHTML(researchEventLabel(event.code))}</p></li>`).join("")}</ol>` : `<p>等待第一条阶段记录。</p>`}</section></aside>
+    </section>` : `<section class="research-recent"><header><div><span>最近案卷</span><h2>继续研究</h2></div><small>仅保存当前浏览器中的不透明运行 ID</small></header>${researchState.loading.list ? `<p>正在读取最近运行…</p>` : researchState.recentRuns.length ? `<div>${researchState.recentRuns.map((item) => `<a href="${escapeAttribute(buildResearchRunURL(item.run_id))}"><span>${escapeHTML(researchStatusLabel(item.status))}</span><strong>${escapeHTML(item.question || "未命名研究")}</strong><small>${escapeHTML(item.updated_at || "")}</small></a>`).join("")}</div>` : `<p>还没有最近运行。先从上方提出一个可验证的问题。</p>`}</section>`}
+  </main>`, "research");
+  bindResearchWorkspaceEvents(route);
+}
+
+function bindResearchWorkspaceEvents(route) {
+  document.querySelector("#research-create-form")?.addEventListener("submit", createResearchRun);
+  document.querySelector("[data-research-cancel]")?.addEventListener("click", () => cancelResearchRun(route?.runID));
+  document.querySelectorAll("[data-research-tab]").forEach((button) => button.addEventListener("click", () => { researchState.activeTab = button.dataset.researchTab || "evidence"; renderResearchWorkspace(route); }));
+  document.querySelectorAll("[data-research-confirm-identity]").forEach((button) => button.addEventListener("click", () => confirmResearchIdentity(route?.runID, button.dataset.researchConfirmIdentity)));
+}
+
+function researchRequestID() {
+  return window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+async function createResearchRun(event) {
+  event.preventDefault();
+  const data = new FormData(event.currentTarget);
+  const sources = data.getAll("sources").map(String);
+  researchState.draft = { question: String(data.get("question") || "").trim(), mode: String(data.get("mode") || "auto"), sources: sources.length ? sources : ["knowledge"], packageID: String(data.get("package_id") || "").trim(), packageVersion: String(data.get("package_version") || "").trim() };
+  researchState.loading.create = true;
+  researchState.message = "正在建立受控研究运行…";
+  renderResearchWorkspace({ runID: "" });
+  try {
+    const runRequest = { mode: researchState.draft.mode, question: researchState.draft.question, requested_sources: researchState.draft.sources };
+    if (researchState.draft.packageID) runRequest.package_id = researchState.draft.packageID;
+    if (researchState.draft.packageVersion) runRequest.package_version = researchState.draft.packageVersion;
+    const payload = await apiFetch("/api/research/runs", { method: "POST", headers: { "Idempotency-Key": `research-ui:${researchRequestID()}` }, body: JSON.stringify(runRequest) });
+    const runID = payload?.run?.run_id;
+    if (!runID) throw new Error("服务器未返回研究运行 ID");
+    rememberResearchRun(runID);
+    window.history.pushState({}, "", buildResearchRunURL(runID));
+    clearResearchRunDetail(runID);
+    await boot();
+  } catch (error) {
+    researchState.message = error instanceof Error ? error.message : String(error);
+    renderResearchWorkspace({ runID: "" });
+  } finally {
+    researchState.loading.create = false;
+    const route = getResearchRoute();
+    if (route) renderResearchWorkspace(route);
+  }
+}
+
+async function loadRecentResearchRuns() {
+  const request = researchListRequestController.begin();
+  researchState.loading.list = true;
+  renderResearchWorkspace({ runID: "" });
+  const runs = [];
+  for (const runID of researchRecentRunIDs()) {
+    try {
+      const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}`, { signal: request.signal });
+      if (payload?.run) runs.push(payload.run);
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+    }
+  }
+  if (!researchListRequestController.isCurrent(request.sequence) || getResearchRoute()?.runID) return;
+  researchState.recentRuns = runs;
+  researchState.loading.list = false;
+  renderResearchWorkspace({ runID: "" });
+}
+
+async function loadResearchRun(runID) {
+  const request = researchDetailRequestController.begin();
+  researchState.loading.detail = true;
+  try {
+    const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}`, { signal: request.signal });
+    if (!researchDetailRequestController.isCurrent(request.sequence) || getResearchRoute()?.runID !== runID) return;
+    researchState.detail = payload;
+    rememberResearchRun(runID);
+  } catch (error) {
+    if (error?.name === "AbortError" || !researchDetailRequestController.isCurrent(request.sequence)) return;
+    researchState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (researchDetailRequestController.isCurrent(request.sequence) && getResearchRoute()?.runID === runID) {
+      researchState.loading.detail = false;
+      renderResearchWorkspace({ runID });
+    }
+  }
+}
+
+function scheduleResearchEventPoll(runID) {
+  if (researchEventPollTimer || researchTerminalStatuses.has(researchState.detail?.run?.status)) return;
+  researchEventPollTimer = window.setTimeout(async () => {
+    researchEventPollTimer = null;
+    if (getResearchRoute()?.runID !== runID) return;
+    await Promise.all([loadResearchRun(runID), pollResearchEvents(runID)]);
+  }, 1600);
+}
+
+async function pollResearchEvents(runID) {
+  const request = researchEventsRequestController.begin();
+  researchState.loading.events = true;
+  const query = new URLSearchParams();
+  query.set("after", String(researchState.nextSequence || 0));
+  try {
+    const payload = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}/events?${query.toString()}`, { signal: request.signal });
+    if (!researchEventsRequestController.isCurrent(request.sequence) || getResearchRoute()?.runID !== runID) return;
+    const bySequence = new Map(researchState.events.map((item) => [item.sequence, item]));
+    (Array.isArray(payload?.events) ? payload.events : []).forEach((item) => bySequence.set(item.sequence, item));
+    researchState.events = [...bySequence.values()].sort((left, right) => Number(left.sequence) - Number(right.sequence));
+    researchState.nextSequence = Number(payload?.next_sequence || researchState.nextSequence || 0);
+  } catch (error) {
+    if (error?.name !== "AbortError" && researchEventsRequestController.isCurrent(request.sequence)) researchState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (researchEventsRequestController.isCurrent(request.sequence) && getResearchRoute()?.runID === runID) {
+      researchState.loading.events = false;
+      renderResearchWorkspace({ runID });
+      scheduleResearchEventPoll(runID);
+    }
+  }
+}
+
+async function cancelResearchRun(runID) {
+  if (!runID) return;
+  researchState.loading.cancel = true;
+  renderResearchWorkspace({ runID });
+  try {
+    researchState.detail = await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}/cancel`, { method: "POST", body: "{}" });
+    researchState.message = "研究运行已取消。";
+    researchEventsRequestController.cancel();
+  } catch (error) {
+    researchState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    researchState.loading.cancel = false;
+    renderResearchWorkspace({ runID });
+  }
+}
+
+async function confirmResearchIdentity(runID, bindingID) {
+  if (!runID || !bindingID) return;
+  researchState.loading.identity = bindingID;
+  renderResearchWorkspace({ runID });
+  try {
+    await apiFetch(`/api/research/runs/${encodeURIComponent(runID)}/identity-bindings/${encodeURIComponent(bindingID)}/confirm`, { method: "POST", body: "{}" });
+    researchState.message = "身份边界已由人工确认。";
+    await loadResearchRun(runID);
+  } catch (error) {
+    researchState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    researchState.loading.identity = "";
+    renderResearchWorkspace({ runID });
+  }
+}
+
 function formatArticleTime(value) {
   if (!value) {
     return "";
@@ -10947,6 +11283,11 @@ async function boot() {
   knowledgeSearchSequence += 1;
   dedaoEbookDetailLoadSequence += 1;
   const routePathname = getRoutePathname();
+  const researchRoute = getResearchRoute(routePathname);
+  if (!researchRoute) {
+    researchListRequestController.cancel();
+    clearResearchRunDetail();
+  }
   if (!isJobCenterRoute(routePathname)) {
     jobCenterLoadSequence += 1;
   }
@@ -10988,6 +11329,20 @@ async function boot() {
   if (routePathname === ROUTES.sessionSettings) {
     renderSessionSettings();
     await loadSessionSettings();
+    return;
+  }
+  if (researchRoute) {
+    if (researchRoute.packageID) researchState.draft.packageID = researchRoute.packageID;
+    if (researchRoute.packageVersion) researchState.draft.packageVersion = researchRoute.packageVersion;
+    if (researchRoute.runID) {
+      if (researchState.detail?.run?.run_id !== researchRoute.runID) clearResearchRunDetail(researchRoute.runID);
+      renderResearchWorkspace(researchRoute);
+      await Promise.all([loadResearchRun(researchRoute.runID), pollResearchEvents(researchRoute.runID)]);
+    } else {
+      clearResearchRunDetail();
+      renderResearchWorkspace(researchRoute);
+      await loadRecentResearchRuns();
+    }
     return;
   }
   if (routePathname === ROUTES.jobs || routePathname.startsWith(`${ROUTES.jobs}/`)) {
