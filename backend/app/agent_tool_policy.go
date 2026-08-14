@@ -59,6 +59,29 @@ func AgentReadOnlyToolIDs() []string {
 	return names
 }
 
+var researchAgentToolCatalog = []string{
+	"research/search_chatlog",
+	"research/expand_chat_context",
+	"research/resolve_chat_identity",
+	"research/list_identity_conversations",
+	"research/fetch_chat_message",
+	"research/search_knowledge",
+	"research/fetch_knowledge_evidence",
+	"research/search_prior_runs",
+}
+
+func ResearchAgentToolIDs() []string {
+	result := append([]string(nil), researchAgentToolCatalog...)
+	sort.Strings(result)
+	return result
+}
+
+func AgentPackageKnownToolIDs() []string {
+	result := append(AgentReadOnlyToolIDs(), ResearchAgentToolIDs()...)
+	sort.Strings(result)
+	return result
+}
+
 func EvaluateAgentToolCall(pkg AgentPackage, mcpServer, toolName string, arguments map[string]any) AgentToolPolicyDecision {
 	toolID := strings.TrimSpace(mcpServer) + "/" + strings.TrimSpace(toolName)
 	audit := AgentToolAudit{

@@ -108,7 +108,7 @@
     {
       "path": "/api/agent-packages/",
       "file": "backend/app/agent_package_store.go",
-      "line": 485,
+      "line": 488,
       "authenticated": true
     },
     {
@@ -1327,7 +1327,7 @@
     {
       "name": "AgentPackage",
       "file": "backend/app/agent_package.go",
-      "line": 41
+      "line": 42
     },
     {
       "name": "AgentPackageIdempotencyRecord",
@@ -1347,7 +1347,7 @@
     {
       "name": "AgentPackageUIManifest",
       "file": "backend/app/agent_package.go",
-      "line": 132
+      "line": 145
     },
     {
       "name": "AgentTraceOTLPEnvelope",

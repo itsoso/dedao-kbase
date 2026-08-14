@@ -61,6 +61,7 @@ type AgentCompilationRequest struct {
 	PrimaryReleaseID     string   `json:"primary_release_id"`
 	SupportingReleaseIDs []string `json:"supporting_release_ids,omitempty"`
 	Version              string   `json:"version"`
+	ResearchEnabled      bool     `json:"research_enabled,omitempty"`
 }
 
 type AgentCompilation struct {
@@ -267,13 +268,16 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 			if candidate.Kind == AgentCompilationCandidateEvidence {
 				expectedSchemaVersion = AgentPackageSchemaVersionV2
 			}
-			if candidate.Package.SchemaVersion != expectedSchemaVersion {
+			if candidate.Package.SchemaVersion != expectedSchemaVersion && candidate.Package.SchemaVersion != AgentPackageSchemaVersionV3 {
 				return fmt.Errorf(
 					"ready candidates[%d] kind %q requires package schema_version %q",
 					index,
 					candidate.Kind,
 					expectedSchemaVersion,
 				)
+			}
+			if candidate.Package.SchemaVersion == AgentPackageSchemaVersionV3 && candidate.Package.ResearchPolicy == nil {
+				return fmt.Errorf("ready candidates[%d] v3 package requires research_policy", index)
 			}
 			if len(candidate.Issues) != 0 {
 				return fmt.Errorf("ready candidates[%d] must not contain issues", index)
@@ -518,6 +522,7 @@ func compileStudyAgentCandidate(
 			Capabilities: []string{"reader", "search", "grounded_chat", "evidence", "quiz"},
 		},
 	}
+	applyAgentCompilationResearchPolicy(&pkg, request.ResearchEnabled)
 	return finalizeAgentCompilationCandidate(store, AgentCompilationCandidateStudy, pkg)
 }
 
@@ -694,6 +699,7 @@ func compileEvidenceAgentCandidate(
 			Capabilities: []string{"reader", "search", "grounded_chat", "evidence"},
 		},
 	}
+	applyAgentCompilationResearchPolicy(&pkg, request.ResearchEnabled)
 	return finalizeAgentCompilationCandidate(store, AgentCompilationCandidateEvidence, pkg)
 }
 
@@ -847,6 +853,30 @@ func allReadOnlyAgentCompilationTools() AgentPackageToolPolicy {
 	return AgentPackageToolPolicy{Tools: rules}
 }
 
+func applyAgentCompilationResearchPolicy(pkg *AgentPackage, enabled bool) {
+	if pkg == nil || !enabled {
+		return
+	}
+	pkg.SchemaVersion = AgentPackageSchemaVersionV3
+	pkg.ResearchPolicy = &AgentPackageResearchPolicy{
+		Modes:          []string{ResearchModeAuto, ResearchModeQuick, ResearchModeDeep},
+		AllowedSources: []string{ResearchSourceKnowledge, ResearchSourceChatlog, ResearchSourcePriorRuns},
+		AllowedTools:   ResearchAgentToolIDs(), MaxIterations: 8, MaxEvidenceItems: 300,
+		MaxQuotedChars: 80000, MaxCostUSD: 10, RequireVerification: true,
+	}
+	for _, toolID := range ResearchAgentToolIDs() {
+		server, tool, ok := strings.Cut(toolID, "/")
+		if ok {
+			pkg.ToolPolicy.Tools = append(pkg.ToolPolicy.Tools, AgentPackageToolRule{
+				MCPServer: server, ToolName: tool, Decision: AgentToolAllow,
+			})
+		}
+	}
+	pkg.ModelPolicy.MaxCostUSD = pkg.ResearchPolicy.MaxCostUSD
+	pkg.EvaluationPolicy.SuiteVersion = "research-agent-v1"
+	pkg.UIManifest.Capabilities = append(pkg.UIManifest.Capabilities, "deep_research")
+}
+
 func agentCompilationEvaluationPolicy(evidence bool) AgentPackageEvaluationPolicy {
 	scores := map[string]float64{
 		"retrieval":           0.8,
@@ -887,7 +917,11 @@ func finalizeAgentCompilationCandidate(
 ) AgentCompilationCandidate {
 	finalized, err := FinalizeAgentPackage(pkg)
 	if err == nil {
-		err = ValidateAgentPackage(finalized, store, AgentReadOnlyToolIDs())
+		knownTools := AgentReadOnlyToolIDs()
+		if finalized.SchemaVersion == AgentPackageSchemaVersionV3 {
+			knownTools = AgentPackageKnownToolIDs()
+		}
+		err = ValidateAgentPackage(finalized, store, knownTools)
 	}
 	if err != nil {
 		return blockedAgentCompilationCandidate(kind, AgentCompilationIssue{

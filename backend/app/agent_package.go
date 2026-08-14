@@ -15,6 +15,7 @@ var agentPackageIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 const (
 	AgentPackageSchemaVersionV1 = "agent-package.v1"
 	AgentPackageSchemaVersionV2 = "agent-package.v2"
+	AgentPackageSchemaVersionV3 = "agent-package.v3"
 	AgentPackageSchemaVersion   = AgentPackageSchemaVersionV1
 	AgentPackageDraft           = "draft"
 	AgentPackagePublished       = "published"
@@ -53,6 +54,7 @@ type AgentPackage struct {
 	SafetyPolicy     AgentPackageSafetyPolicy     `json:"safety_policy"`
 	EvaluationPolicy AgentPackageEvaluationPolicy `json:"evaluation_policy"`
 	EvidencePolicy   *AgentPackageEvidencePolicy  `json:"evidence_policy,omitempty"`
+	ResearchPolicy   *AgentPackageResearchPolicy  `json:"research_policy,omitempty"`
 	UIManifest       AgentPackageUIManifest       `json:"ui_manifest"`
 	CreatedAt        string                       `json:"created_at,omitempty"`
 	PublishedAt      string                       `json:"published_at,omitempty"`
@@ -119,6 +121,17 @@ type AgentPackageEvidencePolicy struct {
 	ReportSchema              string                              `json:"report_schema"`
 }
 
+type AgentPackageResearchPolicy struct {
+	Modes               []string `json:"modes"`
+	AllowedSources      []string `json:"allowed_sources"`
+	AllowedTools        []string `json:"allowed_tools"`
+	MaxIterations       int      `json:"max_iterations"`
+	MaxEvidenceItems    int      `json:"max_evidence_items"`
+	MaxQuotedChars      int      `json:"max_quoted_chars"`
+	MaxCostUSD          float64  `json:"max_cost_usd"`
+	RequireVerification bool     `json:"require_verification"`
+}
+
 type AgentPackageEvidenceReleaseRole struct {
 	ReleaseID string `json:"release_id"`
 	Role      string `json:"role"`
@@ -161,12 +174,22 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 		if pkg.EvidencePolicy != nil {
 			return fmt.Errorf("schema_version v1 does not allow evidence_policy")
 		}
+		if pkg.ResearchPolicy != nil {
+			return fmt.Errorf("schema_version v1 does not allow research_policy")
+		}
 	case AgentPackageSchemaVersionV2:
 		if pkg.EvidencePolicy == nil {
 			return fmt.Errorf("evidence_policy is required for schema_version %q", AgentPackageSchemaVersionV2)
 		}
+		if pkg.ResearchPolicy != nil {
+			return fmt.Errorf("schema_version v2 does not allow research_policy")
+		}
+	case AgentPackageSchemaVersionV3:
+		if pkg.ResearchPolicy == nil {
+			return fmt.Errorf("research_policy is required for schema_version %q", AgentPackageSchemaVersionV3)
+		}
 	default:
-		return fmt.Errorf("schema_version must be %q or %q", AgentPackageSchemaVersionV1, AgentPackageSchemaVersionV2)
+		return fmt.Errorf("schema_version must be %q, %q, or %q", AgentPackageSchemaVersionV1, AgentPackageSchemaVersionV2, AgentPackageSchemaVersionV3)
 	}
 	if err := requireContractFields(map[string]string{
 		"package_id":                        pkg.PackageID,
@@ -208,6 +231,11 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	}
 	if err := validateAgentPackageTools(pkg.ToolPolicy, knownTools); err != nil {
 		return err
+	}
+	if pkg.ResearchPolicy != nil {
+		if err := validateAgentPackageResearch(*pkg.ResearchPolicy, pkg.ToolPolicy); err != nil {
+			return err
+		}
 	}
 	if err := validateAgentPackageSafety(pkg.SafetyPolicy); err != nil {
 		return err
@@ -340,6 +368,68 @@ func validateAgentPackageSafety(policy AgentPackageSafetyPolicy) error {
 	}
 	if strings.TrimSpace(policy.EscalationTarget) == "" {
 		return fmt.Errorf("safety_policy.escalation_target is required")
+	}
+	return nil
+}
+
+func validateAgentPackageResearch(policy AgentPackageResearchPolicy, tools AgentPackageToolPolicy) error {
+	allowedModes := stringSet([]string{ResearchModeAuto, ResearchModeQuick, ResearchModeDeep})
+	modes := uniqueTrimmedStrings(policy.Modes)
+	if len(modes) == 0 || len(modes) != len(policy.Modes) {
+		return fmt.Errorf("research_policy.modes must be non-empty and unique")
+	}
+	for _, mode := range modes {
+		if !allowedModes[mode] {
+			return fmt.Errorf("research_policy.modes contains unsupported mode %q", mode)
+		}
+	}
+	allowedSources := stringSet([]string{ResearchSourceKnowledge, ResearchSourceChatlog, ResearchSourcePriorRuns})
+	sources := uniqueTrimmedStrings(policy.AllowedSources)
+	if len(sources) == 0 || len(sources) != len(policy.AllowedSources) {
+		return fmt.Errorf("research_policy.allowed_sources must be non-empty and unique")
+	}
+	for _, source := range sources {
+		if !allowedSources[source] {
+			return fmt.Errorf("research_policy.allowed_sources contains unsupported source %q", source)
+		}
+	}
+	approvedTools := stringSet(ResearchAgentToolIDs())
+	policyTools := uniqueTrimmedStrings(policy.AllowedTools)
+	if len(policyTools) == 0 || len(policyTools) != len(policy.AllowedTools) {
+		return fmt.Errorf("research_policy.allowed_tools must be non-empty and unique")
+	}
+	for _, tool := range policyTools {
+		if !approvedTools[tool] {
+			return fmt.Errorf("research_policy.allowed_tools contains unapproved tool %q", tool)
+		}
+	}
+	policyToolSet := stringSet(policyTools)
+	allowedByPackage := map[string]bool{}
+	for _, rule := range tools.Tools {
+		toolID := strings.TrimSpace(rule.MCPServer) + "/" + strings.TrimSpace(rule.ToolName)
+		if !approvedTools[toolID] {
+			continue
+		}
+		if !policyToolSet[toolID] {
+			return fmt.Errorf("research tool %q is outside research_policy.allowed_tools", toolID)
+		}
+		if rule.Decision == AgentToolAllow {
+			allowedByPackage[toolID] = true
+		}
+	}
+	for _, tool := range policyTools {
+		if !allowedByPackage[tool] {
+			return fmt.Errorf("research_policy.allowed_tools %q requires an allow rule", tool)
+		}
+	}
+	if policy.MaxIterations <= 0 || policy.MaxIterations > researchBudgetMaxIterations ||
+		policy.MaxEvidenceItems <= 0 || policy.MaxEvidenceItems > researchBudgetMaxEvidence ||
+		policy.MaxQuotedChars <= 0 || policy.MaxQuotedChars > researchBudgetMaxQuotedChars ||
+		policy.MaxCostUSD <= 0 || policy.MaxCostUSD > researchBudgetMaxCostUSD {
+		return fmt.Errorf("research_policy budget is outside supported bounds")
+	}
+	if !policy.RequireVerification {
+		return fmt.Errorf("research_policy.require_verification must be true")
 	}
 	return nil
 }
@@ -511,7 +601,7 @@ func agentPackageIndependentSupportingSources(
 func validateAgentPackageUI(manifest AgentPackageUIManifest) error {
 	allowed := map[string]struct{}{
 		"reader": {}, "search": {}, "grounded_chat": {}, "evidence": {},
-		"quiz": {}, "action_plan": {},
+		"quiz": {}, "action_plan": {}, "deep_research": {},
 	}
 	if len(manifest.Capabilities) == 0 {
 		return fmt.Errorf("ui_manifest.capabilities is required")
@@ -644,6 +734,11 @@ func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {
 			return normalized.EvidencePolicy.ReleaseRoles[i].ReleaseID < normalized.EvidencePolicy.ReleaseRoles[j].ReleaseID
 		})
 		normalized.EvidencePolicy.AllowedVerdicts = sortedUniqueStrings(normalized.EvidencePolicy.AllowedVerdicts)
+	}
+	if normalized.ResearchPolicy != nil {
+		normalized.ResearchPolicy.Modes = sortedUniqueStrings(normalized.ResearchPolicy.Modes)
+		normalized.ResearchPolicy.AllowedSources = sortedUniqueStrings(normalized.ResearchPolicy.AllowedSources)
+		normalized.ResearchPolicy.AllowedTools = sortedUniqueStrings(normalized.ResearchPolicy.AllowedTools)
 	}
 	normalized.UIManifest.Capabilities = sortedUniqueStrings(normalized.UIManifest.Capabilities)
 	return normalized, nil

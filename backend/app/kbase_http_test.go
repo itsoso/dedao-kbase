@@ -453,6 +453,36 @@ func TestKBaseHTTPHandlerAgentCompilationUsesReadOnlyAPIAuthAndReturnsCandidates
 	}
 }
 
+func TestKBaseHTTPHandlerAgentPackageCompilationResearchOptIn(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-http-research", "book-http-research", "2026-08-14T12:00:00Z",
+		"单一来源结论", "Publisher Primary", "dedao_ebook",
+	)
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "consumer-token"})
+	payload, err := json.Marshal(AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion, Mode: AgentCompilationModeStudy,
+		PrimaryReleaseID: primary.ReleaseID, Version: "1.0.0", ResearchEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/compile", "consumer-token", string(payload))
+	if response.Code != http.StatusOK {
+		t.Fatalf("research compilation status=%d body=%s", response.Code, response.Body.String())
+	}
+	var compilation AgentCompilation
+	if err := json.Unmarshal(response.Body.Bytes(), &compilation); err != nil {
+		t.Fatal(err)
+	}
+	if len(compilation.Candidates) != 1 || compilation.Candidates[0].Package == nil ||
+		compilation.Candidates[0].Package.SchemaVersion != AgentPackageSchemaVersionV3 ||
+		compilation.Candidates[0].Package.ResearchPolicy == nil {
+		t.Fatalf("research compilation = %#v", compilation)
+	}
+}
+
 func TestKBaseHTTPHandlerAgentCompilationRejectsInvalidBodies(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{

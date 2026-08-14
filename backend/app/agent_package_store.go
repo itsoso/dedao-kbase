@@ -79,6 +79,9 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 	if err := ValidateAgentPackage(pkg, store, knownTools); err != nil {
 		return nil, false, err
 	}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		return nil, false, fmt.Errorf("research-agent-v1 trusted evaluation is required before v3 publication")
+	}
 	if err := ValidateAgentPackageEvaluationGate(store, pkg); err != nil {
 		return nil, false, err
 	}
@@ -167,7 +170,7 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 		PublishedAt:    published.PublishedAt,
 		URL:            agentPackageURL(published.PackageID, published.Version),
 	}
-	if published.SchemaVersion == AgentPackageSchemaVersionV2 {
+	if published.SchemaVersion == AgentPackageSchemaVersionV2 || published.SchemaVersion == AgentPackageSchemaVersionV3 {
 		descriptor, descriptorErr := newAgentPackageRuntimeDescriptor(published)
 		if descriptorErr != nil {
 			return nil, false, descriptorErr
@@ -220,7 +223,7 @@ func (s *BookKnowledgeStore) LoadAgentPackageContext(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := ValidateAgentPackage(*pkg, s, AgentReadOnlyToolIDs()); err != nil {
+	if err := ValidateAgentPackage(*pkg, s, AgentPackageKnownToolIDs()); err != nil {
 		return nil, fmt.Errorf("validate persisted agent package: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
@@ -361,7 +364,7 @@ func (s *BookKnowledgeStore) loadAgentPackageRecordContextUnlocked(
 	if pkg.PackageID != record.PackageID || pkg.Version != record.Version {
 		return nil, fmt.Errorf("agent package artifact identity does not match manifest record")
 	}
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 {
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 || pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
 		if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err != nil {
 			return nil, err
 		}
@@ -401,10 +404,10 @@ func newAgentPackageRuntimeDescriptor(pkg AgentPackage) (AgentPackageRuntimeDesc
 
 func validateAgentPackageRuntimeDescriptor(record AgentPackageRecord, pkg *AgentPackage) error {
 	if record.Runtime == nil {
-		return fmt.Errorf("agent package v2 runtime descriptor is required")
+		return fmt.Errorf("agent package runtime descriptor is required")
 	}
 	descriptor := *record.Runtime
-	if descriptor.SchemaVersion != AgentPackageSchemaVersionV2 ||
+	if (descriptor.SchemaVersion != AgentPackageSchemaVersionV2 && descriptor.SchemaVersion != AgentPackageSchemaVersionV3) ||
 		descriptor.PackageID != record.PackageID ||
 		descriptor.Version != record.Version ||
 		descriptor.ContentHash != record.ContentHash ||

@@ -362,6 +362,56 @@ func TestCompileAgentPackagesDualBuildsDeterministicCandidates(t *testing.T) {
 	}
 }
 
+func TestAgentCompilationResearchOptInEmitsV3WithoutChangingOrdinaryTools(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease("release-research", "book-research", "2026-08-14T10:00:00Z", "有证据的结论", "Publisher", "dedao_ebook")
+	saveKnowledgeAssemblyRelease(t, store, primary)
+	base := AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion, Mode: AgentCompilationModeStudy,
+		PrimaryReleaseID: primary.ReleaseID, Version: "1.0.0",
+	}
+	ordinary, err := CompileAgentPackages(store, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	researchRequest := base
+	researchRequest.ResearchEnabled = true
+	research, err := CompileAgentPackages(store, researchRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ordinaryPackage := ordinary.Candidates[0].Package
+	researchPackage := research.Candidates[0].Package
+	if ordinaryPackage == nil || researchPackage == nil {
+		t.Fatalf("ordinary=%#v research=%#v", ordinary, research)
+	}
+	if ordinaryPackage.SchemaVersion != AgentPackageSchemaVersionV1 || ordinaryPackage.ResearchPolicy != nil ||
+		!reflect.DeepEqual(ordinaryPackage.ToolPolicy, allReadOnlyAgentCompilationTools()) {
+		t.Fatalf("ordinary compilation gained research: %#v", ordinaryPackage)
+	}
+	if researchPackage.SchemaVersion != AgentPackageSchemaVersionV3 || researchPackage.ResearchPolicy == nil ||
+		!agentTestContainsString(researchPackage.UIManifest.Capabilities, "deep_research") ||
+		researchPackage.EvaluationPolicy.SuiteVersion != "research-agent-v1" {
+		t.Fatalf("research package = %#v", researchPackage)
+	}
+	if err := ValidateAgentPackage(*researchPackage, store, AgentPackageKnownToolIDs()); err != nil {
+		t.Fatalf("research package invalid: %v", err)
+	}
+	for _, tool := range ResearchAgentToolIDs() {
+		server, name, _ := strings.Cut(tool, "/")
+		found := false
+		for _, rule := range researchPackage.ToolPolicy.Tools {
+			found = found || (rule.MCPServer == server && rule.ToolName == name && rule.Decision == AgentToolAllow)
+		}
+		if !found {
+			t.Fatalf("research package missing %q", tool)
+		}
+	}
+	if ordinary.CompilationID == research.CompilationID || ordinaryPackage.ContentHash == researchPackage.ContentHash {
+		t.Fatal("research opt-in was not bound into compilation/package identity")
+	}
+}
+
 func TestCompileAgentPackagesDualKeepsStudyReadyWithoutSupport(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	primary := agentCompilerTestRelease(

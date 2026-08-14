@@ -77,6 +77,61 @@ func TestAgentPackageV2RequiresEvidencePolicyAndKeepsV1Compatible(t *testing.T) 
 	}
 }
 
+func TestAgentPackageResearchPolicyIsExplicitVersionedAndHashBound(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := validAgentPackageV3()
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(finalized, store, AgentPackageKnownToolIDs()); err != nil {
+		t.Fatalf("v3 research package rejected: %v", err)
+	}
+
+	missing := pkg
+	missing.ResearchPolicy = nil
+	missing, err = FinalizeAgentPackage(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(missing, store, AgentPackageKnownToolIDs()); err == nil || !strings.Contains(err.Error(), "research_policy") {
+		t.Fatalf("v3 missing policy error = %v", err)
+	}
+
+	legacy := validAgentPackage()
+	legacy.ResearchPolicy = pkg.ResearchPolicy
+	legacy, err = FinalizeAgentPackage(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(legacy, store, AgentPackageKnownToolIDs()); err == nil || !strings.Contains(err.Error(), "v1") {
+		t.Fatalf("v1 research policy error = %v", err)
+	}
+
+	unsafe := pkg
+	unsafe.ResearchPolicy = cloneAgentPackageResearchPolicy(pkg.ResearchPolicy)
+	unsafe.ResearchPolicy.AllowedTools = append(unsafe.ResearchPolicy.AllowedTools, "research/export_all_chat")
+	unsafe, err = FinalizeAgentPackage(unsafe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateAgentPackage(unsafe, store, append(AgentPackageKnownToolIDs(), "research/export_all_chat")); err == nil || !strings.Contains(err.Error(), "allowed_tools") {
+		t.Fatalf("unsafe research tool error = %v", err)
+	}
+
+	changed := pkg
+	changed.ResearchPolicy = cloneAgentPackageResearchPolicy(pkg.ResearchPolicy)
+	changed.ResearchPolicy.MaxIterations++
+	changed, err = FinalizeAgentPackage(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ContentHash == finalized.ContentHash {
+		t.Fatal("research budget did not change package content hash")
+	}
+}
+
 func TestAgentPackageV2RequiresEvidenceAuditEvaluationThresholds(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
@@ -738,6 +793,38 @@ func validAgentPackageV2() AgentPackage {
 		pkg.EvaluationPolicy.MinimumScores[metric] = 1
 	}
 	return pkg
+}
+
+func validAgentPackageV3() AgentPackage {
+	pkg := validAgentPackage()
+	pkg.SchemaVersion = AgentPackageSchemaVersionV3
+	pkg.Version = "3.0.0"
+	pkg.ResearchPolicy = &AgentPackageResearchPolicy{
+		Modes:          []string{ResearchModeAuto, ResearchModeQuick, ResearchModeDeep},
+		AllowedSources: []string{ResearchSourceKnowledge, ResearchSourceChatlog, ResearchSourcePriorRuns},
+		AllowedTools:   ResearchAgentToolIDs(), MaxIterations: 8, MaxEvidenceItems: 300,
+		MaxQuotedChars: 80000, MaxCostUSD: 10, RequireVerification: true,
+	}
+	for _, toolID := range ResearchAgentToolIDs() {
+		server, tool, _ := strings.Cut(toolID, "/")
+		pkg.ToolPolicy.Tools = append(pkg.ToolPolicy.Tools, AgentPackageToolRule{
+			MCPServer: server, ToolName: tool, Decision: AgentToolAllow,
+		})
+	}
+	pkg.EvaluationPolicy.SuiteVersion = "research-agent-v1"
+	pkg.UIManifest.Capabilities = append(pkg.UIManifest.Capabilities, "deep_research")
+	return pkg
+}
+
+func cloneAgentPackageResearchPolicy(policy *AgentPackageResearchPolicy) *AgentPackageResearchPolicy {
+	if policy == nil {
+		return nil
+	}
+	cloned := *policy
+	cloned.Modes = append([]string(nil), policy.Modes...)
+	cloned.AllowedSources = append([]string(nil), policy.AllowedSources...)
+	cloned.AllowedTools = append([]string(nil), policy.AllowedTools...)
+	return &cloned
 }
 
 func saveAgentPackageTestRelease(t *testing.T, store *BookKnowledgeStore) {

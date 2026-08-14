@@ -226,7 +226,7 @@ func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
 	}
 	agentTools := uniqueTrimmedStrings(cfg.AgentTools)
 	if len(agentTools) == 0 {
-		agentTools = AgentReadOnlyToolIDs()
+		agentTools = AgentPackageKnownToolIDs()
 	}
 	auditMaxBodyBytes := cfg.AuditMaxBodyBytes
 	if auditMaxBodyBytes <= 0 {

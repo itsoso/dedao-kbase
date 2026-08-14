@@ -129,6 +129,33 @@ func TestAgentPackageV2PublishesBoundRuntimeTimeoutDescriptor(t *testing.T) {
 	}
 }
 
+func TestAgentPackageStoreV3UsesRuntimeDescriptorAndRejectsPublicationBeforeTrustedEvaluation(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg, err := FinalizeAgentPackage(validAgentPackageV3())
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := newAgentPackageRuntimeDescriptor(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := AgentPackageRecord{
+		PackageID: pkg.PackageID, Version: pkg.Version, ContentHash: pkg.ContentHash,
+		LifecycleState: AgentPackagePublished, Runtime: &descriptor,
+	}
+	if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err != nil {
+		t.Fatalf("v3 runtime descriptor rejected: %v", err)
+	}
+	record.Runtime = nil
+	if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("missing v3 descriptor error = %v", err)
+	}
+	if _, _, err := PublishAgentPackage(store, pkg, "research-v3-blocked", AgentPackageKnownToolIDs(), time.Now()); err == nil || !strings.Contains(err.Error(), "research-agent-v1") {
+		t.Fatalf("v3 publication error = %v", err)
+	}
+}
+
 func TestAgentPackageV2RejectsTamperedRuntimeTimeoutDescriptor(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

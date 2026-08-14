@@ -69,6 +69,34 @@ func TestAgentToolPolicyPreservesRequireConfirmation(t *testing.T) {
 	}
 }
 
+func TestAgentPackageResearchToolCatalogDoesNotExpandOrdinaryReadOnlyTools(t *testing.T) {
+	readOnly := AgentReadOnlyToolIDs()
+	known := AgentPackageKnownToolIDs()
+	research := ResearchAgentToolIDs()
+	if len(research) != 8 || len(known) != len(readOnly)+len(research) {
+		t.Fatalf("tool catalogs read_only=%v research=%v known=%v", readOnly, research, known)
+	}
+	for _, tool := range research {
+		if !strings.HasPrefix(tool, "research/") || agentTestContainsString(readOnly, tool) || !agentTestContainsString(known, tool) {
+			t.Fatalf("research tool leaked into ordinary catalog: %q", tool)
+		}
+	}
+	for _, forbidden := range []string{"send", "delete", "edit", "export", "media", "shell", "filesystem", "http"} {
+		if strings.Contains(strings.Join(research, " "), forbidden) {
+			t.Fatalf("research catalog contains forbidden capability %q: %v", forbidden, research)
+		}
+	}
+}
+
+func agentTestContainsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func agentToolPolicyTestPackage() AgentPackage {
 	pkg := validAgentPackage()
 	pkg.ToolPolicy.Tools = []AgentPackageToolRule{
