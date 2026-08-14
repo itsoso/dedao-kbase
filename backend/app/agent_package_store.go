@@ -79,9 +79,6 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 	if err := ValidateAgentPackage(pkg, store, knownTools); err != nil {
 		return nil, false, err
 	}
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
-		return nil, false, fmt.Errorf("research-agent-v1 trusted evaluation is required before v3 publication")
-	}
 	if err := ValidateAgentPackageEvaluationGate(store, pkg); err != nil {
 		return nil, false, err
 	}

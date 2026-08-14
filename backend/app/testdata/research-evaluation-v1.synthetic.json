@@ -1,0 +1,145 @@
+{
+  "schema_version": "agent-evaluation.v1",
+  "suite_version": "research-agent-v1",
+  "research_cases": [
+    {
+      "case_id": "quick-grounded",
+      "mode": "quick",
+      "question": "What does the selected synthetic source say about option alpha?",
+      "expected": {
+        "searched_sources": ["knowledge"],
+        "identity_status": "not_found",
+        "outcome": "completed",
+        "material_claim_ids": ["claim-quick"],
+        "minimum_citation_coverage": 1
+      },
+      "observed": {
+        "searched_sources": ["knowledge"],
+        "identity_status": "not_found",
+        "outcome": "completed",
+        "conclusions": [
+          {
+            "claim_id": "claim-quick",
+            "evidence_ids": ["evidence-knowledge-1"]
+          }
+        ],
+        "available_evidence_ids": ["evidence-knowledge-1"],
+        "latency_ms": 420,
+        "cost_usd": 0.02,
+        "private_projection_safe": true
+      },
+      "max_latency_ms": 15000,
+      "max_cost_usd": 0.25
+    },
+    {
+      "case_id": "deep-case-comparison",
+      "mode": "deep",
+      "question": "Compare the synthetic historical and current cases and preserve uncertainty.",
+      "expected": {
+        "searched_sources": ["knowledge", "chatlog", "prior_runs"],
+        "identity_status": "resolved",
+        "identity_id": "identity-alpha",
+        "timeline_event_ids": ["event-day-1", "event-day-2", "event-day-3"],
+        "trend_direction": "mixed",
+        "direct_advice_claim_ids": ["claim-direct"],
+        "conflict_ids": ["conflict-timing"],
+        "case_difference_dimensions": ["age", "stage_day", "symptoms"],
+        "outcome": "completed",
+        "material_claim_ids": ["claim-direct", "claim-trend", "claim-transfer"],
+        "minimum_citation_coverage": 1,
+        "recovery_status": "not_found"
+      },
+      "observed": {
+        "searched_sources": ["knowledge", "chatlog", "prior_runs"],
+        "identity_status": "resolved",
+        "identity_id": "identity-alpha",
+        "timeline_event_ids": ["event-day-1", "event-day-2", "event-day-3"],
+        "numeric_values": [24, 25, 18],
+        "reported_trend_direction": "mixed",
+        "direct_advice_claim_ids": ["claim-direct"],
+        "conflict_ids": ["conflict-timing"],
+        "case_difference_dimensions": ["age", "stage_day", "symptoms"],
+        "transferred_amount": "",
+        "recovery_status": "not_found",
+        "conclusions": [
+          {
+            "claim_id": "claim-direct",
+            "evidence_ids": ["evidence-chat-1"]
+          },
+          {
+            "claim_id": "claim-trend",
+            "evidence_ids": ["evidence-chat-2", "evidence-chat-3", "evidence-chat-4"]
+          },
+          {
+            "claim_id": "claim-transfer",
+            "evidence_ids": ["evidence-chat-5", "evidence-knowledge-2"]
+          }
+        ],
+        "available_evidence_ids": [
+          "evidence-chat-1",
+          "evidence-chat-2",
+          "evidence-chat-3",
+          "evidence-chat-4",
+          "evidence-chat-5",
+          "evidence-knowledge-2"
+        ],
+        "outcome": "completed",
+        "latency_ms": 4200,
+        "cost_usd": 0.18,
+        "private_projection_safe": true
+      },
+      "max_latency_ms": 180000,
+      "max_cost_usd": 1
+    },
+    {
+      "case_id": "deep-identity-ambiguous",
+      "mode": "deep",
+      "question": "Resolve which synthetic identity the shared alias refers to.",
+      "expected": {
+        "searched_sources": ["chatlog"],
+        "identity_status": "ambiguous",
+        "outcome": "identity_ambiguous",
+        "failure_code": "identity_ambiguous",
+        "minimum_citation_coverage": 1
+      },
+      "observed": {
+        "searched_sources": ["chatlog"],
+        "identity_status": "ambiguous",
+        "outcome": "identity_ambiguous",
+        "failure_code": "identity_ambiguous",
+        "latency_ms": 350,
+        "cost_usd": 0.01,
+        "private_projection_safe": true
+      },
+      "max_latency_ms": 180000,
+      "max_cost_usd": 1
+    },
+    {
+      "case_id": "deep-insufficient-followup",
+      "mode": "deep",
+      "question": "Did the synthetic historical subject recover?",
+      "expected": {
+        "searched_sources": ["chatlog", "prior_runs"],
+        "identity_status": "resolved",
+        "identity_id": "identity-alpha",
+        "outcome": "partial_evidence",
+        "failure_code": "partial_evidence",
+        "minimum_citation_coverage": 1,
+        "recovery_status": "not_found"
+      },
+      "observed": {
+        "searched_sources": ["chatlog", "prior_runs"],
+        "identity_status": "resolved",
+        "identity_id": "identity-alpha",
+        "outcome": "partial_evidence",
+        "failure_code": "partial_evidence",
+        "recovery_status": "not_found",
+        "latency_ms": 700,
+        "cost_usd": 0.02,
+        "private_projection_safe": true
+      },
+      "max_latency_ms": 180000,
+      "max_cost_usd": 1
+    }
+  ]
+}

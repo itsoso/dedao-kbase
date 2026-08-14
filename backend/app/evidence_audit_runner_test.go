@@ -481,6 +481,59 @@ func TestEvidenceAuditRunnerDoesNotCallModelWhenWholeAuditBudgetIsInsufficient(t
 	}
 }
 
+func TestEvidenceAuditRunnerAcceptsTrustedResearchV3WithEvidencePolicy(t *testing.T) {
+	store, base := evidenceAuditRunnerTestStore(t, 1, 1)
+	pkg := base
+	pkg.Version = "3.0.0-research"
+	pkg.LifecycleState = AgentPackageDraft
+	pkg.ContentHash = ""
+	pkg.CreatedAt = ""
+	pkg.PublishedAt = ""
+	pkg.Supersedes = ""
+	applyAgentCompilationResearchPolicy(&pkg, true)
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	supported := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictSupported, false, "research-v3-supported")
+	conflicted := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictMixed, true, "research-v3-conflicted")
+	insufficient := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictInsufficient, false, "research-v3-insufficient")
+	submitted := loadResearchEvaluationFixture(t)
+	submitted.Cases = evidenceAuditEvaluationSuite(finalized, supported, conflicted, insufficient).Cases
+	trusted := trustedResearchEvaluationFixture(submitted)
+	trusted.Cases = append([]AgentEvaluationCase(nil), submitted.Cases...)
+	for index := range trusted.Cases {
+		trusted.Cases[index].AuditID = ""
+	}
+	if err := store.SaveTrustedAgentEvaluationSuite(finalized, trusted); err != nil {
+		t.Fatal(err)
+	}
+	resolved, report, err := EvaluateAgentPackageAgainstTrustedSuite(store, finalized, submitted, testAgentPackageTime())
+	if err != nil || !report.Passed {
+		t.Fatalf("trusted research evidence evaluation = %#v err=%v", report, err)
+	}
+	if err := store.SaveAgentPackageEvaluation(finalized, resolved, report); err != nil {
+		t.Fatal(err)
+	}
+	published, _, err := PublishAgentPackage(
+		store, finalized, "publish-research-evidence-v3", AgentPackageKnownToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	audit := createEvidenceAuditRunnerTask(t, store, *published, "research-v3-audit", "Evidence comparison only.")
+	completed, err := RunEvidenceAudit(
+		context.Background(), store, audit.AuditID,
+		&evidenceAuditFakeClient{answers: []string{`{"candidate_verdict":"supported","rationale":"bounded","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`}},
+		evidenceAuditRunnerConfig(),
+	)
+	if err != nil || completed.Status != EvidenceAuditCompleted {
+		t.Fatalf("RunEvidenceAudit() = %#v, %v", completed, err)
+	}
+}
+
 func TestEvidenceAuditRunnerRejectsIndividualDecisionsDespitePopulationPrefixes(t *testing.T) {
 	for _, scope := range []string{
 		"Population-level PICO: should this patient undergo surgery?",

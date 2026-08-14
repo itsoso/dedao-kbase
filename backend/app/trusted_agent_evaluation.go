@@ -30,7 +30,16 @@ func (s *BookKnowledgeStore) TrustedAgentEvaluationSuitePath(pkg AgentPackage) s
 }
 
 func ValidateTrustedAgentEvaluationSuite(pkg AgentPackage, suite AgentEvaluationSuite) error {
-	if pkg.SchemaVersion != AgentPackageSchemaVersionV2 {
+	switch pkg.SchemaVersion {
+	case AgentPackageSchemaVersionV2:
+	case AgentPackageSchemaVersionV3:
+		if err := validateTrustedResearchEvaluationSuite(pkg, suite); err != nil {
+			return err
+		}
+		if pkg.EvidencePolicy == nil {
+			return nil
+		}
+	default:
 		return fmt.Errorf("trusted evidence audit suites require an agent-package.v2 package")
 	}
 	if strings.TrimSpace(pkg.ContentHash) == "" {
@@ -163,6 +172,19 @@ func (s *BookKnowledgeStore) ResolveTrustedAgentEvaluationSuite(
 		submittedByID[caseID] = evalCase
 	}
 	resolved := *trusted
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		resolved, err = resolveTrustedResearchEvaluationSuite(*trusted, submitted)
+		if err != nil {
+			return AgentEvaluationSuite{}, "", err
+		}
+		if pkg.EvidencePolicy == nil {
+			payload, encodeErr := encodeJSONFile(*trusted)
+			if encodeErr != nil {
+				return AgentEvaluationSuite{}, "", encodeErr
+			}
+			return resolved, sha256Fingerprint(payload), nil
+		}
+	}
 	resolved.Cases = append([]AgentEvaluationCase(nil), trusted.Cases...)
 	for index, trustedCase := range trusted.Cases {
 		submittedCase, ok := submittedByID[trustedCase.CaseID]

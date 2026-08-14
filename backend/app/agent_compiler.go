@@ -874,6 +874,12 @@ func applyAgentCompilationResearchPolicy(pkg *AgentPackage, enabled bool) {
 	}
 	pkg.ModelPolicy.MaxCostUSD = pkg.ResearchPolicy.MaxCostUSD
 	pkg.EvaluationPolicy.SuiteVersion = "research-agent-v1"
+	pkg.EvaluationPolicy.MinimumScores = researchEvaluationMinimumScores()
+	if pkg.EvidencePolicy != nil {
+		for _, metric := range trustedEvidenceAuditEvaluationMetrics {
+			pkg.EvaluationPolicy.MinimumScores[metric] = 1
+		}
+	}
 	pkg.UIManifest.Capabilities = append(pkg.UIManifest.Capabilities, "deep_research")
 }
 

@@ -892,8 +892,8 @@ func loadEvidenceAuditPackageContext(
 	if err := ctx.Err(); err != nil {
 		return AgentPackage{}, err
 	}
-	if pkg.SchemaVersion != AgentPackageSchemaVersionV2 || pkg.EvidencePolicy == nil {
-		return AgentPackage{}, fmt.Errorf("evidence audit requires a published agent-package.v2 with evidence_policy")
+	if (pkg.SchemaVersion != AgentPackageSchemaVersionV2 && pkg.SchemaVersion != AgentPackageSchemaVersionV3) || pkg.EvidencePolicy == nil {
+		return AgentPackage{}, fmt.Errorf("evidence audit requires a published evidence-capable package with evidence_policy")
 	}
 	return *pkg, nil
 }

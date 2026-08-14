@@ -3,7 +3,7 @@
   "$id": "https://kbase.executor.life/contracts/agent-evaluation-v1.schema.json",
   "title": "KBase Agent Evaluation Suite v1",
   "type": "object",
-  "required": ["schema_version", "suite_version", "cases"],
+  "required": ["schema_version", "suite_version"],
   "properties": {
     "schema_version": { "const": "agent-evaluation.v1" },
     "suite_version": { "type": "string", "minLength": 1 },
@@ -11,8 +11,17 @@
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/$defs/case" }
+    },
+    "research_cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/research_case" }
     }
   },
+  "anyOf": [
+    { "required": ["cases"] },
+    { "required": ["research_cases"] }
+  ],
   "additionalProperties": false,
   "$defs": {
     "metric": {
@@ -145,6 +154,77 @@
           }
         }
       ],
+      "additionalProperties": false
+    },
+    "research_conclusion": {
+      "type": "object",
+      "required": ["claim_id", "evidence_ids"],
+      "properties": {
+        "claim_id": { "type": "string", "minLength": 1 },
+        "evidence_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "research_expected": {
+      "type": "object",
+      "required": ["outcome", "minimum_citation_coverage"],
+      "properties": {
+        "searched_sources": { "type": "array", "items": { "enum": ["knowledge", "chatlog", "prior_runs"] } },
+        "identity_status": { "enum": ["resolved", "ambiguous", "not_found"] },
+        "identity_id": { "type": "string" },
+        "timeline_event_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "trend_direction": { "enum": ["up", "down", "flat", "mixed"] },
+        "direct_advice_claim_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "conflict_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "case_difference_dimensions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "outcome": { "type": "string", "minLength": 1 },
+        "failure_code": { "type": "string" },
+        "material_claim_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "minimum_citation_coverage": { "type": "number", "minimum": 0, "maximum": 1 },
+        "recovery_status": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "research_observed": {
+      "type": "object",
+      "properties": {
+        "searched_sources": { "type": "array", "items": { "enum": ["knowledge", "chatlog", "prior_runs"] } },
+        "identity_status": { "enum": ["resolved", "ambiguous", "not_found"] },
+        "identity_id": { "type": "string" },
+        "timeline_event_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "numeric_values": { "type": "array", "items": { "type": "number" } },
+        "reported_trend_direction": { "enum": ["up", "down", "flat", "mixed"] },
+        "direct_advice_claim_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "conflict_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "case_difference_dimensions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "transferred_amount": { "type": "string" },
+        "recovery_status": { "type": "string" },
+        "conclusions": { "type": "array", "items": { "$ref": "#/$defs/research_conclusion" } },
+        "available_evidence_ids": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "outcome": { "type": "string" },
+        "failure_code": { "type": "string" },
+        "latency_ms": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": "number", "minimum": 0 },
+        "private_projection_safe": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "research_case": {
+      "type": "object",
+      "required": ["case_id", "mode", "question", "expected", "observed", "max_latency_ms", "max_cost_usd"],
+      "properties": {
+        "case_id": { "type": "string", "minLength": 1 },
+        "mode": { "enum": ["quick", "deep"] },
+        "question": { "type": "string", "minLength": 1 },
+        "expected": { "$ref": "#/$defs/research_expected" },
+        "observed": { "$ref": "#/$defs/research_observed" },
+        "max_latency_ms": { "type": "integer", "minimum": 1 },
+        "max_cost_usd": { "type": "number", "exclusiveMinimum": 0 }
+      },
       "additionalProperties": false
     }
   }

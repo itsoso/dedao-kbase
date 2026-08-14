@@ -812,6 +812,7 @@ func validAgentPackageV3() AgentPackage {
 		})
 	}
 	pkg.EvaluationPolicy.SuiteVersion = "research-agent-v1"
+	pkg.EvaluationPolicy.MinimumScores = researchEvaluationMinimumScores()
 	pkg.UIManifest.Capabilities = append(pkg.UIManifest.Capabilities, "deep_research")
 	return pkg
 }

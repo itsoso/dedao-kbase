@@ -2667,7 +2667,7 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		}
 		evaluationSuite := input.Suite
 		trustedSuiteHash := ""
-		if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+		if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 || input.Package.SchemaVersion == AgentPackageSchemaVersionV3 {
 			var resolveErr error
 			evaluationSuite, trustedSuiteHash, resolveErr = h.store.ResolveTrustedAgentEvaluationSuite(
 				input.Package,
@@ -2688,8 +2688,12 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
 				return
 			}
-			if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 {
+			if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 || input.Package.SchemaVersion == AgentPackageSchemaVersionV3 {
 				if existing.TrustedSuiteHash == "" {
+					if input.Package.SchemaVersion == AgentPackageSchemaVersionV3 {
+						writeHTTPError(w, http.StatusConflict, "research package trusted evaluation identity is missing")
+						return
+					}
 					evaluatedAt, parseErr := time.Parse(time.RFC3339Nano, existing.EvaluatedAt)
 					if parseErr != nil {
 						writeHTTPError(w, http.StatusConflict, "legacy agent package evaluation timestamp is invalid")

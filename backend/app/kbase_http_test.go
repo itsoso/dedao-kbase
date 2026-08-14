@@ -334,6 +334,52 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
+func TestKBaseHTTPHandlerTrustsEvaluatesAndPublishesResearchPackageV3(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveAgentPackageTestRelease(t, store)
+	pkg := finalizedResearchEvaluationPackage(t)
+	submitted := loadResearchEvaluationFixture(t)
+	trusted := trustedResearchEvaluationFixture(submitted)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "admin-token", AgentPublisherToken: "publisher-token",
+	})
+
+	trustPayload, err := json.Marshal(AgentPackageTrustedEvaluationSuiteRequest{Package: pkg, Suite: trusted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustedResponse := requestJSONKBase(
+		handler, http.MethodPost, "/api/agent-packages/evaluation-suites/trust", "admin-token", string(trustPayload),
+	)
+	if trustedResponse.Code != http.StatusCreated {
+		t.Fatalf("trust research suite status=%d body=%s", trustedResponse.Code, trustedResponse.Body.String())
+	}
+
+	evaluatePayload, err := json.Marshal(AgentPackageEvaluationRequest{Package: pkg, Suite: submitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated := requestJSONKBase(
+		handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(evaluatePayload),
+	)
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("evaluate research package status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+
+	publishPayload, err := json.Marshal(AgentPackagePublishRequest{
+		IdempotencyKey: "research-http-publish", Package: pkg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := requestJSONKBase(
+		handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishPayload),
+	)
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), AgentPackageSchemaVersionV3) {
+		t.Fatalf("publish research package status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
 func TestKBaseHTTPHandlerControlledAgentRequiresCookieSessionAndBuildsDraft(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)

@@ -240,7 +240,7 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	if err := validateAgentPackageSafety(pkg.SafetyPolicy); err != nil {
 		return err
 	}
-	if err := validateAgentPackageEvaluation(pkg.SchemaVersion, pkg.EvaluationPolicy); err != nil {
+	if err := validateAgentPackageEvaluation(pkg.SchemaVersion, pkg.EvidencePolicy != nil, pkg.EvaluationPolicy); err != nil {
 		return err
 	}
 	if err := validateAgentPackageUI(pkg.UIManifest); err != nil {
@@ -434,22 +434,26 @@ func validateAgentPackageResearch(policy AgentPackageResearchPolicy, tools Agent
 	return nil
 }
 
-func validateAgentPackageEvaluation(schemaVersion string, policy AgentPackageEvaluationPolicy) error {
+func validateAgentPackageEvaluation(schemaVersion string, hasEvidencePolicy bool, policy AgentPackageEvaluationPolicy) error {
 	if strings.TrimSpace(policy.SuiteVersion) == "" {
 		return fmt.Errorf("evaluation_policy.suite_version is required")
 	}
 	if len(policy.MinimumScores) == 0 {
 		return fmt.Errorf("evaluation_policy.minimum_scores is required")
 	}
-	for _, metric := range []string{
+	requiredMetrics := []string{
 		"retrieval", "retrieval_precision", "citations", "faithfulness", "abstention",
 		"tool_choice", "tool_arguments", "task_completion", "latency", "cost",
-	} {
+	}
+	if schemaVersion == AgentPackageSchemaVersionV3 {
+		requiredMetrics = ResearchEvaluationMetricNames()
+	}
+	for _, metric := range requiredMetrics {
 		if _, ok := policy.MinimumScores[metric]; !ok {
 			return fmt.Errorf("required evaluation metric %q is missing", metric)
 		}
 	}
-	if schemaVersion == AgentPackageSchemaVersionV2 {
+	if schemaVersion == AgentPackageSchemaVersionV2 || hasEvidencePolicy {
 		for _, metric := range []string{
 			"adjudication_consistency",
 			"source_independence",
