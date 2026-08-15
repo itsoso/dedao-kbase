@@ -421,6 +421,36 @@ func TestAgentCompilationResearchOptInEmitsV4WithoutChangingOrdinaryTools(t *tes
 	}
 }
 
+func TestAgentCompilationResearchStudyPreservesEvidenceOnlyAndInfersLegacyDedaoSource(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	primary := agentCompilerTestRelease(
+		"release-research-legacy", "book-research-legacy", "2026-08-14T10:00:00Z",
+		"有证据的结论", "Publisher", "",
+	)
+	primary.Book.DedaoID = 128942
+	primary.UsagePolicy = BookUsageEvidenceOnly
+	primary.Quality.UsagePolicy = BookUsageEvidenceOnly
+	saveKnowledgeAssemblyRelease(t, store, primary)
+
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion, Mode: AgentCompilationModeStudy,
+		PrimaryReleaseID: primary.ReleaseID, Version: "1.0.0", ResearchEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != AgentCompilationStatusReady || len(result.Candidates) != 1 || result.Candidates[0].Package == nil {
+		t.Fatalf("legacy Research compilation = %#v", result)
+	}
+	pkg := result.Candidates[0].Package
+	if !reflect.DeepEqual(pkg.RetrievalPolicy.AllowedSourceTypes, []string{"dedao_ebook"}) {
+		t.Fatalf("allowed source types = %#v", pkg.RetrievalPolicy.AllowedSourceTypes)
+	}
+	if pkg.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly {
+		t.Fatalf("usage policy = %q", pkg.SafetyPolicy.UsagePolicy)
+	}
+}
+
 func TestCompileAgentPackagesDualKeepsStudyReadyWithoutSupport(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	primary := agentCompilerTestRelease(

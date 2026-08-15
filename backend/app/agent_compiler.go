@@ -485,6 +485,20 @@ func compileStudyAgentCandidate(
 			},
 		)
 	}
+	sourceType, err := controlledAgentSourceType(release.Book)
+	if err != nil {
+		return blockedAgentCompilationCandidate(
+			AgentCompilationCandidateStudy,
+			AgentCompilationIssue{
+				Code:    AgentCompilationIssueReleaseInvalid,
+				Message: "The primary release has no usable source type.",
+			},
+		)
+	}
+	usagePolicy := strings.TrimSpace(release.UsagePolicy)
+	if usagePolicy == "" {
+		usagePolicy = BookUsageStandard
+	}
 	pkg := AgentPackage{
 		SchemaVersion:  AgentPackageSchemaVersionV1,
 		PackageID:      opaqueAgentCompilationPackageID(release.BookID, AgentCompilationCandidateStudy),
@@ -497,7 +511,7 @@ func compileStudyAgentCandidate(
 		}},
 		RetrievalPolicy: AgentPackageRetrievalPolicy{
 			Strategy:           "lexical",
-			AllowedSourceTypes: []string{release.Book.SourceType},
+			AllowedSourceTypes: []string{sourceType},
 			RequireCitations:   true,
 			MaxContextChunks:   8,
 		},
@@ -513,7 +527,7 @@ func compileStudyAgentCandidate(
 		}},
 		ToolPolicy: allReadOnlyAgentCompilationTools(),
 		SafetyPolicy: AgentPackageSafetyPolicy{
-			UsagePolicy:       BookUsageStandard,
+			UsagePolicy:       usagePolicy,
 			AbstentionReasons: []string{"insufficient_evidence", "outside_scope"},
 			EscalationTarget:  "human_review",
 		},
@@ -647,7 +661,17 @@ func compileEvidenceAgentCandidate(
 			ReleaseID: release.ReleaseID,
 			Role:      role,
 		})
-		sourceTypes = append(sourceTypes, release.Book.SourceType)
+		sourceType, err := controlledAgentSourceType(release.Book)
+		if err != nil {
+			return blockedAgentCompilationCandidate(
+				AgentCompilationCandidateEvidence,
+				AgentCompilationIssue{
+					Code:    AgentCompilationIssueReleaseInvalid,
+					Message: "A selected release has no usable source type.",
+				},
+			)
+		}
+		sourceTypes = append(sourceTypes, sourceType)
 	}
 	pkg := AgentPackage{
 		SchemaVersion:  AgentPackageSchemaVersionV2,

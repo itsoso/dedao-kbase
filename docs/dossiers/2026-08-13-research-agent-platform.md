@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13
 
-**Status:** Layer E implementation complete; G1–G4 passed; G5–G6 pending
+**Status:** Layer E implementation complete; G1–G5 passed; G6 remediation in progress
 
 **Approved design:**
 [Research Agent Platform Design](../plans/2026-08-13-research-agent-platform-design.md)
@@ -40,8 +40,8 @@ editing, message deletion, bulk private-data export, or automatic publication.
 | G2 Feasibility and risk | PASS | The macOS Chatlog Worker, shared-token control plane, bounded evidence promotion, typed outcomes, resumable orchestration, and private-data persistence boundaries have focused tests. A content-free loopback probe on 2026-08-14 returned HTTP 200 with a valid aggregate response. |
 | G3 Tests | PASS | On 2026-08-14 the complete Task 14 suite passed without output truncation: module verification, vet, all Go tests, frontend build, every Web smoke, Research process smoke, Chatlog packaging smoke, direct-deployment smokes, system-map drift, privacy, and diff checks. The first attempt exposed a brittle mobile CSS smoke selector; its root cause was fixed and the complete suite was rerun from the beginning. |
 | G4 Review | PASS | The seventh independent review of the exact staged integration candidate reported Critical 0, Important 0, Ready to merge Yes. It verified public v3/v4 schemas, HTTP/create-and-resume v4 enforcement, direct/Worker/derived tool authorization, policy-denied terminal behavior, and isolated process smoke. |
-| G5 Deployment health | PENDING | Nothing from this feature has been deployed. |
-| G6 Online verification | PENDING | No production Research Run has been executed. |
+| G5 Deployment health | PASS | Reviewed revision `23375066acd429ae164e8f4bf2496503db9efc93` was deployed on 2026-08-15. Public and loopback health reported that exact revision; KBase, book-job Worker, three evolution Workers, and the macOS Chatlog Worker were active with zero failed start status. Installed binary hashes matched the staged candidates and the post-cutover warning window was empty. Recoverable server and evolution backups were retained under the revision-scoped deployment batch. |
+| G6 Online verification | IN PROGRESS | The first production compile against real immutable Releases exposed two legacy-compatibility blockers before any Research Run was created: an older Dedao Release had an empty persisted source type despite a controlled Dedao identifier, and a real WeChat article Release carried `evidence_only` while study compilation forced `standard`. The narrowly scoped compiler remediation passed production-data read-only diagnostics and independent review; deployment and real quick/deep Runs remain required. |
 
 ## Current checkpoint
 
@@ -540,3 +540,36 @@ package and proves that the Research endpoint rejects it as ineligible.
 
 G4 is PASS. Deployment health and authorized real-data acceptance remain
 separate G5/G6 gates and are not implied by this code-review decision.
+
+## G5 deployment and G6 remediation checkpoint
+
+Reviewed merge revision `23375066acd429ae164e8f4bf2496503db9efc93` was
+published to canonical main and deployed as one revision across the KBase
+server, book-job Worker, three evolution Workers, and the macOS Chatlog Worker.
+The server deployment used candidate-first health probes and revision-scoped
+recoverable backups. Public and loopback health, system service state, build
+metadata, candidate/install hashes, and a post-cutover warning window all
+passed. Research was explicitly enabled in the server environment without
+changing the approved shared-token Worker transport.
+
+The first authorized G6 compile used real production Release metadata rather
+than a synthetic seed. It correctly failed closed, revealing two compatibility
+gaps in legacy immutable Releases: controlled Dedao records created before
+source typing could have an empty `SourceType`, and real WeChat evidence
+Releases could already be restricted to `evidence_only`. The compiler
+remediation reuses the existing controlled source inference, which permits a
+Dedao inference only from a Dedao ID, EnID, or `dedao://ebook/` locator; all
+other missing sources remain blocked. Study compilation now inherits the
+Release usage policy and defaults only an actually empty policy to `standard`,
+so the change cannot weaken an evidence-only Release.
+
+The remediation passed focused compiler/HTTP/no-downgrade tests, the complete
+backend package, the Research process smoke, focused race detection,
+system-map drift, privacy, and diff checks. A read-only diagnostic against the
+real production Release store validated both a legacy Dedao book as
+`dedao_ebook`/`standard` and a real WeChat article as
+`wechat_mp_article`/`evidence_only`, without printing or persisting source
+content. Independent review returned Ready to merge Yes with zero Critical and
+zero Important findings. G6 remains open until the exact remediation revision
+is deployed and both real quick and deep Research Runs, citations, Worker
+search/fetch/expand flow, persistence, and restart recovery are verified.
