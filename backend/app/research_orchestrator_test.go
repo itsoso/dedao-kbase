@@ -23,6 +23,8 @@ type fakeResearchStageModel struct {
 	plannerOutputs   []ResearchPlannerOutput
 	extractorOutput  *ResearchExtractorOutput
 	malformedExtract bool
+	synthesizedCount int
+	synthesizedSize  int
 }
 
 type blockingResearchStageModel struct {
@@ -142,6 +144,23 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 	case *ResearchSynthesizerOutput:
 		if len(evidenceIDs) == 0 {
 			return ResearchModelUsage{}, errors.New("no evidence marker")
+		}
+		if m.synthesizedCount > 0 {
+			conclusions := make([]ResearchConclusionDraft, 0, m.synthesizedCount)
+			for index := 0; index < m.synthesizedCount; index++ {
+				conclusion := ResearchConclusionDraft{
+					ConclusionID:       fmt.Sprintf("conclusion-%d", index),
+					Text:               strings.Repeat("grounded conclusion ", m.synthesizedSize),
+					SupportEvidenceIDs: []string{evidenceIDs[index%len(evidenceIDs)]},
+					Confidence:         0.9,
+				}
+				if len(citationIDs) > 0 {
+					conclusion.CitationIDs = []string{citationIDs[index%len(citationIDs)]}
+				}
+				conclusions = append(conclusions, conclusion)
+			}
+			*value = ResearchSynthesizerOutput{DecisionSummary: "Synthesize grounded evidence", Conclusions: conclusions}
+			break
 		}
 		conclusion := ResearchConclusionDraft{
 			ConclusionID: "conclusion-a", Text: "Synthetic grounded conclusion",
@@ -320,9 +339,13 @@ func TestResearchOrchestratorQuickPathBoundsEvidenceBeforeModelCostReservation(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	model := &fakeResearchStageModel{usage: ResearchModelUsage{
-		InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CostUSD: 0.015,
-	}}
+	model := &fakeResearchStageModel{
+		synthesizedCount: 4,
+		synthesizedSize:  20,
+		usage: ResearchModelUsage{
+			InputTokens: 2681, OutputTokens: 843, TotalTokens: 3524, CostUSD: 0.3524,
+		},
+	}
 	orchestrator, err := NewResearchOrchestrator(ResearchOrchestratorConfig{
 		KnowledgeStore: knowledge, ResearchStore: research, Tools: tools, Model: model,
 		ModelConfig: BookTokenPlanConfig{APIKey: "synthetic", Model: "qwen-plus"}, WorkerAgentID: "chatlog-agent",
@@ -346,9 +369,39 @@ func TestResearchOrchestratorQuickPathBoundsEvidenceBeforeModelCostReservation(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	drafts, err := orchestrator.loadDrafts(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if result.Run.Status != ResearchCompleted || result.Outcome != ResearchOutcomeCompleted ||
-		len(evidence) != 3 {
-		t.Fatalf("quick cost result=%#v evidence=%d calls=%#v", result, len(evidence), model.calls)
+		len(evidence) != researchQuickKnowledgeLimit || len(drafts) != researchQuickConclusionLimit {
+		t.Fatalf("quick cost result=%#v evidence=%d drafts=%d calls=%#v", result, len(evidence), len(drafts), model.calls)
+	}
+}
+
+func TestResearchOrchestratorQuickPathBoundsDraftsBeforeVerifierCostReservation(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.synthesizedCount = 4
+	model.synthesizedSize = 20
+	model.usage = ResearchModelUsage{InputTokens: 2681, OutputTokens: 843, TotalTokens: 3524, CostUSD: 0.3524}
+	input := researchStoreTestInput("quick-draft-cost-boundary")
+	input.Request.PackageID = pkg.PackageID
+	input.Request.PackageVersion = pkg.Version
+	input.Request.Question = "grounded"
+	input.Budget.MaxCostUSD = 1
+	run, _, err := research.CreateRun(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 12)
+	drafts, err := orchestrator.loadDrafts(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.Status != ResearchCompleted || result.Outcome != ResearchOutcomeCompleted ||
+		len(drafts) != researchQuickConclusionLimit || model.callCount(ResearchRoleVerifier) != 1 {
+		t.Fatalf("quick draft cost result=%#v drafts=%d calls=%#v", result, len(drafts), model.calls)
 	}
 }
 

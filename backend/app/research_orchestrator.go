@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	ResearchWaitWorkerPending   = "worker_pending"
-	researchQuickKnowledgeLimit = 3
+	ResearchWaitWorkerPending    = "worker_pending"
+	researchQuickKnowledgeLimit  = 3
+	researchQuickConclusionLimit = 2
 
 	ResearchOutcomeCompleted          = "completed"
 	ResearchOutcomeWorkerOffline      = "worker_offline"
@@ -865,7 +866,11 @@ func (o *ResearchOrchestrator) advanceSynthesizing(ctx context.Context, run Rese
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
-	messages, err := o.stageMessages(ctx, run, ResearchRoleSynthesizer, "Synthesize conclusions. Every conclusion must cite accessible support.")
+	instruction := "Synthesize conclusions. Every conclusion must cite accessible support."
+	if run.Mode == ResearchModeQuick {
+		instruction = "Synthesize at most two concise conclusions. Every conclusion must cite accessible support."
+	}
+	messages, err := o.stageMessages(ctx, run, ResearchRoleSynthesizer, instruction)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
@@ -876,7 +881,11 @@ func (o *ResearchOrchestrator) advanceSynthesizing(ctx context.Context, run Rese
 	if len(output.Conclusions) == 0 {
 		return ResearchAdvanceResult{}, ErrResearchPartialEvidence
 	}
-	if err := o.saveDrafts(run, output.Conclusions); err != nil {
+	drafts := output.Conclusions
+	if run.Mode == ResearchModeQuick && len(drafts) > researchQuickConclusionLimit {
+		drafts = drafts[:researchQuickConclusionLimit]
+	}
+	if err := o.saveDrafts(run, drafts); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	return o.transition(run, ResearchVerifying, "conclusions_synthesized")

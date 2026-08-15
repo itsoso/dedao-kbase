@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -177,19 +177,36 @@ func newClinicalTrialAuditStore(root string, now func() time.Time) (*ClinicalTri
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("configure clinical trial audit busy timeout: %w", err)
 	}
 	if err := migrateClinicalTrialAuditDB(db); err != nil {
 		db.Close()
-		return nil, err
+		return nil, fmt.Errorf("migrate clinical trial audit database: %w", err)
 	}
 	for _, statement := range []string{`PRAGMA foreign_keys = ON`, `PRAGMA journal_mode = WAL`} {
-		if _, err := db.Exec(statement); err != nil {
+		if err := execClinicalTrialAuditPragma(db, statement); err != nil {
 			db.Close()
-			return nil, err
+			return nil, fmt.Errorf("configure clinical trial audit database with %q: %w", statement, err)
 		}
 	}
 	return &ClinicalTrialAuditStore{root: root, dbPath: dbPath, now: now, random: rand.Reader, db: db}, nil
+}
+
+func execClinicalTrialAuditPragma(db *sql.DB, statement string) error {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := db.Exec(statement)
+		if err == nil {
+			return nil
+		}
+		var sqliteErr sqlite3.Error
+		if !errors.As(err, &sqliteErr) ||
+			(sqliteErr.Code != sqlite3.ErrBusy && sqliteErr.Code != sqlite3.ErrLocked) ||
+			!time.Now().Before(deadline) {
+			return err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (s *ClinicalTrialAuditStore) Root() string {

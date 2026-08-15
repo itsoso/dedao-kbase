@@ -769,3 +769,38 @@ read the wall clock again, and required the two second-formatted values to be
 identical. The assertion now parses the emitted RFC3339 anchor and proves it is
 between timestamps captured immediately before and after prompt generation;
 twenty consecutive focused runs pass. Runtime time anchoring was unchanged.
+
+### Real quick verification cost-boundary finding
+
+The exact `ec6a967e5fcf72ff2b9e5f0f0f9f93f81b9c67a5` deployment removed the
+zero-model-call budget failure. A broad production question then completed one
+synthesizer invocation but returned no conclusion because the three selected
+excerpts did not contain the requested symptom or escalation terms; the Run
+correctly ended as `partial_evidence`. Aggregate-only inspection confirmed
+three knowledge evidence records and no Chatlog access.
+
+A second question aligned to highly represented collection topics produced
+four grounded draft conclusions after one successful synthesizer call. It then
+ended as `budget_exhausted` before verifier invocation: the first call used
+0.3524 USD and the complete evidence plus four draft records could not fit the
+remaining conservative one-dollar quick budget. This was a separate
+end-to-end boundary from the already-fixed evidence count.
+
+The follow-up keeps the one-dollar hard limit and three highest-ranked evidence
+records, while bounding quick synthesis to the first two ordered grounded
+conclusions before verification. Deep mode remains unchanged. The regression
+uses three maximum-length knowledge excerpts, a four-conclusion synthesizer
+response, and the observed first-call cost; it requires exactly two persisted
+drafts, one verifier call, and a completed Run. Exact-revision deployment and
+another production quick Run are still required before G6 can pass.
+
+The final full-suite rerun also exposed an unrelated existing SQLite startup
+race: two concurrent clinical-trial audit stores could both finish schema
+migration and then contend while enabling WAL; SQLite does not reliably apply
+the configured busy timeout to that journal-mode transition. The constructor
+now retries only `SQLITE_BUSY` and `SQLITE_LOCKED` for that bounded setup step,
+preserves all other errors, and reports the failing phase. Five hundred
+concurrent legacy-migration repetitions pass after the fix. The complete Gate
+suite then passed on the combined candidate: module verification, vet, the full
+Go suite, frontend production build and UI smokes, Research process smoke,
+focused race, system-map drift, privacy, and diff checks all returned zero.
