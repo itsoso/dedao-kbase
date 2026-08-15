@@ -26,6 +26,7 @@ const (
 	ResearchOutcomeSourceChanged     = "source_changed"
 	ResearchOutcomeModelTimeout      = "model_timeout"
 	ResearchOutcomeCanceled          = "canceled"
+	ResearchOutcomePolicyDenied      = "policy_denied"
 )
 
 var (
@@ -34,6 +35,7 @@ var (
 	ErrResearchPartialEvidence          = errors.New(ResearchOutcomePartialEvidence)
 	ErrResearchBudgetExhausted          = errors.New(ResearchOutcomeBudgetExhausted)
 	ErrResearchCitationMismatch         = errors.New(ResearchOutcomeCitationMismatch)
+	ErrResearchPolicyDenied             = errors.New(ResearchOutcomePolicyDenied)
 	ErrResearchModelInProgress          = errors.New("research model invocation is already in progress")
 	researchOrchestratorTransitionFault = func(string) error { return nil }
 )
@@ -111,6 +113,18 @@ func (o *ResearchOrchestrator) Advance(ctx context.Context, runID string) (Resea
 	if err := o.ensureState(*run); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
+	pkg, err := loadRunnableResearchAgentPackage(
+		ctx, o.config.KnowledgeStore, *run, run.PackageID, run.PackageVersion,
+	)
+	if err == nil {
+		err = validateResearchAgentRunPolicy(*pkg, *run)
+	}
+	if err != nil {
+		if errors.Is(err, ErrResearchPolicyDenied) {
+			return o.finish(*run, ResearchFailed, ResearchOutcomePolicyDenied)
+		}
+		return ResearchAdvanceResult{}, err
+	}
 	var result ResearchAdvanceResult
 	switch run.Status {
 	case ResearchPlanning:
@@ -142,7 +156,7 @@ func (o *ResearchOrchestrator) Advance(ctx context.Context, runID string) (Resea
 		return ResearchAdvanceResult{}, err
 	}
 	status := ResearchInsufficient
-	if outcome == ResearchOutcomeModelTimeout {
+	if outcome == ResearchOutcomeModelTimeout || outcome == ResearchOutcomePolicyDenied {
 		status = ResearchFailed
 	}
 	finished, finishErr := o.finish(*run, status, outcome)
@@ -170,6 +184,9 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 	}
 	for _, call := range output.ToolCalls {
 		if isResearchWorkerTool(call.Tool) {
+			if err := o.authorizeResearchTool(ctx, run, call.Tool); err != nil {
+				return ResearchAdvanceResult{}, err
+			}
 			arguments, err := json.Marshal(call.Arguments)
 			if err != nil {
 				return ResearchAdvanceResult{}, err
@@ -281,7 +298,7 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
-	planned, err := o.planChatlogCandidateFetches(run, jobs, evidence)
+	planned, err := o.planChatlogCandidateFetches(ctx, run, jobs, evidence)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
@@ -298,7 +315,7 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 	return o.transition(run, next, "deep_evidence_retrieved")
 }
 
-func (o *ResearchOrchestrator) planChatlogCandidateFetches(run ResearchRun, jobs []ResearchWorkerJob, evidence []ResearchEvidence) (bool, error) {
+func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, run ResearchRun, jobs []ResearchWorkerJob, evidence []ResearchEvidence) (bool, error) {
 	candidates, err := o.config.ResearchStore.ListResearchWorkerCandidates(run.RunID)
 	if err != nil || len(candidates) == 0 {
 		return false, err
@@ -348,6 +365,9 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(run ResearchRun, jobs
 		selectedCandidates = append(selectedCandidates, candidates[:selectionLimit]...)
 		created := false
 		for _, candidate := range selectedCandidates {
+			if err := o.authorizeResearchTool(ctx, run, ResearchWorkerToolFetchChatMessage); err != nil {
+				return false, err
+			}
 			occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
 			if err != nil {
 				return false, fmt.Errorf("invalid persisted Chatlog candidate time: %w", err)
@@ -393,6 +413,9 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(run ResearchRun, jobs
 		if remainingEvidence < contextRadius*2 {
 			return false, ErrResearchBudgetExhausted
 		}
+		if err := o.authorizeResearchTool(ctx, run, ResearchWorkerToolExpandChatContext); err != nil {
+			return false, err
+		}
 		occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
 		if err != nil {
 			return false, fmt.Errorf("invalid persisted Chatlog candidate time: %w", err)
@@ -416,6 +439,16 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(run ResearchRun, jobs
 		remainingEvidence -= contextRadius * 2
 	}
 	return created, nil
+}
+
+func (o *ResearchOrchestrator) authorizeResearchTool(ctx context.Context, run ResearchRun, toolName string) error {
+	pkg, err := loadRunnableResearchAgentPackage(
+		ctx, o.config.KnowledgeStore, run, run.PackageID, run.PackageVersion,
+	)
+	if err != nil {
+		return err
+	}
+	return authorizeResearchAgentTool(*pkg, run, toolName)
 }
 
 func (o *ResearchOrchestrator) advanceIdentity(run ResearchRun) (ResearchAdvanceResult, error) {
@@ -1547,6 +1580,8 @@ func ClassifyResearchOrchestratorOutcome(err error) string {
 		return ResearchOutcomeCitationMismatch
 	case errors.Is(err, ErrResearchEvidenceSourceChanged):
 		return ResearchOutcomeSourceChanged
+	case errors.Is(err, ErrResearchPolicyDenied):
+		return ResearchOutcomePolicyDenied
 	case errors.Is(err, context.DeadlineExceeded):
 		return ResearchOutcomeModelTimeout
 	}

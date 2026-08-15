@@ -481,7 +481,7 @@ func TestEvidenceAuditRunnerDoesNotCallModelWhenWholeAuditBudgetIsInsufficient(t
 	}
 }
 
-func TestEvidenceAuditRunnerAcceptsTrustedResearchV3WithEvidencePolicy(t *testing.T) {
+func TestEvidenceAuditRunnerAcceptsTrustedResearchV4WithEvidencePolicy(t *testing.T) {
 	store, base := evidenceAuditRunnerTestStore(t, 1, 1)
 	pkg := base
 	pkg.Version = "3.0.0-research"
@@ -496,9 +496,9 @@ func TestEvidenceAuditRunnerAcceptsTrustedResearchV3WithEvidencePolicy(t *testin
 		t.Fatal(err)
 	}
 
-	supported := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictSupported, false, "research-v3-supported")
-	conflicted := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictMixed, true, "research-v3-conflicted")
-	insufficient := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictInsufficient, false, "research-v3-insufficient")
+	supported := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictSupported, false, "research-v4-supported")
+	conflicted := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictMixed, true, "research-v4-conflicted")
+	insufficient := persistEvidenceAuditEvaluationReport(t, store, finalized, EvidenceAuditVerdictInsufficient, false, "research-v4-insufficient")
 	submitted := loadResearchEvaluationFixture(t)
 	submitted.Cases = evidenceAuditEvaluationSuite(finalized, supported, conflicted, insufficient).Cases
 	trusted := trustedResearchEvaluationFixture(submitted)
@@ -517,13 +517,13 @@ func TestEvidenceAuditRunnerAcceptsTrustedResearchV3WithEvidencePolicy(t *testin
 		t.Fatal(err)
 	}
 	published, _, err := PublishAgentPackage(
-		store, finalized, "publish-research-evidence-v3", AgentPackageKnownToolIDs(), testAgentPackageTime(),
+		store, finalized, "publish-research-evidence-v4", AgentPackageKnownToolIDs(), testAgentPackageTime(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	audit := createEvidenceAuditRunnerTask(t, store, *published, "research-v3-audit", "Evidence comparison only.")
+	audit := createEvidenceAuditRunnerTask(t, store, *published, "research-v4-audit", "Evidence comparison only.")
 	completed, err := RunEvidenceAudit(
 		context.Background(), store, audit.AuditID,
 		&evidenceAuditFakeClient{answers: []string{`{"candidate_verdict":"supported","rationale":"bounded","evidence":[{"release_id":"support-a","citation_id":"support-a-c1","stance":"supports"}],"limitations":[],"knowledge_gaps":[],"review_actions":[]}`}},

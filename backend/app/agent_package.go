@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
@@ -16,6 +17,7 @@ const (
 	AgentPackageSchemaVersionV1 = "agent-package.v1"
 	AgentPackageSchemaVersionV2 = "agent-package.v2"
 	AgentPackageSchemaVersionV3 = "agent-package.v3"
+	AgentPackageSchemaVersionV4 = "agent-package.v4"
 	AgentPackageSchemaVersion   = AgentPackageSchemaVersionV1
 	AgentPackageDraft           = "draft"
 	AgentPackagePublished       = "published"
@@ -40,30 +42,36 @@ const (
 )
 
 type AgentPackage struct {
-	SchemaVersion    string                       `json:"schema_version"`
-	PackageID        string                       `json:"package_id"`
-	Version          string                       `json:"version"`
-	ContentHash      string                       `json:"content_hash"`
-	LifecycleState   string                       `json:"lifecycle_state"`
-	Supersedes       string                       `json:"supersedes,omitempty"`
-	Releases         []AgentPackageReleaseRef     `json:"releases"`
-	RetrievalPolicy  AgentPackageRetrievalPolicy  `json:"retrieval_policy"`
-	ModelPolicy      AgentPackageModelPolicy      `json:"model_policy"`
-	PromptProfiles   []AgentPackagePromptProfile  `json:"prompt_profiles"`
-	ToolPolicy       AgentPackageToolPolicy       `json:"tool_policy"`
-	SafetyPolicy     AgentPackageSafetyPolicy     `json:"safety_policy"`
-	EvaluationPolicy AgentPackageEvaluationPolicy `json:"evaluation_policy"`
-	EvidencePolicy   *AgentPackageEvidencePolicy  `json:"evidence_policy,omitempty"`
-	ResearchPolicy   *AgentPackageResearchPolicy  `json:"research_policy,omitempty"`
-	UIManifest       AgentPackageUIManifest       `json:"ui_manifest"`
-	CreatedAt        string                       `json:"created_at,omitempty"`
-	PublishedAt      string                       `json:"published_at,omitempty"`
+	SchemaVersion      string                       `json:"schema_version"`
+	PackageID          string                       `json:"package_id"`
+	Version            string                       `json:"version"`
+	ContentHash        string                       `json:"content_hash"`
+	LifecycleState     string                       `json:"lifecycle_state"`
+	Supersedes         string                       `json:"supersedes,omitempty"`
+	Releases           []AgentPackageReleaseRef     `json:"releases,omitempty"`
+	CollectionReleases []AgentPackageCollectionRef  `json:"collection_releases,omitempty"`
+	RetrievalPolicy    AgentPackageRetrievalPolicy  `json:"retrieval_policy"`
+	ModelPolicy        AgentPackageModelPolicy      `json:"model_policy"`
+	PromptProfiles     []AgentPackagePromptProfile  `json:"prompt_profiles"`
+	ToolPolicy         AgentPackageToolPolicy       `json:"tool_policy"`
+	SafetyPolicy       AgentPackageSafetyPolicy     `json:"safety_policy"`
+	EvaluationPolicy   AgentPackageEvaluationPolicy `json:"evaluation_policy"`
+	EvidencePolicy     *AgentPackageEvidencePolicy  `json:"evidence_policy,omitempty"`
+	ResearchPolicy     *AgentPackageResearchPolicy  `json:"research_policy,omitempty"`
+	UIManifest         AgentPackageUIManifest       `json:"ui_manifest"`
+	CreatedAt          string                       `json:"created_at,omitempty"`
+	PublishedAt        string                       `json:"published_at,omitempty"`
 }
 
 type AgentPackageReleaseRef struct {
 	ReleaseID   string   `json:"release_id"`
 	ContentHash string   `json:"content_hash"`
 	CitationIDs []string `json:"citation_ids"`
+}
+
+type AgentPackageCollectionRef struct {
+	ReleaseID   string `json:"release_id"`
+	ContentHash string `json:"content_hash"`
 }
 
 type AgentPackageRetrievalPolicy struct {
@@ -177,6 +185,9 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 		if pkg.ResearchPolicy != nil {
 			return fmt.Errorf("schema_version v1 does not allow research_policy")
 		}
+		if len(pkg.CollectionReleases) != 0 {
+			return fmt.Errorf("schema_version v1 does not allow collection_releases")
+		}
 	case AgentPackageSchemaVersionV2:
 		if pkg.EvidencePolicy == nil {
 			return fmt.Errorf("evidence_policy is required for schema_version %q", AgentPackageSchemaVersionV2)
@@ -184,12 +195,28 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 		if pkg.ResearchPolicy != nil {
 			return fmt.Errorf("schema_version v2 does not allow research_policy")
 		}
+		if len(pkg.CollectionReleases) != 0 {
+			return fmt.Errorf("schema_version v2 does not allow collection_releases")
+		}
 	case AgentPackageSchemaVersionV3:
+		if pkg.EvidencePolicy != nil {
+			return fmt.Errorf("schema_version v3 does not allow evidence_policy")
+		}
+		if len(pkg.Releases) != 0 {
+			return fmt.Errorf("releases must be empty for schema_version %q", AgentPackageSchemaVersionV3)
+		}
+		if pkg.ResearchPolicy != nil {
+			return fmt.Errorf("schema_version v3 does not allow research_policy")
+		}
+	case AgentPackageSchemaVersionV4:
 		if pkg.ResearchPolicy == nil {
-			return fmt.Errorf("research_policy is required for schema_version %q", AgentPackageSchemaVersionV3)
+			return fmt.Errorf("research_policy is required for schema_version %q", AgentPackageSchemaVersionV4)
+		}
+		if len(pkg.CollectionReleases) != 0 {
+			return fmt.Errorf("schema_version v4 does not allow collection_releases")
 		}
 	default:
-		return fmt.Errorf("schema_version must be %q, %q, or %q", AgentPackageSchemaVersionV1, AgentPackageSchemaVersionV2, AgentPackageSchemaVersionV3)
+		return fmt.Errorf("schema_version must be %q, %q, %q, or %q", AgentPackageSchemaVersionV1, AgentPackageSchemaVersionV2, AgentPackageSchemaVersionV3, AgentPackageSchemaVersionV4)
 	}
 	if err := requireContractFields(map[string]string{
 		"package_id":                        pkg.PackageID,
@@ -217,7 +244,7 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	if pkg.ContentHash != wantHash {
 		return fmt.Errorf("content_hash does not match deterministic package content")
 	}
-	if len(pkg.Releases) == 0 {
+	if pkg.SchemaVersion != AgentPackageSchemaVersionV3 && len(pkg.Releases) == 0 {
 		return fmt.Errorf("releases must pin at least one published release")
 	}
 	if err := validateAgentPackageRetrieval(pkg.RetrievalPolicy); err != nil {
@@ -245,6 +272,9 @@ func ValidateAgentPackage(pkg AgentPackage, store *BookKnowledgeStore, knownTool
 	}
 	if err := validateAgentPackageUI(pkg.UIManifest); err != nil {
 		return err
+	}
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		return validateAgentPackageCollectionReleases(pkg, store)
 	}
 	validatedReleases, err := validateAgentPackageReleases(pkg, store)
 	if err != nil {
@@ -445,7 +475,7 @@ func validateAgentPackageEvaluation(schemaVersion string, hasEvidencePolicy bool
 		"retrieval", "retrieval_precision", "citations", "faithfulness", "abstention",
 		"tool_choice", "tool_arguments", "task_completion", "latency", "cost",
 	}
-	if schemaVersion == AgentPackageSchemaVersionV3 {
+	if schemaVersion == AgentPackageSchemaVersionV4 {
 		requiredMetrics = ResearchEvaluationMetricNames()
 	}
 	for _, metric := range requiredMetrics {
@@ -699,6 +729,59 @@ func validateAgentPackageReleases(
 	return validated, nil
 }
 
+func validateAgentPackageCollectionReleases(pkg AgentPackage, store *BookKnowledgeStore) error {
+	if store == nil {
+		return fmt.Errorf("published collection release store is required")
+	}
+	if len(pkg.CollectionReleases) != 1 {
+		return fmt.Errorf("collection_releases must pin exactly one published collection release")
+	}
+	ref := pkg.CollectionReleases[0]
+	if ref.ReleaseID == "" || ref.ReleaseID != strings.TrimSpace(ref.ReleaseID) {
+		return fmt.Errorf("collection_releases[0].release_id is required and must use canonical form")
+	}
+	if ref.ContentHash == "" || ref.ContentHash != strings.TrimSpace(ref.ContentHash) {
+		return fmt.Errorf("collection_releases[0].content_hash is required for an immutable reference")
+	}
+	release, err := store.LoadKnowledgeCollectionRelease(ref.ReleaseID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("published collection release %q was not found", ref.ReleaseID)
+		}
+		return fmt.Errorf("load published collection release %q: %w", ref.ReleaseID, err)
+	}
+	if release.ContentHash != ref.ContentHash {
+		return fmt.Errorf("collection release %q content hash does not match pinned content hash", ref.ReleaseID)
+	}
+	if release.UsagePolicy != BookUsageEvidenceOnly || pkg.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly {
+		return fmt.Errorf("collection Agent safety policy must be %q", BookUsageEvidenceOnly)
+	}
+	if release.Definition.SourceType != "wechat_mp_article" {
+		return fmt.Errorf("collection release source type %q is unsupported", release.Definition.SourceType)
+	}
+	allowedSources := sortedUniqueStrings(pkg.RetrievalPolicy.AllowedSourceTypes)
+	if len(allowedSources) != 1 || allowedSources[0] != release.Definition.SourceType {
+		return fmt.Errorf("collection release source type %q is outside retrieval policy", release.Definition.SourceType)
+	}
+	readOnly := stringSet(AgentReadOnlyToolIDs())
+	configured := make(map[string]bool, len(pkg.ToolPolicy.Tools))
+	for _, rule := range pkg.ToolPolicy.Tools {
+		toolID := strings.TrimSpace(rule.MCPServer) + "/" + strings.TrimSpace(rule.ToolName)
+		if !readOnly[toolID] {
+			return fmt.Errorf("collection Agent tool %q is not read-only", toolID)
+		}
+		if rule.Decision == AgentToolAllow {
+			configured[toolID] = true
+		}
+	}
+	for _, required := range []string{"book-mcp/agent.search", "book-mcp/agent.resolve_citation"} {
+		if !configured[required] {
+			return fmt.Errorf("collection Agent requires read-only tool %q", required)
+		}
+	}
+	return nil
+}
+
 func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {
 	payload, err := json.Marshal(pkg)
 	if err != nil {
@@ -721,6 +804,12 @@ func normalizeAgentPackageForHash(pkg AgentPackage) (AgentPackage, error) {
 			return normalized.Releases[i].ContentHash < normalized.Releases[j].ContentHash
 		}
 		return normalized.Releases[i].ReleaseID < normalized.Releases[j].ReleaseID
+	})
+	sort.Slice(normalized.CollectionReleases, func(i, j int) bool {
+		if normalized.CollectionReleases[i].ReleaseID == normalized.CollectionReleases[j].ReleaseID {
+			return normalized.CollectionReleases[i].ContentHash < normalized.CollectionReleases[j].ContentHash
+		}
+		return normalized.CollectionReleases[i].ReleaseID < normalized.CollectionReleases[j].ReleaseID
 	})
 	normalized.RetrievalPolicy.AllowedSourceTypes = sortedUniqueStrings(normalized.RetrievalPolicy.AllowedSourceTypes)
 	normalized.ModelPolicy.Fallbacks = uniqueTrimmedStrings(normalized.ModelPolicy.Fallbacks)

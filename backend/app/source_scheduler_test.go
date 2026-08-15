@@ -99,7 +99,7 @@ func TestSourceSchedulerDoesNotRetryBlockedFailures(t *testing.T) {
 		"wcplus operation blocked: not_max_version",
 		"source agent request failed with HTTP 401 unauthorized",
 		"wcplus license expired",
-		"request throttled",
+		"wechat discovery failed: verification_required",
 		"request parameter expired",
 	}
 	for index, reason := range reasons {
@@ -125,6 +125,71 @@ func TestSourceSchedulerDoesNotRetryBlockedFailures(t *testing.T) {
 	}
 	if len(runs) != len(reasons) {
 		t.Fatalf("blocked failures were retried: %#v", runs)
+	}
+}
+
+func TestSourceSchedulerThrottleCooldownBecomesRetryable(t *testing.T) {
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC))
+	store, err := newSourceSyncStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	subscription := createSchedulerTestSubscription(t, store, "throttle", "interval:60", true)
+	failed := createSchedulerFailedRun(t, store, "agent-scheduler", "wechat discovery failed: throttled")
+	if failed.FailureCode != SourceRunFailureThrottled || failed.RetryAfter == "" {
+		t.Fatalf("failed=%#v", failed)
+	}
+	scheduler, err := NewSourceScheduler(store, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Minute)
+	result, err := scheduler.Tick()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 0 || result.SkippedCooldown != 1 {
+		t.Fatalf("during cooldown=%#v", result)
+	}
+	clock.Advance(defaultSourceThrottleCooldown)
+	result, err = scheduler.Tick()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 1 || result.Retried != 1 || result.SkippedCooldown != 0 {
+		t.Fatalf("after cooldown=%#v", result)
+	}
+	runs, err := store.ListRuns(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := latestSchedulerRun(t, runs, subscription.ID)
+	if latest.RetryOf != failed.ID || latest.Attempt != 2 {
+		t.Fatalf("retry=%#v", latest)
+	}
+}
+
+func TestSourceSchedulerThrottleCooldownDoesNotDuplicateActiveRun(t *testing.T) {
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 12, 13, 0, 0, 0, time.UTC))
+	store, err := newSourceSyncStore(t.TempDir(), clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	createSchedulerTestSubscription(t, store, "throttle-active", "interval:60", true)
+	failed := createSchedulerFailedRun(t, store, "agent-scheduler", "request throttled")
+	clock.Advance(defaultSourceThrottleCooldown + 2*time.Minute)
+	if _, err := store.RetryRun(failed.ID); err != nil {
+		t.Fatal(err)
+	}
+	scheduler, _ := NewSourceScheduler(store, clock.Now)
+	result, err := scheduler.Tick()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 0 || result.SkippedActive != 1 {
+		t.Fatalf("result=%#v", result)
 	}
 }
 

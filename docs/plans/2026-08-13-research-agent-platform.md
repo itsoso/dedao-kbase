@@ -916,8 +916,8 @@ git commit -m "feat(kbase): expose research runs"
 
 **Step 1: Write failing package-policy tests**
 
-Add an opt-in `agent-package.v3` Research policy. Test that v1/v2 hashes and
-validation remain unchanged, v3 requires an explicit policy, normal compilation
+Add an opt-in `agent-package.v4` Research policy. Test that v1/v2/v3 hashes and
+validation remain unchanged, v4 requires an explicit policy, normal compilation
 does not gain Chatlog access, and a research-enabled compilation receives only
 the approved read-only tools.
 
@@ -925,7 +925,7 @@ the approved read-only tools.
 
 Run: `go test ./backend/app -run 'TestAgentPackage.*Research|TestAgentCompilation.*Research'`
 
-Expected: FAIL because v3 and the policy do not exist.
+Expected: FAIL because v4 and the policy do not exist.
 
 **Step 3: Add the explicit versioned policy**
 
@@ -961,16 +961,16 @@ tool may enter this policy.
 **Step 4: Add explicit compiler opt-in**
 
 Extend the compilation request with `research_enabled`, default false. Keep
-`allReadOnlyAgentCompilationTools()` book-only. When true, emit v3, append the
+`allReadOnlyAgentCompilationTools()` book-only. When true, emit v4, append the
 Research tools, add `deep_research` to the UI manifest, and use the approved
 budgets. Ensure the compilation ID and content hash include the opt-in.
 
 **Step 5: Preserve storage and runtime compatibility**
 
-Treat v3 as a runtime-described immutable artifact everywhere v2 currently
+Treat v4 as a runtime-described immutable artifact everywhere v2 currently
 requires a descriptor. Add `AgentPackageKnownToolIDs()` for package validation;
 keep `AgentReadOnlyToolIDs()` and `allReadOnlyAgentCompilationTools()` book-only
-so ordinary packages do not inherit Research tools. Reject v3 publication until
+so ordinary packages do not inherit Research tools. Reject v4 publication until
 Task 13 supplies and passes the trusted `research-agent-v1` evaluation path.
 
 **Step 6: Run package tests**
@@ -978,7 +978,7 @@ Task 13 supplies and passes the trusted `research-agent-v1` evaluation path.
 Run:
 
 ```bash
-go test ./backend/app -run 'TestAgentPackage.*Research|TestAgentCompilation.*Research|TestAgentPackageStore.*V3'
+go test ./backend/app -run 'TestAgentPackage.*Research|TestAgentCompilation.*Research|TestAgentPackageStore.*V4'
 go test ./backend/app -run 'TestAgentPackage|TestAgentCompilation|TestAgentToolPolicy|TestKBaseHTTP.*AgentPackage'
 ```
 
@@ -1118,8 +1118,8 @@ deterministic hard gates from model-graded language quality. Do not let a high
 aggregate score override a failed privacy, identity, citation, or fabrication
 gate.
 
-Wire v3 evaluation, persistence, HTTP evaluate/publish, and publish-time
-recomputation to the trusted Research suite. Permit an evidence-capable v3
+Wire v4 evaluation, persistence, HTTP evaluate/publish, and publish-time
+recomputation to the trusted Research suite. Permit an evidence-capable v4
 package in the existing evidence-audit runner only when `evidence_policy` is
 present, and require the trusted Research suite to include both Research and
 evidence hard gates for that combination. Keep v2 behavior byte-for-byte

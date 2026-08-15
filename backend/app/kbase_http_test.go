@@ -100,6 +100,145 @@ func TestKBaseHTTPHandlerRequiresBearerTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPKnowledgeCollectionLifecycle(t *testing.T) {
+	root := t.TempDir()
+	store := NewBookKnowledgeStore(root)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	collectionBody := `{"collection_id":"wechat-account-fixture","title":"Fixture account knowledge","source_type":"wechat_mp_article","source_account_key":"account-a","source_account":"Fixture account","enabled":true}`
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/collections", "", collectionBody)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	created := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/collections", "secret-token", collectionBody)
+	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"collection_id":"wechat-account-fixture"`) {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	if strings.Contains(strings.ToLower(created.Body.String()), "cookie") || strings.Contains(strings.ToLower(created.Body.String()), "password") {
+		t.Fatalf("create leaked credentials: %s", created.Body.String())
+	}
+
+	saveCollectionArticleFixture(t, store, "book-a", "article-a", "Fixture account")
+	recordCollectionArticleFixture(t, store, "account-a", "Fixture account", "book-a", "article-a")
+	built := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/build", "secret-token")
+	if built.Code != http.StatusOK || !strings.Contains(built.Body.String(), `"status":"ready"`) || !strings.Contains(built.Body.String(), `"decision":"pass"`) {
+		t.Fatalf("build status=%d body=%s", built.Code, built.Body.String())
+	}
+	published := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/publish", "secret-token")
+	if published.Code != http.StatusCreated {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+	var release KnowledgeCollectionRelease
+	if err := json.Unmarshal(published.Body.Bytes(), &release); err != nil || release.ReleaseID == "" {
+		t.Fatalf("release=%#v err=%v", release, err)
+	}
+
+	listed := requestKBase(handler, http.MethodGet, "/api/knowledge/collections", "secret-token")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"collections":[`) {
+		t.Fatalf("list status=%d body=%s", listed.Code, listed.Body.String())
+	}
+	detail := requestKBase(handler, http.MethodGet, "/api/knowledge/collections/wechat-account-fixture", "secret-token")
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"candidate_hash"`) || !strings.Contains(detail.Body.String(), release.ReleaseID) {
+		t.Fatalf("detail status=%d body=%s", detail.Code, detail.Body.String())
+	}
+	releaseDetail := requestKBase(handler, http.MethodGet, "/api/knowledge/collection-releases/"+release.ReleaseID, "secret-token")
+	if releaseDetail.Code != http.StatusOK || !strings.Contains(releaseDetail.Body.String(), `"book_id":"book-a"`) {
+		t.Fatalf("release detail status=%d body=%s", releaseDetail.Code, releaseDetail.Body.String())
+	}
+}
+
+func TestKBaseHTTPKnowledgeCollectionValidationAndQualityGate(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+
+	oversized := requestJSONKBase(handler, http.MethodPost, "/api/knowledge/collections", "secret-token", `{"collection_id":"too-large","title":"`+strings.Repeat("x", 20<<10)+`","source_type":"wechat_mp_article","source_account_key":"account-a","source_account":"Fixture","enabled":true}`)
+	if oversized.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized status=%d body=%s", oversized.Code, oversized.Body.String())
+	}
+	wrongMethod := requestKBase(handler, http.MethodPut, "/api/knowledge/collections", "secret-token")
+	if wrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("wrong method status=%d body=%s", wrongMethod.Code, wrongMethod.Body.String())
+	}
+	missing := requestKBase(handler, http.MethodGet, "/api/knowledge/collections/missing", "secret-token")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	saveCollectionFixture(t, store, "wechat-account-fixture", "account-a")
+	saveCollectionArticleFixture(t, store, "book-invalid", "article-invalid", "Fixture account")
+	recordCollectionArticleFixture(t, store, "account-a", "Fixture account", "book-invalid", "article-invalid")
+	invalid, err := store.LoadPackage("book-invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid.Citations = nil
+	invalid.Book.ContentHash = ""
+	if err := store.SavePackage(*invalid); err != nil {
+		t.Fatal(err)
+	}
+	built := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/build", "secret-token")
+	if built.Code != http.StatusOK || !strings.Contains(built.Body.String(), `"status":"blocked"`) {
+		t.Fatalf("blocked build status=%d body=%s", built.Code, built.Body.String())
+	}
+	publish := requestKBase(handler, http.MethodPost, "/api/knowledge/collections/wechat-account-fixture/publish", "secret-token")
+	if publish.Code != http.StatusConflict {
+		t.Fatalf("quality gate status=%d body=%s", publish.Code, publish.Body.String())
+	}
+	buildWrongMethod := requestKBase(handler, http.MethodGet, "/api/knowledge/collections/wechat-account-fixture/build", "secret-token")
+	if buildWrongMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("build method status=%d body=%s", buildWrongMethod.Code, buildWrongMethod.Body.String())
+	}
+}
+
+func TestKBaseHTTPCollectionAgentDraftEvaluateAndPublish(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "admin-token", AgentPublisherToken: "publisher-token",
+	})
+	draftResponse := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/collection-draft", "admin-token",
+		`{"collection_release_id":"`+release.ReleaseID+`","package_id":"fixture-collection-agent","version":"1.0.0"}`)
+	if draftResponse.Code != http.StatusCreated {
+		t.Fatalf("draft status=%d body=%s", draftResponse.Code, draftResponse.Body.String())
+	}
+	var bundle ControlledAgentDraft
+	if err := json.Unmarshal(draftResponse.Body.Bytes(), &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Package.SchemaVersion != AgentPackageSchemaVersionV3 || len(bundle.Suite.Cases) == 0 {
+		t.Fatalf("bundle=%#v", bundle)
+	}
+	evaluationBody, err := json.Marshal(AgentPackageEvaluationRequest{Package: bundle.Package, Suite: bundle.Suite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluated := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/evaluate", "publisher-token", string(evaluationBody))
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("evaluate status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	publishBody, err := json.Marshal(AgentPackagePublishRequest{IdempotencyKey: "fixture-collection-agent-1", Package: bundle.Package})
+	if err != nil {
+		t.Fatal(err)
+	}
+	published := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishBody))
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"schema_version":"agent-package.v3"`) {
+		t.Fatalf("publish status=%d body=%s", published.Code, published.Body.String())
+	}
+}
+
+func TestKBaseHTTPCollectionAgentDraftDoesNotPublishAutomatically(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "admin-token", AgentPublisherToken: "publisher-token"})
+	response := requestJSONKBase(handler, http.MethodPost, "/api/agent-packages/collection-draft", "admin-token",
+		`{"collection_release_id":"`+release.ReleaseID+`"}`)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("draft status=%d body=%s", response.Code, response.Body.String())
+	}
+	packages, err := store.ListAgentPackages("", 10)
+	if err != nil || len(packages) != 0 {
+		t.Fatalf("draft auto-published packages=%#v err=%v", packages, err)
+	}
+}
+
 func TestKBaseHTTPHandlerListsEmptyAgentPackagesAsArray(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
@@ -334,7 +473,7 @@ func TestKBaseHTTPHandlerEvaluatesAndPersistsAgentPackageBeforePublication(t *te
 	}
 }
 
-func TestKBaseHTTPHandlerTrustsEvaluatesAndPublishesResearchPackageV3(t *testing.T) {
+func TestKBaseHTTPHandlerTrustsEvaluatesAndPublishesResearchPackageV4(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
 	pkg := finalizedResearchEvaluationPackage(t)
@@ -375,7 +514,7 @@ func TestKBaseHTTPHandlerTrustsEvaluatesAndPublishesResearchPackageV3(t *testing
 	published := requestJSONKBase(
 		handler, http.MethodPost, "/api/agent-packages/publish", "publisher-token", string(publishPayload),
 	)
-	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), AgentPackageSchemaVersionV3) {
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), AgentPackageSchemaVersionV4) {
 		t.Fatalf("publish research package status=%d body=%s", published.Code, published.Body.String())
 	}
 }
@@ -424,6 +563,73 @@ func TestKBaseHTTPHandlerControlledAgentRequiresCookieSessionAndBuildsDraft(t *t
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("cookie controlled draft status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestKBaseHTTPHandlerControlledCollectionAgentRequiresCookieAndExplicitPublish(t *testing.T) {
+	store, _, release := agentCollectionRuntimeFixture(t)
+	sessionDirectory := t.TempDir()
+	if err := os.Chmod(sessionDirectory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	sessionStore, err := NewBrowserSessionStore(BrowserSessionStoreConfig{
+		Path: filepath.Join(sessionDirectory, "browser-sessions.sqlite3"),
+		TTL:  24 * time.Hour, RenewalInterval: time.Hour, MaxActive: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sessionStore.Close() })
+	credentials, err := createBrowserSessionForTest(sessionStore, BrowserSessionCreate{DeviceLabel: "Collection Agent Browser"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	csrfToken, _, err := sessionStore.IssueCSRF(credentials.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
+		Store: store, AuthToken: "consumer-token", AgentPublisherToken: "publisher-token",
+		BrowserSessionSecret: "browser-secret",
+		BrowserSessions: BrowserSessionHTTPConfig{
+			Store: sessionStore, PublicOrigin: testBrowserSessionOrigin,
+			TTL: 24 * time.Hour, RenewalInterval: time.Hour, MaxActive: 10,
+		},
+	})
+	body := `{"draft":{"collection_release_id":"` + release.ReleaseID + `","package_id":"browser-collection-agent","version":"1.0.0"}}`
+
+	bearer := requestJSONKBase(handler, http.MethodPost, "/api/controlled-collection-agent/draft", "consumer-token", body)
+	if bearer.Code != http.StatusUnauthorized {
+		t.Fatalf("bearer collection draft status=%d body=%s", bearer.Code, bearer.Body.String())
+	}
+
+	request := func(path, body string) *httptest.ResponseRecorder {
+		req := newKBaseBrowserCookieRequest(http.MethodPost, path, credentials.Token, body)
+		addKBaseBrowserSessionSecurityHeaders(req, csrfToken)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	draft := request("/api/controlled-collection-agent/draft", body)
+	if draft.Code != http.StatusOK || !strings.Contains(draft.Body.String(), `"schema_version":"agent-package.v3"`) {
+		t.Fatalf("cookie collection draft status=%d body=%s", draft.Code, draft.Body.String())
+	}
+	if _, err := store.LoadAgentPackage("browser-collection-agent", "1.0.0"); err == nil {
+		t.Fatalf("draft must not publish package, err=%v", err)
+	}
+
+	evaluated := request("/api/controlled-collection-agent/evaluate", body)
+	if evaluated.Code != http.StatusCreated || !strings.Contains(evaluated.Body.String(), `"passed":true`) {
+		t.Fatalf("collection evaluate status=%d body=%s", evaluated.Code, evaluated.Body.String())
+	}
+	unconfirmed := request("/api/controlled-collection-agent/publish", body)
+	if unconfirmed.Code != http.StatusBadRequest {
+		t.Fatalf("unconfirmed collection publish status=%d body=%s", unconfirmed.Code, unconfirmed.Body.String())
+	}
+	publishBody := strings.TrimSuffix(body, "}") + `,"idempotency_key":"browser-collection-agent-1","confirm":true}`
+	published := request("/api/controlled-collection-agent/publish", publishBody)
+	if published.Code != http.StatusCreated || !strings.Contains(published.Body.String(), `"schema_version":"agent-package.v3"`) {
+		t.Fatalf("collection publish status=%d body=%s", published.Code, published.Body.String())
 	}
 }
 
@@ -523,7 +729,7 @@ func TestKBaseHTTPHandlerAgentPackageCompilationResearchOptIn(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(compilation.Candidates) != 1 || compilation.Candidates[0].Package == nil ||
-		compilation.Candidates[0].Package.SchemaVersion != AgentPackageSchemaVersionV3 ||
+		compilation.Candidates[0].Package.SchemaVersion != AgentPackageSchemaVersionV4 ||
 		compilation.Candidates[0].Package.ResearchPolicy == nil {
 		t.Fatalf("research compilation = %#v", compilation)
 	}
@@ -2214,21 +2420,60 @@ func TestKBaseHTTPResearchWorkerAuthenticationAndValidation(t *testing.T) {
 }
 
 func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing.T) {
-	root := t.TempDir()
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
+	root := knowledge.Root()
 	researchStore, err := OpenResearchStore(root, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = researchStore.Close() })
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{
-		Store: NewBookKnowledgeStore(root), AuthToken: "admin-secret", ResearchStore: researchStore,
+		Store: knowledge, AuthToken: "admin-secret", ResearchStore: researchStore,
 		ResearchQuickBudget: ResearchBudget{MaxIterations: 2, MaxEvidenceItems: 20, MaxQuotedChars: 4000, MaxModelCalls: 2, MaxCostUSD: 1},
-		ResearchDeepBudget:  ResearchBudget{MaxIterations: 8, MaxEvidenceItems: 200, MaxQuotedChars: 40000, MaxModelCalls: 12, MaxCostUSD: 8},
+		ResearchDeepBudget:  ResearchBudget{MaxIterations: 20, MaxEvidenceItems: 1000, MaxQuotedChars: 200000, MaxModelCalls: 32, MaxCostUSD: 100},
 	})
+	legacyBase, err := knowledge.LoadAgentPackage(pkg.PackageID, "1.0.0")
+	if err != nil {
+		t.Fatalf("load legacy package template: %v", err)
+	}
+	legacyBase.PackageID = "legacy-research-ineligible"
+	legacyBase.ContentHash = ""
+	legacyBase.LifecycleState = AgentPackageDraft
+	legacyBase.Supersedes = ""
+	legacyBase.CreatedAt = ""
+	legacyBase.PublishedAt = ""
+	legacyDraft, err := FinalizeAgentPackage(*legacyBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savePassingAgentPackageTestEvaluation(t, knowledge, legacyDraft)
+	legacyPackage, _, err := PublishAgentPackage(
+		knowledge, legacyDraft, "research-http-publish-v1", AgentPackageKnownToolIDs(), testAgentPackageTime().Add(time.Minute),
+	)
+	if err != nil {
+		t.Fatalf("publish legacy package: %v", err)
+	}
+	if legacyPackage.SchemaVersion != AgentPackageSchemaVersionV1 || legacyPackage.LifecycleState != AgentPackagePublished {
+		t.Fatalf("legacy package fixture is not a published v1 package: %#v", legacyPackage)
+	}
+	legacyRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(fmt.Sprintf(
+		`{"mode":"quick","question":"legacy must not opt in","package_id":%q,"package_version":%q,"requested_sources":["knowledge"]}`,
+		legacyPackage.PackageID, legacyPackage.Version,
+	)))
+	legacyRequest.Header.Set("Content-Type", "application/json")
+	legacyRequest.Header.Set("Authorization", "Bearer admin-secret")
+	legacyRequest.Header.Set("Idempotency-Key", "research-http-legacy")
+	legacyResponse := httptest.NewRecorder()
+	handler.ServeHTTP(legacyResponse, legacyRequest)
+	if legacyResponse.Code != http.StatusBadRequest || !strings.Contains(legacyResponse.Body.String(), "research_package_not_eligible") {
+		t.Fatalf("legacy package create status=%d body=%s", legacyResponse.Code, legacyResponse.Body.String())
+	}
 
-	createRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(
-		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
-	))
+	body := fmt.Sprintf(
+		`{"mode":"auto","question":"比较去年与现在的建议","package_id":%q,"package_version":%q,"requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
+		pkg.PackageID, pkg.Version,
+	)
+	createRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
 	createRequest.Header.Set("Content-Type", "application/json")
 	createRequest.Header.Set("Authorization", "Bearer admin-secret")
 	createRequest.Header.Set("Idempotency-Key", "research-http-one")
@@ -2240,9 +2485,10 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	var payload struct {
 		Created bool `json:"created"`
 		Run     struct {
-			RunID  string `json:"run_id"`
-			Mode   string `json:"mode"`
-			Status string `json:"status"`
+			RunID  string         `json:"run_id"`
+			Mode   string         `json:"mode"`
+			Status string         `json:"status"`
+			Budget ResearchBudget `json:"budget"`
 		} `json:"run"`
 	}
 	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
@@ -2251,15 +2497,19 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	if !payload.Created || payload.Run.RunID == "" || payload.Run.Mode != ResearchModeDeep || payload.Run.Status != string(ResearchPlanning) {
 		t.Fatalf("create payload=%#v", payload)
 	}
+	if payload.Run.Budget.MaxIterations != pkg.ResearchPolicy.MaxIterations ||
+		payload.Run.Budget.MaxEvidenceItems != pkg.ResearchPolicy.MaxEvidenceItems ||
+		payload.Run.Budget.MaxQuotedChars != pkg.ResearchPolicy.MaxQuotedChars ||
+		payload.Run.Budget.MaxCostUSD != pkg.ResearchPolicy.MaxCostUSD || payload.Run.Budget.MaxModelCalls != 32 {
+		t.Fatalf("Research package did not bound server budget: %#v", payload.Run.Budget)
+	}
 	for _, private := range []string{"subject-private", `"subject_ids"`, `"lease_owner"`, `"summary"`, `"actor"`} {
 		if strings.Contains(created.Body.String(), private) {
 			t.Fatalf("create response exposed %q: %s", private, created.Body.String())
 		}
 	}
 
-	replayRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(
-		`{"mode":"auto","question":"比较去年与现在的建议","requested_sources":["knowledge","chatlog"],"subject_ids":["subject-private"]}`,
-	))
+	replayRequest := httptest.NewRequest(http.MethodPost, "/api/research/runs", strings.NewReader(body))
 	replayRequest.Header.Set("Content-Type", "application/json")
 	replayRequest.Header.Set("Authorization", "Bearer admin-secret")
 	replayRequest.Header.Set("Idempotency-Key", "research-http-one")
@@ -2397,13 +2647,15 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
 	clock := &browserSessionTestClock{now: time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)}
 	handler, sessionStore := newKBaseBrowserSessionHTTPTestHandler(t, clock, 903)
-	root := t.TempDir()
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
+	root := knowledge.Root()
 	researchStore, err := OpenResearchStore(root, clock.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = researchStore.Close() })
 	concrete := handler.(*kbaseHTTPHandler)
+	concrete.store = knowledge
 	concrete.researchStore = researchStore
 	if err := migrateResearchHTTP(researchStore.db); err != nil {
 		t.Fatal(err)
@@ -2413,7 +2665,10 @@ func TestKBaseHTTPResearchRunCookieCSRFAndOwnership(t *testing.T) {
 	first := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Research Browser One")
 	second := createKBaseBrowserSessionHTTPTestCredentials(t, sessionStore, "Research Browser Two")
 	csrf, _ := loadKBaseBrowserSessionCSRF(t, handler, first.Token)
-	body := `{"mode":"quick","question":"只检索当前知识库"}`
+	body := fmt.Sprintf(
+		`{"mode":"quick","question":"只检索当前知识库","package_id":%q,"package_version":%q,"requested_sources":["knowledge"]}`,
+		pkg.PackageID, pkg.Version,
+	)
 
 	missingCSRF := newKBaseBrowserCookieRequest(http.MethodPost, "/api/research/runs", first.Token, body)
 	missingCSRF.Header.Set("Idempotency-Key", "cookie-run")

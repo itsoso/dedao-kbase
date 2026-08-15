@@ -129,10 +129,10 @@ func TestAgentPackageV2PublishesBoundRuntimeTimeoutDescriptor(t *testing.T) {
 	}
 }
 
-func TestAgentPackageStoreV3UsesRuntimeDescriptorAndRequiresTrustedEvaluation(t *testing.T) {
+func TestAgentPackageStoreV4UsesRuntimeDescriptorAndRequiresTrustedEvaluation(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
-	pkg, err := FinalizeAgentPackage(validAgentPackageV3())
+	pkg, err := FinalizeAgentPackage(validAgentPackageV4())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,14 +145,14 @@ func TestAgentPackageStoreV3UsesRuntimeDescriptorAndRequiresTrustedEvaluation(t 
 		LifecycleState: AgentPackagePublished, Runtime: &descriptor,
 	}
 	if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err != nil {
-		t.Fatalf("v3 runtime descriptor rejected: %v", err)
+		t.Fatalf("v4 runtime descriptor rejected: %v", err)
 	}
 	record.Runtime = nil
 	if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err == nil || !strings.Contains(err.Error(), "required") {
-		t.Fatalf("missing v3 descriptor error = %v", err)
+		t.Fatalf("missing v4 descriptor error = %v", err)
 	}
-	if _, _, err := PublishAgentPackage(store, pkg, "research-v3-blocked", AgentPackageKnownToolIDs(), time.Now()); err == nil || !strings.Contains(err.Error(), "evaluation report is required") {
-		t.Fatalf("v3 publication error = %v", err)
+	if _, _, err := PublishAgentPackage(store, pkg, "research-v4-blocked", AgentPackageKnownToolIDs(), time.Now()); err == nil || !strings.Contains(err.Error(), "evaluation report is required") {
+		t.Fatalf("v4 publication error = %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -45,7 +46,8 @@ type WeChatDiscoveryError struct{ Code string }
 
 func (e *WeChatDiscoveryError) Error() string { return "wechat discovery failed: " + e.Code }
 func WeChatDiscoveryErrorCode(err error) string {
-	if typed, ok := err.(*WeChatDiscoveryError); ok {
+	var typed *WeChatDiscoveryError
+	if errors.As(err, &typed) {
 		return typed.Code
 	}
 	return ""

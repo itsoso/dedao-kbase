@@ -52,6 +52,16 @@ go build -o "$smoke_root/kbase-server" ./cmd/kbase-server
 go build -o "$smoke_root/chatlog-agent" ./cmd/chatlog-agent
 go build -o "$smoke_root/source-agent-updater" ./cmd/source-agent-updater
 
+research_package_output="$smoke_root/research-package.txt"
+go run ./scripts/research-smoke-seed \
+  "$store_root" \
+  backend/app/testdata/research-evaluation-v1.synthetic.json \
+  >"$research_package_output"
+[[ "$(wc -l <"$research_package_output" | tr -d '[:space:]')" == "2" ]]
+research_package_id="$(sed -n '1p' "$research_package_output")"
+research_package_version="$(sed -n '2p' "$research_package_output")"
+[[ -n "$research_package_id" && -n "$research_package_version" ]]
+
 smoke_token() {
   printf 'smoke-%s-%024d' "$1" 0
 }
@@ -100,7 +110,7 @@ curl --fail --silent --show-error \
   -H "Authorization: Bearer $auth_token" \
   -H 'Content-Type: application/json' \
   -H 'Idempotency-Key: full-stack-smoke' \
-  --data '{"mode":"auto","question":"Compare the synthetic history timeline and conflict.","requested_sources":["chatlog"],"subject_ids":["smoke-subject"]}' \
+  --data "{\"mode\":\"auto\",\"question\":\"Compare the synthetic history timeline and conflict.\",\"package_id\":\"$research_package_id\",\"package_version\":\"$research_package_version\",\"requested_sources\":[\"chatlog\"],\"subject_ids\":[\"smoke-subject\"]}" \
   "$kbase_url/api/research/runs" >"$run_response"
 run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["run_id"])' "$run_response")"
 
@@ -170,6 +180,6 @@ go test ./cmd/chatlog-agent -count=1 -run 'TestChatlogAgentOnceHeartbeatsAndComp
 
 go test ./cmd/kbase-server -count=1 -run 'TestResearchServerRuntimeStartsRecoversAndShutsDown|TestResearchServerConfigurationUsesStrictBoundedEnvironment'
 
-go test ./backend/app -count=1 -run 'TestResearchEvaluationSyntheticGoldPassesAllHardGates|TestResearchEvaluationHardFailuresCannotBeOverriddenByAggregateScore|TestKBaseHTTPHandlerTrustsEvaluatesAndPublishesResearchPackageV3'
+go test ./backend/app -count=1 -run 'TestResearchEvaluationSyntheticGoldPassesAllHardGates|TestResearchEvaluationHardFailuresCannotBeOverriddenByAggregateScore|TestKBaseHTTPHandlerTrustsEvaluatesAndPublishesResearchPackageV4'
 
 printf '%s\n' 'research agent smoke passed'

@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13
 
-**Status:** Layer E complete; G1–G4 passed; G5–G6 pending
+**Status:** Layer E implementation complete; G1–G4 passed; G5–G6 pending
 
 **Approved design:**
 [Research Agent Platform Design](../plans/2026-08-13-research-agent-platform-design.md)
@@ -39,7 +39,7 @@ editing, message deletion, bulk private-data export, or automatic publication.
 | G1 Admission | PASS | Approved design, explicit modes, source boundaries, transition rules, budgets, and typed deep-research escalation are captured by Task 1 tests. |
 | G2 Feasibility and risk | PASS | The macOS Chatlog Worker, shared-token control plane, bounded evidence promotion, typed outcomes, resumable orchestration, and private-data persistence boundaries have focused tests. A content-free loopback probe on 2026-08-14 returned HTTP 200 with a valid aggregate response. |
 | G3 Tests | PASS | On 2026-08-14 the complete Task 14 suite passed without output truncation: module verification, vet, all Go tests, frontend build, every Web smoke, Research process smoke, Chatlog packaging smoke, direct-deployment smokes, system-map drift, privacy, and diff checks. The first attempt exposed a brittle mobile CSS smoke selector; its root cause was fixed and the complete suite was rerun from the beginning. |
-| G4 Review | PASS | The fifth independent review confirmed every prior blocker closed, found no Critical, Important, or Minor issue, and returned `Ready to merge: Yes`. |
+| G4 Review | PASS | The seventh independent review of the exact staged integration candidate reported Critical 0, Important 0, Ready to merge Yes. It verified public v3/v4 schemas, HTTP/create-and-resume v4 enforcement, direct/Worker/derived tool authorization, policy-denied terminal behavior, and isolated process smoke. |
 | G5 Deployment health | PENDING | Nothing from this feature has been deployed. |
 | G6 Online verification | PENDING | No production Research Run has been executed. |
 
@@ -47,7 +47,7 @@ editing, message deletion, bulk private-data export, or automatic publication.
 
 Tasks 1–12 are complete in the isolated `codex/research-agent-platform`
 worktree. The platform now has durable Research Runs, privacy-bounded evidence,
-the local Chatlog Worker protocol, role-separated orchestration, versioned v3
+the local Chatlog Worker protocol, role-separated orchestration, versioned v4
 package policy, authenticated Research APIs, and the Chinese Research
 workspace.
 
@@ -60,12 +60,13 @@ recovery, ambiguous identity use, unsafe amount transfer, unsupported
 conclusions, trend misclassification, and private projection are hard failures
 that cannot be overridden by an aggregate score.
 
-The trusted-suite path now accepts v3, stores the trusted-suite hash, recomputes
+The trusted-suite path now accepts v4, stores the trusted-suite hash, recomputes
 the report at persistence and publication time, and permits publication only
-after the immutable evaluation passes. A v3 package that also declares an
+after the immutable evaluation passes. A v4 package that also declares an
 evidence policy must pass both Research and evidence-audit hard gates before the
 existing evidence runner accepts it. v1/v2 behavior remains on the existing
-evaluation paths.
+evaluation paths, while v3 remains reserved for WeChat/publication collection
+packages introduced on canonical `dedao-kbase/main`.
 
 The repeatable process-level smoke starts an isolated KBase server, fake
 Chatlog/TokenPlan loopback service, and real `chatlog-agent once` process. It
@@ -73,7 +74,7 @@ creates a deep run, waits with a bounded timeout, and verifies the Worker
 heartbeat, completed job, promoted Chatlog evidence, searched/cited scope,
 verified conclusion support, and durable event chain. The same smoke also runs
 the deterministic coordinator restart/resume, Worker-offline,
-identity-ambiguous, trusted-evaluation, and v3-publication cases. Process output
+identity-ambiguous, trusted-evaluation, and v4-publication cases. Process output
 is checked for private sentinel leakage.
 
 ## Real-data acceptance checkpoint
@@ -461,3 +462,81 @@ and diff checks passed during the review.
 
 G4 is PASS. Real-data acceptance remains pending and must be completed as part
 of G5/G6 against the exact reviewed and deployed revision.
+
+### Canonical-main integration revalidation
+
+Before deployment, canonical `dedao-kbase/main` was merged into the reviewed
+feature branch. Both lines had independently allocated `agent-package.v3`:
+canonical main for WeChat/publication collection packages and this feature for
+Research policy. The integration preserves canonical v3 collection semantics
+and moves Research packages to `agent-package.v4`; v1 and v2 remain unchanged.
+The combined schema rejects cross-version field mixing and routes trusted
+evaluation, runtime descriptors, compilation, and publication through the
+corresponding version-specific path.
+
+The merged candidate passed module verification, `go vet ./...`, the complete
+Go suite, the Vue production build, all desktop and Web smoke scripts, focused
+Research/collection tests, combined race detection, Research process smoke,
+Chatlog packaging smoke, direct-deployment contract and behavior smokes,
+system-map drift, privacy, and staged/unstaged diff checks. A fresh independent
+review of the merged v3/v4 boundary is required before the integration commit;
+G5/G6 remain pending.
+
+### Sixth G4 integration review: NO-GO and remediation candidate
+
+The sixth review found two release blockers after canonical-main integration.
+First, the public compilation request and response schemas did not describe
+`research_enabled` or v4 packages, and no standalone v3/v4 package schemas
+existed. Second, Research run creation and orchestration accepted ordinary
+published packages with a `search` capability without enforcing the v4
+Research opt-in, requested mode/source scope, Research tool allowlist, package
+ToolPolicy, or package budget ceilings. This allowed a v1/v2 or v3 collection
+package to be associated with a deep run and potentially schedule a local
+Chatlog Worker job.
+
+The remediation candidate adds public v3 collection and v4 Research package
+schemas, updates compilation request/response schemas, and verifies the
+version boundaries with schema-instance tests. A v3 schema permits exactly one
+collection Release and rejects Research/evidence/ordinary Release fields; a v4
+schema requires ResearchPolicy and rejects collection Releases.
+
+Research requests now require a published, trusted-evaluation-passing v4
+package with `search` and `deep_research` capabilities. Creation checks both
+the requested and resolved mode plus requested sources. Resume/advance repeats
+the package, policy, source, and budget checks. Every direct or Worker tool is
+mapped to its `research/*` package tool ID and source, then checked against both
+ResearchPolicy and an `allow` ToolPolicy rule before execution or job creation.
+Server budgets are bounded by the package iteration, evidence, quoted-character,
+and cost ceilings. Violations terminate fail-closed as `policy_denied`; the
+malicious-planner regression proves no Worker job is created.
+
+The process smoke now seeds and publishes an ordinary immutable knowledge
+Release plus a trusted v4 Research package through public application APIs
+before creating its real server run. The remediated candidate passed the full
+Go suite and vet, focused race tests, Vue build, all frontend/Web smokes,
+Research process smoke, packaging/direct-deployment smokes, system-map, privacy,
+and diff checks. G4 remains pending until a fresh independent review returns
+GO on this exact candidate.
+
+### Seventh G4 integration review: GO
+
+The seventh independent review returned **Ready to merge: Yes** with zero
+Critical and zero Important findings. It confirmed that HTTP creation and
+orchestrator resume both require a published, evaluated v4 Research package;
+mode, source, tool, and budget bounds fail closed; and direct tools, Worker
+jobs, and derived fetch/expand jobs all cross the same ResearchPolicy and
+ToolPolicy authorization boundary. It also verified that a malicious planner
+cannot leave a Worker job behind after `policy_denied`, and that the public
+v3/v4 schemas are compiled and exercised against real instances.
+
+During the review, a single-source `prior_runs` auto request was found to be
+misrouted to the knowledge-only quick path. The route now deterministically
+selects deep mode for prior-run research, while an explicit quick request
+returns `deep_research_required`; focused and race regression tests passed.
+The generated system map was refreshed after this routing change and its drift
+check passed. The review's sole Minor test-coverage observation was also
+closed: the HTTP legacy rejection now constructs and publishes an actual v1
+package and proves that the Research endpoint rejects it as ineligible.
+
+G4 is PASS. Deployment health and authorized real-data acceptance remain
+separate G5/G6 gates and are not implied by this code-review decision.

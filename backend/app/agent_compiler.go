@@ -268,7 +268,7 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 			if candidate.Kind == AgentCompilationCandidateEvidence {
 				expectedSchemaVersion = AgentPackageSchemaVersionV2
 			}
-			if candidate.Package.SchemaVersion != expectedSchemaVersion && candidate.Package.SchemaVersion != AgentPackageSchemaVersionV3 {
+			if candidate.Package.SchemaVersion != expectedSchemaVersion && candidate.Package.SchemaVersion != AgentPackageSchemaVersionV4 {
 				return fmt.Errorf(
 					"ready candidates[%d] kind %q requires package schema_version %q",
 					index,
@@ -276,8 +276,8 @@ func ValidateAgentCompilation(compilation AgentCompilation) error {
 					expectedSchemaVersion,
 				)
 			}
-			if candidate.Package.SchemaVersion == AgentPackageSchemaVersionV3 && candidate.Package.ResearchPolicy == nil {
-				return fmt.Errorf("ready candidates[%d] v3 package requires research_policy", index)
+			if candidate.Package.SchemaVersion == AgentPackageSchemaVersionV4 && candidate.Package.ResearchPolicy == nil {
+				return fmt.Errorf("ready candidates[%d] v4 package requires research_policy", index)
 			}
 			if len(candidate.Issues) != 0 {
 				return fmt.Errorf("ready candidates[%d] must not contain issues", index)
@@ -857,7 +857,7 @@ func applyAgentCompilationResearchPolicy(pkg *AgentPackage, enabled bool) {
 	if pkg == nil || !enabled {
 		return
 	}
-	pkg.SchemaVersion = AgentPackageSchemaVersionV3
+	pkg.SchemaVersion = AgentPackageSchemaVersionV4
 	pkg.ResearchPolicy = &AgentPackageResearchPolicy{
 		Modes:          []string{ResearchModeAuto, ResearchModeQuick, ResearchModeDeep},
 		AllowedSources: []string{ResearchSourceKnowledge, ResearchSourceChatlog, ResearchSourcePriorRuns},
@@ -924,7 +924,7 @@ func finalizeAgentCompilationCandidate(
 	finalized, err := FinalizeAgentPackage(pkg)
 	if err == nil {
 		knownTools := AgentReadOnlyToolIDs()
-		if finalized.SchemaVersion == AgentPackageSchemaVersionV3 {
+		if finalized.SchemaVersion == AgentPackageSchemaVersionV4 {
 			knownTools = AgentPackageKnownToolIDs()
 		}
 		err = ValidateAgentPackage(finalized, store, knownTools)

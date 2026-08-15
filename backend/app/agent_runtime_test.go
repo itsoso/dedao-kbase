@@ -33,6 +33,159 @@ func TestAgentPackageRuntimeSearchesEveryPinnedRelease(t *testing.T) {
 	}
 }
 
+func TestAgentPackageCollectionRuntimeSearchesPinnedMembersGlobally(t *testing.T) {
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	response, err := searchAgentPackageEvidence(store, pkg, "shared insight", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 {
+		t.Fatalf("results=%#v", response.Results)
+	}
+	seenBooks := map[string]bool{}
+	for _, result := range response.Results {
+		seenBooks[result.MemberBookID] = true
+		if result.CollectionReleaseID != release.ReleaseID || result.ReleaseID != release.ReleaseID || result.MemberContentHash == "" || result.ChunkID == "" || len(result.CitationIDs) != 1 {
+			t.Fatalf("result=%#v", result)
+		}
+	}
+	if !seenBooks["book-a"] || !seenBooks["book-b"] || seenBooks["book-foreign"] {
+		t.Fatalf("member scope=%#v", seenBooks)
+	}
+	limited, err := searchAgentPackageEvidence(store, pkg, "shared insight", 1)
+	if err != nil || len(limited.Results) != 1 {
+		t.Fatalf("limited=%#v err=%v", limited, err)
+	}
+}
+
+func TestAgentPackageCollectionRuntimeRejectsStaleMemberAndForgedCitation(t *testing.T) {
+	store, pkg, _ := agentCollectionRuntimeFixture(t)
+	pkgA, err := store.LoadPackage("book-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkgA.Chunks[0].Text += " changed"
+	pkgA.Book.ContentHash = ""
+	if err := store.SavePackage(*pkgA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := searchAgentPackageEvidence(store, pkg, "shared", 2); err == nil || !strings.Contains(err.Error(), "content hash") {
+		t.Fatalf("stale member error=%v", err)
+	}
+
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	_, err = resolveAgentPackageReleaseCitation(store, pkg, release.ReleaseID, "book-a-chunk", "forged-citation")
+	if err == nil || !strings.Contains(err.Error(), "allowlist") {
+		t.Fatalf("forged citation error=%v", err)
+	}
+}
+
+func TestAgentPackageCollectionRuntimeAcceptsLegacyStoredSourceHash(t *testing.T) {
+	store, pkg, _ := agentCollectionRuntimeFixture(t)
+	article, err := store.LoadPackage("book-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	article.Book.ContentHash = strings.Repeat("b", 64)
+	if err := store.SavePackage(*article); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := searchAgentPackageEvidence(store, pkg, "shared insight", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Results) != 2 {
+		t.Fatalf("results=%#v", response.Results)
+	}
+}
+
+func TestAgentPackageCollectionRuntimeChatAbstainsAndTracesMemberProvenance(t *testing.T) {
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	abstained, err := chatFinalizedAgentPackageWithClient(
+		context.Background(), store, pkg, "unrelated astronomy question", &fakeBookKnowledgeLLMClient{answer: "must not run"},
+		&BookTokenPlanConfig{}, testAgentPackageTime(), false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if abstained.Outcome != AgentTraceOutcomeAbstained || abstained.AbstentionReason != "insufficient_evidence" {
+		t.Fatalf("abstained=%#v", abstained)
+	}
+
+	client := &fakeBookKnowledgeLLMClient{answer: "Combined answer [citation:book-a-citation] [citation:book-b-citation]"}
+	response, err := chatFinalizedAgentPackageWithClient(
+		context.Background(), store, pkg, "shared insight", client,
+		&BookTokenPlanConfig{}, testAgentPackageTime(), true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Outcome != AgentTraceOutcomeCompleted || len(response.Citations) != 2 || response.TraceID == "" {
+		t.Fatalf("response=%#v", response)
+	}
+	trace, err := store.LoadAgentTrace(response.TraceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(trace.Releases) != 1 || trace.Releases[0].ReleaseID != release.ReleaseID || trace.Releases[0].CollectionID != release.CollectionID || len(trace.Retrievals) != 2 {
+		t.Fatalf("trace=%#v", trace)
+	}
+	for _, retrieval := range trace.Retrievals {
+		if retrieval.MemberBookID == "" || retrieval.MemberContentHash == "" || retrieval.ChunkID == "" {
+			t.Fatalf("retrieval=%#v", retrieval)
+		}
+	}
+}
+
+func TestAgentToolPolicyAllowsPinnedCollectionReleaseScope(t *testing.T) {
+	_, pkg, release := agentCollectionRuntimeFixture(t)
+	decision := EvaluateAgentToolCall(pkg, "book-mcp", "agent.search", map[string]any{
+		"package_id": pkg.PackageID, "package_version": pkg.Version,
+		"release_id": release.ReleaseID, "query": "shared insight",
+	})
+	if decision.Decision != AgentToolAllow {
+		t.Fatalf("decision=%#v", decision)
+	}
+}
+
+func agentCollectionRuntimeFixture(t *testing.T) (*BookKnowledgeStore, AgentPackage, *KnowledgeCollectionRelease) {
+	t.Helper()
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveCollectionFixture(t, store, "wechat-account-fixture", "account-a")
+	for _, fixture := range []struct {
+		bookID, itemID, accountKey, text string
+	}{
+		{"book-a", "article-a", "account-a", "shared insight from alpha article"},
+		{"book-b", "article-b", "account-a", "shared insight from beta article"},
+		{"book-foreign", "article-foreign", "account-b", "shared insight foreign secret"},
+	} {
+		saveCollectionArticleFixture(t, store, fixture.bookID, fixture.itemID, "Fixture account")
+		article, err := store.LoadPackage(fixture.bookID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		article.Chunks[0].Text = fixture.text
+		article.Book.ContentHash = ""
+		if err := store.SavePackage(*article); err != nil {
+			t.Fatal(err)
+		}
+		recordCollectionArticleFixture(t, store, fixture.accountKey, "Fixture account", fixture.bookID, fixture.itemID)
+	}
+	if _, err := store.BuildKnowledgeCollectionCandidate("wechat-account-fixture"); err != nil {
+		t.Fatal(err)
+	}
+	release, err := store.PublishKnowledgeCollection("wechat-account-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := BuildControlledCollectionAgentDraft(store, ControlledCollectionAgentDraftRequest{CollectionReleaseID: release.ReleaseID}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, *pkg, release
+}
+
 func TestAgentPackageRuntimeSearchRetrievesChineseNaturalLanguageQuery(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	release := agentPackageTestRelease()
@@ -662,6 +815,68 @@ func TestKBaseHTTPHandlerSanitizesAgentChatTimeout(t *testing.T) {
 
 func agentRuntimeTestStore(t *testing.T) (*BookKnowledgeStore, AgentPackage) {
 	return agentRuntimeTestStoreWithLimit(t, 8)
+}
+
+func TestResearchAgentPackageScopeAndToolAuthorizationFailClosed(t *testing.T) {
+	base := validAgentPackageV4()
+	tests := []struct {
+		name    string
+		mutate  func(*AgentPackage)
+		mode    string
+		sources []string
+		want    string
+	}{
+		{name: "v1", mutate: func(pkg *AgentPackage) { pkg.SchemaVersion = AgentPackageSchemaVersionV1; pkg.ResearchPolicy = nil }, mode: ResearchModeQuick, sources: []string{ResearchSourceKnowledge}, want: "agent-package.v4"},
+		{name: "v2", mutate: func(pkg *AgentPackage) { pkg.SchemaVersion = AgentPackageSchemaVersionV2; pkg.ResearchPolicy = nil }, mode: ResearchModeQuick, sources: []string{ResearchSourceKnowledge}, want: "agent-package.v4"},
+		{name: "v3 collection", mutate: func(pkg *AgentPackage) { pkg.SchemaVersion = AgentPackageSchemaVersionV3; pkg.ResearchPolicy = nil }, mode: ResearchModeDeep, sources: []string{ResearchSourceChatlog}, want: "agent-package.v4"},
+		{name: "missing capability", mutate: func(pkg *AgentPackage) { pkg.UIManifest.Capabilities = []string{"search"} }, mode: ResearchModeDeep, sources: []string{ResearchSourceChatlog}, want: "deep_research"},
+		{name: "mode outside policy", mutate: func(pkg *AgentPackage) { pkg.ResearchPolicy.Modes = []string{ResearchModeDeep} }, mode: ResearchModeQuick, sources: []string{ResearchSourceKnowledge}, want: "mode"},
+		{name: "source outside policy", mutate: func(pkg *AgentPackage) { pkg.ResearchPolicy.AllowedSources = []string{ResearchSourceKnowledge} }, mode: ResearchModeDeep, sources: []string{ResearchSourceChatlog}, want: "source"},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			pkg := base
+			pkg.UIManifest.Capabilities = append([]string(nil), base.UIManifest.Capabilities...)
+			pkg.ResearchPolicy = cloneAgentPackageResearchPolicy(base.ResearchPolicy)
+			testCase.mutate(&pkg)
+			if err := validateResearchAgentPackageScope(pkg, testCase.mode, testCase.sources); err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("validation error = %v, want %q", err, testCase.want)
+			}
+		})
+	}
+
+	run := ResearchRun{Mode: ResearchModeDeep, RequestedSources: []string{ResearchSourceKnowledge}}
+	if err := authorizeResearchAgentTool(base, run, ResearchWorkerToolSearchChatlog); err == nil || !strings.Contains(err.Error(), "requested source") {
+		t.Fatalf("Chatlog outside requested scope error = %v", err)
+	}
+	missingRule := base
+	missingRule.ToolPolicy.Tools = append([]AgentPackageToolRule(nil), base.ToolPolicy.Tools...)
+	for index, rule := range missingRule.ToolPolicy.Tools {
+		if rule.MCPServer == "research" && rule.ToolName == ResearchToolSearchKnowledge {
+			missingRule.ToolPolicy.Tools = append(missingRule.ToolPolicy.Tools[:index], missingRule.ToolPolicy.Tools[index+1:]...)
+			break
+		}
+	}
+	run.RequestedSources = []string{ResearchSourceKnowledge}
+	if err := authorizeResearchAgentTool(missingRule, run, ResearchToolSearchKnowledge); err == nil || !strings.Contains(err.Error(), "tool_policy") {
+		t.Fatalf("missing tool rule error = %v", err)
+	}
+
+	serverBudget := ResearchBudget{
+		MaxIterations: 20, MaxEvidenceItems: 1000, MaxQuotedChars: 200000,
+		MaxModelCalls: 32, MaxCostUSD: 100,
+	}
+	bounded := boundResearchBudgetByPolicy(serverBudget, *base.ResearchPolicy)
+	if bounded.MaxIterations != base.ResearchPolicy.MaxIterations ||
+		bounded.MaxEvidenceItems != base.ResearchPolicy.MaxEvidenceItems ||
+		bounded.MaxQuotedChars != base.ResearchPolicy.MaxQuotedChars ||
+		bounded.MaxCostUSD != base.ResearchPolicy.MaxCostUSD || bounded.MaxModelCalls != serverBudget.MaxModelCalls {
+		t.Fatalf("bounded budget = %#v policy=%#v", bounded, base.ResearchPolicy)
+	}
+	run.Budget = serverBudget
+	if err := validateResearchAgentRunPolicy(base, run); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("over-policy run budget error = %v", err)
+	}
 }
 
 func agentRuntimeTestStoreWithLimit(t *testing.T, maxContextChunks int) (*BookKnowledgeStore, AgentPackage) {

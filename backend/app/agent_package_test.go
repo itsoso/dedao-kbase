@@ -80,13 +80,13 @@ func TestAgentPackageV2RequiresEvidencePolicyAndKeepsV1Compatible(t *testing.T) 
 func TestAgentPackageResearchPolicyIsExplicitVersionedAndHashBound(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
-	pkg := validAgentPackageV3()
+	pkg := validAgentPackageV4()
 	finalized, err := FinalizeAgentPackage(pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := ValidateAgentPackage(finalized, store, AgentPackageKnownToolIDs()); err != nil {
-		t.Fatalf("v3 research package rejected: %v", err)
+		t.Fatalf("v4 research package rejected: %v", err)
 	}
 
 	missing := pkg
@@ -96,7 +96,7 @@ func TestAgentPackageResearchPolicyIsExplicitVersionedAndHashBound(t *testing.T)
 		t.Fatal(err)
 	}
 	if err := ValidateAgentPackage(missing, store, AgentPackageKnownToolIDs()); err == nil || !strings.Contains(err.Error(), "research_policy") {
-		t.Fatalf("v3 missing policy error = %v", err)
+		t.Fatalf("v4 missing policy error = %v", err)
 	}
 
 	legacy := validAgentPackage()
@@ -795,9 +795,9 @@ func validAgentPackageV2() AgentPackage {
 	return pkg
 }
 
-func validAgentPackageV3() AgentPackage {
+func validAgentPackageV4() AgentPackage {
 	pkg := validAgentPackage()
-	pkg.SchemaVersion = AgentPackageSchemaVersionV3
+	pkg.SchemaVersion = AgentPackageSchemaVersionV4
 	pkg.Version = "3.0.0"
 	pkg.ResearchPolicy = &AgentPackageResearchPolicy{
 		Modes:          []string{ResearchModeAuto, ResearchModeQuick, ResearchModeDeep},

@@ -211,6 +211,15 @@ func TestValidateAgentCompilationContract(t *testing.T) {
 			want: "schema_version",
 		},
 		{
+			name: "research v4 requires policy",
+			mutate: func(value *AgentCompilation) {
+				pkg := validAgentPackageV4()
+				pkg.ResearchPolicy = nil
+				value.Candidates[0].Package = &pkg
+			},
+			want: "v4 package requires research_policy",
+		},
+		{
 			name: "blocked excludes package",
 			mutate: func(value *AgentCompilation) {
 				pkg := readyPackage
@@ -362,7 +371,7 @@ func TestCompileAgentPackagesDualBuildsDeterministicCandidates(t *testing.T) {
 	}
 }
 
-func TestAgentCompilationResearchOptInEmitsV3WithoutChangingOrdinaryTools(t *testing.T) {
+func TestAgentCompilationResearchOptInEmitsV4WithoutChangingOrdinaryTools(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	primary := agentCompilerTestRelease("release-research", "book-research", "2026-08-14T10:00:00Z", "有证据的结论", "Publisher", "dedao_ebook")
 	saveKnowledgeAssemblyRelease(t, store, primary)
@@ -389,7 +398,7 @@ func TestAgentCompilationResearchOptInEmitsV3WithoutChangingOrdinaryTools(t *tes
 		!reflect.DeepEqual(ordinaryPackage.ToolPolicy, allReadOnlyAgentCompilationTools()) {
 		t.Fatalf("ordinary compilation gained research: %#v", ordinaryPackage)
 	}
-	if researchPackage.SchemaVersion != AgentPackageSchemaVersionV3 || researchPackage.ResearchPolicy == nil ||
+	if researchPackage.SchemaVersion != AgentPackageSchemaVersionV4 || researchPackage.ResearchPolicy == nil ||
 		!agentTestContainsString(researchPackage.UIManifest.Capabilities, "deep_research") ||
 		researchPackage.EvaluationPolicy.SuiteVersion != "research-agent-v1" {
 		t.Fatalf("research package = %#v", researchPackage)

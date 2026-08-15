@@ -200,6 +200,33 @@ func TestResearchOrchestratorDeepKnowledgeSearchFetchesObservedMatches(t *testin
 	}
 }
 
+func TestResearchOrchestratorBlocksPlannerToolOutsideRequestedSources(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.plannerOutput = &ResearchPlannerOutput{
+		DecisionSummary: "Attempt an out-of-scope Chatlog search",
+		ToolCalls: []ResearchPlannedToolCall{{
+			Tool:      ResearchWorkerToolSearchChatlog,
+			Arguments: map[string]any{"query": "private"},
+		}},
+	}
+	run := createResearchOrchestratorRun(t, research, pkg, "planner-source-denied", ResearchModeDeep,
+		[]string{ResearchSourceKnowledge}, "grounded")
+	result, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.Status != ResearchFailed || result.Outcome != ResearchOutcomePolicyDenied {
+		t.Fatalf("policy-denied result = %#v", result)
+	}
+	jobs, err := orchestrator.listWorkerJobs(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("out-of-scope planner created jobs: %#v", jobs)
+	}
+}
+
 func TestResearchOrchestratorDeepPathWaitsResumesAndSurvivesRestart(t *testing.T) {
 	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
 	run := createResearchOrchestratorRun(t, research, pkg, "deep-path", ResearchModeDeep,
@@ -381,7 +408,7 @@ func TestResearchOrchestratorSelectsStableBoundedChatlogCandidateWindows(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
-			planned, err := orchestrator.planChatlogCandidateFetches(run, jobs, nil)
+			planned, err := orchestrator.planChatlogCandidateFetches(context.Background(), run, jobs, nil)
 			if err != nil || !planned {
 				t.Fatalf("planned=%v err=%v", planned, err)
 			}
@@ -436,7 +463,7 @@ func TestResearchOrchestratorSelectsStableBoundedChatlogCandidateWindows(t *test
 			if err != nil {
 				t.Fatal(err)
 			}
-			planned, err = restarted.planChatlogCandidateFetches(run, jobs, evidence)
+			planned, err = restarted.planChatlogCandidateFetches(context.Background(), run, jobs, evidence)
 			if err != nil || !planned {
 				t.Fatalf("restart planned=%v err=%v", planned, err)
 			}
@@ -1115,7 +1142,7 @@ func TestResearchCoordinatorRenewsLeaseDuringLongAdvance(t *testing.T) {
 
 func newResearchOrchestratorTestHarness(t *testing.T) (*ResearchOrchestrator, *ResearchStore, AgentPackage, *fakeResearchStageModel) {
 	t.Helper()
-	knowledge, pkg := agentRuntimeTestStore(t)
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
 	research, err := OpenResearchStore(knowledge.Root(), nil)
 	if err != nil {
 		t.Fatal(err)

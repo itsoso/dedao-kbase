@@ -88,7 +88,7 @@ func EvaluateAgentPackageDeterministically(store *BookKnowledgeStore, pkg AgentP
 	if strings.TrimSpace(suite.SuiteVersion) == "" || suite.SuiteVersion != pkg.EvaluationPolicy.SuiteVersion {
 		return AgentEvaluationReport{}, fmt.Errorf("evaluation suite version %q does not match package policy %q", suite.SuiteVersion, pkg.EvaluationPolicy.SuiteVersion)
 	}
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV4 {
 		return evaluateResearchAgentPackage(store, pkg, suite, now)
 	}
 	if len(suite.Cases) == 0 {
@@ -705,6 +705,11 @@ func agentPackagePinsRelease(pkg AgentPackage, releaseID string) bool {
 			return true
 		}
 	}
+	for _, ref := range pkg.CollectionReleases {
+		if ref.ReleaseID == releaseID {
+			return true
+		}
+	}
 	return false
 }
 
@@ -820,7 +825,7 @@ func (s *BookKnowledgeStore) SaveAgentPackageEvaluation(pkg AgentPackage, suite 
 		return fmt.Errorf("evaluation evaluated_at is invalid: %w", err)
 	}
 	expected := AgentEvaluationReport{}
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 || pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+	if agentPackageUsesTrustedEvaluation(pkg.SchemaVersion) {
 		_, expected, err = EvaluateAgentPackageAgainstTrustedSuite(s, pkg, suite, evaluatedAt)
 	} else {
 		expected, err = EvaluateAgentPackageDeterministically(s, pkg, suite, evaluatedAt)
@@ -967,7 +972,7 @@ func ValidateAgentPackageEvaluationGate(store *BookKnowledgeStore, pkg AgentPack
 		return fmt.Errorf("load trusted evaluation suite: %w", err)
 	}
 	expected := AgentEvaluationReport{}
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 || pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+	if agentPackageUsesTrustedEvaluation(pkg.SchemaVersion) {
 		_, expected, err = EvaluateAgentPackageAgainstTrustedSuite(store, pkg, *suite, evaluatedAt)
 	} else {
 		expected, err = EvaluateAgentPackageDeterministically(store, pkg, *suite, evaluatedAt)

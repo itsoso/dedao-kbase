@@ -69,6 +69,7 @@ const ROUTES = Object.freeze({
   sourceAgents: "/sources/agents",
   bookReader: "/read/books",
   knowledgePackages: "/knowledge/packages",
+  knowledgeCollections: "/knowledge/collections",
   agentPackages: "/agent-packages",
   agents: "/agents",
   bookApps: "/book-apps",
@@ -224,6 +225,7 @@ const dedaoLibraryState = {
 const sourceControlState = {
   agents: [],
   subscriptions: [],
+  knowledgeCollections: [],
   runs: [],
   selectedSubscriptionID: "",
   selectedRunID: "",
@@ -240,6 +242,16 @@ const sourceControlState = {
     sourceScheduleMode: "manual",
     sourceIntervalSeconds: 3600,
   },
+};
+
+const collectionWorkspaceState = {
+  detail: null,
+  loading: "",
+  message: "",
+  agentDraft: null,
+  evaluation: null,
+  publishedAgent: null,
+  agentVersion: "1.0.0",
 };
 
 const sourceAgentManagementState = {
@@ -461,6 +473,7 @@ function knowledgeReviewReasonLabel(reason) {
 let isWCPlusBootstrapped = false;
 let sourceControlPollTimer = null;
 let sourceControlLoadSequence = 0;
+let collectionWorkspaceLoadSequence = 0;
 let sourceAgentManagementPollTimer = null;
 let sourceAgentManagementSequence = 0;
 let sourceAgentDetailSequence = 0;
@@ -1415,6 +1428,23 @@ function knowledgeResourceFromLocation(pathname = getRoutePathname()) {
 
 function getKnowledgeBookID() {
   return knowledgeResourceFromLocation()?.bookID || "";
+}
+
+function getKnowledgeCollectionID(pathname = getRoutePathname()) {
+  const prefix = `${ROUTES.knowledgeCollections}/`;
+  if (!pathname.startsWith(prefix)) {
+    return "";
+  }
+  const raw = pathname.slice(prefix.length).split("/")[0];
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
+function buildKnowledgeCollectionURL(collectionID) {
+  return collectionID ? `${ROUTES.knowledgeCollections}/${encodeURIComponent(collectionID)}` : ROUTES.knowledgeCollections;
 }
 
 function isKnowledgePackageDetailRoute() {
@@ -4669,6 +4699,31 @@ function renderAgentCompiler() {
 
 function renderBookAgentEvidence() {
   const releaseRows = bookAgentState.releases.map((release) => {
+    const members = Array.isArray(release.members) ? release.members : [];
+    if (members.length || release.schema_version === "knowledge_collection_release.v1") {
+      const citationCount = members.reduce((total, member) => total + (Array.isArray(member.citation_ids) ? member.citation_ids.length : 0), 0);
+      return `
+        <article class="book-agent__release">
+          <header>
+            <div>
+              <span>集合发布版本</span>
+              <strong>${escapeHTML(agentReleaseDisplayTitle(release))}</strong>
+            </div>
+            <code>${escapeHTML(String(release.content_hash || "").slice(0, 18))}</code>
+          </header>
+          <div class="book-agent__evidence-grid">
+            ${members.slice(0, 6).map((member) => `
+              <div>
+                <span>${escapeHTML(member.book_id || "article")}</span>
+                <p>${escapeHTML(member.published_at || "发布时间未提供")}</p>
+                <small>${(member.citation_ids || []).slice(0, 3).map((id) => escapeHTML(id)).join(" · ") || "无引用 ID"}</small>
+              </div>
+            `).join("") || `<p class="web-muted">此集合发布版本暂无成员文章。</p>`}
+          </div>
+          <footer>${members.length} 篇文章 · ${citationCount} 条引用 · ${escapeHTML(release.usage_policy || "策略未提供")}</footer>
+        </article>
+      `;
+    }
     const claims = Array.isArray(release.analysis?.claims) ? release.analysis.claims : [];
     const citations = Array.isArray(release.citations) ? release.citations : [];
     return `
@@ -5309,9 +5364,32 @@ function agentConsoleDisplayName(bookTitle) {
   const title = String(bookTitle || "").trim().replace(/^\d+[_\-\s]+/, "");
   if (title) {
     const subject = title.split(/[：:]/)[0].trim();
+    if (subject.includes("集合知识库")) {
+      return `${subject} Agent`;
+    }
     return subject.endsWith("研究助手") ? subject : `${subject}研究助手`;
   }
   return "知识研究助手";
+}
+
+function agentReleaseDisplayTitle(release) {
+  return String(
+    release?.definition?.title ||
+    release?.book?.title ||
+    release?.book_id ||
+    release?.collection_id ||
+    release?.release_id ||
+    "知识库",
+  ).trim();
+}
+
+function agentPinnedReleaseCount(pkg) {
+  const collectionReleases = Array.isArray(pkg?.collection_releases) ? pkg.collection_releases : [];
+  if (collectionReleases.length) {
+    return collectionReleases.length;
+  }
+  const releases = Array.isArray(pkg?.releases) ? pkg.releases : [];
+  return releases.length || bookAgentState.releases.length;
 }
 
 function agentEvaluationMetricLabel(metric) {
@@ -5377,9 +5455,10 @@ function renderAgentTechnicalCredentials(pkg, release, evaluation) {
 }
 
 function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation, runtimeStatus) {
-  const displayName = agentConsoleDisplayName(release.book?.title);
+  const displayName = agentConsoleDisplayName(agentReleaseDisplayTitle(release));
   const evaluationPassed = Boolean(evaluation.passed);
-  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const releaseCount = agentPinnedReleaseCount(pkg);
+  const isCollectionAgent = Array.isArray(pkg.collection_releases) && pkg.collection_releases.length > 0;
   const evaluationMetrics = Object.entries(evaluation.metrics || {}).map(([metric, score]) => `
     <div><span>${escapeHTML(agentEvaluationMetricLabel(metric))}</span><strong>${Math.round(Number(score || 0) * 100)}%</strong></div>
   `).join("");
@@ -5412,8 +5491,12 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
         <section class="agent-console__workspace" aria-label="Agent 主要工作区">
           ${renderBookAgentCapability("reader", `
             <section class="book-agent__capability book-agent__reader agent-console__reader" data-capability="reader">
-              <div class="book-agent__section-head"><div><span>01</span><h2>版本化阅读</h2></div><p>打开此 Agent 固定的知识版本。</p></div>
-              ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>进入阅读器 →</small></a>` : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
+              <div class="book-agent__section-head"><div><span>01</span><h2>${isCollectionAgent ? "集合知识库" : "版本化阅读"}</h2></div><p>打开此 Agent 固定的知识版本。</p></div>
+              ${isCollectionAgent
+                ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildKnowledgeCollectionURL(release.collection_id))}"><span>打开集合知识库</span><strong>${escapeHTML(agentReleaseDisplayTitle(release))}</strong><small>${Array.isArray(release.members) ? release.members.length : 0} 篇文章 · 进入集合工作台 →</small></a>`
+                : bookID
+                  ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(release.book?.title || bookID)}</strong><small>进入阅读器 →</small></a>`
+                  : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
             </section>
           `)}
           ${renderBookAgentCapability("search", `
@@ -5479,9 +5562,9 @@ function renderAgentConsole(route, pkg, release, bookID, searchRows, evaluation,
 }
 
 function renderAgentPackageContract(pkg, release, evaluation, runtimeStatus) {
-  const displayName = agentConsoleDisplayName(release.book?.title);
+  const displayName = agentConsoleDisplayName(agentReleaseDisplayTitle(release));
   const evaluationPassed = Boolean(evaluation.passed);
-  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const releaseCount = agentPinnedReleaseCount(pkg);
   const evaluationMetrics = renderAgentEvaluationMetrics(evaluation);
   const citationBoundary = pkg.retrieval_policy?.require_citations
     ? "所有回答必须绑定固定知识包中的引用。"
@@ -5536,9 +5619,11 @@ function renderAgentPackageContract(pkg, release, evaluation, runtimeStatus) {
 }
 
 function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, runtimeStatus) {
-  const bookTitle = agentBookDisplayTitle(release.book?.title, agentConsoleDisplayName(release.book?.title));
+  const releaseTitle = agentReleaseDisplayTitle(release);
+  const bookTitle = agentBookDisplayTitle(releaseTitle, agentConsoleDisplayName(releaseTitle));
   const evaluationPassed = Boolean(evaluation.passed);
-  const releaseCount = Array.isArray(pkg.releases) ? pkg.releases.length : bookAgentState.releases.length;
+  const releaseCount = agentPinnedReleaseCount(pkg);
+  const isCollectionAgent = Array.isArray(pkg.collection_releases) && pkg.collection_releases.length > 0;
   const evidenceBoundary = pkg.retrieval_policy?.require_citations
     ? "回答必须绑定当前固定版本的引用；证据不足时主动拒答。"
     : "回答遵循当前知识包的证据与拒答策略。";
@@ -5566,8 +5651,12 @@ function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, run
         <section class="reading-app__workspace" aria-label="阅读应用主要工作区">
           ${renderBookAgentCapability("reader", `
             <section class="book-agent__capability book-agent__reader" data-capability="reader">
-              <div class="book-agent__section-head"><div><span>01</span><h2>版本化阅读</h2></div><p>打开当前 Agent 固定的书籍版本。</p></div>
-              ${bookID ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(bookTitle)}</strong><small>进入阅读器 →</small></a>` : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
+              <div class="book-agent__section-head"><div><span>01</span><h2>${isCollectionAgent ? "集合知识库" : "版本化阅读"}</h2></div><p>打开当前 Agent 固定的知识版本。</p></div>
+              ${isCollectionAgent
+                ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildKnowledgeCollectionURL(release.collection_id))}"><span>打开集合知识库</span><strong>${escapeHTML(bookTitle)}</strong><small>${Array.isArray(release.members) ? release.members.length : 0} 篇文章 · 进入集合工作台 →</small></a>`
+                : bookID
+                  ? `<a class="book-agent__reader-link" href="${escapeAttribute(buildBookReaderURL(bookID))}"><span>打开本书</span><strong>${escapeHTML(bookTitle)}</strong><small>进入阅读器 →</small></a>`
+                  : `<div class="book-agent__unavailable"><strong>阅读器尚未接通</strong><p>Release 未提供可解析的 book_id。</p></div>`}
             </section>
           `)}
           ${renderBookAgentCapability("search", `
@@ -5605,11 +5694,29 @@ function renderAgentReadingApp(pkg, release, bookID, searchRows, evaluation, run
   `;
 }
 
+function renderBookAgentLoading(route) {
+  const pageLabel = ({ package: "Agent 包契约", agent: "Agent 控制台", app: "阅读应用" })[route.view] || "Agent";
+  return `
+    <main class="book-agent book-agent--detail">
+      <section class="web-panel" aria-live="polite" aria-busy="true">
+        <p class="web-kicker">${escapeHTML(pageLabel)}</p>
+        <h1>正在加载指定 Agent</h1>
+        <p class="web-muted">正在恢复安全会话并读取版本 ${escapeHTML(route.version || "最新版本")}，请稍候。</p>
+        <code>${escapeHTML(route.packageID)}</code>
+      </section>
+    </main>
+  `;
+}
+
 function renderBookAgentPlatform(route = bookAgentState.route || { view: "package", packageID: "" }) {
   deactivateProofroomModal();
-  if (!route.packageID || !bookAgentState.package) {
+  if (!route.packageID) {
     renderShell(renderBookAgentPackageIndex(route), "agents");
     bindAgentEvolutionEvents(route);
+    return;
+  }
+  if (!bookAgentState.package) {
+    renderShell(renderBookAgentLoading(route), "agents");
     return;
   }
   const pkg = bookAgentState.package;
@@ -6328,6 +6435,16 @@ async function loadAgentEvolutionConsole() {
   });
 }
 
+async function loadPinnedAgentReleases(pkg) {
+  const bookReleases = (pkg.releases || []).map((reference) => (
+    apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
+  ));
+  const collectionReleases = (pkg.collection_releases || []).map((reference) => (
+    apiFetch(`/api/knowledge/collection-releases/${encodeURIComponent(reference.release_id)}`)
+  ));
+  return Promise.all([...bookReleases, ...collectionReleases]);
+}
+
 async function loadBookAgentPlatform(route) {
   cancelEvidenceAuditPoll();
   if (route.packageID) {
@@ -6355,9 +6472,7 @@ async function loadBookAgentPlatform(route) {
       return;
     }
     bookAgentState.package = pkg;
-    const releases = await Promise.all((pkg.releases || []).map((reference) => (
-      apiFetch(`/api/knowledge/releases/${encodeURIComponent(reference.release_id)}`)
-    )));
+    const releases = await loadPinnedAgentReleases(pkg);
     if (sequence !== bookAgentLoadSequence) {
       return;
     }
@@ -7787,6 +7902,7 @@ function renderSourceSubscriptionList() {
   `).join("");
   const rows = sourceControlState.subscriptions.map((subscription, index) => {
     const active = subscription.id === sourceControlState.selectedSubscriptionID ? " active" : "";
+    const collection = sourceCollectionForSubscription(subscription);
     return `
       <article class="source-control__subscription${active}">
         <button class="source-control__subscription-select" type="button" data-source-subscription-index="${index}">
@@ -7799,6 +7915,9 @@ function renderSourceSubscriptionList() {
             <span>启用</span>
           </label>
           <button class="button button-ghost" type="button" data-source-subscription-sync="${index}">立即同步</button>
+          ${collection
+            ? `<a class="button button-link" data-source-collection-open href="${escapeAttribute(buildKnowledgeCollectionURL(collection.collection_id))}">集合工作台</a>`
+            : `<button class="button button-link" type="button" data-source-collection-create="${index}">创建集合</button>`}
         </div>
       </article>
     `;
@@ -7981,8 +8100,252 @@ function renderSourceRunDrawer() {
   `;
 }
 
+function collectionStatusLabel(value) {
+  return ({ ready: "可发布", partial: "部分可用", blocked: "已阻断", pass: "通过", quarantine: "隔离", reject: "拒绝" })[value] || value || "尚未生成";
+}
+
+function collectionLatestRelease(detail = collectionWorkspaceState.detail) {
+  if (detail?.published_release) {
+    return detail.published_release;
+  }
+  const releases = Array.isArray(detail?.releases) ? detail.releases : [];
+  return releases[releases.length - 1] || null;
+}
+
+function collectionPublishedMemberKeys(detail = collectionWorkspaceState.detail) {
+  const release = collectionLatestRelease(detail);
+  return new Set(Array.isArray(release?.members) ? release.members.map((member) => member.source_item_key) : []);
+}
+
+function renderCollectionMetric(label, value, note = "") {
+  return `<article><span>${escapeHTML(label)}</span><strong>${escapeHTML(value)}</strong>${note ? `<small>${escapeHTML(note)}</small>` : ""}</article>`;
+}
+
+function renderKnowledgeCollectionWorkspace() {
+  const detail = collectionWorkspaceState.detail || {};
+  const collection = detail.collection || {};
+  const candidate = detail.candidate || null;
+  const quality = detail.quality || null;
+  const releases = Array.isArray(detail.releases) ? detail.releases : [];
+  const latestRelease = collectionLatestRelease(detail);
+  const publishedKeys = collectionPublishedMemberKeys(detail);
+  const members = Array.isArray(candidate?.members) ? candidate.members : [];
+  const exclusions = Array.isArray(candidate?.exclusions) ? candidate.exclusions : [];
+  const additions = members.filter((member) => !publishedKeys.has(member.source_item_key)).length;
+  const removals = latestRelease ? Math.max(0, Number(latestRelease.member_count || 0) - (members.length - additions)) : 0;
+  const agentDraft = collectionWorkspaceState.agentDraft;
+  const evaluation = collectionWorkspaceState.evaluation;
+  const publishedAgent = collectionWorkspaceState.publishedAgent;
+  const status = collectionWorkspaceState.loading || collectionWorkspaceState.message || "人工控制：构建、Release、Agent 均需显式确认";
+  const canPublishRelease = candidate?.status === "ready" && quality?.decision === "pass";
+  const canDraftAgent = Boolean(latestRelease?.release_id);
+  const canEvaluateAgent = Boolean(agentDraft?.package && agentDraft?.suite);
+  const canPublishAgent = Boolean(agentDraft?.package && evaluation?.passed);
+  const memberRows = members.map((member) => `
+    <tr>
+      <td><a href="${escapeAttribute(buildKnowledgePackageURL(member.book_id))}">${escapeHTML(member.source_item_key || member.book_id)}</a><small>${escapeHTML(member.book_id)}</small></td>
+      <td>${escapeHTML(formatSourceControlTime(member.published_at))}</td>
+      <td>${member.citation_ids?.length || 0}</td>
+      <td><span class="collection-workspace__hash">${escapeHTML(member.content_hash)}</span></td>
+      <td><a class="button button-link" href="${escapeAttribute(buildKnowledgePackageURL(member.book_id))}">查看成员知识包</a></td>
+    </tr>
+  `).join("");
+  const qualityRows = (quality?.rules || []).map((rule) => `
+    <li class="${rule.passed ? "is-pass" : "is-fail"}"><span>${rule.passed ? "通过" : "失败"}</span><div><strong>${escapeHTML(rule.id)}</strong><small>${escapeHTML(rule.message)}</small></div>${rule.hard ? "<em>硬门槛</em>" : ""}</li>
+  `).join("");
+  const exclusionRows = exclusions.map((item) => `
+    <li><strong>${escapeHTML(item.source_item_key || item.book_id || "未知条目")}</strong><span>${escapeHTML(item.code)} · ${escapeHTML(item.message)}</span></li>
+  `).join("");
+  const releaseRows = [...releases].reverse().map((release, index) => `
+    <li><span>${index === 0 ? "当前" : "历史"}</span><div><strong>${escapeHTML(release.release_id)}</strong><small>${release.member_count} 篇 · ${escapeHTML(formatSourceControlTime(release.created_at))}</small></div>${release.supersedes ? `<small>替代 ${escapeHTML(release.supersedes)}</small>` : ""}</li>
+  `).join("");
+
+  renderShell(`
+    <main class="collection-workspace">
+      <header class="collection-workspace__command-bar">
+        <div>
+          <p class="web-kicker">公众号集合知识库</p>
+          <h1>${escapeHTML(collection.title || collection.collection_id || "集合工作台")}</h1>
+          <p>${escapeHTML(collection.source_account || collection.source_account_key || "精确来源未载入")} · 证据型只读 Agent</p>
+        </div>
+        <div class="collection-workspace__command-actions">
+          <a class="button button-ghost" href="/wechat-source">返回采集器</a>
+          <button class="button button-primary" data-collection-build type="button" ${collectionWorkspaceState.loading ? "disabled" : ""}>生成候选</button>
+          <span class="web-status">${escapeHTML(status)}</span>
+        </div>
+      </header>
+
+      <section class="collection-workspace__metrics" aria-label="集合摘要">
+        ${renderCollectionMetric("采集健康", candidate ? collectionStatusLabel(candidate.status) : "待首次构建", `${members.length} 个有效成员`)}
+        ${renderCollectionMetric("成员差异", candidate ? `+${additions} / −${removals}` : "尚未比较", "candidate-versus-published")}
+        ${renderCollectionMetric("排除项", String(exclusions.length), exclusions.length ? "需处理后再发布" : "来源与内容完整")}
+        ${renderCollectionMetric("Release", String(releases.length), latestRelease?.release_id || "尚未发布")}
+      </section>
+
+      <div class="collection-workspace__layout">
+        <section class="collection-workspace__main">
+          <article class="collection-workspace__pipeline">
+            <div class="collection-workspace__section-head"><div><span>人工发布链</span><h2>集合 → Release → Agent</h2></div><small>每一步保存不可变身份；后一步不会由前一步自动触发。</small></div>
+            <ol>
+              <li class="${candidate ? "is-ready" : ""}"><b>01</b><div><strong>构建集合候选</strong><span>${candidate ? `${members.length} 篇 · ${collectionStatusLabel(candidate.status)}` : "汇总当前公众号已入库文章"}</span></div><button class="button button-ghost" data-collection-build type="button">重新构建</button></li>
+              <li class="${latestRelease ? "is-ready" : ""}"><b>02</b><div><strong>发布知识 Release</strong><span>${latestRelease ? latestRelease.release_id : "通过质量门槛后人工发布"}</span></div><button class="button button-primary" data-collection-release-publish type="button" ${canPublishRelease ? "" : "disabled"}>发布知识 Release</button></li>
+              <li class="${agentDraft ? "is-ready" : ""}"><b>03</b><div><strong>生成 Agent 草稿</strong><span>${agentDraft?.package ? `${agentDraft.package.package_id} · ${agentDraft.package.version}` : "绑定当前不可变 Release"}</span></div><button class="button button-ghost" data-collection-agent-draft type="button" ${canDraftAgent ? "" : "disabled"}>生成 Agent 草稿</button></li>
+              <li class="${evaluation?.passed ? "is-ready" : ""}"><b>04</b><div><strong>运行可信评测</strong><span>${evaluation ? (evaluation.passed ? "全部指标通过" : `未通过：${(evaluation.failures || []).join("、")}`) : "验证检索、引用、拒答与成本边界"}</span></div><button class="button button-ghost" data-collection-agent-evaluate type="button" ${canEvaluateAgent ? "" : "disabled"}>运行可信评测</button></li>
+              <li class="${publishedAgent ? "is-ready" : ""}"><b>05</b><div><strong>发布 Agent</strong><span>${publishedAgent ? `${publishedAgent.package_id} · ${publishedAgent.version}` : "仅评测通过后开放"}</span></div><button class="button button-primary" data-collection-agent-publish type="button" ${canPublishAgent ? "" : "disabled"}>发布 Agent</button></li>
+            </ol>
+          </article>
+
+          <article class="collection-workspace__members">
+            <div class="collection-workspace__section-head"><div><span>成员清单</span><h2>${members.length} 篇公众号文章</h2></div><small>只展示身份与哈希；正文仍留在各知识包。</small></div>
+            <div class="collection-workspace__table-wrap"><table class="collection-workspace__member-table"><thead><tr><th>来源条目</th><th>发布时间</th><th>引用</th><th>内容哈希</th><th>操作</th></tr></thead><tbody>${memberRows || '<tr><td colspan="5">生成候选后显示成员。</td></tr>'}</tbody></table></div>
+          </article>
+        </section>
+
+        <aside class="collection-workspace__side-stack">
+          <article><div class="collection-workspace__section-head"><div><span>Gate</span><h2>质量规则</h2></div><b>${escapeHTML(collectionStatusLabel(quality?.decision))}</b></div><ul class="collection-workspace__quality">${qualityRows || "<li><span>等待</span><div><strong>尚未评测</strong><small>先生成集合候选。</small></div></li>"}</ul></article>
+          <article><div class="collection-workspace__section-head"><div><span>Exceptions</span><h2>排除项</h2></div><b>${exclusions.length}</b></div><ul class="collection-workspace__exclusions">${exclusionRows || "<li><strong>无排除项</strong><span>当前候选未发现越界或损坏成员。</span></li>"}</ul></article>
+          <article><div class="collection-workspace__section-head"><div><span>Immutable history</span><h2>回滚锚点</h2></div><b>${releases.length}</b></div><ul class="collection-workspace__releases">${releaseRows || "<li><span>—</span><div><strong>尚未发布</strong><small>发布后可按 Release 身份回滚。</small></div></li>"}</ul></article>
+        </aside>
+      </div>
+    </main>
+  `, "knowledge");
+  bindKnowledgeCollectionWorkspaceEvents();
+}
+
+function bindKnowledgeCollectionWorkspaceEvents() {
+  document.querySelectorAll("[data-collection-build]").forEach((button) => button.addEventListener("click", buildKnowledgeCollectionCandidate));
+  document.querySelector("[data-collection-release-publish]")?.addEventListener("click", publishKnowledgeCollectionRelease);
+  document.querySelector("[data-collection-agent-draft]")?.addEventListener("click", createCollectionAgentDraft);
+  document.querySelector("[data-collection-agent-evaluate]")?.addEventListener("click", evaluateCollectionAgent);
+  document.querySelector("[data-collection-agent-publish]")?.addEventListener("click", publishCollectionAgent);
+}
+
+async function loadKnowledgeCollectionWorkspace(collectionID = getKnowledgeCollectionID()) {
+  const sequence = ++collectionWorkspaceLoadSequence;
+  collectionWorkspaceState.loading = "加载集合";
+  collectionWorkspaceState.message = "";
+  renderKnowledgeCollectionWorkspace();
+  try {
+    const detail = await loadKnowledgeCollectionDetailPayload(collectionID);
+    if (sequence === collectionWorkspaceLoadSequence) {
+      collectionWorkspaceState.detail = detail;
+      collectionWorkspaceState.publishedAgent = detail.published_agent || null;
+      collectionWorkspaceState.message = "集合契约已载入。";
+    }
+  } catch (error) {
+    if (sequence === collectionWorkspaceLoadSequence) collectionWorkspaceState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (sequence === collectionWorkspaceLoadSequence) {
+      collectionWorkspaceState.loading = "";
+      renderKnowledgeCollectionWorkspace();
+    }
+  }
+}
+
+async function loadKnowledgeCollectionDetailPayload(collectionID) {
+  const detail = await apiFetch(`/api/knowledge/collections/${encodeURIComponent(collectionID)}`);
+  const releases = Array.isArray(detail.releases) ? detail.releases : [];
+  const latest = releases[releases.length - 1];
+  if (latest?.release_id) {
+    detail.published_release = await apiFetch(`/api/knowledge/collection-releases/${encodeURIComponent(latest.release_id)}`);
+  }
+  const packageID = `${detail.collection?.collection_id || ""}-agent`;
+  if (packageID !== "-agent") {
+    try {
+      detail.published_agent = await apiFetch(`/api/agent-packages/${encodeURIComponent(packageID)}`);
+    } catch (error) {
+      if (Number(error?.status || 0) !== 404) throw error;
+    }
+  }
+  return detail;
+}
+
+async function runCollectionWorkspaceAction(label, action) {
+  collectionWorkspaceState.loading = label;
+  collectionWorkspaceState.message = "";
+  renderKnowledgeCollectionWorkspace();
+  try {
+    await action();
+  } catch (error) {
+    collectionWorkspaceState.message = error instanceof Error ? error.message : String(error);
+  } finally {
+    collectionWorkspaceState.loading = "";
+    renderKnowledgeCollectionWorkspace();
+  }
+}
+
+async function buildKnowledgeCollectionCandidate() {
+  await runCollectionWorkspaceAction("构建集合候选", async () => {
+    await apiFetch(`/api/knowledge/collections/${encodeURIComponent(getKnowledgeCollectionID())}/build`, { method: "POST", body: JSON.stringify({}) });
+    collectionWorkspaceState.detail = await loadKnowledgeCollectionDetailPayload(getKnowledgeCollectionID());
+    collectionWorkspaceState.agentDraft = null;
+    collectionWorkspaceState.evaluation = null;
+    collectionWorkspaceState.message = "候选已生成；请检查成员差异与质量规则。";
+  });
+}
+
+async function publishKnowledgeCollectionRelease() {
+  await runCollectionWorkspaceAction("发布知识 Release", async () => {
+    const release = await apiFetch(`/api/knowledge/collections/${encodeURIComponent(getKnowledgeCollectionID())}/publish`, { method: "POST", body: JSON.stringify({}) });
+    collectionWorkspaceState.detail = await loadKnowledgeCollectionDetailPayload(getKnowledgeCollectionID());
+    collectionWorkspaceState.message = `知识 Release 已发布：${release.release_id}`;
+  });
+}
+
+async function createCollectionAgentDraft() {
+  await runCollectionWorkspaceAction("生成 Agent 草稿", async () => {
+    const release = collectionLatestRelease();
+    const collection = collectionWorkspaceState.detail?.collection || {};
+    collectionWorkspaceState.agentDraft = await apiFetch("/api/controlled-collection-agent/draft", {
+      method: "POST",
+      body: JSON.stringify({ draft: { collection_release_id: release.release_id, package_id: `${collection.collection_id}-agent`, version: collectionWorkspaceState.agentVersion } }),
+    });
+    collectionWorkspaceState.evaluation = null;
+    collectionWorkspaceState.message = "Agent 草稿已生成，尚未评测和发布。";
+  });
+}
+
+async function evaluateCollectionAgent() {
+  await runCollectionWorkspaceAction("运行可信评测", async () => {
+    const pkg = collectionWorkspaceState.agentDraft.package;
+    const result = await apiFetch("/api/controlled-collection-agent/evaluate", {
+      method: "POST",
+      body: JSON.stringify({ draft: { collection_release_id: collectionLatestRelease().release_id, package_id: pkg.package_id, version: pkg.version } }),
+    });
+    collectionWorkspaceState.evaluation = result.evaluation;
+    collectionWorkspaceState.message = result.evaluation?.passed ? "可信评测通过，可以人工发布 Agent。" : "可信评测未通过，发布保持关闭。";
+  });
+}
+
+async function publishCollectionAgent() {
+  if (!collectionWorkspaceState.evaluation?.passed || !window.confirm("确认发布这个已通过可信评测的公众号集合 Agent？发布后版本不可变。")) return;
+  await runCollectionWorkspaceAction("发布 Agent", async () => {
+    const pkg = collectionWorkspaceState.agentDraft.package;
+    const result = await apiFetch("/api/controlled-collection-agent/publish", {
+      method: "POST",
+      body: JSON.stringify({
+        draft: { collection_release_id: collectionLatestRelease().release_id, package_id: pkg.package_id, version: pkg.version },
+        idempotency_key: `collection-ui:${pkg.content_hash}`,
+        confirm: true,
+      }),
+    });
+    collectionWorkspaceState.publishedAgent = result.package;
+    collectionWorkspaceState.message = `Agent 已发布：${result.package.package_id} · ${result.package.version}`;
+  });
+}
+
 function selectedSourceSubscription() {
   return sourceControlState.subscriptions.find((subscription) => subscription.id === sourceControlState.selectedSubscriptionID) || null;
+}
+
+function sourceCollectionForSubscription(subscription) {
+  if (!subscription) {
+    return null;
+  }
+  return sourceControlState.knowledgeCollections.find((collection) => (
+    collection.source_type === subscription.source_type &&
+    collection.source_account_key === subscription.source_account_key
+  )) || null;
 }
 
 function sourceAgentIsOnline(agent, now = Date.now()) {
@@ -8101,10 +8464,15 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
     renderWCPlusPage();
   }
   try {
-    const [agentPayload, subscriptionPayload, runPayload] = await Promise.all([
+    const collectionRequest = apiFetch("/api/knowledge/collections").then(
+      (value) => ({ value, unavailable: false }),
+      () => ({ value: { collections: [] }, unavailable: true }),
+    );
+    const [agentPayload, subscriptionPayload, runPayload, collectionPayload] = await Promise.all([
       apiFetch("/api/source-agents"),
       apiFetch("/api/source-subscriptions"),
       apiFetch("/api/source-sync/runs?limit=200"),
+      collectionRequest,
     ]);
     if (sequence !== sourceControlLoadSequence) {
       return;
@@ -8112,6 +8480,7 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
     sourceControlState.agents = Array.isArray(agentPayload.agents) ? agentPayload.agents : [];
     sourceControlState.subscriptions = Array.isArray(subscriptionPayload.subscriptions) ? subscriptionPayload.subscriptions : [];
     sourceControlState.runs = Array.isArray(runPayload.runs) ? runPayload.runs : [];
+    sourceControlState.knowledgeCollections = Array.isArray(collectionPayload.value.collections) ? collectionPayload.value.collections : [];
     if (!sourceControlState.draft.sourceAgentID && sourceControlState.agents.length === 1) {
       sourceControlState.draft.sourceAgentID = sourceControlState.agents[0].agent_id || "";
     }
@@ -8139,7 +8508,7 @@ async function loadSourceControlPlane({ silent = false, renderResult = true } = 
       }
     }
     shouldRender = shouldRender || previousSignature !== sourceControlDataSignature();
-    sourceControlState.message = `${sourceControlState.agents.length} 个 Agent · ${sourceControlState.subscriptions.length} 个订阅 · ${sourceControlState.runs.length} 次运行`;
+    sourceControlState.message = `${sourceControlState.agents.length} 个 Agent · ${sourceControlState.subscriptions.length} 个订阅 · ${sourceControlState.runs.length} 次运行${collectionPayload.unavailable ? " · 集合列表暂不可用" : ""}`;
   } catch (error) {
     if (sequence === sourceControlLoadSequence) {
       sourceControlState.message = error instanceof Error ? error.message : String(error);
@@ -8160,6 +8529,7 @@ function sourceControlDataSignature() {
   return JSON.stringify({
     agents: sourceControlState.agents,
     subscriptions: sourceControlState.subscriptions,
+    knowledgeCollections: sourceControlState.knowledgeCollections,
     runs: sourceControlState.runs,
     runDetail: sourceControlState.runDetail,
   });
@@ -8239,6 +8609,15 @@ function bindSourceControlEvents() {
       }
     });
   }
+  for (const button of document.querySelectorAll("[data-source-collection-create]")) {
+    button.addEventListener("click", async () => {
+      const index = Number(button.getAttribute("data-source-collection-create") || "0");
+      const subscription = sourceControlState.subscriptions[index];
+      if (subscription) {
+        await createCollectionForSubscription(subscription);
+      }
+    });
+  }
   for (const button of document.querySelectorAll("[data-source-run-filter]")) {
     button.addEventListener("click", () => {
       sourceControlState.runFilter = String(button.getAttribute("data-source-run-filter") || "all");
@@ -8273,6 +8652,37 @@ function bindSourceControlEvents() {
       await bootstrapWCPlusSource();
     }
   });
+}
+
+function collectionIDForSubscription(subscription) {
+  const stableID = String(subscription?.id || "").trim();
+  if (/^[A-Za-z0-9._-]+$/.test(stableID)) {
+    return `wechat-${stableID}`.slice(0, 128);
+  }
+  return `wechat-collection-${Date.now()}`;
+}
+
+async function createCollectionForSubscription(subscription) {
+  sourceControlState.loading = "创建公众号集合";
+  renderWCPlusPage();
+  try {
+    const collection = await apiFetch("/api/knowledge/collections", {
+      method: "POST",
+      body: JSON.stringify({
+        collection_id: collectionIDForSubscription(subscription),
+        title: `${subscription.source_account || subscription.source_account_key}公众号集合知识库`,
+        source_type: subscription.source_type || "wechat_mp_article",
+        source_account_key: subscription.source_account_key,
+        source_account: subscription.source_account || subscription.source_account_key,
+        enabled: true,
+      }),
+    });
+    window.location.assign(buildKnowledgeCollectionURL(collection.collection_id));
+  } catch (error) {
+    sourceControlState.message = error instanceof Error ? error.message : String(error);
+    sourceControlState.loading = "";
+    renderWCPlusPage();
+  }
 }
 
 function readSourceSubscriptionDraft() {
@@ -11299,6 +11709,9 @@ async function boot() {
   if (!researchRoute) {
     researchListRequestController.cancel();
     clearResearchRunDetail();
+	}
+  if (!routePathname.startsWith(`${ROUTES.knowledgeCollections}/`)) {
+    collectionWorkspaceLoadSequence += 1;
   }
   if (!isJobCenterRoute(routePathname)) {
     jobCenterLoadSequence += 1;
@@ -11365,6 +11778,16 @@ async function boot() {
   if (routePathname === ROUTES.operations) {
     renderKnowledgeOperationsConsole();
     await loadKnowledgeOperationsConsole();
+    return;
+  }
+  const knowledgeCollectionID = getKnowledgeCollectionID(routePathname);
+  if (knowledgeCollectionID) {
+    collectionWorkspaceState.detail = null;
+    collectionWorkspaceState.agentDraft = null;
+    collectionWorkspaceState.evaluation = null;
+    collectionWorkspaceState.publishedAgent = null;
+    renderKnowledgeCollectionWorkspace();
+    await loadKnowledgeCollectionWorkspace(knowledgeCollectionID);
     return;
   }
   const sourceAgentDetailID = getSourceAgentDetailID(routePathname);

@@ -147,6 +147,16 @@ func (r *ResearchToolRegistry) Execute(ctx context.Context, name string, request
 		}
 		return ResearchToolResult{}, err
 	}
+	if err := authorizeResearchAgentTool(*pkg, *run, name); err != nil {
+		if auditErr := r.saveAudit(started, request, ResearchToolAuditRecord{
+			ToolName: name, ArgumentFingerprint: argumentFingerprint,
+			PolicyDecision: "block", Outcome: ResearchToolOutcomeFailed,
+			ResultFingerprint: researchToolFingerprint(map[string]any{"outcome": ResearchToolOutcomeFailed}),
+		}); auditErr != nil {
+			return ResearchToolResult{}, fmt.Errorf("%v; persist research tool audit: %w", err, auditErr)
+		}
+		return ResearchToolResult{}, err
+	}
 	result, executeErr := tool.Execute(ctx, request)
 	result.ToolName = name
 	result.Package = researchToolPackageScope(*pkg)

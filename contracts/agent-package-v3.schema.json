@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/agent-package-v3.schema.json",
+  "title": "KBase Collection Agent Package v3",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "package_id",
+    "version",
+    "content_hash",
+    "lifecycle_state",
+    "collection_releases",
+    "retrieval_policy",
+    "model_policy",
+    "prompt_profiles",
+    "tool_policy",
+    "safety_policy",
+    "evaluation_policy",
+    "ui_manifest"
+  ],
+  "properties": {
+    "schema_version": { "const": "agent-package.v3" },
+    "package_id": { "$ref": "agent-package-v1.schema.json#/properties/package_id" },
+    "version": { "$ref": "agent-package-v1.schema.json#/properties/version" },
+    "content_hash": { "$ref": "agent-package-v1.schema.json#/properties/content_hash" },
+    "lifecycle_state": { "$ref": "agent-package-v1.schema.json#/properties/lifecycle_state" },
+    "supersedes": { "$ref": "agent-package-v1.schema.json#/properties/supersedes" },
+    "collection_releases": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["release_id", "content_hash"],
+        "properties": {
+          "release_id": { "type": "string", "minLength": 1 },
+          "content_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
+        }
+      }
+    },
+    "retrieval_policy": { "$ref": "agent-package-v1.schema.json#/properties/retrieval_policy" },
+    "model_policy": { "$ref": "agent-package-v1.schema.json#/properties/model_policy" },
+    "prompt_profiles": { "$ref": "agent-package-v1.schema.json#/properties/prompt_profiles" },
+    "tool_policy": { "$ref": "agent-package-v1.schema.json#/properties/tool_policy" },
+    "safety_policy": { "$ref": "agent-package-v1.schema.json#/properties/safety_policy" },
+    "evaluation_policy": { "$ref": "agent-package-v1.schema.json#/properties/evaluation_policy" },
+    "ui_manifest": { "$ref": "agent-package-v1.schema.json#/properties/ui_manifest" },
+    "created_at": { "$ref": "agent-package-v1.schema.json#/properties/created_at" },
+    "published_at": { "$ref": "agent-package-v1.schema.json#/properties/published_at" }
+  },
+  "not": {
+    "anyOf": [
+      { "required": ["releases"] },
+      { "required": ["evidence_policy"] },
+      { "required": ["research_policy"] }
+    ]
+  },
+  "additionalProperties": true
+}

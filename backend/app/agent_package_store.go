@@ -167,7 +167,7 @@ func PublishAgentPackage(store *BookKnowledgeStore, pkg AgentPackage, idempotenc
 		PublishedAt:    published.PublishedAt,
 		URL:            agentPackageURL(published.PackageID, published.Version),
 	}
-	if published.SchemaVersion == AgentPackageSchemaVersionV2 || published.SchemaVersion == AgentPackageSchemaVersionV3 {
+	if agentPackageUsesRuntimeDescriptor(published.SchemaVersion) {
 		descriptor, descriptorErr := newAgentPackageRuntimeDescriptor(published)
 		if descriptorErr != nil {
 			return nil, false, descriptorErr
@@ -361,7 +361,7 @@ func (s *BookKnowledgeStore) loadAgentPackageRecordContextUnlocked(
 	if pkg.PackageID != record.PackageID || pkg.Version != record.Version {
 		return nil, fmt.Errorf("agent package artifact identity does not match manifest record")
 	}
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 || pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+	if agentPackageUsesRuntimeDescriptor(pkg.SchemaVersion) {
 		if err := validateAgentPackageRuntimeDescriptor(record, &pkg); err != nil {
 			return nil, err
 		}
@@ -404,7 +404,7 @@ func validateAgentPackageRuntimeDescriptor(record AgentPackageRecord, pkg *Agent
 		return fmt.Errorf("agent package runtime descriptor is required")
 	}
 	descriptor := *record.Runtime
-	if (descriptor.SchemaVersion != AgentPackageSchemaVersionV2 && descriptor.SchemaVersion != AgentPackageSchemaVersionV3) ||
+	if !agentPackageUsesRuntimeDescriptor(descriptor.SchemaVersion) ||
 		descriptor.PackageID != record.PackageID ||
 		descriptor.Version != record.Version ||
 		descriptor.ContentHash != record.ContentHash ||
@@ -426,6 +426,10 @@ func validateAgentPackageRuntimeDescriptor(record AgentPackageRecord, pkg *Agent
 		return fmt.Errorf("agent package runtime descriptor does not match artifact")
 	}
 	return nil
+}
+
+func agentPackageUsesRuntimeDescriptor(schemaVersion string) bool {
+	return schemaVersion == AgentPackageSchemaVersionV2 || schemaVersion == AgentPackageSchemaVersionV3 || schemaVersion == AgentPackageSchemaVersionV4
 }
 
 func agentPackageRuntimeDescriptorHash(descriptor AgentPackageRuntimeDescriptor) (string, error) {

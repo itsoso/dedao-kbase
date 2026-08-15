@@ -161,7 +161,7 @@ func TestResearchEvaluationSchemaDeclaresResearchCasesWithoutRequiringLegacyCase
 	validateSchemaInstance(t, "agent-evaluation-v1.schema.json", suite, true)
 }
 
-func TestResearchEvaluationTrustedSuiteGatesV3PublicationAndRecomputesAtPublish(t *testing.T) {
+func TestResearchEvaluationTrustedSuiteGatesV4PublicationAndRecomputesAtPublish(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	saveAgentPackageTestRelease(t, store)
 	pkg := finalizedResearchEvaluationPackage(t)
@@ -214,13 +214,48 @@ func trustedResearchEvaluationFixture(suite AgentEvaluationSuite) AgentEvaluatio
 
 func finalizedResearchEvaluationPackage(t *testing.T) AgentPackage {
 	t.Helper()
-	pkg := validAgentPackageV3()
+	pkg := validAgentPackageV4()
 	pkg.EvaluationPolicy.MinimumScores = researchEvaluationMinimumScores()
 	finalized, err := FinalizeAgentPackage(pkg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return finalized
+}
+
+func researchAgentRuntimeTestStore(t *testing.T) (*BookKnowledgeStore, AgentPackage) {
+	t.Helper()
+	store, pkg := agentRuntimeTestStore(t)
+	pkg.Version = "4.0.0-research"
+	pkg.ContentHash = ""
+	pkg.LifecycleState = AgentPackageDraft
+	pkg.CreatedAt = ""
+	pkg.PublishedAt = ""
+	pkg.Supersedes = ""
+	applyAgentCompilationResearchPolicy(&pkg, true)
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitted := loadResearchEvaluationFixture(t)
+	trusted := trustedResearchEvaluationFixture(submitted)
+	if err := store.SaveTrustedAgentEvaluationSuite(finalized, trusted); err != nil {
+		t.Fatal(err)
+	}
+	resolved, report, err := EvaluateAgentPackageAgainstTrustedSuite(store, finalized, submitted, testAgentPackageTime())
+	if err != nil || !report.Passed {
+		t.Fatalf("research evaluation = %#v err=%v", report, err)
+	}
+	if err := store.SaveAgentPackageEvaluation(finalized, resolved, report); err != nil {
+		t.Fatal(err)
+	}
+	published, _, err := PublishAgentPackage(
+		store, finalized, "runtime-research-v4", AgentPackageKnownToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, *published
 }
 
 func loadResearchEvaluationFixture(t *testing.T) AgentEvaluationSuite {

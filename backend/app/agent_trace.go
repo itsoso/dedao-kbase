@@ -176,16 +176,20 @@ type AgentTracePackageRef struct {
 }
 
 type AgentTraceReleaseRef struct {
-	ReleaseID   string `json:"release_id"`
-	Version     string `json:"version"`
-	ContentHash string `json:"content_hash"`
+	ReleaseID    string `json:"release_id"`
+	Version      string `json:"version"`
+	ContentHash  string `json:"content_hash"`
+	CollectionID string `json:"collection_id,omitempty"`
 }
 
 type AgentTraceRetrieval struct {
-	EvidenceID string  `json:"evidence_id"`
-	ReleaseID  string  `json:"release_id"`
-	Score      float64 `json:"score"`
-	Rank       int     `json:"rank"`
+	EvidenceID        string  `json:"evidence_id"`
+	ReleaseID         string  `json:"release_id"`
+	MemberBookID      string  `json:"member_book_id,omitempty"`
+	MemberContentHash string  `json:"member_content_hash,omitempty"`
+	ChunkID           string  `json:"chunk_id,omitempty"`
+	Score             float64 `json:"score"`
+	Rank              int     `json:"rank"`
 }
 
 type AgentTraceModelRoute struct {
@@ -337,6 +341,15 @@ func ValidateAgentTrace(trace AgentTrace) error {
 		}
 		if _, ok := releases[retrieval.ReleaseID]; !ok {
 			return fmt.Errorf("retrieval release %q is outside trace scope", retrieval.ReleaseID)
+		}
+		hasMemberProvenance := retrieval.MemberBookID != "" || retrieval.MemberContentHash != "" || retrieval.ChunkID != ""
+		if hasMemberProvenance {
+			if retrieval.MemberBookID == "" || retrieval.MemberContentHash == "" || retrieval.ChunkID == "" {
+				return fmt.Errorf("retrievals[%d] collection member provenance is incomplete", index)
+			}
+			if err := validateAgentSHA256(fmt.Sprintf("retrievals[%d].member_content_hash", index), retrieval.MemberContentHash); err != nil {
+				return err
+			}
 		}
 		if _, exists := evidence[retrieval.EvidenceID]; exists {
 			return fmt.Errorf("duplicate retrieval evidence %q", retrieval.EvidenceID)

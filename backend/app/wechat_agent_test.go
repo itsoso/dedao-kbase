@@ -671,6 +671,37 @@ func TestWeChatAgentSetsInitialFrontierToNewestFilteredMatch(t *testing.T) {
 	}
 }
 
+func TestWeChatAgentThrottlePreservesCursorForCooldownRetry(t *testing.T) {
+	discoveryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"base_resp": map[string]any{"ret": 200013}})
+	}))
+	defer discoveryServer.Close()
+	sessions := fakeSessionHealthProvider{session: WeChatMPSession{Token: "test-token"}}
+	discovery, err := NewWeChatDiscovery(WeChatDiscoveryConfig{BaseURL: discoveryServer.URL, HTTPClient: discoveryServer.Client(), SessionProvider: sessions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := NewWeChatSourceAdapter(WeChatSourceAdapterConfig{Sessions: sessions, Discovery: discovery})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial, err := encodeWeChatAgentCursor(weChatAgentCursor{UpstreamBegin: 40, PublicationItemIndex: 2, LastArticleKey: "article-40", LastTimestamp: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := adapter.Execute(context.Background(), SourceSyncRun{
+		ID: "run-throttled", RequestedOperation: "discover_articles",
+		Subscription: &SourceSubscription{SourceAccountKey: "account-key", Cursor: initial},
+	}, &recordingSourceEnvelopeSink{})
+	var executionErr *SourceAdapterExecutionError
+	if !errors.As(err, &executionErr) || WeChatDiscoveryErrorCode(err) != "throttled" {
+		t.Fatalf("result=%#v error=%T %v", result, err, err)
+	}
+	if executionErr.Cursor != initial || result.Cursor != initial {
+		t.Fatalf("cursor result=%q error=%q want=%q", result.Cursor, executionErr.Cursor, initial)
+	}
+}
+
 func newFailureTestWeChatAgentAdapter(t *testing.T, failedPath string) *WeChatSourceAdapter {
 	t.Helper()
 	articleServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

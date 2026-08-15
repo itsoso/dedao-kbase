@@ -109,3 +109,57 @@ func TestKnowledgeCatalogGroupsProbableDuplicatesAndRebuildsFromPackages(t *test
 		t.Fatalf("rebuilt duplicate groups = %q/%q", rebuiltFirst.DuplicateGroupID, rebuiltSecond.DuplicateGroupID)
 	}
 }
+
+func TestKnowledgeCatalogListsOnlyCurrentVersionsForExactSourceAccount(t *testing.T) {
+	root := t.TempDir()
+	clock := newSourceSyncTestClock(time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC))
+	catalog, err := NewKnowledgeCatalogStore(root, clock.Now)
+	if err != nil {
+		t.Fatalf("new catalog: %v", err)
+	}
+	t.Cleanup(func() { _ = catalog.Close() })
+
+	record := func(accountKey, itemKey, hash string) {
+		t.Helper()
+		_, err := catalog.RecordContentVersion(SourceArticleEnvelope{
+			SourceType:      "wechat_mp_article",
+			SourceAccountID: accountKey,
+			SourceAccount:   "Fixture account",
+			SourceItemID:    itemKey,
+			SourceURL:       "https://mp.weixin.qq.com/s/" + itemKey,
+		}, hash, "book-"+itemKey, "books/book-"+itemKey+"/manifest.json")
+		if err != nil {
+			t.Fatalf("record %s: %v", itemKey, err)
+		}
+	}
+
+	record("account-a", "article-a", "hash-a1")
+	clock.Advance(time.Minute)
+	record("account-a", "article-a", "hash-a2")
+	record("account-a", "article-b", "hash-b")
+	record("account-b", "article-c", "hash-c")
+	record("account-a", "article-d", "hash-d")
+
+	records, err := catalog.ListCurrentContentVersionsBySourceAccount("wechat_mp_article", "account-a", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("records = %#v", records)
+	}
+	if records[0].Source.SourceItemKey != "article-a" || records[0].Version.ContentHash != "hash-a2" {
+		t.Fatalf("current article-a = %#v", records[0])
+	}
+	for _, record := range records {
+		if record.Source.SourceAccountKey != "account-a" || !record.Version.IsCurrent {
+			t.Fatalf("out-of-scope record = %#v", record)
+		}
+	}
+	limited, err := catalog.ListCurrentContentVersionsBySourceAccount("wechat_mp_article", "account-a", 2)
+	if err != nil || len(limited) != 2 {
+		t.Fatalf("limited records = %#v err=%v", limited, err)
+	}
+	if _, err := catalog.ListCurrentContentVersionsBySourceAccount("wechat_mp_article", "account-a", 0); err == nil {
+		t.Fatal("zero limit unexpectedly accepted")
+	}
+}

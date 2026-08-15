@@ -181,7 +181,8 @@
         "package": {
           "oneOf": [
             { "$ref": "agent-package-v1.schema.json" },
-            { "$ref": "agent-package-v2.schema.json" }
+            { "$ref": "agent-package-v2.schema.json" },
+            { "$ref": "agent-package-v4.schema.json" }
           ]
         },
         "issues": {
@@ -229,7 +230,12 @@
           },
           "then": {
             "properties": {
-              "package": { "$ref": "agent-package-v1.schema.json" }
+              "package": {
+                "oneOf": [
+                  { "$ref": "agent-package-v1.schema.json" },
+                  { "$ref": "agent-package-v4.schema.json" }
+                ]
+              }
             }
           }
         },
@@ -240,7 +246,12 @@
           },
           "then": {
             "properties": {
-              "package": { "$ref": "agent-package-v2.schema.json" }
+              "package": {
+                "oneOf": [
+                  { "$ref": "agent-package-v2.schema.json" },
+                  { "$ref": "agent-package-v4.schema.json" }
+                ]
+              }
             }
           }
         }

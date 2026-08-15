@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kbase.executor.life/contracts/agent-package-v4.schema.json",
+  "title": "KBase Research Agent Package v4",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "package_id",
+    "version",
+    "content_hash",
+    "lifecycle_state",
+    "releases",
+    "retrieval_policy",
+    "model_policy",
+    "prompt_profiles",
+    "tool_policy",
+    "safety_policy",
+    "evaluation_policy",
+    "research_policy",
+    "ui_manifest"
+  ],
+  "properties": {
+    "schema_version": { "const": "agent-package.v4" },
+    "package_id": { "$ref": "agent-package-v1.schema.json#/properties/package_id" },
+    "version": { "$ref": "agent-package-v1.schema.json#/properties/version" },
+    "content_hash": { "$ref": "agent-package-v1.schema.json#/properties/content_hash" },
+    "lifecycle_state": { "$ref": "agent-package-v1.schema.json#/properties/lifecycle_state" },
+    "supersedes": { "$ref": "agent-package-v1.schema.json#/properties/supersedes" },
+    "releases": { "$ref": "agent-package-v2.schema.json#/properties/releases" },
+    "retrieval_policy": { "$ref": "agent-package-v1.schema.json#/properties/retrieval_policy" },
+    "model_policy": { "$ref": "agent-package-v1.schema.json#/properties/model_policy" },
+    "prompt_profiles": { "$ref": "agent-package-v1.schema.json#/properties/prompt_profiles" },
+    "tool_policy": { "$ref": "agent-package-v1.schema.json#/properties/tool_policy" },
+    "safety_policy": { "$ref": "agent-package-v1.schema.json#/properties/safety_policy" },
+    "evaluation_policy": {
+      "type": "object",
+      "required": ["suite_version", "minimum_scores"],
+      "properties": {
+        "suite_version": { "type": "string", "minLength": 1 },
+        "minimum_scores": {
+          "type": "object",
+          "required": [
+            "research_retrieval_scope",
+            "research_identity_precision",
+            "research_identity_ambiguity",
+            "research_timeline_precision",
+            "research_timeline_recall",
+            "research_numeric_trend",
+            "research_direct_advice",
+            "research_intervention_extraction",
+            "research_conflict_extraction",
+            "research_case_transfer_warning",
+            "research_citation_coverage",
+            "research_safe_insufficiency",
+            "research_private_projection",
+            "research_latency",
+            "research_cost"
+          ],
+          "additionalProperties": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 1
+          }
+        }
+      }
+    },
+    "evidence_policy": { "$ref": "agent-package-v2.schema.json#/properties/evidence_policy" },
+    "research_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "modes",
+        "allowed_sources",
+        "allowed_tools",
+        "max_iterations",
+        "max_evidence_items",
+        "max_quoted_chars",
+        "max_cost_usd",
+        "require_verification"
+      ],
+      "properties": {
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["auto", "quick", "deep"] }
+        },
+        "allowed_sources": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["knowledge", "chatlog", "prior_runs"] }
+        },
+        "allowed_tools": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "research/expand_chat_context",
+              "research/fetch_chat_message",
+              "research/fetch_knowledge_evidence",
+              "research/list_identity_conversations",
+              "research/resolve_chat_identity",
+              "research/search_chatlog",
+              "research/search_knowledge",
+              "research/search_prior_runs"
+            ]
+          }
+        },
+        "max_iterations": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "max_evidence_items": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "max_quoted_chars": { "type": "integer", "minimum": 1, "maximum": 200000 },
+        "max_cost_usd": { "type": "number", "exclusiveMinimum": 0, "maximum": 100 },
+        "require_verification": { "const": true }
+      }
+    },
+    "ui_manifest": {
+      "type": "object",
+      "required": ["capabilities"],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["reader", "search", "grounded_chat", "evidence", "quiz", "action_plan", "deep_research"]
+          }
+        }
+      }
+    },
+    "created_at": { "$ref": "agent-package-v1.schema.json#/properties/created_at" },
+    "published_at": { "$ref": "agent-package-v1.schema.json#/properties/published_at" }
+  },
+  "allOf": [
+    {
+      "if": { "required": ["evidence_policy"] },
+      "then": {
+        "properties": {
+          "evaluation_policy": {
+            "properties": {
+              "minimum_scores": {
+                "required": [
+                  "adjudication_consistency",
+                  "source_independence",
+                  "conflict_detection",
+                  "report_citation_completeness",
+                  "safe_insufficiency",
+                  "proofroom_projection_completeness"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "not": { "required": ["collection_releases"] },
+  "additionalProperties": true
+}

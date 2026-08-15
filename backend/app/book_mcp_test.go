@@ -170,6 +170,39 @@ func TestBookKnowledgeMCPReadsOnlyPinnedPackageRelease(t *testing.T) {
 	}
 }
 
+func TestBookKnowledgeMCPCollectionRuntimeSearchesAndResolvesPinnedMember(t *testing.T) {
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	results, err := searchAgentPackageCollectionEvidence(store, pkg, "shared insight", 2)
+	if err != nil || len(results) != 2 {
+		t.Fatalf("results=%#v err=%v", results, err)
+	}
+	citation, err := resolveAgentPackageReleaseCitation(store, pkg, release.ReleaseID, results[0].ClaimID, results[0].CitationIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if citation.BookID != results[0].MemberBookID || citation.ChunkID != results[0].ChunkID {
+		t.Fatalf("citation=%#v result=%#v", citation, results[0])
+	}
+}
+
+func TestBookKnowledgeMCPCollectionRuntimeRoutesScopedTools(t *testing.T) {
+	store, pkg, release := agentCollectionRuntimeFixture(t)
+	server := NewBookKnowledgeMCPServer(store)
+	search, err := server.callCollectionTool("agent.search", map[string]any{
+		"package_id": pkg.PackageID, "package_version": pkg.Version, "release_id": release.ReleaseID,
+		"query": "shared insight", "limit": float64(2),
+	}, pkg, release.ReleaseID)
+	if err != nil || !strings.Contains(string(search), `"member_book_id":"book-a"`) || !strings.Contains(string(search), `"member_book_id":"book-b"`) {
+		t.Fatalf("search=%s err=%v", search, err)
+	}
+	citation, err := server.callCollectionTool("agent.resolve_citation", map[string]any{
+		"citation_id": "book-a-citation",
+	}, pkg, release.ReleaseID)
+	if err != nil || !strings.Contains(string(citation), `"book_id":"book-a"`) {
+		t.Fatalf("citation=%s err=%v", citation, err)
+	}
+}
+
 func TestBookKnowledgeMCPSearchDoesNotExposeClaimCitationsOutsidePackageAllowlist(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	release := agentPackageTestRelease()

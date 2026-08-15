@@ -260,6 +260,9 @@ func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
 	if got := requestSupportItems["maxLength"]; got != float64(agentCompilationMaxReleaseIDRunes) {
 		t.Fatalf("supporting release maxLength = %#v", got)
 	}
+	if got := requestProperties["research_enabled"].(map[string]any)["type"]; got != "boolean" {
+		t.Fatalf("research_enabled type = %#v", got)
+	}
 
 	responseRaw, err := os.ReadFile(filepath.Join(
 		"..",
@@ -291,7 +294,7 @@ func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
 	}
 	candidate := defs["candidate"].(map[string]any)
 	candidateProperties := candidate["properties"].(map[string]any)
-	if got := len(candidateProperties["package"].(map[string]any)["oneOf"].([]any)); got != 2 {
+	if got := len(candidateProperties["package"].(map[string]any)["oneOf"].([]any)); got != 3 {
 		t.Fatalf("candidate package schema refs = %d", got)
 	}
 	if got := len(candidate["allOf"].([]any)); got != 4 {
@@ -301,6 +304,73 @@ func TestAgentCompilationSchemasCarryHardLimits(t *testing.T) {
 	if got := nextActionItems["maxLength"]; got != float64(agentCompilationMaxNextActionRunes) {
 		t.Fatalf("next action maxLength = %#v", got)
 	}
+}
+
+func TestAgentCompilationSchemasAcceptResearchV4(t *testing.T) {
+	request := AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion,
+		Mode:          AgentCompilationModeStudy, PrimaryReleaseID: "release-research",
+		Version: "1.0.0", ResearchEnabled: true,
+	}
+	validateSchemaInstance(t, "agent-compilation-request-v1.schema.json", request, true)
+
+	v4, err := FinalizeAgentPackage(validAgentPackageV4())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilation := AgentCompilation{
+		SchemaVersion: AgentCompilationSchemaVersion, CompilerVersion: AgentCompilerVersion,
+		CompilationID: "compilation-research-schema", Mode: AgentCompilationModeStudy,
+		AssemblyID: "assembly-research-schema", ReleaseIDs: []string{"release-research"},
+		Status: AgentCompilationStatusReady,
+		Candidates: []AgentCompilationCandidate{{
+			Kind: AgentCompilationCandidateStudy, Status: AgentCompilationCandidateReady,
+			Package: &v4, NextActions: []string{AgentCompilationNextActionEvaluate},
+		}},
+	}
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, true)
+	compilation.Mode = AgentCompilationModeEvidence
+	compilation.Candidates[0].Kind = AgentCompilationCandidateEvidence
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, true)
+
+	withoutPolicy := v4
+	withoutPolicy.ResearchPolicy = nil
+	compilation.Candidates[0].Package = &withoutPolicy
+	validateSchemaInstance(t, "agent-compilation-v1.schema.json", compilation, false)
+}
+
+func TestAgentPackageV3AndV4PublicSchemasPreserveVersionBoundaries(t *testing.T) {
+	v3 := validAgentPackage()
+	v3.SchemaVersion = AgentPackageSchemaVersionV3
+	v3.Releases = nil
+	v3.CollectionReleases = []AgentPackageCollectionRef{{
+		ReleaseID:   "collection-release-fixture",
+		ContentHash: "sha256:" + strings.Repeat("a", 64),
+	}}
+	v3, err := FinalizeAgentPackage(v3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateSchemaInstance(t, "agent-package-v3.schema.json", v3, true)
+	v3WithTwoCollections := v3
+	v3WithTwoCollections.CollectionReleases = append(
+		append([]AgentPackageCollectionRef(nil), v3.CollectionReleases...),
+		AgentPackageCollectionRef{ReleaseID: "collection-release-second", ContentHash: "sha256:" + strings.Repeat("b", 64)},
+	)
+	validateSchemaInstance(t, "agent-package-v3.schema.json", v3WithTwoCollections, false)
+
+	v4, err := FinalizeAgentPackage(validAgentPackageV4())
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateSchemaInstance(t, "agent-package-v4.schema.json", v4, true)
+
+	v3WithResearch := v3
+	v3WithResearch.ResearchPolicy = v4.ResearchPolicy
+	validateSchemaInstance(t, "agent-package-v3.schema.json", v3WithResearch, false)
+	v4WithCollection := v4
+	v4WithCollection.CollectionReleases = v3.CollectionReleases
+	validateSchemaInstance(t, "agent-package-v4.schema.json", v4WithCollection, false)
 }
 
 func TestAgentCompilationSchemaRequiresPackageVersionForCandidateKind(t *testing.T) {

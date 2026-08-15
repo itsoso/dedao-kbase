@@ -262,6 +262,53 @@ func (s *KnowledgeCatalogStore) ListContentVersions(sourceID string) ([]Knowledg
 	return versions, rows.Err()
 }
 
+func (s *KnowledgeCatalogStore) ListCurrentContentVersionsBySourceAccount(sourceType, sourceAccountKey string, limit int) ([]KnowledgeCatalogRecord, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("knowledge catalog store is required")
+	}
+	sourceType = strings.TrimSpace(sourceType)
+	sourceAccountKey = strings.TrimSpace(sourceAccountKey)
+	if sourceType == "" || sourceAccountKey == "" {
+		return nil, fmt.Errorf("source_type and source_account_key are required")
+	}
+	if limit < 1 || limit > 1000 {
+		return nil, fmt.Errorf("limit must be between 1 and 1000")
+	}
+	rows, err := s.db.Query(`SELECT
+		s.source_id, s.source_type, s.source_account_key, s.source_account, s.source_item_key,
+		s.canonical_uri, s.license_scope, s.created_at, s.updated_at,
+		v.content_version_id, v.source_id, v.content_hash, v.target_book_id, v.artifact_ref,
+		v.predecessor_version_id, v.is_current, v.created_at, v.updated_at
+		FROM knowledge_sources s
+		JOIN knowledge_content_versions v ON v.source_id = s.source_id AND v.is_current = 1
+		WHERE s.source_type = ? AND s.source_account_key = ?
+		ORDER BY s.source_item_key, s.source_id
+		LIMIT ?`, sourceType, sourceAccountKey, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records := make([]KnowledgeCatalogRecord, 0)
+	for rows.Next() {
+		var record KnowledgeCatalogRecord
+		var current int
+		if err := rows.Scan(
+			&record.Source.SourceID, &record.Source.SourceType, &record.Source.SourceAccountKey,
+			&record.Source.SourceAccount, &record.Source.SourceItemKey, &record.Source.CanonicalURI,
+			&record.Source.LicenseScope, &record.Source.CreatedAt, &record.Source.UpdatedAt,
+			&record.Version.ContentVersionID, &record.Version.SourceID, &record.Version.ContentHash,
+			&record.Version.TargetBookID, &record.Version.ArtifactRef, &record.Version.PredecessorVersionID,
+			&current, &record.Version.CreatedAt, &record.Version.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		record.Version.IsCurrent = current == 1
+		record.DuplicateGroupID = stableKnowledgeID("duplicate", record.Version.ContentHash)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func RebuildKnowledgeCatalog(root string, bookStore *BookKnowledgeStore, now func() time.Time) (*KnowledgeCatalogStore, error) {
 	if bookStore == nil {
 		bookStore = NewBookKnowledgeStore(root)

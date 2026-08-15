@@ -33,6 +33,7 @@ func ValidateTrustedAgentEvaluationSuite(pkg AgentPackage, suite AgentEvaluation
 	switch pkg.SchemaVersion {
 	case AgentPackageSchemaVersionV2:
 	case AgentPackageSchemaVersionV3:
+	case AgentPackageSchemaVersionV4:
 		if err := validateTrustedResearchEvaluationSuite(pkg, suite); err != nil {
 			return err
 		}
@@ -40,7 +41,7 @@ func ValidateTrustedAgentEvaluationSuite(pkg AgentPackage, suite AgentEvaluation
 			return nil
 		}
 	default:
-		return fmt.Errorf("trusted evidence audit suites require an agent-package.v2 package")
+		return fmt.Errorf("trusted evaluation suites require an agent-package.v2, agent-package.v3, or agent-package.v4 package")
 	}
 	if strings.TrimSpace(pkg.ContentHash) == "" {
 		return fmt.Errorf("trusted evaluation suite requires package content_hash")
@@ -53,7 +54,7 @@ func ValidateTrustedAgentEvaluationSuite(pkg AgentPackage, suite AgentEvaluation
 		return fmt.Errorf("trusted evaluation suite cases are required")
 	}
 	seenCases := make(map[string]bool, len(suite.Cases))
-	seenMetrics := make(map[string]bool, len(trustedEvidenceAuditEvaluationMetrics))
+	seenMetrics := make(map[string]bool)
 	hasPositiveGold := false
 	hasConflictGold := false
 	for index, evalCase := range suite.Cases {
@@ -62,13 +63,13 @@ func ValidateTrustedAgentEvaluationSuite(pkg AgentPackage, suite AgentEvaluation
 			return fmt.Errorf("trusted evaluation suite cases[%d] has an empty or duplicate case_id", index)
 		}
 		seenCases[caseID] = true
+		seenMetrics[evalCase.Metric] = true
 		if !isEvidenceAuditEvaluationMetric(evalCase.Metric) {
 			continue
 		}
 		if strings.TrimSpace(evalCase.AuditID) != "" {
 			return fmt.Errorf("trusted evaluation suite case %q must not pin a runtime audit_id", caseID)
 		}
-		seenMetrics[evalCase.Metric] = true
 		switch evalCase.Metric {
 		case "adjudication_consistency":
 			for _, claim := range evalCase.ExpectedClaims {
@@ -88,16 +89,25 @@ func ValidateTrustedAgentEvaluationSuite(pkg AgentPackage, suite AgentEvaluation
 			}
 		}
 	}
-	for _, metric := range trustedEvidenceAuditEvaluationMetrics {
-		if !seenMetrics[metric] {
-			return fmt.Errorf("trusted evaluation suite is missing evidence metric %q", metric)
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 ||
+		(pkg.SchemaVersion == AgentPackageSchemaVersionV4 && pkg.EvidencePolicy != nil) {
+		for _, metric := range trustedEvidenceAuditEvaluationMetrics {
+			if !seenMetrics[metric] {
+				return fmt.Errorf("trusted evaluation suite is missing evidence metric %q", metric)
+			}
 		}
-	}
-	if !hasPositiveGold {
-		return fmt.Errorf("trusted evaluation suite requires a non-insufficient adjudication gold case")
-	}
-	if !hasConflictGold {
-		return fmt.Errorf("trusted evaluation suite requires a positive conflict gold case")
+		if !hasPositiveGold {
+			return fmt.Errorf("trusted evaluation suite requires a non-insufficient adjudication gold case")
+		}
+		if !hasConflictGold {
+			return fmt.Errorf("trusted evaluation suite requires a positive conflict gold case")
+		}
+	} else {
+		for _, metric := range []string{"retrieval", "retrieval_precision", "citations", "faithfulness", "abstention", "tool_choice", "tool_arguments", "task_completion", "latency", "cost"} {
+			if !seenMetrics[metric] {
+				return fmt.Errorf("trusted collection evaluation suite is missing behavioral metric %q", metric)
+			}
+		}
 	}
 	return nil
 }
@@ -172,7 +182,7 @@ func (s *BookKnowledgeStore) ResolveTrustedAgentEvaluationSuite(
 		submittedByID[caseID] = evalCase
 	}
 	resolved := *trusted
-	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV4 {
 		resolved, err = resolveTrustedResearchEvaluationSuite(*trusted, submitted)
 		if err != nil {
 			return AgentEvaluationSuite{}, "", err
@@ -204,14 +214,20 @@ func (s *BookKnowledgeStore) ResolveTrustedAgentEvaluationSuite(
 			return AgentEvaluationSuite{}, "", fmt.Errorf("submitted suite case %q modifies trusted evaluation suite behavior", trustedCase.CaseID)
 		}
 	}
-	if err := validateResolvedTrustedEvidenceCoverage(resolved); err != nil {
-		return AgentEvaluationSuite{}, "", err
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV2 || pkg.SchemaVersion == AgentPackageSchemaVersionV4 {
+		if err := validateResolvedTrustedEvidenceCoverage(resolved); err != nil {
+			return AgentEvaluationSuite{}, "", err
+		}
 	}
 	payload, err := encodeJSONFile(*trusted)
 	if err != nil {
 		return AgentEvaluationSuite{}, "", err
 	}
 	return resolved, sha256Fingerprint(payload), nil
+}
+
+func agentPackageUsesTrustedEvaluation(schemaVersion string) bool {
+	return schemaVersion == AgentPackageSchemaVersionV2 || schemaVersion == AgentPackageSchemaVersionV3 || schemaVersion == AgentPackageSchemaVersionV4
 }
 
 func validateResolvedTrustedEvidenceCoverage(suite AgentEvaluationSuite) error {

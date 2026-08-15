@@ -122,6 +122,12 @@ func EvaluateAgentToolCall(pkg AgentPackage, mcpServer, toolName string, argumen
 			break
 		}
 	}
+	for _, release := range pkg.CollectionReleases {
+		if release.ReleaseID == audit.ReleaseID {
+			pinned = true
+			break
+		}
+	}
 	if !pinned {
 		return block(fmt.Sprintf("release scope %q is not pinned by package", audit.ReleaseID))
 	}

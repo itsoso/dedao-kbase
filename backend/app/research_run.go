@@ -20,6 +20,7 @@ const (
 	ResearchRouteExplicitQuick    = "explicit_quick"
 	ResearchRouteExplicitDeep     = "explicit_deep"
 	ResearchRoutePrivateHistory   = "private_history"
+	ResearchRoutePriorResearch    = "prior_research"
 	ResearchRouteCrossSource      = "cross_source"
 	ResearchRouteIdentity         = "identity_resolution"
 	ResearchRouteTimeline         = "timeline_reconstruction"
@@ -146,6 +147,9 @@ func ValidateResearchRunRequest(request ResearchRunRequest) error {
 	if len([]rune(strings.TrimSpace(request.PackageVersion))) > researchPackageVersionMaxRunes {
 		return fmt.Errorf("package_version exceeds %d characters", researchPackageVersionMaxRunes)
 	}
+	if strings.TrimSpace(request.PackageID) == "" || strings.TrimSpace(request.PackageVersion) == "" {
+		return fmt.Errorf("package_id and package_version are required")
+	}
 	if len(request.RequestedSources) > researchRequestedSourcesMax {
 		return fmt.Errorf("requested_sources exceeds %d items", researchRequestedSourcesMax)
 	}
@@ -209,8 +213,11 @@ func researchDeepRouteReasons(request ResearchRunRequest) []string {
 		}
 	}
 	for _, rawSource := range request.RequestedSources {
-		if strings.TrimSpace(rawSource) == ResearchSourceChatlog {
+		switch strings.TrimSpace(rawSource) {
+		case ResearchSourceChatlog:
 			appendReason(ResearchRoutePrivateHistory)
+		case ResearchSourcePriorRuns:
+			appendReason(ResearchRoutePriorResearch)
 		}
 	}
 	if len(request.RequestedSources) > 1 {

@@ -10,6 +10,8 @@ func TestRouteResearchModeChoosesDeepForPrivateHistory(t *testing.T) {
 	request := ResearchRunRequest{
 		Mode:             ResearchModeAuto,
 		Question:         "Compare the current case with an earlier case.",
+		PackageID:        "research-agent",
+		PackageVersion:   "1.0.0",
 		RequestedSources: []string{ResearchSourceKnowledge, ResearchSourceChatlog},
 	}
 
@@ -22,10 +24,37 @@ func TestRouteResearchModeChoosesDeepForPrivateHistory(t *testing.T) {
 	}
 }
 
+func TestRouteResearchModeChoosesDeepForPriorRuns(t *testing.T) {
+	request := ResearchRunRequest{
+		Question:         "总结以前的研究结论",
+		PackageID:        "research-agent",
+		PackageVersion:   "1.0.0",
+		RequestedSources: []string{ResearchSourcePriorRuns},
+	}
+	mode, reasons, err := RouteResearchMode(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != ResearchModeDeep || !containsResearchReason(reasons, ResearchRoutePriorResearch) {
+		t.Fatalf("expected prior runs to route deep, got mode=%q reasons=%v", mode, reasons)
+	}
+	if err := ValidateResearchModeScope(ResearchRunRequest{
+		Mode:             ResearchModeQuick,
+		Question:         request.Question,
+		PackageID:        request.PackageID,
+		PackageVersion:   request.PackageVersion,
+		RequestedSources: request.RequestedSources,
+	}, ResearchModeQuick); !errors.Is(err, ErrResearchDeepRequired) {
+		t.Fatalf("expected explicit quick prior-runs request to require deep mode, got %v", err)
+	}
+}
+
 func TestRouteResearchModeKeepsExplicitQuickButRequiresDeepForChatlog(t *testing.T) {
 	request := ResearchRunRequest{
 		Mode:             ResearchModeQuick,
 		Question:         "Summarize the earlier discussion.",
+		PackageID:        "research-agent",
+		PackageVersion:   "1.0.0",
 		RequestedSources: []string{ResearchSourceChatlog},
 	}
 
@@ -45,6 +74,8 @@ func TestRouteResearchModeChoosesQuickForBoundedKnowledgeQuestion(t *testing.T) 
 	mode, reasons, err := RouteResearchMode(ResearchRunRequest{
 		Mode:             ResearchModeAuto,
 		Question:         "What does the selected collection say about sleep?",
+		PackageID:        "research-agent",
+		PackageVersion:   "1.0.0",
 		RequestedSources: []string{ResearchSourceKnowledge},
 	})
 	if err != nil {
@@ -62,9 +93,17 @@ func TestValidateResearchRunRequestRejectsUnknownSourceAndOversizedQuestion(t *t
 		want    string
 	}{
 		{
-			name: "unknown source",
+			name: "missing package scope",
 			request: ResearchRunRequest{
 				Mode: ResearchModeAuto, Question: "question",
+				RequestedSources: []string{ResearchSourceKnowledge},
+			},
+			want: "package_id and package_version",
+		},
+		{
+			name: "unknown source",
+			request: ResearchRunRequest{
+				Mode: ResearchModeAuto, Question: "question", PackageID: "research-agent", PackageVersion: "1.0.0",
 				RequestedSources: []string{"private_database"},
 			},
 			want: "unsupported requested source",
@@ -72,7 +111,7 @@ func TestValidateResearchRunRequestRejectsUnknownSourceAndOversizedQuestion(t *t
 		{
 			name: "oversized question",
 			request: ResearchRunRequest{
-				Mode: ResearchModeAuto, Question: strings.Repeat("问", researchQuestionMaxRunes+1),
+				Mode: ResearchModeAuto, Question: strings.Repeat("问", researchQuestionMaxRunes+1), PackageID: "research-agent", PackageVersion: "1.0.0",
 				RequestedSources: []string{ResearchSourceKnowledge},
 			},
 			want: "question exceeds",

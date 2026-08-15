@@ -124,6 +124,9 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 		return nil, fmt.Errorf("agent tool policy %s: %s (argument_hash=%s)", decision.Decision, decision.Reason, decision.Audit.ArgumentHash)
 	}
 	releaseID := stringArgument(input, "release_id")
+	if pkg.SchemaVersion == AgentPackageSchemaVersionV3 {
+		return s.callCollectionTool(name, input, pkg, releaseID)
+	}
 	release, err := s.store.LoadKnowledgeRelease(releaseID)
 	if err != nil {
 		return nil, fmt.Errorf("load pinned release: %w", err)
@@ -198,6 +201,95 @@ func (s *BookKnowledgeMCPServer) Call(name string, arguments json.RawMessage) (j
 			}
 		}
 		return nil, fmt.Errorf("claim not found in pinned release: %s", claimID)
+	default:
+		return nil, fmt.Errorf("tool is outside the read-only Agent tool catalog: %s", name)
+	}
+}
+
+func (s *BookKnowledgeMCPServer) callCollectionTool(name string, input map[string]any, pkg AgentPackage, releaseID string) (json.RawMessage, error) {
+	release, err := loadPinnedAgentCollectionRelease(s.store, pkg)
+	if err != nil {
+		return nil, err
+	}
+	if release.ReleaseID != releaseID {
+		return nil, fmt.Errorf("collection release is outside the pinned package scope: %s", releaseID)
+	}
+	switch name {
+	case "agent.package_metadata":
+		evaluation, err := s.store.LoadAgentPackageEvaluation(pkg.ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("load package evaluation: %w", err)
+		}
+		return marshalMCPResult(map[string]any{
+			"package_id": pkg.PackageID, "package_version": pkg.Version, "package_hash": pkg.ContentHash,
+			"lifecycle_state": pkg.LifecycleState, "release_id": release.ReleaseID, "release_hash": release.ContentHash,
+			"collection_id": release.CollectionID, "member_count": len(release.Members),
+			"retrieval_policy": pkg.RetrievalPolicy, "safety_policy": pkg.SafetyPolicy,
+			"evaluation_status": map[string]any{"passed": evaluation.Passed, "suite_version": evaluation.SuiteVersion, "metrics": evaluation.Metrics},
+			"ui_manifest":       pkg.UIManifest,
+		})
+	case "agent.search":
+		limit, err := agentToolLimit(input["limit"], pkg.RetrievalPolicy.MaxContextChunks)
+		if err != nil {
+			return nil, err
+		}
+		results, err := searchAgentPackageCollectionEvidence(s.store, pkg, stringArgument(input, "query"), limit)
+		if err != nil {
+			return nil, err
+		}
+		return marshalMCPResult(results)
+	case "agent.resolve_citation":
+		citationID := stringArgument(input, "citation_id")
+		for _, member := range release.Members {
+			if !stringBoolSet(member.CitationIDs...)[citationID] {
+				continue
+			}
+			article, err := loadPinnedAgentCollectionMember(s.store, *release, member)
+			if err != nil {
+				return nil, err
+			}
+			for _, citation := range article.Citations {
+				if citation.CitationID == citationID {
+					return marshalMCPResult(AgentScopedCitation{
+						CitationID: citation.CitationID, BookID: citation.BookID,
+						ChapterID: citation.ChapterID, ChunkID: citation.ChunkID,
+						Anchor: citation.Anchor, Note: citation.Note,
+						SourceType: citation.SourceType, PublishedAt: citation.PublishedAt,
+					})
+				}
+			}
+		}
+		return nil, fmt.Errorf("citation is outside the pinned collection release allowlist: %s", citationID)
+	case "agent.get_claim":
+		chunkID := stringArgument(input, "claim_id")
+		for _, member := range release.Members {
+			article, err := loadPinnedAgentCollectionMember(s.store, *release, member)
+			if err != nil {
+				return nil, err
+			}
+			allowed := stringBoolSet(member.CitationIDs...)
+			for _, chunk := range article.Chunks {
+				if chunk.ChunkID != chunkID {
+					continue
+				}
+				citationIDs := make([]string, 0)
+				for _, citation := range article.Citations {
+					if citation.ChunkID == chunkID && allowed[citation.CitationID] {
+						citationIDs = append(citationIDs, citation.CitationID)
+					}
+				}
+				if pkg.RetrievalPolicy.RequireCitations && len(citationIDs) == 0 {
+					return nil, fmt.Errorf("chunk citations are outside the pinned collection release allowlist: %s", chunkID)
+				}
+				return marshalMCPResult(AgentPackageEvidence{
+					ReleaseID: release.ReleaseID, CollectionReleaseID: release.ReleaseID,
+					MemberBookID: member.BookID, MemberContentHash: member.ContentHash,
+					ChunkID: chunk.ChunkID, ClaimID: chunk.ChunkID, Statement: chunk.Text,
+					CitationIDs: sortedUniqueStrings(citationIDs), Score: 1,
+				})
+			}
+		}
+		return nil, fmt.Errorf("chunk not found in pinned collection release: %s", chunkID)
 	default:
 		return nil, fmt.Errorf("tool is outside the read-only Agent tool catalog: %s", name)
 	}

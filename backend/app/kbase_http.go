@@ -155,6 +155,7 @@ const defaultResearchWorkerHTTPMaxBodyBytes int64 = 128 << 10
 const defaultResearchRunHTTPMaxBodyBytes int64 = 64 << 10
 const defaultEvidenceAuditMaxBodyBytes int64 = 64 << 10
 const defaultAgentCompilationMaxBodyBytes int64 = 64 << 10
+const defaultKnowledgeCollectionMaxBodyBytes int64 = 16 << 10
 const defaultDedaoEbookVerificationTimeout = 15 * time.Second
 
 func NewKBaseHTTPHandler(cfg KBaseHTTPConfig) http.Handler {
@@ -426,7 +427,8 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleEvolutionReadAPI(w, r)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/api/controlled-agent/") {
+	if strings.HasPrefix(r.URL.Path, "/api/controlled-agent/") ||
+		strings.HasPrefix(r.URL.Path, "/api/controlled-collection-agent/") {
 		if h.agentPublisherToken == "" {
 			writeHTTPError(w, http.StatusServiceUnavailable, "controlled Agent publisher is not configured")
 			return
@@ -435,7 +437,11 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeHTTPError(w, http.StatusUnauthorized, "controlled Agent requires an authorized browser session")
 			return
 		}
-		h.handleControlledAgentWorkflow(w, r)
+		if strings.HasPrefix(r.URL.Path, "/api/controlled-collection-agent/") {
+			h.handleControlledCollectionAgentWorkflow(w, r)
+		} else {
+			h.handleControlledAgentWorkflow(w, r)
+		}
 		return
 	}
 	if isSourceSyncAdminPath(r.URL.Path) {
@@ -552,6 +558,14 @@ func (h *kbaseHTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/api/knowledge/pipeline/run" {
 		h.handleKnowledgePipelineRun(w, r)
+		return
+	}
+	if r.URL.Path == "/api/knowledge/collections" || strings.HasPrefix(r.URL.Path, "/api/knowledge/collections/") {
+		h.handleKnowledgeCollections(w, r)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/knowledge/collection-releases/") {
+		h.handleKnowledgeCollectionReleases(w, r)
 		return
 	}
 	if packageID, ok := agentPackageAuditCollectionPathID(r.URL.Path); ok {
@@ -1782,6 +1796,169 @@ func (h *kbaseHTTPHandler) handleKnowledgeReleases(w http.ResponseWriter, r *htt
 	writeHTTPJSON(w, http.StatusOK, map[string]any{"releases": releases, "next_cursor": nextCursor})
 }
 
+func (h *kbaseHTTPHandler) handleKnowledgeCollections(w http.ResponseWriter, r *http.Request) {
+	const basePath = "/api/knowledge/collections"
+	if r.URL.Path == basePath {
+		switch r.Method {
+		case http.MethodGet:
+			collections, err := h.store.ListKnowledgeCollections()
+			if err != nil {
+				writeHTTPError(w, http.StatusInternalServerError, "knowledge collections unavailable")
+				return
+			}
+			if collections == nil {
+				collections = []KnowledgeCollectionDefinition{}
+			}
+			writeHTTPJSON(w, http.StatusOK, map[string]any{"collections": collections})
+		case http.MethodPost:
+			defer r.Body.Close()
+			var definition KnowledgeCollectionDefinition
+			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, defaultKnowledgeCollectionMaxBodyBytes))
+			decoder.DisallowUnknownFields()
+			if err := decoder.Decode(&definition); err != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					writeHTTPError(w, http.StatusRequestEntityTooLarge, "request body is too large")
+					return
+				}
+				writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+				return
+			}
+			if err := decoder.Decode(&struct{}{}); err != io.EOF {
+				writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+				return
+			}
+			if strings.TrimSpace(definition.SchemaVersion) == "" {
+				definition.SchemaVersion = KnowledgeCollectionDefinitionSchemaVersion
+			}
+			saved, err := h.store.SaveKnowledgeCollection(definition)
+			if err != nil {
+				status := http.StatusBadRequest
+				if errors.Is(err, ErrKnowledgeCollectionSourceConflict) {
+					status = http.StatusConflict
+				}
+				writeHTTPError(w, status, err.Error())
+				return
+			}
+			writeHTTPJSON(w, http.StatusCreated, saved)
+		default:
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+		return
+	}
+
+	rawPath := strings.TrimPrefix(r.URL.EscapedPath(), basePath+"/")
+	parts := strings.Split(rawPath, "/")
+	if len(parts) < 1 || len(parts) > 2 || parts[0] == "" {
+		writeHTTPError(w, http.StatusNotFound, "knowledge collection not found")
+		return
+	}
+	collectionID, err := url.PathUnescape(parts[0])
+	if err != nil || strings.Contains(collectionID, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "invalid collection_id")
+		return
+	}
+	action := ""
+	if len(parts) == 2 {
+		action = parts[1]
+	}
+	switch action {
+	case "":
+		if r.Method != http.MethodGet {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		definition, err := h.store.LoadKnowledgeCollection(collectionID)
+		if err != nil {
+			h.writeKnowledgeCollectionError(w, err, false)
+			return
+		}
+		payload := map[string]any{"collection": definition}
+		if candidate, err := h.store.LoadKnowledgeCollectionCandidate(collectionID); err == nil {
+			payload["candidate"] = candidate
+		}
+		if quality, err := h.store.LoadKnowledgeCollectionQuality(collectionID); err == nil {
+			payload["quality"] = quality
+		}
+		releases, err := h.store.ListKnowledgeCollectionReleases(collectionID)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, "knowledge collection releases unavailable")
+			return
+		}
+		payload["releases"] = releases
+		writeHTTPJSON(w, http.StatusOK, payload)
+	case "build":
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		candidate, err := h.store.BuildKnowledgeCollectionCandidate(collectionID)
+		if err != nil {
+			h.writeKnowledgeCollectionError(w, err, false)
+			return
+		}
+		quality, err := h.store.LoadKnowledgeCollectionQuality(collectionID)
+		if err != nil {
+			writeHTTPError(w, http.StatusInternalServerError, "knowledge collection quality unavailable")
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"candidate": candidate, "quality": quality})
+	case "publish":
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		release, err := h.store.PublishKnowledgeCollection(collectionID)
+		if err != nil {
+			h.writeKnowledgeCollectionError(w, err, true)
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, release)
+	default:
+		writeHTTPError(w, http.StatusNotFound, "knowledge collection route not found")
+	}
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeCollectionReleases(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	const prefix = "/api/knowledge/collection-releases/"
+	rawID := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
+	if rawID == "" || strings.Contains(rawID, "/") {
+		writeHTTPError(w, http.StatusNotFound, "knowledge collection release not found")
+		return
+	}
+	releaseID, err := url.PathUnescape(rawID)
+	if err != nil || strings.Contains(releaseID, "/") {
+		writeHTTPError(w, http.StatusBadRequest, "invalid release_id")
+		return
+	}
+	release, err := h.store.LoadKnowledgeCollectionRelease(releaseID)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeHTTPError(w, http.StatusNotFound, "knowledge collection release not found")
+			return
+		}
+		writeHTTPError(w, http.StatusInternalServerError, "knowledge collection release unavailable")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, release)
+}
+
+func (h *kbaseHTTPHandler) writeKnowledgeCollectionError(w http.ResponseWriter, err error, publish bool) {
+	if errors.Is(err, ErrKnowledgeCollectionNotFound) || os.IsNotExist(err) {
+		writeHTTPError(w, http.StatusNotFound, "knowledge collection not found")
+		return
+	}
+	if publish || errors.Is(err, ErrKnowledgeCollectionSourceConflict) || strings.Contains(err.Error(), "disabled") {
+		writeHTTPError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeHTTPError(w, http.StatusBadRequest, err.Error())
+}
+
 type AgentPackagePublishRequest struct {
 	IdempotencyKey string       `json:"idempotency_key"`
 	Package        AgentPackage `json:"package"`
@@ -1796,6 +1973,89 @@ type ControlledAgentWorkflowRequest struct {
 	Draft          ControlledAgentDraftRequest `json:"draft"`
 	IdempotencyKey string                      `json:"idempotency_key,omitempty"`
 	Confirm        bool                        `json:"confirm,omitempty"`
+}
+
+type ControlledCollectionAgentWorkflowRequest struct {
+	Draft          ControlledCollectionAgentDraftRequest `json:"draft"`
+	IdempotencyKey string                                `json:"idempotency_key,omitempty"`
+	Confirm        bool                                  `json:"confirm,omitempty"`
+}
+
+func (h *kbaseHTTPHandler) handleControlledCollectionAgentWorkflow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	defer r.Body.Close()
+	var request ControlledCollectionAgentWorkflowRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	draft, err := BuildControlledCollectionAgentDraftBundle(h.store, request.Draft, h.agentTools)
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.store.SaveTrustedAgentEvaluationSuite(draft.Package, draft.Suite); err != nil {
+		status := http.StatusBadRequest
+		if strings.Contains(err.Error(), "immutable") {
+			status = http.StatusConflict
+		}
+		writeHTTPError(w, status, err.Error())
+		return
+	}
+	switch r.URL.Path {
+	case "/api/controlled-collection-agent/draft":
+		writeHTTPJSON(w, http.StatusOK, draft)
+	case "/api/controlled-collection-agent/evaluate":
+		report, created, err := h.evaluateControlledAgentDraft(*draft)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "draft": draft, "evaluation": report})
+	case "/api/controlled-collection-agent/publish":
+		if !request.Confirm {
+			writeHTTPError(w, http.StatusBadRequest, "explicit confirmation is required")
+			return
+		}
+		if strings.TrimSpace(request.IdempotencyKey) == "" {
+			writeHTTPError(w, http.StatusBadRequest, "idempotency_key is required")
+			return
+		}
+		report, _, err := h.evaluateControlledAgentDraft(*draft)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !report.Passed {
+			writeHTTPError(w, http.StatusConflict, "controlled collection Agent evaluation did not pass")
+			return
+		}
+		published, created, err := PublishAgentPackage(h.store, draft.Package, request.IdempotencyKey, h.agentTools, time.Now())
+		if err != nil {
+			writeHTTPError(w, http.StatusConflict, err.Error())
+			return
+		}
+		status := http.StatusOK
+		if created {
+			status = http.StatusCreated
+		}
+		writeHTTPJSON(w, status, map[string]any{"created": created, "evaluation": report, "package": published})
+	default:
+		writeHTTPError(w, http.StatusNotFound, "controlled collection Agent operation not found")
+	}
 }
 
 func (h *kbaseHTTPHandler) handleControlledAgentWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -1874,7 +2134,13 @@ func (h *kbaseHTTPHandler) evaluateControlledAgentDraft(draft ControlledAgentDra
 	} else if !os.IsNotExist(err) {
 		return nil, false, err
 	}
-	report, err := EvaluateAgentPackageDeterministically(h.store, draft.Package, draft.Suite, time.Now())
+	report := AgentEvaluationReport{}
+	var err error
+	if agentPackageUsesTrustedEvaluation(draft.Package.SchemaVersion) {
+		_, report, err = EvaluateAgentPackageAgainstTrustedSuite(h.store, draft.Package, draft.Suite, time.Now())
+	} else {
+		report, err = EvaluateAgentPackageDeterministically(h.store, draft.Package, draft.Suite, time.Now())
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -2563,13 +2829,47 @@ func sanitizeEvidenceAuditHTTPLogCause(value string) string {
 
 func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Request) {
 	const (
-		collectionPath = "/api/agent-packages"
-		compilePath    = "/api/agent-packages/compile"
-		evaluatePath   = "/api/agent-packages/evaluate"
-		publishPath    = "/api/agent-packages/publish"
-		trustSuitePath = "/api/agent-packages/evaluation-suites/trust"
-		detailPrefix   = "/api/agent-packages/"
+		collectionPath      = "/api/agent-packages"
+		compilePath         = "/api/agent-packages/compile"
+		collectionDraftPath = "/api/agent-packages/collection-draft"
+		evaluatePath        = "/api/agent-packages/evaluate"
+		publishPath         = "/api/agent-packages/publish"
+		trustSuitePath      = "/api/agent-packages/evaluation-suites/trust"
+		detailPrefix        = "/api/agent-packages/"
 	)
+	if r.URL.Path == collectionDraftPath {
+		if r.Method != http.MethodPost {
+			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		defer r.Body.Close()
+		var input ControlledCollectionAgentDraftRequest
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, defaultAgentCompilationMaxBodyBytes))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&input); err != nil {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeHTTPError(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		bundle, err := BuildControlledCollectionAgentDraftBundle(h.store, input, h.agentTools)
+		if err != nil {
+			writeHTTPError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := h.store.SaveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite); err != nil {
+			status := http.StatusBadRequest
+			if strings.Contains(err.Error(), "immutable") {
+				status = http.StatusConflict
+			}
+			writeHTTPError(w, status, err.Error())
+			return
+		}
+		writeHTTPJSON(w, http.StatusCreated, bundle)
+		return
+	}
 	if r.URL.Path == compilePath {
 		if r.Method != http.MethodPost {
 			writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2667,7 +2967,7 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 		}
 		evaluationSuite := input.Suite
 		trustedSuiteHash := ""
-		if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 || input.Package.SchemaVersion == AgentPackageSchemaVersionV3 {
+		if agentPackageUsesTrustedEvaluation(input.Package.SchemaVersion) {
 			var resolveErr error
 			evaluationSuite, trustedSuiteHash, resolveErr = h.store.ResolveTrustedAgentEvaluationSuite(
 				input.Package,
@@ -2688,9 +2988,9 @@ func (h *kbaseHTTPHandler) handleAgentPackages(w http.ResponseWriter, r *http.Re
 				writeHTTPError(w, http.StatusConflict, "agent package evaluation suite is immutable for this content hash")
 				return
 			}
-			if input.Package.SchemaVersion == AgentPackageSchemaVersionV2 || input.Package.SchemaVersion == AgentPackageSchemaVersionV3 {
+			if agentPackageUsesTrustedEvaluation(input.Package.SchemaVersion) {
 				if existing.TrustedSuiteHash == "" {
-					if input.Package.SchemaVersion == AgentPackageSchemaVersionV3 {
+					if input.Package.SchemaVersion == AgentPackageSchemaVersionV4 {
 						writeHTTPError(w, http.StatusConflict, "research package trusted evaluation identity is missing")
 						return
 					}
@@ -4370,10 +4670,25 @@ func (h *kbaseHTTPHandler) handleResearchRunCreate(w http.ResponseWriter, r *htt
 		writeHTTPError(w, http.StatusBadRequest, "invalid_research_request")
 		return
 	}
+	requestedMode := strings.TrimSpace(request.Mode)
+	if requestedMode == "" {
+		requestedMode = ResearchModeAuto
+	}
+	pkg, err := loadRunnableResearchAgentPackageScope(
+		r.Context(), h.store, request.PackageID, request.PackageVersion, requestedMode, request.RequestedSources,
+	)
+	if err == nil && requestedMode != mode {
+		err = validateResearchAgentPackageScope(*pkg, mode, request.RequestedSources)
+	}
+	if err != nil {
+		writeHTTPError(w, http.StatusBadRequest, "research_package_not_eligible")
+		return
+	}
 	budget := h.researchQuickBudget
 	if mode == ResearchModeDeep {
 		budget = h.researchDeepBudget
 	}
+	budget = boundResearchBudgetByPolicy(budget, *pkg.ResearchPolicy)
 	keyDigest := sha256.Sum256([]byte(ownerHash + "\x00" + strings.TrimSpace(idempotencyKey)))
 	run, created, err := h.researchStore.CreateRun(ResearchRunInput{
 		IdempotencyKey: hex.EncodeToString(keyDigest[:]), Request: request, Mode: mode,

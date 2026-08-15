@@ -21,6 +21,7 @@ type SourceSchedulerTickResult struct {
 	SkippedFuture   int `json:"skipped_future"`
 	SkippedActive   int `json:"skipped_active"`
 	SkippedBlocked  int `json:"skipped_blocked"`
+	SkippedCooldown int `json:"skipped_cooldown"`
 	InvalidSchedule int `json:"invalid_schedule"`
 }
 
@@ -79,9 +80,21 @@ func (s *SourceScheduler) Tick() (SourceSchedulerTickResult, error) {
 			result.SkippedFuture++
 			continue
 		}
-		if found && latest.Status == SourceRunFailed && sourceScheduleFailureBlocked(latest.Error) {
-			result.SkippedBlocked++
-			continue
+		if found && latest.Status == SourceRunFailed {
+			if latest.FailureCode == SourceRunFailureThrottled {
+				retryAfter, parseErr := time.Parse(time.RFC3339Nano, latest.RetryAfter)
+				if parseErr != nil {
+					result.SkippedBlocked++
+					continue
+				}
+				if now.Before(retryAfter) {
+					result.SkippedCooldown++
+					continue
+				}
+			} else if sourceScheduleFailureBlocked(latest.FailureCode, latest.Error) {
+				result.SkippedBlocked++
+				continue
+			}
 		}
 
 		if found && latest.Status == SourceRunFailed {
@@ -186,7 +199,13 @@ func isActiveSourceRunStatus(status string) bool {
 	}
 }
 
-func sourceScheduleFailureBlocked(message string) bool {
+func sourceScheduleFailureBlocked(failureCode, message string) bool {
+	switch strings.TrimSpace(failureCode) {
+	case SourceRunFailureLoginRequired, SourceRunFailureVerificationRequired, SourceRunFailureForbidden, SourceRunFailurePermanent:
+		return true
+	case SourceRunFailureThrottled:
+		return false
+	}
 	message = strings.ToLower(strings.TrimSpace(message))
 	for _, marker := range []string{
 		"not_max_version",
@@ -198,8 +217,6 @@ func sourceScheduleFailureBlocked(message string) bool {
 		"http 403",
 		"license",
 		"licence",
-		"throttl",
-		"too many requests",
 		"parameter expired",
 		"parameter_expired",
 		"request parameter expired",

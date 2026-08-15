@@ -9,7 +9,7 @@ import (
 )
 
 func TestResearchKnowledgeToolPinsPackageReleaseCitationsAndAudits(t *testing.T) {
-	knowledge, pkg := agentRuntimeTestStore(t)
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
 	research, err := OpenResearchStore(knowledge.Root(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +77,7 @@ func TestResearchKnowledgeToolPinsPackageReleaseCitationsAndAudits(t *testing.T)
 }
 
 func TestResearchKnowledgeToolFailsClosedWhenPinnedReleaseChanges(t *testing.T) {
-	knowledge, pkg := agentRuntimeTestStore(t)
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
 	research, err := OpenResearchStore(knowledge.Root(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestResearchKnowledgeToolFailsClosedWhenPinnedReleaseChanges(t *testing.T) 
 }
 
 func TestResearchPriorRunToolPromotesVerifiedConclusionAndRequiresVerificationForUnderlyingPrivateExcerpt(t *testing.T) {
-	knowledge, pkg := agentRuntimeTestStore(t)
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
 	research, err := OpenResearchStore(knowledge.Root(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -219,6 +219,10 @@ func createResearchToolRun(t *testing.T, store *ResearchStore, pkg AgentPackage,
 	input := researchStoreTestInput(key)
 	input.Request.PackageID = pkg.PackageID
 	input.Request.PackageVersion = pkg.Version
+	input.Request.Mode = ResearchModeDeep
+	input.Request.RequestedSources = []string{ResearchSourceKnowledge, ResearchSourceChatlog, ResearchSourcePriorRuns}
+	input.Mode = ResearchModeDeep
+	input.RouteReasons = []string{ResearchRouteExplicitDeep}
 	run, _, err := store.CreateRun(input)
 	if err != nil {
 		t.Fatal(err)
