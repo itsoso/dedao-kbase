@@ -17,9 +17,9 @@ import (
 
 const (
 	KnowledgeCollectionMaterializationSchemaVersion = "knowledge_collection_materialization.v1"
-	knowledgeCollectionMaterializationMaxClaims     = 1000
-	knowledgeCollectionMaterializationMaxCitations  = 1000
-	knowledgeCollectionMaterializationMaxQuoted     = 200000
+	knowledgeCollectionMaterializationMaxClaims     = 5000
+	knowledgeCollectionMaterializationMaxCitations  = 5000
+	knowledgeCollectionMaterializationMaxQuoted     = 5000000
 )
 
 var ErrKnowledgeCollectionMaterializationConflict = errors.New("knowledge collection materialization conflicts with immutable content")
@@ -82,6 +82,9 @@ func (s *BookKnowledgeStore) MaterializeKnowledgeCollectionRelease(releaseID str
 		}
 		var target KnowledgeRelease
 		if err := readJSONFile(s.KnowledgeReleasePath(existing.TargetReleaseID), &target); err != nil {
+			if os.IsNotExist(err) {
+				return nil, false, fmt.Errorf("%w: target release is missing", ErrKnowledgeCollectionMaterializationConflict)
+			}
 			return nil, false, err
 		}
 		if !reflect.DeepEqual(target, result.Release) {
@@ -91,6 +94,20 @@ func (s *BookKnowledgeStore) MaterializeKnowledgeCollectionRelease(releaseID str
 		return result, false, nil
 	} else if !os.IsNotExist(err) {
 		return nil, false, err
+	}
+	manifest, err := s.loadKnowledgeReleaseManifestUnlocked()
+	if err != nil {
+		return nil, false, err
+	}
+	wantRecord := KnowledgeReleaseRecord{
+		ReleaseID: result.Release.ReleaseID, BookID: result.Release.BookID,
+		ContentHash: result.Release.ContentHash, Supersedes: result.Release.Supersedes,
+		UsagePolicy: result.Release.UsagePolicy, CreatedAt: result.Release.CreatedAt,
+	}
+	for _, record := range manifest.Releases {
+		if record.ReleaseID == wantRecord.ReleaseID && !reflect.DeepEqual(record, wantRecord) {
+			return nil, false, fmt.Errorf("%w: target manifest record changed", ErrKnowledgeCollectionMaterializationConflict)
+		}
 	}
 
 	var existingRelease KnowledgeRelease
@@ -128,6 +145,12 @@ func (s *BookKnowledgeStore) loadKnowledgeCollectionReleaseUnlocked(releaseID st
 	if release.UsagePolicy != BookUsageEvidenceOnly || release.Quality.Decision != BookQualityPass ||
 		release.Quality.UsagePolicy != BookUsageEvidenceOnly || len(release.Members) == 0 {
 		return nil, fmt.Errorf("knowledge collection release is not eligible for evidence-only materialization")
+	}
+	if err := ValidateKnowledgeCollectionDefinition(release.Definition); err != nil {
+		return nil, fmt.Errorf("knowledge collection release definition is invalid: %w", err)
+	}
+	if len(release.Members) > KnowledgeCollectionMaxMembers {
+		return nil, fmt.Errorf("knowledge collection release exceeds member limit")
 	}
 	return &release, nil
 }
@@ -172,6 +195,12 @@ func (s *BookKnowledgeStore) projectKnowledgeCollectionReleaseUnlocked(collectio
 			if !ok || strings.TrimSpace(chunk.Text) == "" {
 				return nil, fmt.Errorf("pinned collection member %q cited chunk cannot be resolved", boundedEvidenceID(member.BookID))
 			}
+			if citation.CitationID == "" || citation.BookID != member.BookID ||
+				citation.SourceType != collection.Definition.SourceType || citation.SourceItemKey != member.SourceItemKey ||
+				citation.SourceAccount != collection.Definition.SourceAccount || citation.ChapterID != chunk.ChapterID ||
+				chunk.BookID != member.BookID {
+				return nil, fmt.Errorf("pinned collection member %q citation source identity changed", boundedEvidenceID(member.BookID))
+			}
 			namespace := knowledgeCollectionMaterializationNamespace(member)
 			chapterID := namespace + "-chapter-" + opaqueKnowledgeCollectionMaterializationID(citation.ChapterID)
 			chunkID := namespace + "-chunk-" + opaqueKnowledgeCollectionMaterializationID(citation.ChunkID)
@@ -189,9 +218,8 @@ func (s *BookKnowledgeStore) projectKnowledgeCollectionReleaseUnlocked(collectio
 				SourceItemKey: member.SourceItemKey, PublishedAt: firstNonEmpty(member.PublishedAt, article.Book.PublishedAt),
 			})
 			quotedRunes += utf8.RuneCountInString(statement)
-			if len(claims) > knowledgeCollectionMaterializationMaxClaims ||
-				len(citations) > knowledgeCollectionMaterializationMaxCitations || quotedRunes > knowledgeCollectionMaterializationMaxQuoted {
-				return nil, fmt.Errorf("knowledge collection materialization exceeds aggregate evidence limits")
+			if err := validateKnowledgeCollectionMaterializationLimits(len(claims), len(citations), quotedRunes); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -257,11 +285,20 @@ func validateKnowledgeCollectionMaterializationMember(collection KnowledgeCollec
 		return fmt.Errorf("pinned collection member %q content hash changed", boundedEvidenceID(member.BookID))
 	}
 	if article.Book.BookID != member.BookID || article.Book.SourceType != collection.Definition.SourceType ||
-		article.Book.SourceKey != member.SourceItemKey || article.Book.SourceAccount != collection.Definition.SourceAccount {
+		article.Book.SourceKey != member.SourceItemKey || article.Book.SourceAccount != collection.Definition.SourceAccount ||
+		(member.PublishedAt != "" && article.Book.PublishedAt != member.PublishedAt) {
 		return fmt.Errorf("pinned collection member %q source identity changed", boundedEvidenceID(member.BookID))
 	}
 	if len(member.CitationIDs) == 0 {
 		return fmt.Errorf("pinned collection member %q has no citation allowlist", boundedEvidenceID(member.BookID))
+	}
+	return nil
+}
+
+func validateKnowledgeCollectionMaterializationLimits(claims, citations, quotedRunes int) error {
+	if claims > knowledgeCollectionMaterializationMaxClaims ||
+		citations > knowledgeCollectionMaterializationMaxCitations || quotedRunes > knowledgeCollectionMaterializationMaxQuoted {
+		return fmt.Errorf("knowledge collection materialization exceeds aggregate evidence limits")
 	}
 	return nil
 }
