@@ -971,10 +971,12 @@ func TestResearchPlannerPromptListsOnlyRunAuthorizedEntryTools(t *testing.T) {
 			orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
 			run := createResearchOrchestratorRun(t, research, pkg, "planner-prompt-"+testCase.name,
 				ResearchModeDeep, []string{testCase.source}, "bounded research")
+			before := research.now().UTC().Truncate(time.Second)
 			messages, err := orchestrator.stageMessages(context.Background(), run, ResearchRolePlanner, "Plan bounded retrieval")
 			if err != nil {
 				t.Fatal(err)
 			}
+			after := research.now().UTC().Truncate(time.Second)
 			joined := ""
 			for _, message := range messages {
 				joined += message.Content + "\n"
@@ -983,8 +985,18 @@ func TestResearchPlannerPromptListsOnlyRunAuthorizedEntryTools(t *testing.T) {
 				!strings.Contains(joined, `"name":"`+testCase.tool+`"`) {
 				t.Fatalf("planner prompt omitted run-scoped tool contract: %s", joined)
 			}
-			currentTime := research.now().UTC().Format(time.RFC3339)
-			if !strings.Contains(joined, `"current_time_utc":"`+currentTime+`"`) ||
+			const timePrefix = `"current_time_utc":"`
+			timeStart := strings.Index(joined, timePrefix)
+			timeEnd := -1
+			if timeStart >= 0 {
+				timeStart += len(timePrefix)
+				timeEnd = strings.Index(joined[timeStart:], `"`)
+			}
+			var anchoredAt time.Time
+			if timeEnd >= 0 {
+				anchoredAt, err = time.Parse(time.RFC3339, joined[timeStart:timeStart+timeEnd])
+			}
+			if err != nil || timeEnd < 0 || anchoredAt.Before(before) || anchoredAt.After(after) ||
 				!strings.Contains(joined, "Resolve every relative date") {
 				t.Fatalf("planner prompt omitted the authoritative relative-date anchor: %s", joined)
 			}

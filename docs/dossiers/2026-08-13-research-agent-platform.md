@@ -762,3 +762,10 @@ now completes synthesis and verification with exactly three promoted results.
 The original quick test, focused race run, complete Go suite and vet, and the
 full Research process smoke pass. Exact-revision redeployment and repeated real
 quick plus deep cross-source acceptance remain required.
+
+The first clean-host rebuild of that remediation also exposed an existing
+second-boundary flake in the planner time-anchor test: it generated the prompt,
+read the wall clock again, and required the two second-formatted values to be
+identical. The assertion now parses the emitted RFC3339 anchor and proves it is
+between timestamps captured immediately before and after prompt generation;
+twenty consecutive focused runs pass. Runtime time anchoring was unchanged.
