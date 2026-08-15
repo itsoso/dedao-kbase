@@ -185,6 +185,23 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 	if _, err := o.invokeModel(ctx, run, ResearchRolePlanner, fmt.Sprintf("planner:%d", state.Iteration), messages, &output); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
+	if containsResearchString(run.RequestedSources, ResearchSourceKnowledge) &&
+		!containsResearchString(run.ActualScope.SearchedSources, ResearchSourceKnowledge) {
+		knowledgePlanned := false
+		for _, call := range output.ToolCalls {
+			if call.Tool == ResearchToolSearchKnowledge {
+				knowledgePlanned = true
+				break
+			}
+		}
+		if !knowledgePlanned {
+			output.ToolCalls = append(output.ToolCalls, ResearchPlannedToolCall{
+				Tool: ResearchToolSearchKnowledge, Arguments: map[string]any{
+					"query": run.Question, "limit": researchToolDefaultLimit,
+				},
+			})
+		}
+	}
 	for _, call := range output.ToolCalls {
 		if isResearchWorkerTool(call.Tool) {
 			if err := o.authorizeResearchTool(ctx, run, call.Tool); err != nil {

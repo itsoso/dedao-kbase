@@ -303,6 +303,40 @@ func TestResearchOrchestratorDeepKnowledgeSearchFetchesObservedMatches(t *testin
 	}
 }
 
+func TestResearchOrchestratorDeepPlanningCoversRequestedKnowledgeAlongsideChatlog(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.plannerOutput = &ResearchPlannerOutput{
+		DecisionSummary: "Search private history first",
+		ToolCalls: []ResearchPlannedToolCall{{
+			Tool: ResearchWorkerToolSearchChatlog, Arguments: map[string]any{
+				"talker_ref": "room-a", "time_from": "2032-01-01T00:00:00Z",
+				"time_to": "2032-01-02T00:00:00Z", "limit": 2,
+			},
+		}},
+	}
+	run := createResearchOrchestratorRun(t, research, pkg, "deep-all-requested-sources", ResearchModeDeep,
+		[]string{ResearchSourceKnowledge, ResearchSourceChatlog}, "grounded")
+
+	result, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || result.Run.Status != ResearchRetrieving {
+		t.Fatalf("planning result=%#v err=%v", result, err)
+	}
+	evidence, err := research.ListEvidence(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evidence) == 0 || evidence[0].SourceType != ResearchEvidenceSourceKnowledge {
+		t.Fatalf("requested knowledge source was silently omitted: %#v", evidence)
+	}
+	jobs, err := orchestrator.listWorkerJobs(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Tool != ResearchWorkerToolSearchChatlog {
+		t.Fatalf("requested Chatlog source was not preserved: %#v", jobs)
+	}
+}
+
 func TestResearchOrchestratorBlocksPlannerToolOutsideRequestedSources(t *testing.T) {
 	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
 	model.plannerOutput = &ResearchPlannerOutput{
