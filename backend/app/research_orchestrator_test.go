@@ -20,6 +20,7 @@ type fakeResearchStageModel struct {
 	err              error
 	usage            ResearchModelUsage
 	plannerOutput    *ResearchPlannerOutput
+	plannerOutputs   []ResearchPlannerOutput
 	extractorOutput  *ResearchExtractorOutput
 	malformedExtract bool
 }
@@ -98,6 +99,10 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 	sort.Strings(conclusionIDs)
 	switch value := output.(type) {
 	case *ResearchPlannerOutput:
+		if len(m.plannerOutputs) >= m.calls[role] {
+			*value = m.plannerOutputs[m.calls[role]-1]
+			break
+		}
 		if m.plannerOutput != nil {
 			*value = *m.plannerOutput
 			break
@@ -164,6 +169,63 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 		usage = ResearchModelUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}
 	}
 	return usage, nil
+}
+
+func TestResearchOrchestratorReplansAfterIdentityDiscoveryBeforeDeclaringZeroHit(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.plannerOutputs = []ResearchPlannerOutput{
+		{DecisionSummary: "Resolve the requested identity first", ToolCalls: []ResearchPlannedToolCall{{
+			Tool: ResearchWorkerToolResolveChatIdentity, Arguments: map[string]any{"identity_ref": "target-person"},
+		}}},
+		{DecisionSummary: "Search all conversations after identity discovery", ToolCalls: []ResearchPlannedToolCall{{
+			Tool: ResearchWorkerToolSearchChatlog, Arguments: map[string]any{
+				"talker_ref": "*", "sender_ref": "target-person", "keyword": "illness",
+				"time_from": "2032-01-01T00:00:00Z", "time_to": "2032-01-31T00:00:00Z", "limit": 20,
+			},
+		}}},
+	}
+	run := createResearchOrchestratorRun(t, research, pkg, "identity-then-search", ResearchModeDeep,
+		[]string{ResearchSourceChatlog}, "Review target-person illness history")
+
+	planned, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || planned.Run.Status != ResearchRetrieving {
+		t.Fatalf("identity planning result=%#v err=%v", planned, err)
+	}
+	job, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+	if err != nil || job == nil || job.Tool != ResearchWorkerToolResolveChatIdentity {
+		t.Fatalf("identity job=%#v err=%v", job, err)
+	}
+	if _, err := research.CompleteWorkerJob(job.JobID, "chatlog-agent", job.LeaseID, job.RequestHash,
+		ResearchWorkerResult{SearchedSources: []string{ResearchSourceChatlog}}); err != nil {
+		t.Fatal(err)
+	}
+
+	replanned, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || replanned.Run.Status != ResearchPlanning || isTerminalResearchStatus(replanned.Run.Status) {
+		t.Fatalf("identity completion must replan before zero-hit: result=%#v err=%v", replanned, err)
+	}
+	messages, err := orchestrator.stageMessages(context.Background(), replanned.Run, ResearchRolePlanner, "Plan bounded retrieval")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	for _, message := range messages {
+		joined += message.Content + "\n"
+	}
+	for _, required := range []string{`"completed_calls_must_not_be_repeated":true`, `"tool":"resolve_chat_identity"`,
+		`"state":"completed"`, `use * only for a bounded all-conversation search`} {
+		if !strings.Contains(joined, required) {
+			t.Fatalf("replanning prompt missing %q: %s", required, joined)
+		}
+	}
+	secondPlan, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || secondPlan.Run.Status != ResearchRetrieving || model.callCount(ResearchRolePlanner) != 2 {
+		t.Fatalf("second planning result=%#v calls=%d err=%v", secondPlan, model.callCount(ResearchRolePlanner), err)
+	}
+	searchJob, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+	if err != nil || searchJob == nil || searchJob.Tool != ResearchWorkerToolSearchChatlog {
+		t.Fatalf("search job=%#v err=%v", searchJob, err)
+	}
 }
 
 func (m *fakeResearchStageModel) callCount(role ResearchModelRole) int {

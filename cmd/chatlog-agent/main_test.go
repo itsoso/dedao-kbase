@@ -514,6 +514,62 @@ func TestChatlogAgentIdentityResolutionReturnsOnlyOpaqueCandidates(t *testing.T)
 	}
 }
 
+func TestChatlogAgentWildcardSearchScansSessionsAndRanksSenderHintLocally(t *testing.T) {
+	var chatlogQueries []url.Values
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/session":
+			_, _ = w.Write([]byte(`{"items":[
+				{"userName":"room-a","nOrder":2,"nickName":"A","content":"private","nTime":"2032-01-02T00:00:00Z"},
+				{"userName":"room-b","nOrder":1,"nickName":"B","content":"private","nTime":"2032-01-01T00:00:00Z"}
+			]}`))
+		case "/api/v1/chatlog":
+			chatlogQueries = append(chatlogQueries, r.URL.Query())
+			switch r.URL.Query().Get("talker") {
+			case "room-a":
+				_, _ = w.Write([]byte(`[{"seq":2,"time":"2032-01-02T08:00:00+08:00","talker":"room-a","sender":"private-a","senderName":"小宝-皮皮妈","type":1,"content":"新冠建议 A"}]`))
+			case "room-b":
+				_, _ = w.Write([]byte(`[{"seq":1,"time":"2032-01-01T08:00:00+08:00","talker":"room-b","sender":"private-b","senderName":"其他人","type":1,"content":"新冠建议 B"}]`))
+			default:
+				t.Fatalf("unexpected talker %q", r.URL.Query().Get("talker"))
+			}
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer local.Close()
+	reader, err := app.NewChatlogHTTPReader(app.ChatlogHTTPConfig{BaseURL: local.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &chatlogAgentRuntime{
+		reader: reader, agentID: "chatlog-agent-a",
+		locators: &chatlogLocatorCache{path: filepath.Join(t.TempDir(), "locators.json"), entries: map[string]chatlogLocatorCacheEntry{}},
+	}
+	result, err := runtime.executeJob(context.Background(), app.ResearchWorkerJob{
+		Tool:      app.ResearchWorkerToolSearchChatlog,
+		Arguments: []byte(`{"talker_ref":"*","sender_ref":"皮皮妈妈","keyword":"新冠","time_from":"2032-01-01T00:00:00Z","time_to":"2032-01-31T00:00:00Z","limit":2}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chatlogQueries) != 2 || len(result.Items) != 2 {
+		t.Fatalf("queries=%d result=%#v", len(chatlogQueries), result)
+	}
+	for _, query := range chatlogQueries {
+		if query.Get("sender") != "" || query.Get("keyword") != "新冠" || query.Get("talker") == "*" {
+			t.Fatalf("wildcard local query leaked unsupported filter: %v", query)
+		}
+	}
+	if result.Items[0].Locator.MessageRef == "" || result.Items[0].Selected || result.Items[0].Content != "" {
+		t.Fatalf("wildcard candidate boundary = %#v", result.Items[0])
+	}
+	first, err := runtime.locators.resolve(result.Items[0].Locator.MessageRef)
+	if err != nil || first.ConversationRef != "room-a" {
+		t.Fatalf("sender hint did not rank matching local alias first: locator=%#v err=%v", first, err)
+	}
+}
+
 func TestChatlogAgentReportsDependencyUnavailableWithoutLeakingDetails(t *testing.T) {
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "PRIVATE_LOCAL_FAILURE", http.StatusServiceUnavailable)

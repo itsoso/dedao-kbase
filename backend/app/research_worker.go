@@ -827,6 +827,10 @@ func validateResearchWorkerArguments(tool string, encoded json.RawMessage) error
 		if strings.TrimSpace(args.TalkerRef) == "" {
 			return fmt.Errorf("talker_ref is required")
 		}
+		if strings.TrimSpace(args.TalkerRef) == "*" &&
+			(strings.TrimSpace(args.Keyword) == "" || args.Offset > 500) {
+			return fmt.Errorf("global Chatlog search requires a keyword and offset at most 500")
+		}
 		if strings.TrimSpace(args.TimeFrom) == "" || strings.TrimSpace(args.TimeTo) == "" {
 			return fmt.Errorf("time_from and time_to are required")
 		}

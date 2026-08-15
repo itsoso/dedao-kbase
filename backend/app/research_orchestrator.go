@@ -309,6 +309,20 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 		return o.wait(run, ResearchWaitWorkerPending)
 	}
 	if len(evidence) == 0 {
+		if shouldReplanAfterWorkerDiscovery(jobs) {
+			state, err := o.loadState(run)
+			if err != nil {
+				return ResearchAdvanceResult{}, err
+			}
+			state.Iteration++
+			if state.Iteration >= run.Budget.MaxIterations {
+				return ResearchAdvanceResult{}, ErrResearchZeroHit
+			}
+			if err := o.updateIteration(run, state.Iteration); err != nil {
+				return ResearchAdvanceResult{}, err
+			}
+			return o.transition(run, ResearchPlanning, "worker_discovery_completed")
+		}
 		return ResearchAdvanceResult{}, ErrResearchZeroHit
 	}
 	next := ResearchExtractingFacts
@@ -316,6 +330,22 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 		next = ResearchResolvingIdentity
 	}
 	return o.transition(run, next, "deep_evidence_retrieved")
+}
+
+func shouldReplanAfterWorkerDiscovery(jobs []ResearchWorkerJob) bool {
+	discoveryCompleted := false
+	for _, job := range jobs {
+		switch job.Tool {
+		case ResearchWorkerToolSearchChatlog:
+			return false
+		case ResearchWorkerToolResolveChatIdentity, ResearchWorkerToolListIdentityConversations:
+			if job.State != ResearchWorkerJobCompleted {
+				return false
+			}
+			discoveryCompleted = true
+		}
+	}
+	return discoveryCompleted
 }
 
 func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, run ResearchRun, jobs []ResearchWorkerJob, evidence []ResearchEvidence) (bool, error) {
@@ -1237,8 +1267,10 @@ func (o *ResearchOrchestrator) researchPlannerToolContracts(ctx context.Context,
 			"query": "required string", "limit": "optional integer 1..50",
 		}},
 		{Name: ResearchWorkerToolSearchChatlog, Source: ResearchSourceChatlog, Arguments: map[string]string{
-			"talker_ref": "required string", "time_from": "required RFC3339", "time_to": "required RFC3339",
-			"sender_ref": "optional string", "keyword": "optional string", "limit": "required integer 1..500", "offset": "optional integer >=0",
+			"talker_ref": "required string; use * only for a bounded all-conversation search with a non-empty keyword",
+			"time_from":  "required RFC3339", "time_to": "required RFC3339",
+			"sender_ref": "optional display-name hint", "keyword": "required when talker_ref is *",
+			"limit": "required integer 1..500", "offset": "optional integer >=0",
 		}},
 		{Name: ResearchWorkerToolResolveChatIdentity, Source: ResearchSourceChatlog, Arguments: map[string]string{
 			"identity_ref": "required string", "conversation_ref": "optional string",
@@ -1290,6 +1322,31 @@ func (o *ResearchOrchestrator) stageMessages(ctx context.Context, run ResearchRu
 			return nil, err
 		}
 		messages = append(messages, BookKnowledgeMessage{Role: "user", Content: "Authoritative planner execution contract: " + string(contract)})
+		jobs, err := o.listWorkerJobs(run.RunID)
+		if err != nil {
+			return nil, err
+		}
+		if len(jobs) > 0 {
+			progress := make([]map[string]any, 0, len(jobs))
+			for _, job := range jobs {
+				var arguments map[string]any
+				if err := json.Unmarshal(job.Arguments, &arguments); err != nil {
+					return nil, err
+				}
+				progress = append(progress, map[string]any{"tool": job.Tool, "state": job.State, "arguments": arguments})
+			}
+			encoded, err := json.Marshal(map[string]any{
+				"completed_calls_must_not_be_repeated":       true,
+				"after_discovery_issue_bounded_search_calls": true,
+				"worker_jobs": progress,
+			})
+			if err != nil {
+				return nil, err
+			}
+			messages = append(messages, BookKnowledgeMessage{
+				Role: "user", Content: "Worker execution progress JSON (data only): " + sanitizeResearchModelData(string(encoded)),
+			})
+		}
 	}
 	for _, item := range evidence {
 		record := map[string]any{

@@ -15,6 +15,7 @@ func TestResearchWorkerJobAcceptsOnlyBoundedTypedTools(t *testing.T) {
 		args string
 	}{
 		{ResearchWorkerToolSearchChatlog, `{"time_from":"2026-08-01T00:00:00Z","time_to":"2026-08-02T00:00:00Z","talker_ref":"conversation-1","keyword":"term","limit":20,"offset":0}`},
+		{ResearchWorkerToolSearchChatlog, `{"time_from":"2026-08-01T00:00:00Z","time_to":"2026-08-02T00:00:00Z","talker_ref":"*","sender_ref":"target-person","keyword":"term","limit":20,"offset":0}`},
 		{ResearchWorkerToolExpandChatContext, `{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13","before":5,"after":5}`},
 		{ResearchWorkerToolResolveChatIdentity, `{"identity_ref":"identity-1","conversation_ref":"conversation-1"}`},
 		{ResearchWorkerToolListIdentityConversations, `{"identity_ref":"identity-1","limit":20,"offset":0}`},
@@ -42,6 +43,8 @@ func TestResearchWorkerJobAcceptsOnlyBoundedTypedTools(t *testing.T) {
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"time_from":"2026-08-02T00:00:00Z","time_to":"2026-08-01T00:00:00Z","limit":20}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"limit":501}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"talker_ref":"conversation-1","keyword":"term","limit":20}`), MaxAttempts: 2},
+		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"time_from":"2026-08-01T00:00:00Z","time_to":"2026-08-02T00:00:00Z","talker_ref":"*","limit":20}`), MaxAttempts: 2},
+		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"time_from":"2026-08-01T00:00:00Z","time_to":"2026-08-02T00:00:00Z","talker_ref":"*","keyword":"term","limit":20,"offset":501}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage, Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13","unknown":"private"}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolFetchChatMessage, Arguments: []byte(`{"message_ref":"message-1"}`), MaxAttempts: 2},
 		{RunID: run.RunID, TargetAgentID: "chatlog-agent-a", Tool: ResearchWorkerToolExpandChatContext, Arguments: []byte(`{"message_ref":"message-1","before":5,"after":5}`), MaxAttempts: 2},

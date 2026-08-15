@@ -28,6 +28,12 @@ const (
 	chatlogAgentVersion         = "0.1.0"
 	chatlogAgentProtocolVersion = "2026-08-01"
 	chatlogAgentCapability      = "chatlog_read"
+	chatlogGlobalTalkerRef      = "*"
+	chatlogGlobalSessionLimit   = 5000
+	chatlogGlobalSessionPage    = 500
+	chatlogGlobalSearchWorkers  = 16
+	chatlogGlobalPerTalkerLimit = 20
+	chatlogGlobalOffsetMax      = 500
 )
 
 var chatlogAgentRevision = "0000000000000000000000000000000000000000"
@@ -478,10 +484,7 @@ func (r *chatlogAgentRuntime) executeJob(ctx context.Context, job app.ResearchWo
 		if err := json.Unmarshal(job.Arguments, &args); err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		messages, err := r.reader.SearchMessages(ctx, app.ChatlogQuery{
-			Time: chatlogDateRange(args.TimeFrom, args.TimeTo), Talker: args.TalkerRef,
-			Sender: args.SenderRef, Keyword: args.Keyword, Limit: args.Limit, Offset: args.Offset,
-		})
+		messages, err := r.searchChatlogMessages(ctx, args)
 		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
@@ -566,6 +569,172 @@ func (r *chatlogAgentRuntime) executeJob(ctx context.Context, job app.ResearchWo
 	default:
 		return app.ResearchWorkerResult{}, fmt.Errorf("unsupported research job")
 	}
+}
+
+func (r *chatlogAgentRuntime) searchChatlogMessages(ctx context.Context, args app.ResearchWorkerSearchChatlogArgs) ([]app.ChatlogMessage, error) {
+	query := app.ChatlogQuery{
+		Time: chatlogDateRange(args.TimeFrom, args.TimeTo), Talker: args.TalkerRef,
+		Sender: args.SenderRef, Keyword: args.Keyword, Limit: args.Limit, Offset: args.Offset,
+	}
+	if strings.TrimSpace(args.TalkerRef) != chatlogGlobalTalkerRef {
+		return r.reader.SearchMessages(ctx, query)
+	}
+	if strings.TrimSpace(args.Keyword) == "" || args.Offset > chatlogGlobalOffsetMax {
+		return nil, fmt.Errorf("global Chatlog search requires a keyword and bounded offset")
+	}
+	sessions := make([]app.ChatlogSession, 0, chatlogGlobalSessionPage)
+	seenTalkers := map[string]bool{}
+	for offset := 0; offset < chatlogGlobalSessionLimit; offset += chatlogGlobalSessionPage {
+		page, err := r.reader.ListSessions(ctx, "", chatlogGlobalSessionPage, offset)
+		if err != nil {
+			return nil, err
+		}
+		for _, session := range page.Items {
+			talker := strings.TrimSpace(session.UserName)
+			if talker == "" || seenTalkers[talker] {
+				continue
+			}
+			seenTalkers[talker] = true
+			sessions = append(sessions, session)
+		}
+		if len(page.Items) < chatlogGlobalSessionPage {
+			break
+		}
+	}
+	if len(sessions) == 0 {
+		return []app.ChatlogMessage{}, nil
+	}
+	perTalkerLimit := args.Limit + args.Offset
+	if perTalkerLimit > chatlogGlobalPerTalkerLimit {
+		perTalkerLimit = chatlogGlobalPerTalkerLimit
+	}
+	if perTalkerLimit < 1 {
+		perTalkerLimit = 1
+	}
+	scanCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	indices := make(chan int)
+	type indexedChatlogBatch struct {
+		index    int
+		messages []app.ChatlogMessage
+	}
+	type rankedChatlogMessage struct {
+		sessionIndex int
+		message      app.ChatlogMessage
+	}
+	var firstErr error
+	var errMu sync.Mutex
+	workerCount := chatlogGlobalSearchWorkers
+	if workerCount > len(sessions) {
+		workerCount = len(sessions)
+	}
+	results := make(chan indexedChatlogBatch, workerCount)
+	var workers sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range indices {
+				messages, err := r.reader.SearchMessages(scanCtx, app.ChatlogQuery{
+					Time: query.Time, Talker: sessions[index].UserName, Keyword: query.Keyword,
+					Limit: perTalkerLimit,
+				})
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+						cancel()
+					}
+					errMu.Unlock()
+					return
+				}
+				select {
+				case results <- indexedChatlogBatch{index: index, messages: messages}:
+				case <-scanCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(indices)
+		for index := range sessions {
+			select {
+			case indices <- index:
+			case <-scanCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
+	wanted := args.Limit + args.Offset
+	senderHint := normalizeChatlogSenderHint(args.SenderRef)
+	selected := make([]rankedChatlogMessage, 0, wanted)
+	less := func(i, j int) bool {
+		left, right := selected[i], selected[j]
+		leftRank := chatlogSenderHintRank(senderHint, left.message)
+		rightRank := chatlogSenderHintRank(senderHint, right.message)
+		if leftRank != rightRank {
+			return leftRank > rightRank
+		}
+		if !left.message.Time.Equal(right.message.Time) {
+			return left.message.Time.Before(right.message.Time)
+		}
+		if left.sessionIndex != right.sessionIndex {
+			return left.sessionIndex < right.sessionIndex
+		}
+		return left.message.Seq < right.message.Seq
+	}
+	for batch := range results {
+		for _, message := range batch.messages {
+			selected = append(selected, rankedChatlogMessage{sessionIndex: batch.index, message: message})
+		}
+		sort.SliceStable(selected, less)
+		if len(selected) > wanted {
+			selected = selected[:wanted]
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	start := args.Offset
+	if start > len(selected) {
+		start = len(selected)
+	}
+	end := start + args.Limit
+	if end > len(selected) {
+		end = len(selected)
+	}
+	messages := make([]app.ChatlogMessage, 0, end-start)
+	for _, item := range selected[start:end] {
+		messages = append(messages, item.message)
+	}
+	return messages, nil
+}
+
+func normalizeChatlogSenderHint(value string) string {
+	compact := strings.ToLower(strings.TrimSpace(value))
+	compact = strings.NewReplacer("妈妈", "妈", " ", "", "-", "", "_", "", "·", "").Replace(compact)
+	return compact
+}
+
+func chatlogSenderHintRank(hint string, message app.ChatlogMessage) int {
+	if hint == "" {
+		return 0
+	}
+	for _, candidate := range []string{message.SenderName, message.Sender} {
+		candidate = normalizeChatlogSenderHint(candidate)
+		if candidate == hint {
+			return 3
+		}
+		if candidate != "" && (strings.Contains(candidate, hint) || strings.Contains(hint, candidate)) {
+			return 2
+		}
+	}
+	return 0
 }
 
 func (r *chatlogAgentRuntime) resultForSearchCandidates(messages []app.ChatlogMessage) (app.ResearchWorkerResult, error) {

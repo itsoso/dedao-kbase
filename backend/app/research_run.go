@@ -255,6 +255,7 @@ func ValidateResearchTransition(from, to ResearchRunStatus) error {
 			ResearchRetrieving: true,
 		},
 		ResearchRetrieving: {
+			ResearchPlanning:          true,
 			ResearchResolvingIdentity: true,
 			ResearchExtractingFacts:   true,
 			ResearchSynthesizing:      true,
