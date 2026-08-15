@@ -457,6 +457,108 @@ location /api/ {
 
 复核任务由 `kbase-server` 后台处理，不依赖本地来源 Agent。反馈写入、任务状态和发布通过 OS advisory lock 串行化，并以冷却、指数退避和最大尝试次数限制模型调用；服务重启后会恢复超时的 `running` 任务，服务取消或分析期间内容变化则重新排队。`/book-knowledge/{book_id}?review=1` 可查看已发布版本、候选哈希、质量规则和任务状态，并执行安全重试或确认发布。复核只生成知识包快照的候选分析与质量报告，已有 release 保持不可变；系统不会自动发布，显式发布时会校验最新异常评估、复核状态及候选哈希，成功后任务标记为 `published`，未解决或已过期的候选不能发布。
 
+### Research Agent 与 Chatlog Worker
+
+Research Agent 在 KBase 控制面中提供 `quick` 和 `deep` 两种研究模式。`quick`
+只检索已发布的不可变知识 Release，目标是在 15 秒内返回带引用的结论；涉及
+Chatlog、跨来源、身份解析、时间线、历史/当前案例比较或冲突分析时必须使用
+`deep`，正常目标为三分钟内完成。两种模式都受迭代、证据条数、引用字符、模型
+调用和成本预算约束；模型不能直接访问 Chatlog，也不能绕过 Worker 或引用校验。
+
+启用服务端运行时需要显式设置 `KBASE_RESEARCH_ENABLED=true` 和 TokenPlan 凭据。
+可以分别用 `KBASE_RESEARCH_PLANNER_MODEL`、`KBASE_RESEARCH_EXTRACTOR_MODEL`、
+`KBASE_RESEARCH_SYNTHESIZER_MODEL`、`KBASE_RESEARCH_VERIFIER_MODEL` 固定角色模型；
+预算使用 `KBASE_RESEARCH_QUICK_*` 与 `KBASE_RESEARCH_DEEP_*` 变量配置。生产环境
+应保持 KBase 仅监听 loopback，由现有 HTTPS 反向代理提供浏览器入口。
+
+用户 API：
+
+- `POST /api/research/runs`：创建研究任务，必须提供唯一 `Idempotency-Key`；
+- `GET /api/research/runs/{run_id}`：读取脱敏状态、实际检索/引用范围和失败码；
+- `GET /api/research/runs/{run_id}/events?after={sequence}`：增量读取阶段事件；
+- `POST /api/research/runs/{run_id}/cancel`：取消非终态任务；
+- `POST /api/research/runs/{run_id}/identity-bindings/{binding_id}/confirm`：人工确认歧义身份。
+
+浏览器沿用 HttpOnly Cookie、同源 CSRF 和任务所有权隔离；机器客户端沿用
+`KBASE_AUTH_TOKEN`。`/api/research-worker/*` 只接受共享的
+`KBASE_SOURCE_AGENT_TOKEN`，不能使用普通 API token 或 publisher token。Chatlog
+Worker 只能领取分配给自身 `agent_id` 的任务。当前多个来源 Worker 共享这一个
+受控 transport token，因此泄漏时必须同时轮换服务端和全部 Worker。
+
+每次 Worker 领取都会得到不可复用的 `lease_id`，续租、完成和失败请求必须回传
+同一 ID；长查询期间 Worker 会自动续租，失租后立即取消本地查询且不得提交结果。
+Chatlog 搜索只上报不含正文和原始定位符的 `sha256:` 候选，控制面随后下发有界
+抓取或上下文扩展任务；服务端会再次校验候选属于同一 Research Run、同一 Worker
+和同一锚点，校验失败的内容不会进入证据库。
+
+Chatlog Worker 第一版仅支持 macOS。它只读取本机 `127.0.0.1`、`localhost` 或
+`::1` 上的 Chatlog API，默认地址为 `http://127.0.0.1:5030`；禁止通过公网隧道、
+反向代理或局域网监听暴露该端口。发送到 KBase 的内容仅包含选中的有界证据摘录、
+不透明身份和可复核定位信息，不上传完整原始响应、联系人导出、Cookie 或 Token。
+日志不得记录消息正文、身份、定位符、密钥或本机路径。
+
+构建并安装原生 Worker 和共享 updater：
+
+```bash
+bash scripts/build-chatlog-agent-macos.sh --check
+bash scripts/build-chatlog-agent-macos.sh
+
+test -r "${KBASE_SOURCE_AGENT_TOKEN_FILE:?}"
+env -u KBASE_SOURCE_AGENT_TOKEN \
+  KBASE_REMOTE_URL="https://kbase.example.invalid" \
+  KBASE_SOURCE_AGENT_ID="chatlog-agent-1" \
+  CHATLOG_AGENT_STATE_DIR="${HOME}/Library/Application Support/dedao-kbase/chatlog-agent/state" \
+  CHATLOG_BASE_URL="http://127.0.0.1:5030" \
+  bash scripts/install-chatlog-agent-macos.sh \
+  < "${KBASE_SOURCE_AGENT_TOKEN_FILE:?}"
+```
+
+安装器只从标准输入接收共享 Token，并将其写入 macOS Keychain；Token 不进入
+plist、参数、配置文件或日志。安装后用以下命令检查 launchd、Chatlog 依赖、远端
+认证、精确 revision 和 updater 受保护配置：
+
+```bash
+CHATLOG_AGENT_HOME="${CHATLOG_AGENT_INSTALL_DIR:-${HOME}/Library/Application Support/dedao-kbase/chatlog-agent}"
+launchctl print "gui/$(id -u)/life.executor.kbase.chatlog-agent"
+launchctl print "gui/$(id -u)/life.executor.kbase.chatlog-agent.updater"
+
+env -u KBASE_SOURCE_AGENT_TOKEN \
+  KBASE_REMOTE_URL="https://kbase.example.invalid" \
+  KBASE_SOURCE_AGENT_ID="chatlog-agent-1" \
+  CHATLOG_AGENT_STATE_DIR="${HOME}/Library/Application Support/dedao-kbase/chatlog-agent/state" \
+  CHATLOG_BASE_URL="http://127.0.0.1:5030" \
+  "${CHATLOG_AGENT_HOME}/chatlog-agent" doctor
+"${CHATLOG_AGENT_HOME}/chatlog-agent" build-info
+"${CHATLOG_AGENT_HOME}/source-agent-updater" --check-config --worker-type chatlog-worker
+```
+
+升级只能由已登录管理员在 `/sources/agents` 中选择服务端私有 catalog 里
+`allowed_for_rollout=true` 的同类型、同架构、协议兼容产物。Worker 与 updater 会
+校验固定 revision、byte size 和 SHA-256；这里不增加签名机制，也不允许任意 URL、
+路径、shell、脚本或无人值守升级。安装或升级若未获得 ready receipt、认证心跳或
+新版本确认，会自动恢复本机备份并报告 `rolled_back`。不要手工执行
+`--run-pending`、删除 handoff/backup 文件或覆盖二进制；`rollback_failed` 必须先
+保留现场并修复 launchd/权限，再从控制面恢复。
+
+常见失败与恢复：
+
+- `worker_offline` / `dependency_unavailable`：确认 Chatlog 仍在 loopback 监听，运行
+  `doctor`，恢复 Worker 后用新的幂等键重试；不能降级为无依据回答；
+- `identity_ambiguous`：在界面确认候选身份后继续，禁止按昵称相似度自动选择；
+- `zero_hit` / `partial_evidence`：缩小问题或补充获授权来源，保留“不足”结论；
+- `citation_mismatch` / `source_changed`：重新抓取定位信息并创建新任务，不能复用旧引用；
+- `budget_exhausted` / `model_timeout`：缩小检索范围或调整受控预算，不得跳过核验；
+- `rolled_back`：确认旧版本心跳和 updater readiness 后，再选择新的已批准产物；
+- `rollback_failed`：停止继续升级并保留状态，由管理员人工修复，不能静默标记成功。
+
+卸载默认保留状态和日志以便审计；只有明确提供受限的绝对状态/日志目录时才允许
+删除：
+
+```bash
+bash scripts/uninstall-chatlog-agent-macos.sh --check
+bash scripts/uninstall-chatlog-agent-macos.sh
+```
+
 ### 微信/WC Plus 来源工作台
 
 在线 Web UI 的统一入口是 `/sources/agents`：总览按在线、需处理、离线、暂停和升级中分组，展示两个独立 Worker 的版本、协议、能力健康、心跳、当前运行/命令以及 outbox/dead-letter 计数。`/sources/agents/{agent_id}` 提供稳定详情页和命令时间线，并分别深链到 `/wechat-source` 与 `/wcplus-source`。旧的直连代理工具收在“本地 API 诊断”中；浏览器不会直接访问本机 WC Plus 端口。

@@ -66,7 +66,7 @@
     {
       "path": "/api/admin/browser-sessions",
       "file": "backend/app/kbase_http.go",
-      "line": 5755,
+      "line": 5956,
       "authenticated": true
     },
     {
@@ -216,13 +216,13 @@
     {
       "path": "/api/browser/session",
       "file": "backend/app/kbase_http.go",
-      "line": 5869,
+      "line": 6070,
       "authenticated": true
     },
     {
       "path": "/api/browser/session/logout",
       "file": "backend/app/kbase_http.go",
-      "line": 5871,
+      "line": 6072,
       "authenticated": true
     },
     {
@@ -744,19 +744,19 @@
     {
       "path": "/api/research-worker/jobs/",
       "file": "backend/app/kbase_http.go",
-      "line": 4629,
+      "line": 4830,
       "authenticated": true
     },
     {
       "path": "/api/research-worker/jobs/",
       "file": "backend/app/research_worker_client.go",
-      "line": 91,
+      "line": 92,
       "authenticated": true
     },
     {
       "path": "/api/research-worker/jobs/claim",
       "file": "backend/app/kbase_http.go",
-      "line": 4551,
+      "line": 4749,
       "authenticated": true
     },
     {
@@ -906,7 +906,7 @@
     {
       "path": "/api/source-agent/runs/",
       "file": "backend/app/kbase_http.go",
-      "line": 5058,
+      "line": 5259,
       "authenticated": true
     },
     {
@@ -1867,7 +1867,7 @@
     {
       "name": "ResearchAnalysisRecord",
       "file": "backend/app/research_analysis.go",
-      "line": 146
+      "line": 157
     },
     {
       "name": "ResearchRun",

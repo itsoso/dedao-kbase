@@ -271,9 +271,12 @@ func (r *ResearchToolRegistry) searchPriorRuns(_ context.Context, request Resear
 	rows, err := r.research.db.Query(`SELECT c.run_id, c.conclusion_id, c.conclusion_text,
 		c.evidence_ids_json, c.confidence FROM research_conclusions c
 		JOIN research_runs run ON run.run_id = c.run_id
+		LEFT JOIN research_http_owners prior_owner ON prior_owner.run_id = c.run_id
+		LEFT JOIN research_http_owners current_owner ON current_owner.run_id = ?
 		WHERE run.status = ? AND run.run_id <> ? AND run.package_id = ? AND run.package_version = ?
+		AND COALESCE(prior_owner.owner_hash, '') = COALESCE(current_owner.owner_hash, '')
 		AND lower(c.conclusion_text) LIKE ? ESCAPE '\'
-		ORDER BY c.created_at DESC, c.conclusion_id ASC LIMIT ?`, ResearchCompleted, request.RunID,
+		ORDER BY c.created_at DESC, c.conclusion_id ASC LIMIT ?`, request.RunID, ResearchCompleted, request.RunID,
 		request.PackageID, request.PackageVersion, "%"+escapeResearchToolLike(strings.ToLower(query))+"%", limit)
 	if err != nil {
 		return ResearchToolResult{}, err
@@ -291,6 +294,18 @@ func (r *ResearchToolRegistry) searchPriorRuns(_ context.Context, request Resear
 			return ResearchToolResult{}, err
 		}
 		result.PriorConclusions = append(result.PriorConclusions, item)
+		bundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
+			SearchedSources: []string{ResearchSourcePriorRuns},
+			Items: []ResearchWorkerEvidenceCandidate{{
+				SourceType: ResearchEvidenceSourcePriorRun, SourceRole: ResearchEvidenceRoleUserHistory,
+				Content: item.Text, Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+				Locator: ResearchEvidenceLocator{PriorRunID: item.RunID, MessageRef: item.ConclusionID},
+			}},
+		})
+		if err != nil {
+			return ResearchToolResult{}, err
+		}
+		result.PromotedEvidence = append(result.PromotedEvidence, bundle.Evidence...)
 		for _, evidenceID := range item.EvidenceIDs {
 			allowedEvidence[item.RunID+"\x00"+evidenceID] = true
 		}

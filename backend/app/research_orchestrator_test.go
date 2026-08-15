@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -12,17 +15,77 @@ import (
 type fakeResearchStageModel struct {
 	mu              sync.Mutex
 	calls           map[ResearchModelRole]int
+	models          map[ResearchModelRole][]string
 	verifierVerdict string
 	err             error
+	usage           ResearchModelUsage
+	plannerOutput   *ResearchPlannerOutput
+	extractorOutput *ResearchExtractorOutput
 }
 
-func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, _ BookTokenPlanConfig, messages []BookKnowledgeMessage, output any) (ResearchModelUsage, error) {
+type blockingResearchStageModel struct {
+	inner   fakeResearchStageModel
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+type recoveringResearchStageModel struct {
+	mu           sync.Mutex
+	calls        int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+}
+
+func (m *blockingResearchStageModel) Run(ctx context.Context, role ResearchModelRole, config BookTokenPlanConfig, messages []BookKnowledgeMessage, output any) (ResearchModelUsage, error) {
+	m.once.Do(func() { close(m.started) })
+	select {
+	case <-m.release:
+	case <-ctx.Done():
+		return ResearchModelUsage{}, ctx.Err()
+	}
+	return m.inner.Run(ctx, role, config, messages, output)
+}
+
+func (m *recoveringResearchStageModel) Run(ctx context.Context, _ ResearchModelRole, _ BookTokenPlanConfig, _ []BookKnowledgeMessage, output any) (ResearchModelUsage, error) {
+	m.mu.Lock()
+	m.calls++
+	call := m.calls
+	m.mu.Unlock()
+	if call == 1 {
+		close(m.firstStarted)
+		select {
+		case <-m.releaseFirst:
+		case <-ctx.Done():
+			return ResearchModelUsage{}, ctx.Err()
+		}
+	}
+	planner, ok := output.(*ResearchPlannerOutput)
+	if !ok {
+		return ResearchModelUsage{}, errors.New("unexpected recovery test output")
+	}
+	summary := "fresh-attempt"
+	if call == 1 {
+		summary = "stale-attempt"
+	}
+	*planner = ResearchPlannerOutput{DecisionSummary: summary, ToolCalls: []ResearchPlannedToolCall{{
+		Tool:      ResearchWorkerToolSearchChatlog,
+		Arguments: map[string]any{"talker_ref": "room-a", "time_from": "2032-01-01T00:00:00Z", "time_to": "2032-01-02T00:00:00Z", "limit": 2},
+	}}}
+	return ResearchModelUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15, CostUSD: 0.001}, nil
+}
+
+func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, config BookTokenPlanConfig, messages []BookKnowledgeMessage, output any) (ResearchModelUsage, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.calls == nil {
 		m.calls = map[ResearchModelRole]int{}
 	}
+	if m.models == nil {
+		m.models = map[ResearchModelRole][]string{}
+	}
 	m.calls[role]++
+	m.models[role] = append(m.models[role], config.Model)
 	if m.err != nil {
 		return ResearchModelUsage{}, m.err
 	}
@@ -31,6 +94,10 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 	conclusionIDs := sortedResearchReferenceIDs(messages, "conclusion")
 	switch value := output.(type) {
 	case *ResearchPlannerOutput:
+		if m.plannerOutput != nil {
+			*value = *m.plannerOutput
+			break
+		}
 		*value = ResearchPlannerOutput{
 			DecisionSummary: "Retrieve a bounded synthetic chat range",
 			ToolCalls: []ResearchPlannedToolCall{{
@@ -42,6 +109,10 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 			}},
 		}
 	case *ResearchExtractorOutput:
+		if m.extractorOutput != nil {
+			*value = *m.extractorOutput
+			break
+		}
 		if len(evidenceIDs) == 0 {
 			return ResearchModelUsage{}, errors.New("no evidence marker")
 		}
@@ -76,7 +147,11 @@ func (m *fakeResearchStageModel) Run(_ context.Context, role ResearchModelRole, 
 			value.Gaps = []string{"synthetic_gap"}
 		}
 	}
-	return ResearchModelUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}, nil
+	usage := m.usage
+	if usage == (ResearchModelUsage{}) {
+		usage = ResearchModelUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15}
+	}
+	return usage, nil
 }
 
 func (m *fakeResearchStageModel) callCount(role ResearchModelRole) int {
@@ -105,10 +180,38 @@ func TestResearchOrchestratorQuickPathCompletesWithGroundedPackageRetrieval(t *t
 	}
 }
 
+func TestResearchOrchestratorDeepKnowledgeSearchFetchesObservedMatches(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.plannerOutput = &ResearchPlannerOutput{
+		DecisionSummary: "Search the pinned knowledge package",
+		ToolCalls: []ResearchPlannedToolCall{{
+			Tool: ResearchToolSearchKnowledge, Arguments: map[string]any{"query": "grounded", "limit": 4},
+		}},
+	}
+	run := createResearchOrchestratorRun(t, research, pkg, "deep-knowledge-observation", ResearchModeDeep,
+		[]string{ResearchSourceKnowledge}, "grounded")
+	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 12)
+	evidence, err := research.ListEvidence(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.Status != ResearchCompleted || len(evidence) == 0 || evidence[0].SourceType != ResearchEvidenceSourceKnowledge {
+		t.Fatalf("result=%#v evidence=%#v", result, evidence)
+	}
+}
+
 func TestResearchOrchestratorDeepPathWaitsResumesAndSurvivesRestart(t *testing.T) {
 	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
 	run := createResearchOrchestratorRun(t, research, pkg, "deep-path", ResearchModeDeep,
 		[]string{ResearchSourceKnowledge, ResearchSourceChatlog}, "cross source history")
+	run.Budget.MaxEvidenceItems = 5
+	encodedBudget, err := json.Marshal(run.Budget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET budget_json = ? WHERE run_id = ?`, string(encodedBudget), run.RunID); err != nil {
+		t.Fatal(err)
+	}
 	first, err := orchestrator.Advance(context.Background(), run.RunID)
 	if err != nil {
 		t.Fatal(err)
@@ -128,13 +231,78 @@ func TestResearchOrchestratorDeepPathWaitsResumesAndSurvivesRestart(t *testing.T
 	if err != nil || job == nil {
 		t.Fatalf("claim job=%#v error=%v", job, err)
 	}
-	if _, err := research.CompleteWorkerJob(job.JobID, "chatlog-agent", job.RequestHash, ResearchWorkerResult{
+	if _, err := research.CompleteWorkerJob(job.JobID, "chatlog-agent", job.LeaseID, job.RequestHash, ResearchWorkerResult{
+		SearchedSources: []string{ResearchSourceChatlog},
+		Items: []ResearchWorkerEvidenceCandidate{{
+			SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+			Privacy: ResearchEvidencePrivacyPrivate, Selected: false, OccurredAt: "2026-08-13T08:01:00+08:00",
+			Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451", MessageRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451"},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fetchPlanned, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || fetchPlanned.WaitReason != ResearchWaitWorkerPending {
+		t.Fatalf("fetch planning result=%#v err=%v", fetchPlanned, err)
+	}
+	fetchJob, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+	if err != nil || fetchJob == nil || fetchJob.Tool != ResearchWorkerToolFetchChatMessage {
+		t.Fatalf("fetch job=%#v err=%v", fetchJob, err)
+	}
+	if _, err := research.CompleteWorkerJob(fetchJob.JobID, "chatlog-agent", fetchJob.LeaseID, fetchJob.RequestHash, ResearchWorkerResult{
 		SearchedSources: []string{ResearchSourceChatlog},
 		Items: []ResearchWorkerEvidenceCandidate{{
 			SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
 			Content: "Synthetic private history", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
-			Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: "room-a", MessageRef: "message-a"},
+			Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451", MessageRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451"},
 		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	expandPlanned, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || expandPlanned.WaitReason != ResearchWaitWorkerPending {
+		t.Fatalf("expand planning result=%#v err=%v", expandPlanned, err)
+	}
+	expandJob, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+	if err != nil || expandJob == nil || expandJob.Tool != ResearchWorkerToolExpandChatContext {
+		t.Fatalf("expand job=%#v err=%v", expandJob, err)
+	}
+	const (
+		beforeRef1 = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		beforeRef2 = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+		afterRef1  = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+		afterRef2  = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+	)
+	if _, err := research.CompleteWorkerJob(expandJob.JobID, "chatlog-agent", expandJob.LeaseID, expandJob.RequestHash, ResearchWorkerResult{
+		SearchedSources:    []string{ResearchSourceChatlog},
+		AnchorCandidateRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451",
+		Items: []ResearchWorkerEvidenceCandidate{
+			{
+				SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+				Content: "Synthetic context before one", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+				Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: beforeRef1, MessageRef: beforeRef1},
+			},
+			{
+				SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+				Content: "Synthetic context before two", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+				Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: beforeRef2, MessageRef: beforeRef2},
+			},
+			{
+				SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+				Content: "Synthetic private history", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+				Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451", MessageRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451"},
+			},
+			{
+				SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+				Content: "Synthetic context after one", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+				Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: afterRef1, MessageRef: afterRef1},
+			},
+			{
+				SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+				Content: "Synthetic context after two", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+				Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: afterRef2, MessageRef: afterRef2},
+			},
+		},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,6 +316,289 @@ func TestResearchOrchestratorDeepPathWaitsResumesAndSurvivesRestart(t *testing.T
 		model.callCount(ResearchRoleExtractor) != 1 || model.callCount(ResearchRoleSynthesizer) != 1 ||
 		model.callCount(ResearchRoleVerifier) != 1 {
 		t.Fatalf("deep result=%#v calls=%#v", result, model.calls)
+	}
+	evidence, err := research.ListEvidence(run.RunID)
+	if err != nil || len(evidence) != 5 {
+		t.Fatalf("expanded evidence=%#v err=%v", evidence, err)
+	}
+}
+
+func TestResearchOrchestratorSelectsStableBoundedChatlogCandidateWindows(t *testing.T) {
+	tests := []struct {
+		name          string
+		maxEvidence   int
+		wantSelected  int
+		verifyRestart bool
+	}{
+		{name: "more_than_eight_hits_are_bounded", maxEvidence: 100, wantSelected: 8},
+		{name: "tight_budget_keeps_complete_windows", maxEvidence: 10, wantSelected: 2, verifyRestart: true},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+			run := createResearchOrchestratorRun(t, research, pkg, "candidate-window-"+testCase.name,
+				ResearchModeDeep, []string{ResearchSourceChatlog}, "bounded history")
+			run.Budget.MaxEvidenceItems = testCase.maxEvidence
+			encodedBudget, err := json.Marshal(run.Budget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := research.db.Exec(`UPDATE research_runs SET budget_json = ? WHERE run_id = ?`, string(encodedBudget), run.RunID); err != nil {
+				t.Fatal(err)
+			}
+			arguments, err := json.Marshal(ResearchWorkerSearchChatlogArgs{
+				TimeFrom: "2026-08-13T00:00:00Z", TimeTo: "2026-08-14T00:00:00Z",
+				TalkerRef: "room-a", Limit: 20,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := research.CreateWorkerJob(ResearchWorkerJobInput{
+				RunID: run.RunID, TargetAgentID: "chatlog-agent", Tool: ResearchWorkerToolSearchChatlog,
+				Arguments: arguments, MaxAttempts: 3,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			searchJob, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+			if err != nil || searchJob == nil {
+				t.Fatalf("search job=%#v err=%v", searchJob, err)
+			}
+			items := make([]ResearchWorkerEvidenceCandidate, 0, 10)
+			for index := 0; index < 10; index++ {
+				candidateRef := fmt.Sprintf("sha256:%064x", index+1)
+				items = append(items, ResearchWorkerEvidenceCandidate{
+					SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+					Privacy: ResearchEvidencePrivacyPrivate, Selected: false,
+					OccurredAt: time.Date(2026, 8, 13, 8, index, 0, 0, time.UTC).Format(time.RFC3339),
+					Locator:    ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: candidateRef, MessageRef: candidateRef},
+				})
+			}
+			if _, err := research.CompleteWorkerJob(searchJob.JobID, "chatlog-agent", searchJob.LeaseID, searchJob.RequestHash,
+				ResearchWorkerResult{SearchedSources: []string{ResearchSourceChatlog}, Items: items}); err != nil {
+				t.Fatal(err)
+			}
+			jobs, err := orchestrator.listWorkerJobs(run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planned, err := orchestrator.planChatlogCandidateFetches(run, jobs, nil)
+			if err != nil || !planned {
+				t.Fatalf("planned=%v err=%v", planned, err)
+			}
+			jobs, err = orchestrator.listWorkerJobs(run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := []string{}
+			for _, job := range jobs {
+				if job.Tool != ResearchWorkerToolFetchChatMessage {
+					continue
+				}
+				var args ResearchWorkerFetchChatMessageArgs
+				if err := json.Unmarshal(job.Arguments, &args); err != nil {
+					t.Fatal(err)
+				}
+				selected = append(selected, args.MessageRef)
+			}
+			if len(selected) != testCase.wantSelected {
+				t.Fatalf("selected=%v want=%d", selected, testCase.wantSelected)
+			}
+			if !testCase.verifyRestart {
+				return
+			}
+			for range selected {
+				fetchJob, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+				if err != nil || fetchJob == nil || fetchJob.Tool != ResearchWorkerToolFetchChatMessage {
+					t.Fatalf("fetch job=%#v err=%v", fetchJob, err)
+				}
+				var args ResearchWorkerFetchChatMessageArgs
+				if err := json.Unmarshal(fetchJob.Arguments, &args); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := research.CompleteWorkerJob(fetchJob.JobID, "chatlog-agent", fetchJob.LeaseID, fetchJob.RequestHash,
+					ResearchWorkerResult{SearchedSources: []string{ResearchSourceChatlog}, Items: []ResearchWorkerEvidenceCandidate{{
+						SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+						Content: "selected " + args.MessageRef, Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
+						Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: args.MessageRef, MessageRef: args.MessageRef},
+					}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			restarted, err := NewResearchOrchestrator(orchestrator.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			jobs, err = restarted.listWorkerJobs(run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			evidence, err := research.ListEvidence(run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			planned, err = restarted.planChatlogCandidateFetches(run, jobs, evidence)
+			if err != nil || !planned {
+				t.Fatalf("restart planned=%v err=%v", planned, err)
+			}
+			jobs, err = restarted.listWorkerJobs(run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expanded := []string{}
+			for _, job := range jobs {
+				if job.Tool != ResearchWorkerToolExpandChatContext {
+					continue
+				}
+				var args ResearchWorkerExpandChatContextArgs
+				if err := json.Unmarshal(job.Arguments, &args); err != nil {
+					t.Fatal(err)
+				}
+				expanded = append(expanded, args.MessageRef)
+			}
+			if !sameResearchStringSet(selected, expanded) {
+				t.Fatalf("selected=%v expanded=%v", selected, expanded)
+			}
+		})
+	}
+}
+
+func TestResearchOrchestratorResolvesPersistedOpaqueIdentityBinding(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "opaque-binding-resolution", ResearchModeDeep,
+		[]string{ResearchSourceChatlog}, "resolve same person")
+	if _, err := research.db.Exec(`UPDATE research_runs SET status = ?, route_reasons_json = ? WHERE run_id = ?`,
+		ResearchResolvingIdentity, `["identity_resolution"]`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	const identityID = "chat-identity-5a01731f9d22d0e8243e4f3f5170b871"
+	if _, err := research.db.Exec(`INSERT INTO research_identity_bindings
+		(binding_id, run_id, identity_id, source_type, source_identity_hash, confidence, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, "binding-opaque", run.RunID, identityID, ResearchSourceChatlog,
+		"sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451", 1,
+		time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.Status != ResearchExtractingFacts || !sameResearchStringSet(result.Run.SubjectIDs, []string{identityID}) {
+		t.Fatalf("identity result=%#v", result)
+	}
+}
+
+func TestResearchOrchestratorBuildsGroundedTimelineInProductionStage(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "grounded-timeline-stage", ResearchModeDeep,
+		[]string{ResearchSourceChatlog}, "build timeline")
+	candidate := researchEvidenceTestCandidate("Grounded dated fact")
+	candidate.OccurredAt = "2032-01-01T09:00:00Z"
+	bundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
+		SearchedSources: []string{ResearchSourceChatlog}, Items: []ResearchWorkerEvidenceCandidate{candidate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.StoreEvidenceBundle(run.RunID, run.Version, bundle); err != nil {
+		t.Fatal(err)
+	}
+	if err := research.StoreResearchAnalysisRecords(run.RunID, []ResearchAnalysisRecord{{
+		RecordID: "fact-dated", Kind: ResearchAnalysisFact, Summary: "Dated grounded fact",
+		Attributes:         map[string]any{"fact_kind": "observation", "occurred_at": "2032-01-01T09:00:00Z"},
+		SupportEvidenceIDs: []string{bundle.Evidence[0].EvidenceID}, Confidence: 0.9, ReviewState: ResearchReviewVerified,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET status = ?, route_reasons_json = ? WHERE run_id = ?`,
+		ResearchBuildingTimeline, `["timeline_reconstruction"]`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	result, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records, err := research.ListResearchAnalysisRecords(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, record := range records {
+		if record.Kind == ResearchAnalysisTimelineEvent && record.Summary == "Dated grounded fact" {
+			found = true
+		}
+	}
+	if result.Run.Status != ResearchSynthesizing || !found {
+		t.Fatalf("result=%#v records=%#v", result, records)
+	}
+}
+
+func TestResearchOrchestratorClassifiesNumericTrendAndComparesCasesInProduction(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "trend-case-production", ResearchModeDeep,
+		[]string{ResearchSourceChatlog}, "compare cases and numeric trend")
+	candidate := researchEvidenceTestCandidate("Grounded measurements and case attributes")
+	bundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
+		SearchedSources: []string{ResearchSourceChatlog}, Items: []ResearchWorkerEvidenceCandidate{candidate},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.StoreEvidenceBundle(run.RunID, run.Version, bundle); err != nil {
+		t.Fatal(err)
+	}
+	evidenceID := bundle.Evidence[0].EvidenceID
+	model.extractorOutput = &ResearchExtractorOutput{
+		DecisionSummary: "Extract typed measurements and comparable cases",
+		Measurements: []ResearchMeasurement{
+			{MeasurementID: "ct-1", Name: "ct", Value: 24, OccurredAt: "2032-01-01T09:00:00Z", EvidenceIDs: []string{evidenceID}, Confidence: 0.9},
+			{MeasurementID: "ct-2", Name: "ct", Value: 25, OccurredAt: "2032-01-02T09:00:00Z", EvidenceIDs: []string{evidenceID}, Confidence: 0.9},
+			{MeasurementID: "ct-3", Name: "ct", Value: 18, OccurredAt: "2032-01-03T09:00:00Z", EvidenceIDs: []string{evidenceID}, Confidence: 0.9},
+		},
+		Cases: []ResearchCase{
+			{CaseID: "historical", Role: "historical", Age: 30, StageDay: 3, Symptoms: []string{"cough"}, RecoveryStatus: "recovered", EvidenceIDs: []string{evidenceID}},
+			{CaseID: "current", Role: "current", Age: 34, StageDay: 4, Symptoms: []string{"cough", "fever"}, RecoveryStatus: "active", EvidenceIDs: []string{evidenceID}},
+		},
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET status = ?, route_reasons_json = ? WHERE run_id = ?`,
+		ResearchExtractingFacts, `["case_comparison"]`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	extracted, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || extracted.Run.Status != ResearchComparingCases {
+		t.Fatalf("extracted=%#v err=%v", extracted, err)
+	}
+	compared, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || compared.Run.Status != ResearchSynthesizing {
+		t.Fatalf("compared=%#v err=%v", compared, err)
+	}
+	records, err := research.ListResearchAnalysisRecords(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trendFound, caseDifferenceFound := false, false
+	for _, record := range records {
+		if record.Kind == ResearchAnalysisMeasurement && researchStringAttribute(record.Attributes, "record_type") == "numeric_trend" {
+			trendFound = researchStringAttribute(record.Attributes, "direction") == ResearchTrendMixed &&
+				researchStringAttribute(record.Attributes, "net_direction") == ResearchTrendDown
+		}
+		if record.Kind == ResearchAnalysisCaseDifference {
+			caseDifferenceFound = true
+		}
+	}
+	if !trendFound || !caseDifferenceFound {
+		t.Fatalf("analysis records=%#v", records)
+	}
+	messages, err := orchestrator.stageMessages(compared.Run, "Synthesize deterministic analysis")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := ""
+	for _, message := range messages {
+		joined += message.Content + "\n"
+	}
+	if !strings.Contains(joined, "numeric_trend") || !strings.Contains(joined, "case_difference") ||
+		!strings.Contains(joined, ResearchTrendMixed) {
+		t.Fatalf("stage messages omitted deterministic analysis: %s", joined)
 	}
 }
 
@@ -229,12 +680,225 @@ func TestResearchOrchestratorModelInvocationIsDurablyIdempotent(t *testing.T) {
 		t.Fatalf("calls=%#v first=%#v second=%#v", model.calls, first, second)
 	}
 	var invocations, inputTokens, outputTokens int
-	if err := research.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0)
-		FROM research_model_invocations WHERE run_id = ?`, run.RunID).Scan(&invocations, &inputTokens, &outputTokens); err != nil {
+	var recordedCost float64
+	if err := research.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(estimated_cost_usd), 0)
+		FROM research_model_invocations WHERE run_id = ?`, run.RunID).Scan(&invocations, &inputTokens, &outputTokens, &recordedCost); err != nil {
 		t.Fatal(err)
 	}
-	if invocations != 1 || inputTokens != 10 || outputTokens != 5 {
-		t.Fatalf("invocations=%d input=%d output=%d", invocations, inputTokens, outputTokens)
+	if invocations != 1 || inputTokens != 10 || outputTokens != 5 || recordedCost <= 0 {
+		t.Fatalf("invocations=%d input=%d output=%d cost=%v", invocations, inputTokens, outputTokens, recordedCost)
+	}
+}
+
+func TestResearchOrchestratorAtomicallyReservesModelBudget(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	model := &blockingResearchStageModel{started: make(chan struct{}), release: make(chan struct{})}
+	orchestrator.config.Model = model
+	run := createResearchOrchestratorRun(t, research, pkg, "model-budget-reservation", ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
+	run.Budget.MaxCostUSD = 0.2225
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "Plan a bounded retrieval"}}
+	firstDone := make(chan error, 1)
+	go func() {
+		var output ResearchPlannerOutput
+		_, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "reservation:first", messages, &output)
+		firstDone <- err
+	}()
+	select {
+	case <-model.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first model call did not start")
+	}
+	var second ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "reservation:second", messages, &second); !errors.Is(err, ErrResearchBudgetExhausted) {
+		t.Fatalf("second reservation error=%v", err)
+	}
+	close(model.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first model call error=%v", err)
+	}
+}
+
+func TestResearchOrchestratorRetriesFailedModelInvocation(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "model-failed-retry", ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
+	model.err = errors.New("synthetic transient model failure")
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "Plan a bounded retrieval"}}
+	var first ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:retry", messages, &first); err == nil {
+		t.Fatal("first model attempt unexpectedly succeeded")
+	}
+	model.err = nil
+	var second ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:retry", messages, &second); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var attempt int
+	if err := research.db.QueryRow(`SELECT status, attempt FROM research_model_invocations WHERE run_id = ?`, run.RunID).Scan(&status, &attempt); err != nil {
+		t.Fatal(err)
+	}
+	if status != "completed" || attempt != 2 || model.callCount(ResearchRolePlanner) != 2 {
+		t.Fatalf("status=%q attempt=%d calls=%d", status, attempt, model.callCount(ResearchRolePlanner))
+	}
+	rows, err := research.db.Query(`SELECT attempt, status FROM research_model_invocation_attempts WHERE run_id = ? ORDER BY attempt`, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	statuses := []string{}
+	for rows.Next() {
+		var rowAttempt int
+		var rowStatus string
+		if err := rows.Scan(&rowAttempt, &rowStatus); err != nil {
+			t.Fatal(err)
+		}
+		statuses = append(statuses, fmt.Sprintf("%d:%s", rowAttempt, rowStatus))
+	}
+	if !sameResearchStringSet(statuses, []string{"1:failed", "2:completed"}) {
+		t.Fatalf("attempt statuses=%v", statuses)
+	}
+}
+
+func TestResearchOrchestratorRecoversOldEpochInvocationAndFencesStaleCompletion(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	model := &recoveringResearchStageModel{firstStarted: make(chan struct{}), releaseFirst: make(chan struct{})}
+	orchestrator.config.Model = model
+	run := createResearchOrchestratorRun(t, research, pkg, "model-crash-recovery", ResearchModeDeep, []string{ResearchSourceChatlog}, "history")
+	firstLease, err := research.ClaimRunnableRun("coordinator-old", time.Minute)
+	if err != nil || firstLease == nil || firstLease.RunID != run.RunID {
+		t.Fatalf("first lease=%#v err=%v", firstLease, err)
+	}
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "Plan a bounded retrieval"}}
+	firstDone := make(chan error, 1)
+	go func() {
+		var output ResearchPlannerOutput
+		_, invokeErr := orchestrator.invokeModel(context.Background(), *firstLease, ResearchRolePlanner, "planner:recover", messages, &output)
+		firstDone <- invokeErr
+	}()
+	select {
+	case <-model.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first model attempt did not start")
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET lease_expires_at = ? WHERE run_id = ?`,
+		time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	secondLease, err := research.ClaimRunnableRun("coordinator-new", time.Minute)
+	if err != nil || secondLease == nil || secondLease.LeaseEpoch == firstLease.LeaseEpoch {
+		t.Fatalf("second lease=%#v err=%v", secondLease, err)
+	}
+	var fresh ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), *secondLease, ResearchRolePlanner, "planner:recover", messages, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	close(model.releaseFirst)
+	if err := <-firstDone; !errors.Is(err, ErrResearchRunStaleLease) {
+		t.Fatalf("stale completion error=%v", err)
+	}
+	var replay ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), *secondLease, ResearchRolePlanner, "planner:recover", messages, &replay); err != nil {
+		t.Fatal(err)
+	}
+	var status, epoch string
+	var attempt int
+	if err := research.db.QueryRow(`SELECT status, attempt, lease_epoch FROM research_model_invocations WHERE run_id = ?`, run.RunID).Scan(&status, &attempt, &epoch); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.DecisionSummary != "fresh-attempt" || replay.DecisionSummary != "fresh-attempt" || status != "completed" || attempt != 2 || epoch != secondLease.LeaseEpoch {
+		t.Fatalf("fresh=%#v replay=%#v status=%q attempt=%d epoch=%q", fresh, replay, status, attempt, epoch)
+	}
+	rows, err := research.db.Query(`SELECT attempt, status FROM research_model_invocation_attempts WHERE run_id = ? ORDER BY attempt`, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	statuses := []string{}
+	for rows.Next() {
+		var rowAttempt int
+		var rowStatus string
+		if err := rows.Scan(&rowAttempt, &rowStatus); err != nil {
+			t.Fatal(err)
+		}
+		statuses = append(statuses, fmt.Sprintf("%d:%s", rowAttempt, rowStatus))
+	}
+	if !sameResearchStringSet(statuses, []string{"1:abandoned", "2:completed"}) {
+		t.Fatalf("attempt statuses=%v", statuses)
+	}
+}
+
+func TestResearchOrchestratorModelIdentityIncludesResolvedModel(t *testing.T) {
+	orchestrator, research, pkg, firstModel := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "model-provenance", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
+	messages := []BookKnowledgeMessage{{Role: "user", Content: "Plan bounded retrieval"}}
+	var first ResearchPlannerOutput
+	if _, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:provenance", messages, &first); err != nil {
+		t.Fatal(err)
+	}
+	if firstModel.callCount(ResearchRolePlanner) != 1 {
+		t.Fatalf("first model calls=%d", firstModel.callCount(ResearchRolePlanner))
+	}
+
+	secondModel := &fakeResearchStageModel{}
+	secondConfig := orchestrator.config
+	secondConfig.Model = secondModel
+	secondConfig.ModelConfig.Model = "qwen-max-second"
+	restarted, err := NewResearchOrchestrator(secondConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second ResearchPlannerOutput
+	if _, err := restarted.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:provenance", messages, &second); err != nil {
+		t.Fatal(err)
+	}
+	if secondModel.callCount(ResearchRolePlanner) != 1 {
+		t.Fatalf("changed model reused stale response; calls=%d", secondModel.callCount(ResearchRolePlanner))
+	}
+	rows, err := research.db.Query(`SELECT DISTINCT model FROM research_model_invocations WHERE run_id = ? ORDER BY model`, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	models := []string{}
+	for rows.Next() {
+		var model string
+		if err := rows.Scan(&model); err != nil {
+			t.Fatal(err)
+		}
+		models = append(models, model)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 || models[0] != "qwen-max-second" || models[1] != "qwen-plus" {
+		t.Fatalf("audited models=%v", models)
+	}
+}
+
+func TestResearchOrchestratorRejectsModelResultThatExhaustsCostBudget(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.usage = ResearchModelUsage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15, CostUSD: 0.75}
+	run := createResearchOrchestratorRun(t, research, pkg, "model-cost-budget", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
+	run.Budget.MaxCostUSD = 0.5
+	var output ResearchPlannerOutput
+	_, err := orchestrator.invokeModel(context.Background(), run, ResearchRolePlanner, "planner:cost", []BookKnowledgeMessage{{Role: "user", Content: "plan"}}, &output)
+	if !errors.Is(err, ErrResearchBudgetExhausted) {
+		t.Fatalf("cost budget error=%v", err)
+	}
+	var status string
+	var cost float64
+	if err := research.db.QueryRow(`SELECT status, estimated_cost_usd FROM research_model_invocations WHERE run_id = ?`, run.RunID).Scan(&status, &cost); err != nil {
+		t.Fatal(err)
+	}
+	if status != ResearchOutcomeBudgetExhausted || cost != 0.75 {
+		t.Fatalf("invocation status=%q cost=%v", status, cost)
+	}
+	var cached int
+	if err := research.db.QueryRow(`SELECT COUNT(1) FROM research_orchestrator_models WHERE run_id = ?`, run.RunID).Scan(&cached); err != nil {
+		t.Fatal(err)
+	}
+	if cached != 0 {
+		t.Fatalf("over-budget response was cached: %d", cached)
 	}
 }
 
@@ -243,10 +907,10 @@ func TestResearchOrchestratorKeepsRepeatedDraftIDsIsolatedByRun(t *testing.T) {
 	first := createResearchOrchestratorRun(t, research, pkg, "conclusion-scope-a", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
 	second := createResearchOrchestratorRun(t, research, pkg, "conclusion-scope-b", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
 	draft := []ResearchConclusionDraft{{ConclusionID: "model-local-id", Text: "Synthetic", SupportEvidenceIDs: []string{"evidence-a"}, Confidence: 0.9}}
-	if err := orchestrator.promoteVerifiedConclusions(first.RunID, draft); err != nil {
+	if err := orchestrator.promoteVerifiedConclusions(first, draft); err != nil {
 		t.Fatal(err)
 	}
-	if err := orchestrator.promoteVerifiedConclusions(second.RunID, draft); err != nil {
+	if err := orchestrator.promoteVerifiedConclusions(second, draft); err != nil {
 		t.Fatal(err)
 	}
 	firstItems, err := research.ListVerifiedResearchConclusions(first.RunID)
@@ -259,6 +923,108 @@ func TestResearchOrchestratorKeepsRepeatedDraftIDsIsolatedByRun(t *testing.T) {
 	}
 	if len(firstItems) != 1 || len(secondItems) != 1 || firstItems[0].ConclusionID == secondItems[0].ConclusionID {
 		t.Fatalf("first=%#v second=%#v", firstItems, secondItems)
+	}
+}
+
+func TestResearchOrchestratorPersistsVerifiedConclusionCitations(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "conclusion-citations", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
+	draft := []ResearchConclusionDraft{{
+		ConclusionID: "grounded-conclusion", Text: "Grounded", SupportEvidenceIDs: []string{"evidence-a"},
+		CitationIDs: []string{"citation-a"}, Confidence: 0.9,
+	}}
+	if err := orchestrator.promoteVerifiedConclusions(run, draft); err != nil {
+		t.Fatal(err)
+	}
+	items, err := research.ListVerifiedResearchConclusions(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || !sameResearchStringSet(items[0].CitationIDs, []string{"citation-a"}) {
+		t.Fatalf("verified conclusions = %#v", items)
+	}
+}
+
+func TestResearchOrchestratorRejectsWritesFromExpiredLeaseEpoch(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "stale-run-fence", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
+	first, err := research.ClaimRunnableRun("coordinator-a", time.Minute)
+	if err != nil || first == nil || first.RunID != run.RunID {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	if _, err := research.db.Exec(`UPDATE research_runs SET lease_expires_at = ? WHERE run_id = ?`, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano), run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	second, err := research.ClaimRunnableRun("coordinator-b", time.Minute)
+	if err != nil || second == nil || second.LeaseEpoch == first.LeaseEpoch {
+		t.Fatalf("second=%#v err=%v", second, err)
+	}
+	drafts := []ResearchConclusionDraft{{ConclusionID: "stale", Text: "must not persist", SupportEvidenceIDs: []string{"evidence-a"}, Confidence: 0.9}}
+	if err := orchestrator.promoteVerifiedConclusions(*first, drafts); !errors.Is(err, ErrResearchRunStaleLease) {
+		t.Fatalf("stale promotion error=%v", err)
+	}
+	var count int
+	if err := research.db.QueryRow(`SELECT COUNT(*) FROM research_conclusions WHERE run_id = ?`, run.RunID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("stale conclusions=%d err=%v", count, err)
+	}
+	if _, err := research.TransitionRunWithLease(run.RunID, run.Version, ResearchRetrieving,
+		ResearchTransition{Code: "stale", Actor: "coordinator-a"}, first.LeaseOwner, first.LeaseEpoch); !errors.Is(err, ErrResearchRunStaleLease) {
+		t.Fatalf("stale transition error=%v", err)
+	}
+	if _, err := research.TransitionRunWithLease(run.RunID, run.Version, ResearchRetrieving,
+		ResearchTransition{Code: "current", Actor: "coordinator-b"}, second.LeaseOwner, second.LeaseEpoch); err != nil {
+		t.Fatalf("current transition error=%v", err)
+	}
+}
+
+func TestResearchOrchestratorTerminalTransitionRollsBackMetadataAndEventTogether(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "terminal-transition-atomic", ResearchModeQuick, []string{ResearchSourceKnowledge}, "grounded")
+	claimed, err := research.ClaimRunnableRun("coordinator-atomic", time.Minute)
+	if err != nil || claimed == nil || claimed.RunID != run.RunID {
+		t.Fatalf("claimed=%#v err=%v", claimed, err)
+	}
+	if err := orchestrator.ensureState(*claimed); err != nil {
+		t.Fatal(err)
+	}
+	var eventsBefore int
+	if err := research.db.QueryRow(`SELECT COUNT(*) FROM research_events WHERE run_id = ?`, run.RunID).Scan(&eventsBefore); err != nil {
+		t.Fatal(err)
+	}
+	originalFault := researchOrchestratorTransitionFault
+	t.Cleanup(func() { researchOrchestratorTransitionFault = originalFault })
+	researchOrchestratorTransitionFault = func(point string) error {
+		if point == "before_event" {
+			return errors.New("synthetic transition fault")
+		}
+		return nil
+	}
+	if _, err := orchestrator.finish(*claimed, ResearchInsufficient, ResearchOutcomePartialEvidence); err == nil {
+		t.Fatal("terminal transition unexpectedly succeeded")
+	}
+	loaded, err := research.LoadRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcome string
+	if err := research.db.QueryRow(`SELECT last_outcome FROM research_orchestrator_state WHERE run_id = ?`, run.RunID).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	var eventsAfter int
+	if err := research.db.QueryRow(`SELECT COUNT(*) FROM research_events WHERE run_id = ?`, run.RunID).Scan(&eventsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != ResearchPlanning || loaded.Failure != nil || outcome != "" || eventsAfter != eventsBefore {
+		t.Fatalf("run=%#v outcome=%q events=%d/%d", loaded, outcome, eventsBefore, eventsAfter)
+	}
+
+	researchOrchestratorTransitionFault = originalFault
+	result, err := orchestrator.finish(*claimed, ResearchInsufficient, ResearchOutcomePartialEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.Status != ResearchInsufficient || result.Run.Failure == nil || result.Run.Failure.Code != ResearchOutcomePartialEvidence || result.Outcome != ResearchOutcomePartialEvidence {
+		t.Fatalf("terminal result=%#v", result)
 	}
 }
 
@@ -299,6 +1065,51 @@ func TestResearchOrchestratorCoordinatorAdvancesDurableRunsAndShutsDown(t *testi
 	defer shutdownCancel()
 	if err := coordinator.Shutdown(shutdownCtx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestResearchCoordinatorRenewsLeaseDuringLongAdvance(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	blocking := &blockingResearchStageModel{started: make(chan struct{}), release: make(chan struct{})}
+	orchestrator.config.Model = blocking
+	run := createResearchOrchestratorRun(t, research, pkg, "coordinator-renew", ResearchModeDeep, []string{ResearchSourceKnowledge}, "long planning")
+	coordinator, err := NewResearchCoordinator(ResearchCoordinatorConfig{
+		Store: research, Orchestrator: orchestrator, Workers: 1, QueueSize: 2, OwnerID: "coordinator-primary",
+		PollInterval: 10 * time.Millisecond, LeaseDuration: 120 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := coordinator.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocking.started:
+	case <-time.After(time.Second):
+		t.Fatal("long model call did not start")
+	}
+	time.Sleep(260 * time.Millisecond)
+	claimed, err := research.ClaimRunnableRun("coordinator-competitor", 120*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil {
+		t.Fatalf("competitor reclaimed active run=%s", claimed.RunID)
+	}
+	close(blocking.release)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	if err := coordinator.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := research.LoadRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.LeaseOwner != "" {
+		t.Fatalf("lease remained after worker completion: %#v", loaded)
 	}
 }
 

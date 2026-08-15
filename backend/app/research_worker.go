@@ -3,10 +3,12 @@ package app
 import (
 	"bytes"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 )
@@ -57,6 +59,7 @@ type ResearchWorkerJob struct {
 	Attempt           int             `json:"attempt"`
 	MaxAttempts       int             `json:"max_attempts"`
 	LeaseOwner        string          `json:"lease_owner,omitempty"`
+	LeaseID           string          `json:"lease_id,omitempty"`
 	LeaseExpiresAt    string          `json:"lease_expires_at,omitempty"`
 	RequestHash       string          `json:"request_hash"`
 	ResultFingerprint string          `json:"result_fingerprint,omitempty"`
@@ -101,7 +104,25 @@ type ResearchWorkerFetchChatMessageArgs struct {
 	Time            string `json:"time"`
 }
 
+type ResearchWorkerCandidate struct {
+	RunID        string `json:"run_id"`
+	JobID        string `json:"job_id"`
+	CandidateRef string `json:"candidate_ref"`
+	SourceType   string `json:"source_type"`
+	SourceRole   string `json:"source_role"`
+	OccurredAt   string `json:"occurred_at,omitempty"`
+	CreatedAt    string `json:"created_at"`
+}
+
 func (s *ResearchStore) CreateWorkerJob(input ResearchWorkerJobInput) (*ResearchWorkerJob, bool, error) {
+	return s.createWorkerJob(input, "", "", false)
+}
+
+func (s *ResearchStore) CreateWorkerJobWithLease(input ResearchWorkerJobInput, owner, epoch string) (*ResearchWorkerJob, bool, error) {
+	return s.createWorkerJob(input, owner, epoch, true)
+}
+
+func (s *ResearchStore) createWorkerJob(input ResearchWorkerJobInput, owner, epoch string, guarded bool) (*ResearchWorkerJob, bool, error) {
 	runID := strings.TrimSpace(input.RunID)
 	if runID == "" {
 		return nil, false, fmt.Errorf("run_id is required")
@@ -140,6 +161,11 @@ func (s *ResearchStore) CreateWorkerJob(input ResearchWorkerJobInput) (*Research
 	if isTerminalResearchStatus(run.Status) {
 		return nil, false, ErrResearchWorkerTerminal
 	}
+	if guarded {
+		if err := assertResearchRunLeaseTx(tx, run.RunID, owner, epoch, s.now()); err != nil {
+			return nil, false, err
+		}
+	}
 	var existingID string
 	err = tx.QueryRow(`SELECT job_id FROM research_worker_jobs WHERE run_id = ? AND request_hash = ?`, runID, requestHash).Scan(&existingID)
 	if err == nil {
@@ -157,9 +183,9 @@ func (s *ResearchStore) CreateWorkerJob(input ResearchWorkerJobInput) (*Research
 	}
 	_, err = tx.Exec(`INSERT INTO research_worker_jobs (
 		job_id, run_id, target_agent_id, tool, arguments_json, state, attempt, max_attempts,
-		lease_owner, lease_expires_at, request_hash, result_fingerprint, failure_code,
+		lease_owner, lease_id, lease_expires_at, request_hash, result_fingerprint, failure_code,
 		created_at, updated_at, completed_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, '', '', ?, ?, '')`,
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', '', ?, '', '', ?, ?, '')`,
 		job.JobID, job.RunID, job.TargetAgentID, job.Tool, string(job.Arguments), job.State, job.Attempt,
 		job.MaxAttempts, job.RequestHash, job.CreatedAt, job.UpdatedAt)
 	if err != nil {
@@ -209,9 +235,10 @@ func (s *ResearchStore) ClaimWorkerJob(agentID string, lease time.Duration) (*Re
 	nowTime := s.now().UTC()
 	now := nowTime.Format(time.RFC3339Nano)
 	expires := nowTime.Add(lease).Format(time.RFC3339Nano)
+	leaseID := newResearchWorkerLeaseID()
 	result, err := tx.Exec(`UPDATE research_worker_jobs SET state = ?, attempt = attempt + 1,
-		lease_owner = ?, lease_expires_at = ?, updated_at = ?, failure_code = ''
-		WHERE job_id = ? AND state = ?`, ResearchWorkerJobLeased, agentID, expires, now, job.JobID, ResearchWorkerJobQueued)
+		lease_owner = ?, lease_id = ?, lease_expires_at = ?, updated_at = ?, failure_code = ''
+		WHERE job_id = ? AND state = ?`, ResearchWorkerJobLeased, agentID, leaseID, expires, now, job.JobID, ResearchWorkerJobQueued)
 	if err != nil {
 		return nil, err
 	}
@@ -236,12 +263,13 @@ func (s *ResearchStore) ClaimWorkerJob(agentID string, lease time.Duration) (*Re
 	job.State = ResearchWorkerJobLeased
 	job.Attempt++
 	job.LeaseOwner = agentID
+	job.LeaseID = leaseID
 	job.LeaseExpiresAt = expires
 	job.UpdatedAt = now
 	return job, nil
 }
 
-func (s *ResearchStore) RenewWorkerJobLease(jobID, agentID string, lease time.Duration) error {
+func (s *ResearchStore) RenewWorkerJobLease(jobID, agentID, leaseID string, lease time.Duration) error {
 	agentID, err := normalizeSourceAgentName("agent_id", agentID, sourceAgentIDMaxRunes, false)
 	if err != nil {
 		return err
@@ -261,14 +289,29 @@ func (s *ResearchStore) RenewWorkerJobLease(jobID, agentID string, lease time.Du
 	if job.TargetAgentID != agentID || job.LeaseOwner != agentID {
 		return ErrResearchWorkerLeaseOwner
 	}
+	if strings.TrimSpace(leaseID) == "" || job.LeaseID != strings.TrimSpace(leaseID) {
+		return ErrResearchWorkerStaleResult
+	}
 	if job.State != ResearchWorkerJobLeased {
 		return ErrResearchWorkerTerminal
 	}
 	nowTime := s.now().UTC()
+	if researchWorkerLeaseExpired(job.LeaseExpiresAt, nowTime) {
+		return ErrResearchWorkerTerminal
+	}
 	now := nowTime.Format(time.RFC3339Nano)
 	expires := nowTime.Add(lease).Format(time.RFC3339Nano)
-	if _, err := tx.Exec(`UPDATE research_worker_jobs SET lease_expires_at = ?, updated_at = ? WHERE job_id = ?`, expires, now, job.JobID); err != nil {
+	updated, err := tx.Exec(`UPDATE research_worker_jobs SET lease_expires_at = ?, updated_at = ?
+		WHERE job_id = ? AND state = ? AND lease_owner = ? AND lease_id = ?`,
+		expires, now, job.JobID, ResearchWorkerJobLeased, agentID, leaseID)
+	if err != nil {
 		return err
+	}
+	if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return err
+		}
+		return ErrResearchWorkerStaleResult
 	}
 	run, err := loadResearchRun(tx, job.RunID)
 	if err != nil {
@@ -281,16 +324,11 @@ func (s *ResearchStore) RenewWorkerJobLease(jobID, agentID string, lease time.Du
 	return tx.Commit()
 }
 
-func (s *ResearchStore) CompleteWorkerJob(jobID, agentID, requestHash string, result ResearchWorkerResult) (*ResearchWorkerJob, error) {
+func (s *ResearchStore) CompleteWorkerJob(jobID, agentID, leaseID, requestHash string, result ResearchWorkerResult) (*ResearchWorkerJob, error) {
 	bundle, err := NormalizeResearchWorkerResult(result)
 	if err != nil {
 		return nil, err
 	}
-	encodedBundle, err := json.Marshal(bundle)
-	if err != nil {
-		return nil, err
-	}
-	resultFingerprint := researchEvidenceHash(encodedBundle)
 	agentID = strings.TrimSpace(agentID)
 	requestHash = strings.TrimSpace(requestHash)
 	tx, err := s.db.Begin()
@@ -304,6 +342,44 @@ func (s *ResearchStore) CompleteWorkerJob(jobID, agentID, requestHash string, re
 	}
 	if job.TargetAgentID != agentID || job.LeaseOwner != agentID {
 		return nil, ErrResearchWorkerLeaseOwner
+	}
+	if strings.TrimSpace(leaseID) == "" || job.LeaseID != strings.TrimSpace(leaseID) {
+		return nil, ErrResearchWorkerStaleResult
+	}
+	if requestHash == "" || requestHash != job.RequestHash {
+		return nil, ErrResearchWorkerStaleResult
+	}
+	if job.State != ResearchWorkerJobLeased && job.State != ResearchWorkerJobCompleted {
+		return nil, ErrResearchWorkerTerminal
+	}
+	if job.State == ResearchWorkerJobLeased && researchWorkerLeaseExpired(job.LeaseExpiresAt, s.now()) {
+		return nil, ErrResearchWorkerTerminal
+	}
+	candidates, err := normalizeResearchWorkerCandidates(job, result)
+	if err != nil {
+		return nil, err
+	}
+	identityCandidates, err := normalizeResearchWorkerIdentityCandidates(job, result.IdentityCandidates)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateResearchWorkerSelectedBoundaryTx(tx, job, result); err != nil {
+		return nil, err
+	}
+	encodedProjection, err := json.Marshal(struct {
+		Bundle             ResearchEvidenceBundle      `json:"bundle"`
+		Candidates         []ResearchWorkerCandidate   `json:"candidates"`
+		IdentityCandidates []ResearchIdentityCandidate `json:"identity_candidates"`
+	}{Bundle: bundle, Candidates: candidates, IdentityCandidates: identityCandidates})
+	if err != nil {
+		return nil, err
+	}
+	resultFingerprint := researchEvidenceHash(encodedProjection)
+	if job.TargetAgentID != agentID || job.LeaseOwner != agentID {
+		return nil, ErrResearchWorkerLeaseOwner
+	}
+	if strings.TrimSpace(leaseID) == "" || job.LeaseID != strings.TrimSpace(leaseID) {
+		return nil, ErrResearchWorkerStaleResult
 	}
 	if requestHash == "" || requestHash != job.RequestHash {
 		return nil, ErrResearchWorkerStaleResult
@@ -324,6 +400,28 @@ func (s *ResearchStore) CompleteWorkerJob(jobID, agentID, requestHash string, re
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	if err := storeResearchEvidenceBundleTx(tx, run, bundle, now); err != nil {
 		return nil, err
+	}
+	for _, candidate := range candidates {
+		if _, err := tx.Exec(`INSERT INTO research_worker_candidates
+			(run_id, job_id, candidate_ref, source_type, source_role, occurred_at, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(run_id, candidate_ref) DO UPDATE SET job_id = excluded.job_id,
+				source_type = excluded.source_type, source_role = excluded.source_role,
+				occurred_at = excluded.occurred_at`, run.RunID, job.JobID, candidate.CandidateRef,
+			candidate.SourceType, candidate.SourceRole, candidate.OccurredAt, now); err != nil {
+			return nil, err
+		}
+	}
+	for _, candidate := range identityCandidates {
+		bindingID := "research-binding-" + researchAnalysisID(run.RunID, candidate.IdentityID)
+		confidence := researchIdentityCandidateConfidence(candidate)
+		if _, err := tx.Exec(`INSERT INTO research_identity_bindings
+			(binding_id, run_id, identity_id, source_type, source_identity_hash, confidence, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(binding_id) DO UPDATE SET confidence = excluded.confidence`, bindingID, run.RunID,
+			candidate.IdentityID, ResearchSourceChatlog, researchEvidenceHash([]byte(candidate.IdentityID)), confidence, now); err != nil {
+			return nil, err
+		}
 	}
 	update, err := tx.Exec(`UPDATE research_worker_jobs SET state = ?, result_fingerprint = ?,
 		failure_code = '', updated_at = ?, completed_at = ? WHERE job_id = ? AND state = ?`,
@@ -353,7 +451,200 @@ func (s *ResearchStore) CompleteWorkerJob(jobID, agentID, requestHash string, re
 	return job, nil
 }
 
-func (s *ResearchStore) FailWorkerJob(jobID, agentID, requestHash, code string, retryable bool) (*ResearchWorkerJob, error) {
+func validateResearchWorkerSelectedBoundaryTx(tx *sql.Tx, job *ResearchWorkerJob, result ResearchWorkerResult) error {
+	if job == nil {
+		return ErrResearchWorkerJobNotFound
+	}
+	selected := make([]ResearchWorkerEvidenceCandidate, 0, len(result.Items))
+	for _, item := range result.Items {
+		if item.Selected {
+			selected = append(selected, item)
+		}
+	}
+	if job.Tool != ResearchWorkerToolFetchChatMessage && job.Tool != ResearchWorkerToolExpandChatContext {
+		if len(selected) != 0 || strings.TrimSpace(result.AnchorCandidateRef) != "" {
+			return fmt.Errorf("selected evidence is outside a candidate-bound fetch")
+		}
+		return nil
+	}
+	var anchorRef string
+	maxSelected := 1
+	switch job.Tool {
+	case ResearchWorkerToolFetchChatMessage:
+		var args ResearchWorkerFetchChatMessageArgs
+		if err := json.Unmarshal(job.Arguments, &args); err != nil {
+			return err
+		}
+		anchorRef = strings.TrimSpace(args.MessageRef)
+		if strings.TrimSpace(args.ConversationRef) != anchorRef || len(selected) != 1 {
+			return fmt.Errorf("fetch result does not match the requested candidate")
+		}
+	case ResearchWorkerToolExpandChatContext:
+		var args ResearchWorkerExpandChatContextArgs
+		if err := json.Unmarshal(job.Arguments, &args); err != nil {
+			return err
+		}
+		anchorRef = strings.TrimSpace(args.MessageRef)
+		maxSelected = args.Before + args.After + 1
+		if strings.TrimSpace(args.ConversationRef) != anchorRef || strings.TrimSpace(result.AnchorCandidateRef) != anchorRef || len(selected) == 0 || len(selected) > maxSelected {
+			return fmt.Errorf("expanded context is outside the server-issued candidate window")
+		}
+	}
+	if !validResearchOpaqueCandidateRef(anchorRef) {
+		return fmt.Errorf("candidate reference is not opaque")
+	}
+	var candidateCount int
+	err := tx.QueryRow(`SELECT COUNT(*) FROM research_worker_candidates c
+		JOIN research_worker_jobs source_job ON source_job.job_id = c.job_id
+		WHERE c.run_id = ? AND c.candidate_ref = ? AND c.source_type = ?
+			AND source_job.target_agent_id = ? AND source_job.tool = ?`,
+		job.RunID, anchorRef, ResearchEvidenceSourceChatlog, job.TargetAgentID, ResearchWorkerToolSearchChatlog).Scan(&candidateCount)
+	if err != nil {
+		return err
+	}
+	if candidateCount != 1 {
+		return fmt.Errorf("candidate does not belong to this run and worker")
+	}
+	anchorSeen := false
+	for _, item := range selected {
+		messageRef := strings.TrimSpace(item.Locator.MessageRef)
+		if item.SourceType != ResearchEvidenceSourceChatlog || item.Privacy != ResearchEvidencePrivacyPrivate ||
+			item.Locator.WorkerID != job.TargetAgentID || !validResearchOpaqueCandidateRef(messageRef) ||
+			strings.TrimSpace(item.Locator.ConversationRef) != messageRef {
+			return fmt.Errorf("selected evidence crosses the candidate boundary")
+		}
+		if messageRef == anchorRef {
+			anchorSeen = true
+		}
+		if job.Tool == ResearchWorkerToolFetchChatMessage && messageRef != anchorRef {
+			return fmt.Errorf("fetch result does not match the requested candidate")
+		}
+	}
+	if !anchorSeen {
+		return fmt.Errorf("selected evidence omits the requested candidate")
+	}
+	return nil
+}
+
+func normalizeResearchWorkerIdentityCandidates(job *ResearchWorkerJob, candidates []ResearchIdentityCandidate) ([]ResearchIdentityCandidate, error) {
+	if len(candidates) == 0 {
+		return []ResearchIdentityCandidate{}, nil
+	}
+	if job == nil || job.Tool != ResearchWorkerToolResolveChatIdentity || len(candidates) > researchModelArrayMax {
+		return nil, fmt.Errorf("identity candidates are outside the resolve-identity boundary")
+	}
+	result := make([]ResearchIdentityCandidate, 0, len(candidates))
+	seen := map[string]bool{}
+	for _, candidate := range candidates {
+		identityID := strings.TrimSpace(candidate.IdentityID)
+		if !strings.HasPrefix(identityID, "chat-identity-") || len(identityID) != len("chat-identity-")+32 ||
+			strings.TrimSpace(candidate.DisplayName) != "" || len(candidate.Aliases) != 0 ||
+			(candidate.AccountID != "" && candidate.AccountID != identityID) ||
+			(candidate.TargetAccountID != "" && candidate.TargetAccountID != identityID) {
+			return nil, fmt.Errorf("identity candidate crosses the private identity boundary")
+		}
+		if _, err := hex.DecodeString(strings.TrimPrefix(identityID, "chat-identity-")); err != nil {
+			return nil, fmt.Errorf("identity candidate is not opaque")
+		}
+		if seen[identityID] {
+			continue
+		}
+		seen[identityID] = true
+		candidate.IdentityID = identityID
+		result = append(result, candidate)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].IdentityID < result[j].IdentityID })
+	return result, nil
+}
+
+func researchIdentityCandidateConfidence(candidate ResearchIdentityCandidate) float64 {
+	if candidate.ConfirmedBinding || candidate.SelfIdentification ||
+		(candidate.AccountID != "" && candidate.AccountID == candidate.TargetAccountID) {
+		return 1
+	}
+	confidence := 0.4
+	for _, matched := range []bool{candidate.DisplayNameMatch, candidate.ContactMetadataMatch, candidate.GroupMembershipMatch, candidate.ConversationContinuity} {
+		if matched {
+			confidence += 0.1
+		}
+	}
+	if confidence > 0.9 {
+		confidence = 0.9
+	}
+	return confidence
+}
+
+func normalizeResearchWorkerCandidates(job *ResearchWorkerJob, result ResearchWorkerResult) ([]ResearchWorkerCandidate, error) {
+	if job == nil {
+		return nil, ErrResearchWorkerJobNotFound
+	}
+	candidates := []ResearchWorkerCandidate{}
+	for _, item := range result.Items {
+		if item.Selected {
+			if job.Tool == ResearchWorkerToolSearchChatlog {
+				return nil, fmt.Errorf("chatlog search cannot promote evidence directly")
+			}
+			continue
+		}
+		if job.Tool != ResearchWorkerToolSearchChatlog {
+			return nil, fmt.Errorf("only chatlog search can return discovery candidates")
+		}
+		candidateRef := strings.TrimSpace(item.Locator.MessageRef)
+		if item.SourceType != ResearchEvidenceSourceChatlog || item.Privacy != ResearchEvidencePrivacyPrivate ||
+			strings.TrimSpace(item.SourceRole) == "" || strings.TrimSpace(item.Content) != "" ||
+			strings.TrimSpace(item.AuthorIdentityID) != "" || len(item.SubjectIdentityIDs) != 0 ||
+			!validResearchOpaqueCandidateRef(candidateRef) || strings.TrimSpace(item.Locator.ConversationRef) != candidateRef ||
+			strings.TrimSpace(item.Locator.WorkerID) != job.TargetAgentID || item.Locator.ReleaseID != "" || item.Locator.PriorRunID != "" {
+			return nil, fmt.Errorf("chatlog search candidate crosses the private locator boundary")
+		}
+		occurredAt := strings.TrimSpace(item.OccurredAt)
+		if occurredAt != "" {
+			if _, err := time.Parse(time.RFC3339, occurredAt); err != nil {
+				return nil, fmt.Errorf("chatlog search candidate occurred_at is invalid")
+			}
+		}
+		candidates = append(candidates, ResearchWorkerCandidate{
+			RunID: job.RunID, JobID: job.JobID, CandidateRef: candidateRef,
+			SourceType: item.SourceType, SourceRole: item.SourceRole, OccurredAt: occurredAt,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].OccurredAt == candidates[j].OccurredAt {
+			return candidates[i].CandidateRef < candidates[j].CandidateRef
+		}
+		return candidates[i].OccurredAt < candidates[j].OccurredAt
+	})
+	return candidates, nil
+}
+
+func validResearchOpaqueCandidateRef(value string) bool {
+	value = strings.TrimSpace(value)
+	if !strings.HasPrefix(value, "sha256:") || len(value) != len("sha256:")+64 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, "sha256:"))
+	return err == nil
+}
+
+func (s *ResearchStore) ListResearchWorkerCandidates(runID string) ([]ResearchWorkerCandidate, error) {
+	rows, err := s.db.Query(`SELECT run_id, job_id, candidate_ref, source_type, source_role, occurred_at, created_at
+		FROM research_worker_candidates WHERE run_id = ? ORDER BY occurred_at ASC, candidate_ref ASC`, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []ResearchWorkerCandidate{}
+	for rows.Next() {
+		var item ResearchWorkerCandidate
+		if err := rows.Scan(&item.RunID, &item.JobID, &item.CandidateRef, &item.SourceType, &item.SourceRole, &item.OccurredAt, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (s *ResearchStore) FailWorkerJob(jobID, agentID, leaseID, requestHash, code string, retryable bool) (*ResearchWorkerJob, error) {
 	agentID = strings.TrimSpace(agentID)
 	requestHash = strings.TrimSpace(requestHash)
 	code = strings.TrimSpace(code)
@@ -369,16 +660,22 @@ func (s *ResearchStore) FailWorkerJob(jobID, agentID, requestHash, code string, 
 	if err != nil {
 		return nil, err
 	}
-	if job.TargetAgentID != agentID || job.LeaseOwner != agentID {
+	if job.TargetAgentID != agentID {
 		return nil, ErrResearchWorkerLeaseOwner
+	}
+	if strings.TrimSpace(leaseID) == "" || job.LeaseID != strings.TrimSpace(leaseID) {
+		return nil, ErrResearchWorkerStaleResult
 	}
 	if requestHash == "" || requestHash != job.RequestHash {
 		return nil, ErrResearchWorkerStaleResult
 	}
-	if job.State == ResearchWorkerJobFailed && job.FailureCode == code {
+	if (job.State == ResearchWorkerJobQueued || job.State == ResearchWorkerJobFailed) && job.FailureCode == code {
 		return job, nil
 	}
-	if job.State != ResearchWorkerJobLeased {
+	if job.LeaseOwner != agentID {
+		return nil, ErrResearchWorkerLeaseOwner
+	}
+	if job.State != ResearchWorkerJobLeased || researchWorkerLeaseExpired(job.LeaseExpiresAt, s.now()) {
 		return nil, ErrResearchWorkerTerminal
 	}
 	state := ResearchWorkerJobFailed
@@ -388,10 +685,18 @@ func (s *ResearchStore) FailWorkerJob(jobID, agentID, requestHash, code string, 
 		completedAt = ""
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	_, err = tx.Exec(`UPDATE research_worker_jobs SET state = ?, lease_owner = '', lease_expires_at = '',
-		failure_code = ?, updated_at = ?, completed_at = ? WHERE job_id = ?`, state, code, now, completedAt, job.JobID)
+	update, err := tx.Exec(`UPDATE research_worker_jobs SET state = ?, lease_owner = '', lease_expires_at = '',
+		failure_code = ?, updated_at = ?, completed_at = ? WHERE job_id = ? AND state = ? AND lease_owner = ? AND lease_id = ?`,
+		state, code, now, completedAt, job.JobID, ResearchWorkerJobLeased, agentID, leaseID)
 	if err != nil {
 		return nil, err
+	}
+	changed, err := update.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if changed != 1 {
+		return nil, ErrResearchWorkerStaleResult
 	}
 	run, err := loadResearchRun(tx, job.RunID)
 	if err != nil {
@@ -600,10 +905,10 @@ func loadResearchWorkerJob(queryer researchWorkerJobQuerier, jobID string) (*Res
 	var job ResearchWorkerJob
 	var arguments string
 	err := queryer.QueryRow(`SELECT job_id, run_id, target_agent_id, tool, arguments_json, state,
-		attempt, max_attempts, lease_owner, lease_expires_at, request_hash, result_fingerprint,
+		attempt, max_attempts, lease_owner, lease_id, lease_expires_at, request_hash, result_fingerprint,
 		failure_code, created_at, updated_at, completed_at FROM research_worker_jobs WHERE job_id = ?`, jobID).Scan(
 		&job.JobID, &job.RunID, &job.TargetAgentID, &job.Tool, &arguments, &job.State,
-		&job.Attempt, &job.MaxAttempts, &job.LeaseOwner, &job.LeaseExpiresAt, &job.RequestHash,
+		&job.Attempt, &job.MaxAttempts, &job.LeaseOwner, &job.LeaseID, &job.LeaseExpiresAt, &job.RequestHash,
 		&job.ResultFingerprint, &job.FailureCode, &job.CreatedAt, &job.UpdatedAt, &job.CompletedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrResearchWorkerJobNotFound
@@ -622,4 +927,8 @@ func researchWorkerLeaseExpired(value string, now time.Time) bool {
 
 func newResearchWorkerJobID() string {
 	return strings.Replace(newResearchRunID(), "research-run-", "research-job-", 1)
+}
+
+func newResearchWorkerLeaseID() string {
+	return strings.Replace(newResearchRunID(), "research-run-", "research-lease-", 1)
 }

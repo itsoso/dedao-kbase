@@ -11075,6 +11075,18 @@ function renderResearchEvidence(items) {
   return items.map((item) => `<article class="research-evidence-card"><header><span>${escapeHTML(item.source_role || "背景证据")}</span><time>${escapeHTML(item.occurred_at || "时间未知")}</time></header><p>${escapeHTML(item.content_excerpt || "摘录不可用")}</p><footer><span>${escapeHTML(item.source_type || "未知来源")}</span><span>${item.locator_available ? "可重新核验" : "定位信息未公开"}</span></footer></article>`).join("");
 }
 
+function renderResearchConclusionCitations(item) {
+  const citations = Array.isArray(item?.citations) ? item.citations : [];
+  if (!citations.length) return `<span class="research-report__citation-empty">无可公开引用</span>`;
+  return `<span class="research-report__citations">${citations.map((citation, index) => {
+    const label = `引用 ${index + 1}`;
+    const safeHref = citation?.available && typeof citation?.href === "string" && citation.href.startsWith("/api/citations/");
+    return safeHref
+      ? `<a href="${escapeAttribute(citation.href)}" target="_blank" rel="noopener">${label}</a>`
+      : `<span title="引用定位当前不可用">${label}</span>`;
+  }).join("")}</span>`;
+}
+
 function renderResearchTabPanel(detail, activeTab) {
   const records = Array.isArray(detail?.analysis_records) ? detail.analysis_records : [];
   if (activeTab === "timeline") {
@@ -11087,7 +11099,7 @@ function renderResearchTabPanel(detail, activeTab) {
   }
   if (activeTab === "report") {
     const conclusions = Array.isArray(detail?.conclusions) ? detail.conclusions : [];
-    return conclusions.length ? `<div class="research-report">${conclusions.map((item) => `<article><p>${escapeHTML(item.text || item.conclusion_text || "")}</p><footer>置信度 ${Math.round(Number(item.confidence || 0) * 100)}% · ${Array.isArray(item.evidence_ids) ? item.evidence_ids.length : 0} 条证据</footer></article>`).join("")}</div>` : `<div class="research-empty"><strong>研究报告尚未通过核验</strong><p>只有完成引用核验的结论才会进入最终报告；证据不足会明确保留。</p></div>`;
+    return conclusions.length ? `<div class="research-report">${conclusions.map((item) => `<article><p>${escapeHTML(item.text || item.conclusion_text || "")}</p><footer><span>置信度 ${Math.round(Number(item.confidence || 0) * 100)}% · ${Array.isArray(item.evidence_ids) ? item.evidence_ids.length : 0} 条证据</span>${renderResearchConclusionCitations(item)}</footer></article>`).join("")}</div>` : `<div class="research-empty"><strong>研究报告尚未通过核验</strong><p>只有完成引用核验的结论才会进入最终报告；证据不足会明确保留。</p></div>`;
   }
   return renderResearchEvidence(detail?.evidence);
 }

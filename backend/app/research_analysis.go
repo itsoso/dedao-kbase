@@ -122,12 +122,23 @@ type ResearchConflict struct {
 
 type ResearchCase struct {
 	CaseID         string             `json:"case_id"`
+	Role           string             `json:"role,omitempty"`
 	Age            int                `json:"age,omitempty"`
 	StageDay       int                `json:"stage_day,omitempty"`
 	Symptoms       []string           `json:"symptoms,omitempty"`
 	Measurements   map[string]float64 `json:"measurements,omitempty"`
 	RecoveryStatus string             `json:"recovery_status,omitempty"`
 	EvidenceIDs    []string           `json:"evidence_ids,omitempty"`
+}
+
+type ResearchMeasurement struct {
+	MeasurementID string   `json:"measurement_id"`
+	Name          string   `json:"name"`
+	Value         float64  `json:"value"`
+	OccurredAt    string   `json:"occurred_at"`
+	EvidenceIDs   []string `json:"evidence_ids"`
+	Confidence    float64  `json:"confidence"`
+	ReviewState   string   `json:"review_state,omitempty"`
 }
 
 type ResearchCaseDifference struct {
@@ -348,6 +359,14 @@ func CompareResearchCases(left, right ResearchCase) ResearchCaseComparison {
 }
 
 func (s *ResearchStore) StoreResearchAnalysisRecords(runID string, records []ResearchAnalysisRecord) error {
+	return s.storeResearchAnalysisRecords(runID, records, "", "")
+}
+
+func (s *ResearchStore) StoreResearchAnalysisRecordsWithLease(runID string, records []ResearchAnalysisRecord, owner, epoch string) error {
+	return s.storeResearchAnalysisRecords(runID, records, owner, epoch)
+}
+
+func (s *ResearchStore) storeResearchAnalysisRecords(runID string, records []ResearchAnalysisRecord, owner, epoch string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("research store is required")
 	}
@@ -362,6 +381,9 @@ func (s *ResearchStore) StoreResearchAnalysisRecords(runID string, records []Res
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, runID, owner, epoch, s.now()); err != nil {
+		return err
+	}
 	now := s.now().UTC().Format(timeRFC3339Nano)
 	for _, record := range records {
 		if err := validateResearchAnalysisRecord(tx, runID, record); err != nil {

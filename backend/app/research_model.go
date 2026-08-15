@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const (
@@ -47,9 +48,11 @@ type ResearchPlannerOutput struct {
 }
 
 type ResearchExtractorOutput struct {
-	DecisionSummary string          `json:"decision_summary"`
-	Facts           []ResearchFact  `json:"facts"`
-	Claims          []ResearchClaim `json:"claims"`
+	DecisionSummary string                `json:"decision_summary"`
+	Facts           []ResearchFact        `json:"facts"`
+	Claims          []ResearchClaim       `json:"claims"`
+	Measurements    []ResearchMeasurement `json:"measurements,omitempty"`
+	Cases           []ResearchCase        `json:"cases,omitempty"`
 }
 
 type ResearchConclusionDraft struct {
@@ -167,7 +170,8 @@ func validateResearchModelOutput(
 	case ResearchRoleExtractor:
 		value := output.(*ResearchExtractorOutput)
 		decisionSummary = value.DecisionSummary
-		if len(value.Facts) > researchModelArrayMax || len(value.Claims) > researchModelArrayMax {
+		if len(value.Facts) > researchModelArrayMax || len(value.Claims) > researchModelArrayMax ||
+			len(value.Measurements) > researchModelArrayMax || len(value.Cases) > researchModelArrayMax {
 			return fmt.Errorf("extractor array exceeds %d items", researchModelArrayMax)
 		}
 		for _, fact := range value.Facts {
@@ -177,6 +181,27 @@ func validateResearchModelOutput(
 		}
 		for _, claim := range value.Claims {
 			if err := requireResearchModelReferences(claim.EvidenceIDs, availableEvidence, "evidence"); err != nil {
+				return err
+			}
+		}
+		for _, measurement := range value.Measurements {
+			if strings.TrimSpace(measurement.MeasurementID) == "" || strings.TrimSpace(measurement.Name) == "" ||
+				strings.TrimSpace(measurement.OccurredAt) == "" || measurement.Confidence <= 0 || measurement.Confidence > 1 {
+				return fmt.Errorf("measurement id, name, occurred_at, and confidence are required")
+			}
+			if _, err := time.Parse(time.RFC3339, measurement.OccurredAt); err != nil {
+				return fmt.Errorf("measurement occurred_at must be RFC3339")
+			}
+			if err := requireResearchModelReferences(measurement.EvidenceIDs, availableEvidence, "evidence"); err != nil {
+				return err
+			}
+		}
+		for _, researchCase := range value.Cases {
+			if strings.TrimSpace(researchCase.CaseID) == "" ||
+				(researchCase.Role != "historical" && researchCase.Role != "current") || len(researchCase.EvidenceIDs) == 0 {
+				return fmt.Errorf("case id, historical/current role, and evidence are required")
+			}
+			if err := requireResearchModelReferences(researchCase.EvidenceIDs, availableEvidence, "evidence"); err != nil {
 				return err
 			}
 		}

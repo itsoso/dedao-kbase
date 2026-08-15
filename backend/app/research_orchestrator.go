@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,11 +29,13 @@ const (
 )
 
 var (
-	ErrResearchIdentityAmbiguous = errors.New(ResearchOutcomeIdentityAmbiguous)
-	ErrResearchZeroHit           = errors.New(ResearchOutcomeZeroHit)
-	ErrResearchPartialEvidence   = errors.New(ResearchOutcomePartialEvidence)
-	ErrResearchBudgetExhausted   = errors.New(ResearchOutcomeBudgetExhausted)
-	ErrResearchCitationMismatch  = errors.New(ResearchOutcomeCitationMismatch)
+	ErrResearchIdentityAmbiguous        = errors.New(ResearchOutcomeIdentityAmbiguous)
+	ErrResearchZeroHit                  = errors.New(ResearchOutcomeZeroHit)
+	ErrResearchPartialEvidence          = errors.New(ResearchOutcomePartialEvidence)
+	ErrResearchBudgetExhausted          = errors.New(ResearchOutcomeBudgetExhausted)
+	ErrResearchCitationMismatch         = errors.New(ResearchOutcomeCitationMismatch)
+	ErrResearchModelInProgress          = errors.New("research model invocation is already in progress")
+	researchOrchestratorTransitionFault = func(string) error { return nil }
 )
 
 type ResearchOrchestratorConfig struct {
@@ -41,6 +44,7 @@ type ResearchOrchestratorConfig struct {
 	Tools          *ResearchToolRegistry
 	Model          ResearchStageModel
 	ModelConfig    BookTokenPlanConfig
+	RoleModels     map[ResearchModelRole]string
 	WorkerAgentID  string
 }
 
@@ -55,6 +59,7 @@ type ResearchVerifiedConclusion struct {
 	RunID        string   `json:"run_id"`
 	Text         string   `json:"text"`
 	EvidenceIDs  []string `json:"evidence_ids"`
+	CitationIDs  []string `json:"citation_ids"`
 	Confidence   float64  `json:"confidence"`
 	CreatedAt    string   `json:"created_at"`
 }
@@ -67,6 +72,13 @@ type researchOrchestratorState struct {
 
 type ResearchOrchestrator struct {
 	config ResearchOrchestratorConfig
+}
+
+type researchRunLeaseContextKey struct{}
+
+type researchRunLeaseFence struct {
+	Owner string
+	Epoch string
 }
 
 func NewResearchOrchestrator(config ResearchOrchestratorConfig) (*ResearchOrchestrator, error) {
@@ -90,7 +102,13 @@ func (o *ResearchOrchestrator) Advance(ctx context.Context, runID string) (Resea
 	if isTerminalResearchStatus(run.Status) {
 		return o.terminalResult(*run), nil
 	}
-	if err := o.ensureState(run.RunID); err != nil {
+	fence, _ := ctx.Value(researchRunLeaseContextKey{}).(researchRunLeaseFence)
+	if run.LeaseOwner != "" || run.LeaseEpoch != "" {
+		if fence.Owner != run.LeaseOwner || fence.Epoch != run.LeaseEpoch || researchWorkerLeaseExpired(run.LeaseExpiresAt, o.config.ResearchStore.now()) {
+			return ResearchAdvanceResult{}, ErrResearchRunStaleLease
+		}
+	}
+	if err := o.ensureState(*run); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	var result ResearchAdvanceResult
@@ -102,13 +120,13 @@ func (o *ResearchOrchestrator) Advance(ctx context.Context, runID string) (Resea
 	case ResearchResolvingIdentity:
 		result, err = o.advanceIdentity(*run)
 	case ResearchBuildingTimeline:
-		result, err = o.transition(*run, ResearchExtractingFacts, "timeline_built")
+		result, err = o.advanceTimeline(*run)
 	case ResearchExtractingFacts:
 		result, err = o.advanceExtracting(ctx, *run)
 	case ResearchDetectingConflicts:
 		result, err = o.advanceConflicts(*run)
 	case ResearchComparingCases:
-		result, err = o.transition(*run, ResearchSynthesizing, "cases_compared")
+		result, err = o.advanceCases(*run)
 	case ResearchSynthesizing:
 		result, err = o.advanceSynthesizing(ctx, *run)
 	case ResearchVerifying:
@@ -138,7 +156,7 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 	if run.Mode == ResearchModeQuick {
 		return o.transition(run, ResearchRetrieving, "quick_retrieval_planned")
 	}
-	state, err := o.loadState(run.RunID)
+	state, err := o.loadState(run)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
@@ -156,10 +174,10 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 			if err != nil {
 				return ResearchAdvanceResult{}, err
 			}
-			if _, _, err := o.config.ResearchStore.CreateWorkerJob(ResearchWorkerJobInput{
+			if _, _, err := o.config.ResearchStore.CreateWorkerJobWithLease(ResearchWorkerJobInput{
 				RunID: run.RunID, TargetAgentID: o.config.WorkerAgentID, Tool: call.Tool,
 				Arguments: arguments, MaxAttempts: 3,
-			}); err != nil {
+			}, run.LeaseOwner, run.LeaseEpoch); err != nil {
 				return ResearchAdvanceResult{}, err
 			}
 			continue
@@ -170,7 +188,23 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 		if err != nil {
 			return ResearchAdvanceResult{}, err
 		}
-		if err := o.storePromotedEvidence(run.RunID, toolResult.PromotedEvidence); err != nil {
+		promoted := append([]ResearchEvidence(nil), toolResult.PromotedEvidence...)
+		if call.Tool == ResearchToolSearchKnowledge {
+			for _, item := range toolResult.Knowledge {
+				if len(item.CitationIDs) == 0 || len(promoted) >= run.Budget.MaxEvidenceItems {
+					continue
+				}
+				fetched, err := o.config.Tools.Execute(ctx, ResearchToolFetchKnowledgeEvidence, ResearchToolRequest{
+					RunID: run.RunID, PackageID: run.PackageID, PackageVersion: run.PackageVersion,
+					Arguments: map[string]any{"release_id": item.ReleaseID, "claim_id": item.ClaimID, "citation_id": item.CitationIDs[0]},
+				})
+				if err != nil {
+					return ResearchAdvanceResult{}, err
+				}
+				promoted = append(promoted, fetched.PromotedEvidence...)
+			}
+		}
+		if err := o.storePromotedEvidence(run, promoted); err != nil {
 			return ResearchAdvanceResult{}, err
 		}
 	}
@@ -218,7 +252,7 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 			if len(promoted) == 0 {
 				return ResearchAdvanceResult{}, ErrResearchZeroHit
 			}
-			if err := o.storePromotedEvidence(run.RunID, promoted); err != nil {
+			if err := o.storePromotedEvidence(run, promoted); err != nil {
 				return ResearchAdvanceResult{}, err
 			}
 		}
@@ -247,6 +281,13 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
+	planned, err := o.planChatlogCandidateFetches(run, jobs, evidence)
+	if err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	if planned {
+		return o.wait(run, ResearchWaitWorkerPending)
+	}
 	if len(evidence) == 0 {
 		return ResearchAdvanceResult{}, ErrResearchZeroHit
 	}
@@ -257,23 +298,239 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 	return o.transition(run, next, "deep_evidence_retrieved")
 }
 
-func (o *ResearchOrchestrator) advanceIdentity(run ResearchRun) (ResearchAdvanceResult, error) {
-	if len(run.SubjectIDs) == 0 {
-		return ResearchAdvanceResult{}, ErrResearchIdentityAmbiguous
+func (o *ResearchOrchestrator) planChatlogCandidateFetches(run ResearchRun, jobs []ResearchWorkerJob, evidence []ResearchEvidence) (bool, error) {
+	candidates, err := o.config.ResearchStore.ListResearchWorkerCandidates(run.RunID)
+	if err != nil || len(candidates) == 0 {
+		return false, err
 	}
-	next := ResearchExtractingFacts
-	if containsResearchString(run.RouteReasons, ResearchRouteTimeline) {
-		next = ResearchBuildingTimeline
+	fetchedEvidence := map[string]bool{}
+	for _, item := range evidence {
+		if item.SourceType == ResearchEvidenceSourceChatlog {
+			fetchedEvidence[strings.TrimSpace(item.Locator.MessageRef)] = true
+		}
 	}
-	return o.transition(run, next, "identity_resolved")
+	fetchRequested := map[string]bool{}
+	fetchCompleted := map[string]bool{}
+	expandRequested := map[string]bool{}
+	for _, job := range jobs {
+		switch job.Tool {
+		case ResearchWorkerToolFetchChatMessage:
+			var arguments ResearchWorkerFetchChatMessageArgs
+			if json.Unmarshal(job.Arguments, &arguments) == nil {
+				anchor := strings.TrimSpace(arguments.MessageRef)
+				fetchRequested[anchor] = true
+				if job.State == ResearchWorkerJobCompleted {
+					fetchCompleted[anchor] = true
+				}
+			}
+		case ResearchWorkerToolExpandChatContext:
+			var arguments ResearchWorkerExpandChatContextArgs
+			if json.Unmarshal(job.Arguments, &arguments) == nil {
+				expandRequested[strings.TrimSpace(arguments.MessageRef)] = true
+			}
+		}
+	}
+	const contextRadius = 2
+	const evidencePerCandidate = 1 + contextRadius*2
+	remainingEvidence := run.Budget.MaxEvidenceItems - len(evidence)
+	selectedCandidates := make([]ResearchWorkerCandidate, 0, researchToolDefaultLimit)
+	if len(fetchRequested) == 0 {
+		selectionLimit := remainingEvidence / evidencePerCandidate
+		if selectionLimit > researchToolDefaultLimit {
+			selectionLimit = researchToolDefaultLimit
+		}
+		if selectionLimit <= 0 {
+			return false, ErrResearchBudgetExhausted
+		}
+		if selectionLimit > len(candidates) {
+			selectionLimit = len(candidates)
+		}
+		selectedCandidates = append(selectedCandidates, candidates[:selectionLimit]...)
+		created := false
+		for _, candidate := range selectedCandidates {
+			occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
+			if err != nil {
+				return false, fmt.Errorf("invalid persisted Chatlog candidate time: %w", err)
+			}
+			arguments, err := json.Marshal(ResearchWorkerFetchChatMessageArgs{
+				MessageRef: candidate.CandidateRef, ConversationRef: candidate.CandidateRef,
+				Time: occurredAt.Format("2006-01-02"),
+			})
+			if err != nil {
+				return false, err
+			}
+			_, wasCreated, err := o.config.ResearchStore.CreateWorkerJobWithLease(ResearchWorkerJobInput{
+				RunID: run.RunID, TargetAgentID: o.config.WorkerAgentID, Tool: ResearchWorkerToolFetchChatMessage,
+				Arguments: arguments, MaxAttempts: 3,
+			}, run.LeaseOwner, run.LeaseEpoch)
+			if err != nil {
+				return false, err
+			}
+			created = created || wasCreated
+		}
+		return created, nil
+	}
+
+	for _, candidate := range candidates {
+		if fetchRequested[candidate.CandidateRef] {
+			selectedCandidates = append(selectedCandidates, candidate)
+		}
+	}
+	if len(selectedCandidates) != len(fetchRequested) || len(selectedCandidates) > researchToolDefaultLimit {
+		return false, ErrResearchWorkerTerminal
+	}
+	for _, candidate := range selectedCandidates {
+		if !fetchCompleted[candidate.CandidateRef] || !fetchedEvidence[candidate.CandidateRef] {
+			return false, ErrResearchWorkerTerminal
+		}
+	}
+
+	created := false
+	for _, candidate := range selectedCandidates {
+		if expandRequested[candidate.CandidateRef] {
+			continue
+		}
+		if remainingEvidence < contextRadius*2 {
+			return false, ErrResearchBudgetExhausted
+		}
+		occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
+		if err != nil {
+			return false, fmt.Errorf("invalid persisted Chatlog candidate time: %w", err)
+		}
+		arguments, err := json.Marshal(ResearchWorkerExpandChatContextArgs{
+			MessageRef: candidate.CandidateRef, ConversationRef: candidate.CandidateRef,
+			Time: occurredAt.Format("2006-01-02"), Before: contextRadius, After: contextRadius,
+		})
+		if err != nil {
+			return false, err
+		}
+		_, wasCreated, err := o.config.ResearchStore.CreateWorkerJobWithLease(ResearchWorkerJobInput{
+			RunID: run.RunID, TargetAgentID: o.config.WorkerAgentID, Tool: ResearchWorkerToolExpandChatContext,
+			Arguments: arguments, MaxAttempts: 3,
+		}, run.LeaseOwner, run.LeaseEpoch)
+		if err != nil {
+			return false, err
+		}
+		created = created || wasCreated
+		expandRequested[candidate.CandidateRef] = true
+		remainingEvidence -= contextRadius * 2
+	}
+	return created, nil
 }
 
-func (o *ResearchOrchestrator) advanceExtracting(ctx context.Context, run ResearchRun) (ResearchAdvanceResult, error) {
-	state, err := o.loadState(run.RunID)
+func (o *ResearchOrchestrator) advanceIdentity(run ResearchRun) (ResearchAdvanceResult, error) {
+	if len(run.SubjectIDs) == 0 {
+		rows, err := o.config.ResearchStore.db.Query(`SELECT identity_id, confidence
+			FROM research_identity_bindings WHERE run_id = ? ORDER BY binding_id`, run.RunID)
+		if err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		candidates := []ResearchIdentityCandidate{}
+		for rows.Next() {
+			var identityID string
+			var confidence float64
+			if err := rows.Scan(&identityID, &confidence); err != nil {
+				_ = rows.Close()
+				return ResearchAdvanceResult{}, err
+			}
+			candidates = append(candidates, ResearchIdentityCandidate{
+				IdentityID: identityID, ConfirmedBinding: confidence >= 1,
+			})
+		}
+		if err := rows.Close(); err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		decision := ResolveResearchIdentity(candidates)
+		if decision.Status != ResearchIdentityResolved || strings.TrimSpace(decision.IdentityID) == "" {
+			return ResearchAdvanceResult{}, ErrResearchIdentityAmbiguous
+		}
+		subjectJSON, err := json.Marshal([]string{decision.IdentityID})
+		if err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		tx, err := o.config.ResearchStore.db.Begin()
+		if err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		result, err := tx.Exec(`UPDATE research_runs SET subject_ids_json = ?, version = version + 1,
+			updated_at = ? WHERE run_id = ? AND version = ? AND lease_owner = ? AND lease_epoch = ?`, string(subjectJSON),
+			o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano), run.RunID, run.Version, run.LeaseOwner, run.LeaseEpoch)
+		if err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil || changed != 1 {
+			return ResearchAdvanceResult{}, ErrResearchRunVersionConflict
+		}
+		if err := tx.Commit(); err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		loaded, err := o.config.ResearchStore.LoadRun(run.RunID)
+		if err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		run = *loaded
+	}
+	return o.transition(run, ResearchExtractingFacts, "identity_resolved")
+}
+
+func (o *ResearchOrchestrator) advanceTimeline(run ResearchRun) (ResearchAdvanceResult, error) {
+	evidence, err := o.config.ResearchStore.ListEvidence(run.RunID)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
-	messages, err := o.stageMessages(run, "Extract only grounded facts and claims.")
+	records, err := o.config.ResearchStore.ListResearchAnalysisRecords(run.RunID)
+	if err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	facts := []ResearchFact{}
+	for _, record := range records {
+		factKind := researchStringAttribute(record.Attributes, "fact_kind")
+		if record.Kind != ResearchAnalysisFact || factKind == "" {
+			continue
+		}
+		facts = append(facts, ResearchFact{
+			FactID: record.RecordID, Kind: factKind, Summary: record.Summary,
+			Status:      researchStringAttribute(record.Attributes, "status"),
+			OccurredAt:  researchStringAttribute(record.Attributes, "occurred_at"),
+			EvidenceIDs: append([]string(nil), record.SupportEvidenceIDs...),
+			Confidence:  record.Confidence, ReviewState: record.ReviewState,
+		})
+	}
+	timeline := BuildResearchTimeline(evidence, facts)
+	analysis := make([]ResearchAnalysisRecord, 0, len(timeline))
+	for _, event := range timeline {
+		analysis = append(analysis, ResearchAnalysisRecord{
+			RecordID: event.TimelineEventID, Kind: ResearchAnalysisTimelineEvent, Summary: event.Summary,
+			Attributes:         map[string]any{"fact_id": event.FactID, "status": event.Status, "occurred_at": event.OccurredAt},
+			SupportEvidenceIDs: event.EvidenceIDs, Confidence: defaultResearchConfidence(event.Confidence),
+			ReviewState: defaultResearchReviewState(event.ReviewState),
+		})
+	}
+	if len(analysis) > 0 {
+		if err := o.config.ResearchStore.StoreResearchAnalysisRecordsWithLease(run.RunID, analysis, run.LeaseOwner, run.LeaseEpoch); err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+	}
+	next := ResearchSynthesizing
+	if containsResearchString(run.RouteReasons, ResearchRouteConflict) {
+		next = ResearchDetectingConflicts
+	} else if containsResearchString(run.RouteReasons, ResearchRouteCaseComparison) {
+		next = ResearchComparingCases
+	}
+	return o.transition(run, next, "timeline_built")
+}
+
+func (o *ResearchOrchestrator) advanceExtracting(ctx context.Context, run ResearchRun) (ResearchAdvanceResult, error) {
+	state, err := o.loadState(run)
+	if err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	messages, err := o.stageMessages(run, "Extract only grounded facts, claims, numeric measurements, and historical/current cases. Every item must cite evidence IDs.")
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
@@ -281,7 +538,7 @@ func (o *ResearchOrchestrator) advanceExtracting(ctx context.Context, run Resear
 	if _, err := o.invokeModel(ctx, run, ResearchRoleExtractor, fmt.Sprintf("extractor:%d", state.Iteration), messages, &output); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
-	records := make([]ResearchAnalysisRecord, 0, len(output.Facts)+len(output.Claims))
+	records := make([]ResearchAnalysisRecord, 0, len(output.Facts)+len(output.Claims)+len(output.Measurements)+len(output.Cases))
 	for _, fact := range output.Facts {
 		records = append(records, ResearchAnalysisRecord{
 			RecordID: fact.FactID, Kind: ResearchAnalysisFact, Summary: fact.Summary,
@@ -298,18 +555,185 @@ func (o *ResearchOrchestrator) advanceExtracting(ctx context.Context, run Resear
 			ReviewState: defaultResearchReviewState(claim.ReviewState),
 		})
 	}
+	for _, measurement := range output.Measurements {
+		records = append(records, ResearchAnalysisRecord{
+			RecordID: measurement.MeasurementID, Kind: ResearchAnalysisMeasurement,
+			Summary: fmt.Sprintf("%s=%g", measurement.Name, measurement.Value),
+			Attributes: map[string]any{"record_type": "measurement", "measurement_name": measurement.Name,
+				"value": measurement.Value, "occurred_at": measurement.OccurredAt},
+			SupportEvidenceIDs: measurement.EvidenceIDs, Confidence: defaultResearchConfidence(measurement.Confidence),
+			ReviewState: defaultResearchReviewState(measurement.ReviewState),
+		})
+	}
+	for _, researchCase := range output.Cases {
+		records = append(records, ResearchAnalysisRecord{
+			RecordID: researchCase.CaseID, Kind: ResearchAnalysisFact, Summary: "Research case " + researchCase.CaseID,
+			Attributes: map[string]any{"record_type": "case", "case_role": researchCase.Role, "age": researchCase.Age,
+				"stage_day": researchCase.StageDay, "symptoms": researchCase.Symptoms,
+				"measurements": researchCase.Measurements, "recovery_status": researchCase.RecoveryStatus},
+			SupportEvidenceIDs: researchCase.EvidenceIDs, Confidence: 1, ReviewState: ResearchReviewPending,
+		})
+	}
 	if len(records) > 0 {
-		if err := o.config.ResearchStore.StoreResearchAnalysisRecords(run.RunID, records); err != nil {
+		if err := o.config.ResearchStore.StoreResearchAnalysisRecordsWithLease(run.RunID, records, run.LeaseOwner, run.LeaseEpoch); err != nil {
 			return ResearchAdvanceResult{}, err
 		}
 	}
+	if err := o.storeResearchNumericTrends(run, output.Measurements); err != nil {
+		return ResearchAdvanceResult{}, err
+	}
 	next := ResearchSynthesizing
-	if containsResearchString(run.RouteReasons, ResearchRouteConflict) {
+	if containsResearchString(run.RouteReasons, ResearchRouteTimeline) {
+		next = ResearchBuildingTimeline
+	} else if containsResearchString(run.RouteReasons, ResearchRouteConflict) {
 		next = ResearchDetectingConflicts
 	} else if containsResearchString(run.RouteReasons, ResearchRouteCaseComparison) {
 		next = ResearchComparingCases
 	}
 	return o.transition(run, next, "facts_extracted")
+}
+
+func (o *ResearchOrchestrator) storeResearchNumericTrends(run ResearchRun, measurements []ResearchMeasurement) error {
+	grouped := map[string][]ResearchMeasurement{}
+	for _, measurement := range measurements {
+		name := strings.TrimSpace(measurement.Name)
+		grouped[name] = append(grouped[name], measurement)
+	}
+	names := make([]string, 0, len(grouped))
+	for name := range grouped {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	records := []ResearchAnalysisRecord{}
+	for _, name := range names {
+		series := grouped[name]
+		if len(series) < 2 {
+			continue
+		}
+		sort.Slice(series, func(i, j int) bool {
+			if series[i].OccurredAt == series[j].OccurredAt {
+				return series[i].MeasurementID < series[j].MeasurementID
+			}
+			return series[i].OccurredAt < series[j].OccurredAt
+		})
+		values := make([]float64, 0, len(series))
+		evidenceIDs := []string{}
+		confidence := 1.0
+		for _, measurement := range series {
+			values = append(values, measurement.Value)
+			evidenceIDs = append(evidenceIDs, measurement.EvidenceIDs...)
+			if measurement.Confidence < confidence {
+				confidence = measurement.Confidence
+			}
+		}
+		trend := ClassifyResearchNumericTrend(values)
+		records = append(records, ResearchAnalysisRecord{
+			RecordID: "trend-" + researchAnalysisID(run.RunID, name), Kind: ResearchAnalysisMeasurement,
+			Summary: fmt.Sprintf("%s trend is %s (net %s)", name, trend.Direction, trend.NetDirection),
+			Attributes: map[string]any{"record_type": "numeric_trend", "measurement_name": name,
+				"direction": trend.Direction, "net_direction": trend.NetDirection, "delta": trend.Delta,
+				"increases": trend.Increases, "decreases": trend.Decreases, "unchanged": trend.Unchanged},
+			SupportEvidenceIDs: uniqueSortedResearchStrings(evidenceIDs), Confidence: defaultResearchConfidence(confidence),
+			ReviewState: ResearchReviewPending,
+		})
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	return o.config.ResearchStore.StoreResearchAnalysisRecordsWithLease(run.RunID, records, run.LeaseOwner, run.LeaseEpoch)
+}
+
+func (o *ResearchOrchestrator) advanceCases(run ResearchRun) (ResearchAdvanceResult, error) {
+	records, err := o.config.ResearchStore.ListResearchAnalysisRecords(run.RunID)
+	if err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	cases := []ResearchCase{}
+	for _, record := range records {
+		if researchStringAttribute(record.Attributes, "record_type") != "case" {
+			continue
+		}
+		cases = append(cases, ResearchCase{
+			CaseID: record.RecordID, Role: researchStringAttribute(record.Attributes, "case_role"),
+			Age: researchIntAttribute(record.Attributes, "age"), StageDay: researchIntAttribute(record.Attributes, "stage_day"),
+			Symptoms:       researchStringSliceAttribute(record.Attributes, "symptoms"),
+			Measurements:   researchFloatMapAttribute(record.Attributes, "measurements"),
+			RecoveryStatus: researchStringAttribute(record.Attributes, "recovery_status"),
+			EvidenceIDs:    append([]string(nil), record.SupportEvidenceIDs...),
+		})
+	}
+	sort.Slice(cases, func(i, j int) bool {
+		if cases[i].Role == cases[j].Role {
+			return cases[i].CaseID < cases[j].CaseID
+		}
+		return cases[i].Role == "historical"
+	})
+	if len(cases) >= 2 {
+		comparison := CompareResearchCases(cases[0], cases[1])
+		support := uniqueSortedResearchStrings(append(append([]string{}, cases[0].EvidenceIDs...), cases[1].EvidenceIDs...))
+		differences := make([]ResearchAnalysisRecord, 0, len(comparison.MaterialDifferences))
+		for _, difference := range comparison.MaterialDifferences {
+			differences = append(differences, ResearchAnalysisRecord{
+				RecordID: "case-difference-" + researchAnalysisID(comparison.LeftCaseID, comparison.RightCaseID, difference.Dimension),
+				Kind:     ResearchAnalysisCaseDifference, Summary: fmt.Sprintf("%s differs: %s vs %s", difference.Dimension, difference.Left, difference.Right),
+				Attributes: map[string]any{"dimension": difference.Dimension, "left": difference.Left,
+					"right": difference.Right, "transferability": comparison.Transferability},
+				SupportEvidenceIDs: support, Confidence: 1, ReviewState: ResearchReviewPending,
+			})
+		}
+		if len(differences) > 0 {
+			if err := o.config.ResearchStore.StoreResearchAnalysisRecordsWithLease(run.RunID, differences, run.LeaseOwner, run.LeaseEpoch); err != nil {
+				return ResearchAdvanceResult{}, err
+			}
+		}
+	}
+	return o.transition(run, ResearchSynthesizing, "cases_compared")
+}
+
+func researchIntAttribute(attributes map[string]any, key string) int {
+	switch value := attributes[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	case json.Number:
+		parsed, _ := strconv.Atoi(value.String())
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func researchStringSliceAttribute(attributes map[string]any, key string) []string {
+	result := []string{}
+	switch values := attributes[key].(type) {
+	case []any:
+		for _, value := range values {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				result = append(result, text)
+			}
+		}
+	case []string:
+		result = append(result, values...)
+	}
+	return uniqueSortedResearchStrings(result)
+}
+
+func researchFloatMapAttribute(attributes map[string]any, key string) map[string]float64 {
+	result := map[string]float64{}
+	switch values := attributes[key].(type) {
+	case map[string]any:
+		for name, value := range values {
+			if number, ok := value.(float64); ok {
+				result[name] = number
+			}
+		}
+	case map[string]float64:
+		for name, value := range values {
+			result[name] = value
+		}
+	}
+	return result
 }
 
 func (o *ResearchOrchestrator) advanceConflicts(run ResearchRun) (ResearchAdvanceResult, error) {
@@ -341,7 +765,7 @@ func (o *ResearchOrchestrator) advanceConflicts(run ResearchRun) (ResearchAdvanc
 		})
 	}
 	if len(analysis) > 0 {
-		if err := o.config.ResearchStore.StoreResearchAnalysisRecords(run.RunID, analysis); err != nil {
+		if err := o.config.ResearchStore.StoreResearchAnalysisRecordsWithLease(run.RunID, analysis, run.LeaseOwner, run.LeaseEpoch); err != nil {
 			return ResearchAdvanceResult{}, err
 		}
 	}
@@ -353,7 +777,7 @@ func (o *ResearchOrchestrator) advanceConflicts(run ResearchRun) (ResearchAdvanc
 }
 
 func (o *ResearchOrchestrator) advanceSynthesizing(ctx context.Context, run ResearchRun) (ResearchAdvanceResult, error) {
-	state, err := o.loadState(run.RunID)
+	state, err := o.loadState(run)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
@@ -368,14 +792,14 @@ func (o *ResearchOrchestrator) advanceSynthesizing(ctx context.Context, run Rese
 	if len(output.Conclusions) == 0 {
 		return ResearchAdvanceResult{}, ErrResearchPartialEvidence
 	}
-	if err := o.saveDrafts(run.RunID, output.Conclusions); err != nil {
+	if err := o.saveDrafts(run, output.Conclusions); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	return o.transition(run, ResearchVerifying, "conclusions_synthesized")
 }
 
 func (o *ResearchOrchestrator) advanceVerifying(ctx context.Context, run ResearchRun) (ResearchAdvanceResult, error) {
-	state, err := o.loadState(run.RunID)
+	state, err := o.loadState(run)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
@@ -401,7 +825,7 @@ func (o *ResearchOrchestrator) advanceVerifying(ctx context.Context, run Researc
 		containsResearchString(output.Warnings, "case_transfer_limited")
 	if output.Verdict == ResearchVerifierVerified && caseWarningPresent &&
 		sameResearchStringSet(output.VerifiedConclusionIDs, researchDraftIDs(drafts)) {
-		if err := o.promoteVerifiedConclusions(run.RunID, drafts); err != nil {
+		if err := o.promoteVerifiedConclusions(run, drafts); err != nil {
 			return ResearchAdvanceResult{}, err
 		}
 		return o.finish(run, ResearchCompleted, ResearchOutcomeCompleted)
@@ -410,7 +834,7 @@ func (o *ResearchOrchestrator) advanceVerifying(ctx context.Context, run Researc
 		return o.finish(run, ResearchInsufficient, ResearchOutcomePartialEvidence)
 	}
 	state.Iteration++
-	if err := o.updateIteration(run.RunID, state.Iteration); err != nil {
+	if err := o.updateIteration(run, state.Iteration); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	if state.Iteration >= run.Budget.MaxIterations {
@@ -427,8 +851,13 @@ func (o *ResearchOrchestrator) invokeModel(
 	messages []BookKnowledgeMessage,
 	output any,
 ) (ResearchModelUsage, error) {
+	modelConfig := o.config.ModelConfig
+	if roleModel := strings.TrimSpace(o.config.RoleModels[role]); roleModel != "" {
+		modelConfig.Model = roleModel
+	}
+	resolvedModel := normalizeBookTokenPlanModel(modelConfig.Model)
 	requestIdentity := researchToolFingerprint(map[string]any{
-		"run_id": run.RunID, "role": role, "request_key": requestKey, "messages": messages,
+		"run_id": run.RunID, "role": role, "model": resolvedModel, "request_key": requestKey, "messages": messages,
 	})
 	var responseJSON, usageJSON string
 	err := o.config.ResearchStore.db.QueryRow(`SELECT response_json, usage_json FROM research_orchestrator_models
@@ -446,12 +875,8 @@ func (o *ResearchOrchestrator) invokeModel(
 	if !errors.Is(err, sql.ErrNoRows) {
 		return ResearchModelUsage{}, err
 	}
-	state, err := o.loadState(run.RunID)
-	if err != nil {
+	if err := o.ensureState(run); err != nil {
 		return ResearchModelUsage{}, err
-	}
-	if state.ModelCalls >= run.Budget.MaxModelCalls {
-		return ResearchModelUsage{}, ErrResearchBudgetExhausted
 	}
 	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
 	invocationID := "research-model-" + researchAnalysisID(run.RunID, requestIdentity)
@@ -459,26 +884,175 @@ func (o *ResearchOrchestrator) invokeModel(
 	if err != nil {
 		return ResearchModelUsage{}, err
 	}
-	if _, err := startTx.Exec(`INSERT INTO research_model_invocations
-		(invocation_id, run_id, request_identity, model, purpose, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 'running', ?, ?)
-		ON CONFLICT(request_identity) DO UPDATE SET status = 'running', updated_at = excluded.updated_at`,
-		invocationID, run.RunID, requestIdentity, normalizeBookTokenPlanModel(o.config.ModelConfig.Model), role, now, now); err != nil {
-		_ = startTx.Rollback()
+	defer func() { _ = startTx.Rollback() }()
+	if err := assertResearchRunLeaseTx(startTx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return ResearchModelUsage{}, err
+	}
+	var modelCalls int
+	if err := startTx.QueryRow(`SELECT model_calls FROM research_orchestrator_state WHERE run_id = ?`, run.RunID).Scan(&modelCalls); err != nil {
+		return ResearchModelUsage{}, err
+	}
+	if modelCalls >= run.Budget.MaxModelCalls {
+		return ResearchModelUsage{}, ErrResearchBudgetExhausted
+	}
+	var spentCost float64
+	if err := startTx.QueryRow(`SELECT COALESCE(SUM(estimated_cost_usd), 0)
+		FROM research_model_invocations WHERE run_id = ? AND request_identity <> ?`, run.RunID, requestIdentity).Scan(&spentCost); err != nil {
+		return ResearchModelUsage{}, err
+	}
+	var existingStatus, existingEpoch string
+	var existingAttempt int
+	var priorAttemptCost float64
+	existingErr := startTx.QueryRow(`SELECT status, attempt, lease_epoch, estimated_cost_usd
+		FROM research_model_invocations WHERE request_identity = ?`, requestIdentity).Scan(
+		&existingStatus, &existingAttempt, &existingEpoch, &priorAttemptCost)
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return ResearchModelUsage{}, existingErr
+	}
+	if existingErr == nil {
+		switch existingStatus {
+		case "running":
+			if existingEpoch == run.LeaseEpoch {
+				return ResearchModelUsage{}, ErrResearchModelInProgress
+			}
+		case "failed":
+		case ResearchOutcomeBudgetExhausted:
+			return ResearchModelUsage{}, ErrResearchBudgetExhausted
+		default:
+			return ResearchModelUsage{}, ErrResearchRunVersionConflict
+		}
+	}
+	remainingCost := run.Budget.MaxCostUSD - spentCost - priorAttemptCost
+	if remainingCost <= 0 || applyAgentRuntimeCostBudget(&modelConfig, messages, remainingCost) != nil {
+		return ResearchModelUsage{}, ErrResearchBudgetExhausted
+	}
+	reservation := agentRuntimeEstimatedMaxCostUSD(messages, modelConfig.MaxTokens)
+	if reservation <= 0 || spentCost+priorAttemptCost+reservation > run.Budget.MaxCostUSD {
+		return ResearchModelUsage{}, ErrResearchBudgetExhausted
+	}
+	var reservationResult sql.Result
+	if errors.Is(existingErr, sql.ErrNoRows) {
+		reservationResult, err = startTx.Exec(`INSERT INTO research_model_invocations
+			(invocation_id, run_id, request_identity, model, purpose, status, attempt, lease_epoch, estimated_cost_usd, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'running', 1, ?, ?, ?, ?)`,
+			invocationID, run.RunID, requestIdentity, resolvedModel, role, run.LeaseEpoch, reservation, now, now)
+	} else {
+		if _, err := startTx.Exec(`INSERT OR IGNORE INTO research_model_invocation_attempts
+			(request_identity, attempt, run_id, lease_epoch, status, reserved_cost_usd, actual_cost_usd, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, requestIdentity, existingAttempt, run.RunID, existingEpoch,
+			existingStatus, priorAttemptCost, priorAttemptCost, now, now); err != nil {
+			return ResearchModelUsage{}, err
+		}
+		if existingStatus == "running" {
+			if _, err := startTx.Exec(`UPDATE research_model_invocation_attempts SET status = 'abandoned',
+				actual_cost_usd = CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd ELSE reserved_cost_usd END,
+				updated_at = ? WHERE request_identity = ? AND attempt = ? AND lease_epoch = ? AND status = 'running'`,
+				now, requestIdentity, existingAttempt, existingEpoch); err != nil {
+				return ResearchModelUsage{}, err
+			}
+		}
+		reservationResult, err = startTx.Exec(`UPDATE research_model_invocations SET status = 'running', attempt = attempt + 1,
+			lease_epoch = ?, model = ?, estimated_cost_usd = ?, updated_at = ?
+			WHERE request_identity = ? AND attempt = ? AND status = ?`, run.LeaseEpoch, resolvedModel,
+			priorAttemptCost+reservation, now, requestIdentity, existingAttempt, existingStatus)
+	}
+	if err != nil {
+		return ResearchModelUsage{}, err
+	}
+	changed, changesErr := reservationResult.RowsAffected()
+	if changesErr != nil {
+		return ResearchModelUsage{}, changesErr
+	}
+	if changed != 1 {
+		return ResearchModelUsage{}, ErrResearchModelInProgress
+	}
+	currentAttempt := existingAttempt + 1
+	if errors.Is(existingErr, sql.ErrNoRows) {
+		currentAttempt = 1
+	}
+	if _, err := startTx.Exec(`INSERT INTO research_model_invocation_attempts
+		(request_identity, attempt, run_id, lease_epoch, status, reserved_cost_usd, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'running', ?, ?, ?)`, requestIdentity, currentAttempt, run.RunID,
+		run.LeaseEpoch, reservation, now, now); err != nil {
 		return ResearchModelUsage{}, err
 	}
 	if _, err := startTx.Exec(`UPDATE research_orchestrator_state SET model_calls = model_calls + 1, updated_at = ? WHERE run_id = ?`, now, run.RunID); err != nil {
-		_ = startTx.Rollback()
 		return ResearchModelUsage{}, err
 	}
 	if err := startTx.Commit(); err != nil {
 		return ResearchModelUsage{}, err
 	}
-	usage, err := o.config.Model.Run(ctx, role, o.config.ModelConfig, messages, output)
+	usage, err := o.config.Model.Run(ctx, role, modelConfig, messages, output)
 	if err != nil {
-		_, _ = o.config.ResearchStore.db.Exec(`UPDATE research_model_invocations SET status = 'failed', updated_at = ?
-			WHERE request_identity = ?`, o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano), requestIdentity)
+		failureTx, txErr := o.config.ResearchStore.db.Begin()
+		if txErr == nil {
+			if fenceErr := assertResearchRunLeaseTx(failureTx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); fenceErr == nil {
+				result, updateErr := failureTx.Exec(`UPDATE research_model_invocations SET status = 'failed', updated_at = ?
+					WHERE request_identity = ? AND lease_epoch = ? AND status = 'running'`,
+					o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano), requestIdentity, run.LeaseEpoch)
+				if updateErr != nil {
+					txErr = updateErr
+				} else if changed, changesErr := result.RowsAffected(); changesErr != nil || changed != 1 {
+					txErr = ErrResearchRunStaleLease
+				} else if _, updateErr := failureTx.Exec(`UPDATE research_model_invocation_attempts SET status = 'failed',
+					actual_cost_usd = CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd ELSE reserved_cost_usd END,
+					updated_at = ? WHERE request_identity = ? AND attempt = ? AND lease_epoch = ? AND status = 'running'`,
+					o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano), requestIdentity, currentAttempt, run.LeaseEpoch); updateErr != nil {
+					txErr = updateErr
+				}
+			}
+			if txErr == nil {
+				txErr = failureTx.Commit()
+			} else {
+				_ = failureTx.Rollback()
+			}
+		}
 		return ResearchModelUsage{}, err
+	}
+	now = o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
+	tx, err := o.config.ResearchStore.db.Begin()
+	if err != nil {
+		return ResearchModelUsage{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return ResearchModelUsage{}, err
+	}
+	if err := tx.QueryRow(`SELECT COALESCE(SUM(estimated_cost_usd), 0)
+		FROM research_model_invocations WHERE run_id = ? AND request_identity <> ?`, run.RunID, requestIdentity).Scan(&spentCost); err != nil {
+		return ResearchModelUsage{}, err
+	}
+	actualCost := usage.CostUSD
+	if actualCost <= 0 {
+		totalTokens := usage.TotalTokens
+		if totalTokens <= 0 {
+			totalTokens = usage.InputTokens + usage.OutputTokens
+		}
+		if totalTokens > 0 {
+			actualCost = float64(totalTokens) * agentRuntimeUSDPerTokenCeiling
+		} else {
+			actualCost = reservation
+		}
+		usage.CostUSD = actualCost
+	}
+	cumulativeAttemptCost := priorAttemptCost + actualCost
+	if spentCost+cumulativeAttemptCost > run.Budget.MaxCostUSD {
+		if _, err := tx.Exec(`UPDATE research_model_invocations SET status = ?, input_tokens = ?,
+			output_tokens = ?, estimated_cost_usd = ?, updated_at = ? WHERE request_identity = ? AND lease_epoch = ?`,
+			ResearchOutcomeBudgetExhausted, usage.InputTokens, usage.OutputTokens, cumulativeAttemptCost, now, requestIdentity, run.LeaseEpoch); err != nil {
+			return ResearchModelUsage{}, err
+		}
+		if _, err := tx.Exec(`UPDATE research_model_invocation_attempts SET status = ?, input_tokens = ?,
+			output_tokens = ?, actual_cost_usd = ?, updated_at = ?
+			WHERE request_identity = ? AND attempt = ? AND lease_epoch = ? AND status = 'running'`,
+			ResearchOutcomeBudgetExhausted, usage.InputTokens, usage.OutputTokens, actualCost, now,
+			requestIdentity, currentAttempt, run.LeaseEpoch); err != nil {
+			return ResearchModelUsage{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return ResearchModelUsage{}, err
+		}
+		return ResearchModelUsage{}, ErrResearchBudgetExhausted
 	}
 	response, err := json.Marshal(output)
 	if err != nil {
@@ -488,12 +1062,6 @@ func (o *ResearchOrchestrator) invokeModel(
 	if err != nil {
 		return ResearchModelUsage{}, err
 	}
-	now = o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
-	tx, err := o.config.ResearchStore.db.Begin()
-	if err != nil {
-		return ResearchModelUsage{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
 	result, err := tx.Exec(`INSERT OR IGNORE INTO research_orchestrator_models
 		(request_identity, run_id, role, response_json, usage_json, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		requestIdentity, run.RunID, role, string(response), string(encodedUsage), now)
@@ -505,10 +1073,30 @@ func (o *ResearchOrchestrator) invokeModel(
 		return ResearchModelUsage{}, err
 	}
 	if inserted == 1 {
-		if _, err := tx.Exec(`UPDATE research_model_invocations SET status = 'completed', input_tokens = ?,
-			output_tokens = ?, estimated_cost_usd = ?, updated_at = ? WHERE request_identity = ?`,
-			usage.InputTokens, usage.OutputTokens, usage.CostUSD, now, requestIdentity); err != nil {
+		updated, err := tx.Exec(`UPDATE research_model_invocations SET status = 'completed', input_tokens = ?,
+			output_tokens = ?, estimated_cost_usd = ?, updated_at = ? WHERE request_identity = ? AND lease_epoch = ?`,
+			usage.InputTokens, usage.OutputTokens, cumulativeAttemptCost, now, requestIdentity, run.LeaseEpoch)
+		if err != nil {
 			return ResearchModelUsage{}, err
+		}
+		if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
+			if err != nil {
+				return ResearchModelUsage{}, err
+			}
+			return ResearchModelUsage{}, ErrResearchRunStaleLease
+		}
+		updated, err = tx.Exec(`UPDATE research_model_invocation_attempts SET status = 'completed', input_tokens = ?,
+			output_tokens = ?, actual_cost_usd = ?, updated_at = ?
+			WHERE request_identity = ? AND attempt = ? AND lease_epoch = ? AND status = 'running'`,
+			usage.InputTokens, usage.OutputTokens, actualCost, now, requestIdentity, currentAttempt, run.LeaseEpoch)
+		if err != nil {
+			return ResearchModelUsage{}, err
+		}
+		if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
+			if err != nil {
+				return ResearchModelUsage{}, err
+			}
+			return ResearchModelUsage{}, ErrResearchRunStaleLease
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -533,17 +1121,36 @@ func (o *ResearchOrchestrator) stageMessages(run ResearchRun, instruction string
 		}
 		messages = append(messages, BookKnowledgeMessage{Role: "user", Content: content})
 	}
+	records, err := o.config.ResearchStore.ListResearchAnalysisRecords(run.RunID)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range records {
+		attributes, err := json.Marshal(record.Attributes)
+		if err != nil {
+			return nil, err
+		}
+		content := "[analysis:" + record.RecordID + " kind=" + record.Kind + "] " + record.Summary
+		if len(attributes) > 2 {
+			content += " attributes=" + string(attributes)
+		}
+		messages = append(messages, BookKnowledgeMessage{Role: "user", Content: content})
+	}
 	return messages, nil
 }
 
-func (o *ResearchOrchestrator) storePromotedEvidence(runID string, evidence []ResearchEvidence) error {
+func (o *ResearchOrchestrator) storePromotedEvidence(run ResearchRun, evidence []ResearchEvidence) error {
 	if len(evidence) == 0 {
 		return nil
 	}
-	run, err := o.config.ResearchStore.LoadRun(runID)
+	loaded, err := o.config.ResearchStore.LoadRun(run.RunID)
 	if err != nil {
 		return err
 	}
+	if loaded.LeaseOwner != run.LeaseOwner || loaded.LeaseEpoch != run.LeaseEpoch {
+		return ErrResearchRunStaleLease
+	}
+	run.Version = loaded.Version
 	searched := []string{}
 	cited := []string{}
 	for _, item := range evidence {
@@ -554,26 +1161,33 @@ func (o *ResearchOrchestrator) storePromotedEvidence(runID string, evidence []Re
 		searched = append(searched, source)
 		cited = append(cited, source)
 	}
-	_, err = o.config.ResearchStore.StoreEvidenceBundle(runID, run.Version, ResearchEvidenceBundle{
+	_, err = o.config.ResearchStore.StoreEvidenceBundleWithLease(run.RunID, run.Version, ResearchEvidenceBundle{
 		Evidence: evidence, SearchedSources: uniqueSortedResearchStrings(searched), CitedSources: uniqueSortedResearchStrings(cited),
-	})
+	}, run.LeaseOwner, run.LeaseEpoch)
 	return err
 }
 
 func (o *ResearchOrchestrator) transition(run ResearchRun, to ResearchRunStatus, code string) (ResearchAdvanceResult, error) {
-	updated, err := o.config.ResearchStore.TransitionRun(run.RunID, run.Version, to,
-		ResearchTransition{Code: code, Actor: "orchestrator"})
+	updated, err := o.transitionRunState(run, to, ResearchTransition{Code: code, Actor: "orchestrator"}, "", "", nil)
 	if err != nil {
-		return ResearchAdvanceResult{}, err
-	}
-	if _, err := o.config.ResearchStore.db.Exec(`UPDATE research_runs SET wait_reason = '' WHERE run_id = ?`, run.RunID); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	return ResearchAdvanceResult{Run: *updated}, nil
 }
 
 func (o *ResearchOrchestrator) wait(run ResearchRun, reason string) (ResearchAdvanceResult, error) {
-	if _, err := o.config.ResearchStore.db.Exec(`UPDATE research_runs SET wait_reason = ? WHERE run_id = ?`, reason, run.RunID); err != nil {
+	tx, err := o.config.ResearchStore.db.Begin()
+	if err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	if _, err := tx.Exec(`UPDATE research_runs SET wait_reason = ? WHERE run_id = ?`, reason, run.RunID); err != nil {
+		return ResearchAdvanceResult{}, err
+	}
+	if err := tx.Commit(); err != nil {
 		return ResearchAdvanceResult{}, err
 	}
 	run.WaitReason = reason
@@ -581,11 +1195,6 @@ func (o *ResearchOrchestrator) wait(run ResearchRun, reason string) (ResearchAdv
 }
 
 func (o *ResearchOrchestrator) finish(run ResearchRun, status ResearchRunStatus, outcome string) (ResearchAdvanceResult, error) {
-	updated, err := o.config.ResearchStore.TransitionRun(run.RunID, run.Version, status,
-		ResearchTransition{Code: outcome, Actor: "orchestrator"})
-	if err != nil {
-		return ResearchAdvanceResult{}, err
-	}
 	failureJSON := ""
 	if status != ResearchCompleted {
 		failure, err := json.Marshal(ResearchFailure{Code: outcome, Message: outcome, Retryable: false})
@@ -594,18 +1203,76 @@ func (o *ResearchOrchestrator) finish(run ResearchRun, status ResearchRunStatus,
 		}
 		failureJSON = string(failure)
 	}
-	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
-	if _, err := o.config.ResearchStore.db.Exec(`UPDATE research_runs SET wait_reason = '', failure_json = ? WHERE run_id = ?`, failureJSON, run.RunID); err != nil {
-		return ResearchAdvanceResult{}, err
-	}
-	if _, err := o.config.ResearchStore.db.Exec(`UPDATE research_orchestrator_state SET last_outcome = ?, updated_at = ? WHERE run_id = ?`, outcome, now, run.RunID); err != nil {
-		return ResearchAdvanceResult{}, err
-	}
-	loaded, err := o.config.ResearchStore.LoadRun(updated.RunID)
+	updated, err := o.transitionRunState(run, status,
+		ResearchTransition{Code: outcome, Actor: "orchestrator"}, "", failureJSON, &outcome)
 	if err != nil {
 		return ResearchAdvanceResult{}, err
 	}
-	return ResearchAdvanceResult{Run: *loaded, Outcome: outcome}, nil
+	return ResearchAdvanceResult{Run: *updated, Outcome: outcome}, nil
+}
+
+func (o *ResearchOrchestrator) transitionRunState(run ResearchRun, to ResearchRunStatus, transition ResearchTransition, waitReason, failureJSON string, outcome *string) (*ResearchRun, error) {
+	if err := validateResearchTransitionInput(transition); err != nil {
+		return nil, err
+	}
+	tx, err := o.config.ResearchStore.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	current, err := loadResearchRun(tx, run.RunID)
+	if err != nil {
+		return nil, err
+	}
+	if current.Version != run.Version {
+		return nil, ErrResearchRunVersionConflict
+	}
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return nil, err
+	}
+	if err := ValidateResearchTransition(current.Status, to); err != nil {
+		return nil, err
+	}
+	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.Exec(`UPDATE research_runs SET status = ?, version = version + 1,
+		wait_reason = ?, failure_json = ?, updated_at = ?
+		WHERE run_id = ? AND version = ? AND lease_owner = ? AND lease_epoch = ?`,
+		to, waitReason, failureJSON, now, run.RunID, run.Version, run.LeaseOwner, run.LeaseEpoch)
+	if err != nil {
+		return nil, err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return nil, err
+		}
+		return nil, ErrResearchRunStaleLease
+	}
+	if outcome != nil {
+		if _, err := tx.Exec(`UPDATE research_orchestrator_state SET last_outcome = ?, updated_at = ? WHERE run_id = ?`, *outcome, now, run.RunID); err != nil {
+			return nil, err
+		}
+	}
+	if err := researchOrchestratorTransitionFault("before_event"); err != nil {
+		return nil, err
+	}
+	if err := insertResearchEvent(tx, run.RunID, current.Status, to, transition, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	current.Status = to
+	current.Version++
+	current.WaitReason = waitReason
+	current.UpdatedAt = now
+	current.Failure = nil
+	if failureJSON != "" {
+		current.Failure = &ResearchFailure{}
+		if err := json.Unmarshal([]byte(failureJSON), current.Failure); err != nil {
+			return nil, err
+		}
+	}
+	return current, nil
 }
 
 func (o *ResearchOrchestrator) terminalResult(run ResearchRun) ResearchAdvanceResult {
@@ -621,27 +1288,47 @@ func (o *ResearchOrchestrator) terminalResult(run ResearchRun) ResearchAdvanceRe
 	return ResearchAdvanceResult{Run: run, Outcome: outcome, WaitReason: run.WaitReason}
 }
 
-func (o *ResearchOrchestrator) ensureState(runID string) error {
+func (o *ResearchOrchestrator) ensureState(run ResearchRun) error {
+	tx, err := o.config.ResearchStore.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return err
+	}
 	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
-	_, err := o.config.ResearchStore.db.Exec(`INSERT OR IGNORE INTO research_orchestrator_state
-		(run_id, iteration, model_calls, last_outcome, updated_at) VALUES (?, 0, 0, '', ?)`, runID, now)
-	return err
+	if _, err := tx.Exec(`INSERT OR IGNORE INTO research_orchestrator_state
+		(run_id, iteration, model_calls, last_outcome, updated_at) VALUES (?, 0, 0, '', ?)`, run.RunID, now); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (o *ResearchOrchestrator) loadState(runID string) (researchOrchestratorState, error) {
-	if err := o.ensureState(runID); err != nil {
+func (o *ResearchOrchestrator) loadState(run ResearchRun) (researchOrchestratorState, error) {
+	if err := o.ensureState(run); err != nil {
 		return researchOrchestratorState{}, err
 	}
 	var state researchOrchestratorState
 	err := o.config.ResearchStore.db.QueryRow(`SELECT iteration, model_calls, last_outcome
-		FROM research_orchestrator_state WHERE run_id = ?`, runID).Scan(&state.Iteration, &state.ModelCalls, &state.Outcome)
+		FROM research_orchestrator_state WHERE run_id = ?`, run.RunID).Scan(&state.Iteration, &state.ModelCalls, &state.Outcome)
 	return state, err
 }
 
-func (o *ResearchOrchestrator) updateIteration(runID string, iteration int) error {
+func (o *ResearchOrchestrator) updateIteration(run ResearchRun, iteration int) error {
+	tx, err := o.config.ResearchStore.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return err
+	}
 	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
-	_, err := o.config.ResearchStore.db.Exec(`UPDATE research_orchestrator_state SET iteration = ?, updated_at = ? WHERE run_id = ?`, iteration, now, runID)
-	return err
+	if _, err := tx.Exec(`UPDATE research_orchestrator_state SET iteration = ?, updated_at = ? WHERE run_id = ?`, iteration, now, run.RunID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (o *ResearchOrchestrator) listWorkerJobs(runID string) ([]ResearchWorkerJob, error) {
@@ -672,12 +1359,15 @@ func (o *ResearchOrchestrator) listWorkerJobs(runID string) ([]ResearchWorkerJob
 	return result, nil
 }
 
-func (o *ResearchOrchestrator) saveDrafts(runID string, drafts []ResearchConclusionDraft) error {
+func (o *ResearchOrchestrator) saveDrafts(run ResearchRun, drafts []ResearchConclusionDraft) error {
 	tx, err := o.config.ResearchStore.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return err
+	}
 	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
 	for _, draft := range drafts {
 		evidenceJSON, err := json.Marshal(uniqueSortedResearchStrings(draft.SupportEvidenceIDs))
@@ -693,7 +1383,7 @@ func (o *ResearchOrchestrator) saveDrafts(runID string, drafts []ResearchConclus
 			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(run_id, conclusion_id) DO UPDATE SET conclusion_text = excluded.conclusion_text,
 				evidence_ids_json = excluded.evidence_ids_json, citation_ids_json = excluded.citation_ids_json,
-				confidence = excluded.confidence`, runID, draft.ConclusionID, draft.Text,
+				confidence = excluded.confidence`, run.RunID, draft.ConclusionID, draft.Text,
 			string(evidenceJSON), string(citationJSON), draft.Confidence, now); err != nil {
 			return err
 		}
@@ -757,25 +1447,33 @@ func (o *ResearchOrchestrator) validateDraftSupports(run ResearchRun, drafts []R
 	return nil
 }
 
-func (o *ResearchOrchestrator) promoteVerifiedConclusions(runID string, drafts []ResearchConclusionDraft) error {
+func (o *ResearchOrchestrator) promoteVerifiedConclusions(run ResearchRun, drafts []ResearchConclusionDraft) error {
 	tx, err := o.config.ResearchStore.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := assertResearchRunLeaseTx(tx, run.RunID, run.LeaseOwner, run.LeaseEpoch, o.config.ResearchStore.now()); err != nil {
+		return err
+	}
 	now := o.config.ResearchStore.now().UTC().Format(time.RFC3339Nano)
 	for _, draft := range drafts {
-		storedConclusionID := "research-conclusion-" + researchAnalysisID(runID, draft.ConclusionID)
+		storedConclusionID := "research-conclusion-" + researchAnalysisID(run.RunID, draft.ConclusionID)
 		evidenceJSON, err := json.Marshal(uniqueSortedResearchStrings(draft.SupportEvidenceIDs))
 		if err != nil {
 			return err
 		}
+		citationJSON, err := json.Marshal(uniqueSortedResearchStrings(draft.CitationIDs))
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`INSERT INTO research_conclusions
-			(conclusion_id, run_id, conclusion_text, evidence_ids_json, confidence, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			(conclusion_id, run_id, conclusion_text, evidence_ids_json, citation_ids_json, confidence, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(conclusion_id) DO UPDATE SET conclusion_text = excluded.conclusion_text,
-				evidence_ids_json = excluded.evidence_ids_json, confidence = excluded.confidence`,
-			storedConclusionID, runID, draft.Text, string(evidenceJSON), draft.Confidence, now); err != nil {
+				evidence_ids_json = excluded.evidence_ids_json, citation_ids_json = excluded.citation_ids_json,
+				confidence = excluded.confidence`, storedConclusionID, run.RunID, draft.Text, string(evidenceJSON),
+			string(citationJSON), draft.Confidence, now); err != nil {
 			return err
 		}
 	}
@@ -783,7 +1481,7 @@ func (o *ResearchOrchestrator) promoteVerifiedConclusions(runID string, drafts [
 }
 
 func (s *ResearchStore) ListVerifiedResearchConclusions(runID string) ([]ResearchVerifiedConclusion, error) {
-	rows, err := s.db.Query(`SELECT conclusion_id, run_id, conclusion_text, evidence_ids_json, confidence, created_at
+	rows, err := s.db.Query(`SELECT conclusion_id, run_id, conclusion_text, evidence_ids_json, citation_ids_json, confidence, created_at
 		FROM research_conclusions WHERE run_id = ? ORDER BY conclusion_id`, strings.TrimSpace(runID))
 	if err != nil {
 		return nil, err
@@ -792,11 +1490,14 @@ func (s *ResearchStore) ListVerifiedResearchConclusions(runID string) ([]Researc
 	result := []ResearchVerifiedConclusion{}
 	for rows.Next() {
 		var item ResearchVerifiedConclusion
-		var evidenceJSON string
-		if err := rows.Scan(&item.ConclusionID, &item.RunID, &item.Text, &evidenceJSON, &item.Confidence, &item.CreatedAt); err != nil {
+		var evidenceJSON, citationJSON string
+		if err := rows.Scan(&item.ConclusionID, &item.RunID, &item.Text, &evidenceJSON, &citationJSON, &item.Confidence, &item.CreatedAt); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(evidenceJSON), &item.EvidenceIDs); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(citationJSON), &item.CitationIDs); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -930,7 +1631,7 @@ type ResearchCoordinatorConfig struct {
 
 type ResearchCoordinator struct {
 	config  ResearchCoordinatorConfig
-	queue   chan string
+	queue   chan ResearchRun
 	ctx     context.Context
 	cancel  context.CancelFunc
 	mu      sync.Mutex
@@ -966,7 +1667,7 @@ func NewResearchCoordinator(config ResearchCoordinatorConfig) (*ResearchCoordina
 		config.OwnerID = strings.Replace(newResearchRunID(), "research-run-", "research-coordinator-", 1)
 	}
 	return &ResearchCoordinator{
-		config: config, queue: make(chan string, config.QueueSize), pending: map[string]bool{},
+		config: config, queue: make(chan ResearchRun, config.QueueSize), pending: map[string]bool{},
 	}, nil
 }
 
@@ -1044,20 +1745,20 @@ func (c *ResearchCoordinator) scan() {
 		c.mu.Lock()
 		if c.pending[run.RunID] {
 			c.mu.Unlock()
-			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID)
+			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID, run.LeaseEpoch)
 			return
 		}
 		c.pending[run.RunID] = true
 		c.mu.Unlock()
 		select {
-		case c.queue <- run.RunID:
+		case c.queue <- *run:
 		case <-c.ctx.Done():
 			c.removePending(run.RunID)
-			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID)
+			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID, run.LeaseEpoch)
 			return
 		default:
 			c.removePending(run.RunID)
-			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID)
+			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID, run.LeaseEpoch)
 			return
 		}
 	}
@@ -1069,10 +1770,38 @@ func (c *ResearchCoordinator) worker() {
 		select {
 		case <-c.ctx.Done():
 			return
-		case runID := <-c.queue:
-			_, _ = c.config.Orchestrator.Advance(c.ctx, runID)
-			_ = c.config.Store.ReleaseRunLease(runID, c.config.OwnerID)
-			c.removePending(runID)
+		case run := <-c.queue:
+			advanceCtx, cancel := context.WithCancel(c.ctx)
+			advanceCtx = context.WithValue(advanceCtx, researchRunLeaseContextKey{}, researchRunLeaseFence{Owner: c.config.OwnerID, Epoch: run.LeaseEpoch})
+			renewDone := make(chan error, 1)
+			go c.renewRunLease(advanceCtx, cancel, run.RunID, run.LeaseEpoch, renewDone)
+			_, _ = c.config.Orchestrator.Advance(advanceCtx, run.RunID)
+			cancel()
+			_ = <-renewDone
+			_ = c.config.Store.ReleaseRunLease(run.RunID, c.config.OwnerID, run.LeaseEpoch)
+			c.removePending(run.RunID)
+		}
+	}
+}
+
+func (c *ResearchCoordinator) renewRunLease(ctx context.Context, cancel context.CancelFunc, runID, epoch string, done chan<- error) {
+	interval := c.config.LeaseDuration / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			done <- nil
+			return
+		case <-ticker.C:
+			if err := c.config.Store.RenewRunLease(runID, c.config.OwnerID, epoch, c.config.LeaseDuration); err != nil {
+				cancel()
+				done <- err
+				return
+			}
 		}
 	}
 }
@@ -1083,9 +1812,9 @@ func (c *ResearchCoordinator) removePending(runID string) {
 	c.mu.Unlock()
 }
 
-func (s *ResearchStore) ReleaseRunLease(runID, owner string) error {
-	result, err := s.db.Exec(`UPDATE research_runs SET lease_owner = '', lease_expires_at = ''
-		WHERE run_id = ? AND lease_owner = ?`, strings.TrimSpace(runID), strings.TrimSpace(owner))
+func (s *ResearchStore) ReleaseRunLease(runID, owner, epoch string) error {
+	result, err := s.db.Exec(`UPDATE research_runs SET lease_owner = '', lease_epoch = '', lease_expires_at = ''
+		WHERE run_id = ? AND lease_owner = ? AND lease_epoch = ?`, strings.TrimSpace(runID), strings.TrimSpace(owner), strings.TrimSpace(epoch))
 	if err != nil {
 		return err
 	}

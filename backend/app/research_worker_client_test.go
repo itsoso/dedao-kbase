@@ -22,26 +22,35 @@ func TestResearchWorkerClientUsesSharedBearerTokenAndIdempotencyHeader(t *testin
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
 				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
 				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobLeased, Attempt: 1,
-				LeaseOwner: "agent-a", RequestHash: "sha256:request",
+				LeaseOwner: "agent-a", LeaseID: "research-lease-1", RequestHash: "sha256:request",
 			}})
 		case "/api/research-worker/jobs/job-1/renew":
-			if r.Header.Get("Idempotency-Key") != "job-1:sha256:request:renew" {
+			if r.Header.Get("Idempotency-Key") != "job-1:research-lease-1:renew" {
 				t.Fatalf("renew idempotency=%q", r.Header.Get("Idempotency-Key"))
 			}
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
 				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
 				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobLeased,
-				Attempt: 1, LeaseOwner: "agent-a", RequestHash: "sha256:request",
+				Attempt: 1, LeaseOwner: "agent-a", LeaseID: "research-lease-1", RequestHash: "sha256:request",
 			}})
 		case "/api/research-worker/jobs/job-1/complete":
-			if r.Header.Get("Idempotency-Key") != "job-1:sha256:request:complete" {
+			if r.Header.Get("Idempotency-Key") != "job-1:research-lease-1:complete" {
 				t.Fatalf("complete idempotency=%q", r.Header.Get("Idempotency-Key"))
 			}
 			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
 				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
 				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobCompleted,
-				Attempt: 1, LeaseOwner: "agent-a", RequestHash: "sha256:request",
+				Attempt: 1, LeaseOwner: "agent-a", LeaseID: "research-lease-1", RequestHash: "sha256:request",
 				ResultFingerprint: "sha256:result",
+			}})
+		case "/api/research-worker/jobs/job-1/fail":
+			if r.Header.Get("Idempotency-Key") != "job-1:research-lease-1:fail:dependency_unavailable" {
+				t.Fatalf("fail idempotency=%q", r.Header.Get("Idempotency-Key"))
+			}
+			writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
+				JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
+				Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`), State: ResearchWorkerJobQueued,
+				Attempt: 1, MaxAttempts: 2, LeaseID: "research-lease-1", RequestHash: "sha256:request", FailureCode: "dependency_unavailable",
 			}})
 		default:
 			http.NotFound(w, r)
@@ -65,14 +74,18 @@ func TestResearchWorkerClientUsesSharedBearerTokenAndIdempotencyHeader(t *testin
 	if err != nil || completed.State != ResearchWorkerJobCompleted {
 		t.Fatalf("completed=%#v err=%v", completed, err)
 	}
-	if len(calls) != 3 {
+	failed, err := client.Fail(context.Background(), *job, "dependency_unavailable", true)
+	if err != nil || failed.State != ResearchWorkerJobQueued || failed.LeaseOwner != "" {
+		t.Fatalf("failed=%#v err=%v", failed, err)
+	}
+	if len(calls) != 4 {
 		t.Fatalf("calls=%v", calls)
 	}
 }
 
 func TestResearchWorkerClientRejectsMalformedOrForeignResponses(t *testing.T) {
 	for _, response := range []string{
-		`{"job":{"job_id":"job-1","run_id":"run-1","target_agent_id":"agent-b","tool":"fetch_chat_message","arguments":{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"},"state":"leased","attempt":1,"lease_owner":"agent-b","request_hash":"sha256:request"}}`,
+		`{"job":{"job_id":"job-1","run_id":"run-1","target_agent_id":"agent-b","tool":"fetch_chat_message","arguments":{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"},"state":"leased","attempt":1,"lease_owner":"agent-b","lease_id":"research-lease-1","request_hash":"sha256:request"}}`,
 		`{"job":null,"unknown":"private"}`,
 		`{"job":`,
 	} {
@@ -92,6 +105,31 @@ func TestResearchWorkerClientRejectsMalformedOrForeignResponses(t *testing.T) {
 				t.Fatalf("error=%v", err)
 			}
 		})
+	}
+}
+
+func TestResearchWorkerClientRejectsChangedLeaseID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"job": ResearchWorkerJob{
+			JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
+			Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`),
+			State:     ResearchWorkerJobLeased, Attempt: 1, LeaseOwner: "agent-a", LeaseID: "research-lease-replaced", RequestHash: "sha256:request",
+		}})
+	}))
+	defer server.Close()
+	client, err := NewResearchWorkerClient(ResearchWorkerClientConfig{
+		RemoteURL: server.URL, Token: "worker-secret", AgentID: "agent-a", HTTPClient: server.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := ResearchWorkerJob{
+		JobID: "job-1", RunID: "run-1", TargetAgentID: "agent-a", Tool: ResearchWorkerToolFetchChatMessage,
+		Arguments: []byte(`{"message_ref":"message-1","conversation_ref":"conversation-1","time":"2026-08-13"}`),
+		State:     ResearchWorkerJobLeased, Attempt: 1, LeaseOwner: "agent-a", LeaseID: "research-lease-original", RequestHash: "sha256:request",
+	}
+	if err := client.Renew(context.Background(), job, time.Minute); err == nil {
+		t.Fatal("changed lease_id response accepted")
 	}
 }
 

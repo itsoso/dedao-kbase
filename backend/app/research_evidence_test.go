@@ -154,6 +154,61 @@ func TestResearchEvidenceStorePersistsOnlyNormalizedEvidenceAndScope(t *testing.
 	}
 }
 
+func TestResearchEvidenceStoreEnforcesRunItemAndQuotedCharacterBudgetsAtomically(t *testing.T) {
+	store := newResearchStoreForTest(t)
+	input := researchStoreTestInput("evidence-budget")
+	input.Budget.MaxEvidenceItems = 1
+	input.Budget.MaxQuotedChars = 10
+	run, _, err := store.CreateRun(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := researchEvidenceTestCandidate("123456")
+	firstBundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
+		SearchedSources: []string{ResearchSourceChatlog}, Items: []ResearchWorkerEvidenceCandidate{first},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.StoreEvidenceBundle(run.RunID, run.Version, firstBundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := researchEvidenceTestCandidate("abcdef")
+	second.Locator.MessageRef = "sha256:6b01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94452"
+	secondBundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
+		SearchedSources: []string{ResearchSourceChatlog}, Items: []ResearchWorkerEvidenceCandidate{second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StoreEvidenceBundle(run.RunID, updated.Version, secondBundle); !errors.Is(err, ErrResearchBudgetExhausted) {
+		t.Fatalf("item budget error=%v", err)
+	}
+	stored, err := store.ListEvidence(run.RunID)
+	if err != nil || len(stored) != 1 || stored[0].ContentExcerpt != first.Content {
+		t.Fatalf("stored after item rejection=%#v err=%v", stored, err)
+	}
+
+	input = researchStoreTestInput("quoted-budget")
+	input.Budget.MaxEvidenceItems = 5
+	input.Budget.MaxQuotedChars = 10
+	quotedRun, _, err := store.CreateRun(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StoreEvidenceBundle(quotedRun.RunID, quotedRun.Version, ResearchEvidenceBundle{
+		Evidence:        append(append([]ResearchEvidence{}, firstBundle.Evidence...), secondBundle.Evidence...),
+		SearchedSources: []string{ResearchSourceChatlog}, CitedSources: []string{ResearchSourceChatlog},
+	}); !errors.Is(err, ErrResearchBudgetExhausted) {
+		t.Fatalf("quoted-character budget error=%v", err)
+	}
+	stored, err = store.ListEvidence(quotedRun.RunID)
+	if err != nil || len(stored) != 0 {
+		t.Fatalf("quoted budget partially persisted=%#v err=%v", stored, err)
+	}
+}
+
 func TestResearchEvidenceStoreDetectsChangedSourceAcrossBundles(t *testing.T) {
 	store := newResearchStoreForTest(t)
 	run := createResearchRunForTest(t, store, "evidence-change")
@@ -233,7 +288,9 @@ func researchEvidenceTestCandidate(content string) ResearchWorkerEvidenceCandida
 		OccurredAt:         "2026-08-13T07:43:06+08:00",
 		Content:            content,
 		Locator: ResearchEvidenceLocator{
-			WorkerID: "worker-fixture", ConversationRef: "opaque-conversation", MessageRef: "opaque-message",
+			WorkerID:        "worker-fixture",
+			ConversationRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451",
+			MessageRef:      "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451",
 		},
 		Privacy:  ResearchEvidencePrivacyPrivate,
 		Selected: true,

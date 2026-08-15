@@ -80,8 +80,10 @@ type ResearchWorkerEvidenceCandidate struct {
 }
 
 type ResearchWorkerResult struct {
-	SearchedSources []string                          `json:"searched_sources"`
-	Items           []ResearchWorkerEvidenceCandidate `json:"items"`
+	SearchedSources    []string                          `json:"searched_sources"`
+	Items              []ResearchWorkerEvidenceCandidate `json:"items"`
+	IdentityCandidates []ResearchIdentityCandidate       `json:"identity_candidates,omitempty"`
+	AnchorCandidateRef string                            `json:"anchor_candidate_ref,omitempty"`
 
 	// Retrieval adapters may use these fields while decoding a local response.
 	// The normalizer deliberately has no output path for them.
@@ -251,6 +253,9 @@ func validateResearchEvidenceLocator(sourceType string, locator ResearchEvidence
 	case ResearchEvidenceSourceChatlog:
 		if strings.TrimSpace(locator.WorkerID) == "" || strings.TrimSpace(locator.ConversationRef) == "" || strings.TrimSpace(locator.MessageRef) == "" {
 			return fmt.Errorf("chatlog evidence requires worker, conversation, and message references")
+		}
+		if !validResearchOpaqueCandidateRef(locator.ConversationRef) || !validResearchOpaqueCandidateRef(locator.MessageRef) {
+			return fmt.Errorf("chatlog evidence requires locally opaque locator references")
 		}
 	case ResearchEvidenceSourceKnowledge:
 		if strings.TrimSpace(locator.ReleaseID) == "" {

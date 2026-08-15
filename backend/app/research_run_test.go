@@ -92,8 +92,8 @@ func TestValidateResearchTransitionSupportsDeepAndQuickPaths(t *testing.T) {
 		ResearchPlanning,
 		ResearchRetrieving,
 		ResearchResolvingIdentity,
-		ResearchBuildingTimeline,
 		ResearchExtractingFacts,
+		ResearchBuildingTimeline,
 		ResearchDetectingConflicts,
 		ResearchComparingCases,
 		ResearchSynthesizing,
@@ -126,6 +126,18 @@ func TestValidateResearchTransitionRejectsSkippedAndTerminalTransitions(t *testi
 	} {
 		if err := ValidateResearchTransition(terminal, ResearchPlanning); err == nil {
 			t.Fatalf("terminal status %q resumed", terminal)
+		}
+	}
+}
+
+func TestValidateResearchTransitionAllowsTypedInsufficiencyFromEveryActiveStage(t *testing.T) {
+	for _, status := range []ResearchRunStatus{
+		ResearchPlanning, ResearchRetrieving, ResearchResolvingIdentity, ResearchBuildingTimeline,
+		ResearchExtractingFacts, ResearchDetectingConflicts, ResearchComparingCases,
+		ResearchSynthesizing, ResearchVerifying,
+	} {
+		if err := ValidateResearchTransition(status, ResearchInsufficient); err != nil {
+			t.Fatalf("status=%s error=%v", status, err)
 		}
 	}
 }

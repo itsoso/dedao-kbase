@@ -323,8 +323,9 @@ for (const marker of [
 assert.ok(html.includes("20260809-book-job-recovery"), "book job recovery should bust cached app assets");
 assert.doesNotMatch(js, />\s*job execution failed\s*</i, "job center must not render raw worker failure copy");
 assert.ok(js.includes('role="status" aria-live="polite"'), "job center async results should be announced accessibly");
-const mobileJobStart = css.lastIndexOf("@media (max-width: 760px)");
-const mobileJobEnd = css.indexOf("@media (prefers-reduced-motion: reduce)", mobileJobStart);
+const mobileJobMarker = css.lastIndexOf(".job-center__toolbar > .button");
+const mobileJobStart = css.lastIndexOf("@media (max-width: 760px)", mobileJobMarker);
+const mobileJobEnd = css.indexOf("@media ", mobileJobMarker);
 const mobileJobSource = mobileJobStart >= 0 ? css.slice(mobileJobStart, mobileJobEnd >= 0 ? mobileJobEnd : undefined) : "";
 const mobileJobToolbar = mobileJobSource.match(/\.job-center__toolbar\s*\{([\s\S]*?)\}/)?.[1] || "";
 const mobileJobRefresh = mobileJobSource.match(/\.job-center__toolbar\s*>\s*\.button\s*\{([\s\S]*?)\}/)?.[1] || "";
@@ -403,6 +404,8 @@ assert.ok(packageChatSource.includes("version=${encodeURIComponent(pkg.version)}
 assert.ok(!packageChatSource.includes("/api/book-chat"), "Book App chat must not fall back to the generic single-book endpoint");
 assert.ok(js.includes("renderBookAgentAnswerCitations"), "Book App should render citation identities returned by package chat");
 assert.ok(js.includes("result.release_id"), "Book App search should render release identity across multi-release packages");
+assert.ok(js.includes("renderResearchConclusionCitations"), "Research reports should render claim-level citation links");
+assert.ok(js.includes('citation.href.startsWith("/api/citations/")'), "Research citation links must remain on the bounded citation endpoint");
 for (const marker of [
   "bookAgentActionSequence",
   "isBookAgentActionCurrent",

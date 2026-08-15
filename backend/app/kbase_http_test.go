@@ -2187,6 +2187,10 @@ func TestKBaseHTTPResearchWorkerAuthenticationAndValidation(t *testing.T) {
 	if claimed.Code != http.StatusOK || !strings.Contains(claimed.Body.String(), `"job_id":"`+job.JobID+`"`) {
 		t.Fatalf("claimed status=%d body=%s", claimed.Code, claimed.Body.String())
 	}
+	claimedJob, err := researchStore.LoadWorkerJob(job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	foreignComplete := requestJSONKBase(handler, http.MethodPost,
 		"/api/research-worker/jobs/"+url.PathEscape(job.JobID)+"/complete", "worker-secret",
 		`{"agent_id":"chatlog-agent-b","request_hash":"`+job.RequestHash+`","result":{"items":[]}}`)
@@ -2195,7 +2199,7 @@ func TestKBaseHTTPResearchWorkerAuthenticationAndValidation(t *testing.T) {
 	}
 	invalidTime := requestJSONKBase(handler, http.MethodPost,
 		"/api/research-worker/jobs/"+url.PathEscape(job.JobID)+"/complete", "worker-secret",
-		`{"agent_id":"chatlog-agent-a","request_hash":"`+job.RequestHash+`","result":{"items":[{"source_type":"chatlog_message","source_role":"direct_advice","occurred_at":"not-a-time","content":"bounded","locator":{"worker_id":"worker-fixture","conversation_ref":"conversation","message_ref":"message"},"privacy":"private","selected":true}]}}`)
+		`{"agent_id":"chatlog-agent-a","lease_id":"`+claimedJob.LeaseID+`","request_hash":"`+job.RequestHash+`","result":{"items":[{"source_type":"chatlog_message","source_role":"direct_advice","occurred_at":"not-a-time","content":"bounded","locator":{"worker_id":"worker-fixture","conversation_ref":"conversation","message_ref":"message"},"privacy":"private","selected":true}]}}`)
 	if invalidTime.Code != http.StatusBadRequest {
 		t.Fatalf("invalid time status=%d body=%s", invalidTime.Code, invalidTime.Body.String())
 	}
@@ -2273,17 +2277,86 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	if events.Code != http.StatusOK || !strings.Contains(events.Body.String(), `"code":"run_created"`) || strings.Contains(events.Body.String(), `"actor"`) || strings.Contains(events.Body.String(), `"summary"`) {
 		t.Fatalf("events status=%d body=%s", events.Code, events.Body.String())
 	}
+	saveFeedRelease(t, NewBookKnowledgeStore(root), KnowledgeRelease{
+		ReleaseID: "release-safe", BookID: "book-safe", ContentHash: "release-safe-hash",
+		UsagePolicy: BookUsageEvidenceOnly, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	})
+	run, err := researchStore.LoadRun(payload.Run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, err := NormalizeResearchWorkerResult(ResearchWorkerResult{
+		SearchedSources: []string{ResearchSourceKnowledge},
+		Items: []ResearchWorkerEvidenceCandidate{{
+			SourceType: ResearchEvidenceSourceKnowledge, SourceRole: ResearchEvidenceRoleExternalEvidence,
+			Content: "可公开的最小证据摘录", OccurredAt: "2026-08-14T10:00:00Z",
+			Locator: ResearchEvidenceLocator{ReleaseID: "release-safe", MessageRef: "claim-private", ConversationRef: "citation-safe"},
+			Privacy: ResearchEvidencePrivacyPublic, Selected: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := researchStore.StoreEvidenceBundle(run.RunID, run.Version, bundle); err != nil {
+		t.Fatal(err)
+	}
+	if err := researchStore.StoreResearchAnalysisRecords(run.RunID, []ResearchAnalysisRecord{{
+		RecordID: "timeline-safe", Kind: ResearchAnalysisTimelineEvent, Summary: "可公开的时间线摘要",
+		Attributes:         map[string]any{"occurred_at": "2026-08-14T10:00:00Z", "private_identity": "person-one"},
+		SupportEvidenceIDs: []string{bundle.Evidence[0].EvidenceID}, Confidence: 0.8, ReviewState: ResearchReviewVerified,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := researchStore.db.Exec(`INSERT INTO research_conclusions
+		(conclusion_id, run_id, conclusion_text, evidence_ids_json, citation_ids_json, confidence, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, "conclusion-safe", run.RunID, "可公开的核验结论",
+		`["`+bundle.Evidence[0].EvidenceID+`"]`, `["citation-safe"]`, 0.9, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := researchStore.db.Exec(`INSERT INTO research_identity_bindings
 		(binding_id, run_id, identity_id, source_type, source_identity_hash, confidence, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, "binding-one", payload.Run.RunID, "person-one", "chatlog", "private-hash", 0.7, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
+	identityFailure, err := json.Marshal(ResearchFailure{Code: ResearchOutcomeIdentityAmbiguous, Message: "private ambiguity detail", Retryable: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := researchStore.db.Exec(`UPDATE research_runs SET status = ?, subject_ids_json = '[]', failure_json = ?, wait_reason = ?, version = version + 1 WHERE run_id = ?`,
+		ResearchInsufficient, string(identityFailure), "identity_confirmation", run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	redactedDetail := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID), "admin-secret")
+	if redactedDetail.Code != http.StatusOK || !strings.Contains(redactedDetail.Body.String(), `"content_excerpt":"可公开的最小证据摘录"`) ||
+		!strings.Contains(redactedDetail.Body.String(), `"summary":"可公开的时间线摘要"`) ||
+		!strings.Contains(redactedDetail.Body.String(), `"text":"可公开的核验结论"`) ||
+		!strings.Contains(redactedDetail.Body.String(), `/api/citations/citation-safe?book_id=book-safe`) ||
+		!strings.Contains(redactedDetail.Body.String(), `"binding_id":"binding-one"`) ||
+		!strings.Contains(redactedDetail.Body.String(), `"confirmed":false`) {
+		t.Fatalf("redacted detail status=%d body=%s", redactedDetail.Code, redactedDetail.Body.String())
+	}
+	for _, private := range []string{"private-hash", "person-one", "claim-private", "private ambiguity detail", "private_identity", `"locator"`, `"attributes"`} {
+		if strings.Contains(redactedDetail.Body.String(), private) {
+			t.Fatalf("detail response exposed %q: %s", private, redactedDetail.Body.String())
+		}
+	}
 	confirmed := requestJSONKBase(handler, http.MethodPost,
 		"/api/research/runs/"+url.PathEscape(payload.Run.RunID)+"/identity-bindings/binding-one/confirm",
 		"admin-secret", `{}`)
 	if confirmed.Code != http.StatusOK || !strings.Contains(confirmed.Body.String(), `"confirmed":true`) || strings.Contains(confirmed.Body.String(), "private-hash") {
 		t.Fatalf("confirm status=%d body=%s", confirmed.Code, confirmed.Body.String())
+	}
+	resumed, err := researchStore.LoadRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed.Status != ResearchResolvingIdentity || !sameResearchStringSet(resumed.SubjectIDs, []string{"person-one"}) || resumed.Failure != nil || resumed.WaitReason != "" {
+		t.Fatalf("resumed run = %#v", resumed)
+	}
+	confirmedDetail := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID), "admin-secret")
+	if confirmedDetail.Code != http.StatusAccepted || !strings.Contains(confirmedDetail.Body.String(), `"confirmed":true`) || strings.Contains(confirmedDetail.Body.String(), "person-one") {
+		t.Fatalf("confirmed detail status=%d body=%s", confirmedDetail.Code, confirmedDetail.Body.String())
 	}
 	canceled := requestJSONKBase(handler, http.MethodPost, "/api/research/runs/"+url.PathEscape(payload.Run.RunID)+"/cancel", "admin-secret", `{}`)
 	if canceled.Code != http.StatusAccepted || !strings.Contains(canceled.Body.String(), `"status":"canceled"`) {
@@ -2292,6 +2365,32 @@ func TestKBaseHTTPResearchRunLifecycleBearerCompatibilityAndRedaction(t *testing
 	terminal := requestKBase(handler, http.MethodGet, "/api/research/runs/"+url.PathEscape(payload.Run.RunID), "admin-secret")
 	if terminal.Code != http.StatusOK {
 		t.Fatalf("terminal detail status=%d body=%s", terminal.Code, terminal.Body.String())
+	}
+	unrelatedFailure, err := json.Marshal(ResearchFailure{Code: ResearchOutcomePartialEvidence, Message: "private unrelated failure", Retryable: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := researchStore.db.Exec(`UPDATE research_runs SET status = ?, failure_json = ?, wait_reason = ?, version = version + 1 WHERE run_id = ?`,
+		ResearchInsufficient, string(unrelatedFailure), "manual_review", run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	beforeUnrelatedConfirmation, err := researchStore.LoadRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedConfirmation := requestJSONKBase(handler, http.MethodPost,
+		"/api/research/runs/"+url.PathEscape(payload.Run.RunID)+"/identity-bindings/binding-one/confirm", "admin-secret", `{}`)
+	if unrelatedConfirmation.Code != http.StatusOK || !strings.Contains(unrelatedConfirmation.Body.String(), `"resumed":false`) {
+		t.Fatalf("unrelated confirmation status=%d body=%s", unrelatedConfirmation.Code, unrelatedConfirmation.Body.String())
+	}
+	afterUnrelatedConfirmation, err := researchStore.LoadRun(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterUnrelatedConfirmation.Status != ResearchInsufficient || afterUnrelatedConfirmation.Failure == nil ||
+		afterUnrelatedConfirmation.Failure.Code != ResearchOutcomePartialEvidence || afterUnrelatedConfirmation.WaitReason != "manual_review" ||
+		afterUnrelatedConfirmation.Version != beforeUnrelatedConfirmation.Version {
+		t.Fatalf("unrelated terminal run mutated: before=%#v after=%#v", beforeUnrelatedConfirmation, afterUnrelatedConfirmation)
 	}
 }
 

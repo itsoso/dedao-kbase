@@ -83,17 +83,21 @@ func (c *ResearchWorkerClient) Renew(ctx context.Context, job ResearchWorkerJob,
 	}
 	payload := struct {
 		AgentID      string `json:"agent_id"`
+		LeaseID      string `json:"lease_id"`
 		LeaseSeconds int    `json:"lease_seconds"`
-	}{c.agentID, int(lease / time.Second)}
+	}{c.agentID, job.LeaseID, int(lease / time.Second)}
 	var response struct {
 		Job ResearchWorkerJob `json:"job"`
 	}
 	requestPath := "/api/research-worker/jobs/" + url.PathEscape(job.JobID) + "/renew"
-	idempotency := job.JobID + ":" + job.RequestHash + ":renew"
+	idempotency := job.JobID + ":" + job.LeaseID + ":renew"
 	if err := c.doJSON(ctx, http.MethodPost, requestPath, idempotency, payload, &response); err != nil {
 		return err
 	}
-	return c.validateJob(response.Job, job.JobID, ResearchWorkerJobLeased)
+	if err := c.validateJob(response.Job, job.JobID, ResearchWorkerJobLeased); err != nil {
+		return err
+	}
+	return validateResearchWorkerResponseLease(job, response.Job)
 }
 
 func (c *ResearchWorkerClient) Complete(ctx context.Context, job ResearchWorkerJob, result ResearchWorkerResult) (ResearchWorkerJob, error) {
@@ -102,18 +106,22 @@ func (c *ResearchWorkerClient) Complete(ctx context.Context, job ResearchWorkerJ
 	}
 	payload := struct {
 		AgentID     string               `json:"agent_id"`
+		LeaseID     string               `json:"lease_id"`
 		RequestHash string               `json:"request_hash"`
 		Result      ResearchWorkerResult `json:"result"`
-	}{c.agentID, job.RequestHash, result}
+	}{c.agentID, job.LeaseID, job.RequestHash, result}
 	var response struct {
 		Job ResearchWorkerJob `json:"job"`
 	}
 	requestPath := "/api/research-worker/jobs/" + url.PathEscape(job.JobID) + "/complete"
-	idempotency := job.JobID + ":" + job.RequestHash + ":complete"
+	idempotency := job.JobID + ":" + job.LeaseID + ":complete"
 	if err := c.doJSON(ctx, http.MethodPost, requestPath, idempotency, payload, &response); err != nil {
 		return ResearchWorkerJob{}, err
 	}
 	if err := c.validateJob(response.Job, job.JobID, ResearchWorkerJobCompleted); err != nil {
+		return ResearchWorkerJob{}, err
+	}
+	if err := validateResearchWorkerResponseLease(job, response.Job); err != nil {
 		return ResearchWorkerJob{}, err
 	}
 	return response.Job, nil
@@ -125,15 +133,16 @@ func (c *ResearchWorkerClient) Fail(ctx context.Context, job ResearchWorkerJob, 
 	}
 	payload := struct {
 		AgentID     string `json:"agent_id"`
+		LeaseID     string `json:"lease_id"`
 		RequestHash string `json:"request_hash"`
 		Code        string `json:"code"`
 		Retryable   bool   `json:"retryable"`
-	}{c.agentID, job.RequestHash, code, retryable}
+	}{c.agentID, job.LeaseID, job.RequestHash, code, retryable}
 	var response struct {
 		Job ResearchWorkerJob `json:"job"`
 	}
 	requestPath := "/api/research-worker/jobs/" + url.PathEscape(job.JobID) + "/fail"
-	idempotency := job.JobID + ":" + job.RequestHash + ":fail:" + strings.TrimSpace(code)
+	idempotency := job.JobID + ":" + job.LeaseID + ":fail:" + strings.TrimSpace(code)
 	if err := c.doJSON(ctx, http.MethodPost, requestPath, idempotency, payload, &response); err != nil {
 		return ResearchWorkerJob{}, err
 	}
@@ -143,7 +152,17 @@ func (c *ResearchWorkerClient) Fail(ctx context.Context, job ResearchWorkerJob, 
 	if err := c.validateJob(response.Job, job.JobID, response.Job.State); err != nil {
 		return ResearchWorkerJob{}, err
 	}
+	if err := validateResearchWorkerResponseLease(job, response.Job); err != nil {
+		return ResearchWorkerJob{}, err
+	}
 	return response.Job, nil
+}
+
+func validateResearchWorkerResponseLease(request, response ResearchWorkerJob) error {
+	if strings.TrimSpace(request.LeaseID) == "" || response.LeaseID != request.LeaseID {
+		return fmt.Errorf("invalid research worker response")
+	}
+	return nil
 }
 
 func (c *ResearchWorkerClient) doJSON(ctx context.Context, method, requestPath, idempotency string, payload, response any) error {
@@ -193,9 +212,16 @@ func (c *ResearchWorkerClient) doJSON(ctx context.Context, method, requestPath, 
 }
 
 func (c *ResearchWorkerClient) validateJob(job ResearchWorkerJob, expectedJobID, expectedState string) error {
+	validLeaseOwner := job.LeaseOwner == c.agentID
+	if expectedState == ResearchWorkerJobQueued || expectedState == ResearchWorkerJobFailed {
+		validLeaseOwner = job.LeaseOwner == ""
+	}
 	if strings.TrimSpace(job.JobID) == "" || strings.TrimSpace(job.RunID) == "" ||
-		job.TargetAgentID != c.agentID || job.LeaseOwner != c.agentID || job.State != expectedState ||
+		job.TargetAgentID != c.agentID || !validLeaseOwner || job.State != expectedState ||
 		job.Attempt <= 0 || strings.TrimSpace(job.RequestHash) == "" {
+		return fmt.Errorf("invalid research worker response")
+	}
+	if strings.TrimSpace(job.LeaseID) == "" {
 		return fmt.Errorf("invalid research worker response")
 	}
 	if expectedJobID != "" && job.JobID != expectedJobID {

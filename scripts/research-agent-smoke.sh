@@ -105,7 +105,9 @@ curl --fail --silent --show-error \
 run_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["run_id"])' "$run_response")"
 
 worker_output="$smoke_root/worker.json"
-for _ in $(seq 1 100); do
+detail_response="$smoke_root/detail.json"
+worker_job_completed=false
+for _ in $(seq 1 300); do
   env \
     KBASE_REMOTE_URL="$kbase_url" \
     KBASE_SOURCE_AGENT_TOKEN="$source_token" \
@@ -113,15 +115,9 @@ for _ in $(seq 1 100); do
     CHATLOG_AGENT_STATE_DIR="$state_root" \
     CHATLOG_BASE_URL="$fixture_url" \
     "$smoke_root/chatlog-agent" once >"$worker_output" 2>"$smoke_root/worker.err"
-  if python3 -c 'import json,sys; raise SystemExit(0 if json.load(open(sys.argv[1])).get("job_id") else 1)' "$worker_output"; then
-    break
+  if python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if value.get("job_state")=="completed" else 1)' "$worker_output"; then
+    worker_job_completed=true
   fi
-  sleep 0.1
-done
-python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value.get("ok") and value.get("heartbeat") and value.get("job_state")=="completed" and value.get("evidence_count")==1' "$worker_output"
-
-detail_response="$smoke_root/detail.json"
-for _ in $(seq 1 300); do
   curl --fail --silent --show-error -H "Authorization: Bearer $auth_token" \
     "$kbase_url/api/research/runs/$run_id" >"$detail_response"
   status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run"]["status"])' "$detail_response")"
@@ -129,6 +125,7 @@ for _ in $(seq 1 300); do
   [[ "$status" == "failed" || "$status" == "insufficient" || "$status" == "canceled" ]] && exit 1
   sleep 0.1
 done
+[[ "$worker_job_completed" == "true" ]]
 python3 -c 'import json,sys; run=json.load(open(sys.argv[1]))["run"]; assert run["status"]=="completed"; assert run["actual_scope"]["searched_sources"]==["chatlog"]; assert run["actual_scope"]["cited_sources"]==["chatlog"]' "$detail_response"
 
 events_response="$smoke_root/events.json"
@@ -149,11 +146,17 @@ conclusions = connection.execute(
 jobs = connection.execute(
     "SELECT COUNT(*) FROM research_worker_jobs WHERE run_id = ? AND state = 'completed'", (run_id,)
 ).fetchone()[0]
+expand_jobs = connection.execute(
+    "SELECT COUNT(*) FROM research_worker_jobs WHERE run_id = ? AND tool = 'expand_chat_context' AND state = 'completed'", (run_id,)
+).fetchone()[0]
+evidence = connection.execute(
+    "SELECT COUNT(*) FROM research_evidence WHERE run_id = ?", (run_id,)
+).fetchone()[0]
 events = connection.execute(
     "SELECT COUNT(*) FROM research_events WHERE run_id = ?", (run_id,)
 ).fetchone()[0]
 assert len(conclusions) == 1 and json.loads(conclusions[0][0])
-assert jobs == 1 and events >= 8
+assert jobs == 3 and expand_jobs == 1 and evidence == 3 and events >= 12
 PY
 
 if rg -q 'SMOKE_PRIVATE_RAW_SENTINEL' "$smoke_root/kbase.log" "$smoke_root/worker.json" "$smoke_root/worker.err"; then

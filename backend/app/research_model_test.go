@@ -41,10 +41,10 @@ func TestResearchModelRunsRoleSpecificStrictOutputs(t *testing.T) {
 		},
 		{
 			role:    ResearchRoleExtractor,
-			content: `{"decision_summary":"Extract one supported fact","facts":[{"fact_id":"fact-a","kind":"observation","summary":"Synthetic fact","evidence_ids":["evidence-a"],"confidence":0.9,"review_state":"pending"}],"claims":[]}`,
+			content: `{"decision_summary":"Extract typed grounded records","facts":[{"fact_id":"fact-a","kind":"observation","summary":"Synthetic fact","evidence_ids":["evidence-a"],"confidence":0.9,"review_state":"pending"}],"claims":[],"measurements":[{"measurement_id":"measurement-a","name":"ct","value":18,"occurred_at":"2032-01-01T00:00:00Z","evidence_ids":["evidence-a"],"confidence":0.9}],"cases":[{"case_id":"case-a","role":"current","age":34,"stage_day":4,"evidence_ids":["evidence-a"]}]}`,
 			output:  &ResearchExtractorOutput{},
 			check: func(t *testing.T, output any) {
-				if len(output.(*ResearchExtractorOutput).Facts) != 1 {
+				if len(output.(*ResearchExtractorOutput).Facts) != 1 || len(output.(*ResearchExtractorOutput).Measurements) != 1 || len(output.(*ResearchExtractorOutput).Cases) != 1 {
 					t.Fatalf("extractor = %#v", output)
 				}
 			},
@@ -110,6 +110,7 @@ func TestResearchModelRejectsNonStrictOrUnsupportedOutput(t *testing.T) {
 		{"unsupported tool", ResearchRolePlanner, `{"decision_summary":"x","tool_calls":[{"tool":"write_chatlog","arguments":{}}]}`, &ResearchPlannerOutput{}, "unsupported"},
 		{"over limit array", ResearchRoleExtractor, `{"decision_summary":"x","facts":[` + strings.Join(overLimitFacts, ",") + `],"claims":[]}`, &ResearchExtractorOutput{}, "exceeds"},
 		{"unreferenced evidence", ResearchRoleExtractor, `{"decision_summary":"x","facts":[{"fact_id":"fact-a","kind":"observation","summary":"x","evidence_ids":["evidence-missing"],"confidence":0.8,"review_state":"pending"}],"claims":[]}`, &ResearchExtractorOutput{}, "unreferenced evidence"},
+		{"unreferenced measurement", ResearchRoleExtractor, `{"decision_summary":"x","facts":[],"claims":[],"measurements":[{"measurement_id":"measurement-a","name":"ct","value":18,"occurred_at":"2032-01-01T00:00:00Z","evidence_ids":["evidence-missing"],"confidence":0.8}]}`, &ResearchExtractorOutput{}, "unreferenced evidence"},
 		{"conclusion without support", ResearchRoleSynthesizer, `{"decision_summary":"x","conclusions":[{"conclusion_id":"conclusion-a","text":"x","support_evidence_ids":[],"citation_ids":[],"confidence":0.8}]}`, &ResearchSynthesizerOutput{}, "support"},
 		{"unreferenced citation", ResearchRoleSynthesizer, `{"decision_summary":"x","conclusions":[{"conclusion_id":"conclusion-a","text":"x","support_evidence_ids":["evidence-a"],"citation_ids":["citation-missing"],"confidence":0.8}]}`, &ResearchSynthesizerOutput{}, "unreferenced citation"},
 	}

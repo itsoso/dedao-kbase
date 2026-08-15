@@ -118,7 +118,7 @@ func TestResearchKnowledgeToolFailsClosedWhenPinnedReleaseChanges(t *testing.T) 
 	}
 }
 
-func TestResearchPriorRunToolReturnsOnlyVerifiedConclusionsAndRequiresNewLocatorVerification(t *testing.T) {
+func TestResearchPriorRunToolPromotesVerifiedConclusionAndRequiresVerificationForUnderlyingPrivateExcerpt(t *testing.T) {
 	knowledge, pkg := agentRuntimeTestStore(t)
 	research, err := OpenResearchStore(knowledge.Root(), nil)
 	if err != nil {
@@ -136,7 +136,7 @@ func TestResearchPriorRunToolReturnsOnlyVerifiedConclusionsAndRequiresNewLocator
 		Items: []ResearchWorkerEvidenceCandidate{{
 			SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
 			Content: "Synthetic private history", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
-			Locator: ResearchEvidenceLocator{WorkerID: "worker-1", ConversationRef: "room-1", MessageRef: "message-1"},
+			Locator: ResearchEvidenceLocator{WorkerID: "worker-1", ConversationRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451", MessageRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451"},
 		}},
 	})
 	if err != nil {
@@ -174,7 +174,8 @@ func TestResearchPriorRunToolReturnsOnlyVerifiedConclusionsAndRequiresNewLocator
 		t.Fatal(err)
 	}
 	if len(withoutVerification.PriorConclusions) != 1 || withoutVerification.PriorConclusions[0].RunID != verifiedRun.RunID ||
-		len(withoutVerification.PromotedEvidence) != 0 {
+		len(withoutVerification.PromotedEvidence) != 1 ||
+		withoutVerification.PromotedEvidence[0].Locator.MessageRef != "conclusion-verified" {
 		t.Fatalf("prior results without verification = %#v", withoutVerification)
 	}
 
@@ -191,10 +192,25 @@ func TestResearchPriorRunToolReturnsOnlyVerifiedConclusionsAndRequiresNewLocator
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(withVerification.PromotedEvidence) != 1 ||
+	if len(withVerification.PromotedEvidence) != 2 ||
 		withVerification.PromotedEvidence[0].SourceType != ResearchEvidenceSourcePriorRun ||
 		withVerification.PromotedEvidence[0].Locator.PriorRunID != verifiedRun.RunID {
 		t.Fatalf("verified prior evidence = %#v", withVerification.PromotedEvidence)
+	}
+	foreignCurrent := createResearchToolRun(t, research, pkg, "prior-foreign-owner")
+	if _, err := research.db.Exec(`INSERT INTO research_http_owners(run_id, owner_hash, created_at) VALUES (?, ?, ?), (?, ?, ?)`,
+		verifiedRun.RunID, "owner-a", verifiedRun.UpdatedAt, foreignCurrent.RunID, "owner-b", foreignCurrent.UpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	foreignResult, err := registry.Execute(context.Background(), ResearchToolSearchPriorRuns, ResearchToolRequest{
+		RunID: foreignCurrent.RunID, PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Arguments: map[string]any{"query": "synthetic conclusion", "limit": 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(foreignResult.PriorConclusions) != 0 || len(foreignResult.PromotedEvidence) != 0 {
+		t.Fatalf("cross-owner prior result=%#v", foreignResult)
 	}
 }
 

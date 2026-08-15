@@ -4,6 +4,7 @@ import json
 import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 
 PRIVATE_SENTINEL = "SMOKE_PRIVATE_RAW_SENTINEL"
@@ -86,14 +87,36 @@ class Handler(BaseHTTPRequestHandler):
             self.write_json(200, {"items": []})
             return
         if path == "/api/v1/chatlog":
-            self.write_json(200, [{
-                "seq": 7301,
-                "time": "2026-08-13T08:01:00+08:00",
-                "talker": "smoke-conversation",
-                "sender": "smoke-identity",
-                "type": 1,
-                "content": PRIVATE_SENTINEL + " bounded selected evidence",
-            }])
+            messages = [
+                {
+                    "seq": 7300,
+                    "time": "2026-08-13T08:00:00+08:00",
+                    "talker": "smoke-conversation",
+                    "sender": "smoke-peer",
+                    "type": 1,
+                    "content": "bounded context before the selected message",
+                },
+                {
+                    "seq": 7301,
+                    "time": "2026-08-13T08:01:00+08:00",
+                    "talker": "smoke-conversation",
+                    "sender": "smoke-identity",
+                    "type": 1,
+                    "content": PRIVATE_SENTINEL + " synthetic bounded selected evidence",
+                },
+                {
+                    "seq": 7302,
+                    "time": "2026-08-13T08:02:00+08:00",
+                    "talker": "smoke-conversation",
+                    "sender": "smoke-peer",
+                    "type": 1,
+                    "content": "bounded context after the selected message",
+                },
+            ]
+            query = parse_qs(urlparse(self.path).query)
+            if query.get("keyword"):
+                messages = [messages[1]]
+            self.write_json(200, messages)
             return
         self.write_json(404, {"error": "not_found"})
 

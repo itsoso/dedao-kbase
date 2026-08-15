@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/yann0917/dedao-gui/backend/app"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,6 +14,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/yann0917/dedao-gui/backend/app"
 )
 
 func TestMain(m *testing.M) {
@@ -85,6 +87,116 @@ func (f chatlogControlRunnerFake) RunOnce(context.Context) (app.SourceAgentCycle
 }
 
 func (f chatlogControlRunnerFake) ControlActive() bool { return f.active }
+
+type chatlogResearchClientFake struct {
+	mu            sync.Mutex
+	job           *app.ResearchWorkerJob
+	renewErr      error
+	renewCalls    int
+	completeCalls int
+	failCalls     int
+}
+
+func (f *chatlogResearchClientFake) Claim(context.Context, time.Duration) (*app.ResearchWorkerJob, error) {
+	return f.job, nil
+}
+
+func (f *chatlogResearchClientFake) Renew(context.Context, app.ResearchWorkerJob, time.Duration) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.renewCalls++
+	return f.renewErr
+}
+
+func (f *chatlogResearchClientFake) Complete(_ context.Context, job app.ResearchWorkerJob, _ app.ResearchWorkerResult) (app.ResearchWorkerJob, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completeCalls++
+	job.State = app.ResearchWorkerJobCompleted
+	return job, nil
+}
+
+func (f *chatlogResearchClientFake) Fail(_ context.Context, job app.ResearchWorkerJob, code string, _ bool) (app.ResearchWorkerJob, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failCalls++
+	job.State = app.ResearchWorkerJobFailed
+	job.FailureCode = code
+	return job, nil
+}
+
+func (f *chatlogResearchClientFake) counts() (int, int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.renewCalls, f.completeCalls, f.failCalls
+}
+
+func TestChatlogAgentRenewsLeaseDuringLongResearchJob(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/chatlog" {
+			http.NotFound(w, r)
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer local.Close()
+	reader, err := app.NewChatlogHTTPReader(app.ChatlogHTTPConfig{BaseURL: local.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &chatlogResearchClientFake{job: &app.ResearchWorkerJob{
+		JobID: "research-job-heartbeat", RunID: "research-run-heartbeat", TargetAgentID: "chatlog-agent-a",
+		Tool: app.ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"time_from":"2026-08-15T00:00:00Z","time_to":"2026-08-15T23:59:59Z","talker_ref":"conversation","keyword":"term","limit":1}`),
+		State: app.ResearchWorkerJobLeased, Attempt: 1, MaxAttempts: 2, LeaseOwner: "chatlog-agent-a",
+		LeaseID: "research-lease-heartbeat", RequestHash: "sha256:request",
+	}}
+	runtime := &chatlogAgentRuntime{
+		control: chatlogControlRunnerFake{result: app.SourceAgentCycleResult{OK: true}}, researchClient: client,
+		reader: reader, agentID: "chatlog-agent-a", locators: &chatlogLocatorCache{entries: map[string]chatlogLocatorCacheEntry{}},
+		jobLease: time.Second, renewInterval: 5 * time.Millisecond,
+	}
+	if _, err := runtime.once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	renews, completes, fails := client.counts()
+	if renews == 0 || completes != 1 || fails != 0 {
+		t.Fatalf("renews=%d completes=%d fails=%d", renews, completes, fails)
+	}
+}
+
+func TestChatlogAgentCancelsJobAndDoesNotSubmitAfterRenewLoss(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/chatlog" {
+			http.NotFound(w, r)
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer local.Close()
+	reader, err := app.NewChatlogHTTPReader(app.ChatlogHTTPConfig{BaseURL: local.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &chatlogResearchClientFake{renewErr: errors.New("stale lease"), job: &app.ResearchWorkerJob{
+		JobID: "research-job-renew-loss", RunID: "research-run-renew-loss", TargetAgentID: "chatlog-agent-a",
+		Tool: app.ResearchWorkerToolSearchChatlog, Arguments: []byte(`{"time_from":"2026-08-15T00:00:00Z","time_to":"2026-08-15T23:59:59Z","talker_ref":"conversation","keyword":"term","limit":1}`),
+		State: app.ResearchWorkerJobLeased, Attempt: 1, MaxAttempts: 2, LeaseOwner: "chatlog-agent-a",
+		LeaseID: "research-lease-renew-loss", RequestHash: "sha256:request",
+	}}
+	runtime := &chatlogAgentRuntime{
+		control: chatlogControlRunnerFake{result: app.SourceAgentCycleResult{OK: true}}, researchClient: client,
+		reader: reader, agentID: "chatlog-agent-a", locators: &chatlogLocatorCache{entries: map[string]chatlogLocatorCacheEntry{}},
+		jobLease: time.Second, renewInterval: 5 * time.Millisecond,
+	}
+	if _, err := runtime.once(context.Background()); !errors.Is(err, errChatlogWorkerLeaseLost) {
+		t.Fatalf("once error=%v", err)
+	}
+	renews, completes, fails := client.counts()
+	if renews != 1 || completes != 0 || fails != 0 {
+		t.Fatalf("renews=%d completes=%d fails=%d", renews, completes, fails)
+	}
+}
 
 func TestChatlogAgentDoesNotClaimResearchWhileControlCommandIsActive(t *testing.T) {
 	remoteCalls := 0
@@ -261,12 +373,12 @@ func TestChatlogAgentOnceHeartbeatsAndCompletesSearchWithoutLoggingContent(t *te
 		case "/api/source-agent/commands/claim":
 			_, _ = w.Write([]byte(`{"command":null}`))
 		case "/api/research-worker/jobs/claim":
-			_, _ = w.Write([]byte(`{"job":{"job_id":"research-job-1","run_id":"research-run-1","target_agent_id":"chatlog-agent-a","tool":"search_chatlog","arguments":{"time_from":"2026-08-13T00:00:00Z","time_to":"2026-08-13T23:59:59Z","talker_ref":"conversation-1","keyword":"term","limit":10},"state":"leased","attempt":1,"max_attempts":2,"lease_owner":"chatlog-agent-a","lease_expires_at":"2026-08-13T13:00:00Z","request_hash":"sha256:request"}}`))
+			_, _ = w.Write([]byte(`{"job":{"job_id":"research-job-1","run_id":"research-run-1","target_agent_id":"chatlog-agent-a","tool":"search_chatlog","arguments":{"time_from":"2026-08-13T00:00:00Z","time_to":"2026-08-13T23:59:59Z","talker_ref":"conversation-1","keyword":"term","limit":10},"state":"leased","attempt":1,"max_attempts":2,"lease_owner":"chatlog-agent-a","lease_id":"research-lease-1","lease_expires_at":"2026-08-13T13:00:00Z","request_hash":"sha256:request"}}`))
 		case "/api/research-worker/jobs/research-job-1/complete":
 			if err := json.NewDecoder(r.Body).Decode(&completed); err != nil {
 				t.Fatal(err)
 			}
-			_, _ = w.Write([]byte(`{"job":{"job_id":"research-job-1","run_id":"research-run-1","target_agent_id":"chatlog-agent-a","tool":"search_chatlog","arguments":{"time_from":"2026-08-13T00:00:00Z","time_to":"2026-08-13T23:59:59Z","talker_ref":"conversation-1","keyword":"term","limit":10},"state":"completed","attempt":1,"max_attempts":2,"lease_owner":"chatlog-agent-a","request_hash":"sha256:request","result_fingerprint":"sha256:result"}}`))
+			_, _ = w.Write([]byte(`{"job":{"job_id":"research-job-1","run_id":"research-run-1","target_agent_id":"chatlog-agent-a","tool":"search_chatlog","arguments":{"time_from":"2026-08-13T00:00:00Z","time_to":"2026-08-13T23:59:59Z","talker_ref":"conversation-1","keyword":"term","limit":10},"state":"completed","attempt":1,"max_attempts":2,"lease_owner":"chatlog-agent-a","lease_id":"research-lease-1","request_hash":"sha256:request","result_fingerprint":"sha256:result"}}`))
 		default:
 			t.Fatalf("unexpected remote path=%s", r.URL.Path)
 		}
@@ -280,6 +392,13 @@ func TestChatlogAgentOnceHeartbeatsAndCompletesSearchWithoutLoggingContent(t *te
 	if strings.Join(calls, ",") != "/api/source-agent/heartbeat,/api/source-agent/commands/claim,/api/research-worker/jobs/claim,/api/research-worker/jobs/research-job-1/complete" {
 		t.Fatalf("calls=%v", calls)
 	}
+	var cycle chatlogAgentCycleResult
+	if err := json.Unmarshal(stdout.Bytes(), &cycle); err != nil {
+		t.Fatal(err)
+	}
+	if cycle.CandidateCount != 1 || cycle.EvidenceCount != 0 {
+		t.Fatalf("cycle counts=%#v", cycle)
+	}
 	health, _ := heartbeat["capability_health"].(map[string]any)
 	if heartbeat["worker_type"] != chatlogAgentWorkerType || health["chatlog_read"] == nil {
 		t.Fatalf("heartbeat=%#v", heartbeat)
@@ -288,6 +407,22 @@ func TestChatlogAgentOnceHeartbeatsAndCompletesSearchWithoutLoggingContent(t *te
 	items, _ := result["items"].([]any)
 	if len(items) != 1 {
 		t.Fatalf("completed=%#v", completed)
+	}
+	candidate, _ := items[0].(map[string]any)
+	locator, _ := candidate["locator"].(map[string]any)
+	conversationRef, _ := locator["conversation_ref"].(string)
+	messageRef, _ := locator["message_ref"].(string)
+	if candidate["selected"] != false || candidate["content"] != "" || !strings.HasPrefix(conversationRef, "sha256:") || conversationRef != messageRef {
+		t.Fatalf("search candidate crossed privacy boundary: %#v", candidate)
+	}
+	encodedCompletion, err := json.Marshal(completed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{privateContent, "conversation-1", "3001", "identity-1"} {
+		if strings.Contains(string(encodedCompletion), forbidden) {
+			t.Fatalf("completion leaked %q: %s", forbidden, encodedCompletion)
+		}
 	}
 	for _, output := range []string{stdout.String(), stderr.String()} {
 		for _, forbidden := range []string{privateContent, "identity-1", "shared-token", env["CHATLOG_AGENT_STATE_DIR"]} {
@@ -299,6 +434,19 @@ func TestChatlogAgentOnceHeartbeatsAndCompletesSearchWithoutLoggingContent(t *te
 }
 
 func TestChatlogAgentContextExpansionDropsKeywordAndSender(t *testing.T) {
+	stateDir := t.TempDir()
+	cache, err := openChatlogLocatorCache(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageTime, err := time.Parse(time.RFC3339, "2026-08-13T08:02:00+08:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateRef, err := cache.store(app.ChatlogMessage{Time: messageTime, Talker: "conversation-1", MessageRef: "4002"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var chatlogQuery string
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -314,15 +462,55 @@ func TestChatlogAgentContextExpansionDropsKeywordAndSender(t *testing.T) {
 		}
 	}))
 	defer local.Close()
-	remote := chatlogAgentJobServer(t, `{"job":{"job_id":"research-job-2","run_id":"research-run-1","target_agent_id":"chatlog-agent-a","tool":"expand_chat_context","arguments":{"message_ref":"4002","conversation_ref":"conversation-1","time":"2026-08-13","before":1,"after":1},"state":"leased","attempt":1,"max_attempts":2,"lease_owner":"chatlog-agent-a","request_hash":"sha256:request"}}`)
+	remote := chatlogAgentJobServer(t, `{"job":{"job_id":"research-job-2","run_id":"research-run-1","target_agent_id":"chatlog-agent-a","tool":"expand_chat_context","arguments":{"message_ref":"`+candidateRef+`","conversation_ref":"`+candidateRef+`","time":"2026-08-13","before":1,"after":1},"state":"leased","attempt":1,"max_attempts":2,"lease_owner":"chatlog-agent-a","lease_id":"research-lease-2","request_hash":"sha256:request"}}`)
 	defer remote.Close()
 	var stdout, stderr bytes.Buffer
-	if err := runChatlogAgentCLI(context.Background(), []string{"once"}, chatlogAgentTestEnvironment(remote.URL, local.URL, t.TempDir()).lookup, &stdout, &stderr); err != nil {
+	if err := runChatlogAgentCLI(context.Background(), []string{"once"}, chatlogAgentTestEnvironment(remote.URL, local.URL, stateDir).lookup, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	values, _ := url.ParseQuery(chatlogQuery)
 	if values.Get("keyword") != "" || values.Get("sender") != "" || values.Get("talker") != "conversation-1" {
 		t.Fatalf("context query=%s", chatlogQuery)
+	}
+}
+
+func TestChatlogAgentIdentityResolutionReturnsOnlyOpaqueCandidates(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/contact" || r.URL.Query().Get("keyword") != "target-name" {
+			t.Fatalf("request=%s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		_, _ = w.Write([]byte(`{"items":[
+			{"userName":"target-name","alias":"private-alias","remark":"private-remark","nickName":"private-name","isFriend":true},
+			{"userName":"other-account","alias":"target-name","remark":"","nickName":"","isFriend":true}
+		]}`))
+	}))
+	defer local.Close()
+	reader, err := app.NewChatlogHTTPReader(app.ChatlogHTTPConfig{BaseURL: local.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &chatlogAgentRuntime{reader: reader, agentID: "chatlog-agent-a"}
+	result, err := runtime.executeJob(context.Background(), app.ResearchWorkerJob{
+		Tool: app.ResearchWorkerToolResolveChatIdentity, Arguments: []byte(`{"identity_ref":"target-name"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.IdentityCandidates) != 2 || result.IdentityCandidates[0].IdentityID == "" {
+		t.Fatalf("identity candidates=%#v", result.IdentityCandidates)
+	}
+	exact := result.IdentityCandidates[0]
+	if exact.AccountID != exact.IdentityID || exact.TargetAccountID != exact.IdentityID {
+		t.Fatalf("exact identity candidate=%#v", exact)
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"target-name", "private-alias", "private-remark", "private-name", "other-account"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("identity result leaked %q: %s", forbidden, encoded)
+		}
 	}
 }
 

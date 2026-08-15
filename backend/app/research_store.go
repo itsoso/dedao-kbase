@@ -35,6 +35,7 @@ var (
 	ErrResearchRunIdempotencyConflict = errors.New("research run idempotency conflict")
 	ErrResearchRunVersionConflict     = errors.New("research run version conflict")
 	ErrResearchRunLeaseOwner          = errors.New("research run belongs to another coordinator")
+	ErrResearchRunStaleLease          = errors.New("research run lease is stale")
 
 	researchStoreTransitionFault = func(string) error { return nil }
 )
@@ -124,6 +125,7 @@ func migrateResearchStore(db *sql.DB) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			lease_owner TEXT NOT NULL DEFAULT '',
+			lease_epoch TEXT NOT NULL DEFAULT '',
 			lease_expires_at TEXT NOT NULL DEFAULT ''
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_research_runs_status_updated ON research_runs(status, updated_at, run_id)`,
@@ -138,6 +140,11 @@ func migrateResearchStore(db *sql.DB) error {
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_research_events_run_sequence ON research_events(run_id, sequence)`,
+		`CREATE TABLE IF NOT EXISTS research_http_owners (
+			run_id TEXT PRIMARY KEY REFERENCES research_runs(run_id) ON DELETE CASCADE,
+			owner_hash TEXT NOT NULL, created_at TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_http_owners_owner ON research_http_owners(owner_hash, run_id)`,
 		`CREATE TABLE IF NOT EXISTS research_steps (
 			step_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
 			stage TEXT NOT NULL, status TEXT NOT NULL, decision_summary TEXT NOT NULL DEFAULT '',
@@ -173,26 +180,45 @@ func migrateResearchStore(db *sql.DB) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS research_conclusions (
 			conclusion_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
-			conclusion_text TEXT NOT NULL, evidence_ids_json TEXT NOT NULL DEFAULT '[]', confidence REAL NOT NULL,
+			conclusion_text TEXT NOT NULL, evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+			citation_ids_json TEXT NOT NULL DEFAULT '[]', confidence REAL NOT NULL,
 			created_at TEXT NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS research_worker_jobs (
 			job_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
 			target_agent_id TEXT NOT NULL, tool TEXT NOT NULL, arguments_json TEXT NOT NULL, state TEXT NOT NULL,
 			attempt INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL,
-			lease_owner TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL,
+			lease_owner TEXT NOT NULL DEFAULT '', lease_id TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT '', request_hash TEXT NOT NULL,
 			result_fingerprint TEXT NOT NULL DEFAULT '', failure_code TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '',
 			UNIQUE (run_id, request_hash)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_research_worker_jobs_state_lease ON research_worker_jobs(target_agent_id, state, lease_expires_at, created_at)`,
+		`CREATE TABLE IF NOT EXISTS research_worker_candidates (
+			run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
+			job_id TEXT NOT NULL REFERENCES research_worker_jobs(job_id) ON DELETE CASCADE,
+			candidate_ref TEXT NOT NULL, source_type TEXT NOT NULL, source_role TEXT NOT NULL,
+			occurred_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+			PRIMARY KEY (run_id, candidate_ref)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_worker_candidates_job ON research_worker_candidates(job_id, candidate_ref)`,
 		`CREATE TABLE IF NOT EXISTS research_model_invocations (
 			invocation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
 			request_identity TEXT NOT NULL UNIQUE, model TEXT NOT NULL, purpose TEXT NOT NULL,
-			status TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0, lease_epoch TEXT NOT NULL DEFAULT '',
+			input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
 			estimated_cost_usd REAL NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_research_model_request_identity ON research_model_invocations(request_identity)`,
+		`CREATE TABLE IF NOT EXISTS research_model_invocation_attempts (
+			request_identity TEXT NOT NULL, attempt INTEGER NOT NULL, run_id TEXT NOT NULL REFERENCES research_runs(run_id) ON DELETE CASCADE,
+			lease_epoch TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+			reserved_cost_usd REAL NOT NULL DEFAULT 0, actual_cost_usd REAL NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+			PRIMARY KEY (request_identity, attempt)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_research_model_attempts_run ON research_model_invocation_attempts(run_id, status, updated_at)`,
 		`CREATE TABLE IF NOT EXISTS research_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`INSERT OR IGNORE INTO research_meta(key, value) VALUES ('schema_version', '1')`,
 	}
@@ -201,7 +227,48 @@ func migrateResearchStore(db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	if err := ensureResearchStoreColumn(db, "research_conclusions", "citation_ids_json", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_worker_jobs", "lease_id", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_runs", "lease_epoch", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := ensureResearchStoreColumn(db, "research_model_invocations", "attempt", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	return ensureResearchStoreColumn(db, "research_model_invocations", "lease_epoch", `TEXT NOT NULL DEFAULT ''`)
+}
+
+func ensureResearchStoreColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull, primaryKey int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 func (s *ResearchStore) CreateRun(input ResearchRunInput) (*ResearchRun, bool, error) {
@@ -249,12 +316,12 @@ func (s *ResearchStore) CreateRun(input ResearchRunInput) (*ResearchRun, bool, e
 		run_id, idempotency_key, request_hash, schema_version, mode, question, status,
 		package_id, package_version, subject_ids_json, requested_sources_json, route_reasons_json,
 		actual_scope_json, budget_json, wait_reason, failure_json, version, created_at, updated_at,
-		lease_owner, lease_expires_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		lease_owner, lease_epoch, lease_expires_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		run.RunID, input.IdempotencyKey, requestHash, run.SchemaVersion, run.Mode, run.Question, run.Status,
 		run.PackageID, run.PackageVersion, values.subjectIDs, values.requestedSources, values.routeReasons,
 		values.actualScope, values.budget, run.WaitReason, values.failure, run.Version, run.CreatedAt, run.UpdatedAt,
-		run.LeaseOwner, run.LeaseExpiresAt)
+		run.LeaseOwner, run.LeaseEpoch, run.LeaseExpiresAt)
 	if err != nil {
 		return nil, false, err
 	}
@@ -272,6 +339,14 @@ func (s *ResearchStore) LoadRun(runID string) (*ResearchRun, error) {
 }
 
 func (s *ResearchStore) TransitionRun(runID string, expectedVersion int64, to ResearchRunStatus, transition ResearchTransition) (*ResearchRun, error) {
+	return s.transitionRun(runID, expectedVersion, to, transition, "", "", false)
+}
+
+func (s *ResearchStore) TransitionRunWithLease(runID string, expectedVersion int64, to ResearchRunStatus, transition ResearchTransition, owner, epoch string) (*ResearchRun, error) {
+	return s.transitionRun(runID, expectedVersion, to, transition, owner, epoch, true)
+}
+
+func (s *ResearchStore) transitionRun(runID string, expectedVersion int64, to ResearchRunStatus, transition ResearchTransition, owner, epoch string, guarded bool) (*ResearchRun, error) {
 	if err := validateResearchTransitionInput(transition); err != nil {
 		return nil, err
 	}
@@ -287,12 +362,27 @@ func (s *ResearchStore) TransitionRun(runID string, expectedVersion int64, to Re
 	if run.Version != expectedVersion {
 		return nil, ErrResearchRunVersionConflict
 	}
+	if guarded {
+		if err := assertResearchRunLeaseTx(tx, run.RunID, owner, epoch, s.now()); err != nil {
+			return nil, err
+		}
+	}
 	if err := ValidateResearchTransition(run.Status, to); err != nil {
 		return nil, err
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	result, err := tx.Exec(`UPDATE research_runs SET status = ?, version = version + 1, updated_at = ? WHERE run_id = ? AND version = ?`,
-		to, now, run.RunID, expectedVersion)
+	query := `UPDATE research_runs SET status = ?, version = version + 1, updated_at = ?`
+	args := []any{to, now}
+	if !guarded {
+		query += `, lease_owner = '', lease_epoch = '', lease_expires_at = ''`
+	}
+	query += ` WHERE run_id = ? AND version = ?`
+	args = append(args, run.RunID, expectedVersion)
+	if guarded {
+		query += ` AND lease_owner = ? AND lease_epoch = ?`
+		args = append(args, owner, epoch)
+	}
+	result, err := tx.Exec(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -316,6 +406,25 @@ func (s *ResearchStore) TransitionRun(runID string, expectedVersion int64, to Re
 	run.Version++
 	run.UpdatedAt = now
 	return run, nil
+}
+
+func assertResearchRunLeaseTx(tx *sql.Tx, runID, owner, epoch string, now time.Time) error {
+	var storedOwner, storedEpoch, expiresAt string
+	if err := tx.QueryRow(`SELECT lease_owner, lease_epoch, lease_expires_at FROM research_runs WHERE run_id = ?`, strings.TrimSpace(runID)).Scan(&storedOwner, &storedEpoch, &expiresAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrResearchRunNotFound
+		}
+		return err
+	}
+	owner = strings.TrimSpace(owner)
+	epoch = strings.TrimSpace(epoch)
+	if owner == "" && epoch == "" && storedOwner == "" && storedEpoch == "" {
+		return nil
+	}
+	if owner == "" || epoch == "" || storedOwner != owner || storedEpoch != epoch || researchWorkerLeaseExpired(expiresAt, now) {
+		return ErrResearchRunStaleLease
+	}
+	return nil
 }
 
 func (s *ResearchStore) ListEvents(runID string, after int64, limit int) ([]ResearchEvent, error) {
@@ -369,7 +478,8 @@ func (s *ResearchStore) ClaimRunnableRun(owner string, lease time.Duration) (*Re
 		return nil, err
 	}
 	expires := nowTime.Add(lease).Format(time.RFC3339Nano)
-	if _, err := tx.Exec(`UPDATE research_runs SET lease_owner = ?, lease_expires_at = ?, updated_at = ? WHERE run_id = ?`, owner, expires, now, runID); err != nil {
+	epoch := strings.Replace(newResearchRunID(), "research-run-", "research-lease-", 1)
+	if _, err := tx.Exec(`UPDATE research_runs SET lease_owner = ?, lease_epoch = ?, lease_expires_at = ?, updated_at = ? WHERE run_id = ?`, owner, epoch, expires, now, runID); err != nil {
 		return nil, err
 	}
 	if err := insertResearchEvent(tx, runID, run.Status, run.Status,
@@ -380,12 +490,13 @@ func (s *ResearchStore) ClaimRunnableRun(owner string, lease time.Duration) (*Re
 		return nil, err
 	}
 	run.LeaseOwner = owner
+	run.LeaseEpoch = epoch
 	run.LeaseExpiresAt = expires
 	run.UpdatedAt = now
 	return run, nil
 }
 
-func (s *ResearchStore) RenewRunLease(runID, owner string, lease time.Duration) error {
+func (s *ResearchStore) RenewRunLease(runID, owner, epoch string, lease time.Duration) error {
 	owner = strings.TrimSpace(owner)
 	if owner == "" || lease <= 0 {
 		return fmt.Errorf("lease owner and positive duration are required")
@@ -402,11 +513,25 @@ func (s *ResearchStore) RenewRunLease(runID, owner string, lease time.Duration) 
 	if run.LeaseOwner != owner {
 		return ErrResearchRunLeaseOwner
 	}
+	if strings.TrimSpace(epoch) == "" || run.LeaseEpoch != strings.TrimSpace(epoch) {
+		return ErrResearchRunStaleLease
+	}
 	nowTime := s.now().UTC()
+	if researchWorkerLeaseExpired(run.LeaseExpiresAt, nowTime) {
+		return ErrResearchRunStaleLease
+	}
 	now := nowTime.Format(time.RFC3339Nano)
 	expires := nowTime.Add(lease).Format(time.RFC3339Nano)
-	if _, err := tx.Exec(`UPDATE research_runs SET lease_expires_at = ?, updated_at = ? WHERE run_id = ? AND lease_owner = ?`, expires, now, run.RunID, owner); err != nil {
+	result, err := tx.Exec(`UPDATE research_runs SET lease_expires_at = ?, updated_at = ?
+		WHERE run_id = ? AND lease_owner = ? AND lease_epoch = ?`, expires, now, run.RunID, owner, epoch)
+	if err != nil {
 		return err
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if err != nil {
+			return err
+		}
+		return ErrResearchRunStaleLease
 	}
 	if err := insertResearchEvent(tx, run.RunID, run.Status, run.Status,
 		ResearchTransition{Code: "lease_renewed", Actor: owner}, now); err != nil {
@@ -416,6 +541,14 @@ func (s *ResearchStore) RenewRunLease(runID, owner string, lease time.Duration) 
 }
 
 func (s *ResearchStore) StoreEvidenceBundle(runID string, expectedVersion int64, bundle ResearchEvidenceBundle) (*ResearchRun, error) {
+	return s.storeEvidenceBundle(runID, expectedVersion, bundle, "", "")
+}
+
+func (s *ResearchStore) StoreEvidenceBundleWithLease(runID string, expectedVersion int64, bundle ResearchEvidenceBundle, owner, epoch string) (*ResearchRun, error) {
+	return s.storeEvidenceBundle(runID, expectedVersion, bundle, owner, epoch)
+}
+
+func (s *ResearchStore) storeEvidenceBundle(runID string, expectedVersion int64, bundle ResearchEvidenceBundle, owner, epoch string) (*ResearchRun, error) {
 	if err := validateResearchEvidenceBundle(bundle); err != nil {
 		return nil, err
 	}
@@ -430,6 +563,9 @@ func (s *ResearchStore) StoreEvidenceBundle(runID string, expectedVersion int64,
 	}
 	if run.Version != expectedVersion {
 		return nil, ErrResearchRunVersionConflict
+	}
+	if err := assertResearchRunLeaseTx(tx, run.RunID, owner, epoch, s.now()); err != nil {
+		return nil, err
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
 	if err := storeResearchEvidenceBundleTx(tx, run, bundle, now); err != nil {
@@ -480,6 +616,9 @@ func validateResearchEvidenceBundle(bundle ResearchEvidenceBundle) error {
 
 func storeResearchEvidenceBundleTx(tx *sql.Tx, run *ResearchRun, bundle ResearchEvidenceBundle, now string) error {
 	if err := validateResearchEvidenceBundle(bundle); err != nil {
+		return err
+	}
+	if err := enforceResearchEvidenceBudgetTx(tx, run, bundle.Evidence); err != nil {
 		return err
 	}
 	for _, evidence := range bundle.Evidence {
@@ -534,6 +673,45 @@ func storeResearchEvidenceBundleTx(tx *sql.Tx, run *ResearchRun, bundle Research
 	}
 	run.Version++
 	run.UpdatedAt = now
+	return nil
+}
+
+func enforceResearchEvidenceBudgetTx(tx *sql.Tx, run *ResearchRun, incoming []ResearchEvidence) error {
+	rows, err := tx.Query(`SELECT evidence_id, content_excerpt FROM research_evidence WHERE run_id = ?`, run.RunID)
+	if err != nil {
+		return err
+	}
+	existing := map[string]bool{}
+	count := 0
+	quotedRunes := 0
+	for rows.Next() {
+		var evidenceID, excerpt string
+		if err := rows.Scan(&evidenceID, &excerpt); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		existing[evidenceID] = true
+		count++
+		quotedRunes += len([]rune(excerpt))
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, evidence := range incoming {
+		if existing[evidence.EvidenceID] {
+			continue
+		}
+		existing[evidence.EvidenceID] = true
+		count++
+		quotedRunes += len([]rune(evidence.ContentExcerpt))
+	}
+	if count > run.Budget.MaxEvidenceItems || quotedRunes > run.Budget.MaxQuotedChars {
+		return ErrResearchBudgetExhausted
+	}
 	return nil
 }
 
@@ -622,11 +800,11 @@ func loadResearchRun(queryer researchRowQuerier, runID string) (*ResearchRun, er
 	var subjectIDs, requestedSources, routeReasons, actualScope, budget, failure string
 	err := queryer.QueryRow(`SELECT schema_version, run_id, mode, question, status, package_id, package_version,
 		subject_ids_json, requested_sources_json, route_reasons_json, actual_scope_json, budget_json,
-		wait_reason, failure_json, version, created_at, updated_at, lease_owner, lease_expires_at
+		wait_reason, failure_json, version, created_at, updated_at, lease_owner, lease_epoch, lease_expires_at
 		FROM research_runs WHERE run_id = ?`, runID).Scan(
 		&run.SchemaVersion, &run.RunID, &run.Mode, &run.Question, &run.Status, &run.PackageID, &run.PackageVersion,
 		&subjectIDs, &requestedSources, &routeReasons, &actualScope, &budget,
-		&run.WaitReason, &failure, &run.Version, &run.CreatedAt, &run.UpdatedAt, &run.LeaseOwner, &run.LeaseExpiresAt)
+		&run.WaitReason, &failure, &run.Version, &run.CreatedAt, &run.UpdatedAt, &run.LeaseOwner, &run.LeaseEpoch, &run.LeaseExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrResearchRunNotFound
 	}

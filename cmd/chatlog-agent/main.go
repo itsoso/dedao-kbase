@@ -12,8 +12,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,13 +43,40 @@ type chatlogAgentConfig struct {
 
 type chatlogAgentRuntime struct {
 	sourceClient   *app.SourceAgentClient
-	researchClient *app.ResearchWorkerClient
+	researchClient chatlogResearchWorkerClient
 	reader         *app.ChatlogHTTPReader
 	control        chatlogControlRunner
 	outbox         *app.SourceAgentOutbox
 	upgrade        interface{ Close() error }
 	agentID        string
+	locators       *chatlogLocatorCache
+	jobLease       time.Duration
+	renewInterval  time.Duration
 }
+
+type chatlogResearchWorkerClient interface {
+	Claim(context.Context, time.Duration) (*app.ResearchWorkerJob, error)
+	Renew(context.Context, app.ResearchWorkerJob, time.Duration) error
+	Complete(context.Context, app.ResearchWorkerJob, app.ResearchWorkerResult) (app.ResearchWorkerJob, error)
+	Fail(context.Context, app.ResearchWorkerJob, string, bool) (app.ResearchWorkerJob, error)
+}
+
+var errChatlogWorkerLeaseLost = errors.New("research worker lease lost")
+
+type chatlogLocatorCacheEntry struct {
+	ConversationRef string `json:"conversation_ref"`
+	MessageRef      string `json:"message_ref"`
+	Time            string `json:"time"`
+	StoredAt        string `json:"stored_at"`
+}
+
+type chatlogLocatorCache struct {
+	mu      sync.Mutex
+	path    string
+	entries map[string]chatlogLocatorCacheEntry
+}
+
+const chatlogLocatorCacheMaxEntries = 2000
 
 type chatlogControlRunner interface {
 	RunOnce(context.Context) (app.SourceAgentCycleResult, error)
@@ -61,12 +90,13 @@ type chatlogWorkerUpgradeRuntime struct {
 }
 
 type chatlogAgentCycleResult struct {
-	OK            bool   `json:"ok"`
-	Heartbeat     bool   `json:"heartbeat"`
-	JobID         string `json:"job_id,omitempty"`
-	JobState      string `json:"job_state,omitempty"`
-	EvidenceCount int    `json:"evidence_count,omitempty"`
-	Code          string `json:"code,omitempty"`
+	OK             bool   `json:"ok"`
+	Heartbeat      bool   `json:"heartbeat"`
+	JobID          string `json:"job_id,omitempty"`
+	JobState       string `json:"job_state,omitempty"`
+	EvidenceCount  int    `json:"evidence_count,omitempty"`
+	CandidateCount int    `json:"candidate_count,omitempty"`
+	Code           string `json:"code,omitempty"`
 }
 
 func main() {
@@ -229,6 +259,10 @@ func newChatlogAgentRuntime(config chatlogAgentConfig) (*chatlogAgentRuntime, er
 	if err != nil {
 		return nil, err
 	}
+	locators, err := openChatlogLocatorCache(config.Source.StateDir)
+	if err != nil {
+		return nil, errors.Join(err, outbox.Close())
+	}
 	upgrade, err := chatlogAgentUpgradeFactory(sourceClient)
 	if err != nil {
 		return nil, errors.Join(err, outbox.Close())
@@ -246,6 +280,7 @@ func newChatlogAgentRuntime(config chatlogAgentConfig) (*chatlogAgentRuntime, er
 	return &chatlogAgentRuntime{
 		sourceClient: sourceClient, researchClient: researchClient, reader: reader,
 		control: control, outbox: outbox, upgrade: upgrade.closer, agentID: config.Source.AgentID,
+		locators: locators, jobLease: 2 * time.Minute, renewInterval: 40 * time.Second,
 	}, nil
 }
 
@@ -298,15 +333,22 @@ func (r *chatlogAgentRuntime) once(ctx context.Context) (chatlogAgentCycleResult
 	if r.control.ControlActive() {
 		return chatlogAgentCycleResult{OK: true, Heartbeat: true}, nil
 	}
-	job, err := r.researchClient.Claim(ctx, 2*time.Minute)
+	lease := r.jobLease
+	if lease <= 0 {
+		lease = 2 * time.Minute
+	}
+	job, err := r.researchClient.Claim(ctx, lease)
 	if err != nil {
 		return chatlogAgentCycleResult{}, err
 	}
 	if job == nil {
 		return chatlogAgentCycleResult{OK: true, Heartbeat: true}, nil
 	}
-	result, err := r.executeJob(ctx, *job)
+	result, err := r.executeJobWithLease(ctx, *job, lease)
 	if err != nil {
+		if errors.Is(err, errChatlogWorkerLeaseLost) {
+			return chatlogAgentCycleResult{}, err
+		}
 		failed, reportErr := r.researchClient.Fail(ctx, *job, chatlogWorkerFailureCode(err), isRetryableChatlogWorkerError(err))
 		if reportErr != nil {
 			return chatlogAgentCycleResult{}, reportErr
@@ -317,9 +359,64 @@ func (r *chatlogAgentRuntime) once(ctx context.Context) (chatlogAgentCycleResult
 	if err != nil {
 		return chatlogAgentCycleResult{}, err
 	}
+	evidenceCount, candidateCount := 0, 0
+	for _, item := range result.Items {
+		if item.Selected {
+			evidenceCount++
+		} else {
+			candidateCount++
+		}
+	}
 	return chatlogAgentCycleResult{
-		OK: true, Heartbeat: true, JobID: completed.JobID, JobState: completed.State, EvidenceCount: len(result.Items),
+		OK: true, Heartbeat: true, JobID: completed.JobID, JobState: completed.State,
+		EvidenceCount: evidenceCount, CandidateCount: candidateCount,
 	}, nil
+}
+
+func (r *chatlogAgentRuntime) executeJobWithLease(ctx context.Context, job app.ResearchWorkerJob, lease time.Duration) (app.ResearchWorkerResult, error) {
+	jobCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	interval := r.renewInterval
+	if interval <= 0 {
+		interval = lease / 3
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	renewErr := make(chan error, 1)
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-jobCtx.Done():
+				return
+			case <-ticker.C:
+				if err := r.researchClient.Renew(jobCtx, job, lease); err != nil {
+					select {
+					case renewErr <- errors.Join(errChatlogWorkerLeaseLost, err):
+					default:
+					}
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	result, executeErr := r.executeJob(jobCtx, job)
+	close(stop)
+	<-done
+	select {
+	case err := <-renewErr:
+		return app.ResearchWorkerResult{}, err
+	default:
+		return result, executeErr
+	}
 }
 
 func (r *chatlogAgentRuntime) close() error {
@@ -388,44 +485,75 @@ func (r *chatlogAgentRuntime) executeJob(ctx context.Context, job app.ResearchWo
 		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		return r.resultForMessages(messages), nil
+		return r.resultForSearchCandidates(messages)
 	case app.ResearchWorkerToolExpandChatContext:
 		var args app.ResearchWorkerExpandChatContextArgs
 		if err := json.Unmarshal(job.Arguments, &args); err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		messages, err := r.reader.SearchMessages(ctx, app.ChatlogQuery{Time: args.Time, Talker: args.ConversationRef, Limit: 500})
+		locator, err := r.locators.resolve(args.MessageRef)
 		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		contextMessages, err := selectChatlogContext(messages, args.MessageRef, args.Before, args.After)
+		messages, err := r.reader.SearchMessages(ctx, app.ChatlogQuery{Time: locator.Time, Talker: locator.ConversationRef, Limit: 500})
 		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		return r.resultForMessages(contextMessages), nil
+		contextMessages, err := selectChatlogContext(messages, locator.MessageRef, args.Before, args.After)
+		if err != nil {
+			return app.ResearchWorkerResult{}, err
+		}
+		result, err := r.resultForSelectedMessages(contextMessages)
+		if err != nil {
+			return app.ResearchWorkerResult{}, err
+		}
+		result.AnchorCandidateRef = args.MessageRef
+		return result, nil
 	case app.ResearchWorkerToolFetchChatMessage:
 		var args app.ResearchWorkerFetchChatMessageArgs
 		if err := json.Unmarshal(job.Arguments, &args); err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		messages, err := r.reader.SearchMessages(ctx, app.ChatlogQuery{Time: args.Time, Talker: args.ConversationRef, Limit: 500})
+		locator, err := r.locators.resolve(args.MessageRef)
 		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		selected, err := selectChatlogContext(messages, args.MessageRef, 0, 0)
+		messages, err := r.reader.SearchMessages(ctx, app.ChatlogQuery{Time: locator.Time, Talker: locator.ConversationRef, Limit: 500})
 		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		return r.resultForMessages(selected), nil
+		selected, err := selectChatlogContext(messages, locator.MessageRef, 0, 0)
+		if err != nil {
+			return app.ResearchWorkerResult{}, err
+		}
+		return r.resultForSelectedMessages(selected)
 	case app.ResearchWorkerToolResolveChatIdentity:
 		var args app.ResearchWorkerResolveChatIdentityArgs
 		if err := json.Unmarshal(job.Arguments, &args); err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		if _, err := r.reader.ListContacts(ctx, args.IdentityRef, 50, 0); err != nil {
+		contacts, err := r.reader.ListContacts(ctx, args.IdentityRef, 50, 0)
+		if err != nil {
 			return app.ResearchWorkerResult{}, err
 		}
-		return app.ResearchWorkerResult{SearchedSources: []string{app.ResearchSourceChatlog}}, nil
+		identityRef := strings.TrimSpace(args.IdentityRef)
+		candidates := make([]app.ResearchIdentityCandidate, 0, len(contacts.Items))
+		for _, contact := range contacts.Items {
+			identityID := chatlogOpaqueIdentity(contact.UserName)
+			candidate := app.ResearchIdentityCandidate{
+				IdentityID: identityID, ContactMetadataMatch: true,
+				DisplayNameMatch: identityRef == strings.TrimSpace(contact.Alias) ||
+					identityRef == strings.TrimSpace(contact.Remark) || identityRef == strings.TrimSpace(contact.NickName),
+			}
+			if identityRef == strings.TrimSpace(contact.UserName) {
+				candidate.AccountID = identityID
+				candidate.TargetAccountID = identityID
+			}
+			candidates = append(candidates, candidate)
+		}
+		return app.ResearchWorkerResult{
+			SearchedSources: []string{app.ResearchSourceChatlog}, IdentityCandidates: candidates,
+		}, nil
 	case app.ResearchWorkerToolListIdentityConversations:
 		var args app.ResearchWorkerListIdentityConversationsArgs
 		if err := json.Unmarshal(job.Arguments, &args); err != nil {
@@ -440,23 +568,134 @@ func (r *chatlogAgentRuntime) executeJob(ctx context.Context, job app.ResearchWo
 	}
 }
 
-func (r *chatlogAgentRuntime) resultForMessages(messages []app.ChatlogMessage) app.ResearchWorkerResult {
+func (r *chatlogAgentRuntime) resultForSearchCandidates(messages []app.ChatlogMessage) (app.ResearchWorkerResult, error) {
+	return r.resultForMessages(messages, false)
+}
+
+func (r *chatlogAgentRuntime) resultForSelectedMessages(messages []app.ChatlogMessage) (app.ResearchWorkerResult, error) {
+	return r.resultForMessages(messages, true)
+}
+
+func (r *chatlogAgentRuntime) resultForMessages(messages []app.ChatlogMessage, selected bool) (app.ResearchWorkerResult, error) {
+	if r.locators == nil {
+		return app.ResearchWorkerResult{}, fmt.Errorf("chatlog locator cache is unavailable")
+	}
 	items := make([]app.ResearchWorkerEvidenceCandidate, 0, len(messages))
 	for _, message := range messages {
 		content := strings.TrimSpace(message.Content)
 		if content == "" {
 			continue
 		}
-		items = append(items, app.ResearchWorkerEvidenceCandidate{
+		candidateRef, err := r.locators.store(message)
+		if err != nil {
+			return app.ResearchWorkerResult{}, err
+		}
+		candidate := app.ResearchWorkerEvidenceCandidate{
 			SourceType: app.ResearchEvidenceSourceChatlog, SourceRole: app.ResearchEvidenceRoleUserHistory,
-			AuthorIdentityID: chatlogOpaqueIdentity(message.Sender), OccurredAt: message.Time.Format(time.RFC3339),
-			Content: content, Locator: app.ResearchEvidenceLocator{
-				WorkerID: r.agentID, ConversationRef: message.Talker, MessageRef: message.MessageRef,
-			},
-			Privacy: app.ResearchEvidencePrivacyPrivate, Selected: true,
-		})
+			OccurredAt: message.Time.Format(time.RFC3339), Locator: app.ResearchEvidenceLocator{
+				WorkerID: r.agentID, ConversationRef: candidateRef, MessageRef: candidateRef,
+			}, Privacy: app.ResearchEvidencePrivacyPrivate, Selected: selected,
+		}
+		if selected {
+			candidate.AuthorIdentityID = chatlogOpaqueIdentity(message.Sender)
+			candidate.Content = content
+		}
+		items = append(items, candidate)
 	}
-	return app.ResearchWorkerResult{SearchedSources: []string{app.ResearchSourceChatlog}, Items: items}
+	return app.ResearchWorkerResult{SearchedSources: []string{app.ResearchSourceChatlog}, Items: items}, nil
+}
+
+func openChatlogLocatorCache(stateDir string) (*chatlogLocatorCache, error) {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		return nil, err
+	}
+	cache := &chatlogLocatorCache{path: filepath.Join(stateDir, "research-locators.json"), entries: map[string]chatlogLocatorCacheEntry{}}
+	payload, err := os.ReadFile(cache.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return cache, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(payload, &cache.entries); err != nil {
+		return nil, fmt.Errorf("decode Chatlog locator cache: %w", err)
+	}
+	if len(cache.entries) > chatlogLocatorCacheMaxEntries {
+		return nil, fmt.Errorf("Chatlog locator cache exceeds supported bounds")
+	}
+	return cache, nil
+}
+
+func (c *chatlogLocatorCache) store(message app.ChatlogMessage) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	digest := sha256.Sum256([]byte(message.Talker + "\x00" + message.MessageRef + "\x00" + message.Time.Format("2006-01-02")))
+	ref := "sha256:" + hex.EncodeToString(digest[:])
+	c.entries[ref] = chatlogLocatorCacheEntry{
+		ConversationRef: message.Talker, MessageRef: message.MessageRef,
+		Time: message.Time.Format("2006-01-02"), StoredAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	c.pruneLocked()
+	return ref, c.persistLocked()
+}
+
+func (c *chatlogLocatorCache) resolve(ref string) (chatlogLocatorCacheEntry, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[strings.TrimSpace(ref)]
+	if !ok {
+		return chatlogLocatorCacheEntry{}, fmt.Errorf("chatlog candidate locator is unavailable")
+	}
+	return entry, nil
+}
+
+func (c *chatlogLocatorCache) pruneLocked() {
+	if len(c.entries) <= chatlogLocatorCacheMaxEntries {
+		return
+	}
+	type item struct{ ref, storedAt string }
+	ordered := make([]item, 0, len(c.entries))
+	for ref, entry := range c.entries {
+		ordered = append(ordered, item{ref: ref, storedAt: entry.StoredAt})
+	}
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].storedAt == ordered[j].storedAt {
+			return ordered[i].ref < ordered[j].ref
+		}
+		return ordered[i].storedAt < ordered[j].storedAt
+	})
+	for _, stale := range ordered[:len(ordered)-chatlogLocatorCacheMaxEntries] {
+		delete(c.entries, stale.ref)
+	}
+}
+
+func (c *chatlogLocatorCache) persistLocked() error {
+	payload, err := json.Marshal(c.entries)
+	if err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(c.path), ".research-locators-*")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer func() { _ = os.Remove(temporaryPath) }()
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(payload); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, c.path)
 }
 
 func selectChatlogContext(messages []app.ChatlogMessage, messageRef string, before, after int) ([]app.ChatlogMessage, error) {

@@ -82,6 +82,7 @@ type ResearchRun struct {
 	CreatedAt        string            `json:"created_at"`
 	UpdatedAt        string            `json:"updated_at"`
 	LeaseOwner       string            `json:"-"`
+	LeaseEpoch       string            `json:"-"`
 	LeaseExpiresAt   string            `json:"-"`
 }
 
@@ -239,7 +240,7 @@ func ValidateResearchTransition(from, to ResearchRunStatus) error {
 	if isTerminalResearchStatus(from) {
 		return fmt.Errorf("terminal research run cannot transition from %q", from)
 	}
-	if to == ResearchFailed || to == ResearchCanceled {
+	if to == ResearchFailed || to == ResearchCanceled || to == ResearchInsufficient {
 		return nil
 	}
 	allowed := map[ResearchRunStatus]map[ResearchRunStatus]bool{
@@ -252,14 +253,17 @@ func ValidateResearchTransition(from, to ResearchRunStatus) error {
 			ResearchSynthesizing:      true,
 		},
 		ResearchResolvingIdentity: {
-			ResearchBuildingTimeline: true,
-			ResearchExtractingFacts:  true,
-		},
-		ResearchBuildingTimeline: {
 			ResearchExtractingFacts: true,
 		},
-		ResearchExtractingFacts: {
+		ResearchBuildingTimeline: {
 			ResearchDetectingConflicts: true,
+			ResearchComparingCases:     true,
+			ResearchSynthesizing:       true,
+		},
+		ResearchExtractingFacts: {
+			ResearchBuildingTimeline:   true,
+			ResearchDetectingConflicts: true,
+			ResearchComparingCases:     true,
 			ResearchSynthesizing:       true,
 		},
 		ResearchDetectingConflicts: {

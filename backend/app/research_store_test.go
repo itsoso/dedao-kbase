@@ -173,7 +173,7 @@ func TestResearchStoreRecoversExpiredRunLease(t *testing.T) {
 	if err != nil || recovered == nil || recovered.RunID != run.RunID || recovered.LeaseOwner != "coordinator-b" {
 		t.Fatalf("recovered=%#v err=%v", recovered, err)
 	}
-	if err := store.RenewRunLease(run.RunID, "coordinator-a", time.Minute); !errors.Is(err, ErrResearchRunLeaseOwner) {
+	if err := store.RenewRunLease(run.RunID, "coordinator-a", claimed.LeaseEpoch, time.Minute); !errors.Is(err, ErrResearchRunLeaseOwner) {
 		t.Fatalf("old owner renewal error=%v", err)
 	}
 }

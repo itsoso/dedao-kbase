@@ -4196,6 +4196,46 @@ type researchEventHTTPView struct {
 	CreatedAt  string            `json:"created_at"`
 }
 
+type researchEvidenceHTTPView struct {
+	EvidenceID       string `json:"evidence_id"`
+	SourceType       string `json:"source_type"`
+	SourceRole       string `json:"source_role"`
+	OccurredAt       string `json:"occurred_at,omitempty"`
+	ContentExcerpt   string `json:"content_excerpt,omitempty"`
+	LocatorAvailable bool   `json:"locator_available"`
+}
+
+type researchAnalysisHTTPView struct {
+	RecordID           string   `json:"record_id"`
+	Kind               string   `json:"kind"`
+	Summary            string   `json:"summary"`
+	OccurredAt         string   `json:"occurred_at,omitempty"`
+	SupportEvidenceIDs []string `json:"support_evidence_ids"`
+	Confidence         float64  `json:"confidence"`
+	ReviewState        string   `json:"review_state"`
+}
+
+type researchCitationHTTPView struct {
+	CitationID string `json:"citation_id"`
+	Href       string `json:"href,omitempty"`
+	Available  bool   `json:"available"`
+}
+
+type researchConclusionHTTPView struct {
+	ConclusionID string                     `json:"conclusion_id"`
+	Text         string                     `json:"text"`
+	EvidenceIDs  []string                   `json:"evidence_ids"`
+	Citations    []researchCitationHTTPView `json:"citations"`
+	Confidence   float64                    `json:"confidence"`
+}
+
+type researchIdentityBindingHTTPView struct {
+	BindingID  string  `json:"binding_id"`
+	SourceType string  `json:"source_type"`
+	Confidence float64 `json:"confidence"`
+	Confirmed  bool    `json:"confirmed"`
+}
+
 func validResearchHTTPBudget(budget ResearchBudget) bool {
 	return budget.MaxIterations > 0 && budget.MaxIterations <= researchBudgetMaxIterations &&
 		budget.MaxEvidenceItems > 0 && budget.MaxEvidenceItems <= researchBudgetMaxEvidence &&
@@ -4380,7 +4420,110 @@ func (h *kbaseHTTPHandler) handleResearchRunDetail(w http.ResponseWriter, runID,
 	if isTerminalResearchStatus(run.Status) {
 		status = http.StatusOK
 	}
-	writeHTTPJSON(w, status, map[string]any{"run": publicResearchRun(*run)})
+	evidence, err := h.researchStore.ListEvidence(runID)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	analysis, err := h.researchStore.ListResearchAnalysisRecords(runID)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	conclusions, err := h.researchStore.ListVerifiedResearchConclusions(runID)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	identities, err := h.publicResearchIdentityBindings(runID)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	writeHTTPJSON(w, status, map[string]any{
+		"run": publicResearchRun(*run), "evidence": publicResearchEvidence(evidence),
+		"analysis_records":  publicResearchAnalysis(analysis),
+		"conclusions":       h.publicResearchConclusions(conclusions, evidence),
+		"identity_bindings": identities,
+	})
+}
+
+func publicResearchEvidence(items []ResearchEvidence) []researchEvidenceHTTPView {
+	result := make([]researchEvidenceHTTPView, 0, len(items))
+	for _, item := range items {
+		locatorAvailable := strings.TrimSpace(item.Locator.WorkerID) != "" || strings.TrimSpace(item.Locator.ConversationRef) != "" ||
+			strings.TrimSpace(item.Locator.MessageRef) != "" || strings.TrimSpace(item.Locator.ReleaseID) != "" ||
+			strings.TrimSpace(item.Locator.PriorRunID) != ""
+		result = append(result, researchEvidenceHTTPView{
+			EvidenceID: item.EvidenceID, SourceType: item.SourceType, SourceRole: item.SourceRole,
+			OccurredAt: item.OccurredAt, ContentExcerpt: item.ContentExcerpt, LocatorAvailable: locatorAvailable,
+		})
+	}
+	return result
+}
+
+func publicResearchAnalysis(items []ResearchAnalysisRecord) []researchAnalysisHTTPView {
+	result := make([]researchAnalysisHTTPView, 0, len(items))
+	for _, item := range items {
+		result = append(result, researchAnalysisHTTPView{
+			RecordID: item.RecordID, Kind: item.Kind, Summary: item.Summary,
+			OccurredAt:         researchStringAttribute(item.Attributes, "occurred_at"),
+			SupportEvidenceIDs: append([]string(nil), item.SupportEvidenceIDs...),
+			Confidence:         item.Confidence, ReviewState: item.ReviewState,
+		})
+	}
+	return result
+}
+
+func (h *kbaseHTTPHandler) publicResearchConclusions(items []ResearchVerifiedConclusion, evidence []ResearchEvidence) []researchConclusionHTTPView {
+	result := make([]researchConclusionHTTPView, 0, len(items))
+	for _, item := range items {
+		citations := make([]researchCitationHTTPView, 0, len(item.CitationIDs))
+		for _, citationID := range item.CitationIDs {
+			view := researchCitationHTTPView{CitationID: citationID}
+			for _, source := range evidence {
+				if source.SourceType != ResearchEvidenceSourceKnowledge || source.Locator.ConversationRef != citationID || source.Locator.ReleaseID == "" {
+					continue
+				}
+				release, err := h.store.LoadKnowledgeRelease(source.Locator.ReleaseID)
+				if err == nil && strings.TrimSpace(release.BookID) != "" {
+					view.Href = "/api/citations/" + url.PathEscape(citationID) + "?book_id=" + url.QueryEscape(release.BookID)
+					view.Available = true
+				}
+				break
+			}
+			citations = append(citations, view)
+		}
+		result = append(result, researchConclusionHTTPView{
+			ConclusionID: item.ConclusionID, Text: item.Text, EvidenceIDs: append([]string(nil), item.EvidenceIDs...),
+			Citations: citations, Confidence: item.Confidence,
+		})
+	}
+	return result
+}
+
+func (h *kbaseHTTPHandler) publicResearchIdentityBindings(runID string) ([]researchIdentityBindingHTTPView, error) {
+	rows, err := h.researchStore.db.Query(`SELECT binding.binding_id, binding.source_type, binding.confidence,
+		CASE WHEN confirmation.binding_id IS NULL THEN 0 ELSE 1 END
+		FROM research_identity_bindings binding
+		LEFT JOIN research_identity_confirmations confirmation ON confirmation.binding_id = binding.binding_id
+		WHERE binding.run_id = ? ORDER BY binding.created_at ASC, binding.binding_id ASC`, strings.TrimSpace(runID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []researchIdentityBindingHTTPView{}
+	for rows.Next() {
+		var item researchIdentityBindingHTTPView
+		var confirmed int
+		if err := rows.Scan(&item.BindingID, &item.SourceType, &item.Confidence, &confirmed); err != nil {
+			return nil, err
+		}
+		item.SourceType = publicResearchCode(item.SourceType, "unknown")
+		item.Confirmed = confirmed == 1
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 
 func (h *kbaseHTTPHandler) handleResearchRunEvents(w http.ResponseWriter, r *http.Request, runID, ownerHash string) {
@@ -4462,8 +4605,14 @@ func (h *kbaseHTTPHandler) handleResearchIdentityConfirmation(w http.ResponseWri
 		writeHTTPError(w, http.StatusNotFound, "research_run_not_found")
 		return
 	}
-	var found string
-	err := h.researchStore.db.QueryRow(`SELECT binding_id FROM research_identity_bindings WHERE binding_id = ? AND run_id = ?`, bindingID, runID).Scan(&found)
+	tx, err := h.researchStore.db.Begin()
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	var identityID string
+	err = tx.QueryRow(`SELECT identity_id FROM research_identity_bindings WHERE binding_id = ? AND run_id = ?`, bindingID, runID).Scan(&identityID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeHTTPError(w, http.StatusNotFound, "identity_binding_not_found")
 		return
@@ -4472,14 +4621,63 @@ func (h *kbaseHTTPHandler) handleResearchIdentityConfirmation(w http.ResponseWri
 		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
 		return
 	}
-	_, err = h.researchStore.db.Exec(`INSERT INTO research_identity_confirmations(binding_id, run_id, confirmed_at)
-		VALUES (?, ?, ?) ON CONFLICT(binding_id) DO UPDATE SET confirmed_at = excluded.confirmed_at`,
-		bindingID, runID, h.researchStore.now().UTC().Format(time.RFC3339Nano))
+	run, err := loadResearchRun(tx, runID)
 	if err != nil {
 		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
 		return
 	}
-	writeHTTPJSON(w, http.StatusOK, map[string]any{"binding_id": bindingID, "confirmed": true})
+	now := h.researchStore.now().UTC().Format(time.RFC3339Nano)
+	if _, err = tx.Exec(`DELETE FROM research_identity_confirmations WHERE run_id = ? AND binding_id <> ?`, runID, bindingID); err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	_, err = tx.Exec(`INSERT INTO research_identity_confirmations(binding_id, run_id, confirmed_at)
+		VALUES (?, ?, ?) ON CONFLICT(binding_id) DO UPDATE SET confirmed_at = excluded.confirmed_at`,
+		bindingID, runID, now)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	resumed := run.Status == ResearchInsufficient && run.Failure != nil && run.Failure.Code == ResearchOutcomeIdentityAmbiguous
+	if isTerminalResearchStatus(run.Status) && !resumed {
+		if err := tx.Commit(); err != nil {
+			writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+			return
+		}
+		writeHTTPJSON(w, http.StatusOK, map[string]any{"binding_id": bindingID, "confirmed": true, "resumed": false})
+		return
+	}
+	subjectIDs := uniqueSortedResearchStrings(append(run.SubjectIDs, identityID))
+	subjectJSON, err := json.Marshal(subjectIDs)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	nextStatus := run.Status
+	if resumed {
+		nextStatus = ResearchResolvingIdentity
+	}
+	result, err := tx.Exec(`UPDATE research_runs SET subject_ids_json = ?, status = ?, wait_reason = '', failure_json = '',
+		version = version + 1, updated_at = ? WHERE run_id = ? AND version = ?`, string(subjectJSON), nextStatus, now, runID, run.Version)
+	if err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	changed, err := result.RowsAffected()
+	if err != nil || changed != 1 {
+		writeHTTPError(w, http.StatusConflict, "research_run_version_conflict")
+		return
+	}
+	if err := insertResearchEvent(tx, runID, run.Status, nextStatus,
+		ResearchTransition{Code: "identity_confirmed", Actor: "research-http"}, now); err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeHTTPError(w, http.StatusServiceUnavailable, "research_service_unavailable")
+		return
+	}
+	writeHTTPJSON(w, http.StatusOK, map[string]any{"binding_id": bindingID, "confirmed": true, "resumed": resumed})
 }
 
 func (h *kbaseHTTPHandler) researchRunOwned(runID, ownerHash string) bool {
@@ -4574,12 +4772,13 @@ func (h *kbaseHTTPHandler) handleResearchWorker(w http.ResponseWriter, r *http.R
 	case "renew":
 		var payload struct {
 			AgentID      string `json:"agent_id"`
+			LeaseID      string `json:"lease_id"`
 			LeaseSeconds int    `json:"lease_seconds"`
 		}
 		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
 			return
 		}
-		if err := h.researchStore.RenewWorkerJobLease(jobID, payload.AgentID, time.Duration(payload.LeaseSeconds)*time.Second); err != nil {
+		if err := h.researchStore.RenewWorkerJobLease(jobID, payload.AgentID, payload.LeaseID, time.Duration(payload.LeaseSeconds)*time.Second); err != nil {
 			h.writeResearchWorkerError(w, err)
 			return
 		}
@@ -4592,13 +4791,14 @@ func (h *kbaseHTTPHandler) handleResearchWorker(w http.ResponseWriter, r *http.R
 	case "complete":
 		var payload struct {
 			AgentID     string               `json:"agent_id"`
+			LeaseID     string               `json:"lease_id"`
 			RequestHash string               `json:"request_hash"`
 			Result      ResearchWorkerResult `json:"result"`
 		}
 		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
 			return
 		}
-		job, err := h.researchStore.CompleteWorkerJob(jobID, payload.AgentID, payload.RequestHash, payload.Result)
+		job, err := h.researchStore.CompleteWorkerJob(jobID, payload.AgentID, payload.LeaseID, payload.RequestHash, payload.Result)
 		if err != nil {
 			h.writeResearchWorkerError(w, err)
 			return
@@ -4607,6 +4807,7 @@ func (h *kbaseHTTPHandler) handleResearchWorker(w http.ResponseWriter, r *http.R
 	case "fail":
 		var payload struct {
 			AgentID     string `json:"agent_id"`
+			LeaseID     string `json:"lease_id"`
 			RequestHash string `json:"request_hash"`
 			Code        string `json:"code"`
 			Retryable   bool   `json:"retryable"`
@@ -4614,7 +4815,7 @@ func (h *kbaseHTTPHandler) handleResearchWorker(w http.ResponseWriter, r *http.R
 		if !decodeStrictLimitedHTTPJSON(w, r, defaultResearchWorkerHTTPMaxBodyBytes, &payload) {
 			return
 		}
-		job, err := h.researchStore.FailWorkerJob(jobID, payload.AgentID, payload.RequestHash, payload.Code, payload.Retryable)
+		job, err := h.researchStore.FailWorkerJob(jobID, payload.AgentID, payload.LeaseID, payload.RequestHash, payload.Code, payload.Retryable)
 		if err != nil {
 			h.writeResearchWorkerError(w, err)
 			return

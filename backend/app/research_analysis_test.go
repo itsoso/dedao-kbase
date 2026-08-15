@@ -110,7 +110,7 @@ func TestResearchAnalysisStorePersistsSupportConfidenceAndReviewState(t *testing
 		Items: []ResearchWorkerEvidenceCandidate{{
 			SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleDirectObservation,
 			Content: "Synthetic grounded observation", Privacy: ResearchEvidencePrivacyPrivate, Selected: true,
-			Locator: ResearchEvidenceLocator{WorkerID: "worker-a", ConversationRef: "room-a", MessageRef: "message-a"},
+			Locator: ResearchEvidenceLocator{WorkerID: "worker-a", ConversationRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451", MessageRef: "sha256:5a01731f9d22d0e8243e4f3f5170b8710d35a48a49bf1090962a7a37efa94451"},
 		}},
 	})
 	if err != nil {

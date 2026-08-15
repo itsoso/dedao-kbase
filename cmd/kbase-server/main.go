@@ -487,24 +487,6 @@ func (runtime researchServerRuntime) Close() error {
 	return runtime.Store.Close()
 }
 
-type researchRoleStageModel struct {
-	inner  app.ResearchStageModel
-	models map[app.ResearchModelRole]string
-}
-
-func (model researchRoleStageModel) Run(
-	ctx context.Context,
-	role app.ResearchModelRole,
-	config app.BookTokenPlanConfig,
-	messages []app.BookKnowledgeMessage,
-	output any,
-) (app.ResearchModelUsage, error) {
-	if roleModel := strings.TrimSpace(model.models[role]); roleModel != "" {
-		config.Model = roleModel
-	}
-	return model.inner.Run(ctx, role, config, messages, output)
-}
-
 func defaultResearchServerConfig() researchServerConfig {
 	return researchServerConfig{
 		Workers: 2, QueueSize: 64, PollInterval: time.Second, LeaseDuration: 30 * time.Second,
@@ -649,7 +631,7 @@ func newResearchServerRuntime(
 	baseModel := app.NewResearchStageModel(app.NewTokenPlanChatClient(nil))
 	orchestrator, err := app.NewResearchOrchestrator(app.ResearchOrchestratorConfig{
 		KnowledgeStore: knowledge, ResearchStore: store, Tools: tools,
-		Model: researchRoleStageModel{inner: baseModel, models: config.RoleModels}, ModelConfig: modelConfig,
+		Model: baseModel, ModelConfig: modelConfig, RoleModels: config.RoleModels,
 		WorkerAgentID: "chatlog-agent",
 	})
 	if err != nil {

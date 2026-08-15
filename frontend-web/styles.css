@@ -8319,7 +8319,12 @@ body.has-proofroom-modal {
 }
 .research-timeline time { position: absolute; right: calc(100% + 14px); top: 0; width: 68px; color: #6f786f; font-size: 11px; text-align: right; }
 .research-timeline p { margin: 0; line-height: 1.6; }
-.research-report article footer { color: #6d786f; font-size: 11px; }
+.research-report article footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 14px; color: #6d786f; font-size: 11px; }
+.research-report__citations { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.research-report__citations a,
+.research-report__citations > span { border: 1px solid rgba(39, 95, 79, 0.22); padding: 2px 7px; color: #285c4d; text-decoration: none; }
+.research-report__citations a:hover { border-color: #ff6b00; color: #b44b00; }
+.research-report__citation-empty { color: #929a94; }
 
 .research-scope-ledger ul { margin: 9px 0 0; padding-left: 17px; color: #536057; font-size: 12px; line-height: 1.7; }
 .research-event-ledger ol { margin-top: 10px; }
