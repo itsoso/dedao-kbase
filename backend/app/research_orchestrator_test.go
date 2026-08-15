@@ -227,6 +227,57 @@ func TestResearchOrchestratorBlocksPlannerToolOutsideRequestedSources(t *testing
 	}
 }
 
+func TestResearchOrchestratorInvalidPlannerToolArgumentsTerminateWithoutReplay(t *testing.T) {
+	tests := []struct {
+		name      string
+		tool      string
+		arguments map[string]any
+		sources   []string
+	}{
+		{
+			name: "direct tool", tool: ResearchToolSearchKnowledge,
+			arguments: map[string]any{"query": "grounded", "limit": researchToolMaxLimit + 1},
+			sources:   []string{ResearchSourceKnowledge},
+		},
+		{
+			name: "worker tool", tool: ResearchWorkerToolSearchChatlog,
+			arguments: map[string]any{"limit": 2},
+			sources:   []string{ResearchSourceChatlog},
+		},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+			model.plannerOutput = &ResearchPlannerOutput{
+				DecisionSummary: "Return one deterministic invalid tool request",
+				ToolCalls:       []ResearchPlannedToolCall{{Tool: testCase.tool, Arguments: testCase.arguments}},
+			}
+			run := createResearchOrchestratorRun(t, research, pkg, "invalid-tool-"+strings.ReplaceAll(testCase.name, " ", "-"),
+				ResearchModeDeep, testCase.sources, "grounded")
+
+			result, err := orchestrator.Advance(context.Background(), run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Run.Status != ResearchFailed || result.Outcome != ResearchOutcomePolicyDenied {
+				t.Fatalf("invalid tool result = %#v", result)
+			}
+			replayed, err := orchestrator.Advance(context.Background(), run.RunID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replayed.Run.Status != ResearchFailed || model.callCount(ResearchRolePlanner) != 1 {
+				t.Fatalf("invalid tool replay = %#v planner calls=%d", replayed, model.callCount(ResearchRolePlanner))
+			}
+			if claimed, err := research.ClaimRunnableRun("coordinator-after-terminal", time.Minute); err != nil {
+				t.Fatal(err)
+			} else if claimed != nil {
+				t.Fatalf("terminal invalid-tool run was reclaimed: %#v", claimed)
+			}
+		})
+	}
+}
+
 func TestResearchOrchestratorDeepPathWaitsResumesAndSurvivesRestart(t *testing.T) {
 	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
 	run := createResearchOrchestratorRun(t, research, pkg, "deep-path", ResearchModeDeep,

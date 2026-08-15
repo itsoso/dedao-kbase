@@ -125,19 +125,19 @@ func (s *ResearchStore) CreateWorkerJobWithLease(input ResearchWorkerJobInput, o
 func (s *ResearchStore) createWorkerJob(input ResearchWorkerJobInput, owner, epoch string, guarded bool) (*ResearchWorkerJob, bool, error) {
 	runID := strings.TrimSpace(input.RunID)
 	if runID == "" {
-		return nil, false, fmt.Errorf("run_id is required")
+		return nil, false, fmt.Errorf("%w: run_id is required", ErrResearchInvalidToolRequest)
 	}
 	targetAgentID, err := normalizeSourceAgentName("target_agent_id", input.TargetAgentID, sourceAgentIDMaxRunes, false)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("%w: %v", ErrResearchInvalidToolRequest, err)
 	}
 	tool := strings.TrimSpace(input.Tool)
 	arguments, err := normalizeResearchWorkerArguments(tool, input.Arguments)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("%w: %v", ErrResearchInvalidToolRequest, err)
 	}
 	if input.MaxAttempts <= 0 || input.MaxAttempts > researchWorkerAttemptsMax {
-		return nil, false, fmt.Errorf("max_attempts must be between 1 and %d", researchWorkerAttemptsMax)
+		return nil, false, fmt.Errorf("%w: max_attempts must be between 1 and %d", ErrResearchInvalidToolRequest, researchWorkerAttemptsMax)
 	}
 	requestIdentity, err := json.Marshal(struct {
 		RunID         string          `json:"run_id"`

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -224,10 +225,13 @@ func (r *ResearchToolRegistry) fetchKnowledgeEvidence(ctx context.Context, reque
 	}
 	ref, err := agentPackagePinnedReleaseRef(*pkg, releaseID)
 	if err != nil {
-		return ResearchToolResult{}, err
+		return ResearchToolResult{}, fmt.Errorf("%w: %v", ErrResearchPolicyDenied, err)
 	}
 	release, err := r.knowledge.LoadKnowledgeRelease(releaseID)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ResearchToolResult{}, fmt.Errorf("%w: pinned release %q is unavailable", ErrResearchEvidenceSourceChanged, releaseID)
+		}
 		return ResearchToolResult{}, err
 	}
 	if agentTraceReleaseContentHash(release.ContentHash) != agentTraceReleaseContentHash(ref.ContentHash) {
@@ -238,15 +242,28 @@ func (r *ResearchToolRegistry) fetchKnowledgeEvidence(ctx context.Context, reque
 	for _, claim := range release.Analysis.Claims {
 		if claim.ID == claimID {
 			statement = strings.TrimSpace(claim.Statement)
-			claimCitations = stringBoolSet(claim.CitationIDs...)
+			claimCitations = stringBoolSet(resolveAgentClaimCitationIDs(release.Citations, claim.CitationIDs)...)
 			break
 		}
 	}
 	if statement == "" {
-		return ResearchToolResult{}, fmt.Errorf("claim %q is not present in pinned release %q", claimID, releaseID)
+		return ResearchToolResult{}, fmt.Errorf("%w: claim %q is not present in pinned release %q", ErrResearchCitationMismatch, claimID, releaseID)
 	}
 	if !claimCitations[citationID] {
-		return ResearchToolResult{}, fmt.Errorf("citation %q does not support claim %q", citationID, claimID)
+		return ResearchToolResult{}, fmt.Errorf("%w: citation %q does not support claim %q", ErrResearchCitationMismatch, citationID, claimID)
+	}
+	if !stringBoolSet(ref.CitationIDs...)[citationID] {
+		return ResearchToolResult{}, fmt.Errorf("%w: citation %q is outside pinned release %q allowlist", ErrResearchCitationMismatch, citationID, releaseID)
+	}
+	resolvedInRelease := false
+	for _, candidate := range release.Citations {
+		if candidate.CitationID == citationID {
+			resolvedInRelease = true
+			break
+		}
+	}
+	if !resolvedInRelease {
+		return ResearchToolResult{}, fmt.Errorf("%w: citation %q cannot be resolved in pinned release %q", ErrResearchCitationMismatch, citationID, releaseID)
 	}
 	citation, err := resolveAgentPackageReleaseCitationContext(ctx, r.knowledge, *pkg, releaseID, claimID, citationID)
 	if err != nil {
@@ -325,7 +342,7 @@ func (r *ResearchToolRegistry) searchPriorRuns(_ context.Context, request Resear
 	}
 	verifications, err := parseResearchLocatorVerifications(request.Arguments["verified_locators"])
 	if err != nil {
-		return ResearchToolResult{}, err
+		return ResearchToolResult{}, fmt.Errorf("%w: %v", ErrResearchInvalidToolRequest, err)
 	}
 	for locatorHash, contentHash := range verifications {
 		var priorRunID, evidenceID, sourceRole, authorID, subjectJSON, occurredAt, excerpt, storedContentHash string
@@ -454,7 +471,7 @@ func requiredResearchToolString(arguments map[string]any, name string) (string, 
 	value, ok := arguments[name].(string)
 	value = strings.TrimSpace(value)
 	if !ok || value == "" {
-		return "", fmt.Errorf("%s is required", name)
+		return "", fmt.Errorf("%w: %s is required", ErrResearchInvalidToolRequest, name)
 	}
 	return value, nil
 }
@@ -474,7 +491,7 @@ func researchToolLimit(arguments map[string]any) (int, error) {
 		}
 	}
 	if limit <= 0 || limit > researchToolMaxLimit {
-		return 0, fmt.Errorf("limit must be between 1 and %d", researchToolMaxLimit)
+		return 0, fmt.Errorf("%w: limit must be between 1 and %d", ErrResearchInvalidToolRequest, researchToolMaxLimit)
 	}
 	return limit, nil
 }

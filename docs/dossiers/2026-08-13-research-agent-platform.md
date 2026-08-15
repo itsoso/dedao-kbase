@@ -573,3 +573,47 @@ content. Independent review returned Ready to merge Yes with zero Critical and
 zero Important findings. G6 remains open until the exact remediation revision
 is deployed and both real quick and deep Research Runs, citations, Worker
 search/fetch/expand flow, persistence, and restart recovery are verified.
+
+### First real Research Run finding
+
+The compiler remediation was deployed as
+`976f545e4c58f8e260e92d2f671669e82ba6f52d`. The exact revision passed public
+and loopback health, the five server-side services, the macOS Chatlog Worker,
+candidate/install hash checks, and the post-cutover log window. A real WeChat
+article Release then compiled to a v4 Research package with
+`wechat_mp_article` scope and inherited `evidence_only`; the package passed the
+trusted Research evaluation and was published.
+
+The first real quick Run did not pass G6. Knowledge search returned hits, but
+`fetch_knowledge_evidence` failed repeatedly. The Run was canceled to stop the
+retry/audit flood and G6 remained open. Read-only metadata inspection showed
+that legacy assembled claims can reference a chunk ID while the immutable
+package correctly pins the resolved citation ID. Search already resolved this
+legacy form, but the fetch path compared the resolved citation against the raw
+claim reference and therefore rejected evidence that it had just found.
+
+The follow-up remediation resolves claim references through the shared
+chunk/chapter/citation adapter before support checking. Permanent missing-claim,
+unsupported-citation, and unresolvable-citation failures are also typed as
+`citation_mismatch`, while context cancellation and timeout keep their original
+meaning; this prevents a permanent citation defect from being retried forever.
+The regression reproduces a stored legacy chunk reference against a package
+that pins the final citation ID. It failed before the fix and passed after it,
+along with the complete backend package, Research process smoke, focused race,
+system-map drift, privacy, and diff checks. A fresh independent review and an
+exact-revision redeployment are required before G6 resumes.
+
+That review found one broader blocker: deterministic invalid direct/Worker
+tool arguments and package-scope references could still replay a cached planner
+response forever. The remediation now types malformed bounded arguments as an
+invalid Research tool request, package-outside references as policy denial,
+missing Releases during package validation as policy denial (or source change
+if the pinned Release disappears after validation), and corrupt persisted
+Chatlog candidate state as a terminal Worker outcome. The existing outcome classifier
+therefore ends the Run without converting SQLite, filesystem, or network
+failures of unknown duration into permanent failures. Direct- and Worker-tool
+regressions execute a cached invalid planner result once, verify the typed
+terminal state, call Advance again without another model invocation, and prove
+that the coordinator cannot reclaim the Run. The resolver path was also
+narrowed: explicit claim, package allowlist, and Release citation checks are
+typed, while a later resolver I/O error remains retryable.

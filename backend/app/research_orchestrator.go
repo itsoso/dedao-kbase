@@ -36,6 +36,7 @@ var (
 	ErrResearchBudgetExhausted          = errors.New(ResearchOutcomeBudgetExhausted)
 	ErrResearchCitationMismatch         = errors.New(ResearchOutcomeCitationMismatch)
 	ErrResearchPolicyDenied             = errors.New(ResearchOutcomePolicyDenied)
+	ErrResearchInvalidToolRequest       = errors.New("invalid_research_tool_request")
 	ErrResearchModelInProgress          = errors.New("research model invocation is already in progress")
 	researchOrchestratorTransitionFault = func(string) error { return nil }
 )
@@ -189,7 +190,7 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 			}
 			arguments, err := json.Marshal(call.Arguments)
 			if err != nil {
-				return ResearchAdvanceResult{}, err
+				return ResearchAdvanceResult{}, fmt.Errorf("%w: worker tool arguments cannot be encoded", ErrResearchInvalidToolRequest)
 			}
 			if _, _, err := o.config.ResearchStore.CreateWorkerJobWithLease(ResearchWorkerJobInput{
 				RunID: run.RunID, TargetAgentID: o.config.WorkerAgentID, Tool: call.Tool,
@@ -370,7 +371,7 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, 
 			}
 			occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
 			if err != nil {
-				return false, fmt.Errorf("invalid persisted Chatlog candidate time: %w", err)
+				return false, fmt.Errorf("%w: invalid persisted Chatlog candidate time", ErrResearchWorkerTerminal)
 			}
 			arguments, err := json.Marshal(ResearchWorkerFetchChatMessageArgs{
 				MessageRef: candidate.CandidateRef, ConversationRef: candidate.CandidateRef,
@@ -418,7 +419,7 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, 
 		}
 		occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
 		if err != nil {
-			return false, fmt.Errorf("invalid persisted Chatlog candidate time: %w", err)
+			return false, fmt.Errorf("%w: invalid persisted Chatlog candidate time", ErrResearchWorkerTerminal)
 		}
 		arguments, err := json.Marshal(ResearchWorkerExpandChatContextArgs{
 			MessageRef: candidate.CandidateRef, ConversationRef: candidate.CandidateRef,
@@ -1581,6 +1582,8 @@ func ClassifyResearchOrchestratorOutcome(err error) string {
 	case errors.Is(err, ErrResearchEvidenceSourceChanged):
 		return ResearchOutcomeSourceChanged
 	case errors.Is(err, ErrResearchPolicyDenied):
+		return ResearchOutcomePolicyDenied
+	case errors.Is(err, ErrResearchInvalidToolRequest):
 		return ResearchOutcomePolicyDenied
 	case errors.Is(err, context.DeadlineExceeded):
 		return ResearchOutcomeModelTimeout

@@ -1965,7 +1965,7 @@
     {
       "name": "ResearchToolAuditRecord",
       "file": "backend/app/research_tools.go",
-      "line": 67
+      "line": 68
     },
     {
       "name": "SourceAdapterExecutionError",

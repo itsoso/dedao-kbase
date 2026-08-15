@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -73,6 +74,95 @@ func TestResearchKnowledgeToolPinsPackageReleaseCitationsAndAudits(t *testing.T)
 		if strings.Contains(string(auditJSON), privateValue) {
 			t.Fatalf("audit leaked raw argument %q: %s", privateValue, auditJSON)
 		}
+	}
+}
+
+func TestResearchKnowledgeFetchResolvesLegacyClaimChunkReferences(t *testing.T) {
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
+	release, err := knowledge.LoadKnowledgeRelease(pkg.Releases[0].ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.Analysis == nil || len(release.Analysis.Claims) == 0 || len(release.Citations) == 0 ||
+		strings.TrimSpace(release.Citations[0].ChunkID) == "" {
+		t.Fatalf("legacy citation fixture is incomplete: %#v", release)
+	}
+	release.Analysis.Claims[0].CitationIDs = []string{release.Citations[0].ChunkID}
+	payload, err := encodeJSONFile(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomically(knowledge.KnowledgeReleasePath(release.ReleaseID), payload); err != nil {
+		t.Fatal(err)
+	}
+
+	research, err := OpenResearchStore(knowledge.Root(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = research.Close() })
+	run := createResearchToolRun(t, research, pkg, "legacy-claim-chunk-reference")
+	registry, err := NewResearchToolRegistry(knowledge, research)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := registry.Execute(context.Background(), ResearchToolFetchKnowledgeEvidence, ResearchToolRequest{
+		RunID: run.RunID, PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Arguments: map[string]any{
+			"release_id":  release.ReleaseID,
+			"claim_id":    release.Analysis.Claims[0].ID,
+			"citation_id": release.Citations[0].CitationID,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.PromotedEvidence) != 1 || len(result.Citations) != 1 ||
+		result.Citations[0].CitationID != release.Citations[0].CitationID {
+		t.Fatalf("legacy chunk-reference fetch = %#v", result)
+	}
+}
+
+func TestResearchKnowledgeFetchClassifiesPermanentScopeAndSourceErrors(t *testing.T) {
+	knowledge, pkg := researchAgentRuntimeTestStore(t)
+	research, err := OpenResearchStore(knowledge.Root(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = research.Close() })
+	run := createResearchToolRun(t, research, pkg, "permanent-fetch-errors")
+	registry, err := NewResearchToolRegistry(knowledge, research)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = registry.Execute(context.Background(), ResearchToolFetchKnowledgeEvidence, ResearchToolRequest{
+		RunID: run.RunID, PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Arguments: map[string]any{"release_id": "release-outside-package", "claim_id": "claim-1", "citation_id": "citation-1"},
+	})
+	if !errors.Is(err, ErrResearchPolicyDenied) {
+		t.Fatalf("outside release error = %v", err)
+	}
+
+	ref := pkg.Releases[0]
+	release, err := knowledge.LoadKnowledgeRelease(ref.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := knowledge.KnowledgeReleasePath(ref.ReleaseID)
+	if err := os.Rename(path, path+".missing"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = registry.Execute(context.Background(), ResearchToolFetchKnowledgeEvidence, ResearchToolRequest{
+		RunID: run.RunID, PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Arguments: map[string]any{
+			"release_id": ref.ReleaseID, "claim_id": release.Analysis.Claims[0].ID,
+			"citation_id": release.Citations[0].CitationID,
+		},
+	})
+	if !errors.Is(err, ErrResearchPolicyDenied) {
+		t.Fatalf("missing pinned release error = %v", err)
 	}
 }
 
