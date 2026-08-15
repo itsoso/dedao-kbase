@@ -804,3 +804,29 @@ concurrent legacy-migration repetitions pass after the fix. The complete Gate
 suite then passed on the combined candidate: module verification, vet, the full
 Go suite, frontend production build and UI smokes, Research process smoke,
 focused race, system-map drift, privacy, and diff checks all returned zero.
+
+### First real deep cross-source Run finding
+
+Revision `6c8c4bbde26a7f0284f0c5cd1c582e6c2e9e7f51` was deployed across the
+server, book Worker, three evolution Workers, and the macOS Chatlog Worker.
+Exact public and loopback health, binary revision/hash checks, service health,
+authorization rejection, Chatlog read access, and remote Worker authentication
+passed. The repeated aligned quick Run completed with three knowledge evidence
+records, two verified conclusions, and three available citations; both model
+calls completed within the unchanged one-dollar budget and citation detail was
+re-fetched successfully.
+
+The first deep knowledge-plus-Chatlog Run then exposed a planner contract
+drift before any Chatlog job was created. The published package allows at most
+eight context chunks, while the planner contract advertised a generic maximum
+of fifty. The model repeatedly requested ten or twenty; the package runtime
+correctly rejected every search, but the untyped execution error caused
+replanning until the model budget was exhausted. No evidence was promoted.
+
+The remediation now derives the advertised knowledge limit from the exact
+published package and deterministically lowers planner-requested or default
+limits to that package boundary before audited execution. This can only narrow
+retrieval and does not hide malformed types or missing queries. A regression
+uses a package limit of eight and a planner request of twenty, then requires a
+completed tool audit and forward stage transition. Full gates, exact-revision
+deployment, and a fresh deep cross-source Run remain required.

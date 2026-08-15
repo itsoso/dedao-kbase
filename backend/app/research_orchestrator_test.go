@@ -1058,12 +1058,38 @@ func TestResearchPlannerPromptListsOnlyRunAuthorizedEntryTools(t *testing.T) {
 					t.Fatalf("planner prompt omitted %s: %s", field, joined)
 				}
 			}
+			if testCase.source == ResearchSourceKnowledge &&
+				!strings.Contains(joined, `"limit":"optional integer 1..8"`) {
+				t.Fatalf("planner prompt omitted package retrieval limit: %s", joined)
+			}
 			for _, derived := range []string{ResearchToolFetchKnowledgeEvidence, ResearchWorkerToolFetchChatMessage, ResearchWorkerToolExpandChatContext} {
 				if strings.Contains(joined, `"name":"`+derived+`"`) {
 					t.Fatalf("planner prompt exposed orchestrator-derived tool %q: %s", derived, joined)
 				}
 			}
 		})
+	}
+}
+
+func TestResearchOrchestratorBoundsPlannerKnowledgeLimitToPackagePolicy(t *testing.T) {
+	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
+	model.plannerOutput = &ResearchPlannerOutput{DecisionSummary: "Search the published package", ToolCalls: []ResearchPlannedToolCall{{
+		Tool: ResearchToolSearchKnowledge, Arguments: map[string]any{"query": "grounded", "limit": 20},
+	}}}
+	run := createResearchOrchestratorRun(t, research, pkg, "planner-package-limit", ResearchModeDeep,
+		[]string{ResearchSourceKnowledge}, "grounded")
+
+	result, err := orchestrator.Advance(context.Background(), run.RunID)
+	if err != nil || result.Run.Status != ResearchRetrieving {
+		t.Fatalf("bounded planner result=%#v err=%v", result, err)
+	}
+	var outcome string
+	if err := research.db.QueryRow(`SELECT outcome FROM research_tool_audits WHERE run_id = ? AND tool_name = ?`,
+		run.RunID, ResearchToolSearchKnowledge).Scan(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if outcome != ResearchToolOutcomeCompleted {
+		t.Fatalf("knowledge tool outcome=%q", outcome)
 	}
 }
 

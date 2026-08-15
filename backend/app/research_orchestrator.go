@@ -204,7 +204,26 @@ func (o *ResearchOrchestrator) advancePlanning(ctx context.Context, run Research
 			})
 		}
 	}
+	knowledgeLimit := 0
 	for _, call := range output.ToolCalls {
+		if call.Tool != ResearchToolSearchKnowledge {
+			continue
+		}
+		pkg, err := loadRunnableResearchAgentPackage(ctx, o.config.KnowledgeStore, run, run.PackageID, run.PackageVersion)
+		if err != nil {
+			return ResearchAdvanceResult{}, err
+		}
+		knowledgeLimit = pkg.RetrievalPolicy.MaxContextChunks
+		break
+	}
+	for _, call := range output.ToolCalls {
+		if call.Tool == ResearchToolSearchKnowledge {
+			arguments, err := boundResearchKnowledgeSearchArguments(call.Arguments, knowledgeLimit)
+			if err != nil {
+				return ResearchAdvanceResult{}, err
+			}
+			call.Arguments = arguments
+		}
 		if isResearchWorkerTool(call.Tool) {
 			if err := o.authorizeResearchTool(ctx, run, call.Tool); err != nil {
 				return ResearchAdvanceResult{}, err
@@ -1288,7 +1307,7 @@ func (o *ResearchOrchestrator) researchPlannerToolContracts(ctx context.Context,
 	}
 	definitions := []researchPlannerToolContract{
 		{Name: ResearchToolSearchKnowledge, Source: ResearchSourceKnowledge, Arguments: map[string]string{
-			"query": "required string", "limit": "optional integer 1..50",
+			"query": "required string", "limit": fmt.Sprintf("optional integer 1..%d", pkg.RetrievalPolicy.MaxContextChunks),
 		}},
 		{Name: ResearchToolSearchPriorRuns, Source: ResearchSourcePriorRuns, Arguments: map[string]string{
 			"query": "required string", "limit": "optional integer 1..50",
@@ -1317,6 +1336,25 @@ func (o *ResearchOrchestrator) researchPlannerToolContracts(ctx context.Context,
 		allowed = append(allowed, definition)
 	}
 	return allowed, nil
+}
+
+func boundResearchKnowledgeSearchArguments(arguments map[string]any, maxContextChunks int) (map[string]any, error) {
+	if maxContextChunks <= 0 {
+		return nil, fmt.Errorf("%w: package retrieval context limit is invalid", ErrResearchPolicyDenied)
+	}
+	limit, err := researchToolLimit(arguments)
+	if err != nil {
+		return nil, err
+	}
+	if limit > maxContextChunks {
+		limit = maxContextChunks
+	}
+	bounded := make(map[string]any, len(arguments)+1)
+	for name, value := range arguments {
+		bounded[name] = value
+	}
+	bounded["limit"] = limit
+	return bounded, nil
 }
 
 func (o *ResearchOrchestrator) stageMessages(ctx context.Context, run ResearchRun, role ResearchModelRole, instruction string) ([]BookKnowledgeMessage, error) {
