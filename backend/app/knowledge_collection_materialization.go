@@ -22,7 +22,10 @@ const (
 	knowledgeCollectionMaterializationMaxQuoted     = 5000000
 )
 
-var ErrKnowledgeCollectionMaterializationConflict = errors.New("knowledge collection materialization conflicts with immutable content")
+var (
+	ErrKnowledgeCollectionMaterializationConflict = errors.New("knowledge collection materialization conflicts with immutable content")
+	ErrKnowledgeCollectionMaterializationInvalid  = errors.New("knowledge collection release cannot be materialized")
+)
 
 type KnowledgeCollectionMaterialization struct {
 	SchemaVersion             string `json:"schema_version"`
@@ -72,7 +75,7 @@ func (s *BookKnowledgeStore) MaterializeKnowledgeCollectionRelease(releaseID str
 	}
 	result, err := s.projectKnowledgeCollectionReleaseUnlocked(*collection)
 	if err != nil {
-		return nil, false, err
+		return nil, false, fmt.Errorf("%w: %v", ErrKnowledgeCollectionMaterializationInvalid, err)
 	}
 	materializationPath := s.KnowledgeCollectionMaterializationPath(releaseID)
 	var existing KnowledgeCollectionMaterialization
@@ -136,21 +139,21 @@ func (s *BookKnowledgeStore) loadKnowledgeCollectionReleaseUnlocked(releaseID st
 		return nil, err
 	}
 	if release.ReleaseID != releaseID || release.SchemaVersion != KnowledgeCollectionReleaseSchemaVersion {
-		return nil, fmt.Errorf("knowledge collection release contract is invalid")
+		return nil, fmt.Errorf("%w: release contract is invalid", ErrKnowledgeCollectionMaterializationInvalid)
 	}
 	hash, expectedID, err := knowledgeCollectionReleaseIdentity(release)
 	if err != nil || hash != release.ContentHash || expectedID != release.ReleaseID {
-		return nil, fmt.Errorf("knowledge collection release integrity check failed")
+		return nil, fmt.Errorf("%w: release integrity check failed", ErrKnowledgeCollectionMaterializationInvalid)
 	}
 	if release.UsagePolicy != BookUsageEvidenceOnly || release.Quality.Decision != BookQualityPass ||
 		release.Quality.UsagePolicy != BookUsageEvidenceOnly || len(release.Members) == 0 {
-		return nil, fmt.Errorf("knowledge collection release is not eligible for evidence-only materialization")
+		return nil, fmt.Errorf("%w: release is not eligible", ErrKnowledgeCollectionMaterializationInvalid)
 	}
 	if err := ValidateKnowledgeCollectionDefinition(release.Definition); err != nil {
-		return nil, fmt.Errorf("knowledge collection release definition is invalid: %w", err)
+		return nil, fmt.Errorf("%w: release definition is invalid", ErrKnowledgeCollectionMaterializationInvalid)
 	}
 	if len(release.Members) > KnowledgeCollectionMaxMembers {
-		return nil, fmt.Errorf("knowledge collection release exceeds member limit")
+		return nil, fmt.Errorf("%w: release exceeds member limit", ErrKnowledgeCollectionMaterializationInvalid)
 	}
 	return &release, nil
 }

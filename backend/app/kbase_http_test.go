@@ -147,6 +147,84 @@ func TestKBaseHTTPKnowledgeCollectionLifecycle(t *testing.T) {
 	}
 }
 
+func TestKBaseHTTPKnowledgeCollectionMaterialization(t *testing.T) {
+	store, collection := collectionMaterializationFixture(t)
+	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})
+	path := "/api/knowledge/collection-releases/" + collection.ReleaseID + "/materialize"
+
+	unauthorized := requestJSONKBase(handler, http.MethodPost, path, "", `{}`)
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthorized status=%d body=%s", unauthorized.Code, unauthorized.Body.String())
+	}
+	created := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var payload struct {
+		Created         bool                               `json:"created"`
+		Materialization KnowledgeCollectionMaterialization `json:"materialization"`
+		Release         struct {
+			SchemaVersion string `json:"schema_version"`
+			Version       string `json:"version"`
+			ReleaseID     string `json:"release_id"`
+			BookID        string `json:"book_id"`
+			ContentHash   string `json:"content_hash"`
+			UsagePolicy   string `json:"usage_policy"`
+			CreatedAt     string `json:"created_at"`
+		} `json:"release"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.Created || payload.Materialization.TargetReleaseID == "" ||
+		payload.Release.ReleaseID != payload.Materialization.TargetReleaseID ||
+		payload.Release.ContentHash != payload.Materialization.TargetContentHash ||
+		payload.Release.UsagePolicy != BookUsageEvidenceOnly || payload.Release.CreatedAt == "" {
+		t.Fatalf("payload=%#v", payload)
+	}
+	for _, private := range []string{`"analysis"`, `"citations"`, "Evidence for article-a", "Fixture account"} {
+		if strings.Contains(created.Body.String(), private) {
+			t.Fatalf("materialization response exposed %q: %s", private, created.Body.String())
+		}
+	}
+
+	replayed := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{}`)
+	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) ||
+		!strings.Contains(replayed.Body.String(), payload.Release.ReleaseID) {
+		t.Fatalf("replay status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+
+	for _, testCase := range []struct {
+		name, method, path, body string
+		status                   int
+	}{
+		{"unknown field", http.MethodPost, path, `{"unknown":true}`, http.StatusBadRequest},
+		{"trailing body", http.MethodPost, path, `{} {}`, http.StatusBadRequest},
+		{"oversized body", http.MethodPost, path, `{"padding":"` + strings.Repeat("x", 8<<10) + `"}`, http.StatusRequestEntityTooLarge},
+		{"invalid id", http.MethodPost, "/api/knowledge/collection-releases/not-a-release/materialize", `{}`, http.StatusBadRequest},
+		{"missing release", http.MethodPost, "/api/knowledge/collection-releases/collection-release-aaaaaaaaaaaaaaaaaaaaaaaa/materialize", `{}`, http.StatusNotFound},
+		{"wrong method", http.MethodGet, path, "", http.StatusMethodNotAllowed},
+		{"extra path", http.MethodPost, path + "/extra", `{}`, http.StatusNotFound},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			response := requestJSONKBase(handler, testCase.method, testCase.path, "secret-token", testCase.body)
+			if response.Code != testCase.status {
+				t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+			}
+		})
+	}
+
+	conflict := payload.Materialization
+	conflict.TargetContentHash = "sha256:" + strings.Repeat("f", 64)
+	if err := writeJSONFile(store.KnowledgeCollectionMaterializationPath(collection.ReleaseID), conflict); err != nil {
+		t.Fatal(err)
+	}
+	conflicted := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{}`)
+	if conflicted.Code != http.StatusConflict || strings.Contains(conflicted.Body.String(), store.Root()) {
+		t.Fatalf("conflict status=%d body=%s", conflicted.Code, conflicted.Body.String())
+	}
+}
+
 func TestKBaseHTTPKnowledgeCollectionValidationAndQualityGate(t *testing.T) {
 	store := NewBookKnowledgeStore(t.TempDir())
 	handler := NewKBaseHTTPHandler(KBaseHTTPConfig{Store: store, AuthToken: "secret-token"})

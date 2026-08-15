@@ -1920,19 +1920,24 @@ func (h *kbaseHTTPHandler) handleKnowledgeCollections(w http.ResponseWriter, r *
 }
 
 func (h *kbaseHTTPHandler) handleKnowledgeCollectionReleases(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
 	const prefix = "/api/knowledge/collection-releases/"
-	rawID := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
-	if rawID == "" || strings.Contains(rawID, "/") {
+	rawPath := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
+	parts := strings.Split(rawPath, "/")
+	if rawPath == "" || len(parts) > 2 || len(parts) == 2 && parts[1] != "materialize" {
 		writeHTTPError(w, http.StatusNotFound, "knowledge collection release not found")
 		return
 	}
-	releaseID, err := url.PathUnescape(rawID)
+	releaseID, err := url.PathUnescape(parts[0])
 	if err != nil || strings.Contains(releaseID, "/") {
 		writeHTTPError(w, http.StatusBadRequest, "invalid release_id")
+		return
+	}
+	if len(parts) == 2 {
+		h.handleKnowledgeCollectionReleaseMaterialization(w, r, releaseID)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
 	release, err := h.store.LoadKnowledgeCollectionRelease(releaseID)
@@ -1945,6 +1950,52 @@ func (h *kbaseHTTPHandler) handleKnowledgeCollectionReleases(w http.ResponseWrit
 		return
 	}
 	writeHTTPJSON(w, http.StatusOK, release)
+}
+
+func (h *kbaseHTTPHandler) handleKnowledgeCollectionReleaseMaterialization(w http.ResponseWriter, r *http.Request, releaseID string) {
+	if r.Method != http.MethodPost {
+		writeHTTPError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !knowledgeCollectionReleaseIDPattern.MatchString(releaseID) {
+		writeHTTPError(w, http.StatusBadRequest, "invalid release_id")
+		return
+	}
+	var request struct{}
+	if !decodeStrictLimitedHTTPJSON(w, r, 4<<10, &request) {
+		return
+	}
+	result, created, err := h.store.MaterializeKnowledgeCollectionRelease(releaseID)
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			writeHTTPError(w, http.StatusNotFound, "knowledge collection release not found")
+		case errors.Is(err, ErrKnowledgeCollectionMaterializationConflict):
+			writeHTTPError(w, http.StatusConflict, "knowledge collection materialization conflicts with immutable content")
+		case errors.Is(err, ErrKnowledgeCollectionMaterializationInvalid):
+			writeHTTPError(w, http.StatusConflict, "knowledge collection release cannot be materialized")
+		default:
+			writeHTTPError(w, http.StatusInternalServerError, "knowledge collection materialization unavailable")
+		}
+		return
+	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	writeHTTPJSON(w, status, map[string]any{
+		"created":         created,
+		"materialization": result.Materialization,
+		"release": map[string]any{
+			"schema_version": result.Release.SchemaVersion,
+			"version":        result.Release.Version,
+			"release_id":     result.Release.ReleaseID,
+			"book_id":        result.Release.BookID,
+			"content_hash":   result.Release.ContentHash,
+			"usage_policy":   result.Release.UsagePolicy,
+			"created_at":     result.Release.CreatedAt,
+		},
+	})
 }
 
 func (h *kbaseHTTPHandler) writeKnowledgeCollectionError(w http.ResponseWriter, err error, publish bool) {
