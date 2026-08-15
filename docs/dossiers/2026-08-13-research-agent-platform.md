@@ -726,3 +726,39 @@ system-map drift, privacy, and diff checks all completed with exit code zero.
 A fresh G4 review, exact-revision deployment health, and authorized real
 collection materialization plus cross-source citation re-fetch remain required
 before this checkpoint changes G6 to PASS.
+
+### Real collection acceptance: quick cost-boundary finding
+
+Revision `031031d5927c4819d0f117790d28395265e9b527` was fast-forwarded to
+canonical main and deployed across KBase, the book-job Worker, all three
+evolution Workers, and the macOS Chatlog Worker. Public and loopback health,
+candidate and installed hashes, build metadata, service state, restart counts,
+anonymous authorization rejection, Worker doctor, and the post-cutover warning
+window passed. Recoverable server and evolution backups are retained in the
+revision-scoped deployment batch.
+
+The authorized production materialization of the intended immutable account
+collection created one standard evidence-only Release from 219 pinned members,
+with 733 claims and 733 citations. That Release compiled to, passed the trusted
+Research evaluation for, and published the new v4 package
+`book-agent-8aac21dee8a5f089-study@1.0.0`, content hash
+`sha256:766177493953541ea4a49eb95936f037d0983875882733030d6917a33cf5d7c8`.
+The original v3 collection package was not used as a Research runtime package.
+
+The first real quick Run, `research-run-5e95de3c8888ec77c4645f15f55d8c3f`,
+correctly searched and cited knowledge, promoted eight evidence records, and
+then ended as `budget_exhausted` before any model invocation. Aggregate-only
+inspection showed that quick retrieval normalized every result to 1,200
+characters, producing 9,600 quoted characters. Once the structured evidence
+metadata, system contract, and output allowance were included, the conservative
+cost reservation necessarily exceeded the unchanged one-dollar quick budget.
+G6 therefore remained open.
+
+The remediation keeps the hard one-dollar budget and bounds deterministic quick
+retrieval to the three highest-ranked knowledge results; deep Research retains
+its separate evidence and cost budgets. A regression with eight long eligible
+results reproduced the zero-model-call terminal failure before the change and
+now completes synthesis and verification with exactly three promoted results.
+The original quick test, focused race run, complete Go suite and vet, and the
+full Research process smoke pass. Exact-revision redeployment and repeated real
+quick plus deep cross-source acceptance remain required.

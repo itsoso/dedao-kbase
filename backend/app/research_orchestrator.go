@@ -14,7 +14,8 @@ import (
 )
 
 const (
-	ResearchWaitWorkerPending = "worker_pending"
+	ResearchWaitWorkerPending   = "worker_pending"
+	researchQuickKnowledgeLimit = 3
 
 	ResearchOutcomeCompleted          = "completed"
 	ResearchOutcomeWorkerOffline      = "worker_offline"
@@ -261,7 +262,7 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 		if len(evidence) == 0 {
 			result, err := o.config.Tools.Execute(ctx, ResearchToolSearchKnowledge, ResearchToolRequest{
 				RunID: run.RunID, PackageID: run.PackageID, PackageVersion: run.PackageVersion,
-				Arguments: map[string]any{"query": run.Question},
+				Arguments: map[string]any{"query": run.Question, "limit": researchQuickKnowledgeLimit},
 			})
 			if err != nil {
 				return ResearchAdvanceResult{}, err

@@ -254,6 +254,104 @@ func TestResearchOrchestratorQuickPathCompletesWithGroundedPackageRetrieval(t *t
 	}
 }
 
+func TestResearchOrchestratorQuickPathBoundsEvidenceBeforeModelCostReservation(t *testing.T) {
+	knowledge := NewBookKnowledgeStore(t.TempDir())
+	knowledge.SetAgentSemanticEmbedder(&fakeAgentSemanticEmbedder{})
+	pkg := agentToolPolicyTestPackage()
+	pkg.PackageID = "quick-cost-boundary"
+	pkg.Version = "4.0.0-research"
+	pkg.LifecycleState = AgentPackageDraft
+	pkg.ContentHash = ""
+	pkg.CreatedAt = ""
+	pkg.PublishedAt = ""
+	pkg.Supersedes = ""
+	pkg.Releases = nil
+	for index := 0; index < researchToolDefaultLimit; index++ {
+		release := agentPackageTestRelease()
+		release.ReleaseID = fmt.Sprintf("quick-release-%d", index)
+		release.BookID = fmt.Sprintf("quick-book-%d", index)
+		release.Book.BookID = release.BookID
+		release.ContentHash = sha256Fingerprint([]byte(release.ReleaseID))
+		claimID := fmt.Sprintf("quick-claim-%d", index)
+		citationID := fmt.Sprintf("quick-citation-%d", index)
+		release.Analysis.Claims[0].ID = claimID
+		release.Analysis.Claims[0].Statement = strings.Repeat("grounded ", 160)
+		release.Analysis.Claims[0].CitationIDs = []string{citationID}
+		release.Citations[0].CitationID = citationID
+		release.Citations[0].BookID = release.BookID
+		release.Citations[0].ChunkID = fmt.Sprintf("quick-chunk-%d", index)
+		if err := knowledge.saveKnowledgeRelease(release); err != nil {
+			t.Fatal(err)
+		}
+		pkg.Releases = append(pkg.Releases, AgentPackageReleaseRef{
+			ReleaseID: release.ReleaseID, ContentHash: release.ContentHash, CitationIDs: []string{citationID},
+		})
+	}
+	applyAgentCompilationResearchPolicy(&pkg, true)
+	finalized, err := FinalizeAgentPackage(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitted := loadResearchEvaluationFixture(t)
+	trusted := trustedResearchEvaluationFixture(submitted)
+	if err := knowledge.SaveTrustedAgentEvaluationSuite(finalized, trusted); err != nil {
+		t.Fatal(err)
+	}
+	resolved, report, err := EvaluateAgentPackageAgainstTrustedSuite(knowledge, finalized, submitted, testAgentPackageTime())
+	if err != nil || !report.Passed {
+		t.Fatalf("research evaluation = %#v err=%v", report, err)
+	}
+	if err := knowledge.SaveAgentPackageEvaluation(finalized, resolved, report); err != nil {
+		t.Fatal(err)
+	}
+	published, _, err := PublishAgentPackage(
+		knowledge, finalized, "quick-cost-boundary", AgentPackageKnownToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	research, err := OpenResearchStore(knowledge.Root(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = research.Close() })
+	tools, err := NewResearchToolRegistry(knowledge, research)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := &fakeResearchStageModel{usage: ResearchModelUsage{
+		InputTokens: 100, OutputTokens: 50, TotalTokens: 150, CostUSD: 0.015,
+	}}
+	orchestrator, err := NewResearchOrchestrator(ResearchOrchestratorConfig{
+		KnowledgeStore: knowledge, ResearchStore: research, Tools: tools, Model: model,
+		ModelConfig: BookTokenPlanConfig{APIKey: "synthetic", Model: "qwen-plus"}, WorkerAgentID: "chatlog-agent",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := researchStoreTestInput("quick-cost-boundary")
+	input.Request.PackageID = published.PackageID
+	input.Request.PackageVersion = published.Version
+	input.Request.Question = "grounded"
+	input.Budget = ResearchBudget{
+		MaxIterations: 2, MaxEvidenceItems: 40, MaxQuotedChars: 12000, MaxModelCalls: 4, MaxCostUSD: 1,
+	}
+	run, _, err := research.CreateRun(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 12)
+	evidence, err := research.ListEvidence(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Run.Status != ResearchCompleted || result.Outcome != ResearchOutcomeCompleted ||
+		len(evidence) != 3 {
+		t.Fatalf("quick cost result=%#v evidence=%d calls=%#v", result, len(evidence), model.calls)
+	}
+}
+
 func TestResearchOrchestratorMalformedExtractorOutputTerminatesWithoutReplay(t *testing.T) {
 	orchestrator, research, pkg, model := newResearchOrchestratorTestHarness(t)
 	model.malformedExtract = true
