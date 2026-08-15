@@ -468,7 +468,8 @@ Chatlog、跨来源、身份解析、时间线、历史/当前案例比较或冲
 启用服务端运行时需要显式设置 `KBASE_RESEARCH_ENABLED=true` 和 TokenPlan 凭据。
 可以分别用 `KBASE_RESEARCH_PLANNER_MODEL`、`KBASE_RESEARCH_EXTRACTOR_MODEL`、
 `KBASE_RESEARCH_SYNTHESIZER_MODEL`、`KBASE_RESEARCH_VERIFIER_MODEL` 固定角色模型；
-预算使用 `KBASE_RESEARCH_QUICK_*` 与 `KBASE_RESEARCH_DEEP_*` 变量配置。生产环境
+默认四个结构化角色均使用 `qwen3.8-max-preview`，预算使用
+`KBASE_RESEARCH_QUICK_*` 与 `KBASE_RESEARCH_DEEP_*` 变量配置。生产环境
 应保持 KBase 仅监听 loopback，由现有 HTTPS 反向代理提供浏览器入口。
 
 用户 API：

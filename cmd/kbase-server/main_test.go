@@ -1266,6 +1266,20 @@ func TestResearchServerConfigurationUsesStrictBoundedEnvironment(t *testing.T) {
 	}
 }
 
+func TestDefaultResearchServerConfigUsesStructuredMaxModelForEveryRole(t *testing.T) {
+	config := defaultResearchServerConfig()
+	for _, role := range []app.ResearchModelRole{
+		app.ResearchRolePlanner,
+		app.ResearchRoleExtractor,
+		app.ResearchRoleSynthesizer,
+		app.ResearchRoleVerifier,
+	} {
+		if config.RoleModels[role] != "qwen3.8-max-preview" {
+			t.Fatalf("default model for %s = %q", role, config.RoleModels[role])
+		}
+	}
+}
+
 func TestResearchServerRuntimeStartsRecoversAndShutsDown(t *testing.T) {
 	t.Setenv("DEDAO_TOKENPLAN_API_KEY", "synthetic-research-key")
 	t.Setenv("DEDAO_TOKENPLAN_BASE_URL", "https://provider.invalid/v1")

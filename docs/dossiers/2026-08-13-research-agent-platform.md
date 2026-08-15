@@ -830,3 +830,19 @@ retrieval and does not hide malformed types or missing queries. A regression
 uses a package limit of eight and a planner request of twenty, then requires a
 completed tool audit and forward stage transition. Full gates, exact-revision
 deployment, and a fresh deep cross-source Run remain required.
+
+The redeployed limit remediation completed knowledge search, Chatlog search,
+eight exact fetches, and eight bounded context expansions; the Run reached 36
+cross-source evidence records with both sources in searched and cited scope.
+The default `qwen3.7-plus` extractor then returned invalid structured output.
+A second Run explicitly limited Chatlog to two hits and reached ten cross-source
+records, but the same extractor failed the contract again. Both Runs terminated
+as `invalid_model_output` without cached or promoted conclusions.
+
+Planner, synthesizer, and verifier already default to
+`qwen3.8-max-preview`. The next candidate aligns the extractor default to the
+same stronger structured-output model while retaining the existing bounded
+environment override. This is a model-selection change, not a relaxation of
+the extractor schema, evidence references, citation checks, or fail-closed
+behavior. Configuration regression, full gates, exact deployment, and another
+bounded production deep Run remain required.

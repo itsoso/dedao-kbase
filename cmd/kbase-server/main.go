@@ -493,7 +493,7 @@ func defaultResearchServerConfig() researchServerConfig {
 		ShutdownTimeout: 10 * time.Second,
 		RoleModels: map[app.ResearchModelRole]string{
 			app.ResearchRolePlanner:     "qwen3.8-max-preview",
-			app.ResearchRoleExtractor:   "qwen3.7-plus",
+			app.ResearchRoleExtractor:   "qwen3.8-max-preview",
 			app.ResearchRoleSynthesizer: "qwen3.8-max-preview",
 			app.ResearchRoleVerifier:    "qwen3.8-max-preview",
 		},
