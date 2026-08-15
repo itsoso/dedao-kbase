@@ -879,6 +879,47 @@ func TestResearchAgentPackageScopeAndToolAuthorizationFailClosed(t *testing.T) {
 	}
 }
 
+func TestResearchRuntimeStillRejectsV3Collection(t *testing.T) {
+	store, collection := collectionMaterializationFixture(t)
+	bundle, err := BuildControlledCollectionAgentDraftBundle(store, ControlledCollectionAgentDraftRequest{
+		CollectionReleaseID: collection.ReleaseID,
+	}, AgentReadOnlyToolIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite); err != nil {
+		t.Fatal(err)
+	}
+	resolved, trustedHash, err := store.ResolveTrustedAgentEvaluationSuite(bundle.Package, bundle.Suite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := EvaluateAgentPackageDeterministically(store, bundle.Package, resolved, testAgentPackageTime())
+	if err != nil || !report.Passed {
+		t.Fatalf("collection evaluation=%#v err=%v", report, err)
+	}
+	report.TrustedSuiteHash = trustedHash
+	if err := store.SaveAgentPackageEvaluation(bundle.Package, resolved, report); err != nil {
+		t.Fatal(err)
+	}
+	published, _, err := PublishAgentPackage(
+		store, bundle.Package, "v3-remains-isolated", AgentPackageKnownToolIDs(), testAgentPackageTime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if published.SchemaVersion != AgentPackageSchemaVersionV3 {
+		t.Fatalf("collection package schema=%q", published.SchemaVersion)
+	}
+	_, err = loadRunnableResearchAgentPackageScope(
+		context.Background(), store, published.PackageID, published.Version,
+		ResearchModeDeep, []string{ResearchSourceKnowledge, ResearchSourceChatlog},
+	)
+	if !errors.Is(err, ErrResearchPolicyDenied) || !strings.Contains(err.Error(), AgentPackageSchemaVersionV4) {
+		t.Fatalf("v3 Research scope error=%v", err)
+	}
+}
+
 func agentRuntimeTestStoreWithLimit(t *testing.T, maxContextChunks int) (*BookKnowledgeStore, AgentPackage) {
 	return agentRuntimeTestStoreWithPackageEdit(t, func(pkg *AgentPackage) {
 		pkg.RetrievalPolicy.MaxContextChunks = maxContextChunks

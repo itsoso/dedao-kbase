@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestValidateAgentCompilationRequest(t *testing.T) {
@@ -418,6 +419,91 @@ func TestAgentCompilationResearchOptInEmitsV4WithoutChangingOrdinaryTools(t *tes
 	}
 	if ordinary.CompilationID == research.CompilationID || ordinaryPackage.ContentHash == researchPackage.ContentHash {
 		t.Fatal("research opt-in was not bound into compilation/package identity")
+	}
+}
+
+func TestAgentCompilerAcceptsMaterializedCollectionForResearch(t *testing.T) {
+	store, collection := collectionMaterializationFixture(t)
+	materialized, _, err := store.MaterializeKnowledgeCollectionRelease(collection.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion,
+		Mode:          AgentCompilationModeStudy, PrimaryReleaseID: materialized.Release.ReleaseID,
+		Version: "1.0.0", ResearchEnabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != AgentCompilationStatusReady || len(result.Candidates) != 1 || result.Candidates[0].Package == nil {
+		t.Fatalf("compilation=%#v", result)
+	}
+	pkg := result.Candidates[0].Package
+	if pkg.SchemaVersion != AgentPackageSchemaVersionV4 || pkg.ResearchPolicy == nil ||
+		len(pkg.Releases) != 1 || pkg.Releases[0].ReleaseID != materialized.Release.ReleaseID ||
+		pkg.Releases[0].ContentHash != materialized.Release.ContentHash || len(pkg.CollectionReleases) != 0 ||
+		pkg.SafetyPolicy.UsagePolicy != BookUsageEvidenceOnly ||
+		!agentTestContainsString(pkg.UIManifest.Capabilities, "deep_research") {
+		t.Fatalf("materialized Research package=%#v", pkg)
+	}
+	if err := ValidateAgentPackage(*pkg, store, AgentPackageKnownToolIDs()); err != nil {
+		t.Fatalf("materialized Research package invalid: %v", err)
+	}
+	for _, toolID := range ResearchAgentToolIDs() {
+		server, tool, _ := strings.Cut(toolID, "/")
+		allowed := false
+		for _, rule := range pkg.ToolPolicy.Tools {
+			allowed = allowed || rule.MCPServer == server && rule.ToolName == tool && rule.Decision == AgentToolAllow
+		}
+		if !allowed {
+			t.Fatalf("materialized Research package missing allow rule %q", toolID)
+		}
+	}
+	if collection.ReleaseID == materialized.Release.ReleaseID || materialized.Release.Book.SourceKey != collection.ReleaseID {
+		t.Fatalf("source collection provenance was not retained: collection=%#v release=%#v", collection, materialized.Release)
+	}
+}
+
+func TestAgentCompilerAcceptsMaterializedCollectionWithLongCitedChunk(t *testing.T) {
+	store := NewBookKnowledgeStore(t.TempDir())
+	saveCollectionFixture(t, store, "wechat-account-fixture", "account-a")
+	saveCollectionArticleFixture(t, store, "book-a", "article-a", "Fixture account")
+	article, err := store.LoadPackage("book-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	article.Chunks[0].Text = strings.Repeat("证", knowledgeAssemblyMaxStatementRunes*2+17)
+	article.Book.ContentHash = ""
+	if err := store.SavePackage(*article); err != nil {
+		t.Fatal(err)
+	}
+	recordCollectionArticleFixture(t, store, "account-a", "Fixture account", "book-a", "article-a")
+	if _, err := store.BuildKnowledgeCollectionCandidate("wechat-account-fixture"); err != nil {
+		t.Fatal(err)
+	}
+	collection, err := store.PublishKnowledgeCollection("wechat-account-fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialized, _, err := store.MaterializeKnowledgeCollectionRelease(collection.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if materialized.Release.Analysis == nil || len(materialized.Release.Analysis.Claims) != 3 {
+		t.Fatalf("long chunk claims=%#v", materialized.Release.Analysis)
+	}
+	for _, claim := range materialized.Release.Analysis.Claims {
+		if utf8.RuneCountInString(claim.Statement) > knowledgeAssemblyMaxStatementRunes {
+			t.Fatalf("oversized materialized claim=%#v", claim)
+		}
+	}
+	result, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion, Mode: AgentCompilationModeStudy,
+		PrimaryReleaseID: materialized.Release.ReleaseID, Version: "1.0.0", ResearchEnabled: true,
+	})
+	if err != nil || result.Status != AgentCompilationStatusReady {
+		t.Fatalf("long chunk compilation=%#v err=%v", result, err)
 	}
 }
 

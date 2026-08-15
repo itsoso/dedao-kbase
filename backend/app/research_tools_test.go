@@ -77,6 +77,88 @@ func TestResearchKnowledgeToolPinsPackageReleaseCitationsAndAudits(t *testing.T)
 	}
 }
 
+func TestResearchToolsFetchMaterializedCollectionEvidence(t *testing.T) {
+	knowledge, pkg, collection, materialized := materializedCollectionResearchRuntimeFixture(t)
+	research, err := OpenResearchStore(knowledge.Root(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = research.Close() })
+	run := createResearchToolRun(t, research, pkg, "materialized-collection")
+	registry, err := NewResearchToolRegistry(knowledge, research)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	searched, err := registry.Execute(context.Background(), ResearchToolSearchKnowledge, ResearchToolRequest{
+		RunID: run.RunID, PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Arguments: map[string]any{"query": "Evidence for article-a", "limit": 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(searched.Knowledge) != 1 || searched.Knowledge[0].ReleaseID != materialized.Release.ReleaseID ||
+		len(searched.Knowledge[0].CitationIDs) != 1 {
+		t.Fatalf("materialized search=%#v", searched)
+	}
+	item := searched.Knowledge[0]
+	fetched, err := registry.Execute(context.Background(), ResearchToolFetchKnowledgeEvidence, ResearchToolRequest{
+		RunID: run.RunID, PackageID: pkg.PackageID, PackageVersion: pkg.Version,
+		Arguments: map[string]any{
+			"release_id": item.ReleaseID, "claim_id": item.ClaimID, "citation_id": item.CitationIDs[0],
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fetched.Citations) != 1 || len(fetched.PromotedEvidence) != 1 ||
+		fetched.Citations[0].SourceType != collection.Definition.SourceType ||
+		fetched.PromotedEvidence[0].Locator.ReleaseID != materialized.Release.ReleaseID ||
+		fetched.PromotedEvidence[0].Locator.MessageRef != item.ClaimID {
+		t.Fatalf("materialized fetch=%#v", fetched)
+	}
+	loaded, err := knowledge.LoadKnowledgeRelease(materialized.Release.ReleaseID)
+	if err != nil || len(loaded.Citations) != 1 || loaded.Citations[0].SourceItemKey != collection.Members[0].SourceItemKey {
+		t.Fatalf("materialized citation provenance=%#v err=%v", loaded, err)
+	}
+}
+
+func materializedCollectionResearchRuntimeFixture(
+	t *testing.T,
+) (*BookKnowledgeStore, AgentPackage, *KnowledgeCollectionRelease, *KnowledgeCollectionMaterializationResult) {
+	t.Helper()
+	store, collection := collectionMaterializationFixture(t)
+	materialized, _, err := store.MaterializeKnowledgeCollectionRelease(collection.ReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilation, err := CompileAgentPackages(store, AgentCompilationRequest{
+		SchemaVersion: AgentCompilationRequestSchemaVersion, Mode: AgentCompilationModeStudy,
+		PrimaryReleaseID: materialized.Release.ReleaseID, Version: "1.0.0", ResearchEnabled: true,
+	})
+	if err != nil || len(compilation.Candidates) != 1 || compilation.Candidates[0].Package == nil {
+		t.Fatalf("compilation=%#v err=%v", compilation, err)
+	}
+	pkg := *compilation.Candidates[0].Package
+	submitted := loadResearchEvaluationFixture(t)
+	trusted := trustedResearchEvaluationFixture(submitted)
+	if err := store.SaveTrustedAgentEvaluationSuite(pkg, trusted); err != nil {
+		t.Fatal(err)
+	}
+	resolved, report, err := EvaluateAgentPackageAgainstTrustedSuite(store, pkg, submitted, testAgentPackageTime())
+	if err != nil || !report.Passed {
+		t.Fatalf("research evaluation=%#v err=%v", report, err)
+	}
+	if err := store.SaveAgentPackageEvaluation(pkg, resolved, report); err != nil {
+		t.Fatal(err)
+	}
+	published, _, err := PublishAgentPackage(store, pkg, "materialized-collection-v4", AgentPackageKnownToolIDs(), testAgentPackageTime())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, *published, collection, materialized
+}
+
 func TestResearchKnowledgeFetchResolvesLegacyClaimChunkReferences(t *testing.T) {
 	knowledge, pkg := researchAgentRuntimeTestStore(t)
 	release, err := knowledge.LoadKnowledgeRelease(pkg.Releases[0].ReleaseID)

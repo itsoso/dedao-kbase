@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -208,18 +209,28 @@ func (s *BookKnowledgeStore) projectKnowledgeCollectionReleaseUnlocked(collectio
 			chapterID := namespace + "-chapter-" + opaqueKnowledgeCollectionMaterializationID(citation.ChapterID)
 			chunkID := namespace + "-chunk-" + opaqueKnowledgeCollectionMaterializationID(citation.ChunkID)
 			citationID := namespace + "-citation-" + opaqueKnowledgeCollectionMaterializationID(citation.CitationID)
-			claimID := namespace + "-claim-" + opaqueKnowledgeCollectionMaterializationID(citation.CitationID+"\x00"+citation.ChunkID)
 			statement := strings.TrimSpace(chunk.Text)
-			claims = append(claims, BookAnalysisClaim{
-				ID: claimID, Statement: statement, CitationIDs: []string{citationID},
-				Confidence: 1, Scope: []string{collection.Definition.SourceType, member.SourceItemKey}, RiskLevel: "low",
-			})
 			citations = append(citations, BookKnowledgeCitation{
 				CitationID: citationID, BookID: bookID, ChapterID: chapterID, ChunkID: chunkID,
 				SourceHTML: citation.SourceHTML, Anchor: citation.Anchor, Note: citation.Note,
 				SourceType: collection.Definition.SourceType, SourceAccount: collection.Definition.SourceAccount,
 				SourceItemKey: member.SourceItemKey, PublishedAt: firstNonEmpty(member.PublishedAt, article.Book.PublishedAt),
 			})
+			statementRunes := []rune(statement)
+			for offset, part := 0, 0; offset < len(statementRunes); part++ {
+				end := offset + knowledgeAssemblyMaxStatementRunes
+				if end > len(statementRunes) {
+					end = len(statementRunes)
+				}
+				claimID := namespace + "-claim-" + opaqueKnowledgeCollectionMaterializationID(
+					citation.CitationID+"\x00"+citation.ChunkID+"\x00"+strconv.Itoa(part),
+				)
+				claims = append(claims, BookAnalysisClaim{
+					ID: claimID, Statement: string(statementRunes[offset:end]), CitationIDs: []string{citationID},
+					Confidence: 1, Scope: []string{collection.Definition.SourceType, member.SourceItemKey}, RiskLevel: "low",
+				})
+				offset = end
+			}
 			quotedRunes += utf8.RuneCountInString(statement)
 			if err := validateKnowledgeCollectionMaterializationLimits(len(claims), len(citations), quotedRunes); err != nil {
 				return nil, err
