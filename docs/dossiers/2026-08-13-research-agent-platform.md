@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-13
 
-**Status:** Layer E implementation complete; G1–G5 passed; G6 remediation in progress
+**Status:** Layer E complete; G1–G6 passed
 
 **Approved design:**
 [Research Agent Platform Design](../plans/2026-08-13-research-agent-platform-design.md)
@@ -40,8 +40,8 @@ editing, message deletion, bulk private-data export, or automatic publication.
 | G2 Feasibility and risk | PASS | The macOS Chatlog Worker, shared-token control plane, bounded evidence promotion, typed outcomes, resumable orchestration, and private-data persistence boundaries have focused tests. A content-free loopback probe on 2026-08-14 returned HTTP 200 with a valid aggregate response. |
 | G3 Tests | PASS | On 2026-08-14 the complete Task 14 suite passed without output truncation: module verification, vet, all Go tests, frontend build, every Web smoke, Research process smoke, Chatlog packaging smoke, direct-deployment smokes, system-map drift, privacy, and diff checks. The first attempt exposed a brittle mobile CSS smoke selector; its root cause was fixed and the complete suite was rerun from the beginning. |
 | G4 Review | PASS | The seventh independent review of the exact staged integration candidate reported Critical 0, Important 0, Ready to merge Yes. It verified public v3/v4 schemas, HTTP/create-and-resume v4 enforcement, direct/Worker/derived tool authorization, policy-denied terminal behavior, and isolated process smoke. |
-| G5 Deployment health | PASS | Reviewed revision `23375066acd429ae164e8f4bf2496503db9efc93` was deployed on 2026-08-15. Public and loopback health reported that exact revision; KBase, book-job Worker, three evolution Workers, and the macOS Chatlog Worker were active with zero failed start status. Installed binary hashes matched the staged candidates and the post-cutover warning window was empty. Recoverable server and evolution backups were retained under the revision-scoped deployment batch. |
-| G6 Online verification | IN PROGRESS | Real production compile, publication, and knowledge search/fetch now pass on exact deployed revision `597c8af1243b8b58c7da8c0d2b22ca5f9eead5e4`. The first aligned quick Run promoted eight evidence items but exposed a contradictory generic model prompt that requested only `decision_summary`, preventing the required synthesizer `conclusions`. A role-specific structured-output remediation is under test; quick completion, deep Chatlog search/fetch/expand, citation re-fetch, and restart recovery remain required. |
+| G5 Deployment health | PASS | Exact revision `04333b4bfb3c32cd3fe0a2f0a4b8a2653f60b5e4` was deployed on 2026-08-15. Public and loopback health reported that revision; KBase, book-job Worker, three evolution Workers, and the macOS Chatlog Worker were active and enabled with exit status 0, restart count 0, and no warning-level entries after cutover. Installed identities matched the staged candidates, Chatlog doctor passed local-read and remote-auth checks, and revision-scoped rollback backups were retained. |
+| G6 Online verification | PASS | The materialized 219-member account collection produced a published v4 Research package. A real quick Run completed with three knowledge evidence records, two verified conclusions, available citations, and successful citation re-fetch. On exact deployed revision `04333b4bfb3c32cd3fe0a2f0a4b8a2653f60b5e4`, deep Run `research-run-a9ff6538fba89cdbb919c98044938a1a` completed with four immutable knowledge records and six bounded Chatlog records, three verified conclusions, five available citations, completed search/fetch/expand jobs, successful citation detail re-fetch, and one successful invocation for each of planner, extractor, synthesizer, and verifier. Restart/resume remains covered by the isolated process smoke. No private body was printed or committed. |
 
 ## Current checkpoint
 
@@ -79,17 +79,15 @@ is checked for private sentinel leakage.
 
 ## Real-data acceptance checkpoint
 
-An authorized, content-free probe confirmed that the real Chatlog service is
-reachable on exact loopback and returns a valid aggregate response. No message,
-identity, locator, or source content was printed or committed.
-
-The complete real-data acceptance remains **PENDING** because this worktree has
-no running Research-enabled KBase instance, no locally discoverable published
-collection package, and no configured TokenPlan credential. Consequently no
-real run ID or content hash is recorded, and G5/G6 remain pending. This is not
-treated as a passing production proof; Task 14 must supply the reviewed clean
-revision, selected immutable package, runtime credential, deployment, and
-online verification.
+Authorized real-data acceptance is complete. The immutable account collection
+was materialized into a standard evidence-only Release and compiled, evaluated,
+and published as a v4 Research package. Quick knowledge-only and bounded deep
+knowledge-plus-Chatlog Runs both completed with verified citations. The deep
+Run exercised `search_chatlog`, two exact fetches, and two bounded context
+expansions, then completed all four structured model roles and re-fetched an
+immutable citation detail. Only aggregate counts, opaque IDs, model usage, and
+health outcomes are recorded; no message, identity, locator, article body, or
+source content was printed or committed.
 
 No later gate may be marked PASS before its stated evidence exists, and a
 failed gate returns to the responsible upstream task.
@@ -846,3 +844,32 @@ environment override. This is a model-selection change, not a relaxation of
 the extractor schema, evidence references, citation checks, or fail-closed
 behavior. Configuration regression, full gates, exact deployment, and another
 bounded production deep Run remain required.
+
+### Final extractor-contract remediation and production proof
+
+The exact `4d442f5e8d585fe4319bb7ed5daaef200537e799` deployment proved that the
+stronger extractor returned a complete strict JSON object, but the Run still
+terminated as `invalid_model_output`. A privacy-safe diagnostic inspected only
+the response shape and validation categories: decoding completed normally,
+all four extractor arrays were present, references were in scope, and the only
+violations were the fact and claim `review_state` values. The schema prompt had
+named that field without declaring its allowed values.
+
+Revision `04333b4bfb3c32cd3fe0a2f0a4b8a2653f60b5e4` explicitly declares
+`pending|verified|rejected` and directs newly extracted records to `pending`,
+while preserving strict decoding and all reference, timestamp, confidence, and
+persistence checks. The same real input passed a bounded model probe with no
+validation categories before deployment. Full Go tests, vet, Research process
+smoke, focused race, system-map drift, privacy, and diff checks then passed.
+
+After exact-revision cutover, deep Run
+`research-run-a9ff6538fba89cdbb919c98044938a1a` completed. It promoted four
+immutable knowledge records and six Chatlog records; all five Worker jobs
+(one search, two exact fetches, and two context expansions) completed. Planner,
+extractor, synthesizer, and verifier each completed on the first attempt using
+`qwen3.8-max-preview`. The Run published three verified conclusions backed by
+two evidence records each and five available citations across both requested
+sources. Citation detail re-fetch returned the expected citation, chunk, and
+claim identities. Public and loopback health, all five server services, and the
+macOS Chatlog Worker remained healthy with zero post-cutover warnings or
+restarts. G5 and G6 are PASS.
