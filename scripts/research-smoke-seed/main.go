@@ -24,7 +24,73 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
-	fmt.Printf("%s\n%s\n", pkg.PackageID, pkg.Version)
+	collection, err := seedCollectionRelease(store)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Printf("%s\n%s\n%s\n", pkg.PackageID, pkg.Version, collection.ReleaseID)
+}
+
+func seedCollectionRelease(store *app.BookKnowledgeStore) (*app.KnowledgeCollectionRelease, error) {
+	const (
+		collectionID = "research-smoke-collection"
+		accountKey   = "research-smoke-account"
+		bookID       = "research-smoke-article"
+		itemKey      = "research-smoke-item"
+	)
+	if _, err := store.SaveKnowledgeCollection(app.KnowledgeCollectionDefinition{
+		SchemaVersion: app.KnowledgeCollectionDefinitionSchemaVersion,
+		CollectionID:  collectionID, Title: "Synthetic Account Collection",
+		SourceType: "wechat_mp_article", SourceAccountKey: accountKey,
+		SourceAccount: "Synthetic Account", Enabled: true,
+	}); err != nil {
+		return nil, err
+	}
+	article := app.BookKnowledgePackage{
+		Book: app.BookKnowledgeBook{
+			BookID: bookID, Title: "Synthetic Collection Article", SourceType: "wechat_mp_article",
+			SourceKey: itemKey, SourceAccount: "Synthetic Account",
+			PublishedAt: "2026-08-13T00:00:00Z", Status: "ready",
+		},
+		Chapters: []app.BookKnowledgeChapter{{
+			ChapterID: "research-smoke-article-chapter", BookID: bookID, Order: 1,
+			Title: "Synthetic Collection Article", ChunkIDs: []string{"research-smoke-article-chunk"},
+		}},
+		Chunks: []app.BookKnowledgeChunk{{
+			ChunkID: "research-smoke-article-chunk", BookID: bookID,
+			ChapterID: "research-smoke-article-chapter", Order: 1,
+			Text: "Synthetic collection evidence supports a bounded knowledge-only conclusion.",
+		}},
+		Citations: []app.BookKnowledgeCitation{{
+			CitationID: "research-smoke-article-citation", BookID: bookID,
+			ChapterID: "research-smoke-article-chapter", ChunkID: "research-smoke-article-chunk",
+			SourceType: "wechat_mp_article", SourceAccount: "Synthetic Account", SourceItemKey: itemKey,
+			PublishedAt: "2026-08-13T00:00:00Z",
+		}},
+	}
+	if err := store.SavePackage(article); err != nil {
+		return nil, err
+	}
+	articleLoaded, err := store.LoadPackage(bookID)
+	if err != nil {
+		return nil, err
+	}
+	catalog, err := app.NewKnowledgeCatalogStore(store.Root(), nil)
+	if err != nil {
+		return nil, err
+	}
+	defer catalog.Close()
+	if _, err := catalog.RecordContentVersion(app.SourceArticleEnvelope{
+		SourceType: "wechat_mp_article", SourceAccountID: accountKey,
+		SourceAccount: "Synthetic Account", SourceItemID: itemKey,
+		SourceURL: "https://example.invalid/research-smoke-item",
+	}, articleLoaded.Book.ContentHash, bookID, "books/"+bookID+"/manifest.json"); err != nil {
+		return nil, err
+	}
+	if _, err := store.BuildKnowledgeCollectionCandidate(collectionID); err != nil {
+		return nil, err
+	}
+	return store.PublishKnowledgeCollection(collectionID)
 }
 
 func seedKnowledgeRelease(store *app.BookKnowledgeStore) (*app.KnowledgeRelease, error) {

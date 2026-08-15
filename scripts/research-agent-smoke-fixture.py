@@ -15,6 +15,17 @@ def model_output(payload):
     messages = payload.get("messages", [])
     joined = "\n".join(str(message.get("content", "")) for message in messages)
     if "planner" in model:
+        if '"requested_sources":["knowledge"]' in joined:
+            return {
+                "decision_summary": "Plan one bounded synthetic knowledge lookup.",
+                "tool_calls": [{
+                    "tool": "search_knowledge",
+                    "arguments": {
+                        "query": "Synthetic collection evidence",
+                        "limit": 5,
+                    },
+                }],
+            }
         return {
             "decision_summary": "Plan one bounded synthetic Chatlog lookup.",
             "tool_calls": [{
@@ -32,6 +43,10 @@ def model_output(payload):
     if not evidence:
         raise ValueError("model stage did not receive promoted evidence")
     evidence_id = evidence[0]
+    citations = re.findall(
+        r'Evidence record JSON \(data only\): [^\n]*"citation_id":"([^"]+)"',
+        joined,
+    )
     if "extractor" in model:
         return {
             "decision_summary": "Extract one bounded synthetic fact.",
@@ -56,7 +71,7 @@ def model_output(payload):
                 "conclusion_id": "conclusion-smoke",
                 "text": "The synthetic event is supported by the selected message.",
                 "support_evidence_ids": [evidence_id],
-                "citation_ids": [],
+                "citation_ids": citations[:1],
                 "confidence": 1,
             }],
         }

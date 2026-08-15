@@ -675,3 +675,54 @@ terminal `invalid_model_output` outcome, is not invoked again, and cannot be
 claimed by another coordinator. The Chinese workspace presents this outcome
 explicitly. Focused, full, race, process, drift, privacy, and independent
 review gates must be rerun on the combined candidate before deployment.
+
+### Collection-to-Research materialization bridge
+
+The first real cross-source acceptance after the requested-source coverage fix
+proved that knowledge and Chatlog are both searched, but the selected standard
+Release belonged to an unrelated book. Production already contained the
+intended immutable public-account collection as an `agent-package.v3` package.
+That package is intentionally ineligible for Research, and v4 intentionally
+rejects `collection_releases`; weakening either boundary would reopen the
+cross-version tool-authorization defect closed during G4.
+
+The approved bridge instead materializes one immutable collection Release into
+one canonical evidence-only `knowledge_release.v1`. It verifies the source
+Release identity, every pinned member content hash and source identity, and the
+member citation allowlist before writing anything. Local article identifiers
+are namespaced, long cited chunks are split deterministically at the Assembly
+statement bound without truncation, and the source collection/target Release
+hashes plus evidence counts are stored as replayable provenance. Aggregate
+member, claim, citation, and quoted-character bounds fail closed. No request
+signing was added.
+
+The authenticated action is:
+
+```text
+POST /api/knowledge/collection-releases/{release_id}/materialize
+```
+
+It accepts exactly one empty JSON object, returns 201 on creation and 200 on
+replay, and exposes only IDs, hashes, counts, usage policy, and timestamps. The
+existing compiler then produces an unchanged v4 Research package that pins the
+materialized standard Release; an evaluated and published v3 collection package
+continues to be policy-denied at the Research runtime boundary.
+
+The isolated process smoke now seeds a synthetic account collection and uses
+the real HTTP surface to materialize, compile, trust, evaluate, and publish its
+v4 package. A real quick Research Run executes both `search_knowledge` and
+`fetch_knowledge_evidence`, completes with knowledge in searched and cited
+scope, and re-fetches the verified citation. This smoke exposed and closed a
+separate citation-detail gap: a standard Release without a mutable Book package
+was marked available in the Research detail projection but returned 404. The
+citation endpoint now falls back to the latest immutable standard Release for
+the exact book/citation pair and returns the same metadata-only projection; it
+does not return source text, account identity, anchors, notes, or local paths.
+
+G3 is PASS on the combined candidate: module verification, `go vet ./...`,
+`go test ./...`, the frontend production build, all desktop and web smoke
+suites, deployment and packaging smokes, the focused Research race suite,
+system-map drift, privacy, and diff checks all completed with exit code zero.
+A fresh G4 review, exact-revision deployment health, and authorized real
+collection materialization plus cross-source citation re-fetch remain required
+before this checkpoint changes G6 to PASS.

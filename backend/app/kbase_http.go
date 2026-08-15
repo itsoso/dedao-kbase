@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -3931,37 +3932,82 @@ func (h *kbaseHTTPHandler) handleGetCitation(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	pkg, err := h.loadHTTPBookPackage(bookID)
-	if err != nil {
-		writeHTTPError(w, http.StatusNotFound, "book not found")
-		return
-	}
-	for _, citation := range pkg.Citations {
-		if citation.CitationID != citationID {
-			continue
-		}
-		claimIDs := make([]string, 0, 2)
-		for _, claim := range pkg.Claims {
-			for _, candidate := range claim.Citations {
-				if candidate == citationID {
-					claimIDs = append(claimIDs, claim.ClaimID)
-					break
+	if err == nil {
+		for _, citation := range pkg.Citations {
+			if citation.CitationID != citationID {
+				continue
+			}
+			claimIDs := make([]string, 0, 2)
+			for _, claim := range pkg.Claims {
+				for _, candidate := range claim.Citations {
+					if candidate == citationID {
+						claimIDs = append(claimIDs, claim.ClaimID)
+						break
+					}
 				}
 			}
+			writeHTTPCitationIdentity(w, citation, claimIDs)
+			return
 		}
-		writeHTTPJSON(w, http.StatusOK, map[string]any{
-			"citation": map[string]string{
-				"citation_id":  citation.CitationID,
-				"book_id":      citation.BookID,
-				"chapter_id":   citation.ChapterID,
-				"chunk_id":     citation.ChunkID,
-				"source_type":  citation.SourceType,
-				"published_at": citation.PublishedAt,
-			},
-			"claim_ids": claimIDs,
-		})
+		writeHTTPError(w, http.StatusNotFound, "citation not found")
+		return
+	}
+	citation, claimIDs, found, err := h.resolvePublishedKnowledgeReleaseCitation(bookID, citationID)
+	if err != nil {
+		writeHTTPError(w, http.StatusInternalServerError, "citation unavailable")
+		return
+	}
+	if found {
+		writeHTTPCitationIdentity(w, citation, claimIDs)
 		return
 	}
 	writeHTTPError(w, http.StatusNotFound, "citation not found")
+}
+
+func (h *kbaseHTTPHandler) resolvePublishedKnowledgeReleaseCitation(bookID, citationID string) (BookKnowledgeCitation, []string, bool, error) {
+	records, err := h.store.ListLatestKnowledgeReleasesForBook("", 2, bookID)
+	if err != nil {
+		return BookKnowledgeCitation{}, nil, false, err
+	}
+	for _, record := range records {
+		release, err := h.store.LoadKnowledgeRelease(record.ReleaseID)
+		if err != nil {
+			return BookKnowledgeCitation{}, nil, false, err
+		}
+		if release.BookID != bookID {
+			continue
+		}
+		for _, citation := range release.Citations {
+			if citation.CitationID != citationID || citation.BookID != bookID {
+				continue
+			}
+			claimIDs := make([]string, 0, 2)
+			if release.Analysis != nil {
+				for _, claim := range release.Analysis.Claims {
+					if stringBoolSet(resolveAgentClaimCitationIDs(release.Citations, claim.CitationIDs)...)[citationID] {
+						claimIDs = append(claimIDs, claim.ID)
+					}
+				}
+			}
+			sort.Strings(claimIDs)
+			return citation, claimIDs, true, nil
+		}
+	}
+	return BookKnowledgeCitation{}, nil, false, nil
+}
+
+func writeHTTPCitationIdentity(w http.ResponseWriter, citation BookKnowledgeCitation, claimIDs []string) {
+	writeHTTPJSON(w, http.StatusOK, map[string]any{
+		"citation": map[string]string{
+			"citation_id":  citation.CitationID,
+			"book_id":      citation.BookID,
+			"chapter_id":   citation.ChapterID,
+			"chunk_id":     citation.ChunkID,
+			"source_type":  citation.SourceType,
+			"published_at": citation.PublishedAt,
+		},
+		"claim_ids": claimIDs,
+	})
 }
 
 func (h *kbaseHTTPHandler) handleGetBook(w http.ResponseWriter, r *http.Request) {

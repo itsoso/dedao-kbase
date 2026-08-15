@@ -187,6 +187,19 @@ func TestKBaseHTTPKnowledgeCollectionMaterialization(t *testing.T) {
 			t.Fatalf("materialization response exposed %q: %s", private, created.Body.String())
 		}
 	}
+	materializedRelease, err := store.LoadKnowledgeRelease(payload.Release.ReleaseID)
+	if err != nil || len(materializedRelease.Citations) != 1 {
+		t.Fatalf("materialized release=%#v err=%v", materializedRelease, err)
+	}
+	citationDetail := requestKBase(handler, http.MethodGet,
+		"/api/citations/"+url.PathEscape(materializedRelease.Citations[0].CitationID)+"?book_id="+url.QueryEscape(materializedRelease.BookID),
+		"secret-token")
+	if citationDetail.Code != http.StatusOK ||
+		!strings.Contains(citationDetail.Body.String(), `"citation_id":"`+materializedRelease.Citations[0].CitationID+`"`) ||
+		strings.Contains(citationDetail.Body.String(), "Evidence for article-a") ||
+		strings.Contains(citationDetail.Body.String(), "Fixture account") {
+		t.Fatalf("materialized citation status=%d body=%s", citationDetail.Code, citationDetail.Body.String())
+	}
 
 	replayed := requestJSONKBase(handler, http.MethodPost, path, "secret-token", `{}`)
 	if replayed.Code != http.StatusOK || !strings.Contains(replayed.Body.String(), `"created":false`) ||
