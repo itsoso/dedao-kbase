@@ -463,7 +463,7 @@ func applyStructuredQwenThinkingPolicy(cfg *BookTokenPlanConfig) {
 
 func isQwenHybridThinkingModel(model string) bool {
 	compact := strings.ToLower(strings.NewReplacer("-", "", "_", "", " ", "", ".", "").Replace(strings.TrimSpace(model)))
-	return strings.HasPrefix(compact, "qwen37")
+	return strings.HasPrefix(compact, "qwen37") || strings.HasPrefix(compact, "qwen38")
 }
 
 func buildBookChatContext(

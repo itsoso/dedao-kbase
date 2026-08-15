@@ -95,6 +95,28 @@ func TestResearchModelRunsRoleSpecificStrictOutputs(t *testing.T) {
 	}
 }
 
+func TestResearchModelDisablesThinkingForQwen38StructuredOutput(t *testing.T) {
+	client := &fakeResearchResultClient{result: BookKnowledgeLLMResult{
+		Content: `{"decision_summary":"No tools required","tool_calls":[]}`,
+	}}
+	model := NewResearchStageModel(client)
+	var output ResearchPlannerOutput
+	_, err := model.Run(
+		context.Background(),
+		ResearchRolePlanner,
+		BookTokenPlanConfig{APIKey: "synthetic", Model: "Qwen-3.8-Max-Preview"},
+		[]BookKnowledgeMessage{{Role: "user", Content: "Return bounded structured JSON."}},
+		ResearchModelReferences{},
+		&output,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.config.Model != "qwen3.8-max-preview" || client.config.EnableThinking == nil || *client.config.EnableThinking {
+		t.Fatalf("structured Qwen 3.8 config = %#v, want canonical model with thinking disabled", client.config)
+	}
+}
+
 func TestResearchModelRejectsNonStrictOrUnsupportedOutput(t *testing.T) {
 	overLimitFacts := make([]string, researchModelArrayMax+1)
 	for index := range overLimitFacts {
