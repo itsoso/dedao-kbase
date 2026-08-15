@@ -1235,7 +1235,7 @@ func researchRoleSystemPrompt(role ResearchModelRole) (string, error) {
 	var schema string
 	switch role {
 	case ResearchRolePlanner:
-		schema = `Schema: {"decision_summary":"string","tool_calls":[{"tool":"allowed_tools name","arguments":{}}]}. Follow the planner contract; use [] when no retrieval is needed.`
+		schema = `Schema: {"decision_summary":"string","tool_calls":[{"tool":"allowed_tools name","arguments":{}}]}. Follow the planner contract; use [] when no retrieval is needed. Resolve every relative date from the authoritative current_time_utc field.`
 	case ResearchRoleExtractor:
 		schema = `Schema: {"decision_summary":"string","facts":[Fact],"claims":[Claim],"measurements":[Measurement],"cases":[Case]}. Fact keys: "fact_id","kind","summary","status","occurred_at"(RFC3339),"evidence_ids","confidence","review_state". Claim keys: "claim_id","kind","topic","value","timing","amount","applies_to","evidence_ids","confidence","review_state". Measurement keys: "measurement_id","name","value","occurred_at"(RFC3339),"evidence_ids","confidence","review_state". Case keys: "case_id","role"(historical/current),"age","stage_day","symptoms","measurements","recovery_status","evidence_ids". Use [] for categories with no grounded items; confidence is (0,1].`
 	case ResearchRoleSynthesizer:
@@ -1301,7 +1301,10 @@ func (o *ResearchOrchestrator) stageMessages(ctx context.Context, run ResearchRu
 	if err != nil {
 		return nil, err
 	}
-	task, err := json.Marshal(map[string]string{"instruction": instruction, "question": run.Question})
+	task, err := json.Marshal(map[string]string{
+		"instruction": instruction, "question": run.Question,
+		"current_time_utc": o.config.ResearchStore.now().UTC().Format(time.RFC3339),
+	})
 	if err != nil {
 		return nil, err
 	}

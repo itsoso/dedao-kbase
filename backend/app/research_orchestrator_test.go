@@ -386,6 +386,7 @@ func TestResearchOrchestratorDeepPathWaitsResumesAndSurvivesRestart(t *testing.T
 	run := createResearchOrchestratorRun(t, research, pkg, "deep-path", ResearchModeDeep,
 		[]string{ResearchSourceKnowledge, ResearchSourceChatlog}, "cross source history")
 	run.Budget.MaxEvidenceItems = 5
+	run.Budget.MaxCostUSD = 1
 	encodedBudget, err := json.Marshal(run.Budget)
 	if err != nil {
 		t.Fatal(err)
@@ -849,6 +850,11 @@ func TestResearchPlannerPromptListsOnlyRunAuthorizedEntryTools(t *testing.T) {
 			if !strings.Contains(joined, `"requested_sources":["`+testCase.source+`"]`) ||
 				!strings.Contains(joined, `"name":"`+testCase.tool+`"`) {
 				t.Fatalf("planner prompt omitted run-scoped tool contract: %s", joined)
+			}
+			currentTime := research.now().UTC().Format(time.RFC3339)
+			if !strings.Contains(joined, `"current_time_utc":"`+currentTime+`"`) ||
+				!strings.Contains(joined, "Resolve every relative date") {
+				t.Fatalf("planner prompt omitted the authoritative relative-date anchor: %s", joined)
 			}
 			for _, field := range testCase.fields {
 				if !strings.Contains(joined, field) {
