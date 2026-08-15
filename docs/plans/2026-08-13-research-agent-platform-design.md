@@ -434,6 +434,7 @@ The platform exposes typed failure and incomplete states:
 - `citation_mismatch`;
 - `source_changed`;
 - `model_timeout`;
+- `invalid_model_output`;
 - `insufficient`;
 - `failed`; and
 - `canceled`.

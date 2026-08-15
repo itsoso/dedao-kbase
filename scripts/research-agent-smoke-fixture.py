@@ -28,7 +28,7 @@ def model_output(payload):
                 },
             }],
         }
-    evidence = re.findall(r"\[evidence:([^\]]+)\]", joined)
+    evidence = re.findall(r'"evidence_id"\s*:\s*"([^"]+)"', joined)
     if not evidence:
         raise ValueError("model stage did not receive promoted evidence")
     evidence_id = evidence[0]
@@ -46,6 +46,8 @@ def model_output(payload):
                 "review_state": "verified",
             }],
             "claims": [],
+            "measurements": [],
+            "cases": [],
         }
     if "synthesizer" in model:
         return {

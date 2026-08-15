@@ -33,6 +33,7 @@ for (const marker of [
   "冲突",
   "研究报告",
   "确认身份",
+  "模型输出格式无效",
 ]) {
   assert.ok(js.includes(marker), `Research workspace should include ${marker}`);
 }
@@ -78,5 +79,6 @@ assert.ok(mobile.includes(".research-dossier"), "mobile workspace should collaps
 assert.ok(mobile.includes("grid-template-columns: minmax(0, 1fr)"), "mobile research layout should use one bounded column");
 assert.ok(css.includes("prefers-reduced-motion: reduce"), "research motion should respect reduced motion");
 assert.ok(html.includes("20260814-research-workspace"), "Research workspace should publish fresh assets");
+assert.ok(html.includes("20260815-research-model-output"), "Research failure guidance should publish with a fresh app asset");
 
 console.log("Research workspace smoke passed");

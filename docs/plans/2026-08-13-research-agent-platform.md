@@ -782,7 +782,7 @@ Cover:
 - verifier gaps return to planning with a bounded iteration count;
 - `worker_offline`, `identity_ambiguous`, `zero_hit`, `partial_evidence`,
   `budget_exhausted`, `citation_mismatch`, `source_changed`, and
-  `model_timeout` become typed outcomes;
+  `model_timeout` and `invalid_model_output` become typed outcomes;
 - cancellation and restart recovery; and
 - duplicate enqueue/model responses remain idempotent.
 

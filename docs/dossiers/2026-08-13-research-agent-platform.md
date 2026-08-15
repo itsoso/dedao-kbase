@@ -41,7 +41,7 @@ editing, message deletion, bulk private-data export, or automatic publication.
 | G3 Tests | PASS | On 2026-08-14 the complete Task 14 suite passed without output truncation: module verification, vet, all Go tests, frontend build, every Web smoke, Research process smoke, Chatlog packaging smoke, direct-deployment smokes, system-map drift, privacy, and diff checks. The first attempt exposed a brittle mobile CSS smoke selector; its root cause was fixed and the complete suite was rerun from the beginning. |
 | G4 Review | PASS | The seventh independent review of the exact staged integration candidate reported Critical 0, Important 0, Ready to merge Yes. It verified public v3/v4 schemas, HTTP/create-and-resume v4 enforcement, direct/Worker/derived tool authorization, policy-denied terminal behavior, and isolated process smoke. |
 | G5 Deployment health | PASS | Reviewed revision `23375066acd429ae164e8f4bf2496503db9efc93` was deployed on 2026-08-15. Public and loopback health reported that exact revision; KBase, book-job Worker, three evolution Workers, and the macOS Chatlog Worker were active with zero failed start status. Installed binary hashes matched the staged candidates and the post-cutover warning window was empty. Recoverable server and evolution backups were retained under the revision-scoped deployment batch. |
-| G6 Online verification | IN PROGRESS | The first production compile against real immutable Releases exposed two legacy-compatibility blockers before any Research Run was created: an older Dedao Release had an empty persisted source type despite a controlled Dedao identifier, and a real WeChat article Release carried `evidence_only` while study compilation forced `standard`. The narrowly scoped compiler remediation passed production-data read-only diagnostics and independent review; deployment and real quick/deep Runs remain required. |
+| G6 Online verification | IN PROGRESS | Real production compile, publication, and knowledge search/fetch now pass on exact deployed revision `597c8af1243b8b58c7da8c0d2b22ca5f9eead5e4`. The first aligned quick Run promoted eight evidence items but exposed a contradictory generic model prompt that requested only `decision_summary`, preventing the required synthesizer `conclusions`. A role-specific structured-output remediation is under test; quick completion, deep Chatlog search/fetch/expand, citation re-fetch, and restart recovery remain required. |
 
 ## Current checkpoint
 
@@ -617,3 +617,61 @@ terminal state, call Advance again without another model invocation, and prove
 that the coordinator cannot reclaim the Run. The resolver path was also
 narrowed: explicit claim, package allowlist, and Release citation checks are
 typed, while a later resolver I/O error remains retryable.
+
+### Second real Research Run finding
+
+The citation and deterministic-retry remediation was independently reviewed,
+published, and deployed as
+`597c8af1243b8b58c7da8c0d2b22ca5f9eead5e4`. Exact public/loopback health,
+the five server-side services, the macOS Chatlog Worker, installed binary
+hashes, and the post-cutover log window passed again. A deliberately unrelated
+quick question ended honestly as `partial_evidence` after one successful
+knowledge search and fetch. A second question aligned to the immutable article
+then promoted eight evidence items, proving the legacy search-to-fetch path was
+fixed.
+
+The aligned Run still ended as `partial_evidence`. Privacy-safe inspection of
+its persisted model response found a grounded Chinese `decision_summary` but a
+null `conclusions` field. The production system message told every model role
+to return strict role-specific JSON and simultaneously to provide only
+`decision_summary`; the synthesizer followed the latter instruction even
+though its validated contract requires conclusion text, support evidence IDs,
+citation IDs, and confidence. G6 therefore remains open.
+
+The remediation replaces that contradictory generic message with fail-closed,
+role-specific schemas for planner, extractor, synthesizer, and verifier. It
+continues to prohibit Markdown, extra fields, and hidden reasoning; restricts
+all references to IDs actually present in the stage context; and tells the
+synthesizer to return an empty conclusion set only when supplied evidence
+genuinely cannot support an answer. A contract regression covers every role
+and rejects unsupported roles. The exact reviewed remediation must be deployed
+before repeating both quick and deep online acceptance.
+
+The first independent review of that prompt remediation returned NO-GO with
+three Important findings. A deep planner still lacked a Run-specific tool and
+argument catalog; model reference allowlists were reconstructed by scanning
+free text, so marker-shaped strings inside questions or evidence could be
+misclassified; and extractor validation was looser than final analysis-record
+persistence, allowing a deterministic malformed response to fail after it had
+been cached.
+
+The follow-up closes all three boundaries. The planner now receives an
+authoritative JSON contract derived from the published v4 package, requested
+sources, ResearchPolicy, and ToolPolicy. It exposes only authorized entry
+tools with bounded argument schemas; citation fetch and Chatlog fetch/expand
+remain orchestrator-derived and are rejected as planner output. Model
+reference scopes now come directly from selected evidence and persisted draft
+conclusions, are included in request identity, and are revalidated on cache
+hits. Questions, evidence, analysis, and conclusions are serialized as data
+records, marker-shaped strings are neutralized, and the system message forbids
+following embedded instructions.
+
+Four-role output validation now runs before cache persistence and again when a
+cached response is loaded. Facts, claims, measurements, cases, conclusions,
+and verifier arrays are checked against the same required IDs, review states,
+confidence bounds, timestamps, evidence support, and citation scope used by
+later persistence. A deterministic malformed response produces the typed
+terminal `invalid_model_output` outcome, is not invoked again, and cannot be
+claimed by another coordinator. The Chinese workspace presents this outcome
+explicitly. Focused, full, race, process, drift, privacy, and independent
+review gates must be rerun on the combined candidate before deployment.

@@ -34,7 +34,13 @@ type ResearchModelUsage struct {
 }
 
 type ResearchStageModel interface {
-	Run(context.Context, ResearchModelRole, BookTokenPlanConfig, []BookKnowledgeMessage, any) (ResearchModelUsage, error)
+	Run(context.Context, ResearchModelRole, BookTokenPlanConfig, []BookKnowledgeMessage, ResearchModelReferences, any) (ResearchModelUsage, error)
+}
+
+type ResearchModelReferences struct {
+	EvidenceIDs   []string
+	CitationIDs   []string
+	ConclusionIDs []string
 }
 
 type ResearchPlannedToolCall struct {
@@ -92,10 +98,11 @@ func (m *researchStageModel) Run(
 	role ResearchModelRole,
 	config BookTokenPlanConfig,
 	messages []BookKnowledgeMessage,
+	references ResearchModelReferences,
 	output any,
 ) (ResearchModelUsage, error) {
 	if err := validateResearchModelOutputType(role, output); err != nil {
-		return ResearchModelUsage{}, err
+		return ResearchModelUsage{}, fmt.Errorf("%w: %v", ErrResearchInvalidModelOutput, err)
 	}
 	config.Model = normalizeBookTokenPlanModel(config.Model)
 	applyStructuredQwenThinkingPolicy(&config)
@@ -104,13 +111,13 @@ func (m *researchStageModel) Run(
 		return ResearchModelUsage{}, err
 	}
 	if err := decodeStrictBookJSON(result.Content, output, researchModelResponseMax); err != nil {
-		return ResearchModelUsage{}, err
+		return ResearchModelUsage{}, fmt.Errorf("%w: %v", ErrResearchInvalidModelOutput, err)
 	}
-	availableEvidence := researchModelReferences(messages, "evidence")
-	availableCitations := researchModelReferences(messages, "citation")
-	availableConclusions := researchModelReferences(messages, "conclusion")
+	availableEvidence := stringBoolSet(references.EvidenceIDs...)
+	availableCitations := stringBoolSet(references.CitationIDs...)
+	availableConclusions := stringBoolSet(references.ConclusionIDs...)
 	if err := validateResearchModelOutput(role, output, availableEvidence, availableCitations, availableConclusions); err != nil {
-		return ResearchModelUsage{}, err
+		return ResearchModelUsage{}, fmt.Errorf("%w: %v", ErrResearchInvalidModelOutput, err)
 	}
 	usage := ResearchModelUsage{}
 	if result.Usage != nil {
@@ -154,6 +161,9 @@ func validateResearchModelOutput(
 	case ResearchRolePlanner:
 		value := output.(*ResearchPlannerOutput)
 		decisionSummary = value.DecisionSummary
+		if value.ToolCalls == nil {
+			return fmt.Errorf("planner tool_calls array is required")
+		}
 		if len(value.ToolCalls) > researchModelToolCallsMax {
 			return fmt.Errorf("planner tool_calls exceeds %d items", researchModelToolCallsMax)
 		}
@@ -161,6 +171,9 @@ func validateResearchModelOutput(
 		for _, call := range value.ToolCalls {
 			if !allowed[strings.TrimSpace(call.Tool)] {
 				return fmt.Errorf("unsupported research tool %q", call.Tool)
+			}
+			if call.Arguments == nil {
+				return fmt.Errorf("research tool arguments object is required")
 			}
 			encoded, err := json.Marshal(call.Arguments)
 			if err != nil || len(encoded) > researchWorkerArgumentsMaxBytes {
@@ -170,16 +183,43 @@ func validateResearchModelOutput(
 	case ResearchRoleExtractor:
 		value := output.(*ResearchExtractorOutput)
 		decisionSummary = value.DecisionSummary
+		if value.Facts == nil || value.Claims == nil || value.Measurements == nil || value.Cases == nil {
+			return fmt.Errorf("extractor facts, claims, measurements, and cases arrays are required")
+		}
 		if len(value.Facts) > researchModelArrayMax || len(value.Claims) > researchModelArrayMax ||
 			len(value.Measurements) > researchModelArrayMax || len(value.Cases) > researchModelArrayMax {
 			return fmt.Errorf("extractor array exceeds %d items", researchModelArrayMax)
 		}
 		for _, fact := range value.Facts {
+			if strings.TrimSpace(fact.FactID) == "" || strings.TrimSpace(fact.Kind) == "" || strings.TrimSpace(fact.Summary) == "" {
+				return fmt.Errorf("fact id, kind, and summary are required")
+			}
+			if fact.Confidence <= 0 || fact.Confidence > 1 || !validResearchModelReviewState(fact.ReviewState) {
+				return fmt.Errorf("fact confidence and review_state are invalid")
+			}
+			if strings.TrimSpace(fact.OccurredAt) != "" {
+				if _, err := time.Parse(time.RFC3339, fact.OccurredAt); err != nil {
+					return fmt.Errorf("fact occurred_at must be RFC3339")
+				}
+			}
+			if len(uniqueSortedResearchStrings(fact.EvidenceIDs)) == 0 {
+				return fmt.Errorf("fact evidence_ids are required")
+			}
 			if err := requireResearchModelReferences(fact.EvidenceIDs, availableEvidence, "evidence"); err != nil {
 				return err
 			}
 		}
 		for _, claim := range value.Claims {
+			if strings.TrimSpace(claim.ClaimID) == "" || strings.TrimSpace(claim.Kind) == "" ||
+				strings.TrimSpace(claim.Topic) == "" || strings.TrimSpace(claim.Value) == "" {
+				return fmt.Errorf("claim id, kind, topic, and value are required")
+			}
+			if claim.Confidence <= 0 || claim.Confidence > 1 || !validResearchModelReviewState(claim.ReviewState) {
+				return fmt.Errorf("claim confidence and review_state are invalid")
+			}
+			if len(uniqueSortedResearchStrings(claim.EvidenceIDs)) == 0 {
+				return fmt.Errorf("claim evidence_ids are required")
+			}
 			if err := requireResearchModelReferences(claim.EvidenceIDs, availableEvidence, "evidence"); err != nil {
 				return err
 			}
@@ -192,13 +232,17 @@ func validateResearchModelOutput(
 			if _, err := time.Parse(time.RFC3339, measurement.OccurredAt); err != nil {
 				return fmt.Errorf("measurement occurred_at must be RFC3339")
 			}
+			if len(uniqueSortedResearchStrings(measurement.EvidenceIDs)) == 0 {
+				return fmt.Errorf("measurement evidence_ids are required")
+			}
 			if err := requireResearchModelReferences(measurement.EvidenceIDs, availableEvidence, "evidence"); err != nil {
 				return err
 			}
 		}
 		for _, researchCase := range value.Cases {
 			if strings.TrimSpace(researchCase.CaseID) == "" ||
-				(researchCase.Role != "historical" && researchCase.Role != "current") || len(researchCase.EvidenceIDs) == 0 {
+				(researchCase.Role != "historical" && researchCase.Role != "current") ||
+				len(uniqueSortedResearchStrings(researchCase.EvidenceIDs)) == 0 {
 				return fmt.Errorf("case id, historical/current role, and evidence are required")
 			}
 			if err := requireResearchModelReferences(researchCase.EvidenceIDs, availableEvidence, "evidence"); err != nil {
@@ -208,11 +252,15 @@ func validateResearchModelOutput(
 	case ResearchRoleSynthesizer:
 		value := output.(*ResearchSynthesizerOutput)
 		decisionSummary = value.DecisionSummary
+		if value.Conclusions == nil {
+			return fmt.Errorf("synthesizer conclusions array is required")
+		}
 		if len(value.Conclusions) > researchModelArrayMax {
 			return fmt.Errorf("synthesizer conclusions exceeds %d items", researchModelArrayMax)
 		}
 		for _, conclusion := range value.Conclusions {
-			if strings.TrimSpace(conclusion.ConclusionID) == "" || strings.TrimSpace(conclusion.Text) == "" || len(conclusion.SupportEvidenceIDs) == 0 {
+			if strings.TrimSpace(conclusion.ConclusionID) == "" || strings.TrimSpace(conclusion.Text) == "" ||
+				len(uniqueSortedResearchStrings(conclusion.SupportEvidenceIDs)) == 0 || conclusion.CitationIDs == nil {
 				return fmt.Errorf("conclusion id, text, and support evidence are required")
 			}
 			if err := requireResearchModelReferences(conclusion.SupportEvidenceIDs, availableEvidence, "evidence"); err != nil {
@@ -228,6 +276,9 @@ func validateResearchModelOutput(
 	case ResearchRoleVerifier:
 		value := output.(*ResearchVerifierOutput)
 		decisionSummary = value.DecisionSummary
+		if value.VerifiedConclusionIDs == nil || value.Gaps == nil || value.Warnings == nil {
+			return fmt.Errorf("verifier verified_conclusion_ids, gaps, and warnings arrays are required")
+		}
 		if len(value.VerifiedConclusionIDs) > researchModelArrayMax || len(value.Gaps) > researchModelArrayMax || len(value.Warnings) > researchModelArrayMax {
 			return fmt.Errorf("verifier array exceeds %d items", researchModelArrayMax)
 		}
@@ -247,6 +298,10 @@ func validateResearchModelOutput(
 	return nil
 }
 
+func validResearchModelReviewState(value string) bool {
+	return value == ResearchReviewPending || value == ResearchReviewVerified || value == ResearchReviewRejected
+}
+
 func requireResearchModelReferences(values []string, available map[string]bool, kind string) error {
 	for _, value := range uniqueSortedResearchStrings(values) {
 		if !available[value] {
@@ -256,36 +311,10 @@ func requireResearchModelReferences(values []string, available map[string]bool, 
 	return nil
 }
 
-func researchModelReferences(messages []BookKnowledgeMessage, kind string) map[string]bool {
-	prefix := "[" + kind + ":"
-	result := map[string]bool{}
-	for _, message := range messages {
-		remaining := message.Content
-		for {
-			start := strings.Index(remaining, prefix)
-			if start < 0 {
-				break
-			}
-			remaining = remaining[start+len(prefix):]
-			end := strings.Index(remaining, "]")
-			if end < 0 {
-				break
-			}
-			value := strings.TrimSpace(remaining[:end])
-			if value != "" {
-				result[value] = true
-			}
-			remaining = remaining[end+1:]
-		}
-	}
-	return result
-}
-
 func researchModelAllowedTools() map[string]bool {
 	return stringBoolSet(
-		ResearchToolSearchKnowledge, ResearchToolFetchKnowledgeEvidence, ResearchToolSearchPriorRuns,
-		ResearchWorkerToolSearchChatlog, ResearchWorkerToolExpandChatContext,
+		ResearchToolSearchKnowledge, ResearchToolSearchPriorRuns,
+		ResearchWorkerToolSearchChatlog,
 		ResearchWorkerToolResolveChatIdentity, ResearchWorkerToolListIdentityConversations,
-		ResearchWorkerToolFetchChatMessage,
 	)
 }

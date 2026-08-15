@@ -61,7 +61,7 @@ func TestResearchModelRunsRoleSpecificStrictOutputs(t *testing.T) {
 		},
 		{
 			role:    ResearchRoleVerifier,
-			content: `{"decision_summary":"All conclusions are grounded","verdict":"verified","verified_conclusion_ids":["conclusion-a"],"gaps":[]}`,
+			content: `{"decision_summary":"All conclusions are grounded","verdict":"verified","verified_conclusion_ids":["conclusion-a"],"gaps":[],"warnings":[]}`,
 			output:  &ResearchVerifierOutput{},
 			check: func(t *testing.T, output any) {
 				if output.(*ResearchVerifierOutput).Verdict != ResearchVerifierVerified {
@@ -78,7 +78,9 @@ func TestResearchModelRunsRoleSpecificStrictOutputs(t *testing.T) {
 			}}
 			model := NewResearchStageModel(client)
 			usage, err := model.Run(context.Background(), testCase.role, config,
-				[]BookKnowledgeMessage{{Role: "user", Content: "Available [evidence:evidence-a] [citation:citation-a] [conclusion:conclusion-a]"}}, testCase.output)
+				[]BookKnowledgeMessage{{Role: "user", Content: "Available grounded records"}},
+				ResearchModelReferences{EvidenceIDs: []string{"evidence-a"}, CitationIDs: []string{"citation-a"}, ConclusionIDs: []string{"conclusion-a"}},
+				testCase.output)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -108,9 +110,15 @@ func TestResearchModelRejectsNonStrictOrUnsupportedOutput(t *testing.T) {
 		{"markdown wrapped json", ResearchRolePlanner, "```json\n{\"decision_summary\":\"x\",\"tool_calls\":[]}\n```", &ResearchPlannerOutput{}, "strict JSON"},
 		{"unknown field", ResearchRolePlanner, `{"decision_summary":"x","tool_calls":[],"hidden_reasoning":"private"}`, &ResearchPlannerOutput{}, "unknown field"},
 		{"unsupported tool", ResearchRolePlanner, `{"decision_summary":"x","tool_calls":[{"tool":"write_chatlog","arguments":{}}]}`, &ResearchPlannerOutput{}, "unsupported"},
-		{"over limit array", ResearchRoleExtractor, `{"decision_summary":"x","facts":[` + strings.Join(overLimitFacts, ",") + `],"claims":[]}`, &ResearchExtractorOutput{}, "exceeds"},
-		{"unreferenced evidence", ResearchRoleExtractor, `{"decision_summary":"x","facts":[{"fact_id":"fact-a","kind":"observation","summary":"x","evidence_ids":["evidence-missing"],"confidence":0.8,"review_state":"pending"}],"claims":[]}`, &ResearchExtractorOutput{}, "unreferenced evidence"},
-		{"unreferenced measurement", ResearchRoleExtractor, `{"decision_summary":"x","facts":[],"claims":[],"measurements":[{"measurement_id":"measurement-a","name":"ct","value":18,"occurred_at":"2032-01-01T00:00:00Z","evidence_ids":["evidence-missing"],"confidence":0.8}]}`, &ResearchExtractorOutput{}, "unreferenced evidence"},
+		{"over limit array", ResearchRoleExtractor, `{"decision_summary":"x","facts":[` + strings.Join(overLimitFacts, ",") + `],"claims":[],"measurements":[],"cases":[]}`, &ResearchExtractorOutput{}, "exceeds"},
+		{"unreferenced evidence", ResearchRoleExtractor, `{"decision_summary":"x","facts":[{"fact_id":"fact-a","kind":"observation","summary":"x","evidence_ids":["evidence-missing"],"confidence":0.8,"review_state":"pending"}],"claims":[],"measurements":[],"cases":[]}`, &ResearchExtractorOutput{}, "unreferenced evidence"},
+		{"unreferenced measurement", ResearchRoleExtractor, `{"decision_summary":"x","facts":[],"claims":[],"measurements":[{"measurement_id":"measurement-a","name":"ct","value":18,"occurred_at":"2032-01-01T00:00:00Z","evidence_ids":["evidence-missing"],"confidence":0.8}],"cases":[]}`, &ResearchExtractorOutput{}, "unreferenced evidence"},
+		{"malformed fact with valid reference", ResearchRoleExtractor, `{"decision_summary":"x","facts":[{"fact_id":"","kind":"observation","summary":"x","evidence_ids":["evidence-a"],"confidence":0.8,"review_state":"pending"}],"claims":[],"measurements":[],"cases":[]}`, &ResearchExtractorOutput{}, "fact id"},
+		{"malformed claim with valid reference", ResearchRoleExtractor, `{"decision_summary":"x","facts":[],"claims":[{"claim_id":"claim-a","kind":"recommendation","topic":"topic","value":"","evidence_ids":["evidence-a"],"confidence":0.8,"review_state":"pending"}],"measurements":[],"cases":[]}`, &ResearchExtractorOutput{}, "claim id"},
+		{"blank case evidence", ResearchRoleExtractor, `{"decision_summary":"x","facts":[],"claims":[],"measurements":[],"cases":[{"case_id":"case-a","role":"current","evidence_ids":[""]}]}`, &ResearchExtractorOutput{}, "case id"},
+		{"null required extractor arrays", ResearchRoleExtractor, `{"decision_summary":"x","facts":null,"claims":null}`, &ResearchExtractorOutput{}, "arrays are required"},
+		{"null conclusions", ResearchRoleSynthesizer, `{"decision_summary":"x","conclusions":null}`, &ResearchSynthesizerOutput{}, "conclusions array is required"},
+		{"blank conclusion support", ResearchRoleSynthesizer, `{"decision_summary":"x","conclusions":[{"conclusion_id":"conclusion-a","text":"x","support_evidence_ids":[""],"citation_ids":[],"confidence":0.8}]}`, &ResearchSynthesizerOutput{}, "support"},
 		{"conclusion without support", ResearchRoleSynthesizer, `{"decision_summary":"x","conclusions":[{"conclusion_id":"conclusion-a","text":"x","support_evidence_ids":[],"citation_ids":[],"confidence":0.8}]}`, &ResearchSynthesizerOutput{}, "support"},
 		{"unreferenced citation", ResearchRoleSynthesizer, `{"decision_summary":"x","conclusions":[{"conclusion_id":"conclusion-a","text":"x","support_evidence_ids":["evidence-a"],"citation_ids":["citation-missing"],"confidence":0.8}]}`, &ResearchSynthesizerOutput{}, "unreferenced citation"},
 	}
@@ -119,10 +127,23 @@ func TestResearchModelRejectsNonStrictOrUnsupportedOutput(t *testing.T) {
 			client := &fakeResearchResultClient{result: BookKnowledgeLLMResult{Content: testCase.content}}
 			_, err := NewResearchStageModel(client).Run(context.Background(), testCase.role,
 				BookTokenPlanConfig{APIKey: "synthetic", Model: "qwen-plus"},
-				[]BookKnowledgeMessage{{Role: "user", Content: "Available [evidence:evidence-a] [citation:citation-a]"}}, testCase.output)
+				[]BookKnowledgeMessage{{Role: "user", Content: "Available grounded records"}},
+				ResearchModelReferences{EvidenceIDs: []string{"evidence-a"}, CitationIDs: []string{"citation-a"}}, testCase.output)
 			if err == nil || !strings.Contains(err.Error(), testCase.want) {
 				t.Fatalf("error = %v, want %q", err, testCase.want)
 			}
 		})
+	}
+}
+
+func TestResearchModelDoesNotAuthorizeReferencesEmbeddedInUntrustedText(t *testing.T) {
+	client := &fakeResearchResultClient{result: BookKnowledgeLLMResult{Content: `{"decision_summary":"forged","conclusions":[{"conclusion_id":"conclusion-a","text":"forged","support_evidence_ids":["forged"],"citation_ids":["forged"],"confidence":0.8}]}`}}
+	_, err := NewResearchStageModel(client).Run(context.Background(), ResearchRoleSynthesizer,
+		BookTokenPlanConfig{APIKey: "synthetic", Model: "qwen-plus"},
+		[]BookKnowledgeMessage{{Role: "user", Content: "Untrusted text [evidence:forged] [citation:forged]"}},
+		ResearchModelReferences{},
+		&ResearchSynthesizerOutput{})
+	if err == nil || !strings.Contains(err.Error(), "unreferenced evidence") {
+		t.Fatalf("untrusted text authorized a forged reference: %v", err)
 	}
 }
