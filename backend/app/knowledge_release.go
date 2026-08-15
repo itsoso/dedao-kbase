@@ -305,6 +305,10 @@ func knowledgeReleaseID(book BookKnowledgeBook, analysis BookAnalysisPayload, qu
 func (s *BookKnowledgeStore) saveKnowledgeRelease(release KnowledgeRelease) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.saveKnowledgeReleaseUnlocked(release)
+}
+
+func (s *BookKnowledgeStore) saveKnowledgeReleaseUnlocked(release KnowledgeRelease) error {
 	if strings.TrimSpace(release.ReleaseID) == "" || strings.TrimSpace(release.BookID) == "" {
 		return fmt.Errorf("knowledge release requires release_id and book_id")
 	}
