@@ -829,6 +829,48 @@ func TestResearchOrchestratorSelectsStableBoundedChatlogCandidateWindows(t *test
 	}
 }
 
+func TestResearchOrchestratorInvalidPersistedWorkerCandidateIsWorkerFailed(t *testing.T) {
+	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+	run := createResearchOrchestratorRun(t, research, pkg, "invalid-worker-candidate",
+		ResearchModeDeep, []string{ResearchSourceChatlog}, "bounded history")
+	arguments, err := json.Marshal(ResearchWorkerSearchChatlogArgs{
+		TimeFrom: "2026-08-13T00:00:00Z", TimeTo: "2026-08-14T00:00:00Z", TalkerRef: "room-a", Limit: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := research.CreateWorkerJob(ResearchWorkerJobInput{
+		RunID: run.RunID, TargetAgentID: "chatlog-agent", Tool: ResearchWorkerToolSearchChatlog,
+		Arguments: arguments, MaxAttempts: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := research.ClaimWorkerJob("chatlog-agent", time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("job=%#v err=%v", job, err)
+	}
+	candidateRef := "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+	if _, err := research.CompleteWorkerJob(job.JobID, "chatlog-agent", job.LeaseID, job.RequestHash, ResearchWorkerResult{
+		Items: []ResearchWorkerEvidenceCandidate{{
+			SourceType: ResearchEvidenceSourceChatlog, SourceRole: ResearchEvidenceRoleUserHistory,
+			Privacy: ResearchEvidencePrivacyPrivate, OccurredAt: "2026-08-13T08:00:00Z",
+			Locator: ResearchEvidenceLocator{WorkerID: "chatlog-agent", ConversationRef: candidateRef, MessageRef: candidateRef},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := research.db.Exec(`UPDATE research_worker_candidates SET occurred_at = 'not-a-time' WHERE run_id = ?`, run.RunID); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := orchestrator.listWorkerJobs(run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.planChatlogCandidateFetches(context.Background(), run, jobs, nil); !errors.Is(err, ErrResearchWorkerFailed) {
+		t.Fatalf("error=%v want worker_failed", err)
+	}
+}
+
 func TestResearchOrchestratorResolvesPersistedOpaqueIdentityBinding(t *testing.T) {
 	orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
 	run := createResearchOrchestratorRun(t, research, pkg, "opaque-binding-resolution", ResearchModeDeep,
@@ -1174,6 +1216,7 @@ func TestResearchOrchestratorTypedOutcomesAndCancellation(t *testing.T) {
 		want string
 	}{
 		{ErrResearchWorkerTerminal, ResearchOutcomeWorkerOffline},
+		{ErrResearchWorkerFailed, ResearchOutcomeWorkerFailed},
 		{ErrResearchIdentityAmbiguous, ResearchOutcomeIdentityAmbiguous},
 		{ErrResearchZeroHit, ResearchOutcomeZeroHit},
 		{ErrResearchPartialEvidence, ResearchOutcomePartialEvidence},
@@ -1198,6 +1241,43 @@ func TestResearchOrchestratorTypedOutcomesAndCancellation(t *testing.T) {
 	result, err := orchestrator.Advance(context.Background(), canceled.RunID)
 	if err != nil || result.Run.Status != ResearchCanceled || model.callCount(ResearchRoleSynthesizer) != 0 {
 		t.Fatalf("canceled result=%#v error=%v calls=%#v", result, err, model.calls)
+	}
+}
+
+func TestResearchOrchestratorWorkerFailedAndExpiredHaveDistinctOutcomes(t *testing.T) {
+	tests := []struct {
+		name  string
+		state string
+		code  string
+		want  string
+	}{
+		{name: "connected query failed", state: ResearchWorkerJobFailed, code: "dependency_unavailable", want: ResearchOutcomeWorkerFailed},
+		{name: "lease expired", state: ResearchWorkerJobExpired, want: ResearchOutcomeWorkerOffline},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			orchestrator, research, pkg, _ := newResearchOrchestratorTestHarness(t)
+			run := createResearchOrchestratorRun(t, research, pkg, "worker-outcome-"+testCase.state,
+				ResearchModeDeep, []string{ResearchSourceChatlog}, "bounded history")
+			if _, err := research.db.Exec(`UPDATE research_runs SET status = ? WHERE run_id = ?`, ResearchRetrieving, run.RunID); err != nil {
+				t.Fatal(err)
+			}
+			job, _, err := research.CreateWorkerJob(ResearchWorkerJobInput{
+				RunID: run.RunID, TargetAgentID: "chatlog-agent", Tool: ResearchWorkerToolSearchChatlog,
+				Arguments:   json.RawMessage(`{"time_from":"2026-08-13T00:00:00Z","time_to":"2026-08-14T00:00:00Z","talker_ref":"room-a","limit":1}`),
+				MaxAttempts: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := research.db.Exec(`UPDATE research_worker_jobs SET state = ?, failure_code = ? WHERE job_id = ?`, testCase.state, testCase.code, job.JobID); err != nil {
+				t.Fatal(err)
+			}
+			result := advanceResearchUntilTerminal(t, orchestrator, run.RunID, 2)
+			if result.Outcome != testCase.want {
+				t.Fatalf("outcome=%q want=%q result=%#v", result.Outcome, testCase.want, result)
+			}
+		})
 	}
 }
 

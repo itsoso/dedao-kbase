@@ -20,6 +20,7 @@ const (
 
 	ResearchOutcomeCompleted          = "completed"
 	ResearchOutcomeWorkerOffline      = "worker_offline"
+	ResearchOutcomeWorkerFailed       = "worker_failed"
 	ResearchOutcomeIdentityAmbiguous  = "identity_ambiguous"
 	ResearchOutcomeZeroHit            = "zero_hit"
 	ResearchOutcomePartialEvidence    = "partial_evidence"
@@ -34,6 +35,7 @@ const (
 
 var (
 	ErrResearchIdentityAmbiguous        = errors.New(ResearchOutcomeIdentityAmbiguous)
+	ErrResearchWorkerFailed             = errors.New(ResearchOutcomeWorkerFailed)
 	ErrResearchZeroHit                  = errors.New(ResearchOutcomeZeroHit)
 	ErrResearchPartialEvidence          = errors.New(ResearchOutcomePartialEvidence)
 	ErrResearchBudgetExhausted          = errors.New(ResearchOutcomeBudgetExhausted)
@@ -330,7 +332,9 @@ func (o *ResearchOrchestrator) advanceRetrieving(ctx context.Context, run Resear
 			switch job.State {
 			case ResearchWorkerJobQueued, ResearchWorkerJobLeased:
 				return o.wait(run, ResearchWaitWorkerPending)
-			case ResearchWorkerJobFailed, ResearchWorkerJobExpired:
+			case ResearchWorkerJobFailed:
+				return ResearchAdvanceResult{}, ErrResearchWorkerFailed
+			case ResearchWorkerJobExpired:
 				return ResearchAdvanceResult{}, ErrResearchWorkerTerminal
 			}
 		}
@@ -441,7 +445,7 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, 
 			}
 			occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
 			if err != nil {
-				return false, fmt.Errorf("%w: invalid persisted Chatlog candidate time", ErrResearchWorkerTerminal)
+				return false, fmt.Errorf("%w: invalid persisted Chatlog candidate time", ErrResearchWorkerFailed)
 			}
 			arguments, err := json.Marshal(ResearchWorkerFetchChatMessageArgs{
 				MessageRef: candidate.CandidateRef, ConversationRef: candidate.CandidateRef,
@@ -468,11 +472,11 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, 
 		}
 	}
 	if len(selectedCandidates) != len(fetchRequested) || len(selectedCandidates) > researchToolDefaultLimit {
-		return false, ErrResearchWorkerTerminal
+		return false, ErrResearchWorkerFailed
 	}
 	for _, candidate := range selectedCandidates {
 		if !fetchCompleted[candidate.CandidateRef] || !fetchedEvidence[candidate.CandidateRef] {
-			return false, ErrResearchWorkerTerminal
+			return false, ErrResearchWorkerFailed
 		}
 	}
 
@@ -489,7 +493,7 @@ func (o *ResearchOrchestrator) planChatlogCandidateFetches(ctx context.Context, 
 		}
 		occurredAt, err := time.Parse(time.RFC3339, candidate.OccurredAt)
 		if err != nil {
-			return false, fmt.Errorf("%w: invalid persisted Chatlog candidate time", ErrResearchWorkerTerminal)
+			return false, fmt.Errorf("%w: invalid persisted Chatlog candidate time", ErrResearchWorkerFailed)
 		}
 		arguments, err := json.Marshal(ResearchWorkerExpandChatContextArgs{
 			MessageRef: candidate.CandidateRef, ConversationRef: candidate.CandidateRef,
@@ -1860,6 +1864,8 @@ func migrateResearchOrchestrator(db *sql.DB) error {
 
 func ClassifyResearchOrchestratorOutcome(err error) string {
 	switch {
+	case errors.Is(err, ErrResearchWorkerFailed):
+		return ResearchOutcomeWorkerFailed
 	case errors.Is(err, ErrResearchWorkerTerminal):
 		return ResearchOutcomeWorkerOffline
 	case errors.Is(err, ErrResearchIdentityAmbiguous):
