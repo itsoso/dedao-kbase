@@ -240,7 +240,7 @@ func researchStoreTestInput(key string) ResearchRunInput {
 		RouteReasons: []string{ResearchRouteExplicitQuick},
 		Budget: ResearchBudget{
 			MaxIterations: 2, MaxEvidenceItems: 16, MaxQuotedChars: 4000,
-			MaxModelCalls: 4, MaxCostUSD: 0.25,
+			MaxModelCalls: 4, MaxCostUSD: 0.5,
 		},
 	}
 }
