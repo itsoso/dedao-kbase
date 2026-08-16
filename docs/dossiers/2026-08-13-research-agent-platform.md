@@ -873,3 +873,38 @@ sources. Citation detail re-fetch returned the expected citation, chunk, and
 claim identities. Public and loopback health, all five server services, and the
 macOS Chatlog Worker remained healthy with zero post-cutover warnings or
 restarts. G5 and G6 are PASS.
+
+### Bounded runtime recovery after manual-evaluation failure
+
+Manual Run `research-run-76473a67580306362540625408907750` ended as
+`worker_offline`, although privacy-safe production state proved that the macOS
+Worker stayed connected. Identity resolution and one Chatlog search completed;
+a separate long-range Chatlog search failed after three attempts. Each failed
+attempt stopped at approximately 10.5 seconds, while the loopback Chatlog
+service completed comparable requests with HTTP 200 after the former ten-second
+client deadline. The public outcome therefore combined two defects: an
+undersized fixed local deadline and a terminal-failure mapping that treated an
+explicit connected-Worker failure as offline.
+
+The remediation raises only the loopback HTTP reader's fixed default deadline
+to the existing thirty-second maximum. It keeps loopback-only networking,
+redirect rejection, response and row bounds, Worker lease heartbeats, and
+fail-closed result validation unchanged. Explicit failed jobs and invalid
+persisted Worker boundaries now produce `worker_failed`; expired leases remain
+`worker_offline`.
+
+The same candidate adds one durable, budgeted model-output repair per Research
+role. Strictly invalid primary output records only an allowlisted failure code;
+after restart, the primary is not called again and the separate repair identity
+regenerates one complete object from the original trusted context. Both calls
+consume model-call and cost reservations. A second invalid result terminates
+with a fixed role-specific outcome, while timeouts, provider failures, policy
+denials, lease loss, and budget exhaustion never enter the repair path. No raw
+invalid output or validation detail is persisted.
+
+G3 passed after a generated system-map refresh: the complete Go suite, focused
+Research and Chatlog race suite, vet, all Web UI smokes, isolated Research
+process smoke, Chatlog Worker packaging smoke, system-map drift, privacy, and
+diff checks all exited zero. Exact-revision merge, deployment, Worker update,
+and a repeated production deep Run remain required before this remediation's
+G5/G6 status can pass.

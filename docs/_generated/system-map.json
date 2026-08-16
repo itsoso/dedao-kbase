@@ -1056,25 +1056,25 @@
     {
       "path": "/api/v1/chatlog",
       "file": "backend/app/chatlog_http.go",
-      "line": 167,
+      "line": 168,
       "authenticated": true
     },
     {
       "path": "/api/v1/chatroom",
       "file": "backend/app/chatlog_http.go",
-      "line": 262,
+      "line": 263,
       "authenticated": true
     },
     {
       "path": "/api/v1/contact",
       "file": "backend/app/chatlog_http.go",
-      "line": 230,
+      "line": 231,
       "authenticated": true
     },
     {
       "path": "/api/v1/session",
       "file": "backend/app/chatlog_http.go",
-      "line": 298,
+      "line": 299,
       "authenticated": true
     },
     {
