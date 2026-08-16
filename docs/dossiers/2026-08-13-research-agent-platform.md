@@ -908,3 +908,26 @@ process smoke, Chatlog Worker packaging smoke, system-map drift, privacy, and
 diff checks all exited zero. Exact-revision merge, deployment, Worker update,
 and a repeated production deep Run remain required before this remediation's
 G5/G6 status can pass.
+
+The first independent G4 review returned NO-GO with one Important finding: a
+repair that had already failed strict validation could be called again if the
+process stopped before the Run terminal transition committed. The restart path
+skipped the failed primary identity but did not inspect the durable repair
+identity before entering the invocation retry state machine.
+
+Revision `1f0963d` closes that crash window. Before any repair model call,
+budget reservation, or attempt write, the orchestrator derives the exact repair
+identity and returns the fixed role outcome when its durable failure code is
+already `invalid_model_output`. The restart regression leaves the Run
+nonterminal after primary and repair failure, recreates the orchestrator, and
+proves provider calls remain at two while model-call and attempt counts remain
+unchanged. A separate regression proves that sufficient call slots do not
+permit repair when the remaining dollar budget cannot reserve it.
+
+The final independent G4 review found zero Critical, Important, or Minor
+issues and returned **Ready to merge: Yes**. On the exact remediated code, vet,
+the complete Go suite, the complete focused Research/Chatlog race lane, all Web
+smokes, Research process smoke, Chatlog packaging smoke, system-map drift,
+privacy, and diff checks exited zero. G4 is PASS; G5/G6 remain pending until
+the final clean-main revision and matching macOS Worker are deployed and the
+production case is repeated.
