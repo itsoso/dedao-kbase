@@ -167,6 +167,16 @@ func TestChatlogHTTPEnforcesTimeoutOnCustomClient(t *testing.T) {
 	}
 }
 
+func TestChatlogHTTPDefaultTimeoutSupportsBoundedLongLocalQueries(t *testing.T) {
+	reader, err := NewChatlogHTTPReader(ChatlogHTTPConfig{BaseURL: "http://127.0.0.1:5030"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reader.client.Timeout != 30*time.Second {
+		t.Fatalf("timeout=%s want=30s", reader.client.Timeout)
+	}
+}
+
 func TestChatlogHTTPBoundsBodiesAndClassifiesUnavailableOrMalformedService(t *testing.T) {
 	for name, handler := range map[string]http.HandlerFunc{
 		"oversized": func(w http.ResponseWriter, _ *http.Request) {

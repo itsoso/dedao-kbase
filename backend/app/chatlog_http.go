@@ -17,6 +17,7 @@ import (
 
 const (
 	defaultChatlogHTTPBaseURL         = "http://127.0.0.1:5030"
+	defaultChatlogHTTPTimeout         = 30 * time.Second
 	chatlogHTTPMaxResponseBytes int64 = 4 << 20
 	chatlogHTTPMaxRows                = 500
 	chatlogHTTPMaxContextWindow       = 100
@@ -139,11 +140,11 @@ func NewChatlogHTTPReader(config ChatlogHTTPConfig) (*ChatlogHTTPReader, error) 
 	}
 	client := config.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: defaultChatlogHTTPTimeout}
 	}
 	clientCopy := *client
-	if clientCopy.Timeout <= 0 || clientCopy.Timeout > 30*time.Second {
-		clientCopy.Timeout = 10 * time.Second
+	if clientCopy.Timeout <= 0 || clientCopy.Timeout > defaultChatlogHTTPTimeout {
+		clientCopy.Timeout = defaultChatlogHTTPTimeout
 	}
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return ErrChatlogUnsafeRedirect
